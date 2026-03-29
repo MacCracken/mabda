@@ -384,4 +384,50 @@ mod tests {
     fn render_pipeline_types() {
         let _size = std::mem::size_of::<RenderPipeline>();
     }
+
+    #[test]
+    fn draw_command_debug() {
+        let d = DrawCommand::Draw {
+            vertex_count: 100,
+            instance_count: 10,
+        };
+        let s = format!("{d:?}");
+        assert!(s.contains("100"));
+        assert!(s.contains("10"));
+    }
+
+    #[test]
+    fn draw_command_clone() {
+        let d = DrawCommand::DrawIndexed {
+            index_count: 36,
+            instance_count: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        };
+        let d2 = d;
+        assert!(matches!(
+            d2,
+            DrawCommand::DrawIndexed {
+                index_count: 36,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn primitive_defaults() {
+        let prim = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        };
+        assert_eq!(prim.topology, wgpu::PrimitiveTopology::TriangleList);
+        assert_eq!(prim.front_face, wgpu::FrontFace::Ccw);
+        assert!(prim.cull_mode.is_none());
+    }
 }

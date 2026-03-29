@@ -7,6 +7,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Trait for types that describe their GPU vertex buffer layout.
+///
+/// Implement this for custom vertex types to enable generic pipeline
+/// construction. All built-in vertex types ([`Vertex2D`], [`Vertex3D`],
+/// [`SkinnedVertex3D`]) implement this trait.
 pub trait VertexLayout {
     /// Returns the wgpu vertex buffer layout descriptor for this type.
     fn layout() -> wgpu::VertexBufferLayout<'static>;

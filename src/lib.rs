@@ -76,7 +76,7 @@ pub use render_pipeline::{DrawCommand, RenderPipeline, RenderPipelineBuilder};
 #[cfg(feature = "graphics")]
 pub use render_target::RenderTarget;
 #[cfg(feature = "graphics")]
-pub use sampler::{SamplerPreset, create_sampler};
+pub use sampler::{SamplerPreset, create_sampler, create_sampler_custom};
 #[cfg(feature = "graphics")]
 pub use surface::{PresentModePreference, SurfaceState};
 #[cfg(feature = "graphics")]
