@@ -1,5 +1,4 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use mabda::compute::{workgroups_1d, workgroups_2d};
 use mabda::{Color, FrameProfiler, GpuCapabilities};
 
 fn bench_color_lerp(c: &mut Criterion) {
@@ -20,20 +19,30 @@ fn bench_color_from_hex(c: &mut Criterion) {
     });
 }
 
-fn bench_workgroups_1d(c: &mut Criterion) {
-    c.bench_function("workgroups_1d", |bench| {
+fn bench_color_luminance(c: &mut Criterion) {
+    let color = Color::new(0.5, 0.3, 0.8, 1.0);
+    c.bench_function("color_luminance", |bench| {
         bench.iter(|| {
-            std::hint::black_box(workgroups_1d(1_000_000, 256));
+            std::hint::black_box(color.luminance());
         });
     });
 }
 
-fn bench_workgroups_2d(c: &mut Criterion) {
-    c.bench_function("workgroups_2d", |bench| {
-        bench.iter(|| {
-            std::hint::black_box(workgroups_2d(1920, 1080, 16, 16));
+fn bench_workgroups(c: &mut Criterion) {
+    #[cfg(feature = "compute")]
+    {
+        use mabda::compute::{workgroups_1d, workgroups_2d};
+        c.bench_function("workgroups_1d", |bench| {
+            bench.iter(|| {
+                std::hint::black_box(workgroups_1d(1_000_000, 256));
+            });
         });
-    });
+        c.bench_function("workgroups_2d", |bench| {
+            bench.iter(|| {
+                std::hint::black_box(workgroups_2d(1920, 1080, 16, 16));
+            });
+        });
+    }
 }
 
 fn bench_profiler_frame(c: &mut Criterion) {
@@ -70,22 +79,12 @@ fn bench_capabilities_report(c: &mut Criterion) {
     });
 }
 
-fn bench_color_luminance(c: &mut Criterion) {
-    let color = Color::new(0.5, 0.3, 0.8, 1.0);
-    c.bench_function("color_luminance", |bench| {
-        bench.iter(|| {
-            std::hint::black_box(color.luminance());
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_color_lerp,
     bench_color_from_hex,
     bench_color_luminance,
-    bench_workgroups_1d,
-    bench_workgroups_2d,
+    bench_workgroups,
     bench_profiler_frame,
     bench_capabilities_report,
 );

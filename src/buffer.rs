@@ -137,6 +137,134 @@ pub fn read_buffer_typed<T: bytemuck::Pod>(
     Ok(bytemuck::cast_slice(&bytes).to_vec())
 }
 
+/// Create a GPU vertex buffer initialized with vertex data.
+#[cfg(feature = "graphics")]
+#[must_use]
+pub fn create_vertex_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    vertices: &[T],
+    label: &str,
+) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// Create a GPU index buffer initialized with index data.
+///
+/// `T` should be `u16` or `u32` depending on the index format.
+#[cfg(feature = "graphics")]
+#[must_use]
+pub fn create_index_buffer<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    indices: &[T],
+    label: &str,
+) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// A GPU buffer that grows automatically when data exceeds capacity.
+///
+/// Uses exponential growth (3/2 multiplier, minimum 16 elements) to
+/// amortize reallocation cost. Suitable for vertex, index, instance,
+/// or storage buffers where the element count varies frame-to-frame.
+pub struct GrowableBuffer {
+    /// The underlying GPU buffer.
+    pub buffer: wgpu::Buffer,
+    /// Current number of elements written.
+    pub count: u32,
+    capacity: usize,
+    usage: wgpu::BufferUsages,
+    label: String,
+    element_size: usize,
+}
+
+impl GrowableBuffer {
+    /// Create a growable buffer with initial capacity.
+    ///
+    /// `element_size` is the byte size of each element (e.g., `size_of::<Vertex3D>()`).
+    /// `usage` is the wgpu buffer usage flags (e.g., `VERTEX | COPY_DST`).
+    pub fn new(
+        device: &wgpu::Device,
+        capacity: usize,
+        element_size: usize,
+        usage: wgpu::BufferUsages,
+        label: impl Into<String>,
+    ) -> Self {
+        let label = label.into();
+        let capacity = capacity.max(16);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&label),
+            size: (capacity * element_size) as u64,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            count: 0,
+            capacity,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            label,
+            element_size,
+        }
+    }
+
+    /// Update buffer contents. Regrows if data exceeds capacity.
+    pub fn update<T: bytemuck::Pod>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[T],
+    ) {
+        self.count = data.len() as u32;
+
+        if data.is_empty() {
+            return;
+        }
+
+        if data.len() > self.capacity {
+            let new_capacity = (data.len() * 3 / 2).max(16);
+            tracing::debug!(
+                old_capacity = self.capacity,
+                new_capacity,
+                label = %self.label,
+                "growable buffer regrow"
+            );
+            self.capacity = new_capacity;
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&self.label),
+                size: (self.capacity * self.element_size) as u64,
+                usage: self.usage,
+                mapped_at_creation: false,
+            });
+        }
+
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Current element count.
+    #[must_use]
+    #[inline]
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Current capacity in elements.
+    #[must_use]
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

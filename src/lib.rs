@@ -27,32 +27,62 @@
 //! - **Graphics**: [`texture`], [`render_target`]
 //! - **Profiling**: [`profiler`]
 
+// ── Core (always available) ─────────────────────────────────────────────────
 pub mod buffer;
 pub mod capabilities;
 pub mod color;
-pub mod compute;
 pub mod context;
 pub mod error;
 pub mod profiler;
-pub mod render_target;
-pub mod texture;
 
-// ── Core ────────────────────────────────────────────────────────────────────
+// ── Compute ─────────────────────────────────────────────────────────────────
+#[cfg(feature = "compute")]
+pub mod compute;
+
+// ── Graphics ────────────────────────────────────────────────────────────────
+#[cfg(feature = "graphics")]
+pub mod render_pipeline;
+#[cfg(feature = "graphics")]
+pub mod render_target;
+#[cfg(feature = "graphics")]
+pub mod sampler;
+#[cfg(feature = "graphics")]
+pub mod surface;
+#[cfg(feature = "graphics")]
+pub mod texture;
+#[cfg(feature = "graphics")]
+pub mod vertex;
+
+// ── Core re-exports ─────────────────────────────────────────────────────────
 pub use capabilities::GpuCapabilities;
 pub use color::Color;
 pub use context::GpuContext;
 pub use error::{GpuError, Result};
 
-// ── Compute ─────────────────────────────────────────────────────────────────
 pub use buffer::{
-    create_staging_buffer, create_storage_buffer, create_storage_buffer_empty,
+    GrowableBuffer, create_staging_buffer, create_storage_buffer, create_storage_buffer_empty,
     create_uniform_buffer, read_buffer,
 };
+
+// ── Compute re-exports ──────────────────────────────────────────────────────
+#[cfg(feature = "compute")]
 pub use compute::ComputePipeline;
 
-// ── Graphics ────────────────────────────────────────────────────────────────
+// ── Graphics re-exports ─────────────────────────────────────────────────────
+#[cfg(feature = "graphics")]
+pub use buffer::{create_index_buffer, create_vertex_buffer};
+#[cfg(feature = "graphics")]
+pub use render_pipeline::{DrawCommand, RenderPipeline, RenderPipelineBuilder};
+#[cfg(feature = "graphics")]
 pub use render_target::RenderTarget;
+#[cfg(feature = "graphics")]
+pub use sampler::{SamplerPreset, create_sampler};
+#[cfg(feature = "graphics")]
+pub use surface::{PresentModePreference, SurfaceState};
+#[cfg(feature = "graphics")]
 pub use texture::{Texture, TextureCache, create_default_sampler};
+#[cfg(feature = "graphics")]
+pub use vertex::{SkinnedVertex3D, Vertex2D, Vertex3D, VertexLayout};
 
-// ── Profiling ───────────────────────────────────────────────────────────────
+// ── Profiling re-exports ────────────────────────────────────────────────────
 pub use profiler::{FrameProfiler, GpuTimestamps, PassTiming};
