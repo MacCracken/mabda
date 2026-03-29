@@ -90,6 +90,7 @@ pub fn read_buffer(
     source: &wgpu::Buffer,
     size: u64,
 ) -> Result<Vec<u8>> {
+    tracing::debug!(size, "GPU buffer readback");
     let staging = create_staging_buffer(device, size, "readback_staging");
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

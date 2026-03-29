@@ -117,12 +117,14 @@ impl ComputePipeline {
 
     /// Get the bind group layout for creating bind groups.
     #[must_use]
+    #[inline]
     pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
         &self.bind_group_layout
     }
 
     /// Get the underlying wgpu compute pipeline.
     #[must_use]
+    #[inline]
     pub fn raw(&self) -> &wgpu::ComputePipeline {
         &self.pipeline
     }
@@ -141,6 +143,7 @@ impl ComputePipeline {
         workgroups_y: u32,
         workgroups_z: u32,
     ) {
+        tracing::debug!(workgroups_x, workgroups_y, workgroups_z, "compute dispatch");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("compute_encoder"),
         });
@@ -225,5 +228,23 @@ mod tests {
     #[test]
     fn workgroups_2d_remainder() {
         assert_eq!(workgroups_2d(33, 17, 16, 16), (3, 2));
+    }
+
+    #[test]
+    fn workgroups_1d_single() {
+        assert_eq!(workgroups_1d(1, 64), 1);
+        assert_eq!(workgroups_1d(0, 64), 0);
+    }
+
+    #[test]
+    fn workgroups_2d_single() {
+        assert_eq!(workgroups_2d(1, 1, 8, 8), (1, 1));
+        assert_eq!(workgroups_2d(0, 0, 8, 8), (0, 0));
+    }
+
+    #[test]
+    fn workgroups_1d_large() {
+        assert_eq!(workgroups_1d(1_000_000, 256), 3907);
+        assert_eq!(workgroups_1d(u32::MAX, 256), 16_777_216);
     }
 }

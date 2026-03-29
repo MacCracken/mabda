@@ -53,12 +53,14 @@ impl FrameProfiler {
     }
 
     /// Call at the start of each frame.
+    #[inline]
     pub fn begin_frame(&mut self) {
         self.frame_start = Some(Instant::now());
         self.pass_times.clear();
     }
 
     /// Call at the end of each frame. Returns the frame time in ms.
+    #[inline]
     pub fn end_frame(&mut self) -> f64 {
         let elapsed = self
             .frame_start
@@ -79,6 +81,7 @@ impl FrameProfiler {
     }
 
     /// Record a pass timing manually (for CPU-timed passes).
+    #[inline]
     pub fn record_pass(&mut self, label: impl Into<String>, duration_ms: f64) {
         self.pass_times.push(PassTiming {
             label: label.into(),
@@ -161,12 +164,14 @@ impl GpuTimestamps {
 
     /// Get the query set for use in render/compute pass descriptors.
     #[must_use]
+    #[inline]
     pub fn query_set(&self) -> &wgpu::QuerySet {
         &self.query_set
     }
 
     /// Maximum number of query pairs (passes) supported.
     #[must_use]
+    #[inline]
     pub fn max_passes(&self) -> u32 {
         self.max_queries / 2
     }
@@ -296,5 +301,36 @@ mod tests {
         };
         assert_eq!(t.label, "shadow");
         assert_eq!(t.duration_ms, 1.5);
+    }
+
+    #[test]
+    fn profiler_total_pass_time_empty() {
+        let p = FrameProfiler::new();
+        assert_eq!(p.total_pass_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn profiler_custom_alpha() {
+        let p = FrameProfiler::with_alpha(0.5);
+        assert_eq!(p.frame_count, 0);
+        // Alpha should be clamped to valid range
+        let p_low = FrameProfiler::with_alpha(0.0);
+        let p_high = FrameProfiler::with_alpha(2.0);
+        // Both should still function correctly
+        assert_eq!(p_low.frame_count, 0);
+        assert_eq!(p_high.frame_count, 0);
+    }
+
+    #[test]
+    fn profiler_multiple_resets() {
+        let mut p = FrameProfiler::new();
+        for _ in 0..5 {
+            p.begin_frame();
+            p.record_pass("test", 1.0);
+            p.end_frame();
+            p.reset();
+            assert_eq!(p.frame_count, 0);
+            assert!(p.pass_times.is_empty());
+        }
     }
 }

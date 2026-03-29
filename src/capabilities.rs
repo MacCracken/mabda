@@ -40,6 +40,7 @@ pub struct GpuCapabilities {
 impl GpuCapabilities {
     /// Query capabilities from a [`GpuContext`](crate::context::GpuContext).
     pub fn from_context(ctx: &crate::context::GpuContext) -> Self {
+        tracing::debug!("querying GPU capabilities");
         let info = ctx.adapter.get_info();
         let features = ctx.device.features();
         let limits = ctx.device.limits();
@@ -90,31 +91,36 @@ impl GpuCapabilities {
     /// Format as a human-readable report.
     #[must_use]
     pub fn report(&self) -> String {
-        format!(
-            "GPU: {} ({})\n\
-             Timestamp queries: {}\n\
-             Max texture 2D: {}\n\
-             Max uniform buffer: {} bytes\n\
-             Max storage buffer: {} bytes\n\
-             Max buffer size: {} bytes\n\
-             Max bind groups: {}\n\
-             Max vertex buffers: {}\n\
-             Max compute workgroup: {:?}\n\
-             Max compute workgroups/dim: {}\n\
-             Multi-draw indirect: {}",
-            self.adapter_name,
-            self.backend,
-            self.timestamp_query,
-            self.max_texture_dimension_2d,
-            self.max_uniform_buffer_size,
-            self.max_storage_buffer_size,
-            self.max_buffer_size,
-            self.max_bind_groups,
-            self.max_vertex_buffers,
-            self.max_compute_workgroup_size,
-            self.max_compute_workgroups_per_dimension,
-            self.multi_draw_indirect,
-        )
+        use std::fmt::Write;
+        let mut out = String::with_capacity(512);
+        let _ = write!(out, "GPU: {} ({})", self.adapter_name, self.backend);
+        let _ = write!(out, "\nTimestamp queries: {}", self.timestamp_query);
+        let _ = write!(out, "\nMax texture 2D: {}", self.max_texture_dimension_2d);
+        let _ = write!(
+            out,
+            "\nMax uniform buffer: {} bytes",
+            self.max_uniform_buffer_size
+        );
+        let _ = write!(
+            out,
+            "\nMax storage buffer: {} bytes",
+            self.max_storage_buffer_size
+        );
+        let _ = write!(out, "\nMax buffer size: {} bytes", self.max_buffer_size);
+        let _ = write!(out, "\nMax bind groups: {}", self.max_bind_groups);
+        let _ = write!(out, "\nMax vertex buffers: {}", self.max_vertex_buffers);
+        let _ = write!(
+            out,
+            "\nMax compute workgroup: {:?}",
+            self.max_compute_workgroup_size
+        );
+        let _ = write!(
+            out,
+            "\nMax compute workgroups/dim: {}",
+            self.max_compute_workgroups_per_dimension
+        );
+        let _ = write!(out, "\nMulti-draw indirect: {}", self.multi_draw_indirect);
+        out
     }
 }
 
@@ -159,6 +165,54 @@ mod tests {
     #[test]
     fn gpu_capabilities_types() {
         let _size = std::mem::size_of::<GpuCapabilities>();
+    }
+
+    #[test]
+    fn capabilities_report_format() {
+        let caps = GpuCapabilities {
+            adapter_name: "Test GPU".into(),
+            backend: "Vulkan".into(),
+            timestamp_query: true,
+            compute_shaders: true,
+            max_texture_dimension_2d: 16384,
+            max_uniform_buffer_size: 65536,
+            max_storage_buffer_size: 134_217_728,
+            max_buffer_size: 268_435_456,
+            max_bind_groups: 4,
+            max_vertex_buffers: 8,
+            max_compute_workgroup_size: [256, 256, 64],
+            max_compute_workgroups_per_dimension: 65535,
+            multi_draw_indirect: false,
+        };
+        let report = caps.report();
+        assert!(report.contains("Test GPU"));
+        assert!(report.contains("Vulkan"));
+        assert!(report.contains("16384"));
+        assert!(report.contains("65536"));
+    }
+
+    #[test]
+    fn capabilities_uniform_storage_fits() {
+        let caps = GpuCapabilities {
+            adapter_name: "Test".into(),
+            backend: "Vulkan".into(),
+            timestamp_query: false,
+            compute_shaders: true,
+            max_texture_dimension_2d: 8192,
+            max_uniform_buffer_size: 65536,
+            max_storage_buffer_size: 134_217_728,
+            max_buffer_size: 268_435_456,
+            max_bind_groups: 4,
+            max_vertex_buffers: 8,
+            max_compute_workgroup_size: [256, 256, 64],
+            max_compute_workgroups_per_dimension: 65535,
+            multi_draw_indirect: false,
+        };
+        assert!(caps.uniform_fits(1024));
+        assert!(caps.uniform_fits(65536));
+        assert!(!caps.uniform_fits(65537));
+        assert!(caps.storage_fits(1024));
+        assert!(!caps.storage_fits(134_217_729));
     }
 
     #[test]

@@ -78,6 +78,7 @@ impl RenderTarget {
     /// This is a blocking GPU readback — use for tests and screenshots,
     /// not in game loops.
     pub fn read_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Vec<u8>> {
+        tracing::debug!(self.width, self.height, ?self.format, "reading render target pixels");
         let bytes_per_row = 4u32
             .checked_mul(self.width)
             .ok_or_else(|| GpuError::Readback("bytes_per_row overflow".into()))?;

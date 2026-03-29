@@ -278,6 +278,24 @@ mod tests {
     }
 
     #[test]
+    fn color_lerp_midpoints() {
+        let a = Color::new(0.0, 0.0, 0.0, 0.0);
+        let b = Color::new(1.0, 1.0, 1.0, 1.0);
+        let q = a.lerp(b, 0.25);
+        assert!((q.r - 0.25).abs() < f32::EPSILON);
+        assert!((q.a - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn color_from_hex_components() {
+        let c = Color::from_hex(0xAABBCCDD);
+        assert!((c.r - 0xAA as f32 / 255.0).abs() < 0.001);
+        assert!((c.g - 0xBB as f32 / 255.0).abs() < 0.001);
+        assert!((c.b - 0xCC as f32 / 255.0).abs() < 0.001);
+        assert!((c.a - 0xDD as f32 / 255.0).abs() < 0.001);
+    }
+
+    #[test]
     fn color_rgba8_roundtrip() {
         for val in [0u8, 1, 127, 128, 254, 255] {
             let c = Color::from_rgba8(val, val, val, val);

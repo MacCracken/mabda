@@ -94,6 +94,7 @@ impl Texture {
         label: &str,
         sampler: wgpu::Sampler,
     ) -> Result<Self> {
+        tracing::debug!(width, height, label, "creating texture from RGBA");
         if width == 0 || height == 0 {
             return Err(GpuError::Texture("zero-size texture".into()));
         }

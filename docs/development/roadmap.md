@@ -55,6 +55,58 @@
 - Full-screen triangle rendering (no vertex buffer, shader-generated geometry)
 - Command encoder + pass pattern with proper scoping
 
+### Hardening Results
+
+#### Completed Fixes
+- Added `#[inline]` to 7 hot-path methods (profiler: `begin_frame`, `end_frame`, `record_pass`, `query_set`, `max_passes`; compute: `bind_group_layout`, `raw`)
+- Added `tracing::debug!` to 5 operations (buffer readback, compute dispatch, texture RGBA creation, capabilities query, render target readback)
+- Replaced `format!` with `write!` in `GpuCapabilities::report()` to avoid temporary allocation
+- Removed `Cargo.lock` from tracking (library crate)
+- Created `deny.toml` for license/advisory/source checks
+- Created `.gitignore` (was missing entirely; `target/` was committed)
+
+#### Tests Added (43 → 53)
+- `capabilities_report_format` — validates report output content
+- `capabilities_uniform_storage_fits` — validates limit checking methods
+- `workgroups_1d_single` / `workgroups_2d_single` — zero and single-element edge cases
+- `workgroups_1d_large` — validates large dispatch calculations
+- `color_lerp_midpoints` — quarter-point interpolation accuracy
+- `color_from_hex_components` — per-channel hex parsing
+- `profiler_total_pass_time_empty` — zero-pass total
+- `profiler_custom_alpha` — EMA alpha clamping
+- `profiler_multiple_resets` — repeated reset cycles
+
+#### Benchmarks Added (5 → 7)
+- `color_luminance`: ~288 ps
+- `capabilities_report`: ~325 ns (write! impl)
+
+#### Baseline Benchmarks
+| Benchmark | Time |
+|---|---|
+| `color_lerp` | ~261 ps |
+| `color_from_hex` | ~258 ps |
+| `color_luminance` | ~288 ps |
+| `workgroups_1d` | ~258 ps |
+| `workgroups_2d` | ~263 ps |
+| `profiler_frame_cycle` | ~66 ns |
+| `capabilities_report` | ~325 ns |
+
+#### External Research Findings
+- **Thin wrappers over wgpu, not heavy abstractions** — bevy_render, rend3, iced_wgpu all wrap wgpu types with newtype + Deref, keeping the full wgpu API accessible. Mabda's current approach (public wgpu fields on GpuContext) aligns.
+- **Render graph belongs in consumers, not foundation** — bevy puts its render graph in bevy_render (a higher layer). Mabda should provide primitives; soorat owns orchestration. Moved render graph to backlog.
+- **Pipeline caching via descriptor hashing** — universal pattern (bevy, screen-13, rend3). `PipelineCache` with `get_or_create()` keyed by descriptor hash. Added to Sprint 3.
+- **Bind group layout interning** — hash-based dedup of layouts shared across pipelines. Added to Sprint 2.5.
+- **Size-class buffer pooling** — highest-impact resource management feature. Pool buffers in power-of-two size classes, recycle on drop. Added to Sprint 3.
+- **Shader module cache keyed by source hash** — already planned (Sprint 3.3). Research confirms hash-based dedup + optional hot-reload behind feature gate.
+- **Profiling: scope-based API** — `wgpu-profiler` pattern (begin_scope/end_scope or RAII guard). Consider for profiler enhancement.
+- **Feature-gated profiling** — profiling calls should compile to no-ops when disabled.
+
+#### Known Issues (deferred to sprints)
+- Feature gates (`graphics`, `compute`) declared in Cargo.toml but not enforced in lib.rs — Sprint 1
+- `debug_assert` for Color NaN/Inf (silent in release) — acceptable for GPU hot path
+- No integration tests requiring GPU hardware — requires CI with GPU or mock adapter
+- Texture format fixed to RGBA8UnormSrgb — Sprint 2.2
+
 ---
 
 ## Sprint 1: Core Pipeline Infrastructure
@@ -123,34 +175,39 @@
 
 ---
 
-## Sprint 3: Orchestration & Performance
+## Sprint 3: Caching, Pooling & Performance
 
-> Goal: Multi-pass rendering, instancing, shader caching, indirect dispatch
+> Goal: Pipeline caching, buffer pooling, instancing, shader caching, indirect dispatch
 
-### 3.1 — Render Graph
-- [ ] `RenderGraph` with DAG-based pass ordering (from soorat's render_graph.rs)
-- [ ] Extensible `PassType` enum (`#[non_exhaustive]`)
-- [ ] Topological sort for execution order
-- [ ] Conditional pass enable/disable
-- [ ] Pass-to-pass dependency declaration
+### 3.1 — Pipeline Cache
+- [ ] `PipelineCache` — hash-based dedup of `RenderPipeline` and `ComputePipeline` descriptors
+- [ ] `get_or_create()` API keyed by descriptor hash
+- [ ] Bind group layout interning — share layouts across pipelines
+- [ ] Optional async pipeline compilation (non-blocking creation)
 
-### 3.2 — Instancing
+### 3.2 — Buffer Pool
+- [ ] Size-class buffer pooling (power-of-two sizes)
+- [ ] Generational handles for safe buffer reuse
+- [ ] Automatic recycling on drop
+- [ ] Staging belt for upload batching
+
+### 3.3 — Instancing
 - [ ] `InstanceBuffer` with dynamic growth (from soorat's instancing.rs)
 - [ ] Generic `InstanceData` trait for per-instance attributes
 - [ ] Vertex step mode configuration
 - [ ] Integration with render pipeline draw calls
 
-### 3.3 — Shader Module Cache
+### 3.4 — Shader Module Cache
 - [ ] `ShaderCache` — deduplicate `wgpu::ShaderModule` creation
 - [ ] Key by source hash or label
 - [ ] Invalidation on source change (dev workflow)
 
-### 3.4 — Indirect Dispatch & Draw
+### 3.5 — Indirect Dispatch & Draw
 - [ ] `create_indirect_buffer()` for `DispatchIndirect` / `DrawIndirect` / `DrawIndexedIndirect`
 - [ ] Helpers for compute-driven draw call generation
 - [ ] Multi-draw indirect support (capability-gated)
 
-### 3.5 — Compute Pipeline Enhancements
+### 3.6 — Compute Pipeline Enhancements
 - [ ] Multi-bind-group layout support (currently single group only)
 - [ ] Timestamp query integration in compute passes
 - [ ] Push constant support (when available)
@@ -189,6 +246,7 @@
 
 > Only promoted to a sprint when a consumer needs it
 
+- [ ] Render graph (DAG-based pass orchestration) — likely belongs in soorat, not foundation
 - [ ] Multi-queue coordination (async compute + graphics)
 - [ ] Memory budget tracking / allocation strategy
 - [ ] Specialization constants
