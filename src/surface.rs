@@ -58,6 +58,7 @@ impl SurfaceState {
         let caps = surface.get_capabilities(adapter);
 
         if caps.formats.is_empty() {
+            tracing::error!("no supported surface formats found");
             return Err(GpuError::SurfaceConfig(
                 "no supported surface formats".into(),
             ));
@@ -121,15 +122,21 @@ impl SurfaceState {
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => Ok(texture),
             wgpu::CurrentSurfaceTexture::Timeout => {
+                tracing::warn!("surface texture acquisition timed out");
                 Err(GpuError::SurfaceTexture("surface timeout".into()))
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
+                tracing::warn!("surface texture outdated — resize may be needed");
                 Err(GpuError::SurfaceTexture("surface outdated".into()))
             }
             wgpu::CurrentSurfaceTexture::Lost => {
+                tracing::error!("surface lost — reconfiguration required");
                 Err(GpuError::SurfaceTexture("surface lost".into()))
             }
-            _ => Err(GpuError::SurfaceTexture("unknown surface error".into())),
+            _ => {
+                tracing::error!("unknown surface texture error");
+                Err(GpuError::SurfaceTexture("unknown surface error".into()))
+            }
         }
     }
 

@@ -4,6 +4,17 @@
 >
 > Consumers: soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simulation), aethersafta (desktop compositor), kiran (game engine via soorat)
 
+### Post-Sprint Review Protocol
+
+After completing each sprint, run a review/audit before starting the next:
+
+1. **Cleanliness check**: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. **Internal review**: Audit all new/changed code for gaps, optimizations, security, logging, errors, docs
+3. **Fix findings**: Apply fixes from audit, re-run cleanliness check
+4. **Additional tests/benchmarks**: From review findings
+5. **Benchmarks**: Run full suite, verify no regressions
+6. **Update roadmap**: Record sprint results and findings
+
 ---
 
 ## P(-1): Scaffold Hardening
@@ -109,35 +120,48 @@
 
 ---
 
-## Sprint 1: Core Pipeline Infrastructure
+## Sprint 1: Core Pipeline Infrastructure ✓
 
 > Goal: Render pipeline parity with compute pipeline, vertex/index support, surface lifecycle
 
-### 1.1 — Render Pipeline Abstraction
-- [ ] `RenderPipeline` struct wrapping `wgpu::RenderPipeline` + bind group layout(s)
-- [ ] Builder or constructor accepting vertex/fragment shaders, vertex layouts, blend state, depth config
-- [ ] `encode_pass()` for batching into existing encoder
-- [ ] `draw()` one-shot convenience method
-- [ ] Support multi-bind-group layouts
+### 1.1 — Render Pipeline Abstraction ✓
+- [x] `RenderPipeline` struct wrapping `wgpu::RenderPipeline` + bind group layout(s)
+- [x] `RenderPipelineBuilder` with vertex/fragment shaders, vertex layouts, blend state, depth config
+- [x] `encode_draw()` for batching into existing encoder
+- [x] `draw()` one-shot convenience method
+- [x] Multi-bind-group layout support (Vec<BindGroupLayout>)
+- [x] `DrawCommand` enum (Draw, DrawIndexed) with `#[non_exhaustive]`
 
-### 1.2 — Vertex & Index Buffers
-- [ ] `create_vertex_buffer()` — typed, with usage flags
-- [ ] `create_index_buffer()` — u16/u32 support
-- [ ] `VertexLayout` trait or helper for `wgpu::VertexBufferLayout` generation
-- [ ] Common vertex types: `Vertex2D { pos, uv }`, `Vertex3D { pos, normal, uv }`
-- [ ] Persistent buffer with regrowth pattern (from soorat's SpriteBuffers)
+### 1.2 — Vertex & Index Buffers ✓
+- [x] `create_vertex_buffer()` — generic over `bytemuck::Pod`
+- [x] `create_index_buffer()` — generic (u16/u32)
+- [x] `VertexLayout` trait for `wgpu::VertexBufferLayout` generation
+- [x] `Vertex2D` (32B), `Vertex3D` (48B), `SkinnedVertex3D` (96B) — extracted from soorat
+- [x] `GrowableBuffer` — persistent buffer with 3/2 exponential regrowth
 
-### 1.3 — Surface Lifecycle
-- [ ] `Surface` struct wrapping `wgpu::Surface` + config
-- [ ] `configure()` / `resize()` with validation
-- [ ] `get_current_texture()` → frame target
-- [ ] `present()` with error recovery
-- [ ] Integration with `GpuContext`
+### 1.3 — Surface Lifecycle ✓
+- [x] `SurfaceState` managing `wgpu::SurfaceConfiguration`
+- [x] `configure()` with sRGB format preference and validation
+- [x] `resize()` with zero-size skip
+- [x] `acquire()` with error handling for all surface states
+- [x] `PresentModePreference` enum (Vsync/NoVsync/Immediate/Mailbox)
 
-### 1.4 — Sampler Expansion
-- [ ] `SamplerDescriptor` presets: nearest, linear, anisotropic, comparison (shadow)
-- [ ] `create_sampler()` with configurable filter/address/compare modes
-- [ ] Keep `create_default_sampler()` as convenience
+### 1.4 — Sampler Expansion ✓
+- [x] `SamplerPreset` enum: Nearest, Linear, Anisotropic, Comparison
+- [x] `create_sampler()` and `create_sampler_custom()` helpers
+- [x] `create_default_sampler()` retained for backward compat
+
+### 1.5 — Feature Gate Enforcement ✓
+- [x] `compute` feature gates compute module
+- [x] `graphics` feature gates texture, render_target, vertex, sampler, render_pipeline, surface
+- [x] Core modules (buffer, context, error, capabilities, color, profiler) always available
+- [x] Default features changed to `["full"]`
+
+### Sprint 1 Post-Review Findings
+- Hardened tracing: added `debug!` to all 6 buffer creation functions, `warn!`/`error!` to all error paths
+- Tracing levels: `debug` for normal operations, `warn` for recoverable errors (zero-size, timeout, outdated), `error` for failures (lost surface, adapter not found, overflow, readback failure)
+- Tests: 53 → 90 (37 new across vertex, sampler, surface, render_pipeline, buffer)
+- Added `VertexLayout` trait doc comment, re-exported `create_sampler_custom`
 
 ---
 

@@ -96,14 +96,26 @@ impl Texture {
     ) -> Result<Self> {
         tracing::debug!(width, height, label, "creating texture from RGBA");
         if width == 0 || height == 0 {
+            tracing::warn!(width, height, label, "rejected zero-size texture");
             return Err(GpuError::Texture("zero-size texture".into()));
         }
 
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|v| v.checked_mul(4))
-            .ok_or_else(|| GpuError::Texture("texture dimensions overflow".into()))?;
+            .ok_or_else(|| {
+                tracing::error!(width, height, label, "texture dimensions overflow");
+                GpuError::Texture("texture dimensions overflow".into())
+            })?;
         if rgba.len() != expected {
+            tracing::warn!(
+                width,
+                height,
+                expected,
+                actual = rgba.len(),
+                label,
+                "RGBA buffer size mismatch"
+            );
             return Err(GpuError::Texture(format!(
                 "RGBA buffer size mismatch: expected {width}x{height}x4={expected}, got {}",
                 rgba.len()

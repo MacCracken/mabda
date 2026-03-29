@@ -17,6 +17,12 @@ pub fn create_storage_buffer(
     label: &str,
     read_only: bool,
 ) -> wgpu::Buffer {
+    tracing::debug!(
+        label,
+        size = data.len(),
+        read_only,
+        "creating storage buffer"
+    );
     use wgpu::util::DeviceExt;
     let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     if !read_only {
@@ -39,6 +45,7 @@ pub fn create_storage_buffer_empty(
     label: &str,
     read_only: bool,
 ) -> wgpu::Buffer {
+    tracing::debug!(label, size, read_only, "creating empty storage buffer");
     let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     if !read_only {
         usage |= wgpu::BufferUsages::COPY_SRC;
@@ -57,6 +64,7 @@ pub fn create_storage_buffer_empty(
 /// (64KB on WebGPU). Use storage buffers for larger data.
 #[must_use]
 pub fn create_uniform_buffer(device: &wgpu::Device, data: &[u8], label: &str) -> wgpu::Buffer {
+    tracing::debug!(label, size = data.len(), "creating uniform buffer");
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
@@ -71,6 +79,7 @@ pub fn create_uniform_buffer(device: &wgpu::Device, data: &[u8], label: &str) ->
 /// into it, then map and read.
 #[must_use]
 pub fn create_staging_buffer(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
+    tracing::debug!(label, size, "creating staging buffer");
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
@@ -110,8 +119,14 @@ pub fn read_buffer(
     });
 
     rx.recv()
-        .map_err(|e| GpuError::Readback(format!("channel error: {e}")))?
-        .map_err(|e| GpuError::Readback(format!("map failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!("buffer readback channel error: {e}");
+            GpuError::Readback(format!("channel error: {e}"))
+        })?
+        .map_err(|e| {
+            tracing::error!("buffer readback map failed: {e}");
+            GpuError::Readback(format!("map failed: {e}"))
+        })?;
 
     let data = slice.get_mapped_range();
     let result = data.to_vec();
@@ -145,6 +160,7 @@ pub fn create_vertex_buffer<T: bytemuck::Pod>(
     vertices: &[T],
     label: &str,
 ) -> wgpu::Buffer {
+    tracing::debug!(label, count = vertices.len(), "creating vertex buffer");
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
@@ -163,6 +179,7 @@ pub fn create_index_buffer<T: bytemuck::Pod>(
     indices: &[T],
     label: &str,
 ) -> wgpu::Buffer {
+    tracing::debug!(label, count = indices.len(), "creating index buffer");
     use wgpu::util::DeviceExt;
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),

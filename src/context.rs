@@ -45,6 +45,7 @@ impl GpuContext {
         desc.backends = wgpu::Backends::all();
         let instance = wgpu::Instance::new(desc);
 
+        tracing::debug!("requesting GPU adapter");
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -52,12 +53,18 @@ impl GpuContext {
                 force_fallback_adapter: false,
             })
             .await
-            .map_err(|_| GpuError::AdapterNotFound)?;
+            .map_err(|_| {
+                tracing::error!("no suitable GPU adapter found");
+                GpuError::AdapterNotFound
+            })?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
-            .map_err(|e: wgpu::RequestDeviceError| GpuError::DeviceRequest(e.to_string()))?;
+            .map_err(|e: wgpu::RequestDeviceError| {
+                tracing::error!("GPU device request failed: {e}");
+                GpuError::DeviceRequest(e.to_string())
+            })?;
 
         tracing::info!(
             adapter = adapter.get_info().name,

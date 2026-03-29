@@ -79,16 +79,22 @@ impl RenderTarget {
     /// not in game loops.
     pub fn read_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Vec<u8>> {
         tracing::debug!(self.width, self.height, ?self.format, "reading render target pixels");
-        let bytes_per_row = 4u32
-            .checked_mul(self.width)
-            .ok_or_else(|| GpuError::Readback("bytes_per_row overflow".into()))?;
+        let bytes_per_row = 4u32.checked_mul(self.width).ok_or_else(|| {
+            tracing::error!(width = self.width, "render target bytes_per_row overflow");
+            GpuError::Readback("bytes_per_row overflow".into())
+        })?;
         // wgpu requires rows aligned to 256 bytes
         let padded_bytes_per_row = (bytes_per_row + 255) & !255;
-        let buffer_size = u64::from(
-            padded_bytes_per_row
-                .checked_mul(self.height)
-                .ok_or_else(|| GpuError::Readback("buffer size overflow".into()))?,
-        );
+        let buffer_size = u64::from(padded_bytes_per_row.checked_mul(self.height).ok_or_else(
+            || {
+                tracing::error!(
+                    width = self.width,
+                    height = self.height,
+                    "render target buffer size overflow"
+                );
+                GpuError::Readback("buffer size overflow".into())
+            },
+        )?);
 
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("render_target_readback"),
@@ -135,8 +141,14 @@ impl RenderTarget {
             submission_index: None,
         });
         rx.recv()
-            .map_err(|e| GpuError::Readback(format!("channel: {e}")))?
-            .map_err(|e| GpuError::Readback(format!("map failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!("render target readback channel error: {e}");
+                GpuError::Readback(format!("channel: {e}"))
+            })?
+            .map_err(|e| {
+                tracing::error!("render target readback map failed: {e}");
+                GpuError::Readback(format!("map failed: {e}"))
+            })?;
 
         let data = buffer_slice.get_mapped_range();
 
