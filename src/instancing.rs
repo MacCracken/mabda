@@ -100,6 +100,7 @@ pub struct InstanceBuffer {
 
 impl InstanceBuffer {
     /// Create an instance buffer from a slice of instance data.
+    #[must_use = "GPU buffer allocated but not used"]
     pub fn new(device: &wgpu::Device, instances: &[InstanceData]) -> Self {
         use wgpu::util::DeviceExt;
         tracing::debug!(count = instances.len(), "creating instance buffer");
@@ -117,6 +118,7 @@ impl InstanceBuffer {
     }
 
     /// Create an empty instance buffer with pre-allocated capacity.
+    #[must_use = "GPU buffer allocated but not used"]
     pub fn with_capacity(device: &wgpu::Device, capacity: usize) -> Self {
         let capacity = capacity.max(16);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {

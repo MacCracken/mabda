@@ -168,6 +168,9 @@ impl BindGroupLayoutBuilder {
     }
 
     /// Add a custom entry for binding types not covered by presets.
+    ///
+    /// Unlike preset methods, this does NOT auto-set the `binding` index.
+    /// You must set `entry.binding` manually to the correct value.
     #[must_use]
     pub fn custom(mut self, entry: wgpu::BindGroupLayoutEntry) -> Self {
         self.entries.push(entry);

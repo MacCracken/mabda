@@ -167,8 +167,6 @@ mod tests {
         let cache = PipelineCache::new();
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
-        assert!(!cache.contains_render(42));
-        assert!(!cache.contains_compute(42));
     }
 
     #[test]
@@ -178,14 +176,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "graphics")]
     fn cache_get_render_none() {
         let cache = PipelineCache::new();
+        assert!(!cache.contains_render(1));
         assert!(cache.get_render(1).is_none());
     }
 
     #[test]
+    #[cfg(feature = "compute")]
     fn cache_get_compute_none() {
         let cache = PipelineCache::new();
+        assert!(!cache.contains_compute(1));
         assert!(cache.get_compute(1).is_none());
     }
 
