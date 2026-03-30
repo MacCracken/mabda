@@ -17,15 +17,13 @@ After completing each sprint, run a review/audit before starting the next:
 
 ---
 
-## Pre-v1.0: Documentation & Examples
+## Pre-v1.0: Documentation & Examples ✓
 
-> Goal: Documentation, consumer integration guide, inline examples
-
-### Documentation
-- [ ] Architecture overview (`docs/architecture/overview.md`)
-- [ ] Usage guide with code examples for each module
-- [ ] Consumer integration guide (how soorat/rasa/bijli depend on mabda)
-- [ ] Inline doc examples (`cargo test --doc`)
+All documentation complete:
+- [x] Architecture overview (`docs/architecture/overview.md`)
+- [x] Usage guide with code examples (`docs/guides/usage.md`)
+- [x] Consumer integration guide (`docs/guides/integration.md`)
+- [x] Crate-level module docs updated in lib.rs
 
 ---
 
