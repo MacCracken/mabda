@@ -133,6 +133,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "graphics")]
     fn gpu_render_pass_debug_groups() {
         let Some(ctx) = try_gpu() else { return };
         let target = crate::render_target::RenderTarget::new(
