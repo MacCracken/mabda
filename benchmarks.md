@@ -5,128 +5,128 @@ Three-point tracking: **baseline** (first run) / **previous** / **latest**
 | Point | Date | Commit |
 |-------|------|--------|
 | Baseline | 2026-03-30T03:19:02Z | `4a802cd` |
-| Previous | 2026-03-30T05:09:44Z | `ba81a3e` |
-| Latest | 2026-03-30T05:22:44Z | `19d8b66` |
+| Previous | 2026-03-30T05:22:44Z | `19d8b66` |
+| Latest | 2026-03-30T06:19:37Z | `f113c93` |
 
 ## color_lerp
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `color_lerp` | 267.90 ps | 327.70 ps | 361.50 ps |
+| `color_lerp` | 267.90 ps | 361.50 ps | 257.40 ps |
 
 ## color_from_hex
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `color_from_hex` | 265.70 ps | 315.90 ps | 286.20 ps |
+| `color_from_hex` | 265.70 ps | 286.20 ps | 259.40 ps |
 
 ## color_luminance
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `color_luminance` | 264.30 ps | 311.20 ps | 300.40 ps |
+| `color_luminance` | 264.30 ps | 300.40 ps | 258.80 ps |
 
 ## workgroups_1d
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `workgroups_1d` | 270.20 ps | 286.20 ps | 355.70 ps |
+| `workgroups_1d` | 270.20 ps | 355.70 ps | 258.00 ps |
 
 ## workgroups_2d
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `workgroups_2d` | 263.40 ps | 285.40 ps | 353.30 ps |
+| `workgroups_2d` | 263.40 ps | 353.30 ps | 258.30 ps |
 
 ## profiler_frame_cycle
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `profiler_frame_cycle` | 65.88 ns | 70.38 ns | 76.69 ns |
+| `profiler_frame_cycle` | 65.88 ns | 76.69 ns | 65.56 ns |
 
 ## capabilities_report
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `capabilities_report` | 316.89 ns | 329.26 ns | 373.87 ns |
+| `capabilities_report` | 316.89 ns | 373.87 ns | 287.61 ns |
 
 ## create_storage_buffer_4k
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `create_storage_buffer_4k` | — | 11.23 µs | 5.04 µs |
+| `create_storage_buffer_4k` | — | 5.04 µs | 4.02 µs |
 
 ## create_uniform_buffer_64
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `create_uniform_buffer_64` | — | 2.94 µs | 3.07 µs |
+| `create_uniform_buffer_64` | — | 3.07 µs | 2.81 µs |
 
 ## uniform_buffer_write
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `uniform_buffer_write` | — | 1.23 µs | 1.49 µs |
+| `uniform_buffer_write` | — | 1.49 µs | 929.87 ns |
 
 ## shader_cache_hit
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `shader_cache_hit` | — | 38.63 ns | 42.33 ns |
+| `shader_cache_hit` | — | 42.33 ns | 36.52 ns |
 
 ## shader_cache_miss
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `shader_cache_miss` | — | 3.68 µs | 4.31 µs |
+| `shader_cache_miss` | — | 4.31 µs | 3.65 µs |
 
 ## bind_group_cache_hit
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `bind_group_cache_hit` | — | 16.95 ns | 15.63 ns |
+| `bind_group_cache_hit` | — | 15.63 ns | 13.20 ns |
 
 ## texture_1x1_solid
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `texture_1x1_solid` | — | 7.18 µs | 6.88 µs |
+| `texture_1x1_solid` | — | 6.88 µs | 6.92 µs |
 
 ## texture_256x256_rgba
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `texture_256x256_rgba` | — | 485.16 µs | 441.76 µs |
+| `texture_256x256_rgba` | — | 441.76 µs | 1.06 ms |
 
 ## depth_texture_1080p
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `depth_texture_1080p` | — | 2.46 µs | 2.58 µs |
+| `depth_texture_1080p` | — | 2.58 µs | 2.23 µs |
 
 ## render_target_1080p
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `render_target_1080p` | — | 4.17 µs | 4.23 µs |
+| `render_target_1080p` | — | 4.23 µs | 3.84 µs |
 
 ## render_target_msaa4_1080p
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `render_target_msaa4_1080p` | — | 16.88 µs | 17.47 µs |
+| `render_target_msaa4_1080p` | — | 17.47 µs | 16.32 µs |
 
 ## render_pipeline_build
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `render_pipeline_build` | — | 103.52 µs | 102.57 µs |
+| `render_pipeline_build` | — | 102.57 µs | 97.68 µs |
 
 ## compute_dispatch_1024
 
 | Benchmark | Baseline | Previous | Latest |
 |-----------|----------|----------|--------|
-| `compute_dispatch_1024` | — | 33.31 µs | 30.89 µs |
+| `compute_dispatch_1024` | — | 30.89 µs | 31.50 µs |
 
 ---
 
