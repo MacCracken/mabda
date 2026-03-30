@@ -112,6 +112,13 @@ impl RenderTarget {
         }
     }
 
+    /// Get the depth attachment view, if one exists.
+    #[must_use]
+    #[inline]
+    pub fn depth_view(&self) -> Option<&wgpu::TextureView> {
+        self.depth.as_ref().map(|d| &d.view)
+    }
+
     /// Read back the render target pixels as RGBA8 bytes.
     ///
     /// This is a blocking GPU readback — use for tests and screenshots,

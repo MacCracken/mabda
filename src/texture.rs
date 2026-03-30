@@ -372,7 +372,13 @@ impl CubemapTexture {
             return Err(GpuError::Texture("zero-size cubemap".into()));
         }
 
-        let expected_face_size = (size as usize) * (size as usize) * (bytes_per_pixel as usize);
+        let expected_face_size = (size as usize)
+            .checked_mul(size as usize)
+            .and_then(|v| v.checked_mul(bytes_per_pixel as usize))
+            .ok_or_else(|| {
+                tracing::error!(size, bytes_per_pixel, "cubemap face size overflow");
+                GpuError::Texture("cubemap face size overflow".into())
+            })?;
         for (i, face) in faces.iter().enumerate() {
             if face.len() != expected_face_size {
                 return Err(GpuError::Texture(format!(

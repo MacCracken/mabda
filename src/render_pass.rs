@@ -143,7 +143,14 @@ impl<'a> RenderPassBuilder<'a> {
     /// Begin the render pass on the given command encoder.
     ///
     /// Returns the `wgpu::RenderPass` ready for pipeline/bindgroup/draw calls.
+    /// The returned pass borrows the encoder — drop it before submitting.
     pub fn begin(self, encoder: &'a mut wgpu::CommandEncoder) -> wgpu::RenderPass<'a> {
+        tracing::debug!(
+            color_attachments = self.color_attachments.len(),
+            has_depth = self.depth_attachment.is_some(),
+            label = self.label.unwrap_or("unnamed"),
+            "beginning render pass"
+        );
         let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment<'_>>> = self
             .color_attachments
             .iter()
