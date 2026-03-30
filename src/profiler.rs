@@ -32,7 +32,9 @@ pub struct FrameProfiler {
 /// Timing for a single render/compute pass.
 #[derive(Debug, Clone)]
 pub struct PassTiming {
+    /// Name/identifier of the pass.
     pub label: String,
+    /// Duration of the pass in milliseconds.
     pub duration_ms: f64,
 }
 
@@ -161,10 +163,18 @@ impl FrameProfiler {
             if i > 0 {
                 let _ = write!(out, ",");
             }
+            // Escape JSON special characters in label
+            let escaped = p
+                .label
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
             let _ = write!(
                 out,
-                "{{\"label\":\"{}\",\"duration_ms\":{:.3}}}",
-                p.label, p.duration_ms
+                "{{\"label\":\"{escaped}\",\"duration_ms\":{:.3}}}",
+                p.duration_ms
             );
         }
         let _ = write!(out, "]}}");
@@ -207,6 +217,7 @@ pub struct ProfileScope<'a> {
 
 impl<'a> ProfileScope<'a> {
     /// Start timing a named scope.
+    #[must_use = "profile scope records nothing if not bound to a variable"]
     pub fn new(profiler: &'a mut FrameProfiler, label: impl Into<String>) -> Self {
         Self {
             profiler,
@@ -502,6 +513,22 @@ mod tests {
         let csv = p.export_history_csv();
         assert!(csv.starts_with("frame,ms\n"));
         assert_eq!(csv.lines().count(), 4); // header + 3 data lines
+    }
+
+    #[test]
+    fn profiler_export_json_escaping() {
+        let mut p = FrameProfiler::new();
+        p.begin_frame();
+        p.record_pass("shadow\"pass", 1.0);
+        p.record_pass("line\nbreak", 2.0);
+        p.end_frame();
+        let json = p.export_json();
+        // Escaped quotes should not break JSON structure
+        assert!(json.contains("shadow\\\"pass"));
+        assert!(json.contains("line\\nbreak"));
+        // Should be parseable (basic structural check)
+        assert!(json.starts_with('{'));
+        assert!(json.ends_with('}'));
     }
 
     #[test]

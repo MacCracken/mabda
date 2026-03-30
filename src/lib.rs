@@ -22,9 +22,10 @@
 //!
 //! # Modules
 //!
-//! - **Core**: [`context`], [`error`], [`capabilities`], [`color`]
-//! - **Compute**: [`compute`], [`buffer`]
-//! - **Graphics**: [`texture`], [`render_target`]
+//! - **Core**: [`context`], [`error`], [`capabilities`], [`color`], [`buffer`], [`typed_buffer`], [`debug`], [`resource`]
+//! - **Compute**: [`compute`] (feature-gated)
+//! - **Graphics**: [`texture`], [`render_target`], [`render_pipeline`], [`render_pass`], [`vertex`], [`sampler`], [`surface`], [`depth`], [`blend`], [`bind_group`], [`instancing`] (feature-gated)
+//! - **Caching**: [`shader`], [`pipeline_cache`]
 //! - **Profiling**: [`profiler`]
 
 // ── Core (always available) ─────────────────────────────────────────────────

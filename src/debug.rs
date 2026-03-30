@@ -42,6 +42,7 @@ pub struct DebugScope<'a> {
 
 impl<'a> DebugScope<'a> {
     /// Push a debug group and return a guard that pops it on drop.
+    #[must_use = "debug scope pops immediately if not bound to a variable"]
     pub fn new(encoder: &'a mut wgpu::CommandEncoder, label: &str) -> Self {
         encoder.push_debug_group(label);
         Self { encoder }
