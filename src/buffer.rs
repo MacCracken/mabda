@@ -221,6 +221,83 @@ pub fn create_index_buffer<T: bytemuck::Pod>(
     })
 }
 
+/// Create an indirect dispatch buffer (3 × u32: workgroups_x, workgroups_y, workgroups_z).
+///
+/// The buffer has `INDIRECT | STORAGE | COPY_DST` usage, allowing it to be
+/// written by compute shaders or the CPU, then used for `dispatch_workgroups_indirect`.
+#[must_use]
+pub fn create_dispatch_indirect_buffer(
+    device: &wgpu::Device,
+    workgroups: [u32; 3],
+    label: &str,
+) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    tracing::debug!(label, ?workgroups, "creating dispatch indirect buffer");
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&workgroups),
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// Create an indirect draw buffer (4 × u32: vertex_count, instance_count, first_vertex, first_instance).
+///
+/// The buffer has `INDIRECT | STORAGE | COPY_DST` usage.
+#[cfg(feature = "graphics")]
+#[must_use]
+pub fn create_draw_indirect_buffer(
+    device: &wgpu::Device,
+    vertex_count: u32,
+    instance_count: u32,
+    label: &str,
+) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    tracing::debug!(
+        label,
+        vertex_count,
+        instance_count,
+        "creating draw indirect buffer"
+    );
+    let data = [vertex_count, instance_count, 0u32, 0u32];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&data),
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// Create an indirect indexed draw buffer (5 × u32: index_count, instance_count, first_index, base_vertex, first_instance).
+///
+/// The buffer has `INDIRECT | STORAGE | COPY_DST` usage.
+#[cfg(feature = "graphics")]
+#[must_use]
+pub fn create_draw_indexed_indirect_buffer(
+    device: &wgpu::Device,
+    index_count: u32,
+    instance_count: u32,
+    label: &str,
+) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    tracing::debug!(
+        label,
+        index_count,
+        instance_count,
+        "creating indexed draw indirect buffer"
+    );
+    let data = [index_count, instance_count, 0u32, 0u32, 0u32];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(&data),
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
 /// A GPU buffer that grows automatically when data exceeds capacity.
 ///
 /// Uses exponential growth (3/2 multiplier, minimum 16 elements) to

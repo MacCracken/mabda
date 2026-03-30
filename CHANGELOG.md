@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **render_pass** — `RenderPassBuilder` for fluent render pass construction with multiple color attachments (MRT), MSAA resolve targets, depth/stencil attachments
 - **render_target** — `RenderTargetBuilder` with MSAA support (multisampled + resolve textures), optional depth attachment; `render_view()` and `resolve_target()` helpers
 - **texture** — `Texture::from_raw()` for any `TextureFormat` (not just RGBA8); default textures: `black_pixel()`, `transparent_pixel()`, `flat_normal()`; `CubemapTexture` for 6-face cubemaps with bind group helper; `copy_texture_to_texture()` utility; `mip_level_count()` calculation helper; `Texture::format()` accessor
+- **compute** — multi-bind-group support: `with_layouts()` for multiple groups, `dispatch_multi()` / `encode_dispatch_multi()`, `encode_dispatch_indirect()` for GPU-driven dispatch; `PingPongBuffer` for iterative compute patterns (FDTD, blur, fluid)
+- **bind_group** — `BindGroupLayoutBuilder` with preset methods: `uniform_buffer()`, `storage_buffer()`, `texture_2d()`, `texture_cube()`, `texture_depth_2d()`, `sampler()`, `comparison_sampler()`, auto-incrementing binding indices
+- **instancing** — `InstanceData` (80B: model matrix + color tint) with vertex layout at locations 7–11; `InstanceBuffer` with dynamic growth
+- **shader** — `ShaderCache` for hash-based shader module deduplication with `get_or_compile()`, `invalidate()`, and `clear()`
+- **pipeline_cache** — `PipelineCache` for hash-based render/compute pipeline deduplication with `get_or_insert_render()` / `get_or_insert_compute()`, feature-gated per pipeline type
+- **buffer** — `create_dispatch_indirect_buffer()`, `create_draw_indirect_buffer()`, `create_draw_indexed_indirect_buffer()` for GPU-driven dispatch and draw
 - **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback; existing `GpuContext::new()` / `new_for_surface()` remain as convenience wrappers
 - **buffer** — `PendingReadback` + `read_buffer_async()` for non-blocking GPU readback; `read_buffer()` refactored to delegate to async path; `GrowableBuffer::generation()` counter for bind group invalidation detection
 - **compute** — `validate_dispatch()` checks workgroup counts against `max_compute_workgroups_per_dimension`

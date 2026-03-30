@@ -33,6 +33,7 @@ pub mod capabilities;
 pub mod color;
 pub mod context;
 pub mod error;
+pub mod pipeline_cache;
 pub mod profiler;
 pub mod typed_buffer;
 
@@ -42,17 +43,24 @@ pub mod compute;
 
 // ── Graphics ────────────────────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
+pub mod bind_group;
+#[cfg(feature = "graphics")]
 pub mod blend;
 #[cfg(feature = "graphics")]
 pub mod depth;
 #[cfg(feature = "graphics")]
+pub mod instancing;
+#[cfg(feature = "graphics")]
 pub mod render_pass;
+
+// ── Shared (no feature gate) ────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
 pub mod render_pipeline;
 #[cfg(feature = "graphics")]
 pub mod render_target;
 #[cfg(feature = "graphics")]
 pub mod sampler;
+pub mod shader;
 #[cfg(feature = "graphics")]
 pub mod surface;
 #[cfg(feature = "graphics")]
@@ -67,22 +75,33 @@ pub use context::{GpuContext, GpuContextBuilder};
 pub use error::{GpuError, Result};
 
 pub use buffer::{
-    GrowableBuffer, PendingReadback, create_staging_buffer, create_storage_buffer,
-    create_storage_buffer_empty, create_uniform_buffer, read_buffer, read_buffer_async,
-    read_buffer_typed,
+    GrowableBuffer, PendingReadback, create_dispatch_indirect_buffer, create_staging_buffer,
+    create_storage_buffer, create_storage_buffer_empty, create_uniform_buffer, read_buffer,
+    read_buffer_async, read_buffer_typed,
 };
+pub use pipeline_cache::PipelineCache;
+pub use shader::ShaderCache;
 
 // ── Compute re-exports ──────────────────────────────────────────────────────
 #[cfg(feature = "compute")]
-pub use compute::{ComputePipeline, validate_dispatch, workgroups_1d, workgroups_2d};
+pub use compute::{
+    ComputePipeline, PingPongBuffer, validate_dispatch, workgroups_1d, workgroups_2d,
+};
 
 // ── Graphics re-exports ─────────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
+pub use bind_group::BindGroupLayoutBuilder;
+#[cfg(feature = "graphics")]
 pub use blend::{BlendPreset, blend_state};
 #[cfg(feature = "graphics")]
-pub use buffer::{create_index_buffer, create_vertex_buffer};
+pub use buffer::{
+    create_draw_indexed_indirect_buffer, create_draw_indirect_buffer, create_index_buffer,
+    create_vertex_buffer,
+};
 #[cfg(feature = "graphics")]
 pub use depth::DepthTexture;
+#[cfg(feature = "graphics")]
+pub use instancing::{InstanceBuffer, InstanceData};
 #[cfg(feature = "graphics")]
 pub use render_pass::RenderPassBuilder;
 #[cfg(feature = "graphics")]
