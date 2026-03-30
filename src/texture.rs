@@ -94,7 +94,39 @@ impl Texture {
         label: &str,
         sampler: wgpu::Sampler,
     ) -> Result<Self> {
-        tracing::debug!(width, height, label, "creating texture from RGBA");
+        Self::from_raw(
+            device,
+            queue,
+            rgba,
+            width,
+            height,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            label,
+            sampler,
+        )
+    }
+
+    /// Create a texture from raw pixel data with any format.
+    ///
+    /// This is the most flexible texture constructor. All other `from_*`
+    /// methods delegate to this.
+    ///
+    /// - `bytes_per_pixel`: Number of bytes per texel (e.g., 4 for RGBA8, 8 for RGBA16Float).
+    /// - `format`: The `wgpu::TextureFormat` matching the pixel data layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        format: wgpu::TextureFormat,
+        label: &str,
+        sampler: wgpu::Sampler,
+    ) -> Result<Self> {
+        tracing::debug!(width, height, ?format, label, "creating texture");
         if width == 0 || height == 0 {
             tracing::warn!(width, height, label, "rejected zero-size texture");
             return Err(GpuError::Texture("zero-size texture".into()));
@@ -102,23 +134,24 @@ impl Texture {
 
         let expected = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|v| v.checked_mul(4))
+            .and_then(|v| v.checked_mul(bytes_per_pixel as usize))
             .ok_or_else(|| {
                 tracing::error!(width, height, label, "texture dimensions overflow");
                 GpuError::Texture("texture dimensions overflow".into())
             })?;
-        if rgba.len() != expected {
+        if data.len() != expected {
             tracing::warn!(
                 width,
                 height,
+                bytes_per_pixel,
                 expected,
-                actual = rgba.len(),
+                actual = data.len(),
                 label,
-                "RGBA buffer size mismatch"
+                "pixel buffer size mismatch"
             );
             return Err(GpuError::Texture(format!(
-                "RGBA buffer size mismatch: expected {width}x{height}x4={expected}, got {}",
-                rgba.len()
+                "pixel buffer size mismatch: expected {width}x{height}x{bytes_per_pixel}={expected}, got {}",
+                data.len()
             )));
         }
 
@@ -134,7 +167,7 @@ impl Texture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -146,10 +179,10 @@ impl Texture {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            rgba,
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
+                bytes_per_row: Some(bytes_per_pixel * width),
                 rows_per_image: Some(height),
             },
             size,
@@ -162,6 +195,13 @@ impl Texture {
             view,
             sampler,
         })
+    }
+
+    /// Get the texture format.
+    #[must_use]
+    #[inline]
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.texture.format()
     }
 
     /// Create a wgpu bind group for this texture (texture view + sampler at bindings 0, 1).

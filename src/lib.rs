@@ -42,6 +42,10 @@ pub mod compute;
 
 // ── Graphics ────────────────────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
+pub mod blend;
+#[cfg(feature = "graphics")]
+pub mod depth;
+#[cfg(feature = "graphics")]
 pub mod render_pipeline;
 #[cfg(feature = "graphics")]
 pub mod render_target;
@@ -72,7 +76,11 @@ pub use compute::{ComputePipeline, validate_dispatch, workgroups_1d, workgroups_
 
 // ── Graphics re-exports ─────────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
+pub use blend::{BlendPreset, blend_state};
+#[cfg(feature = "graphics")]
 pub use buffer::{create_index_buffer, create_vertex_buffer};
+#[cfg(feature = "graphics")]
+pub use depth::DepthTexture;
 #[cfg(feature = "graphics")]
 pub use render_pipeline::{DrawCommand, RenderPipeline, RenderPipelineBuilder};
 #[cfg(feature = "graphics")]
