@@ -123,19 +123,19 @@ impl SurfaceState {
             wgpu::CurrentSurfaceTexture::Success(texture) => Ok(texture),
             wgpu::CurrentSurfaceTexture::Timeout => {
                 tracing::warn!("surface texture acquisition timed out");
-                Err(GpuError::SurfaceTexture("surface timeout".into()))
+                Err(GpuError::SurfaceTimeout)
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 tracing::warn!("surface texture outdated — resize may be needed");
-                Err(GpuError::SurfaceTexture("surface outdated".into()))
+                Err(GpuError::SurfaceOutdated)
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 tracing::error!("surface lost — reconfiguration required");
-                Err(GpuError::SurfaceTexture("surface lost".into()))
+                Err(GpuError::SurfaceLost)
             }
             _ => {
                 tracing::error!("unknown surface texture error");
-                Err(GpuError::SurfaceTexture("unknown surface error".into()))
+                Err(GpuError::SurfaceLost)
             }
         }
     }

@@ -16,8 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **sampler** — `SamplerPreset` enum (Nearest, Linear, Anisotropic, Comparison); `create_sampler()` and `create_sampler_custom()` helpers
 - **feature gates** — `compute` feature gates compute module; `graphics` feature gates texture, render_target, vertex, sampler, render_pipeline, surface; core modules always available; default features changed to `["full"]`
 - **deny.toml** — license, advisory, and source checks for dependencies
+- **typed_buffer** — `UniformBuffer<T>` with 16-byte alignment enforcement; `StorageBuffer<T>` for typed storage buffer management; both use `bytemuck::Pod` for safe byte casting
+- **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback; existing `GpuContext::new()` / `new_for_surface()` remain as convenience wrappers
+- **buffer** — `PendingReadback` + `read_buffer_async()` for non-blocking GPU readback; `read_buffer()` refactored to delegate to async path; `GrowableBuffer::generation()` counter for bind group invalidation detection
+- **compute** — `validate_dispatch()` checks workgroup counts against `max_compute_workgroups_per_dimension`
+- **texture** — `validate_dimensions()` checks against `max_texture_dimension_2d`
 
 ### Changed
+
+- **error** — `GpuError` restructured with `#[source]` chaining: `DeviceRequest` wraps `wgpu::RequestDeviceError`, `ReadbackMap` wraps `wgpu::BufferAsyncError`, `ImageDecode` wraps `image::ImageError`; surface errors split into `SurfaceTimeout` / `SurfaceOutdated` / `SurfaceLost`; added `is_recoverable()` method; added `WorkgroupLimitExceeded` and `TextureDimensionExceeded` variants
 
 - **buffer** — all buffer creation functions now emit `tracing::debug!` with label and size
 - **error paths** — all error paths now emit `tracing::warn!` (recoverable) or `tracing::error!` (failures) before returning errors
@@ -28,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **capabilities** — `report()` uses `write!` instead of `format!` to avoid temporary allocation
 - **profiler** — `begin_frame()`, `end_frame()`, `record_pass()`, `query_set()`, `max_passes()` marked `#[inline]`
 - **compute** — `bind_group_layout()`, `raw()` marked `#[inline]`; `dispatch()` emits tracing
+
+### Breaking
+
+- **error** — removed `SurfaceTexture(String)` variant (replaced by `SurfaceTimeout`, `SurfaceOutdated`, `SurfaceLost`); removed `Readback(String)` variant (replaced by `ReadbackMap`, `ReadbackChannel`); `DeviceRequest` now wraps `wgpu::RequestDeviceError` instead of `String`
 
 ### Removed
 

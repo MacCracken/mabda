@@ -181,6 +181,42 @@ impl ComputePipeline {
     }
 }
 
+/// Validate workgroup counts against device limits.
+///
+/// Returns `Err(GpuError::WorkgroupLimitExceeded)` if any dimension exceeds
+/// `max_compute_workgroups_per_dimension`.
+pub fn validate_dispatch(
+    limits: &wgpu::Limits,
+    workgroups_x: u32,
+    workgroups_y: u32,
+    workgroups_z: u32,
+) -> crate::error::Result<()> {
+    use crate::error::GpuError;
+    let max = limits.max_compute_workgroups_per_dimension;
+    if workgroups_x > max {
+        return Err(GpuError::WorkgroupLimitExceeded {
+            axis: "x",
+            actual: workgroups_x,
+            limit: max,
+        });
+    }
+    if workgroups_y > max {
+        return Err(GpuError::WorkgroupLimitExceeded {
+            axis: "y",
+            actual: workgroups_y,
+            limit: max,
+        });
+    }
+    if workgroups_z > max {
+        return Err(GpuError::WorkgroupLimitExceeded {
+            axis: "z",
+            actual: workgroups_z,
+            limit: max,
+        });
+    }
+    Ok(())
+}
+
 /// Calculate workgroup count for a 1D dispatch.
 ///
 /// Returns `ceil(total / workgroup_size)`.
@@ -240,6 +276,39 @@ mod tests {
     fn workgroups_2d_single() {
         assert_eq!(workgroups_2d(1, 1, 8, 8), (1, 1));
         assert_eq!(workgroups_2d(0, 0, 8, 8), (0, 0));
+    }
+
+    #[test]
+    fn validate_dispatch_within_limits() {
+        let limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 65535,
+            ..Default::default()
+        };
+        assert!(validate_dispatch(&limits, 100, 100, 1).is_ok());
+        assert!(validate_dispatch(&limits, 65535, 65535, 65535).is_ok());
+    }
+
+    #[test]
+    fn validate_dispatch_exceeds_limits() {
+        let limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 65535,
+            ..Default::default()
+        };
+        assert!(validate_dispatch(&limits, 65536, 1, 1).is_err());
+        assert!(validate_dispatch(&limits, 1, 65536, 1).is_err());
+        assert!(validate_dispatch(&limits, 1, 1, 65536).is_err());
+    }
+
+    #[test]
+    fn validate_dispatch_error_contains_axis() {
+        let limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 100,
+            ..Default::default()
+        };
+        let err = validate_dispatch(&limits, 200, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("x"));
+        let err = validate_dispatch(&limits, 1, 200, 1).unwrap_err();
+        assert!(err.to_string().contains("y"));
     }
 
     #[test]

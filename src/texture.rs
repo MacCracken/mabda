@@ -44,7 +44,7 @@ impl Texture {
     ) -> Result<Self> {
         tracing::debug!(label, "loading texture from bytes");
         let img = image::load_from_memory(bytes)
-            .map_err(|e| GpuError::Texture(e.to_string()))?
+            .map_err(GpuError::ImageDecode)?
             .to_rgba8();
 
         let (width, height) = img.dimensions();
@@ -288,6 +288,31 @@ impl TextureCache {
     }
 }
 
+/// Validate texture dimensions against device limits.
+///
+/// Returns `Err(GpuError::TextureDimensionExceeded)` if either dimension
+/// exceeds `max_texture_dimension_2d`.
+pub fn validate_dimensions(
+    width: u32,
+    height: u32,
+    limits: &wgpu::Limits,
+) -> crate::error::Result<()> {
+    let max = limits.max_texture_dimension_2d;
+    if width > max {
+        return Err(crate::error::GpuError::TextureDimensionExceeded {
+            actual: width,
+            limit: max,
+        });
+    }
+    if height > max {
+        return Err(crate::error::GpuError::TextureDimensionExceeded {
+            actual: height,
+            limit: max,
+        });
+    }
+    Ok(())
+}
+
 impl Default for TextureCache {
     fn default() -> Self {
         Self::new()
@@ -312,5 +337,25 @@ mod tests {
     fn texture_cache_default() {
         let cache = TextureCache::default();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn validate_dimensions_within_limits() {
+        let limits = wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..Default::default()
+        };
+        assert!(validate_dimensions(1024, 1024, &limits).is_ok());
+        assert!(validate_dimensions(8192, 8192, &limits).is_ok());
+    }
+
+    #[test]
+    fn validate_dimensions_exceeds_limits() {
+        let limits = wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..Default::default()
+        };
+        assert!(validate_dimensions(8193, 1024, &limits).is_err());
+        assert!(validate_dimensions(1024, 8193, &limits).is_err());
     }
 }

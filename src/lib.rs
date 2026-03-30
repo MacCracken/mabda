@@ -34,6 +34,7 @@ pub mod color;
 pub mod context;
 pub mod error;
 pub mod profiler;
+pub mod typed_buffer;
 
 // ── Compute ─────────────────────────────────────────────────────────────────
 #[cfg(feature = "compute")]
@@ -56,17 +57,18 @@ pub mod vertex;
 // ── Core re-exports ─────────────────────────────────────────────────────────
 pub use capabilities::GpuCapabilities;
 pub use color::Color;
-pub use context::GpuContext;
+pub use context::{GpuContext, GpuContextBuilder};
 pub use error::{GpuError, Result};
 
 pub use buffer::{
-    GrowableBuffer, create_staging_buffer, create_storage_buffer, create_storage_buffer_empty,
-    create_uniform_buffer, read_buffer,
+    GrowableBuffer, PendingReadback, create_staging_buffer, create_storage_buffer,
+    create_storage_buffer_empty, create_uniform_buffer, read_buffer, read_buffer_async,
+    read_buffer_typed,
 };
 
 // ── Compute re-exports ──────────────────────────────────────────────────────
 #[cfg(feature = "compute")]
-pub use compute::ComputePipeline;
+pub use compute::{ComputePipeline, validate_dispatch, workgroups_1d, workgroups_2d};
 
 // ── Graphics re-exports ─────────────────────────────────────────────────────
 #[cfg(feature = "graphics")]
@@ -80,9 +82,12 @@ pub use sampler::{SamplerPreset, create_sampler, create_sampler_custom};
 #[cfg(feature = "graphics")]
 pub use surface::{PresentModePreference, SurfaceState};
 #[cfg(feature = "graphics")]
-pub use texture::{Texture, TextureCache, create_default_sampler};
+pub use texture::{Texture, TextureCache, create_default_sampler, validate_dimensions};
 #[cfg(feature = "graphics")]
 pub use vertex::{SkinnedVertex3D, Vertex2D, Vertex3D, VertexLayout};
+
+// ── Typed buffer re-exports ──────────────────────────────────────────────────
+pub use typed_buffer::{StorageBuffer, UniformBuffer};
 
 // ── Profiling re-exports ────────────────────────────────────────────────────
 pub use profiler::{FrameProfiler, GpuTimestamps, PassTiming};

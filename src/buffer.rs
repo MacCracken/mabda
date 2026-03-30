@@ -99,7 +99,23 @@ pub fn read_buffer(
     source: &wgpu::Buffer,
     size: u64,
 ) -> Result<Vec<u8>> {
-    tracing::debug!(size, "GPU buffer readback");
+    read_buffer_async(device, queue, source, size).finish(device)
+}
+
+/// Submit a buffer readback without blocking.
+///
+/// The GPU copy is submitted immediately. Returns a [`PendingReadback`]
+/// that can be completed later with [`PendingReadback::finish`]. This
+/// allows interleaving other GPU work between submission and completion.
+///
+/// For simple blocking readback, use [`read_buffer`] instead.
+pub fn read_buffer_async(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    size: u64,
+) -> PendingReadback {
+    tracing::debug!(size, "GPU buffer readback submitted");
     let staging = create_staging_buffer(device, size, "readback_staging");
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -108,32 +124,48 @@ pub fn read_buffer(
     encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = device.poll(wgpu::PollType::Wait {
-        timeout: None,
-        submission_index: None,
-    });
+    PendingReadback { staging }
+}
 
-    rx.recv()
-        .map_err(|e| {
-            tracing::error!("buffer readback channel error: {e}");
-            GpuError::Readback(format!("channel error: {e}"))
-        })?
-        .map_err(|e| {
-            tracing::error!("buffer readback map failed: {e}");
-            GpuError::Readback(format!("map failed: {e}"))
-        })?;
+/// A pending GPU readback operation.
+///
+/// The GPU copy has been submitted. Call [`finish`](Self::finish) to
+/// block until the data is available.
+pub struct PendingReadback {
+    staging: wgpu::Buffer,
+}
 
-    let data = slice.get_mapped_range();
-    let result = data.to_vec();
-    drop(data);
-    staging.unmap();
+impl PendingReadback {
+    /// Block until the readback completes and return the data.
+    pub fn finish(self, device: &wgpu::Device) -> Result<Vec<u8>> {
+        let slice = self.staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            timeout: None,
+            submission_index: None,
+        });
 
-    Ok(result)
+        rx.recv()
+            .map_err(|e| {
+                tracing::error!("buffer readback channel error: {e}");
+                let _ = e;
+                GpuError::ReadbackChannel
+            })?
+            .map_err(|e| {
+                tracing::error!("buffer readback map failed: {e}");
+                GpuError::ReadbackMap(e)
+            })?;
+
+        let data = slice.get_mapped_range();
+        let result = data.to_vec();
+        drop(data);
+        self.staging.unmap();
+
+        Ok(result)
+    }
 }
 
 /// Read back a GPU buffer and reinterpret as a typed slice.
@@ -202,6 +234,7 @@ pub struct GrowableBuffer {
     usage: wgpu::BufferUsages,
     label: String,
     element_size: usize,
+    generation: u64,
 }
 
 impl GrowableBuffer {
@@ -231,6 +264,7 @@ impl GrowableBuffer {
             usage: usage | wgpu::BufferUsages::COPY_DST,
             label,
             element_size,
+            generation: 0,
         }
     }
 
@@ -256,6 +290,7 @@ impl GrowableBuffer {
                 "growable buffer regrow"
             );
             self.capacity = new_capacity;
+            self.generation += 1;
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&self.label),
                 size: (self.capacity * self.element_size) as u64,
@@ -279,6 +314,18 @@ impl GrowableBuffer {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Generation counter — increments each time the buffer is reallocated.
+    ///
+    /// Use this to detect when dependent bind groups need rebuilding.
+    /// If the generation changes after an [`update`](Self::update) call,
+    /// the underlying `wgpu::Buffer` has been replaced and any bind groups
+    /// referencing the old buffer are invalid.
+    #[must_use]
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 

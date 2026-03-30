@@ -81,7 +81,7 @@ impl RenderTarget {
         tracing::debug!(self.width, self.height, ?self.format, "reading render target pixels");
         let bytes_per_row = 4u32.checked_mul(self.width).ok_or_else(|| {
             tracing::error!(width = self.width, "render target bytes_per_row overflow");
-            GpuError::Readback("bytes_per_row overflow".into())
+            GpuError::Buffer("bytes_per_row overflow".into())
         })?;
         // wgpu requires rows aligned to 256 bytes
         let padded_bytes_per_row = (bytes_per_row + 255) & !255;
@@ -92,7 +92,7 @@ impl RenderTarget {
                     height = self.height,
                     "render target buffer size overflow"
                 );
-                GpuError::Readback("buffer size overflow".into())
+                GpuError::Buffer("buffer size overflow".into())
             },
         )?);
 
@@ -143,11 +143,12 @@ impl RenderTarget {
         rx.recv()
             .map_err(|e| {
                 tracing::error!("render target readback channel error: {e}");
-                GpuError::Readback(format!("channel: {e}"))
+                let _ = e;
+                GpuError::ReadbackChannel
             })?
             .map_err(|e| {
                 tracing::error!("render target readback map failed: {e}");
-                GpuError::Readback(format!("map failed: {e}"))
+                GpuError::ReadbackMap(e)
             })?;
 
         let data = buffer_slice.get_mapped_range();
