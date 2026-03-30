@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **shader** — `ShaderCache` for hash-based shader module deduplication with `get_or_compile()`, `invalidate()`, and `clear()`
 - **pipeline_cache** — `PipelineCache` for hash-based render/compute pipeline deduplication with `get_or_insert_render()` / `get_or_insert_compute()`, feature-gated per pipeline type
 - **buffer** — `create_dispatch_indirect_buffer()`, `create_draw_indirect_buffer()`, `create_draw_indexed_indirect_buffer()` for GPU-driven dispatch and draw
+- **debug** — `DebugScope` RAII guard for push/pop debug groups on command encoders; `push_debug_group()`, `pop_debug_group()`, `insert_debug_marker()` for encoders, render passes, and compute passes
+- **resource** — `FrameResources` for tracking transient GPU buffers/textures with automatic end-of-frame cleanup
+- **profiler** — frame history ring buffer with `worst_frame_ms()` / `best_frame_ms()` for stutter detection; `export_json()` and `export_history_csv()` for post-frame analysis; `ProfileScope` RAII timer that auto-records pass duration on drop; `with_alpha_and_history()` constructor
 - **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback; existing `GpuContext::new()` / `new_for_surface()` remain as convenience wrappers
 - **buffer** — `PendingReadback` + `read_buffer_async()` for non-blocking GPU readback; `read_buffer()` refactored to delegate to async path; `GrowableBuffer::generation()` counter for bind group invalidation detection
 - **compute** — `validate_dispatch()` checks workgroup counts against `max_compute_workgroups_per_dimension`

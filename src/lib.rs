@@ -32,9 +32,11 @@ pub mod buffer;
 pub mod capabilities;
 pub mod color;
 pub mod context;
+pub mod debug;
 pub mod error;
 pub mod pipeline_cache;
 pub mod profiler;
+pub mod resource;
 pub mod typed_buffer;
 
 // ── Compute ─────────────────────────────────────────────────────────────────
@@ -72,7 +74,9 @@ pub mod vertex;
 pub use capabilities::GpuCapabilities;
 pub use color::Color;
 pub use context::{GpuContext, GpuContextBuilder};
+pub use debug::DebugScope;
 pub use error::{GpuError, Result};
+pub use resource::FrameResources;
 
 pub use buffer::{
     GrowableBuffer, PendingReadback, create_dispatch_indirect_buffer, create_staging_buffer,
@@ -124,4 +128,4 @@ pub use vertex::{SkinnedVertex3D, Vertex2D, Vertex3D, VertexLayout};
 pub use typed_buffer::{StorageBuffer, UniformBuffer};
 
 // ── Profiling re-exports ────────────────────────────────────────────────────
-pub use profiler::{FrameProfiler, GpuTimestamps, PassTiming};
+pub use profiler::{FrameProfiler, GpuTimestamps, PassTiming, ProfileScope};
