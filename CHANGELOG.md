@@ -23,7 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **all modules** — GPU integration tests using headless wgpu backend; 278 tests (was 162), 75.4% line coverage (was 22.47%)
 
 #### Infrastructure
+- **ci** — GitHub Actions CI pipeline: check/lint, security audit, cargo-deny, multi-platform tests (Linux/macOS/Windows), feature-gate tests, MSRV (1.89), coverage (codecov.io), documentation, benchmarks
+- **release** — GitHub Actions release pipeline: tag-triggered, version consistency verification (VERSION/Cargo.toml/tag), crates.io publish, GitHub Release with auto-generated notes
+- **Makefile** — local `make check` (fmt + clippy + test + audit), plus bench, coverage, doc targets
+- **codecov.yml** — coverage thresholds (5% project, 70% patch)
 - **scripts/coverage-check.sh** — CI coverage gate script, fails if line coverage drops below threshold (default: 70%)
+- **rust-toolchain.toml** — pins stable channel with rustfmt + clippy
+- **CONTRIBUTING.md** — development workflow, prerequisites, code style, testing, benchmarks
+- **SECURITY.md** — vulnerability reporting via GitHub Security Advisories, response SLAs
+- **CODE_OF_CONDUCT.md** — Contributor Covenant v2.1
 
 ### Changed
 
