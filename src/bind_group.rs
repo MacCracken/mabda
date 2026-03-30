@@ -263,4 +263,48 @@ mod tests {
             .comparison_sampler(wgpu::ShaderStages::FRAGMENT);
         assert_eq!(builder.entries().len(), 2);
     }
+
+    fn try_gpu() -> Option<wgpu::Device> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some(ctx.device)
+    }
+
+    #[test]
+    fn gpu_build_layout() {
+        let Some(device) = try_gpu() else { return };
+        let custom_entry = wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let builder = BindGroupLayoutBuilder::new()
+            .uniform_buffer_dynamic(wgpu::ShaderStages::VERTEX)
+            .texture_cube(wgpu::ShaderStages::FRAGMENT)
+            .comparison_sampler(wgpu::ShaderStages::FRAGMENT)
+            .custom(custom_entry);
+        assert_eq!(builder.entries().len(), 4);
+        let _layout = builder.build(&device, "test");
+    }
+
+    #[test]
+    fn gpu_all_presets() {
+        let Some(device) = try_gpu() else { return };
+        let builder = BindGroupLayoutBuilder::new()
+            .uniform_buffer(wgpu::ShaderStages::VERTEX)
+            .uniform_buffer_dynamic(wgpu::ShaderStages::VERTEX)
+            .storage_buffer(wgpu::ShaderStages::COMPUTE)
+            .storage_buffer_readonly(wgpu::ShaderStages::COMPUTE)
+            .texture_2d(wgpu::ShaderStages::FRAGMENT)
+            .texture_cube(wgpu::ShaderStages::FRAGMENT)
+            .texture_depth_2d(wgpu::ShaderStages::FRAGMENT)
+            .sampler(wgpu::ShaderStages::FRAGMENT)
+            .comparison_sampler(wgpu::ShaderStages::FRAGMENT);
+        assert_eq!(builder.entries().len(), 9);
+        let _layout = builder.build(&device, "all_presets");
+    }
 }

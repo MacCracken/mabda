@@ -61,6 +61,7 @@ pub struct PassTiming {
 
 impl FrameProfiler {
     /// Create a new profiler with default EMA smoothing (alpha = 0.05).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_alpha(0.05)
     }
@@ -70,6 +71,7 @@ impl FrameProfiler {
     /// `alpha` controls how quickly the average responds to changes:
     /// - Lower values (e.g. 0.01) = smoother, slower to react
     /// - Higher values (e.g. 0.2) = noisier, faster to react
+    #[must_use]
     pub fn with_alpha(alpha: f64) -> Self {
         Self::with_alpha_and_history(alpha, 300)
     }
@@ -78,6 +80,7 @@ impl FrameProfiler {
     ///
     /// `history_capacity` is the number of recent frame times to keep for
     /// stutter detection (default: 300 = ~5 seconds at 60 FPS).
+    #[must_use]
     pub fn with_alpha_and_history(alpha: f64, history_capacity: usize) -> Self {
         Self {
             frame_start: None,
@@ -251,7 +254,8 @@ impl<'a> ProfileScope<'a> {
 impl Drop for ProfileScope<'_> {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed().as_secs_f64() * 1000.0;
-        self.profiler.record_pass(self.label.clone(), elapsed);
+        self.profiler
+            .record_pass(std::mem::take(&mut self.label), elapsed);
     }
 }
 
@@ -279,10 +283,12 @@ impl GpuTimestamps {
     /// Create GPU timestamp queries. Returns `None` if the device doesn't support timestamps.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, max_passes: u32) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            tracing::debug!("GPU timestamps not available — device lacks TIMESTAMP_QUERY");
             return None;
         }
 
-        let max_queries = max_passes * 2; // begin + end per pass
+        let max_queries = max_passes.saturating_mul(2); // begin + end per pass
+        tracing::debug!(max_passes, max_queries, "creating GPU timestamp queries");
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("gpu_timestamps"),
             ty: wgpu::QueryType::Timestamp,
@@ -359,6 +365,7 @@ impl GpuTimestamps {
         });
 
         if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            tracing::warn!("GPU timestamp readback failed");
             return Vec::new();
         }
 

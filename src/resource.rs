@@ -120,4 +120,79 @@ mod tests {
     fn frame_resources_types() {
         let _size = std::mem::size_of::<FrameResources>();
     }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_track_buffer_and_clear() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let mut res = FrameResources::new();
+        let buf = crate::buffer::create_storage_buffer(&device, &[0u8; 64], "track_buf", true);
+        res.track_buffer(buf);
+        assert_eq!(res.buffer_count(), 1);
+        assert_eq!(res.total_count(), 1);
+        res.clear();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn gpu_track_texture_and_clear() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let mut res = FrameResources::new();
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("track_tex"),
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        res.track_texture(tex);
+        assert_eq!(res.texture_count(), 1);
+        res.clear();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn gpu_track_mixed() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let mut res = FrameResources::new();
+        let buf1 = crate::buffer::create_storage_buffer(&device, &[0u8; 32], "mixed_buf1", true);
+        let buf2 = crate::buffer::create_storage_buffer(&device, &[0u8; 32], "mixed_buf2", true);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mixed_tex"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        res.track_buffer(buf1);
+        res.track_buffer(buf2);
+        res.track_texture(tex);
+        assert_eq!(res.total_count(), 3);
+        res.clear();
+        assert!(res.is_empty());
+    }
 }

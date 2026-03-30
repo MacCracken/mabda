@@ -33,6 +33,7 @@ pub enum BlendPreset {
 
 /// Convert a blend preset to a `wgpu::BlendState`.
 #[must_use]
+#[inline]
 pub fn blend_state(preset: BlendPreset) -> wgpu::BlendState {
     match preset {
         BlendPreset::Opaque => wgpu::BlendState::REPLACE,

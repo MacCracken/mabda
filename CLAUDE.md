@@ -36,14 +36,15 @@ soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simu
 1. Work phase — new features, roadmap items, bug fixes
 2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
 3. Test + benchmark additions for new code
-4. Run benchmarks (`./scripts/bench-history.sh`)
-5. Internal review — performance, memory, security, throughput, correctness
-6. Cleanliness check — must be clean after audit
-7. Deeper tests/benchmarks from audit observations
-8. Run benchmarks again — prove the wins
-9. If audit heavy → return to step 5
-10. Documentation — update CHANGELOG, roadmap, docs
-11. Version check — VERSION, Cargo.toml, recipe all in sync
+4. Coverage gate: `./scripts/coverage-check.sh 70` (must stay above 70%)
+5. Run benchmarks (`./scripts/bench-history.sh`)
+6. Internal review — performance, memory, security, throughput, correctness
+7. Cleanliness check — must be clean after audit
+8. Deeper tests/benchmarks from audit observations
+9. Run benchmarks again — prove the wins
+10. If audit heavy → return to step 6
+11. Documentation — update CHANGELOG, roadmap, docs
+12. Version check — VERSION, Cargo.toml, recipe all in sync
 12. Return to step 1
 
 ### Task Sizing

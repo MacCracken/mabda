@@ -20,7 +20,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **adr** — ADR-001 (public fields), ADR-002 (runtime alignment), ADR-003 (fixed vertex types) — all resolved from soorat migration findings
 
 #### Testing
-- **all modules** — GPU integration tests using headless wgpu backend; 241 tests (was 162), line coverage up from 22.47%
+- **all modules** — GPU integration tests using headless wgpu backend; 278 tests (was 162), 75.4% line coverage (was 22.47%)
+
+#### Infrastructure
+- **scripts/coverage-check.sh** — CI coverage gate script, fails if line coverage drops below threshold (default: 70%)
+
+### Changed
+
+#### Audit Hardening
+- **buffer** — `read_buffer_typed`, `GrowableBuffer::new/update` use checked/saturating arithmetic to prevent integer overflow on 32-bit targets
+- **typed_buffer** — `StorageBuffer::empty` uses saturating arithmetic for size calculation
+- **instancing** — `InstanceBuffer::with_capacity/update` use saturating arithmetic for buffer size and growth factor
+- **render_target** — `read_pixels` uses `u64` arithmetic for pixel buffer size to prevent overflow on large textures
+- **profiler** — `GpuTimestamps::new` uses `saturating_mul` for query count; `read_results` logs warning on readback failure instead of silently returning empty; `ProfileScope::drop` uses `mem::take` instead of `clone` to avoid allocation
+- **compute** — `ComputePipeline::with_layouts` now emits `tracing::debug!` on pipeline creation; bind group layout labels use `write!` instead of `format!`
+- **render_pipeline** — bind group layout labels use `write!` instead of `format!` to avoid temporary allocations in loop
+- **context** — `adapter_info()`, `limits()`, `features()` marked `#[inline]`
+- **color** — `from_rgba8()`, `from_hex()`, `to_wgpu()` marked `#[inline]`
+- **blend** — `blend_state()` marked `#[inline]`
+- **depth** — `depth_stencil_state()` marked `#[inline]`
+- **profiler** — `FrameProfiler::new()`, `with_alpha()`, `with_alpha_and_history()` marked `#[must_use]`
+- **vertex** — `VertexLayout::layout()` trait method marked `#[must_use]`
 
 #### Core
 - **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback

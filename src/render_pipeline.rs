@@ -382,9 +382,12 @@ impl<'a> RenderPipelineBuilder<'a> {
             .iter()
             .enumerate()
             .map(|(i, entries)| {
+                use std::fmt::Write;
+                let mut label = String::with_capacity(24);
+                let _ = write!(label, "bind_group_layout_{i}");
                 self.device
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                        label: Some(&format!("bind_group_layout_{i}")),
+                        label: Some(&label),
                         entries,
                     })
             })
@@ -721,5 +724,37 @@ mod tests {
         assert_eq!(pipeline.bind_group_layout_count(), 1);
         assert!(pipeline.bind_group_layout(0).is_some());
         assert!(pipeline.bind_group_layout(1).is_none());
+    }
+
+    #[test]
+    fn gpu_pipeline_indexed_draw() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .build()
+            .unwrap();
+        let idx_buf = crate::buffer::create_index_buffer(&ctx.device, &[0u16, 1, 2], "test_idx");
+        pipeline.draw(
+            &ctx.device,
+            &ctx.queue,
+            &target.view,
+            &[],
+            &[],
+            Some((&idx_buf, wgpu::IndexFormat::Uint16)),
+            DrawCommand::DrawIndexed {
+                index_count: 3,
+                instance_count: 1,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+            },
+            Some(crate::color::Color::BLACK),
+        );
     }
 }

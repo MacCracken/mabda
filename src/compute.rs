@@ -85,6 +85,11 @@ impl ComputePipeline {
         entry_point: &str,
         groups: &[&[wgpu::BindGroupLayoutEntry]],
     ) -> Self {
+        tracing::debug!(
+            entry_point,
+            groups = groups.len(),
+            "creating compute pipeline"
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_shader"),
             source: wgpu::ShaderSource::Wgsl(wgsl_source.into()),
@@ -94,8 +99,11 @@ impl ComputePipeline {
             .iter()
             .enumerate()
             .map(|(i, entries)| {
+                use std::fmt::Write;
+                let mut label = String::with_capacity(20);
+                let _ = write!(label, "compute_layout_{i}");
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some(&format!("compute_layout_{i}")),
+                    label: Some(&label),
                     entries,
                 })
             })

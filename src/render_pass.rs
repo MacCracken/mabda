@@ -341,4 +341,28 @@ mod tests {
         }
         ctx.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    #[test]
+    fn gpu_begin_load_color_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("load_color_test"),
+            });
+        {
+            // Pass None for clear_color to exercise the LoadOp::Load path
+            let _pass = RenderPassBuilder::new()
+                .label("load_color_pass")
+                .color_attachment(&target.view, None)
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
 }

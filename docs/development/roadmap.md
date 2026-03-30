@@ -46,10 +46,37 @@ Soorat uses all three provided types, defines zero custom ones. Derive macro is 
 - [x] All public types documented with inline examples (`/// # Examples`) — 35+ types covered
 - [x] Resolve architectural decisions — ADR-001 (public fields), ADR-002 (runtime alignment), ADR-003 (fixed vertex types)
 - [x] BindGroupCache added for soorat phase 4 readiness (bind group dedup/invalidation)
-- [x] Test coverage push — 257 tests, 69.02% line coverage (up from 162 tests / 22.47%)
+- [x] Test coverage — 278 tests, 75.4% line coverage (up from 162 tests / 22.47%); CI gate at 70%
 - [x] Benchmark suite — 20 benchmarks (CPU + GPU), history tracked in CSV
+- [x] Coverage gate — `./scripts/coverage-check.sh 70` added to work loop
 - [ ] Migrate soorat onto mabda (phases 0-3 done, phase 4 pending: bind group reuse, shader dedup, pipeline caching)
-- [ ] Push test coverage toward 80%+ (remaining gap: surface lifecycle — requires real window)
+
+---
+
+## Test Coverage Roadmap
+
+Current: **75.4%** (278 tests, 1034/1367 lines). CI gate: **70% minimum**.
+
+### To 80% (~63 more lines needed)
+
+| Module | Current | Gap | What to test |
+|--------|---------|-----|--------------|
+| profiler.rs | 59% (72/122) | 50 lines | GpuTimestamps::read_results full path (needs TIMESTAMP_QUERY device), export_history_csv edge cases |
+| typed_buffer.rs | 51% (25/49) | 24 lines | StorageBuffer::new tracing paths, UniformBuffer zero-size rejection path |
+| context.rs | 72% (51/71) | 20 lines | GpuContextBuilder with surface (needs window or mock surface) |
+| render_target.rs | 71% (85/119) | 34 lines | RenderTargetBuilder MSAA read_pixels path, error overflow paths |
+| pipeline_cache.rs | 72% (28/39) | 11 lines | get_or_insert_render/compute with real GPU pipelines |
+| color.rs | 64% (35/55) | 20 lines | Remaining constant definitions (tarpaulin false negatives on `const` items) |
+
+### To 90% (~150 more lines needed)
+
+Requires infrastructure changes:
+
+- [ ] **Surface testing harness** — create a headless surface via `wgpu::Instance::create_surface_from_core` or similar for testing `SurfaceState` (configure, resize, acquire). This covers surface.rs (41 uncovered lines).
+- [ ] **TIMESTAMP_QUERY test device** — request a device with `Features::TIMESTAMP_QUERY` for testing `GpuTimestamps` full lifecycle (resolve + read_results). Falls back to skip on hardware without support.
+- [ ] **Pipeline cache GPU tests** — build real render/compute pipelines, insert into cache, verify dedup and invalidation with actual GPU objects.
+- [ ] **Render pipeline edge cases** — test with vertex buffers, multiple bind groups, MSAA multisample state, all topology variants.
+- [ ] **Texture error paths** — test zero-size rejection, dimension overflow, format mismatch in from_raw.
 
 ---
 

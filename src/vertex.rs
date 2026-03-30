@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 pub trait VertexLayout {
     /// Returns the wgpu vertex buffer layout descriptor for this type.
+    #[must_use]
     fn layout() -> wgpu::VertexBufferLayout<'static>;
 }
 

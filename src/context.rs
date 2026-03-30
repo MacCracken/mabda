@@ -61,18 +61,21 @@ impl GpuContext {
 
     /// Get adapter info (name, backend, vendor, etc.).
     #[must_use]
+    #[inline]
     pub fn adapter_info(&self) -> wgpu::AdapterInfo {
         self.adapter.get_info()
     }
 
     /// Get device limits.
     #[must_use]
+    #[inline]
     pub fn limits(&self) -> wgpu::Limits {
         self.device.limits()
     }
 
     /// Get device features.
     #[must_use]
+    #[inline]
     pub fn features(&self) -> wgpu::Features {
         self.device.features()
     }

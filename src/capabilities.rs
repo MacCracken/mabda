@@ -249,4 +249,17 @@ mod tests {
         assert_eq!(caps.adapter_name, decoded.adapter_name);
         assert_eq!(caps.max_buffer_size, decoded.max_buffer_size);
     }
+
+    fn try_gpu() -> Option<crate::context::GpuContext> {
+        pollster::block_on(crate::context::GpuContext::new()).ok()
+    }
+
+    #[test]
+    fn gpu_from_context() {
+        let Some(ctx) = try_gpu() else { return };
+        let caps = GpuCapabilities::from_context(&ctx);
+        assert!(!caps.adapter_name.is_empty());
+        assert!(caps.max_texture_dimension_2d > 0);
+        assert!(caps.max_buffer_size > 0);
+    }
 }

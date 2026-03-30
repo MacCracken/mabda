@@ -188,7 +188,10 @@ pub fn read_buffer_typed<T: bytemuck::Pod>(
     source: &wgpu::Buffer,
     count: usize,
 ) -> Result<Vec<T>> {
-    let size = (count * std::mem::size_of::<T>()) as u64;
+    let size = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| GpuError::Buffer("read_buffer_typed: size overflow".into()))?
+        as u64;
     let bytes = read_buffer(device, queue, source, size)?;
     Ok(bytemuck::cast_slice(&bytes).to_vec())
 }
@@ -349,7 +352,7 @@ impl GrowableBuffer {
         let capacity = capacity.max(16);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&label),
-            size: (capacity * element_size) as u64,
+            size: (capacity.saturating_mul(element_size)) as u64,
             usage: usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -371,14 +374,14 @@ impl GrowableBuffer {
         queue: &wgpu::Queue,
         data: &[T],
     ) {
-        self.count = data.len() as u32;
+        self.count = data.len().min(u32::MAX as usize) as u32;
 
         if data.is_empty() {
             return;
         }
 
         if data.len() > self.capacity {
-            let new_capacity = (data.len() * 3 / 2).max(16);
+            let new_capacity = data.len().saturating_mul(3).saturating_div(2).max(16);
             tracing::debug!(
                 old_capacity = self.capacity,
                 new_capacity,
@@ -389,7 +392,7 @@ impl GrowableBuffer {
             self.generation += 1;
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&self.label),
-                size: (self.capacity * self.element_size) as u64,
+                size: (self.capacity.saturating_mul(self.element_size)) as u64,
                 usage: self.usage,
                 mapped_at_creation: false,
             });
@@ -596,5 +599,57 @@ mod tests {
         buf.update(&device, &queue, &large);
         assert_eq!(buf.count(), 32);
         assert!(buf.generation() > gen0);
+    }
+
+    #[test]
+    #[cfg(feature = "graphics")]
+    fn gpu_create_vertex_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let buf = create_vertex_buffer(&device, &data, "test_vertex");
+        assert_eq!(buf.size(), (8 * std::mem::size_of::<f32>()) as u64);
+    }
+
+    #[test]
+    #[cfg(feature = "graphics")]
+    fn gpu_create_index_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [u16; 6] = [0, 1, 2, 2, 3, 0];
+        let buf = create_index_buffer(&device, &data, "test_index");
+        // 6 * 2 = 12, but wgpu may pad to 4-byte alignment
+        assert!(buf.size() >= (6 * std::mem::size_of::<u16>()) as u64);
+    }
+
+    #[test]
+    fn gpu_create_dispatch_indirect_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = create_dispatch_indirect_buffer(&device, [64, 1, 1], "test_dispatch");
+        assert_eq!(buf.size(), 12);
+    }
+
+    #[test]
+    #[cfg(feature = "graphics")]
+    fn gpu_create_draw_indirect_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = create_draw_indirect_buffer(&device, 100, 1, "test_draw");
+        assert_eq!(buf.size(), 16);
+    }
+
+    #[test]
+    #[cfg(feature = "graphics")]
+    fn gpu_create_draw_indexed_indirect_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = create_draw_indexed_indirect_buffer(&device, 36, 1, "test_draw_indexed");
+        assert_eq!(buf.size(), 20);
     }
 }

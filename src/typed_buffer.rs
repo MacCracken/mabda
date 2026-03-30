@@ -119,7 +119,7 @@ impl<T: bytemuck::Pod> StorageBuffer<T> {
     /// Create an empty storage buffer with capacity for `count` elements.
     #[must_use = "GPU buffer allocated but not used"]
     pub fn empty(device: &wgpu::Device, count: usize, label: &str, read_only: bool) -> Self {
-        let size = (count * std::mem::size_of::<T>()) as u64;
+        let size = count.saturating_mul(std::mem::size_of::<T>()) as u64;
         tracing::debug!(
             label,
             count,
@@ -304,5 +304,49 @@ mod tests {
         let buf = StorageBuffer::new(&device, &data, "small", false);
         let too_big: [f32; 4] = [0.0; 4];
         assert!(buf.write(&queue, &too_big).is_err());
+    }
+
+    #[test]
+    fn gpu_storage_buffer_write_partial() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 8] = [0.0; 8];
+        let buf = StorageBuffer::new(&device, &data, "partial_write", false);
+        // Write only 4 elements into a buffer with capacity for 8
+        let partial: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        assert!(buf.write(&queue, &partial).is_ok());
+    }
+
+    #[test]
+    fn gpu_storage_buffer_count_and_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 16] = [0.0; 16];
+        let buf = StorageBuffer::new(&device, &data, "accessors", false);
+        assert_eq!(buf.count(), 16);
+        let _raw: &wgpu::Buffer = buf.buffer();
+    }
+
+    // 48-byte struct (multiple of 16)
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Aligned48 {
+        data: [f32; 12], // 48 bytes
+    }
+
+    #[test]
+    fn gpu_uniform_buffer_48_aligned() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        assert!(std::mem::size_of::<Aligned48>().is_multiple_of(16));
+        let data = Aligned48 { data: [0.5; 12] };
+        let buf = UniformBuffer::new(&device, &data, "aligned48");
+        assert!(buf.is_ok());
+        let buf = buf.unwrap();
+        let updated = Aligned48 { data: [1.0; 12] };
+        buf.write(&queue, &updated);
     }
 }

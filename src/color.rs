@@ -92,6 +92,7 @@ impl Color {
 
     /// Create from 8-bit RGBA (0–255).
     #[must_use]
+    #[inline]
     pub fn from_rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self {
             r: r as f32 / 255.0,
@@ -103,6 +104,7 @@ impl Color {
 
     /// Create from hex color (e.g., `0xFF0000FF` for opaque red).
     #[must_use]
+    #[inline]
     pub fn from_hex(hex: u32) -> Self {
         Self::from_rgba8(
             ((hex >> 24) & 0xFF) as u8,
@@ -121,6 +123,7 @@ impl Color {
 
     /// Convert to `wgpu::Color`.
     #[must_use]
+    #[inline]
     pub fn to_wgpu(self) -> wgpu::Color {
         wgpu::Color {
             r: self.r as f64,
@@ -315,5 +318,39 @@ mod tests {
             let r_back = (c.r * 255.0).round() as u8;
             assert_eq!(r_back, val, "roundtrip failed for {val}");
         }
+    }
+
+    #[test]
+    fn color_constants_values() {
+        assert_eq!(Color::RED.r, 1.0);
+        assert_eq!(Color::RED.g, 0.0);
+        assert_eq!(Color::RED.b, 0.0);
+        assert_eq!(Color::GREEN.g, 1.0);
+        assert_eq!(Color::GREEN.r, 0.0);
+        assert_eq!(Color::BLUE.b, 1.0);
+        assert_eq!(Color::BLUE.r, 0.0);
+        assert_eq!(Color::TRANSPARENT.a, 0.0);
+        assert_eq!(Color::TRANSPARENT.r, 0.0);
+        assert!((Color::CORNFLOWER_BLUE.r - 0.392).abs() < f32::EPSILON);
+        assert!((Color::CORNFLOWER_BLUE.g - 0.584).abs() < f32::EPSILON);
+        assert!((Color::CORNFLOWER_BLUE.b - 0.929).abs() < f32::EPSILON);
+        assert_eq!(Color::CORNFLOWER_BLUE.a, 1.0);
+    }
+
+    #[test]
+    fn color_to_array_roundtrip() {
+        let original = Color::new(0.2, 0.4, 0.6, 0.8);
+        let arr = original.to_array();
+        let restored: Color = arr.into();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn color_rgb_constructor_alpha() {
+        let c = Color::rgb(0.5, 0.5, 0.5);
+        assert_eq!(c.a, 1.0);
+        assert_eq!(c.r, 0.5);
+        assert_eq!(c.g, 0.5);
+        assert_eq!(c.b, 0.5);
     }
 }

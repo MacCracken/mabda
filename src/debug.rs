@@ -131,4 +131,62 @@ mod tests {
         }
         ctx.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    #[test]
+    fn gpu_render_pass_debug_groups() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_debug_test"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("debug_render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            push_render_debug_group(&mut pass, "render_group");
+            insert_render_debug_marker(&mut pass, "render_marker");
+            pop_render_debug_group(&mut pass);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_compute_pass_debug_groups() {
+        let Some(ctx) = try_gpu() else { return };
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compute_debug_test"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("debug_compute_pass"),
+                timestamp_writes: None,
+            });
+            push_compute_debug_group(&mut pass, "compute_group");
+            insert_compute_debug_marker(&mut pass, "compute_marker");
+            pop_compute_debug_group(&mut pass);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
 }

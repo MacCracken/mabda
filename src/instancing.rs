@@ -142,7 +142,7 @@ impl InstanceBuffer {
         let capacity = capacity.max(16);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),
-            size: (capacity * std::mem::size_of::<InstanceData>()) as u64,
+            size: capacity.saturating_mul(std::mem::size_of::<InstanceData>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -167,7 +167,7 @@ impl InstanceBuffer {
         }
 
         if instances.len() > self.capacity {
-            self.capacity = (instances.len() * 3 / 2).max(16);
+            self.capacity = instances.len().saturating_mul(3).saturating_div(2).max(16);
             tracing::debug!(
                 old_count = self.count,
                 new_capacity = self.capacity,
@@ -175,7 +175,10 @@ impl InstanceBuffer {
             );
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instance_buffer"),
-                size: (self.capacity * std::mem::size_of::<InstanceData>()) as u64,
+                size: self
+                    .capacity
+                    .saturating_mul(std::mem::size_of::<InstanceData>())
+                    as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });

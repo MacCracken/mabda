@@ -86,6 +86,7 @@ impl DepthTexture {
     ///
     /// Uses `Less` comparison (standard depth test) with depth writes enabled.
     #[must_use]
+    #[inline]
     pub fn depth_stencil_state(&self) -> wgpu::DepthStencilState {
         wgpu::DepthStencilState {
             format: self.format,

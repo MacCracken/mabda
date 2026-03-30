@@ -200,9 +200,10 @@ impl RenderTarget {
         let data = buffer_slice.get_mapped_range();
 
         // Strip row padding
-        let mut pixels = Vec::with_capacity((4 * self.width * self.height) as usize);
+        let pixel_count = 4u64 * u64::from(self.width) * u64::from(self.height);
+        let mut pixels = Vec::with_capacity(pixel_count as usize);
         for row in 0..self.height {
-            let start = (row * padded_bytes_per_row) as usize;
+            let start = (u64::from(row) * u64::from(padded_bytes_per_row)) as usize;
             let end = start + (4 * self.width) as usize;
             pixels.extend_from_slice(&data[start..end]);
         }
