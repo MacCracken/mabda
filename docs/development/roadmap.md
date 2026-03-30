@@ -17,13 +17,11 @@ After completing each sprint, run a review/audit before starting the next:
 
 ---
 
-## Pre-v1.0: Documentation & Examples ✓
+## v1.0 Remaining
 
-All documentation complete:
-- [x] Architecture overview (`docs/architecture/overview.md`)
-- [x] Usage guide with code examples (`docs/guides/usage.md`)
-- [x] Consumer integration guide (`docs/guides/integration.md`)
-- [x] Crate-level module docs updated in lib.rs
+- [ ] 80%+ test coverage (162 tests exist, needs measurement)
+- [ ] All public types documented with inline examples (`/// # Examples`)
+- [ ] At least one consumer (soorat) fully migrated to mabda pipelines
 
 ---
 
@@ -49,20 +47,3 @@ All documentation complete:
 - [ ] Staging belt integration (wgpu's StagingBelt for streaming uploads)
 - [ ] TextureArray — layered 2D textures
 - [ ] Mipmap generation (compute or blit)
-
----
-
-## v1.0 Criteria
-
-- [ ] Documentation complete (architecture, usage guide, consumer integration)
-- [ ] 80%+ test coverage
-- [ ] Benchmark suite covering all hot paths
-- [ ] Zero `unwrap()` / `panic!()` in library code
-- [ ] All public types documented with examples
-- [ ] At least one consumer (soorat) fully migrated to mabda pipelines
-- [ ] `cargo clippy --all-features -- -D warnings` clean
-- [ ] `cargo deny check` clean
-- [ ] CHANGELOG complete with benchmark numbers for performance items
-- [ ] Structured errors with source chaining throughout
-- [ ] No silent data corruption (typed buffers with alignment enforcement)
-- [ ] Device lost handling for all consumers
