@@ -46,6 +46,8 @@ pub mod blend;
 #[cfg(feature = "graphics")]
 pub mod depth;
 #[cfg(feature = "graphics")]
+pub mod render_pass;
+#[cfg(feature = "graphics")]
 pub mod render_pipeline;
 #[cfg(feature = "graphics")]
 pub mod render_target;
@@ -82,6 +84,8 @@ pub use buffer::{create_index_buffer, create_vertex_buffer};
 #[cfg(feature = "graphics")]
 pub use depth::DepthTexture;
 #[cfg(feature = "graphics")]
+pub use render_pass::RenderPassBuilder;
+#[cfg(feature = "graphics")]
 pub use render_pipeline::{DrawCommand, RenderPipeline, RenderPipelineBuilder};
 #[cfg(feature = "graphics")]
 pub use render_target::{RenderTarget, RenderTargetBuilder};
@@ -91,7 +95,8 @@ pub use sampler::{SamplerPreset, create_sampler, create_sampler_custom};
 pub use surface::{PresentModePreference, SurfaceState};
 #[cfg(feature = "graphics")]
 pub use texture::{
-    Texture, TextureCache, create_default_sampler, mip_level_count, validate_dimensions,
+    CubemapTexture, Texture, TextureCache, copy_texture_to_texture, create_default_sampler,
+    mip_level_count, validate_dimensions,
 };
 #[cfg(feature = "graphics")]
 pub use vertex::{SkinnedVertex3D, Vertex2D, Vertex3D, VertexLayout};

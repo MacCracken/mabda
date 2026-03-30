@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **feature gates** — `compute` feature gates compute module; `graphics` feature gates texture, render_target, vertex, sampler, render_pipeline, surface; core modules always available; default features changed to `["full"]`
 - **deny.toml** — license, advisory, and source checks for dependencies
 - **typed_buffer** — `UniformBuffer<T>` with 16-byte alignment enforcement; `StorageBuffer<T>` for typed storage buffer management; both use `bytemuck::Pod` for safe byte casting
+- **depth** — `DepthTexture` struct with `Depth32Float` and `Depth24PlusStencil8` format constants, resize support, `depth_stencil_state()` helper for pipeline integration
+- **blend** — `BlendPreset` enum (Opaque, AlphaBlend, PremultipliedAlpha, Additive, Multiply) with `blend_state()` converter
+- **render_pass** — `RenderPassBuilder` for fluent render pass construction with multiple color attachments (MRT), MSAA resolve targets, depth/stencil attachments
+- **render_target** — `RenderTargetBuilder` with MSAA support (multisampled + resolve textures), optional depth attachment; `render_view()` and `resolve_target()` helpers
+- **texture** — `Texture::from_raw()` for any `TextureFormat` (not just RGBA8); default textures: `black_pixel()`, `transparent_pixel()`, `flat_normal()`; `CubemapTexture` for 6-face cubemaps with bind group helper; `copy_texture_to_texture()` utility; `mip_level_count()` calculation helper; `Texture::format()` accessor
 - **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback; existing `GpuContext::new()` / `new_for_surface()` remain as convenience wrappers
 - **buffer** — `PendingReadback` + `read_buffer_async()` for non-blocking GPU readback; `read_buffer()` refactored to delegate to async path; `GrowableBuffer::generation()` counter for bind group invalidation detection
 - **compute** — `validate_dispatch()` checks workgroup counts against `max_compute_workgroups_per_dimension`

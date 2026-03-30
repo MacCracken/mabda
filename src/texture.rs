@@ -343,6 +343,159 @@ impl TextureCache {
     }
 }
 
+/// A GPU cubemap texture (6 faces) with view and sampler.
+pub struct CubemapTexture {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
+    pub size: u32,
+}
+
+impl CubemapTexture {
+    /// Create a cubemap from 6 face images (raw pixel data, same size).
+    ///
+    /// Faces should be provided in order: +X, -X, +Y, -Y, +Z, -Z.
+    /// Each face must be `size x size` pixels in the given format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        faces: [&[u8]; 6],
+        size: u32,
+        bytes_per_pixel: u32,
+        format: wgpu::TextureFormat,
+        label: &str,
+        sampler: wgpu::Sampler,
+    ) -> Result<Self> {
+        tracing::debug!(size, ?format, label, "creating cubemap texture");
+        if size == 0 {
+            return Err(GpuError::Texture("zero-size cubemap".into()));
+        }
+
+        let expected_face_size = (size as usize) * (size as usize) * (bytes_per_pixel as usize);
+        for (i, face) in faces.iter().enumerate() {
+            if face.len() != expected_face_size {
+                return Err(GpuError::Texture(format!(
+                    "cubemap face {i} size mismatch: expected {expected_face_size}, got {}",
+                    face.len()
+                )));
+            }
+        }
+
+        let extent = wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 6,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        for (i, face) in faces.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                face,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_pixel * size),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(label),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+
+        Ok(Self {
+            texture,
+            view,
+            sampler,
+            size,
+        })
+    }
+
+    /// Create a bind group for this cubemap (view at binding 0, sampler at binding 1).
+    #[must_use]
+    pub fn bind_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cubemap_bind_group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+}
+
+/// Copy a region from one texture to another.
+///
+/// Both textures must have compatible formats and the region must fit
+/// within both source and destination dimensions.
+pub fn copy_texture_to_texture(
+    encoder: &mut wgpu::CommandEncoder,
+    source: &wgpu::Texture,
+    dest: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) {
+    tracing::debug!(width, height, "texture-to-texture copy");
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: source,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: dest,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 /// Calculate the number of mip levels for a texture of the given dimensions.
 ///
 /// Returns `floor(log2(max(width, height))) + 1`, which is the standard
