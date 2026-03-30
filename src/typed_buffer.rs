@@ -26,6 +26,7 @@ impl<T: bytemuck::Pod> UniformBuffer<T> {
     ///
     /// Returns `Err(GpuError::Buffer)` if `size_of::<T>()` is not a
     /// multiple of 16 bytes.
+    #[must_use = "GPU buffer allocated but not used"]
     pub fn new(device: &wgpu::Device, data: &T, label: &str) -> Result<Self> {
         let size = std::mem::size_of::<T>();
         if size == 0 {
@@ -73,6 +74,7 @@ impl<T: bytemuck::Pod> StorageBuffer<T> {
     ///
     /// - `read_only = true`: buffer is read-only in shaders (no `COPY_SRC`).
     /// - `read_only = false`: buffer is read-write with `COPY_SRC` for readback.
+    #[must_use = "GPU buffer allocated but not used"]
     pub fn new(device: &wgpu::Device, data: &[T], label: &str, read_only: bool) -> Self {
         tracing::debug!(
             label,
@@ -95,6 +97,7 @@ impl<T: bytemuck::Pod> StorageBuffer<T> {
     }
 
     /// Create an empty storage buffer with capacity for `count` elements.
+    #[must_use = "GPU buffer allocated but not used"]
     pub fn empty(device: &wgpu::Device, count: usize, label: &str, read_only: bool) -> Self {
         let size = (count * std::mem::size_of::<T>()) as u64;
         tracing::debug!(
@@ -114,9 +117,20 @@ impl<T: bytemuck::Pod> StorageBuffer<T> {
 
     /// Write new data to the buffer.
     ///
-    /// The data length must not exceed the buffer's original capacity.
-    pub fn write(&self, queue: &wgpu::Queue, data: &[T]) {
+    /// The data length must not exceed the buffer's original capacity
+    /// (as set by [`new`](Self::new) or [`empty`](Self::empty)).
+    ///
+    /// Returns `Err(GpuError::Buffer)` if `data.len()` exceeds capacity.
+    pub fn write(&self, queue: &wgpu::Queue, data: &[T]) -> Result<()> {
+        if data.len() > self.count {
+            return Err(GpuError::Buffer(format!(
+                "storage buffer write exceeds capacity: {} > {}",
+                data.len(),
+                self.count
+            )));
+        }
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
+        Ok(())
     }
 
     /// Get the underlying wgpu buffer for bind group creation.

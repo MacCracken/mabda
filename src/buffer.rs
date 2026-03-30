@@ -131,6 +131,7 @@ pub fn read_buffer_async(
 ///
 /// The GPU copy has been submitted. Call [`finish`](Self::finish) to
 /// block until the data is available.
+#[must_use = "readback submitted but never completed — call .finish()"]
 pub struct PendingReadback {
     staging: wgpu::Buffer,
 }
