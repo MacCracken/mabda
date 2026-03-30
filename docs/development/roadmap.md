@@ -46,7 +46,7 @@ Fixed vertex types (`Vertex2D`, `Vertex3D`, `SkinnedVertex3D`) cover common case
 ---
 
 ## v1.0 Remaining
-
+- [ ] P1 - RenderPipelineBuilder doesn't support fragment: None (depth-only pipelines like shadow), enhancement candidate.
 - [ ] Migrate soorat onto mabda (local dependency, build, test, fix API friction)
 - [ ] Resolve architectural decisions above based on migration findings
 - [ ] 80%+ test coverage (162 tests exist, needs measurement)
