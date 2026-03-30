@@ -84,13 +84,15 @@ pub use depth::DepthTexture;
 #[cfg(feature = "graphics")]
 pub use render_pipeline::{DrawCommand, RenderPipeline, RenderPipelineBuilder};
 #[cfg(feature = "graphics")]
-pub use render_target::RenderTarget;
+pub use render_target::{RenderTarget, RenderTargetBuilder};
 #[cfg(feature = "graphics")]
 pub use sampler::{SamplerPreset, create_sampler, create_sampler_custom};
 #[cfg(feature = "graphics")]
 pub use surface::{PresentModePreference, SurfaceState};
 #[cfg(feature = "graphics")]
-pub use texture::{Texture, TextureCache, create_default_sampler, validate_dimensions};
+pub use texture::{
+    Texture, TextureCache, create_default_sampler, mip_level_count, validate_dimensions,
+};
 #[cfg(feature = "graphics")]
 pub use vertex::{SkinnedVertex3D, Vertex2D, Vertex3D, VertexLayout};
 

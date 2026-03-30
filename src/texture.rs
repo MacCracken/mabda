@@ -71,6 +71,21 @@ impl Texture {
         Self::from_color(device, queue, crate::color::Color::WHITE)
     }
 
+    /// Create a 1x1 black pixel texture.
+    pub fn black_pixel(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
+        Self::from_color(device, queue, crate::color::Color::BLACK)
+    }
+
+    /// Create a 1x1 transparent pixel texture.
+    pub fn transparent_pixel(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
+        Self::from_color(device, queue, crate::color::Color::TRANSPARENT)
+    }
+
+    /// Create a 1x1 flat normal map texture (pointing straight up: RGB = 128, 128, 255).
+    pub fn flat_normal(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
+        Self::from_rgba(device, queue, &[128, 128, 255, 255], 1, 1, "flat_normal")
+    }
+
     /// Create a texture from raw RGBA8 pixel data.
     pub fn from_rgba(
         device: &wgpu::Device,
@@ -328,6 +343,19 @@ impl TextureCache {
     }
 }
 
+/// Calculate the number of mip levels for a texture of the given dimensions.
+///
+/// Returns `floor(log2(max(width, height))) + 1`, which is the standard
+/// mip chain length down to 1x1.
+#[must_use]
+#[inline]
+pub fn mip_level_count(width: u32, height: u32) -> u32 {
+    if width == 0 || height == 0 {
+        return 1;
+    }
+    (width.max(height)).ilog2() + 1
+}
+
 /// Validate texture dimensions against device limits.
 ///
 /// Returns `Err(GpuError::TextureDimensionExceeded)` if either dimension
@@ -387,6 +415,17 @@ mod tests {
         };
         assert!(validate_dimensions(1024, 1024, &limits).is_ok());
         assert!(validate_dimensions(8192, 8192, &limits).is_ok());
+    }
+
+    #[test]
+    fn mip_level_count_values() {
+        assert_eq!(mip_level_count(1, 1), 1);
+        assert_eq!(mip_level_count(2, 2), 2);
+        assert_eq!(mip_level_count(4, 4), 3);
+        assert_eq!(mip_level_count(256, 256), 9);
+        assert_eq!(mip_level_count(1024, 512), 11);
+        assert_eq!(mip_level_count(1, 512), 10);
+        assert_eq!(mip_level_count(0, 0), 1);
     }
 
     #[test]
