@@ -9,6 +9,18 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 /// Frame profiler — tracks CPU-side frame timing and GPU pass durations.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::profiler::FrameProfiler;
+///
+/// let mut profiler = FrameProfiler::new();
+/// profiler.begin_frame();
+/// // ... render work ...
+/// profiler.end_frame();
+/// assert!(profiler.frame_count > 0);
+/// ```
 #[derive(Debug, Clone)]
 pub struct FrameProfiler {
     frame_start: Option<Instant>,
@@ -30,6 +42,15 @@ pub struct FrameProfiler {
 }
 
 /// Timing for a single render/compute pass.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::profiler::PassTiming;
+///
+/// let timing = PassTiming { label: "shadow".into(), duration_ms: 0.42 };
+/// assert_eq!(timing.label, "shadow");
+/// ```
 #[derive(Debug, Clone)]
 pub struct PassTiming {
     /// Name/identifier of the pass.
@@ -237,6 +258,15 @@ impl Drop for ProfileScope<'_> {
 /// GPU timestamp query set — wraps `wgpu::QuerySet` for per-pass GPU timing.
 ///
 /// Only functional when the device supports `Features::TIMESTAMP_QUERY`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::profiler::GpuTimestamps;
+///
+/// let timestamps = GpuTimestamps::new(&device, 8); // up to 8 passes
+/// // Write timestamps around render passes, then resolve and read
+/// ```
 pub struct GpuTimestamps {
     query_set: wgpu::QuerySet,
     resolve_buffer: wgpu::Buffer,
@@ -534,5 +564,69 @@ mod tests {
     #[test]
     fn profile_scope_types() {
         let _size = std::mem::size_of::<ProfileScope<'_>>();
+    }
+
+    #[test]
+    fn profile_scope_records_on_drop() {
+        let mut profiler = FrameProfiler::new();
+        profiler.begin_frame();
+        {
+            let _scope = ProfileScope::new(&mut profiler, "test_scope");
+            // scope drops here
+        }
+        assert_eq!(profiler.pass_times.len(), 1);
+        assert_eq!(profiler.pass_times[0].label, "test_scope");
+        assert!(profiler.pass_times[0].duration_ms >= 0.0);
+    }
+
+    #[test]
+    fn profile_scope_multiple() {
+        let mut profiler = FrameProfiler::new();
+        profiler.begin_frame();
+        {
+            let _a = ProfileScope::new(&mut profiler, "pass_a");
+        }
+        {
+            let _b = ProfileScope::new(&mut profiler, "pass_b");
+        }
+        assert_eq!(profiler.pass_times.len(), 2);
+        assert_eq!(profiler.pass_times[0].label, "pass_a");
+        assert_eq!(profiler.pass_times[1].label, "pass_b");
+    }
+
+    fn try_gpu() -> Option<crate::context::GpuContext> {
+        pollster::block_on(crate::context::GpuContext::new()).ok()
+    }
+
+    #[test]
+    fn gpu_timestamps_requires_feature() {
+        let Some(ctx) = try_gpu() else { return };
+        let ts = GpuTimestamps::new(&ctx.device, &ctx.queue, 8);
+        if ctx
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            let ts = ts.unwrap();
+            assert_eq!(ts.max_passes(), 8);
+            let _qs = ts.query_set();
+        } else {
+            assert!(ts.is_none());
+        }
+    }
+
+    #[test]
+    fn gpu_timestamps_resolve() {
+        let Some(ctx) = try_gpu() else { return };
+        let Some(ts) = GpuTimestamps::new(&ctx.device, &ctx.queue, 4) else {
+            return;
+        };
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        ts.resolve(&mut encoder, 2);
+        ctx.queue.submit(std::iter::once(encoder.finish()));
     }
 }

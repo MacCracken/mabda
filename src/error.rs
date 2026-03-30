@@ -3,6 +3,18 @@
 use thiserror::Error;
 
 /// Errors produced by mabda GPU operations.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::error::GpuError;
+///
+/// let err = GpuError::AdapterNotFound;
+/// assert!(!err.is_recoverable());
+///
+/// let err = GpuError::SurfaceTimeout;
+/// assert!(err.is_recoverable());
+/// ```
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GpuError {

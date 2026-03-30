@@ -29,6 +29,7 @@
 //! - **Profiling**: [`profiler`]
 
 // ── Core (always available) ─────────────────────────────────────────────────
+pub mod bind_group_cache;
 pub mod buffer;
 pub mod capabilities;
 pub mod color;
@@ -79,6 +80,7 @@ pub use debug::DebugScope;
 pub use error::{GpuError, Result};
 pub use resource::FrameResources;
 
+pub use bind_group_cache::BindGroupCache;
 pub use buffer::{
     GrowableBuffer, PendingReadback, create_dispatch_indirect_buffer, create_staging_buffer,
     create_storage_buffer, create_storage_buffer_empty, create_uniform_buffer, read_buffer,

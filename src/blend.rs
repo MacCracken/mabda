@@ -4,6 +4,15 @@
 //! for render pipeline color targets.
 
 /// Common blend mode presets.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::blend::{BlendPreset, blend_state};
+///
+/// let state = blend_state(BlendPreset::AlphaBlend);
+/// let opaque = blend_state(BlendPreset::Opaque);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BlendPreset {

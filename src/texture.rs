@@ -24,6 +24,19 @@ pub fn create_default_sampler(device: &wgpu::Device) -> wgpu::Sampler {
 }
 
 /// A GPU texture with view and sampler, ready for binding.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::texture::Texture;
+///
+/// // Load from image bytes (requires `image` feature):
+/// let tex = Texture::from_bytes(&device, &queue, include_bytes!("icon.png"), "icon")?;
+///
+/// // 1x1 fallback textures:
+/// let white = Texture::white_pixel(&device, &queue)?;
+/// let normal = Texture::flat_normal(&device, &queue)?;
+/// ```
 pub struct Texture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -258,6 +271,16 @@ struct CachedTexture {
 }
 
 /// Cache of loaded textures, keyed by u64 texture ID.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::texture::TextureCache;
+///
+/// let mut cache = TextureCache::new();
+/// cache.insert(0, texture, 1920 * 1080 * 4);
+/// let tex = cache.get(0);
+/// ```
 pub struct TextureCache {
     entries: HashMap<u64, CachedTexture>,
 }
@@ -344,6 +367,16 @@ impl TextureCache {
 }
 
 /// A GPU cubemap texture (6 faces) with view and sampler.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::texture::CubemapTexture;
+///
+/// let cubemap = CubemapTexture::from_faces(
+///     &device, &queue, &faces, 512, "skybox",
+/// )?;
+/// ```
 pub struct CubemapTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -595,5 +628,286 @@ mod tests {
         };
         assert!(validate_dimensions(8193, 1024, &limits).is_err());
         assert!(validate_dimensions(1024, 8193, &limits).is_err());
+    }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_create_default_sampler() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let _sampler = create_default_sampler(&device);
+    }
+
+    #[test]
+    fn gpu_texture_from_rgba() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let rgba = [255u8, 0, 0, 255]; // 1x1 red pixel
+        let tex = Texture::from_rgba(&device, &queue, &rgba, 1, 1, "red_pixel").unwrap();
+        assert_eq!(tex.texture.width(), 1);
+        assert_eq!(tex.texture.height(), 1);
+    }
+
+    #[test]
+    fn gpu_texture_from_color() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let tex = Texture::from_color(&device, &queue, crate::color::Color::RED).unwrap();
+        assert_eq!(tex.texture.width(), 1);
+    }
+
+    #[test]
+    fn gpu_texture_white_pixel() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let _tex = Texture::white_pixel(&device, &queue).unwrap();
+    }
+
+    #[test]
+    fn gpu_texture_black_pixel() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let _tex = Texture::black_pixel(&device, &queue).unwrap();
+    }
+
+    #[test]
+    fn gpu_texture_transparent_pixel() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let _tex = Texture::transparent_pixel(&device, &queue).unwrap();
+    }
+
+    #[test]
+    fn gpu_texture_flat_normal() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let _tex = Texture::flat_normal(&device, &queue).unwrap();
+    }
+
+    #[test]
+    fn gpu_texture_from_raw() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data = vec![128u8; 4 * 4 * 4]; // 4x4 RGBA
+        let sampler = create_default_sampler(&device);
+        let tex = Texture::from_raw(
+            &device,
+            &queue,
+            &data,
+            4,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "raw_test",
+            sampler,
+        )
+        .unwrap();
+        assert_eq!(tex.texture.width(), 4);
+        assert_eq!(tex.texture.height(), 4);
+    }
+
+    #[test]
+    fn gpu_copy_texture_to_texture() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        // Create textures with COPY_SRC/COPY_DST usage for copy test
+        let src_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("copy_src"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dst_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("copy_dst"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_test"),
+        });
+        copy_texture_to_texture(&mut encoder, &src_tex, &dst_tex, 2, 2);
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_texture_bind_group() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let tex = Texture::white_pixel(&device, &queue).unwrap();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tex_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let _bg = tex.bind_group(&device, &layout);
+    }
+
+    #[test]
+    fn gpu_texture_size() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data = vec![0u8; 8 * 4 * 4]; // 8x4 RGBA
+        let tex = Texture::from_rgba(&device, &queue, &data, 8, 4, "size_test").unwrap();
+        assert_eq!(tex.size(), (8, 4));
+    }
+
+    #[test]
+    fn gpu_texture_format() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let tex = Texture::white_pixel(&device, &queue).unwrap();
+        assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8UnormSrgb);
+    }
+
+    #[test]
+    fn gpu_cubemap_texture() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let face_data = vec![128u8; 2 * 2 * 4]; // 2x2 RGBA per face
+        let faces: [&[u8]; 6] = [
+            &face_data, &face_data, &face_data, &face_data, &face_data, &face_data,
+        ];
+        let sampler = create_default_sampler(&device);
+        let cubemap = CubemapTexture::new(
+            &device,
+            &queue,
+            faces,
+            2,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "test_cubemap",
+            sampler,
+        )
+        .unwrap();
+        assert_eq!(cubemap.size, 2);
+    }
+
+    #[test]
+    fn gpu_cubemap_zero_size_error() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let face = vec![0u8; 0];
+        let faces: [&[u8]; 6] = [&face, &face, &face, &face, &face, &face];
+        let sampler = create_default_sampler(&device);
+        let result = CubemapTexture::new(
+            &device,
+            &queue,
+            faces,
+            0,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "bad",
+            sampler,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gpu_cubemap_face_size_mismatch() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let good_face = vec![0u8; 2 * 2 * 4];
+        let bad_face = vec![0u8; 3 * 3 * 4]; // wrong size
+        let faces: [&[u8]; 6] = [
+            &good_face, &good_face, &good_face, &good_face, &good_face, &bad_face,
+        ];
+        let sampler = create_default_sampler(&device);
+        let result = CubemapTexture::new(
+            &device,
+            &queue,
+            faces,
+            2,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "mismatch",
+            sampler,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gpu_texture_cache_with_bind_group() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let tex = Texture::white_pixel(&device, &queue).unwrap();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cache_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mut cache = TextureCache::new();
+        cache.insert(42, tex, &device, &layout);
+        assert!(cache.contains(42));
+        assert!(cache.get(42).is_some());
+        assert!(cache.get_bind_group(42).is_some());
     }
 }

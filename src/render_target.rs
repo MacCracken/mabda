@@ -369,4 +369,109 @@ mod tests {
             wgpu::TextureFormat::Rgba8UnormSrgb
         );
     }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_render_target_new() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTarget::new(&device, 256, 256, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(target.width, 256);
+        assert_eq!(target.height, 256);
+        assert_eq!(target.sample_count, 1);
+        assert!(target.msaa_view.is_none());
+        assert!(target.depth.is_none());
+    }
+
+    #[test]
+    fn gpu_render_target_zero_size_clamp() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTarget::new(&device, 0, 0, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(target.width, 1);
+        assert_eq!(target.height, 1);
+    }
+
+    #[test]
+    fn gpu_render_target_no_msaa_views() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTarget::new(&device, 64, 64, wgpu::TextureFormat::Rgba8UnormSrgb);
+        // Non-MSAA: render_view is the main view, resolve_target is None
+        let _rv = target.render_view();
+        assert!(target.resolve_target().is_none());
+        assert!(target.depth_view().is_none());
+    }
+
+    #[test]
+    fn gpu_render_target_matching_surface() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target =
+            RenderTarget::matching_surface(&device, 800, 600, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(target.format, wgpu::TextureFormat::Bgra8UnormSrgb);
+    }
+
+    #[test]
+    fn gpu_render_target_read_pixels() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTarget::new(&device, 2, 2, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let pixels = target.read_pixels(&device, &queue).unwrap();
+        assert_eq!(pixels.len(), 2 * 2 * 4); // 2x2 RGBA
+    }
+
+    #[test]
+    fn gpu_builder_basic() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTargetBuilder::new(&device, 128, 128).build();
+        assert_eq!(target.width, 128);
+        assert_eq!(target.format, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(target.sample_count, 1);
+    }
+
+    #[test]
+    fn gpu_builder_with_depth() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTargetBuilder::new(&device, 128, 128)
+            .depth(crate::depth::DepthTexture::DEFAULT_FORMAT)
+            .build();
+        assert!(target.depth.is_some());
+        assert!(target.depth_view().is_some());
+    }
+
+    #[test]
+    fn gpu_builder_with_msaa() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTargetBuilder::new(&device, 128, 128).msaa(4).build();
+        assert_eq!(target.sample_count, 4);
+        assert!(target.msaa_view.is_some());
+        assert!(target.resolve_target().is_some());
+    }
+
+    #[test]
+    fn gpu_builder_with_format() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let target = RenderTargetBuilder::new(&device, 64, 64)
+            .format(wgpu::TextureFormat::Rgba16Float)
+            .build();
+        assert_eq!(target.format, wgpu::TextureFormat::Rgba16Float);
+    }
 }

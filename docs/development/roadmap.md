@@ -21,36 +21,35 @@ After completing each sprint, run a review/audit before starting the next:
 
 Decisions that must be resolved during soorat migration, before tagging v1.0. Taking breaking changes after v1 is costly.
 
-### GpuContext public fields vs accessor methods
+### GpuContext public fields vs accessor methods — RESOLVED
 
-`GpuContext` exposes `pub instance`, `pub adapter`, `pub device`, `pub queue` as raw wgpu types. This lets consumers bypass mabda entirely and call wgpu directly.
+**Decision:** Keep public fields. See [ADR-001](../adr/001-gpucontext-public-fields.md).
 
-**Tradeoff:**
-- Public fields: maximum flexibility, zero-cost access, consumers own their wgpu usage
-- Accessor methods: mabda controls access, can add resource tracking, newtype wrappers, or multi-queue support later without breaking API
+Soorat accesses `ctx.device` and `ctx.queue` in many call sites with zero friction. Wrapping adds cost without current benefit. Multi-queue, if needed, is additive.
 
-**Decision needed:** If any future backlog item (multi-queue, resource tracking, GPU memory stats) would require wrapping these types, the public fields must change to methods before v1. Evaluate during soorat migration — if soorat accesses these fields directly in many places, the cost of switching is high. If only a few call sites, switch now.
+### Typed buffer alignment strategy — RESOLVED
 
-### Typed buffer alignment strategy
+**Decision:** Keep runtime validation, no `encase`. See [ADR-002](../adr/002-runtime-alignment-validation.md).
 
-`UniformBuffer<T>` validates `size_of::<T>() % 16 == 0` at runtime. This catches misaligned types but only at creation time, not compile time. The alternative is `encase` (compile-time std140 derive) but adds a dependency.
+Soorat's 4 uniform types were already correctly aligned. Zero alignment errors during migration. Runtime check is sufficient.
 
-**Decision needed:** If soorat migration reveals frequent alignment issues (vec3 padding, nested structs), evaluate adding `encase` as an optional dependency behind a feature gate.
+### Vertex type extensibility — RESOLVED
 
-### Vertex type extensibility
+**Decision:** Keep fixed types + manual `VertexLayout` trait, no derive macro. See [ADR-003](../adr/003-fixed-vertex-types.md).
 
-Fixed vertex types (`Vertex2D`, `Vertex3D`, `SkinnedVertex3D`) cover common cases. The `VertexLayout` trait exists for custom types, but consumers must hand-write `wgpu::VertexBufferLayout` with manual offset calculations.
-
-**Decision needed:** If soorat needs additional vertex formats beyond the three provided, consider a derive macro or builder for vertex layout generation.
+Soorat uses all three provided types, defines zero custom ones. Derive macro is demand-gated.
 
 ---
 
 ## v1.0 Remaining
-- [ ] P1 - RenderPipelineBuilder doesn't support fragment: None (depth-only pipelines like shadow), enhancement candidate.
-- [ ] Migrate soorat onto mabda (local dependency, build, test, fix API friction)
-- [ ] Resolve architectural decisions above based on migration findings
-- [ ] 80%+ test coverage (162 tests exist, needs measurement)
-- [ ] All public types documented with inline examples (`/// # Examples`)
+- [x] P1 - RenderPipelineBuilder depth-only pipeline support (`fragment: None`, `depth_only()` constructor)
+- [x] All public types documented with inline examples (`/// # Examples`) — 35+ types covered
+- [x] Resolve architectural decisions — ADR-001 (public fields), ADR-002 (runtime alignment), ADR-003 (fixed vertex types)
+- [x] BindGroupCache added for soorat phase 4 readiness (bind group dedup/invalidation)
+- [x] Test coverage push — 257 tests, 69.02% line coverage (up from 162 tests / 22.47%)
+- [x] Benchmark suite — 20 benchmarks (CPU + GPU), history tracked in CSV
+- [ ] Migrate soorat onto mabda (phases 0-3 done, phase 4 pending: bind group reuse, shader dedup, pipeline caching)
+- [ ] Push test coverage toward 80%+ (remaining gap: surface lifecycle — requires real window)
 
 ---
 

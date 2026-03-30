@@ -99,4 +99,36 @@ mod tests {
     fn debug_scope_types() {
         let _size = std::mem::size_of::<DebugScope<'_>>();
     }
+
+    fn try_gpu() -> Option<crate::context::GpuContext> {
+        pollster::block_on(crate::context::GpuContext::new()).ok()
+    }
+
+    #[test]
+    fn gpu_push_pop_debug_group() {
+        let Some(ctx) = try_gpu() else { return };
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        push_debug_group(&mut encoder, "test_group");
+        insert_debug_marker(&mut encoder, "marker");
+        pop_debug_group(&mut encoder);
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_debug_scope_raii() {
+        let Some(ctx) = try_gpu() else { return };
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scope_test"),
+            });
+        {
+            let _scope = DebugScope::new(&mut encoder, "scoped_group");
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
 }

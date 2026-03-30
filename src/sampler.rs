@@ -5,6 +5,15 @@
 //! for full control over sampler parameters.
 
 /// Predefined sampler configurations for common use cases.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::sampler::{SamplerPreset, create_sampler};
+///
+/// let linear = create_sampler(&device, SamplerPreset::Linear);
+/// let shadow = create_sampler(&device, SamplerPreset::Comparison);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SamplerPreset {
@@ -107,5 +116,32 @@ mod tests {
     fn sampler_preset_debug() {
         let s = format!("{:?}", SamplerPreset::Comparison);
         assert_eq!(s, "Comparison");
+    }
+
+    fn try_gpu() -> Option<wgpu::Device> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some(ctx.device)
+    }
+
+    #[test]
+    fn gpu_create_all_presets() {
+        let Some(device) = try_gpu() else { return };
+        let _nearest = create_sampler(&device, SamplerPreset::Nearest);
+        let _linear = create_sampler(&device, SamplerPreset::Linear);
+        let _aniso = create_sampler(&device, SamplerPreset::Anisotropic);
+        let _comp = create_sampler(&device, SamplerPreset::Comparison);
+    }
+
+    #[test]
+    fn gpu_create_custom_sampler() {
+        let Some(device) = try_gpu() else { return };
+        let _sampler = create_sampler_custom(
+            &device,
+            &wgpu::SamplerDescriptor {
+                label: Some("custom"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                ..Default::default()
+            },
+        );
     }
 }

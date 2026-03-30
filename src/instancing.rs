@@ -7,6 +7,15 @@
 /// Per-instance data: model matrix (column-major 4x4) + color tint.
 ///
 /// 80 bytes total. Vertex step mode is `Instance`, using shader locations 7–11.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::instancing::InstanceData;
+///
+/// let instance = InstanceData::from_translation(10.0, 0.0, -5.0);
+/// assert_eq!(std::mem::size_of::<InstanceData>(), 80);
+/// ```
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct InstanceData {
@@ -92,6 +101,16 @@ impl InstanceData {
 /// Instance buffer — holds per-instance data on the GPU with dynamic growth.
 ///
 /// Uses the same exponential growth strategy as [`GrowableBuffer`](crate::buffer::GrowableBuffer).
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::instancing::{InstanceData, InstanceBuffer};
+///
+/// let instances = vec![InstanceData::from_translation(0.0, 0.0, 0.0); 100];
+/// let mut buf = InstanceBuffer::new(&device, &instances);
+/// buf.update(&device, &queue, &instances);
+/// ```
 pub struct InstanceBuffer {
     pub buffer: wgpu::Buffer,
     pub count: u32,
@@ -265,5 +284,45 @@ mod tests {
                 assert_eq!(m[j * 4 + i], expected, "mat[{i}][{j}] wrong");
             }
         }
+    }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_instance_buffer_create() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let instances = vec![InstanceData::default(); 10];
+        let buf = InstanceBuffer::new(&device, &instances);
+        assert_eq!(buf.count, 10);
+    }
+
+    #[test]
+    fn gpu_instance_buffer_update() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let initial = vec![InstanceData::default(); 4];
+        let mut buf = InstanceBuffer::new(&device, &initial);
+        assert_eq!(buf.count, 4);
+
+        let larger = vec![InstanceData::from_translation(1.0, 0.0, 0.0); 100];
+        buf.update(&device, &queue, &larger);
+        assert_eq!(buf.count, 100);
+    }
+
+    #[test]
+    fn gpu_instance_buffer_empty() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let initial = vec![InstanceData::default(); 4];
+        let mut buf = InstanceBuffer::new(&device, &initial);
+        buf.update(&device, &queue, &[]);
+        assert_eq!(buf.count, 0);
     }
 }

@@ -7,6 +7,17 @@
 use crate::error::{GpuError, Result};
 
 /// Present mode preference.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::surface::{PresentModePreference, SurfaceState};
+///
+/// let state = SurfaceState::configure(
+///     &surface, &adapter, &device, 1280, 720,
+///     PresentModePreference::Vsync,
+/// )?;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PresentModePreference {
@@ -38,6 +49,21 @@ impl PresentModePreference {
 /// Does NOT own the `wgpu::Surface` — the consumer creates the surface
 /// from their windowing system and passes it in. This struct manages
 /// configuration, resize, and frame acquisition.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut state = SurfaceState::configure(
+///     &surface, &adapter, &device, width, height,
+///     PresentModePreference::Vsync,
+/// )?;
+///
+/// // On window resize:
+/// state.resize(&surface, &device, new_width, new_height);
+///
+/// // Each frame:
+/// let frame = state.get_current_texture(&surface)?;
+/// ```
 pub struct SurfaceState {
     config: wgpu::SurfaceConfiguration,
     format: wgpu::TextureFormat,

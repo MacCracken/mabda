@@ -11,6 +11,16 @@
 /// Use [`with_layout`](Self::with_layout) for a single custom bind group,
 /// or [`with_layouts`](Self::with_layouts) for multiple bind groups
 /// (e.g., storage buffers + uniform buffers + textures).
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::compute::ComputePipeline;
+///
+/// // 2-buffer pipeline (1 output + 1 input):
+/// let pipeline = ComputePipeline::new(&device, WGSL, "main", 2);
+/// pipeline.dispatch(&device, &queue, &bind_group, [64, 1, 1]);
+/// ```
 pub struct ComputePipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
@@ -263,6 +273,18 @@ impl ComputePipeline {
 ///
 /// Common in FDTD simulation, iterative blur, fluid simulation, and any
 /// algorithm that reads from one buffer and writes to another, then swaps.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::compute::PingPongBuffer;
+///
+/// let mut pp = PingPongBuffer::new(&device, &initial_data, "simulation");
+/// for _ in 0..100 {
+///     pipeline.dispatch_with(pp.read(), pp.write(), workgroups);
+///     pp.swap();
+/// }
+/// ```
 pub struct PingPongBuffer {
     buffers: [wgpu::Buffer; 2],
     current: usize,
@@ -476,5 +498,87 @@ mod tests {
     #[test]
     fn ping_pong_types() {
         let _size = std::mem::size_of::<PingPongBuffer>();
+    }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    const DOUBLE_SHADER: &str = r#"
+        @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+        @group(0) @binding(1) var<storage, read> input: array<f32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) id: vec3u) {
+            if id.x < arrayLength(&input) {
+                output[id.x] = input[id.x] * 2.0;
+            }
+        }
+    "#;
+
+    #[test]
+    fn gpu_compute_pipeline_create() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let pipeline = ComputePipeline::new(&device, DOUBLE_SHADER, "main", 2);
+        assert_eq!(pipeline.bind_group_layout_count(), 1);
+        assert!(pipeline.bind_group_layout(0).is_some());
+        assert!(pipeline.bind_group_layout(1).is_none());
+    }
+
+    #[test]
+    fn gpu_compute_dispatch_roundtrip() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let pipeline = ComputePipeline::new(&device, DOUBLE_SHADER, "main", 2);
+
+        let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let input_buf = crate::buffer::create_storage_buffer(
+            &device,
+            bytemuck::cast_slice(&input),
+            "input",
+            true,
+        );
+        let output_buf = crate::buffer::create_storage_buffer_empty(&device, 16, "output", false);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("test_bg"),
+            layout: pipeline.bind_group_layout(0).unwrap(),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        pipeline.dispatch(&device, &queue, &bind_group, 1, 1, 1);
+
+        let result: Vec<f32> =
+            crate::buffer::read_buffer_typed(&device, &queue, &output_buf, 4).unwrap();
+        assert_eq!(result, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn gpu_ping_pong_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let mut pp = PingPongBuffer::new(&device, 64, "pp_test");
+        assert_eq!(pp.index(), 0);
+        let src0 = pp.source() as *const _;
+        let dst0 = pp.dest() as *const _;
+        pp.swap();
+        assert_eq!(pp.index(), 1);
+        // After swap, source/dest are swapped
+        assert_eq!(src0, pp.dest() as *const _);
+        assert_eq!(dst0, pp.source() as *const _);
     }
 }

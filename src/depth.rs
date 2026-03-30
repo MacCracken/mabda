@@ -5,6 +5,15 @@
 //! depth-based effects.
 
 /// A GPU depth texture with view, ready for use as a depth attachment.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::depth::DepthTexture;
+///
+/// let depth = DepthTexture::new_default(&device, 1920, 1080);
+/// // Use depth.view as a depth attachment in a render pass
+/// ```
 pub struct DepthTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -111,5 +120,61 @@ mod tests {
             DepthTexture::DEPTH_STENCIL_FORMAT,
             wgpu::TextureFormat::Depth24PlusStencil8
         );
+    }
+
+    fn try_gpu() -> Option<wgpu::Device> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some(ctx.device)
+    }
+
+    #[test]
+    fn gpu_create_default_depth() {
+        let Some(device) = try_gpu() else { return };
+        let depth = DepthTexture::new_default(&device, 1920, 1080);
+        assert_eq!(depth.width, 1920);
+        assert_eq!(depth.height, 1080);
+        assert_eq!(depth.format, DepthTexture::DEFAULT_FORMAT);
+    }
+
+    #[test]
+    fn gpu_create_depth_stencil() {
+        let Some(device) = try_gpu() else { return };
+        let depth = DepthTexture::new(&device, 800, 600, DepthTexture::DEPTH_STENCIL_FORMAT);
+        assert_eq!(depth.format, wgpu::TextureFormat::Depth24PlusStencil8);
+    }
+
+    #[test]
+    fn gpu_resize_depth() {
+        let Some(device) = try_gpu() else { return };
+        let mut depth = DepthTexture::new_default(&device, 100, 100);
+        depth.resize(&device, 200, 200);
+        assert_eq!(depth.width, 200);
+        assert_eq!(depth.height, 200);
+    }
+
+    #[test]
+    fn gpu_resize_zero_is_noop() {
+        let Some(device) = try_gpu() else { return };
+        let mut depth = DepthTexture::new_default(&device, 100, 100);
+        depth.resize(&device, 0, 200);
+        assert_eq!(depth.width, 100); // unchanged
+    }
+
+    #[test]
+    fn gpu_depth_stencil_state() {
+        let Some(device) = try_gpu() else { return };
+        let depth = DepthTexture::new_default(&device, 100, 100);
+        let state = depth.depth_stencil_state();
+        assert_eq!(state.format, DepthTexture::DEFAULT_FORMAT);
+        assert_eq!(state.depth_write_enabled, Some(true));
+        assert_eq!(state.depth_compare, Some(wgpu::CompareFunction::Less));
+    }
+
+    #[test]
+    fn gpu_min_size_clamp() {
+        let Some(device) = try_gpu() else { return };
+        let depth = DepthTexture::new_default(&device, 0, 0);
+        assert_eq!(depth.width, 1);
+        assert_eq!(depth.height, 1);
     }
 }

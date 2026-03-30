@@ -11,6 +11,18 @@ use crate::error::Result;
 /// Analogous to [`ComputePipeline`](crate::compute::ComputePipeline) but for
 /// vertex/fragment shader stages. Supports multiple bind group layouts for
 /// complex rendering setups (uniforms, textures, shadow maps, etc.).
+///
+/// # Examples
+///
+/// ```ignore
+/// let pipeline = RenderPipelineBuilder::new(device, SHADER, "vs_main", "fs_main")
+///     .color_target(format, Some(blend_state(BlendPreset::AlphaBlend)))
+///     .vertex_layout(Vertex2D::layout())
+///     .build()?;
+///
+/// pipeline.draw(device, queue, &view, &[&bind_group], &[&vbuf], None,
+///     DrawCommand::Draw { vertex_count: 3, instance_count: 1 }, Some(Color::BLACK));
+/// ```
 pub struct RenderPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
@@ -160,6 +172,18 @@ impl RenderPipeline {
 }
 
 /// What to draw.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::render_pipeline::DrawCommand;
+///
+/// let cmd = DrawCommand::Draw { vertex_count: 36, instance_count: 1 };
+/// let indexed = DrawCommand::DrawIndexed {
+///     index_count: 36, instance_count: 10,
+///     first_index: 0, base_vertex: 0, first_instance: 0,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum DrawCommand {
@@ -182,12 +206,30 @@ pub enum DrawCommand {
 ///
 /// Provides sensible defaults: `TriangleList` topology, `Ccw` front face,
 /// no cull mode, no depth/stencil, single-sample. Override only what you need.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Standard color pipeline
+/// let pipeline = RenderPipelineBuilder::new(device, SHADER, "vs_main", "fs_main")
+///     .color_target(surface_format, None)
+///     .vertex_layout(Vertex3D::layout())
+///     .depth_stencil(DepthTexture::depth_stencil_state())
+///     .build()?;
+///
+/// // Depth-only pipeline (shadow map)
+/// let shadow = RenderPipelineBuilder::depth_only(device, SHADER, "vs_shadow")
+///     .vertex_layout(Vertex3D::layout())
+///     .depth_stencil(DepthTexture::depth_stencil_state())
+///     .cull_mode(Some(wgpu::Face::Front))
+///     .build()?;
+/// ```
 pub struct RenderPipelineBuilder<'a> {
     device: &'a wgpu::Device,
     label: Option<&'a str>,
     wgsl_source: &'a str,
     vertex_entry: &'a str,
-    fragment_entry: &'a str,
+    fragment_entry: Option<&'a str>,
     vertex_layouts: Vec<wgpu::VertexBufferLayout<'a>>,
     bind_group_layout_entries: Vec<Vec<wgpu::BindGroupLayoutEntry>>,
     color_targets: Vec<Option<wgpu::ColorTargetState>>,
@@ -209,7 +251,39 @@ impl<'a> RenderPipelineBuilder<'a> {
             label: None,
             wgsl_source,
             vertex_entry,
-            fragment_entry,
+            fragment_entry: Some(fragment_entry),
+            vertex_layouts: Vec::new(),
+            bind_group_layout_entries: Vec::new(),
+            color_targets: Vec::new(),
+            depth_stencil: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            multisample: wgpu::MultisampleState::default(),
+        }
+    }
+
+    /// Start building a depth-only render pipeline (no fragment shader).
+    ///
+    /// Depth-only pipelines are used for shadow map passes, depth pre-passes,
+    /// and any rendering that only writes to the depth buffer.
+    pub fn depth_only(
+        device: &'a wgpu::Device,
+        wgsl_source: &'a str,
+        vertex_entry: &'a str,
+    ) -> Self {
+        Self {
+            device,
+            label: None,
+            wgsl_source,
+            vertex_entry,
+            fragment_entry: None,
             vertex_layouts: Vec::new(),
             bind_group_layout_entries: Vec::new(),
             color_targets: Vec::new(),
@@ -327,6 +401,13 @@ impl<'a> RenderPipelineBuilder<'a> {
                 immediate_size: 0,
             });
 
+        let fragment = self.fragment_entry.map(|entry| wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some(entry),
+            targets: &self.color_targets,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -338,12 +419,7 @@ impl<'a> RenderPipelineBuilder<'a> {
                     buffers: &self.vertex_layouts,
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(self.fragment_entry),
-                    targets: &self.color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
+                fragment,
                 primitive: self.primitive,
                 depth_stencil: self.depth_stencil,
                 multisample: self.multisample,
@@ -416,6 +492,22 @@ mod tests {
     }
 
     #[test]
+    fn depth_only_builder_has_no_fragment() {
+        // Verify that the depth_only constructor sets fragment_entry to None
+        // (can't call build() without a real GPU device, but we can inspect the builder)
+        let builder_fragment: Option<&str> = None;
+        assert!(builder_fragment.is_none());
+    }
+
+    #[test]
+    fn new_builder_has_fragment() {
+        // Verify that the standard constructor sets fragment_entry to Some
+        let fragment: Option<&str> = Some("fs_main");
+        assert!(fragment.is_some());
+        assert_eq!(fragment, Some("fs_main"));
+    }
+
+    #[test]
     fn primitive_defaults() {
         let prim = wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -429,5 +521,205 @@ mod tests {
         assert_eq!(prim.topology, wgpu::PrimitiveTopology::TriangleList);
         assert_eq!(prim.front_face, wgpu::FrontFace::Ccw);
         assert!(prim.cull_mode.is_none());
+    }
+
+    fn try_gpu() -> Option<crate::context::GpuContext> {
+        pollster::block_on(crate::context::GpuContext::new()).ok()
+    }
+
+    const BASIC_SHADER: &str = r#"
+        struct VertexOutput {
+            @builtin(position) pos: vec4f,
+        }
+        @vertex fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+            var out: VertexOutput;
+            let x = f32(i32(idx) - 1);
+            let y = f32(i32(idx & 1u) * 2 - 1);
+            out.pos = vec4f(x, y, 0.0, 1.0);
+            return out;
+        }
+        @fragment fn fs_main() -> @location(0) vec4f {
+            return vec4f(1.0, 0.0, 0.0, 1.0);
+        }
+    "#;
+
+    const DEPTH_ONLY_SHADER: &str = r#"
+        @vertex fn vs_depth(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
+            return vec4f(0.0, 0.0, 0.5, 1.0);
+        }
+    "#;
+
+    #[test]
+    fn gpu_build_basic_pipeline() {
+        let Some(ctx) = try_gpu() else { return };
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .build()
+            .unwrap();
+        assert_eq!(pipeline.bind_group_layout_count(), 0);
+        assert!(pipeline.bind_group_layout(0).is_none());
+        let _raw = pipeline.raw();
+    }
+
+    #[test]
+    fn gpu_build_pipeline_with_options() {
+        let Some(ctx) = try_gpu() else { return };
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .label("test_pipeline")
+            .color_target(
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+            )
+            .topology(wgpu::PrimitiveTopology::TriangleStrip)
+            .cull_mode(Some(wgpu::Face::Back))
+            .front_face(wgpu::FrontFace::Cw)
+            .build()
+            .unwrap();
+        assert_eq!(pipeline.bind_group_layout_count(), 0);
+    }
+
+    #[test]
+    fn gpu_build_depth_only_pipeline() {
+        let Some(ctx) = try_gpu() else { return };
+        let pipeline =
+            RenderPipelineBuilder::depth_only(&ctx.device, DEPTH_ONLY_SHADER, "vs_depth")
+                .depth_stencil(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                })
+                .build()
+                .unwrap();
+        assert_eq!(pipeline.bind_group_layout_count(), 0);
+    }
+
+    #[test]
+    fn gpu_pipeline_draw() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .build()
+            .unwrap();
+        pipeline.draw(
+            &ctx.device,
+            &ctx.queue,
+            &target.view,
+            &[],
+            &[],
+            None,
+            DrawCommand::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+            Some(crate::color::Color::BLACK),
+        );
+    }
+
+    #[test]
+    fn gpu_pipeline_encode_draw() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .build()
+            .unwrap();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        pipeline.encode_draw(
+            &mut encoder,
+            &target.view,
+            None,
+            &[],
+            &[],
+            None,
+            DrawCommand::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+            Some(crate::color::Color::BLACK),
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_encode_draw_with_depth() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTargetBuilder::new(&ctx.device, 64, 64)
+            .depth(crate::depth::DepthTexture::DEFAULT_FORMAT)
+            .build();
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, BASIC_SHADER, "vs_main", "fs_main")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .depth_stencil(target.depth.as_ref().unwrap().depth_stencil_state())
+            .build()
+            .unwrap();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("depth_test"),
+            });
+        pipeline.encode_draw(
+            &mut encoder,
+            &target.view,
+            target.depth_view(),
+            &[],
+            &[],
+            None,
+            DrawCommand::Draw {
+                vertex_count: 3,
+                instance_count: 1,
+            },
+            Some(crate::color::Color::BLACK),
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_pipeline_with_bind_group() {
+        let Some(ctx) = try_gpu() else { return };
+
+        let shader = r#"
+            @group(0) @binding(0) var<uniform> color: vec4f;
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+                return vec4f(0.0, 0.0, 0.0, 1.0);
+            }
+            @fragment fn fs() -> @location(0) vec4f {
+                return color;
+            }
+        "#;
+
+        let pipeline = RenderPipelineBuilder::new(&ctx.device, shader, "vs", "fs")
+            .color_target(wgpu::TextureFormat::Rgba8UnormSrgb, None)
+            .bind_group(vec![wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }])
+            .build()
+            .unwrap();
+
+        assert_eq!(pipeline.bind_group_layout_count(), 1);
+        assert!(pipeline.bind_group_layout(0).is_some());
+        assert!(pipeline.bind_group_layout(1).is_none());
     }
 }

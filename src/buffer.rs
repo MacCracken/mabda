@@ -131,6 +131,14 @@ pub fn read_buffer_async(
 ///
 /// The GPU copy has been submitted. Call [`finish`](Self::finish) to
 /// block until the data is available.
+///
+/// # Examples
+///
+/// ```ignore
+/// let pending = read_buffer_async(&device, &queue, &gpu_buffer, size);
+/// // ... do other work while GPU copies ...
+/// let data: Vec<u8> = pending.finish(&device)?;
+/// ```
 #[must_use = "readback submitted but never completed — call .finish()"]
 pub struct PendingReadback {
     staging: wgpu::Buffer,
@@ -303,6 +311,16 @@ pub fn create_draw_indexed_indirect_buffer(
 /// Uses exponential growth (3/2 multiplier, minimum 16 elements) to
 /// amortize reallocation cost. Suitable for vertex, index, instance,
 /// or storage buffers where the element count varies frame-to-frame.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::buffer::GrowableBuffer;
+///
+/// let mut buf = GrowableBuffer::new(&device, &vertices, usage, "verts");
+/// // Next frame with more data — grows if needed:
+/// buf.write(&device, &queue, &new_vertices);
+/// ```
 pub struct GrowableBuffer {
     /// The underlying GPU buffer.
     pub buffer: wgpu::Buffer,
@@ -469,5 +487,114 @@ mod tests {
         let data_len = 42usize;
         let count = data_len as u32;
         assert_eq!(count, 42);
+    }
+
+    /// Helper: create a headless GPU context, skipping if no adapter available.
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_create_storage_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let buf =
+            create_storage_buffer(&device, bytemuck::cast_slice(&data), "test_storage", false);
+        assert_eq!(buf.size(), 16);
+    }
+
+    #[test]
+    fn gpu_create_storage_buffer_empty() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = create_storage_buffer_empty(&device, 256, "test_empty", true);
+        assert_eq!(buf.size(), 256);
+    }
+
+    #[test]
+    fn gpu_create_uniform_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 4] = [0.0; 4];
+        let buf = create_uniform_buffer(&device, bytemuck::cast_slice(&data), "test_uniform");
+        assert_eq!(buf.size(), 16);
+    }
+
+    #[test]
+    fn gpu_create_staging_buffer() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = create_staging_buffer(&device, 1024, "test_staging");
+        assert_eq!(buf.size(), 1024);
+    }
+
+    #[test]
+    fn gpu_read_buffer_roundtrip() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let buf =
+            create_storage_buffer(&device, bytemuck::cast_slice(&data), "readback_test", false);
+        let result = read_buffer(&device, &queue, &buf, 16).unwrap();
+        let output: &[f32] = bytemuck::cast_slice(&result);
+        assert_eq!(output, &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn gpu_read_buffer_async_roundtrip() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 2] = [42.0, -1.0];
+        let buf = create_storage_buffer(&device, bytemuck::cast_slice(&data), "async_test", false);
+        let pending = read_buffer_async(&device, &queue, &buf, 8);
+        let result = pending.finish(&device).unwrap();
+        let output: &[f32] = bytemuck::cast_slice(&result);
+        assert_eq!(output, &[42.0, -1.0]);
+    }
+
+    #[test]
+    fn gpu_read_buffer_typed() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [u32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let buf = create_storage_buffer(&device, bytemuck::cast_slice(&data), "typed_test", false);
+        let result: Vec<u32> = read_buffer_typed(&device, &queue, &buf, 8).unwrap();
+        assert_eq!(result, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn gpu_growable_buffer_update_and_grow() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let mut buf = GrowableBuffer::new(
+            &device,
+            4, // initial capacity: 4 elements
+            std::mem::size_of::<f32>(),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "grow_test",
+        );
+        assert_eq!(buf.count(), 0);
+        let gen0 = buf.generation();
+
+        // Small update — fits in capacity
+        let small: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        buf.update(&device, &queue, &small);
+        assert_eq!(buf.count(), 4);
+
+        // Large update — triggers growth
+        let large: [f32; 32] = [0.5; 32];
+        buf.update(&device, &queue, &large);
+        assert_eq!(buf.count(), 32);
+        assert!(buf.generation() > gen0);
     }
 }

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+#### Caching
+- **bind_group_cache** — `BindGroupCache` for deduplicating bind group creation by caller-provided key; supports `get_or_insert()`, `invalidate()`, `invalidate_where()` for bulk invalidation on resource reallocation
+
+#### Render Pipeline
+- **render_pipeline** — `RenderPipelineBuilder::depth_only()` constructor for depth-only pipelines (shadow maps, depth pre-pass); fragment shader is now optional via `Option<&str>` fragment entry
+
+#### Documentation
+- **all modules** — `/// # Examples` doc blocks on all 35+ public types (was 8/35)
+- **adr** — ADR-001 (public fields), ADR-002 (runtime alignment), ADR-003 (fixed vertex types) — all resolved from soorat migration findings
+
+#### Testing
+- **all modules** — GPU integration tests using headless wgpu backend; 241 tests (was 162), line coverage up from 22.47%
+
 #### Core
 - **context** — `GpuContextBuilder` for custom device features, limits, power preference, and device lost callback
 - **error** — structured error variants with `#[source]` chaining (`DeviceRequest`, `ReadbackMap`, `ImageDecode`); surface errors split into `SurfaceTimeout` / `SurfaceOutdated` / `SurfaceLost`; `is_recoverable()` method; `WorkgroupLimitExceeded` and `TextureDimensionExceeded` validation variants

@@ -11,12 +11,37 @@ use serde::{Deserialize, Serialize};
 /// Implement this for custom vertex types to enable generic pipeline
 /// construction. All built-in vertex types ([`Vertex2D`], [`Vertex3D`],
 /// [`SkinnedVertex3D`]) implement this trait.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::vertex::VertexLayout;
+///
+/// // Use the trait to get a layout for any vertex type generically:
+/// fn create_pipeline<V: VertexLayout>(device: &wgpu::Device) {
+///     let layout = V::layout();
+///     // ... use layout in pipeline construction
+/// }
+/// ```
 pub trait VertexLayout {
     /// Returns the wgpu vertex buffer layout descriptor for this type.
     fn layout() -> wgpu::VertexBufferLayout<'static>;
 }
 
 /// A 2D vertex with position, texture coordinates, and color.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::vertex::Vertex2D;
+///
+/// let v = Vertex2D {
+///     position: [0.0, 0.0],
+///     tex_coords: [0.0, 0.0],
+///     color: [1.0, 1.0, 1.0, 1.0],
+/// };
+/// assert_eq!(std::mem::size_of::<Vertex2D>(), 32);
+/// ```
 #[repr(C)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable,
@@ -65,6 +90,20 @@ impl VertexLayout for Vertex2D {
 }
 
 /// A 3D vertex with position, normal, texture coordinates, and color.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::vertex::Vertex3D;
+///
+/// let v = Vertex3D {
+///     position: [0.0, 1.0, 0.0],
+///     normal: [0.0, 1.0, 0.0],
+///     tex_coords: [0.5, 0.5],
+///     color: [1.0, 1.0, 1.0, 1.0],
+/// };
+/// assert_eq!(std::mem::size_of::<Vertex3D>(), 48);
+/// ```
 #[repr(C)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable,
@@ -122,6 +161,14 @@ impl VertexLayout for Vertex3D {
 
 /// A skinned 3D vertex with tangent, joint indices, and joint weights.
 /// Used for skeletal animation and normal-mapped meshes.
+///
+/// # Examples
+///
+/// ```
+/// use mabda::vertex::SkinnedVertex3D;
+///
+/// assert_eq!(std::mem::size_of::<SkinnedVertex3D>(), 96);
+/// ```
 #[repr(C)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable,

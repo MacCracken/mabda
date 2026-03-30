@@ -195,4 +195,25 @@ mod tests {
     fn cache_types() {
         let _size = std::mem::size_of::<PipelineCache>();
     }
+
+    #[test]
+    fn cache_clear() {
+        let mut cache = PipelineCache::new();
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "graphics")]
+    fn invalidate_render_missing() {
+        let mut cache = PipelineCache::new();
+        assert!(!cache.invalidate_render(42));
+    }
+
+    #[test]
+    #[cfg(feature = "compute")]
+    fn invalidate_compute_missing() {
+        let mut cache = PipelineCache::new();
+        assert!(!cache.invalidate_compute(42));
+    }
 }

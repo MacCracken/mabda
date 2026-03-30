@@ -16,6 +16,19 @@ use crate::error::{GpuError, Result};
 ///
 /// Use the raw [`create_uniform_buffer`](crate::buffer::create_uniform_buffer)
 /// function if you need to bypass alignment validation.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[repr(C)]
+/// #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+/// struct Uniforms {
+///     mvp: [f32; 16],  // 64 bytes — multiple of 16 ✓
+/// }
+///
+/// let buf = UniformBuffer::new(&device, &uniforms, "camera")?;
+/// buf.write(&queue, &updated_uniforms);
+/// ```
 pub struct UniformBuffer<T: bytemuck::Pod> {
     buffer: wgpu::Buffer,
     _marker: std::marker::PhantomData<T>,
@@ -63,6 +76,13 @@ impl<T: bytemuck::Pod> UniformBuffer<T> {
 ///
 /// `T` must be `bytemuck::Pod`. Storage buffers have no alignment
 /// restriction beyond the element size itself (std430 rules).
+///
+/// # Examples
+///
+/// ```ignore
+/// let buf = StorageBuffer::new(&device, &particles, "particles", false)?;
+/// buf.write(&queue, &updated_particles);
+/// ```
 pub struct StorageBuffer<T: bytemuck::Pod> {
     buffer: wgpu::Buffer,
     count: usize,
@@ -202,5 +222,87 @@ mod tests {
             std::mem::size_of::<StorageBuffer<f32>>(),
             std::mem::size_of::<StorageBuffer<[f32; 4]>>()
         );
+    }
+
+    fn try_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some((ctx.device, ctx.queue))
+    }
+
+    #[test]
+    fn gpu_uniform_buffer_create_aligned() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data = Aligned16 { data: [1.0; 4] };
+        let buf = UniformBuffer::new(&device, &data, "test_uniform");
+        assert!(buf.is_ok());
+    }
+
+    #[test]
+    fn gpu_uniform_buffer_reject_unaligned() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data = Unaligned12 { data: [1.0; 3] };
+        let result = UniformBuffer::new(&device, &data, "bad_uniform");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gpu_uniform_buffer_write() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data = Aligned32 {
+            a: [1.0; 4],
+            b: [2.0; 4],
+        };
+        let buf = UniformBuffer::new(&device, &data, "write_test").unwrap();
+        let updated = Aligned32 {
+            a: [3.0; 4],
+            b: [4.0; 4],
+        };
+        buf.write(&queue, &updated);
+    }
+
+    #[test]
+    fn gpu_storage_buffer_create() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 8] = [0.0; 8];
+        let buf = StorageBuffer::new(&device, &data, "test_storage", false);
+        assert_eq!(buf.count(), 8);
+    }
+
+    #[test]
+    fn gpu_storage_buffer_empty() {
+        let Some((device, _queue)) = try_gpu() else {
+            return;
+        };
+        let buf = StorageBuffer::<f32>::empty(&device, 256, "empty_storage", true);
+        assert_eq!(buf.count(), 256);
+    }
+
+    #[test]
+    fn gpu_storage_buffer_write_ok() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let buf = StorageBuffer::new(&device, &data, "write_test", false);
+        assert!(buf.write(&queue, &[5.0, 6.0, 7.0, 8.0]).is_ok());
+    }
+
+    #[test]
+    fn gpu_storage_buffer_write_exceeds_capacity() {
+        let Some((device, queue)) = try_gpu() else {
+            return;
+        };
+        let data: [f32; 2] = [1.0, 2.0];
+        let buf = StorageBuffer::new(&device, &data, "small", false);
+        let too_big: [f32; 4] = [0.0; 4];
+        assert!(buf.write(&queue, &too_big).is_err());
     }
 }

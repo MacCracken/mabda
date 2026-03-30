@@ -7,6 +7,19 @@
 use serde::{Deserialize, Serialize};
 
 /// RGBA color with f32 components (0.0–1.0).
+///
+/// # Examples
+///
+/// ```
+/// use mabda::color::Color;
+///
+/// let c = Color::new(1.0, 0.5, 0.0, 1.0);
+/// assert_eq!(c.r, 1.0);
+///
+/// let red = Color::from_hex(0xFF0000FF);
+/// let blended = Color::WHITE.lerp(Color::BLACK, 0.5);
+/// assert!((blended.r - 0.5).abs() < f32::EPSILON);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Color {
     pub r: f32,

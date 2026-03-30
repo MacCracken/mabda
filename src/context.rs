@@ -15,6 +15,15 @@ use crate::error::{GpuError, Result};
 /// This is the shared GPU foundation. Every consumer (rendering, compute,
 /// image processing) takes a `&GpuContext` rather than managing its own
 /// device lifecycle.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::context::GpuContext;
+///
+/// let ctx = GpuContext::new().await?;
+/// // Use ctx.device, ctx.queue for all GPU operations
+/// ```
 pub struct GpuContext {
     /// The wgpu instance (entry point for adapter/surface creation).
     pub instance: wgpu::Instance,
@@ -264,5 +273,62 @@ mod tests {
             builder.power_preference,
             wgpu::PowerPreference::HighPerformance
         );
+    }
+
+    #[test]
+    fn headless_gpu_context() {
+        let result = pollster::block_on(GpuContext::new());
+        if let Ok(ctx) = result {
+            let info = ctx.adapter_info();
+            assert!(!info.name.is_empty());
+            let limits = ctx.limits();
+            assert!(limits.max_texture_dimension_2d > 0);
+            let _features = ctx.features();
+            ctx.poll_wait();
+        }
+    }
+
+    #[test]
+    fn builder_with_custom_limits() {
+        let result = pollster::block_on(
+            GpuContextBuilder::new()
+                .limits(wgpu::Limits::default())
+                .build(),
+        );
+        if let Ok(ctx) = result {
+            assert!(ctx.limits().max_texture_dimension_2d > 0);
+        }
+    }
+
+    #[test]
+    fn builder_with_device_lost_callback() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+        let result = pollster::block_on(
+            GpuContextBuilder::new()
+                .device_lost_callback(move |_reason, _msg| {
+                    called_clone.store(true, Ordering::SeqCst);
+                })
+                .build(),
+        );
+        // Just verify it builds successfully with a callback
+        if let Ok(ctx) = result {
+            assert!(ctx.limits().max_texture_dimension_2d > 0);
+        }
+    }
+
+    #[test]
+    fn builder_low_power() {
+        let result = pollster::block_on(
+            GpuContextBuilder::new()
+                .power_preference(wgpu::PowerPreference::LowPower)
+                .build(),
+        );
+        if let Ok(ctx) = result {
+            let _info = ctx.adapter_info();
+        }
     }
 }

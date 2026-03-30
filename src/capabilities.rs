@@ -7,6 +7,18 @@
 use serde::{Deserialize, Serialize};
 
 /// GPU capabilities report — what the current device supports.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::capabilities::GpuCapabilities;
+///
+/// let caps = GpuCapabilities::from_adapter(&adapter);
+/// println!("{}", caps.report());
+/// if caps.timestamp_query {
+///     // enable GPU profiling
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuCapabilities {
     /// Adapter name (e.g., "NVIDIA GeForce RTX 4090").

@@ -218,4 +218,127 @@ mod tests {
     fn builder_types() {
         let _size = std::mem::size_of::<RenderPassBuilder<'_>>();
     }
+
+    fn try_gpu() -> Option<crate::context::GpuContext> {
+        pollster::block_on(crate::context::GpuContext::new()).ok()
+    }
+
+    #[test]
+    fn gpu_begin_color_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        {
+            let _pass = RenderPassBuilder::new()
+                .label("test_pass")
+                .color_attachment(&target.view, Some(crate::color::Color::BLACK))
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_begin_color_and_depth_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTargetBuilder::new(&ctx.device, 64, 64)
+            .depth(crate::depth::DepthTexture::DEFAULT_FORMAT)
+            .build();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        {
+            let _pass = RenderPassBuilder::new()
+                .color_attachment(&target.view, Some(crate::color::Color::CORNFLOWER_BLUE))
+                .depth_attachment(target.depth_view().unwrap())
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_begin_depth_load_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let depth = crate::depth::DepthTexture::new_default(&ctx.device, 64, 64);
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        {
+            let _pass = RenderPassBuilder::new()
+                .color_attachment(&target.view, None)
+                .depth_attachment_load(&depth.view)
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_begin_depth_stencil_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let depth = crate::depth::DepthTexture::new(
+            &ctx.device,
+            64,
+            64,
+            crate::depth::DepthTexture::DEPTH_STENCIL_FORMAT,
+        );
+        let target = crate::render_target::RenderTarget::new(
+            &ctx.device,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        {
+            let _pass = RenderPassBuilder::new()
+                .color_attachment(&target.view, Some(crate::color::Color::BLACK))
+                .depth_stencil_attachment(&depth.view)
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[test]
+    fn gpu_begin_msaa_pass() {
+        let Some(ctx) = try_gpu() else { return };
+        let target = crate::render_target::RenderTargetBuilder::new(&ctx.device, 64, 64)
+            .msaa(4)
+            .build();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test"),
+            });
+        {
+            let _pass = RenderPassBuilder::new()
+                .color_attachment_msaa(
+                    target.render_view(),
+                    target.resolve_target().unwrap(),
+                    Some(crate::color::Color::BLACK),
+                )
+                .begin(&mut encoder);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
 }

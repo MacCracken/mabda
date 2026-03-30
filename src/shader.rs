@@ -11,6 +11,17 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 ///
 /// Prevents redundant shader compilation when the same WGSL source is
 /// used by multiple pipelines.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mabda::shader::ShaderCache;
+///
+/// let mut cache = ShaderCache::new();
+/// let module = cache.get_or_compile(&device, WGSL_SOURCE, "my_shader");
+/// // Same source returns cached module:
+/// let same = cache.get_or_compile(&device, WGSL_SOURCE, "my_shader");
+/// ```
 pub struct ShaderCache {
     modules: HashMap<u64, wgpu::ShaderModule>,
 }
@@ -132,5 +143,49 @@ mod tests {
     fn contains_before_compile() {
         let cache = ShaderCache::new();
         assert!(!cache.contains("fn main() {}"));
+    }
+
+    fn try_gpu() -> Option<wgpu::Device> {
+        let ctx = pollster::block_on(crate::context::GpuContext::new()).ok()?;
+        Some(ctx.device)
+    }
+
+    const TEST_SHADER: &str = "@compute @workgroup_size(64) fn main() {}";
+
+    #[test]
+    fn gpu_compile_and_cache() {
+        let Some(device) = try_gpu() else { return };
+        let mut cache = ShaderCache::new();
+        let _module = cache.get_or_compile(&device, TEST_SHADER, "test");
+        assert!(cache.contains(TEST_SHADER));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn gpu_deduplication() {
+        let Some(device) = try_gpu() else { return };
+        let mut cache = ShaderCache::new();
+        let _m1 = cache.get_or_compile(&device, TEST_SHADER, "first");
+        let _m2 = cache.get_or_compile(&device, TEST_SHADER, "second");
+        assert_eq!(cache.len(), 1); // same source = same module
+    }
+
+    #[test]
+    fn gpu_invalidate() {
+        let Some(device) = try_gpu() else { return };
+        let mut cache = ShaderCache::new();
+        let _m = cache.get_or_compile(&device, TEST_SHADER, "test");
+        assert!(cache.invalidate(TEST_SHADER));
+        assert!(!cache.contains(TEST_SHADER));
+        assert!(!cache.invalidate(TEST_SHADER)); // already gone
+    }
+
+    #[test]
+    fn gpu_clear() {
+        let Some(device) = try_gpu() else { return };
+        let mut cache = ShaderCache::new();
+        let _m = cache.get_or_compile(&device, TEST_SHADER, "test");
+        cache.clear();
+        assert!(cache.is_empty());
     }
 }

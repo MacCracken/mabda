@@ -5,49 +5,127 @@ Three-point tracking: **baseline** (first run) / **previous** / **latest**
 | Point | Date | Commit |
 |-------|------|--------|
 | Baseline | 2026-03-30T03:19:02Z | `4a802cd` |
-| Latest | 2026-03-30T03:19:02Z | `4a802cd` |
+| Latest | 2026-03-30T05:09:44Z | `ba81a3e` |
 
 ## color_lerp
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `color_lerp` | 267.90 ps | 267.90 ps |
+| `color_lerp` | 267.90 ps | 327.70 ps |
 
 ## color_from_hex
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `color_from_hex` | 265.70 ps | 265.70 ps |
+| `color_from_hex` | 265.70 ps | 315.90 ps |
 
 ## color_luminance
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `color_luminance` | 264.30 ps | 264.30 ps |
+| `color_luminance` | 264.30 ps | 311.20 ps |
 
 ## workgroups_1d
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `workgroups_1d` | 270.20 ps | 270.20 ps |
+| `workgroups_1d` | 270.20 ps | 286.20 ps |
 
 ## workgroups_2d
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `workgroups_2d` | 263.40 ps | 263.40 ps |
+| `workgroups_2d` | 263.40 ps | 285.40 ps |
 
 ## profiler_frame_cycle
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `profiler_frame_cycle` | 65.88 ns | 65.88 ns |
+| `profiler_frame_cycle` | 65.88 ns | 70.38 ns |
 
 ## capabilities_report
 
 | Benchmark | Baseline | Latest |
 |-----------|----------|--------|
-| `capabilities_report` | 316.89 ns | 316.89 ns |
+| `capabilities_report` | 316.89 ns | 329.26 ns |
+
+## create_storage_buffer_4k
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `create_storage_buffer_4k` | — | 11.23 µs |
+
+## create_uniform_buffer_64
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `create_uniform_buffer_64` | — | 2.94 µs |
+
+## uniform_buffer_write
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `uniform_buffer_write` | — | 1.23 µs |
+
+## shader_cache_hit
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `shader_cache_hit` | — | 38.63 ns |
+
+## shader_cache_miss
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `shader_cache_miss` | — | 3.68 µs |
+
+## bind_group_cache_hit
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `bind_group_cache_hit` | — | 16.95 ns |
+
+## texture_1x1_solid
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `texture_1x1_solid` | — | 7.18 µs |
+
+## texture_256x256_rgba
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `texture_256x256_rgba` | — | 485.16 µs |
+
+## depth_texture_1080p
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `depth_texture_1080p` | — | 2.46 µs |
+
+## render_target_1080p
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `render_target_1080p` | — | 4.17 µs |
+
+## render_target_msaa4_1080p
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `render_target_msaa4_1080p` | — | 16.88 µs |
+
+## render_pipeline_build
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `render_pipeline_build` | — | 103.52 µs |
+
+## compute_dispatch_1024
+
+| Benchmark | Baseline | Latest |
+|-----------|----------|--------|
+| `compute_dispatch_1024` | — | 33.31 µs |
 
 ---
 
