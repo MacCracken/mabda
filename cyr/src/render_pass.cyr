@@ -1,0 +1,102 @@
+# render_pass.cyr — render pass builder
+# Ported from mabda/src/render_pass.rs
+#
+# Fluent builder for configuring render pass color and depth attachments.
+#
+# RenderPassBuilder struct layout (48 bytes):
+#   +0:  label (cstr ptr, 8)
+#   +8:  color_attachments (vec of attachment ptrs)
+#   +16: depth_view (WGPUTextureView or 0, 8)
+#   +24: depth_clear (f32 bit pattern — default 1.0)
+#   +28: depth_load_op (u32 — Clear or Load)
+#   +32: stencil_clear (u32)
+#
+# ColorAttachment (56 bytes — matches WGPURenderPassColorAttachment):
+#   +0:  view (WGPUTextureView, 8)
+#   +8:  depthSlice (u32)
+#   +16: resolveTarget (WGPUTextureView or 0, 8)
+#   +24: loadOp (u32)
+#   +28: storeOp (u32)
+#   +32: clearValue (WGPUColor = 32 bytes: r,g,b,a as f64)
+
+var COLOR_ATTACHMENT_SIZE = 64;
+
+fn rpb_pass_new() {
+    var b = alloc(48);
+    memset(b, 0, 48);
+    store64(b + 8, vec_new());
+    # depth_clear = 1.0 as f32
+    store32(b + 24, 0x3F800000);
+    store32(b + 28, WGPU_LOAD_OP_CLEAR);
+    return b;
+}
+
+fn rpb_pass_label(b, label) { store64(b, label); return b; }
+
+# Add a color attachment (clear with given color, or load existing)
+fn rpb_pass_color(b, view, clear_color) {
+    var att = alloc(COLOR_ATTACHMENT_SIZE);
+    memset(att, 0, COLOR_ATTACHMENT_SIZE);
+    store64(att, view);
+    store32(att + 8, 0xFFFFFFFF);  # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED
+    if (clear_color != 0) {
+        store32(att + 24, WGPU_LOAD_OP_CLEAR);
+        store32(att + 28, WGPU_STORE_OP_STORE);
+        color_write_f64(clear_color, att + 32);
+    } else {
+        store32(att + 24, WGPU_LOAD_OP_LOAD);
+        store32(att + 28, WGPU_STORE_OP_STORE);
+    }
+    vec_push(load64(b + 8), att);
+    return b;
+}
+
+# Add a color attachment with MSAA resolve
+fn rpb_pass_color_msaa(b, render_view, resolve_view, clear_color) {
+    var att = alloc(COLOR_ATTACHMENT_SIZE);
+    memset(att, 0, COLOR_ATTACHMENT_SIZE);
+    store64(att, render_view);
+    store32(att + 8, 0xFFFFFFFF);
+    store64(att + 16, resolve_view);
+    if (clear_color != 0) {
+        store32(att + 24, WGPU_LOAD_OP_CLEAR);
+        store32(att + 28, WGPU_STORE_OP_STORE);
+        color_write_f64(clear_color, att + 32);
+    } else {
+        store32(att + 24, WGPU_LOAD_OP_LOAD);
+        store32(att + 28, WGPU_STORE_OP_STORE);
+    }
+    vec_push(load64(b + 8), att);
+    return b;
+}
+
+# Set depth attachment
+fn rpb_pass_depth(b, depth_view) {
+    store64(b + 16, depth_view);
+    return b;
+}
+
+# Set depth load op (LOAD instead of CLEAR)
+fn rpb_pass_depth_load(b) {
+    store32(b + 28, WGPU_LOAD_OP_LOAD);
+    return b;
+}
+
+# Get the color attachment count
+fn rpb_pass_color_count(b) {
+    return vec_len(load64(b + 8));
+}
+
+# Get color attachment array pointer (for WGPURenderPassDescriptor)
+fn rpb_pass_color_array(b) {
+    var attachments = load64(b + 8);
+    var count = vec_len(attachments);
+    if (count == 0) { return 0; }
+    # Build contiguous array
+    var arr = alloc(count * COLOR_ATTACHMENT_SIZE);
+    for (var i = 0; i < count; i = i + 1) {
+        var src = vec_get(attachments, i);
+        memcpy(arr + i * COLOR_ATTACHMENT_SIZE, src, COLOR_ATTACHMENT_SIZE);
+    }
+    return arr;
+}
