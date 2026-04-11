@@ -1,0 +1,60 @@
+# shader_cache.cyr — hash-based shader module deduplication
+# Ported from mabda/src/shader.rs
+#
+# ShaderCache stores compiled shader modules keyed by a hash of
+# their WGSL source code. Prevents recompiling identical shaders.
+#
+# Uses hashmap.cyr with u64 hash keys → shader module handles.
+
+# FNV-1a hash for shader source deduplication
+fn _shader_hash(source) {
+    var hash = 14695981039346656037;  # FNV offset basis (u64)
+    var i = 0;
+    var c = load8(source + i);
+    while (c != 0) {
+        hash = hash ^ c;
+        hash = hash * 1099511628211;  # FNV prime
+        i = i + 1;
+        c = load8(source + i);
+    }
+    return hash;
+}
+
+fn shader_cache_new() {
+    return map_new();
+}
+
+# Get a cached shader module or 0 if not cached
+fn shader_cache_get(cache, wgsl_source) {
+    var key = _shader_hash(wgsl_source);
+    var ibuf[24];
+    var kstr_len = fmt_int_buf(key, &ibuf);
+    store8(&ibuf + kstr_len, 0);
+    return map_get(cache, &ibuf);
+}
+
+# Store a shader module in the cache
+fn shader_cache_set(cache, wgsl_source, module) {
+    var key = _shader_hash(wgsl_source);
+    var ibuf[24];
+    var kstr_len = fmt_int_buf(key, &ibuf);
+    store8(&ibuf + kstr_len, 0);
+    map_set(cache, &ibuf, module);
+    return 0;
+}
+
+# Get or compile: returns cached module or compiles new one
+fn shader_cache_get_or_compile(cache, device, wgsl_source, label) {
+    var existing = shader_cache_get(cache, wgsl_source);
+    if (existing != 0) { return existing; }
+
+    # Compile new shader
+    var src = wgpu_shader_source_wgsl(wgsl_source);
+    var desc = wgpu_shader_module_descriptor(label, src);
+    var module = wgpu_device_create_shader_module(device, desc);
+
+    if (module != 0) {
+        shader_cache_set(cache, wgsl_source, module);
+    }
+    return module;
+}

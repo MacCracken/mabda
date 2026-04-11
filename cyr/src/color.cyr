@@ -1,0 +1,248 @@
+# color.cyr — RGBA color type and utilities
+# Ported from mabda/src/color.rs
+#
+# Color is the shared RGBA type for the AGNOS GPU ecosystem.
+# All components stored as f64 (0.0–1.0). Converted to f32 at GPU boundary.
+#
+# Color struct layout (32 bytes):
+#   +0:  r (f64 bit pattern)
+#   +8:  g (f64 bit pattern)
+#   +16: b (f64 bit pattern)
+#   +24: a (f64 bit pattern)
+
+# ================================================================
+# f64 constants (bit patterns)
+# ================================================================
+
+# f64 constants — initialized at runtime via color_init()
+var F64_0    = 0;
+var F64_1    = 0;
+var F64_255  = 0;
+var F64_HALF = 0;
+var F64_TWO  = 0;
+
+# Rec. 709 luminance coefficients
+var F64_LUM_R = 0;  # 0.2126
+var F64_LUM_G = 0;  # 0.7152
+var F64_LUM_B = 0;  # 0.0722
+
+# Cornflower blue components
+var F64_CB_R = 0;   # 0.392
+var F64_CB_G = 0;   # 0.584
+var F64_CB_B = 0;   # 0.929
+
+var _color_initialized = 0;
+
+fn color_init() {
+    if (_color_initialized == 1) { return 0; }
+    _color_initialized = 1;
+
+    F64_0    = f64_from(0);
+    F64_1    = f64_from(1);
+    F64_255  = f64_from(255);
+    F64_HALF = f64_div(f64_from(1), f64_from(2));
+    F64_TWO  = f64_from(2);
+
+    # 0.2126 = 2126 / 10000
+    F64_LUM_R = f64_div(f64_from(2126), f64_from(10000));
+    # 0.7152 = 7152 / 10000
+    F64_LUM_G = f64_div(f64_from(7152), f64_from(10000));
+    # 0.0722 = 722 / 10000
+    F64_LUM_B = f64_div(f64_from(722), f64_from(10000));
+
+    # 0.392 = 392 / 1000
+    F64_CB_R = f64_div(f64_from(392), f64_from(1000));
+    # 0.584 = 584 / 1000
+    F64_CB_G = f64_div(f64_from(584), f64_from(1000));
+    # 0.929 = 929 / 1000
+    F64_CB_B = f64_div(f64_from(929), f64_from(1000));
+
+    return 0;
+}
+
+# ================================================================
+# Color constructors
+# ================================================================
+
+# Create a Color from f64 RGBA components (0.0–1.0)
+fn color_new(r, g, b, a) {
+    var c = alloc(32);
+    store64(c, r);
+    store64(c + 8, g);
+    store64(c + 16, b);
+    store64(c + 24, a);
+    return c;
+}
+
+# Create a Color from RGB with full opacity
+fn color_rgb(r, g, b) {
+    return color_new(r, g, b, F64_1);
+}
+
+# Create a Color from 8-bit RGBA (0–255 integer values)
+fn color_from_rgba8(r, g, b, a) {
+    var fr = f64_div(f64_from(r), F64_255);
+    var fg = f64_div(f64_from(g), F64_255);
+    var fb = f64_div(f64_from(b), F64_255);
+    var fa = f64_div(f64_from(a), F64_255);
+    return color_new(fr, fg, fb, fa);
+}
+
+# Create a Color from hex (e.g., 0xFF0000FF for opaque red)
+fn color_from_hex(hex) {
+    var r = (hex >> 24) & 0xFF;
+    var g = (hex >> 16) & 0xFF;
+    var b = (hex >> 8) & 0xFF;
+    var a = hex & 0xFF;
+    return color_from_rgba8(r, g, b, a);
+}
+
+# ================================================================
+# Color accessors
+# ================================================================
+
+fn color_r(c) { return load64(c); }
+fn color_g(c) { return load64(c + 8); }
+fn color_b(c) { return load64(c + 16); }
+fn color_a(c) { return load64(c + 24); }
+
+fn color_set_r(c, v) { store64(c, v); return 0; }
+fn color_set_g(c, v) { store64(c + 8, v); return 0; }
+fn color_set_b(c, v) { store64(c + 16, v); return 0; }
+fn color_set_a(c, v) { store64(c + 24, v); return 0; }
+
+# ================================================================
+# Color math
+# ================================================================
+
+# Luminance (perceived brightness, Rec. 709)
+fn color_luminance(c) {
+    var r = f64_mul(F64_LUM_R, color_r(c));
+    var g = f64_mul(F64_LUM_G, color_g(c));
+    var b = f64_mul(F64_LUM_B, color_b(c));
+    return f64_add(f64_add(r, g), b);
+}
+
+# Linear interpolation between two colors
+# t is clamped to [0.0, 1.0]
+fn color_lerp(a, b, t) {
+    # Clamp t
+    if (f64_lt(t, F64_0) == 1) { t = F64_0; }
+    if (f64_gt(t, F64_1) == 1) { t = F64_1; }
+
+    var r = f64_add(color_r(a), f64_mul(f64_sub(color_r(b), color_r(a)), t));
+    var g = f64_add(color_g(a), f64_mul(f64_sub(color_g(b), color_g(a)), t));
+    var bl = f64_add(color_b(a), f64_mul(f64_sub(color_b(b), color_b(a)), t));
+    var al = f64_add(color_a(a), f64_mul(f64_sub(color_a(b), color_a(a)), t));
+    return color_new(r, g, bl, al);
+}
+
+# Check if two colors are equal (exact f64 comparison)
+fn color_eq(a, b) {
+    if (color_r(a) != color_r(b)) { return 0; }
+    if (color_g(a) != color_g(b)) { return 0; }
+    if (color_b(a) != color_b(b)) { return 0; }
+    if (color_a(a) != color_a(b)) { return 0; }
+    return 1;
+}
+
+# ================================================================
+# GPU conversion — write color as 4x f32 to a buffer
+# ================================================================
+# wgpu expects f64 for wgpu::Color (clear colors) and f32 for vertex data.
+# f64→f32 via inline asm: cvtsd2ss (SSE2)
+
+# Convert f64 bit pattern to f32 bit pattern (in low 32 bits of i64)
+fn f64_to_f32(val) {
+    var result = 0;
+    # movq xmm0, val; cvtsd2ss xmm0, xmm0; movd eax, xmm0; mov result, rax
+    asm {
+        # movq xmm0, [rbp-8] (val)
+        0x66; 0x48; 0x0F; 0x6E; 0x45; 0xF8;
+        # cvtsd2ss xmm0, xmm0
+        0xF2; 0x0F; 0x5A; 0xC0;
+        # movd eax, xmm0
+        0x66; 0x0F; 0x7E; 0xC0;
+        # mov [rbp-16], rax (result)
+        0x48; 0x89; 0x45; 0xF0;
+    }
+    return result;
+}
+
+# Convert f32 bit pattern (low 32 bits) to f64 bit pattern
+fn f32_to_f64(val) {
+    var result = 0;
+    # movd xmm0, eax(val); cvtss2sd xmm0, xmm0; movq result, xmm0
+    asm {
+        # mov eax, [rbp-8] (val — only low 32 bits matter)
+        0x8B; 0x45; 0xF8;
+        # movd xmm0, eax
+        0x66; 0x0F; 0x6E; 0xC0;
+        # cvtss2sd xmm0, xmm0
+        0xF3; 0x0F; 0x5A; 0xC0;
+        # movq [rbp-16], xmm0 (result)
+        0x66; 0x48; 0x0F; 0x7E; 0x45; 0xF0;
+    }
+    return result;
+}
+
+# Write color as 4x f32 (16 bytes) to destination pointer
+# Used for vertex color data, uniform buffers, etc.
+fn color_write_f32(c, dst) {
+    store32(dst, f64_to_f32(color_r(c)));
+    store32(dst + 4, f64_to_f32(color_g(c)));
+    store32(dst + 8, f64_to_f32(color_b(c)));
+    store32(dst + 12, f64_to_f32(color_a(c)));
+    return 0;
+}
+
+# Write color as 4x f64 (32 bytes) to destination pointer
+# Used for wgpu::Color (clear colors in render passes)
+fn color_write_f64(c, dst) {
+    store64(dst, color_r(c));
+    store64(dst + 8, color_g(c));
+    store64(dst + 16, color_b(c));
+    store64(dst + 24, color_a(c));
+    return 0;
+}
+
+# ================================================================
+# Preset colors (allocated on first use via alloc)
+# ================================================================
+
+var _COLOR_WHITE = 0;
+var _COLOR_BLACK = 0;
+var _COLOR_RED = 0;
+var _COLOR_GREEN = 0;
+var _COLOR_BLUE = 0;
+var _COLOR_TRANSPARENT = 0;
+var _COLOR_CORNFLOWER_BLUE = 0;
+
+fn COLOR_WHITE() {
+    if (_COLOR_WHITE == 0) { _COLOR_WHITE = color_new(F64_1, F64_1, F64_1, F64_1); }
+    return _COLOR_WHITE;
+}
+fn COLOR_BLACK() {
+    if (_COLOR_BLACK == 0) { _COLOR_BLACK = color_new(F64_0, F64_0, F64_0, F64_1); }
+    return _COLOR_BLACK;
+}
+fn COLOR_RED() {
+    if (_COLOR_RED == 0) { _COLOR_RED = color_new(F64_1, F64_0, F64_0, F64_1); }
+    return _COLOR_RED;
+}
+fn COLOR_GREEN() {
+    if (_COLOR_GREEN == 0) { _COLOR_GREEN = color_new(F64_0, F64_1, F64_0, F64_1); }
+    return _COLOR_GREEN;
+}
+fn COLOR_BLUE() {
+    if (_COLOR_BLUE == 0) { _COLOR_BLUE = color_new(F64_0, F64_0, F64_1, F64_1); }
+    return _COLOR_BLUE;
+}
+fn COLOR_TRANSPARENT() {
+    if (_COLOR_TRANSPARENT == 0) { _COLOR_TRANSPARENT = color_new(F64_0, F64_0, F64_0, F64_0); }
+    return _COLOR_TRANSPARENT;
+}
+fn COLOR_CORNFLOWER_BLUE() {
+    if (_COLOR_CORNFLOWER_BLUE == 0) { _COLOR_CORNFLOWER_BLUE = color_new(F64_CB_R, F64_CB_G, F64_CB_B, F64_1); }
+    return _COLOR_CORNFLOWER_BLUE;
+}

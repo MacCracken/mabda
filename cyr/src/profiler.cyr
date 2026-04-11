@@ -1,0 +1,193 @@
+# profiler.cyr — CPU frame profiling
+# Ported from mabda/src/profiler.rs
+#
+# FrameProfiler: EMA smoothing, frame timing, history ring buffer, pass timing
+# No RAII ProfileScope — use explicit profile_begin/profile_end instead
+#
+# FrameProfiler struct layout (72 bytes):
+#   +0:  frame_start_sec  (i64 — seconds from clock_gettime)
+#   +8:  frame_start_nsec (i64 — nanoseconds)
+#   +16: cpu_frame_ms     (f64)
+#   +24: avg_frame_ms     (f64)
+#   +32: fps              (f64)
+#   +40: frame_count      (i64)
+#   +48: alpha            (f64)
+#   +56: history          (vec ptr — vec of f64 frame times)
+#   +64: history_cap      (i64)
+#
+# PassTiming (24 bytes):
+#   +0:  label       (str ptr)
+#   +8:  label_len   (i64)
+#   +16: duration_ms (f64)
+
+# ================================================================
+# Time helpers — clock_gettime(CLOCK_MONOTONIC)
+# ================================================================
+
+# SYS_clock_gettime = 228, CLOCK_MONOTONIC = 1
+fn _time_now_ns() {
+    var ts[16];  # timespec: tv_sec(8) + tv_nsec(8)
+    syscall(228, 1, &ts);
+    var sec = load64(&ts);
+    var nsec = load64(&ts + 8);
+    # Return total nanoseconds as i64 (good for ~292 years)
+    return sec * 1000000000 + nsec;
+}
+
+# Convert nanosecond delta to f64 milliseconds
+fn _ns_to_ms(ns) {
+    # ms = ns / 1_000_000
+    var f_ns = f64_from(ns);
+    var f_million = f64_from(1000000);
+    return f64_div(f_ns, f_million);
+}
+
+# ================================================================
+# FrameProfiler
+# ================================================================
+
+fn profiler_new() {
+    return profiler_with_alpha_and_history(
+        f64_div(f64_from(5), f64_from(100)),   # 0.05
+        300
+    );
+}
+
+fn profiler_with_alpha(alpha) {
+    return profiler_with_alpha_and_history(alpha, 300);
+}
+
+fn profiler_with_alpha_and_history(alpha, history_cap) {
+    var p = alloc(72);
+    store64(p, 0);           # frame_start_sec
+    store64(p + 8, 0);       # frame_start_nsec
+    store64(p + 16, F64_0);  # cpu_frame_ms
+    # avg_frame_ms = 16.67
+    store64(p + 24, f64_div(f64_from(1667), f64_from(100)));
+    # fps = 60.0
+    store64(p + 32, f64_from(60));
+    store64(p + 40, 0);      # frame_count
+    # Clamp alpha to [0.001, 1.0]
+    var f_min = f64_div(f64_from(1), f64_from(1000));
+    if (f64_lt(alpha, f_min) == 1) { alpha = f_min; }
+    if (f64_gt(alpha, F64_1) == 1) { alpha = F64_1; }
+    store64(p + 48, alpha);
+    store64(p + 56, vec_new());  # history vec
+    store64(p + 64, history_cap);
+    return p;
+}
+
+# Accessors
+fn profiler_cpu_frame_ms(p)  { return load64(p + 16); }
+fn profiler_avg_frame_ms(p)  { return load64(p + 24); }
+fn profiler_fps(p)           { return load64(p + 32); }
+fn profiler_frame_count(p)   { return load64(p + 40); }
+
+fn profiler_begin_frame(p) {
+    var now = _time_now_ns();
+    store64(p, now);
+    return 0;
+}
+
+fn profiler_end_frame(p) {
+    var start = load64(p);
+    var now = _time_now_ns();
+    var elapsed_ns = now - start;
+    var elapsed_ms = _ns_to_ms(elapsed_ns);
+
+    # cpu_frame_ms = elapsed
+    store64(p + 16, elapsed_ms);
+
+    # EMA: avg = avg * (1 - alpha) + elapsed * alpha
+    var avg = load64(p + 24);
+    var alpha = load64(p + 48);
+    var one_minus_alpha = f64_sub(F64_1, alpha);
+    var new_avg = f64_add(f64_mul(avg, one_minus_alpha), f64_mul(elapsed_ms, alpha));
+    store64(p + 24, new_avg);
+
+    # fps = 1000.0 / avg_frame_ms
+    var f_1000 = f64_from(1000);
+    if (f64_gt(new_avg, F64_0) == 1) {
+        store64(p + 32, f64_div(f_1000, new_avg));
+    } else {
+        store64(p + 32, F64_0);
+    }
+
+    # frame_count++
+    store64(p + 40, load64(p + 40) + 1);
+
+    # Record in history ring buffer
+    var history = load64(p + 56);
+    var cap = load64(p + 64);
+    if (vec_len(history) >= cap) {
+        # Remove oldest (shift left — simple but O(n))
+        _vec_shift_left(history);
+    }
+    vec_push(history, elapsed_ms);
+
+    return elapsed_ms;
+}
+
+# Shift all elements left by 1, drop index 0
+fn _vec_shift_left(v) {
+    var len = vec_len(v);
+    if (len <= 1) {
+        if (len == 1) { vec_pop(v); }
+        return 0;
+    }
+    for (var i = 0; i < len - 1; i = i + 1) {
+        vec_set(v, i, vec_get(v, i + 1));
+    }
+    vec_pop(v);
+    return 0;
+}
+
+fn profiler_reset(p) {
+    store64(p + 16, F64_0);
+    store64(p + 24, f64_div(f64_from(1667), f64_from(100)));
+    store64(p + 32, f64_from(60));
+    store64(p + 40, 0);
+    var history = load64(p + 56);
+    # Clear history
+    while (vec_len(history) > 0) { vec_pop(history); }
+    return 0;
+}
+
+fn profiler_worst_frame_ms(p) {
+    var history = load64(p + 56);
+    var len = vec_len(history);
+    if (len == 0) { return F64_0; }
+    var worst = vec_get(history, 0);
+    for (var i = 1; i < len; i = i + 1) {
+        var v = vec_get(history, i);
+        if (f64_gt(v, worst) == 1) { worst = v; }
+    }
+    return worst;
+}
+
+fn profiler_best_frame_ms(p) {
+    var history = load64(p + 56);
+    var len = vec_len(history);
+    if (len == 0) { return F64_0; }
+    var best = vec_get(history, 0);
+    for (var i = 1; i < len; i = i + 1) {
+        var v = vec_get(history, i);
+        if (f64_lt(v, best) == 1) { best = v; }
+    }
+    return best;
+}
+
+# ================================================================
+# Explicit profiling (replaces RAII ProfileScope)
+# ================================================================
+
+# Begin timing a pass — returns timestamp (nanoseconds)
+fn profile_begin() {
+    return _time_now_ns();
+}
+
+# End timing a pass — returns duration in f64 milliseconds
+fn profile_end(start_ns) {
+    var now = _time_now_ns();
+    return _ns_to_ms(now - start_ns);
+}

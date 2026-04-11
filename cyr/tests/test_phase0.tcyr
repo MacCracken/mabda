@@ -1,0 +1,123 @@
+# test_phase0.tcyr — Phase 0 FFI validation
+# Compiled with object; directive, linked with wgpu_main.c via gcc
+# Proves: dynlib → wgpu-native → GPU device → buffer round-trip
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/syscalls.cyr"
+include "lib/mmap.cyr"
+include "lib/fnptr.cyr"
+include "lib/tagged.cyr"
+include "lib/hashmap.cyr"
+include "lib/vec.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/color.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+include "src/wgpu_ffi.cyr"
+include "src/context.cyr"
+
+# ================================================================
+# Test: create GPU context
+# ================================================================
+
+var _gpu_preinit = 0;
+
+fn test_create_context() {
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        var e = payload(res);
+        syscall(1, 2, "SKIP: no GPU (", 14);
+        gpu_err_print_name(gpu_err_code(e));
+        syscall(1, 2, ")\n", 2);
+        return 0 - 1;  # signal skip
+    }
+    var ctx = payload(res);
+    assert(ctx != 0, "context created");
+    assert(gpu_ctx_instance(ctx) != 0, "instance non-null");
+    assert(gpu_ctx_adapter(ctx) != 0, "adapter non-null");
+    assert(gpu_ctx_device(ctx) != 0, "device non-null");
+    assert(gpu_ctx_queue(ctx) != 0, "queue non-null");
+    gpu_context_release(ctx);
+    return 0;
+}
+
+# ================================================================
+# Test: buffer write → readback round-trip
+# ================================================================
+
+fn test_buffer_roundtrip() {
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) { return 0; }
+    var ctx = payload(res);
+    var device = gpu_ctx_device(ctx);
+    var queue = gpu_ctx_queue(ctx);
+
+    var buf_size = 32;
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
+    var buf_desc = wgpu_buffer_descriptor("test-buf", usage, buf_size, 0);
+    var gpu_buf = wgpu_device_create_buffer(device, buf_desc);
+    assert(gpu_buf != 0, "buffer created");
+
+    # Write [10, 20, 30, 40]
+    var data[32];
+    store64(&data, 10);
+    store64(&data + 8, 20);
+    store64(&data + 16, 30);
+    store64(&data + 24, 40);
+    wgpu_queue_write_buffer(queue, gpu_buf, 0, &data, buf_size);
+
+    # Create staging buffer for readback
+    var stg_desc = wgpu_buffer_descriptor("staging", WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST, buf_size, 0);
+    var staging = wgpu_device_create_buffer(device, stg_desc);
+    assert(staging != 0, "staging created");
+
+    # Copy gpu_buf → staging
+    var enc_desc = wgpu_command_encoder_descriptor("copy-enc");
+    var encoder = wgpu_device_create_command_encoder(device, enc_desc);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, gpu_buf, 0, staging, 0, buf_size);
+    var cmd_desc = wgpu_command_buffer_descriptor("copy-cmd");
+    var cmd_buf = wgpu_command_encoder_finish(encoder, cmd_desc);
+
+    var cmds[8];
+    store64(&cmds, cmd_buf);
+    wgpu_queue_submit(queue, 1, &cmds);
+
+    # Map and read back
+    var map_status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, buf_size);
+    assert(map_status == WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS, "map succeeds");
+
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, buf_size);
+    assert(mapped != 0, "mapped non-null");
+
+    assert_eq(load64(mapped), 10, "readback[0]=10");
+    assert_eq(load64(mapped + 8), 20, "readback[1]=20");
+    assert_eq(load64(mapped + 16), 30, "readback[2]=30");
+    assert_eq(load64(mapped + 24), 40, "readback[3]=40");
+
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    wgpu_buffer_release(gpu_buf);
+    gpu_context_release(ctx);
+    return 0;
+}
+
+# ================================================================
+# Entry point — called from C main() with fn_table pointer
+# ================================================================
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    alloc_init();
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var skip = test_create_context();
+    if (skip == 0 - 1) { return 0; }  # no GPU, skip gracefully
+
+    test_buffer_roundtrip();
+    return assert_summary();
+}
