@@ -160,10 +160,18 @@ static int preinit_gpu(void) {
 }
 
 extern long mabda_main(long fn_table_ptr, long preinit_ptr);
+// Cyrius top-level init code (enum values, global vars)
+// This is at the start of the .text section — calling the entry point
+// triggers the jmp to init code which initializes all globals.
+// We call it via a function pointer to the start of .text.
+extern void _start_cyrius(void) __attribute__((weak));
 
 int main(void) {
-    // Pre-init GPU in C (dlopen works here, no TEXTREL)
+    // Pre-init GPU in C
+    fprintf(stderr, "main: starting GPU pre-init...\n");
     int gpu_ok = preinit_gpu();
+    fprintf(stderr, "main: gpu_ok=%d instance=%p adapter=%p device=%p queue=%p\n",
+        gpu_ok, (void*)preinit.instance, (void*)preinit.adapter, (void*)preinit.device, (void*)preinit.queue);
 
     build_fn_table();
     long result = mabda_main((long)(void*)fn_table, gpu_ok ? (long)(void*)&preinit : 0);

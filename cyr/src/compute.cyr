@@ -1,0 +1,143 @@
+# compute.cyr — compute pipeline creation and dispatch
+# Ported from mabda/src/compute.rs
+#
+# ComputePipeline struct layout (24 bytes):
+#   +0: pipeline          (WGPUComputePipeline handle, 8)
+#   +8: bind_group_layout (WGPUBindGroupLayout handle, 8)
+#   +16: pipeline_layout  (WGPUPipelineLayout handle, 8)
+
+# ================================================================
+# ComputePipeline creation
+# ================================================================
+
+# Create a compute pipeline with default storage buffer bindings
+# buffer 0 = read-write storage, buffers 1..n = read-only storage
+fn compute_pipeline_new(device, wgsl_source, entry_point, storage_count) {
+    # Build bind group layout entries
+    var entries = alloc(storage_count * 120);
+    for (var i = 0; i < storage_count; i = i + 1) {
+        var e = entries + i * 120;
+        memset(e, 0, 120);
+        if (i == 0) {
+            # First buffer: read-write storage
+            wgpu_bgl_entry_buffer(e, i, WGPU_SHADER_STAGE_COMPUTE, WGPU_BUFFER_BINDING_TYPE_STORAGE, 0, 0);
+        } else {
+            # Remaining: read-only storage
+            wgpu_bgl_entry_buffer(e, i, WGPU_SHADER_STAGE_COMPUTE, WGPU_BUFFER_BINDING_TYPE_READ_ONLY_STORAGE, 0, 0);
+        }
+    }
+
+    # Create bind group layout
+    var bgl_desc = wgpu_bind_group_layout_descriptor("compute_bgl", entries, storage_count);
+    var bgl = wgpu_device_create_bind_group_layout(device, bgl_desc);
+    if (bgl == 0) { return 0; }
+
+    # Create pipeline layout
+    var layouts[8];
+    store64(&layouts, bgl);
+    var pl_desc = wgpu_pipeline_layout_descriptor("compute_pl", &layouts, 1);
+    var pl = wgpu_device_create_pipeline_layout(device, pl_desc);
+    if (pl == 0) { return 0; }
+
+    # Create shader module
+    var src = wgpu_shader_source_wgsl(wgsl_source);
+    var sm_desc = wgpu_shader_module_descriptor("compute_shader", src);
+    var shader = wgpu_device_create_shader_module(device, sm_desc);
+    if (shader == 0) { return 0; }
+
+    # Create compute pipeline
+    var cp_desc = wgpu_compute_pipeline_descriptor("compute_pipeline", pl, shader, entry_point);
+    var pipeline = wgpu_device_create_compute_pipeline(device, cp_desc);
+
+    wgpu_shader_module_release(shader);
+    if (pipeline == 0) { return 0; }
+
+    # Build ComputePipeline struct
+    var cp = alloc(24);
+    store64(cp, pipeline);
+    store64(cp + 8, bgl);
+    store64(cp + 16, pl);
+    return cp;
+}
+
+# Accessors
+fn compute_pipeline_handle(cp)     { return load64(cp); }
+fn compute_pipeline_bgl(cp)        { return load64(cp + 8); }
+fn compute_pipeline_layout(cp)     { return load64(cp + 16); }
+
+# ================================================================
+# Dispatch helpers
+# ================================================================
+
+# Dispatch a compute pipeline with one bind group
+fn compute_dispatch(device, queue, cp, bind_group, x, y, z) {
+    var enc_desc = wgpu_command_encoder_descriptor("compute_enc");
+    var encoder = wgpu_device_create_command_encoder(device, enc_desc);
+
+    var pass_desc = wgpu_compute_pass_descriptor("compute_pass");
+    var pass = wgpu_command_encoder_begin_compute_pass(encoder, pass_desc);
+
+    wgpu_compute_pass_set_pipeline(pass, compute_pipeline_handle(cp));
+    wgpu_compute_pass_set_bind_group(pass, 0, bind_group, 0, 0);
+    wgpu_compute_pass_dispatch(pass, x, y, z);
+    wgpu_compute_pass_end(pass);
+
+    var cmd_desc = wgpu_command_buffer_descriptor("compute_cmd");
+    var cmd_buf = wgpu_command_encoder_finish(encoder, cmd_desc);
+
+    var cmds[8];
+    store64(&cmds, cmd_buf);
+    wgpu_queue_submit(queue, 1, &cmds);
+    return 0;
+}
+
+# ================================================================
+# PingPongBuffer — iterative compute with source/dest swapping
+# ================================================================
+#
+# PingPongBuffer struct layout (24 bytes):
+#   +0: buffer_a (WGPUBuffer, 8)
+#   +8: buffer_b (WGPUBuffer, 8)
+#   +16: current  (i64, 0=A is source, 1=B is source)
+
+fn ping_pong_new(device, size) {
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc_a = wgpu_buffer_descriptor("ping", usage, size, 0);
+    var desc_b = wgpu_buffer_descriptor("pong", usage, size, 0);
+    var pp = alloc(24);
+    store64(pp, wgpu_device_create_buffer(device, desc_a));
+    store64(pp + 8, wgpu_device_create_buffer(device, desc_b));
+    store64(pp + 16, 0);
+    return pp;
+}
+
+fn ping_pong_source(pp) {
+    if (load64(pp + 16) == 0) { return load64(pp); }
+    return load64(pp + 8);
+}
+
+fn ping_pong_dest(pp) {
+    if (load64(pp + 16) == 0) { return load64(pp + 8); }
+    return load64(pp);
+}
+
+fn ping_pong_swap(pp) {
+    var cur = load64(pp + 16);
+    store64(pp + 16, 1 - cur);
+    return 0;
+}
+
+fn ping_pong_release(pp) {
+    wgpu_buffer_release(load64(pp));
+    wgpu_buffer_release(load64(pp + 8));
+    return 0;
+}
+
+# Release a compute pipeline
+fn compute_pipeline_release(cp) {
+    if (cp == 0) { return 0; }
+    wgpu_compute_pipeline_release(compute_pipeline_handle(cp));
+    wgpu_bind_group_layout_release(compute_pipeline_bgl(cp));
+    wgpu_pipeline_layout_release(compute_pipeline_layout(cp));
+    return 0;
+}

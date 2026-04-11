@@ -1,2 +1,199 @@
-# buffer.cyr — GPU buffer management (stub — Phase 2)
-# Will be ported from mabda/src/buffer.rs
+# buffer.cyr — GPU buffer management
+# Ported from mabda/src/buffer.rs
+#
+# Buffer creation helpers, readback, and GrowableBuffer.
+# All functions use wgpu FFI function table.
+
+# ================================================================
+# Buffer creation helpers
+# ================================================================
+
+# Create a storage buffer with initial data
+fn create_storage_buffer(device, queue, data, size, label) {
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_COPY_SRC;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf != 0) {
+        wgpu_queue_write_buffer(queue, buf, 0, data, size);
+    }
+    return buf;
+}
+
+# Create an empty storage buffer (for compute output)
+fn create_storage_buffer_empty(device, size, label) {
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_COPY_SRC;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+# Create a uniform buffer with initial data
+fn create_uniform_buffer(device, queue, data, size, label) {
+    var usage = WGPU_BUFFER_USAGE_UNIFORM | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf != 0) {
+        wgpu_queue_write_buffer(queue, buf, 0, data, size);
+    }
+    return buf;
+}
+
+# Create a staging buffer for CPU readback
+fn create_staging_buffer(device, size, label) {
+    var usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+# Create a vertex buffer with initial data
+fn create_vertex_buffer(device, queue, data, size, label) {
+    var usage = WGPU_BUFFER_USAGE_VERTEX | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf != 0) {
+        wgpu_queue_write_buffer(queue, buf, 0, data, size);
+    }
+    return buf;
+}
+
+# Create an index buffer with initial data
+fn create_index_buffer(device, queue, data, size, label) {
+    var usage = WGPU_BUFFER_USAGE_INDEX | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf != 0) {
+        wgpu_queue_write_buffer(queue, buf, 0, data, size);
+    }
+    return buf;
+}
+
+# Create an indirect dispatch buffer
+fn create_dispatch_indirect_buffer(device, queue, data, size, label) {
+    var usage = WGPU_BUFFER_USAGE_INDIRECT | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor(label, usage, size, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf != 0) {
+        wgpu_queue_write_buffer(queue, buf, 0, data, size);
+    }
+    return buf;
+}
+
+# ================================================================
+# Synchronous buffer readback
+# ================================================================
+
+# Read buffer contents synchronously
+# Returns pointer to copied data (heap-allocated) or 0 on failure
+fn read_buffer(device, queue, buffer, size) {
+    # Create staging buffer
+    var staging = create_staging_buffer(device, size, "readback_staging");
+    if (staging == 0) { return 0; }
+
+    # Copy buffer → staging
+    var enc_desc = wgpu_command_encoder_descriptor("readback_enc");
+    var encoder = wgpu_device_create_command_encoder(device, enc_desc);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buffer, 0, staging, 0, size);
+    var cmd_desc = wgpu_command_buffer_descriptor("readback_cmd");
+    var cmd_buf = wgpu_command_encoder_finish(encoder, cmd_desc);
+
+    var cmds[8];
+    store64(&cmds, cmd_buf);
+    wgpu_queue_submit(queue, 1, &cmds);
+
+    # Map and copy
+    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, size);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return 0;
+    }
+
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, size);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return 0;
+    }
+
+    # Copy to heap
+    var result = alloc(size);
+    memcpy(result, mapped, size);
+
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return result;
+}
+
+# ================================================================
+# GrowableBuffer — dynamic GPU buffer with generation tracking
+# ================================================================
+#
+# GrowableBuffer struct layout (32 bytes):
+#   +0: buffer     (WGPUBuffer handle, 8)
+#   +8: capacity   (i64, bytes)
+#   +16: generation (i64, incremented on growth — invalidates bind groups)
+#   +24: usage      (i64, WGPUBufferUsage flags)
+
+fn growable_buffer_new(device, initial_capacity, usage) {
+    var gb = alloc(32);
+    var desc = wgpu_buffer_descriptor("growable", usage, initial_capacity, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    store64(gb, buf);
+    store64(gb + 8, initial_capacity);
+    store64(gb + 16, 0);
+    store64(gb + 24, usage);
+    return gb;
+}
+
+fn growable_buffer_handle(gb)     { return load64(gb); }
+fn growable_buffer_capacity(gb)   { return load64(gb + 8); }
+fn growable_buffer_generation(gb) { return load64(gb + 16); }
+
+# Update buffer contents — grows if needed, returns 1 if grown (bind group invalidated)
+fn growable_buffer_update(gb, device, queue, data, size) {
+    var cap = load64(gb + 8);
+    var grew = 0;
+    if (size > cap) {
+        # Grow to 2x or size, whichever is larger
+        var new_cap = cap * 2;
+        if (size > new_cap) { new_cap = size; }
+        # Release old buffer
+        var old = load64(gb);
+        if (old != 0) { wgpu_buffer_release(old); }
+        # Create new
+        var usage = load64(gb + 24);
+        var desc = wgpu_buffer_descriptor("growable", usage, new_cap, 0);
+        var new_buf = wgpu_device_create_buffer(device, desc);
+        store64(gb, new_buf);
+        store64(gb + 8, new_cap);
+        store64(gb + 16, load64(gb + 16) + 1);  # increment generation
+        grew = 1;
+    }
+    wgpu_queue_write_buffer(queue, load64(gb), 0, data, size);
+    return grew;
+}
+
+# ================================================================
+# Compute workgroup helpers (pure math, no GPU)
+# ================================================================
+
+# Calculate workgroup count for 1D dispatch
+# Returns ceil(total / workgroup_size)
+fn workgroups_1d(total, workgroup_size) {
+    return (total + workgroup_size - 1) / workgroup_size;
+}
+
+# Calculate workgroup count for 2D dispatch
+# Returns (x_groups, y_groups) packed as two i64 at dst
+fn workgroups_2d(dst, width, height, wg_x, wg_y) {
+    store64(dst, (width + wg_x - 1) / wg_x);
+    store64(dst + 8, (height + wg_y - 1) / wg_y);
+    return 0;
+}
+
+# Validate dispatch workgroup count against device limits
+# Returns 0 if valid, error code if exceeded
+fn validate_dispatch(x, y, z, max_per_dim) {
+    if (x > max_per_dim) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (y > max_per_dim) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (z > max_per_dim) { return GPU_ERR_WORKGROUP_LIMIT; }
+    return 0;
+}
