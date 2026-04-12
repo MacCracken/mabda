@@ -1,30 +1,23 @@
-# 001 — GpuContext exposes public fields, not accessor methods
+# 001 — GpuContext uses accessor functions, not opaque handles
 
-## Status: Accepted
+## Status: Accepted (updated for Cyrius port)
 
 ## Context
 
-`GpuContext` exposes `pub instance`, `pub adapter`, `pub device`, `pub queue` as raw wgpu types. This lets consumers bypass mabda entirely and call wgpu directly. The alternative is accessor methods, which would let mabda control access and enable future features like resource tracking, newtype wrappers, or multi-queue support without breaking the API.
-
-This decision was evaluated during the soorat migration (phases 0-3), which is mabda's first and most complex consumer integration.
+In the Rust version, `GpuContext` exposed `pub instance`, `pub adapter`, `pub device`, `pub queue` as raw wgpu types. In the Cyrius port, all handles are opaque i64 pointers stored in a heap-allocated struct.
 
 ## Decision
 
-Keep public fields. Do not wrap with accessor methods before v1.
-
-**Evidence from soorat migration:**
-- Soorat accesses `ctx.device` and `ctx.queue` in many call sites (buffer creation, texture uploads, pipeline building, command submission).
-- No call sites needed resource tracking or interception — soorat passes the raw device/queue directly to wgpu helpers and mabda's own APIs.
-- The backlog items that would benefit from wrapping (multi-queue, GPU memory stats) are demand-gated and not needed by any current consumer.
+Provide accessor functions (`gpu_ctx_device(ctx)`, `gpu_ctx_queue(ctx)`, etc.) that return the raw handles. Consumers can call wgpu FFI directly with these handles.
 
 **Rationale:**
-- Public fields provide zero-cost access with no indirection.
-- Wrapping these types adds API surface without current benefit.
-- If multi-queue or resource tracking is needed later, a new `GpuDevice` wrapper type can be introduced alongside the existing fields (additive change) rather than replacing them (breaking change).
-- The `instance` and `adapter` are rarely accessed after initialization — only `device` and `queue` are hot-path.
+- Cyrius has no struct field access syntax for opaque types — accessor functions are the standard pattern
+- Zero-cost: `gpu_ctx_device(ctx)` compiles to `load64(ctx + 16)` — one instruction
+- Consumers still get direct access to wgpu handles for advanced use
+- Consistent with all other Cyrius struct patterns (DeviceInfo, Color, etc.)
 
 ## Consequences
 
-- Consumers can call wgpu directly, bypassing mabda's abstractions. This is a feature, not a bug — mabda is a foundation layer, not a sandbox.
-- If multi-queue support is added, it will need a new API rather than modifying `GpuContext`. This is acceptable because multi-queue is a fundamentally different execution model.
-- GPU memory statistics, if added, would be implemented via a separate `GpuStats` struct that observes allocations rather than intercepting field access.
+- Same as Rust version: consumers can bypass mabda and call wgpu directly
+- Multi-queue support would add new accessor functions (additive, not breaking)
+- The struct layout (32 bytes: instance/adapter/device/queue at fixed offsets) is part of the ABI

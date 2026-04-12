@@ -2,93 +2,103 @@
 
 ## What Mabda Is
 
-Mabda is a GPU foundation library. It owns the `wgpu` dependency and provides shared GPU infrastructure so that every AGNOS consumer builds on one consistent base instead of duplicating device management, buffer creation, and pipeline setup.
+Mabda is a GPU foundation library written in Cyrius. It owns the wgpu-native FFI boundary and provides shared GPU infrastructure so that every AGNOS consumer builds on one consistent base instead of duplicating device management, buffer creation, and pipeline setup.
 
 ## Module Map
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │           GpuContext                 │
-                    │   (device, queue, adapter, instance) │
-                    └──────────────┬──────────────────────┘
-                                   │
-         ┌─────────────────────────┼─────────────────────────┐
-         │                         │                         │
-    ┌────▼────┐              ┌─────▼─────┐            ┌──────▼──────┐
-    │ Compute │              │   Core    │            │  Graphics   │
-    │         │              │           │            │             │
-    │ compute │              │ buffer    │            │ texture     │
-    │         │              │ typed_buf │            │ depth       │
-    └─────────┘              │ error     │            │ render_tgt  │
-                             │ color     │            │ render_pipe │
-    ┌─────────┐              │ caps      │            │ render_pass │
-    │ Caching │              │ debug     │            │ vertex      │
-    │         │              │ resource  │            │ sampler     │
-    │ shader  │              │ profiler  │            │ surface     │
-    │ pipe_$  │              └───────────┘            │ blend       │
-    └─────────┘                                      │ bind_group  │
-                                                     │ instancing  │
-                                                     └─────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ Consumers: soorat, rasa, ranga, bijli, aethersafta      │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│ mabda                                                    │
+│                                                          │
+│  Core:       error, color, capabilities, context,        │
+│              profiler, resource, debug                    │
+│                                                          │
+│  Buffers:    buffer, compute, shader_cache,              │
+│              pipeline_cache, bind_group_cache             │
+│                                                          │
+│  Graphics:   vertex, blend, sampler, depth, texture,     │
+│              bind_group, instancing                       │
+│                                                          │
+│  Render:     render_target, render_pipeline,              │
+│              render_pass, surface                         │
+│                                                          │
+│  FFI:        wgpu_types, wgpu_descriptors, wgpu_ffi      │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│ wgpu-native C API (v29) via function table               │
+│ C shim (wgpu_main.c) handles by-value struct callbacks   │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│ Vulkan / Metal / DX12 (GPU driver)                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Feature Gates
+## FFI Architecture
 
-| Feature | Modules |
-|---------|---------|
-| *(always)* | context, error, buffer, typed_buffer, capabilities, color, profiler, debug, resource, shader, pipeline_cache |
-| `compute` | compute (ComputePipeline, PingPongBuffer, validate_dispatch, workgroups) |
-| `graphics` | texture, depth, render_target, render_pipeline, render_pass, vertex, sampler, surface, blend, bind_group, instancing |
-| `full` | compute + graphics (default) |
+Cyrius cannot call C functions directly (no extern declarations). Instead:
 
-## Data Flow
-
-### Compute consumer (e.g., bijli)
+1. **C launcher** (`wgpu_main.c`) initializes libc, loads Vulkan, creates GPU context
+2. **Function table** — C populates an array of 40 wgpu function pointers
+3. **Cyrius code** receives the table pointer, calls functions via `fncall0-6`
+4. **Shim wrappers** handle wgpu functions that pass structs by value (callbacks)
 
 ```
-GpuContext::new()
-  → ComputePipeline::with_layouts(device, shader, bind_groups)
-  → create_storage_buffer(device, data) or StorageBuffer<T>::new()
-  → pipeline.dispatch(device, queue, bind_group, x, y, z)
-  → read_buffer(device, queue, output_buf, size)
+C main() → _cyrius_init() → alloc_init() → GPU pre-init → mabda_main(fn_table, preinit)
+                                                                  ↓
+                                                     fncall2(_fp(8), device, desc)
+                                                                  ↓
+                                                     wgpuDeviceCreateBuffer(device, desc)
 ```
 
-### Graphics consumer (e.g., soorat)
+## Object Mode Compilation
+
+Cyrius `.o` files are linked with gcc against wgpu-native:
 
 ```
-GpuContext::new_for_surface(surface)
-  → SurfaceState::configure(surface, adapter, device, w, h, Vsync)
-  → RenderPipelineBuilder::new(device, shader, "vs", "fs")
-      .vertex_layout(Vertex3D::layout())
-      .color_target(format, Some(blend_state(AlphaBlend)))
-      .depth_stencil(depth.depth_stencil_state())
-      .build()
-  → RenderPassBuilder::new()
-      .color_attachment(&color_view, Some(Color::BLACK))
-      .depth_attachment(&depth.view)
-      .begin(&mut encoder)
-  → surface_state.acquire(surface) → present
+test.tcyr → cc3 (object;) → test.o → gcc + wgpu_main.o + libwgpu_native.a → binary
 ```
 
-## Consumers
+Key requirements:
+- `_cyrius_init()` must be called before any Cyrius functions (initializes enums/globals)
+- `alloc_init()` must be called after `_cyrius_init()` (init resets global state)
+- Symbol clashes (memcpy, memset, etc.) resolved via `objcopy -L`
 
-| Crate | Uses | Feature |
-|-------|------|---------|
-| soorat | render pipeline, vertex, texture, depth, surface, instancing, blend | `graphics` |
-| rasa | compute pipeline, typed buffers, async readback | `compute` |
-| ranga | compute pipeline, texture, typed buffers | `full` |
-| bijli | compute pipeline, PingPongBuffer, async readback | `compute` |
-| aethersafta | render pipeline, surface, blend, render pass | `graphics` |
-| kiran | via soorat | `full` |
-
-## Dependencies
+## Data Flow: Compute
 
 ```
-mabda
-  └── wgpu 29         (GPU abstraction)
-  └── bytemuck 1       (safe byte casting)
-  └── pollster 0.4     (async runtime for GPU init)
-  └── serde 1          (serialization)
-  └── thiserror 2      (error derivation)
-  └── tracing 0.1      (structured logging)
-  └── image 0.25       (optional, PNG/JPEG loading)
+1. gpu_context_from_preinit(ptr)     → GpuContext (instance/adapter/device/queue)
+2. wgpu_buffer_descriptor(...)       → C struct at heap address
+3. wgpu_device_create_buffer(d, desc) → WGPUBuffer handle (opaque i64)
+4. wgpu_queue_write_buffer(q, b, ...) → data uploaded to GPU
+5. compute_pipeline_new(d, wgsl, ...) → ComputePipeline (pipeline/bgl/layout)
+6. compute_dispatch(d, q, cp, bg, x,y,z) → GPU execution
+7. read_buffer(d, q, b, size)        → heap-allocated copy of GPU data
 ```
+
+## Data Flow: Render
+
+```
+1. rpb_new(device, shader, "vs_main") → RenderPipelineBuilder
+2. rpb_color_target(b, format, blend)  → configure output
+3. rpb_depth(b, DEPTH32_FLOAT)         → configure depth
+4. rpb_build(b)                        → RenderPipeline
+5. rpb_pass_new()                      → RenderPassBuilder
+6. rpb_pass_color(b, view, color)      → attach color target
+7. rpb_pass_depth(b, depth_view)       → attach depth
+```
+
+## Consumer Matrix
+
+| Consumer | context | buffer | compute | texture | render | profiler |
+|----------|---------|--------|---------|---------|--------|----------|
+| soorat   | x       | x      |         | x       | x      | x        |
+| rasa     | x       | x      | x       | x       |        |          |
+| ranga    | x       | x      | x       |         |        |          |
+| bijli    | x       | x      | x       |         |        | x        |
+| aethersafta | x    | x      |         | x       | x      |          |

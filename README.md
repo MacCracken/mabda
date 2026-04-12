@@ -1,64 +1,122 @@
 # Mabda
 
-**Mabda** (Arabic: مبدأ — origin, principle, starting point) is the GPU foundation layer for the [AGNOS](https://github.com/MacCracken) ecosystem. It owns the `wgpu` dependency and provides shared GPU infrastructure that all AGNOS GPU consumers build upon.
+**Mabda** (Arabic: مبدأ — origin, principle, starting point) is the GPU foundation layer for the [AGNOS](https://github.com/MacCracken) ecosystem. It wraps the wgpu-native C API and provides shared GPU infrastructure that all AGNOS GPU consumers build upon.
+
+Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS systems language.
 
 ## Features
 
-- **Device lifecycle** — adapter selection, device/queue creation, headless + surface-aware init
-- **Compute pipelines** — shader compilation, bind group layout, 1D/2D dispatch helpers
-- **Buffer management** — storage, uniform, staging buffers with typed readback
-- **Texture loading** — PNG/JPEG, solid color, RGBA, caching with bind group management
-- **Render targets** — offscreen framebuffers with CPU readback (row alignment handled)
-- **GPU profiling** — CPU frame timing (EMA), GPU timestamp queries
-- **Capability detection** — adapter limits, feature queries, WebGPU compatibility constants
-
-## Cargo Features
-
-| Feature | Description |
-|---------|-------------|
-| `graphics` | Render targets, texture loading, surface helpers |
-| `compute` | Compute pipeline, storage buffers, dispatch utilities |
-| `full` | Enables both `graphics` and `compute` |
-
-## Consumers
-
-| Crate | Role |
-|-------|------|
-| **soorat** | Rendering engine (sprites, PBR, shadows, post-fx) |
-| **rasa** | Image editor (GPU compute filters) |
-| **ranga** | Image processing library (GPU pixel ops) |
-| **bijli** | Electromagnetic simulation (FDTD compute) |
-| **aethersafta** | Desktop compositor (GPU compositing) |
-| **kiran** | Game engine (via soorat) |
+- **Device lifecycle** — GpuContext creation with adapter/device/queue management
+- **Buffer management** — storage, uniform, vertex, index, staging, indirect buffers; synchronous readback; GrowableBuffer with generation tracking
+- **Compute pipelines** — shader compilation, bind group layout, dispatch, PingPongBuffer
+- **Render pipelines** — builder pattern for vertex/fragment shaders, blend, depth, topology
+- **Textures** — RGBA creation, TextureCache, mip levels, dimension validation
+- **Render targets** — offscreen framebuffers with optional MSAA and depth
+- **Profiling** — FrameProfiler with EMA smoothing, frame history, explicit scope timing
+- **Caching** — ShaderCache, PipelineCache, BindGroupCache for GPU resource deduplication
+- **Capabilities** — GPU feature/limit detection, WebGPU compatibility constants
 
 ## Quick Start
 
-```toml
-[dependencies]
-mabda = { version = "0.1", features = ["full"] }
+```cyrius
+include "lib/mabda.cyr"
+
+fn main() {
+    alloc_init();
+    color_init();
+
+    # Create GPU context (via C launcher pre-init)
+    var res = gpu_context_from_preinit(preinit_ptr);
+    var ctx = payload(res);
+    var device = gpu_ctx_device(ctx);
+    var queue = gpu_ctx_queue(ctx);
+
+    # Create a storage buffer
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor("my-buf", usage, 1024, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+
+    # Write data
+    var data[64];
+    store64(&data, 42);
+    wgpu_queue_write_buffer(queue, buf, 0, &data, 64);
+
+    wgpu_buffer_release(buf);
+    gpu_context_release(ctx);
+    return 0;
+}
 ```
 
-```rust
-use mabda::{GpuContext, GpuCapabilities};
+## Modules
 
-// Create a headless GPU context (compute-only)
-let ctx = pollster::block_on(GpuContext::new()).expect("GPU init failed");
+| Layer | Modules |
+|-------|---------|
+| **Core** | error, color, capabilities, context, profiler, resource, debug |
+| **Buffers** | buffer, compute (workgroup math, dispatch, PingPongBuffer) |
+| **Graphics** | vertex, blend, sampler, depth, texture, bind_group, instancing |
+| **Render** | render_target, render_pipeline, render_pass, surface |
+| **Caching** | shader_cache, pipeline_cache, bind_group_cache |
+| **FFI** | wgpu_types, wgpu_descriptors, wgpu_ffi |
 
-// Query capabilities
-let caps = GpuCapabilities::from_context(&ctx);
-println!("{}", caps.report());
+## Consumers
+
+| Project | Use Case |
+|---------|----------|
+| **soorat** | Rendering engine (sprites, PBR, shadows, post-effects) |
+| **rasa** | Image editor (GPU compute filters) |
+| **ranga** | Image processing (GPU pixel ops) |
+| **bijli** | EM simulation (FDTD compute) |
+| **aethersafta** | Desktop compositor (GPU compositing) |
+| **kiran** | Game engine (via soorat) |
+
+## Architecture
+
+Mabda owns the wgpu-native FFI boundary. Consumers depend on mabda, not on wgpu directly.
+
+```
+Consumer (soorat, bijli, ...)
+    ↓
+  mabda (GPU abstraction)
+    ↓
+  wgpu-native C API (via function table + C shim)
+    ↓
+  Vulkan / Metal / DX12
 ```
 
-## Dependencies
+## Build
 
-- **wgpu** — GPU abstraction (Vulkan, Metal, DX12, GL, WebGPU)
-- **bytemuck** — safe byte casting for GPU buffers
-- **pollster** — minimal async runtime for GPU init
-- **serde** — serialization for capabilities and color types
-- **thiserror** — error type derivation
-- **tracing** — structured logging
-- **image** *(optional)* — PNG/JPEG texture loading
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 3.4.14+ and gcc.
+
+```sh
+# Fetch wgpu-native (one-time)
+cd cyr/deps && sh fetch-wgpu.sh && cd ../..
+
+# Run standalone tests (no GPU needed)
+cd cyr
+cyrius test tests/test_color.tcyr
+cyrius test tests/test_profiler.tcyr
+cyrius test tests/test_vertex.tcyr
+
+# Run GPU tests (requires Vulkan)
+make test-phase0
+```
+
+## Project Structure
+
+```
+mabda/
+├── cyr/                  # Cyrius port (active)
+│   ├── src/              # 25 source modules (3,274 lines)
+│   ├── tests/            # Test suites (.tcyr)
+│   ├── deps/             # wgpu-native binaries + C shim
+│   ├── cyrius.toml       # Build config
+│   └── Makefile          # Hybrid C/Cyrius build
+├── rust-old/             # Original Rust implementation (reference)
+├── docs/                 # Architecture, guides, ADRs
+├── VERSION               # 2.0.0
+└── CHANGELOG.md
+```
 
 ## License
 
-GPL-3.0
+GPL-3.0-only

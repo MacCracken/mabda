@@ -2,86 +2,71 @@
 
 Thank you for your interest in contributing to Mabda.
 
+## Prerequisites
+
+- [Cyrius](https://github.com/MacCracken/cyrius) 3.4.14+
+- gcc (for GPU tests — links Cyrius .o with wgpu-native)
+- Vulkan drivers (for GPU tests)
+
 ## Development Workflow
 
 1. Fork and clone the repository
-2. Create a feature branch from `main`
-3. Make your changes
-4. Run `make check` to validate
-5. Open a pull request
+2. Set up the Cyrius stdlib symlink: `cd cyr && ln -sf ~/.cyrius/lib lib`
+3. Fetch wgpu-native (one-time): `cd deps && sh fetch-wgpu.sh`
+4. Make your changes in `cyr/src/`
+5. Run tests: `cyrius test tests/test_color.tcyr` (and other test suites)
+6. For GPU changes: `make test-phase0`
+7. Submit a PR
 
-## Prerequisites
+## Project Structure
 
-- Rust stable (MSRV 1.89)
-- Components: `rustfmt`, `clippy`
-- Optional: `cargo-audit`, `cargo-deny`, `cargo-llvm-cov`, `cargo-tarpaulin`
+```
+cyr/
+├── src/           # Cyrius source modules
+├── tests/         # Test suites (.tcyr files)
+├── deps/          # wgpu-native binaries + C shim (gitignored)
+├── cyrius.toml    # Build configuration
+└── Makefile       # Hybrid C/Cyrius build
+```
 
-## Makefile Targets
+## Running Tests
 
-| Command | Description |
-|---------|-------------|
-| `make check` | fmt + clippy + test + audit |
-| `make fmt` | Check formatting |
-| `make clippy` | Lint with `-D warnings` |
-| `make test` | Run test suite |
-| `make audit` | Security audit |
-| `make deny` | Supply chain checks |
-| `make bench` | Run benchmarks with history tracking |
-| `make coverage` | Generate HTML coverage report |
-| `make coverage-check` | Verify coverage >= 70% threshold |
-| `make doc` | Build documentation |
+```sh
+cd cyr
+
+# Standalone tests (no GPU needed)
+cyrius test tests/test_color.tcyr
+cyrius test tests/test_profiler.tcyr
+cyrius test tests/test_vertex.tcyr
+cyrius test tests/test_dynlib.tcyr
+
+# GPU integration tests (requires Vulkan)
+make test-phase0
+```
 
 ## Adding a Module
 
-1. Create `src/module_name.rs` with module doc comment
-2. Add `pub mod module_name;` to `src/lib.rs`
-3. Re-export key types from `lib.rs`
-4. Add unit tests in the module (`#[cfg(test)] mod tests`)
-5. Add `/// # Examples` doc block on all public types
-6. Update README feature list
-
-If the module requires an external dependency, gate it behind a feature flag.
-
-## Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `full` | Enables both `graphics` and `compute` (default) |
-| `graphics` | Render pipelines, textures, surfaces, depth, blend, instancing |
-| `compute` | Compute pipelines, dispatch, ping-pong buffers |
+1. Create `cyr/src/mymodule.cyr`
+2. Add `include "src/mymodule.cyr"` in `cyr/src/mabda.cyr`
+3. Add tests in `cyr/tests/test_mymodule.tcyr`
+4. Update CHANGELOG.md
 
 ## Code Style
 
-- `cargo fmt` — mandatory
-- `cargo clippy -- -D warnings` — zero warnings
-- Doc comments on all public items
-- `#[non_exhaustive]` on public enums
-- `#[must_use]` on all pure functions
-- `#[inline]` on hot-path functions
-- No `unwrap()` or `panic!()` in library code
-- Use `tracing` for structured logging, not `println!`
-- `write!` over `format!` — avoid temporary allocations
-- `Cow` over clone — borrow when you can, allocate only when you must
+- Use `#` comments (not `//`)
+- Prefix private functions with `_`
+- Document struct layouts with byte offset comments
+- Use `alloc(N)` for heap structs, `store64/load64` for field access
+- Error handling via tagged unions (Ok/Err from tagged.cyr)
+- No `unwrap()` or `panic!()` equivalent — return errors
+- Use `f64_*` builtins for float math, `f64_to_f32` at GPU boundary
 
-## Testing
+## Commit Messages
 
-- Unit tests colocated in modules (`#[cfg(test)] mod tests`)
-- GPU integration tests use headless wgpu backend (skip if no adapter)
-- Feature-gated tests with `#[cfg(feature = "...")]`
-- Target: 80%+ line coverage (CI gate at 70%)
-- Use `f32::EPSILON` or small epsilon for float comparisons
-
-## Benchmarks
-
-- All benchmarks use Criterion
-- Run `make bench` to record results to `bench-history.csv`
-- Performance claims in CHANGELOG must include benchmark numbers
-- Never skip benchmarks before claiming improvements
-
-## Commits
-
-- Use conventional-style messages
-- One logical change per commit
+Follow [Keep a Changelog](https://keepachangelog.com/) categories:
+- `add: feature description` for new features
+- `fix: bug description` for bug fixes
+- `change: what changed` for modifications
 
 ## License
 

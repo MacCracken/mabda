@@ -2,231 +2,186 @@
 
 ## Getting Started
 
-```toml
-[dependencies]
-mabda = { version = "0.1", features = ["full"] }
+Include mabda in your Cyrius source:
+
+```cyrius
+include "lib/mabda.cyr"
+```
+
+For object mode (linking with C for GPU access):
+
+```cyrius
+object;
+include "lib/mabda.cyr"
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    alloc_init();
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    # ... your GPU code ...
+    return 0;
+}
 ```
 
 ## GPU Context
 
-```rust
-use mabda::{GpuContext, GpuContextBuilder};
+The C launcher pre-initializes the GPU and passes handles to Cyrius:
 
-// Simple headless context
-let ctx = pollster::block_on(GpuContext::new())?;
-
-// Custom context with features
-let ctx = pollster::block_on(
-    GpuContextBuilder::new()
-        .power_preference(wgpu::PowerPreference::LowPower)
-        .features(wgpu::Features::TIMESTAMP_QUERY)
-        .device_lost_callback(|reason, msg| {
-            eprintln!("GPU device lost: {reason:?} — {msg}");
-        })
-        .build()
-)?;
+```cyrius
+var res = gpu_context_from_preinit(preinit_ptr);
+if (is_err_result(res) == 1) {
+    # No GPU available
+    return 1;
+}
+var ctx = payload(res);
+var device = gpu_ctx_device(ctx);
+var queue = gpu_ctx_queue(ctx);
 ```
 
 ## Buffers
 
-### Raw buffers
+### Storage Buffer (read-write GPU memory)
 
-```rust
-use mabda::buffer::*;
+```cyrius
+var data[64];
+store64(&data, 42);
+store64(&data + 8, 99);
 
-let storage = create_storage_buffer(&ctx.device, &data_bytes, "my_buf", false);
-let uniform = create_uniform_buffer(&ctx.device, &uniform_bytes, "camera");
+var buf = create_storage_buffer(device, queue, &data, 64, "my-storage");
 ```
 
-### Typed buffers (recommended)
+### Uniform Buffer (read-only, 16-byte aligned)
 
-```rust
-use mabda::{UniformBuffer, StorageBuffer};
-
-// Enforces 16-byte alignment for uniforms
-let camera_buf = UniformBuffer::new(&ctx.device, &camera_data, "camera")?;
-camera_buf.write(&ctx.queue, &updated_camera);
-
-// Storage buffer with typed access
-let particles = StorageBuffer::new(&ctx.device, &particle_data, "particles", false);
+```cyrius
+var uniforms[16];
+store32(&uniforms, f64_to_f32(F64_1));  # time = 1.0
+var ubuf = create_uniform_buffer(device, queue, &uniforms, 16, "my-uniform");
 ```
 
-### Async readback
+### Buffer Readback
 
-```rust
-use mabda::{read_buffer_async, PendingReadback};
+```cyrius
+var result = read_buffer(device, queue, gpu_buf, size);
+if (result != 0) {
+    var value = load64(result);
+}
+```
 
-let pending = read_buffer_async(&ctx.device, &ctx.queue, &output_buf, size);
-// ... do other GPU work ...
-let data = pending.finish(&ctx.device)?;
+### GrowableBuffer
+
+```cyrius
+var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST;
+var gb = growable_buffer_new(device, 1024, usage);
+var grew = growable_buffer_update(gb, device, queue, data, new_size);
+if (grew == 1) {
+    # Buffer was reallocated — rebind bind groups
+}
 ```
 
 ## Compute Pipelines
 
-```rust
-use mabda::{ComputePipeline, workgroups_1d};
+```cyrius
+var wgsl = "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) id: vec3<u32>) {\n  data[id.x] = data[id.x] * 2.0;\n}";
 
-// Single bind group (simple)
-let pipeline = ComputePipeline::new(&ctx.device, SHADER_SRC, "main", 2);
-pipeline.dispatch(&ctx.device, &ctx.queue, &bind_group, workgroups_1d(count, 256), 1, 1);
-
-// Multiple bind groups
-let pipeline = ComputePipeline::with_layouts(&ctx.device, SHADER_SRC, "main", &[
-    &storage_entries,
-    &uniform_entries,
-]);
-pipeline.dispatch_multi(&ctx.device, &ctx.queue, &[&bg0, &bg1], 64, 1, 1);
-
-// Indirect dispatch
-pipeline.encode_dispatch_indirect(&mut encoder, &[&bg0], &indirect_buf, 0);
+var cp = compute_pipeline_new(device, wgsl, "main", 1);
+# Create bind group, then dispatch:
+compute_dispatch(device, queue, cp, bind_group, workgroups_1d(count, 64), 1, 1);
 ```
 
-### PingPong buffers
+## Vertex Types
 
-```rust
-use mabda::PingPongBuffer;
+```cyrius
+# Vertex2D: position(2) + tex_coords(2) + color(4) = 32 bytes
+var v = vertex2d_new(F64_0, F64_0, F64_0, F64_0, F64_1, F64_1, F64_1, F64_1);
 
-let mut pp = PingPongBuffer::new(&ctx.device, buffer_size, "fdtd_field");
-for _ in 0..iterations {
-    // source() reads, dest() writes
-    pipeline.dispatch(&ctx.device, &ctx.queue, &create_bg(pp.source(), pp.dest()), x, 1, 1);
-    pp.swap();
-}
+# Write directly to buffer memory
+var buf[96];  # 3 vertices
+vertex2d_write(&buf, px, py, tx, ty, cr, cg, cb, ca);
+vertex2d_write(&buf + 32, ...);
+vertex2d_write(&buf + 64, ...);
+
+# Get attribute layout for pipeline
+var attrs = vertex2d_attributes();
 ```
 
-## Render Pipelines
+## Colors
 
-```rust
-use mabda::{RenderPipelineBuilder, DrawCommand, BlendPreset, blend_state};
+```cyrius
+color_init();  # Must call once before using color functions
 
-let pipeline = RenderPipelineBuilder::new(&ctx.device, SHADER, "vs_main", "fs_main")
-    .vertex_layout(Vertex3D::layout())
-    .bind_group(uniform_entries)
-    .bind_group(texture_entries)
-    .color_target(surface_format, Some(blend_state(BlendPreset::AlphaBlend)))
-    .depth_stencil(depth.depth_stencil_state())
-    .cull_mode(Some(wgpu::Face::Back))
-    .build()?;
+var red = COLOR_RED();
+var custom = color_new(F64_HALF, F64_0, F64_1, F64_1);
+var blended = color_lerp(COLOR_BLACK(), COLOR_WHITE(), F64_HALF);
+var lum = color_luminance(custom);
 
-pipeline.draw(
-    &ctx.device, &ctx.queue, &color_view,
-    &[&uniform_bg, &texture_bg],
-    &[&vertex_buf],
-    Some((&index_buf, wgpu::IndexFormat::Uint32)),
-    DrawCommand::DrawIndexed { index_count: 36, instance_count: 1, first_index: 0, base_vertex: 0, first_instance: 0 },
-    Some(Color::BLACK),
-);
+# Write as f32 for GPU buffers (16 bytes)
+var cbuf[16];
+color_write_f32(red, &cbuf);
 ```
 
-## Render Passes
+## Blend Modes
 
-```rust
-use mabda::RenderPassBuilder;
-
-let mut pass = RenderPassBuilder::new()
-    .label("geometry")
-    .color_attachment(&color_view, Some(Color::CORNFLOWER_BLUE))
-    .depth_attachment(&depth.view)
-    .begin(&mut encoder);
-// ... draw calls on pass ...
-```
-
-### MSAA
-
-```rust
-use mabda::RenderTargetBuilder;
-
-let target = RenderTargetBuilder::new(&ctx.device, 1920, 1080)
-    .format(surface_format)
-    .msaa(4)
-    .depth(DepthTexture::DEFAULT_FORMAT)
-    .build();
-
-let mut pass = RenderPassBuilder::new()
-    .color_attachment_msaa(target.render_view(), target.resolve_target().unwrap(), Some(Color::BLACK))
-    .depth_attachment(target.depth_view().unwrap())
-    .begin(&mut encoder);
-```
-
-## Textures
-
-```rust
-use mabda::{Texture, create_default_sampler};
-
-// From image bytes (PNG/JPEG)
-let tex = Texture::from_bytes(&ctx.device, &ctx.queue, include_bytes!("diffuse.png"), "diffuse")?;
-
-// Any format
-let hdr_tex = Texture::from_raw(
-    &ctx.device, &ctx.queue, &hdr_data, 512, 512, 8,
-    wgpu::TextureFormat::Rgba16Float, "hdr", sampler,
-)?;
-
-// Defaults
-let white = Texture::white_pixel(&ctx.device, &ctx.queue)?;
-let normal = Texture::flat_normal(&ctx.device, &ctx.queue)?;
-```
-
-## Bind Group Layout Builder
-
-```rust
-use mabda::BindGroupLayoutBuilder;
-
-let layout = BindGroupLayoutBuilder::new()
-    .uniform_buffer(wgpu::ShaderStages::VERTEX_FRAGMENT)   // binding 0
-    .texture_2d(wgpu::ShaderStages::FRAGMENT)               // binding 1
-    .sampler(wgpu::ShaderStages::FRAGMENT)                   // binding 2
-    .build(&ctx.device, "material_layout");
+```cyrius
+var bs = blend_state_new(BLEND_ALPHA_BLEND);
+# Also: BLEND_OPAQUE, BLEND_PREMULTIPLIED_ALPHA, BLEND_ADDITIVE, BLEND_MULTIPLY
 ```
 
 ## Profiling
 
-```rust
-use mabda::{FrameProfiler, ProfileScope};
+```cyrius
+var prof = profiler_new();
 
-let mut profiler = FrameProfiler::new();
+profiler_begin_frame(prof);
+# ... render/compute work ...
+var frame_ms = profiler_end_frame(prof);
 
-// Each frame:
-profiler.begin_frame();
-{
-    let _scope = ProfileScope::new(&mut profiler, "shadow_pass");
-    // ... render shadow pass ...
-}
-let frame_ms = profiler.end_frame();
+# Explicit scope timing (replaces RAII ProfileScope)
+var start = profile_begin();
+# ... work ...
+var duration_ms = profile_end(start);
 
-// Analysis
-println!("FPS: {:.0}", profiler.fps);
-println!("Worst: {:.1}ms", profiler.worst_frame_ms());
-println!("{}", profiler.export_json());
-```
-
-## Debug Groups
-
-```rust
-use mabda::DebugScope;
-
-{
-    let _guard = DebugScope::new(&mut encoder, "post_process");
-    // ... commands visible as "post_process" in RenderDoc/PIX ...
-}
+# Query stats
+var avg = profiler_avg_frame_ms(prof);
+var fps = profiler_fps(prof);
+var worst = profiler_worst_frame_ms(prof);
 ```
 
 ## Error Handling
 
-```rust
-use mabda::GpuError;
+Mabda uses tagged unions (Ok/Err) from tagged.cyr:
 
-match result {
-    Err(e) if e.is_recoverable() => {
-        // Surface timeout/outdated — retry or resize
-    }
-    Err(GpuError::SurfaceLost) => {
-        // Reconfigure surface
-    }
-    Err(e) => {
-        // Fatal — log and exit
-        tracing::error!("{e}");
-    }
-    Ok(_) => {}
+```cyrius
+var res = gpu_context_from_preinit(ptr);
+if (is_err_result(res) == 1) {
+    var err = payload(res);
+    var code = gpu_err_code(err);
+    var name = gpu_err_name(code);
+    # Handle error...
+    return 1;
 }
+var ctx = payload(res);  # success value
+```
+
+Recoverable errors (retry or reconfigure):
+
+```cyrius
+if (gpu_err_is_recoverable(code) == 1) {
+    # Surface timeout/outdated — retry
+}
+```
+
+## Workgroup Math
+
+```cyrius
+# 1D: ceil(total / workgroup_size)
+var groups = workgroups_1d(element_count, 64);
+
+# 2D: (ceil(w/wg_x), ceil(h/wg_y))
+var wg[16];
+workgroups_2d(&wg, width, height, 8, 8);
+var gx = load64(&wg);
+var gy = load64(&wg + 8);
+
+# Validate against device limits
+var err = validate_dispatch(gx, gy, 1, max_per_dim);
 ```

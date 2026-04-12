@@ -2,41 +2,89 @@ name: Release
 
 on:
   push:
-    tags:
-      - "*"
+    tags: ['*']
+
+permissions:
+  contents: write
+
+env:
+  CYRIUS_VERSION: "3.4.14"
 
 jobs:
   ci:
+    name: CI Gate
     uses: ./.github/workflows/ci.yml
 
-  publish:
-    needs: ci
+  build:
+    name: Build Release
+    needs: [ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Verify version consistency
+
+      - name: Verify version
         run: |
-          FILE_VERSION=$(cat VERSION)
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          TAG_VERSION="${GITHUB_REF_NAME}"
-          if [ "$FILE_VERSION" != "$CARGO_VERSION" ] || [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
-            echo "Version mismatch: VERSION=$FILE_VERSION Cargo.toml=$CARGO_VERSION tag=$TAG_VERSION"
-            exit 1
-          fi
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          TOML_VERSION=$(grep '^version = ' cyr/cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="${GITHUB_REF_NAME}"
+          [ "$FILE_VERSION" = "$TAG" ] || { echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          [ "$TOML_VERSION" = "$TAG" ] || { echo "cyrius.toml ($TOML_VERSION) != tag ($TAG)"; exit 1; }
+
+      - name: Install Cyrius toolchain
+        run: |
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+
+      - name: Setup lib symlink
+        run: ln -sf "$HOME/.cyrius/lib" cyr/lib
+
+      - name: Test
+        working-directory: cyr
+        run: |
+          cyrius test tests/test_color.tcyr
+          cyrius test tests/test_profiler.tcyr
+          cyrius test tests/test_vertex.tcyr
+          cyrius test tests/test_dynlib.tcyr
+
+      - name: Clean toolchain artifacts
+        run: rm -f cyrius-*.tar.gz
+
+      - name: Archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="mabda-${TAG}/" -o "mabda-${TAG}-src.tar.gz" HEAD
+          sha256sum mabda-*.tar.gz > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            mabda-*.tar.gz
+            SHA256SUMS
 
   release:
-    needs: [ci, publish]
+    name: Create GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@v4
         with:
-          generate_release_notes: true
+          name: release-artifacts
+      - name: Changelog
+        run: awk "/^## \\[${GITHUB_REF_NAME}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "mabda ${{ github.ref_name }}"
+          body_path: /tmp/body.md
+          prerelease: ${{ startsWith(github.ref_name, '0.') }}
+          files: |
+            mabda-*.tar.gz
+            SHA256SUMS

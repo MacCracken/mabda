@@ -1,104 +1,57 @@
 # Mabda — Development Roadmap
 
-> GPU foundation layer for AGNOS — device lifecycle, buffers, compute, textures, profiling, capability detection
->
-> Consumers: soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simulation), aethersafta (desktop compositor), kiran (game engine via soorat)
+> GPU foundation layer for AGNOS. Written in Cyrius.
+> 25 modules, 3,274 lines, 92 tests. wgpu-native v29 FFI.
 
-### Post-Sprint Review Protocol
+## v2.0.0 (Current) — Cyrius Port
 
-After completing each sprint, run a review/audit before starting the next:
+Complete port from Rust to Cyrius. All 25 modules ported.
+GPU FFI operational via C launcher + function table.
 
-1. **Cleanliness check**: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
-2. **Internal review**: Audit all new/changed code for gaps, optimizations, security, logging, errors, docs
-3. **Fix findings**: Apply fixes from audit, re-run cleanliness check
-4. **Additional tests/benchmarks**: From review findings
-5. **Benchmarks**: Run full suite, verify no regressions
-6. **Update roadmap & CHANGELOG**: Record sprint results, remove completed items
+### Completed
+- All core modules: error, color, capabilities, context, profiler, resource
+- All buffer/compute modules: buffer, compute, shader_cache, pipeline_cache, bind_group_cache
+- All graphics modules: vertex, blend, sampler, depth, texture, bind_group, instancing
+- All render modules: render_target, render_pipeline, render_pass, surface, debug
+- FFI layer: wgpu_types, wgpu_descriptors, wgpu_ffi, C launcher
+- 89 standalone tests + 3 GPU integration tests
+- Cyrius compiler fixes upstreamed: PIC codegen (3.4.12), mmap rename (3.4.12), _cyrius_init (3.4.14)
+- GPU discovery via yukti 1.2.0
 
----
-
-## Pre-v1.0 Architectural Decisions
-
-Decisions that must be resolved during soorat migration, before tagging v1.0. Taking breaking changes after v1 is costly.
-
-### GpuContext public fields vs accessor methods — RESOLVED
-
-**Decision:** Keep public fields. See [ADR-001](../adr/001-gpucontext-public-fields.md).
-
-Soorat accesses `ctx.device` and `ctx.queue` in many call sites with zero friction. Wrapping adds cost without current benefit. Multi-queue, if needed, is additive.
-
-### Typed buffer alignment strategy — RESOLVED
-
-**Decision:** Keep runtime validation, no `encase`. See [ADR-002](../adr/002-runtime-alignment-validation.md).
-
-Soorat's 4 uniform types were already correctly aligned. Zero alignment errors during migration. Runtime check is sufficient.
-
-### Vertex type extensibility — RESOLVED
-
-**Decision:** Keep fixed types + manual `VertexLayout` trait, no derive macro. See [ADR-003](../adr/003-fixed-vertex-types.md).
-
-Soorat uses all three provided types, defines zero custom ones. Derive macro is demand-gated.
-
----
-
-## v1.0 Remaining
-- [x] P1 - RenderPipelineBuilder depth-only pipeline support (`fragment: None`, `depth_only()` constructor)
-- [x] All public types documented with inline examples (`/// # Examples`) — 35+ types covered
-- [x] Resolve architectural decisions — ADR-001 (public fields), ADR-002 (runtime alignment), ADR-003 (fixed vertex types)
-- [x] BindGroupCache added for soorat phase 4 readiness (bind group dedup/invalidation)
-- [x] Test coverage — 278 tests, 75.4% line coverage (up from 162 tests / 22.47%); CI gate at 70%
-- [x] Benchmark suite — 20 benchmarks (CPU + GPU), history tracked in CSV
-- [x] Coverage gate — `./scripts/coverage-check.sh 70` added to work loop
-- [ ] Migrate soorat onto mabda (phases 0-3 done, phase 4 pending: bind group reuse, shader dedup, pipeline caching)
-
----
-
-## Test Coverage Roadmap
-
-Current: **75.4%** (278 tests, 1034/1367 lines). CI gate: **70% minimum**.
-
-### To 80% (~63 more lines needed)
-
-| Module | Current | Gap | What to test |
-|--------|---------|-----|--------------|
-| profiler.rs | 59% (72/122) | 50 lines | GpuTimestamps::read_results full path (needs TIMESTAMP_QUERY device), export_history_csv edge cases |
-| typed_buffer.rs | 51% (25/49) | 24 lines | StorageBuffer::new tracing paths, UniformBuffer zero-size rejection path |
-| context.rs | 72% (51/71) | 20 lines | GpuContextBuilder with surface (needs window or mock surface) |
-| render_target.rs | 71% (85/119) | 34 lines | RenderTargetBuilder MSAA read_pixels path, error overflow paths |
-| pipeline_cache.rs | 72% (28/39) | 11 lines | get_or_insert_render/compute with real GPU pipelines |
-| color.rs | 64% (35/55) | 20 lines | Remaining constant definitions (tarpaulin false negatives on `const` items) |
-
-### To 90% (~150 more lines needed)
-
-Requires infrastructure changes:
-
-- [ ] **Surface testing harness** — create a headless surface via `wgpu::Instance::create_surface_from_core` or similar for testing `SurfaceState` (configure, resize, acquire). This covers surface.rs (41 uncovered lines).
-- [ ] **TIMESTAMP_QUERY test device** — request a device with `Features::TIMESTAMP_QUERY` for testing `GpuTimestamps` full lifecycle (resolve + read_results). Falls back to skip on hardware without support.
-- [ ] **Pipeline cache GPU tests** — build real render/compute pipelines, insert into cache, verify dedup and invalidation with actual GPU objects.
-- [ ] **Render pipeline edge cases** — test with vertex buffers, multiple bind groups, MSAA multisample state, all topology variants.
-- [ ] **Texture error paths** — test zero-size rejection, dimension overflow, format mismatch in from_raw.
-
----
+### Pending
+- Full buffer readback test (write + copy + map + verify)
+- Typed buffer wrappers (uniform_buffer_new, storage_buffer_new)
+- GPU timestamp profiling (GpuTimestamps)
+- Texture creation via FFI (wgpuDeviceCreateTexture)
+- Render pipeline creation via FFI (wgpuDeviceCreateRenderPipeline)
+- Surface management via FFI (wgpuSurfaceGetCurrentTexture)
 
 ## Backlog (demand-gated)
 
-> Only promoted when a consumer needs it
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Render graph (DAG pass orchestration) | Not started | After render pipeline FFI works |
+| Multi-queue coordination | Not started | Additive to GpuContext |
+| Compressed textures (BC/ETC2/ASTC) | Not started | Needs texture FFI |
+| SPIR-V shader support | Not started | Currently WGSL only |
+| Mipmap generation | Not started | Needs texture FFI |
+| Image loading (PNG/JPEG) | Not started | Needs C image library (stb_image) |
+| WebGPU/WASM target | Not started | Needs Cyrius WASM backend |
 
-- [ ] Render graph (DAG-based pass orchestration) — likely belongs in soorat, not foundation
-- [ ] Multi-queue coordination (async compute + graphics)
-- [ ] Compressed texture format support (BC/DXT, ETC2, ASTC)
-- [ ] SPIR-V shader support (alongside WGSL)
-- [ ] Compute barrier/atomics helpers
-- [ ] Texture streaming / virtual textures
-- [ ] Backend selection at compile time (feature-gated)
-- [ ] WebGPU/WASM target support
-- [ ] Scissor/viewport helpers for per-region rendering
-- [ ] Command encoder abstraction / multi-pass batching
-- [ ] Vertex format extensibility (derive macro for custom layouts)
-- [ ] DynamicUniformBuffer<T> — dynamic offset support for instanced uniforms
-- [ ] Shader preprocessing (#import, #ifdef) — evaluate naga_oil integration
-- [ ] Pipeline specialization by key type — SpecializedPipeline<Key> trait
-- [ ] GPU memory statistics — VRAM usage, allocation counts
-- [ ] Staging belt integration (wgpu's StagingBelt for streaming uploads)
-- [ ] TextureArray — layered 2D textures
-- [ ] Mipmap generation (compute or blit)
+## v1.0.0 Criteria (met in Rust, porting to Cyrius)
+
+- [x] All 25 modules ported
+- [x] GPU context creation working
+- [x] Buffer create/write/release working
+- [ ] Compute dispatch end-to-end test
+- [ ] Render pipeline end-to-end test
+- [ ] Consumer integration (soorat port to Cyrius)
+
+## Architectural Decisions
+
+| ADR | Decision |
+|-----|----------|
+| [001](../adr/001-gpucontext-public-fields.md) | GpuContext uses accessor functions (load64 at fixed offsets) |
+| [002](../adr/002-runtime-alignment-validation.md) | Runtime alignment check for uniform buffers (bitwise AND) |
+| [003](../adr/003-fixed-vertex-types.md) | Fixed vertex types, manual layout, no codegen |
+| [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI |

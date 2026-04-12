@@ -4,152 +4,90 @@
 
 **Mabda** (مبدأ — Arabic: origin, principle, starting point) — GPU foundation layer for AGNOS (device lifecycle, buffers, compute, textures, profiling, capability detection)
 
-- **Type**: Library crate
-- **License**: GPL-3.0
-- **Version**: 0.1.0
+- **Type**: Library (Cyrius)
+- **License**: GPL-3.0-only
+- **Version**: 2.0.0
+- **Language**: Cyrius 3.4.14+
+- **GPU FFI**: wgpu-native v29 C API
 
 ## Consumers
 
 soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simulation), aethersafta (desktop compositor), kiran (game engine, via soorat)
 
-**Depends on**: wgpu (GPU abstraction)
+**Depends on**: wgpu-native (GPU abstraction, C API), sakshi (logging)
 
-**Modules**: context, error, capabilities, color, buffer, compute, texture, render_target, profiler
+**Modules**: error, color, capabilities, context, buffer, compute, texture, render_target, render_pipeline, render_pass, depth, vertex, sampler, surface, blend, bind_group, instancing, profiler, shader_cache, pipeline_cache, bind_group_cache, debug, resource, wgpu_types, wgpu_descriptors, wgpu_ffi
 
 ## Development Process
-
-### P(-1): Scaffold Hardening (before any new features)
-
-0. Read roadmap, CHANGELOG, and open issues — know what was intended before auditing what was built
-1. Test + benchmark sweep of existing code
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
-3. Get baseline benchmarks (`./scripts/bench-history.sh`)
-4. Internal deep review — gaps, optimizations, security, logging/errors, docs
-5. External research — domain completeness, missing capabilities, best practices, world-class accuracy
-6. Cleanliness check — must be clean after review
-7. Additional tests/benchmarks from findings
-8. Post-review benchmarks — prove the wins
-9. Repeat if heavy
 
 ### Work Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
-2. Cleanliness check: `cargo fmt --check`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo audit`, `cargo deny check`, `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`
+2. Cleanliness check: run all test suites
 3. Test + benchmark additions for new code
-4. Coverage gate: `./scripts/coverage-check.sh 70` (must stay above 70%)
-5. Run benchmarks (`./scripts/bench-history.sh`)
-6. Internal review — performance, memory, security, throughput, correctness
-7. Cleanliness check — must be clean after audit
-8. Deeper tests/benchmarks from audit observations
-9. Run benchmarks again — prove the wins
-10. If audit heavy → return to step 6
-11. Documentation — update CHANGELOG, roadmap, docs
-12. Version check — VERSION, Cargo.toml, recipe all in sync
-12. Return to step 1
+4. Internal review — performance, memory, correctness
+5. Deeper tests from audit observations
+6. Documentation — update CHANGELOG, roadmap, docs
+7. Version check — VERSION, cyrius.toml in sync
+8. Return to step 1
 
 ### Task Sizing
 
-- **Low/Medium effort**: Batch freely — multiple items per work loop cycle
-- **Large effort**: Small bites only — break into sub-tasks, verify each before moving to the next. Never batch large items together
-- **If unsure**: Treat it as large. Smaller bites are always safer than overcommitting
-
-### Refactoring
-
-- Refactor when the code tells you to — duplication, unclear boundaries, performance bottlenecks
-- Never refactor speculatively. Wait for the third instance before extracting an abstraction
-- Refactoring is part of the work loop, not a separate phase. If a review (step 5) reveals structural issues, refactor before moving to step 6
-- Every refactor must pass the same cleanliness + benchmark gates as new code
+- **Low/Medium effort**: Batch freely
+- **Large effort**: Small bites — break into sub-tasks, verify each
+- **If unsure**: Treat as large
 
 ### Key Principles
 
-- **Never skip benchmarks.** Numbers don't lie. The CSV history is the proof.
-- **Tests + benchmarks are the way.** Minimum 80%+ coverage target.
-- **Own the stack.** If an AGNOS crate wraps an external lib, depend on the AGNOS crate.
+- **Tests are the way.** 92+ tests, all passing.
+- **Own the stack.** If AGNOS wraps an external lib, depend on the AGNOS crate.
 - **No magic.** Every operation is measurable, auditable, traceable.
-- **`#[non_exhaustive]`** on all public enums.
-- **`#[must_use]`** on all pure functions.
-- **`#[inline]`** on hot-path functions.
-- **`write!` over `format!`** — avoid temporary allocations.
-- **Cow over clone** — borrow when you can, allocate only when you must.
-- **Vec arena over HashMap** — when indices are known, direct access beats hashing.
-- **Feature-gate optional deps** — consumers pull only what they need.
-- **tracing on all operations** — structured logging for audit trail.
-- **No `unwrap()` or `panic!()`** in library code — return errors or safe defaults.
+- **Manual memory.** `alloc/store64/load64` — document struct layouts with byte offsets.
+- **Tagged unions for errors.** `Ok(value)` / `Err(gpu_err(...))` via tagged.cyr.
+- **f64 internally, f32 at GPU boundary.** Use `f64_to_f32()` when writing to GPU buffers.
+- **Document struct layouts.** Every struct gets a comment block with field offsets.
+- **Prefix private helpers with `_`.** Public API uses descriptive names.
+
+## FFI Architecture
+
+GPU programs use a C launcher (`deps/wgpu_main.c`):
+1. C `main()` calls `_cyrius_init()` then `alloc_init()`
+2. C pre-initializes GPU (instance/adapter/device/queue)
+3. C builds function table (40 wgpu function pointers)
+4. C calls `mabda_main(fn_table_ptr, preinit_ptr)`
+5. Cyrius calls wgpu via `fncall2(_fp(N), arg1, arg2)`
+
+For standalone tests (no GPU): use `cyrius test tests/test_foo.tcyr` directly.
 
 ## DO NOT
 
-- **Do not commit or push** — the user handles all git operations (commit, push, tag)
+- **Do not commit or push** — the user handles all git operations
 - **NEVER use `gh` CLI** — use `curl` to GitHub API only
-- Do not add unnecessary dependencies — keep it lean
-- Do not `unwrap()` or `panic!()` in library code
-- Do not skip benchmarks before claiming performance improvements
-- Do not commit `target/` or `Cargo.lock` (library crates only)
+- Do not add unnecessary dependencies
+- Do not skip tests before claiming changes work
+- Do not commit `cyr/build/`, `cyr/deps/wgpu-native/`, or `cyr/deps/*.o`
 
 ## Documentation Structure
 
 ```
-Root files (required):
-  README.md          — quick start, features, dependency stack, consumers, license
-  CHANGELOG.md       — per-version changes (Added/Changed/Fixed/Removed)
-  CLAUDE.md          — this file (development process, principles, DO NOTs)
-  CONTRIBUTING.md    — fork, branch, make check, PR workflow
-  SECURITY.md        — supported versions, scope, reporting
-  CODE_OF_CONDUCT.md — Contributor Covenant
-  LICENSE            — GPL-3.0
+Root files:
+  README.md, CHANGELOG.md, CLAUDE.md, CONTRIBUTING.md,
+  SECURITY.md, CODE_OF_CONDUCT.md, LICENSE, VERSION
 
-docs/ (required):
-  architecture/
-    overview.md      — module map, data flow, consumers, dependency stack
-  development/
-    roadmap.md       — completed items, backlog, future features (demand-gated), v1.0 criteria
-
-docs/ (when earned — not scaffolded empty):
-  adr/
-    NNN-title.md     — architectural decision records (when non-obvious choices are made)
-  development/
-    threat-model.md  — attack surface, mitigations (when security-relevant)
-    dependency-watch.md — deps to monitor for updates/CVEs
-  guides/
-    usage.md         — patterns, philosophy, code examples
-    testing.md       — test count, coverage, testing patterns
-
-ADR format:
-  # NNN — Title
-  ## Status: Accepted/Superseded
-  ## Context: Why this decision was needed
-  ## Decision: What we chose
-  ## Consequences: Trade-offs, what changes
+docs/:
+  architecture/overview.md   — module map, FFI architecture, data flow
+  development/roadmap.md     — completed, pending, backlog
+  guides/usage.md            — code examples for all APIs
+  guides/integration.md      — consumer integration patterns
+  adr/001-004                — architectural decision records
 ```
 
 ## CHANGELOG Format
 
-Follow [Keep a Changelog](https://keepachangelog.com/):
-
 ```markdown
-# Changelog
-
-## [Unreleased]
+## [X.Y.Z] — YYYY-MM-DD
 ### Added — new features
 ### Changed — changes to existing features
 ### Fixed — bug fixes
-### Removed — removed features
-### Security — vulnerability fixes
-### Performance — benchmark-proven improvements (include numbers)
-
-## [X.Y.Z] - YYYY-MM-DD
-### Added
-- **module_name** — what was added and why
-### Changed
-- item: old behavior → new behavior
-### Fixed
-- issue description (root cause → fix)
-### Performance
-- benchmark_name: before → after (−XX%)
+### Breaking — breaking changes with migration guide
 ```
-
-Rules:
-- Every PR/commit that changes behavior gets a CHANGELOG entry
-- Performance claims MUST include benchmark numbers
-- Breaking changes get a **Breaking** section with migration guide
-- Group by module when multiple changes in one release
-- Link to ADR if a change was driven by an architectural decision

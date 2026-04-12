@@ -1,32 +1,36 @@
-# 003 — Fixed vertex types with VertexLayout trait, no derive macro
+# 003 — Fixed vertex types with manual layout, no codegen
 
-## Status: Accepted
+## Status: Accepted (updated for Cyrius port)
 
 ## Context
 
-Mabda provides three fixed vertex types (`Vertex2D`, `Vertex3D`, `SkinnedVertex3D`) covering 2D UI/sprites, 3D meshes, and skeletal animation. The `VertexLayout` trait exists for custom types, but consumers must hand-write `wgpu::VertexBufferLayout` with manual offset calculations.
-
-The alternative is a derive macro (`#[derive(VertexLayout)]`) or a builder for vertex layout generation, which would reduce boilerplate for custom vertex types.
-
-This decision was evaluated during the soorat migration (phases 0-3).
+Mabda provides three canonical vertex types: Vertex2D (32B), Vertex3D (48B), SkinnedVertex3D (96B). The Rust version used a `VertexLayout` trait with manual implementations. The question was whether to add a derive macro for custom vertex types.
 
 ## Decision
 
-Keep fixed vertex types and the manual `VertexLayout` trait. Do not add a derive macro.
-
-**Evidence from soorat migration:**
-- Soorat uses all three provided types: `Vertex2D` for UI/sprites, `Vertex3D` for meshes, `SkinnedVertex3D` for animated characters.
-- Soorat defines zero custom vertex types — the three provided cover all its rendering needs.
-- No other current consumer (rasa, ranga, bijli, aethersafta) has reported needing custom vertex formats.
+Keep fixed vertex types with manual `vertex2d_write()` / `vertex3d_new()` functions and explicit attribute layout builders (`vertex2d_attributes()`, `vertex3d_attributes()`). No codegen for custom types.
 
 **Rationale:**
-- A derive macro is a proc-macro crate, adding compile-time cost and a new crate to maintain. This is unjustified without consumer demand.
-- The three provided types cover the overwhelmingly common cases: 2D (32B), 3D (48B), and skinned 3D (96B).
-- For consumers that do need custom formats, hand-writing `VertexBufferLayout` is a one-time cost per type. The offset calculations are straightforward with `std::mem::size_of` and `std::mem::offset_of`.
-- The `VertexLayout` trait provides the generic interface needed for pipeline construction without forcing a specific generation strategy.
+- Cyrius has no traits, generics, or derive macros — custom vertex types are just `alloc(N)` + `store32` at known offsets
+- Three types cover all current consumer needs (soorat uses Vertex2D and Vertex3D)
+- Adding codegen for custom vertex types would require compiler changes (`#derive` for vertex layouts) with no current demand
+- Manual layout is explicit and auditable — each field's byte offset and shader location is documented
+
+**Cyrius vertex pattern:**
+```cyrius
+# Vertex2D: 32 bytes
+# +0: position (2 x f32)   location 0
+# +8: tex_coords (2 x f32) location 1
+# +16: color (4 x f32)     location 2
+fn vertex2d_write(dst, px, py, tx, ty, cr, cg, cb, ca) {
+    store32(dst, f64_to_f32(px));
+    store32(dst + 4, f64_to_f32(py));
+    # ...
+}
+```
 
 ## Consequences
 
-- Consumers needing custom vertex types must manually implement `VertexLayout`. This is acceptable for a foundation library — custom vertex formats are an advanced use case.
-- If kiran (game engine) or a future consumer needs many custom vertex formats, a derive macro can be added as a separate `mabda-derive` crate without changing the core library. This is purely additive.
-- The vertex type extensibility backlog item is moved to demand-gated status. It will be promoted if a consumer requests it.
+- Custom vertex types require manual `store32` at byte offsets — simple but verbose
+- Attribute descriptors must be built manually (24 bytes per attribute)
+- If demand arises, a `#derive(VertexLayout)` could be added to Cyrius — demand-gated
