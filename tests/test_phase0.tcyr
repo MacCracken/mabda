@@ -17,6 +17,13 @@ include "src/wgpu_types.cyr"
 include "src/wgpu_descriptors.cyr"
 include "src/wgpu_ffi.cyr"
 include "src/context.cyr"
+include "src/buffer.cyr"
+include "src/typed_buffer.cyr"
+include "src/gpu_timestamps.cyr"
+include "src/sampler.cyr"
+include "src/cache_key.cyr"
+include "src/texture.cyr"
+include "src/render_pipeline.cyr"
 
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
@@ -118,6 +125,198 @@ fn mabda_main(fn_table_ptr, preinit_ptr) {
     wgpu_buffer_release(read_buf);
     wgpu_buffer_release(write_buf);
 
-    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    # Test 5: typed_buffer GPU paths
+    # 5a: uniform_buffer_new rejects unaligned size
+    var udata[16];
+    store64(&udata, 0);
+    store64(&udata + 8, 0);
+    var ub_bad = uniform_buffer_new(device, queue, &udata, 12, "bad-ub");
+    if (is_err_result(ub_bad) == 0) {
+        syscall(1, 2, "FAIL: uniform_buffer_new(12) should be Err\n", 44);
+        return 1;
+    }
+
+    # 5b: uniform_buffer_new accepts aligned size, allocates handle
+    var ub = uniform_buffer_new(device, queue, &udata, 16, "good-ub");
+    if (is_ok(ub) == 0) {
+        syscall(1, 2, "FAIL: uniform_buffer_new(16) should be Ok\n", 43);
+        return 1;
+    }
+    var ub_ptr = payload(ub);
+    if (uniform_buffer_handle(ub_ptr) == 0) {
+        syscall(1, 2, "FAIL: uniform buffer handle is null\n", 36);
+        return 1;
+    }
+    if (uniform_buffer_size(ub_ptr) != 16) {
+        syscall(1, 2, "FAIL: uniform buffer size mismatch\n", 35);
+        return 1;
+    }
+    uniform_buffer_release(ub_ptr);
+    syscall(1, 1, "PASS: typed uniform buffer (reject unaligned, accept aligned)\n", 62);
+
+    # 5c: storage_buffer_new + metadata accessors
+    var sdata[64];
+    var i = 0;
+    while (i < 8) {
+        store64(&sdata + i * 8, i);
+        i = i + 1;
+    }
+    # Use storage_buffer_new (6 args) as the byte-oriented entry point, then
+    # rewrap with element-count metadata for the accessor checks.
+    var sb_bytes = storage_buffer_new(device, queue, &sdata, 64, "sb-new", 0);
+    var sb = storage_buffer_wrap(storage_buffer_handle(sb_bytes), 64, 8, 8);
+    if (storage_buffer_handle(sb) == 0) {
+        syscall(1, 2, "FAIL: storage buffer handle null\n", 33);
+        return 1;
+    }
+    if (storage_buffer_count(sb) != 8) {
+        syscall(1, 2, "FAIL: storage buffer count\n", 27);
+        return 1;
+    }
+    if (storage_buffer_capacity(sb) != 64) {
+        syscall(1, 2, "FAIL: storage buffer capacity\n", 30);
+        return 1;
+    }
+
+    # 5d: storage_buffer_write rejects write exceeding count
+    var too_big[16];
+    var over = storage_buffer_write(queue, sb, &too_big, 16);
+    if (is_err_result(over) == 0) {
+        syscall(1, 2, "FAIL: storage_buffer_write over capacity should be Err\n", 55);
+        return 1;
+    }
+
+    # 5e: storage_buffer_write accepts partial write within capacity
+    var partial[16];
+    store64(&partial, 99);
+    var ok = storage_buffer_write(queue, sb, &partial, 2);
+    if (is_ok(ok) == 0) {
+        syscall(1, 2, "FAIL: storage_buffer_write partial should be Ok\n", 48);
+        return 1;
+    }
+    storage_buffer_release(sb);
+    syscall(1, 1, "PASS: typed storage buffer (metadata, capacity guard, partial write)\n", 69);
+
+    # Test 6: GPU timestamps — feature detection + creation (if supported)
+    if (gpu_timestamps_supported(device) == 1) {
+        var ts_res = gpu_timestamps_new(device, queue, 4);
+        if (is_ok(ts_res) == 0) {
+            syscall(1, 2, "FAIL: gpu_timestamps_new returned Err despite feature\n", 54);
+            return 1;
+        }
+        var ts = payload(ts_res);
+        if (gpu_timestamps_max_passes(ts) != 4) {
+            syscall(1, 2, "FAIL: gpu_timestamps max_passes\n", 32);
+            return 1;
+        }
+        if (gpu_timestamps_query_set(ts) == 0) {
+            syscall(1, 2, "FAIL: gpu_timestamps query_set null\n", 36);
+            return 1;
+        }
+        if (gpu_timestamps_resolve_buffer(ts) == 0) {
+            syscall(1, 2, "FAIL: gpu_timestamps resolve_buffer null\n", 41);
+            return 1;
+        }
+        if (gpu_timestamps_read_buffer(ts) == 0) {
+            syscall(1, 2, "FAIL: gpu_timestamps read_buffer null\n", 38);
+            return 1;
+        }
+        gpu_timestamps_release(ts);
+        syscall(1, 1, "PASS: GPU timestamps (feature check, create, release)\n", 54);
+    } else {
+        # Device doesn't have TIMESTAMP_QUERY enabled — verify the error path.
+        var ts_res = gpu_timestamps_new(device, queue, 4);
+        if (is_err_result(ts_res) == 0) {
+            syscall(1, 2, "FAIL: expected Err when feature unsupported\n", 44);
+            return 1;
+        }
+        syscall(1, 1, "SKIP: TIMESTAMP_QUERY not supported (error path verified)\n", 58);
+    }
+
+    # Test 7: Texture creation + view + upload (full round-trip)
+    var tex = texture_create_rgba8(device, 4, 4, "test-tex-raw");
+    if (tex == 0) {
+        syscall(1, 2, "FAIL: texture_create_rgba8 returned null\n", 41);
+        return 1;
+    }
+    var view = texture_view_create_rgba8(tex, "test-tex-view");
+    if (view == 0) {
+        syscall(1, 2, "FAIL: texture_view_create_rgba8 returned null\n", 46);
+        return 1;
+    }
+    # Upload a solid-red 4×4 pattern (64 bytes = 4 × 4 × 4)
+    var pixels[64];
+    var pi = 0;
+    while (pi < 64) {
+        store8(&pixels + pi,     0xFF);  # R
+        store8(&pixels + pi + 1, 0x00);  # G
+        store8(&pixels + pi + 2, 0x00);  # B
+        store8(&pixels + pi + 3, 0xFF);  # A
+        pi = pi + 4;
+    }
+    texture_upload_rgba8(queue, tex, &pixels, 4, 4);
+    wgpu_texture_view_release(view);
+    wgpu_texture_release(tex);
+    syscall(1, 1, "PASS: texture create + view + upload + release\n", 47);
+
+    # Test 7b: texture_from_rgba convenience wrapper
+    var t = texture_from_rgba(device, queue, &pixels, 4, 4, "conv-tex");
+    if (t == 0) {
+        syscall(1, 2, "FAIL: texture_from_rgba returned null\n", 38);
+        return 1;
+    }
+    if (texture_handle(t) == 0) {
+        syscall(1, 2, "FAIL: convenience texture handle is null\n", 41);
+        return 1;
+    }
+    if (texture_view(t) == 0) {
+        syscall(1, 2, "FAIL: convenience texture view is null\n", 39);
+        return 1;
+    }
+    if (texture_width(t) != 4) {
+        syscall(1, 2, "FAIL: texture_width stored incorrectly\n", 39);
+        return 1;
+    }
+    if (texture_height(t) != 4) {
+        syscall(1, 2, "FAIL: texture_height stored incorrectly\n", 40);
+        return 1;
+    }
+    texture_release(t);
+    syscall(1, 1, "PASS: texture_from_rgba convenience wrapper\n", 44);
+
+    # Test 7c: Sampler creation
+    var samp_desc = sampler_descriptor(SAMPLER_LINEAR);
+    var sampler = wgpu_device_create_sampler(device, samp_desc);
+    if (sampler == 0) {
+        syscall(1, 2, "FAIL: wgpu_device_create_sampler returned null\n", 47);
+        return 1;
+    }
+    wgpu_sampler_release(sampler);
+    syscall(1, 1, "PASS: sampler create + release\n", 31);
+
+    # Test 8: Render pipeline creation (full-screen triangle shader)
+    var wgsl = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> { let x = f32(i32(i) - 1); let y = f32(i32(i & 1u) * 2 - 1); return vec4<f32>(x, y, 0.0, 1.0); } @fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }";
+    var shader_src = wgpu_shader_source_wgsl(wgsl);
+    var shader_desc = wgpu_shader_module_descriptor("triangle", shader_src);
+    var shader_module = wgpu_device_create_shader_module(device, shader_desc);
+    if (shader_module == 0) {
+        syscall(1, 2, "FAIL: shader module creation\n", 29);
+        return 1;
+    }
+    var rp = render_pipeline_create_simple(device, shader_module,
+                                           WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (rp == 0) {
+        syscall(1, 2, "FAIL: render_pipeline_create_simple returned 0\n", 47);
+        return 1;
+    }
+    if (render_pipeline_handle(rp) == 0) {
+        syscall(1, 2, "FAIL: render pipeline handle is null\n", 37);
+        return 1;
+    }
+    render_pipeline_release(rp);
+    wgpu_shader_module_release(shader_module);
+    syscall(1, 1, "PASS: render pipeline create + release\n", 39);
+
+    syscall(1, 1, "\n10 passed, 0 failed\n", 21);
     return 0;
 }

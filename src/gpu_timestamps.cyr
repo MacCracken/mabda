@@ -1,0 +1,164 @@
+# gpu_timestamps.cyr — GPU timestamp query profiling
+# Ported from mabda/src/profiler.rs :: GpuTimestamps
+#
+# Wraps wgpu's QuerySet + resolve buffer + read buffer triple to provide
+# per-pass GPU timing. The adapter must support `TIMESTAMP_QUERY` (feature
+# code 0x9 in WGPUFeatureName).
+#
+# GpuTimestamps struct layout (56 bytes):
+#   +0:  query_set        (WGPUQuerySet handle, 8)
+#   +8:  resolve_buffer   (WGPUBuffer handle, 8)
+#   +16: read_buffer      (WGPUBuffer handle, 8)
+#   +24: max_queries      (i64, query pair count × 2)
+#   +32: timestamp_period_bits (i64, f32 bit-pattern — 1.0f by default)
+#   +40: _pad             (8)
+#   +48: _pad             (8)
+
+# WGPUQueryType constants (webgpu.h)
+enum WGPUQueryType {
+    WGPU_QUERY_TYPE_OCCLUSION = 1;
+    WGPU_QUERY_TYPE_TIMESTAMP = 2;
+}
+
+# WGPUFeatureName::TimestampQuery from webgpu.h
+var WGPU_FEATURE_TIMESTAMP_QUERY = 9;
+
+# WGPUBufferUsage::QueryResolve (0x200) — must combine with COPY_SRC
+var WGPU_BUFFER_USAGE_QUERY_RESOLVE = 0x200;
+
+# ================================================================
+# Adapter feature query
+# ================================================================
+
+# Returns 1 if the DEVICE has timestamp queries enabled, 0 otherwise.
+# Note: wgpu requires TIMESTAMP_QUERY to be explicitly requested when
+# creating the device — an adapter supporting the feature is not enough.
+# Check the device, not the adapter.
+fn gpu_timestamps_supported(device) {
+    if (device == 0) { return 0; }
+    return wgpu_device_has_feature(device, WGPU_FEATURE_TIMESTAMP_QUERY);
+}
+
+# ================================================================
+# Allocation
+# ================================================================
+
+# Create GPU timestamp queries. Returns a GpuResult:
+#   Ok(ts_ptr)   — on success
+#   Err(...)     — if the device doesn't support TIMESTAMP_QUERY
+#
+# max_passes is the number of query PAIRS (begin + end per pass).
+# The query set is sized at max_passes * 2.
+fn gpu_timestamps_new(device, queue, max_passes) {
+    if (gpu_timestamps_supported(device) == 0) {
+        return GpuErrMsg(GPU_ERR_OTHER, "device lacks TIMESTAMP_QUERY feature");
+    }
+
+    var max_queries = max_passes * 2;
+
+    # 1. Create the query set
+    var qs_desc = wgpu_query_set_descriptor("gpu_timestamps",
+                                            WGPU_QUERY_TYPE_TIMESTAMP,
+                                            max_queries);
+    var qs = wgpu_device_create_query_set(device, qs_desc);
+    if (qs == 0) {
+        return GpuErrMsg(GPU_ERR_OTHER, "wgpuDeviceCreateQuerySet returned null");
+    }
+
+    # 2. Resolve buffer: QUERY_RESOLVE | COPY_SRC, 8 bytes per query
+    var buffer_size = max_queries * 8;
+    var resolve_usage = WGPU_BUFFER_USAGE_QUERY_RESOLVE | WGPU_BUFFER_USAGE_COPY_SRC;
+    var resolve_desc = wgpu_buffer_descriptor("timestamp_resolve",
+                                              resolve_usage, buffer_size, 0);
+    var resolve_buffer = wgpu_device_create_buffer(device, resolve_desc);
+
+    # 3. Read buffer: COPY_DST | MAP_READ
+    var read_usage = WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_MAP_READ;
+    var read_desc = wgpu_buffer_descriptor("timestamp_read",
+                                           read_usage, buffer_size, 0);
+    var read_buffer = wgpu_device_create_buffer(device, read_desc);
+
+    # 4. Record the hardware timestamp period
+    var period_bits = wgpu_queue_get_timestamp_period_bits(queue);
+
+    # 5. Build the wrapper struct
+    var ts = alloc(56);
+    store64(ts + 0,  qs);
+    store64(ts + 8,  resolve_buffer);
+    store64(ts + 16, read_buffer);
+    store64(ts + 24, max_queries);
+    store64(ts + 32, period_bits);
+    store64(ts + 40, 0);
+    store64(ts + 48, 0);
+    return GpuOk(ts);
+}
+
+# ================================================================
+# Accessors
+# ================================================================
+
+fn gpu_timestamps_query_set(ts)      { return load64(ts + 0); }
+fn gpu_timestamps_resolve_buffer(ts) { return load64(ts + 8); }
+fn gpu_timestamps_read_buffer(ts)    { return load64(ts + 16); }
+fn gpu_timestamps_max_queries(ts)    { return load64(ts + 24); }
+fn gpu_timestamps_max_passes(ts)     { return load64(ts + 24) / 2; }
+fn gpu_timestamps_period_bits(ts)    { return load64(ts + 32); }
+
+# ================================================================
+# Resolve + readback
+# ================================================================
+
+# Resolve queries into the resolve buffer and copy to the read buffer.
+# Call after all passes with timestamp writes are submitted.
+#
+# query_count is the number of individual query slots to resolve (not pairs).
+fn gpu_timestamps_resolve(ts, encoder, query_count) {
+    var max = load64(ts + 24);
+    var count = query_count;
+    if (count > max) { count = max; }
+    var qs      = load64(ts + 0);
+    var resolve = load64(ts + 8);
+    var read    = load64(ts + 16);
+    wgpu_encoder_resolve_query_set(encoder, qs, 0, count, resolve, 0);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, resolve, 0, read, 0, count * 8);
+    return 0;
+}
+
+# Map the read buffer synchronously and return a pointer to the raw u64
+# timestamp array. Caller must call gpu_timestamps_unmap when done.
+#
+# Returns 0 on failure. Call AFTER queue_submit and device_poll so the GPU
+# has finished writing the timestamps.
+fn gpu_timestamps_map(ts, device, query_count) {
+    var max = load64(ts + 24);
+    var count = query_count;
+    if (count > max) { count = max; }
+    var read = load64(ts + 16);
+    var status = wgpu_buffer_map_sync(device, read, WGPU_MAP_MODE_READ, 0, count * 8);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return 0;
+    }
+    return wgpu_buffer_get_const_mapped_range(read, 0, count * 8);
+}
+
+fn gpu_timestamps_unmap(ts) {
+    wgpu_buffer_unmap(load64(ts + 16));
+    return 0;
+}
+
+# ================================================================
+# Release
+# ================================================================
+
+fn gpu_timestamps_release(ts) {
+    var qs      = load64(ts + 0);
+    var resolve = load64(ts + 8);
+    var read    = load64(ts + 16);
+    if (qs != 0)      { wgpu_query_set_release(qs); }
+    if (resolve != 0) { wgpu_buffer_release(resolve); }
+    if (read != 0)    { wgpu_buffer_release(read); }
+    store64(ts + 0, 0);
+    store64(ts + 8, 0);
+    store64(ts + 16, 0);
+    return 0;
+}

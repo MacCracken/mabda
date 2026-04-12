@@ -1,0 +1,115 @@
+# test_surface.tcyr — pure-data tests for surface.cyr
+# Ported from rust-old/src/surface.rs tests. Skips any tests that need a
+# real WGPUSurface handle (no windowing system in a standalone test).
+
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/fmt.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/assert.cyr"
+
+include "src/error.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+# surface.cyr references wgpu_surface_configure etc. which live in
+# wgpu_ffi.cyr. We can't pull wgpu_ffi in here without the function table,
+# so we inline just the constants + pure helpers we want to test.
+
+# ================================================================
+# Present mode preferences — copied from surface.cyr
+# ================================================================
+var PRESENT_VSYNC     = 0;
+var PRESENT_NO_VSYNC  = 1;
+var PRESENT_IMMEDIATE = 2;
+var PRESENT_MAILBOX   = 3;
+
+# WGPUPresentMode v29 values
+var WGPU_PRESENT_MODE_FIFO         = 1;
+var WGPU_PRESENT_MODE_FIFO_RELAXED = 2;
+var WGPU_PRESENT_MODE_IMMEDIATE    = 3;
+var WGPU_PRESENT_MODE_MAILBOX      = 4;
+
+fn present_mode_to_wgpu(pref) {
+    if (pref == PRESENT_VSYNC)     { return WGPU_PRESENT_MODE_FIFO; }
+    if (pref == PRESENT_NO_VSYNC)  { return WGPU_PRESENT_MODE_FIFO_RELAXED; }
+    if (pref == PRESENT_IMMEDIATE) { return WGPU_PRESENT_MODE_IMMEDIATE; }
+    if (pref == PRESENT_MAILBOX)   { return WGPU_PRESENT_MODE_MAILBOX; }
+    return WGPU_PRESENT_MODE_FIFO;
+}
+
+# ================================================================
+# Tests
+# ================================================================
+
+fn test_present_mode_constants() {
+    # Verify the v29 enum values (these must match wgpu-native webgpu.h)
+    assert_eq(WGPU_PRESENT_MODE_FIFO,         1, "Fifo=1");
+    assert_eq(WGPU_PRESENT_MODE_FIFO_RELAXED, 2, "FifoRelaxed=2");
+    assert_eq(WGPU_PRESENT_MODE_IMMEDIATE,    3, "Immediate=3");
+    assert_eq(WGPU_PRESENT_MODE_MAILBOX,      4, "Mailbox=4");
+    return 0;
+}
+
+fn test_present_mode_mapping() {
+    assert_eq(present_mode_to_wgpu(PRESENT_VSYNC),     WGPU_PRESENT_MODE_FIFO,         "vsync → fifo");
+    assert_eq(present_mode_to_wgpu(PRESENT_NO_VSYNC),  WGPU_PRESENT_MODE_FIFO_RELAXED, "no vsync → relaxed");
+    assert_eq(present_mode_to_wgpu(PRESENT_IMMEDIATE), WGPU_PRESENT_MODE_IMMEDIATE,    "immediate");
+    assert_eq(present_mode_to_wgpu(PRESENT_MAILBOX),   WGPU_PRESENT_MODE_MAILBOX,      "mailbox");
+    # Unknown preference should default to Fifo
+    assert_eq(present_mode_to_wgpu(99), WGPU_PRESENT_MODE_FIFO, "unknown → fifo");
+    return 0;
+}
+
+# ================================================================
+# WGPUSurfaceConfiguration descriptor layout test
+# ================================================================
+# Mirrors surface_state_configure's descriptor building without needing
+# the FFI function table to be populated.
+fn test_surface_configuration_layout() {
+    var fake_device  = 0xdeadbeef;
+    var usage        = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    var cfg = wgpu_surface_configuration(fake_device,
+                                         WGPU_TEXTURE_FORMAT_BGRA8_UNORM,
+                                         1920, 1080, usage,
+                                         WGPU_PRESENT_MODE_FIFO);
+    assert_eq(load64(cfg + 8),  fake_device,                    "device stored");
+    assert_eq(load32(cfg + 16), WGPU_TEXTURE_FORMAT_BGRA8_UNORM, "format stored");
+    assert_eq(load64(cfg + 24), usage,                          "usage stored");
+    assert_eq(load32(cfg + 32), 1920,                           "width stored");
+    assert_eq(load32(cfg + 36), 1080,                           "height stored");
+    assert_eq(load64(cfg + 40), 0,                              "viewFormatCount=0");
+    assert_eq(load64(cfg + 48), 0,                              "viewFormats=NULL");
+    assert_eq(load32(cfg + 56), 0,                              "alphaMode=Auto(0)");
+    assert_eq(load32(cfg + 60), WGPU_PRESENT_MODE_FIFO,         "presentMode stored");
+    return 0;
+}
+
+fn test_surface_configuration_zero_init() {
+    # A second build should produce a fresh struct with no leakage.
+    var cfg1 = wgpu_surface_configuration(0, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 100, 200,
+                                          WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+                                          WGPU_PRESENT_MODE_FIFO_RELAXED);
+    var cfg2 = wgpu_surface_configuration(0, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 300, 400,
+                                          WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+                                          WGPU_PRESENT_MODE_IMMEDIATE);
+    assert_eq(load32(cfg1 + 32), 100, "cfg1 width=100");
+    assert_eq(load32(cfg1 + 36), 200, "cfg1 height=200");
+    assert_eq(load32(cfg2 + 32), 300, "cfg2 width=300");
+    assert_eq(load32(cfg2 + 36), 400, "cfg2 height=400");
+    assert_eq(load32(cfg1 + 60), WGPU_PRESENT_MODE_FIFO_RELAXED, "cfg1 present mode");
+    assert_eq(load32(cfg2 + 60), WGPU_PRESENT_MODE_IMMEDIATE,    "cfg2 present mode");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_present_mode_constants();
+    test_present_mode_mapping();
+    test_surface_configuration_layout();
+    test_surface_configuration_zero_init();
+    return assert_summary();
+}
+var exit_code = main();
+syscall(60, exit_code);

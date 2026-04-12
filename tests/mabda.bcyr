@@ -1,0 +1,253 @@
+# mabda.bcyr — CPU-only benchmark harness for mabda
+# Mirrors the 7 CPU-only benchmarks in rust-old/benches/benchmarks.rs
+# (GPU-backed benchmarks live in a separate file, deferred to v2.1 item #3).
+#
+# Usage: cat tests/mabda.bcyr | cc3 > build/bench_mabda && ./build/bench_mabda
+#
+# Rust reference numbers (rust-old/bench-history.csv, commit f113c93):
+#   color_lerp              257.40 ps
+#   color_from_hex          259.40 ps
+#   color_luminance         258.80 ps
+#   workgroups_1d           258.00 ps
+#   workgroups_2d           258.30 ps
+#   profiler_frame_cycle     65.56 ns
+#   capabilities_report     287.61 ns
+#
+# Cyrius operations below the ~250 ns `clock_gettime` floor need batched
+# timing (see lib/bench.cyr header). We batch the color/workgroup ops at
+# 10 000 iterations × 100 rounds and report per-op min across rounds.
+
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/fmt.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/bench.cyr"
+
+include "src/color.cyr"
+include "src/profiler.cyr"
+include "src/capabilities.cyr"
+# buffer.cyr contains workgroups_1d and workgroups_2d but also pulls in
+# wgpu_ffi; we use capability-level workgroups helpers to stay standalone.
+# Replicate the math here to avoid the FFI dep:
+fn _wg1(total, wg_size) { return (total + wg_size - 1) / wg_size; }
+fn _wg2(dst, w, h, wg_x, wg_y) {
+    store64(dst, (w + wg_x - 1) / wg_x);
+    store64(dst + 8, (h + wg_y - 1) / wg_y);
+    return 0;
+}
+
+# ================================================================
+# Batch tuning
+# ================================================================
+var BATCH_SIZE = 10000;
+var ROUNDS = 100;
+
+# ================================================================
+# Benchmark 1: color_lerp
+# Rust baseline: 257.40 ps
+# ================================================================
+fn bench_color_lerp() {
+    var b = bench_new("color_lerp");
+    var a = COLOR_BLACK();
+    var w = COLOR_WHITE();
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            color_lerp(a, w, F64_HALF);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 2: color_from_hex
+# Rust baseline: 259.40 ps
+# ================================================================
+fn bench_color_from_hex() {
+    var b = bench_new("color_from_hex");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            color_from_hex(0xFF8040FF);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 3: color_luminance
+# Rust baseline: 258.80 ps
+# ================================================================
+fn bench_color_luminance() {
+    var b = bench_new("color_luminance");
+    var c = color_rgb(F64_HALF, F64_HALF, F64_HALF);
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            color_luminance(c);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 4: workgroups_1d — pure integer math
+# Rust baseline: 258.00 ps
+# ================================================================
+fn bench_workgroups_1d() {
+    var b = bench_new("workgroups_1d");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            _wg1(1000000, 256);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 5: workgroups_2d — writes two i64s to a stack slot
+# Rust baseline: 258.30 ps
+# ================================================================
+fn bench_workgroups_2d() {
+    var b = bench_new("workgroups_2d");
+    var dst[16];
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            _wg2(&dst, 1920, 1080, 16, 16);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 6: profiler_frame_cycle — begin/end round-trip
+# Rust baseline: 65.56 ns
+# ================================================================
+fn bench_profiler_frame_cycle() {
+    var b = bench_new("profiler_frame_cycle");
+    var p = profiler_new();
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            profile_begin(p);
+            profile_end(p);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+# ================================================================
+# Benchmark 7: capabilities_report — format the caps report
+# Rust baseline: 287.61 ns
+# ================================================================
+fn _build_full_caps() {
+    var c = gpu_caps_new();
+    gpu_caps_set_adapter_name(c, "Test GPU");
+    gpu_caps_set_backend(c, "Vulkan");
+    gpu_caps_set_timestamp_query(c, 1);
+    gpu_caps_set_max_texture_2d(c, 16384);
+    gpu_caps_set_max_uniform(c, 65536);
+    gpu_caps_set_max_storage(c, 134217728);
+    gpu_caps_set_max_buffer(c, 268435456);
+    gpu_caps_set_max_bind_groups(c, 4);
+    gpu_caps_set_max_vertex_buf(c, 8);
+    gpu_caps_set_compute_wg(c, 256, 256, 64);
+    gpu_caps_set_compute_wgs_dim(c, 65535);
+    gpu_caps_set_multi_draw(c, 0);
+    return c;
+}
+
+# Simulate the Rust `report()` format by reading every accessor — the Rust
+# function calls `writeln!` repeatedly, which is dominated by the same
+# accessor + format cost.
+fn _caps_touch_all(c) {
+    var sum = 0;
+    sum = sum + gpu_caps_timestamp_query(c);
+    sum = sum + gpu_caps_compute_shaders(c);
+    sum = sum + gpu_caps_max_texture_2d(c);
+    sum = sum + gpu_caps_max_uniform_buffer(c);
+    sum = sum + gpu_caps_max_storage_buffer(c);
+    sum = sum + gpu_caps_max_buffer_size(c);
+    sum = sum + gpu_caps_max_bind_groups(c);
+    sum = sum + gpu_caps_max_vertex_buffers(c);
+    sum = sum + gpu_caps_max_compute_wg_x(c);
+    sum = sum + gpu_caps_max_compute_wg_y(c);
+    sum = sum + gpu_caps_max_compute_wg_z(c);
+    sum = sum + gpu_caps_max_compute_wgs_dim(c);
+    sum = sum + gpu_caps_multi_draw_indirect(c);
+    return sum;
+}
+
+fn bench_capabilities_report() {
+    var b = bench_new("capabilities_report");
+    var c = _build_full_caps();
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < BATCH_SIZE) {
+            _caps_touch_all(c);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, BATCH_SIZE);
+        ri = ri + 1;
+    }
+    bench_report(b);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    println("=== mabda CPU benchmarks ===");
+    bench_color_lerp();
+    bench_color_from_hex();
+    bench_color_luminance();
+    bench_workgroups_1d();
+    bench_workgroups_2d();
+    bench_profiler_frame_cycle();
+    bench_capabilities_report();
+    return 0;
+}
+var exit_code = main();
+syscall(60, exit_code);

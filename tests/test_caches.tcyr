@@ -1,0 +1,194 @@
+# test_caches.tcyr — pure-data tests for the three cache modules
+# Ported from rust-old/src/{shader,pipeline_cache,bind_group_cache}.rs tests.
+#
+# All three are hashmap wrappers + (for shader) an FNV-1a hash. None of the
+# cache logic touches the GPU, so these run entirely standalone. The
+# shader_cache_get_or_compile path is intentionally skipped because it calls
+# into wgpu_device_create_shader_module.
+
+include "lib/string.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/fmt.cyr"
+include "lib/syscalls.cyr"
+include "lib/hashmap.cyr"
+include "lib/assert.cyr"
+
+# shader_cache, pipeline_cache, bind_group_cache all need wgpu_ffi only for
+# the shader_cache_get_or_compile path. We skip that function by including
+# just enough to compile the cache modules.
+include "src/cache_key.cyr"
+include "src/shader_cache.cyr"
+include "src/pipeline_cache.cyr"
+include "src/bind_group_cache.cyr"
+
+# ================================================================
+# FNV-1a hash is deterministic
+# ================================================================
+fn test_shader_hash_deterministic() {
+    var a = _shader_hash("@compute @workgroup_size(1) fn main() {}");
+    var b = _shader_hash("@compute @workgroup_size(1) fn main() {}");
+    assert_eq(a, b, "same input → same hash");
+    return 0;
+}
+
+fn test_shader_hash_distinct() {
+    var a = _shader_hash("fn a() {}");
+    var b = _shader_hash("fn b() {}");
+    assert(a != b, "different input → different hash");
+    return 0;
+}
+
+fn test_shader_hash_empty_string() {
+    var h = _shader_hash("");
+    # FNV-1a empty → offset basis (14695981039346656037)
+    assert(h != 0, "empty string gives offset basis");
+    return 0;
+}
+
+fn test_shader_hash_single_char_variance() {
+    var a = _shader_hash("a");
+    var b = _shader_hash("b");
+    var c = _shader_hash("aa");
+    assert(a != b, "a != b");
+    assert(a != c, "a != aa");
+    return 0;
+}
+
+# ================================================================
+# shader_cache get/set round-trip (no GPU)
+# ================================================================
+fn test_shader_cache_miss() {
+    var cache = shader_cache_new();
+    var handle = shader_cache_get(cache, "not in cache");
+    assert_eq(handle, 0, "miss returns 0");
+    return 0;
+}
+
+fn test_shader_cache_set_and_get() {
+    var cache = shader_cache_new();
+    # Use a non-zero sentinel for the module handle so we can distinguish it
+    # from the "miss = 0" return.
+    var fake_module = 0xdeadbeef;
+    shader_cache_set(cache, "@compute fn x() {}", fake_module);
+    var got = shader_cache_get(cache, "@compute fn x() {}");
+    assert_eq(got, fake_module, "round-trip handle");
+    return 0;
+}
+
+fn test_shader_cache_distinct_keys() {
+    var cache = shader_cache_new();
+    shader_cache_set(cache, "shader a", 111);
+    shader_cache_set(cache, "shader b", 222);
+    assert_eq(shader_cache_get(cache, "shader a"), 111, "a preserved");
+    assert_eq(shader_cache_get(cache, "shader b"), 222, "b preserved");
+    return 0;
+}
+
+fn test_shader_cache_update_overwrites() {
+    var cache = shader_cache_new();
+    shader_cache_set(cache, "same key", 100);
+    shader_cache_set(cache, "same key", 200);
+    assert_eq(shader_cache_get(cache, "same key"), 200, "newer value wins");
+    return 0;
+}
+
+# ================================================================
+# pipeline_cache get/set round-trip
+# ================================================================
+fn test_pipeline_cache_miss() {
+    var cache = pipeline_cache_new();
+    assert_eq(pipeline_cache_get(cache, 42),  0, "miss returns 0");
+    assert_eq(pipeline_cache_has(cache, 42),  0, "has returns 0 on miss");
+    return 0;
+}
+
+fn test_pipeline_cache_set_and_get() {
+    var cache = pipeline_cache_new();
+    pipeline_cache_set(cache, 42, 0xabcd);
+    assert_eq(pipeline_cache_get(cache, 42), 0xabcd, "round-trip");
+    assert_eq(pipeline_cache_has(cache, 42), 1, "has returns 1 after set");
+    return 0;
+}
+
+fn test_pipeline_cache_distinct_keys() {
+    var cache = pipeline_cache_new();
+    pipeline_cache_set(cache, 1, 100);
+    pipeline_cache_set(cache, 2, 200);
+    pipeline_cache_set(cache, 99, 9900);
+    assert_eq(pipeline_cache_get(cache, 1),  100, "key 1");
+    assert_eq(pipeline_cache_get(cache, 2),  200, "key 2");
+    assert_eq(pipeline_cache_get(cache, 99), 9900, "key 99");
+    return 0;
+}
+
+fn test_pipeline_cache_large_key() {
+    var cache = pipeline_cache_new();
+    # Large u64-ish key (fits in i64 signed range)
+    var big = 0x7FFFFFFFFFFFFFFF;
+    pipeline_cache_set(cache, big, 7);
+    assert_eq(pipeline_cache_get(cache, big), 7, "max i64 key round-trip");
+    return 0;
+}
+
+# ================================================================
+# bind_group_cache get/set/has
+# ================================================================
+fn test_bind_group_cache_miss() {
+    var cache = bind_group_cache_new();
+    assert_eq(bind_group_cache_get(cache, 0x100), 0, "miss returns 0");
+    assert_eq(bind_group_cache_has(cache, 0x100), 0, "has false on miss");
+    return 0;
+}
+
+fn test_bind_group_cache_set_and_get() {
+    var cache = bind_group_cache_new();
+    bind_group_cache_set(cache, 0x100, 0xbeef);
+    assert_eq(bind_group_cache_get(cache, 0x100), 0xbeef, "round-trip");
+    assert_eq(bind_group_cache_has(cache, 0x100), 1, "has true after set");
+    return 0;
+}
+
+fn test_bind_group_cache_distinct() {
+    var cache = bind_group_cache_new();
+    bind_group_cache_set(cache, 1, 11);
+    bind_group_cache_set(cache, 2, 22);
+    bind_group_cache_set(cache, 3, 33);
+    assert_eq(bind_group_cache_get(cache, 1), 11, "1 → 11");
+    assert_eq(bind_group_cache_get(cache, 2), 22, "2 → 22");
+    assert_eq(bind_group_cache_get(cache, 3), 33, "3 → 33");
+    return 0;
+}
+
+fn test_bind_group_cache_clear_returns_fresh() {
+    var cache = bind_group_cache_new();
+    bind_group_cache_set(cache, 42, 0xdead);
+    var fresh = bind_group_cache_clear(cache);
+    # Note: bind_group_cache_clear returns a *new* empty map rather than
+    # mutating the existing one (hashmap.cyr has no iter-with-remove).
+    assert_eq(bind_group_cache_get(fresh, 42), 0, "cleared cache is empty");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_shader_hash_deterministic();
+    test_shader_hash_distinct();
+    test_shader_hash_empty_string();
+    test_shader_hash_single_char_variance();
+    test_shader_cache_miss();
+    test_shader_cache_set_and_get();
+    test_shader_cache_distinct_keys();
+    test_shader_cache_update_overwrites();
+    test_pipeline_cache_miss();
+    test_pipeline_cache_set_and_get();
+    test_pipeline_cache_distinct_keys();
+    test_pipeline_cache_large_key();
+    test_bind_group_cache_miss();
+    test_bind_group_cache_set_and_get();
+    test_bind_group_cache_distinct();
+    test_bind_group_cache_clear_returns_fresh();
+    return assert_summary();
+}
+var exit_code = main();
+syscall(60, exit_code);

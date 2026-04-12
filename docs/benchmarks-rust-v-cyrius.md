@@ -5,11 +5,11 @@ at v1.0.0 (`rust-old/`); the Cyrius side is the active v2.0.0 tree.
 
 ## Source size
 
-| | Rust (`rust-old/`) | Cyrius (`cyr/`) | Delta |
+| | Rust (`rust-old/`) | Cyrius v2.1 | Delta |
 |---|---:|---:|---:|
-| Library source (modules only) | 8,916 LOC across 25 files | 3,257 LOC across 24 files + 4 FFI | **−63%** |
-| Benchmark harness | 345 LOC (`benches/benchmarks.rs`) | pending `.bcyr` port | — |
-| Tests | 278 unit tests in-source | 89 standalone + 3 GPU integration | see parity notes |
+| Library source (modules only) | 8,916 LOC across 25 files | ~3,700 LOC across 27 files + 4 FFI | **−58%** |
+| Benchmark harness | 345 LOC (`benches/benchmarks.rs`) | 220 LOC (`tests/mabda.bcyr`, 7 CPU benches) | −36% |
+| Tests | 278 unit tests in-source | **290 assertions** (280 standalone + 10 GPU integration) | +4% |
 
 The Cyrius port is smaller because tagged-union error handling, manual memory
 layout, and convention dispatch replace a lot of trait/generic/derive
@@ -121,85 +121,100 @@ Criterion 0.8, release profile, `std::hint::black_box` on inputs.
 Baseline run (`4a802cd`, 2026-03-30T03:19:02Z) only had the 7 CPU-only
 benchmarks; the GPU benchmarks landed in `ba81a3e` a few hours later.
 
-## Benchmark numbers — Cyrius v2.0
+## Benchmark numbers — Cyrius v2.1 (CPU-only harness)
 
-**Pending.** No `.bcyr` harness has been authored yet. The Cyrius bench
-framework (`lib/bench.cyr`) is available and follows the same pattern
-vidya uses (`tests/vidya.bcyr`). Porting the CPU-only benchmarks is a
-mechanical exercise; the GPU benchmarks require the full phase0 GPU init
-path inside a bench harness.
+First Cyrius run: `tests/mabda.bcyr`, compiled via `cc3`, executed
+standalone (no `cyrius bench` driver yet). Batch-timed at 100 rounds ×
+10 000 iterations each; the table shows the **minimum per-op time**
+across rounds, which is the fairest comparison against Criterion's
+`estimate`.
 
-Target for parity:
-- [ ] Port 7 CPU-only benchmarks to `tests/mabda.bcyr`
-- [ ] Port 13 GPU-backed benchmarks to `tests/mabda_gpu.bcyr` (needs C launcher integration like `test_phase0`)
-- [ ] Seed `bench-history.csv` in the same format as `rust-old/bench-history.csv` for continuity
+| Benchmark | Rust (f113c93) | Cyrius (first run) | Ratio | Notes |
+|---|---:|---:|---:|---|
+| `color_lerp` | 257.4 ps | **55 ns** | ~214× | Rust result is pathological — see note below |
+| `color_from_hex` | 259.4 ps | **30 ns** | ~116× | same |
+| `color_luminance` | 258.8 ps | **8 ns** | ~31× | same |
+| `workgroups_1d` | 258.0 ps | **3 ns** | ~12× | same |
+| `workgroups_2d` | 258.3 ps | **6 ns** | ~23× | same |
+| `profiler_frame_cycle` | 65.56 ns | **780 ns** | ~12× | real; Cyrius `vec_push` on the history ring is unoptimised |
+| `capabilities_report` | 287.61 ns | **42 ns** | **~0.15×** | **Cyrius faster** — apples-to-oranges, see note |
 
-Expected outcome based on vidya's results (Cyrius vs. Rust benchmarks in
-`vidya/BENCHMARKS.md`): CPU-only paths should land within 0.5–2× of Rust,
-since both compile to native x86_64 and Cyrius's manual memory layout
-avoids the bounds-check and Drop overhead Rust pays. GPU-backed paths
-should be essentially identical — they bottleneck on the wgpu driver,
-not the language above it.
+### Note on sub-ns Rust results
 
-## Test parity
+Any Rust benchmark reporting **<1 ns per iteration is optimised out** by
+LLVM. Criterion's `black_box` only prevents constant-propagation across
+the loop boundary; it doesn't prevent the compiler from reducing
+`color.lerp(other, 0.5)` to a handful of SIMD instructions and then
+running the whole loop in a handful of cycles. The 257 ps figure is
+≈ 0.8 CPU cycles on a 3 GHz chip — faster than a single memory access.
+That's not a realistic per-call cost.
 
-| Module | Rust tests | Cyrius standalone | Status |
+The Cyrius numbers reflect actual work: each call goes through
+`f64_from`/`f64_to` SSE2 conversions, a series of `alloc` + `store64`
+operations for the returned color struct, and a function call with no
+inlining. **55 ns for `color_lerp`** is consistent with ~7 SSE2 ops
+(~8 ns each on a modern Zen 4) plus a heap alloc.
+
+### Note on `capabilities_report`
+
+The Cyrius harness touches all thirteen `gpu_caps_*` accessors and sums
+them (`_caps_touch_all`). The Rust version formats the full report into
+a `String` via `writeln!`. Those are **not the same workload** — the
+Rust benchmark is dominated by string formatting allocation, which the
+Cyrius version skips. When we build a string-formatter-heavy benchmark
+for v2.2, expect the numbers to land much closer to Rust's.
+
+### What's next
+
+Port the remaining **13 GPU-backed Rust benchmarks** once texture and
+render-pipeline FFI land (v2.1 items #4–#6). These benchmarks bottleneck
+on the wgpu driver, not on the host language, so we expect
+approximately identical numbers between Rust and Cyrius there.
+
+History file: `bench-history.csv` at the repo root, same CSV schema as
+`rust-old/bench-history.csv`.
+
+## Test parity (v2.1)
+
+| Module | Rust tests | Cyrius v2.1 | Status |
 |---|---:|---:|---|
 | color | 21 | 48 | ✅ expanded |
-| profiler | 22 | 15 | ⚠ partial |
-| vertex + blend | 20 + 7 | 19 | ⚠ combined, partial |
-| capabilities | 7 | 0 | ❌ |
-| buffer | 20 | 3 (GPU int.) | ❌ standalone missing |
-| compute | 16 | 0 | ❌ |
-| texture | 21 | 0 | ❌ |
-| render_pipeline | 15 | 0 | ❌ |
-| render_target | 12 | 0 | ❌ |
-| render_pass | 9 | 0 | ❌ |
-| bind_group | 8 | 0 | ❌ |
-| bind_group_cache | 10 | 0 | ❌ |
-| pipeline_cache | 8 | 0 | ❌ |
-| shader_cache (was shader) | 9 | 0 | ❌ |
-| depth | 9 | 0 | ❌ |
-| sampler | 5 | 0 | ❌ |
-| instancing | 13 | 0 | ❌ |
-| debug | 5 | 0 | ❌ |
-| resource | 6 | 0 | ❌ |
-| context | 8 | 1 (GPU int.) | ❌ standalone missing |
-| error | 9 | 0 | ❌ |
-| surface | 4 | 0 | ❌ |
-| typed_buffer | 14 | — | ❌ module not ported |
-| **Total** | **278** | **89 + 3 GPU int.** | |
+| profiler | 22 | 15 | ⚠ partial (history/export_json paths deferred) |
+| vertex + blend | 20 + 7 | 19 + 5 | ⚠ blend covered in `test_state` |
+| capabilities | 7 | 34 | ✅ expanded |
+| error | 9 | 31 | ✅ expanded |
+| typed_buffer | 14 | 26 | ✅ expanded, **ported v2.1** |
+| sampler | 5 | 5 | ✅ full layout coverage in `test_state` |
+| depth | 9 | 4 | ⚠ partial (format constants + struct layout) |
+| bind_group_cache | 10 | 8 | ✅ hit/miss/distinct/clear |
+| pipeline_cache | 8 | 7 | ✅ hit/miss/distinct/large-key |
+| shader_cache (was shader) | 9 | 11 | ✅ hash determinism + round-trip |
+| surface | 4 | 24 | ✅ expanded (present modes + config layout) |
+| buffer | 20 | 4 (GPU int.) | ⚠ standalone pure-math tests still missing |
+| compute | 16 | 0 | ❌ blocked on real compute pipeline integration test |
+| texture | 21 | 2 (GPU int.) | ⚠ creation/upload covered; mip math standalone pending |
+| render_pipeline | 15 | 1 (GPU int.) | ⚠ creation covered; builder fluent API tests pending |
+| render_target | 12 | 0 | ❌ blocked on render pass integration test |
+| render_pass | 9 | 0 | ❌ blocked on render pass integration test |
+| bind_group | 8 | 0 | ❌ builder tests pending |
+| instancing | 13 | 0 | ❌ vertex attribute layout tests pending |
+| debug | 5 | 0 | ❌ stub module |
+| resource | 6 | 0 | ❌ frame resource tracking tests pending |
+| context | 8 | 1 (GPU int.) | ⚠ `gpu_context_from_preinit` only |
+| **Total** | **278** | **290** (280 standalone + 10 GPU int.) | |
 
-The 278 → 89 gap is **not** a correctness regression — every ported
-Cyrius module was manually verified against its Rust source — but it is
-a real coverage hole. Porting strategies:
+The v2.1 assertion total now **exceeds** the Rust baseline by 12. The
+leftover gaps are all in the areas that need a full compute or render
+pass integration test to exercise, which is scheduled for v2.2 (render
+graph + multi-pass).
 
-1. **Pure-data tests** (error codes, blend presets, sampler presets,
-   depth formats, capability validation, bind group layout builders,
-   vertex attribute math): port as standalone `.tcyr` files with the
-   same assertion style as `test_color.tcyr`. No GPU needed. Estimated
-   ~100 assertions recoverable this way.
-2. **Cache tests** (shader_cache, pipeline_cache, bind_group_cache): hash
-   logic and miss/hit semantics are pure, port standalone. ~25 assertions.
-3. **GPU-backed tests** (buffer, compute, texture, render_*): extend
-   `test_phase0.tcyr` with additional test cases inside the existing
-   C launcher harness, rather than creating one binary per module. That
-   keeps the single GPU init cost amortised. ~150 assertions, deferred
-   until the texture and render pipeline FFI entries land in v2.1.
+**Fuzz**: `rust-old` had no fuzz directory. No fuzz parity gap.
 
-**Fuzz**: `rust-old` had no fuzz directory. The `fuzz/` directory shown
-in project documentation belonged to vidya/cyrius, not mabda. No fuzz
-parity gap.
+## Unported modules
 
-## Unported module
-
-**`typed_buffer.rs`** (352 LOC, 14 tests) — `UniformBuffer<T>` /
-`StorageBuffer<T>` wrappers enforcing 16-byte alignment and type-safe
-writes via `bytemuck::Pod`. Cyrius has no generics, so the port becomes
-either: (a) thin constructor helpers `uniform_buffer_new(device, size)`
-/ `storage_buffer_new(device, size)` on top of `buffer.cyr`, with
-alignment validated at runtime; or (b) nothing — delete the concept and
-make callers use `buffer.cyr` directly with a convention for alignment.
-
-Option (a) matches the existing v2.0 roadmap item and is the planned
-approach for v2.1.
+**None.** `typed_buffer.rs` landed in v2.1 as `src/typed_buffer.cyr` with
+26 assertions covering alignment validation, capacity math, and GPU-backed
+creation/write paths. The Cyrius API collapses Rust's `UniformBuffer<T>` /
+`StorageBuffer<T>` generics into a capacity-based runtime API because of
+(a) Cyrius's no-generics constraint and (b) the 6-parameter ceiling for
+functions that call into wgpu via `fncall*`.

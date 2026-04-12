@@ -1,47 +1,119 @@
-# texture.cyr — texture loading and management
+# texture.cyr — texture creation, view, sampler, and caching
 # Ported from mabda/src/texture.rs
 #
-# Texture struct layout (24 bytes):
-#   +0: texture (WGPUTexture handle, 8)
-#   +8: view    (WGPUTextureView handle, 8)
+# Texture struct layout (32 bytes):
+#   +0:  texture (WGPUTexture handle, 8)
+#   +8:  view    (WGPUTextureView handle, 8)
 #   +16: sampler (WGPUSampler handle, 8)
+#   +24: width × height packed (lower 32 bits = width, upper 32 bits = height)
 #
-# NOTE: wgpuDeviceCreateTexture, wgpuTextureCreateView, wgpuDeviceCreateSampler
-# need to be added to wgpu_ffi.cyr function table for GPU creation.
-# For now, struct layout and helper logic are defined.
+# The last field is for informational purposes — the original 24-byte layout
+# lost size information, which makes `texture_from_*` results hard to use.
+#
+# FFI contract: all creation paths use wgpu_ffi slots 45–51. See
+# src/wgpu_descriptors.cyr for the struct builders.
 
-# Texture accessors
-fn texture_handle(t)  { return load64(t); }
-fn texture_view(t)    { return load64(t + 8); }
-fn texture_sampler(t) { return load64(t + 16); }
+# ================================================================
+# Accessors
+# ================================================================
+fn texture_handle(t)    { return load64(t); }
+fn texture_view(t)      { return load64(t + 8); }
+fn texture_sampler(t)   { return load64(t + 16); }
+fn texture_width(t)     { return load32(t + 24); }
+fn texture_height(t)    { return load32(t + 28); }
 
 # Build a Texture struct from pre-created handles
 fn texture_from_handles(tex, view, sampler) {
-    var t = alloc(24);
-    store64(t, tex);
-    store64(t + 8, view);
+    var t = alloc(32);
+    store64(t + 0,  tex);
+    store64(t + 8,  view);
     store64(t + 16, sampler);
+    store64(t + 24, 0);
     return t;
 }
 
-# Create a 1x1 solid color texture from RGBA8 bytes
-# rgba_ptr points to 4 bytes [r, g, b, a]
-fn texture_from_rgba(device, queue, rgba_ptr, width, height, label) {
-    # TODO: implement with wgpuDeviceCreateTexture + wgpuQueueWriteTexture
-    # For now, return 0 (not available until texture FFI is added)
+# Release all handles held by a Texture struct (safe for partial fills)
+fn texture_release(t) {
+    var tex     = load64(t + 0);
+    var view    = load64(t + 8);
+    var sampler = load64(t + 16);
+    if (view != 0)    { wgpu_texture_view_release(view); }
+    if (tex != 0)     { wgpu_texture_release(tex); }
+    if (sampler != 0) { wgpu_sampler_release(sampler); }
+    store64(t + 0, 0);
+    store64(t + 8, 0);
+    store64(t + 16, 0);
     return 0;
 }
 
-# Create a 1x1 solid color from a Color struct
+# ================================================================
+# Raw creation — create a texture handle without view/sampler
+# ================================================================
+
+# Creates a 2D texture with RGBA8_UNORM format and
+# TEXTURE_BINDING | COPY_DST usage (the common "upload + sample" case).
+fn texture_create_rgba8(device, width, height, label) {
+    var usage = WGPU_TEXTURE_USAGE_TEXTURE_BINDING | WGPU_TEXTURE_USAGE_COPY_DST;
+    var desc = wgpu_texture_descriptor(label, usage, WGPU_TEXTURE_DIMENSION_2D,
+                                       width, height, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    return wgpu_device_create_texture(device, desc);
+}
+
+# Create a default 2D TextureView for an RGBA8 texture.
+fn texture_view_create_rgba8(texture, label) {
+    var desc = wgpu_texture_view_descriptor(label,
+                                            WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                                            WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    return wgpu_texture_create_view(texture, desc);
+}
+
+# ================================================================
+# Upload — wraps wgpuQueueWriteTexture
+# ================================================================
+
+# Upload a tightly packed RGBA8 buffer into a texture.
+#   bytes_per_row = width × 4 (caller can override for aligned uploads)
+fn texture_upload_rgba8(queue, texture, data, width, height) {
+    var dest = wgpu_texel_copy_texture_info(texture, 0);
+    var layout = wgpu_texel_copy_buffer_layout(0, width * 4, height);
+    var size = wgpu_extent_3d(width, height, 1);
+    var data_size = width * height * 4;
+    wgpu_queue_write_texture(queue, dest, data, data_size, layout, size);
+    return 0;
+}
+
+# ================================================================
+# Convenience: RGBA8 texture + view + upload in one call
+# ================================================================
+# Caller must supply a tightly packed (width × height × 4) byte buffer.
+# Returns a Texture struct with texture + view populated (sampler = 0).
+fn texture_from_rgba(device, queue, rgba_ptr, width, height, label) {
+    var tex = texture_create_rgba8(device, width, height, label);
+    if (tex == 0) { return 0; }
+    var view = texture_view_create_rgba8(tex, label);
+    texture_upload_rgba8(queue, tex, rgba_ptr, width, height);
+    var t = alloc(32);
+    store64(t + 0,  tex);
+    store64(t + 8,  view);
+    store64(t + 16, 0);
+    store32(t + 24, width);
+    store32(t + 28, height);
+    return t;
+}
+
+# Create a 1×1 solid-color texture from a Color struct.
 fn texture_from_color(device, queue, color) {
     var rgba[4];
-    # Convert f64 color components to u8
-    store8(&rgba, f64_to(f64_mul(color_r(color), f64_from(255))));
+    store8(&rgba,     f64_to(f64_mul(color_r(color), f64_from(255))));
     store8(&rgba + 1, f64_to(f64_mul(color_g(color), f64_from(255))));
     store8(&rgba + 2, f64_to(f64_mul(color_b(color), f64_from(255))));
     store8(&rgba + 3, f64_to(f64_mul(color_a(color), f64_from(255))));
     return texture_from_rgba(device, queue, &rgba, 1, 1, "solid_color");
 }
+
+# ================================================================
+# Mip math (pure — no FFI)
+# ================================================================
 
 # Compute mip level count for a texture of given dimensions
 fn mip_level_count(width, height) {
@@ -65,22 +137,24 @@ fn validate_dimensions(width, height, max_dim) {
 # ================================================================
 # TextureCache — keyed caching for loaded textures
 # ================================================================
+# Uses the same _hash_to_heap_key helper as the other caches. Stack-allocated
+# keys would dangle as soon as the setter returned; see the cache-fix section
+# in shader_cache.cyr for the rationale.
 
 fn texture_cache_new() {
     return map_new();
 }
 
 fn texture_cache_get(cache, key) {
-    var ibuf[24];
-    var klen = fmt_int_buf(key, &ibuf);
-    store8(&ibuf + klen, 0);
-    return map_get(cache, &ibuf);
+    return map_get(cache, _hash_to_heap_key(key));
 }
 
 fn texture_cache_set(cache, key, texture) {
-    var ibuf[24];
-    var klen = fmt_int_buf(key, &ibuf);
-    store8(&ibuf + klen, 0);
-    map_set(cache, &ibuf, texture);
+    map_set(cache, _hash_to_heap_key(key), texture);
+    return 0;
+}
+
+fn texture_cache_has(cache, key) {
+    if (texture_cache_get(cache, key) != 0) { return 1; }
     return 0;
 }

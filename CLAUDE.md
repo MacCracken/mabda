@@ -6,9 +6,9 @@
 
 - **Type**: Library (Cyrius)
 - **License**: GPL-3.0-only
-- **Version**: 2.0.0
+- **Version**: 2.1.0
 - **Language**: Cyrius 3.4.12+ (PIC codegen + mmap rename — declared in `cyrius.toml`)
-- **GPU FFI**: wgpu-native v29 C API
+- **GPU FFI**: wgpu-native v29 C API (58-slot function table)
 
 ## Consumers
 
@@ -39,7 +39,7 @@ soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simu
 
 ### Key Principles
 
-- **Tests are the way.** 93 tests (89 standalone + 4 GPU integration), all passing.
+- **Tests are the way.** 290 assertions (280 standalone + 10 GPU integration), all passing.
 - **Own the stack.** If AGNOS wraps an external lib, depend on the AGNOS crate.
 - **No magic.** Every operation is measurable, auditable, traceable.
 - **Manual memory.** `alloc/store64/load64` — document struct layouts with byte offsets.
@@ -48,6 +48,7 @@ soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simu
 - **Document struct layouts.** Every struct gets a comment block with field offsets.
 - **Prefix private helpers with `_`.** Public API uses descriptive names.
 - **Struct-pack wgpu args with 6+ parameters.** Cyrius `fncall6` + wgpu-native segfaults. Wrap via a C shim in `deps/wgpu_main.c` that takes `(handle, struct_ptr)` and call via `fncall2` — see `wgpu_command_encoder_copy_buffer_to_buffer` and `wgpu_buffer_map_sync` for the pattern.
+- **6-parameter ceiling for Cyrius fns that make wgpu fncalls.** Pure Cyrius functions can take 12+ args without issue, but the moment one of them internally `fncall*`s into wgpu-native, any fn signature with 7+ params reliably segfaults. Fold params into a struct pointer or split into helpers. See `feedback_cyrius_param_ceiling.md`.
 
 ## Project Layout (flat — matches vidya/cyrius)
 

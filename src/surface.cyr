@@ -1,27 +1,37 @@
 # surface.cyr — window surface lifecycle management
 # Ported from mabda/src/surface.rs
 #
-# SurfaceState manages a window surface's configuration and frame acquisition.
-# Requires a windowing system (not used in headless compute).
+# mabda is headless — creating a WGPUSurface requires a platform-specific
+# handle (X11 window, Wayland surface, HWND, NSView, etc). Consumers like
+# soorat provide the handle; this module owns everything that happens
+# after creation: configure, acquire-frame, present, release.
 #
-# SurfaceState struct layout (40 bytes):
-#   +0:  surface (WGPUSurface handle, 8)
-#   +8:  format  (u32 WGPUTextureFormat)
-#   +16: width   (i64)
-#   +24: height  (i64)
-#   +32: present_mode (u32)
+# SurfaceState struct layout (48 bytes):
+#   +0:  surface          (WGPUSurface handle, 8)
+#   +8:  device           (WGPUDevice handle, 8) — needed for reconfigure
+#   +16: format           (u32 WGPUTextureFormat)
+#   +24: width            (i64)
+#   +32: height           (i64)
+#   +40: present_mode     (u32)
 
-# Present mode preferences
+# ================================================================
+# Present mode preferences (wgpu-native v29 values)
+# ================================================================
 var PRESENT_VSYNC     = 0;
 var PRESENT_NO_VSYNC  = 1;
 var PRESENT_IMMEDIATE = 2;
 var PRESENT_MAILBOX   = 3;
 
-# WGPUPresentMode constants
-var WGPU_PRESENT_MODE_FIFO        = 2;  # Vsync
-var WGPU_PRESENT_MODE_FIFO_RELAXED = 3;
-var WGPU_PRESENT_MODE_IMMEDIATE   = 0;
-var WGPU_PRESENT_MODE_MAILBOX     = 1;
+# WGPUPresentMode — v29 values
+var WGPU_PRESENT_MODE_FIFO         = 1;
+var WGPU_PRESENT_MODE_FIFO_RELAXED = 2;
+var WGPU_PRESENT_MODE_IMMEDIATE    = 3;
+var WGPU_PRESENT_MODE_MAILBOX      = 4;
+
+# WGPUSurfaceGetCurrentTextureStatus — v29 values
+var WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL    = 1;
+var WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL = 2;
+var WGPU_SURFACE_STATUS_TIMEOUT            = 3;
 
 fn present_mode_to_wgpu(pref) {
     if (pref == PRESENT_VSYNC)     { return WGPU_PRESENT_MODE_FIFO; }
@@ -31,51 +41,101 @@ fn present_mode_to_wgpu(pref) {
     return WGPU_PRESENT_MODE_FIFO;
 }
 
-# Accessors
-fn surface_state_handle(ss)  { return load64(ss); }
-fn surface_state_format(ss)  { return load32(ss + 8); }
-fn surface_state_width(ss)   { return load64(ss + 16); }
-fn surface_state_height(ss)  { return load64(ss + 24); }
-fn surface_state_present(ss) { return load32(ss + 32); }
+# ================================================================
+# SurfaceState accessors
+# ================================================================
+fn surface_state_handle(ss)  { return load64(ss + 0); }
+fn surface_state_device(ss)  { return load64(ss + 8); }
+fn surface_state_format(ss)  { return load32(ss + 16); }
+fn surface_state_width(ss)   { return load64(ss + 24); }
+fn surface_state_height(ss)  { return load64(ss + 32); }
+fn surface_state_present(ss) { return load32(ss + 40); }
 
-# Create a SurfaceState (requires wgpuSurface from windowing system)
-fn surface_state_new(surface, format, width, height, present_pref) {
-    var ss = alloc(40);
-    store64(ss, surface);
-    store32(ss + 8, format);
-    store64(ss + 16, width);
-    store64(ss + 24, height);
-    store32(ss + 32, present_mode_to_wgpu(present_pref));
+# ================================================================
+# SurfaceState construction — called by the consumer after they obtain
+# a WGPUSurface handle from their windowing library.
+# ================================================================
+fn surface_state_new(surface, device, format, width, height, present_pref) {
+    var ss = alloc(48);
+    store64(ss + 0,  surface);
+    store64(ss + 8,  device);
+    store32(ss + 16, format);
+    store64(ss + 24, width);
+    store64(ss + 32, height);
+    store32(ss + 40, present_mode_to_wgpu(present_pref));
+    _surface_state_configure(ss);
     return ss;
 }
 
-# Resize the surface (reconfigure with new dimensions)
+# Internal: build a SurfaceConfiguration and call wgpuSurfaceConfigure.
+# Used by surface_state_new and surface_state_resize.
+fn _surface_state_configure(ss) {
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    var cfg = wgpu_surface_configuration(surface_state_device(ss),
+                                         surface_state_format(ss),
+                                         surface_state_width(ss),
+                                         surface_state_height(ss),
+                                         usage,
+                                         surface_state_present(ss));
+    wgpu_surface_configure(surface_state_handle(ss), cfg);
+    return 0;
+}
+
+# ================================================================
+# Resize — reconfigure the surface with new dimensions
+# ================================================================
 fn surface_state_resize(ss, width, height) {
     if (width == 0) { return 0; }
     if (height == 0) { return 0; }
-    store64(ss + 16, width);
-    store64(ss + 24, height);
-    # TODO: call wgpuSurfaceConfigure with updated size
+    store64(ss + 24, width);
+    store64(ss + 32, height);
+    _surface_state_configure(ss);
     return 0;
 }
 
-# Get current surface texture for rendering
-# TODO: wgpuSurfaceGetCurrentTexture → SurfaceTexture
+# ================================================================
+# Frame acquisition — wraps wgpuSurfaceGetCurrentTexture
+# ================================================================
+# Returns a GpuResult:
+#   Ok(texture_handle) — success (optimal or suboptimal)
+#   Err(...)           — timeout, outdated, lost, etc.
+#
+# wgpuSurfaceGetCurrentTexture writes into a WGPUSurfaceTexture struct
+# (24 bytes): +0 nextInChain, +8 texture, +16 status.
 fn surface_state_acquire(ss) {
-    # Returns WGPUSurfaceTexture or error
-    # Requires wgpuSurfaceGetCurrentTexture in FFI table
-    return 0;
+    var out = alloc(24);
+    memset(out, 0, 24);
+    wgpu_surface_get_current_texture(surface_state_handle(ss), out);
+    var status = load32(out + 16);
+    var texture = load64(out + 8);
+    if (status == WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL) { return GpuOk(texture); }
+    if (status == WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL) { return GpuOk(texture); }
+    if (status == WGPU_SURFACE_STATUS_TIMEOUT) {
+        return GpuErrMsg(GPU_ERR_SURFACE_TIMEOUT, "surface texture acquire timed out");
+    }
+    return GpuErrMsg(GPU_ERR_SURFACE_LOST, "surface texture acquire failed");
 }
 
-# Present the current frame
-# TODO: wgpuSurfacePresent
+# ================================================================
+# Present + release
+# ================================================================
 fn surface_state_present(ss) {
+    wgpu_surface_present(surface_state_handle(ss));
     return 0;
 }
 
-# Get the surface size as (width, height) at a destination pointer
+fn surface_state_release(ss) {
+    var h = load64(ss + 0);
+    if (h != 0) { wgpu_surface_release(h); }
+    store64(ss + 0, 0);
+    return 0;
+}
+
+# ================================================================
+# Size helper (unchanged from pre-FFI version)
+# ================================================================
 fn surface_state_size(ss, dst) {
-    store64(dst, surface_state_width(ss));
+    store64(dst + 0, surface_state_width(ss));
     store64(dst + 8, surface_state_height(ss));
     return 0;
 }

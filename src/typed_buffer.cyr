@@ -1,0 +1,148 @@
+# typed_buffer.cyr — Typed GPU buffer wrappers with runtime alignment checks
+# Ported from mabda/src/typed_buffer.rs
+#
+# Cyrius has no generics; the Rust `UniformBuffer<T>` / `StorageBuffer<T>`
+# collapse to runtime-sized wrappers that carry capacity/count information
+# alongside the wgpu handle. Alignment validation happens at construction.
+#
+# For raw byte-level control without the wrapper overhead, use the functions
+# in buffer.cyr directly.
+#
+# UniformBuffer struct layout (16 bytes):
+#   +0: handle  (WGPUBuffer, 8)
+#   +8: size    (i64, bytes — always a multiple of 16)
+#
+# StorageBuffer struct layout (32 bytes):
+#   +0:  handle        (WGPUBuffer, 8)
+#   +8:  capacity      (i64, bytes)
+#   +16: count         (i64, element count)
+#   +24: element_size  (i64, bytes per element)
+#
+# ABI note: all functions in this file cap the parameter list at 6 to avoid
+# Cyrius's parameter-passing issue when a 7+-arg function also makes wgpu
+# fncalls. See feedback_fncall6_wgpu memory for the related fncall6 issue.
+
+# ================================================================
+# UniformBuffer
+# ================================================================
+
+# Create a uniform buffer initialized with `data`. Returns a GpuResult:
+#   Ok(ub_ptr) on success
+#   Err(gpu_err(...)) if size is zero or not a multiple of 16
+#
+# Enforces WebGPU's minUniformBufferOffsetAlignment = 16.
+fn uniform_buffer_new(device, queue, data, size, label) {
+    if (size == 0) {
+        return GpuErrMsg(GPU_ERR_BUFFER, "uniform buffer size is zero");
+    }
+    # size % 16 == 0 via bitwise AND since 16 is a power of two
+    if ((size & 15) != 0) {
+        return GpuErrMsg(GPU_ERR_BUFFER, "uniform buffer size must be multiple of 16");
+    }
+    var handle = create_uniform_buffer(device, queue, data, size, label);
+    if (handle == 0) {
+        return GpuErrMsg(GPU_ERR_BUFFER, "wgpuDeviceCreateBuffer returned null");
+    }
+    var ub = alloc(16);
+    store64(ub, handle);
+    store64(ub + 8, size);
+    return GpuOk(ub);
+}
+
+# Write new data to the uniform buffer. Caller must pass the same size as
+# was used at creation; writes of a different size are undefined behavior.
+fn uniform_buffer_write(queue, ub, data, size) {
+    wgpu_queue_write_buffer(queue, load64(ub), 0, data, size);
+    return 0;
+}
+
+# Accessors
+fn uniform_buffer_handle(ub) { return load64(ub); }
+fn uniform_buffer_size(ub)   { return load64(ub + 8); }
+
+# Release the underlying GPU buffer. The struct itself is bump-allocated
+# and collected with the rest of the arena.
+fn uniform_buffer_release(ub) {
+    var h = load64(ub);
+    if (h != 0) { wgpu_buffer_release(h); }
+    store64(ub, 0);
+    return 0;
+}
+
+# ================================================================
+# StorageBuffer
+# ================================================================
+
+fn _storage_usage(read_only) {
+    if (read_only == 0) {
+        return WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_COPY_SRC;
+    }
+    return WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST;
+}
+
+# Create a raw storage buffer handle. Does not track count or element size
+# — use storage_buffer_wrap if you need metadata on top of this handle.
+fn storage_buffer_create(device, capacity, label, read_only) {
+    var usage = _storage_usage(read_only);
+    var desc = wgpu_buffer_descriptor(label, usage, capacity, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+# Wrap a raw buffer handle with element-count metadata. Caller is responsible
+# for ensuring `capacity == count * element_size` (no runtime validation).
+fn storage_buffer_wrap(handle, capacity, count, element_size) {
+    var sb = alloc(32);
+    store64(sb, handle);
+    store64(sb + 8, capacity);
+    store64(sb + 16, count);
+    store64(sb + 24, element_size);
+    return sb;
+}
+
+# Convenience: create a storage buffer initialized with `data`.
+# 6 parameters max (Cyrius ABI ceiling — see header comment).
+# The caller folds (count × element_size) into `capacity` before calling.
+# Element metadata on the returned wrapper is set to a byte-oriented view
+# (count = capacity, element_size = 1). Callers who need richer metadata
+# should use storage_buffer_create + storage_buffer_wrap directly.
+fn storage_buffer_new(device, queue, data, capacity, label, read_only) {
+    var handle = storage_buffer_create(device, capacity, label, read_only);
+    if (handle != 0) {
+        wgpu_queue_write_buffer(queue, handle, 0, data, capacity);
+    }
+    return storage_buffer_wrap(handle, capacity, capacity, 1);
+}
+
+# Convenience: create an empty storage buffer of the given byte capacity.
+fn storage_buffer_empty(device, capacity, label, read_only) {
+    var handle = storage_buffer_create(device, capacity, label, read_only);
+    return storage_buffer_wrap(handle, capacity, capacity, 1);
+}
+
+# Write `write_count` elements into the storage buffer. Returns a GpuResult:
+#   Ok(0)          on success
+#   Err(...)       if write_count > stored count (exceeds capacity)
+fn storage_buffer_write(queue, sb, data, write_count) {
+    var capacity_count = load64(sb + 16);
+    if (write_count > capacity_count) {
+        return GpuErrMsg(GPU_ERR_BUFFER, "storage buffer write exceeds capacity");
+    }
+    var element_size = load64(sb + 24);
+    var write_bytes = write_count * element_size;
+    wgpu_queue_write_buffer(queue, load64(sb), 0, data, write_bytes);
+    return GpuOk(0);
+}
+
+# Accessors
+fn storage_buffer_handle(sb)       { return load64(sb); }
+fn storage_buffer_capacity(sb)     { return load64(sb + 8); }
+fn storage_buffer_count(sb)        { return load64(sb + 16); }
+fn storage_buffer_element_size(sb) { return load64(sb + 24); }
+
+# Release the underlying GPU buffer.
+fn storage_buffer_release(sb) {
+    var h = load64(sb);
+    if (h != 0) { wgpu_buffer_release(h); }
+    store64(sb, 0);
+    return 0;
+}

@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-04-12
+
+v2.1.0 is the Rust-parity catch-up release. All seven v2.1 roadmap items
+landed along with a batch of v29 API-value fixes surfaced by the first
+real GPU-backed uses.
+
+### Added
+- **`src/typed_buffer.cyr`** — `UniformBuffer` / `StorageBuffer` wrappers with
+  runtime alignment validation (16-byte multiple for uniform buffers) and
+  capacity-tracking metadata. API: `uniform_buffer_new`, `uniform_buffer_write`,
+  `storage_buffer_create`, `storage_buffer_wrap`, `storage_buffer_new`,
+  `storage_buffer_empty`, `storage_buffer_write`, accessors, release. Ports
+  `rust-old/src/typed_buffer.rs` (352 LOC, 14 tests).
+- **`src/gpu_timestamps.cyr`** — GPU timestamp profiling via wgpu's query set +
+  resolve buffer + read buffer triple. API: `gpu_timestamps_supported` (device
+  feature check), `gpu_timestamps_new`, `gpu_timestamps_resolve`,
+  `gpu_timestamps_map`/`unmap`, `gpu_timestamps_release`.
+- **Texture FFI** — `wgpuDeviceCreateTexture`, `wgpuTextureCreateView`,
+  `wgpuDeviceCreateSampler`, `wgpuQueueWriteTexture` (struct-packed shim),
+  `wgpuTextureRelease`, `wgpuTextureViewRelease`, `wgpuSamplerRelease` wired
+  through slots 45–51 of the function table. `texture.cyr` rewrite exposes
+  `texture_create_rgba8`, `texture_view_create_rgba8`, `texture_upload_rgba8`,
+  `texture_from_rgba` convenience wrapper, and `texture_release`.
+- **Render pipeline FFI** — `wgpuDeviceCreateRenderPipeline` +
+  `wgpuRenderPipelineRelease` at slots 52–53. New `render_pipeline_create_simple`
+  entry builds the full 168-byte `WGPURenderPipelineDescriptor` (vertex state,
+  primitive state, multisample state, fragment state with a single color
+  target) and auto-layouts. The legacy `rpb_*` builder API is retained and
+  delegates to the simple path for backward compatibility.
+- **Surface FFI** — `wgpuSurfaceConfigure`, `wgpuSurfaceGetCurrentTexture`,
+  `wgpuSurfacePresent`, `wgpuSurfaceRelease` at slots 54–57. `surface.cyr`
+  rewrite wraps configure/acquire/present/release. Since mabda is headless,
+  consumers still provide the `WGPUSurface` handle from their windowing
+  library; mabda owns the lifecycle after that.
+- **`src/cache_key.cyr`** — shared `_hash_to_heap_key` helper used by
+  `shader_cache`, `pipeline_cache`, `bind_group_cache`, and `texture` cache.
+  Fixes a latent bug where each cache module previously stored a pointer to
+  a stack-allocated key buffer that dangled as soon as the setter returned
+  (hashmap.cyr::map_set stores pointers without copying). Second-insert
+  test case catches the regression.
+- **`tests/mabda.bcyr`** — first Cyrius benchmark harness. Batch-timed via
+  `lib/bench.cyr` over 100 rounds × 10 000 iterations, covers the 7 CPU-only
+  Rust benchmarks: `color_lerp`, `color_from_hex`, `color_luminance`,
+  `workgroups_1d`, `workgroups_2d`, `profiler_frame_cycle`, `capabilities_report`.
+  Results seeded into `bench-history.csv` (same schema as `rust-old/`).
+  Comparison updated in `docs/benchmarks-rust-v-cyrius.md` — Rust's picosecond
+  numbers were identified as LLVM having optimised the bodies out.
+- **Pure-data test batch** — `test_typed_buffer` (26), `test_error` (31),
+  `test_capabilities` (34), `test_state` (blend+sampler+depth, 50),
+  `test_caches` (26), `test_surface` (24). **+191 assertions recoverable**
+  over v2.0's standalone total.
+- **FFI function table grew 40 → 58 slots.** New entries: query set (4),
+  device feature check (1), texture (7), render pipeline (2), surface (4).
+
+### Fixed
+- **v29 enum value drift** — several constants in `wgpu_types.cyr`, `sampler.cyr`,
+  `depth.cyr`, and `render_pipeline.cyr` (pre-existing stub) were set to values
+  from an older wgpu version. Re-verified against the v29 header:
+  - `WGPUTextureFormat::RGBA8Unorm` 18 → 0x16 (22)
+  - `WGPUTextureFormat::BGRA8Unorm` 23 → 0x1B (27)
+  - `WGPUTextureFormat::Depth32Float` 39 → 0x30 (48)
+  - `WGPUTextureFormat::Depth24PlusStencil8` 41 → 0x2F (47)
+  - `WGPUSType::ShaderSourceWGSL` 0x07 → 0x02
+  - `WGPUAddressMode::ClampToEdge` 2 → 1
+  - `WGPUFilterMode::{Nearest,Linear}` 0/1 → 1/2
+  - `WGPUMipmapFilterMode::{Nearest,Linear}` 0/1 → 1/2
+  - `WGPUPresentMode::Fifo/FifoRelaxed/Immediate/Mailbox` 2/3/0/1 → 1/2/3/4
+  - `WGPUPrimitiveTopology::TriangleList` 3 → 4
+  - `WGPUCullMode::None` 0 → 1
+  These silently compiled against v29 but would have crashed the first time
+  any real FFI call hit them. All caught when the texture + render pipeline
+  FFI landed.
+- **`WGPUSamplerDescriptor` default init missing `maxAnisotropy=1`** — wgpu v29
+  rejects samplers with `maxAnisotropy < 1`. `_sampler_desc_init` now writes
+  the default along with `lodMaxClamp=32.0f` to match `WGPU_SAMPLER_DESCRIPTOR_INIT`.
+- **Cache dangling-pointer bug** — `shader_cache_set`, `pipeline_cache_set`,
+  `bind_group_cache_set`, and `texture_cache_set` passed a `var ibuf[24]`
+  stack buffer to `hashmap.cyr::map_set`, which stores key pointers without
+  copying. Cross-call the stack slot would alias, causing subsequent lookups
+  to miss. Now all four use the shared `_hash_to_heap_key` helper.
+
+### Cyrius language feedback
+- **7-parameter functions that fncall into wgpu crash.** Discovered via
+  `storage_buffer_new(device, queue, data, count, element_size, label, read_only)`
+  — the exact same logic in a helper with ≤4 params worked. Worked around by
+  folding parameters into a capacity-based API. Rule is now documented in
+  `CLAUDE.md`: any Cyrius function that makes a wgpu `fncall*` must cap at
+  6 parameters. Saved as `feedback_cyrius_param_ceiling.md`.
+
+### Stats
+- 11 test binaries, **290 assertions** (was 93 at v2.0 ship)
+- 27 library modules + 4 FFI modules + 1 cache helper
+- 58-slot FFI function table (was 40)
+- 5 new struct-packed shims in `wgpu_main.c`
+- Device-side full GPU path proven: context → buffer → texture → sampler →
+  shader module → render pipeline → release, on a real GPU with no panics
+
 ## [2.0.0] — 2026-04-11
 
 ### Added — Pre-release Cleanup
