@@ -7,7 +7,7 @@ at v1.0.0 (`rust-old/`); the Cyrius side is the active v2.0.0 tree.
 
 | | Rust (`rust-old/`) | Cyrius (`cyr/`) | Delta |
 |---|---:|---:|---:|
-| Library source (modules only) | 8,916 LOC across 25 files | 3,257 LOC across 25 files + 4 FFI | **−63%** |
+| Library source (modules only) | 8,916 LOC across 25 files | 3,257 LOC across 24 files + 4 FFI | **−63%** |
 | Benchmark harness | 345 LOC (`benches/benchmarks.rs`) | pending `.bcyr` port | — |
 | Tests | 278 unit tests in-source | 89 standalone + 3 GPU integration | see parity notes |
 

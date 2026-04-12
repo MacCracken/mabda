@@ -7,7 +7,7 @@
 - **Type**: Library (Cyrius)
 - **License**: GPL-3.0-only
 - **Version**: 2.0.0
-- **Language**: Cyrius 3.4.14+
+- **Language**: Cyrius 3.4.12+ (PIC codegen + mmap rename — declared in `cyrius.toml`)
 - **GPU FFI**: wgpu-native v29 C API
 
 ## Consumers
@@ -55,7 +55,7 @@ soorat (renderer), rasa (image editor), ranga (image processing), bijli (EM simu
 mabda/
 ├── src/                GPU library modules (.cyr)
 ├── tests/              .tcyr test files
-├── lib/                Vendored subset of cyrius stdlib (15 modules)
+├── lib/                Symlink to the installed Cyrius stdlib (CI → $HOME/.cyrius/lib)
 ├── deps/               C launcher (wgpu_main.c), wgpu-native v29 binaries
 ├── scripts/            Build/release utilities
 ├── docs/               Architecture, roadmap, ADRs, guides

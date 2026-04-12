@@ -23,13 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed — Pre-release Cleanup
 - **Flat project layout** — `cyr/{src,lib,tests,deps,Makefile,cyrius.toml}`
   moved to repo root. Matches vidya/cyrius convention. `make test-all` now
-  runs from repo root.
-- **Vendored stdlib trimmed** from 45 modules to 15 (the ones mabda actually
-  uses). Remaining: alloc, args, assert, dynlib, fmt, fnptr, hashmap, io,
-  mmap, sakshi, str, string, syscalls, tagged, vec. Drops ~30 files of drift
-  risk against upstream Cyrius.
+  runs from repo root. `lib/` remains a symlink to the upstream Cyrius stdlib
+  (overridden in CI to `$HOME/.cyrius/lib`), so mabda never vendors stdlib —
+  it always tracks the installed toolchain.
 - **Makefile `test-all`** now runs all five test suites (added `test-profiler`
   and `test-vertex` which were previously orphaned in the Makefile).
+- **CI workflows** updated for the flat layout. Removed all `working-directory: cyr`
+  entries and `cyr/cyrius.toml` / `cyr/src/` path references.
 
 ### Fixed — Pre-release Cleanup
 - **`vec_get` undefined warning** — `fmt.cyr` and `str.cyr` (from vendored
