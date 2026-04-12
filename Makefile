@@ -117,11 +117,18 @@ build/bench_mabda: tests/mabda.bcyr src/color.cyr src/profiler.cyr src/capabilit
 bench: build/bench_mabda
 	./build/bench_mabda
 
-test-all: test-dynlib test-color test-profiler test-vertex test-typed-buffer \
+version-check:
+	@./scripts/version-check.sh
+
+bundle:
+	@./scripts/bundle.sh
+
+test-all: version-check bundle test-dynlib test-color test-profiler test-vertex test-typed-buffer \
           test-error test-capabilities test-state test-caches test-surface test-phase0
 
 clean:
 	rm -rf build/
 
 .PHONY: test-phase0 test-color test-dynlib test-profiler test-vertex test-typed-buffer \
-        test-error test-capabilities test-state test-caches test-surface bench test-all clean
+        test-error test-capabilities test-state test-caches test-surface bench \
+        version-check bundle test-all clean

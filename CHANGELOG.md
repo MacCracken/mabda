@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] — 2026-04-12
+
+Stdlib inclusion release. Mabda is now consumable as a Cyrius stdlib dep
+via `[deps.mabda]` in downstream `cyrius.toml` files. Cyrius 3.4.17 has
+already staged the dep entry; when 3.4.18 ships it becomes active and
+`cyrius deps` will resolve it automatically.
+
+### The transitional backend callout
+
+**Mabda's wgpu-native C launcher is transitional scaffolding, not the
+long-term design.** The public API (`@public` files in `src/`) is the
+stability boundary. When the pure-Cyrius GPU backend lands in v3.0,
+the launcher, the `deps/wgpu-native/` binaries, the libC dependency,
+and the FFI layer all go away — and every consumer that only touches
+the `@public` API recompiles without edits. The `examples/stdlib-consumer/`
+project is the regression test for that contract.
+
+### Added
+- **`dist/mabda.cyr`** — single-file bundled distribution (~141 KB,
+  29 modules concatenated in `src/mabda.cyr` include order). Strips
+  per-module `include` lines; consumer supplies stdlib via their own
+  `cyrius.toml`.
+- **`scripts/bundle.sh`** — reproducible bundler. Byte-identical output
+  given an unmodified `src/` tree. Idempotent. Intentionally minimal
+  (no banner, no per-module separators) because a larger-format bundle
+  tripped cc3's token buffer limit during development.
+- **`[lib]` section in `cyrius.toml`** — declares the module graph for
+  `cyrius deps` consumers. Lists all 29 modules in dependency order.
+- **`src/*.cyr` public/internal markers** — every file gets a line-1
+  comment: `# @public — stable API surface` (26 files) or `# @internal —
+  FFI / toolchain scaffolding, replaced in v3.0` (5 files: `wgpu_types`,
+  `wgpu_descriptors`, `wgpu_ffi`, `tagged_obj`, `cache_key`). Consumer
+  docs instruct "do not reference `@internal`."
+- **`examples/stdlib-consumer/`** — minimal "hello GPU" example
+  (`cyrius.toml` + `src/main.cyr` + `README.md`) that consumes mabda via
+  the stdlib-dep path. Proves the stdlib-inclusion contract end-to-end
+  and serves as the v3.0 regression test.
+- **`docs/stdlib-integration.md`** — consumer guide. Covers declaring
+  the dep, writing consumer code against the `@public` API, building
+  the (transitional) C launcher, and what specifically disappears in
+  v3.0. Clearly labels every transitional section.
+- **`docs/adr/005-public-api-surface-marking.md`** — ADR capturing the
+  `@public`/`@internal` marker decision, the v2.1.1 inventory, and the
+  v3.0 migration checklist.
+- **`scripts/version-check.sh`** — fails `make test-all` if `VERSION`,
+  `cyrius.toml`, `CHANGELOG.md`, or `README.md` disagree on the version
+  number. Prevents future drift.
+
+### Changed
+- **`cyrius-version` bumped `3.4.12` → `3.4.18`.** 3.4.18 is the release
+  that activates `[deps.mabda]` as a first-class Cyrius stdlib dep.
+- **Line-length and naming-convention lint warnings eliminated.** 16
+  warnings in v2.1.0 (line length in `blend`, `color`, `compute`,
+  `wgpu_ffi`; PascalCase `GpuOk`/`GpuErr`/`GpuErrMsg` in `error`).
+  Renamed to `gpu_ok`/`gpu_err_result`/`gpu_err_result_msg` across all
+  src files and tests. Lint now clean.
+- **Format pass across `gpu_timestamps`, `profiler`, `render_pipeline`,
+  `surface`, `texture`.** `cyrius fmt` now reports clean on all `src/`
+  files.
+
+### Stats
+- `cyrius audit` — 14/14 pass (compile, 11 test suites, lint, fmt)
+- `dist/mabda.cyr` — 4,025 lines, 141,912 bytes, compiles cleanly as a
+  single bundle with zero errors (~29 expected `undefined function`
+  warnings for the FFI slot externals, documented as benign in
+  `docs/stdlib-integration.md`)
+- 11 test binaries, still 290 assertions (no test churn in v2.1.1)
+- 26 `@public` files + 5 `@internal` files in `src/`
+- Version sync enforced by `scripts/version-check.sh`
+
 ## [2.1.0] — 2026-04-12
 
 v2.1.0 is the Rust-parity catch-up release. All seven v2.1 roadmap items

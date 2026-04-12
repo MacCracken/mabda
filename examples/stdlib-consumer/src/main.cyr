@@ -1,0 +1,90 @@
+# hello_gpu — minimal mabda consumer example
+#
+# Proves the stdlib-inclusion contract: a consumer project writes no FFI code
+# and depends only on mabda's public API. The C launcher lives at the edge of
+# the consumer (in deps/) and goes away entirely in v3.0.
+#
+# Build:
+#   cyrius deps            # pulls mabda dist/mabda.cyr via cyrius.toml
+#   make -C deps           # builds the wgpu-native launcher
+#   cyrius build           # compiles this file to build/hello_gpu
+#   ./build/hello_gpu      # runs against a real GPU
+#
+# During the v2.1.1 transition period (before Cyrius 3.4.18 activates
+# [deps.mabda]), replace the `include "lib/mabda.cyr"` line with a direct
+# path include of the bundled file.
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/args.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/mmap.cyr"
+include "lib/sakshi.cyr"
+include "lib/dynlib.cyr"
+
+# In a real `cyrius deps` flow, this resolves to ~/.cyrius/cache/mabda/dist/mabda.cyr.
+# For this example, symlink mabda's dist/ into the consumer's local lib/ tree:
+#   ln -sf ../../../dist/mabda.cyr lib/mabda.cyr
+include "lib/mabda.cyr"
+
+# Entry point called by the C launcher AFTER _cyrius_init + alloc_init +
+# wgpu_ffi_init_table.
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+
+    # 1. Acquire the pre-initialized GPU context from the launcher
+    var res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "no GPU available\n", 17);
+        return 1;
+    }
+    var ctx = payload(res);
+    var device = gpu_ctx_device(ctx);
+    var queue = gpu_ctx_queue(ctx);
+    syscall(1, 1, "hello_gpu: GPU context acquired\n", 32);
+
+    # 2. Create a 4x4 RGBA texture (uses v2.1.0 texture FFI)
+    var pixels[64];
+    var pi = 0;
+    while (pi < 64) {
+        store8(&pixels + pi,     0x33);
+        store8(&pixels + pi + 1, 0xCC);
+        store8(&pixels + pi + 2, 0xFF);
+        store8(&pixels + pi + 3, 0xFF);
+        pi = pi + 4;
+    }
+    var t = texture_from_rgba(device, queue, &pixels, 4, 4, "hello-tex");
+    if (t == 0) {
+        syscall(1, 2, "texture creation failed\n", 24);
+        return 1;
+    }
+    syscall(1, 1, "hello_gpu: texture uploaded\n", 28);
+
+    # 3. Build a minimal render pipeline (v2.1.0 render_pipeline FFI)
+    var wgsl = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> { let x = f32(i32(i) - 1); let y = f32(i32(i & 1u) * 2 - 1); return vec4<f32>(x, y, 0.0, 1.0); } @fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }";
+    var src = wgpu_shader_source_wgsl(wgsl);
+    var desc = wgpu_shader_module_descriptor("hello", src);
+    var module = wgpu_device_create_shader_module(device, desc);
+    var rp = render_pipeline_create_simple(device, module, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (rp == 0) {
+        syscall(1, 2, "render pipeline creation failed\n", 32);
+        return 1;
+    }
+    syscall(1, 1, "hello_gpu: render pipeline ready\n", 33);
+
+    # 4. Cleanup
+    render_pipeline_release(rp);
+    wgpu_shader_module_release(module);
+    texture_release(t);
+
+    syscall(1, 1, "hello_gpu: done\n", 16);
+    return 0;
+}
