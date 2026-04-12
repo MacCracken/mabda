@@ -11,8 +11,6 @@
 
 static void c_on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
     WGPUStringView message, void* ud1, void* ud2) {
-    fprintf(stderr, "c_on_adapter: status=%d adapter=%p msg='%.*s'\n",
-        status, (void*)adapter, (int)message.length, message.data);
     if (status == WGPURequestAdapterStatus_Success && ud1)
         *(long*)ud1 = (long)adapter;
 }
@@ -32,8 +30,6 @@ static void c_on_buffer_mapped(WGPUMapAsyncStatus status,
 
 // Request adapter: (instance, power_pref, result_ptr) → adapter handle in *result_ptr
 long wgpu_shim_request_adapter(WGPUInstance instance, long power_pref, long* result_ptr) {
-    fprintf(stderr, "shim_request_adapter: inst=%p pref=%ld result_ptr=%p\n",
-        (void*)instance, power_pref, (void*)result_ptr);
     WGPURequestAdapterOptions opts = {0};
     opts.powerPreference = (WGPUPowerPreference)power_pref;
     WGPURequestAdapterCallbackInfo cb = {
@@ -160,18 +156,17 @@ static int preinit_gpu(void) {
 }
 
 extern long mabda_main(long fn_table_ptr, long preinit_ptr);
-// Cyrius top-level init code (enum values, global vars)
-// This is at the start of the .text section — calling the entry point
-// triggers the jmp to init code which initializes all globals.
-// We call it via a function pointer to the start of .text.
-extern void _start_cyrius(void) __attribute__((weak));
+extern void _cyrius_init(void);
+extern void alloc_init(void);
 
 int main(void) {
+    // Initialize Cyrius globals (enums, global vars), then heap
+    // Order matters: _cyrius_init resets global vars, alloc_init must come after
+    _cyrius_init();
+    alloc_init();
+
     // Pre-init GPU in C
-    fprintf(stderr, "main: starting GPU pre-init...\n");
     int gpu_ok = preinit_gpu();
-    fprintf(stderr, "main: gpu_ok=%d instance=%p adapter=%p device=%p queue=%p\n",
-        gpu_ok, (void*)preinit.instance, (void*)preinit.adapter, (void*)preinit.device, (void*)preinit.queue);
 
     build_fn_table();
     long result = mabda_main((long)(void*)fn_table, gpu_ok ? (long)(void*)&preinit : 0);

@@ -17,7 +17,7 @@ LOCALIZE_FLAGS = $(foreach sym,$(LOCALIZE_SYMS),-L $(sym))
 build/test_phase0.o: tests/test_phase0.tcyr src/*.cyr
 	@mkdir -p build
 	printf 'object;\n' | cat - tests/test_phase0.tcyr | $(CC3) > build/test_phase0.o
-	objcopy $(LOCALIZE_FLAGS) build/test_phase0.o
+	objcopy $(LOCALIZE_FLAGS) -L print_num -L println build/test_phase0.o
 
 deps/wgpu_main.o: deps/wgpu_main.c
 	$(GCC) -c deps/wgpu_main.c -I$(WGPU_DIR)/include -o deps/wgpu_main.o
