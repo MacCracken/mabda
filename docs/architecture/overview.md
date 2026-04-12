@@ -69,6 +69,25 @@ Key requirements:
 - `alloc_init()` must be called after `_cyrius_init()` (init resets global state)
 - Symbol clashes (memcpy, memset, etc.) resolved via `objcopy -L`
 
+## Struct-packing shim pattern (required for wgpu 6+ arg functions)
+
+Cyrius's `fncall6` correctly passes 6 i64 arguments per the SysV-AMD64 ABI,
+but calling wgpu-native v29 entry points this way segfaults reliably — the
+same sequence works from pure C. Root cause is unconfirmed, but the fix is
+consistent: wrap the call in a C shim that accepts `(primary_handle,
+struct_ptr)`, unpack the struct in C, and call wgpu from C. Cyrius then
+invokes the shim via `fncall2`.
+
+Two shims live in `deps/wgpu_main.c`:
+- `wgpu_shim_copy_buffer_to_buffer(encoder, WgpuCopyArgs*)` — for
+  `wgpuCommandEncoderCopyBufferToBuffer` (6 args: encoder, src, src_off, dst,
+  dst_off, size).
+- `wgpu_shim_buffer_map(device, WgpuMapArgs*)` — for `wgpuBufferMapAsync` +
+  `wgpuDevicePoll` (6 args: device, buffer, mode, offset, size, status_ptr).
+
+Any future wgpu entry with 6+ i64 arguments should follow the same pattern.
+Entries with 5 or fewer args use the plain `fncall0..fncall5` path directly.
+
 ## Data Flow: Compute
 
 ```

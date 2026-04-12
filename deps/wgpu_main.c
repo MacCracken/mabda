@@ -54,21 +54,73 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     return *result_ptr;
 }
 
-// Buffer map sync: (device, buffer, mode, offset, size, status_ptr) → status in *status_ptr
-void wgpu_shim_buffer_map(WGPUDevice device, WGPUBuffer buffer,
-    WGPUMapMode mode, size_t offset, size_t size, long* status_ptr) {
+// Buffer map sync — struct-packed form. fncall6 from Cyrius has shown
+// subtle misbehavior when the 6 stack slots include pointer + u64 + u64,
+// so we accept a struct pointer instead and unpack in C.
+typedef struct {
+    WGPUBuffer buffer;
+    uint32_t mode;
+    size_t offset;
+    size_t size;
+    long* status_ptr;
+} WgpuMapArgs;
+
+void wgpu_shim_buffer_map(WGPUDevice device, WgpuMapArgs* args) {
     WGPUBufferMapCallbackInfo cb = {
         .mode = WGPUCallbackMode_AllowSpontaneous,
         .callback = c_on_buffer_mapped,
-        .userdata1 = status_ptr,
+        .userdata1 = args->status_ptr,
     };
-    wgpuBufferMapAsync(buffer, mode, offset, size, cb);
+    wgpuBufferMapAsync(args->buffer, (WGPUMapMode)args->mode, args->offset, args->size, cb);
     wgpuDevicePoll(device, true, NULL);
 }
 
 // Device poll simplified
 WGPUBool wgpu_shim_device_poll(WGPUDevice device, WGPUBool wait) {
     return wgpuDevicePoll(device, wait, NULL);
+}
+
+// Create command encoder with a valid (possibly NULL) descriptor. wgpu-native
+// v29 is sensitive to uninitialized struct padding reaching its dispatch layer,
+// so we build the descriptor locally from C where the ABI matches exactly.
+WGPUCommandEncoder wgpu_shim_create_command_encoder(WGPUDevice device, const char* label) {
+    WGPUCommandEncoderDescriptor desc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+    if (label) {
+        desc.label.data = label;
+        desc.label.length = strlen(label);
+    }
+    return wgpuDeviceCreateCommandEncoder(device, &desc);
+}
+
+// Finish the command encoder with a zero-inited descriptor.
+WGPUCommandBuffer wgpu_shim_command_encoder_finish(WGPUCommandEncoder encoder, const char* label) {
+    WGPUCommandBufferDescriptor desc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+    if (label) {
+        desc.label.data = label;
+        desc.label.length = strlen(label);
+    }
+    return wgpuCommandEncoderFinish(encoder, &desc);
+}
+
+// Submit a single command buffer. Simpler than passing an array handle from
+// Cyrius when the count is always small.
+void wgpu_shim_queue_submit_one(WGPUQueue queue, WGPUCommandBuffer cmd) {
+    wgpuQueueSubmit(queue, 1, &cmd);
+}
+
+// Copy from src to dst — struct-based so Cyrius only has to fncall2 into the
+// shim with (encoder, &args). Avoids any fncall6 ABI subtlety.
+typedef struct {
+    WGPUBuffer src;
+    uint64_t src_off;
+    WGPUBuffer dst;
+    uint64_t dst_off;
+    uint64_t size;
+} WgpuCopyArgs;
+
+void wgpu_shim_copy_buffer_to_buffer(WGPUCommandEncoder encoder, WgpuCopyArgs* args) {
+    wgpuCommandEncoderCopyBufferToBuffer(encoder, args->src, args->src_off,
+                                         args->dst, args->dst_off, args->size);
 }
 
 // === Function table ===
@@ -107,17 +159,17 @@ static void build_fn_table(void) {
     fn_table[i++] = (void*)wgpuBindGroupLayoutRelease;                // 24
     fn_table[i++] = (void*)wgpuPipelineLayoutRelease;                 // 25
     // Command (26-34)
-    fn_table[i++] = (void*)wgpuDeviceCreateCommandEncoder;            // 26
+    fn_table[i++] = (void*)wgpu_shim_create_command_encoder;          // 26 (shim: takes device, label)
     fn_table[i++] = (void*)wgpuCommandEncoderBeginComputePass;        // 27
-    fn_table[i++] = (void*)wgpuCommandEncoderCopyBufferToBuffer;      // 28
-    fn_table[i++] = (void*)wgpuCommandEncoderFinish;                  // 29
+    fn_table[i++] = (void*)wgpu_shim_copy_buffer_to_buffer;           // 28 (shim wrapper)
+    fn_table[i++] = (void*)wgpu_shim_command_encoder_finish;          // 29 (shim: takes encoder, label)
     fn_table[i++] = (void*)wgpuComputePassEncoderSetPipeline;         // 30
     fn_table[i++] = (void*)wgpuComputePassEncoderSetBindGroup;        // 31
     fn_table[i++] = (void*)wgpuComputePassEncoderDispatchWorkgroups;  // 32
     fn_table[i++] = (void*)wgpuComputePassEncoderEnd;                 // 33
     fn_table[i++] = (void*)wgpuCommandEncoderRelease;                 // 34
     // Queue (35)
-    fn_table[i++] = (void*)wgpuQueueSubmit;                           // 35
+    fn_table[i++] = (void*)wgpu_shim_queue_submit_one;                // 35 (shim: takes queue, single cmd buffer)
     // Adapter (36-38)
     fn_table[i++] = (void*)wgpuAdapterGetInfo;                        // 36
     fn_table[i++] = (void*)wgpuAdapterGetLimits;                      // 37

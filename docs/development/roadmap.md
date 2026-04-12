@@ -1,12 +1,13 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 25 modules, 3,274 lines, 92 tests. wgpu-native v29 FFI.
+> 24 library modules + 4 FFI modules, 3,257 lines, 93 tests. wgpu-native v29 FFI.
 
 ## v2.0.0 (Current) — Cyrius Port
 
-Complete port from Rust to Cyrius. All 25 modules ported.
-GPU FFI operational via C launcher + function table.
+Complete port from Rust to Cyrius. All 24 Rust modules ported (`typed_buffer`
+is scheduled for v2.1). GPU FFI operational via C launcher + struct-packing
+shims.
 
 ### Completed
 - All core modules: error, color, capabilities, context, profiler, resource
@@ -14,17 +15,23 @@ GPU FFI operational via C launcher + function table.
 - All graphics modules: vertex, blend, sampler, depth, texture, bind_group, instancing
 - All render modules: render_target, render_pipeline, render_pass, surface, debug
 - FFI layer: wgpu_types, wgpu_descriptors, wgpu_ffi, C launcher
-- 89 standalone tests + 3 GPU integration tests
+- 89 standalone tests + 4 GPU integration tests (including buffer round-trip)
+- Buffer readback round-trip (write → copy → map → verify) — **v1.0 criterion met**
 - Cyrius compiler fixes upstreamed: PIC codegen (3.4.12), mmap rename (3.4.12), _cyrius_init (3.4.14)
 - GPU discovery via yukti 1.2.0
+- Struct-packing shim pattern for wgpu functions with 6+ i64 args (avoids `fncall6` bug)
+- Flat project layout (src/, lib/, tests/, deps/ at repo root) matching vidya/cyrius convention
+- Vendored stdlib trimmed to 15 actually-used modules (down from 45)
+- Benchmarks reference: `docs/benchmarks-rust-v-cyrius.md`
 
-### Pending
-- Full buffer readback test (write + copy + map + verify)
-- Typed buffer wrappers (uniform_buffer_new, storage_buffer_new)
+### Pending (v2.1)
+- `typed_buffer` port (`uniform_buffer_new`, `storage_buffer_new` — Rust had 14 tests, 352 LOC)
+- Standalone `.tcyr` tests for pure-data modules (error, capabilities, blend, sampler, depth, bind_group, caches) — ~125 assertions recoverable
 - GPU timestamp profiling (GpuTimestamps)
 - Texture creation via FFI (wgpuDeviceCreateTexture)
 - Render pipeline creation via FFI (wgpuDeviceCreateRenderPipeline)
 - Surface management via FFI (wgpuSurfaceGetCurrentTexture)
+- `.bcyr` benchmark harness to parity with Rust's 20 benchmarks
 
 ## Backlog (demand-gated)
 

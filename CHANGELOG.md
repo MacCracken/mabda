@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [2.0.0] — 2026-04-11
 
+### Added — Pre-release Cleanup
+- **Buffer readback round-trip test** — `test_phase0.tcyr` now exercises the full
+  write → copy → map → verify path on a real GPU device. Closes the v1.0
+  completion criterion. 93 tests total passing (89 standalone + 4 GPU).
+- **Struct-packing shim pattern** for wgpu entry points with 6+ i64 arguments.
+  `wgpu_command_encoder_copy_buffer_to_buffer` and `wgpu_buffer_map_sync` now
+  allocate arg structs in Cyrius and call C shims via `fncall2`, routing
+  around an `fncall6` + wgpu-native ABI interaction that segfaulted reliably.
+  Pattern documented in `docs/architecture/overview.md`.
+- **`docs/benchmarks-rust-v-cyrius.md`** — Rust v1.0 vs Cyrius v2.0 reference
+  (source size −63%, 20 benchmark numbers from commit `f113c93`, binary
+  size comparison, test parity audit).
+
+### Changed — Pre-release Cleanup
+- **Flat project layout** — `cyr/{src,lib,tests,deps,Makefile,cyrius.toml}`
+  moved to repo root. Matches vidya/cyrius convention. `make test-all` now
+  runs from repo root.
+- **Vendored stdlib trimmed** from 45 modules to 15 (the ones mabda actually
+  uses). Remaining: alloc, args, assert, dynlib, fmt, fnptr, hashmap, io,
+  mmap, sakshi, str, string, syscalls, tagged, vec. Drops ~30 files of drift
+  risk against upstream Cyrius.
+- **Makefile `test-all`** now runs all five test suites (added `test-profiler`
+  and `test-vertex` which were previously orphaned in the Makefile).
+
+### Fixed — Pre-release Cleanup
+- **`vec_get` undefined warning** — `fmt.cyr` and `str.cyr` (from vendored
+  cyrius stdlib) reference `vec_get` without declaring it. Tests that use
+  those modules now include `lib/vec.cyr` explicitly.
+- **Removed crashing `test_syslib`** — `syslib.cyr` and `test_syslib.tcyr`
+  deleted. `dynlib.cyr` (already upstreamed to Cyrius 3.4.11) is the
+  supported path for dynamic library loading.
+- **`wgpu_queue_submit_one`** — replaces the old array-based `wgpu_queue_submit`
+  for the single-command-buffer case. C shim allocates the 1-element array
+  itself, avoiding one more Cyrius-side alloc in the hot path.
+
 ### Added — Cyrius Language Port
 
 Complete port of mabda from Rust to Cyrius. 25 modules, 3,274 lines of Cyrius source,

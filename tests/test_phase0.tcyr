@@ -1,0 +1,123 @@
+# test_phase0.tcyr — Phase 0 FFI validation
+# Compiled with object; directive, linked with wgpu_main.c via gcc
+# Proves: wgpu-native C API → GPU device → buffer round-trip (write+copy+map+verify)
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/syscalls.cyr"
+include "lib/fnptr.cyr"
+include "lib/hashmap.cyr"
+include "lib/vec.cyr"
+include "lib/tagged.cyr"
+
+include "src/error.cyr"
+include "src/color.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+include "src/wgpu_ffi.cyr"
+include "src/context.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    # _cyrius_init() + alloc_init() already called from C main
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    # Test 1: Create GPU context from pre-initialized handles
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    # Test 2: Create and release a storage buffer
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor("test-buf", usage, 64, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf == 0) {
+        syscall(1, 2, "FAIL: buffer creation\n", 22);
+        return 1;
+    }
+    wgpu_buffer_release(buf);
+    syscall(1, 1, "PASS: GPU buffer create+release\n", 32);
+
+    # Test 3: Write data to buffer
+    var write_usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_COPY_SRC;
+    var write_desc = wgpu_buffer_descriptor("write-buf", write_usage, 32, 0);
+    var write_buf = wgpu_device_create_buffer(device, write_desc);
+    if (write_buf == 0) {
+        syscall(1, 2, "FAIL: write_buf is null\n", 24);
+        return 1;
+    }
+    var data[32];
+    store64(&data, 42);
+    store64(&data + 8, 99);
+    wgpu_queue_write_buffer(queue, write_buf, 0, &data, 16);
+    syscall(1, 1, "PASS: GPU buffer write\n", 23);
+
+    # Test 4: Round-trip — write → copy → map → verify (v1.0 criterion)
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("read-buf", read_usage, 32, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) {
+        syscall(1, 2, "FAIL: readback buffer create\n", 29);
+        return 1;
+    }
+
+    # Encode a copy command: write_buf[0..16] → read_buf[0..16]
+    var encoder = wgpu_device_create_command_encoder(device, "copy-enc");
+    if (encoder == 0) {
+        syscall(1, 2, "FAIL: command encoder\n", 22);
+        return 1;
+    }
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, write_buf, 0, read_buf, 0, 16);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, "copy-cmd");
+    if (cmd_buf == 0) {
+        syscall(1, 2, "FAIL: command buffer finish\n", 28);
+        return 1;
+    }
+
+    # Submit the copy command (C shim takes a single handle)
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    # Map readback buffer synchronously, read, verify, unmap
+    var map_status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, 16);
+    if (map_status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        syscall(1, 2, "FAIL: buffer map\n", 17);
+        return 1;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, 16);
+    if (mapped == 0) {
+        syscall(1, 2, "FAIL: get mapped range\n", 23);
+        return 1;
+    }
+    var v0 = load64(mapped);
+    var v1 = load64(mapped + 8);
+    wgpu_buffer_unmap(read_buf);
+
+    if (v0 != 42) {
+        syscall(1, 2, "FAIL: round-trip v0 mismatch\n", 29);
+        return 1;
+    }
+    if (v1 != 99) {
+        syscall(1, 2, "FAIL: round-trip v1 mismatch\n", 29);
+        return 1;
+    }
+    syscall(1, 1, "PASS: GPU buffer round-trip (write+copy+map+verify)\n", 52);
+
+    # Cleanup
+    wgpu_command_encoder_release(encoder);
+    wgpu_buffer_release(read_buf);
+    wgpu_buffer_release(write_buf);
+
+    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    return 0;
+}

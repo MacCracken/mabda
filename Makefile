@@ -45,9 +45,25 @@ build/test_dynlib: tests/test_dynlib.tcyr lib/dynlib.cyr
 test-dynlib: build/test_dynlib
 	./build/test_dynlib
 
-test-all: test-dynlib test-color test-phase0
+# Profiler test (no GPU needed)
+build/test_profiler: tests/test_profiler.tcyr src/profiler.cyr src/color.cyr
+	@mkdir -p build
+	cat tests/test_profiler.tcyr | $(CC3) > build/test_profiler && chmod +x build/test_profiler
+
+test-profiler: build/test_profiler
+	./build/test_profiler
+
+# Vertex + blend test (no GPU needed)
+build/test_vertex: tests/test_vertex.tcyr src/vertex.cyr src/blend.cyr src/color.cyr
+	@mkdir -p build
+	cat tests/test_vertex.tcyr | $(CC3) > build/test_vertex && chmod +x build/test_vertex
+
+test-vertex: build/test_vertex
+	./build/test_vertex
+
+test-all: test-dynlib test-color test-profiler test-vertex test-phase0
 
 clean:
 	rm -rf build/
 
-.PHONY: test-phase0 test-color test-dynlib test-all clean
+.PHONY: test-phase0 test-color test-dynlib test-profiler test-vertex test-all clean
