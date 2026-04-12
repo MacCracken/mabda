@@ -9,11 +9,33 @@
 # provide their own stdlib (dynlib, fmt, alloc, vec, etc.) and must
 # populate the wgpu function-pointer table before calling mabda_main.
 #
-# Produces a minimal file: no banner, no per-module separators. The
-# surrounding comments in individual modules serve as documentation.
-# Banner text on a bundled file triggered a cc3 buffer limit during
-# v2.1.1 development, so the bundler keeps the output as terse as
-# possible.
+# ---------------------------------------------------------------------------
+# HISTORICAL NOTE — the "banners break cc3" red herring
+# ---------------------------------------------------------------------------
+# During v2.1.1 bundler development, the dist file originally included a
+# top-of-file banner + per-module `# --- name.cyr ---` separators, and cc3
+# rejected the bundle with `error:3719: unexpected end of file` at token
+# positions that didn't line up with anything suspicious. The fix appeared
+# to be "strip all banner text" and this comment block once said exactly
+# that.
+#
+# Cyrius 3.4.18 proved the real cause: cc3's raw stdin read loop silently
+# truncated at 131072 bytes (the old 128KB `input_buf` limit). The mabda
+# bundle was 141912 bytes. Everything beyond byte 131072 was dropped on
+# the floor with no diagnostic; the parser then ran out of tokens mid-way
+# through a function body and reported "end of file" at whatever token
+# position the truncation happened to hit.
+#
+# Stripping banners "worked" by shaving enough bytes to fit under 131072
+# for a previous bundle revision — a coincidence fix, not a root cause
+# fix. The real fix is in Cyrius 3.4.18: `input_buf` was expanded to 256KB
+# and now errors out explicitly on overflow instead of silently truncating.
+#
+# We still strip the banner + separators because there's no reason to spend
+# bytes on them — but that is an economy choice, NOT a workaround for a
+# compiler bug. If you find yourself tempted to re-add banner text, go
+# ahead: cc3 >= 3.4.18 handles it fine. Just pin your `cyrius-version`.
+# ---------------------------------------------------------------------------
 #
 # Usage: scripts/bundle.sh
 

@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.2] — 2026-04-12
+
+Rust source removal release. The frozen `rust-old/` tree is gone from the
+working tree; the full Rust v1.0.0 source remains accessible via
+`git checkout 1.0.0`. This is a hygiene release — no library code changes,
+no API changes, no test changes.
+
+### Removed
+- **`rust-old/`** — 9,261 LOC of frozen Rust source + ~5.4 GB of build
+  artifacts under `target/`. The Rust source was purely reference material
+  after the v2.0.0 port shipped; every one of the 25 Rust modules had a
+  Cyrius counterpart. Archaeology is preserved via `git checkout 1.0.0`.
+
+### Preserved before removal
+- **`docs/rust-v1-bench-history.csv`** — `git mv` of the original Rust
+  benchmark CSV (68 lines, 4 real runs across commits `4a802cd`,
+  `ba81a3e`, `19d8b66`, `f113c93` on 2026-03-30). Cited as the reference
+  dataset in `docs/benchmarks-rust-v-cyrius.md`.
+- **Rust v1.0 line coverage snapshot** — 1,034 / 1,367 lines (75.6%),
+  extracted from `rust-old/target/tarpaulin/mabda-coverage.json` and
+  inlined into `docs/benchmarks-rust-v-cyrius.md` as a per-module table
+  before the target/ tree was dropped. Only line-coverage data point
+  available for the v1.0 reference implementation.
+
+### Dropped without preservation
+- `rust-old/target/debug/` (4.9 GB) — debug build artifacts
+- `rust-old/target/release/` (503 MB) — release build artifacts
+- `rust-old/target/criterion/` (5.7 MB) — detailed Criterion stats
+  (point estimates already captured in `bench-history.csv`)
+- `rust-old/target/doc/` (5.9 MB) — `cargo doc` HTML output, regeneratable
+- `rust-old/benchmarks.md` — content already in `docs/benchmarks-rust-v-cyrius.md`
+- `rust-old/Cargo.{toml,lock}`, `codecov.yml`, `deny.toml`,
+  `rust-toolchain.toml`, `Makefile`, `scripts/*.sh` — Rust-specific
+  tooling, no Cyrius equivalent
+
+### Changed
+- **`README.md`** — rewrote the stale Project Structure section (still
+  showed the pre-flatten `cyr/` subdirectory from v1.x) with the current
+  flat layout including `dist/`, `examples/`, and `scripts/`. Build
+  instructions updated to use `cyrius audit` and `make test-all`.
+  Added pointers to the `@public`/`@internal` marker system,
+  ADR-005, the stdlib integration guide, and `git tag 1.0.0` for Rust
+  archaeology. Minimum Cyrius version bumped `3.4.14` → `3.4.18` to
+  match `cyrius.toml`.
+- **`CLAUDE.md`** — project structure diagram updated to include `dist/`,
+  `examples/`, and the version-check/bundle Make targets. `rust-old/`
+  entry removed; replaced with a note about `git checkout 1.0.0`.
+- **`.gitignore`** — dropped the `rust-old/target/` and
+  `rust-old/Cargo.lock` lines.
+- **`docs/benchmarks-rust-v-cyrius.md`** — title now reads "Rust v1.0 vs.
+  Cyrius v2.1" (was "vs. Cyrius v2.0"). `rust-old/` path references
+  rewritten to cite the preserved CSV and `git tag 1.0.0`. New "Rust v1.0
+  line coverage" section with the 24-module table.
+- **Test docstrings** — the six test files that cited "Ported from
+  rust-old/src/..." now say "Ported from the Rust v1.0.0 ... — see git
+  tag 1.0.0" instead. Affects `test_error.tcyr`, `test_capabilities.tcyr`,
+  `test_state.tcyr`, `test_caches.tcyr`, `test_surface.tcyr`,
+  `mabda.bcyr`.
+
+### Stats
+- **-9,261 LOC** of Rust source removed from the working tree
+- **-5.4 GB** of build artifacts reclaimed on disk (already gitignored,
+  but no longer sitting on the filesystem)
+- `cyrius audit` — still 14/14 pass, 290 assertions green
+- `dist/mabda.cyr` — unchanged (byte-identical regen from `src/`)
+
+### How to reach the deleted files
+```sh
+git checkout 1.0.0          # the entire Rust v1.0.0 tree
+git log --all -- rust-old/  # every commit that touched rust-old
+```
+
 ## [2.1.1] — 2026-04-12
 
 Stdlib inclusion release. Mabda is now consumable as a Cyrius stdlib dep

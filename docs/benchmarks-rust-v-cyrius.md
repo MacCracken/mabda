@@ -1,11 +1,13 @@
-# Benchmarks — Rust v1.0 vs. Cyrius v2.0
+# Benchmarks — Rust v1.0 vs. Cyrius v2.1
 
 Reference snapshot for the mabda Rust → Cyrius port. The Rust side is frozen
-at v1.0.0 (`rust-old/`); the Cyrius side is the active v2.0.0 tree.
+at tag `1.0.0` (`git checkout 1.0.0` to inspect it); the Cyrius side is the
+active v2.1.x tree. Historical Rust benchmark numbers are preserved in
+[`docs/rust-v1-bench-history.csv`](rust-v1-bench-history.csv).
 
 ## Source size
 
-| | Rust (`rust-old/`) | Cyrius v2.1 | Delta |
+| | Rust v1.0 | Cyrius v2.1 | Delta |
 |---|---:|---:|---:|
 | Library source (modules only) | 8,916 LOC across 25 files | ~3,700 LOC across 27 files + 4 FFI | **−58%** |
 | Benchmark harness | 345 LOC (`benches/benchmarks.rs`) | 220 LOC (`tests/mabda.bcyr`, 7 CPU benches) | −36% |
@@ -171,8 +173,9 @@ render-pipeline FFI land (v2.1 items #4–#6). These benchmarks bottleneck
 on the wgpu driver, not on the host language, so we expect
 approximately identical numbers between Rust and Cyrius there.
 
-History file: `bench-history.csv` at the repo root, same CSV schema as
-`rust-old/bench-history.csv`.
+History files: `bench-history.csv` at the repo root (current Cyrius runs)
+and [`docs/rust-v1-bench-history.csv`](rust-v1-bench-history.csv) (frozen
+Rust v1.0 reference data). Both use the same CSV schema.
 
 ## Test parity (v2.1)
 
@@ -208,7 +211,40 @@ leftover gaps are all in the areas that need a full compute or render
 pass integration test to exercise, which is scheduled for v2.2 (render
 graph + multi-pass).
 
-**Fuzz**: `rust-old` had no fuzz directory. No fuzz parity gap.
+**Fuzz**: Rust v1.0 had no fuzz directory. No fuzz parity gap.
+
+## Rust v1.0 line coverage (reference)
+
+Extracted from `rust-old/target/tarpaulin/mabda-coverage.json` before the
+rust-old tree was removed in v2.1.2. Preserved here as reference data; the
+Rust source itself is recoverable via `git checkout 1.0.0`.
+
+**Total: 1,034 / 1,367 lines covered (75.6%).**
+
+| Module | Coverage | Module | Coverage |
+|---|---:|---|---:|
+| `bind_group.rs` | 100% | `pipeline_cache.rs` | 72% |
+| `bind_group_cache.rs` | 100% | `profiler.rs` | 59% |
+| `blend.rs` | 78% | `render_pass.rs` | 64% |
+| `buffer.rs` | 88% | `render_pipeline.rs` | 76% |
+| `capabilities.rs` | 100% | `render_target.rs` | 71% |
+| `color.rs` | 62% | `resource.rs` | 100% |
+| `compute.rs` | 84% | `sampler.rs` | 100% |
+| `context.rs` | 73% | `shader.rs` | 100% |
+| `debug.rs` | 100% | `surface.rs` | 13% |
+| `depth.rs` | 89% | `texture.rs` | 80% |
+| `error.rs` | 75% | `typed_buffer.rs` | 53% |
+| `instancing.rs` | 75% | `vertex.rs` | 100% |
+
+The low numbers on `surface.rs` (13%) and `profiler.rs` (59%) are consistent
+with the Cyrius v2.1 test matrix observations: both modules had non-trivial
+internal state (frame history buffer, surface configuration lifecycle) that
+the Rust unit tests didn't cover. The v2.1 Cyrius tests cover the same
+code paths at roughly similar depth.
+
+The v2.1 Cyrius tree has no equivalent coverage tooling — Cyrius has no
+tarpaulin yet. This snapshot is the only line-coverage data point available
+for the v1.0 reference implementation.
 
 ## Unported modules
 
