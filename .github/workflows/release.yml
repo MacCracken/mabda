@@ -2,13 +2,13 @@ name: Release
 
 on:
   push:
-    tags: ['*']
+    # Accept both `v1.2.3` and `1.2.3` tag styles.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
-
-env:
-  CYRIUS_VERSION: "3.4.14"
 
 jobs:
   ci:
@@ -24,50 +24,64 @@ jobs:
 
       - name: Verify version
         run: |
-          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          TOML_VERSION=$(grep '^version = ' cyrius.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          TAG="${GITHUB_REF_NAME}"
-          [ "$FILE_VERSION" = "$TAG" ] || { echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
-          [ "$TOML_VERSION" = "$TAG" ] || { echo "cyrius.toml ($TOML_VERSION) != tag ($TAG)"; exit 1; }
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "tag ($TAG) is not semver x.y.z"; exit 1; }
+          [ "$FILE_VERSION" = "$TAG" ] || {
+            echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
         run: |
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
+          echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
           mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
           cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp "$CYRIUS_DIR/scripts/cyrius" "$HOME/.cyrius/bin/cyrius" 2>/dev/null || true
           cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
           chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
       - name: Setup lib symlink
         run: |
           rm -f lib
           ln -sf "$HOME/.cyrius/lib" lib
 
-      - name: Test
+      - name: Resolve deps
+        run: cyrius deps
+
+      - name: Build (link-check, DCE on)
         run: |
-          cyrius test tests/test_color.tcyr
-          cyrius test tests/test_profiler.tcyr
-          cyrius test tests/test_vertex.tcyr
-          cyrius test tests/test_dynlib.tcyr
+          mkdir -p build
+          CYRIUS_DCE=1 cyrius build programs/smoke.cyr build/mabda_smoke
+          echo "smoke: $(wc -c < build/mabda_smoke) bytes"
+
+      - name: Test
+        run: cyrius test tests/tcyr/mabda.tcyr
+
+      - name: Regenerate dist bundle
+        run: cyrius distlib
 
       - name: Clean toolchain artifacts
         run: rm -f cyrius-*.tar.gz
 
       - name: Archive
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${GITHUB_REF_NAME#v}"
           git archive --format=tar.gz --prefix="mabda-${TAG}/" -o "mabda-${TAG}-src.tar.gz" HEAD
-          sha256sum mabda-*.tar.gz > SHA256SUMS
+          cp dist/mabda.cyr "mabda-${TAG}.cyr"
+          sha256sum mabda-*.tar.gz mabda-*.cyr > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-artifacts
           path: |
             mabda-*.tar.gz
+            mabda-*.cyr
             SHA256SUMS
 
   release:
@@ -80,12 +94,15 @@ jobs:
         with:
           name: release-artifacts
       - name: Changelog
-        run: awk "/^## \\[${GITHUB_REF_NAME}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          awk "/^## \\[${TAG}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
       - uses: softprops/action-gh-release@v2
         with:
           name: "mabda ${{ github.ref_name }}"
           body_path: /tmp/body.md
-          prerelease: ${{ startsWith(github.ref_name, '0.') }}
+          prerelease: ${{ startsWith(github.ref_name, '0.') || startsWith(github.ref_name, 'v0.') }}
           files: |
             mabda-*.tar.gz
+            mabda-*.cyr
             SHA256SUMS

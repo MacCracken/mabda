@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-04-19
+
+Project scaffolding brought in line with the first-party AGNOS convention
+(yukti / vidya / patra). Toolchain pin jumps from Cyrius 3.4.19 to 5.4.7.
+No library API changes — every call site in soorat, rasa, ranga, bijli,
+and aethersafta keeps working without modification.
+
+### Added
+- **`cyrius.cyml`** replaces `cyrius.toml`. Version is pulled from
+  `VERSION` via `${file:VERSION}` so a single file is the source of
+  truth. `[deps] stdlib = [...]` declares the stdlib modules mabda
+  needs; `cyrius deps` resolves them against the toolchain.
+- **`tests/tcyr/mabda.tcyr`** — single consolidated CPU-only suite
+  covering error, color, capabilities, profiler, typed_buffer, vertex,
+  state (blend/sampler/depth), caches, surface. 273 assertions.
+- **`tests/bcyr/mabda.bcyr`** — moved into its conventional subdirectory;
+  run via `cyrius bench tests/bcyr/mabda.bcyr`.
+- **`programs/smoke.cyr`** — link-check program that includes
+  `src/lib.cyr` and exits 0. Gives CI an entry point for
+  `cyrius build` without inventing a fake CLI.
+- **`programs/phase0.cyr`** — GPU integration test (renamed from
+  `tests/test_phase0.tcyr`). Still compiled via the Makefile's C-launcher
+  path because it links against wgpu-native.
+- Flat layout: `src/lib.cyr` (renamed from `src/mabda.cyr`) declares the
+  full include chain; domain modules remain flat (zero transitive
+  includes) so `cyrius distlib` can concatenate them cleanly.
+
+### Changed
+- **Toolchain pin**: `cyrius = "5.4.7"` in `cyrius.cyml` (was `3.4.19`).
+- **CI** (`.github/workflows/ci.yml`) reworked to match yukti:
+  lint, fmt-check, vet, dist-in-sync check (`cyrius distlib` diff-clean
+  against `dist/mabda.cyr`), link-check build, `cyrius test`, `cyrius
+  bench`, security scan, docs/version-consistency gate.
+- **Release** (`.github/workflows/release.yml`) rewritten around
+  `cyrius distlib` — regenerates `dist/mabda.cyr` and attaches it to
+  the GitHub Release alongside the source tarball.
+- **Makefile** shrunk to a thin wrapper over the `cyrius` CLI; the GPU
+  integration path (`make test-phase0`) retained for local dev.
+- **`scripts/bundle.sh`** removed — `cyrius distlib` handles bundling.
+- **`scripts/version-check.sh`** targets `cyrius.cyml` and accepts the
+  `${file:VERSION}` templated form.
+- **`scripts/version-bump.sh`** now only touches `VERSION` (the manifest
+  reads from it).
+
+### Removed
+- `cyrius.toml` — replaced by `cyrius.cyml`.
+- `src/tagged_obj.cyr` — internal object-mode tagged-union scaffolding
+  that hasn't been referenced since the FFI rework; the `tagged` stdlib
+  covers every remaining caller.
+- Ten per-module test files (`tests/test_*.tcyr`) — folded into
+  `tests/tcyr/mabda.tcyr`. dynlib's tests are dropped from the mabda
+  suite since dynlib is a stdlib concern.
+
+### Not breaking
+- `dist/mabda.cyr` is regenerated but the exported API surface
+  (`gpu_context_from_preinit`, `wgpu_*`, `color_*`, `storage_buffer_*`,
+  `render_pipeline_create_simple`, …) is byte-identical at the function
+  signature level. Consumers pinning `[deps.mabda] tag = "2.2.0"` only
+  need to bump the tag.
+
 ## [2.1.2] — 2026-04-12
 
 Rust source removal release. The frozen `rust-old/` tree is gone from the
