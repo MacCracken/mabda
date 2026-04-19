@@ -47,7 +47,7 @@ no API changes, no test changes.
   instructions updated to use `cyrius audit` and `make test-all`.
   Added pointers to the `@public`/`@internal` marker system,
   ADR-005, the stdlib integration guide, and `git tag 1.0.0` for Rust
-  archaeology. Minimum Cyrius version bumped `3.4.14` → `3.4.18` to
+  archaeology. Minimum Cyrius version bumped `3.4.14` → `3.4.19` to
   match `cyrius.toml`.
 - **`CLAUDE.md`** — project structure diagram updated to include `dist/`,
   `examples/`, and the version-check/bundle Make targets. `rust-old/`
@@ -80,8 +80,8 @@ git log --all -- rust-old/  # every commit that touched rust-old
 ## [2.1.1] — 2026-04-12
 
 Stdlib inclusion release. Mabda is now consumable as a Cyrius stdlib dep
-via `[deps.mabda]` in downstream `cyrius.toml` files. Cyrius 3.4.17 has
-already staged the dep entry; when 3.4.18 ships it becomes active and
+via `[deps.mabda]` in downstream `cyrius.toml` files. Cyrius 3.4.19 has
+already staged the dep entry; when 3.4.19 ships it becomes active and
 `cyrius deps` will resolve it automatically.
 
 ### The transitional backend callout
@@ -126,7 +126,7 @@ project is the regression test for that contract.
   number. Prevents future drift.
 
 ### Changed
-- **`cyrius-version` bumped `3.4.12` → `3.4.18`.** 3.4.18 is the release
+- **`cyrius-version` bumped `3.4.12` → `3.4.19`.** 3.4.19 is the release
   that activates `[deps.mabda]` as a first-class Cyrius stdlib dep.
 - **Line-length and naming-convention lint warnings eliminated.** 16
   warnings in v2.1.0 (line length in `blend`, `color`, `compute`,

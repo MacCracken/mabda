@@ -94,9 +94,9 @@ cache-dangling-pointer bug that shipped in v2.0.
 
 **Goal:** ship mabda as a Cyrius stdlib dep **now**, so every Cyrius user
 gets a sovereign GPU surface they can build against. The C shim is a known
-transitional detail, not a blocker. Cyrius 3.4.17 has already staged
+transitional detail, not a blocker. Cyrius 3.4.19 has already staged
 `[deps.mabda]` pointing at tag `2.1.1`; when that tag ships,
-Cyrius 3.4.18 activates the dep.
+Cyrius 3.4.19 activates the dep.
 
 ### What "stdlib inclusion" actually means here
 
@@ -124,7 +124,7 @@ throwing away.
 | 1 | **`dist/mabda.cyr` single-file bundle** | All 27 modules concatenated in `src/mabda.cyr` include order. Matches yukti/patra/sigil/sakshi bundle convention — this is how `cyrius deps` symlinks resolve. |
 | 2 | **`scripts/bundle.sh`** — reproducible bundler | Produces `dist/mabda.cyr` from `src/mabda.cyr` by expanding `include` directives in place. Byte-reproducible so CI can diff-check against the committed copy. Idempotent. |
 | 3 | **`[lib]` section in `cyrius.toml`** | `entry = "src/mabda.cyr"`, `modules = [...]` in dependency order. Mirrors yukti's `[lib]` block. |
-| 4 | **`cyrius-version = "3.4.18"`** | Bump the minimum Cyrius to the release that activates `[deps.mabda]` as a first-class dep. |
+| 4 | **`cyrius-version = "3.4.19"`** | Bump the minimum Cyrius to the release that activates `[deps.mabda]` as a first-class dep. |
 | 5 | **`cyrius audit` clean on the public-API path** | `fmt --check`, `lint`, pure-data tests all green. `lib/` is a symlink, never vendored. |
 | 6 | **`cat dist/mabda.cyr \| cc3 > /dev/null` compiles** | The bundled form must pass cc3 with zero errors. `undefined function` warnings are OK for the FFI fn-table slots (those are externals populated by the launcher) — document the expected warning list so consumers know it's benign. |
 | 7 | **Public API surface marked and documented** | Every non-FFI `.cyr` in `src/` gets a `# @public` or `# @internal` comment at the top of the file. Consumer docs list only the `@public` surface. The FFI modules (`wgpu_types`, `wgpu_descriptors`, `wgpu_ffi`, `tagged_obj`, anything touching `fncall_N`) are all `@internal`. This is the contract that survives the backend swap. |
@@ -141,7 +141,7 @@ throwing away.
 - Every `src/*.cyr` has a `# @public` or `# @internal` header comment
 - `cyrius audit` reports 0 warnings, all tests pass
 - The consumer example project builds end-to-end without any mabda-tree files
-- Cyrius 3.4.18 lands immediately after — flips `[deps.mabda]` from
+- Cyrius 3.4.19 lands immediately after — flips `[deps.mabda]` from
   "staged" to "active" and adds `lib/mabda.cyr` symlink
 
 ---

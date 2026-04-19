@@ -19,7 +19,7 @@
 # to be "strip all banner text" and this comment block once said exactly
 # that.
 #
-# Cyrius 3.4.18 proved the real cause: cc3's raw stdin read loop silently
+# Cyrius 3.4.19 proved the real cause: cc3's raw stdin read loop silently
 # truncated at 131072 bytes (the old 128KB `input_buf` limit). The mabda
 # bundle was 141912 bytes. Everything beyond byte 131072 was dropped on
 # the floor with no diagnostic; the parser then ran out of tokens mid-way
@@ -28,13 +28,13 @@
 #
 # Stripping banners "worked" by shaving enough bytes to fit under 131072
 # for a previous bundle revision — a coincidence fix, not a root cause
-# fix. The real fix is in Cyrius 3.4.18: `input_buf` was expanded to 256KB
+# fix. The real fix is in Cyrius 3.4.19: `input_buf` was expanded to 256KB
 # and now errors out explicitly on overflow instead of silently truncating.
 #
 # We still strip the banner + separators because there's no reason to spend
 # bytes on them — but that is an economy choice, NOT a workaround for a
 # compiler bug. If you find yourself tempted to re-add banner text, go
-# ahead: cc3 >= 3.4.18 handles it fine. Just pin your `cyrius-version`.
+# ahead: cc3 >= 3.4.19 handles it fine. Just pin your `cyrius-version`.
 # ---------------------------------------------------------------------------
 #
 # Usage: scripts/bundle.sh

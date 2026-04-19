@@ -13,7 +13,7 @@ Minimal "hello GPU" example for mabda. Proves the stdlib-inclusion contract:
 
 ## Build
 
-Before Cyrius 3.4.18 lands (staged `[deps.mabda]` → active):
+Before Cyrius 3.4.19 lands (staged `[deps.mabda]` → active):
 
 ```sh
 ln -sf ../../../dist/mabda.cyr lib/mabda.cyr  # symlink the bundle
@@ -22,7 +22,7 @@ cyrius build                                  # compile the consumer
 ./build/hello_gpu                             # run
 ```
 
-After Cyrius 3.4.18 lands:
+After Cyrius 3.4.19 lands:
 
 ```sh
 cyrius deps            # resolves [deps.mabda] from cyrius.toml

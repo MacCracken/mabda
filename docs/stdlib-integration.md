@@ -17,7 +17,7 @@ In your `cyrius.toml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius-version = "3.4.18"
+cyrius-version = "3.4.19"
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"

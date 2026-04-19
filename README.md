@@ -85,7 +85,7 @@ Consumer (soorat, bijli, ...)
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 3.4.18+ and gcc.
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 3.4.19+ and gcc.
 
 ```sh
 # Fetch wgpu-native (one-time)
