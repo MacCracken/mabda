@@ -16,10 +16,16 @@ native backend lands, consumer code will not change by a single byte.
 
 ```
   v2.3.0  ───▶  wgpu-native via C shim          (shipping, audited)
+  v2.4.0  ───▶  v1.0-parity closeout            (compute + render E2E, LOW sweep)
+  v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
        ▼
   v3.0    ───▶  pure Cyrius GPU backend         (backend swap — API unchanged)
+  v3.1    ───▶  multi-queue + mipmaps           (consumer catch-up, C shim retired)
+  v3.2    ───▶  compressed textures + SPIR-V    (texture/shader breadth)
+  v3.3    ───▶  image loading                   (gated on pure-Cyrius decoder)
+  v3.x+   ───▶  WebGPU / WASM                   (blocked on Cyrius WASM backend)
 ```
 
 Everything in this roadmap prioritizes **API stability** over
@@ -172,41 +178,138 @@ Cyrius yet. Small release, no structural changes.
 | 3 | Pick up scheduled LOW audit items (LOW-2 → LOW-6) | Planned — none individually block, but 2.4.0 is a good time to sweep |
 
 Exit criteria: `programs/phase0.cyr` + two new programs together
-exercise every v1.0 criterion and close the checklist below.
+exercise every v1.0 criterion and close the checklist below. Once
+checked, the v1.0-parity era ends and mabda enters the **feature-wave**
+phase (2.5.x) ahead of the 3.0 backend swap.
 
 ---
 
-## Future — Native GPU Backend (direction, unscoped)
+## v2.5.0 — Render Graph (Next after 2.4.0)
 
-The wgpu-native + C shim path is transitional. The long-term
-direction is a pure Cyrius GPU backend (DRM/KMS today, AGNOS kernel
-driver eventually) so Cyrius projects depend on zero C artifacts for
-GPU work. **Scope is deliberately left open** — this will be tackled
-when there's appetite for it, not front-loaded as a commitment.
+First feature release post-parity. Adds DAG-style pass orchestration
+on top of the existing `render_pass` + `render_pipeline` +
+`compute` primitives. Additive only — no public API of the
+underlying modules changes, so consumers can opt in at their own
+pace. Designed to survive the 3.0 backend swap unchanged (graph
+execution is pure Cyrius; nodes dispatch through the public mabda
+API, not through FFI directly).
+
+### Planned scope
+- `src/render_graph.cyr` — new module. Node types: **compute node**
+  (shader + bind group + workgroup dims), **render node** (pipeline
+  + target + draw list), **copy node** (buffer↔buffer, buffer↔texture,
+  texture↔texture), **transient resource** (buffer / texture the
+  graph owns for the duration of a frame).
+- Topological sort + linear execution. No automatic barrier insertion
+  in v2.5 — wgpu-native handles the synchronization we need; the
+  graph only owns the **ordering**.
+- Resource aliasing pass (optional, off by default) — transient
+  buffers/textures with disjoint lifetimes share allocation.
+- `rasa` / `soorat` are the reference consumers. One simple render
+  graph end-to-end program in `programs/` (clear → compute → blit →
+  present).
+
+### Out of scope for 2.5.0
+- Cross-queue coordination (moves to 3.1 with multi-queue).
+- Barrier tracking / automatic layout transitions (wgpu handles; the
+  native backend in 3.0 will revisit).
+- Conditional / branching passes. Linear DAG only.
+
+### Exit criteria
+- Render graph module with ≥20 new CPU assertions in
+  `tests/tcyr/mabda.tcyr`.
+- One GPU integration program exercising compute → render → copy
+  in a single graph submission.
+- Documentation: `docs/guides/render-graph.md` — authoring guide with
+  a three-node example.
+
+---
+
+## v3.0 — Native GPU Backend (Backend Swap)
+
+The wgpu-native + C shim path is transitional. **v3.0 is the swap.**
+wgpu-native and the `deps/wgpu_main.c` launcher are retired in
+favour of a pure Cyrius GPU backend (DRM/KMS on Linux first, AGNOS
+kernel driver eventually). Cyrius projects depend on zero C
+artifacts for GPU work.
 
 **The one invariant that matters:** the public mabda API (`# @public`
 files from v2.1.1) does not change when the backend swaps. Consumers
 bump their `[deps.mabda]` tag and their C launcher requirement
 disappears. The `examples/stdlib-consumer/` project is the regression
-test — if it still compiles after the swap, the contract held.
+test — if it still compiles after the swap, the contract held. The
+v2.5 render graph must also replay unchanged.
 
-Everything else — which vendor first, what the shader lowering looks
-like, whether to take a compute-only waypoint — is a call for a later
-version when the work actually starts. Not spec'd here.
+### Scope (high level, refined closer to the work)
+- DRM/KMS backend in pure Cyrius — no libdrm, no libwayland.
+- WGSL → hardware ISA lowering path (vendor-first decision deferred).
+- Backend selector: `wgpu-native` (legacy, kept for one release as
+  migration safety) vs. `native` (default).
+- ADR 006 supersedes ADR 004 (C launcher FFI). Filed when scope
+  concretizes.
+
+### Exit criteria
+- `dist/mabda.cyr` consumers rebuild with `[backends]` defaulting to
+  `native`; `examples/stdlib-consumer/` and `programs/phase0.cyr`
+  pass without the C launcher.
+- soorat, rasa, ranga, bijli, aethersafta, kiran all green on the
+  native backend in their own CI.
+- `deps/wgpu_main.c` and `deps/wgpu-native/` removed from the tree
+  one release after the swap (v3.1 cleanup).
 
 ---
 
-## Backlog (demand-gated, orthogonal to the backend swap)
+## v3.1 — Multi-queue + Mipmaps (Consumer Catch-up)
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Render graph (DAG pass orchestration) | Not started | Additive on top of `render_pass` + `render_pipeline` |
-| Multi-queue coordination | Not started | Additive to GpuContext |
-| Compressed textures (BC/ETC2/ASTC) | Not started | Builds on texture FFI |
-| SPIR-V shader support | Not started | Currently WGSL only |
-| Mipmap generation | Not started | Builds on texture FFI |
-| Image loading (PNG/JPEG) | Not started | Consumer-side today; could adopt a pure-Cyrius decoder once one exists |
-| WebGPU/WASM target | Not started | Blocked on Cyrius WASM backend |
+Both items are orthogonal to the backend swap and were backlog'd
+against v1.0 / v2.x — 3.1 is their natural home once the native
+backend is stable.
+
+- **Multi-queue coordination** — additive to `GpuContext`. Separate
+  compute / graphics / transfer queues with explicit submit ordering.
+  Consumers needing it: rasa (compute + present overlap), bijli
+  (large transfer workloads).
+- **Mipmap generation** — on-device chain generation via compute
+  shader. Builds on the existing texture FFI surface. Consumers:
+  soorat (texture-heavy UI), kiran (asset pipeline).
+- **`deps/wgpu_main.c` + `deps/wgpu-native/` removal** — the final
+  cleanup from the v3.0 swap, one release later as per v3.0 exit
+  criteria.
+
+---
+
+## v3.2 — Texture & Shader Breadth
+
+- **Compressed textures (BC / ETC2 / ASTC)** — format enums,
+  validation, upload path. Builds on the texture FFI (now native).
+  Driven by kiran and aethersafta's asset sizes.
+- **SPIR-V shader support** — alternative path to WGSL. Shader
+  cache keyed on source kind. Reuses `shader_cache.cyr`.
+
+---
+
+## v3.3 — Asset Loading
+
+- **Image loading (PNG / JPEG)** — adopted only once a pure-Cyrius
+  decoder exists in the AGNOS ecosystem. **Dependency-gated**: if
+  no decoder ships by the 3.3 window, this moves to 3.4+. No C
+  image library will be vendored to force the issue.
+
+---
+
+## v3.x+ — Web Target (Blocked)
+
+- **WebGPU / WASM target** — blocked on the Cyrius WASM backend
+  landing in the compiler. No version commitment until that
+  prerequisite exists. Tracked here so it doesn't get forgotten.
+
+---
+
+## Backlog (not yet scheduled)
+
+Empty. All previously-listed backlog items are now slotted into
+2.5.0 → 3.x above. New items land here first and graduate to a
+version once there's consumer demand plus a clear scope.
 
 ---
 
