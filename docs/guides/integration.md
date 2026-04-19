@@ -1,8 +1,20 @@
 # Consumer Integration Guide
 
+> Written against mabda 2.3.0 / Cyrius 5.4.7. Full launcher-wiring
+> walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
+
 ## How to Depend on Mabda
 
-Include mabda's library entry point in your Cyrius source:
+Declare mabda in your `cyrius.cyml`:
+
+```cyml
+[deps.mabda]
+git = "https://github.com/MacCracken/mabda.git"
+tag = "2.3.0"
+modules = ["dist/mabda.cyr"]
+```
+
+Then include the library entry point in your Cyrius source:
 
 ```cyrius
 include "lib/mabda.cyr"
@@ -10,9 +22,12 @@ include "lib/mabda.cyr"
 
 For GPU access (object mode + C linking), your project needs:
 
-1. A C launcher (`wgpu_main.c`) that pre-initializes the GPU
-2. wgpu-native library (`libwgpu_native.a`)
-3. Compilation: `cc3` (object mode) + `gcc` (linking)
+1. A C launcher (`wgpu_main.c`) that pre-initializes the GPU —
+   reference implementation in `deps/wgpu_main.c` of the mabda repo
+2. wgpu-native library (`libwgpu_native.a`, v29) — downloaded via
+   `sh deps/fetch-wgpu.sh`
+3. Compilation: `cc5` (object mode, prepend `object;`) + `gcc`
+   (linking)
 
 ## Shared GpuContext Pattern
 

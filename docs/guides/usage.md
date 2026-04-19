@@ -1,21 +1,36 @@
 # Usage Guide
 
+> Written against mabda 2.3.0 / Cyrius 5.4.7. See
+> [`docs/stdlib-integration.md`](../stdlib-integration.md) for
+> consumer-project setup (manifest, deps, launcher build rule).
+
 ## Getting Started
 
-Include mabda in your Cyrius source:
+Pull mabda in as a dep in your `cyrius.cyml`:
+
+```cyml
+[deps.mabda]
+git = "https://github.com/MacCracken/mabda.git"
+tag = "2.3.0"
+modules = ["dist/mabda.cyr"]
+```
+
+Then include it in your Cyrius source:
 
 ```cyrius
 include "lib/mabda.cyr"
 ```
 
-For object mode (linking with C for GPU access):
+For GPU access, the C launcher compiles your source in object mode
+(prepend `object;` — the Makefile handles this), initialises the GPU,
+builds a function table, and calls `mabda_main(fn_table, preinit)`:
 
 ```cyrius
 object;
 include "lib/mabda.cyr"
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
-    alloc_init();
+    # _cyrius_init() + alloc_init() already ran inside the launcher
     color_init();
     wgpu_ffi_init_table(fn_table_ptr);
     # ... your GPU code ...
@@ -173,15 +188,18 @@ if (gpu_err_is_recoverable(code) == 1) {
 ## Workgroup Math
 
 ```cyrius
-# 1D: ceil(total / workgroup_size)
+# 1D: ceil(total / workgroup_size); returns 0 on workgroup_size == 0
+# (zero-guard added in 2.3.0 to avoid SIGFPE — audit MED-1)
 var groups = workgroups_1d(element_count, 64);
 
-# 2D: (ceil(w/wg_x), ceil(h/wg_y))
+# 2D: writes (ceil(w/wg_x), ceil(h/wg_y)) into dst; leaves dst zeroed
+# when either wg_x or wg_y is 0.
 var wg[16];
 workgroups_2d(&wg, width, height, 8, 8);
 var gx = load64(&wg);
 var gy = load64(&wg + 8);
 
-# Validate against device limits
+# Validate against device limits (optional — not called internally;
+# consumers are expected to check before driving large dispatches).
 var err = validate_dispatch(gx, gy, 1, max_per_dim);
 ```
