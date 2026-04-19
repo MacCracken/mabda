@@ -148,8 +148,12 @@ fn growable_buffer_update(gb, device, queue, data, size) {
     var cap = load64(gb + 8);
     var grew = 0;
     if (size > cap) {
-        # Grow to 2x or size, whichever is larger
+        # Grow to 2x or size, whichever is larger. The `new_cap < cap`
+        # check catches signed-i64 overflow when cap approaches the
+        # i64 boundary — without it, the doubling wraps to a negative
+        # number and `size > new_cap` takes the wrong branch (audit MED-2).
         var new_cap = cap * 2;
+        if (new_cap < cap) { new_cap = size; }
         if (size > new_cap) { new_cap = size; }
         # Release old buffer
         var old = load64(gb);
@@ -172,14 +176,22 @@ fn growable_buffer_update(gb, device, queue, data, size) {
 # ================================================================
 
 # Calculate workgroup count for 1D dispatch
-# Returns ceil(total / workgroup_size)
+# Returns ceil(total / workgroup_size), or 0 if workgroup_size is 0.
+# The 0 guard avoids SIGFPE when a caller passes a mis-configured workgroup
+# size pulled from a shader config — see audit MED-1.
 fn workgroups_1d(total, workgroup_size) {
+    if (workgroup_size == 0) { return 0; }
     return (total + workgroup_size - 1) / workgroup_size;
 }
 
 # Calculate workgroup count for 2D dispatch
-# Returns (x_groups, y_groups) packed as two i64 at dst
+# Returns (x_groups, y_groups) packed as two i64 at dst; leaves dst zeroed
+# on wg_x == 0 or wg_y == 0 (avoids SIGFPE — audit MED-1).
 fn workgroups_2d(dst, width, height, wg_x, wg_y) {
+    store64(dst, 0);
+    store64(dst + 8, 0);
+    if (wg_x == 0) { return 0; }
+    if (wg_y == 0) { return 0; }
     store64(dst, (width + wg_x - 1) / wg_x);
     store64(dst + 8, (height + wg_y - 1) / wg_y);
     return 0;

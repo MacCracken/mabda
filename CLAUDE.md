@@ -158,16 +158,74 @@ For standalone library testing (no GPU), `cyrius test` runs
 
 ## Development Process
 
+### P(-1): Scaffold Hardening (before any new features)
+
+0. Read roadmap, CHANGELOG, audit history — know what was intended
+1. Cleanliness: `cyrius build programs/smoke.cyr` (0 warnings),
+   `cyrius lint` (0 warnings), `cyrius fmt --check` diff-clean,
+   `cyrius vet programs/smoke.cyr` clean
+2. Test sweep: 286+ assertions pass, `cyrius distlib` diff-clean
+3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
+4. Internal deep review — gaps, optimizations, correctness, docs
+5. External research — wgpu-native / WebGPU / GPU-driver CVE sweep
+   since last pass
+6. Security audit (see below) — file findings in
+   `docs/audit/YYYY-MM-DD-audit.md`
+7. Additional tests from findings — each HIGH/MED fix lands with an
+   assertion that would have caught the original bug
+8. Post-review benchmarks — prove the wins (if any)
+9. Documentation audit — CLAUDE.md, roadmap, CHANGELOG, audit index
+10. Repeat if heavy
+
 ### Work Loop (continuous)
 
 1. Work phase — new features, roadmap items, bug fixes
 2. Cleanliness check — `cyrius test tests/tcyr/mabda.tcyr`
 3. Test + benchmark additions for new code
 4. Internal review — performance, memory, correctness
-5. Deeper tests from audit observations
+5. If any FFI / buffer / texture math changed: re-run the audit
+   checklist against the diff
 6. Documentation — update CHANGELOG, roadmap, docs
 7. Version check — `./scripts/version-check.sh` passes
 8. Return to step 1
+
+### Security Hardening (before release)
+
+1. **Input validation** — every function accepting consumer-supplied
+   data (buffer sizes, texture dimensions, workgroup counts,
+   descriptor fields, label strings) validates bounds, types, ranges
+   before use
+2. **Buffer safety** — every `var buf[N]` and `alloc(N)` verified:
+   N in bytes, max offset < N, no adjacent-allocation overflow. The
+   struct header comment's byte count must match the actual `alloc`
+3. **Integer overflow** — any `a * b` / `a + b` / `a << n` on sizes
+   or dimensions gets an overflow guard before use, especially in
+   texture / buffer / workgroup math
+4. **Divide-by-zero** — any `/` or `%` verifies the divisor is
+   non-zero before the operation (workgroup helpers were the
+   regression case in 2.3.0)
+5. **Syscall return handling** — every `syscall()` return value is
+   checked; error paths either recover or deterministically zero
+   any output buffer the caller will read
+6. **Pointer validation** — no raw deref of consumer-supplied
+   pointers; label strings use `wgpu_string_view_len` with an
+   explicit length when length is known
+7. **FFI descriptor offset review** — every edit to
+   `wgpu_descriptors.cyr` cross-referenced against the v29
+   `webgpu.h` layout; field offsets noted in the module header
+   comment block
+8. **`fncall6` avoidance** — any wgpu-native call taking 6+ i64
+   arguments goes through a struct-packing shim in
+   `deps/wgpu_main.c`; direct `fncall6` reliably crashes against
+   wgpu-native (see `feedback_fncall6_wgpu` memory)
+9. **Known CVE check** — review against current wgpu-native /
+   WebGPU / GPU-driver CVEs since the prior audit
+10. **File findings** — `docs/audit/YYYY-MM-DD-audit.md` with
+    severity, file, line, class, mitigation
+
+Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
+(moderate effort) / **MEDIUM** (specific conditions) / **LOW**
+(defense-in-depth).
 
 ### Task Sizing
 
@@ -184,6 +242,8 @@ For standalone library testing (no GPU), `cyrius test` runs
 5. Version consistency — `./scripts/version-check.sh` passes
 6. Consumer check — soorat, rasa, ranga, bijli, aethersafta still build
    against the new bundle
+7. Audit index up to date — `docs/audit/` has the current
+   `YYYY-MM-DD-audit.md` referenced from CHANGELOG
 
 ## CI / Release
 

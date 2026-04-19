@@ -89,9 +89,38 @@ fn storage_buffer_create(device, capacity, label, read_only) {
     return wgpu_device_create_buffer(device, desc);
 }
 
-# Wrap a raw buffer handle with element-count metadata. Caller is responsible
-# for ensuring `capacity == count * element_size` (no runtime validation).
+# Wrap a raw buffer handle with element-count metadata. The wrapper zero-
+# initialises element_size to 1 when count * element_size would overflow
+# or exceed capacity — see audit MED-5. Callers that need the unchecked
+# byte-oriented path can use storage_buffer_wrap_raw.
 fn storage_buffer_wrap(handle, capacity, count, element_size) {
+    var sb = alloc(32);
+    store64(sb, handle);
+    store64(sb + 8, capacity);
+    store64(sb + 16, count);
+    # Consistency: count * element_size must fit in i64 and not exceed capacity.
+    if (element_size <= 0) {
+        store64(sb + 24, 1);
+    } else {
+        var max_count = 0x7FFFFFFFFFFFFFFF / element_size;
+        if (count > max_count) {
+            store64(sb + 24, 1);
+        } else {
+            var required = count * element_size;
+            if (required > capacity) {
+                store64(sb + 24, 1);
+            } else {
+                store64(sb + 24, element_size);
+            }
+        }
+    }
+    return sb;
+}
+
+# Unchecked wrap — byte-oriented view on top of an already-validated handle.
+# Internal convenience for storage_buffer_new / _empty. Do not expose this as
+# a general-purpose entry point; the checked storage_buffer_wrap is preferred.
+fn storage_buffer_wrap_raw(handle, capacity, count, element_size) {
     var sb = alloc(32);
     store64(sb, handle);
     store64(sb + 8, capacity);
@@ -111,24 +140,34 @@ fn storage_buffer_new(device, queue, data, capacity, label, read_only) {
     if (handle != 0) {
         wgpu_queue_write_buffer(queue, handle, 0, data, capacity);
     }
-    return storage_buffer_wrap(handle, capacity, capacity, 1);
+    return storage_buffer_wrap_raw(handle, capacity, capacity, 1);
 }
 
 # Convenience: create an empty storage buffer of the given byte capacity.
 fn storage_buffer_empty(device, capacity, label, read_only) {
     var handle = storage_buffer_create(device, capacity, label, read_only);
-    return storage_buffer_wrap(handle, capacity, capacity, 1);
+    return storage_buffer_wrap_raw(handle, capacity, capacity, 1);
 }
 
 # Write `write_count` elements into the storage buffer. Returns a GpuResult:
 #   Ok(0)          on success
 #   Err(...)       if write_count > stored count (exceeds capacity)
+#   Err(...)       if write_count * element_size would overflow i64 (audit MED-4)
 fn storage_buffer_write(queue, sb, data, write_count) {
     var capacity_count = load64(sb + 16);
     if (write_count > capacity_count) {
         return gpu_err_result_msg(GPU_ERR_BUFFER, "storage buffer write exceeds capacity");
     }
     var element_size = load64(sb + 24);
+    # Overflow guard: write_count * element_size must fit in i64 positive range.
+    # 0x7FFFFFFFFFFFFFFF / element_size is the largest safe write_count for this
+    # element_size. Skip when element_size is 0 (nothing to write).
+    if (element_size != 0) {
+        var max_write = 0x7FFFFFFFFFFFFFFF / element_size;
+        if (write_count > max_write) {
+            return gpu_err_result_msg(GPU_ERR_BUFFER, "storage buffer write size overflow");
+        }
+    }
     var write_bytes = write_count * element_size;
     wgpu_queue_write_buffer(queue, load64(sb), 0, data, write_bytes);
     return gpu_ok(0);

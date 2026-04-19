@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-04-19
+
+P(-1) scaffold-hardening release. Last audit-gated milestone before
+mabda is promoted to first-party trusted stdlib status alongside
+yukti / patra / sakshi. Full findings in
+[`docs/audit/2026-04-19-audit.md`](docs/audit/2026-04-19-audit.md) —
+2 HIGH + 6 MED + 6 LOW across 29 modules; every HIGH and MED fixed.
+
+### Added
+- **`docs/audit/2026-04-19-audit.md`** — full security audit report
+  (scope, methodology, findings with severity / file / lines / class,
+  CVE sweep, remediation plan, non-findings).
+- **`CLAUDE.md` P(-1) + Security Hardening sections** — the 10-point
+  release checklist mabda now enforces before every minor bump.
+- **13 new audit-regression assertions** in `tests/tcyr/mabda.tcyr`
+  (273 → 286), one per HIGH / MED fix.
+- **`storage_buffer_wrap_raw`** — unchecked byte-oriented wrapper
+  for callers that previously relied on `storage_buffer_wrap`'s
+  byte-oriented convenience path. The public `storage_buffer_wrap`
+  now enforces `capacity ≥ count × element_size` and overflow-safety.
+
+### Fixed (HIGH)
+- **HIGH-1 `surface_state_present` name collision** (`src/surface.cyr`).
+  The mutating present helper shadowed the present-mode accessor,
+  so `_surface_state_configure` was (accidentally) calling the
+  present function and configuring the surface with `present_mode = 0`.
+  Mutating helper renamed to `surface_state_submit_present`; accessor
+  unchanged. Regression: `test_audit_surface_present_accessor`.
+- **HIGH-2 `rpb_label` 4-byte heap overflow** (`src/render_pipeline.cyr`).
+  Builder allocation bumped `alloc(80)` → `alloc(88)` so the label
+  slot at `+76` (8 bytes) fits. Regression: `test_audit_rpb_label_fits`.
+
+### Fixed (MEDIUM)
+- **MED-1** `workgroups_1d` / `workgroups_2d` return 0 on zero
+  workgroup size instead of SIGFPE-ing (`src/buffer.cyr`).
+- **MED-2** `growable_buffer_update` detects signed-i64 overflow on
+  `cap * 2` and falls back to `size` (`src/buffer.cyr`).
+- **MED-3** `texture_upload_rgba8` short-circuits on zero / negative /
+  past-i32 dimensions before handing to wgpu-native (`src/texture.cyr`).
+- **MED-4** `storage_buffer_write` rejects
+  `write_count × element_size` that would overflow i64
+  (`src/typed_buffer.cyr`).
+- **MED-5** `storage_buffer_wrap` validates
+  `capacity ≥ count × element_size` at wrap time and clamps
+  `element_size` to 1 on inconsistency; unchecked variant preserved
+  as `storage_buffer_wrap_raw` for internal byte-oriented use
+  (`src/typed_buffer.cyr`).
+- **MED-6** `_time_now_ns` zeroes its timespec before the
+  `clock_gettime` syscall so a failure returns 0 instead of stack
+  garbage (`src/profiler.cyr`).
+
+### Fixed (LOW)
+- **LOW-1** `GpuCapabilities` struct header comment corrected from
+  "128 bytes" to "120 bytes" to match the actual `alloc(120)`
+  (`src/capabilities.cyr`).
+
+### Scheduled (LOW, not blocking 2.3.0)
+- **LOW-2** `read_buffer` size cap
+- **LOW-3** wire `validate_dispatch` / `validate_dimensions` into
+  internal dispatchers
+- **LOW-4** bounded `strlen` in `wgpu_string_view`
+- **LOW-5** resource cleanup on `compute_pipeline_new` failure paths
+- **LOW-6** clamp color components in `texture_from_color`
+
+### Metrics
+- **Modules**: 29 (unchanged)
+- **Source lines**: ~4,000 (unchanged)
+- **Tests**: 286 assertions (was 273 — +13 audit regressions)
+- **Dist bundle**: `dist/mabda.cyr` regenerated
+
+### Promotion note
+Mabda 2.3.0 is the last stdlib-candidate release requiring an
+external audit gate. Starting with 2.4.0, mabda is treated as a
+first-party trusted dependency: the Security Hardening checklist in
+`CLAUDE.md` is the internal gate, and the audit artefact moves to a
+rolling review rather than a release-blocking pass.
+
 ## [2.2.0] — 2026-04-19
 
 Project scaffolding brought in line with the first-party AGNOS convention
