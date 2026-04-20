@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.1] — 2026-04-19
+
+Sakshi observability wiring. Mabda's existing error / profiler /
+context plumbing now emits structured sakshi events when the
+consumer opts in. No public API changes; default behaviour stays
+silent. Earns the sakshi include that's been part of the mabda
+include chain since v2.1.1.
+
+### Added
+- **`mabda_observability_enable()` / `mabda_observability_disable()`
+  / `mabda_observability_is_enabled()`** in `src/error.cyr` — opt-in
+  gating for the new emission paths. Independent of sakshi's own
+  level / output configuration so consumers can keep mabda silent
+  even with sakshi otherwise active.
+- **`_sk_emit_err(code)` + `_sk_info_cstr(msg)`** — internal helpers
+  that route mabda events to sakshi. Recoverable GpuErr codes
+  emit `sakshi_warn`; non-recoverable emit `sakshi_error`. Both
+  use `gpu_err_name(code)` so the event message matches the
+  human-readable code name.
+- **`profiler_begin_frame` / `profiler_end_frame` sakshi spans** —
+  wrapped with `sakshi_span_enter("frame", 5) / sakshi_span_exit()`
+  when observability is enabled. Trace consumers get per-frame
+  timing for free; profiler's existing CPU timing math is untouched.
+- **`gpu_context_from_preinit` success path** emits
+  `sakshi_info("mabda: gpu context created")`.
+- **`gpu_context_release`** emits
+  `sakshi_info("mabda: gpu context released")`.
+- **6 new CPU assertions** in `tests/tcyr/mabda.tcyr` (303 → 309)
+  covering: default-disabled state, enable/disable flag flips,
+  disabled-no-emission contract, enabled-emits-on-err contract,
+  frame span depth invariant.
+
+### Notes
+- Failure paths in `gpu_context_from_preinit` route through
+  `gpu_err_result(...)`, which already calls `_sk_emit_err`. No
+  duplicate emission.
+- Tests use `sakshi_output_buffer()` + `sakshi_ring_*` to verify
+  emission counts without polluting test stderr.
+
+### Metrics
+- **Modules**: 29 (unchanged)
+- **Source lines**: ~4,100 (+~50 across error/profiler/context)
+- **Tests**: 309 assertions (was 303 — +6 observability)
+- **Dist bundle**: `dist/mabda.cyr` regenerated
+
+### Next
+- v2.4.2 — render-pass FFI expansion + render E2E (closes v1.0)
+- v2.5.0 — render graph
+
+---
+
 ## [2.4.0] — 2026-04-19
 
 v1.0-parity (partial) closeout. Picks off the v1.0 criteria the
