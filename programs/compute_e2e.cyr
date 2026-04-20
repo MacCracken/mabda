@@ -1,0 +1,142 @@
+# programs/compute_e2e.cyr — Compute dispatch end-to-end GPU test
+#
+# Exercises the v1.0 criterion: "Compute dispatch end-to-end test".
+# Upload → dispatch → readback → verify. A minimal WGSL shader doubles
+# each u32 element of a storage buffer; we copy the result into a
+# MAP_READ buffer and assert every element matches 2*input.
+#
+# Linked with deps/wgpu_main.c via the Makefile target `test-compute-e2e`.
+# Selective includes mirror programs/phase0.cyr (no src/lib.cyr — keeps
+# the object small).
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/syscalls.cyr"
+include "lib/fnptr.cyr"
+include "lib/hashmap.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/tagged.cyr"
+
+include "src/error.cyr"
+include "src/color.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+include "src/wgpu_ffi.cyr"
+include "src/context.cyr"
+include "src/buffer.cyr"
+include "src/compute.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len) { syscall(1, 2, msg, len); return 1; }
+fn _pass(msg, len) { syscall(1, 1, msg, len); return 0; }
+
+# Build the compute shader source — @workgroup_size(8), doubles each u32
+fn _build_shader() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var<storage, read_write> ");
+    str_builder_add_cstr(sb, "data: array<u32>; ");
+    str_builder_add_cstr(sb, "@compute @workgroup_size(8) fn main(");
+    str_builder_add_cstr(sb, "@builtin(global_invocation_id) gid: vec3<u32>) { ");
+    str_builder_add_cstr(sb, "data[gid.x] = data[gid.x] * 2u; }");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    # --- 1. Build compute pipeline (1 read-write storage binding) ---
+    var wgsl = _build_shader();
+    var cp = compute_pipeline_new(device, wgsl, "main", 1);
+    if (cp == 0) { return _fail("FAIL: compute_pipeline_new\n", 27); }
+    syscall(1, 1, "PASS: compute pipeline created\n", 31);
+
+    # --- 2. Create storage buffer with initial [1..8] u32 values ---
+    var storage_usage = WGPU_BUFFER_USAGE_STORAGE
+                      | WGPU_BUFFER_USAGE_COPY_DST
+                      | WGPU_BUFFER_USAGE_COPY_SRC;
+    var storage_desc = wgpu_buffer_descriptor("compute-storage", storage_usage, 32, 0);
+    var storage_buf = wgpu_device_create_buffer(device, storage_desc);
+    if (storage_buf == 0) { return _fail("FAIL: storage buffer create\n", 28); }
+
+    # Initial data: [1, 2, 3, 4, 5, 6, 7, 8] as u32 — 32 bytes packed
+    var input[32];
+    var i = 0;
+    while (i < 8) {
+        store32(&input + i * 4, i + 1);
+        i = i + 1;
+    }
+    wgpu_queue_write_buffer(queue, storage_buf, 0, &input, 32);
+    syscall(1, 1, "PASS: storage buffer populated\n", 31);
+
+    # --- 3. Build a bind group wrapping the storage buffer ---
+    var bge[56];
+    wgpu_bind_group_entry_buffer(&bge, 0, storage_buf, 0, 32);
+    var bg_desc = wgpu_bind_group_descriptor("compute-bg", compute_pipeline_bgl(cp), &bge, 1);
+    var bg = wgpu_device_create_bind_group(device, bg_desc);
+    if (bg == 0) { return _fail("FAIL: bind group create\n", 24); }
+    syscall(1, 1, "PASS: bind group created\n", 25);
+
+    # --- 4. Dispatch (1,1,1) — workgroup_size(8) covers all 8 elements ---
+    compute_dispatch(device, queue, cp, bg, 1, 1, 1);
+    syscall(1, 1, "PASS: compute dispatch submitted\n", 33);
+
+    # --- 5. Copy storage_buf → readback_buf and map for verification ---
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("compute-read", read_usage, 32, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return _fail("FAIL: readback buffer create\n", 29); }
+
+    var enc = wgpu_device_create_command_encoder(device, "compute-copy-enc");
+    if (enc == 0) { return _fail("FAIL: encoder\n", 14); }
+    wgpu_command_encoder_copy_buffer_to_buffer(enc, storage_buf, 0, read_buf, 0, 32);
+    var cmd = wgpu_command_encoder_finish(enc, "compute-copy-cmd");
+    if (cmd == 0) { return _fail("FAIL: cmd buffer finish\n", 24); }
+    wgpu_queue_submit_one(queue, cmd);
+
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, 32);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("FAIL: map readback\n", 19);
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, 32);
+    if (mapped == 0) { return _fail("FAIL: get mapped range\n", 23); }
+
+    # --- 6. Verify: each element should be doubled ---
+    var j = 0;
+    while (j < 8) {
+        var got = load32(mapped + j * 4);
+        var expected = (j + 1) * 2;
+        if (got != expected) {
+            wgpu_buffer_unmap(read_buf);
+            return _fail("FAIL: element mismatch (compute shader didn't run?)\n", 52);
+        }
+        j = j + 1;
+    }
+    wgpu_buffer_unmap(read_buf);
+    syscall(1, 1, "PASS: compute shader doubled every element (8/8)\n", 49);
+
+    # --- 7. Cleanup ---
+    wgpu_command_encoder_release(enc);
+    wgpu_bind_group_release(bg);
+    wgpu_buffer_release(read_buf);
+    wgpu_buffer_release(storage_buf);
+    compute_pipeline_release(cp);
+
+    syscall(1, 1, "\n7 passed, 0 failed\n", 20);
+    return 0;
+}

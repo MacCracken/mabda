@@ -5,6 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] — 2026-04-19
+
+v1.0-parity (partial) closeout. Picks off the v1.0 criteria the
+existing FFI surface can already reach: compute dispatch end-to-end
+plus the scheduled LOW audit sweep. Render-pipeline E2E deferred to
+v2.4.2 (needs render-pass FFI expansion — see roadmap and
+`docs/issues/2026-04-19-phase0-build-broken.md`).
+
+### Added
+- **`programs/compute_e2e.cyr`** — compute dispatch end-to-end
+  GPU integration test: write → bind → dispatch → copy → map →
+  verify. WGSL shader doubles every u32 element; readback asserts
+  every element matches `2 * input`. Mirrors the existing
+  buffer round-trip in `programs/phase0.cyr`.
+- **`make build-gpu-programs`** CI gate — `cyrius check` every
+  `programs/*.cyr` and fail on any warning. Closes the missing-include
+  class of bug surfaced as Issue 2 in
+  `docs/issues/2026-04-19-phase0-build-broken.md`. Runnable on CI
+  without `wgpu-native`.
+- **`make test-compute-e2e`** + **`make test-render-e2e`** + **`make
+  test-gpu`** Makefile targets. Pattern rule for `build/%.o`
+  generalises the phase0 build to any `programs/*.cyr`.
+- **`docs/issues/2026-04-19-phase0-build-broken.md`** — internal
+  issue doc tracking the cyrius `_cyrius_init`-LOCAL regression
+  (fixed upstream in cyrius v5.4.9), the `lib/str.cyr` missing-include
+  bug in `programs/phase0.cyr` (fixed mabda-side), and the queued
+  `cyrius build --strict` enhancement.
+- **17 new audit-regression assertions** in `tests/tcyr/mabda.tcyr`
+  (286 → 303), one or more per LOW fix below.
+
+### Fixed (LOW)
+- **LOW-2 `read_buffer` size cap** (`src/buffer.cyr`). New
+  `read_buffer_capped(device, queue, buffer, size, max_bytes)`
+  rejects `size <= 0`, `size > max_bytes`, and `size >
+  wgpu_buffer_get_size(buffer)` before allocating staging or host
+  memory. The existing `read_buffer(...)` now delegates to it with a
+  256 MB default cap (matches WebGPU `maxStorageBufferBindingSize`
+  default). Regression: `test_audit_read_buffer_zero_size_rejected`,
+  `test_audit_read_buffer_exceeds_cap_rejected`.
+- **LOW-3** `validate_dispatch` / `validate_dimensions` wired into
+  the internal dispatchers (`src/compute.cyr`, `src/texture.cyr`).
+  `compute_dispatch` short-circuits on `<= 0` or `> 65535`
+  workgroup counts; `texture_create_rgba8` short-circuits on `<= 0`
+  or `> 8192` dimensions. Both match the WebGPU spec minimum.
+  Regressions: `test_audit_compute_dispatch_zero_dim_rejected`,
+  `test_audit_compute_dispatch_exceeds_max_rejected`,
+  `test_audit_texture_create_exceeds_max_rejected`.
+- **LOW-4 bounded `_wgpu_strnlen`** (`src/wgpu_descriptors.cyr`).
+  `wgpu_string_view` now bounds its strlen at 4 KB
+  (`WGPU_LABEL_MAX_BYTES`) so a corrupt or non-null-terminated label
+  cannot walk off mapped memory. Regressions:
+  `test_audit_strnlen_short_string`, `test_audit_strnlen_caps_at_max`.
+- **LOW-5 `compute_pipeline_new` failure-path cleanup**
+  (`src/compute.cyr`). Each early-return between BGL / pipeline
+  layout / shader / pipeline creation now releases the wgpu handles
+  it has accumulated so far, plus an upfront `storage_count <= 0`
+  guard. Regression:
+  `test_audit_compute_pipeline_zero_storage_rejected`.
+- **LOW-6 `_clamp_unit` in `texture_from_color`**
+  (`src/texture.cyr`). f64 RGBA components outside `[0.0, 1.0]` are
+  clamped before the u8 conversion so wrapping arithmetic
+  (`1.5 → 382 → 126`) cannot produce a garbage pixel. Regressions:
+  `test_audit_clamp_unit_in_range`, `test_audit_clamp_unit_above_one`,
+  `test_audit_clamp_unit_below_zero`.
+
+### Fixed (other)
+- **`programs/phase0.cyr`** — added missing `include "lib/str.cyr"`.
+  Phase0 used `str_builder_*` / `str_cstr` for the WGSL shader source
+  (added when the literal was split across lines) but the include
+  block hadn't been updated. Linker failed with 8 undefined-references
+  on a clean build. Mabda-side fix; root-cause Issue 2 in
+  `docs/issues/2026-04-19-phase0-build-broken.md`.
+
+### Changed
+- **Toolchain pin** `cyrius = "5.4.7" → "5.4.10"` in `cyrius.cyml`.
+  Picks up the v5.4.9 fix for `_cyrius_init` GLOBAL emission in
+  `object;` mode (Issue 1 in the `phase0-build-broken` doc), plus
+  the v5.4.10 `lib/thread.cyr` post-clone child-path fix.
+- **Makefile** — `build/phase0.o` rule generalised to a `build/%.o`
+  pattern rule covering all `programs/*.cyr`. New per-program link
+  rules + phony test targets follow the same template.
+
+### Metrics
+- **Modules**: 29 (unchanged)
+- **Source lines**: ~4,050 (+50 across LOW fixes)
+- **Tests**: 303 assertions (was 286 — +17 LOW-sweep regressions)
+- **Programs**: 3 (was 2 — added `compute_e2e.cyr`)
+- **Dist bundle**: `dist/mabda.cyr` regenerated
+
+### Next
+- v2.4.1 — sakshi observability (additive)
+- v2.4.2 — render-pass FFI expansion + render E2E (closes v1.0)
+- v2.5.0 — render graph
+
+---
+
 ## [2.3.0] — 2026-04-19
 
 P(-1) scaffold-hardening release. Last audit-gated milestone before

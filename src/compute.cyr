@@ -11,9 +11,15 @@
 # ComputePipeline creation
 # ================================================================
 
-# Create a compute pipeline with default storage buffer bindings
-# buffer 0 = read-write storage, buffers 1..n = read-only storage
+# Create a compute pipeline with default storage buffer bindings.
+# buffer 0 = read-write storage, buffers 1..n = read-only storage.
+#
+# Failure-path cleanup (audit LOW-5): every wgpu handle allocated
+# before a failure is released before the function returns 0, so
+# repeated failed creation attempts cannot leak GPU memory.
 fn compute_pipeline_new(device, wgsl_source, entry_point, storage_count) {
+    if (storage_count <= 0) { return 0; }
+
     # Build bind group layout entries
     var entries = alloc(storage_count * 120);
     var stage = WGPU_SHADER_STAGE_COMPUTE;
@@ -41,20 +47,31 @@ fn compute_pipeline_new(device, wgsl_source, entry_point, storage_count) {
     store64(&layouts, bgl);
     var pl_desc = wgpu_pipeline_layout_descriptor("compute_pl", &layouts, 1);
     var pl = wgpu_device_create_pipeline_layout(device, pl_desc);
-    if (pl == 0) { return 0; }
+    if (pl == 0) {
+        wgpu_bind_group_layout_release(bgl);
+        return 0;
+    }
 
     # Create shader module
     var src = wgpu_shader_source_wgsl(wgsl_source);
     var sm_desc = wgpu_shader_module_descriptor("compute_shader", src);
     var shader = wgpu_device_create_shader_module(device, sm_desc);
-    if (shader == 0) { return 0; }
+    if (shader == 0) {
+        wgpu_pipeline_layout_release(pl);
+        wgpu_bind_group_layout_release(bgl);
+        return 0;
+    }
 
     # Create compute pipeline
     var cp_desc = wgpu_compute_pipeline_descriptor("compute_pipeline", pl, shader, entry_point);
     var pipeline = wgpu_device_create_compute_pipeline(device, cp_desc);
 
     wgpu_shader_module_release(shader);
-    if (pipeline == 0) { return 0; }
+    if (pipeline == 0) {
+        wgpu_pipeline_layout_release(pl);
+        wgpu_bind_group_layout_release(bgl);
+        return 0;
+    }
 
     # Build ComputePipeline struct
     var cp = alloc(24);
@@ -73,8 +90,20 @@ fn compute_pipeline_layout(cp)     { return load64(cp + 16); }
 # Dispatch helpers
 # ================================================================
 
-# Dispatch a compute pipeline with one bind group
+# WebGPU spec minimum: maxComputeWorkgroupsPerDimension = 65535.
+# Dispatches exceeding this are short-circuited (no-op) — matches the
+# audit MED-3 zero/negative short-circuit pattern. Audit LOW-3.
+var MABDA_MAX_DISPATCH_DIM = 65535;
+
+# Dispatch a compute pipeline with one bind group.
+# Returns 0 on submit; returns 0 silently (no submit) if any dimension
+# is <= 0 or exceeds MABDA_MAX_DISPATCH_DIM. See audit LOW-3.
 fn compute_dispatch(device, queue, cp, bind_group, x, y, z) {
+    if (x <= 0) { return 0; }
+    if (y <= 0) { return 0; }
+    if (z <= 0) { return 0; }
+    if (validate_dispatch(x, y, z, MABDA_MAX_DISPATCH_DIM) != 0) { return 0; }
+
     var encoder = wgpu_device_create_command_encoder(device, "compute_enc");
 
     var pass_desc = wgpu_compute_pass_descriptor("compute_pass");

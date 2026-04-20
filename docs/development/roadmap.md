@@ -16,7 +16,9 @@ native backend lands, consumer code will not change by a single byte.
 
 ```
   v2.3.0  ───▶  wgpu-native via C shim          (shipping, audited)
-  v2.4.0  ───▶  v1.0-parity closeout            (compute + render E2E, LOW sweep)
+  v2.4.0  ───▶  v1.0-parity (partial)           (compute E2E, LOW sweep)
+  v2.4.1  ───▶  sakshi observability            (structured logging + spans — additive)
+  v2.4.2  ───▶  render-pass FFI + render E2E    (closes v1.0 checklist)
   v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
@@ -165,26 +167,110 @@ and MED fixed.
 
 ---
 
-## v2.4.0 — v1.0-Parity Closeout (Next)
+## v2.4.0 — v1.0-Parity (Partial) (Next)
 
-Finish the last unchecked items from the v1.0 criteria list below —
-the Rust v1.0 criteria that haven't been re-validated end-to-end in
-Cyrius yet. Small release, no structural changes.
+Pick off the v1.0 criteria the existing FFI surface can already
+reach. Render-pipeline end-to-end deferred to v2.4.2 because the
+FFI table has no render-pass execution slots yet (descriptor
+builder exists; encoder dispatch does not — see `wgpu_ffi.cyr`,
+slots end at 57/surface). Small release, no structural changes.
 
 | # | Item | Status |
 |---|------|--------|
 | 1 | Compute dispatch end-to-end test in `programs/` | Planned — write → dispatch → read-back assertion, mirroring the buffer round-trip that already ships |
-| 2 | Render pipeline end-to-end test in `programs/` | Planned — draw-and-readback off an offscreen render target |
-| 3 | Pick up scheduled LOW audit items (LOW-2 → LOW-6) | Planned — none individually block, but 2.4.0 is a good time to sweep |
+| 2 | Pick up scheduled LOW audit items (LOW-2 → LOW-6) | Planned — none individually block, but 2.4.0 is a good time to sweep |
+| 3 | `make build-gpu-programs` CI gate | Planned — compile-but-don't-link every `programs/*.cyr`, fail on any cc5 warning. Closes the missing-include class of bug surfaced by `docs/issues/2026-04-19-phase0-build-broken.md` Issue 2 |
 
-Exit criteria: `programs/phase0.cyr` + two new programs together
-exercise every v1.0 criterion and close the checklist below. Once
-checked, the v1.0-parity era ends and mabda enters the **feature-wave**
-phase (2.5.x) ahead of the 3.0 backend swap.
+Exit criteria: `programs/phase0.cyr` + `programs/compute_e2e.cyr`
+together exercise every v1.0 criterion the current FFI can reach.
+Render-pipeline E2E waits for v2.4.2.
 
 ---
 
-## v2.5.0 — Render Graph (Next after 2.4.0)
+## v2.4.1 — Sakshi Observability
+
+Earn the sakshi include that's already in `src/lib.cyr`. Wire the
+structured-logging / span / packed-error primitives into mabda's
+existing plumbing. Additive only — no public API changes, default
+behaviour stays silent (consumers opt in via `sakshi_set_level`).
+
+### Planned scope
+- **`src/error.cyr`** — every `Err(gpu_err(...))` construction path
+  emits `sakshi_error(...)` with the GpuErr code mapped to a short
+  category string. Existing tagged-union return shape unchanged.
+- **`src/profiler.cyr`** — `profiler_frame_begin` /
+  `profiler_frame_end` wrap their timing logic in
+  `sakshi_span_enter("frame", 5)` / `sakshi_span_exit()` so trace
+  consumers get per-frame spans for free.
+- **`src/context.cyr`** — `sakshi_info` on context creation,
+  `sakshi_warn` on the adapter-not-found / device-create-failed
+  error paths.
+- **~5 new CPU assertions** — level gating, emission fires, span
+  depth behaves across frame begin/end.
+
+### Out of scope for 2.4.1
+- Replacing any part of the profiler with sakshi — both coexist.
+- Wiring sakshi into `resource.cyr` leak tracing (backlog — adds
+  noise without a consumer asking for it).
+- UDP / file / ring-buffer sakshi outputs — consumer-configured,
+  mabda just emits events.
+
+### Exit criteria
+- `dist/mabda.cyr` still clean; `examples/stdlib-consumer/` still
+  compiles unchanged.
+- CPU suite passes with sakshi level set to `SK_TRACE` end-to-end
+  (captures events without crashing).
+- At least one soorat / rasa consumer opts in and reports back that
+  spans show up in their sakshi output.
+
+---
+
+## v2.4.2 — Render-pass FFI + Render E2E
+
+Closes the v1.0 checklist. Adds the wgpu render-pass execution
+surface that v2.4.0 deferred. Mechanical FFI work — no public
+mabda API changes; `render_pass.cyr` builder gains an actual
+dispatcher to hand its descriptors to.
+
+### Planned scope
+- **`wgpu_ffi.cyr` slots 58-63 (approx)** — add:
+  - `wgpuCommandEncoderBeginRenderPass` (likely struct-packed via
+    a C shim — descriptor has 6+ fields including a colorAttachments
+    array pointer; fits the `feedback_fncall6_wgpu` pattern)
+  - `wgpuRenderPassEncoderSetPipeline`
+  - `wgpuRenderPassEncoderSetBindGroup`
+  - `wgpuRenderPassEncoderDraw`
+  - `wgpuRenderPassEncoderEnd`
+  - `wgpuRenderPassEncoderRelease`
+  - `wgpuCommandEncoderCopyTextureToBuffer` (struct-packed shim —
+    src/dst are `WGPUTexelCopyTextureInfo` / `WGPUTexelCopyBufferInfo`
+    structs)
+- **`render_pass.cyr` dispatcher** — `rpb_pass_begin(encoder, b)`
+  builder method that emits the descriptor and calls the new FFI.
+- **`programs/render_e2e.cyr`** — create offscreen RGBA8 render
+  target with RENDER_ATTACHMENT | COPY_SRC usage; clear to a known
+  colour via render pass; copy texture → buffer; map + verify
+  pixels.
+- **`deps/wgpu_main.c`** — 2-3 new struct-packing shims, fn-table
+  population.
+- **~10 new CPU assertions** + 1 new GPU integration program.
+
+### Exit criteria
+- `make test-render-e2e` passes on a wgpu-native-capable host.
+- v1.0 criteria checklist below is fully ticked.
+- `make build-gpu-programs` CI gate continues to compile-clean
+  every `programs/*.cyr`.
+
+### Why this isn't bundled into 2.5.0
+The render graph in 2.5.0 *uses* render-pass dispatch as a
+primitive — it cannot land cleanly without the FFI slots existing
+first. Splitting them gives 2.5.0 a clean "build orchestration on
+top of stable primitives" narrative instead of mixing FFI plumbing
+with DAG design.
+
+---
+
+## v2.5.0 — Render Graph (After 2.4.2)
 
 First feature release post-parity. Adds DAG-style pass orchestration
 on top of the existing `render_pass` + `render_pipeline` +
@@ -322,8 +408,10 @@ version once there's consumer demand plus a clear scope.
       `programs/phase0.cyr`
 - [x] Texture create / view / upload / release — `programs/phase0.cyr`
 - [x] Render pipeline create / release — `programs/phase0.cyr`
-- [ ] Compute dispatch end-to-end test (v2.4.0)
-- [ ] Render pipeline end-to-end draw + readback (v2.4.0)
+- [x] Compute dispatch end-to-end test (v2.4.0 —
+      `programs/compute_e2e.cyr`)
+- [ ] Render pipeline end-to-end draw + readback (v2.4.2 — needs
+      render-pass FFI expansion)
 - [ ] Consumer integration: soorat port to Cyrius (consumer-side, not
       mabda-side — tracked in soorat's repo)
 

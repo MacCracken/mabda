@@ -1243,6 +1243,103 @@ fn test_audit_gpu_caps_last_field_at_112() {
     return 0;
 }
 
+# LOW-2: read_buffer enforces a size cap and rejects bad sizes before
+# allocating a staging buffer or host memory. A zero/negative size must
+# return 0 unconditionally; a size exceeding the cap must do likewise.
+fn test_audit_read_buffer_zero_size_rejected() {
+    assert_eq(read_buffer_capped(0, 0, 0, 0, 1024), 0,
+    "read_buffer_capped(size=0) returns 0");
+    assert_eq(read_buffer_capped(0, 0, 0, -1, 1024), 0,
+    "read_buffer_capped(size<0) returns 0");
+    return 0;
+}
+
+fn test_audit_read_buffer_exceeds_cap_rejected() {
+    assert_eq(read_buffer_capped(0, 0, 0, 2048, 1024), 0,
+    "read_buffer_capped(size>cap) returns 0");
+    return 0;
+}
+
+# LOW-3: compute_dispatch and texture_create_rgba8 reject inputs that
+# exceed WebGPU spec-default limits before reaching wgpu-native.
+fn test_audit_compute_dispatch_zero_dim_rejected() {
+    assert_eq(compute_dispatch(0, 0, 0, 0, 0, 1, 1), 0,
+    "compute_dispatch(x=0) short-circuits");
+    assert_eq(compute_dispatch(0, 0, 0, 0, 1, 0, 1), 0,
+    "compute_dispatch(y=0) short-circuits");
+    assert_eq(compute_dispatch(0, 0, 0, 0, 1, 1, 0), 0,
+    "compute_dispatch(z=0) short-circuits");
+    return 0;
+}
+
+fn test_audit_compute_dispatch_exceeds_max_rejected() {
+    assert_eq(compute_dispatch(0, 0, 0, 0, 70000, 1, 1), 0,
+    "compute_dispatch(x>MAX) short-circuits");
+    return 0;
+}
+
+fn test_audit_texture_create_exceeds_max_rejected() {
+    assert_eq(texture_create_rgba8(0, 9000, 256, "too-wide"), 0,
+    "texture_create_rgba8(width>MAX) returns 0");
+    assert_eq(texture_create_rgba8(0, 256, 9000, "too-tall"), 0,
+    "texture_create_rgba8(height>MAX) returns 0");
+    return 0;
+}
+
+# LOW-4: _wgpu_strnlen caps at the supplied bound. A normal short
+# string returns its actual length; a max-length probe must not
+# overshoot.
+fn test_audit_strnlen_short_string() {
+    assert_eq(_wgpu_strnlen("hello", 4096), 5,
+    "_wgpu_strnlen returns actual length when below bound");
+    return 0;
+}
+
+fn test_audit_strnlen_caps_at_max() {
+    # 4096 bytes of 'A' followed by a NUL — capped at 100.
+    var buf[4097];
+    var i = 0;
+    while (i < 4096) { store8(&buf + i, 65); i = i + 1; }
+    store8(&buf + 4096, 0);
+    assert_eq(_wgpu_strnlen(&buf, 100), 100,
+    "_wgpu_strnlen caps at the supplied bound");
+    return 0;
+}
+
+# LOW-5: compute_pipeline_new rejects nonsensical storage_count without
+# leaking GPU handles. Resource cleanup on mid-construction failures is
+# tested indirectly: any device=0 / wgsl="" call must return 0 cleanly.
+fn test_audit_compute_pipeline_zero_storage_rejected() {
+    assert_eq(compute_pipeline_new(0, "", "main", 0), 0,
+    "compute_pipeline_new(storage_count=0) returns 0");
+    assert_eq(compute_pipeline_new(0, "", "main", -1), 0,
+    "compute_pipeline_new(storage_count<0) returns 0");
+    return 0;
+}
+
+# LOW-6: _clamp_unit folds out-of-range f64 components to [0.0, 1.0]
+# before the u8 conversion so wrapping arithmetic can't produce a
+# garbage edge pixel.
+fn test_audit_clamp_unit_in_range() {
+    assert_eq(_clamp_unit(F64_0), F64_0, "_clamp_unit(0.0) = 0.0");
+    assert_eq(_clamp_unit(F64_1), F64_1, "_clamp_unit(1.0) = 1.0");
+    return 0;
+}
+
+fn test_audit_clamp_unit_above_one() {
+    assert_eq(_clamp_unit(f64_from(2)), F64_1,
+    "_clamp_unit(2.0) clamps to 1.0");
+    return 0;
+}
+
+fn test_audit_clamp_unit_below_zero() {
+    var neg = f64_from(0);
+    neg = f64_sub(F64_0, F64_1);   # -1.0
+    assert_eq(_clamp_unit(neg), F64_0,
+    "_clamp_unit(-1.0) clamps to 0.0");
+    return 0;
+}
+
 # ================================================================
 # Main
 # ================================================================
@@ -1357,7 +1454,7 @@ fn main() {
     test_surface_configuration_layout();
     test_surface_configuration_zero_init();
 
-    # audit regressions (10)
+    # audit regressions — HIGH/MED (v2.3.0) + LOW sweep (v2.4.0) (22)
     test_audit_surface_present_accessor();
     test_audit_rpb_label_fits();
     test_audit_workgroups_1d_zero_divisor();
@@ -1368,6 +1465,17 @@ fn main() {
     test_audit_storage_buffer_wrap_valid();
     test_audit_texture_upload_zero_dim();
     test_audit_gpu_caps_last_field_at_112();
+    test_audit_read_buffer_zero_size_rejected();
+    test_audit_read_buffer_exceeds_cap_rejected();
+    test_audit_compute_dispatch_zero_dim_rejected();
+    test_audit_compute_dispatch_exceeds_max_rejected();
+    test_audit_texture_create_exceeds_max_rejected();
+    test_audit_strnlen_short_string();
+    test_audit_strnlen_caps_at_max();
+    test_audit_compute_pipeline_zero_storage_rejected();
+    test_audit_clamp_unit_in_range();
+    test_audit_clamp_unit_above_one();
+    test_audit_clamp_unit_below_zero();
 
     return assert_summary();
 }

@@ -51,9 +51,17 @@ fn texture_release(t) {
 # Raw creation — create a texture handle without view/sampler
 # ================================================================
 
+# WebGPU spec minimum: maxTextureDimension2D = 8192. Larger creations
+# are rejected (return 0) before hitting wgpu-native. Audit LOW-3.
+var MABDA_MAX_TEXTURE_DIM_2D = 8192;
+
 # Creates a 2D texture with RGBA8_UNORM format and
 # TEXTURE_BINDING | COPY_DST usage (the common "upload + sample" case).
+# Returns 0 on invalid dimensions (<= 0 or > MABDA_MAX_TEXTURE_DIM_2D).
 fn texture_create_rgba8(device, width, height, label) {
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return 0; }
     var usage = WGPU_TEXTURE_USAGE_TEXTURE_BINDING | WGPU_TEXTURE_USAGE_COPY_DST;
     var desc = wgpu_texture_descriptor(label, usage, WGPU_TEXTURE_DIMENSION_2D,
     width, height, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
@@ -108,13 +116,25 @@ fn texture_from_rgba(device, queue, rgba_ptr, width, height, label) {
     return t;
 }
 
+# Clamp an f64 component to the WebGPU-valid colour range [0.0, 1.0].
+# Audit LOW-6 — without this, f64 components outside [0,1] truncate
+# to wrapping u8 values (1.5 → 382 → 126; -0.5 → -127 → 129).
+fn _clamp_unit(v) {
+    if (f64_lt(v, F64_0) == 1) { return F64_0; }
+    if (f64_gt(v, F64_1) == 1) { return F64_1; }
+    return v;
+}
+
 # Create a 1×1 solid-color texture from a Color struct.
+# Components outside [0.0, 1.0] are clamped before the u8 conversion
+# so out-of-range values produce a defined edge-of-gamut pixel rather
+# than a wrapped garbage one. Audit LOW-6.
 fn texture_from_color(device, queue, color) {
     var rgba[4];
-    store8(&rgba,     f64_to(f64_mul(color_r(color), f64_from(255))));
-    store8(&rgba + 1, f64_to(f64_mul(color_g(color), f64_from(255))));
-    store8(&rgba + 2, f64_to(f64_mul(color_b(color), f64_from(255))));
-    store8(&rgba + 3, f64_to(f64_mul(color_a(color), f64_from(255))));
+    store8(&rgba,     f64_to(f64_mul(_clamp_unit(color_r(color)), F64_255)));
+    store8(&rgba + 1, f64_to(f64_mul(_clamp_unit(color_g(color)), F64_255)));
+    store8(&rgba + 2, f64_to(f64_mul(_clamp_unit(color_b(color)), F64_255)));
+    store8(&rgba + 3, f64_to(f64_mul(_clamp_unit(color_a(color)), F64_255)));
     return texture_from_rgba(device, queue, &rgba, 1, 1, "solid_color");
 }
 

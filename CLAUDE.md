@@ -10,7 +10,7 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + C launcher
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 5.4.7+ (`cyrius.cyml: cyrius = "5.4.7"`)
-- **Version**: 2.3.0 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
+- **Version**: 2.4.0 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
 - **GPU FFI**: wgpu-native v29 C API via `deps/wgpu_main.c` launcher
 
 ## Goal
@@ -23,7 +23,7 @@ v3.x is an implementation detail, not an API break.
 ## Current State
 
 - **Source**: 29 domain modules under `src/*.cyr`, ~4,000 lines total.
-- **Tests**: 286 CPU-only assertions in `tests/tcyr/mabda.tcyr` plus a
+- **Tests**: 303 CPU-only assertions in `tests/tcyr/mabda.tcyr` plus a
   GPU integration test (`programs/phase0.cyr`) driven through the C
   launcher.
 - **Benchmarks**: `tests/bcyr/mabda.bcyr` — color, workgroup math,
@@ -61,7 +61,7 @@ them against the installed toolchain.
 ```bash
 cyrius deps                              # resolve stdlib into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke   # link-check
-cyrius test tests/tcyr/mabda.tcyr        # 286 CPU assertions
+cyrius test tests/tcyr/mabda.tcyr        # 303 CPU assertions
 cyrius bench tests/bcyr/mabda.bcyr       # CPU benchmarks
 cyrius distlib                           # → dist/mabda.cyr
 make test-phase0                         # GPU integration (needs wgpu-native)
@@ -132,7 +132,7 @@ For standalone library testing (no GPU), `cyrius test` runs
 
 ## Key Constraints
 
-- **Tests are the way** — 286 CPU assertions + 1 GPU integration test,
+- **Tests are the way** — 303 CPU assertions + 1 GPU integration test,
   all passing. Every new code path adds an assertion.
 - **Own the stack** — if AGNOS wraps something external, depend on the
   AGNOS crate (sakshi, yukti, patra). wgpu-native is the sole C dep

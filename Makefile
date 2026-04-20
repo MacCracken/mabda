@@ -71,7 +71,10 @@ version-check:
 test-all: version-check dist test
 
 # ---------------------------------------------------------------------------
-# GPU integration test (requires wgpu-native + deps/wgpu_main.c shim)
+# GPU integration tests (require wgpu-native + deps/wgpu_main.c shim)
+#
+# `object;` mode is the one sanctioned direct-cc5 invocation (see CLAUDE.md).
+# A future `cyrius build --object` (queued upstream for 5.4.10+) will retire it.
 # ---------------------------------------------------------------------------
 
 LOCALIZE_SYMS  = memcpy memset memchr strlen strchr memeq atoi
@@ -80,18 +83,54 @@ LOCALIZE_FLAGS = $(foreach s,$(LOCALIZE_SYMS),-L $(s))
 deps/wgpu_main.o: deps/wgpu_main.c
 	$(GCC) -c $< -I$(WGPU_DIR)/include -o $@
 
-build/phase0.o: programs/phase0.cyr src/*.cyr
+# Pattern rule for all programs/*.cyr GPU programs.
+build/%.o: programs/%.cyr src/*.cyr
 	@mkdir -p build
-	printf 'object;\n' | cat - programs/phase0.cyr | $(CC5) > $@
+	printf 'object;\n' | cat - $< | $(CC5) > $@
 	objcopy $(LOCALIZE_FLAGS) -L print_num -L println $@
 
 build/phase0: build/phase0.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/phase0.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+build/compute_e2e: build/compute_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/compute_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/render_e2e: build/render_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/render_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
+
+.PHONY: test-compute-e2e
+test-compute-e2e: build/compute_e2e
+	./build/compute_e2e
+
+.PHONY: test-render-e2e
+test-render-e2e: build/render_e2e
+	./build/render_e2e
+
+# Developer gate: run every GPU integration program in sequence.
+.PHONY: test-gpu
+test-gpu: test-phase0 test-compute-e2e test-render-e2e
+
+# CI gate: syntax + semantic check every programs/*.cyr without needing
+# wgpu-native on the runner. Fails on any cyrius warning/error.
+# Closes the Issue-2-class bug (missing includes compiling silently) from
+# docs/issues/2026-04-19-phase0-build-broken.md.
+.PHONY: build-gpu-programs
+build-gpu-programs:
+	@fail=0; \
+	for f in programs/*.cyr; do \
+		out=$$($(CYRIUS) check $$f 2>&1); \
+		if echo "$$out" | grep -qE '(warning|error):'; then \
+			echo "$$f:"; echo "$$out"; fail=1; \
+		fi; \
+	done; \
+	[ $$fail -eq 0 ] || { echo "build-gpu-programs: warnings/errors in programs/"; exit 1; }
 
 .PHONY: clean
 clean:
