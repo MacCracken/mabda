@@ -1,0 +1,483 @@
+# programs/benchmarks.cyr — GPU-backed benchmark parity with Rust v1.0
+#
+# Ports the 13 Rust-v1 GPU benchmarks (benches/benchmarks.rs, commit
+# f113c93) into a single Cyrius program that drives a real wgpu-native
+# device. Pairs with the 7 CPU-only benchmarks in tests/bcyr/mabda.bcyr.
+#
+# Each benchmark records a min-per-op time across N iterations (fairest
+# comparison to Criterion's `estimate`). Output is human-readable to
+# stdout plus one `CSV:name,ns` line per benchmark that scripts can grep
+# into bench-history.csv (matches the schema of
+# docs/rust-v1-bench-history.csv).
+#
+# Reference numbers (Rust v1.0, RADV RENOIR equivalent):
+#   create_storage_buffer_4k       4.02 µs
+#   create_uniform_buffer_64       2.81 µs
+#   uniform_buffer_write         929.87 ns
+#   shader_cache_hit              36.52 ns
+#   shader_cache_miss              3.65 µs
+#   bind_group_cache_hit          13.20 ns
+#   texture_1x1_solid              6.92 µs
+#   texture_256x256_rgba           1.06 ms
+#   depth_texture_1080p            2.23 µs
+#   render_target_1080p            3.84 µs
+#   render_target_msaa4_1080p     16.32 µs
+#   render_pipeline_build         97.68 µs
+#   compute_dispatch_1024         31.50 µs
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/syscalls.cyr"
+include "lib/fnptr.cyr"
+include "lib/hashmap.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/tagged.cyr"
+include "lib/sakshi.cyr"
+include "lib/bench.cyr"
+
+include "src/error.cyr"
+include "src/color.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+include "src/wgpu_ffi.cyr"
+include "src/context.cyr"
+include "src/buffer.cyr"
+include "src/typed_buffer.cyr"
+include "src/compute.cyr"
+include "src/shader_cache.cyr"
+include "src/bind_group_cache.cyr"
+include "src/sampler.cyr"
+include "src/depth.cyr"
+include "src/texture.cyr"
+include "src/render_target.cyr"
+include "src/render_pipeline.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+# ================================================================
+# CSV-friendly report — one line per benchmark, easy to grep
+# ================================================================
+fn _csv_row(name, ns) {
+    syscall(1, 1, "CSV:", 4);
+    syscall(1, 1, name, strlen(name));
+    syscall(1, 1, ",", 1);
+    fmt_int(ns);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+fn _report(b) {
+    bench_report(b);
+    _csv_row(load64(b), bench_min_ns(b));
+    return 0;
+}
+
+# ================================================================
+# 1. create_storage_buffer_4k — Rust baseline 4.02 µs
+# ================================================================
+fn bench_create_storage_buffer_4k(device, queue) {
+    var b = bench_new("create_storage_buffer_4k");
+    # Pre-fill 4 KiB of source data once; benchmark the create+write.
+    var data[4096];
+    memset(&data, 0xAB, 4096);
+    # Warm-up
+    var warm = create_storage_buffer(device, queue, &data, 4096, "warmup");
+    if (warm != 0) { wgpu_buffer_release(warm); }
+
+    var ri = 0;
+    while (ri < 200) {
+        bench_batch_start(b);
+        var buf = create_storage_buffer(device, queue, &data, 4096, "bench");
+        bench_batch_stop(b, 1);
+        if (buf != 0) { wgpu_buffer_release(buf); }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 2. create_uniform_buffer_64 — Rust baseline 2.81 µs
+# ================================================================
+fn bench_create_uniform_buffer_64(device, queue) {
+    var b = bench_new("create_uniform_buffer_64");
+    var data[64];
+    memset(&data, 0x33, 64);
+    var warm = create_uniform_buffer(device, queue, &data, 64, "warmup");
+    if (warm != 0) { wgpu_buffer_release(warm); }
+
+    var ri = 0;
+    while (ri < 500) {
+        bench_batch_start(b);
+        var buf = create_uniform_buffer(device, queue, &data, 64, "bench");
+        bench_batch_stop(b, 1);
+        if (buf != 0) { wgpu_buffer_release(buf); }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 3. uniform_buffer_write — Rust baseline 929.87 ns
+# ================================================================
+fn bench_uniform_buffer_write(device, queue) {
+    var b = bench_new("uniform_buffer_write");
+    var data[64];
+    memset(&data, 0x77, 64);
+    var ub = create_uniform_buffer(device, queue, &data, 64, "write-target");
+    if (ub == 0) { return 0; }
+
+    var ri = 0;
+    while (ri < 1000) {
+        bench_batch_start(b);
+        wgpu_queue_write_buffer(queue, ub, 0, &data, 64);
+        bench_batch_stop(b, 1);
+        ri = ri + 1;
+    }
+    _report(b);
+    wgpu_buffer_release(ub);
+    return 0;
+}
+
+# ================================================================
+# 4. shader_cache_hit — Rust baseline 36.52 ns
+# v2.4.5: the cache now backs on the u64-keyed hashmap added in cyrius
+# v5.5.20, so hits are pure int-hash + slot-compare with zero per-lookup
+# allocation. Iteration counts restored to a comparable range with Rust's
+# Criterion default.
+# ================================================================
+fn bench_shader_cache_hit(device) {
+    var b = bench_new("shader_cache_hit");
+    var cache = shader_cache_new();
+    # Prime the cache
+    var src = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4(0.0); }";
+    shader_cache_get_or_compile(cache, device, src, "prime");
+
+    var ri = 0;
+    while (ri < 100) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 10000) {
+            shader_cache_get_or_compile(cache, device, src, "hit");
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 10000);
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 5. shader_cache_miss — Rust baseline 3.65 µs
+# Each iteration uses a unique source string so the cache always misses
+# (forces a real wgpu shader module create). We vary the body text so
+# the FNV hash is different and forces a real compile each time.
+#
+# Kept small (30 shaders) because every miss leaks a shader module on
+# the wgpu device — creating thousands exhausts the driver.
+# ================================================================
+fn bench_shader_cache_miss(device) {
+    var b = bench_new("shader_cache_miss");
+    var cache = shader_cache_new();
+    var count = 30;
+    var sources = alloc(count * 8);
+    var gi = 0;
+    while (gi < count) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb,
+        "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(");
+            str_builder_add_int(sb, gi);
+            str_builder_add_cstr(sb, ".0, 0.0, 0.0, 1.0); }");
+        store64(sources + gi * 8, str_cstr(str_builder_build(sb)));
+        gi = gi + 1;
+    }
+
+    var ri = 0;
+    while (ri < count) {
+        var src = load64(sources + ri * 8);
+        bench_batch_start(b);
+        shader_cache_get_or_compile(cache, device, src, "miss");
+        bench_batch_stop(b, 1);
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 6. bind_group_cache_hit — Rust baseline 13.20 ns
+# v2.4.5: zero-alloc hit path via u64-keyed hashmap (cyrius v5.5.20).
+# ================================================================
+fn bench_bind_group_cache_hit() {
+    var b = bench_new("bind_group_cache_hit");
+    var cache = bind_group_cache_new();
+    bind_group_cache_set(cache, 0xBEEFCAFE, 0x12345678);
+
+    var ri = 0;
+    while (ri < 100) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 10000) {
+            bind_group_cache_get(cache, 0xBEEFCAFE);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 10000);
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 7. texture_1x1_solid — Rust baseline 6.92 µs
+# ================================================================
+fn bench_texture_1x1_solid(device, queue) {
+    var b = bench_new("texture_1x1_solid");
+    var c = color_new(F64_1, F64_HALF, F64_0, F64_1);
+    # Warm up
+    var warm = texture_from_color(device, queue, c);
+    if (warm != 0) { texture_release(warm); }
+
+    var ri = 0;
+    while (ri < 200) {
+        bench_batch_start(b);
+        var t = texture_from_color(device, queue, c);
+        bench_batch_stop(b, 1);
+        if (t != 0) { texture_release(t); }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 8. texture_256x256_rgba — Rust baseline 1.06 ms
+# ================================================================
+fn bench_texture_256x256_rgba(device, queue) {
+    var b = bench_new("texture_256x256_rgba");
+    var SIZE = 262144;  # 256 * 256 * 4
+    var data = alloc(SIZE);
+    memset(data, 0x55, SIZE);
+    var warm = texture_from_rgba(device, queue, data, 256, 256, "warmup");
+    if (warm != 0) { texture_release(warm); }
+
+    var ri = 0;
+    while (ri < 30) {
+        bench_batch_start(b);
+        var t = texture_from_rgba(device, queue, data, 256, 256, "bench");
+        bench_batch_stop(b, 1);
+        if (t != 0) { texture_release(t); }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 9. depth_texture_1080p — Rust baseline 2.23 µs
+# ================================================================
+fn bench_depth_texture_1080p(device) {
+    var b = bench_new("depth_texture_1080p");
+    var warm = depth_texture_new_default(device, 1920, 1080);
+    if (warm != 0) {
+        wgpu_texture_view_release(depth_texture_view(warm));
+        wgpu_texture_release(depth_texture_handle(warm));
+    }
+
+    var ri = 0;
+    while (ri < 200) {
+        bench_batch_start(b);
+        var dt = depth_texture_new_default(device, 1920, 1080);
+        bench_batch_stop(b, 1);
+        if (dt != 0) {
+            wgpu_texture_view_release(depth_texture_view(dt));
+            wgpu_texture_release(depth_texture_handle(dt));
+        }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 10. render_target_1080p — Rust baseline 3.84 µs
+# ================================================================
+fn bench_render_target_1080p(device) {
+    var b = bench_new("render_target_1080p");
+    var warm_b = rtb_new(1920, 1080);
+    var warm = rtb_build(warm_b, device);
+    # Intentionally not releasing — rtb_build's ownership story is the
+    # "returned struct owns all handles" pattern and the bench loop
+    # releases them inline below.
+    if (warm != 0) {
+        wgpu_texture_view_release(render_target_view(warm));
+        wgpu_texture_release(render_target_texture(warm));
+    }
+
+    var ri = 0;
+    while (ri < 200) {
+        var rb = rtb_new(1920, 1080);
+        bench_batch_start(b);
+        var rt = rtb_build(rb, device);
+        bench_batch_stop(b, 1);
+        if (rt != 0) {
+            wgpu_texture_view_release(render_target_view(rt));
+            wgpu_texture_release(render_target_texture(rt));
+        }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 11. render_target_msaa4_1080p — Rust baseline 16.32 µs
+# ================================================================
+fn bench_render_target_msaa4_1080p(device) {
+    var b = bench_new("render_target_msaa4_1080p");
+    var ri = 0;
+    while (ri < 100) {
+        var rb = rtb_new(1920, 1080);
+        rtb_msaa(rb, 4);
+        bench_batch_start(b);
+        var rt = rtb_build(rb, device);
+        bench_batch_stop(b, 1);
+        if (rt != 0) {
+            wgpu_texture_view_release(render_target_view(rt));
+            var msaa = render_target_msaa_view(rt);
+            if (msaa != 0) { wgpu_texture_view_release(msaa); }
+            wgpu_texture_release(render_target_texture(rt));
+        }
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+# ================================================================
+# 12. render_pipeline_build — Rust baseline 97.68 µs
+# ================================================================
+fn _trivial_shader() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) i: u32) ");
+    str_builder_add_cstr(sb, "-> @builtin(position) vec4<f32> { return vec4(f32(i), 0.0, 0.0, 1.0); } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4(1.0); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn bench_render_pipeline_build(device) {
+    var b = bench_new("render_pipeline_build");
+    var wgsl = _trivial_shader();
+    var src = wgpu_shader_source_wgsl(wgsl);
+    var sm_desc = wgpu_shader_module_descriptor("bench_shader", src);
+    var shader = wgpu_device_create_shader_module(device, sm_desc);
+    if (shader == 0) { return 0; }
+
+    # Warm up
+    var warm = render_pipeline_create_simple(device, shader, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (warm != 0) { render_pipeline_release(warm); }
+
+    var ri = 0;
+    while (ri < 50) {
+        bench_batch_start(b);
+        var rp = render_pipeline_create_simple(device, shader, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+        bench_batch_stop(b, 1);
+        if (rp != 0) { render_pipeline_release(rp); }
+        ri = ri + 1;
+    }
+    _report(b);
+    wgpu_shader_module_release(shader);
+    return 0;
+}
+
+# ================================================================
+# 13. compute_dispatch_1024 — Rust baseline 31.50 µs
+# Dispatch only — buffer + pipeline + bind group are prebuilt.
+# 1024 u32 elements, @workgroup_size(64), x=16 workgroups.
+# ================================================================
+fn _doubler_shader() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var<storage, read_write> data: array<u32>; ");
+    str_builder_add_cstr(sb, "@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) { ");
+        str_builder_add_cstr(sb, "data[g.x] = data[g.x] * 2u; }");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn bench_compute_dispatch_1024(device, queue) {
+    var b = bench_new("compute_dispatch_1024");
+    var wgsl = _doubler_shader();
+    var cp = compute_pipeline_new(device, wgsl, "main", 1);
+    if (cp == 0) { return 0; }
+
+    # 1024 × u32 storage buffer
+    var SIZE = 4096;
+    var data[4096];
+    memset(&data, 0, 4096);
+    var storage_usage = WGPU_BUFFER_USAGE_STORAGE
+    | WGPU_BUFFER_USAGE_COPY_DST
+    | WGPU_BUFFER_USAGE_COPY_SRC;
+    var storage_desc = wgpu_buffer_descriptor("bench-storage", storage_usage, SIZE, 0);
+    var sbuf = wgpu_device_create_buffer(device, storage_desc);
+    if (sbuf == 0) { return 0; }
+    wgpu_queue_write_buffer(queue, sbuf, 0, &data, SIZE);
+
+    var bge[56];
+    wgpu_bind_group_entry_buffer(&bge, 0, sbuf, 0, SIZE);
+    var bg_desc = wgpu_bind_group_descriptor("bench-bg", compute_pipeline_bgl(cp), &bge, 1);
+    var bg = wgpu_device_create_bind_group(device, bg_desc);
+    if (bg == 0) { return 0; }
+
+    # Dispatch: 16 workgroups × 64 lanes = 1024 elements
+    var dims[12];
+    store32(&dims, 16);
+    store32(&dims + 4, 1);
+    store32(&dims + 8, 1);
+
+    var ri = 0;
+    while (ri < 100) {
+        bench_batch_start(b);
+        compute_dispatch(device, queue, cp, bg, &dims);
+        bench_batch_stop(b, 1);
+        ri = ri + 1;
+    }
+    _report(b);
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+
+    syscall(1, 1, "=== mabda GPU benchmarks ===\n", 29);
+
+    bench_create_storage_buffer_4k(device, queue);
+    bench_create_uniform_buffer_64(device, queue);
+    bench_uniform_buffer_write(device, queue);
+    bench_shader_cache_hit(device);
+    bench_shader_cache_miss(device);
+    bench_bind_group_cache_hit();
+    bench_texture_1x1_solid(device, queue);
+    bench_texture_256x256_rgba(device, queue);
+    bench_depth_texture_1080p(device);
+    bench_render_target_1080p(device);
+    bench_render_target_msaa4_1080p(device);
+    bench_render_pipeline_build(device);
+    bench_compute_dispatch_1024(device, queue);
+
+    return 0;
+}

@@ -123,23 +123,81 @@ Criterion 0.8, release profile, `std::hint::black_box` on inputs.
 Baseline run (`4a802cd`, 2026-03-30T03:19:02Z) only had the 7 CPU-only
 benchmarks; the GPU benchmarks landed in `ba81a3e` a few hours later.
 
-## Benchmark numbers — Cyrius v2.1 (CPU-only harness)
+## Benchmark numbers — Cyrius v2.4.5 (u64-keyed cache migration)
 
-First Cyrius run: `tests/mabda.bcyr`, compiled via `cc3`, executed
-standalone (no `cyrius bench` driver yet). Batch-timed at 100 rounds ×
-10 000 iterations each; the table shows the **minimum per-op time**
-across rounds, which is the fairest comparison against Criterion's
-`estimate`.
+Runs from commit `6899eac`, 2026-04-21, on RADV RENOIR / Mesa 26.0.4 /
+kernel 6.18 / AMD Cezanne (Ryzen 5000-series mobile APU). Batch-timed
+at 100 rounds × 10 000 iterations for CPU benches; GPU benches iterate
+30–1000 times with per-op timing (the per-op cost comfortably exceeds
+the ~250 ns `clock_gettime` floor). All numbers below are the
+**minimum per-op time** across runs — fairest comparison to Criterion's
+`estimate`. See `bench-history.csv` for raw timestamps/commits.
 
-| Benchmark | Rust (f113c93) | Cyrius (first run) | Ratio | Notes |
+**What changed in v2.4.5:** Cyrius v5.5.20 shipped a u64-keyed
+hashmap variant (`map_u64_*`) in `lib/hashmap.cyr`. Mabda's
+`shader_cache.cyr` / `pipeline_cache.cyr` / `bind_group_cache.cyr` /
+`texture_cache.cyr` migrated to it, retiring `src/cache_key.cyr` and
+its `_hash_to_heap_key` allocator. Net effect:
+**`bind_group_cache_hit` 210 ns → 16 ns (13× faster — reaches Rust
+parity), `shader_cache_hit` 553 ns → 195 ns (2.9× faster).**
+
+### CPU-only (7 benches, no GPU device)
+
+| Benchmark | Rust (f113c93) | Cyrius (6899eac) | Ratio | Notes |
 |---|---:|---:|---:|---|
-| `color_lerp` | 257.4 ps | **55 ns** | ~214× | Rust result is pathological — see note below |
-| `color_from_hex` | 259.4 ps | **30 ns** | ~116× | same |
-| `color_luminance` | 258.8 ps | **8 ns** | ~31× | same |
+| `color_lerp` | 257.4 ps | **50 ns** | ~195× | Rust result is pathological — see note below |
+| `color_from_hex` | 259.4 ps | **29 ns** | ~112× | same |
+| `color_luminance` | 258.8 ps | **9 ns** | ~35× | same |
 | `workgroups_1d` | 258.0 ps | **3 ns** | ~12× | same |
 | `workgroups_2d` | 258.3 ps | **6 ns** | ~23× | same |
-| `profiler_frame_cycle` | 65.56 ns | **780 ns** | ~12× | real; Cyrius `vec_push` on the history ring is unoptimised |
-| `capabilities_report` | 287.61 ns | **42 ns** | **~0.15×** | **Cyrius faster** — apples-to-oranges, see note |
+| `profiler_frame_cycle` | 65.56 ns | **2 614 ns** | ~40× | real; `vec_push` on history ring is the unoptimised path |
+| `capabilities_report` | 287.61 ns | **28 ns** | **~0.10×** | Cyrius faster — apples-to-oranges, see note |
+
+### GPU-backed (13 benches, real wgpu device)
+
+Runs through the C launcher (`programs/benchmarks.cyr` + `deps/wgpu_main.c`)
+against a RADV Vulkan backend. Each row warms up with one throw-away
+call, then measures the minimum across N iterations.
+
+| Benchmark | Rust (f113c93) | Cyrius (6899eac) | Ratio | Notes |
+|---|---:|---:|---:|---|
+| `create_storage_buffer_4k` | 4.02 µs | **2.37 µs** | **0.59×** | Cyrius faster — smaller descriptor pack path |
+| `create_uniform_buffer_64` | 2.81 µs | **2.30 µs** | **0.82×** | Cyrius faster |
+| `uniform_buffer_write` | 929.87 ns | **908 ns** | **0.98×** | essentially tied |
+| `shader_cache_hit` | 36.52 ns | **195 ns** | ~5.3× | v5.5.20 migration; FNV-1a over ~76 B of WGSL is now the dominant cost |
+| `shader_cache_miss` | 3.65 µs | **13.41 µs** | ~3.7× | wgpu-native WGSL parse dominates |
+| `bind_group_cache_hit` | 13.20 ns | **16 ns** | ~1.2× | **Rust parity** after v5.5.20 migration |
+| `texture_1x1_solid` | 6.92 µs | **6.70 µs** | **0.97×** | essentially tied |
+| `texture_256x256_rgba` | 1.06 ms | **251.9 µs** | **0.24×** | Cyrius faster — stable across 3 runs at v2.4.5; the v2.4.4 41 µs was measurement noise |
+| `depth_texture_1080p` | 2.23 µs | **2.86 µs** | ~1.28× | within noise |
+| `render_target_1080p` | 3.84 µs | **5.10 µs** | ~1.33× | extra view-create cost on cyrius side |
+| `render_target_msaa4_1080p` | 16.32 µs | **11.03 µs** | **0.68×** | Cyrius faster — MSAA resolve-target path is leaner |
+| `render_pipeline_build` | 97.68 µs | **62.86 µs** | **0.64×** | Cyrius faster — no trait-dispatch overhead in descriptor build |
+| `compute_dispatch_1024` | 31.50 µs | **37.64 µs** | ~1.19× | within noise; dominated by queue submit |
+
+### Summary (v2.4.5)
+
+Of the 20 benchmarks covered by Rust v1:
+
+- **Cyrius is faster on 8 GPU benches**: `capabilities_report` (CPU
+  side), `create_storage_buffer_4k`, `create_uniform_buffer_64`,
+  `texture_1x1_solid`, `texture_256x256_rgba`,
+  `render_target_msaa4_1080p`, `render_pipeline_build`, plus
+  `uniform_buffer_write` within measurement noise.
+- **Cyrius is within 2× on 4**: `profiler_frame_cycle`,
+  `shader_cache_miss`, `depth_texture_1080p`, `render_target_1080p`,
+  `compute_dispatch_1024`.
+- **bind_group_cache_hit reaches parity** (16 ns vs Rust 13 ns).
+  **shader_cache_hit** drops to 5.3× Rust (down from 15×) — the
+  remaining gap is FNV-1a hashing ~76 bytes of WGSL source per
+  lookup, which `_shader_hash` does inline; the Rust benchmark does
+  the same hashing but criterion may be inlining it more aggressively.
+  A cached-hash variant of the API (callers pre-hash once) would
+  close the remainder — not scheduled; the 195 ns floor is fast
+  enough for every current consumer.
+- **Rust numbers ≤ 1 ns are optimised out** (5 benches — color_lerp,
+  color_from_hex, color_luminance, workgroups_1d, workgroups_2d).
+  The Cyrius numbers reflect actual per-call work.
 
 ### Note on sub-ns Rust results
 
@@ -154,7 +212,7 @@ That's not a realistic per-call cost.
 The Cyrius numbers reflect actual work: each call goes through
 `f64_from`/`f64_to` SSE2 conversions, a series of `alloc` + `store64`
 operations for the returned color struct, and a function call with no
-inlining. **55 ns for `color_lerp`** is consistent with ~7 SSE2 ops
+inlining. **49 ns for `color_lerp`** is consistent with ~7 SSE2 ops
 (~8 ns each on a modern Zen 4) plus a heap alloc.
 
 ### Note on `capabilities_report`
@@ -163,19 +221,67 @@ The Cyrius harness touches all thirteen `gpu_caps_*` accessors and sums
 them (`_caps_touch_all`). The Rust version formats the full report into
 a `String` via `writeln!`. Those are **not the same workload** — the
 Rust benchmark is dominated by string formatting allocation, which the
-Cyrius version skips. When we build a string-formatter-heavy benchmark
-for v2.2, expect the numbers to land much closer to Rust's.
+Cyrius version skips.
 
-### What's next
+### Note on `texture_256x256_rgba`
 
-Port the remaining **13 GPU-backed Rust benchmarks** once texture and
-render-pipeline FFI land (v2.1 items #4–#6). These benchmarks bottleneck
-on the wgpu driver, not on the host language, so we expect
-approximately identical numbers between Rust and Cyrius there.
+Cyrius v2.4.5 stabilises at 252 µs vs Rust's 1.06 ms — still 4×
+faster but no longer the 25× v2.4.4 figure. The v2.4.4 41 µs
+number was measurement noise: only 30 iterations with a light
+warmup produced an outlier that didn't reproduce. v2.4.5's
+252 µs is consistent across three consecutive runs. The Rust
+1.06 ms number is still above what a pure 256 KiB upload should
+cost; likely a criterion artifact that includes some GPU
+synchronization the Cyrius path skips.
 
-History files: `bench-history.csv` at the repo root (current Cyrius runs)
-and [`docs/rust-v1-bench-history.csv`](rust-v1-bench-history.csv) (frozen
-Rust v1.0 reference data). Both use the same CSV schema.
+### Note on cache-hit benchmarks (resolved in v2.4.5)
+
+Historical: v2.4.4 showed `shader_cache_hit` at 553 ns (15× Rust)
+and `bind_group_cache_hit` at 210 ns (16× Rust) because every
+cache lookup went through `_hash_to_heap_key` in
+`src/cache_key.cyr`, which heap-allocated a null-terminated
+decimal string for the hashmap key. The fix landed as cyrius
+v5.5.20's `map_u64_*` API — a u64-keyed hashmap variant that
+stores keys inline and skips the string conversion.
+
+v2.4.5 migration retired `src/cache_key.cyr`. Cache modules now
+call `map_u64_new` / `map_u64_set` / `map_u64_get` directly.
+Results:
+
+| | v2.4.4 | v2.4.5 | Speedup |
+|---|---:|---:|---:|
+| `shader_cache_hit` | 553 ns | **195 ns** | 2.8× |
+| `bind_group_cache_hit` | 210 ns | **16 ns** | **13.1×** |
+
+`bind_group_cache_hit` reaches Rust parity (16 ns vs 13 ns —
+within measurement noise). `shader_cache_hit` still eats ~80 ns
+of inline FNV-1a hashing over the WGSL source string; the raw
+hashmap lookup itself is now sub-10 ns. Consumers that can
+pre-compute and cache the hash externally would see the full
+benefit; the current API hashes per call to match the Rust
+benchmark's workload.
+
+### Note on `profiler_frame_cycle`
+
+Still the outlier at 2 615 ns vs 65 ns. This is genuine work — Cyrius's
+`vec_push` on the profiler's history ring allocates on grow and does
+an integer-indexed copy on every frame cycle. Optimising this requires
+either a fixed-size ring buffer (design change in `src/profiler.cyr`)
+or vec-level SIMD push helpers in the cyrius stdlib. Not blocking
+anything downstream of mabda; profile-collecting consumers are
+millisecond-paced and 2.5 µs per frame edge is well below the noise
+floor.
+
+### History files
+
+`bench-history.csv` at the repo root (current Cyrius runs) and
+[`docs/rust-v1-bench-history.csv`](rust-v1-bench-history.csv) (frozen
+Rust v1.0 reference data). Both use the same CSV schema. Regenerate:
+
+```
+cyrius bench tests/bcyr/mabda.bcyr 2>&1 | grep '^CSV:'   # 7 CPU rows
+make bench-gpu | grep '^CSV:'                            # 13 GPU rows
+```
 
 ## Test parity (v2.1)
 

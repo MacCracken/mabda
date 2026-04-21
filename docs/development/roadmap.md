@@ -20,6 +20,8 @@ native backend lands, consumer code will not change by a single byte.
   v2.4.1  ───▶  sakshi observability            (structured logging + spans — additive)
   v2.4.2  ───▶  GPU runtime validation          (FFI offset/enum sweep + compute E2E actually runs on GPU)
   v2.4.3  ───▶  render-pass FFI + render E2E    (v1.0 checklist closed)
+  v2.4.4  ───▶  benchmark parity with Rust v1   (13 GPU benches + 2 latent FFI stubs fixed)
+  v2.4.5  ───▶  cache hot-path unblock          (u64-keyed hashmap migration — bind_group_cache_hit hits Rust parity)
   v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
@@ -266,6 +268,61 @@ caught the originals — the provable foundation v2.4.3 can build on.
 ### v1.0 tick
 - **Compute dispatch end-to-end** — now runs on real hardware.
   Last open v1.0 item is render-pipeline E2E (v2.4.3).
+
+---
+
+## v2.4.5 — Cache Hot-Path Unblock (Shipped)
+
+Narrow patch release. Picks up cyrius v5.5.20's new u64-keyed
+hashmap API (`map_u64_*`) and migrates mabda's four cache modules
+(`shader_cache`, `pipeline_cache`, `bind_group_cache`,
+`texture_cache`) to use it directly. Retires `src/cache_key.cyr`
+and its per-lookup heap-alloc helper.
+
+### Shipped
+- Toolchain pin `5.5.11 → 5.5.20`.
+- Cache modules rewritten to use `map_u64_*` directly.
+- `src/cache_key.cyr` deleted.
+- `programs/benchmarks.cyr` cache-hit iteration counts relaxed
+  (the arena-exhaustion risk that forced the cap is gone).
+
+### Headline
+- `bind_group_cache_hit` drops **210 ns → 16 ns (13× faster)** —
+  reaches Rust v1 parity (Rust was 13 ns).
+- `shader_cache_hit` drops **553 ns → 195 ns (2.8× faster)**.
+- All other benchmarks within noise of v2.4.4 numbers; 13/13 GPU
+  benches still pass end-to-end.
+
+---
+
+## v2.4.4 — Benchmark Parity with Rust v1 (Shipped)
+
+Ports the 13 GPU-backed Rust benchmarks the v2.1 CPU harness deferred
+so the side-by-side comparison in `docs/benchmarks-rust-v-cyrius.md`
+covers the full 20-benchmark Rust v1 suite. Running the benchmarks on
+real hardware surfaced two more latent FFI stubs that shipped through
+v2.4.3 carrying TODO markers — both fixed in this release.
+
+### Shipped
+- `programs/benchmarks.cyr` with 13 GPU benches; `make bench-gpu`
+  runs them; CSV output pipes into `bench-history.csv`.
+- `tests/bcyr/mabda.bcyr` CPU harness also emits CSV rows.
+- `depth_texture_new` fixed — was calling `wgpu_device_create_buffer`
+  (wrong API) with broken descriptor offsets; now uses the shared
+  `wgpu_texture_descriptor` builder and `wgpu_device_create_texture`.
+- `rtb_build` fixed — was a stub that never created GPU resources;
+  now creates the main render-target texture, optional MSAA
+  texture with `sampleCount` patched in place, and optional depth
+  attachment.
+- `docs/benchmarks-rust-v-cyrius.md` expanded with full comparison
+  across all 20 benchmarks.
+
+### Headline
+- Cyrius beats Rust v1 on 7 of 13 GPU benches; within 2× on 4 more.
+- Cache-hit benches (shader + bind-group) are the outliers at ~15×
+  slower — traced to `_hash_to_heap_key` per-lookup heap alloc.
+  A u64-keyed hashmap in the cyrius stdlib would close this; tracked
+  for v2.5+.
 
 ---
 

@@ -5,6 +5,140 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.5] — 2026-04-21
+
+**Cache hot-path unblock via cyrius v5.5.20's u64-keyed hashmap.**
+mabda's cache modules now call `map_u64_*` directly, retiring the
+per-lookup `_hash_to_heap_key` allocation documented in the v2.4.4
+benchmark report. `bind_group_cache_hit` drops **13× (210 ns → 16 ns)
+and reaches Rust v1 parity**; `shader_cache_hit` drops 2.8× (553 ns →
+195 ns).
+
+### Changed
+- **Toolchain pin** `cyrius = "5.5.11" → "5.5.20"` in `cyrius.cyml`.
+  Picks up the `map_u64_*` API in `lib/hashmap.cyr` (see cyrius
+  v5.5.20 CHANGELOG — SplitMix64-hashed, 16 B slot layout, zero alloc
+  on get/has/set-of-existing-key).
+- **`src/shader_cache.cyr`** — `shader_cache_new` / `_get` / `_set` /
+  `_get_or_compile` now back on `map_u64_*`. The FNV-1a hash
+  (`_shader_hash`) output goes straight into the map as the u64 key;
+  no more decimal-string conversion.
+- **`src/pipeline_cache.cyr`**, **`src/bind_group_cache.cyr`**,
+  **`src/texture.cyr`** (texture_cache helpers) — same migration.
+  Callers pass raw u64 hash keys.
+- **`programs/benchmarks.cyr`** — `shader_cache_hit` and
+  `bind_group_cache_hit` iteration caps relaxed (10 × 1000 → 100 ×
+  10 000); the arena-exhaustion risk that forced the cap in v2.4.4
+  is gone with the new zero-alloc hit path.
+
+### Removed
+- **`src/cache_key.cyr`** deleted. The `_hash_to_heap_key` helper
+  (decimal-string conversion for cstr-keyed hashmap keys) is no
+  longer needed. `src/lib.cyr` and `cyrius.cyml`'s `[lib] modules`
+  list updated to drop the include. Three `programs/*.cyr` that
+  selectively included `src/cache_key.cyr` also dropped the line.
+
+### Unblocked
+- Cache-hit cost is no longer a gating item for v2.5.0 render graph.
+  Graph-node lookups (compute + render + copy + transient) all land
+  in the cache modules touched here; the new 16-ns floor means cache
+  overhead stays well below the render-pass ~5 µs setup cost.
+
+### Metrics
+- **Benchmarks**: 20 (unchanged). New v2.4.5 rows in
+  `bench-history.csv` at commit `6899eac`.
+- **Tests**: 343 assertions (unchanged).
+- **Source lines**: ~4,150 (−26 net — cache_key.cyr deletion
+  outweighed the cache modules getting slightly leaner).
+- **Dist bundle**: `dist/mabda.cyr` regenerated.
+- **GPU integration**: phase0 10/10, compute_e2e 7/7, render_e2e 8/8,
+  bench-gpu 13/13 all pass on RADV / Mesa 26.0.
+
+### Next
+- v2.5.0 — render graph (DAG pass orchestration). Foundation now
+  has a zero-alloc cache-lookup floor, so graph-node dedup is cheap.
+
+---
+
+## [2.4.4] — 2026-04-21
+
+**Benchmark parity with Rust v1.0 — full 20-benchmark suite.** Ports
+the 13 GPU-backed Rust benchmarks that v2.1's CPU harness deferred.
+Exercising them on real hardware surfaced two more latent FFI stubs
+that shipped through v2.4.3 (both carried TODO comments — neither
+ever ran against wgpu-native). v2.4.4 fixes those, lands the full
+benchmark harness, and records a side-by-side comparison to Rust v1
+in `docs/benchmarks-rust-v-cyrius.md`.
+
+See the doc for per-benchmark numbers; headline: **Cyrius is faster
+than Rust v1 on 7 of 13 GPU benchmarks**, within 2× on 4 more, and
+notably slower only on the two cache-hit benches (which route through
+a per-lookup heap alloc — tracked for a u64-keyed-hashmap fix in the
+cyrius stdlib for v2.5+).
+
+### Added
+- **`programs/benchmarks.cyr`** — 13 GPU-backed benchmarks matching
+  the Rust v1 set: `create_storage_buffer_4k`,
+  `create_uniform_buffer_64`, `uniform_buffer_write`,
+  `shader_cache_hit`, `shader_cache_miss`, `bind_group_cache_hit`,
+  `texture_1x1_solid`, `texture_256x256_rgba`, `depth_texture_1080p`,
+  `render_target_1080p`, `render_target_msaa4_1080p`,
+  `render_pipeline_build`, `compute_dispatch_1024`. Uses
+  `lib/bench.cyr` for timing, caps iteration counts per-bench so the
+  alloc arena isn't exhausted by cache benchmarks. Prints both
+  human-readable lines and `CSV:name,ns` rows that pipe straight into
+  `bench-history.csv`.
+- **`make bench-gpu`** — Makefile target linking `programs/benchmarks.cyr`
+  with `deps/wgpu_main.c` (same pattern as `test-phase0` / `test-compute-e2e` /
+  `test-render-e2e`). Output to stdout; pipe through `grep '^CSV:'`
+  for machine-readable rows.
+- **`_csv_row` helper** in `tests/bcyr/mabda.bcyr` — CPU harness now
+  also emits `CSV:` lines so CPU + GPU rows share one capture path.
+- **Expanded `docs/benchmarks-rust-v-cyrius.md`** with the full
+  Cyrius-vs-Rust comparison table for all 20 benchmarks, plus notes
+  on each outlier (sub-ns Rust optimisation-out, `capabilities_report`
+  workload mismatch, `texture_256x256_rgba` Rust-side wait artifact,
+  cache-hit alloc pattern, `profiler_frame_cycle` vec_push cost).
+- **Fresh `bench-history.csv` entries** for all 20 benchmarks at
+  commit `6899eac`, timestamp `2026-04-21T04:25:00Z`.
+
+### Fixed
+- **`src/depth.cyr` — `depth_texture_new` was a latent stub.** The
+  function called `wgpu_device_create_buffer` (wrong API — should be
+  `create_texture`) with a hand-rolled 80-byte descriptor whose field
+  offsets were off by 4 (`size` at +40 vs the correct +36). The
+  returned `DepthTexture` struct stored a zero texture handle and was
+  never actually usable on the GPU — the bug slept behind a `TODO`
+  comment through every release up to v2.4.3. Rewritten to use the
+  shared `wgpu_texture_descriptor` builder (which has correct v29
+  offsets) and `wgpu_device_create_texture` (slot 45), plus a default
+  2D view for use as a render-pass depth attachment.
+- **`src/render_target.cyr` — `rtb_build` was a stub** that stored
+  width/height/format metadata but never created any GPU textures
+  (another `TODO`). Rewritten to create the main render-target
+  texture (with `RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC`
+  usage), an optional N-sample MSAA texture when `sample_count > 1`
+  (patching the descriptor's `sampleCount @ +56` in place because
+  `wgpu_texture_descriptor` hard-codes 1), and an optional depth
+  attachment via `depth_texture_new`.
+- Both functions had ADR 005 `@public` markers; consumers depending on
+  `rtb_build` or `depth_texture_new` would have been relying on a
+  function that silently returned a half-populated struct. Neither
+  fix changes the public API signature.
+
+### Metrics
+- **Benchmarks**: 20 total (7 CPU + 13 GPU) — was 7 (CPU only).
+- **Tests**: 343 assertions (unchanged from v2.4.3).
+- **GPU integration**: phase0 10/10, compute_e2e 7/7, render_e2e 8/8,
+  bench-gpu 13/13 all pass on RADV / Mesa 26.0.
+- **Dist bundle**: `dist/mabda.cyr` regenerated.
+
+### Next
+- v2.5.0 — render graph (DAG pass orchestration). Foundation now
+  covers the full v1.0 surface area on real hardware.
+
+---
+
 ## [2.4.3] — 2026-04-20
 
 **Render-pass FFI + render E2E — v1.0 checklist closed.** Adds the

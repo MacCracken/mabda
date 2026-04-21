@@ -8,7 +8,7 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 2.4.3
+Version: 2.4.5
 
 ## Features
 
@@ -96,7 +96,7 @@ Consumer (soorat, bijli, ...)
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.5.11+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.5.20+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -141,7 +141,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              2.4.3
+├── VERSION              2.4.5
 └── CHANGELOG.md
 ```
 

@@ -14,51 +14,28 @@ var DEPTH_FORMAT_DEPTH32_FLOAT         = 0x30;  # WGPUTextureFormat_Depth32Float
 var DEPTH_FORMAT_DEPTH24_PLUS_STENCIL8 = 0x2F;  # WGPUTextureFormat_Depth24PlusStencil8
 var DEPTH_DEFAULT_FORMAT               = 0x30;
 
-# WGPUTextureDescriptor layout (72 bytes):
-#   +0:  nextInChain (8)
-#   +8:  label (StringView = 16)
-#   +24: usage (u64 flags)
-#   +32: dimension (u32)
-#   +40: size (Extent3D = 12: width u32, height u32, depthOrArrayLayers u32)
-#   +52: format (u32)
-#   +56: mipLevelCount (u32)
-#   +60: sampleCount (u32)
-#   +64: viewFormatCount (u64)
-#   +72: viewFormats (ptr)
-
-fn _depth_texture_descriptor(label, width, height, format) {
-    var desc = alloc(80);
-    memset(desc, 0, 80);
-    if (label != 0) { wgpu_string_view(desc + 8, label); }
-    # usage = RENDER_ATTACHMENT | TEXTURE_BINDING
-    store64(desc + 24, 0x10 | 0x04);
-    # dimension = 2D (1)
-    store32(desc + 32, 1);
-    # size: width, height, depth=1
-    if (width < 1) { width = 1; }
-    if (height < 1) { height = 1; }
-    store32(desc + 40, width);
-    store32(desc + 44, height);
-    store32(desc + 48, 1);
-    # format
-    store32(desc + 52, format);
-    # mipLevelCount = 1
-    store32(desc + 56, 1);
-    # sampleCount = 1
-    store32(desc + 60, 1);
-    return desc;
-}
-
-# Create a depth texture
-# Returns DepthTexture struct pointer
+# Create a depth texture backed by a real WGPUTexture + view.
+# Uses the shared `wgpu_texture_descriptor` builder (which matches v29
+# WGPUTextureDescriptor offsets byte-for-byte: size@+36 NOT +40) and
+# calls `wgpu_device_create_texture` (slot 45 — not create_buffer, which
+# was the latent TODO-marked bug before v2.4.4).
+# Returns DepthTexture struct pointer (40 bytes), or 0 on failure.
 fn depth_texture_new(device, width, height, format) {
-    var desc = _depth_texture_descriptor("depth_texture", width, height, format);
-    var texture = wgpu_device_create_buffer(device, desc);  # TODO: use create_texture
-    # NOTE: actual GPU creation requires wgpuDeviceCreateTexture + wgpuTextureCreateView
-    # which need to be added to wgpu_ffi.cyr. For now, store the descriptor info.
+    if (width < 1)  { width = 1; }
+    if (height < 1) { height = 1; }
+    # usage = RENDER_ATTACHMENT | TEXTURE_BINDING
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var desc = wgpu_texture_descriptor("depth_texture", usage,
+    WGPU_TEXTURE_DIMENSION_2D, width, height, format);
+    var texture = wgpu_device_create_texture(device, desc);
+    if (texture == 0) { return 0; }
+    # Default 2D view that matches the texture's format.
+    var view_desc = wgpu_texture_view_descriptor(0, format,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(texture, view_desc);
     var dt = alloc(40);
-    store64(dt, 0);       # texture handle (populated when FFI available)
-    store64(dt + 8, 0);   # view handle
+    store64(dt, texture);
+    store64(dt + 8, view);
     store32(dt + 16, format);
     store64(dt + 24, width);
     store64(dt + 32, height);

@@ -81,16 +81,63 @@ fn rtb_depth(b, depth_format) {
     return b;
 }
 
-# Build — creates GPU resources
-# Returns RenderTarget ptr (GPU texture creation requires FFI extensions)
+# Build — creates the real GPU texture + view(s) + optional depth attachment.
+# Returns a RenderTarget ptr (GPU resources allocated) or 0 on failure.
+#
+# Single-sampled build: one texture (usage = RENDER_ATTACHMENT | TEXTURE_BINDING
+# | COPY_SRC) + default view.
+# MSAA build: a resolve-sided 1-sample texture (same usage, stored at `view`)
+# PLUS an N-sample MSAA texture (RENDER_ATTACHMENT only — multisampled
+# textures cannot carry TEXTURE_BINDING, wgpu rejects that combo) stored at
+# `msaa_view`. The render-pass builder points `view` at the render target and
+# `resolve_target` at the MSAA view to drive hardware resolve at pass end.
+# With depth_format != 0, a matching depth_texture_new is attached at +56.
 fn rtb_build(b, device) {
+    var width        = load64(b + 0);
+    var height       = load64(b + 8);
+    var format       = load32(b + 16);
+    var sample_count = load32(b + 20);
+    var depth_format = load32(b + 24);
+
     var rt = alloc(RENDER_TARGET_SIZE);
     memset(rt, 0, RENDER_TARGET_SIZE);
-    store32(rt + 16, load32(b + 16));           # format
-    store64(rt + 24, load64(b));                 # width
-    store64(rt + 32, load64(b + 8));             # height
-    store64(rt + 40, load32(b + 20));            # sample_count
-    # TODO: create texture, view, MSAA view, depth via wgpu FFI
-    # (requires wgpuDeviceCreateTexture in function table)
+    store32(rt + 16, format);
+    store64(rt + 24, width);
+    store64(rt + 32, height);
+    store64(rt + 40, sample_count);
+
+    # --- Main (resolve-side on MSAA) texture — 1 sample ---
+    var main_usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+    | WGPU_TEXTURE_USAGE_COPY_SRC;
+    var main_desc = wgpu_texture_descriptor("render_target", main_usage,
+    WGPU_TEXTURE_DIMENSION_2D, width, height, format);
+    var main_tex = wgpu_device_create_texture(device, main_desc);
+    if (main_tex == 0) { return 0; }
+    var main_view_desc = wgpu_texture_view_descriptor(0, format,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var main_view = wgpu_texture_create_view(main_tex, main_view_desc);
+    store64(rt + 0, main_tex);
+    store64(rt + 8, main_view);
+
+    # --- Optional MSAA texture (N samples, RENDER_ATTACHMENT only) ---
+    if (sample_count > 1) {
+        var msaa_usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+        var msaa_desc = wgpu_texture_descriptor("render_target_msaa",
+        msaa_usage, WGPU_TEXTURE_DIMENSION_2D, width, height, format);
+        # Override sampleCount @ +56 (wgpu_texture_descriptor bakes in 1).
+        store32(msaa_desc + 56, sample_count);
+        var msaa_tex = wgpu_device_create_texture(device, msaa_desc);
+        if (msaa_tex != 0) {
+            var msaa_view = wgpu_texture_create_view(msaa_tex, main_view_desc);
+            store64(rt + 48, msaa_view);
+        }
+    }
+
+    # --- Optional depth attachment ---
+    if (depth_format != 0) {
+        var depth = depth_texture_new(device, width, height, depth_format);
+        store64(rt + 56, depth);
+    }
     return rt;
 }
