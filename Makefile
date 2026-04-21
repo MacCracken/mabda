@@ -105,6 +105,10 @@ build/benchmarks: build/benchmarks.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/benchmarks.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+build/render_graph_e2e: build/render_graph_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/render_graph_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
@@ -117,6 +121,10 @@ test-compute-e2e: build/compute_e2e
 test-render-e2e: build/render_e2e
 	./build/render_e2e
 
+.PHONY: test-render-graph-e2e
+test-render-graph-e2e: build/render_graph_e2e
+	./build/render_graph_e2e
+
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows
 # that scripts/bench-record.sh can append to bench-history.csv.
@@ -126,7 +134,7 @@ bench-gpu: build/benchmarks
 
 # Developer gate: run every GPU integration program in sequence.
 .PHONY: test-gpu
-test-gpu: test-phase0 test-compute-e2e test-render-e2e
+test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e
 
 # CI gate: syntax + semantic check every programs/*.cyr without needing
 # wgpu-native on the runner. Fails on any cyrius warning/error coming from

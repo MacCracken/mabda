@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] — 2026-04-21
+
+**First feature release post-v1.0-parity. Adds a DAG-style render
+graph on top of the now-stable compute + render-pass + copy
+primitives.** Consumers describe a frame as nodes + transient
+resources; the graph topo-sorts and executes every node into a
+single command encoder with one queue submit. Additive only — no
+existing public API changed. Designed to survive the v3.0 backend
+swap unchanged.
+
+### Added
+- **`src/render_graph.cyr`** — new module. Public API:
+  - `rg_new()` / `rg_release(g)` — graph lifetime.
+  - `rg_label(g, cstr)` / `rg_aliasing(g, on)` — attributes.
+  - `rg_add_compute(g, pipeline, bg, dims_xyz, label)` → node_id.
+  - `rg_add_render(g, pass_builder, pipeline, draw_verts, label)` → node_id.
+    `pipeline = 0` + `draw_verts = 0` ⇒ clear-only pass.
+  - `rg_add_copy_buf_buf(g, src, src_off, dst, dst_off, size)` → node_id.
+  - `rg_add_copy_tex_buf(g, args72)` → node_id. `args72` is a pointer
+    to a 72-byte WgpuCopyTexToBufArgs — same layout as the v2.4.3
+    render-pass FFI shim.
+  - `rg_add_transient_buffer(g, size, usage, label)` → res_id.
+  - `rg_add_transient_texture(g, w, h, format, usage, label)` → res_id.
+  - `rg_node_reads(g, node_id, res_id)` / `rg_node_writes(...)` — drive
+    the Kahn toposort and (future) aliasing analysis.
+  - `rg_build(g, device)` — validate dependency graph + allocate
+    transient GPU resources. Returns 0 on success, 1 on cycle.
+  - `rg_execute(g, device, queue)` — one encoder, one submit. Returns
+    0 on success, 1 on unbuilt-graph / null device or queue / encoder
+    failure.
+- **`programs/render_graph_e2e.cyr`** — 3-node integration test
+  (compute doubler → render clear-to-red → copy_texture_to_buffer).
+  Verifies compute output matches `[2, 4, 6, ... 16]` and readback
+  pixel(0,0) = `(0xFF, 0x00, 0x00, 0xFF)` exact. All 5 assertions
+  pass first try on RADV / Mesa 26.0.
+- **`make test-render-graph-e2e`** Makefile target. Added to the
+  aggregate `test-gpu` gate.
+- **`docs/guides/render-graph.md`** — authoring guide with the three-
+  node example, node-kind table, reads/writes semantics, execution
+  contract, when-NOT-to-use section, and out-of-scope list.
+- **44 new CPU regression assertions** (343 → 387) in
+  `tests/tcyr/mabda.tcyr`. Cover graph construction, transient
+  recording, reads/writes guards, build idempotence, linear-chain
+  and diamond topological sort, null-handle short-circuits, and the
+  aliasing flag round-trip.
+
+### Scope
+
+- **Linear DAG only.** Cycles return error from `rg_build`. Out-of-order
+  insertion: toposort respects writer→reader edges only in insertion
+  direction, which effectively validates the user supplied a correct
+  linear ordering. Full multi-version read/write tracking (programmatic
+  consumers that build graphs out of execution order) is v2.5.1+ work.
+- **No automatic barrier insertion.** wgpu-native handles layout
+  transitions and memory barriers. v3.0's native backend revisits this.
+- **Aliasing pass scaffolded but OFF by default.** `rg_aliasing(g, 1)`
+  flips a flag the current build path does not yet consume — every
+  transient gets its own allocation. Alias-pass implementation lands
+  when a consumer asks for memory-tight frames.
+- **Single-queue only.** Cross-queue coordination moves to v3.1 with
+  multi-queue support.
+
+### Metrics
+- **Modules**: 30 (was 29 — +`render_graph.cyr`).
+- **Source lines**: ~4,500 (+~350 render_graph).
+- **Tests**: 387 assertions (was 343 — +44 render graph).
+- **Programs**: 5 (was 4 — +`render_graph_e2e.cyr`).
+- **FFI slots**: 65 (unchanged; render_graph dispatches through
+  existing slots — render pass FFI from v2.4.3, compute FFI from
+  v2.0, copy from v2.0).
+- **Dist bundle**: `dist/mabda.cyr` regenerated.
+- **GPU integration**: phase0 10/10, compute_e2e 7/7, render_e2e 8/8,
+  render_graph_e2e 5/5, bench-gpu 13/13 all pass.
+
+### Next
+- v2.5.1+ — full out-of-order toposort, aliasing pass, per-pass
+  debug labels in the command encoder (nested `debug_push` wrap
+  around each node).
+- v3.0 — pure Cyrius GPU backend. The render graph's public surface
+  does not change; only the dispatch primitives it calls get
+  replaced.
+
+---
+
 ## [2.4.5] — 2026-04-21
 
 **Cache hot-path unblock via cyrius v5.5.20's u64-keyed hashmap.**

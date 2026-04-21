@@ -1455,6 +1455,215 @@ fn test_audit_render_target_rgba8_rejects_invalid() {
     return 0;
 }
 
+# ================================================================
+# v2.5.0 — render graph
+# ================================================================
+
+fn test_rg_new_initial_state() {
+    var g = rg_new();
+    assert_neq(g, 0, "rg_new allocates a graph");
+    assert_eq(rg_node_count(g), 0, "new graph has no nodes");
+    assert_eq(rg_transient_count(g), 0, "new graph has no transients");
+    assert_eq(rg_is_built(g), 0, "new graph is not built");
+    return 0;
+}
+
+fn test_rg_add_compute_returns_incrementing_ids() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var n0 = rg_add_compute(g, 0, 0, &dims, "a");
+    var n1 = rg_add_compute(g, 0, 0, &dims, "b");
+    var n2 = rg_add_compute(g, 0, 0, &dims, "c");
+    assert_eq(n0, 0, "first compute node id = 0");
+    assert_eq(n1, 1, "second compute node id = 1");
+    assert_eq(n2, 2, "third compute node id = 2");
+    assert_eq(rg_node_count(g), 3, "node count reflects adds");
+    return 0;
+}
+
+fn test_rg_add_render_and_copy_nodes() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r = rg_add_render(g, 0, 0, 0, "render");
+    var c = rg_add_copy_buf_buf(g, 0, 0, 0, 0, 64);
+    var k = rg_add_compute(g, 0, 0, &dims, "cmp");
+    assert_eq(r, 0, "render node id");
+    assert_eq(c, 1, "copy node id");
+    assert_eq(k, 2, "compute node id");
+    assert_eq(rg_node_count(g), 3, "three mixed-kind nodes");
+    return 0;
+}
+
+fn test_rg_add_transient_buffer_incrementing_ids() {
+    var g = rg_new();
+    var r0 = rg_add_transient_buffer(g, 4096, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 256,  0x04, "r1");
+    assert_eq(r0, 0, "first transient id = 0");
+    assert_eq(r1, 1, "second transient id = 1");
+    assert_eq(rg_transient_count(g), 2, "two transients recorded");
+    return 0;
+}
+
+fn test_rg_add_transient_texture() {
+    var g = rg_new();
+    var t0 = rg_add_transient_texture(g, 1920, 1080, 18, 0x10, "rt");
+    assert_eq(t0, 0, "first transient texture id = 0");
+    assert_eq(rg_transient_count(g), 1, "one transient recorded");
+    return 0;
+}
+
+fn test_rg_node_reads_writes_guards_out_of_range() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    assert_eq(rg_node_reads(g, 0 - 1, 0), 0,
+    "reads(-1, _) short-circuits");
+    assert_eq(rg_node_reads(g, 99, 0), 0,
+    "reads(out-of-range, _) short-circuits");
+    assert_eq(rg_node_writes(g, 0 - 1, 0), 0,
+    "writes(-1, _) short-circuits");
+    assert_eq(rg_node_writes(g, 99, 0), 0,
+    "writes(out-of-range, _) short-circuits");
+    return 0;
+}
+
+fn test_rg_build_sets_built_flag() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    assert_eq(rg_build(g, 0), 0, "rg_build succeeds on trivial graph");
+    assert_eq(rg_is_built(g), 1, "built flag set after rg_build");
+    return 0;
+}
+
+fn test_rg_build_empty_graph_is_fine() {
+    var g = rg_new();
+    assert_eq(rg_build(g, 0), 0, "rg_build on empty graph returns 0");
+    assert_eq(rg_is_built(g), 1, "built flag still set for empty graph");
+    return 0;
+}
+
+fn test_rg_build_is_idempotent() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_build(g, 0);
+    assert_eq(rg_build(g, 0), 0,
+    "second rg_build short-circuits to success");
+    return 0;
+}
+
+fn test_rg_build_linear_chain_preserves_order() {
+    # A writes r0, B reads r0 — sort order must be A, B.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    assert_eq(rg_build(g, 0), 0, "linear chain builds");
+    # After rg_build, nodes[0].sort_idx == 0, nodes[1].sort_idx == 1.
+    var nodes = load64(g + 0);
+    assert_eq(load64(vec_get(nodes, 0) + 48), 0,
+    "A sort_idx = 0");
+    assert_eq(load64(vec_get(nodes, 1) + 48), 1,
+    "B sort_idx = 1");
+    return 0;
+}
+
+fn test_rg_build_diamond_shape() {
+    # A writes r0; B and C both read r0; D reads r0 and depends on
+    # both B and C indirectly via a write to r1 and r2 respectively.
+    # For v2.5.0 insertion-order semantics, A is sort 0, then B/C in
+    # insertion order, then D last.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    rg_node_reads(g, c, r0);
+    var d = rg_add_compute(g, 0, 0, &dims, "D");
+    rg_node_reads(g, d, r0);
+    assert_eq(rg_build(g, 0), 0, "diamond graph builds");
+    var nodes = load64(g + 0);
+    assert_eq(load64(vec_get(nodes, 0) + 48), 0, "A first");
+    # B, C, D ordering among themselves: all have in-degree 1 then
+    # drop to 0 together once A drains; queue processes them in
+    # insertion order B, C, D. Sort idx 1, 2, 3.
+    assert_eq(load64(vec_get(nodes, 1) + 48), 1, "B second");
+    assert_eq(load64(vec_get(nodes, 2) + 48), 2, "C third");
+    assert_eq(load64(vec_get(nodes, 3) + 48), 3, "D last");
+    return 0;
+}
+
+fn test_rg_execute_unbuilt_fails_fast() {
+    # rg_execute must refuse a graph that hasn't been built yet.
+    var g = rg_new();
+    assert_eq(rg_execute(g, 0, 0), 1,
+    "rg_execute on unbuilt graph returns 1 (error)");
+    return 0;
+}
+
+fn test_rg_execute_null_device_fails_fast() {
+    # After build, executing against a null device should return
+    # non-zero (the inner wgpu_device_create_command_encoder returns
+    # 0; rg_execute propagates the failure).
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    rg_build(g, 0);
+    # Without a real device fn-table, wgpu_device_create_command_encoder
+    # returns 0 and rg_execute returns 1.
+    assert_eq(rg_execute(g, 0, 0), 1,
+    "rg_execute with null device returns 1");
+    return 0;
+}
+
+fn test_rg_transient_handle_before_build_is_label_ptr() {
+    # Before rg_build, the handle slot holds the label pointer (the
+    # struct layout doubles the slot up as a staging area). This is
+    # a load-bearing implementation detail documented in the module
+    # header — the assertion guards against accidental refactors.
+    var g = rg_new();
+    var r = rg_add_transient_buffer(g, 64, 0x08, "label-str");
+    # Before build, handle field holds the label pointer.
+    assert_neq(rg_transient_handle(g, r), 0,
+    "pre-build handle slot holds label ptr, not 0");
+    return 0;
+}
+
+fn test_rg_transient_handle_out_of_range() {
+    var g = rg_new();
+    rg_add_transient_buffer(g, 64, 0x08, "r");
+    assert_eq(rg_transient_handle(g, 0 - 1), 0,
+    "rg_transient_handle(-1) = 0");
+    assert_eq(rg_transient_handle(g, 99), 0,
+    "rg_transient_handle(out-of-range) = 0");
+    assert_eq(rg_transient_view(g, 0 - 1), 0,
+    "rg_transient_view(-1) = 0");
+    assert_eq(rg_transient_view(g, 99), 0,
+    "rg_transient_view(out-of-range) = 0");
+    return 0;
+}
+
+fn test_rg_release_null_is_safe() {
+    assert_eq(rg_release(0), 0, "rg_release(0) is a no-op");
+    return 0;
+}
+
+fn test_rg_aliasing_flag_round_trip() {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    assert_eq(load64(g + 24), 1, "aliasing flag set to 1");
+    rg_aliasing(g, 0);
+    assert_eq(load64(g + 24), 0, "aliasing flag set to 0");
+    return 0;
+}
+
 fn test_audit_bgl_entry_buffer_offsets() {
     # WGPUBindGroupLayoutEntry is 120 bytes. Buffer sub-struct starts at
     # +32 with its own nextInChain (8 bytes) first; type lives at +40,
@@ -1691,6 +1900,25 @@ fn main() {
     test_audit_rpb_pass_begin_null_encoder();
     test_audit_rpb_pass_begin_empty_short_circuits();
     test_audit_render_target_rgba8_rejects_invalid();
+
+    # v2.5.0 — render graph
+    test_rg_new_initial_state();
+    test_rg_add_compute_returns_incrementing_ids();
+    test_rg_add_render_and_copy_nodes();
+    test_rg_add_transient_buffer_incrementing_ids();
+    test_rg_add_transient_texture();
+    test_rg_node_reads_writes_guards_out_of_range();
+    test_rg_build_sets_built_flag();
+    test_rg_build_empty_graph_is_fine();
+    test_rg_build_is_idempotent();
+    test_rg_build_linear_chain_preserves_order();
+    test_rg_build_diamond_shape();
+    test_rg_execute_unbuilt_fails_fast();
+    test_rg_execute_null_device_fails_fast();
+    test_rg_transient_handle_before_build_is_label_ptr();
+    test_rg_transient_handle_out_of_range();
+    test_rg_release_null_is_safe();
+    test_rg_aliasing_flag_round_trip();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

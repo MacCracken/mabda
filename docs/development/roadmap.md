@@ -22,7 +22,7 @@ native backend lands, consumer code will not change by a single byte.
   v2.4.3  ───▶  render-pass FFI + render E2E    (v1.0 checklist closed)
   v2.4.4  ───▶  benchmark parity with Rust v1   (13 GPU benches + 2 latent FFI stubs fixed)
   v2.4.5  ───▶  cache hot-path unblock          (u64-keyed hashmap migration — bind_group_cache_hit hits Rust parity)
-  v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
+  v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive, shipped)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
        ▼
@@ -387,44 +387,44 @@ with DAG design.
 
 ---
 
-## v2.5.0 — Render Graph (After 2.4.3)
+## v2.5.0 — Render Graph (Shipped)
 
-First feature release post-parity. Adds DAG-style pass orchestration
-on top of the existing `render_pass` + `render_pipeline` +
-`compute` primitives. Additive only — no public API of the
-underlying modules changes, so consumers can opt in at their own
-pace. Designed to survive the 3.0 backend swap unchanged (graph
-execution is pure Cyrius; nodes dispatch through the public mabda
-API, not through FFI directly).
+First feature release post-parity. Added DAG-style pass orchestration
+on top of the stable compute + render-pass + copy primitives. Additive
+only — no existing public API changed.
 
-### Planned scope
-- `src/render_graph.cyr` — new module. Node types: **compute node**
-  (shader + bind group + workgroup dims), **render node** (pipeline
-  + target + draw list), **copy node** (buffer↔buffer, buffer↔texture,
-  texture↔texture), **transient resource** (buffer / texture the
-  graph owns for the duration of a frame).
-- Topological sort + linear execution. No automatic barrier insertion
-  in v2.5 — wgpu-native handles the synchronization we need; the
-  graph only owns the **ordering**.
-- Resource aliasing pass (optional, off by default) — transient
-  buffers/textures with disjoint lifetimes share allocation.
-- `rasa` / `soorat` are the reference consumers. One simple render
-  graph end-to-end program in `programs/` (clear → compute → blit →
-  present).
+### Shipped
+- `src/render_graph.cyr` — new module (350 LOC). Node types:
+  **compute** (pipeline + bind group + dims), **render** (pass
+  builder + optional pipeline + vertex count), **copy_buf_buf** and
+  **copy_tex_buf** (direct and struct-packed encoder dispatch).
+  **Transient resources** — buffers and textures the graph owns
+  between `rg_build` and `rg_release`.
+- Kahn's toposort over insertion-order read/write edges; cycle
+  detection returns error from `rg_build`.
+- Execution: one `WGPUCommandEncoder` for the whole graph + one
+  `queue.submit` — the per-node overhead is zero.
+- 44 new CPU assertions (343 → 387) in `tests/tcyr/mabda.tcyr`.
+- `programs/render_graph_e2e.cyr` — 3-node integration test
+  (compute doubler → render clear-to-red → texture copy). 5/5 pass
+  on RADV / Mesa 26.0.
+- `docs/guides/render-graph.md` — authoring guide with a three-node
+  example, node-kind table, reads/writes semantics, execution
+  contract, out-of-scope list.
+- `make test-render-graph-e2e` Makefile target; added to the
+  aggregate `make test-gpu` gate.
 
-### Out of scope for 2.5.0
-- Cross-queue coordination (moves to 3.1 with multi-queue).
-- Barrier tracking / automatic layout transitions (wgpu handles; the
-  native backend in 3.0 will revisit).
-- Conditional / branching passes. Linear DAG only.
-
-### Exit criteria
-- Render graph module with ≥20 new CPU assertions in
-  `tests/tcyr/mabda.tcyr`.
-- One GPU integration program exercising compute → render → copy
-  in a single graph submission.
-- Documentation: `docs/guides/render-graph.md` — authoring guide with
-  a three-node example.
+### Out of scope (v2.5.1+)
+- Full out-of-order toposort with multi-version read/write
+  tracking — today's sort respects insertion-order edges only,
+  which validates that the user supplied a correct linear order.
+- Resource aliasing pass — the `aliasing_flag` / `first_use` hooks
+  are in place but no pass consumes them yet. Ships when a consumer
+  asks for memory-tight frames.
+- Automatic barrier insertion — wgpu-native handles this; v3.0's
+  native backend revisits.
+- Cross-queue coordination — single-queue only. Moves to v3.1.
+- Conditional / branching passes — linear DAG only.
 
 ---
 

@@ -1,0 +1,224 @@
+# programs/render_graph_e2e.cyr — Render graph E2E GPU test
+#
+# Exercises v2.5.0 render_graph.cyr by building and submitting a
+# three-node graph in a single command-encoder submission:
+#
+#   compute node  — runs a doubler WGSL shader against a storage buffer
+#                   that owns known input values [1..8]; output becomes
+#                   [2..16].
+#   render node   — clears a 256×256 RGBA8 render target to opaque red.
+#   copy node     — copies the render target into a MAP_READ buffer so
+#                   the host can verify the pixel value.
+#
+# After rg_execute the compute buffer and readback buffer are mapped and
+# checked:
+#   - compute[0..7] must equal [2, 4, 6, 8, 10, 12, 14, 16]
+#   - readback[0..3] must equal [0xFF, 0x00, 0x00, 0xFF]
+#
+# Proves the graph:
+#   - allocates transient resources (storage buffer + render-target texture)
+#   - executes three kinds of nodes in one encoder
+#   - submits once at the end (the "ONE queue submit" invariant)
+#
+# Linked with deps/wgpu_main.c via the Makefile target `test-render-graph-e2e`.
+
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/syscalls.cyr"
+include "lib/fnptr.cyr"
+include "lib/hashmap.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/tagged.cyr"
+include "lib/sakshi.cyr"
+
+include "src/error.cyr"
+include "src/color.cyr"
+include "src/wgpu_types.cyr"
+include "src/wgpu_descriptors.cyr"
+include "src/wgpu_ffi.cyr"
+include "src/context.cyr"
+include "src/buffer.cyr"
+include "src/typed_buffer.cyr"
+include "src/compute.cyr"
+include "src/shader_cache.cyr"
+include "src/bind_group_cache.cyr"
+include "src/texture.cyr"
+include "src/render_pipeline.cyr"
+include "src/render_pass.cyr"
+include "src/render_graph.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len) { syscall(1, 2, msg, len); return 1; }
+
+fn _doubler_shader() {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb,
+    "@group(0) @binding(0) var<storage, read_write> data: array<u32>; ");
+    str_builder_add_cstr(sb,
+    "@compute @workgroup_size(8) fn main(@builtin(global_invocation_id) g: vec3<u32>) { ");
+        str_builder_add_cstr(sb,
+        "data[g.x] = data[g.x] * 2u; }");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr) {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    # --- Pre-allocate resources the graph will use ---
+    # Storage buffer for compute (mabda creates; graph references as a
+    # non-transient input). 8 u32 elements = 32 bytes.
+    var input[32];
+    var i = 0;
+    while (i < 8) {
+        store32(&input + i * 4, i + 1);
+        i = i + 1;
+    }
+    var storage_usage = WGPU_BUFFER_USAGE_STORAGE
+    | WGPU_BUFFER_USAGE_COPY_DST
+    | WGPU_BUFFER_USAGE_COPY_SRC;
+    var storage_desc = wgpu_buffer_descriptor("rg-storage",
+    storage_usage, 32, 0);
+    var storage_buf = wgpu_device_create_buffer(device, storage_desc);
+    if (storage_buf == 0) { return _fail("FAIL: storage buffer\n", 21); }
+    wgpu_queue_write_buffer(queue, storage_buf, 0, &input, 32);
+
+    # Compute pipeline + bind group.
+    var wgsl = _doubler_shader();
+    var cp = compute_pipeline_new(device, wgsl, "main", 1);
+    if (cp == 0) { return _fail("FAIL: compute pipeline\n", 23); }
+    var bge[56];
+    wgpu_bind_group_entry_buffer(&bge, 0, storage_buf, 0, 32);
+    var bg_desc = wgpu_bind_group_descriptor("rg-bg",
+    compute_pipeline_bgl(cp), &bge, 1);
+    var bg = wgpu_device_create_bind_group(device, bg_desc);
+    if (bg == 0) { return _fail("FAIL: bind group\n", 17); }
+
+    # Render target + view (graph transient).
+    var W = 256;
+    var H = 256;
+    var rt = texture_create_render_target_rgba8(device, W, H, "rg-rt");
+    if (rt == 0) { return _fail("FAIL: render target\n", 20); }
+    var rt_view = texture_view_create_rgba8(rt, "rg-rt-view");
+
+    # Render pass builder — clear-only, red.
+    var red = color_new(F64_1, F64_0, F64_0, F64_1);
+    var rpb = rpb_pass_new();
+    rpb_pass_label(rpb, "rg-clear-pass");
+    rpb_pass_color(rpb, rt_view, red);
+
+    # Readback buffer (MAP_READ | COPY_DST). 256 × 1024 bytes per row
+    # (bytesPerRow must be 256-aligned; 256 × 4 = 1024 is fine).
+    var READ_SIZE = 262144;
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("rg-readback",
+    read_usage, READ_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return _fail("FAIL: readback\n", 15); }
+
+    syscall(1, 1, "PASS: resources ready\n", 22);
+
+    # --- Build the graph ---
+    var g = rg_new();
+    rg_label(g, "rg-e2e");
+
+    var dims[12];
+    store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, cp, bg, &dims, "compute.double");
+
+    rg_add_render(g, rpb, 0, 0, "render.clear");
+
+    # Pack the copy-tex-to-buffer args matching WgpuCopyTexToBufArgs.
+    var cargs[72];
+    memset(&cargs, 0, 72);
+    store64(&cargs + 0,  rt);              # src_texture
+    store32(&cargs + 8,  0);               # src_mip_level
+    store32(&cargs + 12, 0);               # src_origin_x
+    store32(&cargs + 16, 0);               # src_origin_y
+    store32(&cargs + 20, 0);               # src_origin_z
+    store32(&cargs + 24, 0);               # aspect = All
+    store64(&cargs + 32, read_buf);        # dst_buffer
+    store64(&cargs + 40, 0);               # dst_offset
+    store32(&cargs + 48, 1024);            # dst_bytes_per_row (256 * 4)
+    store32(&cargs + 52, H);               # dst_rows_per_image
+    store32(&cargs + 56, W);               # copy_w
+    store32(&cargs + 60, H);               # copy_h
+    store32(&cargs + 64, 1);               # copy_depth
+    rg_add_copy_tex_buf(g, &cargs);
+
+    if (rg_build(g, device) != 0) {
+        return _fail("FAIL: rg_build\n", 15);
+    }
+    syscall(1, 1, "PASS: graph built (3 nodes)\n", 28);
+
+    if (rg_execute(g, device, queue) != 0) {
+        return _fail("FAIL: rg_execute\n", 17);
+    }
+    syscall(1, 1, "PASS: graph executed\n", 21);
+
+    # --- Verify compute output ---
+    var tmp_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var tmp_desc = wgpu_buffer_descriptor("rg-compute-read", tmp_usage, 32, 0);
+    var tmp_buf = wgpu_device_create_buffer(device, tmp_desc);
+    var enc = wgpu_device_create_command_encoder(device, "rg-verify-enc");
+    wgpu_command_encoder_copy_buffer_to_buffer(enc, storage_buf, 0, tmp_buf, 0, 32);
+    var tcmd = wgpu_command_encoder_finish(enc, "rg-verify-cmd");
+    wgpu_queue_submit_one(queue, tcmd);
+
+    var cstatus = wgpu_buffer_map_sync(device, tmp_buf, WGPU_MAP_MODE_READ, 0, 32);
+    if (cstatus != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("FAIL: map compute output\n", 25);
+    }
+    var cmapped = wgpu_buffer_get_const_mapped_range(tmp_buf, 0, 32);
+    if (cmapped == 0) { return _fail("FAIL: compute mapped range\n", 27); }
+    var j = 0;
+    while (j < 8) {
+        var got = load32(cmapped + j * 4);
+        var expected = (j + 1) * 2;
+        if (got != expected) {
+            wgpu_buffer_unmap(tmp_buf);
+            return _fail("FAIL: compute element mismatch\n", 31);
+        }
+        j = j + 1;
+    }
+    wgpu_buffer_unmap(tmp_buf);
+    syscall(1, 1, "PASS: compute doubled 8/8 elements\n", 35);
+
+    # --- Verify render pass cleared to red ---
+    var rstatus = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, READ_SIZE);
+    if (rstatus != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("FAIL: map readback\n", 19);
+    }
+    var rmapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, READ_SIZE);
+    if (rmapped == 0) { return _fail("FAIL: readback mapped range\n", 28); }
+
+    var r = load8(rmapped + 0);
+    var gr = load8(rmapped + 1);
+    var b = load8(rmapped + 2);
+    var a = load8(rmapped + 3);
+    if (r != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: red\n", 10); }
+    if (gr != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: green\n", 12); }
+    if (b != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: blue\n", 11); }
+    if (a != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: alpha\n", 12); }
+    wgpu_buffer_unmap(read_buf);
+    syscall(1, 1, "PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)\n", 44);
+
+    rg_release(g);
+    syscall(1, 1, "\n5 passed, 0 failed\n", 20);
+    return 0;
+}
