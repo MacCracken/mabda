@@ -1385,6 +1385,76 @@ fn test_audit_load_op_values() {
     return 0;
 }
 
+fn test_audit_color_attachment_size_72() {
+    # v29 WGPURenderPassColorAttachment is 72 bytes (nextInChain@0,
+    # view@8, depthSlice@16+pad, resolveTarget@24, loadOp@32, storeOp@36,
+    # clearValue@40). Pre-fix, mabda had COLOR_ATTACHMENT_SIZE = 64 and
+    # was writing view@0 / loadOp@24 / storeOp@28 / clearValue@32 —
+    # everything off by 8 and the total size wrong by 8 too.
+    assert_eq(COLOR_ATTACHMENT_SIZE, 72,
+    "COLOR_ATTACHMENT_SIZE matches v29 WGPURenderPassColorAttachment (72)");
+    return 0;
+}
+
+fn test_audit_rpb_pass_color_offsets() {
+    # After rpb_pass_color writes an attachment, every field must land at
+    # its v29 offset so the C shim can pass the array through without
+    # repacking. clearColor should be the opaque red we passed.
+    var rpb = rpb_pass_new();
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);  # (1.0, 0.0, 0.0, 1.0)
+    rpb_pass_color(rpb, 0xDEADBEEFCAFEBABE, clear);
+    assert_eq(rpb_pass_color_count(rpb), 1, "one color attachment recorded");
+    var arr = rpb_pass_color_array(rpb);
+    assert_neq(arr, 0, "color array allocated");
+    assert_eq(load64(arr), 0, "att.nextInChain @ +0 is 0");
+    assert_eq(load64(arr + 8), 0xDEADBEEFCAFEBABE, "att.view @ +8");
+    assert_eq(load32(arr + 16), 0xFFFFFFFF,
+    "att.depthSlice @ +16 = WGPU_DEPTH_SLICE_UNDEFINED");
+    assert_eq(load64(arr + 24), 0,
+    "att.resolveTarget @ +24 is 0 when no MSAA");
+    assert_eq(load32(arr + 32), WGPU_LOAD_OP_CLEAR, "att.loadOp @ +32 = Clear");
+    assert_eq(load32(arr + 36), WGPU_STORE_OP_STORE, "att.storeOp @ +36 = Store");
+    # clearValue is 4x f64 — just check r and a matched (1.0 bit-pattern).
+    assert_eq(load64(arr + 40), F64_1, "att.clearValue.r @ +40 = 1.0");
+    assert_eq(load64(arr + 40 + 24), F64_1,
+    "att.clearValue.a @ +64 = 1.0 (opaque)");
+    return 0;
+}
+
+fn test_audit_rpb_pass_begin_null_encoder() {
+    # rpb_pass_begin must refuse a null encoder — otherwise the shim
+    # fncalls into wgpu-native with a NULL handle and crashes inside
+    # Device::create_command_encoder (see v2.4.2 audit).
+    var rpb = rpb_pass_new();
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    rpb_pass_color(rpb, 1, clear);
+    assert_eq(rpb_pass_begin(0, rpb), 0,
+    "rpb_pass_begin(0, rpb) short-circuits");
+    return 0;
+}
+
+fn test_audit_rpb_pass_begin_empty_short_circuits() {
+    # wgpu rejects render passes with zero color attachments when no
+    # depth/stencil is attached either — our dispatcher short-circuits
+    # to 0 before making that trip to the GPU.
+    var rpb = rpb_pass_new();
+    assert_eq(rpb_pass_begin(0xDEAD, rpb), 0,
+    "rpb_pass_begin with empty builder short-circuits");
+    return 0;
+}
+
+fn test_audit_render_target_rgba8_rejects_invalid() {
+    # Same validation envelope as texture_create_rgba8 — 0/neg/>MAX are
+    # rejected before reaching wgpu-native. v2.4.3 LOW.
+    assert_eq(texture_create_render_target_rgba8(0, 0, 256, "w0"), 0,
+    "render_target_rgba8(w=0) rejected");
+    assert_eq(texture_create_render_target_rgba8(0, 256, 0, "h0"), 0,
+    "render_target_rgba8(h=0) rejected");
+    assert_eq(texture_create_render_target_rgba8(0, 9000, 256, "w>max"), 0,
+    "render_target_rgba8(w>MAX) rejected");
+    return 0;
+}
+
 fn test_audit_bgl_entry_buffer_offsets() {
     # WGPUBindGroupLayoutEntry is 120 bytes. Buffer sub-struct starts at
     # +32 with its own nextInChain (8 bytes) first; type lives at +40,
@@ -1614,6 +1684,13 @@ fn main() {
     test_audit_buffer_binding_type_values();
     test_audit_load_op_values();
     test_audit_bgl_entry_buffer_offsets();
+
+    # v2.4.3 — render-pass FFI regressions (5)
+    test_audit_color_attachment_size_72();
+    test_audit_rpb_pass_color_offsets();
+    test_audit_rpb_pass_begin_null_encoder();
+    test_audit_rpb_pass_begin_empty_short_circuits();
+    test_audit_render_target_rgba8_rejects_invalid();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

@@ -19,7 +19,7 @@ native backend lands, consumer code will not change by a single byte.
   v2.4.0  ───▶  v1.0-parity (partial)           (compute E2E, LOW sweep)
   v2.4.1  ───▶  sakshi observability            (structured logging + spans — additive)
   v2.4.2  ───▶  GPU runtime validation          (FFI offset/enum sweep + compute E2E actually runs on GPU)
-  v2.4.3  ───▶  render-pass FFI + render E2E    (closes v1.0 checklist)
+  v2.4.3  ───▶  render-pass FFI + render E2E    (v1.0 checklist closed)
   v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
@@ -269,14 +269,28 @@ caught the originals — the provable foundation v2.4.3 can build on.
 
 ---
 
-## v2.4.3 — Render-pass FFI + Render E2E
+## v2.4.3 — Render-pass FFI + Render E2E (Shipped)
 
 Closes the v1.0 checklist. Adds the wgpu render-pass execution
-surface. Mechanical FFI work — no public mabda API changes;
-`render_pass.cyr` builder gains an actual dispatcher to hand its
-descriptors to. Full plan already in
-`docs/proposals/2026-04-19-render-pass-ffi.md` — the foundation it
-builds on is now proven by v2.4.2's runtime-validated FFI.
+surface on top of v2.4.2's runtime-validated FFI foundation.
+
+### Shipped
+- 7 new FFI slots (58-64) in `deps/wgpu_main.c` + `src/wgpu_ffi.cyr`.
+- 2 struct-packing C shims: `WgpuBeginPassArgs` (40B) and
+  `WgpuCopyTexToBufArgs` (72B).
+- `rpb_pass_begin(encoder, b)` dispatcher in `src/render_pass.cyr`.
+- `texture_create_render_target_rgba8` helper in `src/texture.cyr`.
+- **`programs/render_e2e.cyr`** — 256×256 RGBA8 offscreen render
+  target → clear to `(1.0, 0.0, 0.0, 1.0)` → copy back → verify
+  pixel(0,0) = `0xFF, 0x00, 0x00, 0xFF` exact.
+- Latent `WGPURenderPassColorAttachment` layout bug in
+  `src/render_pass.cyr` fixed (was 56/64 bytes mixed — v29 is 72).
+- 16 new CPU regression assertions (327 → 343).
+- `make test-render-e2e` 8/8 passes on RADV / Mesa 26.0.
+
+### v1.0 tick
+- ✅ **Render pipeline end-to-end draw + readback** — last open
+  v1.0 criterion. Every v1.0 item mabda owns is now live.
 
 ### Planned scope
 - **`wgpu_ffi.cyr` slots 58-63 (approx)** — add:
@@ -456,8 +470,9 @@ version once there's consumer demand plus a clear scope.
 - [x] Render pipeline create / release — `programs/phase0.cyr`
 - [x] Compute dispatch end-to-end test (v2.4.0 wrote the program;
       v2.4.2 got it running on real hardware — `programs/compute_e2e.cyr`)
-- [ ] Render pipeline end-to-end draw + readback (v2.4.3 — needs
-      render-pass FFI expansion)
+- [x] Render pipeline end-to-end draw + readback (v2.4.3 —
+      `programs/render_e2e.cyr`: clear → copy_texture_to_buffer →
+      map → verify pixel matches clear color exactly)
 - [ ] Consumer integration: soorat port to Cyrius (consumer-side, not
       mabda-side — tracked in soorat's repo)
 

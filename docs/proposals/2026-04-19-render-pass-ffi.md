@@ -1,10 +1,12 @@
 # 2026-04-19 — Render-pass FFI expansion (v2.4.2 dependency)
 
 **Owner:** lang agent (upstream; mabda consumes)
-**Consumer:** mabda v2.4.2
-**Status:** open — proposal awaiting lang-agent implementation
-**Blocks:** v2.4.2 closeout (last item on v1.0 parity checklist),
-v2.5.0 render graph
+**Consumer:** mabda v2.4.3 (v2.4.2 was re-carved as GPU runtime
+validation; render-pass work moved forward one release)
+**Status:** **shipped in mabda v2.4.3 — 2026-04-20.** All 7 FFI
+slots landed, both C shims in place, `rpb_pass_begin` dispatcher
+wired, `programs/render_e2e.cyr` passes on RADV / Mesa 26.0.
+**Unblocks:** v2.5.0 render graph.
 
 ---
 

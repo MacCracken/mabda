@@ -158,6 +158,102 @@ void wgpu_shim_resolve_query_set(WGPUCommandEncoder encoder, WgpuResolveArgs* ar
                                       args->destination_offset);
 }
 
+// BeginRenderPass takes a WGPURenderPassDescriptor by pointer — the descriptor
+// itself is built from a mabda-provided packed args struct so the Cyrius side
+// does not have to assemble nested struct-by-value fields itself. The packed
+// color-attachment array Cyrius supplies is already v29-layout-compatible (72
+// bytes per entry, matching WGPURenderPassColorAttachment) so we pass it
+// straight through without repacking. See src/render_pass.cyr for the builder.
+//
+// WgpuBeginPassArgs layout (40 bytes, Cyrius-side matches):
+//   +0:  color_attachments     (const WGPURenderPassColorAttachment*)
+//   +8:  color_attachment_count (u64)
+//   +16: depth_stencil          (const WGPURenderPassDepthStencilAttachment* or NULL)
+//   +24: timestamp_writes       (const WGPUPassTimestampWrites* or NULL)
+//   +32: label                  (const char* or NULL)
+typedef struct {
+    const WGPURenderPassColorAttachment* color_attachments;
+    uint64_t                             color_attachment_count;
+    const WGPURenderPassDepthStencilAttachment* depth_stencil;
+    const WGPUPassTimestampWrites*       timestamp_writes;
+    const char*                          label;
+} WgpuBeginPassArgs;
+
+WGPURenderPassEncoder wgpu_shim_command_encoder_begin_render_pass(
+    WGPUCommandEncoder encoder, const WgpuBeginPassArgs* args) {
+    WGPURenderPassDescriptor desc = {0};
+    if (args->label) {
+        desc.label.data = args->label;
+        desc.label.length = strlen(args->label);
+    }
+    desc.colorAttachmentCount = (size_t)args->color_attachment_count;
+    desc.colorAttachments = args->color_attachments;
+    desc.depthStencilAttachment = args->depth_stencil;
+    desc.timestampWrites = args->timestamp_writes;
+    return wgpuCommandEncoderBeginRenderPass(encoder, &desc);
+}
+
+// CopyTextureToBuffer takes WGPUTexelCopyTextureInfo (src) +
+// WGPUTexelCopyBufferInfo (dst) + WGPUExtent3D (copySize), all
+// struct-by-value in Cyrius-terms. We pack everything flat so the Cyrius side
+// only has to fncall2(_fp, encoder, &args). Layout pinned explicitly — if
+// webgpu.h v29 grows a new field, update here and in Cyrius in lockstep.
+//
+// WgpuCopyTexToBufArgs layout (72 bytes, Cyrius-side matches):
+//   +0:  src_texture        (WGPUTexture)
+//   +8:  src_mip_level      (u32)
+//   +12: src_origin_x       (u32)
+//   +16: src_origin_y       (u32)
+//   +20: src_origin_z       (u32)
+//   +24: aspect             (u32, WGPUTextureAspect_All = 0)
+//   +28: (pad 4)
+//   +32: dst_buffer         (WGPUBuffer)
+//   +40: dst_offset         (u64)
+//   +48: dst_bytes_per_row  (u32)
+//   +52: dst_rows_per_image (u32)
+//   +56: copy_w             (u32)
+//   +60: copy_h             (u32)
+//   +64: copy_depth         (u32)
+//   +68: (pad 4)
+typedef struct {
+    WGPUTexture src_texture;
+    uint32_t    src_mip_level;
+    uint32_t    src_origin_x;
+    uint32_t    src_origin_y;
+    uint32_t    src_origin_z;
+    uint32_t    aspect;
+    uint32_t    _pad0;
+    WGPUBuffer  dst_buffer;
+    uint64_t    dst_offset;
+    uint32_t    dst_bytes_per_row;
+    uint32_t    dst_rows_per_image;
+    uint32_t    copy_w;
+    uint32_t    copy_h;
+    uint32_t    copy_depth;
+    uint32_t    _pad1;
+} WgpuCopyTexToBufArgs;
+
+void wgpu_shim_command_encoder_copy_texture_to_buffer(
+    WGPUCommandEncoder encoder, const WgpuCopyTexToBufArgs* args) {
+    WGPUTexelCopyTextureInfo src = {0};
+    src.texture  = args->src_texture;
+    src.mipLevel = args->src_mip_level;
+    src.origin.x = args->src_origin_x;
+    src.origin.y = args->src_origin_y;
+    src.origin.z = args->src_origin_z;
+    src.aspect   = (WGPUTextureAspect)args->aspect;
+
+    WGPUTexelCopyBufferInfo dst = {0};
+    dst.layout.offset       = args->dst_offset;
+    dst.layout.bytesPerRow  = args->dst_bytes_per_row;
+    dst.layout.rowsPerImage = args->dst_rows_per_image;
+    dst.buffer              = args->dst_buffer;
+
+    WGPUExtent3D size = { args->copy_w, args->copy_h, args->copy_depth };
+
+    wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &size);
+}
+
 // Queue timestamp period returns a float. Cyrius's fncall1 always reads rax
 // as i64, so we reinterpret the f32 as its i32 bit-pattern (zero-extended).
 // Cyrius can decode with f64_from(f32_to_f64_bits(load_as_f32(bits))) if it
@@ -175,7 +271,7 @@ long wgpu_shim_get_timestamp_period_bits(WGPUQueue queue) {
 }
 
 // === Function table ===
-#define FN_COUNT 58
+#define FN_COUNT 65
 static void* fn_table[FN_COUNT];
 
 static void build_fn_table(void) {
@@ -249,6 +345,14 @@ static void build_fn_table(void) {
     fn_table[i++] = (void*)wgpuSurfaceGetCurrentTexture;              // 55
     fn_table[i++] = (void*)wgpuSurfacePresent;                        // 56
     fn_table[i++] = (void*)wgpuSurfaceRelease;                        // 57
+    // Render pass execution (58-64) — v2.4.3
+    fn_table[i++] = (void*)wgpu_shim_command_encoder_begin_render_pass;   // 58 (shim: packs descriptor)
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetPipeline;              // 59
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetBindGroup;             // 60
+    fn_table[i++] = (void*)wgpuRenderPassEncoderDraw;                     // 61
+    fn_table[i++] = (void*)wgpuRenderPassEncoderEnd;                      // 62
+    fn_table[i++] = (void*)wgpuRenderPassEncoderRelease;                  // 63
+    fn_table[i++] = (void*)wgpu_shim_command_encoder_copy_texture_to_buffer;  // 64 (shim: packs src/dst/size)
 }
 
 // Pre-initialize GPU context in C (before Cyrius code runs)

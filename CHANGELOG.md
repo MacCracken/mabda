@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.3] — 2026-04-20
+
+**Render-pass FFI + render E2E — v1.0 checklist closed.** Adds the
+wgpu render-pass execution surface v2.4.0 deferred and v2.4.2's
+FFI validation made safe to build on. A 6-step offscreen render
+pass (create RGBA8 target → build pass with CLEAR color → open pass
+via the new FFI → end pass → copy texture → map + verify pixel)
+runs clean on RADV / Mesa 26.0 / kernel 6.18, with pixel(0,0)
+matching the clear color byte-exact.
+
+### Added
+- **7 new wgpu FFI slots (58-64)** in `deps/wgpu_main.c` and
+  `src/wgpu_ffi.cyr`:
+  - 58: `wgpu_shim_command_encoder_begin_render_pass` (struct-packed
+    shim — descriptor contains struct-by-value fields, fits the
+    `feedback_fncall6_wgpu` pattern)
+  - 59: `wgpuRenderPassEncoderSetPipeline` (direct, 2 args)
+  - 60: `wgpuRenderPassEncoderSetBindGroup` (direct, 5 args)
+  - 61: `wgpuRenderPassEncoderDraw` (direct, 5 args)
+  - 62: `wgpuRenderPassEncoderEnd` (direct, 1 arg)
+  - 63: `wgpuRenderPassEncoderRelease` (direct, 1 arg)
+  - 64: `wgpu_shim_command_encoder_copy_texture_to_buffer`
+    (struct-packed shim — both src/dst are nested v29 structs)
+- **2 new struct-packing C shims** with field-by-field unpack in C:
+  - `WgpuBeginPassArgs` (40 bytes): packed render-pass descriptor
+    without the struct-by-value overhead.
+  - `WgpuCopyTexToBufArgs` (72 bytes): flat src/dst/copy-size
+    layout, C unpacks into `WGPUTexelCopyTextureInfo` /
+    `WGPUTexelCopyBufferInfo` / `WGPUExtent3D`.
+- **`rpb_pass_begin(encoder, builder)`** in `src/render_pass.cyr` —
+  dispatcher method that allocates a `WgpuBeginPassArgs` from the
+  builder and calls slot 58. Short-circuits on null encoder or
+  empty color-attachment list (wgpu validates those and wouldn't
+  appreciate the round-trip).
+- **`texture_create_render_target_rgba8(device, w, h, label)`** in
+  `src/texture.cyr` — RGBA8_UNORM target with
+  `RENDER_ATTACHMENT | COPY_SRC | COPY_DST` usage so it can be
+  drawn into, read back, and initialised. Same validation envelope
+  as `texture_create_rgba8` (rejects invalid dims).
+- **`programs/render_e2e.cyr`** — the end-to-end integration test
+  itself. 256×256 render target, clear to `(1.0, 0.0, 0.0, 1.0)`,
+  copy back, verify pixel(0,0) is `0xFF, 0x00, 0x00, 0xFF` exact
+  (RGBA8_UNORM round-trips integer-valued f64s losslessly).
+- **16 new CPU regression assertions** (327 → 343) under a new
+  `v2.4.3 — render-pass FFI regressions` section in
+  `tests/tcyr/mabda.tcyr`:
+  - `test_audit_color_attachment_size_72` — guards the
+    `COLOR_ATTACHMENT_SIZE = 72` constant against drift.
+  - `test_audit_rpb_pass_color_offsets` (8 assertions) — every
+    field `rpb_pass_color` writes lands at its v29 offset, so the
+    packed array can be passed to wgpu without repacking.
+  - `test_audit_rpb_pass_begin_null_encoder` — null encoder
+    short-circuits before calling the shim.
+  - `test_audit_rpb_pass_begin_empty_short_circuits` — empty color
+    attachment list short-circuits.
+  - `test_audit_render_target_rgba8_rejects_invalid` (3 assertions)
+    — same input-validation envelope as `texture_create_rgba8`.
+
+### Fixed
+- **`src/render_pass.cyr` — color attachment layout.** The
+  ColorAttachment struct was documented as 56 bytes (with
+  `COLOR_ATTACHMENT_SIZE = 64` — internally inconsistent) and laid
+  out against a pre-v29 `WGPURenderPassColorAttachment` that
+  didn't have `nextInChain`. v29's struct is 72 bytes with
+  `nextInChain @ +0 / view @ +8 / depthSlice @ +16 + pad /
+  resolveTarget @ +24 / loadOp @ +32 / storeOp @ +36 /
+  clearValue @ +40`. `rpb_pass_color` / `rpb_pass_color_msaa` now
+  write to the correct offsets and `COLOR_ATTACHMENT_SIZE = 72`,
+  so the packed array flows straight to wgpu-native.
+  Latent bug — render E2E had never run before this release.
+
+### Metrics
+- **Modules**: 29 (unchanged)
+- **FFI slots**: 65 (was 58 — +7 render pass)
+- **Source lines**: ~4,170 (+~70 across render_pass, texture, ffi,
+  wgpu_main.c, render_e2e program)
+- **Tests**: 343 assertions (was 327 — +16 v2.4.3 regressions)
+- **GPU integration**: `make test-phase0` 10/10,
+  `make test-compute-e2e` 7/7,
+  **`make test-render-e2e` 8/8** — all pass on RADV / Mesa 26.0.
+- **Dist bundle**: `dist/mabda.cyr` regenerated
+- **v1.0 checklist**: ✅ closed. Every v1.0 criterion mabda can
+  cover (non-consumer-side) is now runtime-validated.
+
+### Next
+- v2.5.0 — render graph (DAG pass orchestration). Builds on the
+  now-stable render_pass + render_pipeline + compute primitives.
+  No public API churn expected.
+
+---
+
 ## [2.4.2] — 2026-04-20
 
 **GPU runtime validation release.** mabda v2.4.1 shipped with latent

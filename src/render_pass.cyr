@@ -3,6 +3,9 @@
 # Ported from mabda/src/render_pass.rs
 #
 # Fluent builder for configuring render pass color and depth attachments.
+# Each color attachment is stored in v29-compatible layout (72 bytes, matching
+# WGPURenderPassColorAttachment) so the C shim can pass the packed array
+# through to wgpu-native without repacking.
 #
 # RenderPassBuilder struct layout (48 bytes):
 #   +0:  label (cstr ptr, 8)
@@ -12,15 +15,16 @@
 #   +28: depth_load_op (u32 — Clear or Load)
 #   +32: stencil_clear (u32)
 #
-# ColorAttachment (56 bytes — matches WGPURenderPassColorAttachment):
-#   +0:  view (WGPUTextureView, 8)
-#   +8:  depthSlice (u32)
-#   +16: resolveTarget (WGPUTextureView or 0, 8)
-#   +24: loadOp (u32)
-#   +28: storeOp (u32)
-#   +32: clearValue (WGPUColor = 32 bytes: r,g,b,a as f64)
+# ColorAttachment (72 bytes — matches v29 WGPURenderPassColorAttachment):
+#   +0:  nextInChain (8) — always 0
+#   +8:  view (WGPUTextureView, 8)
+#   +16: depthSlice (u32) + 4 pad
+#   +24: resolveTarget (WGPUTextureView or 0, 8)
+#   +32: loadOp (u32)
+#   +36: storeOp (u32)
+#   +40: clearValue (WGPUColor = 32 bytes: r,g,b,a as f64)
 
-var COLOR_ATTACHMENT_SIZE = 64;
+var COLOR_ATTACHMENT_SIZE = 72;
 
 fn rpb_pass_new() {
     var b = alloc(48);
@@ -38,15 +42,15 @@ fn rpb_pass_label(b, label) { store64(b, label); return b; }
 fn rpb_pass_color(b, view, clear_color) {
     var att = alloc(COLOR_ATTACHMENT_SIZE);
     memset(att, 0, COLOR_ATTACHMENT_SIZE);
-    store64(att, view);
-    store32(att + 8, 0xFFFFFFFF);  # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED
+    store64(att + 8, view);
+    store32(att + 16, 0xFFFFFFFF);  # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED
     if (clear_color != 0) {
-        store32(att + 24, WGPU_LOAD_OP_CLEAR);
-        store32(att + 28, WGPU_STORE_OP_STORE);
-        color_write_f64(clear_color, att + 32);
+        store32(att + 32, WGPU_LOAD_OP_CLEAR);
+        store32(att + 36, WGPU_STORE_OP_STORE);
+        color_write_f64(clear_color, att + 40);
     } else {
-        store32(att + 24, WGPU_LOAD_OP_LOAD);
-        store32(att + 28, WGPU_STORE_OP_STORE);
+        store32(att + 32, WGPU_LOAD_OP_LOAD);
+        store32(att + 36, WGPU_STORE_OP_STORE);
     }
     vec_push(load64(b + 8), att);
     return b;
@@ -56,16 +60,16 @@ fn rpb_pass_color(b, view, clear_color) {
 fn rpb_pass_color_msaa(b, render_view, resolve_view, clear_color) {
     var att = alloc(COLOR_ATTACHMENT_SIZE);
     memset(att, 0, COLOR_ATTACHMENT_SIZE);
-    store64(att, render_view);
-    store32(att + 8, 0xFFFFFFFF);
-    store64(att + 16, resolve_view);
+    store64(att + 8, render_view);
+    store32(att + 16, 0xFFFFFFFF);
+    store64(att + 24, resolve_view);
     if (clear_color != 0) {
-        store32(att + 24, WGPU_LOAD_OP_CLEAR);
-        store32(att + 28, WGPU_STORE_OP_STORE);
-        color_write_f64(clear_color, att + 32);
+        store32(att + 32, WGPU_LOAD_OP_CLEAR);
+        store32(att + 36, WGPU_STORE_OP_STORE);
+        color_write_f64(clear_color, att + 40);
     } else {
-        store32(att + 24, WGPU_LOAD_OP_LOAD);
-        store32(att + 28, WGPU_STORE_OP_STORE);
+        store32(att + 32, WGPU_LOAD_OP_LOAD);
+        store32(att + 36, WGPU_STORE_OP_STORE);
     }
     vec_push(load64(b + 8), att);
     return b;
@@ -100,4 +104,33 @@ fn rpb_pass_color_array(b) {
         memcpy(arr + i * COLOR_ATTACHMENT_SIZE, src, COLOR_ATTACHMENT_SIZE);
     }
     return arr;
+}
+
+# Open a wgpu render pass against `encoder` from the configured builder `b`.
+# Allocates a WgpuBeginPassArgs (40 bytes) that the C shim consumes — the
+# packed color-attachment array is v29-layout-compatible and flows straight
+# through. Returns the WGPURenderPassEncoder handle (0 if encoder is null or
+# no color attachments are configured — wgpu rejects empty descriptors).
+#
+# WgpuBeginPassArgs layout (40 bytes, mirrors deps/wgpu_main.c):
+#   +0:  color_attachments      (ptr)
+#   +8:  color_attachment_count (u64)
+#   +16: depth_stencil          (ptr or 0)
+#   +24: timestamp_writes       (ptr or 0)
+#   +32: label                  (cstr or 0)
+fn rpb_pass_begin(encoder, b) {
+    if (encoder == 0) { return 0; }
+    var count = rpb_pass_color_count(b);
+    if (count == 0) { return 0; }
+    var arr = rpb_pass_color_array(b);
+    var args = alloc(40);
+    memset(args, 0, 40);
+    store64(args + 0,  arr);
+    store64(args + 8,  count);
+    # depth_stencil + timestamp_writes left NULL — out of scope for v2.4.3
+    # (depth attachment storage in the builder is retained for v2.5 usage;
+    # the dispatcher will grow a depth-stencil pack when the render graph
+    # consumes it).
+    store64(args + 32, load64(b));  # label
+    return wgpu_command_encoder_begin_render_pass(encoder, args);
 }
