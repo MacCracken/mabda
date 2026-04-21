@@ -9,7 +9,7 @@ detection.
 
 - **Type**: Cyrius library (include-chain) + dist bundle + C launcher
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 5.4.7+ (`cyrius.cyml: cyrius = "5.4.7"`)
+- **Language**: Cyrius 5.5.11+ (`cyrius.cyml: cyrius = "5.5.11"`)
 - **Version**: 2.4.1 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
 - **GPU FFI**: wgpu-native v29 C API via `deps/wgpu_main.c` launcher
 
@@ -247,7 +247,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.4.7"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "5.5.11"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts

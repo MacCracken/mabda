@@ -96,7 +96,7 @@ Consumer (soorat, bijli, ...)
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.4.7+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.5.11+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 

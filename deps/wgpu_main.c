@@ -263,7 +263,18 @@ typedef struct {
 static WgpuPreinit preinit;
 
 static int preinit_gpu(void) {
-    preinit.instance = wgpuCreateInstance(NULL);
+    // Force Vulkan on Linux — wgpu-native's default (InstanceBackend_All)
+    // tries GLES too, and Mesa's EGL init path crashes on hosts without
+    // a live DISPLAY / Wayland socket (verified on RADV Mesa 26.0, kernel
+    // 6.18). Vulkan-only keeps the path headless-safe and deterministic.
+    WGPUInstanceExtras extras = {0};
+    extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
+    extras.backends = WGPUInstanceBackend_Vulkan;
+
+    WGPUInstanceDescriptor desc = {0};
+    desc.nextInChain = (const WGPUChainedStruct*)&extras;
+
+    preinit.instance = wgpuCreateInstance(&desc);
     if (!preinit.instance) return 0;
 
     long adapter_ptr = 0;

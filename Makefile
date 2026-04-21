@@ -77,7 +77,7 @@ test-all: version-check dist test
 # A future `cyrius build --object` (queued upstream for 5.4.10+) will retire it.
 # ---------------------------------------------------------------------------
 
-LOCALIZE_SYMS  = memcpy memset memchr strlen strchr memeq atoi
+LOCALIZE_SYMS  = memcpy memset memchr strlen strchr strstr memeq atoi
 LOCALIZE_FLAGS = $(foreach s,$(LOCALIZE_SYMS),-L $(s))
 
 deps/wgpu_main.o: deps/wgpu_main.c
@@ -118,7 +118,10 @@ test-render-e2e: build/render_e2e
 test-gpu: test-phase0 test-compute-e2e test-render-e2e
 
 # CI gate: syntax + semantic check every programs/*.cyr without needing
-# wgpu-native on the runner. Fails on any cyrius warning/error.
+# wgpu-native on the runner. Fails on any cyrius warning/error coming from
+# mabda-owned source (programs/ or src/). Warnings whose path begins with
+# `lib/` originate in the cyrius stdlib and are filtered out — they are
+# tracked upstream, not here.
 # Closes the Issue-2-class bug (missing includes compiling silently) from
 # docs/issues/2026-04-19-phase0-build-broken.md.
 .PHONY: build-gpu-programs
@@ -126,7 +129,8 @@ build-gpu-programs:
 	@fail=0; \
 	for f in programs/*.cyr; do \
 		out=$$($(CYRIUS) check $$f 2>&1); \
-		if echo "$$out" | grep -qE '(warning|error):'; then \
+		flagged=$$(echo "$$out" | grep -E '(warning|error):' | grep -vE '(warning|error):lib/' || true); \
+		if [ -n "$$flagged" ]; then \
 			echo "$$f:"; echo "$$out"; fail=1; \
 		fi; \
 	done; \

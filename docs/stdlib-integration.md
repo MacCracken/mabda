@@ -18,7 +18,7 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "5.4.7"
+cyrius = "5.5.11"
 
 [build]
 entry = "src/main.cyr"

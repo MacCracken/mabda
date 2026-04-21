@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Hygiene pass. Bumps the cyrius toolchain pin to the current release
+(5.5.11) and closes two regressions surfaced by 5.5.11's stricter
+`cyrius check` pass.
+
+### Changed
+- **Toolchain pin** `cyrius = "5.4.10" → "5.5.11"` in `cyrius.cyml`.
+  Picks up `fncall7` / `fncall8` (added at 5.4.13 — scalar-only, not
+  AAPCS64-compatible past arg 6 on aarch64) plus the stdlib's updated
+  `lib/fnptr.cyr` header documenting the struct-by-value ABI
+  handshake. The "fncall6 + wgpu" crash class is now understood as a
+  struct-by-value passing mismatch, not a cyrius bug — full rationale
+  in `docs/issues/2026-04-19-fncall6-wgpu-crash-resolution.md`. All
+  existing C shims in `deps/wgpu_main.c` remain correct.
+
+### Fixed
+- **`programs/phase0.cyr`** and **`programs/compute_e2e.cyr`** — added
+  missing `include "lib/sakshi.cyr"`. Both programs use selective
+  includes; when v2.4.1 wired sakshi into `src/error.cyr` /
+  `src/context.cyr` / `src/profiler.cyr`, the programs silently
+  compiled with undefined `sakshi_*` references until 5.5.11's
+  `cyrius check` escalated them from warnings to errors. No behaviour
+  change — observability stays off by default.
+- **`Makefile`** `build-gpu-programs` — the CI gate now ignores
+  warnings whose path begins with `lib/` (stdlib-originated, tracked
+  upstream) so a stdlib-side warning cannot break mabda's gate.
+
+### Unblocked (toolchain-side)
+- `_cyrius_init` GLOBAL emission in `object;` mode — fixed in
+  cyrius 5.4.9, confirmed at 5.5.11.
+- `fncall6 + wgpu-native` crash — reclassified: not a cyrius bug,
+  but a SysV / AAPCS64 struct-by-value ABI mismatch. Existing
+  struct-packing shim pattern in `deps/wgpu_main.c` remains the
+  canonical workaround.
+
+### Notes
+- Stdlib at 5.5.11 emits `warning:lib/syscalls_x86_64_linux.cyr:358:
+  syscall arity mismatch` on any build including `lib/syscalls.cyr`.
+  Filtered out in the `build-gpu-programs` gate; to report upstream.
+
 ## [2.4.1] — 2026-04-19
 
 Sakshi observability wiring. Mabda's existing error / profiler /
