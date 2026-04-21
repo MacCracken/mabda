@@ -5,46 +5,145 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.4.2] — 2026-04-20
 
-Hygiene pass. Bumps the cyrius toolchain pin to the current release
-(5.5.11) and closes two regressions surfaced by 5.5.11's stricter
-`cyrius check` pass.
+**GPU runtime validation release.** mabda v2.4.1 shipped with latent
+FFI bugs that CPU-only tests couldn't catch — `compute_e2e` and
+`phase0` were compile-clean and link-clean but had never executed
+against a real wgpu-native + Vulkan driver. Running them for the
+first time against a RADV / Mesa 26.0 / kernel 6.18 host exposed a
+cascade of latent offset / enum / ABI issues. This release closes all
+of them, adds CPU regression assertions that would have caught the
+originals, and earns the v1.0 compute-dispatch tick.
 
-### Changed
+v2.4.2 is a **scope re-carve**: the roadmap's original v2.4.2
+(render-pass FFI + render E2E) is pushed to v2.4.3. Landing render-pass
+FFI on top of broken FFI infrastructure would have amplified the same
+offset/enum classes across a wider surface. This release is the
+provable foundation v2.4.3 can build on.
+
+### Changed (toolchain)
 - **Toolchain pin** `cyrius = "5.4.10" → "5.5.11"` in `cyrius.cyml`.
-  Picks up `fncall7` / `fncall8` (added at 5.4.13 — scalar-only, not
-  AAPCS64-compatible past arg 6 on aarch64) plus the stdlib's updated
-  `lib/fnptr.cyr` header documenting the struct-by-value ABI
-  handshake. The "fncall6 + wgpu" crash class is now understood as a
-  struct-by-value passing mismatch, not a cyrius bug — full rationale
-  in `docs/issues/2026-04-19-fncall6-wgpu-crash-resolution.md`. All
-  existing C shims in `deps/wgpu_main.c` remain correct.
+  Picks up `fncall7` / `fncall8` (scalar-only, not AAPCS64-compatible
+  past arg 6 on aarch64) plus the stdlib's updated `lib/fnptr.cyr`
+  header documenting the struct-by-value ABI handshake. The
+  "fncall6 + wgpu" crash class is now understood as a struct-by-value
+  passing mismatch, not a cyrius bug — rationale in
+  `docs/issues/2026-04-19-fncall6-wgpu-crash-resolution.md`.
 
-### Fixed
+### Fixed (FFI runtime validation)
+- **`deps/wgpu_main.c` — Vulkan-only backend.** `wgpuCreateInstance(NULL)`
+  used the default `InstanceBackend_All`, which tries GLES; Mesa's EGL
+  init path crashes on hosts without a live DISPLAY / Wayland socket.
+  `preinit_gpu` now passes a `WGPUInstanceDescriptor` with a chained
+  `WGPUInstanceExtras { backends = WGPUInstanceBackend_Vulkan }`.
+  Deterministic and headless-safe.
+- **`Makefile` — localize `strstr`.** Cyrius stdlib exports `strstr`
+  as a GLOBAL symbol. When linked with `wgpu_main.o`, cyrius's
+  implementation was interposing libc's `strstr`, and Mesa's Vulkan
+  init path calls `strstr` during driver-string probing. The incompatible
+  implementation crashed the adapter-enumeration path. Added `strstr` to
+  `LOCALIZE_SYMS` so `objcopy -L` hides it from the linker.
+- **`src/wgpu_descriptors.cyr` — `wgpu_bgl_entry_buffer` offsets.**
+  `WGPUBufferBindingLayout` has an 8-byte `nextInChain` pointer first;
+  `type` / `hasDynamicOffset` / `minBindingSize` belong at +40 / +44 /
+  +48 of the outer `WGPUBindGroupLayoutEntry`, not +32 / +36 / +40.
+  Pre-fix, the buffer-type value was written into the `nextInChain`
+  pointer slot, producing a non-null garbage pointer that wgpu_core
+  rejected as an invalid chained struct. Header comment now lists the
+  full 120-byte layout including v29's `bindingArraySize @ +24`.
+- **`src/wgpu_types.cyr` — `WGPUBufferBindingType` renumbered.** v29
+  inserted `BindingNotUsed = 0`, shifting every subsequent value up.
+  Pre-fix mabda had `UNIFORM = 1` / `STORAGE = 2`; v29 expects
+  `UNIFORM = 2` / `STORAGE = 3`. The runtime silently treated every
+  storage binding as a uniform binding, which is what surfaced as
+  "Storage class Uniform doesn't match the shader" on real dispatch.
+- **`src/wgpu_types.cyr` — `WGPULoadOp` swap.** `LOAD` and `CLEAR`
+  were swapped (`CLEAR = 1`, `LOAD = 2`). v29 has `LOAD = 1`,
+  `CLEAR = 2`. Silent data-corruption bug in render passes —
+  CLEAR-configured attachments would have loaded instead, and vice
+  versa. Latent because no render E2E runtime test exists yet; the
+  enum audit caught it before v2.4.3's render pass ever ran.
+- **`src/compute.cyr` — `compute_dispatch` signature reduced to 5
+  parameters.** The previous `(device, queue, cp, bg, x, y, z)`
+  7-parameter form was documented in `feedback_cyrius_param_ceiling`
+  as a crash class — Cyrius functions with 7+ parameters that
+  internally `fncall*` into wgpu-native segfault on the wgpu call.
+  At 5.5.11 the crash is still present (re-verified). Refactored
+  to `(device, queue, cp, bg, dims_xyz)` where `dims_xyz` is a
+  pointer to 12 bytes holding three packed u32 workgroup counts.
+  **Breaking** — all callers and the `test_audit_compute_dispatch_*`
+  assertions updated.
 - **`programs/phase0.cyr`** and **`programs/compute_e2e.cyr`** — added
   missing `include "lib/sakshi.cyr"`. Both programs use selective
   includes; when v2.4.1 wired sakshi into `src/error.cyr` /
   `src/context.cyr` / `src/profiler.cyr`, the programs silently
   compiled with undefined `sakshi_*` references until 5.5.11's
-  `cyrius check` escalated them from warnings to errors. No behaviour
-  change — observability stays off by default.
-- **`Makefile`** `build-gpu-programs` — the CI gate now ignores
+  stricter `cyrius check` escalated them to errors.
+- **`Makefile` `build-gpu-programs`** — the CI gate now ignores
   warnings whose path begins with `lib/` (stdlib-originated, tracked
   upstream) so a stdlib-side warning cannot break mabda's gate.
+
+### Added
+- **18 new CPU regression assertions** in `tests/tcyr/mabda.tcyr`
+  (309 → 327), all under a new `v2.4.2 — GPU runtime validation
+  regressions` section:
+  - `test_audit_buffer_binding_type_values` (5) — asserts every v29
+    value of `WGPUBufferBindingType` end-to-end.
+  - `test_audit_load_op_values` (6) — asserts `WGPULoadOp` /
+    `WGPUStoreOp` values match v29.
+  - `test_audit_bgl_entry_buffer_offsets` (7) — asserts
+    `wgpu_bgl_entry_buffer` writes go to the correct offsets
+    (`type@+40`, `hasDynOffset@+44`, `minSize@+48`).
+  - Updated `test_audit_compute_dispatch_*` to use the new
+    `dims_xyz` pointer API.
+
+### Breaking
+- `compute_dispatch(device, queue, cp, bg, x, y, z)` →
+  `compute_dispatch(device, queue, cp, bg, dims_xyz)`.
+  **Migration:**
+  ```cyr
+  var dims[12];
+  store32(&dims, x);
+  store32(&dims + 4, y);
+  store32(&dims + 8, z);
+  compute_dispatch(device, queue, cp, bg, &dims);
+  ```
+  Consumers using the `ping_pong_*` family of compute helpers are
+  unaffected — those wrap `compute_dispatch` internally and their
+  public signatures haven't changed.
 
 ### Unblocked (toolchain-side)
 - `_cyrius_init` GLOBAL emission in `object;` mode — fixed in
   cyrius 5.4.9, confirmed at 5.5.11.
-- `fncall6 + wgpu-native` crash — reclassified: not a cyrius bug,
-  but a SysV / AAPCS64 struct-by-value ABI mismatch. Existing
-  struct-packing shim pattern in `deps/wgpu_main.c` remains the
-  canonical workaround.
+- `fncall6 + wgpu-native` crash — reclassified: SysV / AAPCS64
+  struct-by-value ABI mismatch, not a cyrius bug.
+- 7-parameter Cyrius function + wgpu fncall crash — re-verified at
+  5.5.11 (still real). `feedback_cyrius_param_ceiling` stays valid.
 
 ### Notes
 - Stdlib at 5.5.11 emits `warning:lib/syscalls_x86_64_linux.cyr:358:
   syscall arity mismatch` on any build including `lib/syscalls.cyr`.
-  Filtered out in the `build-gpu-programs` gate; to report upstream.
+  Filtered out in `build-gpu-programs`; to report upstream.
+- v1.0 checklist: **compute dispatch end-to-end** now ticked.
+  Render pipeline end-to-end (the last open item) moves to v2.4.3.
+
+### Metrics
+- **Modules**: 29 (unchanged)
+- **Source lines**: ~4,100 (+~30 across descriptor offsets,
+  compute_dispatch refactor, new comments)
+- **Tests**: 327 assertions (was 309 — +18 v2.4.2 regressions)
+- **GPU integration**: `make test-phase0` 10/10 pass,
+  `make test-compute-e2e` 7/7 pass on a RADV / Mesa 26.0 / kernel 6.18 host
+- **Dist bundle**: `dist/mabda.cyr` regenerated
+
+### Next
+- v2.4.3 — render-pass FFI expansion + render E2E (closes v1.0). Full
+  plan already in `docs/proposals/2026-04-19-render-pass-ffi.md` — the
+  foundation it builds on is now proven.
+- v2.5.0 — render graph
+
+---
 
 ## [2.4.1] — 2026-04-19
 

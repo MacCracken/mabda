@@ -1262,18 +1262,24 @@ fn test_audit_read_buffer_exceeds_cap_rejected() {
 
 # LOW-3: compute_dispatch and texture_create_rgba8 reject inputs that
 # exceed WebGPU spec-default limits before reaching wgpu-native.
+# compute_dispatch takes a dims_xyz pointer (3 packed u32) to stay at 5
+# parameters — see the note in src/compute.cyr.
 fn test_audit_compute_dispatch_zero_dim_rejected() {
-    assert_eq(compute_dispatch(0, 0, 0, 0, 0, 1, 1), 0,
+    var d0x[12]; store32(&d0x, 0); store32(&d0x + 4, 1); store32(&d0x + 8, 1);
+    var d0y[12]; store32(&d0y, 1); store32(&d0y + 4, 0); store32(&d0y + 8, 1);
+    var d0z[12]; store32(&d0z, 1); store32(&d0z + 4, 1); store32(&d0z + 8, 0);
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0x), 0,
     "compute_dispatch(x=0) short-circuits");
-    assert_eq(compute_dispatch(0, 0, 0, 0, 1, 0, 1), 0,
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0y), 0,
     "compute_dispatch(y=0) short-circuits");
-    assert_eq(compute_dispatch(0, 0, 0, 0, 1, 1, 0), 0,
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0z), 0,
     "compute_dispatch(z=0) short-circuits");
     return 0;
 }
 
 fn test_audit_compute_dispatch_exceeds_max_rejected() {
-    assert_eq(compute_dispatch(0, 0, 0, 0, 70000, 1, 1), 0,
+    var dmax[12]; store32(&dmax, 70000); store32(&dmax + 4, 1); store32(&dmax + 8, 1);
+    assert_eq(compute_dispatch(0, 0, 0, 0, &dmax), 0,
     "compute_dispatch(x>MAX) short-circuits");
     return 0;
 }
@@ -1337,6 +1343,71 @@ fn test_audit_clamp_unit_below_zero() {
     neg = f64_sub(F64_0, F64_1);   # -1.0
     assert_eq(_clamp_unit(neg), F64_0,
     "_clamp_unit(-1.0) clamps to 0.0");
+    return 0;
+}
+
+# ================================================================
+# v2.4.2 — GPU runtime validation regressions
+# ================================================================
+# The following assertions guard the FFI descriptor / enum drift bugs
+# caught when mabda v2.4.1 first exercised a real wgpu-native GPU on a
+# Mesa/Vulkan Linux box. Each assertion is written so that reintroducing
+# the bug (wrong enum value, wrong struct offset) fails the CPU suite
+# immediately — no GPU required. See `docs/issues/2026-04-20-*` and the
+# v2.4.2 CHANGELOG entry for the full narrative.
+
+fn test_audit_buffer_binding_type_values() {
+    # v29 renumbering: BindingNotUsed=0 was inserted, shifting every
+    # subsequent value up by one. Pre-fix, STORAGE was mistakenly 2
+    # and the runtime treated storage bindings as uniform bindings.
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_BINDING_NOT_USED, 0,
+    "BufferBindingType BindingNotUsed = 0 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_UNDEFINED, 1,
+    "BufferBindingType Undefined = 1 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_UNIFORM, 2,
+    "BufferBindingType Uniform = 2 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_STORAGE, 3,
+    "BufferBindingType Storage = 3 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_READ_ONLY_STORAGE, 4,
+    "BufferBindingType ReadOnlyStorage = 4 (v29)");
+    return 0;
+}
+
+fn test_audit_load_op_values() {
+    # Pre-fix these were swapped (CLEAR=1, LOAD=2) — render passes
+    # flipped clear/load semantics silently.
+    assert_eq(WGPU_LOAD_OP_UNDEFINED, 0, "LoadOp Undefined = 0 (v29)");
+    assert_eq(WGPU_LOAD_OP_LOAD, 1, "LoadOp Load = 1 (v29)");
+    assert_eq(WGPU_LOAD_OP_CLEAR, 2, "LoadOp Clear = 2 (v29)");
+    assert_eq(WGPU_STORE_OP_UNDEFINED, 0, "StoreOp Undefined = 0 (v29)");
+    assert_eq(WGPU_STORE_OP_STORE, 1, "StoreOp Store = 1 (v29)");
+    assert_eq(WGPU_STORE_OP_DISCARD, 2, "StoreOp Discard = 2 (v29)");
+    return 0;
+}
+
+fn test_audit_bgl_entry_buffer_offsets() {
+    # WGPUBindGroupLayoutEntry is 120 bytes. Buffer sub-struct starts at
+    # +32 with its own nextInChain (8 bytes) first; type lives at +40,
+    # hasDynamicOffset at +44, minBindingSize at +48. Pre-fix, mabda was
+    # writing type at +32 (into the nextInChain ptr slot) which caused
+    # wgpu_core to treat a non-null garbage pointer as a chained struct
+    # and reject the BGL.
+    var e[120];
+    memset(&e, 0xAA, 120);
+    wgpu_bgl_entry_buffer(&e, 7, WGPU_SHADER_STAGE_COMPUTE,
+    WGPU_BUFFER_BINDING_TYPE_STORAGE, 1, 256);
+    assert_eq(load64(&e), 0, "BGL entry nextInChain cleared to 0");
+    assert_eq(load32(&e + 8), 7, "BGL entry binding @ +8");
+    assert_eq(load64(&e + 16), WGPU_SHADER_STAGE_COMPUTE,
+    "BGL entry visibility @ +16 (u64)");
+    assert_eq(load64(&e + 32), 0,
+    "BGL entry buffer.nextInChain @ +32 cleared");
+    assert_eq(load32(&e + 40), WGPU_BUFFER_BINDING_TYPE_STORAGE,
+    "BGL entry buffer.type @ +40 (NOT +32)");
+    assert_eq(load32(&e + 44), 1,
+    "BGL entry buffer.hasDynamicOffset @ +44 (NOT +36)");
+    assert_eq(load64(&e + 48), 256,
+    "BGL entry buffer.minBindingSize @ +48 (NOT +40)");
     return 0;
 }
 
@@ -1538,6 +1609,11 @@ fn main() {
     test_audit_clamp_unit_in_range();
     test_audit_clamp_unit_above_one();
     test_audit_clamp_unit_below_zero();
+
+    # v2.4.2 — GPU runtime validation regressions (3)
+    test_audit_buffer_binding_type_values();
+    test_audit_load_op_values();
+    test_audit_bgl_entry_buffer_offsets();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

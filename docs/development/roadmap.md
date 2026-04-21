@@ -18,7 +18,8 @@ native backend lands, consumer code will not change by a single byte.
   v2.3.0  ───▶  wgpu-native via C shim          (shipping, audited)
   v2.4.0  ───▶  v1.0-parity (partial)           (compute E2E, LOW sweep)
   v2.4.1  ───▶  sakshi observability            (structured logging + spans — additive)
-  v2.4.2  ───▶  render-pass FFI + render E2E    (closes v1.0 checklist)
+  v2.4.2  ───▶  GPU runtime validation          (FFI offset/enum sweep + compute E2E actually runs on GPU)
+  v2.4.3  ───▶  render-pass FFI + render E2E    (closes v1.0 checklist)
   v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive)
        │
        │        kernel GPU driver work (in parallel, AGNOS scope)
@@ -167,10 +168,10 @@ and MED fixed.
 
 ---
 
-## v2.4.0 — v1.0-Parity (Partial) (Next)
+## v2.4.0 — v1.0-Parity (Partial) (Shipped)
 
 Pick off the v1.0 criteria the existing FFI surface can already
-reach. Render-pipeline end-to-end deferred to v2.4.2 because the
+reach. Render-pipeline end-to-end deferred to v2.4.3 because the
 FFI table has no render-pass execution slots yet (descriptor
 builder exists; encoder dispatch does not — see `wgpu_ffi.cyr`,
 slots end at 57/surface). Small release, no structural changes.
@@ -183,11 +184,11 @@ slots end at 57/surface). Small release, no structural changes.
 
 Exit criteria: `programs/phase0.cyr` + `programs/compute_e2e.cyr`
 together exercise every v1.0 criterion the current FFI can reach.
-Render-pipeline E2E waits for v2.4.2.
+Render-pipeline E2E waits for v2.4.3.
 
 ---
 
-## v2.4.1 — Sakshi Observability
+## v2.4.1 — Sakshi Observability (Shipped)
 
 Earn the sakshi include that's already in `src/lib.cyr`. Wire the
 structured-logging / span / packed-error primitives into mabda's
@@ -225,12 +226,57 @@ behaviour stays silent (consumers opt in via `sakshi_set_level`).
 
 ---
 
-## v2.4.2 — Render-pass FFI + Render E2E
+## v2.4.2 — GPU Runtime Validation (Shipped)
+
+Scope re-carve. The original v2.4.2 plan (render-pass FFI + render
+E2E) moves to v2.4.3. v2.4.1 shipped with latent FFI bugs that
+CPU-only tests couldn't catch — `compute_e2e` and `phase0` were
+compile-clean and link-clean but had never run against a real
+wgpu-native + Vulkan driver. First-ever run on a RADV / Mesa 26.0
+box surfaced a cascade of offset / enum / ABI issues. v2.4.2 fixes
+all of them and adds CPU regression assertions that would have
+caught the originals — the provable foundation v2.4.3 can build on.
+
+### Shipped
+- Toolchain pin `5.4.10 → 5.5.11`; `_cyrius_init` fix and
+  `fncall7`/`fncall8` confirmed at the current release.
+- **`deps/wgpu_main.c`** — `wgpuCreateInstance` now passes
+  `InstanceExtras { backends = Vulkan }`. Headless-safe on Mesa.
+- **`Makefile`** — `strstr` localized (was interposing libc and
+  breaking Mesa's driver-string probing).
+- **`src/wgpu_descriptors.cyr`** — `wgpu_bgl_entry_buffer` offsets
+  corrected for v29's `WGPUBufferBindingLayout` (8-byte
+  `nextInChain` first; `type@+40`, `hasDynOffset@+44`, `minSize@+48`).
+- **`src/wgpu_types.cyr`** — `WGPUBufferBindingType` renumbered for
+  v29 (inserted `BindingNotUsed = 0`); `WGPULoadOp` values
+  un-swapped (`LOAD=1`, `CLEAR=2`).
+- **`src/compute.cyr`** — `compute_dispatch` signature reduced from
+  7 params to 5 via a `dims_xyz` pointer. The 7-param class
+  reliably crashes when internally fncalling into wgpu-native
+  (re-verified at 5.5.11 — see `feedback_cyrius_param_ceiling`).
+  **Breaking** — migration in the CHANGELOG.
+- **`programs/phase0.cyr`, `programs/compute_e2e.cyr`** — added
+  missing `include "lib/sakshi.cyr"` (regression from v2.4.1's
+  observability wiring, caught by 5.5.11's stricter `cyrius check`).
+- **18 new CPU regression assertions** under a new
+  `v2.4.2 — GPU runtime validation regressions` section. 309 → 327.
+- **`make test-phase0`** 10/10 pass; **`make test-compute-e2e`** 7/7
+  pass on a RADV / Mesa 26.0 / kernel 6.18 host.
+
+### v1.0 tick
+- **Compute dispatch end-to-end** — now runs on real hardware.
+  Last open v1.0 item is render-pipeline E2E (v2.4.3).
+
+---
+
+## v2.4.3 — Render-pass FFI + Render E2E
 
 Closes the v1.0 checklist. Adds the wgpu render-pass execution
-surface that v2.4.0 deferred. Mechanical FFI work — no public
-mabda API changes; `render_pass.cyr` builder gains an actual
-dispatcher to hand its descriptors to.
+surface. Mechanical FFI work — no public mabda API changes;
+`render_pass.cyr` builder gains an actual dispatcher to hand its
+descriptors to. Full plan already in
+`docs/proposals/2026-04-19-render-pass-ffi.md` — the foundation it
+builds on is now proven by v2.4.2's runtime-validated FFI.
 
 ### Planned scope
 - **`wgpu_ffi.cyr` slots 58-63 (approx)** — add:
@@ -270,7 +316,7 @@ with DAG design.
 
 ---
 
-## v2.5.0 — Render Graph (After 2.4.2)
+## v2.5.0 — Render Graph (After 2.4.3)
 
 First feature release post-parity. Adds DAG-style pass orchestration
 on top of the existing `render_pass` + `render_pipeline` +
@@ -408,9 +454,9 @@ version once there's consumer demand plus a clear scope.
       `programs/phase0.cyr`
 - [x] Texture create / view / upload / release — `programs/phase0.cyr`
 - [x] Render pipeline create / release — `programs/phase0.cyr`
-- [x] Compute dispatch end-to-end test (v2.4.0 —
-      `programs/compute_e2e.cyr`)
-- [ ] Render pipeline end-to-end draw + readback (v2.4.2 — needs
+- [x] Compute dispatch end-to-end test (v2.4.0 wrote the program;
+      v2.4.2 got it running on real hardware — `programs/compute_e2e.cyr`)
+- [ ] Render pipeline end-to-end draw + readback (v2.4.3 — needs
       render-pass FFI expansion)
 - [ ] Consumer integration: soorat port to Cyrius (consumer-side, not
       mabda-side — tracked in soorat's repo)

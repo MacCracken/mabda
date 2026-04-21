@@ -204,16 +204,21 @@ Both depend on the GPU integration build path working. Until issues
 ## Dev-box runtime note
 
 After applying all fixes, `make test-phase0` links clean and the
-binary starts executing. On a host without a wgpu-native-compatible
-GPU / driver, `wgpuCreateInstance(NULL)` SIGSEGVs inside the C
-preinit path (before any cyrius code runs). Instrumentation confirms
-`_cyrius_init` and `alloc_init` both succeed; the crash is in the C
-preinit, in `wgpu-native` itself.
+binary starts executing. An earlier version of this doc described
+`wgpuCreateInstance(NULL)` as an environment-dependent SIGSEGV on
+hosts without a live DISPLAY / Wayland socket. **That analysis was
+incomplete** — the crash was actually wgpu-native's default
+`InstanceBackend_All` trying to initialise the GLES path, which
+calls into Mesa's `libEGL.so` and crashes during headless EGL
+setup. Mabda v2.4.2 fixes this by passing
+`WGPUInstanceExtras { backends = WGPUInstanceBackend_Vulkan }`
+via the instance descriptor in `deps/wgpu_main.c::preinit_gpu`.
 
-This is **environment-dependent**, not a mabda or cyrius defect.
-The v2.4.0 compute/render E2E programs will share this characteristic:
-compile-clean + link-clean in CI, runtime validation requires a
-dev box with a working wgpu-native stack.
+Residual environment caveat: the box still needs a working
+Vulkan stack (libvulkan + RADV / Intel / NVIDIA Vulkan ICD) to
+get past instance + adapter creation. That is hardware-dependent
+and expected — wgpu-native requires at least one driver backend
+with physical devices it can enumerate.
 
 ## References
 
