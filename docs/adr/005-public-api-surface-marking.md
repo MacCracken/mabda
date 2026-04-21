@@ -34,22 +34,33 @@ The distinction is load-bearing for two reasons:
    under `examples/stdlib-consumer/`, and (future) lint checks can
    enforce the boundary by reading the first line of every file.
 
-## Inventory (v2.1.1)
+## Inventory (v2.5.0)
 
-**Public (26 files):** `mabda`, `error`, `color`, `capabilities`,
+**Public (27 files):** `lib`, `error`, `color`, `capabilities`,
 `profiler`, `resource`, `context`, `buffer`, `typed_buffer`,
 `gpu_timestamps`, `compute`, `shader_cache`, `pipeline_cache`,
 `bind_group_cache`, `vertex`, `blend`, `sampler`, `depth`, `bind_group`,
 `texture`, `render_target`, `render_pipeline`, `render_pass`,
-`surface`, `instancing`, `debug`.
+`render_graph`, `surface`, `instancing`, `debug`.
 
-**Internal (5 files):** `wgpu_types`, `wgpu_descriptors`, `wgpu_ffi`,
-`tagged_obj`, `cache_key`.
+**Internal (3 files):** `wgpu_types`, `wgpu_descriptors`, `wgpu_ffi`.
 
 The internal set is deliberately small — everything that a consumer
-might reasonably need to call is `@public`. Only the raw FFI slots,
-the object-mode tagged-union bootstrap, and the private cache-key
-helper are marked internal.
+might reasonably need to call is `@public`. Only the raw FFI slots
+(wgpu-specific enums, descriptor builders, function-pointer table)
+stay internal.
+
+Inventory history:
+- **v2.1.1 (original):** 26 public + 5 internal. Internal set
+  included `tagged_obj` (object-mode tagged-union bootstrap) and
+  `cache_key` (decimal-string hashmap key helper).
+- **v2.4.5:** `cache_key` retired — cyrius v5.5.20 shipped a
+  u64-keyed hashmap variant that replaced the decimal-string key
+  pattern across the four cache modules.
+- **v2.5.0:** `render_graph` added as public (DAG pass
+  orchestration). `tagged_obj` no longer tracked as internal —
+  tagged-union usage is through the cyrius stdlib's `lib/tagged.cyr`
+  rather than a mabda-side bootstrap.
 
 ## Consequences
 
@@ -82,8 +93,9 @@ helper are marked internal.
 
 - **Separate `src/public/` and `src/internal/` directories.** Rejected
   because it would force a large file move and would complicate the
-  `src/mabda.cyr` include order (which has real forward-dependency
-  concerns around `cache_key.cyr`).
+  `src/lib.cyr` include order (which has real forward-dependency
+  concerns between the cache modules and the `cache_key` helper that
+  was retired in v2.4.5).
 - **Rust-style `pub(crate)` visibility.** Cyrius has no visibility
   modifiers. A marker comment is the cheapest signal we have.
 - **No marking; document in `docs/`.** Rejected because docs drift

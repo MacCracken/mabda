@@ -1,8 +1,11 @@
 # Usage Guide
 
-> Written against mabda 2.3.0 / Cyrius 5.4.7. See
+> Written against mabda 2.5.0 / Cyrius 5.5.20. See
 > [`docs/stdlib-integration.md`](../stdlib-integration.md) for
-> consumer-project setup (manifest, deps, launcher build rule).
+> consumer-project setup (manifest, deps, launcher build rule), and
+> [`render-graph.md`](render-graph.md) if you want to orchestrate
+> multiple compute / render / copy passes through a single command
+> encoder.
 
 ## Getting Started
 
@@ -11,7 +14,7 @@ Pull mabda in as a dep in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "2.3.0"
+tag = "2.5.0"
 modules = ["dist/mabda.cyr"]
 ```
 

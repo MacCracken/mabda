@@ -1,9 +1,22 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+
+Change categories in use: **Added**, **Changed**, **Deprecated**,
+**Removed**, **Fixed**, **Security** (Keep a Changelog standard) plus
+**Breaking** when a change is incompatible at the public-API level
+(always accompanied by a migration note), **Unblocked** for
+toolchain-side items that became viable mid-cycle, **Metrics** for
+numeric deltas (module count, assertions, bundle size), and **Next**
+for the immediate forward pointer.
+
+## [Unreleased]
+
+Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
+section when they ship.
 
 ## [2.5.0] — 2026-04-21
 
@@ -338,7 +351,7 @@ provable foundation v2.4.3 can build on.
   header documenting the struct-by-value ABI handshake. The
   "fncall6 + wgpu" crash class is now understood as a struct-by-value
   passing mismatch, not a cyrius bug — rationale in
-  `docs/issues/2026-04-19-fncall6-wgpu-crash-resolution.md`.
+  `docs/archive/issues/2026-04-19-fncall6-wgpu-crash-resolution.md`.
 
 ### Fixed (FFI runtime validation)
 - **`deps/wgpu_main.c` — Vulkan-only backend.** `wgpuCreateInstance(NULL)`
@@ -448,7 +461,7 @@ provable foundation v2.4.3 can build on.
 
 ### Next
 - v2.4.3 — render-pass FFI expansion + render E2E (closes v1.0). Full
-  plan already in `docs/proposals/2026-04-19-render-pass-ffi.md` — the
+  plan already in `docs/archive/proposals/2026-04-19-render-pass-ffi.md` — the
   foundation it builds on is now proven.
 - v2.5.0 — render graph
 
@@ -511,7 +524,7 @@ v1.0-parity (partial) closeout. Picks off the v1.0 criteria the
 existing FFI surface can already reach: compute dispatch end-to-end
 plus the scheduled LOW audit sweep. Render-pipeline E2E deferred to
 v2.4.2 (needs render-pass FFI expansion — see roadmap and
-`docs/issues/2026-04-19-phase0-build-broken.md`).
+`docs/archive/issues/2026-04-19-phase0-build-broken.md`).
 
 ### Added
 - **`programs/compute_e2e.cyr`** — compute dispatch end-to-end
@@ -522,12 +535,12 @@ v2.4.2 (needs render-pass FFI expansion — see roadmap and
 - **`make build-gpu-programs`** CI gate — `cyrius check` every
   `programs/*.cyr` and fail on any warning. Closes the missing-include
   class of bug surfaced as Issue 2 in
-  `docs/issues/2026-04-19-phase0-build-broken.md`. Runnable on CI
+  `docs/archive/issues/2026-04-19-phase0-build-broken.md`. Runnable on CI
   without `wgpu-native`.
 - **`make test-compute-e2e`** + **`make test-render-e2e`** + **`make
   test-gpu`** Makefile targets. Pattern rule for `build/%.o`
   generalises the phase0 build to any `programs/*.cyr`.
-- **`docs/issues/2026-04-19-phase0-build-broken.md`** — internal
+- **`docs/archive/issues/2026-04-19-phase0-build-broken.md`** — internal
   issue doc tracking the cyrius `_cyrius_init`-LOCAL regression
   (fixed upstream in cyrius v5.4.9), the `lib/str.cyr` missing-include
   bug in `programs/phase0.cyr` (fixed mabda-side), and the queued
@@ -576,7 +589,7 @@ v2.4.2 (needs render-pass FFI expansion — see roadmap and
   (added when the literal was split across lines) but the include
   block hadn't been updated. Linker failed with 8 undefined-references
   on a clean build. Mabda-side fix; root-cause Issue 2 in
-  `docs/issues/2026-04-19-phase0-build-broken.md`.
+  `docs/archive/issues/2026-04-19-phase0-build-broken.md`.
 
 ### Changed
 - **Toolchain pin** `cyrius = "5.4.7" → "5.4.10"` in `cyrius.cyml`.
@@ -1102,3 +1115,22 @@ Rust v1.0.0 release. Full GPU foundation library with 25 modules, 278 tests,
 ### Added
 - Initial Rust implementation: context, compute, buffer, texture, render_target,
   profiler, capabilities, color, error
+
+---
+
+[Unreleased]: https://github.com/MacCracken/mabda/compare/2.5.0...HEAD
+[2.5.0]: https://github.com/MacCracken/mabda/compare/2.4.5...2.5.0
+[2.4.5]: https://github.com/MacCracken/mabda/compare/2.4.4...2.4.5
+[2.4.4]: https://github.com/MacCracken/mabda/compare/2.4.3...2.4.4
+[2.4.3]: https://github.com/MacCracken/mabda/compare/2.4.2...2.4.3
+[2.4.2]: https://github.com/MacCracken/mabda/compare/2.4.1...2.4.2
+[2.4.1]: https://github.com/MacCracken/mabda/compare/2.4.0...2.4.1
+[2.4.0]: https://github.com/MacCracken/mabda/compare/2.3.0...2.4.0
+[2.3.0]: https://github.com/MacCracken/mabda/compare/2.2.0...2.3.0
+[2.2.0]: https://github.com/MacCracken/mabda/compare/2.1.2...2.2.0
+[2.1.2]: https://github.com/MacCracken/mabda/compare/2.1.1...2.1.2
+[2.1.1]: https://github.com/MacCracken/mabda/compare/2.1.0...2.1.1
+[2.1.0]: https://github.com/MacCracken/mabda/compare/2.0.0...2.1.0
+[2.0.0]: https://github.com/MacCracken/mabda/compare/1.0.0...2.0.0
+[1.0.0]: https://github.com/MacCracken/mabda/compare/0.1.0...1.0.0
+[0.1.0]: https://github.com/MacCracken/mabda/releases/tag/0.1.0

@@ -10,8 +10,9 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + C launcher
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 5.5.20+ (`cyrius.cyml: cyrius = "5.5.20"`)
-- **Version**: 2.4.1 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
+- **Version**: 2.5.0 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
 - **GPU FFI**: wgpu-native v29 C API via `deps/wgpu_main.c` launcher
+  (65-slot function table, 7 struct-packing shims)
 
 ## Goal
 
@@ -22,14 +23,16 @@ v3.x is an implementation detail, not an API break.
 
 ## Current State
 
-- **Source**: 29 domain modules under `src/*.cyr`, ~4,000 lines total.
-- **Tests**: 309 CPU-only assertions in `tests/tcyr/mabda.tcyr` plus a
-  GPU integration test (`programs/phase0.cyr`) driven through the C
-  launcher.
-- **Benchmarks**: `tests/bcyr/mabda.bcyr` — color, workgroup math,
-  profiler, capability report. Reference Rust numbers in
+- **Source**: 30 domain modules under `src/*.cyr`, ~4,500 lines total.
+- **Tests**: 387 CPU-only assertions in `tests/tcyr/mabda.tcyr` plus
+  four GPU integration programs (`phase0`, `compute_e2e`, `render_e2e`,
+  `render_graph_e2e`) driven through the C launcher. GPU benchmarks
+  in `programs/benchmarks.cyr` (13 benches, Rust v1 parity set).
+- **Benchmarks**: `tests/bcyr/mabda.bcyr` — 7 CPU benches (color,
+  workgroup math, profiler, capability report). GPU benches via
+  `make bench-gpu`. Reference Rust numbers in
   `docs/benchmarks-rust-v-cyrius.md`.
-- **Dist bundle**: `dist/mabda.cyr` — 4,025 lines, ~142 KB.
+- **Dist bundle**: `dist/mabda.cyr` — ~4,900 lines, ~160 KB.
   `cyrius distlib` regenerates it.
 - **Integration**: consumed by soorat, rasa, ranga, bijli, aethersafta,
   kiran (via soorat).
@@ -61,53 +64,58 @@ them against the installed toolchain.
 ```bash
 cyrius deps                              # resolve stdlib into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke   # link-check
-cyrius test tests/tcyr/mabda.tcyr        # 309 CPU assertions
-cyrius bench tests/bcyr/mabda.bcyr       # CPU benchmarks
+cyrius test tests/tcyr/mabda.tcyr        # 387 CPU assertions
+cyrius bench tests/bcyr/mabda.bcyr       # 7 CPU benchmarks
 cyrius distlib                           # → dist/mabda.cyr
-make test-phase0                         # GPU integration (needs wgpu-native)
+make test-gpu                            # 4 GPU integration programs (needs wgpu-native)
+make bench-gpu                           # 13 GPU benchmarks
 ```
 
 ## Architecture (flat — matches yukti / vidya)
 
 ```
 mabda/
-├── src/                 29 GPU library modules — flat, zero transitive includes
+├── src/                 30 GPU library modules — flat, zero transitive includes
 │   ├── lib.cyr            — the single include chain (stdlib + domain modules)
 │   ├── error.cyr          — GpuErr codes + Result helpers
 │   ├── color.cyr          — f64-backed RGBA colour type
 │   ├── capabilities.cyr   — WebGPU limit detection
 │   ├── profiler.cyr       — CPU-side frame timing, EMA, history
 │   ├── resource.cyr       — RAII-ish buffer/texture lifetime tracker
-│   ├── wgpu_types.cyr     — usage/format/shader-stage enums
-│   ├── wgpu_descriptors.cyr — packed descriptor builders
-│   ├── wgpu_ffi.cyr       — 40-entry function-pointer table
+│   ├── wgpu_types.cyr     — @internal: usage/format/shader-stage enums
+│   ├── wgpu_descriptors.cyr — @internal: packed descriptor builders
+│   ├── wgpu_ffi.cyr       — @internal: 65-entry function-pointer table
 │   ├── context.cyr        — GpuContext (instance/adapter/device/queue)
 │   ├── buffer.cyr         — low-level buffer helpers
 │   ├── typed_buffer.cyr   — uniform/storage buffer metadata
 │   ├── gpu_timestamps.cyr — TIMESTAMP_QUERY feature wiring
 │   ├── compute.cyr        — compute pipeline + ping-pong helpers
-│   ├── cache_key.cyr      — shared hash helper
-│   ├── shader_cache.cyr   — WGSL source → module cache
-│   ├── pipeline_cache.cyr — (pipeline layout, entry) → pipeline cache
-│   ├── bind_group_cache.cyr — (layout, resource-id tuple) → bind group
+│   ├── shader_cache.cyr   — WGSL source → module cache (u64-keyed, v2.4.5)
+│   ├── pipeline_cache.cyr — u64 hash → pipeline cache (u64-keyed, v2.4.5)
+│   ├── bind_group_cache.cyr — u64 hash → bind group cache (u64-keyed, v2.4.5)
 │   ├── vertex.cyr         — Vertex2D / 3D layouts
 │   ├── blend.cyr          — BLEND_* constants
 │   ├── sampler.cyr        — sampler descriptor builder
 │   ├── depth.cyr          — depth-stencil state + depth-texture helpers
 │   ├── bind_group.cyr     — BGL builder
-│   ├── texture.cyr        — RGBA8 helpers, create_from_rgba, cache
-│   ├── render_target.cyr  — RenderTarget + builder
+│   ├── texture.cyr        — RGBA8 helpers, render-target create, cache
+│   ├── render_target.cyr  — RenderTarget + builder (texture + view + MSAA + depth)
 │   ├── render_pipeline.cyr — pipeline builder, create_simple, draw helpers
-│   ├── render_pass.cyr    — RenderPass builder
+│   ├── render_pass.cyr    — RenderPass builder + rpb_pass_begin dispatcher
+│   ├── render_graph.cyr   — DAG pass orchestration (v2.5.0)
 │   ├── surface.cyr        — surface configuration + acquire/present
 │   ├── instancing.cyr     — instance buffer + identity helpers
 │   └── debug.cyr          — push/pop debug markers
 ├── tests/
-│   ├── tcyr/mabda.tcyr    — consolidated CPU-only suite (273 assertions)
-│   └── bcyr/mabda.bcyr    — CPU-only benchmark harness
+│   ├── tcyr/mabda.tcyr    — consolidated CPU-only suite (387 assertions)
+│   └── bcyr/mabda.bcyr    — CPU-only benchmark harness (7 benches)
 ├── programs/
-│   ├── smoke.cyr          — link-check for the full include chain
-│   └── phase0.cyr         — GPU integration test (needs C launcher)
+│   ├── smoke.cyr              — link-check for the full include chain
+│   ├── phase0.cyr             — GPU smoke (buffer/texture/pipeline) — 10 PASS
+│   ├── compute_e2e.cyr        — compute dispatch round-trip — 7 PASS
+│   ├── render_e2e.cyr         — render pass clear + pixel verify — 8 PASS
+│   ├── render_graph_e2e.cyr   — 3-node DAG (compute → render → copy) — 5 PASS
+│   └── benchmarks.cyr         — 13 GPU benches, Rust-v1 parity set
 ├── dist/mabda.cyr         — bundle for `[deps.mabda]` consumers
 ├── deps/
 │   ├── wgpu_main.c        — C launcher: fn table + struct-packing shims
@@ -122,18 +130,22 @@ mabda/
 GPU programs go through the C launcher (`deps/wgpu_main.c`):
 
 1. C `main()` calls `_cyrius_init()` then `alloc_init()`
-2. C pre-initializes GPU (instance/adapter/device/queue)
-3. C builds the function-pointer table (40 wgpu functions + struct-packing shims)
+2. C pre-initializes GPU (instance/adapter/device/queue — Vulkan-only
+   via `WGPUInstanceExtras { backends = Vulkan }`; see v2.4.2 CHANGELOG
+   for why the default `All` was a problem on headless boxes)
+3. C builds the function-pointer table (65 wgpu functions +
+   7 struct-packing shims)
 4. C calls `mabda_main(fn_table_ptr, preinit_ptr)` which the consumer defines
-5. Cyrius calls wgpu via `fncall2` / `fncall5` — **never** `fncall6` directly
+5. Cyrius calls wgpu via `fncall1`/`fncall2`/`fncall5` and struct-packed
+   shims — **never** `fncall6` with a struct-by-value arg
 
 For standalone library testing (no GPU), `cyrius test` runs
 `tests/tcyr/mabda.tcyr` against `src/lib.cyr` — no wgpu-native needed.
 
 ## Key Constraints
 
-- **Tests are the way** — 309 CPU assertions + 1 GPU integration test,
-  all passing. Every new code path adds an assertion.
+- **Tests are the way** — 387 CPU assertions + 4 GPU integration
+  programs, all passing. Every new code path adds an assertion.
 - **Own the stack** — if AGNOS wraps something external, depend on the
   AGNOS crate (sakshi, yukti, patra). wgpu-native is the sole C dep
   and it is consumer-provided, not vendored.

@@ -1,8 +1,15 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 29 domain modules, ~4,000 lines, 286 CPU assertions + 1 GPU
-> integration test. `dist/mabda.cyr` bundle at 4,093 lines.
+> 30 domain modules, ~4,500 lines, 387 CPU assertions + 4 GPU
+> integration programs + 13 GPU benchmarks. `dist/mabda.cyr`
+> bundle at ~4,900 lines.
+
+This document is **forward-looking**. For detail on every shipped
+release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
+source of truth for completed work. Shipped-section details were
+pruned 2026-04-21 when the v2.x line closed so this file stays
+useful for planning instead of bloating with history.
 
 ## The Long Arc
 
@@ -15,416 +22,76 @@ consumers while the native GPU backend is being built. When the
 native backend lands, consumer code will not change by a single byte.
 
 ```
-  v2.3.0  ───▶  wgpu-native via C shim          (shipping, audited)
-  v2.4.0  ───▶  v1.0-parity (partial)           (compute E2E, LOW sweep)
-  v2.4.1  ───▶  sakshi observability            (structured logging + spans — additive)
-  v2.4.2  ───▶  GPU runtime validation          (FFI offset/enum sweep + compute E2E actually runs on GPU)
-  v2.4.3  ───▶  render-pass FFI + render E2E    (v1.0 checklist closed)
-  v2.4.4  ───▶  benchmark parity with Rust v1   (13 GPU benches + 2 latent FFI stubs fixed)
-  v2.4.5  ───▶  cache hot-path unblock          (u64-keyed hashmap migration — bind_group_cache_hit hits Rust parity)
-  v2.5.0  ───▶  render graph                    (DAG pass orchestration — additive, shipped)
+  v2.0.0 → v2.3.0  ─▶  Cyrius port + Rust-v1 parity + P(-1) audit      (shipped)
+  v2.4.0 → v2.4.5  ─▶  v1.0 parity completion + FFI validation +
+                        benchmark parity + cache hot-path unblock      (shipped)
+  v2.5.0           ─▶  render graph (DAG pass orchestration)           (shipped)
        │
-       │        kernel GPU driver work (in parallel, AGNOS scope)
+       │                   kernel GPU driver work (parallel, AGNOS scope)
        ▼
-  v3.0    ───▶  pure Cyrius GPU backend         (backend swap — API unchanged)
-  v3.1    ───▶  multi-queue + mipmaps           (consumer catch-up, C shim retired)
-  v3.2    ───▶  compressed textures + SPIR-V    (texture/shader breadth)
-  v3.3    ───▶  image loading                   (gated on pure-Cyrius decoder)
-  v3.x+   ───▶  WebGPU / WASM                   (blocked on Cyrius WASM backend)
+  v2.5.x           ─▶  render graph follow-ups (out-of-order toposort,
+                        aliasing pass) — driven by consumer demand
+  v3.0             ─▶  pure Cyrius GPU backend (backend swap, API unchanged)
+  v3.1             ─▶  multi-queue + mipmaps (consumer catch-up, C shim retired)
+  v3.2             ─▶  compressed textures + SPIR-V (texture/shader breadth)
+  v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
+  v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
 ```
 
 Everything in this roadmap prioritizes **API stability** over
 **backend correctness**. The public surface (context, buffer, compute,
-texture, render_pipeline, etc.) is the load-bearing contract. The FFI
-layer underneath is explicitly marked internal (`@internal` header on
-line 1 of every FFI module) so no consumer accidentally couples to it.
+texture, render_pipeline, render_pass, render_graph, etc.) is the
+load-bearing contract. The FFI layer underneath is explicitly marked
+internal (`@internal` header on line 1 of every FFI module) so no
+consumer accidentally couples to it.
 
 ---
 
-## v2.0.0 — Cyrius Port (Shipped)
+## Shipped — one-line history
 
-Complete port from Rust to Cyrius. All Rust modules ported. GPU FFI
-operational via C launcher + struct-packing shims.
+Source of truth: [`CHANGELOG.md`](../../CHANGELOG.md). Use that for
+detail; this table is a jump list.
 
-### Shipped
-- All core modules: error, color, capabilities, context, profiler, resource
-- All buffer/compute modules: buffer, compute, shader_cache, pipeline_cache, bind_group_cache
-- All graphics modules: vertex, blend, sampler, depth, texture, bind_group, instancing
-- All render modules: render_target, render_pipeline, render_pass, surface, debug
-- FFI layer: wgpu_types, wgpu_descriptors, wgpu_ffi, C launcher
-- 89 standalone tests + 4 GPU integration tests (including buffer round-trip)
-- Buffer readback round-trip (write → copy → map → verify) — **v1.0 criterion met**
-- Cyrius compiler fixes upstreamed: PIC codegen (3.4.12), mmap rename (3.4.12), `_cyrius_init` (3.4.14)
-- GPU discovery via yukti 1.2.0
-- Struct-packing shim pattern for wgpu functions with 6+ i64 args (avoids `fncall6` bug)
-
----
-
-## v2.1.0 — Feature Catch-up (Shipped)
-
-Rust-parity catch-up release. Every v2.1 item landed along with a
-batch of wgpu v29 enum-value fixes that were latent in the v2.0 tree
-(silently compiled against an older wgpu version — first noticed
-when texture and render pipeline FFI actually dispatched into
-wgpu-native).
-
-- `typed_buffer.cyr` port
-- Standalone `.tcyr` tests for pure-data modules (+191 assertions)
-- GPU timestamp profiling (`gpu_timestamps.cyr`)
-- Texture creation via FFI (slots 45–51)
-- Render pipeline FFI (slots 52–53, `render_pipeline_create_simple`)
-- Surface FFI (slots 54–57)
-- CPU-only benchmark harness (`tests/mabda.bcyr`)
-
-**Outcome:** 290 assertions, 10 GPU-backed phase-0 checks. Fixed a
-latent cache-dangling-pointer bug that shipped in v2.0 (shared
-`_hash_to_heap_key` helper in `cache_key.cyr`).
+| Release | Theme |
+|---------|-------|
+| [2.5.0](../../CHANGELOG.md#250--2026-04-21) | Render graph — DAG pass orchestration, single encoder + single submit, 44 new regression assertions |
+| [2.4.5](../../CHANGELOG.md#245--2026-04-21) | Cache hot-path unblock — u64-keyed hashmap migration (cyrius v5.5.20); `bind_group_cache_hit` reaches Rust parity |
+| [2.4.4](../../CHANGELOG.md#244--2026-04-21) | Benchmark parity — 13 GPU benches ported, `depth_texture_new` / `rtb_build` latent stubs fixed |
+| [2.4.3](../../CHANGELOG.md#243--2026-04-20) | Render-pass FFI + render E2E (closes v1.0 checklist) |
+| [2.4.2](../../CHANGELOG.md#242--2026-04-20) | GPU runtime validation — FFI offset / enum sweep; compute E2E actually runs on GPU |
+| [2.4.1](../../CHANGELOG.md#241--2026-04-19) | Sakshi observability — opt-in structured logging and spans |
+| [2.4.0](../../CHANGELOG.md#240--2026-04-19) | v1.0 parity (partial) — compute E2E program, LOW audit sweep |
+| [2.3.0](../../CHANGELOG.md#230--2026-04-19) | P(-1) security audit — 0 CRITICAL / 2 HIGH / 6 MED / 6 LOW across 29 modules |
+| [2.2.0](../../CHANGELOG.md#220--2026-04-19) | Scaffolding refresh — flat layout, `cyrius.cyml`, `cyrius distlib` |
+| [2.1.2](../../CHANGELOG.md#212--2026-04-12) | Rust-source removal hygiene release |
+| [2.1.1](../../CHANGELOG.md#211--2026-04-12) | Stdlib inclusion — `dist/mabda.cyr` single-file bundle |
+| [2.1.0](../../CHANGELOG.md#210--2026-04-12) | Feature catch-up — `typed_buffer`, GPU timestamps, texture / render pipeline FFI |
+| [2.0.0](../../CHANGELOG.md#200--2026-04-11) | Cyrius port — complete Rust → Cyrius port of every module |
+| [1.0.0](../../CHANGELOG.md#100--2026-04-09) | Last Rust release, frozen as the Cyrius-port reference |
 
 ---
 
-## v2.1.1 — Stdlib Inclusion (Shipped)
+## v2.5.x — Render graph follow-ups (not yet scheduled)
 
-Goal: ship mabda as a Cyrius stdlib dep so every Cyrius user gets a
-sovereign GPU surface they can build against.
+Everything below is in the out-of-scope list in `docs/guides/render-graph.md`.
+None of it is blocking a consumer today; each item ships when a specific
+consumer request arrives. Listed so they don't get lost.
 
-- `dist/mabda.cyr` single-file bundle
-- `[lib]` section in the manifest
-- Toolchain pin bumped to Cyrius 3.4.19 (the release that activates
-  `[deps.mabda]` as a first-class dep)
-- Public API surface marked with `# @public` / `# @internal` on
-  line 1 of every `src/*.cyr` file (see ADR 005)
-- `examples/stdlib-consumer/` reference project
-- `docs/stdlib-integration.md` consumer guide
-- Vendored `lib/*.cyr` replaced by a symlink to `$HOME/.cyrius/lib/`
-- `scripts/version-check.sh` — version consistency gate
-
----
-
-## v2.1.2 — Rust-source Removal (Shipped)
-
-Hygiene release. The frozen `rust-old/` tree was removed from the
-working tree; the full Rust v1.0.0 source remains accessible via
-`git checkout 1.0.0`. Preserved the Rust benchmark history CSV and
-the Rust coverage snapshot inlined into
-`docs/benchmarks-rust-v-cyrius.md`.
-
----
-
-## v2.2.0 — Scaffolding Refresh (Shipped)
-
-Project layout brought in line with the first-party AGNOS convention
-(yukti / vidya / patra). Toolchain pin jumped from Cyrius 3.4.19 to
-5.4.7. No library API changes — every consumer call site keeps
-working without modification.
-
-- `cyrius.toml` → `cyrius.cyml` (yukti format,
-  `version = "${file:VERSION}"` templating)
-- Flat layout: `src/lib.cyr` (renamed from `src/mabda.cyr`) declares
-  the single include chain; 29 domain modules remain flat
-- `tests/tcyr/mabda.tcyr` — consolidated CPU-only suite (273
-  assertions)
-- `tests/bcyr/mabda.bcyr` — benchmark harness in conventional subdir
-- `programs/smoke.cyr` — link-check entry point for `cyrius build`
-- `programs/phase0.cyr` — renamed GPU integration test
-- CI rewritten to match yukti: lint / fmt / vet / dist-sync / test /
-  bench gates
-- Release workflow regenerates `dist/mabda.cyr` via `cyrius distlib`
-- Makefile shrunk to a thin wrapper over the `cyrius` CLI
-- `scripts/bundle.sh` retired (`cyrius distlib` replaces it)
-
----
-
-## v2.3.0 — P(-1) Security Audit (Shipped)
-
-Last audit-gated stdlib-candidate release before mabda is promoted
-to first-party trusted status alongside yukti / patra / sakshi. Full
-findings in
-[`docs/audit/2026-04-19-audit.md`](../audit/2026-04-19-audit.md) —
-0 CRITICAL / 2 HIGH / 6 MED / 6 LOW across 29 modules; every HIGH
-and MED fixed.
-
-- **HIGH-1** `surface_state_present` name collision → accessor was
-  silently shadowed by the mutating present helper, breaking
-  `_surface_state_configure`
-- **HIGH-2** `rpb_label` 4-byte heap overflow (80-byte alloc, 8-byte
-  store at +76)
-- **MED-1** workgroup helpers: zero-divisor SIGFPE
-- **MED-2** growable buffer: `cap * 2` overflow
-- **MED-3** texture upload: dimension product overflow + missing
-  zero-dim guard
-- **MED-4** storage buffer write: `write_count × element_size`
-  overflow
-- **MED-5** storage buffer wrap: capacity / count / element_size
-  inconsistency
-- **MED-6** profiler: `clock_gettime` return-value unchecked
-- 13 new audit-regression assertions (273 → 286)
-- `CLAUDE.md` gains P(-1) + Security Hardening sections
-
-### Scheduled (not blocking 2.3.0)
-- **LOW-2** `read_buffer` size cap
-- **LOW-3** wire `validate_dispatch` / `validate_dimensions` into
-  internal dispatchers
-- **LOW-4** bounded `strlen` in `wgpu_string_view`
-- **LOW-5** resource cleanup on `compute_pipeline_new` failure paths
-- **LOW-6** clamp color components in `texture_from_color`
-
----
-
-## v2.4.0 — v1.0-Parity (Partial) (Shipped)
-
-Pick off the v1.0 criteria the existing FFI surface can already
-reach. Render-pipeline end-to-end deferred to v2.4.3 because the
-FFI table has no render-pass execution slots yet (descriptor
-builder exists; encoder dispatch does not — see `wgpu_ffi.cyr`,
-slots end at 57/surface). Small release, no structural changes.
-
-| # | Item | Status |
-|---|------|--------|
-| 1 | Compute dispatch end-to-end test in `programs/` | Planned — write → dispatch → read-back assertion, mirroring the buffer round-trip that already ships |
-| 2 | Pick up scheduled LOW audit items (LOW-2 → LOW-6) | Planned — none individually block, but 2.4.0 is a good time to sweep |
-| 3 | `make build-gpu-programs` CI gate | Planned — compile-but-don't-link every `programs/*.cyr`, fail on any cc5 warning. Closes the missing-include class of bug surfaced by `docs/issues/2026-04-19-phase0-build-broken.md` Issue 2 |
-
-Exit criteria: `programs/phase0.cyr` + `programs/compute_e2e.cyr`
-together exercise every v1.0 criterion the current FFI can reach.
-Render-pipeline E2E waits for v2.4.3.
-
----
-
-## v2.4.1 — Sakshi Observability (Shipped)
-
-Earn the sakshi include that's already in `src/lib.cyr`. Wire the
-structured-logging / span / packed-error primitives into mabda's
-existing plumbing. Additive only — no public API changes, default
-behaviour stays silent (consumers opt in via `sakshi_set_level`).
-
-### Planned scope
-- **`src/error.cyr`** — every `Err(gpu_err(...))` construction path
-  emits `sakshi_error(...)` with the GpuErr code mapped to a short
-  category string. Existing tagged-union return shape unchanged.
-- **`src/profiler.cyr`** — `profiler_frame_begin` /
-  `profiler_frame_end` wrap their timing logic in
-  `sakshi_span_enter("frame", 5)` / `sakshi_span_exit()` so trace
-  consumers get per-frame spans for free.
-- **`src/context.cyr`** — `sakshi_info` on context creation,
-  `sakshi_warn` on the adapter-not-found / device-create-failed
-  error paths.
-- **~5 new CPU assertions** — level gating, emission fires, span
-  depth behaves across frame begin/end.
-
-### Out of scope for 2.4.1
-- Replacing any part of the profiler with sakshi — both coexist.
-- Wiring sakshi into `resource.cyr` leak tracing (backlog — adds
-  noise without a consumer asking for it).
-- UDP / file / ring-buffer sakshi outputs — consumer-configured,
-  mabda just emits events.
-
-### Exit criteria
-- `dist/mabda.cyr` still clean; `examples/stdlib-consumer/` still
-  compiles unchanged.
-- CPU suite passes with sakshi level set to `SK_TRACE` end-to-end
-  (captures events without crashing).
-- At least one soorat / rasa consumer opts in and reports back that
-  spans show up in their sakshi output.
-
----
-
-## v2.4.2 — GPU Runtime Validation (Shipped)
-
-Scope re-carve. The original v2.4.2 plan (render-pass FFI + render
-E2E) moves to v2.4.3. v2.4.1 shipped with latent FFI bugs that
-CPU-only tests couldn't catch — `compute_e2e` and `phase0` were
-compile-clean and link-clean but had never run against a real
-wgpu-native + Vulkan driver. First-ever run on a RADV / Mesa 26.0
-box surfaced a cascade of offset / enum / ABI issues. v2.4.2 fixes
-all of them and adds CPU regression assertions that would have
-caught the originals — the provable foundation v2.4.3 can build on.
-
-### Shipped
-- Toolchain pin `5.4.10 → 5.5.11`; `_cyrius_init` fix and
-  `fncall7`/`fncall8` confirmed at the current release.
-- **`deps/wgpu_main.c`** — `wgpuCreateInstance` now passes
-  `InstanceExtras { backends = Vulkan }`. Headless-safe on Mesa.
-- **`Makefile`** — `strstr` localized (was interposing libc and
-  breaking Mesa's driver-string probing).
-- **`src/wgpu_descriptors.cyr`** — `wgpu_bgl_entry_buffer` offsets
-  corrected for v29's `WGPUBufferBindingLayout` (8-byte
-  `nextInChain` first; `type@+40`, `hasDynOffset@+44`, `minSize@+48`).
-- **`src/wgpu_types.cyr`** — `WGPUBufferBindingType` renumbered for
-  v29 (inserted `BindingNotUsed = 0`); `WGPULoadOp` values
-  un-swapped (`LOAD=1`, `CLEAR=2`).
-- **`src/compute.cyr`** — `compute_dispatch` signature reduced from
-  7 params to 5 via a `dims_xyz` pointer. The 7-param class
-  reliably crashes when internally fncalling into wgpu-native
-  (re-verified at 5.5.11 — see `feedback_cyrius_param_ceiling`).
-  **Breaking** — migration in the CHANGELOG.
-- **`programs/phase0.cyr`, `programs/compute_e2e.cyr`** — added
-  missing `include "lib/sakshi.cyr"` (regression from v2.4.1's
-  observability wiring, caught by 5.5.11's stricter `cyrius check`).
-- **18 new CPU regression assertions** under a new
-  `v2.4.2 — GPU runtime validation regressions` section. 309 → 327.
-- **`make test-phase0`** 10/10 pass; **`make test-compute-e2e`** 7/7
-  pass on a RADV / Mesa 26.0 / kernel 6.18 host.
-
-### v1.0 tick
-- **Compute dispatch end-to-end** — now runs on real hardware.
-  Last open v1.0 item is render-pipeline E2E (v2.4.3).
-
----
-
-## v2.4.5 — Cache Hot-Path Unblock (Shipped)
-
-Narrow patch release. Picks up cyrius v5.5.20's new u64-keyed
-hashmap API (`map_u64_*`) and migrates mabda's four cache modules
-(`shader_cache`, `pipeline_cache`, `bind_group_cache`,
-`texture_cache`) to use it directly. Retires `src/cache_key.cyr`
-and its per-lookup heap-alloc helper.
-
-### Shipped
-- Toolchain pin `5.5.11 → 5.5.20`.
-- Cache modules rewritten to use `map_u64_*` directly.
-- `src/cache_key.cyr` deleted.
-- `programs/benchmarks.cyr` cache-hit iteration counts relaxed
-  (the arena-exhaustion risk that forced the cap is gone).
-
-### Headline
-- `bind_group_cache_hit` drops **210 ns → 16 ns (13× faster)** —
-  reaches Rust v1 parity (Rust was 13 ns).
-- `shader_cache_hit` drops **553 ns → 195 ns (2.8× faster)**.
-- All other benchmarks within noise of v2.4.4 numbers; 13/13 GPU
-  benches still pass end-to-end.
-
----
-
-## v2.4.4 — Benchmark Parity with Rust v1 (Shipped)
-
-Ports the 13 GPU-backed Rust benchmarks the v2.1 CPU harness deferred
-so the side-by-side comparison in `docs/benchmarks-rust-v-cyrius.md`
-covers the full 20-benchmark Rust v1 suite. Running the benchmarks on
-real hardware surfaced two more latent FFI stubs that shipped through
-v2.4.3 carrying TODO markers — both fixed in this release.
-
-### Shipped
-- `programs/benchmarks.cyr` with 13 GPU benches; `make bench-gpu`
-  runs them; CSV output pipes into `bench-history.csv`.
-- `tests/bcyr/mabda.bcyr` CPU harness also emits CSV rows.
-- `depth_texture_new` fixed — was calling `wgpu_device_create_buffer`
-  (wrong API) with broken descriptor offsets; now uses the shared
-  `wgpu_texture_descriptor` builder and `wgpu_device_create_texture`.
-- `rtb_build` fixed — was a stub that never created GPU resources;
-  now creates the main render-target texture, optional MSAA
-  texture with `sampleCount` patched in place, and optional depth
-  attachment.
-- `docs/benchmarks-rust-v-cyrius.md` expanded with full comparison
-  across all 20 benchmarks.
-
-### Headline
-- Cyrius beats Rust v1 on 7 of 13 GPU benches; within 2× on 4 more.
-- Cache-hit benches (shader + bind-group) are the outliers at ~15×
-  slower — traced to `_hash_to_heap_key` per-lookup heap alloc.
-  A u64-keyed hashmap in the cyrius stdlib would close this; tracked
-  for v2.5+.
-
----
-
-## v2.4.3 — Render-pass FFI + Render E2E (Shipped)
-
-Closes the v1.0 checklist. Adds the wgpu render-pass execution
-surface on top of v2.4.2's runtime-validated FFI foundation.
-
-### Shipped
-- 7 new FFI slots (58-64) in `deps/wgpu_main.c` + `src/wgpu_ffi.cyr`.
-- 2 struct-packing C shims: `WgpuBeginPassArgs` (40B) and
-  `WgpuCopyTexToBufArgs` (72B).
-- `rpb_pass_begin(encoder, b)` dispatcher in `src/render_pass.cyr`.
-- `texture_create_render_target_rgba8` helper in `src/texture.cyr`.
-- **`programs/render_e2e.cyr`** — 256×256 RGBA8 offscreen render
-  target → clear to `(1.0, 0.0, 0.0, 1.0)` → copy back → verify
-  pixel(0,0) = `0xFF, 0x00, 0x00, 0xFF` exact.
-- Latent `WGPURenderPassColorAttachment` layout bug in
-  `src/render_pass.cyr` fixed (was 56/64 bytes mixed — v29 is 72).
-- 16 new CPU regression assertions (327 → 343).
-- `make test-render-e2e` 8/8 passes on RADV / Mesa 26.0.
-
-### v1.0 tick
-- ✅ **Render pipeline end-to-end draw + readback** — last open
-  v1.0 criterion. Every v1.0 item mabda owns is now live.
-
-### Planned scope
-- **`wgpu_ffi.cyr` slots 58-63 (approx)** — add:
-  - `wgpuCommandEncoderBeginRenderPass` (likely struct-packed via
-    a C shim — descriptor has 6+ fields including a colorAttachments
-    array pointer; fits the `feedback_fncall6_wgpu` pattern)
-  - `wgpuRenderPassEncoderSetPipeline`
-  - `wgpuRenderPassEncoderSetBindGroup`
-  - `wgpuRenderPassEncoderDraw`
-  - `wgpuRenderPassEncoderEnd`
-  - `wgpuRenderPassEncoderRelease`
-  - `wgpuCommandEncoderCopyTextureToBuffer` (struct-packed shim —
-    src/dst are `WGPUTexelCopyTextureInfo` / `WGPUTexelCopyBufferInfo`
-    structs)
-- **`render_pass.cyr` dispatcher** — `rpb_pass_begin(encoder, b)`
-  builder method that emits the descriptor and calls the new FFI.
-- **`programs/render_e2e.cyr`** — create offscreen RGBA8 render
-  target with RENDER_ATTACHMENT | COPY_SRC usage; clear to a known
-  colour via render pass; copy texture → buffer; map + verify
-  pixels.
-- **`deps/wgpu_main.c`** — 2-3 new struct-packing shims, fn-table
-  population.
-- **~10 new CPU assertions** + 1 new GPU integration program.
-
-### Exit criteria
-- `make test-render-e2e` passes on a wgpu-native-capable host.
-- v1.0 criteria checklist below is fully ticked.
-- `make build-gpu-programs` CI gate continues to compile-clean
-  every `programs/*.cyr`.
-
-### Why this isn't bundled into 2.5.0
-The render graph in 2.5.0 *uses* render-pass dispatch as a
-primitive — it cannot land cleanly without the FFI slots existing
-first. Splitting them gives 2.5.0 a clean "build orchestration on
-top of stable primitives" narrative instead of mixing FFI plumbing
-with DAG design.
-
----
-
-## v2.5.0 — Render Graph (Shipped)
-
-First feature release post-parity. Added DAG-style pass orchestration
-on top of the stable compute + render-pass + copy primitives. Additive
-only — no existing public API changed.
-
-### Shipped
-- `src/render_graph.cyr` — new module (350 LOC). Node types:
-  **compute** (pipeline + bind group + dims), **render** (pass
-  builder + optional pipeline + vertex count), **copy_buf_buf** and
-  **copy_tex_buf** (direct and struct-packed encoder dispatch).
-  **Transient resources** — buffers and textures the graph owns
-  between `rg_build` and `rg_release`.
-- Kahn's toposort over insertion-order read/write edges; cycle
-  detection returns error from `rg_build`.
-- Execution: one `WGPUCommandEncoder` for the whole graph + one
-  `queue.submit` — the per-node overhead is zero.
-- 44 new CPU assertions (343 → 387) in `tests/tcyr/mabda.tcyr`.
-- `programs/render_graph_e2e.cyr` — 3-node integration test
-  (compute doubler → render clear-to-red → texture copy). 5/5 pass
-  on RADV / Mesa 26.0.
-- `docs/guides/render-graph.md` — authoring guide with a three-node
-  example, node-kind table, reads/writes semantics, execution
-  contract, out-of-scope list.
-- `make test-render-graph-e2e` Makefile target; added to the
-  aggregate `make test-gpu` gate.
-
-### Out of scope (v2.5.1+)
-- Full out-of-order toposort with multi-version read/write
-  tracking — today's sort respects insertion-order edges only,
-  which validates that the user supplied a correct linear order.
-- Resource aliasing pass — the `aliasing_flag` / `first_use` hooks
-  are in place but no pass consumes them yet. Ships when a consumer
-  asks for memory-tight frames.
-- Automatic barrier insertion — wgpu-native handles this; v3.0's
-  native backend revisits.
-- Cross-queue coordination — single-queue only. Moves to v3.1.
-- Conditional / branching passes — linear DAG only.
+- **Full out-of-order toposort.** Today's Kahn implementation only
+  counts edges in insertion-order direction; that validates users
+  who build graphs in a correct linear order. Programmatic consumers
+  that build graphs with cross-inserted dependencies need multi-
+  version read/write tracking.
+- **Resource aliasing pass.** The `rg_aliasing(g, 1)` flag and the
+  `first_use` field on `TransientResource` are already scaffolded.
+  Ship the alias analysis that walks transients and reuses backing
+  storage between disjoint lifetimes — relevant for consumers with
+  dozens of transient buffers per frame.
+- **Per-node debug scopes.** Wrap each node's encoding in
+  `debug_push(node.label)` / `debug_pop` so GPU profilers
+  (RenderDoc, PIX, RGP) show the graph structure.
+- **Graph visualizer.** Export a DOT file or similar from the
+  toposorted node/edge list. Consumer-requested; not core.
 
 ---
 
@@ -453,8 +120,9 @@ v2.5 render graph must also replay unchanged.
 
 ### Exit criteria
 - `dist/mabda.cyr` consumers rebuild with `[backends]` defaulting to
-  `native`; `examples/stdlib-consumer/` and `programs/phase0.cyr`
-  pass without the C launcher.
+  `native`; `examples/stdlib-consumer/`, `programs/phase0.cyr`,
+  `programs/compute_e2e.cyr`, `programs/render_e2e.cyr`,
+  `programs/render_graph_e2e.cyr` all pass without the C launcher.
 - soorat, rasa, ranga, bijli, aethersafta, kiran all green on the
   native backend in their own CI.
 - `deps/wgpu_main.c` and `deps/wgpu-native/` removed from the tree
@@ -510,28 +178,29 @@ backend is stable.
 
 ## Backlog (not yet scheduled)
 
-Empty. All previously-listed backlog items are now slotted into
-2.5.0 → 3.x above. New items land here first and graduate to a
-version once there's consumer demand plus a clear scope.
+Empty. New items land here first and graduate to a version once
+there's consumer demand plus a clear scope.
 
 ---
 
 ## v1.0.0 Criteria (Rust v1.0 feature parity in Cyrius)
 
-- [x] All 29 modules ported
-- [x] GPU context creation working
-- [x] Buffer create / write / release working
+All mabda-side criteria complete as of v2.4.3. The last open item is
+consumer-side.
+
+- [x] All core modules ported (30 as of v2.5.0 — v1.0 had 25).
+- [x] GPU context creation working.
+- [x] Buffer create / write / release working.
 - [x] Buffer readback round-trip (write → copy → map → verify) —
-      `programs/phase0.cyr`
-- [x] Texture create / view / upload / release — `programs/phase0.cyr`
-- [x] Render pipeline create / release — `programs/phase0.cyr`
-- [x] Compute dispatch end-to-end test (v2.4.0 wrote the program;
-      v2.4.2 got it running on real hardware — `programs/compute_e2e.cyr`)
-- [x] Render pipeline end-to-end draw + readback (v2.4.3 —
-      `programs/render_e2e.cyr`: clear → copy_texture_to_buffer →
-      map → verify pixel matches clear color exactly)
-- [ ] Consumer integration: soorat port to Cyrius (consumer-side, not
-      mabda-side — tracked in soorat's repo)
+      `programs/phase0.cyr`.
+- [x] Texture create / view / upload / release — `programs/phase0.cyr`.
+- [x] Render pipeline create / release — `programs/phase0.cyr`.
+- [x] Compute dispatch end-to-end test — `programs/compute_e2e.cyr`
+      (v2.4.0 wrote; v2.4.2 got it running on real hardware).
+- [x] Render pipeline end-to-end draw + readback —
+      `programs/render_e2e.cyr` (v2.4.3).
+- [ ] Consumer integration: soorat port to Cyrius (consumer-side,
+      tracked in soorat's repo).
 
 ---
 

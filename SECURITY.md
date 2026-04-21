@@ -24,9 +24,9 @@ harden the wrapper, document the workaround, or both.
 
 | Version | Supported                                                |
 |---------|----------------------------------------------------------|
-| 2.3.x   | **Yes** — current release, receives security fixes       |
-| 2.2.x   | Yes — receives security fixes via back-ports on request  |
-| < 2.2   | No                                                       |
+| 2.5.x   | **Yes** — current release, receives security fixes       |
+| 2.4.x   | Yes — receives security fixes via back-ports on request  |
+| < 2.4   | No                                                       |
 
 ## Response Timeline
 
@@ -54,10 +54,14 @@ adjacent GPU / wgpu surfaces. Findings are filed as
 |------------|---------|------------------------------|---------------------------------------------------------------|
 | 2026-04-19 | 2.3.0   | 0 CRITICAL / 2 HIGH / 6 MED / 6 LOW | [`docs/audit/2026-04-19-audit.md`](docs/audit/2026-04-19-audit.md) |
 
-2.3.0 was the last audit-gated stdlib-candidate release. From 2.4.0 on,
-the `CLAUDE.md` Security Hardening checklist is the rolling internal
-gate; the next full audit pass will land alongside the v3.0 backend
-swap (native Cyrius GPU backend — see ADR 004 / planned ADR 006).
+2.3.0 was the last audit-gated stdlib-candidate release. From 2.4.0
+through 2.5.x, the `CLAUDE.md` Security Hardening checklist has been
+the rolling internal gate. Every v2.4.x patch that fixed a latent
+bug (e.g. v2.4.2 FFI offset sweep, v2.4.4 `depth_texture_new` /
+`rtb_build` stub fixes) landed with a CPU regression assertion in
+`tests/tcyr/mabda.tcyr` so the bug can't re-enter. The next full
+audit pass will land alongside the v3.0 backend swap (native Cyrius
+GPU backend — see ADR 004 / planned ADR 006).
 
 ## Design Principles
 

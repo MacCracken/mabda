@@ -29,7 +29,7 @@ stdlib = ["alloc", "string", "fmt", "syscalls", "tagged", "fnptr"]
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "2.3.0"
+tag = "2.5.0"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -43,8 +43,8 @@ a `# @public` or `# @internal` marker on line 1:
 
 - **`# @public`** — stable API, survives the v3.0 backend swap. Safe.
 - **`# @internal`** — FFI scaffolding (`wgpu_types`,
-  `wgpu_descriptors`, `wgpu_ffi`, `cache_key`). Will be replaced.
-  Do not reference these from consumer code.
+  `wgpu_descriptors`, `wgpu_ffi`). Will be replaced. Do not
+  reference these from consumer code.
 
 Consumer entry points look like this:
 

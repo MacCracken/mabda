@@ -24,7 +24,7 @@ cyrius build                               # compile the consumer
 ```
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`2.3.0`), and creates `lib/mabda.cyr` as a symlink into
+there (`2.5.0`), and creates `lib/mabda.cyr` as a symlink into
 `$HOME/.cyrius/cache/mabda/dist/mabda.cyr`. The consumer then
 includes it with `include "lib/mabda.cyr"`.
 
