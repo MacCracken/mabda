@@ -1999,6 +1999,309 @@ fn test_native_gem_mmap_request_layout() {
     return 0;
 }
 
+# ================================================================
+# v3 Phase B.3.a — submission infrastructure constants
+# ================================================================
+
+fn test_native_phase_b3a_nr_offsets() {
+    assert_eq(DRM_AMDGPU_CTX,     0x02, "CTX nr offset");
+    assert_eq(DRM_AMDGPU_BO_LIST, 0x03, "BO_LIST nr offset");
+    assert_eq(DRM_AMDGPU_GEM_VA,  0x08, "GEM_VA nr offset");
+    return 0;
+}
+
+fn test_native_ctx_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_CTX_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_CTX);
+    assert_eq(DRM_IOCTL_AMDGPU_CTX, expected, "CTX ioctl = 0xC0106442");
+    assert_eq(DRM_IOCTL_AMDGPU_CTX, 0xC0106442, "precomputed constant");
+    return 0;
+}
+
+fn test_native_bo_list_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_BO_LIST_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_BO_LIST);
+    assert_eq(DRM_IOCTL_AMDGPU_BO_LIST, expected, "BO_LIST ioctl = 0xC0186443");
+    assert_eq(DRM_IOCTL_AMDGPU_BO_LIST, 0xC0186443, "precomputed constant");
+    return 0;
+}
+
+fn test_native_gem_va_ioctl_encoding() {
+    # GEM_VA is WRITE-only (kernel reads everything from the struct,
+    # writes nothing back). dir=1, size=64.
+    var expected = native_ioc_encode(1, DRM_AMDGPU_GEM_VA_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_VA, expected, "GEM_VA ioctl = 0x40406448");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_VA, 0x40406448, "precomputed constant");
+    return 0;
+}
+
+fn test_native_struct_sizes() {
+    assert_eq(DRM_AMDGPU_CTX_SIZE,           16, "drm_amdgpu_ctx union = 16");
+    assert_eq(DRM_AMDGPU_BO_LIST_SIZE,       24, "drm_amdgpu_bo_list union = 24");
+    assert_eq(DRM_AMDGPU_GEM_VA_SIZE,        64, "drm_amdgpu_gem_va struct = 64");
+    assert_eq(DRM_AMDGPU_BO_LIST_ENTRY_SIZE,  8, "drm_amdgpu_bo_list_entry = 8");
+    return 0;
+}
+
+fn test_native_ctx_opcodes() {
+    assert_eq(AMDGPU_CTX_OP_ALLOC_CTX, 1, "ALLOC_CTX = 1");
+    assert_eq(AMDGPU_CTX_OP_FREE_CTX,  2, "FREE_CTX = 2");
+    return 0;
+}
+
+fn test_native_bo_list_opcodes() {
+    assert_eq(AMDGPU_BO_LIST_OP_CREATE,  0, "BO_LIST_OP_CREATE = 0");
+    assert_eq(AMDGPU_BO_LIST_OP_DESTROY, 1, "BO_LIST_OP_DESTROY = 1");
+    return 0;
+}
+
+fn test_native_va_opcodes_and_flags() {
+    assert_eq(AMDGPU_VA_OP_MAP,            1,   "VA_OP_MAP = 1");
+    assert_eq(AMDGPU_VA_OP_UNMAP,          2,   "VA_OP_UNMAP = 2");
+    assert_eq(AMDGPU_VM_PAGE_READABLE,     0x2, "PAGE_READABLE = 0x2");
+    assert_eq(AMDGPU_VM_PAGE_WRITEABLE,    0x4, "PAGE_WRITEABLE = 0x4");
+    assert_eq(AMDGPU_VM_PAGE_EXECUTABLE,   0x8, "PAGE_EXECUTABLE = 0x8");
+    return 0;
+}
+
+fn test_native_bo_list_entry_layout() {
+    # drm_amdgpu_bo_list_entry: {bo_handle u32, bo_priority u32} = 8 bytes.
+    var e[8];
+    memset(&e, 0, 8);
+    store32(&e + 0, 7);
+    store32(&e + 4, 3);
+    assert_eq(load32(&e + 0), 7, "bo_handle at +0");
+    assert_eq(load32(&e + 4), 3, "bo_priority at +4");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B.3.b — PM4 packet builder
+# ================================================================
+
+fn test_native_pm4_opcodes() {
+    assert_eq(IT_NOP,             0x10, "IT_NOP opcode");
+    assert_eq(IT_SET_SH_REG,      0x76, "IT_SET_SH_REG opcode");
+    assert_eq(IT_DISPATCH_DIRECT, 0x15, "IT_DISPATCH_DIRECT opcode");
+    assert_eq(IT_ACQUIRE_MEM,     0x58, "IT_ACQUIRE_MEM opcode");
+    assert_eq(IT_RELEASE_MEM,     0x49, "IT_RELEASE_MEM opcode");
+    assert_eq(IT_EVENT_WRITE,     0x46, "IT_EVENT_WRITE opcode");
+    return 0;
+}
+
+fn test_native_sh_reg_byte_offsets() {
+    assert_eq(R_COMPUTE_DISPATCH_INITIATOR, 0xB800, "DISPATCH_INITIATOR byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_X,       0xB81C, "NUM_THREAD_X byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_Y,       0xB820, "NUM_THREAD_Y byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_Z,       0xB824, "NUM_THREAD_Z byte offset");
+    assert_eq(R_COMPUTE_PGM_LO,             0xB848, "COMPUTE_PGM_LO byte offset");
+    assert_eq(R_COMPUTE_PGM_HI,             0xB84C, "COMPUTE_PGM_HI byte offset");
+    assert_eq(R_COMPUTE_PGM_RSRC1,          0xB850, "PGM_RSRC1 byte offset");
+    assert_eq(R_COMPUTE_PGM_RSRC2,          0xB854, "PGM_RSRC2 byte offset");
+    assert_eq(R_COMPUTE_USER_DATA_0,        0xB900, "USER_DATA_0 byte offset");
+    return 0;
+}
+
+fn test_native_sh_reg_offset_encoding() {
+    # (byte_offset - 0xB000) / 4
+    assert_eq(native_sh_reg_offset(R_COMPUTE_DISPATCH_INITIATOR), 0x200, "DISPATCH_INITIATOR → 0x200");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_NUM_THREAD_X),       0x207, "NUM_THREAD_X → 0x207");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_LO),             0x212, "PGM_LO → 0x212");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_RSRC1),          0x214, "PGM_RSRC1 → 0x214");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_USER_DATA_0),        0x240, "USER_DATA_0 → 0x240");
+    return 0;
+}
+
+fn test_native_pm4_pkt3_header() {
+    # PKT3(IT_NOP, 1, 0): type=3, count=0, opcode=0x10, predicate=0.
+    # Expected: (3<<30) | (0<<16) | (0x10<<8) | 0 = 0xC0001000
+    assert_eq(native_pm4_pkt3_header(IT_NOP, 1, 0), 0xC0001000, "NOP count=1");
+    # PKT3(IT_SET_SH_REG, 2, 0): count-1=1, opcode=0x76.
+    # Expected: (3<<30) | (1<<16) | (0x76<<8) | 0 = 0xC0017600
+    assert_eq(native_pm4_pkt3_header(IT_SET_SH_REG, 2, 0), 0xC0017600, "SET_SH_REG count=2");
+    # PKT3(IT_DISPATCH_DIRECT, 4, 0): count-1=3, opcode=0x15.
+    # Expected: (3<<30) | (3<<16) | (0x15<<8) | 0 = 0xC0031500
+    assert_eq(native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 0), 0xC0031500, "DISPATCH_DIRECT count=4");
+    # Predicate bit in the low byte.
+    assert_eq(native_pm4_pkt3_header(IT_NOP, 1, 1), 0xC0001001, "predicate bit set");
+    return 0;
+}
+
+fn test_native_pm4_set_sh_reg_one_layout() {
+    # Setting one register: header + offset + value = 3 dwords.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_set_sh_reg_one(&buf, 0, R_COMPUTE_PGM_LO, 0xDEADBEEF);
+    assert_eq(pos, 12, "SET_SH_REG one = 3 dwords = 12 bytes");
+    # Header: PKT3(IT_SET_SH_REG, count=2, 0) = 0xC0017600.
+    assert_eq(load32(&buf + 0), 0xC0017600, "header");
+    # Register offset (SH-reg form): 0x212.
+    assert_eq(load32(&buf + 4), 0x212, "SH-reg offset for PGM_LO");
+    # Value we wrote.
+    assert_eq(load32(&buf + 8), 0xDEADBEEF, "value");
+    return 0;
+}
+
+fn test_native_pm4_set_sh_reg_multi_layout() {
+    # Setting 3 contiguous regs (PGM_LO, PGM_HI, PGM_RSRC1): header +
+    # offset + 3 values = 5 dwords.
+    var vals[12];
+    store32(&vals + 0, 0x1111);
+    store32(&vals + 4, 0x2222);
+    store32(&vals + 8, 0x3333);
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_set_sh_reg(&buf, 0, R_COMPUTE_PGM_LO, 3, &vals);
+    assert_eq(pos, 20, "3-reg SET = 5 dwords = 20 bytes");
+    # Header: PKT3(IT_SET_SH_REG, count=4, 0) — count-1 = 3 → (3<<16) | (0x76<<8) | 0xC0000000 = 0xC0037600.
+    assert_eq(load32(&buf + 0),  0xC0037600, "header for 3 regs");
+    assert_eq(load32(&buf + 4),  0x212,      "SH-reg offset for PGM_LO base");
+    assert_eq(load32(&buf + 8),  0x1111,     "value 1");
+    assert_eq(load32(&buf + 12), 0x2222,     "value 2");
+    assert_eq(load32(&buf + 16), 0x3333,     "value 3");
+    return 0;
+}
+
+fn test_native_pm4_dispatch_direct_layout() {
+    # DISPATCH_DIRECT: header + 4 data dwords = 5 dwords = 20 bytes.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_dispatch_direct(&buf, 0, 8, 4, 2, COMPUTE_DISPATCH_INITIATOR_MIN);
+    assert_eq(pos, 20, "DISPATCH_DIRECT = 5 dwords");
+    # Header: PKT3(IT_DISPATCH_DIRECT, 4, 0) = 0xC0031500.
+    assert_eq(load32(&buf + 0),  0xC0031500, "header");
+    assert_eq(load32(&buf + 4),  8, "dim_x");
+    assert_eq(load32(&buf + 8),  4, "dim_y");
+    assert_eq(load32(&buf + 12), 2, "dim_z");
+    assert_eq(load32(&buf + 16), 1, "initiator (COMPUTE_SHADER_EN)");
+    return 0;
+}
+
+fn test_native_pm4_nop_padding() {
+    # NOP with pad_dwords=4: header + 3 filler dwords = 4 dwords = 16 bytes.
+    var buf[64];
+    memset(&buf, 0xFF, 64);
+    var pos = native_pm4_nop(&buf, 0, 4);
+    assert_eq(pos, 16, "NOP pad=4 → 16 bytes");
+    # Header: PKT3(IT_NOP, 4, 0) = (3<<30) | (3<<16) | (0x10<<8) = 0xC0031000.
+    assert_eq(load32(&buf + 0),  0xC0031000, "NOP header");
+    # Filler dwords zeroed.
+    assert_eq(load32(&buf + 4),  0, "filler 1");
+    assert_eq(load32(&buf + 8),  0, "filler 2");
+    assert_eq(load32(&buf + 12), 0, "filler 3");
+    # NOP with pad_dwords=1: just the header, no filler.
+    memset(&buf, 0xFF, 64);
+    pos = native_pm4_nop(&buf, 0, 1);
+    assert_eq(pos, 4, "NOP pad=1 → 4 bytes");
+    assert_eq(load32(&buf + 0), 0xC0001000, "single-dword NOP header");
+    return 0;
+}
+
+fn test_native_gfx9_shader_constants() {
+    # s_endpgm (SOPP format): 0xBF810000 on GFX9. Stable across GFX6-11.
+    assert_eq(GFX9_S_ENDPGM, 0xBF810000, "s_endpgm encoding");
+    # PGM_RSRC1 minimum: FLOAT_MODE=0xC0 | DX10_CLAMP | IEEE_MODE
+    # = (0xC0 << 12) | (1 << 21) | (1 << 23) = 0x00AC0000.
+    # FLOAT_MODE must be non-zero — some GFX9 firmware rejects 0.
+    assert_eq(GFX9_COMPUTE_PGM_RSRC1_MIN, 0xAC0000, "RSRC1 min = 0x00AC0000");
+    assert_eq(GFX9_COMPUTE_PGM_RSRC2_MIN, 0, "RSRC2 min (no user SGPR / scratch / LDS)");
+    # DISPATCH_INITIATOR: COMPUTE_SHADER_EN | FORCE_START_AT_000 = 0x5
+    assert_eq(GFX9_DISPATCH_INITIATOR, 0x5, "DISPATCH_INITIATOR = SHADER_EN | FORCE_START_AT_000");
+    return 0;
+}
+
+fn test_native_gfx9_extended_register_offsets() {
+    assert_eq(R_COMPUTE_RESOURCE_LIMITS,        0xB858, "RESOURCE_LIMITS byte offset");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xB85C, "STATIC_THREAD_MGMT_SE0");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xB860, "STATIC_THREAD_MGMT_SE1");
+    assert_eq(R_COMPUTE_TMPRING_SIZE,           0xB864, "TMPRING_SIZE");
+    return 0;
+}
+
+fn test_native_gfx9_shader_endpgm_writes_bytes() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    var pos = native_gfx9_shader_endpgm(&buf, 0);
+    assert_eq(pos, 4, "endpgm wrote 4 bytes");
+    assert_eq(load32(&buf + 0), 0xBF810000, "endpgm bytes");
+    return 0;
+}
+
+fn test_native_syncobj_ioctl_encodings() {
+    # All three are _IOWR('d', nr, struct syncobj_*).
+    var create_expected  = native_ioc_encode(3, DRM_SYNCOBJ_CREATE_SIZE,  DRM_IOCTL_TYPE, 0xBF);
+    var destroy_expected = native_ioc_encode(3, DRM_SYNCOBJ_DESTROY_SIZE, DRM_IOCTL_TYPE, 0xC0);
+    var wait_expected    = native_ioc_encode(3, DRM_SYNCOBJ_WAIT_SIZE,    DRM_IOCTL_TYPE, 0xC3);
+    assert_eq(DRM_IOCTL_SYNCOBJ_CREATE,  create_expected,  "SYNCOBJ_CREATE ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_DESTROY, destroy_expected, "SYNCOBJ_DESTROY ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_WAIT,    wait_expected,    "SYNCOBJ_WAIT ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_CREATE,  0xC00864BF, "SYNCOBJ_CREATE = 0xC00864BF");
+    assert_eq(DRM_IOCTL_SYNCOBJ_DESTROY, 0xC00864C0, "SYNCOBJ_DESTROY = 0xC00864C0");
+    assert_eq(DRM_IOCTL_SYNCOBJ_WAIT,    0xC02864C3, "SYNCOBJ_WAIT = 0xC02864C3 (40-byte struct)");
+    return 0;
+}
+
+fn test_native_syncobj_sizes_and_flags() {
+    assert_eq(DRM_SYNCOBJ_CREATE_SIZE,  8,  "syncobj_create = 8");
+    assert_eq(DRM_SYNCOBJ_DESTROY_SIZE, 8,  "syncobj_destroy = 8");
+    assert_eq(DRM_SYNCOBJ_WAIT_SIZE,    40, "syncobj_wait = 40");
+    assert_eq(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,        0x1, "WAIT_ALL = 0x1");
+    assert_eq(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, 0x2, "WAIT_FOR_SUBMIT = 0x2");
+    return 0;
+}
+
+fn test_native_cs_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_CS_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_CS);
+    assert_eq(DRM_IOCTL_AMDGPU_CS, expected, "AMDGPU_CS ioctl");
+    assert_eq(DRM_IOCTL_AMDGPU_CS, 0xC0186444, "precomputed constant");
+    assert_eq(DRM_AMDGPU_CS, 0x04, "CS nr offset");
+    return 0;
+}
+
+fn test_native_cs_struct_sizes() {
+    assert_eq(DRM_AMDGPU_CS_SIZE,               24, "union drm_amdgpu_cs = 24");
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SIZE,         16, "drm_amdgpu_cs_chunk = 16");
+    assert_eq(DRM_AMDGPU_CS_CHUNK_IB_SIZE,      32, "drm_amdgpu_cs_chunk_ib = 32");
+    # _sem struct: u32 handle only, used by SYNCOBJ_OUT / SYNCOBJ_IN /
+    # DEPENDENCIES / SCHEDULED_DEPENDENCIES chunks.
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SEM_SIZE,      4, "drm_amdgpu_cs_chunk_sem = 4");
+    # _syncobj struct: 16 bytes, used by SYNCOBJ_TIMELINE_WAIT/SIGNAL only.
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SYNCOBJ_SIZE, 16, "drm_amdgpu_cs_chunk_syncobj = 16");
+    return 0;
+}
+
+fn test_native_cs_chunk_ids_and_ip_types() {
+    assert_eq(AMDGPU_CHUNK_ID_IB,          0x01, "CHUNK_ID_IB");
+    assert_eq(AMDGPU_CHUNK_ID_FENCE,       0x02, "CHUNK_ID_FENCE");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 0x05, "CHUNK_ID_SYNCOBJ_OUT");
+    assert_eq(AMDGPU_HW_IP_GFX,     0, "HW_IP_GFX");
+    assert_eq(AMDGPU_HW_IP_COMPUTE, 1, "HW_IP_COMPUTE");
+    return 0;
+}
+
+fn test_native_pm4_builder_composability() {
+    # Chain operations: NOP + SET_SH_REG(one) + DISPATCH_DIRECT.
+    # Expected layout:
+    #   0x00-0x03: NOP header (1 dword)
+    #   0x04-0x0F: SET_SH_REG DISPATCH_INITIATOR = 1 (3 dwords)
+    #   0x10-0x23: DISPATCH_DIRECT 1,1,1, init=1 (5 dwords)
+    # Total: 9 dwords = 36 bytes.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = 0;
+    pos = native_pm4_nop(&buf, pos, 1);
+    pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_DISPATCH_INITIATOR, 1);
+    pos = native_pm4_dispatch_direct(&buf, pos, 1, 1, 1, COMPUTE_DISPATCH_INITIATOR_MIN);
+    assert_eq(pos, 36, "composed stream = 36 bytes");
+    # Spot check: each header at its expected offset.
+    assert_eq(load32(&buf + 0),  0xC0001000, "NOP header at 0");
+    assert_eq(load32(&buf + 4),  0xC0017600, "SET_SH_REG header at 4");
+    assert_eq(load32(&buf + 16), 0xC0031500, "DISPATCH_DIRECT header at 16");
+    return 0;
+}
+
 fn test_rg_plan_reclaim_ratio_chain() {
     # 6-node linear chain with 5 transients. Each node hands off to the
     # next via a distinct transient. Classic staggered interval graph —
@@ -2323,6 +2626,38 @@ fn main() {
     test_native_amdgpu_gem_domains();
     test_native_gem_create_request_layout();
     test_native_gem_mmap_request_layout();
+
+    # v3 Phase B.3.a — submission infrastructure (8)
+    test_native_phase_b3a_nr_offsets();
+    test_native_ctx_ioctl_encoding();
+    test_native_bo_list_ioctl_encoding();
+    test_native_gem_va_ioctl_encoding();
+    test_native_struct_sizes();
+    test_native_ctx_opcodes();
+    test_native_bo_list_opcodes();
+    test_native_va_opcodes_and_flags();
+    test_native_bo_list_entry_layout();
+
+    # v3 Phase B.3.b — PM4 packet builder (7)
+    test_native_pm4_opcodes();
+    test_native_sh_reg_byte_offsets();
+    test_native_sh_reg_offset_encoding();
+    test_native_pm4_pkt3_header();
+    test_native_pm4_set_sh_reg_one_layout();
+    test_native_pm4_set_sh_reg_multi_layout();
+    test_native_pm4_dispatch_direct_layout();
+    test_native_pm4_nop_padding();
+    test_native_pm4_builder_composability();
+
+    # v3 Phase B.3.c/d — shader encoding, syncobj, CS ioctl (8)
+    test_native_gfx9_shader_constants();
+    test_native_gfx9_shader_endpgm_writes_bytes();
+    test_native_gfx9_extended_register_offsets();
+    test_native_syncobj_ioctl_encodings();
+    test_native_syncobj_sizes_and_flags();
+    test_native_cs_ioctl_encoding();
+    test_native_cs_struct_sizes();
+    test_native_cs_chunk_ids_and_ip_types();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

@@ -13,6 +13,7 @@
 #   make test-phase0    — GPU integration test (requires wgpu-native)
 #   make test-native-enum — v3 Phase B.1 DRM probe (requires DRM hardware)
 #   make test-native-gem-roundtrip — v3 Phase B.2 GEM BO round-trip (requires DRM hardware)
+#   make test-native-submit-setup — v3 Phase B.3.a ctx/BO-list/VA setup (requires DRM hardware)
 #   make test-all       — version-check + dist regen + CPU tests + fuzz
 #   make lint / fmt-check / vet  — quality gates
 #   make clean          — scrub build/
@@ -165,6 +166,28 @@ build/native_gem_roundtrip: programs/native_gem_roundtrip.cyr src/*.cyr
 .PHONY: test-native-gem-roundtrip
 test-native-gem-roundtrip: build/native_gem_roundtrip
 	./build/native_gem_roundtrip
+
+# v3 Phase B.3.a — submission prerequisites (ctx, BO list, VA map).
+# Exercises every setup ioctl without submitting any GPU work.
+# Requires DRM hardware; not in CI.
+build/native_submit_setup: programs/native_submit_setup.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_submit_setup.cyr $@
+
+.PHONY: test-native-submit-setup
+test-native-submit-setup: build/native_submit_setup
+	./build/native_submit_setup
+
+# v3 Phase B.3.d — first live compute dispatch. Uploads an s_endpgm
+# shader, builds a PM4 stream, submits via DRM_IOCTL_AMDGPU_CS, waits
+# on a sync-obj. Exits 0 iff the dispatch completes.
+build/native_compute_spike: programs/native_compute_spike.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_compute_spike.cyr $@
+
+.PHONY: test-native-compute-spike
+test-native-compute-spike: build/native_compute_spike
+	./build/native_compute_spike
 
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows

@@ -1,0 +1,234 @@
+# programs/native_compute_spike.cyr — v3 Phase B.3.d hardware integration
+#
+# First live AMDGPU compute dispatch from pure Cyrius. Uploads a
+# minimum GFX9 shader (s_endpgm), builds a PM4 command stream with
+# our packet builder, submits via DRM_IOCTL_AMDGPU_CS, waits for
+# completion via a DRM sync object, and exits 0 if the dispatch
+# returned without kernel error.
+#
+# The shader does nothing (s_endpgm is a single-instruction no-op
+# that just terminates the wave). This program therefore cannot
+# verify any output data — that's Phase B.4. What it DOES verify:
+#   - every ioctl returns 0
+#   - the sync-obj becomes signaled within 5 seconds
+#   - the kernel neither rejects the submission nor kernel-hangs the GPU
+#
+# Exit codes:
+#   0  — dispatch completed (sync-obj signaled)
+#   1  — open fd failed
+#   2  — shader BO setup failed
+#   3  — IB BO setup failed
+#   4  — context alloc failed
+#   5  — BO list create failed
+#   6  — syncobj create failed
+#   7  — CS ioctl failed
+#   8  — syncobj wait failed (including timeout)
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Return the current CLOCK_MONOTONIC time in nanoseconds. syscall 228
+# = clock_gettime; id 1 = CLOCK_MONOTONIC.
+fn mono_ns() {
+    var ts[16];
+    syscall(228, 1, &ts);
+    var sec = load64(&ts + 0);
+    var nsec = load64(&ts + 8);
+    return sec * 1000000000 + nsec;
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native compute spike (v3 Phase B.3.d)\n");
+    print_cstr("-------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+    print_cstr("fd="); print_i64(fd); print_cstr("\n");
+
+    # ---- Shader BO: 4 KiB GTT, s_endpgm at offset 0, VA @ 0x200000 ----
+    var shader_size = 4096;
+    var shader_bo[16];
+    var rc = native_bo_create_gtt(fd, shader_size, &shader_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: shader bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        sys_close(fd); return 2;
+    }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map = load64(&shader_bo + 8);
+    memset(shader_map, 0, shader_size);
+    native_gfx9_shader_endpgm(shader_map, 0);
+    var shader_va = NATIVE_GPU_VA_BASE;  # 0x200000
+    rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: shader va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+        sys_close(fd); return 2;
+    }
+    print_cstr("shader bo=") ; print_i64(shader_handle);
+    print_cstr(" va=0x"); print_i64(shader_va); print_cstr("\n");
+
+    # ---- Build PM4 stream in a heap buffer ----
+    #
+    # Sequence:
+    #   SET_SH_REG COMPUTE_PGM_LO      = shader_va >> 8
+    #   SET_SH_REG COMPUTE_PGM_HI      = shader_va >> 40
+    #   SET_SH_REG COMPUTE_PGM_RSRC1   = min
+    #   SET_SH_REG COMPUTE_PGM_RSRC2   = min
+    #   SET_SH_REG COMPUTE_NUM_THREAD_X = 1
+    #   SET_SH_REG COMPUTE_NUM_THREAD_Y = 1
+    #   SET_SH_REG COMPUTE_NUM_THREAD_Z = 1
+    #   DISPATCH_DIRECT 1, 1, 1, COMPUTE_SHADER_EN
+    # 7 * 3 + 5 = 26 dwords = 104 bytes
+    var pm4 = alloc(256);
+    memset(pm4, 0, 256);
+    var pos = 0;
+    # GFX9 PGM_LO holds bits [8:39] of the shader address; PGM_HI holds
+    # bits [40:47] — hardware does an implicit <<8 before fetch.
+    var pgm_lo = (shader_va / 256) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
+    # Program compute-pipeline state. Order matches radv's
+    # radv_emit_dispatch_packets. STATIC_THREAD_MGMT and RESOURCE_LIMITS
+    # are critical — default 0 means "no CUs enabled, no waves", which
+    # causes dispatches to queue forever without error.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC1, GFX9_COMPUTE_PGM_RSRC1_MIN);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_MIN);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS,        0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE,           0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_X, 1);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Y, 1);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Z, 1);
+    pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
+    # AMDGPU requires IBs padded to a cache-line boundary. Safe bet is
+    # 32 dwords (128 bytes). Pad with a single NOP packet of the right
+    # dword count.
+    var cur_dwords = pos / 4;
+    var target_dwords = 32;
+    if (cur_dwords < target_dwords) {
+        pos = native_pm4_nop(pm4, pos, target_dwords - cur_dwords);
+    }
+    var pm4_bytes = pos;
+    print_cstr("pm4 stream bytes="); print_i64(pm4_bytes); print_cstr("\n");
+
+    # ---- IB BO: 4 KiB GTT, PM4 stream at offset 0, VA @ 0x400000 ----
+    var ib_size = 4096;
+    var ib_bo[16];
+    rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: ib bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+        native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+        sys_close(fd); return 3;
+    }
+    var ib_handle = load64(&ib_bo + 0);
+    var ib_map = load64(&ib_bo + 8);
+    memset(ib_map, 0, ib_size);
+    memcpy(ib_map, pm4, pm4_bytes);
+    var ib_va = 0x400000;
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size,
+                           AMDGPU_VM_PAGE_READABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: ib va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+        native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+        sys_close(fd); return 3;
+    }
+    print_cstr("ib bo="); print_i64(ib_handle);
+    print_cstr(" va=0x"); print_i64(ib_va); print_cstr("\n");
+
+    # ---- Context ----
+    var req_ctx[16];
+    rc = native_ctx_alloc(fd, &req_ctx);
+    if (rc != 0) {
+        print_cstr("FAIL: ctx_alloc errno="); print_i64(0 - rc); print_cstr("\n");
+        return 4;
+    }
+    var ctx_id = native_ctx_alloc_id(&req_ctx);
+    print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
+
+    # ---- BO list: both shader + IB ----
+    var entries[16];
+    store32(&entries + 0, shader_handle); store32(&entries + 4, 0);
+    store32(&entries + 8, ib_handle);     store32(&entries + 12, 0);
+    var req_list[24];
+    rc = native_bo_list_create(fd, &entries, 2, &req_list);
+    if (rc != 0) {
+        print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 5;
+    }
+    var list_handle = native_bo_list_create_handle(&req_list);
+    print_cstr("bo_list_handle="); print_i64(list_handle); print_cstr("\n");
+
+    # ---- Sync-obj ----
+    var syncobj_handle_ptr = alloc(8);
+    rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    if (rc != 0) {
+        print_cstr("FAIL: syncobj_create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 6;
+    }
+    var syncobj_handle = load64(syncobj_handle_ptr);
+    print_cstr("syncobj="); print_i64(syncobj_handle); print_cstr("\n");
+
+    # ---- Submit CS with IB + SYNCOBJ_OUT ----
+    # Try COMPUTE ring first (the "right" ring for compute dispatches).
+    # If COMPUTE is unavailable on this platform, fall back to GFX.
+    rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
+                          AMDGPU_HW_IP_COMPUTE, syncobj_handle);
+    if (rc == 0) {
+        print_cstr("submitted to COMPUTE ring\n");
+    }
+    if (rc != 0) {
+        print_cstr("COMPUTE ring errno="); print_i64(0 - rc);
+        print_cstr(", retrying on GFX ring\n");
+        rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
+                              AMDGPU_HW_IP_GFX, syncobj_handle);
+        if (rc == 0) { print_cstr("submitted to GFX ring\n"); }
+    }
+    if (rc != 0) {
+        print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
+        return 7;
+    }
+    print_cstr("cs submitted\n");
+
+    # ---- Wait for completion, 15-second timeout ----
+    # AMDGPU's default TDR is 10s — 15s gives enough headroom to see
+    # a GPU reset fence (which would signal the syncobj with an error
+    # rather than leaving us in ETIME land).
+    var deadline = mono_ns() + 15000000000;
+    rc = native_syncobj_wait(fd, syncobj_handle, deadline);
+    if (rc != 0) {
+        print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
+        return 8;
+    }
+    print_cstr("dispatch completed (sync-obj signaled)\n");
+
+    # ---- Teardown ----
+    native_syncobj_destroy(fd, syncobj_handle);
+    native_bo_list_destroy(fd, list_handle);
+    native_ctx_free(fd, ctx_id);
+    native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+    native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+    native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+    native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+    sys_close(fd);
+    print_cstr("OK\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -1,0 +1,131 @@
+# programs/native_submit_setup.cyr — v3 Phase B.3.a hardware integration
+#
+# Exercises the full command-submission *setup* sequence on real
+# AMDGPU hardware without actually submitting anything. Proves that
+# every prerequisite ioctl succeeds end-to-end:
+#
+#   open(/dev/dri/renderD128)
+#   DRM_IOCTL_AMDGPU_GEM_CREATE   — allocate a 4 KiB GTT BO
+#   DRM_IOCTL_AMDGPU_GEM_VA (MAP) — give the BO a GPU virtual address
+#   DRM_IOCTL_AMDGPU_CTX (ALLOC)  — create a GPU context
+#   DRM_IOCTL_AMDGPU_BO_LIST (CR) — create residency list with our BO
+#   DRM_IOCTL_AMDGPU_BO_LIST (DS) — destroy list
+#   DRM_IOCTL_AMDGPU_CTX (FREE)   — free context
+#   DRM_IOCTL_AMDGPU_GEM_VA (UN)  — unmap VA
+#   DRM_IOCTL_GEM_CLOSE           — close BO
+#   close(fd)
+#
+# If every ioctl returns 0, the submission prerequisites are in place
+# and Phase B.3.b (PM4 packet builder) can proceed. This does NOT
+# submit any GPU work.
+#
+# Exit codes:
+#   0 — full sequence succeeded
+#   1 — open failed
+#   2 — gem_create failed
+#   3 — gem_va_map failed
+#   4 — ctx_alloc failed
+#   5 — bo_list_create failed
+#   (teardown failures are printed but don't change the success exit
+#    code — they indicate drift to investigate without invalidating
+#    the forward-path proof.)
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native submit-setup (v3 Phase B.3.a)\n");
+    print_cstr("-------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) {
+        print_cstr("FAIL: open\n"); return 1;
+    }
+    print_cstr("opened fd="); print_i64(fd); print_cstr("\n");
+
+    # Create a 4 KiB GTT BO.
+    var size = 4096;
+    var req_create[32];
+    var rc = native_gem_create(fd, size, 4096, AMDGPU_GEM_DOMAIN_GTT, 0, &req_create);
+    if (rc != 0) {
+        print_cstr("FAIL: gem_create errno="); print_i64(0 - rc); print_cstr("\n");
+        sys_close(fd); return 2;
+    }
+    var handle = native_gem_create_handle(&req_create);
+    print_cstr("gem_create handle="); print_i64(handle); print_cstr("\n");
+
+    # VA-map the BO.
+    var va = NATIVE_GPU_VA_BASE;
+    var page_flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+    rc = native_gem_va_map(fd, handle, va, size, page_flags);
+    if (rc != 0) {
+        print_cstr("FAIL: gem_va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        native_gem_close(fd, handle);
+        sys_close(fd); return 3;
+    }
+    print_cstr("gem_va_map va=0x"); print_i64(va); print_cstr(" size=");
+    print_i64(size); print_cstr("\n");
+
+    # Allocate a context.
+    var req_ctx[16];
+    rc = native_ctx_alloc(fd, &req_ctx);
+    if (rc != 0) {
+        print_cstr("FAIL: ctx_alloc errno="); print_i64(0 - rc); print_cstr("\n");
+        native_gem_va_unmap(fd, handle, va, size);
+        native_gem_close(fd, handle);
+        sys_close(fd); return 4;
+    }
+    var ctx_id = native_ctx_alloc_id(&req_ctx);
+    print_cstr("ctx_alloc ctx_id="); print_i64(ctx_id); print_cstr("\n");
+
+    # Create a BO list containing our one BO.
+    var entries[8];
+    store32(&entries + 0, handle);
+    store32(&entries + 4, 0);  # priority 0
+    var req_list[24];
+    rc = native_bo_list_create(fd, &entries, 1, &req_list);
+    if (rc != 0) {
+        print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
+        native_ctx_free(fd, ctx_id);
+        native_gem_va_unmap(fd, handle, va, size);
+        native_gem_close(fd, handle);
+        sys_close(fd); return 5;
+    }
+    var list_handle = native_bo_list_create_handle(&req_list);
+    print_cstr("bo_list_create list_handle="); print_i64(list_handle); print_cstr("\n");
+
+    # Teardown. Print any non-zero return but don't change exit code —
+    # the forward path already succeeded.
+    rc = native_bo_list_destroy(fd, list_handle);
+    if (rc != 0) {
+        print_cstr("warn: bo_list_destroy errno="); print_i64(0 - rc); print_cstr("\n");
+    }
+    rc = native_ctx_free(fd, ctx_id);
+    if (rc != 0) {
+        print_cstr("warn: ctx_free errno="); print_i64(0 - rc); print_cstr("\n");
+    }
+    rc = native_gem_va_unmap(fd, handle, va, size);
+    if (rc != 0) {
+        print_cstr("warn: gem_va_unmap errno="); print_i64(0 - rc); print_cstr("\n");
+    }
+    rc = native_gem_close(fd, handle);
+    if (rc != 0) {
+        print_cstr("warn: gem_close errno="); print_i64(0 - rc); print_cstr("\n");
+    }
+    sys_close(fd);
+    print_cstr("OK — submission prerequisites in place\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
