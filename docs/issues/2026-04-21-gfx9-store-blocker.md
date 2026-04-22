@@ -75,6 +75,59 @@ sync-obj wait.
    — but every other ioctl works, and `STATIC_THREAD_MGMT` wouldn't
    work either without proper VMID init. Unconfirmed.
 
+## Session 2 additions (after three more research agents)
+
+Additional fixes applied — **none of which have unblocked the store**:
+
+- `TRAP_PRESENT=1` in PGM_RSRC2 (bit 6). Was missing; now `RSRC2 = 0x44` for the store-shader path.
+- 16 dwords of `s_nop 0` trailing padding after `s_endpgm` (AMDGPU ABI requirement; SQ prefetches past shader end).
+- `IT_ACQUIRE_MEM` packet with `coher_cntl = 0x38800000` (SH_ICACHE | SH_KCACHE | TC | TCL1 action_ena) emitted before `DISPATCH_DIRECT`.
+- `SET_UCONFIG_REG CP_COHER_START_DELAY = 0` (GFX9-required queue preamble register that radv emits once per queue init).
+- Per-SE CU masks now write all four: `COMPUTE_STATIC_THREAD_MGMT_SE0..SE3` at `0xB85C`, `0xB860`, `0xB864`, `0xB868` (previously had SE0 + SE1 + a WRONG register at 0xB864 labeled as `TMPRING_SIZE` but actually `SE2`; was silently disabling SE2 every dispatch).
+- `RSRC1.SGPRS = 1` (16 SGPRs allocated, vs the previous 0 → 8 SGPRs, insufficient for USER_SGPR + VCC + flat_scratch per radv's accounting).
+
+Failure mode evolution across all the attempts:
+1. **Original**: `bad_op_irq` + GPU reset on any store.
+2. **After VA aperture moves to 4 GiB / 64 GiB**: unchanged.
+3. **After TRAP_PRESENT + NOP padding**: unchanged.
+4. **After ACQUIRE_MEM + CP_COHER_START_DELAY + SE2/SE3 writes + SGPRS=1**: on some runs `bad_op_irq` still fires; on some runs dispatch "completes" but output buffer reads sentinel. It's possible the "completion" is actually a timeout-then-reset-signal cycle rather than a genuine dispatch success — dmesg still shows resets under the same timestamp window.
+
+## Session 3 — GROUND TRUTH from Mesa AMD_DEBUG=ib (2026-04-21 evening)
+
+Installed opencl-mesa + clinfo + strace. Built a minimal OpenCL "store 0xDEADBEEF to buf[0]" probe, ran it with `AMD_DEBUG=ib`. Mesa's rusticl dumped the full PM4 IB it emits for a successful compute dispatch on this exact Cezanne/gfx90c hardware.
+
+**Biggest finding: my register offsets were wrong by a whole-register shift.** Every register from PGM_LO through TMPRING_SIZE was at the wrong byte offset. B.3.d's "dispatch completed" in earlier sessions was a false positive — the sync-obj was firing via the GPU-reset recovery path, not from actual shader execution. My "PGM_LO" writes were going to RSRC1; the real PGM_LO retained kernel-stale state, and the "dispatched shader" was whatever kernel-installed default lived at that address.
+
+Corrected GFX9 register offsets (verified against Mesa IB dump):
+
+| Register | Actual offset | What I had (wrong) |
+|----------|--------------|--------------------|
+| `COMPUTE_PGM_LO` | **0xB830** | 0xB848 (actually RSRC1) |
+| `COMPUTE_PGM_HI` | **0xB834** | 0xB84C (actually RSRC2) |
+| `COMPUTE_PGM_RSRC1` | **0xB848** | 0xB850 (reserved?) |
+| `COMPUTE_PGM_RSRC2` | **0xB84C** | 0xB854 (actually RESOURCE_LIMITS) |
+| `COMPUTE_RESOURCE_LIMITS` | **0xB854** | 0xB858 (actually SE0) |
+| `COMPUTE_STATIC_THREAD_MGMT_SE0` | **0xB858** | 0xB85C (actually SE1) |
+| `COMPUTE_STATIC_THREAD_MGMT_SE1` | **0xB85C** | 0xB860 (actually TMPRING_SIZE) |
+| `COMPUTE_TMPRING_SIZE` | **0xB860** | not written |
+| `COMPUTE_STATIC_THREAD_MGMT_SE2` | 0xB864 | 0xB864 (accidentally correct) |
+| `COMPUTE_STATIC_THREAD_MGMT_SE3` | 0xB868 | 0xB868 (accidentally correct) |
+
+Offsets corrected. Tests updated to match. `make test` = 602/602 pass.
+
+**With offsets corrected, ALL hardware dispatches wedge the GPU** — even the `s_endpgm`-only `compute_spike`. This is actually the HONEST state. There's additional setup Mesa does that we don't, which this session identified in the IB dump but hasn't yet applied fully:
+
+1. **SET_SH_REG `PGM_HI = 0x80`** unconditionally (Mesa's shaders live at VA `0x800000000000`, but user VA range on gfx90c caps below that — needs more investigation to find the valid high-VA shader slot).
+2. **SET_UCONFIG_REG `TA_CS_BC_BASE_ADDR = 0x01004400` + `_HI = 0x80`** (border color base).
+3. **`WRITE_DATA`** to VA `0xffff800100600300` (kernel-tracked, purpose unclear).
+4. **`COMPUTE_PGM_RSRC2 = 0x8`** (USER_SGPR=4, not 2) — Mesa ABI expects USER_DATA_0..3 to hold something specific (likely scratch V# descriptor in s[0:3]).
+5. **Scratch V# setup** — Mesa sets `USER_DATA_0 = 0x00200040` and `USER_DATA_2 = 0x00200000`. USER_DATA_0/1 is almost certainly the private_segment_buffer V# (scratch descriptor, 16-byte buffer resource). Even though SCRATCH_EN=0 in RSRC2, the hardware may validate s[0:3] as a V#.
+6. **`COMPUTE_TMPRING_SIZE = 0x100`** (Mesa allocates 256 waves of scratch even for trivial kernels).
+7. **`ACQUIRE_MEM CP_COHER_CNTL = 0xa8c40000`** (Mesa uses this exact value; we've been using 0x38800000).
+8. **`DISPATCH_INITIATOR = 0x45`** (bits 0, 2, 6 — bit 6 is ORDER_MODE).
+
+Next session's first move: match Mesa's complete PM4 stream byte-for-byte on a scratch-less GFX9 test, iterate until the dispatch actually runs our shader (verifiable by store succeeding).
+
 ## Likely next angles (for a future session)
 
 1. **Is there a `COMPUTE_PGM_RSRC3` on GFX9?** GFX10+ has one. Vega

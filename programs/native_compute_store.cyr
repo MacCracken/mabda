@@ -67,9 +67,10 @@ fn main() {
     var shader_map    = load64(&shader_bo + 8);
     memset(shader_map, 0, shader_size);
     native_gfx9_shader_store_deadbeef(shader_map, 0);
-    var shader_va = 0x200000;
+    # Mesa-verified: shader at high VA + R/W/X permissions.
+    var shader_va = 0x8000000000;
     rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) { print_cstr("FAIL: shader va_map\n"); return 2; }
 
     # ---- Output BO: 4 KiB GTT, seed with sentinel 0xBAADF00D ----
@@ -100,10 +101,16 @@ fn main() {
     var pm4 = alloc(512);
     memset(pm4, 0, 512);
     var pos = 0;
-    # ACQUIRE_MEM first — invalidate I-cache / K-cache / TC. Per
-    # ROCT-Thunk kfdtest this is required on GFX9 before any compute
-    # dispatch; without it the SQ can decode stale I-cache bytes as
-    # illegal opcodes.
+    # GFX9-required queue preamble items that radv emits once per
+    # queue-init and we must emit per-submission (our context is
+    # fresh each run):
+    #   CP_COHER_START_DELAY = 0  — GFX9-specific fix that must land
+    #                               before any dispatch touches memory.
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
+
+    # ACQUIRE_MEM — invalidate I-cache / K-cache / TC. Required on
+    # GFX9 before compute dispatch; without it the SQ can decode
+    # stale I-cache bytes as illegal opcodes.
     pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
 
     # COMPUTE_START_X/Y/Z = 0 (grid origin). Default 0, but kfdtest
@@ -120,11 +127,14 @@ fn main() {
     # RSRC2: USER_SGPR = 2 (load s0/s1 from USER_DATA_0/1) AND
     # TRAP_PRESENT = 1 (mandatory on GFX9 for memory ops).
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0);
+    # Match Mesa rusticl's values: RESOURCE_LIMITS=0x140, TMPRING_SIZE=0x100,
+    # only SE0 enabled (mesa deliberately sets SE1-3 to 0 even on 4-SE parts).
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
     # USER_DATA_0 = low 32 of output VA, USER_DATA_1 = high 32.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0,     out_va & 0xFFFFFFFF);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);

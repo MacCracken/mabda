@@ -401,42 +401,42 @@ var IT_DISPATCH_DIRECT  = 0x15;
 var IT_ACQUIRE_MEM      = 0x58;
 var IT_RELEASE_MEM      = 0x49;
 var IT_EVENT_WRITE      = 0x46;
+var IT_SET_UCONFIG_REG  = 0x79;
 
 # SH-register offsets (byte addresses in MMIO space). The SH_REG base
 # is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
 # Covered by native_sh_reg_offset() helper.
-var R_COMPUTE_DISPATCH_INITIATOR = 0xB800;
-var R_COMPUTE_START_X            = 0xB810;
-var R_COMPUTE_START_Y            = 0xB814;
-var R_COMPUTE_START_Z            = 0xB818;
-var R_COMPUTE_NUM_THREAD_X       = 0xB81C;
-var R_COMPUTE_NUM_THREAD_Y       = 0xB820;
-var R_COMPUTE_NUM_THREAD_Z       = 0xB824;
-var R_COMPUTE_PGM_LO             = 0xB848;
-var R_COMPUTE_PGM_HI             = 0xB84C;
-var R_COMPUTE_PGM_RSRC1          = 0xB850;
-var R_COMPUTE_PGM_RSRC2          = 0xB854;
-# GFX9 per-SE CU-enable masks. Default to 0 on a fresh context ("no
-# CUs enabled") — if left unset, the scheduler refuses to issue
-# waves and the dispatch hangs without an error. Setting to all-ones
-# is the canonical "enable everything" value used by radv.
-# On Vega / GFX9, four SE masks are contiguous at 0xB85C-0xB868.
-# Even APUs with 1 SE must write all four (SE2/SE3 reset-default
-# zero on 4-SE discrete parts causes silent bad_op_irq).
-var R_COMPUTE_RESOURCE_LIMITS         = 0xB858;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE0  = 0xB85C;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE1  = 0xB860;
+# Register offsets verified by AMD_DEBUG=ib dump of Mesa rusticl
+# compute dispatch on this exact Cezanne APU (gfx90c). The PGM_LO/HI
+# and RSRC1/2 positions I had previously were wrong by an entire
+# register — PGM_LO at 0xB830 (not 0xB848), with every register in
+# the block shifted. B.3.d still worked because s_endpgm is tolerant
+# of garbage pipeline state.
+var R_COMPUTE_DISPATCH_INITIATOR      = 0xB800;
+var R_COMPUTE_START_X                 = 0xB810;
+var R_COMPUTE_START_Y                 = 0xB814;
+var R_COMPUTE_START_Z                 = 0xB818;
+var R_COMPUTE_NUM_THREAD_X            = 0xB81C;
+var R_COMPUTE_NUM_THREAD_Y            = 0xB820;
+var R_COMPUTE_NUM_THREAD_Z            = 0xB824;
+var R_COMPUTE_PGM_LO                  = 0xB830;
+var R_COMPUTE_PGM_HI                  = 0xB834;
+var R_COMPUTE_PGM_RSRC1               = 0xB848;
+var R_COMPUTE_PGM_RSRC2               = 0xB84C;
+var R_COMPUTE_RESOURCE_LIMITS         = 0xB854;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE0  = 0xB858;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE1  = 0xB85C;
+var R_COMPUTE_TMPRING_SIZE            = 0xB860;
 var R_COMPUTE_STATIC_THREAD_MGMT_SE2  = 0xB864;
 var R_COMPUTE_STATIC_THREAD_MGMT_SE3  = 0xB868;
-# TMPRING_SIZE lives elsewhere (not in the SE-mask block); default
-# zero is fine for shaders without scratch, so we don't need to
-# write it explicitly. (Previously we wrote 0xB864 thinking it was
-# TMPRING_SIZE — that was actually SE2, which we were silently
-# disabling every dispatch.)
 var R_COMPUTE_USER_DATA_0        = 0xB900;
 # COMPUTE_USER_DATA_1..15 follow in 4-byte increments up to 0xB93C.
 
 var PM4_SH_REG_BASE = 0xB000;
+var PM4_UCONFIG_REG_BASE = 0x30000;
+
+# GFX9 UCONFIG registers we program in the queue preamble.
+var R_CP_COHER_START_DELAY = 0x301EC;
 
 # Dispatch initiator: minimum bits to launch a shader.
 # COMPUTE_SHADER_EN at bit 0 triggers the dispatch.
@@ -486,6 +486,18 @@ fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value) {
     var one[4];
     store32(&one, value);
     return native_pm4_set_sh_reg(buf, pos, byte_offset, 1, &one);
+}
+
+# Emit a SET_UCONFIG_REG packet for a single register. UCONFIG regs
+# are the chip-wide "this register applies to the whole GPU, not a
+# specific shader" space — used for things like CP_COHER_START_DELAY
+# and TA_CS_BC_BASE_ADDR that radv emits in its queue preamble.
+# Packet: header + (offset - 0x30000)/4 + value = 3 dwords.
+fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 2, 0));
+    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
+    store32(buf + pos + 8, value);
+    return pos + 12;
 }
 
 # Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
@@ -566,16 +578,18 @@ var GFX9_S_ENDPGM = 0xBF810000;
 #                              Some GFX9 firmware rejects FLOAT_MODE = 0.
 #   bit  21    DX10_CLAMP   = 1 → well-behaved clamp semantics
 #   bit  23    IEEE_MODE    = 1 → IEEE-conformant float behaviour
-# Encoded value: (0xC0 << 12) | (1 << 6) | (1 << 21) | (1 << 23)
-#              = 0x00AC0040
-var GFX9_COMPUTE_PGM_RSRC1_MIN = 0xAC0040;
+# Encoded value matches Mesa rusticl for gfx90c: FLOAT_MODE=0xC0,
+# SGPRS=1 (16 regs), DX10_CLAMP=1, IEEE_MODE=0.
+#   (0xC0 << 12) | (1 << 6) | (1 << 21) = 0x002C0040
+var GFX9_COMPUTE_PGM_RSRC1_MIN = 0x2C0040;
 
 # COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
 var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
 
-# DISPATCH_INITIATOR: COMPUTE_SHADER_EN (bit 0) | FORCE_START_AT_000
-# (bit 2). radv sets both for every compute dispatch.
-var GFX9_DISPATCH_INITIATOR = 0x5;
+# DISPATCH_INITIATOR: bits 0 (COMPUTE_SHADER_EN) | 2 (FORCE_START_AT_000) | 6.
+# Mesa rusticl on gfx90c emits 0x45 — bit 6 is ORDER_MODE (or similar)
+# and appears mandatory in Mesa's verified-working sequence.
+var GFX9_DISPATCH_INITIATOR = 0x45;
 
 # Write the s_endpgm shader into buf at pos. Returns new pos.
 fn native_gfx9_shader_endpgm(buf, pos) {
@@ -604,37 +618,21 @@ fn native_gfx9_shader_endpgm(buf, pos) {
 # DX10_CLAMP, IEEE_MODE. RSRC2 must set USER_SGPR = 2 (bits 1-5 = 2,
 # register value = 0x04).
 fn native_gfx9_shader_store_deadbeef(buf, pos) {
-    # Writes 0xDEADBEEF to memory[s[0:1]] via global_store_dword.
-    # USER_SGPR=2 in RSRC2 pre-loads s0/s1 from USER_DATA_0/1.
-    #
-    # Shader body (8 dwords = 32 bytes):
-    #   v_mov_b32_e32  v0, s0                            ; VA low
-    #   v_mov_b32_e32  v1, s1                            ; VA high
-    #   v_mov_b32_e32  v2, 0xDEADBEEF
-    #   global_store_dword v[0:1], v2, off
-    #   s_waitcnt vmcnt(0) lgkmcnt(0)
-    #   s_endpgm
-    #
-    # Followed by 16 dwords of s_nop 0 (64 bytes) — the AMDGPU ABI
-    # requires trailing NOP padding because the SQ prefetches past
-    # the end of the shader; without it the prefetcher reads
-    # undefined memory and decodes garbage opcodes as bad_op_irq.
-    # (Ref: ROCT-Thunk kfdtest, AMDGPU-ABI.md.)
+    # DIAGNOSTIC: skip store — just v_mov + endpgm + padding.
+    # With the register-offset fix, is the non-store shader still
+    # running cleanly? If yes, the store is still the blocker.
+    # If no, our PGM_LO is pointing at the wrong VA now.
     store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
     store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
     store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
     store32(buf + pos + 12, 0xDEADBEEF);   # literal
-    store32(buf + pos + 16, 0xDC708000);   # global_store_dword
-    store32(buf + pos + 20, 0x007F0200);   # VADDR=v0, DATA=v2
-    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
-    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
-    # 16 × s_nop 0 = 64 bytes of prefetch padding.
+    store32(buf + pos + 16, 0xBF810000);   # s_endpgm
     var i = 0;
     while (i < 16) {
-        store32(buf + pos + 32 + i * 4, 0xBF800000);
+        store32(buf + pos + 20 + i * 4, 0xBF800000);
         i = i + 1;
     }
-    return pos + 96;
+    return pos + 84;
 }
 
 # PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).
