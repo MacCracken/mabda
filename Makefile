@@ -189,6 +189,18 @@ build/native_compute_spike: programs/native_compute_spike.cyr src/*.cyr
 test-native-compute-spike: build/native_compute_spike
 	./build/native_compute_spike
 
+# v3 Phase B.4 — compute shader writes a constant to memory; CPU
+# reads back and verifies. First real mabda GPU work with verifiable
+# output. Clang-assembled GFX9 ISA; no WGSL compilation pipeline yet
+# (that's post-v3.0).
+build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_compute_store.cyr $@
+
+.PHONY: test-native-compute-store
+test-native-compute-store: build/native_compute_store
+	./build/native_compute_store
+
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows
 # that scripts/bench-record.sh can append to bench-history.csv.

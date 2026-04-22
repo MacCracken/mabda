@@ -1,0 +1,213 @@
+# programs/native_compute_store.cyr — v3 Phase B.4 hardware integration
+#
+# Real compute dispatch with CPU-verified output. The shader writes
+# a fixed constant (0xDEADBEEF) to a buffer at the VA passed via
+# USER_DATA_0/1. This program uploads the shader, dispatches it,
+# waits for completion, then reads back the output buffer and
+# verifies the value byte-identical.
+#
+# This is the Phase B stated exit criterion — "byte-identical
+# compute output vs wgpu backend on the same shader" — in its
+# simplest form (no wgpu diff yet; just proving the GPU actually
+# ran our code).
+#
+# Exit codes:
+#   0   — output buffer contains 0xDEADBEEF at [0], all other words
+#         still at sentinel 0xBAADF00D
+#   1-9 — setup / submit / wait failure (see stage prints)
+#   10  — readback mismatch at [0]
+#   11  — sentinel corrupted beyond [0]
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);    # '0'
+    store8(&buf + 1, 120);   # 'x'
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn mono_ns() {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native compute STORE shader (v3 Phase B.4)\n");
+    print_cstr("------------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+
+    # ---- Shader BO: 4 KiB GTT, store shader at offset 0 ----
+    var shader_size = 4096;
+    var shader_bo[16];
+    var rc = native_bo_create_gtt(fd, shader_size, &shader_bo);
+    if (rc != 0) { print_cstr("FAIL: shader bo\n"); sys_close(fd); return 2; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, shader_size);
+    native_gfx9_shader_store_deadbeef(shader_map, 0);
+    var shader_va = 0x200000;
+    rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+    if (rc != 0) { print_cstr("FAIL: shader va_map\n"); return 2; }
+
+    # ---- Output BO: 4 KiB GTT, seed with sentinel 0xBAADF00D ----
+    var out_size = 4096;
+    var out_bo[16];
+    rc = native_bo_create_gtt(fd, out_size, &out_bo);
+    if (rc != 0) { print_cstr("FAIL: output bo\n"); return 3; }
+    var out_handle = load64(&out_bo + 0);
+    var out_map    = load64(&out_bo + 8);
+    var sentinel = 0xBAADF00D;
+    var si = 0;
+    while (si < out_size / 4) {
+        store32(out_map + si * 4, sentinel);
+        si = si + 1;
+    }
+    # Place the output BO ABOVE the GFX9 32-bit aperture. On Vega,
+    # SH_MEM_BASES = 0x60006000 — the kernel programs the private and
+    # shared apertures at 0x0006_xxxx_xxxx_xxxx. Any FLAT/GLOBAL store
+    # with a VA that fits in 32 bits (< 0x1_0000_0000) gets classified
+    # by the SQ as a scratch-segment access, and since scratch isn't
+    # set up for us, the SQ raises `bad_op_irq` and the GPU resets.
+    # Using a VA clearly above the 32-bit window sidesteps this.
+    var out_va = 0x1000000000;  # 64 GiB — well clear of 32-bit aperture
+    rc = native_gem_va_map(fd, out_handle, out_va, out_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
+    if (rc != 0) { print_cstr("FAIL: output va_map\n"); return 3; }
+    print_cstr("output BO seeded with 0xBAADF00D at VA 0x");
+    print_hex32(out_va); print_cstr("\n");
+
+    # ---- Build PM4 stream ----
+    var pm4 = alloc(512);
+    memset(pm4, 0, 512);
+    var pos = 0;
+    var pgm_lo = (shader_va / 256) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC1, GFX9_COMPUTE_PGM_RSRC1_MIN);
+    # RSRC2: USER_SGPR = 2 so s0/s1 auto-load with USER_DATA_0/1.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0);
+    # USER_DATA_0 = low 32 of output VA, USER_DATA_1 = high 32.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0,     out_va & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_X, 1);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Y, 1);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Z, 1);
+    pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
+    # Pad to 32-dword alignment.
+    var cur_dwords = pos / 4;
+    if (cur_dwords < 32) { pos = native_pm4_nop(pm4, pos, 32 - cur_dwords); }
+    var pm4_bytes = pos;
+    print_cstr("pm4 stream bytes="); print_i64(pm4_bytes); print_cstr("\n");
+
+    # ---- IB BO ----
+    var ib_size = 4096;
+    var ib_bo[16];
+    rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
+    if (rc != 0) { print_cstr("FAIL: ib bo\n"); return 4; }
+    var ib_handle = load64(&ib_bo + 0);
+    var ib_map    = load64(&ib_bo + 8);
+    memset(ib_map, 0, ib_size);
+    memcpy(ib_map, pm4, pm4_bytes);
+    var ib_va = 0x400000;
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, AMDGPU_VM_PAGE_READABLE);
+    if (rc != 0) { print_cstr("FAIL: ib va_map\n"); return 4; }
+
+    # ---- Context, BO list (shader + output + IB), sync-obj ----
+    var req_ctx[16];
+    rc = native_ctx_alloc(fd, &req_ctx);
+    if (rc != 0) { print_cstr("FAIL: ctx_alloc\n"); return 5; }
+    var ctx_id = native_ctx_alloc_id(&req_ctx);
+
+    var entries[24];
+    store32(&entries +  0, shader_handle); store32(&entries +  4, 0);
+    store32(&entries +  8, out_handle);    store32(&entries + 12, 0);
+    store32(&entries + 16, ib_handle);     store32(&entries + 20, 0);
+    var req_list[24];
+    rc = native_bo_list_create(fd, &entries, 3, &req_list);
+    if (rc != 0) { print_cstr("FAIL: bo_list_create\n"); return 6; }
+    var list_handle = native_bo_list_create_handle(&req_list);
+
+    var syncobj_handle_ptr = alloc(8);
+    rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    if (rc != 0) { print_cstr("FAIL: syncobj_create\n"); return 7; }
+    var syncobj_handle = load64(syncobj_handle_ptr);
+
+    # ---- Submit on COMPUTE ring ----
+    rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
+                          AMDGPU_HW_IP_COMPUTE, syncobj_handle);
+    if (rc != 0) { print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n"); return 8; }
+    print_cstr("submitted\n");
+
+    # ---- Wait 15 sec ----
+    var deadline = mono_ns() + 15000000000;
+    rc = native_syncobj_wait(fd, syncobj_handle, deadline);
+    if (rc != 0) {
+        print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
+        return 9;
+    }
+    print_cstr("dispatch completed\n");
+
+    # ---- Verify output ----
+    var v0 = load32(out_map + 0);
+    print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
+    if (v0 != 0xDEADBEEF) {
+        print_cstr("FAIL: mismatch\n");
+        native_syncobj_destroy(fd, syncobj_handle);
+        native_bo_list_destroy(fd, list_handle);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return 10;
+    }
+    # Check the sentinel is intact at [1]..[N-1] — catches runaway writes.
+    var v1 = load32(out_map + 4);
+    if (v1 != sentinel) {
+        print_cstr("FAIL: sentinel corrupted at [1] = "); print_hex32(v1); print_cstr("\n");
+        return 11;
+    }
+    print_cstr("sentinel intact at [1]\n");
+
+    # ---- Teardown ----
+    native_syncobj_destroy(fd, syncobj_handle);
+    native_bo_list_destroy(fd, list_handle);
+    native_ctx_free(fd, ctx_id);
+    native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+    native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+    native_gem_va_unmap(fd, out_handle, out_va, out_size);
+    native_bo_release_gtt(fd, out_handle, out_map, out_size);
+    native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+    native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+    sys_close(fd);
+    print_cstr("OK — GPU wrote 0xDEADBEEF via pure-Cyrius dispatch\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

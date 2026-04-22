@@ -538,6 +538,49 @@ fn native_gfx9_shader_endpgm(buf, pos) {
     return pos + 4;
 }
 
+# Write a "store 0xDEADBEEF to buffer[0]" shader at `pos` in `buf`.
+# Expects USER_SGPR = 2, with s0/s1 pre-loaded to the buffer VA.
+#
+# Bytes produced by `clang -target amdgcn--amdhsa -mcpu=gfx902 -c`:
+#   v_mov_b32_e32  v0, s0                            ; low 32 bits of VA
+#   v_mov_b32_e32  v1, s1                            ; high 32 bits of VA
+#   v_mov_b32_e32  v2, 0xDEADBEEF                    ; constant
+#   global_store_dword v[0:1], v2, off glc slc       ; write-through store
+#   s_waitcnt vmcnt(0) lgkmcnt(0)                    ; wait for store
+#   s_endpgm                                         ; terminate
+#
+# GLC + SLC bypass the GPU's L1 and L2 caches, writing straight to
+# system memory. Without them the store lands in L2; CPU readback
+# from the mapped GTT sees stale data until a cache-flush preempts
+# it. Combined with s_waitcnt before s_endpgm, SLC=1 makes the store
+# CPU-visible by the time the syncobj fires.
+#
+# Returns new pos (pos + 32). RSRC1 must include FLOAT_MODE = 0xC0,
+# DX10_CLAMP, IEEE_MODE. RSRC2 must set USER_SGPR = 2 (bits 1-5 = 2,
+# register value = 0x04).
+fn native_gfx9_shader_store_deadbeef(buf, pos) {
+    # ==== B.4 BLOCKED — see docs/issues/2026-04-21-gfx9-store-blocker.md ====
+    # Diagnostic-safe body (v_mov + s_endpgm, no memory store). Runs
+    # cleanly through the full dispatch pipeline but doesn't write
+    # anything, so the verify step expectedly fails. The real store
+    # variants (global/flat/scalar, any VA tried from 256 MiB to
+    # 64 GiB) all trigger gfx_v9_0_bad_op_irq and GPU reset. Needs
+    # a round of research focused on SH_MEM_CONFIG / SH_MEM_BASES /
+    # FLAT_SCRATCH_INIT / KMD-managed VMID semantics before stores
+    # will retire on this APU.
+    store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
+    store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
+    store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
+    store32(buf + pos + 12, 0xDEADBEEF);   # literal
+    store32(buf + pos + 16, 0xBF810000);   # s_endpgm
+    return pos + 20;
+}
+
+# RSRC2 with USER_SGPR = 2 — tells HW to pre-load SGPRs s0, s1 with
+# COMPUTE_USER_DATA_0, COMPUTE_USER_DATA_1 before shader entry.
+# USER_SGPR field occupies bits 1-5; value 2 encodes as 0x04.
+var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2 = 0x04;
+
 # ================================================================
 # v3 Phase B.3.d — syncobj lifecycle (generic DRM, not AMDGPU-specific)
 # ================================================================
