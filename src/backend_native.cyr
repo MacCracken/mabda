@@ -1,0 +1,124 @@
+# @internal — native GPU backend (v3.0, ADR 006)
+# backend_native.cyr — pure-Cyrius GPU backend via direct DRM ioctls
+#
+# v3 Phase B subdivision status:
+#   B.0 — research: done (see ../vidya/content/direct_drm_gpu_compute)
+#   B.1 — device enum + capability query: THIS FILE (current)
+#   B.2 — GEM BO create/map/round-trip: pending
+#   B.3 — pre-compiled compute shader dispatch: pending
+#   B.4 — fence + readback + wgpu parity: pending
+#
+# Path chosen: CS + PM4 via /dev/dri/renderD128 (unified path shared
+# with graphics in Phase C, rather than KFD+AQL compute-only). See
+# design doc docs/proposals/v3-native-api-principles.md Phase B.
+#
+# All data types are i64 / u64 unless noted. drm_version struct layout
+# mirrors include/uapi/drm/drm.h on x86_64 Linux. No libdrm — direct
+# syscall(SYS_IOCTL) only.
+
+# ================================================================
+# Constants
+# ================================================================
+# DRM ioctl encoding mirrors include/uapi/asm-generic/ioctl.h:
+#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
+# Size field is 14 bits, type 8, nr 8, dir 2.
+var _IOC_NONE  = 0;
+var _IOC_WRITE = 1;
+var _IOC_READ  = 2;
+var _IOC_RW    = 3;
+
+# DRM: type 'd' = 0x64
+var DRM_IOCTL_TYPE = 0x64;
+
+# drm_version: nr 0x00, RW, sizeof(struct drm_version) == 64 on x86_64
+#   0x64 | (3 << 30) | (64 << 16) | (0x64 << 8) | 0x00 == 0xC0406400
+var DRM_VERSION_SIZE = 64;
+var DRM_IOCTL_VERSION = 0xC0406400;
+
+# drm_version struct (64 bytes on x86_64):
+#   +0:  version_major      (i32)
+#   +4:  version_minor      (i32)
+#   +8:  version_patchlevel (i32)
+#   +12: pad (4)
+#   +16: name_len  (u64)  — in: buffer capacity; out: required length
+#   +24: name_ptr  (u64)  — caller-allocated char buffer
+#   +32: date_len  (u64)
+#   +40: date_ptr  (u64)
+#   +48: desc_len  (u64)
+#   +56: desc_ptr  (u64)
+
+# Render node path. renderD128 is the first unprivileged render-only
+# node; renderD129+ exist on multi-GPU systems.
+var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
+
+# ================================================================
+# Helpers
+# ================================================================
+
+# Encode an ioctl number. Public to make the encoding testable.
+# dir ∈ {0=NONE, 1=WRITE, 2=READ, 3=RW}
+# size must fit in 14 bits (masked to 0x3FFF)
+# type, nr are byte-sized (masked to 0xFF)
+fn native_ioc_encode(dir, size, type, nr) {
+    var d = dir & 3;
+    var s = size & 0x3FFF;
+    var t = type & 0xFF;
+    var n = nr & 0xFF;
+    return (d * 0x40000000) | (s * 0x10000) | (t * 0x100) | n;
+}
+
+# Open /dev/dri/renderD128 for read/write. Returns fd on success or
+# the negative errno on failure (Linux syscall convention). No auth
+# needed — render nodes bypass the DRM master/auth dance.
+fn native_open_render_node() {
+    return sys_open(DRM_RENDER_NODE_PATH, O_RDWR, 0);
+}
+
+# Issue DRM_IOCTL_VERSION in two passes against the given fd. First
+# pass collects version_major/minor/patchlevel + required name_len.
+# Second pass writes the driver-name string into a heap-allocated
+# buffer whose address is stored in the caller's struct.
+#
+# `ver` points to a 64-byte caller-allocated region, zeroed by the
+# caller. On success:
+#   ver + 0..12  = version triple (major, minor, patchlevel)
+#   ver + 16     = name_len (actual bytes written)
+#   ver + 24     = pointer to heap name buffer (NUL-terminated string
+#                  of length name_len; caller does not free — alloc()
+#                  memory is process-lifetime in mabda today)
+# Returns 0 on success, negative errno on ioctl failure.
+fn native_drm_version(fd, ver) {
+    # Zero the struct — caller is expected to have done this, but be
+    # defensive since we're about to issue a kernel ioctl.
+    memset(ver, 0, 64);
+
+    # Pass 1: lengths only. All _ptr fields stay 0 so kernel skips
+    # string writes but still reports required lengths.
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+
+    var name_len = load64(ver + 16);
+    if (name_len == 0) { return 0; }
+
+    # Pass 2: allocate a buffer, point name_ptr at it, re-issue.
+    # +1 for a defensive NUL terminator beyond the kernel's writeback.
+    var name_buf = alloc(name_len + 1);
+    memset(name_buf, 0, name_len + 1);
+    store64(ver + 16, name_len);  # capacity
+    store64(ver + 24, name_buf);
+
+    rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+    return 0;
+}
+
+# Convenience: full probe. Opens the render node, reads version,
+# closes fd. Fills `out` (64 bytes) with the drm_version struct.
+# Returns 0 on success, non-zero on failure (open or ioctl).
+fn native_probe_device(out) {
+    var fd = native_open_render_node();
+    if (fd < 0) { return fd; }
+    var rc = native_drm_version(fd, out);
+    sys_close(fd);
+    return rc;
+}

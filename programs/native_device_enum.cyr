@@ -1,0 +1,89 @@
+# programs/native_device_enum.cyr — v3 Phase B.1 hardware integration
+#
+# Opens /dev/dri/renderD128 via direct syscall(SYS_IOCTL), issues
+# DRM_IOCTL_VERSION, and prints the driver name + version triple.
+# This is the smallest possible proof that mabda's native backend
+# can talk to DRM hardware at all — no libdrm, no libvulkan, no C
+# launcher, no wgpu-native linked.
+#
+# Exit codes:
+#   0 — driver probed successfully; name printed
+#   1 — could not open /dev/dri/renderD128 (negative fd from syscall)
+#   2 — DRM_IOCTL_VERSION ioctl failed
+#
+# Not in CI (hardware-dependent). Run via `make test-native-enum`.
+
+include "src/lib.cyr"
+
+fn print_cstr(s) {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native device enum (v3 Phase B.1)\n");
+    print_cstr("--------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) {
+        print_cstr("FAIL: could not open ");
+        print_cstr(DRM_RENDER_NODE_PATH);
+        print_cstr(" (errno ");
+        print_i64(0 - fd);
+        print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened ");
+    print_cstr(DRM_RENDER_NODE_PATH);
+    print_cstr(" fd=");
+    print_i64(fd);
+    print_cstr("\n");
+
+    var ver[64];
+    memset(&ver, 0, 64);
+    var rc = native_drm_version(fd, &ver);
+    if (rc != 0) {
+        print_cstr("FAIL: DRM_IOCTL_VERSION returned ");
+        print_i64(rc);
+        print_cstr("\n");
+        sys_close(fd);
+        return 2;
+    }
+
+    var major = load32(&ver + 0);
+    var minor = load32(&ver + 4);
+    var patch = load32(&ver + 8);
+    var name_len = load64(&ver + 16);
+    var name_ptr = load64(&ver + 24);
+
+    print_cstr("driver version: ");
+    print_i64(major);
+    print_cstr(".");
+    print_i64(minor);
+    print_cstr(".");
+    print_i64(patch);
+    print_cstr("\n");
+
+    print_cstr("driver name:    ");
+    if (name_ptr != 0) {
+        syscall(1, 1, name_ptr, name_len);
+    }
+    print_cstr("\n");
+
+    sys_close(fd);
+    print_cstr("OK\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

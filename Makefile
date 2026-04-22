@@ -11,6 +11,7 @@
 #   make build          — link-check the library (programs/smoke.cyr)
 #   make dist           — regenerate dist/mabda.cyr via `cyrius distlib`
 #   make test-phase0    — GPU integration test (requires wgpu-native)
+#   make test-native-enum — v3 Phase B.1 DRM probe (requires DRM hardware)
 #   make test-all       — version-check + dist regen + CPU tests + fuzz
 #   make lint / fmt-check / vet  — quality gates
 #   make clean          — scrub build/
@@ -140,6 +141,18 @@ test-render-e2e: build/render_e2e
 .PHONY: test-render-graph-e2e
 test-render-graph-e2e: build/render_graph_e2e
 	./build/render_graph_e2e
+
+# v3 Phase B.1 — hardware integration. Probes /dev/dri/renderD128 via
+# direct syscall(SYS_IOCTL), prints driver name + version. Requires
+# DRM hardware on the host; not in CI. Pure Cyrius — no wgpu-native,
+# no C launcher, no libdrm linked.
+build/native_device_enum: programs/native_device_enum.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_device_enum.cyr $@
+
+.PHONY: test-native-enum
+test-native-enum: build/native_device_enum
+	./build/native_device_enum
 
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows

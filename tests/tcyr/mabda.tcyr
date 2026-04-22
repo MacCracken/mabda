@@ -1833,6 +1833,89 @@ fn test_rg_first_use_last_use_across_multiple_reads() {
     return 0;
 }
 
+# ================================================================
+# v3 Phase B.1 — native backend: ioctl encoding + constants
+# Pure-math assertions only; hardware-dependent probing lives in
+# programs/native_device_enum.cyr under `make test-native-enum`.
+# ================================================================
+
+fn test_native_ioc_encode_drm_version() {
+    # DRM_IOCTL_VERSION = _IOWR('d', 0x00, struct drm_version)
+    # dir=3 (RW), type='d'=0x64, nr=0x00, size=64 → 0xC0406400
+    assert_eq(native_ioc_encode(3, 64, 0x64, 0), 0xC0406400, "DRM_IOCTL_VERSION encodes correctly");
+    assert_eq(native_ioc_encode(3, 64, 0x64, 0), DRM_IOCTL_VERSION, "constant matches encoder");
+    return 0;
+}
+
+fn test_native_ioc_encode_directions() {
+    # dir lives in bits 30-31. Each direction swaps bit patterns there.
+    assert_eq(native_ioc_encode(0, 0, 0, 0), 0x00000000, "NONE dir = 0 upper bits");
+    assert_eq(native_ioc_encode(1, 0, 0, 0), 0x40000000, "WRITE dir = 0x40000000");
+    assert_eq(native_ioc_encode(2, 0, 0, 0), 0x80000000, "READ dir = 0x80000000");
+    assert_eq(native_ioc_encode(3, 0, 0, 0), 0xC0000000, "RW dir = 0xC0000000");
+    return 0;
+}
+
+fn test_native_ioc_encode_size_in_bits_16_to_29() {
+    # Size field is 14 bits wide (bits 16-29). Small size packs cleanly.
+    assert_eq(native_ioc_encode(0, 1, 0, 0), 0x00010000, "size=1 at bit 16");
+    assert_eq(native_ioc_encode(0, 64, 0, 0), 0x00400000, "size=64 at bit 16+6");
+    assert_eq(native_ioc_encode(0, 0x3FFF, 0, 0), 0x3FFF0000, "size=max (14 bits all set)");
+    # Size overflow: 0x4000 wraps to 0 (14-bit mask).
+    assert_eq(native_ioc_encode(0, 0x4000, 0, 0), 0x00000000, "size overflow masks to 0");
+    return 0;
+}
+
+fn test_native_ioc_encode_type_and_nr() {
+    # type is bits 8-15, nr is bits 0-7. Both byte-sized.
+    assert_eq(native_ioc_encode(0, 0, 0x64, 0), 0x00006400, "type=0x64 at bits 8-15");
+    assert_eq(native_ioc_encode(0, 0, 0, 0xFF), 0x000000FF, "nr=0xFF at bits 0-7");
+    assert_eq(native_ioc_encode(0, 0, 0xFF, 0xFF), 0x0000FFFF, "type+nr combined");
+    return 0;
+}
+
+fn test_native_drm_constants() {
+    assert_eq(DRM_IOCTL_TYPE, 0x64, "DRM type is 'd'");
+    assert_eq(DRM_VERSION_SIZE, 64, "drm_version is 64 bytes on x86_64");
+    return 0;
+}
+
+fn test_native_drm_version_struct_layout() {
+    # Verify we can round-trip values at the documented offsets.
+    # If the layout drifts (e.g., mabda grows a helper that assumes
+    # different offsets), these assertions catch it before the ioctl
+    # hits the kernel.
+    var v[64];
+    memset(&v, 0, 64);
+    store32(&v + 0,  1);       # version_major
+    store32(&v + 4,  2);       # version_minor
+    store32(&v + 8,  3);       # version_patchlevel
+    store64(&v + 16, 13);      # name_len
+    store64(&v + 24, 0xAAAA);  # name_ptr
+    store64(&v + 32, 14);      # date_len
+    store64(&v + 40, 0xBBBB);  # date_ptr
+    store64(&v + 48, 15);      # desc_len
+    store64(&v + 56, 0xCCCC);  # desc_ptr
+    assert_eq(load32(&v + 0),  1,      "major at +0");
+    assert_eq(load32(&v + 4),  2,      "minor at +4");
+    assert_eq(load32(&v + 8),  3,      "patch at +8");
+    assert_eq(load64(&v + 16), 13,     "name_len at +16");
+    assert_eq(load64(&v + 24), 0xAAAA, "name_ptr at +24");
+    assert_eq(load64(&v + 32), 14,     "date_len at +32");
+    assert_eq(load64(&v + 40), 0xBBBB, "date_ptr at +40");
+    assert_eq(load64(&v + 48), 15,     "desc_len at +48");
+    assert_eq(load64(&v + 56), 0xCCCC, "desc_ptr at +56");
+    return 0;
+}
+
+fn test_native_render_node_path() {
+    # Constant must equal the canonical first-render-node path.
+    var expected = "/dev/dri/renderD128";
+    assert_eq(strlen(DRM_RENDER_NODE_PATH), strlen(expected), "path length matches");
+    assert_eq(memeq(DRM_RENDER_NODE_PATH, expected, strlen(expected)), 1, "path contents match");
+    return 0;
+}
+
 fn test_rg_plan_reclaim_ratio_chain() {
     # 6-node linear chain with 5 transients. Each node hands off to the
     # next via a distinct transient. Classic staggered interval graph —
@@ -2128,6 +2211,13 @@ fn main() {
     test_rg_aliasing_flag_round_trip();
 
     # v3 Phase A — transient aliasing planner (10)
+    test_native_ioc_encode_drm_version();
+    test_native_ioc_encode_directions();
+    test_native_ioc_encode_size_in_bits_16_to_29();
+    test_native_ioc_encode_type_and_nr();
+    test_native_drm_constants();
+    test_native_drm_version_struct_layout();
+    test_native_render_node_path();
     test_rg_plan_unbuilt_returns_error();
     test_rg_plan_empty_graph();
     test_rg_plan_unused_transient_excluded();
@@ -2138,6 +2228,8 @@ fn main() {
     test_rg_plan_alignment_256();
     test_rg_first_use_last_use_across_multiple_reads();
     test_rg_plan_reclaim_ratio_chain();
+
+    # v3 Phase B.1 — native backend ioctl encoding (7 new, above)
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

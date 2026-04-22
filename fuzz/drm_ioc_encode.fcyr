@@ -1,0 +1,94 @@
+# Fuzz: DRM ioctl encoder invariants (v3 Phase B.1)
+#
+# Exercises native_ioc_encode(dir, size, type, nr) across a range of
+# inputs and verifies decode round-trip invariants:
+#
+#   (1) nr occupies bits 0-7  (low byte, preserved exactly)
+#   (2) type occupies bits 8-15 (preserved exactly when < 256)
+#   (3) size occupies bits 16-29 (14-bit mask, wraps above 0x3FFF)
+#   (4) dir occupies bits 30-31 (2-bit mask, wraps above 3)
+#   (5) Fields are non-overlapping — encoding the product of any
+#       single field should leave all others at zero.
+#
+# Exit codes:
+#   0 — all invariants hold across all samples
+#   1 — nr round-trip failed
+#   2 — type round-trip failed
+#   3 — size round-trip failed
+#   4 — dir round-trip failed
+#   5 — field bleed detected (bits outside expected range)
+
+include "src/lib.cyr"
+
+alloc_init();
+
+# Simple LCG.
+var _rng = 1;
+fn rng_seed(s) { _rng = s; return 0; }
+fn rng_next() {
+    _rng = _rng * 6364136223846793005 + 1442695040888963407;
+    return _rng;
+}
+fn rng_u32() {
+    var r = rng_next();
+    if (r < 0) { r = 0 - r; }
+    return r % 0xFFFFFFFF;
+}
+
+var seeds[40];
+store64(&seeds +  0,   1);
+store64(&seeds +  8,  42);
+store64(&seeds + 16, 137);
+store64(&seeds + 24, 999);
+store64(&seeds + 32, 31415);
+
+var seed_count = 5;
+var samples_per_seed = 1000;
+
+var seed_i = 0;
+while (seed_i < seed_count) {
+    rng_seed(load64(&seeds + seed_i * 8));
+
+    var s = 0;
+    while (s < samples_per_seed) {
+        # Draw random inputs. Each field intentionally draws from a
+        # range wider than its mask to stress the wrap behavior.
+        var dir  = rng_u32() % 8;         # 0-7 (mask is 3)
+        var size = rng_u32() % 0x8000;    # 0-32767 (mask is 0x3FFF)
+        var type = rng_u32() % 0x200;     # 0-511 (mask is 0xFF)
+        var nr   = rng_u32() % 0x200;     # 0-511 (mask is 0xFF)
+
+        var enc = native_ioc_encode(dir, size, type, nr);
+
+        # Invariant (1): nr round-trip
+        var nr_back = enc & 0xFF;
+        var nr_expected = nr & 0xFF;
+        if (nr_back != nr_expected) { syscall(60, 1); }
+
+        # Invariant (2): type round-trip
+        var type_back = (enc / 0x100) & 0xFF;
+        var type_expected = type & 0xFF;
+        if (type_back != type_expected) { syscall(60, 2); }
+
+        # Invariant (3): size round-trip (14 bits)
+        var size_back = (enc / 0x10000) & 0x3FFF;
+        var size_expected = size & 0x3FFF;
+        if (size_back != size_expected) { syscall(60, 3); }
+
+        # Invariant (4): dir round-trip (2 bits)
+        var dir_back = (enc / 0x40000000) & 3;
+        var dir_expected = dir & 3;
+        if (dir_back != dir_expected) { syscall(60, 4); }
+
+        # Invariant (5): no field bleed — if we zero each field, the
+        # remainder should be the encode of the other three.
+        var no_nr = enc & 0xFFFFFF00;
+        var e_no_nr = native_ioc_encode(dir, size, type, 0);
+        if (no_nr != e_no_nr) { syscall(60, 5); }
+
+        s = s + 1;
+    }
+    seed_i = seed_i + 1;
+}
+
+syscall(60, 0);
