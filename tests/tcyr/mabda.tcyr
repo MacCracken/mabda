@@ -1664,6 +1664,213 @@ fn test_rg_aliasing_flag_round_trip() {
     return 0;
 }
 
+# ================================================================
+# v3 Phase A — transient aliasing planner
+# ================================================================
+
+fn test_rg_plan_unbuilt_returns_error() {
+    var g = rg_new();
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 1, "plan on unbuilt graph returns 1");
+    return 0;
+}
+
+fn test_rg_plan_empty_graph() {
+    var g = rg_new();
+    assert_eq(rg_build(g, 0), 0, "empty build ok");
+    var stats[24];
+    memset(&stats, 0xFF, 24);
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan on empty returns 0");
+    assert_eq(load64(&stats + 0), 0, "empty: 0 slots");
+    assert_eq(load64(&stats + 8), 0, "empty: 0 naive");
+    assert_eq(load64(&stats + 16), 0, "empty: 0 aliased");
+    return 0;
+}
+
+fn test_rg_plan_unused_transient_excluded() {
+    var g = rg_new();
+    var orphan = rg_add_transient_buffer(g, 256, 0, "orphan");
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(load64(&stats + 0), 0, "unused transient: 0 slots");
+    assert_eq(load64(&stats + 8), 0, "unused transient: 0 naive");
+    assert_eq(rg_transient_first_use(g, orphan), 0 - 1, "orphan first_use stays -1");
+    assert_eq(rg_transient_last_use(g, orphan), 0 - 1, "orphan last_use stays -1");
+    return 0;
+}
+
+fn test_rg_plan_single_buffer_offset_zero() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r = rg_add_transient_buffer(g, 256, 0, "only");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(rg_transient_offset(g, r), 0, "single transient at offset 0");
+    assert_eq(load64(&stats + 0), 1, "1 slot");
+    assert_eq(load64(&stats + 8), 256, "naive = 256");
+    assert_eq(load64(&stats + 16), 256, "aliased = 256");
+    return 0;
+}
+
+fn test_rg_plan_overlapping_buffers_different_offsets() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # Two buffers both alive at the same node: A writes both, B reads both.
+    # Lifetimes [0,1] and [0,1] — overlapping entirely.
+    var r0 = rg_add_transient_buffer(g, 256, 0, "r0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_writes(g, a, r0);
+    rg_node_writes(g, a, r1);
+    rg_node_reads(g, b, r0);
+    rg_node_reads(g, b, r1);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    var off0 = rg_transient_offset(g, r0);
+    var off1 = rg_transient_offset(g, r1);
+    assert(off0 != off1, "overlapping r0/r1 get different offsets");
+    assert_eq(load64(&stats + 0), 2, "2 slots for overlapping pair");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    return 0;
+}
+
+fn test_rg_plan_disjoint_buffers_share_offset() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # 4-node linear chain: A→B→C→D. Three transients staggered.
+    # buf0 lifetime [0,1], scratch [1,2], buf1 [2,3].
+    # buf0 and buf1 are pairwise disjoint (can share). scratch overlaps both.
+    var r0 = rg_add_transient_buffer(g, 256, 0, "buf0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "scratch");
+    var r2 = rg_add_transient_buffer(g, 256, 0, "buf1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    var d = rg_add_compute(g, 0, 0, &dims, "D");
+    rg_node_writes(g, a, r0);
+    rg_node_reads(g, b, r0);
+    rg_node_writes(g, b, r1);
+    rg_node_reads(g, c, r1);
+    rg_node_writes(g, c, r2);
+    rg_node_reads(g, d, r2);
+    assert_eq(rg_build(g, 0), 0, "linear chain builds");
+    # Lifetimes
+    assert_eq(rg_transient_first_use(g, r0), 0, "buf0 first_use=0");
+    assert_eq(rg_transient_last_use(g, r0),  1, "buf0 last_use=1");
+    assert_eq(rg_transient_first_use(g, r1), 1, "scratch first_use=1");
+    assert_eq(rg_transient_last_use(g, r1),  2, "scratch last_use=2");
+    assert_eq(rg_transient_first_use(g, r2), 2, "buf1 first_use=2");
+    assert_eq(rg_transient_last_use(g, r2),  3, "buf1 last_use=3");
+    # Planner should give buf0 and buf1 the same offset (slot 1),
+    # scratch a separate offset (slot 2). 2 slots total.
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(rg_transient_offset(g, r0), 0,   "buf0 offset=0");
+    assert_eq(rg_transient_offset(g, r1), 256, "scratch offset=256");
+    assert_eq(rg_transient_offset(g, r2), 0,   "buf1 reuses buf0 slot");
+    assert_eq(load64(&stats + 0), 2,   "2 slots");
+    assert_eq(load64(&stats + 8), 768, "naive = 3 * 256");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    return 0;
+}
+
+fn test_rg_plan_buffers_and_textures_separate() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var buf = rg_add_transient_buffer(g, 256, 0, "buf");
+    # 4x4 RGBA8 texture = 64 bytes → aligns up to 256.
+    var tex = rg_add_transient_texture(g, 4, 4, 18, 0, "tex");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, buf);
+    rg_node_reads(g, n, tex);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    # Buffers placed first, textures after — kept in separate sub-ranges.
+    assert_eq(rg_transient_offset(g, buf), 0,   "buffer at offset 0");
+    assert_eq(rg_transient_offset(g, tex), 256, "texture after buffer range");
+    assert_eq(load64(&stats + 0), 2, "2 slots across kinds");
+    return 0;
+}
+
+fn test_rg_plan_alignment_256() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # 100-byte buffer — must align up to 256.
+    var r = rg_add_transient_buffer(g, 100, 0, "small");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(load64(&stats + 8), 256, "naive aligned up from 100 to 256");
+    assert_eq(load64(&stats + 16), 256, "aliased aligned up from 100 to 256");
+    return 0;
+}
+
+fn test_rg_first_use_last_use_across_multiple_reads() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # One writer, three readers — lifetime spans writer through last reader.
+    var r = rg_add_transient_buffer(g, 256, 0, "shared");
+    var w  = rg_add_compute(g, 0, 0, &dims, "W");
+    var r1 = rg_add_compute(g, 0, 0, &dims, "R1");
+    var r2 = rg_add_compute(g, 0, 0, &dims, "R2");
+    var r3 = rg_add_compute(g, 0, 0, &dims, "R3");
+    rg_node_writes(g, w, r);
+    rg_node_reads(g, r1, r);
+    rg_node_reads(g, r2, r);
+    rg_node_reads(g, r3, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    assert_eq(rg_transient_first_use(g, r), 0, "first_use = W");
+    assert_eq(rg_transient_last_use(g, r), 3, "last_use = R3");
+    return 0;
+}
+
+fn test_rg_plan_reclaim_ratio_chain() {
+    # 6-node linear chain with 5 transients. Each node hands off to the
+    # next via a distinct transient. Classic staggered interval graph —
+    # heavy aliasing opportunity.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var bufs[40];
+    var i = 0;
+    while (i < 5) {
+        store64(&bufs + i * 8, rg_add_transient_buffer(g, 256, 0, "b"));
+        i = i + 1;
+    }
+    var nodes[48];
+    i = 0;
+    while (i < 6) {
+        store64(&nodes + i * 8, rg_add_compute(g, 0, 0, &dims, "n"));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        rg_node_writes(g, load64(&nodes + i * 8), load64(&bufs + i * 8));
+        rg_node_reads(g, load64(&nodes + (i + 1) * 8), load64(&bufs + i * 8));
+        i = i + 1;
+    }
+    assert_eq(rg_build(g, 0), 0, "chain builds");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    # naive = 5 * 256 = 1280. Staggered pairs: b0/b2/b4 can share one
+    # slot (lifetimes [0,1], [2,3], [4,5] — disjoint); b1/b3 share
+    # another ([1,2], [3,4] — disjoint). 2 slots, aliased = 512.
+    assert_eq(load64(&stats + 0), 2, "2 slots");
+    assert_eq(load64(&stats + 8), 1280, "naive = 5 * 256");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    var reclaim = (load64(&stats + 8) - load64(&stats + 16)) * 100 / load64(&stats + 8);
+    assert(reclaim >= 30, "reclaim >= 30%");
+    return 0;
+}
+
 fn test_audit_bgl_entry_buffer_offsets() {
     # WGPUBindGroupLayoutEntry is 120 bytes. Buffer sub-struct starts at
     # +32 with its own nextInChain (8 bytes) first; type lives at +40,
@@ -1919,6 +2126,18 @@ fn main() {
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();
     test_rg_aliasing_flag_round_trip();
+
+    # v3 Phase A — transient aliasing planner (10)
+    test_rg_plan_unbuilt_returns_error();
+    test_rg_plan_empty_graph();
+    test_rg_plan_unused_transient_excluded();
+    test_rg_plan_single_buffer_offset_zero();
+    test_rg_plan_overlapping_buffers_different_offsets();
+    test_rg_plan_disjoint_buffers_share_offset();
+    test_rg_plan_buffers_and_textures_separate();
+    test_rg_plan_alignment_256();
+    test_rg_first_use_last_use_across_multiple_reads();
+    test_rg_plan_reclaim_ratio_chain();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

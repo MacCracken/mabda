@@ -7,10 +7,11 @@
 # Quick reference:
 #   make test           — CPU-only tests (`cyrius test tests/tcyr/mabda.tcyr`)
 #   make bench          — CPU-only benchmarks
+#   make fuzz           — invariant harnesses under fuzz/*.fcyr
 #   make build          — link-check the library (programs/smoke.cyr)
 #   make dist           — regenerate dist/mabda.cyr via `cyrius distlib`
 #   make test-phase0    — GPU integration test (requires wgpu-native)
-#   make test-all       — version-check + dist regen + CPU tests
+#   make test-all       — version-check + dist regen + CPU tests + fuzz
 #   make lint / fmt-check / vet  — quality gates
 #   make clean          — scrub build/
 
@@ -36,6 +37,21 @@ test:
 .PHONY: bench
 bench:
 	$(CYRIUS) bench tests/bcyr/mabda.bcyr
+
+# Fuzz harnesses — each fuzz/*.fcyr is a standalone program that
+# exits 0 on pass, nonzero on invariant violation. `cyrius test`
+# runs and checks the exit code. Convention matches cyrius stdlib
+# (../cyrius/fuzz/*.fcyr).
+.PHONY: fuzz
+fuzz:
+	@fail=0; \
+	for f in fuzz/*.fcyr; do \
+		printf '%-48s ' "$$f"; \
+		$(CYRIUS) test $$f > /tmp/mabda-fuzz.log 2>&1; \
+		rc=$$?; \
+		if [ $$rc -eq 0 ]; then echo "PASS"; else echo "FAIL (exit $$rc)"; fail=1; fi; \
+	done; \
+	[ $$fail -eq 0 ] || { echo "fuzz: at least one harness failed"; exit 1; }
 
 .PHONY: lint
 lint:
@@ -68,7 +84,7 @@ version-check:
 	@./scripts/version-check.sh
 
 .PHONY: test-all
-test-all: version-check dist test
+test-all: version-check dist test fuzz
 
 # ---------------------------------------------------------------------------
 # GPU integration tests (require wgpu-native + deps/wgpu_main.c shim)

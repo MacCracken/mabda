@@ -1,0 +1,204 @@
+# Fuzz: transient aliasing planner invariants (v3 Phase A)
+#
+# Builds synthetic render graphs across a range of seeds and verifies
+# planner invariants hold for every configuration:
+#   (1) every transient's offset is >= 0 and < aliased_bytes
+#   (2) for every pair of transients with overlapping lifetimes,
+#       either they have non-overlapping offset ranges OR they are
+#       different kinds (buffers vs textures — kept separate by the
+#       planner)
+#   (3) aliased_bytes <= naive_bytes (the planner can never be worse
+#       than the no-aliasing baseline)
+#   (4) aliased_bytes >= largest single transient size (obvious floor)
+#
+# Exit codes:
+#   0 — all seeds pass
+#   1 — plan returned non-zero on built graph
+#   2 — offset out of [0, aliased_bytes)
+#   3 — two co-live same-kind transients with overlapping offset ranges
+#   4 — aliased_bytes > naive_bytes
+#   5 — aliased_bytes < max transient size
+#   6 — unbuilt-graph guard failed (plan should return 1)
+
+include "src/lib.cyr"
+
+alloc_init();
+
+# Simple LCG — deterministic per seed.
+var _rng_state = 1;
+fn rng_seed(s) { _rng_state = s; return 0; }
+fn rng_next() {
+    _rng_state = _rng_state * 6364136223846793005 + 1442695040888963407;
+    return _rng_state;
+}
+fn rng_range(lo, hi) {
+    var span = hi - lo;
+    if (span <= 0) { return lo; }
+    var r = rng_next();
+    if (r < 0) { r = 0 - r; }
+    return lo + (r % span);
+}
+
+# Unbuilt-graph guard check.
+var guard_g = rg_new();
+var guard_stats[24];
+if (rg_plan_aliasing_stats(guard_g, &guard_stats) != 1) { syscall(60, 6); }
+
+# Run N random configurations. Each:
+#   - 3-12 compute nodes
+#   - 2-8 transient buffers (size 64-4096 bytes) and/or textures (4x4 to 64x64)
+#   - random read/write declarations linking nodes in a DAG pattern
+var seeds[32];
+store64(&seeds +   0,    1);
+store64(&seeds +   8,   42);
+store64(&seeds +  16,  137);
+store64(&seeds +  24,  256);
+store64(&seeds +  32,  999);
+store64(&seeds +  40, 7777);
+store64(&seeds +  48, 31415);
+store64(&seeds +  56, 65536);
+
+var seed_count = 8;
+var seed_i = 0;
+while (seed_i < seed_count) {
+    rng_seed(load64(&seeds + seed_i * 8));
+
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+
+    var n_nodes = rng_range(3, 12);
+    var n_trans = rng_range(2, 8);
+
+    # Add transients — mix buffers and textures.
+    var trans_ids[64];
+    var trans_kinds[64];
+    var ti = 0;
+    while (ti < n_trans) {
+        var is_tex = rng_range(0, 2);
+        var rid = 0;
+        if (is_tex == 0) {
+            var sz = rng_range(64, 4096);
+            rid = rg_add_transient_buffer(g, sz, 0, "b");
+            store64(&trans_kinds + ti * 8, RES_BUFFER);
+        }
+        if (is_tex == 1) {
+            var w = rng_range(4, 64);
+            var h = rng_range(4, 64);
+            rid = rg_add_transient_texture(g, w, h, 18, 0, "t");
+            store64(&trans_kinds + ti * 8, RES_TEXTURE);
+        }
+        store64(&trans_ids + ti * 8, rid);
+        ti = ti + 1;
+    }
+
+    # Add nodes.
+    var node_ids[96];
+    var ni = 0;
+    while (ni < n_nodes) {
+        store64(&node_ids + ni * 8, rg_add_compute(g, 0, 0, &dims, "n"));
+        ni = ni + 1;
+    }
+
+    # Declare reads/writes. Each transient gets a writer at a random
+    # node and readers at later nodes (forms a DAG — writer precedes
+    # every reader so no cycle).
+    ti = 0;
+    while (ti < n_trans) {
+        var rid2 = load64(&trans_ids + ti * 8);
+        var w_idx = rng_range(0, n_nodes - 1);
+        rg_node_writes(g, load64(&node_ids + w_idx * 8), rid2);
+        var n_readers = rng_range(1, 4);
+        var rk = 0;
+        while (rk < n_readers) {
+            var r_idx = rng_range(w_idx + 1, n_nodes);
+            rg_node_reads(g, load64(&node_ids + r_idx * 8), rid2);
+            rk = rk + 1;
+        }
+        ti = ti + 1;
+    }
+
+    if (rg_build(g, 0) != 0) {
+        # Cycle — skip this seed. Shouldn't happen with writer-precedes
+        # logic but be defensive.
+        seed_i = seed_i + 1;
+    }
+    if (rg_build(g, 0) == 0) {
+        var stats[24];
+        if (rg_plan_aliasing_stats(g, &stats) != 0) { syscall(60, 1); }
+
+        var slot_count = load64(&stats + 0);
+        var naive = load64(&stats + 8);
+        var aliased = load64(&stats + 16);
+
+        # Invariant 3: aliased <= naive
+        if (aliased > naive) { syscall(60, 4); }
+
+        # Invariant 1 & 4: per-transient checks.
+        ti = 0;
+        var max_size = 0;
+        while (ti < n_trans) {
+            var rid3 = load64(&trans_ids + ti * 8);
+            var fu = rg_transient_first_use(g, rid3);
+            if (fu != 0 - 1) {
+                var off = rg_transient_offset(g, rid3);
+                if (off < 0)         { syscall(60, 2); }
+                if (off >= aliased)  { syscall(60, 2); }
+                # Compute this transient's aligned byte size.
+                var r = vec_get(load64(g + 8), rid3);
+                var sz = _rg_plan_align_up(_rg_plan_transient_bytes(r), 256);
+                if (sz > max_size) { max_size = sz; }
+            }
+            ti = ti + 1;
+        }
+        if (aliased < max_size) { syscall(60, 5); }
+
+        # Invariant 2: pairwise overlap check. For every pair of
+        # same-kind live transients whose lifetimes overlap, their
+        # offset ranges must not intersect.
+        var a_i = 0;
+        while (a_i < n_trans) {
+            var ra = load64(&trans_ids + a_i * 8);
+            var fa = rg_transient_first_use(g, ra);
+            if (fa != 0 - 1) {
+                var la = rg_transient_last_use(g, ra);
+                var oa = rg_transient_offset(g, ra);
+                var ka = load64(&trans_kinds + a_i * 8);
+                var rpa = vec_get(load64(g + 8), ra);
+                var sa = _rg_plan_align_up(_rg_plan_transient_bytes(rpa), 256);
+
+                var b_i = a_i + 1;
+                while (b_i < n_trans) {
+                    var rb = load64(&trans_ids + b_i * 8);
+                    var fb = rg_transient_first_use(g, rb);
+                    if (fb != 0 - 1) {
+                        var lb = rg_transient_last_use(g, rb);
+                        var ob = rg_transient_offset(g, rb);
+                        var kb = load64(&trans_kinds + b_i * 8);
+                        var rpb = vec_get(load64(g + 8), rb);
+                        var sb = _rg_plan_align_up(_rg_plan_transient_bytes(rpb), 256);
+
+                        if (ka == kb) {
+                            # Lifetimes overlap if !(la < fb OR lb < fa).
+                            var non_overlap_life = 0;
+                            if (la < fb) { non_overlap_life = 1; }
+                            if (lb < fa) { non_overlap_life = 1; }
+                            if (non_overlap_life == 0) {
+                                # Offset ranges [oa, oa+sa) and [ob, ob+sb)
+                                # must not intersect.
+                                var non_overlap_off = 0;
+                                if (oa + sa <= ob) { non_overlap_off = 1; }
+                                if (ob + sb <= oa) { non_overlap_off = 1; }
+                                if (non_overlap_off == 0) { syscall(60, 3); }
+                            }
+                        }
+                    }
+                    b_i = b_i + 1;
+                }
+            }
+            a_i = a_i + 1;
+        }
+    }
+    seed_i = seed_i + 1;
+}
+
+syscall(60, 0);
