@@ -42,3 +42,36 @@ Use a C launcher (`wgpu_main.c`) that:
 - Symbol clashes (memcpy, memset, strlen) require `objcopy -L` post-processing
 - Adding new wgpu functions requires updating both `wgpu_main.c` and `wgpu_ffi.cyr`
 - Standalone Cyrius tests (color, profiler, vertex) don't need the C launcher
+
+## Revisited (2026-04, v3.0 dual-backend era)
+
+An earlier framing described this launcher as **transitional**
+scaffolding to be replaced in v3.0. That framing is revised, not
+retracted: retirement slides from v3.0 to v4.0.
+
+v3.0 adds a pure Cyrius DRM/KMS backend *alongside* the C launcher
+path rather than replacing it — see ADR 006. Both backends live
+behind the `# @public` surface, selectable per consumer build. The
+C launcher stays load-bearing **for the entire v3.x line** for three
+reasons:
+
+1. **Measurement baseline.** The C path isolates cyrius codegen
+   changes (pre/post-5.6.x O-passes) from backend-architecture
+   changes, letting us attribute perf wins cleanly.
+2. **Migration runway.** Consumers (soorat, rasa, ranga, bijli,
+   aethersafta, kiran) move to the native backend on their own
+   timelines across the v3.x line. The C path must work until every
+   consumer is cut over AND running native in production.
+3. **Portability insurance.** wgpu-native continues to absorb
+   vendor/driver/OS-specific behaviour during v3.x so the native
+   DRM/KMS backend matures against a stable reference.
+
+**v4.0 retires ADR 004.** Once every consumer has been running native
+in production across a full release cycle, the C launcher +
+`deps/wgpu-native/` are removed. v4.0 is the native-only release.
+The retirement criterion is consumer-driven, not calendar-driven.
+
+Drift noted: the function table is 65 entries as of v2.4.x, not the
+40 recorded above. Not worth a rewrite of the original Decision
+section — the architectural point (function-table dispatch, C owns
+GPU pre-init and Cyrius entry) is unchanged.

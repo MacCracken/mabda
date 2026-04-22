@@ -16,10 +16,13 @@ useful for planning instead of bloating with history.
 Mabda is the **public GPU API** for the Cyrius ecosystem. It ships
 now via a C shim over wgpu-native so real projects (soorat, rasa,
 ranga, bijli, aethersafta, kiran) can depend on a stable,
-sovereign-owned surface immediately. The C shim is **transitional
-scaffolding** — it exists exclusively to get mabda in front of
-consumers while the native GPU backend is being built. When the
-native backend lands, consumer code will not change by a single byte.
+sovereign-owned surface immediately. In v3.0 a **pure Cyrius DRM/KMS
+backend is added alongside** the C launcher path — both coexist,
+selectable per consumer, so the same bench suite exercises both. This
+gives us a clean A/B across two axes: **(C hooks vs native Cyrius) ×
+(pre-5.6.x vs post-5.6.x compiler optimizations)**. The public API
+does not change when the native backend lands; consumer code stays
+byte-identical.
 
 ```
   v2.0.0 → v2.3.0  ─▶  Cyrius port + Rust-v1 parity + P(-1) audit      (shipped)
@@ -31,12 +34,20 @@ native backend lands, consumer code will not change by a single byte.
        ▼
   v2.5.x           ─▶  render graph follow-ups (out-of-order toposort,
                         aliasing pass) — driven by consumer demand
-  v3.0             ─▶  pure Cyrius GPU backend (backend swap, API unchanged)
-  v3.1             ─▶  multi-queue + mipmaps (consumer catch-up, C shim retired)
+  v3.0             ─▶  dual-backend — native Cyrius DRM/KMS added
+                        alongside wgpu+C; API unchanged; A/B bench matrix
+  v3.1             ─▶  multi-queue + mipmaps (consumer catch-up)
   v3.2             ─▶  compressed textures + SPIR-V (texture/shader breadth)
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
+  v4.0             ─▶  C launcher + wgpu-native retired;
+                        native Cyrius backend is the only backend
 ```
+
+Across the v3.x line the C launcher stays in-tree as a permanent
+second backend. It retires in **v4.0** — only after every consumer
+has been running native in production across a full release cycle.
+Retirement is consumer-driven, not calendar-driven.
 
 Everything in this roadmap prioritizes **API stability** over
 **backend correctness**. The public surface (context, buffer, compute,
@@ -95,57 +106,77 @@ consumer request arrives. Listed so they don't get lost.
 
 ---
 
-## v3.0 — Native GPU Backend (Backend Swap)
+## v3.0 — Dual Backend (Native Cyrius Added Alongside C Path)
 
-The wgpu-native + C shim path is transitional. **v3.0 is the swap.**
-wgpu-native and the `deps/wgpu_main.c` launcher are retired in
-favour of a pure Cyrius GPU backend (DRM/KMS on Linux first, AGNOS
-kernel driver eventually). Cyrius projects depend on zero C
-artifacts for GPU work.
+v3.0 **adds** a pure Cyrius GPU backend (DRM/KMS on Linux first, AGNOS
+kernel driver eventually) **alongside** the existing wgpu-native + C
+launcher path. Both coexist; neither is retired. Consumers pick per
+build, the bench suite runs both, and the resulting matrix is the
+evidence base for future cutover decisions.
+
+**Why dual rather than swap.** The C-hooked path is our measurement
+baseline. Keeping it in-tree lets us quantify: FFI overhead per call,
+native-backend regressions, pre-vs-post-5.6.x O-pass attribution (C
+path isolates the cyrius codegen changes from backend architecture
+changes), and consumer-by-consumer cutover timing. Retiring the C
+path before that data existed would destroy the comparison.
 
 **The one invariant that matters:** the public mabda API (`# @public`
-files from v2.1.1) does not change when the backend swaps. Consumers
-bump their `[deps.mabda]` tag and their C launcher requirement
-disappears. The `examples/stdlib-consumer/` project is the regression
-test — if it still compiles after the swap, the contract held. The
-v2.5 render graph must also replay unchanged.
+files from v2.1.1) does not change. Consumers who don't opt in to the
+native backend see zero behavioural change; consumers who do flip a
+single build flag. The `examples/stdlib-consumer/` project is the
+regression test — if it still compiles against both backends, the
+contract held. The v2.5 render graph must replay unchanged on both.
 
 ### Scope (high level, refined closer to the work)
-- DRM/KMS backend in pure Cyrius — no libdrm, no libwayland.
-- WGSL → hardware ISA lowering path (vendor-first decision deferred).
-- Backend selector: `wgpu-native` (legacy, kept for one release as
-  migration safety) vs. `native` (default).
-- ADR 006 supersedes ADR 004 (C launcher FFI). Filed when scope
-  concretizes.
+- **Backend abstraction layer** — extract the wgpu-handle dispatch
+  points behind an internal `Backend` interface (context/buffer/
+  compute/texture/render-pipeline/render-pass entry points). The
+  public API stays untouched; the indirection lives under `@internal`.
+- **DRM/KMS backend in pure Cyrius** — no libdrm, no libwayland.
+- **WGSL → hardware ISA lowering path** — vendor-first decision
+  deferred; spike during v3.0 design.
+- **Backend selector** — `wgpu` (C launcher, default, unchanged for
+  existing consumers) vs. `native` (new, opt-in). Probably a
+  `cyrius.cyml` flag or a build-time constant; finalized in ADR 006.
+- **Dual-backend bench harness** — `make bench-gpu` runs the
+  13-bench suite under each backend, emits CSV columns for both,
+  `bench-history.csv` grows a `backend` column.
+- **ADR 006** — pure Cyrius GPU backend via DRM/KMS. **Supplements**
+  ADR 004 rather than superseding it; both backends are now
+  architecturally load-bearing. Filed when scope concretizes.
 
 ### Exit criteria
-- `dist/mabda.cyr` consumers rebuild with `[backends]` defaulting to
-  `native`; `examples/stdlib-consumer/`, `programs/phase0.cyr`,
+- `dist/mabda.cyr` ships with both backends compiled in; default is
+  still `wgpu` for API-stability reasons.
+- `examples/stdlib-consumer/`, `programs/phase0.cyr`,
   `programs/compute_e2e.cyr`, `programs/render_e2e.cyr`,
-  `programs/render_graph_e2e.cyr` all pass without the C launcher.
-- soorat, rasa, ranga, bijli, aethersafta, kiran all green on the
-  native backend in their own CI.
-- `deps/wgpu_main.c` and `deps/wgpu-native/` removed from the tree
-  one release after the swap (v3.1 cleanup).
+  `programs/render_graph_e2e.cyr` all pass under both backends.
+- All 387 CPU assertions + 13 GPU benches pass under both backends
+  (CPU assertions are backend-agnostic and should be untouched).
+- soorat / rasa / ranga / bijli / aethersafta / kiran continue to
+  build and run under the `wgpu` default; at least one consumer runs
+  a CI matrix entry under `native` to prove the path.
+- Bench matrix published: 13 benches × {wgpu, native} × {pre-5.6.x,
+  post-5.6.x} — four columns per bench in `bench-history.csv`, with
+  `docs/benchmarks-rust-v-cyrius.md` refreshed to tell the story.
 
 ---
 
 ## v3.1 — Multi-queue + Mipmaps (Consumer Catch-up)
 
-Both items are orthogonal to the backend swap and were backlog'd
-against v1.0 / v2.x — 3.1 is their natural home once the native
-backend is stable.
+Both items were backlog'd against v1.0 / v2.x — 3.1 is their natural
+home once the v3.0 backend abstraction is in place (both backends
+implement the new surface).
 
 - **Multi-queue coordination** — additive to `GpuContext`. Separate
   compute / graphics / transfer queues with explicit submit ordering.
   Consumers needing it: rasa (compute + present overlap), bijli
-  (large transfer workloads).
+  (large transfer workloads). Implemented on both backends.
 - **Mipmap generation** — on-device chain generation via compute
-  shader. Builds on the existing texture FFI surface. Consumers:
-  soorat (texture-heavy UI), kiran (asset pipeline).
-- **`deps/wgpu_main.c` + `deps/wgpu-native/` removal** — the final
-  cleanup from the v3.0 swap, one release later as per v3.0 exit
-  criteria.
+  shader. Builds on the existing texture surface. Consumers:
+  soorat (texture-heavy UI), kiran (asset pipeline). Implemented on
+  both backends.
 
 ---
 
@@ -211,6 +242,6 @@ consumer-side.
 | [001](../adr/001-gpucontext-public-fields.md) | GpuContext uses accessor functions (`load64` at fixed offsets) |
 | [002](../adr/002-runtime-alignment-validation.md) | Runtime alignment check for uniform buffers (bitwise AND) |
 | [003](../adr/003-fixed-vertex-types.md) | Fixed vertex types, manual layout, no codegen |
-| [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI — **transitional**, replaced in v3.0 |
-| [005](../adr/005-public-api-surface-marking.md) | Public API surface marking (`# @public` / `# @internal`) — the stability boundary that survives the backend swap |
-| 006 (planned, v3.0) | Pure Cyrius GPU backend via DRM/KMS — supersedes ADR 004 |
+| [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI — permanent, coexists with native backend from v3.0 onward |
+| [005](../adr/005-public-api-surface-marking.md) | Public API surface marking (`# @public` / `# @internal`) — the stability boundary that holds across backends |
+| [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — adds a second backend alongside ADR 004 during v3.x; wgpu path retires at v4.0 (Proposed, v3.0 design) |
