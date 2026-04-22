@@ -132,20 +132,55 @@ Five phases. Each has a concrete scope and an unambiguous exit criterion. No pha
 
 **Why first:** validates principle 1 (graph-first) by proving graph-level analysis produces real memory wins. Pure CPU, pure math, zero DRM ioctl risk, entirely reversible.
 
-### Phase B — DRM compute spike
+### Phase B — DRM compute spike (subdivided)
 
-**Scope:**
-- `src/backend_native.cyr` (new, `@internal`) — native backend entry points. Compute-only subset.
-- `programs/native_compute_spike.cyr` — trivial compute shader, native backend linked, no wgpu in the binary.
-- Shader submission via direct DRM/KMS ioctls (syscall path). Resources backed by Phase A's bump allocator.
-- Backend selector stub wired in `src/lib.cyr`.
-- Tests: CPU-side assertions for backend_native dispatch table in `tests/tcyr/mabda.tcyr`.
-- Bench: `native_compute_dispatch_throughput` in `tests/bcyr/mabda.bcyr` (CPU-side recording cost only; GPU runtime on the spike binary itself).
-- Fuzz: `fuzz/native_descriptor_encoding.fcyr` — random descriptor writes, verify byte-layout invariants hold.
+Phase B is an order of magnitude larger than Phase A. Phase A was pure CPU algorithm (interval coloring). Phase B requires direct DRM hardware interaction — vendor-specific ring buffer format, command-submission ioctls, shader ISA encoding, fence primitives. Mesa's radv/anv reference implementations are 50K+ lines per vendor. Not an afternoon spike.
 
-**Exit criterion:** `native_compute_spike` reads back a buffer that matches the wgpu backend's output on the same shader byte-for-byte. Fuzz harnesses green.
+**Subdivided into B.0–B.4**, each with its own mini-exit.
 
-**Why second:** validates principles 2 and 3 on real hardware without the surface/present complexity. If this fails, the design is wrong cheaply.
+#### B.0 — Research + target-vendor selection
+
+External research on the minimum AMDGPU (likely starting target — most-open kernel driver, Mesa radv as reference) ioctl-level compute dispatch path. Findings land in a new vidya topic for reuse across AGNOS projects. Decision point: direct-ioctl vs libdrm stepping stone — sovereignty principle prefers direct; if B.0 surfaces months of kernel RE, we negotiate the interim *before* committing code.
+
+**Exit:** vidya topic written, target vendor chosen, estimated B.3 scope documented.
+
+#### B.1 — Device enumeration + capability query
+
+- `src/backend_native.cyr` (new, `@internal`) — skeleton only.
+- Open `/dev/dri/renderD128`, issue `DRM_IOCTL_VERSION`, parse driver name + version.
+- Tests: ioctl wrapper round-trip.
+- Fuzz: `fuzz/drm_device_enum.fcyr` — device-path edge cases.
+
+**Exit:** device-open test returns the target driver string on dev hardware.
+
+#### B.2 — GEM BO create/map/round-trip
+
+- Vendor-specific `GEM_CREATE` + `GEM_MMAP` ioctls.
+- CPU write → CPU read-back through the BO. No GPU execution.
+- Tests: BO lifecycle round-trip assertions.
+- Fuzz: random size + domain combinations.
+
+**Exit:** byte-identical round-trip through a GEM BO.
+
+#### B.3 — Pre-compiled compute shader dispatch
+
+- The hard part. Scope gets concrete after B.0 research.
+- Pre-compiled shader binary (hand-assembled ISA or offline-compiled SPIR-V→ISA via a separate tool). **WGSL compilation is out-of-scope for v3.0** — separate mountain, post-v3.x.
+- Ring buffer format, doorbell path, submission ioctl.
+- `programs/native_compute_spike.cyr` dispatches a trivial hardcoded shader.
+- Tests: PM4 (or equivalent) packet-encoding assertions.
+- Fuzz: `fuzz/native_descriptor_encoding.fcyr` — random descriptor writes, verify byte-layout invariants.
+
+**Exit:** compute dispatch completes without kernel error.
+
+#### B.4 — Fence + readback + wgpu parity
+
+- Wait for submission via sync-obj or legacy fence ioctl.
+- Read result buffer; diff against wgpu backend's output on the same shader.
+
+**Exit (Phase B stated):** byte-identical compute output vs wgpu backend. All fuzz harnesses green.
+
+**Why this subdivision:** each sub-phase has a concrete, testable mini-exit. If B.0 research says direct-ioctl B.3 is months of kernel RE, we negotiate a libdrm stepping stone *with clear-eyed awareness of the sovereignty tradeoff* rather than hitting the wall mid-implementation.
 
 ### Phase C — DRM render path
 
