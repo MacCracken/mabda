@@ -158,6 +158,40 @@ Concrete next moves (in order of probability):
 3. Capture Mesa's AMDGPU_CS ioctl payload byte-for-byte; build our CS ioctl to match chunk-by-chunk.
 4. If still stuck, check whether Mesa uses `AMDGPU_VM_OP_RESERVE_VMID` via a separate VM ioctl before GEM_VA.
 
+## Session 5 — Devcoredump pinpoints VA-0 fault (2026-04-22)
+
+Captured `/sys/class/drm/card0/device/devcoredump/data` (6 MB, 290k lines) during a fresh wedge. Key findings:
+
+```
+[gfxhub] Page fault observed
+Faulty page starting at address: 0x0000000000000000
+mmVM_L2_PROTECTION_FAULT_STATUS = 0x00700881
+  → CID=1 (CP or shader memory client)
+  → VMID=8 (compute VMID)
+```
+
+**Fault is at VA 0x0**, not a high-VA mis-translation. Combined with the compute VMID (8) and the CP/shader client, this matches the hypothesis that **the hardware dereferences `s[0:3]` as a private_segment_buffer V# descriptor during dispatch setup**, even when the shader doesn't use scratch. Zero-valued SGPRs → zero V# base → access at VA 0 → fault.
+
+**Mesa's approach that avoids this:**
+- `COMPUTE_PGM_RSRC2 = 0x8` (USER_SGPR=4, TRAP_PRESENT=0)
+- `COMPUTE_USER_DATA_0 = 0x00200040` (V# word 0: base low bits at 2 MiB + 64)
+- `COMPUTE_USER_DATA_2 = 0x00200000` (kernel arg pointer, 2 MiB)
+- USER_DATA_1/_3 left at 0 (V# word 1 = high bits + stride, word 3 = kernarg high/stride)
+
+Mesa deliberately puts its data buffers at LOW VAs (`0x00200000`-range) while shader BOs live at canonical-high (`0xFFFF_8001_XXXXXXXX`). The V# base thus points to valid low-VA mapped memory, satisfying the HW's implicit scratch-setup check without actually using scratch.
+
+**Saved artifacts:**
+- `/tmp/gpu_dump.txt` — 6 MB devcoredump with register state at fault time
+- `docs/issues/2026-04-21-mesa-cl-ioctl-trace.log` — Mesa OpenCL ioctl trace
+- Reproduction: `./build/native_compute_spike` → wedges → `sudo cat /sys/class/drm/card0/device/devcoredump/data > /tmp/gpu_dump.txt`
+
+**Concrete next steps (in order):**
+1. Set `RSRC2 = 0x8` (USER_SGPR=4).
+2. Emit `SET_SH_REG COMPUTE_USER_DATA_0..3` with Mesa's exact values: 0x00200040, 0, 0x00200000, 0. Even if we don't have a real scratch BO, these values are non-zero enough to satisfy the HW's V# base check, and they point to the LOW-VA area which we can map.
+3. Map a dummy "scratch" BO at VA 0x00200000 with some reasonable size so the V# base resolves to valid memory. The GPU won't actually touch it (our shader doesn't use scratch), but the HW's implicit check passes.
+4. On spike (s_endpgm) we expect clean execution (no wedge, no sync-obj-via-reset).
+5. On store, proceed with the actual shader once the spike baseline is clean.
+
 ## Likely next angles (for a future session)
 
 1. **Is there a `COMPUTE_PGM_RSRC3` on GFX9?** GFX10+ has one. Vega
