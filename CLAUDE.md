@@ -59,6 +59,35 @@ v3.x is an implementation detail, not an API break.
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
 
+### Dependency wiring (HARD RULE)
+
+`lib/` is a **real directory** populated by `cyrius deps` — it contains
+per-module copies of the stdlib files declared in `[deps].stdlib`, plus
+symlinks into `~/.cyrius/deps/<pkg>/<ver>/dist/` for bundled deps
+(`mabda.cyr`, `patra.cyr`, `sakshi.cyr`, `sigil.cyr`, etc.). It is
+gitignored (`/lib/` in `.gitignore`) — a build artifact, not source.
+
+**NEVER** replace `lib/` with a symlink to a cyrius checkout (e.g.
+`ln -s /home/macro/Repos/cyrius/lib lib`) or to `~/.cyrius/lib`. The
+repo previously shipped exactly that symlink and it caused a recurring
+corruption bug: any agent working in this repo (formatting, linting,
+refactoring, dead-code cleanup) that wrote to `lib/<anything>.cyr`
+actually wrote through the symlink into the **cyrius** repo. `mabda`
+has no visibility into who else `include`s those files, so a dead-code
+pass against `lib/dynlib.cyr` would silently delete fns that
+`cyrius/lib/fdlopen.cyr` depends on. CI then broke in the cyrius repo,
+not mabda's — making the root cause invisible.
+
+Legitimate setup — both CI and local dev — is:
+
+```
+rm -rf lib && mkdir lib && cyrius deps
+```
+
+Never edit `lib/*.cyr` by hand. If the stdlib needs a fix, fix it in
+the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
+`cyrius.cyml`, re-run `cyrius deps`.
+
 ## Quick Start
 
 ```bash

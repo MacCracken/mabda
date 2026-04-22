@@ -24,21 +24,36 @@ GCC        ?= gcc
 WGPU_DIR   ?= deps/wgpu-native
 
 # ---------------------------------------------------------------------------
+# Lib-wiring guard — refuses to build if lib/ is a symlink to a cyrius
+# checkout. See CLAUDE.md "Dependency wiring" — that configuration causes
+# cross-repo writes when an agent working in mabda edits lib/*.cyr.
+# ---------------------------------------------------------------------------
+.PHONY: check-lib-wiring
+check-lib-wiring:
+	@if [ -L lib ]; then \
+		echo "ERROR: lib/ is a symlink ($$(readlink lib))."; \
+		echo "       mabda's lib/ must be a real directory populated by"; \
+		echo "       'cyrius deps'. See CLAUDE.md > Dependency wiring."; \
+		echo "       Fix: rm lib && mkdir lib && cyrius deps"; \
+		exit 1; \
+	fi
+
+# ---------------------------------------------------------------------------
 # Library gates (no GPU needed)
 # ---------------------------------------------------------------------------
 
 .PHONY: build
-build:
+build: check-lib-wiring
 	@mkdir -p build
 	CYRIUS_DCE=1 $(CYRIUS) build programs/smoke.cyr build/mabda_smoke
 	@echo "smoke: $$(wc -c < build/mabda_smoke) bytes"
 
 .PHONY: test
-test:
+test: check-lib-wiring
 	$(CYRIUS) test tests/tcyr/mabda.tcyr
 
 .PHONY: bench
-bench:
+bench: check-lib-wiring
 	$(CYRIUS) bench tests/bcyr/mabda.bcyr
 
 # Fuzz harnesses — each fuzz/*.fcyr is a standalone program that
