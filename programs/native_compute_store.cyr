@@ -67,8 +67,9 @@ fn main() {
     var shader_map    = load64(&shader_bo + 8);
     memset(shader_map, 0, shader_size);
     native_gfx9_shader_store_deadbeef(shader_map, 0);
-    # Mesa-verified: shader at high VA + R/W/X permissions.
-    var shader_va = 0x8000000000;
+    # Back to a low VA — with correct PGM_LO/HI encoding (no >> 8
+    # shift), a sensible 2 MiB VA should work.
+    var shader_va = 0x200000;
     rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
                            AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) { print_cstr("FAIL: shader va_map\n"); return 2; }
@@ -101,12 +102,18 @@ fn main() {
     var pm4 = alloc(512);
     memset(pm4, 0, 512);
     var pos = 0;
-    # GFX9-required queue preamble items that radv emits once per
-    # queue-init and we must emit per-submission (our context is
-    # fresh each run):
-    #   CP_COHER_START_DELAY = 0  — GFX9-specific fix that must land
-    #                               before any dispatch touches memory.
+    # GFX9-required queue preamble items that radv and rusticl emit.
+    # Our context is fresh each run so all of these must be in-stream.
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
+    # Border color base address — Mesa sets this even when the shader
+    # doesn't sample textures. Point to the shader BO's VA as a
+    # valid placeholder (any mapped VA will do for a non-sampling
+    # compute dispatch).
+    var bc_va = shader_va;
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR,
+                                         (bc_va / 256) & 0xFFFFFFFF);
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR_HI,
+                                         (bc_va / 0x10000000000) & 0xFF);
 
     # ACQUIRE_MEM — invalidate I-cache / K-cache / TC. Required on
     # GFX9 before compute dispatch; without it the SQ can decode
@@ -119,7 +126,8 @@ fn main() {
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Y, 0);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Z, 0);
 
-    var pgm_lo = (shader_va / 256) & 0xFFFFFFFF;
+    # GFX9: PGM_LO = VA[31:0], PGM_HI = VA[47:40] (Mesa-verified).
+    var pgm_lo = shader_va & 0xFFFFFFFF;
     var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);

@@ -209,11 +209,27 @@ fn native_gem_close(fd, handle) {
 # we got past gem_create but failed at mmap; caller should gem_close
 # the handle in that case).
 fn native_bo_create_gtt(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_GTT, out);
+}
+
+# Shader BOs may need VRAM domain on some hardware — on Cezanne
+# (Vega APU) physical memory is shared, but the domain flag affects
+# residency semantics. Per Mesa rusticl behavior, shader code lives
+# in VRAM-domain BOs.
+fn native_bo_create_vram(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_VRAM, out);
+}
+
+fn _native_bo_create_domain(fd, size, domain, out) {
     store64(out + 0, 0);
     store64(out + 8, 0);
 
     var req[32];
-    var rc = native_gem_create(fd, size, 4096, AMDGPU_GEM_DOMAIN_GTT, 0, &req);
+    # For VRAM-domain on APUs we need CPU_ACCESS_REQUIRED (bit 0) so
+    # the BO lands in BAR-accessible VRAM we can mmap.
+    var flags = 0;
+    if (domain == AMDGPU_GEM_DOMAIN_VRAM) { flags = 1; }  # CPU_ACCESS_REQUIRED
+    var rc = native_gem_create(fd, size, 4096, domain, flags, &req);
     if (rc != 0) { return rc; }
     var handle = native_gem_create_handle(&req);
     store64(out + 0, handle);
@@ -224,9 +240,6 @@ fn native_bo_create_gtt(fd, size, out) {
     var offset = native_gem_mmap_offset_value(&mreq);
 
     var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-    # cyr_mmap returns negative errno on failure (addr < 0 in two's
-    # complement sense — most negative errnos fall in the last page
-    # which userspace won't get; a simple `< 0` check is fine).
     if (addr < 0) { return addr; }
     store64(out + 8, addr);
     return 0;
@@ -437,6 +450,10 @@ var PM4_UCONFIG_REG_BASE = 0x30000;
 
 # GFX9 UCONFIG registers we program in the queue preamble.
 var R_CP_COHER_START_DELAY = 0x301EC;
+# Texture addressing border-color base. Mesa rusticl programs these
+# in its preamble even for shaders that don't sample textures.
+var R_TA_CS_BC_BASE_ADDR    = 0x30E00;
+var R_TA_CS_BC_BASE_ADDR_HI = 0x30E04;
 
 # Dispatch initiator: minimum bits to launch a shader.
 # COMPUTE_SHADER_EN at bit 0 triggers the dispatch.
@@ -528,14 +545,11 @@ fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
 #   +24 poll_interval (cycles between state-check; 0x0A standard)
 # Total: 7 dwords (28 bytes). Returns new pos.
 fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
-    # Shader caches + TC L1/L2 invalidate:
-    #   bit 23: TC_ACTION_ENA  (texture cache / L2)
-    #   bit 27: SH_KCACHE_ACTION_ENA
-    #   bit 28: SH_ICACHE_ACTION_ENA
-    #   bit 29: TCL1_ACTION_ENA
-    # Value: 0x38800000
+    # coher_cntl = 0xa8c40000 (verified from Mesa rusticl
+    # AMD_DEBUG=ib dump on gfx90c). This covers full cache
+    # invalidate + writeback for compute dispatch preambles.
     store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 7, 0));
-    store32(buf + pos +  4, 0x38800000);   # coher_cntl
+    store32(buf + pos +  4, 0xA8C40000);   # coher_cntl (Mesa-verified)
     store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
     store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
     store32(buf + pos + 16, 0);            # coher_base_lo
@@ -586,10 +600,10 @@ var GFX9_COMPUTE_PGM_RSRC1_MIN = 0x2C0040;
 # COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
 var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
 
-# DISPATCH_INITIATOR: bits 0 (COMPUTE_SHADER_EN) | 2 (FORCE_START_AT_000) | 6.
-# Mesa rusticl on gfx90c emits 0x45 — bit 6 is ORDER_MODE (or similar)
-# and appears mandatory in Mesa's verified-working sequence.
-var GFX9_DISPATCH_INITIATOR = 0x45;
+# DISPATCH_INITIATOR: just COMPUTE_SHADER_EN (bit 0). Minimum value.
+# Mesa rusticl uses 0x45, but that includes ORDER_MODE + FORCE_START
+# bits that may be context-specific.
+var GFX9_DISPATCH_INITIATOR = 0x1;
 
 # Write the s_endpgm shader into buf at pos. Returns new pos.
 fn native_gfx9_shader_endpgm(buf, pos) {

@@ -128,6 +128,36 @@ Offsets corrected. Tests updated to match. `make test` = 602/602 pass.
 
 Next session's first move: match Mesa's complete PM4 stream byte-for-byte on a scratch-less GFX9 test, iterate until the dispatch actually runs our shader (verifiable by store succeeding).
 
+## Session 4 — Mesa strace + more register semantics (2026-04-21 late evening)
+
+Installed packages (strace, clinfo, opencl-mesa). Ran `strace -f -e trace=ioctl -v` on the working OpenCL compute probe. Full log preserved at `docs/issues/2026-04-21-mesa-cl-ioctl-trace.log`.
+
+**New ground truth from the strace:**
+
+1. **Mesa maps ALL its BOs in the canonical-high VA aperture**, specifically starting at `0xFFFF_8001_0000_0000` with 2 MiB strides: handle 1 → `0xFFFF_8001_0000_0000`, handle 3 → `0xFFFF_8001_0020_0000`, etc. My mabda code had been mapping at low VAs (2 MiB / 4 MiB) which the kernel accepts but the GPU's compute path doesn't actually run shaders from.
+
+2. **The apparent "PGM_HI = 0x80 = 128 TiB shader VA" that made no physical sense turns out to be encoding bits[47:40] of a canonical-high VA `0xFFFF_8001_xxxxxxxx`.** The 0x80 + the implicit bits 39:32 = 0x01 (from the GFX9 shader aperture) combine to give the full 48-bit canonical VA — sign-extended upward by the hardware. PGM_LO holds the low 32 bits, PGM_HI holds bits 47:40, and bits 39:32 are an implicit 0x01 tied to the aperture. My PGM encoding had been assuming a much lower VA range.
+
+3. **Mesa uses `DRM_IOWR` (dir=3) for `AMDGPU_GEM_VA`, not `DRM_IOW` (dir=1)** that the header declares. Kernel accepts both — not a blocker but worth noting.
+
+**Applied this session:**
+- Shader and IB VAs moved to canonical-high aperture.
+- Both `compute_spike.cyr` and `compute_store.cyr` updated.
+- PGM_LO/HI encoding confirmed: `PGM_LO = va & 0xFFFFFFFF`, `PGM_HI = (va >> 40) & 0xFF`.
+
+**Result:** still wedges. So the VA aperture was *a* missing piece but not the final one. The next most likely remaining delta is Mesa's `WRITE_DATA` preamble packet (writing 4 bytes to `0xFFFF_8001_0060_0300`) which appears to be a kernel-tracked progress marker. Without it, the kernel may not know our submission actually advanced, and consider it stuck.
+
+**Saved artifacts for next session:**
+- Full Mesa ioctl trace: `docs/issues/2026-04-21-mesa-cl-ioctl-trace.log`
+- Mesa PM4 IB dump (not saved, but reproducible via `AMD_DEBUG=ib ./build/shader/cl_probe`)
+- OpenCL probe source: `build/shader/cl_probe.c` (used to reproduce the working-dispatch trace)
+
+Concrete next moves (in order of probability):
+1. Emit Mesa's `WRITE_DATA` packet (opcode 0x37) writing 0 to `0xFFFF_8001_0060_0300` in the preamble.
+2. Set `TA_CS_BC_BASE_ADDR` to point at a canonical-high VA matching Mesa's `0x80_01004400`.
+3. Capture Mesa's AMDGPU_CS ioctl payload byte-for-byte; build our CS ioctl to match chunk-by-chunk.
+4. If still stuck, check whether Mesa uses `AMDGPU_VM_OP_RESERVE_VMID` via a separate VM ioctl before GEM_VA.
+
 ## Likely next angles (for a future session)
 
 1. **Is there a `COMPUTE_PGM_RSRC3` on GFX9?** GFX10+ has one. Vega
