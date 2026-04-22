@@ -406,6 +406,9 @@ var IT_EVENT_WRITE      = 0x46;
 # is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
 # Covered by native_sh_reg_offset() helper.
 var R_COMPUTE_DISPATCH_INITIATOR = 0xB800;
+var R_COMPUTE_START_X            = 0xB810;
+var R_COMPUTE_START_Y            = 0xB814;
+var R_COMPUTE_START_Z            = 0xB818;
 var R_COMPUTE_NUM_THREAD_X       = 0xB81C;
 var R_COMPUTE_NUM_THREAD_Y       = 0xB820;
 var R_COMPUTE_NUM_THREAD_Z       = 0xB824;
@@ -417,10 +420,19 @@ var R_COMPUTE_PGM_RSRC2          = 0xB854;
 # CUs enabled") — if left unset, the scheduler refuses to issue
 # waves and the dispatch hangs without an error. Setting to all-ones
 # is the canonical "enable everything" value used by radv.
+# On Vega / GFX9, four SE masks are contiguous at 0xB85C-0xB868.
+# Even APUs with 1 SE must write all four (SE2/SE3 reset-default
+# zero on 4-SE discrete parts causes silent bad_op_irq).
 var R_COMPUTE_RESOURCE_LIMITS         = 0xB858;
 var R_COMPUTE_STATIC_THREAD_MGMT_SE0  = 0xB85C;
 var R_COMPUTE_STATIC_THREAD_MGMT_SE1  = 0xB860;
-var R_COMPUTE_TMPRING_SIZE            = 0xB864;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE2  = 0xB864;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE3  = 0xB868;
+# TMPRING_SIZE lives elsewhere (not in the SE-mask block); default
+# zero is fine for shaders without scratch, so we don't need to
+# write it explicitly. (Previously we wrote 0xB864 thinking it was
+# TMPRING_SIZE — that was actually SE2, which we were silently
+# disabling every dispatch.)
 var R_COMPUTE_USER_DATA_0        = 0xB900;
 # COMPUTE_USER_DATA_1..15 follow in 4-byte increments up to 0xB93C.
 
@@ -490,6 +502,36 @@ fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
     return pos;
 }
 
+# Emit an ACQUIRE_MEM packet that invalidates the shader I-cache,
+# K-cache, and TC (texture / L2) caches. Per ROCT-Thunk kfdtest,
+# this is mandatory before a compute dispatch on GFX9 — without it
+# the I-cache can return stale bytes and the SQ decodes garbage
+# as an "illegal opcode". Packet format:
+#   +0  PKT3 header (opcode IT_ACQUIRE_MEM, count=5+1 data dwords)
+#   +4  coher_cntl (cache-invalidate action bits)
+#   +8  coher_size_lo (bytes to invalidate; 0xFFFFFFFF = everything)
+#   +12 coher_size_hi (24-bit mask for GFX9)
+#   +16 coher_base_lo (base VA; 0 = start from 0)
+#   +20 coher_base_hi
+#   +24 poll_interval (cycles between state-check; 0x0A standard)
+# Total: 7 dwords (28 bytes). Returns new pos.
+fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
+    # Shader caches + TC L1/L2 invalidate:
+    #   bit 23: TC_ACTION_ENA  (texture cache / L2)
+    #   bit 27: SH_KCACHE_ACTION_ENA
+    #   bit 28: SH_ICACHE_ACTION_ENA
+    #   bit 29: TCL1_ACTION_ENA
+    # Value: 0x38800000
+    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 7, 0));
+    store32(buf + pos +  4, 0x38800000);   # coher_cntl
+    store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
+    store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
+    store32(buf + pos + 16, 0);            # coher_base_lo
+    store32(buf + pos + 20, 0);            # coher_base_hi
+    store32(buf + pos + 24, 0x0A);         # poll_interval
+    return pos + 28;
+}
+
 # Emit a NOP of `pad_dwords` total dwords (header + pad_dwords-1
 # filler). Useful for aligning IBs to 8-dword boundaries (kernel
 # requirement on some rings). Returns new position.
@@ -516,14 +558,17 @@ fn native_pm4_nop(buf, pos, pad_dwords) {
 var GFX9_S_ENDPGM = 0xBF810000;
 
 # GFX9 COMPUTE_PGM_RSRC1 minimum viable mask.
-#   bits  0-5  VGPRS        = 0 → allocate 4 VGPRs
-#   bits  6-9  SGPRS        = 0 → allocate 8 SGPRs
+#   bits  0-5  VGPRS        = 0 → allocate 4 VGPRs (enough for v0-v3)
+#   bits  6-9  SGPRS        = 1 → allocate 16 SGPRs
+#       SGPRS=0 allocates only 8 and is too few once VCC (+2) and
+#       flat_scratch (+3) overhead are counted on a store shader.
 #   bits 12-19 FLOAT_MODE   = 0xC0 → round-to-nearest-even for f32 + f64.
 #                              Some GFX9 firmware rejects FLOAT_MODE = 0.
 #   bit  21    DX10_CLAMP   = 1 → well-behaved clamp semantics
 #   bit  23    IEEE_MODE    = 1 → IEEE-conformant float behaviour
-# Encoded value: (0xC0 << 12) | (1 << 21) | (1 << 23) = 0x00AC0000
-var GFX9_COMPUTE_PGM_RSRC1_MIN = 0xAC0000;
+# Encoded value: (0xC0 << 12) | (1 << 6) | (1 << 21) | (1 << 23)
+#              = 0x00AC0040
+var GFX9_COMPUTE_PGM_RSRC1_MIN = 0xAC0040;
 
 # COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
 var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
@@ -559,22 +604,47 @@ fn native_gfx9_shader_endpgm(buf, pos) {
 # DX10_CLAMP, IEEE_MODE. RSRC2 must set USER_SGPR = 2 (bits 1-5 = 2,
 # register value = 0x04).
 fn native_gfx9_shader_store_deadbeef(buf, pos) {
-    # ==== B.4 BLOCKED — see docs/issues/2026-04-21-gfx9-store-blocker.md ====
-    # Diagnostic-safe body (v_mov + s_endpgm, no memory store). Runs
-    # cleanly through the full dispatch pipeline but doesn't write
-    # anything, so the verify step expectedly fails. The real store
-    # variants (global/flat/scalar, any VA tried from 256 MiB to
-    # 64 GiB) all trigger gfx_v9_0_bad_op_irq and GPU reset. Needs
-    # a round of research focused on SH_MEM_CONFIG / SH_MEM_BASES /
-    # FLAT_SCRATCH_INIT / KMD-managed VMID semantics before stores
-    # will retire on this APU.
+    # Writes 0xDEADBEEF to memory[s[0:1]] via global_store_dword.
+    # USER_SGPR=2 in RSRC2 pre-loads s0/s1 from USER_DATA_0/1.
+    #
+    # Shader body (8 dwords = 32 bytes):
+    #   v_mov_b32_e32  v0, s0                            ; VA low
+    #   v_mov_b32_e32  v1, s1                            ; VA high
+    #   v_mov_b32_e32  v2, 0xDEADBEEF
+    #   global_store_dword v[0:1], v2, off
+    #   s_waitcnt vmcnt(0) lgkmcnt(0)
+    #   s_endpgm
+    #
+    # Followed by 16 dwords of s_nop 0 (64 bytes) — the AMDGPU ABI
+    # requires trailing NOP padding because the SQ prefetches past
+    # the end of the shader; without it the prefetcher reads
+    # undefined memory and decodes garbage opcodes as bad_op_irq.
+    # (Ref: ROCT-Thunk kfdtest, AMDGPU-ABI.md.)
     store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
     store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
     store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
     store32(buf + pos + 12, 0xDEADBEEF);   # literal
-    store32(buf + pos + 16, 0xBF810000);   # s_endpgm
-    return pos + 20;
+    store32(buf + pos + 16, 0xDC708000);   # global_store_dword
+    store32(buf + pos + 20, 0x007F0200);   # VADDR=v0, DATA=v2
+    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
+    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
+    # 16 × s_nop 0 = 64 bytes of prefetch padding.
+    var i = 0;
+    while (i < 16) {
+        store32(buf + pos + 32 + i * 4, 0xBF800000);
+        i = i + 1;
+    }
+    return pos + 96;
 }
+
+# PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).
+# On GFX9, TRAP_PRESENT must be set or memory-op trap paths fire
+# bad_op_irq even when no actual trap occurs. Per kfdtest this bit
+# is mandatory for any compute dispatch that touches memory.
+#   USER_SGPR = 2 → bits 1-5 = 0b00010 → value 0x04
+#   TRAP_PRESENT → bit 6        → value 0x40
+# Combined: 0x04 | 0x40 = 0x44
+var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP = 0x44;
 
 # RSRC2 with USER_SGPR = 2 — tells HW to pre-load SGPRs s0, s1 with
 # COMPUTE_USER_DATA_0, COMPUTE_USER_DATA_1 before shader entry.

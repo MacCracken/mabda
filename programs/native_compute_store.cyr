@@ -85,14 +85,11 @@ fn main() {
         store32(out_map + si * 4, sentinel);
         si = si + 1;
     }
-    # Place the output BO ABOVE the GFX9 32-bit aperture. On Vega,
-    # SH_MEM_BASES = 0x60006000 — the kernel programs the private and
-    # shared apertures at 0x0006_xxxx_xxxx_xxxx. Any FLAT/GLOBAL store
-    # with a VA that fits in 32 bits (< 0x1_0000_0000) gets classified
-    # by the SQ as a scratch-segment access, and since scratch isn't
-    # set up for us, the SQ raises `bad_op_irq` and the GPU resets.
-    # Using a VA clearly above the 32-bit window sidesteps this.
-    var out_va = 0x1000000000;  # 64 GiB — well clear of 32-bit aperture
+    # Output BO at 64 GiB VA — well above the 32-bit window. Note:
+    # this alone doesn't avoid bad_op_irq on stores (empirically
+    # confirmed); the real fix is TRAP_PRESENT in RSRC2 + shader
+    # trailing NOP padding (kfdtest minimum).
+    var out_va = 0x1000000000;
     rc = native_gem_va_map(fd, out_handle, out_va, out_size,
                            AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
     if (rc != 0) { print_cstr("FAIL: output va_map\n"); return 3; }
@@ -103,17 +100,31 @@ fn main() {
     var pm4 = alloc(512);
     memset(pm4, 0, 512);
     var pos = 0;
+    # ACQUIRE_MEM first — invalidate I-cache / K-cache / TC. Per
+    # ROCT-Thunk kfdtest this is required on GFX9 before any compute
+    # dispatch; without it the SQ can decode stale I-cache bytes as
+    # illegal opcodes.
+    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
+
+    # COMPUTE_START_X/Y/Z = 0 (grid origin). Default 0, but kfdtest
+    # writes them explicitly — some firmware revisions require it.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_X, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Y, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Z, 0);
+
     var pgm_lo = (shader_va / 256) & 0xFFFFFFFF;
     var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC1, GFX9_COMPUTE_PGM_RSRC1_MIN);
-    # RSRC2: USER_SGPR = 2 so s0/s1 auto-load with USER_DATA_0/1.
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2);
+    # RSRC2: USER_SGPR = 2 (load s0/s1 from USER_DATA_0/1) AND
+    # TRAP_PRESENT = 1 (mandatory on GFX9 for memory ops).
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0xFFFFFFFF);
     # USER_DATA_0 = low 32 of output VA, USER_DATA_1 = high 32.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0,     out_va & 0xFFFFFFFF);
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);
