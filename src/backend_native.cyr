@@ -122,3 +122,120 @@ fn native_probe_device(out) {
     sys_close(fd);
     return rc;
 }
+
+# ================================================================
+# v3 Phase B.2 — GEM buffer object lifecycle (AMDGPU)
+# ================================================================
+# Kernel UAPI reference: /usr/include/drm/amdgpu_drm.h,
+#                        /usr/include/drm/drm.h (for generic GEM_CLOSE).
+# All numbers here are verifiable via native_ioc_encode; tests lock
+# them down in tests/tcyr/mabda.tcyr.
+
+# DRM_COMMAND_BASE = 0x40 in drm.h; AMDGPU driver-specific ioctls
+# start there. We pre-compute the absolute nr for each ioctl.
+var DRM_COMMAND_BASE       = 0x40;
+var DRM_AMDGPU_GEM_CREATE  = 0x00;
+var DRM_AMDGPU_GEM_MMAP    = 0x01;
+
+# Union / struct sizes on x86_64 (in bytes):
+#   union drm_amdgpu_gem_create { in (32) | out (8) } = 32
+#   union drm_amdgpu_gem_mmap   { in (8)  | out (8) } = 8
+#   struct drm_gem_close                              = 8
+var DRM_AMDGPU_GEM_CREATE_SIZE = 32;
+var DRM_AMDGPU_GEM_MMAP_SIZE   = 8;
+var DRM_GEM_CLOSE_SIZE         = 8;
+
+# Absolute ioctl numbers (precomputed; tests verify via native_ioc_encode):
+#   DRM_IOCTL_AMDGPU_GEM_CREATE = _IOWR('d', 0x40, union drm_amdgpu_gem_create)
+#     dir=3, size=32, type=0x64, nr=0x40 → 0xC0206440
+#   DRM_IOCTL_AMDGPU_GEM_MMAP   = _IOWR('d', 0x41, union drm_amdgpu_gem_mmap)
+#     dir=3, size=8, type=0x64, nr=0x41 → 0xC0086441
+#   DRM_IOCTL_GEM_CLOSE         = _IOW ('d', 0x09, struct drm_gem_close)
+#     dir=1, size=8, type=0x64, nr=0x09 → 0x40086409
+var DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440;
+var DRM_IOCTL_AMDGPU_GEM_MMAP   = 0xC0086441;
+var DRM_IOCTL_GEM_CLOSE         = 0x40086409;
+
+# Memory domain flags (bitwise OR for combinations; we only use CPU,
+# GTT, VRAM for Phase B.2 — the rest appear in later phases).
+var AMDGPU_GEM_DOMAIN_CPU      = 0x1;
+var AMDGPU_GEM_DOMAIN_GTT      = 0x2;
+var AMDGPU_GEM_DOMAIN_VRAM     = 0x4;
+
+# GEM BO create. Args are written into `req` (caller-owned 32 bytes,
+# will be zeroed); on success the BO handle is read back from req+0.
+# Returns 0 on success, negative errno on failure.
+#
+# `domains` is a bitmask of AMDGPU_GEM_DOMAIN_*. For a plain
+# CPU-visible buffer (Phase B.2 round-trip), use GTT.
+fn native_gem_create(fd, size, alignment, domains, domain_flags, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_CREATE_SIZE);
+    store64(req + 0,  size);
+    store64(req + 8,  alignment);
+    store64(req + 16, domains);
+    store64(req + 24, domain_flags);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
+}
+
+# Read the handle out of a req buffer that native_gem_create populated.
+fn native_gem_create_handle(req) { return load32(req + 0); }
+
+# GEM BO mmap-offset query. Given a handle, returns the offset to pass
+# as the mmap(2) `offset` argument. `req` is caller-owned 8 bytes.
+# Returns 0 on success (with offset at req+0 on out), negative errno
+# on failure.
+fn native_gem_mmap_offset(fd, handle, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_MMAP_SIZE);
+    store32(req + 0, handle);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
+}
+
+fn native_gem_mmap_offset_value(req) { return load64(req + 0); }
+
+# GEM handle close. Generic DRM ioctl — not AMDGPU-specific.
+# Returns 0 on success, negative errno on failure.
+fn native_gem_close(fd, handle) {
+    var req[8];
+    store32(&req + 0, handle);
+    store32(&req + 4, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_GEM_CLOSE, &req);
+}
+
+# Convenience: create a CPU-visible GTT BO and mmap it. Populates
+# `out` (16 bytes):
+#   +0: handle       (u32 zero-extended to u64)
+#   +8: mapped_addr  (u64 from mmap return, or negative errno on failure)
+# Returns 0 on success, negative errno on failure (out+0 is valid if
+# we got past gem_create but failed at mmap; caller should gem_close
+# the handle in that case).
+fn native_bo_create_gtt(fd, size, out) {
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+
+    var req[32];
+    var rc = native_gem_create(fd, size, 4096, AMDGPU_GEM_DOMAIN_GTT, 0, &req);
+    if (rc != 0) { return rc; }
+    var handle = native_gem_create_handle(&req);
+    store64(out + 0, handle);
+
+    var mreq[8];
+    rc = native_gem_mmap_offset(fd, handle, &mreq);
+    if (rc != 0) { return rc; }
+    var offset = native_gem_mmap_offset_value(&mreq);
+
+    var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+    # cyr_mmap returns negative errno on failure (addr < 0 in two's
+    # complement sense — most negative errnos fall in the last page
+    # which userspace won't get; a simple `< 0` check is fine).
+    if (addr < 0) { return addr; }
+    store64(out + 8, addr);
+    return 0;
+}
+
+# Release a BO created via native_bo_create_gtt: munmap, then
+# gem_close. Returns 0 on success.
+fn native_bo_release_gtt(fd, handle, addr, size) {
+    if (addr != 0) { cyr_munmap(addr, size); }
+    if (handle != 0) { native_gem_close(fd, handle); }
+    return 0;
+}

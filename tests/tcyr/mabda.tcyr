@@ -1916,6 +1916,89 @@ fn test_native_render_node_path() {
     return 0;
 }
 
+# ================================================================
+# v3 Phase B.2 — GEM BO lifecycle (AMDGPU) — pure-math constants
+# ================================================================
+
+fn test_native_drm_command_base() {
+    assert_eq(DRM_COMMAND_BASE, 0x40, "DRM_COMMAND_BASE = 0x40");
+    return 0;
+}
+
+fn test_native_amdgpu_ioctl_nr_offsets() {
+    assert_eq(DRM_AMDGPU_GEM_CREATE, 0x00, "GEM_CREATE nr offset");
+    assert_eq(DRM_AMDGPU_GEM_MMAP,   0x01, "GEM_MMAP nr offset");
+    return 0;
+}
+
+fn test_native_gem_create_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0, union drm_amdgpu_gem_create) with 32-byte union.
+    var expected = native_ioc_encode(3, DRM_AMDGPU_GEM_CREATE_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_CREATE, expected, "GEM_CREATE ioctl = 0xC0206440");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_CREATE, 0xC0206440, "precomputed constant");
+    return 0;
+}
+
+fn test_native_gem_mmap_ioctl_encoding() {
+    # _IOWR('d', 0x41, union drm_amdgpu_gem_mmap) with 8-byte union.
+    var expected = native_ioc_encode(3, DRM_AMDGPU_GEM_MMAP_SIZE, DRM_IOCTL_TYPE,
+                                     DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_MMAP, expected, "GEM_MMAP ioctl = 0xC0086441");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_MMAP, 0xC0086441, "precomputed constant");
+    return 0;
+}
+
+fn test_native_gem_close_ioctl_encoding() {
+    # _IOW('d', 0x09, struct drm_gem_close) with 8-byte struct.
+    var expected = native_ioc_encode(1, DRM_GEM_CLOSE_SIZE, DRM_IOCTL_TYPE, 0x09);
+    assert_eq(DRM_IOCTL_GEM_CLOSE, expected, "GEM_CLOSE ioctl = 0x40086409");
+    assert_eq(DRM_IOCTL_GEM_CLOSE, 0x40086409, "precomputed constant");
+    return 0;
+}
+
+fn test_native_amdgpu_gem_domains() {
+    # Domain bit values mirror kernel UAPI. They are disjoint single bits.
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU,  0x1, "CPU = 0x1");
+    assert_eq(AMDGPU_GEM_DOMAIN_GTT,  0x2, "GTT = 0x2");
+    assert_eq(AMDGPU_GEM_DOMAIN_VRAM, 0x4, "VRAM = 0x4");
+    # Single-bit invariant: each is a power of 2, no shared bits.
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU & AMDGPU_GEM_DOMAIN_GTT,  0, "CPU/GTT disjoint");
+    assert_eq(AMDGPU_GEM_DOMAIN_GTT & AMDGPU_GEM_DOMAIN_VRAM, 0, "GTT/VRAM disjoint");
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU & AMDGPU_GEM_DOMAIN_VRAM, 0, "CPU/VRAM disjoint");
+    return 0;
+}
+
+fn test_native_gem_create_request_layout() {
+    # drm_amdgpu_gem_create_in: {bo_size, alignment, domains, domain_flags}
+    # each u64, packed — 32 bytes total.
+    var req[32];
+    memset(&req, 0, 32);
+    store64(&req + 0,  0x1000);   # bo_size = 4096
+    store64(&req + 8,  0x0100);   # alignment = 256
+    store64(&req + 16, 0x2);      # domains = GTT
+    store64(&req + 24, 0);        # domain_flags
+    assert_eq(load64(&req + 0),  0x1000, "bo_size slot");
+    assert_eq(load64(&req + 8),  0x0100, "alignment slot");
+    assert_eq(load64(&req + 16), 0x2,    "domains slot");
+    assert_eq(load64(&req + 24), 0,      "domain_flags slot");
+    return 0;
+}
+
+fn test_native_gem_mmap_request_layout() {
+    # drm_amdgpu_gem_mmap_in: {handle u32, _pad u32} = 8 bytes.
+    # Out variant: {addr_ptr u64} at the same memory.
+    var req[8];
+    memset(&req, 0, 8);
+    store32(&req + 0, 42);    # handle
+    assert_eq(load32(&req + 0), 42, "handle at +0");
+    # After kernel writes, the same 8 bytes become an i64 addr_ptr.
+    memset(&req, 0, 8);
+    store64(&req + 0, 0xDEAD00);
+    assert_eq(load64(&req + 0), 0xDEAD00, "addr_ptr at +0 (union)");
+    return 0;
+}
+
 fn test_rg_plan_reclaim_ratio_chain() {
     # 6-node linear chain with 5 transients. Each node hands off to the
     # next via a distinct transient. Classic staggered interval graph —
@@ -2230,6 +2313,16 @@ fn main() {
     test_rg_plan_reclaim_ratio_chain();
 
     # v3 Phase B.1 — native backend ioctl encoding (7 new, above)
+
+    # v3 Phase B.2 — GEM BO lifecycle constants (7)
+    test_native_drm_command_base();
+    test_native_amdgpu_ioctl_nr_offsets();
+    test_native_gem_create_ioctl_encoding();
+    test_native_gem_mmap_ioctl_encoding();
+    test_native_gem_close_ioctl_encoding();
+    test_native_amdgpu_gem_domains();
+    test_native_gem_create_request_layout();
+    test_native_gem_mmap_request_layout();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

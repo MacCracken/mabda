@@ -12,6 +12,7 @@
 #   make dist           — regenerate dist/mabda.cyr via `cyrius distlib`
 #   make test-phase0    — GPU integration test (requires wgpu-native)
 #   make test-native-enum — v3 Phase B.1 DRM probe (requires DRM hardware)
+#   make test-native-gem-roundtrip — v3 Phase B.2 GEM BO round-trip (requires DRM hardware)
 #   make test-all       — version-check + dist regen + CPU tests + fuzz
 #   make lint / fmt-check / vet  — quality gates
 #   make clean          — scrub build/
@@ -153,6 +154,17 @@ build/native_device_enum: programs/native_device_enum.cyr src/*.cyr
 .PHONY: test-native-enum
 test-native-enum: build/native_device_enum
 	./build/native_device_enum
+
+# v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
+# mmaps it, writes a deterministic pattern, reads it back byte-identical,
+# releases. Requires DRM hardware; not in CI.
+build/native_gem_roundtrip: programs/native_gem_roundtrip.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_gem_roundtrip.cyr $@
+
+.PHONY: test-native-gem-roundtrip
+test-native-gem-roundtrip: build/native_gem_roundtrip
+	./build/native_gem_roundtrip
 
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows
