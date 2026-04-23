@@ -517,12 +517,24 @@ fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
     return pos + 12;
 }
 
+# Emit a SET_UCONFIG_REG packet for two consecutive registers. `values`
+# points to two u32s. Packet: header + reg_offset + 2 values = 4 dwords.
+fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 3, 0));
+    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
+    store32(buf + pos + 8,  load32(values + 0));
+    store32(buf + pos + 12, load32(values + 4));
+    return pos + 16;
+}
+
 # Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
 # given workgroup counts and the provided initiator mask (typically
 # COMPUTE_DISPATCH_INITIATOR_MIN). Returns new position.
 fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
     # 4 data dwords: dim_x, dim_y, dim_z, initiator. count = 4.
-    store32(buf + pos, native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 0));
+    # Low byte of header is shader_type (2 = compute), not predicate.
+    # Mesa emits 0xc0031502 — verified via AMD_DEBUG=ib dump.
+    store32(buf + pos, native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 2));
     pos = pos + 4;
     store32(buf + pos, dim_x); pos = pos + 4;
     store32(buf + pos, dim_y); pos = pos + 4;
@@ -549,7 +561,9 @@ fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
     # shader_type (0=graphics, non-zero=compute) — NOT the generic
     # predicate bit. Mesa rusticl emits 0xc0055802 = shader_type=0x02.
     # coher_cntl = 0xa8c40000 verified from Mesa AMD_DEBUG=ib dump.
-    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 7, 2));
+    # Count field: 6 data dwords follow (cntl, size_lo/hi, base_lo/hi,
+    # poll). Header encodes count-1 = 5.
+    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, 2));
     store32(buf + pos +  4, 0xA8C40000);   # coher_cntl
     store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
     store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
@@ -601,10 +615,9 @@ var GFX9_COMPUTE_PGM_RSRC1_MIN = 0x2C0040;
 # COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
 var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
 
-# DISPATCH_INITIATOR: just COMPUTE_SHADER_EN (bit 0). Minimum value.
-# Mesa rusticl uses 0x45, but that includes ORDER_MODE + FORCE_START
-# bits that may be context-specific.
-var GFX9_DISPATCH_INITIATOR = 0x1;
+# DISPATCH_INITIATOR = 0x45 (Mesa-verified): bits 0 (COMPUTE_SHADER_EN)
+# | 2 (FORCE_START_AT_000) | 6 (ORDER_MODE).
+var GFX9_DISPATCH_INITIATOR = 0x45;
 
 # Write the s_endpgm shader into buf at pos. Returns new pos.
 fn native_gfx9_shader_endpgm(buf, pos) {

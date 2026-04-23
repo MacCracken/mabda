@@ -1,7 +1,7 @@
 # v3 Native GPU Backend — Design Principles
 
-**Status:** Draft (v3 branch, 2026-04-21)
-**Related:** [ADR 006](../adr/006-native-cyrius-gpu-backend.md) (dual-backend), [ADR 005](../adr/005-public-api-surface-marking.md) (@public boundary), [ADR 004](../adr/004-c-launcher-ffi.md) (wgpu path, v3.x era)
+**Status:** Draft (v3 branch, 2026-04-22 — Phase A shipped; Phase B.0–B.3.c complete; B.3.d live-verified for first dispatch but see blocker note below; B.4 blocked pending PM4-encoder-fix retest)
+**Related:** [ADR 006](../adr/006-native-cyrius-gpu-backend.md) (dual-backend), [ADR 005](../adr/005-public-api-surface-marking.md) (@public boundary), [ADR 004](../adr/004-c-launcher-ffi.md) (wgpu path, v3.x era), [GFX9 store blocker](../issues/2026-04-21-gfx9-store-blocker.md)
 
 ## Framing
 
@@ -181,6 +181,19 @@ External research on the minimum AMDGPU (likely starting target — most-open ke
 **Exit (Phase B stated):** byte-identical compute output vs wgpu backend. All fuzz harnesses green.
 
 **Why this subdivision:** each sub-phase has a concrete, testable mini-exit. If B.0 research says direct-ioctl B.3 is months of kernel RE, we negotiate a libdrm stepping stone *with clear-eyed awareness of the sovereignty tradeoff* rather than hitting the wall mid-implementation.
+
+#### Phase B status (2026-04-22)
+
+- **B.0** ✅ direct-ioctl path picked; AMDGPU as first target.
+- **B.1** ✅ `native_device_enum` returns `amdgpu` on gfx90c.
+- **B.2** ✅ `native_gem_roundtrip` — byte-identical CPU→GPU→CPU.
+- **B.3.a** ✅ ctx/BO-list/VA-map infrastructure lands in `backend_native.cyr`.
+- **B.3.b** ✅ PM4 builder (pure math). **Two encoding bugs found + fixed in Session 7** (see blocker doc): ACQUIRE_MEM count field off-by-one (desynced CP stream for all prior attempts); DISPATCH_DIRECT missing shader_type=2. Test suite gained byte-exact header assertions against Mesa AMD_DEBUG=ib.
+- **B.3.c** ✅ `native_gfx9_shader_endpgm` (single-instruction no-op).
+- **B.3.d** ⚠️ First live dispatch was believed to pass in Session 3 but turned out to be a false positive (sync-obj was signaling via GPU-reset recovery, not actual execution). With the PM4 fixes from Session 7, **B.3.d needs to be re-verified live**. This is the single gating test for all of Phase B.
+- **B.4** ⛔ Blocked on B.3.d retest. Shader-store variants (the actual "write a known value, read it back" proof) have not been re-attempted since the PM4 fixes.
+
+Once B.3.d is green on real hardware with the corrected PM4 stream, B.4 should resume along the path originally intended (real shader, output BO, sync-obj wait, readback verify).
 
 ### Phase C — DRM render path
 

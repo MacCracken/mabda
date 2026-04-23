@@ -192,6 +192,34 @@ Mesa deliberately puts its data buffers at LOW VAs (`0x00200000`-range) while sh
 4. On spike (s_endpgm) we expect clean execution (no wedge, no sync-obj-via-reset).
 5. On store, proceed with the actual shader once the spike baseline is clean.
 
+## Session 6 — The wedge is in kernel init, not our PM4 (2026-04-22)
+
+Applied Session 5's proposed fix: stub BO at VA 0x200000, RSRC2=0x8 (USER_SGPR=4), USER_DATA_0..3 = Mesa's V# values (0x00200040, 0, 0x00200000, 0), stub BO added to BO list.
+
+**Result: same fault, same VA, same everything.**
+
+Captured fresh devcoredump (`/tmp/gpu_dump2.txt`). Critical new observation from `mmCP_HQD_IB_BASE_ADDR = 0x00b88c00`:
+
+> The MEC is executing an IB at VA 0x00b88c00 — a LOW kernel-GART VA, NOT our IB (which we mapped at `0xFFFF_8001_0020_0000`). This is a **kernel-inserted initialization IB** that runs BEFORE user submissions as part of context/VMID setup. Our IB never runs because the kernel's own init PM4 is what's faulting at VA 0.
+
+**Revised root cause theory:** the problem is not in our PM4 stream at all. Our context is landing on a VMID that the kernel hasn't fully initialized for compute. Its init IB tries to access something at VA 0 (probably the SH_MEM aperture state, or a kernel tracking BO with a zero-initialized base) and faults.
+
+Mesa works because libdrm_amdgpu's `amdgpu_cs_ctx_create` wraps the ioctl with additional setup that triggers `init_compute_vmid` on the kernel side — which our raw `DRM_IOCTL_AMDGPU_CTX` apparently doesn't fully trigger.
+
+**This means more PM4 fiddling won't help. The fix is at the context/VM layer:**
+
+1. Try `DRM_IOCTL_AMDGPU_CTX` with different flags (`AMDGPU_CTX_PRIORITY_HIGH`, `AMDGPU_CTX_FLAG_RECOVERY`, etc.).
+2. Add a `DRM_IOCTL_AMDGPU_VM` call with `AMDGPU_VM_OP_RESERVE_VMID` after context alloc — may force kernel to run the full compute-VMID init path.
+3. Strace Mesa's `DRM_IOCTL_AMDGPU_CTX` args specifically — compare flags byte-for-byte.
+4. Last resort: use libdrm_amdgpu's `amdgpu_cs_ctx_create` (import as a C dep) to validate the context-setup theory. If dispatch succeeds via libdrm's context but fails via raw ioctl with identical PM4, we've proven it's context-init and can then reverse-engineer libdrm's specific init calls.
+
+**Saved state:**
+- `/tmp/gpu_dump2.txt` — second coredump, same fault pattern.
+- Stub BO + USER_SGPR=4 + USER_DATA V# values are in the code (didn't help but they're Mesa-matched and wanted eventually anyway).
+- `DISPATCH_INITIATOR = 0x45` restored to match Mesa exactly.
+
+The specific next test: **strace Mesa's DRM_IOCTL_AMDGPU_CTX call with full arg bytes, diff against what mabda sends.** If there's any flag bit difference, that's likely the answer.
+
 ## Likely next angles (for a future session)
 
 1. **Is there a `COMPUTE_PGM_RSRC3` on GFX9?** GFX10+ has one. Vega
@@ -244,3 +272,73 @@ The wgpu backend does compute round-trips in `programs/compute_e2e.cyr`
 (shipping since v2.4.0), so consumer-level compute *does* work on this
 hardware — just not via our direct-ioctl path with the PM4 state we're
 programming. That gap is the open question.
+
+## Session 7 (2026-04-22): PM4 builder bug — found via Mesa IB diff
+
+Ran `AMD_DEBUG=ib ./build/shader/cl_probe` to dump the exact PM4
+stream Mesa emits for a working compute dispatch, and diffed it
+byte-by-byte against ours.
+
+**Two genuine encoding bugs in the shared PM4 builder:**
+
+### 1. ACQUIRE_MEM count field off-by-one
+
+`native_pm4_acquire_mem_full_invalidate` was calling
+`native_pm4_pkt3_header(IT_ACQUIRE_MEM, 7, 2)`. The `count` parameter
+is documented as "number of data dwords following the header"; the
+formula subtracts one: `(count - 1) & 0x3FFF`. ACQUIRE_MEM on GFX9 has
+6 data dwords (coher_cntl, size_lo, size_hi, base_lo, base_hi,
+poll_interval). Passing `count=7` made the header claim 7 data dwords.
+
+Mesa emits `c0055802`. We emitted `c0065802`. The CP, following the
+header's word-count, consumed an extra dword past our last payload —
+namely the **next packet's header** (SET_SH_REG PGM_LO, 0xC0017600).
+After this point every subsequent packet boundary was misaligned: CP
+interpreted `native_sh_reg_offset(R_COMPUTE_PGM_LO)` (0x20C) as a new
+PKT3 header (invalid — top bits are zero, so type=0), causing the
+illegal-opcode trap and GPU reset.
+
+This fully explains why every Session 1–6 experiment wedged in what
+looked like different places: any post-ACQUIRE_MEM work we added was
+being parsed as garbage data by the CP. The "fault at VA 0" in
+coredumps was the CP dereferencing whatever dword happened to land in
+the SRC_ADDR slot of a mis-parsed DMA_DATA opcode.
+
+Fix: `native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, 2)` →
+header `0xC0055802`, matching Mesa.
+
+### 2. DISPATCH_DIRECT missing shader_type=2
+
+The low byte of IT_DISPATCH_DIRECT's PKT3 header is `shader_type`
+(0 = graphics, 2 = compute) — not a predicate bit. We were emitting
+`0xC0031500`; Mesa emits `0xC0031502`. Whether this alone would wedge
+a compute dispatch on GFX9 is unclear (some docs suggest the CP
+ignores it for DISPATCH_DIRECT on the compute ring), but it's wrong
+either way. Fixed by passing `2` as the predicate/type arg.
+
+### Other functional gaps aligned to Mesa
+
+Also in the Mesa dump but missing or wrong in our spike:
+
+- `COMPUTE_RESOURCE_LIMITS = 0x140` (WAVES_PER_SH=320). We wrote 0,
+  which caps the SH to zero waves — silent stall even if PM4 parses
+  correctly.
+- `COMPUTE_TMPRING_SIZE = 0x100`. Unset in our prior spike.
+- `STATIC_THREAD_MGMT_SE1/SE2/SE3 = 0` (Cezanne has 1 SE). We wrote
+  all 0xFFFFFFFF; Mesa zeros the absent-SE mask registers.
+- Register ordering — Mesa programs STATIC_THREAD_MGMT before the
+  UCONFIG preamble, not after.
+
+Updated `programs/native_compute_spike.cyr` to emit the preamble in
+Mesa's exact order with the correct register values. New PM4 size:
+~56 dwords + NOP pad to 64. Added
+`test_native_pm4_acquire_mem_layout` (byte-exact header + payload)
+and fixed `test_native_pm4_dispatch_direct_layout` to expect
+`0xC0031502`. Test count 602 → 610 (8 new assertions). All green.
+
+**Next live test:** rerun `./build/native_compute_spike`. Expected
+outcome: the `s_endpgm`-only dispatch (no memory ops) signals the
+sync-obj cleanly without wedging the GPU. If confirmed, the
+previously-observed wedges are explained by the off-by-one and the
+path to Phase B.4 reopens — the shader store experiments can resume
+with a correctly-built PM4 stream.

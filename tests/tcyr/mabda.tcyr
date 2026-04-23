@@ -2174,12 +2174,34 @@ fn test_native_pm4_dispatch_direct_layout() {
     memset(&buf, 0, 64);
     var pos = native_pm4_dispatch_direct(&buf, 0, 8, 4, 2, COMPUTE_DISPATCH_INITIATOR_MIN);
     assert_eq(pos, 20, "DISPATCH_DIRECT = 5 dwords");
-    # Header: PKT3(IT_DISPATCH_DIRECT, 4, 0) = 0xC0031500.
-    assert_eq(load32(&buf + 0),  0xC0031500, "header");
+    # Header: PKT3(IT_DISPATCH_DIRECT, 4, shader_type=2) = 0xC0031502.
+    # Low byte is shader_type (compute), not predicate — verified against
+    # Mesa AMD_DEBUG=ib: `c0031502`.
+    assert_eq(load32(&buf + 0),  0xC0031502, "header (shader_type=compute)");
     assert_eq(load32(&buf + 4),  8, "dim_x");
     assert_eq(load32(&buf + 8),  4, "dim_y");
     assert_eq(load32(&buf + 12), 2, "dim_z");
     assert_eq(load32(&buf + 16), 1, "initiator (COMPUTE_SHADER_EN)");
+    return 0;
+}
+
+fn test_native_pm4_acquire_mem_layout() {
+    # ACQUIRE_MEM on GFX9 (shader_type=compute): header + 6 data dwords
+    # = 7 dwords = 28 bytes. Mesa emits header c0055802:
+    #   type=3, count-1=5 (6 data dwords), opcode=0x58, shader_type=2.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_acquire_mem_full_invalidate(&buf, 0);
+    assert_eq(pos, 28, "ACQUIRE_MEM = 7 dwords = 28 bytes");
+    # Header must exactly match Mesa's byte-for-byte or the CP
+    # misreads the dword count and desynchronizes the IB stream.
+    assert_eq(load32(&buf + 0),  0xC0055802, "header byte-exact Mesa match");
+    assert_eq(load32(&buf + 4),  0xA8C40000, "coher_cntl");
+    assert_eq(load32(&buf + 8),  0xFFFFFFFF, "coher_size_lo");
+    assert_eq(load32(&buf + 12), 0x00FFFFFF, "coher_size_hi");
+    assert_eq(load32(&buf + 16), 0,          "coher_base_lo");
+    assert_eq(load32(&buf + 20), 0,          "coher_base_hi");
+    assert_eq(load32(&buf + 24), 0x0A,       "poll_interval");
     return 0;
 }
 
@@ -2211,8 +2233,8 @@ fn test_native_gfx9_shader_constants() {
     # = (0xC0 << 12) | (1 << 6) | (1 << 21) = 0x002C0040.
     assert_eq(GFX9_COMPUTE_PGM_RSRC1_MIN, 0x2C0040, "RSRC1 = 0x002C0040 (matches Mesa rusticl)");
     assert_eq(GFX9_COMPUTE_PGM_RSRC2_MIN, 0, "RSRC2 min (no user SGPR / scratch / LDS)");
-    # DISPATCH_INITIATOR: COMPUTE_SHADER_EN (bit 0) only.
-    assert_eq(GFX9_DISPATCH_INITIATOR, 0x1, "DISPATCH_INITIATOR = COMPUTE_SHADER_EN");
+    # DISPATCH_INITIATOR: 0x45 (Mesa-verified).
+    assert_eq(GFX9_DISPATCH_INITIATOR, 0x45, "DISPATCH_INITIATOR = 0x45");
     return 0;
 }
 
@@ -2306,7 +2328,7 @@ fn test_native_pm4_builder_composability() {
     # Spot check: each header at its expected offset.
     assert_eq(load32(&buf + 0),  0xC0001000, "NOP header at 0");
     assert_eq(load32(&buf + 4),  0xC0017600, "SET_SH_REG header at 4");
-    assert_eq(load32(&buf + 16), 0xC0031500, "DISPATCH_DIRECT header at 16");
+    assert_eq(load32(&buf + 16), 0xC0031502, "DISPATCH_DIRECT header at 16 (shader_type=compute)");
     return 0;
 }
 
@@ -2654,6 +2676,7 @@ fn main() {
     test_native_pm4_set_sh_reg_one_layout();
     test_native_pm4_set_sh_reg_multi_layout();
     test_native_pm4_dispatch_direct_layout();
+    test_native_pm4_acquire_mem_layout();
     test_native_pm4_nop_padding();
     test_native_pm4_builder_composability();
 

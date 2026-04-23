@@ -82,18 +82,62 @@ fn main() {
     print_cstr("shader bo=") ; print_i64(shader_handle);
     print_cstr(" va=0x"); print_i64(shader_va); print_cstr("\n");
 
+    # ---- Stub data BO at VA 0x200000 ----
+    # Per gpu-coredump analysis (docs/issues/2026-04-21-gfx9-store-blocker.md
+    # Session 5): the HW dereferences s[0:3] as a scratch V# during
+    # dispatch setup. With zero-valued USER_DATA → zero V# base → VA 0
+    # fault. Mesa satisfies this by pointing USER_DATA_0 at a valid low
+    # VA (0x00200040) and USER_DATA_2 at 0x00200000. We map a 4 KiB
+    # stub BO at 0x200000 so those references resolve to valid memory.
+    var stub_size = 4096;
+    var stub_bo[16];
+    rc = native_bo_create_gtt(fd, stub_size, &stub_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: stub bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+        native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+        sys_close(fd); return 2;
+    }
+    var stub_handle = load64(&stub_bo + 0);
+    var stub_map    = load64(&stub_bo + 8);
+    memset(stub_map, 0, stub_size);
+    var stub_va = 0x200000;
+    rc = native_gem_va_map(fd, stub_handle, stub_va, stub_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: stub va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        native_bo_release_gtt(fd, stub_handle, stub_map, stub_size);
+        native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+        native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+        sys_close(fd); return 2;
+    }
+    print_cstr("stub bo="); print_i64(stub_handle);
+    print_cstr(" va=0x"); print_i64(stub_va); print_cstr("\n");
+
     # ---- Build PM4 stream in a heap buffer ----
     #
-    # Sequence:
-    #   SET_SH_REG COMPUTE_PGM_LO      = shader_va >> 8
-    #   SET_SH_REG COMPUTE_PGM_HI      = shader_va >> 40
-    #   SET_SH_REG COMPUTE_PGM_RSRC1   = min
-    #   SET_SH_REG COMPUTE_PGM_RSRC2   = min
-    #   SET_SH_REG COMPUTE_NUM_THREAD_X = 1
-    #   SET_SH_REG COMPUTE_NUM_THREAD_Y = 1
-    #   SET_SH_REG COMPUTE_NUM_THREAD_Z = 1
-    #   DISPATCH_DIRECT 1, 1, 1, COMPUTE_SHADER_EN
-    # 7 * 3 + 5 = 26 dwords = 104 bytes
+    # Byte-for-byte rebuild of Mesa rusticl's compute preamble +
+    # dispatch, verified via AMD_DEBUG=ib on gfx90c. Prior versions
+    # of this spike had two PM4-builder bugs (ACQUIRE_MEM count
+    # off-by-one; DISPATCH_DIRECT missing shader_type=2) that caused
+    # CP stream desync and full GPU resets. Both are fixed in
+    # backend_native.cyr now.
+    #
+    # Mesa's order (from the AMD_DEBUG dump):
+    #   1. COMPUTE_PGM_HI
+    #   2. STATIC_THREAD_MGMT_SE0 + SE1
+    #   3. STATIC_THREAD_MGMT_SE2 + SE3
+    #   4. CP_COHER_START_DELAY
+    #   5. TA_CS_BC_BASE_ADDR + _HI
+    #   6. COMPUTE_PGM_LO
+    #   7. COMPUTE_PGM_RSRC1 + RSRC2
+    #   8. COMPUTE_TMPRING_SIZE
+    #   9. COMPUTE_USER_DATA_2 + 3
+    #   10. COMPUTE_USER_DATA_0
+    #   11. ACQUIRE_MEM
+    #   12. COMPUTE_RESOURCE_LIMITS
+    #   13. COMPUTE_NUM_THREAD_X + Y + Z
+    #   14. DISPATCH_DIRECT
     var pm4 = alloc(256);
     memset(pm4, 0, 256);
     var pos = 0;
@@ -102,36 +146,67 @@ fn main() {
     # encoded in PGM_LO/HI. For VA 0xFFFF_8001_0000_0000: PGM_LO=0, PGM_HI=0x80.
     var pgm_lo = shader_va & 0xFFFFFFFF;
     var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
-    # Program compute-pipeline state. Order matches radv's
-    # radv_emit_dispatch_packets. STATIC_THREAD_MGMT and RESOURCE_LIMITS
-    # are critical — default 0 means "no CUs enabled, no waves", which
-    # causes dispatches to queue forever without error.
-    # GFX9 preamble (matches Mesa rusticl).
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
-    var bc_va = shader_va;
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR,
-                                         (bc_va / 256) & 0xFFFFFFFF);
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR_HI,
-                                         (bc_va / 0x10000000000) & 0xFF);
-    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    # 1. PGM_HI (early — before preamble in Mesa's dump).
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC1, GFX9_COMPUTE_PGM_RSRC1_MIN);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_MIN);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS,        0);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_X, 1);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Y, 1);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Z, 1);
+    # 2. STATIC_THREAD_MGMT_SE0/SE1 — Mesa sets SE0 = 0xFFFFFFFF to
+    # enable all CUs in SE0 (Cezanne has 1 SE), SE1 = 0 (absent).
+    var thread_mgmt_01[8];
+    store32(&thread_mgmt_01 + 0, 0xFFFFFFFF);
+    store32(&thread_mgmt_01 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 2, &thread_mgmt_01);
+    # 3. STATIC_THREAD_MGMT_SE2/SE3 = 0, 0 (absent on Cezanne).
+    var thread_mgmt_23[8];
+    store32(&thread_mgmt_23 + 0, 0);
+    store32(&thread_mgmt_23 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 2, &thread_mgmt_23);
+    # 4. CP_COHER_START_DELAY = 0.
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
+    # 5. TA_CS_BC_BASE_ADDR + _HI — border-color base pointer. Mesa
+    # points this at its preamble scratch area; any valid shader-space
+    # VA is fine since SCRATCH_EN=0 means the HW never reads it.
+    var bc_va = shader_va;
+    var bc_pair[8];
+    store32(&bc_pair + 0, (bc_va / 256) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va / 0x10000000000) & 0xFF);
+    pos = native_pm4_set_uconfig_reg_pair(pm4, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
+    # 6. PGM_LO.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    # 7. PGM_RSRC1 + RSRC2 as a pair.
+    var rsrc[8];
+    store32(&rsrc + 0, GFX9_COMPUTE_PGM_RSRC1_MIN);
+    # RSRC2 = 0x8: USER_SGPR=4. HW loads s0..s3 from USER_DATA_0..3.
+    store32(&rsrc + 4, 0x8);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    # 8. TMPRING_SIZE. Mesa writes 0x100 (WAVES=256) even for kernels
+    # that don't use scratch. Zero-default may leave scratch ring
+    # state uninitialized and trigger a fault during wave launch.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
+    # 9. USER_DATA_2 + 3 — upper half of the scratch buffer V#.
+    var user23[8];
+    store32(&user23 + 0, 0x00200000);
+    store32(&user23 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_USER_DATA_0 + 8, 2, &user23);
+    # 10. USER_DATA_0 — low half of the scratch V# (base+size).
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0 + 0, 0x00200040);
+    # 11. ACQUIRE_MEM flushes I/K/L2 caches before dispatch. Mandatory
+    # on GFX9; without it the SQ can decode stale bytes as invalid ops.
+    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
+    # 12. RESOURCE_LIMITS = 0x140 (WAVES_PER_SH=320). Zero does NOT
+    # mean "unlimited" on GFX9 — it caps to zero waves and causes a
+    # silent stall / eventual TDR.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    # 13. NUM_THREAD_X/Y/Z as a 3-reg block.
+    var nt[12];
+    store32(&nt + 0, 1);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    # 14. DISPATCH_DIRECT. Header now carries shader_type=2.
     pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
-    # AMDGPU requires IBs padded to a cache-line boundary. Safe bet is
-    # 32 dwords (128 bytes). Pad with a single NOP packet of the right
-    # dword count.
+    # AMDGPU requires IBs padded to a cache-line boundary. Pad to 64
+    # dwords with a single NOP packet.
     var cur_dwords = pos / 4;
-    var target_dwords = 32;
+    var target_dwords = 64;
     if (cur_dwords < target_dwords) {
         pos = native_pm4_nop(pm4, pos, target_dwords - cur_dwords);
     }
@@ -176,12 +251,13 @@ fn main() {
     var ctx_id = native_ctx_alloc_id(&req_ctx);
     print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
-    # ---- BO list: both shader + IB ----
-    var entries[16];
-    store32(&entries + 0, shader_handle); store32(&entries + 4, 0);
-    store32(&entries + 8, ib_handle);     store32(&entries + 12, 0);
+    # ---- BO list: shader + IB + stub ----
+    var entries[24];
+    store32(&entries +  0, shader_handle); store32(&entries +  4, 0);
+    store32(&entries +  8, ib_handle);     store32(&entries + 12, 0);
+    store32(&entries + 16, stub_handle);   store32(&entries + 20, 0);
     var req_list[24];
-    rc = native_bo_list_create(fd, &entries, 2, &req_list);
+    rc = native_bo_list_create(fd, &entries, 3, &req_list);
     if (rc != 0) {
         print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
         return 5;
