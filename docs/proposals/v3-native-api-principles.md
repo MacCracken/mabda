@@ -1,6 +1,6 @@
 # v3 Native GPU Backend — Design Principles
 
-**Status:** Draft (v3 branch, 2026-04-22 — Phase A shipped; Phase B.0–B.3.c complete; B.3.d live-verified for first dispatch but see blocker note below; B.4 blocked pending PM4-encoder-fix retest)
+**Status:** Draft (v3 branch, 2026-04-23 — Phase A shipped; Phase B.0–B.3.d complete, live-verified on gfx90c after Session 7 PM4 fixes; B.4 next)
 **Related:** [ADR 006](../adr/006-native-cyrius-gpu-backend.md) (dual-backend), [ADR 005](../adr/005-public-api-surface-marking.md) (@public boundary), [ADR 004](../adr/004-c-launcher-ffi.md) (wgpu path, v3.x era), [GFX9 store blocker](../issues/2026-04-21-gfx9-store-blocker.md)
 
 ## Framing
@@ -182,18 +182,16 @@ External research on the minimum AMDGPU (likely starting target — most-open ke
 
 **Why this subdivision:** each sub-phase has a concrete, testable mini-exit. If B.0 research says direct-ioctl B.3 is months of kernel RE, we negotiate a libdrm stepping stone *with clear-eyed awareness of the sovereignty tradeoff* rather than hitting the wall mid-implementation.
 
-#### Phase B status (2026-04-22)
+#### Phase B status (2026-04-23)
 
 - **B.0** ✅ direct-ioctl path picked; AMDGPU as first target.
 - **B.1** ✅ `native_device_enum` returns `amdgpu` on gfx90c.
 - **B.2** ✅ `native_gem_roundtrip` — byte-identical CPU→GPU→CPU.
 - **B.3.a** ✅ ctx/BO-list/VA-map infrastructure lands in `backend_native.cyr`.
-- **B.3.b** ✅ PM4 builder (pure math). **Two encoding bugs found + fixed in Session 7** (see blocker doc): ACQUIRE_MEM count field off-by-one (desynced CP stream for all prior attempts); DISPATCH_DIRECT missing shader_type=2. Test suite gained byte-exact header assertions against Mesa AMD_DEBUG=ib.
+- **B.3.b** ✅ PM4 builder (pure math). Two encoding bugs found + fixed in Session 7 (see issue doc): ACQUIRE_MEM count field off-by-one; DISPATCH_DIRECT missing shader_type=2. Test suite gained byte-exact header assertions against Mesa `AMD_DEBUG=ib`.
 - **B.3.c** ✅ `native_gfx9_shader_endpgm` (single-instruction no-op).
-- **B.3.d** ⚠️ First live dispatch was believed to pass in Session 3 but turned out to be a false positive (sync-obj was signaling via GPU-reset recovery, not actual execution). With the PM4 fixes from Session 7, **B.3.d needs to be re-verified live**. This is the single gating test for all of Phase B.
-- **B.4** ⛔ Blocked on B.3.d retest. Shader-store variants (the actual "write a known value, read it back" proof) have not been re-attempted since the PM4 fixes.
-
-Once B.3.d is green on real hardware with the corrected PM4 stream, B.4 should resume along the path originally intended (real shader, output BO, sync-obj wait, readback verify).
+- **B.3.d** ✅ **First live compute dispatch on gfx90c, 2026-04-23.** `./build/native_compute_spike` completes with `dispatch completed (sync-obj signaled)`, RC=0, dmesg silent. Ran under released cyrius 5.6.13. The previously-observed wedges are fully explained by the Session 7 PM4 encoder bugs; with those fixed the CP parses the stream correctly and the shader executes.
+- **B.4** 🟡 **Prepared, not live-verified.** Real store shader restored (`native_gfx9_shader_store_deadbeef` in `src/backend_native.cyr` — bytes from `clang -target amdgcn--amdhsa -mcpu=gfx90c`, byte-exact test in `tests/tcyr/mabda.tcyr`). `programs/native_compute_store.cyr` rewritten to mirror the spike's Mesa-verified PM4 preamble byte-for-byte except for three store-specific deltas (USER_DATA_0/1 = output VA low/high; USER_DATA_2/3 = spike's scratch-V# stub; BO list grows to 4 entries). 621 CPU assertions green. Binary `build/native_compute_store` built under released 5.6.13; awaiting dev-box SSH access for the live retest. Live-run handoff: `docs/handoff/2026-04-23-b4-store-retest.md`. Second kernel (add-kernel) before declaring Phase B done is worth discussing — the bench targets (`native_vs_wgpu_compute` ≥ 90%) aren't meaningful on a one-instruction shader.
 
 ### Phase C — DRM render path
 

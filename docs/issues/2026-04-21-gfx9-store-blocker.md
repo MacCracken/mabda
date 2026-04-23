@@ -1,7 +1,7 @@
 # v3 Phase B.4 — GFX9 Compute Store Blocker
 
-**Status:** Open
-**Date:** 2026-04-21
+**Status:** B.3.d resolved 2026-04-23 (Session 7 PM4 fixes verified live); B.4 store verify still pending
+**Date:** 2026-04-21 (opened) — 2026-04-23 (B.3.d retest passed)
 **Affects:** Phase B.4 (verifiable compute dispatch on AMDGPU direct-ioctl path)
 **Hardware:** AMD Cezanne APU (Vega7 iGPU, GFX9/gfx90c), Linux 6.18.22-lts
 
@@ -342,3 +342,66 @@ sync-obj cleanly without wedging the GPU. If confirmed, the
 previously-observed wedges are explained by the off-by-one and the
 path to Phase B.4 reopens — the shader store experiments can resume
 with a correctly-built PM4 stream.
+
+## Session 8 (2026-04-23): B.3.d retest — PASSED
+
+Retest ran on the freshly-rebooted work machine immediately after the
+active cyrius toolchain was switched from the in-dev 5.6.14 back to
+the released 5.6.13. Spike binary rebuilt from source under 5.6.13
+(224,984 bytes), 610/610 CPU assertions green, then:
+
+```
+$ ./build/native_compute_spike
+mabda native compute spike (v3 Phase B.3.d)
+-------------------------------------------
+fd=3
+shader bo=1 va=0x-140733193388032
+stub bo=2 va=0x2097152
+pm4 stream bytes=256
+ib bo=3 va=0x-140733191290880
+ctx_id=1
+bo_list_handle=1
+syncobj=1
+submitted to COMPUTE ring
+cs submitted
+dispatch completed (sync-obj signaled)
+OK
+$ echo $?
+0
+$ sudo dmesg --since "1 minute ago" | grep -iE "amdgpu|drm|gfx|bad_op|reset|ring|hang|fence"
+(empty)
+```
+
+- RC=0, no kernel log entries — no `gfx_v9_0_bad_op_irq`, no `MODE2`
+  reset, GPU stayed healthy through the run.
+- This is the first genuine pass of B.3.d (Session 3's "pass" was a
+  false positive via reset-recovery sync-obj signaling; Session 8's
+  pass has byte-correct PM4 and a silent dmesg).
+
+**Vindicates the Session 7 analysis.** Two encoding bugs in the PM4
+builder (`ACQUIRE_MEM` count off-by-one; `DISPATCH_DIRECT` missing
+`shader_type=2`) were responsible for every wedge observed in Sessions
+1–6. The VMID/scratch/SH_MEM/VA-aperture theories chased across those
+sessions were all downstream of CP stream desync; once the CP parses
+the stream correctly, dispatch just works.
+
+**Cosmetic observation from the spike output (not a correctness
+issue):** `shader bo=1 va=0x-140733193388032` and `ib bo=3
+va=0x-140733191290880` print the canonical-high VAs as signed i64.
+Worth a one-line `fmt` fix in the spike's logging when we're next in
+that file.
+
+### What this closes / what remains
+
+- **Closed:** B.3.d retest. The PM4 wedge blocker that opened this
+  issue on 2026-04-21 is resolved.
+- **Still open:** the original issue title ("GFX9 Compute Store
+  Blocker"). Stores themselves haven't been re-attempted since the
+  PM4 fixes — `programs/native_compute_store.cyr` still uses the
+  diagnostic `s_endpgm`-only stub from Session 6. B.4's stated exit
+  ("byte-identical compute output vs wgpu") requires swapping the
+  stub for the real store variant and verifying readback.
+
+This issue stays open until the store variant runs green. When it
+does, close with a final "Session N: store verified" section and
+update the v3-native-api-principles.md Phase B status block.

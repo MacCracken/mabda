@@ -4190,7 +4190,7 @@ fn rpb_pass_begin(encoder, b) {
 #   +64: copy_depth         (u32)
 #   +68: pad (4)
 #
-# TransientResource (56 bytes):
+# TransientResource (72 bytes, grew from 56 at v3 for aliasing planner):
 #   +0:  kind         (i64 — RES_BUFFER or RES_TEXTURE)
 #   +8:  handle       (WGPUBuffer or WGPUTexture — populated by rg_build)
 #   +16: view         (WGPUTextureView for textures, 0 for buffers — populated by rg_build)
@@ -4198,6 +4198,8 @@ fn rpb_pass_begin(encoder, b) {
 #   +32: height       (u64 — 0 for buffer, texture height)
 #   +40: format_usage (u64 — format << 32 | usage_flags)
 #   +48: first_use    (i64 — node sort_idx of first user, -1 before scan)
+#   +56: last_use     (i64 — node sort_idx of last user, -1 before scan)
+#   +64: offset       (i64 — byte offset into the aliased block, set by planner)
 
 var NODE_COMPUTE       = 1;
 var NODE_RENDER        = 2;
@@ -4305,12 +4307,13 @@ fn rg_node_writes(g, node_id, res_id) {
 # creation happens inside rg_build.
 
 fn rg_add_transient_buffer(g, size, usage, label) {
-    var r = alloc(56);
-    memset(r, 0, 56);
+    var r = alloc(72);
+    memset(r, 0, 72);
     store64(r + 0,  RES_BUFFER);
     store64(r + 24, size);
     store64(r + 40, usage);
     store64(r + 48, 0 - 1);
+    store64(r + 56, 0 - 1);
     # label stashed in handle slot until rg_build replaces it
     store64(r + 8,  label);
     var res_id = vec_len(load64(g + 8));
@@ -4319,14 +4322,15 @@ fn rg_add_transient_buffer(g, size, usage, label) {
 }
 
 fn rg_add_transient_texture(g, width, height, format, usage, label) {
-    var r = alloc(56);
-    memset(r, 0, 56);
+    var r = alloc(72);
+    memset(r, 0, 72);
     store64(r + 0,  RES_TEXTURE);
     store64(r + 24, width);
     store64(r + 32, height);
     # Pack (format << 32) | usage so both fit in one field.
     store64(r + 40, (format * 0x100000000) | usage);
     store64(r + 48, 0 - 1);
+    store64(r + 56, 0 - 1);
     store64(r + 8,  label);
     var res_id = vec_len(load64(g + 8));
     vec_push(load64(g + 8), r);
@@ -4485,9 +4489,65 @@ fn rg_build(g, device) {
         k = k + 1;
     }
 
-    # --- Scan transient lifetimes and allocate GPU resources ---
+    # --- Scan transient lifetimes: for every node in sorted order,
+    #     for every resource in its reads+writes, update that
+    #     transient's first_use = min(first_use, sort_idx) and
+    #     last_use  = max(last_use, sort_idx). Transients that are
+    #     never read or written stay at (first_use, last_use) = (-1, -1)
+    #     and the planner treats them as dead.
     var transients = load64(g + 8);
     var t = vec_len(transients);
+    var ni = 0;
+    while (ni < n) {
+        var node = vec_get(nodes, ni);
+        var sort_idx = load64(node + 48);
+        # Reads
+        var reads_vec = load64(node + 16);
+        var rcount = vec_len(reads_vec);
+        var ri = 0;
+        while (ri < rcount) {
+            var res_id = vec_get(reads_vec, ri);
+            if (res_id >= 0) {
+                if (res_id < t) {
+                    var r = vec_get(transients, res_id);
+                    var fu = load64(r + 48);
+                    if (fu == 0 - 1) { store64(r + 48, sort_idx); }
+                    if (fu != 0 - 1) { if (sort_idx < fu) { store64(r + 48, sort_idx); } }
+                    var lu = load64(r + 56);
+                    if (lu == 0 - 1) { store64(r + 56, sort_idx); }
+                    if (lu != 0 - 1) { if (sort_idx > lu) { store64(r + 56, sort_idx); } }
+                }
+            }
+            ri = ri + 1;
+        }
+        # Writes — same update logic
+        var writes_vec = load64(node + 24);
+        var wcount = vec_len(writes_vec);
+        var wi = 0;
+        while (wi < wcount) {
+            var res_id = vec_get(writes_vec, wi);
+            if (res_id >= 0) {
+                if (res_id < t) {
+                    var r = vec_get(transients, res_id);
+                    var fu = load64(r + 48);
+                    if (fu == 0 - 1) { store64(r + 48, sort_idx); }
+                    if (fu != 0 - 1) { if (sort_idx < fu) { store64(r + 48, sort_idx); } }
+                    var lu = load64(r + 56);
+                    if (lu == 0 - 1) { store64(r + 56, sort_idx); }
+                    if (lu != 0 - 1) { if (sort_idx > lu) { store64(r + 56, sort_idx); } }
+                }
+            }
+            wi = wi + 1;
+        }
+        ni = ni + 1;
+    }
+
+    # --- Allocate GPU resources per transient. The aliasing planner
+    #     (rg_plan_aliasing_stats) can diagnose the memory the graph
+    #     *would* save under full aliasing; actually applying aliasing
+    #     to GPU memory lands in v3 Phase B (native backend). Today
+    #     each transient gets its own wgpu handle regardless of the
+    #     aliasing_flag value.
     var ti = 0;
     while (ti < t) {
         var r = vec_get(transients, ti);
@@ -4497,6 +4557,214 @@ fn rg_build(g, device) {
 
     store64(g + 16, 1);
     return 0;
+}
+
+# ================================================================
+# Aliasing planner — v3 Phase A
+# ================================================================
+# Computes how much backing memory the transient set would occupy
+# under optimal aliasing (disjoint-lifetime transients sharing a
+# backing slot). Pure analysis; does not mutate the graph's GPU
+# allocation. Phase B's native backend will call this during rg_build
+# when rg_aliasing(g, 1) is set and place transients at the computed
+# offsets inside a single BO.
+#
+# Algorithm: greedy interval coloring, per kind (buffers cannot alias
+# textures and vice versa at the memory-type level). For each
+# transient in first_use order, find the slot whose current occupant's
+# last_use < this transient's first_use AND whose size >= this
+# transient's size; reuse the tightest-fit match or open a new slot.
+#
+# Writes the chosen byte offset into each transient's `offset` field
+# (byte 64). Stores the output stats at `out`:
+#   +0:  slot_count    (i64) — total number of backing slots
+#   +8:  naive_bytes   (i64) — sum of all transient sizes (no aliasing)
+#   +16: aliased_bytes (i64) — block size under optimal aliasing
+# Transients with first_use == -1 (never used) are skipped.
+# Returns 0 on success.
+#
+# Byte size per kind: buffers use size_w directly; textures use
+# width * height * 4 as a portable RGBA8 proxy. Format-aware sizing
+# lands with Phase B's texture-format byte-width table.
+#
+# Alignment: 256 bytes, matches typical GPU storage-buffer binding
+# alignment. Both naive and aliased totals respect it, so the reclaim
+# ratio is apples-to-apples.
+var _RG_PLAN_ALIGN = 256;
+
+fn _rg_plan_transient_bytes(r) {
+    var kind = load64(r + 0);
+    if (kind == RES_BUFFER) {
+        return load64(r + 24);
+    }
+    # Texture: width * height * 4 (RGBA8 proxy).
+    var w = load64(r + 24);
+    var h = load64(r + 32);
+    if (h == 0) { h = 1; }
+    return w * h * 4;
+}
+
+fn _rg_plan_align_up(n, align) {
+    var rem = n % align;
+    if (rem == 0) { return n; }
+    return n + (align - rem);
+}
+
+# Per-kind planner. Call once with kind=RES_BUFFER then once with
+# kind=RES_TEXTURE, summing results. Slots are tracked in two
+# parallel vecs:
+#   slot_offset (i64)
+#   slot_size   (i64)
+#   slot_until  (i64 — last_use of the current occupant; -1 = free)
+fn _rg_plan_kind(g, kind, start_offset, out_slot_count) {
+    var transients = load64(g + 8);
+    var t = vec_len(transients);
+    if (t == 0) { store64(out_slot_count, 0); return start_offset; }
+
+    # Collect live transients of this kind (first_use != -1).
+    var live = vec_new();
+    var ti = 0;
+    while (ti < t) {
+        var r = vec_get(transients, ti);
+        if (load64(r + 0) == kind) {
+            if (load64(r + 48) != 0 - 1) { vec_push(live, r); }
+        }
+        ti = ti + 1;
+    }
+
+    # Selection sort by first_use ascending. O(n²) but n is small
+    # (typically dozens); good enough to land Phase A.
+    var n_live = vec_len(live);
+    var i = 0;
+    while (i < n_live) {
+        var min_j = i;
+        var j = i + 1;
+        while (j < n_live) {
+            if (load64(vec_get(live, j) + 48) < load64(vec_get(live, min_j) + 48)) {
+                min_j = j;
+            }
+            j = j + 1;
+        }
+        if (min_j != i) {
+            var tmp = vec_get(live, i);
+            vec_set(live, i, vec_get(live, min_j));
+            vec_set(live, min_j, tmp);
+        }
+        i = i + 1;
+    }
+
+    # Greedy interval coloring: walk transients in first_use order,
+    # reuse a slot whose occupant's last_use < this.first_use and
+    # whose size >= this.size (tightest-fit), else open a new slot.
+    var slot_offsets = vec_new();
+    var slot_sizes   = vec_new();
+    var slot_until   = vec_new();
+    var cursor = start_offset;
+
+    var si = 0;
+    while (si < n_live) {
+        var r2 = vec_get(live, si);
+        var fu2 = load64(r2 + 48);
+        var lu2 = load64(r2 + 56);
+        var sz2 = _rg_plan_align_up(_rg_plan_transient_bytes(r2), _RG_PLAN_ALIGN);
+
+        var best = 0 - 1;
+        var best_size = 0 - 1;
+        var k = 0;
+        while (k < vec_len(slot_offsets)) {
+            var u = vec_get(slot_until, k);
+            if (u < fu2) {
+                var slot_sz = vec_get(slot_sizes, k);
+                if (slot_sz >= sz2) {
+                    if (best == 0 - 1) { best = k; best_size = slot_sz; }
+                    if (best != 0 - 1) {
+                        if (slot_sz < best_size) { best = k; best_size = slot_sz; }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+
+        if (best == 0 - 1) {
+            store64(r2 + 64, cursor);
+            vec_push(slot_offsets, cursor);
+            vec_push(slot_sizes, sz2);
+            vec_push(slot_until, lu2);
+            cursor = cursor + sz2;
+        } else {
+            store64(r2 + 64, vec_get(slot_offsets, best));
+            vec_set(slot_until, best, lu2);
+        }
+        si = si + 1;
+    }
+
+    store64(out_slot_count, vec_len(slot_offsets));
+    return cursor;
+}
+
+# Public planner query. `out` must point to 24 bytes:
+#   +0:  slot_count    (i64)
+#   +8:  naive_bytes   (i64) — sum of all live transient sizes, aligned
+#   +16: aliased_bytes (i64) — total block size under aliasing
+# Sets each live transient's offset field as a side effect.
+# Returns 0 on success, 1 if the graph is not yet built.
+fn rg_plan_aliasing_stats(g, out) {
+    if (rg_is_built(g) == 0) { return 1; }
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+    store64(out + 16, 0);
+
+    # Naive bytes: sum of every live transient's aligned size.
+    var transients = load64(g + 8);
+    var t = vec_len(transients);
+    var naive = 0;
+    var ti = 0;
+    while (ti < t) {
+        var r = vec_get(transients, ti);
+        if (load64(r + 48) != 0 - 1) {
+            naive = naive + _rg_plan_align_up(_rg_plan_transient_bytes(r), _RG_PLAN_ALIGN);
+        }
+        ti = ti + 1;
+    }
+
+    # Per-kind planning. Offsets are disjoint across kinds (buffers
+    # get [0, buf_end); textures start at buf_end). This is conservative
+    # — real hardware might allow mixed allocations but requires
+    # bufferImageGranularity handling that lives in Phase B.
+    var buf_slots = alloc(8);
+    store64(buf_slots, 0);
+    var buf_end = _rg_plan_kind(g, RES_BUFFER, 0, buf_slots);
+
+    var tex_slots = alloc(8);
+    store64(tex_slots, 0);
+    var tex_end = _rg_plan_kind(g, RES_TEXTURE, buf_end, tex_slots);
+
+    store64(out + 0, load64(buf_slots) + load64(tex_slots));
+    store64(out + 8, naive);
+    store64(out + 16, tex_end);
+    return 0;
+}
+
+# Accessor: byte offset assigned by the planner for a transient.
+# Returns -1 if the graph isn't built or the planner hasn't run.
+fn rg_transient_offset(g, res_id) {
+    if (res_id < 0) { return 0 - 1; }
+    if (res_id >= rg_transient_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 8), res_id) + 64);
+}
+
+# Accessor: sort_idx of a transient's first user (-1 if unused).
+fn rg_transient_first_use(g, res_id) {
+    if (res_id < 0) { return 0 - 1; }
+    if (res_id >= rg_transient_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 8), res_id) + 48);
+}
+
+# Accessor: sort_idx of a transient's last user (-1 if unused).
+fn rg_transient_last_use(g, res_id) {
+    if (res_id < 0) { return 0 - 1; }
+    if (res_id >= rg_transient_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 8), res_id) + 56);
 }
 
 # ================================================================

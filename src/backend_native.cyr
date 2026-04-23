@@ -626,9 +626,11 @@ fn native_gfx9_shader_endpgm(buf, pos) {
 }
 
 # Write a "store 0xDEADBEEF to buffer[0]" shader at `pos` in `buf`.
-# Expects USER_SGPR = 2, with s0/s1 pre-loaded to the buffer VA.
+# Expects s0/s1 pre-loaded with the low/high 32 bits of the output VA
+# (either via USER_SGPR = 2 loading from USER_DATA_0/1, or via
+# USER_SGPR ≥ 2 where the caller places the VA in those slots).
 #
-# Bytes produced by `clang -target amdgcn--amdhsa -mcpu=gfx902 -c`:
+# Source (assembled via `clang -target amdgcn--amdhsa -mcpu=gfx90c`):
 #   v_mov_b32_e32  v0, s0                            ; low 32 bits of VA
 #   v_mov_b32_e32  v1, s1                            ; high 32 bits of VA
 #   v_mov_b32_e32  v2, 0xDEADBEEF                    ; constant
@@ -642,25 +644,37 @@ fn native_gfx9_shader_endpgm(buf, pos) {
 # it. Combined with s_waitcnt before s_endpgm, SLC=1 makes the store
 # CPU-visible by the time the syncobj fires.
 #
-# Returns new pos (pos + 32). RSRC1 must include FLOAT_MODE = 0xC0,
-# DX10_CLAMP, IEEE_MODE. RSRC2 must set USER_SGPR = 2 (bits 1-5 = 2,
-# register value = 0x04).
+# Layout (bytes):
+#   +0:  0x7E000200  v_mov_b32_e32 v0, s0   (VOP1: opcode=1, vdst=0, src0=0)
+#   +4:  0x7E020201  v_mov_b32_e32 v1, s1   (VOP1: opcode=1, vdst=1, src0=1)
+#   +8:  0x7E0402FF  v_mov_b32_e32 v2, <literal>  (src0=255 → literal follows)
+#   +12: 0xDEADBEEF  literal
+#   +16: 0xDC738000  global_store_dword dword 1  (FLAT+GLOBAL, glc=1, slc=1)
+#   +20: 0x007F0200  global_store_dword dword 2  (addr=v0, data=v2, saddr=off=127)
+#   +24: 0xBF8C0070  s_waitcnt vmcnt(0) lgkmcnt(0)  (SIMM16 = 0x0070)
+#   +28: 0xBF810000  s_endpgm
+#   +32..+95: 16 × 0xBF800000  s_nop 0  (AMDGPU-ABI-required prefetch padding)
+#
+# Returns new pos (pos + 96). RSRC1 must include FLOAT_MODE = 0xC0,
+# DX10_CLAMP, IEEE_MODE (GFX9_COMPUTE_PGM_RSRC1_MIN satisfies all).
+# USER_SGPR ≥ 2 required so s0/s1 are populated; the canonical setup
+# is RSRC2 = 0x8 (USER_SGPR=4) with USER_DATA_0/1 = VA low/high and
+# USER_DATA_2/3 = Mesa's scratch-V# stub (0x00200000/0).
 fn native_gfx9_shader_store_deadbeef(buf, pos) {
-    # DIAGNOSTIC: skip store — just v_mov + endpgm + padding.
-    # With the register-offset fix, is the non-store shader still
-    # running cleanly? If yes, the store is still the blocker.
-    # If no, our PGM_LO is pointing at the wrong VA now.
     store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
     store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
     store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
     store32(buf + pos + 12, 0xDEADBEEF);   # literal
-    store32(buf + pos + 16, 0xBF810000);   # s_endpgm
+    store32(buf + pos + 16, 0xDC738000);   # global_store_dword v[0:1], v2, off glc slc (dword 1)
+    store32(buf + pos + 20, 0x007F0200);   # global_store_dword (dword 2: addr=v0, data=v2, saddr=off)
+    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
+    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
     var i = 0;
     while (i < 16) {
-        store32(buf + pos + 20 + i * 4, 0xBF800000);
+        store32(buf + pos + 32 + i * 4, 0xBF800000);   # s_nop 0
         i = i + 1;
     }
-    return pos + 84;
+    return pos + 96;
 }
 
 # PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).

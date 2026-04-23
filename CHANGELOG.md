@@ -18,6 +18,98 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.0-dev]
+
+Pre-release dev-track entries for the v3 native-backend work. No
+release date; individual items are dated inline when they land.
+
+### Fixed — 2026-04-22/23 (B.3.d PM4 encoder bugs)
+
+- `src/backend_native.cyr::native_pm4_acquire_mem_full_invalidate` —
+  count argument `7 → 6`. The PKT3 header's word-count formula is
+  `(count - 1) & 0x3FFF`, and ACQUIRE_MEM on GFX9 has 6 data dwords
+  (coher_cntl, size_lo, size_hi, base_lo, base_hi, poll_interval).
+  Passing `count=7` made the header claim 7 payload dwords; the CP
+  consumed the following `SET_SH_REG` header as stray data, then
+  mis-parsed every subsequent packet in the IB. Resulting
+  `gfx_v9_0_bad_op_irq` + MODE2 reset looked like different failures
+  across Sessions 1–6 but was one-and-the-same desync. Mesa's
+  `AMD_DEBUG=ib` dump shows `0xC0055802`; we now match byte-exact.
+- `src/backend_native.cyr::native_pm4_dispatch_direct` — predicate
+  argument `0 → 2`. The low byte of IT_DISPATCH_DIRECT's PKT3 header
+  is `shader_type` (0 = graphics, 2 = compute), not a predicate bit.
+  Header now emits `0xC0031502`, matching Mesa.
+- `src/backend_native.cyr` — added `native_pm4_set_uconfig_reg_pair`
+  helper for paired register writes (TA_CS_BC_BASE_ADDR + _HI).
+- `programs/native_compute_spike.cyr` — rewrote PM4 emission to
+  mirror Mesa rusticl's exact preamble order (PGM_HI →
+  STATIC_THREAD_MGMT × 2 → UCONFIG preamble → PGM_LO → RSRC1/2 →
+  TMPRING_SIZE → USER_DATA_2/3 → USER_DATA_0 → ACQUIRE_MEM →
+  RESOURCE_LIMITS → NUM_THREAD → DISPATCH_DIRECT). Register values
+  aligned: `RESOURCE_LIMITS = 0x140` (was `0` — zero waves = silent
+  stall), `TMPRING_SIZE = 0x100` (was unset), `STATIC_THREAD_MGMT_SE1
+  /SE2/SE3 = 0` (Cezanne has 1 SE; writing 0xFFFFFFFF to absent-SE
+  mask registers is meaningless and diverges from Mesa).
+
+### Verified — 2026-04-23
+
+- **Phase B.3.d closed.** Live retest on gfx90c (Cezanne APU):
+  `./build/native_compute_spike` → `dispatch completed (sync-obj
+  signaled)`, RC=0, `dmesg` silent (no `gfx_v9_0_bad_op_irq`, no
+  `MODE2` reset). Ran under released cyrius 5.6.13.
+
+### Added — testing
+
+- `tests/tcyr/mabda.tcyr::test_native_pm4_acquire_mem_layout` — byte-
+  exact header + payload assertion against the Mesa IB dump.
+- Updated `test_native_pm4_dispatch_direct_layout` and the PM4
+  composability test for the new `shader_type` byte.
+- Test count 602 → 610 (8 new assertions). All green under 5.6.13.
+
+### Methodology note
+
+The actually-valuable lesson: any direct-PM4 code should diff header
+bytes byte-exactly against `AMD_DEBUG=ib` output *before* being run
+live. Six sessions of theorizing about VMID/scratch/VA aperture were
+all downstream of a one-bit count-field bug that a five-minute diff
+would have caught. Captured as `feedback_pm4_verify_against_mesa_ib`
+in auto-memory and as a vidya field note.
+
+### Prepared — 2026-04-23 (B.4 store shader — built, not live-verified)
+
+- `src/backend_native.cyr::native_gfx9_shader_store_deadbeef` —
+  Session 6 diagnostic stub replaced with the real 6-instruction
+  store kernel (v_mov_b32 v0,s0; v_mov_b32 v1,s1; v_mov_b32 v2,
+  literal; global_store_dword v[0:1],v2,off glc slc; s_waitcnt
+  vmcnt(0) lgkmcnt(0); s_endpgm) + 16-dword NOP prefetch padding.
+  Bytes are byte-exact output of `clang -target amdgcn--amdhsa
+  -mcpu=gfx90c`. Function grew from 84 → 96 bytes.
+- `programs/native_compute_store.cyr` — full rewrite. PM4 preamble
+  is byte-identical to `programs/native_compute_spike.cyr` (the
+  Session 8 verified-working baseline) except for three store-
+  specific deltas: USER_DATA_0/1 carry the real output VA (spike
+  used Mesa's scratch-V# stub there); USER_DATA_2/3 kept at the
+  spike values (shader ignores s2/s3); BO list has 4 entries (shader
+  + stub + output + IB). All VAs canonical-high.
+- `tests/tcyr/mabda.tcyr::test_native_gfx9_shader_store_deadbeef_writes_bytes` —
+  new byte-exact assertion covering every dword of the store shader
+  + the NOP padding. Test count 610 → 621.
+- `build/native_compute_store` built under released 5.6.13. **Not
+  yet run on hardware** — awaiting SSH access to the dev box.
+  Handoff for the live retest at
+  `docs/handoff/2026-04-23-b4-store-retest.md`.
+
+### Changed — toolchain
+
+- `cyrius.cyml` pin `5.5.20 → 5.6.13`. The active toolchain on the
+  dev box was already running 5.6.x; the manifest was lagging. Pin
+  now matches the released 5.6 line (5.6.14 is in-dev, not shipped).
+- `dist/mabda.cyr` regenerated — picked up +274/-6 lines of latent
+  drift from v3 Phase A work (`src/render_graph.cyr` transient
+  aliasing planner, commit `211a47b`) that had never been re-
+  bundled. Not related to the pin bump; caught as a side-effect of
+  the bump-prompted regen.
+
 ## [2.5.0] — 2026-04-21
 
 **First feature release post-v1.0-parity. Adds a DAG-style render

@@ -1,22 +1,35 @@
 # programs/native_compute_store.cyr — v3 Phase B.4 hardware integration
 #
-# Real compute dispatch with CPU-verified output. The shader writes
-# a fixed constant (0xDEADBEEF) to a buffer at the VA passed via
-# USER_DATA_0/1. This program uploads the shader, dispatches it,
-# waits for completion, then reads back the output buffer and
-# verifies the value byte-identical.
+# First pure-Cyrius compute dispatch that actually writes a known
+# value to GPU memory and verifies it byte-identical from the CPU
+# side. The shader is `native_gfx9_shader_store_deadbeef` — a
+# six-instruction GFX9 kernel that stores `0xDEADBEEF` to the VA
+# pre-loaded in s[0:1], with GLC+SLC cache bypass + s_waitcnt so the
+# store is CPU-visible by the time the sync-obj fires.
 #
-# This is the Phase B stated exit criterion — "byte-identical
-# compute output vs wgpu backend on the same shader" — in its
-# simplest form (no wgpu diff yet; just proving the GPU actually
-# ran our code).
+# PM4 stream is byte-identical to `programs/native_compute_spike.cyr`
+# (the working B.3.d baseline) except for:
+#   - USER_DATA_0/1 carry the real output VA (spike used Mesa's
+#     scratch-V# stub bytes there).
+#   - USER_DATA_2/3 keep Mesa's scratch-V# stub values (the shader
+#     doesn't read s2/s3, but the HW may implicitly reference them
+#     during dispatch setup).
+#   - BO list has 4 entries (shader + stub + output + IB).
 #
 # Exit codes:
-#   0   — output buffer contains 0xDEADBEEF at [0], all other words
-#         still at sentinel 0xBAADF00D
-#   1-9 — setup / submit / wait failure (see stage prints)
-#   10  — readback mismatch at [0]
-#   11  — sentinel corrupted beyond [0]
+#   0   — output buffer contains 0xDEADBEEF at [0]; sentinel intact at [1]
+#   1   — open fd failed
+#   2   — shader BO setup failed
+#   3   — stub BO setup failed
+#   4   — output BO setup failed
+#   5   — IB BO setup failed
+#   6   — context alloc failed
+#   7   — BO list create failed
+#   8   — syncobj create failed
+#   9   — cs submit failed
+#   10  — syncobj wait failed (timeout or error)
+#   11  — readback mismatch at out[0]
+#   12  — sentinel corrupted at out[1]
 
 include "src/lib.cyr"
 
@@ -57,28 +70,66 @@ fn main() {
 
     var fd = native_open_render_node();
     if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+    print_cstr("fd="); print_i64(fd); print_cstr("\n");
 
     # ---- Shader BO: 4 KiB GTT, store shader at offset 0 ----
+    # Shader VA in the canonical-high aperture matches spike + Mesa.
     var shader_size = 4096;
     var shader_bo[16];
     var rc = native_bo_create_gtt(fd, shader_size, &shader_bo);
-    if (rc != 0) { print_cstr("FAIL: shader bo\n"); sys_close(fd); return 2; }
+    if (rc != 0) {
+        print_cstr("FAIL: shader bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        sys_close(fd); return 2;
+    }
     var shader_handle = load64(&shader_bo + 0);
     var shader_map    = load64(&shader_bo + 8);
     memset(shader_map, 0, shader_size);
     native_gfx9_shader_store_deadbeef(shader_map, 0);
-    # Back to a low VA — with correct PGM_LO/HI encoding (no >> 8
-    # shift), a sensible 2 MiB VA should work.
-    var shader_va = 0x200000;
+    var shader_va = 0xFFFF800100000000;
     rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
-    if (rc != 0) { print_cstr("FAIL: shader va_map\n"); return 2; }
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: shader va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        return 2;
+    }
+    print_cstr("shader bo="); print_i64(shader_handle);
+    print_cstr(" va=0x"); print_i64(shader_va); print_cstr("\n");
 
-    # ---- Output BO: 4 KiB GTT, seed with sentinel 0xBAADF00D ----
+    # ---- Stub BO at VA 0x200000 (Mesa's scratch-V# reference point) ----
+    # See session 5/7 analysis in docs/issues/2026-04-21-gfx9-store-blocker.md.
+    # The spike established that keeping this stub mapped is part of the
+    # working baseline; we match its VA + size exactly.
+    var stub_size = 4096;
+    var stub_bo[16];
+    rc = native_bo_create_gtt(fd, stub_size, &stub_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: stub bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 3;
+    }
+    var stub_handle = load64(&stub_bo + 0);
+    var stub_map    = load64(&stub_bo + 8);
+    memset(stub_map, 0, stub_size);
+    var stub_va = 0x200000;
+    rc = native_gem_va_map(fd, stub_handle, stub_va, stub_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: stub va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        return 3;
+    }
+    print_cstr("stub bo="); print_i64(stub_handle);
+    print_cstr(" va=0x"); print_i64(stub_va); print_cstr("\n");
+
+    # ---- Output BO: 4 KiB GTT, canonical-high VA, seeded with 0xBAADF00D ----
+    # Keeping output in the same aperture as shader + IB matches Mesa's
+    # pattern. 4 MiB above the IB (which goes to 0xFFFF800100200000) gives
+    # non-overlapping VA with room to spare.
     var out_size = 4096;
     var out_bo[16];
     rc = native_bo_create_gtt(fd, out_size, &out_bo);
-    if (rc != 0) { print_cstr("FAIL: output bo\n"); return 3; }
+    if (rc != 0) {
+        print_cstr("FAIL: output bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 4;
+    }
     var out_handle = load64(&out_bo + 0);
     var out_map    = load64(&out_bo + 8);
     var sentinel = 0xBAADF00D;
@@ -87,139 +138,196 @@ fn main() {
         store32(out_map + si * 4, sentinel);
         si = si + 1;
     }
-    # Output BO at 64 GiB VA — well above the 32-bit window. Note:
-    # this alone doesn't avoid bad_op_irq on stores (empirically
-    # confirmed); the real fix is TRAP_PRESENT in RSRC2 + shader
-    # trailing NOP padding (kfdtest minimum).
-    var out_va = 0x1000000000;
+    var out_va = 0xFFFF800100400000;
     rc = native_gem_va_map(fd, out_handle, out_va, out_size,
                            AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
-    if (rc != 0) { print_cstr("FAIL: output va_map\n"); return 3; }
-    print_cstr("output BO seeded with 0xBAADF00D at VA 0x");
-    print_hex32(out_va); print_cstr("\n");
+    if (rc != 0) {
+        print_cstr("FAIL: output va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        return 4;
+    }
+    print_cstr("output bo="); print_i64(out_handle);
+    print_cstr(" va=0x"); print_i64(out_va);
+    print_cstr(" seeded with 0xBAADF00D\n");
 
     # ---- Build PM4 stream ----
-    var pm4 = alloc(512);
-    memset(pm4, 0, 512);
+    # Byte-identical preamble to native_compute_spike.cyr (Mesa-verified
+    # via AMD_DEBUG=ib on this exact Cezanne APU). Deltas off the spike
+    # are exactly where the store shader needs them:
+    #   - USER_SGPR = 4 (RSRC2 = 0x8) kept from spike.
+    #   - USER_DATA_0/1 = output VA low/high (spike used Mesa's scratch
+    #     V# magic bytes; shader reads s0/s1 as the store address).
+    #   - USER_DATA_2/3 = 0x00200000/0 (Mesa's scratch V# stub; shader
+    #     ignores s2/s3 but HW may implicitly reference them).
+    #
+    # Mesa's order (from the AMD_DEBUG dump):
+    #   1. COMPUTE_PGM_HI
+    #   2. STATIC_THREAD_MGMT_SE0 + SE1
+    #   3. STATIC_THREAD_MGMT_SE2 + SE3
+    #   4. CP_COHER_START_DELAY
+    #   5. TA_CS_BC_BASE_ADDR + _HI
+    #   6. COMPUTE_PGM_LO
+    #   7. COMPUTE_PGM_RSRC1 + RSRC2
+    #   8. COMPUTE_TMPRING_SIZE
+    #   9. COMPUTE_USER_DATA_2 + 3
+    #   10. COMPUTE_USER_DATA_0 + 1 ← pair-write now (stores output VA)
+    #   11. ACQUIRE_MEM
+    #   12. COMPUTE_RESOURCE_LIMITS
+    #   13. COMPUTE_NUM_THREAD_X + Y + Z
+    #   14. DISPATCH_DIRECT
+    var pm4 = alloc(256);
+    memset(pm4, 0, 256);
     var pos = 0;
-    # GFX9-required queue preamble items that radv and rusticl emit.
-    # Our context is fresh each run so all of these must be in-stream.
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
-    # Border color base address — Mesa sets this even when the shader
-    # doesn't sample textures. Point to the shader BO's VA as a
-    # valid placeholder (any mapped VA will do for a non-sampling
-    # compute dispatch).
-    var bc_va = shader_va;
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR,
-                                         (bc_va / 256) & 0xFFFFFFFF);
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_TA_CS_BC_BASE_ADDR_HI,
-                                         (bc_va / 0x10000000000) & 0xFF);
-
-    # ACQUIRE_MEM — invalidate I-cache / K-cache / TC. Required on
-    # GFX9 before compute dispatch; without it the SQ can decode
-    # stale I-cache bytes as illegal opcodes.
-    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
-
-    # COMPUTE_START_X/Y/Z = 0 (grid origin). Default 0, but kfdtest
-    # writes them explicitly — some firmware revisions require it.
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_X, 0);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Y, 0);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_START_Z, 0);
-
-    # GFX9: PGM_LO = VA[31:0], PGM_HI = VA[47:40] (Mesa-verified).
     var pgm_lo = shader_va & 0xFFFFFFFF;
     var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    # 1. PGM_HI.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC1, GFX9_COMPUTE_PGM_RSRC1_MIN);
-    # RSRC2: USER_SGPR = 2 (load s0/s1 from USER_DATA_0/1) AND
-    # TRAP_PRESENT = 1 (mandatory on GFX9 for memory ops).
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_RSRC2, GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP);
-    # Match Mesa rusticl's values: RESOURCE_LIMITS=0x140, TMPRING_SIZE=0x100,
-    # only SE0 enabled (mesa deliberately sets SE1-3 to 0 even on 4-SE parts).
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0);
+    # 2. STATIC_THREAD_MGMT_SE0/SE1 — SE0 all CUs, SE1 absent on Cezanne.
+    var thread_mgmt_01[8];
+    store32(&thread_mgmt_01 + 0, 0xFFFFFFFF);
+    store32(&thread_mgmt_01 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 2, &thread_mgmt_01);
+    # 3. STATIC_THREAD_MGMT_SE2/SE3 = 0, 0 (absent on Cezanne).
+    var thread_mgmt_23[8];
+    store32(&thread_mgmt_23 + 0, 0);
+    store32(&thread_mgmt_23 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 2, &thread_mgmt_23);
+    # 4. CP_COHER_START_DELAY = 0.
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
+    # 5. TA_CS_BC_BASE_ADDR + _HI — border-color base, pointed at shader VA.
+    var bc_va = shader_va;
+    var bc_pair[8];
+    store32(&bc_pair + 0, (bc_va / 256) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va / 0x10000000000) & 0xFF);
+    pos = native_pm4_set_uconfig_reg_pair(pm4, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
+    # 6. PGM_LO.
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    # 7. PGM_RSRC1 + RSRC2 as a pair.
+    var rsrc[8];
+    store32(&rsrc + 0, GFX9_COMPUTE_PGM_RSRC1_MIN);
+    store32(&rsrc + 4, 0x8);   # USER_SGPR=4, no TRAP, no SCRATCH_EN
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    # 8. TMPRING_SIZE.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
-    # USER_DATA_0 = low 32 of output VA, USER_DATA_1 = high 32.
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0,     out_va & 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_USER_DATA_0 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_X, 1);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Y, 1);
-    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_NUM_THREAD_Z, 1);
+    # 9. USER_DATA_2 + 3 — Mesa's scratch V# stub (shader ignores s2/s3).
+    var user23[8];
+    store32(&user23 + 0, 0x00200000);
+    store32(&user23 + 4, 0);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_USER_DATA_0 + 8, 2, &user23);
+    # 10. USER_DATA_0 + 1 — output VA low/high. HW loads s0/s1 from these.
+    var user01[8];
+    store32(&user01 + 0, out_va & 0xFFFFFFFF);
+    store32(&user01 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_USER_DATA_0, 2, &user01);
+    # 11. ACQUIRE_MEM flushes I/K/L2 caches before dispatch.
+    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
+    # 12. RESOURCE_LIMITS = 0x140 (WAVES_PER_SH=320).
+    pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    # 13. NUM_THREAD_X/Y/Z.
+    var nt[12];
+    store32(&nt + 0, 1);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    # 14. DISPATCH_DIRECT with shader_type=2.
     pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
-    # Pad to 32-dword alignment.
+    # Pad to 64 dwords (AMDGPU cache-line alignment).
     var cur_dwords = pos / 4;
-    if (cur_dwords < 32) { pos = native_pm4_nop(pm4, pos, 32 - cur_dwords); }
+    var target_dwords = 64;
+    if (cur_dwords < target_dwords) {
+        pos = native_pm4_nop(pm4, pos, target_dwords - cur_dwords);
+    }
     var pm4_bytes = pos;
     print_cstr("pm4 stream bytes="); print_i64(pm4_bytes); print_cstr("\n");
 
-    # ---- IB BO ----
+    # ---- IB BO: 4 KiB GTT, PM4 at offset 0, VA @ canonical-high ----
     var ib_size = 4096;
     var ib_bo[16];
     rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
-    if (rc != 0) { print_cstr("FAIL: ib bo\n"); return 4; }
+    if (rc != 0) {
+        print_cstr("FAIL: ib bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 5;
+    }
     var ib_handle = load64(&ib_bo + 0);
     var ib_map    = load64(&ib_bo + 8);
     memset(ib_map, 0, ib_size);
     memcpy(ib_map, pm4, pm4_bytes);
-    var ib_va = 0x400000;
+    var ib_va = 0xFFFF800100200000;
     rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, AMDGPU_VM_PAGE_READABLE);
-    if (rc != 0) { print_cstr("FAIL: ib va_map\n"); return 4; }
+    if (rc != 0) {
+        print_cstr("FAIL: ib va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        return 5;
+    }
+    print_cstr("ib bo="); print_i64(ib_handle);
+    print_cstr(" va=0x"); print_i64(ib_va); print_cstr("\n");
 
-    # ---- Context, BO list (shader + output + IB), sync-obj ----
+    # ---- Context ----
     var req_ctx[16];
     rc = native_ctx_alloc(fd, &req_ctx);
-    if (rc != 0) { print_cstr("FAIL: ctx_alloc\n"); return 5; }
+    if (rc != 0) {
+        print_cstr("FAIL: ctx_alloc errno="); print_i64(0 - rc); print_cstr("\n");
+        return 6;
+    }
     var ctx_id = native_ctx_alloc_id(&req_ctx);
+    print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
-    var entries[24];
+    # ---- BO list: shader + stub + output + IB ----
+    var entries[32];
     store32(&entries +  0, shader_handle); store32(&entries +  4, 0);
-    store32(&entries +  8, out_handle);    store32(&entries + 12, 0);
-    store32(&entries + 16, ib_handle);     store32(&entries + 20, 0);
+    store32(&entries +  8, stub_handle);   store32(&entries + 12, 0);
+    store32(&entries + 16, out_handle);    store32(&entries + 20, 0);
+    store32(&entries + 24, ib_handle);     store32(&entries + 28, 0);
     var req_list[24];
-    rc = native_bo_list_create(fd, &entries, 3, &req_list);
-    if (rc != 0) { print_cstr("FAIL: bo_list_create\n"); return 6; }
+    rc = native_bo_list_create(fd, &entries, 4, &req_list);
+    if (rc != 0) {
+        print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 7;
+    }
     var list_handle = native_bo_list_create_handle(&req_list);
+    print_cstr("bo_list_handle="); print_i64(list_handle); print_cstr("\n");
 
+    # ---- Sync-obj ----
     var syncobj_handle_ptr = alloc(8);
     rc = native_syncobj_create(fd, syncobj_handle_ptr);
-    if (rc != 0) { print_cstr("FAIL: syncobj_create\n"); return 7; }
+    if (rc != 0) {
+        print_cstr("FAIL: syncobj_create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 8;
+    }
     var syncobj_handle = load64(syncobj_handle_ptr);
+    print_cstr("syncobj="); print_i64(syncobj_handle); print_cstr("\n");
 
     # ---- Submit on COMPUTE ring ----
     rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
                           AMDGPU_HW_IP_COMPUTE, syncobj_handle);
-    if (rc != 0) { print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n"); return 8; }
-    print_cstr("submitted\n");
+    if (rc != 0) {
+        print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
+        return 9;
+    }
+    print_cstr("submitted to COMPUTE ring\n");
 
     # ---- Wait 15 sec ----
     var deadline = mono_ns() + 15000000000;
     rc = native_syncobj_wait(fd, syncobj_handle, deadline);
     if (rc != 0) {
         print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
-        return 9;
+        return 10;
     }
-    print_cstr("dispatch completed\n");
+    print_cstr("dispatch completed (sync-obj signaled)\n");
 
     # ---- Verify output ----
     var v0 = load32(out_map + 0);
     print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
     if (v0 != 0xDEADBEEF) {
-        print_cstr("FAIL: mismatch\n");
+        print_cstr("FAIL: mismatch at [0]\n");
         native_syncobj_destroy(fd, syncobj_handle);
         native_bo_list_destroy(fd, list_handle);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
-        return 10;
+        return 11;
     }
-    # Check the sentinel is intact at [1]..[N-1] — catches runaway writes.
     var v1 = load32(out_map + 4);
     if (v1 != sentinel) {
         print_cstr("FAIL: sentinel corrupted at [1] = "); print_hex32(v1); print_cstr("\n");
-        return 11;
+        return 12;
     }
     print_cstr("sentinel intact at [1]\n");
 
@@ -231,6 +339,8 @@ fn main() {
     native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
     native_gem_va_unmap(fd, out_handle, out_va, out_size);
     native_bo_release_gtt(fd, out_handle, out_map, out_size);
+    native_gem_va_unmap(fd, stub_handle, stub_va, stub_size);
+    native_bo_release_gtt(fd, stub_handle, stub_map, stub_size);
     native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
     native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
     sys_close(fd);
