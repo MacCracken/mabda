@@ -1,8 +1,8 @@
 # v3 Phase B.4 — GFX9 Compute Store Blocker
 
-**Status:** B.3.d resolved 2026-04-23 (Session 7 PM4 fixes verified live); B.4 store verify still pending
-**Date:** 2026-04-21 (opened) — 2026-04-23 (B.3.d retest passed)
-**Affects:** Phase B.4 (verifiable compute dispatch on AMDGPU direct-ioctl path)
+**Status:** REOPENED Session 9 2026-04-23 — B.3.d's "pass" was a TDR false positive. Real blocker is upstream of the CP, in the CS submission path. See Session 9 below and `docs/handoff/2026-04-23-session9-tdr-false-positive.md`.
+**Date:** 2026-04-21 (opened) — 2026-04-23 Session 8 (false close) → 2026-04-23 Session 9 (reopened)
+**Affects:** Phase B.3.d AND B.4 (both blocked — submissions never reach the CP)
 **Hardware:** AMD Cezanne APU (Vega7 iGPU, GFX9/gfx90c), Linux 6.18.22-lts
 
 ## Symptom
@@ -405,3 +405,82 @@ that file.
 This issue stays open until the store variant runs green. When it
 does, close with a final "Session N: store verified" section and
 update the v3-native-api-principles.md Phase B status block.
+
+## Session 9 (2026-04-23 afternoon): Session 8's close was a TDR false positive
+
+Preparing B.4 with the real store shader surfaced a much deeper
+finding: **no v3 CS submission has actually executed on the CP** —
+not the store, not the spike, not even Session 8's "successful"
+B.3.d retest. Every `dispatch completed (sync-obj signaled)` we've
+ever printed in Phase B has been the kernel TDR-resetting a ring
+and signalling our fence as "completed-via-reset."
+
+### The smoking gun — WRITE_DATA diagnostic never lands
+
+Adding a PKT3 WRITE_DATA packet to the spike's IB (targeting the
+stub BO's VA with value `0xCAFEBABE`) and CPU-reading the stub BO
+post-submit: the first word remains `0x00000000` (creation-time
+memset). If the CP had processed the IB, the WRITE_DATA packet
+would have written `0xCAFEBABE` before any DISPATCH_DIRECT.
+
+### Timing tells
+
+- **Empty/NOP-only IB takes exactly ~10s** — AMDGPU's default TDR
+  (Timeout Detection & Recovery) timeout is 10s. This isn't a
+  coincidence; it's the kernel "completing" our submission by
+  resetting the ring.
+- **Mesa `cl_probe` on the same hardware: 77 ms**, with correct
+  readback. GPU is healthy, Mesa's submission path works.
+- **Runs 2 and 3 of `./build/native_compute_spike`: ~10s each.**
+  Repeated TDRs leave the compute queue in "soft queue full" state
+  per `/sys/class/drm/card0/device/compute_reset_mask`.
+
+### What Session 9 ruled out
+
+- **PM4 content:** tried empty IB, NOP-only IB, full compute preamble
+  + DISPATCH. All time out the same way. Not a PM4 issue.
+- **Ring choice:** tried COMPUTE and GFX. Same behaviour.
+- **BO flags:** tried `AMDGPU_GEM_CREATE_CPU_GTT_USWC` (bit 2) +
+  `AMDGPU_GEM_CREATE_VM_ALWAYS_VALID` (bit 6). No effect.
+- **IB flags:** tried `AMDGPU_IB_FLAG_EMIT_MEM_SYNC` (bit 6). No
+  effect.
+- **USER_DATA / RSRC2:** tried USER_SGPR=2 and =4, with and without
+  the scratch-V# stub. No effect (the CP never runs the shader).
+- **Output VA aperture:** tried canonical-high (`0xFFFF_8001_xxxx`)
+  and low (`0x00400000`). No effect.
+
+### Where the actual blocker lives
+
+Between `AMDGPU_CS` ioctl returning 0 and the CP executing our
+PM4. Candidates (ranked by likelihood):
+
+1. **Ring index / ip_instance mismatch.** We hard-code
+   `ring=0, ip_instance=0` for `HW_IP_COMPUTE`. Mesa's libdrm
+   wrapper auto-selects a valid ring; ours may be targeting a
+   kernel-reserved slot that accepts submissions silently.
+2. **Missing CS chunks.** Mesa's strace shows no
+   `DRM_IOCTL_AMDGPU_BO_LIST` — BOs are declared via the
+   `AMDGPU_CHUNK_ID_BO_HANDLES` (0x06) chunk. We tried this once
+   and got `ENOENT`; chunk payload format needs more investigation.
+3. **CS / IB flags.** Mesa may set flags we don't.
+4. **Context alloc.** Mesa may use non-default priority / flags.
+5. **Accumulated TDR state on our DRM fd.** Reboot would rule out.
+
+### Handoff
+
+Next steps, reboot gate, and runbook are in
+`docs/handoff/2026-04-23-session9-tdr-false-positive.md`. The
+Session 9 diagnostic changes to spike / store / backend_native.cyr
+were reverted at end of session — working tree is clean. Session 7
+PM4 fixes remain valid (they are real bugs; they just aren't
+downstream of the actual blocker).
+
+### What stays valid
+
+- Session 7 PM4 encoder fixes.
+- Real store shader bytes + byte-exact test (621 CPU assertions
+  green under 5.6.13).
+- Store program's Mesa-aligned PM4 preamble.
+- Toolchain pin bump to 5.6.13.
+
+None of those need re-work once the CS-submission blocker is fixed.

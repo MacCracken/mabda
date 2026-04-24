@@ -1,5 +1,18 @@
 # v3 Phase B.4 Live Retest — Agent Handoff
 
+> **⚠️ SUPERSEDED 2026-04-23 Session 9 afternoon.** This handoff was
+> written on the premise that B.3.d passed live. Session 9 discovered
+> that "pass" was a 10-second AMDGPU TDR false positive — the CP has
+> never actually executed any of our PM4. Running
+> `./build/native_compute_store` will NOT produce a real store; it
+> will hit the same TDR and appear to "succeed." The actual blocker
+> is in the CS submission path between `AMDGPU_CS` ioctl and CP
+> execution. See `docs/handoff/2026-04-23-session9-tdr-false-positive.md`
+> for the full runbook. **The rest of this doc is kept for historical
+> context and because all the CODE prepared here (real store shader,
+> byte-exact test, Mesa-aligned PM4 preamble in the store program)
+> remains valid once the submission path is fixed.**
+
 **Date:** 2026-04-23
 **Branch:** `v3`
 **Prior context:** B.3.d retest passed today (see `docs/handoff/2026-04-22-pm4-fix-retest.md` and Session 8 in the store-blocker issue). With the PM4 builder fixed, Phase B.4 reopens: a real store shader + output-buffer readback. All code is written, all CPU gates are green, **binary is built and on disk but has NOT been fired on hardware** because the current session did not have SSH access to the dev box.

@@ -51,12 +51,32 @@ release date; individual items are dated inline when they land.
   /SE2/SE3 = 0` (Cezanne has 1 SE; writing 0xFFFFFFFF to absent-SE
   mask registers is meaningless and diverges from Mesa).
 
-### Verified — 2026-04-23
+### Retracted — 2026-04-23 (Session 9): Phase B.3.d was a TDR false positive
 
-- **Phase B.3.d closed.** Live retest on gfx90c (Cezanne APU):
-  `./build/native_compute_spike` → `dispatch completed (sync-obj
-  signaled)`, RC=0, `dmesg` silent (no `gfx_v9_0_bad_op_irq`, no
-  `MODE2` reset). Ran under released cyrius 5.6.13.
+- **B.3.d is NOT closed.** The "dispatch completed (sync-obj signaled),
+  RC=0, dmesg silent" signature does not prove the CP ran our IB — it
+  only proves the kernel's Timeout Detection & Recovery (TDR) path
+  signalled our fence. Session 9 investigation added a CP-side
+  WRITE_DATA packet to the spike's PM4 stream targeting the stub BO's
+  VA. Post-submit CPU readback of the stub BO's first word returned
+  `0x00000000` (unchanged from creation's memset), not `0xCAFEBABE`
+  (the value WRITE_DATA would have written if the IB actually ran).
+- **Timing proof:** empty/NOP-only IB runs take exactly ~10 seconds —
+  AMDGPU's default TDR timeout — and return "success." Mesa's
+  `cl_probe` on the same hardware runs in ~77 milliseconds with
+  correct readback, confirming the GPU is healthy and Mesa's
+  submission path works.
+- **Location of actual blocker:** somewhere between "AMDGPU_CS ioctl
+  returns 0" and "CP executes our PM4." Candidates ranked (see Session
+  9 handoff): ring index / ip_instance, BO_HANDLES chunk vs BO_LIST
+  ioctl, CS/IB flags, context priority, accumulated TDR state.
+- **What stays valid:** Session 7 PM4 encoder fixes (ACQUIRE_MEM
+  count, DISPATCH_DIRECT shader_type) are real bugs that *would*
+  wedge the CP if submissions ever reached it. The store shader
+  bytes and byte-exact tests are correct. Only the "verified live"
+  claim is retracted.
+- **Full Session 9 handoff:**
+  `docs/handoff/2026-04-23-session9-tdr-false-positive.md`.
 
 ### Added — testing
 
@@ -94,10 +114,13 @@ in auto-memory and as a vidya field note.
 - `tests/tcyr/mabda.tcyr::test_native_gfx9_shader_store_deadbeef_writes_bytes` —
   new byte-exact assertion covering every dword of the store shader
   + the NOP padding. Test count 610 → 621.
-- `build/native_compute_store` built under released 5.6.13. **Not
-  yet run on hardware** — awaiting SSH access to the dev box.
-  Handoff for the live retest at
-  `docs/handoff/2026-04-23-b4-store-retest.md`.
+- `build/native_compute_store` built under released 5.6.13. **Session
+  9 update: cannot be meaningfully verified until the CS-submission
+  blocker documented in the Session 9 handoff is fixed.** All iteration
+  attempts on the store program (tried both USER_SGPR=2 and =4;
+  canonical-high and low output VA; hardcoded-VA shader variant
+  bypassing USER_DATA) failed the same way because the CP never
+  actually executes our IB.
 
 ### Changed — toolchain
 
