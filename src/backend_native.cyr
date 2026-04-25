@@ -771,6 +771,7 @@ var DRM_IOCTL_AMDGPU_CS               = 0xC0186444;
 var AMDGPU_CHUNK_ID_IB           = 0x01;
 var AMDGPU_CHUNK_ID_FENCE        = 0x02;
 var AMDGPU_CHUNK_ID_SYNCOBJ_OUT  = 0x05;
+var AMDGPU_CHUNK_ID_BO_HANDLES   = 0x06;
 
 var AMDGPU_HW_IP_GFX      = 0;
 var AMDGPU_HW_IP_COMPUTE  = 1;
@@ -839,6 +840,84 @@ fn native_cs_submit(fd, ctx_id, bo_list_handle, ib_va, ib_bytes, ip_type, syncob
     store32(&req + 4,  bo_list_handle);
     store32(&req + 8,  num_chunks);
     store32(&req + 12, 0);                # flags
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the BO_HANDLES chunk path (Mesa rusticl pattern) instead
+# of the BO_LIST_OP_CREATE ioctl. The kernel parser at drivers/gpu/drm/amd/
+# amdgpu/amdgpu_cs.c:p1_bo_handles consumes the chunk_data as a
+# drm_amdgpu_bo_list_in (24 bytes); its bo_info_ptr field then points to the
+# array of {handle u32, priority u32} entries. cs.in.bo_list_handle is
+# unused (the BO list is reconstructed from the chunk).
+#
+# Caller pre-builds bo_list_in (24 bytes) with:
+#   off  0: operation    = 0xFFFFFFFF  (sentinel — kernel infers from chunk)
+#   off  4: list_handle  = 0xFFFFFFFF  (sentinel)
+#   off  8: bo_number    = N
+#   off 12: bo_info_size = 8           (sizeof drm_amdgpu_bo_list_entry)
+#   off 16: bo_info_ptr  = &entries    (N × {u32 handle, u32 priority})
+#
+# Chunk order matches Mesa's amdgpu_cs_submit_ib_kernelq:
+#   1. BO_HANDLES
+#   2. SYNCOBJ_OUT  (when syncobj_handle != 0)
+#   3. IB
+fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type, syncobj_handle) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  0);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var include_sync = 1;
+    if (syncobj_handle == 0) { include_sync = 0; }
+
+    # Up to 3 chunk descriptors (16 bytes each): BO_HANDLES, SYNCOBJ_OUT, IB.
+    var chunks[48];
+    memset(&chunks, 0, 48);
+    # 1. BO_HANDLES — length_dw = sizeof(drm_amdgpu_bo_list_in)/4 = 6.
+    store32(&chunks + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks + 4,  6);
+    store64(&chunks + 8,  bo_list_in_ptr);
+
+    var pos = 16;
+    if (include_sync == 1) {
+        store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+        store32(&chunks + pos + 4,  1);
+        store64(&chunks + pos + 8,  &syncobj_chunk);
+        pos = pos + 16;
+    }
+    # IB chunk last (matches Mesa).
+    store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + pos + 4,  32 / 4);
+    store64(&chunks + pos + 8,  &ib_chunk);
+
+    var num_chunks = 2 + include_sync;
+
+    var chunk_ptrs[24];
+    store64(&chunk_ptrs + 0,  &chunks + 0);
+    if (include_sync == 1) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+        store64(&chunk_ptrs + 16, &chunks + 32);
+    }
+    if (include_sync == 0) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+    }
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  0);                # bo_list_handle = 0 (chunk replaces it)
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);
     store64(&req + 16, &chunk_ptrs);
 
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);

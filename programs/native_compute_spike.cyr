@@ -3,26 +3,32 @@
 # First live AMDGPU compute dispatch from pure Cyrius. Uploads a
 # minimum GFX9 shader (s_endpgm), builds a PM4 command stream with
 # our packet builder, submits via DRM_IOCTL_AMDGPU_CS, waits for
-# completion via a DRM sync object, and exits 0 if the dispatch
-# returned without kernel error.
+# completion via a DRM sync object, and verifies the CP actually ran
+# the IB via a CP-side WRITE_DATA proof-of-execution packet.
 #
 # The shader does nothing (s_endpgm is a single-instruction no-op
-# that just terminates the wave). This program therefore cannot
-# verify any output data — that's Phase B.4. What it DOES verify:
-#   - every ioctl returns 0
-#   - the sync-obj becomes signaled within 5 seconds
-#   - the kernel neither rejects the submission nor kernel-hangs the GPU
+# that just terminates the wave). The dispatch reaching s_endpgm is
+# not directly observable, but the CP-side WRITE_DATA at PM4 offset 0
+# IS — if it lands in stub[0] post-submit, the CP processed our IB.
+# That distinguishes real completion from AMDGPU TDR (the kernel
+# resetting our ring after 10s and signalling the syncobj as if
+# completed).
+#
+# Submission uses the BO_HANDLES chunk path (Mesa rusticl pattern),
+# not the BO_LIST_OP_CREATE ioctl. Session 9 (2026-04-23) showed the
+# BO_LIST path returns success at every layer but the CP never sees
+# the IB; switching to BO_HANDLES is the runbook fix.
 #
 # Exit codes:
-#   0  — dispatch completed (sync-obj signaled)
+#   0  — dispatch completed AND WRITE_DATA landed (CP ran the IB)
 #   1  — open fd failed
 #   2  — shader BO setup failed
 #   3  — IB BO setup failed
 #   4  — context alloc failed
-#   5  — BO list create failed
 #   6  — syncobj create failed
 #   7  — CS ioctl failed
 #   8  — syncobj wait failed (including timeout)
+#   9  — syncobj signalled but stub[0] != 0xCAFEBABE (TDR false positive)
 
 include "src/lib.cyr"
 
@@ -141,6 +147,20 @@ fn main() {
     var pm4 = alloc(256);
     memset(pm4, 0, 256);
     var pos = 0;
+    # 0. WRITE_DATA proof-of-execution. PKT3 IT_WRITE_DATA writes a constant
+    # to a CPU-readable BO from the CP itself, before any compute state is
+    # touched. If the post-submit readback shows the sentinel, the CP did
+    # process the IB. If it stays at zero, the bug is in CS submission, not
+    # PM4 / shader / dispatch. See Session 9 handoff (2026-04-23) and the
+    # `feedback_verify_gpu_actually_ran` memory.
+    # Header: type=3, count=3 (3+1=4 payload dwords), opcode=IT_WRITE_DATA(0x37).
+    # Control: DST_SEL=MEM_ASYNC(5)<<8 | WR_ONE_ADDR(1<<16) | WR_CONFIRM(1<<20).
+    store32(pm4 + pos +  0, 0xC0033700);
+    store32(pm4 + pos +  4, 0x00110500);
+    store32(pm4 + pos +  8, stub_va & 0xFFFFFFFF);
+    store32(pm4 + pos + 12, (stub_va / 0x100000000) & 0xFFFFFFFF);
+    store32(pm4 + pos + 16, 0xCAFEBABE);
+    pos = pos + 20;
     # GFX9 encoding (Mesa-verified): PGM_LO = VA[31:0], PGM_HI = VA[47:40].
     # Bits 39:32 are an implicit 0x01 via the GFX9 shader aperture — not
     # encoded in PGM_LO/HI. For VA 0xFFFF_8001_0000_0000: PGM_LO=0, PGM_HI=0x80.
@@ -251,19 +271,21 @@ fn main() {
     var ctx_id = native_ctx_alloc_id(&req_ctx);
     print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
-    # ---- BO list: shader + IB + stub ----
+    # ---- Inline BO list (Mesa BO_HANDLES chunk path) ----
+    # 8 bytes per entry: { handle u32, priority u32 }.
     var entries[24];
     store32(&entries +  0, shader_handle); store32(&entries +  4, 0);
     store32(&entries +  8, ib_handle);     store32(&entries + 12, 0);
     store32(&entries + 16, stub_handle);   store32(&entries + 20, 0);
-    var req_list[24];
-    rc = native_bo_list_create(fd, &entries, 3, &req_list);
-    if (rc != 0) {
-        print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 5;
-    }
-    var list_handle = native_bo_list_create_handle(&req_list);
-    print_cstr("bo_list_handle="); print_i64(list_handle); print_cstr("\n");
+    # drm_amdgpu_bo_list_in (24 bytes) — operation/list_handle are sentinels
+    # when used as BO_HANDLES chunk_data; the kernel reconstructs the list
+    # from bo_info_ptr.
+    var bo_list_in[24];
+    store32(&bo_list_in + 0,  0xFFFFFFFF);
+    store32(&bo_list_in + 4,  0xFFFFFFFF);
+    store32(&bo_list_in + 8,  3);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
 
     # ---- Sync-obj ----
     var syncobj_handle_ptr = alloc(8);
@@ -275,48 +297,95 @@ fn main() {
     var syncobj_handle = load64(syncobj_handle_ptr);
     print_cstr("syncobj="); print_i64(syncobj_handle); print_cstr("\n");
 
-    # ---- Submit CS with IB + SYNCOBJ_OUT ----
-    # Try COMPUTE ring first (the "right" ring for compute dispatches).
-    # If COMPUTE is unavailable on this platform, fall back to GFX.
-    rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
-                          AMDGPU_HW_IP_COMPUTE, syncobj_handle);
+    # ---- DIAGNOSTIC: query AMDGPU_INFO_HW_IP_INFO for ring availability ----
+    # bit N of available_rings == 1 means ring N exists.
+    var info_resp_gfx[40];
+    memset(&info_resp_gfx, 0, 40);
+    var info_req[32];
+    memset(&info_req, 0, 32);
+    store64(&info_req + 0,  &info_resp_gfx);     # return_pointer
+    store32(&info_req + 8,  40);                  # return_size
+    store32(&info_req + 12, 0x02);                # AMDGPU_INFO_HW_IP_INFO
+    store32(&info_req + 16, 0);                   # type = GFX
+    store32(&info_req + 20, 0);                   # ip_instance
+    var info_rc = syscall(SYS_IOCTL, fd, 0x40206445, &info_req);
+    print_cstr("HW_IP_INFO GFX: rc="); print_i64(info_rc);
+    print_cstr(" available_rings=0x"); fmt_hex(load32(&info_resp_gfx + 24));
+    print_cstr("\n");
+
+    var info_resp_cmp[40];
+    memset(&info_resp_cmp, 0, 40);
+    memset(&info_req, 0, 32);
+    store64(&info_req + 0,  &info_resp_cmp);
+    store32(&info_req + 8,  40);
+    store32(&info_req + 12, 0x02);
+    store32(&info_req + 16, 1);                   # type = COMPUTE
+    store32(&info_req + 20, 0);
+    info_rc = syscall(SYS_IOCTL, fd, 0x40206445, &info_req);
+    print_cstr("HW_IP_INFO COMPUTE: rc="); print_i64(info_rc);
+    print_cstr(" available_rings=0x"); fmt_hex(load32(&info_resp_cmp + 24));
+    print_cstr("\n");
+
+    # ---- Submit CS via BO_HANDLES chunk (Mesa rusticl pattern) ----
+    # Mesa does NOT use the BO_LIST_OP_CREATE ioctl — it inlines the BO
+    # list as an AMDGPU_CHUNK_ID_BO_HANDLES chunk in the CS request.
+    # Session 9 (2026-04-23) showed BO_LIST + CS reaches the kernel and
+    # signals the syncobj via TDR after 10s without ever executing the
+    # IB. Switch to BO_HANDLES path here.
+    var t_submit_start = mono_ns();
+    rc = native_cs_submit_inline_bos(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
+                                     AMDGPU_HW_IP_COMPUTE, syncobj_handle);
     if (rc == 0) {
         print_cstr("submitted to COMPUTE ring\n");
     }
     if (rc != 0) {
         print_cstr("COMPUTE ring errno="); print_i64(0 - rc);
         print_cstr(", retrying on GFX ring\n");
-        rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
-                              AMDGPU_HW_IP_GFX, syncobj_handle);
+        rc = native_cs_submit_inline_bos(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
+                                         AMDGPU_HW_IP_GFX, syncobj_handle);
         if (rc == 0) { print_cstr("submitted to GFX ring\n"); }
     }
     if (rc != 0) {
         print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
         return 7;
     }
-    print_cstr("cs submitted\n");
 
     # ---- Wait for completion, 15-second timeout ----
-    # AMDGPU's default TDR is 10s — 15s gives enough headroom to see
-    # a GPU reset fence (which would signal the syncobj with an error
-    # rather than leaving us in ETIME land).
     var deadline = mono_ns() + 15000000000;
     rc = native_syncobj_wait(fd, syncobj_handle, deadline);
     if (rc != 0) {
         print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
         return 8;
     }
-    print_cstr("dispatch completed (sync-obj signaled)\n");
+    var t_submit_end = mono_ns();
+    var elapsed_ms = (t_submit_end - t_submit_start) / 1000000;
+    print_cstr("dispatch completed (sync-obj signaled) in ");
+    print_i64(elapsed_ms);
+    print_cstr(" ms\n");
+
+    # ---- Proof-of-execution readback ----
+    # WRITE_DATA at PM4 offset 0 should have written 0xCAFEBABE into stub[0]
+    # if the CP processed the IB. If it stays 0, the CP never ran the IB —
+    # the syncobj signal is a TDR recovery, not real completion.
+    var stub_word = load32(stub_map + 0);
+    print_cstr("stub[0] = 0x");
+    fmt_hex(stub_word);
+    if (stub_word == 0xCAFEBABE) {
+        print_cstr("  (PASS — CP executed the IB)\n");
+    }
+    if (stub_word != 0xCAFEBABE) {
+        print_cstr("  (FAIL — want 0xCAFEBABE)\n");
+    }
 
     # ---- Teardown ----
     native_syncobj_destroy(fd, syncobj_handle);
-    native_bo_list_destroy(fd, list_handle);
     native_ctx_free(fd, ctx_id);
     native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
     native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
     native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
     native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
     sys_close(fd);
+    if (stub_word != 0xCAFEBABE) { return 9; }
     print_cstr("OK\n");
     return 0;
 }
