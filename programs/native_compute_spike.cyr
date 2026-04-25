@@ -144,8 +144,14 @@ fn main() {
     #   12. COMPUTE_RESOURCE_LIMITS
     #   13. COMPUTE_NUM_THREAD_X + Y + Z
     #   14. DISPATCH_DIRECT
-    var pm4 = alloc(256);
-    memset(pm4, 0, 256);
+    # PM4 buffer sized for the gfx9 minimum IB alignment of 256 DW (1 KiB).
+    # Both gfx_v9_0_ring_funcs_gfx and _compute set align_mask = 0xff in the
+    # kernel — userspace IBs whose length-in-DW isn't a multiple of 256 are
+    # silently rejected at CP fetch (no dmesg, fence still signals after
+    # the 10s lockup_timeout). Allocating exactly 1 KiB and padding the
+    # tail with NOPs keeps everyone happy.
+    var pm4 = alloc(1024);
+    memset(pm4, 0, 1024);
     var pos = 0;
     # 0. WRITE_DATA proof-of-execution. PKT3 IT_WRITE_DATA writes a constant
     # to a CPU-readable BO from the CP itself, before any compute state is
@@ -223,10 +229,11 @@ fn main() {
     pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
     # 14. DISPATCH_DIRECT. Header now carries shader_type=2.
     pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
-    # AMDGPU requires IBs padded to a cache-line boundary. Pad to 64
-    # dwords with a single NOP packet.
+    # GFX9 IB alignment: ring align_mask = 0xff means length must be a
+    # multiple of 256 DW (1 KiB). Pad with a single NOP packet that
+    # covers the remaining dwords.
     var cur_dwords = pos / 4;
-    var target_dwords = 64;
+    var target_dwords = 256;
     if (cur_dwords < target_dwords) {
         pos = native_pm4_nop(pm4, pos, target_dwords - cur_dwords);
     }
