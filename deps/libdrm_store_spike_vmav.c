@@ -1,4 +1,13 @@
 /*
+ * deps/libdrm_store_spike_vmav.c — Session 13 diagnostic, v3 Phase B.4
+ *
+ * Variant of libdrm_store_spike.c that adds AMDGPU_GEM_CREATE_VM_ALWAYS_VALID
+ * (0x40) on every BO. Hypothesis: BOs without this flag get re-evicted /
+ * re-faulted by the kernel during dispatch on Cezanne, causing the CP to
+ * stall on missing pages. Mesa sets this flag on all CL/compute BOs.
+ *
+ * --- ORIGINAL HEADER BELOW ---
+ *
  * deps/libdrm_store_spike.c — Session 12 diagnostic, v3 Phase B.4
  *
  * Real GFX9 compute-dispatch via libdrm_amdgpu. Adapts deps/libdrm_spike.c
@@ -177,7 +186,8 @@ int main(void) {
      * goes in USER_DATA_0/1. RSRC2 USER_SGPR=4 → kernel loads s0..s3. */
     struct amdgpu_bo_alloc_request req = {
         .alloc_size = 4096, .phys_alignment = 4096,
-        .preferred_heap = AMDGPU_GEM_DOMAIN_GTT, .flags = 0,
+        .preferred_heap = AMDGPU_GEM_DOMAIN_GTT,
+        .flags = AMDGPU_GEM_CREATE_VM_ALWAYS_VALID,  /* 0x40 — Session 13 retest */
     };
 
     amdgpu_bo_handle ib_bo, shader_bo, out_bo, stub_bo;
@@ -213,14 +223,10 @@ int main(void) {
     uint32_t *ib = (uint32_t *)ib_cpu;
     uint32_t *p = ib;
 
-    /* GFX9 PGM_LO/HI encoding (from radv / amdgpu kernel):
-     *   PGM_LO = (va >> 8) & 0xFFFFFFFF   — bits [39:8] of VA in 32-bit register
-     *   PGM_HI = (va >> 40) & 0xFF        — bits [47:40] of VA in low byte
-     * Hardware reconstructs:  shader_addr = (PGM_HI << 40) | (PGM_LO << 8).
-     * Session 13 fix: prior code stuffed VA[31:0] into PGM_LO and VA[39:8] into
-     * PGM_HI — CP saw shader at (raw_va << 8), fetched garbage, hung every IB. */
-    uint32_t pgm_lo = (uint32_t)((shader_va >> 8) & 0xFFFFFFFFu);
-    uint32_t pgm_hi = (uint32_t)((shader_va >> 40) & 0xFFu);
+    /* GFX9 PGM_LO/HI encoding: PGM_LO = VA[31:0], PGM_HI = VA[39:8] (bits 39:8 of VA shifted right by 8).
+     * shader_va is general-range from libdrm va allocator (typically ~4 GiB+); both halves needed. */
+    uint32_t pgm_lo = (uint32_t)(shader_va & 0xFFFFFFFFu);
+    uint32_t pgm_hi = (uint32_t)((shader_va >> 8) & 0xFFFFFFFFu);   /* fits 24 bits for canonical VAs */
 
     /* 1. PGM_HI (early). */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_PGM_HI, pgm_hi);
