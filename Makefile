@@ -216,6 +216,47 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+# v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
+# Used to differentiate "is this bug in our direct ioctls?" (spike =
+# libdrm-canonical, hangs identically) from "is shader-dispatch the
+# fix?" (store_spike = full Mesa preamble + real shader, also hangs).
+# Both are diagnostic — shipping mabda doesn't depend on them.
+build/libdrm_spike: deps/libdrm_spike.c
+	@mkdir -p build
+	cc -O2 -Wall -o $@ $< -ldrm_amdgpu
+
+build/libdrm_store_spike: deps/libdrm_store_spike.c
+	@mkdir -p build
+	cc -O2 -Wall -o $@ $< -ldrm_amdgpu
+
+.PHONY: test-libdrm-spike
+test-libdrm-spike: build/libdrm_spike
+	./build/libdrm_spike
+
+.PHONY: test-libdrm-store-spike
+test-libdrm-store-spike: build/libdrm_store_spike
+	./build/libdrm_store_spike
+
+# Post-reboot diagnostic baseline (Session 13 entry point). Runs Mesa
+# cl_probe (must work — proves GPU is alive), then both libdrm spikes
+# (must hang identically — confirms blocker is reproducible). Inspects
+# kernel reset count via journalctl. Order matters: cl_probe first so
+# we know GPU is healthy before we start triggering resets.
+.PHONY: gpu-baseline
+gpu-baseline: build/libdrm_spike build/libdrm_store_spike build/shader/cl_probe
+	@echo "==== Mesa cl_probe (must PASS, ~80 ms) ===="
+	time ./build/shader/cl_probe
+	@echo
+	@echo "==== libdrm_spike — bare WRITE_DATA (expect ECANCELED ~10 s) ===="
+	-time ./build/libdrm_spike
+	@echo
+	@echo "==== libdrm_store_spike — full shader-dispatch (expect ECANCELED) ===="
+	-time ./build/libdrm_store_spike
+	@echo
+	@echo "==== recent AMDGPU journal entries ===="
+	-journalctl --since "2 minutes ago" --no-pager 2>/dev/null | \
+		grep -iE "amdgpu|gpu reset" | tail -10
+
 # GPU-backed benchmarks. Parity with Rust v1.0's benches/benchmarks.rs
 # (13 benches). Reports both human-readable lines and CSV:name,ns rows
 # that scripts/bench-record.sh can append to bench-history.csv.

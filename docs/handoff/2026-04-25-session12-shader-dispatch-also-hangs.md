@@ -3,8 +3,39 @@
 **Date:** 2026-04-25 (late afternoon, after Session 11)
 **Branch:** `v3`
 **Working tree:** clean (Session 12 work committed)
-**Status:** B.3.d **still blocked.** Built `deps/libdrm_store_spike.c`
-— canonical libdrm_amdgpu submission with the **real GFX9 store
+**Status:** B.3.d **still blocked.**
+
+## QUICK START — post-reboot Session 13 entry
+
+Run from repo root:
+
+```bash
+# 1. Verify Cyrius toolchain (manifest pin: 5.6.13; tested under 5.6.43).
+cyrius --version
+
+# 2. Rebuild diagnostic binaries from committed sources.
+make build/libdrm_spike build/libdrm_store_spike build/native_compute_spike
+
+# 3. Baseline. Single command runs Mesa cl_probe (PASS expected) then
+# both libdrm spikes (HANG expected) and prints recent kernel events.
+make gpu-baseline
+
+# 4. If the post-reboot results match what's documented below, proceed
+# to the Step 2 / Step 3 experiments. If anything has changed (e.g.,
+# Mesa cl_probe also fails, or our spikes start working), STOP and
+# document — the situation is no longer the same.
+```
+
+**Cycle budget:** every spike run that hangs the GPU triggers a MODE2
+reset and degrades the kernel's recovery state. Allow at most **3
+direct-submission attempts per session** before rebooting again.
+Mesa cl_probe is the canary: if it stops working, the GPU is
+properly poisoned and we must reboot before further work.
+
+## Headline summary
+
+Built `deps/libdrm_store_spike.c` — canonical libdrm_amdgpu
+submission with the **real GFX9 store
 shader** (clang-compiled, byte-extracted from `build/shader/spike.o`)
 and the full Mesa-rusticl byte-exact compute preamble (Session 7
 pattern: PGM_HI/STATIC_THREAD_MGMT/CP_COHER/TA_CS_BC/PGM_LO/
@@ -102,38 +133,79 @@ shape. Mesa cl_probe works.
 
 ### Step 0 — reboot
 
-Required. The system has done ~25 GPU resets today; the kernel's
+Required. The system did ~25 GPU resets today; the kernel's
 guilt-tracking and reset-recovery state are likely poisoning fresh
 submissions.
 
 ### Step 1 — re-baseline
 
 ```bash
-./build/shader/cl_probe                    # ~80 ms, expect 0xDEADBEEF
-time ./build/libdrm_store_spike            # if 10 s TDR or fast ECANCELED — bug confirmed reproducible post-reboot
+make gpu-baseline
 ```
+
+That runs Mesa cl_probe (must PASS, ~80 ms), then both libdrm spikes
+(both expected to FAIL with ECANCELED), then dumps recent AMDGPU
+journal entries. If Mesa fails, the post-reboot state is wrong —
+debug that first. If both spikes pass, the bug self-resolved across
+reboots — celebrate, validate, update memories.
 
 ### Step 2 — try VM_ALWAYS_VALID
 
-Edit `deps/libdrm_store_spike.c`:
-`req.flags = AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;` (or `(1 << 6)`).
-Rebuild, run.
-
-### Step 3 — strace Mesa via ltrace
+Edit `deps/libdrm_store_spike.c`, change the `amdgpu_bo_alloc_request`
+flags from `0` to `AMDGPU_GEM_CREATE_VM_ALWAYS_VALID` (= `(1 << 6)`).
 
 ```bash
-ltrace -l libdrm_amdgpu.so.1 ./build/shader/cl_probe 2>/tmp/cl_probe.ltrace
+make build/libdrm_store_spike
+./build/libdrm_store_spike
 ```
 
-Inspect `/tmp/cl_probe.ltrace` for the exact libdrm call sequence.
-Compare to our `libdrm_store_spike.c` — find calls Mesa makes that
-we don't.
+If readback shows `0xDEADBEEF`: **bug found.** Mesa relies on
+VM_ALWAYS_VALID, our submissions don't get the same VM-side
+treatment without it. Port the flag back to direct-ioctl Cyrius
+(`native_bo_create_gtt` in `src/backend_native.cyr`) and rebuild
+the Cyrius spike. **STOP after one attempt** — if it still hangs,
+revert and proceed to Step 3.
 
-### Step 4 — if all else fails, fallback
+### Step 3 — ltrace Mesa to capture the working init sequence
+
+```bash
+ltrace -l 'libdrm_amdgpu*' -o /tmp/mesa.ltrace ./build/shader/cl_probe
+ltrace -l 'libdrm_amdgpu*' -o /tmp/spike.ltrace ./build/libdrm_store_spike
+diff /tmp/mesa.ltrace /tmp/spike.ltrace
+```
+
+ltrace intercepts only libdrm symbol calls (lighter than full strace);
+shouldn't perturb Mesa's submission timing. If it does perturb, build
+a tiny C program that *just* replicates Mesa's pre-CS query sequence
+(amdgpu_query_gpu_info, amdgpu_query_hw_ip_info × N, amdgpu_query_firmware_version,
+etc.) without any submit, observe its calls, then pre-pend those queries
+to our store_spike.
+
+The diff should reveal one or more libdrm calls Mesa makes during
+init that we don't — most likely candidates: `amdgpu_query_gpu_info`,
+`amdgpu_query_firmware_version`, `amdgpu_cs_ctx_stable_pstate`, or
+multiple `amdgpu_query_hw_ip_info` queries that prime per-IP state.
+
+### Step 4 — if Steps 2 and 3 fail, fall back
 
 Document Cezanne as known-blocked, ship v3 GA via wgpu-native, file an
-upstream issue. The mabda v3 native backend can revisit when we have
-gfx10+ hardware available.
+upstream issue (linking this handoff and the Session 11 coredump).
+The mabda v3 native backend can revisit when we have gfx10+ hardware
+available.
+
+Specifically:
+- Update `docs/proposals/v3-native-api-principles.md` to mark Phase
+  B.3.d as ⚠ blocked-on-Cezanne; document the wgpu fallback path.
+- Update CHANGELOG with a "Known issue: native backend non-functional
+  on AMD APUs gfx9–gfx9c (Renoir/Cezanne); use wgpu backend".
+- File an issue at `docs/issues/2026-04-25-cezanne-direct-cs-blocked.md`
+  with full repro steps + coredump excerpt.
+
+Alternative: get RDNA hardware (gfx10+) — any RX 5500 or newer dGPU,
+or a Phoenix/Strix/Krackan APU — and retest. If the bug is
+Cezanne-firmware-specific, the native backend may "just work" on
+newer hardware. That's a relatively cheap acquisition compared to
+weeks of Cezanne ISA archeology.
 
 ## Supporting material
 
