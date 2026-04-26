@@ -71,35 +71,46 @@
 #define GFX9_COMPUTE_PGM_RSRC1_MIN  0x002C0040u   /* see backend_native.cyr */
 #define GFX9_DISPATCH_INITIATOR     0x45u         /* COMPUTE_SHADER_EN | FORCE_START_AT_000 */
 
-/* PM4 emit helpers. `p` is a uint32_t* cursor; macros advance it. */
+/* PM4 emit helpers. `p` is a uint32_t* cursor; macros advance it.
+ *
+ * Session 14 fix: PACKET3 count_minus_1 = (body_dws - 1). Body_dws is the
+ * number of DWs *after* the header. Pre-Session-14 this file passed
+ * `body_dws` (one too high) for every helper, which the CP firmware partly
+ * tolerated by silently consuming +1 DW per packet — masked the bug for
+ * Sessions 7-13. Adding the WRITE_DATA + DMA_DATA packets at correct count
+ * (they match Mesa byte-for-byte) desynced the mixed convention IB and
+ * tripped "Illegal opcode" on Cezanne. Verified against Mesa AMD_DEBUG=ib
+ * dump headers in build/strace/cl_probe_ib.log.
+ */
 static inline uint32_t *pm4_set_sh_reg_one(uint32_t *p, uint32_t reg_byte, uint32_t v) {
-    *p++ = PACKET3(IT_SET_SH_REG, 2);                          /* count=2 → 3 body DWs */
+    *p++ = PACKET3(IT_SET_SH_REG, 1);                          /* body=2 (offset+value) */
     *p++ = (reg_byte - PM4_SH_REG_BASE) / 4;
     *p++ = v;
     return p;
 }
 static inline uint32_t *pm4_set_sh_reg_n(uint32_t *p, uint32_t reg_byte, unsigned n, const uint32_t *vals) {
-    *p++ = PACKET3(IT_SET_SH_REG, n + 1);                      /* offset + n values */
+    *p++ = PACKET3(IT_SET_SH_REG, n);                          /* body=n+1 (offset + n values) */
     *p++ = (reg_byte - PM4_SH_REG_BASE) / 4;
     for (unsigned i = 0; i < n; i++) *p++ = vals[i];
     return p;
 }
 static inline uint32_t *pm4_set_uconfig_one(uint32_t *p, uint32_t reg_byte, uint32_t v) {
-    *p++ = PACKET3(IT_SET_UCONFIG_REG, 2);
+    *p++ = PACKET3(IT_SET_UCONFIG_REG, 1);                     /* body=2 */
     *p++ = (reg_byte - PM4_UCONFIG_REG_BASE) / 4;
     *p++ = v;
     return p;
 }
 static inline uint32_t *pm4_set_uconfig_pair(uint32_t *p, uint32_t reg_byte, uint32_t lo, uint32_t hi) {
-    *p++ = PACKET3(IT_SET_UCONFIG_REG, 3);
+    *p++ = PACKET3(IT_SET_UCONFIG_REG, 2);                     /* body=3 (offset + lo + hi) */
     *p++ = (reg_byte - PM4_UCONFIG_REG_BASE) / 4;
     *p++ = lo;
     *p++ = hi;
     return p;
 }
 static inline uint32_t *pm4_acquire_mem_full(uint32_t *p) {
-    /* PKT3 ACQUIRE_MEM with shader_type=2 in the predicate byte (Mesa pattern). */
-    *p++ = PACKET3(IT_ACQUIRE_MEM, 6) | 0x02;                  /* 0xC0055802 */
+    /* PKT3 ACQUIRE_MEM with shader_type=2 in the predicate byte (Mesa pattern).
+     * Header should match Mesa byte-exact: 0xC0055802. */
+    *p++ = PACKET3(IT_ACQUIRE_MEM, 5) | 0x02;                  /* body=6 → 0xC0055802 */
     *p++ = 0xA8C40000u;                                        /* coher_cntl: full L2/I/K invalidate */
     *p++ = 0xFFFFFFFFu;                                        /* coher_size_lo */
     *p++ = 0x00FFFFFFu;                                        /* coher_size_hi (24-bit) */
@@ -109,8 +120,9 @@ static inline uint32_t *pm4_acquire_mem_full(uint32_t *p) {
     return p;
 }
 static inline uint32_t *pm4_dispatch_direct(uint32_t *p, uint32_t x, uint32_t y, uint32_t z) {
-    /* Low byte of header = shader_type (2 = compute). */
-    *p++ = PACKET3(IT_DISPATCH_DIRECT, 4) | 0x02;              /* 0xC0031502 */
+    /* Low byte of header = shader_type (2 = compute). Header matches Mesa byte-exact:
+     * 0xC0031502 (count_minus_1 = 3 → body = 4 DWs: x, y, z, initiator). */
+    *p++ = PACKET3(IT_DISPATCH_DIRECT, 3) | 0x02;              /* body=4 → 0xC0031502 */
     *p++ = x;
     *p++ = y;
     *p++ = z;
@@ -241,6 +253,15 @@ int main(void) {
     p = pm4_set_uconfig_pair(p, R_TA_CS_BC_BASE_ADDR,
                              (uint32_t)((shader_va >> 8) & 0xFFFFFFFFu),
                              (uint32_t)((shader_va >> 40) & 0xFFu));
+    /* 5a. WRITE_DATA zero-fence (Mesa cl_probe IB byte-exact, dump line 32-38).
+     * 4-DW WRITE_DATA(MEM, ENGINE_SEL=ME, WR_CONFIRM=1) → kernel-magic fence VA
+     * 0xFFFF800100600300 is a reserved sync VA the firmware accepts without a
+     * userspace BO mapping. Acts as a CP-side serialization barrier. */
+    *p++ = PACKET3(0x37, 3);
+    *p++ = 0x00100500u;
+    *p++ = 0x00600300u;        /* fence_va lo */
+    *p++ = 0xFFFF8001u;        /* fence_va hi */
+    *p++ = 0x00000000u;        /* zero-fence value */
     /* 6. PGM_LO. */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_PGM_LO, pgm_lo);
     /* 7. PGM_RSRC1 + RSRC2 as a pair. RSRC2 = 0x8 → USER_SGPR=4 (loads s0..s3). */
@@ -264,6 +285,17 @@ int main(void) {
     }
     /* 11. ACQUIRE_MEM (mandatory cache invalidate before dispatch on GFX9). */
     p = pm4_acquire_mem_full(p);
+    /* 11a. DMA_DATA NOWHERE sync (Mesa cl_probe IB byte-exact, dump line 106-117).
+     * 7-DW DMA_DATA(DST_SEL=NOWHERE, BYTE_COUNT=96, RAW_WAIT=0). Fetches 96 B
+     * via TC L2 from kernel-magic VA 0xFFFF800000000000 and discards — forces
+     * an L2 fence between ACQUIRE_MEM and the dispatch. */
+    *p++ = PACKET3(0x50, 5);
+    *p++ = 0x60200000u;        /* word0: ENGINE=ME, DST_SEL=NOWHERE, SRC_SEL=SRC_ADDR_TC_L2 */
+    *p++ = 0x00000000u;        /* SRC_ADDR_LO */
+    *p++ = 0xFFFF8000u;        /* SRC_ADDR_HI */
+    *p++ = 0x00000000u;        /* DST_ADDR_LO */
+    *p++ = 0xFFFF8000u;        /* DST_ADDR_HI */
+    *p++ = 0x80000060u;        /* COMMAND: BYTE_COUNT=0x60, DISABLE_WR_CONFIRM=1 */
     /* 12. RESOURCE_LIMITS = 0x140 (WAVES_PER_SH=320). Zero stalls forever. */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_RESOURCE_LIMITS, 0x140);
     /* 13. NUM_THREAD_X/Y/Z = 1, 1, 1. */
@@ -273,10 +305,13 @@ int main(void) {
     }
     /* 14. DISPATCH_DIRECT (1, 1, 1). */
     p = pm4_dispatch_direct(p, 1, 1, 1);
-    /* Pad to IB_DW_TOTAL DWs. */
-    p = pm4_nop_pad(p, ib, IB_DW_TOTAL);
+    /* No NOP padding — Mesa's IB1 (74 DWs) submits exact packet size with no
+     * trailing fill. Our pm4_nop_pad had an off-by-one in the count field that
+     * tripped "Illegal opcode" after the WRITE_DATA + DMA_DATA additions made
+     * the dispatch progress far enough for the CP to reach the NOPs. */
+    unsigned ib_dws_used = (unsigned)(p - ib);
 
-    fprintf(stderr, "pm4 IB built: %ld DWs (target %d)\n", p - ib, IB_DW_TOTAL);
+    fprintf(stderr, "pm4 IB built: %u DWs\n", ib_dws_used);
 
     /* ---- BO list: IB, shader, output, stub. ---- */
     amdgpu_bo_handle bos[4] = { ib_bo, shader_bo, out_bo, stub_bo };
@@ -288,7 +323,7 @@ int main(void) {
      * Session 11 confirmed runs Mesa OpenCL successfully). ---- */
     struct amdgpu_cs_ib_info ib_info = {
         .ib_mc_address = ib_va,
-        .size          = IB_DW_TOTAL,
+        .size          = ib_dws_used,
         .flags         = 0,
     };
     struct amdgpu_cs_request submit_req = {
