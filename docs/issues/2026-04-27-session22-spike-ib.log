@@ -1,0 +1,76 @@
+Session 22 — libdrm_store_spike IB hex dump
+HEAD: 6e0ea08 (Session 21 USER_DATA_0/1 count=2 packing fix in)
+Run: cold-boot, fence seq=4/5, comp_1.1.0
+Result: syncobj timeout 5145 ms; out[0] = 0xBAADF00D
+Fault: 0x66d000 / CPC / vmid:0 / RW=1 / PERM=0x5 (PTE invalid + write denied)
+
+VAs:
+  ib_va     = 0x0000000100000000
+  shader_va = 0xffff800100000000   (AMDGPU_VA_RANGE_HIGH)
+  out_va    = 0x0000000100001000
+  stub_va   = 0x0000000100002000
+
+IB DUMP (75 DWs, 8 DWs/line):
+0000: c0017600 0000020d 00000080 c0027600 00000216 ffffffff 00000000 c0027600
+0008: 00000219 00000000 00000000 c0017900 0000007b 00000000 c0027900 00000380
+0010: 01004400 00000080 c0033700 00100500 00600300 ffff8001 00000000 c0017600
+0018: 0000020c 01000000 c0027600 00000212 002c0040 00000008 c0017600 00000218
+0020: 00000100 c0027600 00000242 00002000 00000001 c0027600 00000240 00001000
+0028: 00000001 c0055802 a8c40000 ffffffff 00ffffff 00000000 00000000 0000000a
+0030: c0055000 60200000 00000000 ffff8000 00000000 ffff8000 80000060 c0017600
+0038: 00000215 00000140 c0037600 00000207 00000001 00000001 00000001 c0031502
+0040: 00000001 00000001 00000001 00000045 c0055000 e0300000 00000000 00000000
+0048: 00000000 00000000 00000000
+
+Diff vs Mesa cl_probe IB1 (74 DWs, build/strace/cl_probe_ib.log):
+
+  DW    OURS                MESA                FIELD
+  0x19  01000000            00000000            COMPUTE_PGM_LO    (we have shader_va offset 0x100000000; Mesa at 0x0)
+  0x21  c0027600            c0017600            USER_DATA_0 packet header (Mesa: count=1, single value)
+  0x23  00200000            00200000            USER_DATA_2       (matches via byte-luck — actually we have stub_va_lo=0x00002000 wait...)
+
+  Wait: at 0x23 ours = 00002000 (stub_va_lo), Mesa = 00200000.
+  Realigning the DIFF — the headers are at:
+    0x21 = SET_SH_REG header for USER_DATA_2
+    0x22 = USER_DATA_2 offset
+    0x23 = USER_DATA_2 value
+    0x24 = USER_DATA_3 value
+
+  DW    OURS         MESA         FIELD
+  0x23  00002000     00200000     USER_DATA_2  (we: stub_va_lo; Mesa: kernel arg buf descriptor low)
+  0x24  00000001     00000000     USER_DATA_3  (we: stub_va_hi; Mesa: 0)
+  0x25  c0027600     c0017600     USER_DATA_0 SET_SH_REG header (count_minus_1: us=2, Mesa=1)
+  0x27  00001000     00200040     USER_DATA_0  (we: out_va_lo; Mesa: kernel arg buf entry packed)
+  0x28  00000001     —            USER_DATA_1  (we set; Mesa does NOT)
+
+After USER_DATA_0/1 we are 1 DW longer than Mesa (ours 75 DW total, Mesa 74).
+
+Decoding our PGM_LO/HI:
+  shader_va = 0xFFFF800100000000
+  PGM_HI    = (shader_va >> 40) & 0xFF       = 0x80
+  PGM_LO    = (shader_va >>  8) & 0xFFFFFFFF = 0x01000000
+  Reconstruct = (0x80 << 40) | (0x01000000 << 8) = 0xFFFF800100000000  ✓
+
+Decoding Mesa PGM_LO/HI:
+  PGM_HI = 0x80, PGM_LO = 0
+  Reconstruct = 0xFFFF800000000000  (their shader allocated at exactly the high-canonical base)
+
+Both addresses are valid upper-canonical, both should be mapped by their
+respective allocators. Different absolute addresses, both reachable.
+
+dmesg fault summary:
+  amdgpu: ring comp_1.1.0 timeout, signaled seq=4, emitted seq=5
+  amdgpu: Starting comp_1.1.0 ring reset
+  amdgpu: fail to wait on hqd deactive
+  amdgpu: Ring comp_1.1.0 reset failed
+  amdgpu: GPU reset begin!. Source:  1
+  amdgpu: MODE2 reset
+  amdgpu: GPU reset succeeded, trying to resume
+  amdgpu: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:0 pasid:0)
+  amdgpu:   in page starting at address 0x000000000066d000 from IH client 0x1b (UTCL2)
+  amdgpu: VM_L2_PROTECTION_FAULT_STATUS:0x00040A50
+  amdgpu:          Faulty UTCL2 client ID: CPC (0x5)
+  amdgpu:          PERMISSION_FAULTS: 0x5    (PTE invalid + write denied)
+  amdgpu:          RW: 0x1                   (write attempt)
+  amdgpu: GPU reset(1) succeeded!
+  amdgpu: [drm] device wedged, but recovered through reset

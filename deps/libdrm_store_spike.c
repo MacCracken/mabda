@@ -430,14 +430,26 @@ int main(void) {
     r = amdgpu_cs_create_syncobj(dev, &signal_syncobj);
     CHECK(r, "amdgpu_cs_create_syncobj");
 
+    /* Session 22 finding: 0x66d000 fault still fires on cold boot, even with
+     * Session 21's USER_DATA packing fix. Hypothesis to test in Session 23:
+     * the fault is ring-specific (some MEC pipe/queue's MQD lives at a VA
+     * that shadows 0x66d000 in vmid 0). Allow forcing ring + ip_instance
+     * from env vars so we can sweep the matrix without recompiling. */
+    const char *env_ring     = getenv("SPIKE_RING");
+    const char *env_instance = getenv("SPIKE_IP_INSTANCE");
+    uint32_t spike_ring     = env_ring     ? (uint32_t)atoi(env_ring)     : 0;
+    uint32_t spike_instance = env_instance ? (uint32_t)atoi(env_instance) : 0;
+    fprintf(stderr, "submit: ip_type=COMPUTE ip_instance=%u ring=%u\n",
+            spike_instance, spike_ring);
+
     struct drm_amdgpu_cs_chunk_ib ib_chunk_data = {
         ._pad        = 0,
         .flags       = 0,
         .va_start    = ib_va,
         .ib_bytes    = ib_dws_used * 4u,
         .ip_type     = AMDGPU_HW_IP_COMPUTE,
-        .ip_instance = 0,
-        .ring        = 0,
+        .ip_instance = spike_instance,
+        .ring        = spike_ring,
     };
     struct drm_amdgpu_cs_chunk_sem sem_chunk_data = { .handle = signal_syncobj };
 
