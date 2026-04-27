@@ -248,11 +248,23 @@ int main(void) {
     }
     /* 4. CP_COHER_START_DELAY = 0. */
     p = pm4_set_uconfig_one(p, R_CP_COHER_START_DELAY, 0);
-    /* 5. TA_CS_BC_BASE_ADDR + _HI — border-color base; any valid shader-space VA works
-     * (SCRATCH_EN=0 means HW never reads it). Use the shader VA. */
+    /* 5. TA_CS_BC_BASE_ADDR + _HI — border-color base.
+     *
+     * Session 16 fix: previously pointed at shader_va, on the (wrong) belief
+     * that "SCRATCH_EN=0 means HW never reads it." On Cezanne the CPC walks
+     * the BC base address during dispatch setup regardless — pointing it at
+     * our 4 KB shader BO meant CPC interpreted shader bytes as descriptors
+     * and produced a derived write to ~0x66d000, tripping a UTCL2 fault
+     * (Sessions 14-15 attempt 1+2, identical address every time).
+     *
+     * Match Mesa cl_probe IB byte-exact (`AMD_DEBUG=ib` dump lines 27-31):
+     *   LO = 0x01004400, HI = 0x00000080
+     *   → reconstructed VA = (0x80 << 40) | (0x01004400 << 8) = 0xFFFF800100440000
+     * That is the kernel-reserved magic VA the firmware accepts as a no-op
+     * BC base without an actual BO mapping. */
     p = pm4_set_uconfig_pair(p, R_TA_CS_BC_BASE_ADDR,
-                             (uint32_t)((shader_va >> 8) & 0xFFFFFFFFu),
-                             (uint32_t)((shader_va >> 40) & 0xFFu));
+                             0x01004400u,   /* LO: matches Mesa byte-exact */
+                             0x00000080u);  /* HI: matches Mesa byte-exact */
     /* 5a. WRITE_DATA zero-fence (Mesa cl_probe IB byte-exact, dump line 32-38).
      * 4-DW WRITE_DATA(MEM, ENGINE_SEL=ME, WR_CONFIRM=1) → kernel-magic fence VA
      * 0xFFFF800100600300 is a reserved sync VA the firmware accepts without a
@@ -305,6 +317,20 @@ int main(void) {
     }
     /* 14. DISPATCH_DIRECT (1, 1, 1). */
     p = pm4_dispatch_direct(p, 1, 1, 1);
+    /* 15. Trailing DMA_DATA CP_SYNC=1 BYTE_COUNT=0 terminator (Mesa cl_probe IB
+     * byte-exact, dump line 165-186). 7-DW DMA_DATA(CP_SYNC=1, ENGINE=ME,
+     * DST_SEL=DST_ADDR_TC_L2, SRC_SEL=SRC_ADDR_TC_L2, BYTE_COUNT=0) — a no-op
+     * transfer that forces the CP to wait for outstanding work before
+     * signaling the user fence. Session 17 attempt 1: closes a Mesa delta;
+     * unlikely to fix the 0x66d000 CPC setup fault on its own (fault is
+     * pre-dispatch), but eliminates one variable. */
+    *p++ = PACKET3(0x50, 5);                                /* DMA_DATA, body=6 */
+    *p++ = 0xE0300000u;                                     /* word0: CP_SYNC=1 */
+    *p++ = 0x00000000u;                                     /* SRC_LO */
+    *p++ = 0x00000000u;                                     /* SRC_HI */
+    *p++ = 0x00000000u;                                     /* DST_LO */
+    *p++ = 0x00000000u;                                     /* DST_HI */
+    *p++ = 0x00000000u;                                     /* COMMAND: BYTE_COUNT=0 */
     /* No NOP padding — Mesa's IB1 (74 DWs) submits exact packet size with no
      * trailing fill. Our pm4_nop_pad had an off-by-one in the count field that
      * tripped "Illegal opcode" after the WRITE_DATA + DMA_DATA additions made
@@ -312,6 +338,19 @@ int main(void) {
     unsigned ib_dws_used = (unsigned)(p - ib);
 
     fprintf(stderr, "pm4 IB built: %u DWs\n", ib_dws_used);
+
+    /* Session 17 diagnostic: dump IB hex so we can byte-exact diff against
+     * Mesa AMD_DEBUG=ib output. 8 DWs per line, hex offset on the left.
+     * Lossless: no IB content change. Always emit; cheap. */
+    fprintf(stderr, "---- IB DUMP (%u DWs) ----\n", ib_dws_used);
+    for (unsigned i = 0; i < ib_dws_used; i += 8) {
+        fprintf(stderr, "%04x:", i);
+        for (unsigned j = i; j < i + 8 && j < ib_dws_used; j++) {
+            fprintf(stderr, " %08x", ib[j]);
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "---- IB DUMP END ----\n");
 
     /* ---- BO list: IB, shader, output, stub. ---- */
     amdgpu_bo_handle bos[4] = { ib_bo, shader_bo, out_bo, stub_bo };
