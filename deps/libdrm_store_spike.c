@@ -147,7 +147,15 @@ static inline uint32_t *pm4_nop_pad(uint32_t *p, uint32_t *base, unsigned target
  */
 /* Bytes extracted byte-exact from build/shader/spike.o .text section
  * (xxd output: ff00 80be 0000 0010 8000 81be ff00 83be efbe adde c000 42c0
- *              0000 0000 7fc0 8cbf 0000 81bf). */
+ *              0000 0000 7fc0 8cbf 0000 81bf).
+ *
+ * Session 18 attempt 5 swapped this for a bare `s_endpgm` (2-DW) and the
+ * 0x66d000 CPC fault RETURNED. So the fault is in CPC's post-dispatch
+ * cleanup, not the dispatch setup — attempts 3-4 only hid it behind a
+ * shader hang (USER_DATA values were wrong, so global_store stalled in
+ * s_waitcnt and the wave never completed cleanly). Reverted to the real
+ * 9-DW store kernel for Session 19's investigation of CPC CSA / queue
+ * context setup differences vs Mesa. */
 static const uint32_t spike_shader_code[9] = {
     0xBE8000FFu,    /* part 1: v_mov_b32_e32 v0, s0 (VOP1 with 64-bit encoding form) */
     0x10000000u,    /* part 2                                                        */
@@ -291,18 +299,30 @@ int main(void) {
     }
     /* 8. TMPRING_SIZE = 0x100. Mesa always sets this even when scratch is unused. */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_TMPRING_SIZE, 0x100);
-    /* 9. USER_DATA_2/3 — high half of scratch V# (any valid GTT VA satisfies the fetch). */
+    /* 9-10. Session 18 final state: real values, Mesa-style packet shapes.
+     *
+     * Hypothesis E was: the count=2 SET_SH_REG for USER_DATA_0/1 triggered
+     * the 0x66d000 CPC fault. Attempts 3 and 4 ran without that fault and
+     * SEEMED to confirm it. Attempt 5 falsified it: replacing the store
+     * kernel with bare s_endpgm brought the fault back even with these
+     * Mesa-style packet shapes. So the fault is in CPC's *post-dispatch
+     * cleanup* (CSA save / wave fini), and attempts 3-4 only hid it
+     * because the global_store hung in s_waitcnt — wave never completed.
+     *
+     * Keeping these Mesa-style packet shapes for Session 19 — they are
+     * Mesa-byte-exact in IB structure, which is the right baseline.
+     * Investigation pivots to KERNEL queue setup: amdgpu_cs_ctx_create
+     * vs whatever Mesa's rusticl uses, CSA region setup, queue init.
+     */
     {
         uint32_t v[2] = { (uint32_t)(stub_va & 0xFFFFFFFFu),
                           (uint32_t)((stub_va >> 32) & 0xFFFFFFFFu) };
         p = pm4_set_sh_reg_n(p, R_COMPUTE_USER_DATA_0 + 8 /* USER_DATA_2 */, 2, v);
     }
-    /* 10. USER_DATA_0/1 — output VA (what the shader's s0,s1 will be). */
-    {
-        uint32_t v[2] = { (uint32_t)(out_va & 0xFFFFFFFFu),
-                          (uint32_t)((out_va >> 32) & 0xFFFFFFFFu) };
-        p = pm4_set_sh_reg_n(p, R_COMPUTE_USER_DATA_0, 2, v);
-    }
+    p = pm4_set_sh_reg_one(p, R_COMPUTE_USER_DATA_0,
+                           (uint32_t)(out_va & 0xFFFFFFFFu));
+    p = pm4_set_sh_reg_one(p, R_COMPUTE_USER_DATA_0 + 4 /* USER_DATA_1 */,
+                           (uint32_t)((out_va >> 32) & 0xFFFFFFFFu));
     /* 11. ACQUIRE_MEM (mandatory cache invalidate before dispatch on GFX9). */
     p = pm4_acquire_mem_full(p);
     /* 11a. DMA_DATA NOWHERE sync (Mesa cl_probe IB byte-exact, dump line 106-117).
