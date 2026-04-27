@@ -319,10 +319,14 @@ int main(void) {
                           (uint32_t)((stub_va >> 32) & 0xFFFFFFFFu) };
         p = pm4_set_sh_reg_n(p, R_COMPUTE_USER_DATA_0 + 8 /* USER_DATA_2 */, 2, v);
     }
-    p = pm4_set_sh_reg_one(p, R_COMPUTE_USER_DATA_0,
-                           (uint32_t)(out_va & 0xFFFFFFFFu));
-    p = pm4_set_sh_reg_one(p, R_COMPUTE_USER_DATA_0 + 4 /* USER_DATA_1 */,
-                           (uint32_t)((out_va >> 32) & 0xFFFFFFFFu));
+    /* Session 21: pack USER_DATA_0/1 as a single count=2 SET_SH_REG packet
+     * (matches Mesa IB1 byte-exact for the USER_DATA_0/1 emit; was previously
+     * two count=1 packets — the only remaining packet-shape delta). */
+    {
+        uint32_t v[2] = { (uint32_t)(out_va & 0xFFFFFFFFu),
+                          (uint32_t)((out_va >> 32) & 0xFFFFFFFFu) };
+        p = pm4_set_sh_reg_n(p, R_COMPUTE_USER_DATA_0, 2, v);
+    }
     /* 11. ACQUIRE_MEM (mandatory cache invalidate before dispatch on GFX9). */
     p = pm4_acquire_mem_full(p);
     /* 11a. DMA_DATA NOWHERE sync (Mesa cl_probe IB byte-exact, dump line 106-117).
@@ -380,48 +384,106 @@ int main(void) {
     }
     fprintf(stderr, "---- IB DUMP END ----\n");
 
-    /* ---- BO list: IB, shader, output, stub. ---- */
-    amdgpu_bo_handle bos[4] = { ib_bo, shader_bo, out_bo, stub_bo };
-    amdgpu_bo_list_handle bo_list;
-    r = amdgpu_bo_list_create(dev, 4, bos, NULL, &bo_list);
-    CHECK(r, "amdgpu_bo_list_create");
+    /* ---- Session 20: modern submit path matching Mesa cl_probe ioctl shape.
+     *
+     * Replaces legacy amdgpu_bo_list_create + amdgpu_cs_submit + amdgpu_cs_query_fence_status
+     * with amdgpu_cs_submit_raw2 + chunks [IB, BO_HANDLES, SYNCOBJ_OUT] + amdgpu_cs_syncobj_wait.
+     *
+     * Hypothesis (from Session 19 strace diff): the legacy path causes the kernel
+     * to allocate a user-fence VA whose write target the CPC tries to populate
+     * after dispatch completion — and on Cezanne kernel 6.18.24 that VA isn't
+     * cleanly mapped, producing the recurring 0x66d000 UTCL2 fault. The modern
+     * path uses syncobj-fd signaling instead, so no kernel user-fence VA is
+     * involved. cl_probe (Mesa rusticl + radeonsi) uses this path and works.
+     */
 
-    /* ---- Submit on COMPUTE ring (matches Mesa cl_probe; the ring that
-     * Session 11 confirmed runs Mesa OpenCL successfully). ---- */
-    struct amdgpu_cs_ib_info ib_info = {
-        .ib_mc_address = ib_va,
-        .size          = ib_dws_used,
-        .flags         = 0,
+    /* Resolve KMS handles for BO_HANDLES chunk. */
+    uint32_t ib_kh, shader_kh, out_kh, stub_kh;
+    r = amdgpu_bo_export(ib_bo,     amdgpu_bo_handle_type_kms, &ib_kh);     CHECK(r, "bo_export ib");
+    r = amdgpu_bo_export(shader_bo, amdgpu_bo_handle_type_kms, &shader_kh); CHECK(r, "bo_export shader");
+    r = amdgpu_bo_export(out_bo,    amdgpu_bo_handle_type_kms, &out_kh);    CHECK(r, "bo_export out");
+    r = amdgpu_bo_export(stub_bo,   amdgpu_bo_handle_type_kms, &stub_kh);   CHECK(r, "bo_export stub");
+
+    struct drm_amdgpu_bo_list_entry bo_entries[4] = {
+        { .bo_handle = ib_kh,     .bo_priority = 0 },
+        { .bo_handle = shader_kh, .bo_priority = 0 },
+        { .bo_handle = out_kh,    .bo_priority = 0 },
+        { .bo_handle = stub_kh,   .bo_priority = 0 },
     };
-    struct amdgpu_cs_request submit_req = {
-        .flags         = 0,
-        .ip_type       = AMDGPU_HW_IP_COMPUTE,
-        .ip_instance   = 0,
-        .ring          = 0,
-        .resources     = bo_list,
-        .number_of_ibs = 1,
-        .ibs           = &ib_info,
+
+    /* The kernel CS BO_HANDLES parser treats chunk_data as
+     * `struct drm_amdgpu_bo_list_in` and dereferences `bo_info_ptr` to
+     * read the entries. Passing the entry array directly desyncs the
+     * struct fields — bo_number gets read from entry[1].bo_handle and
+     * lookup fails with ENOENT. (Matches the kernel path used by
+     * DRM_IOCTL_AMDGPU_BO_LIST so it's the same struct shape.) */
+    struct drm_amdgpu_bo_list_in bo_handles_data = {
+        .operation    = 0,
+        .list_handle  = 0,
+        .bo_number    = 4,
+        .bo_info_size = (uint32_t)sizeof(struct drm_amdgpu_bo_list_entry),
+        .bo_info_ptr  = (uint64_t)(uintptr_t)bo_entries,
     };
+
+    /* Output syncobj — kernel signals it when the IB completes. */
+    uint32_t signal_syncobj = 0;
+    r = amdgpu_cs_create_syncobj(dev, &signal_syncobj);
+    CHECK(r, "amdgpu_cs_create_syncobj");
+
+    struct drm_amdgpu_cs_chunk_ib ib_chunk_data = {
+        ._pad        = 0,
+        .flags       = 0,
+        .va_start    = ib_va,
+        .ib_bytes    = ib_dws_used * 4u,
+        .ip_type     = AMDGPU_HW_IP_COMPUTE,
+        .ip_instance = 0,
+        .ring        = 0,
+    };
+    struct drm_amdgpu_cs_chunk_sem sem_chunk_data = { .handle = signal_syncobj };
+
+    struct drm_amdgpu_cs_chunk chunks[3] = {
+        { .chunk_id   = AMDGPU_CHUNK_ID_IB,
+          .length_dw  = (uint32_t)(sizeof(ib_chunk_data) / 4),
+          .chunk_data = (uint64_t)(uintptr_t)&ib_chunk_data },
+        { .chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES,
+          .length_dw  = (uint32_t)(sizeof(bo_handles_data) / 4),
+          .chunk_data = (uint64_t)(uintptr_t)&bo_handles_data },
+        { .chunk_id   = AMDGPU_CHUNK_ID_SYNCOBJ_OUT,
+          .length_dw  = (uint32_t)(sizeof(sem_chunk_data) / 4),
+          .chunk_data = (uint64_t)(uintptr_t)&sem_chunk_data },
+    };
+
+    uint64_t seq_no = 0;
     uint64_t t0 = mono_ms();
-    r = amdgpu_cs_submit(ctx, 0, &submit_req, 1);
-    CHECK(r, "amdgpu_cs_submit");
+    r = amdgpu_cs_submit_raw2(dev, ctx, 0 /* no bo_list_handle */, 3, chunks, &seq_no);
+    CHECK(r, "amdgpu_cs_submit_raw2");
 
-    struct amdgpu_cs_fence fence = {
-        .context = ctx, .ip_type = AMDGPU_HW_IP_COMPUTE,
-        .ip_instance = 0, .ring = 0, .fence = submit_req.seq_no,
-    };
-    uint32_t expired = 0;
-    r = amdgpu_cs_query_fence_status(&fence, 5000000000ull, 0, &expired);
-    CHECK(r, "amdgpu_cs_query_fence_status");
-    if (!expired) DIE("fence not expired (timeout) after %" PRIu64 " ms", mono_ms() - t0);
-    fprintf(stderr, "submit-to-fence: %" PRIu64 " ms\n", mono_ms() - t0);
+    /* DRM_IOCTL_SYNCOBJ_WAIT takes an *absolute* CLOCK_MONOTONIC nsec
+     * deadline, not a relative duration. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t deadline_ns = (int64_t)now.tv_sec * 1000000000ll
+                        + (int64_t)now.tv_nsec
+                        + 5000000000ll /* 5 s */;
+
+    uint32_t first_signaled = 0;
+    r = amdgpu_cs_syncobj_wait(dev, &signal_syncobj, 1,
+                               deadline_ns, 0 /* flags */, &first_signaled);
+    if (r == 0) {
+        fprintf(stderr, "submit-to-syncobj-signal: %" PRIu64 " ms\n", mono_ms() - t0);
+    } else {
+        /* Per Session 18: even on timeout the wave may have completed
+         * before the post-dispatch CPC fault — read out[0] to find out. */
+        fprintf(stderr, "syncobj_wait: %d (%s) after %" PRIu64 " ms — checking out[0] anyway\n",
+                r, strerror(-r), mono_ms() - t0);
+    }
 
     uint32_t got = *(uint32_t *)out_cpu;
     printf("out[0] = 0x%08X (want 0xDEADBEEF) — %s\n",
            got, got == 0xDEADBEEFu ? "PASS" : "FAIL");
 
     /* Best-effort teardown. */
-    amdgpu_bo_list_destroy(bo_list);
+    amdgpu_cs_destroy_syncobj(dev, signal_syncobj);
 #define FREE_BO(name) do { \
     amdgpu_bo_cpu_unmap(name##_bo); \
     amdgpu_bo_va_op(name##_bo, 0, 4096, name##_va, 0, AMDGPU_VA_OP_UNMAP); \
