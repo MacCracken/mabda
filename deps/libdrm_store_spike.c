@@ -197,19 +197,27 @@ int main(void) {
     uint64_t ib_va, shader_va, out_va, stub_va;
     amdgpu_va_handle ib_vah, shader_vah, out_vah, stub_vah;
 
-#define ALLOC_BO(name) do { \
+#define ALLOC_BO(name, va_flags) do { \
     r = amdgpu_bo_alloc(dev, &req, &name##_bo); CHECK(r, "alloc " #name); \
     r = amdgpu_va_range_alloc(dev, amdgpu_gpu_va_range_general, 4096, 4096, 0, \
-                              &name##_va, &name##_vah, 0); CHECK(r, "va_range_alloc " #name); \
+                              &name##_va, &name##_vah, (va_flags)); CHECK(r, "va_range_alloc " #name); \
     r = amdgpu_bo_va_op(name##_bo, 0, 4096, name##_va, 0, AMDGPU_VA_OP_MAP); CHECK(r, "va_op MAP " #name); \
     r = amdgpu_bo_cpu_map(name##_bo, &name##_cpu); CHECK(r, "cpu_map " #name); \
     memset(name##_cpu, 0, 4096); \
 } while (0)
 
-    ALLOC_BO(ib);
-    ALLOC_BO(shader);
-    ALLOC_BO(out);
-    ALLOC_BO(stub);
+    ALLOC_BO(ib,     0);
+    /* Session 17 attempt 2: place shader BO at upper-canonical VA
+     * (AMDGPU_VA_RANGE_HIGH = 0x2) to match Mesa's IB byte-exact for the
+     * COMPUTE_PGM_LO/HI deltas (Mesa: PGM_HI=0x80 PGM_LO=0 → shader at
+     * 0xFFFF800000000000+; ours was at user 0x100001000 → PGM_HI=0
+     * PGM_LO=0x01000010). Hypothesis: CPC's internal CSA / wave-init
+     * write path is gated on shader-VA-half (bit 47 = 1), and our
+     * lower-canonical placement leaves CPC pointed at an uninitialized
+     * default that derives the 0x66d000 fault address. */
+    ALLOC_BO(shader, AMDGPU_VA_RANGE_HIGH);
+    ALLOC_BO(out,    0);
+    ALLOC_BO(stub,   0);
 
     fprintf(stderr, "ib_va=0x%016" PRIx64 " shader_va=0x%016" PRIx64
                     " out_va=0x%016" PRIx64 " stub_va=0x%016" PRIx64 "\n",
