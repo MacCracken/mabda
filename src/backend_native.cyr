@@ -577,8 +577,15 @@ fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
 # filler). Useful for aligning IBs to 8-dword boundaries (kernel
 # requirement on some rings). Returns new position.
 fn native_pm4_nop(buf, pos, pad_dwords) {
-    if (pad_dwords < 1) { return pos; }
-    store32(buf + pos, native_pm4_pkt3_header(IT_NOP, pad_dwords, 0));
+    if (pad_dwords < 2) { return pos; }
+    # Session 25b fix: NOP packet of `pad_dwords` total dwords needs body =
+    # pad_dwords - 1, so pass count = pad_dwords - 1 to pkt3_header (which
+    # subtracts one to encode count_minus_1). Prior code passed pad_dwords
+    # directly, causing the on-wire header to claim body = pad_dwords (one
+    # too many) — CP read 1 dw past the IB end and either hung trying to
+    # fetch the missing dw or processed garbage. This silently bricked
+    # every native compute submit (TDR after 10s).
+    store32(buf + pos, native_pm4_pkt3_header(IT_NOP, pad_dwords - 1, 0));
     pos = pos + 4;
     var i = 1;
     while (i < pad_dwords) {
@@ -921,4 +928,68 @@ fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_t
     store64(&req + 16, &chunk_ptrs);
 
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the full 4-chunk Mesa-rusticl shape:
+# BO_HANDLES + SYNCOBJ_OUT + FENCE + IB, with caller-provided IB flags.
+# This is the byte-shape that the working session-25b C spike uses
+# (deps/libdrm_store_spike_v3.c). The 3-chunk variant
+# native_cs_submit_inline_bos (without FENCE) accepts the submit ioctl
+# but never queues the IB to MEC for compute on this kernel — TDR fires
+# after 10s and the syncobj signals as if the IB completed.
+#
+# Caller pre-builds bo_list_in (24 bytes) per native_cs_submit_inline_bos.
+# fence_kh = KMS handle of a BO mapped into the GPU VA space. The kernel
+# writes the IB completion sequence number to (fence_bo + fence_offset),
+# 8 bytes. fence_offset is typically 32 (matches Mesa).
+# ib_flags = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (0x08) for compute.
+fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
+                           syncobj_handle, fence_kh, fence_offset, ib_flags) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  ib_flags);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var fence_chunk[8];
+    store32(&fence_chunk + 0, fence_kh);
+    store32(&fence_chunk + 4, fence_offset);
+
+    var chunks_4[64];
+    memset(&chunks_4, 0, 64);
+    store32(&chunks_4 + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks_4 + 4,  6);
+    store64(&chunks_4 + 8,  bo_list_in_ptr);
+    store32(&chunks_4 + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+    store32(&chunks_4 + 20, 1);
+    store64(&chunks_4 + 24, &syncobj_chunk);
+    store32(&chunks_4 + 32, AMDGPU_CHUNK_ID_FENCE);
+    store32(&chunks_4 + 36, 2);
+    store64(&chunks_4 + 40, &fence_chunk);
+    store32(&chunks_4 + 48, AMDGPU_CHUNK_ID_IB);
+    store32(&chunks_4 + 52, 32 / 4);
+    store64(&chunks_4 + 56, &ib_chunk);
+
+    var chunk_ptrs_4[32];
+    store64(&chunk_ptrs_4 + 0,  &chunks_4 + 0);
+    store64(&chunk_ptrs_4 + 8,  &chunks_4 + 16);
+    store64(&chunk_ptrs_4 + 16, &chunks_4 + 32);
+    store64(&chunk_ptrs_4 + 24, &chunks_4 + 48);
+
+    var req_4[24];
+    memset(&req_4, 0, 24);
+    store32(&req_4 + 0,  ctx_id);
+    store32(&req_4 + 4,  0);
+    store32(&req_4 + 8,  4);
+    store32(&req_4 + 12, 0);
+    store64(&req_4 + 16, &chunk_ptrs_4);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
 }

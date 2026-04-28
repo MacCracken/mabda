@@ -87,7 +87,7 @@ fn main() {
     native_gfx9_shader_store_deadbeef(shader_map, 0);
     var shader_va = 0xFFFF800100000000;
     rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) {
         print_cstr("FAIL: shader va_map errno="); print_i64(0 - rc); print_cstr("\n");
         return 2;
@@ -109,9 +109,15 @@ fn main() {
     var stub_handle = load64(&stub_bo + 0);
     var stub_map    = load64(&stub_bo + 8);
     memset(stub_map, 0, stub_size);
-    var stub_va = 0x200000;
+    # Session 25b: stub at canonical-high VA. Earlier code used 0x200000
+    # (user-low) on the (untested) hypothesis that compute queues accept
+    # both halves. The session-25b post-dispatch WRITE_DATA marker test
+    # showed user-low writes from the compute queue silently fail (marker
+    # never landed in stub_map). Mirror the working C spike: HIGH VA for
+    # everything.
+    var stub_va = 0xFFFF800100004000;
     rc = native_gem_va_map(fd, stub_handle, stub_va, stub_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) {
         print_cstr("FAIL: stub va_map errno="); print_i64(0 - rc); print_cstr("\n");
         return 3;
@@ -140,7 +146,7 @@ fn main() {
     }
     var out_va = 0xFFFF800100400000;
     rc = native_gem_va_map(fd, out_handle, out_va, out_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE);
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) {
         print_cstr("FAIL: output va_map errno="); print_i64(0 - rc); print_cstr("\n");
         return 4;
@@ -148,6 +154,31 @@ fn main() {
     print_cstr("output bo="); print_i64(out_handle);
     print_cstr(" va=0x"); print_i64(out_va);
     print_cstr(" seeded with 0xBAADF00D\n");
+
+    # ---- Fence BO: 4 KiB GTT, canonical-high VA ----
+    # Session 25b: kernel writes the IB completion sequence number to
+    # fence_va + 32 (8 bytes). Required by the 4-chunk Mesa-shape submit;
+    # without an explicit FENCE chunk the kernel fallback path doesn't
+    # enqueue the IB to MEC for compute submits on this kernel.
+    var fence_size = 4096;
+    var fence_bo[16];
+    rc = native_bo_create_gtt(fd, fence_size, &fence_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: fence bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        return 5;
+    }
+    var fence_handle = load64(&fence_bo + 0);
+    var fence_map    = load64(&fence_bo + 8);
+    memset(fence_map, 0, fence_size);
+    var fence_va = 0xFFFF800100600000;
+    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size,
+                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+    if (rc != 0) {
+        print_cstr("FAIL: fence va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        return 5;
+    }
+    print_cstr("fence bo="); print_i64(fence_handle);
+    print_cstr(" va=0x"); print_i64(fence_va); print_cstr("\n");
 
     # ---- Build PM4 stream ----
     # Byte-identical preamble to native_compute_spike.cyr (Mesa-verified
@@ -177,8 +208,17 @@ fn main() {
     var pm4 = alloc(256);
     memset(pm4, 0, 256);
     var pos = 0;
-    var pgm_lo = shader_va & 0xFFFFFFFF;
-    var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
+    # GFX9 PGM_LO/HI encoding (Mesa-verified, see C spike line 257-264 +
+    # session-13 finding): PGM_LO = (va >> 8) & 0xFFFFFFFF (bits 39:8 of
+    # the VA in 32 bits), PGM_HI = (va >> 40) & 0xFF (bits 47:40).
+    # Hardware reconstructs:  shader_addr = (PGM_HI << 40) | (PGM_LO << 8).
+    # Prior Cyrius code used va & 0xFFFFFFFF (bits 31:0) for PGM_LO —
+    # for shader_va=0xFFFF800100000000 that gives PGM_LO=0, PGM_HI=0x80,
+    # so HW fetched from (0x80 << 40 | 0 << 8) = 0x0000800000000000
+    # (totally wrong VA) — wave fails launch → TDR. Same bug C spike
+    # session 13 fixed.
+    var pgm_lo = (shader_va >> 8) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va >> 40) & 0xFF;
     # 1. PGM_HI.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
     # 2. STATIC_THREAD_MGMT_SE0/SE1 — SE0 all CUs, SE1 absent on Cezanne.
@@ -194,10 +234,15 @@ fn main() {
     # 4. CP_COHER_START_DELAY = 0.
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
     # 5. TA_CS_BC_BASE_ADDR + _HI — border-color base, pointed at shader VA.
-    var bc_va = shader_va;
+    # Session 25b proved BC_BASE=0/0 works on Cezanne; the session-16
+    # claim that "CPC walks BC base regardless during dispatch setup"
+    # was derived from a now-falsified read of the 0x66d000 fault
+    # (which was actually a kernel reset-replay artifact of an
+    # unmapped-VA WRITE_DATA hang in the C spike, not a CPC walk).
+    var bc_va = 0;
     var bc_pair[8];
-    store32(&bc_pair + 0, (bc_va / 256) & 0xFFFFFFFF);
-    store32(&bc_pair + 4, (bc_va / 0x10000000000) & 0xFF);
+    store32(&bc_pair + 0, (bc_va >> 8) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va >> 40) & 0xFF);
     pos = native_pm4_set_uconfig_reg_pair(pm4, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
     # 6. PGM_LO.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
@@ -209,14 +254,17 @@ fn main() {
     # 8. TMPRING_SIZE.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
     # 9. USER_DATA_2 + 3 — Mesa's scratch V# stub (shader ignores s2/s3).
+    # USER_DATA_2/3 must be the canonical-high stub VA, encoded as a 64-bit
+    # pointer split low/high. HW fetches a scratch V# from this VA during
+    # dispatch setup; LOW-VA values fail silently on the compute queue.
     var user23[8];
-    store32(&user23 + 0, 0x00200000);
-    store32(&user23 + 4, 0);
+    store32(&user23 + 0, stub_va & 0xFFFFFFFF);
+    store32(&user23 + 4, (stub_va >> 32) & 0xFFFFFFFF);
     pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_USER_DATA_0 + 8, 2, &user23);
     # 10. USER_DATA_0 + 1 — output VA low/high. HW loads s0/s1 from these.
     var user01[8];
     store32(&user01 + 0, out_va & 0xFFFFFFFF);
-    store32(&user01 + 4, (out_va / 0x100000000) & 0xFFFFFFFF);
+    store32(&user01 + 4, (out_va >> 32) & 0xFFFFFFFF);
     pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_USER_DATA_0, 2, &user01);
     # 11. ACQUIRE_MEM flushes I/K/L2 caches before dispatch.
     pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
@@ -230,6 +278,17 @@ fn main() {
     pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
     # 14. DISPATCH_DIRECT with shader_type=2.
     pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
+    # Session 25b diagnostic: WRITE_DATA(WR_CONFIRM=1) marker post-dispatch.
+    # Lands 0xC0FFEE12 in stub_va+4 if CP got through DISPATCH_DIRECT and
+    # back into the IB stream — proves dispatch returned cleanly and
+    # localizes any "shader did not write out_va" failure to the wave
+    # itself rather than IB-side dispatch handling.
+    store32(pm4 + pos +  0, 0xC0033700);
+    store32(pm4 + pos +  4, 0x00100500);
+    store32(pm4 + pos +  8, (stub_va + 4) & 0xFFFFFFFF);
+    store32(pm4 + pos + 12, ((stub_va + 4) >> 32) & 0xFFFFFFFF);
+    store32(pm4 + pos + 16, 0xC0FFEE12);
+    pos = pos + 20;
     # Pad to 64 dwords (AMDGPU cache-line alignment).
     var cur_dwords = pos / 4;
     var target_dwords = 64;
@@ -238,6 +297,34 @@ fn main() {
     }
     var pm4_bytes = pos;
     print_cstr("pm4 stream bytes="); print_i64(pm4_bytes); print_cstr("\n");
+
+    # Session 25b diagnostic — dump IB hex 8 dws/line. Diff against
+    # docs/issues/session25b/spike.log to find where Cyrius vs C diverges.
+    print_cstr("---- IB DUMP ----\n");
+    var dw_total = pm4_bytes / 4;
+    var di = 0;
+    while (di < dw_total) {
+        var hb[5];
+        store8(&hb + 0, 48);  # '0'
+        store8(&hb + 1, 120); # 'x'
+        var dig = "0123456789abcdef";
+        store8(&hb + 2, load8(dig + ((di / 256) & 0xF)));
+        store8(&hb + 3, load8(dig + ((di /  16) & 0xF)));
+        store8(&hb + 4, load8(dig + (di & 0xF)));
+        syscall(1, 1, &hb, 5);
+        print_cstr(":");
+        var jj = 0;
+        while (jj < 8) {
+            if (di + jj < dw_total) {
+                print_cstr(" ");
+                print_hex32(load32(pm4 + (di + jj) * 4));
+            }
+            jj = jj + 1;
+        }
+        print_cstr("\n");
+        di = di + 8;
+    }
+    print_cstr("---- IB DUMP END ----\n");
 
     # ---- IB BO: 4 KiB GTT, PM4 at offset 0, VA @ canonical-high ----
     var ib_size = 4096;
@@ -252,7 +339,7 @@ fn main() {
     memset(ib_map, 0, ib_size);
     memcpy(ib_map, pm4, pm4_bytes);
     var ib_va = 0xFFFF800100200000;
-    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, AMDGPU_VM_PAGE_READABLE);
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
     if (rc != 0) {
         print_cstr("FAIL: ib va_map errno="); print_i64(0 - rc); print_cstr("\n");
         return 5;
@@ -270,20 +357,29 @@ fn main() {
     var ctx_id = native_ctx_alloc_id(&req_ctx);
     print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
-    # ---- BO list: shader + stub + output + IB ----
-    var entries[32];
-    store32(&entries +  0, shader_handle); store32(&entries +  4, 0);
-    store32(&entries +  8, stub_handle);   store32(&entries + 12, 0);
-    store32(&entries + 16, out_handle);    store32(&entries + 20, 0);
-    store32(&entries + 24, ib_handle);     store32(&entries + 28, 0);
-    var req_list[24];
-    rc = native_bo_list_create(fd, &entries, 4, &req_list);
-    if (rc != 0) {
-        print_cstr("FAIL: bo_list_create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 7;
-    }
-    var list_handle = native_bo_list_create_handle(&req_list);
-    print_cstr("bo_list_handle="); print_i64(list_handle); print_cstr("\n");
+    # ---- Inline BO list (Mesa BO_HANDLES chunk path) ----
+    # Session 25b: switched away from BO_LIST_OP_CREATE here. Per the
+    # session-9 finding (echoed in native_compute_spike.cyr), the
+    # BO_LIST_OP_CREATE submit path on this kernel accepts our submit
+    # but never queues the IB to the CP — the kernel TDR-recovers
+    # after 10s and signals the syncobj as if the IB completed,
+    # producing the false-PASS shape we hit in the first store run
+    # (sync-obj signals fast, marker stale, out[0] = sentinel).
+    # Mesa rusticl uses the BO_HANDLES chunk path; mirror that.
+    # 5-entry BO list: shader, stub, out, ib, fence. Priorities mirror
+    # Mesa rusticl pattern (eviction hint).
+    var entries[40];
+    store32(&entries +  0, fence_handle);  store32(&entries +  4, 1);
+    store32(&entries +  8, stub_handle);   store32(&entries + 12, 3);
+    store32(&entries + 16, out_handle);    store32(&entries + 20, 3);
+    store32(&entries + 24, shader_handle); store32(&entries + 28, 4);
+    store32(&entries + 32, ib_handle);     store32(&entries + 36, 10);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);  # operation sentinel
+    store32(&bo_list_in +  4, 0xFFFFFFFF);  # list_handle sentinel
+    store32(&bo_list_in +  8, 5);            # bo_number
+    store32(&bo_list_in + 12, 8);            # sizeof(drm_amdgpu_bo_list_entry)
+    store64(&bo_list_in + 16, &entries);
 
     # ---- Sync-obj ----
     var syncobj_handle_ptr = alloc(8);
@@ -295,9 +391,15 @@ fn main() {
     var syncobj_handle = load64(syncobj_handle_ptr);
     print_cstr("syncobj="); print_i64(syncobj_handle); print_cstr("\n");
 
-    # ---- Submit on COMPUTE ring ----
-    rc = native_cs_submit(fd, ctx_id, list_handle, ib_va, pm4_bytes,
-                          AMDGPU_HW_IP_COMPUTE, syncobj_handle);
+    # ---- Submit on COMPUTE ring (BO_HANDLES inline path) ----
+    # Session 25b: 4-chunk Mesa-shape submit. fence_offset=32 matches Mesa.
+    # IB flag 0x08 = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (Mesa-byte-exact).
+    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
+    store64(fence_map + 32, 0);
+    var t_submit_start = mono_ns();
+    rc = native_cs_submit_4chunk(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
+                                 AMDGPU_HW_IP_COMPUTE, syncobj_handle,
+                                 fence_handle, 32, 0x08);
     if (rc != 0) {
         print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
         return 9;
@@ -311,15 +413,23 @@ fn main() {
         print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
         return 10;
     }
-    print_cstr("dispatch completed (sync-obj signaled)\n");
+    var elapsed_ms = (mono_ns() - t_submit_start) / 1000000;
+    print_cstr("submit-to-syncobj-signal: "); print_i64(elapsed_ms); print_cstr(" ms");
+    if (elapsed_ms >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
+    print_cstr("\n");
 
     # ---- Verify output ----
+    # Session 25b: read post-dispatch CP marker first — proves CP returned
+    # from DISPATCH_DIRECT and ran further IB packets after the dispatch.
+    var marker_post = load32(stub_map + 4);
+    print_cstr("post-dispatch marker = "); print_hex32(marker_post);
+    if (marker_post == 0xC0FFEE12) { print_cstr(" OK (CP cleared dispatch)\n"); }
+    if (marker_post != 0xC0FFEE12) { print_cstr(" STALE (CP did not return from dispatch)\n"); }
     var v0 = load32(out_map + 0);
     print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
     if (v0 != 0xDEADBEEF) {
         print_cstr("FAIL: mismatch at [0]\n");
         native_syncobj_destroy(fd, syncobj_handle);
-        native_bo_list_destroy(fd, list_handle);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
         return 11;
@@ -333,7 +443,6 @@ fn main() {
 
     # ---- Teardown ----
     native_syncobj_destroy(fd, syncobj_handle);
-    native_bo_list_destroy(fd, list_handle);
     native_ctx_free(fd, ctx_id);
     native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
     native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
