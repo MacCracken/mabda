@@ -826,6 +826,114 @@ fn test_native_perm_bits_distinct() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 4f.iii — Resource tracker ctx-aware integration
+# ================================================================
+# FrameResources grew from 16 → 24 bytes; +0 holds an optional
+# GpuContext*. frame_resources_release_buffers routes through
+# gpu_buffer_release(ctx, h), which dispatches through
+# ctx->backend->buffer_release. Mock-backend tests below verify
+# dispatch semantics; counter increments per call confirm the
+# tracker calls the slot exactly once per tracked handle.
+
+var _step4f3_release_count = 0;
+var _step4f3_release_handles[64];
+
+fn _step4f3_release_capture(ctx, buf) {
+    var idx = _step4f3_release_count;
+    if (idx < 8) {
+        store64(&_step4f3_release_handles + idx * 8, buf);
+    }
+    _step4f3_release_count = _step4f3_release_count + 1;
+    return 0;
+}
+
+fn test_frame_resources_new_legacy_no_ctx() {
+    var fr = frame_resources_new();
+    assert(fr != 0, "fr non-null");
+    assert_eq(frame_resources_ctx(fr), 0, "legacy ctor leaves ctx zero");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_new_for_stores_ctx() {
+    var ctx = alloc(48);
+    memset(ctx, 0, 48);
+    var fr = frame_resources_new_for(ctx);
+    assert_eq(frame_resources_ctx(fr), ctx, "ctx stored at +0");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_track_buffers_and_textures() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xAA01);
+    frame_resources_track_buffer(fr, 0xAA02);
+    frame_resources_track_buffer(fr, 0xAA03);
+    frame_resources_track_texture(fr, 0xBB01);
+    frame_resources_track_texture(fr, 0xBB02);
+    assert_eq(frame_resources_buffer_count(fr), 3, "3 buffers");
+    assert_eq(frame_resources_texture_count(fr), 2, "2 textures");
+    return 0;
+}
+
+fn test_frame_resources_clear_pops_all() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xCAFE);
+    frame_resources_track_texture(fr, 0xBEEF);
+    assert_eq(frame_resources_buffer_count(fr), 1, "1 buffer pre-clear");
+    assert_eq(frame_resources_texture_count(fr), 1, "1 texture pre-clear");
+    frame_resources_clear(fr);
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty post-clear");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty post-clear");
+    return 0;
+}
+
+fn test_frame_resources_release_buffers_dispatches_through_backend() {
+    # Synth a ctx with a mock backend whose buffer_release slot
+    # counts calls and captures handles.
+    _step4f3_release_count = 0;
+    memset(&_step4f3_release_handles, 0, 64);
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE, &_step4f3_release_capture);
+    var ctx = alloc(48);
+    memset(ctx, 0, 48);
+    store64(ctx + 32, b);
+    var fr = frame_resources_new_for(ctx);
+    frame_resources_track_buffer(fr, 0xAA01);
+    frame_resources_track_buffer(fr, 0xAA02);
+    frame_resources_track_buffer(fr, 0xAA03);
+    var n = frame_resources_release_buffers(fr);
+    assert_eq(n, 3, "released 3 buffers");
+    assert_eq(_step4f3_release_count, 3, "slot dispatched 3 times");
+    assert_eq(frame_resources_buffer_count(fr), 0, "tracker drained");
+    # All 3 handles passed through — order is LIFO since we vec_pop.
+    var h0 = load64(&_step4f3_release_handles + 0);
+    var h1 = load64(&_step4f3_release_handles + 8);
+    var h2 = load64(&_step4f3_release_handles + 16);
+    assert(h0 != 0, "handle 0 captured");
+    assert(h1 != 0, "handle 1 captured");
+    assert(h2 != 0, "handle 2 captured");
+    # Sum check (any order — all 3 must have been seen)
+    var total = h0 + h1 + h2;
+    assert_eq(total, 0xAA01 + 0xAA02 + 0xAA03, "all 3 handles seen");
+    return 0;
+}
+
+fn test_frame_resources_release_buffers_no_ctx_is_noop() {
+    _step4f3_release_count = 0;
+    var fr = frame_resources_new();    # legacy, no ctx
+    frame_resources_track_buffer(fr, 0xDEAD);
+    var n = frame_resources_release_buffers(fr);
+    assert_eq(n, 0, "no-ctx fr releases 0");
+    assert_eq(_step4f3_release_count, 0, "did not dispatch");
+    # Buffer remains tracked — caller must clear manually.
+    assert_eq(frame_resources_buffer_count(fr), 1, "buffer still tracked");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -896,6 +1004,14 @@ fn main() {
     # v3 Step 4f.ii — BO page-perm constants (2)
     test_native_perm_constants_present();
     test_native_perm_bits_distinct();
+
+    # v3 Step 4f.iii — FrameResources ctx-aware integration (6)
+    test_frame_resources_new_legacy_no_ctx();
+    test_frame_resources_new_for_stores_ctx();
+    test_frame_resources_track_buffers_and_textures();
+    test_frame_resources_clear_pops_all();
+    test_frame_resources_release_buffers_dispatches_through_backend();
+    test_frame_resources_release_buffers_no_ctx_is_noop();
 
     return assert_summary();
 }
