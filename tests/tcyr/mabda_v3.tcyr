@@ -1174,6 +1174,96 @@ fn test_backend_wgpu_texture_release_null_safe() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 5.6 — native texture wrapper safety
+# ================================================================
+# Native side wraps the Step 5.1+5.2 primitives. Create needs a
+# real fd to syscall into amdgpu, so CPU tests cover the guard
+# paths only (null ctx, zero dims, null src/dst, n mismatch).
+# Hardware end-to-end is Step 5.8 (programs/native_texture_e2e).
+
+fn test_backend_native_texture_create_null_ctx_returns_zero() {
+    var rc = _backend_native_texture_create_2d_rgba8(0, 16, 16);
+    assert_eq(rc, 0, "null ctx → 0 (no struct allocated)");
+    return 0;
+}
+
+fn test_backend_native_texture_create_zero_dim_returns_zero() {
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 0, 16),  0, "w=0 → 0");
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 16, 0),  0, "h=0 → 0");
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 0, 0),   0, "0x0 → 0");
+    return 0;
+}
+
+fn test_backend_native_texture_write_memcpy_round_trip() {
+    # Synth a tex struct with addr pointing at a CPU buffer (no GPU
+    # involvement on the native path — write is just memcpy onto
+    # the mmap'd pointer). Lets us test the write+read pair from
+    # CPU without the full create/release round-trip.
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    var pixels[16];
+    memset(&pixels, 0, 16);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);  # non-zero so it doesn't look uninitialised
+    store64(&tex + NATIVE_TEX_FIELD_ADDR,   &pixels);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   16);
+    var src[16];
+    var i = 0;
+    while (i < 16) { store8(&src + i, i + 1); i = i + 1; }
+    var rc_w = _backend_native_texture_write(ctx, &tex, &src, 16);
+    assert_eq(rc_w, 0, "write returns 0");
+    # Verify memcpy actually moved bytes.
+    var j = 0;
+    while (j < 16) {
+        assert_eq(load8(&pixels + j), j + 1, "pixel byte matches src");
+        j = j + 1;
+    }
+    var dst[16];
+    memset(&dst, 0, 16);
+    var rc_r = _backend_native_texture_read(ctx, &tex, &dst, 16);
+    assert_eq(rc_r, 0, "read returns 0");
+    var k = 0;
+    while (k < 16) {
+        assert_eq(load8(&dst + k), k + 1, "dst byte matches pixel");
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn test_backend_native_texture_write_null_args_err() {
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   1024);
+    var src[8];
+    memset(&src, 0, 8);
+    assert_eq(_backend_native_texture_write(0, &tex, &src, 1024),  GPU_ERR_OTHER,  "null ctx");
+    assert_eq(_backend_native_texture_write(ctx, 0, &src, 1024),   GPU_ERR_OTHER,  "null tex");
+    assert_eq(_backend_native_texture_write(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null src");
+    assert_eq(_backend_native_texture_write(ctx, &tex, &src, 0),   GPU_ERR_BUFFER, "n=0");
+    # Tex with addr=0 (uninit) → err (catches the case where caller
+    # forgot to call create before write).
+    var tex2[32];
+    memset(&tex2, 0, 32);
+    store64(&tex2 + NATIVE_TEX_FIELD_SIZE, 1024);
+    assert_eq(_backend_native_texture_write(ctx, &tex2, &src, 1024), GPU_ERR_BUFFER, "addr=0");
+    return 0;
+}
+
+fn test_backend_native_texture_release_null_safe() {
+    assert_eq(_backend_native_texture_release(0, 0), 0, "null ctx is safe");
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    assert_eq(_backend_native_texture_release(ctx, 0), 0, "null tex is safe");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1274,6 +1364,13 @@ fn main() {
     test_backend_wgpu_texture_write_size_mismatch_err();
     test_backend_wgpu_texture_read_null_args_err();
     test_backend_wgpu_texture_release_null_safe();
+
+    # v3 Step 5.6 — native texture wrapper safety (5)
+    test_backend_native_texture_create_null_ctx_returns_zero();
+    test_backend_native_texture_create_zero_dim_returns_zero();
+    test_backend_native_texture_write_memcpy_round_trip();
+    test_backend_native_texture_write_null_args_err();
+    test_backend_native_texture_release_null_safe();
 
     return assert_summary();
 }
