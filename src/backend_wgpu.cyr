@@ -28,18 +28,47 @@
 # ================================================================
 # Context
 # ================================================================
-# gpu_context_from_preinit returns a tagged GpuResult. The slot
-# signature is "raw ctx pointer or 0 on failure" — unwrap here so
-# the dispatch layer above doesn't have to know about Result.
+# Slot signature: "raw ctx pointer or 0 on failure". This wrapper
+# does the wgpu-specific bookkeeping (validate preinit fields,
+# allocate the 40-byte GpuContext, copy instance/adapter/device/
+# queue from the C launcher's preinit struct). It does NOT call
+# the public gpu_context_from_preinit — that fn now allocates a
+# backend and dispatches *into* this slot, so calling it back would
+# recurse forever. The +32 backend slot in the ctx struct is left
+# zero; the public caller fills it after the slot returns.
 
 fn _backend_wgpu_ctx_create_from_preinit(preinit_ptr) {
-    var res = gpu_context_from_preinit(preinit_ptr);
-    if (is_ok(res) == 1) { return payload(res); }
-    return 0;
+    if (preinit_ptr == 0) { return 0; }
+    var instance = load64(preinit_ptr);
+    var adapter  = load64(preinit_ptr + 8);
+    var device   = load64(preinit_ptr + 16);
+    var queue    = load64(preinit_ptr + 24);
+    if (instance == 0) { return 0; }
+    if (adapter == 0)  { return 0; }
+    if (device == 0)   { return 0; }
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx,      instance);
+    store64(ctx + 8,  adapter);
+    store64(ctx + 16, device);
+    store64(ctx + 24, queue);
+    return ctx;
 }
 
+# Slot signature: "release ctx, return 0". Releases the wgpu
+# handles directly (does NOT call public gpu_context_release —
+# that fn now dispatches *into* this slot). The backend ptr at
+# +32 is owned by the caller; this wrapper does not touch it.
+
 fn _backend_wgpu_ctx_release(ctx) {
-    return gpu_context_release(ctx);
+    if (ctx == 0) { return 0; }
+    var device = load64(ctx + 16);
+    var adapter = load64(ctx + 8);
+    var instance = load64(ctx);
+    if (device != 0)   { wgpu_device_release(device); }
+    if (adapter != 0)  { wgpu_adapter_release(adapter); }
+    if (instance != 0) { wgpu_instance_release(instance); }
+    return 0;
 }
 
 # ================================================================
