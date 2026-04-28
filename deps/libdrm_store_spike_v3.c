@@ -376,10 +376,23 @@ int main(void) {
     *p++ = 0x00000000u;                                     /* DST_LO */
     *p++ = 0x00000000u;                                     /* DST_HI */
     *p++ = 0x00000000u;                                     /* COMMAND: BYTE_COUNT=0 */
-    /* No NOP padding — Mesa's IB1 (74 DWs) submits exact packet size with no
-     * trailing fill. Our pm4_nop_pad had an off-by-one in the count field that
-     * tripped "Illegal opcode" after the WRITE_DATA + DMA_DATA additions made
-     * the dispatch progress far enough for the CP to reach the NOPs. */
+    /* Session 25: pad IB to 32-byte alignment (80 DWs = 320 bytes) to match
+     * Mesa cl_probe ib_bytes byte-exact. Re-read of the AMD_DEBUG=ib log vs
+     * cl_probe.csdump showed Mesa CS#1 disasm ends at dw=74 but ib_bytes=320
+     * (80 DWs) — the trailing 6 DWs are a single NOP padding packet. Session
+     * 17's "no padding" comment was based on the disasm-only read.
+     *
+     * Hypothesis: gfx9 CP fetches IBs in cache-line-aligned chunks; over-
+     * fetching our 75-DW IB reads 0x00000000 from the (memset-zeroed) tail
+     * of the IB BO, which the CP firmware decodes as "PKT3 op=0 count=0" —
+     * a reserved/invalid type-3 packet that hangs MEC mid-IB. Padding to 80
+     * DWs eliminates the over-fetch and matches Mesa byte-exact.
+     *
+     * NOP packet shape: count_minus_1 = body_dws - 1. To consume 5 DWs total
+     * (1 header + 4 body), set count_minus_1 = 3. Body DWs are already zero
+     * from memset(ib_cpu, 0, 4096). */
+    *p++ = PACKET3(IT_NOP, 3);                              /* 5-DW NOP: header + 4 zero body DWs */
+    p += 4;
     unsigned ib_dws_used = (unsigned)(p - ib);
 
     fprintf(stderr, "pm4 IB built: %u DWs\n", ib_dws_used);
