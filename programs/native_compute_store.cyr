@@ -155,51 +155,17 @@ fn main() {
     print_cstr(" va=0x"); print_i64(out_va);
     print_cstr(" seeded with 0xBAADF00D\n");
 
-    # ---- Build PM4 stream (Step 4a: extracted to backend_native.cyr) ----
-    # native_pm4_build_compute_store_deadbeef() emits the full
-    # Mesa-verified preamble + DISPATCH_DIRECT + post-dispatch
-    # 0xC0FFEE12 marker + NOP padding. See src/backend_native.cyr
-    # for the per-register sequence and Mesa-rusticl alignment.
-    var pm4 = alloc(256);
-    memset(pm4, 0, 256);
-    var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
-                                                            shader_va,
-                                                            stub_va,
-                                                            out_va,
-                                                            1, 1, 1);
-    print_cstr("pm4 stream bytes="); print_i64(pm4_bytes); print_cstr("\n");
+    # ---- Dispatch through the Backend abstraction (Step 4d) ----
+    # The slot wrapper (_backend_native_compute_dispatch in
+    # src/backend_native.cyr) builds the PM4 stream internally,
+    # allocates per-call IB + fence + syncobj, submits via 4-chunk
+    # Mesa shape, waits, and tears down ephemerals — all by routing
+    # gpu_compute_dispatch() through ctx->backend->slot via fncall6.
 
-    # Session 25b diagnostic — dump IB hex 8 dws/line. Diff against
-    # docs/issues/session25b/spike.log to find where Cyrius vs C diverges.
-    print_cstr("---- IB DUMP ----\n");
-    var dw_total = pm4_bytes / 4;
-    var di = 0;
-    while (di < dw_total) {
-        var hb[5];
-        store8(&hb + 0, 48);  # '0'
-        store8(&hb + 1, 120); # 'x'
-        var dig = "0123456789abcdef";
-        store8(&hb + 2, load8(dig + ((di / 256) & 0xF)));
-        store8(&hb + 3, load8(dig + ((di /  16) & 0xF)));
-        store8(&hb + 4, load8(dig + (di & 0xF)));
-        syscall(1, 1, &hb, 5);
-        print_cstr(":");
-        var jj = 0;
-        while (jj < 8) {
-            if (di + jj < dw_total) {
-                print_cstr(" ");
-                print_hex32(load32(pm4 + (di + jj) * 4));
-            }
-            jj = jj + 1;
-        }
-        print_cstr("\n");
-        di = di + 8;
-    }
-    print_cstr("---- IB DUMP END ----\n");
-
-    # ---- Dispatch (Step 4b: extracted to native_compute_dispatch_simple) ----
-    # Allocates IB + fence + syncobj internally, submits via 4-chunk
-    # Mesa shape, waits up to 15s, releases ephemerals before return.
+    # Allocate the amdgpu context id and pack the native ctx with the
+    # dual-interpretation field layout (fd / ctx_id / stub_handle /
+    # stub_va at +0..+24, backend ptr at +32). See module header in
+    # src/backend_native.cyr for the convention.
     var ctx_handle_block[16];
     rc = native_ctx_alloc(fd, &ctx_handle_block);
     if (rc != 0) {
@@ -209,18 +175,30 @@ fn main() {
     var ctx_id = native_ctx_alloc_id(&ctx_handle_block);
     print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx +  0, fd);
+    store64(ctx +  8, ctx_id);
+    store64(ctx + 16, stub_handle);
+    store64(ctx + 24, stub_va);
+    store64(ctx + 32, backend_native_new());
+
+    # Pack the (handle, va) pairs that the slot wrapper expects for
+    # `shmod` and `bp` (private 16-byte convention).
+    var shmod_pair[16];
+    native_buf_pair_write(&shmod_pair, shader_handle, shader_va);
+    var bp_pair[16];
+    native_buf_pair_write(&bp_pair, out_handle, out_va);
+
     var t_submit_start = mono_ns();
-    rc = native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
-                                        shader_handle, stub_handle, out_handle,
-                                        t_submit_start + 15000000000);
+    rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
     var elapsed_ms = (mono_ns() - t_submit_start) / 1000000;
     print_cstr("submit-to-syncobj-signal: "); print_i64(elapsed_ms); print_cstr(" ms");
     if (elapsed_ms >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
     print_cstr("\n");
     if (rc != 0) {
-        print_cstr("FAIL: native_compute_dispatch_simple rc="); print_i64(rc); print_cstr("\n");
-        native_ctx_free(fd, ctx_id);
-        sys_close(fd);
+        print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx);
         return 9;
     }
 
@@ -235,8 +213,7 @@ fn main() {
     print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
     if (v0 != 0xDEADBEEF) {
         print_cstr("FAIL: mismatch at [0]\n");
-        native_ctx_free(fd, ctx_id);
-        sys_close(fd);
+        gpu_context_release(ctx);
         return 11;
     }
     var v1 = load32(out_map + 4);
@@ -247,14 +224,18 @@ fn main() {
     print_cstr("sentinel intact at [1]\n");
 
     # ---- Teardown ----
-    native_ctx_free(fd, ctx_id);
+    # Caller-owned BOs (shader / stub / output) are released in
+    # explicit native_*_release calls; gpu_context_release()
+    # routes through ctx->backend->ctx_release which frees the
+    # amdgpu ctx_id and closes the DRM fd. The order matters —
+    # release BOs before closing fd.
     native_gem_va_unmap(fd, out_handle, out_va, out_size);
     native_bo_release_gtt(fd, out_handle, out_map, out_size);
     native_gem_va_unmap(fd, stub_handle, stub_va, stub_size);
     native_bo_release_gtt(fd, stub_handle, stub_map, stub_size);
     native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
     native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
-    sys_close(fd);
+    gpu_context_release(ctx);
     print_cstr("OK — GPU wrote 0xDEADBEEF via pure-Cyrius dispatch\n");
     return 0;
 }
