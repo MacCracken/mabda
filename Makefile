@@ -217,6 +217,14 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+build/native_texture_e2e: programs/native_texture_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_texture_e2e.cyr $@
+
+.PHONY: test-native-texture-e2e
+test-native-texture-e2e: build/native_texture_e2e
+	./build/native_texture_e2e
+
 # v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
 # Used to differentiate "is this bug in our direct ioctls?" (spike =
 # libdrm-canonical, hangs identically) from "is shader-dispatch the
