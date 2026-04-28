@@ -188,6 +188,52 @@ fn main() {
     }
     print_cstr("sentinel intact at [1]\n");
 
+    # ---- Dispatch #2 (Step 5a: multi-dispatch validation) ----
+    # Re-seed the output BO and dispatch the same shader through
+    # the SAME ctx — exercises Step 4f.iv's cached IB + fence BOs.
+    # If the cached path retained any state from dispatch #1 in a
+    # way that breaks dispatch #2, this is where it surfaces.
+    print_cstr("\n---- second dispatch on same ctx ----\n");
+    var si2 = 0;
+    while (si2 < out_size / 4) {
+        store32(out_map + si2 * 4, sentinel);
+        si2 = si2 + 1;
+    }
+    var v0_pre = load32(out_map + 0);
+    if (v0_pre != sentinel) {
+        print_cstr("FAIL: re-seed failed (pre-dispatch out[0] = ");
+        print_hex32(v0_pre); print_cstr(")\n");
+        gpu_context_release(ctx);
+        return 13;
+    }
+    var t2 = mono_ns();
+    rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
+    var elapsed2 = (mono_ns() - t2) / 1000000;
+    print_cstr("dispatch #2 signal: "); print_i64(elapsed2); print_cstr(" ms");
+    if (elapsed2 >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
+    print_cstr("\n");
+    if (rc != 0) {
+        print_cstr("FAIL: dispatch #2 rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx);
+        return 14;
+    }
+    var marker2 = load32(native_ctx_stub_addr(ctx) + 4);
+    print_cstr("dispatch #2 marker = "); print_hex32(marker2);
+    if (marker2 == 0xC0FFEE12) { print_cstr(" OK\n"); }
+    if (marker2 != 0xC0FFEE12) {
+        print_cstr(" STALE — second dispatch did not reach CP\n");
+        gpu_context_release(ctx);
+        return 15;
+    }
+    var v0_post = load32(out_map + 0);
+    print_cstr("dispatch #2 output[0] = "); print_hex32(v0_post);
+    if (v0_post != 0xDEADBEEF) {
+        print_cstr(" FAIL: second dispatch did not write 0xDEADBEEF\n");
+        gpu_context_release(ctx);
+        return 16;
+    }
+    print_cstr(" OK — multi-dispatch on cached IB+fence path works\n");
+
     # ---- Teardown ----
     # Caller-owned BOs (shader / output) are released explicitly.
     # The stub BO is owned by the GpuContext now (allocated inside
