@@ -1224,48 +1224,30 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 # collide with these. The 5-entry BO_HANDLES list is hardcoded:
 # fence / stub / out / shader / IB. Generalising to caller-provided
 # residency is a Step 4c+ follow-up.
-fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
-        shader_handle, stub_handle, out_handle, timeout_ns) {
-    # Allocate IB BO at the canonical-high IB VA.
-    var ib_size = 4096;
-    var ib_bo[16];
-    var rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
-    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
-    var ib_handle = load64(&ib_bo + 0);
-    var ib_map    = load64(&ib_bo + 8);
-    memset(ib_map, 0, ib_size);
-    memcpy(ib_map, pm4, pm4_bytes);
-    var ib_va = 0xFFFF800100200000;
-    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, _NATIVE_PERM_IB);
-    if (rc != 0) {
-        var rc_save = rc;
-        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return _native_neg_rc_to_gpu_err(rc_save);
-    }
+# Step 4f.iv: dispatch using the per-context cached IB + fence BOs
+# from gpu_context_new_native. Replaces native_compute_dispatch_simple
+# (Step 4b's per-dispatch alloc-and-free path). Caller passes the
+# GpuContext so we can pull cached BO handles + VAs + CPU mmap addrs
+# (saves ~7 syscalls of BO churn per dispatch). The shader / stub /
+# output handles come from the caller (still per-dispatch, since
+# they're user-provided resources).
+fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
+        shader_handle, out_handle, timeout_ns) {
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var ib_handle   = native_ctx_ib_handle(ctx);
+    var ib_va       = native_ctx_ib_va(ctx);
+    var ib_addr     = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_addr   = native_ctx_fence_addr(ctx);
 
-    # Allocate fence BO at the canonical-high fence VA.
-    var fence_size = 4096;
-    var fence_bo[16];
-    rc = native_bo_create_gtt(fd, fence_size, &fence_bo);
-    if (rc != 0) {
-        var rc_save = rc;
-        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return _native_neg_rc_to_gpu_err(rc_save);
-    }
-    var fence_handle = load64(&fence_bo + 0);
-    var fence_map    = load64(&fence_bo + 8);
-    memset(fence_map, 0, fence_size);
-    var fence_va = 0xFFFF800100600000;
-    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size,
-                           _NATIVE_PERM_DATA);
-    if (rc != 0) {
-        var rc_save = rc;
-        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
-        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return _native_neg_rc_to_gpu_err(rc_save);
-    }
+    # Stage PM4 into the cached IB BO (memset + memcpy; no alloc).
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+
+    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
+    store64(fence_addr + 32, 0);
 
     # Build the 5-entry inline BO_HANDLES list (Mesa rusticl shape).
     var entries[40];
@@ -1281,46 +1263,24 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     store32(&bo_list_in + 12, 8);
     store64(&bo_list_in + 16, &entries);
 
-    # Sync-obj.
+    # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
     var syncobj_handle_ptr = alloc(8);
-    rc = native_syncobj_create(fd, syncobj_handle_ptr);
-    if (rc != 0) {
-        var rc_save = rc;
-        native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
-        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
-        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return _native_neg_rc_to_gpu_err(rc_save);
-    }
+    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
     var syncobj_handle = load64(syncobj_handle_ptr);
 
-    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
-    store64(fence_map + 32, 0);
-
-    # 4-chunk Mesa-shape submit (BO_HANDLES + SYNCOBJ_OUT + FENCE + IB).
-    rc = native_cs_submit_4chunk(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
+    # 4-chunk Mesa-shape submit.
+    rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
                                  AMDGPU_HW_IP_COMPUTE, syncobj_handle,
                                  fence_handle, 32, 0x08);
     if (rc != 0) {
         var rc_save = rc;
         native_syncobj_destroy(fd, syncobj_handle);
-        native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
-        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
-        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
         return _native_neg_rc_to_gpu_err(rc_save);
     }
 
-    # Wait until the syncobj signals, or timeout.
     var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
-
-    # Teardown ephemerals — always, regardless of wait_rc.
     native_syncobj_destroy(fd, syncobj_handle);
-    native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
-    native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
-    native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-    native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-
     return _native_neg_rc_to_gpu_err(wait_rc);
 }
 
@@ -1354,11 +1314,17 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
 #   compute_dispatch slot — until a public gpu_buffer_native_new()
 #   helper lands, callers pack the pair manually.
 
-fn native_ctx_fd(ctx)            { return load64(ctx +  0); }
-fn native_ctx_id(ctx)             { return load64(ctx +  8); }
-fn native_ctx_stub_handle(ctx)    { return load64(ctx + 16); }
-fn native_ctx_stub_va(ctx)        { return load64(ctx + 24); }
-fn native_ctx_stub_addr(ctx)      { return load64(ctx + 40); }
+fn native_ctx_fd(ctx)             { return load64(ctx +  0); }
+fn native_ctx_id(ctx)              { return load64(ctx +  8); }
+fn native_ctx_stub_handle(ctx)     { return load64(ctx + 16); }
+fn native_ctx_stub_va(ctx)         { return load64(ctx + 24); }
+fn native_ctx_stub_addr(ctx)       { return load64(ctx + 40); }
+fn native_ctx_ib_handle(ctx)       { return load64(ctx + 48); }
+fn native_ctx_ib_va(ctx)           { return load64(ctx + 56); }
+fn native_ctx_ib_addr(ctx)         { return load64(ctx + 64); }
+fn native_ctx_fence_handle(ctx)    { return load64(ctx + 72); }
+fn native_ctx_fence_va(ctx)        { return load64(ctx + 80); }
+fn native_ctx_fence_addr(ctx)      { return load64(ctx + 88); }
 
 # Pack (handle, va) into the private 16-byte buffer-pair shape.
 # Caller allocates 16 bytes for `dst` (typically a stack-local
@@ -1387,6 +1353,21 @@ fn _backend_native_ctx_release(ctx) {
     if (ctx == 0) { return 0; }
     var fd = native_ctx_fd(ctx);
     var ctx_id = native_ctx_id(ctx);
+    var ib_handle = native_ctx_ib_handle(ctx);
+    var ib_va = native_ctx_ib_va(ctx);
+    var ib_addr = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_va = native_ctx_fence_va(ctx);
+    var fence_addr = native_ctx_fence_addr(ctx);
+    # Release per-context cached fence + IB BOs (Step 4f.iv).
+    if (fence_handle != 0) {
+        native_gem_va_unmap(fd, fence_handle, fence_va, 4096);
+        native_bo_release_gtt(fd, fence_handle, fence_addr, 4096);
+    }
+    if (ib_handle != 0) {
+        native_gem_va_unmap(fd, ib_handle, ib_va, 4096);
+        native_bo_release_gtt(fd, ib_handle, ib_addr, 4096);
+    }
     if (ctx_id != 0) { native_ctx_free(fd, ctx_id); }
     if (fd > 0) { sys_close(fd); }
     return 0;
@@ -1429,9 +1410,6 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     if (shmod == 0) { return GPU_ERR_OTHER; }
     if (bp == 0)    { return GPU_ERR_OTHER; }
 
-    var fd = native_ctx_fd(ctx);
-    var cid = native_ctx_id(ctx);
-    var stub_handle = native_ctx_stub_handle(ctx);
     var stub_va = native_ctx_stub_va(ctx);
     var shader_handle = load64(shmod + 0);
     var shader_va     = load64(shmod + 8);
@@ -1448,9 +1426,12 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     var ns_now = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8);
     var deadline = ns_now + 15000000000;
 
-    return native_compute_dispatch_simple(fd, cid, pm4, pm4_bytes,
-                                          shader_handle, stub_handle,
-                                          out_handle, deadline);
+    # Step 4f.iv: route through the cached-BO path. The IB and
+    # fence BOs were allocated once in gpu_context_new_native; we
+    # just memcpy PM4 into the cached IB and submit.
+    return native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
+                                          shader_handle, out_handle,
+                                          deadline);
 }
 
 # Device wait — stub. Native dispatch is synchronous (waits on the

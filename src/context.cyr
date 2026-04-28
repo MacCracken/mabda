@@ -2,14 +2,19 @@
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (48 bytes — grew from 40 at v3 Step 4e):
+# GpuContext struct layout (96 bytes — grew from 48 at v3 Step 4f.iv):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
 #   +24: queue    / stub_va     (wgpu: WGPUQueue    | native: stub BO VA)
 #   +32: backend  (Backend*, 8) — @internal dispatch table
-#   +40: stub_addr (8)          — native: CPU-side mmap of stub BO;
-#                                 zero on wgpu (unused)
+#   +40: stub_addr  (8)         — native: stub BO CPU mmap; zero on wgpu
+#   +48: ib_handle  (8)         — native: per-context IB BO handle (Step 4f.iv)
+#   +56: ib_va      (8)         — native: IB BO GPU VA
+#   +64: ib_addr    (8)         — native: IB BO CPU mmap (memcpy PM4 here)
+#   +72: fence_handle (8)       — native: per-context fence BO handle
+#   +80: fence_va   (8)         — native: fence BO GPU VA
+#   +88: fence_addr (8)         — native: fence BO CPU mmap (pre-zero seqno slot)
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
@@ -47,8 +52,8 @@ fn gpu_context_from_preinit(preinit_ptr) {
     if (instance == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (adapter == 0)  { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (device == 0)   { return gpu_err_result(GPU_ERR_DEVICE_REQUEST); }
-    var ctx = alloc(48);
-    memset(ctx, 0, 48);
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
     store64(ctx,      instance);
     store64(ctx + 8,  adapter);
     store64(ctx + 16, device);
@@ -71,6 +76,16 @@ fn gpu_context_from_preinit(preinit_ptr) {
 # long-lived create/destroy cycles ever surface.
 var _NATIVE_STUB_VA   = 0xFFFF800100004000;
 var _NATIVE_STUB_SIZE = 4096;
+
+# Per-context cached IB + fence (Step 4f.iv). Allocated once in
+# gpu_context_new_native, reused across every dispatch through
+# native_compute_dispatch_simple. Released in
+# _backend_native_ctx_release. Avoids ~7 syscalls of BO churn per
+# dispatch (alloc/va_map/munmap/va_unmap/close × 2 BOs + syncobj).
+var _NATIVE_IB_VA     = 0xFFFF800100200000;
+var _NATIVE_IB_SIZE   = 4096;
+var _NATIVE_FENCE_VA  = 0xFFFF800100600000;
+var _NATIVE_FENCE_SIZE = 4096;
 
 fn gpu_context_new_native() {
     var fd = native_open_render_node();
@@ -109,14 +124,71 @@ fn gpu_context_new_native() {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
-    var ctx = alloc(48);
-    memset(ctx, 0, 48);
+    # Step 4f.iv: allocate the per-context IB + fence BOs once
+    # (cached for reuse across dispatches).
+    var ib_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_IB_SIZE, &ib_bo);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var ib_handle = load64(&ib_bo + 0);
+    var ib_map    = load64(&ib_bo + 8);
+    rc = native_gem_va_map(fd, ib_handle, _NATIVE_IB_VA,
+                           _NATIVE_IB_SIZE, _NATIVE_PERM_IB);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var fence_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_FENCE_SIZE, &fence_bo);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var fence_handle = load64(&fence_bo + 0);
+    var fence_map    = load64(&fence_bo + 8);
+    memset(fence_map, 0, _NATIVE_FENCE_SIZE);
+    rc = native_gem_va_map(fd, fence_handle, _NATIVE_FENCE_VA,
+                           _NATIVE_FENCE_SIZE, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, fence_handle, fence_map, _NATIVE_FENCE_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
     store64(ctx +  0, fd);
     store64(ctx +  8, ctx_id);
     store64(ctx + 16, stub_handle);
     store64(ctx + 24, _NATIVE_STUB_VA);
     store64(ctx + 32, backend_native_new());
     store64(ctx + 40, stub_map);
+    store64(ctx + 48, ib_handle);
+    store64(ctx + 56, _NATIVE_IB_VA);
+    store64(ctx + 64, ib_map);
+    store64(ctx + 72, fence_handle);
+    store64(ctx + 80, _NATIVE_FENCE_VA);
+    store64(ctx + 88, fence_map);
     _sk_info_cstr("mabda: gpu context created (native)");
     return gpu_ok(ctx);
 }
