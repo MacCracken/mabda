@@ -23,6 +23,66 @@ section when they ship.
 Pre-release dev-track entries for the v3 native-backend work. No
 release date; individual items are dated inline when they land.
 
+### Verified — 2026-04-27/28 (B.4 store shader live-verified on Cezanne)
+
+- `programs/native_compute_store.cyr` lands `0xDEADBEEF` in `out[0]`
+  from a pure-Cyrius compute dispatch on AMD Cezanne (gfx90c, kernel
+  6.18.24-1-lts, MEC fw `0x1e2`). Submit-to-syncobj signal is **0 ms**
+  (not the 10 s TDR shape). The post-dispatch `0xC0FFEE12` `WRITE_DATA`
+  marker confirms the CP returned cleanly from `DISPATCH_DIRECT`. The
+  cl_probe canary stays green afterward. **All three B.4 calibration
+  gates from the Session 24 handoff are now met**, reversing the
+  Session 9 retraction.
+- The Session 25b investigation found six independent bugs that had to
+  be fixed for the Cyrius native compute path to match the working
+  C spike byte for byte. Full diff in
+  `docs/handoff/2026-04-28-session25-b4-verified.md`. Summary:
+  - `src/backend_native.cyr::native_pm4_nop` — count_minus_1 off-by-one;
+    `pad_dwords` was passed directly to `native_pm4_pkt3_header` (which
+    subtracts 1 internally), so the on-wire header claimed one extra
+    body dword. CP read past the IB end and either hung or processed
+    garbage. Fix: pass `pad_dwords - 1`. Same convention bug class as
+    the `feedback_pm4_count_minus_1_naming` memory.
+  - `programs/native_compute_store.cyr` — `PGM_LO/HI` encoding. GFX9
+    reconstructs `addr = (PGM_HI << 40) | (PGM_LO << 8)`, so PGM_LO
+    must carry bits `[39:8]` (use `(va >> 8) & 0xFFFFFFFF`), not bits
+    `[31:0]` (`va & 0xFFFFFFFF`). The old encoding produced
+    `addr = 0x0000800000000000` for `shader_va = 0xFFFF800100000000` —
+    wrong VA, wave fails launch, queue TDRs. Same class as the
+    `feedback_cyrius_signed_div_high_va` memory; converted remaining
+    `va / 2^N` patterns to `>> N` shifts.
+  - `programs/native_compute_store.cyr` — stub VA moved from
+    `0x200000` (user-low) to `0xFFFF800100004000` (canonical-high).
+    Session 25b's post-dispatch marker test showed user-low writes
+    from the compute queue silently fail. USER_DATA_2/3 now encodes
+    the canonical-high stub VA as a 64-bit pointer split low/high.
+  - `programs/native_compute_store.cyr` — `TA_CS_BC_BASE_ADDR = 0`.
+    The Session 16 hypothesis that `BC_BASE` had to point at
+    `shader_va` (or Mesa's magic `0x01004400 / 0x80`) is falsified
+    by Session 25b's clean A/B: the only difference between the
+    failing 25 run and the passing 25b run is `BC_BASE = magic` vs
+    `BC_BASE = 0`.
+  - `src/backend_native.cyr` — added `native_cs_submit_4chunk` with
+    explicit `AMDGPU_CHUNK_ID_FENCE` (offset 32) plus
+    `IB flags = 0x08` (`AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE`).
+    Replaces the 3-chunk path that submitted cleanly but never
+    queued the IB to MEC (Session 9 false-positive shape).
+  - `programs/native_compute_store.cyr` — inline BO list with
+    `operation = list_handle = 0xFFFFFFFF` sentinels (Mesa rusticl
+    inline-residency path); replaces `BO_LIST_OP_CREATE`. All BOs
+    given full `R | W | X` page perms during bring-up — flagged for
+    re-tightening once a regression test catches the narrowing
+    failure mode.
+- Falsified hypotheses (cleared from the live tracking list):
+  - `BC_BASE = shader_va` is load-bearing (Session 16).
+  - `BC_BASE = 0x01004400 / 0x80` (Mesa magic VA) is load-bearing.
+  - Compute queues accept both VA halves (user-low + canonical-high).
+- What B.4 closing does **not** include: a `Backend.compute_dispatch`
+  abstraction, multi-dispatch submits, profiler integration, or the
+  other three integration shapes (`phase0`, `render_e2e`,
+  `render_graph_e2e`). These are still required by the v3.0 exit
+  criteria. Backend abstraction (ADR 006) is the natural next step.
+
 ### Fixed — 2026-04-22/23 (B.3.d PM4 encoder bugs)
 
 - `src/backend_native.cyr::native_pm4_acquire_mem_full_invalidate` —
