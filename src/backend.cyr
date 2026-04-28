@@ -15,7 +15,9 @@
 # adding them with stub-`return GPU_ERR_NOT_IMPLEMENTED` bodies is
 # explicitly out of scope (see docs/proposals/v3-backend-interface.md).
 #
-# Backend struct layout (88 bytes — 10 fnptr slots + 1 kind value):
+# Backend struct layout (120 bytes — 14 fnptr slots + 1 kind value):
+#
+# v0 (Step 1, 88 bytes):
 #   +0:  ctx_create_from_preinit  fnptr (preinit_ptr)            -> ctx
 #   +8:  ctx_release              fnptr (ctx)                    -> 0
 #   +16: buffer_create            fnptr (ctx, size, usage)       -> buf
@@ -27,6 +29,12 @@
 #   +64: compute_dispatch         fnptr (ctx, mod, x, y, z, bp)  -> 0|err
 #   +72: device_wait_idle         fnptr (ctx)                    -> 0
 #   +80: kind                     u64   value: BACKEND_KIND_*
+#
+# v1 texture slots (Step 5.4, +32 bytes):
+#   +88:  texture_create_2d_rgba8 fnptr (ctx, w, h)              -> tex_ptr
+#   +96:  texture_write           fnptr (ctx, tex, src, n)       -> 0|err
+#   +104: texture_read            fnptr (ctx, tex, dst, n)       -> 0|err
+#   +112: texture_release         fnptr (ctx, tex)               -> 0
 #
 # The kind field at +80 is a u64 value, not a fnptr — kind is
 # invariant per backend, so storing it directly saves an indirect
@@ -88,11 +96,27 @@ var BACKEND_SLOT_SHADER_MODULE_RELEASE   = 56;
 var BACKEND_SLOT_COMPUTE_DISPATCH        = 64;
 var BACKEND_SLOT_DEVICE_WAIT_IDLE        = 72;
 var BACKEND_SLOT_KIND                    = 80;
-var BACKEND_SIZE                         = 88;
 
-# Number of fnptr slots (everything before the kind slot). Layout
-# assertions and backend_is_complete() iterate over this range.
+# v1 texture slots (Step 5.4) — appended after KIND. Append-after-
+# kind keeps every v0 slot offset stable so existing layout tests
+# pass unchanged. Per docs/proposals/v3-backend-interface.md.
+var BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8 = 88;
+var BACKEND_SLOT_TEXTURE_WRITE           = 96;
+var BACKEND_SLOT_TEXTURE_READ            = 104;
+var BACKEND_SLOT_TEXTURE_RELEASE         = 112;
+
+var BACKEND_SIZE                         = 120;
+
+# v0 fnptr block ends at +80 (the KIND value sits there). Layout
+# assertions and the v0 portion of backend_is_complete() iterate
+# 0..80. Kept stable so v0 tests don't need to change.
 var BACKEND_FNPTR_SLOTS_END              = 80;
+
+# v1 texture fnptr block: 88..120. Treated as a second range by
+# backend_is_complete() so the kind value at +80 isn't mistaken
+# for a missing fnptr.
+var BACKEND_TEXTURE_SLOTS_BEGIN          = 88;
+var BACKEND_TEXTURE_SLOTS_END            = 120;
 
 # ================================================================
 # Backend struct construction
@@ -145,6 +169,11 @@ fn backend_is_complete(b) {
     while (off < BACKEND_FNPTR_SLOTS_END) {
         if (load64(b + off) == 0) { return 0; }
         off = off + 8;
+    }
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        if (load64(b + off2) == 0) { return 0; }
+        off2 = off2 + 8;
     }
     return 1;
 }
