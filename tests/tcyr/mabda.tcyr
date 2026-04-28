@@ -2206,22 +2206,36 @@ fn test_native_pm4_acquire_mem_layout() {
 }
 
 fn test_native_pm4_nop_padding() {
+    # Encoding contract (Session 25b — see CHANGELOG [3.0.0-dev]):
+    # pad_dwords is the TOTAL packet size in dwords (header + body).
+    # Body = pad_dwords - 1 filler dwords; header encodes count_minus_1
+    # = pad_dwords - 2 (because pkt3_header subtracts another 1 from
+    # the count argument). Minimum useful pad_dwords = 2.
     # NOP with pad_dwords=4: header + 3 filler dwords = 4 dwords = 16 bytes.
     var buf[64];
     memset(&buf, 0xFF, 64);
     var pos = native_pm4_nop(&buf, 0, 4);
     assert_eq(pos, 16, "NOP pad=4 → 16 bytes");
-    # Header: PKT3(IT_NOP, 4, 0) = (3<<30) | (3<<16) | (0x10<<8) = 0xC0031000.
-    assert_eq(load32(&buf + 0),  0xC0031000, "NOP header");
+    # Header: PKT3(IT_NOP, count=3, 0) → wire count_minus_1 = 2.
+    # = (3<<30) | (2<<16) | (0x10<<8) = 0xC0021000.
+    assert_eq(load32(&buf + 0),  0xC0021000, "NOP pad=4 header");
     # Filler dwords zeroed.
     assert_eq(load32(&buf + 4),  0, "filler 1");
     assert_eq(load32(&buf + 8),  0, "filler 2");
     assert_eq(load32(&buf + 12), 0, "filler 3");
-    # NOP with pad_dwords=1: just the header, no filler.
+    # NOP with pad_dwords=2 (minimum useful): header + 1 filler = 2 dwords.
+    # Wire count_minus_1 = 0; header = 0xC0001000.
+    memset(&buf, 0xFF, 64);
+    pos = native_pm4_nop(&buf, 0, 2);
+    assert_eq(pos, 8, "NOP pad=2 → 8 bytes");
+    assert_eq(load32(&buf + 0), 0xC0001000, "NOP pad=2 header");
+    assert_eq(load32(&buf + 4), 0,          "NOP pad=2 filler");
+    # NOP with pad_dwords=1 is rejected (no body slot to claim);
+    # function returns pos unchanged and writes nothing.
     memset(&buf, 0xFF, 64);
     pos = native_pm4_nop(&buf, 0, 1);
-    assert_eq(pos, 4, "NOP pad=1 → 4 bytes");
-    assert_eq(load32(&buf + 0), 0xC0001000, "single-dword NOP header");
+    assert_eq(pos, 0, "NOP pad=1 rejected (returns pos unchanged)");
+    assert_eq(load32(&buf + 0), 0xFFFFFFFF, "NOP pad=1 wrote nothing");
     return 0;
 }
 
@@ -2334,23 +2348,25 @@ fn test_native_cs_chunk_ids_and_ip_types() {
 }
 
 fn test_native_pm4_builder_composability() {
-    # Chain operations: NOP + SET_SH_REG(one) + DISPATCH_DIRECT.
+    # Chain operations: NOP(pad=2) + SET_SH_REG(one) + DISPATCH_DIRECT.
+    # NOP pad=2 (minimum useful per Session 25b): 1 header + 1 filler dword.
     # Expected layout:
-    #   0x00-0x03: NOP header (1 dword)
-    #   0x04-0x0F: SET_SH_REG DISPATCH_INITIATOR = 1 (3 dwords)
-    #   0x10-0x23: DISPATCH_DIRECT 1,1,1, init=1 (5 dwords)
-    # Total: 9 dwords = 36 bytes.
+    #   0x00-0x03: NOP header (count_minus_1 = 0)
+    #   0x04-0x07: NOP filler (zero)
+    #   0x08-0x13: SET_SH_REG DISPATCH_INITIATOR = 1 (3 dwords)
+    #   0x14-0x27: DISPATCH_DIRECT 1,1,1, init=1 (5 dwords)
+    # Total: 10 dwords = 40 bytes.
     var buf[64];
     memset(&buf, 0, 64);
     var pos = 0;
-    pos = native_pm4_nop(&buf, pos, 1);
+    pos = native_pm4_nop(&buf, pos, 2);
     pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_DISPATCH_INITIATOR, 1);
     pos = native_pm4_dispatch_direct(&buf, pos, 1, 1, 1, COMPUTE_DISPATCH_INITIATOR_MIN);
-    assert_eq(pos, 36, "composed stream = 36 bytes");
+    assert_eq(pos, 40, "composed stream = 40 bytes");
     # Spot check: each header at its expected offset.
     assert_eq(load32(&buf + 0),  0xC0001000, "NOP header at 0");
-    assert_eq(load32(&buf + 4),  0xC0017600, "SET_SH_REG header at 4");
-    assert_eq(load32(&buf + 16), 0xC0031502, "DISPATCH_DIRECT header at 16 (shader_type=compute)");
+    assert_eq(load32(&buf + 8),  0xC0017600, "SET_SH_REG header at 8");
+    assert_eq(load32(&buf + 20), 0xC0031502, "DISPATCH_DIRECT header at 20 (shader_type=compute)");
     return 0;
 }
 
