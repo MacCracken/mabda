@@ -168,26 +168,145 @@ fn _backend_wgpu_shader_module_release(ctx, shmod) {
 }
 
 # ================================================================
-# Texture slots — stubs for Step 5.4 (wgpu fillers land in Step 5.5)
+# Texture slots — wgpu wrappers (Step 5.5)
 # ================================================================
-# Mounted on the v1 texture slots so backend_is_complete stays
-# strict (every slot non-null). All four return their "not yet
-# implemented" sentinel; Step 5.5 replaces them with real
-# wgpu_queue_write_texture / copy_texture_to_buffer wrappers.
+# Returns a 32-byte struct in the same shape src/texture.cyr uses
+# elsewhere in the codebase, so the wgpu side stays consistent:
+#   +0:  handle   (WGPUTexture, u64)
+#   +8:  view     (WGPUTextureView, u64)
+#   +16: sampler  (WGPUSampler — unused for plain write/read; kept
+#                  for shape-compat with src/texture.cyr; zero here)
+#   +24: width    (u32)
+#   +28: height   (u32)
+#
+# Step 5.5 limit: width must be a multiple of 64 (so bytes_per_row =
+# width*4 satisfies wgpu's COPY_BUFFER_ALIGNMENT = 256 on the read
+# path). Real consumer flows already match this — render_e2e uses
+# 256x256. Sub-64 widths need a row-padded staging buffer; deferred.
 
 fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height) {
-    return 0;
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
+              | WGPU_TEXTURE_USAGE_COPY_DST
+              | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var desc = wgpu_texture_descriptor(0, usage,
+                                       WGPU_TEXTURE_DIMENSION_2D,
+                                       width, height,
+                                       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+                                          WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                                          WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store64(t + 16, 0);
+    store32(t + 24, width);
+    store32(t + 28, height);
+    return t;
 }
 
 fn _backend_wgpu_texture_write(ctx, tex, src, n) {
-    return GPU_ERR_OTHER;
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+    var dst_info = wgpu_texel_copy_texture_info(handle, 0);
+    var layout = wgpu_texel_copy_buffer_layout(0, width * 4, height);
+    var extent = wgpu_extent_3d(width, height, 1);
+    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
+    return 0;
 }
 
 fn _backend_wgpu_texture_read(ctx, tex, dst, n) {
-    return GPU_ERR_OTHER;
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+
+    # Stage the readback through a MAP_READ buffer.
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ
+                      | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    # Build copy_texture_to_buffer args (72-byte struct layout —
+    # see src/wgpu_ffi.cyr / programs/render_e2e.cyr for the field
+    # offsets).
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs +  0, handle);
+    store32(cargs +  8, 0);   # src mip
+    store32(cargs + 12, 0);   # origin x
+    store32(cargs + 16, 0);   # origin y
+    store32(cargs + 20, 0);   # origin z
+    store32(cargs + 24, 0);   # aspect = All
+    store64(cargs + 32, staging);
+    store64(cargs + 40, 0);
+    store32(cargs + 48, width * 4);
+    store32(cargs + 52, height);
+    store32(cargs + 56, width);
+    store32(cargs + 60, height);
+    store32(cargs + 64, 1);
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_texture_to_buffer(encoder, cargs);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging,
+                                       WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(dst, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
 }
 
 fn _backend_wgpu_texture_release(ctx, tex) {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { return 0; }
+    var handle = load64(tex +  0);
+    var view   = load64(tex +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(tex +  0, 0);
+    store64(tex +  8, 0);
+    store32(tex + 24, 0);
+    store32(tex + 28, 0);
     return 0;
 }
 
