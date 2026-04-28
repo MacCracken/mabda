@@ -352,6 +352,51 @@ var AMDGPU_VM_PAGE_READABLE   = 0x2;
 var AMDGPU_VM_PAGE_WRITEABLE  = 0x4;
 var AMDGPU_VM_PAGE_EXECUTABLE = 0x8;
 
+# ================================================================
+# BO page-perm constants (v3 Step 4f.ii)
+# ================================================================
+# Per-BO page perms for the AMDGPU VA mapping. Session 25b granted
+# R | W | X everywhere as a workaround during bring-up. Step 4f.ii
+# narrows back to the per-BO minimum each role needs — empirically
+# verified on Cezanne kernel 6.18.24:
+#
+#   _NATIVE_PERM_SHADER (R | X)  shader BOs — CP fetches, the wave
+#                                executes from these pages. CPU
+#                                writes shader bytes via the host
+#                                mmap (separate page table), so
+#                                GPU W is not required.
+#   _NATIVE_PERM_DATA   (R | W)  data BOs — stub, output, fence.
+#                                HW reads V# state / output target,
+#                                CP writes diagnostic markers,
+#                                kernel writes user fence seqno.
+#   _NATIVE_PERM_IB     (R | X)  IB BOs — CP only reads PM4 from
+#                                these, but on Cezanne the X bit is
+#                                load-bearing: dropping X causes the
+#                                compute ring to TDR. Hardware
+#                                bisect during Step 4f.ii (R-only,
+#                                R+W, R+X all tested) — only R+X
+#                                makes the dispatch land. AMDGPU
+#                                gates CP fetch through the execute
+#                                bit even though PM4 isn'"'"'t shader
+#                                code. The W bit is not required.
+#
+# Earlier this session a constants-init-order bug had _NATIVE_PERM_*
+# evaluating to 0 (referenced AMDGPU_VM_PAGE_* before they were
+# defined). The block now sits AFTER the AMDGPU_VM_PAGE_* defs,
+# which Cyrius initialises in declaration order. The CPU regression
+# test in tests/tcyr/mabda_v3.tcyr locks the values so further
+# narrowing trips a test before reaching hardware.
+
+var _NATIVE_PERM_FULL   = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_WRITEABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_SHADER = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_DATA   = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_WRITEABLE;
+var _NATIVE_PERM_IB     = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+
 # Sensible default for a first-BO VA base — 2 MiB into the GPU VA
 # space, well above any kernel-reserved low region. Phase B.3.a only
 # supports one-BO-at-a-time; a full VA allocator lands in B.3.b.
@@ -1181,10 +1226,6 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 # residency is a Step 4c+ follow-up.
 fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
         shader_handle, stub_handle, out_handle, timeout_ns) {
-    var page_perms = AMDGPU_VM_PAGE_READABLE
-                   | AMDGPU_VM_PAGE_WRITEABLE
-                   | AMDGPU_VM_PAGE_EXECUTABLE;
-
     # Allocate IB BO at the canonical-high IB VA.
     var ib_size = 4096;
     var ib_bo[16];
@@ -1195,7 +1236,7 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     memset(ib_map, 0, ib_size);
     memcpy(ib_map, pm4, pm4_bytes);
     var ib_va = 0xFFFF800100200000;
-    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, page_perms);
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, _NATIVE_PERM_IB);
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
@@ -1216,7 +1257,8 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var fence_map    = load64(&fence_bo + 8);
     memset(fence_map, 0, fence_size);
     var fence_va = 0xFFFF800100600000;
-    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size, page_perms);
+    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size,
+                           _NATIVE_PERM_DATA);
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
