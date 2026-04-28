@@ -2419,6 +2419,125 @@ fn test_audit_bgl_entry_buffer_offsets() {
 }
 
 # ================================================================
+# v3 Phase B5 — backend abstraction (src/backend.cyr)
+# ================================================================
+# Step 1 lands the @internal Backend struct + smoke test only;
+# wgpu and native backend slot fills are subsequent steps. The
+# load-bearing test here is test_backend_fncall_through_slot_smoke
+# — proves Cyrius-fn-via-fnptr-via-struct-slot dispatch works
+# before any backend implementation depends on it.
+
+fn test_backend_struct_layout() {
+    assert_eq(BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,  0, "ctx_create at 0");
+    assert_eq(BACKEND_SLOT_CTX_RELEASE,              8, "ctx_release at 8");
+    assert_eq(BACKEND_SLOT_BUFFER_CREATE,           16, "buffer_create at 16");
+    assert_eq(BACKEND_SLOT_BUFFER_WRITE,            24, "buffer_write at 24");
+    assert_eq(BACKEND_SLOT_BUFFER_READ,             32, "buffer_read at 32");
+    assert_eq(BACKEND_SLOT_BUFFER_RELEASE,          40, "buffer_release at 40");
+    assert_eq(BACKEND_SLOT_SHADER_MODULE_CREATE,    48, "shader_module_create at 48");
+    assert_eq(BACKEND_SLOT_SHADER_MODULE_RELEASE,   56, "shader_module_release at 56");
+    assert_eq(BACKEND_SLOT_COMPUTE_DISPATCH,        64, "compute_dispatch at 64");
+    assert_eq(BACKEND_SLOT_DEVICE_WAIT_IDLE,        72, "device_wait_idle at 72");
+    assert_eq(BACKEND_SLOT_KIND,                    80, "kind at 80");
+    assert_eq(BACKEND_FNPTR_SLOTS_END,              80, "fnptr slots end at 80");
+    assert_eq(BACKEND_SIZE,                         88, "total = 88");
+    return 0;
+}
+
+fn test_backend_kind_constants_distinct() {
+    assert(BACKEND_KIND_NULL   != BACKEND_KIND_WGPU,    "null != wgpu");
+    assert(BACKEND_KIND_WGPU   != BACKEND_KIND_AMD,     "wgpu != amd");
+    assert(BACKEND_KIND_AMD    != BACKEND_KIND_NVIDIA,  "amd != nvidia");
+    assert(BACKEND_KIND_NVIDIA != BACKEND_KIND_INTEL,   "nvidia != intel");
+    assert_eq(BACKEND_KIND_NULL,   0, "null = 0");
+    assert_eq(BACKEND_KIND_WGPU,   1, "wgpu = 1");
+    assert_eq(BACKEND_KIND_AMD,    2, "amd  = 2");
+    assert_eq(BACKEND_KIND_NVIDIA, 3, "nvidia = 3");
+    assert_eq(BACKEND_KIND_INTEL,  4, "intel  = 4");
+    return 0;
+}
+
+fn test_backend_new_zero_initialized() {
+    var b = backend_new();
+    var off = 0;
+    while (off < BACKEND_SIZE) {
+        assert_eq(load64(b + off), 0, "slot zero on new");
+        off = off + 8;
+    }
+    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "kind starts NULL");
+    return 0;
+}
+
+fn test_backend_kind_round_trip() {
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_WGPU);
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "wgpu round-trips");
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    assert_eq(backend_kind(b), BACKEND_KIND_AMD,  "amd round-trips");
+    backend_set_kind(b, BACKEND_KIND_NULL);
+    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "null round-trips");
+    return 0;
+}
+
+fn test_backend_set_get_slot_round_trip() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0x1234);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0x1234, "fnptr stored at buffer_create slot");
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0xDEADBEEF);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0xDEADBEEF, "slot overwritten");
+    # Setting one slot does not perturb its neighbours.
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, 0xAA);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE, 0xBB);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0xDEADBEEF, "neighbour writes do not bleed");
+    return 0;
+}
+
+fn test_backend_fncall_through_slot_smoke() {
+    # Step 1's load-bearing test: prove Cyrius-fn-via-fnptr-via-
+    # struct-slot dispatch works. The v2.x codebase only fncalls
+    # against extern-C function pointers; the entire backend
+    # abstraction relies on Cyrius-to-Cyrius dispatch through a
+    # slot. If this fails, the design is unviable.
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_smoke_sentinel);
+    var fp = backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE);
+    assert(fp != 0, "stored fnptr loads back non-zero");
+    var got = fncall1(fp, 100);
+    assert_eq(got, BACKEND_SMOKE_SENTINEL + 100,
+              "fncall1 through struct slot returns sentinel + arg");
+    # Same fn, mounted on a different slot, behaves identically.
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_smoke_sentinel);
+    var fp2 = backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    var got2 = fncall1(fp2, 7);
+    assert_eq(got2, BACKEND_SMOKE_SENTINEL + 7,
+              "slot identity does not affect dispatch");
+    return 0;
+}
+
+fn test_backend_is_complete_detects_missing_slot() {
+    var b = backend_new();
+    assert_eq(backend_is_complete(b), 0,
+              "fresh backend not complete (all slots zero)");
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        backend_set_slot(b, off, &_backend_smoke_sentinel);
+        off = off + 8;
+    }
+    assert_eq(backend_is_complete(b), 1,
+              "all fnptr slots set -> complete");
+    # Wiping one slot drops completeness.
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped slot drops completeness");
+    return 0;
+}
+
+# ================================================================
 # v2.4.1 — sakshi observability wiring
 # ================================================================
 # These assertions verify the gating contract: mabda emits sakshi
@@ -2712,6 +2831,15 @@ fn main() {
     test_native_cs_ioctl_encoding();
     test_native_cs_struct_sizes();
     test_native_cs_chunk_ids_and_ip_types();
+
+    # v3 Phase B5 — backend abstraction (7)
+    test_backend_struct_layout();
+    test_backend_kind_constants_distinct();
+    test_backend_new_zero_initialized();
+    test_backend_kind_round_trip();
+    test_backend_set_get_slot_round_trip();
+    test_backend_fncall_through_slot_smoke();
+    test_backend_is_complete_detects_missing_slot();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();
