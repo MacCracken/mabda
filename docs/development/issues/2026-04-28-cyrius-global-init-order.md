@@ -4,7 +4,9 @@
 **Component:** `cyrius` compiler / runtime — global initializer evaluation
 **Severity:** Medium (silent miscompile; surfaces as runtime zeros that
 look like working code)
-**Toolchain:** `cyrius 5.7.23`
+**Toolchain at discovery:** `cyrius 5.7.23` (also reproduces at `5.7.28`)
+**Upstream status:** Slotted for review + fix in `cyrius 5.7.32` (per
+the language-agent review queue, 2026-04-28).
 
 ## Summary
 

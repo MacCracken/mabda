@@ -2,15 +2,17 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
+**Last refresh:** 2026-04-28 (post Step 5a)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
 > Native compute dispatch verified end-to-end on AMD Cezanne (gfx90c)
 > on 2026-04-28 — see
 > [`docs/handoff/2026-04-28-session25-b4-verified.md`](../handoff/2026-04-28-session25-b4-verified.md).
-> That is **the foundation**, not the release. v3.0 is roughly 15%
-> complete by exit criteria; the bulk is still ahead. This punch list
-> is the path from "compute store passes" to "v3.0 ships."
+> Backend abstraction layer + Phase B.4 follow-ups + multi-dispatch
+> validation all landed. Native compute path is solid; **next big
+> chunk is Phase C (textures + render)**, broken into bite-sized
+> sub-steps below.
 
 ## Hard truths up front
 
@@ -26,76 +28,192 @@ Read these before sequencing.
   all six consumers technically able to flip, "running native in
   production across a full release cycle" is what gates AMD wgpu
   retirement at v4.0. v3.0 ship just opens that window.
-- **Tier 1 alone is multi-month.** Backend abstraction + Phase C
-  native (texture + render) + Phase D native (surface) + WGSL
-  lowering is the bulk of the work. The verified compute dispatch is
-  the foundation, not the cap.
+- **Tier 1 is multi-month.** Backend abstraction + Phase B.4
+  follow-ups are done; Phase C native (texture + render) + Phase D
+  native (surface) + WGSL lowering still ahead — bulk of remaining
+  work. Don't try to swallow a phase whole; chunks below.
 - **Linux + AMD only.** v3.0's native backend covers AMD on Linux.
   NVIDIA / Intel / macOS / Windows consumers continue on `wgpu`.
   Don't accept scope-creep that pretends otherwise.
 
 ## Tier 1 — Code completeness
 
-The native backend currently proves **compute dispatch only**. Roadmap
-exit criteria require all four integration shapes (`phase0`,
-`compute_e2e`, `render_e2e`, `render_graph_e2e`) plus
-`examples/stdlib-consumer/` to pass under **both** backends on AMD.
-
-### Backend abstraction layer (Phase B5 — proposal already drafted)
+### Backend abstraction layer ✅
 
 Proposal: [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md).
 
-- [ ] `src/backend.cyr` — 11-slot `Backend` struct + `BACKEND_KIND_*`
-  constants + null-slot helpers + struct-layout assertions
-- [ ] `src/backend_wgpu.cyr` — fill all 11 slots with wgpu calls;
-  existing modules' wgpu wiring moves here
-- [ ] Refactor `src/buffer.cyr`, `src/compute.cyr`, etc. to dispatch
-  through `ctx->backend->slot`; public API surface unchanged
-- [ ] `MABDA_BACKEND_KIND` compile-time constant in `src/lib.cyr`
-- [ ] `GpuContext` grows from 32 → 40 bytes (backend ptr at +32);
-  single greppable migration of every `alloc(32)`
-- [ ] Smoke test: Cyrius-fn-to-Cyrius-fn `fncall` through a struct
-  slot — a shape we haven't extensively exercised; do this **first**
-  before committing to the layout
+- [x] `src/backend.cyr` — 11-slot `Backend` struct + `BACKEND_KIND_*`
+  constants + null-slot helpers + struct-layout assertions (Step 1)
+- [x] `src/backend_wgpu.cyr` — fill all 11 slots with wgpu calls;
+  existing wiring extracted into the slot wrappers (Step 2)
+- [x] Refactor `src/buffer.cyr`, `src/compute.cyr`, `src/context.cyr`
+  to dispatch through `ctx->backend->slot`; public API surface
+  unchanged. `gpu_buffer_create / write / read / release`,
+  `gpu_shader_module_create / release`, `gpu_compute_dispatch`,
+  `gpu_device_wait_idle`, `gpu_context_release` all dispatch through
+  the abstraction (Steps 3a–3g)
+- [x] `MABDA_BACKEND_KIND` compile-time constant in `src/backend.cyr`
+  (Step 4e)
+- [x] `GpuContext` grew 32 → 40 → 48 → 96 bytes (Steps 3a, 4e, 4f.iv)
+  — single greppable migration of every `alloc(N)` site
+- [x] Smoke test: Cyrius-fn-to-Cyrius-fn `fncall` through a struct
+  slot — `fncall1/2/3/5/6` all proven against real hardware (Steps 1, 3b–g)
 
-### Native backend slot fills (Phases C + D)
+### Native backend slot fills
 
-- [ ] `Backend.compute_dispatch` on native — lift the working
-  `native_compute_store` flow into a reusable function. Today it's
-  470 lines inline in the program; needs multi-dispatch per submit
-  and BO ownership across calls.
-- [ ] **Phase C — texture path on native.** `Backend.texture_create
-  / write / release`. Tile / format / mip / view work; AMD-specific
-  surface layouts.
-- [ ] **Phase C — render pipeline + render pass on native.**
-  `Backend.render_pipeline_create / render_pass_begin / end / draw`.
-  Graphics ring, vertex fetch, MRT, depth/stencil. Substantial.
-- [ ] **Phase D — surface + present on native.** DRM/KMS scanout,
-  page flips, vblank sync. Required by soorat / aethersafta.
-- [ ] **WGSL → GFX9 ISA lowering.** Roadmap-mandated for v3.0. Today
-  native takes pre-compiled ISA only; consumers ship WGSL. Without
-  lowering, no v2.x consumer can run on native unmodified.
-- [ ] Native equivalents of `phase0`, `compute_e2e`, `render_e2e`,
-  `render_graph_e2e` — preferably by making the existing programs
-  backend-agnostic (dispatch through `Backend`) rather than
-  duplicating
+#### Compute dispatch ✅
 
-### Phase B.4 follow-ups (small)
+- [x] `Backend.compute_dispatch` on native — lifted into
+  `native_compute_dispatch_cached` in `src/backend_native.cyr`
+  (Steps 4a–4d, 4f.iv)
+- [x] `gpu_context_new_native()` public bring-up entry — opens
+  fd, allocates ctx_id + stub + cached IB + cached fence (Step 4e)
+- [x] Multi-dispatch validated end-to-end on real hardware — same
+  ctx, two back-to-back dispatches both pass (Step 5a)
+- [x] `programs/native_compute_store.cyr` is the native-equivalent
+  of `compute_e2e` (writes 0xDEADBEEF, verifies via CPU readback)
 
-Captured in the B.4-verified handoff; clean up before the abstraction
-work or you'll inherit them later.
+#### Phase C — texture path on native (broken into chunks)
 
-- [ ] Tighten BO page perms from `R | W | X` everywhere back to
-  per-BO minimums + add a regression test that catches the
-  narrowing failure mode
-- [ ] Memory-model design: how does native BO management surface to
-  the `Resource` tracker (`src/resource.cyr`)?
-- [ ] Error-model mapping: `errno` → `GpuErr` codes. The codes exist
-  in `src/error.cyr`; the mapping doesn't. Pick a convention before
-  the abstraction work locks it in.
-- [ ] BO ownership lifecycle so `native_compute_store`-shaped flows
-  can dispatch many times without leaking. Per-context IB ring
-  buffer; per-context BO list.
+The smallest first cut is a flat 2D RGBA8 BO with no tiling/no
+mipmaps/no DCC. Format/tiling expansion comes later as consumers
+need it.
+
+- [ ] **5.1** — `native_texture_create_2d_rgba8(fd, w, h, out)`
+  primitive. Allocates GTT BO sized `w * h * 4`, va_maps at the
+  texture VA range (e.g. `0xFFFF800100A00000`+), returns
+  `(handle, va, addr, size)` packed in a 32-byte struct. CPU
+  regression test: size formula, struct layout, VA-range
+  isolation from existing IB / fence / shader / stub VAs.
+- [ ] **5.2** — `native_texture_release_2d_rgba8(fd, tex)`
+  primitive. va_unmap + bo_release_gtt. Pair with 5.1.
+- [ ] **5.3** — Texture slot signatures designed in
+  `docs/proposals/v3-backend-interface.md` revision: `texture_create`,
+  `texture_write`, `texture_read`, `texture_release` slot signatures.
+  Backend struct grows from 88 → 120 bytes (4 new slots).
+- [ ] **5.4** — `src/backend.cyr` updated with new slot offsets +
+  layout asserts. CPU tests for new constants.
+- [ ] **5.5** — `_backend_wgpu_texture_*` slot wrappers around
+  `wgpu_device_create_texture` / `wgpu_queue_write_texture` /
+  copy-texture-to-buffer + map for read.
+- [ ] **5.6** — `_backend_native_texture_*` slot wrappers around
+  the 5.1/5.2 primitives + a CPU-side memcpy for write/read
+  (since GTT pages are CPU-accessible). No GPU-side pixel
+  conversion yet.
+- [ ] **5.7** — Public `gpu_texture_create_2d_rgba8 / write / read
+  / release` dispatchers in `src/texture.cyr`. Coexist with v2.x
+  `texture_create_rgba8` which retires at v5.1.
+- [ ] **5.8** — Native texture round-trip end-to-end test:
+  CPU-write pattern → GPU buffer → native texture (via copy or
+  shader) → CPU-readback. Use `programs/native_compute_store.cyr`
+  as the template; new program `programs/native_texture_e2e.cyr`.
+- [ ] **5.9** — Update `programs/phase0.cyr` Test 11 family to
+  also exercise `gpu_texture_*` dispatchers under wgpu (mirrors
+  the Step 3c `gpu_buffer_*` validation — proves the slot wires
+  reach real wgpu without regressions).
+
+#### Phase C — render pipeline + render pass on native (broken into chunks)
+
+- [ ] **6.1** — Design doc: GFX9 graphics pipeline state
+  (vertex shader registers, fragment shader registers, rasterizer
+  state, color/depth target setup). Pages from amdgpu kernel
+  source + Mesa radv. Filed in
+  `docs/proposals/v3-native-render-design.md`.
+- [ ] **6.2** — Trivial GFX9 vertex+fragment shader pair
+  (full-screen triangle, solid color output) compiled via
+  `clang -target amdgcn`. Bytes get the same byte-exact treatment
+  as `native_gfx9_shader_store_deadbeef`.
+- [ ] **6.3** — `native_render_target_create(fd, w, h, format, out)`
+  primitive — render-target BO + va_map at a render-target VA
+  range. Reuse 5.1's BO allocator pattern.
+- [ ] **6.4** — PM4 packets for graphics pipeline state setup
+  (PA_SC_SCREEN_SCISSOR, PA_CL_VPORT_*, CB_TARGET_MASK, …). Build
+  on top of existing PM4 helpers.
+- [ ] **6.5** — `native_pm4_build_render_clear_triangle(buf, …)` —
+  PM4 stream that runs a vertex+fragment dispatch to clear a
+  render target with a solid color. Mirrors
+  `native_pm4_build_compute_store_deadbeef` shape.
+- [ ] **6.6** — `native_render_dispatch_simple(ctx, …)` — analogous
+  to `native_compute_dispatch_cached` but on the GFX ring.
+- [ ] **6.7** — Backend interface render-pipeline / render-pass
+  slots (proposal revision; ~6 new slots: pipeline_create,
+  pipeline_release, pass_begin, pass_end, draw, render-target
+  binding).
+- [ ] **6.8** — `_backend_wgpu_*` and `_backend_native_*` wrappers.
+- [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
+  (mirror of `programs/render_e2e.cyr`).
+
+#### Phase D — surface + present on native (broken into chunks)
+
+- [ ] **7.1** — DRM/KMS device discovery: enumerate connectors,
+  modes, encoders. `native_kms_init(fd)` returns a KmsState.
+  Filed under `src/backend_native_kms.cyr` to keep it separate
+  from the compute path.
+- [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
+  for the first connected DP/HDMI), set it.
+- [ ] **7.3** — Framebuffer creation: KMS-side wrapping of a
+  GTT BO as a scanout surface.
+- [ ] **7.4** — Page flip + vblank: `drmModePageFlip` analog
+  through direct ioctl; vblank wait via `drmWaitVBlank` analog.
+- [ ] **7.5** — Backend interface surface slots
+  (`surface_configure / acquire / present`).
+- [ ] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
+  wrappers.
+- [ ] **7.7** — Public dispatchers + `programs/native_present_e2e.cyr`
+  (open a window, render a clear, present, hold for 1s, exit).
+
+#### WGSL → GFX9 ISA lowering (broken into chunks)
+
+This is the v3.0 hard truth. Scoping carefully.
+
+- [ ] **8.1** — Frontend choice: WGSL parser vs SPIR-V loader.
+  Design doc + decision in `docs/proposals/v3-shader-lowering.md`.
+  Prefer SPIR-V (well-specified, existing parsers) if mabda
+  consumers can ship SPIR-V; WGSL is the customer-facing format
+  but transpiling WGSL→SPIR-V is a separate problem with existing
+  tools (Naga, Tint).
+- [ ] **8.2** — IR design: tagged-union AST for the subset
+  needed by Phase 1 (compute kernels with global stores, no
+  textures, no atomics).
+- [ ] **8.3** — GFX9 instruction encoder library:
+  `src/gfx9_isa.cyr` with builders for SMEM / VMEM / SOPP / VOP1
+  / VOP2 / VOP3 / VINTRP categories.
+- [ ] **8.4** — Register allocator: linear-scan over SGPRs +
+  VGPRs. Spill to scratch deferred (large-shader follow-up).
+- [ ] **8.5** — End-to-end smoke: hand-built IR for "write
+  0xDEADBEEF to s[0:1]" → runs through encoder → produces bytes
+  that match the existing `native_gfx9_shader_store_deadbeef`
+  byte-for-byte.
+- [ ] **8.6** — Storage-buffer reads + writes (`global_load_*`,
+  `global_store_*`).
+- [ ] **8.7** — User-data binding mapping: WGSL/SPIR-V binding
+  points → USER_DATA_0..3 SGPR slots.
+- [ ] **8.8** — Workgroup size > 1 support (NUM_THREAD_X/Y/Z).
+- [ ] **8.9** — `gpu_shader_module_create` accepts source bytes
+  on native and runs them through the lowering. WGSL or SPIR-V
+  per the 8.1 decision.
+- [ ] **8.10** — Re-generate `native_gfx9_shader_store_deadbeef`
+  from WGSL/SPIR-V source via the lowering. Replaces the hand-
+  authored bytes; CI check that the lowered bytes match the
+  hand-authored bytes byte-for-byte.
+
+#### Phase B.4 follow-ups ✅
+
+- [x] Tighten BO page perms — `_NATIVE_PERM_SHADER` (R|X),
+  `_NATIVE_PERM_DATA` (R|W), `_NATIVE_PERM_IB` (R|X — X bit is
+  load-bearing on Cezanne; surprise) (Step 4f.ii)
+- [x] Memory-model design — `FrameResources` is now ctx-aware,
+  `frame_resources_release_buffers` dispatches through
+  `ctx->backend->buffer_release` (Step 4f.iii)
+- [x] Error-model mapping — `_native_errno_to_gpu_err`,
+  `_native_neg_rc_to_gpu_err`. Native fails through this helper
+  for ENOMEM/EPERM/EACCES/ENOENT/EBUSY/ETIMEDOUT/ETIME (Step 4f.i)
+- [x] BO ownership lifecycle — per-context cached IB + fence BOs
+  (Step 4f.iv); 7 syscalls of churn per dispatch eliminated. Multi-
+  dispatch validated (Step 5a). **Open follow-up:** BO list still
+  hardcoded to 5 entries; multi-buffer dispatches need a
+  parameterized residency list — file as Phase C / Tier 1
+  follow-up under one of the 5.x or 6.x sub-steps.
 
 ## Tier 2 — Integration & regression
 
@@ -106,10 +224,11 @@ work or you'll inherit them later.
   unchanged); zero behavioural changes
 - [ ] At least one consumer (likely soorat or compute-heavy bijli)
   runs a CI matrix entry under `native` on AMD hardware
-- [ ] All 387 CPU assertions still pass — they're backend-agnostic
-  and should be untouched, but verify after every Tier 1 step
-- [ ] All 13 GPU benches pass under `native` on AMD (today they only
-  run under `wgpu`)
+- [x] CPU assertions still pass — 624 (mabda.tcyr) + 227
+  (mabda_v3.tcyr) = **851 passing as of Step 5a**, all backend-
+  agnostic, no regressions throughout backend abstraction work
+- [ ] All 13 GPU benches pass under `native` on AMD (today they
+  only run under `wgpu`)
 
 ## Tier 3 — Performance evidence (the v3.0 "story")
 
@@ -170,24 +289,20 @@ Ordered roughly the way they'll need to run.
   on the new abstraction layer.
 - [ ] `VERSION` bump `2.5.0` → `3.0.0` + `cyrius.cyml` cross-check
   via `scripts/version-check.sh`
-- [ ] Toolchain pin decision — currently `5.7.23` (bumped during
-  Session 25). Confirm this is the release target, or pin to
-  whatever 5.6.x stable shipped most recently. Document the choice.
+- [x] Toolchain pin decision — `cyrius = "5.7.28"` in `cyrius.cyml`
+  as of 2026-04-28 (bumped during Step 4f.iii). Confirm at release
+  time whether to bump again or pin here.
 - [ ] `cyrius distlib` regenerate — `dist/mabda.cyr` will grow
   significantly (Backend layer + both backend implementations); CI
   gate must not drift
 - [ ] Lint / fmt / vet clean across the **whole repo** (not just
   touched files) — `cyrius lint src/*.cyr programs/*.cyr`,
   `cyrius fmt --check`, `cyrius vet programs/smoke.cyr`
-- [ ] **Split `tests/tcyr/mabda.tcyr`** into multiple smaller files
-  to work around the `cyrius lint` file-size threshold bug
-  (`docs/development/issues/2026-04-28-cyrlint-multi-line-assert.md`).
-  Suggest grouping by phase: `mabda.tcyr` for v2.x assertions,
-  `mabda_v3.tcyr` for the v3 backend-abstraction tests added in
-  Steps 1-3e+, possibly more splits as the suite grows. Update the
-  Makefile + CI workflow to run all the test files. Without this,
-  the v3.0 lint-clean gate cannot be met while the upstream lint
-  bug is open.
+- [x] **Split `tests/tcyr/mabda.tcyr`** into multiple smaller files
+  (Cleanup 1, 2026-04-28). `mabda.tcyr` for v2.x (624 assertions);
+  `mabda_v3.tcyr` for v3 backend-abstraction tests (227 assertions).
+  `Makefile` test target + CI workflows (`ci.yml`, `release.yml`)
+  run both. Lint clean on both files.
 - [ ] `.github/workflows/release.yml` tag filter + version-verify
   still work against the `v3.0.0` shape
 - [ ] Soak window — run the new bundle in CI for N days (suggest
@@ -208,57 +323,52 @@ These keep the v4.0 / v5.0 commitments visible from the v3.0 ship.
   file's existence keeps the commitment visible from the v3.0 ship.
 - [ ] (Optional) ADR 008 placeholder for Intel native (v5.0) — same
   shape. Could also wait until v5.0 design opens.
-- [ ] Issue tracker entries for known v3.0-deferred items: BO perms
-  tightening, multi-dispatch IB ring, `Resource` tracker
-  integration. Anything that the audit flags but doesn't block ship.
+- [ ] Issue tracker entries for known v3.0-deferred items:
+  parameterized BO residency list, multi-buffer dispatches,
+  `Resource` tracker texture-release once Phase C lands. Anything
+  that the audit flags but doesn't block ship.
 
-## Recommended sequencing
+## Recommended sequencing (refreshed 2026-04-28)
 
-This is the smallest-bites-first order. Each step is verifiable
-end-to-end before the next; nothing past Step 4 starts until Step 4
-clean.
+The smallest-bites-first order. Each step is verifiable end-to-end
+before the next. **Steps 1–4 done; we're at the start of Step 5.**
 
-1. **Backend abstraction smoke test.** Land `src/backend.cyr` with
-   the 11-slot struct + layout assertions. Add a single Cyrius-fn
-   that registers a stub backend with one slot and proves the
-   `fncall` through a struct slot works. Smallest possible; unblocks
-   everything.
-2. **`backend_wgpu.cyr` filling all slots.** Refactor `src/buffer.cyr`,
-   `src/compute.cyr`, etc. to dispatch through `ctx->backend`. Run
-   all 387 CPU assertions + the four integration programs under
-   `wgpu` and prove zero regression. This is the load-bearing
-   abstraction-validation step — if the abstraction breaks anything
-   here, fix it before going further.
-3. **Lift `native_compute_store` into `Backend.compute_dispatch`.**
-   First native slot lit. Native equivalent of `compute_e2e` runs.
-4. **Phase B.4 follow-ups** (BO perms, error-model mapping, IB ring,
-   Resource integration). Cleans up the foundation before the bigger
-   work. Don't skip.
-5. **Phase C native** (texture + render pipeline). Biggest single
-   chunk; budget multiple weeks. Probably split into 5a (texture),
-   5b (render pipeline + render pass), 5c (render_graph replay on
-   native).
-6. **Phase D native** (surface). Gated on Phase C.
-7. **WGSL → GFX9 lowering** — can be parallel to Phase C/D once the
-   SPIR-V vs WGSL frontend choice is made. May want to spike this
-   at step 4 instead, depending on the answer.
-8. **Bench harness + matrix + perf docs** once all four programs
-   pass under both backends.
+1. ~~Backend abstraction smoke test~~ ✅
+2. ~~`backend_wgpu.cyr` filling all slots + refactor public API~~ ✅
+3. ~~Lift `native_compute_store` into `Backend.compute_dispatch`~~ ✅
+4. ~~Phase B.4 follow-ups (BO perms, error mapping, IB ring,
+   Resource tracker)~~ ✅
+5. **Phase C native (texture + render pipeline)** — chunks 5.1–5.9
+   (texture) then 6.1–6.9 (render pipeline). At least 18 sub-steps;
+   budget weeks. Start with 5.1 (texture-create primitive) — small
+   bite that establishes the BO allocation pattern.
+6. **Phase D native (surface)** — chunks 7.1–7.7. Gated on Phase C
+   render path landing.
+7. **WGSL → GFX9 lowering** — chunks 8.1–8.10. Can be parallel to
+   Phase C/D once the SPIR-V vs WGSL frontend choice (8.1) is made.
+   May want to spike 8.1 alongside 5.x to surface design risk early.
+8. **Bench harness + matrix + perf docs** — Tier 3, once all four
+   programs pass under both backends.
 9. **Tier 4 documentation** — runs alongside everything; finalize
    at end.
 10. **Tier 5 release engineering** — P(-1) audit, version bump,
     distlib regen, soak, RC, ship.
 
-## Status snapshot (update as we go)
+## Status snapshot (refreshed 2026-04-28)
 
 | Tier | Status | Last touched |
 |------|--------|-------------|
-| Tier 1 — Code completeness | not started | — |
-| Tier 2 — Integration & regression | not started | — |
-| Tier 3 — Performance evidence | not started | — |
-| Tier 4 — Documentation | partially: handoff + CHANGELOG `[Unreleased]` written; CLAUDE.md / stdlib-integration / migration guide pending | 2026-04-28 |
-| Tier 5 — Release engineering | not started | — |
-| Tier 6 — Forward tracking | not started | — |
+| Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
+| Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
+| Tier 1 — Phase C texture | ⬜ not started — chunks 5.1–5.9 queued | — |
+| Tier 1 — Phase C render | ⬜ not started — chunks 6.1–6.9 queued | — |
+| Tier 1 — Phase D surface | ⬜ not started — chunks 7.1–7.7 queued | — |
+| Tier 1 — WGSL lowering | ⬜ not started — chunks 8.1–8.10 queued | — |
+| Tier 2 — Integration & regression | partial — CPU 851/851 pass; consumer sweep pending | 2026-04-28 |
+| Tier 3 — Performance evidence | ⬜ not started | — |
+| Tier 4 — Documentation | partial — handoff + 2 issue docs filed; CLAUDE.md / migration guide pending | 2026-04-28 |
+| Tier 5 — Release engineering | partial — toolchain pin (5.7.28) + test split landed; rest pending | 2026-04-28 |
+| Tier 6 — Forward tracking | ⬜ not started | — |
 
 ## Notes / decisions captured along the way
 
@@ -267,5 +377,32 @@ punch-list work that future-you should know about.)
 
 - **2026-04-28** — Punch list opened. Phase B.4 verified on AMD
   Cezanne; native compute dispatch foundation in place. Backend
-  interface proposal drafted (`docs/proposals/v3-backend-interface.md`),
-  not yet approved.
+  interface proposal drafted (`docs/proposals/v3-backend-interface.md`).
+- **2026-04-28** — Backend abstraction landed end-to-end (Steps 1–3g).
+  Cyrius-fn-via-fnptr-via-struct-slot dispatch validated for `fncall1`,
+  `fncall2`, `fncall3`, `fncall5`, `fncall6` against real wgpu hardware.
+  The `feedback_fncall6_wgpu` memory's concern was about extern-C ABI
+  mismatch; Cyrius-to-Cyrius works fine.
+- **2026-04-28** — Native Backend slot wiring complete (Steps 4a–4d).
+  `programs/native_compute_store.cyr` shrunk from 446 → 244 lines.
+- **2026-04-28** — `MABDA_BACKEND_KIND` constant + `gpu_context_new_native`
+  entry point landed (Step 4e). GpuContext now 48 → 96 bytes (Step 4f.iv).
+- **2026-04-28** — Phase B.4 follow-ups all done (Steps 4f.i–iv).
+  `programs/native_compute_store.cyr` final size: 244 lines.
+- **2026-04-28** — Cyrius global init-order bug discovered during
+  Step 4f.ii. Filed as
+  `docs/development/issues/2026-04-28-cyrius-global-init-order.md`
+  and saved as memory `feedback_cyrius_global_init_order.md`.
+  CPU regression test pattern for computed constants pays for itself.
+- **2026-04-28** — `cyrius lint` file-size threshold bug filed as
+  `docs/development/issues/2026-04-28-cyrlint-multi-line-assert.md`.
+  Workaround: split big test files (`mabda.tcyr` + `mabda_v3.tcyr`).
+- **2026-04-28** — `cyim 1.1.4` regex commands fail mid-session. Filed
+  as `docs/development/issues/2026-04-28-cyim-regex-pattern-error.md`.
+  Workaround: use `cyim --batch` with NUL-separated pairs from Python
+  heredocs; `cyim --write` for full-file overwrites.
+- **2026-04-28** — Toolchain bumped to `cyrius 5.7.28` (Step 4f.iii).
+- **2026-04-28** — Multi-dispatch validated (Step 5a). Cached IB +
+  fence BOs survive back-to-back submits without state leakage. Two
+  dispatches per `make test-native-compute-store` run, both pass at
+  0 ms signal.
