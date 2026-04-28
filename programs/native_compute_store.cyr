@@ -155,31 +155,6 @@ fn main() {
     print_cstr(" va=0x"); print_i64(out_va);
     print_cstr(" seeded with 0xBAADF00D\n");
 
-    # ---- Fence BO: 4 KiB GTT, canonical-high VA ----
-    # Session 25b: kernel writes the IB completion sequence number to
-    # fence_va + 32 (8 bytes). Required by the 4-chunk Mesa-shape submit;
-    # without an explicit FENCE chunk the kernel fallback path doesn't
-    # enqueue the IB to MEC for compute submits on this kernel.
-    var fence_size = 4096;
-    var fence_bo[16];
-    rc = native_bo_create_gtt(fd, fence_size, &fence_bo);
-    if (rc != 0) {
-        print_cstr("FAIL: fence bo create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 5;
-    }
-    var fence_handle = load64(&fence_bo + 0);
-    var fence_map    = load64(&fence_bo + 8);
-    memset(fence_map, 0, fence_size);
-    var fence_va = 0xFFFF800100600000;
-    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
-    if (rc != 0) {
-        print_cstr("FAIL: fence va_map errno="); print_i64(0 - rc); print_cstr("\n");
-        return 5;
-    }
-    print_cstr("fence bo="); print_i64(fence_handle);
-    print_cstr(" va=0x"); print_i64(fence_va); print_cstr("\n");
-
     # ---- Build PM4 stream (Step 4a: extracted to backend_native.cyr) ----
     # native_pm4_build_compute_store_deadbeef() emits the full
     # Mesa-verified preamble + DISPATCH_DIRECT + post-dispatch
@@ -222,98 +197,32 @@ fn main() {
     }
     print_cstr("---- IB DUMP END ----\n");
 
-    # ---- IB BO: 4 KiB GTT, PM4 at offset 0, VA @ canonical-high ----
-    var ib_size = 4096;
-    var ib_bo[16];
-    rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
-    if (rc != 0) {
-        print_cstr("FAIL: ib bo create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 5;
-    }
-    var ib_handle = load64(&ib_bo + 0);
-    var ib_map    = load64(&ib_bo + 8);
-    memset(ib_map, 0, ib_size);
-    memcpy(ib_map, pm4, pm4_bytes);
-    var ib_va = 0xFFFF800100200000;
-    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
-    if (rc != 0) {
-        print_cstr("FAIL: ib va_map errno="); print_i64(0 - rc); print_cstr("\n");
-        return 5;
-    }
-    print_cstr("ib bo="); print_i64(ib_handle);
-    print_cstr(" va=0x"); print_i64(ib_va); print_cstr("\n");
-
-    # ---- Context ----
-    var req_ctx[16];
-    rc = native_ctx_alloc(fd, &req_ctx);
+    # ---- Dispatch (Step 4b: extracted to native_compute_dispatch_simple) ----
+    # Allocates IB + fence + syncobj internally, submits via 4-chunk
+    # Mesa shape, waits up to 15s, releases ephemerals before return.
+    var ctx_handle_block[16];
+    rc = native_ctx_alloc(fd, &ctx_handle_block);
     if (rc != 0) {
         print_cstr("FAIL: ctx_alloc errno="); print_i64(0 - rc); print_cstr("\n");
         return 6;
     }
-    var ctx_id = native_ctx_alloc_id(&req_ctx);
+    var ctx_id = native_ctx_alloc_id(&ctx_handle_block);
     print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
 
-    # ---- Inline BO list (Mesa BO_HANDLES chunk path) ----
-    # Session 25b: switched away from BO_LIST_OP_CREATE here. Per the
-    # session-9 finding (echoed in native_compute_spike.cyr), the
-    # BO_LIST_OP_CREATE submit path on this kernel accepts our submit
-    # but never queues the IB to the CP — the kernel TDR-recovers
-    # after 10s and signals the syncobj as if the IB completed,
-    # producing the false-PASS shape we hit in the first store run
-    # (sync-obj signals fast, marker stale, out[0] = sentinel).
-    # Mesa rusticl uses the BO_HANDLES chunk path; mirror that.
-    # 5-entry BO list: shader, stub, out, ib, fence. Priorities mirror
-    # Mesa rusticl pattern (eviction hint).
-    var entries[40];
-    store32(&entries +  0, fence_handle);  store32(&entries +  4, 1);
-    store32(&entries +  8, stub_handle);   store32(&entries + 12, 3);
-    store32(&entries + 16, out_handle);    store32(&entries + 20, 3);
-    store32(&entries + 24, shader_handle); store32(&entries + 28, 4);
-    store32(&entries + 32, ib_handle);     store32(&entries + 36, 10);
-    var bo_list_in[24];
-    store32(&bo_list_in +  0, 0xFFFFFFFF);  # operation sentinel
-    store32(&bo_list_in +  4, 0xFFFFFFFF);  # list_handle sentinel
-    store32(&bo_list_in +  8, 5);            # bo_number
-    store32(&bo_list_in + 12, 8);            # sizeof(drm_amdgpu_bo_list_entry)
-    store64(&bo_list_in + 16, &entries);
-
-    # ---- Sync-obj ----
-    var syncobj_handle_ptr = alloc(8);
-    rc = native_syncobj_create(fd, syncobj_handle_ptr);
-    if (rc != 0) {
-        print_cstr("FAIL: syncobj_create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 8;
-    }
-    var syncobj_handle = load64(syncobj_handle_ptr);
-    print_cstr("syncobj="); print_i64(syncobj_handle); print_cstr("\n");
-
-    # ---- Submit on COMPUTE ring (BO_HANDLES inline path) ----
-    # Session 25b: 4-chunk Mesa-shape submit. fence_offset=32 matches Mesa.
-    # IB flag 0x08 = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (Mesa-byte-exact).
-    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
-    store64(fence_map + 32, 0);
     var t_submit_start = mono_ns();
-    rc = native_cs_submit_4chunk(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
-                                 AMDGPU_HW_IP_COMPUTE, syncobj_handle,
-                                 fence_handle, 32, 0x08);
-    if (rc != 0) {
-        print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
-        return 9;
-    }
-    print_cstr("submitted to COMPUTE ring\n");
-
-    # ---- Wait 15 sec ----
-    var deadline = mono_ns() + 15000000000;
-    rc = native_syncobj_wait(fd, syncobj_handle, deadline);
-    if (rc != 0) {
-        print_cstr("FAIL: syncobj_wait errno="); print_i64(0 - rc); print_cstr("\n");
-        return 10;
-    }
+    rc = native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
+                                        shader_handle, stub_handle, out_handle,
+                                        t_submit_start + 15000000000);
     var elapsed_ms = (mono_ns() - t_submit_start) / 1000000;
     print_cstr("submit-to-syncobj-signal: "); print_i64(elapsed_ms); print_cstr(" ms");
     if (elapsed_ms >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
     print_cstr("\n");
+    if (rc != 0) {
+        print_cstr("FAIL: native_compute_dispatch_simple rc="); print_i64(rc); print_cstr("\n");
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return 9;
+    }
 
     # ---- Verify output ----
     # Session 25b: read post-dispatch CP marker first — proves CP returned
@@ -326,7 +235,6 @@ fn main() {
     print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
     if (v0 != 0xDEADBEEF) {
         print_cstr("FAIL: mismatch at [0]\n");
-        native_syncobj_destroy(fd, syncobj_handle);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
         return 11;
@@ -339,10 +247,7 @@ fn main() {
     print_cstr("sentinel intact at [1]\n");
 
     # ---- Teardown ----
-    native_syncobj_destroy(fd, syncobj_handle);
     native_ctx_free(fd, ctx_id);
-    native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
-    native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
     native_gem_va_unmap(fd, out_handle, out_va, out_size);
     native_bo_release_gtt(fd, out_handle, out_map, out_size);
     native_gem_va_unmap(fd, stub_handle, stub_va, stub_size);

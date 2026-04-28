@@ -1097,3 +1097,130 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
 }
+
+# ================================================================
+# v3 Step 4b — composed dispatch (PM4 + IB + fence + submit + wait)
+# ================================================================
+# All-in-one COMPUTE-ring dispatch built on top of the existing
+# primitives. Caller owns shader / stub / output BOs (passed in by
+# handle); the IB BO, fence BO, syncobj are ephemeral — allocated,
+# va-mapped, used once, and released before this fn returns.
+#
+# Args:
+#   fd            — DRM render node fd
+#   ctx_id        — amdgpu context id (from native_ctx_alloc)
+#   pm4           — pointer to a PM4 dword stream (caller-built)
+#   pm4_bytes     — byte count of the PM4 stream
+#   shader_handle — KMS handle of the shader BO
+#   stub_handle   — KMS handle of the Mesa-stub BO
+#   out_handle    — KMS handle of the output BO
+#   timeout_ns    — syncobj wait deadline (absolute, in ns; pass
+#                   mono_ns() + 15_000_000_000 for a 15-second wait)
+#
+# Returns 0 on success (syncobj signalled within timeout) or a
+# GPU_ERR_* code on failure. Does NOT verify the post-dispatch
+# marker or the output bytes — that's the caller's job.
+#
+# IB and fence are allocated at hardcoded VAs (0xFFFF800100200000
+# and 0xFFFF800100600000 respectively) — caller's BOs must not
+# collide with these. The 5-entry BO_HANDLES list is hardcoded:
+# fence / stub / out / shader / IB. Generalising to caller-provided
+# residency is a Step 4c+ follow-up.
+fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
+        shader_handle, stub_handle, out_handle, timeout_ns) {
+    var page_perms = AMDGPU_VM_PAGE_READABLE
+                   | AMDGPU_VM_PAGE_WRITEABLE
+                   | AMDGPU_VM_PAGE_EXECUTABLE;
+
+    # Allocate IB BO at the canonical-high IB VA.
+    var ib_size = 4096;
+    var ib_bo[16];
+    var rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
+    if (rc != 0) { return GPU_ERR_BUFFER; }
+    var ib_handle = load64(&ib_bo + 0);
+    var ib_map    = load64(&ib_bo + 8);
+    memset(ib_map, 0, ib_size);
+    memcpy(ib_map, pm4, pm4_bytes);
+    var ib_va = 0xFFFF800100200000;
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, page_perms);
+    if (rc != 0) {
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        return GPU_ERR_BUFFER;
+    }
+
+    # Allocate fence BO at the canonical-high fence VA.
+    var fence_size = 4096;
+    var fence_bo[16];
+    rc = native_bo_create_gtt(fd, fence_size, &fence_bo);
+    if (rc != 0) {
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        return GPU_ERR_BUFFER;
+    }
+    var fence_handle = load64(&fence_bo + 0);
+    var fence_map    = load64(&fence_bo + 8);
+    memset(fence_map, 0, fence_size);
+    var fence_va = 0xFFFF800100600000;
+    rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size, page_perms);
+    if (rc != 0) {
+        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        return GPU_ERR_BUFFER;
+    }
+
+    # Build the 5-entry inline BO_HANDLES list (Mesa rusticl shape).
+    var entries[40];
+    store32(&entries +  0, fence_handle);  store32(&entries +  4, 1);
+    store32(&entries +  8, stub_handle);   store32(&entries + 12, 3);
+    store32(&entries + 16, out_handle);    store32(&entries + 20, 3);
+    store32(&entries + 24, shader_handle); store32(&entries + 28, 4);
+    store32(&entries + 32, ib_handle);     store32(&entries + 36, 10);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 5);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+
+    # Sync-obj.
+    var syncobj_handle_ptr = alloc(8);
+    rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    if (rc != 0) {
+        native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
+        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        return GPU_ERR_OTHER;
+    }
+    var syncobj_handle = load64(syncobj_handle_ptr);
+
+    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
+    store64(fence_map + 32, 0);
+
+    # 4-chunk Mesa-shape submit (BO_HANDLES + SYNCOBJ_OUT + FENCE + IB).
+    rc = native_cs_submit_4chunk(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
+                                 AMDGPU_HW_IP_COMPUTE, syncobj_handle,
+                                 fence_handle, 32, 0x08);
+    if (rc != 0) {
+        native_syncobj_destroy(fd, syncobj_handle);
+        native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
+        native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+        return GPU_ERR_OTHER;
+    }
+
+    # Wait until the syncobj signals, or timeout.
+    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+
+    # Teardown ephemerals — always, regardless of wait_rc.
+    native_syncobj_destroy(fd, syncobj_handle);
+    native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
+    native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
+    native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
+    native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
+
+    if (wait_rc != 0) { return GPU_ERR_OTHER; }
+    return 0;
+}
