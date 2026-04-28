@@ -106,16 +106,135 @@ because the native path doesn't have them yet, and shipping the
 interface with stub-`return GPU_ERR_NOT_IMPLEMENTED` slots that
 don't have a native test path is the wrong move:
 
-| Operation | Gating |
-|-----------|--------|
-| `texture_create / write / release` | needs native texture format/tiling work (Phase C) |
-| `render_pipeline_create / release` | needs native graphics ring path (Phase C) |
-| `render_pass_begin / end` | needs surface acquire (Phase D) |
-| `surface_configure / acquire / present` | needs DRM/KMS scanout path (Phase D/E) |
+| Operation | Gating | Status |
+|-----------|--------|--------|
+| `texture_create / write / read / release` | native texture format/tiling work (Phase C) | **v1 — design landed Step 5.3, code lands Step 5.4** |
+| `render_pipeline_create / release` | native graphics ring path (Phase C) | deferred to Phase C 6.x chunks |
+| `render_pass_begin / end` | surface acquire (Phase D) | deferred to Phase C 6.x chunks |
+| `surface_configure / acquire / present` | DRM/KMS scanout path (Phase D) | deferred to Phase D 7.x chunks |
 
 Each gets added to `Backend` when its native counterpart has a
 working e2e program. Fail-loud (interface compile-error) is better
 than fail-silent (`GPU_ERR_NOT_IMPLEMENTED` at runtime).
+
+## v1 expansion — texture slots (Step 5.3)
+
+The native side already has linear 2D RGBA8 texture create/release
+primitives (Steps 5.1 + 5.2). Step 5.4 promotes them to first-class
+Backend slots so the public API can dispatch through the abstraction
+the same way `gpu_buffer_*` does.
+
+### Layout (v1 — appends 4 texture slots)
+
+```text
+Backend struct (120 bytes — 14 slots × 8 bytes; grew from v0's 88):
+  +0:   ctx_create_from_preinit  (preinit_ptr)              → ctx        (v0)
+  +8:   ctx_release              (ctx)                      → 0          (v0)
+  +16:  buffer_create            (ctx, size, usage)         → buf        (v0)
+  +24:  buffer_write             (ctx, buf, off, ptr, n)    → 0|err      (v0)
+  +32:  buffer_read              (ctx, buf, off, ptr, n)    → 0|err      (v0)
+  +40:  buffer_release           (ctx, buf)                 → 0          (v0)
+  +48:  shader_module_create     (ctx, bytes_ptr, n)        → mod        (v0)
+  +56:  shader_module_release    (ctx, mod)                 → 0          (v0)
+  +64:  compute_dispatch         (ctx, mod, x, y, z, bp)    → 0|err      (v0)
+  +72:  device_wait_idle         (ctx)                      → 0          (v0)
+  +80:  kind                     u64 value: BACKEND_KIND_*               (v0)
+  +88:  texture_create_2d_rgba8  (ctx, width, height)       → tex_ptr   (v1)
+  +96:  texture_write            (ctx, tex_ptr, src, n)     → 0|err     (v1)
+  +104: texture_read             (ctx, tex_ptr, dst, n)     → 0|err     (v1)
+  +112: texture_release          (ctx, tex_ptr)             → 0         (v1)
+```
+
+**Why append after kind:** keeps every v0 slot offset stable
+(BACKEND_SLOT_CTX_RELEASE = 8, BACKEND_SLOT_KIND = 80, etc.). All
+existing tests that assert v0 layout pass unchanged. Future
+expansions (render_pipeline, surface) follow the same rule —
+append at the next available offset, never re-shuffle.
+
+### Slot signatures, per backend
+
+#### `texture_create_2d_rgba8 (ctx, width, height) → tex_ptr`
+
+Returns an opaque `tex_ptr` (u64). Layout is **backend-specific**:
+
+- **wgpu**: pointer to a 32-byte struct `{handle: WGPUTexture,
+  view: WGPUTextureView, _pad: 0, size_bytes: w*h*4}`. The wrapper
+  creates both texture + default 2D view in one shot since
+  consumers always want the view.
+- **native**: pointer to the existing `NativeTexture` struct from
+  Step 5.1 — `{handle: KMS u32, va: u64, addr: u64, size: u64}`.
+  32 bytes; same shape as the wgpu side coincidentally, simplifies
+  caller assumptions.
+
+Caller treats `tex_ptr` as opaque. Both backends allocate the
+struct on the heap; caller releases via `texture_release`.
+
+#### `texture_write (ctx, tex_ptr, src, n) → 0|err`
+
+Write `n` bytes from `src` into the texture's pixel data. Linear
+RGBA8 layout means src is a flat array of `width × height × 4`
+bytes (top-to-bottom, left-to-right, RGBARGBARGBA…).
+
+- **wgpu**: `wgpu_queue_write_texture` with `WGPUTexelCopyTextureInfo`
+  pointing at the texture, `bytesPerRow = width * 4`,
+  `rowsPerImage = height`. Same parameters as the existing
+  `wgpu_queue_write_texture` consumers.
+- **native**: `memcpy(tex.addr, src, n)`. Linear-layout textures
+  in GTT are CPU-accessible; no GPU involvement.
+
+`n` must equal `tex.size` for v1; partial writes deferred to a
+future iteration (consumer driver: when staging buffers come into
+play).
+
+#### `texture_read (ctx, tex_ptr, dst, n) → 0|err`
+
+Read `n` bytes from the texture's pixel data into `dst`. Symmetric
+with `texture_write`.
+
+- **wgpu**: copy_texture_to_buffer + map_sync + memcpy + unmap.
+  Same staging dance as `_backend_wgpu_buffer_read` (Step 2).
+- **native**: `memcpy(dst, tex.addr, n)`. Trivial.
+
+#### `texture_release (ctx, tex_ptr) → 0`
+
+Frees both the GPU resources and the heap struct itself. Caller
+must not access `tex_ptr` after release (current code doesn't
+zero the caller's pointer; that's a `gpu_texture_release` public
+fn responsibility).
+
+- **wgpu**: `wgpu_texture_release(handle)` + `wgpu_texture_view_release(view)` + free struct.
+- **native**: `native_texture_release_2d_rgba8(fd, tex)` (Step 5.2,
+  zeroes the struct in place) + free(tex_ptr).
+
+### What v1 still defers
+
+- **Mipmaps.** RGBA8 only, no mip levels. Mipped textures + on-GPU
+  generation land in v3.1 per the roadmap (consumer catch-up).
+- **Other formats.** RGBA32_FLOAT, BGRA8, depth formats, BC/ETC2/
+  ASTC compressed — all deferred. RGBA8 covers the
+  `examples/stdlib-consumer/` exit criterion; the rest is v3.2.
+- **Tiling.** Native side is linear-only; AMD optimal-tiling
+  (DCC, micro-tiled, swizzled) is performance work post-v3.0.
+- **GPU-side writes.** Compute shaders writing into a texture is a
+  v3.x follow-up; v1 only supports CPU-uploaded textures.
+- **Multi-texture-per-context.** Step 5.1's VA hardcoding limits
+  callers to a single texture per ctx until the multi-texture VA
+  allocator lands later in Phase C.
+
+### Migration sequencing
+
+The same 5-step pattern that landed v0:
+
+1. ~~`src/backend.cyr`~~ extend slot constants + struct size — Step 5.4.
+2. `src/backend_wgpu.cyr` — fill the 4 new slots with wgpu wrappers — Step 5.5.
+3. `src/backend_native.cyr` — fill the 4 new slots with the
+   Step 5.1+5.2 primitives — Step 5.6.
+4. Public `gpu_texture_*` dispatchers in `src/texture.cyr` — Step 5.7.
+5. End-to-end validation: `programs/native_texture_e2e.cyr`
+   under native; `programs/phase0.cyr` Test 12 family under wgpu —
+   Steps 5.8 + 5.9.
+
+All 5 steps are punch-list chunks 5.4 through 5.9.
 
 ## File layout
 
