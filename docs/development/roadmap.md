@@ -24,6 +24,18 @@ gives us a clean A/B across two axes: **(C hooks vs native Cyrius) ×
 does not change when the native backend lands; consumer code stays
 byte-identical.
 
+**Vendor scope of the native backend.** v3.0's native backend is
+**AMD-only** at first ship: it talks to the Linux `amdgpu` kernel
+driver via direct DRM ioctls, builds GFX9 PM4 packet streams, and
+ships pre-compiled GFX9 ISA. Phase B.4 verified the path end-to-end
+on AMD Cezanne (gfx90c). Other AMD generations (GFX10/11/12, RDNA*)
+share the path but need per-generation bring-up. **NVIDIA support is
+scoped to v4.0** (nouveau / nvgpu — different submission path
+entirely, no PM4) and **Intel support is tentatively v5.0** (i915 /
+Xe — different ISA and command streamer). NVIDIA and Intel hardware
+continues to run on the wgpu backend through v3.x, which remains the
+cross-vendor default.
+
 ```
   v2.0.0 → v2.3.0  ─▶  Cyrius port + Rust-v1 parity + P(-1) audit      (shipped)
   v2.4.0 → v2.4.5  ─▶  v1.0 parity completion + FFI validation +
@@ -34,20 +46,46 @@ byte-identical.
        ▼
   v2.5.x           ─▶  render graph follow-ups (out-of-order toposort,
                         aliasing pass) — driven by consumer demand
-  v3.0             ─▶  dual-backend — native Cyrius DRM/KMS added
-                        alongside wgpu+C; API unchanged; A/B bench matrix
+  v3.0             ─▶  dual-backend — native Cyrius (AMD/amdgpu/GFX9)
+                        added alongside wgpu+C; API unchanged; A/B
+                        bench matrix
   v3.1             ─▶  multi-queue + mipmaps (consumer catch-up)
   v3.2             ─▶  compressed textures + SPIR-V (texture/shader breadth)
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
-  v4.0             ─▶  C launcher + wgpu-native retired;
-                        native Cyrius backend is the only backend
+  v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
+                        retires (AMD consumers run on AMD native only)
+  v5.0             ─▶  Intel native backend added (tentative); NVIDIA
+                        wgpu path retires (NVIDIA → NVIDIA native only)
+  v5.1             ─▶  Full wgpu retirement once Intel native is in
+                        production — wgpu-native + C launcher + the
+                        FFI binding code all leave the tree
 ```
 
-Across the v3.x line the C launcher stays in-tree as a permanent
-second backend. It retires in **v4.0** — only after every consumer
-has been running native in production across a full release cycle.
-Retirement is consumer-driven, not calendar-driven.
+Wgpu retirement is **per-chipset, not all-at-once**. Each major
+vendor gets a release window where wgpu and native coexist for that
+vendor (so existing consumers can flip on their schedule). Once a
+vendor's native backend has been in production for a release cycle
+**on that vendor's hardware**, the wgpu path is dropped for that
+vendor — but the wgpu binding stays in-tree to serve the vendors
+whose native backends haven't shipped yet. This keeps the consumer
+migration smooth: nobody on a wgpu-only chipset is forced to move
+before their native backend is real.
+
+The concrete cutovers:
+- **v4.0** — AMD wgpu retires. AMD consumers now run on AMD native
+  only. NVIDIA + Intel still on wgpu.
+- **v5.0** — NVIDIA wgpu retires. NVIDIA consumers now on NVIDIA
+  native. Intel still on wgpu.
+- **v5.1** — Intel wgpu retires; wgpu+C path leaves the tree
+  entirely. Mabda is fully native-Cyrius across every supported
+  vendor.
+
+Each retirement is gated by **(a)** that vendor's native backend
+having been in production across a full release cycle, and **(b)**
+every consumer that ships on that vendor having flipped. Retirement
+is consumer- and vendor-driven; the version numbers above are the
+target shape, not a commitment.
 
 Everything in this roadmap prioritizes **API stability** over
 **backend correctness**. The public surface (context, buffer, compute,
@@ -106,13 +144,25 @@ consumer request arrives. Listed so they don't get lost.
 
 ---
 
-## v3.0 — Dual Backend (Native Cyrius Added Alongside C Path)
+## v3.0 — Dual Backend (AMD Native Added Alongside C Path)
 
-v3.0 **adds** a pure Cyrius GPU backend (DRM/KMS on Linux first, AGNOS
-kernel driver eventually) **alongside** the existing wgpu-native + C
-launcher path. Both coexist; neither is retired. Consumers pick per
-build, the bench suite runs both, and the resulting matrix is the
-evidence base for future cutover decisions.
+v3.0 **adds** a pure Cyrius GPU backend **for AMD hardware**
+(amdgpu kernel driver via direct DRM ioctls; GFX9 ISA + PM4 packet
+streams; AGNOS kernel-driver integration eventually) **alongside**
+the existing wgpu-native + C launcher path. Both coexist; neither is
+retired. Consumers on AMD hardware can opt into the native path; all
+other consumers continue on wgpu unchanged. The bench suite runs both
+on AMD, and the resulting matrix is the evidence base for future
+cutover decisions.
+
+**Vendor status going into v3.0:**
+- **AMD** — first-class on the native path. GFX9 (Cezanne / gfx90c)
+  end-to-end verified Phase B.4 (2026-04-28). Other generations
+  (GFX10/11/12, RDNA*) share the path; bring-up per-generation.
+- **NVIDIA** — wgpu only in v3.x. Native path scoped to v4.0.
+- **Intel** — wgpu only in v3.x. Native path tentative for v5.0.
+- **macOS / Windows** — wgpu only across the v3.x line. The native
+  backend is Linux-DRM only; non-Linux consumers stay on wgpu.
 
 **Why dual rather than swap.** The C-hooked path is our measurement
 baseline. Keeping it in-tree lets us quantify: FFI overhead per call,
@@ -133,33 +183,49 @@ contract held. The v2.5 render graph must replay unchanged on both.
   points behind an internal `Backend` interface (context/buffer/
   compute/texture/render-pipeline/render-pass entry points). The
   public API stays untouched; the indirection lives under `@internal`.
-- **DRM/KMS backend in pure Cyrius** — no libdrm, no libwayland.
-- **WGSL → hardware ISA lowering path** — vendor-first decision
-  deferred; spike during v3.0 design.
+  Proposal: [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md).
+- **AMD/amdgpu DRM backend in pure Cyrius** — no libdrm, no
+  libwayland; direct `ioctl(DRM_IOCTL_AMDGPU_*)`. PM4 packet streams
+  for the command processor; pre-compiled GFX9 ISA. The shape of
+  this work is captured in `src/backend_native.cyr` and
+  `programs/native_compute_store.cyr`; B.4 verified
+  [2026-04-28](../handoff/2026-04-28-session25-b4-verified.md).
+- **WGSL → AMD-ISA lowering path** — required for consumers that
+  ship WGSL shaders (most of v2.x). The native backend takes
+  pre-compiled GFX9 ISA today; landing a lowering path is in scope
+  for v3.0. Cross-vendor lowering (PTX/SPIR-V/Gen) is out of scope
+  here — it lives with each vendor's native arc.
 - **Backend selector** — `wgpu` (C launcher, default, unchanged for
-  existing consumers) vs. `native` (new, opt-in). Probably a
-  `cyrius.cyml` flag or a build-time constant; finalized in ADR 006.
+  existing consumers) vs. `native` (AMD, new, opt-in). Compile-time
+  constant in `src/lib.cyr` (per the v3-backend-interface proposal);
+  promotable to a `cyrius.cyml` flag in v3.1+ if consumer CI matrices
+  need it.
 - **Dual-backend bench harness** — `make bench-gpu` runs the
-  13-bench suite under each backend, emits CSV columns for both,
-  `bench-history.csv` grows a `backend` column.
+  13-bench suite under each backend on AMD hardware, emits CSV
+  columns for both, `bench-history.csv` grows a `backend` column.
 - **ADR 006** — pure Cyrius GPU backend via DRM/KMS. **Supplements**
-  ADR 004 rather than superseding it; both backends are now
-  architecturally load-bearing. Filed when scope concretizes.
+  ADR 004 rather than superseding it; both backends are
+  architecturally load-bearing. Now also the precedent for v4.0
+  (NVIDIA) and v5.0 (Intel).
 
 ### Exit criteria
 - `dist/mabda.cyr` ships with both backends compiled in; default is
   still `wgpu` for API-stability reasons.
-- `examples/stdlib-consumer/`, `programs/phase0.cyr`,
+- On AMD hardware: `examples/stdlib-consumer/`, `programs/phase0.cyr`,
   `programs/compute_e2e.cyr`, `programs/render_e2e.cyr`,
   `programs/render_graph_e2e.cyr` all pass under both backends.
+- On NVIDIA / Intel / macOS / Windows: same programs pass under the
+  `wgpu` backend (regression check — native is not expected to run).
 - All 387 CPU assertions + 13 GPU benches pass under both backends
-  (CPU assertions are backend-agnostic and should be untouched).
+  on AMD (CPU assertions are backend-agnostic and should be untouched).
 - soorat / rasa / ranga / bijli / aethersafta / kiran continue to
-  build and run under the `wgpu` default; at least one consumer runs
-  a CI matrix entry under `native` to prove the path.
-- Bench matrix published: 13 benches × {wgpu, native} × {pre-5.6.x,
-  post-5.6.x} — four columns per bench in `bench-history.csv`, with
-  `docs/benchmarks-rust-v-cyrius.md` refreshed to tell the story.
+  build and run under the `wgpu` default on every supported platform;
+  at least one consumer runs a CI matrix entry under `native` on AMD
+  hardware to prove the path.
+- Bench matrix published (AMD only): 13 benches × {wgpu, native} ×
+  {pre-5.6.x, post-5.6.x} — four columns per bench in
+  `bench-history.csv`, with `docs/benchmarks-rust-v-cyrius.md`
+  refreshed to tell the story.
 
 ---
 
@@ -204,6 +270,148 @@ implement the new surface).
 - **WebGPU / WASM target** — blocked on the Cyrius WASM backend
   landing in the compiler. No version commitment until that
   prerequisite exists. Tracked here so it doesn't get forgotten.
+
+---
+
+## v4.0 — NVIDIA Native Backend; AMD wgpu Retires
+
+v4.0 does two things: adds NVIDIA hardware to the native path **and**
+retires the wgpu path for AMD. After v4.0, AMD consumers run on the
+AMD native backend only; NVIDIA and Intel consumers continue on
+wgpu. The wgpu binding code itself stays in-tree to serve those
+remaining vendors.
+
+Until v4.0 ships, NVIDIA consumers stay on the wgpu backend and AMD
+consumers can run on either backend.
+
+**What's different from v3.0's AMD work.** Almost everything below
+the `Backend` interface:
+
+- **Submission path.** No PM4. NVIDIA's command streamer takes a
+  different packet format (Maxwell+ class methods over channels);
+  the kernel-side abstraction is also different — either nouveau
+  via DRM, or nvidia.ko via `/dev/nvidia*` character devices.
+  Choice between nouveau (open-source, integrates with the existing
+  DRM ioctl pattern) and nvidia.ko (proprietary, performant, but a
+  C library / non-Cyrius dependency we'd be re-importing) is a
+  v4.0 design-spike question.
+- **Shader ISA.** No GFX9. NVIDIA shaders ship as PTX (a portable
+  IR — needs JIT) or as SASS (per-SM-class assembly). The WGSL → ISA
+  lowering path from v3.0 informs the architecture but the back end
+  is fully replaced.
+- **Memory model.** NVIDIA's BAR / staging behavior diverges from
+  AMD's (ReBAR semantics, CUDA-style unified memory). The
+  `gpu_memory_pooling` allocator decisions from v3 may need a
+  vendor-specific tuning pass.
+
+**Scope (refined closer to the work)**
+- **`src/backend_nvidia.cyr`** — fills the same `Backend` slots that
+  `src/backend_native.cyr` (AMD) does. The interface from v3.0 is
+  the contract; if a slot is too AMD-shaped, that's an interface
+  bug to revise, not a work-around.
+- **NVIDIA `programs/nvidia_compute_store.cyr` analogue** — same
+  proof-of-life flow that gated v3.0 B.4: dispatch → CPU readback
+  of `0xDEADBEEF`. Different driver path; same proof.
+- **`MABDA_BACKEND_KIND` gains `BACKEND_KIND_NVIDIA`.** Backend
+  selection is still compile-time; `cyrius.cyml` flag remains an
+  option if consumer CI matrices need runtime-ish selection.
+- **Dual-backend bench harness** widens to a 4-axis matrix: vendor
+  × {wgpu, native} × {pre-/post-5.6.x} × bench. AMD's table doubles;
+  NVIDIA gets its own.
+- **ADR 007** — proposed during v4.0 design. Documents the
+  nouveau-vs-nvidia.ko decision and the SASS/PTX choice.
+
+**Exit criteria**
+- All v3.0 exit programs pass under `native` on NVIDIA hardware
+  (specific generation TBD during v4.0 scoping; likely Ampere or
+  Lovelace as the bring-up class).
+- soorat (smoke-test consumer) builds and runs under
+  `BACKEND_KIND_NVIDIA` in CI on NVIDIA hardware.
+- The NVIDIA work doesn't regress AMD or wgpu paths.
+- **AMD wgpu retirement**: every AMD-using consumer has been on the
+  AMD native backend in production across a full v3.x release cycle.
+  At v4.0 ship, the AMD code paths in `src/wgpu_*.cyr` /
+  `src/backend_wgpu.cyr` either get a `BACKEND_KIND_AMD` guard that
+  errors out, or the AMD-specific wgpu wiring is removed
+  (the wgpu *binding* stays for NVIDIA + Intel; AMD consumers no
+  longer have a wgpu route).
+
+---
+
+## v5.0 — Intel Native Backend (Tentative); NVIDIA wgpu Retires
+
+v5.0 tentatively adds Intel hardware to the native path **and**
+retires the wgpu path for NVIDIA. Promoted from "tentative" on the
+Intel side once a consumer or AGNOS hardware target with Intel
+GPUs makes the work justified — Intel discrete (Arc) and Intel
+integrated graphics (Gen12+, Xe) are different bring-up classes.
+
+After v5.0 ships, NVIDIA consumers run on NVIDIA native only; Intel
+consumers run on Intel native if v5.0 covers them, otherwise still
+on wgpu.
+
+**Likely scope.** Same shape as v4.0 NVIDIA, retargeted:
+
+- **`src/backend_intel.cyr`** filling the v3.0 `Backend` slots.
+- **Submission path.** i915 (legacy) or Xe (new). Choice is a v5.0
+  design-spike question; Xe is the strategic target if it's stable
+  enough by then.
+- **Shader ISA.** Gen ISA. WGSL → Gen lowering separately scoped;
+  pre-compiled bring-up first.
+- **`MABDA_BACKEND_KIND` gains `BACKEND_KIND_INTEL`.**
+- **ADR 008** — Intel native, proposed during v5.0 design.
+
+**Exit criteria** — same shape as v4.0 NVIDIA, against Intel
+hardware. **NVIDIA wgpu retirement** at v5.0 ship: every
+NVIDIA-using consumer has been on the NVIDIA native backend in
+production across a full v4.x release cycle. NVIDIA-specific wgpu
+wiring is removed (the binding stays in-tree for Intel until v5.1).
+**If Intel native slips past v5.0**, the NVIDIA retirement still
+ships at v5.0 — Intel native is a separate gate that doesn't block
+NVIDIA's progress. v5.0 just becomes "NVIDIA wgpu retires; Intel
+native still pending."
+
+---
+
+## v5.1 — Full wgpu Retirement
+
+v5.1 is the last cutover: the Intel wgpu path retires, and with it
+the entire wgpu+C scaffolding leaves the tree. Mabda is fully
+native-Cyrius across every supported vendor.
+
+**Scope**
+- **Retire Intel wgpu wiring.** Conditional on Intel native (v5.0)
+  having been in production for a full release cycle on Intel
+  hardware. If v5.0 didn't actually ship Intel native, v5.1 doesn't
+  ship either — the version is a placeholder for that completion.
+- **Remove `src/wgpu_*.cyr`, `src/backend_wgpu.cyr`,
+  `deps/wgpu_main.c`, `deps/wgpu-native/`.** The 65-slot wgpu fn
+  table and its struct-packing shims go away.
+- **Remove the `Backend` indirection**, optionally. If only one
+  backend kind remains per vendor, the `ctx->backend` slot is
+  redundant; whether to flatten it back into direct calls is a
+  design decision at the time, gated on whether multi-vendor
+  per-binary becomes a real requirement.
+- **macOS / Windows.** v5.1 retirement also forecloses cross-OS
+  support unless a non-wgpu story for them exists. AGNOS-on-Mac is
+  not a current goal; this is an explicit acceptance, not a
+  surprise. If a consumer needs cross-OS support after v5.1 they're
+  on the v3.x–v5.0 wgpu line indefinitely — same shipping mechanism
+  the rust v1 line uses today.
+
+**Gate.** All three conditions must hold at v5.1 ship:
+
+1. Every vendor mabda supports has a native backend in production
+   on its target hardware (AMD ✓ at v3.0, NVIDIA ✓ at v4.0, Intel
+   ✓ at v5.0 if it shipped).
+2. Every consumer (soorat / rasa / ranga / bijli / aethersafta /
+   kiran) is running native on every chipset they target.
+3. No new consumer has joined the project that requires a chipset
+   the native path doesn't yet cover.
+
+If any of these slips, v5.1 slips with it. The wgpu binding stays
+in-tree until all three are met. Retirement is consumer- and
+vendor-driven, not calendar-driven.
 
 ---
 

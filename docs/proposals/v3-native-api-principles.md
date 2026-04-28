@@ -86,7 +86,7 @@ What collapses, what stays, what's new.
 | Texture-create variants in `src/texture.cyr` | `gpu_texture_new(ctx, format, w, h, usage, tier)` |
 | Render-target-create variants | `gpu_render_target_new(ctx, format, w, h, msaa, depth)` |
 
-v2.1.1 names stay as thin shims across v3.x. **Retire at v4.0** alongside the wgpu path (per ADR 005 dual checkpoint).
+v2.1.1 names stay as thin shims across v3.x. **Retire at v5.1** alongside the full wgpu path removal (per ADR 005 dual checkpoint, ADR 006 per-chipset retirement schedule). The shims are cheap; preserving them through the v4.0/v5.0 vendor-by-vendor cutover means consumers don't have to re-fight the renaming question while they're flipping backends.
 
 **Stays unchanged:**
 - `render_graph_new`, `rg_*` family (v2.5.0) — hardens internally.

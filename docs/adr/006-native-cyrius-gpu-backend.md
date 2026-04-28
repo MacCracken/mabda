@@ -2,8 +2,9 @@
 
 **Status:** Proposed (v3.0 design phase, branch `v3`)
 **Date:** 2026-04-21
+**Updated:** 2026-04-28 — vendor scope clarified after Phase B.4 verified; wgpu retirement reframed per-chipset (v4.0 AMD, v5.0 NVIDIA, v5.1 Intel) instead of a single v4.0 event. See [development/roadmap.md](../development/roadmap.md).
 **Supersedes:** n/a
-**Related:** ADR 004 (C launcher FFI — v3.x-era backend, retires v4.0), ADR 005 (public API surface marking)
+**Related:** ADR 004 (C launcher FFI — stays in-tree until per-chipset retirement; full removal at v5.1), ADR 005 (public API surface marking)
 
 ## Context
 
@@ -37,15 +38,25 @@ release cycle), not calendar-driven.
 
 ## Decision
 
-Ship a second mabda backend in v3.0:
+Ship a second mabda backend in v3.0, vendor-by-vendor across the
+v3.x–v5.x line:
 
-- **Name:** `native` (vs. the existing `wgpu` backend).
-- **Scope:** pure Cyrius DRM/KMS on Linux — no libdrm, no libwayland,
-  no wgpu-native, no C launcher. AGNOS kernel GPU driver integration
-  is a downstream v3.x+ follow-up once the DRM/KMS path is stable.
-- **Selection:** per-consumer build-time. Probably a `cyrius.cyml`
-  flag (e.g., `[mabda] backend = "wgpu"` / `"native"`) or a
-  compile-time constant. Finalized before v3.0 ships.
+- **Name:** `native` (vs. the existing `wgpu` backend), with vendor
+  variants — `BACKEND_KIND_AMD` (v3.0), `BACKEND_KIND_NVIDIA`
+  (v4.0), `BACKEND_KIND_INTEL` (v5.0, tentative).
+- **v3.0 scope:** pure Cyrius DRM/KMS on Linux for **AMD hardware
+  only** — direct `ioctl(DRM_IOCTL_AMDGPU_*)`, GFX9 PM4 packet
+  streams, pre-compiled GFX9 ISA. No libdrm, no libwayland, no
+  wgpu-native, no C launcher. Phase B.4 verified end-to-end on AMD
+  Cezanne (gfx90c). NVIDIA and Intel hardware run on the existing
+  wgpu path through v3.x. AGNOS kernel GPU driver integration is a
+  downstream v3.x+ follow-up once the userspace DRM/KMS path is
+  stable.
+- **Selection:** per-consumer build-time. Compile-time constant
+  `MABDA_BACKEND_KIND` in `src/lib.cyr` (per
+  [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md));
+  promotable to a `cyrius.cyml` flag in v3.1+ if consumer CI
+  matrices need it.
 - **Default for v3.0:** `wgpu`. Consumers opt into `native`
   explicitly. This keeps v3.0 byte-compatible for every existing
   consumer and makes the native backend the thing under test rather
@@ -86,13 +97,24 @@ Ship a second mabda backend in v3.0:
      Rust v1, wgpu-backend pre-5.6.x, wgpu-backend post-5.6.x,
      native-backend pre-5.6.x, native-backend post-5.6.x.
 
-5. **Consumer migration path**
-   - v3.0: `wgpu` default. `native` available behind a flag.
-   - v3.1+: consumers test `native` in their CI matrix when ready.
-   - v3.x late: once every consumer is in production on `native`
-     across a full release cycle, v4.0 planning opens.
-   - v4.0: wgpu path retires (`deps/wgpu_main.c`, `deps/wgpu-native/`,
-     `src/wgpu_*.cyr`, `src/backend_wgpu.cyr` all removed).
+5. **Consumer migration path** (per-chipset retirement)
+   - v3.0: `wgpu` is the default for everyone. AMD consumers can opt
+     into `BACKEND_KIND_AMD` (native). NVIDIA + Intel + macOS +
+     Windows consumers stay on `wgpu`.
+   - v3.x: AMD consumers test `native` in their CI matrix when ready.
+   - v4.0: NVIDIA native (`BACKEND_KIND_NVIDIA`) lands; **AMD wgpu
+     retires**. AMD consumers run on AMD native only. NVIDIA + Intel
+     still on wgpu. The wgpu binding stays in-tree to serve them.
+   - v5.0: Intel native (`BACKEND_KIND_INTEL`) lands (tentative);
+     **NVIDIA wgpu retires**. Intel may still be on wgpu if v5.0
+     ships only the NVIDIA-side retirement.
+   - v5.1: **Intel wgpu retires** and the entire wgpu+C scaffolding
+     leaves the tree (`deps/wgpu_main.c`, `deps/wgpu-native/`,
+     `src/wgpu_*.cyr`, `src/backend_wgpu.cyr` all removed). Mabda is
+     fully native-Cyrius across every supported vendor.
+   - Each per-chipset retirement is gated on every consumer on that
+     vendor having flipped voluntarily; calendar dates are not the
+     gate. v5.1 is gated on Intel native (v5.0) having shipped.
 
 ## Why not these alternatives
 
@@ -125,34 +147,58 @@ Ship a second mabda backend in v3.0:
 
 - Two backends means two maintenance surfaces. Every new wgpu FFI
   entry needs a native-backend counterpart (or an explicit "not
-  implemented on native yet" error).
-- CI matrix roughly doubles the GPU test time. Mitigated because
-  CPU-only tests (387 assertions, 7 CPU benches) run once.
-- `src/` grows by the abstraction layer + two backend modules;
-  `dist/mabda.cyr` grows accordingly.
+  implemented on native yet" error). At v4.0+ the surface count
+  grows (AMD native + NVIDIA native + wgpu remainder); at v5.x it
+  peaks (three native backends + wgpu) before contracting at v5.1
+  back down to three.
+- CI matrix roughly doubles the GPU test time per supported vendor.
+  Mitigated because CPU-only tests (387 assertions, 7 CPU benches)
+  run once regardless.
+- `src/` grows by the abstraction layer + per-vendor backend
+  modules; `dist/mabda.cyr` grows accordingly until v5.1's wgpu
+  removal.
 
 **Neutral:**
 
-- The v4.0 timeline is set by consumer cutover, not by calendar. If
-  all consumers move fast, v4.0 is near; if not, v3.x gets a long
-  tail. Either outcome is fine under this ADR.
+- The per-chipset retirement timeline is set by consumer cutover,
+  not calendar. If consumers move fast on a vendor, that vendor's
+  retirement window is near; if not, that vendor stays on wgpu
+  longer. Either outcome is fine under this ADR.
+- v5.1 is the explicit "wgpu fully out" milestone. If Intel native
+  (v5.0) doesn't actually ship, v5.1 doesn't ship either — the
+  wgpu binding stays in-tree to serve Intel until the gate is met.
 
-## Open questions (deferred to v3.0 design spike on `v3` branch)
+## Open questions
 
-- **WGSL → ISA lowering.** Vendor-first or multi-vendor? If
-  vendor-first, which vendor? Depends on AGNOS hardware targeting.
+Resolved during v3.0 design spike (some by Phase B.4 verification on
+2026-04-28, others by the v3-backend-interface proposal):
+
+- **AMD WGSL → GFX9 ISA lowering.** v3.0 takes pre-compiled GFX9 ISA
+  bytes; lowering path landed as a v3.0 in-scope item (not yet
+  implemented in code, but scoped — see roadmap). NVIDIA / Intel
+  lowering paths are per-vendor v4.0 / v5.0 design items.
+- **Selector ergonomics.** Resolved: compile-time constant
+  `MABDA_BACKEND_KIND` in `src/lib.cyr`, per
+  [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md).
+  Promotable to a `cyrius.cyml` flag in v3.1+ if needed.
+
+Still open at the time of this update:
+
 - **Memory model.** How does the native backend integrate with
   mabda's manual `alloc`/`store64` discipline? Does DRM/KMS BO
-  management surface to the `Resource` tracker?
+  management surface to the `Resource` tracker? (B.4 sidesteps this
+  by allocating per-program; real consumer flows need an answer.)
 - **Surface / present path.** DRM/KMS provides raw scanout.
   Consumers (soorat, aethersafta) expect a surface abstraction
-  compatible with what wgpu gives them today. Mapping TBD.
+  compatible with what wgpu gives them today. Mapping TBD; gated on
+  Phase D.
 - **Error model.** wgpu errors come back through the FFI callback
   path. Native backend errors come through syscall return. The
-  `GpuErr` codes already exist (`src/error.cyr`); mapping TBD.
-- **Selector ergonomics.** `cyrius.cyml` flag? Compile-time constant
-  in `src/lib.cyr`? Build-time environment variable? All three are
-  implementable; pick one before v3.0 ships.
+  `GpuErr` codes already exist (`src/error.cyr`); mapping TBD when
+  the backend interface lands in code.
+- **Per-vendor ADRs.** Each vendor expansion (NVIDIA v4.0, Intel
+  v5.0) gets its own ADR. ADR 007 = NVIDIA. ADR 008 = Intel. Both
+  filed when their respective design phases open, not now.
 
 ## Follow-up
 
