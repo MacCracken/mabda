@@ -2685,6 +2685,50 @@ fn test_gpu_ctx_backend_field_isolated() {
 }
 
 # ================================================================
+# v3 Step 3b — gpu_context_release dispatches through backend slot
+# ================================================================
+# Counter incremented by the slot fn. Tests synthesise a ctx with
+# a fake backend whose ctx_release slot points at the counter; if
+# gpu_context_release dispatches through the slot, the counter
+# bumps. Set back to 0 in each test.
+
+var _step3b_ctx_release_count = 0;
+var _step3b_ctx_release_arg   = 0;
+
+fn _step3b_release_counter(ctx) {
+    _step3b_ctx_release_count = _step3b_ctx_release_count + 1;
+    _step3b_ctx_release_arg   = ctx;
+    return 0;
+}
+
+fn test_gpu_context_release_dispatches_through_backend() {
+    _step3b_ctx_release_count = 0;
+    _step3b_ctx_release_arg   = 0;
+    # Build a synthetic ctx whose +32 backend points at a stub
+    # backend whose ctx_release slot points at the counter fn.
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, &_step3b_release_counter);
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx + 32, b);
+    gpu_context_release(ctx);
+    assert_eq(_step3b_ctx_release_count, 1,
+              "slot dispatched exactly once");
+    assert_eq(_step3b_ctx_release_arg, ctx,
+              "slot received the ctx pointer as arg 1");
+    return 0;
+}
+
+fn test_gpu_context_release_null_ctx_is_safe() {
+    # Null ctx must short-circuit before trying to load backend.
+    _step3b_ctx_release_count = 0;
+    gpu_context_release(0);
+    assert_eq(_step3b_ctx_release_count, 0,
+              "null ctx does not dispatch");
+    return 0;
+}
+
+# ================================================================
 # v2.4.1 — sakshi observability wiring
 # ================================================================
 # These assertions verify the gating contract: mabda emits sakshi
@@ -2997,6 +3041,10 @@ fn main() {
     # v3 Step 3a — GpuContext backend plumbing (2)
     test_gpu_ctx_backend_accessor();
     test_gpu_ctx_backend_field_isolated();
+
+    # v3 Step 3b — gpu_context_release dispatches through backend (2)
+    test_gpu_context_release_dispatches_through_backend();
+    test_gpu_context_release_null_ctx_is_safe();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();
