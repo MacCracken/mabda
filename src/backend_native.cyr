@@ -1477,3 +1477,75 @@ fn backend_native_new() {
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
+
+# ================================================================
+# v3 Step 5.1 — native 2D RGBA8 texture primitives (Phase C)
+# ================================================================
+# Linear-layout 2D RGBA8 textures. No mipmaps, no DCC, no tiling —
+# just a flat array of (width × height × 4) bytes. Sufficient for
+# CPU-uploaded textures + compute-shader writes; tiled / mipped /
+# format-rich textures are subsequent Phase C chunks (5.x).
+#
+# NativeTexture struct layout (32 bytes):
+#   +0:  handle (u64, KMS handle)
+#   +8:  va     (u64, canonical-high GPU VA)
+#   +16: addr   (u64, CPU mmap pointer)
+#   +24: size   (u64, bytes — width × height × 4)
+#
+# Step 5.1 hardcodes the texture VA at _NATIVE_TEXTURE_VA_BASE.
+# This means a single texture per context until the multi-texture
+# VA allocator lands (later 5.x chunk). Future textures must use
+# different VAs — pre-Step-5.x callers should allocate at most one
+# texture, OR pick their own VA (the helper accepts a hardcoded
+# base, but doesn't enforce uniqueness).
+#
+# VA range layout (canonical-high aperture):
+#   0x100000000  shader BOs (caller-managed in v3 programs)
+#   0x100004000  stub (gpu_context_new_native)
+#   0x100200000  cached IB (gpu_context_new_native)
+#   0x100400000  output BOs (caller-managed)
+#   0x100600000  cached fence (gpu_context_new_native)
+#   0x100A00000  textures (this step) — 4 MiB headroom from fence,
+#                room for textures up to ~64 MiB (4Kx4K RGBA8)
+#                before colliding with future allocations
+#
+# Texture release is Step 5.2.
+
+var _NATIVE_TEXTURE_VA_BASE = 0xFFFF800100A00000;
+
+var NATIVE_TEX_FIELD_HANDLE = 0;
+var NATIVE_TEX_FIELD_VA     = 8;
+var NATIVE_TEX_FIELD_ADDR   = 16;
+var NATIVE_TEX_FIELD_SIZE   = 24;
+var NATIVE_TEX_STRUCT_SIZE  = 32;
+
+# Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
+# call without a fd. width × height × 4 bytes per pixel.
+fn native_texture_size_2d_rgba8(width, height) {
+    return width * height * 4;
+}
+
+# Allocate a 2D RGBA8 texture: GTT BO + va_map at the texture VA.
+# Caller provides `out` — a 32-byte buffer matching NativeTexture
+# layout; on success the function fills handle/va/addr/size. On
+# failure returns a GPU_ERR_* code, leaves out untouched.
+fn native_texture_create_2d_rgba8(fd, width, height, out) {
+    var size = native_texture_size_2d_rgba8(width, height);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    var va = _NATIVE_TEXTURE_VA_BASE;
+    rc = native_gem_va_map(fd, handle, va, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(out + NATIVE_TEX_FIELD_VA,     va);
+    store64(out + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,   size);
+    return 0;
+}

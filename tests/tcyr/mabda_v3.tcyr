@@ -989,6 +989,64 @@ fn test_native_ctx_layout_isolation_step4iv() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 5.1 — native 2D RGBA8 texture primitives (Phase C)
+# ================================================================
+# CPU-only tests — size formula, NativeTexture struct layout, and
+# VA-range isolation from the existing canonical-high allocations
+# (shader / stub / IB / fence / output). Hardware tests for
+# texture create + readback land in Step 5.8 (native_texture_e2e).
+
+fn test_native_texture_size_2d_rgba8_formula() {
+    assert_eq(native_texture_size_2d_rgba8(1, 1),     4,        "1x1 = 4 bytes");
+    assert_eq(native_texture_size_2d_rgba8(16, 16),   1024,     "16x16 = 1 KiB");
+    assert_eq(native_texture_size_2d_rgba8(256, 256), 262144,   "256x256 = 256 KiB");
+    assert_eq(native_texture_size_2d_rgba8(64, 32),   8192,     "64x32 rectangular");
+    assert_eq(native_texture_size_2d_rgba8(0, 0),     0,        "0x0 = 0 (degenerate)");
+    return 0;
+}
+
+fn test_native_texture_struct_field_offsets() {
+    assert_eq(NATIVE_TEX_FIELD_HANDLE, 0,  "handle at +0");
+    assert_eq(NATIVE_TEX_FIELD_VA,     8,  "va at +8");
+    assert_eq(NATIVE_TEX_FIELD_ADDR,   16, "addr at +16");
+    assert_eq(NATIVE_TEX_FIELD_SIZE,   24, "size at +24");
+    assert_eq(NATIVE_TEX_STRUCT_SIZE,  32, "total = 32");
+    return 0;
+}
+
+fn test_native_texture_va_range_distinct() {
+    # The texture VA base must not collide with the canonical-high
+    # VAs already used by gpu_context_new_native + the consumer
+    # programs. If a future allocation lands here, this test catches
+    # the conflict before it produces a runtime VA-map failure.
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_STUB_VA,    "tex != stub");
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_IB_VA,      "tex != IB");
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_FENCE_VA,   "tex != fence");
+    # Programs hardcode shader_va = 0xFFFF800100000000 and
+    # output_va = 0xFFFF800100400000 — assert the texture base
+    # doesn't alias either.
+    assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100000000, "tex != shader VA");
+    assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100400000, "tex != output VA");
+    return 0;
+}
+
+fn test_native_texture_struct_round_trip() {
+    # Hand-pack a NativeTexture struct (no fd needed) and verify the
+    # field offsets thread through correctly.
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 0xCAFE);
+    store64(&tex + NATIVE_TEX_FIELD_VA,     _NATIVE_TEXTURE_VA_BASE);
+    store64(&tex + NATIVE_TEX_FIELD_ADDR,   0xBEEF);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   1024);
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_HANDLE), 0xCAFE,                "handle round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_VA),     _NATIVE_TEXTURE_VA_BASE, "va round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_ADDR),   0xBEEF,                "addr round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_SIZE),   1024,                  "size round-trips");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1071,6 +1129,12 @@ fn main() {
     # v3 Step 4f.iv — per-context IB + fence cache (2)
     test_native_ctx_ib_fence_accessors();
     test_native_ctx_layout_isolation_step4iv();
+
+    # v3 Step 5.1 — native 2D RGBA8 texture primitives (4)
+    test_native_texture_size_2d_rgba8_formula();
+    test_native_texture_struct_field_offsets();
+    test_native_texture_va_range_distinct();
+    test_native_texture_struct_round_trip();
 
     return assert_summary();
 }
