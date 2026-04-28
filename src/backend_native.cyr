@@ -52,6 +52,59 @@ var DRM_IOCTL_VERSION = 0xC0406400;
 var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
 
 # ================================================================
+# Errno → GpuErr mapping (v3 Step 4f.i)
+# ================================================================
+# Native primitives return 0 on success or negative errno on
+# failure (Linux ABI convention). Slot wrappers and public
+# dispatchers want positive GPU_ERR_* codes from src/error.cyr.
+# Until v3.0 ships, we keep the existing GpuErrCode enum stable
+# and route specific errno values to the closest existing code:
+#
+#   ENOMEM  (12)      → GPU_ERR_BUFFER          (BO alloc OOM)
+#   EPERM   (1)       → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   EACCES  (13)      → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   ENOENT  (2)       → GPU_ERR_ADAPTER_NOT_FOUND (no render node)
+#   EBUSY   (16)      → GPU_ERR_DEVICE_REQUEST   (device contention)
+#   ETIMEDOUT (110)   → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait)
+#   ETIME   (62)      → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait alt)
+#   default           → GPU_ERR_OTHER
+#
+# Adding a new GPU_ERR_* code (e.g. INVALID_ARG, FENCE_TIMEOUT) is
+# a v3.0+1 follow-up — error.cyr enum is part of the @public
+# surface and should not churn during v3.0 stabilisation.
+
+var _NATIVE_ERRNO_EPERM     =   1;
+var _NATIVE_ERRNO_ENOENT    =   2;
+var _NATIVE_ERRNO_ENOMEM    =  12;
+var _NATIVE_ERRNO_EACCES    =  13;
+var _NATIVE_ERRNO_EBUSY     =  16;
+var _NATIVE_ERRNO_ETIME     =  62;
+var _NATIVE_ERRNO_ETIMEDOUT = 110;
+
+# Map a positive errno to a GPU_ERR_* code. Caller passes the
+# absolute value (i.e. converted from negative-rc convention by
+# _native_neg_rc_to_gpu_err below).
+fn _native_errno_to_gpu_err(errno) {
+    if (errno == _NATIVE_ERRNO_ENOMEM)    { return GPU_ERR_BUFFER; }
+    if (errno == _NATIVE_ERRNO_EPERM)     { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EACCES)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_ENOENT)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EBUSY)     { return GPU_ERR_DEVICE_REQUEST; }
+    if (errno == _NATIVE_ERRNO_ETIMEDOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
+    if (errno == _NATIVE_ERRNO_ETIME)     { return GPU_ERR_SURFACE_TIMEOUT; }
+    return GPU_ERR_OTHER;
+}
+
+# Map a negative-errno return code (rc <= 0 convention used by
+# native_* primitives) to 0 (success) or GPU_ERR_*. Pass the rc
+# directly; this fn handles the sign flip + mapping.
+fn _native_neg_rc_to_gpu_err(rc) {
+    if (rc == 0) { return 0; }
+    if (rc > 0)  { return _native_errno_to_gpu_err(rc); }
+    return _native_errno_to_gpu_err(0 - rc);
+}
+
+# ================================================================
 # Helpers
 # ================================================================
 
@@ -1136,7 +1189,7 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var ib_size = 4096;
     var ib_bo[16];
     var rc = native_bo_create_gtt(fd, ib_size, &ib_bo);
-    if (rc != 0) { return GPU_ERR_BUFFER; }
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
     var ib_handle = load64(&ib_bo + 0);
     var ib_map    = load64(&ib_bo + 8);
     memset(ib_map, 0, ib_size);
@@ -1144,8 +1197,9 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var ib_va = 0xFFFF800100200000;
     rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, page_perms);
     if (rc != 0) {
+        var rc_save = rc;
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return GPU_ERR_BUFFER;
+        return _native_neg_rc_to_gpu_err(rc_save);
     }
 
     # Allocate fence BO at the canonical-high fence VA.
@@ -1153,9 +1207,10 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var fence_bo[16];
     rc = native_bo_create_gtt(fd, fence_size, &fence_bo);
     if (rc != 0) {
+        var rc_save = rc;
         native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return GPU_ERR_BUFFER;
+        return _native_neg_rc_to_gpu_err(rc_save);
     }
     var fence_handle = load64(&fence_bo + 0);
     var fence_map    = load64(&fence_bo + 8);
@@ -1163,10 +1218,11 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var fence_va = 0xFFFF800100600000;
     rc = native_gem_va_map(fd, fence_handle, fence_va, fence_size, page_perms);
     if (rc != 0) {
+        var rc_save = rc;
         native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
         native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return GPU_ERR_BUFFER;
+        return _native_neg_rc_to_gpu_err(rc_save);
     }
 
     # Build the 5-entry inline BO_HANDLES list (Mesa rusticl shape).
@@ -1187,11 +1243,12 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     var syncobj_handle_ptr = alloc(8);
     rc = native_syncobj_create(fd, syncobj_handle_ptr);
     if (rc != 0) {
+        var rc_save = rc;
         native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
         native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
         native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return GPU_ERR_OTHER;
+        return _native_neg_rc_to_gpu_err(rc_save);
     }
     var syncobj_handle = load64(syncobj_handle_ptr);
 
@@ -1203,12 +1260,13 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
                                  AMDGPU_HW_IP_COMPUTE, syncobj_handle,
                                  fence_handle, 32, 0x08);
     if (rc != 0) {
+        var rc_save = rc;
         native_syncobj_destroy(fd, syncobj_handle);
         native_gem_va_unmap(fd, fence_handle, fence_va, fence_size);
         native_bo_release_gtt(fd, fence_handle, fence_map, fence_size);
         native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
-        return GPU_ERR_OTHER;
+        return _native_neg_rc_to_gpu_err(rc_save);
     }
 
     # Wait until the syncobj signals, or timeout.
@@ -1221,8 +1279,7 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     native_gem_va_unmap(fd, ib_handle, ib_va, ib_size);
     native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
 
-    if (wait_rc != 0) { return GPU_ERR_OTHER; }
-    return 0;
+    return _native_neg_rc_to_gpu_err(wait_rc);
 }
 
 # ================================================================
