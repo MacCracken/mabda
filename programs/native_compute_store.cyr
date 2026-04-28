@@ -68,9 +68,24 @@ fn main() {
     print_cstr("mabda native compute STORE shader (v3 Phase B.4)\n");
     print_cstr("------------------------------------------------\n");
 
-    var fd = native_open_render_node();
-    if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+    # ---- Native GpuContext (Step 4e: gpu_context_new_native) ----
+    # Opens the DRM render node, allocates the amdgpu context id,
+    # creates and va-maps the Mesa-stub BO at canonical-high
+    # 0xFFFF800100004000, attaches a backend_native_new() at +32.
+    # All bring-up that used to live inline in this program now sits
+    # behind the public API.
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        return 1;
+    }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var stub_va = native_ctx_stub_va(ctx);
     print_cstr("fd="); print_i64(fd); print_cstr("\n");
+    print_cstr("stub bo="); print_i64(stub_handle);
+    print_cstr(" va=0x"); print_i64(stub_va); print_cstr("\n");
 
     # ---- Shader BO: 4 KiB GTT, store shader at offset 0 ----
     # Shader VA in the canonical-high aperture matches spike + Mesa.
@@ -79,7 +94,7 @@ fn main() {
     var rc = native_bo_create_gtt(fd, shader_size, &shader_bo);
     if (rc != 0) {
         print_cstr("FAIL: shader bo create errno="); print_i64(0 - rc); print_cstr("\n");
-        sys_close(fd); return 2;
+        gpu_context_release(ctx); return 2;
     }
     var shader_handle = load64(&shader_bo + 0);
     var shader_map    = load64(&shader_bo + 8);
@@ -94,36 +109,6 @@ fn main() {
     }
     print_cstr("shader bo="); print_i64(shader_handle);
     print_cstr(" va=0x"); print_i64(shader_va); print_cstr("\n");
-
-    # ---- Stub BO at VA 0x200000 (Mesa's scratch-V# reference point) ----
-    # See session 5/7 analysis in docs/issues/2026-04-21-gfx9-store-blocker.md.
-    # The spike established that keeping this stub mapped is part of the
-    # working baseline; we match its VA + size exactly.
-    var stub_size = 4096;
-    var stub_bo[16];
-    rc = native_bo_create_gtt(fd, stub_size, &stub_bo);
-    if (rc != 0) {
-        print_cstr("FAIL: stub bo create errno="); print_i64(0 - rc); print_cstr("\n");
-        return 3;
-    }
-    var stub_handle = load64(&stub_bo + 0);
-    var stub_map    = load64(&stub_bo + 8);
-    memset(stub_map, 0, stub_size);
-    # Session 25b: stub at canonical-high VA. Earlier code used 0x200000
-    # (user-low) on the (untested) hypothesis that compute queues accept
-    # both halves. The session-25b post-dispatch WRITE_DATA marker test
-    # showed user-low writes from the compute queue silently fail (marker
-    # never landed in stub_map). Mirror the working C spike: HIGH VA for
-    # everything.
-    var stub_va = 0xFFFF800100004000;
-    rc = native_gem_va_map(fd, stub_handle, stub_va, stub_size,
-                           AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE);
-    if (rc != 0) {
-        print_cstr("FAIL: stub va_map errno="); print_i64(0 - rc); print_cstr("\n");
-        return 3;
-    }
-    print_cstr("stub bo="); print_i64(stub_handle);
-    print_cstr(" va=0x"); print_i64(stub_va); print_cstr("\n");
 
     # ---- Output BO: 4 KiB GTT, canonical-high VA, seeded with 0xBAADF00D ----
     # Keeping output in the same aperture as shader + IB matches Mesa's
@@ -155,33 +140,13 @@ fn main() {
     print_cstr(" va=0x"); print_i64(out_va);
     print_cstr(" seeded with 0xBAADF00D\n");
 
-    # ---- Dispatch through the Backend abstraction (Step 4d) ----
+    # ---- Dispatch through the Backend abstraction ----
     # The slot wrapper (_backend_native_compute_dispatch in
     # src/backend_native.cyr) builds the PM4 stream internally,
     # allocates per-call IB + fence + syncobj, submits via 4-chunk
     # Mesa shape, waits, and tears down ephemerals — all by routing
     # gpu_compute_dispatch() through ctx->backend->slot via fncall6.
-
-    # Allocate the amdgpu context id and pack the native ctx with the
-    # dual-interpretation field layout (fd / ctx_id / stub_handle /
-    # stub_va at +0..+24, backend ptr at +32). See module header in
-    # src/backend_native.cyr for the convention.
-    var ctx_handle_block[16];
-    rc = native_ctx_alloc(fd, &ctx_handle_block);
-    if (rc != 0) {
-        print_cstr("FAIL: ctx_alloc errno="); print_i64(0 - rc); print_cstr("\n");
-        return 6;
-    }
-    var ctx_id = native_ctx_alloc_id(&ctx_handle_block);
-    print_cstr("ctx_id="); print_i64(ctx_id); print_cstr("\n");
-
-    var ctx = alloc(40);
-    memset(ctx, 0, 40);
-    store64(ctx +  0, fd);
-    store64(ctx +  8, ctx_id);
-    store64(ctx + 16, stub_handle);
-    store64(ctx + 24, stub_va);
-    store64(ctx + 32, backend_native_new());
+    print_cstr("ctx_id="); print_i64(native_ctx_id(ctx)); print_cstr("\n");
 
     # Pack the (handle, va) pairs that the slot wrapper expects for
     # `shmod` and `bp` (private 16-byte convention).
@@ -205,7 +170,7 @@ fn main() {
     # ---- Verify output ----
     # Session 25b: read post-dispatch CP marker first — proves CP returned
     # from DISPATCH_DIRECT and ran further IB packets after the dispatch.
-    var marker_post = load32(stub_map + 4);
+    var marker_post = load32(native_ctx_stub_addr(ctx) + 4);
     print_cstr("post-dispatch marker = "); print_hex32(marker_post);
     if (marker_post == 0xC0FFEE12) { print_cstr(" OK (CP cleared dispatch)\n"); }
     if (marker_post != 0xC0FFEE12) { print_cstr(" STALE (CP did not return from dispatch)\n"); }
@@ -224,15 +189,12 @@ fn main() {
     print_cstr("sentinel intact at [1]\n");
 
     # ---- Teardown ----
-    # Caller-owned BOs (shader / stub / output) are released in
-    # explicit native_*_release calls; gpu_context_release()
-    # routes through ctx->backend->ctx_release which frees the
-    # amdgpu ctx_id and closes the DRM fd. The order matters —
-    # release BOs before closing fd.
+    # Caller-owned BOs (shader / output) are released explicitly.
+    # The stub BO is owned by the GpuContext now (allocated inside
+    # gpu_context_new_native); kernel auto-releases it on fd close
+    # via gpu_context_release → _backend_native_ctx_release.
     native_gem_va_unmap(fd, out_handle, out_va, out_size);
     native_bo_release_gtt(fd, out_handle, out_map, out_size);
-    native_gem_va_unmap(fd, stub_handle, stub_va, stub_size);
-    native_bo_release_gtt(fd, stub_handle, stub_map, stub_size);
     native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
     native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
     gpu_context_release(ctx);

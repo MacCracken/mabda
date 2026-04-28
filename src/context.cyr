@@ -2,18 +2,20 @@
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (40 bytes — grew from 32 at v3 Step 3a):
-#   +0:  instance (WGPUInstance, 8)        — wgpu-only (zero on native)
-#   +8:  adapter  (WGPUAdapter, 8)         — wgpu-only (zero on native)
-#   +16: device   (WGPUDevice, 8)          — wgpu-only (zero on native)
-#   +24: queue    (WGPUQueue, 8)           — wgpu-only (zero on native)
-#   +32: backend  (Backend*, 8)            — @internal dispatch table
+# GpuContext struct layout (48 bytes — grew from 40 at v3 Step 4e):
+#   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
+#   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
+#   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
+#   +24: queue    / stub_va     (wgpu: WGPUQueue    | native: stub BO VA)
+#   +32: backend  (Backend*, 8) — @internal dispatch table
+#   +40: stub_addr (8)          — native: CPU-side mmap of stub BO;
+#                                 zero on wgpu (unused)
 #
-# The +0..+24 layout is preserved so existing wgpu accessors keep
-# working unchanged. Step 3a plumbs the backend ptr at +32 but does
-# not yet change which path the public buffer/compute/etc. fns take
-# — that's Step 3b/3c (refactor public modules to dispatch through
-# ctx->backend->slot). Until then the +32 ptr is informational.
+# The dual interpretation of +0..+24 is documented in
+# src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
+# you which view applies. Native-side accessors live in
+# src/backend_native.cyr (native_ctx_fd / _id / _stub_handle /
+# _stub_va). The +32 backend ptr is always a Backend struct.
 
 fn gpu_ctx_instance(ctx) { return load64(ctx); }
 fn gpu_ctx_adapter(ctx)  { return load64(ctx + 8); }
@@ -26,10 +28,17 @@ fn gpu_ctx_backend(ctx)  { return load64(ctx + 32); }
 # sakshi event when observability is enabled. The success path emits
 # its own info-level event for the trace consumer (v2.4.1).
 #
-# Allocates a default wgpu Backend at the +32 slot. Selecting a
-# different backend at this entry point is Step 3c work; until then
-# every consumer gets the wgpu backend (matching v2.x behaviour).
+# Step 4e: branches on MABDA_BACKEND_KIND (set in src/lib.cyr).
+# Default = BACKEND_KIND_WGPU (v2.x behaviour preserved). Setting
+# the constant to BACKEND_KIND_AMD makes this fn route to
+# gpu_context_new_native() — preinit_ptr is ignored on that path
+# (the C launcher's preinit struct is wgpu-shaped). Programs that
+# want to opt into the native path explicitly without touching the
+# global default can call gpu_context_new_native() directly.
 fn gpu_context_from_preinit(preinit_ptr) {
+    if (MABDA_BACKEND_KIND == BACKEND_KIND_AMD) {
+        return gpu_context_new_native();
+    }
     if (preinit_ptr == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     var instance = load64(preinit_ptr);
     var adapter  = load64(preinit_ptr + 8);
@@ -38,8 +47,8 @@ fn gpu_context_from_preinit(preinit_ptr) {
     if (instance == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (adapter == 0)  { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (device == 0)   { return gpu_err_result(GPU_ERR_DEVICE_REQUEST); }
-    var ctx = alloc(40);
-    memset(ctx, 0, 40);
+    var ctx = alloc(48);
+    memset(ctx, 0, 48);
     store64(ctx,      instance);
     store64(ctx + 8,  adapter);
     store64(ctx + 16, device);
@@ -49,11 +58,73 @@ fn gpu_context_from_preinit(preinit_ptr) {
     return gpu_ok(ctx);
 }
 
+# Bring up a native (AMD/amdgpu) GpuContext. Opens /dev/dri/renderD128,
+# allocates an amdgpu context id, creates and va-maps a 4 KiB stub BO
+# at the canonical-high stub VA (Mesa scratch V# reference point), and
+# attaches a backend_native_new() at the backend slot. Returns
+# Result<ctx>.
+#
+# Stub BO note: the stub is owned by the GpuContext but its mmap
+# address is not stored. On gpu_context_release, _backend_native_ctx_release
+# closes the fd, which kicks the kernel into auto-releasing the BO.
+# This is acceptable for v3.0 (process-lifetime contexts); revisit if
+# long-lived create/destroy cycles ever surface.
+var _NATIVE_STUB_VA   = 0xFFFF800100004000;
+var _NATIVE_STUB_SIZE = 4096;
+
+fn gpu_context_new_native() {
+    var fd = native_open_render_node();
+    if (fd < 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
+
+    var ctx_req[16];
+    var rc = native_ctx_alloc(fd, &ctx_req);
+    if (rc != 0) {
+        sys_close(fd);
+        return gpu_err_result(GPU_ERR_DEVICE_REQUEST);
+    }
+    var ctx_id = native_ctx_alloc_id(&ctx_req);
+
+    var stub_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_STUB_SIZE, &stub_bo);
+    if (rc != 0) {
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(GPU_ERR_BUFFER);
+    }
+    var stub_handle = load64(&stub_bo + 0);
+    var stub_map    = load64(&stub_bo + 8);
+    memset(stub_map, 0, _NATIVE_STUB_SIZE);
+
+    var page_perms = AMDGPU_VM_PAGE_READABLE
+                   | AMDGPU_VM_PAGE_WRITEABLE
+                   | AMDGPU_VM_PAGE_EXECUTABLE;
+    rc = native_gem_va_map(fd, stub_handle, _NATIVE_STUB_VA,
+                           _NATIVE_STUB_SIZE, page_perms);
+    if (rc != 0) {
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(GPU_ERR_BUFFER);
+    }
+
+    var ctx = alloc(48);
+    memset(ctx, 0, 48);
+    store64(ctx +  0, fd);
+    store64(ctx +  8, ctx_id);
+    store64(ctx + 16, stub_handle);
+    store64(ctx + 24, _NATIVE_STUB_VA);
+    store64(ctx + 32, backend_native_new());
+    store64(ctx + 40, stub_map);
+    _sk_info_cstr("mabda: gpu context created (native)");
+    return gpu_ok(ctx);
+}
+
 # Step 3b: dispatches through ctx->backend->ctx_release. The slot
-# wrapper in src/backend_wgpu.cyr does the wgpu_*_release calls
-# (or, on native, the DRM teardown). Public callers see the same
-# behaviour as v2.x, but the per-backend release path is now under
-# the abstraction.
+# wrapper in src/backend_wgpu.cyr does the wgpu_*_release calls;
+# the native counterpart in src/backend_native.cyr frees ctx_id and
+# closes the DRM fd (which kicks the kernel into auto-releasing the
+# stub BO). Public callers see the same behaviour as v2.x, but the
+# per-backend release path is now under the abstraction.
 fn gpu_context_release(ctx) {
     if (ctx == 0) { return 0; }
     var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_CTX_RELEASE);
