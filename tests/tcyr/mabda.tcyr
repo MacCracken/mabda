@@ -2781,6 +2781,116 @@ fn test_gpu_buffer_read_null_ctx_returns_err() {
 }
 
 # ================================================================
+# v3 Step 3d — gpu_buffer_create / write / release dispatch
+# ================================================================
+# Three more ctx-aware buffer dispatchers, each through its own
+# slot. Together they exercise fncall2 (release), fncall3 (create),
+# and fncall5 (write) in the public-API → backend slot direction.
+
+var _step3d_create_count = 0;
+var _step3d_create_ctx   = 0;
+var _step3d_create_size  = 0;
+var _step3d_create_usage = 0;
+
+fn _step3d_create_capture(ctx, size, usage) {
+    _step3d_create_count = _step3d_create_count + 1;
+    _step3d_create_ctx   = ctx;
+    _step3d_create_size  = size;
+    _step3d_create_usage = usage;
+    return 0xCAFE;
+}
+
+fn test_gpu_buffer_create_dispatches_through_backend() {
+    _step3d_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_step3d_create_capture);
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx + 32, b);
+    var got = gpu_buffer_create(ctx, 1024, 0xF);
+    assert_eq(got, 0xCAFE, "slot return value propagates");
+    assert_eq(_step3d_create_count, 1, "slot dispatched once");
+    assert_eq(_step3d_create_ctx,  ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_create_size,  1024,  "arg 2 = size");
+    assert_eq(_step3d_create_usage, 0xF,   "arg 3 = usage");
+    return 0;
+}
+
+var _step3d_write_count = 0;
+var _step3d_write_ctx   = 0;
+var _step3d_write_buf   = 0;
+var _step3d_write_off   = 0;
+var _step3d_write_ptr   = 0;
+var _step3d_write_n     = 0;
+
+fn _step3d_write_capture(ctx, buf, off, ptr, n) {
+    _step3d_write_count = _step3d_write_count + 1;
+    _step3d_write_ctx = ctx;
+    _step3d_write_buf = buf;
+    _step3d_write_off = off;
+    _step3d_write_ptr = ptr;
+    _step3d_write_n   = n;
+    return 0;
+}
+
+fn test_gpu_buffer_write_dispatches_through_backend() {
+    _step3d_write_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_step3d_write_capture);
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx + 32, b);
+    var rc = gpu_buffer_write(ctx, 0xBEEF, 8, 0xCAFE, 32);
+    assert_eq(rc, 0, "slot return value propagates");
+    assert_eq(_step3d_write_count, 1, "slot dispatched once");
+    assert_eq(_step3d_write_ctx, ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_write_buf, 0xBEEF, "arg 2 = buf");
+    assert_eq(_step3d_write_off, 8,      "arg 3 = off");
+    assert_eq(_step3d_write_ptr, 0xCAFE, "arg 4 = ptr");
+    assert_eq(_step3d_write_n,   32,     "arg 5 = n");
+    return 0;
+}
+
+var _step3d_release_count = 0;
+var _step3d_release_ctx   = 0;
+var _step3d_release_buf   = 0;
+
+fn _step3d_release_capture(ctx, buf) {
+    _step3d_release_count = _step3d_release_count + 1;
+    _step3d_release_ctx = ctx;
+    _step3d_release_buf = buf;
+    return 0;
+}
+
+fn test_gpu_buffer_release_dispatches_through_backend() {
+    _step3d_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_step3d_release_capture);
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx + 32, b);
+    var rc = gpu_buffer_release(ctx, 0xBEEF);
+    assert_eq(rc, 0, "slot return value propagates");
+    assert_eq(_step3d_release_count, 1, "slot dispatched once");
+    assert_eq(_step3d_release_ctx, ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_release_buf, 0xBEEF, "arg 2 = buf");
+    return 0;
+}
+
+fn test_gpu_buffer_dispatchers_null_ctx_safe() {
+    _step3d_create_count = 0;
+    _step3d_write_count = 0;
+    _step3d_release_count = 0;
+    assert_eq(gpu_buffer_create(0, 1024, 0xF), 0, "create null returns 0");
+    assert_eq(gpu_buffer_write(0, 0, 0, 0, 0), GPU_ERR_BUFFER, "write null returns err");
+    assert_eq(gpu_buffer_release(0, 0), 0, "release null returns 0");
+    return 0;
+}
+
+# ================================================================
 # v2.4.1 — sakshi observability wiring
 # ================================================================
 # These assertions verify the gating contract: mabda emits sakshi
@@ -3101,6 +3211,12 @@ fn main() {
     # v3 Step 3c — gpu_buffer_read dispatches through backend (2)
     test_gpu_buffer_read_dispatches_through_backend();
     test_gpu_buffer_read_null_ctx_returns_err();
+
+    # v3 Step 3d — gpu_buffer_create / write / release dispatch (4)
+    test_gpu_buffer_create_dispatches_through_backend();
+    test_gpu_buffer_write_dispatches_through_backend();
+    test_gpu_buffer_release_dispatches_through_backend();
+    test_gpu_buffer_dispatchers_null_ctx_safe();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();
