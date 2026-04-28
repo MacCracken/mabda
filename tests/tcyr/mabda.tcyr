@@ -2554,6 +2554,90 @@ fn test_backend_is_complete_detects_missing_slot() {
 }
 
 # ================================================================
+# v3 Phase B5 — wgpu Backend implementation (src/backend_wgpu.cyr)
+# ================================================================
+# Step 2 lands the wgpu wrapper fns + builder. The wrappers
+# themselves drive real wgpu calls, which can't run without
+# wgpu-native loaded — those paths are exercised via the GPU
+# integration programs (phase0, compute_e2e, etc.). CPU tests
+# here verify shape only: builder produces a complete backend,
+# kind = WGPU, slots resolve to the expected wrapper addresses.
+
+fn test_backend_wgpu_new_is_complete() {
+    var b = backend_wgpu_new();
+    assert(b != 0, "backend_wgpu_new returns non-null");
+    assert_eq(backend_is_complete(b), 1,
+              "wgpu backend has all 10 fnptr slots filled");
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU,
+              "wgpu backend kind = BACKEND_KIND_WGPU");
+    return 0;
+}
+
+fn test_backend_wgpu_slot_identities() {
+    # Each slot must point at the matching wrapper. Catches
+    # builder typos (wrong fnptr in wrong slot) at CPU-test time.
+    var b = backend_wgpu_new();
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT),
+              &_backend_wgpu_ctx_create_from_preinit,
+              "slot 0 = ctx_create_from_preinit");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE),
+              &_backend_wgpu_ctx_release,
+              "slot 8 = ctx_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              &_backend_wgpu_buffer_create,
+              "slot 16 = buffer_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_WRITE),
+              &_backend_wgpu_buffer_write,
+              "slot 24 = buffer_write");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_READ),
+              &_backend_wgpu_buffer_read,
+              "slot 32 = buffer_read");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_RELEASE),
+              &_backend_wgpu_buffer_release,
+              "slot 40 = buffer_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
+              &_backend_wgpu_shader_module_create,
+              "slot 48 = shader_module_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE),
+              &_backend_wgpu_shader_module_release,
+              "slot 56 = shader_module_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH),
+              &_backend_wgpu_compute_dispatch,
+              "slot 64 = compute_dispatch");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE),
+              &_backend_wgpu_device_wait_idle,
+              "slot 72 = device_wait_idle");
+    return 0;
+}
+
+fn test_backend_wgpu_compute_dispatch_stub_returns_err() {
+    # Step 2 stub returns GPU_ERR_OTHER unconditionally. Lock that
+    # contract in so Step 3's full implementation has to actively
+    # replace this assertion (proving the stub was retired).
+    var b = backend_wgpu_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var rc = fncall6(fp, 0, 0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_OTHER,
+              "compute_dispatch stub returns GPU_ERR_OTHER");
+    return 0;
+}
+
+fn test_backend_wgpu_two_builders_are_distinct() {
+    # Each backend_wgpu_new() returns a fresh allocation so callers
+    # holding two backends don't share state.
+    var a = backend_wgpu_new();
+    var b = backend_wgpu_new();
+    assert(a != b, "distinct allocations");
+    assert_eq(backend_kind(a), BACKEND_KIND_WGPU, "a kind = WGPU");
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "b kind = WGPU");
+    # Mutating one does not affect the other.
+    backend_set_slot(a, BACKEND_SLOT_CTX_RELEASE, 0);
+    assert(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE) != 0,
+           "b unaffected by a's mutation");
+    return 0;
+}
+
+# ================================================================
 # v2.4.1 — sakshi observability wiring
 # ================================================================
 # These assertions verify the gating contract: mabda emits sakshi
@@ -2856,6 +2940,12 @@ fn main() {
     test_backend_set_get_slot_round_trip();
     test_backend_fncall_through_slot_smoke();
     test_backend_is_complete_detects_missing_slot();
+
+    # v3 Phase B5 — wgpu backend implementation (4)
+    test_backend_wgpu_new_is_complete();
+    test_backend_wgpu_slot_identities();
+    test_backend_wgpu_compute_dispatch_stub_returns_err();
+    test_backend_wgpu_two_builders_are_distinct();
 
     # v2.4.1 — sakshi observability wiring (5)
     test_obs_disabled_by_default();

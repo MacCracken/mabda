@@ -1,0 +1,205 @@
+# @internal — wgpu Backend implementation (v3 Phase B5, ADR 006)
+# backend_wgpu.cyr — fills the Backend interface (src/backend.cyr)
+# with thin wrappers around the existing wgpu FFI + descriptors.
+#
+# Step 2 scope: land the wrapper fns + a backend_wgpu_new() builder
+# that produces a complete Backend (all 10 fnptr slots set, kind =
+# BACKEND_KIND_WGPU). The wrappers are not yet driven by the public
+# API in buffer.cyr / compute.cyr / etc. — that's Step 3's refactor.
+# Until then this module is reachable only through backend_wgpu_new()
+# and the layout/completeness tests in tests/tcyr.
+#
+# Slot signatures (from docs/proposals/v3-backend-interface.md):
+#   ctx_create_from_preinit (preinit_ptr)             -> ctx
+#   ctx_release             (ctx)                     -> 0
+#   buffer_create           (ctx, size, usage)        -> buf
+#   buffer_write            (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_read             (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_release          (ctx, buf)                -> 0
+#   shader_module_create    (ctx, bytes_ptr, n)       -> shmod
+#   shader_module_release   (ctx, shmod)              -> 0
+#   compute_dispatch        (ctx, shmod, x, y, z, bp) -> 0|err  (STUB in Step 2)
+#   device_wait_idle        (ctx)                     -> 0
+#
+# Note: Cyrius reserves `mod` as an operator-position keyword, so the
+# shader-module parameter is named `shmod` here (and in the Backend
+# slot type comments). The slot semantics are unchanged.
+
+# ================================================================
+# Context
+# ================================================================
+# gpu_context_from_preinit returns a tagged GpuResult. The slot
+# signature is "raw ctx pointer or 0 on failure" — unwrap here so
+# the dispatch layer above doesn't have to know about Result.
+
+fn _backend_wgpu_ctx_create_from_preinit(preinit_ptr) {
+    var res = gpu_context_from_preinit(preinit_ptr);
+    if (is_ok(res) == 1) { return payload(res); }
+    return 0;
+}
+
+fn _backend_wgpu_ctx_release(ctx) {
+    return gpu_context_release(ctx);
+}
+
+# ================================================================
+# Buffer
+# ================================================================
+# v0 slot signatures don't carry a label — pass NULL to the wgpu
+# descriptor builder, which short-circuits the StringView write.
+# Step 3 may revise the slot to take a label if profiling / debug
+# tooling needs one.
+
+fn _backend_wgpu_buffer_create(ctx, size, usage) {
+    var device = gpu_ctx_device(ctx);
+    var desc = wgpu_buffer_descriptor(0, usage, size, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+fn _backend_wgpu_buffer_write(ctx, buf, off, ptr, n) {
+    var queue = gpu_ctx_queue(ctx);
+    wgpu_queue_write_buffer(queue, buf, off, ptr, n);
+    return 0;
+}
+
+# Synchronous read. Stages an internal MAP_READ buffer, copies
+# n bytes from buf+off into it, maps, memcpy's into the caller's
+# ptr, and releases. Inlined here (rather than calling buffer.cyr's
+# read_buffer_capped) so backend_wgpu.cyr stays placement-independent
+# in the include chain. The 256 MB cap matches the buffer.cyr
+# default — anything larger requires a bespoke streaming path.
+var _BACKEND_WGPU_READ_CAP = 268435456;
+
+fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n) {
+    if (n <= 0)                     { return GPU_ERR_BUFFER; }
+    if (n > _BACKEND_WGPU_READ_CAP) { return GPU_ERR_BUFFER; }
+    var src_size = wgpu_buffer_get_size(buf);
+    if (off < 0)                    { return GPU_ERR_BUFFER; }
+    if (off + n > src_size)         { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buf, off, staging, 0, n);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(ptr, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
+}
+
+fn _backend_wgpu_buffer_release(ctx, buf) {
+    if (ctx == 0) { return 0; }
+    wgpu_buffer_release(buf);
+    return 0;
+}
+
+# ================================================================
+# Shader module
+# ================================================================
+# v0 slot takes (bytes_ptr, n). For wgpu, bytes are WGSL UTF-8.
+# We don't enforce null-termination — wgpu_string_view bounds
+# strlen() at WGPU_LABEL_MAX_BYTES (4 KB) so non-terminated input
+# fails gracefully rather than walking off mapped memory. Real
+# WGSL programs can exceed that 4 KB though; this is a Step-3-era
+# follow-up to pass an explicit length to wgpu_string_view_len.
+
+fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n) {
+    if (ctx == 0)       { return 0; }
+    if (bytes_ptr == 0) { return 0; }
+    if (n <= 0)         { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var src = wgpu_shader_source_wgsl(bytes_ptr);
+    var desc = wgpu_shader_module_descriptor(0, src);
+    return wgpu_device_create_shader_module(device, desc);
+}
+
+fn _backend_wgpu_shader_module_release(ctx, shmod) {
+    if (ctx == 0) { return 0; }
+    wgpu_shader_module_release(shmod);
+    return 0;
+}
+
+# ================================================================
+# Compute dispatch — STUB for Step 2
+# ================================================================
+# Full assembly (compute pipeline + bind group from bindings_ptr +
+# command encoder + compute pass + dispatch + submit) requires the
+# bindings_ptr format to be locked in and the public compute API in
+# src/compute.cyr to dispatch through this slot. Both are Step 3
+# work — see docs/development/3-0-punchlist.md.
+#
+# Step 2 returns GPU_ERR_OTHER unconditionally. The slot is filled
+# (backend_is_complete returns 1) but calling it through fncall
+# until Step 3 lands is a programming error. CPU tests do not call
+# this slot.
+
+fn _backend_wgpu_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    return GPU_ERR_OTHER;
+}
+
+# ================================================================
+# Device wait
+# ================================================================
+# wgpu_device_poll(device, wait=1) blocks until all submitted work
+# completes. Slot returns 0 on completion.
+
+fn _backend_wgpu_device_wait_idle(ctx) {
+    if (ctx == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    wgpu_device_poll(device, 1);
+    return 0;
+}
+
+# ================================================================
+# Builder
+# ================================================================
+# Allocates a Backend, fills all 10 fnptr slots with the wrapper
+# functions above, and sets kind = BACKEND_KIND_WGPU. Caller owns
+# the returned pointer; pair with backend release once that exists
+# (none required today — the bump allocator reclaims at process
+# end; persistent allocators land in Step 4 / Phase B.4 follow-ups).
+
+fn backend_wgpu_new() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+                     &_backend_wgpu_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_wgpu_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_backend_wgpu_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_backend_wgpu_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+                     &_backend_wgpu_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_backend_wgpu_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+                     &_backend_wgpu_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+                     &_backend_wgpu_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+                     &_backend_wgpu_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_wgpu_device_wait_idle);
+    backend_set_kind(b, BACKEND_KIND_WGPU);
+    return b;
+}
