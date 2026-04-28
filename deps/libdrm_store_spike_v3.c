@@ -135,6 +135,20 @@ static inline uint32_t *pm4_dispatch_direct(uint32_t *p, uint32_t x, uint32_t y,
     *p++ = GFX9_DISPATCH_INITIATOR;
     return p;
 }
+/* Session 25: CPU-readable progress marker. WRITE_DATA(WR_CONFIRM=1, DST_SEL=5
+ * MEMORY async, ENGINE_SEL=ME) writes one DW to a *mapped* user VA. WR_CONFIRM=1
+ * means CP waits for the L2 ack — same packet shape that hung the spike at
+ * IB_RPTR=23 in session 25, except now the target VA is real. If CP stalls
+ * here too, the ack mechanism itself is broken; if it doesn't, each landed
+ * marker tells us exactly how far the IB got. */
+static inline uint32_t *pm4_write_data_marker(uint32_t *p, uint64_t dst_va, uint32_t value) {
+    *p++ = PACKET3(0x37, 3);                                   /* WRITE_DATA, body=4 */
+    *p++ = 0x00100500u;                                        /* DST_SEL=5, WR_CONFIRM=1, ENGINE=ME */
+    *p++ = (uint32_t)(dst_va & 0xFFFFFFFFu);
+    *p++ = (uint32_t)((dst_va >> 32) & 0xFFFFFFFFu);
+    *p++ = value;
+    return p;
+}
 static inline uint32_t *pm4_nop_pad(uint32_t *p, uint32_t *base, unsigned target_total_dw) {
     unsigned cur = (unsigned)(p - base);
     if (cur >= target_total_dw) return p;
@@ -151,26 +165,29 @@ static inline uint32_t *pm4_nop_pad(uint32_t *p, uint32_t *base, unsigned target
  *    __kernel void spike(__global uint *out) { *out = 0xDEADBEEF; }
  * 6 instructions, 9 DWs (36 bytes). USER_SGPR=2 reads {s0=va_lo, s1=va_hi}.
  */
-/* Bytes extracted byte-exact from build/shader/spike.o .text section
- * (xxd output: ff00 80be 0000 0010 8000 81be ff00 83be efbe adde c000 42c0
- *              0000 0000 7fc0 8cbf 0000 81bf).
+/* Session 25 fix: prior code embedded bytes from build/shader/spike.o, which
+ * is the *non-HSA* AMDPAL-style binary — those bytes start 0xBE8000FF = SOP1
+ * `s_mov_b32 s0, 0x10000000`, i.e. scalar moves that *clobber* the USER_DATA
+ * loaded into s0/s1 by the kernel-launch and substitute the shader's own
+ * hardcoded buffer base. The comments labeled them as `v_mov_b32` but that
+ * was a hex misread. Outcome: shader ran, stored 0xDEADBEEF, but to a wrong
+ * address (somewhere derived from 0x10000000), so out_va kept its sentinel.
  *
- * Session 18 attempt 5 swapped this for a bare `s_endpgm` (2-DW) and the
- * 0x66d000 CPC fault RETURNED. So the fault is in CPC's post-dispatch
- * cleanup, not the dispatch setup — attempts 3-4 only hid it behind a
- * shader hang (USER_DATA values were wrong, so global_store stalled in
- * s_waitcnt and the wave never completed cleanly). Reverted to the real
- * 9-DW store kernel for Session 19's investigation of CPC CSA / queue
- * context setup differences vs Mesa. */
-static const uint32_t spike_shader_code[9] = {
-    0xBE8000FFu,    /* part 1: v_mov_b32_e32 v0, s0 (VOP1 with 64-bit encoding form) */
-    0x10000000u,    /* part 2                                                        */
-    0xBE810080u,    /* v_mov_b32_e32 v1, s1                                          */
-    0xBE8300FFu,    /* v_mov_b32_e32 v2, lit (literal follows)                       */
+ * The HSA-ABI binary (build/shader/spike_hsa.o) is what we actually want:
+ * it uses VOP1 vector moves to copy USER_SGPR s0/s1 into v0/v1, then does a
+ * FLAT-encoded global_store_dword v[0:1], v2 — exactly the .s source. Bytes
+ * extracted via `xxd build/shader/spike_hsa.o` from offset 0x100 (.text).
+ *
+ * 8 DWs total (32 bytes). USER_SGPR=2 is the *minimum*; we set RSRC2=0x8 →
+ * USER_SGPR=4, which still loads s0/s1 correctly (s2/s3 ignored by shader). */
+static const uint32_t spike_shader_code[8] = {
+    0x7E000200u,    /* v_mov_b32_e32 v0, s0                                          */
+    0x7E020201u,    /* v_mov_b32_e32 v1, s1                                          */
+    0x7E0402FFu,    /* v_mov_b32_e32 v2, lit                                         */
     0xDEADBEEFu,    /* literal value                                                 */
-    0xC04200C0u,    /* global_store_dword v[0:1], v2, off (FLAT-encoded, 64-bit)     */
-    0x00000000u,    /* part 2                                                        */
-    0xBF8CC07Fu,    /* s_waitcnt vmcnt(0)                                            */
+    0xDC708000u,    /* global_store_dword v[0:1], v2, off (FLAT/GLOBAL part 1)       */
+    0x007F0200u,    /* part 2 (saddr=0x7F=NULL, vdata=v2, addr=v[0:1])               */
+    0xBF8C0F70u,    /* s_waitcnt vmcnt(0) lgkmcnt(0)                                 */
     0xBF810000u,    /* s_endpgm                                                      */
 };
 
@@ -247,6 +264,18 @@ int main(void) {
     /* Seed output with a sentinel that is NOT 0xDEADBEEF to prove the shader wrote it. */
     *(uint32_t *)out_cpu = 0xBAADF00Du;
 
+    /* Session 25: seed three CPU-readable IB-progress markers in fence_cpu.
+     * Marker A at +0  (start-of-IB),
+     * Marker B at +8  (after preamble, before DISPATCH_DIRECT),
+     * Marker C at +16 (after DISPATCH_DIRECT, before terminator).
+     * fence_cpu+32 is reserved for the kernel user-fence write (8 B), so we
+     * stay clear of that window. WRITE_DATA(WR_CONFIRM=1) emits stall the
+     * CP until each write is acked — if any landed value is the sentinel,
+     * CP got stuck before that point. */
+    *(uint32_t *)((uint8_t *)fence_cpu +  0) = 0xBAADF00Du;
+    *(uint32_t *)((uint8_t *)fence_cpu +  8) = 0xBAADF00Du;
+    *(uint32_t *)((uint8_t *)fence_cpu + 16) = 0xBAADF00Du;
+
     /* ---- Write shader code into shader BO. ---- */
     memcpy(shader_cpu, spike_shader_code, sizeof spike_shader_code);
 
@@ -263,6 +292,11 @@ int main(void) {
     uint32_t pgm_lo = (uint32_t)((shader_va >> 8) & 0xFFFFFFFFu);
     uint32_t pgm_hi = (uint32_t)((shader_va >> 40) & 0xFFu);
 
+    /* Session 25 marker A — fires before any preamble work. If fence+0 stays
+     * 0xBAADF00D after submit, CP never started fetching; if it lands as
+     * 0xCAFEBABE we know MEC at least entered our IB and cleared one
+     * WR_CONFIRM round-trip. */
+    p = pm4_write_data_marker(p, fence_va + 0, 0xCAFEBABEu);
     /* 1. PGM_HI (early). */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_PGM_HI, pgm_hi);
     /* 2. STATIC_THREAD_MGMT_SE0 = 0xFFFFFFFF (enable all CUs in SE0), SE1 = 0 (Cezanne has 1 SE). */
@@ -279,30 +313,27 @@ int main(void) {
     p = pm4_set_uconfig_one(p, R_CP_COHER_START_DELAY, 0);
     /* 5. TA_CS_BC_BASE_ADDR + _HI — border-color base.
      *
-     * Session 16 fix: previously pointed at shader_va, on the (wrong) belief
-     * that "SCRATCH_EN=0 means HW never reads it." On Cezanne the CPC walks
-     * the BC base address during dispatch setup regardless — pointing it at
-     * our 4 KB shader BO meant CPC interpreted shader bytes as descriptors
-     * and produced a derived write to ~0x66d000, tripping a UTCL2 fault
-     * (Sessions 14-15 attempt 1+2, identical address every time).
-     *
-     * Match Mesa cl_probe IB byte-exact (`AMD_DEBUG=ib` dump lines 27-31):
-     *   LO = 0x01004400, HI = 0x00000080
-     *   → reconstructed VA = (0x80 << 40) | (0x01004400 << 8) = 0xFFFF800100440000
-     * That is the kernel-reserved magic VA the firmware accepts as a no-op
-     * BC base without an actual BO mapping. */
+     * Session 25: previously set to (LO=0x01004400, HI=0x80) which the comment
+     * called "Mesa kernel-reserved magic VA the firmware accepts as a no-op."
+     * That assumption was wrong. The reconstructed VA 0xFFFF800100440000 is
+     * Mesa's *own* allocated BC stub BO in *Mesa's* address space — we have
+     * nothing mapped there. Set both halves to 0 instead. Our shader is bare
+     * `global_store_dword`, no samplers, so CPC has no reason to walk the BC
+     * descriptor. The session-16 hypothesis ("CPC walks BC base regardless")
+     * was derived from an interpretation of the 0x66d000 fault that we now
+     * know was actually a kernel reset-replay artifact of the WRITE_DATA hang
+     * removed below — not a CPC-walk derivation. If CPC really does walk it
+     * we'll learn that from the next devcd. */
     p = pm4_set_uconfig_pair(p, R_TA_CS_BC_BASE_ADDR,
-                             0x01004400u,   /* LO: matches Mesa byte-exact */
-                             0x00000080u);  /* HI: matches Mesa byte-exact */
-    /* 5a. WRITE_DATA zero-fence (Mesa cl_probe IB byte-exact, dump line 32-38).
-     * 4-DW WRITE_DATA(MEM, ENGINE_SEL=ME, WR_CONFIRM=1) → kernel-magic fence VA
-     * 0xFFFF800100600300 is a reserved sync VA the firmware accepts without a
-     * userspace BO mapping. Acts as a CP-side serialization barrier. */
-    *p++ = PACKET3(0x37, 3);
-    *p++ = 0x00100500u;
-    *p++ = 0x00600300u;        /* fence_va lo */
-    *p++ = 0xFFFF8001u;        /* fence_va hi */
-    *p++ = 0x00000000u;        /* zero-fence value */
+                             0x00000000u,   /* LO = 0 */
+                             0x00000000u);  /* HI = 0 */
+    /* 5a. (REMOVED) WRITE_DATA zero-fence to 0xFFFF800100600300.
+     * That packet was the proximate hang point in session 25: WR_CONFIRM=1
+     * targeting an unmapped VA → CPC issues the write, UTCL1 walks the PTE,
+     * faults, and CPC waits forever for an ack. IP State dump showed
+     * IB_RPTR=23 = exactly past this packet, IB_BASE=0 (cleared on reset),
+     * CP_CPC_STALLED_STAT1=0x01000000, CPC_UTCL1_STATUS=0x000f0002 (pending
+     * walk). Removing this packet eliminates the unmapped-VA stall. */
     /* 6. PGM_LO. */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_PGM_LO, pgm_lo);
     /* 7. PGM_RSRC1 + RSRC2 as a pair. RSRC2 = 0x8 → USER_SGPR=4 (loads s0..s3). */
@@ -342,17 +373,11 @@ int main(void) {
     }
     /* 11. ACQUIRE_MEM (mandatory cache invalidate before dispatch on GFX9). */
     p = pm4_acquire_mem_full(p);
-    /* 11a. DMA_DATA NOWHERE sync (Mesa cl_probe IB byte-exact, dump line 106-117).
-     * 7-DW DMA_DATA(DST_SEL=NOWHERE, BYTE_COUNT=96, RAW_WAIT=0). Fetches 96 B
-     * via TC L2 from kernel-magic VA 0xFFFF800000000000 and discards — forces
-     * an L2 fence between ACQUIRE_MEM and the dispatch. */
-    *p++ = PACKET3(0x50, 5);
-    *p++ = 0x60200000u;        /* word0: ENGINE=ME, DST_SEL=NOWHERE, SRC_SEL=SRC_ADDR_TC_L2 */
-    *p++ = 0x00000000u;        /* SRC_ADDR_LO */
-    *p++ = 0xFFFF8000u;        /* SRC_ADDR_HI */
-    *p++ = 0x00000000u;        /* DST_ADDR_LO */
-    *p++ = 0xFFFF8000u;        /* DST_ADDR_HI */
-    *p++ = 0x80000060u;        /* COMMAND: BYTE_COUNT=0x60, DISABLE_WR_CONFIRM=1 */
+    /* 11a. (REMOVED) DMA_DATA NOWHERE source 0xFFFF800000000000.
+     * Same Mesa-magic-VA mistake as 5a — that source VA is in Mesa's address
+     * space, not ours. DMA_DATA reads 96 B via TC L2 from an unmapped VA
+     * would page-fault. We never reached this packet in session 25 (hang at
+     * idx 23 well before here), but removing it pre-empts a second fault. */
     /* 12. RESOURCE_LIMITS = 0x140 (WAVES_PER_SH=320). Zero stalls forever. */
     p = pm4_set_sh_reg_one(p, R_COMPUTE_RESOURCE_LIMITS, 0x140);
     /* 13. NUM_THREAD_X/Y/Z = 1, 1, 1. */
@@ -360,8 +385,17 @@ int main(void) {
         uint32_t v[3] = { 1, 1, 1 };
         p = pm4_set_sh_reg_n(p, R_COMPUTE_NUM_THREAD_X, 3, v);
     }
+    /* Session 25 marker B — fires after preamble register-set + ACQUIRE_MEM,
+     * before DISPATCH_DIRECT. 0xFEEDFACE landing means the entire compute-
+     * state setup completed cleanly. */
+    p = pm4_write_data_marker(p, fence_va + 8, 0xFEEDFACEu);
     /* 14. DISPATCH_DIRECT (1, 1, 1). */
     p = pm4_dispatch_direct(p, 1, 1, 1);
+    /* Session 25 marker C — fires after DISPATCH_DIRECT returns control to
+     * CP. 0xC0FFEE12 landing means CP got the dispatch back without faulting.
+     * (DISPATCH_DIRECT is fire-and-forget for waves; CP doesn't wait on
+     * shader completion here, only on dispatch acceptance.) */
+    p = pm4_write_data_marker(p, fence_va + 16, 0xC0FFEE12u);
     /* 15. Trailing DMA_DATA CP_SYNC=1 BYTE_COUNT=0 terminator (Mesa cl_probe IB
      * byte-exact, dump line 165-186). 7-DW DMA_DATA(CP_SYNC=1, ENGINE=ME,
      * DST_SEL=DST_ADDR_TC_L2, SRC_SEL=SRC_ADDR_TC_L2, BYTE_COUNT=0) — a no-op
@@ -376,23 +410,24 @@ int main(void) {
     *p++ = 0x00000000u;                                     /* DST_LO */
     *p++ = 0x00000000u;                                     /* DST_HI */
     *p++ = 0x00000000u;                                     /* COMMAND: BYTE_COUNT=0 */
-    /* Session 25: pad IB to 32-byte alignment (80 DWs = 320 bytes) to match
-     * Mesa cl_probe ib_bytes byte-exact. Re-read of the AMD_DEBUG=ib log vs
-     * cl_probe.csdump showed Mesa CS#1 disasm ends at dw=74 but ib_bytes=320
-     * (80 DWs) — the trailing 6 DWs are a single NOP padding packet. Session
-     * 17's "no padding" comment was based on the disasm-only read.
-     *
-     * Hypothesis: gfx9 CP fetches IBs in cache-line-aligned chunks; over-
-     * fetching our 75-DW IB reads 0x00000000 from the (memset-zeroed) tail
-     * of the IB BO, which the CP firmware decodes as "PKT3 op=0 count=0" —
-     * a reserved/invalid type-3 packet that hangs MEC mid-IB. Padding to 80
-     * DWs eliminates the over-fetch and matches Mesa byte-exact.
-     *
-     * NOP packet shape: count_minus_1 = body_dws - 1. To consume 5 DWs total
-     * (1 header + 4 body), set count_minus_1 = 3. Body DWs are already zero
-     * from memset(ib_cpu, 0, 4096). */
-    *p++ = PACKET3(IT_NOP, 3);                              /* 5-DW NOP: header + 4 zero body DWs */
-    p += 4;
+    /* Session 25: pad to 80 DWs total (multiple of 8 = 32 B) via a single NOP
+     * packet emitted by hand — pm4_nop_pad mis-computes count_minus_1 (passes
+     * `pad` instead of `pad-2`) which leaves the NOP packet's claimed body
+     * extending 2 DWs past the cursor. Direct emission keeps the math
+     * obvious: cur DWs used so far, target = 80, NOP packet covers
+     * (80 - cur) DWs total = header + (80 - cur - 1) body DWs, so
+     * count_minus_1 = (80 - cur - 2). Body bytes are already zero from
+     * memset(ib_cpu, 0, 4096). */
+    {
+        unsigned cur = (unsigned)(p - ib);
+        if (cur < 80) {
+            unsigned pad_total = 80 - cur;
+            if (pad_total >= 2) {
+                *p++ = PACKET3(IT_NOP, (uint32_t)(pad_total - 2));
+                p += (pad_total - 1);
+            }
+        }
+    }
     unsigned ib_dws_used = (unsigned)(p - ib);
 
     fprintf(stderr, "pm4 IB built: %u DWs\n", ib_dws_used);
@@ -528,6 +563,18 @@ int main(void) {
     }
 
     uint32_t got = *(uint32_t *)out_cpu;
+    /* Session 25 progress markers — print before the PASS/FAIL line so
+     * partial-progress is visible even if the dispatch itself failed. */
+    uint32_t mA = *(uint32_t *)((uint8_t *)fence_cpu +  0);
+    uint32_t mB = *(uint32_t *)((uint8_t *)fence_cpu +  8);
+    uint32_t mC = *(uint32_t *)((uint8_t *)fence_cpu + 16);
+    fprintf(stderr,
+            "marker A (start)   = 0x%08X %s\n"
+            "marker B (pre-dsp) = 0x%08X %s\n"
+            "marker C (post-dsp)= 0x%08X %s\n",
+            mA, mA == 0xCAFEBABEu ? "OK"  : "STALE",
+            mB, mB == 0xFEEDFACEu ? "OK"  : "STALE",
+            mC, mC == 0xC0FFEE12u ? "OK"  : "STALE");
     printf("out[0] = 0x%08X (want 0xDEADBEEF) — %s\n",
            got, got == 0xDEADBEEFu ? "PASS" : "FAIL");
 
