@@ -179,6 +179,15 @@ Ordered roughly the way they'll need to run.
 - [ ] Lint / fmt / vet clean across the **whole repo** (not just
   touched files) — `cyrius lint src/*.cyr programs/*.cyr`,
   `cyrius fmt --check`, `cyrius vet programs/smoke.cyr`
+- [ ] **Split `tests/tcyr/mabda.tcyr`** into multiple smaller files
+  to work around the `cyrius lint` file-size threshold bug
+  (`docs/development/issues/2026-04-28-cyrlint-multi-line-assert.md`).
+  Suggest grouping by phase: `mabda.tcyr` for v2.x assertions,
+  `mabda_v3.tcyr` for the v3 backend-abstraction tests added in
+  Steps 1-3e+, possibly more splits as the suite grows. Update the
+  Makefile + CI workflow to run all the test files. Without this,
+  the v3.0 lint-clean gate cannot be met while the upstream lint
+  bug is open.
 - [ ] `.github/workflows/release.yml` tag filter + version-verify
   still work against the `v3.0.0` shape
 - [ ] Soak window — run the new bundle in CI for N days (suggest
