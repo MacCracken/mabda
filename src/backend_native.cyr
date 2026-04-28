@@ -1224,3 +1224,173 @@ fn native_compute_dispatch_simple(fd, ctx_id, pm4, pm4_bytes,
     if (wait_rc != 0) { return GPU_ERR_OTHER; }
     return 0;
 }
+
+# ================================================================
+# v3 Step 4c — native Backend interface implementation
+# ================================================================
+# Fills the @internal Backend struct (src/backend.cyr) with native
+# (AMD/amdgpu/GFX9) slot wrappers. Step 4c lands the compute_dispatch
+# slot end-to-end + 9 stubs for the rest. Step 4d+ will fill the
+# stubs as native buffer / shader_module / surface paths land.
+#
+# Native GpuContext field interpretation:
+#   On wgpu, the +0..+24 fields are instance/adapter/device/queue.
+#   On native, they are reinterpreted as:
+#     +0:  fd            (DRM render-node fd)
+#     +8:  ctx_id        (amdgpu context id)
+#     +16: stub_handle   (Mesa scratch V# stub BO handle)
+#     +24: stub_va       (stub BO VA, canonical-high)
+#   The +32 backend ptr is the same on both; backend_kind(b) tells
+#   you which interpretation to use. Future contexts that need more
+#   native state will need to grow GpuContext or push state behind
+#   the backend ptr.
+#
+# Buffer-handle convention used by the slot wrappers:
+#   shmod and bp args are pointers to 16-byte (handle, va) pairs:
+#     +0: u64 KMS handle
+#     +8: u64 GPU VA
+#   This is a private convention between caller and the native
+#   compute_dispatch slot — until a public gpu_buffer_native_new()
+#   helper lands, callers pack the pair manually.
+
+fn native_ctx_fd(ctx)            { return load64(ctx +  0); }
+fn native_ctx_id(ctx)             { return load64(ctx +  8); }
+fn native_ctx_stub_handle(ctx)    { return load64(ctx + 16); }
+fn native_ctx_stub_va(ctx)        { return load64(ctx + 24); }
+
+# Pack (handle, va) into the private 16-byte buffer-pair shape.
+# Caller allocates 16 bytes for `dst` (typically a stack-local
+# `var pair[16]`); this helper writes the two u64 fields.
+fn native_buf_pair_write(dst, handle, va) {
+    store64(dst + 0, handle);
+    store64(dst + 8, va);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Slot wrappers
+# ----------------------------------------------------------------
+
+# Slot signature: ctx_create_from_preinit(preinit_ptr) → ctx.
+# Native does not consume preinit_ptr — it opens its own DRM fd
+# and allocates its own ctx_id, packing them into a fresh ctx
+# struct. Step 4c stub: returns 0 (caller is expected to populate
+# ctx fields explicitly via native_ctx_init_from_handles below
+# until a real implementation lands in Step 4d+).
+fn _backend_native_ctx_create_from_preinit(preinit_ptr) {
+    return 0;
+}
+
+fn _backend_native_ctx_release(ctx) {
+    if (ctx == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var ctx_id = native_ctx_id(ctx);
+    if (ctx_id != 0) { native_ctx_free(fd, ctx_id); }
+    if (fd > 0) { sys_close(fd); }
+    return 0;
+}
+
+# Buffer slots — Step 4c stubs. Native BO management (gpu_buffer_*
+# routed through ctx->backend) is Step 4d+ work. Returning err
+# means "not implemented" without crashing.
+fn _backend_native_buffer_create(ctx, size, usage) {
+    return 0;
+}
+
+fn _backend_native_buffer_write(ctx, buf, off, ptr, n) {
+    return GPU_ERR_OTHER;
+}
+
+fn _backend_native_buffer_read(ctx, buf, off, ptr, n) {
+    return GPU_ERR_OTHER;
+}
+
+fn _backend_native_buffer_release(ctx, buf) {
+    return 0;
+}
+
+# Shader-module slots — stubs. Native shader modules are pre-
+# compiled GFX9 ISA bytes mapped to a BO at a canonical-high VA;
+# Step 4d+ will wrap that.
+fn _backend_native_shader_module_create(ctx, bytes_ptr, n) {
+    return 0;
+}
+
+fn _backend_native_shader_module_release(ctx, shmod) {
+    return 0;
+}
+
+# Compute dispatch — the load-bearing slot. Step 4c lands this
+# end-to-end. shmod and bp are pointers to (handle, va) pairs.
+fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (shmod == 0) { return GPU_ERR_OTHER; }
+    if (bp == 0)    { return GPU_ERR_OTHER; }
+
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var stub_va = native_ctx_stub_va(ctx);
+    var shader_handle = load64(shmod + 0);
+    var shader_va     = load64(shmod + 8);
+    var out_handle = load64(bp + 0);
+    var out_va     = load64(bp + 8);
+
+    var pm4 = alloc(256);
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
+                            shader_va, stub_va, out_va, x, y, z);
+
+    var t_now[16];
+    syscall(228, 1, &t_now);
+    var ns_now = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8);
+    var deadline = ns_now + 15000000000;
+
+    return native_compute_dispatch_simple(fd, cid, pm4, pm4_bytes,
+                                          shader_handle, stub_handle,
+                                          out_handle, deadline);
+}
+
+# Device wait — stub. Native dispatch is synchronous (waits on the
+# syncobj before native_compute_dispatch_simple returns), so a
+# separate device_wait_idle is conceptually a no-op until we ever
+# add async submit paths.
+fn _backend_native_device_wait_idle(ctx) {
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Builder
+# ----------------------------------------------------------------
+
+# Allocates a Backend, fills all 10 slots with the native wrappers
+# above, and sets kind = BACKEND_KIND_AMD. Step 4c only lights the
+# compute_dispatch slot end-to-end; the other 9 slots return
+# stub values (GPU_ERR_OTHER for fallible operations, 0 for void
+# operations). Backend is "complete" per backend_is_complete()
+# (every slot non-null) but only the compute_dispatch path is real.
+fn backend_native_new() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+                     &_backend_native_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_native_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_backend_native_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_backend_native_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+                     &_backend_native_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_backend_native_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+                     &_backend_native_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+                     &_backend_native_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+                     &_backend_native_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_native_device_wait_idle);
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    return b;
+}

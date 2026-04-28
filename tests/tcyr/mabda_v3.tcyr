@@ -625,6 +625,104 @@ fn test_gpu_compute_dispatch_null_ctx_returns_err() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 4c — native Backend slot wrappers + builder
+# ================================================================
+# Step 4c lights backend_native_new() + the compute_dispatch slot
+# end-to-end. CPU tests here verify the builder shape: complete
+# backend, kind = AMD, slots resolve to the expected wrappers.
+# End-to-end dispatch validation happens in the GPU integration
+# program (programs/native_compute_store.cyr — refactored Step 4d).
+# Native ctx field accessor tests verify the dual-interpretation
+# layout convention.
+
+fn test_backend_native_new_is_complete() {
+    var b = backend_native_new();
+    assert(b != 0, "backend_native_new returns non-null");
+    assert_eq(backend_is_complete(b), 1, "all 10 slots filled");
+    assert_eq(backend_kind(b), BACKEND_KIND_AMD, "kind = AMD");
+    return 0;
+}
+
+fn test_backend_native_slot_identities() {
+    var b = backend_native_new();
+    var s_ccp = backend_get_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT);
+    var s_cr = backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE);
+    var s_bc = backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE);
+    var s_bw = backend_get_slot(b, BACKEND_SLOT_BUFFER_WRITE);
+    var s_br = backend_get_slot(b, BACKEND_SLOT_BUFFER_READ);
+    var s_bl = backend_get_slot(b, BACKEND_SLOT_BUFFER_RELEASE);
+    var s_smc = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE);
+    var s_smr = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE);
+    var s_cd = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var s_wi = backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    assert_eq(s_ccp, &_backend_native_ctx_create_from_preinit, "ctx_create");
+    assert_eq(s_cr, &_backend_native_ctx_release, "ctx_release");
+    assert_eq(s_bc, &_backend_native_buffer_create, "buffer_create");
+    assert_eq(s_bw, &_backend_native_buffer_write, "buffer_write");
+    assert_eq(s_br, &_backend_native_buffer_read, "buffer_read");
+    assert_eq(s_bl, &_backend_native_buffer_release, "buffer_release");
+    assert_eq(s_smc, &_backend_native_shader_module_create, "shader_module_create");
+    assert_eq(s_smr, &_backend_native_shader_module_release, "shader_module_release");
+    assert_eq(s_cd, &_backend_native_compute_dispatch, "compute_dispatch");
+    assert_eq(s_wi, &_backend_native_device_wait_idle, "device_wait_idle");
+    return 0;
+}
+
+fn test_backend_native_distinct_from_wgpu() {
+    var w = backend_wgpu_new();
+    var n = backend_native_new();
+    assert(w != n, "distinct backend allocations");
+    assert(backend_kind(w) != backend_kind(n), "distinct kinds");
+    assert_eq(backend_kind(w), BACKEND_KIND_WGPU, "wgpu kind");
+    assert_eq(backend_kind(n), BACKEND_KIND_AMD, "native kind");
+    var w_cd = backend_get_slot(w, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var n_cd = backend_get_slot(n, BACKEND_SLOT_COMPUTE_DISPATCH);
+    assert(w_cd != n_cd, "wgpu and native compute_dispatch slots differ");
+    return 0;
+}
+
+fn test_native_ctx_field_accessors() {
+    var ctx = alloc(40);
+    memset(ctx, 0, 40);
+    store64(ctx +  0, 7);              # fd
+    store64(ctx +  8, 42);             # ctx_id
+    store64(ctx + 16, 0xDEAD);         # stub_handle
+    store64(ctx + 24, 0xFFFF800100004000); # stub_va
+    store64(ctx + 32, 0xBEEF);         # backend ptr
+    assert_eq(native_ctx_fd(ctx), 7, "fd at +0");
+    assert_eq(native_ctx_id(ctx), 42, "ctx_id at +8");
+    assert_eq(native_ctx_stub_handle(ctx), 0xDEAD, "stub_handle at +16");
+    assert_eq(native_ctx_stub_va(ctx), 0xFFFF800100004000, "stub_va at +24");
+    assert_eq(gpu_ctx_backend(ctx), 0xBEEF, "backend ptr unchanged at +32");
+    return 0;
+}
+
+fn test_native_buf_pair_write() {
+    var pair[16];
+    memset(&pair, 0, 16);
+    native_buf_pair_write(&pair, 0xCAFE, 0xBABE);
+    assert_eq(load64(&pair + 0), 0xCAFE, "handle at +0");
+    assert_eq(load64(&pair + 8), 0xBABE, "va at +8");
+    return 0;
+}
+
+fn test_backend_native_compute_dispatch_null_args_err() {
+    var b = backend_native_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var rc1 = fncall6(fp, 0, 0, 0, 0, 0, 0);
+    assert_eq(rc1, GPU_ERR_OTHER, "null ctx → err");
+    var dummy_ctx = alloc(40);
+    memset(dummy_ctx, 0, 40);
+    var rc2 = fncall6(fp, dummy_ctx, 0, 0, 0, 0, 0);
+    assert_eq(rc2, GPU_ERR_OTHER, "null shmod → err");
+    var dummy_pair = alloc(16);
+    memset(dummy_pair, 0, 16);
+    var rc3 = fncall6(fp, dummy_ctx, dummy_pair, 0, 0, 0, 0);
+    assert_eq(rc3, GPU_ERR_OTHER, "null bp → err");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -674,6 +772,14 @@ fn main() {
     # v3 Step 3g — gpu_compute_dispatch (fncall6) (2)
     test_gpu_compute_dispatch_dispatches_through_backend();
     test_gpu_compute_dispatch_null_ctx_returns_err();
+
+    # v3 Step 4c — native Backend slot wrappers + builder (6)
+    test_backend_native_new_is_complete();
+    test_backend_native_slot_identities();
+    test_backend_native_distinct_from_wgpu();
+    test_native_ctx_field_accessors();
+    test_native_buf_pair_write();
+    test_backend_native_compute_dispatch_null_args_err();
 
     return assert_summary();
 }
