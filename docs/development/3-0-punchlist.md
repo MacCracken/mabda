@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.8b)
+**Last refresh:** 2026-04-28 (post Step 6.9a)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -192,6 +192,19 @@ need it.
     cache was the rejected naive design.
 - [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
   (mirror of `programs/render_e2e.cyr`).
+  - [x] **6.9 (a)** — public dispatchers landed. 7 ctx-aware
+    `gpu_render_*` fns in `src/render_target.cyr`,
+    `src/render_pipeline.cyr`, `src/render_pass.cyr` routing
+    through `ctx->backend->render_*` slots. Coexist with v2.x
+    `rtb_*` / `render_pipeline_create_simple` / `rpb_pass_*`
+    helpers. 8 mock-backend CPU tests in
+    `tests/tcyr/mabda_v3.tcyr` verify call threading + arg
+    capture + null-ctx safety. Works on wgpu path immediately
+    via 6.8b's slot wrappers; lights up on native path once
+    6.8c lands. (Step 6.9a, 2026-04-28).
+  - [ ] **6.9 (b)** — `programs/native_render_e2e.cyr` mirroring
+    `programs/render_e2e.cyr`. Gated on 6.8c (which is gated on
+    6.2 + 6.5 + 6.6).
 
 #### Phase D — surface + present on native (broken into chunks)
 
@@ -489,3 +502,12 @@ punch-list work that future-you should know about.)
   gained render_pipeline / render_target includes since backend_wgpu
   now references their helpers. 1073 CPU tests pass; 7 GPU programs
   build clean.
+- **2026-04-28** — Step 6.9a landed (public render dispatchers): 7
+  ctx-aware `gpu_render_*` fns in render_target.cyr / render_pipeline.cyr
+  / render_pass.cyr routing through ctx->backend slots. 8 new
+  mock-backend dispatch tests (1108 CPU tests pass: 624 mabda + 484
+  mabda_v3). Public render API now lives behind the abstraction —
+  consumers can call gpu_render_pipeline_create / gpu_render_pass_begin
+  / etc. and the backend (wgpu today, native at 6.8c) handles the
+  rest. v2.x rtb_* / render_pipeline_create_simple / rpb_pass_* helpers
+  stay in place for code that builds descriptors directly.
