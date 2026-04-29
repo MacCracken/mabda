@@ -1,6 +1,6 @@
 # v3 Backend Interface — `@internal` dispatch surface
 
-**Status:** Draft, v2 (v3 branch, 2026-04-28 — v0 written after Phase B.4 verified; v1 added Step 5.3 with texture slots; v2 added Step 6.7 with render-pipeline + render-pass + render-target slots)
+**Status:** Draft, v2.1 (v3 branch, 2026-04-28 — v0 written after Phase B.4 verified; v1 added Step 5.3 with texture slots; v2 added Step 6.7 with render-pipeline + render-pass + render-target slots; v2.1 corrected post-research — clear-color format and the GFX9 PM4 block split)
 **Related:**
 [ADR 006](../adr/006-native-cyrius-gpu-backend.md) (dual-backend),
 [ADR 005](../adr/005-public-api-surface-marking.md) (`@public` boundary),
@@ -257,9 +257,18 @@ Backend struct (176 bytes — 21 slots × 8 bytes; grew from v1's 120):
   +128: render_target_release          (ctx, rt_ptr)            → 0        (v2)
   +136: render_pipeline_create         (ctx, vs_mod, fs_mod, color_fmt) → pipe_ptr  (v2)
   +144: render_pipeline_release        (ctx, pipe_ptr)          → 0        (v2)
-  +152: render_pass_begin              (ctx, rt_ptr, clear_rgba8) → pass_ptr (v2)
+  +152: render_pass_begin              (ctx, rt_ptr, clear_color_ptr) → pass_ptr (v2)
   +160: render_pass_draw               (ctx, pass_ptr, pipe_ptr, vertex_count, instance_count) → 0|err (v2)
   +168: render_pass_end                (ctx, pass_ptr)           → 0        (v2)
+
+  `clear_color_ptr` points to a 32-byte block of 4×f64 RGBA values
+  (mabda's existing f64-backed `Color` shape from `src/color.cyr`).
+  WGPUColor in webgpu.h v29 is `{double r,g,b,a;}` — packing the clear
+  value as a u32 0xRRGGBBAA arg was an early-draft mistake; loses 56
+  bits of precision per channel and breaks sRGB/HDR/wide-gamut clears
+  that already work on the wgpu path. Verified against
+  `deps/wgpu-native/include/webgpu/webgpu.h:1954` and the existing
+  precedent in `src/render_pass.cyr` (`color_write_f64(c, att+40)`).
 ```
 
 All 7 slots stay within the fncall ceiling (max 5 args + ctx = 6
@@ -328,12 +337,33 @@ Consumers needing other states use the v2.1 expansion (deferred).
   struct-packed via a C shim (existing pattern). Returns a u64
   pointer to a small struct holding the `WGPURenderPipeline` handle.
 - **native**: builds a `NativeRenderPipeline` struct holding the
-  shader VAs + a precomputed PM4-state-block byte buffer (the
-  `SET_SH_REG` + `SET_CONTEXT_REG` writes that get spliced into the
-  IB at draw time). The PM4 state is encoded once per
-  pipeline_create rather than per-draw — pipeline change between
-  draws is the rare case; keeping the encoded bytes resident
-  amortizes the encoding cost.
+  shader VAs + **two** precomputed PM4 byte buffers:
+  - `pipeline_sh_block` — `SET_SH_REG` writes for SPI_SHADER_PGM_LO/HI
+    + RSRC1/2 (VS + PS), SPI_SHADER_USER_DATA layout, SPI_SHADER_POS_FORMAT,
+    SPI_SHADER_Z_FORMAT, SPI_SHADER_COL_FORMAT.
+  - `pipeline_ctx_block` — `SET_CONTEXT_REG` writes for the
+    pipeline-static context regs only: PA_SC_LINE_CNTL, PA_SC_AA_CONFIG,
+    PA_SC_MODE_CNTL, PA_SU_SC_MODE_CNTL (cull/front-face),
+    PA_CL_CLIP_CNTL, PA_CL_VS_OUT_CNTL, VGT_SHADER_STAGES_EN,
+    SPI_PS_INPUT_*, SPI_VS_OUT_CONFIG, CB_SHADER_MASK,
+    CB_TARGET_MASK, CB_COLOR_CONTROL, CB_BLEND0_CONTROL,
+    DB_SHADER_CONTROL, DB_RENDER_CONTROL.
+
+  RT-dependent context regs (CB_COLOR0_BASE/PITCH/SLICE/INFO,
+  DB_*, scissor, viewport) are **NOT** in this pipeline block —
+  they get regenerated at `render_pass_begin` because they depend
+  on the RT being bound, which the pipeline doesn't own. Per-draw
+  fixups (USER_DATA values, VGT_NUM_INSTANCES, the
+  DRAW_INDEX_AUTO packet itself) get appended at the IB tail by
+  `render_pass_draw`.
+
+  This 2-block-per-pipeline + 1-block-per-pass + 1-tail-per-draw
+  shape matches Mesa radv's `ctx_cs` / `cs` / dynamic-state cut
+  exactly, which is the byte-exact reference for our verification
+  protocol (`feedback_pm4_verify_against_mesa_ib`). Earlier draft's
+  "single PM4 block per pipeline" was wrong — there are
+  fundamentally three lifetimes of PM4 state in a graphics
+  dispatch.
 
 `color_fmt` is a u32 enum: `0 = RGBA8_UNORM` for v2. Other formats
 land alongside the v3.2 texture format expansion.
@@ -346,23 +376,33 @@ Frees the pipeline + heap struct.
 - **native**: `free(pipe_ptr)` — no GPU-side teardown needed; the
   PM4 bytes are owned by the struct and freed with it.
 
-#### `render_pass_begin (ctx, rt_ptr, clear_rgba8) → pass_ptr`
+#### `render_pass_begin (ctx, rt_ptr, clear_color_ptr) → pass_ptr`
 
-Starts a render pass on a single color attachment. `clear_rgba8` is
-a packed u32 in `0xRRGGBBAA` byte order — single-arg passes the
-clear color without struct-pack overhead.
+Starts a render pass on a single color attachment. `clear_color_ptr`
+points to 32 bytes of f64 RGBA (mabda's `Color` shape). The wrapper
+copies the f64 quartet into the right offset on each backend.
 
 - **wgpu**: builds a `WGPURenderPassDescriptor` with one color
-  attachment (`load_op = clear`, `clear_value = unpacked from
-  clear_rgba8`), calls `wgpu_command_encoder_begin_render_pass`,
-  and stuffs the encoder + pass + RT into a `NativeRenderPass`-
-  shaped struct so `pass_ptr` is opaque to the caller.
+  attachment. `loadOp = WGPULoadOp_Clear`, `storeOp =
+  WGPUStoreOp_Store` (both must be set explicitly — `Undefined`
+  is invalid per webgpu.h v29; struct-zeroing alone is not enough).
+  `clearValue` is a `WGPUColor { r, g, b, a }` 32-byte struct
+  embedded in the attachment at offset 40 — `memcpy(att+40,
+  clear_color_ptr, 32)`. Calls `wgpu_command_encoder_begin_render_pass`
+  (already through a struct-packing C shim in
+  `deps/wgpu_main.c:182`). `depthStencilAttachment = NULL`,
+  `occlusionQuerySet = NULL`, `timestampWrites = NULL`. The
+  encoder + pass + RT get stuffed into a `NativeRenderPass`-shaped
+  opaque struct.
 - **native**: allocates a per-pass IB-fragment buffer (separate
   from the per-context cached IB so multiple passes can stage
-  in flight), writes the initial PM4 state for the RT binding +
-  clear color, returns a pointer to the pass struct. Submission
-  happens at `render_pass_end`; `draw` calls append to the pass's
-  IB-fragment in between.
+  in flight), writes the **`pass_target_block`** (RT-extent-derived
+  PM4 — CB_COLOR0_BASE/PITCH/SLICE/INFO/ATTRIB, DB_* if depth,
+  PA_SC_SCREEN_SCISSOR_TL/BR, PA_SC_WINDOW_SCISSOR_TL/BR,
+  PA_CL_VPORT_*) followed by the clear-color write, returns a
+  pointer to the pass struct. Submission happens at
+  `render_pass_end`; `draw` calls append to the pass's IB-fragment
+  in between. See "GFX9 PM4 block split" section below.
 
 The clear is **always** issued at pass begin. Load-op = preserve
 is a v2.1 expansion; v2 forces clear-on-begin to keep the slot
@@ -378,10 +418,16 @@ buffers in v2 — the shader synthesizes positions from
 - **wgpu**: `wgpu_render_pass_encoder_set_pipeline` +
   `wgpu_render_pass_encoder_draw(vertex_count, instance_count,
   0, 0)` (first_vertex + first_instance pinned at 0 for v2).
-- **native**: appends `SET_SH_REG` writes for the pipeline's
-  shader VAs + `DRAW_INDEX_AUTO` packet to the pass IB-fragment.
-  `count_minus_1` derivation per
-  `feedback_pm4_count_minus_1_naming.md`.
+- **native**: appends the pipeline's `pipeline_sh_block` and
+  `pipeline_ctx_block` (memcpy from the pipeline struct, no
+  re-encoding), then writes any per-draw USER_DATA values +
+  VGT_NUM_INSTANCES (if instance_count > 1), then a
+  `DRAW_INDEX_AUTO` packet. `count_minus_1` derivation per
+  `feedback_pm4_count_minus_1_naming.md`. If the pipeline_ptr
+  matches the pass's last-bound pipeline_ptr, the SH and CTX
+  blocks are skipped (state caching — same pattern radv uses
+  to avoid context rolls between back-to-back draws of the same
+  pipeline; see GPUOpen "Understanding GPU context rolls").
 
 5 args after the slot ptr — stays at fncall5, the established
 ceiling for ergonomic slot dispatch.
@@ -399,6 +445,123 @@ Finalizes and submits the pass.
   submits with the per-context fence BO, waits for sync-obj
   signal, frees the pass struct. Matches the established Phase B.4
   submit flow.
+
+### GFX9 PM4 block split (native side, mandatory reading before Step 6.8c)
+
+The graphics dispatch state is **not** a single PM4 block per
+pipeline. It has three distinct lifetimes, which the Backend
+interface honors:
+
+| Block | Lifetime | Lives in | Approx size |
+|-------|----------|----------|-------------|
+| `pipeline_sh_block`  | per-pipeline (built at `render_pipeline_create`) | NativeRenderPipeline struct | ~40-80 dwords |
+| `pipeline_ctx_block` | per-pipeline (built at `render_pipeline_create`) | NativeRenderPipeline struct | ~80-160 dwords |
+| `pass_target_block`  | per-pass (rebuilt at `render_pass_begin`) | NativeRenderPass struct | ~40-80 dwords |
+| `draw_tail`          | per-draw (appended in `render_pass_draw`) | IB-fragment, inline | ~10-20 dwords |
+
+Why each lifetime is forced (not chosen):
+
+- **`pipeline_sh_block`** — Shader VAs (SPI_SHADER_PGM_LO/HI for VS+PS),
+  RSRC1/2 control fields, USER_DATA window layout. These are 100%
+  determined by the shader bytes and the pipeline's resource
+  bindings. Pipeline change → re-emit. RT bind → no re-emit needed.
+- **`pipeline_ctx_block`** — Context regs that are pipeline-static:
+  blend, raster mode, depth-test mode, primitive topology, AA mask.
+  Vulkan/Mesa calls these "pipeline state"; radv bakes them into
+  `ctx_cs` at pipeline-create time.
+- **`pass_target_block`** — Context regs that depend on the RT
+  being bound: CB_COLOR0_* (BASE, PITCH, SLICE, INFO, ATTRIB),
+  DB_* (if depth), PA_SC_SCREEN_SCISSOR, PA_SC_WINDOW_SCISSOR,
+  PA_CL_VPORT_*. The pipeline doesn't own these — the RT does —
+  so they cannot be cached at pipeline-create. radv emits them
+  via `radv_emit_fb_color_state` at command-buffer time.
+- **`draw_tail`** — VGT_NUM_INSTANCES (if instancing),
+  per-draw USER_DATA values (push constants, dynamic descriptor
+  pointers), DRAW_INDEX_AUTO packet itself. Per-draw by definition.
+
+**Earlier draft was wrong.** The v2 proposal initially said the
+pipeline state could be encoded in a single PM4 buffer at
+`render_pipeline_create` and spliced in at draw time. That
+collapses three distinct lifetimes into one and would have broken
+RT-bind, viewport-change, and per-draw uniforms. Verified against
+Mesa radv's `radv_pipeline_graphics.c` (pipeline `ctx_cs`),
+`radv_cmd_buffer.c` (`radv_emit_fb_color_state` for RT-dependent
+context regs), and AMD GPUOpen's "Understanding GPU context
+rolls" article (why context-reg writes are batched separately
+from SH-reg writes).
+
+### RLC-gated / kernel-only registers — userspace must NOT write
+
+The Phase B.4 close-out ruled out a "missing queue preamble" theory,
+but the underlying caution stands: GFX9 has registers reserved for
+the kernel and the RLC microcontroller. Writing them from a userspace
+IB is undefined-behavior territory. The Step 6.8c PM4 builders must
+filter against this denylist:
+
+- `GRBM_GFX_INDEX`, `GRBM_GFX_CNTL` — broadcast / per-SE selectors,
+  RLC-mediated.
+- `RLC_*` family entirely — RLC microcontroller's domain.
+- `SH_MEM_CONFIG`, `SH_MEM_BASES` — kernel sets per-VMID at submit.
+- `COMPUTE_STATIC_THREAD_MGMT_SE0..3` — kernel-managed (already
+  set up correctly at ctx-init per the resolved B.3 entry; do not
+  re-write in userspace IB).
+- `PA_SC_TILE_STEERING_OVERRIDE` — kernel-only on GFX9.
+- `MC_VM_*`, `ATC_*` — kernel-only memory controller.
+- `CP_HQD_*`, `CP_MQD_*` — queue-descriptor regs, kernel-set at
+  queue init.
+
+Safe rule: only write registers radv writes from its userspace IB.
+Verify with `AMD_DEBUG=ib` and the byte-exact protocol
+(`feedback_pm4_verify_against_mesa_ib.md`) — anything radv doesn't
+emit, we don't emit either.
+
+### Verification & citations
+
+This section landed in v2.1 (2026-04-28) after two research agents
+verified the v2 design against external sources. Findings:
+
+**Claim 1 — wgpu function names + signatures: VERIFIED.** All 8
+wrapper names exist in `deps/wgpu-native/include/webgpu/webgpu.h`
+v29 and are already wired into `src/wgpu_ffi.cyr`. Two notes:
+(a) mabda already exposes `wgpu_queue_submit_one` (slot 35,
+`src/wgpu_ffi.cyr:124`) — single-cmd convenience wrapper around
+`wgpuQueueSubmit(queue, 1, &cmd_buf)`. Use it for `render_pass_end`.
+(b) `wgpuCommandEncoderFinish`'s descriptor argument is
+`WGPU_NULLABLE`; pass NULL.
+
+**Claim 2 — WGSL `@builtin(vertex_index)` with no vertex buffer:
+VERIFIED.** Already shipping. `programs/phase0.cyr:311-315` and
+`programs/benchmarks.cyr:367-371` use this exact pattern. The
+`WGPUVertexState` struct (webgpu.h:4727) explicitly allows
+`bufferCount = 0, buffers = NULL` — `WGPU_VERTEX_STATE_INIT`
+default. Mabda's `_vertex_state_init` (`src/render_pipeline.cyr:80-87`)
+zero-fills which yields the right shape.
+
+**Claim 3 — clear-color format: CORRECTED.** WGPUColor is `{double
+r,g,b,a;}` (32 bytes) per `webgpu.h:1954`. The earlier draft's
+"packed u32 0xRRGGBBAA" arg was wrong. Slot signature is now
+`(ctx, rt_ptr, clear_color_ptr) → pass_ptr` where `clear_color_ptr`
+is a 32-byte f64 RGBA block (mabda's `Color` shape). Existing
+precedent: `color_write_f64(c, att+40)` in `src/render_pass.cyr`.
+
+**Claim 4 — pipeline descriptor mandatory fields: VERIFIED with
+explicit defaults.** `WGPURenderPipelineDescriptor`: `layout = NULL`
+is legal (auto layout from shader reflection); `depthStencil = NULL`
+is legal (no depth); `fragment = NULL` is legal but useless for
+color output (the v2 proposal requires `fragment` non-NULL with
+`targetCount = 1`). `WGPURenderPassColorAttachment`: `loadOp` and
+`storeOp` must be set explicitly to `Clear`/`Store` etc. — `Undefined`
+is invalid; struct-zeroing alone is not enough. `colorAttachmentCount
+≥ 1` unless using a depth-only pass.
+
+**Claim 5 — GFX9 pipeline state PM4 serializability: REJECTED as
+originally stated.** Replaced with the 3-block split documented
+above. Sources: Mesa docs ("RADV — The Mesa 3D Graphics Library"),
+Mesa source at `src/amd/vulkan/radv_pipeline_graphics.c` and
+`radv_cmd_buffer.c` (`radv_emit_fb_color_state`), AMD GPUOpen
+"Understanding GPU context rolls", and the kernel's
+`drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c` for the RLC save/restore
+list.
 
 ### What v2 still defers
 
@@ -440,6 +603,11 @@ Mirrors the v1 5-step pattern:
    the pass slots are gated on Step 6.5's
    `native_pm4_build_render_clear_triangle` PM4 stream and Step
    6.6's `native_render_dispatch_simple` submit path landing.
+   Split c does NOT cache pipeline state in a single PM4 block —
+   it builds two pipeline blocks (`pipeline_sh_block` +
+   `pipeline_ctx_block`) at pipeline_create time, plus a
+   `pass_target_block` at pass_begin time, plus a per-draw tail.
+   See "GFX9 PM4 block split" above. Honor the RLC-gated denylist.
 5. **Step 6.9** — public `gpu_render_*` dispatchers in
    `src/render_pipeline.cyr`, `src/render_pass.cyr`,
    `src/render_target.cyr`. Coexist with v2.x APIs; old names
