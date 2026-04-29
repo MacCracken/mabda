@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 5a)
+**Last refresh:** 2026-04-28 (post Step 6.3)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -79,53 +79,60 @@ The smallest first cut is a flat 2D RGBA8 BO with no tiling/no
 mipmaps/no DCC. Format/tiling expansion comes later as consumers
 need it.
 
-- [ ] **5.1** — `native_texture_create_2d_rgba8(fd, w, h, out)`
+- [x] **5.1** — `native_texture_create_2d_rgba8(fd, w, h, out)`
   primitive. Allocates GTT BO sized `w * h * 4`, va_maps at the
   texture VA range (e.g. `0xFFFF800100A00000`+), returns
   `(handle, va, addr, size)` packed in a 32-byte struct. CPU
   regression test: size formula, struct layout, VA-range
   isolation from existing IB / fence / shader / stub VAs.
-- [ ] **5.2** — `native_texture_release_2d_rgba8(fd, tex)`
+- [x] **5.2** — `native_texture_release_2d_rgba8(fd, tex)`
   primitive. va_unmap + bo_release_gtt. Pair with 5.1.
-- [ ] **5.3** — Texture slot signatures designed in
+- [x] **5.3** — Texture slot signatures designed in
   `docs/proposals/v3-backend-interface.md` revision: `texture_create`,
   `texture_write`, `texture_read`, `texture_release` slot signatures.
   Backend struct grows from 88 → 120 bytes (4 new slots).
-- [ ] **5.4** — `src/backend.cyr` updated with new slot offsets +
+- [x] **5.4** — `src/backend.cyr` updated with new slot offsets +
   layout asserts. CPU tests for new constants.
-- [ ] **5.5** — `_backend_wgpu_texture_*` slot wrappers around
+- [x] **5.5** — `_backend_wgpu_texture_*` slot wrappers around
   `wgpu_device_create_texture` / `wgpu_queue_write_texture` /
   copy-texture-to-buffer + map for read.
-- [ ] **5.6** — `_backend_native_texture_*` slot wrappers around
+- [x] **5.6** — `_backend_native_texture_*` slot wrappers around
   the 5.1/5.2 primitives + a CPU-side memcpy for write/read
   (since GTT pages are CPU-accessible). No GPU-side pixel
   conversion yet.
-- [ ] **5.7** — Public `gpu_texture_create_2d_rgba8 / write / read
+- [x] **5.7** — Public `gpu_texture_create_2d_rgba8 / write / read
   / release` dispatchers in `src/texture.cyr`. Coexist with v2.x
   `texture_create_rgba8` which retires at v5.1.
-- [ ] **5.8** — Native texture round-trip end-to-end test:
+- [x] **5.8** — Native texture round-trip end-to-end test:
   CPU-write pattern → GPU buffer → native texture (via copy or
   shader) → CPU-readback. Use `programs/native_compute_store.cyr`
   as the template; new program `programs/native_texture_e2e.cyr`.
-- [ ] **5.9** — Update `programs/phase0.cyr` Test 11 family to
+- [x] **5.9** — Update `programs/phase0.cyr` Test 11 family to
   also exercise `gpu_texture_*` dispatchers under wgpu (mirrors
   the Step 3c `gpu_buffer_*` validation — proves the slot wires
   reach real wgpu without regressions).
 
 #### Phase C — render pipeline + render pass on native (broken into chunks)
 
-- [ ] **6.1** — Design doc: GFX9 graphics pipeline state
+- [x] **6.1** — Design doc: GFX9 graphics pipeline state
   (vertex shader registers, fragment shader registers, rasterizer
   state, color/depth target setup). Pages from amdgpu kernel
   source + Mesa radv. Filed in
   `docs/proposals/v3-native-render-design.md`.
 - [ ] **6.2** — Trivial GFX9 vertex+fragment shader pair
-  (full-screen triangle, solid color output) compiled via
-  `clang -target amdgcn`. Bytes get the same byte-exact treatment
-  as `native_gfx9_shader_store_deadbeef`.
-- [ ] **6.3** — `native_render_target_create(fd, w, h, format, out)`
-  primitive — render-target BO + va_map at a render-target VA
-  range. Reuse 5.1's BO allocator pattern.
+  (full-screen triangle, solid color output). **Real research
+  chunk** — graphics shaders need GFX9 vertex/fragment ABI
+  (SPI conventions, position/color exports), not the OpenCL
+  compute kernel ABI that produced `native_gfx9_shader_store_deadbeef`.
+  Realistic options: hand-write against GCN5 ISA spec, extract
+  from radv reference, or wait for Phase 8 WGSL→GFX9 lowering.
+  **Reordered to land after 6.4** — independent of 6.3/6.4, so
+  doing those first lets 6.2 get a focused session with proper
+  time budget.
+- [x] **6.3** — `native_rt_create_2d_rgba8(fd, w, h, out)` +
+  release primitive (Step 6.3 done 2026-04-28). NativeRenderTarget
+  struct (32 bytes, same shape as NativeTexture). RT VA range at
+  `0xFFFF800101000000`. Reuses Step 5.1's BO allocator pattern.
 - [ ] **6.4** — PM4 packets for graphics pipeline state setup
   (PA_SC_SCREEN_SCISSOR, PA_CL_VPORT_*, CB_TARGET_MASK, …). Build
   on top of existing PM4 helpers.

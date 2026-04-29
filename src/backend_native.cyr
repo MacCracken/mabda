@@ -1630,3 +1630,82 @@ fn native_texture_release_2d_rgba8(fd, tex) {
     store64(tex + NATIVE_TEX_FIELD_SIZE,   0);
     return 0;
 }
+
+# ================================================================
+# v3 Step 6.3 — native 2D RGBA8 render target primitives (Phase C)
+# ================================================================
+# Render targets are allocated and mapped almost exactly like
+# textures (Step 5.1) — same GTT BO + va_map + linear layout. The
+# difference is the *role*: an RT is bound to CB_COLOR0_BASE on the
+# graphics ring (Step 6.5) rather than read by a fragment shader as
+# a sampled texture. RT VA range is separate so a single ctx can
+# hold both a sampled texture and an RT without VA collision (the
+# Step 5.1 hardcoded-VA limit applies independently per pool).
+#
+# NativeRenderTarget struct layout (32 bytes — same shape as
+# NativeTexture, intentionally; v3 RTs and textures share an
+# allocator pattern):
+#   +0:  handle (u64, KMS handle)
+#   +8:  va     (u64, canonical-high GPU VA at RT range)
+#   +16: addr   (u64, CPU mmap pointer — for clear-color writes
+#                or CPU readback in tests)
+#   +24: size   (u64, bytes — width × height × 4)
+#
+# RT VA range: 0xFFFF800101000000 — 16 MiB past the texture base
+# (0xFFFF800100A00000 + ~6 MiB headroom). Plenty of room for
+# 2048x2048 RGBA8 RTs (16 MiB) before colliding with future ranges.
+
+var _NATIVE_RT_VA_BASE  = 0xFFFF800101000000;
+
+var NATIVE_RT_FIELD_HANDLE = 0;
+var NATIVE_RT_FIELD_VA     = 8;
+var NATIVE_RT_FIELD_ADDR   = 16;
+var NATIVE_RT_FIELD_SIZE   = 24;
+var NATIVE_RT_STRUCT_SIZE  = 32;
+
+# Pure-math size formula. Symmetric with native_texture_size_2d_rgba8.
+fn native_rt_size_2d_rgba8(width, height) {
+    return width * height * 4;
+}
+
+# Allocate a 2D RGBA8 render target. Single-RT-per-ctx limit (VA
+# is hardcoded at _NATIVE_RT_VA_BASE) — same constraint as the
+# texture allocator. Multi-RT VA allocator lands later in Phase C
+# when render passes need MRT.
+fn native_rt_create_2d_rgba8(fd, width, height, out) {
+    var size = native_rt_size_2d_rgba8(width, height);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    var va = _NATIVE_RT_VA_BASE;
+    rc = native_gem_va_map(fd, handle, va, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_RT_FIELD_HANDLE, handle);
+    store64(out + NATIVE_RT_FIELD_VA,     va);
+    store64(out + NATIVE_RT_FIELD_ADDR,   addr);
+    store64(out + NATIVE_RT_FIELD_SIZE,   size);
+    return 0;
+}
+
+# Release a NativeRenderTarget. Pair with native_rt_create_2d_rgba8.
+fn native_rt_release_2d_rgba8(fd, rt) {
+    if (rt == 0) { return 0; }
+    var handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
+    if (handle == 0) { return 0; }
+    var va   = load64(rt + NATIVE_RT_FIELD_VA);
+    var addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    var size = load64(rt + NATIVE_RT_FIELD_SIZE);
+    native_gem_va_unmap(fd, handle, va, size);
+    native_bo_release_gtt(fd, handle, addr, size);
+    store64(rt + NATIVE_RT_FIELD_HANDLE, 0);
+    store64(rt + NATIVE_RT_FIELD_VA,     0);
+    store64(rt + NATIVE_RT_FIELD_ADDR,   0);
+    store64(rt + NATIVE_RT_FIELD_SIZE,   0);
+    return 0;
+}

@@ -1406,6 +1406,64 @@ fn test_gpu_texture_dispatchers_null_ctx_safe() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 6.3 — native render target primitives (Phase C render)
+# ================================================================
+# CPU-only tests for the RT allocator + release pair. End-to-end
+# hardware validation lands in Step 6.9 (programs/native_render_e2e).
+
+fn test_native_rt_size_formula() {
+    assert_eq(native_rt_size_2d_rgba8(1, 1),     4,        "1x1 = 4 bytes");
+    assert_eq(native_rt_size_2d_rgba8(64, 32),   8192,     "64x32");
+    assert_eq(native_rt_size_2d_rgba8(256, 256), 262144,   "256x256");
+    assert_eq(native_rt_size_2d_rgba8(0, 0),     0,        "0x0 degenerate");
+    return 0;
+}
+
+fn test_native_rt_struct_field_offsets() {
+    assert_eq(NATIVE_RT_FIELD_HANDLE, 0,  "handle at +0");
+    assert_eq(NATIVE_RT_FIELD_VA,     8,  "va at +8");
+    assert_eq(NATIVE_RT_FIELD_ADDR,   16, "addr at +16");
+    assert_eq(NATIVE_RT_FIELD_SIZE,   24, "size at +24");
+    assert_eq(NATIVE_RT_STRUCT_SIZE,  32, "total = 32");
+    return 0;
+}
+
+fn test_native_rt_va_distinct_from_other_pools() {
+    # RT VA must not collide with shader / stub / IB / fence /
+    # output / texture VAs. Catches the "moved a VA constant"
+    # mistake before runtime.
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_STUB_VA,            "rt != stub");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_IB_VA,              "rt != IB");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_FENCE_VA,           "rt != fence");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_TEXTURE_VA_BASE,    "rt != texture");
+    assert(_NATIVE_RT_VA_BASE != 0xFFFF800100000000,         "rt != shader VA");
+    assert(_NATIVE_RT_VA_BASE != 0xFFFF800100400000,         "rt != output VA");
+    return 0;
+}
+
+fn test_native_rt_struct_round_trip() {
+    var rt[32];
+    memset(&rt, 0, 32);
+    store64(&rt + NATIVE_RT_FIELD_HANDLE, 0xCAFE);
+    store64(&rt + NATIVE_RT_FIELD_VA,     _NATIVE_RT_VA_BASE);
+    store64(&rt + NATIVE_RT_FIELD_ADDR,   0xBEEF);
+    store64(&rt + NATIVE_RT_FIELD_SIZE,   8192);
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_HANDLE), 0xCAFE,            "handle round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_VA),     _NATIVE_RT_VA_BASE, "va round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_ADDR),   0xBEEF,            "addr round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_SIZE),   8192,              "size round-trips");
+    return 0;
+}
+
+fn test_native_rt_release_safe_zero() {
+    var rt[32];
+    memset(&rt, 0, 32);
+    assert_eq(native_rt_release_2d_rgba8(7, 0),    0, "null rt is safe");
+    assert_eq(native_rt_release_2d_rgba8(7, &rt),  0, "zero-handle rt is safe");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1520,6 +1578,13 @@ fn main() {
     test_gpu_texture_read_dispatches_through_backend();
     test_gpu_texture_release_dispatches_through_backend();
     test_gpu_texture_dispatchers_null_ctx_safe();
+
+    # v3 Step 6.3 — native render target primitives (5)
+    test_native_rt_size_formula();
+    test_native_rt_struct_field_offsets();
+    test_native_rt_va_distinct_from_other_pools();
+    test_native_rt_struct_round_trip();
+    test_native_rt_release_safe_zero();
 
     return assert_summary();
 }
