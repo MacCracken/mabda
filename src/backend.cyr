@@ -15,7 +15,7 @@
 # adding them with stub-`return GPU_ERR_NOT_IMPLEMENTED` bodies is
 # explicitly out of scope (see docs/proposals/v3-backend-interface.md).
 #
-# Backend struct layout (120 bytes — 14 fnptr slots + 1 kind value):
+# Backend struct layout (176 bytes — 21 fnptr slots + 1 kind value):
 #
 # v0 (Step 1, 88 bytes):
 #   +0:  ctx_create_from_preinit  fnptr (preinit_ptr)            -> ctx
@@ -35,6 +35,24 @@
 #   +96:  texture_write           fnptr (ctx, tex, src, n)       -> 0|err
 #   +104: texture_read            fnptr (ctx, tex, dst, n)       -> 0|err
 #   +112: texture_release         fnptr (ctx, tex)               -> 0
+#
+# v2 render slots (Step 6.8a, +56 bytes):
+#   +120: render_target_create_2d_rgba8  fnptr (ctx, w, h)                 -> rt_ptr
+#   +128: render_target_release          fnptr (ctx, rt)                   -> 0
+#   +136: render_pipeline_create         fnptr (ctx, vs_mod, fs_mod, fmt)  -> pipe
+#   +144: render_pipeline_release        fnptr (ctx, pipe)                 -> 0
+#   +152: render_pass_begin              fnptr (ctx, rt, clear_color_ptr)  -> pass
+#   +160: render_pass_draw               fnptr (ctx, pass, pipe, vc, ic)   -> 0|err
+#   +168: render_pass_end                fnptr (ctx, pass)                 -> 0
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA (mabda Color
+# shape) — WGPUColor in webgpu.h v29 is {double r,g,b,a;}, not a
+# packed u32. See docs/proposals/v3-backend-interface.md v2.1.
+#
+# Native side: pipeline state splits into pipeline_sh_block +
+# pipeline_ctx_block (built at pipeline_create) + pass_target_block
+# (built at pass_begin) + per-draw tail. Single-block pipeline cache
+# was an early-draft mistake; matches Mesa radv ctx_cs/cs cut.
 #
 # The kind field at +80 is a u64 value, not a fnptr — kind is
 # invariant per backend, so storing it directly saves an indirect
@@ -105,7 +123,18 @@ var BACKEND_SLOT_TEXTURE_WRITE           = 96;
 var BACKEND_SLOT_TEXTURE_READ            = 104;
 var BACKEND_SLOT_TEXTURE_RELEASE         = 112;
 
-var BACKEND_SIZE                         = 120;
+# v2 render slots (Step 6.8a) — appended after the texture range.
+# Same append-after-kind invariant: every v0/v1 slot offset stays
+# put. Per docs/proposals/v3-backend-interface.md v2.1.
+var BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8 = 120;
+var BACKEND_SLOT_RENDER_TARGET_RELEASE         = 128;
+var BACKEND_SLOT_RENDER_PIPELINE_CREATE        = 136;
+var BACKEND_SLOT_RENDER_PIPELINE_RELEASE       = 144;
+var BACKEND_SLOT_RENDER_PASS_BEGIN             = 152;
+var BACKEND_SLOT_RENDER_PASS_DRAW              = 160;
+var BACKEND_SLOT_RENDER_PASS_END               = 168;
+
+var BACKEND_SIZE                         = 176;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -117,6 +146,12 @@ var BACKEND_FNPTR_SLOTS_END              = 80;
 # for a missing fnptr.
 var BACKEND_TEXTURE_SLOTS_BEGIN          = 88;
 var BACKEND_TEXTURE_SLOTS_END            = 120;
+
+# v2 render fnptr block: 120..176. Treated as a third range by
+# backend_is_complete() so kind at +80 stays unambiguous and v0/v1
+# tests don't have to know about the new slots.
+var BACKEND_RENDER_SLOTS_BEGIN           = 120;
+var BACKEND_RENDER_SLOTS_END             = 176;
 
 # ================================================================
 # Backend struct construction
@@ -175,6 +210,12 @@ fn backend_is_complete(b) {
         if (load64(b + off2) == 0) { return 0; }
         off2 = off2 + 8;
     }
+    # v2 render slots intentionally NOT walked here — Step 6.8a only
+    # extends the struct layout. backend_wgpu_new / backend_native_new
+    # won't fill the render range until Step 6.8b/c, and we'd rather
+    # keep is_complete green for v0+v1 callers in the meantime than
+    # gate them on a partial v2 backend. Step 6.8b adds the third
+    # range walk alongside the first wgpu render wrapper.
     return 1;
 }
 

@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.7)
+**Last refresh:** 2026-04-28 (post Step 6.8a)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -153,6 +153,24 @@ need it.
   bytes, append-after-kind preserved. All slots within fncall5
   ceiling. Code lands in Step 6.8.
 - [ ] **6.8** — `_backend_wgpu_*` and `_backend_native_*` wrappers.
+  - [x] **6.8 (a)** — pure layout extension in `src/backend.cyr`.
+    7 new slot offset constants (RT create/release, pipeline
+    create/release, pass begin/draw/end at +120..+168), bumped
+    BACKEND_SIZE 120 → 176, added BACKEND_RENDER_SLOTS_BEGIN/END
+    range constants. `backend_is_complete` deliberately defers v2
+    range walk until 6.8b lands real wgpu wrappers (no half-state
+    "complete with stubs" lie). Layout asserts in
+    `tests/tcyr/mabda_v3.tcyr::test_backend_struct_layout` cover
+    every new constant. 419 v3 + 624 mabda CPU tests green.
+    (Step 6.8a, 2026-04-28).
+  - [ ] **6.8 (b)** — wgpu wrappers in `src/backend_wgpu.cyr`. 7
+    new slot wrappers around existing wgpu render helpers; extend
+    `backend_is_complete` to walk the v2 range; phase0 keep-alive.
+  - [ ] **6.8 (c)** — native wrappers in `src/backend_native.cyr`.
+    Gated on 6.2 + 6.5 + 6.6. Honor the 3-block PM4 split
+    (pipeline_sh + pipeline_ctx + pass_target + draw_tail) per
+    `docs/proposals/v3-backend-interface.md` v2.1 — single-block
+    cache was the rejected naive design.
 - [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
   (mirror of `programs/render_e2e.cyr`).
 
@@ -425,3 +443,20 @@ punch-list work that future-you should know about.)
   slots, Backend struct 120 → 176 bytes, append-after-kind preserved.
   Vidya field-notes refreshed: 12 entries in `mabda-v3-gpu.cyml`
   (was 6), 24 entries in `language.cyml` (was 22), index updated.
+- **2026-04-28** — Pit-stop research pass before Step 6.8 code
+  landed. Two research agents verified v2 design against
+  webgpu-native v29 headers + Mesa radv source. Caught two
+  draft-time bugs: clear-color packed as u32 (must be 4×f64
+  pointer per WGPUColor), and "encode pipeline state once at
+  pipeline_create" (must split into pipeline_sh + pipeline_ctx +
+  pass_target + draw_tail per radv ctx_cs/cs cut). Proposal
+  bumped to v2.1; vidya entries
+  `gfx9_pipeline_pm4_three_block_split` +
+  `wgpucolor_is_4_doubles_not_a_packed_u32` capture the lessons
+  for future native-PM4 work.
+- **2026-04-28** — Step 6.8a landed (pure layout): 7 new slot
+  offset constants in `src/backend.cyr`, BACKEND_SIZE 120 → 176,
+  BACKEND_RENDER_SLOTS_BEGIN/END range. backend_is_complete
+  deliberately defers v2 walk until 6.8b — no half-state "complete
+  with stubs" lie. test_backend_struct_layout grew to assert every
+  new offset; 419 v3 + 624 mabda tests green.
