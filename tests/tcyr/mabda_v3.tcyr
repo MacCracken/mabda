@@ -148,8 +148,17 @@ fn test_backend_is_complete_detects_missing_slot() {
         backend_set_slot(b, off2, &_backend_smoke_sentinel);
         off2 = off2 + 8;
     }
+    # v0+v1 alone no longer complete — v2 render range (120..176)
+    # also has fnptr slots that backend_is_complete checks (Step 6.8b).
+    assert_eq(backend_is_complete(b), 0,
+              "v0+v1 fnptrs filled but v2 render range still zero");
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        backend_set_slot(b, off3, &_backend_smoke_sentinel);
+        off3 = off3 + 8;
+    }
     assert_eq(backend_is_complete(b), 1,
-              "all fnptr slots set across both ranges -> complete");
+              "all fnptr slots set across all three ranges -> complete");
     # Wiping one v0 slot drops completeness.
     backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, 0);
     assert_eq(backend_is_complete(b), 0,
@@ -160,6 +169,12 @@ fn test_backend_is_complete_detects_missing_slot() {
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, 0);
     assert_eq(backend_is_complete(b), 0,
               "wiped v1 texture slot drops completeness");
+    # Restore v1, then wipe a v2 render slot — also drops.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
+                     &_backend_smoke_sentinel);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped v2 render slot drops completeness");
     return 0;
 }
 
@@ -177,7 +192,7 @@ fn test_backend_wgpu_new_is_complete() {
     var b = backend_wgpu_new();
     assert(b != 0, "backend_wgpu_new returns non-null");
     assert_eq(backend_is_complete(b), 1,
-              "wgpu backend has all 10 fnptr slots filled");
+              "wgpu backend has all 21 fnptr slots filled");
     assert_eq(backend_kind(b), BACKEND_KIND_WGPU,
               "wgpu backend kind = BACKEND_KIND_WGPU");
     return 0;
@@ -217,6 +232,34 @@ fn test_backend_wgpu_slot_identities() {
     assert_eq(backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE),
               &_backend_wgpu_device_wait_idle,
               "slot 72 = device_wait_idle");
+    return 0;
+}
+
+fn test_backend_wgpu_render_slot_identities() {
+    # v2 render slot identity checks (Step 6.8b). Catches builder
+    # typos in the render half of backend_wgpu_new at CPU-test time.
+    var b = backend_wgpu_new();
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8),
+              &_backend_wgpu_render_target_create_2d_rgba8,
+              "slot 120 = render_target_create_2d_rgba8");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE),
+              &_backend_wgpu_render_target_release,
+              "slot 128 = render_target_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE),
+              &_backend_wgpu_render_pipeline_create,
+              "slot 136 = render_pipeline_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE),
+              &_backend_wgpu_render_pipeline_release,
+              "slot 144 = render_pipeline_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN),
+              &_backend_wgpu_render_pass_begin,
+              "slot 152 = render_pass_begin");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW),
+              &_backend_wgpu_render_pass_draw,
+              "slot 160 = render_pass_draw");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END),
+              &_backend_wgpu_render_pass_end,
+              "slot 168 = render_pass_end");
     return 0;
 }
 
@@ -673,8 +716,30 @@ fn test_gpu_compute_dispatch_null_ctx_returns_err() {
 fn test_backend_native_new_is_complete() {
     var b = backend_native_new();
     assert(b != 0, "backend_native_new returns non-null");
-    assert_eq(backend_is_complete(b), 1, "all 10 slots filled");
+    # v0 + v1 (compute + buffer + texture) are wired up at 4c+5.6.
+    # v2 render slots get wired up at 6.8c (gated on 6.2 + 6.5 + 6.6).
+    # backend_is_complete walks all three ranges as of Step 6.8b, so
+    # the native backend reads as incomplete here. Flip back to == 1
+    # when 6.8c lands.
+    assert_eq(backend_is_complete(b), 0,
+              "native backend incomplete — v2 render slots pending Step 6.8c");
     assert_eq(backend_kind(b), BACKEND_KIND_AMD, "kind = AMD");
+    # The v0 + v1 ranges should be fully filled; only v2 is empty.
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        assert_eq(load64(b + off) != 0, 1, "v0 fnptr filled on native");
+        off = off + 8;
+    }
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        assert_eq(load64(b + off2) != 0, 1, "v1 texture fnptr filled on native");
+        off2 = off2 + 8;
+    }
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        assert_eq(load64(b + off3), 0, "v2 render slot still zero on native (pending 6.8c)");
+        off3 = off3 + 8;
+    }
     return 0;
 }
 
@@ -1593,6 +1658,7 @@ fn main() {
     # v3 Phase B5 — wgpu backend implementation (4)
     test_backend_wgpu_new_is_complete();
     test_backend_wgpu_slot_identities();
+    test_backend_wgpu_render_slot_identities();
     test_backend_wgpu_compute_dispatch_stub_returns_err();
     test_backend_wgpu_two_builders_are_distinct();
 

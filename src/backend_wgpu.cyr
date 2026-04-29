@@ -342,9 +342,176 @@ fn _backend_wgpu_device_wait_idle(ctx) {
 }
 
 # ================================================================
+# Render slots — v2 (Step 6.8b)
+# ================================================================
+# 7 wrappers around the existing wgpu render helpers in
+# render_target.cyr / render_pipeline.cyr / render_pass.cyr. Slot
+# signatures from docs/proposals/v3-backend-interface.md v2.1.
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA — same shape as
+# mabda's Color (src/color.cyr) and as WGPUColor in webgpu.h v29.
+# rpb_pass_color reads it via color_r/g/b/a getters which are
+# load64 at +0/+8/+16/+24, so the slot can pass the raw pointer
+# straight through.
+#
+# Pipeline struct (16 bytes) — opaque to slot caller:
+#   +0:  handle  (WGPURenderPipeline)
+#   +8:  reserved
+#
+# Pass struct (32 bytes) — opaque to slot caller:
+#   +0:  encoder (WGPUCommandEncoder)
+#   +8:  pass    (WGPURenderPassEncoder)
+#   +16: rt_ptr  (back-reference; the rt outlives the pass)
+#   +24: reserved
+
+fn _backend_wgpu_render_target_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT
+              | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+              | WGPU_TEXTURE_USAGE_COPY_SRC;
+    var desc = wgpu_texture_descriptor(0, usage,
+                                       WGPU_TEXTURE_DIMENSION_2D,
+                                       width, height,
+                                       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+                                          WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                                          WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var rt = alloc(32);
+    memset(rt, 0, 32);
+    store64(rt +  0, handle);
+    store64(rt +  8, view);
+    store64(rt + 16, 0);
+    store32(rt + 24, width);
+    store32(rt + 28, height);
+    return rt;
+}
+
+fn _backend_wgpu_render_target_release(ctx, rt) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    var handle = load64(rt +  0);
+    var view   = load64(rt +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(rt +  0, 0);
+    store64(rt +  8, 0);
+    store32(rt + 24, 0);
+    store32(rt + 28, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
+    if (ctx == 0) { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var fmt = color_fmt;
+    if (fmt == 0) { fmt = WGPU_TEXTURE_FORMAT_RGBA8_UNORM; }
+
+    var desc = alloc(168);
+    memset(desc, 0, 168);
+    wgpu_string_view_null(desc + 8);
+    store64(desc + 24, 0);
+    _vertex_state_init(desc + 32, vs_mod, "vs_main");
+    _primitive_state_init(desc + 96, WGPU_TOPOLOGY_TRIANGLE_LIST,
+                                       WGPU_FRONT_FACE_CCW,
+                                       WGPU_CULL_MODE_NONE);
+    store64(desc + 128, 0);
+    _multisample_state_init(desc + 136, 1);
+    var color_target = _color_target_state_new(fmt, 0);
+    var fragment = _fragment_state_new(fs_mod, "fs_main", color_target);
+    store64(desc + 160, fragment);
+
+    var handle = wgpu_device_create_render_pipeline(device, desc);
+    if (handle == 0) { return 0; }
+    var pipe = alloc(16);
+    memset(pipe, 0, 16);
+    store64(pipe + 0, handle);
+    return pipe;
+}
+
+fn _backend_wgpu_render_pipeline_release(ctx, pipe) {
+    if (ctx == 0) { return 0; }
+    if (pipe == 0) { return 0; }
+    var handle = load64(pipe + 0);
+    if (handle != 0) { wgpu_render_pipeline_release(handle); }
+    store64(pipe + 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var view = load64(rt + 8);
+    if (view == 0) { return 0; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) { return 0; }
+
+    var pb = rpb_pass_new();
+    rpb_pass_color(pb, view, clear_color_ptr);
+    var pass = rpb_pass_begin(encoder, pb);
+    if (pass == 0) {
+        wgpu_command_encoder_release(encoder);
+        return 0;
+    }
+
+    var p = alloc(32);
+    memset(p, 0, 32);
+    store64(p +  0, encoder);
+    store64(p +  8, pass);
+    store64(p + 16, rt);
+    return p;
+}
+
+fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    var pass_enc = load64(pass + 8);
+    var pipe_handle = load64(pipe + 0);
+    if (pass_enc == 0)    { return GPU_ERR_OTHER; }
+    if (pipe_handle == 0) { return GPU_ERR_OTHER; }
+    wgpu_render_pass_encoder_set_pipeline(pass_enc, pipe_handle);
+    wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_end(ctx, pass) {
+    if (ctx == 0) { return 0; }
+    if (pass == 0) { return 0; }
+    var encoder  = load64(pass +  0);
+    var pass_enc = load64(pass +  8);
+    if (pass_enc != 0) { wgpu_render_pass_encoder_end(pass_enc); }
+    if (encoder != 0) {
+        var queue = gpu_ctx_queue(ctx);
+        var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+        if (cmd_buf != 0) { wgpu_queue_submit_one(queue, cmd_buf); }
+        wgpu_command_encoder_release(encoder);
+    }
+    if (pass_enc != 0) { wgpu_render_pass_encoder_release(pass_enc); }
+    store64(pass +  0, 0);
+    store64(pass +  8, 0);
+    store64(pass + 16, 0);
+    return 0;
+}
+
+# ================================================================
 # Builder
 # ================================================================
-# Allocates a Backend, fills all 10 fnptr slots with the wrapper
+# Allocates a Backend, fills all 21 fnptr slots with the wrapper
 # functions above, and sets kind = BACKEND_KIND_WGPU. Caller owns
 # the returned pointer; pair with backend release once that exists
 # (none required today — the bump allocator reclaims at process
@@ -380,6 +547,20 @@ fn backend_wgpu_new() {
                      &_backend_wgpu_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
                      &_backend_wgpu_texture_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+                     &_backend_wgpu_render_target_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+                     &_backend_wgpu_render_target_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+                     &_backend_wgpu_render_pipeline_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+                     &_backend_wgpu_render_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+                     &_backend_wgpu_render_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+                     &_backend_wgpu_render_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+                     &_backend_wgpu_render_pass_end);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }

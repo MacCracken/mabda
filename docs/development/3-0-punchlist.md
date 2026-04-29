@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.8a)
+**Last refresh:** 2026-04-28 (post Step 6.8b)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -163,9 +163,28 @@ need it.
     `tests/tcyr/mabda_v3.tcyr::test_backend_struct_layout` cover
     every new constant. 419 v3 + 624 mabda CPU tests green.
     (Step 6.8a, 2026-04-28).
-  - [ ] **6.8 (b)** — wgpu wrappers in `src/backend_wgpu.cyr`. 7
-    new slot wrappers around existing wgpu render helpers; extend
-    `backend_is_complete` to walk the v2 range; phase0 keep-alive.
+  - [x] **6.8 (b)** — wgpu wrappers in `src/backend_wgpu.cyr`. 7
+    new slot wrappers (RT create/release, pipeline create/release,
+    pass begin/draw/end). `backend_wgpu_new()` installs all 21 slots.
+    `backend_is_complete` extended to walk the v2 range. Pipeline
+    descriptor builds inline using existing `_vertex_state_init` /
+    `_primitive_state_init` / `_multisample_state_init` /
+    `_color_target_state_new` / `_fragment_state_new` from
+    `src/render_pipeline.cyr`. Pass struct (32 bytes) holds
+    encoder + pass + rt back-reference. Pipeline struct (16 bytes)
+    holds the WGPURenderPipeline handle. clear_color_ptr is a
+    32-byte f64×4 RGBA block (mabda Color shape) — passed straight
+    through to rpb_pass_color which calls color_write_f64. Tests:
+    7 new layout asserts in test_backend_struct_layout (already in
+    6.8a) + new `test_backend_wgpu_render_slot_identities` (7
+    pointer-identity assertions) + extended
+    `test_backend_is_complete_detects_missing_slot` to fill all
+    three ranges + relaxed `test_backend_native_new_is_complete`
+    to expect incomplete-with-v2-empty until 6.8c. Selective-include
+    integration programs (compute_e2e, render_e2e) gained
+    render_target / render_pipeline includes since backend_wgpu
+    now references their constants. CPU sweep: 624 + 449 = 1073
+    passing. All 7 GPU programs build clean. (Step 6.8b, 2026-04-28).
   - [ ] **6.8 (c)** — native wrappers in `src/backend_native.cyr`.
     Gated on 6.2 + 6.5 + 6.6. Honor the 3-block PM4 split
     (pipeline_sh + pipeline_ctx + pass_target + draw_tail) per
@@ -460,3 +479,13 @@ punch-list work that future-you should know about.)
   deliberately defers v2 walk until 6.8b — no half-state "complete
   with stubs" lie. test_backend_struct_layout grew to assert every
   new offset; 419 v3 + 624 mabda tests green.
+- **2026-04-28** — Step 6.8b landed (wgpu wrappers): 7 wgpu render
+  wrappers in `src/backend_wgpu.cyr` reusing the existing descriptor
+  helpers from render_pipeline.cyr / render_pass.cyr / render_target.cyr.
+  `backend_wgpu_new()` installs all 21 slots; backend_is_complete
+  walks all three ranges. Pipeline struct = 16 bytes (handle); Pass
+  struct = 32 bytes (encoder + pass + rt). Native test relaxed to
+  expect incomplete-v2-pending until 6.8c. compute_e2e + render_e2e
+  gained render_pipeline / render_target includes since backend_wgpu
+  now references their helpers. 1073 CPU tests pass; 7 GPU programs
+  build clean.
