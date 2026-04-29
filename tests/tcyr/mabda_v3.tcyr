@@ -1464,6 +1464,109 @@ fn test_native_rt_release_safe_zero() {
     return 0;
 }
 
+# ================================================================
+# v3 Step 6.4 — SET_CONTEXT_REG + DRAW_INDEX_AUTO PM4 builders
+# ================================================================
+# Byte-exact tests for the new graphics-side PM4 emitters. The
+# wire format mirrors SET_SH_REG / SET_UCONFIG_REG; differences
+# are the opcode and the dword-offset base. Step 6.5 will validate
+# these byte sequences against radv's output for a full clear-
+# triangle dispatch (the existing Phase B.4 protocol).
+
+fn test_native_pm4_opcodes_extended() {
+    assert_eq(IT_SET_CONTEXT_REG, 0x69, "SET_CONTEXT_REG opcode");
+    assert_eq(IT_DRAW_INDEX_AUTO, 0x2D, "DRAW_INDEX_AUTO opcode");
+    assert_eq(PM4_CONTEXT_REG_BASE, 0xA000, "context-reg base byte address");
+    return 0;
+}
+
+fn test_native_context_reg_offset_encoding() {
+    # Synthetic 4-aligned context-register addresses. Specific R_*
+    # register values land in Step 6.5 against radv's IB dump.
+    assert_eq(native_context_reg_offset(0xA000), 0,    "base address → 0");
+    assert_eq(native_context_reg_offset(0xA00C), 3,    "+12 bytes → dw offset 3");
+    assert_eq(native_context_reg_offset(0xA238), 0x8E, "+0x238 bytes → dw 0x8E");
+    assert_eq(native_context_reg_offset(0xA318), 0xC6, "+0x318 bytes → dw 0xC6");
+    assert_eq(native_context_reg_offset(0xA31C), 0xC7, "+0x31C bytes → dw 0xC7");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_one_layout() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    # Use 0xA238 (synthetic; happens to match radv's CB_TARGET_MASK)
+    var pos = native_pm4_set_context_reg_one(&buf, 0, 0xA238, 0xF);
+    assert_eq(pos, 12, "single-reg context-set = 3 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=2, 0) → count_minus_1=1
+    # → (3<<30) | (1<<16) | (0x69<<8) = 0xC0016900.
+    assert_eq(load32(&buf + 0), 0xC0016900, "header bytes");
+    assert_eq(load32(&buf + 4), 0x8E,       "reg_offset dword (0x238/4)");
+    assert_eq(load32(&buf + 8), 0xF,        "value");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_pair_layout() {
+    var buf[20];
+    memset(&buf, 0xFF, 20);
+    var values[8];
+    store32(&values + 0, 0xAAAAAAAA);
+    store32(&values + 4, 0xBBBBBBBB);
+    # Use 0xA00C (synthetic; happens to match a scissor TL register)
+    var pos = native_pm4_set_context_reg_pair(&buf, 0, 0xA00C, &values);
+    assert_eq(pos, 16, "pair context-set = 4 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=3, 0) → count_minus_1=2
+    # → 0xC0026900.
+    assert_eq(load32(&buf + 0),  0xC0026900, "header bytes");
+    assert_eq(load32(&buf + 4),  3,           "reg_offset dw (0xC/4)");
+    assert_eq(load32(&buf + 8),  0xAAAAAAAA, "value 0");
+    assert_eq(load32(&buf + 12), 0xBBBBBBBB, "value 1");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_multi_layout() {
+    # 4-register write — common for CB_COLOR0_PITCH/_SLICE/_VIEW/_INFO
+    # in a single packet.
+    var buf[28];
+    memset(&buf, 0xFF, 28);
+    var values[16];
+    store32(&values +  0, 0x11);
+    store32(&values +  4, 0x22);
+    store32(&values +  8, 0x33);
+    store32(&values + 12, 0x44);
+    # Use 0xA31C (synthetic; matches CB_COLOR0_PITCH per Mesa sid.h)
+    var pos = native_pm4_set_context_reg(&buf, 0, 0xA31C, 4, &values);
+    assert_eq(pos, 24, "multi(4) context-set = 6 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=5, 0) → count_minus_1=4
+    # → 0xC0046900.
+    assert_eq(load32(&buf + 0), 0xC0046900, "header bytes");
+    assert_eq(load32(&buf + 4), 0xC7,       "reg_offset dw (0x31C/4)");
+    assert_eq(load32(&buf + 8),  0x11, "value 0");
+    assert_eq(load32(&buf + 12), 0x22, "value 1");
+    assert_eq(load32(&buf + 16), 0x33, "value 2");
+    assert_eq(load32(&buf + 20), 0x44, "value 3");
+    return 0;
+}
+
+fn test_native_pm4_draw_index_auto_layout() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    var pos = native_pm4_draw_index_auto(&buf, 0, 3, DI_SRC_SEL_AUTO_INDEX);
+    assert_eq(pos, 12, "DRAW_INDEX_AUTO = 3 dwords");
+    # Header: PKT3(IT_DRAW_INDEX_AUTO, count=2, 0) → count_minus_1=1
+    # → (3<<30) | (1<<16) | (0x2D<<8) = 0xC0012D00.
+    assert_eq(load32(&buf + 0), 0xC0012D00, "header bytes");
+    assert_eq(load32(&buf + 4), 3,          "vertex_count");
+    assert_eq(load32(&buf + 8), 0x02,       "draw_initiator (auto-index)");
+    return 0;
+}
+
+fn test_native_pm4_di_src_sel_constant() {
+    # DI_SRC_SEL_AUTO_INDEX is the source-select bits for an auto-
+    # index draw. Standard value per Mesa's V_0287F0_DI_SRC_SEL_AUTO_INDEX = 2.
+    assert_eq(DI_SRC_SEL_AUTO_INDEX, 0x02, "auto-index source select");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1585,6 +1688,15 @@ fn main() {
     test_native_rt_va_distinct_from_other_pools();
     test_native_rt_struct_round_trip();
     test_native_rt_release_safe_zero();
+
+    # v3 Step 6.4 — SET_CONTEXT_REG + DRAW_INDEX_AUTO builders (7)
+    test_native_pm4_opcodes_extended();
+    test_native_context_reg_offset_encoding();
+    test_native_pm4_set_context_reg_one_layout();
+    test_native_pm4_set_context_reg_pair_layout();
+    test_native_pm4_set_context_reg_multi_layout();
+    test_native_pm4_draw_index_auto_layout();
+    test_native_pm4_di_src_sel_constant();
 
     return assert_summary();
 }

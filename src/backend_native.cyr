@@ -508,7 +508,9 @@ fn native_gem_va_unmap(fd, handle, va_address, size) {
 # Opcodes
 var IT_NOP              = 0x10;
 var IT_SET_SH_REG       = 0x76;
+var IT_SET_CONTEXT_REG  = 0x69;
 var IT_DISPATCH_DIRECT  = 0x15;
+var IT_DRAW_INDEX_AUTO  = 0x2D;
 var IT_ACQUIRE_MEM      = 0x58;
 var IT_RELEASE_MEM      = 0x49;
 var IT_EVENT_WRITE      = 0x46;
@@ -544,6 +546,7 @@ var R_COMPUTE_USER_DATA_0        = 0xB900;
 # COMPUTE_USER_DATA_1..15 follow in 4-byte increments up to 0xB93C.
 
 var PM4_SH_REG_BASE = 0xB000;
+var PM4_CONTEXT_REG_BASE = 0xA000;
 var PM4_UCONFIG_REG_BASE = 0x30000;
 
 # GFX9 UCONFIG registers we program in the queue preamble.
@@ -572,6 +575,14 @@ fn native_pm4_pkt3_header(opcode, count, predicate) {
 # packet expects: `(offset - 0xB000) / 4`.
 fn native_sh_reg_offset(byte_offset) {
     return (byte_offset - PM4_SH_REG_BASE) / 4;
+}
+
+# Convert a context-register byte-offset into the SET_CONTEXT_REG
+# wire form: `(offset - 0xA000) / 4`. Context registers cover the
+# rasterizer/viewport/CB target/DB depth state — graphics-only,
+# distinct from SH (shader) and UConfig (top-level chip state).
+fn native_context_reg_offset(byte_offset) {
+    return (byte_offset - PM4_CONTEXT_REG_BASE) / 4;
 }
 
 # Emit a SET_SH_REG packet for `n` contiguous registers starting at
@@ -624,6 +635,83 @@ fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
     store32(buf + pos + 12, load32(values + 4));
     return pos + 16;
 }
+
+# ================================================================
+# v3 Step 6.4 — context-register + draw PM4 builders (Phase C)
+# ================================================================
+# SET_CONTEXT_REG (opcode 0x69) writes to the graphics-only context
+# register file (rasterizer / viewport / CB color-target / DB depth-
+# target state). Wire format mirrors SET_SH_REG / SET_UCONFIG_REG:
+# header + reg_offset + N values; reg_offset is dword-relative to
+# PM4_CONTEXT_REG_BASE = 0xA000.
+#
+# DRAW_INDEX_AUTO (opcode 0x2D) kicks a vertex+fragment dispatch on
+# the GFX ring with auto-generated vertex IDs (0..vertex_count-1),
+# no index buffer required. The "auto" source-select is what makes
+# the first cut tractable — no VBO binding, no index buffer.
+#
+# Both opcodes will be byte-exact-validated against radv's output
+# (AMD_DEBUG=ib) in Step 6.5 when we compose the full clear-triangle
+# PM4 stream.
+
+# Multi-register SET_CONTEXT_REG: header + reg_offset + n values.
+# Packet body length = n + 1 dwords.
+fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, n + 1, 0));
+    pos = pos + 4;
+    store32(buf + pos, native_context_reg_offset(byte_offset));
+    pos = pos + 4;
+    var i = 0;
+    while (i < n) {
+        store32(buf + pos, load32(values + i * 4));
+        pos = pos + 4;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# Single-register convenience: SET_CONTEXT_REG with one value.
+fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 2, 0));
+    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
+    store32(buf + pos + 8, value);
+    return pos + 12;
+}
+
+# Pair convenience: SET_CONTEXT_REG with two consecutive registers.
+# Useful for things like CB_COLOR0_BASE + _PITCH or PA_SC_SCREEN_SCISSOR_TL + _BR.
+fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 3, 0));
+    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
+    store32(buf + pos + 8,  load32(values + 0));
+    store32(buf + pos + 12, load32(values + 4));
+    return pos + 16;
+}
+
+# Emit a DRAW_INDEX_AUTO packet. `vertex_count` is the number of
+# vertices the rasterizer will assemble; `draw_initiator` carries
+# the SOURCE_SELECT bits + USE_OPAQUE / etc. The standard value
+# for auto-index draws is 0x02 (DI_SRC_SEL_AUTO_INDEX in bits[1:0]).
+# Packet shape: header + 2 data dwords. count = 2.
+fn native_pm4_draw_index_auto(buf, pos, vertex_count, draw_initiator) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_DRAW_INDEX_AUTO, 2, 0));
+    store32(buf + pos + 4, vertex_count);
+    store32(buf + pos + 8, draw_initiator);
+    return pos + 12;
+}
+
+# Specific context-register addresses (R_PA_SC_*, R_CB_COLOR0_*,
+# etc.) are deferred to Step 6.5 — those values get verified
+# byte-exact against radv's AMD_DEBUG=ib output for an equivalent
+# clear-triangle dispatch. The Phase B.4 protocol applies: don't
+# claim a register address is correct until a working hardware
+# diff confirms it. The builders above are the load-bearing part
+# of Step 6.4; Step 6.5 supplies the addresses they'll be called
+# with.
+
+# DRAW_INDEX_AUTO source-select constants. See
+# docs/proposals/v3-native-render-design.md § PM4 packet families.
+var DI_SRC_SEL_AUTO_INDEX = 0x02;
 
 # Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
 # given workgroup counts and the provided initiator mask (typically
