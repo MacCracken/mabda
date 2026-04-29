@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.9a)
+**Last refresh:** 2026-04-28 (post Step 6.9a + handoff session25c)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -511,3 +511,24 @@ punch-list work that future-you should know about.)
   / etc. and the backend (wgpu today, native at 6.8c) handles the
   rest. v2.x rtb_* / render_pipeline_create_simple / rpb_pass_* helpers
   stay in place for code that builds descriptors directly.
+- **2026-04-28** — Step 6.2 attempted, surfaced as gated-on-decision.
+  Research agent produced the spec-derived register state + offsets +
+  shader-shape spec. Live IB capture path doesn't work on Mesa 26.0.5
+  on this dev box (Arch base, no DRI3, no display) — RADV_DEBUG=hang
+  only fires on hang, dumpibs is silent, RGP needs a swapchain. The
+  existing compute shader bytes were derived via clang+AMDHSA, not
+  from a live IB dump (correcting the framing in
+  `feedback_pm4_verify_against_mesa_ib`). Three viable derivation
+  paths for 6.2(b) documented in
+  `docs/handoff/2026-04-28-session25c-punch-list-march.md`. 6.2(a) —
+  the spec-derived register state + offset constants + capture-protocol
+  doc — is unblocked and queued as the next bite. Session paused for
+  user rest; handoff doc captures the decision-needed state.
+- **2026-04-28** — Followup fix discovered (uncommitted at session
+  pause): Step 6.9a's `render_target.cyr` addition to compute_e2e /
+  render_e2e surfaces a transitive dependency on `depth.cyr`
+  (rtb_build references depth_texture_*). Phase0 also gained the
+  same dep via the v2 backend wrappers needing render_pass.cyr.
+  3-file fix queued — handoff doc has the suggested commit message.
+  **Lesson:** `cyrius build <prog>` ≠ `make build/<prog>` — only the
+  Makefile path runs the GCC link that catches transitive deps.
