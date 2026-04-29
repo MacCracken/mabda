@@ -1,6 +1,6 @@
 # v3 Backend Interface — `@internal` dispatch surface
 
-**Status:** Draft (v3 branch, 2026-04-28 — written immediately after Phase B.4 verified)
+**Status:** Draft, v2 (v3 branch, 2026-04-28 — v0 written after Phase B.4 verified; v1 added Step 5.3 with texture slots; v2 added Step 6.7 with render-pipeline + render-pass + render-target slots)
 **Related:**
 [ADR 006](../adr/006-native-cyrius-gpu-backend.md) (dual-backend),
 [ADR 005](../adr/005-public-api-surface-marking.md) (`@public` boundary),
@@ -108,9 +108,8 @@ don't have a native test path is the wrong move:
 
 | Operation | Gating | Status |
 |-----------|--------|--------|
-| `texture_create / write / read / release` | native texture format/tiling work (Phase C) | **v1 — design landed Step 5.3, code lands Step 5.4** |
-| `render_pipeline_create / release` | native graphics ring path (Phase C) | deferred to Phase C 6.x chunks |
-| `render_pass_begin / end` | surface acquire (Phase D) | deferred to Phase C 6.x chunks |
+| `texture_create / write / read / release` | native texture format/tiling work (Phase C) | **v1 — design landed Step 5.3, code landed Steps 5.4–5.9** |
+| `render_target_create / release`, `render_pipeline_create / release`, `render_pass_begin / draw / end` | native graphics ring path + GFX9 shader bytes (Phase C 6.x) | **v2 — design landed Step 6.7, code lands Step 6.8 (gated on 6.2 + 6.5 + 6.6)** |
 | `surface_configure / acquire / present` | DRM/KMS scanout path (Phase D) | deferred to Phase D 7.x chunks |
 
 Each gets added to `Backend` when its native counterpart has a
@@ -236,6 +235,225 @@ The same 5-step pattern that landed v0:
 
 All 5 steps are punch-list chunks 5.4 through 5.9.
 
+## v2 expansion — render-pipeline + render-pass + render-target slots (Step 6.7)
+
+Steps 6.3 + 6.4 already landed the native primitives that earn this
+expansion: `native_rt_create_2d_rgba8` + matching release (Step 6.3),
+plus PM4 builders for `SET_CONTEXT_REG` and `DRAW_INDEX_AUTO`
+(Step 6.4). v2 promotes them to first-class Backend slots so the
+public API can dispatch the graphics path through the same
+abstraction the compute + texture paths already use.
+
+7 new slots, sized to fit the existing fncall1..fncall5 slot
+dispatch shapes. Append-after-kind invariant preserved — every v0
++ v1 offset is unchanged.
+
+### Layout (v2 — appends 7 render slots)
+
+```text
+Backend struct (176 bytes — 21 slots × 8 bytes; grew from v1's 120):
+  +0..+112   ...same as v1 (compute + texture + kind)...
+  +120: render_target_create_2d_rgba8  (ctx, w, h)              → rt_ptr   (v2)
+  +128: render_target_release          (ctx, rt_ptr)            → 0        (v2)
+  +136: render_pipeline_create         (ctx, vs_mod, fs_mod, color_fmt) → pipe_ptr  (v2)
+  +144: render_pipeline_release        (ctx, pipe_ptr)          → 0        (v2)
+  +152: render_pass_begin              (ctx, rt_ptr, clear_rgba8) → pass_ptr (v2)
+  +160: render_pass_draw               (ctx, pass_ptr, pipe_ptr, vertex_count, instance_count) → 0|err (v2)
+  +168: render_pass_end                (ctx, pass_ptr)           → 0        (v2)
+```
+
+All 7 slots stay within the fncall ceiling (max 5 args + ctx = 6
+total to the slot wrapper, dispatched via `fncall5`). No
+struct-by-value args. No 7+-arity slot.
+
+Why these seven and not fewer / more:
+
+- **RT create + release as Backend slots, not free fns.** Step 6.3's
+  primitives are compiled into the binary either way; promoting them
+  to slots costs nothing and gives consumers a single dispatch
+  surface. No reason to leave them out and force a separate code
+  path for "make me an RT vs make me a texture".
+- **Pipeline create + release as a pair.** Same shape as
+  `shader_module_create / release` in v0. Pipeline lifetime is
+  consumer-managed; the slot is just the gate.
+- **Pass begin / draw / end as a triple.** Mirrors wgpu's encoder
+  flow exactly. `begin` returns an opaque encoder handle, `draw`
+  records a draw, `end` finalizes + submits. Lets consumers issue
+  multiple draws in one pass without slot-count creep.
+- **Single `render_pass_draw` slot, no separate `set_pipeline`.**
+  `draw` takes both the pass and the pipeline. Avoids encoder-state
+  machine semantics in the slot interface; the pipeline is bound
+  per-draw in the slot impl. Trade-off: every draw re-binds the
+  pipeline on the wgpu side (free; wgpu handles it). On native, the
+  PM4 builder caches the last-bound pipeline_ptr and skips the
+  state writes if unchanged.
+
+### Slot signatures, per backend
+
+#### `render_target_create_2d_rgba8 (ctx, width, height) → rt_ptr`
+
+Returns an opaque `rt_ptr` (u64) — same 32-byte struct shape as
+texture handles for the reasons noted in v1.
+
+- **wgpu**: pointer to a `{handle, view, sampler, w_h_packed}`
+  struct, where `handle` is a `WGPUTexture` created with
+  `RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC` usage and
+  `view` is the default 2D view. Same shape as v1 textures plus
+  the render-attachment usage bit.
+- **native**: pointer to the existing `NativeRenderTarget` struct
+  from Step 6.3 — `{handle, va, addr, size, w_h_pitch_packed}`.
+  RT VA range at `0xFFFF800101000000`+, separate from the texture
+  range so future tiling/format divergence has somewhere to land.
+
+#### `render_target_release (ctx, rt_ptr) → 0`
+
+Frees the GPU resources + heap struct. Same shape as
+`texture_release` in v1.
+
+- **wgpu**: `wgpu_texture_view_release` + `wgpu_texture_release` +
+  `free(rt_ptr)`.
+- **native**: `native_rt_release_2d_rgba8(fd, rt)` (Step 6.3) +
+  `free(rt_ptr)`.
+
+#### `render_pipeline_create (ctx, vs_mod, fs_mod, color_fmt) → pipe_ptr`
+
+Builds a graphics pipeline from a vertex + fragment shader module
+pair, targeting the given color format. Pipeline state for v2 is
+**fixed-function-implicit**: full-screen viewport, no depth, no
+blend, no MSAA, single color attachment, triangle list topology.
+Consumers needing other states use the v2.1 expansion (deferred).
+
+- **wgpu**: `wgpu_device_create_render_pipeline` with a descriptor
+  filled in from the args. The 7+-arg descriptor is already
+  struct-packed via a C shim (existing pattern). Returns a u64
+  pointer to a small struct holding the `WGPURenderPipeline` handle.
+- **native**: builds a `NativeRenderPipeline` struct holding the
+  shader VAs + a precomputed PM4-state-block byte buffer (the
+  `SET_SH_REG` + `SET_CONTEXT_REG` writes that get spliced into the
+  IB at draw time). The PM4 state is encoded once per
+  pipeline_create rather than per-draw — pipeline change between
+  draws is the rare case; keeping the encoded bytes resident
+  amortizes the encoding cost.
+
+`color_fmt` is a u32 enum: `0 = RGBA8_UNORM` for v2. Other formats
+land alongside the v3.2 texture format expansion.
+
+#### `render_pipeline_release (ctx, pipe_ptr) → 0`
+
+Frees the pipeline + heap struct.
+
+- **wgpu**: `wgpu_render_pipeline_release(handle)` + `free(pipe_ptr)`.
+- **native**: `free(pipe_ptr)` — no GPU-side teardown needed; the
+  PM4 bytes are owned by the struct and freed with it.
+
+#### `render_pass_begin (ctx, rt_ptr, clear_rgba8) → pass_ptr`
+
+Starts a render pass on a single color attachment. `clear_rgba8` is
+a packed u32 in `0xRRGGBBAA` byte order — single-arg passes the
+clear color without struct-pack overhead.
+
+- **wgpu**: builds a `WGPURenderPassDescriptor` with one color
+  attachment (`load_op = clear`, `clear_value = unpacked from
+  clear_rgba8`), calls `wgpu_command_encoder_begin_render_pass`,
+  and stuffs the encoder + pass + RT into a `NativeRenderPass`-
+  shaped struct so `pass_ptr` is opaque to the caller.
+- **native**: allocates a per-pass IB-fragment buffer (separate
+  from the per-context cached IB so multiple passes can stage
+  in flight), writes the initial PM4 state for the RT binding +
+  clear color, returns a pointer to the pass struct. Submission
+  happens at `render_pass_end`; `draw` calls append to the pass's
+  IB-fragment in between.
+
+The clear is **always** issued at pass begin. Load-op = preserve
+is a v2.1 expansion; v2 forces clear-on-begin to keep the slot
+count down.
+
+#### `render_pass_draw (ctx, pass_ptr, pipe_ptr, vertex_count, instance_count) → 0|err`
+
+Records a draw into the pass with the given pipeline. No vertex
+buffers in v2 — the shader synthesizes positions from
+`vertex_index` (the gfx9_graphics_shader_abi_research entry's
+"clear-shader fast path"). Instance count >1 supported.
+
+- **wgpu**: `wgpu_render_pass_encoder_set_pipeline` +
+  `wgpu_render_pass_encoder_draw(vertex_count, instance_count,
+  0, 0)` (first_vertex + first_instance pinned at 0 for v2).
+- **native**: appends `SET_SH_REG` writes for the pipeline's
+  shader VAs + `DRAW_INDEX_AUTO` packet to the pass IB-fragment.
+  `count_minus_1` derivation per
+  `feedback_pm4_count_minus_1_naming.md`.
+
+5 args after the slot ptr — stays at fncall5, the established
+ceiling for ergonomic slot dispatch.
+
+#### `render_pass_end (ctx, pass_ptr) → 0`
+
+Finalizes and submits the pass.
+
+- **wgpu**: `wgpu_render_pass_encoder_end` + `wgpu_command_encoder_finish`
+  + `wgpu_queue_submit` + free the pass struct. The RT contents
+  are then valid for `texture_read` (v1 slot) or further pipeline
+  consumption.
+- **native**: appends a fence WRITE_DATA + EOS marker to the IB-
+  fragment, splices the fragment into a fresh `cs` ioctl chunk,
+  submits with the per-context fence BO, waits for sync-obj
+  signal, frees the pass struct. Matches the established Phase B.4
+  submit flow.
+
+### What v2 still defers
+
+- **Multiple color attachments.** Single attachment per pass for
+  v2; MRT ships with v3.1.
+- **Depth / stencil.** No depth attachment, no z-test, no stencil
+  ops in v2. Lands in v3.1 alongside the depth-format texture
+  expansion. The 32-byte RT struct already has space reserved at
+  +24 for a future depth-handle slot.
+- **MSAA.** Sample count = 1, no resolve attachment. v3.x
+  follow-up.
+- **Vertex buffers.** Vertex pulling via `vertex_index` only —
+  enough for full-screen triangles, blits, simple effects. Vertex
+  buffers + index buffers in a v3.1 expansion (re-uses the
+  existing v0 buffer slots; just adds `set_vertex_buffer` /
+  `set_index_buffer` slots to the pass).
+- **Pipeline state variants.** Blend mode, raster mode, depth
+  state, viewport overrides — all locked to fixed defaults in v2.
+  When consumers need them, they land as a `pipeline_create_v2`
+  slot taking a packed state-descriptor byte buffer.
+- **Multi-pass-per-encoder.** Each `render_pass_begin` =
+  fresh native CS submit on the native side. Multiple passes in
+  one submit (the wgpu encoder pattern) is a v3.1 perf
+  optimization.
+
+### Migration sequencing
+
+Mirrors the v1 5-step pattern:
+
+1. **Step 6.7 — this proposal revision.** Doc-only. Adds the v2
+   section, defines slot offsets + signatures.
+2. **Step 6.8 (split a)** — `src/backend.cyr`: 7 new slot offset
+   constants, struct size 120 → 176 bytes, layout asserts.
+3. **Step 6.8 (split b)** — `src/backend_wgpu.cyr`: 7 wgpu slot
+   wrappers around existing wgpu render helpers. `programs/phase0.cyr`
+   continues passing.
+4. **Step 6.8 (split c)** — `src/backend_native.cyr`: 7 native
+   slot wrappers. RT slots wrap Step 6.3's primitives directly;
+   the pass slots are gated on Step 6.5's
+   `native_pm4_build_render_clear_triangle` PM4 stream and Step
+   6.6's `native_render_dispatch_simple` submit path landing.
+5. **Step 6.9** — public `gpu_render_*` dispatchers in
+   `src/render_pipeline.cyr`, `src/render_pass.cyr`,
+   `src/render_target.cyr`. Coexist with v2.x APIs; old names
+   delegate to the new dispatch path.
+6. **Step 6.9 close** — `programs/native_render_e2e.cyr` mirroring
+   `programs/render_e2e.cyr`. Runs end-to-end on both backends.
+
+Pre-condition for step 4 above: 6.2 (graphics shader bytes) +
+6.5 + 6.6 must land first. Slots 1, 2, 3, 4 (RT + pipeline
+create/release) can land before that on the native side because
+they're pure struct allocation; slots 5, 6, 7 (the pass triple)
+need a working PM4 dispatch path. The wgpu side has no such
+gating — all 7 land together.
+
 ## File layout
 
 ```text
@@ -344,12 +562,12 @@ clean, distlib regenerated.
 
 ## Out of scope for this proposal
 
-- Render path. Phase C (the texture / render-pipeline / render-pass
-  slots) gets its own interface revision once the native side has
-  a working `programs/native_render_e2e.cyr`.
+- Surface / present path. Phase D's `surface_configure / acquire /
+  present` slots get their own revision once the native KMS path
+  (`programs/native_present_e2e.cyr`) is working.
 - Multi-queue. v3.1 work; the `Backend` struct layout above
-  accommodates extension via a `+88` queue-handle slot when the
-  time comes.
+  accommodates extension via a future slot at the next available
+  offset (`+176` after v2) when the time comes.
 - WGSL → ISA lowering. The interface takes `bytes_ptr + n` for
   shader modules; the bytes are SPIR-V on wgpu and pre-compiled
   GFX9 ISA on native. The lowering decision (ADR 006 open

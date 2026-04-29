@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.3)
+**Last refresh:** 2026-04-28 (post Step 6.7)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -133,19 +133,25 @@ need it.
   release primitive (Step 6.3 done 2026-04-28). NativeRenderTarget
   struct (32 bytes, same shape as NativeTexture). RT VA range at
   `0xFFFF800101000000`. Reuses Step 5.1's BO allocator pattern.
-- [ ] **6.4** — PM4 packets for graphics pipeline state setup
+- [x] **6.4** — PM4 packets for graphics pipeline state setup
   (PA_SC_SCREEN_SCISSOR, PA_CL_VPORT_*, CB_TARGET_MASK, …). Build
-  on top of existing PM4 helpers.
+  on top of existing PM4 helpers. Landed: `native_pm4_set_context_reg`
+  + `_one` + `_pair` + `native_pm4_draw_index_auto` in
+  `src/backend_native.cyr`. Synthetic-but-aligned addresses pending
+  Step 6.5's radv-validated set.
 - [ ] **6.5** — `native_pm4_build_render_clear_triangle(buf, …)` —
   PM4 stream that runs a vertex+fragment dispatch to clear a
   render target with a solid color. Mirrors
   `native_pm4_build_compute_store_deadbeef` shape.
 - [ ] **6.6** — `native_render_dispatch_simple(ctx, …)` — analogous
   to `native_compute_dispatch_cached` but on the GFX ring.
-- [ ] **6.7** — Backend interface render-pipeline / render-pass
-  slots (proposal revision; ~6 new slots: pipeline_create,
-  pipeline_release, pass_begin, pass_end, draw, render-target
-  binding).
+- [x] **6.7** — Backend interface render-pipeline / render-pass
+  slots (proposal revision). Landed v2 expansion in
+  `docs/proposals/v3-backend-interface.md`: 7 new slots
+  (render_target_create + release, render_pipeline_create + release,
+  render_pass_begin + draw + end), Backend struct grows 120 → 176
+  bytes, append-after-kind preserved. All slots within fncall5
+  ceiling. Code lands in Step 6.8.
 - [ ] **6.8** — `_backend_wgpu_*` and `_backend_native_*` wrappers.
 - [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
   (mirror of `programs/render_e2e.cyr`).
@@ -413,3 +419,9 @@ punch-list work that future-you should know about.)
   fence BOs survive back-to-back submits without state leakage. Two
   dispatches per `make test-native-compute-store` run, both pass at
   0 ms signal.
+- **2026-04-28** — Step 6.4 (PM4 SET_CONTEXT_REG + DRAW_INDEX_AUTO
+  builders) landed. Step 6.7 (Backend interface v2 expansion) landed
+  doc-only in `docs/proposals/v3-backend-interface.md`: 7 new render
+  slots, Backend struct 120 → 176 bytes, append-after-kind preserved.
+  Vidya field-notes refreshed: 12 entries in `mabda-v3-gpu.cyml`
+  (was 6), 24 entries in `language.cyml` (was 22), index updated.
