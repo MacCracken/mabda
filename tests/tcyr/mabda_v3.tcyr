@@ -716,15 +716,12 @@ fn test_gpu_compute_dispatch_null_ctx_returns_err() {
 fn test_backend_native_new_is_complete() {
     var b = backend_native_new();
     assert(b != 0, "backend_native_new returns non-null");
-    # v0 + v1 (compute + buffer + texture) are wired up at 4c+5.6.
-    # v2 render slots get wired up at 6.8c (gated on 6.2 + 6.5 + 6.6).
-    # backend_is_complete walks all three ranges as of Step 6.8b, so
-    # the native backend reads as incomplete here. Flip back to == 1
-    # when 6.8c lands.
-    assert_eq(backend_is_complete(b), 0,
-              "native backend incomplete — v2 render slots pending Step 6.8c");
+    # All three ranges (v0 compute/buffer + v1 texture + v2 render)
+    # are wired as of Step 6.8(c). backend_is_complete walks all
+    # three; the native backend reads as complete now.
+    assert_eq(backend_is_complete(b), 1,
+              "native backend complete with v2 render range filled (Step 6.8c)");
     assert_eq(backend_kind(b), BACKEND_KIND_AMD, "kind = AMD");
-    # The v0 + v1 ranges should be fully filled; only v2 is empty.
     var off = 0;
     while (off < BACKEND_FNPTR_SLOTS_END) {
         assert_eq(load64(b + off) != 0, 1, "v0 fnptr filled on native");
@@ -737,7 +734,7 @@ fn test_backend_native_new_is_complete() {
     }
     var off3 = BACKEND_RENDER_SLOTS_BEGIN;
     while (off3 < BACKEND_RENDER_SLOTS_END) {
-        assert_eq(load64(b + off3), 0, "v2 render slot still zero on native (pending 6.8c)");
+        assert_eq(load64(b + off3) != 0, 1, "v2 render fnptr filled on native");
         off3 = off3 + 8;
     }
     return 0;
@@ -765,6 +762,21 @@ fn test_backend_native_slot_identities() {
     assert_eq(s_smr, &_backend_native_shader_module_release, "shader_module_release");
     assert_eq(s_cd, &_backend_native_compute_dispatch, "compute_dispatch");
     assert_eq(s_wi, &_backend_native_device_wait_idle, "device_wait_idle");
+    # v2 render slot identities (Step 6.8c).
+    var s_rtc = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8);
+    var s_rtr = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE);
+    var s_rpc = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE);
+    var s_rpr = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE);
+    var s_rpb = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN);
+    var s_rpd = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW);
+    var s_rpe = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END);
+    assert_eq(s_rtc, &_backend_native_render_target_create_2d_rgba8, "rt_create");
+    assert_eq(s_rtr, &_backend_native_render_target_release,         "rt_release");
+    assert_eq(s_rpc, &_backend_native_render_pipeline_create,        "pipe_create");
+    assert_eq(s_rpr, &_backend_native_render_pipeline_release,       "pipe_release");
+    assert_eq(s_rpb, &_backend_native_render_pass_begin,             "pass_begin");
+    assert_eq(s_rpd, &_backend_native_render_pass_draw,              "pass_draw");
+    assert_eq(s_rpe, &_backend_native_render_pass_end,               "pass_end");
     return 0;
 }
 
@@ -1500,7 +1512,9 @@ fn test_native_rt_struct_field_offsets() {
     assert_eq(NATIVE_RT_FIELD_VA,     8,  "va at +8");
     assert_eq(NATIVE_RT_FIELD_ADDR,   16, "addr at +16");
     assert_eq(NATIVE_RT_FIELD_SIZE,   24, "size at +24");
-    assert_eq(NATIVE_RT_STRUCT_SIZE,  32, "total = 32");
+    assert_eq(NATIVE_RT_FIELD_WIDTH,  32, "width at +32");
+    assert_eq(NATIVE_RT_FIELD_HEIGHT, 36, "height at +36");
+    assert_eq(NATIVE_RT_STRUCT_SIZE,  40, "total = 40");
     return 0;
 }
 
@@ -1518,22 +1532,26 @@ fn test_native_rt_va_distinct_from_other_pools() {
 }
 
 fn test_native_rt_struct_round_trip() {
-    var rt[32];
-    memset(&rt, 0, 32);
+    var rt[40];
+    memset(&rt, 0, 40);
     store64(&rt + NATIVE_RT_FIELD_HANDLE, 0xCAFE);
     store64(&rt + NATIVE_RT_FIELD_VA,     _NATIVE_RT_VA_BASE);
     store64(&rt + NATIVE_RT_FIELD_ADDR,   0xBEEF);
     store64(&rt + NATIVE_RT_FIELD_SIZE,   8192);
+    store32(&rt + NATIVE_RT_FIELD_WIDTH,  64);
+    store32(&rt + NATIVE_RT_FIELD_HEIGHT, 32);
     assert_eq(load64(&rt + NATIVE_RT_FIELD_HANDLE), 0xCAFE,            "handle round-trips");
     assert_eq(load64(&rt + NATIVE_RT_FIELD_VA),     _NATIVE_RT_VA_BASE, "va round-trips");
     assert_eq(load64(&rt + NATIVE_RT_FIELD_ADDR),   0xBEEF,            "addr round-trips");
     assert_eq(load64(&rt + NATIVE_RT_FIELD_SIZE),   8192,              "size round-trips");
+    assert_eq(load32(&rt + NATIVE_RT_FIELD_WIDTH),  64,                "width round-trips");
+    assert_eq(load32(&rt + NATIVE_RT_FIELD_HEIGHT), 32,                "height round-trips");
     return 0;
 }
 
 fn test_native_rt_release_safe_zero() {
-    var rt[32];
-    memset(&rt, 0, 32);
+    var rt[40];
+    memset(&rt, 0, 40);
     assert_eq(native_rt_release_2d_rgba8(7, 0),    0, "null rt is safe");
     assert_eq(native_rt_release_2d_rgba8(7, &rt),  0, "zero-handle rt is safe");
     return 0;
@@ -2219,6 +2237,101 @@ fn test_native_render_bo_list_pack_distinct_from_compute() {
 }
 
 # ================================================================
+# v3 Step 6.8(c) — NativeRenderPipeline + NativePass layouts
+# ================================================================
+# v2.1's 4-block PM4 split lives in two structs: NativeRenderPipeline
+# carries the pre-built per-pipeline blocks; NativePass carries
+# per-pass refs. Layout tests pin the field offsets + sizes; the
+# load-bearing byte-exact test asserts that the cached blocks are
+# bit-identical to a fresh composer invocation (so pass_draw can
+# memcpy them with confidence).
+
+fn test_native_render_pipeline_struct_field_offsets() {
+    assert_eq(NATIVE_PIPE_FIELD_VS_HANDLE,  0,   "vs_handle at +0");
+    assert_eq(NATIVE_PIPE_FIELD_VS_VA,      8,   "vs_va at +8");
+    assert_eq(NATIVE_PIPE_FIELD_FS_HANDLE,  16,  "fs_handle at +16");
+    assert_eq(NATIVE_PIPE_FIELD_FS_VA,      24,  "fs_va at +24");
+    assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK,   32,  "sh_block at +32");
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  80,  "ctx_block at +80");
+    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    48,  "sh_block size = 48");
+    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   240, "ctx_block size = 240");
+    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      320, "total = 320");
+    # The two block sizes must match the composers' actual outputs;
+    # the SH_BLOCK starts where the header ends, and the CTX_BLOCK
+    # starts where the SH_BLOCK ends.
+    assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK + NATIVE_PIPE_SH_BLOCK_SIZE,
+              NATIVE_PIPE_FIELD_CTX_BLOCK,
+              "sh_block end = ctx_block start");
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK + NATIVE_PIPE_CTX_BLOCK_SIZE,
+              NATIVE_PIPE_STRUCT_SIZE,
+              "ctx_block end = struct end");
+    return 0;
+}
+
+fn test_native_render_pipeline_pack_matches_composer() {
+    # The cached sh_block + ctx_block in NativeRenderPipeline must be
+    # byte-identical to what the standalone composer emits — that's
+    # the contract pass_draw relies on when it memcpy's them into the
+    # IB. If the composers ever drift (a 6.5(b) refactor that changes
+    # an emit order, e.g.), this test fails immediately.
+    var vs_va = 0xFFFF800200000000;
+    var fs_va = 0xFFFF800200001000;
+
+    var pipe[320];
+    memset(&pipe, 0xCC, 320);
+    var rc = native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va);
+    assert_eq(rc, 0, "pack returns 0 on success");
+
+    # Header round-trips.
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_VS_HANDLE), 0xAA,  "vs_handle");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_VS_VA),     vs_va, "vs_va");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_FS_HANDLE), 0xBB,  "fs_handle");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_FS_VA),     fs_va, "fs_va");
+
+    # Re-build the blocks via the composers into a parallel buffer
+    # and compare dword-by-dword.
+    var ref_sh[48];
+    memset(&ref_sh, 0xDD, 48);
+    var sh_end = native_pm4_build_render_pipeline_sh(&ref_sh, 0, vs_va, fs_va);
+    assert_eq(sh_end, 48, "ref sh_block ends at 48");
+
+    var ref_ctx[240];
+    memset(&ref_ctx, 0xDD, 240);
+    var ctx_end = native_pm4_build_render_pipeline_ctx(&ref_ctx, 0);
+    assert_eq(ctx_end, 240, "ref ctx_block ends at 240");
+
+    var i = 0;
+    while (i < 48) {
+        assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + i),
+                  load32(&ref_sh + i),
+                  "sh_block dword matches composer");
+        i = i + 4;
+    }
+    var j = 0;
+    while (j < 240) {
+        assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_CTX_BLOCK + j),
+                  load32(&ref_ctx + j),
+                  "ctx_block dword matches composer");
+        j = j + 4;
+    }
+    return 0;
+}
+
+fn test_native_render_pipeline_pack_null_out() {
+    assert_eq(native_render_pipeline_pack(0, 1, 2, 3, 4), -1, "null out → -1");
+    return 0;
+}
+
+fn test_native_render_pass_struct_field_offsets() {
+    assert_eq(NATIVE_PASS_FIELD_CTX,         0,  "ctx_ref at +0");
+    assert_eq(NATIVE_PASS_FIELD_RESERVED,    8,  "reserved at +8");
+    assert_eq(NATIVE_PASS_FIELD_RT,          16, "rt_ptr at +16");
+    assert_eq(NATIVE_PASS_FIELD_CLEAR_COLOR, 24, "clear_color at +24");
+    assert_eq(NATIVE_PASS_STRUCT_SIZE,       32, "total = 32");
+    return 0;
+}
+
+# ================================================================
 # v3 Step 6.9 — public render-* dispatchers route through Backend
 # ================================================================
 # 7 mock-backend dispatch tests proving each public gpu_render_*
@@ -2593,6 +2706,12 @@ fn main() {
     test_native_render_handles_write_layout();
     test_native_render_bo_list_pack_layout();
     test_native_render_bo_list_pack_distinct_from_compute();
+
+    # v3 Step 6.8(c) — NativeRenderPipeline + NativePass (4)
+    test_native_render_pipeline_struct_field_offsets();
+    test_native_render_pipeline_pack_matches_composer();
+    test_native_render_pipeline_pack_null_out();
+    test_native_render_pass_struct_field_offsets();
 
     # v3 Step 6.9 — public render-* dispatchers (8)
     test_gpu_render_target_create_dispatches_through_backend();

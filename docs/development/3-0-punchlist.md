@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 6.6 — render-ring dispatch landed)
+**Last refresh:** 2026-04-30 (post Step 6.8(c) — native render slot wrappers landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -244,11 +244,32 @@ need it.
     render_target / render_pipeline includes since backend_wgpu
     now references their constants. CPU sweep: 624 + 449 = 1073
     passing. All 7 GPU programs build clean. (Step 6.8b, 2026-04-28).
-  - [ ] **6.8 (c)** — native wrappers in `src/backend_native.cyr`.
-    Gated on 6.2 + 6.5 + 6.6. Honor the 3-block PM4 split
-    (pipeline_sh + pipeline_ctx + pass_target + draw_tail) per
-    `docs/proposals/v3-backend-interface.md` v2.1 — single-block
-    cache was the rejected naive design.
+  - [x] **6.8 (c)** — native wrappers in `src/backend_native.cyr`.
+    7 new slot wrappers (RT create/release, pipeline create/release,
+    pass begin/draw/end). The 4-block PM4 split materializes as two
+    structs: `NativeRenderPipeline` (320 B — header + pre-built 48 B
+    `pipeline_sh_block` + pre-built 240 B `pipeline_ctx_block`) is
+    packed once at `pipeline_create` via `native_render_pipeline_pack`;
+    `NativePass` (32 B — ctx_ref + rt_ptr + clear_color_ptr) just
+    stashes refs at `pass_begin` and defers PM4 emit to `pass_draw`.
+    `pass_draw` composes the full IB (ACQUIRE_MEM preamble + 2
+    UConfig + memcpy of pipeline_sh + memcpy of pipeline_ctx +
+    `_pass_target` from RT extents + `_draw_tail` + NOP padding to
+    256 dwords) and dispatches via Step 6.6's
+    `native_render_dispatch_simple`. A byte-exact CPU test
+    (`test_native_render_pipeline_pack_matches_composer`) asserts
+    each cached block is dword-identical to a fresh composer
+    invocation — so the memcpy fast path and the standalone composer
+    can never silently diverge. Also extended `NativeRenderTarget`
+    32 → 40 B to carry width/height (read by `pass_draw` to feed
+    the pass_target composer; the RT is the source of truth for its
+    own dimensions). v2-native limitations documented inline:
+    single draw per pass, no state caching, `clear_color_ptr` ignored
+    (FS shader hardcodes red), `color_fmt` ignored (RGBA8_UNORM only).
+    `backend_native_new()` now wires all 21 slots — `backend_is_complete`
+    returns 1 (was 0 with v2 range pending). 819 v3 (was 712 at 6.6
+    close) + 624 mabda CPU asserts green; smoke + lint clean.
+    (Step 6.8(c), 2026-04-30).
 - [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
   (mirror of `programs/render_e2e.cyr`).
   - [x] **6.9 (a)** — public dispatchers landed. 7 ctx-aware
@@ -497,7 +518,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
-| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) + 6.6 done; 6.8(c) + 6.9(b) next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
+| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) + 6.6 + 6.8(c) done; 6.9(b) next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
 | Tier 1 — Phase D surface (7.x) | ⬜ not started — fully unblocked, parallel side-quest | — |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |

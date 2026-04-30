@@ -177,33 +177,102 @@ The full submit + syscall path is HW-gated — the e2e gate is
 6.9(b)'s `programs/native_render_e2e.cyr`. 712 v3 (was 697) +
 624 mabda CPU asserts green; smoke + lint clean.
 
-### Metrics — 2026-04-30 (post Step 6.6)
+### Added — 2026-04-30 (Step 6.8(c) — native render slot wrappers)
+
+The 4-block PM4 split from `docs/proposals/v3-backend-interface.md`
+v2.1 lands in code: two new structs (`NativeRenderPipeline`,
+`NativePass`) plus seven slot wrappers wire the public render API
+through to the native graphics ring.
+
+- **`NativeRenderPipeline`** (320 B): header (vs+fs handle/va, 32 B)
+  + pre-built `pipeline_sh_block` (48 B, exact output of
+  `native_pm4_build_render_pipeline_sh`) + pre-built
+  `pipeline_ctx_block` (240 B, exact output of
+  `native_pm4_build_render_pipeline_ctx`). Packed once at
+  `pipeline_create` time via `native_render_pipeline_pack`. Per the
+  4-block split's pipeline-static lifetime, these blocks are encoded
+  once and memcpy'd into every IB that uses this pipeline.
+- **`NativePass`** (32 B): ctx_ref / rt_ptr / clear_color_ptr +
+  reserved. Layout matches `_backend_wgpu_render_pass_begin`'s
+  pass struct shape for parity. v2-native defers all PM4 emit to
+  `pass_draw` rather than splitting begin/draw — single-draw-per-
+  pass means the lifetime split has no caching value yet.
+- **Seven slot wrappers** in `src/backend_native.cyr`:
+  - `_backend_native_render_target_create_2d_rgba8` /
+    `_backend_native_render_target_release` — wrap Step 6.3's
+    `native_rt_create_2d_rgba8` / `_release` primitives.
+  - `_backend_native_render_pipeline_create` /
+    `_backend_native_render_pipeline_release` — alloc + pack /
+    zero. `color_fmt` accepted for slot ABI parity but ignored
+    (only RGBA8_UNORM supported on native v2).
+  - `_backend_native_render_pass_begin` — alloc 32 B, stash refs.
+    No PM4 emit; defers to `pass_draw`.
+  - `_backend_native_render_pass_draw` — composes the full IB
+    (ACQUIRE_MEM preamble + 2 UConfig + memcpy `pipeline_sh_block`
+    + memcpy `pipeline_ctx_block` + `_pass_target` from RT extents
+    + `_draw_tail` + NOP padding to 256 dwords) and dispatches via
+    Step 6.6's `native_render_dispatch_simple`. `vc` / `ic` accepted
+    for ABI parity; the FS+VS pair is fixed-shape (3-vertex
+    fullscreen triangle), so the actual draw_tail uses
+    `GFX9_FULLSCREEN_TRI_VCOUNT` regardless.
+  - `_backend_native_render_pass_end` — zero pass struct.
+- **`NativeRenderTarget` extended 32 → 40 B**: added width / height
+  fields at +32 / +36 (u32 each). Required by `pass_draw` to feed
+  RT dimensions into `native_pm4_build_render_pass_target`. The RT
+  is the source of truth for its own dimensions; consumers
+  shouldn't reconstruct from `size = w*h*4`.
+- **`backend_native_new()`** now wires all 21 slots —
+  `backend_is_complete()` returns 1 (was 0 with v2 render range
+  pending since 6.8(b) close).
+
+**Load-bearing CPU test:**
+`test_native_render_pipeline_pack_matches_composer` asserts that
+the cached `pipeline_sh_block` and `pipeline_ctx_block` inside a
+freshly-packed `NativeRenderPipeline` are dword-identical to what
+the standalone composers emit into a parallel scratch buffer. Guards
+against the "memcpy fast path silently diverges from the composer"
+class of bug — if `native_pm4_build_render_pipeline_sh` ever
+changes its emit order or count, this test fails immediately rather
+than producing a corrupt IB at HW dispatch.
+
+**v2-native limitations** (documented inline; lifted in v3.x):
+single draw per pass, no pipeline state caching across draws,
+`clear_color_ptr` ignored (FS shader hardcodes red — Step 6.2(b)),
+`color_fmt` ignored (only RGBA8_UNORM).
+
+819 v3 (was 712) + 624 mabda CPU asserts green; smoke + lint clean.
+
+### Metrics — 2026-04-30 (post Step 6.8(c))
 
 - Module count: 33 (unchanged).
-- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged — backend-agnostic
-  v2 surface, all green).
-- `tests/tcyr/mabda_v3.tcyr`: **712 assertions** (was 697; +15 from
-  Step 6.6 helpers).
-- `src/backend_native.cyr`: ~2,520 lines (was ~2,400 at 6.5(b) close).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: **819 assertions** (was 712; +103 from
+  Step 6.8(c) — including the byte-exact dword-by-dword equivalence
+  test that walks the 48 B sh_block + 240 B ctx_block one register
+  write at a time).
+- `src/backend_native.cyr`: ~2,690 lines (was ~2,520 at 6.6 close).
 - `dist/mabda.cyr`: regenerated under cyrius 5.7.36 distlib.
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 6.6)
+### Next — 2026-04-30 (post Step 6.8(c))
 
-Step 6.8(c) — native render slot wrappers in
-`src/backend_native.cyr` (per `docs/proposals/v3-backend-interface.md`
-v2.1's 4-block slice: `_backend_native_render_pipeline_create` builds
-sh+ctx blocks once, `_backend_native_render_pass_begin` builds the
-pass_target block per-pass, `_backend_native_render_pass_draw` emits
-draw_tail and routes through `native_render_dispatch_simple`). Then
-6.9(b) `programs/native_render_e2e.cyr` for the HW gate.
+**Step 6.9(b)** — `programs/native_render_e2e.cyr` mirroring
+`programs/render_e2e.cyr`. Now fully unblocked: 6.5(b) builds the
+PM4 stream, 6.6 submits it on the GFX ring, 6.8(c) routes the public
+`gpu_render_*` dispatchers through `backend_native`. The e2e
+program creates a NativeRenderTarget + NativeRenderPipeline +
+dispatches one pass, then CPU-reads the RT and verifies pixel(0,0)
+is solid red. This is the first hardware gate for the entire 6.x
+chain.
 
 In parallel, Phase D surface (7.x) is still fully unblocked — pure
 DRM/KMS path, no shader bytes, no PM4 verification gate.
 
 The "claim 6.5 done" gate remains Layer-2 verification (Hyprland +
 `RADV_DEBUG=hang` IB diff, or the headless capture program in
-`programs/diagnostics/radv_capture/`).
+`programs/diagnostics/radv_capture/`). Step 6.9(b) gives us a
+known-good Cyrius-side IB whose bytes can be diffed against radv's
+once that capture is available.
 
 Full handoff (Step 6.5 close-out + 6.6 sequencing):
 [`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).

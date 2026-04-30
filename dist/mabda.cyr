@@ -5321,6 +5321,152 @@ fn _backend_native_texture_release(ctx, tex) {
 }
 
 # ----------------------------------------------------------------
+# Render slot wrappers (v3 Step 6.8(c))
+# ----------------------------------------------------------------
+# Seven slots wrapping Step 6.3 (RT primitives), 6.5(b) (PM4
+# composers), and 6.6 (`native_render_dispatch_simple`). The
+# 4-block PM4 split lives in the structs:
+#   render_pipeline_create  → pre-builds sh + ctx blocks once
+#   render_pass_begin       → just stashes refs (defers PM4)
+#   render_pass_draw        → composes the full IB + dispatches
+#   render_pass_end         → zeros the pass struct
+#
+# v2-native limitations (lifted in v3.x):
+#   - Single draw per pass (one dispatch per pass_end).
+#   - No pipeline state caching (every draw re-emits sh + ctx).
+#   - clear_color_ptr ignored — the FS shader (Step 6.2(b)) hardcodes
+#     solid red. Honoring runtime clear color requires a v3.x PM4
+#     extension (CB_COLOR0_CLEAR_WORD0..3 or shader patching).
+#   - color_fmt ignored — only RGBA8_UNORM supported on native.
+
+fn _backend_native_render_target_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0)    { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var rt = alloc(NATIVE_RT_STRUCT_SIZE);
+    memset(rt, 0, NATIVE_RT_STRUCT_SIZE);
+    var rc = native_rt_create_2d_rgba8(fd, width, height, rt);
+    if (rc != 0) { return 0; }
+    return rt;
+}
+
+fn _backend_native_render_target_release(ctx, rt) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0)  { return 0; }
+    var fd = native_ctx_fd(ctx);
+    native_rt_release_2d_rgba8(fd, rt);
+    return 0;
+}
+
+# Pipeline create — vs_mod and fs_mod are pointers to (handle, va)
+# pairs (the same shmod convention compute_dispatch uses). color_fmt
+# is accepted for slot ABI parity with wgpu but ignored for v2-native.
+fn _backend_native_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
+    if (ctx == 0)    { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var vs_handle = load64(vs_mod + 0);
+    var vs_va     = load64(vs_mod + 8);
+    var fs_handle = load64(fs_mod + 0);
+    var fs_va     = load64(fs_mod + 8);
+    var pipe = alloc(NATIVE_PIPE_STRUCT_SIZE);
+    var rc = native_render_pipeline_pack(pipe, vs_handle, vs_va,
+                                         fs_handle, fs_va);
+    if (rc != 0) { return 0; }
+    return pipe;
+}
+
+fn _backend_native_render_pipeline_release(ctx, pipe) {
+    if (ctx == 0)  { return 0; }
+    if (pipe == 0) { return 0; }
+    memset(pipe, 0, NATIVE_PIPE_STRUCT_SIZE);
+    return 0;
+}
+
+fn _backend_native_render_pass_begin(ctx, rt, clear_color_ptr) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0)  { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var p = alloc(NATIVE_PASS_STRUCT_SIZE);
+    memset(p, 0, NATIVE_PASS_STRUCT_SIZE);
+    store64(p + NATIVE_PASS_FIELD_CTX,         ctx);
+    store64(p + NATIVE_PASS_FIELD_RT,          rt);
+    store64(p + NATIVE_PASS_FIELD_CLEAR_COLOR, clear_color_ptr);
+    return p;
+}
+
+# Compose the full clear-triangle PM4 stream and dispatch on the GFX
+# ring. v2-native: single-draw-per-pass — vc/ic are accepted for ABI
+# parity but the FS+VS pair is fixed-shape (3-vertex fullscreen
+# triangle, single instance), so the PM4 stream's draw_tail uses
+# `GFX9_FULLSCREEN_TRI_VCOUNT`/`_NUM_INSTANCES_ONE` regardless. State
+# caching (skip pipeline_sh+ctx if same pipe) is a v3.x perf item.
+fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    var rt = load64(pass + NATIVE_PASS_FIELD_RT);
+    if (rt == 0) { return GPU_ERR_OTHER; }
+    var rt_va     = load64(rt + NATIVE_RT_FIELD_VA);
+    var rt_handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
+    var rt_width  = load32(rt + NATIVE_RT_FIELD_WIDTH);
+    var rt_height = load32(rt + NATIVE_RT_FIELD_HEIGHT);
+    if (rt_va == 0)     { return GPU_ERR_OTHER; }
+    if (rt_handle == 0) { return GPU_ERR_OTHER; }
+    if (rt_width <= 0)  { return GPU_ERR_OTHER; }
+    if (rt_height <= 0) { return GPU_ERR_OTHER; }
+
+    var vs_handle = load64(pipe + NATIVE_PIPE_FIELD_VS_HANDLE);
+    var fs_handle = load64(pipe + NATIVE_PIPE_FIELD_FS_HANDLE);
+    if (vs_handle == 0) { return GPU_ERR_OTHER; }
+    if (fs_handle == 0) { return GPU_ERR_OTHER; }
+
+    # Build the IB stream into a 1024-byte scratch (matches the
+    # 256-dword padded shape of native_pm4_build_render_clear_triangle).
+    var pm4 = alloc(1024);
+    memset(pm4, 0, 1024);
+    var pos = 0;
+    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_PRIMITIVE_TYPE,
+                                         GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_NUM_INSTANCES,
+                                         GFX9_VGT_NUM_INSTANCES_ONE);
+    # Splice the pre-built sh + ctx blocks (Step 6.5(b) composers
+    # already ran at pipeline_create — this is the cached-block path).
+    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_SH_BLOCK,
+           NATIVE_PIPE_SH_BLOCK_SIZE);
+    pos = pos + NATIVE_PIPE_SH_BLOCK_SIZE;
+    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_CTX_BLOCK,
+           NATIVE_PIPE_CTX_BLOCK_SIZE);
+    pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
+    pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
+                                              rt_width, rt_height);
+    pos = native_pm4_build_render_draw_tail(pm4, pos);
+    var cur_dwords = pos / 4;
+    if (cur_dwords < 256) {
+        pos = native_pm4_nop(pm4, pos, 256 - cur_dwords);
+    }
+
+    var triple[24];
+    native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle);
+
+    var t_now[16];
+    syscall(228, 1, &t_now);
+    var ns_now = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8);
+    var deadline = ns_now + 15000000000;
+
+    return native_render_dispatch_simple(ctx, pm4, pos, &triple, deadline);
+}
+
+fn _backend_native_render_pass_end(ctx, pass) {
+    if (ctx == 0)  { return 0; }
+    if (pass == 0) { return 0; }
+    memset(pass, 0, NATIVE_PASS_STRUCT_SIZE);
+    return 0;
+}
+
+# ----------------------------------------------------------------
 # Builder
 # ----------------------------------------------------------------
 
@@ -5360,6 +5506,20 @@ fn backend_native_new() {
                      &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
                      &_backend_native_texture_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+                     &_backend_native_render_target_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+                     &_backend_native_render_target_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+                     &_backend_native_render_pipeline_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+                     &_backend_native_render_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+                     &_backend_native_render_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+                     &_backend_native_render_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+                     &_backend_native_render_pass_end);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
@@ -5467,14 +5627,21 @@ fn native_texture_release_2d_rgba8(fd, tex) {
 # hold both a sampled texture and an RT without VA collision (the
 # Step 5.1 hardcoded-VA limit applies independently per pool).
 #
-# NativeRenderTarget struct layout (32 bytes — same shape as
-# NativeTexture, intentionally; v3 RTs and textures share an
-# allocator pattern):
+# NativeRenderTarget struct layout (40 bytes):
 #   +0:  handle (u64, KMS handle)
 #   +8:  va     (u64, canonical-high GPU VA at RT range)
 #   +16: addr   (u64, CPU mmap pointer — for clear-color writes
 #                or CPU readback in tests)
 #   +24: size   (u64, bytes — width × height × 4)
+#   +32: width  (u32, pixels)
+#   +36: height (u32, pixels)
+#
+# Width/height live on the RT (not derived from size) because Step
+# 6.8c's render_pass_draw needs to feed them into
+# native_pm4_build_render_pass_target (CB_COLOR0_PITCH and the
+# scissor/viewport regs). The RT is the source of truth for its
+# own dimensions; consumers shouldn't reconstruct them by factoring
+# `size`.
 #
 # RT VA range: 0xFFFF800101000000 — 16 MiB past the texture base
 # (0xFFFF800100A00000 + ~6 MiB headroom). Plenty of room for
@@ -5486,7 +5653,9 @@ var NATIVE_RT_FIELD_HANDLE = 0;
 var NATIVE_RT_FIELD_VA     = 8;
 var NATIVE_RT_FIELD_ADDR   = 16;
 var NATIVE_RT_FIELD_SIZE   = 24;
-var NATIVE_RT_STRUCT_SIZE  = 32;
+var NATIVE_RT_FIELD_WIDTH  = 32;
+var NATIVE_RT_FIELD_HEIGHT = 36;
+var NATIVE_RT_STRUCT_SIZE  = 40;
 
 # Pure-math size formula. Symmetric with native_texture_size_2d_rgba8.
 fn native_rt_size_2d_rgba8(width, height) {
@@ -5515,6 +5684,8 @@ fn native_rt_create_2d_rgba8(fd, width, height, out) {
     store64(out + NATIVE_RT_FIELD_VA,     va);
     store64(out + NATIVE_RT_FIELD_ADDR,   addr);
     store64(out + NATIVE_RT_FIELD_SIZE,   size);
+    store32(out + NATIVE_RT_FIELD_WIDTH,  width);
+    store32(out + NATIVE_RT_FIELD_HEIGHT, height);
     return 0;
 }
 
@@ -5532,8 +5703,88 @@ fn native_rt_release_2d_rgba8(fd, rt) {
     store64(rt + NATIVE_RT_FIELD_VA,     0);
     store64(rt + NATIVE_RT_FIELD_ADDR,   0);
     store64(rt + NATIVE_RT_FIELD_SIZE,   0);
+    store32(rt + NATIVE_RT_FIELD_WIDTH,  0);
+    store32(rt + NATIVE_RT_FIELD_HEIGHT, 0);
     return 0;
 }
+
+# ================================================================
+# v3 Step 6.8(c) — NativeRenderPipeline + NativePass
+# ================================================================
+# v2.1's 4-block PM4 split (`docs/proposals/v3-backend-interface.md`
+# § "GFX9 PM4 block split"). Each lifetime gets its own home:
+#
+#   pipeline_sh_block  — per-pipeline, built at pipeline_create
+#   pipeline_ctx_block — per-pipeline, built at pipeline_create
+#   pass_target_block  — per-pass, built at pass_draw (v2: same call
+#                        as the dispatch since v2 is single-draw-per-
+#                        pass; future state-caching can hoist to
+#                        pass_begin)
+#   draw_tail          — per-draw, appended at pass_draw
+#
+# The per-pipeline blocks are pre-built once and memcpy'd into the
+# IB at every dispatch. v2 pass_draw rebuilds pass_target_block and
+# draw_tail every time (no caching) — that's the single-draw-per-
+# pass simplification noted in v2.1 "What v2 still defers".
+
+# NativeRenderPipeline struct layout (320 bytes):
+#   +0:   vs_handle (u64, KMS handle for VS shader BO)
+#   +8:   vs_va     (u64, canonical-high GPU VA of VS bytes)
+#   +16:  fs_handle (u64, KMS handle for FS shader BO)
+#   +24:  fs_va     (u64, canonical-high GPU VA of FS bytes)
+#   +32:  pipeline_sh_block  (48 bytes — output of
+#                              native_pm4_build_render_pipeline_sh)
+#   +80:  pipeline_ctx_block (240 bytes — output of
+#                              native_pm4_build_render_pipeline_ctx)
+#
+# The two block sizes (48 / 240) are pinned by the 6.5(b) composers
+# and CPU-asserted in mabda_v3.tcyr — if those drift, this struct's
+# inline layout breaks and tests catch it before runtime.
+
+var NATIVE_PIPE_FIELD_VS_HANDLE = 0;
+var NATIVE_PIPE_FIELD_VS_VA     = 8;
+var NATIVE_PIPE_FIELD_FS_HANDLE = 16;
+var NATIVE_PIPE_FIELD_FS_VA     = 24;
+var NATIVE_PIPE_FIELD_SH_BLOCK  = 32;
+var NATIVE_PIPE_FIELD_CTX_BLOCK = 80;
+var NATIVE_PIPE_SH_BLOCK_SIZE   = 48;
+var NATIVE_PIPE_CTX_BLOCK_SIZE  = 240;
+var NATIVE_PIPE_STRUCT_SIZE     = 320;
+
+# Build a NativeRenderPipeline in-place. Caller allocates
+# NATIVE_PIPE_STRUCT_SIZE bytes for `out`. Pre-builds both pipeline
+# blocks; failure (composer returning a wrong-sized block) returns
+# negative.
+fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va) {
+    if (out == 0) { return -1; }
+    memset(out, 0, NATIVE_PIPE_STRUCT_SIZE);
+    store64(out + NATIVE_PIPE_FIELD_VS_HANDLE, vs_handle);
+    store64(out + NATIVE_PIPE_FIELD_VS_VA,     vs_va);
+    store64(out + NATIVE_PIPE_FIELD_FS_HANDLE, fs_handle);
+    store64(out + NATIVE_PIPE_FIELD_FS_VA,     fs_va);
+    var sh_end = native_pm4_build_render_pipeline_sh(
+                     out + NATIVE_PIPE_FIELD_SH_BLOCK, 0, vs_va, fs_va);
+    if (sh_end != NATIVE_PIPE_SH_BLOCK_SIZE) { return -2; }
+    var ctx_end = native_pm4_build_render_pipeline_ctx(
+                      out + NATIVE_PIPE_FIELD_CTX_BLOCK, 0);
+    if (ctx_end != NATIVE_PIPE_CTX_BLOCK_SIZE) { return -3; }
+    return 0;
+}
+
+# NativePass struct layout (32 bytes — matches wgpu pass struct
+# shape from src/backend_wgpu.cyr for parity, with native-specific
+# field interpretations):
+#   +0:  ctx_ref         (u64, GpuContext for pass_draw + pass_end)
+#   +8:  reserved        (u64, parallel to wgpu's pass-encoder slot)
+#   +16: rt_ptr          (u64, NativeRenderTarget — provides VA / w / h)
+#   +24: clear_color_ptr (u64, 32-byte f64 RGBA — captured for v2.1;
+#                         v2-native ignores because the FS shader
+#                         hardcodes solid red, see Step 6.2(b) FS)
+var NATIVE_PASS_FIELD_CTX         = 0;
+var NATIVE_PASS_FIELD_RESERVED    = 8;
+var NATIVE_PASS_FIELD_RT          = 16;
+var NATIVE_PASS_FIELD_CLEAR_COLOR = 24;
+var NATIVE_PASS_STRUCT_SIZE       = 32;
 
 # --- buffer.cyr ---
 
