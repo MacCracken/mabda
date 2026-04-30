@@ -4456,7 +4456,279 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
 
 # Device wait — stub. Native dispatch is synchronous (waits on the
 # syncobj before native_compute_dispatch_simple returns), so a
-# separate device_wait_id
+# separate device_wait_idle is conceptually a no-op until we ever
+# add async submit paths.
+fn _backend_native_device_wait_idle(ctx) {
+    return 0;
+}
+
+# Texture slots — real impls (Step 5.6). Wraps the Step 5.1 + 5.2
+# primitives. Linear-layout GTT textures are CPU-accessible via the
+# mmap'd address — write/read collapse to memcpy. Compare with the
+# wgpu side's staging-buffer + queue_write / copy_texture_to_buffer
+# dance: native is dramatically simpler because the BO's pixel data
+# IS the CPU mmap.
+
+fn _backend_native_texture_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    var rc = native_texture_create_2d_rgba8(fd, width, height, tex);
+    if (rc != 0) { return 0; }
+    return tex;
+}
+
+fn _backend_native_texture_write(ctx, tex, src, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    if (addr == 0)   { return GPU_ERR_BUFFER; }
+    if (n != size)   { return GPU_ERR_BUFFER; }
+    memcpy(addr, src, n);
+    return 0;
+}
+
+fn _backend_native_texture_read(ctx, tex, dst, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    if (addr == 0)   { return GPU_ERR_BUFFER; }
+    if (n != size)   { return GPU_ERR_BUFFER; }
+    memcpy(dst, addr, n);
+    return 0;
+}
+
+fn _backend_native_texture_release(ctx, tex) {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    native_texture_release_2d_rgba8(fd, tex);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Builder
+# ----------------------------------------------------------------
+
+# Allocates a Backend, fills all 10 slots with the native wrappers
+# above, and sets kind = BACKEND_KIND_AMD. Step 4c only lights the
+# compute_dispatch slot end-to-end; the other 9 slots return
+# stub values (GPU_ERR_OTHER for fallible operations, 0 for void
+# operations). Backend is "complete" per backend_is_complete()
+# (every slot non-null) but only the compute_dispatch path is real.
+fn backend_native_new() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+                     &_backend_native_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_native_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_backend_native_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_backend_native_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+                     &_backend_native_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_backend_native_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+                     &_backend_native_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+                     &_backend_native_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+                     &_backend_native_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_native_device_wait_idle);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
+                     &_backend_native_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
+                     &_backend_native_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
+                     &_backend_native_texture_read);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
+                     &_backend_native_texture_release);
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    return b;
+}
+
+# ================================================================
+# v3 Step 5.1 — native 2D RGBA8 texture primitives (Phase C)
+# ================================================================
+# Linear-layout 2D RGBA8 textures. No mipmaps, no DCC, no tiling —
+# just a flat array of (width × height × 4) bytes. Sufficient for
+# CPU-uploaded textures + compute-shader writes; tiled / mipped /
+# format-rich textures are subsequent Phase C chunks (5.x).
+#
+# NativeTexture struct layout (32 bytes):
+#   +0:  handle (u64, KMS handle)
+#   +8:  va     (u64, canonical-high GPU VA)
+#   +16: addr   (u64, CPU mmap pointer)
+#   +24: size   (u64, bytes — width × height × 4)
+#
+# Step 5.1 hardcodes the texture VA at _NATIVE_TEXTURE_VA_BASE.
+# This means a single texture per context until the multi-texture
+# VA allocator lands (later 5.x chunk). Future textures must use
+# different VAs — pre-Step-5.x callers should allocate at most one
+# texture, OR pick their own VA (the helper accepts a hardcoded
+# base, but doesn't enforce uniqueness).
+#
+# VA range layout (canonical-high aperture):
+#   0x100000000  shader BOs (caller-managed in v3 programs)
+#   0x100004000  stub (gpu_context_new_native)
+#   0x100200000  cached IB (gpu_context_new_native)
+#   0x100400000  output BOs (caller-managed)
+#   0x100600000  cached fence (gpu_context_new_native)
+#   0x100A00000  textures (this step) — 4 MiB headroom from fence,
+#                room for textures up to ~64 MiB (4Kx4K RGBA8)
+#                before colliding with future allocations
+#
+# Texture release is Step 5.2.
+
+var _NATIVE_TEXTURE_VA_BASE = 0xFFFF800100A00000;
+
+var NATIVE_TEX_FIELD_HANDLE = 0;
+var NATIVE_TEX_FIELD_VA     = 8;
+var NATIVE_TEX_FIELD_ADDR   = 16;
+var NATIVE_TEX_FIELD_SIZE   = 24;
+var NATIVE_TEX_STRUCT_SIZE  = 32;
+
+# Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
+# call without a fd. width × height × 4 bytes per pixel.
+fn native_texture_size_2d_rgba8(width, height) {
+    return width * height * 4;
+}
+
+# Allocate a 2D RGBA8 texture: GTT BO + va_map at the texture VA.
+# Caller provides `out` — a 32-byte buffer matching NativeTexture
+# layout; on success the function fills handle/va/addr/size. On
+# failure returns a GPU_ERR_* code, leaves out untouched.
+fn native_texture_create_2d_rgba8(fd, width, height, out) {
+    var size = native_texture_size_2d_rgba8(width, height);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    var va = _NATIVE_TEXTURE_VA_BASE;
+    rc = native_gem_va_map(fd, handle, va, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(out + NATIVE_TEX_FIELD_VA,     va);
+    store64(out + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,   size);
+    return 0;
+}
+
+# Release a NativeTexture: va_unmap + bo_release_gtt, then zero
+# the struct so accidental double-releases or stale-handle reads
+# fail at zero rather than at a recycled BO. Tex with handle == 0
+# is a no-op (caller may release an uninitialised struct safely).
+fn native_texture_release_2d_rgba8(fd, tex) {
+    if (tex == 0) { return 0; }
+    var handle = load64(tex + NATIVE_TEX_FIELD_HANDLE);
+    if (handle == 0) { return 0; }
+    var va   = load64(tex + NATIVE_TEX_FIELD_VA);
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    native_gem_va_unmap(fd, handle, va, size);
+    native_bo_release_gtt(fd, handle, addr, size);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, 0);
+    store64(tex + NATIVE_TEX_FIELD_VA,     0);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   0);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   0);
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.3 — native 2D RGBA8 render target primitives (Phase C)
+# ================================================================
+# Render targets are allocated and mapped almost exactly like
+# textures (Step 5.1) — same GTT BO + va_map + linear layout. The
+# difference is the *role*: an RT is bound to CB_COLOR0_BASE on the
+# graphics ring (Step 6.5) rather than read by a fragment shader as
+# a sampled texture. RT VA range is separate so a single ctx can
+# hold both a sampled texture and an RT without VA collision (the
+# Step 5.1 hardcoded-VA limit applies independently per pool).
+#
+# NativeRenderTarget struct layout (32 bytes — same shape as
+# NativeTexture, intentionally; v3 RTs and textures share an
+# allocator pattern):
+#   +0:  handle (u64, KMS handle)
+#   +8:  va     (u64, canonical-high GPU VA at RT range)
+#   +16: addr   (u64, CPU mmap pointer — for clear-color writes
+#                or CPU readback in tests)
+#   +24: size   (u64, bytes — width × height × 4)
+#
+# RT VA range: 0xFFFF800101000000 — 16 MiB past the texture base
+# (0xFFFF800100A00000 + ~6 MiB headroom). Plenty of room for
+# 2048x2048 RGBA8 RTs (16 MiB) before colliding with future ranges.
+
+var _NATIVE_RT_VA_BASE  = 0xFFFF800101000000;
+
+var NATIVE_RT_FIELD_HANDLE = 0;
+var NATIVE_RT_FIELD_VA     = 8;
+var NATIVE_RT_FIELD_ADDR   = 16;
+var NATIVE_RT_FIELD_SIZE   = 24;
+var NATIVE_RT_STRUCT_SIZE  = 32;
+
+# Pure-math size formula. Symmetric with native_texture_size_2d_rgba8.
+fn native_rt_size_2d_rgba8(width, height) {
+    return width * height * 4;
+}
+
+# Allocate a 2D RGBA8 render target. Single-RT-per-ctx limit (VA
+# is hardcoded at _NATIVE_RT_VA_BASE) — same constraint as the
+# texture allocator. Multi-RT VA allocator lands later in Phase C
+# when render passes need MRT.
+fn native_rt_create_2d_rgba8(fd, width, height, out) {
+    var size = native_rt_size_2d_rgba8(width, height);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    var va = _NATIVE_RT_VA_BASE;
+    rc = native_gem_va_map(fd, handle, va, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_RT_FIELD_HANDLE, handle);
+    store64(out + NATIVE_RT_FIELD_VA,     va);
+    store64(out + NATIVE_RT_FIELD_ADDR,   addr);
+    store64(out + NATIVE_RT_FIELD_SIZE,   size);
+    return 0;
+}
+
+# Release a NativeRenderTarget. Pair with native_rt_create_2d_rgba8.
+fn native_rt_release_2d_rgba8(fd, rt) {
+    if (rt == 0) { return 0; }
+    var handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
+    if (handle == 0) { return 0; }
+    var va   = load64(rt + NATIVE_RT_FIELD_VA);
+    var addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    var size = load64(rt + NATIVE_RT_FIELD_SIZE);
+    native_gem_va_unmap(fd, handle, va, size);
+    native_bo_release_gtt(fd, handle, addr, size);
+    store64(rt + NATIVE_RT_FIELD_HANDLE, 0);
+    store64(rt + NATIVE_RT_FIELD_VA,     0);
+    store64(rt + NATIVE_RT_FIELD_ADDR,   0);
+    store64(rt + NATIVE_RT_FIELD_SIZE,   0);
+    return 0;
+}
 
 # --- buffer.cyr ---
 
