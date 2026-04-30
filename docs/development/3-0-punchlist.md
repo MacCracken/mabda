@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.3 — KMS framebuffer primitives landed)
+**Last refresh:** 2026-04-30 (post Step 7.2(b) — SETCRTC primitive landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -409,13 +409,31 @@ need it.
     against 1080p60 timing). 153 phase_d + 836 v3 + 624 mabda
     CPU asserts green; smoke + lint + distlib clean.
     (Step 7.2(a), 2026-04-30).
-  - [ ] **7.2 (b)** — `DRM_IOCTL_MODE_SETCRTC` ioctl + struct +
-    helper, plus the higher-level `native_kms_modeset(state,
-    conn_id, fb_id)` driver. Gated on 7.3 framebuffer (SETCRTC
-    needs an FB ID to scan out — without it the call still
-    works for "blank the CRTC" but the useful path is
-    "modeset → present a framebuffer", which composes naturally
-    with 7.3).
+  - [x] **7.2 (b)** — `DRM_IOCTL_MODE_SETCRTC` primitive.
+    `DRM_IOCTL_MODE_SETCRTC` (= `0xC06864A2`) ioctl number,
+    `drm_mode_crtc` struct shape (104 B; embeds the 68-byte
+    `drm_mode_modeinfo` at +36 — final struct end aligns
+    exactly: 36 + 68 = 104). Low-level
+    `native_drm_mode_set_crtc(fd, req)` wrapper. High-level
+    `native_kms_set_crtc(fd, crtc_id, fb_id, conn_ids_ptr,
+    conn_count, mode_ptr)` builds the request inline (memcpy's
+    the 68-byte modeinfo from the caller-supplied pointer,
+    which usually comes from `native_kms_get_connector_modes` +
+    `native_kms_pick_preferred_mode`). Convenience
+    `native_kms_disable_crtc(fd, crtc_id)` issues the same ioctl
+    with fb_id=0 + mode_valid=0 + zero connector list — useful
+    for clean teardown after a present session. Permission +
+    cross-fd notes documented inline (SETCRTC requires DRM
+    master; FB and CRTC must be reachable through one master
+    fd — the cross-fd PRIME bridge is the next bite). Skipped
+    HW probe — the natural HW exercise for SETCRTC is the
+    end-to-end modeset bite (7.2(c)) where we have a full
+    BO → FB → SETCRTC path. 4 new CPU tests, 21 asserts (ioctl
+    number derivation, struct field offsets including the
+    embedded modeinfo end-aligns to struct size, null-safety
+    on both helpers covering all 6 invalid-arg cases). 208
+    phase_d + 836 v3 + 624 mabda CPU asserts green; smoke +
+    lint + distlib clean. (Step 7.2(b), 2026-04-30).
 - [x] **7.3** — Framebuffer creation: KMS-side wrapping of a
   GTT BO as a scanout surface. `DRM_IOCTL_MODE_ADDFB2` (=
   `0xC06464B8`) + `DRM_IOCTL_MODE_RMFB` (= `0xC00464AF`) ioctl
@@ -661,7 +679,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick HW-verified; **7.3 FB primitives in tree**; 7.2(b) modeset + 7.4–7.7 (page-flip → present) ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick HW-verified; 7.3 FB + 7.2(b) SETCRTC primitives in tree; **7.2(c) cross-fd PRIME bridge + e2e modeset next**; 7.4–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

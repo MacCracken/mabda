@@ -605,37 +605,89 @@ ioctl numbers re-derived, drm_mode_fb_cmd2 field offsets +
 starts, etc.), fourcc constants derived from ASCII byte values,
 null-safety on both high-level fns.
 
-### Metrics — 2026-04-30 (post Step 7.3)
+### Added — 2026-04-30 (Step 7.2(b) — SETCRTC primitive)
+
+The ioctl that actually flips a display: binds `(CRTC,
+framebuffer, mode, connector list)` in one atomic kernel call.
+Disabling a CRTC is the same ioctl with fb_id=0 + mode_valid=0
++ count_connectors=0 — the kernel reads that combination as
+"stop scanning out from this CRTC."
+
+- **`DRM_IOCTL_MODE_SETCRTC`** (= `0xC06864A2`) ioctl number,
+  re-derived from first principles in CPU tests.
+- **`drm_mode_crtc`** struct shape (104 bytes): connector ptr +
+  count, CRTC ID, FB ID, scan-out (x, y), gamma_size,
+  mode_valid flag, embedded `drm_mode_modeinfo` at +36. The
+  embedded modeinfo end-aligns to the struct boundary exactly
+  (36 + 68 = 104) — pinned in tests so any struct drift between
+  modeinfo and SETCRTC layouts surfaces immediately.
+- **Low-level** `native_drm_mode_set_crtc(fd, req)` wrapper —
+  caller fills the 104-byte request directly.
+- **High-level** `native_kms_set_crtc(fd, crtc_id, fb_id,
+  conn_ids_ptr, conn_count, mode_ptr)` builds the request
+  inline. Memcpy's the 68-byte modeinfo from the caller's
+  pointer — typical input is the result of
+  `native_kms_get_connector_modes` + `native_kms_pick_preferred_mode`
+  followed by an offset into the modes array.
+- **Convenience** `native_kms_disable_crtc(fd, crtc_id)` issues
+  the same ioctl with all "active" fields zeroed. Useful for
+  clean teardown after present, and as a CRTC-accessibility
+  probe.
+
+Documented inline:
+
+- **Permission**: SETCRTC requires DRM master. On a running
+  desktop the compositor (Hyprland / GNOME / KDE) holds master,
+  so this ioctl returns EACCES from a non-master client. Need
+  a vt-switch to a tty (which drops the previous master) or
+  explicit `DRM_IOCTL_SET_MASTER` after the compositor releases.
+- **Cross-fd**: `fb_id` only resolves on the fd where it was
+  created. BO + AddFB2 + SETCRTC must all be reachable through
+  one master fd. The PRIME bridge (next bite) is what lets a
+  render-fd BO become a master-fd FB.
+
+No HW exercise yet — saved for the end-to-end modeset bite
+(7.2(c)) where we have BO → FB → SETCRTC composed end-to-end.
+
+4 new CPU tests, 21 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl number derivation, drm_mode_crtc field offsets including
+the embedded-modeinfo end-aligns-to-size sanity check,
+null-safety on both helpers covering all 6 invalid-arg cases for
+`set_crtc` plus 2 for `disable_crtc`.
+
+### Metrics — 2026-04-30 (post Step 7.2(b))
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
 - `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **187 assertions** (was 153
-  at 7.2(a) close; +34 from 7.3).
-- `src/backend_native_kms.cyr`: ~760 lines (was ~620 at 7.2(a);
-  +140 lines for ADDFB2 / RMFB primitives + fourcc + helpers).
-- `dist/mabda.cyr`: regenerated (10213 lines).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **208 assertions** (was 187
+  at 7.3 close; +21 from 7.2(b)).
+- `src/backend_native_kms.cyr`: ~875 lines (was ~760 at 7.3 close;
+  +115 lines for SETCRTC primitive + struct + helpers).
+- `dist/mabda.cyr`: regenerated (10319 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.3)
+### Next — 2026-04-30 (post Step 7.2(b))
 
-**Phase D structural primitives complete.** Next bite is end-to-end:
+**Phase D ioctl primitives all in tree.** End-to-end modeset is
+two more bites away:
 
-1. **7.2(b) — `DRM_IOCTL_MODE_SETCRTC` ioctl + driver +
-   end-to-end modeset.** All four prerequisites are now in tree:
-   discovery (7.1), mode-pick (7.2(a)), encoder/CRTC binding
-   (7.1(c)), framebuffer (7.3). The driver shape:
-   `native_kms_modeset(state, conn_id)` walks discovery → fetches
-   modes → picks preferred → walks to encoder → picks CRTC from
-   `possible_crtcs` mask → allocates a BO sized to the mode →
-   `native_kms_add_fb_xrgb8888` → SETCRTC. The first run on
-   Cezanne would visibly flip the desktop's modeset — biggest
-   "real thing happening" gate yet on Phase D. Cross-fd plumbing
-   (BO on render-fd, FB on master-fd, dmabuf import) is the
-   non-obvious piece worth designing carefully before coding.
-2. **7.4–7.7 — page-flip, present, release, public API.** v3.0
-   completion path for native surface present, after 7.2(b)
-   proves modeset works.
+1. **7.2(c) — cross-fd PRIME bridge.** `DRM_IOCTL_PRIME_HANDLE_TO_FD`
+   + `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctls + structs (16 bytes
+   each), low-level helpers, and a high-level
+   `native_kms_import_bo(card_fd, render_fd, render_handle)` that
+   does (handle → dmabuf fd via render_fd) → (dmabuf fd → handle
+   via card_fd) → close dmabuf fd. Returns the master-fd-namespace
+   handle that AddFB2 will accept. CPU-testable shape; HW exercise
+   in 7.2(d).
+2. **7.2(d) — end-to-end modeset driver.**
+   `native_kms_modeset(state, conn_id)` composes everything:
+   walk discovery → pick preferred mode → bridge a render-fd BO
+   to card-fd handle → AddFB2 → SETCRTC. First run on Cezanne
+   would visibly flip the desktop's modeset — biggest "real
+   thing happening" gate yet on Phase D.
+3. **7.4–7.7 — page-flip, present, release, public API.** v3.0
+   completion path for native surface present.
 
 **Phase C render HW-gated items still pending:**
 

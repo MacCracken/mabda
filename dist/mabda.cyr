@@ -6686,6 +6686,112 @@ fn native_kms_rm_fb(fd, fb_id) {
     return native_drm_mode_rm_fb(fd, &id_buf);
 }
 
+# ================================================================
+# v3 Step 7.2(b) — SETCRTC primitive
+# ================================================================
+# `DRM_IOCTL_MODE_SETCRTC` is the ioctl that actually flips the
+# display: it binds (CRTC, framebuffer, mode, connector list) all
+# at once. Disabling a CRTC is the same ioctl with fb_id=0 +
+# mode_valid=0 + count_connectors=0 — the kernel interprets that as
+# "stop scanning out from this CRTC" and may power down the
+# associated encoder + connector to save power.
+#
+# Cross-fd note: the kernel verifies that fb_id refers to a
+# framebuffer registered on THIS fd. A framebuffer added on the
+# master fd is only valid for SETCRTC on the same fd. BO + FB +
+# SETCRTC must all be reachable through one master fd — see
+# the PRIME bridge (next step) for how a render-fd BO becomes a
+# master-fd FB.
+#
+# Permission note: SETCRTC requires DRM master. On a running
+# desktop session the compositor (Hyprland / GNOME / KDE) holds
+# master, so this ioctl returns EACCES from a non-master client.
+# To exercise it from a userspace client, vt-switch to a tty
+# (the previous master drops automatically) or use
+# `DRM_IOCTL_SET_MASTER` after the compositor releases.
+
+# DRM_IOCTL_MODE_SETCRTC — nr 0xA2, RW, sizeof(drm_mode_crtc) = 104
+#   0xC0000000 | (104 << 16) | (0x64 << 8) | 0xA2 == 0xC06864A2
+var DRM_IOCTL_MODE_SETCRTC = 0xC06864A2;
+
+# drm_mode_crtc layout (104 bytes, x86_64). The mode field is a
+# drm_mode_modeinfo embedded in-place at +36 — caller can either
+# fill it directly or memcpy from a modes array entry returned by
+# native_kms_get_connector_modes.
+#
+#   +0:  set_connectors_ptr  (u64) — IN: ptr to u32[count_connectors]
+#   +8:  count_connectors    (u32) — IN: number of connectors to bind
+#   +12: crtc_id             (u32) — IN: CRTC to configure
+#   +16: fb_id               (u32) — IN: framebuffer to scan out, 0 = blank
+#   +20: x                   (u32) — IN: x offset within FB
+#   +24: y                   (u32) — IN: y offset within FB
+#   +28: gamma_size          (u32) — OUT (not used in v3 setup path)
+#   +32: mode_valid          (u32) — IN: 1 = use mode, 0 = disable
+#   +36: mode                (drm_mode_modeinfo, 68 B) — IN if mode_valid
+var DRM_MODE_CRTC_SIZE             = 104;
+var DRM_MODE_CRTC_CONN_PTR         = 0;
+var DRM_MODE_CRTC_COUNT_CONN       = 8;
+var DRM_MODE_CRTC_CRTC_ID          = 12;
+var DRM_MODE_CRTC_FB_ID            = 16;
+var DRM_MODE_CRTC_X                = 20;
+var DRM_MODE_CRTC_Y                = 24;
+var DRM_MODE_CRTC_GAMMA_SIZE       = 28;
+var DRM_MODE_CRTC_MODE_VALID       = 32;
+var DRM_MODE_CRTC_MODE             = 36;
+
+# Low-level SETCRTC ioctl. Caller owns `req` (104 bytes), MUST fill
+# crtc_id + fb_id + connector_ptr/count + mode_valid + mode (or
+# zeros for disable). Returns 0 on success, negative errno on
+# failure (typically -EACCES for "not master", -EINVAL for "bad
+# CRTC / FB / mode combination").
+fn native_drm_mode_set_crtc(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_SETCRTC, req);
+}
+
+# High-level SETCRTC. `mode_ptr` points to a 68-byte
+# drm_mode_modeinfo (typically picked from the array returned by
+# native_kms_get_connector_modes via native_kms_pick_preferred_mode).
+# `conn_ids_ptr` is a u32 array of connector IDs to bind to this
+# CRTC; `conn_count` is its length. Scan-out region defaults to
+# (0, 0) — the FB's top-left becomes the screen's top-left.
+#
+# Returns 0 on success, negative errno on failure. Null-safe on
+# every pointer arg.
+fn native_kms_set_crtc(fd, crtc_id, fb_id, conn_ids_ptr, conn_count, mode_ptr) {
+    if (fd <= 0)         { return -1; }
+    if (crtc_id == 0)    { return -1; }
+    if (fb_id == 0)      { return -1; }
+    if (conn_ids_ptr == 0) { return -1; }
+    if (conn_count <= 0) { return -1; }
+    if (mode_ptr == 0)   { return -1; }
+
+    var req[104];
+    memset(&req, 0, DRM_MODE_CRTC_SIZE);
+    store64(&req + DRM_MODE_CRTC_CONN_PTR,    conn_ids_ptr);
+    store32(&req + DRM_MODE_CRTC_COUNT_CONN,  conn_count);
+    store32(&req + DRM_MODE_CRTC_CRTC_ID,     crtc_id);
+    store32(&req + DRM_MODE_CRTC_FB_ID,       fb_id);
+    store32(&req + DRM_MODE_CRTC_MODE_VALID,  1);
+    memcpy(&req + DRM_MODE_CRTC_MODE, mode_ptr, DRM_MODE_MODEINFO_SIZE);
+    return native_drm_mode_set_crtc(fd, &req);
+}
+
+# Convenience: disable a CRTC. Same ioctl as native_kms_set_crtc
+# but with fb_id=0 + mode_valid=0 + connector list empty — the
+# kernel interprets the combination as "stop scanout."
+# Useful for clean teardown after a present session, and for
+# probing CRTC accessibility (a successful disable on an idle
+# CRTC proves master + CRTC ID are valid).
+fn native_kms_disable_crtc(fd, crtc_id) {
+    if (fd <= 0)      { return -1; }
+    if (crtc_id == 0) { return -1; }
+    var req[104];
+    memset(&req, 0, DRM_MODE_CRTC_SIZE);
+    store32(&req + DRM_MODE_CRTC_CRTC_ID, crtc_id);
+    # All other fields (fb_id, mode_valid, conn ptr/count) stay 0.
+    return native_drm_mode_set_crtc(fd, &req);
+}
+
 # --- buffer.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
