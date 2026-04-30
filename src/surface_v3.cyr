@@ -76,25 +76,50 @@ fn gpu_surface_configure_native_kiosk(ctx, card_fd, width, height) {
 }
 
 # Native (logind): asks systemd-logind via dbus TakeDevice() to
-# delegate DRM master from the caller's session. v3.0 returns 0
-# unconditionally — the dbus client (`samvada` package) lands in
-# v3.x. Public API shape committed now so consumers that target
-# the eventual API don't have to refactor when the body fills in.
+# delegate DRM master from the caller's session. As of v3.0 the
+# `samvada` package (`[deps.samvada]` >= 0.2.0) provides the
+# implementation; this dispatcher composes:
+#   1. samvada_session_take_device(major, minor) on each candidate
+#      card (minors 0..1 — most systems have AMD on card0 or card1;
+#      multi-GPU disambiguation is a v3.x extension).
+#   2. First card that returns a positive fd → stash via
+#      gpu_ctx_set_native_card_fd + dispatch through the slot.
 #
-# Returns the surface_ptr on success (v3.x), 0 on failure (always
-# in v3.0). Consumer code that wants an HW-functional path today
-# should use gpu_surface_configure_native_kiosk + manual master.
+# Pre-condition: samvada must already be initialized. Consumer
+# programs link `samvada/deps/samvada_main.c` alongside mabda's
+# `wgpu_main.c`; the C side calls `samvada_main(table)` during
+# init which populates samvada's static fn-table reference. If
+# samvada isn't initialized, take_device returns -22 (EINVAL)
+# and this dispatcher falls through to "logind path unavailable"
+# (returns 0 — consumer can fall back to _native_kiosk).
+#
+# DRM major is 226 on Linux (drivers/gpu/drm/drm_drv.c); minors
+# 0..15 cover card0..card15 (primary nodes). Render nodes start
+# at minor 128 and aren't relevant here — TakeDevice operates on
+# the master/primary node.
+var _DRM_MAJOR = 226;
+
 fn gpu_surface_configure_native_logind(ctx, width, height) {
     if (ctx == 0)    { return 0; }
     if (width <= 0)  { return 0; }
     if (height <= 0) { return 0; }
-    # Stub: v3.0 always returns 0. v3.x will:
-    #   1. Use samvada to find caller's logind session
-    #   2. Call samvada_session_take_device(drm_major, drm_minor)
-    #   3. Stash the returned fd via gpu_ctx_set_native_card_fd
-    #   4. Dispatch through the slot (same as kiosk path)
-    # Until then: predictable failure, no surprise side effects.
-    return 0;
+
+    # Try minors 0 + 1 — covers the typical AMD-on-card0 and
+    # AMD-on-card1 setups (split-GPU machines often have integrated
+    # on card0 and discrete on card1, or vice versa). Multi-card
+    # disambiguation is v3.x scope.
+    var fd = samvada_session_take_device(_DRM_MAJOR, 0);
+    if (fd < 0) {
+        fd = samvada_session_take_device(_DRM_MAJOR, 1);
+    }
+    if (fd < 0) { return 0; }   # samvada uninit'd OR no card available
+
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE);
+    if (slot == 0) { return 0; }
+    gpu_ctx_set_native_card_fd(ctx, fd);
+    return fncall3(slot, ctx, width, height);
 }
 
 # ================================================================

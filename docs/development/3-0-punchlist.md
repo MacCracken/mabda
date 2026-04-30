@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.7 — Phase D code-complete)
+**Last refresh:** 2026-04-30 (post WGSL-deferral pivot + samvada v0.2.0 wired + cyrius pin 5.7.36 → 5.7.48)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -18,30 +18,47 @@
 
 Read these before sequencing.
 
-- **WGSL → GFX9 ISA lowering is the single largest unknown.** Roadmap
-  declares it in scope for v3.0; today the native path takes
-  pre-compiled GFX9 bytes only. If lowering slips, v3.0's
-  `examples/stdlib-consumer/` cannot run unmodified on `native` —
-  which fails the exit criterion. Worth a sober design spike before
-  committing to a v3.0 ship date.
-- **Consumer cutover takes calendar time, not just code.** Even with
-  all six consumers technically able to flip, "running native in
-  production across a full release cycle" is what gates AMD wgpu
-  retirement at v4.0. v3.0 ship just opens that window.
-- **Tier 1 is multi-month.** Backend abstraction + Phase B.4 +
-  Phase C texture + Phase C render + Phase D KMS primitives are
-  all in tree as of 2026-04-30. Remaining: 7.7 public surface API,
-  8.1–8.10 WGSL lowering, plus Tier 2/3/4/5 ship work. The
-  WGSL chunk is still the calendar-dominant unknown.
-- **Linux + AMD only.** v3.0's native backend covers AMD on Linux.
-  NVIDIA / Intel / macOS / Windows consumers continue on `wgpu`.
-  Don't accept scope-creep that pretends otherwise.
-- **Logind master is a v3.x problem, not a v3.0 blocker.** The
-  Phase D ioctl primitives (SETCRTC, page-flip) all return EACCES
-  inside a running compositor session. Three workarounds for HW
-  testing today (vkms / no-compositor / stop display-manager);
-  the proper fix is dbus TakeDevice() integration in 7.7 or v3.x.
-  See `project_phase_d_master_logind_blocker` memory.
+- **WGSL → GFX9 ISA lowering is deferred to v3.x.** Earlier
+  framing said v3.0 needed in-mabda WGSL lowering for the
+  `examples/stdlib-consumer/` exit criterion. Re-research
+  2026-04-30 surfaced the actual architecture:
+  `gpu_shader_module_create(ctx, bytes_ptr, n)` is **already
+  byte-polymorphic** — wgpu interprets bytes as WGSL UTF-8,
+  native reads as pre-compiled GFX9 ISA. v3.0 ships a small
+  hand-encoded shader library covering the MVP shaders the
+  AGNOS consumers need (clear, blit, fullscreen-triangle,
+  doubler-compute) and consumers carry their own shader
+  bundles. WGSL → GFX9 lowering becomes a v3.x project.
+  External options (Tint, Naga, SPIRV-Cross, Mesa ACO) all
+  violate "own the stack" or are dead — the v3.x path is
+  pure-Cyrius compute-subset lowering, ~10–16 weeks calendar.
+  See `docs/proposals/v3-wgsl-frontend-choice.md` (next
+  bite — design spike doc).
+- **Consumer cutover takes calendar time, not just code.** Even
+  with all six consumers technically able to flip, "running
+  native in production across a full release cycle" is what
+  gates AMD wgpu retirement at v4.0. v3.0 ship just opens that
+  window.
+- **Tier 1 is now bounded and tractable.** Backend abstraction
+  + Phase B.4 + Phase C texture + Phase C render + Phase D
+  surface (7.1–7.7 including logind via samvada) all in tree
+  as of 2026-04-30. WGSL lowering deferred to v3.x. Remaining
+  Tier 1 work: bench-history `backend` column, native-on-AMD CI
+  cell, `examples/stdlib-consumer/` cross-backend pixel-identity
+  check. Calendar weeks, not months.
+- **Linux + AMD only.** v3.0's native backend covers AMD on
+  Linux. NVIDIA / Intel / macOS / Windows consumers continue on
+  `wgpu`. Don't accept scope-creep that pretends otherwise.
+- **Logind master gating is solved by samvada v0.2.0.** Phase D
+  ioctl primitives (SETCRTC, page-flip) return EACCES inside a
+  running compositor session under direct `SET_MASTER`; the
+  `samvada` Cyrius dbus client (sister AGNOS package, shipped
+  2026-04-30) wraps logind's `TakeDevice()` to delegate master
+  cleanly. mabda's `gpu_surface_configure_native_logind`
+  composes samvada → stash master fd on ctx → dispatch through
+  the slot. v3.x roadmap retires both samvada's libsystemd
+  C-shim and mabda's wgpu-native C shim together at v4.0.
+  See `project_samvada_dbus_package` memory.
 
 ## Tier 1 — Code completeness
 
@@ -655,9 +672,24 @@ need it.
   Closes Phase D code-completion. (Step 7.7, 2026-04-30).
   (open a window, render a clear, present, hold for 1s, exit).
 
-#### WGSL → GFX9 ISA lowering (broken into chunks)
+#### WGSL → GFX9 ISA lowering — **deferred to v3.x** (2026-04-30)
 
-This is the v3.0 hard truth. Scoping carefully.
+**Decision (2026-04-30):** v3.0 does NOT ship WGSL lowering.
+`gpu_shader_module_create` is byte-polymorphic — wgpu reads as
+WGSL UTF-8, native reads as pre-compiled GFX9 ISA — so consumers
+ship their own shader bundles for the native path in v3.0. The
+8.x sub-bullets below stay queued for v3.x; **none are v3.0
+ship-blockers.** See updated "Hard truths up front" + the
+v3.x roadmap entry for the pivot.
+
+External frontend options (Tint, Naga, SPIRV-Cross, Mesa ACO)
+were researched and rejected — see
+`docs/proposals/v3-wgsl-frontend-choice.md` (when it lands as
+the v3.x design spike). Path forward for v3.x: roll-our-own
+compute-subset WGSL → GFX9 in pure Cyrius, matching the
+sigil/sakshi/samvada "own the stack" posture. Calendar
+estimate: 10–16 weeks for compute MVP, another 8–12 for
+vertex/fragment + texture sampling.
 
 - [ ] **8.1** — Frontend choice: WGSL parser vs SPIR-V loader.
   Design doc + decision in `docs/proposals/v3-shader-lowering.md`.
@@ -829,44 +861,42 @@ Ordered roughly the way they'll need to run.
 
 These keep the v4.0 / v5.0 commitments visible from the v3.0 ship.
 
-- [ ] **`samvada` package — scaffold during v3.0, fill in
-  v3.x with C shim, retire at v4.0.** Carries the realization
-  of `gpu_surface_configure_native_logind` (today a stub
-  returning `GPU_ERR_NOT_IMPLEMENTED`). Lives as a separate
+- [x] **`samvada` package — scaffolded + v0.2.0 shipped + wired
+  into mabda (2026-04-30).** Carries the realization of
+  `gpu_surface_configure_native_logind`. Lives as a separate
   Cyrius package alongside `sakshi` / `patra` / `sigil` — own
-  repo, authored as `src/*.cyr`, bundled via `cyrius distlib`
-  into `dist/samvada.cyr`, consumed by mabda (and any other
-  AGNOS client) through `[deps.samvada]` in `cyrius.cyml`. Name
-  picked 2026-04-30: Sanskrit *saṃvāda* "dialogue," ASCII form
-  (no macron) for filesystem / Makefile / git friendliness.
-  **Architectural strategy** (revised 2026-04-30): treat
-  `samvada` as the dbus peer of mabda's wgpu C-launcher. v3.x
-  ships a C shim around `libsystemd`'s `sd_bus_*` API
-  (~200 LoC C + ~150 LoC Cyrius bindings, mirrors
-  `mabda/deps/wgpu_main.c` function-table pattern). v4.0
-  retires both C-shim deps together — wgpu-native retires for
-  AMD (existing roadmap commitment), `samvada`'s C shim gets
-  replaced by pure-Cyrius dbus or removed entirely depending
-  on how the v4.0 logind story evolves. **Scaffold this
-  session**: init repo at `~/Repos/samvada`, README,
-  `cyrius.cyml` mirroring sakshi's shape, empty `src/lib.cyr`
-  include chain stub, `src/samvada.cyr` with module header +
-  placeholder fn, `deps/samvada_main.c` C-shim entry point
-  stub (mirrors `mabda/deps/wgpu_main.c`),
-  `tests/tcyr/samvada.tcyr` smoke,
-  `.github/workflows/ci.yml`, `Makefile` test target,
-  `VERSION = 0.0.1`, GPL-3.0-only `LICENSE`, `CHANGELOG.md`
-  with `[0.0.1] — repo initialized` entry. v3.x implementation
-  effort: ~3–5 sessions of `sd_bus` plumbing (system-bus
-  connect via TakeDevice, Pause/ResumeDevice signal handlers,
-  GetSession dispatch). Design captured in
+  repo at `https://github.com/MacCracken/samvada`, authored as
+  `src/*.cyr`, bundled via `cyrius distlib` into
+  `dist/samvada.cyr`, consumed by mabda through
+  `[deps.samvada] tag = "0.2.0"` in `cyrius.cyml`.
+  **Architectural strategy:** dbus peer of mabda's wgpu
+  C-launcher. v0.x ships a libsystemd C shim
+  (`deps/samvada_main.c`, ~200 LoC C + ~150 LoC Cyrius
+  bindings) wrapping the logind subset (`open_system_bus`,
+  `get_session_path`, `take_device`, `release_device`,
+  `pump_signals`, `subscribe_pause_resume`). v1.0 coordinated
+  with mabda v4.0 — both C-shim deps retire together; samvada
+  becomes pure-Cyrius dbus marshaller OR is deprecated if
+  kernel-level master delegation lands.
+  **Mabda integration (this session):** `[deps.samvada] = "0.2.0"`
+  added to `cyrius.cyml`; `lib/samvada.cyr` symlinked into the
+  include chain via `src/lib.cyr`;
+  `_backend_native_surface_configure_logind` body filled in
+  `src/surface_v3.cyr` to compose `samvada_session_take_device`
+  → stash master fd → dispatch through the slot. CPU test
+  `test_gpu_surface_configure_native_logind_uninit_samvada`
+  pins the "samvada uninitialized → returns 0" failure mode.
+  **What still has to happen:** consumer programs link both
+  `mabda/deps/wgpu_main.c` (or its native-only equivalent) AND
+  `samvada/deps/samvada_main.c`; the C side calls
+  `samvada_main(table)` during init to populate samvada's
+  static fn-table reference. Once that's wired into a
+  consumer (likely soorat / aethersafta), the logind path is
+  HW-validated. Design captured in
   `docs/proposals/v3-surface-api-design.md` § "v3.x logind
   realization — `samvada` package"; v4.0 retirement noted in
-  `docs/development/roadmap.md` § v4.0. When `samvada` is
-  ready, swap the stub body in
-  `_backend_native_surface_configure_logind` and consumers that
-  already called the API in v3.0 Just Work without code
-  changes.
+  `docs/development/roadmap.md` § v4.0. (samvada scaffold +
+  v0.2.0 + mabda wire-up, 2026-04-30).
 - [ ] **ADR 007 placeholder** for NVIDIA native (v4.0). Status:
   `Deferred to v4.0`. Single page; documents the
   nouveau-vs-nvidia.ko design-spike question, SASS/PTX choice. The
@@ -896,18 +926,31 @@ before the next. **Steps 1–7 done; WGSL lowering (8.x) is next.**
    page-flip, present, slot stubs all in tree.~~ ✅
 7. ~~Phase D public API (7.7) — `gpu_surface_*` dispatchers,
    real slot wrappers replacing 7.6's stubs, e2e program.
-   Master-acquisition for the `_native_logind` path deferred to
-   the `samvada` v0.2.0 package (Tier 6).~~ ✅
-8. **WGSL → GFX9 lowering** — chunks 8.1–8.10. Was queued as
-   parallel to 5–7; in practice 7.x landed first because Phase C
-   was the higher-risk path. Now the load-bearing pre-ship gate.
-   The frontend choice (8.1) is the first design call.
-9. **Bench harness + matrix + perf docs** — Tier 3. Needs at
-   least one consumer running on `native` to be meaningful.
-10. **Tier 4 documentation** — CLAUDE.md update, migration guide,
-    `[3.0.0-dev]` → `[3.0.0]` collapse.
-11. **Tier 5 release engineering** — P(-1) audit, version bump
+   `samvada` v0.2.0 scaffolded + wired same day; logind path
+   composes through it.~~ ✅
+8. **`docs/proposals/v3-wgsl-frontend-choice.md`** — design
+   spike doc capturing the 2026-04-30 research: external
+   options rejected, v3.x roll-our-own pure-Cyrius compute
+   lowering (10–16 weeks), v3.0 ships byte-polymorphic
+   `gpu_shader_module_create` with consumer-supplied GFX9
+   ISA bundles. Doc-only bite to lock in the deferral
+   architecture.
+9. **Tier 2 — `programs/diagnostics/radv_capture/`.** Headless
+   Vulkan capture program (C, separate codebase area).
+   Unblocks the Layer-2 byte-diff that 6.5 has been waiting
+   on. Self-contained, parallel to the doc work.
+10. **Tier 4 documentation** — CLAUDE.md update for v3
+    architecture, migration guide for consumers, vidya
+    field-notes refresh (largely done 2026-04-30; verify),
+    `[3.0.0-dev]` → `[3.0.0]` collapse at ship time.
+11. **Tier 3 bench harness + matrix + perf docs** — needs at
+    least one consumer running on `native` to be meaningful.
+    Scoped to "evidence" rather than "lowering blocked us."
+12. **Tier 5 release engineering** — P(-1) audit, version bump
     2.5.0 → 3.0.0, distlib regen, soak, `v3.0.0-rc.1`, ship.
+
+WGSL → GFX9 lowering (8.1–8.10 sub-bullets) is **v3.x scope**
+post-ship; not on the v3.0 critical path.
 
 ## Status snapshot (refreshed 2026-04-30)
 
@@ -917,8 +960,8 @@ before the next. **Steps 1–7 done; WGSL lowering (8.x) is next.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.10 prep all landed; 6.5 Layer-2 verify + post-draw cache flush gated on headless radv capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | **code-complete** — 7.1–7.7 all in tree; HW exercise gated on logind master (samvada v0.2.0 fills `_native_logind` body) | 2026-04-30 |
-| Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued; design call (WGSL frontend vs SPIR-V loader) is the next bite | — |
+| Tier 1 — Phase D surface (7.x) | **code-complete** — 7.1–7.7 all in tree; samvada v0.2.0 wired for logind path; HW e2e gated on consumer linking both C shims | 2026-04-30 |
+| Tier 1 — WGSL lowering (8.x) | **deferred to v3.x** — `gpu_shader_module_create` is byte-polymorphic, consumers ship pre-compiled GFX9 ISA in v3.0; design spike doc + 10–16-week pure-Cyrius compute lowering as v3.x project | 2026-04-30 |
 | Tier 2 — Integration & regression | partial — CPU 624 + 856 + 297 = **1777 pass**; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |
 | Tier 4 — Documentation | partial — session 26 handoff filed; CHANGELOG `[3.0.0-dev]` updated; CLAUDE.md / migration guide / vidya field-notes pending | 2026-04-30 |
