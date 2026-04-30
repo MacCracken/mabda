@@ -1,7 +1,11 @@
 # v3.0 — Graphics shader-bytes derivation & PM4 verification protocol
 
-**Status:** Working spec. 6.2(a) constants landed; 6.2(b) path
-selection pending.
+**Status:** Working spec. 6.2(a) constants landed; 6.2(b) path 1
+chosen (hand-encode against GCN5 ISA spec); both shaders landed:
+`native_gfx9_shader_solid_red` (FS, 92 bytes) and
+`native_gfx9_shader_fullscreen_triangle_vs` (VS, 116 bytes). All
+encodings cross-checked against `clang -target amdgcn--amdhsa
+-mcpu=gfx90c -O2` disassembly via `llvm-objdump -d`.
 **Branch:** `v3`
 **Predecessor:**
 [`docs/handoff/2026-04-28-session25c-punch-list-march.md`](../handoff/2026-04-28-session25c-punch-list-march.md)
@@ -44,11 +48,33 @@ shader (`src/backend_native.cyr::native_gfx9_shader_store_deadbeef`,
 lines ~960-975), the source was:
 
 ```text
-clang -target amdgcn--amdhsa -mcpu=gfx90c -c kernel.cl -o kernel.elf
-llvm-objdump -d kernel.elf
+clang -target amdgcn--amdhsa -mcpu=gfx90c -nogpulib -O2 -c kernel.cl -o kernel.elf
+llvm-objdump -d --triple=amdgcn--amdhsa --mcpu=gfx90c kernel.elf
 # read the .text bytes and the SOPP/VOP1/VMEM encodings
 # transcribe into Cyrius store32() calls with comments
 ```
+
+For the VS arithmetic encodings (Step 6.2(b) VS, 2026-04-30), the
+reference CL kernel was:
+
+```c
+// vid_to_pos.cl
+__kernel void vid_to_pos(__global float *out, uint vid) {
+    int xi = ((vid     ) & 1) * 4 - 1;
+    int yi = ((vid >> 1) & 1) * 4 - 1;
+    out[0] = (float)xi;
+    out[1] = (float)yi;
+}
+```
+
+The kernel's `__clang_ocl_kern_imp_vid_to_pos` body (the
+implementation called by the kernel wrapper) emits the VOP2
+arithmetic against vid in v2; mabda's VS rebases the same opcodes
+against v0 (vertex_id at graphics-ABI shader entry). Re-derive at
+any time with the clang invocation above against this CL source —
+the emitted opcodes (v_lshlrev_b32 = 0x12, v_and_b32 = 0x13,
+v_add_u32 = 0x34, v_cvt_f32_i32 = VOP1 opcode 5) are stable across
+LLVM versions on gfx90c.
 
 The shader's source was a 6-instruction OpenCL kernel; the bytes
 landed verbatim into the Cyrius file. **The source-citation comment
@@ -204,6 +230,64 @@ Path 1. Highest knowledge compounding, zero tooling deps, matches
 the working compute precedent, produces the reference artifact
 that Step 8.5's lowering smoke test will diff against. The cost
 (iteration cycles) is real but bounded.
+
+## What 6.2(b) lands so far (FS only)
+
+`native_gfx9_shader_solid_red(buf, pos)` — 92 bytes, encodes:
+
+| Offset | Bytes | Instruction |
+|--------|-------|-------------|
+| +0 | `0x7E0002F2` | `v_mov_b32_e32 v0, 1.0` (R) |
+| +4 | `0x7E020280` | `v_mov_b32_e32 v1, 0.0` (G) |
+| +8 | `0x7E040280` | `v_mov_b32_e32 v2, 0.0` (B) |
+| +12 | `0x7E0602F2` | `v_mov_b32_e32 v3, 1.0` (A) |
+| +16 | `0xF800180F` | `exp mrt0 done vm en=0xF tgt=0` (word 0) |
+| +20 | `0x03020100` | exp word 1 (vsrc0..3 = v0..v3) |
+| +24 | `0xBF810000` | `s_endpgm` |
+| +28..+91 | 16 × `0xBF800000` | `s_nop 0` (AMDGPU prefetch padding) |
+
+19 dword value-asserts in
+`tests/tcyr/mabda_v3.tcyr::test_gfx9_fs_solid_red_byte_pattern` plus
+`test_gfx9_fs_solid_red_alignment` pin every emitted byte. Encoding
+derivations are spec-cited in the source comment block; verification
+gate is Step 6.5 hardware diff.
+
+**VS landed** — `native_gfx9_shader_fullscreen_triangle_vs(buf, pos)`
+— 116 bytes, encodes (using v0=vertex_id, v1 as scratch — clobbering
+instance_id which is unused, keeping total VGPRs at 4 so RSRC1 stays
+at the minimum):
+
+| Offset | Bytes | Instruction |
+|--------|-------|-------------|
+| +0 | `0x24040081` | `v_lshlrev_b32_e32 v2, 1, v0` |
+| +4 | `0x24000082` | `v_lshlrev_b32_e32 v0, 2, v0` |
+| +8 | `0x26000084` | `v_and_b32_e32 v0, 4, v0` |
+| +12 | `0x26040484` | `v_and_b32_e32 v2, 4, v2` |
+| +16 | `0x680000C1` | `v_add_u32_e32 v0, -1, v0` |
+| +20 | `0x680404C1` | `v_add_u32_e32 v2, -1, v2` |
+| +24 | `0x7E000B00` | `v_cvt_f32_i32_e32 v0, v0` |
+| +28 | `0x7E020B02` | `v_cvt_f32_i32_e32 v1, v2` |
+| +32 | `0x7E040280` | `v_mov_b32_e32 v2, 0.0` |
+| +36 | `0x7E0602F2` | `v_mov_b32_e32 v3, 1.0` |
+| +40 | `0xF80008CF` | `exp pos0 done en=0xF tgt=12` (word 0) |
+| +44 | `0x03020100` | exp word 1 (vsrc0..3 = v0..v3) |
+| +48 | `0xBF810000` | `s_endpgm` |
+| +52..+115 | 16 × `0xBF800000` | `s_nop 0` (AMDGPU prefetch padding) |
+
+VOP2 arithmetic opcodes (v_lshlrev_b32 = 0x12, v_and_b32 = 0x13,
+v_add_u32 = 0x34) ground-truthed via `clang -target amdgcn--amdhsa
+-mcpu=gfx90c -O2 -nogpulib -O2` of an equivalent CL kernel
+(`vid_to_pos.cl` — see Layer-1 protocol section above) plus
+`llvm-objdump -d --triple=amdgcn--amdhsa --mcpu=gfx90c`. The
+arithmetic VOP2 encodings are ABI-independent — same bytes whether
+dispatched from compute or graphics — so a compute-ABI disassembly
+gives authoritative encodings for the graphics-ABI shader.
+
+32 dword value-asserts in
+`tests/tcyr/mabda_v3.tcyr::test_gfx9_vs_fullscreen_triangle_byte_pattern`
++ `test_gfx9_vs_fullscreen_triangle_alignment` pin every emitted
+byte. Verification gate: Step 6.5 hardware diff (PM4 stream + first
+pixel readback).
 
 ## What 6.2(a) lands now (decision-independent)
 

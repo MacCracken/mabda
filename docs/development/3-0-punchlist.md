@@ -124,11 +124,30 @@ need it.
   chunk** — graphics shaders need GFX9 vertex/fragment ABI
   (SPI conventions, position/color exports), not the OpenCL
   compute kernel ABI that produced `native_gfx9_shader_store_deadbeef`.
-  Realistic options: hand-write against GCN5 ISA spec, extract
-  from radv reference, or wait for Phase 8 WGSL→GFX9 lowering.
-  **Reordered to land after 6.4** — independent of 6.3/6.4, so
-  doing those first lets 6.2 get a focused session with proper
-  time budget.
+  Path chosen: **hand-encode against GCN5 ISA spec** (path 1 from
+  `docs/proposals/v3-shader-bytes-capture.md`).
+  - [x] **6.2(a)** — spec-derived register addresses + bitfield
+    minimums (12 R_SPI/CB constants, 6 RSRC1/RSRC2/format
+    minimums, full-screen-triangle vertex count) in
+    `src/backend_native.cyr` with 30 CPU value-asserts in
+    `tests/tcyr/mabda_v3.tcyr` (Step 6.2(a), 2026-04-30). Capture
+    protocol doc filed at
+    `docs/proposals/v3-shader-bytes-capture.md`.
+  - [x] **6.2(b) FS** — `native_gfx9_shader_solid_red` (92 bytes,
+    4× v_mov + exp mrt0 done vm + s_endpgm + 16-NOP prefetch
+    padding). Encoding spec-cited; 19 byte-asserts pin every
+    dword. `GFX9_FS_SOLID_RED_SIZE = 92` exposed for Step 6.5's
+    BO sizing. (Step 6.2(b) FS, 2026-04-30).
+  - [x] **6.2(b) VS** — `native_gfx9_shader_fullscreen_triangle_vs`
+    (116 bytes, standard radv `(vid&1)*4-1, (vid>>1)*4-1` pattern).
+    VOP2 arithmetic encodings ground-truthed via `clang -target
+    amdgcn--amdhsa -mcpu=gfx90c -O2` of an equivalent CL kernel
+    (vid_to_pos.cl) + `llvm-objdump -d` — same Layer-1 protocol
+    the compute shader used. Uses v0 (vertex_id) and v1 (clobbers
+    instance_id) as scratch, keeps total VGPR count at 4 so RSRC1
+    minimum is unchanged. 32 byte-asserts pin every dword.
+    `GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116` exposed for Step 6.5.
+    (Step 6.2(b) VS, 2026-04-30).
 - [x] **6.3** — `native_rt_create_2d_rgba8(fd, w, h, out)` +
   release primitive (Step 6.3 done 2026-04-28). NativeRenderTarget
   struct (32 bytes, same shape as NativeTexture). RT VA range at

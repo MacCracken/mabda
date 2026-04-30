@@ -1729,6 +1729,112 @@ fn test_gfx9_fullscreen_triangle_vertex_count() {
 }
 
 # ================================================================
+# v3 Step 6.2(b) — fragment shader bytes (solid red FS)
+# ================================================================
+# Pin every dword the FS encoder emits, plus the total byte count.
+# Per the 4f.ii lesson, value-asserting every spec-derived constant
+# at CPU test time means a typo in an instruction encoding (top
+# byte 0x7E for VOP1, 0xF8 for EXP, 0xBF for SOPP) surfaces here
+# rather than as a TDR on hardware. Header citations live in
+# src/backend_native.cyr Step 6.2(b) section.
+
+fn test_gfx9_fs_solid_red_byte_pattern() {
+    var buf[96];
+    memset(&buf, 0xCC, 96);
+    var pos = native_gfx9_shader_solid_red(&buf, 0);
+    assert_eq(pos, GFX9_FS_SOLID_RED_SIZE, "FS shader writes 92 bytes");
+    assert_eq(GFX9_FS_SOLID_RED_SIZE, 92, "FS size constant");
+
+    # Four v_mov_b32_e32 instructions setting v0..v3 to (1.0, 0.0, 0.0, 1.0).
+    # VOP1 top byte = 0x7E. Inline constants 242 = 1.0, 128 = 0.0.
+    assert_eq(load32(&buf +  0), 0x7E0002F2, "v_mov v0, 1.0");
+    assert_eq(load32(&buf +  4), 0x7E020280, "v_mov v1, 0.0");
+    assert_eq(load32(&buf +  8), 0x7E040280, "v_mov v2, 0.0");
+    assert_eq(load32(&buf + 12), 0x7E0602F2, "v_mov v3, 1.0");
+
+    # EXP instruction (8 bytes, 2 dwords). Top byte 0xF8 (encoding
+    # 0x3E in bits 26-31). Word 0 carries en/tgt/done/vm flags;
+    # word 1 carries vsrc0..3.
+    assert_eq(load32(&buf + 16), 0xF800180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 20), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
+
+    # s_endpgm (SOPP, 0xBF810000) — same byte pattern as compute.
+    assert_eq(load32(&buf + 24), 0xBF810000, "s_endpgm");
+
+    # 16 NOP-padding dwords (s_nop 0 = 0xBF800000) — AMDGPU prefetch
+    # requirement; matches the compute shader's tail.
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 28 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_gfx9_fs_solid_red_alignment() {
+    # The FS payload must be 4-byte aligned (every store is 32-bit)
+    # and the total size must be a multiple of 4 — confirming PM4
+    # set_sh_reg can point PGM_LO/HI at any 256-byte-aligned BO offset
+    # without unaligned-instruction hazards. The 92-byte size leaves
+    # 164 bytes of slack within a 256-byte-aligned shader BO slot;
+    # the BO allocator at Step 6.5 sizes accordingly.
+    assert_eq(GFX9_FS_SOLID_RED_SIZE % 4, 0, "FS size is dword-aligned");
+    return 0;
+}
+
+fn test_gfx9_vs_fullscreen_triangle_byte_pattern() {
+    # VS bytes cross-checked against `clang -target amdgcn--amdhsa
+    # -mcpu=gfx90c -O2` of the equivalent CL kernel. The arithmetic
+    # VOP2 opcodes (v_lshlrev_b32 = 0x12, v_and_b32 = 0x13, v_add_u32
+    # = 0x34) are ABI-independent, so the compute-ABI disassembly
+    # gives authoritative encodings for the graphics-ABI shader.
+    var buf[128];
+    memset(&buf, 0xCC, 128);
+    var pos = native_gfx9_shader_fullscreen_triangle_vs(&buf, 0);
+    assert_eq(pos, GFX9_VS_FULLSCREEN_TRIANGLE_SIZE, "VS shader writes 116 bytes");
+    assert_eq(GFX9_VS_FULLSCREEN_TRIANGLE_SIZE, 116, "VS size constant");
+
+    # VOP2 arithmetic: shift, mask, subtract — all top byte 0x24/0x26/0x68
+    # (opcodes 0x12, 0x13, 0x34 in bits 30-25).
+    assert_eq(load32(&buf +  0), 0x24040081, "v_lshlrev_b32 v2, 1, v0");
+    assert_eq(load32(&buf +  4), 0x24000082, "v_lshlrev_b32 v0, 2, v0");
+    assert_eq(load32(&buf +  8), 0x26000084, "v_and_b32 v0, 4, v0");
+    assert_eq(load32(&buf + 12), 0x26040484, "v_and_b32 v2, 4, v2");
+    assert_eq(load32(&buf + 16), 0x680000C1, "v_add_u32 v0, -1, v0");
+    assert_eq(load32(&buf + 20), 0x680404C1, "v_add_u32 v2, -1, v2");
+
+    # VOP1 cvt + mov — top byte 0x7E. cvt opcode 5, mov opcode 1.
+    # VGPR src in 9-bit src0 starts at 256 (v0=0x100, v1=0x101, v2=0x102).
+    assert_eq(load32(&buf + 24), 0x7E000B00, "v_cvt_f32_i32 v0, v0");
+    assert_eq(load32(&buf + 28), 0x7E020B02, "v_cvt_f32_i32 v1, v2");
+    assert_eq(load32(&buf + 32), 0x7E040280, "v_mov v2, 0.0");
+    assert_eq(load32(&buf + 36), 0x7E0602F2, "v_mov v3, 1.0");
+
+    # EXP pos0 done — top byte 0xF8. tgt=12 (pos0) in bits 4-9.
+    # exp pos0 done en=0xF: 0xF8000000 | (1<<11) | (12<<4) | 0xF = 0xF80008CF.
+    assert_eq(load32(&buf + 40), 0xF80008CF, "exp pos0 done word 0");
+    assert_eq(load32(&buf + 44), 0x03020100, "exp pos0 vsrc0..3 = v0..v3");
+
+    # s_endpgm — same as compute and FS.
+    assert_eq(load32(&buf + 48), 0xBF810000, "s_endpgm");
+
+    # 16 NOP padding dwords.
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 52 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_gfx9_vs_fullscreen_triangle_alignment() {
+    # Dword-aligned, fits within a 256-byte-aligned shader BO slot
+    # with 140 bytes of slack. Step 6.5 sizes the VS BO accordingly.
+    assert_eq(GFX9_VS_FULLSCREEN_TRIANGLE_SIZE % 4, 0, "VS size is dword-aligned");
+    return 0;
+}
+
+# ================================================================
 # v3 Step 6.9 — public render-* dispatchers route through Backend
 # ================================================================
 # 7 mock-backend dispatch tests proving each public gpu_render_*
@@ -2074,6 +2180,14 @@ fn main() {
     test_gfx9_pgm_rsrc_minimums();
     test_gfx9_spi_format_field_values();
     test_gfx9_fullscreen_triangle_vertex_count();
+
+    # v3 Step 6.2(b) — fragment shader bytes (2)
+    test_gfx9_fs_solid_red_byte_pattern();
+    test_gfx9_fs_solid_red_alignment();
+
+    # v3 Step 6.2(b) — vertex shader bytes (2)
+    test_gfx9_vs_fullscreen_triangle_byte_pattern();
+    test_gfx9_vs_fullscreen_triangle_alignment();
 
     # v3 Step 6.9 — public render-* dispatchers (8)
     test_gpu_render_target_create_dispatches_through_backend();
