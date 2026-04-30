@@ -2587,29 +2587,159 @@ fn _backend_native_render_pass_end(ctx, pass) {
 }
 
 # ----------------------------------------------------------------
-# Surface slot stubs (v3 Step 7.6)
+# Surface slot wrappers (v3 Step 7.7)
 # ----------------------------------------------------------------
-# Native surface implementation requires opening the card master fd
-# (separate from the render fd that ctx already holds at +0) and
-# composing 7.4(b)'s native_kms_alloc_fb + native_kms_present + 7.2(d)'s
-# modeset driver. Doing that requires a `NativeSurface` bag struct
-# and a card-fd-on-ctx story — both tied to the public API design
-# in Step 7.7 (TTY/kiosk vs logind-aware delegation). Until then
-# these stubs let `backend_is_complete` succeed without committing
-# to either model.
+# The slot reads `card_fd` from `gpu_ctx_native_card_fd(ctx)`,
+# which the public `gpu_surface_configure_native_kiosk` dispatcher
+# stashes there before calling the slot. The render fd stays at
+# `native_ctx_fd(ctx)` (set by `gpu_context_new_native`).
+#
+# Composes the full pipeline:
+#   discovery    (7.1, native_kms_init)
+#   modeset      (7.2(d), native_kms_modeset_first_connected)
+#   second FB    (7.4(b), native_kms_alloc_fb)
+#   page-flip    (7.4(b), native_kms_present) — on each frame
+#   teardown     (7.4(b) + 7.2(d), release_fb + release_scanout)
+#
+# Caveat: surface_configure ONLY works on the kiosk path in v3.0.
+# The logind path (gpu_surface_configure_native_logind) is gated
+# on the v3.x samvada package; for now its public dispatcher
+# returns GPU_ERR_NOT_IMPLEMENTED before reaching this slot.
+
+# NativeSurface layout (120 bytes):
+#   +0:   card_fd        (i32)
+#   +4:   render_fd      (i32)
+#   +8:   state          (u64) — KmsState ptr (96 B elsewhere)
+#   +16:  scanout        (40 B inline NativeKmsScanout) — has fb_a
+#   +56:  fb_b           (32 B inline NativeKmsFb) — second framebuffer
+#   +88:  front_is_b     (u32) — 0 = scanout's fb is front, 1 = fb_b is front
+#   +92:  pad            (u32) — alignment
+#   +96:  width          (u32) — pixels (mode-bound)
+#   +100: height         (u32) — pixels
+#   +104: pitch          (u32) — bytes per row (256-aligned, matches both FBs)
+#   +108: pad            (u32)
+var NATIVE_SURFACE_SIZE        = 120;
+var NATIVE_SURFACE_CARD_FD     = 0;
+var NATIVE_SURFACE_RENDER_FD   = 4;
+var NATIVE_SURFACE_STATE       = 8;
+var NATIVE_SURFACE_SCANOUT     = 16;
+var NATIVE_SURFACE_FB_B        = 56;
+var NATIVE_SURFACE_FRONT_IS_B  = 88;
+var NATIVE_SURFACE_WIDTH       = 96;
+var NATIVE_SURFACE_HEIGHT      = 100;
+var NATIVE_SURFACE_PITCH       = 104;
+
+# Configure a native surface. Reads card_fd from ctx (set by the
+# public dispatcher), runs full modeset on first connected
+# connector, allocates a second FB for double-buffering, returns
+# the populated NativeSurface ptr (or 0 on any failure step).
 fn _backend_native_surface_configure(ctx, width, height) {
-    return 0;   # surface_ptr — 0 signals "not configured"
+    if (ctx == 0)    { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    var card_fd = gpu_ctx_native_card_fd(ctx);
+    if (card_fd <= 0) { return 0; }   # consumer didn't pre-stash
+    var render_fd = native_ctx_fd(ctx);
+    if (render_fd <= 0) { return 0; }
+
+    var ns = alloc(NATIVE_SURFACE_SIZE);
+    memset(ns, 0, NATIVE_SURFACE_SIZE);
+    store32(ns + NATIVE_SURFACE_CARD_FD,   card_fd);
+    store32(ns + NATIVE_SURFACE_RENDER_FD, render_fd);
+
+    # ---- discovery ----
+    var state = native_kms_init(card_fd);
+    if (state == 0) { return 0; }
+    store64(ns + NATIVE_SURFACE_STATE, state);
+
+    # ---- modeset on first CONNECTED connector ----
+    var rc = native_kms_modeset_first_connected(card_fd, render_fd,
+                                                state,
+                                                ns + NATIVE_SURFACE_SCANOUT);
+    if (rc != 0) {
+        native_kms_release(state);
+        return 0;
+    }
+    var fb_w = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_WIDTH);
+    var fb_h = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_HEIGHT);
+
+    # ---- alloc second FB matching mode dimensions ----
+    rc = native_kms_alloc_fb(card_fd, render_fd, fb_w, fb_h,
+                             ns + NATIVE_SURFACE_FB_B);
+    if (rc != 0) {
+        native_kms_release_scanout(card_fd, render_fd,
+                                   ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release(state);
+        return 0;
+    }
+
+    var pitch_raw = fb_w * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    store32(ns + NATIVE_SURFACE_WIDTH,      fb_w);
+    store32(ns + NATIVE_SURFACE_HEIGHT,     fb_h);
+    store32(ns + NATIVE_SURFACE_PITCH,      pitch);
+    store32(ns + NATIVE_SURFACE_FRONT_IS_B, 0);  # scanout's FB is front
+    return ns;
 }
 
+# Acquire returns the back-buffer's NativeKmsFb pointer (the FB
+# that's NOT currently scanning). Consumer fills its mapped_addr
+# with frame content, then calls present.
 fn _backend_native_surface_acquire(ctx, surface) {
-    return 0;   # fb_ptr — 0 signals "no buffer available"
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var front_is_b = load32(surface + NATIVE_SURFACE_FRONT_IS_B);
+    if (front_is_b != 0) {
+        # fb_b is currently scanning → back is the scanout's FB
+        return surface + NATIVE_SURFACE_SCANOUT;
+    }
+    # scanout's FB is currently scanning → back is fb_b
+    return surface + NATIVE_SURFACE_FB_B;
 }
 
+# Present flips the back buffer to scanning, blocks on vblank,
+# then toggles which is "front." After return, the buffer that
+# was just presented is on screen, and the next acquire returns
+# the OTHER one.
 fn _backend_native_surface_present(ctx, surface) {
-    return GPU_ERR_OTHER;
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    var card_fd = load32(surface + NATIVE_SURFACE_CARD_FD);
+    var front_is_b = load32(surface + NATIVE_SURFACE_FRONT_IS_B);
+    var back_fb_id = 0;
+    if (front_is_b != 0) {
+        # back is scanout's FB
+        back_fb_id = load32(surface + NATIVE_SURFACE_SCANOUT
+                            + NATIVE_KMS_SCANOUT_FB_ID);
+    }
+    if (front_is_b == 0) {
+        # back is fb_b
+        back_fb_id = load32(surface + NATIVE_SURFACE_FB_B
+                            + NATIVE_KMS_FB_FB_ID);
+    }
+    var rc = native_kms_present(card_fd,
+                                surface + NATIVE_SURFACE_SCANOUT,
+                                back_fb_id, 0);
+    if (rc != 0) { return rc; }
+    # Toggle which is front. (The flip-completed event drained inside
+    # native_kms_present already ran; back is now scanning.)
+    if (front_is_b == 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 1); }
+    if (front_is_b != 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 0); }
+    return 0;
 }
 
 fn _backend_native_surface_release(ctx, surface) {
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var card_fd   = load32(surface + NATIVE_SURFACE_CARD_FD);
+    var render_fd = load32(surface + NATIVE_SURFACE_RENDER_FD);
+    var state     = load64(surface + NATIVE_SURFACE_STATE);
+    native_kms_release_fb(card_fd, render_fd,
+                          surface + NATIVE_SURFACE_FB_B);
+    native_kms_release_scanout(card_fd, render_fd,
+                               surface + NATIVE_SURFACE_SCANOUT);
+    if (state != 0) { native_kms_release(state); }
+    memset(surface, 0, NATIVE_SURFACE_SIZE);
     return 0;
 }
 

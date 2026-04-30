@@ -950,6 +950,122 @@ locking in either consumer protocol.
 - `test_backend_wgpu_new_is_complete` + `_native_new_is_complete`
   each check all 4 v3 slots are filled.
 
+### Added — 2026-04-30 (Step 7.7 — Phase D public API + e2e program)
+
+Closes Phase D code-completion. The full chain from window
+handle (or DRM master fd) to scanned-out frame goes through one
+public API surface, with both backends fully wired.
+
+**GpuContext extension (96 → 112 bytes)** — added two
+consumer-stash fields per the v3-surface-api-design proposal:
+`wgpu_surface_handle` at +96 (set by
+`gpu_surface_configure_wgpu`) and `native_card_fd` at +104
+(set by `gpu_surface_configure_native_kiosk`). Accessor pairs
+`gpu_ctx_*_handle` / `gpu_ctx_set_*_handle` /
+`gpu_ctx_native_card_fd` / `gpu_ctx_set_native_card_fd` exposed
+in `src/context.cyr`. Single greppable migration: every
+`alloc(96)` site bumped to `alloc(112)` (3 src + 38 test
+sites).
+
+**`src/surface_v3.cyr`** — new module. Six public dispatchers:
+
+```
+gpu_surface_configure_wgpu(ctx, wgpu_surface, w, h)        → surface_ptr
+gpu_surface_configure_native_kiosk(ctx, card_fd, w, h)     → surface_ptr
+gpu_surface_configure_native_logind(ctx, w, h)             → 0  (v3.0 stub)
+
+gpu_surface_acquire(ctx, surface)  → fb_ptr
+gpu_surface_present(ctx, surface)  → 0|err
+gpu_surface_release(ctx, surface)  → 0
+```
+
+The three configure entries stash backend-specific resources
+(`WGPUSurface` handle / DRM master `card_fd`) on `GpuContext`
+via the new accessors, then dispatch through the slot table —
+slot signature `(ctx, w, h)` stays stable from 7.5. The three
+per-frame ops route directly through the slot table.
+
+**Wgpu wrappers (real impls, replacing 7.6 stubs).** Thin
+delegates over the existing v2 `src/surface.cyr`
+`surface_state_*` lifecycle. Configure reads `wgpu_surface`
+from ctx, calls `surface_state_new` with default RGBA8_UNORM
++ vsync. Acquire unwraps the `Result` returned by
+`surface_state_acquire`. Present + release passthrough.
+
+**Native wrappers (real impls).** Introduce a 120-byte
+`NativeSurface` struct (`card_fd` + `render_fd` + `state` ptr
++ inline 40-byte scanout + inline 32-byte fb_b + `front_is_b`
+flag + dimensions + pitch). Configure runs the full pipeline:
+`native_kms_init` → `native_kms_modeset_first_connected` →
+`native_kms_alloc_fb` for the second buffer. Acquire returns
+the back-buffer pointer (toggle on `front_is_b`). Present
+calls `native_kms_present` then toggles. Release tears down
+all three (fb_b + scanout + state).
+
+**`programs/native_present_e2e.cyr`** (~190 lines). Runs the
+public API end-to-end: opens card_fd, takes DRM master,
+configures the surface, then a 120-frame loop fills the
+back-buffer with a vertically-scrolling blue-red gradient
+(0x00RRGGBB pixels into the BO's `mapped_addr`, pitch-aware).
+Verified live on the dev box up through `SET_MASTER` — returns
+EACCES because Hyprland holds master, same gate as
+`native_kms_modeset_smoke`. Pipeline is structurally correct;
+visible flip needs a tty + stopped compositor, OR the
+v3.x `samvada` package landing.
+
+**Bump-allocator note.** Stack-local `var ctx[112]` for the
+new tests (heap-allocated tests at this point in the file
+exhaust the bump allocator). Pattern carries forward — any
+new tests in `mabda_v3_phase_d.tcyr` that need a ctx should
+use stack-local arrays.
+
+8 new CPU tests, 38 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+extended ctx size pin, both consumer-stash accessor
+round-trips, `NativeSurface` field offsets + inline-struct
+alignment, null-safety on all 6 public dispatchers, v3.0
+logind-stub pin (catches an accidental non-zero return).
+
+### Metrics — 2026-04-30 (post Step 7.7)
+
+- Module count: **35** (was 34; `surface_v3.cyr` is new).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 856 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **335 assertions** (was
+  297 at 7.6 close; +38 from 7.7).
+- `src/context.cyr`: ~210 lines (was ~190; +20 for the
+  `GPU_CONTEXT_SIZE` constant + 4 new accessors + extended
+  layout docstring).
+- `src/surface_v3.cyr`: 145 lines (new).
+- `src/backend_wgpu.cyr`: ~615 lines (was ~590; +25 for real
+  surface impls).
+- `src/backend_native.cyr`: ~2,870 lines (was ~2,720;
+  +150 for `NativeSurface` struct + 4 real surface impls).
+- `programs/native_present_e2e.cyr`: ~190 lines (new).
+- `dist/mabda.cyr`: regenerated (11417 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Next — 2026-04-30 (post Step 7.7)
+
+**Phase D code-complete.** Mabda v3.0's Tier 1 in-mabda code
+is done end-to-end except for WGSL lowering. Two paths forward,
+genuinely independent:
+
+1. **8.1 design spike — WGSL frontend choice.** The v3.0 ship-
+   blocker per the punchlist's "Hard truths." Doc-only bite:
+   compares WGSL parser vs SPIR-V loader vs Tint integration,
+   commits to one in a `docs/proposals/v3-wgsl-frontend-choice.md`.
+   Same pattern as 7.7's design spike. Implementation (8.2–8.10)
+   then follows over multiple sessions.
+2. **Tier 2 — `programs/diagnostics/radv_capture/`.** Headless
+   Vulkan capture program (C, separate codebase area). Unblocks
+   the Layer-2 byte-diff that 6.5 has been waiting on. Self-
+   contained, parallel to 8.x.
+
+Plus the long tail of Tier 4 doc updates (CLAUDE.md still
+describes v2.5.0) and Tier 5 release engineering (P(-1) audit,
+VERSION bump to 3.0.0, etc.). Those run in any order once
+Tier 1 closes.
+
 ### Metrics — 2026-04-30 (post Step 7.6)
 
 - Module count: 34 (unchanged).

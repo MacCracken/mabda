@@ -1,0 +1,200 @@
+# programs/native_present_e2e.cyr — v3 Step 7.7 e2e
+#
+# 120-frame double-buffered animated present using the v3 public
+# surface API. Closes Phase D end-to-end on real hardware.
+#
+# Flow:
+#   1. Open card_fd + render_fd, take DRM master
+#   2. gpu_context_new_native()
+#   3. gpu_surface_configure_native_kiosk(ctx, card_fd, w, h)
+#   4. for frame in 0..120:
+#        fb = gpu_surface_acquire(ctx, surface)
+#        # Fill fb's mapped_addr with frame-dependent gradient
+#        gpu_surface_present(ctx, surface)
+#   5. gpu_surface_release + drop_master + close fds
+#
+# **Run from a tty.** Same master-acquisition gate as
+# native_kms_modeset_smoke; see project memory
+# `project_phase_d_master_logind_blocker` for the workarounds
+# (vkms / no-compositor / stop display-manager). When the v3.x
+# `samvada` package lands, gpu_surface_configure_native_logind
+# will be the in-session alternative.
+#
+# At 60 Hz the screen shows ~2 seconds of a vertically-scrolling
+# blue-to-red gradient — visual confirmation the page-flip path
+# works. Each frame's gradient offset is `frame * 4` rows, so
+# the pattern wraps every (h/4) frames.
+#
+# Exit codes:
+#   0   — 120 frames presented, clean teardown
+#   1   — open /dev/dri/cardN failed
+#   2   — open /dev/dri/renderD128 failed
+#   3   — DRM_IOCTL_SET_MASTER failed (logind holds master)
+#   4   — gpu_context_new_native failed
+#   5   — gpu_surface_configure_native_kiosk failed (most likely
+#         no connected connector, or modeset rejected)
+#   6   — gpu_surface_acquire returned 0 mid-loop
+#   7   — gpu_surface_present returned non-zero mid-loop
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Card-node scan — same shape as native_kms_summary's helper.
+fn _try_open_card(path_buf) {
+    var i = 0;
+    while (i < 10) {
+        store8(path_buf + 13, 48 + i);
+        var fd = syscall(2, path_buf, 0x2, 0);
+        if (fd >= 0) { return fd; }
+        i = i + 1;
+    }
+    return -2;
+}
+
+# Fill the back-buffer with a vertically-scrolling gradient. Each
+# row's color depends on (y + offset) mod height — wraps cleanly.
+# Top half blends blue→red; bottom half stays mostly red. XRGB8888
+# LE memory is [B, G, R, X] per pixel; pack as 0x00RRGGBB.
+fn _fill_gradient(addr, w, h, pitch, frame_offset) {
+    var y = 0;
+    while (y < h) {
+        var virt_y = (y + frame_offset) % h;
+        # virt_y goes 0..h-1; map to red intensity 0..255 across full height.
+        var r = (virt_y * 255) / h;
+        var b = 255 - r;
+        var pixel = (r << 16) | b;   # G stays 0
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, pixel);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native present e2e (v3 Step 7.7)\n");
+    print_cstr("--------------------------------------\n");
+    print_cstr("expect: vertically-scrolling blue-red gradient for ~2s\n\n");
+
+    # Open card master fd.
+    var path[16];
+    memset(&path, 0, 16);
+    store8(&path + 0,  47);   store8(&path + 1,  100);  store8(&path + 2,  101);
+    store8(&path + 3,  118);  store8(&path + 4,  47);   store8(&path + 5,  100);
+    store8(&path + 6,  114);  store8(&path + 7,  105);  store8(&path + 8,  47);
+    store8(&path + 9,  99);   store8(&path + 10, 97);   store8(&path + 11, 114);
+    store8(&path + 12, 100);
+    var card_fd = _try_open_card(&path);
+    if (card_fd < 0) {
+        print_cstr("FAIL: open /dev/dri/cardN errno=");
+        print_i64(0 - card_fd); print_cstr("\n");
+        return 1;
+    }
+    print_cstr("opened card_fd="); print_i64(card_fd); print_cstr("\n");
+
+    # Take DRM master explicitly so the slot path's SETCRTC works.
+    var rc = native_drm_set_master(card_fd);
+    if (rc != 0) {
+        print_cstr("FAIL: SET_MASTER errno="); print_i64(0 - rc);
+        print_cstr(" (logind holds master? run from a tty + stop compositor)\n");
+        sys_close(card_fd);
+        return 3;
+    }
+
+    # Bring up native ctx (opens render fd internally).
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        native_drm_drop_master(card_fd);
+        sys_close(card_fd);
+        return 4;
+    }
+    var ctx = payload(ctx_res);
+
+    # Configure surface. width/height are placeholders — the slot
+    # uses the modeset's actual mode dimensions, not these. v3.0
+    # passes them through anyway as a hint for future format/scale
+    # logic.
+    var W = 1920;
+    var H = 1080;
+    var surface = gpu_surface_configure_native_kiosk(ctx, card_fd, W, H);
+    if (surface == 0) {
+        print_cstr("FAIL: gpu_surface_configure_native_kiosk (no connected connector?)\n");
+        gpu_context_release(ctx);
+        native_drm_drop_master(card_fd);
+        sys_close(card_fd);
+        return 5;
+    }
+    var actual_w = load32(surface + NATIVE_SURFACE_WIDTH);
+    var actual_h = load32(surface + NATIVE_SURFACE_HEIGHT);
+    var pitch    = load32(surface + NATIVE_SURFACE_PITCH);
+    print_cstr("PASS: surface configured "); print_i64(actual_w);
+    print_cstr("x"); print_i64(actual_h); print_cstr(" pitch=");
+    print_i64(pitch); print_cstr("\n");
+
+    # Animation loop — 120 frames at vsync = ~2s @60Hz.
+    var frame = 0;
+    while (frame < 120) {
+        var fb = gpu_surface_acquire(ctx, surface);
+        if (fb == 0) {
+            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame);
+            print_cstr("\n");
+            gpu_surface_release(ctx, surface);
+            gpu_context_release(ctx);
+            native_drm_drop_master(card_fd);
+            sys_close(card_fd);
+            return 6;
+        }
+        # fb is a NativeKmsFb-shaped pointer (or NativeKmsScanout-
+        # shaped for the front-is-fb_b case — same layout up through
+        # mapped_addr / width / height fields). Read mapped_addr.
+        # NativeKmsFb.MAPPED_ADDR offset = 16; NativeKmsScanout's
+        # mapped_addr is at +24. We pick based on which side the
+        # acquire returned. The cleanest path: use the surface's
+        # cached width/pitch (they match both FBs since both were
+        # alloc'd at modeset dimensions).
+        var addr = 0;
+        if (fb == surface + NATIVE_SURFACE_FB_B) {
+            addr = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR);
+        }
+        if (fb == surface + NATIVE_SURFACE_SCANOUT) {
+            addr = load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
+        }
+        _fill_gradient(addr, actual_w, actual_h, pitch, frame * 4);
+        rc = gpu_surface_present(ctx, surface);
+        if (rc != 0) {
+            print_cstr("FAIL: present returned "); print_i64(rc);
+            print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+            gpu_surface_release(ctx, surface);
+            gpu_context_release(ctx);
+            native_drm_drop_master(card_fd);
+            sys_close(card_fd);
+            return 7;
+        }
+        frame = frame + 1;
+    }
+    print_cstr("PASS: 120 frames presented\n");
+
+    gpu_surface_release(ctx, surface);
+    gpu_context_release(ctx);
+    native_drm_drop_master(card_fd);
+    sys_close(card_fd);
+    print_cstr("teardown complete\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

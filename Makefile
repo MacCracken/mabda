@@ -260,6 +260,18 @@ build/native_kms_modeset_smoke: programs/native_kms_modeset_smoke.cyr src/*.cyr
 test-native-kms-modeset: build/native_kms_modeset_smoke
 	./build/native_kms_modeset_smoke
 
+# v3 Step 7.7 — Phase D end-to-end. 120-frame double-buffered
+# animated present using the v3 public surface API. Requires DRM
+# master — run from a tty (Ctrl-Alt-F2 + stop the compositor)
+# or wait for v3.x samvada / logind support.
+build/native_present_e2e: programs/native_present_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_present_e2e.cyr $@
+
+.PHONY: test-native-present-e2e
+test-native-present-e2e: build/native_present_e2e
+	./build/native_present_e2e
+
 # v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
 # Used to differentiate "is this bug in our direct ioctls?" (spike =
 # libdrm-canonical, hangs identically) from "is shader-dispatch the

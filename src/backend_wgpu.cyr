@@ -46,8 +46,8 @@ fn _backend_wgpu_ctx_create_from_preinit(preinit_ptr) {
     if (instance == 0) { return 0; }
     if (adapter == 0)  { return 0; }
     if (device == 0)   { return 0; }
-    var ctx = alloc(96);
-    memset(ctx, 0, 96);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
     store64(ctx,      instance);
     store64(ctx + 8,  adapter);
     store64(ctx + 16, device);
@@ -509,38 +509,50 @@ fn _backend_wgpu_render_pass_end(ctx, pass) {
 }
 
 # ----------------------------------------------------------------
-# Surface slot stubs (v3 Step 7.6)
+# Surface slot wrappers (v3 Step 7.7)
 # ----------------------------------------------------------------
-# The wgpu surface API needs a `WGPUSurface` handle obtained from
-# the consumer's window (X11 / Wayland / HWND). The v3 slot
-# signatures don't currently carry a window-handle parameter — that
-# protocol gets designed in Step 7.7 (public API), where the
-# architectural question of "TTY/kiosk vs logind-aware compositor"
-# also gets resolved.
-#
-# Until 7.7, wgpu consumers needing a surface should continue to
-# use the v2 `src/surface.cyr` API directly:
-#   surface_state_new(wgpu_surface_handle, device, format, w, h, present_pref)
-#   surface_state_acquire / surface_state_submit_present /
-#   surface_state_resize / surface_state_release
-#
-# These stubs exist so the slot table is "complete" for
-# `backend_is_complete` but route through error returns at runtime.
-# Step 7.7 replaces them with real wrappers.
+# Reads the `WGPUSurface` handle from `gpu_ctx_wgpu_surface_handle(ctx)`
+# (set by the public dispatcher `gpu_surface_configure_wgpu` in
+# src/surface_v3.cyr before calling the slot). Delegates to the
+# v2 `src/surface.cyr` `surface_state_*` API which already handles
+# the wgpu surface configuration / acquire / present lifecycle.
+# Caller can keep using `surface_state_*` directly if they prefer
+# (v2 path stays in tree); the v3 slot path adds backend
+# abstraction for consumers writing portable code.
 fn _backend_wgpu_surface_configure(ctx, width, height) {
-    return 0;   # surface_ptr — 0 signals "not configured"
+    if (ctx == 0)         { return 0; }
+    if (width <= 0)       { return 0; }
+    if (height <= 0)      { return 0; }
+    var wgpu_surface = gpu_ctx_wgpu_surface_handle(ctx);
+    if (wgpu_surface == 0) { return 0; }   # consumer didn't pre-stash
+    var device = gpu_ctx_device(ctx);
+    if (device == 0)       { return 0; }
+    return surface_state_new(wgpu_surface, device,
+                             WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                             width, height, PRESENT_VSYNC);
 }
 
+# `surface_state_acquire` returns a Result<texture_handle>; the slot
+# protocol returns the texture handle directly (or 0 on error) so
+# the caller can pass it forward without unwrapping a Result.
 fn _backend_wgpu_surface_acquire(ctx, surface) {
-    return 0;   # fb_ptr — 0 signals "no buffer available"
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var res = surface_state_acquire(surface);
+    if (is_err_result(res) == 1) { return 0; }
+    return payload(res);
 }
 
 fn _backend_wgpu_surface_present(ctx, surface) {
-    return GPU_ERR_OTHER;
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    return surface_state_submit_present(surface);
 }
 
 fn _backend_wgpu_surface_release(ctx, surface) {
-    return 0;
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    return surface_state_release(surface);
 }
 
 # ================================================================

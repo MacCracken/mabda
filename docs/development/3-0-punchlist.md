@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.6 — surface slot stubs wired, both backends complete)
+**Last refresh:** 2026-04-30 (post Step 7.7 — Phase D code-complete)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -619,7 +619,40 @@ need it.
   to walk v3, plus per-backend "all v3 slots filled" sub-tests).
   856 v3 + 297 phase_d + 624 mabda CPU asserts green; smoke +
   lint + distlib clean. (Step 7.6, 2026-04-30).
-- [ ] **7.7** — Public dispatchers + `programs/native_present_e2e.cyr`
+- [x] **7.7** — Public dispatchers + `programs/native_present_e2e.cyr`.
+  GpuContext extended 96 → 112 bytes (added `wgpu_surface_handle`
+  at +96, `native_card_fd` at +104) with `gpu_ctx_set_*` /
+  `gpu_ctx_*_handle` accessors per the v3-surface-api-design
+  proposal. New `src/surface_v3.cyr` ships 6 public dispatchers:
+  three backend-specific configure entries
+  (`gpu_surface_configure_wgpu`,
+  `gpu_surface_configure_native_kiosk` — fully implemented;
+  `gpu_surface_configure_native_logind` — v3.0 stub deferred to
+  the `samvada` package), plus three generic per-frame ops
+  (`gpu_surface_acquire`, `gpu_surface_present`,
+  `gpu_surface_release`) routing through the slot table.
+  Wgpu slot wrappers replace 7.6's stubs with thin delegates
+  over the v2 `src/surface.cyr` `surface_state_*` lifecycle.
+  Native slot wrappers introduce a 120-byte `NativeSurface`
+  struct (card_fd / render_fd / state ptr / inline 40-byte
+  scanout / inline 32-byte fb_b / front_is_b flag / dimensions /
+  pitch) and compose 7.1 discovery + 7.2(d) modeset + 7.4(b)
+  alloc_fb + present into a working scanout — all reusing
+  primitives. New `programs/native_present_e2e.cyr` (~190 lines)
+  drives a 120-frame double-buffered animated gradient through
+  the public API; **verified live up through SET_MASTER on the
+  dev box** (returns EACCES because Hyprland holds master, same
+  gate as the modeset smoke; the program walks correctly through
+  card_fd open + master probe before failing). Bulk-migrated 38
+  test sites' `alloc(96)` → `alloc(112)` for the ctx layout
+  bump. Tests use stack-local `var ctx[112]` for new tests
+  (heap-allocated tests would exhaust the bump allocator at this
+  point in the test file). 8 new CPU tests, 38 asserts (ctx
+  layout + accessors + NativeSurface field offsets +
+  null-safety on all 6 public dispatchers + v3.0 logind-stub
+  pin). 624 mabda + 856 v3 + 335 phase_d = **1815 CPU asserts
+  green**; smoke + lint + distlib clean.
+  Closes Phase D code-completion. (Step 7.7, 2026-04-30).
   (open a window, render a clear, present, hold for 1s, exit).
 
 #### WGSL → GFX9 ISA lowering (broken into chunks)
@@ -848,7 +881,7 @@ These keep the v4.0 / v5.0 commitments visible from the v3.0 ship.
 ## Recommended sequencing (refreshed 2026-04-30)
 
 Smallest-bites-first order. Each step is verifiable end-to-end
-before the next. **Steps 1–6 done; we're at the start of Step 7.**
+before the next. **Steps 1–7 done; WGSL lowering (8.x) is next.**
 
 1. ~~Backend abstraction smoke test~~ ✅
 2. ~~`backend_wgpu.cyr` filling all slots + refactor public API~~ ✅
@@ -860,12 +893,11 @@ before the next. **Steps 1–6 done; we're at the start of Step 7.**
    gated on either Hyprland-hostile master access or the headless
    radv capture program.~~ ✅
 6. ~~Phase D KMS primitives (7.1–7.6) — discovery, modeset, FB,
-   page-flip, present, slot stubs all in tree. Master-acquisition
-   is logind-gated; deferred to v3.x or to 7.7's design.~~ ✅
-7. **7.7 — Phase D public API + e2e program.** Architecture
-   decisions (TTY/kiosk vs logind-aware, wgpu surface handle
-   protocol) + real slot wrappers replacing 7.6's stubs +
-   `programs/native_present_e2e.cyr`. Closes Phase D.
+   page-flip, present, slot stubs all in tree.~~ ✅
+7. ~~Phase D public API (7.7) — `gpu_surface_*` dispatchers,
+   real slot wrappers replacing 7.6's stubs, e2e program.
+   Master-acquisition for the `_native_logind` path deferred to
+   the `samvada` v0.2.0 package (Tier 6).~~ ✅
 8. **WGSL → GFX9 lowering** — chunks 8.1–8.10. Was queued as
    parallel to 5–7; in practice 7.x landed first because Phase C
    was the higher-risk path. Now the load-bearing pre-ship gate.
@@ -885,7 +917,7 @@ before the next. **Steps 1–6 done; we're at the start of Step 7.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.10 prep all landed; 6.5 Layer-2 verify + post-draw cache flush gated on headless radv capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout + stubs in tree (7.1–7.6)**; only 7.7 (public API + real slot impls + e2e program) remains; HW exercise gated on logind master story | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | **code-complete** — 7.1–7.7 all in tree; HW exercise gated on logind master (samvada v0.2.0 fills `_native_logind` body) | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued; design call (WGSL frontend vs SPIR-V loader) is the next bite | — |
 | Tier 2 — Integration & regression | partial — CPU 624 + 856 + 297 = **1777 pass**; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

@@ -2,7 +2,9 @@
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (96 bytes — grew from 48 at v3 Step 4f.iv):
+# GpuContext struct layout (112 bytes — grew 48 → 96 at v3 Step
+# 4f.iv, then 96 → 112 at v3 Step 7.7 for the surface API
+# consumer-stash slots):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
@@ -15,18 +17,48 @@
 #   +72: fence_handle (8)       — native: per-context fence BO handle
 #   +80: fence_va   (8)         — native: fence BO GPU VA
 #   +88: fence_addr (8)         — native: fence BO CPU mmap (pre-zero seqno slot)
+#   +96: wgpu_surface_handle (8) — wgpu: WGPUSurface; set by
+#                                  gpu_surface_configure_wgpu before the
+#                                  slot reads it. Zero on native.
+#   +104: native_card_fd (8)    — native: DRM master card fd; set by
+#                                  gpu_surface_configure_native_kiosk.
+#                                  Zero on wgpu.
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
 # you which view applies. Native-side accessors live in
 # src/backend_native.cyr (native_ctx_fd / _id / _stub_handle /
 # _stub_va). The +32 backend ptr is always a Backend struct.
+#
+# +96 / +104 are the consumer-stash fields the v3.0 surface API
+# uses to pass backend-specific resources into the
+# `surface_configure(ctx, w, h)` slot whose signature can't
+# carry them directly (see docs/proposals/v3-surface-api-design.md
+# § "Why 'stash on ctx' rather than passing through every slot").
+
+var GPU_CONTEXT_SIZE = 112;
 
 fn gpu_ctx_instance(ctx) { return load64(ctx); }
 fn gpu_ctx_adapter(ctx)  { return load64(ctx + 8); }
 fn gpu_ctx_device(ctx)   { return load64(ctx + 16); }
 fn gpu_ctx_queue(ctx)    { return load64(ctx + 24); }
 fn gpu_ctx_backend(ctx)  { return load64(ctx + 32); }
+
+# v3 Step 7.7 — surface API consumer-stash accessors. Set by the
+# backend-specific `gpu_surface_configure_*` public fns; read by
+# the matching `_backend_*_surface_configure` slot impls.
+fn gpu_ctx_wgpu_surface_handle(ctx) { return load64(ctx + 96); }
+fn gpu_ctx_native_card_fd(ctx)      { return load64(ctx + 104); }
+fn gpu_ctx_set_wgpu_surface_handle(ctx, h) {
+    if (ctx == 0) { return -1; }
+    store64(ctx + 96, h);
+    return 0;
+}
+fn gpu_ctx_set_native_card_fd(ctx, fd) {
+    if (ctx == 0) { return -1; }
+    store64(ctx + 104, fd);
+    return 0;
+}
 
 # Create from pre-initialized handles (C launcher fills these).
 # Failure paths route through gpu_err_result, which already emits a
@@ -52,8 +84,8 @@ fn gpu_context_from_preinit(preinit_ptr) {
     if (instance == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (adapter == 0)  { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (device == 0)   { return gpu_err_result(GPU_ERR_DEVICE_REQUEST); }
-    var ctx = alloc(96);
-    memset(ctx, 0, 96);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
     store64(ctx,      instance);
     store64(ctx + 8,  adapter);
     store64(ctx + 16, device);
@@ -175,8 +207,8 @@ fn gpu_context_new_native() {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
-    var ctx = alloc(96);
-    memset(ctx, 0, 96);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
     store64(ctx +  0, fd);
     store64(ctx +  8, ctx_id);
     store64(ctx + 16, stub_handle);
