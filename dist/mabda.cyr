@@ -744,46 +744,102 @@ fn profile_end(start_ns) {
 
 # @public — stable API surface (survives the v3.0 backend swap)
 # resource.cyr — frame resource tracking
-# Ported from mabda/src/resource.rs
+# Ported from mabda/src/resource.rs; v3 Step 4f.iii made it
+# ctx-aware so cleanup can route through the Backend abstraction.
 #
-# FrameResources tracks transient GPU resources (buffers, textures)
-# created during a frame, so they can be cleaned up at frame end.
+# FrameResources struct layout (24 bytes — grew from 16 at v3 4f.iii):
+#   +0:  ctx      (GpuContext*, 8 — optional; 0 = legacy untracked-ctx)
+#   +8:  buffers  (vec ptr — opaque u64 buffer handles)
+#   +16: textures (vec ptr — opaque u64 texture handles)
 #
-# FrameResources struct layout (16 bytes):
-#   +0: buffers  (vec ptr — vec of WGPUBuffer handles)
-#   +8: textures (vec ptr — vec of WGPUTexture handles)
+# Storage is backend-agnostic: u64 handles fit both wgpu (WGPUBuffer/
+# WGPUTexture) and native (KMS handles for amdgpu BOs). Cleanup is
+# the part that needs backend dispatch — frame_resources_release_buffers
+# routes through gpu_buffer_release(ctx, h), which goes through
+# ctx->backend->buffer_release. Texture cleanup stays caller-managed
+# until the texture slot lands in the Backend interface (Phase C work).
+#
+# Two construction paths:
+#   frame_resources_new()        — legacy, no ctx; cleanup is caller's
+#                                  responsibility
+#   frame_resources_new_for(ctx) — v3-shape; release_buffers dispatches
+#                                  through ctx->backend
 
 fn frame_resources_new() {
-    var fr = alloc(16);
-    store64(fr, vec_new());
-    store64(fr + 8, vec_new());
+    var fr = alloc(24);
+    memset(fr, 0, 24);
+    store64(fr,      0);             # ctx unset
+    store64(fr + 8,  vec_new());     # buffers
+    store64(fr + 16, vec_new());     # textures
     return fr;
 }
 
+fn frame_resources_new_for(ctx) {
+    var fr = alloc(24);
+    memset(fr, 0, 24);
+    store64(fr,      ctx);
+    store64(fr + 8,  vec_new());
+    store64(fr + 16, vec_new());
+    return fr;
+}
+
+fn frame_resources_ctx(fr) { return load64(fr); }
+
 fn frame_resources_track_buffer(fr, buffer) {
-    vec_push(load64(fr), buffer);
+    vec_push(load64(fr + 8), buffer);
     return 0;
 }
 
 fn frame_resources_track_texture(fr, texture) {
-    vec_push(load64(fr + 8), texture);
+    vec_push(load64(fr + 16), texture);
     return 0;
 }
 
 fn frame_resources_buffer_count(fr) {
-    return vec_len(load64(fr));
-}
-
-fn frame_resources_texture_count(fr) {
     return vec_len(load64(fr + 8));
 }
 
+fn frame_resources_texture_count(fr) {
+    return vec_len(load64(fr + 16));
+}
+
+# Pop every tracked handle without releasing. Useful when the
+# caller has already done backend-specific cleanup and just wants
+# to reset the tracker. Identical to the v2.x behaviour; preserved
+# for legacy callers that managed release manually.
 fn frame_resources_clear(fr) {
-    var bufs = load64(fr);
+    var bufs = load64(fr + 8);
     while (vec_len(bufs) > 0) { vec_pop(bufs); }
-    var texs = load64(fr + 8);
+    var texs = load64(fr + 16);
     while (vec_len(texs) > 0) { vec_pop(texs); }
     return 0;
+}
+
+# Pop every tracked buffer handle and dispatch
+# gpu_buffer_release(ctx, h) for each. Routes through
+# ctx->backend->buffer_release, so it works for both wgpu and
+# native backends. Returns the number of buffers released.
+#
+# Requires that the FrameResources was created with
+# frame_resources_new_for(ctx); on a legacy frame_resources_new()
+# instance (ctx == 0) this is a no-op that returns 0 — caller is
+# expected to handle release themselves in that case.
+#
+# Texture release is not yet dispatchable through the Backend
+# interface (the texture slot lands in Phase C); textures stay
+# tracked but caller-released until then.
+fn frame_resources_release_buffers(fr) {
+    var ctx = load64(fr);
+    if (ctx == 0) { return 0; }
+    var bufs = load64(fr + 8);
+    var n = vec_len(bufs);
+    var i = 0;
+    while (vec_len(bufs) > 0) {
+        var h = vec_pop(bufs);
+        gpu_buffer_release(ctx, h);
+        i = i + 1;
+    }
+    return i;
 }
 
 # --- wgpu_types.cyr ---
@@ -1839,28 +1895,866 @@ fn wgpu_command_encoder_copy_texture_to_buffer(enc, args) {
     return fncall2(_fp(64), enc, args);
 }
 
+# --- backend.cyr ---
+
+# @internal — Backend dispatch interface (v3 Phase B5, ADR 006)
+# backend.cyr — function-pointer table both backends fill, dispatched
+# through ctx->backend at v3.0+.
+#
+# This is the @internal indirection point that lets v3.0 ship two
+# backends behind the same @public surface. Public callers never
+# touch this struct; they call the existing fns in buffer.cyr,
+# compute.cyr, etc., which (post-refactor) dispatch through
+# ctx->backend->slot via fncallN.
+#
+# Anchor: this layout hosts what programs/native_compute_store.cyr
+# proved end-to-end on AMD Cezanne 2026-04-28 — every operation that
+# flow exercised gets a slot. Texture / render pipeline / surface
+# slots are deferred until each has a working native e2e program;
+# adding them with stub-`return GPU_ERR_NOT_IMPLEMENTED` bodies is
+# explicitly out of scope (see docs/proposals/v3-backend-interface.md).
+#
+# Backend struct layout (176 bytes — 21 fnptr slots + 1 kind value):
+#
+# v0 (Step 1, 88 bytes):
+#   +0:  ctx_create_from_preinit  fnptr (preinit_ptr)            -> ctx
+#   +8:  ctx_release              fnptr (ctx)                    -> 0
+#   +16: buffer_create            fnptr (ctx, size, usage)       -> buf
+#   +24: buffer_write             fnptr (ctx, buf, off, ptr, n)  -> 0|err
+#   +32: buffer_read              fnptr (ctx, buf, off, ptr, n)  -> 0|err
+#   +40: buffer_release           fnptr (ctx, buf)               -> 0
+#   +48: shader_module_create     fnptr (ctx, bytes_ptr, n)      -> mod
+#   +56: shader_module_release    fnptr (ctx, mod)               -> 0
+#   +64: compute_dispatch         fnptr (ctx, mod, x, y, z, bp)  -> 0|err
+#   +72: device_wait_idle         fnptr (ctx)                    -> 0
+#   +80: kind                     u64   value: BACKEND_KIND_*
+#
+# v1 texture slots (Step 5.4, +32 bytes):
+#   +88:  texture_create_2d_rgba8 fnptr (ctx, w, h)              -> tex_ptr
+#   +96:  texture_write           fnptr (ctx, tex, src, n)       -> 0|err
+#   +104: texture_read            fnptr (ctx, tex, dst, n)       -> 0|err
+#   +112: texture_release         fnptr (ctx, tex)               -> 0
+#
+# v2 render slots (Step 6.8a, +56 bytes):
+#   +120: render_target_create_2d_rgba8  fnptr (ctx, w, h)                 -> rt_ptr
+#   +128: render_target_release          fnptr (ctx, rt)                   -> 0
+#   +136: render_pipeline_create         fnptr (ctx, vs_mod, fs_mod, fmt)  -> pipe
+#   +144: render_pipeline_release        fnptr (ctx, pipe)                 -> 0
+#   +152: render_pass_begin              fnptr (ctx, rt, clear_color_ptr)  -> pass
+#   +160: render_pass_draw               fnptr (ctx, pass, pipe, vc, ic)   -> 0|err
+#   +168: render_pass_end                fnptr (ctx, pass)                 -> 0
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA (mabda Color
+# shape) — WGPUColor in webgpu.h v29 is {double r,g,b,a;}, not a
+# packed u32. See docs/proposals/v3-backend-interface.md v2.1.
+#
+# Native side: pipeline state splits into pipeline_sh_block +
+# pipeline_ctx_block (built at pipeline_create) + pass_target_block
+# (built at pass_begin) + per-draw tail. Single-block pipeline cache
+# was an early-draft mistake; matches Mesa radv ctx_cs/cs cut.
+#
+# The kind field at +80 is a u64 value, not a fnptr — kind is
+# invariant per backend, so storing it directly saves an indirect
+# call on every kind query. All other slots are fnptr.
+#
+# Cyrius-fn-to-Cyrius-fn fncall through a struct slot is the
+# fundamental shape this interface relies on. The v2.x codebase
+# only uses fncallN against extern-C function pointers (wgpu_ffi.cyr).
+# tests/tcyr/mabda.tcyr::test_backend_fncall_through_slot_smoke
+# proves the shape works in Cyrius-to-Cyrius before any backend
+# implementation depends on it. If that test ever fails, the entire
+# backend abstraction is unviable — bail out to a different design.
+
+# ================================================================
+# Backend kind constants
+# ================================================================
+# Reserved up front for v4.0 (NVIDIA) and v5.0 (Intel). Adding the
+# constants now means downstream code can pattern-match on every
+# vendor we plan to ship without churning enum values later.
+
+enum BackendKind {
+    BACKEND_KIND_NULL    = 0;
+    BACKEND_KIND_WGPU    = 1;
+    BACKEND_KIND_AMD     = 2;
+    BACKEND_KIND_NVIDIA  = 3;
+    BACKEND_KIND_INTEL   = 4;
+}
+
+# ================================================================
+# Backend selector (v3 Step 4e, ADR 006) — compile-time choice
+# ================================================================
+# Default: BACKEND_KIND_WGPU. Consumers that want the native AMD
+# path edit this constant to BACKEND_KIND_AMD before building, then
+# rebuild. gpu_context_from_preinit() in src/context.cyr reads this
+# and routes to gpu_context_new_native() when set to AMD. Explicit
+# entry points (gpu_context_new_native) are also available for
+# programs that need to opt in regardless of the global default.
+#
+# v3.1+ may promote this to a `cyrius.cyml` flag if consumer CI
+# matrices need per-build switching without editing the source.
+# Proposal: docs/proposals/v3-backend-interface.md.
+var MABDA_BACKEND_KIND = BACKEND_KIND_WGPU;
+
+# ================================================================
+# Slot byte offsets
+# ================================================================
+# Use these constants instead of raw integers when reading / writing
+# slots. The slot offsets are part of the load-bearing struct layout;
+# tests/tcyr asserts each one against its expected value.
+
+var BACKEND_SLOT_CTX_CREATE_FROM_PREINIT = 0;
+var BACKEND_SLOT_CTX_RELEASE             = 8;
+var BACKEND_SLOT_BUFFER_CREATE           = 16;
+var BACKEND_SLOT_BUFFER_WRITE            = 24;
+var BACKEND_SLOT_BUFFER_READ             = 32;
+var BACKEND_SLOT_BUFFER_RELEASE          = 40;
+var BACKEND_SLOT_SHADER_MODULE_CREATE    = 48;
+var BACKEND_SLOT_SHADER_MODULE_RELEASE   = 56;
+var BACKEND_SLOT_COMPUTE_DISPATCH        = 64;
+var BACKEND_SLOT_DEVICE_WAIT_IDLE        = 72;
+var BACKEND_SLOT_KIND                    = 80;
+
+# v1 texture slots (Step 5.4) — appended after KIND. Append-after-
+# kind keeps every v0 slot offset stable so existing layout tests
+# pass unchanged. Per docs/proposals/v3-backend-interface.md.
+var BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8 = 88;
+var BACKEND_SLOT_TEXTURE_WRITE           = 96;
+var BACKEND_SLOT_TEXTURE_READ            = 104;
+var BACKEND_SLOT_TEXTURE_RELEASE         = 112;
+
+# v2 render slots (Step 6.8a) — appended after the texture range.
+# Same append-after-kind invariant: every v0/v1 slot offset stays
+# put. Per docs/proposals/v3-backend-interface.md v2.1.
+var BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8 = 120;
+var BACKEND_SLOT_RENDER_TARGET_RELEASE         = 128;
+var BACKEND_SLOT_RENDER_PIPELINE_CREATE        = 136;
+var BACKEND_SLOT_RENDER_PIPELINE_RELEASE       = 144;
+var BACKEND_SLOT_RENDER_PASS_BEGIN             = 152;
+var BACKEND_SLOT_RENDER_PASS_DRAW              = 160;
+var BACKEND_SLOT_RENDER_PASS_END               = 168;
+
+var BACKEND_SIZE                         = 176;
+
+# v0 fnptr block ends at +80 (the KIND value sits there). Layout
+# assertions and the v0 portion of backend_is_complete() iterate
+# 0..80. Kept stable so v0 tests don't need to change.
+var BACKEND_FNPTR_SLOTS_END              = 80;
+
+# v1 texture fnptr block: 88..120. Treated as a second range by
+# backend_is_complete() so the kind value at +80 isn't mistaken
+# for a missing fnptr.
+var BACKEND_TEXTURE_SLOTS_BEGIN          = 88;
+var BACKEND_TEXTURE_SLOTS_END            = 120;
+
+# v2 render fnptr block: 120..176. Treated as a third range by
+# backend_is_complete() so kind at +80 stays unambiguous and v0/v1
+# tests don't have to know about the new slots.
+var BACKEND_RENDER_SLOTS_BEGIN           = 120;
+var BACKEND_RENDER_SLOTS_END             = 176;
+
+# ================================================================
+# Backend struct construction
+# ================================================================
+
+# Allocate a zero-initialized Backend. Caller fills slots before
+# wiring it into a GpuContext.
+fn backend_new() {
+    var b = alloc(BACKEND_SIZE);
+    memset(b, 0, BACKEND_SIZE);
+    return b;
+}
+
+# ================================================================
+# Slot setters / getters
+# ================================================================
+# Generic slot access. Specialized wrapper calls — e.g.
+# backend_compute_dispatch(b, ctx, mod, x, y, z, bp) — will land in
+# subsequent steps once the wgpu and native backend implementations
+# go in. Step 1 only needs the raw shape.
+
+fn backend_set_slot(b, off, fnptr) {
+    store64(b + off, fnptr);
+    return 0;
+}
+
+fn backend_get_slot(b, off) {
+    return load64(b + off);
+}
+
+fn backend_set_kind(b, kind) {
+    store64(b + BACKEND_SLOT_KIND, kind);
+    return 0;
+}
+
+fn backend_kind(b) {
+    return load64(b + BACKEND_SLOT_KIND);
+}
+
+# ================================================================
+# Completeness check
+# ================================================================
+# Returns 1 if every fnptr slot is non-zero. Does NOT check the
+# kind value — kind == BACKEND_KIND_NULL is a separate condition
+# that callers can check independently. Used by backend builders
+# to assert post-conditions during context init.
+
+fn backend_is_complete(b) {
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        if (load64(b + off) == 0) { return 0; }
+        off = off + 8;
+    }
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        if (load64(b + off2) == 0) { return 0; }
+        off2 = off2 + 8;
+    }
+    # v2 render slots — Step 6.8b extended the walk now that
+    # backend_wgpu_new fills the render range. backend_native_new
+    # gets the same treatment in Step 6.8c (gated on 6.2 + 6.5 + 6.6).
+    # Until then native callers will see is_complete = 0 and any
+    # caller that asserts completeness on a native backend without
+    # 6.8c needs to know it's pre-v2 territory.
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        if (load64(b + off3) == 0) { return 0; }
+        off3 = off3 + 8;
+    }
+    return 1;
+}
+
+# ================================================================
+# Smoke test helper
+# ================================================================
+# Mounted on a backend slot in tests/tcyr to prove Cyrius-fn-via-
+# fnptr-via-struct-slot dispatch works. Returns sentinel + arg so
+# the assertion can verify the slot's fnptr was actually called
+# (and called with the right arg). Sentinel is 0xBA67E47D — chosen
+# to not collide with common error codes or low addresses.
+
+var BACKEND_SMOKE_SENTINEL = 0xBA67E47D;
+
+fn _backend_smoke_sentinel(arg) {
+    return BACKEND_SMOKE_SENTINEL + arg;
+}
+
+# --- backend_wgpu.cyr ---
+
+# @internal — wgpu Backend implementation (v3 Phase B5, ADR 006)
+# backend_wgpu.cyr — fills the Backend interface (src/backend.cyr)
+# with thin wrappers around the existing wgpu FFI + descriptors.
+#
+# Step 2 scope: land the wrapper fns + a backend_wgpu_new() builder
+# that produces a complete Backend (all 10 fnptr slots set, kind =
+# BACKEND_KIND_WGPU). The wrappers are not yet driven by the public
+# API in buffer.cyr / compute.cyr / etc. — that's Step 3's refactor.
+# Until then this module is reachable only through backend_wgpu_new()
+# and the layout/completeness tests in tests/tcyr.
+#
+# Slot signatures (from docs/proposals/v3-backend-interface.md):
+#   ctx_create_from_preinit (preinit_ptr)             -> ctx
+#   ctx_release             (ctx)                     -> 0
+#   buffer_create           (ctx, size, usage)        -> buf
+#   buffer_write            (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_read             (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_release          (ctx, buf)                -> 0
+#   shader_module_create    (ctx, bytes_ptr, n)       -> shmod
+#   shader_module_release   (ctx, shmod)              -> 0
+#   compute_dispatch        (ctx, shmod, x, y, z, bp) -> 0|err  (STUB in Step 2)
+#   device_wait_idle        (ctx)                     -> 0
+#
+# Note: Cyrius reserves `mod` as an operator-position keyword, so the
+# shader-module parameter is named `shmod` here (and in the Backend
+# slot type comments). The slot semantics are unchanged.
+
+# ================================================================
+# Context
+# ================================================================
+# Slot signature: "raw ctx pointer or 0 on failure". This wrapper
+# does the wgpu-specific bookkeeping (validate preinit fields,
+# allocate the 40-byte GpuContext, copy instance/adapter/device/
+# queue from the C launcher's preinit struct). It does NOT call
+# the public gpu_context_from_preinit — that fn now allocates a
+# backend and dispatches *into* this slot, so calling it back would
+# recurse forever. The +32 backend slot in the ctx struct is left
+# zero; the public caller fills it after the slot returns.
+
+fn _backend_wgpu_ctx_create_from_preinit(preinit_ptr) {
+    if (preinit_ptr == 0) { return 0; }
+    var instance = load64(preinit_ptr);
+    var adapter  = load64(preinit_ptr + 8);
+    var device   = load64(preinit_ptr + 16);
+    var queue    = load64(preinit_ptr + 24);
+    if (instance == 0) { return 0; }
+    if (adapter == 0)  { return 0; }
+    if (device == 0)   { return 0; }
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    store64(ctx,      instance);
+    store64(ctx + 8,  adapter);
+    store64(ctx + 16, device);
+    store64(ctx + 24, queue);
+    return ctx;
+}
+
+# Slot signature: "release ctx, return 0". Releases the wgpu
+# handles directly (does NOT call public gpu_context_release —
+# that fn now dispatches *into* this slot). The backend ptr at
+# +32 is owned by the caller; this wrapper does not touch it.
+
+fn _backend_wgpu_ctx_release(ctx) {
+    if (ctx == 0) { return 0; }
+    var device = load64(ctx + 16);
+    var adapter = load64(ctx + 8);
+    var instance = load64(ctx);
+    if (device != 0)   { wgpu_device_release(device); }
+    if (adapter != 0)  { wgpu_adapter_release(adapter); }
+    if (instance != 0) { wgpu_instance_release(instance); }
+    return 0;
+}
+
+# ================================================================
+# Buffer
+# ================================================================
+# v0 slot signatures don't carry a label — pass NULL to the wgpu
+# descriptor builder, which short-circuits the StringView write.
+# Step 3 may revise the slot to take a label if profiling / debug
+# tooling needs one.
+
+fn _backend_wgpu_buffer_create(ctx, size, usage) {
+    var device = gpu_ctx_device(ctx);
+    var desc = wgpu_buffer_descriptor(0, usage, size, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+fn _backend_wgpu_buffer_write(ctx, buf, off, ptr, n) {
+    var queue = gpu_ctx_queue(ctx);
+    wgpu_queue_write_buffer(queue, buf, off, ptr, n);
+    return 0;
+}
+
+# Synchronous read. Stages an internal MAP_READ buffer, copies
+# n bytes from buf+off into it, maps, memcpy's into the caller's
+# ptr, and releases. Inlined here (rather than calling buffer.cyr's
+# read_buffer_capped) so backend_wgpu.cyr stays placement-independent
+# in the include chain. The 256 MB cap matches the buffer.cyr
+# default — anything larger requires a bespoke streaming path.
+var _BACKEND_WGPU_READ_CAP = 268435456;
+
+fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n) {
+    if (n <= 0)                     { return GPU_ERR_BUFFER; }
+    if (n > _BACKEND_WGPU_READ_CAP) { return GPU_ERR_BUFFER; }
+    var src_size = wgpu_buffer_get_size(buf);
+    if (off < 0)                    { return GPU_ERR_BUFFER; }
+    if (off + n > src_size)         { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buf, off, staging, 0, n);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(ptr, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
+}
+
+fn _backend_wgpu_buffer_release(ctx, buf) {
+    if (ctx == 0) { return 0; }
+    wgpu_buffer_release(buf);
+    return 0;
+}
+
+# ================================================================
+# Shader module
+# ================================================================
+# v0 slot takes (bytes_ptr, n). For wgpu, bytes are WGSL UTF-8.
+# We don't enforce null-termination — wgpu_string_view bounds
+# strlen() at WGPU_LABEL_MAX_BYTES (4 KB) so non-terminated input
+# fails gracefully rather than walking off mapped memory. Real
+# WGSL programs can exceed that 4 KB though; this is a Step-3-era
+# follow-up to pass an explicit length to wgpu_string_view_len.
+
+fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n) {
+    if (ctx == 0)       { return 0; }
+    if (bytes_ptr == 0) { return 0; }
+    if (n <= 0)         { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var src = wgpu_shader_source_wgsl(bytes_ptr);
+    var desc = wgpu_shader_module_descriptor(0, src);
+    return wgpu_device_create_shader_module(device, desc);
+}
+
+fn _backend_wgpu_shader_module_release(ctx, shmod) {
+    if (ctx == 0) { return 0; }
+    wgpu_shader_module_release(shmod);
+    return 0;
+}
+
+# ================================================================
+# Texture slots — wgpu wrappers (Step 5.5)
+# ================================================================
+# Returns a 32-byte struct in the same shape src/texture.cyr uses
+# elsewhere in the codebase, so the wgpu side stays consistent:
+#   +0:  handle   (WGPUTexture, u64)
+#   +8:  view     (WGPUTextureView, u64)
+#   +16: sampler  (WGPUSampler — unused for plain write/read; kept
+#                  for shape-compat with src/texture.cyr; zero here)
+#   +24: width    (u32)
+#   +28: height   (u32)
+#
+# Step 5.5 limit: width must be a multiple of 64 (so bytes_per_row =
+# width*4 satisfies wgpu's COPY_BUFFER_ALIGNMENT = 256 on the read
+# path). Real consumer flows already match this — render_e2e uses
+# 256x256. Sub-64 widths need a row-padded staging buffer; deferred.
+
+fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
+              | WGPU_TEXTURE_USAGE_COPY_DST
+              | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var desc = wgpu_texture_descriptor(0, usage,
+                                       WGPU_TEXTURE_DIMENSION_2D,
+                                       width, height,
+                                       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+                                          WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                                          WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store64(t + 16, 0);
+    store32(t + 24, width);
+    store32(t + 28, height);
+    return t;
+}
+
+fn _backend_wgpu_texture_write(ctx, tex, src, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+    var dst_info = wgpu_texel_copy_texture_info(handle, 0);
+    var layout = wgpu_texel_copy_buffer_layout(0, width * 4, height);
+    var extent = wgpu_extent_3d(width, height, 1);
+    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
+    return 0;
+}
+
+fn _backend_wgpu_texture_read(ctx, tex, dst, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+
+    # Stage the readback through a MAP_READ buffer.
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ
+                      | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    # Build copy_texture_to_buffer args (72-byte struct layout —
+    # see src/wgpu_ffi.cyr / programs/render_e2e.cyr for the field
+    # offsets).
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs +  0, handle);
+    store32(cargs +  8, 0);   # src mip
+    store32(cargs + 12, 0);   # origin x
+    store32(cargs + 16, 0);   # origin y
+    store32(cargs + 20, 0);   # origin z
+    store32(cargs + 24, 0);   # aspect = All
+    store64(cargs + 32, staging);
+    store64(cargs + 40, 0);
+    store32(cargs + 48, width * 4);
+    store32(cargs + 52, height);
+    store32(cargs + 56, width);
+    store32(cargs + 60, height);
+    store32(cargs + 64, 1);
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_texture_to_buffer(encoder, cargs);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging,
+                                       WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(dst, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
+}
+
+fn _backend_wgpu_texture_release(ctx, tex) {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { return 0; }
+    var handle = load64(tex +  0);
+    var view   = load64(tex +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(tex +  0, 0);
+    store64(tex +  8, 0);
+    store32(tex + 24, 0);
+    store32(tex + 28, 0);
+    return 0;
+}
+
+# ================================================================
+# Compute dispatch — STUB for Step 2
+# ================================================================
+# Full assembly (compute pipeline + bind group from bindings_ptr +
+# command encoder + compute pass + dispatch + submit) requires the
+# bindings_ptr format to be locked in and the public compute API in
+# src/compute.cyr to dispatch through this slot. Both are Step 3
+# work — see docs/development/3-0-punchlist.md.
+#
+# Step 2 returns GPU_ERR_OTHER unconditionally. The slot is filled
+# (backend_is_complete returns 1) but calling it through fncall
+# until Step 3 lands is a programming error. CPU tests do not call
+# this slot.
+
+fn _backend_wgpu_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    return GPU_ERR_OTHER;
+}
+
+# ================================================================
+# Device wait
+# ================================================================
+# wgpu_device_poll(device, wait=1) blocks until all submitted work
+# completes. Slot returns 0 on completion.
+
+fn _backend_wgpu_device_wait_idle(ctx) {
+    if (ctx == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    wgpu_device_poll(device, 1);
+    return 0;
+}
+
+# ================================================================
+# Render slots — v2 (Step 6.8b)
+# ================================================================
+# 7 wrappers around the existing wgpu render helpers in
+# render_target.cyr / render_pipeline.cyr / render_pass.cyr. Slot
+# signatures from docs/proposals/v3-backend-interface.md v2.1.
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA — same shape as
+# mabda's Color (src/color.cyr) and as WGPUColor in webgpu.h v29.
+# rpb_pass_color reads it via color_r/g/b/a getters which are
+# load64 at +0/+8/+16/+24, so the slot can pass the raw pointer
+# straight through.
+#
+# Pipeline struct (16 bytes) — opaque to slot caller:
+#   +0:  handle  (WGPURenderPipeline)
+#   +8:  reserved
+#
+# Pass struct (32 bytes) — opaque to slot caller:
+#   +0:  encoder (WGPUCommandEncoder)
+#   +8:  pass    (WGPURenderPassEncoder)
+#   +16: rt_ptr  (back-reference; the rt outlives the pass)
+#   +24: reserved
+
+fn _backend_wgpu_render_target_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT
+              | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+              | WGPU_TEXTURE_USAGE_COPY_SRC;
+    var desc = wgpu_texture_descriptor(0, usage,
+                                       WGPU_TEXTURE_DIMENSION_2D,
+                                       width, height,
+                                       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+                                          WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+                                          WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var rt = alloc(32);
+    memset(rt, 0, 32);
+    store64(rt +  0, handle);
+    store64(rt +  8, view);
+    store64(rt + 16, 0);
+    store32(rt + 24, width);
+    store32(rt + 28, height);
+    return rt;
+}
+
+fn _backend_wgpu_render_target_release(ctx, rt) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    var handle = load64(rt +  0);
+    var view   = load64(rt +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(rt +  0, 0);
+    store64(rt +  8, 0);
+    store32(rt + 24, 0);
+    store32(rt + 28, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
+    if (ctx == 0) { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var fmt = color_fmt;
+    if (fmt == 0) { fmt = WGPU_TEXTURE_FORMAT_RGBA8_UNORM; }
+
+    var desc = alloc(168);
+    memset(desc, 0, 168);
+    wgpu_string_view_null(desc + 8);
+    store64(desc + 24, 0);
+    _vertex_state_init(desc + 32, vs_mod, "vs_main");
+    _primitive_state_init(desc + 96, WGPU_TOPOLOGY_TRIANGLE_LIST,
+                                       WGPU_FRONT_FACE_CCW,
+                                       WGPU_CULL_MODE_NONE);
+    store64(desc + 128, 0);
+    _multisample_state_init(desc + 136, 1);
+    var color_target = _color_target_state_new(fmt, 0);
+    var fragment = _fragment_state_new(fs_mod, "fs_main", color_target);
+    store64(desc + 160, fragment);
+
+    var handle = wgpu_device_create_render_pipeline(device, desc);
+    if (handle == 0) { return 0; }
+    var pipe = alloc(16);
+    memset(pipe, 0, 16);
+    store64(pipe + 0, handle);
+    return pipe;
+}
+
+fn _backend_wgpu_render_pipeline_release(ctx, pipe) {
+    if (ctx == 0) { return 0; }
+    if (pipe == 0) { return 0; }
+    var handle = load64(pipe + 0);
+    if (handle != 0) { wgpu_render_pipeline_release(handle); }
+    store64(pipe + 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var view = load64(rt + 8);
+    if (view == 0) { return 0; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) { return 0; }
+
+    var pb = rpb_pass_new();
+    rpb_pass_color(pb, view, clear_color_ptr);
+    var pass = rpb_pass_begin(encoder, pb);
+    if (pass == 0) {
+        wgpu_command_encoder_release(encoder);
+        return 0;
+    }
+
+    var p = alloc(32);
+    memset(p, 0, 32);
+    store64(p +  0, encoder);
+    store64(p +  8, pass);
+    store64(p + 16, rt);
+    return p;
+}
+
+fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    var pass_enc = load64(pass + 8);
+    var pipe_handle = load64(pipe + 0);
+    if (pass_enc == 0)    { return GPU_ERR_OTHER; }
+    if (pipe_handle == 0) { return GPU_ERR_OTHER; }
+    wgpu_render_pass_encoder_set_pipeline(pass_enc, pipe_handle);
+    wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_end(ctx, pass) {
+    if (ctx == 0) { return 0; }
+    if (pass == 0) { return 0; }
+    var encoder  = load64(pass +  0);
+    var pass_enc = load64(pass +  8);
+    if (pass_enc != 0) { wgpu_render_pass_encoder_end(pass_enc); }
+    if (encoder != 0) {
+        var queue = gpu_ctx_queue(ctx);
+        var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+        if (cmd_buf != 0) { wgpu_queue_submit_one(queue, cmd_buf); }
+        wgpu_command_encoder_release(encoder);
+    }
+    if (pass_enc != 0) { wgpu_render_pass_encoder_release(pass_enc); }
+    store64(pass +  0, 0);
+    store64(pass +  8, 0);
+    store64(pass + 16, 0);
+    return 0;
+}
+
+# ================================================================
+# Builder
+# ================================================================
+# Allocates a Backend, fills all 21 fnptr slots with the wrapper
+# functions above, and sets kind = BACKEND_KIND_WGPU. Caller owns
+# the returned pointer; pair with backend release once that exists
+# (none required today — the bump allocator reclaims at process
+# end; persistent allocators land in Step 4 / Phase B.4 follow-ups).
+
+fn backend_wgpu_new() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+                     &_backend_wgpu_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_wgpu_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_backend_wgpu_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_backend_wgpu_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+                     &_backend_wgpu_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_backend_wgpu_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+                     &_backend_wgpu_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+                     &_backend_wgpu_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+                     &_backend_wgpu_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_wgpu_device_wait_idle);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
+                     &_backend_wgpu_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
+                     &_backend_wgpu_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
+                     &_backend_wgpu_texture_read);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
+                     &_backend_wgpu_texture_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+                     &_backend_wgpu_render_target_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+                     &_backend_wgpu_render_target_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+                     &_backend_wgpu_render_pipeline_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+                     &_backend_wgpu_render_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+                     &_backend_wgpu_render_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+                     &_backend_wgpu_render_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+                     &_backend_wgpu_render_pass_end);
+    backend_set_kind(b, BACKEND_KIND_WGPU);
+    return b;
+}
+
 # --- context.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
-
-# GpuContext struct layout (32 bytes):
-#   +0:  instance (WGPUInstance, 8)
-#   +8:  adapter  (WGPUAdapter, 8)
-#   +16: device   (WGPUDevice, 8)
-#   +24: queue    (WGPUQueue, 8)
+#
+# GpuContext struct layout (96 bytes — grew from 48 at v3 Step 4f.iv):
+#   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
+#   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
+#   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
+#   +24: queue    / stub_va     (wgpu: WGPUQueue    | native: stub BO VA)
+#   +32: backend  (Backend*, 8) — @internal dispatch table
+#   +40: stub_addr  (8)         — native: stub BO CPU mmap; zero on wgpu
+#   +48: ib_handle  (8)         — native: per-context IB BO handle (Step 4f.iv)
+#   +56: ib_va      (8)         — native: IB BO GPU VA
+#   +64: ib_addr    (8)         — native: IB BO CPU mmap (memcpy PM4 here)
+#   +72: fence_handle (8)       — native: per-context fence BO handle
+#   +80: fence_va   (8)         — native: fence BO GPU VA
+#   +88: fence_addr (8)         — native: fence BO CPU mmap (pre-zero seqno slot)
+#
+# The dual interpretation of +0..+24 is documented in
+# src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
+# you which view applies. Native-side accessors live in
+# src/backend_native.cyr (native_ctx_fd / _id / _stub_handle /
+# _stub_va). The +32 backend ptr is always a Backend struct.
 
 fn gpu_ctx_instance(ctx) { return load64(ctx); }
 fn gpu_ctx_adapter(ctx)  { return load64(ctx + 8); }
 fn gpu_ctx_device(ctx)   { return load64(ctx + 16); }
 fn gpu_ctx_queue(ctx)    { return load64(ctx + 24); }
+fn gpu_ctx_backend(ctx)  { return load64(ctx + 32); }
 
 # Create from pre-initialized handles (C launcher fills these).
 # Failure paths route through gpu_err_result, which already emits a
 # sakshi event when observability is enabled. The success path emits
 # its own info-level event for the trace consumer (v2.4.1).
+#
+# Step 4e: branches on MABDA_BACKEND_KIND (set in src/lib.cyr).
+# Default = BACKEND_KIND_WGPU (v2.x behaviour preserved). Setting
+# the constant to BACKEND_KIND_AMD makes this fn route to
+# gpu_context_new_native() — preinit_ptr is ignored on that path
+# (the C launcher's preinit struct is wgpu-shaped). Programs that
+# want to opt into the native path explicitly without touching the
+# global default can call gpu_context_new_native() directly.
 fn gpu_context_from_preinit(preinit_ptr) {
+    if (MABDA_BACKEND_KIND == BACKEND_KIND_AMD) {
+        return gpu_context_new_native();
+    }
     if (preinit_ptr == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     var instance = load64(preinit_ptr);
     var adapter  = load64(preinit_ptr + 8);
@@ -1869,23 +2763,1700 @@ fn gpu_context_from_preinit(preinit_ptr) {
     if (instance == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (adapter == 0)  { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (device == 0)   { return gpu_err_result(GPU_ERR_DEVICE_REQUEST); }
-    var ctx = alloc(32);
-    store64(ctx, instance);
-    store64(ctx + 8, adapter);
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    store64(ctx,      instance);
+    store64(ctx + 8,  adapter);
     store64(ctx + 16, device);
     store64(ctx + 24, queue);
+    store64(ctx + 32, backend_wgpu_new());
     _sk_info_cstr("mabda: gpu context created");
     return gpu_ok(ctx);
 }
 
+# Bring up a native (AMD/amdgpu) GpuContext. Opens /dev/dri/renderD128,
+# allocates an amdgpu context id, creates and va-maps a 4 KiB stub BO
+# at the canonical-high stub VA (Mesa scratch V# reference point), and
+# attaches a backend_native_new() at the backend slot. Returns
+# Result<ctx>.
+#
+# Stub BO note: the stub is owned by the GpuContext but its mmap
+# address is not stored. On gpu_context_release, _backend_native_ctx_release
+# closes the fd, which kicks the kernel into auto-releasing the BO.
+# This is acceptable for v3.0 (process-lifetime contexts); revisit if
+# long-lived create/destroy cycles ever surface.
+var _NATIVE_STUB_VA   = 0xFFFF800100004000;
+var _NATIVE_STUB_SIZE = 4096;
+
+# Per-context cached IB + fence (Step 4f.iv). Allocated once in
+# gpu_context_new_native, reused across every dispatch through
+# native_compute_dispatch_simple. Released in
+# _backend_native_ctx_release. Avoids ~7 syscalls of BO churn per
+# dispatch (alloc/va_map/munmap/va_unmap/close × 2 BOs + syncobj).
+var _NATIVE_IB_VA     = 0xFFFF800100200000;
+var _NATIVE_IB_SIZE   = 4096;
+var _NATIVE_FENCE_VA  = 0xFFFF800100600000;
+var _NATIVE_FENCE_SIZE = 4096;
+
+fn gpu_context_new_native() {
+    var fd = native_open_render_node();
+    if (fd < 0) {
+        return gpu_err_result(_native_neg_rc_to_gpu_err(fd));
+    }
+
+    var ctx_req[16];
+    var rc = native_ctx_alloc(fd, &ctx_req);
+    if (rc != 0) {
+        var rc_save = rc;
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var ctx_id = native_ctx_alloc_id(&ctx_req);
+
+    var stub_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_STUB_SIZE, &stub_bo);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var stub_handle = load64(&stub_bo + 0);
+    var stub_map    = load64(&stub_bo + 8);
+    memset(stub_map, 0, _NATIVE_STUB_SIZE);
+
+    rc = native_gem_va_map(fd, stub_handle, _NATIVE_STUB_VA,
+                           _NATIVE_STUB_SIZE, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    # Step 4f.iv: allocate the per-context IB + fence BOs once
+    # (cached for reuse across dispatches).
+    var ib_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_IB_SIZE, &ib_bo);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var ib_handle = load64(&ib_bo + 0);
+    var ib_map    = load64(&ib_bo + 8);
+    rc = native_gem_va_map(fd, ib_handle, _NATIVE_IB_VA,
+                           _NATIVE_IB_SIZE, _NATIVE_PERM_IB);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var fence_bo[16];
+    rc = native_bo_create_gtt(fd, _NATIVE_FENCE_SIZE, &fence_bo);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var fence_handle = load64(&fence_bo + 0);
+    var fence_map    = load64(&fence_bo + 8);
+    memset(fence_map, 0, _NATIVE_FENCE_SIZE);
+    rc = native_gem_va_map(fd, fence_handle, _NATIVE_FENCE_VA,
+                           _NATIVE_FENCE_SIZE, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, fence_handle, fence_map, _NATIVE_FENCE_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
+        native_ctx_free(fd, ctx_id);
+        sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var ctx = alloc(96);
+    memset(ctx, 0, 96);
+    store64(ctx +  0, fd);
+    store64(ctx +  8, ctx_id);
+    store64(ctx + 16, stub_handle);
+    store64(ctx + 24, _NATIVE_STUB_VA);
+    store64(ctx + 32, backend_native_new());
+    store64(ctx + 40, stub_map);
+    store64(ctx + 48, ib_handle);
+    store64(ctx + 56, _NATIVE_IB_VA);
+    store64(ctx + 64, ib_map);
+    store64(ctx + 72, fence_handle);
+    store64(ctx + 80, _NATIVE_FENCE_VA);
+    store64(ctx + 88, fence_map);
+    _sk_info_cstr("mabda: gpu context created (native)");
+    return gpu_ok(ctx);
+}
+
+# Step 3b: dispatches through ctx->backend->ctx_release. The slot
+# wrapper in src/backend_wgpu.cyr does the wgpu_*_release calls;
+# the native counterpart in src/backend_native.cyr frees ctx_id and
+# closes the DRM fd (which kicks the kernel into auto-releasing the
+# stub BO). Public callers see the same behaviour as v2.x, but the
+# per-backend release path is now under the abstraction.
 fn gpu_context_release(ctx) {
     if (ctx == 0) { return 0; }
-    wgpu_device_release(gpu_ctx_device(ctx));
-    wgpu_adapter_release(gpu_ctx_adapter(ctx));
-    wgpu_instance_release(gpu_ctx_instance(ctx));
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_CTX_RELEASE);
+    fncall1(slot, ctx);
     _sk_info_cstr("mabda: gpu context released");
     return 0;
 }
+
+# Block until all submitted GPU work has completed. Returns 0.
+# Step 3f: dispatches through ctx->backend->device_wait_idle.
+# On wgpu the slot wrapper calls wgpu_device_poll(device, wait=1).
+fn gpu_device_wait_idle(ctx) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    return fncall1(slot, ctx);
+}
+
+# --- backend_native.cyr ---
+
+# @internal — native GPU backend (v3.0, ADR 006)
+# backend_native.cyr — pure-Cyrius GPU backend via direct DRM ioctls
+#
+# v3 Phase B subdivision status:
+#   B.0 — research: done (see ../vidya/content/direct_drm_gpu_compute)
+#   B.1 — device enum + capability query: THIS FILE (current)
+#   B.2 — GEM BO create/map/round-trip: pending
+#   B.3 — pre-compiled compute shader dispatch: pending
+#   B.4 — fence + readback + wgpu parity: pending
+#
+# Path chosen: CS + PM4 via /dev/dri/renderD128 (unified path shared
+# with graphics in Phase C, rather than KFD+AQL compute-only). See
+# design doc docs/proposals/v3-native-api-principles.md Phase B.
+#
+# All data types are i64 / u64 unless noted. drm_version struct layout
+# mirrors include/uapi/drm/drm.h on x86_64 Linux. No libdrm — direct
+# syscall(SYS_IOCTL) only.
+
+# ================================================================
+# Constants
+# ================================================================
+# DRM ioctl encoding mirrors include/uapi/asm-generic/ioctl.h:
+#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
+# Size field is 14 bits, type 8, nr 8, dir 2.
+var _IOC_NONE  = 0;
+var _IOC_WRITE = 1;
+var _IOC_READ  = 2;
+var _IOC_RW    = 3;
+
+# DRM: type 'd' = 0x64
+var DRM_IOCTL_TYPE = 0x64;
+
+# drm_version: nr 0x00, RW, sizeof(struct drm_version) == 64 on x86_64
+#   0x64 | (3 << 30) | (64 << 16) | (0x64 << 8) | 0x00 == 0xC0406400
+var DRM_VERSION_SIZE = 64;
+var DRM_IOCTL_VERSION = 0xC0406400;
+
+# drm_version struct (64 bytes on x86_64):
+#   +0:  version_major      (i32)
+#   +4:  version_minor      (i32)
+#   +8:  version_patchlevel (i32)
+#   +12: pad (4)
+#   +16: name_len  (u64)  — in: buffer capacity; out: required length
+#   +24: name_ptr  (u64)  — caller-allocated char buffer
+#   +32: date_len  (u64)
+#   +40: date_ptr  (u64)
+#   +48: desc_len  (u64)
+#   +56: desc_ptr  (u64)
+
+# Render node path. renderD128 is the first unprivileged render-only
+# node; renderD129+ exist on multi-GPU systems.
+var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
+
+# ================================================================
+# Errno → GpuErr mapping (v3 Step 4f.i)
+# ================================================================
+# Native primitives return 0 on success or negative errno on
+# failure (Linux ABI convention). Slot wrappers and public
+# dispatchers want positive GPU_ERR_* codes from src/error.cyr.
+# Until v3.0 ships, we keep the existing GpuErrCode enum stable
+# and route specific errno values to the closest existing code:
+#
+#   ENOMEM  (12)      → GPU_ERR_BUFFER          (BO alloc OOM)
+#   EPERM   (1)       → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   EACCES  (13)      → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   ENOENT  (2)       → GPU_ERR_ADAPTER_NOT_FOUND (no render node)
+#   EBUSY   (16)      → GPU_ERR_DEVICE_REQUEST   (device contention)
+#   ETIMEDOUT (110)   → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait)
+#   ETIME   (62)      → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait alt)
+#   default           → GPU_ERR_OTHER
+#
+# Adding a new GPU_ERR_* code (e.g. INVALID_ARG, FENCE_TIMEOUT) is
+# a v3.0+1 follow-up — error.cyr enum is part of the @public
+# surface and should not churn during v3.0 stabilisation.
+
+var _NATIVE_ERRNO_EPERM     =   1;
+var _NATIVE_ERRNO_ENOENT    =   2;
+var _NATIVE_ERRNO_ENOMEM    =  12;
+var _NATIVE_ERRNO_EACCES    =  13;
+var _NATIVE_ERRNO_EBUSY     =  16;
+var _NATIVE_ERRNO_ETIME     =  62;
+var _NATIVE_ERRNO_ETIMEDOUT = 110;
+
+# Map a positive errno to a GPU_ERR_* code. Caller passes the
+# absolute value (i.e. converted from negative-rc convention by
+# _native_neg_rc_to_gpu_err below).
+fn _native_errno_to_gpu_err(errno) {
+    if (errno == _NATIVE_ERRNO_ENOMEM)    { return GPU_ERR_BUFFER; }
+    if (errno == _NATIVE_ERRNO_EPERM)     { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EACCES)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_ENOENT)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EBUSY)     { return GPU_ERR_DEVICE_REQUEST; }
+    if (errno == _NATIVE_ERRNO_ETIMEDOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
+    if (errno == _NATIVE_ERRNO_ETIME)     { return GPU_ERR_SURFACE_TIMEOUT; }
+    return GPU_ERR_OTHER;
+}
+
+# Map a negative-errno return code (rc <= 0 convention used by
+# native_* primitives) to 0 (success) or GPU_ERR_*. Pass the rc
+# directly; this fn handles the sign flip + mapping.
+fn _native_neg_rc_to_gpu_err(rc) {
+    if (rc == 0) { return 0; }
+    if (rc > 0)  { return _native_errno_to_gpu_err(rc); }
+    return _native_errno_to_gpu_err(0 - rc);
+}
+
+# ================================================================
+# Helpers
+# ================================================================
+
+# Encode an ioctl number. Public to make the encoding testable.
+# dir ∈ {0=NONE, 1=WRITE, 2=READ, 3=RW}
+# size must fit in 14 bits (masked to 0x3FFF)
+# type, nr are byte-sized (masked to 0xFF)
+fn native_ioc_encode(dir, size, type, nr) {
+    var d = dir & 3;
+    var s = size & 0x3FFF;
+    var t = type & 0xFF;
+    var n = nr & 0xFF;
+    return (d * 0x40000000) | (s * 0x10000) | (t * 0x100) | n;
+}
+
+# Open /dev/dri/renderD128 for read/write. Returns fd on success or
+# the negative errno on failure (Linux syscall convention). No auth
+# needed — render nodes bypass the DRM master/auth dance.
+fn native_open_render_node() {
+    return sys_open(DRM_RENDER_NODE_PATH, O_RDWR, 0);
+}
+
+# Issue DRM_IOCTL_VERSION in two passes against the given fd. First
+# pass collects version_major/minor/patchlevel + required name_len.
+# Second pass writes the driver-name string into a heap-allocated
+# buffer whose address is stored in the caller's struct.
+#
+# `ver` points to a 64-byte caller-allocated region, zeroed by the
+# caller. On success:
+#   ver + 0..12  = version triple (major, minor, patchlevel)
+#   ver + 16     = name_len (actual bytes written)
+#   ver + 24     = pointer to heap name buffer (NUL-terminated string
+#                  of length name_len; caller does not free — alloc()
+#                  memory is process-lifetime in mabda today)
+# Returns 0 on success, negative errno on ioctl failure.
+fn native_drm_version(fd, ver) {
+    # Zero the struct — caller is expected to have done this, but be
+    # defensive since we're about to issue a kernel ioctl.
+    memset(ver, 0, 64);
+
+    # Pass 1: lengths only. All _ptr fields stay 0 so kernel skips
+    # string writes but still reports required lengths.
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+
+    var name_len = load64(ver + 16);
+    if (name_len == 0) { return 0; }
+
+    # Pass 2: allocate a buffer, point name_ptr at it, re-issue.
+    # +1 for a defensive NUL terminator beyond the kernel's writeback.
+    var name_buf = alloc(name_len + 1);
+    memset(name_buf, 0, name_len + 1);
+    store64(ver + 16, name_len);  # capacity
+    store64(ver + 24, name_buf);
+
+    rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+    return 0;
+}
+
+# Convenience: full probe. Opens the render node, reads version,
+# closes fd. Fills `out` (64 bytes) with the drm_version struct.
+# Returns 0 on success, non-zero on failure (open or ioctl).
+fn native_probe_device(out) {
+    var fd = native_open_render_node();
+    if (fd < 0) { return fd; }
+    var rc = native_drm_version(fd, out);
+    sys_close(fd);
+    return rc;
+}
+
+# ================================================================
+# v3 Phase B.2 — GEM buffer object lifecycle (AMDGPU)
+# ================================================================
+# Kernel UAPI reference: /usr/include/drm/amdgpu_drm.h,
+#                        /usr/include/drm/drm.h (for generic GEM_CLOSE).
+# All numbers here are verifiable via native_ioc_encode; tests lock
+# them down in tests/tcyr/mabda.tcyr.
+
+# DRM_COMMAND_BASE = 0x40 in drm.h; AMDGPU driver-specific ioctls
+# start there. We pre-compute the absolute nr for each ioctl.
+var DRM_COMMAND_BASE       = 0x40;
+var DRM_AMDGPU_GEM_CREATE  = 0x00;
+var DRM_AMDGPU_GEM_MMAP    = 0x01;
+
+# Union / struct sizes on x86_64 (in bytes):
+#   union drm_amdgpu_gem_create { in (32) | out (8) } = 32
+#   union drm_amdgpu_gem_mmap   { in (8)  | out (8) } = 8
+#   struct drm_gem_close                              = 8
+var DRM_AMDGPU_GEM_CREATE_SIZE = 32;
+var DRM_AMDGPU_GEM_MMAP_SIZE   = 8;
+var DRM_GEM_CLOSE_SIZE         = 8;
+
+# Absolute ioctl numbers (precomputed; tests verify via native_ioc_encode):
+#   DRM_IOCTL_AMDGPU_GEM_CREATE = _IOWR('d', 0x40, union drm_amdgpu_gem_create)
+#     dir=3, size=32, type=0x64, nr=0x40 → 0xC0206440
+#   DRM_IOCTL_AMDGPU_GEM_MMAP   = _IOWR('d', 0x41, union drm_amdgpu_gem_mmap)
+#     dir=3, size=8, type=0x64, nr=0x41 → 0xC0086441
+#   DRM_IOCTL_GEM_CLOSE         = _IOW ('d', 0x09, struct drm_gem_close)
+#     dir=1, size=8, type=0x64, nr=0x09 → 0x40086409
+var DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440;
+var DRM_IOCTL_AMDGPU_GEM_MMAP   = 0xC0086441;
+var DRM_IOCTL_GEM_CLOSE         = 0x40086409;
+
+# Memory domain flags (bitwise OR for combinations; we only use CPU,
+# GTT, VRAM for Phase B.2 — the rest appear in later phases).
+var AMDGPU_GEM_DOMAIN_CPU      = 0x1;
+var AMDGPU_GEM_DOMAIN_GTT      = 0x2;
+var AMDGPU_GEM_DOMAIN_VRAM     = 0x4;
+
+# GEM BO create. Args are written into `req` (caller-owned 32 bytes,
+# will be zeroed); on success the BO handle is read back from req+0.
+# Returns 0 on success, negative errno on failure.
+#
+# `domains` is a bitmask of AMDGPU_GEM_DOMAIN_*. For a plain
+# CPU-visible buffer (Phase B.2 round-trip), use GTT.
+fn native_gem_create(fd, size, alignment, domains, domain_flags, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_CREATE_SIZE);
+    store64(req + 0,  size);
+    store64(req + 8,  alignment);
+    store64(req + 16, domains);
+    store64(req + 24, domain_flags);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
+}
+
+# Read the handle out of a req buffer that native_gem_create populated.
+fn native_gem_create_handle(req) { return load32(req + 0); }
+
+# GEM BO mmap-offset query. Given a handle, returns the offset to pass
+# as the mmap(2) `offset` argument. `req` is caller-owned 8 bytes.
+# Returns 0 on success (with offset at req+0 on out), negative errno
+# on failure.
+fn native_gem_mmap_offset(fd, handle, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_MMAP_SIZE);
+    store32(req + 0, handle);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
+}
+
+fn native_gem_mmap_offset_value(req) { return load64(req + 0); }
+
+# GEM handle close. Generic DRM ioctl — not AMDGPU-specific.
+# Returns 0 on success, negative errno on failure.
+fn native_gem_close(fd, handle) {
+    var req[8];
+    store32(&req + 0, handle);
+    store32(&req + 4, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_GEM_CLOSE, &req);
+}
+
+# Convenience: create a CPU-visible GTT BO and mmap it. Populates
+# `out` (16 bytes):
+#   +0: handle       (u32 zero-extended to u64)
+#   +8: mapped_addr  (u64 from mmap return, or negative errno on failure)
+# Returns 0 on success, negative errno on failure (out+0 is valid if
+# we got past gem_create but failed at mmap; caller should gem_close
+# the handle in that case).
+fn native_bo_create_gtt(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_GTT, out);
+}
+
+# Shader BOs may need VRAM domain on some hardware — on Cezanne
+# (Vega APU) physical memory is shared, but the domain flag affects
+# residency semantics. Per Mesa rusticl behavior, shader code lives
+# in VRAM-domain BOs.
+fn native_bo_create_vram(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_VRAM, out);
+}
+
+fn _native_bo_create_domain(fd, size, domain, out) {
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+
+    var req[32];
+    # For VRAM-domain on APUs we need CPU_ACCESS_REQUIRED (bit 0) so
+    # the BO lands in BAR-accessible VRAM we can mmap.
+    var flags = 0;
+    if (domain == AMDGPU_GEM_DOMAIN_VRAM) { flags = 1; }  # CPU_ACCESS_REQUIRED
+    var rc = native_gem_create(fd, size, 4096, domain, flags, &req);
+    if (rc != 0) { return rc; }
+    var handle = native_gem_create_handle(&req);
+    store64(out + 0, handle);
+
+    var mreq[8];
+    rc = native_gem_mmap_offset(fd, handle, &mreq);
+    if (rc != 0) { return rc; }
+    var offset = native_gem_mmap_offset_value(&mreq);
+
+    var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+    if (addr < 0) { return addr; }
+    store64(out + 8, addr);
+    return 0;
+}
+
+# Release a BO created via native_bo_create_gtt: munmap, then
+# gem_close. Returns 0 on success.
+fn native_bo_release_gtt(fd, handle, addr, size) {
+    if (addr != 0) { cyr_munmap(addr, size); }
+    if (handle != 0) { native_gem_close(fd, handle); }
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B.3.a — submission infrastructure (ctx, BO list, VA map)
+# ================================================================
+# Prerequisites for DRM_IOCTL_AMDGPU_CS (Phase B.3.d):
+#   1. GPU context — isolates submissions from other processes.
+#   2. BO list — residency tracking (kernel keeps listed BOs live).
+#   3. VA map — gives the BO a virtual address in the process's GPU
+#      address space. Without this the GPU cannot touch the BO.
+# All three are cheap, ioctl-only, no PM4 yet.
+
+var DRM_AMDGPU_CTX      = 0x02;
+var DRM_AMDGPU_BO_LIST  = 0x03;
+var DRM_AMDGPU_GEM_VA   = 0x08;
+
+# Union / struct sizes (bytes):
+#   union drm_amdgpu_ctx       { in(16) | out(16) } = 16
+#   union drm_amdgpu_bo_list   { in(24) | out(8)  } = 24
+#   struct drm_amdgpu_gem_va                        = 64
+#   struct drm_amdgpu_bo_list_entry                 = 8
+var DRM_AMDGPU_CTX_SIZE              = 16;
+var DRM_AMDGPU_BO_LIST_SIZE          = 24;
+var DRM_AMDGPU_GEM_VA_SIZE           = 64;
+var DRM_AMDGPU_BO_LIST_ENTRY_SIZE    = 8;
+
+# Precomputed ioctl numbers; native_ioc_encode-verified in tests.
+var DRM_IOCTL_AMDGPU_CTX     = 0xC0106442;
+var DRM_IOCTL_AMDGPU_BO_LIST = 0xC0186443;
+var DRM_IOCTL_AMDGPU_GEM_VA  = 0x40406448;
+
+# Context operations.
+var AMDGPU_CTX_OP_ALLOC_CTX = 1;
+var AMDGPU_CTX_OP_FREE_CTX  = 2;
+
+# BO list operations.
+var AMDGPU_BO_LIST_OP_CREATE  = 0;
+var AMDGPU_BO_LIST_OP_DESTROY = 1;
+
+# VA operations.
+var AMDGPU_VA_OP_MAP   = 1;
+var AMDGPU_VA_OP_UNMAP = 2;
+
+# VM page flags.
+var AMDGPU_VM_PAGE_READABLE   = 0x2;
+var AMDGPU_VM_PAGE_WRITEABLE  = 0x4;
+var AMDGPU_VM_PAGE_EXECUTABLE = 0x8;
+
+# ================================================================
+# BO page-perm constants (v3 Step 4f.ii)
+# ================================================================
+# Per-BO page perms for the AMDGPU VA mapping. Session 25b granted
+# R | W | X everywhere as a workaround during bring-up. Step 4f.ii
+# narrows back to the per-BO minimum each role needs — empirically
+# verified on Cezanne kernel 6.18.24:
+#
+#   _NATIVE_PERM_SHADER (R | X)  shader BOs — CP fetches, the wave
+#                                executes from these pages. CPU
+#                                writes shader bytes via the host
+#                                mmap (separate page table), so
+#                                GPU W is not required.
+#   _NATIVE_PERM_DATA   (R | W)  data BOs — stub, output, fence.
+#                                HW reads V# state / output target,
+#                                CP writes diagnostic markers,
+#                                kernel writes user fence seqno.
+#   _NATIVE_PERM_IB     (R | X)  IB BOs — CP only reads PM4 from
+#                                these, but on Cezanne the X bit is
+#                                load-bearing: dropping X causes the
+#                                compute ring to TDR. Hardware
+#                                bisect during Step 4f.ii (R-only,
+#                                R+W, R+X all tested) — only R+X
+#                                makes the dispatch land. AMDGPU
+#                                gates CP fetch through the execute
+#                                bit even though PM4 isn'"'"'t shader
+#                                code. The W bit is not required.
+#
+# Earlier this session a constants-init-order bug had _NATIVE_PERM_*
+# evaluating to 0 (referenced AMDGPU_VM_PAGE_* before they were
+# defined). The block now sits AFTER the AMDGPU_VM_PAGE_* defs,
+# which Cyrius initialises in declaration order. The CPU regression
+# test in tests/tcyr/mabda_v3.tcyr locks the values so further
+# narrowing trips a test before reaching hardware.
+
+var _NATIVE_PERM_FULL   = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_WRITEABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_SHADER = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_DATA   = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_WRITEABLE;
+var _NATIVE_PERM_IB     = AMDGPU_VM_PAGE_READABLE
+                        | AMDGPU_VM_PAGE_EXECUTABLE;
+
+# Sensible default for a first-BO VA base — 2 MiB into the GPU VA
+# space, well above any kernel-reserved low region. Phase B.3.a only
+# supports one-BO-at-a-time; a full VA allocator lands in B.3.b.
+var NATIVE_GPU_VA_BASE = 0x200000;
+
+# Context lifecycle. `req` is caller-owned 16 bytes.
+# On ALLOC: sets in={op=1, flags=0, ctx_id=0, priority=0}; kernel
+# writes out.alloc.ctx_id at req+0.
+fn native_ctx_alloc(fd, req) {
+    memset(req, 0, DRM_AMDGPU_CTX_SIZE);
+    store32(req + 0,  AMDGPU_CTX_OP_ALLOC_CTX);
+    store32(req + 4,  0);
+    store32(req + 8,  0);
+    store32(req + 12, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
+}
+
+fn native_ctx_alloc_id(req) { return load32(req + 0); }
+
+fn native_ctx_free(fd, ctx_id) {
+    var req[16];
+    memset(&req, 0, 16);
+    store32(&req + 0,  AMDGPU_CTX_OP_FREE_CTX);
+    store32(&req + 4,  0);
+    store32(&req + 8,  ctx_id);
+    store32(&req + 12, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &req);
+}
+
+# BO list lifecycle. `entries` points to an array of
+# drm_amdgpu_bo_list_entry (8 bytes each); `count` is the element
+# count. `req` is caller-owned 24 bytes; on CREATE success,
+# out.list_handle is at req+0.
+fn native_bo_list_create(fd, entries, count, req) {
+    memset(req, 0, DRM_AMDGPU_BO_LIST_SIZE);
+    store32(req + 0,  AMDGPU_BO_LIST_OP_CREATE);
+    store32(req + 4,  0);  # list_handle (in): 0 = create new
+    store32(req + 8,  count);
+    store32(req + 12, DRM_AMDGPU_BO_LIST_ENTRY_SIZE);
+    store64(req + 16, entries);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, req);
+}
+
+fn native_bo_list_create_handle(req) { return load32(req + 0); }
+
+fn native_bo_list_destroy(fd, list_handle) {
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0, AMDGPU_BO_LIST_OP_DESTROY);
+    store32(&req + 4, list_handle);
+    store32(&req + 8, 0);
+    store32(&req + 12, 0);
+    store64(&req + 16, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, &req);
+}
+
+# VA map / unmap. `va_address` and `size` must be page-aligned
+# (4 KiB). `flags` combines AMDGPU_VM_PAGE_*.
+fn native_gem_va_map(fd, handle, va_address, size, flags) {
+    var req[64];
+    memset(&req, 0, 64);
+    store32(&req + 0,  handle);
+    store32(&req + 4,  0);
+    store32(&req + 8,  AMDGPU_VA_OP_MAP);
+    store32(&req + 12, flags);
+    store64(&req + 16, va_address);
+    store64(&req + 24, 0);       # offset_in_bo
+    store64(&req + 32, size);
+    # vm_timeline_point / syncobjs stay zero; unused by legacy CS path.
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+}
+
+fn native_gem_va_unmap(fd, handle, va_address, size) {
+    var req[64];
+    memset(&req, 0, 64);
+    store32(&req + 0,  handle);
+    store32(&req + 4,  0);
+    store32(&req + 8,  AMDGPU_VA_OP_UNMAP);
+    store32(&req + 12, 0);
+    store64(&req + 16, va_address);
+    store64(&req + 24, 0);
+    store64(&req + 32, size);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+}
+
+# ================================================================
+# v3 Phase B.3.b — PM4 packet builder (GFX9 / Vega, target Cezanne)
+# ================================================================
+# Packet format reference: AMD GCN3 ISA docs (public) + Mesa's
+# src/amd/common/sid.h. AMD does not publish a current PM4 manual —
+# Mesa is the de-facto spec.
+#
+# Type-3 packet dword format (32-bit, little-endian):
+#   bits 0-7   — predicate (0 = unconditional)
+#   bits 8-15  — IT_* opcode
+#   bits 16-29 — count (N-1 where N = data-dword count after header)
+#   bits 30-31 — type (must be 3)
+#
+# IT_SET_SH_REG payload:
+#   +0: register offset (from 0xB000, divided by 4)
+#   +4: register value (first; more values follow for contiguous runs)
+#
+# IT_DISPATCH_DIRECT payload:
+#   +0: COMPUTE_DIM_X (workgroup count in x)
+#   +4: COMPUTE_DIM_Y
+#   +8: COMPUTE_DIM_Z
+#   +12: COMPUTE_DISPATCH_INITIATOR (bit 0 = COMPUTE_SHADER_EN)
+
+# Opcodes
+var IT_NOP              = 0x10;
+var IT_SET_SH_REG       = 0x76;
+var IT_SET_CONTEXT_REG  = 0x69;
+var IT_DISPATCH_DIRECT  = 0x15;
+var IT_DRAW_INDEX_AUTO  = 0x2D;
+var IT_ACQUIRE_MEM      = 0x58;
+var IT_RELEASE_MEM      = 0x49;
+var IT_EVENT_WRITE      = 0x46;
+var IT_SET_UCONFIG_REG  = 0x79;
+
+# SH-register offsets (byte addresses in MMIO space). The SH_REG base
+# is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
+# Covered by native_sh_reg_offset() helper.
+# Register offsets verified by AMD_DEBUG=ib dump of Mesa rusticl
+# compute dispatch on this exact Cezanne APU (gfx90c). The PGM_LO/HI
+# and RSRC1/2 positions I had previously were wrong by an entire
+# register — PGM_LO at 0xB830 (not 0xB848), with every register in
+# the block shifted. B.3.d still worked because s_endpgm is tolerant
+# of garbage pipeline state.
+var R_COMPUTE_DISPATCH_INITIATOR      = 0xB800;
+var R_COMPUTE_START_X                 = 0xB810;
+var R_COMPUTE_START_Y                 = 0xB814;
+var R_COMPUTE_START_Z                 = 0xB818;
+var R_COMPUTE_NUM_THREAD_X            = 0xB81C;
+var R_COMPUTE_NUM_THREAD_Y            = 0xB820;
+var R_COMPUTE_NUM_THREAD_Z            = 0xB824;
+var R_COMPUTE_PGM_LO                  = 0xB830;
+var R_COMPUTE_PGM_HI                  = 0xB834;
+var R_COMPUTE_PGM_RSRC1               = 0xB848;
+var R_COMPUTE_PGM_RSRC2               = 0xB84C;
+var R_COMPUTE_RESOURCE_LIMITS         = 0xB854;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE0  = 0xB858;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE1  = 0xB85C;
+var R_COMPUTE_TMPRING_SIZE            = 0xB860;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE2  = 0xB864;
+var R_COMPUTE_STATIC_THREAD_MGMT_SE3  = 0xB868;
+var R_COMPUTE_USER_DATA_0        = 0xB900;
+# COMPUTE_USER_DATA_1..15 follow in 4-byte increments up to 0xB93C.
+
+var PM4_SH_REG_BASE = 0xB000;
+var PM4_CONTEXT_REG_BASE = 0xA000;
+var PM4_UCONFIG_REG_BASE = 0x30000;
+
+# GFX9 UCONFIG registers we program in the queue preamble.
+var R_CP_COHER_START_DELAY = 0x301EC;
+# Texture addressing border-color base. Mesa rusticl programs these
+# in its preamble even for shaders that don't sample textures.
+var R_TA_CS_BC_BASE_ADDR    = 0x30E00;
+var R_TA_CS_BC_BASE_ADDR_HI = 0x30E04;
+
+# Dispatch initiator: minimum bits to launch a shader.
+# COMPUTE_SHADER_EN at bit 0 triggers the dispatch.
+var COMPUTE_DISPATCH_INITIATOR_MIN = 0x1;
+
+# Encode a type-3 PM4 header. `count` is the number of data dwords
+# that follow the header (kernel wants count-1 in the bit field).
+# `count` must be ≥ 1 and ≤ 0x4000.
+fn native_pm4_pkt3_header(opcode, count, predicate) {
+    var d = 3 & 3;                     # type
+    var c = (count - 1) & 0x3FFF;      # count field (N-1)
+    var o = opcode & 0xFF;             # opcode
+    var p = predicate & 0xFF;          # predicate
+    return (d * 0x40000000) | (c * 0x10000) | (o * 0x100) | p;
+}
+
+# Convert a register byte-offset into the SH_REG form the SET_SH_REG
+# packet expects: `(offset - 0xB000) / 4`.
+fn native_sh_reg_offset(byte_offset) {
+    return (byte_offset - PM4_SH_REG_BASE) / 4;
+}
+
+# Convert a context-register byte-offset into the SET_CONTEXT_REG
+# wire form: `(offset - 0xA000) / 4`. Context registers cover the
+# rasterizer/viewport/CB target/DB depth state — graphics-only,
+# distinct from SH (shader) and UConfig (top-level chip state).
+fn native_context_reg_offset(byte_offset) {
+    return (byte_offset - PM4_CONTEXT_REG_BASE) / 4;
+}
+
+# Emit a SET_SH_REG packet for `n` contiguous registers starting at
+# `byte_offset`. Writes header + register-offset dword + n value
+# dwords into `buf` starting at `pos`. `values` points to an array
+# of n u32 values. Returns the new position (pos + 8 + 4*n bytes,
+# i.e., position after the last dword written).
+fn native_pm4_set_sh_reg(buf, pos, byte_offset, n, values) {
+    # PKT3 count: `n + 1` data dwords (offset + n values); bit-field
+    # stores count - 1 = n.
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_SH_REG, n + 1, 0));
+    pos = pos + 4;
+    store32(buf + pos, native_sh_reg_offset(byte_offset));
+    pos = pos + 4;
+    var i = 0;
+    while (i < n) {
+        store32(buf + pos, load32(values + i * 4));
+        pos = pos + 4;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# Convenience for setting a single SH register — the common case in
+# compute dispatch setup. Returns new position.
+fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value) {
+    var one[4];
+    store32(&one, value);
+    return native_pm4_set_sh_reg(buf, pos, byte_offset, 1, &one);
+}
+
+# Emit a SET_UCONFIG_REG packet for a single register. UCONFIG regs
+# are the chip-wide "this register applies to the whole GPU, not a
+# specific shader" space — used for things like CP_COHER_START_DELAY
+# and TA_CS_BC_BASE_ADDR that radv emits in its queue preamble.
+# Packet: header + (offset - 0x30000)/4 + value = 3 dwords.
+fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 2, 0));
+    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
+    store32(buf + pos + 8, value);
+    return pos + 12;
+}
+
+# Emit a SET_UCONFIG_REG packet for two consecutive registers. `values`
+# points to two u32s. Packet: header + reg_offset + 2 values = 4 dwords.
+fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 3, 0));
+    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
+    store32(buf + pos + 8,  load32(values + 0));
+    store32(buf + pos + 12, load32(values + 4));
+    return pos + 16;
+}
+
+# ================================================================
+# v3 Step 6.4 — context-register + draw PM4 builders (Phase C)
+# ================================================================
+# SET_CONTEXT_REG (opcode 0x69) writes to the graphics-only context
+# register file (rasterizer / viewport / CB color-target / DB depth-
+# target state). Wire format mirrors SET_SH_REG / SET_UCONFIG_REG:
+# header + reg_offset + N values; reg_offset is dword-relative to
+# PM4_CONTEXT_REG_BASE = 0xA000.
+#
+# DRAW_INDEX_AUTO (opcode 0x2D) kicks a vertex+fragment dispatch on
+# the GFX ring with auto-generated vertex IDs (0..vertex_count-1),
+# no index buffer required. The "auto" source-select is what makes
+# the first cut tractable — no VBO binding, no index buffer.
+#
+# Both opcodes will be byte-exact-validated against radv's output
+# (AMD_DEBUG=ib) in Step 6.5 when we compose the full clear-triangle
+# PM4 stream.
+
+# Multi-register SET_CONTEXT_REG: header + reg_offset + n values.
+# Packet body length = n + 1 dwords.
+fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, n + 1, 0));
+    pos = pos + 4;
+    store32(buf + pos, native_context_reg_offset(byte_offset));
+    pos = pos + 4;
+    var i = 0;
+    while (i < n) {
+        store32(buf + pos, load32(values + i * 4));
+        pos = pos + 4;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# Single-register convenience: SET_CONTEXT_REG with one value.
+fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 2, 0));
+    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
+    store32(buf + pos + 8, value);
+    return pos + 12;
+}
+
+# Pair convenience: SET_CONTEXT_REG with two consecutive registers.
+# Useful for things like CB_COLOR0_BASE + _PITCH or PA_SC_SCREEN_SCISSOR_TL + _BR.
+fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 3, 0));
+    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
+    store32(buf + pos + 8,  load32(values + 0));
+    store32(buf + pos + 12, load32(values + 4));
+    return pos + 16;
+}
+
+# Emit a DRAW_INDEX_AUTO packet. `vertex_count` is the number of
+# vertices the rasterizer will assemble; `draw_initiator` carries
+# the SOURCE_SELECT bits + USE_OPAQUE / etc. The standard value
+# for auto-index draws is 0x02 (DI_SRC_SEL_AUTO_INDEX in bits[1:0]).
+# Packet shape: header + 2 data dwords. count = 2.
+fn native_pm4_draw_index_auto(buf, pos, vertex_count, draw_initiator) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_DRAW_INDEX_AUTO, 2, 0));
+    store32(buf + pos + 4, vertex_count);
+    store32(buf + pos + 8, draw_initiator);
+    return pos + 12;
+}
+
+# Specific context-register addresses (R_PA_SC_*, R_CB_COLOR0_*,
+# etc.) are deferred to Step 6.5 — those values get verified
+# byte-exact against radv's AMD_DEBUG=ib output for an equivalent
+# clear-triangle dispatch. The Phase B.4 protocol applies: don't
+# claim a register address is correct until a working hardware
+# diff confirms it. The builders above are the load-bearing part
+# of Step 6.4; Step 6.5 supplies the addresses they'll be called
+# with.
+
+# DRAW_INDEX_AUTO source-select constants. See
+# docs/proposals/v3-native-render-design.md § PM4 packet families.
+var DI_SRC_SEL_AUTO_INDEX = 0x02;
+
+# Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
+# given workgroup counts and the provided initiator mask (typically
+# COMPUTE_DISPATCH_INITIATOR_MIN). Returns new position.
+fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
+    # 4 data dwords: dim_x, dim_y, dim_z, initiator. count = 4.
+    # Low byte of header is shader_type (2 = compute), not predicate.
+    # Mesa emits 0xc0031502 — verified via AMD_DEBUG=ib dump.
+    store32(buf + pos, native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 2));
+    pos = pos + 4;
+    store32(buf + pos, dim_x); pos = pos + 4;
+    store32(buf + pos, dim_y); pos = pos + 4;
+    store32(buf + pos, dim_z); pos = pos + 4;
+    store32(buf + pos, initiator); pos = pos + 4;
+    return pos;
+}
+
+# Emit an ACQUIRE_MEM packet that invalidates the shader I-cache,
+# K-cache, and TC (texture / L2) caches. Per ROCT-Thunk kfdtest,
+# this is mandatory before a compute dispatch on GFX9 — without it
+# the I-cache can return stale bytes and the SQ decodes garbage
+# as an "illegal opcode". Packet format:
+#   +0  PKT3 header (opcode IT_ACQUIRE_MEM, count=5+1 data dwords)
+#   +4  coher_cntl (cache-invalidate action bits)
+#   +8  coher_size_lo (bytes to invalidate; 0xFFFFFFFF = everything)
+#   +12 coher_size_hi (24-bit mask for GFX9)
+#   +16 coher_base_lo (base VA; 0 = start from 0)
+#   +20 coher_base_hi
+#   +24 poll_interval (cycles between state-check; 0x0A standard)
+# Total: 7 dwords (28 bytes). Returns new pos.
+fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
+    # For IT_ACQUIRE_MEM on GFX9 the low byte of the PKT3 header is
+    # shader_type (0=graphics, non-zero=compute) — NOT the generic
+    # predicate bit. Mesa rusticl emits 0xc0055802 = shader_type=0x02.
+    # coher_cntl = 0xa8c40000 verified from Mesa AMD_DEBUG=ib dump.
+    # Count field: 6 data dwords follow (cntl, size_lo/hi, base_lo/hi,
+    # poll). Header encodes count-1 = 5.
+    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, 2));
+    store32(buf + pos +  4, 0xA8C40000);   # coher_cntl
+    store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
+    store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
+    store32(buf + pos + 16, 0);            # coher_base_lo
+    store32(buf + pos + 20, 0);            # coher_base_hi
+    store32(buf + pos + 24, 0x0A);         # poll_interval
+    return pos + 28;
+}
+
+# Emit a NOP of `pad_dwords` total dwords (header + pad_dwords-1
+# filler). Useful for aligning IBs to 8-dword boundaries (kernel
+# requirement on some rings). Returns new position.
+fn native_pm4_nop(buf, pos, pad_dwords) {
+    if (pad_dwords < 2) { return pos; }
+    # Session 25b fix: NOP packet of `pad_dwords` total dwords needs body =
+    # pad_dwords - 1, so pass count = pad_dwords - 1 to pkt3_header (which
+    # subtracts one to encode count_minus_1). Prior code passed pad_dwords
+    # directly, causing the on-wire header to claim body = pad_dwords (one
+    # too many) — CP read 1 dw past the IB end and either hung trying to
+    # fetch the missing dw or processed garbage. This silently bricked
+    # every native compute submit (TDR after 10s).
+    store32(buf + pos, native_pm4_pkt3_header(IT_NOP, pad_dwords - 1, 0));
+    pos = pos + 4;
+    var i = 1;
+    while (i < pad_dwords) {
+        store32(buf + pos, 0);
+        pos = pos + 4;
+        i = i + 1;
+    }
+    return pos;
+}
+
+# ================================================================
+# v3 Step 4a — composed PM4 stream for the store-DEADBEEF shader
+# ================================================================
+# Emit the full Mesa-verified PM4 preamble + DISPATCH_DIRECT
+# (workgroup count = x, y, z) + post-dispatch C0FFEE12 marker +
+# trailing NOP padding to 64 dwords. Returns the byte count
+# written into buf.
+#
+# Caller owns the BOs at shader_va / stub_va / out_va; this fn
+# only emits a PM4 stream that, when submitted on the COMPUTE
+# ring with those BOs in the residency list, will dispatch the
+# store_deadbeef shader to write 0xDEADBEEF at out_va.
+#
+# The PM4 layout is byte-identical to the working
+# programs/native_compute_store.cyr build — see the B.4-verified
+# handoff (docs/handoff/2026-04-28-session25-b4-verified.md) for
+# the full Mesa-rusticl alignment rationale.
+fn native_pm4_build_compute_store_deadbeef(buf, shader_va, stub_va,
+                                           out_va, x, y, z) {
+    var pos = 0;
+    # GFX9 PGM_LO/HI encoding: PGM_LO = (va >> 8) & 0xFFFFFFFF,
+    # PGM_HI = (va >> 40) & 0xFF. HW reconstructs:
+    # shader_addr = (PGM_HI << 40) | (PGM_LO << 8).
+    var pgm_lo = (shader_va >> 8) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va >> 40) & 0xFF;
+    # 1. PGM_HI.
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, pgm_hi);
+    # 2. STATIC_THREAD_MGMT_SE0/SE1 — SE0 all CUs, SE1 absent on Cezanne.
+    var thread_mgmt_01[8];
+    store32(&thread_mgmt_01 + 0, 0xFFFFFFFF);
+    store32(&thread_mgmt_01 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0,
+                                2, &thread_mgmt_01);
+    # 3. STATIC_THREAD_MGMT_SE2/SE3 = 0, 0 (absent on Cezanne).
+    var thread_mgmt_23[8];
+    store32(&thread_mgmt_23 + 0, 0);
+    store32(&thread_mgmt_23 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2,
+                                2, &thread_mgmt_23);
+    # 4. CP_COHER_START_DELAY = 0.
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_CP_COHER_START_DELAY, 0);
+    # 5. TA_CS_BC_BASE_ADDR + _HI = 0/0 (Session 25b: BC_BASE = 0 works
+    # on Cezanne; the session-16 magic-VA hypothesis was falsified).
+    var bc_va = 0;
+    var bc_pair[8];
+    store32(&bc_pair + 0, (bc_va >> 8) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va >> 40) & 0xFF);
+    pos = native_pm4_set_uconfig_reg_pair(buf, pos, R_TA_CS_BC_BASE_ADDR,
+                                          &bc_pair);
+    # 6. PGM_LO.
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    # 7. PGM_RSRC1 + RSRC2 as a pair.
+    var rsrc[8];
+    store32(&rsrc + 0, GFX9_COMPUTE_PGM_RSRC1_MIN);
+    store32(&rsrc + 4, 0x8);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    # 8. TMPRING_SIZE.
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
+    # 9. USER_DATA_2 + 3 — Mesa scratch V# stub VA (canonical-high).
+    var user23[8];
+    store32(&user23 + 0, stub_va & 0xFFFFFFFF);
+    store32(&user23 + 4, (stub_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 8,
+                                2, &user23);
+    # 10. USER_DATA_0 + 1 — output VA low/high.
+    var user01[8];
+    store32(&user01 + 0, out_va & 0xFFFFFFFF);
+    store32(&user01 + 4, (out_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0,
+                                2, &user01);
+    # 11. ACQUIRE_MEM flushes I/K/L2 caches before dispatch.
+    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    # 12. RESOURCE_LIMITS = 0x140.
+    pos = native_pm4_set_sh_reg_one(buf, pos,
+                                    R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    # 13. NUM_THREAD_X/Y/Z = 1/1/1 (single-thread workgroup; the
+    # store_deadbeef shader has only one wave).
+    var nt[12];
+    store32(&nt + 0, 1);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    # 14. DISPATCH_DIRECT with shader_type=2 (compute), workgroup
+    # count = (x, y, z).
+    pos = native_pm4_dispatch_direct(buf, pos, x, y, z,
+                                     GFX9_DISPATCH_INITIATOR);
+    # Session 25b diagnostic: WRITE_DATA(WR_CONFIRM=1) marker at
+    # stub_va+4 = 0xC0FFEE12. Proves CP returned cleanly from
+    # DISPATCH_DIRECT and continued through the IB.
+    store32(buf + pos +  0, 0xC0033700);
+    store32(buf + pos +  4, 0x00100500);
+    store32(buf + pos +  8, (stub_va + 4) & 0xFFFFFFFF);
+    store32(buf + pos + 12, ((stub_va + 4) >> 32) & 0xFFFFFFFF);
+    store32(buf + pos + 16, 0xC0FFEE12);
+    pos = pos + 20;
+    # Pad to 64 dwords (AMDGPU cache-line alignment).
+    var cur_dwords = pos / 4;
+    var target_dwords = 64;
+    if (cur_dwords < target_dwords) {
+        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
+    }
+    return pos;
+}
+
+# ================================================================
+# v3 Phase B.3.c — minimum GFX9 shader
+# ================================================================
+# A compute shader consisting of a single s_endpgm instruction.
+# GFX9 encoding: the SOPP format for s_endpgm is 0xBF810000.
+# Usage: write this 4-byte instruction at a 256-byte-aligned VA in
+# a GPU-visible BO; point COMPUTE_PGM_LO/HI at that VA.
+var GFX9_S_ENDPGM = 0xBF810000;
+
+# GFX9 COMPUTE_PGM_RSRC1 minimum viable mask.
+#   bits  0-5  VGPRS        = 0 → allocate 4 VGPRs (enough for v0-v3)
+#   bits  6-9  SGPRS        = 1 → allocate 16 SGPRs
+#       SGPRS=0 allocates only 8 and is too few once VCC (+2) and
+#       flat_scratch (+3) overhead are counted on a store shader.
+#   bits 12-19 FLOAT_MODE   = 0xC0 → round-to-nearest-even for f32 + f64.
+#                              Some GFX9 firmware rejects FLOAT_MODE = 0.
+#   bit  21    DX10_CLAMP   = 1 → well-behaved clamp semantics
+#   bit  23    IEEE_MODE    = 1 → IEEE-conformant float behaviour
+# Encoded value matches Mesa rusticl for gfx90c: FLOAT_MODE=0xC0,
+# SGPRS=1 (16 regs), DX10_CLAMP=1, IEEE_MODE=0.
+#   (0xC0 << 12) | (1 << 6) | (1 << 21) = 0x002C0040
+var GFX9_COMPUTE_PGM_RSRC1_MIN = 0x2C0040;
+
+# COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
+var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
+
+# DISPATCH_INITIATOR = 0x45 (Mesa-verified): bits 0 (COMPUTE_SHADER_EN)
+# | 2 (FORCE_START_AT_000) | 6 (ORDER_MODE).
+var GFX9_DISPATCH_INITIATOR = 0x45;
+
+# Write the s_endpgm shader into buf at pos. Returns new pos.
+fn native_gfx9_shader_endpgm(buf, pos) {
+    store32(buf + pos, GFX9_S_ENDPGM);
+    return pos + 4;
+}
+
+# Write a "store 0xDEADBEEF to buffer[0]" shader at `pos` in `buf`.
+# Expects s0/s1 pre-loaded with the low/high 32 bits of the output VA
+# (either via USER_SGPR = 2 loading from USER_DATA_0/1, or via
+# USER_SGPR ≥ 2 where the caller places the VA in those slots).
+#
+# Source (assembled via `clang -target amdgcn--amdhsa -mcpu=gfx90c`):
+#   v_mov_b32_e32  v0, s0                            ; low 32 bits of VA
+#   v_mov_b32_e32  v1, s1                            ; high 32 bits of VA
+#   v_mov_b32_e32  v2, 0xDEADBEEF                    ; constant
+#   global_store_dword v[0:1], v2, off glc slc       ; write-through store
+#   s_waitcnt vmcnt(0) lgkmcnt(0)                    ; wait for store
+#   s_endpgm                                         ; terminate
+#
+# GLC + SLC bypass the GPU's L1 and L2 caches, writing straight to
+# system memory. Without them the store lands in L2; CPU readback
+# from the mapped GTT sees stale data until a cache-flush preempts
+# it. Combined with s_waitcnt before s_endpgm, SLC=1 makes the store
+# CPU-visible by the time the syncobj fires.
+#
+# Layout (bytes):
+#   +0:  0x7E000200  v_mov_b32_e32 v0, s0   (VOP1: opcode=1, vdst=0, src0=0)
+#   +4:  0x7E020201  v_mov_b32_e32 v1, s1   (VOP1: opcode=1, vdst=1, src0=1)
+#   +8:  0x7E0402FF  v_mov_b32_e32 v2, <literal>  (src0=255 → literal follows)
+#   +12: 0xDEADBEEF  literal
+#   +16: 0xDC738000  global_store_dword dword 1  (FLAT+GLOBAL, glc=1, slc=1)
+#   +20: 0x007F0200  global_store_dword dword 2  (addr=v0, data=v2, saddr=off=127)
+#   +24: 0xBF8C0070  s_waitcnt vmcnt(0) lgkmcnt(0)  (SIMM16 = 0x0070)
+#   +28: 0xBF810000  s_endpgm
+#   +32..+95: 16 × 0xBF800000  s_nop 0  (AMDGPU-ABI-required prefetch padding)
+#
+# Returns new pos (pos + 96). RSRC1 must include FLOAT_MODE = 0xC0,
+# DX10_CLAMP, IEEE_MODE (GFX9_COMPUTE_PGM_RSRC1_MIN satisfies all).
+# USER_SGPR ≥ 2 required so s0/s1 are populated; the canonical setup
+# is RSRC2 = 0x8 (USER_SGPR=4) with USER_DATA_0/1 = VA low/high and
+# USER_DATA_2/3 = Mesa's scratch-V# stub (0x00200000/0).
+fn native_gfx9_shader_store_deadbeef(buf, pos) {
+    store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
+    store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
+    store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
+    store32(buf + pos + 12, 0xDEADBEEF);   # literal
+    store32(buf + pos + 16, 0xDC738000);   # global_store_dword v[0:1], v2, off glc slc (dword 1)
+    store32(buf + pos + 20, 0x007F0200);   # global_store_dword (dword 2: addr=v0, data=v2, saddr=off)
+    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
+    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
+    var i = 0;
+    while (i < 16) {
+        store32(buf + pos + 32 + i * 4, 0xBF800000);   # s_nop 0
+        i = i + 1;
+    }
+    return pos + 96;
+}
+
+# PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).
+# On GFX9, TRAP_PRESENT must be set or memory-op trap paths fire
+# bad_op_irq even when no actual trap occurs. Per kfdtest this bit
+# is mandatory for any compute dispatch that touches memory.
+#   USER_SGPR = 2 → bits 1-5 = 0b00010 → value 0x04
+#   TRAP_PRESENT → bit 6        → value 0x40
+# Combined: 0x04 | 0x40 = 0x44
+var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP = 0x44;
+
+# RSRC2 with USER_SGPR = 2 — tells HW to pre-load SGPRs s0, s1 with
+# COMPUTE_USER_DATA_0, COMPUTE_USER_DATA_1 before shader entry.
+# USER_SGPR field occupies bits 1-5; value 2 encodes as 0x04.
+var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2 = 0x04;
+
+# ================================================================
+# v3 Phase B.3.d — syncobj lifecycle (generic DRM, not AMDGPU-specific)
+# ================================================================
+# drm_syncobj_create  = {handle u32, flags u32} = 8 bytes
+# drm_syncobj_destroy = {handle u32, pad u32}  = 8 bytes
+# drm_syncobj_wait    = {handles u64, timeout_nsec s64, count_handles u32,
+#                        flags u32, first_signaled u32, pad u32,
+#                        deadline_nsec u64} = 40 bytes (kernel ≥ 6.10)
+var DRM_SYNCOBJ_CREATE_SIZE   = 8;
+var DRM_SYNCOBJ_DESTROY_SIZE  = 8;
+var DRM_SYNCOBJ_WAIT_SIZE     = 40;
+
+# Generic DRM ioctls: nr values 0xBF / 0xC0 / 0xC3.
+var DRM_IOCTL_SYNCOBJ_CREATE  = 0xC00864BF;
+var DRM_IOCTL_SYNCOBJ_DESTROY = 0xC00864C0;
+var DRM_IOCTL_SYNCOBJ_WAIT    = 0xC02864C3;
+
+var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL         = 0x1;
+var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT  = 0x2;
+
+# Create a syncobj. Returns handle on success, negative errno on
+# failure. Handle returned via writable req+0.
+fn native_syncobj_create(fd, out_handle_ptr) {
+    var req[8];
+    store32(&req + 0, 0);
+    store32(&req + 4, 0);
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_CREATE, &req);
+    if (rc != 0) { return rc; }
+    store64(out_handle_ptr, load32(&req + 0));
+    return 0;
+}
+
+fn native_syncobj_destroy(fd, handle) {
+    var req[8];
+    store32(&req + 0, handle);
+    store32(&req + 4, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_DESTROY, &req);
+}
+
+# Wait for the syncobj to become signaled. `timeout_ns` is absolute
+# CLOCK_MONOTONIC nanoseconds. Returns 0 on signaled, negative errno
+# on timeout or error. Caller supplies one handle.
+fn native_syncobj_wait(fd, handle, timeout_ns) {
+    var handles[8];
+    store64(&handles + 0, handle);
+    var req[40];
+    memset(&req, 0, 40);
+    store64(&req + 0,  &handles);       # handles ptr
+    store64(&req + 8,  timeout_ns);     # timeout_nsec (absolute)
+    store32(&req + 16, 1);              # count_handles
+    store32(&req + 20, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+    store32(&req + 24, 0);              # first_signaled (out)
+    store32(&req + 28, 0);              # pad
+    store64(&req + 32, 0);              # deadline_nsec
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_WAIT, &req);
+}
+
+# ================================================================
+# v3 Phase B.3.d — CS (command submission) ioctl
+# ================================================================
+# union drm_amdgpu_cs { in (24) | out (8) } = 24
+# struct drm_amdgpu_cs_chunk                = 16 (id u32 + length_dw u32 + data u64)
+# struct drm_amdgpu_cs_chunk_ib             = 32 (pad u32 + flags u32 + va_start u64
+#                                              + ib_bytes u32 + ip_type u32
+#                                              + ip_instance u32 + ring u32)
+# struct drm_amdgpu_cs_chunk_sem            = 4  (handle u32 only)
+#   Used by DEPENDENCIES / SYNCOBJ_IN / SYNCOBJ_OUT / SCHEDULED_DEPENDENCIES.
+# struct drm_amdgpu_cs_chunk_syncobj        = 16 (handle u32 + flags u32 + point u64)
+#   Used by SYNCOBJ_TIMELINE_WAIT / SYNCOBJ_TIMELINE_SIGNAL only.
+var DRM_AMDGPU_CS                     = 0x04;
+var DRM_AMDGPU_CS_SIZE                = 24;
+var DRM_AMDGPU_CS_CHUNK_SIZE          = 16;
+var DRM_AMDGPU_CS_CHUNK_IB_SIZE       = 32;
+var DRM_AMDGPU_CS_CHUNK_SEM_SIZE      = 4;
+var DRM_AMDGPU_CS_CHUNK_SYNCOBJ_SIZE  = 16;
+var DRM_IOCTL_AMDGPU_CS               = 0xC0186444;
+
+var AMDGPU_CHUNK_ID_IB           = 0x01;
+var AMDGPU_CHUNK_ID_FENCE        = 0x02;
+var AMDGPU_CHUNK_ID_SYNCOBJ_OUT  = 0x05;
+var AMDGPU_CHUNK_ID_BO_HANDLES   = 0x06;
+
+var AMDGPU_HW_IP_GFX      = 0;
+var AMDGPU_HW_IP_COMPUTE  = 1;
+
+# Submit a command stream with one IB chunk + one SYNCOBJ_OUT chunk.
+# Returns 0 on success (CS ioctl accepted). The syncobj becomes
+# signaled when the GPU finishes the submission; caller waits via
+# native_syncobj_wait.
+#
+# Arguments:
+#   fd             — DRM render-node fd
+#   ctx_id         — from native_ctx_alloc
+#   bo_list_handle — from native_bo_list_create
+#   ib_va          — GPU virtual address of the IB (PM4 stream)
+#   ib_bytes       — size of the PM4 stream (multiple of 4)
+#   ip_type        — AMDGPU_HW_IP_COMPUTE or AMDGPU_HW_IP_GFX
+#   syncobj_handle — pre-created syncobj to signal on completion (or 0 to omit)
+fn native_cs_submit(fd, ctx_id, bo_list_handle, ib_va, ib_bytes, ip_type, syncobj_handle) {
+    # Build IB chunk payload (32 bytes).
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);         # _pad
+    store32(&ib_chunk + 4,  0);         # flags
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);         # ip_instance
+    store32(&ib_chunk + 28, 0);         # ring
+
+    # Build SYNCOBJ_OUT chunk payload. The kernel treats this chunk as
+    # an array of drm_amdgpu_cs_chunk_sem (4 bytes: handle only) — NOT
+    # the 16-byte drm_amdgpu_cs_chunk_syncobj (which is timeline-only).
+    # Getting this wrong manifests as -EINVAL because the kernel reads
+    # more "handles" than you meant and 0-valued slots fail syncobj
+    # lookup. See feedback memory & CHANGELOG note for v3 Phase B.3.d.
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var include_sync = 1;
+    if (syncobj_handle == 0) { include_sync = 0; }
+
+    # Build chunk descriptors (16 bytes each).
+    var chunks[32];
+    memset(&chunks, 0, 32);
+    store32(&chunks + 0,  AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + 4,  32 / 4);       # length_dw = 8 (IB chunk payload)
+    store64(&chunks + 8,  &ib_chunk);
+
+    if (include_sync == 1) {
+        store32(&chunks + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+        store32(&chunks + 20, 1);         # length_dw = 1 (single u32 handle)
+        store64(&chunks + 24, &syncobj_chunk);
+    }
+
+    var chunk_ptrs[16];
+    store64(&chunk_ptrs + 0, &chunks);
+    if (include_sync == 1) {
+        store64(&chunk_ptrs + 8, &chunks + 16);
+    }
+
+    var num_chunks = 1 + include_sync;
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  bo_list_handle);
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);                # flags
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the BO_HANDLES chunk path (Mesa rusticl pattern) instead
+# of the BO_LIST_OP_CREATE ioctl. The kernel parser at drivers/gpu/drm/amd/
+# amdgpu/amdgpu_cs.c:p1_bo_handles consumes the chunk_data as a
+# drm_amdgpu_bo_list_in (24 bytes); its bo_info_ptr field then points to the
+# array of {handle u32, priority u32} entries. cs.in.bo_list_handle is
+# unused (the BO list is reconstructed from the chunk).
+#
+# Caller pre-builds bo_list_in (24 bytes) with:
+#   off  0: operation    = 0xFFFFFFFF  (sentinel — kernel infers from chunk)
+#   off  4: list_handle  = 0xFFFFFFFF  (sentinel)
+#   off  8: bo_number    = N
+#   off 12: bo_info_size = 8           (sizeof drm_amdgpu_bo_list_entry)
+#   off 16: bo_info_ptr  = &entries    (N × {u32 handle, u32 priority})
+#
+# Chunk order matches Mesa's amdgpu_cs_submit_ib_kernelq:
+#   1. BO_HANDLES
+#   2. SYNCOBJ_OUT  (when syncobj_handle != 0)
+#   3. IB
+fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type, syncobj_handle) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  0);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var include_sync = 1;
+    if (syncobj_handle == 0) { include_sync = 0; }
+
+    # Up to 3 chunk descriptors (16 bytes each): BO_HANDLES, SYNCOBJ_OUT, IB.
+    var chunks[48];
+    memset(&chunks, 0, 48);
+    # 1. BO_HANDLES — length_dw = sizeof(drm_amdgpu_bo_list_in)/4 = 6.
+    store32(&chunks + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks + 4,  6);
+    store64(&chunks + 8,  bo_list_in_ptr);
+
+    var pos = 16;
+    if (include_sync == 1) {
+        store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+        store32(&chunks + pos + 4,  1);
+        store64(&chunks + pos + 8,  &syncobj_chunk);
+        pos = pos + 16;
+    }
+    # IB chunk last (matches Mesa).
+    store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + pos + 4,  32 / 4);
+    store64(&chunks + pos + 8,  &ib_chunk);
+
+    var num_chunks = 2 + include_sync;
+
+    var chunk_ptrs[24];
+    store64(&chunk_ptrs + 0,  &chunks + 0);
+    if (include_sync == 1) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+        store64(&chunk_ptrs + 16, &chunks + 32);
+    }
+    if (include_sync == 0) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+    }
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  0);                # bo_list_handle = 0 (chunk replaces it)
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the full 4-chunk Mesa-rusticl shape:
+# BO_HANDLES + SYNCOBJ_OUT + FENCE + IB, with caller-provided IB flags.
+# This is the byte-shape that the working session-25b C spike uses
+# (deps/libdrm_store_spike_v3.c). The 3-chunk variant
+# native_cs_submit_inline_bos (without FENCE) accepts the submit ioctl
+# but never queues the IB to MEC for compute on this kernel — TDR fires
+# after 10s and the syncobj signals as if the IB completed.
+#
+# Caller pre-builds bo_list_in (24 bytes) per native_cs_submit_inline_bos.
+# fence_kh = KMS handle of a BO mapped into the GPU VA space. The kernel
+# writes the IB completion sequence number to (fence_bo + fence_offset),
+# 8 bytes. fence_offset is typically 32 (matches Mesa).
+# ib_flags = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (0x08) for compute.
+fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
+                           syncobj_handle, fence_kh, fence_offset, ib_flags) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  ib_flags);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var fence_chunk[8];
+    store32(&fence_chunk + 0, fence_kh);
+    store32(&fence_chunk + 4, fence_offset);
+
+    var chunks_4[64];
+    memset(&chunks_4, 0, 64);
+    store32(&chunks_4 + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks_4 + 4,  6);
+    store64(&chunks_4 + 8,  bo_list_in_ptr);
+    store32(&chunks_4 + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+    store32(&chunks_4 + 20, 1);
+    store64(&chunks_4 + 24, &syncobj_chunk);
+    store32(&chunks_4 + 32, AMDGPU_CHUNK_ID_FENCE);
+    store32(&chunks_4 + 36, 2);
+    store64(&chunks_4 + 40, &fence_chunk);
+    store32(&chunks_4 + 48, AMDGPU_CHUNK_ID_IB);
+    store32(&chunks_4 + 52, 32 / 4);
+    store64(&chunks_4 + 56, &ib_chunk);
+
+    var chunk_ptrs_4[32];
+    store64(&chunk_ptrs_4 + 0,  &chunks_4 + 0);
+    store64(&chunk_ptrs_4 + 8,  &chunks_4 + 16);
+    store64(&chunk_ptrs_4 + 16, &chunks_4 + 32);
+    store64(&chunk_ptrs_4 + 24, &chunks_4 + 48);
+
+    var req_4[24];
+    memset(&req_4, 0, 24);
+    store32(&req_4 + 0,  ctx_id);
+    store32(&req_4 + 4,  0);
+    store32(&req_4 + 8,  4);
+    store32(&req_4 + 12, 0);
+    store64(&req_4 + 16, &chunk_ptrs_4);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
+}
+
+# ================================================================
+# v3 Step 4b — composed dispatch (PM4 + IB + fence + submit + wait)
+# ================================================================
+# All-in-one COMPUTE-ring dispatch built on top of the existing
+# primitives. Caller owns shader / stub / output BOs (passed in by
+# handle); the IB BO, fence BO, syncobj are ephemeral — allocated,
+# va-mapped, used once, and released before this fn returns.
+#
+# Args:
+#   fd            — DRM render node fd
+#   ctx_id        — amdgpu context id (from native_ctx_alloc)
+#   pm4           — pointer to a PM4 dword stream (caller-built)
+#   pm4_bytes     — byte count of the PM4 stream
+#   shader_handle — KMS handle of the shader BO
+#   stub_handle   — KMS handle of the Mesa-stub BO
+#   out_handle    — KMS handle of the output BO
+#   timeout_ns    — syncobj wait deadline (absolute, in ns; pass
+#                   mono_ns() + 15_000_000_000 for a 15-second wait)
+#
+# Returns 0 on success (syncobj signalled within timeout) or a
+# GPU_ERR_* code on failure. Does NOT verify the post-dispatch
+# marker or the output bytes — that's the caller's job.
+#
+# IB and fence are allocated at hardcoded VAs (0xFFFF800100200000
+# and 0xFFFF800100600000 respectively) — caller's BOs must not
+# collide with these. The 5-entry BO_HANDLES list is hardcoded:
+# fence / stub / out / shader / IB. Generalising to caller-provided
+# residency is a Step 4c+ follow-up.
+# Step 4f.iv: dispatch using the per-context cached IB + fence BOs
+# from gpu_context_new_native. Replaces native_compute_dispatch_simple
+# (Step 4b's per-dispatch alloc-and-free path). Caller passes the
+# GpuContext so we can pull cached BO handles + VAs + CPU mmap addrs
+# (saves ~7 syscalls of BO churn per dispatch). The shader / stub /
+# output handles come from the caller (still per-dispatch, since
+# they're user-provided resources).
+fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
+        shader_handle, out_handle, timeout_ns) {
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var ib_handle   = native_ctx_ib_handle(ctx);
+    var ib_va       = native_ctx_ib_va(ctx);
+    var ib_addr     = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_addr   = native_ctx_fence_addr(ctx);
+
+    # Stage PM4 into the cached IB BO (memset + memcpy; no alloc).
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+
+    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
+    store64(fence_addr + 32, 0);
+
+    # Build the 5-entry inline BO_HANDLES list (Mesa rusticl shape).
+    var entries[40];
+    store32(&entries +  0, fence_handle);  store32(&entries +  4, 1);
+    store32(&entries +  8, stub_handle);   store32(&entries + 12, 3);
+    store32(&entries + 16, out_handle);    store32(&entries + 20, 3);
+    store32(&entries + 24, shader_handle); store32(&entries + 28, 4);
+    store32(&entries + 32, ib_handle);     store32(&entries + 36, 10);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 5);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+
+    # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
+    var syncobj_handle_ptr = alloc(8);
+    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var syncobj_handle = load64(syncobj_handle_ptr);
+
+    # 4-chunk Mesa-shape submit.
+    rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+                                 AMDGPU_HW_IP_COMPUTE, syncobj_handle,
+                                 fence_handle, 32, 0x08);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_syncobj_destroy(fd, syncobj_handle);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+
+    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    native_syncobj_destroy(fd, syncobj_handle);
+    return _native_neg_rc_to_gpu_err(wait_rc);
+}
+
+# ================================================================
+# v3 Step 4c — native Backend interface implementation
+# ================================================================
+# Fills the @internal Backend struct (src/backend.cyr) with native
+# (AMD/amdgpu/GFX9) slot wrappers. Step 4c lands the compute_dispatch
+# slot end-to-end + 9 stubs for the rest. Step 4d+ will fill the
+# stubs as native buffer / shader_module / surface paths land.
+#
+# Native GpuContext field interpretation:
+#   On wgpu, the +0..+24 fields are instance/adapter/device/queue.
+#   On native, they are reinterpreted as:
+#     +0:  fd            (DRM render-node fd)
+#     +8:  ctx_id        (amdgpu context id)
+#     +16: stub_handle   (Mesa scratch V# stub BO handle)
+#     +24: stub_va       (stub BO VA, canonical-high)
+#     +40: stub_addr     (stub BO CPU mmap pointer; native-only,
+#                         used for the post-dispatch marker check)
+#   The +32 backend ptr is the same on both; backend_kind(b) tells
+#   you which interpretation to use. wgpu leaves +40 zero. Future
+#   native contexts that need more state will need to grow
+#   GpuContext or push state behind the backend ptr.
+#
+# Buffer-handle convention used by the slot wrappers:
+#   shmod and bp args are pointers to 16-byte (handle, va) pairs:
+#     +0: u64 KMS handle
+#     +8: u64 GPU VA
+#   This is a private convention between caller and the native
+#   compute_dispatch slot — until a public gpu_buffer_native_new()
+#   helper lands, callers pack the pair manually.
+
+fn native_ctx_fd(ctx)             { return load64(ctx +  0); }
+fn native_ctx_id(ctx)              { return load64(ctx +  8); }
+fn native_ctx_stub_handle(ctx)     { return load64(ctx + 16); }
+fn native_ctx_stub_va(ctx)         { return load64(ctx + 24); }
+fn native_ctx_stub_addr(ctx)       { return load64(ctx + 40); }
+fn native_ctx_ib_handle(ctx)       { return load64(ctx + 48); }
+fn native_ctx_ib_va(ctx)           { return load64(ctx + 56); }
+fn native_ctx_ib_addr(ctx)         { return load64(ctx + 64); }
+fn native_ctx_fence_handle(ctx)    { return load64(ctx + 72); }
+fn native_ctx_fence_va(ctx)        { return load64(ctx + 80); }
+fn native_ctx_fence_addr(ctx)      { return load64(ctx + 88); }
+
+# Pack (handle, va) into the private 16-byte buffer-pair shape.
+# Caller allocates 16 bytes for `dst` (typically a stack-local
+# `var pair[16]`); this helper writes the two u64 fields.
+fn native_buf_pair_write(dst, handle, va) {
+    store64(dst + 0, handle);
+    store64(dst + 8, va);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Slot wrappers
+# ----------------------------------------------------------------
+
+# Slot signature: ctx_create_from_preinit(preinit_ptr) → ctx.
+# Native does not consume preinit_ptr — it opens its own DRM fd
+# and allocates its own ctx_id, packing them into a fresh ctx
+# struct. Step 4c stub: returns 0 (caller is expected to populate
+# ctx fields explicitly via native_ctx_init_from_handles below
+# until a real implementation lands in Step 4d+).
+fn _backend_native_ctx_create_from_preinit(preinit_ptr) {
+    return 0;
+}
+
+fn _backend_native_ctx_release(ctx) {
+    if (ctx == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var ctx_id = native_ctx_id(ctx);
+    var ib_handle = native_ctx_ib_handle(ctx);
+    var ib_va = native_ctx_ib_va(ctx);
+    var ib_addr = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_va = native_ctx_fence_va(ctx);
+    var fence_addr = native_ctx_fence_addr(ctx);
+    # Release per-context cached fence + IB BOs (Step 4f.iv).
+    if (fence_handle != 0) {
+        native_gem_va_unmap(fd, fence_handle, fence_va, 4096);
+        native_bo_release_gtt(fd, fence_handle, fence_addr, 4096);
+    }
+    if (ib_handle != 0) {
+        native_gem_va_unmap(fd, ib_handle, ib_va, 4096);
+        native_bo_release_gtt(fd, ib_handle, ib_addr, 4096);
+    }
+    if (ctx_id != 0) { native_ctx_free(fd, ctx_id); }
+    if (fd > 0) { sys_close(fd); }
+    return 0;
+}
+
+# Buffer slots — Step 4c stubs. Native BO management (gpu_buffer_*
+# routed through ctx->backend) is Step 4d+ work. Returning err
+# means "not implemented" without crashing.
+fn _backend_native_buffer_create(ctx, size, usage) {
+    return 0;
+}
+
+fn _backend_native_buffer_write(ctx, buf, off, ptr, n) {
+    return GPU_ERR_OTHER;
+}
+
+fn _backend_native_buffer_read(ctx, buf, off, ptr, n) {
+    return GPU_ERR_OTHER;
+}
+
+fn _backend_native_buffer_release(ctx, buf) {
+    return 0;
+}
+
+# Shader-module slots — stubs. Native shader modules are pre-
+# compiled GFX9 ISA bytes mapped to a BO at a canonical-high VA;
+# Step 4d+ will wrap that.
+fn _backend_native_shader_module_create(ctx, bytes_ptr, n) {
+    return 0;
+}
+
+fn _backend_native_shader_module_release(ctx, shmod) {
+    return 0;
+}
+
+# Compute dispatch — the load-bearing slot. Step 4c lands this
+# end-to-end. shmod and bp are pointers to (handle, va) pairs.
+fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (shmod == 0) { return GPU_ERR_OTHER; }
+    if (bp == 0)    { return GPU_ERR_OTHER; }
+
+    var stub_va = native_ctx_stub_va(ctx);
+    var shader_handle = load64(shmod + 0);
+    var shader_va     = load64(shmod + 8);
+    var out_handle = load64(bp + 0);
+    var out_va     = load64(bp + 8);
+
+    var pm4 = alloc(256);
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
+                            shader_va, stub_va, out_va, x, y, z);
+
+    var t_now[16];
+    syscall(228, 1, &t_now);
+    var ns_now = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8);
+    var deadline = ns_now + 15000000000;
+
+    # Step 4f.iv: route through the cached-BO path. The IB and
+    # fence BOs were allocated once in gpu_context_new_native; we
+    # just memcpy PM4 into the cached IB and submit.
+    return native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
+                                          shader_handle, out_handle,
+                                          deadline);
+}
+
+# Device wait — stub. Native dispatch is synchronous (waits on the
+# syncobj before native_compute_dispatch_simple returns), so a
+# separate device_wait_id
 
 # --- buffer.cyr ---
 
@@ -2028,6 +4599,53 @@ fn read_buffer_capped(device, queue, buffer, size, max_bytes) {
     wgpu_buffer_unmap(staging);
     wgpu_buffer_release(staging);
     return result;
+}
+
+# ================================================================
+# v3 Step 3c — ctx-aware buffer read (dispatches through backend)
+# ================================================================
+# Public v3-shape API per docs/proposals/v3-native-api-principles.md:
+# every operation that takes a ctx routes through ctx->backend->slot.
+# This fn validates the buffer_read slot flow end-to-end.
+#
+# Reads n bytes starting at off from buf into the caller-allocated
+# ptr. Returns 0 on success or a GPU_ERR_* code. Does not allocate.
+#
+# Coexists with the legacy read_buffer / read_buffer_capped above,
+# which take (device, queue, buffer, size) and return an alloc-and-
+# fill heap pointer. Those stay for v2.x consumer compatibility and
+# retire alongside the v3.x→v5.1 buffer-name shim retirement.
+
+fn gpu_buffer_read(ctx, buf, off, ptr, n) {
+    if (ctx == 0) { return GPU_ERR_BUFFER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_BUFFER_READ);
+    return fncall5(slot, ctx, buf, off, ptr, n);
+}
+
+# Allocate a GPU buffer of `size` bytes with the given usage flags.
+# Returns the backend handle (an opaque u64); 0 on failure.
+fn gpu_buffer_create(ctx, size, usage) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_BUFFER_CREATE);
+    return fncall3(slot, ctx, size, usage);
+}
+
+# Write n bytes from ptr into buf at off. Returns 0 on success.
+fn gpu_buffer_write(ctx, buf, off, ptr, n) {
+    if (ctx == 0) { return GPU_ERR_BUFFER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_BUFFER_WRITE);
+    return fncall5(slot, ctx, buf, off, ptr, n);
+}
+
+# Release a GPU buffer obtained from gpu_buffer_create. Returns 0.
+fn gpu_buffer_release(ctx, buf) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_BUFFER_RELEASE);
+    return fncall2(slot, ctx, buf);
 }
 
 # ================================================================
@@ -2658,6 +5276,60 @@ fn compute_pipeline_release(cp) {
     wgpu_bind_group_layout_release(compute_pipeline_bgl(cp));
     wgpu_pipeline_layout_release(compute_pipeline_layout(cp));
     return 0;
+}
+
+# ================================================================
+# v3 Step 3e — ctx-aware shader-module dispatchers
+# ================================================================
+# Public v3-shape API per docs/proposals/v3-native-api-principles.md:
+# every operation that takes a ctx routes through ctx->backend->slot.
+# Coexists with the legacy compute_pipeline_new above (which takes
+# WGSL source + builds a full pipeline + bind group layout in one
+# step). The dispatchers here expose the lower-level shader-module
+# primitive so consumers can stage shader bytes once and reuse them
+# across pipelines once Step 3g lands gpu_compute_dispatch.
+#
+# bytes_ptr semantics are backend-specific:
+#   wgpu  — UTF-8 WGSL source, possibly null-terminated
+#   AMD   — pre-compiled GFX9 ISA bytes (Step 3g consumer)
+
+fn gpu_shader_module_create(ctx, bytes_ptr, n) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_SHADER_MODULE_CREATE);
+    return fncall3(slot, ctx, bytes_ptr, n);
+}
+
+fn gpu_shader_module_release(ctx, shmod) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_SHADER_MODULE_RELEASE);
+    return fncall2(slot, ctx, shmod);
+}
+
+# ================================================================
+# v3 Step 3g — ctx-aware compute dispatch (fncall6)
+# ================================================================
+# Slot signature: (ctx, shmod, x, y, z, bindings_ptr) → 0|err.
+# This is the highest-arity slot in the Backend interface and the
+# first time mabda exercises Cyrius-to-Cyrius fncall6 through a
+# struct slot. fncall6 against extern-C wgpu functions has been
+# historically unreliable (per the feedback_fncall6_wgpu memory
+# note) — the fix on that side is a struct-packing C shim. The
+# Cyrius-side fncall6 (cyrius callee, no extern-C ABI mismatch)
+# should work; this dispatcher is the test.
+#
+# bindings_ptr is a raw byte buffer of (slot, kind, handle)
+# triples per the bindless-resources non-negotiable in
+# docs/proposals/v3-native-api-principles.md. The format is not
+# yet finalized; consumers and slot wrappers can ignore it for
+# now (Step 2 wgpu wrapper returns GPU_ERR_OTHER unconditionally).
+
+fn gpu_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_COMPUTE_DISPATCH);
+    return fncall6(slot, ctx, shmod, x, y, z, bp);
 }
 
 # --- shader_cache.cyr ---
@@ -3539,6 +6211,53 @@ fn texture_cache_has(cache, key) {
     return map_u64_has(cache, key);
 }
 
+# ================================================================
+# v3 Step 5.7 — public ctx-aware texture dispatchers
+# ================================================================
+# Public v3-shape API per docs/proposals/v3-native-api-principles.md:
+# every operation that takes a ctx routes through ctx->backend->slot.
+# Coexists with the v2.x texture_create_rgba8 / texture_release /
+# etc. above, which retire at v5.1 alongside the wgpu path.
+#
+# Slot signatures (from docs/proposals/v3-backend-interface.md v1):
+#   texture_create_2d_rgba8 (ctx, width, height)        → tex_ptr
+#   texture_write           (ctx, tex_ptr, src, n)      → 0|err
+#   texture_read            (ctx, tex_ptr, dst, n)      → 0|err
+#   texture_release         (ctx, tex_ptr)              → 0
+#
+# Returns are backend-specific. wgpu wraps a 32-byte
+# {handle, view, sampler, width|height} struct; native wraps a
+# 32-byte NativeTexture (handle, va, addr, size). Caller treats
+# tex_ptr as opaque.
+
+fn gpu_texture_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8);
+    return fncall3(slot, ctx, width, height);
+}
+
+fn gpu_texture_write(ctx, tex, src, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_TEXTURE_WRITE);
+    return fncall4(slot, ctx, tex, src, n);
+}
+
+fn gpu_texture_read(ctx, tex, dst, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_TEXTURE_READ);
+    return fncall4(slot, ctx, tex, dst, n);
+}
+
+fn gpu_texture_release(ctx, tex) {
+    if (ctx == 0) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+                                BACKEND_SLOT_TEXTURE_RELEASE);
+    return fncall2(slot, ctx, tex);
+}
+
 # --- render_target.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
@@ -3683,6 +6402,35 @@ fn rtb_build(b, device) {
         store64(rt + 56, depth);
     }
     return rt;
+}
+
+# ================================================================
+# v3 public dispatchers — Backend-routed render-target API (Step 6.9)
+# ================================================================
+# These dispatch through ctx->backend->render_target_* slots. They
+# coexist with the v2.x rtb_* / render_target_* helpers above; v2.x
+# wgpu programs that build their own RenderTarget directly continue
+# to work, and new programs can use the dispatcher for backend-
+# agnostic code. Returned rt_ptr is opaque (32-byte struct on both
+# backends — see docs/proposals/v3-backend-interface.md v2.1).
+
+fn gpu_render_target_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8);
+    if (slot == 0) { return 0; }
+    return fncall3(slot, ctx, width, height);
+}
+
+fn gpu_render_target_release(ctx, rt) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, rt);
 }
 
 # --- render_pipeline.cyr ---
@@ -3965,6 +6713,37 @@ fn rpb_build(b) {
     return render_pipeline_create_simple(device, module, format);
 }
 
+# ================================================================
+# v3 public dispatchers — Backend-routed render-pipeline API (Step 6.9)
+# ================================================================
+# These dispatch through ctx->backend->render_pipeline_* slots. They
+# coexist with the v2.x render_pipeline_create_simple / rpb_* path —
+# the v2.x path returns a 24-byte struct holding handle+layout+bgl;
+# the v3 path returns whatever shape the backend chose (16 bytes on
+# wgpu — handle only; native uses pipeline_sh_block + pipeline_ctx_block).
+# Slot signatures from docs/proposals/v3-backend-interface.md v2.1.
+
+fn gpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
+    if (ctx == 0) { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE);
+    if (slot == 0) { return 0; }
+    return fncall4(slot, ctx, vs_mod, fs_mod, color_fmt);
+}
+
+fn gpu_render_pipeline_release(ctx, pipe) {
+    if (ctx == 0) { return 0; }
+    if (pipe == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, pipe);
+}
+
 # --- render_pass.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
@@ -4102,6 +6881,49 @@ fn rpb_pass_begin(encoder, b) {
     # consumes it).
     store64(args + 32, load64(b));  # label
     return wgpu_command_encoder_begin_render_pass(encoder, args);
+}
+
+# ================================================================
+# v3 public dispatchers — Backend-routed render-pass API (Step 6.9)
+# ================================================================
+# These dispatch through ctx->backend->render_pass_* slots. They
+# coexist with the v2.x rpb_pass_* builder path. The v2 slot
+# interface clears on every pass-begin (load_op = preserve is a
+# v2.1 expansion); for the v2.x preserve case use rpb_pass_color
+# with clear_color = 0 instead. clear_color_ptr is a 32-byte f64
+# RGBA block (mabda Color shape — same as WGPUColor in webgpu.h v29).
+# Slot signatures from docs/proposals/v3-backend-interface.md v2.1.
+
+fn gpu_render_pass_begin(ctx, rt, clear_color_ptr) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN);
+    if (slot == 0) { return 0; }
+    return fncall3(slot, ctx, rt, clear_color_ptr);
+}
+
+fn gpu_render_pass_draw(ctx, pass, pipe, vertex_count, instance_count) {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0)    { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW);
+    if (slot == 0) { return GPU_ERR_OTHER; }
+    return fncall5(slot, ctx, pass, pipe, vertex_count, instance_count);
+}
+
+fn gpu_render_pass_end(ctx, pass) {
+    if (ctx == 0) { return 0; }
+    if (pass == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, pass);
 }
 
 # --- render_graph.cyr ---
