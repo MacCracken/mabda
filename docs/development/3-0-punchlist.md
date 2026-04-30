@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.4(b) — present primitive + FB alloc helpers landed)
+**Last refresh:** 2026-04-30 (post Step 7.5 — backend surface slot layout landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -563,8 +563,26 @@ need it.
   exercise yet (same logind master gate as 7.2(d)). 4 new CPU
   tests, 19 asserts. 297 phase_d + 836 v3 + 624 mabda CPU
   asserts green. (Step 7.4(b), 2026-04-30).
-- [ ] **7.5** — Backend interface surface slots
-  (`surface_configure / acquire / present`).
+- [x] **7.5** — Backend interface surface slots — pure layout
+  extension in `src/backend.cyr`. 4 new slot offset constants
+  (configure / acquire / present / release at 176 / 184 / 192 /
+  200), bumped `BACKEND_SIZE` 176 → 208, added
+  `BACKEND_SURFACE_SLOTS_BEGIN/END` range markers (176 / 208).
+  Slot signatures documented inline:
+  `surface_configure(ctx, w, h) → surface_ptr`,
+  `surface_acquire(ctx, surface) → fb_ptr`,
+  `surface_present(ctx, surface) → 0|err`,
+  `surface_release(ctx, surface) → 0`. All within the fncall
+  ceiling. `backend_is_complete` deliberately defers the v3
+  surface range walk until 7.6 lands real wgpu/native wrappers
+  (mirrors the 6.8(a) approach: layout in tree, completeness
+  follows when there's an implementation to check). 10 new
+  layout asserts in `tests/tcyr/mabda_v3.tcyr` cover every new
+  constant. **846 v3** + 297 phase_d + 624 mabda CPU asserts
+  green; smoke + lint + distlib clean. Code-only — proposal
+  doc revision is a sub-task of 7.7's public-API design where
+  the architectural questions (TTY-only vs logind-aware) get
+  resolved. (Step 7.5, 2026-04-30).
 - [ ] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
   wrappers.
 - [ ] **7.7** — Public dispatchers + `programs/native_present_e2e.cyr`
@@ -784,7 +802,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **all KMS primitives in tree (7.1–7.4 + 7.4(b))**; HW exercise gated on logind master; backend interface slots (7.5) + wrappers (7.6) + public API (7.7) ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout in tree (7.1–7.5)**; wrappers (7.6) + public API (7.7) ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

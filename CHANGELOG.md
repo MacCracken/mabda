@@ -880,6 +880,57 @@ No HW exercise yet — same logind master gate as 7.2(d) / 7.4.
 alloc + release null-safety, present null-safety covering
 fd / scanout / new_fb / no-crtc.
 
+### Added — 2026-04-30 (Step 7.5 — Backend interface surface slot layout)
+
+Code-only extension to `src/backend.cyr`, mirroring the 5.4 /
+6.8(a) pattern: declare slot offsets + bump struct size +
+expose range markers, defer the implementation wrappers to the
+following step.
+
+- **4 new slot offsets**: `BACKEND_SLOT_SURFACE_CONFIGURE`
+  (176), `_ACQUIRE` (184), `_PRESENT` (192), `_RELEASE` (200).
+- **`BACKEND_SIZE`** bumped 176 → 208.
+- **`BACKEND_SURFACE_SLOTS_BEGIN/END`** = 176 / 208 range markers.
+- **Slot signatures documented inline** in the source:
+  - `surface_configure(ctx, w, h) → surface_ptr` — sets up the
+    surface (wgpu: `wgpu_surface_configure`; native: opens
+    card+render fds + runs full modeset + allocs 2 FBs).
+  - `surface_acquire(ctx, surface) → fb_ptr` — returns the
+    back-buffer the consumer renders into (wgpu: texture view;
+    native: the `NativeKmsFb` not currently scanning).
+  - `surface_present(ctx, surface) → 0|err` — submits the
+    back-buffer for display + swaps front/back.
+  - `surface_release(ctx, surface) → 0` — backend-owned
+    cleanup. Consumer-owned window/fd lifecycle stays the
+    consumer's call (master-fd release in particular needs
+    7.7's design to settle).
+- **`backend_is_complete` defers** the v3 surface range walk
+  until 7.6 lands the real wrappers — same pattern as 6.8(a).
+  Adding the range walk now would falsely report all backends
+  incomplete.
+
+10 new layout asserts in `tests/tcyr/mabda_v3.tcyr` cover every
+new constant (4 slot offsets + 2 range markers + total size +
+3 sanity arithmetic checks).
+
+The proposal-doc revision (`docs/proposals/v3-backend-interface.md`)
+is *intentionally* deferred — the load-bearing architectural
+question (TTY-only model vs logind-aware compositor delegation)
+is part of the 7.7 public-API design and writing the proposal
+now would lock in choices that 7.7 will need to revisit.
+
+### Metrics — 2026-04-30 (post Step 7.5)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: **846 assertions** (was 836 at
+  7.2(b) close; +10 from 7.5 layout asserts).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: 297 assertions (unchanged).
+- `src/backend.cyr`: ~165 lines (was ~155; +10 lines for the
+  v3 slot offsets + range markers + signature docstring).
+- `dist/mabda.cyr`: regenerated (11008 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
 ### Metrics — 2026-04-30 (post Step 7.4(b))
 
 - Module count: 34 (unchanged).
@@ -921,26 +972,20 @@ fd / scanout / new_fb / no-crtc.
 
 ### Next — 2026-04-30 (post Step 7.2(d))
 
-**KMS primitive layer is code-complete (7.1–7.4 + 7.4(b)).**
-Backend abstraction layer is the next bite:
+**KMS primitives + backend slot layout in tree.** Wrappers next:
 
-1. **7.5 — Backend interface surface slots.** Doc-revision +
-   `src/backend.cyr` extension, mirroring 5.4 (texture slots) /
-   6.7 (render slots). Probable slots:
-   `surface_configure(ctx, w, h)` → surface_ptr,
-   `surface_acquire(ctx, surface)` → fb_ptr (for the consumer
-   to draw into), `surface_present(ctx, surface, fb)` → 0|err,
-   `surface_release(ctx, surface)`. Designs the v3.0 public
-   surface API shape.
-2. **7.6 — backend wrappers.** Wgpu side wraps existing
-   surface/swapchain code; native side wraps 7.4(b)'s
-   `native_kms_alloc_fb` + `native_kms_present` + the modeset
-   driver. The cross-fd story (card_fd vs render_fd) becomes a
-   ctx-internal detail consumers don't see.
-3. **7.7 — public `gpu_surface_*` API + e2e program.** v3.0
-   completion path. Architectural decision: TTY app / kiosk
-   model vs logind-aware compositor delegation. Primitives
-   ready either way; this is where the master-acquisition story
+1. **7.6 — backend wrappers**. `_backend_wgpu_surface_*`
+   (4 slot fns wrapping wgpu's surface/swapchain API) +
+   `_backend_native_surface_*` (4 slot fns wrapping 7.4(b)'s
+   present primitive + 7.2(d)'s modeset driver). Both backends
+   fill all 4 slots; `backend_is_complete` gets the v3 surface
+   range walk added here. The cross-fd story (card_fd vs
+   render_fd) becomes a ctx-internal detail.
+2. **7.7 — public `gpu_surface_*` API + e2e program.** v3.0
+   completion path. The architectural decision (TTY-only model
+   vs logind-aware compositor delegation) lands here, since
+   the public API needs to commit to one. Primitives ready
+   either way; this is where the master-acquisition story
    gets resolved.
 
 **Phase C render HW-gated items still pending:**
