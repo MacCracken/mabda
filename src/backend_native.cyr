@@ -1717,6 +1717,16 @@ fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
     pos = native_pm4_build_render_draw_tail(buf, pos);
+    # Flush CB/DB caches so the FB the kernel signals "complete" on
+    # actually contains the rendered pixels — ACQUIRE_MEM at top of
+    # the IB invalidates fetches but does NOT flush dirty CB writes.
+    # Without this the documented Failure A in
+    # programs/native_render_e2e.cyr fires (pixel readback returns
+    # the GTT sentinel byte). 6.10 prep landed the primitive; this
+    # is its splice site. See vidya
+    # phase_d_cache_flush_and_inv_post_draw entry for the
+    # ACQUIRE_MEM-vs-flush semantics.
+    pos = native_pm4_event_write_cache_flush_and_inv(buf, pos);
 
     var cur_dwords = pos / 4;
     var target_dwords = 256;
@@ -2563,6 +2573,11 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
                                               rt_width, rt_height);
     pos = native_pm4_build_render_draw_tail(pm4, pos);
+    # Post-draw cache flush — same rationale as the standalone
+    # composer above. CB writes need to land in memory before the
+    # syncobj signals so the consumer reads / page-flips see the
+    # rendered pixels.
+    pos = native_pm4_event_write_cache_flush_and_inv(pm4, pos);
     var cur_dwords = pos / 4;
     if (cur_dwords < 256) {
         pos = native_pm4_nop(pm4, pos, 256 - cur_dwords);

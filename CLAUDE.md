@@ -7,35 +7,80 @@ foundation layer for AGNOS. Owns device lifecycle, buffers, compute
 dispatch, textures, render pipelines, profiling, and capability
 detection.
 
-- **Type**: Cyrius library (include-chain) + dist bundle + C launcher
+- **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
+  (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 5.5.20+ (`cyrius.cyml: cyrius = "5.5.20"`)
-- **Version**: 2.5.0 — shipping as `lib/mabda.cyr` in the Cyrius stdlib
-- **GPU FFI**: wgpu-native v29 C API via `deps/wgpu_main.c` launcher
-  (65-slot function table, 7 struct-packing shims)
+- **Language**: Cyrius 5.7.48+ (`cyrius.cyml: cyrius = "5.7.48"`)
+- **Version**: 2.5.0 in tree — v3.0 ship is the active focus. v3.0
+  ships dual backend (wgpu + native AMD); native is `Backend`-slot-
+  abstracted alongside wgpu, AMD only in v3.0; NVIDIA/Intel native
+  scoped to v4.0/v5.0.
+- **GPU FFI**: dual-path
+  - **wgpu** — wgpu-native v29 C API via `deps/wgpu_main.c` launcher
+    (65-slot fn table, 7 struct-packing shims)
+  - **native AMD** — direct DRM ioctls via `syscall(SYS_IOCTL)`. No
+    libdrm. Phase B = compute (PM4 + AMDGPU CS), Phase C = textures
+    + render (clear-triangle composer, GFX-ring dispatch), Phase D =
+    KMS surface (modeset, page-flip, present)
+- **`samvada` dep** — sister AGNOS package (sibling of sakshi/patra/
+  sigil) carrying the dbus client for logind master delegation.
+  Wired via `[deps.samvada] tag = "0.2.0"`. Consumer programs link
+  `samvada/deps/samvada_main.c` to populate the C-shim fn-table.
+  v4.0 retires both `wgpu_main.c` and `samvada_main.c` together.
 
 ## Goal
 
 One Cyrius library that answers "set up a GPU device, move bytes on
-and off it, and draw / compute with them" for every AGNOS downstream.
-Portable enough that swapping wgpu-native for a native AGNOS driver in
-v3.x is an implementation detail, not an API break.
+and off it, and draw / compute / present with them" for every AGNOS
+downstream. v3.0 ships dual backend (wgpu and native AMD); v4.0
+retires the wgpu path for AMD. Backend abstraction is the
+load-bearing v3.0 architectural choice — the public API surface
+doesn't change between paths.
 
-## Current State
+## Current State (post Step 7.7, 2026-04-30)
 
-- **Source**: 30 domain modules under `src/*.cyr`, ~4,500 lines total.
-- **Tests**: 387 CPU-only assertions in `tests/tcyr/mabda.tcyr` plus
-  four GPU integration programs (`phase0`, `compute_e2e`, `render_e2e`,
-  `render_graph_e2e`) driven through the C launcher. GPU benchmarks
-  in `programs/benchmarks.cyr` (13 benches, Rust v1 parity set).
-- **Benchmarks**: `tests/bcyr/mabda.bcyr` — 7 CPU benches (color,
-  workgroup math, profiler, capability report). GPU benches via
-  `make bench-gpu`. Reference Rust numbers in
-  `docs/benchmarks-rust-v-cyrius.md`.
-- **Dist bundle**: `dist/mabda.cyr` — ~4,900 lines, ~160 KB.
+- **Source**: 35 domain modules under `src/*.cyr`, ~14,500 lines.
+- **Tests**: **1819 CPU-only assertions** across three files:
+  - `tests/tcyr/mabda.tcyr` — 624 (v2.x backend-agnostic surface)
+  - `tests/tcyr/mabda_v3.tcyr` — 858 (v3 backend abstraction +
+    Phase B/C compute + render)
+  - `tests/tcyr/mabda_v3_phase_d.tcyr` — 337 (Phase D KMS
+    primitives + 7.7 surface API)
+  Plus seven GPU integration programs (`phase0`, `compute_e2e`,
+  `render_e2e`, `render_graph_e2e` for wgpu; `native_compute_store`,
+  `native_texture_e2e`, `native_render_e2e` for native; plus
+  `native_kms_summary` and `native_kms_modeset_smoke` and
+  `native_present_e2e` for Phase D).
+- **Benchmarks**: `tests/bcyr/mabda.bcyr` — 7 CPU benches. GPU
+  benches via `make bench-gpu` (13 benches, Rust v1 parity set on
+  the wgpu path). Reference Rust numbers in
+  `docs/benchmarks-rust-v-cyrius.md`. Native-on-AMD bench cell
+  is Tier 3 work pending a consumer flip.
+- **Dist bundle**: `dist/mabda.cyr` — ~11,400 lines.
   `cyrius distlib` regenerates it.
 - **Integration**: consumed by soorat, rasa, ranga, bijli, aethersafta,
-  kiran (via soorat).
+  kiran (via soorat). Six-consumer regression sweep is Tier 2 ship
+  work.
+
+## Why v3.0 ships dual
+
+- **Backend abstraction layer** — `Backend` struct (208 bytes,
+  25 fnptr slots) + `backend_wgpu_new` / `backend_native_new`
+  fillers. Public API (`gpu_buffer_*` / `gpu_compute_dispatch` /
+  `gpu_texture_*` / `gpu_render_*` / `gpu_surface_*`) routes through
+  `ctx->backend->slot` via fncall1/2/3/5 — same call-site shape on
+  both backends, the slot impls differ.
+- **WGSL → GFX9 lowering deferred to v3.x.** The earlier "v3.0
+  ship-blocker" framing was wrong. `gpu_shader_module_create` is
+  byte-polymorphic at the backend boundary — wgpu reads bytes as
+  WGSL UTF-8, native reads as pre-compiled GFX9 ISA. Consumers
+  ship two-form bundles in v3.0; in-mabda WGSL frontend is a v3.x
+  pure-Cyrius project. See
+  `docs/proposals/v3-wgsl-frontend-choice.md`.
+- **Logind master gate solved by samvada.** `gpu_surface_configure_native_logind`
+  routes through `samvada_session_take_device` for the master fd;
+  `gpu_surface_configure_native_kiosk` is the alternate path where
+  the caller manages master themselves.
 
 ## Consumers
 
@@ -53,8 +98,17 @@ v3.x is an implementation detail, not an API break.
 - **Cyrius stdlib** — `string`, `fmt`, `alloc`, `vec`, `str`, `io`,
   `args`, `hashmap`, `syscalls`, `tagged`, `fnptr`, `mmap`, `dynlib`,
   `sakshi` (ships with Cyrius >= 5.4.7)
+- **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
+  delegation. Pinned via `[deps.samvada] tag = "0.2.0"` in
+  `cyrius.cyml`. mabda doesn't link libsystemd directly — consumer
+  programs link `samvada/deps/samvada_main.c` which calls into
+  `samvada_main(table)` to populate the static fn-table that
+  mabda's `_native_logind` slot reads from.
 - **wgpu-native v29** — external C library, downloaded by consumers
   alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep.
+- **libsystemd** — needed by samvada's C shim (`samvada_main.c`).
+  Consumer-provided link, not a mabda direct dep. Drops at v4.0
+  alongside wgpu-native.
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
@@ -91,72 +145,103 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ## Quick Start
 
 ```bash
-cyrius deps                              # resolve stdlib into lib/
-cyrius build programs/smoke.cyr build/mabda_smoke   # link-check
-cyrius test tests/tcyr/mabda.tcyr        # 387 CPU assertions
-cyrius bench tests/bcyr/mabda.bcyr       # 7 CPU benchmarks
-cyrius distlib                           # → dist/mabda.cyr
-make test-gpu                            # 4 GPU integration programs (needs wgpu-native)
-make bench-gpu                           # 13 GPU benchmarks
+cyrius deps                                          # resolve stdlib + samvada into lib/
+cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
+make test                                            # 1819 CPU assertions across 3 files
+cyrius bench tests/bcyr/mabda.bcyr                   # 7 CPU benchmarks
+cyrius distlib                                       # → dist/mabda.cyr
+make test-gpu                                        # wgpu integration programs (needs wgpu-native)
+make test-native-compute-store                       # native compute (needs amdgpu)
+make test-native-render-e2e                          # native render (HW-gated; cache-flush in tree)
+make test-native-kms-summary                         # KMS topology probe (works in any session)
+make test-native-kms-modeset                         # native modeset (HW + DRM master)
+make test-native-present-e2e                         # 120-frame animated present (HW + master)
+make bench-gpu                                       # 13 GPU benchmarks (wgpu only today)
 ```
 
 ## Architecture (flat — matches yukti / vidya)
 
 ```
 mabda/
-├── src/                 30 GPU library modules — flat, zero transitive includes
-│   ├── lib.cyr            — the single include chain (stdlib + domain modules)
-│   ├── error.cyr          — GpuErr codes + Result helpers
-│   ├── color.cyr          — f64-backed RGBA colour type
-│   ├── capabilities.cyr   — WebGPU limit detection
-│   ├── profiler.cyr       — CPU-side frame timing, EMA, history
-│   ├── resource.cyr       — RAII-ish buffer/texture lifetime tracker
-│   ├── wgpu_types.cyr     — @internal: usage/format/shader-stage enums
-│   ├── wgpu_descriptors.cyr — @internal: packed descriptor builders
-│   ├── wgpu_ffi.cyr       — @internal: 65-entry function-pointer table
-│   ├── context.cyr        — GpuContext (instance/adapter/device/queue)
-│   ├── buffer.cyr         — low-level buffer helpers
-│   ├── typed_buffer.cyr   — uniform/storage buffer metadata
-│   ├── gpu_timestamps.cyr — TIMESTAMP_QUERY feature wiring
-│   ├── compute.cyr        — compute pipeline + ping-pong helpers
-│   ├── shader_cache.cyr   — WGSL source → module cache (u64-keyed, v2.4.5)
-│   ├── pipeline_cache.cyr — u64 hash → pipeline cache (u64-keyed, v2.4.5)
-│   ├── bind_group_cache.cyr — u64 hash → bind group cache (u64-keyed, v2.4.5)
-│   ├── vertex.cyr         — Vertex2D / 3D layouts
-│   ├── blend.cyr          — BLEND_* constants
-│   ├── sampler.cyr        — sampler descriptor builder
-│   ├── depth.cyr          — depth-stencil state + depth-texture helpers
-│   ├── bind_group.cyr     — BGL builder
-│   ├── texture.cyr        — RGBA8 helpers, render-target create, cache
-│   ├── render_target.cyr  — RenderTarget + builder (texture + view + MSAA + depth)
-│   ├── render_pipeline.cyr — pipeline builder, create_simple, draw helpers
-│   ├── render_pass.cyr    — RenderPass builder + rpb_pass_begin dispatcher
-│   ├── render_graph.cyr   — DAG pass orchestration (v2.5.0)
-│   ├── surface.cyr        — surface configuration + acquire/present
-│   ├── instancing.cyr     — instance buffer + identity helpers
-│   └── debug.cyr          — push/pop debug markers
+├── src/                 35 GPU library modules — flat, zero transitive includes
+│   ├── lib.cyr                      — single include chain (stdlib + domain modules + samvada)
+│   ├── error.cyr                    — GpuErr codes + Result helpers
+│   ├── color.cyr                    — f64-backed RGBA colour type
+│   ├── capabilities.cyr             — WebGPU limit detection
+│   ├── profiler.cyr                 — CPU-side frame timing, EMA, history
+│   ├── resource.cyr                 — RAII-ish buffer/texture lifetime tracker
+│   ├── wgpu_types.cyr               — @internal: usage/format/shader-stage enums
+│   ├── wgpu_descriptors.cyr         — @internal: packed descriptor builders
+│   ├── wgpu_ffi.cyr                 — @internal: 65-entry wgpu fn-pointer table
+│   ├── backend.cyr                  — @internal: Backend struct (208 B, 25 slots)
+│   │                                  + BACKEND_KIND_* + null-slot helpers
+│   ├── backend_wgpu.cyr             — @internal: wgpu fillers for all 25 slots
+│   ├── context.cyr                  — GpuContext (112 B; dual-interpretation
+│   │                                  +0..+24 + backend ptr + native cache + surface stash)
+│   ├── backend_native.cyr           — @internal: native AMD fillers (compute/render slots)
+│   │                                  + PM4 builders + DRM/AMDGPU ioctls + native_kms_*
+│   ├── backend_native_kms.cyr       — @internal: KMS surface ioctls (modeset/page-flip/PRIME)
+│   ├── buffer.cyr                   — public gpu_buffer_* dispatch through ctx->backend
+│   ├── typed_buffer.cyr             — uniform/storage buffer metadata
+│   ├── gpu_timestamps.cyr           — TIMESTAMP_QUERY feature wiring
+│   ├── compute.cyr                  — public gpu_compute_dispatch + ping-pong helpers
+│   ├── shader_cache.cyr             — WGSL source → module cache (u64-keyed, v2.4.5)
+│   ├── pipeline_cache.cyr           — u64 hash → pipeline cache
+│   ├── bind_group_cache.cyr         — u64 hash → bind group cache
+│   ├── vertex.cyr                   — Vertex2D / 3D layouts
+│   ├── blend.cyr                    — BLEND_* constants
+│   ├── sampler.cyr                  — sampler descriptor builder
+│   ├── depth.cyr                    — depth-stencil state + depth-texture helpers
+│   ├── bind_group.cyr               — BGL builder
+│   ├── texture.cyr                  — public gpu_texture_* dispatch through ctx->backend
+│   ├── render_target.cyr            — public gpu_render_target_* + RenderTargetBuilder
+│   ├── render_pipeline.cyr          — public gpu_render_pipeline_* + builder + create_simple
+│   ├── render_pass.cyr              — public gpu_render_pass_* + RenderPassBuilder
+│   ├── render_graph.cyr             — DAG pass orchestration (v2.5.0)
+│   ├── surface.cyr                  — v2 wgpu surface_state_* lifecycle
+│   ├── surface_v3.cyr               — public gpu_surface_* dispatchers (Step 7.7):
+│   │                                  configure_wgpu / _native_kiosk / _native_logind +
+│   │                                  acquire / present / release
+│   ├── instancing.cyr               — instance buffer + identity helpers
+│   └── debug.cyr                    — push/pop debug markers
 ├── tests/
-│   ├── tcyr/mabda.tcyr    — consolidated CPU-only suite (387 assertions)
-│   └── bcyr/mabda.bcyr    — CPU-only benchmark harness (7 benches)
+│   ├── tcyr/
+│   │   ├── mabda.tcyr               — v2 backend-agnostic suite (624 asserts)
+│   │   ├── mabda_v3.tcyr            — v3 backend abstraction +
+│   │   │                              compute + render (858 asserts)
+│   │   └── mabda_v3_phase_d.tcyr    — Phase D KMS + 7.7 surface API (337 asserts)
+│   └── bcyr/mabda.bcyr              — CPU benchmark harness (7 benches)
 ├── programs/
-│   ├── smoke.cyr              — link-check for the full include chain
-│   ├── phase0.cyr             — GPU smoke (buffer/texture/pipeline) — 10 PASS
-│   ├── compute_e2e.cyr        — compute dispatch round-trip — 7 PASS
-│   ├── render_e2e.cyr         — render pass clear + pixel verify — 8 PASS
-│   ├── render_graph_e2e.cyr   — 3-node DAG (compute → render → copy) — 5 PASS
-│   └── benchmarks.cyr         — 13 GPU benches, Rust-v1 parity set
-├── dist/mabda.cyr         — bundle for `[deps.mabda]` consumers
+│   ├── smoke.cyr                    — link-check for the full include chain
+│   ├── phase0.cyr                   — wgpu GPU smoke (buffer/texture/pipeline)
+│   ├── compute_e2e.cyr              — wgpu compute dispatch round-trip
+│   ├── render_e2e.cyr               — wgpu render pass clear + pixel verify
+│   ├── render_graph_e2e.cyr         — wgpu 3-node DAG (compute → render → copy)
+│   ├── benchmarks.cyr               — 13 GPU benches, Rust-v1 parity (wgpu)
+│   ├── native_compute_store.cyr     — native compute, write 0xDEADBEEF + readback
+│   ├── native_texture_e2e.cyr       — native texture round-trip
+│   ├── native_render_e2e.cyr        — native render: clear-triangle + pixel verify
+│   ├── native_kms_summary.cyr       — KMS topology probe (Phase D, no-master)
+│   ├── native_kms_modeset_smoke.cyr — native modeset visual smoke (red screen)
+│   └── native_present_e2e.cyr       — 7.7 e2e: 120-frame animated gradient
+├── dist/mabda.cyr                   — bundle for [deps.mabda] consumers
 ├── deps/
-│   ├── wgpu_main.c        — C launcher: fn table + struct-packing shims
-│   └── wgpu-native/       — external C binaries (gitignored)
-├── cyrius.cyml            — package manifest + [lib] + [deps]
-├── Makefile               — thin wrapper over `cyrius` CLI + GPU path
-└── VERSION                — source of truth, templated into manifest
+│   ├── wgpu_main.c                  — C launcher: wgpu fn table + struct-packing shims
+│   └── wgpu-native/                 — external C binaries (gitignored)
+├── lib/                             — populated by `cyrius deps` (gitignored):
+│   ├── string.cyr / fmt.cyr / ...   — Cyrius stdlib copies
+│   └── samvada.cyr                  — symlink into ~/.cyrius/deps/samvada/0.2.0/dist/
+├── cyrius.cyml                      — package manifest + [lib] + [deps] + [deps.samvada]
+├── Makefile                         — wrapper over `cyrius` CLI + GPU paths + native programs
+└── VERSION                          — source of truth, templated into manifest
 ```
 
 ## FFI Architecture
 
-GPU programs go through the C launcher (`deps/wgpu_main.c`):
+mabda has two GPU paths and one auxiliary dbus path; each uses the
+fn-table-via-C-shim pattern.
+
+### wgpu path (`deps/wgpu_main.c`)
 
 1. C `main()` calls `_cyrius_init()` then `alloc_init()`
 2. C pre-initializes GPU (instance/adapter/device/queue — Vulkan-only
@@ -168,16 +253,58 @@ GPU programs go through the C launcher (`deps/wgpu_main.c`):
 5. Cyrius calls wgpu via `fncall1`/`fncall2`/`fncall5` and struct-packed
    shims — **never** `fncall6` with a struct-by-value arg
 
-For standalone library testing (no GPU), `cyrius test` runs
-`tests/tcyr/mabda.tcyr` against `src/lib.cyr` — no wgpu-native needed.
+### Native AMD path (no C shim)
+
+Compute / render / surface ioctls go directly through
+`syscall(SYS_IOCTL)` — no C library, no libdrm. Pure Cyrius.
+Mappings:
+
+- **`/dev/dri/renderD128`** for compute + render allocator (BO
+  create / mmap / GEM close / VA map). AMDGPU-specific ioctls
+  (GEM_CREATE / CTX / BO_LIST / GEM_VA / CS) routed through fd
+  with no master required.
+- **`/dev/dri/cardN`** for KMS surface (MODE_GETRESOURCES /
+  MODE_GETCONNECTOR / MODE_GETENCODER / ADDFB2 / SETCRTC /
+  PAGE_FLIP). Requires DRM master — see `samvada` path for the
+  in-session master story.
+- **PRIME bridge** between the two fds for the surface FB story
+  (see `phase_d_prime_cross_fd_handle_bridge` vidya entry).
+
+### samvada path (`samvada/deps/samvada_main.c`)
+
+Consumer programs that use `gpu_surface_configure_native_logind`
+link `samvada/deps/samvada_main.c` alongside their wgpu launcher.
+Same fn-table pattern:
+
+1. C `main()` builds the samvada 9-slot table (sd_bus_*) and calls
+   `samvada_main(table)` to populate samvada's static reference.
+2. Cyrius calls `samvada_session_take_device(major, minor)` etc.
+   via fncall through the table.
+3. mabda's `_backend_native_surface_configure_logind` slot reads
+   the master fd back from samvada and stashes on
+   `gpu_ctx_native_card_fd` for the slot dispatch.
+
+### CPU testing (no GPU, no master, no dbus)
+
+`cyrius test` runs the three `tests/tcyr/*.tcyr` files against
+`src/lib.cyr` — no wgpu-native, no amdgpu hardware, no libsystemd
+needed. Backend-abstraction routing exercised via mock-fnptr
+sentinels; native ioctls / wgpu calls / sd_bus calls all surface
+as null-safety + struct-shape tests at the Cyrius layer. HW gates
+live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 387 CPU assertions + 4 GPU integration
-  programs, all passing. Every new code path adds an assertion.
-- **Own the stack** — if AGNOS wraps something external, depend on the
-  AGNOS crate (sakshi, yukti, patra). wgpu-native is the sole C dep
-  and it is consumer-provided, not vendored.
+- **Tests are the way** — 1819 CPU assertions across three test
+  files + a dozen GPU/HW programs. Every new code path adds an
+  assertion. Stack-local `var ctx[112]` for test-scoped buffers
+  (heap-allocated tests exhaust the bump allocator — see
+  `bump_allocator_exhaustion_in_tests` vidya entry).
+- **Own the stack** — every external dep is either an AGNOS package
+  (samvada, sakshi, patra, sigil) or a consumer-provided C library
+  (wgpu-native, libsystemd-via-samvada). wgpu-native and libsystemd
+  both retire at v4.0; the trajectory is pure-Cyrius all the way
+  down.
 - **No magic** — every operation measurable, auditable, traceable.
 - **Manual memory** — `alloc / store64 / load64`. Every struct has a
   header comment block with field offsets.
@@ -195,7 +322,17 @@ For standalone library testing (no GPU), `cyrius test` runs
   Cyrius functions can take 12+ args without issue, but the moment one
   internally `fncall*`s into wgpu-native, any signature with 7+ params
   reliably segfaults. Fold into a struct pointer or split. See
-  `feedback_cyrius_param_ceiling.md`.
+  `fncall6_ceiling_into_extern_c` vidya entry.
+- **`var X = expr;` initialization required.** Cyrius rejects bare
+  `var X;` declarations — every var needs an initializer. Use
+  `var X = 0;` for "to-be-set-later" pattern.
+- **`gpu_shader_module_create` is byte-polymorphic.** wgpu reads as
+  WGSL, native reads as pre-compiled GFX9 ISA. v3.0 ships consumer
+  two-form bundles; in-mabda WGSL → GFX9 lowering is v3.x scope.
+- **Phase D ioctl ordering matters.** Discovery → mode-pick → encoder
+  → CRTC → AddFB2 → SETCRTC → PAGE_FLIP. Skipping discovery and
+  hardcoding IDs breaks across reboots. See
+  `phase_d_kms_sequencing` vidya entry.
 
 ## Development Process
 
@@ -203,9 +340,12 @@ For standalone library testing (no GPU), `cyrius test` runs
 
 0. Read roadmap, CHANGELOG, audit history — know what was intended
 1. Cleanliness: `cyrius build programs/smoke.cyr` (0 warnings),
-   `cyrius lint` (0 warnings), `cyrius fmt --check` diff-clean,
+   per-file `cyrius lint src/*.cyr` (0 warnings; the bare repo-wide
+   form was removed in 5.7.x — see
+   `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 286+ assertions pass, `cyrius distlib` diff-clean
+2. Test sweep: 1819+ assertions pass across all three test files,
+   `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
 5. External research — wgpu-native / WebGPU / GPU-driver CVE sweep
@@ -276,19 +416,27 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ### Closeout Pass (before every minor/major bump)
 
-1. Full CPU suite — `cyrius test tests/tcyr/mabda.tcyr` passes
+1. Full CPU suite — `make test` runs all three files
+   (`mabda.tcyr` + `mabda_v3.tcyr` + `mabda_v3_phase_d.tcyr`); 1819+
+   asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
-3. GPU integration — `make test-phase0` passes on a box with wgpu-native
-4. `cyrius distlib` regenerates `dist/mabda.cyr` diff-clean
-5. Version consistency — `./scripts/version-check.sh` passes
-6. Consumer check — soorat, rasa, ranga, bijli, aethersafta still build
-   against the new bundle
-7. Audit index up to date — `docs/audit/` has the current
+3. GPU integration (wgpu) — `make test-phase0` passes on a box with
+   wgpu-native
+4. GPU integration (native) — `make test-native-compute-store`
+   passes on a box with amdgpu (HW-gated; requires AMD render node).
+   `make test-native-render-e2e` and Phase D programs run from a
+   tty / kiosk session OR with samvada+logind wired through a
+   consumer.
+5. `cyrius distlib` regenerates `dist/mabda.cyr` diff-clean
+6. Version consistency — `./scripts/version-check.sh` passes
+7. Consumer check — soorat, rasa, ranga, bijli, aethersafta still build
+   against the new bundle (Tier 2 ship work)
+8. Audit index up to date — `docs/audit/` has the current
    `YYYY-MM-DD-audit.md` referenced from CHANGELOG
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.5.20"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "5.7.48"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts
@@ -299,10 +447,11 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
   `dist/mabda.cyr` drifts from the committed copy.
 - **Smoke build**: `cyrius build programs/smoke.cyr` — proves the
   full include chain links.
-- **Test/bench**: `cyrius test tests/tcyr/mabda.tcyr` + `cyrius bench
-  tests/bcyr/mabda.bcyr`.
+- **Test/bench**: `make test` (runs all three `tests/tcyr/*.tcyr`
+  files) + `cyrius bench tests/bcyr/mabda.bcyr`.
 - **GPU integration is local only** — CI runners don't have
-  wgpu-native; `make test-phase0` is a developer gate.
+  wgpu-native or amdgpu hardware; `make test-phase0` /
+  `make test-native-*` are developer gates.
 
 ## CHANGELOG Format
 
