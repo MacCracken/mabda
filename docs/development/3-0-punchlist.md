@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.2(d) — e2e modeset driver + smoke landed)
+**Last refresh:** 2026-04-30 (post Step 7.4 — page-flip + event-read primitives landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -511,8 +511,34 @@ need it.
   derivations from ASCII byte values, null-safety on both
   high-level fns). 187 phase_d + 836 v3 + 624 mabda CPU asserts
   green; smoke + lint + distlib clean. (Step 7.3, 2026-04-30).
-- [ ] **7.4** — Page flip + vblank: `drmModePageFlip` analog
-  through direct ioctl; vblank wait via `drmWaitVBlank` analog.
+- [x] **7.4** — Page flip + vblank: `drmModePageFlip` analog
+  + event-read primitive. `DRM_IOCTL_MODE_PAGE_FLIP` (=
+  `0xC01864B0`) ioctl number, `drm_mode_crtc_page_flip` struct
+  shape (24 B; crtc_id / fb_id / flags / reserved / user_data),
+  `DRM_MODE_PAGE_FLIP_EVENT` (0x01) + `_ASYNC` (0x02) flag
+  constants. Low-level `native_drm_mode_page_flip` + high-level
+  `native_kms_page_flip(fd, crtc_id, fb_id, flags, user_data)`.
+  Plus the event-read path: `drm_event` header (8 B; type +
+  length) and `drm_event_vblank` payload (32 B total; user_data,
+  tv_sec, tv_usec, sequence, crtc_id),
+  `DRM_EVENT_VBLANK` / `_FLIP_COMPLETE` type constants,
+  `native_drm_read_event(fd, buf, n)` wraps `read(2)` (SYS_READ
+  = 0), 5 inline accessors (`drm_event_type`, `_length`,
+  `drm_event_vblank_{user_data,sequence,crtc_id}`). Used together
+  with the page-flip EVENT flag, this enables vsync-paced
+  double-buffered present (next bite). Skipped HW exercise — same
+  master-acquisition gate as 7.2(d) (logind retains master in
+  desktop session; see project memory for workaround paths).
+  Plus added `DRM_IOCTL_SET_MASTER` / `_DROP_MASTER` (no-payload
+  ioctls 0x641E / 0x641F) + `native_drm_set_master` /
+  `_drop_master` helpers in 7.2(d.1) — the smoke now diagnoses
+  the master situation explicitly, prints `EACCES` instead of
+  guessing. 7 new CPU tests, 32 asserts (page-flip ioctl number
+  + struct field offsets + flag constants + null-safety, event
+  struct shapes + accessor round-trips + read null-safety,
+  master ioctl numbers). 278 phase_d + 836 v3 + 624 mabda CPU
+  asserts green; smoke + lint + distlib clean. (Step 7.4 +
+  7.2(d.1), 2026-04-30).
 - [ ] **7.5** — Backend interface surface slots
   (`surface_configure / acquire / present`).
 - [ ] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
@@ -734,7 +760,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **7.1 + 7.2 + 7.3 all in tree**; pipeline runs through AddFB2 on this dev box; SETCRTC EACCES from desktop is expected (run smoke from tty for visual flip); 7.4–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **7.1–7.4 all primitives in tree**; HW exercise gated on logind master (vkms or no-compositor session — see project memory); 7.5–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

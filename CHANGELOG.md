@@ -770,6 +770,86 @@ sentinel), NativeKmsScanout field offsets (10 fields), modeset
 driver null-safety across all 4 invalid-arg cases, release
 idempotent on zero scanout.
 
+### Added — 2026-04-30 (Step 7.2(d.1) + 7.4 — master ioctls + page-flip)
+
+Two complementary additions: explicit DRM master acquisition (so
+the modeset smoke gives clean diagnostics on which step is
+gated by perms) and the page-flip primitive that v3.0 surface
+present is built on.
+
+**Step 7.2(d.1) — DRM master acquisition:**
+
+- **`DRM_IOCTL_SET_MASTER`** (`0x641E`) and **`DROP_MASTER`**
+  (`0x641F`) — no-payload ioctls (dir=0, size=0).
+- **`native_drm_set_master(fd)`** treats `-EINVAL` (already
+  master) as success, otherwise returns the kernel errno.
+- **`native_drm_drop_master(fd)`** for clean release after the
+  smoke completes.
+- The modeset smoke now calls SET_MASTER explicitly and prints a
+  distinct diagnostic (rc + errno + actionable hint) instead of
+  guessing at SETCRTC's `-EACCES`. On the dev box this surfaces
+  `SET_MASTER: rc=-13 (errno=13)` immediately, with hints
+  pointing at the logind / no-compositor / vkms workarounds.
+
+**Step 7.4 — page-flip + event read:**
+
+- **`DRM_IOCTL_MODE_PAGE_FLIP`** (`0xC01864B0`) ioctl number,
+  `drm_mode_crtc_page_flip` struct (24 B; crtc_id / fb_id /
+  flags / reserved / user_data).
+- **`DRM_MODE_PAGE_FLIP_EVENT`** (0x01) + **`_ASYNC`** (0x02)
+  flag constants. EVENT mode queues a vblank event the caller
+  reads back; ASYNC mode flips immediately (tearing).
+- **Low-level** `native_drm_mode_page_flip(fd, req)` +
+  **high-level** `native_kms_page_flip(fd, crtc_id, fb_id,
+  flags, user_data)` — null-safe on every ptr arg.
+- **Event-read path**: `drm_event` header (8 B; type + length),
+  `drm_event_vblank` payload (32 B total; user_data, tv_sec,
+  tv_usec, sequence, crtc_id). `DRM_EVENT_VBLANK` (0x01) +
+  `_FLIP_COMPLETE` (0x02) type constants. **`native_drm_read_event(fd,
+  buf, n)`** wraps `read(2)` (SYS_READ=0). Five inline accessors
+  (`drm_event_type`, `_length`, `drm_event_vblank_user_data`,
+  `_sequence`, `_crtc_id`) keep call sites readable.
+
+Together these unlock vsync-paced double-buffered present:
+flip with EVENT flag set, fd becomes readable, draining one
+`drm_event_vblank` per flip lets the present loop know when
+the buffer-swap actually hit screen.
+
+### Documented — 2026-04-30 (Phase D logind master blocker)
+
+`programs/native_kms_modeset_smoke.cyr` was run with `sudo`
+from the dev session and from a tty. Both returned
+`SET_MASTER: rc=-13 (EACCES)` followed by `modeset rc=-11`.
+Root cause: modern systemd-logind retains DRM master in the
+running compositor's session even after vt-switch + sudo.
+Confirmed pre-existing-but-undocumented constraint; saved as
+project memory `project_phase_d_master_logind_blocker.md` with
+three workarounds for HW testing (vkms, no-compositor session,
+stop display-manager). Treated as **deferred to v3.x logind
+integration design** (Step 7.7); doesn't block Phase D
+primitive development. The mabda smoke walks the entire
+pipeline correctly through `AddFB2` — only `SETCRTC` is
+gated.
+
+7 new CPU tests, 32 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+master ioctl numbers, page-flip ioctl + struct + flags +
+null-safety, event-struct shapes + round-trip accessors, read
+null-safety.
+
+### Metrics — 2026-04-30 (post Step 7.4)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **278 assertions** (was 243
+  at 7.2(d); +3 from 7.2(d.1) master ioctls + +32 from 7.4).
+- `src/backend_native_kms.cyr`: ~1,330 lines (was ~1,180; +150
+  lines for master + page-flip + event-read primitives).
+- `programs/native_kms_modeset_smoke.cyr`: ~180 lines (was 150;
+  +30 lines for SET_MASTER diagnostics).
+- `dist/mabda.cyr`: regenerated (10794 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
 ### Metrics — 2026-04-30 (post Step 7.2(d))
 
 - Module count: 34 (unchanged).
@@ -785,24 +865,26 @@ idempotent on zero scanout.
 
 ### Next — 2026-04-30 (post Step 7.2(d))
 
-**Phase D modeset code-complete; SETCRTC visual verification gated
-on a tty run.** Two independent paths forward:
+**Phase D primitives 7.1 → 7.4 all in tree.** HW exercise on
+SETCRTC + PAGE_FLIP is logind-gated (see master blocker memory);
+not on critical-path for primitive development.
 
-1. **Run `make test-native-kms-modeset` from a tty.** The smoke
-   program is in tree and tested up through the master-permission
-   boundary on the dev box. A tty run (Ctrl-Alt-F2 to drop
-   Hyprland's master) would visibly flip the screen red for 3
-   seconds and confirm the SETCRTC path works. This is the only
-   piece of v3.0 Phase D that has *not* been HW-validated yet.
-2. **7.4 — page-flip + vblank.** With static modeset working,
-   the next bite is `DRM_IOCTL_MODE_PAGE_FLIP` for double-buffered
-   present without re-doing modeset on every frame. Adds a
-   second BO + AddFB2, swaps which FB the CRTC scans from,
-   waits for vblank. Same shape of structural primitives + e2e
-   driver as 7.2(d).
-3. **7.5–7.7 — present primitive, release lifecycle, public
-   `gpu_surface_*` API.** v3.0 completion path for native surface
-   present.
+1. **7.5 — present primitive.** `native_kms_present(state, fb_b)`
+   composes page-flip + event-read into a single call: queue
+   flip with EVENT, drain the matching `drm_event_vblank`, return
+   the flip's vblank sequence to the caller. Optionally
+   `native_kms_present_double_buffered(state)` keeps two FBs
+   rotating. CPU-testable via mock event payloads.
+2. **7.6 — release lifecycle.** Cleanup ordering for the full
+   surface: drop master → release scanout → close fds → free
+   state. Already partially in `native_kms_release_scanout`;
+   needs a top-level `native_kms_surface_release` that handles
+   the master+state pair.
+3. **7.7 — public `gpu_surface_*` API.** v3.0 completion path —
+   chooses (a) "TTY app / kiosk only — caller manages master"
+   vs (b) "logind-aware compositor delegation via dbus
+   TakeDevice". Architectural decision; the primitives are ready
+   either way.
 
 **Phase C render HW-gated items still pending:**
 

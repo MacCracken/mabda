@@ -117,6 +117,33 @@ fn main() {
     print_i64(card_fd);
     print_cstr("\n");
 
+    # Try to acquire DRM master. On a clean tty (no compositor
+    # running) this succeeds. If a compositor (Hyprland / GNOME)
+    # is running on ANY vt, systemd-logind retains master in that
+    # session and SET_MASTER returns -EBUSY (or -EACCES on stricter
+    # kernels) regardless of vt-switch + sudo. The fix is to stop
+    # the compositor (`systemctl stop ...` or its session manager
+    # equivalent) before running, OR to test against vkms — see
+    # the troubleshooting note below.
+    var master_rc = native_drm_set_master(card_fd);
+    if (master_rc == 0) {
+        print_cstr("SET_MASTER: acquired\n");
+    }
+    if (master_rc != 0) {
+        print_cstr("SET_MASTER: rc=");
+        print_i64(master_rc);
+        print_cstr(" (errno=");
+        print_i64(0 - master_rc);
+        print_cstr(")\n");
+        print_cstr("  hint: another DRM client holds master.\n");
+        print_cstr("  - desktop sessions: logind keeps master in the\n");
+        print_cstr("    compositor's session even on a different vt.\n");
+        print_cstr("    stop the compositor first.\n");
+        print_cstr("  - virtual test path: modprobe vkms gives a fresh\n");
+        print_cstr("    DRM device with master freely available.\n");
+        print_cstr("continuing anyway — SETCRTC will fail predictably.\n");
+    }
+
     # Open render fd.
     var render_fd = native_open_render_node();
     if (render_fd < 0) {
@@ -189,6 +216,11 @@ fn main() {
     # both handles, unmaps the BO.
     native_kms_release_scanout(card_fd, render_fd, &scanout);
     print_cstr("teardown complete\n");
+
+    # Drop master so the next compositor / smoke run can acquire.
+    if (master_rc == 0) {
+        native_drm_drop_master(card_fd);
+    }
 
     native_kms_release(state);
     sys_close(render_fd);

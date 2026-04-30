@@ -41,6 +41,37 @@
 #   0xC0000000 | (64 << 16) | (0x64 << 8) | 0xA0 == 0xC04064A0
 var DRM_IOCTL_MODE_GETRESOURCES = 0xC04064A0;
 
+# DRM_IOCTL_SET_MASTER — nr 0x1E, no payload (dir=0, size=0)
+#   (0 << 30) | (0 << 16) | (0x64 << 8) | 0x1E == 0x641E
+# Acquires DRM master on this fd. Required for SETCRTC, AddFB,
+# PageFlip, and other modesetting ioctls. Returns:
+#   0       — got master
+#   -EACCES — not allowed (e.g., not active vt, no CAP_SYS_ADMIN)
+#   -EINVAL — already master (also fine; treat as success)
+#   -EBUSY  — another fd holds master; will fail until that fd
+#             closes or calls DROP_MASTER (typical when
+#             systemd-logind is keeping master for the
+#             desktop-session compositor on a different vt).
+var DRM_IOCTL_SET_MASTER  = 0x641E;
+var DRM_IOCTL_DROP_MASTER = 0x641F;
+
+# Acquire DRM master. Returns 0 on success or already-master,
+# negative errno on real failure. Treats -EINVAL ("already
+# master, kernel doesn't differentiate") as success — that's the
+# "we opened a fresh fd that auto-mastered" case on some kernels.
+fn native_drm_set_master(fd) {
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SET_MASTER, 0);
+    if (rc == 0)         { return 0; }
+    if (rc == 0 - 22)    { return 0; }   # -EINVAL → already master
+    return rc;
+}
+
+# Release DRM master. Lets the next SET_MASTER on a different fd
+# succeed. Returns 0 on success.
+fn native_drm_drop_master(fd) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_DROP_MASTER, 0);
+}
+
 # DRM_IOCTL_MODE_GETCONNECTOR — nr 0xA7, RW, sizeof(drm_mode_get_connector) = 80
 #   0xC0000000 | (80 << 16) | (0x64 << 8) | 0xA7 == 0xC05064A7
 # (Constant exposed for 7.1(b); ioctl helper lands there.)
@@ -1266,3 +1297,130 @@ fn native_kms_release_scanout(card_fd, render_fd, scanout) {
     memset(scanout, 0, NATIVE_KMS_SCANOUT_SIZE);
     return 0;
 }
+
+# ================================================================
+# v3 Step 7.4 — Page-flip + event read
+# ================================================================
+# Page-flip swaps which framebuffer a CRTC scans out from, without
+# re-doing the full modeset (which would blank the screen briefly).
+# It's the load-bearing primitive for double-buffered present:
+# render to FB B while FB A is on screen, then page-flip A→B at
+# vblank, then render to A while B scans out, repeat.
+#
+# Two variants of the flip behavior, controlled by `flags`:
+#   DRM_MODE_PAGE_FLIP_EVENT — kernel queues a vblank event; the
+#     fd becomes readable, and a 32-byte drm_event_vblank lands in
+#     the read queue when the flip actually happens. Used for
+#     present-time reporting and for stuttering-detection.
+#   DRM_MODE_PAGE_FLIP_ASYNC — flip immediately, don't wait for
+#     vblank. Causes tearing; not what consumers want for v3.0
+#     present, but useful for testing.
+# Default (flags=0) = "synchronous, no event" — kernel still waits
+# for vblank but caller doesn't get notified.
+#
+# Event-read path: after a flip with EVENT flag set, read(2) on
+# the drm fd yields a drm_event header (8 B) followed by the
+# specific event payload. For vblank events the payload is
+# drm_event_vblank (32 B total including the header).
+
+# DRM_IOCTL_MODE_PAGE_FLIP — nr 0xB0, RW, sizeof = 24
+#   0xC0000000 | (24 << 16) | (0x64 << 8) | 0xB0 == 0xC01864B0
+var DRM_IOCTL_MODE_PAGE_FLIP = 0xC01864B0;
+
+# Page-flip flag constants (uapi/drm/drm_mode.h):
+var DRM_MODE_PAGE_FLIP_EVENT = 0x01;
+var DRM_MODE_PAGE_FLIP_ASYNC = 0x02;
+
+# drm_mode_crtc_page_flip layout (24 bytes, x86_64):
+#   +0:  crtc_id    (u32) — IN
+#   +4:  fb_id      (u32) — IN: framebuffer to swap to
+#   +8:  flags      (u32) — IN
+#   +12: reserved   (u32) — must be 0
+#   +16: user_data  (u64) — IN: opaque value returned in the event
+var DRM_MODE_PAGE_FLIP_SIZE      = 24;
+var DRM_MODE_PAGE_FLIP_CRTC_ID   = 0;
+var DRM_MODE_PAGE_FLIP_FB_ID     = 4;
+var DRM_MODE_PAGE_FLIP_FLAGS     = 8;
+var DRM_MODE_PAGE_FLIP_RESERVED  = 12;
+var DRM_MODE_PAGE_FLIP_USER_DATA = 16;
+
+# Low-level page-flip ioctl. Caller fills crtc_id + fb_id + flags
+# (+ user_data if EVENT flag set). Returns 0 on success, negative
+# errno on failure. Common errors:
+#   -EBUSY    — a previous flip is still pending on this CRTC
+#               (haven't received the vblank event yet)
+#   -EINVAL   — fb dimensions don't match CRTC's current mode
+#   -EACCES   — not master (Phase D pre-requisite — see logind
+#               note in memory)
+fn native_drm_mode_page_flip(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_PAGE_FLIP, req);
+}
+
+# High-level page-flip. user_data is opaque — the kernel echoes it
+# back in the event payload, so callers use it to identify which
+# flip the event corresponds to (typically a sequence number).
+# Returns 0 on success, negative errno on failure.
+fn native_kms_page_flip(fd, crtc_id, fb_id, flags, user_data) {
+    if (fd <= 0)      { return -1; }
+    if (crtc_id == 0) { return -1; }
+    if (fb_id == 0)   { return -1; }
+    var req[24];
+    memset(&req, 0, DRM_MODE_PAGE_FLIP_SIZE);
+    store32(&req + DRM_MODE_PAGE_FLIP_CRTC_ID,   crtc_id);
+    store32(&req + DRM_MODE_PAGE_FLIP_FB_ID,     fb_id);
+    store32(&req + DRM_MODE_PAGE_FLIP_FLAGS,     flags);
+    store64(&req + DRM_MODE_PAGE_FLIP_USER_DATA, user_data);
+    return native_drm_mode_page_flip(fd, &req);
+}
+
+# ================================================================
+# DRM event-read path
+# ================================================================
+# The kernel queues events on the drm fd; userspace drains them
+# via read(2). Each event starts with a drm_event header (8 B)
+# describing the event type + total length, followed by event-
+# type-specific payload. For page-flip events:
+#
+#   drm_event (8 B):
+#     +0: type    (u32) — DRM_EVENT_VBLANK or DRM_EVENT_FLIP_COMPLETE
+#     +4: length  (u32) — total bytes including this header
+#
+#   drm_event_vblank payload (24 B following the header → 32 B total):
+#     +8:  user_data  (u64) — the value passed in PAGE_FLIP_USER_DATA
+#     +16: tv_sec     (u32) — flip timestamp seconds
+#     +20: tv_usec    (u32) — flip timestamp microseconds
+#     +24: sequence   (u32) — vblank sequence number
+#     +28: crtc_id    (u32) — which CRTC fired (kernel >= 4.x)
+
+var DRM_EVENT_VBLANK         = 0x01;
+var DRM_EVENT_FLIP_COMPLETE  = 0x02;
+
+var DRM_EVENT_HEADER_SIZE    = 8;
+var DRM_EVENT_HEADER_TYPE    = 0;
+var DRM_EVENT_HEADER_LENGTH  = 4;
+
+var DRM_EVENT_VBLANK_SIZE      = 32;
+var DRM_EVENT_VBLANK_USER_DATA = 8;
+var DRM_EVENT_VBLANK_TV_SEC    = 16;
+var DRM_EVENT_VBLANK_TV_USEC   = 20;
+var DRM_EVENT_VBLANK_SEQUENCE  = 24;
+var DRM_EVENT_VBLANK_CRTC_ID   = 28;
+
+# Read DRM events from the fd. `buf` should be at least 32 bytes
+# for a single drm_event_vblank; a larger buffer can hold multiple
+# queued events. Returns the number of bytes read (positive),
+# 0 if no events available (only with O_NONBLOCK), or negative
+# errno on failure. SYS_READ = 0 on x86_64.
+fn native_drm_read_event(fd, buf, n) {
+    if (fd <= 0)  { return -1; }
+    if (buf == 0) { return -1; }
+    if (n <= 0)   { return -1; }
+    return syscall(0, fd, buf, n);
+}
+
+# Convenience accessors for a freshly-read drm_event_vblank.
+fn drm_event_type(buf)        { return load32(buf + DRM_EVENT_HEADER_TYPE); }
+fn drm_event_length(buf)      { return load32(buf + DRM_EVENT_HEADER_LENGTH); }
+fn drm_event_vblank_user_data(buf) { return load64(buf + DRM_EVENT_VBLANK_USER_DATA); }
+fn drm_event_vblank_sequence(buf)  { return load32(buf + DRM_EVENT_VBLANK_SEQUENCE); }
+fn drm_event_vblank_crtc_id(buf)   { return load32(buf + DRM_EVENT_VBLANK_CRTC_ID); }
