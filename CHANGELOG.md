@@ -415,29 +415,82 @@ master fd (`/dev/dri/card0`), which CI runners typically lack.
   real fix is to bump cyrlint's buffer upstream and re-pin —
   noted as a tooling follow-up.
 
-### Metrics — 2026-04-30 (post Step 7.1(a))
+### Added — 2026-04-30 (Step 7.1(b) — DRM connector primitives)
 
-- Module count: **34** (was 33; `backend_native_kms.cyr` is new).
+Extends `src/backend_native_kms.cyr` with the data structures the
+per-connector enumeration driver (landing in 7.1(c)) will consume:
+
+- **`drm_mode_get_connector`** struct shape (80 bytes; 16 fields
+  pinned by CPU asserts). Same two-call protocol as
+  drm_mode_card_res — pass 1 with zero counts to discover sizes,
+  pass 2 with caller-allocated arrays for encoder IDs, modes,
+  property IDs, and property values. Caller MUST set `connector_id`
+  at +48 before the ioctl (kernel keys lookup off it).
+- **`drm_mode_modeinfo`** struct shape (68 bytes; 13 numeric fields
+  for clock + h/v timings + flags + type + a 32-byte fixed-width
+  name buffer at +36..+68). Each modes_ptr entry in a populated
+  drm_mode_get_connector is one of these.
+- **Connection-status enum**: `DRM_MODE_CONNECTED = 1`,
+  `DRM_MODE_DISCONNECTED = 2`, `DRM_MODE_UNKNOWNCONNECTION = 3`.
+- **Connector-type enum**: 12 values covering modern desktop +
+  laptop hardware — `Unknown` (0), `VGA` (1), `DVII` (2), `DVID`
+  (3), `DVIA` (4), `DisplayPort` (10), `HDMIA` (11), `HDMIB` (12),
+  `eDP` (14), `VIRTUAL` (15), `DSI` (16), `USB` (20). Obscure
+  pre-2010 types (TV / Composite / 9PinDIN) deferred until a
+  consumer asks.
+- **`native_drm_mode_get_connector(fd, req)`** — low-level ioctl
+  wrapper. Caller manages the two-call zeroing pattern.
+
+The higher-level "discover every connector" driver is deferred to
+7.1(c), where it composes naturally with encoder discovery + the
+topology summary fn.
+
+### Changed — 2026-04-30 (Phase D test split)
+
+`tests/tcyr/mabda_v3.tcyr` was approaching cyrlint's 128 KiB
+read-buffer cap (the bug surfaced during 7.1(a) close — see
+session 26 notes). Split out Phase D tests into a new file
+**`tests/tcyr/mabda_v3_phase_d.tcyr`** (9.5 KB, 100 asserts across
+9 tests). The boundary is clean: every test in the new file
+exercises `src/backend_native_kms.cyr` exclusively. `make test`
+runs it after `mabda_v3.tcyr`. As 7.x grows (per-connector
+enumeration in 7.1(c), modeset in 7.2, framebuffer in 7.3,
+page-flip in 7.4, etc.) new Phase D tests land in this file and
+keep `mabda_v3.tcyr` under the cap.
+
+`mabda_v3.tcyr` shrank 134 KB → 126 KB (8 KB headroom). Total
+asserts unchanged: 836 v3 + 100 phase_d = 936, was 887 at 7.1(a)
+close (+49 from 7.1(b)'s 4 new tests).
+
+### Metrics — 2026-04-30 (post Step 7.1(b))
+
+- Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
-- `tests/tcyr/mabda_v3.tcyr`: **887 assertions** (was 836 at
-  6.10-prep close; +51 from 7.1(a)).
-- `src/backend_native_kms.cyr`: 243 lines (new).
-- `dist/mabda.cyr`: regenerated (9615 lines).
+- `tests/tcyr/mabda_v3.tcyr`: **836 assertions** (Phase D tests
+  moved to mabda_v3_phase_d.tcyr).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **100 assertions** (new
+  file; 5 from 7.1(a) + 4 from 7.1(b)).
+- `src/backend_native_kms.cyr`: ~330 lines (was 243 at 7.1(a) close;
+  +87 lines for the 7.1(b) struct constants + ioctl helper).
+- `dist/mabda.cyr`: regenerated (9730 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.1(a))
+### Next — 2026-04-30 (post Step 7.1(b))
 
 **Phase D 7.1 sub-bites in progress.**
 
-1. **7.1(b) — per-connector enumeration.** `MODE_GETCONNECTOR`
-   helper + per-connector mode list + property table. Lands the
-   "what modes does this monitor support" surface. Self-contained
-   bite, mostly mirrors 7.1(a)'s shape with a different ioctl.
-2. **7.1(c) — per-encoder enumeration + topology summary.** Wraps
-   7.1(a)+(b) into a printable summary so `native_kms_summary`
-   gives developers a quick "what's plugged in" check. Useful both
-   as a debug tool and as the foundation for 7.2's mode-pick logic.
-3. **7.2 — mode-set + 7.3 framebuffer.** First HW-gated step in
+1. **7.1(c) — encoder ioctl + per-connector / per-encoder
+   enumeration driver + `native_kms_summary`.** Adds the
+   `drm_mode_get_encoder` struct (20 bytes; 5 fields), the
+   `native_drm_mode_get_encoder` ioctl helper, then the
+   higher-level enumeration driver that walks every connector ID
+   from 7.1(a)'s KmsState through 7.1(b)'s connector ioctl
+   (including its mode + encoder + property arrays), then walks
+   every encoder ID through the new encoder ioctl. Closes Phase D
+   discovery with a printable topology summary that gives
+   developers a `what's plugged in / what modes are supported`
+   debug surface — also the foundation for 7.2's mode-pick logic.
+2. **7.2 — mode-set + 7.3 framebuffer.** First HW-gated step in
    Phase D — needs DRM master access, which a desktop session
    already grants but a tty session doesn't.
 

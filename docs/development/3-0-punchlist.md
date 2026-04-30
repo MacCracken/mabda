@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.1(a) — DRM/KMS GetResources foundation)
+**Last refresh:** 2026-04-30 (post Step 7.1(b) — DRM connector primitives)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -339,8 +339,27 @@ need it.
     safe-zero). 887 v3 (was 836 at 6.10-prep close) + 624 mabda
     CPU asserts green; smoke + lint + distlib clean. (Step
     7.1(a), 2026-04-30).
-  - [ ] **7.1 (b)** — per-connector enumeration. `MODE_GETCONNECTOR`
-    helper + connector-mode + property tables.
+  - [x] **7.1 (b)** — DRM connector ioctl + struct shapes.
+    Extends `src/backend_native_kms.cyr` with the
+    `drm_mode_get_connector` struct (80 bytes; 16 fields pinned)
+    + the `drm_mode_modeinfo` struct (68 bytes; 13 numeric fields
+    + 32-byte name buffer at +36..+68) + the
+    `DRM_MODE_CONNECTED/DISCONNECTED/UNKNOWN` connection-status
+    enum + a 12-value `DRM_MODE_CONNECTOR_*` type enum (VGA / DVI
+    / DP / HDMI / eDP / Virtual / DSI / USB) covering modern
+    desktop + laptop hardware. Low-level
+    `native_drm_mode_get_connector(fd, req)` ioctl helper.
+    Higher-level "discover all connectors" driver deferred to
+    7.1(c) where it composes naturally with encoder discovery
+    + the topology summary. Phase D tests split into
+    `tests/tcyr/mabda_v3_phase_d.tcyr` (new file; 100 asserts
+    across 9 tests) so `mabda_v3.tcyr` stays under cyrlint's 128
+    KiB cap. 4 new tests cover: connector field offsets (16
+    asserts), full modeinfo field offsets (18 asserts including
+    the name+name_len → size sanity check), connection-status
+    constants (3), connector-type constants (12). 836 v3 + 100
+    phase_d + 624 mabda CPU asserts green; smoke + lint +
+    distlib clean. (Step 7.1(b), 2026-04-30).
   - [ ] **7.1 (c)** — per-encoder enumeration + a higher-level
     `native_kms_summary` that prints the discovered topology.
 - [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
@@ -570,7 +589,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — 7.1(a) GetResources foundation done; 7.1(b/c) + 7.2–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — 7.1(a) + 7.1(b) done; 7.1(c) + 7.2–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

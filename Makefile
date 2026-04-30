@@ -52,6 +52,7 @@ build: check-lib-wiring
 test: check-lib-wiring
 	$(CYRIUS) test tests/tcyr/mabda.tcyr
 	$(CYRIUS) test tests/tcyr/mabda_v3.tcyr
+	$(CYRIUS) test tests/tcyr/mabda_v3_phase_d.tcyr
 
 .PHONY: bench
 bench: check-lib-wiring
