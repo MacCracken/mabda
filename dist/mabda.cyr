@@ -6555,6 +6555,137 @@ fn native_kms_mode_refresh_hz(modes_ptr, idx) {
     return (clock * 1000) / (htotal * vtotal);
 }
 
+# ================================================================
+# v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB)
+# ================================================================
+# A KMS framebuffer is a kernel-side handle that wraps a GEM BO
+# with metadata the display engine needs to scan it out: width /
+# height in pixels, pixel format (DRM_FORMAT_*), per-plane row
+# pitch, per-plane offset into the BO, and an optional tiling
+# modifier. The FB ID returned by ADDFB2 is what
+# DRM_IOCTL_MODE_SETCRTC (Step 7.2(b)) takes as input.
+#
+# AddFB2 vs the legacy AddFB: AddFB2 takes a fourcc pixel_format
+# directly + supports up to 4 planes (YUV) + supports modifiers
+# (tiling). Single-plane RGB scanout uses planes[0] only and
+# modifier=0 (linear).
+
+# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 100
+#   0xC0000000 | (100 << 16) | (0x64 << 8) | 0xB8 == 0xC06464B8
+var DRM_IOCTL_MODE_ADDFB2 = 0xC06464B8;
+
+# DRM_IOCTL_MODE_RMFB — nr 0xAF, RW, sizeof(u32) = 4
+#   0xC0000000 | (4 << 16) | (0x64 << 8) | 0xAF == 0xC00464AF
+# The "request" is just a u32 fb_id by value (write-only from
+# userspace to kernel). Same RW-encoding ceremony as ADDFB2.
+var DRM_IOCTL_MODE_RMFB = 0xC00464AF;
+
+# DRM_FORMAT_* fourcc codes (uapi/drm/drm_fourcc.h). Each is a
+# 4-character ASCII tag stored as a little-endian u32. The naming
+# describes the *MSB-first byte order* of a single 32-bit pixel —
+# so DRM_FORMAT_XRGB8888 means a 32-bit word where the MSByte is
+# 'x' (ignored alpha) and the LSByte is 'B'. In LITTLE-ENDIAN
+# memory that pixel reads as `B G R x` (bytes 0..3) — which is
+# what's commonly called BGRX8 or BGRA8.
+#
+# Mapping for mabda's wgpu-parity color formats:
+#   wgpu RGBA8_UNORM (memory: R G B A)  ↔  DRM_FORMAT_ABGR8888
+#   wgpu BGRA8_UNORM (memory: B G R A)  ↔  DRM_FORMAT_ARGB8888
+# v3 Phase D scans out from RGBA8 BOs (matches the render path's
+# RT format), so ABGR8888 is the working format. XRGB / XBGR are
+# also exposed for opaque scanout where alpha is don't-care.
+var DRM_FORMAT_XRGB8888 = 0x34325258;   # 'X' 'R' '2' '4'
+var DRM_FORMAT_ARGB8888 = 0x34325241;   # 'A' 'R' '2' '4'
+var DRM_FORMAT_XBGR8888 = 0x34324258;   # 'X' 'B' '2' '4'
+var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
+
+# drm_mode_fb_cmd2 layout (100 bytes, x86_64):
+#   +0:  fb_id          (u32) — OUT (kernel returns FB ID)
+#   +4:  width          (u32) — IN
+#   +8:  height         (u32) — IN
+#   +12: pixel_format   (u32) — IN (DRM_FORMAT_*)
+#   +16: flags          (u32) — IN
+#   +20: handles[4]     (u32 × 4 = 16 B) — IN, plane GEM handles
+#   +36: pitches[4]     (u32 × 4 = 16 B) — IN, bytes per row per plane
+#   +52: offsets[4]     (u32 × 4 = 16 B) — IN, BO byte offset per plane
+#   +68: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane
+var DRM_MODE_FB_CMD2_SIZE      = 100;
+var DRM_MODE_FB_CMD2_FB_ID     = 0;
+var DRM_MODE_FB_CMD2_WIDTH     = 4;
+var DRM_MODE_FB_CMD2_HEIGHT    = 8;
+var DRM_MODE_FB_CMD2_FORMAT    = 12;
+var DRM_MODE_FB_CMD2_FLAGS     = 16;
+var DRM_MODE_FB_CMD2_HANDLES   = 20;
+var DRM_MODE_FB_CMD2_PITCHES   = 36;
+var DRM_MODE_FB_CMD2_OFFSETS   = 52;
+var DRM_MODE_FB_CMD2_MODIFIERS = 68;
+
+# Linear (untiled) tiling modifier — value 0 in uapi/drm/drm_fourcc.h.
+# Pre-2018 kernels infer linear from "no MODIFIERS flag set"; modern
+# kernels accept an explicit 0 modifier as linear. We expose it
+# here for clarity at call sites.
+var DRM_FORMAT_MOD_LINEAR = 0;
+
+# Low-level AddFB2 ioctl. Caller owns `req` (100 bytes), MUST fill
+# width/height/format/handles/pitches/offsets/modifiers/flags
+# before calling. fb_id at +0 is OUT (overwritten on success).
+# Returns 0 on success (req+0 holds the new FB ID), negative errno
+# on failure.
+fn native_drm_mode_add_fb2(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_ADDFB2, req);
+}
+
+# Low-level RmFB ioctl. The kernel takes a `u32 fb_id` BY VALUE,
+# but Linux's ioctl ABI passes args by pointer — so we pass a
+# 4-byte buffer holding the FB ID. Returns 0 on success, negative
+# errno on failure.
+fn native_drm_mode_rm_fb(fd, fb_id_ptr) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_RMFB, fb_id_ptr);
+}
+
+# High-level: wrap a GEM BO as a single-plane XRGB8888 framebuffer.
+# Returns the FB ID on success (always > 0; the kernel rejects 0
+# as a valid FB ID), or 0 on failure. `pitch` is bytes per row —
+# usually `width * 4` for tightly-packed XRGB8888, but the
+# scanout path may require alignment to a hardware-specific stride
+# (handled by the consumer; this fn just forwards what's given).
+#
+# `bo_handle` MUST come from the same fd as this fn is called on
+# (the kernel verifies). Use the card-master fd for both
+# native_bo_create_gtt and this call.
+fn native_kms_add_fb_xrgb8888(fd, bo_handle, width, height, pitch) {
+    if (fd <= 0)        { return 0; }
+    if (bo_handle == 0) { return 0; }
+    if (width <= 0)     { return 0; }
+    if (height <= 0)    { return 0; }
+    if (pitch <= 0)     { return 0; }
+
+    var req[100];
+    memset(&req, 0, DRM_MODE_FB_CMD2_SIZE);
+    store32(&req + DRM_MODE_FB_CMD2_WIDTH,           width);
+    store32(&req + DRM_MODE_FB_CMD2_HEIGHT,          height);
+    store32(&req + DRM_MODE_FB_CMD2_FORMAT,          DRM_FORMAT_XRGB8888);
+    store32(&req + DRM_MODE_FB_CMD2_FLAGS,           0);
+    store32(&req + DRM_MODE_FB_CMD2_HANDLES + 0,     bo_handle);
+    store32(&req + DRM_MODE_FB_CMD2_PITCHES + 0,     pitch);
+    store32(&req + DRM_MODE_FB_CMD2_OFFSETS + 0,     0);
+    store64(&req + DRM_MODE_FB_CMD2_MODIFIERS + 0,   DRM_FORMAT_MOD_LINEAR);
+    var rc = native_drm_mode_add_fb2(fd, &req);
+    if (rc != 0) { return 0; }
+    return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
+}
+
+# Release a framebuffer ID. fb_id == 0 is a no-op (matches the
+# convention native_kms_add_fb_xrgb8888 uses for failure). Returns
+# 0 on success, negative errno on failure.
+fn native_kms_rm_fb(fd, fb_id) {
+    if (fd <= 0)    { return 0; }
+    if (fb_id == 0) { return 0; }
+    var id_buf[4];
+    store32(&id_buf, fb_id);
+    return native_drm_mode_rm_fb(fd, &id_buf);
+}
+
 # --- buffer.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)

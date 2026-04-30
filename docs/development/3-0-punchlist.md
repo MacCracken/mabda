@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.2(a) — per-connector mode enum landed)
+**Last refresh:** 2026-04-30 (post Step 7.3 — KMS framebuffer primitives landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -416,8 +416,28 @@ need it.
     works for "blank the CRTC" but the useful path is
     "modeset → present a framebuffer", which composes naturally
     with 7.3).
-- [ ] **7.3** — Framebuffer creation: KMS-side wrapping of a
-  GTT BO as a scanout surface.
+- [x] **7.3** — Framebuffer creation: KMS-side wrapping of a
+  GTT BO as a scanout surface. `DRM_IOCTL_MODE_ADDFB2` (=
+  `0xC06464B8`) + `DRM_IOCTL_MODE_RMFB` (= `0xC00464AF`) ioctl
+  numbers (re-derived from first principles in CPU tests),
+  `drm_mode_fb_cmd2` struct shape (100 bytes; 9 fields including
+  the 4-plane handle/pitch/offset/modifier arrays), four
+  `DRM_FORMAT_*` fourcc constants (XRGB / ARGB / XBGR / ABGR
+  8888) with the wgpu↔DRM byte-order mapping documented inline
+  (mabda's `RGBA8_UNORM` = DRM's `ABGR8888`),
+  `DRM_FORMAT_MOD_LINEAR` (0). Low-level `native_drm_mode_add_fb2`
+  + `native_drm_mode_rm_fb` ioctl wrappers; high-level
+  `native_kms_add_fb_xrgb8888(fd, bo_handle, w, h, pitch)` returns
+  the FB ID (or 0 on failure) and `native_kms_rm_fb(fd, fb_id)`
+  releases. Skipped the live HW smoke test — exercising the
+  ADDFB2 path properly needs the BO + master-fd + render-fd
+  cross-namespace plumbing that 7.2(b)'s end-to-end modeset
+  composes naturally; structural primitives are fully CPU-tested.
+  5 new CPU tests, 34 asserts (ioctl numbers, struct field
+  offsets including the 4-plane sub-array consistency, fourcc
+  derivations from ASCII byte values, null-safety on both
+  high-level fns). 187 phase_d + 836 v3 + 624 mabda CPU asserts
+  green; smoke + lint + distlib clean. (Step 7.3, 2026-04-30).
 - [ ] **7.4** — Page flip + vblank: `drmModePageFlip` analog
   through direct ioctl; vblank wait via `drmWaitVBlank` analog.
 - [ ] **7.5** — Backend interface surface slots
@@ -641,7 +661,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **7.1 discovery + 7.2(a) mode-pick HW-verified**; 7.2(b) modeset, 7.3 FB, 7.4–7.7 (page-flip → present) ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick HW-verified; **7.3 FB primitives in tree**; 7.2(b) modeset + 7.4–7.7 (page-flip → present) ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

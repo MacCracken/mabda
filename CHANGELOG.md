@@ -559,40 +559,83 @@ preferred), falls-back-to-0 (no preferred), all 5 mode accessors,
 refresh_hz computed against canonical 1080p60 timing
 (clock=148500, htotal=2200, vtotal=1125 → exactly 60 Hz).
 
-### Metrics — 2026-04-30 (post Step 7.2(a))
+### Added — 2026-04-30 (Step 7.3 — KMS framebuffer primitives)
+
+The kernel-side handle that turns a GEM BO into something a
+DRM/KMS CRTC can scan out. Without this, 7.2(b)'s SETCRTC has
+nothing to display.
+
+- **`DRM_IOCTL_MODE_ADDFB2`** (= `0xC06464B8`) + **`RMFB`**
+  (= `0xC00464AF`) ioctl numbers, derived from first principles
+  in CPU tests so transcription drift surfaces immediately.
+- **`drm_mode_fb_cmd2`** struct shape (100 bytes): fb_id (u32 OUT)
+  + width/height/format/flags + 4-plane arrays for handles
+  (u32×4), pitches (u32×4), offsets (u32×4), modifiers (u64×4).
+  AddFB2 supports up to 4 planes for YUV; single-plane RGB scanout
+  uses planes[0] only.
+- **Four `DRM_FORMAT_*` fourcc constants**: `XRGB8888` (0x34325258),
+  `ARGB8888` (0x34325241), `XBGR8888` (0x34324258),
+  `ABGR8888` (0x34324241). The wgpu ↔ DRM byte-order mapping is
+  documented inline:
+  - wgpu `RGBA8_UNORM` (memory: R G B A) ↔ DRM `ABGR8888`
+  - wgpu `BGRA8_UNORM` (memory: B G R A) ↔ DRM `ARGB8888`
+  v3 Phase D scans out from RGBA8 BOs (matches the render path's
+  RT format), so `ABGR8888` is the working format. `XRGB`/`XBGR`
+  are exposed for opaque scanout where alpha is don't-care.
+- **`DRM_FORMAT_MOD_LINEAR`** (0) — explicit linear-tiling
+  modifier for clarity at call sites. Tiled scanout (DCC, swizzle)
+  is post-v3.0 perf work.
+- **Low-level wrappers**: `native_drm_mode_add_fb2(fd, req)` and
+  `native_drm_mode_rm_fb(fd, fb_id_ptr)`.
+- **High-level helpers**:
+  `native_kms_add_fb_xrgb8888(fd, bo_handle, w, h, pitch)` returns
+  the FB ID on success (always > 0), 0 on failure.
+  `native_kms_rm_fb(fd, fb_id)` releases. Both null-safe.
+
+The actual ADDFB2 ioctl is not exercised on HW yet — properly
+exercising it needs the BO + master-fd + render-fd cross-namespace
+plumbing (KMS lives on master / `card0`, GEM allocator typically
+on render / `renderD128`) that 7.2(b)'s end-to-end modeset path
+composes naturally. Structural primitives are fully CPU-tested
+so when 7.2(b) lands the helpers are HW-ready.
+
+5 new CPU tests, 34 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl numbers re-derived, drm_mode_fb_cmd2 field offsets +
+4-plane sub-array consistency (handles[4] ends where pitches
+starts, etc.), fourcc constants derived from ASCII byte values,
+null-safety on both high-level fns.
+
+### Metrics — 2026-04-30 (post Step 7.3)
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
 - `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **153 assertions** (was 131
-  at 7.1(c) close; +22 from 7.2(a)).
-- `src/backend_native_kms.cyr`: ~620 lines (was ~530 at 7.1(c);
-  +90 lines for the modes wrapper + pick + accessors + refresh
-  computation).
-- `programs/native_kms_summary.cyr`: ~165 lines (was 100 at 7.1(c);
-  +65 lines for the per-connected-connector preferred-mode print).
-- `dist/mabda.cyr`: regenerated (10082 lines).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **187 assertions** (was 153
+  at 7.2(a) close; +34 from 7.3).
+- `src/backend_native_kms.cyr`: ~760 lines (was ~620 at 7.2(a);
+  +140 lines for ADDFB2 / RMFB primitives + fourcc + helpers).
+- `dist/mabda.cyr`: regenerated (10213 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.2(a))
+### Next — 2026-04-30 (post Step 7.3)
 
-**Phase D mode-pick is HW-verified.** Next bites compose into the
-actual modeset + scanout pipeline:
+**Phase D structural primitives complete.** Next bite is end-to-end:
 
-1. **7.3 — framebuffer creation.** `DRM_IOCTL_MODE_ADDFB2`
-   ioctl + struct, wraps a GTT BO as a KMS framebuffer ID. The
-   FB ID is what `DRM_IOCTL_MODE_SETCRTC` (7.2(b)) scans out.
-   Lands first because 7.2(b)'s SETCRTC takes an FB ID arg, and
-   the most useful test is "modeset to a framebuffer that has
-   visible content."
-2. **7.2(b) — DRM_IOCTL_MODE_SETCRTC ioctl + driver.** With
-   discovery (7.1) + mode-pick (7.2(a)) + framebuffer (7.3) all
-   in place, the driver becomes: pick connector → fetch its
-   modes → pick preferred → walk to encoder → pick CRTC from
-   `possible_crtcs` → SETCRTC with the FB. Real modeset on the
-   Cezanne dev box.
-3. **7.4–7.7 — page-flip, present, release, public API.** v3.0
-   completion path for native surface present.
+1. **7.2(b) — `DRM_IOCTL_MODE_SETCRTC` ioctl + driver +
+   end-to-end modeset.** All four prerequisites are now in tree:
+   discovery (7.1), mode-pick (7.2(a)), encoder/CRTC binding
+   (7.1(c)), framebuffer (7.3). The driver shape:
+   `native_kms_modeset(state, conn_id)` walks discovery → fetches
+   modes → picks preferred → walks to encoder → picks CRTC from
+   `possible_crtcs` mask → allocates a BO sized to the mode →
+   `native_kms_add_fb_xrgb8888` → SETCRTC. The first run on
+   Cezanne would visibly flip the desktop's modeset — biggest
+   "real thing happening" gate yet on Phase D. Cross-fd plumbing
+   (BO on render-fd, FB on master-fd, dmabuf import) is the
+   non-obvious piece worth designing carefully before coding.
+2. **7.4–7.7 — page-flip, present, release, public API.** v3.0
+   completion path for native surface present, after 7.2(b)
+   proves modeset works.
 
 **Phase C render HW-gated items still pending:**
 
