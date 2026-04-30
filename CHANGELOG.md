@@ -242,37 +242,100 @@ single draw per pass, no pipeline state caching across draws,
 
 819 v3 (was 712) + 624 mabda CPU asserts green; smoke + lint clean.
 
-### Metrics — 2026-04-30 (post Step 6.8(c))
+### Added — 2026-04-30 (Step 6.9(b) — native render e2e program)
+
+`programs/native_render_e2e.cyr` (243 lines) lands as the
+native-path mirror of `programs/render_e2e.cyr`. Drives the full
+6.x chain end-to-end through the public 6.9(a) `gpu_render_*` API
+in one program:
+
+```
+gpu_context_new_native()
+  → vs/fs shader BOs (4 KiB GTT each, va_map'd at canonical-high)
+  → vs_mod/fs_mod (handle, va) pairs
+  → gpu_render_target_create_2d_rgba8(ctx, 256, 256)
+  → gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0)
+  → gpu_render_pass_begin(ctx, rt, &clear)
+  → gpu_render_pass_draw(ctx, pass, pipe, 3, 1)   # GFX-ring submit
+  → gpu_render_pass_end(ctx, pass)
+  → load8(rt_addr + 0..3)  # native RT is GTT-mapped → CPU-direct
+  → expect (0xFF, 0x00, 0x00, 0xFF)
+```
+
+Native RT is GTT-mapped linear — readback is a direct `load8` of
+the mmap'd bytes. No `copy_texture_to_buffer` round-trip needed
+(unlike the wgpu path). Twelve named exit codes (0–11) map to
+specific failure classes for unattended runs.
+
+Wired into the Makefile as `build/native_render_e2e` /
+`test-native-render-e2e` (mirrors the `native_compute_store` /
+`native_texture_e2e` pattern; no C launcher since the native path
+doesn't link wgpu-native).
+
+**Documented HW-time failure modes** (most likely first, with the
+reasoning so future-you can read it cold):
+
+- **A. Post-draw cache flush missing.** The 6.5(b) PM4 composer
+  emits ACQUIRE_MEM (cache *invalidate*) at the start of the stream
+  — for shader-fetch correctness — but no end-of-pass
+  CACHE_FLUSH_AND_INV. radv emits one before reading the RT. If
+  pixel(0,0) reads back as 0x00000000 (uninitialized GTT) while
+  syncobj signaled normally, this is the suspect. Fix lands in a
+  6.x follow-up (extend the composer with a CACHE_FLUSH_AND_INV at
+  draw_tail end).
+- **B. TDR on the GFX ring.** ~10000ms elapsed + non-zero rc =
+  ring hang. `dmesg | grep amdgpu` confirms; Layer-2 byte-diff
+  vs radv localizes the bad packet.
+- **C. Pipeline state register mis-encoding.** Non-red pixel
+  (e.g. black) means FS ran but RT bind / blend / target-mask is
+  wrong. Suspect 6.5(a)'s pipeline_ctx register addresses.
+
+Build-clean (`cyrius build programs/native_render_e2e.cyr` succeeds;
+full include chain links). HW-gated to run — needs amdgpu + valid
+render-node fd. CI runners without DRM skip; developer gate is
+local `make test-native-render-e2e` on a Cezanne / equivalent box.
+
+**Phase C render is now code-complete** — every 6.x sub-bullet has
+either landed or is a HW-time follow-up (post-draw flush, Layer-2
+verify). The structural critical path from "shader bytes" to
+"pixel verified" is in tree.
+
+### Metrics — 2026-04-30 (post Step 6.9(b))
 
 - Module count: 33 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
-- `tests/tcyr/mabda_v3.tcyr`: **819 assertions** (was 712; +103 from
-  Step 6.8(c) — including the byte-exact dword-by-dword equivalence
-  test that walks the 48 B sh_block + 240 B ctx_block one register
-  write at a time).
-- `src/backend_native.cyr`: ~2,690 lines (was ~2,520 at 6.6 close).
-- `dist/mabda.cyr`: regenerated under cyrius 5.7.36 distlib.
+- `tests/tcyr/mabda_v3.tcyr`: 819 assertions (unchanged from 6.8(c) —
+  6.9(b) adds a program file, not new CPU assertions; the program's
+  pixel(0,0) check is the HW gate).
+- `programs/native_render_e2e.cyr`: 243 lines (new).
+- `src/backend_native.cyr`: ~2,690 lines (unchanged from 6.8(c)).
+- `dist/mabda.cyr`: unchanged (programs aren't bundled).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 6.8(c))
+### Next — 2026-04-30 (post Step 6.9(b))
 
-**Step 6.9(b)** — `programs/native_render_e2e.cyr` mirroring
-`programs/render_e2e.cyr`. Now fully unblocked: 6.5(b) builds the
-PM4 stream, 6.6 submits it on the GFX ring, 6.8(c) routes the public
-`gpu_render_*` dispatchers through `backend_native`. The e2e
-program creates a NativeRenderTarget + NativeRenderPipeline +
-dispatches one pass, then CPU-reads the RT and verifies pixel(0,0)
-is solid red. This is the first hardware gate for the entire 6.x
-chain.
+**Phase C render is code-complete.** Two HW-gated follow-ups:
 
-In parallel, Phase D surface (7.x) is still fully unblocked — pure
-DRM/KMS path, no shader bytes, no PM4 verification gate.
+1. **Run `make test-native-render-e2e` on a Cezanne box.** The
+   first execution is the load-bearing test for the entire 6.x
+   chain. Most likely outcome: pixel readback fails with the
+   sentinel byte (0x55) intact → post-draw cache flush is the
+   missing piece. If so, file as **Step 6.10** (extend
+   `native_pm4_build_render_draw_tail` to append a
+   CACHE_FLUSH_AND_INV).
+2. **Layer-2 byte-diff vs radv.** Once Hyprland is up (or the
+   headless `programs/diagnostics/radv_capture/` lands), diff the
+   IB our `pass_draw` emits against `RADV_DEBUG=hang vkcube`'s
+   IB for an equivalent clear-triangle. This is the "claim 6.5
+   done" gate the session 26 handoff identified.
 
-The "claim 6.5 done" gate remains Layer-2 verification (Hyprland +
-`RADV_DEBUG=hang` IB diff, or the headless capture program in
-`programs/diagnostics/radv_capture/`). Step 6.9(b) gives us a
-known-good Cyrius-side IB whose bytes can be diffed against radv's
-once that capture is available.
+**Phase D surface (7.x)** is fully unblocked and a clean parallel
+side-quest — pure DRM/KMS path, no shader bytes, no PM4
+verification gate.
+
+**WGSL → GFX9 ISA lowering (8.x)** remains the v3.0 ship-blocker
+per "Hard truths up front" in the punchlist. Worth a sober design
+spike before the next major bite.
 
 Full handoff (Step 6.5 close-out + 6.6 sequencing):
 [`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).

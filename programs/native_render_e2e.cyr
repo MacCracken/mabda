@@ -1,0 +1,301 @@
+# programs/native_render_e2e.cyr — v3 Step 6.9(b) hardware integration
+#
+# Native-path mirror of programs/render_e2e.cyr. Drives the public
+# `gpu_render_*` API (Step 6.9(a) dispatchers) end-to-end on the
+# native graphics ring, exercising the entire 6.x chain in one
+# program:
+#
+#   6.2(a) — graphics-pipeline register addresses + minimums
+#   6.2(b) — VS+FS shader bytes
+#   6.3   — native_rt_create_2d_rgba8 (via the slot wrapper)
+#   6.4   — SET_CONTEXT_REG + DRAW_INDEX_AUTO PM4 builders
+#   6.5(a/b) — clear-triangle PM4 stream composer (4-block split)
+#   6.6   — native_render_dispatch_simple GFX-ring submit
+#   6.7   — Backend interface render-pipeline / render-pass slots
+#   6.8(a/b/c) — slot offsets, wgpu wrappers, native wrappers
+#   6.9(a) — public gpu_render_* dispatchers
+#
+# Flow:
+#
+#   1. gpu_context_new_native() — opens DRM render node, allocates
+#      ctx_id + cached IB + cached fence (Step 4e/4f.iv).
+#   2. Allocate VS shader BO (4 KiB GTT), write the 116-byte
+#      `native_gfx9_shader_fullscreen_triangle_vs` at offset 0,
+#      va_map at canonical-high `0xFFFF800100000000` with
+#      _NATIVE_PERM_SHADER.
+#   3. Allocate FS shader BO (4 KiB GTT), write the 92-byte
+#      `native_gfx9_shader_solid_red` at offset 0, va_map at
+#      canonical-high `0xFFFF800100001000` with _NATIVE_PERM_SHADER.
+#   4. Pack vs_mod = (vs_handle, vs_va) and fs_mod = (fs_handle, fs_va)
+#      as 16-byte (handle, va) pairs (the shmod convention
+#      compute_dispatch uses).
+#   5. `gpu_render_target_create_2d_rgba8(ctx, 256, 256)` — routes
+#      through `_backend_native_render_target_create_2d_rgba8`,
+#      allocates a 40-byte NativeRenderTarget at RT-VA-base.
+#   6. `gpu_render_pipeline_create(ctx, vs_mod, fs_mod, 0)` — packs
+#      a NativeRenderPipeline; pre-builds pipeline_sh_block + ctx_block.
+#   7. `gpu_render_pass_begin(ctx, rt, &clear_color)` — alloc'd 32-byte
+#      NativePass (clear_color_ptr accepted but native ignores; FS
+#      hardcodes red).
+#   8. `gpu_render_pass_draw(ctx, pass, pipe, 3, 1)` — composes the
+#      full clear-triangle IB and dispatches via
+#      `native_render_dispatch_simple` on AMDGPU_HW_IP_GFX. Blocks on
+#      syncobj signal.
+#   9. `gpu_render_pass_end(ctx, pass)` — zeros pass struct.
+#  10. CPU-read pixel(0,0) via `load64(rt + NATIVE_RT_FIELD_ADDR)` —
+#      native RT BO is GTT-mapped, so pixel data is directly
+#      CPU-visible. Verify (0xFF, 0x00, 0x00, 0xFF) — exact RGBA8_UNORM
+#      round-trip of the FS's (1.0, 0.0, 0.0, 1.0) export.
+#  11. Teardown: gpu_render_pipeline_release, gpu_render_target_release,
+#      manual va_unmap + bo_release for the caller-owned shader BOs,
+#      gpu_context_release.
+#
+# Exit codes:
+#   0   — pixel(0,0) verified red; native render path live
+#   1   — gpu_context_new_native failed
+#   2   — VS shader BO setup failed
+#   3   — FS shader BO setup failed
+#   4   — RT create returned 0
+#   5   — pipeline create returned 0
+#   6   — pass begin returned 0
+#   7   — pass draw returned non-zero (PM4 dispatch failure / TDR)
+#   8   — pixel(0,0) red byte mismatch (likely cache coherency —
+#         see "What can fail on HW" below)
+#   9   — pixel(0,0) green byte non-zero
+#   10  — pixel(0,0) blue byte non-zero
+#   11  — pixel(0,0) alpha byte mismatch
+#
+# What can fail on HW (most likely first):
+#
+#   A. **Post-draw cache flush missing.** The 6.5(b) PM4 composer
+#      emits ACQUIRE_MEM (cache invalidate) at the START of the
+#      stream — for shader-fetch correctness — but no end-of-pass
+#      CACHE_FLUSH_AND_INV. radv emits one before reading the RT.
+#      If pixel(0,0) reads back as 0x00000000 (uninitialized GTT)
+#      while syncobj signaled normally, this is the suspect. Fix
+#      lands in a 6.x follow-up (extend the composer).
+#   B. **TDR (10s timeout) on the GFX ring.** If pass_draw returns
+#      ~10000ms elapsed and a non-zero rc, the PM4 stream is
+#      hanging the ring. Run with `dmesg | grep amdgpu` to confirm.
+#      Layer-2 byte-diff vs radv's IB will localize which packet.
+#   C. **Pipeline state register mis-encoding.** If pixel(0,0) reads
+#      back as a non-red color (e.g. (0, 0, 0, 0xFF) — black), the
+#      FS is running but the RT bind / blend / target-mask is wrong.
+#      Suspect 6.5(a)'s pipeline_ctx register addresses.
+#
+# Linked via the Makefile target `test-native-render-e2e`. No C
+# launcher (no wgpu-native dependency on the native path).
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn mono_ns() {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+
+    print_cstr("mabda native render e2e (v3 Step 6.9(b))\n");
+    print_cstr("----------------------------------------\n");
+
+    # ---- 1. Native GpuContext ----
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        return 1;
+    }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+    print_cstr("PASS: native ctx (fd="); print_i64(fd);
+    print_cstr(" ctx_id="); print_i64(native_ctx_id(ctx)); print_cstr(")\n");
+
+    # ---- 2. VS shader BO ----
+    var vs_size = 4096;
+    var vs_bo[16];
+    var rc = native_bo_create_gtt(fd, vs_size, &vs_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: vs bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        gpu_context_release(ctx); return 2;
+    }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, vs_size);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    rc = native_gem_va_map(fd, vs_handle, vs_va, vs_size, _NATIVE_PERM_SHADER);
+    if (rc != 0) {
+        print_cstr("FAIL: vs va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        gpu_context_release(ctx); return 2;
+    }
+    print_cstr("PASS: vs shader (handle="); print_i64(vs_handle);
+    print_cstr(" va=0x"); print_i64(vs_va);
+    print_cstr(" "); print_i64(GFX9_VS_FULLSCREEN_TRIANGLE_SIZE); print_cstr(" bytes)\n");
+
+    # ---- 3. FS shader BO ----
+    var fs_size = 4096;
+    var fs_bo[16];
+    rc = native_bo_create_gtt(fd, fs_size, &fs_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: fs bo create errno="); print_i64(0 - rc); print_cstr("\n");
+        native_gem_va_unmap(fd, vs_handle, vs_va, vs_size);
+        native_bo_release_gtt(fd, vs_handle, vs_addr, vs_size);
+        gpu_context_release(ctx); return 3;
+    }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    memset(fs_addr, 0, fs_size);
+    native_gfx9_shader_solid_red(fs_addr, 0);
+    var fs_va = 0xFFFF800100001000;
+    rc = native_gem_va_map(fd, fs_handle, fs_va, fs_size, _NATIVE_PERM_SHADER);
+    if (rc != 0) {
+        print_cstr("FAIL: fs va_map errno="); print_i64(0 - rc); print_cstr("\n");
+        gpu_context_release(ctx); return 3;
+    }
+    print_cstr("PASS: fs shader (handle="); print_i64(fs_handle);
+    print_cstr(" va=0x"); print_i64(fs_va);
+    print_cstr(" "); print_i64(GFX9_FS_SOLID_RED_SIZE); print_cstr(" bytes)\n");
+
+    # ---- 4. (handle, va) pairs for the slot wrappers ----
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+
+    # ---- 5. Render target via the public API ----
+    var W = 256;
+    var H = 256;
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) {
+        print_cstr("FAIL: gpu_render_target_create_2d_rgba8\n");
+        return 4;
+    }
+    var rt_va   = load64(rt + NATIVE_RT_FIELD_VA);
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    print_cstr("PASS: rt 256x256 (va=0x"); print_i64(rt_va);
+    print_cstr(" addr=0x"); print_i64(rt_addr); print_cstr(")\n");
+
+    # Pre-fill with a sentinel byte that's distinct from any expected
+    # value — if we read this back, the GPU never wrote the RT.
+    memset(rt_addr, 0x55, W * H * 4);
+
+    # ---- 6. Render pipeline via the public API ----
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (pipe == 0) {
+        print_cstr("FAIL: gpu_render_pipeline_create\n");
+        gpu_render_target_release(ctx, rt);
+        return 5;
+    }
+    print_cstr("PASS: render pipeline (vs+fs cached, sh+ctx blocks pre-built)\n");
+
+    # ---- 7. Pass begin (clear_color is informational on native) ----
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) {
+        print_cstr("FAIL: gpu_render_pass_begin\n");
+        gpu_render_pipeline_release(ctx, pipe);
+        gpu_render_target_release(ctx, rt);
+        return 6;
+    }
+    print_cstr("PASS: render pass begin\n");
+
+    # ---- 8. Draw — the load-bearing dispatch ----
+    var t_dispatch = mono_ns();
+    rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    var dispatch_ms = (mono_ns() - t_dispatch) / 1000000;
+    print_cstr("dispatch: "); print_i64(dispatch_ms); print_cstr(" ms");
+    if (dispatch_ms >= 9000) {
+        print_cstr(" (likely TDR — IB hung on GFX ring)");
+    }
+    print_cstr("\n");
+    if (rc != 0) {
+        print_cstr("FAIL: gpu_render_pass_draw rc="); print_i64(rc); print_cstr("\n");
+        gpu_render_pass_end(ctx, pass);
+        gpu_render_pipeline_release(ctx, pipe);
+        gpu_render_target_release(ctx, rt);
+        return 7;
+    }
+    print_cstr("PASS: draw signaled\n");
+
+    # ---- 9. Pass end ----
+    gpu_render_pass_end(ctx, pass);
+
+    # ---- 10. Verify pixel(0,0) ----
+    # RT is GTT-mapped linear RGBA8_UNORM; byte 0 = pixel(0,0).R,
+    # byte 1 = .G, byte 2 = .B, byte 3 = .A. FS exports
+    # (1.0, 0.0, 0.0, 1.0) → (0xFF, 0x00, 0x00, 0xFF) under
+    # RGBA8_UNORM round-trip.
+    var r = load8(rt_addr + 0);
+    var g = load8(rt_addr + 1);
+    var b = load8(rt_addr + 2);
+    var a = load8(rt_addr + 3);
+    print_cstr("pixel(0,0) = (");
+    print_hex32(r); print_cstr(", ");
+    print_hex32(g); print_cstr(", ");
+    print_hex32(b); print_cstr(", ");
+    print_hex32(a); print_cstr(")\n");
+
+    var exit_rc = 0;
+    if (r != 0xFF) {
+        print_cstr("FAIL: red != 0xFF (got 0x"); print_hex32(r);
+        print_cstr(") — suspect post-draw cache flush or pipeline state\n");
+        exit_rc = 8;
+    }
+    if (exit_rc == 0 && g != 0x00) {
+        print_cstr("FAIL: green != 0x00\n");
+        exit_rc = 9;
+    }
+    if (exit_rc == 0 && b != 0x00) {
+        print_cstr("FAIL: blue != 0x00\n");
+        exit_rc = 10;
+    }
+    if (exit_rc == 0 && a != 0xFF) {
+        print_cstr("FAIL: alpha != 0xFF\n");
+        exit_rc = 11;
+    }
+    if (exit_rc == 0) {
+        print_cstr("PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)\n");
+    }
+
+    # ---- 11. Teardown ----
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    native_gem_va_unmap(fd, fs_handle, fs_va, fs_size);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, fs_size);
+    native_gem_va_unmap(fd, vs_handle, vs_va, vs_size);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, vs_size);
+    gpu_context_release(ctx);
+
+    if (exit_rc == 0) {
+        print_cstr("\nOK — native render path live (Phase C render done)\n");
+    }
+    return exit_rc;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

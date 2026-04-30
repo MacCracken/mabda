@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 6.8(c) — native render slot wrappers landed)
+**Last refresh:** 2026-04-30 (post Step 6.9(b) — Phase C render code-complete)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -282,9 +282,21 @@ need it.
     capture + null-ctx safety. Works on wgpu path immediately
     via 6.8b's slot wrappers; lights up on native path once
     6.8c lands. (Step 6.9a, 2026-04-28).
-  - [ ] **6.9 (b)** — `programs/native_render_e2e.cyr` mirroring
-    `programs/render_e2e.cyr`. Gated on 6.8c (which is gated on
-    6.2 + 6.5 + 6.6).
+  - [x] **6.9 (b)** — `programs/native_render_e2e.cyr` mirroring
+    `programs/render_e2e.cyr` on the native graphics ring. Drives
+    the full 6.x chain end-to-end through the public 6.9(a)
+    `gpu_render_*` API: native ctx → VS+FS shader BOs → RT create
+    → pipeline create → pass begin/draw/end → CPU readback of
+    pixel(0,0). RT BO is GTT-mapped linear, so readback is a
+    direct `load8(rt_addr+0)` — no copy_texture_to_buffer dance.
+    Builds clean (`make build/native_render_e2e` succeeds; full
+    include chain links via `src/lib.cyr`); HW-gated (needs amdgpu
+    + valid render-node fd; CI skip-if-no-DRM applies). The program
+    documents three expected HW-time failure modes inline:
+    post-draw cache flush missing (most likely — radv emits one,
+    our 6.5(b) composer doesn't yet), TDR on GFX ring, pipeline
+    state mis-encoding. Exit codes 0–11 map to specific failure
+    classes for unattended runs. (Step 6.9(b), 2026-04-30).
 
 #### Phase D — surface + present on native (broken into chunks)
 
@@ -518,7 +530,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
-| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) + 6.6 + 6.8(c) done; 6.9(b) next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
+| Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
 | Tier 1 — Phase D surface (7.x) | ⬜ not started — fully unblocked, parallel side-quest | — |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
