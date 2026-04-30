@@ -1408,6 +1408,272 @@ var GFX9_SPI_VS_OUT_CONFIG_NO_VARYING = 0x0;
 # minimum pattern from radv.
 var GFX9_DB_SHADER_CONTROL_DEFAULT = 0x10;
 
+# CB_COLOR_CONTROL composed value: MODE = CB_NORMAL (1, bits 4-6) +
+# ROP3 = 0xCC (COPY_SOURCE, bits 16-23). Caught in 6.5(a) cross-check
+# that the design doc's "0xCC" was field-shorthand, not the encoded
+# register value: 0xCC at bit 0 would mis-set DEGAMMA_ENABLE + MODE.
+# Authoritative composition:
+#   MODE  = CB_NORMAL << 4    = 0x10
+#   ROP3  = 0xCC << 16        = 0xCC0000
+#   union                     = 0xCC0010
+var GFX9_CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010;
+
+# CB_COLOR0_INFO bit-composed value for a linear RGBA8-unorm RT:
+#   FORMAT[2:6]      = COLOR_8_8_8_8 (0xA) << 2  = 0x28
+#   NUMBER_TYPE[8:10] = NUMBER_UNORM (0)         = 0
+#   COMP_SWAP[11:12] = SWAP_STD (0)              = 0
+# All other bits (compression, fast_clear, blend_clamp, etc.) are 0
+# for the trivial pipeline. Cited from Mesa gfx9.json `register_types`
+# field bit-positions and `enums` value table (extracted 2026-04-30).
+var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x28;
+
+# CB_COLOR0_ATTRIB for 2D linear RGBA8 single-sample:
+#   COLOR_SW_MODE[18:22] = 0    (linear surface, no swizzle)
+#   NUM_SAMPLES[12:14]   = 0    (1 sample = 0)
+#   NUM_FRAGMENTS[15:16] = 0
+#   RESOURCE_TYPE[28:29] = 1    (2D image)
+# union = 1 << 28 = 0x10000000.
+# RESOURCE_TYPE encoding cited from radv source pattern; field
+# enum was not in the gfx9.json snapshot, so flag for HW verify.
+var GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000;
+
+# ================================================================
+# v3 Step 6.5(b) — PM4 stream composer for clear-triangle dispatch
+# ================================================================
+# Composes the four PM4 blocks per docs/proposals/v3-backend-interface.md
+# v2.1 split:
+#   1. pipeline_sh   — VS+PS shader VAs + RSRC1/RSRC2
+#   2. pipeline_ctx  — color/blend/raster/depth/SPI mode-static state
+#   3. pass_target   — RT bind + viewport + scissor (RT-extent dependent)
+#   4. draw_tail     — DRAW_INDEX_AUTO with vcount=3
+# Plus an ACQUIRE_MEM cache-invalidate preamble + UConfig graphics
+# regs (primitive type, num instances) + NOP padding.
+#
+# Every block is its own helper fn so each can be tested independently
+# at the CPU level. The top-level `native_pm4_build_render_clear_triangle`
+# composes them in order.
+#
+# Layer-2 verification gate: byte-exact diff vs `RADV_DEBUG=hang` IB
+# capture of an equivalent `vkCmdDraw` clear. Captured under a desktop
+# session — gated on the Hyprland reinstall (see
+# docs/proposals/v3-shader-bytes-capture.md "What unblocks Layer 2").
+
+# Convert an i64 integer to its IEEE-754 f32 bit pattern.
+# Routes through stdlib's `f64_from(int)` and color.cyr's
+# `f64_to_f32(f64bits)`. Used for viewport scale/offset conversions.
+fn native_int_to_f32_bits(i) {
+    return f64_to_f32(f64_from(i));
+}
+
+# Negate an f32 bit pattern (low 32 bits) by flipping the sign bit.
+# Operates on the integer holding the f32 bits; returns the negated
+# f32 bit pattern.
+fn native_f32_neg_bits(f32_bits) {
+    return f32_bits ^ 0x80000000;
+}
+
+# --- Block 1: pipeline_sh ---
+#
+# Two SET_SH_REG packets, each writing 4 contiguous regs starting at
+# the PGM_LO of each stage. VS at 0xB120, PS at 0xB020. Total: 12
+# dwords (48 bytes). Returns new pos.
+fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va) {
+    # PGM_HI mask = 0xFF: the HW register is 32-bit but only the low 8
+    # bits hold meaningful VA bits [47:40]; matches compute pattern at
+    # line ~809 (R_COMPUTE_PGM_HI). PGM_LO carries bits [39:8].
+    var vs_pgm_lo = (vs_va >> 8)  & 0xFFFFFFFF;
+    var vs_pgm_hi = (vs_va >> 40) & 0xFF;
+    var fs_pgm_lo = (fs_va >> 8)  & 0xFFFFFFFF;
+    var fs_pgm_hi = (fs_va >> 40) & 0xFF;
+
+    var vs_regs[16];
+    store32(&vs_regs +  0, vs_pgm_lo);
+    store32(&vs_regs +  4, vs_pgm_hi);
+    store32(&vs_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
+    store32(&vs_regs + 12, GFX9_VS_PGM_RSRC2_MIN);
+    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_VS, 4, &vs_regs);
+
+    var ps_regs[16];
+    store32(&ps_regs +  0, fs_pgm_lo);
+    store32(&ps_regs +  4, fs_pgm_hi);
+    store32(&ps_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
+    store32(&ps_regs + 12, GFX9_PS_PGM_RSRC2_MIN);
+    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_PS, 4, &ps_regs);
+
+    return pos;
+}
+
+# --- Block 2: pipeline_ctx ---
+#
+# Per-pipeline mode-static state: color/blend, rasterizer, clip,
+# stage enable, SPI inputs, depth disabled, anti-alias off. This
+# block does NOT depend on the RT (no extent, no VA) — it's purely
+# a function of the pipeline's intent.
+fn native_pm4_build_render_pipeline_ctx(buf, pos) {
+    # SPI shader output formats — 3 contiguous regs starting at 0xA70C.
+    var spi_fmts[12];
+    store32(&spi_fmts +  0, SPI_SHADER_POS_FORMAT_4);
+    store32(&spi_fmts +  4, SPI_SHADER_Z_FORMAT_INVALID);
+    store32(&spi_fmts +  8, SPI_SHADER_COL_FORMAT_FP32_ABGR);
+    pos = native_pm4_set_context_reg(buf, pos, R_SPI_SHADER_POS_FORMAT, 3, &spi_fmts);
+
+    # CB target/shader masks — 2 contiguous regs at 0xA238.
+    var cb_masks[8];
+    store32(&cb_masks + 0, GFX9_CB_TARGET_MASK_RGBA);
+    store32(&cb_masks + 4, GFX9_CB_SHADER_MASK_RGBA0);
+    pos = native_pm4_set_context_reg(buf, pos, R_CB_TARGET_MASK, 2, &cb_masks);
+
+    # Color / blend / raster / clip / stage enable.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR_CONTROL,
+                                         GFX9_CB_COLOR_CONTROL_NORMAL_COPY);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_BLEND0_CONTROL,
+                                         GFX9_CB_BLEND_DISABLED);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_SC_MODE_CNTL,
+                                         GFX9_PA_SU_SC_MODE_CULL_NONE);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_CLIP_CNTL,
+                                         GFX9_PA_CL_CLIP_CNTL_DEFAULT);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_SHADER_STAGES_EN,
+                                         GFX9_VGT_SHADER_STAGES_VS_PS);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_REUSE_OFF, 0);
+
+    # SPI inputs/outputs — FS gets the hang-quirk minimum, VS exports
+    # only pos0 (no params).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_INPUT_ENA,
+                                         GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_INPUT_ADDR,
+                                         GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_IN_CONTROL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_VS_OUT_CONFIG,
+                                         GFX9_SPI_VS_OUT_CONFIG_NO_VARYING);
+
+    # Depth/HTILE/render-override — depth-stencil disabled.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_SHADER_CONTROL,
+                                         GFX9_DB_SHADER_CONTROL_DEFAULT);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_HTILE_SURFACE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_OVERRIDE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_OVERRIDE2, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_CONFIG, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_RASTER_CONFIG, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
+
+    return pos;
+}
+
+# --- Block 3: pass_target ---
+#
+# Per-pass state that depends on the RT: scissor (extent), viewport
+# (NDC → pixel mapping with y-flip), and CB_COLOR0_* binding.
+# `rt_va` must be 8-byte aligned. `rt_width` and `rt_height` are
+# pixel counts (must be even for the /2 viewport math to be exact).
+fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
+    # Scissors. Format: low 16 bits = X, high 16 bits = Y.
+    var scissor_tl = 0;
+    var scissor_br = (rt_width & 0xFFFF) | ((rt_height & 0xFFFF) << 16);
+
+    var screen_scissor[8];
+    store32(&screen_scissor + 0, scissor_tl);
+    store32(&screen_scissor + 4, scissor_br);
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_SCREEN_SCISSOR_TL, 2, &screen_scissor);
+
+    var generic_scissor[8];
+    store32(&generic_scissor + 0, scissor_tl);
+    store32(&generic_scissor + 4, scissor_br);
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_GENERIC_SCISSOR_TL, 2, &generic_scissor);
+
+    # Viewport: NDC (-1..1) → pixel (0..w, 0..h) with y-flip.
+    # XSCALE = w/2, XOFFSET = w/2, YSCALE = -h/2, YOFFSET = h/2.
+    # ZSCALE = 1.0, ZOFFSET = 0.0. All as f32 bit patterns in dwords.
+    # PA_CL_VPORT_XSCALE..ZOFFSET_0 are 6 contiguous dwords starting at 0xA43C.
+    var w_half_f32      = native_int_to_f32_bits(rt_width / 2);
+    var h_half_f32      = native_int_to_f32_bits(rt_height / 2);
+    var neg_h_half_f32  = native_f32_neg_bits(h_half_f32);
+    var one_f32         = native_int_to_f32_bits(1);
+
+    var vport[24];
+    store32(&vport +  0, w_half_f32);     # XSCALE
+    store32(&vport +  4, w_half_f32);     # XOFFSET
+    store32(&vport +  8, neg_h_half_f32); # YSCALE (flipped)
+    store32(&vport + 12, h_half_f32);     # YOFFSET
+    store32(&vport + 16, one_f32);        # ZSCALE
+    store32(&vport + 20, 0);              # ZOFFSET (= 0.0 f32)
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_CL_VPORT_XSCALE, 6, &vport);
+
+    # Z viewport range — ZMIN=0.0, ZMAX=1.0 as f32 bits.
+    var z_minmax[8];
+    store32(&z_minmax + 0, 0);            # ZMIN_0 as f32 = 0.0
+    store32(&z_minmax + 4, one_f32);      # ZMAX_0 as f32 = 1.0
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_VPORT_ZMIN_0, 2, &z_minmax);
+
+    # CB_COLOR0 RT bind. BASE = (rt_va >> 8) low 32 bits, BASE_EXT
+    # = (rt_va >> 40) for the 8-bit high-VA extension.
+    var rt_base_lo  = (rt_va >> 8)  & 0xFFFFFFFF;
+    var rt_base_ext = (rt_va >> 40) & 0xFF;
+
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE, rt_base_lo);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE_EXT, rt_base_ext);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_VIEW, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_INFO,
+                                         GFX9_CB_COLOR0_INFO_RGBA8_UNORM);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_ATTRIB,
+                                         GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_DCC_CONTROL, 0);
+
+    return pos;
+}
+
+# --- Block 4: draw_tail ---
+#
+# Single DRAW_INDEX_AUTO with the full-screen-triangle vertex count
+# and AUTO_INDEX source select. Hardware generates vertex_id 0/1/2
+# for the VS to consume from system VGPR v0.
+fn native_pm4_build_render_draw_tail(buf, pos) {
+    return native_pm4_draw_index_auto(buf, pos,
+                                      GFX9_FULLSCREEN_TRI_VCOUNT,
+                                      DI_SRC_SEL_AUTO_INDEX);
+}
+
+# Top-level composer: emits the full PM4 stream for a single
+# clear-triangle dispatch into `buf`. Returns total bytes written
+# (= position after the NOP padding tail).
+#
+# Layout:
+#   1. ACQUIRE_MEM full invalidate
+#   2. UConfig graphics: VGT_PRIMITIVE_TYPE + VGT_NUM_INSTANCES
+#   3. Block 1 — pipeline_sh
+#   4. Block 2 — pipeline_ctx
+#   5. Block 3 — pass_target
+#   6. Block 4 — draw_tail
+#   7. NOP padding to 256-dword (1024-byte) alignment
+#
+# `buf` must be at least 1024 bytes.  `vs_va` and `fs_va` are GPU
+# VAs of the VS+FS BOs (256-byte aligned). `rt_va` is the GPU VA of
+# the color target (8-byte aligned). `rt_width`/`rt_height` are RT
+# dimensions in pixels (must be even).
+#
+# Verification: every emitted dword is structurally tested by
+# `test_native_pm4_render_clear_triangle_*` in mabda_v3.tcyr.
+# Layer-2 byte-exact diff against radv is gated on Hyprland.
+fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
+                                          rt_va, rt_width, rt_height) {
+    var pos = 0;
+    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
+                                         GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_NUM_INSTANCES,
+                                         GFX9_VGT_NUM_INSTANCES_ONE);
+    pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
+    pos = native_pm4_build_render_pipeline_ctx(buf, pos);
+    pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
+    pos = native_pm4_build_render_draw_tail(buf, pos);
+
+    var cur_dwords = pos / 4;
+    var target_dwords = 256;
+    if (cur_dwords < target_dwords) {
+        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
+    }
+    return pos;
+}
+
 # ================================================================
 # v3 Phase B.3.d — syncobj lifecycle (generic DRM, not AMDGPU-specific)
 # ================================================================

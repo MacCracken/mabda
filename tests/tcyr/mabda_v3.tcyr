@@ -1918,6 +1918,244 @@ fn test_gfx9_pipeline_ctx_value_constants() {
     assert_eq(GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN, 0x2,   "SPI_PS_INPUT min for hang quirk");
     assert_eq(GFX9_SPI_VS_OUT_CONFIG_NO_VARYING, 0x0,  "SPI_VS_OUT_CONFIG no varying");
     assert_eq(GFX9_DB_SHADER_CONTROL_DEFAULT,   0x10,  "DB_SHADER_CONTROL default");
+    # Composed bit-pattern values.
+    assert_eq(GFX9_CB_COLOR_CONTROL_NORMAL_COPY, 0xCC0010, "CB_COLOR_CONTROL composed");
+    assert_eq(GFX9_CB_COLOR0_INFO_RGBA8_UNORM,   0x28,     "CB_COLOR0_INFO RGBA8 unorm");
+    assert_eq(GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8, 0x10000000, "CB_COLOR0_ATTRIB 2D linear");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.5(b) — PM4 stream composer for clear-triangle dispatch
+# ================================================================
+# Verifies the four PM4 blocks compose correctly and produce the
+# expected wire-form dwords. CPU-asserted by-construction. Layer-2
+# verification (byte-exact vs radv-IB capture) gated on Hyprland.
+
+fn test_native_int_to_f32_bits_and_negate() {
+    # 0 → 0x00000000, 1 → 0x3F800000, 128 → 0x43000000, 256 → 0x43800000.
+    assert_eq(native_int_to_f32_bits(0),    0x00000000, "int 0 → f32 bits");
+    assert_eq(native_int_to_f32_bits(1),    0x3F800000, "int 1 → f32 bits");
+    assert_eq(native_int_to_f32_bits(128),  0x43000000, "int 128 → f32 bits");
+    assert_eq(native_int_to_f32_bits(256),  0x43800000, "int 256 → f32 bits");
+
+    # Negation flips the sign bit. -1.0 = 0xBF800000, -128.0 = 0xC3000000.
+    assert_eq(native_f32_neg_bits(0x3F800000), 0xBF800000, "neg 1.0");
+    assert_eq(native_f32_neg_bits(0x43000000), 0xC3000000, "neg 128.0");
+    # Negating 0.0 produces -0.0 = 0x80000000 (sign-bit flip).
+    assert_eq(native_f32_neg_bits(0x00000000), 0x80000000, "neg 0.0");
+    return 0;
+}
+
+fn test_native_pm4_render_pipeline_sh_layout() {
+    # VS at VA 0xFFFF800200000000, FS at VA 0xFFFF800200001000.
+    # VS PGM_LO = (vs_va >> 8) & 0xFFFFFFFF
+    #          = (0xFFFF800200000000 >> 8) & 0xFFFFFFFF
+    #          = 0x02000000.
+    # VS PGM_HI = (vs_va >> 40) & 0xFFFFFFFF
+    #          = 0xFFFF8002 & 0xFFFFFFFF = 0xFFFF8002.
+    var buf[64];
+    memset(&buf, 0xCC, 64);
+    var pos = native_pm4_build_render_pipeline_sh(&buf, 0,
+                                                  0xFFFF800200000000,
+                                                  0xFFFF800200001000);
+    # Two SET_SH_REG packets, each 4 values: 6 dwords each = 12 dwords = 48 bytes.
+    assert_eq(pos, 48, "pipeline_sh size = 48 bytes");
+
+    # First packet header — SET_SH_REG opcode 0x76, count_minus_1 = 4
+    # (n+1 = 5 data dwords, count field stores n+1-1 = 4).
+    # Header: 0xC0_count_minus_1<<16_0x76<<8 = 0xC0047600.
+    assert_eq(load32(&buf + 0), 0xC0047600, "VS SET_SH_REG header");
+    assert_eq(load32(&buf + 4), 0x48, "VS PGM_LO wire offset (0xB120 → 0x48)");
+    # vs_va = 0xFFFF800200000000.
+    # PGM_LO = (va >> 8) & 0xFFFFFFFF = 0x02000000 (Cyrius >> is logical).
+    # PGM_HI = (va >> 40) & 0xFF = bits [47:40] of va = 0x80.
+    assert_eq(load32(&buf + 8),  0x02000000, "VS PGM_LO = (vs_va>>8) low");
+    assert_eq(load32(&buf + 12), 0x80,       "VS PGM_HI = (vs_va>>40) byte");
+    assert_eq(load32(&buf + 16), GFX9_GFX_PGM_RSRC1_MIN, "VS PGM_RSRC1");
+    assert_eq(load32(&buf + 20), GFX9_VS_PGM_RSRC2_MIN, "VS PGM_RSRC2");
+
+    # Second packet — PS at offset +24 in buf.
+    # fs_va = 0xFFFF800200001000 → PGM_LO = 0x02000010, PGM_HI = 0x80.
+    assert_eq(load32(&buf + 24), 0xC0047600, "PS SET_SH_REG header");
+    assert_eq(load32(&buf + 28), 0x08, "PS PGM_LO wire offset (0xB020 → 0x08)");
+    assert_eq(load32(&buf + 32), 0x02000010, "PS PGM_LO = (fs_va>>8) low");
+    assert_eq(load32(&buf + 36), 0x80,       "PS PGM_HI = (fs_va>>40) byte");
+    assert_eq(load32(&buf + 40), GFX9_GFX_PGM_RSRC1_MIN, "PS PGM_RSRC1");
+    assert_eq(load32(&buf + 44), GFX9_PS_PGM_RSRC2_MIN, "PS PGM_RSRC2");
+    return 0;
+}
+
+fn test_native_pm4_render_pipeline_ctx_size_and_anchors() {
+    # 2 grouped packets (3+2 values) + 17 singletons = 5+4+17*3 = 60 dw = 240 bytes.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pipeline_ctx(&buf, 0);
+    assert_eq(pos, 240, "pipeline_ctx size = 240 bytes");
+
+    # First packet = SPI shader formats, 3 values starting at POS_FORMAT.
+    # Header: PKT3(SET_CONTEXT_REG, count_minus_1=3, 0) = 0xC0036900.
+    assert_eq(load32(&buf + 0), 0xC0036900, "SPI fmts SET_CONTEXT_REG header");
+    # Wire offset = (0xA70C - 0xA000) / 4 = 0x70C/4 = 0x1C3.
+    assert_eq(load32(&buf + 4),  0x1C3, "POS_FORMAT wire offset");
+    assert_eq(load32(&buf + 8),  SPI_SHADER_POS_FORMAT_4,     "SPI POS_FORMAT");
+    assert_eq(load32(&buf + 12), SPI_SHADER_Z_FORMAT_INVALID, "SPI Z_FORMAT");
+    assert_eq(load32(&buf + 16), SPI_SHADER_COL_FORMAT_FP32_ABGR, "SPI COL_FORMAT");
+
+    # Second packet = CB target/shader masks at +20 in buf.
+    assert_eq(load32(&buf + 20), 0xC0026900, "CB masks SET_CONTEXT_REG header");
+    # Wire offset = (0xA238 - 0xA000) / 4 = 0x238/4 = 0x8E.
+    assert_eq(load32(&buf + 24), 0x8E, "CB_TARGET_MASK wire offset");
+    assert_eq(load32(&buf + 28), GFX9_CB_TARGET_MASK_RGBA,  "CB_TARGET_MASK value");
+    assert_eq(load32(&buf + 32), GFX9_CB_SHADER_MASK_RGBA0, "CB_SHADER_MASK value");
+
+    # First singleton = CB_COLOR_CONTROL at +36. Single-reg: header + offset + value = 3 dwords.
+    assert_eq(load32(&buf + 36), 0xC0016900, "CB_COLOR_CONTROL header");
+    # Wire offset = (0xA808 - 0xA000) / 4 = 0x808/4 = 0x202.
+    assert_eq(load32(&buf + 40), 0x202, "CB_COLOR_CONTROL wire offset");
+    assert_eq(load32(&buf + 44), GFX9_CB_COLOR_CONTROL_NORMAL_COPY, "CB_COLOR_CONTROL value");
+    return 0;
+}
+
+fn test_native_pm4_render_pass_target_layout_256x256() {
+    # RT VA 0xFFFF800101000000 (matches src/backend_native.cyr's RT pool VA).
+    # 256x256 RT — viewport scale = 128, offset = 128.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pass_target(&buf, 0,
+                                                  0xFFFF800101000000,
+                                                  256, 256);
+    # Block size: 2 scissor pairs (4+4=8 dw) + 1 viewport-6 (8 dw) +
+    # 1 zminmax-pair (4 dw) + 6 RT singletons (18 dw) = 38 dw = 152 bytes.
+    assert_eq(pos, 152, "pass_target size = 152 bytes");
+
+    # First packet = screen scissor pair at +0.
+    assert_eq(load32(&buf + 0), 0xC0026900, "screen_scissor header");
+    # Wire offset = (0xA030 - 0xA000) / 4 = 0xC.
+    assert_eq(load32(&buf + 4), 0xC, "PA_SC_SCREEN_SCISSOR_TL wire offset");
+    assert_eq(load32(&buf + 8),  0,         "scissor TL = (0,0)");
+    # BR = (256 << 0) | (256 << 16) = 0x01000100.
+    assert_eq(load32(&buf + 12), 0x01000100, "scissor BR = (256,256)");
+
+    # Skip past second scissor + 6-value viewport packet to spot-check
+    # the viewport scale/offset.
+    # screen_scissor: 4 dw (16 bytes), generic_scissor: 4 dw (16 bytes),
+    # viewport packet at offset 32. Header + offset + 6 values = 8 dw.
+    # set_context_reg(n=6) → pkt3 count_minus_1 = 6 → header 0xC0066900.
+    assert_eq(load32(&buf + 32), 0xC0066900, "viewport header (6 values)");
+    # Wire offset (0xA43C - 0xA000)/4 = 0x10F.
+    assert_eq(load32(&buf + 36), 0x10F, "PA_CL_VPORT_XSCALE wire offset");
+    # Viewport: XSCALE = 128.0 = 0x43000000, XOFFSET = 128.0,
+    # YSCALE = -128.0 = 0xC3000000, YOFFSET = 128.0,
+    # ZSCALE = 1.0 = 0x3F800000, ZOFFSET = 0.
+    assert_eq(load32(&buf + 40), 0x43000000, "VPORT XSCALE = 128.0");
+    assert_eq(load32(&buf + 44), 0x43000000, "VPORT XOFFSET = 128.0");
+    assert_eq(load32(&buf + 48), 0xC3000000, "VPORT YSCALE = -128.0");
+    assert_eq(load32(&buf + 52), 0x43000000, "VPORT YOFFSET = 128.0");
+    assert_eq(load32(&buf + 56), 0x3F800000, "VPORT ZSCALE = 1.0");
+    assert_eq(load32(&buf + 60), 0,          "VPORT ZOFFSET = 0.0");
+    return 0;
+}
+
+fn test_native_pm4_render_pass_target_rt_bind() {
+    # RT VA 0xFFFF800101000000.
+    # (rt_va >> 8): canonical-high arithmetic shift → 0xFFFFFF8001010000
+    # & 0xFFFFFFFF → 0x01010000 (low 32 bits hold the BO offset >> 8).
+    # (rt_va >> 40) & 0xFF: bits 40-47 of rt_va. The byte at that
+    # position in 0xFFFF800101000000 is 0x80.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pass_target(&buf, 0,
+                                                  0xFFFF800101000000,
+                                                  256, 256);
+    # CB_COLOR0 singletons follow scissor (32) + viewport (32) + zmm (16)
+    # = 80 bytes. CB_COLOR0_BASE single-reg header at offset 80.
+    # set_context_reg_one → pkt3_header(0x69, 2, 0) → count_minus_1 = 1.
+    assert_eq(load32(&buf + 80), 0xC0016900, "CB_COLOR0_BASE header");
+    # Wire offset (0xAC60 - 0xA000)/4 = 0xC60/4 = 0x318.
+    assert_eq(load32(&buf + 84), 0x318, "CB_COLOR0_BASE wire offset");
+    assert_eq(load32(&buf + 88), 0x01010000, "CB_COLOR0_BASE = (rt_va>>8) low");
+
+    # CB_COLOR0_BASE_EXT at +92 (next 3-dword packet).
+    assert_eq(load32(&buf + 92), 0xC0016900, "CB_COLOR0_BASE_EXT header");
+    assert_eq(load32(&buf + 96), 0x319, "CB_COLOR0_BASE_EXT wire offset");
+    assert_eq(load32(&buf + 100), 0x80, "CB_COLOR0_BASE_EXT = (rt_va>>40) byte");
+    return 0;
+}
+
+fn test_native_pm4_render_draw_tail() {
+    var buf[16];
+    memset(&buf, 0xCC, 16);
+    var pos = native_pm4_build_render_draw_tail(&buf, 0);
+    assert_eq(pos, 12, "draw_tail = 3 dwords");
+    # DRAW_INDEX_AUTO header: count_minus_1=1, opcode=0x2D → 0xC0012D00.
+    assert_eq(load32(&buf + 0), 0xC0012D00, "DRAW_INDEX_AUTO header");
+    assert_eq(load32(&buf + 4), GFX9_FULLSCREEN_TRI_VCOUNT, "vertex_count = 3");
+    assert_eq(load32(&buf + 8), DI_SRC_SEL_AUTO_INDEX, "auto-index draw initiator");
+    return 0;
+}
+
+fn test_native_pm4_render_clear_triangle_top_level() {
+    # End-to-end composer. Buffer needs ≥ 1024 bytes (256-dword pad target).
+    var buf[1024];
+    memset(&buf, 0xCC, 1024);
+    var pos = native_pm4_build_render_clear_triangle(&buf,
+                            0xFFFF800200000000,   # vs_va
+                            0xFFFF800200001000,   # fs_va
+                            0xFFFF800101000000,   # rt_va
+                            256, 256);            # rt extent
+    # Padded to 256 dwords = 1024 bytes.
+    assert_eq(pos, 1024, "composer pads to 1024 bytes");
+
+    # ACQUIRE_MEM at offset 0: 7 dwords (28 bytes), header 0xC0055802.
+    assert_eq(load32(&buf + 0), 0xC0055802, "ACQUIRE_MEM header");
+
+    # First UConfig SET_REG packet at offset 28 (post-ACQUIRE_MEM).
+    # set_uconfig_reg_one passes count=2 to pkt3_header → count_minus_1=1
+    # → header 0xC0017900.
+    assert_eq(load32(&buf + 28), 0xC0017900, "VGT_PRIMITIVE_TYPE UConfig header");
+    # VGT_PRIMITIVE_TYPE wire offset = (0x30908 - 0x30000)/4 = 0x242.
+    assert_eq(load32(&buf + 32), 0x242, "VGT_PRIMITIVE_TYPE wire offset");
+    assert_eq(load32(&buf + 36), GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, "primitive type");
+
+    # Second UConfig at offset 40.
+    assert_eq(load32(&buf + 40), 0xC0017900, "VGT_NUM_INSTANCES UConfig header");
+    # VGT_NUM_INSTANCES wire offset = (0x30934 - 0x30000)/4 = 0x24D.
+    assert_eq(load32(&buf + 44), 0x24D, "VGT_NUM_INSTANCES wire offset");
+    assert_eq(load32(&buf + 48), GFX9_VGT_NUM_INSTANCES_ONE, "num instances 1");
+
+    # Pipeline_sh starts at offset 52. VS PGM_LO header.
+    assert_eq(load32(&buf + 52), 0xC0047600, "pipeline_sh begins (VS SET_SH_REG)");
+    return 0;
+}
+
+fn test_native_pm4_render_clear_triangle_block_sizes() {
+    # Confirm block sizes sum to the expected pre-padding total.
+    # ACQUIRE_MEM (28) + 2 UConfig (24) + sh (48) + ctx (228) +
+    # pass_target (152) + draw_tail (12) = 492 bytes pre-pad.
+    var buf[1024];
+    memset(&buf, 0xCC, 1024);
+
+    var p = 0;
+    p = native_pm4_acquire_mem_full_invalidate(&buf, p);
+    assert_eq(p, 28, "ACQUIRE_MEM = 28");
+    p = native_pm4_set_uconfig_reg_one(&buf, p, R_VGT_PRIMITIVE_TYPE,
+                                       GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    assert_eq(p, 40, "+UConfig 1");
+    p = native_pm4_set_uconfig_reg_one(&buf, p, R_VGT_NUM_INSTANCES,
+                                       GFX9_VGT_NUM_INSTANCES_ONE);
+    assert_eq(p, 52, "+UConfig 2");
+    p = native_pm4_build_render_pipeline_sh(&buf, p,
+                                            0xFFFF800200000000,
+                                            0xFFFF800200001000);
+    assert_eq(p, 100, "+pipeline_sh = 48");
+    p = native_pm4_build_render_pipeline_ctx(&buf, p);
+    assert_eq(p, 340, "+pipeline_ctx = 240");
+    p = native_pm4_build_render_pass_target(&buf, p,
+                                            0xFFFF800101000000, 256, 256);
+    assert_eq(p, 492, "+pass_target = 152");
+    p = native_pm4_build_render_draw_tail(&buf, p);
+    assert_eq(p, 504, "+draw_tail = 12");
     return 0;
 }
 
@@ -2281,6 +2519,16 @@ fn main() {
     test_gfx9_pass_target_register_addresses();
     test_gfx9_uconfig_graphics_register_addresses();
     test_gfx9_pipeline_ctx_value_constants();
+
+    # v3 Step 6.5(b) — PM4 stream composer for clear-triangle (8)
+    test_native_int_to_f32_bits_and_negate();
+    test_native_pm4_render_pipeline_sh_layout();
+    test_native_pm4_render_pipeline_ctx_size_and_anchors();
+    test_native_pm4_render_pass_target_layout_256x256();
+    test_native_pm4_render_pass_target_rt_bind();
+    test_native_pm4_render_draw_tail();
+    test_native_pm4_render_clear_triangle_top_level();
+    test_native_pm4_render_clear_triangle_block_sizes();
 
     # v3 Step 6.9 — public render-* dispatchers (8)
     test_gpu_render_target_create_dispatches_through_backend();

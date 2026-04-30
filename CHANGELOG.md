@@ -23,6 +23,158 @@ section when they ship.
 Pre-release dev-track entries for the v3 native-backend work. No
 release date; individual items are dated inline when they land.
 
+### Added — 2026-04-30 (Session 26 — Steps 6.2 + 6.5 native render PM4 composer)
+
+The native render path's CPU-testable structure is now end-to-end in
+tree. Register addresses + minimums, VS+FS shader bytes, and the full
+clear-triangle PM4 stream composer all land with by-construction CPU
+asserts pinning every emitted byte. Layer-2 byte-exact verification
+against radv-IB capture remains gated on Hyprland.
+
+- **Step 6.2(a) — graphics-pipeline register addresses + minimums.**
+  12 SH/context register addresses (VS+PS PGM_LO/HI/RSRC1/RSRC2 + SPI
+  shader format outputs + CB_TARGET_MASK) and 6 spec-derived field
+  minimums (RSRC1/RSRC2/format/vcount). 30 CPU value-asserts in
+  `tests/tcyr/mabda_v3.tcyr`. Capture-protocol doc filed at
+  `docs/proposals/v3-shader-bytes-capture.md` (298 lines).
+- **Step 6.2(b) FS — `native_gfx9_shader_solid_red`.** 92-byte
+  hand-encoded fragment shader emitting solid red via 4× `v_mov_b32`
+  + `exp mrt0 done vm` + `s_endpgm` + 16-NOP prefetch padding. Each
+  dword spec-cited from the GFX9/GCN5 ISA spec. 26 byte-asserts.
+  `GFX9_FS_SOLID_RED_SIZE = 92` exposed for Step 6.5 BO sizing.
+- **Step 6.2(b) VS — `native_gfx9_shader_fullscreen_triangle_vs`.**
+  116-byte VS computing NDC fullscreen triangle from system VGPR v0
+  via the standard radv pattern `(vid&1)*4-1, (vid>>1)*4-1`. VOP2
+  arithmetic encodings cross-checked against
+  `clang -target amdgcn--amdhsa -mcpu=gfx90c -O2 -nogpulib`
+  disassembly (`llvm-objdump -d`) of an equivalent CL kernel — same
+  Layer-1 protocol the compute shader used. 32 byte-asserts.
+  `GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116` exposed for Step 6.5.
+- **Step 6.5(a) — clear-triangle PM4 register addresses + value
+  constants.** 38 new register addresses (15 pipeline-static ctx +
+  21 pass-target + 2 UConfig graphics) and 12 simple value constants
+  (target masks, blend / cull / clip defaults, primitive type, SPI
+  hang-quirk minimum, DB defaults). Every address extracted from
+  authoritative Mesa
+  `https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json`
+  with citation comment. 50 CPU value-asserts. Plus 3 composed
+  bit-pattern values (`CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010`,
+  `CB_COLOR0_INFO_RGBA8_UNORM = 0x28`,
+  `CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000`).
+- **Step 6.5(b) — PM4 stream composer for clear-triangle dispatch.**
+  Four-block split per `docs/proposals/v3-backend-interface.md` v2.1:
+  `native_pm4_build_render_pipeline_sh` (VS+PS shader VAs + RSRC,
+  48 B), `_pipeline_ctx` (mode-static state, 240 B),
+  `_pass_target` (RT bind + viewport + scissor, 152 B),
+  `_draw_tail` (DRAW_INDEX_AUTO, 12 B). Top-level
+  `native_pm4_build_render_clear_triangle(buf, vs_va, fs_va, rt_va,
+  rt_width, rt_height)` composes the four blocks + ACQUIRE_MEM
+  preamble + UConfig graphics + NOP padding to 256-dword alignment
+  (1024 B total). Helpers `native_int_to_f32_bits` +
+  `native_f32_neg_bits` for viewport f32 conversion (route through
+  stdlib `f64_from` and color.cyr `f64_to_f32`). 75 CPU asserts
+  exercise int↔f32 helpers + each block in isolation + the top-level
+  composer.
+
+### Fixed — 2026-04-30 (catches during Steps 6.2 + 6.5)
+
+- **`SPI_SHADER_{POS,Z,COL}_FORMAT` addresses scrambled in 6.2(a).**
+  Initial 6.2(a) shipped POS=0xA710, Z=0xA708, COL=0xA70C. Authoritative
+  Mesa gfx9.json: POS=0xA70C, Z=0xA710, COL=0xA714. Caught during
+  6.5(a) cross-check before any HW test ran. Lesson now codified in
+  `docs/proposals/v3-shader-bytes-capture.md` § "Authoritative source
+  for register addresses": every `R_*` constant must cite its
+  gfx9.json `map.at` value.
+- **PGM_HI mask in 6.5(b) `pipeline_sh` block.** Initial composer used
+  `(va >> 40) & 0xFFFFFFFF`; correct mask matches compute pattern
+  (line ~809) — `& 0xFF` (8 bits, bits 40-47 of VA). Cyrius's `>>`
+  on i64 is logical (no sign-extend), so the bug was producing
+  garbage in high bits of a 32-bit register that hardware would
+  ignore but cluttered the IB.
+- **CB_COLOR_CONTROL design-doc value 0xCC was field-shorthand.**
+  `docs/proposals/v3-native-render-design.md` listed 0xCC for "NORMAL
+  ROP". The bare 0xCC interpreted as the encoded register would set
+  DEGAMMA_ENABLE bit 3 and put MODE=4 (CB_DECOMPRESS). Authoritative
+  composition: MODE=CB_NORMAL (1) << 4 = 0x10, ROP3=0xCC << 16 =
+  0xCC0000, union = 0xCC0010. Now exposed as
+  `GFX9_CB_COLOR_CONTROL_NORMAL_COPY`.
+
+### Unblocked — 2026-04-30 (toolchain + tooling)
+
+- **Cyrius distlib 64-KB-per-module truncation fixed upstream in
+  v5.7.36.** `src/backend_native.cyr` grew past 64 KB during the
+  6.2 work. Cyrius distlib's read buffer (`alloc(65536) /
+  file_read_all(..., 65535)` in `cbt/commands.cyr:894`) silently
+  truncated, producing a bundle missing every fn defined past
+  byte 65535. Fixed upstream — buffer raised 64 KB → 256 KB. Mabda
+  pin moved 5.5.20 → 5.7.35 → 5.7.36 across the session.
+- **Cyrius lint/fmt now per-file (5.7.x CLI shape change).** Bare
+  `cyrius lint` / `cyrius fmt --check` (repo-wide) is gone — both
+  require an explicit file argument. Project-wide form for downstream
+  consumers is now a shell loop:
+  `for f in src/*.cyr; do cyrius lint "$f" || exit 1; done`. CLAUDE.md
+  P(-1) Scaffold Hardening section still describes the bare form;
+  flag for Tier 4 doc update.
+- **clang + LLVM AMDGPU installed on the dev box.** `clang 22.1.3` +
+  `llvm-objdump` + `llvm-mc`. Unblocks Layer-1 cross-check protocol
+  (hand-encoded shader bytes vs `clang -target amdgcn--amdhsa
+  -mcpu=gfx90c -O2 -nogpulib` disassembly). Used for the 6.2(b) VS
+  arithmetic VOP2 encodings.
+
+### Methodology note — 2026-04-30 (ground-truth-everything)
+
+The session's bug catches (scrambled SPI addresses, PGM_HI mask,
+CB_COLOR_CONTROL value, six test arithmetic errors) all share a
+shape: speculation-from-design-doc that didn't survive a check
+against the authoritative source. The protocol now reflected in
+`docs/proposals/v3-shader-bytes-capture.md`:
+
+- Layer 1 (shader ISA bytes) — clang `amdgcn--amdhsa` + `llvm-objdump`
+  is the cross-check tool. Reference CL kernel preserved in the proposal
+  doc for re-verification.
+- Layer 2 (PM4 packet stream) — `RADV_DEBUG=hang` IB dump from a vkcube
+  clear-triangle is the cross-check. **Currently gated on Hyprland**
+  (the dev box is Arch base, no DRI3, vkcube needs a presentation
+  surface). Once unblocked, run on the existing
+  `native_pm4_build_render_clear_triangle` output to claim Step 6.5
+  done.
+- Register addresses — Mesa
+  `https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json`
+  is the source of truth. Lookup script captured inline in the
+  proposal doc. Every `R_*` constant in `src/backend_native.cyr`
+  carries a `# Mesa 0x028XYZ` citation comment.
+
+### Metrics — 2026-04-30
+
+- Module count: 33 (unchanged from session 25c).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged — backend-agnostic
+  v2 surface, all green).
+- `tests/tcyr/mabda_v3.tcyr`: **697 assertions** (was 484 at session
+  25c close; +213 from 6.2(a/b) + 6.5(a/b) work).
+- `src/backend_native.cyr`: ~2,400 lines (was 1,799 at session 25c
+  close).
+- `dist/mabda.cyr`: regenerated under cyrius 5.7.36 distlib (now
+  complete; was link-broken pre-5.7.36 due to 64-KB truncation).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml` (was 5.5.20 at
+  session start).
+
+### Next — 2026-04-30
+
+Step 6.6 (`native_render_dispatch_simple`) — GFX-ring submission
+analog of `native_compute_dispatch_cached`. Self-contained,
+CPU-testable. Mirrors the existing compute submission flow
+(`native_cs_submit_4chunk` + syncobj wait) on a different ring kind.
+
+In parallel, Phase D surface (7.x) is fully unblocked and complements
+the 6.x work — pure DRM/KMS path, no shader bytes, no PM4 verification
+gate.
+
+The "claim 6.5 done" gate is Layer-2 verification — gated on Hyprland
+desktop session, then `RADV_DEBUG=hang vkcube` IB capture +
+byte-diff against `native_pm4_build_render_clear_triangle` output.
+
+Full handoff: [`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).
+
 ### Verified — 2026-04-27/28 (B.4 store shader live-verified on Cezanne)
 
 - `programs/native_compute_store.cyr` lands `0xDEADBEEF` in `out[0]`

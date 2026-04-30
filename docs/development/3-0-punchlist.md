@@ -174,14 +174,21 @@ need it.
     `SPI_SHADER_{POS,Z,COL}_FORMAT` triplet had been transcribed
     with scrambled values; corrected against authoritative Mesa
     output before HW test ran. (Step 6.5(a), 2026-04-30).
-  - [ ] **6.5(b)** — full PM4 stream composer
+  - [x] **6.5(b)** — full PM4 stream composer
     (`native_pm4_build_render_clear_triangle`). Splits into
     pipeline_sh / pipeline_ctx / pass_target / draw_tail blocks
-    per docs/proposals/v3-backend-interface.md v2.1. CPU value-
-    asserts pin every emitted dword. Layer-2 byte-exact-vs-radv
-    verification gated on Hyprland (so vkcube can run with a
-    presentation surface and `RADV_DEBUG=hang` produces an IB
-    dump).
+    per docs/proposals/v3-backend-interface.md v2.1. Helpers
+    `native_int_to_f32_bits` + `native_f32_neg_bits` for viewport
+    f32 conversion. Each block is its own fn for independent CPU
+    testing. 75 new value-asserts pin every emitted dword. Bug
+    catches during 6.5(b) implementation: PGM_HI mask was
+    `& 0xFFFFFFFF` initially — corrected to `& 0xFF` to match
+    compute precedent (line ~809) and avoid garbage in high reg
+    bits; CB_COLOR_CONTROL design-doc value 0xCC was field-
+    shorthand, real composed value is 0xCC0010 (MODE=CB_NORMAL +
+    ROP3=COPY_SOURCE). Layer-2 byte-exact-vs-radv verification
+    gated on Hyprland — Step 6.6 / 6.8c / 6.9b can build on this.
+    (Step 6.5(b), 2026-04-30).
 - [ ] **6.6** — `native_render_dispatch_simple(ctx, …)` — analogous
   to `native_compute_dispatch_cached` but on the GFX ring.
 - [x] **6.7** — Backend interface render-pipeline / render-pass
@@ -319,18 +326,32 @@ This is the v3.0 hard truth. Scoping carefully.
 
 ## Tier 2 — Integration & regression
 
+- [ ] **`programs/diagnostics/radv_capture/`** — headless Vulkan
+  capture program. Phase 1: hardcoded for the Step 6.5
+  clear-triangle, produces an `RADV_DEBUG=hang` IB dump for the
+  Layer-2 byte-diff that gates "claim 6.5 done." Phase 2:
+  parameterized for arbitrary draws (width/height/shader/vcount),
+  becomes the golden-image diff harness. Phase 3: cross-consumer
+  adoption — soorat / rasa / aethersafta / kiran land regression
+  tests against it. Decision (2026-04-30): build this as a
+  first-class deliverable rather than relying on
+  `vkcube + native Hyprland` alone. Long-term payoff is UI testing
+  across the AGNOS consumers, not just mabda's PM4 verification.
+  See session 26 handoff for the suggested phasing.
 - [ ] `examples/stdlib-consumer/` builds and runs under **both**
-  backends on AMD
+  backends on AMD. Phase-3 of the harness above lights this up
+  as a real cross-backend pixel-identity check.
 - [ ] Six-consumer regression sweep — soorat / rasa / ranga / bijli /
   aethersafta / kiran all build and run on `wgpu` (default
-  unchanged); zero behavioural changes
+  unchanged); zero behavioural changes.
 - [ ] At least one consumer (likely soorat or compute-heavy bijli)
-  runs a CI matrix entry under `native` on AMD hardware
-- [x] CPU assertions still pass — 624 (mabda.tcyr) + 227
-  (mabda_v3.tcyr) = **851 passing as of Step 5a**, all backend-
-  agnostic, no regressions throughout backend abstraction work
+  runs a CI matrix entry under `native` on AMD hardware.
+- [x] CPU assertions still pass — 624 (mabda.tcyr) + 697
+  (mabda_v3.tcyr) = **1321 passing as of session 26 close**, all
+  backend-agnostic, no regressions throughout backend abstraction
+  / texture / render PM4 composer work.
 - [ ] All 13 GPU benches pass under `native` on AMD (today they
-  only run under `wgpu`)
+  only run under `wgpu`).
 
 ## Tier 3 — Performance evidence (the v3.0 "story")
 
@@ -456,20 +477,20 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 10. **Tier 5 release engineering** — P(-1) audit, version bump,
     distlib regen, soak, RC, ship.
 
-## Status snapshot (refreshed 2026-04-28)
+## Status snapshot (refreshed 2026-04-30)
 
 | Tier | Status | Last touched |
 |------|--------|-------------|
 | Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
-| Tier 1 — Phase C texture | ⬜ not started — chunks 5.1–5.9 queued | — |
-| Tier 1 — Phase C render | ⬜ not started — chunks 6.1–6.9 queued | — |
-| Tier 1 — Phase D surface | ⬜ not started — chunks 7.1–7.7 queued | — |
-| Tier 1 — WGSL lowering | ⬜ not started — chunks 8.1–8.10 queued | — |
-| Tier 2 — Integration & regression | partial — CPU 851/851 pass; consumer sweep pending | 2026-04-28 |
+| Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
+| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) done; 6.6 next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | ⬜ not started — fully unblocked, parallel side-quest | — |
+| Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
+| Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |
-| Tier 4 — Documentation | partial — handoff + 2 issue docs filed; CLAUDE.md / migration guide pending | 2026-04-28 |
-| Tier 5 — Release engineering | partial — toolchain pin (5.7.28) + test split landed; rest pending | 2026-04-28 |
+| Tier 4 — Documentation | partial — session 26 handoff filed; CHANGELOG `[3.0.0-dev]` updated; CLAUDE.md / migration guide / vidya field-notes pending | 2026-04-30 |
+| Tier 5 — Release engineering | partial — toolchain pin 5.7.36 + test split + dist regenerate (clean post-distlib-fix) landed; rest pending | 2026-04-30 |
 | Tier 6 — Forward tracking | ⬜ not started | — |
 
 ## Notes / decisions captured along the way

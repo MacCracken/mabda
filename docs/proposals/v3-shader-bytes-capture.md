@@ -1,11 +1,19 @@
 # v3.0 — Graphics shader-bytes derivation & PM4 verification protocol
 
 **Status:** Working spec. 6.2(a) constants landed; 6.2(b) path 1
-chosen (hand-encode against GCN5 ISA spec); both shaders landed:
-`native_gfx9_shader_solid_red` (FS, 92 bytes) and
-`native_gfx9_shader_fullscreen_triangle_vs` (VS, 116 bytes). All
-encodings cross-checked against `clang -target amdgcn--amdhsa
--mcpu=gfx90c -O2` disassembly via `llvm-objdump -d`.
+chosen (hand-encode against GCN5 ISA spec); both shaders landed
+(`native_gfx9_shader_solid_red` 92 B FS,
+`native_gfx9_shader_fullscreen_triangle_vs` 116 B VS, all
+encodings cross-checked against clang+llvm-objdump). 6.5(a)
+register addresses + values landed (50 constants from authoritative
+Mesa gfx9.json — caught the SPI_SHADER_*_FORMAT scrambled-address
+bug from 6.2(a)). 6.5(b) PM4 stream composer landed: 4-block split
+(pipeline_sh / pipeline_ctx / pass_target / draw_tail) +
+ACQUIRE_MEM preamble + UConfig graphics + NOP padding, total ~492
+bytes per dispatch padded to 1024. CPU-asserted by-construction
+(75 new asserts). **Layer-2 verification (byte-exact vs radv-IB
+capture) is the only remaining gate to claiming 6.5 done — needs
+Hyprland for vkcube + `RADV_DEBUG=hang`.**
 **Branch:** `v3`
 **Predecessor:**
 [`docs/handoff/2026-04-28-session25c-punch-list-march.md`](../handoff/2026-04-28-session25c-punch-list-march.md)
