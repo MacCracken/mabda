@@ -162,6 +162,26 @@ need it.
   PM4 stream that runs a vertex+fragment dispatch to clear a
   render target with a solid color. Mirrors
   `native_pm4_build_compute_store_deadbeef` shape.
+  - [x] **6.5(a)** — clear-triangle PM4 register addresses + value
+    constants. 38 new register addresses (pipeline-static ctx +
+    pass-target + UConfig graphics) plus 12 simple value constants
+    (target masks, blend / cull / clip defaults, primitive type,
+    SPI hang-quirk minimum) in `src/backend_native.cyr`. Every
+    address extracted from Mesa
+    `src/amd/registers/gfx9.json` with a citation comment. 50 new
+    CPU value-asserts in `tests/tcyr/mabda_v3.tcyr`. Surfaced and
+    fixed a Step 6.2(a) bug along the way: the
+    `SPI_SHADER_{POS,Z,COL}_FORMAT` triplet had been transcribed
+    with scrambled values; corrected against authoritative Mesa
+    output before HW test ran. (Step 6.5(a), 2026-04-30).
+  - [ ] **6.5(b)** — full PM4 stream composer
+    (`native_pm4_build_render_clear_triangle`). Splits into
+    pipeline_sh / pipeline_ctx / pass_target / draw_tail blocks
+    per docs/proposals/v3-backend-interface.md v2.1. CPU value-
+    asserts pin every emitted dword. Layer-2 byte-exact-vs-radv
+    verification gated on Hyprland (so vkcube can run with a
+    presentation surface and `RADV_DEBUG=hang` produces an IB
+    dump).
 - [ ] **6.6** — `native_render_dispatch_simple(ctx, …)` — analogous
   to `native_compute_dispatch_cached` but on the GFX ring.
 - [x] **6.7** — Backend interface render-pipeline / render-pass

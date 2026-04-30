@@ -304,9 +304,9 @@ Constants in `src/backend_native.cyr` (Step 6.2(a) section, lines
 | `R_SPI_SHADER_PGM_HI_PS` | `0xB024` | Mesa sid.h |
 | `R_SPI_SHADER_PGM_RSRC1_PS` | `0xB028` | Mesa sid.h |
 | `R_SPI_SHADER_PGM_RSRC2_PS` | `0xB02C` | Mesa sid.h |
-| `R_SPI_SHADER_POS_FORMAT` | `0xA710` | Mesa sid.h `R_028710_*` (mabda 0xA-shorthand) |
-| `R_SPI_SHADER_Z_FORMAT` | `0xA708` | Mesa sid.h `R_028708_*` |
-| `R_SPI_SHADER_COL_FORMAT` | `0xA70C` | Mesa sid.h `R_02870C_*` |
+| `R_SPI_SHADER_POS_FORMAT` | `0xA70C` | Mesa gfx9.json `R_02870C_*` (mabda 0xA-shorthand) |
+| `R_SPI_SHADER_Z_FORMAT` | `0xA710` | Mesa gfx9.json `R_028710_*` |
+| `R_SPI_SHADER_COL_FORMAT` | `0xA714` | Mesa gfx9.json `R_028714_*` |
 | `R_CB_TARGET_MASK` | `0xA238` | Mesa sid.h `R_028238_*` |
 | `GFX9_GFX_PGM_RSRC1_MIN` | `0x002C0040` | mirrors compute RSRC1_MIN |
 | `GFX9_VS_PGM_RSRC2_MIN` | `0x0` | spec; no USER_SGPR / scratch / LDS |
@@ -324,6 +324,53 @@ wire-form encodings produced by `native_sh_reg_offset` /
 `native_context_reg_offset`. Pattern follows the 4f.ii lesson:
 every computed constant gets a CPU value-assert so a typo in a
 spec citation surfaces at test time, not at HW-debug time.
+
+## Authoritative source for register addresses
+
+The single source of truth for every `R_*` constant in
+`src/backend_native.cyr` is Mesa's
+`src/amd/registers/gfx9.json`:
+
+```
+https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json
+```
+
+Each register entry has a `name`, a `chips` list (we want
+`"gfx9"`), and a `map.at` field holding the byte offset in MMIO
+space. Mabda's convention:
+
+- SH registers (Mesa byte address `0xBxxx`) — keep verbatim
+- Context registers (Mesa byte address `0x028xxx`) — subtract
+  `0x1E000` to land in the synthetic `0xAxxx` shorthand. The
+  PM4 wire form via `native_context_reg_offset()` is identical
+  to Mesa's `(addr - 0x28000) / 4` because only the difference
+  from base matters.
+- UConfig registers (Mesa byte address `0x30xxx`) — keep verbatim
+
+The Python lookup script (used 2026-04-30 for Step 6.5(a)) is
+roughly:
+
+```python
+import json
+with open('gfx9.json') as f:
+    d = json.load(f)
+for r in d['register_mappings']:
+    if r.get('name') in ('CB_TARGET_MASK', ...) and 'gfx9' in r.get('chips', []):
+        byte_addr = r['map']['at']
+        if 0x28000 <= byte_addr < 0x29000:
+            mabda = byte_addr - 0x1E000
+        else:
+            mabda = byte_addr
+        print(f'{r["name"]:35s} = 0x{mabda:06X}')
+```
+
+This script caught a real bug in Step 6.2(a) — the
+SPI_SHADER_{POS,Z,COL}_FORMAT triplet had been transcribed with
+scrambled values (POS at the Z address, etc.). Corrected
+2026-04-30 against authoritative Mesa output before any HW test.
+**Lesson**: every `R_*` constant should have a comment citing its
+Mesa gfx9.json `map.at` value. A typo in transcription is invisible
+without that anchor.
 
 ## Verification gates for 6.5 / 6.6
 
