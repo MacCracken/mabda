@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 6.9(b) — Phase C render code-complete)
+**Last refresh:** 2026-04-30 (post Step 6.10 prep — CACHE_FLUSH_AND_INV builder ready)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -297,6 +297,23 @@ need it.
     our 6.5(b) composer doesn't yet), TDR on GFX ring, pipeline
     state mis-encoding. Exit codes 0–11 map to specific failure
     classes for unattended runs. (Step 6.9(b), 2026-04-30).
+- [x] **6.10 prep** — `EVENT_WRITE` / `CACHE_FLUSH_AND_INV` PM4
+  packet builder. Stand-alone primitive (`native_pm4_event_write` +
+  `native_pm4_event_write_cache_flush_and_inv` convenience wrapper)
+  + four GFX9 event constants (`CACHE_FLUSH`, `CACHE_FLUSH_AND_INV`,
+  `EVENT_INDEX_OTHER`, `EVENT_INDEX_TS`) cited from Mesa
+  `gfx9.json`'s `VGT_EVENT_TYPE` enum. **Not yet wired into the
+  render PM4 composer** — the splice into
+  `native_pm4_build_render_clear_triangle` is gated on the first
+  `make test-native-render-e2e` run on Cezanne. If pixel readback
+  fails with the GTT 0x55 sentinel intact (Failure A documented in
+  `programs/native_render_e2e.cyr`), the fix is one call append to
+  the composer's draw block. If HW reveals a different failure
+  class, the builder is still ready for Phase D surface present
+  (which needs an end-of-frame flush) without rework. 5 CPU tests,
+  17 asserts (binary form pinned + position-tracking composability +
+  index packing). 836 v3 + 624 mabda CPU asserts green.
+  (Step 6.10 prep, 2026-04-30).
 
 #### Phase D — surface + present on native (broken into chunks)
 

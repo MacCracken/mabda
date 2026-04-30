@@ -300,38 +300,87 @@ either landed or is a HW-time follow-up (post-draw flush, Layer-2
 verify). The structural critical path from "shader bytes" to
 "pixel verified" is in tree.
 
-### Metrics — 2026-04-30 (post Step 6.9(b))
+### Added — 2026-04-30 (Step 6.10 prep — CACHE_FLUSH_AND_INV builder)
+
+Stand-alone PM4 primitive for the post-draw cache flush radv emits
+before any CB→CPU readback. Lands as a separate prep step (not yet
+wired into the composer) so the moment HW data confirms the
+hypothesis from `programs/native_render_e2e.cyr`'s "Failure A"
+note, the fix is one call-site addition rather than a fresh
+research session.
+
+- **`native_pm4_event_write(buf, pos, event_type, event_index)`** —
+  general-purpose 2-dword EVENT_WRITE builder. Body packs
+  `event_type` in bits[5:0] and `event_index` in bits[11:8] (matches
+  Mesa's `EVENT_TYPE(t) | EVENT_INDEX(i)` macro convention). Used
+  for `event_index = 0` "other" events; TS-style events with a
+  64-bit writeback address need RELEASE_MEM (deferred).
+- **`native_pm4_event_write_cache_flush_and_inv(buf, pos)`** —
+  convenience wrapper that emits the canonical
+  `EVENT_TYPE = CACHE_FLUSH_AND_INV (0x16)`,
+  `EVENT_INDEX = OTHER (0)` packet. The CP processes this event
+  before writing the user-fence completion seqno, so by the time
+  the syncobj signals the RT writes are CPU-visible.
+- Four GFX9 event-type / event-index constants exposed and pinned:
+  `GFX9_EVENT_TYPE_CACHE_FLUSH = 0x04`,
+  `GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16`,
+  `GFX9_EVENT_INDEX_OTHER = 0`, `GFX9_EVENT_INDEX_TS = 5`. All
+  cited from Mesa `gfx9.json`'s `VGT_EVENT_TYPE` enum (the same
+  authoritative source 6.5(a)'s register addresses use).
+
+**Not yet wired into the render PM4 composer.** The first
+`make test-native-render-e2e` on Cezanne is the gate. Two outcomes
+the prep is designed for:
+
+- If pixel readback returns the GTT 0x55 sentinel (Failure A in
+  the e2e program's docstring), append
+  `native_pm4_event_write_cache_flush_and_inv(buf, pos)` after
+  the draw_tail in `native_pm4_build_render_clear_triangle`. One
+  call-site change; the builder + tests are already done.
+- If HW reveals a different failure class, the builder is still
+  needed for Phase D surface present (end-of-frame flush before
+  the page-flip ioctl) — not throwaway work even in the
+  non-flush-bug branch.
+
+**5 CPU tests, 17 asserts:** GFX9 constants pinned, EVENT_WRITE
+binary form (header `0xC0004600` + body `0x00000016` for
+CACHE_FLUSH_AND_INV), wrapper byte-exact equivalence, position-
+tracking composability with `native_pm4_nop`, event_index packing
+(verified with a non-zero index = 5 case so future TS-event paths
+can build on this).
+
+### Metrics — 2026-04-30 (post Step 6.10 prep)
 
 - Module count: 33 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
-- `tests/tcyr/mabda_v3.tcyr`: 819 assertions (unchanged from 6.8(c) —
-  6.9(b) adds a program file, not new CPU assertions; the program's
-  pixel(0,0) check is the HW gate).
-- `programs/native_render_e2e.cyr`: 243 lines (new).
-- `src/backend_native.cyr`: ~2,690 lines (unchanged from 6.8(c)).
-- `dist/mabda.cyr`: unchanged (programs aren't bundled).
+- `tests/tcyr/mabda_v3.tcyr`: **836 assertions** (was 819 at 6.8(c)
+  close — 6.9(b) added no asserts; 6.10 prep added 17).
+- `src/backend_native.cyr`: ~2,750 lines (was ~2,690 at 6.8(c) close;
+  +60 lines for the EVENT_WRITE builders + constants).
+- `programs/native_render_e2e.cyr`: 243 lines (unchanged from 6.9(b)).
+- `dist/mabda.cyr`: regenerated (9368 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 6.9(b))
+### Next — 2026-04-30 (post Step 6.10 prep)
 
-**Phase C render is code-complete.** Two HW-gated follow-ups:
+**Phase C render is code-complete + flush-prep ready.** Two HW-gated
+items remain in the 6.x bucket:
 
-1. **Run `make test-native-render-e2e` on a Cezanne box.** The
-   first execution is the load-bearing test for the entire 6.x
-   chain. Most likely outcome: pixel readback fails with the
-   sentinel byte (0x55) intact → post-draw cache flush is the
-   missing piece. If so, file as **Step 6.10** (extend
-   `native_pm4_build_render_draw_tail` to append a
-   CACHE_FLUSH_AND_INV).
-2. **Layer-2 byte-diff vs radv.** Once Hyprland is up (or the
-   headless `programs/diagnostics/radv_capture/` lands), diff the
-   IB our `pass_draw` emits against `RADV_DEBUG=hang vkcube`'s
-   IB for an equivalent clear-triangle. This is the "claim 6.5
-   done" gate the session 26 handoff identified.
+1. **Run `make test-native-render-e2e` on Cezanne.** The first
+   execution is the load-bearing test for the entire 6.x chain.
+   Failure A (cache flush) → one-line splice using the 6.10-prep
+   builder. Failure B (TDR) → Layer-2 byte-diff to localize.
+   Failure C (pipeline state) → audit 6.5(a) register addresses.
+2. **Layer-2 byte-diff vs radv.** Hyprland or headless
+   `programs/diagnostics/radv_capture/` unblocks; diff our
+   `pass_draw` IB against `RADV_DEBUG=hang vkcube`'s for an
+   equivalent clear-triangle. This is the "claim 6.5 done" gate
+   the session 26 handoff identified.
 
-**Phase D surface (7.x)** is fully unblocked and a clean parallel
-side-quest — pure DRM/KMS path, no shader bytes, no PM4
-verification gate.
+**Phase D surface (7.x)** remains fully unblocked and a clean
+parallel side-quest — pure DRM/KMS path, no shader bytes, no PM4
+verification gate. 7.1 (device discovery) is a self-contained
+~1-session bite.
 
 **WGSL → GFX9 ISA lowering (8.x)** remains the v3.0 ship-blocker
 per "Hard truths up front" in the punchlist. Worth a sober design

@@ -3691,6 +3691,58 @@ fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
     return pos + 28;
 }
 
+# GFX9 EVENT_WRITE event-type values. Sourced from Mesa
+# `src/amd/registers/gfx9.json` (search for `VGT_EVENT_TYPE`) and
+# cross-referenced with radv's `si_emit_*` paths in
+# `src/amd/vulkan/radv_cmd_buffer.c`. The event_type goes in
+# bits[5:0] of the body dword; event_index in bits[11:8].
+#
+# Step 6.10 prep — these are stand-alone primitives, not yet wired
+# into the render PM4 composer. They land here so when the first
+# `make test-native-render-e2e` run on Cezanne reveals "RT readback
+# is the GTT sentinel; CB caches never flushed" (the documented
+# Failure A in `programs/native_render_e2e.cyr`), the fix is one
+# call to `native_pm4_event_write_cache_flush_and_inv` at the end
+# of `native_pm4_build_render_clear_triangle`'s draw block.
+var GFX9_EVENT_TYPE_CACHE_FLUSH         = 0x04;  # gfx9.json VGT_EVENT_TYPE
+var GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16;  # gfx9.json VGT_EVENT_TYPE
+
+# event_index encodes how the kernel/CP interprets the event:
+#   0 = "other" — event_type only, no address (the EVENT_WRITE form
+#                 we use here is 2-dword, just header + body).
+#   5 = sample / cache_flush_ts / cache_flush_and_inv_ts — adds
+#       a 64-bit address pair for timestamp / fence writeback. Used
+#       by RELEASE_MEM-style flushes; deferred to a follow-up if a
+#       TS-style flush is needed.
+var GFX9_EVENT_INDEX_OTHER = 0x0;
+var GFX9_EVENT_INDEX_TS    = 0x5;
+
+# Emit a 2-dword EVENT_WRITE PKT3. Used for event_index = 0 events
+# (no address). For TS-style events with a writeback address, use
+# RELEASE_MEM or a wider EVENT_WRITE_EOP — not implemented here.
+# Body dword shape: event_type in bits[5:0], event_index in
+# bits[11:8] (matches Mesa `EVENT_TYPE(t) | EVENT_INDEX(i)`).
+# Returns new pos.
+fn native_pm4_event_write(buf, pos, event_type, event_index) {
+    store32(buf + pos, native_pm4_pkt3_header(IT_EVENT_WRITE, 1, 0));
+    var body = (event_index << 8) | event_type;
+    store32(buf + pos + 4, body);
+    return pos + 8;
+}
+
+# Convenience wrapper: emit CACHE_FLUSH_AND_INV at the current
+# position. The CP processes this event before the kernel's
+# completion fence is written to the user-fence BO, so by the time
+# the syncobj signals the RT writes are CPU-visible. Pair this with
+# a draw at end-of-pass for any path that does CPU readback — the
+# 6.5(b) composer doesn't include it today (matches radv's pattern
+# of emitting separately at command-buffer end).
+fn native_pm4_event_write_cache_flush_and_inv(buf, pos) {
+    return native_pm4_event_write(buf, pos,
+                                  GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+                                  GFX9_EVENT_INDEX_OTHER);
+}
+
 # Emit a NOP of `pad_dwords` total dwords (header + pad_dwords-1
 # filler). Useful for aligning IBs to 8-dword boundaries (kernel
 # requirement on some rings). Returns new position.

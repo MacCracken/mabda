@@ -2332,6 +2332,92 @@ fn test_native_render_pass_struct_field_offsets() {
 }
 
 # ================================================================
+# v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV PM4 builder
+# ================================================================
+# Stand-alone PM4 packet primitive. Not yet wired into the render
+# composer — the splice into `native_pm4_build_render_clear_triangle`
+# happens after HW confirms the e2e program's pixel readback fails
+# from the missing post-draw flush. Tests pin the binary form of the
+# event-write packet so it stays usable when that day comes.
+
+fn test_gfx9_event_type_constants() {
+    # Sourced from Mesa gfx9.json VGT_EVENT_TYPE enum. CACHE_FLUSH_AND_INV
+    # is the canonical post-draw-pre-readback event radv emits before
+    # CB readback; CACHE_FLUSH alone is for less-aggressive paths.
+    assert_eq(GFX9_EVENT_TYPE_CACHE_FLUSH,         0x04, "CACHE_FLUSH = 0x04");
+    assert_eq(GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV, 0x16, "CACHE_FLUSH_AND_INV = 0x16");
+    assert_eq(GFX9_EVENT_INDEX_OTHER,              0x0,  "event_index OTHER = 0");
+    assert_eq(GFX9_EVENT_INDEX_TS,                 0x5,  "event_index TS = 5");
+    return 0;
+}
+
+fn test_native_pm4_event_write_layout() {
+    var buf[16];
+    memset(&buf, 0xCC, 16);
+    var pos = native_pm4_event_write(&buf, 0,
+                                     GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+                                     GFX9_EVENT_INDEX_OTHER);
+    assert_eq(pos, 8, "EVENT_WRITE = 2 dwords (8 bytes)");
+    # PKT3 header: count_minus_1 = 1 (count = 2 → c-1 = 1), opcode 0x46 (EVENT_WRITE),
+    # type 3, predicate 0 → 0xC0004600.
+    assert_eq(load32(&buf + 0), 0xC0004600, "EVENT_WRITE PKT3 header");
+    # Body: event_index (0) << 8 | event_type (0x16) = 0x00000016.
+    assert_eq(load32(&buf + 4), 0x00000016, "body = event_type | event_index<<8");
+    # Past the packet: untouched 0xCC sentinel.
+    assert_eq(load32(&buf + 8), 0xCCCCCCCC, "byte 8 still sentinel");
+    return 0;
+}
+
+fn test_native_pm4_event_write_packs_event_index() {
+    # If a future caller passes a non-OTHER event_index (e.g., 5 for
+    # a TS-style event), the body must encode it in bits[11:8] without
+    # disturbing the event_type in bits[5:0].
+    var buf[8];
+    memset(&buf, 0, 8);
+    native_pm4_event_write(&buf, 0, 0x14, 0x5);
+    # body = (5 << 8) | 0x14 = 0x514
+    assert_eq(load32(&buf + 4), 0x514,
+              "event_index = 5, event_type = 0x14 packs to 0x514");
+    return 0;
+}
+
+fn test_native_pm4_event_write_cache_flush_and_inv() {
+    # The convenience wrapper must produce byte-exact what the
+    # general-purpose builder produces with the standard args.
+    var buf_a[8];
+    memset(&buf_a, 0, 8);
+    native_pm4_event_write_cache_flush_and_inv(&buf_a, 0);
+
+    var buf_b[8];
+    memset(&buf_b, 0, 8);
+    native_pm4_event_write(&buf_b, 0, 0x16, 0);
+
+    assert_eq(load32(&buf_a + 0), load32(&buf_b + 0), "header matches");
+    assert_eq(load32(&buf_a + 4), load32(&buf_b + 4), "body matches");
+    # Spot-check the absolute body value (0x16 in low byte, no index).
+    assert_eq(load32(&buf_a + 4), 0x00000016, "wrapper body = 0x16");
+    return 0;
+}
+
+fn test_native_pm4_event_write_advances_pos() {
+    # Position-tracking builders compose by passing pos through. Make
+    # sure event_write doesn't accidentally rewrite from the start.
+    var buf[16];
+    memset(&buf, 0, 16);
+    var pos = 0;
+    pos = native_pm4_nop(&buf, pos, 2);  # 2 dwords (8 bytes)
+    assert_eq(pos, 8, "nop landed at offset 0..7");
+    pos = native_pm4_event_write_cache_flush_and_inv(&buf, pos);
+    assert_eq(pos, 16, "event_write landed at offset 8..15");
+    # Verify the NOP header is still at offset 0 (not overwritten).
+    assert_eq(load32(&buf + 0) != 0, 1, "NOP header preserved at 0");
+    # And the EVENT_WRITE header is at offset 8.
+    assert_eq(load32(&buf + 8), 0xC0004600, "EVENT_WRITE header at +8");
+    assert_eq(load32(&buf + 12), 0x00000016, "EVENT_WRITE body at +12");
+    return 0;
+}
+
+# ================================================================
 # v3 Step 6.9 — public render-* dispatchers route through Backend
 # ================================================================
 # 7 mock-backend dispatch tests proving each public gpu_render_*
@@ -2712,6 +2798,13 @@ fn main() {
     test_native_render_pipeline_pack_matches_composer();
     test_native_render_pipeline_pack_null_out();
     test_native_render_pass_struct_field_offsets();
+
+    # v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV (5)
+    test_gfx9_event_type_constants();
+    test_native_pm4_event_write_layout();
+    test_native_pm4_event_write_packs_event_index();
+    test_native_pm4_event_write_cache_flush_and_inv();
+    test_native_pm4_event_write_advances_pos();
 
     # v3 Step 6.9 — public render-* dispatchers (8)
     test_gpu_render_target_create_dispatches_through_backend();
