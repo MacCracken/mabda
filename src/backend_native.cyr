@@ -2678,6 +2678,24 @@ fn _backend_native_surface_configure(ctx, width, height) {
     var fb_w = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_WIDTH);
     var fb_h = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_HEIGHT);
 
+    # Audit HIGH-1 (2026-04-30): preserve cross-backend identity.
+    # The wgpu side honors consumer width/height; the native side
+    # picks the EDID-preferred mode. If they don't match, fail loudly
+    # rather than silently substituting — consumer back-buffer math
+    # downstream assumes the dimensions it asked for.
+    if (fb_w != width)  {
+        native_kms_release_scanout(card_fd, render_fd,
+                                   ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release(state);
+        return 0;
+    }
+    if (fb_h != height) {
+        native_kms_release_scanout(card_fd, render_fd,
+                                   ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release(state);
+        return 0;
+    }
+
     # ---- alloc second FB matching mode dimensions ----
     rc = native_kms_alloc_fb(card_fd, render_fd, fb_w, fb_h,
                              ns + NATIVE_SURFACE_FB_B);
@@ -2735,7 +2753,12 @@ fn _backend_native_surface_present(ctx, surface) {
     var rc = native_kms_present(card_fd,
                                 surface + NATIVE_SURFACE_SCANOUT,
                                 back_fb_id, 0);
-    if (rc != 0) { return rc; }
+    # Audit MED-1 (2026-04-30): map negative-errno (kernel) and
+    # mabda-internal sentinels (-2 short read, -3 wrong event type)
+    # to GPU_ERR_* so consumer error-handling matches the wgpu side.
+    if (rc == 0 - 2) { return GPU_ERR_SURFACE_LOST; }
+    if (rc == 0 - 3) { return GPU_ERR_SURFACE_LOST; }
+    if (rc != 0)     { return _native_neg_rc_to_gpu_err(rc); }
     # Toggle which is front. (The flip-completed event drained inside
     # native_kms_present already ran; back is now scanning.)
     if (front_is_b == 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 1); }
@@ -2968,6 +2991,15 @@ fn native_rt_size_2d_rgba8(width, height) {
 # texture allocator. Multi-RT VA allocator lands later in Phase C
 # when render passes need MRT.
 fn native_rt_create_2d_rgba8(fd, width, height, out) {
+    # Audit MED-3 (2026-04-30): native_pm4_build_render_pass_target's
+    # viewport math uses integer (rt_width / 2) — odd dimensions lose
+    # the half-pixel and silently miscalibrate the scissor / viewport.
+    # Reject odd dims at the allocator boundary (cleanest fix; v3.x
+    # may switch to f64-based viewport math to relax this).
+    if (width <= 0)            { return GPU_ERR_TEXTURE_DIMENSION; }
+    if (height <= 0)           { return GPU_ERR_TEXTURE_DIMENSION; }
+    if ((width & 1) != 0)      { return GPU_ERR_TEXTURE_DIMENSION; }
+    if ((height & 1) != 0)     { return GPU_ERR_TEXTURE_DIMENSION; }
     var size = native_rt_size_2d_rgba8(width, height);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);

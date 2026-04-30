@@ -1340,6 +1340,104 @@ in auto-memory and as a vidya field note.
   bundled. Not related to the pin bump; caught as a side-effect of
   the bump-prompted regen.
 
+### Security — 2026-04-30 (P(-1) v3 audit + ship-blocker fixes)
+
+P(-1) security audit pass against the v3 delta — the new dual-backend
+abstraction (`backend.cyr`, `backend_wgpu.cyr`, `backend_native.cyr`,
+`backend_native_kms.cyr`), the public surface API (`surface_v3.cyr`),
+and the `GpuContext` 96 → 112-byte growth in `context.cyr`. Audit at
+`docs/audit/2026-04-30-audit.md` — 15 findings (0 CRITICAL, 2 HIGH,
+7 MEDIUM, 6 LOW). The 5 ship-blockers landed this session; the 10
+deferred items file as v3.x backlog with the dispositions documented
+in the audit.
+
+**Ship-blocker fixes** (all in tree, all covered by re-verify of
+1828 CPU asserts across the three test files):
+
+- **HIGH-1 — `_backend_native_surface_configure` must honour
+  consumer width/height.** The native slot was reading the EDID
+  preferred mode and silently substituting it for the
+  consumer-supplied dims. Fixed in `src/backend_native.cyr:2680-2697`
+  to reject loudly (return 0 + tear down state) when consumer dims
+  don't match the picked mode. Cross-backend identity preserved.
+  Migration guide (`docs/guides/native-migration.md`) documents
+  the constraint + the `native_kms_summary` discovery path.
+- **HIGH-2 — `gpu_surface_configure_native_logind` master fd leak.**
+  Every failure path between `samvada_session_take_device` and the
+  slot dispatch leaked the delegated DRM master fd (kernel held
+  master until process exit; consumer's "try logind, fall back to
+  kiosk" loop accumulated leaks). Fixed in `src/surface_v3.cyr` to
+  call `samvada_session_release_device` + `sys_close` + scrub the
+  ctx stash on every error path.
+- **MED-1 — native `surface_present` return code shape.** The
+  native slot was passing through negative kernel errnos where the
+  slot ABI declares positive `GPU_ERR_*`. Fixed in
+  `src/backend_native.cyr:2738-2746` to route through
+  `_native_neg_rc_to_gpu_err` for kernel rcs and map the mabda-
+  internal sentinels (`-2`, `-3`) to `GPU_ERR_SURFACE_LOST`.
+  Consumer error-handling now matches the wgpu side.
+- **MED-3 — `native_rt_create_2d_rgba8` must reject odd dims.**
+  `native_pm4_build_render_pass_target`'s viewport math uses
+  integer `rt_width / 2`; odd dims silently lost the half-pixel
+  and miscalibrated the viewport. Fixed in
+  `src/backend_native.cyr:2997-3008` to reject odd width / height
+  + non-positive at the allocator boundary, before any ioctl.
+  9 new asserts in `tests/tcyr/mabda_v3_phase_d.tcyr` pin the
+  rejection contract.
+- **MED-6 — `native_kms_present` event-drain loop.** The single-
+  read `native_kms_read_event` returned `-3` when the kernel
+  queued multiple events per flip (`DRM_EVENT_VBLANK` +
+  `DRM_EVENT_FLIP_COMPLETE` is the modal case). Fixed in
+  `src/backend_native_kms.cyr:1577-1612` to drain events
+  iteratively (walk every event in each read using the header
+  `length` field) until `FLIP_COMPLETE` lands; cap at 16 reads
+  to prevent pathological event-spew from spinning the present
+  loop. The 120-frame `native_present_e2e` may have run by luck
+  on the dev box; this fix removes the dependence.
+- **LOW-6 (bundled)** — `gpu_surface_release` now zeros the ctx
+  stash (`+96` `wgpu_surface_handle`, `+104` `native_card_fd`)
+  after the slot's release. Prevents stale-stash reads on a
+  subsequent configure that fails before stashing.
+
+**Deferred to v3.x** (audit-tracked, non-blocking): MED-2 (overflow
+guards on caller-supplied dims), MED-4 (TOCTOU clamping on
+two-pass DRM discovery), MED-5 (`set_master` `-EINVAL` ambiguity),
+MED-7 / LOW-5 (bump-allocator leaks in long-running consumers),
+LOW-1 / LOW-2 (defense-in-depth nits), LOW-3 (native `gpu_buffer_*`
+slot stubs), LOW-4 (`vc` / `ic` ignored in native render).
+
+### Added — 2026-04-30 (verify, audit, then docs wrap-up)
+
+- **`programs/diagnostics/radv_capture/`** — Phase 1 minimum-viable
+  Vulkan headless compute that mirrors mabda's
+  `native_pm4_build_compute_store_deadbeef` shape. Builds against
+  vulkan-headers + `glslangValidator`, dispatches a single-thread
+  compute via Mesa RADV, verifies readback returns `0xDEADBEEF`.
+  `make dump` runs with `RADV_DEBUG=ibs` to emit the IB byte stream
+  for byte-diff against mabda's PM4 composer. Phase 2 (the actual
+  diff reduction tooling) is a v3.x backlog bite. Verified end-to-
+  end on the dev box (RADV RENOIR / Cezanne).
+- **`docs/guides/native-migration.md`** — 1-pager for consumers
+  flipping from `BACKEND_KIND_WGPU` to `BACKEND_KIND_AMD`. Covers
+  backend selection, byte-polymorphic shader bundles, the v3
+  surface API, samvada wiring for the logind path, dimension
+  constraints from the audit (HIGH-1 + MED-3), known v3.0
+  limitations + their v3.x dispositions, and the consumer-side
+  test matrix.
+
+### Changed — 2026-04-30 (toolchain + housekeeping)
+
+- 6 `src/*.cyr` files re-flowed through `cyrius fmt`
+  (`backend_native_kms.cyr`, `backend_wgpu.cyr`, `buffer.cyr`,
+  `compute.cyr`, `context.cyr`, `texture.cyr`) — continuation-line
+  indent normalization, no semantic changes. `dist/mabda.cyr`
+  regenerated to pick up the re-flow.
+- `src/backend_native.cyr` (137 KiB) NOT re-flowed. `cyrius fmt`
+  silently truncates files >128 KiB (same buffer-cap bug as
+  cyrlint). Splitting `backend_native.cyr` into smaller modules to
+  unblock the fmt gate is a v3.x bite. Documented in the
+  `feedback_cyrlint_128k_buffer_cap` memory note.
+
 ## [2.5.0] — 2026-04-21
 
 **First feature release post-v1.0-parity. Adds a DAG-style render

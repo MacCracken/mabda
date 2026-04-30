@@ -1573,24 +1573,49 @@ fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out) {
     new_fb_id);
     if (rc != 0) { return rc; }
 
-    # Drain one event. drm_event_vblank is 32 bytes; allocate
-    # 64 to be safe against future kernel extensions to the
-    # struct (newer kernels may grow it).
-    var buf[64];
-    memset(&buf, 0, 64);
-    var n = native_drm_read_event(card_fd, &buf, 64);
-    if (n < 0) { return n; }
-    if (n < DRM_EVENT_VBLANK_SIZE) { return -2; }
-
-    var ev_type = drm_event_type(&buf);
-    if (ev_type != DRM_EVENT_FLIP_COMPLETE) { return -3; }
+    # Audit MED-6 (2026-04-30): drain events until FLIP_COMPLETE
+    # found. The kernel may queue multiple events per flip
+    # (DRM_EVENT_VBLANK + DRM_EVENT_FLIP_COMPLETE on most kernels);
+    # the prior single-event read returned -3 on the second present
+    # because the stale VBLANK landed at offset 0. Walk every event
+    # in each buffer using the header `length` field, then re-read
+    # if FLIP_COMPLETE wasn't in this batch. 256-byte read buffer
+    # easily holds 8+ events. Cap the outer reads at 16 to prevent
+    # any pathological event-spew from spinning the present loop
+    # forever (16 * 8 events = 128 events drained before bail-out).
+    var buf[256];
+    var found = 0;
+    var seq = 0;
+    var attempts = 0;
+    while (found == 0) {
+        if (attempts >= 16) { return 0 - 2; }   # too many events drained, bail
+        attempts = attempts + 1;
+        memset(&buf, 0, 256);
+        var n = native_drm_read_event(card_fd, &buf, 256);
+        if (n < 0) { return n; }
+        if (n < DRM_EVENT_VBLANK_SIZE) { return 0 - 2; }
+        # walk events in this read
+        var off = 0;
+        while (off < n) {
+            var ev_len = drm_event_length(&buf + off);
+            if (ev_len <= 0) { return 0 - 3; }   # malformed header, can't advance
+            if (off + ev_len > n) { return 0 - 3; }   # length past read end
+            var ev_type = drm_event_type(&buf + off);
+            if (ev_type == DRM_EVENT_FLIP_COMPLETE) {
+                seq = drm_event_vblank_sequence(&buf + off);
+                found = 1;
+                off = n;   # exit inner loop
+            }
+            if (found == 0) { off = off + ev_len; }
+        }
+    }
 
     # Update scanout's bound FB so subsequent operations have the
     # right state.
     store32(scanout + NATIVE_KMS_SCANOUT_FB_ID, new_fb_id);
 
     if (sequence_out != 0) {
-        store32(sequence_out, drm_event_vblank_sequence(&buf));
+        store32(sequence_out, seq);
     }
     return 0;
 }

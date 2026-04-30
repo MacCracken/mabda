@@ -5753,6 +5753,24 @@ fn _backend_native_surface_configure(ctx, width, height) {
     var fb_w = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_WIDTH);
     var fb_h = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_HEIGHT);
 
+    # Audit HIGH-1 (2026-04-30): preserve cross-backend identity.
+    # The wgpu side honors consumer width/height; the native side
+    # picks the EDID-preferred mode. If they don't match, fail loudly
+    # rather than silently substituting — consumer back-buffer math
+    # downstream assumes the dimensions it asked for.
+    if (fb_w != width)  {
+        native_kms_release_scanout(card_fd, render_fd,
+                                   ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release(state);
+        return 0;
+    }
+    if (fb_h != height) {
+        native_kms_release_scanout(card_fd, render_fd,
+                                   ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release(state);
+        return 0;
+    }
+
     # ---- alloc second FB matching mode dimensions ----
     rc = native_kms_alloc_fb(card_fd, render_fd, fb_w, fb_h,
                              ns + NATIVE_SURFACE_FB_B);
@@ -5810,7 +5828,12 @@ fn _backend_native_surface_present(ctx, surface) {
     var rc = native_kms_present(card_fd,
                                 surface + NATIVE_SURFACE_SCANOUT,
                                 back_fb_id, 0);
-    if (rc != 0) { return rc; }
+    # Audit MED-1 (2026-04-30): map negative-errno (kernel) and
+    # mabda-internal sentinels (-2 short read, -3 wrong event type)
+    # to GPU_ERR_* so consumer error-handling matches the wgpu side.
+    if (rc == 0 - 2) { return GPU_ERR_SURFACE_LOST; }
+    if (rc == 0 - 3) { return GPU_ERR_SURFACE_LOST; }
+    if (rc != 0)     { return _native_neg_rc_to_gpu_err(rc); }
     # Toggle which is front. (The flip-completed event drained inside
     # native_kms_present already ran; back is now scanning.)
     if (front_is_b == 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 1); }
@@ -6043,6 +6066,15 @@ fn native_rt_size_2d_rgba8(width, height) {
 # texture allocator. Multi-RT VA allocator lands later in Phase C
 # when render passes need MRT.
 fn native_rt_create_2d_rgba8(fd, width, height, out) {
+    # Audit MED-3 (2026-04-30): native_pm4_build_render_pass_target's
+    # viewport math uses integer (rt_width / 2) — odd dimensions lose
+    # the half-pixel and silently miscalibrate the scissor / viewport.
+    # Reject odd dims at the allocator boundary (cleanest fix; v3.x
+    # may switch to f64-based viewport math to relax this).
+    if (width <= 0)            { return GPU_ERR_TEXTURE_DIMENSION; }
+    if (height <= 0)           { return GPU_ERR_TEXTURE_DIMENSION; }
+    if ((width & 1) != 0)      { return GPU_ERR_TEXTURE_DIMENSION; }
+    if ((height & 1) != 0)     { return GPU_ERR_TEXTURE_DIMENSION; }
     var size = native_rt_size_2d_rgba8(width, height);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);
@@ -7739,24 +7771,49 @@ fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out) {
     new_fb_id);
     if (rc != 0) { return rc; }
 
-    # Drain one event. drm_event_vblank is 32 bytes; allocate
-    # 64 to be safe against future kernel extensions to the
-    # struct (newer kernels may grow it).
-    var buf[64];
-    memset(&buf, 0, 64);
-    var n = native_drm_read_event(card_fd, &buf, 64);
-    if (n < 0) { return n; }
-    if (n < DRM_EVENT_VBLANK_SIZE) { return -2; }
-
-    var ev_type = drm_event_type(&buf);
-    if (ev_type != DRM_EVENT_FLIP_COMPLETE) { return -3; }
+    # Audit MED-6 (2026-04-30): drain events until FLIP_COMPLETE
+    # found. The kernel may queue multiple events per flip
+    # (DRM_EVENT_VBLANK + DRM_EVENT_FLIP_COMPLETE on most kernels);
+    # the prior single-event read returned -3 on the second present
+    # because the stale VBLANK landed at offset 0. Walk every event
+    # in each buffer using the header `length` field, then re-read
+    # if FLIP_COMPLETE wasn't in this batch. 256-byte read buffer
+    # easily holds 8+ events. Cap the outer reads at 16 to prevent
+    # any pathological event-spew from spinning the present loop
+    # forever (16 * 8 events = 128 events drained before bail-out).
+    var buf[256];
+    var found = 0;
+    var seq = 0;
+    var attempts = 0;
+    while (found == 0) {
+        if (attempts >= 16) { return 0 - 2; }   # too many events drained, bail
+        attempts = attempts + 1;
+        memset(&buf, 0, 256);
+        var n = native_drm_read_event(card_fd, &buf, 256);
+        if (n < 0) { return n; }
+        if (n < DRM_EVENT_VBLANK_SIZE) { return 0 - 2; }
+        # walk events in this read
+        var off = 0;
+        while (off < n) {
+            var ev_len = drm_event_length(&buf + off);
+            if (ev_len <= 0) { return 0 - 3; }   # malformed header, can't advance
+            if (off + ev_len > n) { return 0 - 3; }   # length past read end
+            var ev_type = drm_event_type(&buf + off);
+            if (ev_type == DRM_EVENT_FLIP_COMPLETE) {
+                seq = drm_event_vblank_sequence(&buf + off);
+                found = 1;
+                off = n;   # exit inner loop
+            }
+            if (found == 0) { off = off + ev_len; }
+        }
+    }
 
     # Update scanout's bound FB so subsequent operations have the
     # right state.
     store32(scanout + NATIVE_KMS_SCANOUT_FB_ID, new_fb_id);
 
     if (sequence_out != 0) {
-        store32(sequence_out, drm_event_vblank_sequence(&buf));
+        store32(sequence_out, seq);
     }
     return 0;
 }
@@ -11343,18 +11400,41 @@ fn gpu_surface_configure_native_logind(ctx, width, height) {
     # AMD-on-card1 setups (split-GPU machines often have integrated
     # on card0 and discrete on card1, or vice versa). Multi-card
     # disambiguation is v3.x scope.
+    var minor = 0;
     var fd = samvada_session_take_device(_DRM_MAJOR, 0);
     if (fd < 0) {
+        minor = 1;
         fd = samvada_session_take_device(_DRM_MAJOR, 1);
     }
     if (fd < 0) { return 0; }   # samvada uninit'd OR no card available
 
+    # Audit HIGH-2 (2026-04-30): every failure path between here and
+    # the slot dispatch must release the fd back to logind + close.
+    # Otherwise the consumer's fallback "try logind, then kiosk" loop
+    # accumulates leaked master fds (RLIMIT_NOFILE pressure + DRM
+    # master held until process exit).
     var b = gpu_ctx_backend(ctx);
-    if (b == 0) { return 0; }
+    if (b == 0) {
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        return 0;
+    }
     var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE);
-    if (slot == 0) { return 0; }
+    if (slot == 0) {
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        return 0;
+    }
     gpu_ctx_set_native_card_fd(ctx, fd);
-    return fncall3(slot, ctx, width, height);
+    var surf = fncall3(slot, ctx, width, height);
+    if (surf == 0) {
+        # Slot's own failure path (discovery / modeset / FB alloc).
+        # Return master to logind, close the fd, scrub the ctx stash.
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        gpu_ctx_set_native_card_fd(ctx, 0);
+    }
+    return surf;
 }
 
 # ================================================================
@@ -11400,7 +11480,12 @@ fn gpu_surface_release(ctx, surface) {
     if (b == 0) { return 0; }
     var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_RELEASE);
     if (slot == 0) { return 0; }
-    return fncall2(slot, ctx, surface);
+    var rc = fncall2(slot, ctx, surface);
+    # Audit LOW-6 (2026-04-30): zero the ctx stash so a subsequent
+    # configure that fails before stashing doesn't see stale fd / handle.
+    gpu_ctx_set_wgpu_surface_handle(ctx, 0);
+    gpu_ctx_set_native_card_fd(ctx, 0);
+    return rc;
 }
 
 # --- instancing.cyr ---
