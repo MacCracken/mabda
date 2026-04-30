@@ -1424,3 +1424,173 @@ fn drm_event_length(buf)      { return load32(buf + DRM_EVENT_HEADER_LENGTH); }
 fn drm_event_vblank_user_data(buf) { return load64(buf + DRM_EVENT_VBLANK_USER_DATA); }
 fn drm_event_vblank_sequence(buf)  { return load32(buf + DRM_EVENT_VBLANK_SEQUENCE); }
 fn drm_event_vblank_crtc_id(buf)   { return load32(buf + DRM_EVENT_VBLANK_CRTC_ID); }
+
+# ================================================================
+# v3 Step 7.5 — Reusable FB alloc + present primitive
+# ================================================================
+# Step 7.2(d) bundled BO + PRIME + AddFB2 inside the modeset
+# driver. For double-buffered present, callers need the SAME
+# sequence repeatable for a second (or third) FB without
+# re-doing the modeset. native_kms_alloc_fb extracts it.
+#
+# native_kms_present is the load-bearing primitive: page-flip
+# the bound CRTC to a new FB ID, wait for the flip-complete
+# vblank event, return the kernel's vblank sequence number.
+# Repeating with two FBs (rendering to whichever isn't currently
+# scanning out) is the v3.0 vsync-paced present loop.
+#
+# Caveat (same as 7.2(d)): page-flip returns -EACCES if the fd
+# isn't master. See `project_phase_d_master_logind_blocker`
+# memory for workaround paths.
+
+# NativeKmsFb layout (32 bytes) — a self-contained "framebuffer +
+# its backing BO" bundle. Returned by native_kms_alloc_fb;
+# released by native_kms_release_fb.
+#
+#   +0:  fb_id          (u32) — kernel framebuffer ID (master fd)
+#   +4:  card_handle    (u32) — BO's master-fd handle (PRIME-imported)
+#   +8:  render_handle  (u32) — BO's render-fd handle (allocator-side)
+#   +12: pitch          (u32) — bytes per row (256-byte aligned)
+#   +16: mapped_addr    (u64) — CPU-visible mmap of the BO
+#   +24: bo_size        (u32) — total BO bytes (= pitch × height)
+#   +28: width          (u32) — mode-bound width (height derived from bo_size/pitch)
+var NATIVE_KMS_FB_SIZE         = 32;
+var NATIVE_KMS_FB_FB_ID        = 0;
+var NATIVE_KMS_FB_CARD_HANDLE  = 4;
+var NATIVE_KMS_FB_RENDER_HANDLE = 8;
+var NATIVE_KMS_FB_PITCH        = 12;
+var NATIVE_KMS_FB_MAPPED_ADDR  = 16;
+var NATIVE_KMS_FB_BO_SIZE      = 24;
+var NATIVE_KMS_FB_WIDTH        = 28;
+
+# Allocate a render-fd BO sized for `(width × height)` XRGB8888,
+# PRIME-import to the master fd, AddFB2 it, and populate `out`.
+# Pitch is rounded up to 256-byte alignment (AMD scanout requires;
+# matches native_kms_modeset_first_connected). Returns 0 on success
+# or a negative step code on failure (matches the modeset driver's
+# step-code convention so consumers can map errors uniformly).
+fn native_kms_alloc_fb(card_fd, render_fd, width, height, out) {
+    if (card_fd <= 0)   { return -1; }
+    if (render_fd <= 0) { return -1; }
+    if (width <= 0)     { return -1; }
+    if (height <= 0)    { return -1; }
+    if (out == 0)       { return -1; }
+    memset(out, 0, NATIVE_KMS_FB_SIZE);
+
+    var pitch_raw = width * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    var bo_size = pitch * height;
+
+    var bo_buf[16];
+    var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);
+    if (rc_bo != 0) { return -8; }
+    var render_handle = load64(&bo_buf + 0);
+    var mapped_addr   = load64(&bo_buf + 8);
+
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -9;
+    }
+
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle,
+                                            width, height, pitch);
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -10;
+    }
+
+    store32(out + NATIVE_KMS_FB_FB_ID,         fb_id);
+    store32(out + NATIVE_KMS_FB_CARD_HANDLE,   card_handle);
+    store32(out + NATIVE_KMS_FB_RENDER_HANDLE, render_handle);
+    store32(out + NATIVE_KMS_FB_PITCH,         pitch);
+    store64(out + NATIVE_KMS_FB_MAPPED_ADDR,   mapped_addr);
+    store32(out + NATIVE_KMS_FB_BO_SIZE,       bo_size);
+    store32(out + NATIVE_KMS_FB_WIDTH,         width);
+    return 0;
+}
+
+# Release a NativeKmsFb. Idempotent on a zeroed fb (every release
+# call short-circuits on its zero check). Returns 0.
+fn native_kms_release_fb(card_fd, render_fd, fb) {
+    if (fb == 0) { return 0; }
+    var fb_id         = load32(fb + NATIVE_KMS_FB_FB_ID);
+    var card_handle   = load32(fb + NATIVE_KMS_FB_CARD_HANDLE);
+    var render_handle = load32(fb + NATIVE_KMS_FB_RENDER_HANDLE);
+    var mapped_addr   = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR);
+    var bo_size       = load32(fb + NATIVE_KMS_FB_BO_SIZE);
+    if (card_fd > 0) {
+        if (fb_id != 0)       { native_kms_rm_fb(card_fd, fb_id); }
+        if (card_handle != 0) { native_gem_close(card_fd, card_handle); }
+    }
+    if (render_fd > 0) {
+        if (render_handle != 0) {
+            native_bo_release_gtt(render_fd, render_handle,
+                                  mapped_addr, bo_size);
+        }
+    }
+    memset(fb, 0, NATIVE_KMS_FB_SIZE);
+    return 0;
+}
+
+# Page-flip a scanout's CRTC to a new FB and block until the
+# kernel reports flip-complete. Updates scanout.fb_id to the new
+# value on success so subsequent presents target the right CRTC
+# state. If `sequence_out` is non-null, writes the kernel's
+# vblank sequence number there — useful for present-time
+# tracking and stutter detection.
+#
+# Return codes:
+#    0  — flip completed, scanout updated
+#   -1  — invalid args
+#   <0 — propagated kernel errno from page-flip ioctl OR from
+#        the read(2) on the event fd OR `-2` if read returned
+#        fewer bytes than a drm_event_vblank OR `-3` if the
+#        event we drained wasn't FLIP_COMPLETE (could happen
+#        if some other queued event lives in the read queue;
+#        v3.0 single-flip path doesn't expect that, but the
+#        diagnostic value is worth the rc).
+#
+# Caveat: this is the simplest possible single-flip + blocking-
+# read shape. A real present loop would either (a) use a
+# non-blocking read with poll/epoll on the fd, or (b) batch
+# multiple events. v3.0 keeps this simple; consumers needing
+# more sophisticated event handling can call native_kms_page_flip
+# + native_drm_read_event directly.
+fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out) {
+    if (card_fd <= 0)   { return -1; }
+    if (scanout == 0)   { return -1; }
+    if (new_fb_id == 0) { return -1; }
+
+    var crtc_id = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+    if (crtc_id == 0) { return -1; }
+
+    # User_data carries the new FB ID — convenient echo for any
+    # caller that wants to verify the event matches the flip.
+    var rc = native_kms_page_flip(card_fd, crtc_id, new_fb_id,
+                                  DRM_MODE_PAGE_FLIP_EVENT,
+                                  new_fb_id);
+    if (rc != 0) { return rc; }
+
+    # Drain one event. drm_event_vblank is 32 bytes; allocate
+    # 64 to be safe against future kernel extensions to the
+    # struct (newer kernels may grow it).
+    var buf[64];
+    memset(&buf, 0, 64);
+    var n = native_drm_read_event(card_fd, &buf, 64);
+    if (n < 0) { return n; }
+    if (n < DRM_EVENT_VBLANK_SIZE) { return -2; }
+
+    var ev_type = drm_event_type(&buf);
+    if (ev_type != DRM_EVENT_FLIP_COMPLETE) { return -3; }
+
+    # Update scanout's bound FB so subsequent operations have the
+    # right state.
+    store32(scanout + NATIVE_KMS_SCANOUT_FB_ID, new_fb_id);
+
+    if (sequence_out != 0) {
+        store32(sequence_out, drm_event_vblank_sequence(&buf));
+    }
+    return 0;
+}

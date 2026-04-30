@@ -836,6 +836,62 @@ master ioctl numbers, page-flip ioctl + struct + flags +
 null-safety, event-struct shapes + round-trip accessors, read
 null-safety.
 
+### Added — 2026-04-30 (Step 7.4(b) — present primitive + reusable FB alloc)
+
+`NativeKmsFb` struct (32 B) bundles a framebuffer with its
+backing BO + both fd handles. `native_kms_alloc_fb(card_fd,
+render_fd, w, h, out)` extracts the BO + PRIME + AddFB2
+sequence from `native_kms_modeset_first_connected` into a
+reusable helper — same step-code error convention as the
+modeset driver. `native_kms_release_fb` is the matching
+teardown.
+
+The load-bearing primitive: **`native_kms_present(card_fd,
+scanout, new_fb_id, sequence_out)`** issues `page_flip` with
+the EVENT flag, blocks on `read_event` for the matching
+`drm_event_vblank`, validates the type is `FLIP_COMPLETE`,
+updates `scanout.fb_id` to the new value, and writes the
+kernel's vblank sequence to `*sequence_out` (if non-null).
+Step codes -1 invalid args, -2 short read, -3 wrong event
+type, plus propagated kernel errnos.
+
+Designed for the simplest single-flip + blocking-read shape.
+A real present loop would either (a) use a non-blocking read
+with poll/epoll, or (b) batch multiple events; v3.0 keeps
+this simple and consumers needing more sophisticated handling
+can call `native_kms_page_flip` + `native_drm_read_event`
+directly.
+
+The double-buffered render pattern becomes:
+
+```
+alloc_fb(w, h, &fb_b)
+fill fb_b.mapped_addr with frame N
+present(scanout, fb_b.fb_id, &seq)
+fill scanout.fb_id (now back-buffer) with frame N+1
+present(scanout, scanout_old_fb_a.fb_id, &seq)
+... repeat
+```
+
+No HW exercise yet — same logind master gate as 7.2(d) / 7.4.
+
+4 new CPU tests, 19 asserts in
+`tests/tcyr/mabda_v3_phase_d.tcyr`: FB struct field offsets,
+alloc + release null-safety, present null-safety covering
+fd / scanout / new_fb / no-crtc.
+
+### Metrics — 2026-04-30 (post Step 7.4(b))
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **297 assertions** (was 278
+  at 7.4 close; +19 from 7.4(b)).
+- `src/backend_native_kms.cyr`: ~1,500 lines (was ~1,330 at
+  7.4 close; +170 lines for FB alloc/release + present).
+- `dist/mabda.cyr`: regenerated (10964 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
 ### Metrics — 2026-04-30 (post Step 7.4)
 
 - Module count: 34 (unchanged).
@@ -865,26 +921,27 @@ null-safety.
 
 ### Next — 2026-04-30 (post Step 7.2(d))
 
-**Phase D primitives 7.1 → 7.4 all in tree.** HW exercise on
-SETCRTC + PAGE_FLIP is logind-gated (see master blocker memory);
-not on critical-path for primitive development.
+**KMS primitive layer is code-complete (7.1–7.4 + 7.4(b)).**
+Backend abstraction layer is the next bite:
 
-1. **7.5 — present primitive.** `native_kms_present(state, fb_b)`
-   composes page-flip + event-read into a single call: queue
-   flip with EVENT, drain the matching `drm_event_vblank`, return
-   the flip's vblank sequence to the caller. Optionally
-   `native_kms_present_double_buffered(state)` keeps two FBs
-   rotating. CPU-testable via mock event payloads.
-2. **7.6 — release lifecycle.** Cleanup ordering for the full
-   surface: drop master → release scanout → close fds → free
-   state. Already partially in `native_kms_release_scanout`;
-   needs a top-level `native_kms_surface_release` that handles
-   the master+state pair.
-3. **7.7 — public `gpu_surface_*` API.** v3.0 completion path —
-   chooses (a) "TTY app / kiosk only — caller manages master"
-   vs (b) "logind-aware compositor delegation via dbus
-   TakeDevice". Architectural decision; the primitives are ready
-   either way.
+1. **7.5 — Backend interface surface slots.** Doc-revision +
+   `src/backend.cyr` extension, mirroring 5.4 (texture slots) /
+   6.7 (render slots). Probable slots:
+   `surface_configure(ctx, w, h)` → surface_ptr,
+   `surface_acquire(ctx, surface)` → fb_ptr (for the consumer
+   to draw into), `surface_present(ctx, surface, fb)` → 0|err,
+   `surface_release(ctx, surface)`. Designs the v3.0 public
+   surface API shape.
+2. **7.6 — backend wrappers.** Wgpu side wraps existing
+   surface/swapchain code; native side wraps 7.4(b)'s
+   `native_kms_alloc_fb` + `native_kms_present` + the modeset
+   driver. The cross-fd story (card_fd vs render_fd) becomes a
+   ctx-internal detail consumers don't see.
+3. **7.7 — public `gpu_surface_*` API + e2e program.** v3.0
+   completion path. Architectural decision: TTY app / kiosk
+   model vs logind-aware compositor delegation. Primitives
+   ready either way; this is where the master-acquisition story
+   gets resolved.
 
 **Phase C render HW-gated items still pending:**
 

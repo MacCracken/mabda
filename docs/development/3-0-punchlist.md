@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.4 — page-flip + event-read primitives landed)
+**Last refresh:** 2026-04-30 (post Step 7.4(b) — present primitive + FB alloc helpers landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -539,6 +539,30 @@ need it.
   master ioctl numbers). 278 phase_d + 836 v3 + 624 mabda CPU
   asserts green; smoke + lint + distlib clean. (Step 7.4 +
   7.2(d.1), 2026-04-30).
+- [x] **7.4(b)** — Present primitive + reusable FB alloc.
+  `NativeKmsFb` struct (32 B; fb_id / card_handle /
+  render_handle / pitch / mapped_addr / bo_size / width).
+  `native_kms_alloc_fb(card_fd, render_fd, w, h, out)` extracts
+  the BO + PRIME + AddFB2 sequence from
+  `native_kms_modeset_first_connected` into a reusable helper —
+  same step-code error convention (-1 invalid, -8 BO alloc, -9
+  PRIME, -10 AddFB2). Pitch rounded to 256-byte alignment.
+  `native_kms_release_fb` is the teardown — RmFB + 2 ×
+  gem_close + bo_release_gtt; idempotent on a zeroed FB. The
+  load-bearing primitive
+  `native_kms_present(card_fd, scanout, new_fb_id, sequence_out)`
+  issues `page_flip` with `PAGE_FLIP_EVENT`, blocks on
+  `read_event`, validates the drained event is `FLIP_COMPLETE`,
+  updates `scanout.fb_id`, writes the kernel's vblank sequence
+  to `*sequence_out` (if non-null). Step codes -1 invalid, -2
+  short read, -3 wrong event type, plus propagated kernel
+  errnos. Designed for the simplest single-flip + blocking-read
+  path. Double-buffered render: `alloc_fb(w,h,&fb_b)` → fill
+  `fb_b.mapped_addr` → `present(scanout, fb_b.fb_id, &seq)` →
+  fill the now-back buffer → `present` swap → repeat. No HW
+  exercise yet (same logind master gate as 7.2(d)). 4 new CPU
+  tests, 19 asserts. 297 phase_d + 836 v3 + 624 mabda CPU
+  asserts green. (Step 7.4(b), 2026-04-30).
 - [ ] **7.5** — Backend interface surface slots
   (`surface_configure / acquire / present`).
 - [ ] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
@@ -760,7 +784,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **7.1–7.4 all primitives in tree**; HW exercise gated on logind master (vkms or no-compositor session — see project memory); 7.5–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **all KMS primitives in tree (7.1–7.4 + 7.4(b))**; HW exercise gated on logind master; backend interface slots (7.5) + wrappers (7.6) + public API (7.7) ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |
