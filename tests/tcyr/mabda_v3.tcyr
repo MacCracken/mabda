@@ -1643,6 +1643,92 @@ fn test_native_pm4_di_src_sel_constant() {
 }
 
 # ================================================================
+# v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
+# ================================================================
+# Value-asserts for the spec-anchored constants in
+# src/backend_native.cyr Step 6.2(a) section. Pattern follows the
+# 4f.ii lesson — every computed/spec-derived constant that the PM4
+# stream will eventually emit gets a CPU value-assert so a typo
+# surfaces at test time, not at hardware-debug time.
+
+fn test_gfx9_vs_sh_register_addresses() {
+    # VS shader-program registers (Mesa: R_00B12{0,4,8,C}_SPI_SHADER_*_VS).
+    assert_eq(R_SPI_SHADER_PGM_LO_VS,    0xB120, "VS PGM_LO byte addr");
+    assert_eq(R_SPI_SHADER_PGM_HI_VS,    0xB124, "VS PGM_HI byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC1_VS, 0xB128, "VS PGM_RSRC1 byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC2_VS, 0xB12C, "VS PGM_RSRC2 byte addr");
+    # Wire-form: (addr - 0xB000) / 4. 0xB120 → 0x48, sequential by 1.
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_LO_VS),    0x48, "VS PGM_LO wire");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_RSRC2_VS), 0x4B, "VS PGM_RSRC2 wire");
+    return 0;
+}
+
+fn test_gfx9_ps_sh_register_addresses() {
+    # PS shader-program registers (Mesa: R_00B02{0,4,8,C}_SPI_SHADER_*_PS).
+    assert_eq(R_SPI_SHADER_PGM_LO_PS,    0xB020, "PS PGM_LO byte addr");
+    assert_eq(R_SPI_SHADER_PGM_HI_PS,    0xB024, "PS PGM_HI byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC1_PS, 0xB028, "PS PGM_RSRC1 byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC2_PS, 0xB02C, "PS PGM_RSRC2 byte addr");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_LO_PS),    0x08, "PS PGM_LO wire");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_RSRC2_PS), 0x0B, "PS PGM_RSRC2 wire");
+    return 0;
+}
+
+fn test_gfx9_spi_format_register_addresses() {
+    # SPI shader output format context regs (Mesa 0x028708/0x02870C/0x028710).
+    # mabda 0xA-shorthand (synthetic 0xA000 base) produces identical wire form.
+    assert_eq(R_SPI_SHADER_POS_FORMAT, 0xA710, "SPI_SHADER_POS_FORMAT byte addr");
+    assert_eq(R_SPI_SHADER_Z_FORMAT,   0xA708, "SPI_SHADER_Z_FORMAT byte addr");
+    assert_eq(R_SPI_SHADER_COL_FORMAT, 0xA70C, "SPI_SHADER_COL_FORMAT byte addr");
+    # Wire-form: (addr - 0xA000) / 4. 0xA710 → 0x1C4, etc.
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_POS_FORMAT), 0x1C4, "POS_FORMAT wire");
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_Z_FORMAT),   0x1C2, "Z_FORMAT wire");
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_COL_FORMAT), 0x1C3, "COL_FORMAT wire");
+    return 0;
+}
+
+fn test_gfx9_cb_target_mask_address() {
+    # Pipeline-static color-buffer write mask (Mesa R_028238_CB_TARGET_MASK).
+    # Wire form 0x8E was already exercised by test_native_pm4_set_context_reg_one_layout
+    # using the synthetic literal 0xA238; this assert pins the named constant.
+    assert_eq(R_CB_TARGET_MASK, 0xA238, "CB_TARGET_MASK byte addr");
+    assert_eq(native_context_reg_offset(R_CB_TARGET_MASK), 0x8E, "CB_TARGET_MASK wire");
+    return 0;
+}
+
+fn test_gfx9_pgm_rsrc_minimums() {
+    # RSRC1: VS+PS share the compute minimum (FLOAT_MODE 0xC0, SGPRS=1, DX10_CLAMP, IEEE).
+    assert_eq(GFX9_GFX_PGM_RSRC1_MIN, 0x2C0040, "GFX RSRC1 minimum value");
+    assert_eq(GFX9_GFX_PGM_RSRC1_MIN, GFX9_COMPUTE_PGM_RSRC1_MIN, "GFX RSRC1 mirrors compute");
+    # RSRC2: zero for trivial shape (no USER_SGPR, no scratch, no LDS).
+    # Hazard: PS may need TRAP_PRESENT (bit 6) on GFX9 if the FS does memory ops;
+    # the trivial solid-color FS does not, so 0 is the spec minimum.
+    assert_eq(GFX9_VS_PGM_RSRC2_MIN, 0x0, "VS RSRC2 minimum");
+    assert_eq(GFX9_PS_PGM_RSRC2_MIN, 0x0, "PS RSRC2 minimum");
+    return 0;
+}
+
+fn test_gfx9_spi_format_field_values() {
+    # POS_FORMAT = FLOAT_4 — VS exports four f32 lanes.
+    assert_eq(SPI_SHADER_POS_FORMAT_4, 0x4, "POS_FORMAT FLOAT_4");
+    # Z_FORMAT = INVALID — FS does not export depth.
+    assert_eq(SPI_SHADER_Z_FORMAT_INVALID, 0x0, "Z_FORMAT INVALID");
+    # COL_FORMAT candidates for RGBA8 RT — Step 6.5 picks one and verifies
+    # by CPU-readback. Default is FP32_ABGR (FS writes f32; export quantizes).
+    assert_eq(SPI_SHADER_COL_FORMAT_FP16_ABGR,    0x9, "COL_FORMAT FP16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_UNORM16_ABGR, 0xA, "COL_FORMAT UNORM16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_FP32_ABGR,    0xE, "COL_FORMAT FP32_ABGR");
+    return 0;
+}
+
+fn test_gfx9_fullscreen_triangle_vertex_count() {
+    # Full-screen triangle: 3 vertices generated from vertex_id 0/1/2
+    # via switch in the VS body (no VBO).
+    assert_eq(GFX9_FULLSCREEN_TRI_VCOUNT, 3, "full-screen triangle vertex count");
+    return 0;
+}
+
+# ================================================================
 # v3 Step 6.9 — public render-* dispatchers route through Backend
 # ================================================================
 # 7 mock-backend dispatch tests proving each public gpu_render_*
@@ -1979,6 +2065,15 @@ fn main() {
     test_native_pm4_set_context_reg_multi_layout();
     test_native_pm4_draw_index_auto_layout();
     test_native_pm4_di_src_sel_constant();
+
+    # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums (7)
+    test_gfx9_vs_sh_register_addresses();
+    test_gfx9_ps_sh_register_addresses();
+    test_gfx9_spi_format_register_addresses();
+    test_gfx9_cb_target_mask_address();
+    test_gfx9_pgm_rsrc_minimums();
+    test_gfx9_spi_format_field_values();
+    test_gfx9_fullscreen_triangle_vertex_count();
 
     # v3 Step 6.9 — public render-* dispatchers (8)
     test_gpu_render_target_create_dispatches_through_backend();
