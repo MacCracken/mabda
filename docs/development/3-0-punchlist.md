@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.1(b) — DRM connector primitives)
+**Last refresh:** 2026-04-30 (post Step 7.1(c) — Phase D discovery HW-verified)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -360,8 +360,32 @@ need it.
     constants (3), connector-type constants (12). 836 v3 + 100
     phase_d + 624 mabda CPU asserts green; smoke + lint +
     distlib clean. (Step 7.1(b), 2026-04-30).
-  - [ ] **7.1 (c)** — per-encoder enumeration + a higher-level
-    `native_kms_summary` that prints the discovered topology.
+  - [x] **7.1 (c)** — encoder ioctl + `native_kms_summary`
+    topology printer + runnable diagnostic. `drm_mode_get_encoder`
+    struct (20 B; 5 fields), 9-value `DRM_MODE_ENCODER_*` enum
+    (NONE/DAC/TMDS/LVDS/TVDAC/Virtual/DSI/DP-MST/DPI),
+    `native_drm_mode_get_encoder` ioctl helper. Three name-lookup
+    helpers (`native_drm_connector_type_name`,
+    `native_drm_encoder_type_name`,
+    `native_drm_connection_status_name`) return cstr labels for
+    use in any future diagnostic / summary output.
+    `native_kms_summary(state)` walks the connector + encoder ID
+    arrays from a populated KmsState and prints one line per
+    resource to stdout (id / type-name / status / current-CRTC /
+    possible-CRTCs). New runnable diagnostic
+    `programs/native_kms_summary.cyr` (with `card0..card9` scan
+    so node renumbering doesn't matter) opens a DRM master fd,
+    initializes a KmsState, prints the framebuffer extent
+    summary, then runs `native_kms_summary`. **Verified live on
+    Cezanne 2026-04-30**: 4 connectors (1 HDMI-A connected to
+    CRTC 87, 3 DP disconnected) + 8 encoders (4 TMDS + 4 DP-MST;
+    poss_crtcs = 0xF on all). Phase D discovery is now HW-verified
+    end-to-end. 6 new CPU tests, 31 asserts in mabda_v3_phase_d.tcyr
+    (encoder field offsets, encoder-type enum, three name-lookup
+    fns by first-byte spot-check, summary null-safe). 836 v3 +
+    131 phase_d + 624 mabda CPU asserts green; smoke + lint +
+    distlib clean. Closes Phase D discovery; foundation for
+    7.2's mode-pick logic. (Step 7.1(c), 2026-04-30).
 - [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
   for the first connected DP/HDMI), set it.
 - [ ] **7.3** — Framebuffer creation: KMS-side wrapping of a
@@ -589,7 +613,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — 7.1(a) + 7.1(b) done; 7.1(c) + 7.2–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **7.1 discovery code-complete + HW-verified**; 7.2–7.7 (modeset → present) ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

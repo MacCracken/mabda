@@ -462,37 +462,94 @@ keep `mabda_v3.tcyr` under the cap.
 asserts unchanged: 836 v3 + 100 phase_d = 936, was 887 at 7.1(a)
 close (+49 from 7.1(b)'s 4 new tests).
 
-### Metrics — 2026-04-30 (post Step 7.1(b))
+### Added — 2026-04-30 (Step 7.1(c) — Phase D discovery HW-verified)
+
+Closes Phase D discovery: encoder ioctl + struct, three name-lookup
+helpers, the `native_kms_summary` topology printer, and a runnable
+`programs/native_kms_summary.cyr` diagnostic that **was verified
+live on Cezanne** to print the real DRM/KMS topology of the
+machine.
+
+- **`drm_mode_get_encoder`** struct shape (20 bytes; 5 fields:
+  encoder_id / encoder_type / crtc_id / possible_crtcs /
+  possible_clones).
+- **`DRM_MODE_ENCODER_*`** enum (9 values: NONE / DAC / TMDS /
+  LVDS / TVDAC / Virtual / DSI / DPMST / DPI). DAC + TMDS + LVDS
+  cover legacy / desktop / laptop; Virtual / DSI / DPMST / DPI
+  cover modern ARM + DP-MST setups.
+- **`native_drm_mode_get_encoder(fd, req)`** — low-level ioctl
+  wrapper. Caller sets encoder_id at +0 before calling.
+- **Three name-lookup helpers** returning cstr labels:
+  `native_drm_connector_type_name(t)` → "DP" / "HDMI-A" / "eDP" / "?",
+  `native_drm_encoder_type_name(t)` → "TMDS" / "DP-MST" / "DAC" / "?",
+  `native_drm_connection_status_name(c)` → "connected" / "disconnected" / "unknown" / "?".
+  Inline if/elif chains rather than data tables — keeps the
+  module pure-Cyrius (no string-table runtime), and the fallback
+  "?" surfaces any new kernel value visibly.
+- **`native_kms_summary(state)`** — walks the connector + encoder
+  ID arrays from a populated KmsState and prints one line per
+  resource to stdout. Output shape:
+  ```
+    conn 110 HDMI-A-1 connected enc 109
+    enc 109 TMDS crtc 87 poss 0x0000000F
+  ```
+  Returns 0 on full success, negative errno on the first ioctl
+  that fails; partial output prints up to the failure point —
+  useful when debugging which connector is misbehaving.
+- **`programs/native_kms_summary.cyr`** — runnable diagnostic
+  with a `card0..card9` scan so DRM node renumbering doesn't
+  matter (Cezanne lands at `card1` on this box; other systems
+  may use `card0`). Opens the first available card-node, calls
+  `native_kms_init` for the GetResources discovery, then
+  `native_kms_summary` for per-resource enumeration. 4 named
+  exit codes (0–3) for unattended runs.
+
+**HW verification (Cezanne, 2026-04-30):** ran cleanly on the dev
+box. Discovered 4 connectors (1 HDMI-A-1 connected to CRTC 87 +
+3 DP disconnected) and 8 encoders (4 TMDS + 4 DP-MST; all with
+possible_crtcs = 0x0000000F = all 4 CRTCs usable). Framebuffer
+extent: up to 16384×16384. Real-world output matches the documented
+shape exactly. Phase D discovery is now end-to-end HW-validated —
+no longer "structurally tested but unrun."
+
+6 new CPU tests, 31 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+encoder field offsets (6), encoder-type enum (9), connector + encoder
++ connection name-lookup spot-checks via first-byte comparison (5
++ 5 + 4), summary null-safe (2). The HW path itself is exercised
+via `make test-native-kms-summary`.
+
+### Metrics — 2026-04-30 (post Step 7.1(c))
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
-- `tests/tcyr/mabda_v3.tcyr`: **836 assertions** (Phase D tests
-  moved to mabda_v3_phase_d.tcyr).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **100 assertions** (new
-  file; 5 from 7.1(a) + 4 from 7.1(b)).
-- `src/backend_native_kms.cyr`: ~330 lines (was 243 at 7.1(a) close;
-  +87 lines for the 7.1(b) struct constants + ioctl helper).
-- `dist/mabda.cyr`: regenerated (9730 lines).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **131 assertions** (was 100
+  at 7.1(b) close; +31 from 7.1(c)).
+- `src/backend_native_kms.cyr`: ~530 lines (was ~330 at 7.1(b);
+  +200 lines for encoder ioctl + name lookups + summary printer).
+- `programs/native_kms_summary.cyr`: 100 lines (new).
+- `dist/mabda.cyr`: regenerated (9941 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.1(b))
+### Next — 2026-04-30 (post Step 7.1(c))
 
-**Phase D 7.1 sub-bites in progress.**
+**Phase D 7.1 (discovery) is closed.** HW-verified on Cezanne.
 
-1. **7.1(c) — encoder ioctl + per-connector / per-encoder
-   enumeration driver + `native_kms_summary`.** Adds the
-   `drm_mode_get_encoder` struct (20 bytes; 5 fields), the
-   `native_drm_mode_get_encoder` ioctl helper, then the
-   higher-level enumeration driver that walks every connector ID
-   from 7.1(a)'s KmsState through 7.1(b)'s connector ioctl
-   (including its mode + encoder + property arrays), then walks
-   every encoder ID through the new encoder ioctl. Closes Phase D
-   discovery with a printable topology summary that gives
-   developers a `what's plugged in / what modes are supported`
-   debug surface — also the foundation for 7.2's mode-pick logic.
-2. **7.2 — mode-set + 7.3 framebuffer.** First HW-gated step in
-   Phase D — needs DRM master access, which a desktop session
-   already grants but a tty session doesn't.
+Two paths forward in Phase D:
+
+1. **7.2 — mode-set + 7.3 framebuffer.** Now genuinely unblocked.
+   With 7.1's discovery in hand, mode-pick logic is concrete:
+   walk connectors → find one with `connection == DRM_MODE_CONNECTED`
+   → walk encoders → find one with the connector's `encoder_id`
+   → walk that encoder's `possible_crtcs` mask to pick a CRTC →
+   issue `DRM_IOCTL_MODE_SETCRTC`. The HW gate is DRM master,
+   already proven accessible by 7.1(c)'s diagnostic on this dev
+   box.
+2. **Optional: per-connector mode enumeration (7.1(d) if filed).**
+   The 7.1(b) `drm_mode_modeinfo` struct is in tree but no driver
+   walks the modes_ptr array yet. 7.2's mode-set logic will need
+   this — could land as part of 7.2 (since it composes naturally),
+   or as a separate sub-bite if 7.2 grows large.
 
 **Phase C render HW-gated items still pending:**
 

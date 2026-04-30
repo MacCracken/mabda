@@ -1,0 +1,143 @@
+# programs/native_kms_summary.cyr — v3 Step 7.1(c) diagnostic
+#
+# Walks DRM/KMS resources on the local card-node and prints the
+# discovered topology: every connector (id, type, connection
+# status, currently-bound encoder) and every encoder (id, type,
+# currently-bound CRTC, possible-CRTCs bitmask).
+#
+# This is the developer "what's plugged in" tool — also the
+# foundation for 7.2's mode-set logic, which will pick a connector
+# based on connection status and an encoder based on the
+# possible-CRTCs mask.
+#
+# Card-node discovery: scans `/dev/dri/card0` through `card9` and
+# uses the first one that opens successfully. Linux numbers DRM
+# primary nodes in driver-load order — Cezanne typically lands on
+# `card1` if the system has a separate display controller (or `card0`
+# on a single-GPU box). No libdrm scan; just sequential opens with
+# a per-attempt errno check.
+#
+# Phase D needs a DRM **master** fd (not the render node) — KMS
+# ioctls fail with EACCES on a render-only fd. Most desktop sessions
+# implicitly have master via systemd-logind ACL on /dev/dri/cardN
+# (look for the `+` flag in `ls -l`); tty sessions need to be on
+# vt-active or run as root. Failure surfaces with the errno; user
+# can decide whether to escalate or skip.
+#
+# Exit codes:
+#   0   — summary printed, fd closed
+#   1   — no /dev/dri/cardN opened in card0..card9
+#   2   — native_kms_init failed (kernel rejected MODE_GETRESOURCES)
+#   3   — native_kms_summary failed mid-walk (partial output above)
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Try card0..card9; return the first fd that opens cleanly, or
+# the last errno (negative) on full failure. Path buffer is local
+# stack — pattern-character substitution (the trailing digit) keeps
+# the open(2) call simple.
+fn _try_open_card(path_buf, last_errno_out) {
+    var i = 0;
+    var last = -2;       # ENOENT default
+    while (i < 10) {
+        store8(path_buf + 13, 48 + i);   # '0' + i at index 13 ("/dev/dri/card?")
+        var fd = syscall(2, path_buf, 0x2, 0);
+        if (fd >= 0) {
+            store32(last_errno_out, i);
+            return fd;
+        }
+        last = fd;
+        i = i + 1;
+    }
+    store32(last_errno_out, last);
+    return last;
+}
+
+fn main() {
+    alloc_init();
+
+    # syscall(2) is open(2). Flags: O_RDWR (0x2).
+    var path[16];
+    memset(&path, 0, 16);
+    store8(&path + 0,  47);    # /
+    store8(&path + 1,  100);   # d
+    store8(&path + 2,  101);   # e
+    store8(&path + 3,  118);   # v
+    store8(&path + 4,  47);    # /
+    store8(&path + 5,  100);   # d
+    store8(&path + 6,  114);   # r
+    store8(&path + 7,  105);   # i
+    store8(&path + 8,  47);    # /
+    store8(&path + 9,  99);    # c
+    store8(&path + 10, 97);    # a
+    store8(&path + 11, 114);   # r
+    store8(&path + 12, 100);   # d
+    # +13 is the digit (filled by _try_open_card)
+    # +14 stays NUL
+
+    var info[4];
+    memset(&info, 0, 4);
+    var fd = _try_open_card(&path, &info);
+    if (fd < 0) {
+        print_cstr("FAIL: no /dev/dri/cardN opened (errno=");
+        print_i64(0 - fd);
+        print_cstr("; need DRM master — try a desktop session or sudo)\n");
+        return 1;
+    }
+    var which = load32(&info);
+    print_cstr("opened /dev/dri/card");
+    print_i64(which);
+    print_cstr(" fd=");
+    print_i64(fd);
+    print_cstr("\n");
+
+    var state = native_kms_init(fd);
+    if (state == 0) {
+        print_cstr("FAIL: native_kms_init (MODE_GETRESOURCES rejected)\n");
+        sys_close(fd);
+        return 2;
+    }
+    print_cstr("connectors=");
+    print_i64(kms_state_count_conn(state));
+    print_cstr(" encoders=");
+    print_i64(kms_state_count_enc(state));
+    print_cstr(" crtcs=");
+    print_i64(kms_state_count_crtcs(state));
+    print_cstr(" fbs=");
+    print_i64(kms_state_count_fbs(state));
+    print_cstr(" framebuffer_extent=");
+    print_i64(kms_state_min_width(state));
+    print_cstr("x");
+    print_i64(kms_state_min_height(state));
+    print_cstr(" .. ");
+    print_i64(kms_state_max_width(state));
+    print_cstr("x");
+    print_i64(kms_state_max_height(state));
+    print_cstr("\n");
+
+    var rc = native_kms_summary(state);
+    if (rc != 0) {
+        print_cstr("FAIL: native_kms_summary rc=");
+        print_i64(rc);
+        print_cstr("\n");
+        native_kms_release(state);
+        sys_close(fd);
+        return 3;
+    }
+
+    native_kms_release(state);
+    sys_close(fd);
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

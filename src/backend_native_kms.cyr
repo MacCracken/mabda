@@ -360,3 +360,214 @@ fn kms_state_min_width(state)   { return load32(state + KMS_STATE_FIELD_MIN_WIDT
 fn kms_state_max_width(state)   { return load32(state + KMS_STATE_FIELD_MAX_WIDTH); }
 fn kms_state_min_height(state)  { return load32(state + KMS_STATE_FIELD_MIN_HEIGHT); }
 fn kms_state_max_height(state)  { return load32(state + KMS_STATE_FIELD_MAX_HEIGHT); }
+
+# ================================================================
+# v3 Step 7.1(c) — Encoder ioctl + DRM_MODE_ENCODER_* enum
+# ================================================================
+# drm_mode_get_encoder layout (20 bytes, x86_64):
+#   +0:  encoder_id      (u32) — IN: encoder to query; OUT: same
+#   +4:  encoder_type    (u32) — OUT: DRM_MODE_ENCODER_*
+#   +8:  crtc_id         (u32) — OUT: currently bound CRTC, 0 if free
+#   +12: possible_crtcs  (u32) — OUT: bitmask of usable CRTCs
+#   +16: possible_clones (u32) — OUT: bitmask of clonable encoders
+var DRM_MODE_GET_ENCODER_SIZE       = 20;
+var DRM_MODE_GET_ENCODER_ID         = 0;
+var DRM_MODE_GET_ENCODER_TYPE       = 4;
+var DRM_MODE_GET_ENCODER_CRTC_ID    = 8;
+var DRM_MODE_GET_ENCODER_POSS_CRTCS = 12;
+var DRM_MODE_GET_ENCODER_POSS_CLONES = 16;
+
+# Encoder-type enum (uapi/drm/drm_mode.h DRM_MODE_ENCODER_*).
+# DAC/TMDS/LVDS cover the legacy / desktop / laptop common cases;
+# VIRTUAL/DSI/DPMST/DPI cover modern ARM + DP-MST setups.
+var DRM_MODE_ENCODER_NONE    = 0;
+var DRM_MODE_ENCODER_DAC     = 1;
+var DRM_MODE_ENCODER_TMDS    = 2;
+var DRM_MODE_ENCODER_LVDS    = 3;
+var DRM_MODE_ENCODER_TVDAC   = 4;
+var DRM_MODE_ENCODER_VIRTUAL = 5;
+var DRM_MODE_ENCODER_DSI     = 6;
+var DRM_MODE_ENCODER_DPMST   = 7;
+var DRM_MODE_ENCODER_DPI     = 8;
+
+# Low-level GetEncoder ioctl. Caller owns `req` (20 bytes), MUST
+# set encoder_id at +0 before calling. Returns 0 on success,
+# negative errno on failure.
+fn native_drm_mode_get_encoder(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_GETENCODER, req);
+}
+
+# ================================================================
+# Type-name lookup helpers (cstr return)
+# ================================================================
+# Tables are inline if/elif chains rather than data tables — keeps
+# the module pure-Cyrius (no string-table runtime), and keeps the
+# call sites simple. The fallback "?" string ensures any new value
+# added by a future kernel surfaces visibly in summary output.
+
+fn native_drm_connector_type_name(t) {
+    if (t == DRM_MODE_CONNECTOR_Unknown)     { return "Unknown"; }
+    if (t == DRM_MODE_CONNECTOR_VGA)         { return "VGA"; }
+    if (t == DRM_MODE_CONNECTOR_DVII)        { return "DVI-I"; }
+    if (t == DRM_MODE_CONNECTOR_DVID)        { return "DVI-D"; }
+    if (t == DRM_MODE_CONNECTOR_DVIA)        { return "DVI-A"; }
+    if (t == DRM_MODE_CONNECTOR_DisplayPort) { return "DP"; }
+    if (t == DRM_MODE_CONNECTOR_HDMIA)       { return "HDMI-A"; }
+    if (t == DRM_MODE_CONNECTOR_HDMIB)       { return "HDMI-B"; }
+    if (t == DRM_MODE_CONNECTOR_eDP)         { return "eDP"; }
+    if (t == DRM_MODE_CONNECTOR_VIRTUAL)     { return "Virtual"; }
+    if (t == DRM_MODE_CONNECTOR_DSI)         { return "DSI"; }
+    if (t == DRM_MODE_CONNECTOR_USB)         { return "USB-C"; }
+    return "?";
+}
+
+fn native_drm_encoder_type_name(t) {
+    if (t == DRM_MODE_ENCODER_NONE)    { return "None"; }
+    if (t == DRM_MODE_ENCODER_DAC)     { return "DAC"; }
+    if (t == DRM_MODE_ENCODER_TMDS)    { return "TMDS"; }
+    if (t == DRM_MODE_ENCODER_LVDS)    { return "LVDS"; }
+    if (t == DRM_MODE_ENCODER_TVDAC)   { return "TVDAC"; }
+    if (t == DRM_MODE_ENCODER_VIRTUAL) { return "Virtual"; }
+    if (t == DRM_MODE_ENCODER_DSI)     { return "DSI"; }
+    if (t == DRM_MODE_ENCODER_DPMST)   { return "DP-MST"; }
+    if (t == DRM_MODE_ENCODER_DPI)     { return "DPI"; }
+    return "?";
+}
+
+fn native_drm_connection_status_name(c) {
+    if (c == DRM_MODE_CONNECTED)         { return "connected"; }
+    if (c == DRM_MODE_DISCONNECTED)      { return "disconnected"; }
+    if (c == DRM_MODE_UNKNOWNCONNECTION) { return "unknown"; }
+    return "?";
+}
+
+# ================================================================
+# native_kms_summary — topology printer (Step 7.1(c))
+# ================================================================
+# Walks the connector + encoder ID arrays from a populated KmsState
+# (Step 7.1(a)) and queries each via the per-resource ioctls
+# (7.1(b)/(c) wrappers). Prints one line per connector and one per
+# encoder to stdout. HW-gated (ioctl-driven); CPU tests cover the
+# data-structure surface in mabda_v3_phase_d.tcyr.
+#
+# Output shape (one example line per category):
+#   conn 95 eDP-1 connected enc 94
+#   enc 94 TMDS crtc 73 poss 0x3
+#
+# Intentionally compact — this is a developer diagnostic, not a
+# user-facing UI. The columns are: id, type-name, status (connectors
+# only) / current-CRTC + possible-CRTC mask (encoders only).
+#
+# Returns 0 on full success, negative errno on the first ioctl that
+# fails (subsequent connectors / encoders are skipped). Partial
+# progress is printed up to the point of failure — useful when
+# debugging which connector is misbehaving.
+fn native_kms_summary(state) {
+    if (state == 0) { return -1; }
+    var fd = kms_state_fd(state);
+    if (fd <= 0)    { return -1; }
+
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var enc_count  = kms_state_count_enc(state);
+    var enc_ids    = kms_state_enc_ids(state);
+
+    syscall(1, 1, "kms summary:\n", 13);
+
+    # ---- Connectors ----
+    var i = 0;
+    var cbuf[80];
+    while (i < conn_count) {
+        memset(&cbuf, 0, 80);
+        store32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_ID, load32(conn_ids + i * 4));
+        var rc = native_drm_mode_get_connector(fd, &cbuf);
+        if (rc != 0) { return rc; }
+        var conn_id   = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_ID);
+        var conn_type = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_TYPE);
+        var type_id   = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_TYPE_ID);
+        var connection = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONNECTION);
+        var encoder_id = load32(&cbuf + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+
+        _kms_summary_print_conn(conn_id, conn_type, type_id, connection, encoder_id);
+        i = i + 1;
+    }
+
+    # ---- Encoders ----
+    var j = 0;
+    var ebuf[20];
+    while (j < enc_count) {
+        memset(&ebuf, 0, 20);
+        store32(&ebuf + DRM_MODE_GET_ENCODER_ID, load32(enc_ids + j * 4));
+        var rc = native_drm_mode_get_encoder(fd, &ebuf);
+        if (rc != 0) { return rc; }
+        var enc_id    = load32(&ebuf + DRM_MODE_GET_ENCODER_ID);
+        var enc_type  = load32(&ebuf + DRM_MODE_GET_ENCODER_TYPE);
+        var crtc_id   = load32(&ebuf + DRM_MODE_GET_ENCODER_CRTC_ID);
+        var poss_crtcs = load32(&ebuf + DRM_MODE_GET_ENCODER_POSS_CRTCS);
+
+        _kms_summary_print_enc(enc_id, enc_type, crtc_id, poss_crtcs);
+        j = j + 1;
+    }
+
+    return 0;
+}
+
+# Internal printer — kept in the same module so consumers don't pull
+# in fmt helpers transitively. Splitting these out as `_`-prefixed
+# helpers keeps the main loop in native_kms_summary readable + lets
+# the printer logic evolve without churning the loop.
+fn _kms_summary_print_conn(id, ctype, type_id, connection, enc_id) {
+    syscall(1, 1, "  conn ", 7);
+    _kms_summary_print_u32(id);
+    syscall(1, 1, " ", 1);
+    var name = native_drm_connector_type_name(ctype);
+    syscall(1, 1, name, strlen(name));
+    syscall(1, 1, "-", 1);
+    _kms_summary_print_u32(type_id);
+    syscall(1, 1, " ", 1);
+    var status = native_drm_connection_status_name(connection);
+    syscall(1, 1, status, strlen(status));
+    syscall(1, 1, " enc ", 5);
+    _kms_summary_print_u32(enc_id);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+fn _kms_summary_print_enc(id, etype, crtc_id, poss_crtcs) {
+    syscall(1, 1, "  enc ", 6);
+    _kms_summary_print_u32(id);
+    syscall(1, 1, " ", 1);
+    var name = native_drm_encoder_type_name(etype);
+    syscall(1, 1, name, strlen(name));
+    syscall(1, 1, " crtc ", 6);
+    _kms_summary_print_u32(crtc_id);
+    syscall(1, 1, " poss 0x", 8);
+    _kms_summary_print_hex32(poss_crtcs);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+# Decimal u32 printer — uses fmt_int_buf from lib/fmt to keep the
+# call sites concise. Stack-allocated buffer so we don't churn the
+# bump allocator on every printed connector / encoder.
+fn _kms_summary_print_u32(v) {
+    var buf[16];
+    memset(&buf, 0, 16);
+    var n = fmt_int_buf(v, &buf);
+    syscall(1, 1, &buf, n);
+    return 0;
+}
+
+# 8-digit hex u32 printer for the possible-CRTCs bitmask.
+fn _kms_summary_print_hex32(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[8];
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 8);
+    return 0;
+}

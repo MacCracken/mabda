@@ -237,6 +237,17 @@ build/native_render_e2e: programs/native_render_e2e.cyr src/*.cyr
 test-native-render-e2e: build/native_render_e2e
 	./build/native_render_e2e
 
+# v3 Step 7.1(c) — DRM/KMS topology diagnostic. Needs a DRM master
+# fd (/dev/dri/card0); typically requires a desktop session or
+# root. Run via `make test-native-kms-summary`.
+build/native_kms_summary: programs/native_kms_summary.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_kms_summary.cyr $@
+
+.PHONY: test-native-kms-summary
+test-native-kms-summary: build/native_kms_summary
+	./build/native_kms_summary
+
 # v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
 # Used to differentiate "is this bug in our direct ioctls?" (spike =
 # libdrm-canonical, hangs identically) from "is shader-dispatch the
