@@ -349,42 +349,107 @@ tracking composability with `native_pm4_nop`, event_index packing
 (verified with a non-zero index = 5 case so future TS-event paths
 can build on this).
 
-### Metrics — 2026-04-30 (post Step 6.10 prep)
+### Added — 2026-04-30 (Step 7.1(a) — Phase D DRM/KMS foundation)
 
-- Module count: 33 (unchanged).
+First Phase D bite lands: a new module `src/backend_native_kms.cyr`
+(243 lines) implementing the DRM/KMS GetResources ioctl. Filed
+separately from `backend_native.cyr` because the surface path is
+structurally distinct from the compute / render path — `card0`
+master node + `DRM_IOCTL_MODE_*` family, vs `renderD128` render
+node + `DRM_IOCTL_AMDGPU_*` family.
+
+- **`DRM_IOCTL_MODE_GETRESOURCES`** (= `0xC04064A0`) — derived from
+  `_IOC(RW, 0x64, 0xA0, 64)`. Returns the kernel's count of FBs /
+  CRTCs / connectors / encoders + ID arrays for each.
+- **`drm_mode_card_res`** struct shape (64 bytes, every field
+  pinned by CPU asserts): four `*_ptr` fields, four `count_*`
+  fields (IN: capacity, OUT: actual), four extent-limit fields.
+- **`native_drm_mode_get_resources(fd, req)`** — low-level
+  ioctl wrapper. Caller controls `req` zeroing (count-only pass
+  vs array-fill pass).
+- **`native_kms_init(fd)`** — the two-pass driver. Pass 1 with
+  null pointers + zero counts to discover sizes; pass 2 with
+  heap-allocated arrays of the discovered sizes. Returns a
+  96-byte `KmsState` (or 0 on failure / no DRM master).
+- **`KmsState`** struct (96 bytes): fd + 4 counts + 4 ID array
+  pointers + 4 extent-limit fields + 24 reserved bytes for
+  per-connector / per-encoder summary tables landing in 7.1(b/c).
+- **13 short field accessors** (`kms_state_fd`, `kms_state_count_*`,
+  `kms_state_*_ids`, `kms_state_min_width` etc.) keep call sites
+  readable without spreading the field-offset constants through
+  consumers.
+- **`MODE_GETCONNECTOR`** (= `0xC05064A7`) and **`MODE_GETENCODER`**
+  (= `0xC01464A6`) ioctl-number constants exposed for sub-bites
+  (b) + (c). Helper fns land in those steps.
+- **`native_kms_release(state)`** — safe-zero teardown. Bump-
+  allocator pattern means heap allocs aren't freed (consistent
+  with `native_compute_dispatch_cached`); zeroing the struct
+  surfaces stale-pointer use as null on subsequent loads.
+
+`backend_native_kms.cyr` is wired into the include chain
+(`src/lib.cyr`) and `[lib].modules` (`cyrius.cyml`) so
+`cyrius distlib` bundles it for downstream consumers and the
+smoke build links it.
+
+5 CPU tests, 51 asserts in `tests/tcyr/mabda_v3.tcyr`: ioctl
+numbers re-derived from first principles to catch transcription
+drift, drm_mode_card_res field offsets pinned, KmsState layout
++ accessor round-trips, release safe-zero (null + populated).
+The `native_kms_init` driver itself is HW-gated — needs a DRM
+master fd (`/dev/dri/card0`), which CI runners typically lack.
+
+### Fixed — 2026-04-30 (caught during Step 7.1(a))
+
+- **`cyrius lint` 128 KiB read-buffer cap** surfaced when
+  `tests/tcyr/mabda_v3.tcyr` crossed 131,072 bytes during the
+  7.1(a) test additions. `cyrlint.cyr:523` allocs
+  `var buf = alloc(131072)` and `file_read_all(path, buf, 131072)`
+  truncates anything larger — the linter then misreports
+  "unclosed braces at end of file" near the cutoff while the
+  file is structurally fine. Identical class of bug to the
+  `cyrius distlib` 64K truncation fixed in 5.7.36 (raised to
+  256K). cyrlint never got the same treatment; as of cyrius
+  5.7.42 the cap is still 128 KiB. Worked around by tightening
+  the new test bodies' assertion messages so the file lands
+  at 130,932 bytes (140 bytes headroom). Saved as a memory note;
+  real fix is to bump cyrlint's buffer upstream and re-pin —
+  noted as a tooling follow-up.
+
+### Metrics — 2026-04-30 (post Step 7.1(a))
+
+- Module count: **34** (was 33; `backend_native_kms.cyr` is new).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
-- `tests/tcyr/mabda_v3.tcyr`: **836 assertions** (was 819 at 6.8(c)
-  close — 6.9(b) added no asserts; 6.10 prep added 17).
-- `src/backend_native.cyr`: ~2,750 lines (was ~2,690 at 6.8(c) close;
-  +60 lines for the EVENT_WRITE builders + constants).
-- `programs/native_render_e2e.cyr`: 243 lines (unchanged from 6.9(b)).
-- `dist/mabda.cyr`: regenerated (9368 lines).
+- `tests/tcyr/mabda_v3.tcyr`: **887 assertions** (was 836 at
+  6.10-prep close; +51 from 7.1(a)).
+- `src/backend_native_kms.cyr`: 243 lines (new).
+- `dist/mabda.cyr`: regenerated (9615 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 6.10 prep)
+### Next — 2026-04-30 (post Step 7.1(a))
 
-**Phase C render is code-complete + flush-prep ready.** Two HW-gated
-items remain in the 6.x bucket:
+**Phase D 7.1 sub-bites in progress.**
 
-1. **Run `make test-native-render-e2e` on Cezanne.** The first
-   execution is the load-bearing test for the entire 6.x chain.
-   Failure A (cache flush) → one-line splice using the 6.10-prep
-   builder. Failure B (TDR) → Layer-2 byte-diff to localize.
-   Failure C (pipeline state) → audit 6.5(a) register addresses.
-2. **Layer-2 byte-diff vs radv.** Hyprland or headless
-   `programs/diagnostics/radv_capture/` unblocks; diff our
-   `pass_draw` IB against `RADV_DEBUG=hang vkcube`'s for an
-   equivalent clear-triangle. This is the "claim 6.5 done" gate
-   the session 26 handoff identified.
+1. **7.1(b) — per-connector enumeration.** `MODE_GETCONNECTOR`
+   helper + per-connector mode list + property table. Lands the
+   "what modes does this monitor support" surface. Self-contained
+   bite, mostly mirrors 7.1(a)'s shape with a different ioctl.
+2. **7.1(c) — per-encoder enumeration + topology summary.** Wraps
+   7.1(a)+(b) into a printable summary so `native_kms_summary`
+   gives developers a quick "what's plugged in" check. Useful both
+   as a debug tool and as the foundation for 7.2's mode-pick logic.
+3. **7.2 — mode-set + 7.3 framebuffer.** First HW-gated step in
+   Phase D — needs DRM master access, which a desktop session
+   already grants but a tty session doesn't.
 
-**Phase D surface (7.x)** remains fully unblocked and a clean
-parallel side-quest — pure DRM/KMS path, no shader bytes, no PM4
-verification gate. 7.1 (device discovery) is a self-contained
-~1-session bite.
+**Phase C render HW-gated items still pending:**
 
-**WGSL → GFX9 ISA lowering (8.x)** remains the v3.0 ship-blocker
-per "Hard truths up front" in the punchlist. Worth a sober design
-spike before the next major bite.
+- Run `make test-native-render-e2e` on Cezanne. Failure A → 6.10
+  composer splice, Failure B → Layer-2 IB diff, Failure C → audit
+  6.5(a) registers.
+- Layer-2 byte-diff vs radv (Hyprland or headless capture program).
+
+**WGSL → GFX9 ISA lowering (8.x)** remains the v3.0 ship-blocker.
+Worth a sober design spike before the next major bite.
 
 Full handoff (Step 6.5 close-out + 6.6 sequencing):
 [`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).

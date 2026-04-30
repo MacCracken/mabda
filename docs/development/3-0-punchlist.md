@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 6.10 prep — CACHE_FLUSH_AND_INV builder ready)
+**Last refresh:** 2026-04-30 (post Step 7.1(a) — DRM/KMS GetResources foundation)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -320,7 +320,29 @@ need it.
 - [ ] **7.1** — DRM/KMS device discovery: enumerate connectors,
   modes, encoders. `native_kms_init(fd)` returns a KmsState.
   Filed under `src/backend_native_kms.cyr` to keep it separate
-  from the compute path.
+  from the compute path. Three sub-bites:
+  - [x] **7.1 (a)** — GetResources foundation. New module
+    `src/backend_native_kms.cyr` (243 lines) wired into
+    `src/lib.cyr` + `cyrius.cyml`. Implements
+    `DRM_IOCTL_MODE_GETRESOURCES` (= `0xC04064A0`), the 64-byte
+    `drm_mode_card_res` struct shape (mirrored from
+    `uapi/drm/drm_mode.h`), and `native_kms_init(fd)` — the
+    two-pass driver (count-only ioctl → array-fill ioctl) that
+    returns a 96-byte `KmsState` holding fd, the 4 ID arrays
+    (FB / CRTC / connector / encoder), and the framebuffer
+    extent limits. `MODE_GETCONNECTOR` / `_GETENCODER` ioctl
+    numbers + 13 short field accessors (`kms_state_fd` etc.)
+    also exposed for sub-bites (b) + (c). Mode-set / present
+    ioctls (`SETCRTC`, `PAGE_FLIP`) come in 7.2+. 5 CPU tests,
+    51 asserts (ioctl numbers re-derived from first principles,
+    struct/state field offsets, accessor round-trips, release
+    safe-zero). 887 v3 (was 836 at 6.10-prep close) + 624 mabda
+    CPU asserts green; smoke + lint + distlib clean. (Step
+    7.1(a), 2026-04-30).
+  - [ ] **7.1 (b)** — per-connector enumeration. `MODE_GETCONNECTOR`
+    helper + connector-mode + property tables.
+  - [ ] **7.1 (c)** — per-encoder enumeration + a higher-level
+    `native_kms_summary` that prints the discovered topology.
 - [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
   for the first connected DP/HDMI), set it.
 - [ ] **7.3** — Framebuffer creation: KMS-side wrapping of a
@@ -548,7 +570,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | ⬜ not started — fully unblocked, parallel side-quest | — |
+| Tier 1 — Phase D surface (7.x) | partial — 7.1(a) GetResources foundation done; 7.1(b/c) + 7.2–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

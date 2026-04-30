@@ -1,0 +1,247 @@
+# @internal — native KMS / mode-setting (v3 Phase D, Step 7.1)
+# backend_native_kms.cyr — direct DRM/KMS ioctls for surface present
+#
+# Filed separately from backend_native.cyr because the surface path is
+# structurally distinct from the compute / render path:
+#   - compute / render use /dev/dri/renderD128 (render node, no
+#     master) and DRM_IOCTL_AMDGPU_* + generic GEM ioctls.
+#   - mode-set / scanout uses /dev/dri/card0 (primary node, requires
+#     DRM master) and DRM_IOCTL_MODE_* generic ioctls.
+#
+# The fd story diverges, the ioctl families diverge, the lifetime
+# story diverges (a render-only ctx never touches KMS) — so the code
+# diverges too. Keeping it in its own module makes the boundary
+# explicit and prevents the compute path from accidentally pulling
+# in scanout state.
+#
+# Phase D sub-bullets (per docs/development/3-0-punchlist.md):
+#   7.1(a) — GetResources + KmsState scaffold (THIS FILE, Step 7.1a)
+#   7.1(b) — per-connector enumeration (modes + props)
+#   7.1(c) — per-encoder enumeration + native_kms_state_summary
+#   7.2    — mode-set: pick a default mode + DRM_IOCTL_MODE_SETCRTC
+#   7.3    — framebuffer creation: KMS-side wrap of a GTT BO
+#   7.4    — page flip + vblank
+#   7.5    — present primitive (queue + fence integration)
+#   7.6    — surface release lifecycle
+#   7.7    — public gpu_surface_* API + e2e program
+#
+# All data types are i64 / u64 unless noted. drm_mode_* struct layouts
+# mirror include/uapi/drm/drm_mode.h on x86_64 Linux. No libdrm —
+# direct syscall(SYS_IOCTL) only, same posture as backend_native.cyr.
+
+# ================================================================
+# DRM mode-setting ioctl numbers
+# ================================================================
+# Encoding per asm-generic/ioctl.h:
+#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
+# Direction codes are reused from backend_native.cyr (_IOC_RW = 3);
+# DRM type 'd' = 0x64 likewise reused as DRM_IOCTL_TYPE.
+
+# DRM_IOCTL_MODE_GETRESOURCES — nr 0xA0, RW, sizeof(drm_mode_card_res) = 64
+#   0xC0000000 | (64 << 16) | (0x64 << 8) | 0xA0 == 0xC04064A0
+var DRM_IOCTL_MODE_GETRESOURCES = 0xC04064A0;
+
+# DRM_IOCTL_MODE_GETCONNECTOR — nr 0xA7, RW, sizeof(drm_mode_get_connector) = 80
+#   0xC0000000 | (80 << 16) | (0x64 << 8) | 0xA7 == 0xC05064A7
+# (Constant exposed for 7.1(b); ioctl helper lands there.)
+var DRM_IOCTL_MODE_GETCONNECTOR = 0xC05064A7;
+
+# DRM_IOCTL_MODE_GETENCODER — nr 0xA6, RW, sizeof(drm_mode_get_encoder) = 20
+#   0xC0000000 | (20 << 16) | (0x64 << 8) | 0xA6 == 0xC01464A6
+# (Constant exposed for 7.1(c); ioctl helper lands there.)
+var DRM_IOCTL_MODE_GETENCODER = 0xC01464A6;
+
+# ================================================================
+# drm_mode_card_res struct layout (64 bytes, x86_64)
+# ================================================================
+# Mirror of include/uapi/drm/drm_mode.h:drm_mode_card_res:
+#
+#   +0:  fb_id_ptr           (u64) — userspace ptr to FB-ID array
+#   +8:  crtc_id_ptr         (u64) — userspace ptr to CRTC-ID array
+#   +16: connector_id_ptr    (u64) — userspace ptr to connector-ID array
+#   +24: encoder_id_ptr      (u64) — userspace ptr to encoder-ID array
+#   +32: count_fbs           (u32) — IN: cap; OUT: actual count
+#   +36: count_crtcs         (u32) — IN: cap; OUT: actual count
+#   +40: count_connectors    (u32) — IN: cap; OUT: actual count
+#   +44: count_encoders      (u32) — IN: cap; OUT: actual count
+#   +48: min_width           (u32) — OUT
+#   +52: max_width           (u32) — OUT
+#   +56: min_height          (u32) — OUT
+#   +60: max_height          (u32) — OUT
+#
+# Two-call protocol: first ioctl with count_* = 0 and *_ptr = NULL
+# returns the actual counts; second ioctl with caller-allocated arrays
+# at *_ptr and count_* = capacity returns the IDs. This matches
+# libdrm's drmModeGetResources internal pattern.
+
+var DRM_MODE_CARD_RES_SIZE         = 64;
+var DRM_MODE_CARD_RES_FB_PTR       = 0;
+var DRM_MODE_CARD_RES_CRTC_PTR     = 8;
+var DRM_MODE_CARD_RES_CONN_PTR     = 16;
+var DRM_MODE_CARD_RES_ENC_PTR      = 24;
+var DRM_MODE_CARD_RES_COUNT_FBS    = 32;
+var DRM_MODE_CARD_RES_COUNT_CRTCS  = 36;
+var DRM_MODE_CARD_RES_COUNT_CONN   = 40;
+var DRM_MODE_CARD_RES_COUNT_ENC    = 44;
+var DRM_MODE_CARD_RES_MIN_WIDTH    = 48;
+var DRM_MODE_CARD_RES_MAX_WIDTH    = 52;
+var DRM_MODE_CARD_RES_MIN_HEIGHT   = 56;
+var DRM_MODE_CARD_RES_MAX_HEIGHT   = 60;
+
+# Low-level GetResources ioctl. Caller owns `req` (64 bytes), which
+# this fn does NOT zero — the caller controls whether *_ptr and
+# count_* are set up for a count-only call (zeros) or a capacity-
+# bounded fill call. Returns 0 on success, negative errno on failure.
+fn native_drm_mode_get_resources(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_GETRESOURCES, req);
+}
+
+# ================================================================
+# KmsState struct layout (96 bytes)
+# ================================================================
+# Owns the full output of two-pass MODE_GETRESOURCES discovery:
+# the kernel-reported counts, the four ID arrays (heap-allocated by
+# native_kms_init), and the framebuffer extent limits. The fd is
+# stashed at +0 so subsequent per-connector / per-encoder ioctls
+# don't need to be re-passed it.
+#
+#   +0:  fd                  (u64) — DRM card-node fd
+#   +8:  count_fbs           (u32)
+#   +12: count_crtcs         (u32)
+#   +16: count_connectors    (u32)
+#   +20: count_encoders      (u32)
+#   +24: fb_ids              (u64 ptr — heap, count_fbs × u32)
+#   +32: crtc_ids            (u64 ptr — heap, count_crtcs × u32)
+#   +40: connector_ids       (u64 ptr — heap, count_connectors × u32)
+#   +48: encoder_ids         (u64 ptr — heap, count_encoders × u32)
+#   +56: min_width           (u32)
+#   +60: max_width           (u32)
+#   +64: min_height          (u32)
+#   +68: max_height          (u32)
+#   +72: reserved            (24 bytes — for 7.1(b/c) per-connector
+#                              + per-encoder summary tables)
+var KMS_STATE_FIELD_FD             = 0;
+var KMS_STATE_FIELD_COUNT_FBS      = 8;
+var KMS_STATE_FIELD_COUNT_CRTCS    = 12;
+var KMS_STATE_FIELD_COUNT_CONN     = 16;
+var KMS_STATE_FIELD_COUNT_ENCODERS      = 20;
+var KMS_STATE_FIELD_FB_IDS         = 24;
+var KMS_STATE_FIELD_CRTC_IDS       = 32;
+var KMS_STATE_FIELD_CONN_IDS       = 40;
+var KMS_STATE_FIELD_ENC_IDS        = 48;
+var KMS_STATE_FIELD_MIN_WIDTH      = 56;
+var KMS_STATE_FIELD_MAX_WIDTH      = 60;
+var KMS_STATE_FIELD_MIN_HEIGHT     = 64;
+var KMS_STATE_FIELD_MAX_HEIGHT     = 68;
+var KMS_STATE_STRUCT_SIZE          = 96;
+
+# Two-pass discovery driver. Allocates a 96-byte KmsState, opens DRM
+# resources twice (count-only then array-fill), populates the state.
+# Caller frees the state with native_kms_release.
+#
+# Returns the KmsState pointer on success, or 0 on failure (count-
+# pass ioctl failed; either fd is not a DRM master node, or the
+# kernel doesn't support modesetting on this device).
+fn native_kms_init(fd) {
+    if (fd <= 0) { return 0; }
+    var state = alloc(KMS_STATE_STRUCT_SIZE);
+    memset(state, 0, KMS_STATE_STRUCT_SIZE);
+    store64(state + KMS_STATE_FIELD_FD, fd);
+
+    # ---- Pass 1: count-only (all *_ptr = 0, count_* = 0) ----
+    var req[64];
+    memset(&req, 0, DRM_MODE_CARD_RES_SIZE);
+    var rc = native_drm_mode_get_resources(fd, &req);
+    if (rc != 0) { return 0; }
+
+    var count_fbs   = load32(&req + DRM_MODE_CARD_RES_COUNT_FBS);
+    var count_crtcs = load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS);
+    var count_conn  = load32(&req + DRM_MODE_CARD_RES_COUNT_CONN);
+    var count_enc   = load32(&req + DRM_MODE_CARD_RES_COUNT_ENC);
+
+    # Stash the framebuffer extent limits (these come back from the
+    # count-pass; no need for a fill-pass to read them).
+    store32(state + KMS_STATE_FIELD_MIN_WIDTH,
+            load32(&req + DRM_MODE_CARD_RES_MIN_WIDTH));
+    store32(state + KMS_STATE_FIELD_MAX_WIDTH,
+            load32(&req + DRM_MODE_CARD_RES_MAX_WIDTH));
+    store32(state + KMS_STATE_FIELD_MIN_HEIGHT,
+            load32(&req + DRM_MODE_CARD_RES_MIN_HEIGHT));
+    store32(state + KMS_STATE_FIELD_MAX_HEIGHT,
+            load32(&req + DRM_MODE_CARD_RES_MAX_HEIGHT));
+
+    # ---- Pass 2: array fill ----
+    # Heap-allocate four u32 arrays sized by the pass-1 counts. Skip
+    # the alloc + ioctl for any zero-count category (e.g., a
+    # freshly-booted card with no FBs yet has count_fbs = 0).
+    var fb_ids   = 0;
+    var crtc_ids = 0;
+    var conn_ids = 0;
+    var enc_ids  = 0;
+
+    if (count_fbs > 0)   { fb_ids   = alloc(count_fbs * 4); }
+    if (count_crtcs > 0) { crtc_ids = alloc(count_crtcs * 4); }
+    if (count_conn > 0)  { conn_ids = alloc(count_conn * 4); }
+    if (count_enc > 0)   { enc_ids  = alloc(count_enc * 4); }
+
+    memset(&req, 0, DRM_MODE_CARD_RES_SIZE);
+    store64(&req + DRM_MODE_CARD_RES_FB_PTR,    fb_ids);
+    store64(&req + DRM_MODE_CARD_RES_CRTC_PTR,  crtc_ids);
+    store64(&req + DRM_MODE_CARD_RES_CONN_PTR,  conn_ids);
+    store64(&req + DRM_MODE_CARD_RES_ENC_PTR,   enc_ids);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_FBS,   count_fbs);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS, count_crtcs);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_CONN,  count_conn);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_ENC,   count_enc);
+
+    rc = native_drm_mode_get_resources(fd, &req);
+    if (rc != 0) { return 0; }
+
+    # The kernel may report fewer than pass-1 counts if a connector
+    # was hot-unplugged between calls. Use the post-fill counts as
+    # the source of truth.
+    store32(state + KMS_STATE_FIELD_COUNT_FBS,
+            load32(&req + DRM_MODE_CARD_RES_COUNT_FBS));
+    store32(state + KMS_STATE_FIELD_COUNT_CRTCS,
+            load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS));
+    store32(state + KMS_STATE_FIELD_COUNT_CONN,
+            load32(&req + DRM_MODE_CARD_RES_COUNT_CONN));
+    store32(state + KMS_STATE_FIELD_COUNT_ENCODERS,
+            load32(&req + DRM_MODE_CARD_RES_COUNT_ENC));
+    store64(state + KMS_STATE_FIELD_FB_IDS,   fb_ids);
+    store64(state + KMS_STATE_FIELD_CRTC_IDS, crtc_ids);
+    store64(state + KMS_STATE_FIELD_CONN_IDS, conn_ids);
+    store64(state + KMS_STATE_FIELD_ENC_IDS,  enc_ids);
+
+    return state;
+}
+
+# Release a KmsState. The bump-allocator pattern means the heap
+# allocations themselves are not freed (consistent with
+# native_compute_dispatch_cached and similar paths) — we just zero
+# the struct so subsequent loads of stale ptrs surface as null.
+# Returns 0.
+fn native_kms_release(state) {
+    if (state == 0) { return 0; }
+    memset(state, 0, KMS_STATE_STRUCT_SIZE);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Field accessors (consistent with native_ctx_* helpers in
+# backend_native.cyr — short-name accessors keep call sites readable
+# without spreading the field-offset constants through callers).
+# ----------------------------------------------------------------
+fn kms_state_fd(state)          { return load64(state + KMS_STATE_FIELD_FD); }
+fn kms_state_count_fbs(state)   { return load32(state + KMS_STATE_FIELD_COUNT_FBS); }
+fn kms_state_count_crtcs(state) { return load32(state + KMS_STATE_FIELD_COUNT_CRTCS); }
+fn kms_state_count_conn(state)  { return load32(state + KMS_STATE_FIELD_COUNT_CONN); }
+fn kms_state_count_enc(state)   { return load32(state + KMS_STATE_FIELD_COUNT_ENCODERS); }
+fn kms_state_fb_ids(state)      { return load64(state + KMS_STATE_FIELD_FB_IDS); }
+fn kms_state_crtc_ids(state)    { return load64(state + KMS_STATE_FIELD_CRTC_IDS); }
+fn kms_state_conn_ids(state)    { return load64(state + KMS_STATE_FIELD_CONN_IDS); }
+fn kms_state_enc_ids(state)     { return load64(state + KMS_STATE_FIELD_ENC_IDS); }
+fn kms_state_min_width(state)   { return load32(state + KMS_STATE_FIELD_MIN_WIDTH); }
+fn kms_state_max_width(state)   { return load32(state + KMS_STATE_FIELD_MAX_WIDTH); }
+fn kms_state_min_height(state)  { return load32(state + KMS_STATE_FIELD_MIN_HEIGHT); }
+fn kms_state_max_height(state)  { return load32(state + KMS_STATE_FIELD_MAX_HEIGHT); }
