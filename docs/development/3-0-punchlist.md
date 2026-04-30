@@ -28,13 +28,20 @@ Read these before sequencing.
   all six consumers technically able to flip, "running native in
   production across a full release cycle" is what gates AMD wgpu
   retirement at v4.0. v3.0 ship just opens that window.
-- **Tier 1 is multi-month.** Backend abstraction + Phase B.4
-  follow-ups are done; Phase C native (texture + render) + Phase D
-  native (surface) + WGSL lowering still ahead — bulk of remaining
-  work. Don't try to swallow a phase whole; chunks below.
+- **Tier 1 is multi-month.** Backend abstraction + Phase B.4 +
+  Phase C texture + Phase C render + Phase D KMS primitives are
+  all in tree as of 2026-04-30. Remaining: 7.7 public surface API,
+  8.1–8.10 WGSL lowering, plus Tier 2/3/4/5 ship work. The
+  WGSL chunk is still the calendar-dominant unknown.
 - **Linux + AMD only.** v3.0's native backend covers AMD on Linux.
   NVIDIA / Intel / macOS / Windows consumers continue on `wgpu`.
   Don't accept scope-creep that pretends otherwise.
+- **Logind master is a v3.x problem, not a v3.0 blocker.** The
+  Phase D ioctl primitives (SETCRTC, page-flip) all return EACCES
+  inside a running compositor session. Three workarounds for HW
+  testing today (vkms / no-compositor / stop display-manager);
+  the proper fix is dbus TakeDevice() integration in 7.7 or v3.x.
+  See `project_phase_d_master_logind_blocker` memory.
 
 ## Tier 1 — Code completeness
 
@@ -119,7 +126,7 @@ need it.
   state, color/depth target setup). Pages from amdgpu kernel
   source + Mesa radv. Filed in
   `docs/proposals/v3-native-render-design.md`.
-- [ ] **6.2** — Trivial GFX9 vertex+fragment shader pair
+- [x] **6.2** — Trivial GFX9 vertex+fragment shader pair
   (full-screen triangle, solid color output). **Real research
   chunk** — graphics shaders need GFX9 vertex/fragment ABI
   (SPI conventions, position/color exports), not the OpenCL
@@ -158,7 +165,7 @@ need it.
   + `_one` + `_pair` + `native_pm4_draw_index_auto` in
   `src/backend_native.cyr`. Synthetic-but-aligned addresses pending
   Step 6.5's radv-validated set.
-- [ ] **6.5** — `native_pm4_build_render_clear_triangle(buf, …)` —
+- [x] **6.5** — `native_pm4_build_render_clear_triangle(buf, …)` —
   PM4 stream that runs a vertex+fragment dispatch to clear a
   render target with a solid color. Mirrors
   `native_pm4_build_compute_store_deadbeef` shape.
@@ -211,7 +218,7 @@ need it.
   render_pass_begin + draw + end), Backend struct grows 120 → 176
   bytes, append-after-kind preserved. All slots within fncall5
   ceiling. Code lands in Step 6.8.
-- [ ] **6.8** — `_backend_wgpu_*` and `_backend_native_*` wrappers.
+- [x] **6.8** — `_backend_wgpu_*` and `_backend_native_*` wrappers.
   - [x] **6.8 (a)** — pure layout extension in `src/backend.cyr`.
     7 new slot offset constants (RT create/release, pipeline
     create/release, pass begin/draw/end at +120..+168), bumped
@@ -270,7 +277,7 @@ need it.
     returns 1 (was 0 with v2 range pending). 819 v3 (was 712 at 6.6
     close) + 624 mabda CPU asserts green; smoke + lint clean.
     (Step 6.8(c), 2026-04-30).
-- [ ] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
+- [x] **6.9** — Public dispatchers + `programs/native_render_e2e.cyr`
   (mirror of `programs/render_e2e.cyr`).
   - [x] **6.9 (a)** — public dispatchers landed. 7 ctx-aware
     `gpu_render_*` fns in `src/render_target.cyr`,
@@ -317,7 +324,7 @@ need it.
 
 #### Phase D — surface + present on native (broken into chunks)
 
-- [ ] **7.1** — DRM/KMS device discovery: enumerate connectors,
+- [x] **7.1** — DRM/KMS device discovery: enumerate connectors,
   modes, encoders. `native_kms_init(fd)` returns a KmsState.
   Filed under `src/backend_native_kms.cyr` to keep it separate
   from the compute path. Three sub-bites:
@@ -690,10 +697,11 @@ This is the v3.0 hard truth. Scoping carefully.
   unchanged); zero behavioural changes.
 - [ ] At least one consumer (likely soorat or compute-heavy bijli)
   runs a CI matrix entry under `native` on AMD hardware.
-- [x] CPU assertions still pass — 624 (mabda.tcyr) + 697
-  (mabda_v3.tcyr) = **1321 passing as of session 26 close**, all
-  backend-agnostic, no regressions throughout backend abstraction
-  / texture / render PM4 composer work.
+- [x] CPU assertions still pass — 624 (mabda.tcyr) + 856
+  (mabda_v3.tcyr) + 297 (mabda_v3_phase_d.tcyr) = **1777 passing
+  as of Step 7.6 close**, all backend-agnostic, no regressions
+  throughout backend abstraction / texture / render PM4 composer
+  / Phase D KMS primitive work.
 - [ ] All 13 GPU benches pass under `native` on AMD (today they
   only run under `wgpu`).
 
@@ -756,9 +764,10 @@ Ordered roughly the way they'll need to run.
   on the new abstraction layer.
 - [ ] `VERSION` bump `2.5.0` → `3.0.0` + `cyrius.cyml` cross-check
   via `scripts/version-check.sh`
-- [x] Toolchain pin decision — `cyrius = "5.7.28"` in `cyrius.cyml`
-  as of 2026-04-28 (bumped during Step 4f.iii). Confirm at release
-  time whether to bump again or pin here.
+- [x] Toolchain pin decision — `cyrius = "5.7.36"` in `cyrius.cyml`
+  as of 2026-04-30 (bumped twice mid-session: 5.5.20 → 5.7.35 →
+  5.7.36 to absorb the distlib 64-KB truncation fix). Local
+  cyrius is at 5.7.42; optional re-pin before release.
 - [ ] `cyrius distlib` regenerate — `dist/mabda.cyr` will grow
   significantly (Backend layer + both backend implementations); CI
   gate must not drift
@@ -766,10 +775,13 @@ Ordered roughly the way they'll need to run.
   touched files) — `cyrius lint src/*.cyr programs/*.cyr`,
   `cyrius fmt --check`, `cyrius vet programs/smoke.cyr`
 - [x] **Split `tests/tcyr/mabda.tcyr`** into multiple smaller files
-  (Cleanup 1, 2026-04-28). `mabda.tcyr` for v2.x (624 assertions);
-  `mabda_v3.tcyr` for v3 backend-abstraction tests (227 assertions).
-  `Makefile` test target + CI workflows (`ci.yml`, `release.yml`)
-  run both. Lint clean on both files.
+  (Cleanup 1, 2026-04-28; further split 2026-04-30 during Step
+  7.1(b) to dodge the cyrlint 128 KiB cap). Three files now:
+  `mabda.tcyr` for v2.x (624 assertions), `mabda_v3.tcyr` for
+  v3 backend abstraction (856 assertions),
+  `mabda_v3_phase_d.tcyr` for v3 Phase D / KMS primitives (297
+  assertions). `Makefile` test target + CI workflows run all
+  three. Lint clean on all.
 - [ ] `.github/workflows/release.yml` tag filter + version-verify
   still work against the `v3.0.0` shape
 - [ ] Soak window — run the new bundle in CI for N days (suggest
@@ -795,31 +807,37 @@ These keep the v4.0 / v5.0 commitments visible from the v3.0 ship.
   `Resource` tracker texture-release once Phase C lands. Anything
   that the audit flags but doesn't block ship.
 
-## Recommended sequencing (refreshed 2026-04-28)
+## Recommended sequencing (refreshed 2026-04-30)
 
-The smallest-bites-first order. Each step is verifiable end-to-end
-before the next. **Steps 1–4 done; we're at the start of Step 5.**
+Smallest-bites-first order. Each step is verifiable end-to-end
+before the next. **Steps 1–6 done; we're at the start of Step 7.**
 
 1. ~~Backend abstraction smoke test~~ ✅
 2. ~~`backend_wgpu.cyr` filling all slots + refactor public API~~ ✅
 3. ~~Lift `native_compute_store` into `Backend.compute_dispatch`~~ ✅
 4. ~~Phase B.4 follow-ups (BO perms, error mapping, IB ring,
    Resource tracker)~~ ✅
-5. **Phase C native (texture + render pipeline)** — chunks 5.1–5.9
-   (texture) then 6.1–6.9 (render pipeline). At least 18 sub-steps;
-   budget weeks. Start with 5.1 (texture-create primitive) — small
-   bite that establishes the BO allocation pattern.
-6. **Phase D native (surface)** — chunks 7.1–7.7. Gated on Phase C
-   render path landing.
-7. **WGSL → GFX9 lowering** — chunks 8.1–8.10. Can be parallel to
-   Phase C/D once the SPIR-V vs WGSL frontend choice (8.1) is made.
-   May want to spike 8.1 alongside 5.x to surface design risk early.
-8. **Bench harness + matrix + perf docs** — Tier 3, once all four
-   programs pass under both backends.
-9. **Tier 4 documentation** — runs alongside everything; finalize
-   at end.
-10. **Tier 5 release engineering** — P(-1) audit, version bump,
-    distlib regen, soak, RC, ship.
+5. ~~Phase C native — texture (5.1–5.9) + render (6.1–6.10 prep).
+   Render path code-complete; SETCRTC and Layer-2 verify still
+   gated on either Hyprland-hostile master access or the headless
+   radv capture program.~~ ✅
+6. ~~Phase D KMS primitives (7.1–7.6) — discovery, modeset, FB,
+   page-flip, present, slot stubs all in tree. Master-acquisition
+   is logind-gated; deferred to v3.x or to 7.7's design.~~ ✅
+7. **7.7 — Phase D public API + e2e program.** Architecture
+   decisions (TTY/kiosk vs logind-aware, wgpu surface handle
+   protocol) + real slot wrappers replacing 7.6's stubs +
+   `programs/native_present_e2e.cyr`. Closes Phase D.
+8. **WGSL → GFX9 lowering** — chunks 8.1–8.10. Was queued as
+   parallel to 5–7; in practice 7.x landed first because Phase C
+   was the higher-risk path. Now the load-bearing pre-ship gate.
+   The frontend choice (8.1) is the first design call.
+9. **Bench harness + matrix + perf docs** — Tier 3. Needs at
+   least one consumer running on `native` to be meaningful.
+10. **Tier 4 documentation** — CLAUDE.md update, migration guide,
+    `[3.0.0-dev]` → `[3.0.0]` collapse.
+11. **Tier 5 release engineering** — P(-1) audit, version bump
+    2.5.0 → 3.0.0, distlib regen, soak, `v3.0.0-rc.1`, ship.
 
 ## Status snapshot (refreshed 2026-04-30)
 
@@ -828,10 +846,10 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
-| Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout + slot stubs in tree (7.1–7.6)**; only 7.7 (public API + real slot impls + e2e program) remains | 2026-04-30 |
-| Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
-| Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
+| Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.10 prep all landed; 6.5 Layer-2 verify + post-draw cache flush gated on headless radv capture program | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout + stubs in tree (7.1–7.6)**; only 7.7 (public API + real slot impls + e2e program) remains; HW exercise gated on logind master story | 2026-04-30 |
+| Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued; design call (WGSL frontend vs SPIR-V loader) is the next bite | — |
+| Tier 2 — Integration & regression | partial — CPU 624 + 856 + 297 = **1777 pass**; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |
 | Tier 4 — Documentation | partial — session 26 handoff filed; CHANGELOG `[3.0.0-dev]` updated; CLAUDE.md / migration guide / vidya field-notes pending | 2026-04-30 |
 | Tier 5 — Release engineering | partial — toolchain pin 5.7.36 + test split + dist regenerate (clean post-distlib-fix) landed; rest pending | 2026-04-30 |
@@ -936,3 +954,37 @@ punch-list work that future-you should know about.)
   3-file fix queued — handoff doc has the suggested commit message.
   **Lesson:** `cyrius build <prog>` ≠ `make build/<prog>` — only the
   Makefile path runs the GCC link that catches transitive deps.
+- **2026-04-30** — Phase C render closed end-to-end: 6.2 shader
+  bytes, 6.4 PM4 builders, 6.5 clear-triangle composer, 6.6
+  GFX-ring dispatch, 6.7 backend slot proposal, 6.8 wgpu+native
+  wrappers, 6.9 public dispatchers + e2e program, 6.10 prep
+  CACHE_FLUSH_AND_INV builder. The e2e program (`programs/native_render_e2e.cyr`)
+  builds clean; HW exercise gated on either Hyprland-hostile
+  master access or the headless radv capture program (Tier 2).
+- **2026-04-30** — Cyrius distlib 64-KB read-buffer truncation
+  surfaced + fixed upstream in 5.7.36. Pin 5.5.20 → 5.7.35 →
+  5.7.36 across the session. cyrius lint has the same class of
+  bug at 128 KiB (still upstream as of 5.7.42); workaround is
+  to keep test files under that cap. Caused the
+  `mabda_v3_phase_d.tcyr` split during 7.1(b).
+- **2026-04-30** — Phase D KMS primitives all landed (7.1–7.6).
+  Discovery (7.1 a/b/c), modeset path (7.2 a/b/c/d + 7.2(d.1)
+  master ioctls), framebuffer (7.3), page-flip (7.4), present
+  primitive (7.4(b)), backend slot layout (7.5) + stubs (7.6).
+  HW-verified up through PRIME bridge + AddFB2:
+  `render bo=1 card_handle=1 fb_id=145 PASS` on Cezanne. SETCRTC
+  + page-flip blocked by systemd-logind retaining DRM master in
+  the Hyprland session (saved as
+  `project_phase_d_master_logind_blocker` memory). Three
+  workarounds documented (vkms / no-compositor / stop
+  display-manager). Real architectural answer is logind-aware
+  delegation via dbus TakeDevice() — flagged as v3.x or as part
+  of 7.7's design choice between TTY/kiosk vs logind-aware.
+- **2026-04-30** — Decision deferred to 7.7: wgpu surface
+  consumer protocol (how `WGPUSurface` reaches the slot
+  abstraction) and native master-fd protocol (TTY/kiosk vs
+  logind). Both backends ship surface slots as stubs in 7.6 so
+  `backend_is_complete` succeeds without locking in either
+  consumer protocol. Real implementations land in 7.7 alongside
+  the public `gpu_surface_*` API and the
+  `programs/native_present_e2e.cyr` smoke.
