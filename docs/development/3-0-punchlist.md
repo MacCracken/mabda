@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.2(b) — SETCRTC primitive landed)
+**Last refresh:** 2026-04-30 (post Step 7.2(c) — PRIME bridge + AddFB2 HW-verified)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -409,6 +409,30 @@ need it.
     against 1080p60 timing). 153 phase_d + 836 v3 + 624 mabda
     CPU asserts green; smoke + lint + distlib clean.
     (Step 7.2(a), 2026-04-30).
+  - [x] **7.2 (c)** — PRIME cross-fd BO bridge.
+    `DRM_IOCTL_PRIME_HANDLE_TO_FD` (= `0xC00C642D`) +
+    `DRM_IOCTL_PRIME_FD_TO_HANDLE` (= `0xC00C642E`) ioctl numbers
+    re-derived from first principles, `drm_prime_handle` struct
+    shape (12 B; 3 fields: handle, flags, fd), `DRM_CLOEXEC`
+    (0x80000) + `DRM_RDWR` (0x2) flag constants. Low-level
+    `native_drm_prime_handle_to_fd` + `_fd_to_handle` ioctl
+    wrappers. High-level `native_kms_import_bo(card_fd, render_fd,
+    render_handle)` does the full export → import → close-dmabuf
+    sequence, returns the new card-fd handle (or 0 on failure).
+    The two ends become independent handles pointing at the same
+    underlying memory; closing one doesn't affect the other —
+    documented inline as a teardown-correctness reminder.
+    **Verified live on Cezanne**: `programs/native_kms_summary.cyr`
+    extended with an FB smoke that allocates a 256×256 GTT BO on
+    `/dev/dri/renderD128`, imports onto the master `card1` fd via
+    PRIME, AddFB2's it, prints the FB ID, and tears down. Output
+    on the dev box: `render bo=1 card_handle=1 fb_id=145 PASS`.
+    This single live run validates the entire 7.3 + 7.2(c)
+    structural chain — AddFB2 was previously only CPU-tested. 4
+    new CPU tests, 13 asserts (ioctl numbers, struct field
+    offsets, flag constants, null-safety on the high-level
+    bridge). 221 phase_d + 836 v3 + 624 mabda CPU asserts green;
+    smoke + lint + distlib clean. (Step 7.2(c), 2026-04-30).
   - [x] **7.2 (b)** — `DRM_IOCTL_MODE_SETCRTC` primitive.
     `DRM_IOCTL_MODE_SETCRTC` (= `0xC06864A2`) ioctl number,
     `drm_mode_crtc` struct shape (104 B; embeds the 68-byte
@@ -679,7 +703,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick HW-verified; 7.3 FB + 7.2(b) SETCRTC primitives in tree; **7.2(c) cross-fd PRIME bridge + e2e modeset next**; 7.4–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick + **7.2(c) PRIME bridge + 7.3 AddFB2 HW-verified**; 7.2(b) SETCRTC primitive in tree; **7.2(d) e2e modeset next** (needs tty / master); 7.4–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

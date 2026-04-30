@@ -6792,6 +6792,107 @@ fn native_kms_disable_crtc(fd, crtc_id) {
     return native_drm_mode_set_crtc(fd, &req);
 }
 
+# ================================================================
+# v3 Step 7.2(c) — PRIME cross-fd BO bridge
+# ================================================================
+# DRM PRIME exports a GEM BO from one fd's handle namespace as a
+# kernel-level dmabuf fd, which can then be re-imported on another
+# fd as a fresh handle. The two ends become independent handles
+# pointing at the same underlying memory; closing one does NOT
+# affect the other.
+#
+# Why we need this: KMS ioctls (AddFB2, SETCRTC) live on the master
+# fd (`/dev/dri/cardN`). The AMDGPU GEM allocator
+# (`native_bo_create_gtt`) typically runs on the render fd
+# (`/dev/dri/renderD128`) — that's the convention Mesa / radv
+# established for unprivileged GEM access. Bridging the two
+# requires PRIME.
+#
+# Direction matters:
+#   render_fd → HANDLE_TO_FD → dmabuf_fd → FD_TO_HANDLE → card_fd
+# The transient dmabuf fd is a regular Linux file descriptor; close
+# it after the second ioctl. Both render_fd's handle and card_fd's
+# handle remain valid independently and need separate GEM_CLOSE
+# calls when the consumer is done.
+#
+# Reference: drivers/gpu/drm/drm_prime.c.
+
+# struct drm_prime_handle (12 bytes, x86_64):
+#   +0: handle  (u32) — IN for HANDLE_TO_FD, OUT for FD_TO_HANDLE
+#   +4: flags   (u32) — IN: DRM_CLOEXEC | DRM_RDWR (HANDLE_TO_FD only)
+#   +8: fd      (s32) — OUT for HANDLE_TO_FD, IN for FD_TO_HANDLE
+var DRM_PRIME_HANDLE_SIZE   = 12;
+var DRM_PRIME_HANDLE_HANDLE = 0;
+var DRM_PRIME_HANDLE_FLAGS  = 4;
+var DRM_PRIME_HANDLE_FD     = 8;
+
+# DRM_IOCTL_PRIME_HANDLE_TO_FD — nr 0x2D, RW, sizeof = 12
+#   0xC0000000 | (12 << 16) | (0x64 << 8) | 0x2D == 0xC00C642D
+var DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D;
+
+# DRM_IOCTL_PRIME_FD_TO_HANDLE — nr 0x2E, RW, sizeof = 12
+#   0xC0000000 | (12 << 16) | (0x64 << 8) | 0x2E == 0xC00C642E
+var DRM_IOCTL_PRIME_FD_TO_HANDLE = 0xC00C642E;
+
+# Flags for HANDLE_TO_FD — these mirror the open(2) flags of the
+# resulting dmabuf fd. CLOEXEC is essentially mandatory (otherwise
+# fork+exec leaks the handle); RDWR is needed if the importer
+# wants write access (always true for KMS scanout BOs).
+var DRM_CLOEXEC = 0x80000;     # O_CLOEXEC
+var DRM_RDWR    = 0x2;         # O_RDWR
+
+# Low-level HANDLE_TO_FD ioctl. Caller fills handle + flags at
+# +0/+4; on success, fd is at +8. Returns 0 on success, negative
+# errno on failure.
+fn native_drm_prime_handle_to_fd(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, req);
+}
+
+# Low-level FD_TO_HANDLE ioctl. Caller fills fd at +8; on success,
+# handle is at +0. Returns 0 on success, negative errno on failure.
+fn native_drm_prime_fd_to_handle(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, req);
+}
+
+# High-level: bridge a BO from `render_fd`'s handle namespace into
+# `card_fd`'s. Returns the new card-fd handle on success, or 0 on
+# failure. The transient dmabuf fd is closed before return — the
+# caller only needs to track the two fd handles.
+#
+# Caller is responsible for closing both handles when done:
+#   native_gem_close(render_fd, render_handle);
+#   native_gem_close(card_fd,   card_handle);
+fn native_kms_import_bo(card_fd, render_fd, render_handle) {
+    if (card_fd <= 0)      { return 0; }
+    if (render_fd <= 0)    { return 0; }
+    if (render_handle == 0) { return 0; }
+
+    # ---- Step 1: HANDLE_TO_FD on render_fd ----
+    var exp_req[12];
+    memset(&exp_req, 0, DRM_PRIME_HANDLE_SIZE);
+    store32(&exp_req + DRM_PRIME_HANDLE_HANDLE, render_handle);
+    store32(&exp_req + DRM_PRIME_HANDLE_FLAGS,  DRM_CLOEXEC | DRM_RDWR);
+    var rc = native_drm_prime_handle_to_fd(render_fd, &exp_req);
+    if (rc != 0) { return 0; }
+    var dmabuf_fd = load32(&exp_req + DRM_PRIME_HANDLE_FD);
+    if (dmabuf_fd < 0) { return 0; }
+
+    # ---- Step 2: FD_TO_HANDLE on card_fd ----
+    var imp_req[12];
+    memset(&imp_req, 0, DRM_PRIME_HANDLE_SIZE);
+    store32(&imp_req + DRM_PRIME_HANDLE_FD, dmabuf_fd);
+    rc = native_drm_prime_fd_to_handle(card_fd, &imp_req);
+
+    # Close the transient dmabuf fd in BOTH branches — the kernel
+    # bumped its refcount when FD_TO_HANDLE succeeded (via the
+    # underlying dmabuf object), and on failure we never want to
+    # leak the fd anyway.
+    sys_close(dmabuf_fd);
+
+    if (rc != 0) { return 0; }
+    return load32(&imp_req + DRM_PRIME_HANDLE_HANDLE);
+}
+
 # --- buffer.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)

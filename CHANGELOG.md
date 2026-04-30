@@ -655,39 +655,87 @@ the embedded-modeinfo end-aligns-to-size sanity check,
 null-safety on both helpers covering all 6 invalid-arg cases for
 `set_crtc` plus 2 for `disable_crtc`.
 
-### Metrics — 2026-04-30 (post Step 7.2(b))
+### Added — 2026-04-30 (Step 7.2(c) — PRIME cross-fd BO bridge + AddFB2 HW-verified)
+
+The DRM PRIME ioctl pair that bridges a GEM BO from the render
+node's handle namespace into the master fd's, so a BO allocated
+via the render fd can be wrapped by AddFB2 on the master fd.
+**The end-to-end chain validated live on Cezanne in this bite.**
+
+- **`DRM_IOCTL_PRIME_HANDLE_TO_FD`** (= `0xC00C642D`) — converts
+  a render-fd handle to a kernel-level dmabuf fd.
+- **`DRM_IOCTL_PRIME_FD_TO_HANDLE`** (= `0xC00C642E`) — converts a
+  dmabuf fd to a master-fd handle (different from the render-fd
+  handle; the two refcount the same underlying memory but each
+  is closed independently).
+- **`drm_prime_handle`** struct shape (12 B; handle / flags / fd).
+  Same struct used for both directions — only which fields are
+  IN vs OUT swap.
+- **`DRM_CLOEXEC` (0x80000) + `DRM_RDWR` (0x2)** flag constants
+  for HANDLE_TO_FD. CLOEXEC is mandatory in practice (otherwise
+  fork+exec leaks the handle); RDWR is needed for KMS scanout
+  BOs which the kernel writes to.
+- **Low-level wrappers**: `native_drm_prime_handle_to_fd`,
+  `native_drm_prime_fd_to_handle`.
+- **High-level**: `native_kms_import_bo(card_fd, render_fd,
+  render_handle)` — runs both ioctls + closes the transient
+  dmabuf fd, returns the new card-fd handle (0 on failure).
+  Caller is responsible for closing both handles when done
+  (each fd has its own).
+
+**Live HW verification on Cezanne (2026-04-30):**
+`programs/native_kms_summary.cyr` was extended with an FB smoke
+section that allocates a 256×256 GTT BO on `/dev/dri/renderD128`,
+imports it onto the master `card1` fd via the PRIME bridge,
+calls `native_kms_add_fb_xrgb8888`, prints the FB ID, then
+cleans up. Real output:
+
+```
+fb smoke (render -> PRIME -> master AddFB2):
+  render bo=1 card_handle=1 fb_id=145 PASS
+```
+
+This single live run validates the entire 7.3 + 7.2(c)
+structural chain — AddFB2 was previously only CPU-tested.
+
+4 new CPU tests, 13 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl numbers re-derived, drm_prime_handle field offsets, flag
+constants, null-safety on the high-level bridge across all 3
+invalid-arg cases.
+
+### Metrics — 2026-04-30 (post Step 7.2(c))
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
 - `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **208 assertions** (was 187
-  at 7.3 close; +21 from 7.2(b)).
-- `src/backend_native_kms.cyr`: ~875 lines (was ~760 at 7.3 close;
-  +115 lines for SETCRTC primitive + struct + helpers).
-- `dist/mabda.cyr`: regenerated (10319 lines).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **221 assertions** (was 208
+  at 7.2(b) close; +13 from 7.2(c)).
+- `src/backend_native_kms.cyr`: ~970 lines (was ~875 at 7.2(b);
+  +95 lines for PRIME ioctls + bridge helper).
+- `programs/native_kms_summary.cyr`: ~215 lines (was ~165 at
+  7.2(a); +50 lines for the FB smoke section).
+- `dist/mabda.cyr`: regenerated (10420 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.2(b))
+### Next — 2026-04-30 (post Step 7.2(c))
 
-**Phase D ioctl primitives all in tree.** End-to-end modeset is
-two more bites away:
+**Phase D structural chain HW-verified up through AddFB2.** Only
+SETCRTC remains untested on hardware:
 
-1. **7.2(c) — cross-fd PRIME bridge.** `DRM_IOCTL_PRIME_HANDLE_TO_FD`
-   + `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctls + structs (16 bytes
-   each), low-level helpers, and a high-level
-   `native_kms_import_bo(card_fd, render_fd, render_handle)` that
-   does (handle → dmabuf fd via render_fd) → (dmabuf fd → handle
-   via card_fd) → close dmabuf fd. Returns the master-fd-namespace
-   handle that AddFB2 will accept. CPU-testable shape; HW exercise
-   in 7.2(d).
-2. **7.2(d) — end-to-end modeset driver.**
-   `native_kms_modeset(state, conn_id)` composes everything:
-   walk discovery → pick preferred mode → bridge a render-fd BO
-   to card-fd handle → AddFB2 → SETCRTC. First run on Cezanne
-   would visibly flip the desktop's modeset — biggest "real
-   thing happening" gate yet on Phase D.
-3. **7.4–7.7 — page-flip, present, release, public API.** v3.0
-   completion path for native surface present.
+1. **7.2(d) — end-to-end modeset driver.**
+   `native_kms_modeset(state, conn_id)` composes everything that's
+   already in tree: walk discovery → pick preferred mode → bridge
+   a render-fd BO to card-fd handle → AddFB2 → SETCRTC. The first
+   run would visibly flip the desktop's modeset — biggest "real
+   thing happening" gate yet on Phase D. Requires DRM master,
+   which the running compositor holds; needs to be exercised from
+   a tty (Ctrl-Alt-F2 drops Hyprland's master, leaving us free
+   to take it). Worth designing the program's "fill BO with
+   recognizable test pattern (e.g., red checkerboard)" detail
+   so the visual confirmation is unambiguous.
+2. **7.4–7.7 — page-flip, present, release, public API.** v3.0
+   completion path for native surface present, after 7.2(d)
+   proves modeset works.
 
 **Phase C render HW-gated items still pending:**
 
