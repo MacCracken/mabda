@@ -1,0 +1,200 @@
+# programs/native_kms_modeset_smoke.cyr — v3 Step 7.2(d) live test
+#
+# End-to-end modeset on the first connected connector. Composes
+# 7.1 discovery + 7.2(a) mode-pick + 7.2(b) SETCRTC + 7.2(c) PRIME
+# + 7.3 AddFB2. The result: the screen turns red for 3 seconds,
+# proving every step works on real hardware.
+#
+# **Run from a tty.** SETCRTC requires DRM master, which the
+# running compositor (Hyprland on this dev box) holds while it's
+# the active vt. Switch to an unused vt (Ctrl-Alt-F2) and run
+# from there — systemd-logind will hand master to whoever's on
+# the active vt.
+#
+# Exit codes:
+#   0   — modeset succeeded, screen flashed red, clean teardown
+#   1   — open `/dev/dri/cardN` failed (no master node found in 0..9)
+#   2   — open `/dev/dri/renderD128` failed
+#   3   — native_kms_init failed (kernel rejected MODE_GETRESOURCES)
+#   4   — native_kms_modeset_first_connected failed
+#         (rc < 0 maps to specific failure step — see source)
+#
+# rc decoding for code 4:
+#   -1  invalid args (programmer error, not runtime)
+#   -2  no connected connector found
+#   -3  connected connector has no current encoder
+#   -4  encoder ioctl failed
+#   -5  no usable CRTC in possible_crtcs mask (or out-of-range)
+#   -6  modes ioctl returned 0 modes
+#   -7  preferred mode has zero dimensions (kernel bug?)
+#   -8  bo_create_gtt failed (typical: ENOMEM, EACCES on render node)
+#   -9  PRIME bridge failed (cross-fd handle import)
+#   -10 AddFB2 failed (typical: EINVAL — pitch / format mismatch)
+#   -11 SETCRTC failed (typical: EACCES — not master; run from tty)
+
+include "src/lib.cyr"
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n) {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Same card scan as native_kms_summary — Linux numbers DRM primary
+# nodes in driver-load order, so we try card0..card9.
+fn _try_open_card(path_buf) {
+    var i = 0;
+    while (i < 10) {
+        store8(path_buf + 13, 48 + i);
+        var fd = syscall(2, path_buf, 0x2, 0);
+        if (fd >= 0) { return fd; }
+        i = i + 1;
+    }
+    return -2;
+}
+
+# Fill the BO with solid red. XRGB8888 LE memory layout is bytes:
+# [B, G, R, X] per pixel; setting the 32-bit word to 0x00FF0000
+# gives B=0, G=0, R=0xFF, X=0 → opaque red.
+fn _fill_red(addr, w, h, pitch) {
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        var row = addr + y * pitch;
+        while (x < w) {
+            store32(row + x * 4, 0x00FF0000);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Sleep N seconds via clock_nanosleep(2). syscall(230) is the x86_64
+# entry; flags=0 (relative time), clockid=CLOCK_MONOTONIC (1).
+fn _sleep_seconds(n) {
+    var ts[16];
+    store64(&ts + 0, n);
+    store64(&ts + 8, 0);
+    syscall(230, 1, 0, &ts, 0);
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+
+    print_cstr("mabda native modeset smoke (v3 Step 7.2(d))\n");
+    print_cstr("-------------------------------------------\n");
+    print_cstr("expect: screen turns solid red for 3 seconds, then restores\n\n");
+
+    # Open card master fd.
+    var path[16];
+    memset(&path, 0, 16);
+    store8(&path + 0,  47);    # /
+    store8(&path + 1,  100);   # d
+    store8(&path + 2,  101);   # e
+    store8(&path + 3,  118);   # v
+    store8(&path + 4,  47);    # /
+    store8(&path + 5,  100);   # d
+    store8(&path + 6,  114);   # r
+    store8(&path + 7,  105);   # i
+    store8(&path + 8,  47);    # /
+    store8(&path + 9,  99);    # c
+    store8(&path + 10, 97);    # a
+    store8(&path + 11, 114);   # r
+    store8(&path + 12, 100);   # d
+    var card_fd = _try_open_card(&path);
+    if (card_fd < 0) {
+        print_cstr("FAIL: open /dev/dri/cardN errno=");
+        print_i64(0 - card_fd);
+        print_cstr("\n");
+        return 1;
+    }
+    print_cstr("opened card_fd=");
+    print_i64(card_fd);
+    print_cstr("\n");
+
+    # Open render fd.
+    var render_fd = native_open_render_node();
+    if (render_fd < 0) {
+        print_cstr("FAIL: open render node errno=");
+        print_i64(0 - render_fd);
+        print_cstr("\n");
+        sys_close(card_fd);
+        return 2;
+    }
+    print_cstr("opened render_fd=");
+    print_i64(render_fd);
+    print_cstr("\n");
+
+    # Discovery.
+    var state = native_kms_init(card_fd);
+    if (state == 0) {
+        print_cstr("FAIL: native_kms_init\n");
+        sys_close(render_fd);
+        sys_close(card_fd);
+        return 3;
+    }
+    print_cstr("discovered ");
+    print_i64(kms_state_count_conn(state));
+    print_cstr(" connectors, ");
+    print_i64(kms_state_count_crtcs(state));
+    print_cstr(" crtcs\n");
+
+    # The big one.
+    var scanout[40];
+    memset(&scanout, 0, 40);
+    var rc = native_kms_modeset_first_connected(card_fd, render_fd,
+                                                state, &scanout);
+    if (rc != 0) {
+        print_cstr("FAIL: modeset rc=");
+        print_i64(rc);
+        if (rc == -11) {
+            print_cstr(" (EACCES likely — not master; run from a tty)");
+        }
+        print_cstr("\n");
+        native_kms_release(state);
+        sys_close(render_fd);
+        sys_close(card_fd);
+        return 4;
+    }
+    var w = load32(&scanout + NATIVE_KMS_SCANOUT_WIDTH);
+    var h = load32(&scanout + NATIVE_KMS_SCANOUT_HEIGHT);
+    var addr = load64(&scanout + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
+    print_cstr("PASS: modeset ");
+    print_i64(w);
+    print_cstr("x");
+    print_i64(h);
+    print_cstr(" connector=");
+    print_i64(load32(&scanout + NATIVE_KMS_SCANOUT_CONN_ID));
+    print_cstr(" crtc=");
+    print_i64(load32(&scanout + NATIVE_KMS_SCANOUT_CRTC_ID));
+    print_cstr(" fb=");
+    print_i64(load32(&scanout + NATIVE_KMS_SCANOUT_FB_ID));
+    print_cstr("\n");
+
+    # Fill with red. Pitch must match what AddFB2 was given —
+    # native_kms_modeset_first_connected uses 256-byte aligned
+    # pitch = ((w * 4 + 255) / 256) * 256.
+    var pitch_raw = w * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    _fill_red(addr, w, h, pitch);
+    print_cstr("filled BO with solid red, sleeping 3s ...\n");
+    _sleep_seconds(3);
+
+    # Teardown — release_scanout disables CRTC, removes FB, closes
+    # both handles, unmaps the BO.
+    native_kms_release_scanout(card_fd, render_fd, &scanout);
+    print_cstr("teardown complete\n");
+
+    native_kms_release(state);
+    sys_close(render_fd);
+    sys_close(card_fd);
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

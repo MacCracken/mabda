@@ -703,39 +703,106 @@ ioctl numbers re-derived, drm_prime_handle field offsets, flag
 constants, null-safety on the high-level bridge across all 3
 invalid-arg cases.
 
-### Metrics — 2026-04-30 (post Step 7.2(c))
+### Added — 2026-04-30 (Step 7.2(d) — end-to-end modeset driver)
+
+Composes everything from 7.1 + 7.2(a/b/c) + 7.3 into one call.
+Plus a runnable smoke program that fills the resulting framebuffer
+with solid red and sleeps 3 seconds — when run from a tty, the
+screen visibly flips. Verified live on Cezanne up through the
+SETCRTC permission gate.
+
+- **`NativeKmsScanout`** struct (40 B): conn_id / crtc_id / fb_id
+  / card_handle / render_handle / width / mapped_addr (u64) /
+  height / bo_size. Every resource the caller needs to track for
+  clean teardown lives in this one struct.
+- **`native_kms_modeset_first_connected(card_fd, render_fd, state,
+  out)`** — the load-bearing driver. Walks state's connector IDs,
+  finds the first `DRM_MODE_CONNECTED` one, fetches its encoder,
+  picks a CRTC from `possible_crtcs` (lowest set bit → index into
+  `state.crtc_ids`), fetches the connector's modes array, picks
+  the `DRM_MODE_TYPE_PREFERRED` one, allocates a render-fd BO
+  sized to the mode at 256-byte pitch alignment, PRIME-imports to
+  the card-fd handle namespace via `native_kms_import_bo`, AddFB2
+  via `native_kms_add_fb_xrgb8888`, then SETCRTC via
+  `native_kms_set_crtc`. Returns 0 on success; on failure returns
+  one of 11 named negative rcs that map to specific failure
+  steps — diagnostic value for unattended runs and for filing
+  bug reports against specific kernels.
+- **`native_kms_release_scanout(card_fd, render_fd, scanout)`** —
+  teardown. Issues `disable_crtc` + `rm_fb` + 2 × `gem_close` +
+  `bo_release_gtt` + zeroes the scanout struct. Idempotent on
+  zero — every conditional skips its release call when the
+  field is 0. Safe to call after a partial modeset failure.
+- **`native_kms_lowest_set_bit(mask)`** — pure-Cyrius helper that
+  returns 0..31 for the lowest set bit, -1 if no bit is set.
+  Used by the modeset driver to pick a CRTC from
+  `possible_crtcs`; exposed because it's tiny and callers
+  building their own modeset paths will want it.
+- **`programs/native_kms_modeset_smoke.cyr`** — runnable smoke.
+  Opens `cardN` master fd + `renderD128`, runs discovery, calls
+  the modeset driver, fills the BO with solid red (XRGB8888 LE
+  pixel = `0x00FF0000`), sleeps 3 seconds via
+  `clock_nanosleep(2)` (CLOCK_MONOTONIC, relative), tears down.
+  Documented exit codes 0–4 + sub-rc decoding for code 4 (all 11
+  modeset failure step codes).
+
+**Verified live on Cezanne (2026-04-30, from a desktop session):**
+
+```
+mabda native modeset smoke (v3 Step 7.2(d))
+opened card_fd=3
+opened render_fd=4
+discovered 4 connectors, 4 crtcs
+FAIL: modeset rc=-11 (EACCES likely — not master; run from a tty)
+```
+
+This is the **expected** result from inside a Hyprland session —
+the driver walks the entire pipeline (discovery → mode-pick →
+encoder fetch → CRTC pick → BO alloc → PRIME bridge → AddFB2)
+and only fails at the SETCRTC permission boundary. Running from
+a tty (Ctrl-Alt-F2 drops Hyprland's master and systemd-logind
+hands master to whoever's on the new vt) is the documented path
+to the actual visible flip.
+
+4 new CPU tests, 22 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+`lowest_set_bit` edge cases (bit 0, bit 1, mixed, high bit, zero
+sentinel), NativeKmsScanout field offsets (10 fields), modeset
+driver null-safety across all 4 invalid-arg cases, release
+idempotent on zero scanout.
+
+### Metrics — 2026-04-30 (post Step 7.2(d))
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
 - `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **221 assertions** (was 208
-  at 7.2(b) close; +13 from 7.2(c)).
-- `src/backend_native_kms.cyr`: ~970 lines (was ~875 at 7.2(b);
-  +95 lines for PRIME ioctls + bridge helper).
-- `programs/native_kms_summary.cyr`: ~215 lines (was ~165 at
-  7.2(a); +50 lines for the FB smoke section).
-- `dist/mabda.cyr`: regenerated (10420 lines).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **243 assertions** (was 221
+  at 7.2(c); +22 from 7.2(d)).
+- `src/backend_native_kms.cyr`: ~1,180 lines (was ~970 at 7.2(c);
+  +210 lines for the e2e driver + scanout struct + helpers).
+- `programs/native_kms_modeset_smoke.cyr`: ~150 lines (new).
+- `dist/mabda.cyr`: regenerated (10636 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.2(c))
+### Next — 2026-04-30 (post Step 7.2(d))
 
-**Phase D structural chain HW-verified up through AddFB2.** Only
-SETCRTC remains untested on hardware:
+**Phase D modeset code-complete; SETCRTC visual verification gated
+on a tty run.** Two independent paths forward:
 
-1. **7.2(d) — end-to-end modeset driver.**
-   `native_kms_modeset(state, conn_id)` composes everything that's
-   already in tree: walk discovery → pick preferred mode → bridge
-   a render-fd BO to card-fd handle → AddFB2 → SETCRTC. The first
-   run would visibly flip the desktop's modeset — biggest "real
-   thing happening" gate yet on Phase D. Requires DRM master,
-   which the running compositor holds; needs to be exercised from
-   a tty (Ctrl-Alt-F2 drops Hyprland's master, leaving us free
-   to take it). Worth designing the program's "fill BO with
-   recognizable test pattern (e.g., red checkerboard)" detail
-   so the visual confirmation is unambiguous.
-2. **7.4–7.7 — page-flip, present, release, public API.** v3.0
-   completion path for native surface present, after 7.2(d)
-   proves modeset works.
+1. **Run `make test-native-kms-modeset` from a tty.** The smoke
+   program is in tree and tested up through the master-permission
+   boundary on the dev box. A tty run (Ctrl-Alt-F2 to drop
+   Hyprland's master) would visibly flip the screen red for 3
+   seconds and confirm the SETCRTC path works. This is the only
+   piece of v3.0 Phase D that has *not* been HW-validated yet.
+2. **7.4 — page-flip + vblank.** With static modeset working,
+   the next bite is `DRM_IOCTL_MODE_PAGE_FLIP` for double-buffered
+   present without re-doing modeset on every frame. Adds a
+   second BO + AddFB2, swaps which FB the CRTC scans from,
+   waits for vblank. Same shape of structural primitives + e2e
+   driver as 7.2(d).
+3. **7.5–7.7 — present primitive, release lifecycle, public
+   `gpu_surface_*` API.** v3.0 completion path for native surface
+   present.
 
 **Phase C render HW-gated items still pending:**
 

@@ -1012,6 +1012,18 @@ fn native_drm_prime_fd_to_handle(fd, req) {
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, req);
 }
 
+# Pick the lowest set bit of a u32 bitmask. Returns 0..31 for the
+# bit index, or -1 if no bit is set. Used to find the first
+# usable CRTC from an encoder's `possible_crtcs` mask.
+fn native_kms_lowest_set_bit(mask) {
+    var i = 0;
+    while (i < 32) {
+        if (((mask / (1 << i)) & 1) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
 # High-level: bridge a BO from `render_fd`'s handle namespace into
 # `card_fd`'s. Returns the new card-fd handle on success, or 0 on
 # failure. The transient dmabuf fd is closed before return — the
@@ -1049,4 +1061,208 @@ fn native_kms_import_bo(card_fd, render_fd, render_handle) {
 
     if (rc != 0) { return 0; }
     return load32(&imp_req + DRM_PRIME_HANDLE_HANDLE);
+}
+
+# ================================================================
+# v3 Step 7.2(d) — End-to-end modeset driver
+# ================================================================
+# Composes everything from 7.1 + 7.2(a/b/c) + 7.3 into a single
+# call: walk the discovered topology, find a connected connector,
+# pick its preferred mode, alloc a render-fd BO sized to the mode,
+# bridge it via PRIME, AddFB2 it, SETCRTC. The result is a live
+# scanout — running the smoke program from a tty makes the screen
+# turn red (the FB content) until release.
+#
+# Failure modes worth knowing about:
+#   - SETCRTC returns -EACCES → not master. Run from a tty
+#     (Ctrl-Alt-F2 drops the running compositor's master) and
+#     systemd-logind will hand master to the new process via the
+#     vt-active mechanism.
+#   - SETCRTC returns -EINVAL → mode/CRTC/encoder mismatch. The
+#     algorithm picks "lowest bit of possible_crtcs", which always
+#     yields a valid CRTC for the encoder per kernel guarantees.
+#     If we still see EINVAL, suspect mode struct corruption
+#     (memcpy from the wrong offset, etc.).
+#   - SETCRTC returns -EBUSY → CRTC already in use. Disable the
+#     conflicting CRTC first (native_kms_disable_crtc) or pick
+#     a different bit from possible_crtcs.
+
+# NativeKmsScanout layout (40 bytes) — bag of resources to track
+# for clean teardown after a successful modeset.
+#   +0:  conn_id        (u32) — bound connector
+#   +4:  crtc_id        (u32) — bound CRTC
+#   +8:  fb_id          (u32) — kernel framebuffer ID (master fd)
+#   +12: card_handle    (u32) — BO's master-fd handle (PRIME-imported)
+#   +16: render_handle  (u32) — BO's render-fd handle (allocator-side)
+#   +20: width          (u32) — pixels
+#   +24: mapped_addr    (u64) — CPU-visible mmap of the BO bytes
+#   +32: height         (u32) — pixels
+#   +36: bo_size        (u32) — bytes; for native_bo_release_gtt
+var NATIVE_KMS_SCANOUT_SIZE         = 40;
+var NATIVE_KMS_SCANOUT_CONN_ID      = 0;
+var NATIVE_KMS_SCANOUT_CRTC_ID      = 4;
+var NATIVE_KMS_SCANOUT_FB_ID        = 8;
+var NATIVE_KMS_SCANOUT_CARD_HANDLE  = 12;
+var NATIVE_KMS_SCANOUT_RENDER_HANDLE = 16;
+var NATIVE_KMS_SCANOUT_WIDTH        = 20;
+var NATIVE_KMS_SCANOUT_MAPPED_ADDR  = 24;
+var NATIVE_KMS_SCANOUT_HEIGHT       = 32;
+var NATIVE_KMS_SCANOUT_BO_SIZE      = 36;
+
+# Drive the full modeset on the first connected connector found.
+# Caller provides:
+#   card_fd    — master fd opened on /dev/dri/cardN
+#   render_fd  — opened on /dev/dri/renderD128
+#   state      — populated KmsState from native_kms_init(card_fd)
+#   out        — caller-allocated 40-byte NativeKmsScanout
+# On success returns 0 and `out` is populated; on failure returns
+# negative and `out` is not guaranteed valid (caller should not
+# release).
+fn native_kms_modeset_first_connected(card_fd, render_fd, state, out) {
+    if (card_fd <= 0)   { return -1; }
+    if (render_fd <= 0) { return -1; }
+    if (state == 0)     { return -1; }
+    if (out == 0)       { return -1; }
+    memset(out, 0, NATIVE_KMS_SCANOUT_SIZE);
+
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var crtc_count = kms_state_count_crtcs(state);
+    var crtc_ids   = kms_state_crtc_ids(state);
+
+    # ---- Step A: walk connectors, find first CONNECTED ----
+    var i = 0;
+    var conn_id = 0;
+    var encoder_id = 0;
+    var meta[80];
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(card_fd, &meta) == 0) {
+            var status = load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION);
+            if (status == DRM_MODE_CONNECTED) {
+                conn_id = cid;
+                encoder_id = load32(&meta + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+                i = conn_count;   # break
+            }
+        }
+        i = i + 1;
+    }
+    if (conn_id == 0) { return -2; }   # no connected connector
+
+    # ---- Step B: get encoder, pick CRTC from possible_crtcs ----
+    # If the connector reports encoder_id == 0 (connected but not
+    # currently bound), fall back to the connector's first usable
+    # encoder via the encoders_ptr array — Step 7.1(c) coverage.
+    # For v2-native simplicity, require an existing encoder_id.
+    if (encoder_id == 0) { return -3; }
+    var enc_req[20];
+    memset(&enc_req, 0, DRM_MODE_GET_ENCODER_SIZE);
+    store32(&enc_req + DRM_MODE_GET_ENCODER_ID, encoder_id);
+    if (native_drm_mode_get_encoder(card_fd, &enc_req) != 0) { return -4; }
+    var possible_crtcs = load32(&enc_req + DRM_MODE_GET_ENCODER_POSS_CRTCS);
+    var crtc_idx = native_kms_lowest_set_bit(possible_crtcs);
+    if (crtc_idx < 0)            { return -5; }
+    if (crtc_idx >= crtc_count)  { return -5; }
+    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+
+    # ---- Step C: get connector modes, pick preferred ----
+    var modes_count[4];
+    store32(&modes_count, 0);
+    var modes = native_kms_get_connector_modes(card_fd, conn_id, &modes_count);
+    if (modes == 0) { return -6; }
+    var n_modes = load32(&modes_count);
+    if (n_modes == 0) { return -6; }
+    var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
+    var width  = native_kms_mode_hdisplay(modes, mode_idx);
+    var height = native_kms_mode_vdisplay(modes, mode_idx);
+    if (width <= 0)  { return -7; }
+    if (height <= 0) { return -7; }
+
+    # ---- Step D: allocate render-fd BO sized to mode ----
+    # Pitch rounded up to 256-byte alignment (AMD scanout requires it
+    # on most Vega-era hardware; pre-Vega is more permissive but the
+    # alignment never hurts).
+    var pitch_raw = width * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    var bo_size = pitch * height;
+    var bo_buf[16];
+    var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);
+    if (rc_bo != 0) { return -8; }
+    var render_handle = load64(&bo_buf + 0);
+    var mapped_addr   = load64(&bo_buf + 8);
+
+    # ---- Step E: PRIME-import to card-fd handle namespace ----
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -9;
+    }
+
+    # ---- Step F: AddFB2 ----
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle,
+                                           width, height, pitch);
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -10;
+    }
+
+    # ---- Step G: SETCRTC ----
+    # Connector list is a single u32 holding `conn_id`. The mode
+    # ptr indexes into the modes array we got in Step C — the
+    # array sticks around until the modes pointer is freed (which
+    # we don't do here; the bump allocator outlives this call).
+    var conn_list[4];
+    store32(&conn_list, conn_id);
+    var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    var rc = native_kms_set_crtc(card_fd, crtc_id, fb_id,
+                                 &conn_list, 1, mode_ptr);
+    if (rc != 0) {
+        native_kms_rm_fb(card_fd, fb_id);
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -11;
+    }
+
+    # Success — populate the scanout bag.
+    store32(out + NATIVE_KMS_SCANOUT_CONN_ID,       conn_id);
+    store32(out + NATIVE_KMS_SCANOUT_CRTC_ID,       crtc_id);
+    store32(out + NATIVE_KMS_SCANOUT_FB_ID,         fb_id);
+    store32(out + NATIVE_KMS_SCANOUT_CARD_HANDLE,   card_handle);
+    store32(out + NATIVE_KMS_SCANOUT_RENDER_HANDLE, render_handle);
+    store32(out + NATIVE_KMS_SCANOUT_WIDTH,         width);
+    store32(out + NATIVE_KMS_SCANOUT_HEIGHT,        height);
+    store32(out + NATIVE_KMS_SCANOUT_BO_SIZE,       bo_size);
+    store64(out + NATIVE_KMS_SCANOUT_MAPPED_ADDR,   mapped_addr);
+    return 0;
+}
+
+# Tear down a successful scanout. Disables the CRTC, removes the
+# FB, closes both fd handles, unmaps the BO. Idempotent on a
+# zeroed scanout struct (each zero check skips its release).
+# Returns 0.
+fn native_kms_release_scanout(card_fd, render_fd, scanout) {
+    if (scanout == 0) { return 0; }
+    var crtc_id       = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+    var fb_id         = load32(scanout + NATIVE_KMS_SCANOUT_FB_ID);
+    var card_handle   = load32(scanout + NATIVE_KMS_SCANOUT_CARD_HANDLE);
+    var render_handle = load32(scanout + NATIVE_KMS_SCANOUT_RENDER_HANDLE);
+    var mapped_addr   = load64(scanout + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
+    var bo_size       = load32(scanout + NATIVE_KMS_SCANOUT_BO_SIZE);
+
+    if (card_fd > 0) {
+        if (crtc_id != 0)     { native_kms_disable_crtc(card_fd, crtc_id); }
+        if (fb_id != 0)       { native_kms_rm_fb(card_fd, fb_id); }
+        if (card_handle != 0) { native_gem_close(card_fd, card_handle); }
+    }
+    if (render_fd > 0) {
+        if (render_handle != 0) {
+            native_bo_release_gtt(render_fd, render_handle,
+                                  mapped_addr, bo_size);
+        }
+    }
+    memset(scanout, 0, NATIVE_KMS_SCANOUT_SIZE);
+    return 0;
 }

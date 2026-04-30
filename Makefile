@@ -248,6 +248,18 @@ build/native_kms_summary: programs/native_kms_summary.cyr src/*.cyr
 test-native-kms-summary: build/native_kms_summary
 	./build/native_kms_summary
 
+# v3 Step 7.2(d) — end-to-end modeset live test. Requires DRM
+# master — run from a tty (Ctrl-Alt-F2 to drop the running
+# compositor's master). Screen turns solid red for 3 seconds
+# on success.
+build/native_kms_modeset_smoke: programs/native_kms_modeset_smoke.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_kms_modeset_smoke.cyr $@
+
+.PHONY: test-native-kms-modeset
+test-native-kms-modeset: build/native_kms_modeset_smoke
+	./build/native_kms_modeset_smoke
+
 # v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
 # Used to differentiate "is this bug in our direct ioctls?" (spike =
 # libdrm-canonical, hangs identically) from "is shader-dispatch the

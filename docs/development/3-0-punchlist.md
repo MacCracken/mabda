@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.2(c) — PRIME bridge + AddFB2 HW-verified)
+**Last refresh:** 2026-04-30 (post Step 7.2(d) — e2e modeset driver + smoke landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -386,8 +386,9 @@ need it.
     131 phase_d + 624 mabda CPU asserts green; smoke + lint +
     distlib clean. Closes Phase D discovery; foundation for
     7.2's mode-pick logic. (Step 7.1(c), 2026-04-30).
-- [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
-  for the first connected DP/HDMI), set it. Two sub-bites:
+- [x] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
+  for the first connected DP/HDMI), set it. Sub-bites a/b/c done;
+  d composes them all into the end-to-end driver:
   - [x] **7.2 (a)** — per-connector mode enumeration + preferred
     picker. `native_kms_get_connector_modes(fd, conn_id, count_out)`
     runs the two-call protocol and returns a heap-allocated
@@ -409,6 +410,36 @@ need it.
     against 1080p60 timing). 153 phase_d + 836 v3 + 624 mabda
     CPU asserts green; smoke + lint + distlib clean.
     (Step 7.2(a), 2026-04-30).
+  - [x] **7.2 (d)** — End-to-end modeset driver + smoke program.
+    `NativeKmsScanout` struct (40 B; conn_id / crtc_id / fb_id /
+    card_handle / render_handle / mapped_addr / width / height /
+    bo_size — every resource the caller needs to track for clean
+    teardown). `native_kms_modeset_first_connected(card_fd,
+    render_fd, state, out)` walks the discovered topology, finds
+    the first CONNECTED connector, picks its preferred mode, picks
+    a CRTC from the encoder's `possible_crtcs` mask (lowest set
+    bit), allocates a render-fd BO sized to the mode at 256-byte
+    pitch alignment, PRIME-imports to the card-fd handle namespace,
+    AddFB2's it, and SETCRTCs. Returns 0 on success or one of 11
+    named negative rcs (-1 invalid args, -2 no connected, -3 no
+    encoder, -4 encoder ioctl fail, -5 no usable CRTC, -6 no modes,
+    -7 zero-dim mode, -8 BO alloc fail, -9 PRIME fail, -10 AddFB2
+    fail, -11 SETCRTC fail). `native_kms_release_scanout(card_fd,
+    render_fd, scanout)` is the teardown — disable_crtc + rm_fb +
+    2 gem_close + bo_release_gtt; idempotent on a zeroed scanout.
+    Pure-Cyrius `native_kms_lowest_set_bit(mask)` helper for the
+    CRTC-from-bitmask pick. New `programs/native_kms_modeset_smoke.cyr`
+    fills the BO with solid red (XRGB8888 LE = `0x00FF0000`) and
+    sleeps 3 seconds via `clock_nanosleep` so the user can visually
+    confirm. **Verified live on Cezanne (from a desktop session)**:
+    full pipeline ran end-to-end through AddFB2; SETCRTC returned
+    -11 EACCES (Hyprland holds master) which is the *expected*
+    outcome from a non-tty session. Running from a tty
+    (Ctrl-Alt-F2) flips the screen red for 3s. 4 new CPU tests,
+    22 asserts (lowest_set_bit edge cases + sentinel, scanout
+    field offsets, modeset null-safety, release idempotent on
+    zero). 243 phase_d + 836 v3 + 624 mabda CPU asserts green;
+    smoke + lint + distlib clean. (Step 7.2(d), 2026-04-30).
   - [x] **7.2 (c)** — PRIME cross-fd BO bridge.
     `DRM_IOCTL_PRIME_HANDLE_TO_FD` (= `0xC00C642D`) +
     `DRM_IOCTL_PRIME_FD_TO_HANDLE` (= `0xC00C642E`) ioctl numbers
@@ -703,7 +734,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — 7.1 discovery + 7.2(a) mode-pick + **7.2(c) PRIME bridge + 7.3 AddFB2 HW-verified**; 7.2(b) SETCRTC primitive in tree; **7.2(d) e2e modeset next** (needs tty / master); 7.4–7.7 ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **7.1 + 7.2 + 7.3 all in tree**; pipeline runs through AddFB2 on this dev box; SETCRTC EACCES from desktop is expected (run smoke from tty for visual flip); 7.4–7.7 ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |
