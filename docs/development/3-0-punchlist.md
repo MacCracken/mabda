@@ -797,36 +797,42 @@ Ordered roughly the way they'll need to run.
 These keep the v4.0 / v5.0 commitments visible from the v3.0 ship.
 
 - [ ] **`samvada` package — scaffold during v3.0, fill in
-  v3.x.** Carries the realization of
-  `gpu_surface_configure_native_logind` (today a stub returning
-  `GPU_ERR_NOT_IMPLEMENTED`). Lives as a separate Cyrius
-  package alongside `sakshi` / `patra` / `sigil` — own repo,
-  authored as `src/*.cyr`, bundled via `cyrius distlib` into
-  `dist/samvada.cyr`, consumed by mabda (and any other AGNOS
-  client) through `[deps.samvada]` in `cyrius.cyml`. Name picked
-  2026-04-30: Sanskrit *saṃvāda* "dialogue," ASCII form
-  (no macron) for filesystem / Makefile / git friendliness. Scope
-  for the logind subset: ~500–1000 LoC pure Cyrius covering
-  system-bus socket connect, SASL EXTERNAL auth, message
-  marshalling (header fields + type sigs + alignment),
-  method-call / signal-listen plumbing, minimal type system
-  (int32 / uint32 / string / object_path / unix_fd).
-  **Scaffold this session**: init repo at `~/Repos/samvada`,
-  README, `cyrius.cyml` mirroring sakshi's shape, empty
-  `src/lib.cyr` include chain stub, `src/samvada.cyr` with
-  module header + placeholder fn, `tests/tcyr/samvada.tcyr`
-  smoke, `.github/workflows/ci.yml`, `Makefile` test target,
+  v3.x with C shim, retire at v4.0.** Carries the realization
+  of `gpu_surface_configure_native_logind` (today a stub
+  returning `GPU_ERR_NOT_IMPLEMENTED`). Lives as a separate
+  Cyrius package alongside `sakshi` / `patra` / `sigil` — own
+  repo, authored as `src/*.cyr`, bundled via `cyrius distlib`
+  into `dist/samvada.cyr`, consumed by mabda (and any other
+  AGNOS client) through `[deps.samvada]` in `cyrius.cyml`. Name
+  picked 2026-04-30: Sanskrit *saṃvāda* "dialogue," ASCII form
+  (no macron) for filesystem / Makefile / git friendliness.
+  **Architectural strategy** (revised 2026-04-30): treat
+  `samvada` as the dbus peer of mabda's wgpu C-launcher. v3.x
+  ships a C shim around `libsystemd`'s `sd_bus_*` API
+  (~200 LoC C + ~150 LoC Cyrius bindings, mirrors
+  `mabda/deps/wgpu_main.c` function-table pattern). v4.0
+  retires both C-shim deps together — wgpu-native retires for
+  AMD (existing roadmap commitment), `samvada`'s C shim gets
+  replaced by pure-Cyrius dbus or removed entirely depending
+  on how the v4.0 logind story evolves. **Scaffold this
+  session**: init repo at `~/Repos/samvada`, README,
+  `cyrius.cyml` mirroring sakshi's shape, empty `src/lib.cyr`
+  include chain stub, `src/samvada.cyr` with module header +
+  placeholder fn, `deps/samvada_main.c` C-shim entry point
+  stub (mirrors `mabda/deps/wgpu_main.c`),
+  `tests/tcyr/samvada.tcyr` smoke,
+  `.github/workflows/ci.yml`, `Makefile` test target,
   `VERSION = 0.0.1`, GPL-3.0-only `LICENSE`, `CHANGELOG.md`
-  with `[0.0.1] — repo initialized` entry. Real protocol
-  implementation is a v3.x project (multi-week). Pure-Cyrius
-  posture matches mabda's "own the stack" stance — the C-shim
-  alternative (libsystemd link) would be ~200 LoC faster but
-  adds a foreign dep. Design captured in
+  with `[0.0.1] — repo initialized` entry. v3.x implementation
+  effort: ~3–5 sessions of `sd_bus` plumbing (system-bus
+  connect via TakeDevice, Pause/ResumeDevice signal handlers,
+  GetSession dispatch). Design captured in
   `docs/proposals/v3-surface-api-design.md` § "v3.x logind
-  realization — `samvada` package". When `samvada` is ready,
-  swap the stub body in
-  `_backend_native_surface_configure_logind` and consumers
-  that already called the API in v3.0 Just Work without code
+  realization — `samvada` package"; v4.0 retirement noted in
+  `docs/development/roadmap.md` § v4.0. When `samvada` is
+  ready, swap the stub body in
+  `_backend_native_surface_configure_logind` and consumers that
+  already called the API in v3.0 Just Work without code
   changes.
 - [ ] **ADR 007 placeholder** for NVIDIA native (v4.0). Status:
   `Deferred to v4.0`. Single page; documents the

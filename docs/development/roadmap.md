@@ -335,6 +335,17 @@ the `Backend` interface:
   errors out, or the AMD-specific wgpu wiring is removed
   (the wgpu *binding* stays for NVIDIA + Intel; AMD consumers no
   longer have a wgpu route).
+- **`samvada` C-shim retirement.** The `samvada` package's
+  v3.x C shim around `libsystemd`'s `sd_bus_*` (mirroring
+  mabda's `wgpu_main.c` pattern) gets replaced by a pure-Cyrius
+  dbus marshaller, OR removed entirely if the v4.0 logind story
+  evolves (e.g., kernel-level master delegation lands in a way
+  that obviates dbus). Treated as a peer of the wgpu-native
+  retirement: both C-shim deps for v3.x feature surfaces drop
+  together at v4.0. If the pure-Cyrius dbus implementation
+  isn't ready, the C shim can survive into v4.x — but the
+  commitment is "both C-shim deps go at v4.0 if we ship them
+  in v3.x."
 
 ---
 

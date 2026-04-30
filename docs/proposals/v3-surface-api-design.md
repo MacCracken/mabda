@@ -437,24 +437,34 @@ through `[deps.samvada]` in `cyrius.cyml` which symlinks the
 bundle into the consumer's `lib/samvada.cyr`). Not in mabda's
 tree (mabda is a GPU library; dbus is wrong owner) and not in
 cyrius stdlib (stdlib is for "every Cyrius program needs this"
-— dbus is system-services protocol). **Scope for the logind
-subset**: ~500–1000 lines of pure Cyrius covering system-bus
-socket connect, SASL EXTERNAL auth, message marshalling (header
-fields, type signatures, alignment), method-call + signal
-handling, and a minimal type system (int32 / uint32 / string /
-object_path / unix_fd). Pure-Cyrius posture matches mabda's
-"own the stack" stance — the C-shim-around-libsystemd
-alternative would be ~200 LoC faster but adds an external
-link dep to mabda. The mabda surface API does **not** change
-when this lands: only `_backend_native_surface_configure`'s
-logind branch swaps from "return `GPU_ERR_NOT_IMPLEMENTED`" to
-real `samvada` calls. Consumers that called
-`gpu_surface_configure_native_logind` in v3.0 (and saw the stub
-error) Just Work in v3.x without code changes. Package scaffold
-is filed as a Tier 6 follow-up in the v3.0 punchlist; the
-scaffold itself (empty repo, cyrius.cyml, CI stub) is a
-v3.0-era task — real protocol implementation is multi-week
-v3.x work.
+— dbus is system-services protocol).
+
+**Architectural strategy: C-shim era through v3.x, retired at
+v4.0.** `samvada` v3.x ships a C shim around `libsystemd`'s
+`sd_bus_*` API — ~200 LoC C + ~150 LoC Cyrius bindings,
+mirroring `mabda/deps/wgpu_main.c`'s function-table pattern.
+This is the dbus peer of mabda's wgpu C-launcher. **At v4.0,
+both C-shim deps drop together** — the wgpu-native binding
+retires for AMD (per the existing roadmap commitment), and
+`samvada`'s C shim either gets replaced by a pure-Cyrius dbus
+marshaller (~500–1000 LoC) or removed entirely if the v4.0
+logind story evolves (e.g., kernel-level master delegation
+obviates dbus). Pure-Cyrius posture remains the long-term
+target; the C shim is the pragmatic v3.x stop-gap that lets
+logind support actually ship without a multi-week pure-Cyrius
+detour.
+
+The mabda surface API does **not** change when `samvada`
+lands: only `_backend_native_surface_configure`'s logind
+branch swaps from "return `GPU_ERR_NOT_IMPLEMENTED`" to real
+`samvada` calls. Consumers that called
+`gpu_surface_configure_native_logind` in v3.0 (and saw the
+stub error) Just Work in v3.x without code changes. Package
+scaffold is filed as a Tier 6 follow-up in the v3.0 punchlist;
+the scaffold itself (empty repo, `cyrius.cyml`,
+`deps/samvada_main.c` C-shim entry point, CI stub) is a
+v3.0-era task — the real protocol implementation (`sd_bus`
+calls + Cyrius wrappers) is v3.x work, ~3–5 sessions.
 
 ## Open questions for review
 
