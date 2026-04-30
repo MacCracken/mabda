@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.5 — backend surface slot layout landed)
+**Last refresh:** 2026-04-30 (post Step 7.6 — surface slot stubs wired, both backends complete)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -583,8 +583,35 @@ need it.
   doc revision is a sub-task of 7.7's public-API design where
   the architectural questions (TTY-only vs logind-aware) get
   resolved. (Step 7.5, 2026-04-30).
-- [ ] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
-  wrappers.
+- [x] **7.6** — `_backend_wgpu_surface_*` + `_backend_native_surface_*`
+  slot wrappers — shipped as **stubs**, both backends. Each side
+  installs 4 fns (configure / acquire / present / release) that
+  return 0 or `GPU_ERR_OTHER`; both `backend_wgpu_new` +
+  `backend_native_new` now wire all 25 slots and pass
+  `backend_is_complete` (extended to walk the v3 surface range).
+  Real implementations defer to **7.7** alongside the public
+  API design — both backends have an unresolved consumer-side
+  protocol question that 7.7 settles:
+  - **wgpu**: needs the `WGPUSurface` handle (window-derived) at
+    `surface_configure` time. The current slot signature
+    `(ctx, w, h)` doesn't carry one. 7.7 either adds a
+    `gpu_context_register_surface_wgpu(ctx, handle)` side
+    channel, or extends GpuContext layout, or grows the slot
+    signature.
+  - **native**: needs the card master fd (separate from the
+    render fd that ctx already holds). 7.7 picks between
+    "TTY/kiosk model — caller manages master" vs "logind-aware
+    delegation via dbus TakeDevice". The PRIME bridge
+    (7.2(c)), modeset driver (7.2(d)), and present primitive
+    (7.4(b)) are all ready; just need the master-fd story.
+
+  Inline source comments document both questions and point at
+  the v2 `src/surface.cyr` API as the wgpu-consumer escape
+  hatch until 7.7 lands. 10 new layout asserts in
+  `tests/tcyr/mabda_v3.tcyr` (extended `is_complete_detects_missing_slot`
+  to walk v3, plus per-backend "all v3 slots filled" sub-tests).
+  856 v3 + 297 phase_d + 624 mabda CPU asserts green; smoke +
+  lint + distlib clean. (Step 7.6, 2026-04-30).
 - [ ] **7.7** — Public dispatchers + `programs/native_present_e2e.cyr`
   (open a window, render a clear, present, hold for 1s, exit).
 
@@ -802,7 +829,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout in tree (7.1–7.5)**; wrappers (7.6) + public API (7.7) ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **KMS primitives + backend slot layout + slot stubs in tree (7.1–7.6)**; only 7.7 (public API + real slot impls + e2e program) remains | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

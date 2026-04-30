@@ -919,6 +919,53 @@ question (TTY-only model vs logind-aware compositor delegation)
 is part of the 7.7 public-API design and writing the proposal
 now would lock in choices that 7.7 will need to revisit.
 
+### Added — 2026-04-30 (Step 7.6 — surface slot stubs, both backends)
+
+Both `backend_wgpu_new` and `backend_native_new` now install all
+25 slots — the v3 surface range (4 slots × 8 = 32 bytes) is
+filled with stub fns that return 0 or `GPU_ERR_OTHER`.
+`backend_is_complete` extended to walk the v3 range; both
+backends pass.
+
+- **`_backend_wgpu_surface_{configure,acquire,present,release}`**
+  — stubs in `src/backend_wgpu.cyr`. Documented inline that
+  wgpu consumers needing real surface support should use the
+  v2 `src/surface.cyr` `surface_state_*` API directly until 7.7
+  lands the consumer-side window-handle protocol.
+- **`_backend_native_surface_{configure,acquire,present,release}`**
+  — stubs in `src/backend_native.cyr`. Documented inline that
+  the master-fd-vs-render-fd story (and the logind delegation
+  question) settles in 7.7.
+
+The stubs are intentional — both backends have an unresolved
+consumer-side protocol question that 7.7 resolves alongside
+the public API design. Wiring stubs now keeps the abstraction
+layer "structurally complete" (every slot non-null) without
+locking in either consumer protocol.
+
+10 new layout asserts in `tests/tcyr/mabda_v3.tcyr`:
+- `test_backend_is_complete_detects_missing_slot` extended to
+  walk v3 (the "v0+v1+v2 alone is no longer complete" pattern,
+  matching the 6.8(b) → 6.8(c) staging).
+- `test_backend_wgpu_new_is_complete` + `_native_new_is_complete`
+  each check all 4 v3 slots are filled.
+
+### Metrics — 2026-04-30 (post Step 7.6)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: **856 assertions** (was 846 at
+  7.5 close; +10 from 7.6 stub-wiring tests).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: 297 assertions (unchanged).
+- `src/backend.cyr`: ~170 lines (+5 for v3 range walk in
+  `is_complete`).
+- `src/backend_wgpu.cyr`: ~590 lines (was ~565; +25 for surface
+  stubs + builder wiring).
+- `src/backend_native.cyr`: ~2,720 lines (was ~2,690; +30 for
+  surface stubs + builder wiring).
+- `dist/mabda.cyr`: regenerated (11099 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
 ### Metrics — 2026-04-30 (post Step 7.5)
 
 - Module count: 34 (unchanged).
@@ -972,21 +1019,27 @@ now would lock in choices that 7.7 will need to revisit.
 
 ### Next — 2026-04-30 (post Step 7.2(d))
 
-**KMS primitives + backend slot layout in tree.** Wrappers next:
+**Phase D scaffolding code-complete (7.1–7.6).** Only 7.7
+remains — and it's the architecture-question step. Two
+sub-decisions to make:
 
-1. **7.6 — backend wrappers**. `_backend_wgpu_surface_*`
-   (4 slot fns wrapping wgpu's surface/swapchain API) +
-   `_backend_native_surface_*` (4 slot fns wrapping 7.4(b)'s
-   present primitive + 7.2(d)'s modeset driver). Both backends
-   fill all 4 slots; `backend_is_complete` gets the v3 surface
-   range walk added here. The cross-fd story (card_fd vs
-   render_fd) becomes a ctx-internal detail.
-2. **7.7 — public `gpu_surface_*` API + e2e program.** v3.0
-   completion path. The architectural decision (TTY-only model
-   vs logind-aware compositor delegation) lands here, since
-   the public API needs to commit to one. Primitives ready
-   either way; this is where the master-acquisition story
-   gets resolved.
+1. **wgpu consumer protocol.** How does the consumer pass a
+   `WGPUSurface` handle into the slot abstraction? Options:
+   side-channel `gpu_context_register_surface_wgpu(ctx, handle)`,
+   GpuContext layout extension, or a wider slot signature.
+2. **native master-fd protocol.** TTY/kiosk model (caller
+   opens + holds master) vs logind-aware delegation via dbus
+   TakeDevice. The latter is the proper production path but is
+   significant work; v3.0 might commit to TTY/kiosk and
+   document logind as a v3.x extension.
+
+Once those are decided, 7.7 ships:
+- Public `gpu_surface_*` dispatchers in a new `src/surface_v3.cyr`
+  (or extension to existing `src/surface.cyr`).
+- Real slot wrappers replacing the stubs.
+- `programs/native_present_e2e.cyr` — clear-render-present-hold
+  smoke that visibly flips the screen (in a setting where
+  master is acquirable).
 
 **Phase C render HW-gated items still pending:**
 
