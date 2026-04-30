@@ -250,6 +250,103 @@ fn test_native_kms_summary_null_safe() {
     return 0;
 }
 
+# v3 Step 7.2(a) — per-connector mode enum + preferred picker
+
+fn test_drm_mode_type_constants() {
+    assert_eq(DRM_MODE_TYPE_BUILTIN,   0x01, "BUILTIN");
+    assert_eq(DRM_MODE_TYPE_PREFERRED, 0x08, "PREFERRED");
+    assert_eq(DRM_MODE_TYPE_USERDEF,   0x20, "USERDEF");
+    assert_eq(DRM_MODE_TYPE_DRIVER,    0x40, "DRIVER");
+    return 0;
+}
+
+fn test_native_kms_get_connector_modes_null_safe() {
+    var c[4];
+    assert_eq(native_kms_get_connector_modes(0, 1, &c),  0, "fd=0");
+    assert_eq(native_kms_get_connector_modes(7, 0, &c),  0, "conn_id=0");
+    assert_eq(native_kms_get_connector_modes(7, 1, 0),   0, "count_out=0");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_null_or_empty() {
+    assert_eq(native_kms_pick_preferred_mode(0, 5), 0,  "null modes");
+    var modes[68];
+    memset(&modes, 0, 68);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 0), 0, "count=0");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_finds_first_preferred() {
+    # Synthetic modes array: 3 entries.
+    # mode[0].type = DRIVER only (0x40)        — not preferred
+    # mode[1].type = DRIVER | PREFERRED (0x48) — picked
+    # mode[2].type = DRIVER | PREFERRED (0x48) — also preferred but later
+    var modes[204];   # 3 × 68
+    memset(&modes, 0, 204);
+    store32(&modes + 0 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    store32(&modes + 1 * 68 + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    store32(&modes + 2 * 68 + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 3), 1,
+              "picks first PREFERRED entry");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_falls_back_to_zero() {
+    # No PREFERRED bit set anywhere — fallback returns index 0.
+    var modes[136];   # 2 × 68
+    memset(&modes, 0, 136);
+    store32(&modes + 0 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    store32(&modes + 1 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 2), 0,
+              "no PREFERRED → 0");
+    return 0;
+}
+
+fn test_native_kms_mode_dim_accessors() {
+    # Fill a synthetic single-mode array with 1920×1080@60.
+    var modes[68];
+    memset(&modes, 0, 68);
+    store16(&modes + DRM_MODE_MODEINFO_HDISPLAY, 1920);
+    store16(&modes + DRM_MODE_MODEINFO_VDISPLAY, 1080);
+    store32(&modes + DRM_MODE_MODEINFO_VREFRESH, 60000);
+    store32(&modes + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    assert_eq(native_kms_mode_hdisplay(&modes, 0), 1920, "hdisplay");
+    assert_eq(native_kms_mode_vdisplay(&modes, 0), 1080, "vdisplay");
+    assert_eq(native_kms_mode_vrefresh(&modes, 0), 60000, "vrefresh");
+    assert_eq(native_kms_mode_type(&modes, 0),
+              DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED, "type");
+    # Null-safety on accessors.
+    assert_eq(native_kms_mode_hdisplay(0, 0), 0, "null hdisplay");
+    assert_eq(native_kms_mode_vdisplay(0, 0), 0, "null vdisplay");
+    assert_eq(native_kms_mode_vrefresh(0, 0), 0, "null vrefresh");
+    assert_eq(native_kms_mode_type(0, 0),     0, "null type");
+    return 0;
+}
+
+fn test_native_kms_mode_refresh_hz_computation() {
+    # 1920x1080@60 typical CTA timing: clock=148500 kHz,
+    # htotal=2200, vtotal=1125 → 148500*1000 / (2200*1125)
+    # = 148,500,000 / 2,475,000 = 60 exactly.
+    var modes[68];
+    memset(&modes, 0, 68);
+    store32(&modes + DRM_MODE_MODEINFO_CLOCK,  148500);
+    store16(&modes + DRM_MODE_MODEINFO_HTOTAL, 2200);
+    store16(&modes + DRM_MODE_MODEINFO_VTOTAL, 1125);
+    assert_eq(native_kms_mode_refresh_hz(&modes, 0), 60, "1080p60");
+    # Null + zero-divisor safety.
+    assert_eq(native_kms_mode_refresh_hz(0, 0), 0, "null modes");
+    var bad[68];
+    memset(&bad, 0, 68);
+    store32(&bad + DRM_MODE_MODEINFO_CLOCK,  100000);
+    store16(&bad + DRM_MODE_MODEINFO_HTOTAL, 0);
+    store16(&bad + DRM_MODE_MODEINFO_VTOTAL, 1125);
+    assert_eq(native_kms_mode_refresh_hz(&bad, 0), 0, "htotal=0 safe");
+    return 0;
+}
+
 fn main() {
     # v3 Step 7.1(a) — DRM/KMS GetResources foundation (5)
     test_drm_mode_ioctl_numbers();
@@ -271,6 +368,15 @@ fn main() {
     test_native_drm_encoder_type_name_lookup();
     test_native_drm_connection_status_name_lookup();
     test_native_kms_summary_null_safe();
+
+    # v3 Step 7.2(a) — per-connector mode enum + preferred pick (7)
+    test_drm_mode_type_constants();
+    test_native_kms_get_connector_modes_null_safe();
+    test_native_kms_pick_preferred_null_or_empty();
+    test_native_kms_pick_preferred_finds_first_preferred();
+    test_native_kms_pick_preferred_falls_back_to_zero();
+    test_native_kms_mode_dim_accessors();
+    test_native_kms_mode_refresh_hz_computation();
 
     return assert_summary();
 }

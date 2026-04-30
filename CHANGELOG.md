@@ -518,38 +518,81 @@ encoder field offsets (6), encoder-type enum (9), connector + encoder
 + 5 + 4), summary null-safe (2). The HW path itself is exercised
 via `make test-native-kms-summary`.
 
-### Metrics — 2026-04-30 (post Step 7.1(c))
+### Added — 2026-04-30 (Step 7.2(a) — per-connector mode enum + preferred picker)
+
+Foundation for Phase D mode-set: walk a connector's `modes_ptr`
+array, pick the EDID-preferred mode, expose dimensions + refresh.
+HW-verified on Cezanne — the diagnostic now reports
+`2560x1440@59Hz preferred` for the active monitor.
+
+- **`native_kms_get_connector_modes(fd, conn_id, count_out)`** —
+  two-call wrapper (count → fill) returning a heap
+  `drm_mode_modeinfo[count]` array. Pass-1 reads only count_modes;
+  pass-2 alloc'd to that count and refills. Returns 0 on failure
+  or when count_modes==0 (typical for disconnected connectors).
+  Connection-status filtering is the caller's responsibility.
+- **`DRM_MODE_TYPE_*`** enum: `BUILTIN = 0x01` (deprecated),
+  `PREFERRED = 0x08` (load-bearing — EDID's preferred mode hint),
+  `USERDEF = 0x20`, `DRIVER = 0x40` (typical modern flag). A
+  modern monitor's PREFERRED-flagged mode is typed
+  `DRIVER | PREFERRED = 0x48`.
+- **`native_kms_pick_preferred_mode(modes_ptr, count)`** — returns
+  index of the first mode with the PREFERRED bit set, falls back
+  to 0 when no mode is flagged. Matches radv's
+  `radv_get_preferred_mode` shape.
+- **Five mode accessors**: `native_kms_mode_hdisplay/_vdisplay/
+  _vrefresh/_type/_refresh_hz`. The last is the load-bearing one —
+  computes refresh as `(clock × 1000) / (htotal × vtotal)` because
+  the kernel-reported `vrefresh` field is unreliable on modern
+  kernels (libdrm derives it the same way; the raw `_vrefresh`
+  accessor is exposed only for debugging the kernel's value).
+- **Diagnostic extended.** `programs/native_kms_summary.cyr` now
+  walks each CONNECTED connector, fetches its modes array, picks
+  the preferred index, and prints
+  `conn 110: 2560x1440@59Hz preferred (42 mode total)`. The
+  hardware run on Cezanne verified the full path end-to-end.
+
+7 new CPU tests, 22 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+DRM_MODE_TYPE_* constants, null-safety on the modes wrapper +
+picker, picks-first-preferred (synthetic 3-mode array with two
+preferred), falls-back-to-0 (no preferred), all 5 mode accessors,
+refresh_hz computed against canonical 1080p60 timing
+(clock=148500, htotal=2200, vtotal=1125 → exactly 60 Hz).
+
+### Metrics — 2026-04-30 (post Step 7.2(a))
 
 - Module count: 34 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
 - `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
-- `tests/tcyr/mabda_v3_phase_d.tcyr`: **131 assertions** (was 100
-  at 7.1(b) close; +31 from 7.1(c)).
-- `src/backend_native_kms.cyr`: ~530 lines (was ~330 at 7.1(b);
-  +200 lines for encoder ioctl + name lookups + summary printer).
-- `programs/native_kms_summary.cyr`: 100 lines (new).
-- `dist/mabda.cyr`: regenerated (9941 lines).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **153 assertions** (was 131
+  at 7.1(c) close; +22 from 7.2(a)).
+- `src/backend_native_kms.cyr`: ~620 lines (was ~530 at 7.1(c);
+  +90 lines for the modes wrapper + pick + accessors + refresh
+  computation).
+- `programs/native_kms_summary.cyr`: ~165 lines (was 100 at 7.1(c);
+  +65 lines for the per-connected-connector preferred-mode print).
+- `dist/mabda.cyr`: regenerated (10082 lines).
 - Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30 (post Step 7.1(c))
+### Next — 2026-04-30 (post Step 7.2(a))
 
-**Phase D 7.1 (discovery) is closed.** HW-verified on Cezanne.
+**Phase D mode-pick is HW-verified.** Next bites compose into the
+actual modeset + scanout pipeline:
 
-Two paths forward in Phase D:
-
-1. **7.2 — mode-set + 7.3 framebuffer.** Now genuinely unblocked.
-   With 7.1's discovery in hand, mode-pick logic is concrete:
-   walk connectors → find one with `connection == DRM_MODE_CONNECTED`
-   → walk encoders → find one with the connector's `encoder_id`
-   → walk that encoder's `possible_crtcs` mask to pick a CRTC →
-   issue `DRM_IOCTL_MODE_SETCRTC`. The HW gate is DRM master,
-   already proven accessible by 7.1(c)'s diagnostic on this dev
-   box.
-2. **Optional: per-connector mode enumeration (7.1(d) if filed).**
-   The 7.1(b) `drm_mode_modeinfo` struct is in tree but no driver
-   walks the modes_ptr array yet. 7.2's mode-set logic will need
-   this — could land as part of 7.2 (since it composes naturally),
-   or as a separate sub-bite if 7.2 grows large.
+1. **7.3 — framebuffer creation.** `DRM_IOCTL_MODE_ADDFB2`
+   ioctl + struct, wraps a GTT BO as a KMS framebuffer ID. The
+   FB ID is what `DRM_IOCTL_MODE_SETCRTC` (7.2(b)) scans out.
+   Lands first because 7.2(b)'s SETCRTC takes an FB ID arg, and
+   the most useful test is "modeset to a framebuffer that has
+   visible content."
+2. **7.2(b) — DRM_IOCTL_MODE_SETCRTC ioctl + driver.** With
+   discovery (7.1) + mode-pick (7.2(a)) + framebuffer (7.3) all
+   in place, the driver becomes: pick connector → fetch its
+   modes → pick preferred → walk to encoder → pick CRTC from
+   `possible_crtcs` → SETCRTC with the FB. Real modeset on the
+   Cezanne dev box.
+3. **7.4–7.7 — page-flip, present, release, public API.** v3.0
+   completion path for native surface present.
 
 **Phase C render HW-gated items still pending:**
 

@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-30 (post Step 7.1(c) — Phase D discovery HW-verified)
+**Last refresh:** 2026-04-30 (post Step 7.2(a) — per-connector mode enum landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -387,7 +387,35 @@ need it.
     distlib clean. Closes Phase D discovery; foundation for
     7.2's mode-pick logic. (Step 7.1(c), 2026-04-30).
 - [ ] **7.2** — Mode-set: pick a default mode (highest-rated CRTC
-  for the first connected DP/HDMI), set it.
+  for the first connected DP/HDMI), set it. Two sub-bites:
+  - [x] **7.2 (a)** — per-connector mode enumeration + preferred
+    picker. `native_kms_get_connector_modes(fd, conn_id, count_out)`
+    runs the two-call protocol and returns a heap-allocated
+    `drm_mode_modeinfo[count]` array.
+    `native_kms_pick_preferred_mode(modes, count)` returns the
+    index of the first mode flagged `DRM_MODE_TYPE_PREFERRED`,
+    falling back to 0 (matches radv's pick logic). Five mode-field
+    accessors expose hdisplay / vdisplay / vrefresh / type /
+    refresh_hz; the last computes Hz from `clock × 1000 / (htotal
+    × vtotal)` because the kernel-reported `vrefresh` field is
+    unreliable on modern kernels (libdrm derives it the same way).
+    `DRM_MODE_TYPE_*` enum (BUILTIN / PREFERRED / USERDEF /
+    DRIVER). Diagnostic extended to print preferred-mode-per-
+    connected-connector. **Verified live on Cezanne**:
+    `2560x1440@59Hz preferred (42 mode total)` from the HDMI-A-1
+    monitor. 7 new CPU tests, 22 asserts (DRM_MODE_TYPE_*
+    constants, null-safety, picks-first-preferred,
+    falls-back-to-0, dim accessors, refresh_hz computation
+    against 1080p60 timing). 153 phase_d + 836 v3 + 624 mabda
+    CPU asserts green; smoke + lint + distlib clean.
+    (Step 7.2(a), 2026-04-30).
+  - [ ] **7.2 (b)** — `DRM_IOCTL_MODE_SETCRTC` ioctl + struct +
+    helper, plus the higher-level `native_kms_modeset(state,
+    conn_id, fb_id)` driver. Gated on 7.3 framebuffer (SETCRTC
+    needs an FB ID to scan out — without it the call still
+    works for "blank the CRTC" but the useful path is
+    "modeset → present a framebuffer", which composes naturally
+    with 7.3).
 - [ ] **7.3** — Framebuffer creation: KMS-side wrapping of a
   GTT BO as a scanout surface.
 - [ ] **7.4** — Page flip + vblank: `drmModePageFlip` analog
@@ -613,7 +641,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
 | Tier 1 — Phase C render (6.x) | **code-complete** — 6.1–6.9 all landed (6.9(b) builds clean, HW-gated to run); 6.5 Layer-2 verify + post-draw cache flush gated on Hyprland or headless capture program | 2026-04-30 |
-| Tier 1 — Phase D surface (7.x) | partial — **7.1 discovery code-complete + HW-verified**; 7.2–7.7 (modeset → present) ahead | 2026-04-30 |
+| Tier 1 — Phase D surface (7.x) | partial — **7.1 discovery + 7.2(a) mode-pick HW-verified**; 7.2(b) modeset, 7.3 FB, 7.4–7.7 (page-flip → present) ahead | 2026-04-30 |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
 | Tier 3 — Performance evidence | ⬜ not started | — |

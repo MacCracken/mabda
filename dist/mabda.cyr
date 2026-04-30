@@ -6414,6 +6414,147 @@ fn _kms_summary_print_hex32(v) {
     return 0;
 }
 
+# ================================================================
+# v3 Step 7.2(a) — Per-connector mode enumeration + preferred pick
+# ================================================================
+# Mode-set (7.2 proper) needs to know which mode to set. The kernel
+# returns a modes array per connector via the two-call protocol of
+# DRM_IOCTL_MODE_GETCONNECTOR. The flag word at modeinfo+32 carries
+# the EDID-derived "preferred" hint — picking a mode marked
+# PREFERRED matches what the monitor itself recommends, which is
+# what radv / wlroots / kwin all do.
+#
+# DRM_MODE_TYPE_* enum (uapi/drm/drm_mode.h):
+#   BUILTIN  = 0x01  (deprecated; never set on modern kernels)
+#   CLOCK_C  = 0x02  (deprecated)
+#   CRTC_C   = 0x04  (deprecated)
+#   PREFERRED = 0x08  (EDID's preferred mode — the load-bearing flag)
+#   DEFAULT  = 0x10  (deprecated)
+#   USERDEF  = 0x20  (userspace-added via MODE_ADDMODE)
+#   DRIVER   = 0x40  (kernel-derived from EDID; typical mode flag)
+#
+# A modern monitor's modeinfo.type is typically 0x40 (DRIVER) for
+# every mode and 0x48 (DRIVER | PREFERRED) for the EDID's
+# preferred resolution.
+var DRM_MODE_TYPE_BUILTIN   = 0x01;
+var DRM_MODE_TYPE_PREFERRED = 0x08;
+var DRM_MODE_TYPE_USERDEF   = 0x20;
+var DRM_MODE_TYPE_DRIVER    = 0x40;
+
+# Two-call wrapper for the connector's modes array. Pass 1: count-
+# only ioctl with all *_ptr=0 to discover count_modes. Pass 2:
+# heap-allocate count_modes × DRM_MODE_MODEINFO_SIZE bytes, refill.
+# Returns the heap pointer to the modes array on success (caller
+# treats as `drm_mode_modeinfo[count_modes]`); returns 0 on failure.
+# The count is written to `count_out` (u32) on success.
+#
+# The connection-status check is the caller's responsibility — a
+# disconnected connector still succeeds at the ioctl, just returns
+# count_modes=0 (and possibly some old EDID modes the kernel cached).
+# Callers wanting "modes from a live connector" filter on
+# DRM_MODE_CONNECTED first via native_drm_mode_get_connector.
+fn native_kms_get_connector_modes(fd, conn_id, count_out) {
+    if (fd <= 0)      { return 0; }
+    if (conn_id == 0) { return 0; }
+    if (count_out == 0) { return 0; }
+
+    # ---- Pass 1: count-only ----
+    var req[80];
+    memset(&req, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+    store32(&req + DRM_MODE_GET_CONNECTOR_CONN_ID, conn_id);
+    var rc = native_drm_mode_get_connector(fd, &req);
+    if (rc != 0) { return 0; }
+
+    var count = load32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES);
+    if (count == 0) {
+        store32(count_out, 0);
+        return 0;   # no modes — connector probably disconnected
+    }
+
+    # ---- Pass 2: fill modes (skip encoders / props for this fn) ----
+    var modes = alloc(count * DRM_MODE_MODEINFO_SIZE);
+    memset(&req, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+    store32(&req + DRM_MODE_GET_CONNECTOR_CONN_ID,     conn_id);
+    store64(&req + DRM_MODE_GET_CONNECTOR_MODES_PTR,   modes);
+    store32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES, count);
+    rc = native_drm_mode_get_connector(fd, &req);
+    if (rc != 0) {
+        store32(count_out, 0);
+        return 0;
+    }
+
+    # Kernel may report fewer modes if state changed between calls.
+    # Truth is the post-fill count.
+    var actual = load32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES);
+    store32(count_out, actual);
+    return modes;
+}
+
+# Pick the index of the first mode with the PREFERRED bit set.
+# Returns 0 when no preferred mode is found OR when count is 0
+# (caller must check count first — a 0 return from a count=0
+# array means "nothing valid").
+#
+# This matches radv's `radv_get_preferred_mode` shape: trust the
+# kernel's EDID-derived flag, fall back to mode[0] (which is
+# almost always the same as preferred when set, since the kernel
+# emits the preferred mode first).
+fn native_kms_pick_preferred_mode(modes_ptr, count) {
+    if (modes_ptr == 0) { return 0; }
+    if (count == 0)     { return 0; }
+    var i = 0;
+    while (i < count) {
+        var t = load32(modes_ptr + i * DRM_MODE_MODEINFO_SIZE
+                       + DRM_MODE_MODEINFO_TYPE);
+        if ((t & DRM_MODE_TYPE_PREFERRED) != 0) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read mode dimensions out of a modes_ptr[idx] entry. Useful both
+# for the diagnostic and for callers that want to size a
+# framebuffer to match (Step 7.3). Returns 0 on null / out-of-range.
+fn native_kms_mode_hdisplay(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load16(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+                  + DRM_MODE_MODEINFO_HDISPLAY);
+}
+
+fn native_kms_mode_vdisplay(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load16(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+                  + DRM_MODE_MODEINFO_VDISPLAY);
+}
+
+fn native_kms_mode_vrefresh(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load32(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+                  + DRM_MODE_MODEINFO_VREFRESH);
+}
+
+fn native_kms_mode_type(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load32(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+                  + DRM_MODE_MODEINFO_TYPE);
+}
+
+# Compute refresh rate in Hz from clock + h/vtotal. The kernel's
+# vrefresh field is unreliable on modern kernels (often returned
+# as 0); libdrm computes it the same way:
+#   Hz = clock_kHz × 1000 / (htotal × vtotal)
+# Returns 0 for null modes_ptr or zero divisor.
+fn native_kms_mode_refresh_hz(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    var base   = modes_ptr + idx * DRM_MODE_MODEINFO_SIZE;
+    var clock  = load32(base + DRM_MODE_MODEINFO_CLOCK);
+    var htotal = load16(base + DRM_MODE_MODEINFO_HTOTAL);
+    var vtotal = load16(base + DRM_MODE_MODEINFO_VTOTAL);
+    if (htotal == 0) { return 0; }
+    if (vtotal == 0) { return 0; }
+    return (clock * 1000) / (htotal * vtotal);
+}
+
 # --- buffer.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
