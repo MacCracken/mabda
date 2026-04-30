@@ -424,32 +424,37 @@ Only consumers that need to PRESENT TO SCREEN (soorat, kiran,
 aethersafta) touch this API. The other three keep using the
 existing compute / texture surface they already have.
 
-## v3.x logind realization — package home
+## v3.x logind realization — `samvada` package
 
 When the logind path graduates from stub to real, the dbus
-client lives in a **separate Cyrius package** alongside the
+client lives in a **separate Cyrius package named `samvada`**
+(Sanskrit *saṃvāda* "dialogue," dropped to ASCII for
+filesystem/package-manager friendliness) alongside the
 existing AGNOS deps (`sakshi`, `patra`, `sigil` — same shape:
-own repo, `dist/<name>.cyr` bundle, consumed via `[deps.<name>]`
-in `cyrius.cyml`). Not in mabda's tree (mabda is a GPU library;
-dbus is wrong owner) and not in cyrius stdlib (stdlib is for
-"every Cyrius program needs this" — dbus is system-services
-protocol). Naming follows the AGNOS Sanskrit/Arabic theme —
-`samvāda` (dialogue), `vārta` (conversation), or just `dbus`
-for clarity. **Scope for the logind subset**: ~500–1000 lines
-of pure Cyrius covering system-bus socket connect, SASL
-EXTERNAL auth, message marshalling (header fields, type
-signatures, alignment), method-call + signal handling, and a
-minimal type system (int32 / uint32 / string / object_path /
-unix_fd). Pure-Cyrius posture matches mabda's "own the stack"
-stance — the C-shim-around-libsystemd alternative would be ~200
-LoC faster but adds an external link dep to mabda. The mabda
-surface API does **not** change when this lands: only
-`_backend_native_surface_configure`'s logind branch swaps from
-"return `GPU_ERR_NOT_IMPLEMENTED`" to real dbus calls.
-Consumers that called `gpu_surface_configure_native_logind` in
-v3.0 (and saw the stub error) Just Work in v3.x without code
-changes. Package scaffold is filed as a Tier 6 follow-up in the
-v3.0 punchlist.
+own repo, authored as `src/*.cyr`, bundled via
+`cyrius distlib` into `dist/samvada.cyr`, consumed by mabda
+through `[deps.samvada]` in `cyrius.cyml` which symlinks the
+bundle into the consumer's `lib/samvada.cyr`). Not in mabda's
+tree (mabda is a GPU library; dbus is wrong owner) and not in
+cyrius stdlib (stdlib is for "every Cyrius program needs this"
+— dbus is system-services protocol). **Scope for the logind
+subset**: ~500–1000 lines of pure Cyrius covering system-bus
+socket connect, SASL EXTERNAL auth, message marshalling (header
+fields, type signatures, alignment), method-call + signal
+handling, and a minimal type system (int32 / uint32 / string /
+object_path / unix_fd). Pure-Cyrius posture matches mabda's
+"own the stack" stance — the C-shim-around-libsystemd
+alternative would be ~200 LoC faster but adds an external
+link dep to mabda. The mabda surface API does **not** change
+when this lands: only `_backend_native_surface_configure`'s
+logind branch swaps from "return `GPU_ERR_NOT_IMPLEMENTED`" to
+real `samvada` calls. Consumers that called
+`gpu_surface_configure_native_logind` in v3.0 (and saw the stub
+error) Just Work in v3.x without code changes. Package scaffold
+is filed as a Tier 6 follow-up in the v3.0 punchlist; the
+scaffold itself (empty repo, cyrius.cyml, CI stub) is a
+v3.0-era task — real protocol implementation is multi-week
+v3.x work.
 
 ## Open questions for review
 
