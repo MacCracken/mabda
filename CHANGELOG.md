@@ -144,36 +144,69 @@ against the authoritative source. The protocol now reflected in
   proposal doc. Every `R_*` constant in `src/backend_native.cyr`
   carries a `# Mesa 0x028XYZ` citation comment.
 
-### Metrics — 2026-04-30
+### Added — 2026-04-30 (Step 6.6 — render-ring dispatch)
 
-- Module count: 33 (unchanged from session 25c).
+`native_render_dispatch_simple` lands as the GFX-ring analog of
+`native_compute_dispatch_cached`. Routes through the same Mesa-shape
+4-chunk submit (BO_HANDLES + SYNCOBJ_OUT + FENCE + IB) on the same
+per-context cached IB+fence, with a per-dispatch syncobj. Three
+deltas vs the compute path:
+
+- `ip_type = AMDGPU_HW_IP_GFX` (was `_COMPUTE`) selects the graphics
+  ring.
+- `ib_flags = 0` (compute uses `0x08` /
+  `AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE`). The render PM4 stream's
+  ACQUIRE_MEM preamble (block 0 of
+  `native_pm4_build_render_clear_triangle`) does its own cache
+  invalidate; we don't need the kernel-side TC writeback hook that
+  the compute flag toggles.
+- BO_HANDLES list shape: `(fence / vs / fs / rt / ib)` at residency
+  priorities `(1 / 4 / 4 / 3 / 10)`. Compute is
+  `(fence / stub / out / shader / ib)` at `(1 / 3 / 3 / 4 / 10)` —
+  shader prio (4) goes to both VS and FS, target prio (3) goes to
+  the RT, the compute stub drops out.
+
+Two CPU-testable helpers split out of the inline shape:
+`native_render_handles_write` (24-byte vs/fs/rt triple, analog of
+`native_buf_pair_write`) and `native_render_bo_list_pack` (5-entry
+40-byte residency list builder). 15 new CPU asserts in
+`tests/tcyr/mabda_v3.tcyr` pin both layouts and guard against an
+accidental "same shape as compute" refactor.
+
+The full submit + syscall path is HW-gated — the e2e gate is
+6.9(b)'s `programs/native_render_e2e.cyr`. 712 v3 (was 697) +
+624 mabda CPU asserts green; smoke + lint clean.
+
+### Metrics — 2026-04-30 (post Step 6.6)
+
+- Module count: 33 (unchanged).
 - `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged — backend-agnostic
   v2 surface, all green).
-- `tests/tcyr/mabda_v3.tcyr`: **697 assertions** (was 484 at session
-  25c close; +213 from 6.2(a/b) + 6.5(a/b) work).
-- `src/backend_native.cyr`: ~2,400 lines (was 1,799 at session 25c
-  close).
-- `dist/mabda.cyr`: regenerated under cyrius 5.7.36 distlib (now
-  complete; was link-broken pre-5.7.36 due to 64-KB truncation).
-- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml` (was 5.5.20 at
-  session start).
+- `tests/tcyr/mabda_v3.tcyr`: **712 assertions** (was 697; +15 from
+  Step 6.6 helpers).
+- `src/backend_native.cyr`: ~2,520 lines (was ~2,400 at 6.5(b) close).
+- `dist/mabda.cyr`: regenerated under cyrius 5.7.36 distlib.
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
 
-### Next — 2026-04-30
+### Next — 2026-04-30 (post Step 6.6)
 
-Step 6.6 (`native_render_dispatch_simple`) — GFX-ring submission
-analog of `native_compute_dispatch_cached`. Self-contained,
-CPU-testable. Mirrors the existing compute submission flow
-(`native_cs_submit_4chunk` + syncobj wait) on a different ring kind.
+Step 6.8(c) — native render slot wrappers in
+`src/backend_native.cyr` (per `docs/proposals/v3-backend-interface.md`
+v2.1's 4-block slice: `_backend_native_render_pipeline_create` builds
+sh+ctx blocks once, `_backend_native_render_pass_begin` builds the
+pass_target block per-pass, `_backend_native_render_pass_draw` emits
+draw_tail and routes through `native_render_dispatch_simple`). Then
+6.9(b) `programs/native_render_e2e.cyr` for the HW gate.
 
-In parallel, Phase D surface (7.x) is fully unblocked and complements
-the 6.x work — pure DRM/KMS path, no shader bytes, no PM4 verification
-gate.
+In parallel, Phase D surface (7.x) is still fully unblocked — pure
+DRM/KMS path, no shader bytes, no PM4 verification gate.
 
-The "claim 6.5 done" gate is Layer-2 verification — gated on Hyprland
-desktop session, then `RADV_DEBUG=hang vkcube` IB capture +
-byte-diff against `native_pm4_build_render_clear_triangle` output.
+The "claim 6.5 done" gate remains Layer-2 verification (Hyprland +
+`RADV_DEBUG=hang` IB diff, or the headless capture program in
+`programs/diagnostics/radv_capture/`).
 
-Full handoff: [`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).
+Full handoff (Step 6.5 close-out + 6.6 sequencing):
+[`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).
 
 ### Verified — 2026-04-27/28 (B.4 store shader live-verified on Cezanne)
 

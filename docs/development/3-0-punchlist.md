@@ -2,7 +2,7 @@
 
 **Status:** Working document. Tick items off as they land.
 **Date opened:** 2026-04-28
-**Last refresh:** 2026-04-28 (post Step 6.9a + handoff session25c)
+**Last refresh:** 2026-04-30 (post Step 6.6 — render-ring dispatch landed)
 **Branch:** `v3`
 **Roadmap reference:** [`roadmap.md` § v3.0](roadmap.md#v30--dual-backend-amd-native-added-alongside-c-path)
 
@@ -189,8 +189,21 @@ need it.
     ROP3=COPY_SOURCE). Layer-2 byte-exact-vs-radv verification
     gated on Hyprland — Step 6.6 / 6.8c / 6.9b can build on this.
     (Step 6.5(b), 2026-04-30).
-- [ ] **6.6** — `native_render_dispatch_simple(ctx, …)` — analogous
-  to `native_compute_dispatch_cached` but on the GFX ring.
+- [x] **6.6** — `native_render_dispatch_simple(ctx, …)` — GFX-ring
+  analog of `native_compute_dispatch_cached`. Routes through the
+  same `native_cs_submit_4chunk` Mesa-shape submit (per-context
+  cached IB+fence + per-dispatch syncobj), differs in:
+  `ip_type=AMDGPU_HW_IP_GFX` (was `_COMPUTE`); `ib_flags=0` (the PM4
+  stream's ACQUIRE_MEM preamble handles cache invalidate, no kernel
+  TC_WB hook needed); BO_HANDLES list = (fence/vs/fs/rt/ib) at
+  priorities (1/4/4/3/10). Pairs with two CPU-testable helpers:
+  `native_render_handles_write` (24-byte vs/fs/rt triple analog of
+  `native_buf_pair_write`) and `native_render_bo_list_pack` (pulls
+  the 5-entry residency build out of the inline shape so the priority
+  story is unit-tested, not buried). 712 v3 (was 697 at 6.5(b) close)
+  + 624 mabda CPU asserts green; smoke build + lint clean. The full
+  syscall path is HW-gated — the e2e gate is 6.9(b)'s
+  `programs/native_render_e2e.cyr`. (Step 6.6, 2026-04-30).
 - [x] **6.7** — Backend interface render-pipeline / render-pass
   slots (proposal revision). Landed v2 expansion in
   `docs/proposals/v3-backend-interface.md`: 7 new slots
@@ -484,7 +497,7 @@ before the next. **Steps 1–4 done; we're at the start of Step 5.**
 | Tier 1 — Backend abstraction | ✅ done (Steps 1–3g, 4a–4e) | 2026-04-28 |
 | Tier 1 — Phase B.4 follow-ups | ✅ done (Steps 4f.i–iv, 5a) | 2026-04-28 |
 | Tier 1 — Phase C texture (5.1–5.9) | ✅ done | 2026-04-28 |
-| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) done; 6.6 next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
+| Tier 1 — Phase C render (6.x) | partial — 6.1–6.9a + 6.2(a/b) + 6.5(a/b) + 6.6 done; 6.8(c) + 6.9(b) next; 6.5 Layer-2 verify gated on Hyprland or headless capture program | 2026-04-30 |
 | Tier 1 — Phase D surface (7.x) | ⬜ not started — fully unblocked, parallel side-quest | — |
 | Tier 1 — WGSL lowering (8.x) | ⬜ not started — chunks 8.1–8.10 queued | — |
 | Tier 2 — Integration & regression | partial — CPU 624 mabda + 697 v3 = 1321 pass; GPU 32 untouched; consumer sweep pending | 2026-04-30 |
