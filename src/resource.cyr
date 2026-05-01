@@ -1,43 +1,99 @@
 # @public — stable API surface (survives the v3.0 backend swap)
 # resource.cyr — frame resource tracking
-# Ported from mabda/src/resource.rs
+# Ported from mabda/src/resource.rs; v3 Step 4f.iii made it
+# ctx-aware so cleanup can route through the Backend abstraction.
 #
-# FrameResources tracks transient GPU resources (buffers, textures)
-# created during a frame, so they can be cleaned up at frame end.
+# FrameResources struct layout (24 bytes — grew from 16 at v3 4f.iii):
+#   +0:  ctx      (GpuContext*, 8 — optional; 0 = legacy untracked-ctx)
+#   +8:  buffers  (vec ptr — opaque u64 buffer handles)
+#   +16: textures (vec ptr — opaque u64 texture handles)
 #
-# FrameResources struct layout (16 bytes):
-#   +0: buffers  (vec ptr — vec of WGPUBuffer handles)
-#   +8: textures (vec ptr — vec of WGPUTexture handles)
+# Storage is backend-agnostic: u64 handles fit both wgpu (WGPUBuffer/
+# WGPUTexture) and native (KMS handles for amdgpu BOs). Cleanup is
+# the part that needs backend dispatch — frame_resources_release_buffers
+# routes through gpu_buffer_release(ctx, h), which goes through
+# ctx->backend->buffer_release. Texture cleanup stays caller-managed
+# until the texture slot lands in the Backend interface (Phase C work).
+#
+# Two construction paths:
+#   frame_resources_new()        — legacy, no ctx; cleanup is caller's
+#                                  responsibility
+#   frame_resources_new_for(ctx) — v3-shape; release_buffers dispatches
+#                                  through ctx->backend
 
 fn frame_resources_new() {
-    var fr = alloc(16);
-    store64(fr, vec_new());
-    store64(fr + 8, vec_new());
+    var fr = alloc(24);
+    memset(fr, 0, 24);
+    store64(fr,      0);             # ctx unset
+    store64(fr + 8,  vec_new());     # buffers
+    store64(fr + 16, vec_new());     # textures
     return fr;
 }
 
+fn frame_resources_new_for(ctx) {
+    var fr = alloc(24);
+    memset(fr, 0, 24);
+    store64(fr,      ctx);
+    store64(fr + 8,  vec_new());
+    store64(fr + 16, vec_new());
+    return fr;
+}
+
+fn frame_resources_ctx(fr) { return load64(fr); }
+
 fn frame_resources_track_buffer(fr, buffer) {
-    vec_push(load64(fr), buffer);
+    vec_push(load64(fr + 8), buffer);
     return 0;
 }
 
 fn frame_resources_track_texture(fr, texture) {
-    vec_push(load64(fr + 8), texture);
+    vec_push(load64(fr + 16), texture);
     return 0;
 }
 
 fn frame_resources_buffer_count(fr) {
-    return vec_len(load64(fr));
-}
-
-fn frame_resources_texture_count(fr) {
     return vec_len(load64(fr + 8));
 }
 
+fn frame_resources_texture_count(fr) {
+    return vec_len(load64(fr + 16));
+}
+
+# Pop every tracked handle without releasing. Useful when the
+# caller has already done backend-specific cleanup and just wants
+# to reset the tracker. Identical to the v2.x behaviour; preserved
+# for legacy callers that managed release manually.
 fn frame_resources_clear(fr) {
-    var bufs = load64(fr);
+    var bufs = load64(fr + 8);
     while (vec_len(bufs) > 0) { vec_pop(bufs); }
-    var texs = load64(fr + 8);
+    var texs = load64(fr + 16);
     while (vec_len(texs) > 0) { vec_pop(texs); }
     return 0;
+}
+
+# Pop every tracked buffer handle and dispatch
+# gpu_buffer_release(ctx, h) for each. Routes through
+# ctx->backend->buffer_release, so it works for both wgpu and
+# native backends. Returns the number of buffers released.
+#
+# Requires that the FrameResources was created with
+# frame_resources_new_for(ctx); on a legacy frame_resources_new()
+# instance (ctx == 0) this is a no-op that returns 0 — caller is
+# expected to handle release themselves in that case.
+#
+# Texture release is not yet dispatchable through the Backend
+# interface (the texture slot lands in Phase C); textures stay
+# tracked but caller-released until then.
+fn frame_resources_release_buffers(fr) {
+    var ctx = load64(fr);
+    if (ctx == 0) { return 0; }
+    var bufs = load64(fr + 8);
+    var n = vec_len(bufs);
+    var i = 0;
+    while (vec_len(bufs) > 0) {
+        var h = vec_pop(bufs);
+        gpu_buffer_release(ctx, h);
+        i = i + 1;
+    }
+    return i;
 }

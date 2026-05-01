@@ -8,7 +8,10 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 2.5.0
+Version: 3.0.0-rc.1 (dual backend — wgpu + native AMD; see
+*Hardware support* below. Official 3.0.0 closes out the
+[2026-04-30 audit](docs/audit/2026-04-30-audit.md) deferred items
+per `docs/development/3-0-rc-2-punchlist.md`.)
 
 ## Features
 
@@ -89,10 +92,69 @@ Consumer (soorat, bijli, ...)
     ↓
   mabda (GPU abstraction)
     ↓
-  wgpu-native C API (via function table + C launcher)
+  wgpu-native C API (via function table + C launcher)        ← shipping today (v2.5.x)
     ↓
   Vulkan / Metal / DX12
 ```
+
+In v3.0 a second backend lands alongside the wgpu path. It is selected
+per-consumer; both coexist. Today the native backend is AMD-only:
+
+```
+Consumer (soorat, bijli, ...)
+    ↓
+  mabda (GPU abstraction — same @public API on both backends)
+    ↓
+  ┌──────────────────────────────┐  ┌──────────────────────────────┐
+  │ wgpu backend (default)       │  │ native backend (v3.0, opt-in)│
+  │   wgpu-native + C launcher   │  │   pure Cyrius, AMD/amdgpu    │
+  │   Vulkan / Metal / DX12      │  │   DRM ioctls + GFX9 ISA + PM4│
+  │   AMD / NVIDIA / Intel       │  │   AMD only (GFX9 verified;   │
+  │   on Linux/macOS/Windows     │  │   NVIDIA + Intel = future    │
+  │                              │  │   work, see roadmap)         │
+  └──────────────────────────────┘  └──────────────────────────────┘
+```
+
+## Hardware support
+
+Mabda's two backends have different hardware reach. The native
+backend lands one vendor at a time, and **wgpu retires per-chipset**
+as each vendor's native path matures — not all-at-once. The full
+roadmap is in [docs/development/roadmap.md](docs/development/roadmap.md).
+
+| Backend           | Vendors                  | Status                             |
+|-------------------|--------------------------|------------------------------------|
+| `wgpu`            | AMD, NVIDIA, Intel (anything wgpu-native + Vulkan/Metal/DX12 supports) | **Default. Shipping.** All v2.x consumers run here. Retires per-chipset as each vendor's native path matures. |
+| `native` (AMD)    | AMD                      | **In development (v3.0, branch `v3`).** Compute dispatch verified end-to-end on AMD Cezanne (gfx90c, GFX9). Other GFX families (GFX10/11/12, RDNA*) not yet exercised — same amdgpu / PM4 / DRM ioctl path, but each generation needs its own bring-up. |
+| `native` (NVIDIA) | NVIDIA                   | **Scoped to v4.0.** Different submission path entirely (nouveau / nvgpu, no PM4, different ISA). NVIDIA consumers stay on `wgpu` until v4.0 ships. |
+| `native` (Intel)  | Intel                    | **Tentative for v5.0.** Different submission path (i915 / Xe, no PM4, Gen ISA). Intel consumers stay on `wgpu` until v5.0 ships. |
+
+**Per-chipset retirement.** When a vendor's native backend has been
+in production for a full release cycle on that vendor's hardware,
+the wgpu path is retired *for that vendor* — the wgpu binding stays
+in-tree to serve the vendors whose native backends haven't shipped
+yet. The cutovers (per the roadmap):
+
+- **v4.0** — AMD wgpu retires. AMD consumers run on AMD native only.
+  NVIDIA + Intel still on wgpu.
+- **v5.0** — NVIDIA wgpu retires. NVIDIA consumers run on NVIDIA
+  native only. Intel still on wgpu.
+- **v5.1** — Intel wgpu retires; the wgpu+C path leaves the tree
+  entirely. Mabda becomes fully native-Cyrius across every supported
+  vendor.
+
+**No consumer is forced onto the native backend before their
+chipset's native path is real** — it is opt-in per build, and the
+wgpu fallback exists for every vendor until that vendor's native
+backend is in production. Each retirement is gated on every consumer
+on that vendor having flipped voluntarily; calendar dates are not
+the gate.
+
+Linux is the only OS the native backend targets. macOS and Windows
+consumers stay on `wgpu`; cross-OS support beyond v5.1 is gated on a
+non-wgpu story for those targets, which is not currently scoped.
+See [ADR 006](docs/adr/006-native-cyrius-gpu-backend.md) for the
+multi-backend rationale.
 
 ## Build
 
@@ -146,7 +208,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              2.5.0
+├── VERSION              3.0.0-rc.1
 └── CHANGELOG.md
 ```
 

@@ -1,0 +1,2869 @@
+# tests/tcyr/mabda_v3.tcyr — v3 backend abstraction tests
+# Split from mabda.tcyr 2026-04-28 to work around the cyrius lint
+# file-size threshold bug (see
+# docs/development/issues/2026-04-28-cyrlint-multi-line-assert.md).
+# All tests for src/backend.cyr + src/backend_wgpu.cyr + the
+# v3-shape ctx-aware public dispatchers (gpu_buffer_*,
+# gpu_shader_module_*, gpu_device_wait_idle, gpu_compute_dispatch).
+# v2.x and v3 Phase A/B.1-B.4 tests stay in mabda.tcyr.
+
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ================================================================
+# v3 Phase B5 — backend abstraction (src/backend.cyr)
+# ================================================================
+# Step 1 lands the @internal Backend struct + smoke test only;
+# wgpu and native backend slot fills are subsequent steps. The
+# load-bearing test here is test_backend_fncall_through_slot_smoke
+# — proves Cyrius-fn-via-fnptr-via-struct-slot dispatch works
+# before any backend implementation depends on it.
+
+fn test_backend_struct_layout() {
+    assert_eq(BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,  0, "ctx_create at 0");
+    assert_eq(BACKEND_SLOT_CTX_RELEASE,              8, "ctx_release at 8");
+    assert_eq(BACKEND_SLOT_BUFFER_CREATE,           16, "buffer_create at 16");
+    assert_eq(BACKEND_SLOT_BUFFER_WRITE,            24, "buffer_write at 24");
+    assert_eq(BACKEND_SLOT_BUFFER_READ,             32, "buffer_read at 32");
+    assert_eq(BACKEND_SLOT_BUFFER_RELEASE,          40, "buffer_release at 40");
+    assert_eq(BACKEND_SLOT_SHADER_MODULE_CREATE,    48, "shader_module_create at 48");
+    assert_eq(BACKEND_SLOT_SHADER_MODULE_RELEASE,   56, "shader_module_release at 56");
+    assert_eq(BACKEND_SLOT_COMPUTE_DISPATCH,        64, "compute_dispatch at 64");
+    assert_eq(BACKEND_SLOT_DEVICE_WAIT_IDLE,        72, "device_wait_idle at 72");
+    assert_eq(BACKEND_SLOT_KIND,                    80, "kind at 80");
+    assert_eq(BACKEND_FNPTR_SLOTS_END,              80, "v0 fnptr slots end at 80");
+    # v1 texture slots (Step 5.4)
+    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, 88,  "tex_create_2d_rgba8 at 88");
+    assert_eq(BACKEND_SLOT_TEXTURE_WRITE,           96,  "tex_write at 96");
+    assert_eq(BACKEND_SLOT_TEXTURE_READ,            104, "tex_read at 104");
+    assert_eq(BACKEND_SLOT_TEXTURE_RELEASE,         112, "tex_release at 112");
+    assert_eq(BACKEND_TEXTURE_SLOTS_BEGIN,          88,  "texture range begins 88");
+    assert_eq(BACKEND_TEXTURE_SLOTS_END,             120, "texture range ends 120");
+    # v2 render slots (Step 6.8a)
+    assert_eq(BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8, 120, "rt_create_2d_rgba8 at 120");
+    assert_eq(BACKEND_SLOT_RENDER_TARGET_RELEASE,         128, "rt_release at 128");
+    assert_eq(BACKEND_SLOT_RENDER_PIPELINE_CREATE,        136, "render_pipeline_create at 136");
+    assert_eq(BACKEND_SLOT_RENDER_PIPELINE_RELEASE,       144, "render_pipeline_release at 144");
+    assert_eq(BACKEND_SLOT_RENDER_PASS_BEGIN,             152, "render_pass_begin at 152");
+    assert_eq(BACKEND_SLOT_RENDER_PASS_DRAW,              160, "render_pass_draw at 160");
+    assert_eq(BACKEND_SLOT_RENDER_PASS_END,               168, "render_pass_end at 168");
+    assert_eq(BACKEND_RENDER_SLOTS_BEGIN,                 120, "render range begins 120");
+    assert_eq(BACKEND_RENDER_SLOTS_END,                   176, "render range ends 176");
+    # v3 surface slots (Step 7.5)
+    assert_eq(BACKEND_SLOT_SURFACE_CONFIGURE,             176, "surface_configure at 176");
+    assert_eq(BACKEND_SLOT_SURFACE_ACQUIRE,               184, "surface_acquire at 184");
+    assert_eq(BACKEND_SLOT_SURFACE_PRESENT,               192, "surface_present at 192");
+    assert_eq(BACKEND_SLOT_SURFACE_RELEASE,               200, "surface_release at 200");
+    assert_eq(BACKEND_SURFACE_SLOTS_BEGIN,                176, "surface range begins 176");
+    assert_eq(BACKEND_SURFACE_SLOTS_END,                  208, "surface range ends 208");
+    assert_eq(BACKEND_SIZE,                               208, "total = 208");
+    return 0;
+}
+
+fn test_backend_kind_constants_distinct() {
+    assert(BACKEND_KIND_NULL   != BACKEND_KIND_WGPU,    "null != wgpu");
+    assert(BACKEND_KIND_WGPU   != BACKEND_KIND_AMD,     "wgpu != amd");
+    assert(BACKEND_KIND_AMD    != BACKEND_KIND_NVIDIA,  "amd != nvidia");
+    assert(BACKEND_KIND_NVIDIA != BACKEND_KIND_INTEL,   "nvidia != intel");
+    assert_eq(BACKEND_KIND_NULL,   0, "null = 0");
+    assert_eq(BACKEND_KIND_WGPU,   1, "wgpu = 1");
+    assert_eq(BACKEND_KIND_AMD,    2, "amd  = 2");
+    assert_eq(BACKEND_KIND_NVIDIA, 3, "nvidia = 3");
+    assert_eq(BACKEND_KIND_INTEL,  4, "intel  = 4");
+    return 0;
+}
+
+fn test_backend_new_zero_initialized() {
+    var b = backend_new();
+    var off = 0;
+    while (off < BACKEND_SIZE) {
+        assert_eq(load64(b + off), 0, "slot zero on new");
+        off = off + 8;
+    }
+    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "kind starts NULL");
+    return 0;
+}
+
+fn test_backend_kind_round_trip() {
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_WGPU);
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "wgpu round-trips");
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    assert_eq(backend_kind(b), BACKEND_KIND_AMD,  "amd round-trips");
+    backend_set_kind(b, BACKEND_KIND_NULL);
+    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "null round-trips");
+    return 0;
+}
+
+fn test_backend_set_get_slot_round_trip() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0x1234);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0x1234, "fnptr stored at buffer_create slot");
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0xDEADBEEF);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0xDEADBEEF, "slot overwritten");
+    # Setting one slot does not perturb its neighbours.
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, 0xAA);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE, 0xBB);
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              0xDEADBEEF, "neighbour writes do not bleed");
+    return 0;
+}
+
+fn test_backend_fncall_through_slot_smoke() {
+    # Step 1's load-bearing test: prove Cyrius-fn-via-fnptr-via-
+    # struct-slot dispatch works. The v2.x codebase only fncalls
+    # against extern-C function pointers; the entire backend
+    # abstraction relies on Cyrius-to-Cyrius dispatch through a
+    # slot. If this fails, the design is unviable.
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+                     &_backend_smoke_sentinel);
+    var fp = backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE);
+    assert(fp != 0, "stored fnptr loads back non-zero");
+    var got = fncall1(fp, 100);
+    assert_eq(got, BACKEND_SMOKE_SENTINEL + 100,
+              "fncall1 through struct slot returns sentinel + arg");
+    # Same fn, mounted on a different slot, behaves identically.
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+                     &_backend_smoke_sentinel);
+    var fp2 = backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    var got2 = fncall1(fp2, 7);
+    assert_eq(got2, BACKEND_SMOKE_SENTINEL + 7,
+              "slot identity does not affect dispatch");
+    return 0;
+}
+
+fn test_backend_is_complete_detects_missing_slot() {
+    var b = backend_new();
+    assert_eq(backend_is_complete(b), 0,
+              "fresh backend not complete (all slots zero)");
+    # Fill v0 fnptr range (0..80) — kind at +80 stays zero (it's a
+    # value, not a fnptr).
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        backend_set_slot(b, off, &_backend_smoke_sentinel);
+        off = off + 8;
+    }
+    # v0-only fill is no longer enough — v1 texture range (88..120)
+    # also has fnptr slots that backend_is_complete checks.
+    assert_eq(backend_is_complete(b), 0,
+              "v0 fnptrs filled but v1 texture range still zero");
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        backend_set_slot(b, off2, &_backend_smoke_sentinel);
+        off2 = off2 + 8;
+    }
+    # v0+v1 alone no longer complete — v2 render range (120..176)
+    # also has fnptr slots that backend_is_complete checks (Step 6.8b).
+    assert_eq(backend_is_complete(b), 0,
+              "v0+v1 fnptrs filled but v2 render range still zero");
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        backend_set_slot(b, off3, &_backend_smoke_sentinel);
+        off3 = off3 + 8;
+    }
+    # v0+v1+v2 alone no longer complete — v3 surface range (176..208)
+    # also has fnptr slots that backend_is_complete checks (Step 7.6).
+    assert_eq(backend_is_complete(b), 0,
+              "v0+v1+v2 fnptrs filled but v3 surface range still zero");
+    var off4 = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off4 < BACKEND_SURFACE_SLOTS_END) {
+        backend_set_slot(b, off4, &_backend_smoke_sentinel);
+        off4 = off4 + 8;
+    }
+    assert_eq(backend_is_complete(b), 1,
+              "all fnptr slots set across all four ranges -> complete");
+    # Wiping one v0 slot drops completeness.
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped v0 slot drops completeness");
+    # Restore v0, then wipe a v1 texture slot — also drops.
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+                     &_backend_smoke_sentinel);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped v1 texture slot drops completeness");
+    # Restore v1, then wipe a v2 render slot — also drops.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
+                     &_backend_smoke_sentinel);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped v2 render slot drops completeness");
+    # Restore v2, then wipe a v3 surface slot — also drops.
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+                     &_backend_smoke_sentinel);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_PRESENT, 0);
+    assert_eq(backend_is_complete(b), 0,
+              "wiped v3 surface slot drops completeness");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B5 — wgpu Backend implementation (src/backend_wgpu.cyr)
+# ================================================================
+# Step 2 lands the wgpu wrapper fns + builder. The wrappers
+# themselves drive real wgpu calls, which can't run without
+# wgpu-native loaded — those paths are exercised via the GPU
+# integration programs (phase0, compute_e2e, etc.). CPU tests
+# here verify shape only: builder produces a complete backend,
+# kind = WGPU, slots resolve to the expected wrapper addresses.
+
+fn test_backend_wgpu_new_is_complete() {
+    var b = backend_wgpu_new();
+    assert(b != 0, "backend_wgpu_new returns non-null");
+    assert_eq(backend_is_complete(b), 1,
+              "wgpu backend has all 25 fnptr slots filled (v0+v1+v2+v3)");
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU,
+              "wgpu backend kind = BACKEND_KIND_WGPU");
+    # v3 surface stubs all installed (Step 7.6).
+    var off = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off < BACKEND_SURFACE_SLOTS_END) {
+        assert(load64(b + off) != 0, "v3 surface slot filled on wgpu");
+        off = off + 8;
+    }
+    return 0;
+}
+
+fn test_backend_wgpu_slot_identities() {
+    # Each slot must point at the matching wrapper. Catches
+    # builder typos (wrong fnptr in wrong slot) at CPU-test time.
+    var b = backend_wgpu_new();
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT),
+              &_backend_wgpu_ctx_create_from_preinit,
+              "slot 0 = ctx_create_from_preinit");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE),
+              &_backend_wgpu_ctx_release,
+              "slot 8 = ctx_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
+              &_backend_wgpu_buffer_create,
+              "slot 16 = buffer_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_WRITE),
+              &_backend_wgpu_buffer_write,
+              "slot 24 = buffer_write");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_READ),
+              &_backend_wgpu_buffer_read,
+              "slot 32 = buffer_read");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_RELEASE),
+              &_backend_wgpu_buffer_release,
+              "slot 40 = buffer_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
+              &_backend_wgpu_shader_module_create,
+              "slot 48 = shader_module_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE),
+              &_backend_wgpu_shader_module_release,
+              "slot 56 = shader_module_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH),
+              &_backend_wgpu_compute_dispatch,
+              "slot 64 = compute_dispatch");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE),
+              &_backend_wgpu_device_wait_idle,
+              "slot 72 = device_wait_idle");
+    return 0;
+}
+
+fn test_backend_wgpu_render_slot_identities() {
+    # v2 render slot identity checks (Step 6.8b). Catches builder
+    # typos in the render half of backend_wgpu_new at CPU-test time.
+    var b = backend_wgpu_new();
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8),
+              &_backend_wgpu_render_target_create_2d_rgba8,
+              "slot 120 = render_target_create_2d_rgba8");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE),
+              &_backend_wgpu_render_target_release,
+              "slot 128 = render_target_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE),
+              &_backend_wgpu_render_pipeline_create,
+              "slot 136 = render_pipeline_create");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE),
+              &_backend_wgpu_render_pipeline_release,
+              "slot 144 = render_pipeline_release");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN),
+              &_backend_wgpu_render_pass_begin,
+              "slot 152 = render_pass_begin");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW),
+              &_backend_wgpu_render_pass_draw,
+              "slot 160 = render_pass_draw");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END),
+              &_backend_wgpu_render_pass_end,
+              "slot 168 = render_pass_end");
+    return 0;
+}
+
+fn test_backend_wgpu_compute_dispatch_stub_returns_err() {
+    # Step 2 stub returns GPU_ERR_OTHER unconditionally. Lock that
+    # contract in so Step 3's full implementation has to actively
+    # replace this assertion (proving the stub was retired).
+    var b = backend_wgpu_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var rc = fncall6(fp, 0, 0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_OTHER,
+              "compute_dispatch stub returns GPU_ERR_OTHER");
+    return 0;
+}
+
+fn test_backend_wgpu_two_builders_are_distinct() {
+    # Each backend_wgpu_new() returns a fresh allocation so callers
+    # holding two backends don't share state.
+    var a = backend_wgpu_new();
+    var b = backend_wgpu_new();
+    assert(a != b, "distinct allocations");
+    assert_eq(backend_kind(a), BACKEND_KIND_WGPU, "a kind = WGPU");
+    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "b kind = WGPU");
+    # Mutating one does not affect the other.
+    backend_set_slot(a, BACKEND_SLOT_CTX_RELEASE, 0);
+    assert(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE) != 0,
+           "b unaffected by a's mutation");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B5 / Step 3a — GpuContext backend plumbing
+# ================================================================
+# Step 3a grew GpuContext from 32 to 40 bytes, adding a Backend*
+# slot at +32. The +0..+24 wgpu fields stay in place. Tests below
+# synthesise a 40-byte ctx (no real wgpu handles) and verify the
+# accessors land at the expected offsets. End-to-end validation
+# that gpu_context_from_preinit attaches a real backend lives in
+# the GPU integration programs (phase0, compute_e2e, etc.) — those
+# need wgpu-native loaded and run via `make test-gpu`.
+
+fn test_gpu_ctx_backend_accessor() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 0,  0x111);   # instance
+    store64(ctx + 8,  0x222);   # adapter
+    store64(ctx + 16, 0x333);   # device
+    store64(ctx + 24, 0x444);   # queue
+    store64(ctx + 32, 0x555);   # backend
+    assert_eq(gpu_ctx_instance(ctx), 0x111, "instance at +0");
+    assert_eq(gpu_ctx_adapter(ctx),  0x222, "adapter at +8");
+    assert_eq(gpu_ctx_device(ctx),   0x333, "device at +16");
+    assert_eq(gpu_ctx_queue(ctx),    0x444, "queue at +24");
+    assert_eq(gpu_ctx_backend(ctx),  0x555, "backend at +32");
+    return 0;
+}
+
+fn test_gpu_ctx_backend_field_isolated() {
+    # Mutating the backend slot does not perturb wgpu fields at
+    # +0..+24. Tests the layout is by-byte what the comment claims.
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 0,  0xAAAA);
+    store64(ctx + 8,  0xBBBB);
+    store64(ctx + 16, 0xCCCC);
+    store64(ctx + 24, 0xDDDD);
+    store64(ctx + 32, 0xEEEE);
+    # Overwrite backend slot with a different value.
+    store64(ctx + 32, 0xFFFF);
+    assert_eq(gpu_ctx_instance(ctx), 0xAAAA, "instance untouched");
+    assert_eq(gpu_ctx_adapter(ctx),  0xBBBB, "adapter untouched");
+    assert_eq(gpu_ctx_device(ctx),   0xCCCC, "device untouched");
+    assert_eq(gpu_ctx_queue(ctx),    0xDDDD, "queue untouched");
+    assert_eq(gpu_ctx_backend(ctx),  0xFFFF, "backend overwritten");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3b — gpu_context_release dispatches through backend slot
+# ================================================================
+# Counter incremented by the slot fn. Tests synthesise a ctx with
+# a fake backend whose ctx_release slot points at the counter; if
+# gpu_context_release dispatches through the slot, the counter
+# bumps. Set back to 0 in each test.
+
+var _step3b_ctx_release_count = 0;
+var _step3b_ctx_release_arg   = 0;
+
+fn _step3b_release_counter(ctx) {
+    _step3b_ctx_release_count = _step3b_ctx_release_count + 1;
+    _step3b_ctx_release_arg   = ctx;
+    return 0;
+}
+
+fn test_gpu_context_release_dispatches_through_backend() {
+    _step3b_ctx_release_count = 0;
+    _step3b_ctx_release_arg   = 0;
+    # Build a synthetic ctx whose +32 backend points at a stub
+    # backend whose ctx_release slot points at the counter fn.
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, &_step3b_release_counter);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    gpu_context_release(ctx);
+    assert_eq(_step3b_ctx_release_count, 1,
+              "slot dispatched exactly once");
+    assert_eq(_step3b_ctx_release_arg, ctx,
+              "slot received the ctx pointer as arg 1");
+    return 0;
+}
+
+fn test_gpu_context_release_null_ctx_is_safe() {
+    # Null ctx must short-circuit before trying to load backend.
+    _step3b_ctx_release_count = 0;
+    gpu_context_release(0);
+    assert_eq(_step3b_ctx_release_count, 0,
+              "null ctx does not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3c — gpu_buffer_read dispatches through backend slot
+# ================================================================
+# Counter + arg-capture stub for the buffer_read slot. Verifies the
+# 5-arg fncall threading is correct (ctx, buf, off, ptr, n).
+
+var _step3c_buffer_read_count = 0;
+var _step3c_buffer_read_ctx   = 0;
+var _step3c_buffer_read_buf   = 0;
+var _step3c_buffer_read_off   = 0;
+var _step3c_buffer_read_ptr   = 0;
+var _step3c_buffer_read_n     = 0;
+
+fn _step3c_buffer_read_capture(ctx, buf, off, ptr, n) {
+    _step3c_buffer_read_count = _step3c_buffer_read_count + 1;
+    _step3c_buffer_read_ctx = ctx;
+    _step3c_buffer_read_buf = buf;
+    _step3c_buffer_read_off = off;
+    _step3c_buffer_read_ptr = ptr;
+    _step3c_buffer_read_n   = n;
+    return 0xC3CAB;
+}
+
+fn test_gpu_buffer_read_dispatches_through_backend() {
+    _step3c_buffer_read_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+                     &_step3c_buffer_read_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_buffer_read(ctx, 0xBEEF, 16, 0xCAFE, 64);
+    assert_eq(rc, 0xC3CAB, "slot return value is propagated");
+    assert_eq(_step3c_buffer_read_count, 1,
+              "slot dispatched exactly once");
+    assert_eq(_step3c_buffer_read_ctx, ctx,    "arg 1 = ctx");
+    assert_eq(_step3c_buffer_read_buf, 0xBEEF, "arg 2 = buf");
+    assert_eq(_step3c_buffer_read_off, 16,     "arg 3 = off");
+    assert_eq(_step3c_buffer_read_ptr, 0xCAFE, "arg 4 = ptr");
+    assert_eq(_step3c_buffer_read_n,   64,     "arg 5 = n");
+    return 0;
+}
+
+fn test_gpu_buffer_read_null_ctx_returns_err() {
+    _step3c_buffer_read_count = 0;
+    var rc = gpu_buffer_read(0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_BUFFER, "null ctx returns GPU_ERR_BUFFER");
+    assert_eq(_step3c_buffer_read_count, 0,
+              "null ctx does not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3d — gpu_buffer_create / write / release dispatch
+# ================================================================
+# Three more ctx-aware buffer dispatchers, each through its own
+# slot. Together they exercise fncall2 (release), fncall3 (create),
+# and fncall5 (write) in the public-API → backend slot direction.
+
+var _step3d_create_count = 0;
+var _step3d_create_ctx   = 0;
+var _step3d_create_size  = 0;
+var _step3d_create_usage = 0;
+
+fn _step3d_create_capture(ctx, size, usage) {
+    _step3d_create_count = _step3d_create_count + 1;
+    _step3d_create_ctx   = ctx;
+    _step3d_create_size  = size;
+    _step3d_create_usage = usage;
+    return 0xCAFE;
+}
+
+fn test_gpu_buffer_create_dispatches_through_backend() {
+    _step3d_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+                     &_step3d_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var got = gpu_buffer_create(ctx, 1024, 0xF);
+    assert_eq(got, 0xCAFE, "slot return value propagates");
+    assert_eq(_step3d_create_count, 1, "slot dispatched once");
+    assert_eq(_step3d_create_ctx,  ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_create_size,  1024,  "arg 2 = size");
+    assert_eq(_step3d_create_usage, 0xF,   "arg 3 = usage");
+    return 0;
+}
+
+var _step3d_write_count = 0;
+var _step3d_write_ctx   = 0;
+var _step3d_write_buf   = 0;
+var _step3d_write_off   = 0;
+var _step3d_write_ptr   = 0;
+var _step3d_write_n     = 0;
+
+fn _step3d_write_capture(ctx, buf, off, ptr, n) {
+    _step3d_write_count = _step3d_write_count + 1;
+    _step3d_write_ctx = ctx;
+    _step3d_write_buf = buf;
+    _step3d_write_off = off;
+    _step3d_write_ptr = ptr;
+    _step3d_write_n   = n;
+    return 0;
+}
+
+fn test_gpu_buffer_write_dispatches_through_backend() {
+    _step3d_write_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+                     &_step3d_write_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_buffer_write(ctx, 0xBEEF, 8, 0xCAFE, 32);
+    assert_eq(rc, 0, "slot return value propagates");
+    assert_eq(_step3d_write_count, 1, "slot dispatched once");
+    assert_eq(_step3d_write_ctx, ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_write_buf, 0xBEEF, "arg 2 = buf");
+    assert_eq(_step3d_write_off, 8,      "arg 3 = off");
+    assert_eq(_step3d_write_ptr, 0xCAFE, "arg 4 = ptr");
+    assert_eq(_step3d_write_n,   32,     "arg 5 = n");
+    return 0;
+}
+
+var _step3d_release_count = 0;
+var _step3d_release_ctx   = 0;
+var _step3d_release_buf   = 0;
+
+fn _step3d_release_capture(ctx, buf) {
+    _step3d_release_count = _step3d_release_count + 1;
+    _step3d_release_ctx = ctx;
+    _step3d_release_buf = buf;
+    return 0;
+}
+
+fn test_gpu_buffer_release_dispatches_through_backend() {
+    _step3d_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+                     &_step3d_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_buffer_release(ctx, 0xBEEF);
+    assert_eq(rc, 0, "slot return value propagates");
+    assert_eq(_step3d_release_count, 1, "slot dispatched once");
+    assert_eq(_step3d_release_ctx, ctx,    "arg 1 = ctx");
+    assert_eq(_step3d_release_buf, 0xBEEF, "arg 2 = buf");
+    return 0;
+}
+
+fn test_gpu_buffer_dispatchers_null_ctx_safe() {
+    _step3d_create_count = 0;
+    _step3d_write_count = 0;
+    _step3d_release_count = 0;
+    assert_eq(gpu_buffer_create(0, 1024, 0xF), 0, "create null returns 0");
+    assert_eq(gpu_buffer_write(0, 0, 0, 0, 0), GPU_ERR_BUFFER, "write null returns err");
+    assert_eq(gpu_buffer_release(0, 0), 0, "release null returns 0");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3e — gpu_shader_module_create / release dispatch
+# ================================================================
+# fncall3 (create, 3 args + ctx) and fncall2 (release, 2 args + ctx)
+# re-validation on a different slot pair than buffer.cyr.
+
+var _step3e_create_count = 0;
+var _step3e_create_ctx   = 0;
+var _step3e_create_bytes = 0;
+var _step3e_create_n     = 0;
+var _step3e_release_count = 0;
+var _step3e_release_ctx   = 0;
+var _step3e_release_handle = 0;
+
+fn _step3e_shmod_create_capture(ctx, bp, n) {
+    _step3e_create_count = _step3e_create_count + 1;
+    _step3e_create_ctx = ctx;
+    _step3e_create_bytes = bp;
+    _step3e_create_n = n;
+    return 0xBA5;
+}
+
+fn _step3e_shmod_release_capture(ctx, h) {
+    _step3e_release_count = _step3e_release_count + 1;
+    _step3e_release_ctx = ctx;
+    _step3e_release_handle = h;
+    return 0;
+}
+
+fn test_gpu_shader_module_create_dispatches_through_backend() {
+    _step3e_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE, &_step3e_shmod_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var got = gpu_shader_module_create(ctx, 0xCAFE, 256);
+    assert_eq(got, 0xBA5, "slot return propagates");
+    assert_eq(_step3e_create_count, 1, "slot dispatched once");
+    assert_eq(_step3e_create_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step3e_create_bytes, 0xCAFE, "arg 2 = bytes");
+    assert_eq(_step3e_create_n, 256, "arg 3 = n");
+    return 0;
+}
+
+fn test_gpu_shader_module_release_dispatches_through_backend() {
+    _step3e_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE, &_step3e_shmod_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_shader_module_release(ctx, 0x5EED);
+    assert_eq(rc, 0, "slot return propagates");
+    assert_eq(_step3e_release_count, 1, "slot dispatched once");
+    assert_eq(_step3e_release_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step3e_release_handle, 0x5EED, "arg 2 = handle");
+    return 0;
+}
+
+fn test_gpu_shader_module_dispatchers_null_ctx_safe() {
+    _step3e_create_count = 0;
+    _step3e_release_count = 0;
+    assert_eq(gpu_shader_module_create(0, 0xCAFE, 256), 0, "create null = 0");
+    assert_eq(gpu_shader_module_release(0, 0x5EED), 0, "release null = 0");
+    assert_eq(_step3e_create_count, 0, "create did not dispatch");
+    assert_eq(_step3e_release_count, 0, "release did not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3f — gpu_device_wait_idle dispatch
+# ================================================================
+# Single-arg dispatcher; validates fncall1 on a third distinct
+# slot (ctx_release in 3b, smoke test in 1, this slot now).
+
+var _step3f_wait_count = 0;
+var _step3f_wait_ctx = 0;
+
+fn _step3f_wait_capture(ctx) {
+    _step3f_wait_count = _step3f_wait_count + 1;
+    _step3f_wait_ctx = ctx;
+    return 0;
+}
+
+fn test_gpu_device_wait_idle_dispatches_through_backend() {
+    _step3f_wait_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE, &_step3f_wait_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_device_wait_idle(ctx);
+    assert_eq(rc, 0, "slot return propagates");
+    assert_eq(_step3f_wait_count, 1, "slot dispatched once");
+    assert_eq(_step3f_wait_ctx, ctx, "arg 1 = ctx");
+    return 0;
+}
+
+fn test_gpu_device_wait_idle_null_ctx_safe() {
+    _step3f_wait_count = 0;
+    assert_eq(gpu_device_wait_idle(0), 0, "null ctx returns 0");
+    assert_eq(_step3f_wait_count, 0, "did not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 3g — gpu_compute_dispatch dispatch (fncall6)
+# ================================================================
+# Highest-arity slot. First Cyrius-to-Cyrius fncall6 through a
+# struct slot in mabda. Distinct sentinels chosen for each arg so
+# any swap/rotation surfaces as a specific assertion failure.
+
+var _step3g_dispatch_count = 0;
+var _step3g_dispatch_ctx = 0;
+var _step3g_dispatch_shmod = 0;
+var _step3g_dispatch_x = 0;
+var _step3g_dispatch_y = 0;
+var _step3g_dispatch_z = 0;
+var _step3g_dispatch_bp = 0;
+
+fn _step3g_dispatch_capture(ctx, shmod, x, y, z, bp) {
+    _step3g_dispatch_count = _step3g_dispatch_count + 1;
+    _step3g_dispatch_ctx = ctx;
+    _step3g_dispatch_shmod = shmod;
+    _step3g_dispatch_x = x;
+    _step3g_dispatch_y = y;
+    _step3g_dispatch_z = z;
+    _step3g_dispatch_bp = bp;
+    return 0xD15A;
+}
+
+fn test_gpu_compute_dispatch_dispatches_through_backend() {
+    _step3g_dispatch_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_step3g_dispatch_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_compute_dispatch(ctx, 0xBEEF, 64, 32, 16, 0xCAFE);
+    assert_eq(rc, 0xD15A, "slot return propagates through fncall6");
+    assert_eq(_step3g_dispatch_count, 1, "slot dispatched once");
+    assert_eq(_step3g_dispatch_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step3g_dispatch_shmod, 0xBEEF, "arg 2 = shmod");
+    assert_eq(_step3g_dispatch_x, 64, "arg 3 = x");
+    assert_eq(_step3g_dispatch_y, 32, "arg 4 = y");
+    assert_eq(_step3g_dispatch_z, 16, "arg 5 = z");
+    assert_eq(_step3g_dispatch_bp, 0xCAFE, "arg 6 = bp");
+    return 0;
+}
+
+fn test_gpu_compute_dispatch_null_ctx_returns_err() {
+    _step3g_dispatch_count = 0;
+    var rc = gpu_compute_dispatch(0, 0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_OTHER, "null ctx returns err");
+    assert_eq(_step3g_dispatch_count, 0, "did not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4c — native Backend slot wrappers + builder
+# ================================================================
+# Step 4c lights backend_native_new() + the compute_dispatch slot
+# end-to-end. CPU tests here verify the builder shape: complete
+# backend, kind = AMD, slots resolve to the expected wrappers.
+# End-to-end dispatch validation happens in the GPU integration
+# program (programs/native_compute_store.cyr — refactored Step 4d).
+# Native ctx field accessor tests verify the dual-interpretation
+# layout convention.
+
+fn test_backend_native_new_is_complete() {
+    var b = backend_native_new();
+    assert(b != 0, "backend_native_new returns non-null");
+    # All four ranges (v0 compute/buffer + v1 texture + v2 render +
+    # v3 surface stubs) are wired as of Step 7.6.
+    assert_eq(backend_is_complete(b), 1,
+              "native backend complete with v3 surface range stubbed (Step 7.6)");
+    assert_eq(backend_kind(b), BACKEND_KIND_AMD, "kind = AMD");
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        assert_eq(load64(b + off) != 0, 1, "v0 fnptr filled on native");
+        off = off + 8;
+    }
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        assert_eq(load64(b + off2) != 0, 1, "v1 texture fnptr filled on native");
+        off2 = off2 + 8;
+    }
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        assert_eq(load64(b + off3) != 0, 1, "v2 render fnptr filled on native");
+        off3 = off3 + 8;
+    }
+    var off4 = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off4 < BACKEND_SURFACE_SLOTS_END) {
+        assert_eq(load64(b + off4) != 0, 1, "v3 surface fnptr filled on native");
+        off4 = off4 + 8;
+    }
+    return 0;
+}
+
+fn test_backend_native_slot_identities() {
+    var b = backend_native_new();
+    var s_ccp = backend_get_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT);
+    var s_cr = backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE);
+    var s_bc = backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE);
+    var s_bw = backend_get_slot(b, BACKEND_SLOT_BUFFER_WRITE);
+    var s_br = backend_get_slot(b, BACKEND_SLOT_BUFFER_READ);
+    var s_bl = backend_get_slot(b, BACKEND_SLOT_BUFFER_RELEASE);
+    var s_smc = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE);
+    var s_smr = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE);
+    var s_cd = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var s_wi = backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    assert_eq(s_ccp, &_backend_native_ctx_create_from_preinit, "ctx_create");
+    assert_eq(s_cr, &_backend_native_ctx_release, "ctx_release");
+    assert_eq(s_bc, &_backend_native_buffer_create, "buffer_create");
+    assert_eq(s_bw, &_backend_native_buffer_write, "buffer_write");
+    assert_eq(s_br, &_backend_native_buffer_read, "buffer_read");
+    assert_eq(s_bl, &_backend_native_buffer_release, "buffer_release");
+    assert_eq(s_smc, &_backend_native_shader_module_create, "shader_module_create");
+    assert_eq(s_smr, &_backend_native_shader_module_release, "shader_module_release");
+    assert_eq(s_cd, &_backend_native_compute_dispatch, "compute_dispatch");
+    assert_eq(s_wi, &_backend_native_device_wait_idle, "device_wait_idle");
+    # v2 render slot identities (Step 6.8c).
+    var s_rtc = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8);
+    var s_rtr = backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE);
+    var s_rpc = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE);
+    var s_rpr = backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE);
+    var s_rpb = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN);
+    var s_rpd = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW);
+    var s_rpe = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END);
+    assert_eq(s_rtc, &_backend_native_render_target_create_2d_rgba8, "rt_create");
+    assert_eq(s_rtr, &_backend_native_render_target_release,         "rt_release");
+    assert_eq(s_rpc, &_backend_native_render_pipeline_create,        "pipe_create");
+    assert_eq(s_rpr, &_backend_native_render_pipeline_release,       "pipe_release");
+    assert_eq(s_rpb, &_backend_native_render_pass_begin,             "pass_begin");
+    assert_eq(s_rpd, &_backend_native_render_pass_draw,              "pass_draw");
+    assert_eq(s_rpe, &_backend_native_render_pass_end,               "pass_end");
+    return 0;
+}
+
+fn test_backend_native_distinct_from_wgpu() {
+    var w = backend_wgpu_new();
+    var n = backend_native_new();
+    assert(w != n, "distinct backend allocations");
+    assert(backend_kind(w) != backend_kind(n), "distinct kinds");
+    assert_eq(backend_kind(w), BACKEND_KIND_WGPU, "wgpu kind");
+    assert_eq(backend_kind(n), BACKEND_KIND_AMD, "native kind");
+    var w_cd = backend_get_slot(w, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var n_cd = backend_get_slot(n, BACKEND_SLOT_COMPUTE_DISPATCH);
+    assert(w_cd != n_cd, "wgpu and native compute_dispatch slots differ");
+    return 0;
+}
+
+fn test_native_ctx_field_accessors() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx +  0, 7);              # fd
+    store64(ctx +  8, 42);             # ctx_id
+    store64(ctx + 16, 0xDEAD);         # stub_handle
+    store64(ctx + 24, 0xFFFF800100004000); # stub_va
+    store64(ctx + 32, 0xBEEF);         # backend ptr
+    assert_eq(native_ctx_fd(ctx), 7, "fd at +0");
+    assert_eq(native_ctx_id(ctx), 42, "ctx_id at +8");
+    assert_eq(native_ctx_stub_handle(ctx), 0xDEAD, "stub_handle at +16");
+    assert_eq(native_ctx_stub_va(ctx), 0xFFFF800100004000, "stub_va at +24");
+    assert_eq(gpu_ctx_backend(ctx), 0xBEEF, "backend ptr unchanged at +32");
+    return 0;
+}
+
+fn test_native_buf_pair_write() {
+    var pair[16];
+    memset(&pair, 0, 16);
+    native_buf_pair_write(&pair, 0xCAFE, 0xBABE);
+    assert_eq(load64(&pair + 0), 0xCAFE, "handle at +0");
+    assert_eq(load64(&pair + 8), 0xBABE, "va at +8");
+    return 0;
+}
+
+fn test_backend_native_compute_dispatch_null_args_err() {
+    var b = backend_native_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var rc1 = fncall6(fp, 0, 0, 0, 0, 0, 0);
+    assert_eq(rc1, GPU_ERR_OTHER, "null ctx → err");
+    var dummy_ctx = alloc(112);
+    memset(dummy_ctx, 0, 96);
+    var rc2 = fncall6(fp, dummy_ctx, 0, 0, 0, 0, 0);
+    assert_eq(rc2, GPU_ERR_OTHER, "null shmod → err");
+    var dummy_pair = alloc(16);
+    memset(dummy_pair, 0, 16);
+    var rc3 = fncall6(fp, dummy_ctx, dummy_pair, 0, 0, 0, 0);
+    assert_eq(rc3, GPU_ERR_OTHER, "null bp → err");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4e — MABDA_BACKEND_KIND selector + stub_addr accessor
+# ================================================================
+# The constant defaults to WGPU. Native programs opt in via the
+# explicit gpu_context_new_native() entry point regardless of the
+# global default. Layout test below exercises the +40 stub_addr
+# field that grew GpuContext from 40 → 48 bytes.
+
+fn test_mabda_backend_kind_default_is_wgpu() {
+    assert_eq(MABDA_BACKEND_KIND, BACKEND_KIND_WGPU, "default selector = WGPU");
+    return 0;
+}
+
+fn test_native_ctx_stub_addr_accessor() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 40, 0xC0DE);
+    assert_eq(native_ctx_stub_addr(ctx), 0xC0DE, "stub_addr at +40");
+    # Other fields untouched
+    assert_eq(native_ctx_fd(ctx), 0, "fd zero");
+    assert_eq(native_ctx_id(ctx), 0, "ctx_id zero");
+    assert_eq(native_ctx_stub_handle(ctx), 0, "stub_handle zero");
+    assert_eq(native_ctx_stub_va(ctx), 0, "stub_va zero");
+    assert_eq(gpu_ctx_backend(ctx), 0, "backend zero");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4f.i — errno → GpuErr mapping
+# ================================================================
+# _native_errno_to_gpu_err takes a positive errno; the helper maps
+# it to the closest existing GPU_ERR_* code per the convention
+# documented in src/backend_native.cyr. _native_neg_rc_to_gpu_err
+# wraps the negative-rc convention used by native_* primitives
+# (rc <= 0 means error, sign-flipped errno).
+
+fn test_native_errno_to_gpu_err_classifies() {
+    assert_eq(_native_errno_to_gpu_err(12),  GPU_ERR_BUFFER, "ENOMEM → BUFFER");
+    assert_eq(_native_errno_to_gpu_err(1),   GPU_ERR_ADAPTER_NOT_FOUND, "EPERM → adapter");
+    assert_eq(_native_errno_to_gpu_err(13),  GPU_ERR_ADAPTER_NOT_FOUND, "EACCES → adapter");
+    assert_eq(_native_errno_to_gpu_err(2),   GPU_ERR_ADAPTER_NOT_FOUND, "ENOENT → adapter");
+    assert_eq(_native_errno_to_gpu_err(16),  GPU_ERR_DEVICE_REQUEST, "EBUSY → device");
+    assert_eq(_native_errno_to_gpu_err(110), GPU_ERR_SURFACE_TIMEOUT, "ETIMEDOUT → timeout");
+    assert_eq(_native_errno_to_gpu_err(62),  GPU_ERR_SURFACE_TIMEOUT, "ETIME → timeout");
+    return 0;
+}
+
+fn test_native_errno_to_gpu_err_default_other() {
+    # Unknown errnos fall through to GPU_ERR_OTHER.
+    assert_eq(_native_errno_to_gpu_err(22), GPU_ERR_OTHER, "EINVAL → OTHER (no specific code)");
+    assert_eq(_native_errno_to_gpu_err(14), GPU_ERR_OTHER, "EFAULT → OTHER");
+    assert_eq(_native_errno_to_gpu_err(38), GPU_ERR_OTHER, "ENOSYS → OTHER");
+    assert_eq(_native_errno_to_gpu_err(0),  GPU_ERR_OTHER, "0 (caller bug) → OTHER");
+    assert_eq(_native_errno_to_gpu_err(99), GPU_ERR_OTHER, "arbitrary → OTHER");
+    return 0;
+}
+
+fn test_native_neg_rc_to_gpu_err_sign_flip() {
+    # rc == 0 maps to 0 (success).
+    assert_eq(_native_neg_rc_to_gpu_err(0), 0, "rc=0 → 0");
+    # Negative rc: sign-flip to errno, then map.
+    assert_eq(_native_neg_rc_to_gpu_err(-12),  GPU_ERR_BUFFER, "-ENOMEM");
+    assert_eq(_native_neg_rc_to_gpu_err(-110), GPU_ERR_SURFACE_TIMEOUT, "-ETIMEDOUT");
+    assert_eq(_native_neg_rc_to_gpu_err(-1),   GPU_ERR_ADAPTER_NOT_FOUND, "-EPERM");
+    # Positive rc (defensive — some primitives might already pass abs).
+    assert_eq(_native_neg_rc_to_gpu_err(12),   GPU_ERR_BUFFER, "+ENOMEM (defensive)");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4f.ii — BO page-perm constants
+# ================================================================
+# Locks in the current per-BO perm values. Narrowing the constants
+# past these values will trip these tests before any hardware
+# iteration burns TDR budget — re-tightening should land the
+# narrowed value in src/backend_native.cyr AND the matching
+# assertion here in the same change.
+
+fn test_native_perm_constants_present() {
+    var r = AMDGPU_VM_PAGE_READABLE;
+    var w = AMDGPU_VM_PAGE_WRITEABLE;
+    var x = AMDGPU_VM_PAGE_EXECUTABLE;
+    # Locked-in per-BO minimums after the Step 4f.ii hardware
+    # bisect. _NATIVE_PERM_IB needing the X bit is the surprise —
+    # CP-fetched PM4 still goes through the execute-permission
+    # gate on Cezanne. See module header in src/backend_native.cyr
+    # for the full rationale.
+    assert_eq(_NATIVE_PERM_FULL,   r | w | x, "FULL = R|W|X");
+    assert_eq(_NATIVE_PERM_SHADER, r | x,     "SHADER = R|X");
+    assert_eq(_NATIVE_PERM_DATA,   r | w,     "DATA = R|W");
+    assert_eq(_NATIVE_PERM_IB,     r | x,     "IB = R|X (X is load-bearing)");
+    return 0;
+}
+
+fn test_native_perm_bits_distinct() {
+    # The three AMDGPU page-perm bits are distinct, so combining
+    # them with bitwise OR is well-defined.
+    assert(AMDGPU_VM_PAGE_READABLE != AMDGPU_VM_PAGE_WRITEABLE, "R != W");
+    assert(AMDGPU_VM_PAGE_WRITEABLE != AMDGPU_VM_PAGE_EXECUTABLE, "W != X");
+    assert(AMDGPU_VM_PAGE_READABLE != AMDGPU_VM_PAGE_EXECUTABLE, "R != X");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4f.iii — Resource tracker ctx-aware integration
+# ================================================================
+# FrameResources grew from 16 → 24 bytes; +0 holds an optional
+# GpuContext*. frame_resources_release_buffers routes through
+# gpu_buffer_release(ctx, h), which dispatches through
+# ctx->backend->buffer_release. Mock-backend tests below verify
+# dispatch semantics; counter increments per call confirm the
+# tracker calls the slot exactly once per tracked handle.
+
+var _step4f3_release_count = 0;
+var _step4f3_release_handles[64];
+
+fn _step4f3_release_capture(ctx, buf) {
+    var idx = _step4f3_release_count;
+    if (idx < 8) {
+        store64(&_step4f3_release_handles + idx * 8, buf);
+    }
+    _step4f3_release_count = _step4f3_release_count + 1;
+    return 0;
+}
+
+fn test_frame_resources_new_legacy_no_ctx() {
+    var fr = frame_resources_new();
+    assert(fr != 0, "fr non-null");
+    assert_eq(frame_resources_ctx(fr), 0, "legacy ctor leaves ctx zero");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_new_for_stores_ctx() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var fr = frame_resources_new_for(ctx);
+    assert_eq(frame_resources_ctx(fr), ctx, "ctx stored at +0");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_track_buffers_and_textures() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xAA01);
+    frame_resources_track_buffer(fr, 0xAA02);
+    frame_resources_track_buffer(fr, 0xAA03);
+    frame_resources_track_texture(fr, 0xBB01);
+    frame_resources_track_texture(fr, 0xBB02);
+    assert_eq(frame_resources_buffer_count(fr), 3, "3 buffers");
+    assert_eq(frame_resources_texture_count(fr), 2, "2 textures");
+    return 0;
+}
+
+fn test_frame_resources_clear_pops_all() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xCAFE);
+    frame_resources_track_texture(fr, 0xBEEF);
+    assert_eq(frame_resources_buffer_count(fr), 1, "1 buffer pre-clear");
+    assert_eq(frame_resources_texture_count(fr), 1, "1 texture pre-clear");
+    frame_resources_clear(fr);
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty post-clear");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty post-clear");
+    return 0;
+}
+
+fn test_frame_resources_release_buffers_dispatches_through_backend() {
+    # Synth a ctx with a mock backend whose buffer_release slot
+    # counts calls and captures handles.
+    _step4f3_release_count = 0;
+    memset(&_step4f3_release_handles, 0, 64);
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE, &_step4f3_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var fr = frame_resources_new_for(ctx);
+    frame_resources_track_buffer(fr, 0xAA01);
+    frame_resources_track_buffer(fr, 0xAA02);
+    frame_resources_track_buffer(fr, 0xAA03);
+    var n = frame_resources_release_buffers(fr);
+    assert_eq(n, 3, "released 3 buffers");
+    assert_eq(_step4f3_release_count, 3, "slot dispatched 3 times");
+    assert_eq(frame_resources_buffer_count(fr), 0, "tracker drained");
+    # All 3 handles passed through — order is LIFO since we vec_pop.
+    var h0 = load64(&_step4f3_release_handles + 0);
+    var h1 = load64(&_step4f3_release_handles + 8);
+    var h2 = load64(&_step4f3_release_handles + 16);
+    assert(h0 != 0, "handle 0 captured");
+    assert(h1 != 0, "handle 1 captured");
+    assert(h2 != 0, "handle 2 captured");
+    # Sum check (any order — all 3 must have been seen)
+    var total = h0 + h1 + h2;
+    assert_eq(total, 0xAA01 + 0xAA02 + 0xAA03, "all 3 handles seen");
+    return 0;
+}
+
+fn test_frame_resources_release_buffers_no_ctx_is_noop() {
+    _step4f3_release_count = 0;
+    var fr = frame_resources_new();    # legacy, no ctx
+    frame_resources_track_buffer(fr, 0xDEAD);
+    var n = frame_resources_release_buffers(fr);
+    assert_eq(n, 0, "no-ctx fr releases 0");
+    assert_eq(_step4f3_release_count, 0, "did not dispatch");
+    # Buffer remains tracked — caller must clear manually.
+    assert_eq(frame_resources_buffer_count(fr), 1, "buffer still tracked");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 4f.iv — per-context IB + fence cache
+# ================================================================
+# GpuContext grew 48 → 96 bytes. New native-only fields at +48..+88
+# hold the cached IB BO (handle/va/addr) and fence BO
+# (handle/va/addr). Layout test below verifies offsets; multi-
+# dispatch end-to-end validation is in programs/native_compute_store
+# (would catch any regression of the cached path against real
+# hardware).
+
+fn test_native_ctx_ib_fence_accessors() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 48, 0x10A);   # ib_handle
+    store64(ctx + 56, 0xFFFF800100200000); # ib_va
+    store64(ctx + 64, 0x10C);   # ib_addr
+    store64(ctx + 72, 0x10D);   # fence_handle
+    store64(ctx + 80, 0xFFFF800100600000); # fence_va
+    store64(ctx + 88, 0x10F);   # fence_addr
+    assert_eq(native_ctx_ib_handle(ctx),    0x10A,                 "ib_handle at +48");
+    assert_eq(native_ctx_ib_va(ctx),        0xFFFF800100200000,    "ib_va at +56");
+    assert_eq(native_ctx_ib_addr(ctx),      0x10C,                 "ib_addr at +64");
+    assert_eq(native_ctx_fence_handle(ctx), 0x10D,                 "fence_handle at +72");
+    assert_eq(native_ctx_fence_va(ctx),     0xFFFF800100600000,    "fence_va at +80");
+    assert_eq(native_ctx_fence_addr(ctx),   0x10F,                 "fence_addr at +88");
+    return 0;
+}
+
+fn test_native_ctx_layout_isolation_step4iv() {
+    # Mutating the new fields does not perturb +0..+40 ones.
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx +  0, 0xA1);
+    store64(ctx +  8, 0xA2);
+    store64(ctx + 16, 0xA3);
+    store64(ctx + 24, 0xA4);
+    store64(ctx + 32, 0xA5);
+    store64(ctx + 40, 0xA6);
+    # Now write the new fields:
+    store64(ctx + 48, 0xB1);
+    store64(ctx + 56, 0xB2);
+    store64(ctx + 64, 0xB3);
+    store64(ctx + 72, 0xB4);
+    store64(ctx + 80, 0xB5);
+    store64(ctx + 88, 0xB6);
+    # All earlier fields untouched
+    assert_eq(native_ctx_fd(ctx),         0xA1, "fd untouched");
+    assert_eq(native_ctx_id(ctx),         0xA2, "ctx_id untouched");
+    assert_eq(native_ctx_stub_handle(ctx),0xA3, "stub_handle untouched");
+    assert_eq(native_ctx_stub_va(ctx),    0xA4, "stub_va untouched");
+    assert_eq(gpu_ctx_backend(ctx),       0xA5, "backend untouched");
+    assert_eq(native_ctx_stub_addr(ctx),  0xA6, "stub_addr untouched");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 5.1 — native 2D RGBA8 texture primitives (Phase C)
+# ================================================================
+# CPU-only tests — size formula, NativeTexture struct layout, and
+# VA-range isolation from the existing canonical-high allocations
+# (shader / stub / IB / fence / output). Hardware tests for
+# texture create + readback land in Step 5.8 (native_texture_e2e).
+
+fn test_native_texture_size_2d_rgba8_formula() {
+    assert_eq(native_texture_size_2d_rgba8(1, 1),     4,        "1x1 = 4 bytes");
+    assert_eq(native_texture_size_2d_rgba8(16, 16),   1024,     "16x16 = 1 KiB");
+    assert_eq(native_texture_size_2d_rgba8(256, 256), 262144,   "256x256 = 256 KiB");
+    assert_eq(native_texture_size_2d_rgba8(64, 32),   8192,     "64x32 rectangular");
+    assert_eq(native_texture_size_2d_rgba8(0, 0),     0,        "0x0 = 0 (degenerate)");
+    return 0;
+}
+
+fn test_native_texture_struct_field_offsets() {
+    assert_eq(NATIVE_TEX_FIELD_HANDLE, 0,  "handle at +0");
+    assert_eq(NATIVE_TEX_FIELD_VA,     8,  "va at +8");
+    assert_eq(NATIVE_TEX_FIELD_ADDR,   16, "addr at +16");
+    assert_eq(NATIVE_TEX_FIELD_SIZE,   24, "size at +24");
+    assert_eq(NATIVE_TEX_STRUCT_SIZE,  32, "total = 32");
+    return 0;
+}
+
+fn test_native_texture_va_range_distinct() {
+    # The texture VA base must not collide with the canonical-high
+    # VAs already used by gpu_context_new_native + the consumer
+    # programs. If a future allocation lands here, this test catches
+    # the conflict before it produces a runtime VA-map failure.
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_STUB_VA,    "tex != stub");
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_IB_VA,      "tex != IB");
+    assert(_NATIVE_TEXTURE_VA_BASE != _NATIVE_FENCE_VA,   "tex != fence");
+    # Programs hardcode shader_va = 0xFFFF800100000000 and
+    # output_va = 0xFFFF800100400000 — assert the texture base
+    # doesn't alias either.
+    assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100000000, "tex != shader VA");
+    assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100400000, "tex != output VA");
+    return 0;
+}
+
+fn test_native_texture_struct_round_trip() {
+    # Hand-pack a NativeTexture struct (no fd needed) and verify the
+    # field offsets thread through correctly.
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 0xCAFE);
+    store64(&tex + NATIVE_TEX_FIELD_VA,     _NATIVE_TEXTURE_VA_BASE);
+    store64(&tex + NATIVE_TEX_FIELD_ADDR,   0xBEEF);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   1024);
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_HANDLE), 0xCAFE,                "handle round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_VA),     _NATIVE_TEXTURE_VA_BASE, "va round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_ADDR),   0xBEEF,                "addr round-trips");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_SIZE),   1024,                  "size round-trips");
+    return 0;
+}
+
+fn test_native_texture_release_null_tex_safe() {
+    # Caller passes a null pointer — function must short-circuit
+    # before reading any fields. No syscalls expected.
+    var rc = native_texture_release_2d_rgba8(7, 0);
+    assert_eq(rc, 0, "null tex returns 0");
+    return 0;
+}
+
+fn test_native_texture_release_zero_handle_safe() {
+    # Tex struct exists but handle is 0 — function must short-
+    # circuit before va_unmap / bo_release_gtt (those would syscall
+    # with handle=0 and produce -EINVAL). Caller may release an
+    # uninitialised tex struct without panic.
+    var tex[32];
+    memset(&tex, 0, 32);
+    var rc = native_texture_release_2d_rgba8(7, &tex);
+    assert_eq(rc, 0, "zero-handle tex returns 0");
+    # All fields remain zero (no spurious writes).
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_HANDLE), 0, "handle stays 0");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_VA),     0, "va stays 0");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_ADDR),   0, "addr stays 0");
+    assert_eq(load64(&tex + NATIVE_TEX_FIELD_SIZE),   0, "size stays 0");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 5.5 — wgpu texture wrapper null-arg safety
+# ================================================================
+# The wgpu texture slot wrappers call into wgpu_device / queue
+# primitives that need a real GPU. CPU-only tests cover the
+# guard paths (null ctx, null tex, n mismatch, etc.) that
+# short-circuit before any wgpu call. End-to-end validation
+# happens in Step 5.9 via a phase0 Test 12 family.
+
+fn test_backend_wgpu_texture_create_null_ctx_returns_zero() {
+    var rc = _backend_wgpu_texture_create_2d_rgba8(0, 16, 16);
+    assert_eq(rc, 0, "null ctx → 0 (no struct allocated)");
+    return 0;
+}
+
+fn test_backend_wgpu_texture_create_zero_dim_returns_zero() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 0, 16),  0, "w=0 → 0");
+    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 16, 0),  0, "h=0 → 0");
+    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 0, 0),   0, "0x0 → 0");
+    return 0;
+}
+
+fn test_backend_wgpu_texture_write_null_args_err() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store32(&tex + 24, 16);
+    store32(&tex + 28, 16);
+    var src[64];
+    memset(&src, 0, 64);
+    assert_eq(_backend_wgpu_texture_write(0, &tex, &src, 1024),  GPU_ERR_OTHER,  "null ctx");
+    assert_eq(_backend_wgpu_texture_write(ctx, 0, &src, 1024),   GPU_ERR_OTHER,  "null tex");
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null src");
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 0),   GPU_ERR_BUFFER, "n=0");
+    return 0;
+}
+
+fn test_backend_wgpu_texture_write_size_mismatch_err() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store32(&tex + 24, 16);
+    store32(&tex + 28, 16);
+    var src[64];
+    memset(&src, 0, 64);
+    # 16x16 RGBA8 = 1024 bytes; passing 100 mismatches.
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 100), GPU_ERR_BUFFER, "n != w*h*4");
+    return 0;
+}
+
+fn test_backend_wgpu_texture_read_null_args_err() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store32(&tex + 24, 16);
+    store32(&tex + 28, 16);
+    var dst[64];
+    memset(&dst, 0, 64);
+    assert_eq(_backend_wgpu_texture_read(0, &tex, &dst, 1024),  GPU_ERR_OTHER,  "null ctx");
+    assert_eq(_backend_wgpu_texture_read(ctx, 0, &dst, 1024),   GPU_ERR_OTHER,  "null tex");
+    assert_eq(_backend_wgpu_texture_read(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null dst");
+    assert_eq(_backend_wgpu_texture_read(ctx, &tex, &dst, 0),   GPU_ERR_BUFFER, "n=0");
+    return 0;
+}
+
+fn test_backend_wgpu_texture_release_null_safe() {
+    assert_eq(_backend_wgpu_texture_release(0, 0), 0, "null ctx is safe");
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    assert_eq(_backend_wgpu_texture_release(ctx, 0), 0, "null tex is safe");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 5.6 — native texture wrapper safety
+# ================================================================
+# Native side wraps the Step 5.1+5.2 primitives. Create needs a
+# real fd to syscall into amdgpu, so CPU tests cover the guard
+# paths only (null ctx, zero dims, null src/dst, n mismatch).
+# Hardware end-to-end is Step 5.8 (programs/native_texture_e2e).
+
+fn test_backend_native_texture_create_null_ctx_returns_zero() {
+    var rc = _backend_native_texture_create_2d_rgba8(0, 16, 16);
+    assert_eq(rc, 0, "null ctx → 0 (no struct allocated)");
+    return 0;
+}
+
+fn test_backend_native_texture_create_zero_dim_returns_zero() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 0, 16),  0, "w=0 → 0");
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 16, 0),  0, "h=0 → 0");
+    assert_eq(_backend_native_texture_create_2d_rgba8(ctx, 0, 0),   0, "0x0 → 0");
+    return 0;
+}
+
+fn test_backend_native_texture_write_memcpy_round_trip() {
+    # Synth a tex struct with addr pointing at a CPU buffer (no GPU
+    # involvement on the native path — write is just memcpy onto
+    # the mmap'd pointer). Lets us test the write+read pair from
+    # CPU without the full create/release round-trip.
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var pixels[16];
+    memset(&pixels, 0, 16);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);  # non-zero so it doesn't look uninitialised
+    store64(&tex + NATIVE_TEX_FIELD_ADDR,   &pixels);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   16);
+    var src[16];
+    var i = 0;
+    while (i < 16) { store8(&src + i, i + 1); i = i + 1; }
+    var rc_w = _backend_native_texture_write(ctx, &tex, &src, 16);
+    assert_eq(rc_w, 0, "write returns 0");
+    # Verify memcpy actually moved bytes.
+    var j = 0;
+    while (j < 16) {
+        assert_eq(load8(&pixels + j), j + 1, "pixel byte matches src");
+        j = j + 1;
+    }
+    var dst[16];
+    memset(&dst, 0, 16);
+    var rc_r = _backend_native_texture_read(ctx, &tex, &dst, 16);
+    assert_eq(rc_r, 0, "read returns 0");
+    var k = 0;
+    while (k < 16) {
+        assert_eq(load8(&dst + k), k + 1, "dst byte matches pixel");
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn test_backend_native_texture_write_null_args_err() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   1024);
+    var src[8];
+    memset(&src, 0, 8);
+    assert_eq(_backend_native_texture_write(0, &tex, &src, 1024),  GPU_ERR_OTHER,  "null ctx");
+    assert_eq(_backend_native_texture_write(ctx, 0, &src, 1024),   GPU_ERR_OTHER,  "null tex");
+    assert_eq(_backend_native_texture_write(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null src");
+    assert_eq(_backend_native_texture_write(ctx, &tex, &src, 0),   GPU_ERR_BUFFER, "n=0");
+    # Tex with addr=0 (uninit) → err (catches the case where caller
+    # forgot to call create before write).
+    var tex2[32];
+    memset(&tex2, 0, 32);
+    store64(&tex2 + NATIVE_TEX_FIELD_SIZE, 1024);
+    assert_eq(_backend_native_texture_write(ctx, &tex2, &src, 1024), GPU_ERR_BUFFER, "addr=0");
+    return 0;
+}
+
+fn test_backend_native_texture_release_null_safe() {
+    assert_eq(_backend_native_texture_release(0, 0), 0, "null ctx is safe");
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    assert_eq(_backend_native_texture_release(ctx, 0), 0, "null tex is safe");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 5.7 — public gpu_texture_* dispatch through backend
+# ================================================================
+# Mock backend with counter+capture. Validates fncall threading on
+# all 4 dispatchers. fncall4 (write/read) is the new shape this
+# step exercises end-to-end.
+
+var _step57_create_count = 0;
+var _step57_create_ctx   = 0;
+var _step57_create_w     = 0;
+var _step57_create_h     = 0;
+
+fn _step57_create_capture(ctx, w, h) {
+    _step57_create_count = _step57_create_count + 1;
+    _step57_create_ctx = ctx;
+    _step57_create_w = w;
+    _step57_create_h = h;
+    return 0xCAFE;
+}
+
+fn test_gpu_texture_create_dispatches_through_backend() {
+    _step57_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, &_step57_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var got = gpu_texture_create_2d_rgba8(ctx, 64, 32);
+    assert_eq(got, 0xCAFE, "slot return propagates");
+    assert_eq(_step57_create_count, 1, "slot dispatched once");
+    assert_eq(_step57_create_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step57_create_w, 64, "arg 2 = width");
+    assert_eq(_step57_create_h, 32, "arg 3 = height");
+    return 0;
+}
+
+var _step57_write_count = 0;
+var _step57_write_ctx = 0;
+var _step57_write_tex = 0;
+var _step57_write_src = 0;
+var _step57_write_n   = 0;
+
+fn _step57_write_capture(ctx, tex, src, n) {
+    _step57_write_count = _step57_write_count + 1;
+    _step57_write_ctx = ctx;
+    _step57_write_tex = tex;
+    _step57_write_src = src;
+    _step57_write_n = n;
+    return 0;
+}
+
+fn test_gpu_texture_write_dispatches_through_backend() {
+    _step57_write_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_step57_write_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_texture_write(ctx, 0xBEEF, 0xCAFE, 1024);
+    assert_eq(rc, 0, "slot return propagates");
+    assert_eq(_step57_write_count, 1, "slot dispatched once");
+    assert_eq(_step57_write_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step57_write_tex, 0xBEEF, "arg 2 = tex");
+    assert_eq(_step57_write_src, 0xCAFE, "arg 3 = src");
+    assert_eq(_step57_write_n, 1024, "arg 4 = n");
+    return 0;
+}
+
+var _step57_read_count = 0;
+var _step57_read_ctx = 0;
+var _step57_read_tex = 0;
+var _step57_read_dst = 0;
+var _step57_read_n   = 0;
+
+fn _step57_read_capture(ctx, tex, dst, n) {
+    _step57_read_count = _step57_read_count + 1;
+    _step57_read_ctx = ctx;
+    _step57_read_tex = tex;
+    _step57_read_dst = dst;
+    _step57_read_n = n;
+    return 0;
+}
+
+fn test_gpu_texture_read_dispatches_through_backend() {
+    _step57_read_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ, &_step57_read_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_texture_read(ctx, 0xBEEF, 0xDEED, 2048);
+    assert_eq(rc, 0, "slot return propagates");
+    assert_eq(_step57_read_count, 1, "slot dispatched once");
+    assert_eq(_step57_read_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step57_read_tex, 0xBEEF, "arg 2 = tex");
+    assert_eq(_step57_read_dst, 0xDEED, "arg 3 = dst");
+    assert_eq(_step57_read_n, 2048, "arg 4 = n");
+    return 0;
+}
+
+var _step57_release_count = 0;
+var _step57_release_ctx = 0;
+var _step57_release_tex = 0;
+
+fn _step57_release_capture(ctx, tex) {
+    _step57_release_count = _step57_release_count + 1;
+    _step57_release_ctx = ctx;
+    _step57_release_tex = tex;
+    return 0;
+}
+
+fn test_gpu_texture_release_dispatches_through_backend() {
+    _step57_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_step57_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_texture_release(ctx, 0xBEEF);
+    assert_eq(rc, 0, "slot return propagates");
+    assert_eq(_step57_release_count, 1, "slot dispatched once");
+    assert_eq(_step57_release_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step57_release_tex, 0xBEEF, "arg 2 = tex");
+    return 0;
+}
+
+fn test_gpu_texture_dispatchers_null_ctx_safe() {
+    _step57_create_count = 0;
+    _step57_write_count = 0;
+    _step57_read_count = 0;
+    _step57_release_count = 0;
+    assert_eq(gpu_texture_create_2d_rgba8(0, 16, 16), 0, "create null ctx = 0");
+    assert_eq(gpu_texture_write(0, 0, 0, 0), GPU_ERR_OTHER, "write null ctx = err");
+    assert_eq(gpu_texture_read(0, 0, 0, 0), GPU_ERR_OTHER, "read null ctx = err");
+    assert_eq(gpu_texture_release(0, 0), 0, "release null ctx = 0");
+    assert_eq(_step57_create_count, 0, "create did not dispatch");
+    assert_eq(_step57_write_count, 0, "write did not dispatch");
+    assert_eq(_step57_read_count, 0, "read did not dispatch");
+    assert_eq(_step57_release_count, 0, "release did not dispatch");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.3 — native render target primitives (Phase C render)
+# ================================================================
+# CPU-only tests for the RT allocator + release pair. End-to-end
+# hardware validation lands in Step 6.9 (programs/native_render_e2e).
+
+fn test_native_rt_size_formula() {
+    assert_eq(native_rt_size_2d_rgba8(1, 1),     4,        "1x1 = 4 bytes");
+    assert_eq(native_rt_size_2d_rgba8(64, 32),   8192,     "64x32");
+    assert_eq(native_rt_size_2d_rgba8(256, 256), 262144,   "256x256");
+    assert_eq(native_rt_size_2d_rgba8(0, 0),     0,        "0x0 degenerate");
+    return 0;
+}
+
+fn test_native_rt_struct_field_offsets() {
+    assert_eq(NATIVE_RT_FIELD_HANDLE, 0,  "handle at +0");
+    assert_eq(NATIVE_RT_FIELD_VA,     8,  "va at +8");
+    assert_eq(NATIVE_RT_FIELD_ADDR,   16, "addr at +16");
+    assert_eq(NATIVE_RT_FIELD_SIZE,   24, "size at +24");
+    assert_eq(NATIVE_RT_FIELD_WIDTH,  32, "width at +32");
+    assert_eq(NATIVE_RT_FIELD_HEIGHT, 36, "height at +36");
+    assert_eq(NATIVE_RT_STRUCT_SIZE,  40, "total = 40");
+    return 0;
+}
+
+fn test_native_rt_va_distinct_from_other_pools() {
+    # RT VA must not collide with shader / stub / IB / fence /
+    # output / texture VAs. Catches the "moved a VA constant"
+    # mistake before runtime.
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_STUB_VA,            "rt != stub");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_IB_VA,              "rt != IB");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_FENCE_VA,           "rt != fence");
+    assert(_NATIVE_RT_VA_BASE != _NATIVE_TEXTURE_VA_BASE,    "rt != texture");
+    assert(_NATIVE_RT_VA_BASE != 0xFFFF800100000000,         "rt != shader VA");
+    assert(_NATIVE_RT_VA_BASE != 0xFFFF800100400000,         "rt != output VA");
+    return 0;
+}
+
+fn test_native_rt_struct_round_trip() {
+    var rt[40];
+    memset(&rt, 0, 40);
+    store64(&rt + NATIVE_RT_FIELD_HANDLE, 0xCAFE);
+    store64(&rt + NATIVE_RT_FIELD_VA,     _NATIVE_RT_VA_BASE);
+    store64(&rt + NATIVE_RT_FIELD_ADDR,   0xBEEF);
+    store64(&rt + NATIVE_RT_FIELD_SIZE,   8192);
+    store32(&rt + NATIVE_RT_FIELD_WIDTH,  64);
+    store32(&rt + NATIVE_RT_FIELD_HEIGHT, 32);
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_HANDLE), 0xCAFE,            "handle round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_VA),     _NATIVE_RT_VA_BASE, "va round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_ADDR),   0xBEEF,            "addr round-trips");
+    assert_eq(load64(&rt + NATIVE_RT_FIELD_SIZE),   8192,              "size round-trips");
+    assert_eq(load32(&rt + NATIVE_RT_FIELD_WIDTH),  64,                "width round-trips");
+    assert_eq(load32(&rt + NATIVE_RT_FIELD_HEIGHT), 32,                "height round-trips");
+    return 0;
+}
+
+fn test_native_rt_release_safe_zero() {
+    var rt[40];
+    memset(&rt, 0, 40);
+    assert_eq(native_rt_release_2d_rgba8(7, 0),    0, "null rt is safe");
+    assert_eq(native_rt_release_2d_rgba8(7, &rt),  0, "zero-handle rt is safe");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.4 — SET_CONTEXT_REG + DRAW_INDEX_AUTO PM4 builders
+# ================================================================
+# Byte-exact tests for the new graphics-side PM4 emitters. The
+# wire format mirrors SET_SH_REG / SET_UCONFIG_REG; differences
+# are the opcode and the dword-offset base. Step 6.5 will validate
+# these byte sequences against radv's output for a full clear-
+# triangle dispatch (the existing Phase B.4 protocol).
+
+fn test_native_pm4_opcodes_extended() {
+    assert_eq(IT_SET_CONTEXT_REG, 0x69, "SET_CONTEXT_REG opcode");
+    assert_eq(IT_DRAW_INDEX_AUTO, 0x2D, "DRAW_INDEX_AUTO opcode");
+    assert_eq(PM4_CONTEXT_REG_BASE, 0xA000, "context-reg base byte address");
+    return 0;
+}
+
+fn test_native_context_reg_offset_encoding() {
+    # Synthetic 4-aligned context-register addresses. Specific R_*
+    # register values land in Step 6.5 against radv's IB dump.
+    assert_eq(native_context_reg_offset(0xA000), 0,    "base address → 0");
+    assert_eq(native_context_reg_offset(0xA00C), 3,    "+12 bytes → dw offset 3");
+    assert_eq(native_context_reg_offset(0xA238), 0x8E, "+0x238 bytes → dw 0x8E");
+    assert_eq(native_context_reg_offset(0xA318), 0xC6, "+0x318 bytes → dw 0xC6");
+    assert_eq(native_context_reg_offset(0xA31C), 0xC7, "+0x31C bytes → dw 0xC7");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_one_layout() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    # Use 0xA238 (synthetic; happens to match radv's CB_TARGET_MASK)
+    var pos = native_pm4_set_context_reg_one(&buf, 0, 0xA238, 0xF);
+    assert_eq(pos, 12, "single-reg context-set = 3 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=2, 0) → count_minus_1=1
+    # → (3<<30) | (1<<16) | (0x69<<8) = 0xC0016900.
+    assert_eq(load32(&buf + 0), 0xC0016900, "header bytes");
+    assert_eq(load32(&buf + 4), 0x8E,       "reg_offset dword (0x238/4)");
+    assert_eq(load32(&buf + 8), 0xF,        "value");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_pair_layout() {
+    var buf[20];
+    memset(&buf, 0xFF, 20);
+    var values[8];
+    store32(&values + 0, 0xAAAAAAAA);
+    store32(&values + 4, 0xBBBBBBBB);
+    # Use 0xA00C (synthetic; happens to match a scissor TL register)
+    var pos = native_pm4_set_context_reg_pair(&buf, 0, 0xA00C, &values);
+    assert_eq(pos, 16, "pair context-set = 4 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=3, 0) → count_minus_1=2
+    # → 0xC0026900.
+    assert_eq(load32(&buf + 0),  0xC0026900, "header bytes");
+    assert_eq(load32(&buf + 4),  3,           "reg_offset dw (0xC/4)");
+    assert_eq(load32(&buf + 8),  0xAAAAAAAA, "value 0");
+    assert_eq(load32(&buf + 12), 0xBBBBBBBB, "value 1");
+    return 0;
+}
+
+fn test_native_pm4_set_context_reg_multi_layout() {
+    # 4-register write — common for CB_COLOR0_PITCH/_SLICE/_VIEW/_INFO
+    # in a single packet.
+    var buf[28];
+    memset(&buf, 0xFF, 28);
+    var values[16];
+    store32(&values +  0, 0x11);
+    store32(&values +  4, 0x22);
+    store32(&values +  8, 0x33);
+    store32(&values + 12, 0x44);
+    # Use 0xA31C (synthetic; matches CB_COLOR0_PITCH per Mesa sid.h)
+    var pos = native_pm4_set_context_reg(&buf, 0, 0xA31C, 4, &values);
+    assert_eq(pos, 24, "multi(4) context-set = 6 dwords");
+    # Header: PKT3(IT_SET_CONTEXT_REG, count=5, 0) → count_minus_1=4
+    # → 0xC0046900.
+    assert_eq(load32(&buf + 0), 0xC0046900, "header bytes");
+    assert_eq(load32(&buf + 4), 0xC7,       "reg_offset dw (0x31C/4)");
+    assert_eq(load32(&buf + 8),  0x11, "value 0");
+    assert_eq(load32(&buf + 12), 0x22, "value 1");
+    assert_eq(load32(&buf + 16), 0x33, "value 2");
+    assert_eq(load32(&buf + 20), 0x44, "value 3");
+    return 0;
+}
+
+fn test_native_pm4_draw_index_auto_layout() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    var pos = native_pm4_draw_index_auto(&buf, 0, 3, DI_SRC_SEL_AUTO_INDEX);
+    assert_eq(pos, 12, "DRAW_INDEX_AUTO = 3 dwords");
+    # Header: PKT3(IT_DRAW_INDEX_AUTO, count=2, 0) → count_minus_1=1
+    # → (3<<30) | (1<<16) | (0x2D<<8) = 0xC0012D00.
+    assert_eq(load32(&buf + 0), 0xC0012D00, "header bytes");
+    assert_eq(load32(&buf + 4), 3,          "vertex_count");
+    assert_eq(load32(&buf + 8), 0x02,       "draw_initiator (auto-index)");
+    return 0;
+}
+
+fn test_native_pm4_di_src_sel_constant() {
+    # DI_SRC_SEL_AUTO_INDEX is the source-select bits for an auto-
+    # index draw. Standard value per Mesa's V_0287F0_DI_SRC_SEL_AUTO_INDEX = 2.
+    assert_eq(DI_SRC_SEL_AUTO_INDEX, 0x02, "auto-index source select");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
+# ================================================================
+# Value-asserts for the spec-anchored constants in
+# src/backend_native.cyr Step 6.2(a) section. Pattern follows the
+# 4f.ii lesson — every computed/spec-derived constant that the PM4
+# stream will eventually emit gets a CPU value-assert so a typo
+# surfaces at test time, not at hardware-debug time.
+
+fn test_gfx9_vs_sh_register_addresses() {
+    # VS shader-program registers (Mesa: R_00B12{0,4,8,C}_SPI_SHADER_*_VS).
+    assert_eq(R_SPI_SHADER_PGM_LO_VS,    0xB120, "VS PGM_LO byte addr");
+    assert_eq(R_SPI_SHADER_PGM_HI_VS,    0xB124, "VS PGM_HI byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC1_VS, 0xB128, "VS PGM_RSRC1 byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC2_VS, 0xB12C, "VS PGM_RSRC2 byte addr");
+    # Wire-form: (addr - 0xB000) / 4. 0xB120 → 0x48, sequential by 1.
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_LO_VS),    0x48, "VS PGM_LO wire");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_RSRC2_VS), 0x4B, "VS PGM_RSRC2 wire");
+    return 0;
+}
+
+fn test_gfx9_ps_sh_register_addresses() {
+    # PS shader-program registers (Mesa: R_00B02{0,4,8,C}_SPI_SHADER_*_PS).
+    assert_eq(R_SPI_SHADER_PGM_LO_PS,    0xB020, "PS PGM_LO byte addr");
+    assert_eq(R_SPI_SHADER_PGM_HI_PS,    0xB024, "PS PGM_HI byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC1_PS, 0xB028, "PS PGM_RSRC1 byte addr");
+    assert_eq(R_SPI_SHADER_PGM_RSRC2_PS, 0xB02C, "PS PGM_RSRC2 byte addr");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_LO_PS),    0x08, "PS PGM_LO wire");
+    assert_eq(native_sh_reg_offset(R_SPI_SHADER_PGM_RSRC2_PS), 0x0B, "PS PGM_RSRC2 wire");
+    return 0;
+}
+
+fn test_gfx9_spi_format_register_addresses() {
+    # SPI shader output format context regs (Mesa gfx9.json:
+    # POS_FORMAT=0x02870C, Z_FORMAT=0x028710, COL_FORMAT=0x028714).
+    # Mabda 0xA-shorthand (synthetic 0xA000 base) produces identical wire form.
+    assert_eq(R_SPI_SHADER_POS_FORMAT, 0xA70C, "SPI_SHADER_POS_FORMAT byte addr");
+    assert_eq(R_SPI_SHADER_Z_FORMAT,   0xA710, "SPI_SHADER_Z_FORMAT byte addr");
+    assert_eq(R_SPI_SHADER_COL_FORMAT, 0xA714, "SPI_SHADER_COL_FORMAT byte addr");
+    # Wire-form: (addr - 0xA000) / 4. 0xA70C → 0x1C3, etc.
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_POS_FORMAT), 0x1C3, "POS_FORMAT wire");
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_Z_FORMAT),   0x1C4, "Z_FORMAT wire");
+    assert_eq(native_context_reg_offset(R_SPI_SHADER_COL_FORMAT), 0x1C5, "COL_FORMAT wire");
+    return 0;
+}
+
+fn test_gfx9_cb_target_mask_address() {
+    # Pipeline-static color-buffer write mask (Mesa R_028238_CB_TARGET_MASK).
+    # Wire form 0x8E was already exercised by test_native_pm4_set_context_reg_one_layout
+    # using the synthetic literal 0xA238; this assert pins the named constant.
+    assert_eq(R_CB_TARGET_MASK, 0xA238, "CB_TARGET_MASK byte addr");
+    assert_eq(native_context_reg_offset(R_CB_TARGET_MASK), 0x8E, "CB_TARGET_MASK wire");
+    return 0;
+}
+
+fn test_gfx9_pgm_rsrc_minimums() {
+    # RSRC1: VS+PS share the compute minimum (FLOAT_MODE 0xC0, SGPRS=1, DX10_CLAMP, IEEE).
+    assert_eq(GFX9_GFX_PGM_RSRC1_MIN, 0x2C0040, "GFX RSRC1 minimum value");
+    assert_eq(GFX9_GFX_PGM_RSRC1_MIN, GFX9_COMPUTE_PGM_RSRC1_MIN, "GFX RSRC1 mirrors compute");
+    # RSRC2: zero for trivial shape (no USER_SGPR, no scratch, no LDS).
+    # Hazard: PS may need TRAP_PRESENT (bit 6) on GFX9 if the FS does memory ops;
+    # the trivial solid-color FS does not, so 0 is the spec minimum.
+    assert_eq(GFX9_VS_PGM_RSRC2_MIN, 0x0, "VS RSRC2 minimum");
+    assert_eq(GFX9_PS_PGM_RSRC2_MIN, 0x0, "PS RSRC2 minimum");
+    return 0;
+}
+
+fn test_gfx9_spi_format_field_values() {
+    # POS_FORMAT = FLOAT_4 — VS exports four f32 lanes.
+    assert_eq(SPI_SHADER_POS_FORMAT_4, 0x4, "POS_FORMAT FLOAT_4");
+    # Z_FORMAT = INVALID — FS does not export depth.
+    assert_eq(SPI_SHADER_Z_FORMAT_INVALID, 0x0, "Z_FORMAT INVALID");
+    # COL_FORMAT candidates for RGBA8 RT — Step 6.5 picks one and verifies
+    # by CPU-readback. Default is FP32_ABGR (FS writes f32; export quantizes).
+    assert_eq(SPI_SHADER_COL_FORMAT_FP16_ABGR,    0x9, "COL_FORMAT FP16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_UNORM16_ABGR, 0xA, "COL_FORMAT UNORM16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_FP32_ABGR,    0xE, "COL_FORMAT FP32_ABGR");
+    return 0;
+}
+
+fn test_gfx9_fullscreen_triangle_vertex_count() {
+    # Full-screen triangle: 3 vertices generated from vertex_id 0/1/2
+    # via switch in the VS body (no VBO).
+    assert_eq(GFX9_FULLSCREEN_TRI_VCOUNT, 3, "full-screen triangle vertex count");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.2(b) — fragment shader bytes (solid red FS)
+# ================================================================
+# Pin every dword the FS encoder emits, plus the total byte count.
+# Per the 4f.ii lesson, value-asserting every spec-derived constant
+# at CPU test time means a typo in an instruction encoding (top
+# byte 0x7E for VOP1, 0xF8 for EXP, 0xBF for SOPP) surfaces here
+# rather than as a TDR on hardware. Header citations live in
+# src/backend_native.cyr Step 6.2(b) section.
+
+fn test_gfx9_fs_solid_red_byte_pattern() {
+    var buf[96];
+    memset(&buf, 0xCC, 96);
+    var pos = native_gfx9_shader_solid_red(&buf, 0);
+    assert_eq(pos, GFX9_FS_SOLID_RED_SIZE, "FS shader writes 92 bytes");
+    assert_eq(GFX9_FS_SOLID_RED_SIZE, 92, "FS size constant");
+
+    # Four v_mov_b32_e32 instructions setting v0..v3 to (1.0, 0.0, 0.0, 1.0).
+    # VOP1 top byte = 0x7E. Inline constants 242 = 1.0, 128 = 0.0.
+    assert_eq(load32(&buf +  0), 0x7E0002F2, "v_mov v0, 1.0");
+    assert_eq(load32(&buf +  4), 0x7E020280, "v_mov v1, 0.0");
+    assert_eq(load32(&buf +  8), 0x7E040280, "v_mov v2, 0.0");
+    assert_eq(load32(&buf + 12), 0x7E0602F2, "v_mov v3, 1.0");
+
+    # EXP instruction (8 bytes, 2 dwords). Top byte 0xF8 (encoding
+    # 0x3E in bits 26-31). Word 0 carries en/tgt/done/vm flags;
+    # word 1 carries vsrc0..3.
+    assert_eq(load32(&buf + 16), 0xF800180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 20), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
+
+    # s_endpgm (SOPP, 0xBF810000) — same byte pattern as compute.
+    assert_eq(load32(&buf + 24), 0xBF810000, "s_endpgm");
+
+    # 16 NOP-padding dwords (s_nop 0 = 0xBF800000) — AMDGPU prefetch
+    # requirement; matches the compute shader's tail.
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 28 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_gfx9_fs_solid_red_alignment() {
+    # The FS payload must be 4-byte aligned (every store is 32-bit)
+    # and the total size must be a multiple of 4 — confirming PM4
+    # set_sh_reg can point PGM_LO/HI at any 256-byte-aligned BO offset
+    # without unaligned-instruction hazards. The 92-byte size leaves
+    # 164 bytes of slack within a 256-byte-aligned shader BO slot;
+    # the BO allocator at Step 6.5 sizes accordingly.
+    assert_eq(GFX9_FS_SOLID_RED_SIZE % 4, 0, "FS size is dword-aligned");
+    return 0;
+}
+
+fn test_gfx9_vs_fullscreen_triangle_byte_pattern() {
+    # VS bytes cross-checked against `clang -target amdgcn--amdhsa
+    # -mcpu=gfx90c -O2` of the equivalent CL kernel. The arithmetic
+    # VOP2 opcodes (v_lshlrev_b32 = 0x12, v_and_b32 = 0x13, v_add_u32
+    # = 0x34) are ABI-independent, so the compute-ABI disassembly
+    # gives authoritative encodings for the graphics-ABI shader.
+    var buf[128];
+    memset(&buf, 0xCC, 128);
+    var pos = native_gfx9_shader_fullscreen_triangle_vs(&buf, 0);
+    assert_eq(pos, GFX9_VS_FULLSCREEN_TRIANGLE_SIZE, "VS shader writes 116 bytes");
+    assert_eq(GFX9_VS_FULLSCREEN_TRIANGLE_SIZE, 116, "VS size constant");
+
+    # VOP2 arithmetic: shift, mask, subtract — all top byte 0x24/0x26/0x68
+    # (opcodes 0x12, 0x13, 0x34 in bits 30-25).
+    assert_eq(load32(&buf +  0), 0x24040081, "v_lshlrev_b32 v2, 1, v0");
+    assert_eq(load32(&buf +  4), 0x24000082, "v_lshlrev_b32 v0, 2, v0");
+    assert_eq(load32(&buf +  8), 0x26000084, "v_and_b32 v0, 4, v0");
+    assert_eq(load32(&buf + 12), 0x26040484, "v_and_b32 v2, 4, v2");
+    assert_eq(load32(&buf + 16), 0x680000C1, "v_add_u32 v0, -1, v0");
+    assert_eq(load32(&buf + 20), 0x680404C1, "v_add_u32 v2, -1, v2");
+
+    # VOP1 cvt + mov — top byte 0x7E. cvt opcode 5, mov opcode 1.
+    # VGPR src in 9-bit src0 starts at 256 (v0=0x100, v1=0x101, v2=0x102).
+    assert_eq(load32(&buf + 24), 0x7E000B00, "v_cvt_f32_i32 v0, v0");
+    assert_eq(load32(&buf + 28), 0x7E020B02, "v_cvt_f32_i32 v1, v2");
+    assert_eq(load32(&buf + 32), 0x7E040280, "v_mov v2, 0.0");
+    assert_eq(load32(&buf + 36), 0x7E0602F2, "v_mov v3, 1.0");
+
+    # EXP pos0 done — top byte 0xF8. tgt=12 (pos0) in bits 4-9.
+    # exp pos0 done en=0xF: 0xF8000000 | (1<<11) | (12<<4) | 0xF = 0xF80008CF.
+    assert_eq(load32(&buf + 40), 0xF80008CF, "exp pos0 done word 0");
+    assert_eq(load32(&buf + 44), 0x03020100, "exp pos0 vsrc0..3 = v0..v3");
+
+    # s_endpgm — same as compute and FS.
+    assert_eq(load32(&buf + 48), 0xBF810000, "s_endpgm");
+
+    # 16 NOP padding dwords.
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 52 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_gfx9_vs_fullscreen_triangle_alignment() {
+    # Dword-aligned, fits within a 256-byte-aligned shader BO slot
+    # with 140 bytes of slack. Step 6.5 sizes the VS BO accordingly.
+    assert_eq(GFX9_VS_FULLSCREEN_TRIANGLE_SIZE % 4, 0, "VS size is dword-aligned");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.5(a) — clear-triangle PM4 register addresses + values
+# ================================================================
+# Pin every constant added for the Step 6.5(b) PM4 stream composer.
+# Values extracted from the authoritative Mesa
+# src/amd/registers/gfx9.json (fetched 2026-04-30); pinning here
+# means a typo in transcription surfaces at CPU test time. Group
+# follows the 3-block PM4 split in
+# docs/proposals/v3-backend-interface.md v2.1.
+
+fn test_gfx9_pipeline_ctx_register_addresses() {
+    # Color/blend mode.
+    assert_eq(R_CB_SHADER_MASK,    0xA23C, "CB_SHADER_MASK byte addr");
+    assert_eq(R_CB_COLOR_CONTROL,  0xA808, "CB_COLOR_CONTROL byte addr");
+    assert_eq(R_CB_BLEND0_CONTROL, 0xA780, "CB_BLEND0_CONTROL byte addr");
+    # Rasterizer / clip mode.
+    assert_eq(R_PA_SU_SC_MODE_CNTL, 0xA814, "PA_SU_SC_MODE_CNTL byte addr");
+    assert_eq(R_PA_CL_CLIP_CNTL,    0xA810, "PA_CL_CLIP_CNTL byte addr");
+    # Stage enable + reuse.
+    assert_eq(R_VGT_SHADER_STAGES_EN, 0xAB54, "VGT_SHADER_STAGES_EN byte addr");
+    assert_eq(R_VGT_REUSE_OFF,        0xAAB4, "VGT_REUSE_OFF byte addr");
+    # SPI inputs/outputs.
+    assert_eq(R_SPI_PS_INPUT_ENA,  0xA6CC, "SPI_PS_INPUT_ENA byte addr");
+    assert_eq(R_SPI_PS_INPUT_ADDR, 0xA6D0, "SPI_PS_INPUT_ADDR byte addr");
+    assert_eq(R_SPI_PS_IN_CONTROL, 0xA6D8, "SPI_PS_IN_CONTROL byte addr");
+    assert_eq(R_SPI_VS_OUT_CONFIG, 0xA6C4, "SPI_VS_OUT_CONFIG byte addr");
+    # Depth/stencil.
+    assert_eq(R_DB_SHADER_CONTROL,   0xA80C, "DB_SHADER_CONTROL byte addr");
+    assert_eq(R_DB_HTILE_SURFACE,    0xAABC, "DB_HTILE_SURFACE byte addr");
+    assert_eq(R_DB_RENDER_OVERRIDE,  0xA00C, "DB_RENDER_OVERRIDE byte addr");
+    assert_eq(R_DB_RENDER_OVERRIDE2, 0xA010, "DB_RENDER_OVERRIDE2 byte addr");
+    return 0;
+}
+
+fn test_gfx9_pass_target_register_addresses() {
+    # Scissors.
+    assert_eq(R_PA_SC_SCREEN_SCISSOR_TL,  0xA030, "SCREEN_SCISSOR_TL byte addr");
+    assert_eq(R_PA_SC_SCREEN_SCISSOR_BR,  0xA034, "SCREEN_SCISSOR_BR byte addr");
+    assert_eq(R_PA_SC_GENERIC_SCISSOR_TL, 0xA240, "GENERIC_SCISSOR_TL byte addr");
+    assert_eq(R_PA_SC_GENERIC_SCISSOR_BR, 0xA244, "GENERIC_SCISSOR_BR byte addr");
+    # Viewport (xyz scale + offset for VPORT_0).
+    assert_eq(R_PA_CL_VPORT_XSCALE,  0xA43C, "VPORT_XSCALE byte addr");
+    assert_eq(R_PA_CL_VPORT_XOFFSET, 0xA440, "VPORT_XOFFSET byte addr");
+    assert_eq(R_PA_CL_VPORT_YSCALE,  0xA444, "VPORT_YSCALE byte addr");
+    assert_eq(R_PA_CL_VPORT_YOFFSET, 0xA448, "VPORT_YOFFSET byte addr");
+    assert_eq(R_PA_CL_VPORT_ZSCALE,  0xA44C, "VPORT_ZSCALE byte addr");
+    assert_eq(R_PA_CL_VPORT_ZOFFSET, 0xA450, "VPORT_ZOFFSET byte addr");
+    assert_eq(R_PA_SC_VPORT_ZMIN_0,  0xA2D0, "VPORT_ZMIN_0 byte addr");
+    assert_eq(R_PA_SC_VPORT_ZMAX_0,  0xA2D4, "VPORT_ZMAX_0 byte addr");
+    # Raster engine + AA + screen offset.
+    assert_eq(R_PA_SC_RASTER_CONFIG,           0xA350, "PA_SC_RASTER_CONFIG byte addr");
+    assert_eq(R_PA_SC_AA_CONFIG,               0xABE0, "PA_SC_AA_CONFIG byte addr");
+    assert_eq(R_PA_SU_HARDWARE_SCREEN_OFFSET,  0xA234, "PA_SU_HARDWARE_SCREEN_OFFSET byte addr");
+    # CB_COLOR0 RT bind.
+    assert_eq(R_CB_COLOR0_BASE,        0xAC60, "CB_COLOR0_BASE byte addr");
+    assert_eq(R_CB_COLOR0_BASE_EXT,    0xAC64, "CB_COLOR0_BASE_EXT byte addr");
+    assert_eq(R_CB_COLOR0_VIEW,        0xAC6C, "CB_COLOR0_VIEW byte addr");
+    assert_eq(R_CB_COLOR0_INFO,        0xAC70, "CB_COLOR0_INFO byte addr");
+    assert_eq(R_CB_COLOR0_ATTRIB,      0xAC74, "CB_COLOR0_ATTRIB byte addr");
+    assert_eq(R_CB_COLOR0_DCC_CONTROL, 0xAC78, "CB_COLOR0_DCC_CONTROL byte addr");
+    return 0;
+}
+
+fn test_gfx9_uconfig_graphics_register_addresses() {
+    # UConfig regs encode at their real MMIO byte addresses.
+    assert_eq(R_VGT_PRIMITIVE_TYPE, 0x30908, "VGT_PRIMITIVE_TYPE byte addr");
+    assert_eq(R_VGT_NUM_INSTANCES,  0x30934, "VGT_NUM_INSTANCES byte addr");
+    return 0;
+}
+
+fn test_gfx9_pipeline_ctx_value_constants() {
+    assert_eq(GFX9_CB_TARGET_MASK_RGBA,         0xF,   "CB_TARGET_MASK RGBA all");
+    assert_eq(GFX9_CB_SHADER_MASK_RGBA0,        0xF,   "CB_SHADER_MASK RT0 RGBA");
+    assert_eq(GFX9_CB_COLOR_CONTROL_NORMAL,     0xCC,  "CB_COLOR_CONTROL NORMAL ROP");
+    assert_eq(GFX9_CB_BLEND_DISABLED,           0x0,   "CB blend disabled");
+    assert_eq(GFX9_PA_SU_SC_MODE_CULL_NONE,     0x4,   "PA_SU_SC_MODE cull none");
+    assert_eq(GFX9_VGT_SHADER_STAGES_VS_PS,     0x0,   "VGT stages VS+PS only");
+    assert_eq(GFX9_PA_CL_CLIP_CNTL_DEFAULT,     0x90000, "PA_CL_CLIP_CNTL default");
+    assert_eq(GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, 0x4, "VGT primitive triangle list");
+    assert_eq(GFX9_VGT_NUM_INSTANCES_ONE,       0x1,   "VGT num instances 1");
+    assert_eq(GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN, 0x2,   "SPI_PS_INPUT min for hang quirk");
+    assert_eq(GFX9_SPI_VS_OUT_CONFIG_NO_VARYING, 0x0,  "SPI_VS_OUT_CONFIG no varying");
+    assert_eq(GFX9_DB_SHADER_CONTROL_DEFAULT,   0x10,  "DB_SHADER_CONTROL default");
+    # Composed bit-pattern values.
+    assert_eq(GFX9_CB_COLOR_CONTROL_NORMAL_COPY, 0xCC0010, "CB_COLOR_CONTROL composed");
+    assert_eq(GFX9_CB_COLOR0_INFO_RGBA8_UNORM,   0x28,     "CB_COLOR0_INFO RGBA8 unorm");
+    assert_eq(GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8, 0x10000000, "CB_COLOR0_ATTRIB 2D linear");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.5(b) — PM4 stream composer for clear-triangle dispatch
+# ================================================================
+# Verifies the four PM4 blocks compose correctly and produce the
+# expected wire-form dwords. CPU-asserted by-construction. Layer-2
+# verification (byte-exact vs radv-IB capture) gated on Hyprland.
+
+fn test_native_int_to_f32_bits_and_negate() {
+    # 0 → 0x00000000, 1 → 0x3F800000, 128 → 0x43000000, 256 → 0x43800000.
+    assert_eq(native_int_to_f32_bits(0),    0x00000000, "int 0 → f32 bits");
+    assert_eq(native_int_to_f32_bits(1),    0x3F800000, "int 1 → f32 bits");
+    assert_eq(native_int_to_f32_bits(128),  0x43000000, "int 128 → f32 bits");
+    assert_eq(native_int_to_f32_bits(256),  0x43800000, "int 256 → f32 bits");
+
+    # Negation flips the sign bit. -1.0 = 0xBF800000, -128.0 = 0xC3000000.
+    assert_eq(native_f32_neg_bits(0x3F800000), 0xBF800000, "neg 1.0");
+    assert_eq(native_f32_neg_bits(0x43000000), 0xC3000000, "neg 128.0");
+    # Negating 0.0 produces -0.0 = 0x80000000 (sign-bit flip).
+    assert_eq(native_f32_neg_bits(0x00000000), 0x80000000, "neg 0.0");
+    return 0;
+}
+
+fn test_native_pm4_render_pipeline_sh_layout() {
+    # VS at VA 0xFFFF800200000000, FS at VA 0xFFFF800200001000.
+    # VS PGM_LO = (vs_va >> 8) & 0xFFFFFFFF
+    #          = (0xFFFF800200000000 >> 8) & 0xFFFFFFFF
+    #          = 0x02000000.
+    # VS PGM_HI = (vs_va >> 40) & 0xFFFFFFFF
+    #          = 0xFFFF8002 & 0xFFFFFFFF = 0xFFFF8002.
+    var buf[64];
+    memset(&buf, 0xCC, 64);
+    var pos = native_pm4_build_render_pipeline_sh(&buf, 0,
+                                                  0xFFFF800200000000,
+                                                  0xFFFF800200001000);
+    # Two SET_SH_REG packets, each 4 values: 6 dwords each = 12 dwords = 48 bytes.
+    assert_eq(pos, 48, "pipeline_sh size = 48 bytes");
+
+    # First packet header — SET_SH_REG opcode 0x76, count_minus_1 = 4
+    # (n+1 = 5 data dwords, count field stores n+1-1 = 4).
+    # Header: 0xC0_count_minus_1<<16_0x76<<8 = 0xC0047600.
+    assert_eq(load32(&buf + 0), 0xC0047600, "VS SET_SH_REG header");
+    assert_eq(load32(&buf + 4), 0x48, "VS PGM_LO wire offset (0xB120 → 0x48)");
+    # vs_va = 0xFFFF800200000000.
+    # PGM_LO = (va >> 8) & 0xFFFFFFFF = 0x02000000 (Cyrius >> is logical).
+    # PGM_HI = (va >> 40) & 0xFF = bits [47:40] of va = 0x80.
+    assert_eq(load32(&buf + 8),  0x02000000, "VS PGM_LO = (vs_va>>8) low");
+    assert_eq(load32(&buf + 12), 0x80,       "VS PGM_HI = (vs_va>>40) byte");
+    assert_eq(load32(&buf + 16), GFX9_GFX_PGM_RSRC1_MIN, "VS PGM_RSRC1");
+    assert_eq(load32(&buf + 20), GFX9_VS_PGM_RSRC2_MIN, "VS PGM_RSRC2");
+
+    # Second packet — PS at offset +24 in buf.
+    # fs_va = 0xFFFF800200001000 → PGM_LO = 0x02000010, PGM_HI = 0x80.
+    assert_eq(load32(&buf + 24), 0xC0047600, "PS SET_SH_REG header");
+    assert_eq(load32(&buf + 28), 0x08, "PS PGM_LO wire offset (0xB020 → 0x08)");
+    assert_eq(load32(&buf + 32), 0x02000010, "PS PGM_LO = (fs_va>>8) low");
+    assert_eq(load32(&buf + 36), 0x80,       "PS PGM_HI = (fs_va>>40) byte");
+    assert_eq(load32(&buf + 40), GFX9_GFX_PGM_RSRC1_MIN, "PS PGM_RSRC1");
+    assert_eq(load32(&buf + 44), GFX9_PS_PGM_RSRC2_MIN, "PS PGM_RSRC2");
+    return 0;
+}
+
+fn test_native_pm4_render_pipeline_ctx_size_and_anchors() {
+    # 2 grouped packets (3+2 values) + 17 singletons = 5+4+17*3 = 60 dw = 240 bytes.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pipeline_ctx(&buf, 0);
+    assert_eq(pos, 240, "pipeline_ctx size = 240 bytes");
+
+    # First packet = SPI shader formats, 3 values starting at POS_FORMAT.
+    # Header: PKT3(SET_CONTEXT_REG, count_minus_1=3, 0) = 0xC0036900.
+    assert_eq(load32(&buf + 0), 0xC0036900, "SPI fmts SET_CONTEXT_REG header");
+    # Wire offset = (0xA70C - 0xA000) / 4 = 0x70C/4 = 0x1C3.
+    assert_eq(load32(&buf + 4),  0x1C3, "POS_FORMAT wire offset");
+    assert_eq(load32(&buf + 8),  SPI_SHADER_POS_FORMAT_4,     "SPI POS_FORMAT");
+    assert_eq(load32(&buf + 12), SPI_SHADER_Z_FORMAT_INVALID, "SPI Z_FORMAT");
+    assert_eq(load32(&buf + 16), SPI_SHADER_COL_FORMAT_FP32_ABGR, "SPI COL_FORMAT");
+
+    # Second packet = CB target/shader masks at +20 in buf.
+    assert_eq(load32(&buf + 20), 0xC0026900, "CB masks SET_CONTEXT_REG header");
+    # Wire offset = (0xA238 - 0xA000) / 4 = 0x238/4 = 0x8E.
+    assert_eq(load32(&buf + 24), 0x8E, "CB_TARGET_MASK wire offset");
+    assert_eq(load32(&buf + 28), GFX9_CB_TARGET_MASK_RGBA,  "CB_TARGET_MASK value");
+    assert_eq(load32(&buf + 32), GFX9_CB_SHADER_MASK_RGBA0, "CB_SHADER_MASK value");
+
+    # First singleton = CB_COLOR_CONTROL at +36. Single-reg: header + offset + value = 3 dwords.
+    assert_eq(load32(&buf + 36), 0xC0016900, "CB_COLOR_CONTROL header");
+    # Wire offset = (0xA808 - 0xA000) / 4 = 0x808/4 = 0x202.
+    assert_eq(load32(&buf + 40), 0x202, "CB_COLOR_CONTROL wire offset");
+    assert_eq(load32(&buf + 44), GFX9_CB_COLOR_CONTROL_NORMAL_COPY, "CB_COLOR_CONTROL value");
+    return 0;
+}
+
+fn test_native_pm4_render_pass_target_layout_256x256() {
+    # RT VA 0xFFFF800101000000 (matches src/backend_native.cyr's RT pool VA).
+    # 256x256 RT — viewport scale = 128, offset = 128.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pass_target(&buf, 0,
+                                                  0xFFFF800101000000,
+                                                  256, 256);
+    # Block size: 2 scissor pairs (4+4=8 dw) + 1 viewport-6 (8 dw) +
+    # 1 zminmax-pair (4 dw) + 6 RT singletons (18 dw) = 38 dw = 152 bytes.
+    assert_eq(pos, 152, "pass_target size = 152 bytes");
+
+    # First packet = screen scissor pair at +0.
+    assert_eq(load32(&buf + 0), 0xC0026900, "screen_scissor header");
+    # Wire offset = (0xA030 - 0xA000) / 4 = 0xC.
+    assert_eq(load32(&buf + 4), 0xC, "PA_SC_SCREEN_SCISSOR_TL wire offset");
+    assert_eq(load32(&buf + 8),  0,         "scissor TL = (0,0)");
+    # BR = (256 << 0) | (256 << 16) = 0x01000100.
+    assert_eq(load32(&buf + 12), 0x01000100, "scissor BR = (256,256)");
+
+    # Skip past second scissor + 6-value viewport packet to spot-check
+    # the viewport scale/offset.
+    # screen_scissor: 4 dw (16 bytes), generic_scissor: 4 dw (16 bytes),
+    # viewport packet at offset 32. Header + offset + 6 values = 8 dw.
+    # set_context_reg(n=6) → pkt3 count_minus_1 = 6 → header 0xC0066900.
+    assert_eq(load32(&buf + 32), 0xC0066900, "viewport header (6 values)");
+    # Wire offset (0xA43C - 0xA000)/4 = 0x10F.
+    assert_eq(load32(&buf + 36), 0x10F, "PA_CL_VPORT_XSCALE wire offset");
+    # Viewport: XSCALE = 128.0 = 0x43000000, XOFFSET = 128.0,
+    # YSCALE = -128.0 = 0xC3000000, YOFFSET = 128.0,
+    # ZSCALE = 1.0 = 0x3F800000, ZOFFSET = 0.
+    assert_eq(load32(&buf + 40), 0x43000000, "VPORT XSCALE = 128.0");
+    assert_eq(load32(&buf + 44), 0x43000000, "VPORT XOFFSET = 128.0");
+    assert_eq(load32(&buf + 48), 0xC3000000, "VPORT YSCALE = -128.0");
+    assert_eq(load32(&buf + 52), 0x43000000, "VPORT YOFFSET = 128.0");
+    assert_eq(load32(&buf + 56), 0x3F800000, "VPORT ZSCALE = 1.0");
+    assert_eq(load32(&buf + 60), 0,          "VPORT ZOFFSET = 0.0");
+    return 0;
+}
+
+fn test_native_pm4_render_pass_target_rt_bind() {
+    # RT VA 0xFFFF800101000000.
+    # (rt_va >> 8): canonical-high arithmetic shift → 0xFFFFFF8001010000
+    # & 0xFFFFFFFF → 0x01010000 (low 32 bits hold the BO offset >> 8).
+    # (rt_va >> 40) & 0xFF: bits 40-47 of rt_va. The byte at that
+    # position in 0xFFFF800101000000 is 0x80.
+    var buf[256];
+    memset(&buf, 0xCC, 256);
+    var pos = native_pm4_build_render_pass_target(&buf, 0,
+                                                  0xFFFF800101000000,
+                                                  256, 256);
+    # CB_COLOR0 singletons follow scissor (32) + viewport (32) + zmm (16)
+    # = 80 bytes. CB_COLOR0_BASE single-reg header at offset 80.
+    # set_context_reg_one → pkt3_header(0x69, 2, 0) → count_minus_1 = 1.
+    assert_eq(load32(&buf + 80), 0xC0016900, "CB_COLOR0_BASE header");
+    # Wire offset (0xAC60 - 0xA000)/4 = 0xC60/4 = 0x318.
+    assert_eq(load32(&buf + 84), 0x318, "CB_COLOR0_BASE wire offset");
+    assert_eq(load32(&buf + 88), 0x01010000, "CB_COLOR0_BASE = (rt_va>>8) low");
+
+    # CB_COLOR0_BASE_EXT at +92 (next 3-dword packet).
+    assert_eq(load32(&buf + 92), 0xC0016900, "CB_COLOR0_BASE_EXT header");
+    assert_eq(load32(&buf + 96), 0x319, "CB_COLOR0_BASE_EXT wire offset");
+    assert_eq(load32(&buf + 100), 0x80, "CB_COLOR0_BASE_EXT = (rt_va>>40) byte");
+    return 0;
+}
+
+fn test_native_pm4_render_draw_tail() {
+    var buf[16];
+    memset(&buf, 0xCC, 16);
+    var pos = native_pm4_build_render_draw_tail(&buf, 0);
+    assert_eq(pos, 12, "draw_tail = 3 dwords");
+    # DRAW_INDEX_AUTO header: count_minus_1=1, opcode=0x2D → 0xC0012D00.
+    assert_eq(load32(&buf + 0), 0xC0012D00, "DRAW_INDEX_AUTO header");
+    assert_eq(load32(&buf + 4), GFX9_FULLSCREEN_TRI_VCOUNT, "vertex_count = 3");
+    assert_eq(load32(&buf + 8), DI_SRC_SEL_AUTO_INDEX, "auto-index draw initiator");
+    return 0;
+}
+
+fn test_native_pm4_render_clear_triangle_top_level() {
+    # End-to-end composer. Buffer needs ≥ 1024 bytes (256-dword pad target).
+    var buf[1024];
+    memset(&buf, 0xCC, 1024);
+    var pos = native_pm4_build_render_clear_triangle(&buf,
+                            0xFFFF800200000000,   # vs_va
+                            0xFFFF800200001000,   # fs_va
+                            0xFFFF800101000000,   # rt_va
+                            256, 256);            # rt extent
+    # Padded to 256 dwords = 1024 bytes.
+    assert_eq(pos, 1024, "composer pads to 1024 bytes");
+
+    # ACQUIRE_MEM at offset 0: 7 dwords (28 bytes), header 0xC0055802.
+    assert_eq(load32(&buf + 0), 0xC0055802, "ACQUIRE_MEM header");
+
+    # First UConfig SET_REG packet at offset 28 (post-ACQUIRE_MEM).
+    # set_uconfig_reg_one passes count=2 to pkt3_header → count_minus_1=1
+    # → header 0xC0017900.
+    assert_eq(load32(&buf + 28), 0xC0017900, "VGT_PRIMITIVE_TYPE UConfig header");
+    # VGT_PRIMITIVE_TYPE wire offset = (0x30908 - 0x30000)/4 = 0x242.
+    assert_eq(load32(&buf + 32), 0x242, "VGT_PRIMITIVE_TYPE wire offset");
+    assert_eq(load32(&buf + 36), GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, "primitive type");
+
+    # Second UConfig at offset 40.
+    assert_eq(load32(&buf + 40), 0xC0017900, "VGT_NUM_INSTANCES UConfig header");
+    # VGT_NUM_INSTANCES wire offset = (0x30934 - 0x30000)/4 = 0x24D.
+    assert_eq(load32(&buf + 44), 0x24D, "VGT_NUM_INSTANCES wire offset");
+    assert_eq(load32(&buf + 48), GFX9_VGT_NUM_INSTANCES_ONE, "num instances 1");
+
+    # Pipeline_sh starts at offset 52. VS PGM_LO header.
+    assert_eq(load32(&buf + 52), 0xC0047600, "pipeline_sh begins (VS SET_SH_REG)");
+
+    # CACHE_FLUSH_AND_INV EVENT_WRITE spliced after draw_tail (Step
+    # 6.10 wired post-pivot). draw_tail ends at offset 504; the
+    # 8-byte EVENT_WRITE packet lands at 504..512 with header
+    # 0xC0004600 and body 0x00000016.
+    assert_eq(load32(&buf + 504), 0xC0004600,
+              "EVENT_WRITE header after draw_tail");
+    assert_eq(load32(&buf + 508), 0x00000016,
+              "CACHE_FLUSH_AND_INV body");
+    return 0;
+}
+
+fn test_native_pm4_render_clear_triangle_block_sizes() {
+    # Confirm block sizes sum to the expected pre-padding total.
+    # ACQUIRE_MEM (28) + 2 UConfig (24) + sh (48) + ctx (228) +
+    # pass_target (152) + draw_tail (12) = 492 bytes pre-pad.
+    var buf[1024];
+    memset(&buf, 0xCC, 1024);
+
+    var p = 0;
+    p = native_pm4_acquire_mem_full_invalidate(&buf, p);
+    assert_eq(p, 28, "ACQUIRE_MEM = 28");
+    p = native_pm4_set_uconfig_reg_one(&buf, p, R_VGT_PRIMITIVE_TYPE,
+                                       GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    assert_eq(p, 40, "+UConfig 1");
+    p = native_pm4_set_uconfig_reg_one(&buf, p, R_VGT_NUM_INSTANCES,
+                                       GFX9_VGT_NUM_INSTANCES_ONE);
+    assert_eq(p, 52, "+UConfig 2");
+    p = native_pm4_build_render_pipeline_sh(&buf, p,
+                                            0xFFFF800200000000,
+                                            0xFFFF800200001000);
+    assert_eq(p, 100, "+pipeline_sh = 48");
+    p = native_pm4_build_render_pipeline_ctx(&buf, p);
+    assert_eq(p, 340, "+pipeline_ctx = 240");
+    p = native_pm4_build_render_pass_target(&buf, p,
+                                            0xFFFF800101000000, 256, 256);
+    assert_eq(p, 492, "+pass_target = 152");
+    p = native_pm4_build_render_draw_tail(&buf, p);
+    assert_eq(p, 504, "+draw_tail = 12");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.6 — render-ring dispatch helpers (CPU-testable surface)
+# ================================================================
+# native_render_dispatch_simple itself drives real DRM_AMDGPU_CS
+# syscalls (HW gate is 6.9(b)). Its CPU-testable building blocks
+# are the (vs, fs, rt) handle triple writer and the 5-entry
+# BO_HANDLES list packer — both pinned here.
+
+fn test_native_render_handles_write_layout() {
+    var triple[24];
+    memset(&triple, 0xCC, 24);
+    native_render_handles_write(&triple, 0x1111, 0x2222, 0x3333);
+    assert_eq(load64(&triple +  0), 0x1111, "vs handle at +0");
+    assert_eq(load64(&triple +  8), 0x2222, "fs handle at +8");
+    assert_eq(load64(&triple + 16), 0x3333, "rt handle at +16");
+    return 0;
+}
+
+fn test_native_render_bo_list_pack_layout() {
+    # 5 entries × 8 bytes (handle u32 + priority u32) = 40 bytes.
+    var entries[40];
+    memset(&entries, 0xCC, 40);
+    native_render_bo_list_pack(&entries,
+                               0xF1,    # fence_h
+                               0xA0,    # vs_h
+                               0xA1,    # fs_h
+                               0xB0,    # rt_h
+                               0xC0);   # ib_h
+    # Order matters: fence / vs / fs / rt / ib. Priorities mirror
+    # compute's pattern (fence=1, shaders=4, target=3, ib=10).
+    assert_eq(load32(&entries +  0), 0xF1, "fence handle");
+    assert_eq(load32(&entries +  4), 1,    "fence priority = 1");
+    assert_eq(load32(&entries +  8), 0xA0, "vs handle");
+    assert_eq(load32(&entries + 12), 4,    "vs priority = 4");
+    assert_eq(load32(&entries + 16), 0xA1, "fs handle");
+    assert_eq(load32(&entries + 20), 4,    "fs priority = 4");
+    assert_eq(load32(&entries + 24), 0xB0, "rt handle");
+    assert_eq(load32(&entries + 28), 3,    "rt priority = 3");
+    assert_eq(load32(&entries + 32), 0xC0, "ib handle");
+    assert_eq(load32(&entries + 36), 10,   "ib priority = 10");
+    return 0;
+}
+
+fn test_native_render_bo_list_pack_distinct_from_compute() {
+    # Compute's inline list is (fence, stub, out, shader, ib) at
+    # priorities (1, 3, 3, 4, 10). Render's is (fence, vs, fs, rt, ib)
+    # at (1, 4, 4, 3, 10). Slot-by-slot they differ — guard against
+    # an accidental "same shape" refactor that would hand the kernel
+    # the wrong residency story.
+    var render_entries[40];
+    memset(&render_entries, 0, 40);
+    native_render_bo_list_pack(&render_entries, 1, 2, 3, 4, 5);
+    # Slot 1 (post-fence): render=vs prio 4; compute=stub prio 3.
+    assert_eq(load32(&render_entries + 12), 4, "render slot1 prio = 4 (vs)");
+    # Slot 3: render=rt prio 3; compute=shader prio 4. Different.
+    assert_eq(load32(&render_entries + 28), 3, "render slot3 prio = 3 (rt)");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.8(c) — NativeRenderPipeline + NativePass layouts
+# ================================================================
+# v2.1's 4-block PM4 split lives in two structs: NativeRenderPipeline
+# carries the pre-built per-pipeline blocks; NativePass carries
+# per-pass refs. Layout tests pin the field offsets + sizes; the
+# load-bearing byte-exact test asserts that the cached blocks are
+# bit-identical to a fresh composer invocation (so pass_draw can
+# memcpy them with confidence).
+
+fn test_native_render_pipeline_struct_field_offsets() {
+    assert_eq(NATIVE_PIPE_FIELD_VS_HANDLE,  0,   "vs_handle at +0");
+    assert_eq(NATIVE_PIPE_FIELD_VS_VA,      8,   "vs_va at +8");
+    assert_eq(NATIVE_PIPE_FIELD_FS_HANDLE,  16,  "fs_handle at +16");
+    assert_eq(NATIVE_PIPE_FIELD_FS_VA,      24,  "fs_va at +24");
+    assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK,   32,  "sh_block at +32");
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  80,  "ctx_block at +80");
+    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    48,  "sh_block size = 48");
+    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   240, "ctx_block size = 240");
+    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      320, "total = 320");
+    # The two block sizes must match the composers' actual outputs;
+    # the SH_BLOCK starts where the header ends, and the CTX_BLOCK
+    # starts where the SH_BLOCK ends.
+    assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK + NATIVE_PIPE_SH_BLOCK_SIZE,
+              NATIVE_PIPE_FIELD_CTX_BLOCK,
+              "sh_block end = ctx_block start");
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK + NATIVE_PIPE_CTX_BLOCK_SIZE,
+              NATIVE_PIPE_STRUCT_SIZE,
+              "ctx_block end = struct end");
+    return 0;
+}
+
+fn test_native_render_pipeline_pack_matches_composer() {
+    # The cached sh_block + ctx_block in NativeRenderPipeline must be
+    # byte-identical to what the standalone composer emits — that's
+    # the contract pass_draw relies on when it memcpy's them into the
+    # IB. If the composers ever drift (a 6.5(b) refactor that changes
+    # an emit order, e.g.), this test fails immediately.
+    var vs_va = 0xFFFF800200000000;
+    var fs_va = 0xFFFF800200001000;
+
+    var pipe[320];
+    memset(&pipe, 0xCC, 320);
+    var rc = native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va);
+    assert_eq(rc, 0, "pack returns 0 on success");
+
+    # Header round-trips.
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_VS_HANDLE), 0xAA,  "vs_handle");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_VS_VA),     vs_va, "vs_va");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_FS_HANDLE), 0xBB,  "fs_handle");
+    assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_FS_VA),     fs_va, "fs_va");
+
+    # Re-build the blocks via the composers into a parallel buffer
+    # and compare dword-by-dword.
+    var ref_sh[48];
+    memset(&ref_sh, 0xDD, 48);
+    var sh_end = native_pm4_build_render_pipeline_sh(&ref_sh, 0, vs_va, fs_va);
+    assert_eq(sh_end, 48, "ref sh_block ends at 48");
+
+    var ref_ctx[240];
+    memset(&ref_ctx, 0xDD, 240);
+    var ctx_end = native_pm4_build_render_pipeline_ctx(&ref_ctx, 0);
+    assert_eq(ctx_end, 240, "ref ctx_block ends at 240");
+
+    var i = 0;
+    while (i < 48) {
+        assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + i),
+                  load32(&ref_sh + i),
+                  "sh_block dword matches composer");
+        i = i + 4;
+    }
+    var j = 0;
+    while (j < 240) {
+        assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_CTX_BLOCK + j),
+                  load32(&ref_ctx + j),
+                  "ctx_block dword matches composer");
+        j = j + 4;
+    }
+    return 0;
+}
+
+fn test_native_render_pipeline_pack_null_out() {
+    assert_eq(native_render_pipeline_pack(0, 1, 2, 3, 4), -1, "null out → -1");
+    return 0;
+}
+
+fn test_native_render_pass_struct_field_offsets() {
+    assert_eq(NATIVE_PASS_FIELD_CTX,         0,  "ctx_ref at +0");
+    assert_eq(NATIVE_PASS_FIELD_RESERVED,    8,  "reserved at +8");
+    assert_eq(NATIVE_PASS_FIELD_RT,          16, "rt_ptr at +16");
+    assert_eq(NATIVE_PASS_FIELD_CLEAR_COLOR, 24, "clear_color at +24");
+    assert_eq(NATIVE_PASS_STRUCT_SIZE,       32, "total = 32");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV PM4 builder
+# ================================================================
+# Stand-alone PM4 packet primitive. Not yet wired into the render
+# composer — the splice into `native_pm4_build_render_clear_triangle`
+# happens after HW confirms the e2e program's pixel readback fails
+# from the missing post-draw flush. Tests pin the binary form of the
+# event-write packet so it stays usable when that day comes.
+
+fn test_gfx9_event_type_constants() {
+    # Sourced from Mesa gfx9.json VGT_EVENT_TYPE enum. CACHE_FLUSH_AND_INV
+    # is the canonical post-draw-pre-readback event radv emits before
+    # CB readback; CACHE_FLUSH alone is for less-aggressive paths.
+    assert_eq(GFX9_EVENT_TYPE_CACHE_FLUSH,         0x04, "CACHE_FLUSH = 0x04");
+    assert_eq(GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV, 0x16, "CACHE_FLUSH_AND_INV = 0x16");
+    assert_eq(GFX9_EVENT_INDEX_OTHER,              0x0,  "event_index OTHER = 0");
+    assert_eq(GFX9_EVENT_INDEX_TS,                 0x5,  "event_index TS = 5");
+    return 0;
+}
+
+fn test_native_pm4_event_write_layout() {
+    var buf[16];
+    memset(&buf, 0xCC, 16);
+    var pos = native_pm4_event_write(&buf, 0,
+                                     GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+                                     GFX9_EVENT_INDEX_OTHER);
+    assert_eq(pos, 8, "EVENT_WRITE = 2 dwords (8 bytes)");
+    # PKT3 header: count_minus_1 = 1 (count = 2 → c-1 = 1), opcode 0x46 (EVENT_WRITE),
+    # type 3, predicate 0 → 0xC0004600.
+    assert_eq(load32(&buf + 0), 0xC0004600, "EVENT_WRITE PKT3 header");
+    # Body: event_index (0) << 8 | event_type (0x16) = 0x00000016.
+    assert_eq(load32(&buf + 4), 0x00000016, "body = event_type | event_index<<8");
+    # Past the packet: untouched 0xCC sentinel.
+    assert_eq(load32(&buf + 8), 0xCCCCCCCC, "byte 8 still sentinel");
+    return 0;
+}
+
+fn test_native_pm4_event_write_packs_event_index() {
+    # If a future caller passes a non-OTHER event_index (e.g., 5 for
+    # a TS-style event), the body must encode it in bits[11:8] without
+    # disturbing the event_type in bits[5:0].
+    var buf[8];
+    memset(&buf, 0, 8);
+    native_pm4_event_write(&buf, 0, 0x14, 0x5);
+    # body = (5 << 8) | 0x14 = 0x514
+    assert_eq(load32(&buf + 4), 0x514,
+              "event_index = 5, event_type = 0x14 packs to 0x514");
+    return 0;
+}
+
+fn test_native_pm4_event_write_cache_flush_and_inv() {
+    # The convenience wrapper must produce byte-exact what the
+    # general-purpose builder produces with the standard args.
+    var buf_a[8];
+    memset(&buf_a, 0, 8);
+    native_pm4_event_write_cache_flush_and_inv(&buf_a, 0);
+
+    var buf_b[8];
+    memset(&buf_b, 0, 8);
+    native_pm4_event_write(&buf_b, 0, 0x16, 0);
+
+    assert_eq(load32(&buf_a + 0), load32(&buf_b + 0), "header matches");
+    assert_eq(load32(&buf_a + 4), load32(&buf_b + 4), "body matches");
+    # Spot-check the absolute body value (0x16 in low byte, no index).
+    assert_eq(load32(&buf_a + 4), 0x00000016, "wrapper body = 0x16");
+    return 0;
+}
+
+fn test_native_pm4_event_write_advances_pos() {
+    # Position-tracking builders compose by passing pos through. Make
+    # sure event_write doesn't accidentally rewrite from the start.
+    var buf[16];
+    memset(&buf, 0, 16);
+    var pos = 0;
+    pos = native_pm4_nop(&buf, pos, 2);  # 2 dwords (8 bytes)
+    assert_eq(pos, 8, "nop landed at offset 0..7");
+    pos = native_pm4_event_write_cache_flush_and_inv(&buf, pos);
+    assert_eq(pos, 16, "event_write landed at offset 8..15");
+    # Verify the NOP header is still at offset 0 (not overwritten).
+    assert_eq(load32(&buf + 0) != 0, 1, "NOP header preserved at 0");
+    # And the EVENT_WRITE header is at offset 8.
+    assert_eq(load32(&buf + 8), 0xC0004600, "EVENT_WRITE header at +8");
+    assert_eq(load32(&buf + 12), 0x00000016, "EVENT_WRITE body at +12");
+    return 0;
+}
+
+# v3 Phase D (Step 7.x) tests live in tests/tcyr/mabda_v3_phase_d.tcyr
+# — moved 2026-04-30 to keep this file under cyrlint's 128 KiB cap.
+
+# ================================================================
+# v3 Step 6.9 — public render-* dispatchers route through Backend
+# ================================================================
+# 7 mock-backend dispatch tests proving each public gpu_render_*
+# fn correctly threads ctx + args through ctx->backend->slot via
+# the right fncallN. Wgpu wires up the real bodies (Step 6.8b);
+# native gets bodies in Step 6.8c.
+
+var _step69_rt_create_count = 0;
+var _step69_rt_create_ctx = 0;
+var _step69_rt_create_w = 0;
+var _step69_rt_create_h = 0;
+fn _step69_rt_create_capture(ctx, w, h) {
+    _step69_rt_create_count = _step69_rt_create_count + 1;
+    _step69_rt_create_ctx = ctx;
+    _step69_rt_create_w = w;
+    _step69_rt_create_h = h;
+    return 0xCAFE01;
+}
+fn test_gpu_render_target_create_dispatches_through_backend() {
+    _step69_rt_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+                     &_step69_rt_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var got = gpu_render_target_create_2d_rgba8(ctx, 256, 128);
+    assert_eq(got, 0xCAFE01, "slot return value propagates");
+    assert_eq(_step69_rt_create_count, 1, "slot dispatched once");
+    assert_eq(_step69_rt_create_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step69_rt_create_w, 256, "arg 2 = width");
+    assert_eq(_step69_rt_create_h, 128, "arg 3 = height");
+    return 0;
+}
+
+var _step69_rt_release_count = 0;
+var _step69_rt_release_ctx = 0;
+var _step69_rt_release_rt = 0;
+fn _step69_rt_release_capture(ctx, rt) {
+    _step69_rt_release_count = _step69_rt_release_count + 1;
+    _step69_rt_release_ctx = ctx;
+    _step69_rt_release_rt = rt;
+    return 0;
+}
+fn test_gpu_render_target_release_dispatches_through_backend() {
+    _step69_rt_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+                     &_step69_rt_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    gpu_render_target_release(ctx, 0xBEEF02);
+    assert_eq(_step69_rt_release_count, 1, "slot dispatched once");
+    assert_eq(_step69_rt_release_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step69_rt_release_rt, 0xBEEF02, "arg 2 = rt");
+    return 0;
+}
+
+var _step69_pipe_create_count = 0;
+var _step69_pipe_create_ctx = 0;
+var _step69_pipe_create_vs = 0;
+var _step69_pipe_create_fs = 0;
+var _step69_pipe_create_fmt = 0;
+fn _step69_pipe_create_capture(ctx, vs, fs, fmt) {
+    _step69_pipe_create_count = _step69_pipe_create_count + 1;
+    _step69_pipe_create_ctx = ctx;
+    _step69_pipe_create_vs = vs;
+    _step69_pipe_create_fs = fs;
+    _step69_pipe_create_fmt = fmt;
+    return 0xCAFE03;
+}
+fn test_gpu_render_pipeline_create_dispatches_through_backend() {
+    _step69_pipe_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+                     &_step69_pipe_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var got = gpu_render_pipeline_create(ctx, 0x1111, 0x2222, 28);
+    assert_eq(got, 0xCAFE03, "slot return value propagates");
+    assert_eq(_step69_pipe_create_count, 1, "slot dispatched once");
+    assert_eq(_step69_pipe_create_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step69_pipe_create_vs, 0x1111, "arg 2 = vs_mod");
+    assert_eq(_step69_pipe_create_fs, 0x2222, "arg 3 = fs_mod");
+    assert_eq(_step69_pipe_create_fmt, 28, "arg 4 = color_fmt");
+    return 0;
+}
+
+var _step69_pipe_release_count = 0;
+fn _step69_pipe_release_capture(ctx, pipe) {
+    _step69_pipe_release_count = _step69_pipe_release_count + 1;
+    return 0;
+}
+fn test_gpu_render_pipeline_release_dispatches_through_backend() {
+    _step69_pipe_release_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+                     &_step69_pipe_release_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    gpu_render_pipeline_release(ctx, 0xBEEF04);
+    assert_eq(_step69_pipe_release_count, 1, "slot dispatched once");
+    return 0;
+}
+
+var _step69_pass_begin_count = 0;
+var _step69_pass_begin_ctx = 0;
+var _step69_pass_begin_rt = 0;
+var _step69_pass_begin_color = 0;
+fn _step69_pass_begin_capture(ctx, rt, color) {
+    _step69_pass_begin_count = _step69_pass_begin_count + 1;
+    _step69_pass_begin_ctx = ctx;
+    _step69_pass_begin_rt = rt;
+    _step69_pass_begin_color = color;
+    return 0xCAFE05;
+}
+fn test_gpu_render_pass_begin_dispatches_through_backend() {
+    _step69_pass_begin_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+                     &_step69_pass_begin_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var color[32];
+    memset(&color, 0, 32);
+    var got = gpu_render_pass_begin(ctx, 0xBEEF06, &color);
+    assert_eq(got, 0xCAFE05, "slot return value propagates");
+    assert_eq(_step69_pass_begin_count, 1, "slot dispatched once");
+    assert_eq(_step69_pass_begin_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step69_pass_begin_rt, 0xBEEF06, "arg 2 = rt");
+    assert_eq(_step69_pass_begin_color, &color, "arg 3 = color_ptr");
+    return 0;
+}
+
+var _step69_pass_draw_count = 0;
+var _step69_pass_draw_ctx = 0;
+var _step69_pass_draw_pass = 0;
+var _step69_pass_draw_pipe = 0;
+var _step69_pass_draw_vc = 0;
+var _step69_pass_draw_ic = 0;
+fn _step69_pass_draw_capture(ctx, pass, pipe, vc, ic) {
+    _step69_pass_draw_count = _step69_pass_draw_count + 1;
+    _step69_pass_draw_ctx = ctx;
+    _step69_pass_draw_pass = pass;
+    _step69_pass_draw_pipe = pipe;
+    _step69_pass_draw_vc = vc;
+    _step69_pass_draw_ic = ic;
+    return 0;
+}
+fn test_gpu_render_pass_draw_dispatches_through_backend() {
+    _step69_pass_draw_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+                     &_step69_pass_draw_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_render_pass_draw(ctx, 0xBEEF07, 0xBEEF08, 3, 1);
+    assert_eq(rc, 0, "slot return value propagates");
+    assert_eq(_step69_pass_draw_count, 1, "slot dispatched once");
+    assert_eq(_step69_pass_draw_ctx, ctx, "arg 1 = ctx");
+    assert_eq(_step69_pass_draw_pass, 0xBEEF07, "arg 2 = pass");
+    assert_eq(_step69_pass_draw_pipe, 0xBEEF08, "arg 3 = pipe");
+    assert_eq(_step69_pass_draw_vc, 3, "arg 4 = vertex_count");
+    assert_eq(_step69_pass_draw_ic, 1, "arg 5 = instance_count");
+    return 0;
+}
+
+var _step69_pass_end_count = 0;
+fn _step69_pass_end_capture(ctx, pass) {
+    _step69_pass_end_count = _step69_pass_end_count + 1;
+    return 0;
+}
+fn test_gpu_render_pass_end_dispatches_through_backend() {
+    _step69_pass_end_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+                     &_step69_pass_end_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    gpu_render_pass_end(ctx, 0xBEEF09);
+    assert_eq(_step69_pass_end_count, 1, "slot dispatched once");
+    return 0;
+}
+
+fn test_gpu_render_dispatchers_null_ctx_safe() {
+    # All seven render dispatchers must short-circuit on null ctx
+    # without dispatching. No mock backend needed.
+    assert_eq(gpu_render_target_create_2d_rgba8(0, 64, 64), 0, "rt_create null ctx -> 0");
+    assert_eq(gpu_render_target_release(0, 0xDEAD), 0, "rt_release null ctx -> 0");
+    assert_eq(gpu_render_pipeline_create(0, 1, 2, 28), 0, "pipe_create null ctx -> 0");
+    assert_eq(gpu_render_pipeline_release(0, 0xDEAD), 0, "pipe_release null ctx -> 0");
+    var color[32];
+    memset(&color, 0, 32);
+    assert_eq(gpu_render_pass_begin(0, 0xDEAD, &color), 0, "pass_begin null ctx -> 0");
+    assert_eq(gpu_render_pass_draw(0, 1, 2, 3, 1), GPU_ERR_OTHER, "pass_draw null ctx -> ERR");
+    assert_eq(gpu_render_pass_end(0, 0xDEAD), 0, "pass_end null ctx -> 0");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+
+    # v3 Phase B5 — backend abstraction (7)
+    test_backend_struct_layout();
+    test_backend_kind_constants_distinct();
+    test_backend_new_zero_initialized();
+    test_backend_kind_round_trip();
+    test_backend_set_get_slot_round_trip();
+    test_backend_fncall_through_slot_smoke();
+    test_backend_is_complete_detects_missing_slot();
+
+    # v3 Phase B5 — wgpu backend implementation (4)
+    test_backend_wgpu_new_is_complete();
+    test_backend_wgpu_slot_identities();
+    test_backend_wgpu_render_slot_identities();
+    test_backend_wgpu_compute_dispatch_stub_returns_err();
+    test_backend_wgpu_two_builders_are_distinct();
+
+    # v3 Step 3a — GpuContext backend plumbing (2)
+    test_gpu_ctx_backend_accessor();
+    test_gpu_ctx_backend_field_isolated();
+
+    # v3 Step 3b — gpu_context_release dispatches through backend (2)
+    test_gpu_context_release_dispatches_through_backend();
+    test_gpu_context_release_null_ctx_is_safe();
+
+    # v3 Step 3c — gpu_buffer_read dispatches through backend (2)
+    test_gpu_buffer_read_dispatches_through_backend();
+    test_gpu_buffer_read_null_ctx_returns_err();
+
+    # v3 Step 3d — gpu_buffer_create / write / release dispatch (4)
+    test_gpu_buffer_create_dispatches_through_backend();
+    test_gpu_buffer_write_dispatches_through_backend();
+    test_gpu_buffer_release_dispatches_through_backend();
+    test_gpu_buffer_dispatchers_null_ctx_safe();
+
+    # v3 Step 3e — gpu_shader_module dispatch (3)
+    test_gpu_shader_module_create_dispatches_through_backend();
+    test_gpu_shader_module_release_dispatches_through_backend();
+    test_gpu_shader_module_dispatchers_null_ctx_safe();
+
+    # v3 Step 3f — gpu_device_wait_idle dispatch (2)
+    test_gpu_device_wait_idle_dispatches_through_backend();
+    test_gpu_device_wait_idle_null_ctx_safe();
+
+    # v3 Step 3g — gpu_compute_dispatch (fncall6) (2)
+    test_gpu_compute_dispatch_dispatches_through_backend();
+    test_gpu_compute_dispatch_null_ctx_returns_err();
+
+    # v3 Step 4c — native Backend slot wrappers + builder (6)
+    test_backend_native_new_is_complete();
+    test_backend_native_slot_identities();
+    test_backend_native_distinct_from_wgpu();
+    test_native_ctx_field_accessors();
+    test_native_buf_pair_write();
+    test_backend_native_compute_dispatch_null_args_err();
+
+    # v3 Step 4e — backend selector + stub_addr accessor (2)
+    test_mabda_backend_kind_default_is_wgpu();
+    test_native_ctx_stub_addr_accessor();
+
+    # v3 Step 4f.i — errno → GpuErr mapping (3)
+    test_native_errno_to_gpu_err_classifies();
+    test_native_errno_to_gpu_err_default_other();
+    test_native_neg_rc_to_gpu_err_sign_flip();
+
+    # v3 Step 4f.ii — BO page-perm constants (2)
+    test_native_perm_constants_present();
+    test_native_perm_bits_distinct();
+
+    # v3 Step 4f.iii — FrameResources ctx-aware integration (6)
+    test_frame_resources_new_legacy_no_ctx();
+    test_frame_resources_new_for_stores_ctx();
+    test_frame_resources_track_buffers_and_textures();
+    test_frame_resources_clear_pops_all();
+    test_frame_resources_release_buffers_dispatches_through_backend();
+    test_frame_resources_release_buffers_no_ctx_is_noop();
+
+    # v3 Step 4f.iv — per-context IB + fence cache (2)
+    test_native_ctx_ib_fence_accessors();
+    test_native_ctx_layout_isolation_step4iv();
+
+    # v3 Step 5.1 — native 2D RGBA8 texture primitives (4)
+    test_native_texture_size_2d_rgba8_formula();
+    test_native_texture_struct_field_offsets();
+    test_native_texture_va_range_distinct();
+    test_native_texture_struct_round_trip();
+
+    # v3 Step 5.2 — native_texture_release_2d_rgba8 (2)
+    test_native_texture_release_null_tex_safe();
+    test_native_texture_release_zero_handle_safe();
+
+    # v3 Step 5.5 — wgpu texture wrapper null-arg safety (6)
+    test_backend_wgpu_texture_create_null_ctx_returns_zero();
+    test_backend_wgpu_texture_create_zero_dim_returns_zero();
+    test_backend_wgpu_texture_write_null_args_err();
+    test_backend_wgpu_texture_write_size_mismatch_err();
+    test_backend_wgpu_texture_read_null_args_err();
+    test_backend_wgpu_texture_release_null_safe();
+
+    # v3 Step 5.6 — native texture wrapper safety (5)
+    test_backend_native_texture_create_null_ctx_returns_zero();
+    test_backend_native_texture_create_zero_dim_returns_zero();
+    test_backend_native_texture_write_memcpy_round_trip();
+    test_backend_native_texture_write_null_args_err();
+    test_backend_native_texture_release_null_safe();
+
+    # v3 Step 5.7 — public gpu_texture_* dispatch (5)
+    test_gpu_texture_create_dispatches_through_backend();
+    test_gpu_texture_write_dispatches_through_backend();
+    test_gpu_texture_read_dispatches_through_backend();
+    test_gpu_texture_release_dispatches_through_backend();
+    test_gpu_texture_dispatchers_null_ctx_safe();
+
+    # v3 Step 6.3 — native render target primitives (5)
+    test_native_rt_size_formula();
+    test_native_rt_struct_field_offsets();
+    test_native_rt_va_distinct_from_other_pools();
+    test_native_rt_struct_round_trip();
+    test_native_rt_release_safe_zero();
+
+    # v3 Step 6.4 — SET_CONTEXT_REG + DRAW_INDEX_AUTO builders (7)
+    test_native_pm4_opcodes_extended();
+    test_native_context_reg_offset_encoding();
+    test_native_pm4_set_context_reg_one_layout();
+    test_native_pm4_set_context_reg_pair_layout();
+    test_native_pm4_set_context_reg_multi_layout();
+    test_native_pm4_draw_index_auto_layout();
+    test_native_pm4_di_src_sel_constant();
+
+    # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums (7)
+    test_gfx9_vs_sh_register_addresses();
+    test_gfx9_ps_sh_register_addresses();
+    test_gfx9_spi_format_register_addresses();
+    test_gfx9_cb_target_mask_address();
+    test_gfx9_pgm_rsrc_minimums();
+    test_gfx9_spi_format_field_values();
+    test_gfx9_fullscreen_triangle_vertex_count();
+
+    # v3 Step 6.2(b) — fragment shader bytes (2)
+    test_gfx9_fs_solid_red_byte_pattern();
+    test_gfx9_fs_solid_red_alignment();
+
+    # v3 Step 6.2(b) — vertex shader bytes (2)
+    test_gfx9_vs_fullscreen_triangle_byte_pattern();
+    test_gfx9_vs_fullscreen_triangle_alignment();
+
+    # v3 Step 6.5(a) — clear-triangle PM4 register addresses + values (4)
+    test_gfx9_pipeline_ctx_register_addresses();
+    test_gfx9_pass_target_register_addresses();
+    test_gfx9_uconfig_graphics_register_addresses();
+    test_gfx9_pipeline_ctx_value_constants();
+
+    # v3 Step 6.5(b) — PM4 stream composer for clear-triangle (8)
+    test_native_int_to_f32_bits_and_negate();
+    test_native_pm4_render_pipeline_sh_layout();
+    test_native_pm4_render_pipeline_ctx_size_and_anchors();
+    test_native_pm4_render_pass_target_layout_256x256();
+    test_native_pm4_render_pass_target_rt_bind();
+    test_native_pm4_render_draw_tail();
+    test_native_pm4_render_clear_triangle_top_level();
+    test_native_pm4_render_clear_triangle_block_sizes();
+
+    # v3 Step 6.6 — render-ring dispatch helpers (3)
+    test_native_render_handles_write_layout();
+    test_native_render_bo_list_pack_layout();
+    test_native_render_bo_list_pack_distinct_from_compute();
+
+    # v3 Step 6.8(c) — NativeRenderPipeline + NativePass (4)
+    test_native_render_pipeline_struct_field_offsets();
+    test_native_render_pipeline_pack_matches_composer();
+    test_native_render_pipeline_pack_null_out();
+    test_native_render_pass_struct_field_offsets();
+
+    # v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV (5)
+    test_gfx9_event_type_constants();
+    test_native_pm4_event_write_layout();
+    test_native_pm4_event_write_packs_event_index();
+    test_native_pm4_event_write_cache_flush_and_inv();
+    test_native_pm4_event_write_advances_pos();
+
+    # v3 Step 6.9 — public render-* dispatchers (8)
+    test_gpu_render_target_create_dispatches_through_backend();
+    test_gpu_render_target_release_dispatches_through_backend();
+    test_gpu_render_pipeline_create_dispatches_through_backend();
+    test_gpu_render_pipeline_release_dispatches_through_backend();
+    test_gpu_render_pass_begin_dispatches_through_backend();
+    test_gpu_render_pass_draw_dispatches_through_backend();
+    test_gpu_render_pass_end_dispatches_through_backend();
+    test_gpu_render_dispatchers_null_ctx_safe();
+
+    # v3 Phase D (Step 7.x) tests run in tests/tcyr/mabda_v3_phase_d.tcyr.
+
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);

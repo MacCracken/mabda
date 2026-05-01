@@ -1,0 +1,295 @@
+# @internal — Backend dispatch interface (v3 Phase B5, ADR 006)
+# backend.cyr — function-pointer table both backends fill, dispatched
+# through ctx->backend at v3.0+.
+#
+# This is the @internal indirection point that lets v3.0 ship two
+# backends behind the same @public surface. Public callers never
+# touch this struct; they call the existing fns in buffer.cyr,
+# compute.cyr, etc., which (post-refactor) dispatch through
+# ctx->backend->slot via fncallN.
+#
+# Anchor: this layout hosts what programs/native_compute_store.cyr
+# proved end-to-end on AMD Cezanne 2026-04-28 — every operation that
+# flow exercised gets a slot. Texture / render pipeline / surface
+# slots are deferred until each has a working native e2e program;
+# adding them with stub-`return GPU_ERR_NOT_IMPLEMENTED` bodies is
+# explicitly out of scope (see docs/proposals/v3-backend-interface.md).
+#
+# Backend struct layout (176 bytes — 21 fnptr slots + 1 kind value):
+#
+# v0 (Step 1, 88 bytes):
+#   +0:  ctx_create_from_preinit  fnptr (preinit_ptr)            -> ctx
+#   +8:  ctx_release              fnptr (ctx)                    -> 0
+#   +16: buffer_create            fnptr (ctx, size, usage)       -> buf
+#   +24: buffer_write             fnptr (ctx, buf, off, ptr, n)  -> 0|err
+#   +32: buffer_read              fnptr (ctx, buf, off, ptr, n)  -> 0|err
+#   +40: buffer_release           fnptr (ctx, buf)               -> 0
+#   +48: shader_module_create     fnptr (ctx, bytes_ptr, n)      -> mod
+#   +56: shader_module_release    fnptr (ctx, mod)               -> 0
+#   +64: compute_dispatch         fnptr (ctx, mod, x, y, z, bp)  -> 0|err
+#   +72: device_wait_idle         fnptr (ctx)                    -> 0
+#   +80: kind                     u64   value: BACKEND_KIND_*
+#
+# v1 texture slots (Step 5.4, +32 bytes):
+#   +88:  texture_create_2d_rgba8 fnptr (ctx, w, h)              -> tex_ptr
+#   +96:  texture_write           fnptr (ctx, tex, src, n)       -> 0|err
+#   +104: texture_read            fnptr (ctx, tex, dst, n)       -> 0|err
+#   +112: texture_release         fnptr (ctx, tex)               -> 0
+#
+# v2 render slots (Step 6.8a, +56 bytes):
+#   +120: render_target_create_2d_rgba8  fnptr (ctx, w, h)                 -> rt_ptr
+#   +128: render_target_release          fnptr (ctx, rt)                   -> 0
+#   +136: render_pipeline_create         fnptr (ctx, vs_mod, fs_mod, fmt)  -> pipe
+#   +144: render_pipeline_release        fnptr (ctx, pipe)                 -> 0
+#   +152: render_pass_begin              fnptr (ctx, rt, clear_color_ptr)  -> pass
+#   +160: render_pass_draw               fnptr (ctx, pass, pipe, vc, ic)   -> 0|err
+#   +168: render_pass_end                fnptr (ctx, pass)                 -> 0
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA (mabda Color
+# shape) — WGPUColor in webgpu.h v29 is {double r,g,b,a;}, not a
+# packed u32. See docs/proposals/v3-backend-interface.md v2.1.
+#
+# Native side: pipeline state splits into pipeline_sh_block +
+# pipeline_ctx_block (built at pipeline_create) + pass_target_block
+# (built at pass_begin) + per-draw tail. Single-block pipeline cache
+# was an early-draft mistake; matches Mesa radv ctx_cs/cs cut.
+#
+# The kind field at +80 is a u64 value, not a fnptr — kind is
+# invariant per backend, so storing it directly saves an indirect
+# call on every kind query. All other slots are fnptr.
+#
+# Cyrius-fn-to-Cyrius-fn fncall through a struct slot is the
+# fundamental shape this interface relies on. The v2.x codebase
+# only uses fncallN against extern-C function pointers (wgpu_ffi.cyr).
+# tests/tcyr/mabda.tcyr::test_backend_fncall_through_slot_smoke
+# proves the shape works in Cyrius-to-Cyrius before any backend
+# implementation depends on it. If that test ever fails, the entire
+# backend abstraction is unviable — bail out to a different design.
+
+# ================================================================
+# Backend kind constants
+# ================================================================
+# Reserved up front for v4.0 (NVIDIA) and v5.0 (Intel). Adding the
+# constants now means downstream code can pattern-match on every
+# vendor we plan to ship without churning enum values later.
+
+enum BackendKind {
+    BACKEND_KIND_NULL    = 0;
+    BACKEND_KIND_WGPU    = 1;
+    BACKEND_KIND_AMD     = 2;
+    BACKEND_KIND_NVIDIA  = 3;
+    BACKEND_KIND_INTEL   = 4;
+}
+
+# ================================================================
+# Backend selector (v3 Step 4e, ADR 006) — compile-time choice
+# ================================================================
+# Default: BACKEND_KIND_WGPU. Consumers that want the native AMD
+# path edit this constant to BACKEND_KIND_AMD before building, then
+# rebuild. gpu_context_from_preinit() in src/context.cyr reads this
+# and routes to gpu_context_new_native() when set to AMD. Explicit
+# entry points (gpu_context_new_native) are also available for
+# programs that need to opt in regardless of the global default.
+#
+# v3.1+ may promote this to a `cyrius.cyml` flag if consumer CI
+# matrices need per-build switching without editing the source.
+# Proposal: docs/proposals/v3-backend-interface.md.
+var MABDA_BACKEND_KIND = BACKEND_KIND_WGPU;
+
+# ================================================================
+# Slot byte offsets
+# ================================================================
+# Use these constants instead of raw integers when reading / writing
+# slots. The slot offsets are part of the load-bearing struct layout;
+# tests/tcyr asserts each one against its expected value.
+
+var BACKEND_SLOT_CTX_CREATE_FROM_PREINIT = 0;
+var BACKEND_SLOT_CTX_RELEASE             = 8;
+var BACKEND_SLOT_BUFFER_CREATE           = 16;
+var BACKEND_SLOT_BUFFER_WRITE            = 24;
+var BACKEND_SLOT_BUFFER_READ             = 32;
+var BACKEND_SLOT_BUFFER_RELEASE          = 40;
+var BACKEND_SLOT_SHADER_MODULE_CREATE    = 48;
+var BACKEND_SLOT_SHADER_MODULE_RELEASE   = 56;
+var BACKEND_SLOT_COMPUTE_DISPATCH        = 64;
+var BACKEND_SLOT_DEVICE_WAIT_IDLE        = 72;
+var BACKEND_SLOT_KIND                    = 80;
+
+# v1 texture slots (Step 5.4) — appended after KIND. Append-after-
+# kind keeps every v0 slot offset stable so existing layout tests
+# pass unchanged. Per docs/proposals/v3-backend-interface.md.
+var BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8 = 88;
+var BACKEND_SLOT_TEXTURE_WRITE           = 96;
+var BACKEND_SLOT_TEXTURE_READ            = 104;
+var BACKEND_SLOT_TEXTURE_RELEASE         = 112;
+
+# v2 render slots (Step 6.8a) — appended after the texture range.
+# Same append-after-kind invariant: every v0/v1 slot offset stays
+# put. Per docs/proposals/v3-backend-interface.md v2.1.
+var BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8 = 120;
+var BACKEND_SLOT_RENDER_TARGET_RELEASE         = 128;
+var BACKEND_SLOT_RENDER_PIPELINE_CREATE        = 136;
+var BACKEND_SLOT_RENDER_PIPELINE_RELEASE       = 144;
+var BACKEND_SLOT_RENDER_PASS_BEGIN             = 152;
+var BACKEND_SLOT_RENDER_PASS_DRAW              = 160;
+var BACKEND_SLOT_RENDER_PASS_END               = 168;
+
+# v3 surface slots (Step 7.5) — appended after the render range.
+# Same append-after-kind invariant: every v0/v1/v2 slot offset
+# stays put. Designed for the abstraction layer that sits on top
+# of Phase D's KMS primitives (7.1–7.4 + 7.4(b)) and wgpu's
+# surface/swapchain machinery — both backends fill the same four
+# slots, but the implementations differ widely.
+#
+# Slot signatures (filled in 7.6 wgpu/native wrappers):
+#   surface_configure (ctx, width, height) → surface_ptr
+#       wgpu : wraps wgpu_surface_configure on the consumer's
+#              window surface.
+#       native: opens card+render fds, runs native_kms_init +
+#              native_kms_modeset_first_connected + allocates
+#              two NativeKmsFb's for double-buffering.
+#   surface_acquire (ctx, surface) → fb_ptr
+#       wgpu : wgpu_surface_get_current_texture_view.
+#       native: returns the back-buffer NativeKmsFb (the one
+#              NOT currently scanning).
+#   surface_present (ctx, surface) → 0|err
+#       wgpu : wgpu_surface_present (queue submit + swap).
+#       native: native_kms_present, then swap which FB is back.
+#   surface_release (ctx, surface) → 0
+#       Cleanup. Releases backend-owned resources; consumer-owned
+#       window/fd lifecycle is the consumer's call (master-fd
+#       release in particular needs the public-API design from
+#       Step 7.7 to settle, since the logind story affects who
+#       owns the master fd).
+#
+# All slot signatures stay within fncall ceiling (3 args max for
+# the interface, which is comfortably within fncall6 limits).
+var BACKEND_SLOT_SURFACE_CONFIGURE       = 176;
+var BACKEND_SLOT_SURFACE_ACQUIRE         = 184;
+var BACKEND_SLOT_SURFACE_PRESENT         = 192;
+var BACKEND_SLOT_SURFACE_RELEASE         = 200;
+
+var BACKEND_SIZE                         = 208;
+
+# v0 fnptr block ends at +80 (the KIND value sits there). Layout
+# assertions and the v0 portion of backend_is_complete() iterate
+# 0..80. Kept stable so v0 tests don't need to change.
+var BACKEND_FNPTR_SLOTS_END              = 80;
+
+# v1 texture fnptr block: 88..120. Treated as a second range by
+# backend_is_complete() so the kind value at +80 isn't mistaken
+# for a missing fnptr.
+var BACKEND_TEXTURE_SLOTS_BEGIN          = 88;
+var BACKEND_TEXTURE_SLOTS_END            = 120;
+
+# v2 render fnptr block: 120..176. Treated as a third range by
+# backend_is_complete() so kind at +80 stays unambiguous and v0/v1
+# tests don't have to know about the new slots.
+var BACKEND_RENDER_SLOTS_BEGIN           = 120;
+var BACKEND_RENDER_SLOTS_END             = 176;
+
+# v3 surface fnptr block: 176..208. Fourth range. Per the same
+# pattern, backend_is_complete()'s walk over the surface range is
+# deferred until Step 7.6 lands the wgpu/native fillers — adding
+# the range walk now would falsely report all backends incomplete.
+# Mirrors the 6.8(a) approach: layout in tree, completeness check
+# follows when there's a real implementation to check against.
+var BACKEND_SURFACE_SLOTS_BEGIN          = 176;
+var BACKEND_SURFACE_SLOTS_END            = 208;
+
+# ================================================================
+# Backend struct construction
+# ================================================================
+
+# Allocate a zero-initialized Backend. Caller fills slots before
+# wiring it into a GpuContext.
+fn backend_new() {
+    var b = alloc(BACKEND_SIZE);
+    memset(b, 0, BACKEND_SIZE);
+    return b;
+}
+
+# ================================================================
+# Slot setters / getters
+# ================================================================
+# Generic slot access. Specialized wrapper calls — e.g.
+# backend_compute_dispatch(b, ctx, mod, x, y, z, bp) — will land in
+# subsequent steps once the wgpu and native backend implementations
+# go in. Step 1 only needs the raw shape.
+
+fn backend_set_slot(b, off, fnptr) {
+    store64(b + off, fnptr);
+    return 0;
+}
+
+fn backend_get_slot(b, off) {
+    return load64(b + off);
+}
+
+fn backend_set_kind(b, kind) {
+    store64(b + BACKEND_SLOT_KIND, kind);
+    return 0;
+}
+
+fn backend_kind(b) {
+    return load64(b + BACKEND_SLOT_KIND);
+}
+
+# ================================================================
+# Completeness check
+# ================================================================
+# Returns 1 if every fnptr slot is non-zero. Does NOT check the
+# kind value — kind == BACKEND_KIND_NULL is a separate condition
+# that callers can check independently. Used by backend builders
+# to assert post-conditions during context init.
+
+fn backend_is_complete(b) {
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        if (load64(b + off) == 0) { return 0; }
+        off = off + 8;
+    }
+    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
+        if (load64(b + off2) == 0) { return 0; }
+        off2 = off2 + 8;
+    }
+    # v2 render slots — Step 6.8b extended the walk now that
+    # backend_wgpu_new fills the render range. backend_native_new
+    # gets the same treatment in Step 6.8c (gated on 6.2 + 6.5 + 6.6).
+    # Until then native callers will see is_complete = 0 and any
+    # caller that asserts completeness on a native backend without
+    # 6.8c needs to know it's pre-v2 territory.
+    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off3 < BACKEND_RENDER_SLOTS_END) {
+        if (load64(b + off3) == 0) { return 0; }
+        off3 = off3 + 8;
+    }
+    # v3 surface slots (Step 7.6) — both wgpu and native fill these
+    # with stub fns initially; real implementations land in 7.7
+    # alongside the public API design. The walk treats stubs as
+    # filled (any non-null fnptr counts), so adding them here keeps
+    # both backends "complete" while leaving the runtime behavior
+    # of surface_* deliberately unimplemented.
+    var off4 = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off4 < BACKEND_SURFACE_SLOTS_END) {
+        if (load64(b + off4) == 0) { return 0; }
+        off4 = off4 + 8;
+    }
+    return 1;
+}
+
+# ================================================================
+# Smoke test helper
+# ================================================================
+# Mounted on a backend slot in tests/tcyr to prove Cyrius-fn-via-
+# fnptr-via-struct-slot dispatch works. Returns sentinel + arg so
+# the assertion can verify the slot's fnptr was actually called
+# (and called with the right arg). Sentinel is 0xBA67E47D — chosen
+# to not collide with common error codes or low addresses.
+
+var BACKEND_SMOKE_SENTINEL = 0xBA67E47D;
+
+fn _backend_smoke_sentinel(arg) {
+    return BACKEND_SMOKE_SENTINEL + arg;
+}

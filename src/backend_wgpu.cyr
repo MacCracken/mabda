@@ -1,0 +1,622 @@
+# @internal — wgpu Backend implementation (v3 Phase B5, ADR 006)
+# backend_wgpu.cyr — fills the Backend interface (src/backend.cyr)
+# with thin wrappers around the existing wgpu FFI + descriptors.
+#
+# Step 2 scope: land the wrapper fns + a backend_wgpu_new() builder
+# that produces a complete Backend (all 10 fnptr slots set, kind =
+# BACKEND_KIND_WGPU). The wrappers are not yet driven by the public
+# API in buffer.cyr / compute.cyr / etc. — that's Step 3's refactor.
+# Until then this module is reachable only through backend_wgpu_new()
+# and the layout/completeness tests in tests/tcyr.
+#
+# Slot signatures (from docs/proposals/v3-backend-interface.md):
+#   ctx_create_from_preinit (preinit_ptr)             -> ctx
+#   ctx_release             (ctx)                     -> 0
+#   buffer_create           (ctx, size, usage)        -> buf
+#   buffer_write            (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_read             (ctx, buf, off, ptr, n)   -> 0|err
+#   buffer_release          (ctx, buf)                -> 0
+#   shader_module_create    (ctx, bytes_ptr, n)       -> shmod
+#   shader_module_release   (ctx, shmod)              -> 0
+#   compute_dispatch        (ctx, shmod, x, y, z, bp) -> 0|err  (STUB in Step 2)
+#   device_wait_idle        (ctx)                     -> 0
+#
+# Note: Cyrius reserves `mod` as an operator-position keyword, so the
+# shader-module parameter is named `shmod` here (and in the Backend
+# slot type comments). The slot semantics are unchanged.
+
+# ================================================================
+# Context
+# ================================================================
+# Slot signature: "raw ctx pointer or 0 on failure". This wrapper
+# does the wgpu-specific bookkeeping (validate preinit fields,
+# allocate the 40-byte GpuContext, copy instance/adapter/device/
+# queue from the C launcher's preinit struct). It does NOT call
+# the public gpu_context_from_preinit — that fn now allocates a
+# backend and dispatches *into* this slot, so calling it back would
+# recurse forever. The +32 backend slot in the ctx struct is left
+# zero; the public caller fills it after the slot returns.
+
+fn _backend_wgpu_ctx_create_from_preinit(preinit_ptr) {
+    if (preinit_ptr == 0) { return 0; }
+    var instance = load64(preinit_ptr);
+    var adapter  = load64(preinit_ptr + 8);
+    var device   = load64(preinit_ptr + 16);
+    var queue    = load64(preinit_ptr + 24);
+    if (instance == 0) { return 0; }
+    if (adapter == 0)  { return 0; }
+    if (device == 0)   { return 0; }
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx,      instance);
+    store64(ctx + 8,  adapter);
+    store64(ctx + 16, device);
+    store64(ctx + 24, queue);
+    return ctx;
+}
+
+# Slot signature: "release ctx, return 0". Releases the wgpu
+# handles directly (does NOT call public gpu_context_release —
+# that fn now dispatches *into* this slot). The backend ptr at
+# +32 is owned by the caller; this wrapper does not touch it.
+
+fn _backend_wgpu_ctx_release(ctx) {
+    if (ctx == 0) { return 0; }
+    var device = load64(ctx + 16);
+    var adapter = load64(ctx + 8);
+    var instance = load64(ctx);
+    if (device != 0)   { wgpu_device_release(device); }
+    if (adapter != 0)  { wgpu_adapter_release(adapter); }
+    if (instance != 0) { wgpu_instance_release(instance); }
+    return 0;
+}
+
+# ================================================================
+# Buffer
+# ================================================================
+# v0 slot signatures don't carry a label — pass NULL to the wgpu
+# descriptor builder, which short-circuits the StringView write.
+# Step 3 may revise the slot to take a label if profiling / debug
+# tooling needs one.
+
+fn _backend_wgpu_buffer_create(ctx, size, usage) {
+    var device = gpu_ctx_device(ctx);
+    var desc = wgpu_buffer_descriptor(0, usage, size, 0);
+    return wgpu_device_create_buffer(device, desc);
+}
+
+fn _backend_wgpu_buffer_write(ctx, buf, off, ptr, n) {
+    var queue = gpu_ctx_queue(ctx);
+    wgpu_queue_write_buffer(queue, buf, off, ptr, n);
+    return 0;
+}
+
+# Synchronous read. Stages an internal MAP_READ buffer, copies
+# n bytes from buf+off into it, maps, memcpy's into the caller's
+# ptr, and releases. Inlined here (rather than calling buffer.cyr's
+# read_buffer_capped) so backend_wgpu.cyr stays placement-independent
+# in the include chain. The 256 MB cap matches the buffer.cyr
+# default — anything larger requires a bespoke streaming path.
+var _BACKEND_WGPU_READ_CAP = 268435456;
+
+fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n) {
+    if (n <= 0)                     { return GPU_ERR_BUFFER; }
+    if (n > _BACKEND_WGPU_READ_CAP) { return GPU_ERR_BUFFER; }
+    var src_size = wgpu_buffer_get_size(buf);
+    if (off < 0)                    { return GPU_ERR_BUFFER; }
+    if (off + n > src_size)         { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buf, off, staging, 0, n);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(ptr, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
+}
+
+fn _backend_wgpu_buffer_release(ctx, buf) {
+    if (ctx == 0) { return 0; }
+    wgpu_buffer_release(buf);
+    return 0;
+}
+
+# ================================================================
+# Shader module
+# ================================================================
+# v0 slot takes (bytes_ptr, n). For wgpu, bytes are WGSL UTF-8.
+# We don't enforce null-termination — wgpu_string_view bounds
+# strlen() at WGPU_LABEL_MAX_BYTES (4 KB) so non-terminated input
+# fails gracefully rather than walking off mapped memory. Real
+# WGSL programs can exceed that 4 KB though; this is a Step-3-era
+# follow-up to pass an explicit length to wgpu_string_view_len.
+
+fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n) {
+    if (ctx == 0)       { return 0; }
+    if (bytes_ptr == 0) { return 0; }
+    if (n <= 0)         { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var src = wgpu_shader_source_wgsl(bytes_ptr);
+    var desc = wgpu_shader_module_descriptor(0, src);
+    return wgpu_device_create_shader_module(device, desc);
+}
+
+fn _backend_wgpu_shader_module_release(ctx, shmod) {
+    if (ctx == 0) { return 0; }
+    wgpu_shader_module_release(shmod);
+    return 0;
+}
+
+# ================================================================
+# Texture slots — wgpu wrappers (Step 5.5)
+# ================================================================
+# Returns a 32-byte struct in the same shape src/texture.cyr uses
+# elsewhere in the codebase, so the wgpu side stays consistent:
+#   +0:  handle   (WGPUTexture, u64)
+#   +8:  view     (WGPUTextureView, u64)
+#   +16: sampler  (WGPUSampler — unused for plain write/read; kept
+#                  for shape-compat with src/texture.cyr; zero here)
+#   +24: width    (u32)
+#   +28: height   (u32)
+#
+# Step 5.5 limit: width must be a multiple of 64 (so bytes_per_row =
+# width*4 satisfies wgpu's COPY_BUFFER_ALIGNMENT = 256 on the read
+# path). Real consumer flows already match this — render_e2e uses
+# 256x256. Sub-64 widths need a row-padded staging buffer; deferred.
+
+fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
+    | WGPU_TEXTURE_USAGE_COPY_DST
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var desc = wgpu_texture_descriptor(0, usage,
+    WGPU_TEXTURE_DIMENSION_2D,
+    width, height,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store64(t + 16, 0);
+    store32(t + 24, width);
+    store32(t + 28, height);
+    return t;
+}
+
+fn _backend_wgpu_texture_write(ctx, tex, src, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+    var dst_info = wgpu_texel_copy_texture_info(handle, 0);
+    var layout = wgpu_texel_copy_buffer_layout(0, width * 4, height);
+    var extent = wgpu_extent_3d(width, height, 1);
+    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
+    return 0;
+}
+
+fn _backend_wgpu_texture_read(ctx, tex, dst, n) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var handle = load64(tex +  0);
+    var width  = load32(tex + 24);
+    var height = load32(tex + 28);
+    var expected = width * height * 4;
+    if (n != expected) { return GPU_ERR_BUFFER; }
+
+    # Stage the readback through a MAP_READ buffer.
+    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ
+    | WGPU_BUFFER_USAGE_COPY_DST;
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging = wgpu_device_create_buffer(device, staging_desc);
+    if (staging == 0) { return GPU_ERR_BUFFER; }
+
+    # Build copy_texture_to_buffer args (72-byte struct layout —
+    # see src/wgpu_ffi.cyr / programs/render_e2e.cyr for the field
+    # offsets).
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs +  0, handle);
+    store32(cargs +  8, 0);   # src mip
+    store32(cargs + 12, 0);   # origin x
+    store32(cargs + 16, 0);   # origin y
+    store32(cargs + 20, 0);   # origin z
+    store32(cargs + 24, 0);   # aspect = All
+    store64(cargs + 32, staging);
+    store64(cargs + 40, 0);
+    store32(cargs + 48, width * 4);
+    store32(cargs + 52, height);
+    store32(cargs + 56, width);
+    store32(cargs + 60, height);
+    store32(cargs + 64, 1);
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_texture_to_buffer(encoder, cargs);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(queue, cmd_buf);
+
+    var status = wgpu_buffer_map_sync(device, staging,
+    WGPU_MAP_MODE_READ, 0, n);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    if (mapped == 0) {
+        wgpu_buffer_unmap(staging);
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
+    memcpy(dst, mapped, n);
+    wgpu_buffer_unmap(staging);
+    wgpu_buffer_release(staging);
+    return 0;
+}
+
+fn _backend_wgpu_texture_release(ctx, tex) {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { return 0; }
+    var handle = load64(tex +  0);
+    var view   = load64(tex +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(tex +  0, 0);
+    store64(tex +  8, 0);
+    store32(tex + 24, 0);
+    store32(tex + 28, 0);
+    return 0;
+}
+
+# ================================================================
+# Compute dispatch — STUB for Step 2
+# ================================================================
+# Full assembly (compute pipeline + bind group from bindings_ptr +
+# command encoder + compute pass + dispatch + submit) requires the
+# bindings_ptr format to be locked in and the public compute API in
+# src/compute.cyr to dispatch through this slot. Both are Step 3
+# work — see docs/development/3-0-punchlist.md.
+#
+# Step 2 returns GPU_ERR_OTHER unconditionally. The slot is filled
+# (backend_is_complete returns 1) but calling it through fncall
+# until Step 3 lands is a programming error. CPU tests do not call
+# this slot.
+
+fn _backend_wgpu_compute_dispatch(ctx, shmod, x, y, z, bp) {
+    return GPU_ERR_OTHER;
+}
+
+# ================================================================
+# Device wait
+# ================================================================
+# wgpu_device_poll(device, wait=1) blocks until all submitted work
+# completes. Slot returns 0 on completion.
+
+fn _backend_wgpu_device_wait_idle(ctx) {
+    if (ctx == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    wgpu_device_poll(device, 1);
+    return 0;
+}
+
+# ================================================================
+# Render slots — v2 (Step 6.8b)
+# ================================================================
+# 7 wrappers around the existing wgpu render helpers in
+# render_target.cyr / render_pipeline.cyr / render_pass.cyr. Slot
+# signatures from docs/proposals/v3-backend-interface.md v2.1.
+#
+# clear_color_ptr is a 32-byte block of 4 f64 RGBA — same shape as
+# mabda's Color (src/color.cyr) and as WGPUColor in webgpu.h v29.
+# rpb_pass_color reads it via color_r/g/b/a getters which are
+# load64 at +0/+8/+16/+24, so the slot can pass the raw pointer
+# straight through.
+#
+# Pipeline struct (16 bytes) — opaque to slot caller:
+#   +0:  handle  (WGPURenderPipeline)
+#   +8:  reserved
+#
+# Pass struct (32 bytes) — opaque to slot caller:
+#   +0:  encoder (WGPUCommandEncoder)
+#   +8:  pass    (WGPURenderPassEncoder)
+#   +16: rt_ptr  (back-reference; the rt outlives the pass)
+#   +24: reserved
+
+fn _backend_wgpu_render_target_create_2d_rgba8(ctx, width, height) {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+    | WGPU_TEXTURE_USAGE_COPY_SRC;
+    var desc = wgpu_texture_descriptor(0, usage,
+    WGPU_TEXTURE_DIMENSION_2D,
+    width, height,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var rt = alloc(32);
+    memset(rt, 0, 32);
+    store64(rt +  0, handle);
+    store64(rt +  8, view);
+    store64(rt + 16, 0);
+    store32(rt + 24, width);
+    store32(rt + 28, height);
+    return rt;
+}
+
+fn _backend_wgpu_render_target_release(ctx, rt) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    var handle = load64(rt +  0);
+    var view   = load64(rt +  8);
+    if (view != 0)   { wgpu_texture_view_release(view); }
+    if (handle != 0) { wgpu_texture_release(handle); }
+    store64(rt +  0, 0);
+    store64(rt +  8, 0);
+    store32(rt + 24, 0);
+    store32(rt + 28, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
+    if (ctx == 0) { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var fmt = color_fmt;
+    if (fmt == 0) { fmt = WGPU_TEXTURE_FORMAT_RGBA8_UNORM; }
+
+    var desc = alloc(168);
+    memset(desc, 0, 168);
+    wgpu_string_view_null(desc + 8);
+    store64(desc + 24, 0);
+    _vertex_state_init(desc + 32, vs_mod, "vs_main");
+    _primitive_state_init(desc + 96, WGPU_TOPOLOGY_TRIANGLE_LIST,
+    WGPU_FRONT_FACE_CCW,
+    WGPU_CULL_MODE_NONE);
+    store64(desc + 128, 0);
+    _multisample_state_init(desc + 136, 1);
+    var color_target = _color_target_state_new(fmt, 0);
+    var fragment = _fragment_state_new(fs_mod, "fs_main", color_target);
+    store64(desc + 160, fragment);
+
+    var handle = wgpu_device_create_render_pipeline(device, desc);
+    if (handle == 0) { return 0; }
+    var pipe = alloc(16);
+    memset(pipe, 0, 16);
+    store64(pipe + 0, handle);
+    return pipe;
+}
+
+fn _backend_wgpu_render_pipeline_release(ctx, pipe) {
+    if (ctx == 0) { return 0; }
+    if (pipe == 0) { return 0; }
+    var handle = load64(pipe + 0);
+    if (handle != 0) { wgpu_render_pipeline_release(handle); }
+    store64(pipe + 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr) {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var view = load64(rt + 8);
+    if (view == 0) { return 0; }
+
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) { return 0; }
+
+    var pb = rpb_pass_new();
+    rpb_pass_color(pb, view, clear_color_ptr);
+    var pass = rpb_pass_begin(encoder, pb);
+    if (pass == 0) {
+        wgpu_command_encoder_release(encoder);
+        return 0;
+    }
+
+    var p = alloc(32);
+    memset(p, 0, 32);
+    store64(p +  0, encoder);
+    store64(p +  8, pass);
+    store64(p + 16, rt);
+    return p;
+}
+
+fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic) {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    var pass_enc = load64(pass + 8);
+    var pipe_handle = load64(pipe + 0);
+    if (pass_enc == 0)    { return GPU_ERR_OTHER; }
+    if (pipe_handle == 0) { return GPU_ERR_OTHER; }
+    wgpu_render_pass_encoder_set_pipeline(pass_enc, pipe_handle);
+    wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
+    return 0;
+}
+
+fn _backend_wgpu_render_pass_end(ctx, pass) {
+    if (ctx == 0) { return 0; }
+    if (pass == 0) { return 0; }
+    var encoder  = load64(pass +  0);
+    var pass_enc = load64(pass +  8);
+    if (pass_enc != 0) { wgpu_render_pass_encoder_end(pass_enc); }
+    if (encoder != 0) {
+        var queue = gpu_ctx_queue(ctx);
+        var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+        if (cmd_buf != 0) { wgpu_queue_submit_one(queue, cmd_buf); }
+        wgpu_command_encoder_release(encoder);
+    }
+    if (pass_enc != 0) { wgpu_render_pass_encoder_release(pass_enc); }
+    store64(pass +  0, 0);
+    store64(pass +  8, 0);
+    store64(pass + 16, 0);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Surface slot wrappers (v3 Step 7.7)
+# ----------------------------------------------------------------
+# Reads the `WGPUSurface` handle from `gpu_ctx_wgpu_surface_handle(ctx)`
+# (set by the public dispatcher `gpu_surface_configure_wgpu` in
+# src/surface_v3.cyr before calling the slot). Delegates to the
+# v2 `src/surface.cyr` `surface_state_*` API which already handles
+# the wgpu surface configuration / acquire / present lifecycle.
+# Caller can keep using `surface_state_*` directly if they prefer
+# (v2 path stays in tree); the v3 slot path adds backend
+# abstraction for consumers writing portable code.
+fn _backend_wgpu_surface_configure(ctx, width, height) {
+    if (ctx == 0)         { return 0; }
+    if (width <= 0)       { return 0; }
+    if (height <= 0)      { return 0; }
+    var wgpu_surface = gpu_ctx_wgpu_surface_handle(ctx);
+    if (wgpu_surface == 0) { return 0; }   # consumer didn't pre-stash
+    var device = gpu_ctx_device(ctx);
+    if (device == 0)       { return 0; }
+    return surface_state_new(wgpu_surface, device,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+    width, height, PRESENT_VSYNC);
+}
+
+# `surface_state_acquire` returns a Result<texture_handle>; the slot
+# protocol returns the texture handle directly (or 0 on error) so
+# the caller can pass it forward without unwrapping a Result.
+fn _backend_wgpu_surface_acquire(ctx, surface) {
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var res = surface_state_acquire(surface);
+    if (is_err_result(res) == 1) { return 0; }
+    return payload(res);
+}
+
+fn _backend_wgpu_surface_present(ctx, surface) {
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    return surface_state_submit_present(surface);
+}
+
+fn _backend_wgpu_surface_release(ctx, surface) {
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    return surface_state_release(surface);
+}
+
+# ================================================================
+# Builder
+# ================================================================
+# Allocates a Backend, fills all 21 fnptr slots with the wrapper
+# functions above, and sets kind = BACKEND_KIND_WGPU. Caller owns
+# the returned pointer; pair with backend release once that exists
+# (none required today — the bump allocator reclaims at process
+# end; persistent allocators land in Step 4 / Phase B.4 follow-ups).
+
+fn backend_wgpu_new() {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+    &_backend_wgpu_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+    &_backend_wgpu_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+    &_backend_wgpu_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+    &_backend_wgpu_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+    &_backend_wgpu_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+    &_backend_wgpu_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+    &_backend_wgpu_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+    &_backend_wgpu_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+    &_backend_wgpu_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+    &_backend_wgpu_device_wait_idle);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
+    &_backend_wgpu_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
+    &_backend_wgpu_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
+    &_backend_wgpu_texture_read);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
+    &_backend_wgpu_texture_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+    &_backend_wgpu_render_target_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+    &_backend_wgpu_render_target_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+    &_backend_wgpu_render_pipeline_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+    &_backend_wgpu_render_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+    &_backend_wgpu_render_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+    &_backend_wgpu_render_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+    &_backend_wgpu_render_pass_end);
+    # v3 surface slots (Step 7.6 stubs; 7.7 fills with real impls).
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE,
+    &_backend_wgpu_surface_configure);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE,
+    &_backend_wgpu_surface_acquire);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_PRESENT,
+    &_backend_wgpu_surface_present);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
+    &_backend_wgpu_surface_release);
+    backend_set_kind(b, BACKEND_KIND_WGPU);
+    return b;
+}

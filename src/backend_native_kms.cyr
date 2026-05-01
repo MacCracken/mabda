@@ -1,0 +1,1621 @@
+# @internal — native KMS / mode-setting (v3 Phase D, Step 7.1)
+# backend_native_kms.cyr — direct DRM/KMS ioctls for surface present
+#
+# Filed separately from backend_native.cyr because the surface path is
+# structurally distinct from the compute / render path:
+#   - compute / render use /dev/dri/renderD128 (render node, no
+#     master) and DRM_IOCTL_AMDGPU_* + generic GEM ioctls.
+#   - mode-set / scanout uses /dev/dri/card0 (primary node, requires
+#     DRM master) and DRM_IOCTL_MODE_* generic ioctls.
+#
+# The fd story diverges, the ioctl families diverge, the lifetime
+# story diverges (a render-only ctx never touches KMS) — so the code
+# diverges too. Keeping it in its own module makes the boundary
+# explicit and prevents the compute path from accidentally pulling
+# in scanout state.
+#
+# Phase D sub-bullets (per docs/development/3-0-punchlist.md):
+#   7.1(a) — GetResources + KmsState scaffold (THIS FILE, Step 7.1a)
+#   7.1(b) — per-connector enumeration (modes + props)
+#   7.1(c) — per-encoder enumeration + native_kms_state_summary
+#   7.2    — mode-set: pick a default mode + DRM_IOCTL_MODE_SETCRTC
+#   7.3    — framebuffer creation: KMS-side wrap of a GTT BO
+#   7.4    — page flip + vblank
+#   7.5    — present primitive (queue + fence integration)
+#   7.6    — surface release lifecycle
+#   7.7    — public gpu_surface_* API + e2e program
+#
+# All data types are i64 / u64 unless noted. drm_mode_* struct layouts
+# mirror include/uapi/drm/drm_mode.h on x86_64 Linux. No libdrm —
+# direct syscall(SYS_IOCTL) only, same posture as backend_native.cyr.
+
+# ================================================================
+# DRM mode-setting ioctl numbers
+# ================================================================
+# Encoding per asm-generic/ioctl.h:
+#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
+# Direction codes are reused from backend_native.cyr (_IOC_RW = 3);
+# DRM type 'd' = 0x64 likewise reused as DRM_IOCTL_TYPE.
+
+# DRM_IOCTL_MODE_GETRESOURCES — nr 0xA0, RW, sizeof(drm_mode_card_res) = 64
+#   0xC0000000 | (64 << 16) | (0x64 << 8) | 0xA0 == 0xC04064A0
+var DRM_IOCTL_MODE_GETRESOURCES = 0xC04064A0;
+
+# DRM_IOCTL_SET_MASTER — nr 0x1E, no payload (dir=0, size=0)
+#   (0 << 30) | (0 << 16) | (0x64 << 8) | 0x1E == 0x641E
+# Acquires DRM master on this fd. Required for SETCRTC, AddFB,
+# PageFlip, and other modesetting ioctls. Returns:
+#   0       — got master
+#   -EACCES — not allowed (e.g., not active vt, no CAP_SYS_ADMIN)
+#   -EINVAL — already master (also fine; treat as success)
+#   -EBUSY  — another fd holds master; will fail until that fd
+#             closes or calls DROP_MASTER (typical when
+#             systemd-logind is keeping master for the
+#             desktop-session compositor on a different vt).
+var DRM_IOCTL_SET_MASTER  = 0x641E;
+var DRM_IOCTL_DROP_MASTER = 0x641F;
+
+# Acquire DRM master. Returns 0 on success or already-master,
+# negative errno on real failure. Treats -EINVAL ("already
+# master, kernel doesn't differentiate") as success — that's the
+# "we opened a fresh fd that auto-mastered" case on some kernels.
+fn native_drm_set_master(fd) {
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SET_MASTER, 0);
+    if (rc == 0)         { return 0; }
+    if (rc == 0 - 22)    { return 0; }   # -EINVAL → already master
+    return rc;
+}
+
+# Release DRM master. Lets the next SET_MASTER on a different fd
+# succeed. Returns 0 on success.
+fn native_drm_drop_master(fd) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_DROP_MASTER, 0);
+}
+
+# DRM_IOCTL_MODE_GETCONNECTOR — nr 0xA7, RW, sizeof(drm_mode_get_connector) = 80
+#   0xC0000000 | (80 << 16) | (0x64 << 8) | 0xA7 == 0xC05064A7
+# (Constant exposed for 7.1(b); ioctl helper lands there.)
+var DRM_IOCTL_MODE_GETCONNECTOR = 0xC05064A7;
+
+# DRM_IOCTL_MODE_GETENCODER — nr 0xA6, RW, sizeof(drm_mode_get_encoder) = 20
+#   0xC0000000 | (20 << 16) | (0x64 << 8) | 0xA6 == 0xC01464A6
+# (Constant exposed for 7.1(c); ioctl helper lands there.)
+var DRM_IOCTL_MODE_GETENCODER = 0xC01464A6;
+
+# ================================================================
+# drm_mode_card_res struct layout (64 bytes, x86_64)
+# ================================================================
+# Mirror of include/uapi/drm/drm_mode.h:drm_mode_card_res:
+#
+#   +0:  fb_id_ptr           (u64) — userspace ptr to FB-ID array
+#   +8:  crtc_id_ptr         (u64) — userspace ptr to CRTC-ID array
+#   +16: connector_id_ptr    (u64) — userspace ptr to connector-ID array
+#   +24: encoder_id_ptr      (u64) — userspace ptr to encoder-ID array
+#   +32: count_fbs           (u32) — IN: cap; OUT: actual count
+#   +36: count_crtcs         (u32) — IN: cap; OUT: actual count
+#   +40: count_connectors    (u32) — IN: cap; OUT: actual count
+#   +44: count_encoders      (u32) — IN: cap; OUT: actual count
+#   +48: min_width           (u32) — OUT
+#   +52: max_width           (u32) — OUT
+#   +56: min_height          (u32) — OUT
+#   +60: max_height          (u32) — OUT
+#
+# Two-call protocol: first ioctl with count_* = 0 and *_ptr = NULL
+# returns the actual counts; second ioctl with caller-allocated arrays
+# at *_ptr and count_* = capacity returns the IDs. This matches
+# libdrm's drmModeGetResources internal pattern.
+
+var DRM_MODE_CARD_RES_SIZE         = 64;
+var DRM_MODE_CARD_RES_FB_PTR       = 0;
+var DRM_MODE_CARD_RES_CRTC_PTR     = 8;
+var DRM_MODE_CARD_RES_CONN_PTR     = 16;
+var DRM_MODE_CARD_RES_ENC_PTR      = 24;
+var DRM_MODE_CARD_RES_COUNT_FBS    = 32;
+var DRM_MODE_CARD_RES_COUNT_CRTCS  = 36;
+var DRM_MODE_CARD_RES_COUNT_CONN   = 40;
+var DRM_MODE_CARD_RES_COUNT_ENC    = 44;
+var DRM_MODE_CARD_RES_MIN_WIDTH    = 48;
+var DRM_MODE_CARD_RES_MAX_WIDTH    = 52;
+var DRM_MODE_CARD_RES_MIN_HEIGHT   = 56;
+var DRM_MODE_CARD_RES_MAX_HEIGHT   = 60;
+
+# Low-level GetResources ioctl. Caller owns `req` (64 bytes), which
+# this fn does NOT zero — the caller controls whether *_ptr and
+# count_* are set up for a count-only call (zeros) or a capacity-
+# bounded fill call. Returns 0 on success, negative errno on failure.
+fn native_drm_mode_get_resources(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_GETRESOURCES, req);
+}
+
+# ================================================================
+# drm_mode_get_connector struct layout (80 bytes, x86_64)
+# ================================================================
+# Mirror of include/uapi/drm/drm_mode.h:drm_mode_get_connector:
+#
+#   +0:  encoders_ptr        (u64) — userspace ptr to u32[count_encoders]
+#   +8:  modes_ptr           (u64) — userspace ptr to drm_mode_modeinfo[count_modes]
+#   +16: props_ptr           (u64) — userspace ptr to u32[count_props]
+#   +24: prop_values_ptr     (u64) — userspace ptr to u64[count_props]
+#   +32: count_modes         (u32) — IN: cap; OUT: actual
+#   +36: count_props         (u32) — IN: cap; OUT: actual
+#   +40: count_encoders      (u32) — IN: cap; OUT: actual
+#   +44: encoder_id          (u32) — OUT: current bound encoder, 0 if not connected
+#   +48: connector_id        (u32) — IN: connector id to query
+#   +52: connector_type      (u32) — OUT: DRM_MODE_CONNECTOR_*
+#   +56: connector_type_id   (u32) — OUT: per-type instance (DP-1 → 1, DP-2 → 2)
+#   +60: connection          (u32) — OUT: DRM_MODE_CONNECTED/DISCONNECTED/UNKNOWN
+#   +64: mm_width            (u32) — OUT: physical width in mm
+#   +68: mm_height           (u32) — OUT: physical height in mm
+#   +72: subpixel            (u32) — OUT: subpixel layout
+#   +76: pad                 (u32) — kernel ≥ 4.x; ignore
+#
+# Same two-call protocol as drm_mode_card_res: pass-1 with count_*=0
+# and *_ptr=0 to discover sizes; pass-2 with caller-allocated arrays
+# and count_* = capacity to fill.
+var DRM_MODE_GET_CONNECTOR_SIZE          = 80;
+var DRM_MODE_GET_CONNECTOR_ENCODERS_PTR  = 0;
+var DRM_MODE_GET_CONNECTOR_MODES_PTR     = 8;
+var DRM_MODE_GET_CONNECTOR_PROPS_PTR     = 16;
+var DRM_MODE_GET_CONNECTOR_PROP_VALS_PTR = 24;
+var DRM_MODE_GET_CONNECTOR_COUNT_MODES   = 32;
+var DRM_MODE_GET_CONNECTOR_COUNT_PROPS   = 36;
+var DRM_MODE_GET_CONNECTOR_COUNT_ENC     = 40;
+var DRM_MODE_GET_CONNECTOR_ENCODER_ID    = 44;
+var DRM_MODE_GET_CONNECTOR_CONN_ID       = 48;
+var DRM_MODE_GET_CONNECTOR_CONN_TYPE     = 52;
+var DRM_MODE_GET_CONNECTOR_CONN_TYPE_ID  = 56;
+var DRM_MODE_GET_CONNECTOR_CONNECTION    = 60;
+var DRM_MODE_GET_CONNECTOR_MM_WIDTH      = 64;
+var DRM_MODE_GET_CONNECTOR_MM_HEIGHT     = 68;
+var DRM_MODE_GET_CONNECTOR_SUBPIXEL      = 72;
+
+# Connection status enum (uapi/drm/drm_mode.h):
+var DRM_MODE_CONNECTED       = 1;
+var DRM_MODE_DISCONNECTED    = 2;
+var DRM_MODE_UNKNOWNCONNECTION = 3;
+
+# Connector-type enum — values mirror DRM_MODE_CONNECTOR_* in
+# include/uapi/drm/drm_mode.h. Covers everything modern x86 / ARM
+# desktops + laptops actually use; obscure connector types
+# (TV / Composite / 9PinDIN) shipped pre-2010 hardware and aren't
+# worth wiring constants for until a consumer asks.
+var DRM_MODE_CONNECTOR_Unknown      = 0;
+var DRM_MODE_CONNECTOR_VGA          = 1;
+var DRM_MODE_CONNECTOR_DVII         = 2;
+var DRM_MODE_CONNECTOR_DVID         = 3;
+var DRM_MODE_CONNECTOR_DVIA         = 4;
+var DRM_MODE_CONNECTOR_HDMIA        = 11;
+var DRM_MODE_CONNECTOR_HDMIB        = 12;
+var DRM_MODE_CONNECTOR_DisplayPort  = 10;
+var DRM_MODE_CONNECTOR_eDP          = 14;
+var DRM_MODE_CONNECTOR_VIRTUAL      = 15;
+var DRM_MODE_CONNECTOR_DSI          = 16;
+var DRM_MODE_CONNECTOR_USB          = 20;
+
+# Low-level GetConnector ioctl. Caller owns `req` (80 bytes); fills
+# count_* + *_ptr per the two-call protocol. Caller MUST set
+# `connector_id` at +48 before calling (the kernel keys the lookup
+# off it). Returns 0 on success, negative errno on failure.
+fn native_drm_mode_get_connector(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_GETCONNECTOR, req);
+}
+
+# ================================================================
+# drm_mode_modeinfo struct layout (68 bytes, x86_64)
+# ================================================================
+# Mirror of include/uapi/drm/drm_mode.h:drm_mode_modeinfo. Each
+# entry in the modes_ptr array of a populated drm_mode_get_connector
+# is one of these. The name field is fixed-width 32 bytes (ASCII +
+# NUL padding; not necessarily NUL-terminated if the mode name is
+# exactly 32 chars, though radv / kernel never go that long).
+#
+#   +0:  clock         (u32) — pixel clock in kHz
+#   +4:  hdisplay      (u16) — visible H pixels
+#   +6:  hsync_start   (u16)
+#   +8:  hsync_end     (u16)
+#   +10: htotal        (u16)
+#   +12: hskew         (u16)
+#   +14: vdisplay      (u16) — visible V pixels
+#   +16: vsync_start   (u16)
+#   +18: vsync_end     (u16)
+#   +20: vtotal        (u16)
+#   +22: vscan         (u16)
+#   +24: vrefresh      (u32) — Hz × 1000 (e.g., 59940 = 59.94 Hz)
+#   +28: flags         (u32)
+#   +32: type          (u32)
+#   +36: name[32]      (char) — DRM_DISPLAY_MODE_LEN = 32
+var DRM_MODE_MODEINFO_SIZE        = 68;
+var DRM_MODE_MODEINFO_CLOCK       = 0;
+var DRM_MODE_MODEINFO_HDISPLAY    = 4;
+var DRM_MODE_MODEINFO_HSYNC_START = 6;
+var DRM_MODE_MODEINFO_HSYNC_END   = 8;
+var DRM_MODE_MODEINFO_HTOTAL      = 10;
+var DRM_MODE_MODEINFO_HSKEW       = 12;
+var DRM_MODE_MODEINFO_VDISPLAY    = 14;
+var DRM_MODE_MODEINFO_VSYNC_START = 16;
+var DRM_MODE_MODEINFO_VSYNC_END   = 18;
+var DRM_MODE_MODEINFO_VTOTAL      = 20;
+var DRM_MODE_MODEINFO_VSCAN       = 22;
+var DRM_MODE_MODEINFO_VREFRESH    = 24;
+var DRM_MODE_MODEINFO_FLAGS       = 28;
+var DRM_MODE_MODEINFO_TYPE        = 32;
+var DRM_MODE_MODEINFO_NAME        = 36;
+var DRM_MODE_MODEINFO_NAME_LEN    = 32;
+
+# ================================================================
+# KmsState struct layout (96 bytes)
+# ================================================================
+# Owns the full output of two-pass MODE_GETRESOURCES discovery:
+# the kernel-reported counts, the four ID arrays (heap-allocated by
+# native_kms_init), and the framebuffer extent limits. The fd is
+# stashed at +0 so subsequent per-connector / per-encoder ioctls
+# don't need to be re-passed it.
+#
+#   +0:  fd                  (u64) — DRM card-node fd
+#   +8:  count_fbs           (u32)
+#   +12: count_crtcs         (u32)
+#   +16: count_connectors    (u32)
+#   +20: count_encoders      (u32)
+#   +24: fb_ids              (u64 ptr — heap, count_fbs × u32)
+#   +32: crtc_ids            (u64 ptr — heap, count_crtcs × u32)
+#   +40: connector_ids       (u64 ptr — heap, count_connectors × u32)
+#   +48: encoder_ids         (u64 ptr — heap, count_encoders × u32)
+#   +56: min_width           (u32)
+#   +60: max_width           (u32)
+#   +64: min_height          (u32)
+#   +68: max_height          (u32)
+#   +72: reserved            (24 bytes — for 7.1(b/c) per-connector
+#                              + per-encoder summary tables)
+var KMS_STATE_FIELD_FD             = 0;
+var KMS_STATE_FIELD_COUNT_FBS      = 8;
+var KMS_STATE_FIELD_COUNT_CRTCS    = 12;
+var KMS_STATE_FIELD_COUNT_CONN     = 16;
+var KMS_STATE_FIELD_COUNT_ENCODERS      = 20;
+var KMS_STATE_FIELD_FB_IDS         = 24;
+var KMS_STATE_FIELD_CRTC_IDS       = 32;
+var KMS_STATE_FIELD_CONN_IDS       = 40;
+var KMS_STATE_FIELD_ENC_IDS        = 48;
+var KMS_STATE_FIELD_MIN_WIDTH      = 56;
+var KMS_STATE_FIELD_MAX_WIDTH      = 60;
+var KMS_STATE_FIELD_MIN_HEIGHT     = 64;
+var KMS_STATE_FIELD_MAX_HEIGHT     = 68;
+var KMS_STATE_STRUCT_SIZE          = 96;
+
+# Two-pass discovery driver. Allocates a 96-byte KmsState, opens DRM
+# resources twice (count-only then array-fill), populates the state.
+# Caller frees the state with native_kms_release.
+#
+# Returns the KmsState pointer on success, or 0 on failure (count-
+# pass ioctl failed; either fd is not a DRM master node, or the
+# kernel doesn't support modesetting on this device).
+fn native_kms_init(fd) {
+    if (fd <= 0) { return 0; }
+    var state = alloc(KMS_STATE_STRUCT_SIZE);
+    memset(state, 0, KMS_STATE_STRUCT_SIZE);
+    store64(state + KMS_STATE_FIELD_FD, fd);
+
+    # ---- Pass 1: count-only (all *_ptr = 0, count_* = 0) ----
+    var req[64];
+    memset(&req, 0, DRM_MODE_CARD_RES_SIZE);
+    var rc = native_drm_mode_get_resources(fd, &req);
+    if (rc != 0) { return 0; }
+
+    var count_fbs   = load32(&req + DRM_MODE_CARD_RES_COUNT_FBS);
+    var count_crtcs = load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS);
+    var count_conn  = load32(&req + DRM_MODE_CARD_RES_COUNT_CONN);
+    var count_enc   = load32(&req + DRM_MODE_CARD_RES_COUNT_ENC);
+
+    # Stash the framebuffer extent limits (these come back from the
+    # count-pass; no need for a fill-pass to read them).
+    store32(state + KMS_STATE_FIELD_MIN_WIDTH,
+    load32(&req + DRM_MODE_CARD_RES_MIN_WIDTH));
+    store32(state + KMS_STATE_FIELD_MAX_WIDTH,
+    load32(&req + DRM_MODE_CARD_RES_MAX_WIDTH));
+    store32(state + KMS_STATE_FIELD_MIN_HEIGHT,
+    load32(&req + DRM_MODE_CARD_RES_MIN_HEIGHT));
+    store32(state + KMS_STATE_FIELD_MAX_HEIGHT,
+    load32(&req + DRM_MODE_CARD_RES_MAX_HEIGHT));
+
+    # ---- Pass 2: array fill ----
+    # Heap-allocate four u32 arrays sized by the pass-1 counts. Skip
+    # the alloc + ioctl for any zero-count category (e.g., a
+    # freshly-booted card with no FBs yet has count_fbs = 0).
+    var fb_ids   = 0;
+    var crtc_ids = 0;
+    var conn_ids = 0;
+    var enc_ids  = 0;
+
+    if (count_fbs > 0)   { fb_ids   = alloc(count_fbs * 4); }
+    if (count_crtcs > 0) { crtc_ids = alloc(count_crtcs * 4); }
+    if (count_conn > 0)  { conn_ids = alloc(count_conn * 4); }
+    if (count_enc > 0)   { enc_ids  = alloc(count_enc * 4); }
+
+    memset(&req, 0, DRM_MODE_CARD_RES_SIZE);
+    store64(&req + DRM_MODE_CARD_RES_FB_PTR,    fb_ids);
+    store64(&req + DRM_MODE_CARD_RES_CRTC_PTR,  crtc_ids);
+    store64(&req + DRM_MODE_CARD_RES_CONN_PTR,  conn_ids);
+    store64(&req + DRM_MODE_CARD_RES_ENC_PTR,   enc_ids);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_FBS,   count_fbs);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS, count_crtcs);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_CONN,  count_conn);
+    store32(&req + DRM_MODE_CARD_RES_COUNT_ENC,   count_enc);
+
+    rc = native_drm_mode_get_resources(fd, &req);
+    if (rc != 0) { return 0; }
+
+    # The kernel may report fewer than pass-1 counts if a connector
+    # was hot-unplugged between calls. Use the post-fill counts as
+    # the source of truth.
+    store32(state + KMS_STATE_FIELD_COUNT_FBS,
+    load32(&req + DRM_MODE_CARD_RES_COUNT_FBS));
+    store32(state + KMS_STATE_FIELD_COUNT_CRTCS,
+    load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS));
+    store32(state + KMS_STATE_FIELD_COUNT_CONN,
+    load32(&req + DRM_MODE_CARD_RES_COUNT_CONN));
+    store32(state + KMS_STATE_FIELD_COUNT_ENCODERS,
+    load32(&req + DRM_MODE_CARD_RES_COUNT_ENC));
+    store64(state + KMS_STATE_FIELD_FB_IDS,   fb_ids);
+    store64(state + KMS_STATE_FIELD_CRTC_IDS, crtc_ids);
+    store64(state + KMS_STATE_FIELD_CONN_IDS, conn_ids);
+    store64(state + KMS_STATE_FIELD_ENC_IDS,  enc_ids);
+
+    return state;
+}
+
+# Release a KmsState. The bump-allocator pattern means the heap
+# allocations themselves are not freed (consistent with
+# native_compute_dispatch_cached and similar paths) — we just zero
+# the struct so subsequent loads of stale ptrs surface as null.
+# Returns 0.
+fn native_kms_release(state) {
+    if (state == 0) { return 0; }
+    memset(state, 0, KMS_STATE_STRUCT_SIZE);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Field accessors (consistent with native_ctx_* helpers in
+# backend_native.cyr — short-name accessors keep call sites readable
+# without spreading the field-offset constants through callers).
+# ----------------------------------------------------------------
+fn kms_state_fd(state)          { return load64(state + KMS_STATE_FIELD_FD); }
+fn kms_state_count_fbs(state)   { return load32(state + KMS_STATE_FIELD_COUNT_FBS); }
+fn kms_state_count_crtcs(state) { return load32(state + KMS_STATE_FIELD_COUNT_CRTCS); }
+fn kms_state_count_conn(state)  { return load32(state + KMS_STATE_FIELD_COUNT_CONN); }
+fn kms_state_count_enc(state)   { return load32(state + KMS_STATE_FIELD_COUNT_ENCODERS); }
+fn kms_state_fb_ids(state)      { return load64(state + KMS_STATE_FIELD_FB_IDS); }
+fn kms_state_crtc_ids(state)    { return load64(state + KMS_STATE_FIELD_CRTC_IDS); }
+fn kms_state_conn_ids(state)    { return load64(state + KMS_STATE_FIELD_CONN_IDS); }
+fn kms_state_enc_ids(state)     { return load64(state + KMS_STATE_FIELD_ENC_IDS); }
+fn kms_state_min_width(state)   { return load32(state + KMS_STATE_FIELD_MIN_WIDTH); }
+fn kms_state_max_width(state)   { return load32(state + KMS_STATE_FIELD_MAX_WIDTH); }
+fn kms_state_min_height(state)  { return load32(state + KMS_STATE_FIELD_MIN_HEIGHT); }
+fn kms_state_max_height(state)  { return load32(state + KMS_STATE_FIELD_MAX_HEIGHT); }
+
+# ================================================================
+# v3 Step 7.1(c) — Encoder ioctl + DRM_MODE_ENCODER_* enum
+# ================================================================
+# drm_mode_get_encoder layout (20 bytes, x86_64):
+#   +0:  encoder_id      (u32) — IN: encoder to query; OUT: same
+#   +4:  encoder_type    (u32) — OUT: DRM_MODE_ENCODER_*
+#   +8:  crtc_id         (u32) — OUT: currently bound CRTC, 0 if free
+#   +12: possible_crtcs  (u32) — OUT: bitmask of usable CRTCs
+#   +16: possible_clones (u32) — OUT: bitmask of clonable encoders
+var DRM_MODE_GET_ENCODER_SIZE       = 20;
+var DRM_MODE_GET_ENCODER_ID         = 0;
+var DRM_MODE_GET_ENCODER_TYPE       = 4;
+var DRM_MODE_GET_ENCODER_CRTC_ID    = 8;
+var DRM_MODE_GET_ENCODER_POSS_CRTCS = 12;
+var DRM_MODE_GET_ENCODER_POSS_CLONES = 16;
+
+# Encoder-type enum (uapi/drm/drm_mode.h DRM_MODE_ENCODER_*).
+# DAC/TMDS/LVDS cover the legacy / desktop / laptop common cases;
+# VIRTUAL/DSI/DPMST/DPI cover modern ARM + DP-MST setups.
+var DRM_MODE_ENCODER_NONE    = 0;
+var DRM_MODE_ENCODER_DAC     = 1;
+var DRM_MODE_ENCODER_TMDS    = 2;
+var DRM_MODE_ENCODER_LVDS    = 3;
+var DRM_MODE_ENCODER_TVDAC   = 4;
+var DRM_MODE_ENCODER_VIRTUAL = 5;
+var DRM_MODE_ENCODER_DSI     = 6;
+var DRM_MODE_ENCODER_DPMST   = 7;
+var DRM_MODE_ENCODER_DPI     = 8;
+
+# Low-level GetEncoder ioctl. Caller owns `req` (20 bytes), MUST
+# set encoder_id at +0 before calling. Returns 0 on success,
+# negative errno on failure.
+fn native_drm_mode_get_encoder(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_GETENCODER, req);
+}
+
+# ================================================================
+# Type-name lookup helpers (cstr return)
+# ================================================================
+# Tables are inline if/elif chains rather than data tables — keeps
+# the module pure-Cyrius (no string-table runtime), and keeps the
+# call sites simple. The fallback "?" string ensures any new value
+# added by a future kernel surfaces visibly in summary output.
+
+fn native_drm_connector_type_name(t) {
+    if (t == DRM_MODE_CONNECTOR_Unknown)     { return "Unknown"; }
+    if (t == DRM_MODE_CONNECTOR_VGA)         { return "VGA"; }
+    if (t == DRM_MODE_CONNECTOR_DVII)        { return "DVI-I"; }
+    if (t == DRM_MODE_CONNECTOR_DVID)        { return "DVI-D"; }
+    if (t == DRM_MODE_CONNECTOR_DVIA)        { return "DVI-A"; }
+    if (t == DRM_MODE_CONNECTOR_DisplayPort) { return "DP"; }
+    if (t == DRM_MODE_CONNECTOR_HDMIA)       { return "HDMI-A"; }
+    if (t == DRM_MODE_CONNECTOR_HDMIB)       { return "HDMI-B"; }
+    if (t == DRM_MODE_CONNECTOR_eDP)         { return "eDP"; }
+    if (t == DRM_MODE_CONNECTOR_VIRTUAL)     { return "Virtual"; }
+    if (t == DRM_MODE_CONNECTOR_DSI)         { return "DSI"; }
+    if (t == DRM_MODE_CONNECTOR_USB)         { return "USB-C"; }
+    return "?";
+}
+
+fn native_drm_encoder_type_name(t) {
+    if (t == DRM_MODE_ENCODER_NONE)    { return "None"; }
+    if (t == DRM_MODE_ENCODER_DAC)     { return "DAC"; }
+    if (t == DRM_MODE_ENCODER_TMDS)    { return "TMDS"; }
+    if (t == DRM_MODE_ENCODER_LVDS)    { return "LVDS"; }
+    if (t == DRM_MODE_ENCODER_TVDAC)   { return "TVDAC"; }
+    if (t == DRM_MODE_ENCODER_VIRTUAL) { return "Virtual"; }
+    if (t == DRM_MODE_ENCODER_DSI)     { return "DSI"; }
+    if (t == DRM_MODE_ENCODER_DPMST)   { return "DP-MST"; }
+    if (t == DRM_MODE_ENCODER_DPI)     { return "DPI"; }
+    return "?";
+}
+
+fn native_drm_connection_status_name(c) {
+    if (c == DRM_MODE_CONNECTED)         { return "connected"; }
+    if (c == DRM_MODE_DISCONNECTED)      { return "disconnected"; }
+    if (c == DRM_MODE_UNKNOWNCONNECTION) { return "unknown"; }
+    return "?";
+}
+
+# ================================================================
+# native_kms_summary — topology printer (Step 7.1(c))
+# ================================================================
+# Walks the connector + encoder ID arrays from a populated KmsState
+# (Step 7.1(a)) and queries each via the per-resource ioctls
+# (7.1(b)/(c) wrappers). Prints one line per connector and one per
+# encoder to stdout. HW-gated (ioctl-driven); CPU tests cover the
+# data-structure surface in mabda_v3_phase_d.tcyr.
+#
+# Output shape (one example line per category):
+#   conn 95 eDP-1 connected enc 94
+#   enc 94 TMDS crtc 73 poss 0x3
+#
+# Intentionally compact — this is a developer diagnostic, not a
+# user-facing UI. The columns are: id, type-name, status (connectors
+# only) / current-CRTC + possible-CRTC mask (encoders only).
+#
+# Returns 0 on full success, negative errno on the first ioctl that
+# fails (subsequent connectors / encoders are skipped). Partial
+# progress is printed up to the point of failure — useful when
+# debugging which connector is misbehaving.
+fn native_kms_summary(state) {
+    if (state == 0) { return -1; }
+    var fd = kms_state_fd(state);
+    if (fd <= 0)    { return -1; }
+
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var enc_count  = kms_state_count_enc(state);
+    var enc_ids    = kms_state_enc_ids(state);
+
+    syscall(1, 1, "kms summary:\n", 13);
+
+    # ---- Connectors ----
+    var i = 0;
+    var cbuf[80];
+    while (i < conn_count) {
+        memset(&cbuf, 0, 80);
+        store32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_ID, load32(conn_ids + i * 4));
+        var rc = native_drm_mode_get_connector(fd, &cbuf);
+        if (rc != 0) { return rc; }
+        var conn_id   = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_ID);
+        var conn_type = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_TYPE);
+        var type_id   = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONN_TYPE_ID);
+        var connection = load32(&cbuf + DRM_MODE_GET_CONNECTOR_CONNECTION);
+        var encoder_id = load32(&cbuf + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+
+        _kms_summary_print_conn(conn_id, conn_type, type_id, connection, encoder_id);
+        i = i + 1;
+    }
+
+    # ---- Encoders ----
+    var j = 0;
+    var ebuf[20];
+    while (j < enc_count) {
+        memset(&ebuf, 0, 20);
+        store32(&ebuf + DRM_MODE_GET_ENCODER_ID, load32(enc_ids + j * 4));
+        var rc = native_drm_mode_get_encoder(fd, &ebuf);
+        if (rc != 0) { return rc; }
+        var enc_id    = load32(&ebuf + DRM_MODE_GET_ENCODER_ID);
+        var enc_type  = load32(&ebuf + DRM_MODE_GET_ENCODER_TYPE);
+        var crtc_id   = load32(&ebuf + DRM_MODE_GET_ENCODER_CRTC_ID);
+        var poss_crtcs = load32(&ebuf + DRM_MODE_GET_ENCODER_POSS_CRTCS);
+
+        _kms_summary_print_enc(enc_id, enc_type, crtc_id, poss_crtcs);
+        j = j + 1;
+    }
+
+    return 0;
+}
+
+# Internal printer — kept in the same module so consumers don't pull
+# in fmt helpers transitively. Splitting these out as `_`-prefixed
+# helpers keeps the main loop in native_kms_summary readable + lets
+# the printer logic evolve without churning the loop.
+fn _kms_summary_print_conn(id, ctype, type_id, connection, enc_id) {
+    syscall(1, 1, "  conn ", 7);
+    _kms_summary_print_u32(id);
+    syscall(1, 1, " ", 1);
+    var name = native_drm_connector_type_name(ctype);
+    syscall(1, 1, name, strlen(name));
+    syscall(1, 1, "-", 1);
+    _kms_summary_print_u32(type_id);
+    syscall(1, 1, " ", 1);
+    var status = native_drm_connection_status_name(connection);
+    syscall(1, 1, status, strlen(status));
+    syscall(1, 1, " enc ", 5);
+    _kms_summary_print_u32(enc_id);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+fn _kms_summary_print_enc(id, etype, crtc_id, poss_crtcs) {
+    syscall(1, 1, "  enc ", 6);
+    _kms_summary_print_u32(id);
+    syscall(1, 1, " ", 1);
+    var name = native_drm_encoder_type_name(etype);
+    syscall(1, 1, name, strlen(name));
+    syscall(1, 1, " crtc ", 6);
+    _kms_summary_print_u32(crtc_id);
+    syscall(1, 1, " poss 0x", 8);
+    _kms_summary_print_hex32(poss_crtcs);
+    syscall(1, 1, "\n", 1);
+    return 0;
+}
+
+# Decimal u32 printer — uses fmt_int_buf from lib/fmt to keep the
+# call sites concise. Stack-allocated buffer so we don't churn the
+# bump allocator on every printed connector / encoder.
+fn _kms_summary_print_u32(v) {
+    var buf[16];
+    memset(&buf, 0, 16);
+    var n = fmt_int_buf(v, &buf);
+    syscall(1, 1, &buf, n);
+    return 0;
+}
+
+# 8-digit hex u32 printer for the possible-CRTCs bitmask.
+fn _kms_summary_print_hex32(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[8];
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 8);
+    return 0;
+}
+
+# ================================================================
+# v3 Step 7.2(a) — Per-connector mode enumeration + preferred pick
+# ================================================================
+# Mode-set (7.2 proper) needs to know which mode to set. The kernel
+# returns a modes array per connector via the two-call protocol of
+# DRM_IOCTL_MODE_GETCONNECTOR. The flag word at modeinfo+32 carries
+# the EDID-derived "preferred" hint — picking a mode marked
+# PREFERRED matches what the monitor itself recommends, which is
+# what radv / wlroots / kwin all do.
+#
+# DRM_MODE_TYPE_* enum (uapi/drm/drm_mode.h):
+#   BUILTIN  = 0x01  (deprecated; never set on modern kernels)
+#   CLOCK_C  = 0x02  (deprecated)
+#   CRTC_C   = 0x04  (deprecated)
+#   PREFERRED = 0x08  (EDID's preferred mode — the load-bearing flag)
+#   DEFAULT  = 0x10  (deprecated)
+#   USERDEF  = 0x20  (userspace-added via MODE_ADDMODE)
+#   DRIVER   = 0x40  (kernel-derived from EDID; typical mode flag)
+#
+# A modern monitor's modeinfo.type is typically 0x40 (DRIVER) for
+# every mode and 0x48 (DRIVER | PREFERRED) for the EDID's
+# preferred resolution.
+var DRM_MODE_TYPE_BUILTIN   = 0x01;
+var DRM_MODE_TYPE_PREFERRED = 0x08;
+var DRM_MODE_TYPE_USERDEF   = 0x20;
+var DRM_MODE_TYPE_DRIVER    = 0x40;
+
+# Two-call wrapper for the connector's modes array. Pass 1: count-
+# only ioctl with all *_ptr=0 to discover count_modes. Pass 2:
+# heap-allocate count_modes × DRM_MODE_MODEINFO_SIZE bytes, refill.
+# Returns the heap pointer to the modes array on success (caller
+# treats as `drm_mode_modeinfo[count_modes]`); returns 0 on failure.
+# The count is written to `count_out` (u32) on success.
+#
+# The connection-status check is the caller's responsibility — a
+# disconnected connector still succeeds at the ioctl, just returns
+# count_modes=0 (and possibly some old EDID modes the kernel cached).
+# Callers wanting "modes from a live connector" filter on
+# DRM_MODE_CONNECTED first via native_drm_mode_get_connector.
+fn native_kms_get_connector_modes(fd, conn_id, count_out) {
+    if (fd <= 0)      { return 0; }
+    if (conn_id == 0) { return 0; }
+    if (count_out == 0) { return 0; }
+
+    # ---- Pass 1: count-only ----
+    var req[80];
+    memset(&req, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+    store32(&req + DRM_MODE_GET_CONNECTOR_CONN_ID, conn_id);
+    var rc = native_drm_mode_get_connector(fd, &req);
+    if (rc != 0) { return 0; }
+
+    var count = load32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES);
+    if (count == 0) {
+        store32(count_out, 0);
+        return 0;   # no modes — connector probably disconnected
+    }
+
+    # ---- Pass 2: fill modes (skip encoders / props for this fn) ----
+    var modes = alloc(count * DRM_MODE_MODEINFO_SIZE);
+    memset(&req, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+    store32(&req + DRM_MODE_GET_CONNECTOR_CONN_ID,     conn_id);
+    store64(&req + DRM_MODE_GET_CONNECTOR_MODES_PTR,   modes);
+    store32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES, count);
+    rc = native_drm_mode_get_connector(fd, &req);
+    if (rc != 0) {
+        store32(count_out, 0);
+        return 0;
+    }
+
+    # Kernel may report fewer modes if state changed between calls.
+    # Truth is the post-fill count.
+    var actual = load32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES);
+    store32(count_out, actual);
+    return modes;
+}
+
+# Pick the index of the first mode with the PREFERRED bit set.
+# Returns 0 when no preferred mode is found OR when count is 0
+# (caller must check count first — a 0 return from a count=0
+# array means "nothing valid").
+#
+# This matches radv's `radv_get_preferred_mode` shape: trust the
+# kernel's EDID-derived flag, fall back to mode[0] (which is
+# almost always the same as preferred when set, since the kernel
+# emits the preferred mode first).
+fn native_kms_pick_preferred_mode(modes_ptr, count) {
+    if (modes_ptr == 0) { return 0; }
+    if (count == 0)     { return 0; }
+    var i = 0;
+    while (i < count) {
+        var t = load32(modes_ptr + i * DRM_MODE_MODEINFO_SIZE
+        + DRM_MODE_MODEINFO_TYPE);
+        if ((t & DRM_MODE_TYPE_PREFERRED) != 0) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Read mode dimensions out of a modes_ptr[idx] entry. Useful both
+# for the diagnostic and for callers that want to size a
+# framebuffer to match (Step 7.3). Returns 0 on null / out-of-range.
+fn native_kms_mode_hdisplay(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load16(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+    + DRM_MODE_MODEINFO_HDISPLAY);
+}
+
+fn native_kms_mode_vdisplay(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load16(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+    + DRM_MODE_MODEINFO_VDISPLAY);
+}
+
+fn native_kms_mode_vrefresh(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load32(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+    + DRM_MODE_MODEINFO_VREFRESH);
+}
+
+fn native_kms_mode_type(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    return load32(modes_ptr + idx * DRM_MODE_MODEINFO_SIZE
+    + DRM_MODE_MODEINFO_TYPE);
+}
+
+# Compute refresh rate in Hz from clock + h/vtotal. The kernel's
+# vrefresh field is unreliable on modern kernels (often returned
+# as 0); libdrm computes it the same way:
+#   Hz = clock_kHz × 1000 / (htotal × vtotal)
+# Returns 0 for null modes_ptr or zero divisor.
+fn native_kms_mode_refresh_hz(modes_ptr, idx) {
+    if (modes_ptr == 0) { return 0; }
+    var base   = modes_ptr + idx * DRM_MODE_MODEINFO_SIZE;
+    var clock  = load32(base + DRM_MODE_MODEINFO_CLOCK);
+    var htotal = load16(base + DRM_MODE_MODEINFO_HTOTAL);
+    var vtotal = load16(base + DRM_MODE_MODEINFO_VTOTAL);
+    if (htotal == 0) { return 0; }
+    if (vtotal == 0) { return 0; }
+    return (clock * 1000) / (htotal * vtotal);
+}
+
+# ================================================================
+# v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB)
+# ================================================================
+# A KMS framebuffer is a kernel-side handle that wraps a GEM BO
+# with metadata the display engine needs to scan it out: width /
+# height in pixels, pixel format (DRM_FORMAT_*), per-plane row
+# pitch, per-plane offset into the BO, and an optional tiling
+# modifier. The FB ID returned by ADDFB2 is what
+# DRM_IOCTL_MODE_SETCRTC (Step 7.2(b)) takes as input.
+#
+# AddFB2 vs the legacy AddFB: AddFB2 takes a fourcc pixel_format
+# directly + supports up to 4 planes (YUV) + supports modifiers
+# (tiling). Single-plane RGB scanout uses planes[0] only and
+# modifier=0 (linear).
+
+# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 100
+#   0xC0000000 | (100 << 16) | (0x64 << 8) | 0xB8 == 0xC06464B8
+var DRM_IOCTL_MODE_ADDFB2 = 0xC06464B8;
+
+# DRM_IOCTL_MODE_RMFB — nr 0xAF, RW, sizeof(u32) = 4
+#   0xC0000000 | (4 << 16) | (0x64 << 8) | 0xAF == 0xC00464AF
+# The "request" is just a u32 fb_id by value (write-only from
+# userspace to kernel). Same RW-encoding ceremony as ADDFB2.
+var DRM_IOCTL_MODE_RMFB = 0xC00464AF;
+
+# DRM_FORMAT_* fourcc codes (uapi/drm/drm_fourcc.h). Each is a
+# 4-character ASCII tag stored as a little-endian u32. The naming
+# describes the *MSB-first byte order* of a single 32-bit pixel —
+# so DRM_FORMAT_XRGB8888 means a 32-bit word where the MSByte is
+# 'x' (ignored alpha) and the LSByte is 'B'. In LITTLE-ENDIAN
+# memory that pixel reads as `B G R x` (bytes 0..3) — which is
+# what's commonly called BGRX8 or BGRA8.
+#
+# Mapping for mabda's wgpu-parity color formats:
+#   wgpu RGBA8_UNORM (memory: R G B A)  ↔  DRM_FORMAT_ABGR8888
+#   wgpu BGRA8_UNORM (memory: B G R A)  ↔  DRM_FORMAT_ARGB8888
+# v3 Phase D scans out from RGBA8 BOs (matches the render path's
+# RT format), so ABGR8888 is the working format. XRGB / XBGR are
+# also exposed for opaque scanout where alpha is don't-care.
+var DRM_FORMAT_XRGB8888 = 0x34325258;   # 'X' 'R' '2' '4'
+var DRM_FORMAT_ARGB8888 = 0x34325241;   # 'A' 'R' '2' '4'
+var DRM_FORMAT_XBGR8888 = 0x34324258;   # 'X' 'B' '2' '4'
+var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
+
+# drm_mode_fb_cmd2 layout (100 bytes, x86_64):
+#   +0:  fb_id          (u32) — OUT (kernel returns FB ID)
+#   +4:  width          (u32) — IN
+#   +8:  height         (u32) — IN
+#   +12: pixel_format   (u32) — IN (DRM_FORMAT_*)
+#   +16: flags          (u32) — IN
+#   +20: handles[4]     (u32 × 4 = 16 B) — IN, plane GEM handles
+#   +36: pitches[4]     (u32 × 4 = 16 B) — IN, bytes per row per plane
+#   +52: offsets[4]     (u32 × 4 = 16 B) — IN, BO byte offset per plane
+#   +68: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane
+var DRM_MODE_FB_CMD2_SIZE      = 100;
+var DRM_MODE_FB_CMD2_FB_ID     = 0;
+var DRM_MODE_FB_CMD2_WIDTH     = 4;
+var DRM_MODE_FB_CMD2_HEIGHT    = 8;
+var DRM_MODE_FB_CMD2_FORMAT    = 12;
+var DRM_MODE_FB_CMD2_FLAGS     = 16;
+var DRM_MODE_FB_CMD2_HANDLES   = 20;
+var DRM_MODE_FB_CMD2_PITCHES   = 36;
+var DRM_MODE_FB_CMD2_OFFSETS   = 52;
+var DRM_MODE_FB_CMD2_MODIFIERS = 68;
+
+# Linear (untiled) tiling modifier — value 0 in uapi/drm/drm_fourcc.h.
+# Pre-2018 kernels infer linear from "no MODIFIERS flag set"; modern
+# kernels accept an explicit 0 modifier as linear. We expose it
+# here for clarity at call sites.
+var DRM_FORMAT_MOD_LINEAR = 0;
+
+# Low-level AddFB2 ioctl. Caller owns `req` (100 bytes), MUST fill
+# width/height/format/handles/pitches/offsets/modifiers/flags
+# before calling. fb_id at +0 is OUT (overwritten on success).
+# Returns 0 on success (req+0 holds the new FB ID), negative errno
+# on failure.
+fn native_drm_mode_add_fb2(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_ADDFB2, req);
+}
+
+# Low-level RmFB ioctl. The kernel takes a `u32 fb_id` BY VALUE,
+# but Linux's ioctl ABI passes args by pointer — so we pass a
+# 4-byte buffer holding the FB ID. Returns 0 on success, negative
+# errno on failure.
+fn native_drm_mode_rm_fb(fd, fb_id_ptr) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_RMFB, fb_id_ptr);
+}
+
+# High-level: wrap a GEM BO as a single-plane XRGB8888 framebuffer.
+# Returns the FB ID on success (always > 0; the kernel rejects 0
+# as a valid FB ID), or 0 on failure. `pitch` is bytes per row —
+# usually `width * 4` for tightly-packed XRGB8888, but the
+# scanout path may require alignment to a hardware-specific stride
+# (handled by the consumer; this fn just forwards what's given).
+#
+# `bo_handle` MUST come from the same fd as this fn is called on
+# (the kernel verifies). Use the card-master fd for both
+# native_bo_create_gtt and this call.
+fn native_kms_add_fb_xrgb8888(fd, bo_handle, width, height, pitch) {
+    if (fd <= 0)        { return 0; }
+    if (bo_handle == 0) { return 0; }
+    if (width <= 0)     { return 0; }
+    if (height <= 0)    { return 0; }
+    if (pitch <= 0)     { return 0; }
+
+    var req[100];
+    memset(&req, 0, DRM_MODE_FB_CMD2_SIZE);
+    store32(&req + DRM_MODE_FB_CMD2_WIDTH,           width);
+    store32(&req + DRM_MODE_FB_CMD2_HEIGHT,          height);
+    store32(&req + DRM_MODE_FB_CMD2_FORMAT,          DRM_FORMAT_XRGB8888);
+    store32(&req + DRM_MODE_FB_CMD2_FLAGS,           0);
+    store32(&req + DRM_MODE_FB_CMD2_HANDLES + 0,     bo_handle);
+    store32(&req + DRM_MODE_FB_CMD2_PITCHES + 0,     pitch);
+    store32(&req + DRM_MODE_FB_CMD2_OFFSETS + 0,     0);
+    store64(&req + DRM_MODE_FB_CMD2_MODIFIERS + 0,   DRM_FORMAT_MOD_LINEAR);
+    var rc = native_drm_mode_add_fb2(fd, &req);
+    if (rc != 0) { return 0; }
+    return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
+}
+
+# Release a framebuffer ID. fb_id == 0 is a no-op (matches the
+# convention native_kms_add_fb_xrgb8888 uses for failure). Returns
+# 0 on success, negative errno on failure.
+fn native_kms_rm_fb(fd, fb_id) {
+    if (fd <= 0)    { return 0; }
+    if (fb_id == 0) { return 0; }
+    var id_buf[4];
+    store32(&id_buf, fb_id);
+    return native_drm_mode_rm_fb(fd, &id_buf);
+}
+
+# ================================================================
+# v3 Step 7.2(b) — SETCRTC primitive
+# ================================================================
+# `DRM_IOCTL_MODE_SETCRTC` is the ioctl that actually flips the
+# display: it binds (CRTC, framebuffer, mode, connector list) all
+# at once. Disabling a CRTC is the same ioctl with fb_id=0 +
+# mode_valid=0 + count_connectors=0 — the kernel interprets that as
+# "stop scanning out from this CRTC" and may power down the
+# associated encoder + connector to save power.
+#
+# Cross-fd note: the kernel verifies that fb_id refers to a
+# framebuffer registered on THIS fd. A framebuffer added on the
+# master fd is only valid for SETCRTC on the same fd. BO + FB +
+# SETCRTC must all be reachable through one master fd — see
+# the PRIME bridge (next step) for how a render-fd BO becomes a
+# master-fd FB.
+#
+# Permission note: SETCRTC requires DRM master. On a running
+# desktop session the compositor (Hyprland / GNOME / KDE) holds
+# master, so this ioctl returns EACCES from a non-master client.
+# To exercise it from a userspace client, vt-switch to a tty
+# (the previous master drops automatically) or use
+# `DRM_IOCTL_SET_MASTER` after the compositor releases.
+
+# DRM_IOCTL_MODE_SETCRTC — nr 0xA2, RW, sizeof(drm_mode_crtc) = 104
+#   0xC0000000 | (104 << 16) | (0x64 << 8) | 0xA2 == 0xC06864A2
+var DRM_IOCTL_MODE_SETCRTC = 0xC06864A2;
+
+# drm_mode_crtc layout (104 bytes, x86_64). The mode field is a
+# drm_mode_modeinfo embedded in-place at +36 — caller can either
+# fill it directly or memcpy from a modes array entry returned by
+# native_kms_get_connector_modes.
+#
+#   +0:  set_connectors_ptr  (u64) — IN: ptr to u32[count_connectors]
+#   +8:  count_connectors    (u32) — IN: number of connectors to bind
+#   +12: crtc_id             (u32) — IN: CRTC to configure
+#   +16: fb_id               (u32) — IN: framebuffer to scan out, 0 = blank
+#   +20: x                   (u32) — IN: x offset within FB
+#   +24: y                   (u32) — IN: y offset within FB
+#   +28: gamma_size          (u32) — OUT (not used in v3 setup path)
+#   +32: mode_valid          (u32) — IN: 1 = use mode, 0 = disable
+#   +36: mode                (drm_mode_modeinfo, 68 B) — IN if mode_valid
+var DRM_MODE_CRTC_SIZE             = 104;
+var DRM_MODE_CRTC_CONN_PTR         = 0;
+var DRM_MODE_CRTC_COUNT_CONN       = 8;
+var DRM_MODE_CRTC_CRTC_ID          = 12;
+var DRM_MODE_CRTC_FB_ID            = 16;
+var DRM_MODE_CRTC_X                = 20;
+var DRM_MODE_CRTC_Y                = 24;
+var DRM_MODE_CRTC_GAMMA_SIZE       = 28;
+var DRM_MODE_CRTC_MODE_VALID       = 32;
+var DRM_MODE_CRTC_MODE             = 36;
+
+# Low-level SETCRTC ioctl. Caller owns `req` (104 bytes), MUST fill
+# crtc_id + fb_id + connector_ptr/count + mode_valid + mode (or
+# zeros for disable). Returns 0 on success, negative errno on
+# failure (typically -EACCES for "not master", -EINVAL for "bad
+# CRTC / FB / mode combination").
+fn native_drm_mode_set_crtc(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_SETCRTC, req);
+}
+
+# High-level SETCRTC. `mode_ptr` points to a 68-byte
+# drm_mode_modeinfo (typically picked from the array returned by
+# native_kms_get_connector_modes via native_kms_pick_preferred_mode).
+# `conn_ids_ptr` is a u32 array of connector IDs to bind to this
+# CRTC; `conn_count` is its length. Scan-out region defaults to
+# (0, 0) — the FB's top-left becomes the screen's top-left.
+#
+# Returns 0 on success, negative errno on failure. Null-safe on
+# every pointer arg.
+fn native_kms_set_crtc(fd, crtc_id, fb_id, conn_ids_ptr, conn_count, mode_ptr) {
+    if (fd <= 0)         { return -1; }
+    if (crtc_id == 0)    { return -1; }
+    if (fb_id == 0)      { return -1; }
+    if (conn_ids_ptr == 0) { return -1; }
+    if (conn_count <= 0) { return -1; }
+    if (mode_ptr == 0)   { return -1; }
+
+    var req[104];
+    memset(&req, 0, DRM_MODE_CRTC_SIZE);
+    store64(&req + DRM_MODE_CRTC_CONN_PTR,    conn_ids_ptr);
+    store32(&req + DRM_MODE_CRTC_COUNT_CONN,  conn_count);
+    store32(&req + DRM_MODE_CRTC_CRTC_ID,     crtc_id);
+    store32(&req + DRM_MODE_CRTC_FB_ID,       fb_id);
+    store32(&req + DRM_MODE_CRTC_MODE_VALID,  1);
+    memcpy(&req + DRM_MODE_CRTC_MODE, mode_ptr, DRM_MODE_MODEINFO_SIZE);
+    return native_drm_mode_set_crtc(fd, &req);
+}
+
+# Convenience: disable a CRTC. Same ioctl as native_kms_set_crtc
+# but with fb_id=0 + mode_valid=0 + connector list empty — the
+# kernel interprets the combination as "stop scanout."
+# Useful for clean teardown after a present session, and for
+# probing CRTC accessibility (a successful disable on an idle
+# CRTC proves master + CRTC ID are valid).
+fn native_kms_disable_crtc(fd, crtc_id) {
+    if (fd <= 0)      { return -1; }
+    if (crtc_id == 0) { return -1; }
+    var req[104];
+    memset(&req, 0, DRM_MODE_CRTC_SIZE);
+    store32(&req + DRM_MODE_CRTC_CRTC_ID, crtc_id);
+    # All other fields (fb_id, mode_valid, conn ptr/count) stay 0.
+    return native_drm_mode_set_crtc(fd, &req);
+}
+
+# ================================================================
+# v3 Step 7.2(c) — PRIME cross-fd BO bridge
+# ================================================================
+# DRM PRIME exports a GEM BO from one fd's handle namespace as a
+# kernel-level dmabuf fd, which can then be re-imported on another
+# fd as a fresh handle. The two ends become independent handles
+# pointing at the same underlying memory; closing one does NOT
+# affect the other.
+#
+# Why we need this: KMS ioctls (AddFB2, SETCRTC) live on the master
+# fd (`/dev/dri/cardN`). The AMDGPU GEM allocator
+# (`native_bo_create_gtt`) typically runs on the render fd
+# (`/dev/dri/renderD128`) — that's the convention Mesa / radv
+# established for unprivileged GEM access. Bridging the two
+# requires PRIME.
+#
+# Direction matters:
+#   render_fd → HANDLE_TO_FD → dmabuf_fd → FD_TO_HANDLE → card_fd
+# The transient dmabuf fd is a regular Linux file descriptor; close
+# it after the second ioctl. Both render_fd's handle and card_fd's
+# handle remain valid independently and need separate GEM_CLOSE
+# calls when the consumer is done.
+#
+# Reference: drivers/gpu/drm/drm_prime.c.
+
+# struct drm_prime_handle (12 bytes, x86_64):
+#   +0: handle  (u32) — IN for HANDLE_TO_FD, OUT for FD_TO_HANDLE
+#   +4: flags   (u32) — IN: DRM_CLOEXEC | DRM_RDWR (HANDLE_TO_FD only)
+#   +8: fd      (s32) — OUT for HANDLE_TO_FD, IN for FD_TO_HANDLE
+var DRM_PRIME_HANDLE_SIZE   = 12;
+var DRM_PRIME_HANDLE_HANDLE = 0;
+var DRM_PRIME_HANDLE_FLAGS  = 4;
+var DRM_PRIME_HANDLE_FD     = 8;
+
+# DRM_IOCTL_PRIME_HANDLE_TO_FD — nr 0x2D, RW, sizeof = 12
+#   0xC0000000 | (12 << 16) | (0x64 << 8) | 0x2D == 0xC00C642D
+var DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D;
+
+# DRM_IOCTL_PRIME_FD_TO_HANDLE — nr 0x2E, RW, sizeof = 12
+#   0xC0000000 | (12 << 16) | (0x64 << 8) | 0x2E == 0xC00C642E
+var DRM_IOCTL_PRIME_FD_TO_HANDLE = 0xC00C642E;
+
+# Flags for HANDLE_TO_FD — these mirror the open(2) flags of the
+# resulting dmabuf fd. CLOEXEC is essentially mandatory (otherwise
+# fork+exec leaks the handle); RDWR is needed if the importer
+# wants write access (always true for KMS scanout BOs).
+var DRM_CLOEXEC = 0x80000;     # O_CLOEXEC
+var DRM_RDWR    = 0x2;         # O_RDWR
+
+# Low-level HANDLE_TO_FD ioctl. Caller fills handle + flags at
+# +0/+4; on success, fd is at +8. Returns 0 on success, negative
+# errno on failure.
+fn native_drm_prime_handle_to_fd(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, req);
+}
+
+# Low-level FD_TO_HANDLE ioctl. Caller fills fd at +8; on success,
+# handle is at +0. Returns 0 on success, negative errno on failure.
+fn native_drm_prime_fd_to_handle(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, req);
+}
+
+# Pick the lowest set bit of a u32 bitmask. Returns 0..31 for the
+# bit index, or -1 if no bit is set. Used to find the first
+# usable CRTC from an encoder's `possible_crtcs` mask.
+fn native_kms_lowest_set_bit(mask) {
+    var i = 0;
+    while (i < 32) {
+        if (((mask / (1 << i)) & 1) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+# High-level: bridge a BO from `render_fd`'s handle namespace into
+# `card_fd`'s. Returns the new card-fd handle on success, or 0 on
+# failure. The transient dmabuf fd is closed before return — the
+# caller only needs to track the two fd handles.
+#
+# Caller is responsible for closing both handles when done:
+#   native_gem_close(render_fd, render_handle);
+#   native_gem_close(card_fd,   card_handle);
+fn native_kms_import_bo(card_fd, render_fd, render_handle) {
+    if (card_fd <= 0)      { return 0; }
+    if (render_fd <= 0)    { return 0; }
+    if (render_handle == 0) { return 0; }
+
+    # ---- Step 1: HANDLE_TO_FD on render_fd ----
+    var exp_req[12];
+    memset(&exp_req, 0, DRM_PRIME_HANDLE_SIZE);
+    store32(&exp_req + DRM_PRIME_HANDLE_HANDLE, render_handle);
+    store32(&exp_req + DRM_PRIME_HANDLE_FLAGS,  DRM_CLOEXEC | DRM_RDWR);
+    var rc = native_drm_prime_handle_to_fd(render_fd, &exp_req);
+    if (rc != 0) { return 0; }
+    var dmabuf_fd = load32(&exp_req + DRM_PRIME_HANDLE_FD);
+    if (dmabuf_fd < 0) { return 0; }
+
+    # ---- Step 2: FD_TO_HANDLE on card_fd ----
+    var imp_req[12];
+    memset(&imp_req, 0, DRM_PRIME_HANDLE_SIZE);
+    store32(&imp_req + DRM_PRIME_HANDLE_FD, dmabuf_fd);
+    rc = native_drm_prime_fd_to_handle(card_fd, &imp_req);
+
+    # Close the transient dmabuf fd in BOTH branches — the kernel
+    # bumped its refcount when FD_TO_HANDLE succeeded (via the
+    # underlying dmabuf object), and on failure we never want to
+    # leak the fd anyway.
+    sys_close(dmabuf_fd);
+
+    if (rc != 0) { return 0; }
+    return load32(&imp_req + DRM_PRIME_HANDLE_HANDLE);
+}
+
+# ================================================================
+# v3 Step 7.2(d) — End-to-end modeset driver
+# ================================================================
+# Composes everything from 7.1 + 7.2(a/b/c) + 7.3 into a single
+# call: walk the discovered topology, find a connected connector,
+# pick its preferred mode, alloc a render-fd BO sized to the mode,
+# bridge it via PRIME, AddFB2 it, SETCRTC. The result is a live
+# scanout — running the smoke program from a tty makes the screen
+# turn red (the FB content) until release.
+#
+# Failure modes worth knowing about:
+#   - SETCRTC returns -EACCES → not master. Run from a tty
+#     (Ctrl-Alt-F2 drops the running compositor's master) and
+#     systemd-logind will hand master to the new process via the
+#     vt-active mechanism.
+#   - SETCRTC returns -EINVAL → mode/CRTC/encoder mismatch. The
+#     algorithm picks "lowest bit of possible_crtcs", which always
+#     yields a valid CRTC for the encoder per kernel guarantees.
+#     If we still see EINVAL, suspect mode struct corruption
+#     (memcpy from the wrong offset, etc.).
+#   - SETCRTC returns -EBUSY → CRTC already in use. Disable the
+#     conflicting CRTC first (native_kms_disable_crtc) or pick
+#     a different bit from possible_crtcs.
+
+# NativeKmsScanout layout (40 bytes) — bag of resources to track
+# for clean teardown after a successful modeset.
+#   +0:  conn_id        (u32) — bound connector
+#   +4:  crtc_id        (u32) — bound CRTC
+#   +8:  fb_id          (u32) — kernel framebuffer ID (master fd)
+#   +12: card_handle    (u32) — BO's master-fd handle (PRIME-imported)
+#   +16: render_handle  (u32) — BO's render-fd handle (allocator-side)
+#   +20: width          (u32) — pixels
+#   +24: mapped_addr    (u64) — CPU-visible mmap of the BO bytes
+#   +32: height         (u32) — pixels
+#   +36: bo_size        (u32) — bytes; for native_bo_release_gtt
+var NATIVE_KMS_SCANOUT_SIZE         = 40;
+var NATIVE_KMS_SCANOUT_CONN_ID      = 0;
+var NATIVE_KMS_SCANOUT_CRTC_ID      = 4;
+var NATIVE_KMS_SCANOUT_FB_ID        = 8;
+var NATIVE_KMS_SCANOUT_CARD_HANDLE  = 12;
+var NATIVE_KMS_SCANOUT_RENDER_HANDLE = 16;
+var NATIVE_KMS_SCANOUT_WIDTH        = 20;
+var NATIVE_KMS_SCANOUT_MAPPED_ADDR  = 24;
+var NATIVE_KMS_SCANOUT_HEIGHT       = 32;
+var NATIVE_KMS_SCANOUT_BO_SIZE      = 36;
+
+# Drive the full modeset on the first connected connector found.
+# Caller provides:
+#   card_fd    — master fd opened on /dev/dri/cardN
+#   render_fd  — opened on /dev/dri/renderD128
+#   state      — populated KmsState from native_kms_init(card_fd)
+#   out        — caller-allocated 40-byte NativeKmsScanout
+# On success returns 0 and `out` is populated; on failure returns
+# negative and `out` is not guaranteed valid (caller should not
+# release).
+fn native_kms_modeset_first_connected(card_fd, render_fd, state, out) {
+    if (card_fd <= 0)   { return -1; }
+    if (render_fd <= 0) { return -1; }
+    if (state == 0)     { return -1; }
+    if (out == 0)       { return -1; }
+    memset(out, 0, NATIVE_KMS_SCANOUT_SIZE);
+
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var crtc_count = kms_state_count_crtcs(state);
+    var crtc_ids   = kms_state_crtc_ids(state);
+
+    # ---- Step A: walk connectors, find first CONNECTED ----
+    var i = 0;
+    var conn_id = 0;
+    var encoder_id = 0;
+    var meta[80];
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(card_fd, &meta) == 0) {
+            var status = load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION);
+            if (status == DRM_MODE_CONNECTED) {
+                conn_id = cid;
+                encoder_id = load32(&meta + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+                i = conn_count;   # break
+            }
+        }
+        i = i + 1;
+    }
+    if (conn_id == 0) { return -2; }   # no connected connector
+
+    # ---- Step B: get encoder, pick CRTC from possible_crtcs ----
+    # If the connector reports encoder_id == 0 (connected but not
+    # currently bound), fall back to the connector's first usable
+    # encoder via the encoders_ptr array — Step 7.1(c) coverage.
+    # For v2-native simplicity, require an existing encoder_id.
+    if (encoder_id == 0) { return -3; }
+    var enc_req[20];
+    memset(&enc_req, 0, DRM_MODE_GET_ENCODER_SIZE);
+    store32(&enc_req + DRM_MODE_GET_ENCODER_ID, encoder_id);
+    if (native_drm_mode_get_encoder(card_fd, &enc_req) != 0) { return -4; }
+    var possible_crtcs = load32(&enc_req + DRM_MODE_GET_ENCODER_POSS_CRTCS);
+    var crtc_idx = native_kms_lowest_set_bit(possible_crtcs);
+    if (crtc_idx < 0)            { return -5; }
+    if (crtc_idx >= crtc_count)  { return -5; }
+    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+
+    # ---- Step C: get connector modes, pick preferred ----
+    var modes_count[4];
+    store32(&modes_count, 0);
+    var modes = native_kms_get_connector_modes(card_fd, conn_id, &modes_count);
+    if (modes == 0) { return -6; }
+    var n_modes = load32(&modes_count);
+    if (n_modes == 0) { return -6; }
+    var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
+    var width  = native_kms_mode_hdisplay(modes, mode_idx);
+    var height = native_kms_mode_vdisplay(modes, mode_idx);
+    if (width <= 0)  { return -7; }
+    if (height <= 0) { return -7; }
+
+    # ---- Step D: allocate render-fd BO sized to mode ----
+    # Pitch rounded up to 256-byte alignment (AMD scanout requires it
+    # on most Vega-era hardware; pre-Vega is more permissive but the
+    # alignment never hurts).
+    var pitch_raw = width * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    var bo_size = pitch * height;
+    var bo_buf[16];
+    var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);
+    if (rc_bo != 0) { return -8; }
+    var render_handle = load64(&bo_buf + 0);
+    var mapped_addr   = load64(&bo_buf + 8);
+
+    # ---- Step E: PRIME-import to card-fd handle namespace ----
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -9;
+    }
+
+    # ---- Step F: AddFB2 ----
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle,
+    width, height, pitch);
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -10;
+    }
+
+    # ---- Step G: SETCRTC ----
+    # Connector list is a single u32 holding `conn_id`. The mode
+    # ptr indexes into the modes array we got in Step C — the
+    # array sticks around until the modes pointer is freed (which
+    # we don't do here; the bump allocator outlives this call).
+    var conn_list[4];
+    store32(&conn_list, conn_id);
+    var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    var rc = native_kms_set_crtc(card_fd, crtc_id, fb_id,
+    &conn_list, 1, mode_ptr);
+    if (rc != 0) {
+        native_kms_rm_fb(card_fd, fb_id);
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -11;
+    }
+
+    # Success — populate the scanout bag.
+    store32(out + NATIVE_KMS_SCANOUT_CONN_ID,       conn_id);
+    store32(out + NATIVE_KMS_SCANOUT_CRTC_ID,       crtc_id);
+    store32(out + NATIVE_KMS_SCANOUT_FB_ID,         fb_id);
+    store32(out + NATIVE_KMS_SCANOUT_CARD_HANDLE,   card_handle);
+    store32(out + NATIVE_KMS_SCANOUT_RENDER_HANDLE, render_handle);
+    store32(out + NATIVE_KMS_SCANOUT_WIDTH,         width);
+    store32(out + NATIVE_KMS_SCANOUT_HEIGHT,        height);
+    store32(out + NATIVE_KMS_SCANOUT_BO_SIZE,       bo_size);
+    store64(out + NATIVE_KMS_SCANOUT_MAPPED_ADDR,   mapped_addr);
+    return 0;
+}
+
+# Tear down a successful scanout. Disables the CRTC, removes the
+# FB, closes both fd handles, unmaps the BO. Idempotent on a
+# zeroed scanout struct (each zero check skips its release).
+# Returns 0.
+fn native_kms_release_scanout(card_fd, render_fd, scanout) {
+    if (scanout == 0) { return 0; }
+    var crtc_id       = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+    var fb_id         = load32(scanout + NATIVE_KMS_SCANOUT_FB_ID);
+    var card_handle   = load32(scanout + NATIVE_KMS_SCANOUT_CARD_HANDLE);
+    var render_handle = load32(scanout + NATIVE_KMS_SCANOUT_RENDER_HANDLE);
+    var mapped_addr   = load64(scanout + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
+    var bo_size       = load32(scanout + NATIVE_KMS_SCANOUT_BO_SIZE);
+
+    if (card_fd > 0) {
+        if (crtc_id != 0)     { native_kms_disable_crtc(card_fd, crtc_id); }
+        if (fb_id != 0)       { native_kms_rm_fb(card_fd, fb_id); }
+        if (card_handle != 0) { native_gem_close(card_fd, card_handle); }
+    }
+    if (render_fd > 0) {
+        if (render_handle != 0) {
+            native_bo_release_gtt(render_fd, render_handle,
+            mapped_addr, bo_size);
+        }
+    }
+    memset(scanout, 0, NATIVE_KMS_SCANOUT_SIZE);
+    return 0;
+}
+
+# ================================================================
+# v3 Step 7.4 — Page-flip + event read
+# ================================================================
+# Page-flip swaps which framebuffer a CRTC scans out from, without
+# re-doing the full modeset (which would blank the screen briefly).
+# It's the load-bearing primitive for double-buffered present:
+# render to FB B while FB A is on screen, then page-flip A→B at
+# vblank, then render to A while B scans out, repeat.
+#
+# Two variants of the flip behavior, controlled by `flags`:
+#   DRM_MODE_PAGE_FLIP_EVENT — kernel queues a vblank event; the
+#     fd becomes readable, and a 32-byte drm_event_vblank lands in
+#     the read queue when the flip actually happens. Used for
+#     present-time reporting and for stuttering-detection.
+#   DRM_MODE_PAGE_FLIP_ASYNC — flip immediately, don't wait for
+#     vblank. Causes tearing; not what consumers want for v3.0
+#     present, but useful for testing.
+# Default (flags=0) = "synchronous, no event" — kernel still waits
+# for vblank but caller doesn't get notified.
+#
+# Event-read path: after a flip with EVENT flag set, read(2) on
+# the drm fd yields a drm_event header (8 B) followed by the
+# specific event payload. For vblank events the payload is
+# drm_event_vblank (32 B total including the header).
+
+# DRM_IOCTL_MODE_PAGE_FLIP — nr 0xB0, RW, sizeof = 24
+#   0xC0000000 | (24 << 16) | (0x64 << 8) | 0xB0 == 0xC01864B0
+var DRM_IOCTL_MODE_PAGE_FLIP = 0xC01864B0;
+
+# Page-flip flag constants (uapi/drm/drm_mode.h):
+var DRM_MODE_PAGE_FLIP_EVENT = 0x01;
+var DRM_MODE_PAGE_FLIP_ASYNC = 0x02;
+
+# drm_mode_crtc_page_flip layout (24 bytes, x86_64):
+#   +0:  crtc_id    (u32) — IN
+#   +4:  fb_id      (u32) — IN: framebuffer to swap to
+#   +8:  flags      (u32) — IN
+#   +12: reserved   (u32) — must be 0
+#   +16: user_data  (u64) — IN: opaque value returned in the event
+var DRM_MODE_PAGE_FLIP_SIZE      = 24;
+var DRM_MODE_PAGE_FLIP_CRTC_ID   = 0;
+var DRM_MODE_PAGE_FLIP_FB_ID     = 4;
+var DRM_MODE_PAGE_FLIP_FLAGS     = 8;
+var DRM_MODE_PAGE_FLIP_RESERVED  = 12;
+var DRM_MODE_PAGE_FLIP_USER_DATA = 16;
+
+# Low-level page-flip ioctl. Caller fills crtc_id + fb_id + flags
+# (+ user_data if EVENT flag set). Returns 0 on success, negative
+# errno on failure. Common errors:
+#   -EBUSY    — a previous flip is still pending on this CRTC
+#               (haven't received the vblank event yet)
+#   -EINVAL   — fb dimensions don't match CRTC's current mode
+#   -EACCES   — not master (Phase D pre-requisite — see logind
+#               note in memory)
+fn native_drm_mode_page_flip(fd, req) {
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_MODE_PAGE_FLIP, req);
+}
+
+# High-level page-flip. user_data is opaque — the kernel echoes it
+# back in the event payload, so callers use it to identify which
+# flip the event corresponds to (typically a sequence number).
+# Returns 0 on success, negative errno on failure.
+fn native_kms_page_flip(fd, crtc_id, fb_id, flags, user_data) {
+    if (fd <= 0)      { return -1; }
+    if (crtc_id == 0) { return -1; }
+    if (fb_id == 0)   { return -1; }
+    var req[24];
+    memset(&req, 0, DRM_MODE_PAGE_FLIP_SIZE);
+    store32(&req + DRM_MODE_PAGE_FLIP_CRTC_ID,   crtc_id);
+    store32(&req + DRM_MODE_PAGE_FLIP_FB_ID,     fb_id);
+    store32(&req + DRM_MODE_PAGE_FLIP_FLAGS,     flags);
+    store64(&req + DRM_MODE_PAGE_FLIP_USER_DATA, user_data);
+    return native_drm_mode_page_flip(fd, &req);
+}
+
+# ================================================================
+# DRM event-read path
+# ================================================================
+# The kernel queues events on the drm fd; userspace drains them
+# via read(2). Each event starts with a drm_event header (8 B)
+# describing the event type + total length, followed by event-
+# type-specific payload. For page-flip events:
+#
+#   drm_event (8 B):
+#     +0: type    (u32) — DRM_EVENT_VBLANK or DRM_EVENT_FLIP_COMPLETE
+#     +4: length  (u32) — total bytes including this header
+#
+#   drm_event_vblank payload (24 B following the header → 32 B total):
+#     +8:  user_data  (u64) — the value passed in PAGE_FLIP_USER_DATA
+#     +16: tv_sec     (u32) — flip timestamp seconds
+#     +20: tv_usec    (u32) — flip timestamp microseconds
+#     +24: sequence   (u32) — vblank sequence number
+#     +28: crtc_id    (u32) — which CRTC fired (kernel >= 4.x)
+
+var DRM_EVENT_VBLANK         = 0x01;
+var DRM_EVENT_FLIP_COMPLETE  = 0x02;
+
+var DRM_EVENT_HEADER_SIZE    = 8;
+var DRM_EVENT_HEADER_TYPE    = 0;
+var DRM_EVENT_HEADER_LENGTH  = 4;
+
+var DRM_EVENT_VBLANK_SIZE      = 32;
+var DRM_EVENT_VBLANK_USER_DATA = 8;
+var DRM_EVENT_VBLANK_TV_SEC    = 16;
+var DRM_EVENT_VBLANK_TV_USEC   = 20;
+var DRM_EVENT_VBLANK_SEQUENCE  = 24;
+var DRM_EVENT_VBLANK_CRTC_ID   = 28;
+
+# Read DRM events from the fd. `buf` should be at least 32 bytes
+# for a single drm_event_vblank; a larger buffer can hold multiple
+# queued events. Returns the number of bytes read (positive),
+# 0 if no events available (only with O_NONBLOCK), or negative
+# errno on failure. SYS_READ = 0 on x86_64.
+fn native_drm_read_event(fd, buf, n) {
+    if (fd <= 0)  { return -1; }
+    if (buf == 0) { return -1; }
+    if (n <= 0)   { return -1; }
+    return syscall(0, fd, buf, n);
+}
+
+# Convenience accessors for a freshly-read drm_event_vblank.
+fn drm_event_type(buf)        { return load32(buf + DRM_EVENT_HEADER_TYPE); }
+fn drm_event_length(buf)      { return load32(buf + DRM_EVENT_HEADER_LENGTH); }
+fn drm_event_vblank_user_data(buf) { return load64(buf + DRM_EVENT_VBLANK_USER_DATA); }
+fn drm_event_vblank_sequence(buf)  { return load32(buf + DRM_EVENT_VBLANK_SEQUENCE); }
+fn drm_event_vblank_crtc_id(buf)   { return load32(buf + DRM_EVENT_VBLANK_CRTC_ID); }
+
+# ================================================================
+# v3 Step 7.5 — Reusable FB alloc + present primitive
+# ================================================================
+# Step 7.2(d) bundled BO + PRIME + AddFB2 inside the modeset
+# driver. For double-buffered present, callers need the SAME
+# sequence repeatable for a second (or third) FB without
+# re-doing the modeset. native_kms_alloc_fb extracts it.
+#
+# native_kms_present is the load-bearing primitive: page-flip
+# the bound CRTC to a new FB ID, wait for the flip-complete
+# vblank event, return the kernel's vblank sequence number.
+# Repeating with two FBs (rendering to whichever isn't currently
+# scanning out) is the v3.0 vsync-paced present loop.
+#
+# Caveat (same as 7.2(d)): page-flip returns -EACCES if the fd
+# isn't master. See `project_phase_d_master_logind_blocker`
+# memory for workaround paths.
+
+# NativeKmsFb layout (32 bytes) — a self-contained "framebuffer +
+# its backing BO" bundle. Returned by native_kms_alloc_fb;
+# released by native_kms_release_fb.
+#
+#   +0:  fb_id          (u32) — kernel framebuffer ID (master fd)
+#   +4:  card_handle    (u32) — BO's master-fd handle (PRIME-imported)
+#   +8:  render_handle  (u32) — BO's render-fd handle (allocator-side)
+#   +12: pitch          (u32) — bytes per row (256-byte aligned)
+#   +16: mapped_addr    (u64) — CPU-visible mmap of the BO
+#   +24: bo_size        (u32) — total BO bytes (= pitch × height)
+#   +28: width          (u32) — mode-bound width (height derived from bo_size/pitch)
+var NATIVE_KMS_FB_SIZE         = 32;
+var NATIVE_KMS_FB_FB_ID        = 0;
+var NATIVE_KMS_FB_CARD_HANDLE  = 4;
+var NATIVE_KMS_FB_RENDER_HANDLE = 8;
+var NATIVE_KMS_FB_PITCH        = 12;
+var NATIVE_KMS_FB_MAPPED_ADDR  = 16;
+var NATIVE_KMS_FB_BO_SIZE      = 24;
+var NATIVE_KMS_FB_WIDTH        = 28;
+
+# Allocate a render-fd BO sized for `(width × height)` XRGB8888,
+# PRIME-import to the master fd, AddFB2 it, and populate `out`.
+# Pitch is rounded up to 256-byte alignment (AMD scanout requires;
+# matches native_kms_modeset_first_connected). Returns 0 on success
+# or a negative step code on failure (matches the modeset driver's
+# step-code convention so consumers can map errors uniformly).
+fn native_kms_alloc_fb(card_fd, render_fd, width, height, out) {
+    if (card_fd <= 0)   { return -1; }
+    if (render_fd <= 0) { return -1; }
+    if (width <= 0)     { return -1; }
+    if (height <= 0)    { return -1; }
+    if (out == 0)       { return -1; }
+    memset(out, 0, NATIVE_KMS_FB_SIZE);
+
+    var pitch_raw = width * 4;
+    var pitch = ((pitch_raw + 255) / 256) * 256;
+    var bo_size = pitch * height;
+
+    var bo_buf[16];
+    var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);
+    if (rc_bo != 0) { return -8; }
+    var render_handle = load64(&bo_buf + 0);
+    var mapped_addr   = load64(&bo_buf + 8);
+
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -9;
+    }
+
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle,
+    width, height, pitch);
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
+        return -10;
+    }
+
+    store32(out + NATIVE_KMS_FB_FB_ID,         fb_id);
+    store32(out + NATIVE_KMS_FB_CARD_HANDLE,   card_handle);
+    store32(out + NATIVE_KMS_FB_RENDER_HANDLE, render_handle);
+    store32(out + NATIVE_KMS_FB_PITCH,         pitch);
+    store64(out + NATIVE_KMS_FB_MAPPED_ADDR,   mapped_addr);
+    store32(out + NATIVE_KMS_FB_BO_SIZE,       bo_size);
+    store32(out + NATIVE_KMS_FB_WIDTH,         width);
+    return 0;
+}
+
+# Release a NativeKmsFb. Idempotent on a zeroed fb (every release
+# call short-circuits on its zero check). Returns 0.
+fn native_kms_release_fb(card_fd, render_fd, fb) {
+    if (fb == 0) { return 0; }
+    var fb_id         = load32(fb + NATIVE_KMS_FB_FB_ID);
+    var card_handle   = load32(fb + NATIVE_KMS_FB_CARD_HANDLE);
+    var render_handle = load32(fb + NATIVE_KMS_FB_RENDER_HANDLE);
+    var mapped_addr   = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR);
+    var bo_size       = load32(fb + NATIVE_KMS_FB_BO_SIZE);
+    if (card_fd > 0) {
+        if (fb_id != 0)       { native_kms_rm_fb(card_fd, fb_id); }
+        if (card_handle != 0) { native_gem_close(card_fd, card_handle); }
+    }
+    if (render_fd > 0) {
+        if (render_handle != 0) {
+            native_bo_release_gtt(render_fd, render_handle,
+            mapped_addr, bo_size);
+        }
+    }
+    memset(fb, 0, NATIVE_KMS_FB_SIZE);
+    return 0;
+}
+
+# Page-flip a scanout's CRTC to a new FB and block until the
+# kernel reports flip-complete. Updates scanout.fb_id to the new
+# value on success so subsequent presents target the right CRTC
+# state. If `sequence_out` is non-null, writes the kernel's
+# vblank sequence number there — useful for present-time
+# tracking and stutter detection.
+#
+# Return codes:
+#    0  — flip completed, scanout updated
+#   -1  — invalid args
+#   <0 — propagated kernel errno from page-flip ioctl OR from
+#        the read(2) on the event fd OR `-2` if read returned
+#        fewer bytes than a drm_event_vblank OR `-3` if the
+#        event we drained wasn't FLIP_COMPLETE (could happen
+#        if some other queued event lives in the read queue;
+#        v3.0 single-flip path doesn't expect that, but the
+#        diagnostic value is worth the rc).
+#
+# Caveat: this is the simplest possible single-flip + blocking-
+# read shape. A real present loop would either (a) use a
+# non-blocking read with poll/epoll on the fd, or (b) batch
+# multiple events. v3.0 keeps this simple; consumers needing
+# more sophisticated event handling can call native_kms_page_flip
+# + native_drm_read_event directly.
+fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out) {
+    if (card_fd <= 0)   { return -1; }
+    if (scanout == 0)   { return -1; }
+    if (new_fb_id == 0) { return -1; }
+
+    var crtc_id = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+    if (crtc_id == 0) { return -1; }
+
+    # User_data carries the new FB ID — convenient echo for any
+    # caller that wants to verify the event matches the flip.
+    var rc = native_kms_page_flip(card_fd, crtc_id, new_fb_id,
+    DRM_MODE_PAGE_FLIP_EVENT,
+    new_fb_id);
+    if (rc != 0) { return rc; }
+
+    # Audit MED-6 (2026-04-30): drain events until FLIP_COMPLETE
+    # found. The kernel may queue multiple events per flip
+    # (DRM_EVENT_VBLANK + DRM_EVENT_FLIP_COMPLETE on most kernels);
+    # the prior single-event read returned -3 on the second present
+    # because the stale VBLANK landed at offset 0. Walk every event
+    # in each buffer using the header `length` field, then re-read
+    # if FLIP_COMPLETE wasn't in this batch. 256-byte read buffer
+    # easily holds 8+ events. Cap the outer reads at 16 to prevent
+    # any pathological event-spew from spinning the present loop
+    # forever (16 * 8 events = 128 events drained before bail-out).
+    var buf[256];
+    var found = 0;
+    var seq = 0;
+    var attempts = 0;
+    while (found == 0) {
+        if (attempts >= 16) { return 0 - 2; }   # too many events drained, bail
+        attempts = attempts + 1;
+        memset(&buf, 0, 256);
+        var n = native_drm_read_event(card_fd, &buf, 256);
+        if (n < 0) { return n; }
+        if (n < DRM_EVENT_VBLANK_SIZE) { return 0 - 2; }
+        # walk events in this read
+        var off = 0;
+        while (off < n) {
+            var ev_len = drm_event_length(&buf + off);
+            if (ev_len <= 0) { return 0 - 3; }   # malformed header, can't advance
+            if (off + ev_len > n) { return 0 - 3; }   # length past read end
+            var ev_type = drm_event_type(&buf + off);
+            if (ev_type == DRM_EVENT_FLIP_COMPLETE) {
+                seq = drm_event_vblank_sequence(&buf + off);
+                found = 1;
+                off = n;   # exit inner loop
+            }
+            if (found == 0) { off = off + ev_len; }
+        }
+    }
+
+    # Update scanout's bound FB so subsequent operations have the
+    # right state.
+    store32(scanout + NATIVE_KMS_SCANOUT_FB_ID, new_fb_id);
+
+    if (sequence_out != 0) {
+        store32(sequence_out, seq);
+    }
+    return 0;
+}

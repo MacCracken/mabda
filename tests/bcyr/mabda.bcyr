@@ -241,6 +241,97 @@ fn bench_capabilities_report() {
     return 0;
 }
 
+# ================================================================
+# Benchmark 8/9: rg_plan_aliasing_stats — v3 Phase A baselines
+#
+# Two baselines at different graph sizes. Real consumer workloads
+# (soorat, rasa, aethersafta) will land in Phase D; until then these
+# are synthetic placeholders that establish the scaling curve, not
+# compete with any published GPU-library number.
+#
+# Planner complexity is O(n²) in transient count (selection sort +
+# interval-coloring inner loop). Fine at tens of transients; if Phase D
+# consumer workloads exceed ~100, revisit — interval-tree drops it to
+# O(n log n).
+#
+# Allocator churn per call: 4 vec_new() calls. On the small bench that's
+# a large fraction of the measured time. Scaled bench amortizes it.
+# ================================================================
+var PLAN_BATCH = 100;
+var PLAN_ROUNDS = 100;
+
+# Build an N-node linear chain with N-1 transients in staggered pattern.
+# Each node i writes transient i and node i+1 reads it.
+fn _build_plan_bench_chain(n_nodes) {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var n_trans = n_nodes - 1;
+    var bufs = alloc(n_trans * 8);
+    var i = 0;
+    while (i < n_trans) {
+        store64(bufs + i * 8, rg_add_transient_buffer(g, 256, 0, "b"));
+        i = i + 1;
+    }
+    var nodes = alloc(n_nodes * 8);
+    i = 0;
+    while (i < n_nodes) {
+        store64(nodes + i * 8, rg_add_compute(g, 0, 0, &dims, "n"));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n_trans) {
+        rg_node_writes(g, load64(nodes + i * 8), load64(bufs + i * 8));
+        rg_node_reads(g, load64(nodes + (i + 1) * 8), load64(bufs + i * 8));
+        i = i + 1;
+    }
+    rg_build(g, 0);
+    return g;
+}
+
+# Small chain: 6 nodes, 5 transients. Mostly allocator overhead; useful
+# as a floor number only.
+fn bench_rg_plan_small() {
+    var b = bench_new("rg_plan_aliasing_stats_5");
+    var g = _build_plan_bench_chain(6);
+    var stats[24];
+    var ri = 0;
+    while (ri < PLAN_ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < PLAN_BATCH) {
+            rg_plan_aliasing_stats(g, &stats);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, PLAN_BATCH);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
+# Scaled synthetic: 31 nodes, 30 transients — intended as a placeholder
+# for realistic per-frame graph complexity until Phase D consumers land.
+# Not claiming parity with any shipped engine; just gives a scaling
+# signal vs the 5-transient floor.
+fn bench_rg_plan_scaled() {
+    var b = bench_new("rg_plan_aliasing_stats_30");
+    var g = _build_plan_bench_chain(31);
+    var stats[24];
+    var ri = 0;
+    while (ri < PLAN_ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < PLAN_BATCH) {
+            rg_plan_aliasing_stats(g, &stats);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, PLAN_BATCH);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -252,6 +343,8 @@ fn main() {
     bench_workgroups_2d();
     bench_profiler_frame_cycle();
     bench_capabilities_report();
+    bench_rg_plan_small();
+    bench_rg_plan_scaled();
     return 0;
 }
 var exit_code = main();

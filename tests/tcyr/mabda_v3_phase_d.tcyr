@@ -1,0 +1,923 @@
+# tests/tcyr/mabda_v3_phase_d.tcyr — v3 Phase D (DRM/KMS surface) tests
+#
+# Split from mabda_v3.tcyr 2026-04-30 to keep that file under
+# cyrius lint's 128 KiB read-buffer cap (see
+# `feedback_cyrlint_128k_buffer_cap` memory + the CHANGELOG entry
+# under "Step 7.1(a) Fixed"). The boundary is clean: every test
+# here exercises `src/backend_native_kms.cyr` exclusively, which
+# is the home for all DRM/KMS modesetting state. As 7.x grows
+# (per-connector + per-encoder enumeration in 7.1(b/c), modeset
+# in 7.2, framebuffer in 7.3, page-flip in 7.4, present in 7.5,
+# release in 7.6, public API in 7.7) the new tests land here.
+
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ================================================================
+# v3 Step 7.1(a) — DRM/KMS GetResources foundation
+# ================================================================
+
+fn test_drm_mode_ioctl_numbers() {
+    # Re-derive each ioctl from first principles to catch transcription drift.
+    assert_eq(DRM_IOCTL_MODE_GETRESOURCES,
+              (3 << 30) | (64 << 16) | (0x64 << 8) | 0xA0, "GETRES derived");
+    assert_eq(DRM_IOCTL_MODE_GETRESOURCES, 0xC04064A0, "GETRES literal");
+    assert_eq(DRM_IOCTL_MODE_GETCONNECTOR,
+              (3 << 30) | (80 << 16) | (0x64 << 8) | 0xA7, "GETCONN derived");
+    assert_eq(DRM_IOCTL_MODE_GETCONNECTOR, 0xC05064A7, "GETCONN literal");
+    assert_eq(DRM_IOCTL_MODE_GETENCODER,
+              (3 << 30) | (20 << 16) | (0x64 << 8) | 0xA6, "GETENC derived");
+    assert_eq(DRM_IOCTL_MODE_GETENCODER, 0xC01464A6, "GETENC literal");
+    return 0;
+}
+
+fn test_drm_mode_card_res_field_offsets() {
+    assert_eq(DRM_MODE_CARD_RES_FB_PTR,      0,  "+0");
+    assert_eq(DRM_MODE_CARD_RES_CRTC_PTR,    8,  "+8");
+    assert_eq(DRM_MODE_CARD_RES_CONN_PTR,    16, "+16");
+    assert_eq(DRM_MODE_CARD_RES_ENC_PTR,     24, "+24");
+    assert_eq(DRM_MODE_CARD_RES_COUNT_FBS,   32, "+32");
+    assert_eq(DRM_MODE_CARD_RES_COUNT_CRTCS, 36, "+36");
+    assert_eq(DRM_MODE_CARD_RES_COUNT_CONN,  40, "+40");
+    assert_eq(DRM_MODE_CARD_RES_COUNT_ENC,   44, "+44");
+    assert_eq(DRM_MODE_CARD_RES_MIN_WIDTH,   48, "+48");
+    assert_eq(DRM_MODE_CARD_RES_MAX_WIDTH,   52, "+52");
+    assert_eq(DRM_MODE_CARD_RES_MIN_HEIGHT,  56, "+56");
+    assert_eq(DRM_MODE_CARD_RES_MAX_HEIGHT,  60, "+60");
+    assert_eq(DRM_MODE_CARD_RES_SIZE,        64, "size");
+    return 0;
+}
+
+fn test_kms_state_field_offsets() {
+    assert_eq(KMS_STATE_FIELD_FD,             0,  "fd");
+    assert_eq(KMS_STATE_FIELD_COUNT_FBS,      8,  "fbs");
+    assert_eq(KMS_STATE_FIELD_COUNT_CRTCS,    12, "crtcs");
+    assert_eq(KMS_STATE_FIELD_COUNT_CONN,     16, "conn");
+    assert_eq(KMS_STATE_FIELD_COUNT_ENCODERS, 20, "enc");
+    assert_eq(KMS_STATE_FIELD_FB_IDS,         24, "fb_ids");
+    assert_eq(KMS_STATE_FIELD_CRTC_IDS,       32, "crtc_ids");
+    assert_eq(KMS_STATE_FIELD_CONN_IDS,       40, "conn_ids");
+    assert_eq(KMS_STATE_FIELD_ENC_IDS,        48, "enc_ids");
+    assert_eq(KMS_STATE_FIELD_MIN_WIDTH,      56, "min_w");
+    assert_eq(KMS_STATE_FIELD_MAX_WIDTH,      60, "max_w");
+    assert_eq(KMS_STATE_FIELD_MIN_HEIGHT,     64, "min_h");
+    assert_eq(KMS_STATE_FIELD_MAX_HEIGHT,     68, "max_h");
+    assert_eq(KMS_STATE_STRUCT_SIZE,          96, "size");
+    return 0;
+}
+
+fn test_kms_state_accessors_round_trip() {
+    var s[96];
+    memset(&s, 0, 96);
+    store64(&s + KMS_STATE_FIELD_FD,             42);
+    store32(&s + KMS_STATE_FIELD_COUNT_FBS,      3);
+    store32(&s + KMS_STATE_FIELD_COUNT_CRTCS,    4);
+    store32(&s + KMS_STATE_FIELD_COUNT_CONN,     5);
+    store32(&s + KMS_STATE_FIELD_COUNT_ENCODERS, 6);
+    store64(&s + KMS_STATE_FIELD_FB_IDS,         0xFB);
+    store64(&s + KMS_STATE_FIELD_CRTC_IDS,       0xC1);
+    store64(&s + KMS_STATE_FIELD_CONN_IDS,       0xC2);
+    store64(&s + KMS_STATE_FIELD_ENC_IDS,        0xE1);
+    store32(&s + KMS_STATE_FIELD_MIN_WIDTH,      320);
+    store32(&s + KMS_STATE_FIELD_MAX_WIDTH,      7680);
+    store32(&s + KMS_STATE_FIELD_MIN_HEIGHT,     200);
+    store32(&s + KMS_STATE_FIELD_MAX_HEIGHT,     4320);
+    assert_eq(kms_state_fd(&s),          42,   "fd");
+    assert_eq(kms_state_count_fbs(&s),   3,    "fbs");
+    assert_eq(kms_state_count_crtcs(&s), 4,    "crtcs");
+    assert_eq(kms_state_count_conn(&s),  5,    "conn");
+    assert_eq(kms_state_count_enc(&s),   6,    "enc");
+    assert_eq(kms_state_fb_ids(&s),      0xFB, "fb_ids");
+    assert_eq(kms_state_crtc_ids(&s),    0xC1, "crtc_ids");
+    assert_eq(kms_state_conn_ids(&s),    0xC2, "conn_ids");
+    assert_eq(kms_state_enc_ids(&s),     0xE1, "enc_ids");
+    assert_eq(kms_state_min_width(&s),   320,  "min_w");
+    assert_eq(kms_state_max_width(&s),   7680, "max_w");
+    assert_eq(kms_state_min_height(&s),  200,  "min_h");
+    assert_eq(kms_state_max_height(&s),  4320, "max_h");
+    return 0;
+}
+
+fn test_native_kms_release_safe() {
+    assert_eq(native_kms_release(0), 0, "null safe");
+    var s[96];
+    memset(&s, 0xFF, 96);
+    native_kms_release(&s);
+    assert_eq(load64(&s + KMS_STATE_FIELD_FD),         0, "fd 0");
+    assert_eq(load32(&s + KMS_STATE_FIELD_COUNT_CONN), 0, "conn 0");
+    assert_eq(load64(&s + KMS_STATE_FIELD_CONN_IDS),   0, "conn_ids 0");
+    assert_eq(load32(&s + KMS_STATE_FIELD_MAX_WIDTH),  0, "max_w 0");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 7.1(b) — DRM connector ioctl + struct shapes
+# ================================================================
+
+fn test_drm_mode_get_connector_field_offsets() {
+    assert_eq(DRM_MODE_GET_CONNECTOR_ENCODERS_PTR,  0,  "+0");
+    assert_eq(DRM_MODE_GET_CONNECTOR_MODES_PTR,     8,  "+8");
+    assert_eq(DRM_MODE_GET_CONNECTOR_PROPS_PTR,     16, "+16");
+    assert_eq(DRM_MODE_GET_CONNECTOR_PROP_VALS_PTR, 24, "+24");
+    assert_eq(DRM_MODE_GET_CONNECTOR_COUNT_MODES,   32, "+32");
+    assert_eq(DRM_MODE_GET_CONNECTOR_COUNT_PROPS,   36, "+36");
+    assert_eq(DRM_MODE_GET_CONNECTOR_COUNT_ENC,     40, "+40");
+    assert_eq(DRM_MODE_GET_CONNECTOR_ENCODER_ID,    44, "+44");
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONN_ID,       48, "+48");
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONN_TYPE,     52, "+52");
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONN_TYPE_ID,  56, "+56");
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONNECTION,    60, "+60");
+    assert_eq(DRM_MODE_GET_CONNECTOR_MM_WIDTH,      64, "+64");
+    assert_eq(DRM_MODE_GET_CONNECTOR_MM_HEIGHT,     68, "+68");
+    assert_eq(DRM_MODE_GET_CONNECTOR_SUBPIXEL,      72, "+72");
+    assert_eq(DRM_MODE_GET_CONNECTOR_SIZE,          80, "size");
+    return 0;
+}
+
+fn test_drm_mode_modeinfo_field_offsets() {
+    # Full per-field pin: 13 numeric fields + name field at +36..+68.
+    assert_eq(DRM_MODE_MODEINFO_CLOCK,       0,  "+0");
+    assert_eq(DRM_MODE_MODEINFO_HDISPLAY,    4,  "+4");
+    assert_eq(DRM_MODE_MODEINFO_HSYNC_START, 6,  "+6");
+    assert_eq(DRM_MODE_MODEINFO_HSYNC_END,   8,  "+8");
+    assert_eq(DRM_MODE_MODEINFO_HTOTAL,      10, "+10");
+    assert_eq(DRM_MODE_MODEINFO_HSKEW,       12, "+12");
+    assert_eq(DRM_MODE_MODEINFO_VDISPLAY,    14, "+14");
+    assert_eq(DRM_MODE_MODEINFO_VSYNC_START, 16, "+16");
+    assert_eq(DRM_MODE_MODEINFO_VSYNC_END,   18, "+18");
+    assert_eq(DRM_MODE_MODEINFO_VTOTAL,      20, "+20");
+    assert_eq(DRM_MODE_MODEINFO_VSCAN,       22, "+22");
+    assert_eq(DRM_MODE_MODEINFO_VREFRESH,    24, "+24");
+    assert_eq(DRM_MODE_MODEINFO_FLAGS,       28, "+28");
+    assert_eq(DRM_MODE_MODEINFO_TYPE,        32, "+32");
+    assert_eq(DRM_MODE_MODEINFO_NAME,        36, "+36");
+    assert_eq(DRM_MODE_MODEINFO_NAME_LEN,    32, "name len");
+    assert_eq(DRM_MODE_MODEINFO_SIZE,        68, "size");
+    assert_eq(DRM_MODE_MODEINFO_NAME + DRM_MODE_MODEINFO_NAME_LEN,
+              DRM_MODE_MODEINFO_SIZE, "name fills to size");
+    return 0;
+}
+
+fn test_drm_mode_connection_status_constants() {
+    assert_eq(DRM_MODE_CONNECTED,         1, "connected = 1");
+    assert_eq(DRM_MODE_DISCONNECTED,      2, "disconnected = 2");
+    assert_eq(DRM_MODE_UNKNOWNCONNECTION, 3, "unknown = 3");
+    return 0;
+}
+
+fn test_drm_mode_connector_type_constants() {
+    # Pin the kernel's connector-type enum. Drift would silently
+    # misclassify connectors at runtime.
+    assert_eq(DRM_MODE_CONNECTOR_Unknown,     0,  "Unknown");
+    assert_eq(DRM_MODE_CONNECTOR_VGA,         1,  "VGA");
+    assert_eq(DRM_MODE_CONNECTOR_DVII,        2,  "DVI-I");
+    assert_eq(DRM_MODE_CONNECTOR_DVID,        3,  "DVI-D");
+    assert_eq(DRM_MODE_CONNECTOR_DVIA,        4,  "DVI-A");
+    assert_eq(DRM_MODE_CONNECTOR_DisplayPort, 10, "DP");
+    assert_eq(DRM_MODE_CONNECTOR_HDMIA,       11, "HDMI-A");
+    assert_eq(DRM_MODE_CONNECTOR_HDMIB,       12, "HDMI-B");
+    assert_eq(DRM_MODE_CONNECTOR_eDP,         14, "eDP");
+    assert_eq(DRM_MODE_CONNECTOR_VIRTUAL,     15, "Virtual");
+    assert_eq(DRM_MODE_CONNECTOR_DSI,         16, "DSI");
+    assert_eq(DRM_MODE_CONNECTOR_USB,         20, "USB-C");
+    return 0;
+}
+
+# ================================================================
+# v3 Step 7.1(c) — Encoder ioctl + topology summary
+# ================================================================
+
+fn test_drm_mode_get_encoder_field_offsets() {
+    assert_eq(DRM_MODE_GET_ENCODER_ID,         0,  "+0");
+    assert_eq(DRM_MODE_GET_ENCODER_TYPE,       4,  "+4");
+    assert_eq(DRM_MODE_GET_ENCODER_CRTC_ID,    8,  "+8");
+    assert_eq(DRM_MODE_GET_ENCODER_POSS_CRTCS, 12, "+12");
+    assert_eq(DRM_MODE_GET_ENCODER_POSS_CLONES, 16, "+16");
+    assert_eq(DRM_MODE_GET_ENCODER_SIZE,       20, "size");
+    return 0;
+}
+
+fn test_drm_mode_encoder_type_constants() {
+    assert_eq(DRM_MODE_ENCODER_NONE,    0, "None");
+    assert_eq(DRM_MODE_ENCODER_DAC,     1, "DAC");
+    assert_eq(DRM_MODE_ENCODER_TMDS,    2, "TMDS");
+    assert_eq(DRM_MODE_ENCODER_LVDS,    3, "LVDS");
+    assert_eq(DRM_MODE_ENCODER_TVDAC,   4, "TVDAC");
+    assert_eq(DRM_MODE_ENCODER_VIRTUAL, 5, "Virtual");
+    assert_eq(DRM_MODE_ENCODER_DSI,     6, "DSI");
+    assert_eq(DRM_MODE_ENCODER_DPMST,   7, "DP-MST");
+    assert_eq(DRM_MODE_ENCODER_DPI,     8, "DPI");
+    return 0;
+}
+
+fn test_native_drm_connector_type_name_lookup() {
+    # streq isn't in scope — compare by first byte (cheap proxy
+    # that catches a "wrong table entry" regression without pulling
+    # the full string compare in).
+    assert_eq(load8(native_drm_connector_type_name(DRM_MODE_CONNECTOR_VGA)),         86, "VGA -> V");
+    assert_eq(load8(native_drm_connector_type_name(DRM_MODE_CONNECTOR_DisplayPort)), 68, "DP -> D");
+    assert_eq(load8(native_drm_connector_type_name(DRM_MODE_CONNECTOR_HDMIA)),       72, "HDMI-A -> H");
+    assert_eq(load8(native_drm_connector_type_name(DRM_MODE_CONNECTOR_eDP)),         101, "eDP -> e");
+    assert_eq(load8(native_drm_connector_type_name(99)),                              63, "unknown -> ?");
+    return 0;
+}
+
+fn test_native_drm_encoder_type_name_lookup() {
+    assert_eq(load8(native_drm_encoder_type_name(DRM_MODE_ENCODER_TMDS)),    84,  "TMDS -> T");
+    assert_eq(load8(native_drm_encoder_type_name(DRM_MODE_ENCODER_DAC)),     68,  "DAC -> D");
+    assert_eq(load8(native_drm_encoder_type_name(DRM_MODE_ENCODER_LVDS)),    76,  "LVDS -> L");
+    assert_eq(load8(native_drm_encoder_type_name(DRM_MODE_ENCODER_VIRTUAL)), 86,  "Virtual -> V");
+    assert_eq(load8(native_drm_encoder_type_name(99)),                       63,  "unknown -> ?");
+    return 0;
+}
+
+fn test_native_drm_connection_status_name_lookup() {
+    assert_eq(load8(native_drm_connection_status_name(DRM_MODE_CONNECTED)),         99,  "connected -> c");
+    assert_eq(load8(native_drm_connection_status_name(DRM_MODE_DISCONNECTED)),      100, "disconnected -> d");
+    assert_eq(load8(native_drm_connection_status_name(DRM_MODE_UNKNOWNCONNECTION)), 117, "unknown -> u");
+    assert_eq(load8(native_drm_connection_status_name(99)),                         63,  "fallback -> ?");
+    return 0;
+}
+
+fn test_native_kms_summary_null_safe() {
+    # Null state returns -1 immediately (no syscalls).
+    assert_eq(native_kms_summary(0), -1, "null state");
+    # Non-null state with fd=0 also returns -1 (no syscalls).
+    var s[96];
+    memset(&s, 0, 96);
+    store64(&s + KMS_STATE_FIELD_FD, 0);
+    assert_eq(native_kms_summary(&s), -1, "fd=0 state");
+    return 0;
+}
+
+# v3 Step 7.2(a) — per-connector mode enum + preferred picker
+
+fn test_drm_mode_type_constants() {
+    assert_eq(DRM_MODE_TYPE_BUILTIN,   0x01, "BUILTIN");
+    assert_eq(DRM_MODE_TYPE_PREFERRED, 0x08, "PREFERRED");
+    assert_eq(DRM_MODE_TYPE_USERDEF,   0x20, "USERDEF");
+    assert_eq(DRM_MODE_TYPE_DRIVER,    0x40, "DRIVER");
+    return 0;
+}
+
+fn test_native_kms_get_connector_modes_null_safe() {
+    var c[4];
+    assert_eq(native_kms_get_connector_modes(0, 1, &c),  0, "fd=0");
+    assert_eq(native_kms_get_connector_modes(7, 0, &c),  0, "conn_id=0");
+    assert_eq(native_kms_get_connector_modes(7, 1, 0),   0, "count_out=0");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_null_or_empty() {
+    assert_eq(native_kms_pick_preferred_mode(0, 5), 0,  "null modes");
+    var modes[68];
+    memset(&modes, 0, 68);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 0), 0, "count=0");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_finds_first_preferred() {
+    # Synthetic modes array: 3 entries.
+    # mode[0].type = DRIVER only (0x40)        — not preferred
+    # mode[1].type = DRIVER | PREFERRED (0x48) — picked
+    # mode[2].type = DRIVER | PREFERRED (0x48) — also preferred but later
+    var modes[204];   # 3 × 68
+    memset(&modes, 0, 204);
+    store32(&modes + 0 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    store32(&modes + 1 * 68 + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    store32(&modes + 2 * 68 + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 3), 1,
+              "picks first PREFERRED entry");
+    return 0;
+}
+
+fn test_native_kms_pick_preferred_falls_back_to_zero() {
+    # No PREFERRED bit set anywhere — fallback returns index 0.
+    var modes[136];   # 2 × 68
+    memset(&modes, 0, 136);
+    store32(&modes + 0 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    store32(&modes + 1 * 68 + DRM_MODE_MODEINFO_TYPE, DRM_MODE_TYPE_DRIVER);
+    assert_eq(native_kms_pick_preferred_mode(&modes, 2), 0,
+              "no PREFERRED → 0");
+    return 0;
+}
+
+fn test_native_kms_mode_dim_accessors() {
+    # Fill a synthetic single-mode array with 1920×1080@60.
+    var modes[68];
+    memset(&modes, 0, 68);
+    store16(&modes + DRM_MODE_MODEINFO_HDISPLAY, 1920);
+    store16(&modes + DRM_MODE_MODEINFO_VDISPLAY, 1080);
+    store32(&modes + DRM_MODE_MODEINFO_VREFRESH, 60000);
+    store32(&modes + DRM_MODE_MODEINFO_TYPE,
+            DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED);
+    assert_eq(native_kms_mode_hdisplay(&modes, 0), 1920, "hdisplay");
+    assert_eq(native_kms_mode_vdisplay(&modes, 0), 1080, "vdisplay");
+    assert_eq(native_kms_mode_vrefresh(&modes, 0), 60000, "vrefresh");
+    assert_eq(native_kms_mode_type(&modes, 0),
+              DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED, "type");
+    # Null-safety on accessors.
+    assert_eq(native_kms_mode_hdisplay(0, 0), 0, "null hdisplay");
+    assert_eq(native_kms_mode_vdisplay(0, 0), 0, "null vdisplay");
+    assert_eq(native_kms_mode_vrefresh(0, 0), 0, "null vrefresh");
+    assert_eq(native_kms_mode_type(0, 0),     0, "null type");
+    return 0;
+}
+
+# v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB)
+
+fn test_drm_mode_fb_ioctl_numbers() {
+    # Re-derive each ioctl from first principles.
+    assert_eq(DRM_IOCTL_MODE_ADDFB2,
+              (3 << 30) | (100 << 16) | (0x64 << 8) | 0xB8, "ADDFB2 derived");
+    assert_eq(DRM_IOCTL_MODE_ADDFB2, 0xC06464B8, "ADDFB2 literal");
+    assert_eq(DRM_IOCTL_MODE_RMFB,
+              (3 << 30) | (4 << 16) | (0x64 << 8) | 0xAF, "RMFB derived");
+    assert_eq(DRM_IOCTL_MODE_RMFB, 0xC00464AF, "RMFB literal");
+    return 0;
+}
+
+fn test_drm_mode_fb_cmd2_field_offsets() {
+    assert_eq(DRM_MODE_FB_CMD2_FB_ID,     0,  "+0");
+    assert_eq(DRM_MODE_FB_CMD2_WIDTH,     4,  "+4");
+    assert_eq(DRM_MODE_FB_CMD2_HEIGHT,    8,  "+8");
+    assert_eq(DRM_MODE_FB_CMD2_FORMAT,    12, "+12");
+    assert_eq(DRM_MODE_FB_CMD2_FLAGS,     16, "+16");
+    assert_eq(DRM_MODE_FB_CMD2_HANDLES,   20, "+20");
+    assert_eq(DRM_MODE_FB_CMD2_PITCHES,   36, "+36");
+    assert_eq(DRM_MODE_FB_CMD2_OFFSETS,   52, "+52");
+    assert_eq(DRM_MODE_FB_CMD2_MODIFIERS, 68, "+68");
+    assert_eq(DRM_MODE_FB_CMD2_SIZE,      100, "size");
+    # Sanity: 4×u32 plane arrays land at correct offsets.
+    assert_eq(DRM_MODE_FB_CMD2_HANDLES + 16, DRM_MODE_FB_CMD2_PITCHES,
+              "handles[4] ends where pitches starts");
+    assert_eq(DRM_MODE_FB_CMD2_PITCHES + 16, DRM_MODE_FB_CMD2_OFFSETS,
+              "pitches[4] ends where offsets starts");
+    assert_eq(DRM_MODE_FB_CMD2_OFFSETS + 16, DRM_MODE_FB_CMD2_MODIFIERS,
+              "offsets[4] ends where modifiers starts");
+    assert_eq(DRM_MODE_FB_CMD2_MODIFIERS + 32, DRM_MODE_FB_CMD2_SIZE,
+              "modifier[4] u64s end at struct size");
+    return 0;
+}
+
+fn test_drm_format_fourcc_constants() {
+    # Each fourcc is the 4-byte ASCII tag stored little-endian.
+    # 'X'=88, 'A'=65, 'R'=82, 'B'=66, '2'=50, '4'=52.
+    # XRGB8888 = 'X' | 'R'<<8 | '2'<<16 | '4'<<24
+    assert_eq(DRM_FORMAT_XRGB8888, 88 | (82 << 8) | (50 << 16) | (52 << 24),
+              "XRGB derived");
+    assert_eq(DRM_FORMAT_XRGB8888, 0x34325258, "XRGB literal");
+    assert_eq(DRM_FORMAT_ARGB8888, 65 | (82 << 8) | (50 << 16) | (52 << 24),
+              "ARGB derived");
+    assert_eq(DRM_FORMAT_ARGB8888, 0x34325241, "ARGB literal");
+    assert_eq(DRM_FORMAT_XBGR8888, 88 | (66 << 8) | (50 << 16) | (52 << 24),
+              "XBGR derived");
+    assert_eq(DRM_FORMAT_XBGR8888, 0x34324258, "XBGR literal");
+    assert_eq(DRM_FORMAT_ABGR8888, 65 | (66 << 8) | (50 << 16) | (52 << 24),
+              "ABGR derived");
+    assert_eq(DRM_FORMAT_ABGR8888, 0x34324241, "ABGR literal");
+    assert_eq(DRM_FORMAT_MOD_LINEAR, 0, "linear modifier = 0");
+    return 0;
+}
+
+fn test_native_kms_add_fb_xrgb8888_null_safe() {
+    assert_eq(native_kms_add_fb_xrgb8888(0, 1, 256, 256, 1024), 0, "fd=0");
+    assert_eq(native_kms_add_fb_xrgb8888(7, 0, 256, 256, 1024), 0, "handle=0");
+    assert_eq(native_kms_add_fb_xrgb8888(7, 1,   0, 256, 1024), 0, "w=0");
+    assert_eq(native_kms_add_fb_xrgb8888(7, 1, 256,   0, 1024), 0, "h=0");
+    assert_eq(native_kms_add_fb_xrgb8888(7, 1, 256, 256,    0), 0, "pitch=0");
+    return 0;
+}
+
+fn test_native_kms_rm_fb_null_safe() {
+    assert_eq(native_kms_rm_fb(0, 1), 0, "fd=0 no-op");
+    assert_eq(native_kms_rm_fb(7, 0), 0, "fb_id=0 no-op");
+    return 0;
+}
+
+# v3 Step 7.2(b) — SETCRTC primitive
+
+fn test_drm_mode_set_crtc_ioctl_number() {
+    assert_eq(DRM_IOCTL_MODE_SETCRTC,
+              (3 << 30) | (104 << 16) | (0x64 << 8) | 0xA2,
+              "SETCRTC derived");
+    assert_eq(DRM_IOCTL_MODE_SETCRTC, 0xC06864A2, "SETCRTC literal");
+    return 0;
+}
+
+fn test_drm_mode_crtc_field_offsets() {
+    assert_eq(DRM_MODE_CRTC_CONN_PTR,    0,   "+0");
+    assert_eq(DRM_MODE_CRTC_COUNT_CONN,  8,   "+8");
+    assert_eq(DRM_MODE_CRTC_CRTC_ID,     12,  "+12");
+    assert_eq(DRM_MODE_CRTC_FB_ID,       16,  "+16");
+    assert_eq(DRM_MODE_CRTC_X,           20,  "+20");
+    assert_eq(DRM_MODE_CRTC_Y,           24,  "+24");
+    assert_eq(DRM_MODE_CRTC_GAMMA_SIZE,  28,  "+28");
+    assert_eq(DRM_MODE_CRTC_MODE_VALID,  32,  "+32");
+    assert_eq(DRM_MODE_CRTC_MODE,        36,  "+36");
+    assert_eq(DRM_MODE_CRTC_SIZE,        104, "size");
+    # Sanity: the embedded modeinfo at +36 fills the rest of the
+    # struct exactly (36 + 68 == 104).
+    assert_eq(DRM_MODE_CRTC_MODE + DRM_MODE_MODEINFO_SIZE,
+              DRM_MODE_CRTC_SIZE,
+              "embedded modeinfo fills to size");
+    return 0;
+}
+
+fn test_native_kms_set_crtc_null_safe() {
+    var conn_ids[4];
+    store32(&conn_ids, 99);
+    var mode[68];
+    memset(&mode, 0, 68);
+    assert_eq(native_kms_set_crtc(0, 1, 1, &conn_ids, 1, &mode), -1, "fd=0");
+    assert_eq(native_kms_set_crtc(7, 0, 1, &conn_ids, 1, &mode), -1, "crtc=0");
+    assert_eq(native_kms_set_crtc(7, 1, 0, &conn_ids, 1, &mode), -1, "fb=0");
+    assert_eq(native_kms_set_crtc(7, 1, 1, 0,         1, &mode), -1, "conn_ptr=0");
+    assert_eq(native_kms_set_crtc(7, 1, 1, &conn_ids, 0, &mode), -1, "conn_cnt=0");
+    assert_eq(native_kms_set_crtc(7, 1, 1, &conn_ids, 1, 0),     -1, "mode=0");
+    return 0;
+}
+
+fn test_native_kms_disable_crtc_null_safe() {
+    assert_eq(native_kms_disable_crtc(0, 1), -1, "fd=0");
+    assert_eq(native_kms_disable_crtc(7, 0), -1, "crtc=0");
+    return 0;
+}
+
+# v3 Step 7.2(c) — PRIME cross-fd BO bridge
+
+fn test_drm_prime_ioctl_numbers() {
+    assert_eq(DRM_IOCTL_PRIME_HANDLE_TO_FD,
+              (3 << 30) | (12 << 16) | (0x64 << 8) | 0x2D,
+              "HANDLE_TO_FD derived");
+    assert_eq(DRM_IOCTL_PRIME_HANDLE_TO_FD, 0xC00C642D, "HANDLE_TO_FD literal");
+    assert_eq(DRM_IOCTL_PRIME_FD_TO_HANDLE,
+              (3 << 30) | (12 << 16) | (0x64 << 8) | 0x2E,
+              "FD_TO_HANDLE derived");
+    assert_eq(DRM_IOCTL_PRIME_FD_TO_HANDLE, 0xC00C642E, "FD_TO_HANDLE literal");
+    return 0;
+}
+
+fn test_drm_prime_handle_field_offsets() {
+    assert_eq(DRM_PRIME_HANDLE_HANDLE, 0, "+0");
+    assert_eq(DRM_PRIME_HANDLE_FLAGS,  4, "+4");
+    assert_eq(DRM_PRIME_HANDLE_FD,     8, "+8");
+    assert_eq(DRM_PRIME_HANDLE_SIZE,   12, "size");
+    return 0;
+}
+
+fn test_drm_prime_flag_constants() {
+    # DRM_CLOEXEC mirrors O_CLOEXEC (0o2000000 = 0x80000); DRM_RDWR
+    # mirrors O_RDWR (0x2). Both pinned so a future "match a different
+    # ABI" edit doesn't silently break PRIME export semantics.
+    assert_eq(DRM_CLOEXEC, 0x80000, "CLOEXEC");
+    assert_eq(DRM_RDWR,    0x2,     "RDWR");
+    return 0;
+}
+
+fn test_native_kms_import_bo_null_safe() {
+    assert_eq(native_kms_import_bo(0, 1, 1), 0, "card_fd=0");
+    assert_eq(native_kms_import_bo(1, 0, 1), 0, "render_fd=0");
+    assert_eq(native_kms_import_bo(1, 1, 0), 0, "render_handle=0");
+    return 0;
+}
+
+# v3 Step 7.2(d) — end-to-end modeset driver
+
+fn test_native_kms_lowest_set_bit() {
+    assert_eq(native_kms_lowest_set_bit(0x1),  0,  "bit 0");
+    assert_eq(native_kms_lowest_set_bit(0x2),  1,  "bit 1");
+    assert_eq(native_kms_lowest_set_bit(0xF),  0,  "0xF -> bit 0");
+    assert_eq(native_kms_lowest_set_bit(0x8),  3,  "0x8 -> bit 3");
+    assert_eq(native_kms_lowest_set_bit(0x80000000), 31, "high bit");
+    assert_eq(native_kms_lowest_set_bit(0x0),  -1, "no bits set");
+    return 0;
+}
+
+fn test_native_kms_scanout_struct_field_offsets() {
+    assert_eq(NATIVE_KMS_SCANOUT_CONN_ID,        0,  "conn_id");
+    assert_eq(NATIVE_KMS_SCANOUT_CRTC_ID,        4,  "crtc_id");
+    assert_eq(NATIVE_KMS_SCANOUT_FB_ID,          8,  "fb_id");
+    assert_eq(NATIVE_KMS_SCANOUT_CARD_HANDLE,    12, "card_handle");
+    assert_eq(NATIVE_KMS_SCANOUT_RENDER_HANDLE,  16, "render_handle");
+    assert_eq(NATIVE_KMS_SCANOUT_WIDTH,          20, "width");
+    assert_eq(NATIVE_KMS_SCANOUT_MAPPED_ADDR,    24, "mapped_addr");
+    assert_eq(NATIVE_KMS_SCANOUT_HEIGHT,         32, "height");
+    assert_eq(NATIVE_KMS_SCANOUT_BO_SIZE,        36, "bo_size");
+    assert_eq(NATIVE_KMS_SCANOUT_SIZE,           40, "size");
+    return 0;
+}
+
+fn test_native_kms_modeset_first_connected_null_safe() {
+    var scan[40];
+    var dummy[96];
+    memset(&dummy, 0, 96);
+    assert_eq(native_kms_modeset_first_connected(0, 7, &dummy, &scan), -1, "card_fd=0");
+    assert_eq(native_kms_modeset_first_connected(7, 0, &dummy, &scan), -1, "render_fd=0");
+    assert_eq(native_kms_modeset_first_connected(7, 7, 0,      &scan), -1, "state=0");
+    assert_eq(native_kms_modeset_first_connected(7, 7, &dummy, 0),     -1, "out=0");
+    return 0;
+}
+
+fn test_drm_master_ioctl_numbers() {
+    # Both ioctls have no payload — dir=0, size=0.
+    assert_eq(DRM_IOCTL_SET_MASTER,
+              (0 << 30) | (0 << 16) | (0x64 << 8) | 0x1E,
+              "SET_MASTER derived");
+    assert_eq(DRM_IOCTL_SET_MASTER,  0x641E, "SET_MASTER literal");
+    assert_eq(DRM_IOCTL_DROP_MASTER, 0x641F, "DROP_MASTER literal");
+    return 0;
+}
+
+fn test_native_kms_release_scanout_idempotent_on_zero() {
+    var scan[40];
+    memset(&scan, 0, 40);
+    # All fields zero — every conditional inside release skips, no
+    # actual ioctl issued. Returns 0.
+    assert_eq(native_kms_release_scanout(7, 7, &scan), 0, "zero scanout safe");
+    # And it remains zero (no garbage written).
+    assert_eq(load32(&scan + NATIVE_KMS_SCANOUT_CRTC_ID), 0, "crtc_id stays 0");
+    return 0;
+}
+
+# v3 Step 7.4 — page-flip + event read
+
+fn test_drm_mode_page_flip_ioctl_number() {
+    assert_eq(DRM_IOCTL_MODE_PAGE_FLIP,
+              (3 << 30) | (24 << 16) | (0x64 << 8) | 0xB0,
+              "PAGE_FLIP derived");
+    assert_eq(DRM_IOCTL_MODE_PAGE_FLIP, 0xC01864B0, "PAGE_FLIP literal");
+    return 0;
+}
+
+fn test_drm_mode_page_flip_struct_field_offsets() {
+    assert_eq(DRM_MODE_PAGE_FLIP_CRTC_ID,   0,  "+0");
+    assert_eq(DRM_MODE_PAGE_FLIP_FB_ID,     4,  "+4");
+    assert_eq(DRM_MODE_PAGE_FLIP_FLAGS,     8,  "+8");
+    assert_eq(DRM_MODE_PAGE_FLIP_RESERVED,  12, "+12");
+    assert_eq(DRM_MODE_PAGE_FLIP_USER_DATA, 16, "+16");
+    assert_eq(DRM_MODE_PAGE_FLIP_SIZE,      24, "size");
+    return 0;
+}
+
+fn test_drm_mode_page_flip_flag_constants() {
+    assert_eq(DRM_MODE_PAGE_FLIP_EVENT, 0x01, "EVENT");
+    assert_eq(DRM_MODE_PAGE_FLIP_ASYNC, 0x02, "ASYNC");
+    return 0;
+}
+
+fn test_native_kms_page_flip_null_safe() {
+    assert_eq(native_kms_page_flip(0, 1, 1, 0, 0), -1, "fd=0");
+    assert_eq(native_kms_page_flip(7, 0, 1, 0, 0), -1, "crtc=0");
+    assert_eq(native_kms_page_flip(7, 1, 0, 0, 0), -1, "fb=0");
+    return 0;
+}
+
+fn test_drm_event_struct_constants() {
+    # Event type enum.
+    assert_eq(DRM_EVENT_VBLANK,        0x01, "VBLANK");
+    assert_eq(DRM_EVENT_FLIP_COMPLETE, 0x02, "FLIP_COMPLETE");
+    # Event header.
+    assert_eq(DRM_EVENT_HEADER_TYPE,   0, "header type +0");
+    assert_eq(DRM_EVENT_HEADER_LENGTH, 4, "header length +4");
+    assert_eq(DRM_EVENT_HEADER_SIZE,   8, "header size");
+    # vblank payload offsets (relative to event start, including header).
+    assert_eq(DRM_EVENT_VBLANK_USER_DATA, 8,  "user_data +8");
+    assert_eq(DRM_EVENT_VBLANK_TV_SEC,    16, "tv_sec +16");
+    assert_eq(DRM_EVENT_VBLANK_TV_USEC,   20, "tv_usec +20");
+    assert_eq(DRM_EVENT_VBLANK_SEQUENCE,  24, "sequence +24");
+    assert_eq(DRM_EVENT_VBLANK_CRTC_ID,   28, "crtc_id +28");
+    assert_eq(DRM_EVENT_VBLANK_SIZE,      32, "vblank size");
+    return 0;
+}
+
+fn test_drm_event_accessors_round_trip() {
+    var buf[32];
+    memset(&buf, 0, 32);
+    store32(&buf + DRM_EVENT_HEADER_TYPE,         DRM_EVENT_FLIP_COMPLETE);
+    store32(&buf + DRM_EVENT_HEADER_LENGTH,       32);
+    store64(&buf + DRM_EVENT_VBLANK_USER_DATA,    0xCAFE);
+    store32(&buf + DRM_EVENT_VBLANK_SEQUENCE,     42);
+    store32(&buf + DRM_EVENT_VBLANK_CRTC_ID,      87);
+    assert_eq(drm_event_type(&buf),               DRM_EVENT_FLIP_COMPLETE, "type");
+    assert_eq(drm_event_length(&buf),             32,     "length");
+    assert_eq(drm_event_vblank_user_data(&buf),   0xCAFE, "user_data");
+    assert_eq(drm_event_vblank_sequence(&buf),    42,     "sequence");
+    assert_eq(drm_event_vblank_crtc_id(&buf),     87,     "crtc_id");
+    return 0;
+}
+
+fn test_native_drm_read_event_null_safe() {
+    var buf[32];
+    assert_eq(native_drm_read_event(0, &buf, 32), -1, "fd=0");
+    assert_eq(native_drm_read_event(7, 0,    32), -1, "buf=0");
+    assert_eq(native_drm_read_event(7, &buf,  0), -1, "n=0");
+    return 0;
+}
+
+# v3 Step 7.5 — native_kms_present + reusable FB alloc
+
+fn test_native_kms_fb_struct_field_offsets() {
+    assert_eq(NATIVE_KMS_FB_FB_ID,        0,  "fb_id");
+    assert_eq(NATIVE_KMS_FB_CARD_HANDLE,  4,  "card_handle");
+    assert_eq(NATIVE_KMS_FB_RENDER_HANDLE, 8, "render_handle");
+    assert_eq(NATIVE_KMS_FB_PITCH,        12, "pitch");
+    assert_eq(NATIVE_KMS_FB_MAPPED_ADDR,  16, "mapped_addr");
+    assert_eq(NATIVE_KMS_FB_BO_SIZE,      24, "bo_size");
+    assert_eq(NATIVE_KMS_FB_WIDTH,        28, "width");
+    assert_eq(NATIVE_KMS_FB_SIZE,         32, "size");
+    return 0;
+}
+
+fn test_native_kms_alloc_fb_null_safe() {
+    var out[32];
+    assert_eq(native_kms_alloc_fb(0, 7, 256, 256, &out), -1, "card_fd=0");
+    assert_eq(native_kms_alloc_fb(7, 0, 256, 256, &out), -1, "render_fd=0");
+    assert_eq(native_kms_alloc_fb(7, 7,   0, 256, &out), -1, "w=0");
+    assert_eq(native_kms_alloc_fb(7, 7, 256,   0, &out), -1, "h=0");
+    assert_eq(native_kms_alloc_fb(7, 7, 256, 256, 0),    -1, "out=0");
+    return 0;
+}
+
+fn test_native_kms_release_fb_idempotent_on_zero() {
+    var fb[32];
+    memset(&fb, 0, 32);
+    assert_eq(native_kms_release_fb(7, 7, &fb), 0, "zero fb safe");
+    assert_eq(load32(&fb + NATIVE_KMS_FB_FB_ID), 0, "fb_id stays 0");
+    return 0;
+}
+
+fn test_native_kms_present_null_safe() {
+    var scan[40];
+    var seq[4];
+    memset(&scan, 0, 40);
+    # Zero-crtc scanout — should fail validation.
+    assert_eq(native_kms_present(7, &scan, 1, &seq), -1, "scanout has no crtc");
+    # Args validation.
+    assert_eq(native_kms_present(0, &scan, 1, &seq), -1, "fd=0");
+    assert_eq(native_kms_present(7, 0,     1, &seq), -1, "scanout=0");
+    assert_eq(native_kms_present(7, &scan, 0, &seq), -1, "new_fb=0");
+    return 0;
+}
+
+fn test_native_kms_mode_refresh_hz_computation() {
+    # 1920x1080@60 typical CTA timing: clock=148500 kHz,
+    # htotal=2200, vtotal=1125 → 148500*1000 / (2200*1125)
+    # = 148,500,000 / 2,475,000 = 60 exactly.
+    var modes[68];
+    memset(&modes, 0, 68);
+    store32(&modes + DRM_MODE_MODEINFO_CLOCK,  148500);
+    store16(&modes + DRM_MODE_MODEINFO_HTOTAL, 2200);
+    store16(&modes + DRM_MODE_MODEINFO_VTOTAL, 1125);
+    assert_eq(native_kms_mode_refresh_hz(&modes, 0), 60, "1080p60");
+    # Null + zero-divisor safety.
+    assert_eq(native_kms_mode_refresh_hz(0, 0), 0, "null modes");
+    var bad[68];
+    memset(&bad, 0, 68);
+    store32(&bad + DRM_MODE_MODEINFO_CLOCK,  100000);
+    store16(&bad + DRM_MODE_MODEINFO_HTOTAL, 0);
+    store16(&bad + DRM_MODE_MODEINFO_VTOTAL, 1125);
+    assert_eq(native_kms_mode_refresh_hz(&bad, 0), 0, "htotal=0 safe");
+    return 0;
+}
+
+fn main() {
+    # v3 Step 7.1(a) — DRM/KMS GetResources foundation (5)
+    test_drm_mode_ioctl_numbers();
+    test_drm_mode_card_res_field_offsets();
+    test_kms_state_field_offsets();
+    test_kms_state_accessors_round_trip();
+    test_native_kms_release_safe();
+
+    # v3 Step 7.1(b) — DRM connector ioctl + struct shapes (4)
+    test_drm_mode_get_connector_field_offsets();
+    test_drm_mode_modeinfo_field_offsets();
+    test_drm_mode_connection_status_constants();
+    test_drm_mode_connector_type_constants();
+
+    # v3 Step 7.1(c) — Encoder ioctl + topology summary (6)
+    test_drm_mode_get_encoder_field_offsets();
+    test_drm_mode_encoder_type_constants();
+    test_native_drm_connector_type_name_lookup();
+    test_native_drm_encoder_type_name_lookup();
+    test_native_drm_connection_status_name_lookup();
+    test_native_kms_summary_null_safe();
+
+    # v3 Step 7.2(a) — per-connector mode enum + preferred pick (7)
+    test_drm_mode_type_constants();
+    test_native_kms_get_connector_modes_null_safe();
+    test_native_kms_pick_preferred_null_or_empty();
+    test_native_kms_pick_preferred_finds_first_preferred();
+    test_native_kms_pick_preferred_falls_back_to_zero();
+    test_native_kms_mode_dim_accessors();
+    test_native_kms_mode_refresh_hz_computation();
+
+    # v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB) (5)
+    test_drm_mode_fb_ioctl_numbers();
+    test_drm_mode_fb_cmd2_field_offsets();
+    test_drm_format_fourcc_constants();
+    test_native_kms_add_fb_xrgb8888_null_safe();
+    test_native_kms_rm_fb_null_safe();
+
+    # v3 Step 7.2(b) — SETCRTC primitive (4)
+    test_drm_mode_set_crtc_ioctl_number();
+    test_drm_mode_crtc_field_offsets();
+    test_native_kms_set_crtc_null_safe();
+    test_native_kms_disable_crtc_null_safe();
+
+    # v3 Step 7.2(c) — PRIME cross-fd BO bridge (4)
+    test_drm_prime_ioctl_numbers();
+    test_drm_prime_handle_field_offsets();
+    test_drm_prime_flag_constants();
+    test_native_kms_import_bo_null_safe();
+
+    # v3 Step 7.2(d) — end-to-end modeset driver (5)
+    test_native_kms_lowest_set_bit();
+    test_native_kms_scanout_struct_field_offsets();
+    test_native_kms_modeset_first_connected_null_safe();
+    test_drm_master_ioctl_numbers();
+    test_native_kms_release_scanout_idempotent_on_zero();
+
+    # v3 Step 7.4 — page-flip + event read (6)
+    test_drm_mode_page_flip_ioctl_number();
+    test_drm_mode_page_flip_struct_field_offsets();
+    test_drm_mode_page_flip_flag_constants();
+    test_native_kms_page_flip_null_safe();
+    test_drm_event_struct_constants();
+    test_drm_event_accessors_round_trip();
+    test_native_drm_read_event_null_safe();
+
+    # v3 Step 7.5 — native_kms_present + FB alloc (4)
+    test_native_kms_fb_struct_field_offsets();
+    test_native_kms_alloc_fb_null_safe();
+    test_native_kms_release_fb_idempotent_on_zero();
+    test_native_kms_present_null_safe();
+
+    # v3 Step 7.7 — public surface API (8)
+    test_gpu_context_size_extended_to_112();
+    test_gpu_ctx_wgpu_surface_handle_round_trip();
+    test_gpu_ctx_native_card_fd_round_trip();
+    test_native_surface_struct_field_offsets();
+    test_gpu_surface_configure_wgpu_null_safe();
+    test_gpu_surface_configure_native_kiosk_null_safe();
+    test_gpu_surface_configure_native_logind_uninit_samvada();
+    test_gpu_surface_per_frame_ops_null_safe();
+
+    # v3 audit 2026-04-30 — ship-blocker fixes (MED-3)
+    test_native_rt_create_rejects_odd_dims();
+    test_native_rt_create_rejects_nonpositive_dims();
+
+    return assert_summary();
+}
+
+# v3 Step 7.7 — public surface API
+
+fn test_gpu_context_size_extended_to_112() {
+    # The GpuContext layout extension is what makes the surface
+    # consumer-stash work. Pin the size + the new field offsets
+    # so a future refactor can't silently shrink the struct.
+    assert_eq(GPU_CONTEXT_SIZE, 112, "extended ctx = 112");
+    return 0;
+}
+
+fn test_gpu_ctx_wgpu_surface_handle_round_trip() {
+    # Stack-local — heap-alloc tests at this point in the file
+    # exhaust the bump allocator. Fixed-size array gives the same
+    # observable shape with zero heap pressure.
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0, "starts zero");
+    gpu_ctx_set_wgpu_surface_handle(&ctx, 0xDEADBEEF);
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0xDEADBEEF, "round-trip");
+    assert_eq(gpu_ctx_set_wgpu_surface_handle(0, 1), -1, "null ctx → -1");
+    return 0;
+}
+
+fn test_gpu_ctx_native_card_fd_round_trip() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_ctx_native_card_fd(&ctx), 0, "starts zero");
+    gpu_ctx_set_native_card_fd(&ctx, 42);
+    assert_eq(gpu_ctx_native_card_fd(&ctx), 42, "round-trip");
+    assert_eq(gpu_ctx_set_native_card_fd(0, 7), -1, "null ctx → -1");
+    return 0;
+}
+
+fn test_native_surface_struct_field_offsets() {
+    assert_eq(NATIVE_SURFACE_CARD_FD,    0,   "card_fd");
+    assert_eq(NATIVE_SURFACE_RENDER_FD,  4,   "render_fd");
+    assert_eq(NATIVE_SURFACE_STATE,      8,   "state");
+    assert_eq(NATIVE_SURFACE_SCANOUT,    16,  "scanout");
+    assert_eq(NATIVE_SURFACE_FB_B,       56,  "fb_b");
+    assert_eq(NATIVE_SURFACE_FRONT_IS_B, 88,  "front_is_b");
+    assert_eq(NATIVE_SURFACE_WIDTH,      96,  "width");
+    assert_eq(NATIVE_SURFACE_HEIGHT,     100, "height");
+    assert_eq(NATIVE_SURFACE_PITCH,      104, "pitch");
+    assert_eq(NATIVE_SURFACE_SIZE,       120, "size");
+    # Sanity: scanout + 40-byte size = fb_b offset; fb_b + 32 = front_is_b.
+    assert_eq(NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_SIZE,
+              NATIVE_SURFACE_FB_B,
+              "scanout-end aligns with fb_b-start");
+    assert_eq(NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_SIZE,
+              NATIVE_SURFACE_FRONT_IS_B,
+              "fb_b-end aligns with front_is_b");
+    return 0;
+}
+
+fn test_gpu_surface_configure_wgpu_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_wgpu(0,    0xCAFE, 256, 256), 0, "null ctx");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0,      256, 256), 0, "null surface");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 0,   256), 0, "zero w");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256,   0), 0, "zero h");
+    # No backend = no slot = 0.
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256, 256), 0, "no backend");
+    return 0;
+}
+
+fn test_gpu_surface_configure_native_kiosk_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_native_kiosk(0,     7, 256, 256), 0, "null ctx");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  0, 256, 256), 0, "card_fd=0");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx, -1, 256, 256), 0, "card_fd<0");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7,   0, 256), 0, "zero w");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7, 256,   0), 0, "zero h");
+    return 0;
+}
+
+fn test_gpu_surface_configure_native_logind_uninit_samvada() {
+    # samvada is the gating dependency. In CPU tests, no C-shim
+    # has been linked, so samvada's static fn-table is null
+    # (`_samvada_table == 0`) → samvada_session_take_device
+    # returns -22 (EINVAL) → this dispatcher falls through to 0.
+    # The "logind works" path is HW-gated through the consumer
+    # program, not exercised here.
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 256), 0,
+              "uninit samvada → 0");
+    assert_eq(gpu_surface_configure_native_logind(0, 256, 256), 0,
+              "null ctx still 0");
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 0, 256), 0,
+              "zero w");
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 0), 0,
+              "zero h");
+    return 0;
+}
+
+fn test_gpu_surface_per_frame_ops_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_acquire(0,    0xC0FFEE), 0, "acquire null ctx");
+    assert_eq(gpu_surface_acquire(&ctx, 0),        0, "acquire null surface");
+    assert_eq(gpu_surface_acquire(&ctx, 0xC0FFEE), 0, "acquire no backend");
+    assert_eq(gpu_surface_present(0,    0xC0FFEE), GPU_ERR_OTHER, "present null ctx");
+    assert_eq(gpu_surface_present(&ctx, 0),        GPU_ERR_OTHER, "present null surface");
+    assert_eq(gpu_surface_release(0,    0xC0FFEE), 0, "release null ctx");
+    assert_eq(gpu_surface_release(&ctx, 0),        0, "release null surface");
+    return 0;
+}
+
+# v3 audit 2026-04-30 — MED-3: native_rt_create_2d_rgba8 must reject
+# odd width/height because native_pm4_build_render_pass_target's
+# viewport math uses integer (rt_width / 2). Rejection happens in the
+# allocator BEFORE any ioctl, so a fake fd is fine — the dim guard
+# fires first.
+fn test_native_rt_create_rejects_odd_dims() {
+    var out[40];
+    memset(&out, 0, 40);
+    var fake_fd = 999;
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 3,  4, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "odd width rejected");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 4,  5, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "odd height rejected");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 1,  2, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "1x2 width is odd");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 2,  1, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "2x1 height is odd");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 7, 13, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "both odd rejected");
+    return 0;
+}
+
+fn test_native_rt_create_rejects_nonpositive_dims() {
+    var out[40];
+    memset(&out, 0, 40);
+    var fake_fd = 999;
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  0,  4, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "zero width");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4,  0, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "zero height");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, -2,  4, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "negative width");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4, -2, &out),
+              GPU_ERR_TEXTURE_DIMENSION, "negative height");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

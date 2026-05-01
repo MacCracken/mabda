@@ -18,6 +18,1450 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.0-rc.1] — 2026-04-30
+
+**Release-candidate cut of the v3 native-backend work.** Dual backend
+(wgpu + native AMD) ships against the same public API surface; the
+`Backend` 25-slot fnptr table routes `gpu_buffer_*` /
+`gpu_compute_dispatch` / `gpu_texture_*` / `gpu_render_*` /
+`gpu_surface_*` to the appropriate impl. Native path is direct
+AMDGPU DRM ioctls (no libdrm), with `samvada` as the sister AGNOS
+package providing logind master delegation via libsystemd C-shim.
+
+The 5 ship-blockers from the
+[2026-04-30 audit](docs/audit/2026-04-30-audit.md) are fixed in
+tree (HIGH-1, HIGH-2, MED-1, MED-3, MED-6 + LOW-6 bundled). Audit
+disposition: 10 deferred items file as the rc.2 punchlist
+(`docs/development/3-0-rc-2-punchlist.md`) — official `3.0.0` ships
+once those land clean.
+
+**Metrics**: 35 src/ modules / ~14,500 LoC / 1828 CPU asserts across
+3 test files (was 1819 pre-audit; +9 from MED-3 odd-dim rejection
+asserts) / `dist/mabda.cyr` ~11,500 lines / 7 GPU integration
+programs (`phase0`, `compute_e2e`, `render_e2e`, `render_graph_e2e`
+on wgpu; `native_compute_store`, `native_texture_e2e`,
+`native_render_e2e` on native; plus `native_kms_summary`,
+`native_kms_modeset_smoke`, `native_present_e2e` for Phase D).
+
+The remaining v3.0.0-dev entries below are dev-track items that
+shipped over the v3 cycle; they remain dated and per-step for
+historical traceability.
+
+### Added — 2026-04-30 (Session 26 — Steps 6.2 + 6.5 native render PM4 composer)
+
+The native render path's CPU-testable structure is now end-to-end in
+tree. Register addresses + minimums, VS+FS shader bytes, and the full
+clear-triangle PM4 stream composer all land with by-construction CPU
+asserts pinning every emitted byte. Layer-2 byte-exact verification
+against radv-IB capture remains gated on Hyprland.
+
+- **Step 6.2(a) — graphics-pipeline register addresses + minimums.**
+  12 SH/context register addresses (VS+PS PGM_LO/HI/RSRC1/RSRC2 + SPI
+  shader format outputs + CB_TARGET_MASK) and 6 spec-derived field
+  minimums (RSRC1/RSRC2/format/vcount). 30 CPU value-asserts in
+  `tests/tcyr/mabda_v3.tcyr`. Capture-protocol doc filed at
+  `docs/proposals/v3-shader-bytes-capture.md` (298 lines).
+- **Step 6.2(b) FS — `native_gfx9_shader_solid_red`.** 92-byte
+  hand-encoded fragment shader emitting solid red via 4× `v_mov_b32`
+  + `exp mrt0 done vm` + `s_endpgm` + 16-NOP prefetch padding. Each
+  dword spec-cited from the GFX9/GCN5 ISA spec. 26 byte-asserts.
+  `GFX9_FS_SOLID_RED_SIZE = 92` exposed for Step 6.5 BO sizing.
+- **Step 6.2(b) VS — `native_gfx9_shader_fullscreen_triangle_vs`.**
+  116-byte VS computing NDC fullscreen triangle from system VGPR v0
+  via the standard radv pattern `(vid&1)*4-1, (vid>>1)*4-1`. VOP2
+  arithmetic encodings cross-checked against
+  `clang -target amdgcn--amdhsa -mcpu=gfx90c -O2 -nogpulib`
+  disassembly (`llvm-objdump -d`) of an equivalent CL kernel — same
+  Layer-1 protocol the compute shader used. 32 byte-asserts.
+  `GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116` exposed for Step 6.5.
+- **Step 6.5(a) — clear-triangle PM4 register addresses + value
+  constants.** 38 new register addresses (15 pipeline-static ctx +
+  21 pass-target + 2 UConfig graphics) and 12 simple value constants
+  (target masks, blend / cull / clip defaults, primitive type, SPI
+  hang-quirk minimum, DB defaults). Every address extracted from
+  authoritative Mesa
+  `https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json`
+  with citation comment. 50 CPU value-asserts. Plus 3 composed
+  bit-pattern values (`CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010`,
+  `CB_COLOR0_INFO_RGBA8_UNORM = 0x28`,
+  `CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000`).
+- **Step 6.5(b) — PM4 stream composer for clear-triangle dispatch.**
+  Four-block split per `docs/proposals/v3-backend-interface.md` v2.1:
+  `native_pm4_build_render_pipeline_sh` (VS+PS shader VAs + RSRC,
+  48 B), `_pipeline_ctx` (mode-static state, 240 B),
+  `_pass_target` (RT bind + viewport + scissor, 152 B),
+  `_draw_tail` (DRAW_INDEX_AUTO, 12 B). Top-level
+  `native_pm4_build_render_clear_triangle(buf, vs_va, fs_va, rt_va,
+  rt_width, rt_height)` composes the four blocks + ACQUIRE_MEM
+  preamble + UConfig graphics + NOP padding to 256-dword alignment
+  (1024 B total). Helpers `native_int_to_f32_bits` +
+  `native_f32_neg_bits` for viewport f32 conversion (route through
+  stdlib `f64_from` and color.cyr `f64_to_f32`). 75 CPU asserts
+  exercise int↔f32 helpers + each block in isolation + the top-level
+  composer.
+
+### Fixed — 2026-04-30 (catches during Steps 6.2 + 6.5)
+
+- **`SPI_SHADER_{POS,Z,COL}_FORMAT` addresses scrambled in 6.2(a).**
+  Initial 6.2(a) shipped POS=0xA710, Z=0xA708, COL=0xA70C. Authoritative
+  Mesa gfx9.json: POS=0xA70C, Z=0xA710, COL=0xA714. Caught during
+  6.5(a) cross-check before any HW test ran. Lesson now codified in
+  `docs/proposals/v3-shader-bytes-capture.md` § "Authoritative source
+  for register addresses": every `R_*` constant must cite its
+  gfx9.json `map.at` value.
+- **PGM_HI mask in 6.5(b) `pipeline_sh` block.** Initial composer used
+  `(va >> 40) & 0xFFFFFFFF`; correct mask matches compute pattern
+  (line ~809) — `& 0xFF` (8 bits, bits 40-47 of VA). Cyrius's `>>`
+  on i64 is logical (no sign-extend), so the bug was producing
+  garbage in high bits of a 32-bit register that hardware would
+  ignore but cluttered the IB.
+- **CB_COLOR_CONTROL design-doc value 0xCC was field-shorthand.**
+  `docs/proposals/v3-native-render-design.md` listed 0xCC for "NORMAL
+  ROP". The bare 0xCC interpreted as the encoded register would set
+  DEGAMMA_ENABLE bit 3 and put MODE=4 (CB_DECOMPRESS). Authoritative
+  composition: MODE=CB_NORMAL (1) << 4 = 0x10, ROP3=0xCC << 16 =
+  0xCC0000, union = 0xCC0010. Now exposed as
+  `GFX9_CB_COLOR_CONTROL_NORMAL_COPY`.
+
+### Unblocked — 2026-04-30 (toolchain + tooling)
+
+- **Cyrius distlib 64-KB-per-module truncation fixed upstream in
+  v5.7.36.** `src/backend_native.cyr` grew past 64 KB during the
+  6.2 work. Cyrius distlib's read buffer (`alloc(65536) /
+  file_read_all(..., 65535)` in `cbt/commands.cyr:894`) silently
+  truncated, producing a bundle missing every fn defined past
+  byte 65535. Fixed upstream — buffer raised 64 KB → 256 KB. Mabda
+  pin moved 5.5.20 → 5.7.35 → 5.7.36 across the session.
+- **Cyrius lint/fmt now per-file (5.7.x CLI shape change).** Bare
+  `cyrius lint` / `cyrius fmt --check` (repo-wide) is gone — both
+  require an explicit file argument. Project-wide form for downstream
+  consumers is now a shell loop:
+  `for f in src/*.cyr; do cyrius lint "$f" || exit 1; done`. CLAUDE.md
+  P(-1) Scaffold Hardening section still describes the bare form;
+  flag for Tier 4 doc update.
+- **clang + LLVM AMDGPU installed on the dev box.** `clang 22.1.3` +
+  `llvm-objdump` + `llvm-mc`. Unblocks Layer-1 cross-check protocol
+  (hand-encoded shader bytes vs `clang -target amdgcn--amdhsa
+  -mcpu=gfx90c -O2 -nogpulib` disassembly). Used for the 6.2(b) VS
+  arithmetic VOP2 encodings.
+
+### Methodology note — 2026-04-30 (ground-truth-everything)
+
+The session's bug catches (scrambled SPI addresses, PGM_HI mask,
+CB_COLOR_CONTROL value, six test arithmetic errors) all share a
+shape: speculation-from-design-doc that didn't survive a check
+against the authoritative source. The protocol now reflected in
+`docs/proposals/v3-shader-bytes-capture.md`:
+
+- Layer 1 (shader ISA bytes) — clang `amdgcn--amdhsa` + `llvm-objdump`
+  is the cross-check tool. Reference CL kernel preserved in the proposal
+  doc for re-verification.
+- Layer 2 (PM4 packet stream) — `RADV_DEBUG=hang` IB dump from a vkcube
+  clear-triangle is the cross-check. **Currently gated on Hyprland**
+  (the dev box is Arch base, no DRI3, vkcube needs a presentation
+  surface). Once unblocked, run on the existing
+  `native_pm4_build_render_clear_triangle` output to claim Step 6.5
+  done.
+- Register addresses — Mesa
+  `https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json`
+  is the source of truth. Lookup script captured inline in the
+  proposal doc. Every `R_*` constant in `src/backend_native.cyr`
+  carries a `# Mesa 0x028XYZ` citation comment.
+
+### Added — 2026-04-30 (Step 6.6 — render-ring dispatch)
+
+`native_render_dispatch_simple` lands as the GFX-ring analog of
+`native_compute_dispatch_cached`. Routes through the same Mesa-shape
+4-chunk submit (BO_HANDLES + SYNCOBJ_OUT + FENCE + IB) on the same
+per-context cached IB+fence, with a per-dispatch syncobj. Three
+deltas vs the compute path:
+
+- `ip_type = AMDGPU_HW_IP_GFX` (was `_COMPUTE`) selects the graphics
+  ring.
+- `ib_flags = 0` (compute uses `0x08` /
+  `AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE`). The render PM4 stream's
+  ACQUIRE_MEM preamble (block 0 of
+  `native_pm4_build_render_clear_triangle`) does its own cache
+  invalidate; we don't need the kernel-side TC writeback hook that
+  the compute flag toggles.
+- BO_HANDLES list shape: `(fence / vs / fs / rt / ib)` at residency
+  priorities `(1 / 4 / 4 / 3 / 10)`. Compute is
+  `(fence / stub / out / shader / ib)` at `(1 / 3 / 3 / 4 / 10)` —
+  shader prio (4) goes to both VS and FS, target prio (3) goes to
+  the RT, the compute stub drops out.
+
+Two CPU-testable helpers split out of the inline shape:
+`native_render_handles_write` (24-byte vs/fs/rt triple, analog of
+`native_buf_pair_write`) and `native_render_bo_list_pack` (5-entry
+40-byte residency list builder). 15 new CPU asserts in
+`tests/tcyr/mabda_v3.tcyr` pin both layouts and guard against an
+accidental "same shape as compute" refactor.
+
+The full submit + syscall path is HW-gated — the e2e gate is
+6.9(b)'s `programs/native_render_e2e.cyr`. 712 v3 (was 697) +
+624 mabda CPU asserts green; smoke + lint clean.
+
+### Added — 2026-04-30 (Step 6.8(c) — native render slot wrappers)
+
+The 4-block PM4 split from `docs/proposals/v3-backend-interface.md`
+v2.1 lands in code: two new structs (`NativeRenderPipeline`,
+`NativePass`) plus seven slot wrappers wire the public render API
+through to the native graphics ring.
+
+- **`NativeRenderPipeline`** (320 B): header (vs+fs handle/va, 32 B)
+  + pre-built `pipeline_sh_block` (48 B, exact output of
+  `native_pm4_build_render_pipeline_sh`) + pre-built
+  `pipeline_ctx_block` (240 B, exact output of
+  `native_pm4_build_render_pipeline_ctx`). Packed once at
+  `pipeline_create` time via `native_render_pipeline_pack`. Per the
+  4-block split's pipeline-static lifetime, these blocks are encoded
+  once and memcpy'd into every IB that uses this pipeline.
+- **`NativePass`** (32 B): ctx_ref / rt_ptr / clear_color_ptr +
+  reserved. Layout matches `_backend_wgpu_render_pass_begin`'s
+  pass struct shape for parity. v2-native defers all PM4 emit to
+  `pass_draw` rather than splitting begin/draw — single-draw-per-
+  pass means the lifetime split has no caching value yet.
+- **Seven slot wrappers** in `src/backend_native.cyr`:
+  - `_backend_native_render_target_create_2d_rgba8` /
+    `_backend_native_render_target_release` — wrap Step 6.3's
+    `native_rt_create_2d_rgba8` / `_release` primitives.
+  - `_backend_native_render_pipeline_create` /
+    `_backend_native_render_pipeline_release` — alloc + pack /
+    zero. `color_fmt` accepted for slot ABI parity but ignored
+    (only RGBA8_UNORM supported on native v2).
+  - `_backend_native_render_pass_begin` — alloc 32 B, stash refs.
+    No PM4 emit; defers to `pass_draw`.
+  - `_backend_native_render_pass_draw` — composes the full IB
+    (ACQUIRE_MEM preamble + 2 UConfig + memcpy `pipeline_sh_block`
+    + memcpy `pipeline_ctx_block` + `_pass_target` from RT extents
+    + `_draw_tail` + NOP padding to 256 dwords) and dispatches via
+    Step 6.6's `native_render_dispatch_simple`. `vc` / `ic` accepted
+    for ABI parity; the FS+VS pair is fixed-shape (3-vertex
+    fullscreen triangle), so the actual draw_tail uses
+    `GFX9_FULLSCREEN_TRI_VCOUNT` regardless.
+  - `_backend_native_render_pass_end` — zero pass struct.
+- **`NativeRenderTarget` extended 32 → 40 B**: added width / height
+  fields at +32 / +36 (u32 each). Required by `pass_draw` to feed
+  RT dimensions into `native_pm4_build_render_pass_target`. The RT
+  is the source of truth for its own dimensions; consumers
+  shouldn't reconstruct from `size = w*h*4`.
+- **`backend_native_new()`** now wires all 21 slots —
+  `backend_is_complete()` returns 1 (was 0 with v2 render range
+  pending since 6.8(b) close).
+
+**Load-bearing CPU test:**
+`test_native_render_pipeline_pack_matches_composer` asserts that
+the cached `pipeline_sh_block` and `pipeline_ctx_block` inside a
+freshly-packed `NativeRenderPipeline` are dword-identical to what
+the standalone composers emit into a parallel scratch buffer. Guards
+against the "memcpy fast path silently diverges from the composer"
+class of bug — if `native_pm4_build_render_pipeline_sh` ever
+changes its emit order or count, this test fails immediately rather
+than producing a corrupt IB at HW dispatch.
+
+**v2-native limitations** (documented inline; lifted in v3.x):
+single draw per pass, no pipeline state caching across draws,
+`clear_color_ptr` ignored (FS shader hardcodes red — Step 6.2(b)),
+`color_fmt` ignored (only RGBA8_UNORM).
+
+819 v3 (was 712) + 624 mabda CPU asserts green; smoke + lint clean.
+
+### Added — 2026-04-30 (Step 6.9(b) — native render e2e program)
+
+`programs/native_render_e2e.cyr` (243 lines) lands as the
+native-path mirror of `programs/render_e2e.cyr`. Drives the full
+6.x chain end-to-end through the public 6.9(a) `gpu_render_*` API
+in one program:
+
+```
+gpu_context_new_native()
+  → vs/fs shader BOs (4 KiB GTT each, va_map'd at canonical-high)
+  → vs_mod/fs_mod (handle, va) pairs
+  → gpu_render_target_create_2d_rgba8(ctx, 256, 256)
+  → gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0)
+  → gpu_render_pass_begin(ctx, rt, &clear)
+  → gpu_render_pass_draw(ctx, pass, pipe, 3, 1)   # GFX-ring submit
+  → gpu_render_pass_end(ctx, pass)
+  → load8(rt_addr + 0..3)  # native RT is GTT-mapped → CPU-direct
+  → expect (0xFF, 0x00, 0x00, 0xFF)
+```
+
+Native RT is GTT-mapped linear — readback is a direct `load8` of
+the mmap'd bytes. No `copy_texture_to_buffer` round-trip needed
+(unlike the wgpu path). Twelve named exit codes (0–11) map to
+specific failure classes for unattended runs.
+
+Wired into the Makefile as `build/native_render_e2e` /
+`test-native-render-e2e` (mirrors the `native_compute_store` /
+`native_texture_e2e` pattern; no C launcher since the native path
+doesn't link wgpu-native).
+
+**Documented HW-time failure modes** (most likely first, with the
+reasoning so future-you can read it cold):
+
+- **A. Post-draw cache flush missing.** The 6.5(b) PM4 composer
+  emits ACQUIRE_MEM (cache *invalidate*) at the start of the stream
+  — for shader-fetch correctness — but no end-of-pass
+  CACHE_FLUSH_AND_INV. radv emits one before reading the RT. If
+  pixel(0,0) reads back as 0x00000000 (uninitialized GTT) while
+  syncobj signaled normally, this is the suspect. Fix lands in a
+  6.x follow-up (extend the composer with a CACHE_FLUSH_AND_INV at
+  draw_tail end).
+- **B. TDR on the GFX ring.** ~10000ms elapsed + non-zero rc =
+  ring hang. `dmesg | grep amdgpu` confirms; Layer-2 byte-diff
+  vs radv localizes the bad packet.
+- **C. Pipeline state register mis-encoding.** Non-red pixel
+  (e.g. black) means FS ran but RT bind / blend / target-mask is
+  wrong. Suspect 6.5(a)'s pipeline_ctx register addresses.
+
+Build-clean (`cyrius build programs/native_render_e2e.cyr` succeeds;
+full include chain links). HW-gated to run — needs amdgpu + valid
+render-node fd. CI runners without DRM skip; developer gate is
+local `make test-native-render-e2e` on a Cezanne / equivalent box.
+
+**Phase C render is now code-complete** — every 6.x sub-bullet has
+either landed or is a HW-time follow-up (post-draw flush, Layer-2
+verify). The structural critical path from "shader bytes" to
+"pixel verified" is in tree.
+
+### Added — 2026-04-30 (Step 6.10 prep — CACHE_FLUSH_AND_INV builder)
+
+Stand-alone PM4 primitive for the post-draw cache flush radv emits
+before any CB→CPU readback. Lands as a separate prep step (not yet
+wired into the composer) so the moment HW data confirms the
+hypothesis from `programs/native_render_e2e.cyr`'s "Failure A"
+note, the fix is one call-site addition rather than a fresh
+research session.
+
+- **`native_pm4_event_write(buf, pos, event_type, event_index)`** —
+  general-purpose 2-dword EVENT_WRITE builder. Body packs
+  `event_type` in bits[5:0] and `event_index` in bits[11:8] (matches
+  Mesa's `EVENT_TYPE(t) | EVENT_INDEX(i)` macro convention). Used
+  for `event_index = 0` "other" events; TS-style events with a
+  64-bit writeback address need RELEASE_MEM (deferred).
+- **`native_pm4_event_write_cache_flush_and_inv(buf, pos)`** —
+  convenience wrapper that emits the canonical
+  `EVENT_TYPE = CACHE_FLUSH_AND_INV (0x16)`,
+  `EVENT_INDEX = OTHER (0)` packet. The CP processes this event
+  before writing the user-fence completion seqno, so by the time
+  the syncobj signals the RT writes are CPU-visible.
+- Four GFX9 event-type / event-index constants exposed and pinned:
+  `GFX9_EVENT_TYPE_CACHE_FLUSH = 0x04`,
+  `GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16`,
+  `GFX9_EVENT_INDEX_OTHER = 0`, `GFX9_EVENT_INDEX_TS = 5`. All
+  cited from Mesa `gfx9.json`'s `VGT_EVENT_TYPE` enum (the same
+  authoritative source 6.5(a)'s register addresses use).
+
+**Not yet wired into the render PM4 composer.** The first
+`make test-native-render-e2e` on Cezanne is the gate. Two outcomes
+the prep is designed for:
+
+- If pixel readback returns the GTT 0x55 sentinel (Failure A in
+  the e2e program's docstring), append
+  `native_pm4_event_write_cache_flush_and_inv(buf, pos)` after
+  the draw_tail in `native_pm4_build_render_clear_triangle`. One
+  call-site change; the builder + tests are already done.
+- If HW reveals a different failure class, the builder is still
+  needed for Phase D surface present (end-of-frame flush before
+  the page-flip ioctl) — not throwaway work even in the
+  non-flush-bug branch.
+
+**5 CPU tests, 17 asserts:** GFX9 constants pinned, EVENT_WRITE
+binary form (header `0xC0004600` + body `0x00000016` for
+CACHE_FLUSH_AND_INV), wrapper byte-exact equivalence, position-
+tracking composability with `native_pm4_nop`, event_index packing
+(verified with a non-zero index = 5 case so future TS-event paths
+can build on this).
+
+### Added — 2026-04-30 (Step 7.1(a) — Phase D DRM/KMS foundation)
+
+First Phase D bite lands: a new module `src/backend_native_kms.cyr`
+(243 lines) implementing the DRM/KMS GetResources ioctl. Filed
+separately from `backend_native.cyr` because the surface path is
+structurally distinct from the compute / render path — `card0`
+master node + `DRM_IOCTL_MODE_*` family, vs `renderD128` render
+node + `DRM_IOCTL_AMDGPU_*` family.
+
+- **`DRM_IOCTL_MODE_GETRESOURCES`** (= `0xC04064A0`) — derived from
+  `_IOC(RW, 0x64, 0xA0, 64)`. Returns the kernel's count of FBs /
+  CRTCs / connectors / encoders + ID arrays for each.
+- **`drm_mode_card_res`** struct shape (64 bytes, every field
+  pinned by CPU asserts): four `*_ptr` fields, four `count_*`
+  fields (IN: capacity, OUT: actual), four extent-limit fields.
+- **`native_drm_mode_get_resources(fd, req)`** — low-level
+  ioctl wrapper. Caller controls `req` zeroing (count-only pass
+  vs array-fill pass).
+- **`native_kms_init(fd)`** — the two-pass driver. Pass 1 with
+  null pointers + zero counts to discover sizes; pass 2 with
+  heap-allocated arrays of the discovered sizes. Returns a
+  96-byte `KmsState` (or 0 on failure / no DRM master).
+- **`KmsState`** struct (96 bytes): fd + 4 counts + 4 ID array
+  pointers + 4 extent-limit fields + 24 reserved bytes for
+  per-connector / per-encoder summary tables landing in 7.1(b/c).
+- **13 short field accessors** (`kms_state_fd`, `kms_state_count_*`,
+  `kms_state_*_ids`, `kms_state_min_width` etc.) keep call sites
+  readable without spreading the field-offset constants through
+  consumers.
+- **`MODE_GETCONNECTOR`** (= `0xC05064A7`) and **`MODE_GETENCODER`**
+  (= `0xC01464A6`) ioctl-number constants exposed for sub-bites
+  (b) + (c). Helper fns land in those steps.
+- **`native_kms_release(state)`** — safe-zero teardown. Bump-
+  allocator pattern means heap allocs aren't freed (consistent
+  with `native_compute_dispatch_cached`); zeroing the struct
+  surfaces stale-pointer use as null on subsequent loads.
+
+`backend_native_kms.cyr` is wired into the include chain
+(`src/lib.cyr`) and `[lib].modules` (`cyrius.cyml`) so
+`cyrius distlib` bundles it for downstream consumers and the
+smoke build links it.
+
+5 CPU tests, 51 asserts in `tests/tcyr/mabda_v3.tcyr`: ioctl
+numbers re-derived from first principles to catch transcription
+drift, drm_mode_card_res field offsets pinned, KmsState layout
++ accessor round-trips, release safe-zero (null + populated).
+The `native_kms_init` driver itself is HW-gated — needs a DRM
+master fd (`/dev/dri/card0`), which CI runners typically lack.
+
+### Fixed — 2026-04-30 (caught during Step 7.1(a))
+
+- **`cyrius lint` 128 KiB read-buffer cap** surfaced when
+  `tests/tcyr/mabda_v3.tcyr` crossed 131,072 bytes during the
+  7.1(a) test additions. `cyrlint.cyr:523` allocs
+  `var buf = alloc(131072)` and `file_read_all(path, buf, 131072)`
+  truncates anything larger — the linter then misreports
+  "unclosed braces at end of file" near the cutoff while the
+  file is structurally fine. Identical class of bug to the
+  `cyrius distlib` 64K truncation fixed in 5.7.36 (raised to
+  256K). cyrlint never got the same treatment; as of cyrius
+  5.7.42 the cap is still 128 KiB. Worked around by tightening
+  the new test bodies' assertion messages so the file lands
+  at 130,932 bytes (140 bytes headroom). Saved as a memory note;
+  real fix is to bump cyrlint's buffer upstream and re-pin —
+  noted as a tooling follow-up.
+
+### Added — 2026-04-30 (Step 7.1(b) — DRM connector primitives)
+
+Extends `src/backend_native_kms.cyr` with the data structures the
+per-connector enumeration driver (landing in 7.1(c)) will consume:
+
+- **`drm_mode_get_connector`** struct shape (80 bytes; 16 fields
+  pinned by CPU asserts). Same two-call protocol as
+  drm_mode_card_res — pass 1 with zero counts to discover sizes,
+  pass 2 with caller-allocated arrays for encoder IDs, modes,
+  property IDs, and property values. Caller MUST set `connector_id`
+  at +48 before the ioctl (kernel keys lookup off it).
+- **`drm_mode_modeinfo`** struct shape (68 bytes; 13 numeric fields
+  for clock + h/v timings + flags + type + a 32-byte fixed-width
+  name buffer at +36..+68). Each modes_ptr entry in a populated
+  drm_mode_get_connector is one of these.
+- **Connection-status enum**: `DRM_MODE_CONNECTED = 1`,
+  `DRM_MODE_DISCONNECTED = 2`, `DRM_MODE_UNKNOWNCONNECTION = 3`.
+- **Connector-type enum**: 12 values covering modern desktop +
+  laptop hardware — `Unknown` (0), `VGA` (1), `DVII` (2), `DVID`
+  (3), `DVIA` (4), `DisplayPort` (10), `HDMIA` (11), `HDMIB` (12),
+  `eDP` (14), `VIRTUAL` (15), `DSI` (16), `USB` (20). Obscure
+  pre-2010 types (TV / Composite / 9PinDIN) deferred until a
+  consumer asks.
+- **`native_drm_mode_get_connector(fd, req)`** — low-level ioctl
+  wrapper. Caller manages the two-call zeroing pattern.
+
+The higher-level "discover every connector" driver is deferred to
+7.1(c), where it composes naturally with encoder discovery + the
+topology summary fn.
+
+### Changed — 2026-04-30 (Phase D test split)
+
+`tests/tcyr/mabda_v3.tcyr` was approaching cyrlint's 128 KiB
+read-buffer cap (the bug surfaced during 7.1(a) close — see
+session 26 notes). Split out Phase D tests into a new file
+**`tests/tcyr/mabda_v3_phase_d.tcyr`** (9.5 KB, 100 asserts across
+9 tests). The boundary is clean: every test in the new file
+exercises `src/backend_native_kms.cyr` exclusively. `make test`
+runs it after `mabda_v3.tcyr`. As 7.x grows (per-connector
+enumeration in 7.1(c), modeset in 7.2, framebuffer in 7.3,
+page-flip in 7.4, etc.) new Phase D tests land in this file and
+keep `mabda_v3.tcyr` under the cap.
+
+`mabda_v3.tcyr` shrank 134 KB → 126 KB (8 KB headroom). Total
+asserts unchanged: 836 v3 + 100 phase_d = 936, was 887 at 7.1(a)
+close (+49 from 7.1(b)'s 4 new tests).
+
+### Added — 2026-04-30 (Step 7.1(c) — Phase D discovery HW-verified)
+
+Closes Phase D discovery: encoder ioctl + struct, three name-lookup
+helpers, the `native_kms_summary` topology printer, and a runnable
+`programs/native_kms_summary.cyr` diagnostic that **was verified
+live on Cezanne** to print the real DRM/KMS topology of the
+machine.
+
+- **`drm_mode_get_encoder`** struct shape (20 bytes; 5 fields:
+  encoder_id / encoder_type / crtc_id / possible_crtcs /
+  possible_clones).
+- **`DRM_MODE_ENCODER_*`** enum (9 values: NONE / DAC / TMDS /
+  LVDS / TVDAC / Virtual / DSI / DPMST / DPI). DAC + TMDS + LVDS
+  cover legacy / desktop / laptop; Virtual / DSI / DPMST / DPI
+  cover modern ARM + DP-MST setups.
+- **`native_drm_mode_get_encoder(fd, req)`** — low-level ioctl
+  wrapper. Caller sets encoder_id at +0 before calling.
+- **Three name-lookup helpers** returning cstr labels:
+  `native_drm_connector_type_name(t)` → "DP" / "HDMI-A" / "eDP" / "?",
+  `native_drm_encoder_type_name(t)` → "TMDS" / "DP-MST" / "DAC" / "?",
+  `native_drm_connection_status_name(c)` → "connected" / "disconnected" / "unknown" / "?".
+  Inline if/elif chains rather than data tables — keeps the
+  module pure-Cyrius (no string-table runtime), and the fallback
+  "?" surfaces any new kernel value visibly.
+- **`native_kms_summary(state)`** — walks the connector + encoder
+  ID arrays from a populated KmsState and prints one line per
+  resource to stdout. Output shape:
+  ```
+    conn 110 HDMI-A-1 connected enc 109
+    enc 109 TMDS crtc 87 poss 0x0000000F
+  ```
+  Returns 0 on full success, negative errno on the first ioctl
+  that fails; partial output prints up to the failure point —
+  useful when debugging which connector is misbehaving.
+- **`programs/native_kms_summary.cyr`** — runnable diagnostic
+  with a `card0..card9` scan so DRM node renumbering doesn't
+  matter (Cezanne lands at `card1` on this box; other systems
+  may use `card0`). Opens the first available card-node, calls
+  `native_kms_init` for the GetResources discovery, then
+  `native_kms_summary` for per-resource enumeration. 4 named
+  exit codes (0–3) for unattended runs.
+
+**HW verification (Cezanne, 2026-04-30):** ran cleanly on the dev
+box. Discovered 4 connectors (1 HDMI-A-1 connected to CRTC 87 +
+3 DP disconnected) and 8 encoders (4 TMDS + 4 DP-MST; all with
+possible_crtcs = 0x0000000F = all 4 CRTCs usable). Framebuffer
+extent: up to 16384×16384. Real-world output matches the documented
+shape exactly. Phase D discovery is now end-to-end HW-validated —
+no longer "structurally tested but unrun."
+
+6 new CPU tests, 31 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+encoder field offsets (6), encoder-type enum (9), connector + encoder
++ connection name-lookup spot-checks via first-byte comparison (5
++ 5 + 4), summary null-safe (2). The HW path itself is exercised
+via `make test-native-kms-summary`.
+
+### Added — 2026-04-30 (Step 7.2(a) — per-connector mode enum + preferred picker)
+
+Foundation for Phase D mode-set: walk a connector's `modes_ptr`
+array, pick the EDID-preferred mode, expose dimensions + refresh.
+HW-verified on Cezanne — the diagnostic now reports
+`2560x1440@59Hz preferred` for the active monitor.
+
+- **`native_kms_get_connector_modes(fd, conn_id, count_out)`** —
+  two-call wrapper (count → fill) returning a heap
+  `drm_mode_modeinfo[count]` array. Pass-1 reads only count_modes;
+  pass-2 alloc'd to that count and refills. Returns 0 on failure
+  or when count_modes==0 (typical for disconnected connectors).
+  Connection-status filtering is the caller's responsibility.
+- **`DRM_MODE_TYPE_*`** enum: `BUILTIN = 0x01` (deprecated),
+  `PREFERRED = 0x08` (load-bearing — EDID's preferred mode hint),
+  `USERDEF = 0x20`, `DRIVER = 0x40` (typical modern flag). A
+  modern monitor's PREFERRED-flagged mode is typed
+  `DRIVER | PREFERRED = 0x48`.
+- **`native_kms_pick_preferred_mode(modes_ptr, count)`** — returns
+  index of the first mode with the PREFERRED bit set, falls back
+  to 0 when no mode is flagged. Matches radv's
+  `radv_get_preferred_mode` shape.
+- **Five mode accessors**: `native_kms_mode_hdisplay/_vdisplay/
+  _vrefresh/_type/_refresh_hz`. The last is the load-bearing one —
+  computes refresh as `(clock × 1000) / (htotal × vtotal)` because
+  the kernel-reported `vrefresh` field is unreliable on modern
+  kernels (libdrm derives it the same way; the raw `_vrefresh`
+  accessor is exposed only for debugging the kernel's value).
+- **Diagnostic extended.** `programs/native_kms_summary.cyr` now
+  walks each CONNECTED connector, fetches its modes array, picks
+  the preferred index, and prints
+  `conn 110: 2560x1440@59Hz preferred (42 mode total)`. The
+  hardware run on Cezanne verified the full path end-to-end.
+
+7 new CPU tests, 22 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+DRM_MODE_TYPE_* constants, null-safety on the modes wrapper +
+picker, picks-first-preferred (synthetic 3-mode array with two
+preferred), falls-back-to-0 (no preferred), all 5 mode accessors,
+refresh_hz computed against canonical 1080p60 timing
+(clock=148500, htotal=2200, vtotal=1125 → exactly 60 Hz).
+
+### Added — 2026-04-30 (Step 7.3 — KMS framebuffer primitives)
+
+The kernel-side handle that turns a GEM BO into something a
+DRM/KMS CRTC can scan out. Without this, 7.2(b)'s SETCRTC has
+nothing to display.
+
+- **`DRM_IOCTL_MODE_ADDFB2`** (= `0xC06464B8`) + **`RMFB`**
+  (= `0xC00464AF`) ioctl numbers, derived from first principles
+  in CPU tests so transcription drift surfaces immediately.
+- **`drm_mode_fb_cmd2`** struct shape (100 bytes): fb_id (u32 OUT)
+  + width/height/format/flags + 4-plane arrays for handles
+  (u32×4), pitches (u32×4), offsets (u32×4), modifiers (u64×4).
+  AddFB2 supports up to 4 planes for YUV; single-plane RGB scanout
+  uses planes[0] only.
+- **Four `DRM_FORMAT_*` fourcc constants**: `XRGB8888` (0x34325258),
+  `ARGB8888` (0x34325241), `XBGR8888` (0x34324258),
+  `ABGR8888` (0x34324241). The wgpu ↔ DRM byte-order mapping is
+  documented inline:
+  - wgpu `RGBA8_UNORM` (memory: R G B A) ↔ DRM `ABGR8888`
+  - wgpu `BGRA8_UNORM` (memory: B G R A) ↔ DRM `ARGB8888`
+  v3 Phase D scans out from RGBA8 BOs (matches the render path's
+  RT format), so `ABGR8888` is the working format. `XRGB`/`XBGR`
+  are exposed for opaque scanout where alpha is don't-care.
+- **`DRM_FORMAT_MOD_LINEAR`** (0) — explicit linear-tiling
+  modifier for clarity at call sites. Tiled scanout (DCC, swizzle)
+  is post-v3.0 perf work.
+- **Low-level wrappers**: `native_drm_mode_add_fb2(fd, req)` and
+  `native_drm_mode_rm_fb(fd, fb_id_ptr)`.
+- **High-level helpers**:
+  `native_kms_add_fb_xrgb8888(fd, bo_handle, w, h, pitch)` returns
+  the FB ID on success (always > 0), 0 on failure.
+  `native_kms_rm_fb(fd, fb_id)` releases. Both null-safe.
+
+The actual ADDFB2 ioctl is not exercised on HW yet — properly
+exercising it needs the BO + master-fd + render-fd cross-namespace
+plumbing (KMS lives on master / `card0`, GEM allocator typically
+on render / `renderD128`) that 7.2(b)'s end-to-end modeset path
+composes naturally. Structural primitives are fully CPU-tested
+so when 7.2(b) lands the helpers are HW-ready.
+
+5 new CPU tests, 34 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl numbers re-derived, drm_mode_fb_cmd2 field offsets +
+4-plane sub-array consistency (handles[4] ends where pitches
+starts, etc.), fourcc constants derived from ASCII byte values,
+null-safety on both high-level fns.
+
+### Added — 2026-04-30 (Step 7.2(b) — SETCRTC primitive)
+
+The ioctl that actually flips a display: binds `(CRTC,
+framebuffer, mode, connector list)` in one atomic kernel call.
+Disabling a CRTC is the same ioctl with fb_id=0 + mode_valid=0
++ count_connectors=0 — the kernel reads that combination as
+"stop scanning out from this CRTC."
+
+- **`DRM_IOCTL_MODE_SETCRTC`** (= `0xC06864A2`) ioctl number,
+  re-derived from first principles in CPU tests.
+- **`drm_mode_crtc`** struct shape (104 bytes): connector ptr +
+  count, CRTC ID, FB ID, scan-out (x, y), gamma_size,
+  mode_valid flag, embedded `drm_mode_modeinfo` at +36. The
+  embedded modeinfo end-aligns to the struct boundary exactly
+  (36 + 68 = 104) — pinned in tests so any struct drift between
+  modeinfo and SETCRTC layouts surfaces immediately.
+- **Low-level** `native_drm_mode_set_crtc(fd, req)` wrapper —
+  caller fills the 104-byte request directly.
+- **High-level** `native_kms_set_crtc(fd, crtc_id, fb_id,
+  conn_ids_ptr, conn_count, mode_ptr)` builds the request
+  inline. Memcpy's the 68-byte modeinfo from the caller's
+  pointer — typical input is the result of
+  `native_kms_get_connector_modes` + `native_kms_pick_preferred_mode`
+  followed by an offset into the modes array.
+- **Convenience** `native_kms_disable_crtc(fd, crtc_id)` issues
+  the same ioctl with all "active" fields zeroed. Useful for
+  clean teardown after present, and as a CRTC-accessibility
+  probe.
+
+Documented inline:
+
+- **Permission**: SETCRTC requires DRM master. On a running
+  desktop the compositor (Hyprland / GNOME / KDE) holds master,
+  so this ioctl returns EACCES from a non-master client. Need
+  a vt-switch to a tty (which drops the previous master) or
+  explicit `DRM_IOCTL_SET_MASTER` after the compositor releases.
+- **Cross-fd**: `fb_id` only resolves on the fd where it was
+  created. BO + AddFB2 + SETCRTC must all be reachable through
+  one master fd. The PRIME bridge (next bite) is what lets a
+  render-fd BO become a master-fd FB.
+
+No HW exercise yet — saved for the end-to-end modeset bite
+(7.2(c)) where we have BO → FB → SETCRTC composed end-to-end.
+
+4 new CPU tests, 21 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl number derivation, drm_mode_crtc field offsets including
+the embedded-modeinfo end-aligns-to-size sanity check,
+null-safety on both helpers covering all 6 invalid-arg cases for
+`set_crtc` plus 2 for `disable_crtc`.
+
+### Added — 2026-04-30 (Step 7.2(c) — PRIME cross-fd BO bridge + AddFB2 HW-verified)
+
+The DRM PRIME ioctl pair that bridges a GEM BO from the render
+node's handle namespace into the master fd's, so a BO allocated
+via the render fd can be wrapped by AddFB2 on the master fd.
+**The end-to-end chain validated live on Cezanne in this bite.**
+
+- **`DRM_IOCTL_PRIME_HANDLE_TO_FD`** (= `0xC00C642D`) — converts
+  a render-fd handle to a kernel-level dmabuf fd.
+- **`DRM_IOCTL_PRIME_FD_TO_HANDLE`** (= `0xC00C642E`) — converts a
+  dmabuf fd to a master-fd handle (different from the render-fd
+  handle; the two refcount the same underlying memory but each
+  is closed independently).
+- **`drm_prime_handle`** struct shape (12 B; handle / flags / fd).
+  Same struct used for both directions — only which fields are
+  IN vs OUT swap.
+- **`DRM_CLOEXEC` (0x80000) + `DRM_RDWR` (0x2)** flag constants
+  for HANDLE_TO_FD. CLOEXEC is mandatory in practice (otherwise
+  fork+exec leaks the handle); RDWR is needed for KMS scanout
+  BOs which the kernel writes to.
+- **Low-level wrappers**: `native_drm_prime_handle_to_fd`,
+  `native_drm_prime_fd_to_handle`.
+- **High-level**: `native_kms_import_bo(card_fd, render_fd,
+  render_handle)` — runs both ioctls + closes the transient
+  dmabuf fd, returns the new card-fd handle (0 on failure).
+  Caller is responsible for closing both handles when done
+  (each fd has its own).
+
+**Live HW verification on Cezanne (2026-04-30):**
+`programs/native_kms_summary.cyr` was extended with an FB smoke
+section that allocates a 256×256 GTT BO on `/dev/dri/renderD128`,
+imports it onto the master `card1` fd via the PRIME bridge,
+calls `native_kms_add_fb_xrgb8888`, prints the FB ID, then
+cleans up. Real output:
+
+```
+fb smoke (render -> PRIME -> master AddFB2):
+  render bo=1 card_handle=1 fb_id=145 PASS
+```
+
+This single live run validates the entire 7.3 + 7.2(c)
+structural chain — AddFB2 was previously only CPU-tested.
+
+4 new CPU tests, 13 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+ioctl numbers re-derived, drm_prime_handle field offsets, flag
+constants, null-safety on the high-level bridge across all 3
+invalid-arg cases.
+
+### Added — 2026-04-30 (Step 7.2(d) — end-to-end modeset driver)
+
+Composes everything from 7.1 + 7.2(a/b/c) + 7.3 into one call.
+Plus a runnable smoke program that fills the resulting framebuffer
+with solid red and sleeps 3 seconds — when run from a tty, the
+screen visibly flips. Verified live on Cezanne up through the
+SETCRTC permission gate.
+
+- **`NativeKmsScanout`** struct (40 B): conn_id / crtc_id / fb_id
+  / card_handle / render_handle / width / mapped_addr (u64) /
+  height / bo_size. Every resource the caller needs to track for
+  clean teardown lives in this one struct.
+- **`native_kms_modeset_first_connected(card_fd, render_fd, state,
+  out)`** — the load-bearing driver. Walks state's connector IDs,
+  finds the first `DRM_MODE_CONNECTED` one, fetches its encoder,
+  picks a CRTC from `possible_crtcs` (lowest set bit → index into
+  `state.crtc_ids`), fetches the connector's modes array, picks
+  the `DRM_MODE_TYPE_PREFERRED` one, allocates a render-fd BO
+  sized to the mode at 256-byte pitch alignment, PRIME-imports to
+  the card-fd handle namespace via `native_kms_import_bo`, AddFB2
+  via `native_kms_add_fb_xrgb8888`, then SETCRTC via
+  `native_kms_set_crtc`. Returns 0 on success; on failure returns
+  one of 11 named negative rcs that map to specific failure
+  steps — diagnostic value for unattended runs and for filing
+  bug reports against specific kernels.
+- **`native_kms_release_scanout(card_fd, render_fd, scanout)`** —
+  teardown. Issues `disable_crtc` + `rm_fb` + 2 × `gem_close` +
+  `bo_release_gtt` + zeroes the scanout struct. Idempotent on
+  zero — every conditional skips its release call when the
+  field is 0. Safe to call after a partial modeset failure.
+- **`native_kms_lowest_set_bit(mask)`** — pure-Cyrius helper that
+  returns 0..31 for the lowest set bit, -1 if no bit is set.
+  Used by the modeset driver to pick a CRTC from
+  `possible_crtcs`; exposed because it's tiny and callers
+  building their own modeset paths will want it.
+- **`programs/native_kms_modeset_smoke.cyr`** — runnable smoke.
+  Opens `cardN` master fd + `renderD128`, runs discovery, calls
+  the modeset driver, fills the BO with solid red (XRGB8888 LE
+  pixel = `0x00FF0000`), sleeps 3 seconds via
+  `clock_nanosleep(2)` (CLOCK_MONOTONIC, relative), tears down.
+  Documented exit codes 0–4 + sub-rc decoding for code 4 (all 11
+  modeset failure step codes).
+
+**Verified live on Cezanne (2026-04-30, from a desktop session):**
+
+```
+mabda native modeset smoke (v3 Step 7.2(d))
+opened card_fd=3
+opened render_fd=4
+discovered 4 connectors, 4 crtcs
+FAIL: modeset rc=-11 (EACCES likely — not master; run from a tty)
+```
+
+This is the **expected** result from inside a Hyprland session —
+the driver walks the entire pipeline (discovery → mode-pick →
+encoder fetch → CRTC pick → BO alloc → PRIME bridge → AddFB2)
+and only fails at the SETCRTC permission boundary. Running from
+a tty (Ctrl-Alt-F2 drops Hyprland's master and systemd-logind
+hands master to whoever's on the new vt) is the documented path
+to the actual visible flip.
+
+4 new CPU tests, 22 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+`lowest_set_bit` edge cases (bit 0, bit 1, mixed, high bit, zero
+sentinel), NativeKmsScanout field offsets (10 fields), modeset
+driver null-safety across all 4 invalid-arg cases, release
+idempotent on zero scanout.
+
+### Added — 2026-04-30 (Step 7.2(d.1) + 7.4 — master ioctls + page-flip)
+
+Two complementary additions: explicit DRM master acquisition (so
+the modeset smoke gives clean diagnostics on which step is
+gated by perms) and the page-flip primitive that v3.0 surface
+present is built on.
+
+**Step 7.2(d.1) — DRM master acquisition:**
+
+- **`DRM_IOCTL_SET_MASTER`** (`0x641E`) and **`DROP_MASTER`**
+  (`0x641F`) — no-payload ioctls (dir=0, size=0).
+- **`native_drm_set_master(fd)`** treats `-EINVAL` (already
+  master) as success, otherwise returns the kernel errno.
+- **`native_drm_drop_master(fd)`** for clean release after the
+  smoke completes.
+- The modeset smoke now calls SET_MASTER explicitly and prints a
+  distinct diagnostic (rc + errno + actionable hint) instead of
+  guessing at SETCRTC's `-EACCES`. On the dev box this surfaces
+  `SET_MASTER: rc=-13 (errno=13)` immediately, with hints
+  pointing at the logind / no-compositor / vkms workarounds.
+
+**Step 7.4 — page-flip + event read:**
+
+- **`DRM_IOCTL_MODE_PAGE_FLIP`** (`0xC01864B0`) ioctl number,
+  `drm_mode_crtc_page_flip` struct (24 B; crtc_id / fb_id /
+  flags / reserved / user_data).
+- **`DRM_MODE_PAGE_FLIP_EVENT`** (0x01) + **`_ASYNC`** (0x02)
+  flag constants. EVENT mode queues a vblank event the caller
+  reads back; ASYNC mode flips immediately (tearing).
+- **Low-level** `native_drm_mode_page_flip(fd, req)` +
+  **high-level** `native_kms_page_flip(fd, crtc_id, fb_id,
+  flags, user_data)` — null-safe on every ptr arg.
+- **Event-read path**: `drm_event` header (8 B; type + length),
+  `drm_event_vblank` payload (32 B total; user_data, tv_sec,
+  tv_usec, sequence, crtc_id). `DRM_EVENT_VBLANK` (0x01) +
+  `_FLIP_COMPLETE` (0x02) type constants. **`native_drm_read_event(fd,
+  buf, n)`** wraps `read(2)` (SYS_READ=0). Five inline accessors
+  (`drm_event_type`, `_length`, `drm_event_vblank_user_data`,
+  `_sequence`, `_crtc_id`) keep call sites readable.
+
+Together these unlock vsync-paced double-buffered present:
+flip with EVENT flag set, fd becomes readable, draining one
+`drm_event_vblank` per flip lets the present loop know when
+the buffer-swap actually hit screen.
+
+### Documented — 2026-04-30 (Phase D logind master blocker)
+
+`programs/native_kms_modeset_smoke.cyr` was run with `sudo`
+from the dev session and from a tty. Both returned
+`SET_MASTER: rc=-13 (EACCES)` followed by `modeset rc=-11`.
+Root cause: modern systemd-logind retains DRM master in the
+running compositor's session even after vt-switch + sudo.
+Confirmed pre-existing-but-undocumented constraint; saved as
+project memory `project_phase_d_master_logind_blocker.md` with
+three workarounds for HW testing (vkms, no-compositor session,
+stop display-manager). Treated as **deferred to v3.x logind
+integration design** (Step 7.7); doesn't block Phase D
+primitive development. The mabda smoke walks the entire
+pipeline correctly through `AddFB2` — only `SETCRTC` is
+gated.
+
+7 new CPU tests, 32 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+master ioctl numbers, page-flip ioctl + struct + flags +
+null-safety, event-struct shapes + round-trip accessors, read
+null-safety.
+
+### Added — 2026-04-30 (Step 7.4(b) — present primitive + reusable FB alloc)
+
+`NativeKmsFb` struct (32 B) bundles a framebuffer with its
+backing BO + both fd handles. `native_kms_alloc_fb(card_fd,
+render_fd, w, h, out)` extracts the BO + PRIME + AddFB2
+sequence from `native_kms_modeset_first_connected` into a
+reusable helper — same step-code error convention as the
+modeset driver. `native_kms_release_fb` is the matching
+teardown.
+
+The load-bearing primitive: **`native_kms_present(card_fd,
+scanout, new_fb_id, sequence_out)`** issues `page_flip` with
+the EVENT flag, blocks on `read_event` for the matching
+`drm_event_vblank`, validates the type is `FLIP_COMPLETE`,
+updates `scanout.fb_id` to the new value, and writes the
+kernel's vblank sequence to `*sequence_out` (if non-null).
+Step codes -1 invalid args, -2 short read, -3 wrong event
+type, plus propagated kernel errnos.
+
+Designed for the simplest single-flip + blocking-read shape.
+A real present loop would either (a) use a non-blocking read
+with poll/epoll, or (b) batch multiple events; v3.0 keeps
+this simple and consumers needing more sophisticated handling
+can call `native_kms_page_flip` + `native_drm_read_event`
+directly.
+
+The double-buffered render pattern becomes:
+
+```
+alloc_fb(w, h, &fb_b)
+fill fb_b.mapped_addr with frame N
+present(scanout, fb_b.fb_id, &seq)
+fill scanout.fb_id (now back-buffer) with frame N+1
+present(scanout, scanout_old_fb_a.fb_id, &seq)
+... repeat
+```
+
+No HW exercise yet — same logind master gate as 7.2(d) / 7.4.
+
+4 new CPU tests, 19 asserts in
+`tests/tcyr/mabda_v3_phase_d.tcyr`: FB struct field offsets,
+alloc + release null-safety, present null-safety covering
+fd / scanout / new_fb / no-crtc.
+
+### Added — 2026-04-30 (Step 7.5 — Backend interface surface slot layout)
+
+Code-only extension to `src/backend.cyr`, mirroring the 5.4 /
+6.8(a) pattern: declare slot offsets + bump struct size +
+expose range markers, defer the implementation wrappers to the
+following step.
+
+- **4 new slot offsets**: `BACKEND_SLOT_SURFACE_CONFIGURE`
+  (176), `_ACQUIRE` (184), `_PRESENT` (192), `_RELEASE` (200).
+- **`BACKEND_SIZE`** bumped 176 → 208.
+- **`BACKEND_SURFACE_SLOTS_BEGIN/END`** = 176 / 208 range markers.
+- **Slot signatures documented inline** in the source:
+  - `surface_configure(ctx, w, h) → surface_ptr` — sets up the
+    surface (wgpu: `wgpu_surface_configure`; native: opens
+    card+render fds + runs full modeset + allocs 2 FBs).
+  - `surface_acquire(ctx, surface) → fb_ptr` — returns the
+    back-buffer the consumer renders into (wgpu: texture view;
+    native: the `NativeKmsFb` not currently scanning).
+  - `surface_present(ctx, surface) → 0|err` — submits the
+    back-buffer for display + swaps front/back.
+  - `surface_release(ctx, surface) → 0` — backend-owned
+    cleanup. Consumer-owned window/fd lifecycle stays the
+    consumer's call (master-fd release in particular needs
+    7.7's design to settle).
+- **`backend_is_complete` defers** the v3 surface range walk
+  until 7.6 lands the real wrappers — same pattern as 6.8(a).
+  Adding the range walk now would falsely report all backends
+  incomplete.
+
+10 new layout asserts in `tests/tcyr/mabda_v3.tcyr` cover every
+new constant (4 slot offsets + 2 range markers + total size +
+3 sanity arithmetic checks).
+
+The proposal-doc revision (`docs/proposals/v3-backend-interface.md`)
+is *intentionally* deferred — the load-bearing architectural
+question (TTY-only model vs logind-aware compositor delegation)
+is part of the 7.7 public-API design and writing the proposal
+now would lock in choices that 7.7 will need to revisit.
+
+### Added — 2026-04-30 (Step 7.6 — surface slot stubs, both backends)
+
+Both `backend_wgpu_new` and `backend_native_new` now install all
+25 slots — the v3 surface range (4 slots × 8 = 32 bytes) is
+filled with stub fns that return 0 or `GPU_ERR_OTHER`.
+`backend_is_complete` extended to walk the v3 range; both
+backends pass.
+
+- **`_backend_wgpu_surface_{configure,acquire,present,release}`**
+  — stubs in `src/backend_wgpu.cyr`. Documented inline that
+  wgpu consumers needing real surface support should use the
+  v2 `src/surface.cyr` `surface_state_*` API directly until 7.7
+  lands the consumer-side window-handle protocol.
+- **`_backend_native_surface_{configure,acquire,present,release}`**
+  — stubs in `src/backend_native.cyr`. Documented inline that
+  the master-fd-vs-render-fd story (and the logind delegation
+  question) settles in 7.7.
+
+The stubs are intentional — both backends have an unresolved
+consumer-side protocol question that 7.7 resolves alongside
+the public API design. Wiring stubs now keeps the abstraction
+layer "structurally complete" (every slot non-null) without
+locking in either consumer protocol.
+
+10 new layout asserts in `tests/tcyr/mabda_v3.tcyr`:
+- `test_backend_is_complete_detects_missing_slot` extended to
+  walk v3 (the "v0+v1+v2 alone is no longer complete" pattern,
+  matching the 6.8(b) → 6.8(c) staging).
+- `test_backend_wgpu_new_is_complete` + `_native_new_is_complete`
+  each check all 4 v3 slots are filled.
+
+### Added — 2026-04-30 (Step 7.7 — Phase D public API + e2e program)
+
+Closes Phase D code-completion. The full chain from window
+handle (or DRM master fd) to scanned-out frame goes through one
+public API surface, with both backends fully wired.
+
+**GpuContext extension (96 → 112 bytes)** — added two
+consumer-stash fields per the v3-surface-api-design proposal:
+`wgpu_surface_handle` at +96 (set by
+`gpu_surface_configure_wgpu`) and `native_card_fd` at +104
+(set by `gpu_surface_configure_native_kiosk`). Accessor pairs
+`gpu_ctx_*_handle` / `gpu_ctx_set_*_handle` /
+`gpu_ctx_native_card_fd` / `gpu_ctx_set_native_card_fd` exposed
+in `src/context.cyr`. Single greppable migration: every
+`alloc(96)` site bumped to `alloc(112)` (3 src + 38 test
+sites).
+
+**`src/surface_v3.cyr`** — new module. Six public dispatchers:
+
+```
+gpu_surface_configure_wgpu(ctx, wgpu_surface, w, h)        → surface_ptr
+gpu_surface_configure_native_kiosk(ctx, card_fd, w, h)     → surface_ptr
+gpu_surface_configure_native_logind(ctx, w, h)             → 0  (v3.0 stub)
+
+gpu_surface_acquire(ctx, surface)  → fb_ptr
+gpu_surface_present(ctx, surface)  → 0|err
+gpu_surface_release(ctx, surface)  → 0
+```
+
+The three configure entries stash backend-specific resources
+(`WGPUSurface` handle / DRM master `card_fd`) on `GpuContext`
+via the new accessors, then dispatch through the slot table —
+slot signature `(ctx, w, h)` stays stable from 7.5. The three
+per-frame ops route directly through the slot table.
+
+**Wgpu wrappers (real impls, replacing 7.6 stubs).** Thin
+delegates over the existing v2 `src/surface.cyr`
+`surface_state_*` lifecycle. Configure reads `wgpu_surface`
+from ctx, calls `surface_state_new` with default RGBA8_UNORM
++ vsync. Acquire unwraps the `Result` returned by
+`surface_state_acquire`. Present + release passthrough.
+
+**Native wrappers (real impls).** Introduce a 120-byte
+`NativeSurface` struct (`card_fd` + `render_fd` + `state` ptr
++ inline 40-byte scanout + inline 32-byte fb_b + `front_is_b`
+flag + dimensions + pitch). Configure runs the full pipeline:
+`native_kms_init` → `native_kms_modeset_first_connected` →
+`native_kms_alloc_fb` for the second buffer. Acquire returns
+the back-buffer pointer (toggle on `front_is_b`). Present
+calls `native_kms_present` then toggles. Release tears down
+all three (fb_b + scanout + state).
+
+**`programs/native_present_e2e.cyr`** (~190 lines). Runs the
+public API end-to-end: opens card_fd, takes DRM master,
+configures the surface, then a 120-frame loop fills the
+back-buffer with a vertically-scrolling blue-red gradient
+(0x00RRGGBB pixels into the BO's `mapped_addr`, pitch-aware).
+Verified live on the dev box up through `SET_MASTER` — returns
+EACCES because Hyprland holds master, same gate as
+`native_kms_modeset_smoke`. Pipeline is structurally correct;
+visible flip needs a tty + stopped compositor, OR the
+v3.x `samvada` package landing.
+
+**Bump-allocator note.** Stack-local `var ctx[112]` for the
+new tests (heap-allocated tests at this point in the file
+exhaust the bump allocator). Pattern carries forward — any
+new tests in `mabda_v3_phase_d.tcyr` that need a ctx should
+use stack-local arrays.
+
+8 new CPU tests, 38 asserts in `tests/tcyr/mabda_v3_phase_d.tcyr`:
+extended ctx size pin, both consumer-stash accessor
+round-trips, `NativeSurface` field offsets + inline-struct
+alignment, null-safety on all 6 public dispatchers, v3.0
+logind-stub pin (catches an accidental non-zero return).
+
+### Metrics — 2026-04-30 (post Step 7.7)
+
+- Module count: **35** (was 34; `surface_v3.cyr` is new).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 856 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **335 assertions** (was
+  297 at 7.6 close; +38 from 7.7).
+- `src/context.cyr`: ~210 lines (was ~190; +20 for the
+  `GPU_CONTEXT_SIZE` constant + 4 new accessors + extended
+  layout docstring).
+- `src/surface_v3.cyr`: 145 lines (new).
+- `src/backend_wgpu.cyr`: ~615 lines (was ~590; +25 for real
+  surface impls).
+- `src/backend_native.cyr`: ~2,870 lines (was ~2,720;
+  +150 for `NativeSurface` struct + 4 real surface impls).
+- `programs/native_present_e2e.cyr`: ~190 lines (new).
+- `dist/mabda.cyr`: regenerated (11417 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Next — 2026-04-30 (post Step 7.7)
+
+**Phase D code-complete.** Mabda v3.0's Tier 1 in-mabda code
+is done end-to-end except for WGSL lowering. Two paths forward,
+genuinely independent:
+
+1. **8.1 design spike — WGSL frontend choice.** The v3.0 ship-
+   blocker per the punchlist's "Hard truths." Doc-only bite:
+   compares WGSL parser vs SPIR-V loader vs Tint integration,
+   commits to one in a `docs/proposals/v3-wgsl-frontend-choice.md`.
+   Same pattern as 7.7's design spike. Implementation (8.2–8.10)
+   then follows over multiple sessions.
+2. **Tier 2 — `programs/diagnostics/radv_capture/`.** Headless
+   Vulkan capture program (C, separate codebase area). Unblocks
+   the Layer-2 byte-diff that 6.5 has been waiting on. Self-
+   contained, parallel to 8.x.
+
+Plus the long tail of Tier 4 doc updates (CLAUDE.md still
+describes v2.5.0) and Tier 5 release engineering (P(-1) audit,
+VERSION bump to 3.0.0, etc.). Those run in any order once
+Tier 1 closes.
+
+### Metrics — 2026-04-30 (post Step 7.6)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: **856 assertions** (was 846 at
+  7.5 close; +10 from 7.6 stub-wiring tests).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: 297 assertions (unchanged).
+- `src/backend.cyr`: ~170 lines (+5 for v3 range walk in
+  `is_complete`).
+- `src/backend_wgpu.cyr`: ~590 lines (was ~565; +25 for surface
+  stubs + builder wiring).
+- `src/backend_native.cyr`: ~2,720 lines (was ~2,690; +30 for
+  surface stubs + builder wiring).
+- `dist/mabda.cyr`: regenerated (11099 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Metrics — 2026-04-30 (post Step 7.5)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: **846 assertions** (was 836 at
+  7.2(b) close; +10 from 7.5 layout asserts).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: 297 assertions (unchanged).
+- `src/backend.cyr`: ~165 lines (was ~155; +10 lines for the
+  v3 slot offsets + range markers + signature docstring).
+- `dist/mabda.cyr`: regenerated (11008 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Metrics — 2026-04-30 (post Step 7.4(b))
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **297 assertions** (was 278
+  at 7.4 close; +19 from 7.4(b)).
+- `src/backend_native_kms.cyr`: ~1,500 lines (was ~1,330 at
+  7.4 close; +170 lines for FB alloc/release + present).
+- `dist/mabda.cyr`: regenerated (10964 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Metrics — 2026-04-30 (post Step 7.4)
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **278 assertions** (was 243
+  at 7.2(d); +3 from 7.2(d.1) master ioctls + +32 from 7.4).
+- `src/backend_native_kms.cyr`: ~1,330 lines (was ~1,180; +150
+  lines for master + page-flip + event-read primitives).
+- `programs/native_kms_modeset_smoke.cyr`: ~180 lines (was 150;
+  +30 lines for SET_MASTER diagnostics).
+- `dist/mabda.cyr`: regenerated (10794 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Metrics — 2026-04-30 (post Step 7.2(d))
+
+- Module count: 34 (unchanged).
+- `tests/tcyr/mabda.tcyr`: 624 assertions (unchanged).
+- `tests/tcyr/mabda_v3.tcyr`: 836 assertions (unchanged).
+- `tests/tcyr/mabda_v3_phase_d.tcyr`: **243 assertions** (was 221
+  at 7.2(c); +22 from 7.2(d)).
+- `src/backend_native_kms.cyr`: ~1,180 lines (was ~970 at 7.2(c);
+  +210 lines for the e2e driver + scanout struct + helpers).
+- `programs/native_kms_modeset_smoke.cyr`: ~150 lines (new).
+- `dist/mabda.cyr`: regenerated (10636 lines).
+- Toolchain pin: `cyrius = "5.7.36"` in `cyrius.cyml`.
+
+### Next — 2026-04-30 (post Step 7.2(d))
+
+**Phase D scaffolding code-complete (7.1–7.6).** Only 7.7
+remains — and it's the architecture-question step. Two
+sub-decisions to make:
+
+1. **wgpu consumer protocol.** How does the consumer pass a
+   `WGPUSurface` handle into the slot abstraction? Options:
+   side-channel `gpu_context_register_surface_wgpu(ctx, handle)`,
+   GpuContext layout extension, or a wider slot signature.
+2. **native master-fd protocol.** TTY/kiosk model (caller
+   opens + holds master) vs logind-aware delegation via dbus
+   TakeDevice. The latter is the proper production path but is
+   significant work; v3.0 might commit to TTY/kiosk and
+   document logind as a v3.x extension.
+
+Once those are decided, 7.7 ships:
+- Public `gpu_surface_*` dispatchers in a new `src/surface_v3.cyr`
+  (or extension to existing `src/surface.cyr`).
+- Real slot wrappers replacing the stubs.
+- `programs/native_present_e2e.cyr` — clear-render-present-hold
+  smoke that visibly flips the screen (in a setting where
+  master is acquirable).
+
+**Phase C render HW-gated items still pending:**
+
+- Run `make test-native-render-e2e` on Cezanne. Failure A → 6.10
+  composer splice, Failure B → Layer-2 IB diff, Failure C → audit
+  6.5(a) registers.
+- Layer-2 byte-diff vs radv (Hyprland or headless capture program).
+
+**WGSL → GFX9 ISA lowering (8.x)** remains the v3.0 ship-blocker.
+Worth a sober design spike before the next major bite.
+
+Full handoff (Step 6.5 close-out + 6.6 sequencing):
+[`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).
+
+### Verified — 2026-04-27/28 (B.4 store shader live-verified on Cezanne)
+
+- `programs/native_compute_store.cyr` lands `0xDEADBEEF` in `out[0]`
+  from a pure-Cyrius compute dispatch on AMD Cezanne (gfx90c, kernel
+  6.18.24-1-lts, MEC fw `0x1e2`). Submit-to-syncobj signal is **0 ms**
+  (not the 10 s TDR shape). The post-dispatch `0xC0FFEE12` `WRITE_DATA`
+  marker confirms the CP returned cleanly from `DISPATCH_DIRECT`. The
+  cl_probe canary stays green afterward. **All three B.4 calibration
+  gates from the Session 24 handoff are now met**, reversing the
+  Session 9 retraction.
+- The Session 25b investigation found six independent bugs that had to
+  be fixed for the Cyrius native compute path to match the working
+  C spike byte for byte. Full diff in
+  `docs/handoff/2026-04-28-session25-b4-verified.md`. Summary:
+  - `src/backend_native.cyr::native_pm4_nop` — count_minus_1 off-by-one;
+    `pad_dwords` was passed directly to `native_pm4_pkt3_header` (which
+    subtracts 1 internally), so the on-wire header claimed one extra
+    body dword. CP read past the IB end and either hung or processed
+    garbage. Fix: pass `pad_dwords - 1`. Same convention bug class as
+    the `feedback_pm4_count_minus_1_naming` memory.
+  - `programs/native_compute_store.cyr` — `PGM_LO/HI` encoding. GFX9
+    reconstructs `addr = (PGM_HI << 40) | (PGM_LO << 8)`, so PGM_LO
+    must carry bits `[39:8]` (use `(va >> 8) & 0xFFFFFFFF`), not bits
+    `[31:0]` (`va & 0xFFFFFFFF`). The old encoding produced
+    `addr = 0x0000800000000000` for `shader_va = 0xFFFF800100000000` —
+    wrong VA, wave fails launch, queue TDRs. Same class as the
+    `feedback_cyrius_signed_div_high_va` memory; converted remaining
+    `va / 2^N` patterns to `>> N` shifts.
+  - `programs/native_compute_store.cyr` — stub VA moved from
+    `0x200000` (user-low) to `0xFFFF800100004000` (canonical-high).
+    Session 25b's post-dispatch marker test showed user-low writes
+    from the compute queue silently fail. USER_DATA_2/3 now encodes
+    the canonical-high stub VA as a 64-bit pointer split low/high.
+  - `programs/native_compute_store.cyr` — `TA_CS_BC_BASE_ADDR = 0`.
+    The Session 16 hypothesis that `BC_BASE` had to point at
+    `shader_va` (or Mesa's magic `0x01004400 / 0x80`) is falsified
+    by Session 25b's clean A/B: the only difference between the
+    failing 25 run and the passing 25b run is `BC_BASE = magic` vs
+    `BC_BASE = 0`.
+  - `src/backend_native.cyr` — added `native_cs_submit_4chunk` with
+    explicit `AMDGPU_CHUNK_ID_FENCE` (offset 32) plus
+    `IB flags = 0x08` (`AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE`).
+    Replaces the 3-chunk path that submitted cleanly but never
+    queued the IB to MEC (Session 9 false-positive shape).
+  - `programs/native_compute_store.cyr` — inline BO list with
+    `operation = list_handle = 0xFFFFFFFF` sentinels (Mesa rusticl
+    inline-residency path); replaces `BO_LIST_OP_CREATE`. All BOs
+    given full `R | W | X` page perms during bring-up — flagged for
+    re-tightening once a regression test catches the narrowing
+    failure mode.
+- Falsified hypotheses (cleared from the live tracking list):
+  - `BC_BASE = shader_va` is load-bearing (Session 16).
+  - `BC_BASE = 0x01004400 / 0x80` (Mesa magic VA) is load-bearing.
+  - Compute queues accept both VA halves (user-low + canonical-high).
+- What B.4 closing does **not** include: a `Backend.compute_dispatch`
+  abstraction, multi-dispatch submits, profiler integration, or the
+  other three integration shapes (`phase0`, `render_e2e`,
+  `render_graph_e2e`). These are still required by the v3.0 exit
+  criteria. Backend abstraction (ADR 006) is the natural next step.
+
+### Fixed — 2026-04-22/23 (B.3.d PM4 encoder bugs)
+
+- `src/backend_native.cyr::native_pm4_acquire_mem_full_invalidate` —
+  count argument `7 → 6`. The PKT3 header's word-count formula is
+  `(count - 1) & 0x3FFF`, and ACQUIRE_MEM on GFX9 has 6 data dwords
+  (coher_cntl, size_lo, size_hi, base_lo, base_hi, poll_interval).
+  Passing `count=7` made the header claim 7 payload dwords; the CP
+  consumed the following `SET_SH_REG` header as stray data, then
+  mis-parsed every subsequent packet in the IB. Resulting
+  `gfx_v9_0_bad_op_irq` + MODE2 reset looked like different failures
+  across Sessions 1–6 but was one-and-the-same desync. Mesa's
+  `AMD_DEBUG=ib` dump shows `0xC0055802`; we now match byte-exact.
+- `src/backend_native.cyr::native_pm4_dispatch_direct` — predicate
+  argument `0 → 2`. The low byte of IT_DISPATCH_DIRECT's PKT3 header
+  is `shader_type` (0 = graphics, 2 = compute), not a predicate bit.
+  Header now emits `0xC0031502`, matching Mesa.
+- `src/backend_native.cyr` — added `native_pm4_set_uconfig_reg_pair`
+  helper for paired register writes (TA_CS_BC_BASE_ADDR + _HI).
+- `programs/native_compute_spike.cyr` — rewrote PM4 emission to
+  mirror Mesa rusticl's exact preamble order (PGM_HI →
+  STATIC_THREAD_MGMT × 2 → UCONFIG preamble → PGM_LO → RSRC1/2 →
+  TMPRING_SIZE → USER_DATA_2/3 → USER_DATA_0 → ACQUIRE_MEM →
+  RESOURCE_LIMITS → NUM_THREAD → DISPATCH_DIRECT). Register values
+  aligned: `RESOURCE_LIMITS = 0x140` (was `0` — zero waves = silent
+  stall), `TMPRING_SIZE = 0x100` (was unset), `STATIC_THREAD_MGMT_SE1
+  /SE2/SE3 = 0` (Cezanne has 1 SE; writing 0xFFFFFFFF to absent-SE
+  mask registers is meaningless and diverges from Mesa).
+
+### Retracted — 2026-04-23 (Session 9): Phase B.3.d was a TDR false positive
+
+- **B.3.d is NOT closed.** The "dispatch completed (sync-obj signaled),
+  RC=0, dmesg silent" signature does not prove the CP ran our IB — it
+  only proves the kernel's Timeout Detection & Recovery (TDR) path
+  signalled our fence. Session 9 investigation added a CP-side
+  WRITE_DATA packet to the spike's PM4 stream targeting the stub BO's
+  VA. Post-submit CPU readback of the stub BO's first word returned
+  `0x00000000` (unchanged from creation's memset), not `0xCAFEBABE`
+  (the value WRITE_DATA would have written if the IB actually ran).
+- **Timing proof:** empty/NOP-only IB runs take exactly ~10 seconds —
+  AMDGPU's default TDR timeout — and return "success." Mesa's
+  `cl_probe` on the same hardware runs in ~77 milliseconds with
+  correct readback, confirming the GPU is healthy and Mesa's
+  submission path works.
+- **Location of actual blocker:** somewhere between "AMDGPU_CS ioctl
+  returns 0" and "CP executes our PM4." Candidates ranked (see Session
+  9 handoff): ring index / ip_instance, BO_HANDLES chunk vs BO_LIST
+  ioctl, CS/IB flags, context priority, accumulated TDR state.
+- **What stays valid:** Session 7 PM4 encoder fixes (ACQUIRE_MEM
+  count, DISPATCH_DIRECT shader_type) are real bugs that *would*
+  wedge the CP if submissions ever reached it. The store shader
+  bytes and byte-exact tests are correct. Only the "verified live"
+  claim is retracted.
+- **Full Session 9 handoff:**
+  `docs/handoff/2026-04-23-session9-tdr-false-positive.md`.
+
+### Added — testing
+
+- `tests/tcyr/mabda.tcyr::test_native_pm4_acquire_mem_layout` — byte-
+  exact header + payload assertion against the Mesa IB dump.
+- Updated `test_native_pm4_dispatch_direct_layout` and the PM4
+  composability test for the new `shader_type` byte.
+- Test count 602 → 610 (8 new assertions). All green under 5.6.13.
+
+### Methodology note
+
+The actually-valuable lesson: any direct-PM4 code should diff header
+bytes byte-exactly against `AMD_DEBUG=ib` output *before* being run
+live. Six sessions of theorizing about VMID/scratch/VA aperture were
+all downstream of a one-bit count-field bug that a five-minute diff
+would have caught. Captured as `feedback_pm4_verify_against_mesa_ib`
+in auto-memory and as a vidya field note.
+
+### Prepared — 2026-04-23 (B.4 store shader — built, not live-verified)
+
+- `src/backend_native.cyr::native_gfx9_shader_store_deadbeef` —
+  Session 6 diagnostic stub replaced with the real 6-instruction
+  store kernel (v_mov_b32 v0,s0; v_mov_b32 v1,s1; v_mov_b32 v2,
+  literal; global_store_dword v[0:1],v2,off glc slc; s_waitcnt
+  vmcnt(0) lgkmcnt(0); s_endpgm) + 16-dword NOP prefetch padding.
+  Bytes are byte-exact output of `clang -target amdgcn--amdhsa
+  -mcpu=gfx90c`. Function grew from 84 → 96 bytes.
+- `programs/native_compute_store.cyr` — full rewrite. PM4 preamble
+  is byte-identical to `programs/native_compute_spike.cyr` (the
+  Session 8 verified-working baseline) except for three store-
+  specific deltas: USER_DATA_0/1 carry the real output VA (spike
+  used Mesa's scratch-V# stub there); USER_DATA_2/3 kept at the
+  spike values (shader ignores s2/s3); BO list has 4 entries (shader
+  + stub + output + IB). All VAs canonical-high.
+- `tests/tcyr/mabda.tcyr::test_native_gfx9_shader_store_deadbeef_writes_bytes` —
+  new byte-exact assertion covering every dword of the store shader
+  + the NOP padding. Test count 610 → 621.
+- `build/native_compute_store` built under released 5.6.13. **Session
+  9 update: cannot be meaningfully verified until the CS-submission
+  blocker documented in the Session 9 handoff is fixed.** All iteration
+  attempts on the store program (tried both USER_SGPR=2 and =4;
+  canonical-high and low output VA; hardcoded-VA shader variant
+  bypassing USER_DATA) failed the same way because the CP never
+  actually executes our IB.
+
+### Changed — toolchain
+
+- `cyrius.cyml` pin `5.5.20 → 5.6.13`. The active toolchain on the
+  dev box was already running 5.6.x; the manifest was lagging. Pin
+  now matches the released 5.6 line (5.6.14 is in-dev, not shipped).
+- `dist/mabda.cyr` regenerated — picked up +274/-6 lines of latent
+  drift from v3 Phase A work (`src/render_graph.cyr` transient
+  aliasing planner, commit `211a47b`) that had never been re-
+  bundled. Not related to the pin bump; caught as a side-effect of
+  the bump-prompted regen.
+
+### Security — 2026-04-30 (P(-1) v3 audit + ship-blocker fixes)
+
+P(-1) security audit pass against the v3 delta — the new dual-backend
+abstraction (`backend.cyr`, `backend_wgpu.cyr`, `backend_native.cyr`,
+`backend_native_kms.cyr`), the public surface API (`surface_v3.cyr`),
+and the `GpuContext` 96 → 112-byte growth in `context.cyr`. Audit at
+`docs/audit/2026-04-30-audit.md` — 15 findings (0 CRITICAL, 2 HIGH,
+7 MEDIUM, 6 LOW). The 5 ship-blockers landed this session; the 10
+deferred items file as v3.x backlog with the dispositions documented
+in the audit.
+
+**Ship-blocker fixes** (all in tree, all covered by re-verify of
+1828 CPU asserts across the three test files):
+
+- **HIGH-1 — `_backend_native_surface_configure` must honour
+  consumer width/height.** The native slot was reading the EDID
+  preferred mode and silently substituting it for the
+  consumer-supplied dims. Fixed in `src/backend_native.cyr:2680-2697`
+  to reject loudly (return 0 + tear down state) when consumer dims
+  don't match the picked mode. Cross-backend identity preserved.
+  Migration guide (`docs/guides/native-migration.md`) documents
+  the constraint + the `native_kms_summary` discovery path.
+- **HIGH-2 — `gpu_surface_configure_native_logind` master fd leak.**
+  Every failure path between `samvada_session_take_device` and the
+  slot dispatch leaked the delegated DRM master fd (kernel held
+  master until process exit; consumer's "try logind, fall back to
+  kiosk" loop accumulated leaks). Fixed in `src/surface_v3.cyr` to
+  call `samvada_session_release_device` + `sys_close` + scrub the
+  ctx stash on every error path.
+- **MED-1 — native `surface_present` return code shape.** The
+  native slot was passing through negative kernel errnos where the
+  slot ABI declares positive `GPU_ERR_*`. Fixed in
+  `src/backend_native.cyr:2738-2746` to route through
+  `_native_neg_rc_to_gpu_err` for kernel rcs and map the mabda-
+  internal sentinels (`-2`, `-3`) to `GPU_ERR_SURFACE_LOST`.
+  Consumer error-handling now matches the wgpu side.
+- **MED-3 — `native_rt_create_2d_rgba8` must reject odd dims.**
+  `native_pm4_build_render_pass_target`'s viewport math uses
+  integer `rt_width / 2`; odd dims silently lost the half-pixel
+  and miscalibrated the viewport. Fixed in
+  `src/backend_native.cyr:2997-3008` to reject odd width / height
+  + non-positive at the allocator boundary, before any ioctl.
+  9 new asserts in `tests/tcyr/mabda_v3_phase_d.tcyr` pin the
+  rejection contract.
+- **MED-6 — `native_kms_present` event-drain loop.** The single-
+  read `native_kms_read_event` returned `-3` when the kernel
+  queued multiple events per flip (`DRM_EVENT_VBLANK` +
+  `DRM_EVENT_FLIP_COMPLETE` is the modal case). Fixed in
+  `src/backend_native_kms.cyr:1577-1612` to drain events
+  iteratively (walk every event in each read using the header
+  `length` field) until `FLIP_COMPLETE` lands; cap at 16 reads
+  to prevent pathological event-spew from spinning the present
+  loop. The 120-frame `native_present_e2e` may have run by luck
+  on the dev box; this fix removes the dependence.
+- **LOW-6 (bundled)** — `gpu_surface_release` now zeros the ctx
+  stash (`+96` `wgpu_surface_handle`, `+104` `native_card_fd`)
+  after the slot's release. Prevents stale-stash reads on a
+  subsequent configure that fails before stashing.
+
+**Deferred to v3.x** (audit-tracked, non-blocking): MED-2 (overflow
+guards on caller-supplied dims), MED-4 (TOCTOU clamping on
+two-pass DRM discovery), MED-5 (`set_master` `-EINVAL` ambiguity),
+MED-7 / LOW-5 (bump-allocator leaks in long-running consumers),
+LOW-1 / LOW-2 (defense-in-depth nits), LOW-3 (native `gpu_buffer_*`
+slot stubs), LOW-4 (`vc` / `ic` ignored in native render).
+
+### Added — 2026-04-30 (verify, audit, then docs wrap-up)
+
+- **`programs/diagnostics/radv_capture/`** — Phase 1 minimum-viable
+  Vulkan headless compute that mirrors mabda's
+  `native_pm4_build_compute_store_deadbeef` shape. Builds against
+  vulkan-headers + `glslangValidator`, dispatches a single-thread
+  compute via Mesa RADV, verifies readback returns `0xDEADBEEF`.
+  `make dump` runs with `RADV_DEBUG=ibs` to emit the IB byte stream
+  for byte-diff against mabda's PM4 composer. Phase 2 (the actual
+  diff reduction tooling) is a v3.x backlog bite. Verified end-to-
+  end on the dev box (RADV RENOIR / Cezanne).
+- **`docs/guides/native-migration.md`** — 1-pager for consumers
+  flipping from `BACKEND_KIND_WGPU` to `BACKEND_KIND_AMD`. Covers
+  backend selection, byte-polymorphic shader bundles, the v3
+  surface API, samvada wiring for the logind path, dimension
+  constraints from the audit (HIGH-1 + MED-3), known v3.0
+  limitations + their v3.x dispositions, and the consumer-side
+  test matrix.
+
+### Changed — 2026-04-30 (toolchain + housekeeping)
+
+- 6 `src/*.cyr` files re-flowed through `cyrius fmt`
+  (`backend_native_kms.cyr`, `backend_wgpu.cyr`, `buffer.cyr`,
+  `compute.cyr`, `context.cyr`, `texture.cyr`) — continuation-line
+  indent normalization, no semantic changes. `dist/mabda.cyr`
+  regenerated to pick up the re-flow.
+- `src/backend_native.cyr` (137 KiB) NOT re-flowed. `cyrius fmt`
+  silently truncates files >128 KiB (same buffer-cap bug as
+  cyrlint). Splitting `backend_native.cyr` into smaller modules to
+  unblock the fmt gate is a v3.x bite. Documented in the
+  `feedback_cyrlint_128k_buffer_cap` memory note.
+
 ## [2.5.0] — 2026-04-21
 
 **First feature release post-v1.0-parity. Adds a DAG-style render

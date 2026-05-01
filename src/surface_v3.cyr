@@ -1,0 +1,197 @@
+# @public — v3 surface API (Step 7.7)
+# surface_v3.cyr — public dispatchers for the v3 surface
+# abstraction. Sits ABOVE the v2 `src/surface.cyr` lifecycle (which
+# stays in tree as the wgpu-side mechanism the wgpu wrappers
+# delegate to) and BELOW the consumer's window/master-fd code.
+#
+# Six public fns total:
+#   - 3 backend-specific configure entries:
+#       gpu_surface_configure_wgpu          (wgpu, full)
+#       gpu_surface_configure_native_kiosk  (native, full)
+#       gpu_surface_configure_native_logind (native, stub → samvada v0.2.0)
+#   - 3 generic per-frame ops:
+#       gpu_surface_acquire
+#       gpu_surface_present
+#       gpu_surface_release
+#
+# Configure entries stash backend-specific resources (WGPUSurface
+# handle or DRM master card_fd) on the GpuContext via
+# `gpu_ctx_set_*` accessors, then dispatch through
+# `ctx->backend->surface_configure` slot. The slot impl reads the
+# stash back from ctx and runs backend-appropriate setup.
+#
+# Per-frame ops are backend-agnostic — they route directly through
+# the slot table without any backend-specific input.
+#
+# Design + tradeoffs are documented in
+# `docs/proposals/v3-surface-api-design.md`.
+
+# ================================================================
+# Backend-specific configure entries
+# ================================================================
+
+# Wgpu: caller pre-creates a WGPUSurface from their window using
+# wgpu_instance_create_surface (or whatever windowing-library
+# binding they're using). mabda doesn't touch windows; it just
+# wraps the resulting surface handle with format / size / present
+# config and returns an opaque surface ptr.
+#
+# Returns the surface_ptr on success, 0 on failure (typically:
+# null ctx, zero dimensions, no backend, surface_state_new
+# returning null).
+fn gpu_surface_configure_wgpu(ctx, wgpu_surface, width, height) {
+    if (ctx == 0)          { return 0; }
+    if (wgpu_surface == 0) { return 0; }
+    if (width <= 0)        { return 0; }
+    if (height <= 0)       { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE);
+    if (slot == 0) { return 0; }
+    gpu_ctx_set_wgpu_surface_handle(ctx, wgpu_surface);
+    return fncall3(slot, ctx, width, height);
+}
+
+# Native (TTY/kiosk): caller has already opened /dev/dri/cardN and
+# called DRM_IOCTL_SET_MASTER on it. This entry stashes the fd on
+# ctx and runs the full modeset through the backend slot, which
+# does discovery → mode-pick → BO alloc → PRIME bridge → AddFB2
+# → SETCRTC → second-FB alloc.
+#
+# Returns the surface_ptr on success, 0 on failure. The card_fd
+# remains the caller's responsibility — release_scanout / rm_fb /
+# gem_close run on `release`, but the master fd close + drop_master
+# stay with the caller.
+fn gpu_surface_configure_native_kiosk(ctx, card_fd, width, height) {
+    if (ctx == 0)     { return 0; }
+    if (card_fd <= 0) { return 0; }
+    if (width <= 0)   { return 0; }
+    if (height <= 0)  { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE);
+    if (slot == 0) { return 0; }
+    gpu_ctx_set_native_card_fd(ctx, card_fd);
+    return fncall3(slot, ctx, width, height);
+}
+
+# Native (logind): asks systemd-logind via dbus TakeDevice() to
+# delegate DRM master from the caller's session. As of v3.0 the
+# `samvada` package (`[deps.samvada]` >= 0.2.0) provides the
+# implementation; this dispatcher composes:
+#   1. samvada_session_take_device(major, minor) on each candidate
+#      card (minors 0..1 — most systems have AMD on card0 or card1;
+#      multi-GPU disambiguation is a v3.x extension).
+#   2. First card that returns a positive fd → stash via
+#      gpu_ctx_set_native_card_fd + dispatch through the slot.
+#
+# Pre-condition: samvada must already be initialized. Consumer
+# programs link `samvada/deps/samvada_main.c` alongside mabda's
+# `wgpu_main.c`; the C side calls `samvada_main(table)` during
+# init which populates samvada's static fn-table reference. If
+# samvada isn't initialized, take_device returns -22 (EINVAL)
+# and this dispatcher falls through to "logind path unavailable"
+# (returns 0 — consumer can fall back to _native_kiosk).
+#
+# DRM major is 226 on Linux (drivers/gpu/drm/drm_drv.c); minors
+# 0..15 cover card0..card15 (primary nodes). Render nodes start
+# at minor 128 and aren't relevant here — TakeDevice operates on
+# the master/primary node.
+var _DRM_MAJOR = 226;
+
+fn gpu_surface_configure_native_logind(ctx, width, height) {
+    if (ctx == 0)    { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+
+    # Try minors 0 + 1 — covers the typical AMD-on-card0 and
+    # AMD-on-card1 setups (split-GPU machines often have integrated
+    # on card0 and discrete on card1, or vice versa). Multi-card
+    # disambiguation is v3.x scope.
+    var minor = 0;
+    var fd = samvada_session_take_device(_DRM_MAJOR, 0);
+    if (fd < 0) {
+        minor = 1;
+        fd = samvada_session_take_device(_DRM_MAJOR, 1);
+    }
+    if (fd < 0) { return 0; }   # samvada uninit'd OR no card available
+
+    # Audit HIGH-2 (2026-04-30): every failure path between here and
+    # the slot dispatch must release the fd back to logind + close.
+    # Otherwise the consumer's fallback "try logind, then kiosk" loop
+    # accumulates leaked master fds (RLIMIT_NOFILE pressure + DRM
+    # master held until process exit).
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) {
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        return 0;
+    }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE);
+    if (slot == 0) {
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        return 0;
+    }
+    gpu_ctx_set_native_card_fd(ctx, fd);
+    var surf = fncall3(slot, ctx, width, height);
+    if (surf == 0) {
+        # Slot's own failure path (discovery / modeset / FB alloc).
+        # Return master to logind, close the fd, scrub the ctx stash.
+        samvada_session_release_device(_DRM_MAJOR, minor);
+        sys_close(fd);
+        gpu_ctx_set_native_card_fd(ctx, 0);
+    }
+    return surf;
+}
+
+# ================================================================
+# Generic per-frame ops (backend-agnostic)
+# ================================================================
+
+# Returns a backend-specific buffer pointer the caller renders
+# into. wgpu: a WGPUTexture handle. native: a NativeKmsFb pointer
+# (consumer reads `mapped_addr` field for CPU-direct access).
+# Returns 0 on failure (typically: null inputs, slot rejected,
+# stale surface).
+fn gpu_surface_acquire(ctx, surface) {
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, surface);
+}
+
+# Submit the back-buffer for display. wgpu: queue submit + the
+# library's swapchain present semantics. native: page-flip the
+# CRTC, block on vblank event, swap front/back. Returns 0 on
+# success, GPU_ERR_* on failure.
+fn gpu_surface_present(ctx, surface) {
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_PRESENT);
+    if (slot == 0) { return GPU_ERR_OTHER; }
+    return fncall2(slot, ctx, surface);
+}
+
+# Release the surface and any backend-owned resources (FBs, CRTC
+# disable, BO close). Does NOT close consumer-supplied fds (master
+# card_fd, wgpu surface handle); those stay with the caller.
+fn gpu_surface_release(ctx, surface) {
+    if (ctx == 0)     { return 0; }
+    if (surface == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_SURFACE_RELEASE);
+    if (slot == 0) { return 0; }
+    var rc = fncall2(slot, ctx, surface);
+    # Audit LOW-6 (2026-04-30): zero the ctx stash so a subsequent
+    # configure that fails before stashing doesn't see stale fd / handle.
+    gpu_ctx_set_wgpu_surface_handle(ctx, 0);
+    gpu_ctx_set_native_card_fd(ctx, 0);
+    return rc;
+}

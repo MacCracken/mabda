@@ -2,10 +2,20 @@ name: Release
 
 on:
   push:
-    # Accept both `v1.2.3` and `1.2.3` tag styles.
+    # Accept `v1.2.3`, `1.2.3`, and pre-release `-rc.N` / `-beta.N` /
+    # `-alpha.N` suffixes (added 2026-04-30 for the 3.0.0-rc.1 cut;
+    # rc/beta/alpha tags are flagged as GitHub pre-releases by the
+    # final job, so consumers' tag-resolvers won't pick them up by
+    # default).
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+'
 
 permissions:
   contents: write
@@ -26,8 +36,10 @@ jobs:
         run: |
           FILE_VERSION=$(tr -d '[:space:]' < VERSION)
           TAG="${GITHUB_REF_NAME#v}"
-          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
-            echo "tag ($TAG) is not semver x.y.z"; exit 1; }
+          # Accept x.y.z OR x.y.z-{rc,beta,alpha}.N (matches the
+          # tag-pattern filter on the trigger).
+          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$' || {
+            echo "tag ($TAG) is not semver x.y.z[-{rc,beta,alpha}.N]"; exit 1; }
           [ "$FILE_VERSION" = "$TAG" ] || {
             echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
@@ -46,13 +58,13 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
-      - name: Setup lib symlink
-        run: |
-          rm -f lib
-          ln -sf "$HOME/.cyrius/lib" lib
-
       - name: Resolve deps
-        run: cyrius deps
+        # See CLAUDE.md "Dependency wiring" — lib/ is a real directory
+        # populated by `cyrius deps`, never a symlink to a cyrius checkout.
+        run: |
+          rm -rf lib
+          mkdir lib
+          cyrius deps
 
       - name: Build (link-check, DCE on)
         run: |
@@ -61,7 +73,10 @@ jobs:
           echo "smoke: $(wc -c < build/mabda_smoke) bytes"
 
       - name: Test
-        run: cyrius test tests/tcyr/mabda.tcyr
+        run: |
+          cyrius test tests/tcyr/mabda.tcyr
+          cyrius test tests/tcyr/mabda_v3.tcyr
+          cyrius test tests/tcyr/mabda_v3_phase_d.tcyr
 
       - name: Regenerate dist bundle
         run: cyrius distlib
@@ -101,7 +116,8 @@ jobs:
         with:
           name: "mabda ${{ github.ref_name }}"
           body_path: /tmp/body.md
-          prerelease: ${{ startsWith(github.ref_name, '0.') || startsWith(github.ref_name, 'v0.') }}
+          # Flag as pre-release for 0.x tags AND any -rc / -beta / -alpha suffix.
+          prerelease: ${{ startsWith(github.ref_name, '0.') || startsWith(github.ref_name, 'v0.') || contains(github.ref_name, '-rc.') || contains(github.ref_name, '-beta.') || contains(github.ref_name, '-alpha.') }}
           files: |
             mabda-*.tar.gz
             mabda-*.cyr

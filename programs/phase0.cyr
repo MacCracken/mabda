@@ -17,19 +17,26 @@ include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/tagged.cyr"
 include "lib/sakshi.cyr"
+include "lib/mmap.cyr"
 
 include "src/error.cyr"
 include "src/color.cyr"
 include "src/wgpu_types.cyr"
 include "src/wgpu_descriptors.cyr"
 include "src/wgpu_ffi.cyr"
+include "src/backend.cyr"
+include "src/backend_wgpu.cyr"
+include "src/backend_native.cyr"
 include "src/context.cyr"
 include "src/buffer.cyr"
 include "src/typed_buffer.cyr"
 include "src/gpu_timestamps.cyr"
 include "src/sampler.cyr"
 include "src/texture.cyr"
+include "src/depth.cyr"
+include "src/render_target.cyr"
 include "src/render_pipeline.cyr"
+include "src/render_pass.cyr"
 
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
@@ -331,6 +338,77 @@ fn mabda_main(fn_table_ptr, preinit_ptr) {
     wgpu_shader_module_release(shader_module);
     syscall(1, 1, "PASS: render pipeline create + release\n", 39);
 
-    syscall(1, 1, "\n10 passed, 0 failed\n", 21);
+    # Test 11: v3 ctx-aware buffer dispatchers (Steps 3c/3d) against
+    # real wgpu — validates the inlined staging-buffer + map-sync
+    # path in _backend_wgpu_buffer_read end-to-end.
+    var bb_usage = WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
+    var bb = gpu_buffer_create(_gpu_ctx, 64, bb_usage);
+    if (bb == 0) {
+        syscall(1, 2, "FAIL: gpu_buffer_create returned 0\n", 36);
+        return 1;
+    }
+    var bb_in[64];
+    var bi = 0;
+    while (bi < 64) {
+        store8(&bb_in + bi, bi + 1);
+        bi = bi + 1;
+    }
+    var rc_w = gpu_buffer_write(_gpu_ctx, bb, 0, &bb_in, 64);
+    if (rc_w != 0) {
+        syscall(1, 2, "FAIL: gpu_buffer_write rc != 0\n", 32);
+        return 1;
+    }
+    var bb_out[64];
+    memset(&bb_out, 0, 64);
+    var rc_r = gpu_buffer_read(_gpu_ctx, bb, 0, &bb_out, 64);
+    if (rc_r != 0) {
+        syscall(1, 2, "FAIL: gpu_buffer_read rc != 0\n", 31);
+        return 1;
+    }
+    if (memeq(&bb_in, &bb_out, 64) == 0) {
+        syscall(1, 2, "FAIL: gpu_buffer_read data mismatch\n", 37);
+        return 1;
+    }
+    gpu_buffer_release(_gpu_ctx, bb);
+    syscall(1, 1, "PASS: v3 gpu_buffer_create/write/read/release through ctx->backend\n", 68);
+
+    # Test 12: v3 ctx-aware texture dispatchers (Steps 5.7+5.5) against
+    # real wgpu — mirrors Step 5.8's native_texture_e2e validation
+    # but under the wgpu backend. Width = 64 satisfies wgpu's
+    # COPY_BUFFER_ALIGNMENT = 256 on the read path (64*4 = 256).
+    var TW = 64;
+    var TH = 32;
+    var TN = TW * TH * 4;
+    var gtex = gpu_texture_create_2d_rgba8(_gpu_ctx, TW, TH);
+    if (gtex == 0) {
+        syscall(1, 2, "FAIL: gpu_texture_create_2d_rgba8 returned 0\n", 46);
+        return 1;
+    }
+    var tsrc = alloc(TN);
+    var tdst = alloc(TN);
+    var tx = 0;
+    while (tx < TN) {
+        store8(tsrc + tx, (tx * 7 + 1) & 0xFF);
+        tx = tx + 1;
+    }
+    var trc_w = gpu_texture_write(_gpu_ctx, gtex, tsrc, TN);
+    if (trc_w != 0) {
+        syscall(1, 2, "FAIL: gpu_texture_write rc != 0\n", 33);
+        return 1;
+    }
+    memset(tdst, 0, TN);
+    var trc_r = gpu_texture_read(_gpu_ctx, gtex, tdst, TN);
+    if (trc_r != 0) {
+        syscall(1, 2, "FAIL: gpu_texture_read rc != 0\n", 32);
+        return 1;
+    }
+    if (memeq(tsrc, tdst, TN) == 0) {
+        syscall(1, 2, "FAIL: gpu_texture_read bytes mismatch\n", 39);
+        return 1;
+    }
+    gpu_texture_release(_gpu_ctx, gtex);
+    syscall(1, 1, "PASS: v3 gpu_texture_create/write/read/release through ctx->backend\n", 70);
+
+    syscall(1, 1, "\n12 passed, 0 failed\n", 22);
     return 0;
 }

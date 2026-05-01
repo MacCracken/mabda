@@ -3,28 +3,31 @@
 **Status:** Accepted
 **Date:** 2026-04-12
 **Supersedes:** n/a
-**Related:** ADR 004 (C launcher FFI — transitional), planned ADR 006 (pure Cyrius GPU backend)
+**Related:** ADR 004 (C launcher FFI — v3.x-era backend, retires v4.0), planned ADR 006 (native Cyrius GPU backend added alongside)
 
 ## Context
 
 Mabda ships now via a C shim over wgpu-native so that AGNOS consumers
 (soorat, rasa, ranga, bijli, aethersafta, kiran) have a stable GPU
-surface to build against while the native Cyrius GPU backend is still
-being designed. The C shim is **transitional scaffolding**. When the
-native backend lands in v3.0, the FFI layer is deleted and replaced.
+surface to build against. In v3.0 a second backend — pure Cyrius
+DRM/KMS — ships alongside the C path (see ADR 006). The C path stays
+in-tree for the entire v3.x line as a measurement baseline and
+migration runway; it retires in v4.0 once every consumer is running
+native in production.
 
 The risk: a consumer that reaches into the FFI modules —
-`wgpu_types.cyr`, `wgpu_descriptors.cyr`, `wgpu_ffi.cyr`,
-`tagged_obj.cyr`, `cache_key.cyr` — couples itself to the transitional
-backend and breaks when the swap happens. We need a mechanical way to
-express "this file is load-bearing API; that file is scaffolding."
+`wgpu_types.cyr`, `wgpu_descriptors.cyr`, `wgpu_ffi.cyr` — couples
+itself to wgpu-specific internals and breaks either when the native
+backend replaces it (for that consumer) or when the C path itself
+retires in v4.0. We need a mechanical way to express "this file is
+load-bearing API; that file is backend-specific scaffolding."
 
 ## Decision
 
 Every `.cyr` file in `src/` carries a **marker comment as line 1**:
 
-- `# @public — stable API surface (survives the v3.0 backend swap)`
-- `# @internal — FFI / toolchain scaffolding, replaced in v3.0`
+- `# @public — stable API surface (unchanged across the v3.x dual-backend era and into v4.0)`
+- `# @internal — backend-specific FFI / toolchain scaffolding (wgpu path retires v4.0)`
 
 The distinction is load-bearing for two reasons:
 
@@ -69,9 +72,11 @@ Inventory history:
 - The stability contract is machine-readable, not just documentation.
 - Breaking changes can be scoped: any edit inside an `@public` file
   requires a minor version bump; edits inside `@internal` are free.
-- The v3.0 backend swap becomes testable: every file that was `@public`
-  in v2.1.1 must remain `@public` in v3.0, and every line in the v2.1.1
-  `examples/stdlib-consumer/main.cyr` must still compile.
+- The v3.0 native-backend addition becomes testable: every file that
+  was `@public` in v2.1.1 must remain `@public` in v3.0, and every
+  line in the v2.1.1 `examples/stdlib-consumer/main.cyr` must still
+  compile under both backends. Same test fires again at v4.0 when
+  the wgpu path retires.
 - New consumer patterns have an obvious "don't cross this line" rule.
 
 **Negative:**
@@ -110,6 +115,7 @@ Inventory history:
 - `docs/stdlib-integration.md` already cites this ADR and instructs
   consumers to treat `@internal` as "do not reference."
 - v3.0 migration guide will include a checklist: every `@public` file
-  from v2.1.1 must exist in v3.0 with the same public function names.
-  Tooling to diff the two lists lives in `scripts/check-public-api.sh`
-  (planned for v3.0 milestone).
+  from v2.1.1 must exist in v3.0 with the same public function names
+  across both backends. Same check re-fires at v4.0 when the wgpu
+  path retires. Tooling to diff the public-API surface lives in
+  `scripts/check-public-api.sh` (planned for v3.0 milestone).

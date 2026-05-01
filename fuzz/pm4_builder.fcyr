@@ -1,0 +1,118 @@
+# Fuzz: PM4 packet-builder invariants (v3 Phase B.3.b)
+#
+# Builds PKT3 headers across random valid inputs and verifies the
+# bit fields round-trip. Also builds SET_SH_REG + DISPATCH_DIRECT
+# sequences and verifies byte layouts match the documented packet
+# shape.
+#
+# Invariants checked:
+#   (1) PKT3 type bits (30-31) always == 3
+#   (2) opcode round-trips from bits 8-15
+#   (3) predicate round-trips from bits 0-7
+#   (4) count field is N-1 (where N = caller-supplied count)
+#   (5) SH-reg offset formula: (byte - 0xB000) / 4, byte-aligned
+#   (6) composed SET_SH_REG + DISPATCH_DIRECT buffer has correct
+#       dword-count footprint
+#
+# Exit codes:
+#   0 — all invariants hold across samples
+#   1 — type bits wrong
+#   2 — opcode round-trip failed
+#   3 — predicate round-trip failed
+#   4 — count field encoding failed
+#   5 — SH-reg offset formula wrong
+#   6 — composed buffer length mismatch
+
+include "src/lib.cyr"
+
+alloc_init();
+
+var _rng = 1;
+fn rng_seed(s) { _rng = s; return 0; }
+fn rng_next() {
+    _rng = _rng * 6364136223846793005 + 1442695040888963407;
+    return _rng;
+}
+fn rng_u32() {
+    var r = rng_next();
+    if (r < 0) { r = 0 - r; }
+    return r % 0xFFFFFFFF;
+}
+
+var seeds[32];
+store64(&seeds +  0,   1);
+store64(&seeds +  8,  42);
+store64(&seeds + 16, 137);
+store64(&seeds + 24, 999);
+
+var seed_count = 4;
+var samples_per_seed = 500;
+
+var seed_i = 0;
+while (seed_i < seed_count) {
+    rng_seed(load64(&seeds + seed_i * 8));
+
+    var s = 0;
+    while (s < samples_per_seed) {
+        var op        = rng_u32() % 0x100;      # 0-255 (byte)
+        var count     = 1 + (rng_u32() % 0x3FFF); # 1..0x3FFF valid
+        var predicate = rng_u32() % 0x100;
+
+        var hdr = native_pm4_pkt3_header(op, count, predicate);
+
+        # (1) Type must be 3.
+        var type = (hdr / 0x40000000) & 3;
+        if (type != 3) { syscall(60, 1); }
+
+        # (2) Opcode at bits 8-15.
+        var op_back = (hdr / 0x100) & 0xFF;
+        if (op_back != op) { syscall(60, 2); }
+
+        # (3) Predicate at bits 0-7.
+        var pred_back = hdr & 0xFF;
+        if (pred_back != predicate) { syscall(60, 3); }
+
+        # (4) Count-1 at bits 16-29.
+        var count_field = (hdr / 0x10000) & 0x3FFF;
+        if (count_field != count - 1) { syscall(60, 4); }
+
+        s = s + 1;
+    }
+
+    seed_i = seed_i + 1;
+}
+
+# SH-reg offset formula sanity. Walk every 4-byte aligned address from
+# 0xB000 to 0xBFFC and verify the computed SH-reg offset equals
+# (addr - 0xB000) / 4.
+var a = 0xB000;
+while (a < 0xC000) {
+    var expected = (a - 0xB000) / 4;
+    if (native_sh_reg_offset(a) != expected) { syscall(60, 5); }
+    a = a + 4;
+}
+
+# Composed-buffer footprint. A common "dispatch 1 shader" sequence is:
+#   set_sh_reg(PGM_LO)       3 dwords
+#   set_sh_reg(PGM_HI)       3 dwords
+#   set_sh_reg(RSRC1)        3 dwords
+#   set_sh_reg(RSRC2)        3 dwords
+#   set_sh_reg(NUM_THREAD_X) 3 dwords
+#   set_sh_reg(NUM_THREAD_Y) 3 dwords
+#   set_sh_reg(NUM_THREAD_Z) 3 dwords
+#   dispatch_direct          5 dwords
+# = 7 * 3 + 5 = 26 dwords = 104 bytes.
+var buf[256];
+memset(&buf, 0, 256);
+var pos = 0;
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_PGM_LO,      0);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_PGM_HI,      0);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_PGM_RSRC1,   0);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_PGM_RSRC2,   0);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_NUM_THREAD_X, 1);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_NUM_THREAD_Y, 1);
+pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_NUM_THREAD_Z, 1);
+pos = native_pm4_dispatch_direct(&buf, pos, 1, 1, 1, COMPUTE_DISPATCH_INITIATOR_MIN);
+if (pos != 104) { syscall(60, 6); }
+
+syscall(60, 0);
