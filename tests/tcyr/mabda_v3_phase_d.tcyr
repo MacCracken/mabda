@@ -683,6 +683,59 @@ fn test_native_kms_mode_refresh_hz_computation() {
     return 0;
 }
 
+# ================================================================
+# v3 audit 2026-04-30 → rc.2 fixes
+# ================================================================
+
+# Audit LOW-1: native_drm_set_master / _drop_master need an fd > 0
+# guard, matching every other ioctl wrapper in backend_native_kms.cyr.
+# Before this fix, native_drm_set_master(0) would issue a real
+# syscall and depend on the kernel returning -EBADF.
+fn test_native_drm_master_fd_guard() {
+    assert_eq(native_drm_set_master(0),   -1, "set_master fd=0");
+    assert_eq(native_drm_set_master(0-1), -1, "set_master fd=-1");
+    assert_eq(native_drm_drop_master(0),   -1, "drop_master fd=0");
+    assert_eq(native_drm_drop_master(0-1), -1, "drop_master fd=-1");
+    return 0;
+}
+
+# Audit LOW-2: _kms_summary_print_u32 used a 16-byte stack buffer,
+# too small for a 19-digit max-i64. fmt_int_buf is i64-typed, so a
+# max-magnitude input would have overflowed. Verify the underlying
+# property — fmt_int_buf width fits in the bumped buf[24].
+fn test_kms_summary_print_u32_buf_holds_max_i64() {
+    var buf[24];
+    memset(&buf, 0, 24);
+    var n = fmt_int_buf(9223372036854775807, &buf);
+    assert_eq(n, 19, "max signed i64 fmt width");
+    return 0;
+}
+
+# Audit LOW-3: native gpu_buffer_* / gpu_shader_module_* slots are
+# diagnostic stubs in v3.0. Buffer write/read return
+# GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "native
+# backend doesn't support this yet" from generic failures.
+fn test_native_buffer_stubs_return_not_implemented() {
+    assert_eq(_backend_native_buffer_write(0, 0, 0, 0, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "buffer_write");
+    assert_eq(_backend_native_buffer_read(0, 0, 0, 0, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "buffer_read");
+    # create returns 0-as-no-handle; release is no-op success.
+    assert_eq(_backend_native_buffer_create(0, 0, 0),  0, "buffer_create no handle");
+    assert_eq(_backend_native_buffer_release(0, 0),    0, "buffer_release no-op");
+    assert_eq(_backend_native_shader_module_create(0, 0, 0), 0, "shmod_create no handle");
+    assert_eq(_backend_native_shader_module_release(0, 0),   0, "shmod_release no-op");
+    return 0;
+}
+
+fn test_gpu_err_not_implemented_constant_and_name() {
+    assert_eq(GPU_ERR_NOT_IMPLEMENTED, 18, "code value");
+    var name = gpu_err_name(GPU_ERR_NOT_IMPLEMENTED);
+    # Non-empty name — distinct from "unknown error" sentinel.
+    assert_eq(strlen(name) > 0, 1, "name non-empty");
+    return 0;
+}
+
 fn main() {
     # v3 Step 7.1(a) — DRM/KMS GetResources foundation (5)
     test_drm_mode_ioctl_numbers();
@@ -768,6 +821,12 @@ fn main() {
     # v3 audit 2026-04-30 — ship-blocker fixes (MED-3)
     test_native_rt_create_rejects_odd_dims();
     test_native_rt_create_rejects_nonpositive_dims();
+
+    # v3 audit 2026-04-30 → rc.2 fixes (LOW-1, LOW-2, LOW-3)
+    test_native_drm_master_fd_guard();
+    test_kms_summary_print_u32_buf_holds_max_i64();
+    test_native_buffer_stubs_return_not_implemented();
+    test_gpu_err_not_implemented_constant_and_name();
 
     return assert_summary();
 }

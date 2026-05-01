@@ -41,6 +41,7 @@ enum GpuErrCode {
     GPU_ERR_TEXTURE_DIMENSION       = 15;
     GPU_ERR_FFI_LOAD                = 16;
     GPU_ERR_FFI_SYMBOL              = 17;
+    GPU_ERR_NOT_IMPLEMENTED         = 18;
     GPU_ERR_OTHER                   = 99;
 }
 
@@ -179,6 +180,7 @@ fn gpu_err_name(code) {
     if (code == GPU_ERR_TEXTURE_DIMENSION)  { return "texture dimension exceeded"; }
     if (code == GPU_ERR_FFI_LOAD)           { return "FFI library load failed"; }
     if (code == GPU_ERR_FFI_SYMBOL)         { return "FFI symbol not found"; }
+    if (code == GPU_ERR_NOT_IMPLEMENTED)    { return "operation not implemented on this backend"; }
     if (code == GPU_ERR_OTHER)              { return "other error"; }
     return "unknown error";
 }
@@ -5403,28 +5405,48 @@ fn _backend_native_ctx_release(ctx) {
     return 0;
 }
 
-# Buffer slots — Step 4c stubs. Native BO management (gpu_buffer_*
-# routed through ctx->backend) is Step 4d+ work. Returning err
-# means "not implemented" without crashing.
+# Buffer slots — diagnostic stubs (audit LOW-3).
+#
+# The public `gpu_buffer_*` API is intentionally not implemented on
+# the native AMD backend in v3.0 — consumers that need native today
+# (the in-tree `programs/native_*.cyr`) all use `native_buf_pair_*`
+# directly, and cross-backend portable buffer code is blocked by
+# LOW-4 (vc/ic in render dispatch) anyway. v3.x will port these to
+# `native_buf_pair_*` underneath.
+#
+# Slot semantics:
+#   - `_buffer_create` returns a handle (i64) — 0 means "create
+#     failed, no handle." Callers MUST null-check the return.
+#   - `_buffer_write` / `_buffer_read` return a GpuErr code — 0 is
+#     success, anything else is a failure. We return
+#     GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "the
+#     native backend doesn't support gpu_buffer_* yet" from
+#     generic GPU_ERR_OTHER failures.
+#   - `_buffer_release` is a no-op success — releasing a never-
+#     created handle is sensibly a no-op, and propagating an error
+#     here would leak detail through every cleanup path.
 fn _backend_native_buffer_create(ctx, size, usage) {
     return 0;
 }
 
 fn _backend_native_buffer_write(ctx, buf, off, ptr, n) {
-    return GPU_ERR_OTHER;
+    return GPU_ERR_NOT_IMPLEMENTED;
 }
 
 fn _backend_native_buffer_read(ctx, buf, off, ptr, n) {
-    return GPU_ERR_OTHER;
+    return GPU_ERR_NOT_IMPLEMENTED;
 }
 
 fn _backend_native_buffer_release(ctx, buf) {
     return 0;
 }
 
-# Shader-module slots — stubs. Native shader modules are pre-
-# compiled GFX9 ISA bytes mapped to a BO at a canonical-high VA;
-# Step 4d+ will wrap that.
+# Shader-module slots — diagnostic stubs (audit LOW-3). Same
+# rationale as the buffer slots: native shader modules in v3.0
+# come from `native_shader_lib_*` helpers (pre-compiled GFX9 ISA
+# wrapped at canonical-high VA), not from this public API.
+# `_shader_module_create` returns 0 ("no module") on failure;
+# `_release` is a no-op success.
 fn _backend_native_shader_module_create(ctx, bytes_ptr, n) {
     return 0;
 }
@@ -6253,20 +6275,30 @@ var DRM_IOCTL_MODE_GETRESOURCES = 0xC04064A0;
 var DRM_IOCTL_SET_MASTER  = 0x641E;
 var DRM_IOCTL_DROP_MASTER = 0x641F;
 
-# Acquire DRM master. Returns 0 on success or already-master,
-# negative errno on real failure. Treats -EINVAL ("already
-# master, kernel doesn't differentiate") as success — that's the
-# "we opened a fresh fd that auto-mastered" case on some kernels.
+# Acquire DRM master. Returns 0 on success, negative errno on
+# failure. The kernel return codes the caller may need to handle:
+#   0       — got master
+#   -EACCES — not allowed (e.g., not active vt, no CAP_SYS_ADMIN)
+#   -EINVAL — caller-side error; on some kernels also "already
+#             master" but that case is ambiguous with genuine
+#             argument problems, so we pass it through unchanged
+#             rather than collapsing to success (audit MED-5).
+#             Callers that need to disambiguate "already master"
+#             from "operation rejected" can probe via
+#             DRM_IOCTL_AUTH_MAGIC after a -EINVAL.
+#   -EBUSY  — another fd holds master.
+# Returns -1 if `fd` is invalid (audit LOW-1) — matches every
+# other ioctl wrapper in this file.
 fn native_drm_set_master(fd) {
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SET_MASTER, 0);
-    if (rc == 0)         { return 0; }
-    if (rc == 0 - 22)    { return 0; }   # -EINVAL → already master
-    return rc;
+    if (fd <= 0) { return -1; }
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SET_MASTER, 0);
 }
 
 # Release DRM master. Lets the next SET_MASTER on a different fd
-# succeed. Returns 0 on success.
+# succeed. Returns 0 on success, negative errno on failure, or
+# -1 if `fd` is invalid (audit LOW-1).
 fn native_drm_drop_master(fd) {
+    if (fd <= 0) { return -1; }
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_DROP_MASTER, 0);
 }
 
@@ -6543,15 +6575,25 @@ fn native_kms_init(fd) {
 
     # The kernel may report fewer than pass-1 counts if a connector
     # was hot-unplugged between calls. Use the post-fill counts as
-    # the source of truth.
-    store32(state + KMS_STATE_FIELD_COUNT_FBS,
-    load32(&req + DRM_MODE_CARD_RES_COUNT_FBS));
-    store32(state + KMS_STATE_FIELD_COUNT_CRTCS,
-    load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS));
-    store32(state + KMS_STATE_FIELD_COUNT_CONN,
-    load32(&req + DRM_MODE_CARD_RES_COUNT_CONN));
-    store32(state + KMS_STATE_FIELD_COUNT_ENCODERS,
-    load32(&req + DRM_MODE_CARD_RES_COUNT_ENC));
+    # the source of truth — but defensively clamp against the
+    # pre-fill capacity (audit MED-4). The kernel SHOULD never
+    # return more than the cap we passed in, but the TOCTOU window
+    # between the two ioctls is wide enough that we don't want a
+    # future kernel quirk or hot-add race to trick downstream code
+    # into reading past the end of the heap arrays we sized off
+    # pass-1 counts.
+    var actual_fbs   = load32(&req + DRM_MODE_CARD_RES_COUNT_FBS);
+    var actual_crtcs = load32(&req + DRM_MODE_CARD_RES_COUNT_CRTCS);
+    var actual_conn  = load32(&req + DRM_MODE_CARD_RES_COUNT_CONN);
+    var actual_enc   = load32(&req + DRM_MODE_CARD_RES_COUNT_ENC);
+    if (actual_fbs   > count_fbs)   { actual_fbs   = count_fbs; }
+    if (actual_crtcs > count_crtcs) { actual_crtcs = count_crtcs; }
+    if (actual_conn  > count_conn)  { actual_conn  = count_conn; }
+    if (actual_enc   > count_enc)   { actual_enc   = count_enc; }
+    store32(state + KMS_STATE_FIELD_COUNT_FBS,      actual_fbs);
+    store32(state + KMS_STATE_FIELD_COUNT_CRTCS,    actual_crtcs);
+    store32(state + KMS_STATE_FIELD_COUNT_CONN,     actual_conn);
+    store32(state + KMS_STATE_FIELD_COUNT_ENCODERS, actual_enc);
     store64(state + KMS_STATE_FIELD_FB_IDS,   fb_ids);
     store64(state + KMS_STATE_FIELD_CRTC_IDS, crtc_ids);
     store64(state + KMS_STATE_FIELD_CONN_IDS, conn_ids);
@@ -6776,12 +6818,17 @@ fn _kms_summary_print_enc(id, etype, crtc_id, poss_crtcs) {
     return 0;
 }
 
-# Decimal u32 printer — uses fmt_int_buf from lib/fmt to keep the
+# Decimal printer — uses fmt_int_buf from lib/fmt to keep the
 # call sites concise. Stack-allocated buffer so we don't churn the
-# bump allocator on every printed connector / encoder.
+# bump allocator on every printed connector / encoder. The buffer
+# is 24 bytes to safely hold a 20-digit i64 (max signed i64 is 19
+# digits + sign + null) — fmt_int_buf is i64-typed so a max-magnitude
+# input would overflow a 16-byte buffer (audit LOW-2). KMS IDs are
+# u32 in practice, but the printer is i64-shaped and we don't want
+# a future caller to overflow this without an obvious failure.
 fn _kms_summary_print_u32(v) {
-    var buf[16];
-    memset(&buf, 0, 16);
+    var buf[24];
+    memset(&buf, 0, 24);
     var n = fmt_int_buf(v, &buf);
     syscall(1, 1, &buf, n);
     return 0;
@@ -6871,8 +6918,12 @@ fn native_kms_get_connector_modes(fd, conn_id, count_out) {
     }
 
     # Kernel may report fewer modes if state changed between calls.
-    # Truth is the post-fill count.
+    # Truth is the post-fill count, clamped against the pre-fill
+    # capacity (audit MED-4 — same TOCTOU defense as
+    # native_kms_init: never expose a count larger than the buffer
+    # we sized off pass-1).
     var actual = load32(&req + DRM_MODE_GET_CONNECTOR_COUNT_MODES);
+    if (actual > count) { actual = count; }
     store32(count_out, actual);
     return modes;
 }
