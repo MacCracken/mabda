@@ -2,9 +2,10 @@
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (112 bytes — grew 48 → 96 at v3 Step
-# 4f.iv, then 96 → 112 at v3 Step 7.7 for the surface API
-# consumer-stash slots):
+# GpuContext struct layout (120 bytes — grew 48 → 96 at v3 Step
+# 4f.iv, 96 → 112 at v3 Step 7.7 for the surface API consumer-
+# stash slots, 112 → 120 at v3 rc.2 audit MED-7 to cache the per-
+# dispatch PM4 scratch buffer):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
@@ -23,6 +24,21 @@
 #   +104: native_card_fd (8)    — native: DRM master card fd; set by
 #                                  gpu_surface_configure_native_kiosk.
 #                                  Zero on wgpu.
+#   +112: pm4_scratch (8)       — native: 1024-byte PM4 build buffer,
+#                                  allocated once at gpu_context_new_native,
+#                                  reused (memset on each entry) by
+#                                  _backend_native_compute_dispatch and
+#                                  _backend_native_render_pass_draw. Audit
+#                                  MED-7: replaces per-dispatch alloc(256)
+#                                  / alloc(1024) which leaked through the
+#                                  bump allocator. Zero on wgpu (the wgpu
+#                                  slots never read it). Lifetime contract:
+#                                  shared across compute + render slots,
+#                                  reset on each dispatch entry, NEVER
+#                                  reclaimed — Cyrius single-threaded
+#                                  execution model means a slot fn is the
+#                                  sole writer for the duration of its
+#                                  call.
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
@@ -36,7 +52,8 @@
 # carry them directly (see docs/proposals/v3-surface-api-design.md
 # § "Why 'stash on ctx' rather than passing through every slot").
 
-var GPU_CONTEXT_SIZE = 112;
+var GPU_CONTEXT_SIZE = 120;
+var _NATIVE_PM4_SCRATCH_BYTES = 1024;
 
 fn gpu_ctx_instance(ctx) { return load64(ctx); }
 fn gpu_ctx_adapter(ctx)  { return load64(ctx + 8); }
@@ -207,20 +224,30 @@ fn gpu_context_new_native() {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
+    # Audit MED-7: per-context cached PM4 scratch buffer. 1024 bytes
+    # is the worst-case render-stream size (`_backend_native_render_pass_draw`
+    # builds up to a 256-dword pad target = 1024 B); compute dispatch
+    # uses the first 256 bytes. Allocated once here, reused on every
+    # dispatch — replaces the per-dispatch alloc(256)/alloc(1024)
+    # that previously leaked through the bump allocator.
+    var pm4_scratch = alloc(_NATIVE_PM4_SCRATCH_BYTES);
+    memset(pm4_scratch, 0, _NATIVE_PM4_SCRATCH_BYTES);
+
     var ctx = alloc(GPU_CONTEXT_SIZE);
     memset(ctx, 0, GPU_CONTEXT_SIZE);
-    store64(ctx +  0, fd);
-    store64(ctx +  8, ctx_id);
-    store64(ctx + 16, stub_handle);
-    store64(ctx + 24, _NATIVE_STUB_VA);
-    store64(ctx + 32, backend_native_new());
-    store64(ctx + 40, stub_map);
-    store64(ctx + 48, ib_handle);
-    store64(ctx + 56, _NATIVE_IB_VA);
-    store64(ctx + 64, ib_map);
-    store64(ctx + 72, fence_handle);
-    store64(ctx + 80, _NATIVE_FENCE_VA);
-    store64(ctx + 88, fence_map);
+    store64(ctx +   0, fd);
+    store64(ctx +   8, ctx_id);
+    store64(ctx +  16, stub_handle);
+    store64(ctx +  24, _NATIVE_STUB_VA);
+    store64(ctx +  32, backend_native_new());
+    store64(ctx +  40, stub_map);
+    store64(ctx +  48, ib_handle);
+    store64(ctx +  56, _NATIVE_IB_VA);
+    store64(ctx +  64, ib_map);
+    store64(ctx +  72, fence_handle);
+    store64(ctx +  80, _NATIVE_FENCE_VA);
+    store64(ctx +  88, fence_map);
+    store64(ctx + 112, pm4_scratch);
     _sk_info_cstr("mabda: gpu context created (native)");
     return gpu_ok(ctx);
 }

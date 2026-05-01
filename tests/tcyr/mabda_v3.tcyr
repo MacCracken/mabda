@@ -2136,12 +2136,32 @@ fn test_native_pm4_render_pass_target_rt_bind() {
 fn test_native_pm4_render_draw_tail() {
     var buf[16];
     memset(&buf, 0xCC, 16);
-    var pos = native_pm4_build_render_draw_tail(&buf, 0);
+    # Audit LOW-4: vertex_count is now an explicit param; pass the
+    # fullscreen-tri value to keep this assertion's intent stable.
+    var pos = native_pm4_build_render_draw_tail(&buf, 0, GFX9_FULLSCREEN_TRI_VCOUNT);
     assert_eq(pos, 12, "draw_tail = 3 dwords");
     # DRAW_INDEX_AUTO header: count_minus_1=1, opcode=0x2D → 0xC0012D00.
     assert_eq(load32(&buf + 0), 0xC0012D00, "DRAW_INDEX_AUTO header");
     assert_eq(load32(&buf + 4), GFX9_FULLSCREEN_TRI_VCOUNT, "vertex_count = 3");
     assert_eq(load32(&buf + 8), DI_SRC_SEL_AUTO_INDEX, "auto-index draw initiator");
+    return 0;
+}
+
+# Audit LOW-4: caller-supplied vertex_count threads into the
+# DRAW_INDEX_AUTO packet at dword[1]. Distinct call shapes (6, 36,
+# 0) must produce distinct PM4 streams — verifies the param isn't
+# silently ignored.
+fn test_native_pm4_render_draw_tail_honours_vertex_count() {
+    var buf[16];
+    memset(&buf, 0, 16);
+    native_pm4_build_render_draw_tail(&buf, 0, 6);
+    assert_eq(load32(&buf + 4), 6, "vc=6 in DRAW_INDEX_AUTO[1]");
+    memset(&buf, 0, 16);
+    native_pm4_build_render_draw_tail(&buf, 0, 36);
+    assert_eq(load32(&buf + 4), 36, "vc=36 in DRAW_INDEX_AUTO[1]");
+    memset(&buf, 0, 16);
+    native_pm4_build_render_draw_tail(&buf, 0, 0);
+    assert_eq(load32(&buf + 4), 0, "vc=0 in DRAW_INDEX_AUTO[1]");
     return 0;
 }
 
@@ -2213,7 +2233,7 @@ fn test_native_pm4_render_clear_triangle_block_sizes() {
     p = native_pm4_build_render_pass_target(&buf, p,
     0xFFFF800101000000, 256, 256);
     assert_eq(p, 492, "+pass_target = 152");
-    p = native_pm4_build_render_draw_tail(&buf, p);
+    p = native_pm4_build_render_draw_tail(&buf, p, GFX9_FULLSCREEN_TRI_VCOUNT);
     assert_eq(p, 504, "+draw_tail = 12");
     return 0;
 }
@@ -2652,6 +2672,30 @@ fn test_gpu_render_pass_end_dispatches_through_backend() {
     return 0;
 }
 
+# Audit LOW-4: native render-draw slot enforces the new contract on
+# (vc, ic) before any alloc — vc <= 0 → GPU_ERR_OTHER, ic != 1 →
+# GPU_ERR_NOT_IMPLEMENTED. The early returns happen before the rt /
+# pipe field loads, so sentinel non-null pointers are sufficient.
+fn test_native_render_pass_draw_rejects_bad_vc_ic() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    var pass[8];
+    memset(&pass, 0, 8);
+    var pipe[8];
+    memset(&pipe, 0, 8);
+    # vc <= 0 path.
+    assert_eq(_backend_native_render_pass_draw(&ctx, &pass, &pipe, 0, 1),
+    GPU_ERR_OTHER,           "vc=0 reject");
+    assert_eq(_backend_native_render_pass_draw(&ctx, &pass, &pipe, 0-1, 1),
+    GPU_ERR_OTHER,           "vc=-1 reject");
+    # ic != 1 path — instance rendering is v3.x scope.
+    assert_eq(_backend_native_render_pass_draw(&ctx, &pass, &pipe, 6, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "ic=0 reject");
+    assert_eq(_backend_native_render_pass_draw(&ctx, &pass, &pipe, 6, 2),
+    GPU_ERR_NOT_IMPLEMENTED, "ic=2 reject");
+    return 0;
+}
+
 fn test_gpu_render_dispatchers_null_ctx_safe() {
     # All seven render dispatchers must short-circuit on null ctx
     # without dispatching. No mock backend needed.
@@ -2829,6 +2873,7 @@ fn main() {
     test_native_pm4_render_pass_target_layout_256x256();
     test_native_pm4_render_pass_target_rt_bind();
     test_native_pm4_render_draw_tail();
+    test_native_pm4_render_draw_tail_honours_vertex_count();
     test_native_pm4_render_clear_triangle_top_level();
     test_native_pm4_render_clear_triangle_block_sizes();
 
@@ -2859,6 +2904,10 @@ fn main() {
     test_gpu_render_pass_draw_dispatches_through_backend();
     test_gpu_render_pass_end_dispatches_through_backend();
     test_gpu_render_dispatchers_null_ctx_safe();
+
+    # v3 audit 2026-04-30 → rc.2 fixes (LOW-4) — native render
+    # draw slot honours vc, rejects ic != 1.
+    test_native_render_pass_draw_rejects_bad_vc_ic();
 
     # v3 Phase D (Step 7.x) tests run in tests/tcyr/mabda_v3_phase_d.tcyr.
 

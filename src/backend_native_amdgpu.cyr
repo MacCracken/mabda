@@ -1,0 +1,783 @@
+# @internal — native GPU backend, AMDGPU/DRM ioctl wrappers
+# backend_native_amdgpu.cyr — pure-Cyrius DRM/AMDGPU foundational layer
+#
+# Split out from backend_native.cyr at v3 rc.2 (audit toolchain item)
+# to keep each file under cyrius lint/fmt's 128 KiB read-buffer cap.
+# This file owns the syscall-level foundation:
+#   - DRM ioctl encoding helpers + render-node open
+#   - GEM/BO lifecycle (create_gtt, create_vram, mmap_offset, close, release)
+#   - AMDGPU ctx + bo_list + va_map ioctls
+#   - DRM syncobj (create, destroy, wait)
+#   - DRM CS submit (3 variants: bo_list-by-handle, inline-bos, 4chunk-Mesa-shape)
+#
+# PM4 byte builders live in backend_native_pm4.cyr; GFX9 ISA shaders
+# + register addresses live in backend_native_shaders.cyr; the slot
+# fillers + dispatch fns + texture/RT/pipeline primitives live in
+# backend_native.cyr (which depends on this file).
+#
+# All data types are i64 / u64 unless noted. drm_version struct layout
+# mirrors include/uapi/drm/drm.h on x86_64 Linux. No libdrm — direct
+# syscall(SYS_IOCTL) only.
+
+# ================================================================
+# Constants
+# ================================================================
+# DRM ioctl encoding mirrors include/uapi/asm-generic/ioctl.h:
+#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
+# Size field is 14 bits, type 8, nr 8, dir 2.
+var _IOC_NONE  = 0;
+var _IOC_WRITE = 1;
+var _IOC_READ  = 2;
+var _IOC_RW    = 3;
+
+# DRM: type 'd' = 0x64
+var DRM_IOCTL_TYPE = 0x64;
+
+# drm_version: nr 0x00, RW, sizeof(struct drm_version) == 64 on x86_64
+#   0x64 | (3 << 30) | (64 << 16) | (0x64 << 8) | 0x00 == 0xC0406400
+var DRM_VERSION_SIZE = 64;
+var DRM_IOCTL_VERSION = 0xC0406400;
+
+# drm_version struct (64 bytes on x86_64):
+#   +0:  version_major      (i32)
+#   +4:  version_minor      (i32)
+#   +8:  version_patchlevel (i32)
+#   +12: pad (4)
+#   +16: name_len  (u64)  — in: buffer capacity; out: required length
+#   +24: name_ptr  (u64)  — caller-allocated char buffer
+#   +32: date_len  (u64)
+#   +40: date_ptr  (u64)
+#   +48: desc_len  (u64)
+#   +56: desc_ptr  (u64)
+
+# Render node path. renderD128 is the first unprivileged render-only
+# node; renderD129+ exist on multi-GPU systems.
+var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
+
+# ================================================================
+# Errno → GpuErr mapping (v3 Step 4f.i)
+# ================================================================
+# Native primitives return 0 on success or negative errno on
+# failure (Linux ABI convention). Slot wrappers and public
+# dispatchers want positive GPU_ERR_* codes from src/error.cyr.
+# Until v3.0 ships, we keep the existing GpuErrCode enum stable
+# and route specific errno values to the closest existing code:
+#
+#   ENOMEM  (12)      → GPU_ERR_BUFFER          (BO alloc OOM)
+#   EPERM   (1)       → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   EACCES  (13)      → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
+#   ENOENT  (2)       → GPU_ERR_ADAPTER_NOT_FOUND (no render node)
+#   EBUSY   (16)      → GPU_ERR_DEVICE_REQUEST   (device contention)
+#   ETIMEDOUT (110)   → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait)
+#   ETIME   (62)      → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait alt)
+#   default           → GPU_ERR_OTHER
+#
+# Adding a new GPU_ERR_* code (e.g. INVALID_ARG, FENCE_TIMEOUT) is
+# a v3.0+1 follow-up — error.cyr enum is part of the @public
+# surface and should not churn during v3.0 stabilisation.
+
+var _NATIVE_ERRNO_EPERM     =   1;
+var _NATIVE_ERRNO_ENOENT    =   2;
+var _NATIVE_ERRNO_ENOMEM    =  12;
+var _NATIVE_ERRNO_EACCES    =  13;
+var _NATIVE_ERRNO_EBUSY     =  16;
+var _NATIVE_ERRNO_ETIME     =  62;
+var _NATIVE_ERRNO_ETIMEDOUT = 110;
+
+# Map a positive errno to a GPU_ERR_* code. Caller passes the
+# absolute value (i.e. converted from negative-rc convention by
+# _native_neg_rc_to_gpu_err below).
+fn _native_errno_to_gpu_err(errno) {
+    if (errno == _NATIVE_ERRNO_ENOMEM)    { return GPU_ERR_BUFFER; }
+    if (errno == _NATIVE_ERRNO_EPERM)     { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EACCES)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_ENOENT)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
+    if (errno == _NATIVE_ERRNO_EBUSY)     { return GPU_ERR_DEVICE_REQUEST; }
+    if (errno == _NATIVE_ERRNO_ETIMEDOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
+    if (errno == _NATIVE_ERRNO_ETIME)     { return GPU_ERR_SURFACE_TIMEOUT; }
+    return GPU_ERR_OTHER;
+}
+
+# Map a negative-errno return code (rc <= 0 convention used by
+# native_* primitives) to 0 (success) or GPU_ERR_*. Pass the rc
+# directly; this fn handles the sign flip + mapping.
+fn _native_neg_rc_to_gpu_err(rc) {
+    if (rc == 0) { return 0; }
+    if (rc > 0)  { return _native_errno_to_gpu_err(rc); }
+    return _native_errno_to_gpu_err(0 - rc);
+}
+
+# ================================================================
+# Helpers
+# ================================================================
+
+# Encode an ioctl number. Public to make the encoding testable.
+# dir ∈ {0=NONE, 1=WRITE, 2=READ, 3=RW}
+# size must fit in 14 bits (masked to 0x3FFF)
+# type, nr are byte-sized (masked to 0xFF)
+fn native_ioc_encode(dir, size, type, nr) {
+    var d = dir & 3;
+    var s = size & 0x3FFF;
+    var t = type & 0xFF;
+    var n = nr & 0xFF;
+    return (d * 0x40000000) | (s * 0x10000) | (t * 0x100) | n;
+}
+
+# Open /dev/dri/renderD128 for read/write. Returns fd on success or
+# the negative errno on failure (Linux syscall convention). No auth
+# needed — render nodes bypass the DRM master/auth dance.
+fn native_open_render_node() {
+    return sys_open(DRM_RENDER_NODE_PATH, O_RDWR, 0);
+}
+
+# Issue DRM_IOCTL_VERSION in two passes against the given fd. First
+# pass collects version_major/minor/patchlevel + required name_len.
+# Second pass writes the driver-name string into a heap-allocated
+# buffer whose address is stored in the caller's struct.
+#
+# `ver` points to a 64-byte caller-allocated region, zeroed by the
+# caller. On success:
+#   ver + 0..12  = version triple (major, minor, patchlevel)
+#   ver + 16     = name_len (actual bytes written)
+#   ver + 24     = pointer to heap name buffer (NUL-terminated string
+#                  of length name_len; caller does not free — alloc()
+#                  memory is process-lifetime in mabda today)
+# Returns 0 on success, negative errno on ioctl failure.
+fn native_drm_version(fd, ver) {
+    # Zero the struct — caller is expected to have done this, but be
+    # defensive since we're about to issue a kernel ioctl.
+    memset(ver, 0, 64);
+
+    # Pass 1: lengths only. All _ptr fields stay 0 so kernel skips
+    # string writes but still reports required lengths.
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+
+    var name_len = load64(ver + 16);
+    if (name_len == 0) { return 0; }
+
+    # Pass 2: allocate a buffer, point name_ptr at it, re-issue.
+    # +1 for a defensive NUL terminator beyond the kernel's writeback.
+    var name_buf = alloc(name_len + 1);
+    memset(name_buf, 0, name_len + 1);
+    store64(ver + 16, name_len);  # capacity
+    store64(ver + 24, name_buf);
+
+    rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    if (rc != 0) { return rc; }
+    return 0;
+}
+
+# Convenience: full probe. Opens the render node, reads version,
+# closes fd. Fills `out` (64 bytes) with the drm_version struct.
+# Returns 0 on success, non-zero on failure (open or ioctl).
+fn native_probe_device(out) {
+    var fd = native_open_render_node();
+    if (fd < 0) { return fd; }
+    var rc = native_drm_version(fd, out);
+    sys_close(fd);
+    return rc;
+}
+
+# ================================================================
+# v3 Phase B.2 — GEM buffer object lifecycle (AMDGPU)
+# ================================================================
+# Kernel UAPI reference: /usr/include/drm/amdgpu_drm.h,
+#                        /usr/include/drm/drm.h (for generic GEM_CLOSE).
+# All numbers here are verifiable via native_ioc_encode; tests lock
+# them down in tests/tcyr/mabda.tcyr.
+
+# DRM_COMMAND_BASE = 0x40 in drm.h; AMDGPU driver-specific ioctls
+# start there. We pre-compute the absolute nr for each ioctl.
+var DRM_COMMAND_BASE       = 0x40;
+var DRM_AMDGPU_GEM_CREATE  = 0x00;
+var DRM_AMDGPU_GEM_MMAP    = 0x01;
+
+# Union / struct sizes on x86_64 (in bytes):
+#   union drm_amdgpu_gem_create { in (32) | out (8) } = 32
+#   union drm_amdgpu_gem_mmap   { in (8)  | out (8) } = 8
+#   struct drm_gem_close                              = 8
+var DRM_AMDGPU_GEM_CREATE_SIZE = 32;
+var DRM_AMDGPU_GEM_MMAP_SIZE   = 8;
+var DRM_GEM_CLOSE_SIZE         = 8;
+
+# Absolute ioctl numbers (precomputed; tests verify via native_ioc_encode):
+#   DRM_IOCTL_AMDGPU_GEM_CREATE = _IOWR('d', 0x40, union drm_amdgpu_gem_create)
+#     dir=3, size=32, type=0x64, nr=0x40 → 0xC0206440
+#   DRM_IOCTL_AMDGPU_GEM_MMAP   = _IOWR('d', 0x41, union drm_amdgpu_gem_mmap)
+#     dir=3, size=8, type=0x64, nr=0x41 → 0xC0086441
+#   DRM_IOCTL_GEM_CLOSE         = _IOW ('d', 0x09, struct drm_gem_close)
+#     dir=1, size=8, type=0x64, nr=0x09 → 0x40086409
+var DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440;
+var DRM_IOCTL_AMDGPU_GEM_MMAP   = 0xC0086441;
+var DRM_IOCTL_GEM_CLOSE         = 0x40086409;
+
+# Memory domain flags (bitwise OR for combinations; we only use CPU,
+# GTT, VRAM for Phase B.2 — the rest appear in later phases).
+var AMDGPU_GEM_DOMAIN_CPU      = 0x1;
+var AMDGPU_GEM_DOMAIN_GTT      = 0x2;
+var AMDGPU_GEM_DOMAIN_VRAM     = 0x4;
+
+# GEM BO create. Args are written into `req` (caller-owned 32 bytes,
+# will be zeroed); on success the BO handle is read back from req+0.
+# Returns 0 on success, negative errno on failure.
+#
+# `domains` is a bitmask of AMDGPU_GEM_DOMAIN_*. For a plain
+# CPU-visible buffer (Phase B.2 round-trip), use GTT.
+fn native_gem_create(fd, size, alignment, domains, domain_flags, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_CREATE_SIZE);
+    store64(req + 0,  size);
+    store64(req + 8,  alignment);
+    store64(req + 16, domains);
+    store64(req + 24, domain_flags);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
+}
+
+# Read the handle out of a req buffer that native_gem_create populated.
+fn native_gem_create_handle(req) { return load32(req + 0); }
+
+# GEM BO mmap-offset query. Given a handle, returns the offset to pass
+# as the mmap(2) `offset` argument. `req` is caller-owned 8 bytes.
+# Returns 0 on success (with offset at req+0 on out), negative errno
+# on failure.
+fn native_gem_mmap_offset(fd, handle, req) {
+    memset(req, 0, DRM_AMDGPU_GEM_MMAP_SIZE);
+    store32(req + 0, handle);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
+}
+
+fn native_gem_mmap_offset_value(req) { return load64(req + 0); }
+
+# GEM handle close. Generic DRM ioctl — not AMDGPU-specific.
+# Returns 0 on success, negative errno on failure.
+fn native_gem_close(fd, handle) {
+    var req[8];
+    store32(&req + 0, handle);
+    store32(&req + 4, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_GEM_CLOSE, &req);
+}
+
+# Convenience: create a CPU-visible GTT BO and mmap it. Populates
+# `out` (16 bytes):
+#   +0: handle       (u32 zero-extended to u64)
+#   +8: mapped_addr  (u64 from mmap return, or negative errno on failure)
+# Returns 0 on success, negative errno on failure (out+0 is valid if
+# we got past gem_create but failed at mmap; caller should gem_close
+# the handle in that case).
+fn native_bo_create_gtt(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_GTT, out);
+}
+
+# Shader BOs may need VRAM domain on some hardware — on Cezanne
+# (Vega APU) physical memory is shared, but the domain flag affects
+# residency semantics. Per Mesa rusticl behavior, shader code lives
+# in VRAM-domain BOs.
+fn native_bo_create_vram(fd, size, out) {
+    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_VRAM, out);
+}
+
+fn _native_bo_create_domain(fd, size, domain, out) {
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+
+    var req[32];
+    # For VRAM-domain on APUs we need CPU_ACCESS_REQUIRED (bit 0) so
+    # the BO lands in BAR-accessible VRAM we can mmap.
+    var flags = 0;
+    if (domain == AMDGPU_GEM_DOMAIN_VRAM) { flags = 1; }  # CPU_ACCESS_REQUIRED
+    var rc = native_gem_create(fd, size, 4096, domain, flags, &req);
+    if (rc != 0) { return rc; }
+    var handle = native_gem_create_handle(&req);
+    store64(out + 0, handle);
+
+    var mreq[8];
+    rc = native_gem_mmap_offset(fd, handle, &mreq);
+    if (rc != 0) { return rc; }
+    var offset = native_gem_mmap_offset_value(&mreq);
+
+    var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+    if (addr < 0) { return addr; }
+    store64(out + 8, addr);
+    return 0;
+}
+
+# Release a BO created via native_bo_create_gtt: munmap, then
+# gem_close. Returns 0 on success.
+fn native_bo_release_gtt(fd, handle, addr, size) {
+    if (addr != 0) { cyr_munmap(addr, size); }
+    if (handle != 0) { native_gem_close(fd, handle); }
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B.3.a — submission infrastructure (ctx, BO list, VA map)
+# ================================================================
+# Prerequisites for DRM_IOCTL_AMDGPU_CS (Phase B.3.d):
+#   1. GPU context — isolates submissions from other processes.
+#   2. BO list — residency tracking (kernel keeps listed BOs live).
+#   3. VA map — gives the BO a virtual address in the process's GPU
+#      address space. Without this the GPU cannot touch the BO.
+# All three are cheap, ioctl-only, no PM4 yet.
+
+var DRM_AMDGPU_CTX      = 0x02;
+var DRM_AMDGPU_BO_LIST  = 0x03;
+var DRM_AMDGPU_GEM_VA   = 0x08;
+
+# Union / struct sizes (bytes):
+#   union drm_amdgpu_ctx       { in(16) | out(16) } = 16
+#   union drm_amdgpu_bo_list   { in(24) | out(8)  } = 24
+#   struct drm_amdgpu_gem_va                        = 64
+#   struct drm_amdgpu_bo_list_entry                 = 8
+var DRM_AMDGPU_CTX_SIZE              = 16;
+var DRM_AMDGPU_BO_LIST_SIZE          = 24;
+var DRM_AMDGPU_GEM_VA_SIZE           = 64;
+var DRM_AMDGPU_BO_LIST_ENTRY_SIZE    = 8;
+
+# Precomputed ioctl numbers; native_ioc_encode-verified in tests.
+var DRM_IOCTL_AMDGPU_CTX     = 0xC0106442;
+var DRM_IOCTL_AMDGPU_BO_LIST = 0xC0186443;
+var DRM_IOCTL_AMDGPU_GEM_VA  = 0x40406448;
+
+# Context operations.
+var AMDGPU_CTX_OP_ALLOC_CTX = 1;
+var AMDGPU_CTX_OP_FREE_CTX  = 2;
+
+# BO list operations.
+var AMDGPU_BO_LIST_OP_CREATE  = 0;
+var AMDGPU_BO_LIST_OP_DESTROY = 1;
+
+# VA operations.
+var AMDGPU_VA_OP_MAP   = 1;
+var AMDGPU_VA_OP_UNMAP = 2;
+
+# VM page flags.
+var AMDGPU_VM_PAGE_READABLE   = 0x2;
+var AMDGPU_VM_PAGE_WRITEABLE  = 0x4;
+var AMDGPU_VM_PAGE_EXECUTABLE = 0x8;
+
+# ================================================================
+# BO page-perm constants (v3 Step 4f.ii)
+# ================================================================
+# Per-BO page perms for the AMDGPU VA mapping. Session 25b granted
+# R | W | X everywhere as a workaround during bring-up. Step 4f.ii
+# narrows back to the per-BO minimum each role needs — empirically
+# verified on Cezanne kernel 6.18.24:
+#
+#   _NATIVE_PERM_SHADER (R | X)  shader BOs — CP fetches, the wave
+#                                executes from these pages. CPU
+#                                writes shader bytes via the host
+#                                mmap (separate page table), so
+#                                GPU W is not required.
+#   _NATIVE_PERM_DATA   (R | W)  data BOs — stub, output, fence.
+#                                HW reads V# state / output target,
+#                                CP writes diagnostic markers,
+#                                kernel writes user fence seqno.
+#   _NATIVE_PERM_IB     (R | X)  IB BOs — CP only reads PM4 from
+#                                these, but on Cezanne the X bit is
+#                                load-bearing: dropping X causes the
+#                                compute ring to TDR. Hardware
+#                                bisect during Step 4f.ii (R-only,
+#                                R+W, R+X all tested) — only R+X
+#                                makes the dispatch land. AMDGPU
+#                                gates CP fetch through the execute
+#                                bit even though PM4 isn'"'"'t shader
+#                                code. The W bit is not required.
+#
+# Earlier this session a constants-init-order bug had _NATIVE_PERM_*
+# evaluating to 0 (referenced AMDGPU_VM_PAGE_* before they were
+# defined). The block now sits AFTER the AMDGPU_VM_PAGE_* defs,
+# which Cyrius initialises in declaration order. The CPU regression
+# test in tests/tcyr/mabda_v3.tcyr locks the values so further
+# narrowing trips a test before reaching hardware.
+
+var _NATIVE_PERM_FULL   = AMDGPU_VM_PAGE_READABLE
+| AMDGPU_VM_PAGE_WRITEABLE
+| AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_SHADER = AMDGPU_VM_PAGE_READABLE
+| AMDGPU_VM_PAGE_EXECUTABLE;
+var _NATIVE_PERM_DATA   = AMDGPU_VM_PAGE_READABLE
+| AMDGPU_VM_PAGE_WRITEABLE;
+var _NATIVE_PERM_IB     = AMDGPU_VM_PAGE_READABLE
+| AMDGPU_VM_PAGE_EXECUTABLE;
+
+# Sensible default for a first-BO VA base — 2 MiB into the GPU VA
+# space, well above any kernel-reserved low region. Phase B.3.a only
+# supports one-BO-at-a-time; a full VA allocator lands in B.3.b.
+var NATIVE_GPU_VA_BASE = 0x200000;
+
+# Context lifecycle. `req` is caller-owned 16 bytes.
+# On ALLOC: sets in={op=1, flags=0, ctx_id=0, priority=0}; kernel
+# writes out.alloc.ctx_id at req+0.
+fn native_ctx_alloc(fd, req) {
+    memset(req, 0, DRM_AMDGPU_CTX_SIZE);
+    store32(req + 0,  AMDGPU_CTX_OP_ALLOC_CTX);
+    store32(req + 4,  0);
+    store32(req + 8,  0);
+    store32(req + 12, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
+}
+
+fn native_ctx_alloc_id(req) { return load32(req + 0); }
+
+fn native_ctx_free(fd, ctx_id) {
+    var req[16];
+    memset(&req, 0, 16);
+    store32(&req + 0,  AMDGPU_CTX_OP_FREE_CTX);
+    store32(&req + 4,  0);
+    store32(&req + 8,  ctx_id);
+    store32(&req + 12, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &req);
+}
+
+# BO list lifecycle. `entries` points to an array of
+# drm_amdgpu_bo_list_entry (8 bytes each); `count` is the element
+# count. `req` is caller-owned 24 bytes; on CREATE success,
+# out.list_handle is at req+0.
+fn native_bo_list_create(fd, entries, count, req) {
+    memset(req, 0, DRM_AMDGPU_BO_LIST_SIZE);
+    store32(req + 0,  AMDGPU_BO_LIST_OP_CREATE);
+    store32(req + 4,  0);  # list_handle (in): 0 = create new
+    store32(req + 8,  count);
+    store32(req + 12, DRM_AMDGPU_BO_LIST_ENTRY_SIZE);
+    store64(req + 16, entries);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, req);
+}
+
+fn native_bo_list_create_handle(req) { return load32(req + 0); }
+
+fn native_bo_list_destroy(fd, list_handle) {
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0, AMDGPU_BO_LIST_OP_DESTROY);
+    store32(&req + 4, list_handle);
+    store32(&req + 8, 0);
+    store32(&req + 12, 0);
+    store64(&req + 16, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, &req);
+}
+
+# VA map / unmap. `va_address` and `size` must be page-aligned
+# (4 KiB). `flags` combines AMDGPU_VM_PAGE_*.
+fn native_gem_va_map(fd, handle, va_address, size, flags) {
+    var req[64];
+    memset(&req, 0, 64);
+    store32(&req + 0,  handle);
+    store32(&req + 4,  0);
+    store32(&req + 8,  AMDGPU_VA_OP_MAP);
+    store32(&req + 12, flags);
+    store64(&req + 16, va_address);
+    store64(&req + 24, 0);       # offset_in_bo
+    store64(&req + 32, size);
+    # vm_timeline_point / syncobjs stay zero; unused by legacy CS path.
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+}
+
+fn native_gem_va_unmap(fd, handle, va_address, size) {
+    var req[64];
+    memset(&req, 0, 64);
+    store32(&req + 0,  handle);
+    store32(&req + 4,  0);
+    store32(&req + 8,  AMDGPU_VA_OP_UNMAP);
+    store32(&req + 12, 0);
+    store64(&req + 16, va_address);
+    store64(&req + 24, 0);
+    store64(&req + 32, size);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+}
+
+# ================================================================
+# v3 Phase B.3.d — syncobj lifecycle (generic DRM, not AMDGPU-specific)
+# ================================================================
+# drm_syncobj_create  = {handle u32, flags u32} = 8 bytes
+# drm_syncobj_destroy = {handle u32, pad u32}  = 8 bytes
+# drm_syncobj_wait    = {handles u64, timeout_nsec s64, count_handles u32,
+#                        flags u32, first_signaled u32, pad u32,
+#                        deadline_nsec u64} = 40 bytes (kernel ≥ 6.10)
+var DRM_SYNCOBJ_CREATE_SIZE   = 8;
+var DRM_SYNCOBJ_DESTROY_SIZE  = 8;
+var DRM_SYNCOBJ_WAIT_SIZE     = 40;
+
+# Generic DRM ioctls: nr values 0xBF / 0xC0 / 0xC3.
+var DRM_IOCTL_SYNCOBJ_CREATE  = 0xC00864BF;
+var DRM_IOCTL_SYNCOBJ_DESTROY = 0xC00864C0;
+var DRM_IOCTL_SYNCOBJ_WAIT    = 0xC02864C3;
+
+var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL         = 0x1;
+var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT  = 0x2;
+
+# Create a syncobj. Returns handle on success, negative errno on
+# failure. Handle returned via writable req+0.
+fn native_syncobj_create(fd, out_handle_ptr) {
+    var req[8];
+    store32(&req + 0, 0);
+    store32(&req + 4, 0);
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_CREATE, &req);
+    if (rc != 0) { return rc; }
+    store64(out_handle_ptr, load32(&req + 0));
+    return 0;
+}
+
+fn native_syncobj_destroy(fd, handle) {
+    var req[8];
+    store32(&req + 0, handle);
+    store32(&req + 4, 0);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_DESTROY, &req);
+}
+
+# Wait for the syncobj to become signaled. `timeout_ns` is absolute
+# CLOCK_MONOTONIC nanoseconds. Returns 0 on signaled, negative errno
+# on timeout or error. Caller supplies one handle.
+fn native_syncobj_wait(fd, handle, timeout_ns) {
+    var handles[8];
+    store64(&handles + 0, handle);
+    var req[40];
+    memset(&req, 0, 40);
+    store64(&req + 0,  &handles);       # handles ptr
+    store64(&req + 8,  timeout_ns);     # timeout_nsec (absolute)
+    store32(&req + 16, 1);              # count_handles
+    store32(&req + 20, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+    store32(&req + 24, 0);              # first_signaled (out)
+    store32(&req + 28, 0);              # pad
+    store64(&req + 32, 0);              # deadline_nsec
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_WAIT, &req);
+}
+
+# ================================================================
+# v3 Phase B.3.d — CS (command submission) ioctl
+# ================================================================
+# union drm_amdgpu_cs { in (24) | out (8) } = 24
+# struct drm_amdgpu_cs_chunk                = 16 (id u32 + length_dw u32 + data u64)
+# struct drm_amdgpu_cs_chunk_ib             = 32 (pad u32 + flags u32 + va_start u64
+#                                              + ib_bytes u32 + ip_type u32
+#                                              + ip_instance u32 + ring u32)
+# struct drm_amdgpu_cs_chunk_sem            = 4  (handle u32 only)
+#   Used by DEPENDENCIES / SYNCOBJ_IN / SYNCOBJ_OUT / SCHEDULED_DEPENDENCIES.
+# struct drm_amdgpu_cs_chunk_syncobj        = 16 (handle u32 + flags u32 + point u64)
+#   Used by SYNCOBJ_TIMELINE_WAIT / SYNCOBJ_TIMELINE_SIGNAL only.
+var DRM_AMDGPU_CS                     = 0x04;
+var DRM_AMDGPU_CS_SIZE                = 24;
+var DRM_AMDGPU_CS_CHUNK_SIZE          = 16;
+var DRM_AMDGPU_CS_CHUNK_IB_SIZE       = 32;
+var DRM_AMDGPU_CS_CHUNK_SEM_SIZE      = 4;
+var DRM_AMDGPU_CS_CHUNK_SYNCOBJ_SIZE  = 16;
+var DRM_IOCTL_AMDGPU_CS               = 0xC0186444;
+
+var AMDGPU_CHUNK_ID_IB           = 0x01;
+var AMDGPU_CHUNK_ID_FENCE        = 0x02;
+var AMDGPU_CHUNK_ID_SYNCOBJ_OUT  = 0x05;
+var AMDGPU_CHUNK_ID_BO_HANDLES   = 0x06;
+
+var AMDGPU_HW_IP_GFX      = 0;
+var AMDGPU_HW_IP_COMPUTE  = 1;
+
+# Submit a command stream with one IB chunk + one SYNCOBJ_OUT chunk.
+# Returns 0 on success (CS ioctl accepted). The syncobj becomes
+# signaled when the GPU finishes the submission; caller waits via
+# native_syncobj_wait.
+#
+# Arguments:
+#   fd             — DRM render-node fd
+#   ctx_id         — from native_ctx_alloc
+#   bo_list_handle — from native_bo_list_create
+#   ib_va          — GPU virtual address of the IB (PM4 stream)
+#   ib_bytes       — size of the PM4 stream (multiple of 4)
+#   ip_type        — AMDGPU_HW_IP_COMPUTE or AMDGPU_HW_IP_GFX
+#   syncobj_handle — pre-created syncobj to signal on completion (or 0 to omit)
+fn native_cs_submit(fd, ctx_id, bo_list_handle, ib_va, ib_bytes, ip_type, syncobj_handle) {
+    # Build IB chunk payload (32 bytes).
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);         # _pad
+    store32(&ib_chunk + 4,  0);         # flags
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);         # ip_instance
+    store32(&ib_chunk + 28, 0);         # ring
+
+    # Build SYNCOBJ_OUT chunk payload. The kernel treats this chunk as
+    # an array of drm_amdgpu_cs_chunk_sem (4 bytes: handle only) — NOT
+    # the 16-byte drm_amdgpu_cs_chunk_syncobj (which is timeline-only).
+    # Getting this wrong manifests as -EINVAL because the kernel reads
+    # more "handles" than you meant and 0-valued slots fail syncobj
+    # lookup. See feedback memory & CHANGELOG note for v3 Phase B.3.d.
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var include_sync = 1;
+    if (syncobj_handle == 0) { include_sync = 0; }
+
+    # Build chunk descriptors (16 bytes each).
+    var chunks[32];
+    memset(&chunks, 0, 32);
+    store32(&chunks + 0,  AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + 4,  32 / 4);       # length_dw = 8 (IB chunk payload)
+    store64(&chunks + 8,  &ib_chunk);
+
+    if (include_sync == 1) {
+        store32(&chunks + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+        store32(&chunks + 20, 1);         # length_dw = 1 (single u32 handle)
+        store64(&chunks + 24, &syncobj_chunk);
+    }
+
+    var chunk_ptrs[16];
+    store64(&chunk_ptrs + 0, &chunks);
+    if (include_sync == 1) {
+        store64(&chunk_ptrs + 8, &chunks + 16);
+    }
+
+    var num_chunks = 1 + include_sync;
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  bo_list_handle);
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);                # flags
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the BO_HANDLES chunk path (Mesa rusticl pattern) instead
+# of the BO_LIST_OP_CREATE ioctl. The kernel parser at drivers/gpu/drm/amd/
+# amdgpu/amdgpu_cs.c:p1_bo_handles consumes the chunk_data as a
+# drm_amdgpu_bo_list_in (24 bytes); its bo_info_ptr field then points to the
+# array of {handle u32, priority u32} entries. cs.in.bo_list_handle is
+# unused (the BO list is reconstructed from the chunk).
+#
+# Caller pre-builds bo_list_in (24 bytes) with:
+#   off  0: operation    = 0xFFFFFFFF  (sentinel — kernel infers from chunk)
+#   off  4: list_handle  = 0xFFFFFFFF  (sentinel)
+#   off  8: bo_number    = N
+#   off 12: bo_info_size = 8           (sizeof drm_amdgpu_bo_list_entry)
+#   off 16: bo_info_ptr  = &entries    (N × {u32 handle, u32 priority})
+#
+# Chunk order matches Mesa's amdgpu_cs_submit_ib_kernelq:
+#   1. BO_HANDLES
+#   2. SYNCOBJ_OUT  (when syncobj_handle != 0)
+#   3. IB
+fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type, syncobj_handle) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  0);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var include_sync = 1;
+    if (syncobj_handle == 0) { include_sync = 0; }
+
+    # Up to 3 chunk descriptors (16 bytes each): BO_HANDLES, SYNCOBJ_OUT, IB.
+    var chunks[48];
+    memset(&chunks, 0, 48);
+    # 1. BO_HANDLES — length_dw = sizeof(drm_amdgpu_bo_list_in)/4 = 6.
+    store32(&chunks + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks + 4,  6);
+    store64(&chunks + 8,  bo_list_in_ptr);
+
+    var pos = 16;
+    if (include_sync == 1) {
+        store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+        store32(&chunks + pos + 4,  1);
+        store64(&chunks + pos + 8,  &syncobj_chunk);
+        pos = pos + 16;
+    }
+    # IB chunk last (matches Mesa).
+    store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + pos + 4,  32 / 4);
+    store64(&chunks + pos + 8,  &ib_chunk);
+
+    var num_chunks = 2 + include_sync;
+
+    var chunk_ptrs[24];
+    store64(&chunk_ptrs + 0,  &chunks + 0);
+    if (include_sync == 1) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+        store64(&chunk_ptrs + 16, &chunks + 32);
+    }
+    if (include_sync == 0) {
+        store64(&chunk_ptrs + 8,  &chunks + 16);
+    }
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  0);                # bo_list_handle = 0 (chunk replaces it)
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+}
+
+# Submit a CS using the full 4-chunk Mesa-rusticl shape:
+# BO_HANDLES + SYNCOBJ_OUT + FENCE + IB, with caller-provided IB flags.
+# This is the byte-shape that the working session-25b C spike uses
+# (deps/libdrm_store_spike_v3.c). The 3-chunk variant
+# native_cs_submit_inline_bos (without FENCE) accepts the submit ioctl
+# but never queues the IB to MEC for compute on this kernel — TDR fires
+# after 10s and the syncobj signals as if the IB completed.
+#
+# Caller pre-builds bo_list_in (24 bytes) per native_cs_submit_inline_bos.
+# fence_kh = KMS handle of a BO mapped into the GPU VA space. The kernel
+# writes the IB completion sequence number to (fence_bo + fence_offset),
+# 8 bytes. fence_offset is typically 32 (matches Mesa).
+# ib_flags = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (0x08) for compute.
+fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
+syncobj_handle, fence_kh, fence_offset, ib_flags) {
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  ib_flags);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    var syncobj_chunk[4];
+    store32(&syncobj_chunk + 0, syncobj_handle);
+
+    var fence_chunk[8];
+    store32(&fence_chunk + 0, fence_kh);
+    store32(&fence_chunk + 4, fence_offset);
+
+    var chunks_4[64];
+    memset(&chunks_4, 0, 64);
+    store32(&chunks_4 + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks_4 + 4,  6);
+    store64(&chunks_4 + 8,  bo_list_in_ptr);
+    store32(&chunks_4 + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
+    store32(&chunks_4 + 20, 1);
+    store64(&chunks_4 + 24, &syncobj_chunk);
+    store32(&chunks_4 + 32, AMDGPU_CHUNK_ID_FENCE);
+    store32(&chunks_4 + 36, 2);
+    store64(&chunks_4 + 40, &fence_chunk);
+    store32(&chunks_4 + 48, AMDGPU_CHUNK_ID_IB);
+    store32(&chunks_4 + 52, 32 / 4);
+    store64(&chunks_4 + 56, &ib_chunk);
+
+    var chunk_ptrs_4[32];
+    store64(&chunk_ptrs_4 + 0,  &chunks_4 + 0);
+    store64(&chunk_ptrs_4 + 8,  &chunks_4 + 16);
+    store64(&chunk_ptrs_4 + 16, &chunks_4 + 32);
+    store64(&chunk_ptrs_4 + 24, &chunks_4 + 48);
+
+    var req_4[24];
+    memset(&req_4, 0, 24);
+    store32(&req_4 + 0,  ctx_id);
+    store32(&req_4 + 4,  0);
+    store32(&req_4 + 8,  4);
+    store32(&req_4 + 12, 0);
+    store64(&req_4 + 16, &chunk_ptrs_4);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
+}
+

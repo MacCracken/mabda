@@ -1,2036 +1,29 @@
-# @internal — native GPU backend (v3.0, ADR 006)
-# backend_native.cyr — pure-Cyrius GPU backend via direct DRM ioctls
+# @internal — native GPU backend, dispatch + slot fillers + integration
+# backend_native.cyr — Backend interface implementation for the native AMD path
 #
-# v3 Phase B subdivision status:
-#   B.0 — research: done (see ../vidya/content/direct_drm_gpu_compute)
-#   B.1 — device enum + capability query: THIS FILE (current)
-#   B.2 — GEM BO create/map/round-trip: pending
-#   B.3 — pre-compiled compute shader dispatch: pending
-#   B.4 — fence + readback + wgpu parity: pending
+# Split at v3 rc.2 (audit toolchain item) — the foundational ioctl
+# wrappers, PM4 builders, and GFX9 ISA shaders moved out into
+# backend_native_amdgpu.cyr / backend_native_pm4.cyr /
+# backend_native_shaders.cyr respectively. This file owns the
+# integration layer:
+#   - native_compute_dispatch_cached + native_render_dispatch_simple
+#     (the load-bearing CS-submit drivers, both routed through the
+#     per-context cached IB + fence BOs from gpu_context_new_native)
+#   - native_render_handles_write + native_render_bo_list_pack
+#     (helpers for the GFX-ring submit shape)
+#   - native_ctx_* field accessors against the GpuContext struct's
+#     +0..+112 native-mode interpretation
+#   - native_buf_pair_write (the (handle, va) pair shape compute
+#     dispatch consumes)
+#   - All `_backend_native_*` slot fillers wired into backend_native_new()
+#     — context, buffer, shader-module, compute-dispatch, device-wait,
+#     texture, render-target, render-pipeline, render-pass-{begin,draw,end},
+#     surface-{configure,acquire,present,release}.
+#   - native_texture_* / native_rt_* primitives + NativeRenderPipeline +
+#     NativePass struct shapes.
 #
-# Path chosen: CS + PM4 via /dev/dri/renderD128 (unified path shared
-# with graphics in Phase C, rather than KFD+AQL compute-only). See
-# design doc docs/proposals/v3-native-api-principles.md Phase B.
-#
-# All data types are i64 / u64 unless noted. drm_version struct layout
-# mirrors include/uapi/drm/drm.h on x86_64 Linux. No libdrm — direct
-# syscall(SYS_IOCTL) only.
-
-# ================================================================
-# Constants
-# ================================================================
-# DRM ioctl encoding mirrors include/uapi/asm-generic/ioctl.h:
-#   _IOC(dir, type, nr, size) = (dir << 30) | (size << 16) | (type << 8) | nr
-# Size field is 14 bits, type 8, nr 8, dir 2.
-var _IOC_NONE  = 0;
-var _IOC_WRITE = 1;
-var _IOC_READ  = 2;
-var _IOC_RW    = 3;
-
-# DRM: type 'd' = 0x64
-var DRM_IOCTL_TYPE = 0x64;
-
-# drm_version: nr 0x00, RW, sizeof(struct drm_version) == 64 on x86_64
-#   0x64 | (3 << 30) | (64 << 16) | (0x64 << 8) | 0x00 == 0xC0406400
-var DRM_VERSION_SIZE = 64;
-var DRM_IOCTL_VERSION = 0xC0406400;
-
-# drm_version struct (64 bytes on x86_64):
-#   +0:  version_major      (i32)
-#   +4:  version_minor      (i32)
-#   +8:  version_patchlevel (i32)
-#   +12: pad (4)
-#   +16: name_len  (u64)  — in: buffer capacity; out: required length
-#   +24: name_ptr  (u64)  — caller-allocated char buffer
-#   +32: date_len  (u64)
-#   +40: date_ptr  (u64)
-#   +48: desc_len  (u64)
-#   +56: desc_ptr  (u64)
-
-# Render node path. renderD128 is the first unprivileged render-only
-# node; renderD129+ exist on multi-GPU systems.
-var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
-
-# ================================================================
-# Errno → GpuErr mapping (v3 Step 4f.i)
-# ================================================================
-# Native primitives return 0 on success or negative errno on
-# failure (Linux ABI convention). Slot wrappers and public
-# dispatchers want positive GPU_ERR_* codes from src/error.cyr.
-# Until v3.0 ships, we keep the existing GpuErrCode enum stable
-# and route specific errno values to the closest existing code:
-#
-#   ENOMEM  (12)      → GPU_ERR_BUFFER          (BO alloc OOM)
-#   EPERM   (1)       → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
-#   EACCES  (13)      → GPU_ERR_ADAPTER_NOT_FOUND (no DRM access)
-#   ENOENT  (2)       → GPU_ERR_ADAPTER_NOT_FOUND (no render node)
-#   EBUSY   (16)      → GPU_ERR_DEVICE_REQUEST   (device contention)
-#   ETIMEDOUT (110)   → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait)
-#   ETIME   (62)      → GPU_ERR_SURFACE_TIMEOUT  (syncobj wait alt)
-#   default           → GPU_ERR_OTHER
-#
-# Adding a new GPU_ERR_* code (e.g. INVALID_ARG, FENCE_TIMEOUT) is
-# a v3.0+1 follow-up — error.cyr enum is part of the @public
-# surface and should not churn during v3.0 stabilisation.
-
-var _NATIVE_ERRNO_EPERM     =   1;
-var _NATIVE_ERRNO_ENOENT    =   2;
-var _NATIVE_ERRNO_ENOMEM    =  12;
-var _NATIVE_ERRNO_EACCES    =  13;
-var _NATIVE_ERRNO_EBUSY     =  16;
-var _NATIVE_ERRNO_ETIME     =  62;
-var _NATIVE_ERRNO_ETIMEDOUT = 110;
-
-# Map a positive errno to a GPU_ERR_* code. Caller passes the
-# absolute value (i.e. converted from negative-rc convention by
-# _native_neg_rc_to_gpu_err below).
-fn _native_errno_to_gpu_err(errno) {
-    if (errno == _NATIVE_ERRNO_ENOMEM)    { return GPU_ERR_BUFFER; }
-    if (errno == _NATIVE_ERRNO_EPERM)     { return GPU_ERR_ADAPTER_NOT_FOUND; }
-    if (errno == _NATIVE_ERRNO_EACCES)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
-    if (errno == _NATIVE_ERRNO_ENOENT)    { return GPU_ERR_ADAPTER_NOT_FOUND; }
-    if (errno == _NATIVE_ERRNO_EBUSY)     { return GPU_ERR_DEVICE_REQUEST; }
-    if (errno == _NATIVE_ERRNO_ETIMEDOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
-    if (errno == _NATIVE_ERRNO_ETIME)     { return GPU_ERR_SURFACE_TIMEOUT; }
-    return GPU_ERR_OTHER;
-}
-
-# Map a negative-errno return code (rc <= 0 convention used by
-# native_* primitives) to 0 (success) or GPU_ERR_*. Pass the rc
-# directly; this fn handles the sign flip + mapping.
-fn _native_neg_rc_to_gpu_err(rc) {
-    if (rc == 0) { return 0; }
-    if (rc > 0)  { return _native_errno_to_gpu_err(rc); }
-    return _native_errno_to_gpu_err(0 - rc);
-}
-
-# ================================================================
-# Helpers
-# ================================================================
-
-# Encode an ioctl number. Public to make the encoding testable.
-# dir ∈ {0=NONE, 1=WRITE, 2=READ, 3=RW}
-# size must fit in 14 bits (masked to 0x3FFF)
-# type, nr are byte-sized (masked to 0xFF)
-fn native_ioc_encode(dir, size, type, nr) {
-    var d = dir & 3;
-    var s = size & 0x3FFF;
-    var t = type & 0xFF;
-    var n = nr & 0xFF;
-    return (d * 0x40000000) | (s * 0x10000) | (t * 0x100) | n;
-}
-
-# Open /dev/dri/renderD128 for read/write. Returns fd on success or
-# the negative errno on failure (Linux syscall convention). No auth
-# needed — render nodes bypass the DRM master/auth dance.
-fn native_open_render_node() {
-    return sys_open(DRM_RENDER_NODE_PATH, O_RDWR, 0);
-}
-
-# Issue DRM_IOCTL_VERSION in two passes against the given fd. First
-# pass collects version_major/minor/patchlevel + required name_len.
-# Second pass writes the driver-name string into a heap-allocated
-# buffer whose address is stored in the caller's struct.
-#
-# `ver` points to a 64-byte caller-allocated region, zeroed by the
-# caller. On success:
-#   ver + 0..12  = version triple (major, minor, patchlevel)
-#   ver + 16     = name_len (actual bytes written)
-#   ver + 24     = pointer to heap name buffer (NUL-terminated string
-#                  of length name_len; caller does not free — alloc()
-#                  memory is process-lifetime in mabda today)
-# Returns 0 on success, negative errno on ioctl failure.
-fn native_drm_version(fd, ver) {
-    # Zero the struct — caller is expected to have done this, but be
-    # defensive since we're about to issue a kernel ioctl.
-    memset(ver, 0, 64);
-
-    # Pass 1: lengths only. All _ptr fields stay 0 so kernel skips
-    # string writes but still reports required lengths.
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
-    if (rc != 0) { return rc; }
-
-    var name_len = load64(ver + 16);
-    if (name_len == 0) { return 0; }
-
-    # Pass 2: allocate a buffer, point name_ptr at it, re-issue.
-    # +1 for a defensive NUL terminator beyond the kernel's writeback.
-    var name_buf = alloc(name_len + 1);
-    memset(name_buf, 0, name_len + 1);
-    store64(ver + 16, name_len);  # capacity
-    store64(ver + 24, name_buf);
-
-    rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
-    if (rc != 0) { return rc; }
-    return 0;
-}
-
-# Convenience: full probe. Opens the render node, reads version,
-# closes fd. Fills `out` (64 bytes) with the drm_version struct.
-# Returns 0 on success, non-zero on failure (open or ioctl).
-fn native_probe_device(out) {
-    var fd = native_open_render_node();
-    if (fd < 0) { return fd; }
-    var rc = native_drm_version(fd, out);
-    sys_close(fd);
-    return rc;
-}
-
-# ================================================================
-# v3 Phase B.2 — GEM buffer object lifecycle (AMDGPU)
-# ================================================================
-# Kernel UAPI reference: /usr/include/drm/amdgpu_drm.h,
-#                        /usr/include/drm/drm.h (for generic GEM_CLOSE).
-# All numbers here are verifiable via native_ioc_encode; tests lock
-# them down in tests/tcyr/mabda.tcyr.
-
-# DRM_COMMAND_BASE = 0x40 in drm.h; AMDGPU driver-specific ioctls
-# start there. We pre-compute the absolute nr for each ioctl.
-var DRM_COMMAND_BASE       = 0x40;
-var DRM_AMDGPU_GEM_CREATE  = 0x00;
-var DRM_AMDGPU_GEM_MMAP    = 0x01;
-
-# Union / struct sizes on x86_64 (in bytes):
-#   union drm_amdgpu_gem_create { in (32) | out (8) } = 32
-#   union drm_amdgpu_gem_mmap   { in (8)  | out (8) } = 8
-#   struct drm_gem_close                              = 8
-var DRM_AMDGPU_GEM_CREATE_SIZE = 32;
-var DRM_AMDGPU_GEM_MMAP_SIZE   = 8;
-var DRM_GEM_CLOSE_SIZE         = 8;
-
-# Absolute ioctl numbers (precomputed; tests verify via native_ioc_encode):
-#   DRM_IOCTL_AMDGPU_GEM_CREATE = _IOWR('d', 0x40, union drm_amdgpu_gem_create)
-#     dir=3, size=32, type=0x64, nr=0x40 → 0xC0206440
-#   DRM_IOCTL_AMDGPU_GEM_MMAP   = _IOWR('d', 0x41, union drm_amdgpu_gem_mmap)
-#     dir=3, size=8, type=0x64, nr=0x41 → 0xC0086441
-#   DRM_IOCTL_GEM_CLOSE         = _IOW ('d', 0x09, struct drm_gem_close)
-#     dir=1, size=8, type=0x64, nr=0x09 → 0x40086409
-var DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440;
-var DRM_IOCTL_AMDGPU_GEM_MMAP   = 0xC0086441;
-var DRM_IOCTL_GEM_CLOSE         = 0x40086409;
-
-# Memory domain flags (bitwise OR for combinations; we only use CPU,
-# GTT, VRAM for Phase B.2 — the rest appear in later phases).
-var AMDGPU_GEM_DOMAIN_CPU      = 0x1;
-var AMDGPU_GEM_DOMAIN_GTT      = 0x2;
-var AMDGPU_GEM_DOMAIN_VRAM     = 0x4;
-
-# GEM BO create. Args are written into `req` (caller-owned 32 bytes,
-# will be zeroed); on success the BO handle is read back from req+0.
-# Returns 0 on success, negative errno on failure.
-#
-# `domains` is a bitmask of AMDGPU_GEM_DOMAIN_*. For a plain
-# CPU-visible buffer (Phase B.2 round-trip), use GTT.
-fn native_gem_create(fd, size, alignment, domains, domain_flags, req) {
-    memset(req, 0, DRM_AMDGPU_GEM_CREATE_SIZE);
-    store64(req + 0,  size);
-    store64(req + 8,  alignment);
-    store64(req + 16, domains);
-    store64(req + 24, domain_flags);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
-}
-
-# Read the handle out of a req buffer that native_gem_create populated.
-fn native_gem_create_handle(req) { return load32(req + 0); }
-
-# GEM BO mmap-offset query. Given a handle, returns the offset to pass
-# as the mmap(2) `offset` argument. `req` is caller-owned 8 bytes.
-# Returns 0 on success (with offset at req+0 on out), negative errno
-# on failure.
-fn native_gem_mmap_offset(fd, handle, req) {
-    memset(req, 0, DRM_AMDGPU_GEM_MMAP_SIZE);
-    store32(req + 0, handle);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
-}
-
-fn native_gem_mmap_offset_value(req) { return load64(req + 0); }
-
-# GEM handle close. Generic DRM ioctl — not AMDGPU-specific.
-# Returns 0 on success, negative errno on failure.
-fn native_gem_close(fd, handle) {
-    var req[8];
-    store32(&req + 0, handle);
-    store32(&req + 4, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_GEM_CLOSE, &req);
-}
-
-# Convenience: create a CPU-visible GTT BO and mmap it. Populates
-# `out` (16 bytes):
-#   +0: handle       (u32 zero-extended to u64)
-#   +8: mapped_addr  (u64 from mmap return, or negative errno on failure)
-# Returns 0 on success, negative errno on failure (out+0 is valid if
-# we got past gem_create but failed at mmap; caller should gem_close
-# the handle in that case).
-fn native_bo_create_gtt(fd, size, out) {
-    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_GTT, out);
-}
-
-# Shader BOs may need VRAM domain on some hardware — on Cezanne
-# (Vega APU) physical memory is shared, but the domain flag affects
-# residency semantics. Per Mesa rusticl behavior, shader code lives
-# in VRAM-domain BOs.
-fn native_bo_create_vram(fd, size, out) {
-    return _native_bo_create_domain(fd, size, AMDGPU_GEM_DOMAIN_VRAM, out);
-}
-
-fn _native_bo_create_domain(fd, size, domain, out) {
-    store64(out + 0, 0);
-    store64(out + 8, 0);
-
-    var req[32];
-    # For VRAM-domain on APUs we need CPU_ACCESS_REQUIRED (bit 0) so
-    # the BO lands in BAR-accessible VRAM we can mmap.
-    var flags = 0;
-    if (domain == AMDGPU_GEM_DOMAIN_VRAM) { flags = 1; }  # CPU_ACCESS_REQUIRED
-    var rc = native_gem_create(fd, size, 4096, domain, flags, &req);
-    if (rc != 0) { return rc; }
-    var handle = native_gem_create_handle(&req);
-    store64(out + 0, handle);
-
-    var mreq[8];
-    rc = native_gem_mmap_offset(fd, handle, &mreq);
-    if (rc != 0) { return rc; }
-    var offset = native_gem_mmap_offset_value(&mreq);
-
-    var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-    if (addr < 0) { return addr; }
-    store64(out + 8, addr);
-    return 0;
-}
-
-# Release a BO created via native_bo_create_gtt: munmap, then
-# gem_close. Returns 0 on success.
-fn native_bo_release_gtt(fd, handle, addr, size) {
-    if (addr != 0) { cyr_munmap(addr, size); }
-    if (handle != 0) { native_gem_close(fd, handle); }
-    return 0;
-}
-
-# ================================================================
-# v3 Phase B.3.a — submission infrastructure (ctx, BO list, VA map)
-# ================================================================
-# Prerequisites for DRM_IOCTL_AMDGPU_CS (Phase B.3.d):
-#   1. GPU context — isolates submissions from other processes.
-#   2. BO list — residency tracking (kernel keeps listed BOs live).
-#   3. VA map — gives the BO a virtual address in the process's GPU
-#      address space. Without this the GPU cannot touch the BO.
-# All three are cheap, ioctl-only, no PM4 yet.
-
-var DRM_AMDGPU_CTX      = 0x02;
-var DRM_AMDGPU_BO_LIST  = 0x03;
-var DRM_AMDGPU_GEM_VA   = 0x08;
-
-# Union / struct sizes (bytes):
-#   union drm_amdgpu_ctx       { in(16) | out(16) } = 16
-#   union drm_amdgpu_bo_list   { in(24) | out(8)  } = 24
-#   struct drm_amdgpu_gem_va                        = 64
-#   struct drm_amdgpu_bo_list_entry                 = 8
-var DRM_AMDGPU_CTX_SIZE              = 16;
-var DRM_AMDGPU_BO_LIST_SIZE          = 24;
-var DRM_AMDGPU_GEM_VA_SIZE           = 64;
-var DRM_AMDGPU_BO_LIST_ENTRY_SIZE    = 8;
-
-# Precomputed ioctl numbers; native_ioc_encode-verified in tests.
-var DRM_IOCTL_AMDGPU_CTX     = 0xC0106442;
-var DRM_IOCTL_AMDGPU_BO_LIST = 0xC0186443;
-var DRM_IOCTL_AMDGPU_GEM_VA  = 0x40406448;
-
-# Context operations.
-var AMDGPU_CTX_OP_ALLOC_CTX = 1;
-var AMDGPU_CTX_OP_FREE_CTX  = 2;
-
-# BO list operations.
-var AMDGPU_BO_LIST_OP_CREATE  = 0;
-var AMDGPU_BO_LIST_OP_DESTROY = 1;
-
-# VA operations.
-var AMDGPU_VA_OP_MAP   = 1;
-var AMDGPU_VA_OP_UNMAP = 2;
-
-# VM page flags.
-var AMDGPU_VM_PAGE_READABLE   = 0x2;
-var AMDGPU_VM_PAGE_WRITEABLE  = 0x4;
-var AMDGPU_VM_PAGE_EXECUTABLE = 0x8;
-
-# ================================================================
-# BO page-perm constants (v3 Step 4f.ii)
-# ================================================================
-# Per-BO page perms for the AMDGPU VA mapping. Session 25b granted
-# R | W | X everywhere as a workaround during bring-up. Step 4f.ii
-# narrows back to the per-BO minimum each role needs — empirically
-# verified on Cezanne kernel 6.18.24:
-#
-#   _NATIVE_PERM_SHADER (R | X)  shader BOs — CP fetches, the wave
-#                                executes from these pages. CPU
-#                                writes shader bytes via the host
-#                                mmap (separate page table), so
-#                                GPU W is not required.
-#   _NATIVE_PERM_DATA   (R | W)  data BOs — stub, output, fence.
-#                                HW reads V# state / output target,
-#                                CP writes diagnostic markers,
-#                                kernel writes user fence seqno.
-#   _NATIVE_PERM_IB     (R | X)  IB BOs — CP only reads PM4 from
-#                                these, but on Cezanne the X bit is
-#                                load-bearing: dropping X causes the
-#                                compute ring to TDR. Hardware
-#                                bisect during Step 4f.ii (R-only,
-#                                R+W, R+X all tested) — only R+X
-#                                makes the dispatch land. AMDGPU
-#                                gates CP fetch through the execute
-#                                bit even though PM4 isn'"'"'t shader
-#                                code. The W bit is not required.
-#
-# Earlier this session a constants-init-order bug had _NATIVE_PERM_*
-# evaluating to 0 (referenced AMDGPU_VM_PAGE_* before they were
-# defined). The block now sits AFTER the AMDGPU_VM_PAGE_* defs,
-# which Cyrius initialises in declaration order. The CPU regression
-# test in tests/tcyr/mabda_v3.tcyr locks the values so further
-# narrowing trips a test before reaching hardware.
-
-var _NATIVE_PERM_FULL   = AMDGPU_VM_PAGE_READABLE
-                        | AMDGPU_VM_PAGE_WRITEABLE
-                        | AMDGPU_VM_PAGE_EXECUTABLE;
-var _NATIVE_PERM_SHADER = AMDGPU_VM_PAGE_READABLE
-                        | AMDGPU_VM_PAGE_EXECUTABLE;
-var _NATIVE_PERM_DATA   = AMDGPU_VM_PAGE_READABLE
-                        | AMDGPU_VM_PAGE_WRITEABLE;
-var _NATIVE_PERM_IB     = AMDGPU_VM_PAGE_READABLE
-                        | AMDGPU_VM_PAGE_EXECUTABLE;
-
-# Sensible default for a first-BO VA base — 2 MiB into the GPU VA
-# space, well above any kernel-reserved low region. Phase B.3.a only
-# supports one-BO-at-a-time; a full VA allocator lands in B.3.b.
-var NATIVE_GPU_VA_BASE = 0x200000;
-
-# Context lifecycle. `req` is caller-owned 16 bytes.
-# On ALLOC: sets in={op=1, flags=0, ctx_id=0, priority=0}; kernel
-# writes out.alloc.ctx_id at req+0.
-fn native_ctx_alloc(fd, req) {
-    memset(req, 0, DRM_AMDGPU_CTX_SIZE);
-    store32(req + 0,  AMDGPU_CTX_OP_ALLOC_CTX);
-    store32(req + 4,  0);
-    store32(req + 8,  0);
-    store32(req + 12, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
-}
-
-fn native_ctx_alloc_id(req) { return load32(req + 0); }
-
-fn native_ctx_free(fd, ctx_id) {
-    var req[16];
-    memset(&req, 0, 16);
-    store32(&req + 0,  AMDGPU_CTX_OP_FREE_CTX);
-    store32(&req + 4,  0);
-    store32(&req + 8,  ctx_id);
-    store32(&req + 12, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &req);
-}
-
-# BO list lifecycle. `entries` points to an array of
-# drm_amdgpu_bo_list_entry (8 bytes each); `count` is the element
-# count. `req` is caller-owned 24 bytes; on CREATE success,
-# out.list_handle is at req+0.
-fn native_bo_list_create(fd, entries, count, req) {
-    memset(req, 0, DRM_AMDGPU_BO_LIST_SIZE);
-    store32(req + 0,  AMDGPU_BO_LIST_OP_CREATE);
-    store32(req + 4,  0);  # list_handle (in): 0 = create new
-    store32(req + 8,  count);
-    store32(req + 12, DRM_AMDGPU_BO_LIST_ENTRY_SIZE);
-    store64(req + 16, entries);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, req);
-}
-
-fn native_bo_list_create_handle(req) { return load32(req + 0); }
-
-fn native_bo_list_destroy(fd, list_handle) {
-    var req[24];
-    memset(&req, 0, 24);
-    store32(&req + 0, AMDGPU_BO_LIST_OP_DESTROY);
-    store32(&req + 4, list_handle);
-    store32(&req + 8, 0);
-    store32(&req + 12, 0);
-    store64(&req + 16, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, &req);
-}
-
-# VA map / unmap. `va_address` and `size` must be page-aligned
-# (4 KiB). `flags` combines AMDGPU_VM_PAGE_*.
-fn native_gem_va_map(fd, handle, va_address, size, flags) {
-    var req[64];
-    memset(&req, 0, 64);
-    store32(&req + 0,  handle);
-    store32(&req + 4,  0);
-    store32(&req + 8,  AMDGPU_VA_OP_MAP);
-    store32(&req + 12, flags);
-    store64(&req + 16, va_address);
-    store64(&req + 24, 0);       # offset_in_bo
-    store64(&req + 32, size);
-    # vm_timeline_point / syncobjs stay zero; unused by legacy CS path.
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
-}
-
-fn native_gem_va_unmap(fd, handle, va_address, size) {
-    var req[64];
-    memset(&req, 0, 64);
-    store32(&req + 0,  handle);
-    store32(&req + 4,  0);
-    store32(&req + 8,  AMDGPU_VA_OP_UNMAP);
-    store32(&req + 12, 0);
-    store64(&req + 16, va_address);
-    store64(&req + 24, 0);
-    store64(&req + 32, size);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
-}
-
-# ================================================================
-# v3 Phase B.3.b — PM4 packet builder (GFX9 / Vega, target Cezanne)
-# ================================================================
-# Packet format reference: AMD GCN3 ISA docs (public) + Mesa's
-# src/amd/common/sid.h. AMD does not publish a current PM4 manual —
-# Mesa is the de-facto spec.
-#
-# Type-3 packet dword format (32-bit, little-endian):
-#   bits 0-7   — predicate (0 = unconditional)
-#   bits 8-15  — IT_* opcode
-#   bits 16-29 — count (N-1 where N = data-dword count after header)
-#   bits 30-31 — type (must be 3)
-#
-# IT_SET_SH_REG payload:
-#   +0: register offset (from 0xB000, divided by 4)
-#   +4: register value (first; more values follow for contiguous runs)
-#
-# IT_DISPATCH_DIRECT payload:
-#   +0: COMPUTE_DIM_X (workgroup count in x)
-#   +4: COMPUTE_DIM_Y
-#   +8: COMPUTE_DIM_Z
-#   +12: COMPUTE_DISPATCH_INITIATOR (bit 0 = COMPUTE_SHADER_EN)
-
-# Opcodes
-var IT_NOP              = 0x10;
-var IT_SET_SH_REG       = 0x76;
-var IT_SET_CONTEXT_REG  = 0x69;
-var IT_DISPATCH_DIRECT  = 0x15;
-var IT_DRAW_INDEX_AUTO  = 0x2D;
-var IT_ACQUIRE_MEM      = 0x58;
-var IT_RELEASE_MEM      = 0x49;
-var IT_EVENT_WRITE      = 0x46;
-var IT_SET_UCONFIG_REG  = 0x79;
-
-# SH-register offsets (byte addresses in MMIO space). The SH_REG base
-# is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
-# Covered by native_sh_reg_offset() helper.
-# Register offsets verified by AMD_DEBUG=ib dump of Mesa rusticl
-# compute dispatch on this exact Cezanne APU (gfx90c). The PGM_LO/HI
-# and RSRC1/2 positions I had previously were wrong by an entire
-# register — PGM_LO at 0xB830 (not 0xB848), with every register in
-# the block shifted. B.3.d still worked because s_endpgm is tolerant
-# of garbage pipeline state.
-var R_COMPUTE_DISPATCH_INITIATOR      = 0xB800;
-var R_COMPUTE_START_X                 = 0xB810;
-var R_COMPUTE_START_Y                 = 0xB814;
-var R_COMPUTE_START_Z                 = 0xB818;
-var R_COMPUTE_NUM_THREAD_X            = 0xB81C;
-var R_COMPUTE_NUM_THREAD_Y            = 0xB820;
-var R_COMPUTE_NUM_THREAD_Z            = 0xB824;
-var R_COMPUTE_PGM_LO                  = 0xB830;
-var R_COMPUTE_PGM_HI                  = 0xB834;
-var R_COMPUTE_PGM_RSRC1               = 0xB848;
-var R_COMPUTE_PGM_RSRC2               = 0xB84C;
-var R_COMPUTE_RESOURCE_LIMITS         = 0xB854;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE0  = 0xB858;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE1  = 0xB85C;
-var R_COMPUTE_TMPRING_SIZE            = 0xB860;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE2  = 0xB864;
-var R_COMPUTE_STATIC_THREAD_MGMT_SE3  = 0xB868;
-var R_COMPUTE_USER_DATA_0        = 0xB900;
-# COMPUTE_USER_DATA_1..15 follow in 4-byte increments up to 0xB93C.
-
-var PM4_SH_REG_BASE = 0xB000;
-var PM4_CONTEXT_REG_BASE = 0xA000;
-var PM4_UCONFIG_REG_BASE = 0x30000;
-
-# GFX9 UCONFIG registers we program in the queue preamble.
-var R_CP_COHER_START_DELAY = 0x301EC;
-# Texture addressing border-color base. Mesa rusticl programs these
-# in its preamble even for shaders that don't sample textures.
-var R_TA_CS_BC_BASE_ADDR    = 0x30E00;
-var R_TA_CS_BC_BASE_ADDR_HI = 0x30E04;
-
-# Dispatch initiator: minimum bits to launch a shader.
-# COMPUTE_SHADER_EN at bit 0 triggers the dispatch.
-var COMPUTE_DISPATCH_INITIATOR_MIN = 0x1;
-
-# Encode a type-3 PM4 header. `count` is the number of data dwords
-# that follow the header (kernel wants count-1 in the bit field).
-# `count` must be ≥ 1 and ≤ 0x4000.
-fn native_pm4_pkt3_header(opcode, count, predicate) {
-    var d = 3 & 3;                     # type
-    var c = (count - 1) & 0x3FFF;      # count field (N-1)
-    var o = opcode & 0xFF;             # opcode
-    var p = predicate & 0xFF;          # predicate
-    return (d * 0x40000000) | (c * 0x10000) | (o * 0x100) | p;
-}
-
-# Convert a register byte-offset into the SH_REG form the SET_SH_REG
-# packet expects: `(offset - 0xB000) / 4`.
-fn native_sh_reg_offset(byte_offset) {
-    return (byte_offset - PM4_SH_REG_BASE) / 4;
-}
-
-# Convert a context-register byte-offset into the SET_CONTEXT_REG
-# wire form: `(offset - 0xA000) / 4`. Context registers cover the
-# rasterizer/viewport/CB target/DB depth state — graphics-only,
-# distinct from SH (shader) and UConfig (top-level chip state).
-fn native_context_reg_offset(byte_offset) {
-    return (byte_offset - PM4_CONTEXT_REG_BASE) / 4;
-}
-
-# Emit a SET_SH_REG packet for `n` contiguous registers starting at
-# `byte_offset`. Writes header + register-offset dword + n value
-# dwords into `buf` starting at `pos`. `values` points to an array
-# of n u32 values. Returns the new position (pos + 8 + 4*n bytes,
-# i.e., position after the last dword written).
-fn native_pm4_set_sh_reg(buf, pos, byte_offset, n, values) {
-    # PKT3 count: `n + 1` data dwords (offset + n values); bit-field
-    # stores count - 1 = n.
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_SH_REG, n + 1, 0));
-    pos = pos + 4;
-    store32(buf + pos, native_sh_reg_offset(byte_offset));
-    pos = pos + 4;
-    var i = 0;
-    while (i < n) {
-        store32(buf + pos, load32(values + i * 4));
-        pos = pos + 4;
-        i = i + 1;
-    }
-    return pos;
-}
-
-# Convenience for setting a single SH register — the common case in
-# compute dispatch setup. Returns new position.
-fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value) {
-    var one[4];
-    store32(&one, value);
-    return native_pm4_set_sh_reg(buf, pos, byte_offset, 1, &one);
-}
-
-# Emit a SET_UCONFIG_REG packet for a single register. UCONFIG regs
-# are the chip-wide "this register applies to the whole GPU, not a
-# specific shader" space — used for things like CP_COHER_START_DELAY
-# and TA_CS_BC_BASE_ADDR that radv emits in its queue preamble.
-# Packet: header + (offset - 0x30000)/4 + value = 3 dwords.
-fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 2, 0));
-    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
-    store32(buf + pos + 8, value);
-    return pos + 12;
-}
-
-# Emit a SET_UCONFIG_REG packet for two consecutive registers. `values`
-# points to two u32s. Packet: header + reg_offset + 2 values = 4 dwords.
-fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 3, 0));
-    store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
-    store32(buf + pos + 8,  load32(values + 0));
-    store32(buf + pos + 12, load32(values + 4));
-    return pos + 16;
-}
-
-# ================================================================
-# v3 Step 6.4 — context-register + draw PM4 builders (Phase C)
-# ================================================================
-# SET_CONTEXT_REG (opcode 0x69) writes to the graphics-only context
-# register file (rasterizer / viewport / CB color-target / DB depth-
-# target state). Wire format mirrors SET_SH_REG / SET_UCONFIG_REG:
-# header + reg_offset + N values; reg_offset is dword-relative to
-# PM4_CONTEXT_REG_BASE = 0xA000.
-#
-# DRAW_INDEX_AUTO (opcode 0x2D) kicks a vertex+fragment dispatch on
-# the GFX ring with auto-generated vertex IDs (0..vertex_count-1),
-# no index buffer required. The "auto" source-select is what makes
-# the first cut tractable — no VBO binding, no index buffer.
-#
-# Both opcodes will be byte-exact-validated against radv's output
-# (AMD_DEBUG=ib) in Step 6.5 when we compose the full clear-triangle
-# PM4 stream.
-
-# Multi-register SET_CONTEXT_REG: header + reg_offset + n values.
-# Packet body length = n + 1 dwords.
-fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, n + 1, 0));
-    pos = pos + 4;
-    store32(buf + pos, native_context_reg_offset(byte_offset));
-    pos = pos + 4;
-    var i = 0;
-    while (i < n) {
-        store32(buf + pos, load32(values + i * 4));
-        pos = pos + 4;
-        i = i + 1;
-    }
-    return pos;
-}
-
-# Single-register convenience: SET_CONTEXT_REG with one value.
-fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 2, 0));
-    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
-    store32(buf + pos + 8, value);
-    return pos + 12;
-}
-
-# Pair convenience: SET_CONTEXT_REG with two consecutive registers.
-# Useful for things like CB_COLOR0_BASE + _PITCH or PA_SC_SCREEN_SCISSOR_TL + _BR.
-fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 3, 0));
-    store32(buf + pos + 4, native_context_reg_offset(byte_offset));
-    store32(buf + pos + 8,  load32(values + 0));
-    store32(buf + pos + 12, load32(values + 4));
-    return pos + 16;
-}
-
-# Emit a DRAW_INDEX_AUTO packet. `vertex_count` is the number of
-# vertices the rasterizer will assemble; `draw_initiator` carries
-# the SOURCE_SELECT bits + USE_OPAQUE / etc. The standard value
-# for auto-index draws is 0x02 (DI_SRC_SEL_AUTO_INDEX in bits[1:0]).
-# Packet shape: header + 2 data dwords. count = 2.
-fn native_pm4_draw_index_auto(buf, pos, vertex_count, draw_initiator) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_DRAW_INDEX_AUTO, 2, 0));
-    store32(buf + pos + 4, vertex_count);
-    store32(buf + pos + 8, draw_initiator);
-    return pos + 12;
-}
-
-# Specific context-register addresses (R_PA_SC_*, R_CB_COLOR0_*,
-# etc.) are deferred to Step 6.5 — those values get verified
-# byte-exact against radv's AMD_DEBUG=ib output for an equivalent
-# clear-triangle dispatch. The Phase B.4 protocol applies: don't
-# claim a register address is correct until a working hardware
-# diff confirms it. The builders above are the load-bearing part
-# of Step 6.4; Step 6.5 supplies the addresses they'll be called
-# with.
-
-# DRAW_INDEX_AUTO source-select constants. See
-# docs/proposals/v3-native-render-design.md § PM4 packet families.
-var DI_SRC_SEL_AUTO_INDEX = 0x02;
-
-# Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
-# given workgroup counts and the provided initiator mask (typically
-# COMPUTE_DISPATCH_INITIATOR_MIN). Returns new position.
-fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
-    # 4 data dwords: dim_x, dim_y, dim_z, initiator. count = 4.
-    # Low byte of header is shader_type (2 = compute), not predicate.
-    # Mesa emits 0xc0031502 — verified via AMD_DEBUG=ib dump.
-    store32(buf + pos, native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 2));
-    pos = pos + 4;
-    store32(buf + pos, dim_x); pos = pos + 4;
-    store32(buf + pos, dim_y); pos = pos + 4;
-    store32(buf + pos, dim_z); pos = pos + 4;
-    store32(buf + pos, initiator); pos = pos + 4;
-    return pos;
-}
-
-# Emit an ACQUIRE_MEM packet that invalidates the shader I-cache,
-# K-cache, and TC (texture / L2) caches. Per ROCT-Thunk kfdtest,
-# this is mandatory before a compute dispatch on GFX9 — without it
-# the I-cache can return stale bytes and the SQ decodes garbage
-# as an "illegal opcode". Packet format:
-#   +0  PKT3 header (opcode IT_ACQUIRE_MEM, count=5+1 data dwords)
-#   +4  coher_cntl (cache-invalidate action bits)
-#   +8  coher_size_lo (bytes to invalidate; 0xFFFFFFFF = everything)
-#   +12 coher_size_hi (24-bit mask for GFX9)
-#   +16 coher_base_lo (base VA; 0 = start from 0)
-#   +20 coher_base_hi
-#   +24 poll_interval (cycles between state-check; 0x0A standard)
-# Total: 7 dwords (28 bytes). Returns new pos.
-fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
-    # For IT_ACQUIRE_MEM on GFX9 the low byte of the PKT3 header is
-    # shader_type (0=graphics, non-zero=compute) — NOT the generic
-    # predicate bit. Mesa rusticl emits 0xc0055802 = shader_type=0x02.
-    # coher_cntl = 0xa8c40000 verified from Mesa AMD_DEBUG=ib dump.
-    # Count field: 6 data dwords follow (cntl, size_lo/hi, base_lo/hi,
-    # poll). Header encodes count-1 = 5.
-    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, 2));
-    store32(buf + pos +  4, 0xA8C40000);   # coher_cntl
-    store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
-    store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
-    store32(buf + pos + 16, 0);            # coher_base_lo
-    store32(buf + pos + 20, 0);            # coher_base_hi
-    store32(buf + pos + 24, 0x0A);         # poll_interval
-    return pos + 28;
-}
-
-# GFX9 EVENT_WRITE event-type values. Sourced from Mesa
-# `src/amd/registers/gfx9.json` (search for `VGT_EVENT_TYPE`) and
-# cross-referenced with radv's `si_emit_*` paths in
-# `src/amd/vulkan/radv_cmd_buffer.c`. The event_type goes in
-# bits[5:0] of the body dword; event_index in bits[11:8].
-#
-# Step 6.10 prep — these are stand-alone primitives, not yet wired
-# into the render PM4 composer. They land here so when the first
-# `make test-native-render-e2e` run on Cezanne reveals "RT readback
-# is the GTT sentinel; CB caches never flushed" (the documented
-# Failure A in `programs/native_render_e2e.cyr`), the fix is one
-# call to `native_pm4_event_write_cache_flush_and_inv` at the end
-# of `native_pm4_build_render_clear_triangle`'s draw block.
-var GFX9_EVENT_TYPE_CACHE_FLUSH         = 0x04;  # gfx9.json VGT_EVENT_TYPE
-var GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16;  # gfx9.json VGT_EVENT_TYPE
-
-# event_index encodes how the kernel/CP interprets the event:
-#   0 = "other" — event_type only, no address (the EVENT_WRITE form
-#                 we use here is 2-dword, just header + body).
-#   5 = sample / cache_flush_ts / cache_flush_and_inv_ts — adds
-#       a 64-bit address pair for timestamp / fence writeback. Used
-#       by RELEASE_MEM-style flushes; deferred to a follow-up if a
-#       TS-style flush is needed.
-var GFX9_EVENT_INDEX_OTHER = 0x0;
-var GFX9_EVENT_INDEX_TS    = 0x5;
-
-# Emit a 2-dword EVENT_WRITE PKT3. Used for event_index = 0 events
-# (no address). For TS-style events with a writeback address, use
-# RELEASE_MEM or a wider EVENT_WRITE_EOP — not implemented here.
-# Body dword shape: event_type in bits[5:0], event_index in
-# bits[11:8] (matches Mesa `EVENT_TYPE(t) | EVENT_INDEX(i)`).
-# Returns new pos.
-fn native_pm4_event_write(buf, pos, event_type, event_index) {
-    store32(buf + pos, native_pm4_pkt3_header(IT_EVENT_WRITE, 1, 0));
-    var body = (event_index << 8) | event_type;
-    store32(buf + pos + 4, body);
-    return pos + 8;
-}
-
-# Convenience wrapper: emit CACHE_FLUSH_AND_INV at the current
-# position. The CP processes this event before the kernel's
-# completion fence is written to the user-fence BO, so by the time
-# the syncobj signals the RT writes are CPU-visible. Pair this with
-# a draw at end-of-pass for any path that does CPU readback — the
-# 6.5(b) composer doesn't include it today (matches radv's pattern
-# of emitting separately at command-buffer end).
-fn native_pm4_event_write_cache_flush_and_inv(buf, pos) {
-    return native_pm4_event_write(buf, pos,
-                                  GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
-                                  GFX9_EVENT_INDEX_OTHER);
-}
-
-# Emit a NOP of `pad_dwords` total dwords (header + pad_dwords-1
-# filler). Useful for aligning IBs to 8-dword boundaries (kernel
-# requirement on some rings). Returns new position.
-fn native_pm4_nop(buf, pos, pad_dwords) {
-    if (pad_dwords < 2) { return pos; }
-    # Session 25b fix: NOP packet of `pad_dwords` total dwords needs body =
-    # pad_dwords - 1, so pass count = pad_dwords - 1 to pkt3_header (which
-    # subtracts one to encode count_minus_1). Prior code passed pad_dwords
-    # directly, causing the on-wire header to claim body = pad_dwords (one
-    # too many) — CP read 1 dw past the IB end and either hung trying to
-    # fetch the missing dw or processed garbage. This silently bricked
-    # every native compute submit (TDR after 10s).
-    store32(buf + pos, native_pm4_pkt3_header(IT_NOP, pad_dwords - 1, 0));
-    pos = pos + 4;
-    var i = 1;
-    while (i < pad_dwords) {
-        store32(buf + pos, 0);
-        pos = pos + 4;
-        i = i + 1;
-    }
-    return pos;
-}
-
-# ================================================================
-# v3 Step 4a — composed PM4 stream for the store-DEADBEEF shader
-# ================================================================
-# Emit the full Mesa-verified PM4 preamble + DISPATCH_DIRECT
-# (workgroup count = x, y, z) + post-dispatch C0FFEE12 marker +
-# trailing NOP padding to 64 dwords. Returns the byte count
-# written into buf.
-#
-# Caller owns the BOs at shader_va / stub_va / out_va; this fn
-# only emits a PM4 stream that, when submitted on the COMPUTE
-# ring with those BOs in the residency list, will dispatch the
-# store_deadbeef shader to write 0xDEADBEEF at out_va.
-#
-# The PM4 layout is byte-identical to the working
-# programs/native_compute_store.cyr build — see the B.4-verified
-# handoff (docs/handoff/2026-04-28-session25-b4-verified.md) for
-# the full Mesa-rusticl alignment rationale.
-fn native_pm4_build_compute_store_deadbeef(buf, shader_va, stub_va,
-                                           out_va, x, y, z) {
-    var pos = 0;
-    # GFX9 PGM_LO/HI encoding: PGM_LO = (va >> 8) & 0xFFFFFFFF,
-    # PGM_HI = (va >> 40) & 0xFF. HW reconstructs:
-    # shader_addr = (PGM_HI << 40) | (PGM_LO << 8).
-    var pgm_lo = (shader_va >> 8) & 0xFFFFFFFF;
-    var pgm_hi = (shader_va >> 40) & 0xFF;
-    # 1. PGM_HI.
-    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, pgm_hi);
-    # 2. STATIC_THREAD_MGMT_SE0/SE1 — SE0 all CUs, SE1 absent on Cezanne.
-    var thread_mgmt_01[8];
-    store32(&thread_mgmt_01 + 0, 0xFFFFFFFF);
-    store32(&thread_mgmt_01 + 4, 0);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0,
-                                2, &thread_mgmt_01);
-    # 3. STATIC_THREAD_MGMT_SE2/SE3 = 0, 0 (absent on Cezanne).
-    var thread_mgmt_23[8];
-    store32(&thread_mgmt_23 + 0, 0);
-    store32(&thread_mgmt_23 + 4, 0);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2,
-                                2, &thread_mgmt_23);
-    # 4. CP_COHER_START_DELAY = 0.
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_CP_COHER_START_DELAY, 0);
-    # 5. TA_CS_BC_BASE_ADDR + _HI = 0/0 (Session 25b: BC_BASE = 0 works
-    # on Cezanne; the session-16 magic-VA hypothesis was falsified).
-    var bc_va = 0;
-    var bc_pair[8];
-    store32(&bc_pair + 0, (bc_va >> 8) & 0xFFFFFFFF);
-    store32(&bc_pair + 4, (bc_va >> 40) & 0xFF);
-    pos = native_pm4_set_uconfig_reg_pair(buf, pos, R_TA_CS_BC_BASE_ADDR,
-                                          &bc_pair);
-    # 6. PGM_LO.
-    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_LO, pgm_lo);
-    # 7. PGM_RSRC1 + RSRC2 as a pair.
-    var rsrc[8];
-    store32(&rsrc + 0, GFX9_COMPUTE_PGM_RSRC1_MIN);
-    store32(&rsrc + 4, 0x8);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
-    # 8. TMPRING_SIZE.
-    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
-    # 9. USER_DATA_2 + 3 — Mesa scratch V# stub VA (canonical-high).
-    var user23[8];
-    store32(&user23 + 0, stub_va & 0xFFFFFFFF);
-    store32(&user23 + 4, (stub_va >> 32) & 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 8,
-                                2, &user23);
-    # 10. USER_DATA_0 + 1 — output VA low/high.
-    var user01[8];
-    store32(&user01 + 0, out_va & 0xFFFFFFFF);
-    store32(&user01 + 4, (out_va >> 32) & 0xFFFFFFFF);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0,
-                                2, &user01);
-    # 11. ACQUIRE_MEM flushes I/K/L2 caches before dispatch.
-    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
-    # 12. RESOURCE_LIMITS = 0x140.
-    pos = native_pm4_set_sh_reg_one(buf, pos,
-                                    R_COMPUTE_RESOURCE_LIMITS, 0x140);
-    # 13. NUM_THREAD_X/Y/Z = 1/1/1 (single-thread workgroup; the
-    # store_deadbeef shader has only one wave).
-    var nt[12];
-    store32(&nt + 0, 1);
-    store32(&nt + 4, 1);
-    store32(&nt + 8, 1);
-    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
-    # 14. DISPATCH_DIRECT with shader_type=2 (compute), workgroup
-    # count = (x, y, z).
-    pos = native_pm4_dispatch_direct(buf, pos, x, y, z,
-                                     GFX9_DISPATCH_INITIATOR);
-    # Session 25b diagnostic: WRITE_DATA(WR_CONFIRM=1) marker at
-    # stub_va+4 = 0xC0FFEE12. Proves CP returned cleanly from
-    # DISPATCH_DIRECT and continued through the IB.
-    store32(buf + pos +  0, 0xC0033700);
-    store32(buf + pos +  4, 0x00100500);
-    store32(buf + pos +  8, (stub_va + 4) & 0xFFFFFFFF);
-    store32(buf + pos + 12, ((stub_va + 4) >> 32) & 0xFFFFFFFF);
-    store32(buf + pos + 16, 0xC0FFEE12);
-    pos = pos + 20;
-    # Pad to 64 dwords (AMDGPU cache-line alignment).
-    var cur_dwords = pos / 4;
-    var target_dwords = 64;
-    if (cur_dwords < target_dwords) {
-        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
-    }
-    return pos;
-}
-
-# ================================================================
-# v3 Phase B.3.c — minimum GFX9 shader
-# ================================================================
-# A compute shader consisting of a single s_endpgm instruction.
-# GFX9 encoding: the SOPP format for s_endpgm is 0xBF810000.
-# Usage: write this 4-byte instruction at a 256-byte-aligned VA in
-# a GPU-visible BO; point COMPUTE_PGM_LO/HI at that VA.
-var GFX9_S_ENDPGM = 0xBF810000;
-
-# GFX9 COMPUTE_PGM_RSRC1 minimum viable mask.
-#   bits  0-5  VGPRS        = 0 → allocate 4 VGPRs (enough for v0-v3)
-#   bits  6-9  SGPRS        = 1 → allocate 16 SGPRs
-#       SGPRS=0 allocates only 8 and is too few once VCC (+2) and
-#       flat_scratch (+3) overhead are counted on a store shader.
-#   bits 12-19 FLOAT_MODE   = 0xC0 → round-to-nearest-even for f32 + f64.
-#                              Some GFX9 firmware rejects FLOAT_MODE = 0.
-#   bit  21    DX10_CLAMP   = 1 → well-behaved clamp semantics
-#   bit  23    IEEE_MODE    = 1 → IEEE-conformant float behaviour
-# Encoded value matches Mesa rusticl for gfx90c: FLOAT_MODE=0xC0,
-# SGPRS=1 (16 regs), DX10_CLAMP=1, IEEE_MODE=0.
-#   (0xC0 << 12) | (1 << 6) | (1 << 21) = 0x002C0040
-var GFX9_COMPUTE_PGM_RSRC1_MIN = 0x2C0040;
-
-# COMPUTE_PGM_RSRC2: 0 = no user SGPR args, no scratch, no LDS.
-var GFX9_COMPUTE_PGM_RSRC2_MIN = 0;
-
-# DISPATCH_INITIATOR = 0x45 (Mesa-verified): bits 0 (COMPUTE_SHADER_EN)
-# | 2 (FORCE_START_AT_000) | 6 (ORDER_MODE).
-var GFX9_DISPATCH_INITIATOR = 0x45;
-
-# Write the s_endpgm shader into buf at pos. Returns new pos.
-fn native_gfx9_shader_endpgm(buf, pos) {
-    store32(buf + pos, GFX9_S_ENDPGM);
-    return pos + 4;
-}
-
-# Write a "store 0xDEADBEEF to buffer[0]" shader at `pos` in `buf`.
-# Expects s0/s1 pre-loaded with the low/high 32 bits of the output VA
-# (either via USER_SGPR = 2 loading from USER_DATA_0/1, or via
-# USER_SGPR ≥ 2 where the caller places the VA in those slots).
-#
-# Source (assembled via `clang -target amdgcn--amdhsa -mcpu=gfx90c`):
-#   v_mov_b32_e32  v0, s0                            ; low 32 bits of VA
-#   v_mov_b32_e32  v1, s1                            ; high 32 bits of VA
-#   v_mov_b32_e32  v2, 0xDEADBEEF                    ; constant
-#   global_store_dword v[0:1], v2, off glc slc       ; write-through store
-#   s_waitcnt vmcnt(0) lgkmcnt(0)                    ; wait for store
-#   s_endpgm                                         ; terminate
-#
-# GLC + SLC bypass the GPU's L1 and L2 caches, writing straight to
-# system memory. Without them the store lands in L2; CPU readback
-# from the mapped GTT sees stale data until a cache-flush preempts
-# it. Combined with s_waitcnt before s_endpgm, SLC=1 makes the store
-# CPU-visible by the time the syncobj fires.
-#
-# Layout (bytes):
-#   +0:  0x7E000200  v_mov_b32_e32 v0, s0   (VOP1: opcode=1, vdst=0, src0=0)
-#   +4:  0x7E020201  v_mov_b32_e32 v1, s1   (VOP1: opcode=1, vdst=1, src0=1)
-#   +8:  0x7E0402FF  v_mov_b32_e32 v2, <literal>  (src0=255 → literal follows)
-#   +12: 0xDEADBEEF  literal
-#   +16: 0xDC738000  global_store_dword dword 1  (FLAT+GLOBAL, glc=1, slc=1)
-#   +20: 0x007F0200  global_store_dword dword 2  (addr=v0, data=v2, saddr=off=127)
-#   +24: 0xBF8C0070  s_waitcnt vmcnt(0) lgkmcnt(0)  (SIMM16 = 0x0070)
-#   +28: 0xBF810000  s_endpgm
-#   +32..+95: 16 × 0xBF800000  s_nop 0  (AMDGPU-ABI-required prefetch padding)
-#
-# Returns new pos (pos + 96). RSRC1 must include FLOAT_MODE = 0xC0,
-# DX10_CLAMP, IEEE_MODE (GFX9_COMPUTE_PGM_RSRC1_MIN satisfies all).
-# USER_SGPR ≥ 2 required so s0/s1 are populated; the canonical setup
-# is RSRC2 = 0x8 (USER_SGPR=4) with USER_DATA_0/1 = VA low/high and
-# USER_DATA_2/3 = Mesa's scratch-V# stub (0x00200000/0).
-fn native_gfx9_shader_store_deadbeef(buf, pos) {
-    store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
-    store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
-    store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
-    store32(buf + pos + 12, 0xDEADBEEF);   # literal
-    store32(buf + pos + 16, 0xDC738000);   # global_store_dword v[0:1], v2, off glc slc (dword 1)
-    store32(buf + pos + 20, 0x007F0200);   # global_store_dword (dword 2: addr=v0, data=v2, saddr=off)
-    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
-    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 32 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 96;
-}
-
-# PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).
-# On GFX9, TRAP_PRESENT must be set or memory-op trap paths fire
-# bad_op_irq even when no actual trap occurs. Per kfdtest this bit
-# is mandatory for any compute dispatch that touches memory.
-#   USER_SGPR = 2 → bits 1-5 = 0b00010 → value 0x04
-#   TRAP_PRESENT → bit 6        → value 0x40
-# Combined: 0x04 | 0x40 = 0x44
-var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2_TRAP = 0x44;
-
-# RSRC2 with USER_SGPR = 2 — tells HW to pre-load SGPRs s0, s1 with
-# COMPUTE_USER_DATA_0, COMPUTE_USER_DATA_1 before shader entry.
-# USER_SGPR field occupies bits 1-5; value 2 encodes as 0x04.
-var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2 = 0x04;
-
-# ================================================================
-# v3 Step 6.2(b) — fragment shader: solid red, exp mrt0
-# ================================================================
-# Trivial fragment shader for the first native render pipeline. No
-# inputs (SPI_PS_INPUT_ENA = 0), no varyings, no memory ops — just
-# write four f32 channels and export to MRT0 with done+vm.
-#
-# Source-level equivalent (spec citation, not yet clang-derived;
-# verify against `clang -target amdgcn--amdhsa -mcpu=gfx90c` once
-# clang+LLVM AMDGPU is installed — see
-# docs/proposals/v3-shader-bytes-capture.md "What unblocks Layer 2"):
-#   v_mov_b32_e32  v0, 1.0      ; R = 1.0
-#   v_mov_b32_e32  v1, 0.0      ; G = 0.0
-#   v_mov_b32_e32  v2, 0.0      ; B = 0.0
-#   v_mov_b32_e32  v3, 1.0      ; A = 1.0
-#   exp mrt0 v0, v1, v2, v3 done vm
-#   s_endpgm                    ; HW serializes exp-done before retire,
-#                               ; no s_waitcnt needed
-#
-# Encoding cross-checks (GCN5/GFX9 ISA spec, AMD vega-isa.pdf):
-#
-# VOP1 v_mov_b32_e32 vdst, src — bits 25-31 = 0x3F (top byte 0x7E),
-#   bits 17-24 = vdst, bits 9-16 = opcode 1, bits 0-8 = src.
-#   Inline constants per VOP src table: 128=0.0, 242=1.0.
-#   v0,1.0 → 0x7E000000 | (0<<17) | (1<<9) | 242 = 0x7E0002F2
-#   v1,0.0 → 0x7E000000 | (1<<17) | (1<<9) | 128 = 0x7E020280
-#   v2,0.0 → 0x7E000000 | (2<<17) | (1<<9) | 128 = 0x7E040280
-#   v3,1.0 → 0x7E000000 | (3<<17) | (1<<9) | 242 = 0x7E0602F2
-#
-# EXP encoding (64-bit, two dwords) — bits 31-26 = 0x3E (top byte 0xF8).
-#   Word 0 layout: bits 0-3 en, bits 4-9 tgt, bit 10 compr, bit 11 done,
-#                  bit 12 vm, bits 13-25 reserved=0, bits 26-31 = 0x3E.
-#   Word 1 layout: vsrc0[0-7], vsrc1[8-15], vsrc2[16-23], vsrc3[24-31].
-#   exp mrt0 v0,v1,v2,v3 done vm:
-#     en=0xF, tgt=0 (mrt0), compr=0, done=1, vm=1
-#     Word 0 = 0xF8000000 | (1<<12) | (1<<11) | (0<<4) | 0xF
-#            = 0xF8000000 | 0x1000 | 0x800 | 0xF = 0xF800180F
-#     Word 1 = (3<<24) | (2<<16) | (1<<8) | 0     = 0x03020100
-#
-# SOPP s_endpgm — bits 23-31 = 0x17F, bits 16-22 opcode, bits 0-15 simm16.
-#   opcode 1 = s_endpgm. Encoding: 0xBF810000 (matches existing compute).
-# SOPP s_nop 0 — opcode 0, simm16 0. Encoding: 0xBF800000 (padding).
-#
-# Layout (bytes; total = 92):
-#   +0:  0x7E0002F2  v_mov_b32_e32 v0, 1.0
-#   +4:  0x7E020280  v_mov_b32_e32 v1, 0.0
-#   +8:  0x7E040280  v_mov_b32_e32 v2, 0.0
-#   +12: 0x7E0602F2  v_mov_b32_e32 v3, 1.0
-#   +16: 0xF800180F  exp mrt0 done vm en=0xF tgt=0 (word 0)
-#   +20: 0x03020100  exp word 1 (vsrc0..3 = v0..v3)
-#   +24: 0xBF810000  s_endpgm
-#   +28..+91: 16 × 0xBF800000  s_nop 0  (AMDGPU prefetch padding)
-#
-# RSRC1 expects FLOAT_MODE=0xC0 + DX10_CLAMP + IEEE_MODE
-# (GFX9_GFX_PGM_RSRC1_MIN satisfies all). 4 VGPRs allocated for
-# v0-v3: VGPRS field = ceil(4/4) - 1 = 0, already encoded in MIN.
-# RSRC2: 0 (no USER_DATA, no scratch, no LDS, no memory ops, so
-# TRAP_PRESENT bit 6 is the spec minimum 0; HW verify at Step 6.5).
-# COL_FORMAT for RGBA8 RT: try FP32_ABGR=0xE first, fall back to
-# UNORM16_ABGR=0xA if export quantization misbehaves.
-#
-# Returns new pos (pos + 92).
-fn native_gfx9_shader_solid_red(buf, pos) {
-    store32(buf + pos +  0, 0x7E0002F2);   # v_mov_b32_e32 v0, 1.0
-    store32(buf + pos +  4, 0x7E020280);   # v_mov_b32_e32 v1, 0.0
-    store32(buf + pos +  8, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
-    store32(buf + pos + 12, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
-    store32(buf + pos + 16, 0xF800180F);   # exp mrt0 done vm (word 0)
-    store32(buf + pos + 20, 0x03020100);   # exp word 1 (v0..v3)
-    store32(buf + pos + 24, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 28 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 92;
-}
-
-# Total byte count produced by native_gfx9_shader_solid_red. The PM4
-# stream builder at Step 6.5 needs this to size the BO and to emit
-# the right SET_SH_REG values for SPI_SHADER_PGM_LO_PS / _HI_PS.
-var GFX9_FS_SOLID_RED_SIZE = 92;
-
-# v3 Step 6.2(b) VS — full-screen triangle from vertex_id.
-#
-# Computes NDC position from system VGPR v0 (vertex_id at shader
-# entry on GFX9 graphics-ABI) using the standard radv pattern:
-#   x = (vid     & 1) * 4 - 1
-#   y = ((vid>>1) & 1) * 4 - 1
-# vid ∈ {0,1,2} → (-1,-1), (3,-1), (-1,3) — covers RT entirely
-# after rasterizer clips to viewport.
-#
-# VOP2 encodings cross-checked against `clang -target
-# amdgcn--amdhsa -mcpu=gfx90c -O2` disassembly of an equivalent CL
-# kernel (vid_to_pos.cl); see docs/proposals/v3-shader-bytes-capture.md
-# Layer-1 protocol. The arithmetic VOP2 opcodes (lshlrev_b32=0x12,
-# and_b32=0x13, add_u32=0x34) are ABI-independent — same encodings
-# whether dispatched from compute or graphics.
-#
-# System VGPRs at VS entry on GFX9 (RSRC2_VS = 0):
-#   v0: vertex_id
-#   v1: instance_id (always loaded; clobberable since we don't use it)
-#   v2+: free
-# We use v0 and v1 as scratch — instance_id in v1 gets overwritten
-# with the y float result before exp pos0. This keeps total VGPR
-# usage at 4 (v0..v3), so VGPRS field in RSRC1 stays at 0
-# (GFX9_GFX_PGM_RSRC1_MIN unchanged from compute's 0x002C0040).
-#
-# Source-level equivalent:
-#   v_lshlrev_b32_e32 v2, 1, v0    ; v2 = vid << 1   (save y prep)
-#   v_lshlrev_b32_e32 v0, 2, v0    ; v0 = vid << 2   (x prep)
-#   v_and_b32_e32     v0, 4, v0    ; v0 = (vid<<2) & 4 = (vid&1)*4
-#   v_and_b32_e32     v2, 4, v2    ; v2 = (vid<<1) & 4 = ((vid>>1)&1)*4
-#   v_add_u32_e32     v0, -1, v0   ; v0 = (vid&1)*4 - 1     (x int)
-#   v_add_u32_e32     v2, -1, v2   ; v2 = ((vid>>1)&1)*4 - 1 (y int)
-#   v_cvt_f32_i32_e32 v0, v0       ; v0 = float(x)
-#   v_cvt_f32_i32_e32 v1, v2       ; v1 = float(y)  (clobbers instance_id)
-#   v_mov_b32_e32     v2, 0        ; v2 = 0.0       (z)
-#   v_mov_b32_e32     v3, 1.0      ; v3 = 1.0       (w)
-#   exp pos0 v0, v1, v2, v3 done
-#   s_endpgm
-#
-# Encoding cross-checks (VOP2: bits 30-25 opcode, 24-17 vdst,
-# 16-9 vsrc1, 8-0 src0; -1 = inline 193 = 0xC1; constants 1,2,4 =
-# inline 129/130/132 = 0x81/0x82/0x84; v_cvt_f32_i32 = VOP1
-# opcode 5, VGPR src = 256 + index):
-#
-# Layout (bytes; total = 116):
-#   +0:  0x24040081  v_lshlrev_b32_e32 v2, 1, v0
-#   +4:  0x24000082  v_lshlrev_b32_e32 v0, 2, v0
-#   +8:  0x26000084  v_and_b32_e32     v0, 4, v0
-#   +12: 0x26040484  v_and_b32_e32     v2, 4, v2
-#   +16: 0x680000C1  v_add_u32_e32     v0, -1, v0
-#   +20: 0x680404C1  v_add_u32_e32     v2, -1, v2
-#   +24: 0x7E000B00  v_cvt_f32_i32_e32 v0, v0
-#   +28: 0x7E020B02  v_cvt_f32_i32_e32 v1, v2
-#   +32: 0x7E040280  v_mov_b32_e32     v2, 0.0
-#   +36: 0x7E0602F2  v_mov_b32_e32     v3, 1.0
-#   +40: 0xF80008CF  exp pos0 done en=0xF tgt=12 (word 0)
-#   +44: 0x03020100  exp word 1 (vsrc0..3 = v0..v3)
-#   +48: 0xBF810000  s_endpgm
-#   +52..+115: 16 × 0xBF800000  s_nop 0  (AMDGPU prefetch padding)
-#
-# RSRC1: GFX9_GFX_PGM_RSRC1_MIN (4 VGPRs, 16 SGPRs, FLOAT_MODE 0xC0).
-# RSRC2: 0 (no USER_DATA preload, no scratch, no LDS, no extra
-# system VGPRs beyond vid/instance_id).
-# SPI_SHADER_POS_FORMAT: 4 (POS_FLOAT_4 — VS exports 4 f32 lanes).
-# Returns new pos (pos + 116).
-fn native_gfx9_shader_fullscreen_triangle_vs(buf, pos) {
-    store32(buf + pos +  0, 0x24040081);   # v_lshlrev_b32_e32 v2, 1, v0
-    store32(buf + pos +  4, 0x24000082);   # v_lshlrev_b32_e32 v0, 2, v0
-    store32(buf + pos +  8, 0x26000084);   # v_and_b32_e32 v0, 4, v0
-    store32(buf + pos + 12, 0x26040484);   # v_and_b32_e32 v2, 4, v2
-    store32(buf + pos + 16, 0x680000C1);   # v_add_u32_e32 v0, -1, v0
-    store32(buf + pos + 20, 0x680404C1);   # v_add_u32_e32 v2, -1, v2
-    store32(buf + pos + 24, 0x7E000B00);   # v_cvt_f32_i32_e32 v0, v0
-    store32(buf + pos + 28, 0x7E020B02);   # v_cvt_f32_i32_e32 v1, v2
-    store32(buf + pos + 32, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
-    store32(buf + pos + 36, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
-    store32(buf + pos + 40, 0xF80008CF);   # exp pos0 done (word 0)
-    store32(buf + pos + 44, 0x03020100);   # exp word 1 (v0..v3)
-    store32(buf + pos + 48, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 52 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 116;
-}
-
-# Total byte count produced by native_gfx9_shader_fullscreen_triangle_vs.
-# Step 6.5 sizes the VS BO slot accordingly.
-var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
-
-# ================================================================
-# v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
-# ================================================================
-# Spec-anchor for the trivial vertex+fragment pipeline that Step
-# 6.5 will assemble into a PM4 stream. Decision-independent half
-# of Step 6.2 — the shader-byte derivation path (6.2(b)) doesn't
-# affect any of these addresses or bitfield minimums.
-#
-# Addresses use the same mabda convention as the compute side: SH
-# registers at their real sid.h byte offsets in the 0xB000 block,
-# context registers at the synthetic 0xA000-base shorthand (Mesa
-# uses 0x28000; both produce identical wire-form dwords through
-# native_context_reg_offset() since only the difference matters).
-#
-# Citations are Mesa sid.h naming (R_<6digits>_<name>). Hazard:
-# none of the SH-side addresses below have been hardware-verified
-# on Cezanne yet — the compute equivalents took an AMD_DEBUG=ib
-# pass to confirm (see line 522 comment). 6.2(a) stages the values;
-# Step 6.5's PM4-stream-vs-radv diff is the verification gate.
-# Protocol details: docs/proposals/v3-shader-bytes-capture.md.
-
-# Vertex shader SH registers (Mesa: R_00B12{0,4,8,C}_SPI_SHADER_*_VS).
-# Within the SH-reg block (0xB000 base; native_sh_reg_offset divides
-# by 4). Wire-form offsets: PGM_LO=0x48, _HI=0x49, _RSRC1=0x4A, _RSRC2=0x4B.
-var R_SPI_SHADER_PGM_LO_VS    = 0xB120;
-var R_SPI_SHADER_PGM_HI_VS    = 0xB124;
-var R_SPI_SHADER_PGM_RSRC1_VS = 0xB128;
-var R_SPI_SHADER_PGM_RSRC2_VS = 0xB12C;
-
-# Pixel shader SH registers (Mesa: R_00B02{0,4,8,C}_SPI_SHADER_*_PS).
-# Wire-form offsets: PGM_LO=0x08, _HI=0x09, _RSRC1=0x0A, _RSRC2=0x0B.
-var R_SPI_SHADER_PGM_LO_PS    = 0xB020;
-var R_SPI_SHADER_PGM_HI_PS    = 0xB024;
-var R_SPI_SHADER_PGM_RSRC1_PS = 0xB028;
-var R_SPI_SHADER_PGM_RSRC2_PS = 0xB02C;
-
-# SPI shader output format context registers
-# (Mesa gfx9.json: R_02870C_SPI_SHADER_POS_FORMAT,
-#                  R_028710_SPI_SHADER_Z_FORMAT,
-#                  R_028714_SPI_SHADER_COL_FORMAT).
-# Mabda 0xA-shorthand: subtract 0x1E000 from Mesa's MMIO byte addr
-# (only the difference matters in PM4 wire form).
-# Corrected 2026-04-30 against authoritative Mesa gfx9.json — initial
-# 6.2(a) values had the three addresses scrambled (caught via the
-# 6.5(a) sweep before any HW test ran).
-var R_SPI_SHADER_POS_FORMAT = 0xA70C;
-var R_SPI_SHADER_Z_FORMAT   = 0xA710;
-var R_SPI_SHADER_COL_FORMAT = 0xA714;
-
-# Color-buffer write-mask context register
-# (Mesa: R_028238_CB_TARGET_MASK). Representative pipeline-static
-# context register; CB_SHADER_MASK / CB_COLOR_CONTROL / blend / raster
-# state lands in 6.5 alongside the assembled PM4 stream.
-var R_CB_TARGET_MASK = 0xA238;
-
-# RSRC1 bitfield minimum — graphics shaders use the same FLOAT_MODE +
-# DX10_CLAMP + IEEE_MODE encoding as compute (encoded value 0x002C0040).
-# VS and PS share this minimum; per-shader overrides (VGPR/SGPR counts)
-# get OR'd in by the assembler at Step 6.2(b).
-var GFX9_GFX_PGM_RSRC1_MIN = 0x2C0040;
-
-# RSRC2 minimums — USER_SGPR + scratch + LDS bits.
-#   VS: 0 — no USER_DATA pre-load, no scratch, no LDS for the trivial
-#       full-screen triangle (vertex_id arrives via system VGPR v0).
-#   PS: 0 — TRAP_PRESENT (bit 6) is required on GFX9 for any shader that
-#       does memory ops (set the bit when the FS does global_store);
-#       the trivial solid-color FS only does v_mov + exp, no memory,
-#       so 0 is the minimum. Hardware verification at Step 6.5 may
-#       require the trap bit even for this shape — flag.
-var GFX9_VS_PGM_RSRC2_MIN = 0x0;
-var GFX9_PS_PGM_RSRC2_MIN = 0x0;
-
-# SPI_SHADER_POS_FORMAT — vertex stage exports four f32 lanes for pos0.
-# Encoding: bits 0-3 = format (0=NONE, 4=FLOAT_4). Other formats reserved
-# for tess / GS pipelines we don't use yet.
-var SPI_SHADER_POS_FORMAT_4 = 0x4;
-
-# SPI_SHADER_Z_FORMAT — fragment stage does not export depth.
-var SPI_SHADER_Z_FORMAT_INVALID = 0x0;
-
-# SPI_SHADER_COL_FORMAT for color target 0 — RGBA8 RT.
-# Three candidates documented in the GFX9 ISA spec; the export
-# hardware quantizes the FS f32 output to the RT format. FP32_ABGR
-# is the natural choice (FS does v_mov_b32 of 4 f32s, hardware does
-# the unorm conversion). FP16_ABGR / UNORM16_ABGR are listed for
-# Step 6.5 fallback if FP32_ABGR misbehaves on Cezanne — verification
-# is "render a known color, CPU-readback the RT, compare bytes."
-var SPI_SHADER_COL_FORMAT_FP16_ABGR    = 0x9;
-var SPI_SHADER_COL_FORMAT_UNORM16_ABGR = 0xA;
-var SPI_SHADER_COL_FORMAT_FP32_ABGR    = 0xE;
-
-# Vertex count for a single full-screen triangle. The VS pulls
-# positions from a 3-entry switch on vertex_id (built into the
-# shader, no VBO bind). DRAW_INDEX_AUTO with this count + an
-# initiator of DI_SRC_SEL_AUTO_INDEX produces the assembly.
-var GFX9_FULLSCREEN_TRI_VCOUNT = 3;
-
-# ================================================================
-# v3 Step 6.5(a) — clear-triangle PM4 register addresses + values
-# ================================================================
-# Extension to the 6.2(a) constant set, covering the registers Step
-# 6.5(b)'s native_pm4_build_render_clear_triangle composer needs.
-# Every address below was extracted from
-# https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json
-# (Mesa main, fetched 2026-04-30) — the authoritative source for
-# GFX9 MMIO offsets. The lookup script that produced these is
-# captured in docs/proposals/v3-shader-bytes-capture.md.
-#
-# Mabda convention: SH (0xBxxx) and UConfig (0x3xxxx) addresses are
-# real MMIO byte offsets. Context registers use the synthetic
-# 0xA000 shorthand (Mesa MMIO byte addr - 0x1E000) — produces the
-# same PM4 wire-form dword via native_context_reg_offset() since
-# only the difference from base matters.
-#
-# The constants split mirrors the 3-block PM4 design from
-# docs/proposals/v3-backend-interface.md v2.1: pipeline_sh_block
-# (per-pipeline, shader VAs + RSRC), pipeline_ctx_block
-# (per-pipeline, blend/raster/depth-test mode), pass_target_block
-# (per-pass, RT-extent-derived). The 6.5(b) builder will compose
-# them in that order.
-
-# --- Pipeline-static context regs (ctx block) ---
-
-# Color/blend mode — Mesa gfx9.json names + addresses.
-var R_CB_SHADER_MASK     = 0xA23C;   # Mesa 0x02823C
-var R_CB_COLOR_CONTROL   = 0xA808;   # Mesa 0x028808
-var R_CB_BLEND0_CONTROL  = 0xA780;   # Mesa 0x028780
-
-# Rasterizer / clip mode.
-var R_PA_SU_SC_MODE_CNTL = 0xA814;   # Mesa 0x028814
-var R_PA_CL_CLIP_CNTL    = 0xA810;   # Mesa 0x028810
-
-# Stage enable + reuse.
-var R_VGT_SHADER_STAGES_EN = 0xAB54; # Mesa 0x028B54
-var R_VGT_REUSE_OFF        = 0xAAB4; # Mesa 0x028AB4
-
-# Per-stage SPI inputs (FS) and outputs (VS).
-var R_SPI_PS_INPUT_ENA   = 0xA6CC;   # Mesa 0x0286CC
-var R_SPI_PS_INPUT_ADDR  = 0xA6D0;   # Mesa 0x0286D0
-var R_SPI_PS_IN_CONTROL  = 0xA6D8;   # Mesa 0x0286D8
-var R_SPI_VS_OUT_CONFIG  = 0xA6C4;   # Mesa 0x0286C4
-
-# Depth/stencil test (we run depth-disabled, but radv still emits
-# DB_SHADER_CONTROL + DB_RENDER_OVERRIDE in its preamble).
-var R_DB_SHADER_CONTROL    = 0xA80C; # Mesa 0x02880C
-var R_DB_HTILE_SURFACE     = 0xAABC; # Mesa 0x028ABC
-var R_DB_RENDER_OVERRIDE   = 0xA00C; # Mesa 0x02800C
-var R_DB_RENDER_OVERRIDE2  = 0xA010; # Mesa 0x028010
-
-# --- Pass-target context regs (pass block, RT-extent dependent) ---
-
-# Scissor (screen + generic). Trivial draw uses a single scissor
-# matching the RT extent.
-var R_PA_SC_SCREEN_SCISSOR_TL  = 0xA030;   # Mesa 0x028030
-var R_PA_SC_SCREEN_SCISSOR_BR  = 0xA034;   # Mesa 0x028034
-var R_PA_SC_GENERIC_SCISSOR_TL = 0xA240;   # Mesa 0x028240
-var R_PA_SC_GENERIC_SCISSOR_BR = 0xA244;   # Mesa 0x028244
-
-# Viewport (xyz scale + offset for VPORT_0).
-var R_PA_CL_VPORT_XSCALE   = 0xA43C;   # Mesa 0x02843C
-var R_PA_CL_VPORT_XOFFSET  = 0xA440;   # Mesa 0x028440
-var R_PA_CL_VPORT_YSCALE   = 0xA444;   # Mesa 0x028444
-var R_PA_CL_VPORT_YOFFSET  = 0xA448;   # Mesa 0x028448
-var R_PA_CL_VPORT_ZSCALE   = 0xA44C;   # Mesa 0x02844C
-var R_PA_CL_VPORT_ZOFFSET  = 0xA450;   # Mesa 0x028450
-var R_PA_SC_VPORT_ZMIN_0   = 0xA2D0;   # Mesa 0x0282D0
-var R_PA_SC_VPORT_ZMAX_0   = 0xA2D4;   # Mesa 0x0282D4
-
-# Raster engine config + AA config + screen offset.
-# PA_SC_RASTER_CONFIG: Cezanne has 1 SE; default 0 works.
-var R_PA_SC_RASTER_CONFIG       = 0xA350;  # Mesa 0x028350
-var R_PA_SC_AA_CONFIG           = 0xABE0;  # Mesa 0x028BE0
-var R_PA_SU_HARDWARE_SCREEN_OFFSET = 0xA234; # Mesa 0x028234
-
-# CB_COLOR0 — color target 0 binding. CB_COLOR0_PITCH/_SLICE were
-# removed in GFX9; pitch/slice info lives in CB_COLOR0_ATTRIB.
-var R_CB_COLOR0_BASE         = 0xAC60;  # Mesa 0x028C60
-var R_CB_COLOR0_BASE_EXT     = 0xAC64;  # Mesa 0x028C64 (high bits)
-var R_CB_COLOR0_VIEW         = 0xAC6C;  # Mesa 0x028C6C
-var R_CB_COLOR0_INFO         = 0xAC70;  # Mesa 0x028C70
-var R_CB_COLOR0_ATTRIB       = 0xAC74;  # Mesa 0x028C74
-var R_CB_COLOR0_DCC_CONTROL  = 0xAC78;  # Mesa 0x028C78
-
-# --- UConfig graphics regs ---
-
-# Primitive-list shape + instance count. UConfig regs encode at
-# their real MMIO addresses (no shorthand); native_pm4_set_uconfig_*
-# strips the 0x30000 base when emitting wire form.
-var R_VGT_PRIMITIVE_TYPE = 0x30908;   # Mesa 0x030908
-var R_VGT_NUM_INSTANCES  = 0x30934;   # Mesa 0x030934
-
-# --- Pipeline-static value constants (from design doc + gfx9.json) ---
-
-# Write all four channels of color target 0 (RGBA mask = 0xF in low
-# 4 bits). Used in CB_TARGET_MASK.
-var GFX9_CB_TARGET_MASK_RGBA = 0xF;
-
-# Output enable for color target 0, all four channels. Used in
-# CB_SHADER_MASK; bit pattern is identical to CB_TARGET_MASK for
-# our single-RT trivial pipeline.
-var GFX9_CB_SHADER_MASK_RGBA0 = 0xF;
-
-# CB_COLOR_CONTROL: NORMAL ROP, no compression, blend dest = NONE.
-# Bit pattern 0xCC matches the design doc; encodes ROP=0xCC (NORMAL),
-# DEFAULT_BLEND_OP_DEST=0 (no compression source).
-var GFX9_CB_COLOR_CONTROL_NORMAL = 0xCC;
-
-# Blend disabled — write source verbatim into RT, no per-channel mask.
-var GFX9_CB_BLEND_DISABLED = 0x0;
-
-# PA_SU_SC_MODE_CNTL: cull none (bits 0-1 = 0), front-face = CCW.
-# Bit 2 = POLY_MODE = 0 (PT_TRIANGLELIST renders solid).
-var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x4;
-
-# VGT_SHADER_STAGES_EN: VS+PS only, no tess, no GS, no NGG.
-# Default value 0 disables every optional stage.
-var GFX9_VGT_SHADER_STAGES_VS_PS = 0x0;
-
-# PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF=1, DX_LINEAR_ATTR_CLIP_ENA=1,
-# Z_CLIP_NEAR_DISABLE for NDC z=0..1 default. Cited from design doc.
-var GFX9_PA_CL_CLIP_CNTL_DEFAULT = 0x90000;
-
-# VGT_PRIMITIVE_TYPE: PT_TRIANGLELIST = 4 (independent triangles, no strip).
-var GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST = 0x4;
-
-# VGT_NUM_INSTANCES: single instance.
-var GFX9_VGT_NUM_INSTANCES_ONE = 0x1;
-
-# SPI_PS_INPUT_ENA / _ADDR: minimum non-zero pattern. Bit 0 =
-# PERSP_SAMPLE_ENA enables sample-rate perspective correction.
-# A zero value reportedly causes hangs on some GFX9 firmware
-# (design doc § "Required register state"); 0x2 is the radv-tested
-# safe minimum. Step 6.5(b) ships this as the value; revisit if
-# the trivial PS proves to be a hang case.
-var GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN = 0x2;
-
-# SPI_VS_OUT_CONFIG.NUM_INTERP = 0 — no varyings between VS and PS.
-# bit 0 = VS_HALF_PACK = 0; bits 1-5 = VS_EXPORT_COUNT = 0
-# (1 export = pos0 only, no params).
-var GFX9_SPI_VS_OUT_CONFIG_NO_VARYING = 0x0;
-
-# DB_SHADER_CONTROL: KILL_ENABLE=0, Z_ORDER=EARLY_Z_THEN_LATE_Z (1),
-# DEPTH_BEFORE_SHADER=0. Trivial PS does no depth/stencil writes;
-# minimum pattern from radv.
-var GFX9_DB_SHADER_CONTROL_DEFAULT = 0x10;
-
-# CB_COLOR_CONTROL composed value: MODE = CB_NORMAL (1, bits 4-6) +
-# ROP3 = 0xCC (COPY_SOURCE, bits 16-23). Caught in 6.5(a) cross-check
-# that the design doc's "0xCC" was field-shorthand, not the encoded
-# register value: 0xCC at bit 0 would mis-set DEGAMMA_ENABLE + MODE.
-# Authoritative composition:
-#   MODE  = CB_NORMAL << 4    = 0x10
-#   ROP3  = 0xCC << 16        = 0xCC0000
-#   union                     = 0xCC0010
-var GFX9_CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010;
-
-# CB_COLOR0_INFO bit-composed value for a linear RGBA8-unorm RT:
-#   FORMAT[2:6]      = COLOR_8_8_8_8 (0xA) << 2  = 0x28
-#   NUMBER_TYPE[8:10] = NUMBER_UNORM (0)         = 0
-#   COMP_SWAP[11:12] = SWAP_STD (0)              = 0
-# All other bits (compression, fast_clear, blend_clamp, etc.) are 0
-# for the trivial pipeline. Cited from Mesa gfx9.json `register_types`
-# field bit-positions and `enums` value table (extracted 2026-04-30).
-var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x28;
-
-# CB_COLOR0_ATTRIB for 2D linear RGBA8 single-sample:
-#   COLOR_SW_MODE[18:22] = 0    (linear surface, no swizzle)
-#   NUM_SAMPLES[12:14]   = 0    (1 sample = 0)
-#   NUM_FRAGMENTS[15:16] = 0
-#   RESOURCE_TYPE[28:29] = 1    (2D image)
-# union = 1 << 28 = 0x10000000.
-# RESOURCE_TYPE encoding cited from radv source pattern; field
-# enum was not in the gfx9.json snapshot, so flag for HW verify.
-var GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000;
-
-# ================================================================
-# v3 Step 6.5(b) — PM4 stream composer for clear-triangle dispatch
-# ================================================================
-# Composes the four PM4 blocks per docs/proposals/v3-backend-interface.md
-# v2.1 split:
-#   1. pipeline_sh   — VS+PS shader VAs + RSRC1/RSRC2
-#   2. pipeline_ctx  — color/blend/raster/depth/SPI mode-static state
-#   3. pass_target   — RT bind + viewport + scissor (RT-extent dependent)
-#   4. draw_tail     — DRAW_INDEX_AUTO with vcount=3
-# Plus an ACQUIRE_MEM cache-invalidate preamble + UConfig graphics
-# regs (primitive type, num instances) + NOP padding.
-#
-# Every block is its own helper fn so each can be tested independently
-# at the CPU level. The top-level `native_pm4_build_render_clear_triangle`
-# composes them in order.
-#
-# Layer-2 verification gate: byte-exact diff vs `RADV_DEBUG=hang` IB
-# capture of an equivalent `vkCmdDraw` clear. Captured under a desktop
-# session — gated on the Hyprland reinstall (see
-# docs/proposals/v3-shader-bytes-capture.md "What unblocks Layer 2").
-
-# Convert an i64 integer to its IEEE-754 f32 bit pattern.
-# Routes through stdlib's `f64_from(int)` and color.cyr's
-# `f64_to_f32(f64bits)`. Used for viewport scale/offset conversions.
-fn native_int_to_f32_bits(i) {
-    return f64_to_f32(f64_from(i));
-}
-
-# Negate an f32 bit pattern (low 32 bits) by flipping the sign bit.
-# Operates on the integer holding the f32 bits; returns the negated
-# f32 bit pattern.
-fn native_f32_neg_bits(f32_bits) {
-    return f32_bits ^ 0x80000000;
-}
-
-# --- Block 1: pipeline_sh ---
-#
-# Two SET_SH_REG packets, each writing 4 contiguous regs starting at
-# the PGM_LO of each stage. VS at 0xB120, PS at 0xB020. Total: 12
-# dwords (48 bytes). Returns new pos.
-fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va) {
-    # PGM_HI mask = 0xFF: the HW register is 32-bit but only the low 8
-    # bits hold meaningful VA bits [47:40]; matches compute pattern at
-    # line ~809 (R_COMPUTE_PGM_HI). PGM_LO carries bits [39:8].
-    var vs_pgm_lo = (vs_va >> 8)  & 0xFFFFFFFF;
-    var vs_pgm_hi = (vs_va >> 40) & 0xFF;
-    var fs_pgm_lo = (fs_va >> 8)  & 0xFFFFFFFF;
-    var fs_pgm_hi = (fs_va >> 40) & 0xFF;
-
-    var vs_regs[16];
-    store32(&vs_regs +  0, vs_pgm_lo);
-    store32(&vs_regs +  4, vs_pgm_hi);
-    store32(&vs_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
-    store32(&vs_regs + 12, GFX9_VS_PGM_RSRC2_MIN);
-    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_VS, 4, &vs_regs);
-
-    var ps_regs[16];
-    store32(&ps_regs +  0, fs_pgm_lo);
-    store32(&ps_regs +  4, fs_pgm_hi);
-    store32(&ps_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
-    store32(&ps_regs + 12, GFX9_PS_PGM_RSRC2_MIN);
-    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_PS, 4, &ps_regs);
-
-    return pos;
-}
-
-# --- Block 2: pipeline_ctx ---
-#
-# Per-pipeline mode-static state: color/blend, rasterizer, clip,
-# stage enable, SPI inputs, depth disabled, anti-alias off. This
-# block does NOT depend on the RT (no extent, no VA) — it's purely
-# a function of the pipeline's intent.
-fn native_pm4_build_render_pipeline_ctx(buf, pos) {
-    # SPI shader output formats — 3 contiguous regs starting at 0xA70C.
-    var spi_fmts[12];
-    store32(&spi_fmts +  0, SPI_SHADER_POS_FORMAT_4);
-    store32(&spi_fmts +  4, SPI_SHADER_Z_FORMAT_INVALID);
-    store32(&spi_fmts +  8, SPI_SHADER_COL_FORMAT_FP32_ABGR);
-    pos = native_pm4_set_context_reg(buf, pos, R_SPI_SHADER_POS_FORMAT, 3, &spi_fmts);
-
-    # CB target/shader masks — 2 contiguous regs at 0xA238.
-    var cb_masks[8];
-    store32(&cb_masks + 0, GFX9_CB_TARGET_MASK_RGBA);
-    store32(&cb_masks + 4, GFX9_CB_SHADER_MASK_RGBA0);
-    pos = native_pm4_set_context_reg(buf, pos, R_CB_TARGET_MASK, 2, &cb_masks);
-
-    # Color / blend / raster / clip / stage enable.
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR_CONTROL,
-                                         GFX9_CB_COLOR_CONTROL_NORMAL_COPY);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_BLEND0_CONTROL,
-                                         GFX9_CB_BLEND_DISABLED);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_SC_MODE_CNTL,
-                                         GFX9_PA_SU_SC_MODE_CULL_NONE);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_CLIP_CNTL,
-                                         GFX9_PA_CL_CLIP_CNTL_DEFAULT);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_SHADER_STAGES_EN,
-                                         GFX9_VGT_SHADER_STAGES_VS_PS);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_REUSE_OFF, 0);
-
-    # SPI inputs/outputs — FS gets the hang-quirk minimum, VS exports
-    # only pos0 (no params).
-    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_INPUT_ENA,
-                                         GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_INPUT_ADDR,
-                                         GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_PS_IN_CONTROL, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_VS_OUT_CONFIG,
-                                         GFX9_SPI_VS_OUT_CONFIG_NO_VARYING);
-
-    # Depth/HTILE/render-override — depth-stencil disabled.
-    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_SHADER_CONTROL,
-                                         GFX9_DB_SHADER_CONTROL_DEFAULT);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_HTILE_SURFACE, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_OVERRIDE, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_OVERRIDE2, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_CONFIG, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_RASTER_CONFIG, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
-
-    return pos;
-}
-
-# --- Block 3: pass_target ---
-#
-# Per-pass state that depends on the RT: scissor (extent), viewport
-# (NDC → pixel mapping with y-flip), and CB_COLOR0_* binding.
-# `rt_va` must be 8-byte aligned. `rt_width` and `rt_height` are
-# pixel counts (must be even for the /2 viewport math to be exact).
-fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
-    # Scissors. Format: low 16 bits = X, high 16 bits = Y.
-    var scissor_tl = 0;
-    var scissor_br = (rt_width & 0xFFFF) | ((rt_height & 0xFFFF) << 16);
-
-    var screen_scissor[8];
-    store32(&screen_scissor + 0, scissor_tl);
-    store32(&screen_scissor + 4, scissor_br);
-    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_SCREEN_SCISSOR_TL, 2, &screen_scissor);
-
-    var generic_scissor[8];
-    store32(&generic_scissor + 0, scissor_tl);
-    store32(&generic_scissor + 4, scissor_br);
-    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_GENERIC_SCISSOR_TL, 2, &generic_scissor);
-
-    # Viewport: NDC (-1..1) → pixel (0..w, 0..h) with y-flip.
-    # XSCALE = w/2, XOFFSET = w/2, YSCALE = -h/2, YOFFSET = h/2.
-    # ZSCALE = 1.0, ZOFFSET = 0.0. All as f32 bit patterns in dwords.
-    # PA_CL_VPORT_XSCALE..ZOFFSET_0 are 6 contiguous dwords starting at 0xA43C.
-    var w_half_f32      = native_int_to_f32_bits(rt_width / 2);
-    var h_half_f32      = native_int_to_f32_bits(rt_height / 2);
-    var neg_h_half_f32  = native_f32_neg_bits(h_half_f32);
-    var one_f32         = native_int_to_f32_bits(1);
-
-    var vport[24];
-    store32(&vport +  0, w_half_f32);     # XSCALE
-    store32(&vport +  4, w_half_f32);     # XOFFSET
-    store32(&vport +  8, neg_h_half_f32); # YSCALE (flipped)
-    store32(&vport + 12, h_half_f32);     # YOFFSET
-    store32(&vport + 16, one_f32);        # ZSCALE
-    store32(&vport + 20, 0);              # ZOFFSET (= 0.0 f32)
-    pos = native_pm4_set_context_reg(buf, pos, R_PA_CL_VPORT_XSCALE, 6, &vport);
-
-    # Z viewport range — ZMIN=0.0, ZMAX=1.0 as f32 bits.
-    var z_minmax[8];
-    store32(&z_minmax + 0, 0);            # ZMIN_0 as f32 = 0.0
-    store32(&z_minmax + 4, one_f32);      # ZMAX_0 as f32 = 1.0
-    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_VPORT_ZMIN_0, 2, &z_minmax);
-
-    # CB_COLOR0 RT bind. BASE = (rt_va >> 8) low 32 bits, BASE_EXT
-    # = (rt_va >> 40) for the 8-bit high-VA extension.
-    var rt_base_lo  = (rt_va >> 8)  & 0xFFFFFFFF;
-    var rt_base_ext = (rt_va >> 40) & 0xFF;
-
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE, rt_base_lo);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE_EXT, rt_base_ext);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_VIEW, 0);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_INFO,
-                                         GFX9_CB_COLOR0_INFO_RGBA8_UNORM);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_ATTRIB,
-                                         GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_DCC_CONTROL, 0);
-
-    return pos;
-}
-
-# --- Block 4: draw_tail ---
-#
-# Single DRAW_INDEX_AUTO with the full-screen-triangle vertex count
-# and AUTO_INDEX source select. Hardware generates vertex_id 0/1/2
-# for the VS to consume from system VGPR v0.
-fn native_pm4_build_render_draw_tail(buf, pos) {
-    return native_pm4_draw_index_auto(buf, pos,
-                                      GFX9_FULLSCREEN_TRI_VCOUNT,
-                                      DI_SRC_SEL_AUTO_INDEX);
-}
-
-# Top-level composer: emits the full PM4 stream for a single
-# clear-triangle dispatch into `buf`. Returns total bytes written
-# (= position after the NOP padding tail).
-#
-# Layout:
-#   1. ACQUIRE_MEM full invalidate
-#   2. UConfig graphics: VGT_PRIMITIVE_TYPE + VGT_NUM_INSTANCES
-#   3. Block 1 — pipeline_sh
-#   4. Block 2 — pipeline_ctx
-#   5. Block 3 — pass_target
-#   6. Block 4 — draw_tail
-#   7. NOP padding to 256-dword (1024-byte) alignment
-#
-# `buf` must be at least 1024 bytes.  `vs_va` and `fs_va` are GPU
-# VAs of the VS+FS BOs (256-byte aligned). `rt_va` is the GPU VA of
-# the color target (8-byte aligned). `rt_width`/`rt_height` are RT
-# dimensions in pixels (must be even).
-#
-# Verification: every emitted dword is structurally tested by
-# `test_native_pm4_render_clear_triangle_*` in mabda_v3.tcyr.
-# Layer-2 byte-exact diff against radv is gated on Hyprland.
-fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
-                                          rt_va, rt_width, rt_height) {
-    var pos = 0;
-    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
-                                         GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_NUM_INSTANCES,
-                                         GFX9_VGT_NUM_INSTANCES_ONE);
-    pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
-    pos = native_pm4_build_render_pipeline_ctx(buf, pos);
-    pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(buf, pos);
-    # Flush CB/DB caches so the FB the kernel signals "complete" on
-    # actually contains the rendered pixels — ACQUIRE_MEM at top of
-    # the IB invalidates fetches but does NOT flush dirty CB writes.
-    # Without this the documented Failure A in
-    # programs/native_render_e2e.cyr fires (pixel readback returns
-    # the GTT sentinel byte). 6.10 prep landed the primitive; this
-    # is its splice site. See vidya
-    # phase_d_cache_flush_and_inv_post_draw entry for the
-    # ACQUIRE_MEM-vs-flush semantics.
-    pos = native_pm4_event_write_cache_flush_and_inv(buf, pos);
-
-    var cur_dwords = pos / 4;
-    var target_dwords = 256;
-    if (cur_dwords < target_dwords) {
-        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
-    }
-    return pos;
-}
-
-# ================================================================
-# v3 Phase B.3.d — syncobj lifecycle (generic DRM, not AMDGPU-specific)
-# ================================================================
-# drm_syncobj_create  = {handle u32, flags u32} = 8 bytes
-# drm_syncobj_destroy = {handle u32, pad u32}  = 8 bytes
-# drm_syncobj_wait    = {handles u64, timeout_nsec s64, count_handles u32,
-#                        flags u32, first_signaled u32, pad u32,
-#                        deadline_nsec u64} = 40 bytes (kernel ≥ 6.10)
-var DRM_SYNCOBJ_CREATE_SIZE   = 8;
-var DRM_SYNCOBJ_DESTROY_SIZE  = 8;
-var DRM_SYNCOBJ_WAIT_SIZE     = 40;
-
-# Generic DRM ioctls: nr values 0xBF / 0xC0 / 0xC3.
-var DRM_IOCTL_SYNCOBJ_CREATE  = 0xC00864BF;
-var DRM_IOCTL_SYNCOBJ_DESTROY = 0xC00864C0;
-var DRM_IOCTL_SYNCOBJ_WAIT    = 0xC02864C3;
-
-var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL         = 0x1;
-var DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT  = 0x2;
-
-# Create a syncobj. Returns handle on success, negative errno on
-# failure. Handle returned via writable req+0.
-fn native_syncobj_create(fd, out_handle_ptr) {
-    var req[8];
-    store32(&req + 0, 0);
-    store32(&req + 4, 0);
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_CREATE, &req);
-    if (rc != 0) { return rc; }
-    store64(out_handle_ptr, load32(&req + 0));
-    return 0;
-}
-
-fn native_syncobj_destroy(fd, handle) {
-    var req[8];
-    store32(&req + 0, handle);
-    store32(&req + 4, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_DESTROY, &req);
-}
-
-# Wait for the syncobj to become signaled. `timeout_ns` is absolute
-# CLOCK_MONOTONIC nanoseconds. Returns 0 on signaled, negative errno
-# on timeout or error. Caller supplies one handle.
-fn native_syncobj_wait(fd, handle, timeout_ns) {
-    var handles[8];
-    store64(&handles + 0, handle);
-    var req[40];
-    memset(&req, 0, 40);
-    store64(&req + 0,  &handles);       # handles ptr
-    store64(&req + 8,  timeout_ns);     # timeout_nsec (absolute)
-    store32(&req + 16, 1);              # count_handles
-    store32(&req + 20, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
-    store32(&req + 24, 0);              # first_signaled (out)
-    store32(&req + 28, 0);              # pad
-    store64(&req + 32, 0);              # deadline_nsec
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_WAIT, &req);
-}
-
-# ================================================================
-# v3 Phase B.3.d — CS (command submission) ioctl
-# ================================================================
-# union drm_amdgpu_cs { in (24) | out (8) } = 24
-# struct drm_amdgpu_cs_chunk                = 16 (id u32 + length_dw u32 + data u64)
-# struct drm_amdgpu_cs_chunk_ib             = 32 (pad u32 + flags u32 + va_start u64
-#                                              + ib_bytes u32 + ip_type u32
-#                                              + ip_instance u32 + ring u32)
-# struct drm_amdgpu_cs_chunk_sem            = 4  (handle u32 only)
-#   Used by DEPENDENCIES / SYNCOBJ_IN / SYNCOBJ_OUT / SCHEDULED_DEPENDENCIES.
-# struct drm_amdgpu_cs_chunk_syncobj        = 16 (handle u32 + flags u32 + point u64)
-#   Used by SYNCOBJ_TIMELINE_WAIT / SYNCOBJ_TIMELINE_SIGNAL only.
-var DRM_AMDGPU_CS                     = 0x04;
-var DRM_AMDGPU_CS_SIZE                = 24;
-var DRM_AMDGPU_CS_CHUNK_SIZE          = 16;
-var DRM_AMDGPU_CS_CHUNK_IB_SIZE       = 32;
-var DRM_AMDGPU_CS_CHUNK_SEM_SIZE      = 4;
-var DRM_AMDGPU_CS_CHUNK_SYNCOBJ_SIZE  = 16;
-var DRM_IOCTL_AMDGPU_CS               = 0xC0186444;
-
-var AMDGPU_CHUNK_ID_IB           = 0x01;
-var AMDGPU_CHUNK_ID_FENCE        = 0x02;
-var AMDGPU_CHUNK_ID_SYNCOBJ_OUT  = 0x05;
-var AMDGPU_CHUNK_ID_BO_HANDLES   = 0x06;
-
-var AMDGPU_HW_IP_GFX      = 0;
-var AMDGPU_HW_IP_COMPUTE  = 1;
-
-# Submit a command stream with one IB chunk + one SYNCOBJ_OUT chunk.
-# Returns 0 on success (CS ioctl accepted). The syncobj becomes
-# signaled when the GPU finishes the submission; caller waits via
-# native_syncobj_wait.
-#
-# Arguments:
-#   fd             — DRM render-node fd
-#   ctx_id         — from native_ctx_alloc
-#   bo_list_handle — from native_bo_list_create
-#   ib_va          — GPU virtual address of the IB (PM4 stream)
-#   ib_bytes       — size of the PM4 stream (multiple of 4)
-#   ip_type        — AMDGPU_HW_IP_COMPUTE or AMDGPU_HW_IP_GFX
-#   syncobj_handle — pre-created syncobj to signal on completion (or 0 to omit)
-fn native_cs_submit(fd, ctx_id, bo_list_handle, ib_va, ib_bytes, ip_type, syncobj_handle) {
-    # Build IB chunk payload (32 bytes).
-    var ib_chunk[32];
-    memset(&ib_chunk, 0, 32);
-    store32(&ib_chunk + 0,  0);         # _pad
-    store32(&ib_chunk + 4,  0);         # flags
-    store64(&ib_chunk + 8,  ib_va);
-    store32(&ib_chunk + 16, ib_bytes);
-    store32(&ib_chunk + 20, ip_type);
-    store32(&ib_chunk + 24, 0);         # ip_instance
-    store32(&ib_chunk + 28, 0);         # ring
-
-    # Build SYNCOBJ_OUT chunk payload. The kernel treats this chunk as
-    # an array of drm_amdgpu_cs_chunk_sem (4 bytes: handle only) — NOT
-    # the 16-byte drm_amdgpu_cs_chunk_syncobj (which is timeline-only).
-    # Getting this wrong manifests as -EINVAL because the kernel reads
-    # more "handles" than you meant and 0-valued slots fail syncobj
-    # lookup. See feedback memory & CHANGELOG note for v3 Phase B.3.d.
-    var syncobj_chunk[4];
-    store32(&syncobj_chunk + 0, syncobj_handle);
-
-    var include_sync = 1;
-    if (syncobj_handle == 0) { include_sync = 0; }
-
-    # Build chunk descriptors (16 bytes each).
-    var chunks[32];
-    memset(&chunks, 0, 32);
-    store32(&chunks + 0,  AMDGPU_CHUNK_ID_IB);
-    store32(&chunks + 4,  32 / 4);       # length_dw = 8 (IB chunk payload)
-    store64(&chunks + 8,  &ib_chunk);
-
-    if (include_sync == 1) {
-        store32(&chunks + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
-        store32(&chunks + 20, 1);         # length_dw = 1 (single u32 handle)
-        store64(&chunks + 24, &syncobj_chunk);
-    }
-
-    var chunk_ptrs[16];
-    store64(&chunk_ptrs + 0, &chunks);
-    if (include_sync == 1) {
-        store64(&chunk_ptrs + 8, &chunks + 16);
-    }
-
-    var num_chunks = 1 + include_sync;
-
-    var req[24];
-    memset(&req, 0, 24);
-    store32(&req + 0,  ctx_id);
-    store32(&req + 4,  bo_list_handle);
-    store32(&req + 8,  num_chunks);
-    store32(&req + 12, 0);                # flags
-    store64(&req + 16, &chunk_ptrs);
-
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
-}
-
-# Submit a CS using the BO_HANDLES chunk path (Mesa rusticl pattern) instead
-# of the BO_LIST_OP_CREATE ioctl. The kernel parser at drivers/gpu/drm/amd/
-# amdgpu/amdgpu_cs.c:p1_bo_handles consumes the chunk_data as a
-# drm_amdgpu_bo_list_in (24 bytes); its bo_info_ptr field then points to the
-# array of {handle u32, priority u32} entries. cs.in.bo_list_handle is
-# unused (the BO list is reconstructed from the chunk).
-#
-# Caller pre-builds bo_list_in (24 bytes) with:
-#   off  0: operation    = 0xFFFFFFFF  (sentinel — kernel infers from chunk)
-#   off  4: list_handle  = 0xFFFFFFFF  (sentinel)
-#   off  8: bo_number    = N
-#   off 12: bo_info_size = 8           (sizeof drm_amdgpu_bo_list_entry)
-#   off 16: bo_info_ptr  = &entries    (N × {u32 handle, u32 priority})
-#
-# Chunk order matches Mesa's amdgpu_cs_submit_ib_kernelq:
-#   1. BO_HANDLES
-#   2. SYNCOBJ_OUT  (when syncobj_handle != 0)
-#   3. IB
-fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type, syncobj_handle) {
-    var ib_chunk[32];
-    memset(&ib_chunk, 0, 32);
-    store32(&ib_chunk + 0,  0);
-    store32(&ib_chunk + 4,  0);
-    store64(&ib_chunk + 8,  ib_va);
-    store32(&ib_chunk + 16, ib_bytes);
-    store32(&ib_chunk + 20, ip_type);
-    store32(&ib_chunk + 24, 0);
-    store32(&ib_chunk + 28, 0);
-
-    var syncobj_chunk[4];
-    store32(&syncobj_chunk + 0, syncobj_handle);
-
-    var include_sync = 1;
-    if (syncobj_handle == 0) { include_sync = 0; }
-
-    # Up to 3 chunk descriptors (16 bytes each): BO_HANDLES, SYNCOBJ_OUT, IB.
-    var chunks[48];
-    memset(&chunks, 0, 48);
-    # 1. BO_HANDLES — length_dw = sizeof(drm_amdgpu_bo_list_in)/4 = 6.
-    store32(&chunks + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
-    store32(&chunks + 4,  6);
-    store64(&chunks + 8,  bo_list_in_ptr);
-
-    var pos = 16;
-    if (include_sync == 1) {
-        store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
-        store32(&chunks + pos + 4,  1);
-        store64(&chunks + pos + 8,  &syncobj_chunk);
-        pos = pos + 16;
-    }
-    # IB chunk last (matches Mesa).
-    store32(&chunks + pos + 0,  AMDGPU_CHUNK_ID_IB);
-    store32(&chunks + pos + 4,  32 / 4);
-    store64(&chunks + pos + 8,  &ib_chunk);
-
-    var num_chunks = 2 + include_sync;
-
-    var chunk_ptrs[24];
-    store64(&chunk_ptrs + 0,  &chunks + 0);
-    if (include_sync == 1) {
-        store64(&chunk_ptrs + 8,  &chunks + 16);
-        store64(&chunk_ptrs + 16, &chunks + 32);
-    }
-    if (include_sync == 0) {
-        store64(&chunk_ptrs + 8,  &chunks + 16);
-    }
-
-    var req[24];
-    memset(&req, 0, 24);
-    store32(&req + 0,  ctx_id);
-    store32(&req + 4,  0);                # bo_list_handle = 0 (chunk replaces it)
-    store32(&req + 8,  num_chunks);
-    store32(&req + 12, 0);
-    store64(&req + 16, &chunk_ptrs);
-
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
-}
-
-# Submit a CS using the full 4-chunk Mesa-rusticl shape:
-# BO_HANDLES + SYNCOBJ_OUT + FENCE + IB, with caller-provided IB flags.
-# This is the byte-shape that the working session-25b C spike uses
-# (deps/libdrm_store_spike_v3.c). The 3-chunk variant
-# native_cs_submit_inline_bos (without FENCE) accepts the submit ioctl
-# but never queues the IB to MEC for compute on this kernel — TDR fires
-# after 10s and the syncobj signals as if the IB completed.
-#
-# Caller pre-builds bo_list_in (24 bytes) per native_cs_submit_inline_bos.
-# fence_kh = KMS handle of a BO mapped into the GPU VA space. The kernel
-# writes the IB completion sequence number to (fence_bo + fence_offset),
-# 8 bytes. fence_offset is typically 32 (matches Mesa).
-# ib_flags = AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE (0x08) for compute.
-fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
-                           syncobj_handle, fence_kh, fence_offset, ib_flags) {
-    var ib_chunk[32];
-    memset(&ib_chunk, 0, 32);
-    store32(&ib_chunk + 0,  0);
-    store32(&ib_chunk + 4,  ib_flags);
-    store64(&ib_chunk + 8,  ib_va);
-    store32(&ib_chunk + 16, ib_bytes);
-    store32(&ib_chunk + 20, ip_type);
-    store32(&ib_chunk + 24, 0);
-    store32(&ib_chunk + 28, 0);
-
-    var syncobj_chunk[4];
-    store32(&syncobj_chunk + 0, syncobj_handle);
-
-    var fence_chunk[8];
-    store32(&fence_chunk + 0, fence_kh);
-    store32(&fence_chunk + 4, fence_offset);
-
-    var chunks_4[64];
-    memset(&chunks_4, 0, 64);
-    store32(&chunks_4 + 0,  AMDGPU_CHUNK_ID_BO_HANDLES);
-    store32(&chunks_4 + 4,  6);
-    store64(&chunks_4 + 8,  bo_list_in_ptr);
-    store32(&chunks_4 + 16, AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
-    store32(&chunks_4 + 20, 1);
-    store64(&chunks_4 + 24, &syncobj_chunk);
-    store32(&chunks_4 + 32, AMDGPU_CHUNK_ID_FENCE);
-    store32(&chunks_4 + 36, 2);
-    store64(&chunks_4 + 40, &fence_chunk);
-    store32(&chunks_4 + 48, AMDGPU_CHUNK_ID_IB);
-    store32(&chunks_4 + 52, 32 / 4);
-    store64(&chunks_4 + 56, &ib_chunk);
-
-    var chunk_ptrs_4[32];
-    store64(&chunk_ptrs_4 + 0,  &chunks_4 + 0);
-    store64(&chunk_ptrs_4 + 8,  &chunks_4 + 16);
-    store64(&chunk_ptrs_4 + 16, &chunks_4 + 32);
-    store64(&chunk_ptrs_4 + 24, &chunks_4 + 48);
-
-    var req_4[24];
-    memset(&req_4, 0, 24);
-    store32(&req_4 + 0,  ctx_id);
-    store32(&req_4 + 4,  0);
-    store32(&req_4 + 8,  4);
-    store32(&req_4 + 12, 0);
-    store64(&req_4 + 16, &chunk_ptrs_4);
-
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
-}
+# Depends on all three split files above; the include chain in
+# src/lib.cyr orders them as: amdgpu → shaders → pm4 → backend_native.
 
 # ================================================================
 # v3 Step 4b — composed dispatch (PM4 + IB + fence + submit + wait)
@@ -2068,7 +61,7 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 # output handles come from the caller (still per-dispatch, since
 # they're user-provided resources).
 fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
-        shader_handle, out_handle, timeout_ns) {
+shader_handle, out_handle, timeout_ns) {
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var stub_handle = native_ctx_stub_handle(ctx);
@@ -2100,15 +93,18 @@ fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
     store64(&bo_list_in + 16, &entries);
 
     # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
-    var syncobj_handle_ptr = alloc(8);
-    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    # Audit LOW-5: out-ptr lives on the stack so we don't bump-leak
+    # 8 bytes per dispatch. native_syncobj_create writes the handle
+    # into the buffer; we load it back and pass to wait/destroy.
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
-    var syncobj_handle = load64(syncobj_handle_ptr);
+    var syncobj_handle = load64(&syncobj_buf);
 
     # 4-chunk Mesa-shape submit.
     rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-                                 AMDGPU_HW_IP_COMPUTE, syncobj_handle,
-                                 fence_handle, 32, 0x08);
+    AMDGPU_HW_IP_COMPUTE, syncobj_handle,
+    fence_handle, 32, 0x08);
     if (rc != 0) {
         var rc_save = rc;
         native_syncobj_destroy(fd, syncobj_handle);
@@ -2185,7 +181,7 @@ fn native_render_bo_list_pack(entries40, fence_h, vs_h, fs_h, rt_h, ib_h) {
 # GPU_ERR_* code on failure. Does NOT verify pixels — that's the
 # 6.9(b) e2e program's job.
 fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
-        render_handles_ptr, timeout_ns) {
+render_handles_ptr, timeout_ns) {
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle   = native_ctx_ib_handle(ctx);
@@ -2208,7 +204,7 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
     # 5-entry BO_HANDLES list (Mesa-shape): fence / vs / fs / rt / ib.
     var entries[40];
     native_render_bo_list_pack(&entries, fence_handle,
-                               vs_handle, fs_handle, rt_handle, ib_handle);
+    vs_handle, fs_handle, rt_handle, ib_handle);
     var bo_list_in[24];
     store32(&bo_list_in +  0, 0xFFFFFFFF);
     store32(&bo_list_in +  4, 0xFFFFFFFF);
@@ -2217,17 +213,19 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
     store64(&bo_list_in + 16, &entries);
 
     # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
-    var syncobj_handle_ptr = alloc(8);
-    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    # Audit LOW-5: stack-local out-ptr — same rationale as the
+    # compute dispatcher above.
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
-    var syncobj_handle = load64(syncobj_handle_ptr);
+    var syncobj_handle = load64(&syncobj_buf);
 
     # 4-chunk Mesa-shape submit on the GFX ring. ib_flags=0 (no
     # TC_WB_NOT_INVALIDATE — graphics' ACQUIRE_MEM in the PM4 stream
     # handles cache invalidation directly).
     rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-                                 AMDGPU_HW_IP_GFX, syncobj_handle,
-                                 fence_handle, 32, 0);
+    AMDGPU_HW_IP_GFX, syncobj_handle,
+    fence_handle, 32, 0);
     if (rc != 0) {
         var rc_save = rc;
         native_syncobj_destroy(fd, syncobj_handle);
@@ -2269,17 +267,20 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
 #   compute_dispatch slot — until a public gpu_buffer_native_new()
 #   helper lands, callers pack the pair manually.
 
-fn native_ctx_fd(ctx)             { return load64(ctx +  0); }
-fn native_ctx_id(ctx)              { return load64(ctx +  8); }
-fn native_ctx_stub_handle(ctx)     { return load64(ctx + 16); }
-fn native_ctx_stub_va(ctx)         { return load64(ctx + 24); }
-fn native_ctx_stub_addr(ctx)       { return load64(ctx + 40); }
-fn native_ctx_ib_handle(ctx)       { return load64(ctx + 48); }
-fn native_ctx_ib_va(ctx)           { return load64(ctx + 56); }
-fn native_ctx_ib_addr(ctx)         { return load64(ctx + 64); }
-fn native_ctx_fence_handle(ctx)    { return load64(ctx + 72); }
-fn native_ctx_fence_va(ctx)        { return load64(ctx + 80); }
-fn native_ctx_fence_addr(ctx)      { return load64(ctx + 88); }
+fn native_ctx_fd(ctx)             { return load64(ctx +   0); }
+fn native_ctx_id(ctx)              { return load64(ctx +   8); }
+fn native_ctx_stub_handle(ctx)     { return load64(ctx +  16); }
+fn native_ctx_stub_va(ctx)         { return load64(ctx +  24); }
+fn native_ctx_stub_addr(ctx)       { return load64(ctx +  40); }
+fn native_ctx_ib_handle(ctx)       { return load64(ctx +  48); }
+fn native_ctx_ib_va(ctx)           { return load64(ctx +  56); }
+fn native_ctx_ib_addr(ctx)         { return load64(ctx +  64); }
+fn native_ctx_fence_handle(ctx)    { return load64(ctx +  72); }
+fn native_ctx_fence_va(ctx)        { return load64(ctx +  80); }
+fn native_ctx_fence_addr(ctx)      { return load64(ctx +  88); }
+# Audit MED-7: per-context PM4 build scratch (1024 bytes), allocated
+# once at gpu_context_new_native, shared between compute + render slots.
+fn native_ctx_pm4_scratch(ctx)     { return load64(ctx + 112); }
 
 # Pack (handle, va) into the private 16-byte buffer-pair shape.
 # Caller allocates 16 bytes for `dst` (typically a stack-local
@@ -2328,28 +329,48 @@ fn _backend_native_ctx_release(ctx) {
     return 0;
 }
 
-# Buffer slots — Step 4c stubs. Native BO management (gpu_buffer_*
-# routed through ctx->backend) is Step 4d+ work. Returning err
-# means "not implemented" without crashing.
+# Buffer slots — diagnostic stubs (audit LOW-3).
+#
+# The public `gpu_buffer_*` API is intentionally not implemented on
+# the native AMD backend in v3.0 — consumers that need native today
+# (the in-tree `programs/native_*.cyr`) all use `native_buf_pair_*`
+# directly, and cross-backend portable buffer code is blocked by
+# LOW-4 (vc/ic in render dispatch) anyway. v3.x will port these to
+# `native_buf_pair_*` underneath.
+#
+# Slot semantics:
+#   - `_buffer_create` returns a handle (i64) — 0 means "create
+#     failed, no handle." Callers MUST null-check the return.
+#   - `_buffer_write` / `_buffer_read` return a GpuErr code — 0 is
+#     success, anything else is a failure. We return
+#     GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "the
+#     native backend doesn't support gpu_buffer_* yet" from
+#     generic GPU_ERR_OTHER failures.
+#   - `_buffer_release` is a no-op success — releasing a never-
+#     created handle is sensibly a no-op, and propagating an error
+#     here would leak detail through every cleanup path.
 fn _backend_native_buffer_create(ctx, size, usage) {
     return 0;
 }
 
 fn _backend_native_buffer_write(ctx, buf, off, ptr, n) {
-    return GPU_ERR_OTHER;
+    return GPU_ERR_NOT_IMPLEMENTED;
 }
 
 fn _backend_native_buffer_read(ctx, buf, off, ptr, n) {
-    return GPU_ERR_OTHER;
+    return GPU_ERR_NOT_IMPLEMENTED;
 }
 
 fn _backend_native_buffer_release(ctx, buf) {
     return 0;
 }
 
-# Shader-module slots — stubs. Native shader modules are pre-
-# compiled GFX9 ISA bytes mapped to a BO at a canonical-high VA;
-# Step 4d+ will wrap that.
+# Shader-module slots — diagnostic stubs (audit LOW-3). Same
+# rationale as the buffer slots: native shader modules in v3.0
+# come from `native_shader_lib_*` helpers (pre-compiled GFX9 ISA
+# wrapped at canonical-high VA), not from this public API.
+# `_shader_module_create` returns 0 ("no module") on failure;
+# `_release` is a no-op success.
 fn _backend_native_shader_module_create(ctx, bytes_ptr, n) {
     return 0;
 }
@@ -2360,6 +381,12 @@ fn _backend_native_shader_module_release(ctx, shmod) {
 
 # Compute dispatch — the load-bearing slot. Step 4c lands this
 # end-to-end. shmod and bp are pointers to (handle, va) pairs.
+# Audit MED-7: PM4 build buffer comes from the cached per-context
+# scratch (`native_ctx_pm4_scratch`) instead of a per-dispatch
+# alloc(256). Lifetime contract: the scratch is shared with the
+# render slot; Cyrius is single-threaded so no slot can re-enter
+# while another holds it. Always memset the bytes we'll write before
+# building.
 fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     if (ctx == 0)   { return GPU_ERR_OTHER; }
     if (shmod == 0) { return GPU_ERR_OTHER; }
@@ -2371,10 +398,11 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     var out_handle = load64(bp + 0);
     var out_va     = load64(bp + 8);
 
-    var pm4 = alloc(256);
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
-                            shader_va, stub_va, out_va, x, y, z);
+    shader_va, stub_va, out_va, x, y, z);
 
     var t_now[16];
     syscall(228, 1, &t_now);
@@ -2385,8 +413,8 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     # fence BOs were allocated once in gpu_context_new_native; we
     # just memcpy PM4 into the cached IB and submit.
     return native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
-                                          shader_handle, out_handle,
-                                          deadline);
+    shader_handle, out_handle,
+    deadline);
 }
 
 # Device wait — stub. Native dispatch is synchronous (waits on the
@@ -2502,7 +530,7 @@ fn _backend_native_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt) {
     var fs_va     = load64(fs_mod + 8);
     var pipe = alloc(NATIVE_PIPE_STRUCT_SIZE);
     var rc = native_render_pipeline_pack(pipe, vs_handle, vs_va,
-                                         fs_handle, fs_va);
+    fs_handle, fs_va);
     if (rc != 0) { return 0; }
     return pipe;
 }
@@ -2526,16 +554,22 @@ fn _backend_native_render_pass_begin(ctx, rt, clear_color_ptr) {
     return p;
 }
 
-# Compose the full clear-triangle PM4 stream and dispatch on the GFX
-# ring. v2-native: single-draw-per-pass — vc/ic are accepted for ABI
-# parity but the FS+VS pair is fixed-shape (3-vertex fullscreen
-# triangle, single instance), so the PM4 stream's draw_tail uses
-# `GFX9_FULLSCREEN_TRI_VCOUNT`/`_NUM_INSTANCES_ONE` regardless. State
-# caching (skip pipeline_sh+ctx if same pipe) is a v3.x perf item.
+# Compose the full render PM4 stream and dispatch on the GFX ring.
+# v2-native: single-draw-per-pass. Audit LOW-4: `vc` (vertex count)
+# is now threaded through to the DRAW_INDEX_AUTO packet; v3.0-rc.1
+# silently ignored it and always emitted the fullscreen-triangle
+# count of 3. `ic` (instance count) is still ABI-only — we reject
+# anything but `ic == 1` because instance rendering needs additional
+# VGT_NUM_INSTANCES wiring that's v3.x scope. State caching (skip
+# pipeline_sh+ctx if same pipe) is a v3.x perf item.
 fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (pipe == 0) { return GPU_ERR_OTHER; }
+    # Audit LOW-4: reject zero/negative vertex counts and
+    # non-singleton instance counts before spending an alloc.
+    if (vc <= 0)   { return GPU_ERR_OTHER; }
+    if (ic != 1)   { return GPU_ERR_NOT_IMPLEMENTED; }
     var rt = load64(pass + NATIVE_PASS_FIELD_RT);
     if (rt == 0) { return GPU_ERR_OTHER; }
     var rt_va     = load64(rt + NATIVE_RT_FIELD_VA);
@@ -2552,27 +586,31 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     if (vs_handle == 0) { return GPU_ERR_OTHER; }
     if (fs_handle == 0) { return GPU_ERR_OTHER; }
 
-    # Build the IB stream into a 1024-byte scratch (matches the
-    # 256-dword padded shape of native_pm4_build_render_clear_triangle).
-    var pm4 = alloc(1024);
+    # Build the IB stream into the per-context cached PM4 scratch
+    # (audit MED-7) — replaces a per-draw alloc(1024) that bumped
+    # the allocator forward on every frame. The 1024-byte scratch
+    # is also the worst-case render stream size, matching the
+    # 256-dword padded shape of native_pm4_build_render_clear_triangle.
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 1024);
     var pos = 0;
     pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_PRIMITIVE_TYPE,
-                                         GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_NUM_INSTANCES,
-                                         GFX9_VGT_NUM_INSTANCES_ONE);
+    GFX9_VGT_NUM_INSTANCES_ONE);
     # Splice the pre-built sh + ctx blocks (Step 6.5(b) composers
     # already ran at pipeline_create — this is the cached-block path).
     memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_SH_BLOCK,
-           NATIVE_PIPE_SH_BLOCK_SIZE);
+    NATIVE_PIPE_SH_BLOCK_SIZE);
     pos = pos + NATIVE_PIPE_SH_BLOCK_SIZE;
     memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_CTX_BLOCK,
-           NATIVE_PIPE_CTX_BLOCK_SIZE);
+    NATIVE_PIPE_CTX_BLOCK_SIZE);
     pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
-                                              rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(pm4, pos);
+    rt_width, rt_height);
+    pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
     # Post-draw cache flush — same rationale as the standalone
     # composer above. CB writes need to land in memory before the
     # syncobj signals so the consumer reads / page-flips see the
@@ -2669,8 +707,8 @@ fn _backend_native_surface_configure(ctx, width, height) {
 
     # ---- modeset on first CONNECTED connector ----
     var rc = native_kms_modeset_first_connected(card_fd, render_fd,
-                                                state,
-                                                ns + NATIVE_SURFACE_SCANOUT);
+    state,
+    ns + NATIVE_SURFACE_SCANOUT);
     if (rc != 0) {
         native_kms_release(state);
         return 0;
@@ -2685,23 +723,23 @@ fn _backend_native_surface_configure(ctx, width, height) {
     # downstream assumes the dimensions it asked for.
     if (fb_w != width)  {
         native_kms_release_scanout(card_fd, render_fd,
-                                   ns + NATIVE_SURFACE_SCANOUT);
+        ns + NATIVE_SURFACE_SCANOUT);
         native_kms_release(state);
         return 0;
     }
     if (fb_h != height) {
         native_kms_release_scanout(card_fd, render_fd,
-                                   ns + NATIVE_SURFACE_SCANOUT);
+        ns + NATIVE_SURFACE_SCANOUT);
         native_kms_release(state);
         return 0;
     }
 
     # ---- alloc second FB matching mode dimensions ----
     rc = native_kms_alloc_fb(card_fd, render_fd, fb_w, fb_h,
-                             ns + NATIVE_SURFACE_FB_B);
+    ns + NATIVE_SURFACE_FB_B);
     if (rc != 0) {
         native_kms_release_scanout(card_fd, render_fd,
-                                   ns + NATIVE_SURFACE_SCANOUT);
+        ns + NATIVE_SURFACE_SCANOUT);
         native_kms_release(state);
         return 0;
     }
@@ -2743,16 +781,16 @@ fn _backend_native_surface_present(ctx, surface) {
     if (front_is_b != 0) {
         # back is scanout's FB
         back_fb_id = load32(surface + NATIVE_SURFACE_SCANOUT
-                            + NATIVE_KMS_SCANOUT_FB_ID);
+        + NATIVE_KMS_SCANOUT_FB_ID);
     }
     if (front_is_b == 0) {
         # back is fb_b
         back_fb_id = load32(surface + NATIVE_SURFACE_FB_B
-                            + NATIVE_KMS_FB_FB_ID);
+        + NATIVE_KMS_FB_FB_ID);
     }
     var rc = native_kms_present(card_fd,
-                                surface + NATIVE_SURFACE_SCANOUT,
-                                back_fb_id, 0);
+    surface + NATIVE_SURFACE_SCANOUT,
+    back_fb_id, 0);
     # Audit MED-1 (2026-04-30): map negative-errno (kernel) and
     # mabda-internal sentinels (-2 short read, -3 wrong event type)
     # to GPU_ERR_* so consumer error-handling matches the wgpu side.
@@ -2773,9 +811,9 @@ fn _backend_native_surface_release(ctx, surface) {
     var render_fd = load32(surface + NATIVE_SURFACE_RENDER_FD);
     var state     = load64(surface + NATIVE_SURFACE_STATE);
     native_kms_release_fb(card_fd, render_fd,
-                          surface + NATIVE_SURFACE_FB_B);
+    surface + NATIVE_SURFACE_FB_B);
     native_kms_release_scanout(card_fd, render_fd,
-                               surface + NATIVE_SURFACE_SCANOUT);
+    surface + NATIVE_SURFACE_SCANOUT);
     if (state != 0) { native_kms_release(state); }
     memset(surface, 0, NATIVE_SURFACE_SIZE);
     return 0;
@@ -2794,56 +832,56 @@ fn _backend_native_surface_release(ctx, surface) {
 fn backend_native_new() {
     var b = backend_new();
     backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
-                     &_backend_native_ctx_create_from_preinit);
+    &_backend_native_ctx_create_from_preinit);
     backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
-                     &_backend_native_ctx_release);
+    &_backend_native_ctx_release);
     backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
-                     &_backend_native_buffer_create);
+    &_backend_native_buffer_create);
     backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
-                     &_backend_native_buffer_write);
+    &_backend_native_buffer_write);
     backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
-                     &_backend_native_buffer_read);
+    &_backend_native_buffer_read);
     backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
-                     &_backend_native_buffer_release);
+    &_backend_native_buffer_release);
     backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
-                     &_backend_native_shader_module_create);
+    &_backend_native_shader_module_create);
     backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
-                     &_backend_native_shader_module_release);
+    &_backend_native_shader_module_release);
     backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
-                     &_backend_native_compute_dispatch);
+    &_backend_native_compute_dispatch);
     backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
-                     &_backend_native_device_wait_idle);
+    &_backend_native_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
-                     &_backend_native_texture_create_2d_rgba8);
+    &_backend_native_texture_create_2d_rgba8);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
-                     &_backend_native_texture_write);
+    &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
-                     &_backend_native_texture_read);
+    &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
-                     &_backend_native_texture_release);
+    &_backend_native_texture_release);
     backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
-                     &_backend_native_render_target_create_2d_rgba8);
+    &_backend_native_render_target_create_2d_rgba8);
     backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
-                     &_backend_native_render_target_release);
+    &_backend_native_render_target_release);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
-                     &_backend_native_render_pipeline_create);
+    &_backend_native_render_pipeline_create);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
-                     &_backend_native_render_pipeline_release);
+    &_backend_native_render_pipeline_release);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
-                     &_backend_native_render_pass_begin);
+    &_backend_native_render_pass_begin);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
-                     &_backend_native_render_pass_draw);
+    &_backend_native_render_pass_draw);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
-                     &_backend_native_render_pass_end);
+    &_backend_native_render_pass_end);
     # v3 surface slots (Step 7.6 stubs; 7.7 fills with real impls).
     backend_set_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE,
-                     &_backend_native_surface_configure);
+    &_backend_native_surface_configure);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE,
-                     &_backend_native_surface_acquire);
+    &_backend_native_surface_acquire);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_PRESENT,
-                     &_backend_native_surface_present);
+    &_backend_native_surface_present);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
-                     &_backend_native_surface_release);
+    &_backend_native_surface_release);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
@@ -3096,10 +1134,10 @@ fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va) {
     store64(out + NATIVE_PIPE_FIELD_FS_HANDLE, fs_handle);
     store64(out + NATIVE_PIPE_FIELD_FS_VA,     fs_va);
     var sh_end = native_pm4_build_render_pipeline_sh(
-                     out + NATIVE_PIPE_FIELD_SH_BLOCK, 0, vs_va, fs_va);
+    out + NATIVE_PIPE_FIELD_SH_BLOCK, 0, vs_va, fs_va);
     if (sh_end != NATIVE_PIPE_SH_BLOCK_SIZE) { return -2; }
     var ctx_end = native_pm4_build_render_pipeline_ctx(
-                      out + NATIVE_PIPE_FIELD_CTX_BLOCK, 0);
+    out + NATIVE_PIPE_FIELD_CTX_BLOCK, 0);
     if (ctx_end != NATIVE_PIPE_CTX_BLOCK_SIZE) { return -3; }
     return 0;
 }

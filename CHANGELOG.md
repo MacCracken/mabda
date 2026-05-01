@@ -18,6 +18,192 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.0-rc.2] — 2026-05-01
+
+**Audit-track closeout cut.** Every deferred item from the
+[2026-04-30 audit](docs/audit/2026-04-30-audit.md) (10 findings: 4
+MED, 5 LOW, plus the bundled MED-7+LOW-5 PM4-scratch leak) is fixed
+in tree, plus the two toolchain-side scaffold items the rc.2
+punchlist gated on (`backend_native.cyr` 4-way split + CI fmt-
+truncation guard). Official `3.0.0` is the next cut, after the
+6-consumer regression sweep + 3-day soak (`rc.3` if anything
+regresses).
+
+**Metrics**: 38 src/ modules (was 35; backend_native.cyr split into
+`_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` to land under
+cyrius lint/fmt's 128 KiB cap) / ~14,500 LoC unchanged / **1871 CPU
+asserts** across 3 test files (was 1828 at rc.1; +43 from audit
+fixes) / `dist/mabda.cyr` ~11,800 lines / 8 GPU integration programs
+(rc.1's 7 + new `native_pm4_dump` for the radv_capture Phase 2
+byte-diff harness — CI-safe, no GPU needed).
+
+### Fixed — 2026-05-01 (audit-track closeout)
+
+- **MED-2 — caller-supplied dimension overflow guards** in the
+  scanout path. New `_kms_validate_fb_dims` helper in
+  `src/backend_native_kms.cyr` caps `(width, height)` at 16384 each
+  (WebGPU `MAX_TEXTURE_DIMENSION_2D`, also the AMD single-pipe scanout
+  limit), computes the 256-byte-aligned pitch, and rejects total BO
+  bytes above 2 GiB. Wired into `native_kms_alloc_fb` and
+  `native_kms_modeset_first_connected` — EDID-fed modes that exceed
+  the caps now fail fast (`-1` from alloc_fb, `-7` from modeset)
+  before any BO allocation. 18 new asserts in
+  `tests/tcyr/mabda_v3_phase_d.tcyr` covering 1080p valid math, 16384²
+  at the cap, just-over rejects, non-positive, null out-ptrs, plus
+  the boundary-rejection asserts the audit asked for (16385 / 65537 /
+  negative / overflow).
+- **MED-4 — two-pass DRM discovery TOCTOU clamping.** After the
+  fill-pass ioctl in `native_kms_init` and `native_kms_get_connector_modes`,
+  clamp `actual = min(actual, capacity)` against the pre-fill cap so a
+  hot-add race or future kernel quirk can't cause downstream code to
+  read past the heap arrays sized off pass-1 counts. Defense-in-depth;
+  no behavioural change on a sane kernel.
+- **MED-5 — `native_drm_set_master` no longer collapses `-EINVAL` to
+  success.** Previously the wrapper treated `-EINVAL` as
+  "already master" — but `-EINVAL` is also returned for genuine
+  argument errors, and disambiguation requires a separate
+  `DRM_IOCTL_AUTH_MAGIC` probe. New behaviour: pass `-EINVAL`
+  through unchanged so callers can decide based on subsequent
+  ioctl results. Comment block in `src/backend_native_kms.cyr`
+  documents the contract.
+- **MED-7 + LOW-5 — bump-allocator leaks on per-dispatch PM4
+  scratches.** Both were leaking through every compute / render
+  dispatch:
+  - **MED-7**: `_backend_native_compute_dispatch` leaked 256 B per
+    dispatch (`alloc(256)` for the PM4 scratch);
+    `_backend_native_render_pass_draw` leaked 1024 B per draw
+    (`alloc(1024)` for the same purpose). At 60 fps render = ~61
+    KiB/sec, ~15 GiB over a 3-day soak.
+  - **LOW-5**: both `native_compute_dispatch_cached` and
+    `native_render_dispatch_simple` leaked an additional 8 B per
+    dispatch (`alloc(8)` for the syncobj-handle out-pointer).
+  Fix: extend `GpuContext` from 112 → 120 bytes with a new
+  `+112: pm4_scratch` slot, allocate the 1024-byte scratch once at
+  `gpu_context_new_native`, share between compute (uses first 256 B)
+  and render (uses full 1024 B) slots. Replace `alloc(8)` syncobj
+  scratches with stack-local `var syncobj_buf[8]`. Lifetime contract
+  documented in `src/context.cyr`: scratch is reset on each dispatch
+  entry, never reclaimed; safe under Cyrius's single-threaded
+  execution model. 5 new asserts in Phase D pinning the new
+  GpuContext size + scratch ptr stability.
+- **LOW-1 — `fd > 0` guard on `native_drm_set_master` /
+  `native_drm_drop_master`** matching every other ioctl wrapper in
+  `src/backend_native_kms.cyr`. Returns `-1` on invalid fd instead of
+  issuing a syscall and depending on the kernel's `-EBADF`. 4
+  asserts.
+- **LOW-2 — `_kms_summary_print_u32` 16-byte stack buffer too small
+  for a max-i64 input.** `fmt_int_buf` is i64-typed (max 19 decimal
+  digits + sign + null terminator = 21 bytes); the original 16-byte
+  buffer would have overflowed for max-magnitude inputs. KMS IDs are
+  u32 in practice, but defense-in-depth — buffer bumped to 24 bytes.
+  1 assert pinning the underlying property (`fmt_int_buf` width for
+  max signed i64 = 19).
+- **LOW-3 — diagnostic `GPU_ERR_NOT_IMPLEMENTED` for the native
+  `gpu_buffer_*` / `gpu_shader_module_*` slot stubs.** New error
+  code `GPU_ERR_NOT_IMPLEMENTED = 18` in `src/error.cyr`; native
+  `_buffer_write` / `_buffer_read` slot stubs return it instead of
+  `GPU_ERR_OTHER` so callers can distinguish "this backend doesn't
+  support `gpu_buffer_*` yet" from generic failures. v3.0 native
+  consumers should keep using `native_buf_pair_*` directly; the
+  public `gpu_buffer_*` API native impl is v3.x scope. 8 asserts.
+- **LOW-4 — `vc` (vertex_count) honoured in native render draw.**
+  `_backend_native_render_pass_draw` previously ignored the `vc`
+  parameter and always emitted the fullscreen-triangle 3-vertex count
+  in DRAW_INDEX_AUTO. New behaviour: thread `vc` through
+  `native_pm4_build_render_draw_tail` (signature changed from
+  `(buf, pos)` to `(buf, pos, vertex_count)` — the standalone
+  `native_pm4_build_render_clear_triangle` composer continues to pass
+  `GFX9_FULLSCREEN_TRI_VCOUNT` so its byte-exact PM4 stream stays
+  unchanged). Also reject `ic != 1` with `GPU_ERR_NOT_IMPLEMENTED`
+  (instance rendering is v3.x scope; needs additional VGT_NUM_INSTANCES
+  wiring). 7 new asserts: vc=6/36/0 produce distinct DRAW_INDEX_AUTO
+  dword[1] values + ic=0/2 reject paths.
+
+### Changed — 2026-05-01 (toolchain + scaffold)
+
+- **`src/backend_native.cyr` split into 4 files** (rc.2 punchlist
+  toolchain item). The 142 KiB / 3171-line monolith was over the
+  cyrius lint/fmt 128 KiB read-buffer cap, producing silent
+  truncation warnings and false-positive fmt drift on every CI
+  run. Split along section boundaries:
+  - `src/backend_native_amdgpu.cyr` (~32 KiB, 783 lines) — DRM/GEM/
+    AMDGPU/syncobj/CS-submit ioctl wrappers (foundational layer).
+  - `src/backend_native_shaders.cyr` (~28 KiB, 575 lines) — GFX9
+    ISA shader libraries + GFX9 graphics-register addresses + value
+    minimums.
+  - `src/backend_native_pm4.cyr` (~34 KiB, 731 lines) — PM4 packet
+    primitives + compute + render PM4 stream composers (pure byte
+    builders).
+  - `src/backend_native.cyr` (~52 KiB, 1158 lines) — Backend slot
+    fillers + dispatch drivers + texture/RT/pipeline + ctx accessors
+    + `backend_native_new()`. The integration layer.
+  Include order in `src/lib.cyr` (load-bearing for forward
+  references): `amdgpu → shaders → pm4 → backend_native →
+  backend_native_kms`.
+- **CI fmt-check now defends against future toolchain truncation.**
+  `.github/workflows/ci.yml` adds a line-count guard before the
+  diff: `cyrius fmt --check` output line count must equal the file's
+  line count, or fail with `FAIL fmt truncation: $f — file the
+  toolchain bug` instead of the old false-positive "needs fmt." The
+  previous `>128 KiB skip` block is gone (no file remains over the
+  cap); files growing past the cap now hard-fail with `FAIL: $f
+  exceeds cyrius fmt 128 KiB cap — split required` to prevent silent
+  regressions. (rc.2 punchlist toolchain item.)
+- **`samvada` bumped 0.2.0 → 0.2.2** (`[deps.samvada]` in
+  `cyrius.cyml`). Brings in upstream documentation + CI-quality-bar
+  alignment + `cyrius fmt` drift cleanup; no API changes.
+- **`GpuContext` size bumped 112 → 120** to accommodate the new
+  `+112: pm4_scratch` slot (MED-7 closeout). `GPU_CONTEXT_SIZE`
+  constant updated accordingly; the existing
+  `test_gpu_context_size_extended_to_112` test renamed to `_to_120`.
+  `+0..+24` dual interpretation, `+32` backend, `+40..+88` native
+  cache, `+96/+104` surface-stash all unchanged.
+- **`CLAUDE.md` architecture diagram updated** for the 38-module
+  layout + the new GpuContext field offset.
+
+### Added — 2026-05-01 (radv_capture Phase 2)
+
+- **`programs/native_pm4_dump.cyr` + extractor + `make compare`.**
+  rc.1 shipped Phase 1 of the radv_capture diagnostic harness
+  (proves a libvulkan dispatch runs + RADV emits a `--dump=ibs`
+  trace). Phase 2 adds the byte-diff reduction tooling the audit
+  punchlist gated on:
+  - `programs/native_pm4_dump.cyr` — runs
+    `native_pm4_build_compute_store_deadbeef` against fixed canonical
+    VAs and writes the dword stream to stdout. CI-safe — no GPU
+    access, no DRM fd, no BO allocation. Pair Makefile target:
+    `make dump-native-pm4`.
+  - `programs/diagnostics/radv_capture/extract_dispatch.sh` — awk
+    script that normalizes a PM4 dump (mabda format OR RADV
+    `--dump=ibs` format) into one-packet-per-line decoded output,
+    filtering down to the compute dispatch tail (SET_SH_REGs to
+    `COMPUTE_*` registers, ACQUIRE_MEM, DISPATCH_DIRECT). Format-
+    agnostic — same script handles both inputs.
+  - `make compare` in
+    `programs/diagnostics/radv_capture/Makefile` — runs both
+    extractors over the RADV + mabda dumps and shows the focused
+    diff.
+  - README rewrite documenting the workflow + the
+    "known-equivalents" table for diff lines that are not byte-clean
+    but represent semantically-equivalent shapes (e.g., RADV's
+    `EVENT_WRITE CACHE_FLUSH_AND_INV` vs mabda's
+    `WRITE_DATA(WR_CONFIRM=1)` post-dispatch CP marker).
+  This unblocks the radv-IB byte-exact verification gate that's
+  been "Layer-2 work pending Hyprland" since v3 Step 6.5 — the
+  capture itself still needs a HW box, but the comparison tooling
+  now exists.
+
+### Next
+
+- 6-consumer regression sweep against the rc.2 bundle (soorat / rasa /
+  ranga / bijli / aethersafta / kiran-via-soorat). Parallelizable to
+  a sub-agent. Any file regression filed at
+  `docs/issues/2026-MM-DD-<project>-rc2-regression.md`.
+- 3-day soak window on the dev box with the consumer programs running
+  continuously (no leak / stutter / OOM expected; if any surfaces,
+  rc.3 cuts before the official 3.0.0).
+- VERSION 3.0.0-rc.2 → 3.0.0 + tag once both above pass.
+
 ## [3.0.0-rc.1] — 2026-04-30
 
 **Release-candidate cut of the v3 native-backend work.** Dual backend
