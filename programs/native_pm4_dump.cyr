@@ -1,0 +1,101 @@
+# programs/native_pm4_dump.cyr — Phase 2 PM4 byte-diff helper
+#
+# Builds the PM4 stream that `_backend_native_compute_dispatch`
+# would produce for a 1×1×1 store_deadbeef dispatch and prints the
+# raw dword stream on stdout. No GPU access — purely a composer-
+# output dumper for offline byte-diff against a RADV `--dump=ibs`
+# reference dump.
+#
+# Output format (one line per dword):
+#   0xOOOO  0xDDDDDDDD
+# where OOOO is the byte offset (4-hex zero-padded) and DDDDDDDD
+# is the dword (8-hex zero-padded). The format is greppable for
+# the dispatch-tail extractor in
+# `programs/diagnostics/radv_capture/extract_dispatch.sh`.
+#
+# Usage:
+#   make build/native_pm4_dump   # builds the binary
+#   ./build/native_pm4_dump      # writes the dump to stdout
+#
+# This program runs in any environment (CI, headless box, no GPU)
+# because it never opens a DRM fd, never allocates a BO, never
+# issues an ioctl. The PM4 builder writes into a stack buffer and
+# we just print what came out.
+#
+# Anchor VAs: matched to programs/native_compute_store.cyr's live
+# layout so the printed bytes are byte-identical to what the live
+# slot fn would feed to the kernel.
+
+include "src/lib.cyr"
+
+# 4-digit hex offset (e.g., "0x0040 ") + space.
+fn print_offset_hex16(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[8];
+    store8(&buf + 0, 48);     # '0'
+    store8(&buf + 1, 120);    # 'x'
+    var i = 0;
+    while (i < 4) {
+        var nibble = (v / (1 << ((3 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    store8(&buf + 6, 32);     # ' '
+    store8(&buf + 7, 32);     # ' '
+    syscall(1, 1, &buf, 8);
+    return 0;
+}
+
+# 8-digit hex dword (e.g., "0xC0055802") — no trailing space.
+fn print_dword_hex32(v) {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);     # '0'
+    store8(&buf + 1, 120);    # 'x'
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn print_cstr(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn main() {
+    alloc_init();
+
+    # Anchor VAs — same layout as programs/native_compute_store.cyr.
+    var shader_va = 0xFFFF800100000000;
+    var stub_va   = 0xFFFF800100004000;
+    var out_va    = 0xFFFF800100400000;
+
+    # 1024 bytes is the worst-case render-stream size; the compute
+    # store_deadbeef stream is ~64 dwords (256 bytes) padded to a
+    # 64-dword cache-line boundary by the composer.
+    var pm4[1024];
+    memset(&pm4, 0, 1024);
+    var bytes = native_pm4_build_compute_store_deadbeef(&pm4,
+    shader_va, stub_va, out_va, 1, 1, 1);
+
+    # Header line — version + composer ID for downstream tooling.
+    print_cstr("# mabda native PM4 dump (compute_store_deadbeef, 1x1x1)\n");
+    print_cstr("# composer: native_pm4_build_compute_store_deadbeef\n");
+    print_cstr("# format: <byte-offset>  <dword>\n");
+
+    var i = 0;
+    while (i < bytes) {
+        var dw = load32(&pm4 + i);
+        print_offset_hex16(i);
+        print_dword_hex32(dw);
+        print_cstr("\n");
+        i = i + 4;
+    }
+
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

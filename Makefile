@@ -218,6 +218,19 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+# v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
+# that the live compute_store dispatch produces, but writes the
+# dword stream to stdout instead of submitting it. CI-safe (no GPU
+# access). Pair with programs/diagnostics/radv_capture/Makefile's
+# `compare` target to byte-diff against RADV's --dump=ibs output.
+build/native_pm4_dump: programs/native_pm4_dump.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_pm4_dump.cyr $@
+
+.PHONY: dump-native-pm4
+dump-native-pm4: build/native_pm4_dump
+	./build/native_pm4_dump
+
 build/native_texture_e2e: programs/native_texture_e2e.cyr src/*.cyr
 	@mkdir -p build
 	$(CYRIUS) build programs/native_texture_e2e.cyr $@
