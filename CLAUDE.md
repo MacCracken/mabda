@@ -41,12 +41,12 @@ doesn't change between paths.
 ## Current State (post Step 7.7, 2026-04-30)
 
 - **Source**: 35 domain modules under `src/*.cyr`, ~14,500 lines.
-- **Tests**: **1819 CPU-only assertions** across three files:
+- **Tests**: **1828 CPU-only assertions** across three files:
   - `tests/tcyr/mabda.tcyr` — 624 (v2.x backend-agnostic surface)
   - `tests/tcyr/mabda_v3.tcyr` — 858 (v3 backend abstraction +
     Phase B/C compute + render)
-  - `tests/tcyr/mabda_v3_phase_d.tcyr` — 337 (Phase D KMS
-    primitives + 7.7 surface API)
+  - `tests/tcyr/mabda_v3_phase_d.tcyr` — 346 (Phase D KMS
+    primitives + 7.7 surface API + audit MED-3 odd-dim asserts)
   Plus seven GPU integration programs (`phase0`, `compute_e2e`,
   `render_e2e`, `render_graph_e2e` for wgpu; `native_compute_store`,
   `native_texture_e2e`, `native_render_e2e` for native; plus
@@ -148,7 +148,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 1819 CPU assertions across 3 files
+make test                                            # 1828 CPU assertions across 3 files
 cyrius bench tests/bcyr/mabda.bcyr                   # 7 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -159,6 +159,13 @@ make test-native-kms-modeset                         # native modeset (HW + DRM 
 make test-native-present-e2e                         # 120-frame animated present (HW + master)
 make bench-gpu                                       # 13 GPU benchmarks (wgpu only today)
 ```
+
+**Before tripping toolchain wires**: read
+[`docs/development/2026-04-30-toolchain-issues.md`](docs/development/2026-04-30-toolchain-issues.md) —
+consolidated cheat-sheet of cyrius lint/fmt 128 KiB cap, fncall6
+ABI bug, `var X;` rejection, global init order, logical right shift,
+bump allocator exhaustion in tests. Cross-references the deeper
+`docs/development/issues/` filings + memory notes.
 
 ## Architecture (flat — matches yukti / vidya)
 
@@ -296,7 +303,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 1819 CPU assertions across three test
+- **Tests are the way** — 1828 CPU assertions across three test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -345,7 +352,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 1819+ assertions pass across all three test files,
+2. Test sweep: 1828+ assertions pass across all three test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -418,7 +425,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (`mabda.tcyr` + `mabda_v3.tcyr` + `mabda_v3_phase_d.tcyr`); 1819+
+   (`mabda.tcyr` + `mabda_v3.tcyr` + `mabda_v3_phase_d.tcyr`); 1828+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with

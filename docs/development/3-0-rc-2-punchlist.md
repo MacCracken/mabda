@@ -163,6 +163,40 @@ expected effort. None are HIGH severity (those landed in rc.1).
   generator + ensuring the test files still find every symbol.
 - **Then**: drop the `>128 KiB skip` block from `.github/workflows/ci.yml`.
 
+### Tighter CI fmt-check — line-count guard
+
+- **File**: `.github/workflows/ci.yml` (Format check step).
+- **Why**: rc.1's CI fmt-check failed on push because 11
+  `programs/` + `tests/tcyr/` files had drift the v3 cycle never
+  cleaned up. The current loop catches drift via diff but doesn't
+  defend against the toolchain-side truncation bug — if `cyrius
+  fmt` regresses and starts truncating a sub-128KiB file, the
+  diff would silently flag "needs fmt" without warning that the
+  diff itself is bogus. Add a line-count guard: before diffing,
+  require `wc -l` of `cyrius fmt --check` output equals `wc -l`
+  of the file. If not, FAIL with "fmt truncation detected on
+  $f — file the toolchain bug" rather than "needs fmt."
+- **Fix**: extend the existing loop:
+  ```sh
+  for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do
+    sz=$(wc -c < "$f")
+    if [ "$sz" -ge 131072 ]; then continue; fi
+    fmt_lines=$(cyrius fmt "$f" --check 2>/dev/null | wc -l)
+    file_lines=$(wc -l < "$f")
+    if [ "$fmt_lines" != "$file_lines" ]; then
+      echo "FAIL fmt truncation: $f (file=$file_lines, fmt=$fmt_lines)"
+      fail=1; continue
+    fi
+    if ! diff -q <(cyrius fmt "$f" --check 2>/dev/null) "$f" > /dev/null; then
+      echo "needs fmt: $f"
+      fail=1
+    fi
+  done
+  ```
+- **Test**: hard to unit-test (would need a deliberately-truncated
+  file in CI). Document via comment in the YAML.
+- **Effort**: ~30 minutes.
+
 ### Six-consumer regression sweep (Tier 2 ship work)
 
 - **Goal**: build soorat / rasa / ranga / bijli / aethersafta /
