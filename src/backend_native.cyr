@@ -1675,12 +1675,18 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
 
 # --- Block 4: draw_tail ---
 #
-# Single DRAW_INDEX_AUTO with the full-screen-triangle vertex count
-# and AUTO_INDEX source select. Hardware generates vertex_id 0/1/2
-# for the VS to consume from system VGPR v0.
-fn native_pm4_build_render_draw_tail(buf, pos) {
+# Single DRAW_INDEX_AUTO with caller-supplied `vertex_count` and
+# AUTO_INDEX source select. Hardware generates vertex_id 0/1/...
+# /(vertex_count - 1) for the VS to consume from system VGPR v0.
+# Audit LOW-4: vertex_count was hardcoded to GFX9_FULLSCREEN_TRI_VCOUNT
+# (= 3) in v3.0-rc.1; consumers couldn't draw anything but the
+# fullscreen triangle through this builder. The fullscreen-tri
+# composer (native_pm4_build_render_clear_triangle) still passes
+# GFX9_FULLSCREEN_TRI_VCOUNT explicitly to preserve its byte-for-
+# byte equivalence with the v3.0-rc.1 PM4 stream.
+fn native_pm4_build_render_draw_tail(buf, pos, vertex_count) {
     return native_pm4_draw_index_auto(buf, pos,
-                                      GFX9_FULLSCREEN_TRI_VCOUNT,
+                                      vertex_count,
                                       DI_SRC_SEL_AUTO_INDEX);
 }
 
@@ -1716,7 +1722,7 @@ fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(buf, pos);
+    pos = native_pm4_build_render_draw_tail(buf, pos, GFX9_FULLSCREEN_TRI_VCOUNT);
     # Flush CB/DB caches so the FB the kernel signals "complete" on
     # actually contains the rendered pixels — ACQUIRE_MEM at top of
     # the IB invalidates fetches but does NOT flush dirty CB writes.
@@ -2546,16 +2552,22 @@ fn _backend_native_render_pass_begin(ctx, rt, clear_color_ptr) {
     return p;
 }
 
-# Compose the full clear-triangle PM4 stream and dispatch on the GFX
-# ring. v2-native: single-draw-per-pass — vc/ic are accepted for ABI
-# parity but the FS+VS pair is fixed-shape (3-vertex fullscreen
-# triangle, single instance), so the PM4 stream's draw_tail uses
-# `GFX9_FULLSCREEN_TRI_VCOUNT`/`_NUM_INSTANCES_ONE` regardless. State
-# caching (skip pipeline_sh+ctx if same pipe) is a v3.x perf item.
+# Compose the full render PM4 stream and dispatch on the GFX ring.
+# v2-native: single-draw-per-pass. Audit LOW-4: `vc` (vertex count)
+# is now threaded through to the DRAW_INDEX_AUTO packet; v3.0-rc.1
+# silently ignored it and always emitted the fullscreen-triangle
+# count of 3. `ic` (instance count) is still ABI-only — we reject
+# anything but `ic == 1` because instance rendering needs additional
+# VGT_NUM_INSTANCES wiring that's v3.x scope. State caching (skip
+# pipeline_sh+ctx if same pipe) is a v3.x perf item.
 fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (pipe == 0) { return GPU_ERR_OTHER; }
+    # Audit LOW-4: reject zero/negative vertex counts and
+    # non-singleton instance counts before spending an alloc.
+    if (vc <= 0)   { return GPU_ERR_OTHER; }
+    if (ic != 1)   { return GPU_ERR_NOT_IMPLEMENTED; }
     var rt = load64(pass + NATIVE_PASS_FIELD_RT);
     if (rt == 0) { return GPU_ERR_OTHER; }
     var rt_va     = load64(rt + NATIVE_RT_FIELD_VA);
@@ -2592,7 +2604,7 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
                                               rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(pm4, pos);
+    pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
     # Post-draw cache flush — same rationale as the standalone
     # composer above. CB writes need to land in memory before the
     # syncobj signals so the consumer reads / page-flips see the

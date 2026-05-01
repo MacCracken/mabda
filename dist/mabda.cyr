@@ -4752,12 +4752,18 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
 
 # --- Block 4: draw_tail ---
 #
-# Single DRAW_INDEX_AUTO with the full-screen-triangle vertex count
-# and AUTO_INDEX source select. Hardware generates vertex_id 0/1/2
-# for the VS to consume from system VGPR v0.
-fn native_pm4_build_render_draw_tail(buf, pos) {
+# Single DRAW_INDEX_AUTO with caller-supplied `vertex_count` and
+# AUTO_INDEX source select. Hardware generates vertex_id 0/1/...
+# /(vertex_count - 1) for the VS to consume from system VGPR v0.
+# Audit LOW-4: vertex_count was hardcoded to GFX9_FULLSCREEN_TRI_VCOUNT
+# (= 3) in v3.0-rc.1; consumers couldn't draw anything but the
+# fullscreen triangle through this builder. The fullscreen-tri
+# composer (native_pm4_build_render_clear_triangle) still passes
+# GFX9_FULLSCREEN_TRI_VCOUNT explicitly to preserve its byte-for-
+# byte equivalence with the v3.0-rc.1 PM4 stream.
+fn native_pm4_build_render_draw_tail(buf, pos, vertex_count) {
     return native_pm4_draw_index_auto(buf, pos,
-                                      GFX9_FULLSCREEN_TRI_VCOUNT,
+                                      vertex_count,
                                       DI_SRC_SEL_AUTO_INDEX);
 }
 
@@ -4793,7 +4799,7 @@ fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(buf, pos);
+    pos = native_pm4_build_render_draw_tail(buf, pos, GFX9_FULLSCREEN_TRI_VCOUNT);
     # Flush CB/DB caches so the FB the kernel signals "complete" on
     # actually contains the rendered pixels — ACQUIRE_MEM at top of
     # the IB invalidates fetches but does NOT flush dirty CB writes.
@@ -5623,16 +5629,22 @@ fn _backend_native_render_pass_begin(ctx, rt, clear_color_ptr) {
     return p;
 }
 
-# Compose the full clear-triangle PM4 stream and dispatch on the GFX
-# ring. v2-native: single-draw-per-pass — vc/ic are accepted for ABI
-# parity but the FS+VS pair is fixed-shape (3-vertex fullscreen
-# triangle, single instance), so the PM4 stream's draw_tail uses
-# `GFX9_FULLSCREEN_TRI_VCOUNT`/`_NUM_INSTANCES_ONE` regardless. State
-# caching (skip pipeline_sh+ctx if same pipe) is a v3.x perf item.
+# Compose the full render PM4 stream and dispatch on the GFX ring.
+# v2-native: single-draw-per-pass. Audit LOW-4: `vc` (vertex count)
+# is now threaded through to the DRAW_INDEX_AUTO packet; v3.0-rc.1
+# silently ignored it and always emitted the fullscreen-triangle
+# count of 3. `ic` (instance count) is still ABI-only — we reject
+# anything but `ic == 1` because instance rendering needs additional
+# VGT_NUM_INSTANCES wiring that's v3.x scope. State caching (skip
+# pipeline_sh+ctx if same pipe) is a v3.x perf item.
 fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (pipe == 0) { return GPU_ERR_OTHER; }
+    # Audit LOW-4: reject zero/negative vertex counts and
+    # non-singleton instance counts before spending an alloc.
+    if (vc <= 0)   { return GPU_ERR_OTHER; }
+    if (ic != 1)   { return GPU_ERR_NOT_IMPLEMENTED; }
     var rt = load64(pass + NATIVE_PASS_FIELD_RT);
     if (rt == 0) { return GPU_ERR_OTHER; }
     var rt_va     = load64(rt + NATIVE_RT_FIELD_VA);
@@ -5669,7 +5681,7 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
                                               rt_width, rt_height);
-    pos = native_pm4_build_render_draw_tail(pm4, pos);
+    pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
     # Post-draw cache flush — same rationale as the standalone
     # composer above. CB writes need to land in memory before the
     # syncobj signals so the consumer reads / page-flips see the
@@ -7457,16 +7469,22 @@ fn native_kms_modeset_first_connected(card_fd, render_fd, state, out) {
     var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
     var width  = native_kms_mode_hdisplay(modes, mode_idx);
     var height = native_kms_mode_vdisplay(modes, mode_idx);
-    if (width <= 0)  { return -7; }
-    if (height <= 0) { return -7; }
 
     # ---- Step D: allocate render-fd BO sized to mode ----
     # Pitch rounded up to 256-byte alignment (AMD scanout requires it
     # on most Vega-era hardware; pre-Vega is more permissive but the
-    # alignment never hurts).
-    var pitch_raw = width * 4;
-    var pitch = ((pitch_raw + 255) / 256) * 256;
-    var bo_size = pitch * height;
+    # alignment never hurts). Audit MED-2: cap dims + guard the
+    # pitch/bo_size arithmetic via the shared validator. EDID-fed
+    # modes from sane monitors land well inside the 16384/2 GiB caps,
+    # but a malicious or corrupted EDID could push us into overflow
+    # territory — so validate here, before we allocate.
+    var pitch_buf[8];
+    var bo_size_buf[8];
+    if (_kms_validate_fb_dims(width, height, &pitch_buf, &bo_size_buf) != 0) {
+        return -7;
+    }
+    var pitch   = load64(&pitch_buf);
+    var bo_size = load64(&bo_size_buf);
     var bo_buf[16];
     var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);
     if (rc_bo != 0) { return -8; }
@@ -7712,6 +7730,51 @@ var NATIVE_KMS_FB_MAPPED_ADDR  = 16;
 var NATIVE_KMS_FB_BO_SIZE      = 24;
 var NATIVE_KMS_FB_WIDTH        = 28;
 
+# Audit MED-2 — caller-supplied dimension bounds.
+#
+# Every consumer-facing path that ends up calling AddFB2 (native
+# scanout) flows width/height in from outside (modeset picks them
+# from EDID, alloc_fb takes them as args). Without bounds, a
+# pathological mode or a mistaken caller could push (width × 4)
+# into i32-overflow territory or push the backing BO size past the
+# kernel's u32 caps on pitches[0] / total FB bytes. The kernel
+# would reject the ioctl, but only AFTER we'd done a multi-MiB BO
+# allocation we then have to release.
+#
+# Caps:
+#   - 16384 per dim — WebGPU's MAX_TEXTURE_DIMENSION_2D, which is
+#     also the practical scanout limit on the AMD HW we target
+#     (Vega/RDNA1 max single-pipe).
+#   - 0x80000000 (2 GiB) per BO — strictly under both 2^31 (signed
+#     i32 wrap point that could trip up future arithmetic) and the
+#     kernel's u32 cap on pitches[0] / total FB bytes.
+#
+# 16384 × 16384 XRGB8888 with 256-aligned pitch = 1 GiB exactly,
+# so the 2 GiB BO cap is never reachable from valid (w, h) pairs;
+# it's defense-in-depth in case the per-dim caps relax later.
+var MABDA_KMS_MAX_FB_DIM       = 16384;
+var MABDA_KMS_MAX_FB_BYTES     = 0x80000000;
+var MABDA_KMS_PITCH_ALIGN_MASK = 255;
+
+# Validate (width, height) and compute the 256-byte-aligned pitch
+# + bo_size. Writes pitch and bo_size into the i64-sized out-params
+# on success. Returns 0 on success, -1 on rejection.
+fn _kms_validate_fb_dims(width, height, pitch_out, bo_size_out) {
+    if (pitch_out == 0)            { return -1; }
+    if (bo_size_out == 0)          { return -1; }
+    if (width <= 0)                { return -1; }
+    if (height <= 0)               { return -1; }
+    if (width > MABDA_KMS_MAX_FB_DIM)  { return -1; }
+    if (height > MABDA_KMS_MAX_FB_DIM) { return -1; }
+    var pitch_raw = width * 4;
+    var pitch = ((pitch_raw + MABDA_KMS_PITCH_ALIGN_MASK) / 256) * 256;
+    var bo_size = pitch * height;
+    if (bo_size > MABDA_KMS_MAX_FB_BYTES) { return -1; }
+    store64(pitch_out, pitch);
+    store64(bo_size_out, bo_size);
+    return 0;
+}
+
 # Allocate a render-fd BO sized for `(width × height)` XRGB8888,
 # PRIME-import to the master fd, AddFB2 it, and populate `out`.
 # Pitch is rounded up to 256-byte alignment (AMD scanout requires;
@@ -7721,14 +7784,17 @@ var NATIVE_KMS_FB_WIDTH        = 28;
 fn native_kms_alloc_fb(card_fd, render_fd, width, height, out) {
     if (card_fd <= 0)   { return -1; }
     if (render_fd <= 0) { return -1; }
-    if (width <= 0)     { return -1; }
-    if (height <= 0)    { return -1; }
     if (out == 0)       { return -1; }
     memset(out, 0, NATIVE_KMS_FB_SIZE);
 
-    var pitch_raw = width * 4;
-    var pitch = ((pitch_raw + 255) / 256) * 256;
-    var bo_size = pitch * height;
+    # Audit MED-2: cap caller-supplied dimensions + guard arithmetic.
+    var pitch_buf[8];
+    var bo_size_buf[8];
+    if (_kms_validate_fb_dims(width, height, &pitch_buf, &bo_size_buf) != 0) {
+        return -1;
+    }
+    var pitch   = load64(&pitch_buf);
+    var bo_size = load64(&bo_size_buf);
 
     var bo_buf[16];
     var rc_bo = native_bo_create_gtt(render_fd, bo_size, &bo_buf);

@@ -736,6 +736,51 @@ fn test_gpu_err_not_implemented_constant_and_name() {
     return 0;
 }
 
+# Audit MED-2: caller-supplied dimension overflow guards. Validate
+# the shared math helper at the boundaries: max-dims pass; just-
+# over-cap rejects; non-positive rejects; null out-ptrs reject.
+fn test_kms_validate_fb_dims_caps() {
+    var pitch[8];
+    var bo[8];
+    # 1080p — pitch is already 256-aligned (1920 * 4 = 7680), bo
+    # = 7680 * 1080 = 8294400.
+    assert_eq(_kms_validate_fb_dims(1920, 1080, &pitch, &bo), 0, "1080p ok");
+    assert_eq(load64(&pitch), 7680,    "1080p pitch");
+    assert_eq(load64(&bo),    8294400, "1080p bo_size");
+    # Width 1921: pitch_raw = 7684, aligned to 7936.
+    assert_eq(_kms_validate_fb_dims(1921, 1080, &pitch, &bo), 0, "1921 ok");
+    assert_eq(load64(&pitch), 7936, "1921 pitch aligned");
+    # Cap reached — 16384x16384 must validate, 1 GiB bo_size.
+    assert_eq(_kms_validate_fb_dims(MABDA_KMS_MAX_FB_DIM,
+    MABDA_KMS_MAX_FB_DIM,
+    &pitch, &bo), 0,           "16384^2 ok");
+    assert_eq(load64(&bo),    1073741824,                       "16384^2 = 1 GiB");
+    # Just-over-cap rejected — neither dim allowed past 16384.
+    assert_eq(_kms_validate_fb_dims(16385, 16384, &pitch, &bo), -1, "w 16385 reject");
+    assert_eq(_kms_validate_fb_dims(16384, 16385, &pitch, &bo), -1, "h 16385 reject");
+    # Non-positive rejected.
+    assert_eq(_kms_validate_fb_dims(0,    1080,  &pitch, &bo), -1, "w=0 reject");
+    assert_eq(_kms_validate_fb_dims(0-1,  1080,  &pitch, &bo), -1, "w=-1 reject");
+    assert_eq(_kms_validate_fb_dims(1920, 0,     &pitch, &bo), -1, "h=0 reject");
+    # Out-pointer null guards.
+    assert_eq(_kms_validate_fb_dims(1920, 1080, 0,      &bo),  -1, "pitch_out=0 reject");
+    assert_eq(_kms_validate_fb_dims(1920, 1080, &pitch, 0),    -1, "bo_out=0 reject");
+    return 0;
+}
+
+# Audit MED-2: native_kms_alloc_fb forwards the same validation,
+# rejecting at the public boundary BEFORE any BO alloc / ioctl.
+# Sentinel fds (7) are never reached — rejection is in the
+# validator, observable as -1 return.
+fn test_native_kms_alloc_fb_rejects_oversized_dims() {
+    var fb[32];
+    assert_eq(native_kms_alloc_fb(7, 7, 16385, 1080,  &fb), -1, "w 16385 reject");
+    assert_eq(native_kms_alloc_fb(7, 7, 1920,  65537, &fb), -1, "h 65537 reject");
+    assert_eq(native_kms_alloc_fb(7, 7, 0-1,   1080,  &fb), -1, "w=-1 reject");
+    assert_eq(native_kms_alloc_fb(7, 7, 1920,  0,     &fb), -1, "h=0 reject");
+    return 0;
+}
+
 fn main() {
     # v3 Step 7.1(a) — DRM/KMS GetResources foundation (5)
     test_drm_mode_ioctl_numbers();
@@ -827,6 +872,10 @@ fn main() {
     test_kms_summary_print_u32_buf_holds_max_i64();
     test_native_buffer_stubs_return_not_implemented();
     test_gpu_err_not_implemented_constant_and_name();
+
+    # v3 audit 2026-04-30 → rc.2 fixes (MED-2)
+    test_kms_validate_fb_dims_caps();
+    test_native_kms_alloc_fb_rejects_oversized_dims();
 
     return assert_summary();
 }
