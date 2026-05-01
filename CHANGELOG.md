@@ -18,10 +18,34 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
-## [3.0.0-dev]
+## [3.0.0-rc.1] — 2026-04-30
 
-Pre-release dev-track entries for the v3 native-backend work. No
-release date; individual items are dated inline when they land.
+**Release-candidate cut of the v3 native-backend work.** Dual backend
+(wgpu + native AMD) ships against the same public API surface; the
+`Backend` 25-slot fnptr table routes `gpu_buffer_*` /
+`gpu_compute_dispatch` / `gpu_texture_*` / `gpu_render_*` /
+`gpu_surface_*` to the appropriate impl. Native path is direct
+AMDGPU DRM ioctls (no libdrm), with `samvada` as the sister AGNOS
+package providing logind master delegation via libsystemd C-shim.
+
+The 5 ship-blockers from the
+[2026-04-30 audit](docs/audit/2026-04-30-audit.md) are fixed in
+tree (HIGH-1, HIGH-2, MED-1, MED-3, MED-6 + LOW-6 bundled). Audit
+disposition: 10 deferred items file as the rc.2 punchlist
+(`docs/development/3-0-rc-2-punchlist.md`) — official `3.0.0` ships
+once those land clean.
+
+**Metrics**: 35 src/ modules / ~14,500 LoC / 1828 CPU asserts across
+3 test files (was 1819 pre-audit; +9 from MED-3 odd-dim rejection
+asserts) / `dist/mabda.cyr` ~11,500 lines / 7 GPU integration
+programs (`phase0`, `compute_e2e`, `render_e2e`, `render_graph_e2e`
+on wgpu; `native_compute_store`, `native_texture_e2e`,
+`native_render_e2e` on native; plus `native_kms_summary`,
+`native_kms_modeset_smoke`, `native_present_e2e` for Phase D).
+
+The remaining v3.0.0-dev entries below are dev-track items that
+shipped over the v3 cycle; they remain dated and per-step for
+historical traceability.
 
 ### Added — 2026-04-30 (Session 26 — Steps 6.2 + 6.5 native render PM4 composer)
 

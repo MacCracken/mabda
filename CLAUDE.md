@@ -11,10 +11,11 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 5.7.48+ (`cyrius.cyml: cyrius = "5.7.48"`)
-- **Version**: 2.5.0 in tree — v3.0 ship is the active focus. v3.0
-  ships dual backend (wgpu + native AMD); native is `Backend`-slot-
-  abstracted alongside wgpu, AMD only in v3.0; NVIDIA/Intel native
-  scoped to v4.0/v5.0.
+- **Version**: 3.0.0-rc.1 in tree — official 3.0.0 ships once the
+  rc.2 punchlist (`docs/development/3-0-rc-2-punchlist.md`) closes
+  out the deferred audit items. v3.0 ships dual backend (wgpu +
+  native AMD); native is `Backend`-slot-abstracted alongside wgpu,
+  AMD only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
 - **GPU FFI**: dual-path
   - **wgpu** — wgpu-native v29 C API via `deps/wgpu_main.c` launcher
     (65-slot fn table, 7 struct-packing shims)
