@@ -40,7 +40,10 @@ doesn't change between paths.
 
 ## Current State (post Step 7.7, 2026-04-30)
 
-- **Source**: 35 domain modules under `src/*.cyr`, ~14,500 lines.
+- **Source**: 38 domain modules under `src/*.cyr`, ~14,500 lines (the
+  former 137-KiB `backend_native.cyr` was split into four files at
+  rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
+  to land under cyrius lint/fmt's 128 KiB cap).
 - **Tests**: **1828 CPU-only assertions** across three files:
   - `tests/tcyr/mabda.tcyr` — 624 (v2.x backend-agnostic surface)
   - `tests/tcyr/mabda_v3.tcyr` — 858 (v3 backend abstraction +
@@ -171,7 +174,7 @@ bump allocator exhaustion in tests. Cross-references the deeper
 
 ```
 mabda/
-├── src/                 35 GPU library modules — flat, zero transitive includes
+├── src/                 38 GPU library modules — flat, zero transitive includes
 │   ├── lib.cyr                      — single include chain (stdlib + domain modules + samvada)
 │   ├── error.cyr                    — GpuErr codes + Result helpers
 │   ├── color.cyr                    — f64-backed RGBA colour type
@@ -184,10 +187,18 @@ mabda/
 │   ├── backend.cyr                  — @internal: Backend struct (208 B, 25 slots)
 │   │                                  + BACKEND_KIND_* + null-slot helpers
 │   ├── backend_wgpu.cyr             — @internal: wgpu fillers for all 25 slots
-│   ├── context.cyr                  — GpuContext (112 B; dual-interpretation
-│   │                                  +0..+24 + backend ptr + native cache + surface stash)
-│   ├── backend_native.cyr           — @internal: native AMD fillers (compute/render slots)
-│   │                                  + PM4 builders + DRM/AMDGPU ioctls + native_kms_*
+│   ├── context.cyr                  — GpuContext (120 B; dual-interpretation
+│   │                                  +0..+24 + backend ptr + native cache + surface stash
+│   │                                  + PM4 scratch slot)
+│   ├── backend_native_amdgpu.cyr    — @internal: DRM/AMDGPU/GEM/syncobj/CS-submit
+│   │                                  ioctl wrappers (foundational layer, no PM4 deps)
+│   ├── backend_native_shaders.cyr   — @internal: GFX9 ISA shader builders + GFX9
+│   │                                  graphics register addresses + value minimums
+│   ├── backend_native_pm4.cyr       — @internal: PM4 packet primitives + compute +
+│   │                                  render PM4 stream composers (pure byte builders)
+│   ├── backend_native.cyr           — @internal: native AMD slot fillers + dispatch
+│   │                                  drivers + native_texture/_rt/_render_pipeline +
+│   │                                  ctx accessors + backend_native_new()
 │   ├── backend_native_kms.cyr       — @internal: KMS surface ioctls (modeset/page-flip/PRIME)
 │   ├── buffer.cyr                   — public gpu_buffer_* dispatch through ctx->backend
 │   ├── typed_buffer.cyr             — uniform/storage buffer metadata

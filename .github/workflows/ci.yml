@@ -56,18 +56,32 @@ jobs:
 
       - name: Format check
         run: |
-          # cyrius fmt has a 128 KiB read-buffer cap (same class as
-          # cyrlint's bug); files larger than that get silently
-          # truncated, producing false-positive drift. Skip files
-          # over 128 KiB until the toolchain bumps the cap. Today
-          # this affects `src/backend_native.cyr` only (~137 KiB);
-          # splitting it into smaller modules to unblock the gate
-          # is a v3.x bite, tracked in the rc.2 punchlist.
+          # cyrius fmt has a 128 KiB read-buffer cap; files larger
+          # than that get silently truncated, producing a false
+          # "needs fmt" diff that hides the real toolchain bug. The
+          # rc.2 file split brought every checked file under the
+          # cap (largest now is backend_native_kms.cyr at ~77 KiB),
+          # so the bare-skip block is gone.
+          #
+          # Defense-in-depth: a line-count guard catches future
+          # regressions. If `cyrius fmt --check` truncates, its line
+          # count won't match the file's, and we FAIL with a
+          # diagnostic that points at the toolchain rather than
+          # falsely demanding a re-format. (audit rc.2 toolchain
+          # item — line-count guard.)
           fail=0
           for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do
             sz=$(wc -c < "$f")
             if [ "$sz" -ge 131072 ]; then
-              echo "skip fmt (>128 KiB toolchain cap): $f ($sz bytes)"
+              echo "FAIL: $f exceeds cyrius fmt 128 KiB cap ($sz bytes) — split required"
+              fail=1
+              continue
+            fi
+            fmt_lines=$(cyrius fmt "$f" --check 2>/dev/null | wc -l)
+            file_lines=$(wc -l < "$f")
+            if [ "$fmt_lines" != "$file_lines" ]; then
+              echo "FAIL fmt truncation: $f (file=$file_lines lines, fmt=$fmt_lines lines) — file the toolchain bug"
+              fail=1
               continue
             fi
             if ! diff -q <(cyrius fmt "$f" --check 2>/dev/null) "$f" > /dev/null; then
