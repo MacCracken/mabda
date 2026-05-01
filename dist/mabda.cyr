@@ -2826,9 +2826,10 @@ fn backend_wgpu_new() {
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (112 bytes — grew 48 → 96 at v3 Step
-# 4f.iv, then 96 → 112 at v3 Step 7.7 for the surface API
-# consumer-stash slots):
+# GpuContext struct layout (120 bytes — grew 48 → 96 at v3 Step
+# 4f.iv, 96 → 112 at v3 Step 7.7 for the surface API consumer-
+# stash slots, 112 → 120 at v3 rc.2 audit MED-7 to cache the per-
+# dispatch PM4 scratch buffer):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
@@ -2847,6 +2848,21 @@ fn backend_wgpu_new() {
 #   +104: native_card_fd (8)    — native: DRM master card fd; set by
 #                                  gpu_surface_configure_native_kiosk.
 #                                  Zero on wgpu.
+#   +112: pm4_scratch (8)       — native: 1024-byte PM4 build buffer,
+#                                  allocated once at gpu_context_new_native,
+#                                  reused (memset on each entry) by
+#                                  _backend_native_compute_dispatch and
+#                                  _backend_native_render_pass_draw. Audit
+#                                  MED-7: replaces per-dispatch alloc(256)
+#                                  / alloc(1024) which leaked through the
+#                                  bump allocator. Zero on wgpu (the wgpu
+#                                  slots never read it). Lifetime contract:
+#                                  shared across compute + render slots,
+#                                  reset on each dispatch entry, NEVER
+#                                  reclaimed — Cyrius single-threaded
+#                                  execution model means a slot fn is the
+#                                  sole writer for the duration of its
+#                                  call.
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
@@ -2860,7 +2876,8 @@ fn backend_wgpu_new() {
 # carry them directly (see docs/proposals/v3-surface-api-design.md
 # § "Why 'stash on ctx' rather than passing through every slot").
 
-var GPU_CONTEXT_SIZE = 112;
+var GPU_CONTEXT_SIZE = 120;
+var _NATIVE_PM4_SCRATCH_BYTES = 1024;
 
 fn gpu_ctx_instance(ctx) { return load64(ctx); }
 fn gpu_ctx_adapter(ctx)  { return load64(ctx + 8); }
@@ -3031,20 +3048,30 @@ fn gpu_context_new_native() {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
+    # Audit MED-7: per-context cached PM4 scratch buffer. 1024 bytes
+    # is the worst-case render-stream size (`_backend_native_render_pass_draw`
+    # builds up to a 256-dword pad target = 1024 B); compute dispatch
+    # uses the first 256 bytes. Allocated once here, reused on every
+    # dispatch — replaces the per-dispatch alloc(256)/alloc(1024)
+    # that previously leaked through the bump allocator.
+    var pm4_scratch = alloc(_NATIVE_PM4_SCRATCH_BYTES);
+    memset(pm4_scratch, 0, _NATIVE_PM4_SCRATCH_BYTES);
+
     var ctx = alloc(GPU_CONTEXT_SIZE);
     memset(ctx, 0, GPU_CONTEXT_SIZE);
-    store64(ctx +  0, fd);
-    store64(ctx +  8, ctx_id);
-    store64(ctx + 16, stub_handle);
-    store64(ctx + 24, _NATIVE_STUB_VA);
-    store64(ctx + 32, backend_native_new());
-    store64(ctx + 40, stub_map);
-    store64(ctx + 48, ib_handle);
-    store64(ctx + 56, _NATIVE_IB_VA);
-    store64(ctx + 64, ib_map);
-    store64(ctx + 72, fence_handle);
-    store64(ctx + 80, _NATIVE_FENCE_VA);
-    store64(ctx + 88, fence_map);
+    store64(ctx +   0, fd);
+    store64(ctx +   8, ctx_id);
+    store64(ctx +  16, stub_handle);
+    store64(ctx +  24, _NATIVE_STUB_VA);
+    store64(ctx +  32, backend_native_new());
+    store64(ctx +  40, stub_map);
+    store64(ctx +  48, ib_handle);
+    store64(ctx +  56, _NATIVE_IB_VA);
+    store64(ctx +  64, ib_map);
+    store64(ctx +  72, fence_handle);
+    store64(ctx +  80, _NATIVE_FENCE_VA);
+    store64(ctx +  88, fence_map);
+    store64(ctx + 112, pm4_scratch);
     _sk_info_cstr("mabda: gpu context created (native)");
     return gpu_ok(ctx);
 }
@@ -5183,10 +5210,13 @@ fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
     store64(&bo_list_in + 16, &entries);
 
     # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
-    var syncobj_handle_ptr = alloc(8);
-    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    # Audit LOW-5: out-ptr lives on the stack so we don't bump-leak
+    # 8 bytes per dispatch. native_syncobj_create writes the handle
+    # into the buffer; we load it back and pass to wait/destroy.
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
-    var syncobj_handle = load64(syncobj_handle_ptr);
+    var syncobj_handle = load64(&syncobj_buf);
 
     # 4-chunk Mesa-shape submit.
     rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
@@ -5300,10 +5330,12 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
     store64(&bo_list_in + 16, &entries);
 
     # Per-dispatch syncobj (cheap; one ioctl create + one destroy).
-    var syncobj_handle_ptr = alloc(8);
-    var rc = native_syncobj_create(fd, syncobj_handle_ptr);
+    # Audit LOW-5: stack-local out-ptr — same rationale as the
+    # compute dispatcher above.
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
-    var syncobj_handle = load64(syncobj_handle_ptr);
+    var syncobj_handle = load64(&syncobj_buf);
 
     # 4-chunk Mesa-shape submit on the GFX ring. ib_flags=0 (no
     # TC_WB_NOT_INVALIDATE — graphics' ACQUIRE_MEM in the PM4 stream
@@ -5352,17 +5384,20 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
 #   compute_dispatch slot — until a public gpu_buffer_native_new()
 #   helper lands, callers pack the pair manually.
 
-fn native_ctx_fd(ctx)             { return load64(ctx +  0); }
-fn native_ctx_id(ctx)              { return load64(ctx +  8); }
-fn native_ctx_stub_handle(ctx)     { return load64(ctx + 16); }
-fn native_ctx_stub_va(ctx)         { return load64(ctx + 24); }
-fn native_ctx_stub_addr(ctx)       { return load64(ctx + 40); }
-fn native_ctx_ib_handle(ctx)       { return load64(ctx + 48); }
-fn native_ctx_ib_va(ctx)           { return load64(ctx + 56); }
-fn native_ctx_ib_addr(ctx)         { return load64(ctx + 64); }
-fn native_ctx_fence_handle(ctx)    { return load64(ctx + 72); }
-fn native_ctx_fence_va(ctx)        { return load64(ctx + 80); }
-fn native_ctx_fence_addr(ctx)      { return load64(ctx + 88); }
+fn native_ctx_fd(ctx)             { return load64(ctx +   0); }
+fn native_ctx_id(ctx)              { return load64(ctx +   8); }
+fn native_ctx_stub_handle(ctx)     { return load64(ctx +  16); }
+fn native_ctx_stub_va(ctx)         { return load64(ctx +  24); }
+fn native_ctx_stub_addr(ctx)       { return load64(ctx +  40); }
+fn native_ctx_ib_handle(ctx)       { return load64(ctx +  48); }
+fn native_ctx_ib_va(ctx)           { return load64(ctx +  56); }
+fn native_ctx_ib_addr(ctx)         { return load64(ctx +  64); }
+fn native_ctx_fence_handle(ctx)    { return load64(ctx +  72); }
+fn native_ctx_fence_va(ctx)        { return load64(ctx +  80); }
+fn native_ctx_fence_addr(ctx)      { return load64(ctx +  88); }
+# Audit MED-7: per-context PM4 build scratch (1024 bytes), allocated
+# once at gpu_context_new_native, shared between compute + render slots.
+fn native_ctx_pm4_scratch(ctx)     { return load64(ctx + 112); }
 
 # Pack (handle, va) into the private 16-byte buffer-pair shape.
 # Caller allocates 16 bytes for `dst` (typically a stack-local
@@ -5463,6 +5498,12 @@ fn _backend_native_shader_module_release(ctx, shmod) {
 
 # Compute dispatch — the load-bearing slot. Step 4c lands this
 # end-to-end. shmod and bp are pointers to (handle, va) pairs.
+# Audit MED-7: PM4 build buffer comes from the cached per-context
+# scratch (`native_ctx_pm4_scratch`) instead of a per-dispatch
+# alloc(256). Lifetime contract: the scratch is shared with the
+# render slot; Cyrius is single-threaded so no slot can re-enter
+# while another holds it. Always memset the bytes we'll write before
+# building.
 fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     if (ctx == 0)   { return GPU_ERR_OTHER; }
     if (shmod == 0) { return GPU_ERR_OTHER; }
@@ -5474,7 +5515,8 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp) {
     var out_handle = load64(bp + 0);
     var out_va     = load64(bp + 8);
 
-    var pm4 = alloc(256);
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
                             shader_va, stub_va, out_va, x, y, z);
@@ -5661,9 +5703,13 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic) {
     if (vs_handle == 0) { return GPU_ERR_OTHER; }
     if (fs_handle == 0) { return GPU_ERR_OTHER; }
 
-    # Build the IB stream into a 1024-byte scratch (matches the
-    # 256-dword padded shape of native_pm4_build_render_clear_triangle).
-    var pm4 = alloc(1024);
+    # Build the IB stream into the per-context cached PM4 scratch
+    # (audit MED-7) — replaces a per-draw alloc(1024) that bumped
+    # the allocator forward on every frame. The 1024-byte scratch
+    # is also the worst-case render stream size, matching the
+    # 256-dword padded shape of native_pm4_build_render_clear_triangle.
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 1024);
     var pos = 0;
     pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);

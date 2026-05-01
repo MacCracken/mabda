@@ -854,7 +854,7 @@ fn main() {
     test_native_kms_present_null_safe();
 
     # v3 Step 7.7 — public surface API (8)
-    test_gpu_context_size_extended_to_112();
+    test_gpu_context_size_extended_to_120();
     test_gpu_ctx_wgpu_surface_handle_round_trip();
     test_gpu_ctx_native_card_fd_round_trip();
     test_native_surface_struct_field_offsets();
@@ -877,16 +877,47 @@ fn main() {
     test_kms_validate_fb_dims_caps();
     test_native_kms_alloc_fb_rejects_oversized_dims();
 
+    # v3 audit 2026-04-30 → rc.2 fixes (MED-7)
+    test_native_ctx_pm4_scratch_is_stable();
+
     return assert_summary();
 }
 
 # v3 Step 7.7 — public surface API
 
-fn test_gpu_context_size_extended_to_112() {
-    # The GpuContext layout extension is what makes the surface
-    # consumer-stash work. Pin the size + the new field offsets
-    # so a future refactor can't silently shrink the struct.
-    assert_eq(GPU_CONTEXT_SIZE, 112, "extended ctx = 112");
+fn test_gpu_context_size_extended_to_120() {
+    # The GpuContext layout: 112 → 120 at v3 rc.2 audit MED-7 to
+    # cache the per-dispatch PM4 scratch buffer alongside the IB +
+    # fence + surface-stash slots. Pin the size + the new field
+    # offset so a future refactor can't silently shrink the struct.
+    assert_eq(GPU_CONTEXT_SIZE, 120, "extended ctx = 120");
+    # PM4 scratch buffer size kept in sync — the slot fns memset 256
+    # (compute) or 1024 (render) of this buffer; bumping above 1024
+    # requires updating both slots.
+    assert_eq(_NATIVE_PM4_SCRATCH_BYTES, 1024, "scratch = 1024 bytes");
+    return 0;
+}
+
+# Audit MED-7: stability contract — once `gpu_context_new_native`
+# stashes the PM4 scratch ptr at +112, every dispatch reads the same
+# value through `native_ctx_pm4_scratch`. The accessor never re-allocs
+# under us; if it does, this assertion catches the regression.
+fn test_native_ctx_pm4_scratch_is_stable() {
+    var ctx[120];
+    memset(&ctx, 0, 120);
+    # Sentinel ptr stashed once; two consecutive accessor calls
+    # return the same address (no per-call alloc).
+    store64(&ctx + 112, 0xCAFEBABE);
+    var p1 = native_ctx_pm4_scratch(&ctx);
+    var p2 = native_ctx_pm4_scratch(&ctx);
+    assert_eq(p1, 0xCAFEBABE, "scratch read");
+    assert_eq(p2, 0xCAFEBABE, "scratch stable across calls");
+    assert_eq(p1, p2, "two reads identical");
+    # wgpu-side ctx leaves +112 as 0 — accessor returns 0, slot
+    # short-circuits with GPU_ERR_OTHER (already covered by the
+    # dispatch fns' explicit `if (pm4 == 0)` guards).
+    memset(&ctx, 0, 120);
+    assert_eq(native_ctx_pm4_scratch(&ctx), 0, "wgpu/zero ctx → 0");
     return 0;
 }
 
