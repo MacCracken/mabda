@@ -1,7 +1,7 @@
 # Toolchain issues observed during the v3 cycle
 
 **Date filed:** 2026-04-30 (v3.0.0-rc.1 cut)
-**Toolchain at filing:** `cyrius 5.7.48` (mabda's pin)
+**Toolchain at filing:** `cyrius 5.7.48` (mabda's pin at filing; bumped to `5.11.28` 2026-05-12 ahead of rc.3 soak)
 **Audience:** mabda contributors + the cyrius toolchain team. Each
 entry is the smallest reproducible footprint we hit; cross-referenced
 to the deeper bug reports in `docs/development/issues/` and the
@@ -228,7 +228,7 @@ unconditionally, NOT silent on no-drift
   its tail. The stdlib `[deps].stdlib` references in consumer
   manifests then fail with "module X not found in bundle."
 - **Workaround**: pin cyrius ≥ 5.7.36 (the buffer was raised
-  64K → 256K in that release). mabda's pin (5.7.48) is well
+  64K → 256K in that release). mabda's pin (5.11.28) is well
   above.
 - **Upstream**: fixed in 5.7.36. cited above as the precedent
   for the lint + fmt fix in Class A1.

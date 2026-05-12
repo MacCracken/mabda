@@ -1,6 +1,6 @@
 # Consumer Integration Guide
 
-> Written against mabda 3.0.0-rc.1 / Cyrius 5.7.48. Full launcher-wiring
+> Written against mabda 3.0.0-rc.2 / Cyrius 5.11.28. Full launcher-wiring
 > walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
 
 ## How to Depend on Mabda

@@ -1,6 +1,6 @@
 # Usage Guide
 
-> Written against mabda 3.0.0-rc.1 / Cyrius 5.7.48. See
+> Written against mabda 3.0.0-rc.2 / Cyrius 5.11.28. See
 > [`docs/stdlib-integration.md`](../stdlib-integration.md) for
 > consumer-project setup (manifest, deps, launcher build rule), and
 > [`render-graph.md`](render-graph.md) if you want to orchestrate

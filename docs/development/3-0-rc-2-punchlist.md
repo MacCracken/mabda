@@ -240,21 +240,24 @@ expected effort. None are HIGH severity (those landed in rc.1).
 
 ---
 
-## Closeout for 3.0.0 (post rc.2)
+## Closeout for 3.0.0 (post rc.2 — refined 2026-05-12)
 
-Once every audit-tracked item above is closed:
+rc.2 closed out the audit-tracked items. The soak window that
+originally lived here was **split into rc.3 + rc.4 cuts** on
+2026-05-12 to surface regressions earlier without sinking the
+full 3-day burn-in budget on every iteration. The detail moved to
+two punchlists:
 
-1. Run the full P(-1) closeout matrix per CLAUDE.md
-   (`make test`, full test files, GPU integration on wgpu + native,
-   distlib regen diff-clean, version-check, audit index up to date).
-2. Re-run the audit (`docs/audit/YYYY-MM-DD-audit.md`) — must
-   surface 0 HIGH and 0 MEDIUM findings new since 2026-04-30.
-3. Soak window: 3-day burn-in on the dev box with the consumer
-   programs running continuously. Confirm no leak / stutter / OOM
-   surfaces.
-4. VERSION 3.0.0-rc.2 → 3.0.0.
-5. Tag `v3.0.0`. CI release pipeline should produce the same
-   artifacts as the rc.1 dry-run.
+- **rc.3 — short-soak proof (≤6h).** The dirty-fast gate. Punchlist:
+  [`3-0-rc-3-punchlist.md`](3-0-rc-3-punchlist.md). Closeout matrix
+  (P(-1)), re-audit, and the 6h soak live there.
+- **rc.4 — extended soak (24h → 3d).** 1-day clean is the earliest
+  3.0.0 GA cut; the 3-day window feeds the 3.0.x patch stream.
+  Punchlist: [`3-0-rc-4-punchlist.md`](3-0-rc-4-punchlist.md).
+
+The original linear `1. closeout → 2. audit → 3. 3-day soak →
+4. VERSION bump → 5. tag` sequence is now spread across the two rc
+punchlists. Use those as the authoritative gate trackers.
 
 ---
 

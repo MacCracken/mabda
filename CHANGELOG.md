@@ -195,14 +195,26 @@ byte-diff harness — CI-safe, no GPU needed).
 
 ### Next
 
+- **Toolchain pin bump** (in-flight 2026-05-12): `cyrius 5.7.48 →
+  5.11.28` in `cyrius.cyml`, samvada dep already on 0.2.2. Closeout
+  documented in the rc.3 punchlist.
 - 6-consumer regression sweep against the rc.2 bundle (soorat / rasa /
   ranga / bijli / aethersafta / kiran-via-soorat). Parallelizable to
   a sub-agent. Any file regression filed at
   `docs/issues/2026-MM-DD-<project>-rc2-regression.md`.
-- 3-day soak window on the dev box with the consumer programs running
-  continuously (no leak / stutter / OOM expected; if any surfaces,
-  rc.3 cuts before the official 3.0.0).
-- VERSION 3.0.0-rc.2 → 3.0.0 + tag once both above pass.
+- **Soak strategy split into rc.3 + rc.4** (2026-05-12 plan):
+  - **rc.3** — ≤6h soak proof on the dev box. The dirty-fast gate:
+    if anything regresses inside 6h, we cut rc.3 and iterate before
+    sinking the 24h+ runs. Punchlist:
+    [`docs/development/3-0-rc-3-punchlist.md`](docs/development/3-0-rc-3-punchlist.md).
+  - **rc.4** — extended soak from 24h → up to 3 days. **1-day
+    clean = earliest cut for 3.0.0 GA.** The 3-day window is the
+    focus of the first few 3.0.x patches (anything that surfaces
+    between 24h and 72h becomes a 3.0.1+ tracked item, not a GA
+    blocker). Punchlist:
+    [`docs/development/3-0-rc-4-punchlist.md`](docs/development/3-0-rc-4-punchlist.md).
+- VERSION 3.0.0-rc.2 → 3.0.0-rc.3 → 3.0.0-rc.4 → 3.0.0 + tag once
+  the rc.4 24h-clean gate passes.
 
 ## [3.0.0-rc.1] — 2026-04-30
 
