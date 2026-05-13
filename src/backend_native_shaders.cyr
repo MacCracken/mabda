@@ -322,10 +322,22 @@ var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
 # Vertex shader SH registers (Mesa: R_00B12{0,4,8,C}_SPI_SHADER_*_VS).
 # Within the SH-reg block (0xB000 base; native_sh_reg_offset divides
 # by 4). Wire-form offsets: PGM_LO=0x48, _HI=0x49, _RSRC1=0x4A, _RSRC2=0x4B.
+# RSRC3 (CU enable mask) and LATE_ALLOC live immediately BELOW PGM_LO:
+# wire-form offsets RSRC3=0x46, LATE_ALLOC=0x47. Without these the VS
+# has no CUs allocated → waves can't launch → 2-second GFX TDR.
+var R_SPI_SHADER_PGM_RSRC3_VS = 0xB118;
+var R_SPI_SHADER_LATE_ALLOC_VS = 0xB11C;
 var R_SPI_SHADER_PGM_LO_VS    = 0xB120;
 var R_SPI_SHADER_PGM_HI_VS    = 0xB124;
 var R_SPI_SHADER_PGM_RSRC1_VS = 0xB128;
 var R_SPI_SHADER_PGM_RSRC2_VS = 0xB12C;
+
+# CU enable mask + late VS allocation count captured byte-for-byte from
+# radv on Cezanne/Renoir (gfx90c). 0x003FFFFE enables CUs 1-21; the low
+# bit (CU0) is masked off per AMD's recommended SE/SH layout. Late VS
+# allocation 24 is the Cezanne-tuned value radv computes from CU count.
+var GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL = 0x003FFFFE;
+var GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE  = 0x00000018;
 
 # Pixel shader SH registers (Mesa: R_00B02{0,4,8,C}_SPI_SHADER_*_PS).
 # Wire-form offsets: PGM_LO=0x08, _HI=0x09, _RSRC1=0x0A, _RSRC2=0x0B.
@@ -439,6 +451,27 @@ var R_CB_BLEND0_CONTROL  = 0xA780;   # Mesa 0x028780
 # Rasterizer / clip mode.
 var R_PA_SU_SC_MODE_CNTL = 0xA814;   # Mesa 0x028814
 var R_PA_CL_CLIP_CNTL    = 0xA810;   # Mesa 0x028810
+# PA_CL_VS_OUT_CNTL — VS output enable mask (clip/cull dist, viewport
+# index, etc.). For a trivial VS that only exports position, radv emits
+# 0; the cube draws that export clip distances emit 0x01240000. Without
+# an explicit emit, the register holds whatever the prior context left
+# behind (likely the compositor's value) → the PA stage waits on output
+# slots our VS doesn't fill → GFX TDR.
+var R_PA_CL_VS_OUT_CNTL  = 0xA81C;   # Mesa 0x02881C
+
+# Pipeline-stage handshake registers that radv explicitly emits even
+# when the value is 0. Without explicit emit, mabda inherits whatever
+# the prior context (the compositor) left in these registers, which
+# can stall pipeline stages waiting on handshakes that never complete.
+# Each captured from radv on Cezanne via RADV_DEBUG=dumpibs.
+var R_DB_Z_INFO              = 0xA038;   # Mesa 0x028038
+var R_DB_STENCIL_INFO        = 0xA03C;   # Mesa 0x02803C
+var R_SPI_BARYC_CNTL         = 0xA6E0;   # Mesa 0x0286E0
+var R_VGT_GS_MODE            = 0xAA40;   # Mesa 0x028A40
+var R_VGT_PRIMITIVEID_EN     = 0xAA84;   # Mesa 0x028A84
+var R_PA_SC_AA_MASK_X0Y0_X1Y0 = 0xAC38;  # Mesa 0x028C38
+var R_PA_SC_AA_MASK_X0Y1_X1Y1 = 0xAC3C;  # Mesa 0x028C3C
+var R_PA_SC_SHADER_CONTROL   = 0xAC40;   # Mesa 0x028C40
 
 # Stage enable + reuse.
 var R_VGT_SHADER_STAGES_EN = 0xAB54; # Mesa 0x028B54
@@ -664,8 +697,12 @@ var GFX9_CB_BLEND_DISABLED = 0x0;
 var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x4;
 
 # VGT_SHADER_STAGES_EN: VS+PS only, no tess, no GS, no NGG.
-# Default value 0 disables every optional stage.
-var GFX9_VGT_SHADER_STAGES_VS_PS = 0x0;
+# Bit 16 = VS_EN = VS_STAGE_REAL — REQUIRED. Without it the VGT
+# treats the vertex stage as off and waits forever for vertex
+# output that can't arrive → 2-second GFX TDR. Captured byte-for-
+# byte from radv on Cezanne (vkcube preamble: 0x00010000).
+# All other stage bits (LS/HS/ES/GS/etc.) stay 0 for VS+PS only.
+var GFX9_VGT_SHADER_STAGES_VS_PS = 0x00010000;
 
 # PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF=1, DX_LINEAR_ATTR_CLIP_ENA=1,
 # Z_CLIP_NEAR_DISABLE for NDC z=0..1 default. Cited from design doc.

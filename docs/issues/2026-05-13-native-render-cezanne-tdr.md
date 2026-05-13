@@ -1,9 +1,111 @@
 # 2026-05-13 — native render GFX-ring TDR on Cezanne (gfx90c)
 
-**Status:** OPEN. 26+ register-level correctness fixes landed; the
+**Status:** OPEN. 35+ register-level correctness fixes landed; the
 underlying 2-second GFX-ring TDR persists. Compute path on the same
 hardware is unaffected (6h soak passed 2026-05-12, 15.66M iterations
-flat RSS). Filing for v3.0.x patch-stream resolution after rc.3 cut.
+flat RSS; re-verified post-render-fixes 2026-05-12 evening — compute
+still bit-exact 0xDEADBEEF). Filing for v3.0.x patch-stream resolution
+after rc.3 cut.
+
+## Update — 2026-05-12 evening session (root-cause analysis round 2)
+
+Audit of the rc.2 → rc.3 work in this file revealed that fixes #23,
+#25, #26, #27 (PKT3 NUM_INSTANCES, FLUSH_AND_INV pre-draw, PFP_SYNC_ME,
+PIPELINESTAT_START) **had defined helpers and constants but were never
+wired into `native_pm4_build_render_clear_triangle`**. The composer
+emitted the original 27-or-so register block plus a post-draw
+CACHE_FLUSH_AND_INV, without any of the new pre-draw packets. This
+was caught by byte-dumping the composer output via
+`programs/dump_render_pm4` and diffing against the same hardware's
+radv vkcube capture in `/tmp/radv-ib.txt`.
+
+Followup fixes landed in this evening's session (each one cited
+against radv on Cezanne via `RADV_DEBUG=dumpibs`):
+
+1. **`GFX9_VGT_SHADER_STAGES_VS_PS` 0x0 → 0x00010000.** The old value
+   was a textbook off-by-misunderstanding — comment said "0 = defaults,
+   VS enabled" but on GFX9 the VS_EN bit is at bit 16 and 0 means
+   `VS_STAGE_OFF`. With VS_OFF the VGT waits forever for vertex output
+   that can't arrive → exactly the 2-second VGT TDR shape. Captured
+   byte-for-byte from radv (0x00010000 across every vkcube draw).
+2. **`SPI_SHADER_PGM_RSRC3_VS = 0x003FFFFE`.** Previously not emitted.
+   This is the CU enable mask for the VS — bits 1-21 set means CUs 1-21
+   eligible. Default-after-context-invalidate = whatever the prior
+   context left, often 0 → VS waves can't allocate → hang.
+3. **`SPI_SHADER_LATE_ALLOC_VS = 24`.** Previously not emitted.
+   Cezanne-tuned late VS allocation count from radv.
+4. **`PA_CL_VS_OUT_CNTL = 0`.** Previously not emitted. Our VS exports
+   only position; explicit 0 clears whatever VS_OUT mask the compositor
+   left here (a non-zero value can make the PA stage wait on output
+   slots our VS doesn't fill).
+5. **PFP_SYNC_ME at IB start, EVENT_WRITE PIPELINESTAT_START after
+   ACQUIRE_MEM, PKT3 NUM_INSTANCES (0x2F) replacing
+   SET_UCONFIG_REG(VGT_NUM_INSTANCES).** The packets the previous
+   session said it landed but didn't.
+6. **`PA_SC_AA_MASK_X0Y0_X1Y0` and `PA_SC_AA_MASK_X0Y1_X1Y1` = 0xFFFFFFFF.**
+   Previously not emitted. Default = 0 (no samples covered → no
+   pixels written).
+7. **Six more explicit-`=0` emits** (`SPI_BARYC_CNTL`,
+   `PA_SC_SHADER_CONTROL`, `VGT_GS_MODE`, `VGT_PRIMITIVEID_EN`,
+   `DB_Z_INFO`, `DB_STENCIL_INFO`) — to override whatever the prior
+   compositor context left in each register.
+
+Block sizes updated:
+- `NATIVE_PIPE_SH_BLOCK_SIZE` 48 → 56 (VS SET_SH_REG now spans
+  RSRC3_VS through RSRC2_VS, 6 contiguous regs).
+- `NATIVE_PIPE_FIELD_CTX_BLOCK` 80 → 88.
+- `NATIVE_PIPE_CTX_BLOCK_SIZE` 424 → 532 (9 × 12-byte sets added).
+- `NATIVE_PIPE_STRUCT_SIZE` 504 → 620.
+
+Tested with `make test-native-compute-store` post-fix: compute still
+bit-exact, no regression in the working path.
+
+## At-hang state captured via devcoredump
+
+The 2026-05-12 evening session captured `/sys/class/drm/card1/device/devcoredump/data`
+to `/tmp/render-tdr.txt` (`./scripts/capture-tdr.sh`). Key findings:
+
+- **`Faulty page starting at address: 0x0000000000000000`** — gfxhub
+  page fault at VA 0. `mmVM_L2_PROTECTION_FAULT_STATUS = 0x0` (current
+  status clear — the fault was historic, not active at TDR time).
+- **PFP stalled** — `mmCP_STALLED_STAT1 = 0x00000c00` (bits 10-11),
+  `mmCP_CPF_STALLED_STAT1 = 0x00000001`, `mmCP_CPF_STATUS = 0xbc000223`.
+- **Most-recent PFP packets** (`mmCP_PFP_HEADER_DUMP`):
+  `c0055800 c0004600 c0004600 c0004600 c0032200 c0981000 c0008b00
+  c0064900` — last 8 packets the PFP processed before stalling.
+- **GFX-ring contents** (offset 0x520-0x550 in the kernel ring):
+  - 0x524: `c0012800` CONTEXT_CONTROL with CC0=0x81018003, CC1=0x0 —
+    kernel-emitted preamble immediately before jumping to mabda's IB
+  - 0x530: `c0009000` INDIRECT_BUFFER_PRIV (1 dword)
+  - 0x538: `c0023f00` INDIRECT_BUFFER → 0xffff800100200000 (mabda's IB)
+    with IB_CONTROL=0x07000100 (256 dwords)
+- **VA encoding NOT the bug.** Kernel installs mabda's BOs at the
+  canonical-low 48-bit truncation (`mmCP_IB1_BASE_HI = 0x00008001`,
+  not 0xFFFF8001) — same as how radv's BOs are installed. Hypothesis
+  (C) from the original filing is definitively ruled out.
+- **CONTEXT_CONTROL hypothesis ruled out.** mabda tried emitting its
+  own CONTEXT_CONTROL with CC0=0x80000000 (LOAD_ENABLE=0) immediately
+  after the kernel's; symptom unchanged. Reverted — radv doesn't emit
+  CONTEXT_CONTROL in its userspace IB either.
+
+The fault at VA 0 + PFP stall on a recent packet history that
+includes our ACQUIRE_MEM and several EVENT_WRITEs (PIPELINESTAT_START,
+plus what looks like the kernel's postamble fence events) suggests
+the hang is either:
+- inside our ACQUIRE_MEM's full-VA-range invalidate (BASE=0,
+  SIZE=0xFFFFFFFF — same as radv) triggering an L2 walk that hits a
+  stale tagged line at VA 0
+- inside one of our SET_*_REG packets triggering a context-state
+  load (despite our CC0 attempt) from an unset source address
+- inside the shader fetch path if PGM_LO/HI haven't landed (the
+  CONTEXT_REG/SH_REG load path under the kernel's CC0=0x81018003)
+
+None of these is diagnosable from the coredump alone without either:
+- byte-exact comparison against a radv triangle-test capture (different
+  workload than vkcube — vkcube's draw setup has different state and
+  inferences from it can mislead)
+- `umr` disassembly of the PFP firmware at instruction pointer
+  0x00000ada (`mmCP_PFP_INSTR_PNTR` value at hang)
 
 **Hardware:** AMD Renoir / Cezanne APU (gfx90c), Wayland desktop
 session. radv (Mesa) is the working reference path (`vkcube` runs

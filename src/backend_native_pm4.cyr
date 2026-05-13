@@ -55,6 +55,7 @@ var IT_EVENT_WRITE      = 0x46;
 var IT_NUM_INSTANCES    = 0x2F;  # dedicated PKT3 for VGT_NUM_INSTANCES
 var IT_PFP_SYNC_ME      = 0x42;  # PFP wait for ME drain
 var IT_SET_UCONFIG_REG  = 0x79;
+var IT_CONTEXT_CONTROL  = 0x28;  # Disable HW context-state shadowing
 
 # SH-register offsets (byte addresses in MMIO space). The SH_REG base
 # is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
@@ -380,6 +381,23 @@ fn native_pm4_pfp_sync_me(buf, pos): i64 {
     return pos + 8;
 }
 
+# PKT3_CONTEXT_CONTROL — controls HW context-state shadowing on the
+# GFX ring. radv relies on the kernel-emitted preamble IB (jumped to
+# via INDIRECT_BUFFER at queue init) to set this up; mabda has no such
+# kernel-side preamble, so we must emit it ourselves at the start of
+# every IB. Body: load_control (dw1) + shadow_control (dw2). The
+# canonical "disable shadowing, load all state from packets" value is
+# (0x80000000, 0x80000000) — bit 31 = LOAD_ENABLE_PIPELINE_STAT_ENABLE
+# on dw1, bit 31 = SHADOW_ENABLE on dw2 (kernel sets these for the
+# initial context). Cited from drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+# `gfx_v9_default_init_state[]` and Mesa's si_emit_initial_cmdbuffer.
+fn native_pm4_context_control(buf, pos): i64 {
+    store32(buf + pos + 0, native_pm4_pkt3_header(IT_CONTEXT_CONTROL, 2, 0));
+    store32(buf + pos + 4, 0x80000000);  # load_control
+    store32(buf + pos + 8, 0x80000000);  # shadow_control
+    return pos + 12;
+}
+
 # Emit a PKT3_NUM_INSTANCES packet (opcode 0x2F). Per-draw replacement
 # for SET_UCONFIG_REG(VGT_NUM_INSTANCES, n) — the AMD CP recognizes
 # this as a draw-state hint and updates VGT internals more directly
@@ -416,6 +434,17 @@ fn native_pm4_event_write(buf, pos, event_type, event_index): i64 {
 fn native_pm4_event_write_cache_flush_and_inv(buf, pos): i64 {
     return native_pm4_event_write(buf, pos,
     GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+    GFX9_EVENT_INDEX_OTHER);
+}
+
+# PIPELINESTAT_START — emitted by radv in every GFX preamble after the
+# heavy ACQUIRE_MEM. Starts the GPU's pipeline-statistics counters and
+# unblocks dependent state machines that wait on stat-counter readiness
+# at context start. Without it, on Cezanne/Renoir the GFX ring can sit
+# waiting on the stat-counter pipeline → 2-second TDR.
+fn native_pm4_event_write_pipelinestat_start(buf, pos): i64 {
+    return native_pm4_event_write(buf, pos,
+    GFX9_EVENT_TYPE_PIPELINESTAT_START,
     GFX9_EVENT_INDEX_OTHER);
 }
 
@@ -595,12 +624,19 @@ fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va): i64 {
     var fs_pgm_lo = (fs_va >> 8)  & 0xFFFFFFFF;
     var fs_pgm_hi = (fs_va >> 40) & 0xFF;
 
-    var vs_regs[16];
-    store32(&vs_regs +  0, vs_pgm_lo);
-    store32(&vs_regs +  4, vs_pgm_hi);
-    store32(&vs_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
-    store32(&vs_regs + 12, GFX9_VS_PGM_RSRC2_MIN);
-    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_VS, 4, &vs_regs);
+    # Contiguous SET_SH_REG covering RSRC3_VS, LATE_ALLOC_VS, PGM_LO_VS,
+    # PGM_HI_VS, PGM_RSRC1_VS, PGM_RSRC2_VS (6 regs, addresses 0xB118 →
+    # 0xB12C in 4-byte steps). RSRC3 + LATE_ALLOC must lead because they
+    # control wave allocation; if absent or zero the VS can't launch on
+    # any CU → 2-second GFX TDR even with otherwise-correct shader code.
+    var vs_regs[24];
+    store32(&vs_regs +  0, GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL);
+    store32(&vs_regs +  4, GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE);
+    store32(&vs_regs +  8, vs_pgm_lo);
+    store32(&vs_regs + 12, vs_pgm_hi);
+    store32(&vs_regs + 16, GFX9_GFX_PGM_RSRC1_MIN);
+    store32(&vs_regs + 20, GFX9_VS_PGM_RSRC2_MIN);
+    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_RSRC3_VS, 6, &vs_regs);
 
     var ps_regs[16];
     store32(&ps_regs +  0, fs_pgm_lo);
@@ -644,6 +680,10 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_SHADER_STAGES_EN,
     GFX9_VGT_SHADER_STAGES_VS_PS);
     pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_REUSE_OFF, 0);
+    # PA_CL_VS_OUT_CNTL = 0: our VS exports only position (no clip/cull
+    # distances, no viewport-array index, no misc-vec). Must be set
+    # explicitly to clear whatever value the prior context left here.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_VS_OUT_CNTL, 0);
 
     # SPI inputs/outputs — FS gets the hang-quirk minimum, VS exports
     # only pos0 (no params).
@@ -735,6 +775,30 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     store32(&sx_block + 4, 0);                 # SX_BLEND_OPT_EPSILON = 0
     store32(&sx_block + 8, 0);                 # SX_BLEND_OPT_CONTROL = 0
     pos = native_pm4_set_context_reg(buf, pos, R_SX_PS_DOWNCONVERT, 3, &sx_block);
+
+    # Pipeline-stage handshake state radv always emits — each register
+    # must be set to a known value to override whatever the prior
+    # context (compositor's draws) left here. The default-after-context-
+    # invalidate is NOT zero; it's "whatever was last loaded". Without
+    # these explicit emits, the GFX pipeline can stall at the affected
+    # stage (PA scan converter, SPI barycentric provider, VGT stream-out,
+    # DB depth/stencil eval) waiting on handshakes that never complete →
+    # 2-second exact GFX-ring TDR.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_BARYC_CNTL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_SHADER_CONTROL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_GS_MODE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_PRIMITIVEID_EN, 0);
+    # DB_Z_INFO / DB_STENCIL_INFO = 0 → FORMAT=Z_INVALID/STENCIL_INVALID.
+    # Tells the DB block "no depth-stencil attachment" so it doesn't
+    # try to read DB_Z_READ_BASE / DB_STENCIL_READ_BASE (which are 0
+    # → VM fault path on access).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_Z_INFO, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_STENCIL_INFO, 0);
+    # PA_SC_AA_MASK_X0Y0_X1Y0 / X0Y1_X1Y1 — sample coverage mask for
+    # the rasterizer. Default 0 = no samples covered = no pixels written.
+    # 0xFFFFFFFF = all samples covered (every pixel passes coverage).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y0_X1Y0, 0xFFFFFFFF);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y1_X1Y1, 0xFFFFFFFF);
 
     return pos;
 }
@@ -876,14 +940,32 @@ fn native_pm4_build_render_draw_tail(buf, pos, vertex_count): i64 {
 fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
 rt_va, rt_width, rt_height): i64 {
     var pos = 0;
+    # Preamble shape captured byte-for-byte from radv's GFX preamble IB
+    # on this exact Cezanne/Renoir: PFP_SYNC_ME → heavy ACQUIRE_MEM →
+    # EVENT_WRITE PIPELINESTAT_START. The PFP_SYNC_ME forces the
+    # Prefetch Parser to drain pending work from a prior context (e.g.
+    # the compositor's draws) before our ACQUIRE_MEM invalidates the
+    # caches. Without it, PFP can read stale context state ME hasn't
+    # finished committing → CP stalls waiting on pipeline subsystems
+    # whose state never settles → 2-second exact GFX-ring TDR.
+    # NOTE: we do NOT emit our own CONTEXT_CONTROL here. The kernel
+    # already emits one (CC0=0x81018003, CC1=0) immediately before
+    # jumping to our IB — observed in the GFX-ring devcoredump at
+    # 2026-05-12. Emitting a second CONTEXT_CONTROL with conflicting
+    # load/shadow bits interacted badly and changed the hang shape.
+    # radv also doesn't emit CONTEXT_CONTROL in its userspace IB.
+    pos = native_pm4_pfp_sync_me(buf, pos);
     pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(buf, pos);
+    pos = native_pm4_event_write_pipelinestat_start(buf, pos);
     pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
     GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_NUM_INSTANCES,
-    GFX9_VGT_NUM_INSTANCES_ONE);
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
+    # PKT3 NUM_INSTANCES (opcode 0x2F) goes IMMEDIATELY before
+    # DRAW_INDEX_AUTO. radv emits it as a per-draw hint; AMD CP picks it
+    # up as a draw-state update more reliably than SET_UCONFIG_REG.
+    pos = native_pm4_num_instances(buf, pos, GFX9_VGT_NUM_INSTANCES_ONE);
     pos = native_pm4_build_render_draw_tail(buf, pos, GFX9_FULLSCREEN_TRI_VCOUNT);
     # Flush CB/DB caches so the FB the kernel signals "complete" on
     # actually contains the rendered pixels — ACQUIRE_MEM at top of
