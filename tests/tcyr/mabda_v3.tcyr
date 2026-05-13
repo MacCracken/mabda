@@ -2076,8 +2076,10 @@ fn test_native_pm4_render_pass_target_layout_256x256() {
     0xFFFF800101000000,
     256, 256);
     # Block size: 2 scissor pairs (4+4=8 dw) + 1 viewport-6 (8 dw) +
-    # 1 zminmax-pair (4 dw) + 6 RT singletons (18 dw) = 38 dw = 152 bytes.
-    assert_eq(pos, 152, "pass_target size = 152 bytes");
+    # 1 zminmax-pair (4 dw) + 7 RT singletons (21 dw) = 41 dw = 164
+    # bytes. ATTRIB2 (added 2026-05-13 after the rc.2 0x55-sentinel
+    # bug) is the +12 bytes vs the rc.2 152-byte shape.
+    assert_eq(pos, 164, "pass_target size = 164 bytes");
 
     # First packet = screen scissor pair at +0.
     assert_eq(load32(&buf + 0), 0xC0026900, "screen_scissor header");
@@ -2130,6 +2132,20 @@ fn test_native_pm4_render_pass_target_rt_bind() {
     assert_eq(load32(&buf + 92), 0xC0016900, "CB_COLOR0_BASE_EXT header");
     assert_eq(load32(&buf + 96), 0x319, "CB_COLOR0_BASE_EXT wire offset");
     assert_eq(load32(&buf + 100), 0x80, "CB_COLOR0_BASE_EXT = (rt_va>>40) byte");
+
+    # CB_COLOR0_ATTRIB2 at +104 — the rc.2 0x55-sentinel bug fix.
+    # Without this register the CB sees the RT as zero-extent and
+    # silently drops every pixel write (draw signals fine, RT stays
+    # at the test's pre-fill sentinel). For 256x256:
+    #   MIP0_HEIGHT (bits 0..13)  = 255 = 0xFF
+    #   MIP0_WIDTH  (bits 14..27) = 255 << 14 = 0x3FC000
+    #   MAX_MIP     (bits 28..31) = 0
+    # → value = 0xFF | 0x3FC000 = 0x3FC0FF.
+    # Wire offset = (0xAC68 - 0xA000)/4 = 0xC68/4 = 0x31A.
+    assert_eq(load32(&buf + 104), 0xC0016900, "CB_COLOR0_ATTRIB2 header");
+    assert_eq(load32(&buf + 108), 0x31A, "CB_COLOR0_ATTRIB2 wire offset");
+    assert_eq(load32(&buf + 112), 0x3FC0FF,
+    "CB_COLOR0_ATTRIB2 = (h-1) | ((w-1)<<14) for 256x256");
     return 0;
 }
 
@@ -2198,20 +2214,22 @@ fn test_native_pm4_render_clear_triangle_top_level() {
     assert_eq(load32(&buf + 52), 0xC0047600, "pipeline_sh begins (VS SET_SH_REG)");
 
     # CACHE_FLUSH_AND_INV EVENT_WRITE spliced after draw_tail (Step
-    # 6.10 wired post-pivot). draw_tail ends at offset 504; the
-    # 8-byte EVENT_WRITE packet lands at 504..512 with header
+    # 6.10 wired post-pivot). draw_tail ends at offset 516 (post-
+    # ATTRIB2 fix shifted the pre-pad layout by 12 bytes); the
+    # 8-byte EVENT_WRITE packet lands at 516..524 with header
     # 0xC0004600 and body 0x00000016.
-    assert_eq(load32(&buf + 504), 0xC0004600,
+    assert_eq(load32(&buf + 516), 0xC0004600,
     "EVENT_WRITE header after draw_tail");
-    assert_eq(load32(&buf + 508), 0x00000016,
+    assert_eq(load32(&buf + 520), 0x00000016,
     "CACHE_FLUSH_AND_INV body");
     return 0;
 }
 
 fn test_native_pm4_render_clear_triangle_block_sizes() {
     # Confirm block sizes sum to the expected pre-padding total.
-    # ACQUIRE_MEM (28) + 2 UConfig (24) + sh (48) + ctx (228) +
-    # pass_target (152) + draw_tail (12) = 492 bytes pre-pad.
+    # ACQUIRE_MEM (28) + 2 UConfig (24) + sh (48) + ctx (240) +
+    # pass_target (164) + draw_tail (12) = 516 bytes pre-pad.
+    # (pass_target grew 152 → 164 at the 2026-05-13 ATTRIB2 fix.)
     var buf[1024];
     memset(&buf, 0xCC, 1024);
 
@@ -2232,9 +2250,9 @@ fn test_native_pm4_render_clear_triangle_block_sizes() {
     assert_eq(p, 340, "+pipeline_ctx = 240");
     p = native_pm4_build_render_pass_target(&buf, p,
     0xFFFF800101000000, 256, 256);
-    assert_eq(p, 492, "+pass_target = 152");
+    assert_eq(p, 504, "+pass_target = 164");
     p = native_pm4_build_render_draw_tail(&buf, p, GFX9_FULLSCREEN_TRI_VCOUNT);
-    assert_eq(p, 504, "+draw_tail = 12");
+    assert_eq(p, 516, "+draw_tail = 12");
     return 0;
 }
 
