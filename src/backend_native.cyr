@@ -595,11 +595,13 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 1024);
     var pos = 0;
-    pos = native_pm4_acquire_mem_full_invalidate(pm4, pos);
+    pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(pm4, pos);
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_PRIMITIVE_TYPE,
     GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_NUM_INSTANCES,
-    GFX9_VGT_NUM_INSTANCES_ONE);
+    # Use dedicated PKT3_NUM_INSTANCES (opcode 0x2F) — radv's choice
+    # for per-draw instance count; Cezanne VGT picks this up more
+    # reliably than the generic SET_UCONFIG_REG path.
+    pos = native_pm4_num_instances(pm4, pos, 1);
     # Splice the pre-built sh + ctx blocks (Step 6.5(b) composers
     # already ran at pipeline_create — this is the cached-block path).
     memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_SH_BLOCK,
@@ -610,6 +612,19 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
     rt_width, rt_height);
+    # Pre-draw pixel-pipeline drain — captured byte-exact from radv's
+    # main IB. Without these, in-flight pixel waves from prior
+    # contexts (e.g. the compositor) keep the pixel pipeline busy past
+    # our dispatch's start → GFX ring TDR. The 3-event sequence (CB
+    # meta flush + DB meta flush + PS partial flush) forces the
+    # pipeline to a clean state before our triangle reaches the
+    # rasterizer.
+    pos = native_pm4_event_write(pm4, pos,
+    GFX9_EVENT_TYPE_FLUSH_AND_INV_CB_META, GFX9_EVENT_INDEX_OTHER);
+    pos = native_pm4_event_write(pm4, pos,
+    GFX9_EVENT_TYPE_FLUSH_AND_INV_DB_META, GFX9_EVENT_INDEX_OTHER);
+    pos = native_pm4_event_write(pm4, pos,
+    GFX9_EVENT_TYPE_PS_PARTIAL_FLUSH, GFX9_EVENT_INDEX_PARTIAL_FLUSH);
     pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
     # Post-draw cache flush — same rationale as the standalone
     # composer above. CB writes need to land in memory before the
@@ -1124,8 +1139,8 @@ var NATIVE_PIPE_FIELD_FS_VA     = 24;
 var NATIVE_PIPE_FIELD_SH_BLOCK  = 32;
 var NATIVE_PIPE_FIELD_CTX_BLOCK = 80;
 var NATIVE_PIPE_SH_BLOCK_SIZE   = 48;
-var NATIVE_PIPE_CTX_BLOCK_SIZE  = 376;
-var NATIVE_PIPE_STRUCT_SIZE     = 456;
+var NATIVE_PIPE_CTX_BLOCK_SIZE  = 424;
+var NATIVE_PIPE_STRUCT_SIZE     = 504;
 
 # Build a NativeRenderPipeline in-place. Caller allocates
 # NATIVE_PIPE_STRUCT_SIZE bytes for `out`. Pre-builds both pipeline

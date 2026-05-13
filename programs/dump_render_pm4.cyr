@@ -1,0 +1,72 @@
+# programs/dump_render_pm4.cyr — CPU-only dump of the clear-triangle PM4
+# stream. No DRM, no submit. Calls the composer, then prints each
+# dword as `XXXX: 0xDDDDDDDD\n` for diff against RADV `RADV_DEBUG=ibs`
+# captures. Wired into the Cezanne render-path bring-up: lets us see
+# the exact bytes the GFX ring receives without spending a TDR per
+# iteration.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[11];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    store8(&buf + 10, 10);
+    syscall(1, 1, &buf, 11);
+    return 0;
+}
+fn print_hex16(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[5];
+    var i = 0;
+    while (i < 4) {
+        var nibble = (v / (1 << ((3 - i) * 4))) & 0xF;
+        store8(&buf + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    store8(&buf + 4, 58);  # ':'
+    syscall(1, 1, &buf, 5);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+
+    print_cstr("# mabda native_render clear-triangle PM4 stream\n");
+    print_cstr("# vs_va=0xFFFF800100000000 fs_va=0xFFFF800100001000 rt_va=0xFFFF800101000000 256x256\n");
+
+    var buf[2048];
+    memset(&buf, 0, 2048);
+    var pos = native_pm4_build_render_clear_triangle(&buf,
+    0xFFFF800100000000,
+    0xFFFF800100001000,
+    0xFFFF800101000000,
+    256, 256);
+
+    print_cstr("# total dwords = ");
+    print_hex32(pos / 4);
+    var n = pos / 4;
+    var i = 0;
+    while (i < n) {
+        print_hex16(i * 4);
+        var dword = load32(&buf + i * 4);
+        var space[1];
+        store8(&space, 32);
+        syscall(1, 1, &space, 1);
+        print_hex32(dword);
+        i = i + 1;
+    }
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -485,6 +485,13 @@ var R_PA_SU_HARDWARE_SCREEN_OFFSET = 0xA234; # Mesa 0x028234
 var R_PA_SC_WINDOW_SCISSOR_TL = 0xA204;  # Mesa 0x028204
 var R_PA_SC_WINDOW_SCISSOR_BR = 0xA208;  # Mesa 0x028208
 
+# Per-viewport scissor — radv sets viewport 0's scissor to wide-open
+# with WINDOW_OFFSET_DISABLE on TL. Without this, the post-viewport
+# scissor stage (separate from screen/window/generic) crops the
+# triangle. 0x028250 / 0x028254.
+var R_PA_SC_VPORT_SCISSOR_0_TL = 0xA250;  # Mesa 0x028250
+var R_PA_SC_VPORT_SCISSOR_0_BR = 0xA254;  # Mesa 0x028254
+
 # Guard-band clip / discard adjusts (4 contiguous regs starting at
 # 0x028BE8). Required for the rasterizer to not hang on Cezanne and
 # similar GFX9 APUs — radv writes these unconditionally in
@@ -530,10 +537,43 @@ var R_PA_SU_PRIM_FILTER_CNTL = 0xA82C;  # Mesa 0x02882C
 
 # PA_SC_BINNER_CNTL_0 — primitive binning control. Cezanne / Picasso /
 # Raven / Renoir APUs default to binning ON; if not configured the
-# DPB pipeline can hang. Zero = binning disabled (simple, safe; the
-# perf hit of disabling binning on a 256x256 fullscreen-tri test is
-# zero). Configuring binning properly is v3.x perf scope.
+# DPB pipeline hangs the GFX ring. CRITICAL: value 0 is *not* "off" —
+# it's "BINNING_ALLOWED" (BinningMode enum entry 0). The actual disable
+# values are 2 (USE_NEW_SC) or 3 (USE_LEGACY_SC). This was the rc.2
+# GFX-ring 2-second TDR symptom; fixed 2026-05-13.
 var R_PA_SC_BINNER_CNTL_0    = 0xAC44;  # Mesa 0x028C44
+
+# PA_SC_BINNER_CNTL_1 — paired with CNTL_0. radv writes this
+# unconditionally with MAX_ALLOC_COUNT and MAX_PRIM_PER_BATCH;
+# omitting it leaves the binner with 0 allocator slots which can
+# stall the DPB pipeline even when binning is "disabled" via CNTL_0.
+var R_PA_SC_BINNER_CNTL_1    = 0xAC48;  # Mesa 0x028C48
+
+# BinningMode enum (gfx9.json):
+#   0 BINNING_ALLOWED                (DO NOT USE for "disabled")
+#   1 FORCE_BINNING_ON
+#   2 DISABLE_BINNING_USE_NEW_SC     (the value radv uses for GFX10+)
+#   3 DISABLE_BINNING_USE_LEGACY_SC  (the value radv uses for GFX9)
+#
+# For GFX9 (Cezanne / Raven2 / Renoir family) the disable value is
+# the LEGACY_SC variant, plus two paired bits:
+#   bit 18 = DISABLE_START_OF_PRIM = 1
+#   bit 28 = FLUSH_ON_BINNING_TRANSITION = 1 (Raven2+/Vega12/Vega20)
+#
+# Composed: 3 | (1 << 18) | (1 << 28) = 0x10040003.
+# Cited from radv_cmd.c radv_get_disabled_binning_state() GFX9 branch.
+var GFX9_BINNER_CNTL_0_DISABLED = 0x10040003;
+
+# CNTL_1 reasonable defaults for gfx9 APU: 31 alloc slots, 1023 prim/batch.
+# Encoding: MAX_ALLOC_COUNT[0:15] | MAX_PRIM_PER_BATCH[16:31].
+var GFX9_BINNER_CNTL_1_DEFAULT = 0x03FF001F;
+
+# SX (shader export) downconvert + blend-opt registers. 3 contiguous
+# starting at 0x028754. Without these the SX block doesn't know how
+# to convert the FS's FP32 export to RGBA8_UNORM and may stall the CB.
+var R_SX_PS_DOWNCONVERT      = 0xA754;  # Mesa 0x028754
+var R_SX_BLEND_OPT_EPSILON   = 0xA758;  # Mesa 0x028758
+var R_SX_BLEND_OPT_CONTROL   = 0xA75C;  # Mesa 0x02875C
 
 # VGT vertex reuse + output dealloc — required for VGT (vertex stream
 # fetch) on GFX9 to not deadlock waiting on reuse / dealloc slots.
@@ -559,6 +599,28 @@ var R_CB_COLOR0_VIEW         = 0xAC6C;  # Mesa 0x028C6C
 var R_CB_COLOR0_INFO         = 0xAC70;  # Mesa 0x028C70
 var R_CB_COLOR0_ATTRIB       = 0xAC74;  # Mesa 0x028C74
 var R_CB_COLOR0_DCC_CONTROL  = 0xAC78;  # Mesa 0x028C78
+
+# CMASK / FMASK / DCC base addresses + EXT (high bits) — even for a
+# trivial uncompressed RT, the CB hardware's compression-sidekick
+# state-machine reads these as base addresses on every dispatch. If
+# left at the previous context's stale values, the CB attempts to
+# fetch CMASK/FMASK metadata from a stale VA → VM fault → GFX-ring
+# hang. radv emits all four as part of the 11-reg CB_COLOR0 sequence
+# at draw time (gfx9_emit_fb_color_state). Setting them explicitly
+# to 0 = "no compression / no FMASK / no DCC" — the matching
+# CB_COLOR0_INFO bits already disable compression so the CB skips
+# the prefetch path entirely.
+var R_CB_COLOR0_CMASK         = 0xAC7C;  # Mesa 0x028C7C
+var R_CB_COLOR0_CMASK_BASE_EXT = 0xAC80; # Mesa 0x028C80
+var R_CB_COLOR0_FMASK         = 0xAC84;  # Mesa 0x028C84
+var R_CB_COLOR0_FMASK_BASE_EXT = 0xAC88; # Mesa 0x028C88
+var R_CB_COLOR0_DCC_BASE      = 0xAC94;  # Mesa 0x028C94
+var R_CB_COLOR0_DCC_BASE_EXT  = 0xAC98;  # Mesa 0x028C98
+
+# MRT0 effective pitch — encodes the RT's effective pitch in pixel
+# elements minus one. For a linear 256-wide RT this is 255.
+# Comes from gfx9-specific R_0287A0 set last in radv's gfx9 path.
+var R_CB_MRT0_EPITCH          = 0xA7A0;  # Mesa 0x0287A0
 
 # --- UConfig graphics regs ---
 
@@ -634,13 +696,19 @@ var GFX9_DB_SHADER_CONTROL_DEFAULT = 0x10;
 var GFX9_CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010;
 
 # CB_COLOR0_INFO bit-composed value for a linear RGBA8-unorm RT:
-#   FORMAT[2:6]      = COLOR_8_8_8_8 (0xA) << 2  = 0x28
-#   NUMBER_TYPE[8:10] = NUMBER_UNORM (0)         = 0
-#   COMP_SWAP[11:12] = SWAP_STD (0)              = 0
-# All other bits (compression, fast_clear, blend_clamp, etc.) are 0
-# for the trivial pipeline. Cited from Mesa gfx9.json `register_types`
-# field bit-positions and `enums` value table (extracted 2026-04-30).
-var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x28;
+#   FORMAT[2:6]               = COLOR_8_8_8_8 (0xA) << 2  = 0x28
+#   NUMBER_TYPE[8:10]         = NUMBER_UNORM (0)          = 0
+#   COMP_SWAP[11:12]          = SWAP_STD (0)              = 0
+#   FMASK_COMPRESSION_DISABLE[26] = 1                     = 0x04000000
+#   DCC_ENABLE[28]            = 0
+#
+# Bit 26 is CRITICAL on GFX9. Without it set the CB attempts to
+# fetch FMASK metadata from CB_COLOR0_FMASK (which we set to 0 since
+# there's no FMASK BO) → VM fault → GFX-ring TDR. This was the rc.2
+# native_render_e2e 2-second hang root cause; fixed 2026-05-13 after
+# decoding CB_COLOR0_INFO against gfx9.json's field table.
+# Cited from Mesa gfx9.json `register_types` field bit-positions.
+var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x04000028;
 
 # CB_COLOR0_ATTRIB for 2D linear RGBA8 single-sample:
 #   COLOR_SW_MODE[18:22] = 0    (linear surface, no swizzle)
