@@ -595,6 +595,40 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_RASTER_CONFIG, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
 
+    # GFX9 graphics-pipeline preamble — required to not hang the GFX
+    # ring on Cezanne and similar APUs. The rc.2 native_render_e2e
+    # 0x55-sentinel symptom was actually a ring TDR (kernel resets
+    # the ring at ~2s), masked by CB_COLOR0_ATTRIB2 being missing.
+    # Per gfx9.json + radv ac_cmdbuf.c preamble, the following must
+    # be set before any DRAW_INDEX_AUTO on GFX9:
+    #
+    #   - Guard-band adjusts (PA_CL_GB_*_ADJ = 1.0f) — without these,
+    #     the rasterizer's clip-to-guard-band step can hang on small
+    #     primitives.
+    #   - VGT vertex reuse / output dealloc — VGT deadlocks if these
+    #     are zero (CLEAR_STATE doesn't reliably clear them on
+    #     Bonaire / Cezanne / etc.).
+    #   - PA_SC_BINNER_CNTL_0 = 0 — disable primitive binning. APUs
+    #     ship with binning enabled by default; without an explicit
+    #     BINNER_CNTL_1 batch configuration the DPB pipeline hangs.
+
+    # Four contiguous guard-band adjusts in one SET_CONTEXT_REG packet.
+    var gb_adj[16];
+    store32(&gb_adj +  0, GFX9_PA_CL_GB_ADJ_ONE_F32);  # VERT_CLIP_ADJ
+    store32(&gb_adj +  4, GFX9_PA_CL_GB_ADJ_ONE_F32);  # VERT_DISC_ADJ
+    store32(&gb_adj +  8, GFX9_PA_CL_GB_ADJ_ONE_F32);  # HORZ_CLIP_ADJ
+    store32(&gb_adj + 12, GFX9_PA_CL_GB_ADJ_ONE_F32);  # HORZ_DISC_ADJ
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_CL_GB_VERT_CLIP_ADJ, 4, &gb_adj);
+
+    # PA_SC_BINNER_CNTL_0: disable HW primitive binning.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_BINNER_CNTL_0, 0);
+
+    # VGT vertex reuse + output dealloc — 2 contiguous regs at 0x028C58.
+    var vgt_reuse[8];
+    store32(&vgt_reuse + 0, GFX9_VGT_VERTEX_REUSE_BLOCK);
+    store32(&vgt_reuse + 4, GFX9_VGT_OUT_DEALLOC);
+    pos = native_pm4_set_context_reg(buf, pos, R_VGT_VERTEX_REUSE_BLOCK_CNTL, 2, &vgt_reuse);
+
     return pos;
 }
 
@@ -614,10 +648,21 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height): i6
     store32(&screen_scissor + 4, scissor_br);
     pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_SCREEN_SCISSOR_TL, 2, &screen_scissor);
 
+    # GENERIC_SCISSOR_TL bit 31 = WINDOW_OFFSET_DISABLE — radv writes
+    # this unconditionally; without it the GPU interprets the scissor
+    # as relative to a window-offset register that may be unset.
     var generic_scissor[8];
-    store32(&generic_scissor + 0, scissor_tl);
+    store32(&generic_scissor + 0, scissor_tl | 0x80000000);
     store32(&generic_scissor + 4, scissor_br);
     pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_GENERIC_SCISSOR_TL, 2, &generic_scissor);
+
+    # PA_SC_WINDOW_SCISSOR_TL/BR — must be set (radv writes these in
+    # the gfx6+ preamble path). Pin BR at the GFX9 max (16384,16384)
+    # and set WINDOW_OFFSET_DISABLE on TL.
+    var window_scissor[8];
+    store32(&window_scissor + 0, 0x80000000);                  # TL = (0,0) + WINDOW_OFFSET_DISABLE
+    store32(&window_scissor + 4, (16384) | (16384 << 16));     # BR = (16384, 16384)
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_WINDOW_SCISSOR_TL, 2, &window_scissor);
 
     # Viewport: NDC (-1..1) → pixel (0..w, 0..h) with y-flip.
     # XSCALE = w/2, XOFFSET = w/2, YSCALE = -h/2, YOFFSET = h/2.
