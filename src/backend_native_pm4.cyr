@@ -53,6 +53,7 @@ var IT_ACQUIRE_MEM      = 0x58;
 var IT_RELEASE_MEM      = 0x49;
 var IT_EVENT_WRITE      = 0x46;
 var IT_NUM_INSTANCES    = 0x2F;  # dedicated PKT3 for VGT_NUM_INSTANCES
+var IT_PFP_SYNC_ME      = 0x42;  # PFP wait for ME drain
 var IT_SET_UCONFIG_REG  = 0x79;
 
 # SH-register offsets (byte addresses in MMIO space). The SH_REG base
@@ -352,6 +353,11 @@ var GFX9_EVENT_TYPE_FLUSH_AND_INV_CB_META = 0x2E;  # gfx9.json VGT_EVENT_TYPE
 var GFX9_EVENT_TYPE_FLUSH_AND_INV_DB_META = 0x2C;  # gfx9.json VGT_EVENT_TYPE
 var GFX9_EVENT_TYPE_PS_PARTIAL_FLUSH      = 0x10;  # gfx9.json VGT_EVENT_TYPE
 var GFX9_EVENT_INDEX_PARTIAL_FLUSH        = 0x4;   # PS_PARTIAL_FLUSH uses index 4
+# PIPELINESTAT_START — radv emits this in every preamble. The GPU
+# stat-counter pipeline starts counting (and unblocking dependent
+# state machines) on receipt. Without it, Cezanne's pipeline may
+# wait on stat-counter readiness that never fires.
+var GFX9_EVENT_TYPE_PIPELINESTAT_START    = 0x19;  # gfx9.json VGT_EVENT_TYPE
 
 # event_index encodes how the kernel/CP interprets the event:
 #   0 = "other" — event_type only, no address (the EVENT_WRITE form
@@ -362,6 +368,17 @@ var GFX9_EVENT_INDEX_PARTIAL_FLUSH        = 0x4;   # PS_PARTIAL_FLUSH uses index
 #       TS-style flush is needed.
 var GFX9_EVENT_INDEX_OTHER = 0x0;
 var GFX9_EVENT_INDEX_TS    = 0x5;
+
+# PKT3_PFP_SYNC_ME — forces the PFP (Prefetch Parser) to wait for the
+# ME (Middle Engine) to drain pending work. Required between cache
+# invalidate and the first draw, otherwise the PFP can read context
+# state the ME hasn't yet committed. 2-dword packet: header + 0.
+# radv emits this between RELEASE_MEM and ACQUIRE_MEM on every draw.
+fn native_pm4_pfp_sync_me(buf, pos): i64 {
+    store32(buf + pos + 0, native_pm4_pkt3_header(IT_PFP_SYNC_ME, 1, 0));
+    store32(buf + pos + 4, 0);
+    return pos + 8;
+}
 
 # Emit a PKT3_NUM_INSTANCES packet (opcode 0x2F). Per-draw replacement
 # for SET_UCONFIG_REG(VGT_NUM_INSTANCES, n) — the AMD CP recognizes
