@@ -723,11 +723,13 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     #     BINNER_CNTL_1 batch configuration the DPB pipeline hangs.
 
     # Four contiguous guard-band adjusts in one SET_CONTEXT_REG packet.
+    # CLIP_ADJ ≈ 254.992f (NOT 1.0f); DISC_ADJ = 1.0f. See the constant
+    # definition in backend_native_shaders.cyr for the hang explanation.
     var gb_adj[16];
-    store32(&gb_adj +  0, GFX9_PA_CL_GB_ADJ_ONE_F32);  # VERT_CLIP_ADJ
-    store32(&gb_adj +  4, GFX9_PA_CL_GB_ADJ_ONE_F32);  # VERT_DISC_ADJ
-    store32(&gb_adj +  8, GFX9_PA_CL_GB_ADJ_ONE_F32);  # HORZ_CLIP_ADJ
-    store32(&gb_adj + 12, GFX9_PA_CL_GB_ADJ_ONE_F32);  # HORZ_DISC_ADJ
+    store32(&gb_adj +  0, GFX9_PA_CL_GB_CLIP_ADJ_F32);  # VERT_CLIP_ADJ
+    store32(&gb_adj +  4, GFX9_PA_CL_GB_DISC_ADJ_F32);  # VERT_DISC_ADJ
+    store32(&gb_adj +  8, GFX9_PA_CL_GB_CLIP_ADJ_F32);  # HORZ_CLIP_ADJ
+    store32(&gb_adj + 12, GFX9_PA_CL_GB_DISC_ADJ_F32);  # HORZ_DISC_ADJ
     pos = native_pm4_set_context_reg(buf, pos, R_PA_CL_GB_VERT_CLIP_ADJ, 4, &gb_adj);
 
     # PA_SC_BINNER_CNTL_0/1: explicitly disable HW primitive binning.
@@ -753,10 +755,20 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # PA_SU_VTX_CNTL: PIX_CENTER=1 (bit 0), ROUND_MODE=2 (bits 1:2 → 0b10 = trunc).
     # Value = 1 | (2 << 1) = 0x5.
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_VTX_CNTL, 0x5);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_1, 0);
+    # PA_SC_MODE_CNTL_1 = 0x760201BC — scan-converter walk-order +
+    # FORCE_EOV bits captured byte-for-byte from radv triangle reference.
+    # Decoded bits include WALK_FENCE_ENABLE, WALK_FENCE_SIZE=3,
+    # SUPERTILE_WALK_ORDER_ENABLE, FORCE_EOV_CNTDWN_ENABLE,
+    # FORCE_EOV_REZ_ENABLE, MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE.
+    # With value 0 the SC's walk-order is unconfigured → can stall on
+    # tile traversal.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_1, 0x760201BC);
     pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_TMPRING_SIZE, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_CLIPRECT_RULE, 0xFFFF);
-    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_PRIM_FILTER_CNTL, 0);
+    # PA_SU_PRIM_FILTER_CNTL = 0xC0000000 — bits 30+31 set. Captured
+    # from radv triangle reference. Likely XMAX_RIGHT_EXCLUSION +
+    # YMAX_BOTTOM_EXCLUSION (D3D vs OpenGL pixel-rule selection).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_PRIM_FILTER_CNTL, 0xC0000000);
 
     # PA_SC_VPORT_SCISSOR_0_TL/BR — per-viewport scissor (separate
     # stage from screen/window/generic). Without it the rasterizer's
@@ -799,6 +811,25 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # 0xFFFFFFFF = all samples covered (every pixel passes coverage).
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y0_X1Y0, 0xFFFFFFFF);
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y1_X1Y1, 0xFFFFFFFF);
+
+    # PA_SC_MODE_CNTL_0 = 0x22 — bits 1+5 set. Captured from radv
+    # triangle test. Without it the SC's mode is unconfigured.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_0, 0x22);
+    # VGT_GS_OUT_PRIM_TYPE = 2 (TRIANGLE_STRIP). Even when VGT_SHADER_STAGES_EN
+    # has GS_EN=0, VGT consults this for prim-output sizing. Default 0
+    # (POINTLIST) makes VGT allocate wrong-sized prim buffers.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_GS_OUT_PRIM_TYPE, 2);
+
+    # SX_MRT0..7_BLEND_OPT — 8 contiguous regs all set to 0x06000600.
+    # Without these the SX block can stall waiting on per-MRT blend-opt
+    # info that never arrives, even with only MRT0 bound.
+    var sx_mrt[32];
+    var k = 0;
+    while (k < 8) {
+        store32(&sx_mrt + k * 4, GFX9_SX_MRT_BLEND_OPT_DEFAULT);
+        k = k + 1;
+    }
+    pos = native_pm4_set_context_reg(buf, pos, R_SX_MRT0_BLEND_OPT, 8, &sx_mrt);
 
     return pos;
 }
@@ -959,6 +990,11 @@ rt_va, rt_width, rt_height): i64 {
     pos = native_pm4_event_write_pipelinestat_start(buf, pos);
     pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
     GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    # IA_MULTI_VGT_PARAM = 0x0070007f — input-assembler multi-VGT config.
+    # Captured from radv on Cezanne. Without it the IA stage can't issue
+    # primitives correctly to the VGT (default = unconfigured). Bits:
+    # PRIMGROUP_SIZE=127, PARTIAL_VS_WAVE_ON=1, SWITCH_ON_EOI=1.
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_IA_MULTI_VGT_PARAM, 0x0070007F);
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);

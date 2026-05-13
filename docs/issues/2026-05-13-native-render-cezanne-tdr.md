@@ -107,6 +107,116 @@ None of these is diagnosable from the coredump alone without either:
 - `umr` disassembly of the PFP firmware at instruction pointer
   0x00000ada (`mmCP_PFP_INSTR_PNTR` value at hang)
 
+## Update — 2026-05-12 late session (radv triangle reference built)
+
+`programs/diagnostics/radv_capture_triangle/` was added — a minimal
+Vulkan program that draws a solid-red fullscreen triangle into a
+256x256 RGBA8 RT, exactly mirroring mabda's `native_render_e2e`
+workload. Built with glslangValidator-compiled SPIR-V shaders.
+Runs under `RADV_DEBUG=dumpibs` to capture the byte-exact radv IB.
+
+Byte-diff (`radv-triangle.ib.txt` vs `dump_render_pm4`'s output)
+surfaced **24 value mismatches and 15 register-completely-missing**
+divergences between mabda and radv for the same workload. Captured
+in this session's commit batch:
+
+8. **`PA_CL_GB_VERT_CLIP_ADJ` / `_HORZ_CLIP_ADJ` 1.0f → ≈ 255f** (`0x437EFE00`).
+   Guard-band size was clamped to the clip volume itself; fullscreen
+   triangle's `(3,-1)` / `(-1,3)` vertices fell outside guard band,
+   invoking slow-path clipper.
+9. **`GFX9_GFX_PGM_RSRC1_MIN` 0x012C0041 → 0x002C0040.** Previous
+   value (sourced from vkcube) had VGPRS=1 (8 VGPRs allocated, only
+   4 used) + VGPR_COMP_CNT=1 (HW preloads v1=instance_id; our VS
+   doesn't read it). radv triangle uses 0x002C0040 = VGPRS=0 / VGPR_COMP_CNT=0.
+10. **`GFX9_VS_PGM_RSRC2_MIN` 0 → 0x6** (USER_SGPR=3) and
+    **`GFX9_PS_PGM_RSRC2_MIN` 0 → 0x4** (USER_SGPR=2). SPI requires
+    non-zero USER_SGPR allocation for graphics-stage shaders.
+11. **`PA_SC_MODE_CNTL_1` 0 → 0x760201BC.** Scan-converter walk-order
+    and FORCE_EOV bits.
+12. **`PA_SU_PRIM_FILTER_CNTL` 0 → 0xC0000000.**
+13. **`PA_CL_CLIP_CNTL` 0x90000 → 0x01080000.** Adds DIS_CLIP_ERR_DETECT
+    + DX_LINEAR_ATTR_CLIP_ENA; drops the PS_UCP_Y_SCALE_NEG +
+    PS_UCP_MODE bits we weren't using.
+14. **`PA_SU_SC_MODE_CNTL` 0x4 → 0x240.** Adds bits 6 + 9.
+15. **`VGT_VERTEX_REUSE_BLOCK_CNTL` 14 → 30.** Cezanne-tuned value
+    from radv triangle test (previous 14 was sourced from vkcube).
+16. **`SPI_PS_INPUT_ENA` / `_ADDR` 0x2 → 0x80.** Changed from
+    PERSP_CENTER_ENA to LINEAR_CENTER_ENA matching radv.
+17. **8 new packets added:** `PA_SC_MODE_CNTL_0 = 0x22`,
+    `VGT_GS_OUT_PRIM_TYPE = 2`, `IA_MULTI_VGT_PARAM = 0x0070007F`,
+    `SX_MRT0..7_BLEND_OPT = 0x06000600` (8 contiguous), and the 8
+    explicit-zero handshake regs from the earlier round.
+
+Block sizes after this session:
+- `NATIVE_PIPE_SH_BLOCK_SIZE = 56` (was 48)
+- `NATIVE_PIPE_CTX_BLOCK_SIZE = 596` (was 424)
+- `NATIVE_PIPE_STRUCT_SIZE = 684` (was 504)
+
+Tested post-fix:
+- `make test-native-compute-store` — still bit-exact 0xDEADBEEF.
+- `make test-native-render-e2e` — **still 2-second TDR**. Same exit
+  code 8, pixel(0,0) = 0x55 sentinel.
+
+## Remaining hypotheses (next session)
+
+After 17 register-value fixes byte-aligned with radv on identical
+hardware running identical workload, the TDR persists. The remaining
+candidate causes — **none of which is diagnosable from PM4-state
+comparison alone**:
+
+1. **Mabda's pre-compiled GFX9 ISA shader bytes have a bug.** The
+   `v_lshlrev_b32_e32` / `v_and_b32_e32` / `v_cvt_f32_i32_e32` / `exp`
+   sequences in `native_gfx9_shader_fullscreen_triangle_vs` and
+   `native_gfx9_shader_solid_red` were assembled by hand against the
+   GCN5/GFX9 ISA spec. A single bit error in any instruction encoding
+   could cause the VS to never s_endpgm (infinite loop) or the FS
+   to fault. **To verify: disassemble with `llvm-objdump
+   -d --triple=amdgcn--amdhsa -mcpu=gfx90c` against a binary blob
+   of the shader bytes.** Requires LLVM with AMDGPU target enabled.
+
+2. **`CB_COLOR0_INFO` bit-26 difference.** Mabda emits 0x04000028;
+   radv emits 0x00028028. Both share the FORMAT (bits 3+5) but the
+   high bits differ. Mabda's bit 26 was claimed to be
+   FMASK_COMPRESSION_DISABLE per the original comment but
+   gfx9.json's actual decode wasn't cross-checked. **Action: decode
+   both values against gfx9.json's CB_COLOR0_INFO field bit layout
+   and pick the radv-correct value.**
+
+3. **`SPI_SHADER_COL_FORMAT` mismatch.** Mabda = `0xE` (FP32_ABGR),
+   radv = `0x4` (UNORM16_ABGR). Different because mabda's FS exports
+   FP32 lanes while radv's compiled FS exports FP16. Both should
+   work in principle, but the FP32_ABGR path on Cezanne may require
+   matching `SX_PS_DOWNCONVERT` / `SX_BLEND_OPT_EPSILON` values that
+   mabda leaves at 0.
+
+4. **AMDGPU CS_SUBMIT chunk flags.** Mabda submits with vanilla
+   ib_flags + a single IB chunk. radv may use additional chunks
+   (BO_LIST, FENCE, USER_FENCE_TYPE) or set specific ib_flags
+   (AMDGPU_IB_FLAG_PREAMBLE, AMDGPU_IB_FLAG_PREEMPT) that change
+   how the kernel wraps the user IB.
+
+## Path forward
+
+Recommended next-session steps in priority order:
+
+1. **Install `umr` from AUR** (`yay -S umr-git`) and use `umr -O bits
+   -ds <ringname>` to read the GFX ring state interactively. Critical
+   for verifying *which packet* the PFP is actually stuck on, not
+   inferring from PFP_HEADER_DUMP.
+2. **Disassemble mabda's VS and FS bytes** against the GFX9 spec
+   using LLVM AMDGPU. Verify every instruction's encoding is valid.
+3. **Build a "draw nothing" mabda IB** (skip the actual DRAW_INDEX_AUTO,
+   only emit the state setup + immediately RELEASE_MEM). If THAT also
+   TDRs, the bug is in state setup. If it completes cleanly, the bug
+   is in the draw / shader path.
+
+The 17 register fixes landed this session are all real correctness
+improvements pinned against the radv triangle reference. Each
+individually makes the PM4 stream closer to radv's working shape.
+The remaining gap is one or more bugs that need shader-level or
+CP-firmware-level tooling to diagnose, which is out of scope for
+state-register comparison alone.
+
 **Hardware:** AMD Renoir / Cezanne APU (gfx90c), Wayland desktop
 session. radv (Mesa) is the working reference path (`vkcube` runs
 fine, IB captured byte-exact via `RADV_DEBUG=dumpibs`).

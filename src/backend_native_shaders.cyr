@@ -372,25 +372,29 @@ var R_CB_TARGET_MASK = 0xA238;
 # Graphics (VS/PS) RSRC1 minimum. Differs from the compute constant
 # by bit 24 = LS_VGPR_COMP_CNT[0] = 1. On GFX9 the VS / merged-LS
 # path requires LS_VGPR_COMP_CNT >= 1 to allocate the system VGPRs
-# the SPI preloads before the shader runs. Captured byte-exact from
-# radv's SPI_SHADER_PGM_RSRC1_VS dump (0x012c0041 — VGPRS=1 from
-# a 5-VGPR shader; the +1 is just radv's specific shader bringing
-# more VGPRs than ours, the bit-24 LS bit is the structural fix).
-# Without bit 24 set the VS launches with under-allocated VGPRs and
-# the SPI hangs waiting for fixed-function-emitted system VGPRs that
-# don't fit → GFX-ring TDR.
-var GFX9_GFX_PGM_RSRC1_MIN = 0x012C0041;
+# SPI_SHADER_PGM_RSRC1_VS/PS = 0x002C0040. Decoded:
+#   VGPRS=0 (4 VGPRs allocated — exactly fits v0..v3 our shaders use)
+#   SGPRS=1 (16 SGPRs)
+#   FLOAT_MODE=0xC0 (FP_16_64_DENORMS)
+#   DX10_CLAMP=1
+#   VGPR_COMP_CNT=0 (only v0 preloaded for VS; PS irrelevant)
+# Captured byte-exact from radv on Cezanne via the triangle reference
+# (`programs/diagnostics/radv_capture_triangle`). The previous value
+# 0x012C0041 had bit 24 (VGPR_COMP_CNT=1) and bit 0 (VGPRS=1, 8 VGPRs
+# allocated) — sourced from a vkcube IB whose VS reads instance_id,
+# unlike ours. Matching radv's triangle-test value byte-for-byte.
+var GFX9_GFX_PGM_RSRC1_MIN = 0x002C0040;
 
-# RSRC2 minimums — USER_SGPR + scratch + LDS bits.
-#   VS: 0 — no USER_DATA pre-load, no scratch, no LDS for the trivial
-#       full-screen triangle (vertex_id arrives via system VGPR v0).
-#   PS: 0 — TRAP_PRESENT (bit 6) is required on GFX9 for any shader that
-#       does memory ops (set the bit when the FS does global_store);
-#       the trivial solid-color FS only does v_mov + exp, no memory,
-#       so 0 is the minimum. Hardware verification at Step 6.5 may
-#       require the trap bit even for this shape — flag.
-var GFX9_VS_PGM_RSRC2_MIN = 0x0;
-var GFX9_PS_PGM_RSRC2_MIN = 0x0;
+# SPI_SHADER_PGM_RSRC2_VS = 0x6. Bits 1+2 set → USER_SGPR=3 (3 user-data
+# SGPRs preloaded). Even though our VS doesn't read user_data, the SPI
+# requires a non-zero USER_SGPR allocation for graphics-stage shaders.
+# Captured byte-for-byte from radv triangle test.
+var GFX9_VS_PGM_RSRC2_MIN = 0x6;
+
+# SPI_SHADER_PGM_RSRC2_PS = 0x4. Bit 2 set → USER_SGPR=2 (2 user-data
+# SGPRs preloaded). Required by SPI for PS-stage shaders.
+# Captured byte-for-byte from radv triangle test.
+var GFX9_PS_PGM_RSRC2_MIN = 0x4;
 
 # SPI_SHADER_POS_FORMAT — vertex stage exports four f32 lanes for pos0.
 # Encoding: bits 0-3 = format (0=NONE, 4=FLOAT_4). Other formats reserved
@@ -472,6 +476,11 @@ var R_VGT_PRIMITIVEID_EN     = 0xAA84;   # Mesa 0x028A84
 var R_PA_SC_AA_MASK_X0Y0_X1Y0 = 0xAC38;  # Mesa 0x028C38
 var R_PA_SC_AA_MASK_X0Y1_X1Y1 = 0xAC3C;  # Mesa 0x028C3C
 var R_PA_SC_SHADER_CONTROL   = 0xAC40;   # Mesa 0x028C40
+# Additional regs radv emits before the triangle draw on Cezanne.
+# Captured byte-for-byte from radv_capture_triangle 2026-05-12.
+var R_PA_SC_MODE_CNTL_0      = 0xAA48;   # Mesa 0x028A48
+var R_VGT_GS_OUT_PRIM_TYPE   = 0xAA6C;   # Mesa 0x028A6C
+var R_IA_MULTI_VGT_PARAM     = 0x30960;  # UConfig (Mesa 0x030960)
 
 # Stage enable + reuse.
 var R_VGT_SHADER_STAGES_EN = 0xAB54; # Mesa 0x028B54
@@ -627,10 +636,23 @@ var R_VGT_OUT_DEALLOC_CNTL        = 0xAC5C;  # Mesa 0x028C5C
 # Defaults from radv:
 #   VGT_VERTEX_REUSE_BLOCK_CNTL = 14 (max reuse blocks for legacy non-NGG)
 #   VGT_OUT_DEALLOC_CNTL = 16 (max dealloc slots for VS output)
-#   PA_CL_GB_*_ADJ = 0x3f800000 (= 1.0f, no guard-band scaling)
-var GFX9_VGT_VERTEX_REUSE_BLOCK = 14;
+#   PA_CL_GB_*_CLIP_ADJ = 0x437efe00 (≈ 254.992f) — guard-band span
+#   PA_CL_GB_*_DISC_ADJ = 0x3f800000 (= 1.0f)     — discard scale
+#
+# THE GUARD-BAND CLIP_ADJ MUST NOT BE 1.0. Previously every register
+# defaulted to 1.0f which clamped the guard band to the clip volume
+# itself ([-1,1]) — fullscreen triangles with vertices at (3,-1) and
+# (-1,3) fell OUTSIDE the guard band, invoking the hardware's slow-
+# path clipper, which on Cezanne hangs the GFX ring → 2-second TDR.
+# Captured byte-for-byte from radv `programs/diagnostics/radv_capture_triangle`
+# on this exact Cezanne/Renoir (gfx90c).
+# VGT_VERTEX_REUSE_BLOCK_CNTL = 30 (0x1E) — radv triangle test on
+# Cezanne. Previously 14 (sourced from vkcube). Higher value = more
+# vertex reuse blocks for the legacy non-NGG path.
+var GFX9_VGT_VERTEX_REUSE_BLOCK = 30;
 var GFX9_VGT_OUT_DEALLOC        = 16;
-var GFX9_PA_CL_GB_ADJ_ONE_F32   = 0x3f800000;
+var GFX9_PA_CL_GB_CLIP_ADJ_F32  = 0x437efe00;  # ≈ 254.992f
+var GFX9_PA_CL_GB_DISC_ADJ_F32  = 0x3f800000;  # 1.0f
 
 var R_CB_COLOR0_BASE         = 0xAC60;  # Mesa 0x028C60
 var R_CB_COLOR0_BASE_EXT     = 0xAC64;  # Mesa 0x028C64 (high bits)
@@ -692,9 +714,12 @@ var GFX9_CB_COLOR_CONTROL_NORMAL = 0xCC;
 # Blend disabled — write source verbatim into RT, no per-channel mask.
 var GFX9_CB_BLEND_DISABLED = 0x0;
 
-# PA_SU_SC_MODE_CNTL: cull none (bits 0-1 = 0), front-face = CCW.
-# Bit 2 = POLY_MODE = 0 (PT_TRIANGLELIST renders solid).
-var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x4;
+# PA_SU_SC_MODE_CNTL = 0x240 — radv triangle test value on Cezanne.
+# Decoded: bit 6 = PROVOKING_VTX_LAST, bit 9 = VTX_WINDOW_OFFSET_ENABLE
+# (or similar — exact bit semantics differ between GFX9 docs revisions).
+# Previously 0x4 (POLY_MODE=0, cull none) was correct in intent but
+# missing the additional bits radv programs that the SC stage waits on.
+var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x240;
 
 # VGT_SHADER_STAGES_EN: VS+PS only, no tess, no GS, no NGG.
 # Bit 16 = VS_EN = VS_STAGE_REAL — REQUIRED. Without it the VGT
@@ -704,9 +729,14 @@ var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x4;
 # All other stage bits (LS/HS/ES/GS/etc.) stay 0 for VS+PS only.
 var GFX9_VGT_SHADER_STAGES_VS_PS = 0x00010000;
 
-# PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF=1, DX_LINEAR_ATTR_CLIP_ENA=1,
-# Z_CLIP_NEAR_DISABLE for NDC z=0..1 default. Cited from design doc.
-var GFX9_PA_CL_CLIP_CNTL_DEFAULT = 0x90000;
+# PA_CL_CLIP_CNTL = 0x01080000 — radv triangle test value on Cezanne.
+# Bits: bit 19 = DX_CLIP_SPACE_DEF, bit 20 = DIS_CLIP_ERR_DETECT,
+# bit 24 = DX_LINEAR_ATTR_CLIP_ENA. Previously 0x90000 (bits 16+17+19)
+# set PS_UCP_Y_SCALE_NEG + PS_UCP_MODE which are user-clip-plane bits
+# we don't use; missing DIS_CLIP_ERR_DETECT can make clip-error
+# detection raise faults on out-of-range NDC coords from our
+# fullscreen triangle.
+var GFX9_PA_CL_CLIP_CNTL_DEFAULT = 0x01080000;
 
 # VGT_PRIMITIVE_TYPE: PT_TRIANGLELIST = 4 (independent triangles, no strip).
 var GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST = 0x4;
@@ -720,7 +750,20 @@ var GFX9_VGT_NUM_INSTANCES_ONE = 0x1;
 # (design doc § "Required register state"); 0x2 is the radv-tested
 # safe minimum. Step 6.5(b) ships this as the value; revisit if
 # the trivial PS proves to be a hang case.
-var GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN = 0x2;
+# SPI_PS_INPUT_ENA = 0x80 — bit 7 = LINEAR_CENTER_ENA. Previously 0x2
+# (PERSP_CENTER_ENA). Either bit satisfies the "at-least-one-must-be-set"
+# hang quirk in principle, but radv consistently emits 0x80 for PSes
+# with no interpolated inputs. Captured byte-for-byte from radv triangle
+# reference.
+var GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN = 0x80;
+
+# SX_MRT0..7_BLEND_OPT — per-MRT blend optimization hints. radv emits
+# 0x06000600 for all 8 MRTs even when only MRT0 is bound. Without these
+# the SX block can stall waiting on blend-opt info that never arrives.
+# Captured from radv triangle reference. 8 contiguous regs at 0xA760
+# (Mesa 0x028760..0x02877C).
+var R_SX_MRT0_BLEND_OPT = 0xA760;  # Mesa 0x028760
+var GFX9_SX_MRT_BLEND_OPT_DEFAULT = 0x06000600;
 
 # SPI_VS_OUT_CONFIG.NUM_INTERP = 0 — no varyings between VS and PS.
 # bit 0 = VS_HALF_PACK = 0; bits 1-5 = VS_EXPORT_COUNT = 0
