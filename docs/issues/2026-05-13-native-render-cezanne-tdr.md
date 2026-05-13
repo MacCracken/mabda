@@ -1,11 +1,142 @@
 # 2026-05-13 — native render GFX-ring TDR on Cezanne (gfx90c)
 
-**Status:** OPEN. 35+ register-level correctness fixes landed; the
-underlying 2-second GFX-ring TDR persists. Compute path on the same
-hardware is unaffected (6h soak passed 2026-05-12, 15.66M iterations
-flat RSS; re-verified post-render-fixes 2026-05-12 evening — compute
-still bit-exact 0xDEADBEEF). Filing for v3.0.x patch-stream resolution
-after rc.3 cut.
+**Status: RESOLVED 2026-05-13.** `make test-native-render-e2e` passes
+end-to-end with pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF) at dispatch=0ms.
+Compute path remains bit-exact at 0xDEADBEEF. Texture path passes.
+Two root-cause bugs identified and fixed; 17 supporting register-level
+correctness improvements also landed in the same session.
+
+## Root cause — two distinct bugs
+
+### Bug 1: EXP instruction encoding (TDR cause)
+
+Mabda's hand-encoded GFX9 ISA `exp` instructions in
+`native_gfx9_shader_fullscreen_triangle_vs` and
+`native_gfx9_shader_solid_red` used **top byte `0xF8` (bits 31-26 = 0x3E)**.
+The source comment claimed this was the GFX9 EXP opcode but it isn't —
+on GFX9 the EXP instruction encoding has **bits 31-26 = `0x31`
+(binary 110001)**, giving **top byte `0xC4`**.
+
+| Shader | Position | Mabda emitted | Correct (verified) |
+|--------|----------|---------------|--------------------|
+| VS `exp pos0`        | `+40` | `0xF80008CF` | `0xC40008CF` |
+| FS `exp mrt0 vm`     | `+16` | `0xF800180F` | `0xC400180F` |
+
+Verification: `llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c` on
+the byte stream produced `warning: invalid instruction encoding` for
+the `0xF8` variant; `0xC4` decoded as `exp pos0 v0,v1,v2,v3 done` and
+`exp mrt0 v0,v1,v2,v3 done vm` respectively. Captured in
+`scripts/disasm-shaders.sh` for regression coverage.
+
+Symptom: VS waves executed all v_mov/v_cvt instructions fine, then
+hit the malformed `exp`, silently failed to publish a vertex position,
+and the VGT stage waited forever for vertex output → 2-second
+GFX-ring TDR. The FS had the same problem one stage downstream.
+
+### Bug 2: SPI_SHADER_COL_FORMAT field value (zero-pixel cause)
+
+After the EXP fix, the GFX ring stopped hanging (dispatch=0ms) but
+the RT contained `(0x00, 0x00, 0x00, 0x00)` instead of the FS's
+exported `(1.0, 0.0, 0.0, 1.0)` UNORM8 conversion `(0xFF, 0x00, 0x00, 0xFF)`.
+
+Root cause: `SPI_SHADER_COL_FORMAT_FP32_ABGR = 0xE` in
+`src/backend_native_shaders.cyr`. **`0xE` is a reserved/undocumented
+value in the GFX9 SPI_SHADER_COL_FORMAT field.** The SX silently
+routes reserved values to `SPI_SHADER_ZERO` (no output), so the FS's
+exported color never reached the CB; the CB wrote the zero
+representation of "no output" to the RT.
+
+Correct GFX9 4-bit field values:
+
+```
+0 SPI_SHADER_ZERO
+1 SPI_SHADER_32_R
+2 SPI_SHADER_32_GR
+3 SPI_SHADER_32_AR
+4 SPI_SHADER_FP16_ABGR
+5 SPI_SHADER_UNORM16_ABGR
+6 SPI_SHADER_SNORM16_ABGR
+7 SPI_SHADER_UINT16_ABGR
+8 SPI_SHADER_SINT16_ABGR
+9 SPI_SHADER_32_ABGR    (FP32 export — what mabda wanted)
+```
+
+All three mabda constants were off:
+
+| Constant | Mabda emitted | Correct |
+|----------|---------------|---------|
+| `SPI_SHADER_COL_FORMAT_FP16_ABGR`    | `0x9` | `0x4` |
+| `SPI_SHADER_COL_FORMAT_UNORM16_ABGR` | `0xA` | `0x5` |
+| `SPI_SHADER_COL_FORMAT_FP32_ABGR`    | `0xE` | `0x9` |
+
+## Earlier 27-fixes audit (status)
+
+The 27 "fixes" in the original rc.2 punchlist (and the 17 added in
+this session before the EXP/COL_FORMAT discoveries) were all real
+correctness improvements — they made mabda's PM4 stream genuinely
+closer to radv's working byte sequence. None of them ALONE caused
+the hang; both root causes were below the PM4 layer (shader byte
+encoding + SPI field value). The 17-fix batch this session ALL
+remain landed:
+
+- `VGT_SHADER_STAGES_EN = 0x00010000` (was 0 = VS_OFF — real bug)
+- `SPI_SHADER_PGM_RSRC3_VS = 0x003FFFFE` (CU enable mask)
+- `SPI_SHADER_LATE_ALLOC_VS = 24`
+- `GFX9_GFX_PGM_RSRC1_MIN = 0x002C0040` (was 0x012C0041)
+- `RSRC2_VS = 0x6`, `RSRC2_PS = 0x4`
+- `PA_CL_GB_*_CLIP_ADJ = ~255f` (was 1.0, slow-path clipper)
+- `VGT_VERTEX_REUSE_BLOCK_CNTL = 30`
+- `IA_MULTI_VGT_PARAM = 0x0070007F`
+- `PA_SC_MODE_CNTL_0 = 0x22`, `VGT_GS_OUT_PRIM_TYPE = 2`
+- `PA_SC_MODE_CNTL_1 = 0x760201BC`, `PA_SU_PRIM_FILTER_CNTL = 0xC0000000`
+- 8 explicit-zero handshake regs (PA_SC_AA_MASK_*, SPI_BARYC_CNTL, etc.)
+- `PFP_SYNC_ME` + `PIPELINESTAT_START` + `PKT3 NUM_INSTANCES` actually emitted
+- `PA_CL_VS_OUT_CNTL = 0`
+
+Block sizes after this session:
+- `NATIVE_PIPE_SH_BLOCK_SIZE = 56` (was 48)
+- `NATIVE_PIPE_FIELD_CTX_BLOCK = 88` (was 80)
+- `NATIVE_PIPE_CTX_BLOCK_SIZE = 556` (was 424)
+- `NATIVE_PIPE_STRUCT_SIZE = 644` (was 504)
+
+## Verification
+
+```
+$ make test-native-render-e2e
+...
+pixel(0,0) = (0x000000FF, 0x00000000, 0x00000000, 0x000000FF)
+PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)
+OK — native render path live (Phase C render done)
+
+$ make test-native-compute-store
+... output[0] = 0xDEADBEEF (want 0xDEADBEEF) ...
+OK — GPU wrote 0xDEADBEEF via pure-Cyrius dispatch
+
+$ make test-native-texture-e2e
+verify OK: 8192 bytes match byte-exact
+OK — texture round-trip via Backend abstraction works on native
+
+$ ./scripts/disasm-shaders.sh   # post-fix verification
+=== VS (fullscreen_triangle_vs, 116 bytes) ===   # no "invalid encoding" warnings
+=== FS (solid_red, 92 bytes) ===                  # no "invalid encoding" warnings
+```
+
+## Tooling added this session
+
+- `programs/diagnostics/radv_capture_triangle/` — minimal Vulkan
+  program drawing a solid-red fullscreen triangle into a 256x256
+  RGBA8 RT, mirroring `programs/native_render_e2e` exactly. Used
+  with `RADV_DEBUG=dumpibs` to capture radv's byte-exact IB for
+  this workload (previously vkcube was used and was the wrong
+  scope). Drove the 17-fix register-value alignment work.
+- `scripts/capture-tdr.sh` — wraps `make test-native-render-e2e`
+  with a sudo-cat of `/sys/class/drm/card1/device/devcoredump/data`
+  to `/tmp/render-tdr.txt`. Used to pull the kernel's at-TDR
+  register dump that surfaced PFP_INSTR_PNTR + gfxhub fault.
+- `scripts/disasm-shaders.sh` — pipes the inline hex dwords of
+  mabda's hand-encoded GFX9 ISA shaders through
+  `llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c` for
+  regression coverage. Surfaced Bug 1 immediately.
 
 ## Update — 2026-05-12 evening session (root-cause analysis round 2)
 

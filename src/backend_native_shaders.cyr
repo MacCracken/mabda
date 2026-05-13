@@ -191,7 +191,18 @@ fn native_gfx9_shader_solid_red(buf, pos): i64 {
     store32(buf + pos +  4, 0x7E020280);   # v_mov_b32_e32 v1, 0.0
     store32(buf + pos +  8, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
     store32(buf + pos + 12, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
-    store32(buf + pos + 16, 0xF800180F);   # exp mrt0 done vm (word 0)
+    # exp mrt0 v0,v1,v2,v3 done vm — word 0 = 0xC400180F (NOT 0xF800180F).
+    # Top byte is 0xC4 (bits 31-26 = 110001 = EXP opcode class), not 0xF8.
+    # The 0xF8 in the prior code came from a wrong reading of the GFX9
+    # ISA spec — bits 31-26 = 0x3E gives 0xF8 but that's not the EXP
+    # opcode on GFX9. Verified via `llvm-mc --disassemble --arch=amdgcn
+    # --mcpu=gfx90c` on the byte sequence: 0xC4 decodes to a valid
+    # EXP encoding; 0xF8 decodes as "invalid instruction encoding".
+    # The VS/FS waves executed the v_mov/v_cvt fine then hit the
+    # malformed exp, silently failed to publish position/color, and
+    # the VGT hung waiting for output → 2-second GFX TDR. THIS was
+    # the rc.2 native_render_e2e root cause.
+    store32(buf + pos + 16, 0xC400180F);   # exp mrt0 done vm (word 0)
     store32(buf + pos + 20, 0x03020100);   # exp word 1 (v0..v3)
     store32(buf + pos + 24, 0xBF810000);   # s_endpgm
     var i = 0;
@@ -283,7 +294,12 @@ fn native_gfx9_shader_fullscreen_triangle_vs(buf, pos): i64 {
     store32(buf + pos + 28, 0x7E020B02);   # v_cvt_f32_i32_e32 v1, v2
     store32(buf + pos + 32, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
     store32(buf + pos + 36, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
-    store32(buf + pos + 40, 0xF80008CF);   # exp pos0 done (word 0)
+    # exp pos0 v0,v1,v2,v3 done — word 0 = 0xC40008CF (NOT 0xF80008CF).
+    # Same encoding fix as the FS — top byte is 0xC4 (EXP opcode class
+    # on GFX9), not 0xF8. See the comment in native_gfx9_shader_solid_red
+    # for the full root-cause writeup. Verified by `llvm-mc --disassemble
+    # --arch=amdgcn --mcpu=gfx90c` on the corrected encoding.
+    store32(buf + pos + 40, 0xC40008CF);   # exp pos0 done (word 0)
     store32(buf + pos + 44, 0x03020100);   # exp word 1 (v0..v3)
     store32(buf + pos + 48, 0xBF810000);   # s_endpgm
     var i = 0;
@@ -411,9 +427,25 @@ var SPI_SHADER_Z_FORMAT_INVALID = 0x0;
 # the unorm conversion). FP16_ABGR / UNORM16_ABGR are listed for
 # Step 6.5 fallback if FP32_ABGR misbehaves on Cezanne — verification
 # is "render a known color, CPU-readback the RT, compare bytes."
-var SPI_SHADER_COL_FORMAT_FP16_ABGR    = 0x9;
-var SPI_SHADER_COL_FORMAT_UNORM16_ABGR = 0xA;
-var SPI_SHADER_COL_FORMAT_FP32_ABGR    = 0xE;
+# SPI_SHADER_COL_FORMAT per-MRT 4-bit field values (GFX9 ISA spec):
+#   0 SPI_SHADER_ZERO        (no output)
+#   1 SPI_SHADER_32_R
+#   2 SPI_SHADER_32_GR
+#   3 SPI_SHADER_32_AR
+#   4 SPI_SHADER_FP16_ABGR
+#   5 SPI_SHADER_UNORM16_ABGR
+#   6 SPI_SHADER_SNORM16_ABGR
+#   7 SPI_SHADER_UINT16_ABGR
+#   8 SPI_SHADER_SINT16_ABGR
+#   9 SPI_SHADER_32_ABGR     (FP32 export)
+# Previous constants (0x9 / 0xA / 0xE) were OFF by a whole field —
+# 0xE is reserved/undocumented; the SX silently routes it to ZERO,
+# making the FS's exported color disappear and the CB write zeros to
+# the RT. THIS was the post-EXP-fix "draw completes but pixel = 0"
+# root cause. 2026-05-13.
+var SPI_SHADER_COL_FORMAT_FP16_ABGR    = 0x4;
+var SPI_SHADER_COL_FORMAT_UNORM16_ABGR = 0x5;
+var SPI_SHADER_COL_FORMAT_FP32_ABGR    = 0x9;
 
 # Vertex count for a single full-screen triangle. The VS pulls
 # positions from a 3-entry switch on vertex_id (built into the
@@ -714,12 +746,12 @@ var GFX9_CB_COLOR_CONTROL_NORMAL = 0xCC;
 # Blend disabled — write source verbatim into RT, no per-channel mask.
 var GFX9_CB_BLEND_DISABLED = 0x0;
 
-# PA_SU_SC_MODE_CNTL = 0x240 — radv triangle test value on Cezanne.
-# Decoded: bit 6 = PROVOKING_VTX_LAST, bit 9 = VTX_WINDOW_OFFSET_ENABLE
-# (or similar — exact bit semantics differ between GFX9 docs revisions).
-# Previously 0x4 (POLY_MODE=0, cull none) was correct in intent but
-# missing the additional bits radv programs that the SC stage waits on.
-var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x240;
+# PA_SU_SC_MODE_CNTL = 0x4 — cull none, POLY_MODE=disabled (filled
+# triangles). radv emits 0x240 for the same intent but with extra
+# bits 6+9 set (PROVOKING_VTX_LAST + VTX_WINDOW_OFFSET_ENABLE or
+# similar). 0x4 worked for the no-hang verification; 0x240 produced
+# black pixels (the extra bits may toggle attribute routing).
+var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x4;
 
 # VGT_SHADER_STAGES_EN: VS+PS only, no tess, no GS, no NGG.
 # Bit 16 = VS_EN = VS_STAGE_REAL — REQUIRED. Without it the VGT
@@ -729,14 +761,11 @@ var GFX9_PA_SU_SC_MODE_CULL_NONE = 0x240;
 # All other stage bits (LS/HS/ES/GS/etc.) stay 0 for VS+PS only.
 var GFX9_VGT_SHADER_STAGES_VS_PS = 0x00010000;
 
-# PA_CL_CLIP_CNTL = 0x01080000 — radv triangle test value on Cezanne.
-# Bits: bit 19 = DX_CLIP_SPACE_DEF, bit 20 = DIS_CLIP_ERR_DETECT,
-# bit 24 = DX_LINEAR_ATTR_CLIP_ENA. Previously 0x90000 (bits 16+17+19)
-# set PS_UCP_Y_SCALE_NEG + PS_UCP_MODE which are user-clip-plane bits
-# we don't use; missing DIS_CLIP_ERR_DETECT can make clip-error
-# detection raise faults on out-of-range NDC coords from our
-# fullscreen triangle.
-var GFX9_PA_CL_CLIP_CNTL_DEFAULT = 0x01080000;
+# PA_CL_CLIP_CNTL = 0x90000 — DX_CLIP_SPACE_DEF=1 + lower clip bits.
+# radv emits 0x01080000 (DX_CLIP_SPACE_DEF + DX_LINEAR_ATTR_CLIP_ENA).
+# 0x90000 was mabda's original. The radv value also passed the no-hang
+# test but produced black pixels.
+var GFX9_PA_CL_CLIP_CNTL_DEFAULT = 0x90000;
 
 # VGT_PRIMITIVE_TYPE: PT_TRIANGLELIST = 4 (independent triangles, no strip).
 var GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST = 0x4;
@@ -750,12 +779,12 @@ var GFX9_VGT_NUM_INSTANCES_ONE = 0x1;
 # (design doc § "Required register state"); 0x2 is the radv-tested
 # safe minimum. Step 6.5(b) ships this as the value; revisit if
 # the trivial PS proves to be a hang case.
-# SPI_PS_INPUT_ENA = 0x80 — bit 7 = LINEAR_CENTER_ENA. Previously 0x2
-# (PERSP_CENTER_ENA). Either bit satisfies the "at-least-one-must-be-set"
-# hang quirk in principle, but radv consistently emits 0x80 for PSes
-# with no interpolated inputs. Captured byte-for-byte from radv triangle
-# reference.
-var GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN = 0x80;
+# SPI_PS_INPUT_ENA = 0x2 — bit 1 = PERSP_CENTER_ENA. Either PERSP_CENTER
+# (0x2) or LINEAR_CENTER (0x80) satisfies the "at-least-one-must-be-set"
+# hang quirk. PERSP_CENTER works on Cezanne (verified post-EXP-fix);
+# LINEAR_CENTER also passed the no-hang test but produced black pixels
+# (the SX may need extra companion bits when using linear interp).
+var GFX9_SPI_PS_INPUT_HANG_QUIRK_MIN = 0x2;
 
 # SX_MRT0..7_BLEND_OPT — per-MRT blend optimization hints. radv emits
 # 0x06000600 for all 8 MRTs even when only MRT0 is bound. Without these
@@ -791,14 +820,15 @@ var GFX9_CB_COLOR_CONTROL_NORMAL_COPY = 0xCC0010;
 #   COMP_SWAP[11:12]          = SWAP_STD (0)              = 0
 #   FMASK_COMPRESSION_DISABLE[26] = 1                     = 0x04000000
 #   DCC_ENABLE[28]            = 0
-#
-# Bit 26 is CRITICAL on GFX9. Without it set the CB attempts to
-# fetch FMASK metadata from CB_COLOR0_FMASK (which we set to 0 since
-# there's no FMASK BO) → VM fault → GFX-ring TDR. This was the rc.2
-# native_render_e2e 2-second hang root cause; fixed 2026-05-13 after
-# decoding CB_COLOR0_INFO against gfx9.json's field table.
-# Cited from Mesa gfx9.json `register_types` field bit-positions.
-var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x04000028;
+# Captured from radv triangle reference (`programs/diagnostics/radv_capture_triangle`)
+# on this exact Cezanne — radv emits 0x00028028 for an RGBA8_UNORM RT.
+# Bits 3+5 = FORMAT_LO = COLOR_8_8_8_8. Bits 15+17 = unidentified
+# (likely NUMBER_TYPE_HI + COMP_SWAP_HI) that route the FS's RGBA
+# export lanes correctly to the CB's storage layout. Mabda's previous
+# value 0x04000028 (bit 26 instead of 15+17) had the right FORMAT but
+# missing channel-routing bits — the CB wrote zeros instead of the FS's
+# exported color even after the TDR was fixed.
+var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x00028028;
 
 # CB_COLOR0_ATTRIB for 2D linear RGBA8 single-sample:
 #   COLOR_SW_MODE[18:22] = 0    (linear surface, no swizzle)
