@@ -1,24 +1,50 @@
 #!/usr/bin/env bash
 # Soak runner for mabda 3.0.0-rc.x burn-in.
 #
-# Loops a workload program continuously, sampling health at an
-# exponentially-spaced schedule of checkpoints that backs off to
-# "natural breaks" — 1 minute, 1 hour, then the rc.3 stop at 6 hours.
-# Extend the stop to 24h for rc.4 GA-gate runs, or 72h for the
-# post-GA observation window (see docs/development/3-0-rc-{3,4}-punchlist.md).
+# Loops one or more workload programs continuously and samples
+# health at checkpoints — exponential early ramp (catches infant
+# mortality), 15-min cadence through the rc.4 24h window
+# (~96 samples/24h per the rc.4 punchlist target), coarser past
+# 24h up to the 3-day observation horizon.
 #
-# Default workload: programs/native_compute_store — AMD-only but
-# needs no DRM master, runs cleanly from any desktop terminal.
+# Aligned with docs/development/3-0-rc-3-punchlist.md (6h gate)
+# and docs/development/3-0-rc-4-punchlist.md (24h GA gate, 72h
+# observation window).
 #
-# Failure policy: stop immediately on non-zero exit, readback
-# divergence, or a new amdgpu/drm dmesg line. Captures the last
-# iteration's stdout/stderr + a dmesg tail for triage.
+# Workloads (singletons):
+#   compute   programs/native_compute_store      AMD render-node, no master
+#   render    programs/native_render_e2e         AMD render-node, no master
+#   texture   programs/native_texture_e2e        AMD render-node, no master
+#   wgpu      programs/render_graph_e2e          wgpu (Vulkan), no master
+#   present   programs/native_present_e2e        AMD card-fd, NEEDS DRM master
+#
+# Workloads (bundles, run in parallel):
+#   both      compute + wgpu                     legacy alias (pre-rc.3)
+#   native    compute + render + texture         all AMD paths sans master
+#   all       compute + wgpu + render            rc.3/rc.4 primary post-bug-squash
+#
+# Default workload: compute — AMD-only but needs no DRM master,
+# runs cleanly from any desktop terminal.
+#
+# The `present` workload requires DRM master, which on a logind-
+# managed session is held by the active compositor and not freely
+# takable even with sudo (see project_phase_d_master_logind_blocker).
+# Run from a clean tty / kiosk session, or via a samvada-wired
+# consumer that holds master.
+#
+# Failure policy: stop immediately on non-zero exit (each program
+# self-asserts its readback / pixel / frame-count invariants and
+# returns non-zero on mismatch), or a new amdgpu/drm dmesg line.
+# Captures the last iteration's stdout/stderr + a dmesg tail
+# for triage.
 #
 # Usage:
-#   scripts/soak.sh                       # default: native_compute_store, stop at 6h
-#   scripts/soak.sh --workload=wgpu       # render_graph_e2e instead
-#   scripts/soak.sh --workload=both       # both in parallel
-#   scripts/soak.sh --stop=24h            # rc.4 24h gate
+#   scripts/soak.sh                       # default: compute, stop at 6h (rc.3)
+#   scripts/soak.sh --workload=render     # the previously TDR'd path
+#   scripts/soak.sh --workload=all        # compute + wgpu + render in parallel
+#   scripts/soak.sh --workload=native     # all AMD paths (compute+render+texture)
+#   scripts/soak.sh --workload=present    # master-gated; tty/kiosk only
+#   scripts/soak.sh --stop=24h            # rc.4 GA gate
 #   scripts/soak.sh --stop=72h            # 3-day observation
 #   scripts/soak.sh --stop=5m             # smoke the runner itself
 #   scripts/soak.sh --logdir=/tmp/soak-X  # override log location
@@ -64,16 +90,26 @@ STOP_S=$(parse_duration "$STOP_SPEC")
 
 # -- checkpoint schedule -----------------------------------------------
 #
-# Exponential-doubling milestones that snap to natural breaks at
-# 1m, 1h, and 6h. Only milestones <= STOP_S fire. Past 6h we keep
-# doubling to 12h, then chunk in 12h steps for rc.4 / 72h runs.
+# Three phases:
+#   1. Exponential early ramp 1s..1h — catches infant mortality
+#      (immediate-after-start TDRs, fnptr table misload, mmap leak
+#      that doubles every iter, etc.).
+#   2. 15-min cadence 1h15m..24h — matches the rc.4 punchlist's
+#      "every 15 min ≈ 96 samples / 24h" target. Sampling resolution
+#      stays useful across the GA gate window without flooding CSV.
+#   3. Coarser past 24h up to 72h — observation window, not a gate.
+#
+# Only milestones <= STOP_S fire; STOP_S itself is always appended.
 
 CHECKPOINTS_S=(
     1 2 4 8 16 32 60               # seconds → 1 min
     120 240 480 960 1920 3600      # minutes (2,4,8,16,32) → 1 hour
-    7200 14400 21600               # hours: 2, 4, 6  (rc.3 stop)
-    28800 43200 57600 72000 86400  # 8h, 12h, 16h, 20h, 24h (rc.4 GA gate)
-    129600 172800 216000 259200    # 36h, 48h, 60h, 72h  (3-day window)
+)
+# 15-min cadence from 1h15m through 24h (rc.4 GA gate). seq generates
+# 4500,5400,...,86400 — 92 checkpoints covering the GA-gate window.
+while IFS= read -r t; do CHECKPOINTS_S+=("$t"); done < <(seq 4500 900 86400)
+CHECKPOINTS_S+=(
+    108000 129600 172800 216000 259200   # 30h, 36h, 48h, 60h, 72h
 )
 
 # Build the active schedule: drop anything past STOP_S, append STOP_S
@@ -98,7 +134,9 @@ DMESG_BASELINE="$LOGDIR/dmesg-baseline.txt"
 DMESG_FINAL="$LOGDIR/dmesg-final.txt"
 mkdir -p "$ITER_LOG"
 
-echo "elapsed_s,milestone,iters_compute,iters_wgpu,rss_kb,dmesg_amdgpu_delta,status" > "$SOAK_CSV"
+# CSV header is emitted *after* the workload case below populates
+# NAMES — schema is dynamic so the column set matches the active
+# workload(s) instead of hardcoding compute+wgpu.
 
 log() {
     local msg="$*"
@@ -111,26 +149,64 @@ BINS_TO_BUILD=()
 PROGS=()  # parallel arrays: name + binary path
 NAMES=()
 
+# Map a singleton workload name to its binary, then add it to the
+# parallel NAMES / PROGS / BINS_TO_BUILD arrays. Bundles below
+# call this once per member.
+add_workload() {
+    local name="$1"
+    local bin
+    case "$name" in
+        compute) bin="build/native_compute_store" ;;
+        render)  bin="build/native_render_e2e" ;;
+        texture) bin="build/native_texture_e2e" ;;
+        wgpu)    bin="build/render_graph_e2e" ;;
+        present) bin="build/native_present_e2e" ;;
+        *) echo "internal: unknown singleton '$name'" >&2; exit 2 ;;
+    esac
+    BINS_TO_BUILD+=("$bin")
+    NAMES+=("$name")
+    PROGS+=("$REPO/$bin")
+}
+
 case "$WORKLOAD" in
-    compute)
-        BINS_TO_BUILD+=("build/native_compute_store")
-        NAMES+=("compute"); PROGS+=("$REPO/build/native_compute_store")
-        ;;
-    wgpu)
-        BINS_TO_BUILD+=("build/render_graph_e2e")
-        NAMES+=("wgpu"); PROGS+=("$REPO/build/render_graph_e2e")
+    compute|render|texture|wgpu|present)
+        add_workload "$WORKLOAD"
         ;;
     both)
-        BINS_TO_BUILD+=("build/native_compute_store" "build/render_graph_e2e")
-        NAMES+=("compute"); PROGS+=("$REPO/build/native_compute_store")
-        NAMES+=("wgpu");    PROGS+=("$REPO/build/render_graph_e2e")
+        # Legacy alias from pre-rc.3 — kept for any external invokers
+        # / handoffs that still pass --workload=both. New work should
+        # use --workload=all (which also includes render).
+        add_workload compute
+        add_workload wgpu
         ;;
-    *) echo "unknown --workload: $WORKLOAD (compute|wgpu|both)" >&2; exit 2 ;;
+    native)
+        add_workload compute
+        add_workload render
+        add_workload texture
+        ;;
+    all)
+        # rc.3/rc.4 primary parallel set. Excludes present (master-
+        # gated); pass --workload=present separately on a tty/kiosk
+        # box if you want to add it.
+        add_workload compute
+        add_workload wgpu
+        add_workload render
+        ;;
+    *) echo "unknown --workload: $WORKLOAD (compute|render|texture|wgpu|present|both|native|all)" >&2; exit 2 ;;
 esac
+
+# -- CSV header (dynamic columns from NAMES) --------------------------
+
+{
+    printf "elapsed_s,milestone"
+    for n in "${NAMES[@]}"; do printf ",iters_%s" "$n"; done
+    printf ",rss_kb,dmesg_amdgpu_delta,status\n"
+} > "$SOAK_CSV"
 
 # -- build prerequisites ----------------------------------------------
 
 log "soak start — workload=$WORKLOAD stop=$STOP_SPEC ($STOP_S s) logdir=$LOGDIR"
+log "active programs: ${NAMES[*]}"
 log "checkpoint schedule (s): ${SCHEDULE[*]}"
 
 for b in "${BINS_TO_BUILD[@]}"; do
@@ -298,13 +374,10 @@ for ms in "${SCHEDULE[@]}"; do
     rss=$(sum_rss_kb)
     dmesg_d=$(dmesg_amdgpu_delta)
 
-    # gather per-loop iter counts + status
-    iter_c=0; iter_w=0
+    # gather per-loop iter counts (parallel to NAMES order)
+    iter_values=()
     for i in "${!NAMES[@]}"; do
-        case "${NAMES[$i]}" in
-            compute) iter_c=$(iters_for "$i") ;;
-            wgpu)    iter_w=$(iters_for "$i") ;;
-        esac
+        iter_values+=("$(iters_for "$i")")
     done
 
     # status determination
@@ -318,11 +391,21 @@ for ms in "${SCHEDULE[@]}"; do
         status="FAIL"; fail_reason="new amdgpu/drm dmesg lines: $dmesg_d"
     fi
 
+    # human-readable iter chunk: "compute=123 render=456 wgpu=789"
+    iter_human=""
+    for i in "${!NAMES[@]}"; do
+        iter_human+=$(printf "%s=%-6s " "${NAMES[$i]}" "${iter_values[$i]}")
+    done
+
+    # CSV iter chunk: ",123,456,789"
+    iter_csv=""
+    for v in "${iter_values[@]}"; do iter_csv+=",$v"; done
+
     label=$(fmt_elapsed "$ms")
-    printf "[%s] t=%-6s rss=%-8sKB iters: compute=%-6s wgpu=%-6s dmesg_Δ=%s  %s\n" \
-        "$(date -u +%H:%M:%SZ)" "$label" "$rss" "$iter_c" "$iter_w" "$dmesg_d" "$status" \
+    printf "[%s] t=%-6s rss=%-8sKB iters: %sdmesg_Δ=%s  %s\n" \
+        "$(date -u +%H:%M:%SZ)" "$label" "$rss" "$iter_human" "$dmesg_d" "$status" \
         | tee -a "$SOAK_LOG"
-    echo "$elapsed,$label,$iter_c,$iter_w,$rss,$dmesg_d,$status" >> "$SOAK_CSV"
+    echo "$elapsed,$label$iter_csv,$rss,$dmesg_d,$status" >> "$SOAK_CSV"
 
     if [ "$status" = "FAIL" ]; then
         log "REGRESSION DETECTED: $fail_reason"
