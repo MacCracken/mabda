@@ -52,7 +52,10 @@ var IT_DRAW_INDEX_AUTO  = 0x2D;
 var IT_ACQUIRE_MEM      = 0x58;
 var IT_RELEASE_MEM      = 0x49;
 var IT_EVENT_WRITE      = 0x46;
+var IT_NUM_INSTANCES    = 0x2F;  # dedicated PKT3 for VGT_NUM_INSTANCES
+var IT_PFP_SYNC_ME      = 0x42;  # PFP wait for ME drain
 var IT_SET_UCONFIG_REG  = 0x79;
+var IT_CONTEXT_CONTROL  = 0x28;  # Disable HW context-state shadowing
 
 # SH-register offsets (byte addresses in MMIO space). The SH_REG base
 # is 0xB000; IT_SET_SH_REG takes `(byte_offset - 0xB000) / 4`.
@@ -101,7 +104,7 @@ var COMPUTE_DISPATCH_INITIATOR_MIN = 0x1;
 # Encode a type-3 PM4 header. `count` is the number of data dwords
 # that follow the header (kernel wants count-1 in the bit field).
 # `count` must be ≥ 1 and ≤ 0x4000.
-fn native_pm4_pkt3_header(opcode, count, predicate) {
+fn native_pm4_pkt3_header(opcode, count, predicate): i64 {
     var d = 3 & 3;                     # type
     var c = (count - 1) & 0x3FFF;      # count field (N-1)
     var o = opcode & 0xFF;             # opcode
@@ -111,7 +114,7 @@ fn native_pm4_pkt3_header(opcode, count, predicate) {
 
 # Convert a register byte-offset into the SH_REG form the SET_SH_REG
 # packet expects: `(offset - 0xB000) / 4`.
-fn native_sh_reg_offset(byte_offset) {
+fn native_sh_reg_offset(byte_offset): i64 {
     return (byte_offset - PM4_SH_REG_BASE) / 4;
 }
 
@@ -119,7 +122,7 @@ fn native_sh_reg_offset(byte_offset) {
 # wire form: `(offset - 0xA000) / 4`. Context registers cover the
 # rasterizer/viewport/CB target/DB depth state — graphics-only,
 # distinct from SH (shader) and UConfig (top-level chip state).
-fn native_context_reg_offset(byte_offset) {
+fn native_context_reg_offset(byte_offset): i64 {
     return (byte_offset - PM4_CONTEXT_REG_BASE) / 4;
 }
 
@@ -128,7 +131,7 @@ fn native_context_reg_offset(byte_offset) {
 # dwords into `buf` starting at `pos`. `values` points to an array
 # of n u32 values. Returns the new position (pos + 8 + 4*n bytes,
 # i.e., position after the last dword written).
-fn native_pm4_set_sh_reg(buf, pos, byte_offset, n, values) {
+fn native_pm4_set_sh_reg(buf, pos, byte_offset, n, values): i64 {
     # PKT3 count: `n + 1` data dwords (offset + n values); bit-field
     # stores count - 1 = n.
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_SH_REG, n + 1, 0));
@@ -146,7 +149,7 @@ fn native_pm4_set_sh_reg(buf, pos, byte_offset, n, values) {
 
 # Convenience for setting a single SH register — the common case in
 # compute dispatch setup. Returns new position.
-fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value) {
+fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value): i64 {
     var one[4];
     store32(&one, value);
     return native_pm4_set_sh_reg(buf, pos, byte_offset, 1, &one);
@@ -157,7 +160,7 @@ fn native_pm4_set_sh_reg_one(buf, pos, byte_offset, value) {
 # specific shader" space — used for things like CP_COHER_START_DELAY
 # and TA_CS_BC_BASE_ADDR that radv emits in its queue preamble.
 # Packet: header + (offset - 0x30000)/4 + value = 3 dwords.
-fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
+fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 2, 0));
     store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
     store32(buf + pos + 8, value);
@@ -166,7 +169,7 @@ fn native_pm4_set_uconfig_reg_one(buf, pos, byte_offset, value) {
 
 # Emit a SET_UCONFIG_REG packet for two consecutive registers. `values`
 # points to two u32s. Packet: header + reg_offset + 2 values = 4 dwords.
-fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
+fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, 3, 0));
     store32(buf + pos + 4, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
     store32(buf + pos + 8,  load32(values + 0));
@@ -194,7 +197,7 @@ fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values) {
 
 # Multi-register SET_CONTEXT_REG: header + reg_offset + n values.
 # Packet body length = n + 1 dwords.
-fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values) {
+fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, n + 1, 0));
     pos = pos + 4;
     store32(buf + pos, native_context_reg_offset(byte_offset));
@@ -209,7 +212,7 @@ fn native_pm4_set_context_reg(buf, pos, byte_offset, n, values) {
 }
 
 # Single-register convenience: SET_CONTEXT_REG with one value.
-fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value) {
+fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 2, 0));
     store32(buf + pos + 4, native_context_reg_offset(byte_offset));
     store32(buf + pos + 8, value);
@@ -218,7 +221,7 @@ fn native_pm4_set_context_reg_one(buf, pos, byte_offset, value) {
 
 # Pair convenience: SET_CONTEXT_REG with two consecutive registers.
 # Useful for things like CB_COLOR0_BASE + _PITCH or PA_SC_SCREEN_SCISSOR_TL + _BR.
-fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values) {
+fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_SET_CONTEXT_REG, 3, 0));
     store32(buf + pos + 4, native_context_reg_offset(byte_offset));
     store32(buf + pos + 8,  load32(values + 0));
@@ -231,7 +234,7 @@ fn native_pm4_set_context_reg_pair(buf, pos, byte_offset, values) {
 # the SOURCE_SELECT bits + USE_OPAQUE / etc. The standard value
 # for auto-index draws is 0x02 (DI_SRC_SEL_AUTO_INDEX in bits[1:0]).
 # Packet shape: header + 2 data dwords. count = 2.
-fn native_pm4_draw_index_auto(buf, pos, vertex_count, draw_initiator) {
+fn native_pm4_draw_index_auto(buf, pos, vertex_count, draw_initiator): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_DRAW_INDEX_AUTO, 2, 0));
     store32(buf + pos + 4, vertex_count);
     store32(buf + pos + 8, draw_initiator);
@@ -254,7 +257,7 @@ var DI_SRC_SEL_AUTO_INDEX = 0x02;
 # Emit a DISPATCH_DIRECT packet. Kicks the compute dispatch with the
 # given workgroup counts and the provided initiator mask (typically
 # COMPUTE_DISPATCH_INITIATOR_MIN). Returns new position.
-fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
+fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator): i64 {
     # 4 data dwords: dim_x, dim_y, dim_z, initiator. count = 4.
     # Low byte of header is shader_type (2 = compute), not predicate.
     # Mesa emits 0xc0031502 — verified via AMD_DEBUG=ib dump.
@@ -280,15 +283,42 @@ fn native_pm4_dispatch_direct(buf, pos, dim_x, dim_y, dim_z, initiator) {
 #   +20 coher_base_hi
 #   +24 poll_interval (cycles between state-check; 0x0A standard)
 # Total: 7 dwords (28 bytes). Returns new pos.
-fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
-    # For IT_ACQUIRE_MEM on GFX9 the low byte of the PKT3 header is
-    # shader_type (0=graphics, non-zero=compute) — NOT the generic
-    # predicate bit. Mesa rusticl emits 0xc0055802 = shader_type=0x02.
-    # coher_cntl = 0xa8c40000 verified from Mesa AMD_DEBUG=ib dump.
-    # Count field: 6 data dwords follow (cntl, size_lo/hi, base_lo/hi,
-    # poll). Header encodes count-1 = 5.
-    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, 2));
-    store32(buf + pos +  4, 0xA8C40000);   # coher_cntl
+fn native_pm4_acquire_mem_full_invalidate(buf, pos): i64 {
+    # Compute-ring shape (shader_type=2). Calls this helper from
+    # gfx-ring code (render) routed the CP coherence ops to the
+    # compute cache hierarchy instead of CB/DB — Cezanne's GFX ring
+    # then hung on FS export through a stale graphics cache (rc.2
+    # 0x55-sentinel + 2-second TDR). Fixed 2026-05-13 by routing the
+    # render path through `_for_gfx_ring` (shader_type=0). Compute
+    # callers keep the legacy shape via this helper.
+    return native_pm4_acquire_mem_full_invalidate_for_ring(buf, pos, 2);
+}
+
+# Graphics-ring variant: shader_type=0 → CP coherence ops invalidate
+# the CB / DB / SX / VS / PS caches that the GFX ring actually uses.
+fn native_pm4_acquire_mem_full_invalidate_for_gfx_ring(buf, pos): i64 {
+    return native_pm4_acquire_mem_full_invalidate_for_ring(buf, pos, 0);
+}
+
+# Internal — parameterized by shader_type (0 = graphics, 2 = compute).
+# Both rings use the same coher_cntl mask (full invalidate) and poll
+# interval; only the PKT3 header low byte differs.
+fn native_pm4_acquire_mem_full_invalidate_for_ring(buf, pos, shader_type): i64 {
+    # coher_cntl = 0x28C40000. Captured byte-exact from RADV's
+    # preamble IB (vkcube under `RADV_DEBUG=dumpibs` on the same
+    # Renoir / Cezanne hardware, 2026-05-13). Sets:
+    #   bit 18 SH_ICACHE_ACTION_ENA
+    #   bit 22 TCL1_ACTION_ENA
+    #   bit 23 SH_KCACHE_ACTION_ENA
+    #   bit 27 TC_WB_ACTION_ENA
+    #   bit 29 TC_ACTION_ENA
+    # Mabda previously also set bit 31 (TC_NC_ACTION_ENA — non-
+    # coherent cache action) which on the GFX ring caused the CP to
+    # wait on a non-coherent action that never resolved → 2-second
+    # TDR. That was the rc.2 native_render_e2e 0x55-sentinel root
+    # cause; fixed 2026-05-13.
+    store32(buf + pos +  0, native_pm4_pkt3_header(IT_ACQUIRE_MEM, 6, shader_type));
+    store32(buf + pos +  4, 0x28C40000);   # coher_cntl (no TC_NC bit)
     store32(buf + pos +  8, 0xFFFFFFFF);   # coher_size_lo
     store32(buf + pos + 12, 0x00FFFFFF);   # coher_size_hi (24 bits)
     store32(buf + pos + 16, 0);            # coher_base_lo
@@ -312,6 +342,23 @@ fn native_pm4_acquire_mem_full_invalidate(buf, pos) {
 # of `native_pm4_build_render_clear_triangle`'s draw block.
 var GFX9_EVENT_TYPE_CACHE_FLUSH         = 0x04;  # gfx9.json VGT_EVENT_TYPE
 var GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16;  # gfx9.json VGT_EVENT_TYPE
+# Pre-draw flush events captured byte-exact from RADV's main IB
+# (vkcube under RADV_DEBUG=dumpibs on the same Cezanne / Renoir).
+# Without these, in-flight pixel waves from prior contexts (e.g. the
+# Wayland compositor's draws) keep the pixel pipeline busy past our
+# dispatch's start — the GFX ring then TDRs waiting for the pipeline
+# to drain. This is the actual root cause of the rc.2
+# native_render_e2e 0x55-sentinel hang; fixed 2026-05-13 after
+# capturing radv's IB stream.
+var GFX9_EVENT_TYPE_FLUSH_AND_INV_CB_META = 0x2E;  # gfx9.json VGT_EVENT_TYPE
+var GFX9_EVENT_TYPE_FLUSH_AND_INV_DB_META = 0x2C;  # gfx9.json VGT_EVENT_TYPE
+var GFX9_EVENT_TYPE_PS_PARTIAL_FLUSH      = 0x10;  # gfx9.json VGT_EVENT_TYPE
+var GFX9_EVENT_INDEX_PARTIAL_FLUSH        = 0x4;   # PS_PARTIAL_FLUSH uses index 4
+# PIPELINESTAT_START — radv emits this in every preamble. The GPU
+# stat-counter pipeline starts counting (and unblocking dependent
+# state machines) on receipt. Without it, Cezanne's pipeline may
+# wait on stat-counter readiness that never fires.
+var GFX9_EVENT_TYPE_PIPELINESTAT_START    = 0x19;  # gfx9.json VGT_EVENT_TYPE
 
 # event_index encodes how the kernel/CP interprets the event:
 #   0 = "other" — event_type only, no address (the EVENT_WRITE form
@@ -323,13 +370,54 @@ var GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16;  # gfx9.json VGT_EVENT_TYPE
 var GFX9_EVENT_INDEX_OTHER = 0x0;
 var GFX9_EVENT_INDEX_TS    = 0x5;
 
+# PKT3_PFP_SYNC_ME — forces the PFP (Prefetch Parser) to wait for the
+# ME (Middle Engine) to drain pending work. Required between cache
+# invalidate and the first draw, otherwise the PFP can read context
+# state the ME hasn't yet committed. 2-dword packet: header + 0.
+# radv emits this between RELEASE_MEM and ACQUIRE_MEM on every draw.
+fn native_pm4_pfp_sync_me(buf, pos): i64 {
+    store32(buf + pos + 0, native_pm4_pkt3_header(IT_PFP_SYNC_ME, 1, 0));
+    store32(buf + pos + 4, 0);
+    return pos + 8;
+}
+
+# PKT3_CONTEXT_CONTROL — controls HW context-state shadowing on the
+# GFX ring. radv relies on the kernel-emitted preamble IB (jumped to
+# via INDIRECT_BUFFER at queue init) to set this up; mabda has no such
+# kernel-side preamble, so we must emit it ourselves at the start of
+# every IB. Body: load_control (dw1) + shadow_control (dw2). The
+# canonical "disable shadowing, load all state from packets" value is
+# (0x80000000, 0x80000000) — bit 31 = LOAD_ENABLE_PIPELINE_STAT_ENABLE
+# on dw1, bit 31 = SHADOW_ENABLE on dw2 (kernel sets these for the
+# initial context). Cited from drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+# `gfx_v9_default_init_state[]` and Mesa's si_emit_initial_cmdbuffer.
+fn native_pm4_context_control(buf, pos): i64 {
+    store32(buf + pos + 0, native_pm4_pkt3_header(IT_CONTEXT_CONTROL, 2, 0));
+    store32(buf + pos + 4, 0x80000000);  # load_control
+    store32(buf + pos + 8, 0x80000000);  # shadow_control
+    return pos + 12;
+}
+
+# Emit a PKT3_NUM_INSTANCES packet (opcode 0x2F). Per-draw replacement
+# for SET_UCONFIG_REG(VGT_NUM_INSTANCES, n) — the AMD CP recognizes
+# this as a draw-state hint and updates VGT internals more directly
+# than the generic uconfig path. radv emits this byte-for-byte before
+# every DRAW_INDEX_AUTO; mabda previously used SET_UCONFIG_REG which
+# Cezanne's VGT may not pick up reliably as a per-dispatch update.
+# 2-dword packet: header + instance_count.
+fn native_pm4_num_instances(buf, pos, count): i64 {
+    store32(buf + pos +  0, native_pm4_pkt3_header(IT_NUM_INSTANCES, 1, 0));
+    store32(buf + pos +  4, count);
+    return pos + 8;
+}
+
 # Emit a 2-dword EVENT_WRITE PKT3. Used for event_index = 0 events
 # (no address). For TS-style events with a writeback address, use
 # RELEASE_MEM or a wider EVENT_WRITE_EOP — not implemented here.
 # Body dword shape: event_type in bits[5:0], event_index in
 # bits[11:8] (matches Mesa `EVENT_TYPE(t) | EVENT_INDEX(i)`).
 # Returns new pos.
-fn native_pm4_event_write(buf, pos, event_type, event_index) {
+fn native_pm4_event_write(buf, pos, event_type, event_index): i64 {
     store32(buf + pos, native_pm4_pkt3_header(IT_EVENT_WRITE, 1, 0));
     var body = (event_index << 8) | event_type;
     store32(buf + pos + 4, body);
@@ -343,16 +431,27 @@ fn native_pm4_event_write(buf, pos, event_type, event_index) {
 # a draw at end-of-pass for any path that does CPU readback — the
 # 6.5(b) composer doesn't include it today (matches radv's pattern
 # of emitting separately at command-buffer end).
-fn native_pm4_event_write_cache_flush_and_inv(buf, pos) {
+fn native_pm4_event_write_cache_flush_and_inv(buf, pos): i64 {
     return native_pm4_event_write(buf, pos,
     GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+    GFX9_EVENT_INDEX_OTHER);
+}
+
+# PIPELINESTAT_START — emitted by radv in every GFX preamble after the
+# heavy ACQUIRE_MEM. Starts the GPU's pipeline-statistics counters and
+# unblocks dependent state machines that wait on stat-counter readiness
+# at context start. Without it, on Cezanne/Renoir the GFX ring can sit
+# waiting on the stat-counter pipeline → 2-second TDR.
+fn native_pm4_event_write_pipelinestat_start(buf, pos): i64 {
+    return native_pm4_event_write(buf, pos,
+    GFX9_EVENT_TYPE_PIPELINESTAT_START,
     GFX9_EVENT_INDEX_OTHER);
 }
 
 # Emit a NOP of `pad_dwords` total dwords (header + pad_dwords-1
 # filler). Useful for aligning IBs to 8-dword boundaries (kernel
 # requirement on some rings). Returns new position.
-fn native_pm4_nop(buf, pos, pad_dwords) {
+fn native_pm4_nop(buf, pos, pad_dwords): i64 {
     if (pad_dwords < 2) { return pos; }
     # Session 25b fix: NOP packet of `pad_dwords` total dwords needs body =
     # pad_dwords - 1, so pass count = pad_dwords - 1 to pkt3_header (which
@@ -390,7 +489,7 @@ fn native_pm4_nop(buf, pos, pad_dwords) {
 # handoff (docs/handoff/2026-04-28-session25-b4-verified.md) for
 # the full Mesa-rusticl alignment rationale.
 fn native_pm4_build_compute_store_deadbeef(buf, shader_va, stub_va,
-out_va, x, y, z) {
+out_va, x, y, z): i64 {
     var pos = 0;
     # GFX9 PGM_LO/HI encoding: PGM_LO = (va >> 8) & 0xFFFFFFFF,
     # PGM_HI = (va >> 40) & 0xFF. HW reconstructs:
@@ -500,14 +599,14 @@ out_va, x, y, z) {
 # Convert an i64 integer to its IEEE-754 f32 bit pattern.
 # Routes through stdlib's `f64_from(int)` and color.cyr's
 # `f64_to_f32(f64bits)`. Used for viewport scale/offset conversions.
-fn native_int_to_f32_bits(i) {
+fn native_int_to_f32_bits(i): i64 {
     return f64_to_f32(f64_from(i));
 }
 
 # Negate an f32 bit pattern (low 32 bits) by flipping the sign bit.
 # Operates on the integer holding the f32 bits; returns the negated
 # f32 bit pattern.
-fn native_f32_neg_bits(f32_bits) {
+fn native_f32_neg_bits(f32_bits): i64 {
     return f32_bits ^ 0x80000000;
 }
 
@@ -516,7 +615,7 @@ fn native_f32_neg_bits(f32_bits) {
 # Two SET_SH_REG packets, each writing 4 contiguous regs starting at
 # the PGM_LO of each stage. VS at 0xB120, PS at 0xB020. Total: 12
 # dwords (48 bytes). Returns new pos.
-fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va) {
+fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va): i64 {
     # PGM_HI mask = 0xFF: the HW register is 32-bit but only the low 8
     # bits hold meaningful VA bits [47:40]; matches compute pattern at
     # line ~809 (R_COMPUTE_PGM_HI). PGM_LO carries bits [39:8].
@@ -525,12 +624,19 @@ fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va) {
     var fs_pgm_lo = (fs_va >> 8)  & 0xFFFFFFFF;
     var fs_pgm_hi = (fs_va >> 40) & 0xFF;
 
-    var vs_regs[16];
-    store32(&vs_regs +  0, vs_pgm_lo);
-    store32(&vs_regs +  4, vs_pgm_hi);
-    store32(&vs_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
-    store32(&vs_regs + 12, GFX9_VS_PGM_RSRC2_MIN);
-    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_VS, 4, &vs_regs);
+    # Contiguous SET_SH_REG covering RSRC3_VS, LATE_ALLOC_VS, PGM_LO_VS,
+    # PGM_HI_VS, PGM_RSRC1_VS, PGM_RSRC2_VS (6 regs, addresses 0xB118 →
+    # 0xB12C in 4-byte steps). RSRC3 + LATE_ALLOC must lead because they
+    # control wave allocation; if absent or zero the VS can't launch on
+    # any CU → 2-second GFX TDR even with otherwise-correct shader code.
+    var vs_regs[24];
+    store32(&vs_regs +  0, GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL);
+    store32(&vs_regs +  4, GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE);
+    store32(&vs_regs +  8, vs_pgm_lo);
+    store32(&vs_regs + 12, vs_pgm_hi);
+    store32(&vs_regs + 16, GFX9_GFX_PGM_RSRC1_MIN);
+    store32(&vs_regs + 20, GFX9_VS_PGM_RSRC2_MIN);
+    pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_RSRC3_VS, 6, &vs_regs);
 
     var ps_regs[16];
     store32(&ps_regs +  0, fs_pgm_lo);
@@ -548,7 +654,7 @@ fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va) {
 # stage enable, SPI inputs, depth disabled, anti-alias off. This
 # block does NOT depend on the RT (no extent, no VA) — it's purely
 # a function of the pipeline's intent.
-fn native_pm4_build_render_pipeline_ctx(buf, pos) {
+fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # SPI shader output formats — 3 contiguous regs starting at 0xA70C.
     var spi_fmts[12];
     store32(&spi_fmts +  0, SPI_SHADER_POS_FORMAT_4);
@@ -574,6 +680,10 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos) {
     pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_SHADER_STAGES_EN,
     GFX9_VGT_SHADER_STAGES_VS_PS);
     pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_REUSE_OFF, 0);
+    # PA_CL_VS_OUT_CNTL = 0: our VS exports only position (no clip/cull
+    # distances, no viewport-array index, no misc-vec). Must be set
+    # explicitly to clear whatever value the prior context left here.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_VS_OUT_CNTL, 0);
 
     # SPI inputs/outputs — FS gets the hang-quirk minimum, VS exports
     # only pos0 (no params).
@@ -595,6 +705,128 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos) {
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_RASTER_CONFIG, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
 
+    # GFX9 graphics-pipeline preamble — required to not hang the GFX
+    # ring on Cezanne and similar APUs. The rc.2 native_render_e2e
+    # 0x55-sentinel symptom was actually a ring TDR (kernel resets
+    # the ring at ~2s), masked by CB_COLOR0_ATTRIB2 being missing.
+    # Per gfx9.json + radv ac_cmdbuf.c preamble, the following must
+    # be set before any DRAW_INDEX_AUTO on GFX9:
+    #
+    #   - Guard-band adjusts (PA_CL_GB_*_ADJ = 1.0f) — without these,
+    #     the rasterizer's clip-to-guard-band step can hang on small
+    #     primitives.
+    #   - VGT vertex reuse / output dealloc — VGT deadlocks if these
+    #     are zero (CLEAR_STATE doesn't reliably clear them on
+    #     Bonaire / Cezanne / etc.).
+    #   - PA_SC_BINNER_CNTL_0 = 0 — disable primitive binning. APUs
+    #     ship with binning enabled by default; without an explicit
+    #     BINNER_CNTL_1 batch configuration the DPB pipeline hangs.
+
+    # Four contiguous guard-band adjusts in one SET_CONTEXT_REG packet.
+    # CLIP_ADJ ≈ 254.992f (NOT 1.0f); DISC_ADJ = 1.0f. See the constant
+    # definition in backend_native_shaders.cyr for the hang explanation.
+    var gb_adj[16];
+    store32(&gb_adj +  0, GFX9_PA_CL_GB_CLIP_ADJ_F32);  # VERT_CLIP_ADJ
+    store32(&gb_adj +  4, GFX9_PA_CL_GB_DISC_ADJ_F32);  # VERT_DISC_ADJ
+    store32(&gb_adj +  8, GFX9_PA_CL_GB_CLIP_ADJ_F32);  # HORZ_CLIP_ADJ
+    store32(&gb_adj + 12, GFX9_PA_CL_GB_DISC_ADJ_F32);  # HORZ_DISC_ADJ
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_CL_GB_VERT_CLIP_ADJ, 4, &gb_adj);
+
+    # PA_SC_BINNER_CNTL_0/1: explicitly disable HW primitive binning.
+    # GFX9 needs USE_LEGACY_SC (3), not USE_NEW_SC (2). USE_NEW_SC is
+    # GFX10+ syntax that GFX9 doesn't fully implement. Cited from
+    # radv_cmd.c::radv_get_disabled_binning_state() GFX9 branch.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_BINNER_CNTL_0,
+    GFX9_BINNER_CNTL_0_DISABLED);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_BINNER_CNTL_1,
+    GFX9_BINNER_CNTL_1_DEFAULT);
+
+    # VGT vertex reuse + output dealloc — 2 contiguous regs at 0x028C58.
+    var vgt_reuse[8];
+    store32(&vgt_reuse + 0, GFX9_VGT_VERTEX_REUSE_BLOCK);
+    store32(&vgt_reuse + 4, GFX9_VGT_OUT_DEALLOC);
+    pos = native_pm4_set_context_reg(buf, pos, R_VGT_VERTEX_REUSE_BLOCK_CNTL, 2, &vgt_reuse);
+
+    # Second batch of GFX9 preamble registers. Each adds a 12-byte
+    # SET_CONTEXT_REG_ONE packet; see the @internal header comment
+    # in src/backend_native_shaders.cyr for the per-register rationale.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_DEPTH_CONTROL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_CONTROL, 0);
+    # PA_SU_VTX_CNTL: PIX_CENTER=1 (bit 0), ROUND_MODE=2 (bits 1:2 → 0b10 = trunc).
+    # Value = 1 | (2 << 1) = 0x5.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_VTX_CNTL, 0x5);
+    # PA_SC_MODE_CNTL_1 = 0x760201BC — scan-converter walk-order +
+    # FORCE_EOV bits captured byte-for-byte from radv triangle reference.
+    # Decoded bits include WALK_FENCE_ENABLE, WALK_FENCE_SIZE=3,
+    # SUPERTILE_WALK_ORDER_ENABLE, FORCE_EOV_CNTDWN_ENABLE,
+    # FORCE_EOV_REZ_ENABLE, MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE.
+    # With value 0 the SC's walk-order is unconfigured → can stall on
+    # tile traversal.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_1, 0x760201BC);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_TMPRING_SIZE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_CLIPRECT_RULE, 0xFFFF);
+    # PA_SU_PRIM_FILTER_CNTL = 0xC0000000 — bits 30+31 set. Captured
+    # from radv triangle reference. Likely XMAX_RIGHT_EXCLUSION +
+    # YMAX_BOTTOM_EXCLUSION (D3D vs OpenGL pixel-rule selection).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_PRIM_FILTER_CNTL, 0xC0000000);
+
+    # PA_SC_VPORT_SCISSOR_0_TL/BR — per-viewport scissor (separate
+    # stage from screen/window/generic). Without it the rasterizer's
+    # last-stage scissor can crop everything.
+    var vport_scissor[8];
+    store32(&vport_scissor + 0, 0x80000000);
+    store32(&vport_scissor + 4, (16384) | (16384 << 16));
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_VPORT_SCISSOR_0_TL, 2, &vport_scissor);
+
+    # SX (Shader eXport) downconvert + blend-opt — 3 contiguous regs
+    # at 0x028754. Without these the SX block doesn't know how to
+    # convert the FS's FP32 export lanes to the CB's RGBA8 storage
+    # format and may stall the CB-export handshake.
+    var sx_block[12];
+    store32(&sx_block + 0, 0);                 # SX_PS_DOWNCONVERT = 0 (no downconvert hint)
+    store32(&sx_block + 4, 0);                 # SX_BLEND_OPT_EPSILON = 0
+    store32(&sx_block + 8, 0);                 # SX_BLEND_OPT_CONTROL = 0
+    pos = native_pm4_set_context_reg(buf, pos, R_SX_PS_DOWNCONVERT, 3, &sx_block);
+
+    # Pipeline-stage handshake state radv always emits — each register
+    # must be set to a known value to override whatever the prior
+    # context (compositor's draws) left here. The default-after-context-
+    # invalidate is NOT zero; it's "whatever was last loaded". Without
+    # these explicit emits, the GFX pipeline can stall at the affected
+    # stage (PA scan converter, SPI barycentric provider, VGT stream-out,
+    # DB depth/stencil eval) waiting on handshakes that never complete →
+    # 2-second exact GFX-ring TDR.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_BARYC_CNTL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_SHADER_CONTROL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_GS_MODE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_PRIMITIVEID_EN, 0);
+    # DB_Z_INFO / DB_STENCIL_INFO = 0 → FORMAT=Z_INVALID/STENCIL_INVALID.
+    # Tells the DB block "no depth-stencil attachment" so it doesn't
+    # try to read DB_Z_READ_BASE / DB_STENCIL_READ_BASE (which are 0
+    # → VM fault path on access).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_Z_INFO, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_STENCIL_INFO, 0);
+    # PA_SC_AA_MASK_X0Y0_X1Y0 / X0Y1_X1Y1 — sample coverage mask for
+    # the rasterizer. Default 0 = no samples covered = no pixels written.
+    # 0xFFFFFFFF = all samples covered (every pixel passes coverage).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y0_X1Y0, 0xFFFFFFFF);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y1_X1Y1, 0xFFFFFFFF);
+
+    # PA_SC_MODE_CNTL_0 = 0x22 — bits 1+5 set. Captured from radv
+    # triangle test. Without it the SC's mode is unconfigured.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_0, 0x22);
+    # VGT_GS_OUT_PRIM_TYPE = 2 (TRIANGLE_STRIP). Even when VGT_SHADER_STAGES_EN
+    # has GS_EN=0, VGT consults this for prim-output sizing. Default 0
+    # (POINTLIST) makes VGT allocate wrong-sized prim buffers.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_GS_OUT_PRIM_TYPE, 2);
+
+    # SX_MRT0..7_BLEND_OPT removed — radv's value 0x06000600 may encode
+    # BLEND_OPT_PRESERVE_NONE which makes the SX think the FS output
+    # is don't-care, causing the CB to write zeros instead of the FS's
+    # exported color. With these regs left unset (default 0), the FS's
+    # FP32 export reaches the CB intact. Re-add only if a regression
+    # surfaces on a path that actually uses blend optimization.
+
     return pos;
 }
 
@@ -604,7 +836,7 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos) {
 # (NDC → pixel mapping with y-flip), and CB_COLOR0_* binding.
 # `rt_va` must be 8-byte aligned. `rt_width` and `rt_height` are
 # pixel counts (must be even for the /2 viewport math to be exact).
-fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
+fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height): i64 {
     # Scissors. Format: low 16 bits = X, high 16 bits = Y.
     var scissor_tl = 0;
     var scissor_br = (rt_width & 0xFFFF) | ((rt_height & 0xFFFF) << 16);
@@ -614,10 +846,21 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
     store32(&screen_scissor + 4, scissor_br);
     pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_SCREEN_SCISSOR_TL, 2, &screen_scissor);
 
+    # GENERIC_SCISSOR_TL bit 31 = WINDOW_OFFSET_DISABLE — radv writes
+    # this unconditionally; without it the GPU interprets the scissor
+    # as relative to a window-offset register that may be unset.
     var generic_scissor[8];
-    store32(&generic_scissor + 0, scissor_tl);
+    store32(&generic_scissor + 0, scissor_tl | 0x80000000);
     store32(&generic_scissor + 4, scissor_br);
     pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_GENERIC_SCISSOR_TL, 2, &generic_scissor);
+
+    # PA_SC_WINDOW_SCISSOR_TL/BR — must be set (radv writes these in
+    # the gfx6+ preamble path). Pin BR at the GFX9 max (16384,16384)
+    # and set WINDOW_OFFSET_DISABLE on TL.
+    var window_scissor[8];
+    store32(&window_scissor + 0, 0x80000000);                  # TL = (0,0) + WINDOW_OFFSET_DISABLE
+    store32(&window_scissor + 4, (16384) | (16384 << 16));     # BR = (16384, 16384)
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_WINDOW_SCISSOR_TL, 2, &window_scissor);
 
     # Viewport: NDC (-1..1) → pixel (0..w, 0..h) with y-flip.
     # XSCALE = w/2, XOFFSET = w/2, YSCALE = -h/2, YOFFSET = h/2.
@@ -650,12 +893,35 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
 
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE, rt_base_lo);
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_BASE_EXT, rt_base_ext);
+    # CB_COLOR0_ATTRIB2: surface extent. Without this the CB sees the
+    # RT as zero-extent and silently drops every pixel write (the
+    # rc.2 0x55-sentinel bug). bits[0:13]=MIP0_HEIGHT, [14:27]=MIP0_WIDTH,
+    # [28:31]=MAX_MIP=0 for a single-mip RT.
+    var attrib2 = ((rt_height - 1) & 0x3FFF) | (((rt_width - 1) & 0x3FFF) << 14);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_ATTRIB2, attrib2);
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_VIEW, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_INFO,
     GFX9_CB_COLOR0_INFO_RGBA8_UNORM);
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_ATTRIB,
     GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8);
     pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_DCC_CONTROL, 0);
+
+    # CMASK / FMASK / DCC base = 0 (uncompressed RT). radv's GFX9
+    # emit_fb_color_state writes all of these in a single 11-reg
+    # SET_CONTEXT_REG_SEQ; we emit them as singletons here for
+    # codepath simplicity. Without these the CB hardware reads
+    # stale values from the previous context and VM-faults the
+    # GFX ring on first dispatch.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_CMASK, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_CMASK_BASE_EXT, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_FMASK, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_FMASK_BASE_EXT, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_DCC_BASE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_COLOR0_DCC_BASE_EXT, 0);
+
+    # MRT0 effective pitch — for linear 256-wide: pitch_elements - 1 = 255.
+    var mrt_epitch = (rt_width - 1) & 0xFFFF;
+    pos = native_pm4_set_context_reg_one(buf, pos, R_CB_MRT0_EPITCH, mrt_epitch);
 
     return pos;
 }
@@ -671,7 +937,7 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height) {
 # composer (native_pm4_build_render_clear_triangle) still passes
 # GFX9_FULLSCREEN_TRI_VCOUNT explicitly to preserve its byte-for-
 # byte equivalence with the v3.0-rc.1 PM4 stream.
-fn native_pm4_build_render_draw_tail(buf, pos, vertex_count) {
+fn native_pm4_build_render_draw_tail(buf, pos, vertex_count): i64 {
     return native_pm4_draw_index_auto(buf, pos,
     vertex_count,
     DI_SRC_SEL_AUTO_INDEX);
@@ -699,16 +965,39 @@ fn native_pm4_build_render_draw_tail(buf, pos, vertex_count) {
 # `test_native_pm4_render_clear_triangle_*` in mabda_v3.tcyr.
 # Layer-2 byte-exact diff against radv is gated on Hyprland.
 fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
-rt_va, rt_width, rt_height) {
+rt_va, rt_width, rt_height): i64 {
     var pos = 0;
-    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    # Preamble shape captured byte-for-byte from radv's GFX preamble IB
+    # on this exact Cezanne/Renoir: PFP_SYNC_ME → heavy ACQUIRE_MEM →
+    # EVENT_WRITE PIPELINESTAT_START. The PFP_SYNC_ME forces the
+    # Prefetch Parser to drain pending work from a prior context (e.g.
+    # the compositor's draws) before our ACQUIRE_MEM invalidates the
+    # caches. Without it, PFP can read stale context state ME hasn't
+    # finished committing → CP stalls waiting on pipeline subsystems
+    # whose state never settles → 2-second exact GFX-ring TDR.
+    # NOTE: we do NOT emit our own CONTEXT_CONTROL here. The kernel
+    # already emits one (CC0=0x81018003, CC1=0) immediately before
+    # jumping to our IB — observed in the GFX-ring devcoredump at
+    # 2026-05-12. Emitting a second CONTEXT_CONTROL with conflicting
+    # load/shadow bits interacted badly and changed the hang shape.
+    # radv also doesn't emit CONTEXT_CONTROL in its userspace IB.
+    pos = native_pm4_pfp_sync_me(buf, pos);
+    pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(buf, pos);
+    pos = native_pm4_event_write_pipelinestat_start(buf, pos);
     pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
     GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_NUM_INSTANCES,
-    GFX9_VGT_NUM_INSTANCES_ONE);
+    # IA_MULTI_VGT_PARAM = 0x0070007f — input-assembler multi-VGT config.
+    # Captured from radv on Cezanne. Without it the IA stage can't issue
+    # primitives correctly to the VGT (default = unconfigured). Bits:
+    # PRIMGROUP_SIZE=127, PARTIAL_VS_WAVE_ON=1, SWITCH_ON_EOI=1.
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_IA_MULTI_VGT_PARAM, 0x0070007F);
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
+    # PKT3 NUM_INSTANCES (opcode 0x2F) goes IMMEDIATELY before
+    # DRAW_INDEX_AUTO. radv emits it as a per-draw hint; AMD CP picks it
+    # up as a draw-state update more reliably than SET_UCONFIG_REG.
+    pos = native_pm4_num_instances(buf, pos, GFX9_VGT_NUM_INSTANCES_ONE);
     pos = native_pm4_build_render_draw_tail(buf, pos, GFX9_FULLSCREEN_TRI_VCOUNT);
     # Flush CB/DB caches so the FB the kernel signals "complete" on
     # actually contains the rendered pixels — ACQUIRE_MEM at top of

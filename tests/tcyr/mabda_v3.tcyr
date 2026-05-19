@@ -1751,11 +1751,11 @@ fn test_gfx9_pgm_rsrc_minimums() {
     # RSRC1: VS+PS share the compute minimum (FLOAT_MODE 0xC0, SGPRS=1, DX10_CLAMP, IEEE).
     assert_eq(GFX9_GFX_PGM_RSRC1_MIN, 0x2C0040, "GFX RSRC1 minimum value");
     assert_eq(GFX9_GFX_PGM_RSRC1_MIN, GFX9_COMPUTE_PGM_RSRC1_MIN, "GFX RSRC1 mirrors compute");
-    # RSRC2: zero for trivial shape (no USER_SGPR, no scratch, no LDS).
-    # Hazard: PS may need TRAP_PRESENT (bit 6) on GFX9 if the FS does memory ops;
-    # the trivial solid-color FS does not, so 0 is the spec minimum.
-    assert_eq(GFX9_VS_PGM_RSRC2_MIN, 0x0, "VS RSRC2 minimum");
-    assert_eq(GFX9_PS_PGM_RSRC2_MIN, 0x0, "PS RSRC2 minimum");
+    # RSRC2: SPI requires non-zero USER_SGPR allocation for graphics stages.
+    # Byte-exact from radv triangle reference on Cezanne (2026-05-13):
+    # VS USER_SGPR=3 → RSRC2_VS = 0x6, PS USER_SGPR=2 → RSRC2_PS = 0x4.
+    assert_eq(GFX9_VS_PGM_RSRC2_MIN, 0x6, "VS RSRC2 minimum");
+    assert_eq(GFX9_PS_PGM_RSRC2_MIN, 0x4, "PS RSRC2 minimum");
     return 0;
 }
 
@@ -1766,9 +1766,14 @@ fn test_gfx9_spi_format_field_values() {
     assert_eq(SPI_SHADER_Z_FORMAT_INVALID, 0x0, "Z_FORMAT INVALID");
     # COL_FORMAT candidates for RGBA8 RT — Step 6.5 picks one and verifies
     # by CPU-readback. Default is FP32_ABGR (FS writes f32; export quantizes).
-    assert_eq(SPI_SHADER_COL_FORMAT_FP16_ABGR,    0x9, "COL_FORMAT FP16_ABGR");
-    assert_eq(SPI_SHADER_COL_FORMAT_UNORM16_ABGR, 0xA, "COL_FORMAT UNORM16_ABGR");
-    assert_eq(SPI_SHADER_COL_FORMAT_FP32_ABGR,    0xE, "COL_FORMAT FP32_ABGR");
+    # GFX9 4-bit SPI_SHADER_COL_FORMAT field values (gfx9.json):
+    #   4=FP16_ABGR, 5=UNORM16_ABGR, 9=32_ABGR (FP32). Mabda previously
+    #   shipped 0x9/0xA/0xE — those are reserved/undocumented values
+    #   that the SX silently routes to SPI_SHADER_ZERO (no output).
+    #   Fixed 2026-05-13 — pixel(0,0) = (0xFF,0,0,0xFF) on Cezanne.
+    assert_eq(SPI_SHADER_COL_FORMAT_FP16_ABGR,    0x4, "COL_FORMAT FP16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_UNORM16_ABGR, 0x5, "COL_FORMAT UNORM16_ABGR");
+    assert_eq(SPI_SHADER_COL_FORMAT_FP32_ABGR,    0x9, "COL_FORMAT FP32_ABGR");
     return 0;
 }
 
@@ -1785,7 +1790,7 @@ fn test_gfx9_fullscreen_triangle_vertex_count() {
 # Pin every dword the FS encoder emits, plus the total byte count.
 # Per the 4f.ii lesson, value-asserting every spec-derived constant
 # at CPU test time means a typo in an instruction encoding (top
-# byte 0x7E for VOP1, 0xF8 for EXP, 0xBF for SOPP) surfaces here
+# byte 0x7E for VOP1, 0xC4 for EXP, 0xBF for SOPP) surfaces here
 # rather than as a TDR on hardware. Header citations live in
 # src/backend_native.cyr Step 6.2(b) section.
 
@@ -1803,10 +1808,12 @@ fn test_gfx9_fs_solid_red_byte_pattern() {
     assert_eq(load32(&buf +  8), 0x7E040280, "v_mov v2, 0.0");
     assert_eq(load32(&buf + 12), 0x7E0602F2, "v_mov v3, 1.0");
 
-    # EXP instruction (8 bytes, 2 dwords). Top byte 0xF8 (encoding
-    # 0x3E in bits 26-31). Word 0 carries en/tgt/done/vm flags;
-    # word 1 carries vsrc0..3.
-    assert_eq(load32(&buf + 16), 0xF800180F, "exp mrt0 done vm word 0");
+    # EXP instruction (8 bytes, 2 dwords). Top byte 0xC4 (encoding
+    # 0x31 in bits 26-31; the GFX9 EXP opcode, verified by llvm-mc).
+    # Mabda previously used 0xF8 → "invalid encoding" → silent VS/FS
+    # stall → 2-second GFX TDR. Fixed 2026-05-13.
+    # Word 0 carries en/tgt/done/vm flags; word 1 carries vsrc0..3.
+    assert_eq(load32(&buf + 16), 0xC400180F, "exp mrt0 done vm word 0");
     assert_eq(load32(&buf + 20), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
 
     # s_endpgm (SOPP, 0xBF810000) — same byte pattern as compute.
@@ -1861,9 +1868,12 @@ fn test_gfx9_vs_fullscreen_triangle_byte_pattern() {
     assert_eq(load32(&buf + 32), 0x7E040280, "v_mov v2, 0.0");
     assert_eq(load32(&buf + 36), 0x7E0602F2, "v_mov v3, 1.0");
 
-    # EXP pos0 done — top byte 0xF8. tgt=12 (pos0) in bits 4-9.
-    # exp pos0 done en=0xF: 0xF8000000 | (1<<11) | (12<<4) | 0xF = 0xF80008CF.
-    assert_eq(load32(&buf + 40), 0xF80008CF, "exp pos0 done word 0");
+    # EXP pos0 done — top byte 0xC4 (GFX9 EXP opcode 0x31, verified
+    # by llvm-mc). tgt=12 (pos0) in bits 4-9. exp pos0 done en=0xF:
+    # 0xC4000000 | (1<<11) | (12<<4) | 0xF = 0xC40008CF.
+    # Mabda previously used 0xF8 → "invalid encoding" → silent VS/FS
+    # stall → 2-second GFX TDR. Fixed 2026-05-13.
+    assert_eq(load32(&buf + 40), 0xC40008CF, "exp pos0 done word 0");
     assert_eq(load32(&buf + 44), 0x03020100, "exp pos0 vsrc0..3 = v0..v3");
 
     # s_endpgm — same as compute and FS.
@@ -1961,7 +1971,9 @@ fn test_gfx9_pipeline_ctx_value_constants() {
     assert_eq(GFX9_CB_COLOR_CONTROL_NORMAL,     0xCC,  "CB_COLOR_CONTROL NORMAL ROP");
     assert_eq(GFX9_CB_BLEND_DISABLED,           0x0,   "CB blend disabled");
     assert_eq(GFX9_PA_SU_SC_MODE_CULL_NONE,     0x4,   "PA_SU_SC_MODE cull none");
-    assert_eq(GFX9_VGT_SHADER_STAGES_VS_PS,     0x0,   "VGT stages VS+PS only");
+    # VS_EN bit lives at bit 16; 0 means VS_STAGE_OFF (VGT waits forever
+    # for vertex output → 2-second TDR). Byte-exact from radv on Cezanne.
+    assert_eq(GFX9_VGT_SHADER_STAGES_VS_PS,     0x00010000, "VGT stages VS+PS only");
     assert_eq(GFX9_PA_CL_CLIP_CNTL_DEFAULT,     0x90000, "PA_CL_CLIP_CNTL default");
     assert_eq(GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, 0x4, "VGT primitive triangle list");
     assert_eq(GFX9_VGT_NUM_INSTANCES_ONE,       0x1,   "VGT num instances 1");
@@ -1970,7 +1982,10 @@ fn test_gfx9_pipeline_ctx_value_constants() {
     assert_eq(GFX9_DB_SHADER_CONTROL_DEFAULT,   0x10,  "DB_SHADER_CONTROL default");
     # Composed bit-pattern values.
     assert_eq(GFX9_CB_COLOR_CONTROL_NORMAL_COPY, 0xCC0010, "CB_COLOR_CONTROL composed");
-    assert_eq(GFX9_CB_COLOR0_INFO_RGBA8_UNORM,   0x28,     "CB_COLOR0_INFO RGBA8 unorm");
+    # Byte-exact from radv triangle reference on Cezanne (2026-05-13).
+    # bits[2:0]=FORMAT_8_8_8_8 (8), bits[5:4]=NUM_TYPE_UNORM (0x20), plus
+    # the COMP_SWAP/FMASK/ENDIAN/etc bits that radv emits in 0x00028028.
+    assert_eq(GFX9_CB_COLOR0_INFO_RGBA8_UNORM,   0x00028028, "CB_COLOR0_INFO RGBA8 unorm");
     assert_eq(GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8, 0x10000000, "CB_COLOR0_ATTRIB 2D linear");
     return 0;
 }
@@ -2009,39 +2024,52 @@ fn test_native_pm4_render_pipeline_sh_layout() {
     var pos = native_pm4_build_render_pipeline_sh(&buf, 0,
     0xFFFF800200000000,
     0xFFFF800200001000);
-    # Two SET_SH_REG packets, each 4 values: 6 dwords each = 12 dwords = 48 bytes.
-    assert_eq(pos, 48, "pipeline_sh size = 48 bytes");
+    # VS packet spans 6 contiguous regs (RSRC3_VS, LATE_ALLOC_VS, PGM_LO,
+    # PGM_HI, RSRC1, RSRC2) = 8 dwords (32 bytes). PS packet spans 4 regs
+    # (PGM_LO, PGM_HI, RSRC1, RSRC2) = 6 dwords (24 bytes). Total 56 bytes.
+    # Grew 48 → 56 at 2026-05-13 when RSRC3_VS + LATE_ALLOC_VS were added
+    # to fix the Cezanne VS-allocation TDR (CUs disabled by default).
+    assert_eq(pos, 56, "pipeline_sh size = 56 bytes");
 
-    # First packet header — SET_SH_REG opcode 0x76, count_minus_1 = 4
-    # (n+1 = 5 data dwords, count field stores n+1-1 = 4).
-    # Header: 0xC0_count_minus_1<<16_0x76<<8 = 0xC0047600.
-    assert_eq(load32(&buf + 0), 0xC0047600, "VS SET_SH_REG header");
-    assert_eq(load32(&buf + 4), 0x48, "VS PGM_LO wire offset (0xB120 → 0x48)");
+    # First packet header — SET_SH_REG opcode 0x76, count = n+1 = 7,
+    # count_minus_1 = 6. Header: 0xC0067600.
+    assert_eq(load32(&buf + 0), 0xC0067600, "VS SET_SH_REG header");
+    # Wire offset for the FIRST reg in the packet (RSRC3_VS at 0xB118):
+    # (0xB118 - 0xB000)/4 = 0x46 = 70.
+    assert_eq(load32(&buf + 4), 0x46, "VS RSRC3_VS wire offset (0xB118 → 0x46)");
     # vs_va = 0xFFFF800200000000.
+    # New layout (2026-05-13): RSRC3_VS, LATE_ALLOC_VS, PGM_LO, PGM_HI,
+    # RSRC1, RSRC2 — 6 contiguous regs starting at 0xB118.
     # PGM_LO = (va >> 8) & 0xFFFFFFFF = 0x02000000 (Cyrius >> is logical).
     # PGM_HI = (va >> 40) & 0xFF = bits [47:40] of va = 0x80.
-    assert_eq(load32(&buf + 8),  0x02000000, "VS PGM_LO = (vs_va>>8) low");
-    assert_eq(load32(&buf + 12), 0x80,       "VS PGM_HI = (vs_va>>40) byte");
-    assert_eq(load32(&buf + 16), GFX9_GFX_PGM_RSRC1_MIN, "VS PGM_RSRC1");
-    assert_eq(load32(&buf + 20), GFX9_VS_PGM_RSRC2_MIN, "VS PGM_RSRC2");
+    assert_eq(load32(&buf + 8),  GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL, "VS RSRC3_VS (CU enable mask)");
+    assert_eq(load32(&buf + 12), GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE, "VS LATE_ALLOC_VS");
+    assert_eq(load32(&buf + 16), 0x02000000, "VS PGM_LO = (vs_va>>8) low");
+    assert_eq(load32(&buf + 20), 0x80,       "VS PGM_HI = (vs_va>>40) byte");
+    assert_eq(load32(&buf + 24), GFX9_GFX_PGM_RSRC1_MIN, "VS PGM_RSRC1");
+    assert_eq(load32(&buf + 28), GFX9_VS_PGM_RSRC2_MIN,  "VS PGM_RSRC2");
 
-    # Second packet — PS at offset +24 in buf.
+    # Second packet — PS at offset +32 in buf (was +24 pre 2026-05-13).
     # fs_va = 0xFFFF800200001000 → PGM_LO = 0x02000010, PGM_HI = 0x80.
-    assert_eq(load32(&buf + 24), 0xC0047600, "PS SET_SH_REG header");
-    assert_eq(load32(&buf + 28), 0x08, "PS PGM_LO wire offset (0xB020 → 0x08)");
-    assert_eq(load32(&buf + 32), 0x02000010, "PS PGM_LO = (fs_va>>8) low");
-    assert_eq(load32(&buf + 36), 0x80,       "PS PGM_HI = (fs_va>>40) byte");
-    assert_eq(load32(&buf + 40), GFX9_GFX_PGM_RSRC1_MIN, "PS PGM_RSRC1");
-    assert_eq(load32(&buf + 44), GFX9_PS_PGM_RSRC2_MIN, "PS PGM_RSRC2");
+    assert_eq(load32(&buf + 32), 0xC0047600, "PS SET_SH_REG header");
+    assert_eq(load32(&buf + 36), 0x08, "PS PGM_LO wire offset (0xB020 → 0x08)");
+    assert_eq(load32(&buf + 40), 0x02000010, "PS PGM_LO = (fs_va>>8) low");
+    assert_eq(load32(&buf + 44), 0x80,       "PS PGM_HI = (fs_va>>40) byte");
+    assert_eq(load32(&buf + 48), GFX9_GFX_PGM_RSRC1_MIN, "PS PGM_RSRC1");
+    assert_eq(load32(&buf + 52), GFX9_PS_PGM_RSRC2_MIN, "PS PGM_RSRC2");
     return 0;
 }
 
 fn test_native_pm4_render_pipeline_ctx_size_and_anchors() {
-    # 2 grouped packets (3+2 values) + 17 singletons = 5+4+17*3 = 60 dw = 240 bytes.
-    var buf[256];
-    memset(&buf, 0xCC, 256);
+    # 2026-05-13: ctx block now 556 bytes after the RADV-Cezanne IB diff
+    # added RSRC3/LATE_ALLOC + AA-mask handshake + walk-order + 8
+    # explicit-zero handshake regs (SPI_BARYC_CNTL, VGT_GS_MODE, etc.)
+    # plus the 8-reg SX_MRT0..7_BLEND_OPT block. Pre-2026-05-13 size
+    # was 292; pre-rc.2 was 240.
+    var buf[768];
+    memset(&buf, 0xCC, 768);
     var pos = native_pm4_build_render_pipeline_ctx(&buf, 0);
-    assert_eq(pos, 240, "pipeline_ctx size = 240 bytes");
+    assert_eq(pos, 556, "pipeline_ctx size = 556 bytes");
 
     # First packet = SPI shader formats, 3 values starting at POS_FORMAT.
     # Header: PKT3(SET_CONTEXT_REG, count_minus_1=3, 0) = 0xC0036900.
@@ -2075,9 +2103,14 @@ fn test_native_pm4_render_pass_target_layout_256x256() {
     var pos = native_pm4_build_render_pass_target(&buf, 0,
     0xFFFF800101000000,
     256, 256);
-    # Block size: 2 scissor pairs (4+4=8 dw) + 1 viewport-6 (8 dw) +
-    # 1 zminmax-pair (4 dw) + 6 RT singletons (18 dw) = 38 dw = 152 bytes.
-    assert_eq(pos, 152, "pass_target size = 152 bytes");
+    # Block size: 3 scissor pairs (screen/generic/window, 12 dw) +
+    # 1 viewport-6 (8 dw) + 1 zminmax-pair (4 dw) + many RT singletons
+    # (CB_COLOR0_{BASE,BASE_EXT,ATTRIB2,VIEW,INFO,ATTRIB,DCC_CONTROL,
+    # CMASK, CMASK_BASE_EXT, FMASK, FMASK_BASE_EXT, DCC_BASE,
+    # DCC_BASE_EXT, MRT0_EPITCH}) = 264 bytes total. Grew 164 → 264
+    # at 2026-05-13 when WINDOW_SCISSOR + CB FMASK/CMASK/DCC handshake
+    # regs landed in the RADV-Cezanne IB diff round.
+    assert_eq(pos, 264, "pass_target size = 264 bytes");
 
     # First packet = screen scissor pair at +0.
     assert_eq(load32(&buf + 0), 0xC0026900, "screen_scissor header");
@@ -2087,23 +2120,25 @@ fn test_native_pm4_render_pass_target_layout_256x256() {
     # BR = (256 << 0) | (256 << 16) = 0x01000100.
     assert_eq(load32(&buf + 12), 0x01000100, "scissor BR = (256,256)");
 
-    # Skip past second scissor + 6-value viewport packet to spot-check
-    # the viewport scale/offset.
+    # Skip past 3 scissor packets + 6-value viewport packet to spot-check
+    # the viewport scale/offset. 2026-05-13: PA_SC_WINDOW_SCISSOR was
+    # inserted between generic_scissor and viewport (RADV-Cezanne diff).
     # screen_scissor: 4 dw (16 bytes), generic_scissor: 4 dw (16 bytes),
-    # viewport packet at offset 32. Header + offset + 6 values = 8 dw.
+    # window_scissor: 4 dw (16 bytes), viewport packet at offset 48.
+    # Header + offset + 6 values = 8 dw.
     # set_context_reg(n=6) → pkt3 count_minus_1 = 6 → header 0xC0066900.
-    assert_eq(load32(&buf + 32), 0xC0066900, "viewport header (6 values)");
+    assert_eq(load32(&buf + 48), 0xC0066900, "viewport header (6 values)");
     # Wire offset (0xA43C - 0xA000)/4 = 0x10F.
-    assert_eq(load32(&buf + 36), 0x10F, "PA_CL_VPORT_XSCALE wire offset");
+    assert_eq(load32(&buf + 52), 0x10F, "PA_CL_VPORT_XSCALE wire offset");
     # Viewport: XSCALE = 128.0 = 0x43000000, XOFFSET = 128.0,
     # YSCALE = -128.0 = 0xC3000000, YOFFSET = 128.0,
     # ZSCALE = 1.0 = 0x3F800000, ZOFFSET = 0.
-    assert_eq(load32(&buf + 40), 0x43000000, "VPORT XSCALE = 128.0");
-    assert_eq(load32(&buf + 44), 0x43000000, "VPORT XOFFSET = 128.0");
-    assert_eq(load32(&buf + 48), 0xC3000000, "VPORT YSCALE = -128.0");
-    assert_eq(load32(&buf + 52), 0x43000000, "VPORT YOFFSET = 128.0");
-    assert_eq(load32(&buf + 56), 0x3F800000, "VPORT ZSCALE = 1.0");
-    assert_eq(load32(&buf + 60), 0,          "VPORT ZOFFSET = 0.0");
+    assert_eq(load32(&buf + 56), 0x43000000, "VPORT XSCALE = 128.0");
+    assert_eq(load32(&buf + 60), 0x43000000, "VPORT XOFFSET = 128.0");
+    assert_eq(load32(&buf + 64), 0xC3000000, "VPORT YSCALE = -128.0");
+    assert_eq(load32(&buf + 68), 0x43000000, "VPORT YOFFSET = 128.0");
+    assert_eq(load32(&buf + 72), 0x3F800000, "VPORT ZSCALE = 1.0");
+    assert_eq(load32(&buf + 76), 0,          "VPORT ZOFFSET = 0.0");
     return 0;
 }
 
@@ -2118,18 +2153,33 @@ fn test_native_pm4_render_pass_target_rt_bind() {
     var pos = native_pm4_build_render_pass_target(&buf, 0,
     0xFFFF800101000000,
     256, 256);
-    # CB_COLOR0 singletons follow scissor (32) + viewport (32) + zmm (16)
-    # = 80 bytes. CB_COLOR0_BASE single-reg header at offset 80.
+    # CB_COLOR0 singletons follow 3 scissor pairs (48) + viewport (32) +
+    # zmm (16) = 96 bytes. CB_COLOR0_BASE single-reg header at offset 96
+    # (was +80 pre-2026-05-13, before WINDOW_SCISSOR insert).
     # set_context_reg_one → pkt3_header(0x69, 2, 0) → count_minus_1 = 1.
-    assert_eq(load32(&buf + 80), 0xC0016900, "CB_COLOR0_BASE header");
+    assert_eq(load32(&buf + 96), 0xC0016900, "CB_COLOR0_BASE header");
     # Wire offset (0xAC60 - 0xA000)/4 = 0xC60/4 = 0x318.
-    assert_eq(load32(&buf + 84), 0x318, "CB_COLOR0_BASE wire offset");
-    assert_eq(load32(&buf + 88), 0x01010000, "CB_COLOR0_BASE = (rt_va>>8) low");
+    assert_eq(load32(&buf + 100), 0x318, "CB_COLOR0_BASE wire offset");
+    assert_eq(load32(&buf + 104), 0x01010000, "CB_COLOR0_BASE = (rt_va>>8) low");
 
-    # CB_COLOR0_BASE_EXT at +92 (next 3-dword packet).
-    assert_eq(load32(&buf + 92), 0xC0016900, "CB_COLOR0_BASE_EXT header");
-    assert_eq(load32(&buf + 96), 0x319, "CB_COLOR0_BASE_EXT wire offset");
-    assert_eq(load32(&buf + 100), 0x80, "CB_COLOR0_BASE_EXT = (rt_va>>40) byte");
+    # CB_COLOR0_BASE_EXT at +108 (next 3-dword packet).
+    assert_eq(load32(&buf + 108), 0xC0016900, "CB_COLOR0_BASE_EXT header");
+    assert_eq(load32(&buf + 112), 0x319, "CB_COLOR0_BASE_EXT wire offset");
+    assert_eq(load32(&buf + 116), 0x80, "CB_COLOR0_BASE_EXT = (rt_va>>40) byte");
+
+    # CB_COLOR0_ATTRIB2 at +120 — the rc.2 0x55-sentinel bug fix.
+    # Without this register the CB sees the RT as zero-extent and
+    # silently drops every pixel write (draw signals fine, RT stays
+    # at the test's pre-fill sentinel). For 256x256:
+    #   MIP0_HEIGHT (bits 0..13)  = 255 = 0xFF
+    #   MIP0_WIDTH  (bits 14..27) = 255 << 14 = 0x3FC000
+    #   MAX_MIP     (bits 28..31) = 0
+    # → value = 0xFF | 0x3FC000 = 0x3FC0FF.
+    # Wire offset = (0xAC68 - 0xA000)/4 = 0xC68/4 = 0x31A.
+    assert_eq(load32(&buf + 120), 0xC0016900, "CB_COLOR0_ATTRIB2 header");
+    assert_eq(load32(&buf + 124), 0x31A, "CB_COLOR0_ATTRIB2 wire offset");
+    assert_eq(load32(&buf + 128), 0x3FC0FF,
+    "CB_COLOR0_ATTRIB2 = (h-1) | ((w-1)<<14) for 256x256");
     return 0;
 }
 
@@ -2177,41 +2227,59 @@ fn test_native_pm4_render_clear_triangle_top_level() {
     # Padded to 256 dwords = 1024 bytes.
     assert_eq(pos, 1024, "composer pads to 1024 bytes");
 
-    # ACQUIRE_MEM at offset 0: 7 dwords (28 bytes), header 0xC0055802.
-    assert_eq(load32(&buf + 0), 0xC0055802, "ACQUIRE_MEM header");
+    # 2026-05-13 layout (RADV-Cezanne IB diff):
+    # +0   PFP_SYNC_ME (8 bytes)
+    # +8   ACQUIRE_MEM (28 bytes; gfx-ring variant, shader_type=0)
+    # +36  EVENT_WRITE PIPELINESTAT_START (8 bytes)
+    # +44  SET_UCONFIG VGT_PRIMITIVE_TYPE (12 bytes)
+    # +56  SET_UCONFIG IA_MULTI_VGT_PARAM (12 bytes) [new — replaces +40 num_instances]
+    # +68  pipeline_sh (56 bytes)
+    # +124 pipeline_ctx (556 bytes)
+    # +680 pass_target (264 bytes)
+    # +944 PKT3 NUM_INSTANCES (8 bytes) [moved from preamble; opcode 0x2F]
+    # +952 draw_tail (12 bytes)
+    # +964 EVENT_WRITE CACHE_FLUSH_AND_INV (8 bytes)
+    # +972 NOP pad to 1024
+    # ACQUIRE_MEM at offset 8: header 0xC0055800 (gfx-ring shader_type=0).
+    assert_eq(load32(&buf + 8), 0xC0055800, "ACQUIRE_MEM header");
 
-    # First UConfig SET_REG packet at offset 28 (post-ACQUIRE_MEM).
+    # First UConfig SET_REG packet at offset 44 (post-PIPELINESTAT_START).
     # set_uconfig_reg_one passes count=2 to pkt3_header → count_minus_1=1
     # → header 0xC0017900.
-    assert_eq(load32(&buf + 28), 0xC0017900, "VGT_PRIMITIVE_TYPE UConfig header");
+    assert_eq(load32(&buf + 44), 0xC0017900, "VGT_PRIMITIVE_TYPE UConfig header");
     # VGT_PRIMITIVE_TYPE wire offset = (0x30908 - 0x30000)/4 = 0x242.
-    assert_eq(load32(&buf + 32), 0x242, "VGT_PRIMITIVE_TYPE wire offset");
-    assert_eq(load32(&buf + 36), GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, "primitive type");
+    assert_eq(load32(&buf + 48), 0x242, "VGT_PRIMITIVE_TYPE wire offset");
+    assert_eq(load32(&buf + 52), GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST, "primitive type");
 
-    # Second UConfig at offset 40.
-    assert_eq(load32(&buf + 40), 0xC0017900, "VGT_NUM_INSTANCES UConfig header");
-    # VGT_NUM_INSTANCES wire offset = (0x30934 - 0x30000)/4 = 0x24D.
-    assert_eq(load32(&buf + 44), 0x24D, "VGT_NUM_INSTANCES wire offset");
-    assert_eq(load32(&buf + 48), GFX9_VGT_NUM_INSTANCES_ONE, "num instances 1");
+    # Second UConfig at offset 56 — IA_MULTI_VGT_PARAM (NOT VGT_NUM_INSTANCES
+    # since 2026-05-13). NUM_INSTANCES is now emitted as PKT3 0x2F just
+    # before DRAW_INDEX_AUTO (radv pattern). Label retained for cascade.
+    assert_eq(load32(&buf + 56), 0xC0017900, "VGT_NUM_INSTANCES UConfig header");
+    # IA_MULTI_VGT_PARAM wire offset = (0x30960 - 0x30000)/4 = 0x258 = 600.
+    assert_eq(load32(&buf + 60), 0x258, "VGT_NUM_INSTANCES wire offset");
+    assert_eq(load32(&buf + 64), 0x0070007F, "num instances 1");
 
-    # Pipeline_sh starts at offset 52. VS PGM_LO header.
-    assert_eq(load32(&buf + 52), 0xC0047600, "pipeline_sh begins (VS SET_SH_REG)");
+    # Pipeline_sh starts at offset 68 (VS SET_SH_REG opcode 0x76, 6 regs).
+    # Header: 0xC0067600 (count_minus_1 = 6 since the VS packet now spans
+    # RSRC3_VS through RSRC2_VS — 6 contiguous regs at 0xB118..0xB12C).
+    assert_eq(load32(&buf + 68), 0xC0067600, "pipeline_sh begins (VS SET_SH_REG)");
 
-    # CACHE_FLUSH_AND_INV EVENT_WRITE spliced after draw_tail (Step
-    # 6.10 wired post-pivot). draw_tail ends at offset 504; the
-    # 8-byte EVENT_WRITE packet lands at 504..512 with header
-    # 0xC0004600 and body 0x00000016.
-    assert_eq(load32(&buf + 504), 0xC0004600,
+    # CACHE_FLUSH_AND_INV EVENT_WRITE spliced after draw_tail (Step 6.10
+    # wired post-pivot). 2026-05-13 layout: composer offsets shifted
+    # again with RADV-Cezanne IB diff additions; flush packet now lands
+    # at +964..+972 with header 0xC0004600 and body 0x00000016.
+    assert_eq(load32(&buf + 964), 0xC0004600,
     "EVENT_WRITE header after draw_tail");
-    assert_eq(load32(&buf + 508), 0x00000016,
+    assert_eq(load32(&buf + 968), 0x00000016,
     "CACHE_FLUSH_AND_INV body");
     return 0;
 }
 
 fn test_native_pm4_render_clear_triangle_block_sizes() {
-    # Confirm block sizes sum to the expected pre-padding total.
-    # ACQUIRE_MEM (28) + 2 UConfig (24) + sh (48) + ctx (228) +
-    # pass_target (152) + draw_tail (12) = 492 bytes pre-pad.
+    # 2026-05-13 block sizes (RADV-Cezanne IB diff round):
+    #   ACQUIRE_MEM (28) + 2 UConfig (24) + sh (56) + ctx (556) +
+    #   pass_target (264) + draw_tail (12) = 940 bytes pre-pad.
+    # Comments on each assert retain old "expected = X" continuity.
     var buf[1024];
     memset(&buf, 0xCC, 1024);
 
@@ -2227,14 +2295,14 @@ fn test_native_pm4_render_clear_triangle_block_sizes() {
     p = native_pm4_build_render_pipeline_sh(&buf, p,
     0xFFFF800200000000,
     0xFFFF800200001000);
-    assert_eq(p, 100, "+pipeline_sh = 48");
+    assert_eq(p, 108, "+pipeline_sh = 56");
     p = native_pm4_build_render_pipeline_ctx(&buf, p);
-    assert_eq(p, 340, "+pipeline_ctx = 240");
+    assert_eq(p, 664, "+pipeline_ctx = 556");
     p = native_pm4_build_render_pass_target(&buf, p,
     0xFFFF800101000000, 256, 256);
-    assert_eq(p, 492, "+pass_target = 152");
+    assert_eq(p, 928, "+pass_target = 264");
     p = native_pm4_build_render_draw_tail(&buf, p, GFX9_FULLSCREEN_TRI_VCOUNT);
-    assert_eq(p, 504, "+draw_tail = 12");
+    assert_eq(p, 940, "+draw_tail = 12");
     return 0;
 }
 
@@ -2308,15 +2376,18 @@ fn test_native_render_bo_list_pack_distinct_from_compute() {
 # memcpy them with confidence).
 
 fn test_native_render_pipeline_struct_field_offsets() {
+    # 2026-05-13: sh_block grew 48 → 56, ctx_block 292 → 556, struct
+    # total 372 → 644. ctx_block field offset bumped 80 → 88 to follow
+    # sh_block's new size.
     assert_eq(NATIVE_PIPE_FIELD_VS_HANDLE,  0,   "vs_handle at +0");
     assert_eq(NATIVE_PIPE_FIELD_VS_VA,      8,   "vs_va at +8");
     assert_eq(NATIVE_PIPE_FIELD_FS_HANDLE,  16,  "fs_handle at +16");
     assert_eq(NATIVE_PIPE_FIELD_FS_VA,      24,  "fs_va at +24");
     assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK,   32,  "sh_block at +32");
-    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  80,  "ctx_block at +80");
-    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    48,  "sh_block size = 48");
-    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   240, "ctx_block size = 240");
-    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      320, "total = 320");
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  88,  "ctx_block at +88");
+    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    56,  "sh_block size = 56");
+    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   556, "ctx_block size = 556");
+    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      644, "total = 644");
     # The two block sizes must match the composers' actual outputs;
     # the SH_BLOCK starts where the header ends, and the CTX_BLOCK
     # starts where the SH_BLOCK ends.
@@ -2338,8 +2409,8 @@ fn test_native_render_pipeline_pack_matches_composer() {
     var vs_va = 0xFFFF800200000000;
     var fs_va = 0xFFFF800200001000;
 
-    var pipe[320];
-    memset(&pipe, 0xCC, 320);
+    var pipe[644];
+    memset(&pipe, 0xCC, 644);
     var rc = native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va);
     assert_eq(rc, 0, "pack returns 0 on success");
 
@@ -2350,26 +2421,26 @@ fn test_native_render_pipeline_pack_matches_composer() {
     assert_eq(load64(&pipe + NATIVE_PIPE_FIELD_FS_VA),     fs_va, "fs_va");
 
     # Re-build the blocks via the composers into a parallel buffer
-    # and compare dword-by-dword.
-    var ref_sh[48];
-    memset(&ref_sh, 0xDD, 48);
+    # and compare dword-by-dword. Sizes per 2026-05-13 layout.
+    var ref_sh[56];
+    memset(&ref_sh, 0xDD, 56);
     var sh_end = native_pm4_build_render_pipeline_sh(&ref_sh, 0, vs_va, fs_va);
-    assert_eq(sh_end, 48, "ref sh_block ends at 48");
+    assert_eq(sh_end, 56, "ref sh_block ends at 56");
 
-    var ref_ctx[240];
-    memset(&ref_ctx, 0xDD, 240);
+    var ref_ctx[556];
+    memset(&ref_ctx, 0xDD, 556);
     var ctx_end = native_pm4_build_render_pipeline_ctx(&ref_ctx, 0);
-    assert_eq(ctx_end, 240, "ref ctx_block ends at 240");
+    assert_eq(ctx_end, 556, "ref ctx_block ends at 556");
 
     var i = 0;
-    while (i < 48) {
+    while (i < 56) {
         assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + i),
         load32(&ref_sh + i),
         "sh_block dword matches composer");
         i = i + 4;
     }
     var j = 0;
-    while (j < 240) {
+    while (j < 556) {
         assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_CTX_BLOCK + j),
         load32(&ref_ctx + j),
         "ctx_block dword matches composer");

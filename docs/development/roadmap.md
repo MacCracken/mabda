@@ -208,6 +208,23 @@ contract held. The v2.5 render graph must replay unchanged on both.
   architecturally load-bearing. Now also the precedent for v4.0
   (NVIDIA) and v5.0 (Intel).
 
+### Release cadence (rc.3 / rc.4 / 3.0.0 GA)
+
+The path from rc.2 → 3.0.0 was re-shaped 2026-05-12 to split the
+soak window across two rc cuts:
+
+- **rc.3** — ≤6h burn-in proof (the dirty-fast gate). Detail in
+  [`3-0-rc-3-punchlist.md`](3-0-rc-3-punchlist.md).
+- **rc.4** — 24h → 3-day soak. **24h-clean is the earliest cut
+  for 3.0.0 GA.** The 3-day window is the focus of the first few
+  3.0.x patches (anything surfacing between 24h and 72h goes to
+  the patch backlog, not the GA gate). Detail in
+  [`3-0-rc-4-punchlist.md`](3-0-rc-4-punchlist.md).
+
+This split keeps regressions cheap to catch (you spend 6h, not 3
+days, before learning something is broken) while preserving the
+multi-day observation that informs the post-GA patch stream.
+
 ### Exit criteria
 - `dist/mabda.cyr` ships with both backends compiled in; default is
   still `wgpu` for API-stability reasons.

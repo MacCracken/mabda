@@ -1,10 +1,30 @@
 # Issue: `cyrius lint` reports phantom "unclosed braces at end of file" on large test files
 
+**Status:** ✅ **RESOLVED in cyrius v5.8.41** (verification slot,
+2026-05-03). Premise check at v5.8.41 entry could not reproduce
+the bug across 4 synthetic repros (3500-line plain-vars file,
+mabda's actual mabda.tcyr at 2743 lines, doubled mabda content
+at 5486 lines, and a 9007-line synthetic with 600 fns + multi-
+line `assert_eq()` calls + comments) — all returned 0 warnings.
+Likely fixed by intermediate cyrlint refactor / brace-tracker /
+string-literal-awareness work between v5.7.23 (filing) and
+v5.8.40 (premise check); this issue file was never updated
+post-resolution. v5.8.41 ships a regression-floor gate at
+`cyrius/tests/regression-cyrlint-large-file.sh` that locks the
+fixed state into CI: a 7010-line synthetic file matching this
+issue's repro shape (multi-line `assert_eq()` calls, 700 fns,
+test_groups, comments) must produce 0 "unclosed braces" / 0
+"trailing whitespace" warnings or the gate fails.
+
+**If you hit a NEW variant of this bug**: file a NEW issue with
+fresh repro details + repo location; reference this issue's
+RESOLVED status. Don't reopen this one.
+
 **Discovered:** 2026-04-28 (mabda v3 Step 3d, refined Step 3e)
-**Component:** `cyrius lint` (toolchain — `cyrius 5.7.23`)
+**Component:** `cyrius lint` (toolchain — `cyrius 5.7.23` at filing; resolved by `cyrius 5.8.41`)
 **Severity:** Low (false positive, not blocking compile/test, but
 breaks CI gating per `mabda/CLAUDE.md`)
-**Workarounds in place:**
+**Workarounds (no longer needed at cyrius >= 5.8.40; kept for historical reference):**
 1. Avoid multi-line column-aligned `assert_eq()` continuations
 2. Avoid pushing total `tests/tcyr/mabda.tcyr` length past ~3270 lines
    without splitting into separate test files

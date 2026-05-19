@@ -1,6 +1,6 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0 / Cyrius 5.7.48. Pairs with
+> Written against mabda 3.0.0 / Cyrius 5.11.28. Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
 > wgpu-OR-native consumer that swaps backends without changing

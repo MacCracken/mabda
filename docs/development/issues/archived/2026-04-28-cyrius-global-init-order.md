@@ -1,12 +1,29 @@
-# Issue: Cyrius global init order — silent zero for forward refs
+# Issue: Cyrius global init order — silent zero for forward refs — RESOLVED
+
+**Status:** ✅ **RESOLVED in cyrius v5.7.32** (cyrlint global-init-
+order forward-ref warning shipped). `cyrius lint` now emits a
+warning at every top-level `var X = expr;` whose `expr` references
+a `var` declared at a line > X's line. Mabda's repro
+(`_NATIVE_PERM_FULL = AMDGPU_VM_PAGE_R | W | X` evaluating to 0
+because the perm constants were declared 274 lines later) would
+now warn at `cyrius lint` time before the silent miscompile lands
+in CI / hardware test. v5.7.36 added string-literal awareness so
+identifier-shaped substrings inside `"..."` literals don't
+false-positive. Regression gate at
+`cyrius/tests/regression-lint-global-init-order.sh` (4 sub-tests).
+Cyrius-side mirror archived 2026-05-03 to
+`cyrius/docs/development/issues/archived/2026-04-28-global-init-
+order-forward-ref.md`.
+
+**If you hit a NEW variant of this bug**: file a NEW issue with
+fresh repro details + repo location; reference this issue's
+RESOLVED status. Don't reopen this one.
 
 **Discovered:** 2026-04-28 (mabda v3 Step 4f.ii — BO page perms tightening)
 **Component:** `cyrius` compiler / runtime — global initializer evaluation
 **Severity:** Medium (silent miscompile; surfaces as runtime zeros that
 look like working code)
-**Toolchain at discovery:** `cyrius 5.7.23` (also reproduces at `5.7.28`)
-**Upstream status:** Slotted for review + fix in `cyrius 5.7.32` (per
-the language-agent review queue, 2026-04-28).
+**Toolchain at discovery:** `cyrius 5.7.23` (also reproduces at `5.7.28`); resolved by `cyrius 5.7.32`
 
 ## Summary
 

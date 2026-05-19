@@ -10,10 +10,15 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 5.7.48+ (`cyrius.cyml: cyrius = "5.7.48"`)
-- **Version**: 3.0.0-rc.1 in tree — official 3.0.0 ships once the
-  rc.2 punchlist (`docs/development/3-0-rc-2-punchlist.md`) closes
-  out the deferred audit items. v3.0 ships dual backend (wgpu +
+- **Language**: Cyrius 5.11.28+ (`cyrius.cyml: cyrius = "5.11.28"`)
+- **Version**: 3.0.0-rc.2 in tree — official 3.0.0 ships after the
+  rc.3 (≤6h soak proof) and rc.4 (24h → 3-day soak) cuts. rc.2
+  closed out the audit punchlist
+  (`docs/development/3-0-rc-2-punchlist.md`); the rc.3/rc.4 plan
+  lives in `docs/development/3-0-rc-3-punchlist.md` and
+  `docs/development/3-0-rc-4-punchlist.md`. **1-day soak is the
+  earliest cut for 3.0.0 GA**; the full 3-day window is the
+  focus of the first few 3.0.x patches. v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu,
   AMD only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
 - **GPU FFI**: dual-path
@@ -455,7 +460,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.7.48"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "5.11.28"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts
