@@ -18,6 +18,123 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.0-rc.3] — 2026-05-19
+
+**6-hour soak gate cleared.** Two GFX9-ISA root causes that were
+masking as PM4 issues for the entire rc.2 → rc.3 window are fixed in
+tree (EXP opcode byte + SPI_SHADER_COL_FORMAT field values; see
+[`docs/issues/2026-05-13-native-render-cezanne-tdr.md`](docs/issues/2026-05-13-native-render-cezanne-tdr.md)).
+17 supporting register-correctness improvements landed alongside.
+The rc.3 6 h soak (`--workload=all` = compute + wgpu + render in
+parallel, per `docs/development/3-0-rc-3-punchlist.md`) ran clean
+end-to-end: **33 / 33 checkpoints PASS, 21.6 M total iterations, RSS
+12 760 KB flat, dmesg Δ = 0**. Toolchain pin advanced
+`5.7.48 → 5.11.64` (samvada already on 0.2.2). Official `3.0.0` is
+next: rc.4 takes this bundle into the 24 h GA gate.
+
+**Metrics**: 38 src/ modules / ~14,500 LoC unchanged / **1957 CPU
+asserts** across 3 test files (was 1871 at rc.2; +86 from the
+mabda_v3 assert rebalance landed alongside the TDR fix) /
+`dist/mabda.cyr` ~11,800 lines / 8 GPU integration programs.
+
+### Fixed — 2026-05-13 (native render Cezanne TDR root-cause)
+
+- **EXP instruction encoding (TDR cause).** The hand-encoded GFX9
+  `exp` instructions in
+  `native_gfx9_shader_fullscreen_triangle_vs` and
+  `native_gfx9_shader_solid_red` used top byte `0xF8` (claiming the
+  GFX9 EXP opcode); the correct encoding has bits 31-26 = `0x31`,
+  i.e. top byte `0xC4`. `llvm-mc --disassemble --arch=amdgcn
+  --mcpu=gfx90c` flags `0xF8` as `invalid instruction encoding`;
+  `0xC4` decodes as `exp pos0 …` and `exp mrt0 … vm` cleanly.
+  Symptom: VS waves ran every preceding instruction, then the
+  malformed `exp` silently failed to publish vertex position, VGT
+  waited forever for output, 2-second GFX-ring TDR. FS hit the
+  same wall one stage later. Fix is in
+  `src/backend_native_shaders.cyr`; regression coverage is the
+  `scripts/disasm-shaders.sh` byte-check now wired into the
+  pre-soak verification recipe per the
+  [[feedback_verify_gfx9_shader_bytes_with_llvm_mc]] memory.
+- **`SPI_SHADER_COL_FORMAT` field values (zero-pixel cause).** Past
+  the EXP fix the GFX ring stopped hanging at dispatch=0 ms, but
+  the RT came back `(0x00, 0x00, 0x00, 0x00)` instead of the FS's
+  exported `(0xFF, 0x00, 0x00, 0xFF)` UNORM8 conversion. Root
+  cause: mabda's three SPI_SHADER_COL_FORMAT constants were all
+  off by a few slots, and `FP32_ABGR = 0xE` happens to be reserved
+  in the GFX9 SPI 4-bit field — SX silently routes reserved values
+  to `SPI_SHADER_ZERO`, so the FS export never reached the CB.
+  Corrected to the GFX9 PAL spec table values
+  (`FP16_ABGR = 0x4`, `UNORM16_ABGR = 0x5`, `FP32_ABGR = 0x9`) in
+  `src/backend_native_shaders.cyr`.
+- **17 supporting register-correctness improvements** landed in the
+  same session before the EXP/COL_FORMAT discoveries surfaced.
+  Highlights: `VGT_SHADER_STAGES_EN = 0x00010000` (was 0 = VS_OFF
+  — a real bug, just not the TDR cause), `SPI_SHADER_PGM_RSRC3_VS
+  = 0x003FFFFE` (CU enable mask), `SPI_SHADER_LATE_ALLOC_VS = 24`,
+  plus the broader sweep documented in the TDR issue file. None
+  caused the hang on their own; collectively they push mabda's PM4
+  stream closer to the radv byte-exact target the
+  `programs/native_pm4_dump` capture harness verifies against.
+
+### Changed — 2026-05-13
+
+- **`tests/tcyr/mabda_v3.tcyr` assert rebalance** — 124 lines removed,
+  293 added in the "fixing asserts" pass; counts settle at 951 (was
+  858 at rc.2). The v3 suite now exercises the corrected SPI/EXP
+  values directly so the byte-encoding regressions caught above
+  show up as structural test failures, not as silent runtime
+  zero-pixel returns.
+- **`scripts/soak.sh` hardening** for the rc.3 / rc.4 gates: the
+  workload bundle keys (`all` / `native` / `both`), the dynamic
+  per-workload CSV columns (`iters_<name>`), and the
+  exponential-then-15-min checkpoint cadence all date from this
+  pass. `--workload=all` is the new rc.3/rc.4 primary; the
+  pre-rc.3 `both` alias is retained for back-compat.
+- **`programs/benchmarks.cyr`** picked up the wgpu-side benches
+  that complete the Rust-v1 parity grid on the wgpu path.
+
+### Unblocked — 2026-05-19
+
+- **rc.3 6 h soak.** Full result tree in
+  `docs/handoff/soak-20260519T072831Z/` (`soak.log`, `soak.csv`,
+  per-workload `iterations/`, dmesg baseline + final). Run:
+  `scripts/soak.sh --workload=all --stop=6h`. Final state from
+  the CSV last row (`t=21600s`):
+  - `iters_compute = 12 030 710` (native AMD compute, PM4 dispatch
+    + 0xDEADBEEF readback, every iteration verified)
+  - `iters_wgpu = 602 971` (`render_graph_e2e` — 3-node DAG
+    compute → render → copy through wgpu-native)
+  - `iters_render = 9 278 402` (native AMD GFX-ring clear-triangle
+    + pixel verify — the path the TDR bugs above were blocking)
+  - `rss_kb = 12 760` (identical to t=1s — no bump-allocator
+    monotonic growth across 6 hours, validating the rc.2
+    MED-7+LOW-5 PM4-scratch leak fix in long-form)
+  - `dmesg_delta = 0` (no new `amdgpu`/`drm` lines vs baseline; no
+    `dmesg.diff` artifact written — that's FAIL-only)
+- **rc.4 24 h GA gate** is the next soak. Same `--workload=all`,
+  `--stop=24h`, same logdir shape. Reference recipe:
+  `docs/development/3-0-rc-4-punchlist.md`.
+
+### Next
+
+- **rc.4 24 h GA gate** — `scripts/soak.sh --workload=all --stop=24h`.
+  Clean = earliest cut for 3.0.0 GA; the full 3-day window is
+  3.0.x territory per the rc.4 punchlist.
+- **6-consumer regression sweep** against the rc.3 bundle (soorat /
+  rasa / ranga / bijli / aethersafta / kiran-via-soorat) — still
+  owed from the rc.3 punchlist exit list. Parallelizable to a
+  sub-agent; file any regressions at
+  `docs/issues/2026-05-MM-<project>-rc3-regression.md`.
+- **`present` workload soak** (`programs/native_present_e2e`,
+  120-frame animated gradient) is still gated on a tty / kiosk
+  session or a samvada-wired consumer holding DRM master — see
+  the [[project_phase_d_master_logind_blocker]] memory. Not a
+  3.0.0 blocker (KMS Phase D is feature-complete; the soak is
+  observation), but useful coverage before the 24 h cut if the
+  session shape allows.
+- VERSION 3.0.0-rc.3 → 3.0.0-rc.4 → 3.0.0 once the 24 h-clean gate
+  passes.
+
 ## [3.0.0-rc.2] — 2026-05-01
 
 **Audit-track closeout cut.** Every deferred item from the
