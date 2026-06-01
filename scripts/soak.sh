@@ -209,11 +209,14 @@ log "soak start — workload=$WORKLOAD stop=$STOP_SPEC ($STOP_S s) logdir=$LOGDI
 log "active programs: ${NAMES[*]}"
 log "checkpoint schedule (s): ${SCHEDULE[*]}"
 
+# Always invoke make so it rebuilds on *staleness*, not just absence.
+# A pre-existing-but-stale binary (older than its src/*.cyr deps, or
+# built on a superseded toolchain) silently soaks the wrong bundle —
+# see docs/issues/2026-06-01-soak-stale-binary.md. `make` no-ops when the
+# target is genuinely up to date, so this is cheap on the common path.
 for b in "${BINS_TO_BUILD[@]}"; do
-    if [ ! -x "$b" ]; then
-        log "building $b"
-        make "$b" >> "$SOAK_LOG" 2>&1 || { log "FAIL: $b did not build"; exit 1; }
-    fi
+    log "building $b (make resolves up-to-date)"
+    make "$b" >> "$SOAK_LOG" 2>&1 || { log "FAIL: $b did not build"; exit 1; }
 done
 
 # -- dmesg baseline ---------------------------------------------------
