@@ -18,6 +18,38 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.1] — 2026-06-02
+
+**Toolchain refresh + 6 h confirmation soak.** First 3.0.x patch:
+advances the cyrius pin to the latest release and re-burns the bundle
+on it. No public API change.
+
+### Changed
+
+- **Toolchain pin `6.0.27 → 6.0.43`.** GA shipped on the soaked 6.0.27;
+  3.0.1 tracks the latest cyrius. Full gate sweep clean on 6.0.43 —
+  1957 CPU asserts, lint / fmt / vet / dist all green, no fmt drift.
+
+### Fixed
+
+- **`scripts/soak.sh` hands its logdir back to `$SUDO_USER` at exit.**
+  The runner needs sudo for dmesg capture, which left the committed
+  soak artifacts root-owned — and root-owned tracked files break a
+  later `git checkout` / merge on the untracked working-tree copies
+  (the 3.0.0 GA-merge papercut). It now `chown`s `$LOGDIR` back to the
+  invoking user. See
+  [`docs/issues/2026-06-01-soak-stale-binary.md`](docs/issues/2026-06-01-soak-stale-binary.md).
+
+### Soak
+
+- **6 h confirmation soak on 6.0.43 cleared** (`--workload=all`,
+  `docs/handoff/soak-20260603T012856Z/`): full 6 h end-to-end with a
+  clean `exit=0`, RSS flat at 13 444 KB (0 % drift), dmesg Δ = 0, 0
+  FAIL. Iters: compute 12.3 M, render 9.6 M, wgpu 583 K. Validated
+  both soak.sh fixes from the GA cut — the monitor ran to completion
+  (no infant-mortality hang) and handed the logdir back to the
+  invoking user.
+
 ## [3.0.0] — 2026-06-02
 
 **General availability — dual-backend GPU foundation.** mabda 3.0.0

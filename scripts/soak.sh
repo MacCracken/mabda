@@ -441,4 +441,13 @@ stop_loops
 
 log "soak end — exit=$EXIT_CODE — see $LOGDIR/soak.csv for milestone table"
 
+# If launched under sudo (required for dmesg capture), hand the logdir
+# back to the invoking user. Otherwise the artifacts are root-owned, and
+# committing them makes a later `git checkout`/merge fail on the untracked
+# root-owned copies — the 3.0.0 GA-merge papercut. See
+# docs/issues/2026-06-01-soak-stale-binary.md.
+if [ -n "${SUDO_USER:-}" ]; then
+    chown -R "$SUDO_USER" "$LOGDIR" 2>/dev/null || true
+fi
+
 exit "$EXIT_CODE"

@@ -8,11 +8,11 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.0.0 (dual backend — wgpu + native AMD; see
-*Hardware support* below. GA cut 2026-06-02 after the 24-hour soak
-gate cleared — `--workload=all` ran 26 h 13 m with RSS flat and
-dmesg Δ = 0 on cyrius 6.0.27; see
-`docs/handoff/soak-20260601T222652Z/`.)
+Version: 3.0.1 (dual backend — wgpu + native AMD; see
+*Hardware support* below. GA (3.0.0) cut 2026-06-02 after the 24-hour
+soak gate cleared — `--workload=all` ran 26 h 13 m with RSS flat and
+dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`. 3.0.1 advances
+the cyrius pin to 6.0.43 with a 6 h confirmation soak.)
 
 ## Features
 
@@ -209,7 +209,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              3.0.0
+├── VERSION              3.0.1
 └── CHANGELOG.md
 ```
 
