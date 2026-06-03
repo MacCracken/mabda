@@ -19,18 +19,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
+        # The cyrius.cyml `[package].cyrius` pin is the single source of
+        # truth for the toolchain version (CLAUDE.md § CI/Release). Use the
+        # upstream installer so the versioned ~/.cyrius/versions/<ver>/ layout
+        # matches how cyrius resolves the pin. A hand-rolled flat copy into
+        # ~/.cyrius/{bin,lib} leaves the pinned version unresolvable and
+        # breaks `cyrius deps` (CI failure 2026-06-02; see patra's CI).
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
       - name: Resolve dependencies
         # `cyrius deps` reads [deps].stdlib from cyrius.cyml and copies the
@@ -56,35 +57,17 @@ jobs:
 
       - name: Format check
         run: |
-          # cyrius fmt has a 128 KiB read-buffer cap; files larger
-          # than that get silently truncated, producing a false
-          # "needs fmt" diff that hides the real toolchain bug. The
-          # rc.2 file split brought every checked file under the
-          # cap (largest now is backend_native_kms.cyr at ~77 KiB),
-          # so the bare-skip block is gone.
-          #
-          # Defense-in-depth: a line-count guard catches future
-          # regressions. If `cyrius fmt --check` truncates, its line
-          # count won't match the file's, and we FAIL with a
-          # diagnostic that points at the toolchain rather than
-          # falsely demanding a re-format. (audit rc.2 toolchain
-          # item — line-count guard.)
+          # cyrius 6.0.x's `cyrfmt --check <file>` reports formatting via the
+          # EXIT CODE only (0 = clean, non-zero = needs fmt) — it no longer
+          # echoes the formatted file to stdout the way the 5.x toolchain did.
+          # The old diff/line-count gate (which compared against that stdout)
+          # false-failed every file on 6.0.x. The 5.x 128 KiB fmt-truncation
+          # cap is also gone (cyrfmt 6.0.x formats >128 KiB files cleanly —
+          # e.g. mabda_v3.tcyr at ~133 KiB checks clean), so the size guard
+          # is retired with it.
           fail=0
           for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do
-            sz=$(wc -c < "$f")
-            if [ "$sz" -ge 131072 ]; then
-              echo "FAIL: $f exceeds cyrius fmt 128 KiB cap ($sz bytes) — split required"
-              fail=1
-              continue
-            fi
-            fmt_lines=$(cyrius fmt "$f" --check 2>/dev/null | wc -l)
-            file_lines=$(wc -l < "$f")
-            if [ "$fmt_lines" != "$file_lines" ]; then
-              echo "FAIL fmt truncation: $f (file=$file_lines lines, fmt=$fmt_lines lines) — file the toolchain bug"
-              fail=1
-              continue
-            fi
-            if ! diff -q <(cyrius fmt "$f" --check 2>/dev/null) "$f" > /dev/null; then
+            if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"
               fail=1
             fi
