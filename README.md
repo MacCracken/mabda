@@ -28,8 +28,17 @@ the cyrius pin to 6.0.43 with a 6 h confirmation soak.)
 
 ## Quick Start
 
+mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~515 KB it would
+blow the stdlib preprocess cap). Its stdlib deps that aren't in the cyrius
+auto-prepend union must be `include`d **explicitly, in this order, before
+`mabda`** (the base stdlib — `string`/`alloc`/`str`/`fmt`/`vec`/`io`/… — is
+auto-prepended by `cyrius`, so only these three are manual):
+
 ```cyrius
-include "lib/mabda.cyr"
+include "lib/mmap.cyr"     # mmap flags (MAP_SHARED, …) — GPU buffer mapping
+include "lib/dynlib.cyr"   # dlopen/dlsym — wgpu-native FFI binding
+include "lib/sakshi.cyr"   # structured logging
+include "lib/mabda.cyr"    # mabda itself — MUST come last
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
     color_init();
