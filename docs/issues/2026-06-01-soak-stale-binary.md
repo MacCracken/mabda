@@ -75,3 +75,45 @@ all three programs on 6.0.27 (compute readback `0xDEADBEEF`, render
 pixel `(0xFF,0x00,0x00,0xFF)`, wgpu graph 5/5), and relaunched the
 24h clock at 2026-06-01 22:26:52Z against the fresh binaries
 (`docs/handoff/soak-20260601T222652Z/`).
+
+---
+
+## Amendment 2026-06-02 — monitor process died ~15 min before the finish
+
+The 6.0.27 relaunch ran clean for the full window, but a second
+`soak.sh` robustness bug surfaced at the very end.
+
+**Symptom.** The last recorded checkpoint was t=23h (85500s,
+22:11:52Z) — PASS, RSS flat 13092 KB, dmesg Δ=0. The 86400s/24h
+checkpoint **never logged**, yet the workload loops kept running.
+At inspection (00:35Z June 3, ~26h elapsed) the three loop subshells
+were alive and **reparented to init** (PPID 1), counters still
+climbing (compute 53.9M), all `.status` files `ok`, dmesg Δ still 0.
+The **monitor process itself was gone** — and it left no
+`interrupted` / `soak end` line, so it died on a signal the
+`INT TERM` trap doesn't cover (no journal OOM / segv / kill record).
+
+**Root cause.** `nohup sudo soak.sh` shields only the outer `sudo`,
+not the inner monitor bash. A SIGHUP on session teardown (or a
+SIGPIPE on the checkpoint `tee`) killed the monitor while its
+orphaned workload subshells — already in their own `while :` loops —
+survived and ran on silently, recording nothing.
+
+**Impact on the GA gate.** None, substantively. The mabda workloads
+demonstrably ran **clean past 24h** (26h13m total, 0% RSS drift, 0
+dmesg delta, all readbacks/pixels passing). A manual closeout
+snapshot was appended to the logdir's `soak.log` + `soak.csv`
+(`94408,26h13m-manual,...,PASS`). The only deficiency is the missing
+auto-logged 86400s row — a tooling failure, not a workload failure.
+**24h gate: substantively PASS.**
+
+**Fix.** Two changes to `soak.sh`:
+1. `trap '' HUP PIPE` near the top — the monitor now survives session
+   teardown and a broken `tee` pipe, so a long unattended run records
+   its final checkpoint.
+2. Workload subshells capture `MONITOR_PID=$$` and `kill -0` it each
+   iteration — if the monitor ever dies anyway, the loops self-exit
+   instead of orphaning into init as silent forever-daemons.
+
+Validated with a 12s smoke: build → checkpoint ramp → final 12s
+checkpoint → `soak end — exit=0` → clean teardown.
