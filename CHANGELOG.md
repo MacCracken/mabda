@@ -18,6 +18,73 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.0] — 2026-06-02
+
+**General availability — dual-backend GPU foundation.** mabda 3.0.0
+ships the wgpu (C-launcher) and native AMD (DRM-ioctl) backends behind
+one unchanged public API, routed through the `Backend` slot table —
+the load-bearing architectural choice of the v3.0 cycle. The 24-hour
+GA soak gate is cleared: the rc.3 bundle, rebuilt on cyrius **6.0.27**,
+ran `--workload=all` (compute + wgpu + render in parallel) for
+**26 h 13 m** — RSS flat at 13 092 KB (0 % drift), dmesg Δ = 0, all
+three workloads green throughout, including sustained desktop video
+contention and a live VT-switch / DRM-master handoff mid-run (the
+render-node paths need no master and ran uninterrupted). Full result
+tree in `docs/handoff/soak-20260601T222652Z/`.
+
+**Metrics**: 38 src/ modules / ~14,500 LoC / **1957 CPU asserts**
+(624 + 951 + 382 across three test files) / `dist/mabda.cyr` 12,372
+lines / 8 GPU integration programs / cyrius pin **6.0.27** /
+samvada `0.2.2`.
+
+### Added
+
+- **24-hour GA soak gate cleared.** `scripts/soak.sh --workload=all
+  --stop=24h` on the 6.0.27-built bundle. Final documented state at
+  26 h 13 m (`docs/handoff/soak-20260601T222652Z/`):
+  `iters_compute = 53.9 M` (native AMD PM4 dispatch + 0xDEADBEEF
+  readback, every iteration verified), `iters_render = 41.6 M`
+  (native GFX-ring clear-triangle + pixel verify),
+  `iters_wgpu = 2.49 M` (`render_graph_e2e` 3-node DAG through
+  wgpu-native), `rss_kb = 13 092` (0 % drift vs t=1s),
+  `dmesg_delta = 0`. The run exceeded the 24 h gate; the 3-day
+  observation window is 3.0.x territory.
+
+### Changed
+
+- **Toolchain pin `5.11.64 → 6.0.27`.** The 6.0.0 line renamed the
+  test-runner assert intrinsics; the three `.tcyr` suites were swept
+  to the new form and the GA bundle was soaked on 6.0.27.
+  `dist/mabda.cyr` regenerated on 6.0.27 (cosmetic module-separator
+  normalization).
+
+### Fixed
+
+- **`scripts/soak.sh` stale-binary guard.** The runner only built a
+  workload binary when it was *missing*, so a pre-existing-but-stale
+  `build/` artifact (older than its `src/*.cyr` deps, or built on a
+  superseded toolchain) silently soaked the wrong bundle. Now invokes
+  `make` unconditionally and lets mtime deps resolve staleness. See
+  [`docs/issues/2026-06-01-soak-stale-binary.md`](docs/issues/2026-06-01-soak-stale-binary.md).
+- **`scripts/soak.sh` monitor-death robustness.** `nohup sudo soak.sh`
+  shielded only the outer `sudo`; a SIGHUP on session teardown (or
+  SIGPIPE on the checkpoint `tee`) could kill the monitor process
+  mid-run while the orphaned workload loops ran on silently. Added
+  `trap '' HUP PIPE` plus a `MONITOR_PID` liveness check so workload
+  loops self-exit if the monitor dies. (Surfaced ~15 min before the
+  24 h finish on the GA soak; workloads were unaffected — they ran
+  clean past 24 h.)
+
+### Notes
+
+- **Carried to 3.0.x:** 6-consumer regression sweep (soorat / rasa /
+  ranga / bijli / aethersafta / kiran-via-soorat), the master-gated
+  `present` workload soak, and the 24 h → 72 h observation window.
+  None gate GA. Next planned patch: **3.0.1** pinned to the latest
+  cyrius release with a 6 h confirmation soak.
+- rc.1 – rc.4 detail is retained in the sections below; this entry is
+  the GA consolidation.
+
 ## [3.0.0-rc.3] — 2026-05-19
 
 **6-hour soak gate cleared.** Two GFX9-ISA root causes that were

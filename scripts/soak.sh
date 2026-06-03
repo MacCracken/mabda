@@ -51,8 +51,21 @@
 
 set -euo pipefail
 
+# Survive session/terminal teardown. `nohup sudo soak.sh` only shields
+# the outer sudo, not this monitor. A SIGHUP on session close or a
+# SIGPIPE on the checkpoint `tee` can silently kill the monitor mid-run
+# while the orphaned workload loops keep spinning — that's the
+# 2026-06-02 24h-soak failure (monitor died ~15 min from the finish,
+# final checkpoint never recorded). See
+# docs/issues/2026-06-01-soak-stale-binary.md (monitor-death amendment).
+trap '' HUP PIPE
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
+
+# Captured so workload subshells can detect monitor death and self-exit
+# instead of orphaning into init as silent, unrecorded daemons.
+MONITOR_PID=$$
 
 # -- args --------------------------------------------------------------
 
@@ -209,11 +222,14 @@ log "soak start — workload=$WORKLOAD stop=$STOP_SPEC ($STOP_S s) logdir=$LOGDI
 log "active programs: ${NAMES[*]}"
 log "checkpoint schedule (s): ${SCHEDULE[*]}"
 
+# Always invoke make so it rebuilds on *staleness*, not just absence.
+# A pre-existing-but-stale binary (older than its src/*.cyr deps, or
+# built on a superseded toolchain) silently soaks the wrong bundle —
+# see docs/issues/2026-06-01-soak-stale-binary.md. `make` no-ops when the
+# target is genuinely up to date, so this is cheap on the common path.
 for b in "${BINS_TO_BUILD[@]}"; do
-    if [ ! -x "$b" ]; then
-        log "building $b"
-        make "$b" >> "$SOAK_LOG" 2>&1 || { log "FAIL: $b did not build"; exit 1; }
-    fi
+    log "building $b (make resolves up-to-date)"
+    make "$b" >> "$SOAK_LOG" 2>&1 || { log "FAIL: $b did not build"; exit 1; }
 done
 
 # -- dmesg baseline ---------------------------------------------------
@@ -259,6 +275,9 @@ start_loop() {
     (
         n=0
         while :; do
+            # If the monitor died (signal, crash), don't orphan into a
+            # silent forever-loop — exit so the run tears down cleanly.
+            kill -0 "$MONITOR_PID" 2>/dev/null || exit 0
             if "$bin" > "$out_f" 2> "$err_f"; then
                 n=$((n + 1))
                 echo "$n" > "$iter_f"
