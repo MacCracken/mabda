@@ -18,6 +18,16 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.2] — 2026-06-12
+
+### Changed
+
+- **cyrius pin `6.0.43` → `6.2.1`** (ecosystem-wide stdlib pin sweep onto the
+  current toolchain). No source changes — mabda's `[deps]` carries no carved-out
+  modules and its deps (sakshi, samvada) are unaffected. Verified green on 6.2.1:
+  `cyrius deps` resolves cleanly, full `.tcyr` suite 382/382, bench 3/3,
+  `dist/mabda.cyr` regenerated via `cyrius distlib`.
+
 ## [3.0.1] — 2026-06-02
 
 **Toolchain refresh + 6 h confirmation soak.** First 3.0.x patch:
