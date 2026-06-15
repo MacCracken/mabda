@@ -11,16 +11,14 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.6+ (`cyrius.cyml: cyrius = "6.2.6"`)
-- **Version**: 3.0.0-rc.2 in tree — official 3.0.0 ships after the
-  rc.3 (≤6h soak proof) and rc.4 (24h → 3-day soak) cuts. rc.2
-  closed out the audit punchlist
-  (`docs/development/3-0-rc-2-punchlist.md`); the rc.3/rc.4 plan
-  lives in `docs/development/3-0-rc-3-punchlist.md` and
-  `docs/development/3-0-rc-4-punchlist.md`. **1-day soak is the
-  earliest cut for 3.0.0 GA**; the full 3-day window is the
-  focus of the first few 3.0.x patches. v3.0 ships dual backend (wgpu +
-  native AMD); native is `Backend`-slot-abstracted alongside wgpu,
-  AMD only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
+- **Version**: 3.0.3 in tree. 3.0.0 GA shipped 2026-06-02 after the
+  24-hour soak gate cleared (`--workload=all` ran 26 h 13 m, RSS flat,
+  dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`). The 3.0.x
+  patch stream tracks the toolchain + AGNOS deps: 3.0.1 → cyrius
+  6.0.43, 3.0.2 → 6.2.1, 3.0.3 → cyrius 6.2.6 + samvada 0.4.1. v3.0
+  ships dual backend (wgpu + native AMD); native is
+  `Backend`-slot-abstracted alongside wgpu, AMD only in v3.0;
+  NVIDIA/Intel native scoped to v4.0/v5.0.
 - **GPU FFI**: dual-path
   - **wgpu** — wgpu-native v29 C API via `deps/wgpu_main.c` launcher
     (65-slot fn table, 7 struct-packing shims)
@@ -43,29 +41,29 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post Step 7.7, 2026-04-30)
+## Current State (post 3.0.3, 2026-06-14)
 
-- **Source**: 38 domain modules under `src/*.cyr`, ~14,500 lines (the
+- **Source**: 38 domain modules under `src/*.cyr`, ~12,500 lines (the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
   to land under cyrius lint/fmt's 128 KiB cap).
-- **Tests**: **1828 CPU-only assertions** across three files:
+- **Tests**: **1957 CPU-only assertions** across three files:
   - `tests/tcyr/mabda.tcyr` — 624 (v2.x backend-agnostic surface)
-  - `tests/tcyr/mabda_v3.tcyr` — 858 (v3 backend abstraction +
+  - `tests/tcyr/mabda_v3.tcyr` — 951 (v3 backend abstraction +
     Phase B/C compute + render)
-  - `tests/tcyr/mabda_v3_phase_d.tcyr` — 346 (Phase D KMS
+  - `tests/tcyr/mabda_v3_phase_d.tcyr` — 382 (Phase D KMS
     primitives + 7.7 surface API + audit MED-3 odd-dim asserts)
   Plus seven GPU integration programs (`phase0`, `compute_e2e`,
   `render_e2e`, `render_graph_e2e` for wgpu; `native_compute_store`,
   `native_texture_e2e`, `native_render_e2e` for native; plus
   `native_kms_summary` and `native_kms_modeset_smoke` and
   `native_present_e2e` for Phase D).
-- **Benchmarks**: `tests/bcyr/mabda.bcyr` — 7 CPU benches. GPU
+- **Benchmarks**: `tests/bcyr/mabda.bcyr` — 9 CPU benches. GPU
   benches via `make bench-gpu` (13 benches, Rust v1 parity set on
   the wgpu path). Reference Rust numbers in
   `docs/benchmarks-rust-v-cyrius.md`. Native-on-AMD bench cell
   is Tier 3 work pending a consumer flip.
-- **Dist bundle**: `dist/mabda.cyr` — ~11,400 lines.
+- **Dist bundle**: `dist/mabda.cyr` — ~12,500 lines.
   `cyrius distlib` regenerates it.
 - **Integration**: consumed by soorat, rasa, ranga, bijli, aethersafta,
   kiran (via soorat). Six-consumer regression sweep is Tier 2 ship
@@ -156,8 +154,8 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 1828 CPU assertions across 3 files
-cyrius bench tests/bcyr/mabda.bcyr                   # 7 CPU benchmarks
+make test                                            # 1957 CPU assertions across 3 files
+cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
 make test-native-compute-store                       # native compute (needs amdgpu)
@@ -232,9 +230,9 @@ mabda/
 │   ├── tcyr/
 │   │   ├── mabda.tcyr               — v2 backend-agnostic suite (624 asserts)
 │   │   ├── mabda_v3.tcyr            — v3 backend abstraction +
-│   │   │                              compute + render (858 asserts)
-│   │   └── mabda_v3_phase_d.tcyr    — Phase D KMS + 7.7 surface API (337 asserts)
-│   └── bcyr/mabda.bcyr              — CPU benchmark harness (7 benches)
+│   │   │                              compute + render (951 asserts)
+│   │   └── mabda_v3_phase_d.tcyr    — Phase D KMS + 7.7 surface API (382 asserts)
+│   └── bcyr/mabda.bcyr              — CPU benchmark harness (9 benches)
 ├── programs/
 │   ├── smoke.cyr                    — link-check for the full include chain
 │   ├── phase0.cyr                   — wgpu GPU smoke (buffer/texture/pipeline)
@@ -319,7 +317,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 1828 CPU assertions across three test
+- **Tests are the way** — 1957 CPU assertions across three test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -368,7 +366,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 1828+ assertions pass across all three test files,
+2. Test sweep: 1957+ assertions pass across all three test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -441,7 +439,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (`mabda.tcyr` + `mabda_v3.tcyr` + `mabda_v3_phase_d.tcyr`); 1828+
+   (`mabda.tcyr` + `mabda_v3.tcyr` + `mabda_v3_phase_d.tcyr`); 1957+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
