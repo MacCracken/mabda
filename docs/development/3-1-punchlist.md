@@ -85,10 +85,15 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     valid GPUVM on Cezanne (texture e2e byte-exact); compute + render
     unaffected by the ctx growth. Build / lint / fmt / distlib /
     version-check clean; 2032 CPU asserts green.
-- [ ] **M.2** — `BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED` (+208) and
+- [x] **M.2** — mipmap slot layout (2026-06-15).
+  `BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED` (+208) +
   `BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS` (+216); `BACKEND_SIZE` 208→224;
-  `BACKEND_MIPMAP_SLOTS_BEGIN/END` + `backend_is_complete` walk. Layout
-  asserts in `tests/tcyr/mabda_v3.tcyr`.
+  `BACKEND_MIPMAP_SLOTS_BEGIN/END` (208/224). Per the 6.8a / 7.5 pattern
+  the `backend_is_complete` walk over the mipmap range is **deferred to
+  M.6** (when the fillers land) so existing backends stay "complete"
+  rather than falsely incomplete. 7 layout asserts; build / lint / fmt /
+  vet / distlib / version-check clean; 2039 CPU asserts green. Pure CPU —
+  no HW behavior yet.
 - [ ] **M.3** — Per-level GPU access. wgpu: N `WGPUTextureView`s
   (`baseMipLevel=i`) in a ctx-local handle-keyed table; wire the
   scaffolded storage-texture bind-group-layout entry path. native:
