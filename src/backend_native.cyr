@@ -560,6 +560,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         return GPU_ERR_WORKGROUP_LIMIT;
     }
 
+    # v3.2 X.3: a compute dispatch targeted at a DMA-ring (TRANSFER) queue
+    # is a mis-route — SDMA cannot execute PM4 compute. Reject before
+    # building the PM4 stream. (Zero stash = legacy single-ring path.)
+    var cq = gpu_ctx_current_queue(ctx);
+    if (cq != 0) {
+        if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
+    }
+
     var stub_va = native_ctx_stub_va(ctx);
     var shader_handle = load64(shmod + 0);
     var shader_va     = load64(shmod + 8);
@@ -572,12 +580,11 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
     shader_va, stub_va, out_va, x, y, z);
 
-    # v3.1 Q.3c: if a logical queue is the current dispatch target,
-    # route through the async timeline path on that queue's ring
-    # (signals the queue's persistent timeline; caller waits via
-    # gpu_queue_wait_idle / gpu_queue_barrier). A zero stash preserves
-    # the v3.0 synchronous single-ring path verbatim below.
-    var cq = gpu_ctx_current_queue(ctx);
+    # v3.1 Q.3c: if a logical queue is the current dispatch target (read +
+    # DMA-guarded above), route through the async timeline path on that
+    # queue's ring (signals the queue's persistent timeline; caller waits
+    # via gpu_queue_wait_idle / gpu_queue_barrier). Zero stash = the v3.0
+    # synchronous single-ring path verbatim below.
     if (cq != 0) {
         return native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
         shader_handle, out_handle, cq, queue_ring(cq));
@@ -621,18 +628,16 @@ fn _backend_native_device_wait_idle(ctx): i64 {
 # latest point, and gpu_queue_barrier (Q.4) makes one ring wait on
 # another's point.
 
-# Map a logical queue kind to its AMDGPU HW ring (HW_IP). TRANSFER
-# shares the COMPUTE ring in 3.1.1. The SDMA COPY_LINEAR path is brought
-# up + HW-verified in Q.5 (native_sdma_build_copy_linear + the DMA-ring
-# submit proven by programs/native_sdma_copy_e2e.cyr), but TRANSFER does
-# NOT flip to AMDGPU_HW_IP_DMA yet: there is no public buffer-copy op to
-# drive it, and a DMA-ring queue would mis-route a compute dispatch. The
-# flip lands atomically with the public transfer-copy API (+ wgpu parity)
-# in 3.1.2. Returns -1 on bad kind.
+# Map a logical queue kind to its AMDGPU HW ring (HW_IP). As of v3.2 X.3
+# TRANSFER maps to the real SDMA ring (AMDGPU_HW_IP_DMA), driven by the
+# public buffer-copy API (X.5) over native_transfer_copy_timeline (X.4).
+# Compute/render dispatch onto a DMA-ring queue is rejected with
+# GPU_ERR_TRANSFER (SDMA cannot run PM4 shaders) — see the guard in
+# _backend_native_compute_dispatch. Returns -1 on bad kind.
 fn _native_queue_kind_to_ring(kind): i64 {
     if (kind == QUEUE_KIND_GRAPHICS) { return AMDGPU_HW_IP_GFX; }
     if (kind == QUEUE_KIND_COMPUTE)  { return AMDGPU_HW_IP_COMPUTE; }
-    if (kind == QUEUE_KIND_TRANSFER) { return AMDGPU_HW_IP_COMPUTE; }   # 3.1.2 -> _DMA
+    if (kind == QUEUE_KIND_TRANSFER) { return AMDGPU_HW_IP_DMA; }
     return 0 - 1;
 }
 
