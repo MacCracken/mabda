@@ -84,10 +84,15 @@ lint:
 
 .PHONY: fmt-check
 fmt-check:
+	@# cyrius 6.x's `cyrfmt --check <file>` reports formatting via the EXIT
+	@# CODE only (0 = clean, non-zero = needs fmt) — it no longer echoes the
+	@# formatted file to stdout the way 5.x did, so the old diff-against-stdout
+	@# gate false-failed every file. Mirror CI (.github/workflows/ci.yml).
 	@fail=0; \
 	for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do \
-		diff -q <($(CYRIUS) fmt $$f --check 2>/dev/null) $$f > /dev/null || \
-			{ echo "needs fmt: $$f"; fail=1; }; \
+		if ! $(CYRIUS) fmt $$f --check > /dev/null 2>&1; then \
+			echo "needs fmt: $$f"; fail=1; \
+		fi; \
 	done; \
 	[ $$fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
 

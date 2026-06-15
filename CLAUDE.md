@@ -30,7 +30,7 @@ detection.
     KMS surface (modeset, page-flip, present)
 - **`samvada` dep** — sister AGNOS package (sibling of sakshi/patra/
   sigil) carrying the dbus client for logind master delegation.
-  Wired via `[deps.samvada] tag = "0.2.0"`. Consumer programs link
+  Wired via `[deps.samvada] tag = "0.4.1"`. Consumer programs link
   `samvada/deps/samvada_main.c` to populate the C-shim fn-table.
   v4.0 retires both `wgpu_main.c` and `samvada_main.c` together.
 
@@ -108,7 +108,7 @@ doesn't change between paths.
   `args`, `hashmap`, `syscalls`, `tagged`, `fnptr`, `mmap`, `dynlib`,
   `sakshi` (ships with Cyrius >= 5.4.7)
 - **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
-  delegation. Pinned via `[deps.samvada] tag = "0.2.0"` in
+  delegation. Pinned via `[deps.samvada] tag = "0.4.1"` in
   `cyrius.cyml`. mabda doesn't link libsystemd directly — consumer
   programs link `samvada/deps/samvada_main.c` which calls into
   `samvada_main(table)` to populate the static fn-table that
@@ -254,7 +254,7 @@ mabda/
 │   └── wgpu-native/                 — external C binaries (gitignored)
 ├── lib/                             — populated by `cyrius deps` (gitignored):
 │   ├── string.cyr / fmt.cyr / ...   — Cyrius stdlib copies
-│   └── samvada.cyr                  — symlink into ~/.cyrius/deps/samvada/0.2.0/dist/
+│   └── samvada.cyr                  — symlink into ~/.cyrius/deps/samvada/0.4.1/dist/
 ├── cyrius.cyml                      — package manifest + [lib] + [deps] + [deps.samvada]
 ├── Makefile                         — wrapper over `cyrius` CLI + GPU paths + native programs
 └── VERSION                          — source of truth, templated into manifest

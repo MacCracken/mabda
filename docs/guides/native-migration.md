@@ -111,7 +111,7 @@ gcc -c samvada/deps/samvada_main.c -o samvada_main.o
 ```
 
 samvada itself is a sister AGNOS package (`[deps.samvada]
-tag = "0.2.0"` in your `cyrius.cyml`). It currently uses
+tag = "0.4.1"` in your `cyrius.cyml`). It currently uses
 libsystemd via its C-shim; the v4.0 retirement plan drops both
 wgpu-native and libsystemd in favour of pure-Cyrius.
 

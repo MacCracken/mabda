@@ -18,6 +18,39 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.3] — 2026-06-14
+
+**Toolchain + dep tracking patch.** Documents the cyrius pin already at
+`6.2.6` in tree and advances the `samvada` dep `0.2.2` → `0.4.1`. No
+public API change — the samvada surface mabda consumes (`samvada_main`,
+`samvada_session_take_device`, `samvada_session_release_device`) is
+unchanged across the jump. Verified green on 6.2.6: `cyrius deps`
+resolves clean (samvada 0.4.1, 29 deps locked), smoke build links,
+per-file `cyrius lint` 0 warnings, `cyrius vet` clean, full `.tcyr`
+suite **1957/1957** (624 + 951 + 382), CPU benches run clean, and
+`dist/mabda.cyr` regenerated via `cyrius distlib` (v3.0.3).
+
+### Changed
+
+- **cyrius pin `6.2.1` → `6.2.6`.** The `6.2.6` pin landed in tree with
+  the "language bump to 6.2" commit; 3.0.3 documents it and re-burns the
+  bundle on it. samvada 0.4.1 pins the same `6.2.6` toolchain.
+- **samvada dep `0.2.2` → `0.4.1`** (`[deps.samvada] tag`). samvada's
+  0.2.2 → 0.3.0 → 0.4.0 → 0.4.1 line is a chain of certified
+  no-public-API-change toolchain-tracking releases; every exported
+  symbol's signature and error-code contract is unchanged from 0.2.2.
+  `cyrius deps` re-resolves `lib/samvada.cyr` to the 0.4.1 bundle
+  (`samvada_version()` → `(0,4,1)`); `cyrius.lock` updated.
+
+### Fixed
+
+- **`make fmt-check` aligned to `cyrfmt --check` exit-code semantics.**
+  cyrius 6.x's `cyrfmt --check` reports drift via exit code only and no
+  longer echoes the formatted file to stdout, so the Makefile's old
+  diff-against-stdout gate false-failed every file on 6.2.x. CI already
+  carried this fix (`.github/workflows/ci.yml`); the local gate now
+  matches it.
+
 ## [3.0.2] — 2026-06-12
 
 ### Changed
