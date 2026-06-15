@@ -11,16 +11,17 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.6+ (`cyrius.cyml: cyrius = "6.2.6"`)
-- **Version**: 3.0.4 in tree. 3.0.0 GA shipped 2026-06-02 after the
+- **Version**: 3.1.0 in tree. 3.0.0 GA shipped 2026-06-02 after the
   24-hour soak gate cleared (`--workload=all` ran 26 h 13 m, RSS flat,
-  dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`). The 3.0.x
-  patch stream tracks the toolchain + AGNOS deps: 3.0.1 → cyrius
-  6.0.43, 3.0.2 → 6.2.1, 3.0.3 → cyrius 6.2.6 + samvada 0.4.1; 3.0.4 →
-  P(-1) security-hardening patch (full-surface audit 2026-06-14: 4 HIGH
-  / 5 MED / 7 LOW fixed, +34 regression asserts). v3.0
-  ships dual backend (wgpu + native AMD); native is
-  `Backend`-slot-abstracted alongside wgpu, AMD only in v3.0;
-  NVIDIA/Intel native scoped to v4.0/v5.0.
+  dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`). 3.0.x tracked
+  the toolchain + AGNOS deps (3.0.1 → cyrius 6.0.43, 3.0.2 → 6.2.1,
+  3.0.3 → 6.2.6 + samvada 0.4.1); 3.0.4 → P(-1) security-hardening patch
+  (full-surface audit 2026-06-14). **3.1.0** → on-device mipmap
+  generation: native AMD HW-verified on Cezanne; wgpu `generate` deferred
+  (NOT_IMPLEMENTED, blocked on a wgpu compute path). Multi-queue is the
+  v3.1.x arc's next feature (3.1.1+). v3.0 ships dual backend (wgpu +
+  native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
+  only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
 - **GPU FFI**: dual-path
   - **wgpu** — wgpu-native v29 C API via `deps/wgpu_main.c` launcher
     (65-slot fn table, 7 struct-packing shims)
