@@ -584,6 +584,9 @@ fn test_native_compute_dispatch_queue_targeted_branch() {
     queue_set_syncobj(q, 1);               # non-zero so the driver proceeds
     queue_set_ring(q, AMDGPU_HW_IP_COMPUTE);
     gpu_ctx_set_current_queue(&ctx, q);
+    # Q.4: stage a pending cross-ring wait; the dispatch must consume +
+    # clear it (turning it into an in-CS TIMELINE_WAIT on the submit).
+    queue_set_pending_wait(q, 0x77, 3);
     var shmod[16];
     native_buf_pair_write(&shmod, 0x111, 0x222);
     var bp[16];
@@ -592,6 +595,28 @@ fn test_native_compute_dispatch_queue_targeted_branch() {
     var rc = _backend_native_compute_dispatch(&ctx, &shmod, 1, 1, 1, &bp);
     assert(rc != 0, "fake-fd submit fails gracefully (no crash)");
     assert_eq(queue_point(q), 1, "timeline path taken: queue point bumped 0->1");
+    assert_eq(queue_pending_wait_syncobj(q), 0, "pending wait consumed + cleared");
+    return 0;
+}
+
+fn test_native_queue_barrier_records_pending_wait() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    # Producer queue has submitted up to point 5 on syncobj 0x42.
+    var src = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(src, 0x42);
+    queue_set_point(src, 5);
+    var dst = queue_new(QUEUE_KIND_GRAPHICS);
+    assert_eq(_backend_native_queue_barrier(&ctx, src, dst), 0, "barrier ok");
+    assert_eq(queue_pending_wait_syncobj(dst), 0x42, "dst waits on src syncobj");
+    assert_eq(queue_pending_wait_point(dst), 5, "dst waits on src point 5");
+    assert_eq(queue_point(src), 5, "src point untouched (no CPU block)");
+    # Barrier with an idle producer (point 0) records nothing.
+    var src2 = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(src2, 0x99);
+    var dst2 = queue_new(QUEUE_KIND_GRAPHICS);
+    assert_eq(_backend_native_queue_barrier(&ctx, src2, dst2), 0, "idle-src barrier ok");
+    assert_eq(queue_pending_wait_syncobj(dst2), 0, "no pending wait for idle producer");
     return 0;
 }
 
@@ -2449,6 +2474,7 @@ fn main() {
     test_native_queue_get_guards();
     test_native_queue_wait_idle_guards();
     test_native_queue_barrier_guards();
+    test_native_queue_barrier_records_pending_wait();
     test_native_compute_dispatch_queue_targeted_branch();
     test_native_pm4_builder_composability();
     test_backend_native_new_is_complete();

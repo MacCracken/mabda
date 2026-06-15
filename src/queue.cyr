@@ -54,11 +54,20 @@ var QUEUE_KIND_COUNT    = 3;
 #   +24: timeline_point   monotonic u64 — last point signalled on this
 #                         queue's timeline. Bumped per queue-targeted
 #                         submit (Q.3); read by gpu_queue_barrier (Q.4).
-var QUEUE_OFF_KIND    = 0;
-var QUEUE_OFF_RING    = 8;
-var QUEUE_OFF_SYNCOBJ = 16;
-var QUEUE_OFF_POINT   = 24;
-var QUEUE_STRUCT_SIZE = 32;
+#   +32: pending_wait_syncobj  Q.4 — a cross-ring dependency recorded by
+#                         gpu_queue_barrier on the CONSUMER queue. The
+#                         consumer's NEXT queue-targeted submit adds an
+#                         in-CS TIMELINE_WAIT on (this syncobj, point),
+#                         then clears both. 0 = no pending dependency.
+#   +40: pending_wait_point    Q.4 — the producer timeline point this
+#                         queue's next submit must wait for.
+var QUEUE_OFF_KIND         = 0;
+var QUEUE_OFF_RING         = 8;
+var QUEUE_OFF_SYNCOBJ      = 16;
+var QUEUE_OFF_POINT        = 24;
+var QUEUE_OFF_PEND_SYNCOBJ = 32;
+var QUEUE_OFF_PEND_POINT   = 40;
+var QUEUE_STRUCT_SIZE      = 48;
 
 # Allocate a zero-initialized Queue of the given kind. ring_handle,
 # timeline_syncobj, and timeline_point stay zero until the backend
@@ -109,6 +118,31 @@ fn queue_bump_point(q): i64 {
     var p = load64(q + QUEUE_OFF_POINT) + 1;
     store64(q + QUEUE_OFF_POINT, p);
     return p;
+}
+
+# Pending cross-ring wait dependency (Q.4). gpu_queue_barrier records
+# (producer syncobj, producer point) on the CONSUMER queue; the
+# consumer's next queue-targeted submit reads these, adds an in-CS
+# TIMELINE_WAIT, and clears them. syncobj == 0 means "no pending wait".
+fn queue_pending_wait_syncobj(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_PEND_SYNCOBJ);
+}
+fn queue_pending_wait_point(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_PEND_POINT);
+}
+fn queue_set_pending_wait(q, syncobj, point): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_PEND_SYNCOBJ, syncobj);
+    store64(q + QUEUE_OFF_PEND_POINT, point);
+    return 0;
+}
+fn queue_clear_pending_wait(q): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_PEND_SYNCOBJ, 0);
+    store64(q + QUEUE_OFF_PEND_POINT, 0);
+    return 0;
 }
 
 # ================================================================

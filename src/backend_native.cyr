@@ -162,12 +162,21 @@ shader_handle, out_handle, queue, ip_type): i64 {
     store32(&bo_list_in + 12, 8);
     store64(&bo_list_in + 16, &entries);
 
+    # Consume any pending cross-ring wait that gpu_queue_barrier (Q.4)
+    # recorded on this queue: it becomes an in-CS TIMELINE_WAIT so the
+    # GPU resolves the dependency without a CPU stall. Read + clear
+    # before submit so the queue state is clean regardless of outcome
+    # (a single barrier applies to the next submit only).
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+
     # Reserve this dispatch's timeline point and submit signalling it on
-    # completion. No in-CS wait (wait_syncobj=0) — barriers add that in
-    # Q.4. ib_flags=0x08 (TC_WB_NOT_INVALIDATE) as on the compute path.
+    # completion. ib_flags=0x08 (TC_WB_NOT_INVALIDATE) as on the compute
+    # path. wait_so==0 omits the wait chunk (the common no-barrier case).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-    ip_type, syncobj, point, 0, 0, fence_handle, 32, 0x08);
+    ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -600,18 +609,21 @@ fn _backend_native_queue_wait_idle(ctx, queue): i64 {
     return _native_neg_rc_to_gpu_err(rc);
 }
 
-# Order work on dst_queue after work submitted on src_queue.
-# Q.3b conservative impl: block on the CPU until the producer queue's
-# submitted work retires, so anything the caller then submits on
-# dst_queue is necessarily ordered after it. Correct, but serializes
-# the two rings. Q.4 replaces this with an in-CS TIMELINE_WAIT
-# dependency recorded on dst_queue (no CPU stall — real GFX/COMPUTE
-# overlap). Returns 0|GPU_ERR_*.
+# Order work on dst_queue after work submitted on src_queue (Q.4).
+# Records the producer's (syncobj, current point) as a PENDING WAIT on
+# the consumer queue — no CPU block. The consumer's next queue-targeted
+# submit (native_compute_dispatch_cached_timeline) turns it into an
+# in-CS TIMELINE_WAIT chunk so the dependency resolves GPU-side, leaving
+# the two rings free to overlap. If src has submitted nothing yet
+# (point 0) there's nothing to wait for — no-op. Returns 0|GPU_ERR_*.
 fn _backend_native_queue_barrier(ctx, src_queue, dst_queue): i64 {
     if (ctx == 0)        { return GPU_ERR_OTHER; }
     if (src_queue == 0)  { return GPU_ERR_OTHER; }
     if (dst_queue == 0)  { return GPU_ERR_OTHER; }
-    return _backend_native_queue_wait_idle(ctx, src_queue);
+    var src_point = queue_point(src_queue);
+    if (src_point == 0) { return 0; }
+    queue_set_pending_wait(dst_queue, queue_syncobj(src_queue), src_point);
+    return 0;
 }
 
 # Texture slots — real impls (Step 5.6). Wraps the Step 5.1 + 5.2

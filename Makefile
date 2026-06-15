@@ -236,6 +236,18 @@ build/native_queue_compute_e2e: programs/native_queue_compute_e2e.cyr src/*.cyr
 test-native-queue-compute-e2e: build/native_queue_compute_e2e
 	./build/native_queue_compute_e2e
 
+# v3.1 Q.4 — cross-ring barrier: compute (COMPUTE ring) -> gpu_queue_barrier
+# -> compute on the GRAPHICS queue (GFX ring) whose submit carries an in-CS
+# SYNCOBJ_TIMELINE_WAIT on the compute point. Proves the kernel accepts +
+# completes a CS with a timeline-wait chunk. HW-gated.
+build/native_queue_barrier_e2e: programs/native_queue_barrier_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_queue_barrier_e2e.cyr $@
+
+.PHONY: test-native-queue-barrier-e2e
+test-native-queue-barrier-e2e: build/native_queue_barrier_e2e
+	./build/native_queue_barrier_e2e
+
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the
 # dword stream to stdout instead of submitting it. CI-safe (no GPU
