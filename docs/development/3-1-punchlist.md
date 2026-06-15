@@ -31,12 +31,15 @@ Read these before sequencing.
   flush/invalidate between dispatches — `native_pm4_event_write_cache_flush_and_inv`
   already exists (Step 6.10). Mipmaps are self-contained and lower-risk,
   so they are 3.1.0.
-- **Native mipmaps need NO WGSL frontend.** The 2×2 box-filter downsample
-  shader is hand-authored GFX9 ISA (~100–200 bytes), the same method as
-  the deadbeef / triangle shaders. WGSL→GFX9 lowering stays deferred to
-  v3.x. The genuinely new native work is the **image descriptor table
-  (V#)** for image_load/store — ~200 lines, ABI-risky, budget 2–4 HW
-  iterations on Cezanne.
+- **Native mipmaps need NO WGSL frontend AND no descriptor table.** The
+  2×2 box-filter downsample shader is hand-authored GFX9 ISA, the same
+  method as the deadbeef / triangle shaders; WGSL→GFX9 lowering stays
+  deferred to v3.x. **PIVOT (M.3, 2026-06-15):** native textures are
+  LINEAR, so the shader uses flat `global_load`/`global_store` against
+  computed VAs (the deadbeef user-SGPR ABI) — the image descriptor table
+  (T#/V#) the proposal first assumed is **gone** (deleted ~200 lines of
+  ABI-risky infra; residual risk is just the per-channel RGBA8 averaging,
+  1–2 HW iterations). See `v3.1-mipmap-generation.md` § PIVOT.
 - **The render-graph multi-queue refactor is the arc's biggest risk.**
   The v2.5 graph is single-encoder/single-submit; per-node queue affinity
   + cross-queue fence edges is a 2–3 week design spike with no prototype.
@@ -94,7 +97,7 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
   rather than falsely incomplete. 7 layout asserts; build / lint / fmt /
   vet / distlib / version-check clean; 2039 CPU asserts green. Pure CPU —
   no HW behavior yet.
-- [~] **M.3** — Per-level GPU access.
+- [x] **M.3** — Per-level GPU access (both backends; 2026-06-15).
   - [x] **M.3(native)** + **PIVOT** (2026-06-15). Native textures are
     LINEAR GTT BOs, and the deadbeef shader proves flat
     `global_load`/`global_store` against a user-SGPR VA works on Cezanne —
@@ -104,12 +107,22 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     ABI-risky, 2–4 HW iterations) — the downsample shader (M.4) addresses
     memory arithmetically instead. 4 CPU asserts; proposal updated with
     the pivot rationale. Build/lint/fmt/distlib clean; 2043 asserts green.
-  - [ ] **M.3(wgpu)** — N `WGPUTextureView`s (`baseMipLevel=i`) in a
-    ctx-local handle-keyed table (`wgpu_texture_create_view` exists) +
-    wire the scaffolded storage-texture bind-group-layout entry. Remaining.
-- [ ] **M.4** — Downsample shader.
-  - [ ] **M.4(wgpu)** — mabda-internal WGSL 2×2 box-filter compute
-    shader (sampled level n → storage level n+1).
+  - [x] **M.3(wgpu)** — descriptor machinery (2026-06-15).
+    `wgpu_texture_view_descriptor_level(label, fmt, dim, base_mip)` for
+    per-level views; `wgpu_bgl_entry_texture` (sampled read) +
+    `wgpu_bgl_entry_storage_texture` (write) BGL-entry builders, sub-struct
+    offsets + enum values (`SampleType_Float=2`, `StorageTextureAccess_WriteOnly=2`)
+    cross-checked against `deps/wgpu-native/include/webgpu/webgpu.h` v29.
+    11 CPU byte-layout asserts. (Building the per-level view list +
+    bind groups + dispatch loop is the wgpu half of M.6.)
+- [x] **M.4** — Downsample shader (both backends; 2026-06-15).
+  - [x] **M.4(wgpu)** — `mabda_wgsl_downsample_2x2(dst)` (2026-06-15):
+    mabda-internal WGSL 2×2 box-filter (sampled level n via textureLoad →
+    storage level n+1 via textureStore; @workgroup_size(8,8) + in-shader
+    bounds check). Assembled from <120-char pieces into a caller-owned
+    buffer (Cyrius has no literal concat + the 120-char line lint). 5 CPU
+    smoke asserts. WGSL validated on wgpu HW in M.7 (no standalone naga
+    here), like the native shader is HW-validated then.
   - [x] **M.4(native)** — `native_gfx9_shader_downsample_2x2`
     (2026-06-15). 79 GFX9 instructions / 316 B + 64 B NOP prefetch pad =
     380 B (`GFX9_DOWNSAMPLE_2X2_SIZE`). Single-thread-per-workgroup:

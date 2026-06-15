@@ -141,6 +141,44 @@ fn _backend_wgpu_buffer_release(ctx, buf): i64 {
     return 0;
 }
 
+# v3.1 [M.4(wgpu)]: mabda-internal WGSL 2×2 box-filter downsample compute
+# shader — the wgpu analog of native_gfx9_shader_downsample_2x2. Binding 0
+# is a sampled view of mip level n (read via textureLoad, no sampler);
+# binding 1 is a write storage view of level n+1. One invocation per dst
+# texel (@workgroup_size(8,8); the generate slot dispatches
+# ceil(w/8)×ceil(h/8) and the in-shader bounds check covers the remainder).
+# Assembled from <120-char pieces (Cyrius has no literal concatenation and
+# the line-length lint caps at 120) into a caller-owned buffer — no global
+# literal, no per-call leak. WGSL is whitespace-flexible so the single
+# logical line is fine. Consumed by the wgpu generate slot (M.6);
+# byte-polymorphic create reads it as WGSL UTF-8.
+fn _wgsl_append(dst, off, piece): i64 {
+    var n = _wgpu_strnlen(piece, WGPU_SHADER_SOURCE_MAX_BYTES);
+    memcpy(dst + off, piece, n);
+    return off + n;
+}
+
+# Write the NUL-terminated downsample WGSL into `dst` (caller allocates
+# >= 640 bytes). Returns the byte length (excluding the NUL).
+fn mabda_wgsl_downsample_2x2(dst): i64 {
+    var o = 0;
+    o = _wgsl_append(dst, o, "@group(0) @binding(0) var src: texture_2d<f32>; ");
+    o = _wgsl_append(dst, o, "@group(0) @binding(1) ");
+    o = _wgsl_append(dst, o, "var dst: texture_storage_2d<rgba8unorm, write>; ");
+    o = _wgsl_append(dst, o, "@compute @workgroup_size(8, 8) ");
+    o = _wgsl_append(dst, o, "fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ");
+    o = _wgsl_append(dst, o, "let d = textureDimensions(dst); ");
+    o = _wgsl_append(dst, o, "if (gid.x >= d.x || gid.y >= d.y) { return; } ");
+    o = _wgsl_append(dst, o, "let s = vec2<u32>(gid.x * 2u, gid.y * 2u); ");
+    o = _wgsl_append(dst, o, "let c = (textureLoad(src, s, 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(1u, 0u), 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(0u, 1u), 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(1u, 1u), 0)) * 0.25; ");
+    o = _wgsl_append(dst, o, "textureStore(dst, gid.xy, c); }");
+    store8(dst + o, 0);
+    return o;
+}
+
 # ================================================================
 # Shader module
 # ================================================================

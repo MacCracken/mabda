@@ -1255,6 +1255,37 @@ fn wgpu_bgl_entry_buffer(dst, binding, visibility, buffer_type, has_dynamic_offs
     return 0;
 }
 
+# v3.1 [M.3(wgpu)]: WGPU enum values cited from
+# deps/wgpu-native/include/webgpu/webgpu.h (v29).
+var WGPU_TEXTURE_SAMPLE_TYPE_FLOAT          = 0x02;  # WGPUTextureSampleType_Float
+var WGPU_STORAGE_TEXTURE_ACCESS_WRITE_ONLY  = 0x02;  # WGPUStorageTextureAccess_WriteOnly
+
+# Sampled-texture BGL entry. Sub-struct WGPUTextureBindingLayout at +72:
+# sampleType +80, viewDimension +84, multisampled +88. The mipmap read
+# binding uses sampleType=Float, dimension=2D, multisampled=0.
+fn wgpu_bgl_entry_texture(dst, binding, visibility, sample_type, view_dim, multisampled): i64 {
+    memset(dst, 0, 120);
+    store32(dst + 8, binding);
+    store64(dst + 16, visibility);
+    store32(dst + 80, sample_type);
+    store32(dst + 84, view_dim);
+    store32(dst + 88, multisampled);
+    return 0;
+}
+
+# Storage-texture BGL entry. Sub-struct WGPUStorageTextureBindingLayout at
+# +96: access +104, format +108, viewDimension +112. The mipmap write
+# binding uses access=WriteOnly, format=RGBA8_UNORM, dimension=2D.
+fn wgpu_bgl_entry_storage_texture(dst, binding, visibility, access, format, view_dim): i64 {
+    memset(dst, 0, 120);
+    store32(dst + 8, binding);
+    store64(dst + 16, visibility);
+    store32(dst + 104, access);
+    store32(dst + 108, format);
+    store32(dst + 112, view_dim);
+    return 0;
+}
+
 # ================================================================
 # WGPUBindGroupLayoutDescriptor (40 bytes)
 #   +0:  nextInChain (8)
@@ -1419,6 +1450,15 @@ fn wgpu_texture_view_descriptor(label, format, dimension): i64 {
     store32(desc + 44, 1);              # arrayLayerCount
     store32(desc + 48, WGPU_TEXTURE_ASPECT_ALL);
     store64(desc + 56, 0);              # usage = inherit
+    return desc;
+}
+
+# v3.1 [M.3(wgpu)]: single-level view at `base_mip` (mipLevelCount = 1).
+# Mipmap generation creates one such view per level — the read view at
+# level i-1 and the storage write view at level i.
+fn wgpu_texture_view_descriptor_level(label, format, dimension, base_mip): i64 {
+    var desc = wgpu_texture_view_descriptor(label, format, dimension);
+    store32(desc + 32, base_mip);      # baseMipLevel
     return desc;
 }
 
@@ -2376,6 +2416,44 @@ fn _backend_wgpu_buffer_release(ctx, buf): i64 {
     if (ctx == 0) { return 0; }
     wgpu_buffer_release(buf);
     return 0;
+}
+
+# v3.1 [M.4(wgpu)]: mabda-internal WGSL 2×2 box-filter downsample compute
+# shader — the wgpu analog of native_gfx9_shader_downsample_2x2. Binding 0
+# is a sampled view of mip level n (read via textureLoad, no sampler);
+# binding 1 is a write storage view of level n+1. One invocation per dst
+# texel (@workgroup_size(8,8); the generate slot dispatches
+# ceil(w/8)×ceil(h/8) and the in-shader bounds check covers the remainder).
+# Assembled from <120-char pieces (Cyrius has no literal concatenation and
+# the line-length lint caps at 120) into a caller-owned buffer — no global
+# literal, no per-call leak. WGSL is whitespace-flexible so the single
+# logical line is fine. Consumed by the wgpu generate slot (M.6);
+# byte-polymorphic create reads it as WGSL UTF-8.
+fn _wgsl_append(dst, off, piece): i64 {
+    var n = _wgpu_strnlen(piece, WGPU_SHADER_SOURCE_MAX_BYTES);
+    memcpy(dst + off, piece, n);
+    return off + n;
+}
+
+# Write the NUL-terminated downsample WGSL into `dst` (caller allocates
+# >= 640 bytes). Returns the byte length (excluding the NUL).
+fn mabda_wgsl_downsample_2x2(dst): i64 {
+    var o = 0;
+    o = _wgsl_append(dst, o, "@group(0) @binding(0) var src: texture_2d<f32>; ");
+    o = _wgsl_append(dst, o, "@group(0) @binding(1) ");
+    o = _wgsl_append(dst, o, "var dst: texture_storage_2d<rgba8unorm, write>; ");
+    o = _wgsl_append(dst, o, "@compute @workgroup_size(8, 8) ");
+    o = _wgsl_append(dst, o, "fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ");
+    o = _wgsl_append(dst, o, "let d = textureDimensions(dst); ");
+    o = _wgsl_append(dst, o, "if (gid.x >= d.x || gid.y >= d.y) { return; } ");
+    o = _wgsl_append(dst, o, "let s = vec2<u32>(gid.x * 2u, gid.y * 2u); ");
+    o = _wgsl_append(dst, o, "let c = (textureLoad(src, s, 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(1u, 0u), 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(0u, 1u), 0) ");
+    o = _wgsl_append(dst, o, "+ textureLoad(src, s + vec2<u32>(1u, 1u), 0)) * 0.25; ");
+    o = _wgsl_append(dst, o, "textureStore(dst, gid.xy, c); }");
+    store8(dst + o, 0);
+    return o;
 }
 
 # ================================================================
