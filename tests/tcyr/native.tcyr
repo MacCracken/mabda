@@ -612,6 +612,52 @@ fn test_native_transfer_copy_timeline_driver() {
     return 0;
 }
 
+# v3.2 X.5 — _backend_native_buffer_copy slot guard ladder: null
+# ctx/src/dst/queue, zero/oversized bytes (bounded by both buffers'
+# logical sizes), and the non-DMA-queue mis-route propagated from the
+# driver. The full HW copy path is the X.7 e2e.
+fn test_native_buffer_copy_guards() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    var qt = queue_new(QUEUE_KIND_TRANSFER);
+    queue_set_ring(qt, AMDGPU_HW_IP_DMA);
+    queue_set_syncobj(qt, 5);
+    var src[32];
+    memset(&src, 0, NATIVE_BUF_STRUCT_SIZE);
+    store64((&src) + NATIVE_BUF_FIELD_HANDLE, 1);
+    store64((&src) + NATIVE_BUF_FIELD_VA, 0x100000);
+    store64((&src) + NATIVE_BUF_FIELD_SIZE, 256);
+    var dst[32];
+    memset(&dst, 0, NATIVE_BUF_STRUCT_SIZE);
+    store64((&dst) + NATIVE_BUF_FIELD_HANDLE, 2);
+    store64((&dst) + NATIVE_BUF_FIELD_VA, 0x200000);
+    store64((&dst) + NATIVE_BUF_FIELD_SIZE, 256);
+    assert_eq(_backend_native_buffer_copy(0, qt, &src, &dst, 64),
+    GPU_ERR_OTHER, "null ctx -> GPU_ERR_OTHER");
+    assert_eq(_backend_native_buffer_copy(&ctx, qt, 0, &dst, 64),
+    GPU_ERR_BUFFER, "null src -> GPU_ERR_BUFFER");
+    assert_eq(_backend_native_buffer_copy(&ctx, qt, &src, 0, 64),
+    GPU_ERR_BUFFER, "null dst -> GPU_ERR_BUFFER");
+    assert_eq(_backend_native_buffer_copy(&ctx, 0, &src, &dst, 64),
+    GPU_ERR_OTHER, "null queue -> GPU_ERR_OTHER");
+    assert_eq(_backend_native_buffer_copy(&ctx, qt, &src, &dst, 0),
+    GPU_ERR_BUFFER, "zero bytes -> GPU_ERR_BUFFER");
+    assert_eq(_backend_native_buffer_copy(&ctx, qt, &src, &dst, 300),
+    GPU_ERR_BUFFER, "bytes > src size -> GPU_ERR_BUFFER");
+    store64((&dst) + NATIVE_BUF_FIELD_SIZE, 32);
+    assert_eq(_backend_native_buffer_copy(&ctx, qt, &src, &dst, 64),
+    GPU_ERR_BUFFER, "bytes > dst size -> GPU_ERR_BUFFER");
+    store64((&dst) + NATIVE_BUF_FIELD_SIZE, 256);
+    # A copy aimed at a non-DMA queue propagates GPU_ERR_TRANSFER from
+    # native_transfer_copy_timeline (the ring check lives there).
+    var qc = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_ring(qc, AMDGPU_HW_IP_COMPUTE);
+    queue_set_syncobj(qc, 5);
+    assert_eq(_backend_native_buffer_copy(&ctx, qc, &src, &dst, 64),
+    GPU_ERR_TRANSFER, "non-DMA queue -> GPU_ERR_TRANSFER");
+    return 0;
+}
+
 fn test_native_queue_get_guards() {
     # ctx==0, bad-kind, and no-fd all short-circuit to 0 before any ioctl.
     assert_eq(_backend_native_queue_get(0, QUEUE_KIND_COMPUTE), 0, "null ctx -> 0");
@@ -909,6 +955,9 @@ fn test_backend_native_slot_identities() {
     assert_eq(s_rpb, &_backend_native_render_pass_begin,             "pass_begin");
     assert_eq(s_rpd, &_backend_native_render_pass_draw,              "pass_draw");
     assert_eq(s_rpe, &_backend_native_render_pass_end,               "pass_end");
+    # v3.2 X.5 buffer-copy slot identity.
+    var s_bcp = backend_get_slot(b, BACKEND_SLOT_BUFFER_COPY);
+    assert_eq(s_bcp, &_backend_native_buffer_copy, "buffer_copy");
     return 0;
 }
 
@@ -2639,6 +2688,7 @@ fn main() {
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
     test_native_transfer_copy_timeline_driver();
+    test_native_buffer_copy_guards();
     test_native_queue_get_guards();
     test_native_queue_wait_idle_guards();
     test_native_queue_barrier_guards();

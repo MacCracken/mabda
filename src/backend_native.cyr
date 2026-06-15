@@ -247,6 +247,34 @@ dst_handle, dst_va, bytes, queue): i64 {
     return _native_neg_rc_to_gpu_err(rc);
 }
 
+# v3.2 X.5 — buffer_copy backend slot (native). Copies `bytes` from
+# src_buf to dst_buf (both NativeBuf*) on `queue`'s SDMA ring, then
+# blocks until the copy retires so dst is readable on return (the v3.0
+# synchronous buffer write/read contract). The public dispatchers
+# (gpu_buffer_copy / gpu_queue_transfer_copy in buffer.cyr / queue.cyr)
+# resolve the queue and route here through BACKEND_SLOT_BUFFER_COPY.
+# Bounds the copy by both buffers' logical sizes; the queue-ring (DMA)
+# check lives in native_transfer_copy_timeline. Returns 0|GPU_ERR_*.
+fn _backend_native_buffer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (src_buf == 0) { return GPU_ERR_BUFFER; }
+    if (dst_buf == 0) { return GPU_ERR_BUFFER; }
+    if (queue == 0)   { return GPU_ERR_OTHER; }
+    if (bytes <= 0)   { return GPU_ERR_BUFFER; }
+    var src_size = load64(src_buf + NATIVE_BUF_FIELD_SIZE);
+    var dst_size = load64(dst_buf + NATIVE_BUF_FIELD_SIZE);
+    if (bytes > src_size) { return GPU_ERR_BUFFER; }
+    if (bytes > dst_size) { return GPU_ERR_BUFFER; }
+    var src_handle = load64(src_buf + NATIVE_BUF_FIELD_HANDLE);
+    var src_va     = load64(src_buf + NATIVE_BUF_FIELD_VA);
+    var dst_handle = load64(dst_buf + NATIVE_BUF_FIELD_HANDLE);
+    var dst_va     = load64(dst_buf + NATIVE_BUF_FIELD_VA);
+    var rc = native_transfer_copy_timeline(ctx, src_handle, src_va,
+    dst_handle, dst_va, bytes, queue);
+    if (rc != 0) { return rc; }
+    return _backend_native_queue_wait_idle(ctx, queue);
+}
+
 # ================================================================
 # v3 Step 6.6 — GFX-ring dispatch (clear-triangle composer's submit path)
 # ================================================================
@@ -1431,6 +1459,11 @@ fn backend_native_new(): i64 {
     &_backend_native_queue_barrier);
     backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,
     &_backend_native_queue_wait_idle);
+    # v3.2 X.5 — buffer-copy (SDMA transfer). Native fills the slot now;
+    # the backend_is_complete walk over the range activates in X.6 once
+    # the wgpu filler lands too ("activate when both fill").
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
+    &_backend_native_buffer_copy);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }

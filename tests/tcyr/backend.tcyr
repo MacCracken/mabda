@@ -505,7 +505,13 @@ fn test_backend_struct_layout() {
     assert_eq(BACKEND_TEXFMT_SLOTS_END,                   256, "texfmt range ends 256");
     assert_eq(BACKEND_TEXFMT_SLOTS_BEGIN, BACKEND_QUEUE_SLOTS_END,
     "texfmt range starts where queue range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               256, "total = 256");
+    # v3.2 X.5: buffer-copy (SDMA transfer) slot appended at 256..264.
+    assert_eq(BACKEND_SLOT_BUFFER_COPY,                  256, "buffer_copy at 256");
+    assert_eq(BACKEND_BUFFERCOPY_SLOTS_BEGIN,            256, "buffercopy range begins 256");
+    assert_eq(BACKEND_BUFFERCOPY_SLOTS_END,              264, "buffercopy range ends 264");
+    assert_eq(BACKEND_BUFFERCOPY_SLOTS_BEGIN, BACKEND_TEXFMT_SLOTS_END,
+    "buffercopy range starts where texfmt range ends (no gap/overlap)");
+    assert_eq(BACKEND_SIZE,                               264, "total = 264");
     return 0;
 }
 
@@ -1475,6 +1481,71 @@ fn test_gpu_context_size_extended_to_160() {
     return 0;
 }
 
+# v3.2 X.5 — buffer-copy dispatch through BACKEND_SLOT_BUFFER_COPY.
+# Capture mock pins that gpu_queue_transfer_copy carries all five args
+# (ctx, queue, src, dst, bytes) through fncall5 in order.
+var _x5_copy_count = 0;
+var _x5_copy_ctx   = 0;
+var _x5_copy_queue = 0;
+var _x5_copy_src   = 0;
+var _x5_copy_dst   = 0;
+var _x5_copy_bytes = 0;
+
+fn _x5_copy_capture(ctx, queue, src, dst, bytes): i64 {
+    _x5_copy_count = _x5_copy_count + 1;
+    _x5_copy_ctx   = ctx;
+    _x5_copy_queue = queue;
+    _x5_copy_src   = src;
+    _x5_copy_dst   = dst;
+    _x5_copy_bytes = bytes;
+    return 0xC0FFEE;
+}
+
+fn test_gpu_queue_transfer_copy_dispatches_through_backend() {
+    _x5_copy_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY, &_x5_copy_capture);
+    var ctx = alloc(160);
+    memset(ctx, 0, 160);
+    store64(ctx + 32, b);
+    var rc = gpu_queue_transfer_copy(ctx, 0xAA, 0xBB, 0xCC, 128);
+    assert_eq(rc, 0xC0FFEE, "slot return value propagated");
+    assert_eq(_x5_copy_count, 1, "slot dispatched exactly once");
+    assert_eq(_x5_copy_ctx,   ctx,  "arg 1 = ctx");
+    assert_eq(_x5_copy_queue, 0xAA, "arg 2 = queue");
+    assert_eq(_x5_copy_src,   0xBB, "arg 3 = src_buf");
+    assert_eq(_x5_copy_dst,   0xCC, "arg 4 = dst_buf");
+    assert_eq(_x5_copy_bytes, 128,  "arg 5 = bytes");
+    # Null-slot backend -> GPU_ERR_NOT_IMPLEMENTED (the X.5/X.6 gap state).
+    var b2 = backend_new();
+    var ctx2 = alloc(160);
+    memset(ctx2, 0, 160);
+    store64(ctx2 + 32, b2);
+    assert_eq(gpu_queue_transfer_copy(ctx2, 0xAA, 0xBB, 0xCC, 128),
+    GPU_ERR_NOT_IMPLEMENTED, "null buffer_copy slot -> NOT_IMPLEMENTED");
+    assert_eq(gpu_queue_transfer_copy(0, 0xAA, 0xBB, 0xCC, 128),
+    GPU_ERR_OTHER, "null ctx -> GPU_ERR_OTHER");
+    assert_eq(gpu_queue_transfer_copy(ctx2, 0, 0xBB, 0xCC, 128),
+    GPU_ERR_OTHER, "null queue -> GPU_ERR_OTHER");
+    return 0;
+}
+
+fn test_gpu_buffer_copy_guards() {
+    # null ctx -> GPU_ERR_BUFFER (before any slot/queue touch).
+    assert_eq(gpu_buffer_copy(0, 0xBB, 0xCC, 64),
+    GPU_ERR_BUFFER, "null ctx -> GPU_ERR_BUFFER");
+    # Empty backend: gpu_queue_get's slot is null, so the implicit
+    # transfer queue can't be resolved -> GPU_ERR_OTHER (before the
+    # buffer_copy slot is consulted).
+    var b = backend_new();
+    var ctx = alloc(160);
+    memset(ctx, 0, 160);
+    store64(ctx + 32, b);
+    assert_eq(gpu_buffer_copy(ctx, 0xBB, 0xCC, 64),
+    GPU_ERR_OTHER, "unresolvable transfer queue -> GPU_ERR_OTHER");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1533,5 +1604,7 @@ fn main() {
     test_gpu_render_pass_draw_dispatches_through_backend();
     test_gpu_render_pass_end_dispatches_through_backend();
     test_gpu_context_size_extended_to_160();
+    test_gpu_queue_transfer_copy_dispatches_through_backend();
+    test_gpu_buffer_copy_guards();
     return assert_summary();
 }
