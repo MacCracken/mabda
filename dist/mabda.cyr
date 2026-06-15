@@ -2301,6 +2301,15 @@ fn backend_is_complete(b): i64 {
         if (load64(b + off5) == 0) { return 0; }
         off5 = off5 + 8;
     }
+    # v3.1 queue slots (Q.3b) — both backends now fill the queue range
+    # (wgpu: single-queue aliasing + submit-order barrier; native:
+    # distinct HW rings + persistent timeline syncobjs), so the walk
+    # over it is activated. wgpu fills all three; native fills all three.
+    var off6 = BACKEND_QUEUE_SLOTS_BEGIN;
+    while (off6 < BACKEND_QUEUE_SLOTS_END) {
+        if (load64(b + off6) == 0) { return 0; }
+        off6 = off6 + 8;
+    }
     return 1;
 }
 
@@ -6810,6 +6819,20 @@ fn _backend_native_ctx_release(ctx): i64 {
         native_gem_va_unmap(fd, ib_handle, ib_va, 4096);
         native_bo_release_gtt(fd, ib_handle, ib_addr, 4096);
     }
+    # v3.1 Q.3b: destroy the per-queue persistent timeline syncobjs.
+    # The Queue structs themselves are bump-allocated (native no-reclaim
+    # model); only the kernel syncobj handles need explicit release.
+    if (fd > 0) {
+        var qk = 0;
+        while (qk < QUEUE_KIND_COUNT) {
+            var q = gpu_ctx_queue_slot(ctx, qk);
+            if (q != 0) {
+                var so = queue_syncobj(q);
+                if (so != 0) { native_syncobj_destroy(fd, so); }
+            }
+            qk = qk + 1;
+        }
+    }
     if (ctx_id != 0) { native_ctx_free(fd, ctx_id); }
     if (fd > 0) { sys_close(fd); }
     return 0;
@@ -6923,6 +6946,92 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
 # add async submit paths.
 fn _backend_native_device_wait_idle(ctx): i64 {
     return 0;
+}
+
+# ================================================================
+# v3.1 Q.3 — native queue slots (multi-queue coordination)
+# ================================================================
+# Each logical Queue maps to a real AMDGPU hardware ring and carries a
+# persistent timeline syncobj. GFX and COMPUTE are distinct rings, so
+# genuine graphics/compute overlap is possible (unlike wgpu's single
+# queue). The persistent timeline syncobj replaces the ephemeral
+# per-dispatch binary syncobj on the queue-targeted path (Q.3c): every
+# queue-targeted submit signals the next point, wait_idle waits the
+# latest point, and gpu_queue_barrier (Q.4) makes one ring wait on
+# another's point.
+
+# Map a logical queue kind to its AMDGPU HW ring (HW_IP). TRANSFER
+# falls back to the COMPUTE ring until the SDMA submit path lands in
+# Q.5 (then it maps to AMDGPU_HW_IP_DMA). Returns -1 on bad kind.
+fn _native_queue_kind_to_ring(kind): i64 {
+    if (kind == QUEUE_KIND_GRAPHICS) { return AMDGPU_HW_IP_GFX; }
+    if (kind == QUEUE_KIND_COMPUTE)  { return AMDGPU_HW_IP_COMPUTE; }
+    if (kind == QUEUE_KIND_TRANSFER) { return AMDGPU_HW_IP_COMPUTE; }   # Q.5 -> _DMA
+    return 0 - 1;
+}
+
+# Acquire the native logical queue for `kind`. Idempotent: caches one
+# Queue (with a freshly created persistent timeline syncobj bound to
+# the kind's ring) per kind on the ctx; re-get returns the cached
+# pointer. Returns a Queue* or 0 on bad input / syncobj-create
+# failure. (HW path — needs a real render-node fd; CPU tests cover the
+# bad-kind / null-ctx / no-fd guards.)
+fn _backend_native_queue_get(ctx, kind): i64 {
+    if (ctx == 0) { return 0; }
+    var ring = _native_queue_kind_to_ring(kind);
+    if (ring < 0) { return 0; }
+    var cached = gpu_ctx_queue_slot(ctx, kind);
+    if (cached != 0) { return cached; }
+    var fd = native_ctx_fd(ctx);
+    if (fd <= 0) { return 0; }
+    var sbuf[8];
+    var rc = native_syncobj_create(fd, &sbuf);
+    if (rc != 0) { return 0; }
+    var syncobj = load64(&sbuf);
+    var q = queue_new(kind);
+    if (q == 0) {
+        native_syncobj_destroy(fd, syncobj);
+        return 0;
+    }
+    queue_set_ring(q, ring);
+    queue_set_syncobj(q, syncobj);
+    gpu_ctx_set_queue_slot(ctx, kind, q);
+    return q;
+}
+
+# Block until all work submitted on `queue` has retired — a timeline
+# wait for the queue's current point. point == 0 means nothing has been
+# submitted on this queue yet (no-op). Returns 0|GPU_ERR_*. (HW path
+# for point > 0; CPU tests cover the null + point-0 short-circuits.)
+fn _backend_native_queue_wait_idle(ctx, queue): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    var point = queue_point(queue);
+    if (point == 0) { return 0; }
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+    var fd = native_ctx_fd(ctx);
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    var trc = syscall(228, 1, &t_now);
+    if (trc != 0) { return GPU_ERR_OTHER; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var rc = native_syncobj_timeline_wait(fd, syncobj, point, deadline);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
+# Order work on dst_queue after work submitted on src_queue.
+# Q.3b conservative impl: block on the CPU until the producer queue's
+# submitted work retires, so anything the caller then submits on
+# dst_queue is necessarily ordered after it. Correct, but serializes
+# the two rings. Q.4 replaces this with an in-CS TIMELINE_WAIT
+# dependency recorded on dst_queue (no CPU stall — real GFX/COMPUTE
+# overlap). Returns 0|GPU_ERR_*.
+fn _backend_native_queue_barrier(ctx, src_queue, dst_queue): i64 {
+    if (ctx == 0)        { return GPU_ERR_OTHER; }
+    if (src_queue == 0)  { return GPU_ERR_OTHER; }
+    if (dst_queue == 0)  { return GPU_ERR_OTHER; }
+    return _backend_native_queue_wait_idle(ctx, src_queue);
 }
 
 # Texture slots — real impls (Step 5.6). Wraps the Step 5.1 + 5.2
@@ -7539,6 +7648,15 @@ fn backend_native_new(): i64 {
     &_backend_native_surface_present);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
     &_backend_native_surface_release);
+    # v3.1 queue slots (Q.3b) — distinct HW rings + persistent timeline
+    # syncobjs. Both backends now fill the queue range, so the
+    # backend_is_complete walk over it is activated this step.
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_GET,
+    &_backend_native_queue_get);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_BARRIER,
+    &_backend_native_queue_barrier);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,
+    &_backend_native_queue_wait_idle);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
