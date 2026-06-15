@@ -661,6 +661,34 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
     return tex;
 }
 
+# v3.2 T.7 — format-parameterized native create slot. Block-sized linear
+# BO (page-aligned VA span); stores fmt + logical size. write/read are the
+# existing size-driven memcpy slots (format-agnostic — they validate n
+# against the stored logical size). STORAGE + READBACK only: native cannot
+# SAMPLE a compressed texture this minor (no T#/sampler path — that's Phase
+# TS), and there is no native sample/bind API to call yet, so a consumer
+# simply cannot sample one (nothing to fail loud against until TS adds the
+# bind-for-sample slot).
+fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var logical = mabda_texfmt_data_size(fmt, width, height);
+    if (logical == 0) { return 0; }                    # unknown format id
+    var fd = native_ctx_fd(ctx);
+    var bo_size = _native_align_up(logical, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    var rc = native_texture_create_2d_fmt(fd, va, width, height, fmt, tex);
+    if (rc != 0) { return 0; }
+    return tex;
+}
+
 # v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
 # whole mip pyramid; generate (M.6b) downsamples level-by-level into it.
 fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
@@ -1212,6 +1240,11 @@ fn backend_native_new(): i64 {
     &_backend_native_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
     &_backend_native_texture_create_2d_rgba8);
+    # v3.2 T.7 — format-parameterized create (storage). Both backends now
+    # fill the texfmt slot, so the backend_is_complete walk over the range
+    # activates this step (M.6b "activate when both fill" pattern).
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT,
+    &_backend_native_texture_create_2d_fmt);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
     &_backend_native_texture_create_2d_rgba8_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS,
@@ -1329,6 +1362,7 @@ var NATIVE_TEX_FIELD_SIZE      = 24;
 var NATIVE_TEX_FIELD_WIDTH     = 32;
 var NATIVE_TEX_FIELD_HEIGHT    = 36;
 var NATIVE_TEX_FIELD_MIP_COUNT = 40;
+var NATIVE_TEX_FIELD_FMT       = 44;   # v3.2 T.7 — MABDA_TEXFMT_* (0 = RGBA8); was pad
 var NATIVE_TEX_STRUCT_SIZE     = 48;
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
@@ -1422,6 +1456,39 @@ fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    return 0;
+}
+
+# v3.2 T.7 — low-level format-parameterized native texture create. Linear
+# GTT BO sized to the format's block data_size, but the BO + VA map use a
+# 4 KiB-PAGE-ALIGNED size (compressed sizes are often sub-page — e.g. BC1
+# 4x4 = 8 B — and native_gem_va_map rejects a sub-page size with rc=99,
+# per reference_gem_va_map_page_align). The struct's SIZE field stores the
+# LOGICAL data_size so the (size-driven) write/read validate n correctly.
+# fmt is stashed at +44. STORAGE ONLY this minor — sampling is Phase TS.
+fn native_texture_create_2d_fmt(fd, va_base, width, height, fmt, out): i64 {
+    var logical = mabda_texfmt_data_size(fmt, width, height);
+    if (logical == 0) { return GPU_ERR_TEXTURE; }      # invalid fmt / dims
+    var bo_size = _native_align_up(logical, 4096);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, bo_size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va_base, bo_size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(out + NATIVE_TEX_FIELD_VA,     va_base);
+    store64(out + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,   logical);   # logical bytes (write n==size)
+    store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(out + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(out + NATIVE_TEX_FIELD_FMT,       fmt);
     return 0;
 }
 
