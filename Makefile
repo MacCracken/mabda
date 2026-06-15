@@ -245,6 +245,18 @@ build/native_texture_e2e: programs/native_texture_e2e.cyr src/*.cyr
 test-native-texture-e2e: build/native_texture_e2e
 	./build/native_texture_e2e
 
+# v3.1 M.7 — native mipmap generation e2e. Creates a mipped texture,
+# writes level 0, GPU-downsamples the chain, verifies each level against a
+# CPU box-filter reference. Requires amdgpu render node; renderD128 only
+# (no DRM master), so it runs in any session.
+build/native_mipmap_e2e: programs/native_mipmap_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_mipmap_e2e.cyr $@
+
+.PHONY: test-native-mipmap-e2e
+test-native-mipmap-e2e: build/native_mipmap_e2e
+	./build/native_mipmap_e2e
+
 # v3 Step 6.9(b) — native render end-to-end (mirror of render_e2e
 # on the native graphics ring). HW-gated; runs the full 6.x chain
 # (shader bytes → PM4 composer → GFX dispatch → CPU readback).

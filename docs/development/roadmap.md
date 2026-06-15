@@ -1,12 +1,13 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 38 domain modules, ~12,500 lines, 1991 CPU assertions across 3 test
-> files + 10 GPU integration programs + 9 CPU benches + 13 GPU
-> benchmarks. `dist/mabda.cyr` bundle at ~12,500 lines.
+> 38 domain modules, ~12,500 lines, 2102 CPU assertions across 11
+> functionality-named domain test files + 11 GPU integration programs +
+> 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle at
+> ~12,500 lines.
 >
-> _Header stats current as of the 3.0.4 P(-1) hardening pass
-> (full-surface audit 2026-06-14; see `docs/audit/2026-06-14-audit.md`)._
+> _Header stats current as of the v3.1 mipmap work (2026-06-15): native
+> mipmap generation HW-verified on Cezanne; tests reorganized by domain._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the

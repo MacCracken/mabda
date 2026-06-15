@@ -61,11 +61,12 @@ doesn't change between paths.
   - `native` 895 (amdgpu/PM4/GFX9 ISA/native textures+render)
   Splitting also kept every file under the 128 KiB lint/fmt cap (the old
   `mabda_v3.tcyr` had grown to 148 KiB, past the cap).
-  Plus seven GPU integration programs (`phase0`, `compute_e2e`,
+  Plus GPU integration programs: `phase0`, `compute_e2e`,
   `render_e2e`, `render_graph_e2e` for wgpu; `native_compute_store`,
-  `native_texture_e2e`, `native_render_e2e` for native; plus
-  `native_kms_summary` and `native_kms_modeset_smoke` and
-  `native_present_e2e` for Phase D).
+  `native_texture_e2e`, `native_render_e2e`, `native_mipmap_e2e`
+  (v3.1 — mip-chain generate verified vs a CPU box-filter on Cezanne)
+  for native; plus `native_kms_summary`, `native_kms_modeset_smoke`,
+  `native_present_e2e` for Phase D.
 - **Benchmarks**: `tests/bcyr/mabda.bcyr` — 9 CPU benches. GPU
   benches via `make bench-gpu` (13 benches, Rust v1 parity set on
   the wgpu path). Reference Rust numbers in

@@ -179,9 +179,28 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     single-level e2e intact. (The explicit between-level cache flush the
     plan mentioned is unnecessary with separate dispatches + ACQUIRE_MEM;
     M.7 confirms on HW, adds it if stale.)
-- [ ] **M.7** — `programs/native_mipmap_e2e.cyr` + `programs/mipmap_e2e.cyr`
-  (wgpu): generate a chain from a known level-0 pattern, CPU-read each
-  level, verify 2×2 averaging numerically. HW-gated on AMD (renderD128).
+- [x] **M.7 (native)** — `programs/native_mipmap_e2e.cyr` (2026-06-15).
+  **PASSES on Cezanne** (`make test-native-mipmap-e2e`): creates an 8×8
+  mipped texture, writes a varied level-0 pattern, GPU-generates the
+  chain, CPU-reads levels 1–3 and verifies each is the byte-exact 2×2
+  box-filter of its parent. The whole native mipmap stack (M.1 chain/VA
+  + M.4 GFX9 shader + M.5 PM4 composer/RSRC + M.6b dispatch loop) is now
+  HW-validated end-to-end — correct on the first real dispatch; the only
+  bugs were two BO/VA page-alignment issues (GEM_VA needs 4 KiB-aligned
+  sizes), now fixed for the chain BO + the shader BO. Read-after-write
+  between levels held with the per-dispatch syncobj wait + ACQUIRE_MEM —
+  no explicit between-level flush needed (the plan's open question,
+  resolved). Native mipmap generation is **done**.
+  - [ ] **M.7 (wgpu)** — `programs/mipmap_e2e.cyr` deferred with the wgpu
+    generate path (blocked on real wgpu compute — see M.6b). wgpu
+    `create_mipped` works; generate awaits a v3.x wgpu compute project.
+
+> **3.1.0 status:** the *native* mipmap feature (create + generate) is
+> complete and HW-verified. The *wgpu* generate path is the one remaining
+> gap (blocked on wgpu compute, itself a v3.0 stub). Cutting 3.1.0 now =
+> "native mipmap generation; wgpu create + manual level upload (generate
+> NOT_IMPLEMENTED pending wgpu compute)". Whether to ship 3.1.0 on that
+> basis or hold for wgpu compute is a release call for the maintainer.
 
 ### Phase Q — Multi-queue coordination (→ 3.1.1+)
 
