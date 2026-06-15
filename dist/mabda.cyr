@@ -7289,26 +7289,56 @@ fn _backend_native_ctx_release(ctx): i64 {
 
 # Buffer slots — diagnostic stubs (audit LOW-3).
 #
-# The public `gpu_buffer_*` API is intentionally not implemented on
-# the native AMD backend in v3.0 — consumers that need native today
-# (the in-tree `programs/native_*.cyr`) all use `native_buf_pair_*`
-# directly, and cross-backend portable buffer code is blocked by
-# LOW-4 (vc/ic in render dispatch) anyway. v3.x will port these to
-# `native_buf_pair_*` underneath.
+# Public gpu_buffer_* on native AMD — REAL as of v3.2 (Phase X). A native
+# buffer is a linear GTT BO (the same primitive textures use): the BO's
+# mmap address IS the data, so write/read collapse to memcpy (X.2). This
+# unblocks the public transfer-copy API (gpu_buffer_copy, X.5) + portable
+# consumer buffer code.
 #
-# Slot semantics:
-#   - `_buffer_create` returns a handle (i64) — 0 means "create
-#     failed, no handle." Callers MUST null-check the return.
-#   - `_buffer_write` / `_buffer_read` return a GpuErr code — 0 is
-#     success, anything else is a failure. We return
-#     GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "the
-#     native backend doesn't support gpu_buffer_* yet" from
-#     generic GPU_ERR_OTHER failures.
-#   - `_buffer_release` is a no-op success — releasing a never-
-#     created handle is sensibly a no-op, and propagating an error
-#     here would leak detail through every cleanup path.
+# NativeBuf struct (32 bytes — NativeTexture shape):
+#   +0:  handle  (u64, KMS handle)
+#   +8:  va      (u64, canonical-high GPU VA)
+#   +16: addr    (u64, CPU mmap pointer)
+#   +24: size    (u64, LOGICAL byte count requested; the BO + VA map use a
+#                 4 KiB-page-aligned size since native_gem_va_map rejects a
+#                 sub-page size — see reference_gem_va_map_page_align)
+var NATIVE_BUF_FIELD_HANDLE = 0;
+var NATIVE_BUF_FIELD_VA     = 8;
+var NATIVE_BUF_FIELD_ADDR   = 16;
+var NATIVE_BUF_FIELD_SIZE   = 24;
+var NATIVE_BUF_STRUCT_SIZE  = 32;
+
+# Create a native buffer of `size` bytes. `usage` is ignored on native (a
+# GTT BO is general-purpose; wgpu uses it). Returns a NativeBuf* or 0 on
+# bad input / region exhaustion / ioctl failure. (HW path; the guards are
+# CPU-tested, the BO create/map is HW.)
 fn _backend_native_buffer_create(ctx, size, usage): i64 {
-    return 0;
+    if (ctx == 0) { return 0; }
+    if (size <= 0) { return 0; }
+    # Bound size so _native_align_up can't overflow + the VA region can hold
+    # it (the allocator also returns 0 on exhaustion).
+    if (size > _NATIVE_TEXTURE_VA_REGION) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var bo_size = _native_align_up(size, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, bo_size, &bo);
+    if (rc != 0) { return 0; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return 0;
+    }
+    var buf = alloc(NATIVE_BUF_STRUCT_SIZE);
+    memset(buf, 0, NATIVE_BUF_STRUCT_SIZE);
+    store64(buf + NATIVE_BUF_FIELD_HANDLE, handle);
+    store64(buf + NATIVE_BUF_FIELD_VA,     va);
+    store64(buf + NATIVE_BUF_FIELD_ADDR,   addr);
+    store64(buf + NATIVE_BUF_FIELD_SIZE,   size);   # logical
+    return buf;
 }
 
 fn _backend_native_buffer_write(ctx, buf, off, ptr, n): i64 {
@@ -7319,7 +7349,21 @@ fn _backend_native_buffer_read(ctx, buf, off, ptr, n): i64 {
     return GPU_ERR_NOT_IMPLEMENTED;
 }
 
+# Release a native buffer: VA-unmap + BO-release using the same page-aligned
+# size the create mapped, then zero the struct. Null-safe.
 fn _backend_native_buffer_release(ctx, buf): i64 {
+    if (ctx == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var handle = load64(buf + NATIVE_BUF_FIELD_HANDLE);
+    var va     = load64(buf + NATIVE_BUF_FIELD_VA);
+    var addr   = load64(buf + NATIVE_BUF_FIELD_ADDR);
+    var bo_size = _native_align_up(load64(buf + NATIVE_BUF_FIELD_SIZE), 4096);
+    if (handle != 0) {
+        native_gem_va_unmap(fd, handle, va, bo_size);
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+    }
+    memset(buf, 0, NATIVE_BUF_STRUCT_SIZE);
     return 0;
 }
 
