@@ -52,7 +52,7 @@ cross-vendor default.
   v3.0             ─▶  dual-backend — native Cyrius (AMD/amdgpu/GFX9)
                         added alongside wgpu+C; API unchanged; A/B
                         bench matrix
-  v3.1             ─▶  multi-queue + mipmaps (consumer catch-up)
+  v3.1             ─▶  mipmaps (3.1.0) + multi-queue (3.1.1+) — arc
   v3.2             ─▶  compressed textures + SPIR-V + f64 compute (texture/shader breadth)
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
@@ -249,20 +249,46 @@ multi-day observation that informs the post-GA patch stream.
 
 ---
 
-## v3.1 — Multi-queue + Mipmaps (Consumer Catch-up)
+## v3.1 — Mipmaps + Multi-queue (Consumer Catch-up)
 
 Both items were backlog'd against v1.0 / v2.x — 3.1 is their natural
-home once the v3.0 backend abstraction is in place (both backends
-implement the new surface).
+home now that the v3.0 backend abstraction exists. They are
+**independent** and ship as a sequenced **3.1.x arc**, smallest-risk
+first. Planned 2026-06-15 (subsystem map + design decisions); see the
+**punchlist** and two **design proposals**:
 
-- **Multi-queue coordination** — additive to `GpuContext`. Separate
-  compute / graphics / transfer queues with explicit submit ordering.
-  Consumers needing it: rasa (compute + present overlap), bijli
-  (large transfer workloads). Implemented on both backends.
-- **Mipmap generation** — on-device chain generation via compute
-  shader. Builds on the existing texture surface. Consumers:
-  soorat (texture-heavy UI), kiran (asset pipeline). Implemented on
-  both backends.
+- Punchlist: [`3-1-punchlist.md`](3-1-punchlist.md)
+- Mipmaps: [`docs/proposals/v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md)
+- Multi-queue: [`docs/proposals/v3.1-multiqueue.md`](../proposals/v3.1-multiqueue.md)
+
+### 3.1.0 — Mipmap generation (first; self-contained)
+
+On-device mip-chain generation: create a texture with N levels, write
+level 0, GPU-downsample levels 1..N-1 (2×2 box filter). Same public API
+both backends (`gpu_texture_create_2d_rgba8_mipped` /
+`gpu_texture_generate_mipmaps`). wgpu uses texture views + a WGSL
+downsample shader; native uses a **hand-authored GFX9 ISA** downsample +
+a new image-descriptor-table (V#) path — **no WGSL frontend needed**
+(that stays deferred to v3.x). Per-level barriers ride the single queue
+via the existing cache-flush PM4 primitive (Step 6.10), so **mipmaps do
+not depend on multi-queue**. Consumers: soorat (texture-heavy UI), kiran
+(asset pipeline).
+
+### 3.1.1+ — Multi-queue coordination (logical ordering abstraction)
+
+Named logical queues (GRAPHICS / COMPUTE / TRANSFER) with explicit
+cross-queue ordering. **Hard constraint reckoned with 2026-06-15:**
+WebGPU is one-queue-per-device, so real parallelism is impossible on the
+wgpu backend. Resolution: multi-queue is an **ordering/dependency
+abstraction**, not a parallelism guarantee — wgpu serializes all logical
+queues onto its single queue (correct, no overlap); native AMD maps each
+to a hardware ring (GFX/COMPUTE/DMA) with timeline-syncobj cross-ring
+sync (real overlap). Same public API (ADR 005), backend-specific
+performance — the v3.0 story. Consumers: rasa (compute+present overlap),
+bijli (large transfer). The **render-graph multi-queue refactor** (the
+arc's biggest risk — the v2.5 graph is single-submit) is scoped
+separately (3.1.2 / possibly its own minor); 3.1.1's MVP is
+direct-dispatch multi-queue.
 
 ---
 
