@@ -258,6 +258,48 @@ fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height): i64 {
     return t;
 }
 
+# v3.1 [M.6]: create a mipped 2D RGBA8 texture (mipLevelCount = mip_count)
+# with STORAGE_BINDING so the downsample compute shader can write upper
+# levels. Returns a 32-byte WgpuMippedTexture: handle@0, level-0 view@8,
+# width@16(u32), height@20(u32), mip_count@24(u32). The per-level views
+# the generate path binds are built lazily in the generate slot (M.6b)
+# from `handle` via wgpu_texture_view_descriptor_level — no view table to
+# carry here. The consumer treats the returned ptr as opaque.
+fn _backend_wgpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
+    | WGPU_TEXTURE_USAGE_COPY_DST
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+    | WGPU_TEXTURE_USAGE_STORAGE_BINDING;
+    var desc = wgpu_texture_descriptor_mipped(0, usage,
+    WGPU_TEXTURE_DIMENSION_2D, width, height,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM, mip_count);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    # A full-chain view (all levels) for sampling/upload convenience.
+    var vd = wgpu_texture_view_descriptor(0,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    store32(vd + 36, mip_count);   # mipLevelCount = full chain
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store32(t + 16, width);
+    store32(t + 20, height);
+    store32(t + 24, mip_count);
+    return t;
+}
+
 fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -630,6 +672,8 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
     &_backend_wgpu_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
+    &_backend_wgpu_texture_create_2d_rgba8_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_wgpu_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,

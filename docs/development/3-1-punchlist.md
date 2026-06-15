@@ -151,11 +151,25 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
   (`native_pm4_event_write_cache_flush_and_inv`) is wired in the M.6
   `generate` loop** (it sits between dispatches, not inside this
   single-level composer). HW dispatch validation: M.7.
-- [ ] **M.6** — Slot fillers (`_backend_wgpu_texture_*_mipped` /
-  `_backend_native_*`) + public `gpu_texture_create_2d_rgba8_mipped` /
-  `gpu_texture_generate_mipmaps` dispatchers in `src/texture.cyr` with
-  the 3.0.4 input-validation guards + a `mip_count` bound. Mock-backend
-  CPU tests for slot threading + null-safety.
+- [~] **M.6** — Slot fillers + public dispatchers + `backend_is_complete`
+  walk. Split into create (M.6a) + generate (M.6b):
+  - [x] **M.6a** — `create_mipped` (2026-06-15). native:
+    `native_texture_create_mipped_2d_rgba8` (one chain BO via the M.1
+    allocator) + `_backend_native_texture_create_2d_rgba8_mipped` slot.
+    wgpu: `_backend_wgpu_texture_create_2d_rgba8_mipped` (mipLevelCount +
+    STORAGE_BINDING usage via new `wgpu_texture_descriptor_mipped`) +
+    full-chain view. Both installed in the builders. Public
+    `gpu_texture_create_2d_rgba8_mipped(ctx, w, h, mip_count)` with dim
+    guards + mip-count bound (`0` = full chain). Mock dispatch CPU test
+    (routing, mip_count=0 expansion, validation). Native single-level
+    texture e2e still byte-exact on Cezanne. 2093 asserts; gate clean.
+  - [ ] **M.6b** — `generate_mipmaps` (both backends) + its public
+    dispatcher + extend `backend_is_complete` over the mipmap range (the
+    M.2 deferral). native: cache a downsample-shader BO on the ctx, loop
+    levels dispatching `native_pm4_build_compute_downsample` via the
+    cached-IB path with `native_pm4_event_write_cache_flush_and_inv`
+    between levels. wgpu: per-level views + storage bind groups + dispatch
+    loop over the WGSL shader. Next.
 - [ ] **M.7** — `programs/native_mipmap_e2e.cyr` + `programs/mipmap_e2e.cyr`
   (wgpu): generate a chain from a known level-0 pattern, CPU-read each
   level, verify 2×2 averaging numerically. HW-gated on AMD (renderD128).

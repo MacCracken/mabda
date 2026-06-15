@@ -478,6 +478,27 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
     return tex;
 }
 
+# v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
+# whole mip pyramid; generate (M.6b) downsamples level-by-level into it.
+fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var fd = native_ctx_fd(ctx);
+    var size = native_mip_chain_size(width, height, mip_count);
+    var va = native_ctx_alloc_texture_va(ctx, size);
+    if (va == 0) { return 0; }
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    var rc = native_texture_create_mipped_2d_rgba8(fd, va, width, height, mip_count, tex);
+    if (rc != 0) { return 0; }
+    return tex;
+}
+
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -942,6 +963,8 @@ fn backend_native_new(): i64 {
     &_backend_native_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
     &_backend_native_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
+    &_backend_native_texture_create_2d_rgba8_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
@@ -1139,6 +1162,33 @@ fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    return 0;
+}
+
+# v3.1 [M.6]: allocate a mip-chain texture — one contiguous GTT BO sized
+# to native_mip_chain_size, va-mapped at `va_base`. Level n's bytes live
+# at va_base + native_mip_level_offset(w, h, n). Stores mip_count so the
+# generate path (M.6b) knows how many levels to fill.
+fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, out): i64 {
+    var size = native_mip_chain_size(width, height, mip_count);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va_base, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE,    handle);
+    store64(out + NATIVE_TEX_FIELD_VA,        va_base);
+    store64(out + NATIVE_TEX_FIELD_ADDR,      addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,      size);
+    store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
     return 0;
 }
 

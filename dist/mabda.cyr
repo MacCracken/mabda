@@ -1417,6 +1417,14 @@ fn wgpu_texture_descriptor(label, usage, dimension, width, height, format): i64 
     return desc;
 }
 
+# v3.1 [M.6]: texture descriptor with an explicit mip-level count (the
+# mipmap-generation create path). Identical to the base builder otherwise.
+fn wgpu_texture_descriptor_mipped(label, usage, dimension, width, height, format, mip_count): i64 {
+    var desc = wgpu_texture_descriptor(label, usage, dimension, width, height, format);
+    store32(desc + 52, mip_count);   # mipLevelCount
+    return desc;
+}
+
 # ================================================================
 # WGPUTextureViewDescriptor (64 bytes, verified via offsetof)
 #   +0:  nextInChain
@@ -2535,6 +2543,48 @@ fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height): i64 {
     return t;
 }
 
+# v3.1 [M.6]: create a mipped 2D RGBA8 texture (mipLevelCount = mip_count)
+# with STORAGE_BINDING so the downsample compute shader can write upper
+# levels. Returns a 32-byte WgpuMippedTexture: handle@0, level-0 view@8,
+# width@16(u32), height@20(u32), mip_count@24(u32). The per-level views
+# the generate path binds are built lazily in the generate slot (M.6b)
+# from `handle` via wgpu_texture_view_descriptor_level — no view table to
+# carry here. The consumer treats the returned ptr as opaque.
+fn _backend_wgpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
+    | WGPU_TEXTURE_USAGE_COPY_DST
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
+    | WGPU_TEXTURE_USAGE_STORAGE_BINDING;
+    var desc = wgpu_texture_descriptor_mipped(0, usage,
+    WGPU_TEXTURE_DIMENSION_2D, width, height,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM, mip_count);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    # A full-chain view (all levels) for sampling/upload convenience.
+    var vd = wgpu_texture_view_descriptor(0,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+    WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    store32(vd + 36, mip_count);   # mipLevelCount = full chain
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store32(t + 16, width);
+    store32(t + 20, height);
+    store32(t + 24, mip_count);
+    return t;
+}
+
 fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -2907,6 +2957,8 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
     &_backend_wgpu_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
+    &_backend_wgpu_texture_create_2d_rgba8_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_wgpu_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
@@ -6562,6 +6614,27 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
     return tex;
 }
 
+# v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
+# whole mip pyramid; generate (M.6b) downsamples level-by-level into it.
+fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var fd = native_ctx_fd(ctx);
+    var size = native_mip_chain_size(width, height, mip_count);
+    var va = native_ctx_alloc_texture_va(ctx, size);
+    if (va == 0) { return 0; }
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    var rc = native_texture_create_mipped_2d_rgba8(fd, va, width, height, mip_count, tex);
+    if (rc != 0) { return 0; }
+    return tex;
+}
+
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -7026,6 +7099,8 @@ fn backend_native_new(): i64 {
     &_backend_native_device_wait_idle);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8,
     &_backend_native_texture_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
+    &_backend_native_texture_create_2d_rgba8_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
@@ -7223,6 +7298,33 @@ fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    return 0;
+}
+
+# v3.1 [M.6]: allocate a mip-chain texture — one contiguous GTT BO sized
+# to native_mip_chain_size, va-mapped at `va_base`. Level n's bytes live
+# at va_base + native_mip_level_offset(w, h, n). Stores mip_count so the
+# generate path (M.6b) knows how many levels to fill.
+fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, out): i64 {
+    var size = native_mip_chain_size(width, height, mip_count);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va_base, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE,    handle);
+    store64(out + NATIVE_TEX_FIELD_VA,        va_base);
+    store64(out + NATIVE_TEX_FIELD_ADDR,      addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,      size);
+    store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
     return 0;
 }
 
@@ -11005,6 +11107,29 @@ fn gpu_texture_create_2d_rgba8(ctx, width, height): i64 {
     var slot = backend_get_slot(gpu_ctx_backend(ctx),
     BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8);
     return fncall3(slot, ctx, width, height);
+}
+
+# v3.1 [M.6]: create a 2D RGBA8 texture with a mip chain. mip_count == 1
+# is a single level (same as gpu_texture_create_2d_rgba8); mip_count == 0
+# means "full chain" (floor(log2(max(w,h))) + 1). Levels are allocated but
+# only level 0 is defined until gpu_texture_generate_mipmaps runs. Returns
+# an opaque backend tex_ptr, or 0 on invalid input. Validates dims (same
+# guards as the single-level path) plus the mip-count bound.
+fn gpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var full = mip_level_count(width, height);
+    var mc = mip_count;
+    if (mc == 0) { mc = full; }       # 0 = full chain
+    if (mc < 1) { return 0; }
+    if (mc > full) { return 0; }      # can't exceed the natural chain length
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED);
+    return fncall4(slot, ctx, width, height, mc);
 }
 
 fn gpu_texture_write(ctx, tex, src, n): i64 {
