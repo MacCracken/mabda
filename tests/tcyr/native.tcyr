@@ -465,6 +465,197 @@ fn test_native_cs_chunk_ids_and_ip_types() {
     return 0;
 }
 
+# ================================================================
+# v3.1 Q.3a — timeline syncobj ABI
+# ================================================================
+fn test_native_timeline_ioctl_encodings() {
+    # _IOWR('d', nr, struct ..) — cross-check the precomputed constants
+    # against native_ioc_encode and the C-verified literals.
+    var wait_expected  = native_ioc_encode(3, DRM_SYNCOBJ_TIMELINE_WAIT_SIZE,
+    DRM_IOCTL_TYPE, 0xCA);
+    var query_expected = native_ioc_encode(3, DRM_SYNCOBJ_TIMELINE_ARRAY_SIZE,
+    DRM_IOCTL_TYPE, 0xCB);
+    assert_eq(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, wait_expected,
+    "TIMELINE_WAIT ioctl via encode");
+    assert_eq(DRM_IOCTL_SYNCOBJ_QUERY, query_expected,
+    "SYNCOBJ_QUERY ioctl via encode");
+    assert_eq(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xC03064CA,
+    "TIMELINE_WAIT = 0xC03064CA (48-byte struct)");
+    assert_eq(DRM_IOCTL_SYNCOBJ_QUERY, 0xC01864CB,
+    "SYNCOBJ_QUERY = 0xC01864CB (24-byte struct)");
+    return 0;
+}
+
+fn test_native_timeline_struct_sizes_and_chunk_ids() {
+    assert_eq(DRM_SYNCOBJ_TIMELINE_WAIT_SIZE,  48,
+    "drm_syncobj_timeline_wait = 48");
+    assert_eq(DRM_SYNCOBJ_TIMELINE_ARRAY_SIZE, 24,
+    "drm_syncobj_timeline_array = 24");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_IN,            0x04, "CHUNK_ID_SYNCOBJ_IN");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,   0x08, "CHUNK_ID_TIMELINE_WAIT");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL, 0x09, "CHUNK_ID_TIMELINE_SIGNAL");
+    return 0;
+}
+
+fn test_native_cs_chunk_syncobj_layout() {
+    # drm_amdgpu_cs_chunk_syncobj = {handle u32, flags u32, point u64}.
+    var buf[16];
+    memset(&buf, 0, 16);
+    native_build_cs_chunk_syncobj(&buf, 0x1234, 0, 0x123456789);
+    assert_eq(load32(&buf + 0), 0x1234,     "handle at +0");
+    assert_eq(load32(&buf + 4), 0,          "flags at +4");
+    assert_eq(load64(&buf + 8), 0x123456789, "point (u64) at +8 spans 32-bit boundary");
+    # Non-zero flags + small point round-trip.
+    native_build_cs_chunk_syncobj(&buf, 0xABCD, 0x2, 7);
+    assert_eq(load32(&buf + 0), 0xABCD, "handle overwritten");
+    assert_eq(load32(&buf + 4), 0x2,    "flags round-trip");
+    assert_eq(load64(&buf + 8), 7,      "point round-trip");
+    return 0;
+}
+
+fn test_native_sdma_copy_linear_layout() {
+    # SDMA v4 COPY_LINEAR: 7 dwords, count = bytes-1, canonical-high VA
+    # halves packed via the logical >>.
+    var buf[28];
+    memset(&buf, 0, 28);
+    var n = native_sdma_build_copy_linear(&buf, 0xFFFF800100400000,
+    0xAABB0000CCDD0000, 4096);
+    assert_eq(n, 28, "SDMA copy linear = 28 bytes (7 dw)");
+    assert_eq(load32(&buf + 0),  0x1,        "header: op=COPY(1) sub_op=LINEAR(0)");
+    assert_eq(load32(&buf + 4),  4095,       "count = bytes - 1");
+    assert_eq(load32(&buf + 8),  0,          "params = 0");
+    assert_eq(load32(&buf + 12), 0x00400000, "src_lo");
+    assert_eq(load32(&buf + 16), 0xFFFF8001, "src_hi (logical >>32, canonical-high)");
+    assert_eq(load32(&buf + 20), 0xCCDD0000, "dst_lo");
+    assert_eq(load32(&buf + 24), 0xAABB0000, "dst_hi");
+    assert_eq(AMDGPU_HW_IP_DMA, 2, "DMA ring = HW_IP 2");
+    return 0;
+}
+
+fn test_native_cs_submit_timeline_fence_align_guard() {
+    # Unaligned fence_offset trips the DWORD-align guard (CVE-2026-46220
+    # class) and returns -EINVAL before any ioctl — so the fake fd is
+    # never touched.
+    var rc = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 1, 0, 0, 5, 33, 0);
+    assert_eq(rc, 0 - 22, "unaligned fence_offset -> -EINVAL, no syscall");
+    return 0;
+}
+
+fn test_native_queue_kind_to_ring() {
+    assert_eq(_native_queue_kind_to_ring(QUEUE_KIND_GRAPHICS), AMDGPU_HW_IP_GFX,
+    "GRAPHICS -> GFX ring");
+    assert_eq(_native_queue_kind_to_ring(QUEUE_KIND_COMPUTE), AMDGPU_HW_IP_COMPUTE,
+    "COMPUTE -> COMPUTE ring");
+    assert_eq(_native_queue_kind_to_ring(QUEUE_KIND_TRANSFER), AMDGPU_HW_IP_COMPUTE,
+    "TRANSFER -> COMPUTE fallback in 3.1.1 (3.1.2 -> DMA w/ public copy API)");
+    assert_eq(_native_queue_kind_to_ring(99), 0 - 1, "bad kind -> -1");
+    return 0;
+}
+
+fn test_native_queue_get_guards() {
+    # ctx==0, bad-kind, and no-fd all short-circuit to 0 before any ioctl.
+    assert_eq(_backend_native_queue_get(0, QUEUE_KIND_COMPUTE), 0, "null ctx -> 0");
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    assert_eq(_backend_native_queue_get(&ctx, 99), 0, "bad kind -> 0");
+    assert_eq(_backend_native_queue_get(&ctx, QUEUE_KIND_COMPUTE), 0,
+    "no-fd ctx -> 0, no syscall");
+    return 0;
+}
+
+fn test_native_queue_wait_idle_guards() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    assert_eq(_backend_native_queue_wait_idle(0, 1), GPU_ERR_OTHER, "null ctx err");
+    assert_eq(_backend_native_queue_wait_idle(&ctx, 0), GPU_ERR_OTHER, "null queue err");
+    # A fresh queue has point 0 -> wait_idle is a no-op (no syscall).
+    var q = queue_new(QUEUE_KIND_COMPUTE);
+    assert_eq(_backend_native_queue_wait_idle(&ctx, q), 0,
+    "point 0 queue -> 0 (nothing submitted)");
+    return 0;
+}
+
+fn test_native_queue_barrier_guards() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    assert_eq(_backend_native_queue_barrier(0, 1, 2), GPU_ERR_OTHER, "null ctx err");
+    assert_eq(_backend_native_queue_barrier(&ctx, 0, 2), GPU_ERR_OTHER, "null src err");
+    assert_eq(_backend_native_queue_barrier(&ctx, 1, 0), GPU_ERR_OTHER, "null dst err");
+    return 0;
+}
+
+fn test_native_compute_dispatch_queue_targeted_branch() {
+    # When the current-queue stash is set, compute_dispatch routes
+    # through the async timeline path: the queue's point is bumped (0->1)
+    # and a submit is attempted. With a fake fd (-1) the CS ioctl fails
+    # gracefully (-EBADF -> GPU_ERR_*, no crash). Set just enough ctx
+    # fields for the driver: fd, a real IB mmap buffer, and the PM4
+    # scratch — everything else can stay zero.
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 0, 0 - 1);            # fd = -1 -> CS ioctl -EBADF
+    var ib_scratch[4096];
+    store64((&ctx) + 64, &ib_scratch);     # ib_addr (memcpy target)
+    var pm4_scratch[1024];
+    store64((&ctx) + 112, &pm4_scratch);   # pm4 build buffer
+    var q = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(q, 1);               # non-zero so the driver proceeds
+    queue_set_ring(q, AMDGPU_HW_IP_COMPUTE);
+    gpu_ctx_set_current_queue(&ctx, q);
+    # Q.4: stage a pending cross-ring wait; the dispatch must consume +
+    # clear it (turning it into an in-CS TIMELINE_WAIT on the submit).
+    queue_set_pending_wait(q, 0x77, 3);
+    var shmod[16];
+    native_buf_pair_write(&shmod, 0x111, 0x222);
+    var bp[16];
+    native_buf_pair_write(&bp, 0x333, 0x444);
+    assert_eq(queue_point(q), 0, "point starts 0");
+    var rc = _backend_native_compute_dispatch(&ctx, &shmod, 1, 1, 1, &bp);
+    assert(rc != 0, "fake-fd submit fails gracefully (no crash)");
+    assert_eq(queue_point(q), 1, "timeline path taken: queue point bumped 0->1");
+    assert_eq(queue_pending_wait_syncobj(q), 0, "pending wait consumed + cleared");
+    return 0;
+}
+
+fn test_native_queue_barrier_records_pending_wait() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    # Producer queue has submitted up to point 5 on syncobj 0x42.
+    var src = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(src, 0x42);
+    queue_set_point(src, 5);
+    var dst = queue_new(QUEUE_KIND_GRAPHICS);
+    assert_eq(_backend_native_queue_barrier(&ctx, src, dst), 0, "barrier ok");
+    assert_eq(queue_pending_wait_syncobj(dst), 0x42, "dst waits on src syncobj");
+    assert_eq(queue_pending_wait_point(dst), 5, "dst waits on src point 5");
+    assert_eq(queue_point(src), 5, "src point untouched (no CPU block)");
+    # Barrier with an idle producer (point 0) records nothing.
+    var src2 = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(src2, 0x99);
+    var dst2 = queue_new(QUEUE_KIND_GRAPHICS);
+    assert_eq(_backend_native_queue_barrier(&ctx, src2, dst2), 0, "idle-src barrier ok");
+    assert_eq(queue_pending_wait_syncobj(dst2), 0, "no pending wait for idle producer");
+    return 0;
+}
+
+fn test_native_cs_submit_timeline_point_guards() {
+    # Signalling timeline point 0 is a kernel -EINVAL trap (points are
+    # strictly monotonic from 0); the guard short-circuits before any
+    # ioctl. fence_offset=32 is aligned so it's the point guard, not the
+    # align guard, that fires.
+    var rc0 = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 0, 0, 0, 5, 32, 0);
+    assert_eq(rc0, 0 - 22, "signal_point 0 -> -EINVAL, no syscall");
+    # Waiting on point 0 (with a non-zero wait syncobj) is likewise
+    # rejected: signal_point=1 is valid, wait_syncobj=7 includes a wait,
+    # wait_point=0 trips the wait-point guard.
+    var rcw = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 1, 7, 0, 5, 32, 0);
+    assert_eq(rcw, 0 - 22, "wait_point 0 with a wait chunk -> -EINVAL, no syscall");
+    return 0;
+}
+
 fn test_native_pm4_builder_composability() {
     # Chain operations: NOP(pad=2) + SET_SH_REG(one) + DISPATCH_DIRECT.
     # NOP pad=2 (minimum useful per Session 25b): 1 header + 1 filler dword.
@@ -2293,6 +2484,18 @@ fn main() {
     test_native_cs_ioctl_encoding();
     test_native_cs_struct_sizes();
     test_native_cs_chunk_ids_and_ip_types();
+    test_native_timeline_ioctl_encodings();
+    test_native_timeline_struct_sizes_and_chunk_ids();
+    test_native_cs_chunk_syncobj_layout();
+    test_native_sdma_copy_linear_layout();
+    test_native_cs_submit_timeline_fence_align_guard();
+    test_native_cs_submit_timeline_point_guards();
+    test_native_queue_kind_to_ring();
+    test_native_queue_get_guards();
+    test_native_queue_wait_idle_guards();
+    test_native_queue_barrier_guards();
+    test_native_queue_barrier_records_pending_wait();
+    test_native_compute_dispatch_queue_targeted_branch();
     test_native_pm4_builder_composability();
     test_backend_native_new_is_complete();
     test_backend_native_slot_identities();

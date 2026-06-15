@@ -18,6 +18,79 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.1.1] — 2026-06-15
+
+**Multi-queue coordination (native AMD).** Second feature of the v3.1.x
+arc (`docs/development/3-1-punchlist.md` Phase Q;
+`docs/proposals/v3.1-multiqueue.md`). A logical queue abstraction
+(`GRAPHICS` / `COMPUTE` / `TRANSFER`) lets a consumer dispatch onto
+distinct hardware rings and order cross-ring work with a barrier. **Native
+AMD is HW-verified on Cezanne**: compute on the COMPUTE ring → barrier →
+graphics on the GFX ring (in-CS timeline wait) → an SDMA copy on the DMA
+ring that consumes compute's output — all three rings timeline-ordered
+(`programs/native_multiqueue_e2e.cyr`). Same public API on both backends;
+wgpu aliases all logical queues onto its single device queue (no real
+overlap — see Limitations). No change to existing public API. CPU suite
+2102 → **2265** assertions. Toolchain pin 6.2.6 → **6.2.8**.
+
+### Added
+
+- **Logical queue API** (`src/queue.cyr`): `gpu_queue_get(ctx, kind)`,
+  `gpu_queue_barrier(ctx, src, dst)`, `gpu_queue_wait_idle(ctx, queue)`,
+  and `gpu_ctx_set_current_queue` to target dispatches. `QUEUE_KIND_*`
+  constants + a 48-byte `Queue` (kind / ring / persistent timeline
+  syncobj / point / pending cross-ring wait) + a ctx-side queue table.
+- **Native timeline syncobjs**: `native_syncobj_timeline_wait` /
+  `_query` ioctls + a `native_cs_submit_timeline` driver
+  (`BO_HANDLES + [TIMELINE_WAIT] + TIMELINE_SIGNAL + FENCE + IB`). Each
+  native logical queue carries one persistent timeline syncobj; every
+  queue-targeted submit signals the next point on GPU completion.
+  ABI ground-truthed against `drm.h`/`amdgpu_drm.h` (kernel 7.0).
+- **Cross-ring barrier**: `gpu_queue_barrier` records a pending wait on
+  the consumer queue; its next submit carries it as an in-CS
+  `SYNCOBJ_TIMELINE_WAIT` (with `WAIT_FOR_SUBMIT`), so the dependency
+  resolves GPU-side with no CPU stall — genuine GFX/COMPUTE overlap.
+- **Queue-targeted native dispatch**: `_backend_native_compute_dispatch`
+  routes through the current-queue stash to that queue's ring + timeline
+  (`programs/native_queue_compute_e2e.cyr`,
+  `programs/native_queue_barrier_e2e.cyr`).
+- **SDMA copy foundation** (TRANSFER): `native_sdma_build_copy_linear`
+  (SDMA v4 `COPY_LINEAR`) + `AMDGPU_HW_IP_DMA`. The DMA-ring submit is
+  HW-verified (`programs/native_sdma_copy_e2e.cyr`: 4 KiB copied
+  byte-identical, 0 ms, no TDR).
+- wgpu queue fillers: logical queues alias the single `WGPUQueue`;
+  `queue_barrier` is a submit-order no-op, `queue_wait_idle` a device
+  poll.
+
+### Changed
+
+- `Backend` struct 224 → 248 B (three queue slots, append-after-KIND);
+  `backend_is_complete` walks the new range (both backends fill it).
+- `GpuContext` 128 → 160 B (queue table at +128..+152, outside the
+  +0..+24 dual-interpretation region).
+- **Toolchain pin 6.2.6 → 6.2.8** (`cyrius.cyml`). Full gate re-run green
+  on 6.2.8.
+
+### Limitations / Deferred
+
+- **wgpu multi-queue has no real overlap.** WebGPU exposes one device
+  queue; all three logical queues alias it and run in submit order. The
+  barrier degrades to an ordering pin. Consumers needing genuine
+  concurrency use the native backend.
+- **TRANSFER queue uses the COMPUTE-ring fallback in 3.1.1.** The SDMA
+  copy path is HW-proven, but the `TRANSFER → AMDGPU_HW_IP_DMA` flip + a
+  public buffer-copy op (with wgpu parity) land together in **3.1.2** —
+  a DMA-ring queue with no public copy op would only be a footgun today.
+- **Render-graph multi-queue scheduling** (per-node queue affinity +
+  cross-queue fence edges) is scoped to **3.1.2** (Phase Q.7), not a
+  3.1.1 blocker.
+
+### Next
+
+- 3.1.2: TRANSFER → SDMA ring + public buffer-copy API (wgpu parity) +
+  render-graph multi-queue scheduling. Then six-consumer regression sweep
+  (Tier 2 ship work) before the v3.1.x line settles.
+
 ## [3.1.0] — 2026-06-15
 
 **On-device mipmap generation (native AMD).** First feature of the v3.1.x

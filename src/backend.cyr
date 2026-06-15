@@ -177,7 +177,29 @@ var BACKEND_SLOT_SURFACE_RELEASE         = 200;
 var BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED = 208;
 var BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS       = 216;
 
-var BACKEND_SIZE                         = 224;
+# v3.1 queue fnptr block (Q.1) — multi-queue coordination. Appended
+# after the mipmap range; offsets 0..216 unchanged (append-after-KIND
+# policy holds). Slot signatures (filled in Q.2 wgpu / Q.3 native):
+#   queue_get       (ctx, kind)               -> Queue* | 0
+#       wgpu : returns a logical Queue aliasing the single WGPUQueue.
+#       native: returns a logical Queue bound to the GFX / COMPUTE /
+#               SDMA ring for the kind, with a persistent timeline
+#               syncobj.
+#   queue_barrier   (ctx, src_queue, dst_queue) -> 0|err
+#       wgpu : pins submit ordering on the single queue (no overlap).
+#       native: cross-ring timeline WAIT-in / SIGNAL-out (Q.4).
+#   queue_wait_idle (ctx, queue)              -> 0|err
+#       wgpu : device poll. native: syncobj wait on the queue's point.
+# All within the fncall ceiling (3 args max). Public surface lives in
+# src/queue.cyr; the backend_is_complete() walk over this range is
+# deferred to Q.2 (when the wgpu fillers land) — mirrors the 6.8(a) /
+# 7.5 / M.2 deferral so we don't falsely report every backend
+# incomplete while the slots are still zero.
+var BACKEND_SLOT_QUEUE_GET               = 224;
+var BACKEND_SLOT_QUEUE_BARRIER           = 232;
+var BACKEND_SLOT_QUEUE_WAIT_IDLE         = 240;
+
+var BACKEND_SIZE                         = 248;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -211,6 +233,13 @@ var BACKEND_SURFACE_SLOTS_END            = 208;
 # since the slots are still zero. Same as the 6.8(a) / 7.5 deferral.
 var BACKEND_MIPMAP_SLOTS_BEGIN           = 208;
 var BACKEND_MIPMAP_SLOTS_END             = 224;
+
+# v3.1 queue fnptr block: 224..248. Sixth range. backend_is_complete()'s
+# walk over it is deferred to Q.2 (when the wgpu/native fillers land) —
+# adding the walk now would falsely report every backend incomplete,
+# since the slots are still zero. Same as the 6.8(a) / 7.5 / M.2 deferral.
+var BACKEND_QUEUE_SLOTS_BEGIN            = 224;
+var BACKEND_QUEUE_SLOTS_END              = 248;
 
 # ================================================================
 # Backend struct construction
@@ -299,6 +328,15 @@ fn backend_is_complete(b): i64 {
     while (off5 < BACKEND_MIPMAP_SLOTS_END) {
         if (load64(b + off5) == 0) { return 0; }
         off5 = off5 + 8;
+    }
+    # v3.1 queue slots (Q.3b) — both backends now fill the queue range
+    # (wgpu: single-queue aliasing + submit-order barrier; native:
+    # distinct HW rings + persistent timeline syncobjs), so the walk
+    # over it is activated. wgpu fills all three; native fills all three.
+    var off6 = BACKEND_QUEUE_SLOTS_BEGIN;
+    while (off6 < BACKEND_QUEUE_SLOTS_END) {
+        if (load64(b + off6) == 0) { return 0; }
+        off6 = off6 + 8;
     }
     return 1;
 }

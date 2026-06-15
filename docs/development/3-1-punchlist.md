@@ -1,6 +1,9 @@
 # Mabda v3.1 — Release Punch List
 
-**Status:** Active — minor opened, `v3.1` branch cut 2026-06-15. Tick items as they land.
+**Status:** 3.1.0 (mipmaps) + 3.1.1 (multi-queue) **SHIPPED 2026-06-15**.
+Phase M + Phase Q (Q.1–Q.6) complete + HW-verified on Cezanne. Remaining:
+Q.7 (render-graph multi-queue) + the TRANSFER→DMA flip + public buffer-copy
+API → **3.1.2**; then the Tier 2 six-consumer regression sweep.
 **Date opened:** 2026-06-15
 **Branch:** `v3.1` (cut from `main` after 3.0.4).
 **Roadmap reference:** [`roadmap.md` § v3.1](roadmap.md#v31--mipmaps--multi-queue-consumer-catch-up)
@@ -221,12 +224,24 @@ Proposal: [`v3.1-multiqueue.md`](../proposals/v3.1-multiqueue.md).
 - [ ] **Q.4** — `gpu_queue_barrier`: native cross-ring timeline
   WAIT-in/SIGNAL-out chunks; wgpu ordering pin. CPU tests: barrier-chunk
   layout.
-- [ ] **Q.5** — TRANSFER ring: SDMA PM4 copy path in
-  `src/backend_native_pm4.cyr` (or documented COMPUTE-ring fallback if
-  SDMA bring-up is deferred).
-- [ ] **Q.6** — `programs/native_multiqueue_e2e.cyr`: compute writes a
-  buffer, `queue_barrier`, graphics consumes it — distinct rings,
-  timeline-ordered, CPU-verified. wgpu serialized-equivalent.
+- [x] **Q.5** — TRANSFER ring: SDMA `COPY_LINEAR` packet builder
+  (`native_sdma_build_copy_linear` in `src/backend_native_pm4.cyr`,
+  `AMDGPU_HW_IP_DMA`) — **HW-verified on Cezanne**
+  (`programs/native_sdma_copy_e2e.cyr`: 4 KiB page copied byte-identical
+  on the DMA ring, 0 ms, no TDR). The TRANSFER queue keeps the
+  COMPUTE-ring fallback in **3.1.1** (no public buffer-copy op to drive a
+  DMA-ring queue yet, and a DMA-ring queue would mis-route a compute
+  dispatch). The `TRANSFER -> AMDGPU_HW_IP_DMA` flip + a public
+  buffer-copy API (+ wgpu parity) land together in **3.1.2**, built on
+  this HW-proven foundation.
+- [x] **Q.6** — `programs/native_multiqueue_e2e.cyr` — **HW-verified on
+  Cezanne**: compute (COMPUTE ring) writes a buffer → `gpu_queue_barrier`
+  → graphics (GFX ring) runs ordered-after via an in-CS timeline wait → an
+  SDMA copy (DMA ring) consumes compute's output. Three distinct rings,
+  timeline-ordered, every result CPU-verified. wgpu serialized-equivalent
+  (single device queue). **3.1.1 cut** (VERSION 3.1.1, CHANGELOG, README,
+  CLAUDE, dist; toolchain pin 6.2.6 → 6.2.8; full gate green; 2265 CPU
+  asserts).
 - [ ] **Q.7** — **Render-graph multi-queue scheduling** — design spike
   first (`docs/proposals/v3.1-render-graph-multiqueue.md`), then per-node
   queue affinity + cross-queue fence edges + per-queue submit batching.

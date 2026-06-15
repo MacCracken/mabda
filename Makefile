@@ -224,6 +224,53 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+# v3.1 Q.3c — native multi-queue compute: dispatch on a logical COMPUTE
+# queue (async, timeline-signalled), wait via gpu_queue_wait_idle, verify
+# 0xDEADBEEF; second dispatch proves the persistent timeline (point 1->2).
+# HW-gated (requires the AMD render node).
+build/native_queue_compute_e2e: programs/native_queue_compute_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_queue_compute_e2e.cyr $@
+
+.PHONY: test-native-queue-compute-e2e
+test-native-queue-compute-e2e: build/native_queue_compute_e2e
+	./build/native_queue_compute_e2e
+
+# v3.1 Q.4 — cross-ring barrier: compute (COMPUTE ring) -> gpu_queue_barrier
+# -> compute on the GRAPHICS queue (GFX ring) whose submit carries an in-CS
+# SYNCOBJ_TIMELINE_WAIT on the compute point. Proves the kernel accepts +
+# completes a CS with a timeline-wait chunk. HW-gated.
+build/native_queue_barrier_e2e: programs/native_queue_barrier_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_queue_barrier_e2e.cyr $@
+
+.PHONY: test-native-queue-barrier-e2e
+test-native-queue-barrier-e2e: build/native_queue_barrier_e2e
+	./build/native_queue_barrier_e2e
+
+# v3.1 Q.5 — SDMA COPY_LINEAR on the DMA ring (AMDGPU_HW_IP_DMA): copy a
+# 4 KiB page src->dst and verify byte-identical. Proves the SDMA packet
+# format + DMA-ring submit on Cezanne. HW-gated. (The TRANSFER queue's
+# DMA-ring flip + public copy API land in 3.1.2; this is the foundation.)
+build/native_sdma_copy_e2e: programs/native_sdma_copy_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_sdma_copy_e2e.cyr $@
+
+.PHONY: test-native-sdma-copy-e2e
+test-native-sdma-copy-e2e: build/native_sdma_copy_e2e
+	./build/native_sdma_copy_e2e
+
+# v3.1 Q.6 — headline multi-queue demo: compute (COMPUTE ring) -> barrier
+# -> graphics (GFX ring) + SDMA consume (DMA ring), all three rings
+# timeline-ordered, every result CPU-verified. HW-gated.
+build/native_multiqueue_e2e: programs/native_multiqueue_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_multiqueue_e2e.cyr $@
+
+.PHONY: test-native-multiqueue-e2e
+test-native-multiqueue-e2e: build/native_multiqueue_e2e
+	./build/native_multiqueue_e2e
+
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the
 # dword stream to stdout instead of submitting it. CI-safe (no GPU

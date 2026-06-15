@@ -1,0 +1,160 @@
+# programs/native_queue_barrier_e2e.cyr — v3.1 Q.4 hardware integration
+#
+# Exercises gpu_queue_barrier's in-CS TIMELINE_WAIT path across two
+# distinct logical queues on two HW rings:
+#   1. dispatch the deadbeef compute shader on the COMPUTE queue -> buf_a
+#      (signals COMPUTE timeline point 1).
+#   2. gpu_queue_barrier(COMPUTE -> GRAPHICS): records a pending wait on
+#      the GRAPHICS queue = (COMPUTE syncobj, point 1). No CPU block.
+#   3. dispatch the deadbeef shader on the GRAPHICS queue (GFX ring) -> buf_b.
+#      Its submit carries an in-CS SYNCOBJ_TIMELINE_WAIT on the COMPUTE
+#      point, so the GFX ring resolves the dependency GPU-side.
+#   4. gpu_queue_wait_idle(GRAPHICS) -> verify buf_b == 0xDEADBEEF.
+#
+# Proves the kernel accepts a CS with a TIMELINE_WAIT chunk and the
+# submission completes (not -EINVAL / not a TDR). The headline
+# compute->barrier->render overlap lands in Q.6; this validates the
+# barrier wait-chunk mechanism end-to-end first.
+#
+# Exit codes:
+#   0  — both dispatches wrote 0xDEADBEEF; GFX submit with wait chunk OK
+#   1  — gpu_context_new_native failed
+#   2  — shader BO setup failed
+#   3  — buf_a setup failed
+#   4  — buf_b setup failed
+#   5  — gpu_queue_get failed
+#   9  — compute dispatch failed
+#   10 — compute wait_idle failed / buf_a mismatch
+#   11 — gpu_queue_barrier failed
+#   12 — graphics dispatch (with wait chunk) failed
+#   13 — graphics wait_idle failed (timeout/TDR)
+#   14 — buf_b mismatch (GFX ring did not write)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn setup_out_bo(fd, va, sentinel, out_pair): i64 {
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, 4096, &bo);
+    if (rc != 0) { return rc; }
+    var handle = load64(&bo + 0);
+    var map    = load64(&bo + 8);
+    var si = 0;
+    while (si < 1024) { store32(map + si * 4, sentinel); si = si + 1; }
+    rc = native_gem_va_map(fd, handle, va, 4096, _NATIVE_PERM_DATA);
+    if (rc != 0) { return rc; }
+    store64(out_pair + 0, handle);
+    store64(out_pair + 8, map);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native QUEUE barrier e2e (v3.1 Q.4)\n");
+    print_cstr("-----------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # Shader BO.
+    var shader_bo[16];
+    var rc = native_bo_create_gtt(fd, 4096, &shader_bo);
+    if (rc != 0) { print_cstr("FAIL: shader bo\n"); gpu_context_release(ctx); return 2; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, 4096);
+    native_gfx9_shader_store_deadbeef(shader_map, 0);
+    var shader_va = 0xFFFF800100000000;
+    rc = native_gem_va_map(fd, shader_handle, shader_va, 4096, _NATIVE_PERM_SHADER);
+    if (rc != 0) { print_cstr("FAIL: shader va\n"); return 2; }
+    var shmod[16];
+    native_buf_pair_write(&shmod, shader_handle, shader_va);
+
+    # Two output BOs.
+    var pa[16];
+    if (setup_out_bo(fd, 0xFFFF800100400000, 0xBAADF00D, &pa) != 0) {
+        print_cstr("FAIL: buf_a\n"); return 3;
+    }
+    var pb[16];
+    if (setup_out_bo(fd, 0xFFFF800100440000, 0xBAADF00D, &pb) != 0) {
+        print_cstr("FAIL: buf_b\n"); return 4;
+    }
+    var buf_a_map = load64(&pa + 8);
+    var buf_b_map = load64(&pb + 8);
+    var bp_a[16];
+    native_buf_pair_write(&bp_a, load64(&pa + 0), 0xFFFF800100400000);
+    var bp_b[16];
+    native_buf_pair_write(&bp_b, load64(&pb + 0), 0xFFFF800100440000);
+
+    var qc = gpu_queue_get(ctx, QUEUE_KIND_COMPUTE);
+    var qg = gpu_queue_get(ctx, QUEUE_KIND_GRAPHICS);
+    if (qc == 0) { print_cstr("FAIL: COMPUTE queue\n"); return 5; }
+    if (qg == 0) { print_cstr("FAIL: GRAPHICS queue\n"); return 5; }
+    print_cstr("compute ring="); print_i64(queue_ring(qc));
+    print_cstr(" graphics ring="); print_i64(queue_ring(qg)); print_cstr("\n");
+
+    # Step 1: compute dispatch on the COMPUTE queue.
+    gpu_ctx_set_current_queue(ctx, qc);
+    rc = gpu_compute_dispatch(ctx, &shmod, 1, 1, 1, &bp_a);
+    if (rc != 0) { print_cstr("FAIL: compute dispatch rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 9; }
+    rc = gpu_queue_wait_idle(ctx, qc);
+    if (rc != 0) { print_cstr("FAIL: compute wait rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 10; }
+    var va = load32(buf_a_map + 0);
+    print_cstr("buf_a = "); print_hex32(va); print_cstr("\n");
+    if (va != 0xDEADBEEF) { print_cstr("FAIL: buf_a mismatch\n"); gpu_context_release(ctx); return 10; }
+
+    # Step 2: barrier COMPUTE -> GRAPHICS (records pending wait on qg).
+    rc = gpu_queue_barrier(ctx, qc, qg);
+    if (rc != 0) { print_cstr("FAIL: barrier rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 11; }
+    print_cstr("barrier recorded: qg waits on (syncobj ");
+    print_i64(queue_pending_wait_syncobj(qg)); print_cstr(", point ");
+    print_i64(queue_pending_wait_point(qg)); print_cstr(")\n");
+
+    # Step 3: graphics dispatch on the GFX ring — submit carries the
+    # in-CS TIMELINE_WAIT on the compute point.
+    gpu_ctx_set_current_queue(ctx, qg);
+    rc = gpu_compute_dispatch(ctx, &shmod, 1, 1, 1, &bp_b);
+    if (rc != 0) { print_cstr("FAIL: graphics dispatch (wait chunk) rc="); print_i64(rc);
+        print_cstr("\n"); gpu_context_release(ctx); return 12; }
+    rc = gpu_queue_wait_idle(ctx, qg);
+    if (rc != 0) { print_cstr("FAIL: graphics wait rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 13; }
+    var vb = load32(buf_b_map + 0);
+    print_cstr("buf_b = "); print_hex32(vb); print_cstr(" (want 0xDEADBEEF)\n");
+    if (vb != 0xDEADBEEF) { print_cstr("FAIL: buf_b mismatch (GFX ring did not write)\n");
+        gpu_context_release(ctx); return 14; }
+
+    gpu_context_release(ctx);
+    print_cstr("OK — cross-ring barrier: GFX submit with in-CS TIMELINE_WAIT completed\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

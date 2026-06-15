@@ -1,0 +1,428 @@
+# tests/tcyr/queue.tcyr — multi-queue coordination (v3.1 Phase Q)
+# Functionality-grouped CPU suite. Self-contained.
+#
+# Q.1 covers the layout: kind constants, the Queue struct + accessors,
+# the ctx-side queue table, and the null-slot-guarded public
+# dispatchers. Behavioral routing (the queue_get / barrier / wait_idle
+# slots actually doing work) lands with the fillers in Q.2 (wgpu) /
+# Q.3 (native) and gets its own behavioral tests then.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# Stub queue-slot fns. Each captures its args so a dispatch test can
+# verify the public fn threaded (ctx, kind) / (ctx, q) / (ctx, src,
+# dst) through the slot correctly.
+var _q_get_count = 0;
+
+var _q_get_ctx = 0;
+
+var _q_get_kind = 0;
+
+fn _q_get_stub(ctx, kind) {
+    _q_get_count = _q_get_count + 1;
+    _q_get_ctx = ctx;
+    _q_get_kind = kind;
+    return 0xC0FFEE;
+}
+
+var _q_barrier_count = 0;
+
+var _q_barrier_src = 0;
+
+var _q_barrier_dst = 0;
+
+fn _q_barrier_stub(ctx, src, dst) {
+    _q_barrier_count = _q_barrier_count + 1;
+    _q_barrier_src = src;
+    _q_barrier_dst = dst;
+    return 0;
+}
+
+var _q_wait_count = 0;
+
+var _q_wait_queue = 0;
+
+fn _q_wait_stub(ctx, q) {
+    _q_wait_count = _q_wait_count + 1;
+    _q_wait_queue = q;
+    return 0;
+}
+
+# Build a stack-backed fake ctx with a backend whose queue slots point
+# at the stubs above. ctxbuf must be >= GPU_CONTEXT_SIZE, bebuf >=
+# BACKEND_SIZE. Returns nothing — wires bebuf into ctxbuf+32.
+fn _wire_fake_queue_ctx(ctxbuf, bebuf) {
+    memset(ctxbuf, 0, GPU_CONTEXT_SIZE);
+    memset(bebuf, 0, BACKEND_SIZE);
+    backend_set_slot(bebuf, BACKEND_SLOT_QUEUE_GET, &_q_get_stub);
+    backend_set_slot(bebuf, BACKEND_SLOT_QUEUE_BARRIER, &_q_barrier_stub);
+    backend_set_slot(bebuf, BACKEND_SLOT_QUEUE_WAIT_IDLE, &_q_wait_stub);
+    store64(ctxbuf + 32, bebuf);
+    return 0;
+}
+
+# ================================================================
+# Queue-kind constants
+# ================================================================
+
+fn test_queue_kind_constants() {
+    assert_eq(QUEUE_KIND_GRAPHICS, 0, "graphics = 0");
+    assert_eq(QUEUE_KIND_COMPUTE,  1, "compute = 1");
+    assert_eq(QUEUE_KIND_TRANSFER, 2, "transfer = 2");
+    assert_eq(QUEUE_KIND_COUNT,    3, "count = 3");
+    assert(QUEUE_KIND_GRAPHICS != QUEUE_KIND_COMPUTE, "gfx != compute");
+    assert(QUEUE_KIND_COMPUTE != QUEUE_KIND_TRANSFER, "compute != transfer");
+    return 0;
+}
+
+# ================================================================
+# Queue struct layout + accessors
+# ================================================================
+
+fn test_queue_struct_offsets() {
+    assert_eq(QUEUE_OFF_KIND,         0,  "kind at 0");
+    assert_eq(QUEUE_OFF_RING,         8,  "ring at 8");
+    assert_eq(QUEUE_OFF_SYNCOBJ,      16, "syncobj at 16");
+    assert_eq(QUEUE_OFF_POINT,        24, "point at 24");
+    assert_eq(QUEUE_OFF_PEND_SYNCOBJ, 32, "pending syncobj at 32");
+    assert_eq(QUEUE_OFF_PEND_POINT,   40, "pending point at 40");
+    assert_eq(QUEUE_STRUCT_SIZE,      48, "struct = 48 bytes (Q.4 pending-wait)");
+    return 0;
+}
+
+fn test_queue_pending_wait_round_trip() {
+    var q = queue_new(QUEUE_KIND_GRAPHICS);
+    # Fresh queue: no pending wait.
+    assert_eq(queue_pending_wait_syncobj(q), 0, "no pending syncobj on new");
+    assert_eq(queue_pending_wait_point(q),   0, "no pending point on new");
+    # Record + read back.
+    queue_set_pending_wait(q, 0x55, 9);
+    assert_eq(queue_pending_wait_syncobj(q), 0x55, "pending syncobj round-trips");
+    assert_eq(queue_pending_wait_point(q),   9,    "pending point round-trips");
+    # Setting the pending wait must not perturb the queue's own timeline.
+    assert_eq(queue_point(q), 0, "own point untouched by pending-wait set");
+    # Clear.
+    queue_clear_pending_wait(q);
+    assert_eq(queue_pending_wait_syncobj(q), 0, "cleared syncobj");
+    assert_eq(queue_pending_wait_point(q),   0, "cleared point");
+    # Null-safe.
+    assert_eq(queue_pending_wait_syncobj(0), 0, "pending syncobj(null) = 0");
+    assert_eq(queue_set_pending_wait(0, 1, 1), -1, "set pending(null) = -1");
+    assert_eq(queue_clear_pending_wait(0), -1, "clear pending(null) = -1");
+    return 0;
+}
+
+fn test_queue_new_zero_initialized() {
+    var q = queue_new(QUEUE_KIND_COMPUTE);
+    assert(q != 0, "queue_new returns non-null");
+    assert_eq(queue_kind(q), QUEUE_KIND_COMPUTE, "kind set");
+    assert_eq(queue_ring(q), 0, "ring zero on new");
+    assert_eq(queue_syncobj(q), 0, "syncobj zero on new");
+    assert_eq(queue_point(q), 0, "point zero on new");
+    return 0;
+}
+
+fn test_queue_accessor_round_trip() {
+    var q = queue_new(QUEUE_KIND_GRAPHICS);
+    queue_set_ring(q, 0x11);
+    queue_set_syncobj(q, 0x22);
+    queue_set_point(q, 0x33);
+    assert_eq(queue_ring(q),    0x11, "ring round-trips");
+    assert_eq(queue_syncobj(q), 0x22, "syncobj round-trips");
+    assert_eq(queue_point(q),   0x33, "point round-trips");
+    # kind is invariant — accessors above don't touch it.
+    assert_eq(queue_kind(q), QUEUE_KIND_GRAPHICS, "kind unperturbed");
+    return 0;
+}
+
+fn test_queue_bump_point_monotonic() {
+    var q = queue_new(QUEUE_KIND_COMPUTE);
+    assert_eq(queue_bump_point(q), 1, "first bump -> 1");
+    assert_eq(queue_bump_point(q), 2, "second bump -> 2");
+    assert_eq(queue_bump_point(q), 3, "third bump -> 3");
+    assert_eq(queue_point(q), 3, "point reads back 3");
+    return 0;
+}
+
+fn test_queue_accessors_null_safe() {
+    assert_eq(queue_kind(0),    -1, "kind(0) = -1");
+    assert_eq(queue_ring(0),     0, "ring(0) = 0");
+    assert_eq(queue_syncobj(0),  0, "syncobj(0) = 0");
+    assert_eq(queue_point(0),    0, "point(0) = 0");
+    assert_eq(queue_set_ring(0, 1),    -1, "set_ring(0) = -1");
+    assert_eq(queue_set_syncobj(0, 1), -1, "set_syncobj(0) = -1");
+    assert_eq(queue_set_point(0, 1),   -1, "set_point(0) = -1");
+    assert_eq(queue_bump_point(0),     -1, "bump(0) = -1");
+    return 0;
+}
+
+# ================================================================
+# ctx-side queue table
+# ================================================================
+
+fn test_ctx_queue_table_offsets() {
+    # The table lives OUTSIDE the +0..+24 dual-interpretation region
+    # and after the +120 texture VA cursor.
+    assert_eq(CTX_OFF_QUEUE_GRAPHICS, 128, "graphics slot at 128");
+    assert_eq(CTX_OFF_QUEUE_COMPUTE,  136, "compute slot at 136");
+    assert_eq(CTX_OFF_QUEUE_TRANSFER, 144, "transfer slot at 144");
+    assert_eq(CTX_OFF_QUEUE_CURRENT,  152, "current slot at 152");
+    # All within the struct.
+    assert(CTX_OFF_QUEUE_CURRENT + 8 <= GPU_CONTEXT_SIZE,
+    "current slot fits in ctx");
+    return 0;
+}
+
+fn test_ctx_queue_table_kind_map() {
+    assert_eq(_ctx_queue_table_off(QUEUE_KIND_GRAPHICS), CTX_OFF_QUEUE_GRAPHICS,
+    "graphics maps to its offset");
+    assert_eq(_ctx_queue_table_off(QUEUE_KIND_COMPUTE), CTX_OFF_QUEUE_COMPUTE,
+    "compute maps to its offset");
+    assert_eq(_ctx_queue_table_off(QUEUE_KIND_TRANSFER), CTX_OFF_QUEUE_TRANSFER,
+    "transfer maps to its offset");
+    assert_eq(_ctx_queue_table_off(99), -1, "bad kind -> -1");
+    assert_eq(_ctx_queue_table_off(0 - 1), -1, "negative kind -> -1");
+    return 0;
+}
+
+fn test_ctx_queue_table_round_trip() {
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    # Fresh ctx: every kind reads back 0.
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_GRAPHICS), 0, "gfx slot 0");
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_COMPUTE),  0, "compute slot 0");
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_TRANSFER), 0, "transfer slot 0");
+    # Cache a per-kind queue; reads independent, no bleed.
+    gpu_ctx_set_queue_slot(ctx, QUEUE_KIND_GRAPHICS, 0xAAA);
+    gpu_ctx_set_queue_slot(ctx, QUEUE_KIND_COMPUTE,  0xBBB);
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_GRAPHICS), 0xAAA, "gfx cached");
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_COMPUTE),  0xBBB, "compute cached");
+    assert_eq(gpu_ctx_queue_slot(ctx, QUEUE_KIND_TRANSFER), 0, "transfer still 0");
+    return 0;
+}
+
+fn test_ctx_current_queue_round_trip() {
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    assert_eq(gpu_ctx_current_queue(ctx), 0, "current 0 by default");
+    gpu_ctx_set_current_queue(ctx, 0xDEAD);
+    assert_eq(gpu_ctx_current_queue(ctx), 0xDEAD, "current round-trips");
+    # Reset to default (single-ring path) restores 0.
+    gpu_ctx_set_current_queue(ctx, 0);
+    assert_eq(gpu_ctx_current_queue(ctx), 0, "current resets to default");
+    return 0;
+}
+
+fn test_ctx_queue_table_null_safe() {
+    assert_eq(gpu_ctx_queue_slot(0, QUEUE_KIND_GRAPHICS), 0, "slot(null) = 0");
+    assert_eq(gpu_ctx_set_queue_slot(0, QUEUE_KIND_GRAPHICS, 1), -1,
+    "set_slot(null) = -1");
+    assert_eq(gpu_ctx_current_queue(0), 0, "current(null) = 0");
+    assert_eq(gpu_ctx_set_current_queue(0, 1), -1, "set_current(null) = -1");
+    return 0;
+}
+
+# ================================================================
+# Public dispatchers — slot threading + null guards
+# ================================================================
+
+fn test_gpu_queue_get_dispatches_through_slot() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_get_count = 0;
+    var got = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    assert_eq(_q_get_count, 1, "slot called once");
+    assert_eq(_q_get_kind, QUEUE_KIND_COMPUTE, "kind threaded through");
+    assert_eq(got, 0xC0FFEE, "slot return propagated");
+    return 0;
+}
+
+fn test_gpu_queue_get_validates_input() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_get_count = 0;
+    assert_eq(gpu_queue_get(0, QUEUE_KIND_GRAPHICS), 0, "null ctx -> 0");
+    assert_eq(gpu_queue_get(&ctx, 0 - 1), 0, "negative kind -> 0");
+    assert_eq(gpu_queue_get(&ctx, QUEUE_KIND_COUNT), 0, "kind == count -> 0");
+    assert_eq(gpu_queue_get(&ctx, 99), 0, "kind too big -> 0");
+    assert_eq(_q_get_count, 0, "no slot call on bad input");
+    return 0;
+}
+
+fn test_gpu_queue_get_null_slot_returns_zero() {
+    # Backend with the queue slots left zero (pre-filler state).
+    var ctx[160];
+    var be[248];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    memset(&be, 0, BACKEND_SIZE);
+    store64((&ctx) + 32, &be);
+    assert_eq(gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS), 0,
+    "null queue_get slot -> 0, no crash");
+    return 0;
+}
+
+fn test_gpu_queue_barrier_dispatches_through_slot() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_barrier_count = 0;
+    var rc = gpu_queue_barrier(&ctx, 0x111, 0x222);
+    assert_eq(_q_barrier_count, 1, "barrier slot called once");
+    assert_eq(_q_barrier_src, 0x111, "src threaded through");
+    assert_eq(_q_barrier_dst, 0x222, "dst threaded through");
+    assert_eq(rc, 0, "barrier returns slot rc");
+    return 0;
+}
+
+fn test_gpu_queue_barrier_validates_input() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_barrier_count = 0;
+    assert_eq(gpu_queue_barrier(0, 0x1, 0x2), GPU_ERR_OTHER, "null ctx err");
+    assert_eq(gpu_queue_barrier(&ctx, 0, 0x2), GPU_ERR_OTHER, "null src err");
+    assert_eq(gpu_queue_barrier(&ctx, 0x1, 0), GPU_ERR_OTHER, "null dst err");
+    assert_eq(_q_barrier_count, 0, "no slot call on bad input");
+    return 0;
+}
+
+fn test_gpu_queue_barrier_null_slot_not_implemented() {
+    var ctx[160];
+    var be[248];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    memset(&be, 0, BACKEND_SIZE);
+    store64((&ctx) + 32, &be);
+    assert_eq(gpu_queue_barrier(&ctx, 0x1, 0x2), GPU_ERR_NOT_IMPLEMENTED,
+    "null barrier slot -> NOT_IMPLEMENTED");
+    return 0;
+}
+
+fn test_gpu_queue_wait_idle_dispatches_through_slot() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_wait_count = 0;
+    var rc = gpu_queue_wait_idle(&ctx, 0x777);
+    assert_eq(_q_wait_count, 1, "wait slot called once");
+    assert_eq(_q_wait_queue, 0x777, "queue threaded through");
+    assert_eq(rc, 0, "wait returns slot rc");
+    return 0;
+}
+
+fn test_gpu_queue_wait_idle_validates_input() {
+    var ctx[160];
+    var be[248];
+    _wire_fake_queue_ctx(&ctx, &be);
+    _q_wait_count = 0;
+    assert_eq(gpu_queue_wait_idle(0, 0x7), GPU_ERR_OTHER, "null ctx err");
+    assert_eq(gpu_queue_wait_idle(&ctx, 0), GPU_ERR_OTHER, "null queue err");
+    assert_eq(_q_wait_count, 0, "no slot call on bad input");
+    return 0;
+}
+
+fn test_gpu_queue_wait_idle_null_slot_not_implemented() {
+    var ctx[160];
+    var be[248];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    memset(&be, 0, BACKEND_SIZE);
+    store64((&ctx) + 32, &be);
+    assert_eq(gpu_queue_wait_idle(&ctx, 0x7), GPU_ERR_NOT_IMPLEMENTED,
+    "null wait slot -> NOT_IMPLEMENTED");
+    return 0;
+}
+
+# ================================================================
+# wgpu queue fillers (Q.2)
+# ================================================================
+# Exercise the REAL wgpu fillers through the public dispatcher with a
+# fake ctx carrying a wgpu backend + a sentinel WGPUQueue handle at
+# +24. The happy path of queue_wait_idle calls wgpu_device_poll and is
+# HW-gated; CPU tests cover the aliasing/idempotency bookkeeping and
+# the null guards.
+var _WGPU_FAKE_QUEUE = 0xDEAD2222;
+
+fn _wire_wgpu_ctx(ctxbuf) {
+    memset(ctxbuf, 0, GPU_CONTEXT_SIZE);
+    store64(ctxbuf + 24, _WGPU_FAKE_QUEUE);
+    store64(ctxbuf + 32, backend_wgpu_new());
+    return 0;
+}
+
+fn test_wgpu_queue_get_aliases_single_queue() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var q = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert(q != 0, "wgpu queue_get returns a queue");
+    assert_eq(queue_kind(q), QUEUE_KIND_GRAPHICS, "kind set");
+    assert_eq(queue_ring(q), _WGPU_FAKE_QUEUE, "ring aliases the WGPUQueue");
+    assert_eq(queue_syncobj(q), 0, "no timeline syncobj on wgpu");
+    return 0;
+}
+
+fn test_wgpu_queue_get_idempotent_per_kind() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var a = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    var b = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    assert_eq(a, b, "same kind returns cached queue (idempotent)");
+    var g = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert(g != a, "different kind -> distinct Queue handle");
+    assert_eq(queue_ring(g), queue_ring(a),
+    "but both alias the same WGPUQueue (no real overlap)");
+    return 0;
+}
+
+fn test_wgpu_queue_barrier_is_ordered_noop() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var c = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    var g = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert_eq(gpu_queue_barrier(&ctx, c, g), 0,
+    "wgpu barrier returns 0 (submit-order pin, no-op)");
+    return 0;
+}
+
+fn test_wgpu_queue_wait_idle_filler_null_guards() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var c = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    # The filler's happy path calls wgpu_device_poll (HW-gated); only
+    # the null guards (which return before any wgpu call) are CPU-safe.
+    assert_eq(_backend_wgpu_queue_wait_idle(0, c), GPU_ERR_OTHER,
+    "filler null ctx guarded");
+    assert_eq(_backend_wgpu_queue_wait_idle(&ctx, 0), GPU_ERR_OTHER,
+    "filler null queue guarded");
+    return 0;
+}
+
+fn main() {
+    test_queue_kind_constants();
+    test_queue_struct_offsets();
+    test_queue_pending_wait_round_trip();
+    test_queue_new_zero_initialized();
+    test_queue_accessor_round_trip();
+    test_queue_bump_point_monotonic();
+    test_queue_accessors_null_safe();
+    test_ctx_queue_table_offsets();
+    test_ctx_queue_table_kind_map();
+    test_ctx_queue_table_round_trip();
+    test_ctx_current_queue_round_trip();
+    test_ctx_queue_table_null_safe();
+    test_gpu_queue_get_dispatches_through_slot();
+    test_gpu_queue_get_validates_input();
+    test_gpu_queue_get_null_slot_returns_zero();
+    test_gpu_queue_barrier_dispatches_through_slot();
+    test_gpu_queue_barrier_validates_input();
+    test_gpu_queue_barrier_null_slot_not_implemented();
+    test_gpu_queue_wait_idle_dispatches_through_slot();
+    test_gpu_queue_wait_idle_validates_input();
+    test_gpu_queue_wait_idle_null_slot_not_implemented();
+    test_wgpu_queue_get_aliases_single_queue();
+    test_wgpu_queue_get_idempotent_per_kind();
+    test_wgpu_queue_barrier_is_ordered_noop();
+    test_wgpu_queue_wait_idle_filler_null_guards();
+    return assert_summary();
+}

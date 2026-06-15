@@ -654,6 +654,57 @@ fn _backend_wgpu_surface_release(ctx, surface): i64 {
 }
 
 # ================================================================
+# Queue slot wrappers — v3.1 (Q.2)
+# ================================================================
+# WebGPU exposes a SINGLE device queue. The logical multi-queue
+# abstraction therefore degrades on wgpu: all three logical queues
+# (GRAPHICS / COMPUTE / TRANSFER) alias that one WGPUQueue, there is
+# NO real cross-queue overlap, and ordering is the WebGPU submit-order
+# guarantee rather than timeline syncobjs. Consumers that need genuine
+# GFX/COMPUTE concurrency use the native AMD backend (Q.3). This is the
+# documented wgpu limitation, mirroring how wgpu compute_dispatch is a
+# stub today — see docs/proposals/v3.1-multiqueue.md § "wgpu backend".
+
+# Acquire the logical queue for `kind`. Idempotent: caches one Queue
+# per kind on the ctx and returns the cached pointer on re-get. The
+# Queue's ring_handle carries the single WGPUQueue so queue_wait_idle
+# can poll; timeline_syncobj stays 0 (wgpu has no timeline path here).
+fn _backend_wgpu_queue_get(ctx, kind): i64 {
+    if (ctx == 0) { return 0; }
+    var cached = gpu_ctx_queue_slot(ctx, kind);
+    if (cached != 0) { return cached; }
+    var q = queue_new(kind);
+    if (q == 0) { return 0; }
+    queue_set_ring(q, gpu_ctx_queue(ctx));   # alias the one WGPUQueue
+    gpu_ctx_set_queue_slot(ctx, kind, q);
+    return q;
+}
+
+# Order dst_queue after src_queue. On the single WGPUQueue this is a
+# documented no-op: work submitted before this call already orders
+# before work submitted after (WebGPU queue-order guarantee), so no
+# cross-ring fence is needed. The slot exists so portable consumer
+# code can call gpu_queue_barrier unconditionally.
+fn _backend_wgpu_queue_barrier(ctx, src_queue, dst_queue): i64 {
+    if (ctx == 0)        { return GPU_ERR_OTHER; }
+    if (src_queue == 0)  { return GPU_ERR_OTHER; }
+    if (dst_queue == 0)  { return GPU_ERR_OTHER; }
+    return 0;
+}
+
+# Block until work on `queue` retires. With one underlying queue this
+# is the same device poll as device_wait_idle. (HW-gated: the poll is
+# only exercised against a real wgpu device; CPU tests cover the
+# null-guard paths.)
+fn _backend_wgpu_queue_wait_idle(ctx, queue): i64 {
+    if (ctx == 0)    { return GPU_ERR_OTHER; }
+    if (queue == 0)  { return GPU_ERR_OTHER; }
+    var device = gpu_ctx_device(ctx);
+    wgpu_device_poll(device, 1);
+    return 0;
+}
+
+# ================================================================
 # Builder
 # ================================================================
 # Allocates a Backend, fills all 21 fnptr slots with the wrapper
@@ -719,6 +770,17 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_surface_present);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
     &_backend_wgpu_surface_release);
+    # v3.1 queue slots (Q.2) — logical queues alias the single
+    # WGPUQueue; barrier is a submit-order no-op, wait_idle a device
+    # poll. The backend_is_complete walk over this range activates in
+    # Q.3 once backend_native_new fills it too (matches the M.6b
+    # "activate when both backends fill" pattern).
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_GET,
+    &_backend_wgpu_queue_get);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_BARRIER,
+    &_backend_wgpu_queue_barrier);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,
+    &_backend_wgpu_queue_wait_idle);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }
