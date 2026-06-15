@@ -1200,6 +1200,35 @@ fn test_native_texture_va_range_distinct() {
     # doesn't alias either.
     assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100000000, "tex != shader VA");
     assert(_NATIVE_TEXTURE_VA_BASE != 0xFFFF800100400000, "tex != output VA");
+    # v3.1 M.1(c): the texture region [base, base+region) sits ABOVE the RT
+    # area and must not overlap it (textures moved up to make room for mip
+    # chains). RT base is well below the texture base.
+    assert(_NATIVE_TEXTURE_VA_BASE > _NATIVE_RT_VA_BASE, "tex region above RT");
+    assert(_NATIVE_RT_VA_BASE < _NATIVE_TEXTURE_VA_BASE, "RT below tex region start");
+    return 0;
+}
+
+# v3.1 M.1(c): per-context texture VA bump allocator. Pure math (no fd) —
+# drivable with a stack ctx. First alloc lazy-inits to the base; each
+# allocation is 64 KiB-aligned; over-region requests return 0.
+fn test_native_texture_va_allocator() {
+    var ctx[128];
+    memset(&ctx, 0, 128);
+    var a = native_ctx_alloc_texture_va(&ctx, 1024);
+    assert_eq(a, _NATIVE_TEXTURE_VA_BASE, "first alloc returns base (lazy-init)");
+    var b = native_ctx_alloc_texture_va(&ctx, 1024);
+    assert_eq(b, _NATIVE_TEXTURE_VA_BASE + 0x10000, "second alloc +64KiB");
+    var c = native_ctx_alloc_texture_va(&ctx, 0x10001);   # 64KiB+1 -> 128KiB step
+    assert_eq(c, _NATIVE_TEXTURE_VA_BASE + 0x20000, "third alloc after two 64KiB");
+    assert_eq(native_ctx_tex_va_next(&ctx), _NATIVE_TEXTURE_VA_BASE + 0x40000,
+    "cursor advanced by 64KiB+64KiB+128KiB");
+    assert_eq(native_ctx_alloc_texture_va(0, 16), 0, "null ctx -> 0");
+    # over-region request fails (and leaves the cursor untouched).
+    var ctx2[128];
+    memset(&ctx2, 0, 128);
+    assert_eq(native_ctx_alloc_texture_va(&ctx2, _NATIVE_TEXTURE_VA_REGION + 1), 0,
+    "over-region request returns 0");
+    assert_eq(native_ctx_tex_va_next(&ctx2), 0, "cursor not advanced on failure");
     return 0;
 }
 
@@ -2992,6 +3021,7 @@ fn main() {
     test_native_texture_size_2d_rgba8_formula();
     test_native_texture_struct_field_offsets();
     test_native_texture_va_range_distinct();
+    test_native_texture_va_allocator();
     test_native_texture_struct_round_trip();
 
     # v3 Step 5.2 — native_texture_release_2d_rgba8 (2)

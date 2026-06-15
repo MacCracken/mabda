@@ -54,12 +54,10 @@ Read these before sequencing.
 
 Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
 
-- [~] **M.1** — Mip-chain BO + VA layout (native). Generalize the single
-  hardcoded `_NATIVE_TEXTURE_VA_BASE` into a small VA sub-allocator;
-  contiguous mip levels with per-level offsets
-  (`offset_M = Σ align(w_k·h_k·4)`, ≈1.333×). Grow `NativeTexture` (or a
-  ctx-side mip-metadata table) to carry `mip_count` + offsets. CPU tests:
-  offset math, VA-range isolation, size formula.
+- [x] **M.1** — Mip-chain BO + VA layout (native). DONE 2026-06-15 across
+  three bites (a/b/c below). Mip-layout math + `NativeTexture` mip
+  metadata + per-context VA sub-allocator all landed, CPU-tested, and
+  HW-verified on Cezanne (texture/compute/render e2e all pass).
   - [x] **M.1(a)** — mip-layout math (2026-06-15). Shared `mip_level_dim`
     (`src/texture.cyr`) + native contiguous `native_mip_level_offset` /
     `native_mip_chain_size` with 256-byte per-level alignment (`V#` base
@@ -75,10 +73,18 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     no need to store the offset array. Updated the struct-layout + round-
     trip CPU tests; HW-verified (native_texture_e2e 64×32 byte-exact on
     Cezanne). Build + lint + fmt clean; 2023 CPU asserts green.
-  - [ ] **M.1(c)** — texture VA sub-allocator. Bump cursor over a widened
-    texture VA region (the current 6 MiB gap between the texture base and
-    the RT base can't hold a large mip chain), per-context cursor state.
-    Pulls in a small VA-map layout adjustment — its own bite. Next.
+  - [x] **M.1(c)** — texture VA sub-allocator (2026-06-15). Texture VA
+    region moved up to `0xFFFF800180000000` with a 2 GiB span (the old
+    6 MiB gap below the RT base couldn't hold a mip chain); 64 KiB-aligned
+    per allocation. Per-context bump cursor at `GpuContext+120`
+    (`GPU_CONTEXT_SIZE` 120 → 128, zero-init by the ctx memset, lazy-init
+    in the allocator). `native_ctx_alloc_texture_va` + accessors;
+    `native_texture_create_2d_rgba8` now takes the VA from the allocator
+    (the slot calls it). 9 CPU asserts (allocator math, alignment,
+    exhaustion, RT non-overlap, ctx size). HW-verified: the new VA base is
+    valid GPUVM on Cezanne (texture e2e byte-exact); compute + render
+    unaffected by the ctx growth. Build / lint / fmt / distlib /
+    version-check clean; 2032 CPU asserts green.
 - [ ] **M.2** — `BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED` (+208) and
   `BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS` (+216); `BACKEND_SIZE` 208→224;
   `BACKEND_MIPMAP_SLOTS_BEGIN/END` + `backend_is_complete` walk. Layout

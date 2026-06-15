@@ -282,6 +282,15 @@ fn native_ctx_fence_addr(ctx): i64 { return load64(ctx +  88); }
 # once at gpu_context_new_native, shared between compute + render slots.
 fn native_ctx_pm4_scratch(ctx): i64 { return load64(ctx + 112); }
 
+# v3.1 M.1(c): per-context texture VA bump cursor at +120. Zero on a
+# fresh ctx (the memset); native_ctx_alloc_texture_va lazy-inits it.
+fn native_ctx_tex_va_next(ctx): i64 { return load64(ctx + 120); }
+fn native_ctx_set_tex_va_next(ctx, va): i64 {
+    if (ctx == 0) { return 0 - 1; }
+    store64(ctx + 120, va);
+    return 0;
+}
+
 # Pack (handle, va) into the private 16-byte buffer-pair shape.
 # Caller allocates 16 bytes for `dst` (typically a stack-local
 # `var pair[16]`); this helper writes the two u64 fields.
@@ -457,9 +466,14 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
         return 0;
     }
     var fd = native_ctx_fd(ctx);
+    # v3.1 M.1(c): allocate a unique VA range for this texture from the
+    # per-context region (0 = region exhausted -> create fails).
+    var size = native_texture_size_2d_rgba8(width, height);
+    var va = native_ctx_alloc_texture_va(ctx, size);
+    if (va == 0) { return 0; }
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
-    var rc = native_texture_create_2d_rgba8(fd, width, height, tex);
+    var rc = native_texture_create_2d_rgba8(fd, va, width, height, tex);
     if (rc != 0) { return 0; }
     return tex;
 }
@@ -982,26 +996,48 @@ fn backend_native_new(): i64 {
 #                   native_mip_level_offset(width, height, level))
 #   +44: pad       (u32)
 #
-# Step 5.1 hardcodes the texture VA at _NATIVE_TEXTURE_VA_BASE.
-# This means a single texture per context until the multi-texture
-# VA allocator lands (later 5.x chunk). Future textures must use
-# different VAs — pre-Step-5.x callers should allocate at most one
-# texture, OR pick their own VA (the helper accepts a hardcoded
-# base, but doesn't enforce uniqueness).
+# v3.1 M.1(c): the texture VA region is a per-context bump-allocated
+# range (native_ctx_alloc_texture_va), not a single hardcoded VA. It was
+# moved UP to 0xFFFF800180000000 with a 2 GiB span so a full mip chain
+# (max 8192² RGBA8 ≈ 358 MiB) and several textures fit — the old 6 MiB
+# gap below the RT base could not. RT / shader / output / cache VAs are
+# untouched and sit well below this region.
 #
-# VA range layout (canonical-high aperture):
-#   0x100000000  shader BOs (caller-managed in v3 programs)
-#   0x100004000  stub (gpu_context_new_native)
-#   0x100200000  cached IB (gpu_context_new_native)
-#   0x100400000  output BOs (caller-managed)
-#   0x100600000  cached fence (gpu_context_new_native)
-#   0x100A00000  textures (this step) — 4 MiB headroom from fence,
-#                room for textures up to ~64 MiB (4Kx4K RGBA8)
-#                before colliding with future allocations
+# VA range layout (canonical-high aperture; offsets above
+# 0xFFFF800100000000 unless noted):
+#   0x100000000   shader BOs (caller-managed in v3 programs)
+#   0x100004000   stub (gpu_context_new_native)
+#   0x100200000   cached IB (gpu_context_new_native)
+#   0x100400000   output BOs (caller-managed)
+#   0x100600000   cached fence (gpu_context_new_native)
+#   0x101000000   render targets (_NATIVE_RT_VA_BASE, 16 MiB area)
+#   0x180000000   textures — 2 GiB bump region [base, base + 0x80000000),
+#                 64 KiB-aligned per allocation (v3.1 M.1(c))
 #
-# Texture release is Step 5.2.
+# The bump cursor never reclaims (mabda's native-allocator model — the
+# create-once texture pattern). A free-list is a later concern if a
+# consumer churns textures.
 
-var _NATIVE_TEXTURE_VA_BASE = 0xFFFF800100A00000;
+var _NATIVE_TEXTURE_VA_BASE   = 0xFFFF800180000000;
+var _NATIVE_TEXTURE_VA_REGION = 0x80000000;   # 2 GiB
+var _NATIVE_TEXTURE_VA_ALIGN  = 0x10000;      # 64 KiB per allocation
+
+# Bump-allocate an aligned texture VA range of `size` bytes from the
+# per-context region. Returns the base VA, or 0 on region exhaustion
+# (caller treats 0 as a create failure). Lazy-inits the cursor to
+# _NATIVE_TEXTURE_VA_BASE (the ctx memset leaves +120 zero).
+fn native_ctx_alloc_texture_va(ctx, size): i64 {
+    if (ctx == 0) { return 0; }
+    var cur = native_ctx_tex_va_next(ctx);
+    if (cur == 0) { cur = _NATIVE_TEXTURE_VA_BASE; }
+    var step = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
+    var next = cur + step;
+    if (next > _NATIVE_TEXTURE_VA_BASE + _NATIVE_TEXTURE_VA_REGION) {
+        return 0;
+    }
+    native_ctx_set_tex_va_next(ctx, next);
+    return cur;
+}
 
 var NATIVE_TEX_FIELD_HANDLE    = 0;
 var NATIVE_TEX_FIELD_VA        = 8;
@@ -1060,14 +1096,17 @@ fn native_mip_chain_size(width, height, count): i64 {
 # Caller provides `out` — a 32-byte buffer matching NativeTexture
 # layout; on success the function fills handle/va/addr/size. On
 # failure returns a GPU_ERR_* code, leaves out untouched.
-fn native_texture_create_2d_rgba8(fd, width, height, out): i64 {
+fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
     var size = native_texture_size_2d_rgba8(width, height);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
     var handle = load64(&bo + 0);
     var addr   = load64(&bo + 8);
-    var va = _NATIVE_TEXTURE_VA_BASE;
+    # v3.1 M.1(c): VA is supplied by the per-context sub-allocator (the
+    # slot calls native_ctx_alloc_texture_va) instead of a hardcoded base,
+    # so a context can hold more than one texture without VA collisions.
+    var va = va_base;
     rc = native_gem_va_map(fd, handle, va, size, _NATIVE_PERM_DATA);
     if (rc != 0) {
         var rc_save = rc;
