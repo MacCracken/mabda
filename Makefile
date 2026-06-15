@@ -248,6 +248,18 @@ build/native_queue_barrier_e2e: programs/native_queue_barrier_e2e.cyr src/*.cyr
 test-native-queue-barrier-e2e: build/native_queue_barrier_e2e
 	./build/native_queue_barrier_e2e
 
+# v3.1 Q.5 — SDMA COPY_LINEAR on the DMA ring (AMDGPU_HW_IP_DMA): copy a
+# 4 KiB page src->dst and verify byte-identical. Proves the SDMA packet
+# format + DMA-ring submit on Cezanne. HW-gated. (The TRANSFER queue's
+# DMA-ring flip + public copy API land in 3.1.2; this is the foundation.)
+build/native_sdma_copy_e2e: programs/native_sdma_copy_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_sdma_copy_e2e.cyr $@
+
+.PHONY: test-native-sdma-copy-e2e
+test-native-sdma-copy-e2e: build/native_sdma_copy_e2e
+	./build/native_sdma_copy_e2e
+
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the
 # dword stream to stdout instead of submitting it. CI-safe (no GPU

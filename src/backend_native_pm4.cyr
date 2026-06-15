@@ -1099,3 +1099,38 @@ rt_va, rt_width, rt_height): i64 {
     return pos;
 }
 
+# ================================================================
+# v3.1 Q.5 — SDMA copy packets (TRANSFER ring)
+# ================================================================
+# The SDMA (DMA) ring uses its OWN command format, not GFX/compute PM4.
+# COPY_LINEAR does a flat byte copy src -> dst. Format for SDMA v4
+# (GFX9 / Cezanne), 7 dwords / 28 bytes:
+#   DW0 header : op[7:0]=SDMA_OP_COPY(1), sub_op[15:8]=COPY_LINEAR(0)
+#   DW1 count  : byte_count - 1  (HW convention)
+#   DW2 params : 0 (linear; no swizzle / host-access bits)
+#   DW3 src_lo : src_va[31:0]
+#   DW4 src_hi : src_va[63:32]
+#   DW5 dst_lo : dst_va[31:0]
+#   DW6 dst_hi : dst_va[63:32]
+# VA halves use the logical >> (Cyrius `>>` is logical — see the
+# feedback_cyrius_logical_right_shift memory) and an explicit mask, so
+# canonical-high VAs (0xFFFF8001…) pack correctly. The packet format is
+# HW-verified by programs/native_sdma_copy_e2e.cyr on Cezanne.
+var SDMA_OP_COPY           = 0x1;
+var SDMA_SUBOP_COPY_LINEAR = 0x0;
+
+# Build a 7-dword SDMA COPY_LINEAR packet at `buf`. Returns 28 (bytes).
+# Pure byte-builder — no syscalls; the submit (HW_IP_DMA) is the
+# caller's job.
+fn native_sdma_build_copy_linear(buf, src_va, dst_va, bytes): i64 {
+    var header = SDMA_OP_COPY | (SDMA_SUBOP_COPY_LINEAR << 8);
+    store32(buf + 0,  header);
+    store32(buf + 4,  bytes - 1);                 # count = byte_count - 1
+    store32(buf + 8,  0);                          # parameters
+    store32(buf + 12, src_va & 0xFFFFFFFF);        # src_addr_lo
+    store32(buf + 16, (src_va >> 32) & 0xFFFFFFFF); # src_addr_hi
+    store32(buf + 20, dst_va & 0xFFFFFFFF);        # dst_addr_lo
+    store32(buf + 24, (dst_va >> 32) & 0xFFFFFFFF); # dst_addr_hi
+    return 28;
+}
+
