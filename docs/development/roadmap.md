@@ -50,7 +50,7 @@ cross-vendor default.
                         added alongside wgpu+C; API unchanged; A/B
                         bench matrix
   v3.1             ─▶  multi-queue + mipmaps (consumer catch-up)
-  v3.2             ─▶  compressed textures + SPIR-V (texture/shader breadth)
+  v3.2             ─▶  compressed textures + SPIR-V + f64 compute (texture/shader breadth)
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
@@ -270,6 +270,21 @@ implement the new surface).
   Driven by kiran and aethersafta's asset sizes.
 - **SPIR-V shader support** — alternative path to WGSL. Shader
   cache keyed on source kind. Reuses `shader_cache.cyr`.
+- **f64 (double-precision) compute** — gated on the SPIR-V path above.
+  WGSL has no f64 (gpuweb #2805, deferred Milestone 4+), but SPIR-V +
+  Vulkan's `shaderFloat64` does; expose it as an optional, driver-gated
+  device capability (wgpu surfaces it as the `SHADER_F64` feature —
+  native Vulkan only, not WebGPU / Metal / DX12). Consumer:
+  **attn11** (the f64, hand-derived, grad-checked transformer — its GPU
+  compute backend needs f64 to preserve the CPU f64 oracle every op is
+  validated against; the f32-only WGSL path cannot carry it). Caveats to
+  document for consumers: f64 is ~16–64× slower than f32 on consumer RDNA
+  (FP64-throttled, ~1:16–1:32) and full-rate only on CDNA/Instinct (FP64
+  MFMA, 1:1 matrix via `V_MFMA_F64`); naga may not validate f64, so a raw
+  SPIR-V passthrough may be required. The fully-sovereign, full-rate route
+  — f64 compute on the **native AMD GFX9+ PM4 path** (CDNA `V_MFMA_F64`) —
+  is the heavier follow-on once native compute dispatch is mature (v3.x+ /
+  alongside the v4 native expansion).
 
 ---
 
