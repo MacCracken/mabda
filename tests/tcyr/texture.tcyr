@@ -409,6 +409,65 @@ fn test_format_unsupported_error() {
     return 0;
 }
 
+# v3.2 T.5 — gpu_texture_create_2d slot dispatch (mock slot)
+var _t5_fmt_count = 0;
+
+var _t5_fmt_w = 0;
+
+var _t5_fmt_h = 0;
+
+var _t5_fmt_fmt = 0;
+
+fn _t5_fmt_create_stub(ctx, w, h, fmt) {
+    _t5_fmt_count = _t5_fmt_count + 1;
+    _t5_fmt_w = w;
+    _t5_fmt_h = h;
+    _t5_fmt_fmt = fmt;
+    return 0xFA7;
+}
+
+fn _t5_wire(ctxbuf, bebuf) {
+    memset(ctxbuf, 0, GPU_CONTEXT_SIZE);
+    memset(bebuf, 0, BACKEND_SIZE);
+    backend_set_slot(bebuf, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT, &_t5_fmt_create_stub);
+    store64(ctxbuf + 32, bebuf);
+    return 0;
+}
+
+fn test_gpu_texture_create_2d_dispatch() {
+    var ctx[160];
+    var be[256];
+    _t5_wire(&ctx, &be);
+    _t5_fmt_count = 0;
+    var got = gpu_texture_create_2d(&ctx, 64, 32, MABDA_TEXFMT_BC1);
+    assert_eq(_t5_fmt_count, 1, "slot called once");
+    assert_eq(_t5_fmt_w, 64, "width threaded");
+    assert_eq(_t5_fmt_h, 32, "height threaded");
+    assert_eq(_t5_fmt_fmt, MABDA_TEXFMT_BC1, "fmt threaded");
+    assert_eq(got, 0xFA7, "slot return propagated");
+    # RGBA8 is accepted and routes through the same slot with fmt=RGBA8.
+    got = gpu_texture_create_2d(&ctx, 8, 8, MABDA_TEXFMT_RGBA8);
+    assert_eq(_t5_fmt_count, 2, "slot called again for RGBA8");
+    assert_eq(_t5_fmt_fmt, MABDA_TEXFMT_RGBA8, "RGBA8 routes with fmt=RGBA8");
+    return 0;
+}
+
+fn test_gpu_texture_create_2d_guards() {
+    var ctx[160];
+    var be[256];
+    _t5_wire(&ctx, &be);
+    _t5_fmt_count = 0;
+    assert_eq(gpu_texture_create_2d(0, 8, 8, MABDA_TEXFMT_RGBA8), 0, "null ctx -> 0");
+    assert_eq(gpu_texture_create_2d(&ctx, 0, 8, MABDA_TEXFMT_RGBA8), 0, "zero w -> 0");
+    assert_eq(gpu_texture_create_2d(&ctx, 8, 0 - 1, MABDA_TEXFMT_RGBA8), 0, "neg h -> 0");
+    assert_eq(gpu_texture_create_2d(&ctx, 8193, 8, MABDA_TEXFMT_RGBA8), 0, "oversize -> 0");
+    # Unknown format id rejected before the slot (the format-supported guard).
+    assert_eq(gpu_texture_create_2d(&ctx, 8, 8, MABDA_TEXFMT_COUNT), 0, "unknown fmt -> 0");
+    assert_eq(gpu_texture_create_2d(&ctx, 8, 8, 0 - 1), 0, "negative fmt -> 0");
+    assert_eq(_t5_fmt_count, 0, "no slot call on any bad input");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -423,6 +482,8 @@ fn main() {
     test_caps_compression_bitset_round_trip();
     test_caps_supports_format();
     test_format_unsupported_error();
+    test_gpu_texture_create_2d_dispatch();
+    test_gpu_texture_create_2d_guards();
     test_vertex_blend_opaque();
     test_vertex_blend_alpha();
     test_depth_texture_accessors();
