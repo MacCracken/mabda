@@ -1,8 +1,8 @@
 # Mabda v3.1 — Release Punch List
 
-**Status:** Planning document (pre-implementation). Tick items as they land.
+**Status:** Active — minor opened, `v3.1` branch cut 2026-06-15. Tick items as they land.
 **Date opened:** 2026-06-15
-**Branch:** `main` → cut `v3.1` when the minor opens (3.0.4 is shipped).
+**Branch:** `v3.1` (cut from `main` after 3.0.4).
 **Roadmap reference:** [`roadmap.md` § v3.1](roadmap.md#v31--mipmaps--multi-queue-consumer-catch-up)
 **Design proposals:**
 [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md) ·
@@ -54,12 +54,22 @@ Read these before sequencing.
 
 Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
 
-- [ ] **M.1** — Mip-chain BO + VA layout (native). Generalize the single
+- [~] **M.1** — Mip-chain BO + VA layout (native). Generalize the single
   hardcoded `_NATIVE_TEXTURE_VA_BASE` into a small VA sub-allocator;
   contiguous mip levels with per-level offsets
   (`offset_M = Σ align(w_k·h_k·4)`, ≈1.333×). Grow `NativeTexture` (or a
   ctx-side mip-metadata table) to carry `mip_count` + offsets. CPU tests:
   offset math, VA-range isolation, size formula.
+  - [x] **M.1(a)** — mip-layout math (2026-06-15). Shared `mip_level_dim`
+    (`src/texture.cyr`) + native contiguous `native_mip_level_offset` /
+    `native_mip_chain_size` with 256-byte per-level alignment (`V#` base
+    requirement) + `_native_align_up` (`src/backend_native.cyr`). 23 CPU
+    asserts (mip count/dim in `mabda.tcyr`; offset/size/align in
+    `mabda_v3.tcyr`). Also backfilled the previously-untested
+    `mip_level_count`. Build + lint + fmt clean; 2016 CPU asserts green.
+  - [ ] **M.1(b)** — texture VA sub-allocator (bump over the texture VA
+    region) + `NativeTexture` / ctx-side table carrying `mip_count` +
+    per-level offsets. Next.
 - [ ] **M.2** — `BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED` (+208) and
   `BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS` (+216); `BACKEND_SIZE` 208→224;
   `BACKEND_MIPMAP_SLOTS_BEGIN/END` + `backend_is_complete` walk. Layout
