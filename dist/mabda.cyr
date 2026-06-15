@@ -4057,6 +4057,118 @@ fn native_gfx9_shader_store_deadbeef(buf, pos): i64 {
     return pos + 96;
 }
 
+# v3.1 [M.4]: 2×2 box-filter downsample compute shader (RGBA8 → RGBA8),
+# one workgroup per destination texel (NUM_THREAD 1/1/1; dispatch grid =
+# dst_w × dst_h). 316 bytes of GFX9 ISA + 64 bytes (16 × s_nop 0) prefetch
+# padding = 380 bytes total.
+#
+# Every dword below was assembled by `llvm-mc -triple=amdgcn--amdhsa
+# -mcpu=gfx90c -show-encoding` from hand-written assembly and is round-
+# trip-verified by `scripts/disasm-shaders.sh`
+# (feedback_verify_gfx9_shader_bytes_with_llvm_mc). The byte-averaging
+# (bfe / add3 / lshrrev-by-2) mirrors what `clang -O2` emits for an
+# equivalent OpenCL kernel; the address math is in SALU because every
+# input is uniform (single thread).
+#
+# ABI (the M.5 PM4 composer must set this up):
+#   s0:s1 = src level base VA   s2:s3 = dst level base VA
+#   s4    = dst_w               s6 = tgid_x (= dst x)   s7 = tgid_y (= dst y)
+#   USER_SGPR = 6 (s0..s5); RSRC2 must enable TGID_X | TGID_Y so the CP
+#   loads the workgroup id into s6/s7. src is 2·dst_w wide, so the two
+#   texels of a destination row are adjacent dwords — one
+#   global_load_dwordx2 fetches a pair.
+#   Register usage (for RSRC1): VGPRs v0..v14 (15 → alloc 16), SGPRs
+#   s0..s19 (20 → alloc 24). RSRC1 must reserve at least that.
+fn native_gfx9_shader_downsample_2x2(buf, pos): i64 {
+    store32(buf + pos +   0, 0x92080407);   # s_mul_i32 s8, s7, s4   (y*dst_w)
+    store32(buf + pos +   4, 0x8E098408);   # s_lshl_b32 s9, s8, 4
+    store32(buf + pos +   8, 0x8E0A8306);   # s_lshl_b32 s10, s6, 3
+    store32(buf + pos +  12, 0x81090A09);   # s_add_i32 s9, s9, s10  (off_a bytes)
+    store32(buf + pos +  16, 0x800C0900);   # s_add_u32 s12, s0, s9  (src_a lo)
+    store32(buf + pos +  20, 0x820D8001);   # s_addc_u32 s13, s1, 0  (src_a hi)
+    store32(buf + pos +  24, 0x8E0B8304);   # s_lshl_b32 s11, s4, 3  (8*dst_w)
+    store32(buf + pos +  28, 0x800E0B0C);   # s_add_u32 s14, s12, s11 (src_c lo)
+    store32(buf + pos +  32, 0x820F800D);   # s_addc_u32 s15, s13, 0  (src_c hi)
+    store32(buf + pos +  36, 0x8E108208);   # s_lshl_b32 s16, s8, 2
+    store32(buf + pos +  40, 0x8E118206);   # s_lshl_b32 s17, s6, 2
+    store32(buf + pos +  44, 0x81101110);   # s_add_i32 s16, s16, s17 (dst_off)
+    store32(buf + pos +  48, 0x80121002);   # s_add_u32 s18, s2, s16  (dst lo)
+    store32(buf + pos +  52, 0x82138003);   # s_addc_u32 s19, s3, 0   (dst hi)
+    store32(buf + pos +  56, 0x7E00020C);   # v_mov_b32 v0, s12
+    store32(buf + pos +  60, 0x7E02020D);   # v_mov_b32 v1, s13
+    store32(buf + pos +  64, 0x7E04020E);   # v_mov_b32 v2, s14
+    store32(buf + pos +  68, 0x7E06020F);   # v_mov_b32 v3, s15
+    store32(buf + pos +  72, 0xDC548000);   # global_load_dwordx2 v[4:5], v[0:1], off
+    store32(buf + pos +  76, 0x047F0000);   #   (cont: a=v4, b=v5)
+    store32(buf + pos +  80, 0xDC548000);   # global_load_dwordx2 v[6:7], v[2:3], off
+    store32(buf + pos +  84, 0x067F0002);   #   (cont: c=v6, d=v7)
+    store32(buf + pos +  88, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(buf + pos +  92, 0x261008FF);   # v_and_b32 v8, 0xff, v4   (r: a)
+    store32(buf + pos +  96, 0x000000FF);   #   (literal 0xff)
+    store32(buf + pos + 100, 0x26120AFF);   # v_and_b32 v9, 0xff, v5   (r: b)
+    store32(buf + pos + 104, 0x000000FF);   #   (literal)
+    store32(buf + pos + 108, 0x26140CFF);   # v_and_b32 v10, 0xff, v6  (r: c)
+    store32(buf + pos + 112, 0x000000FF);   #   (literal)
+    store32(buf + pos + 116, 0x26160EFF);   # v_and_b32 v11, 0xff, v7  (r: d)
+    store32(buf + pos + 120, 0x000000FF);   #   (literal)
+    store32(buf + pos + 124, 0xD1FF0008);   # v_add3_u32 v8, v8, v9, v10
+    store32(buf + pos + 128, 0x042A1308);   #   (cont)
+    store32(buf + pos + 132, 0x68101708);   # v_add_u32 v8, v8, v11
+    store32(buf + pos + 136, 0x20101082);   # v_lshrrev_b32 v8, 2, v8  (r avg)
+    store32(buf + pos + 140, 0xD1C80009);   # v_bfe_u32 v9, v4, 8, 8   (g: a)
+    store32(buf + pos + 144, 0x02211104);   #   (cont)
+    store32(buf + pos + 148, 0xD1C8000A);   # v_bfe_u32 v10, v5, 8, 8  (g: b)
+    store32(buf + pos + 152, 0x02211105);   #   (cont)
+    store32(buf + pos + 156, 0xD1C8000B);   # v_bfe_u32 v11, v6, 8, 8  (g: c)
+    store32(buf + pos + 160, 0x02211106);   #   (cont)
+    store32(buf + pos + 164, 0xD1C8000C);   # v_bfe_u32 v12, v7, 8, 8  (g: d)
+    store32(buf + pos + 168, 0x02211107);   #   (cont)
+    store32(buf + pos + 172, 0xD1FF0009);   # v_add3_u32 v9, v9, v10, v11
+    store32(buf + pos + 176, 0x042E1509);   #   (cont)
+    store32(buf + pos + 180, 0x68121909);   # v_add_u32 v9, v9, v12
+    store32(buf + pos + 184, 0x20121282);   # v_lshrrev_b32 v9, 2, v9  (g avg)
+    store32(buf + pos + 188, 0x24121288);   # v_lshlrev_b32 v9, 8, v9  (g<<8)
+    store32(buf + pos + 192, 0xD1C8000A);   # v_bfe_u32 v10, v4, 16, 8 (b: a)
+    store32(buf + pos + 196, 0x02212104);   #   (cont)
+    store32(buf + pos + 200, 0xD1C8000B);   # v_bfe_u32 v11, v5, 16, 8 (b: b)
+    store32(buf + pos + 204, 0x02212105);   #   (cont)
+    store32(buf + pos + 208, 0xD1C8000C);   # v_bfe_u32 v12, v6, 16, 8 (b: c)
+    store32(buf + pos + 212, 0x02212106);   #   (cont)
+    store32(buf + pos + 216, 0xD1C8000D);   # v_bfe_u32 v13, v7, 16, 8 (b: d)
+    store32(buf + pos + 220, 0x02212107);   #   (cont)
+    store32(buf + pos + 224, 0xD1FF000A);   # v_add3_u32 v10, v10, v11, v12
+    store32(buf + pos + 228, 0x0432170A);   #   (cont)
+    store32(buf + pos + 232, 0x68141B0A);   # v_add_u32 v10, v10, v13
+    store32(buf + pos + 236, 0x20141482);   # v_lshrrev_b32 v10, 2, v10 (b avg)
+    store32(buf + pos + 240, 0x24141490);   # v_lshlrev_b32 v10, 16, v10 (b<<16)
+    store32(buf + pos + 244, 0x20160898);   # v_lshrrev_b32 v11, 24, v4 (a: a)
+    store32(buf + pos + 248, 0x20180A98);   # v_lshrrev_b32 v12, 24, v5 (a: b)
+    store32(buf + pos + 252, 0x201A0C98);   # v_lshrrev_b32 v13, 24, v6 (a: c)
+    store32(buf + pos + 256, 0x201C0E98);   # v_lshrrev_b32 v14, 24, v7 (a: d)
+    store32(buf + pos + 260, 0xD1FF000B);   # v_add3_u32 v11, v11, v12, v13
+    store32(buf + pos + 264, 0x0436190B);   #   (cont)
+    store32(buf + pos + 268, 0x68161D0B);   # v_add_u32 v11, v11, v14
+    store32(buf + pos + 272, 0x20161682);   # v_lshrrev_b32 v11, 2, v11 (a avg)
+    store32(buf + pos + 276, 0x24161698);   # v_lshlrev_b32 v11, 24, v11 (a<<24)
+    store32(buf + pos + 280, 0xD2020008);   # v_or3_b32 v8, v8, v9, v10
+    store32(buf + pos + 284, 0x042A1308);   #   (cont)
+    store32(buf + pos + 288, 0x28101708);   # v_or_b32 v8, v8, v11  (packed RGBA8)
+    store32(buf + pos + 292, 0x7E000212);   # v_mov_b32 v0, s18
+    store32(buf + pos + 296, 0x7E020213);   # v_mov_b32 v1, s19
+    store32(buf + pos + 300, 0xDC708000);   # global_store_dword v[0:1], v8, off
+    store32(buf + pos + 304, 0x007F0800);   #   (cont)
+    store32(buf + pos + 308, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
+    store32(buf + pos + 312, 0xBF810000);   # s_endpgm
+    var j = 0;
+    while (j < 16) {
+        store32(buf + pos + 316 + j * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
+        j = j + 1;
+    }
+    return pos + GFX9_DOWNSAMPLE_2X2_SIZE;
+}
+
+var GFX9_DOWNSAMPLE_2X2_SIZE = 380;
+
 # PGM_RSRC2 with USER_SGPR = 2 AND TRAP_PRESENT = 1 (bit 6).
 # On GFX9, TRAP_PRESENT must be set or memory-op trap paths fire
 # bad_op_irq even when no actual trap occurs. Per kfdtest this bit

@@ -110,14 +110,22 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
 - [ ] **M.4** — Downsample shader.
   - [ ] **M.4(wgpu)** — mabda-internal WGSL 2×2 box-filter compute
     shader (sampled level n → storage level n+1).
-  - [ ] **M.4(native)** — `native_gfx9_shader_downsample_2x2`
-    (hand-authored GFX9 ISA; **flat `global_load`/`global_store`** with
-    src/dst level VAs + dst dims in user SGPRs — the deadbeef ABI, NOT
-    image instructions). Reads 4 texels, averages each RGBA8 channel
-    (unpack/sum/>>2/pack), writes 1. clang+objdump ground-truth;
-    byte-pinned CPU asserts per
-    `feedback_verify_gfx9_shader_bytes_with_llvm_mc`. The per-channel
-    averaging is the fiddly part (1–2 HW iterations).
+  - [x] **M.4(native)** — `native_gfx9_shader_downsample_2x2`
+    (2026-06-15). 79 GFX9 instructions / 316 B + 64 B NOP prefetch pad =
+    380 B (`GFX9_DOWNSAMPLE_2X2_SIZE`). Single-thread-per-workgroup:
+    SALU address math (inputs are uniform user SGPRs s0:1=src VA,
+    s2:3=dst VA, s4=dst_w, s6/s7=tgid x/y), two `global_load_dwordx2`
+    (a,b / c,d adjacent), per-channel RGBA8 average (`v_and`/`v_bfe_u32`/
+    `v_add3_u32`/`>>2`), `global_store_dword`. Authored to mabda's minimal
+    ABI (clang's full-ABI output isn't transcribable — it calls runtime
+    fns for group-id + loads args from a kernarg segment); the averaging
+    mirrors clang -O2. **Every dword assembled + round-trip-verified via
+    `llvm-mc` (`scripts/disasm-shaders.sh` now covers it — decodes
+    line-for-line).** CPU byte-pin: size + full-buffer checksum + spot
+    checks. Build/lint/fmt/distlib clean; 2053 asserts green. HW dispatch
+    validation lands with M.5/M.6 (byte-pinned-before-HW, like deadbeef).
+    NOTE for M.5: RSRC1 must reserve VGPRs v0..v14 (16) + SGPRs s0..s19
+    (24); RSRC2 must enable TGID_X|TGID_Y; USER_SGPR=6.
 - [ ] **M.5** — `native_pm4_build_compute_downsample(buf, src_va, dst_va,
   w, h)` + inter-level barrier wiring
   (`native_pm4_event_write_cache_flush_and_inv` between levels). CPU
