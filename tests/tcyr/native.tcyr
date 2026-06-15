@@ -572,6 +572,46 @@ fn test_native_compute_dispatch_on_dma_queue_rejected() {
     return 0;
 }
 
+# v3.2 X.4 — SDMA buffer-copy timeline driver: guard ladder + the
+# point-bump / pending-wait-consume bookkeeping on the full path
+# (fake fd makes the submit fail without HW).
+fn test_native_transfer_copy_timeline_driver() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    # A copy aimed at a non-DMA (compute) queue is a mis-route.
+    var qc = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_ring(qc, AMDGPU_HW_IP_COMPUTE);
+    queue_set_syncobj(qc, 1);
+    assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, qc),
+    GPU_ERR_TRANSFER, "copy on non-DMA queue -> GPU_ERR_TRANSFER");
+    assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, 0),
+    GPU_ERR_OTHER, "null queue -> GPU_ERR_OTHER");
+    # DMA queue but zero bytes -> GPU_ERR_BUFFER (before syncobj check).
+    var qt = queue_new(QUEUE_KIND_TRANSFER);
+    queue_set_ring(qt, AMDGPU_HW_IP_DMA);
+    queue_set_syncobj(qt, 7);
+    assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 0, qt),
+    GPU_ERR_BUFFER, "zero bytes -> GPU_ERR_BUFFER");
+    # DMA queue, no syncobj -> GPU_ERR_OTHER.
+    var qns = queue_new(QUEUE_KIND_TRANSFER);
+    queue_set_ring(qns, AMDGPU_HW_IP_DMA);
+    assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, qns),
+    GPU_ERR_OTHER, "DMA queue, syncobj 0 -> GPU_ERR_OTHER");
+    # Full path: DMA queue + syncobj + ib backing + fake fd. The submit
+    # fails (no HW) but the queue bookkeeping must still run: timeline
+    # point bumped 0->1, the recorded barrier wait consumed.
+    queue_set_pending_wait(qt, 0x55, 3);
+    store64((&ctx) + 0, 0 - 1);          # fd = -1
+    var ib_scratch[4096];
+    store64((&ctx) + 64, &ib_scratch);   # ib_addr
+    assert_eq(queue_point(qt), 0, "point starts 0");
+    var rc = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, qt);
+    assert(rc != 0, "fake-fd submit fails gracefully");
+    assert_eq(queue_point(qt), 1, "timeline point bumped 0->1");
+    assert_eq(queue_pending_wait_syncobj(qt), 0, "pending wait consumed");
+    return 0;
+}
+
 fn test_native_queue_get_guards() {
     # ctx==0, bad-kind, and no-fd all short-circuit to 0 before any ioctl.
     assert_eq(_backend_native_queue_get(0, QUEUE_KIND_COMPUTE), 0, "null ctx -> 0");
@@ -2598,6 +2638,7 @@ fn main() {
     test_native_cs_submit_timeline_point_guards();
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
+    test_native_transfer_copy_timeline_driver();
     test_native_queue_get_guards();
     test_native_queue_wait_idle_guards();
     test_native_queue_barrier_guards();

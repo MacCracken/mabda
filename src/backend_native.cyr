@@ -181,6 +181,73 @@ shader_handle, out_handle, queue, ip_type): i64 {
 }
 
 # ================================================================
+# v3.2 X.4 — SDMA buffer-copy on the DMA ring (timeline path)
+# ================================================================
+# The SDMA analog of native_compute_dispatch_cached_timeline. Copies
+# `bytes` from src_va to dst_va on the AMDGPU DMA (SDMA) ring via a
+# single COPY_LINEAR packet, signalling the queue's persistent timeline
+# on completion. Lifts the HW-proven submit shape from the v3.1 Q.6
+# native_multiqueue_e2e leg 3 (manual SDMA leg) into a reusable driver
+# the public gpu_buffer_copy / gpu_queue_transfer_copy slot (X.5) calls.
+#
+# Differences from the compute/render timeline drivers:
+#   - ip_type is hard-wired to AMDGPU_HW_IP_DMA — this driver only runs
+#     on the SDMA ring, and rejects a queue bound to any other ring.
+#   - 4-entry BO_HANDLES list (fence, ib, src, dst): no shader/stub BO,
+#     src+dst are the copy operands. Residency priorities match the
+#     native_sdma_copy_e2e spike (fence=1, ib=10, src/dst=3).
+#   - ib_flags = 0 — SDMA needs no TC writeback hook.
+# Pending cross-ring waits recorded by gpu_queue_barrier are consumed
+# into an in-CS TIMELINE_WAIT exactly as on the compute path.
+fn native_transfer_copy_timeline(ctx, src_handle, src_va,
+dst_handle, dst_va, bytes, queue): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    # SDMA-ring-only: a copy aimed at a GFX/compute queue is a mis-route.
+    if (queue_ring(queue) != AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
+    if (bytes <= 0) { return GPU_ERR_BUFFER; }
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+
+    var fd  = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+
+    # Stage the SDMA COPY_LINEAR packet into the cached IB BO.
+    memset(ib_addr, 0, 4096);
+    var sdma_bytes = native_sdma_build_copy_linear(ib_addr, src_va, dst_va, bytes);
+
+    # 4-entry inline BO_HANDLES list (fence, ib, src, dst).
+    var entries[32];
+    store32(&entries +  0, fence_handle); store32(&entries +  4, 1);
+    store32(&entries +  8, ib_handle);    store32(&entries + 12, 10);
+    store32(&entries + 16, src_handle);   store32(&entries + 20, 3);
+    store32(&entries + 24, dst_handle);   store32(&entries + 28, 3);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 4);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+
+    # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
+    # TIMELINE_WAIT; read + clear before submit so queue state is clean.
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+
+    # Reserve this copy's timeline point and submit signalling it on
+    # completion. ib_flags = 0 (SDMA needs no TC writeback hook).
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, sdma_bytes,
+    AMDGPU_HW_IP_DMA, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
+# ================================================================
 # v3 Step 6.6 — GFX-ring dispatch (clear-triangle composer's submit path)
 # ================================================================
 # Mirrors native_compute_dispatch_cached but on the GFX ring. Same
