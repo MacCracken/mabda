@@ -302,6 +302,61 @@ fn test_texfmt_to_wgpu_v29_mapping() {
     return 0;
 }
 
+# v3.2 T.3 — block size math + overflow bound
+fn test_texfmt_blocks_for_dim() {
+    assert_eq(MABDA_MAX_TEXTURE_DIM_2D, 8192, "dim bound = 8192");
+    # ceil(dim/b): exact + partial blocks.
+    assert_eq(mabda_texfmt_blocks_for_dim(8, 4), 2, "8/4 = 2");
+    assert_eq(mabda_texfmt_blocks_for_dim(7, 4), 2, "7/4 -> 2 (partial)");
+    assert_eq(mabda_texfmt_blocks_for_dim(5, 4), 2, "5/4 -> 2 (partial)");
+    assert_eq(mabda_texfmt_blocks_for_dim(4, 4), 1, "4/4 = 1 (exact)");
+    assert_eq(mabda_texfmt_blocks_for_dim(1, 4), 1, "1/4 -> 1 (partial)");
+    assert_eq(mabda_texfmt_blocks_for_dim(8192, 4), 2048, "8192/4 = 2048");
+    assert_eq(mabda_texfmt_blocks_for_dim(7, 6), 2, "7/6 -> 2");
+    assert_eq(mabda_texfmt_blocks_for_dim(6, 6), 1, "6/6 = 1");
+    assert_eq(mabda_texfmt_blocks_for_dim(9, 8), 2, "9/8 -> 2");
+    assert_eq(mabda_texfmt_blocks_for_dim(8, 8), 1, "8/8 = 1");
+    # Invalid inputs.
+    assert_eq(mabda_texfmt_blocks_for_dim(0, 4), 0, "0 dim -> 0");
+    assert_eq(mabda_texfmt_blocks_for_dim(0 - 1, 4), 0, "neg dim -> 0");
+    assert_eq(mabda_texfmt_blocks_for_dim(8, 0), 0, "0 block -> 0");
+    return 0;
+}
+
+fn test_texfmt_data_size() {
+    # Uncompressed: w*h*4.
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_RGBA8, 8, 8), 256, "RGBA8 8x8 = 256");
+    # BC: block-rounded.
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_BC1, 8, 8), 32, "BC1 8x8 = 2*2*8");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_BC1, 7, 7), 32, "BC1 7x7 -> 2*2*8 (partial)");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_BC1, 4, 4), 8, "BC1 4x4 = 1*1*8");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_BC3, 8, 8), 64, "BC3 8x8 = 2*2*16");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_ETC2_RGB8, 4, 4), 8, "ETC2_RGB8 4x4 = 8");
+    # ASTC block dims.
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_ASTC_6X6, 6, 6), 16, "ASTC6x6 6x6 = 16");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_ASTC_6X6, 7, 7), 64, "ASTC6x6 7x7 -> 2*2*16");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_ASTC_8X8, 16, 16), 64, "ASTC8x8 16x16 = 2*2*16");
+    # Invalid format / dims.
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_COUNT, 8, 8), 0, "invalid fmt -> 0");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_RGBA8, 0, 8), 0, "zero w -> 0");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_RGBA8, 8, 0 - 1), 0, "neg h -> 0");
+    return 0;
+}
+
+fn test_texfmt_data_size_overflow_bound() {
+    # Worst case at the dim cap, re-derived (not inferred): RGBA8 8192^2*4.
+    var rgba8_max = mabda_texfmt_data_size(MABDA_TEXFMT_RGBA8, 8192, 8192);
+    assert_eq(rgba8_max, 268435456, "RGBA8 8192^2 = 256 MiB");
+    # Compressed worst case (16 B/block) is always <= the RGBA8 bound.
+    var bc7_max = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, 8192, 8192);
+    assert_eq(bc7_max, 67108864, "BC7 8192^2 = 2048^2*16 = 64 MiB");
+    assert(bc7_max < rgba8_max, "compressed worst case < RGBA8 bound");
+    # Past the dim cap -> 0 (the overflow guard), both axes.
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_RGBA8, 8193, 8192), 0, "w>8192 -> 0");
+    assert_eq(mabda_texfmt_data_size(MABDA_TEXFMT_BC7, 8192, 8193), 0, "h>8192 -> 0");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -309,6 +364,9 @@ fn main() {
     test_texfmt_block_geometry();
     test_texfmt_invalid_returns_zero();
     test_texfmt_to_wgpu_v29_mapping();
+    test_texfmt_blocks_for_dim();
+    test_texfmt_data_size();
+    test_texfmt_data_size_overflow_bound();
     test_vertex_blend_opaque();
     test_vertex_blend_alpha();
     test_depth_texture_accessors();

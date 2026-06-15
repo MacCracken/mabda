@@ -1100,6 +1100,47 @@ fn mabda_texfmt_to_wgpu(fmt): i64 {
     return 0;   # WGPUTextureFormat_Undefined
 }
 
+# ================================================================
+# v3.2 T.3 — block size math + the dimension/overflow bound
+# ================================================================
+# WebGPU spec minimum maxTextureDimension2D = 8192; larger creations are
+# rejected before hitting the backend (Audit LOW-3). Lives here (the
+# foundation module) so this block math and texture.cyr's
+# validate_dimensions share one bound.
+var MABDA_MAX_TEXTURE_DIM_2D = 8192;
+
+# Number of blocks spanning `dim` texels for a block edge of `b`:
+# ceil(dim / b) = (dim + b - 1) / b. Returns 0 for a non-positive dim or
+# block edge (invalid input).
+fn mabda_texfmt_blocks_for_dim(dim, b): i64 {
+    if (dim <= 0) { return 0; }
+    if (b <= 0)   { return 0; }
+    return (dim + b - 1) / b;
+}
+
+# Total encoded bytes for a w x h texture in `fmt`:
+# blocks_x * blocks_y * block_bytes. Returns 0 on invalid format,
+# non-positive dims, or dims past MABDA_MAX_TEXTURE_DIM_2D.
+#
+# Overflow re-derivation (security checklist, not inferred): both dims are
+# capped at 8192 before the multiply. The largest product is RGBA8's
+# 8192*8192*4 = 268,435,456 B (256 MiB); the compressed worst case is
+# 16 B/block over ceil(8192/4)^2 = 2048*2048 blocks = 67,108,864 B
+# (64 MiB) — compressed is always <= the RGBA8 size for the same dims. Both
+# are far under i64 max, so after the dim cap the bx*by*bytes multiply
+# cannot overflow.
+fn mabda_texfmt_data_size(fmt, w, h): i64 {
+    var bytes = mabda_texfmt_block_bytes(fmt);
+    if (bytes == 0) { return 0; }                       # invalid format
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    if (w > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }     # overflow guard (dim cap)
+    if (h > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }
+    var bx = mabda_texfmt_blocks_for_dim(w, mabda_texfmt_block_width(fmt));
+    var by = mabda_texfmt_blocks_for_dim(h, mabda_texfmt_block_height(fmt));
+    return bx * by * bytes;
+}
+
 # --- wgpu_descriptors.cyr ---
 
 # @internal — FFI / toolchain scaffolding, replaced in v3.0
@@ -11682,9 +11723,9 @@ fn texture_release(t): i64 {
 # Raw creation — create a texture handle without view/sampler
 # ================================================================
 
-# WebGPU spec minimum: maxTextureDimension2D = 8192. Larger creations
-# are rejected (return 0) before hitting wgpu-native. Audit LOW-3.
-var MABDA_MAX_TEXTURE_DIM_2D = 8192;
+# MABDA_MAX_TEXTURE_DIM_2D (WebGPU spec minimum maxTextureDimension2D =
+# 8192) moved to src/texture_format.cyr at v3.2 T.3 so the block-size math
+# there can share the dimension bound; texture.cyr still uses it below.
 
 # Creates a 2D texture with RGBA8_UNORM format and
 # TEXTURE_BINDING | COPY_DST usage (the common "upload + sample" case).
