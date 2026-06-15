@@ -94,17 +94,30 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
   rather than falsely incomplete. 7 layout asserts; build / lint / fmt /
   vet / distlib / version-check clean; 2039 CPU asserts green. Pure CPU —
   no HW behavior yet.
-- [ ] **M.3** — Per-level GPU access. wgpu: N `WGPUTextureView`s
-  (`baseMipLevel=i`) in a ctx-local handle-keyed table; wire the
-  scaffolded storage-texture bind-group-layout entry path. native:
-  `native_descriptor_table_*` (16-byte V# entries; `SET_SH_REG` of the
-  table VA to `COMPUTE_USER_DATA_*`). CPU tests: view table, V# layout.
+- [~] **M.3** — Per-level GPU access.
+  - [x] **M.3(native)** + **PIVOT** (2026-06-15). Native textures are
+    LINEAR GTT BOs, and the deadbeef shader proves flat
+    `global_load`/`global_store` against a user-SGPR VA works on Cezanne —
+    so per-level access is just `native_texture_level_va(tex, level)`
+    (chain base + `native_mip_level_offset`). **This DELETES the image
+    descriptor-table (T#/V#) design** from the proposal (~200 lines,
+    ABI-risky, 2–4 HW iterations) — the downsample shader (M.4) addresses
+    memory arithmetically instead. 4 CPU asserts; proposal updated with
+    the pivot rationale. Build/lint/fmt/distlib clean; 2043 asserts green.
+  - [ ] **M.3(wgpu)** — N `WGPUTextureView`s (`baseMipLevel=i`) in a
+    ctx-local handle-keyed table (`wgpu_texture_create_view` exists) +
+    wire the scaffolded storage-texture bind-group-layout entry. Remaining.
 - [ ] **M.4** — Downsample shader.
   - [ ] **M.4(wgpu)** — mabda-internal WGSL 2×2 box-filter compute
     shader (sampled level n → storage level n+1).
   - [ ] **M.4(native)** — `native_gfx9_shader_downsample_2x2`
-    (hand-authored GFX9 ISA; clang+objdump ground-truth; byte-pinned CPU
-    asserts per `feedback_verify_gfx9_shader_bytes_with_llvm_mc`).
+    (hand-authored GFX9 ISA; **flat `global_load`/`global_store`** with
+    src/dst level VAs + dst dims in user SGPRs — the deadbeef ABI, NOT
+    image instructions). Reads 4 texels, averages each RGBA8 channel
+    (unpack/sum/>>2/pack), writes 1. clang+objdump ground-truth;
+    byte-pinned CPU asserts per
+    `feedback_verify_gfx9_shader_bytes_with_llvm_mc`. The per-channel
+    averaging is the fiddly part (1–2 HW iterations).
 - [ ] **M.5** — `native_pm4_build_compute_downsample(buf, src_va, dst_va,
   w, h)` + inter-level barrier wiring
   (`native_pm4_event_write_cache_flush_and_inv` between levels). CPU
