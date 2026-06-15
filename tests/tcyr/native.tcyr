@@ -566,6 +566,35 @@ fn test_native_queue_barrier_guards() {
     return 0;
 }
 
+fn test_native_compute_dispatch_queue_targeted_branch() {
+    # When the current-queue stash is set, compute_dispatch routes
+    # through the async timeline path: the queue's point is bumped (0->1)
+    # and a submit is attempted. With a fake fd (-1) the CS ioctl fails
+    # gracefully (-EBADF -> GPU_ERR_*, no crash). Set just enough ctx
+    # fields for the driver: fd, a real IB mmap buffer, and the PM4
+    # scratch — everything else can stay zero.
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 0, 0 - 1);            # fd = -1 -> CS ioctl -EBADF
+    var ib_scratch[4096];
+    store64((&ctx) + 64, &ib_scratch);     # ib_addr (memcpy target)
+    var pm4_scratch[1024];
+    store64((&ctx) + 112, &pm4_scratch);   # pm4 build buffer
+    var q = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_syncobj(q, 1);               # non-zero so the driver proceeds
+    queue_set_ring(q, AMDGPU_HW_IP_COMPUTE);
+    gpu_ctx_set_current_queue(&ctx, q);
+    var shmod[16];
+    native_buf_pair_write(&shmod, 0x111, 0x222);
+    var bp[16];
+    native_buf_pair_write(&bp, 0x333, 0x444);
+    assert_eq(queue_point(q), 0, "point starts 0");
+    var rc = _backend_native_compute_dispatch(&ctx, &shmod, 1, 1, 1, &bp);
+    assert(rc != 0, "fake-fd submit fails gracefully (no crash)");
+    assert_eq(queue_point(q), 1, "timeline path taken: queue point bumped 0->1");
+    return 0;
+}
+
 fn test_native_cs_submit_timeline_point_guards() {
     # Signalling timeline point 0 is a kernel -EINVAL trap (points are
     # strictly monotonic from 0); the guard short-circuits before any
@@ -2420,6 +2449,7 @@ fn main() {
     test_native_queue_get_guards();
     test_native_queue_wait_idle_guards();
     test_native_queue_barrier_guards();
+    test_native_compute_dispatch_queue_targeted_branch();
     test_native_pm4_builder_composability();
     test_backend_native_new_is_complete();
     test_backend_native_slot_identities();

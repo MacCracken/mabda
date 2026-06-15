@@ -1,0 +1,167 @@
+# programs/native_queue_compute_e2e.cyr — v3.1 Q.3c hardware integration
+#
+# First end-to-end exercise of the native multi-queue path: dispatch a
+# compute shader onto a logical COMPUTE queue (async, signalling the
+# queue's PERSISTENT timeline syncobj), then block via gpu_queue_wait_idle
+# (a timeline wait for the queue's point), then verify the GPU wrote
+# 0xDEADBEEF. A second dispatch on the same queue proves the persistent
+# timeline reuses cleanly across submits (point 1 -> 2) — the property a
+# binary syncobj could not give without reset/recreate churn.
+#
+# Same deadbeef compute shader as programs/native_compute_store.cyr; the
+# difference is the submit path:
+#   - gpu_queue_get(ctx, COMPUTE) + gpu_ctx_set_current_queue route
+#     gpu_compute_dispatch through native_compute_dispatch_cached_timeline
+#     (TIMELINE_SIGNAL chunk, no in-CS wait, no per-dispatch syncobj).
+#   - gpu_queue_wait_idle does the SYNCOBJ_TIMELINE_WAIT.
+#   - native_syncobj_timeline_query reads the signalled point back to
+#     prove the accounting.
+#
+# Exit codes:
+#   0   — both dispatches wrote 0xDEADBEEF; timeline point reached 2
+#   1   — gpu_context_new_native failed
+#   2   — shader BO setup failed
+#   4   — output BO setup failed
+#   5   — gpu_queue_get(COMPUTE) failed
+#   9   — dispatch #1 submit failed
+#   10  — gpu_queue_wait_idle #1 failed
+#   11  — readback mismatch after dispatch #1
+#   12  — sentinel corrupted
+#   13  — timeline query #1 wrong point (want >= 1)
+#   14  — dispatch #2 submit failed
+#   15  — gpu_queue_wait_idle #2 failed
+#   16  — readback mismatch after dispatch #2
+#   17  — timeline query #2 wrong point (want >= 2)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native QUEUE compute e2e (v3.1 Q.3c)\n");
+    print_cstr("------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        return 1;
+    }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+    print_cstr("fd="); print_i64(fd); print_cstr("\n");
+
+    # ---- Shader BO ----
+    var shader_size = 4096;
+    var shader_bo[16];
+    var rc = native_bo_create_gtt(fd, shader_size, &shader_bo);
+    if (rc != 0) {
+        print_cstr("FAIL: shader bo create\n"); gpu_context_release(ctx); return 2;
+    }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, shader_size);
+    native_gfx9_shader_store_deadbeef(shader_map, 0);
+    var shader_va = 0xFFFF800100000000;
+    rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
+    _NATIVE_PERM_SHADER);
+    if (rc != 0) { print_cstr("FAIL: shader va_map\n"); return 2; }
+
+    # ---- Output BO seeded with 0xBAADF00D ----
+    var out_size = 4096;
+    var out_bo[16];
+    rc = native_bo_create_gtt(fd, out_size, &out_bo);
+    if (rc != 0) { print_cstr("FAIL: output bo create\n"); return 4; }
+    var out_handle = load64(&out_bo + 0);
+    var out_map    = load64(&out_bo + 8);
+    var sentinel = 0xBAADF00D;
+    var si = 0;
+    while (si < out_size / 4) { store32(out_map + si * 4, sentinel); si = si + 1; }
+    var out_va = 0xFFFF800100400000;
+    rc = native_gem_va_map(fd, out_handle, out_va, out_size, _NATIVE_PERM_DATA);
+    if (rc != 0) { print_cstr("FAIL: output va_map\n"); return 4; }
+
+    # ---- Acquire the COMPUTE queue + make it the dispatch target ----
+    var q = gpu_queue_get(ctx, QUEUE_KIND_COMPUTE);
+    if (q == 0) { print_cstr("FAIL: gpu_queue_get(COMPUTE)\n"); gpu_context_release(ctx); return 5; }
+    print_cstr("compute queue ring="); print_i64(queue_ring(q));
+    print_cstr(" syncobj="); print_i64(queue_syncobj(q)); print_cstr("\n");
+    gpu_ctx_set_current_queue(ctx, q);
+
+    var shmod_pair[16];
+    native_buf_pair_write(&shmod_pair, shader_handle, shader_va);
+    var bp_pair[16];
+    native_buf_pair_write(&bp_pair, out_handle, out_va);
+
+    # ---- Dispatch #1 (async on the queue) + wait_idle ----
+    rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
+    if (rc != 0) { print_cstr("FAIL: dispatch #1 rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 9; }
+    rc = gpu_queue_wait_idle(ctx, q);
+    if (rc != 0) { print_cstr("FAIL: wait_idle #1 rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 10; }
+    var v0 = load32(out_map + 0);
+    print_cstr("dispatch #1 output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
+    if (v0 != 0xDEADBEEF) { print_cstr("FAIL: mismatch #1\n"); gpu_context_release(ctx); return 11; }
+    if (load32(out_map + 4) != sentinel) { print_cstr("FAIL: sentinel corrupt\n");
+        gpu_context_release(ctx); return 12; }
+
+    var pbuf[8];
+    store64(&pbuf, 0);
+    native_syncobj_timeline_query(fd, queue_syncobj(q), &pbuf);
+    var pt1 = load64(&pbuf);
+    print_cstr("timeline point after #1 = "); print_i64(pt1); print_cstr(" (want >= 1)\n");
+    if (pt1 < 1) { print_cstr("FAIL: point #1\n"); gpu_context_release(ctx); return 13; }
+
+    # ---- Dispatch #2 on the same queue: persistent timeline 1 -> 2 ----
+    print_cstr("---- second dispatch on same queue ----\n");
+    var si2 = 0;
+    while (si2 < out_size / 4) { store32(out_map + si2 * 4, sentinel); si2 = si2 + 1; }
+    rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
+    if (rc != 0) { print_cstr("FAIL: dispatch #2 rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 14; }
+    rc = gpu_queue_wait_idle(ctx, q);
+    if (rc != 0) { print_cstr("FAIL: wait_idle #2 rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 15; }
+    var v0b = load32(out_map + 0);
+    print_cstr("dispatch #2 output[0] = "); print_hex32(v0b); print_cstr("\n");
+    if (v0b != 0xDEADBEEF) { print_cstr("FAIL: mismatch #2\n"); gpu_context_release(ctx); return 16; }
+    store64(&pbuf, 0);
+    native_syncobj_timeline_query(fd, queue_syncobj(q), &pbuf);
+    var pt2 = load64(&pbuf);
+    print_cstr("timeline point after #2 = "); print_i64(pt2); print_cstr(" (want >= 2)\n");
+    if (pt2 < 2) { print_cstr("FAIL: point #2\n"); gpu_context_release(ctx); return 17; }
+
+    # ---- Teardown ----
+    native_gem_va_unmap(fd, out_handle, out_va, out_size);
+    native_bo_release_gtt(fd, out_handle, out_map, out_size);
+    native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+    native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+    gpu_context_release(ctx);
+    print_cstr("OK — compute on a logical queue, timeline-ordered, point reached 2\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

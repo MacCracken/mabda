@@ -224,6 +224,18 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+# v3.1 Q.3c — native multi-queue compute: dispatch on a logical COMPUTE
+# queue (async, timeline-signalled), wait via gpu_queue_wait_idle, verify
+# 0xDEADBEEF; second dispatch proves the persistent timeline (point 1->2).
+# HW-gated (requires the AMD render node).
+build/native_queue_compute_e2e: programs/native_queue_compute_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_queue_compute_e2e.cyr $@
+
+.PHONY: test-native-queue-compute-e2e
+test-native-queue-compute-e2e: build/native_queue_compute_e2e
+	./build/native_queue_compute_e2e
+
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the
 # dword stream to stdout instead of submitting it. CI-safe (no GPU
