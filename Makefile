@@ -260,6 +260,17 @@ build/native_sdma_copy_e2e: programs/native_sdma_copy_e2e.cyr src/*.cyr
 test-native-sdma-copy-e2e: build/native_sdma_copy_e2e
 	./build/native_sdma_copy_e2e
 
+# v3.1 Q.6 — headline multi-queue demo: compute (COMPUTE ring) -> barrier
+# -> graphics (GFX ring) + SDMA consume (DMA ring), all three rings
+# timeline-ordered, every result CPU-verified. HW-gated.
+build/native_multiqueue_e2e: programs/native_multiqueue_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_multiqueue_e2e.cyr $@
+
+.PHONY: test-native-multiqueue-e2e
+test-native-multiqueue-e2e: build/native_multiqueue_e2e
+	./build/native_multiqueue_e2e
+
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the
 # dword stream to stdout instead of submitting it. CI-safe (no GPU

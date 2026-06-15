@@ -262,7 +262,7 @@ first. Planned 2026-06-15 (subsystem map + design decisions); see the
 - Mipmaps: [`docs/proposals/v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md)
 - Multi-queue: [`docs/proposals/v3.1-multiqueue.md`](../proposals/v3.1-multiqueue.md)
 
-### 3.1.0 — Mipmap generation (first; self-contained)
+### 3.1.0 — Mipmap generation (first; self-contained) — ✅ SHIPPED 2026-06-15
 
 On-device mip-chain generation: create a texture with N levels, write
 level 0, GPU-downsample levels 1..N-1 (2×2 box filter). Same public API
@@ -275,7 +275,7 @@ via the existing cache-flush PM4 primitive (Step 6.10), so **mipmaps do
 not depend on multi-queue**. Consumers: soorat (texture-heavy UI), kiran
 (asset pipeline).
 
-### 3.1.1+ — Multi-queue coordination (logical ordering abstraction)
+### 3.1.1 — Multi-queue coordination (logical ordering abstraction) — ✅ SHIPPED 2026-06-15
 
 Named logical queues (GRAPHICS / COMPUTE / TRANSFER) with explicit
 cross-queue ordering. **Hard constraint reckoned with 2026-06-15:**
@@ -285,11 +285,25 @@ abstraction**, not a parallelism guarantee — wgpu serializes all logical
 queues onto its single queue (correct, no overlap); native AMD maps each
 to a hardware ring (GFX/COMPUTE/DMA) with timeline-syncobj cross-ring
 sync (real overlap). Same public API (ADR 005), backend-specific
-performance — the v3.0 story. Consumers: rasa (compute+present overlap),
-bijli (large transfer). The **render-graph multi-queue refactor** (the
-arc's biggest risk — the v2.5 graph is single-submit) is scoped
-separately (3.1.2 / possibly its own minor); 3.1.1's MVP is
-direct-dispatch multi-queue.
+performance — the v3.0 story.
+
+**Shipped in 3.1.1 (direct-dispatch MVP, HW-verified on Cezanne):** the
+logical queue API (`gpu_queue_get` / `_barrier` / `_wait_idle` +
+current-queue dispatch); native GFX + COMPUTE timeline queues with
+persistent timeline syncobjs; a cross-ring barrier via an in-CS
+`SYNCOBJ_TIMELINE_WAIT` (no CPU stall); and the SDMA `COPY_LINEAR`
+foundation (HW-proven on the DMA ring). The 3-ring
+compute→barrier→graphics + SDMA-consume e2e
+(`programs/native_multiqueue_e2e.cyr`) passes on real hardware. wgpu
+aliases the single device queue (submit-order barrier, no overlap).
+
+**Deferred to 3.1.2:** the `TRANSFER → AMDGPU_HW_IP_DMA` ring flip + a
+public buffer-copy API (with wgpu parity) — the SDMA path is proven but
+a DMA-ring queue with no public copy op would only be a footgun. Plus the
+**render-graph multi-queue refactor** (per-node queue affinity +
+cross-queue fence edges; the arc's biggest risk — the v2.5 graph is
+single-submit). Consumers: rasa (compute+present overlap), bijli (large
+transfer).
 
 ---
 
