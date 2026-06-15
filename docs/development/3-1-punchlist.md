@@ -67,9 +67,18 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     asserts (mip count/dim in `mabda.tcyr`; offset/size/align in
     `mabda_v3.tcyr`). Also backfilled the previously-untested
     `mip_level_count`. Build + lint + fmt clean; 2016 CPU asserts green.
-  - [ ] **M.1(b)** — texture VA sub-allocator (bump over the texture VA
-    region) + `NativeTexture` / ctx-side table carrying `mip_count` +
-    per-level offsets. Next.
+  - [x] **M.1(b)** — `NativeTexture` mip metadata (2026-06-15). Struct
+    grew 32 → 48 B, appending `width` (+32), `height` (+36), `mip_count`
+    (+40); offsets 0..24 unchanged. `native_texture_create_2d_rgba8`
+    populates them (`mip_count = 1` for single-level). Per-level VA is
+    recomputed on demand as `va + native_mip_level_offset(w, h, level)` —
+    no need to store the offset array. Updated the struct-layout + round-
+    trip CPU tests; HW-verified (native_texture_e2e 64×32 byte-exact on
+    Cezanne). Build + lint + fmt clean; 2023 CPU asserts green.
+  - [ ] **M.1(c)** — texture VA sub-allocator. Bump cursor over a widened
+    texture VA region (the current 6 MiB gap between the texture base and
+    the RT base can't hold a large mip chain), per-context cursor state.
+    Pulls in a small VA-map layout adjustment — its own bite. Next.
 - [ ] **M.2** — `BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED` (+208) and
   `BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS` (+216); `BACKEND_SIZE` 208→224;
   `BACKEND_MIPMAP_SLOTS_BEGIN/END` + `backend_is_complete` walk. Layout

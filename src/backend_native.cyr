@@ -969,11 +969,18 @@ fn backend_native_new(): i64 {
 # CPU-uploaded textures + compute-shader writes; tiled / mipped /
 # format-rich textures are subsequent Phase C chunks (5.x).
 #
-# NativeTexture struct layout (32 bytes):
-#   +0:  handle (u64, KMS handle)
-#   +8:  va     (u64, canonical-high GPU VA)
-#   +16: addr   (u64, CPU mmap pointer)
-#   +24: size   (u64, bytes — width × height × 4)
+# NativeTexture struct layout (48 bytes — grew 32 → 48 at v3.1 M.1(b)
+# to carry mip metadata; offsets 0..24 unchanged):
+#   +0:  handle    (u64, KMS handle)
+#   +8:  va        (u64, canonical-high GPU VA of level 0)
+#   +16: addr      (u64, CPU mmap pointer to level 0)
+#   +24: size      (u64, total BO bytes — single level: w·h·4;
+#                   mip chain: native_mip_chain_size (v3.1 M.2))
+#   +32: width     (u32, level-0 width)
+#   +36: height    (u32, level-0 height)
+#   +40: mip_count (u32, 1 = single level; per-level VA = va +
+#                   native_mip_level_offset(width, height, level))
+#   +44: pad       (u32)
 #
 # Step 5.1 hardcodes the texture VA at _NATIVE_TEXTURE_VA_BASE.
 # This means a single texture per context until the multi-texture
@@ -996,11 +1003,14 @@ fn backend_native_new(): i64 {
 
 var _NATIVE_TEXTURE_VA_BASE = 0xFFFF800100A00000;
 
-var NATIVE_TEX_FIELD_HANDLE = 0;
-var NATIVE_TEX_FIELD_VA     = 8;
-var NATIVE_TEX_FIELD_ADDR   = 16;
-var NATIVE_TEX_FIELD_SIZE   = 24;
-var NATIVE_TEX_STRUCT_SIZE  = 32;
+var NATIVE_TEX_FIELD_HANDLE    = 0;
+var NATIVE_TEX_FIELD_VA        = 8;
+var NATIVE_TEX_FIELD_ADDR      = 16;
+var NATIVE_TEX_FIELD_SIZE      = 24;
+var NATIVE_TEX_FIELD_WIDTH     = 32;
+var NATIVE_TEX_FIELD_HEIGHT    = 36;
+var NATIVE_TEX_FIELD_MIP_COUNT = 40;
+var NATIVE_TEX_STRUCT_SIZE     = 48;
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.
@@ -1068,6 +1078,11 @@ fn native_texture_create_2d_rgba8(fd, width, height, out): i64 {
     store64(out + NATIVE_TEX_FIELD_VA,     va);
     store64(out + NATIVE_TEX_FIELD_ADDR,   addr);
     store64(out + NATIVE_TEX_FIELD_SIZE,   size);
+    # v3.1 M.1(b): single-level texture carries mip_count = 1. The mipped
+    # create path (M.2) fills width/height/mip_count for a real chain.
+    store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(out + NATIVE_TEX_FIELD_MIP_COUNT, 1);
     return 0;
 }
 
