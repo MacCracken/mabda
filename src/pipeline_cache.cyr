@@ -6,19 +6,40 @@
 # u64 hash. v2.4.5 migrated from cstr-keyed to u64-keyed hashmap — zero
 # allocation per lookup; see cyrius v5.5.20 CHANGELOG.
 
+# Audit 2026-06-14 [HIGH-4]: lib/hashmap.cyr reserves two key values
+# in-band — MAP_U64_EMPTY (0) and MAP_U64_TOMB (0xFFFFFFFFFFFFFFFF). A
+# caller-supplied cache key equal to either is silently dropped (every
+# get/has misses), and a stored key of 0 also corrupts the map's
+# occupied-count (was_new fires on every overwrite), mis-timing growth.
+# These caches are keyed by consumer-folded u64 hashes, so a zero or
+# all-ones fold is readily reachable. Remap the two reserved values to
+# fixed sentinel-free constants before delegating to map_u64_*. Applied
+# symmetrically across set/get/has (shared by bind_group_cache too) so
+# round-trips stay consistent. A genuine key colliding with a remap
+# target is a 2^-64 event — the same odds as the original sentinel hit,
+# and strictly better than the always-broken status quo for keys 0/MAX.
+var _CACHE_KEY_REMAP_ZERO = 0x9E3779B97F4A7C15;   # stands in for key 0
+var _CACHE_KEY_REMAP_MAX  = 0xC2B2AE3D27D4EB4F;   # stands in for u64::MAX
+
+fn _cache_safe_key(key): i64 {
+    if (key == 0)                  { return _CACHE_KEY_REMAP_ZERO; }
+    if (key == 0xFFFFFFFFFFFFFFFF) { return _CACHE_KEY_REMAP_MAX; }
+    return key;
+}
+
 fn pipeline_cache_new(): i64 {
     return map_u64_new();
 }
 
 fn pipeline_cache_get(cache, key): i64 {
-    return map_u64_get(cache, key);
+    return map_u64_get(cache, _cache_safe_key(key));
 }
 
 fn pipeline_cache_set(cache, key, pipeline): i64 {
-    map_u64_set(cache, key, pipeline);
+    map_u64_set(cache, _cache_safe_key(key), pipeline);
     return 0;
 }
 
 fn pipeline_cache_has(cache, key): i64 {
-    return map_u64_has(cache, key);
+    return map_u64_has(cache, _cache_safe_key(key));
 }

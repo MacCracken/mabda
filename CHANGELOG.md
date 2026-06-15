@@ -18,6 +18,103 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.0.4] — 2026-06-15
+
+**P(-1) security-hardening patch.** First full-surface security audit
+since 3.0.0 GA (all 38 modules, not just a delta) and since the cyrius
+6.0 → 6.2 toolchain jump. The 2026-04-30 audit's findings held: all 5
+prior ship-blockers and 9/11 deferred items are verified fixed in tree.
+This patch lands the new findings — 4 HIGH, 5 MEDIUM, 7 LOW — each
+HIGH/MED with a regression assertion. CPU suite grew 1957 → **1991**
+assertions; no public API change; verified green on 6.2.6 (lint / fmt /
+vet / dist all clean). Full report:
+[`docs/audit/2026-06-14-audit.md`](docs/audit/2026-06-14-audit.md).
+
+The dominant theme: the v3 backend-abstraction dispatchers were added as
+thin `ctx->backend->slot` pass-throughs and dropped the input validation
+their v2 siblings still enforce. Fixed uniformly.
+
+### Fixed
+
+- **[HIGH-1] `gpu_texture_create_2d_rgba8` now validates dimensions.**
+  The v3 dispatcher forwarded consumer width/height with no positivity /
+  upper-bound / overflow check (its v2 sibling `texture_create_rgba8`
+  enforces `MABDA_MAX_TEXTURE_DIM_2D`). Unvalidated `width*height*4` could
+  reach the native GEM_CREATE ioctl + mmap. Guard added at the dispatcher
+  and at the native slot (`_backend_native_texture_create_2d_rgba8`).
+- **[HIGH-2] logind-acquired DRM master fd no longer leaks on release.**
+  On the `gpu_surface_configure_native_logind` success path mabda owns
+  the samvada-delegated master fd, but `gpu_surface_release` only zeroed
+  the ctx stash — never `samvada_session_release_device` + `sys_close`.
+  Every successful configure→release cycle leaked an fd and held DRM
+  master for the process lifetime. Fixed via per-surface provenance
+  (`NATIVE_SURFACE_MASTER_OWNED` / `_MINOR`, in the struct's free tail):
+  the release slot now returns master to logind and closes the fd; kiosk
+  (consumer-owned) fds are untouched. (Distinct from the 2026-04-30
+  HIGH-2, which fixed only the configure *failure* paths.)
+- **[HIGH-3]/[MED-4] WGSL shader source no longer truncated at 4 KiB.**
+  `wgpu_shader_source_wgsl` derived its StringView length from the 4 KiB
+  `WGPU_LABEL_MAX_BYTES` label cap, silently truncating any shader ≥ 4 KiB
+  (wgpu-native reads exactly `StringView.length` bytes → compile failure
+  or wrong shader). The v3 slot also discarded the explicit length `n` it
+  was handed. Added `wgpu_shader_source_wgsl_len` (used by the slot with
+  the real `n`) and raised the cstr-path scan to a 1 MiB shader-source cap.
+- **[HIGH-4] cache keys 0 / `0xFFFFFFFFFFFFFFFF` no longer corrupt the
+  cache.** `pipeline_cache` and `bind_group_cache` passed caller-supplied
+  u64 hash keys straight to `map_u64_*`, whose reserved EMPTY (0) / TOMB
+  (MAX) sentinels silently dropped those two keys (and key=0 corrupted the
+  occupied-count). Keys now route through `_cache_safe_key`, which remaps
+  the two reserved values out of band.
+- **[MED-1]/[MED-2] native texture/render-target size overflow guards.**
+  `native_texture_size_2d_rgba8` / `native_rt_size_2d_rgba8` computed
+  `width*height*4` with no upper-dimension cap before GEM_CREATE + mmap.
+  The dimension cap (subsumes the prior deferred MED-2 render-path twin
+  [LOW-5] — the 14-bit CB_COLOR0_ATTRIB2 extent can no longer wrap).
+- **[MED-3] `gpu_compute_dispatch` now validates workgroup counts.**
+  The v3 compute dispatcher dropped the `<=0` + `MABDA_MAX_DISPATCH_DIM`
+  (65535) guards its v2 sibling enforces; restored at the dispatcher and
+  the native slot so out-of-range counts can't reach PM4 + CS submit.
+- **[MED-5] `gpu_timestamps_new` null-checks buffer creation.** The two
+  `wgpu_device_create_buffer` returns were stored unchecked; on VRAM
+  exhaustion the wrapper held null handles later deref'd in wgpu-native.
+  Now releases acquired resources and returns `Err`.
+- **[MED-6] test no longer shadows production `present_mode_to_wgpu`.**
+  `mabda.tcyr` re-defined it (and the `WGPU_PRESENT_MODE_*` vars) verbatim;
+  under "last definition wins" the test validated its own stale copy, and
+  the duplicate-fn build warning tripped the zero-warning gate. Removed —
+  the test now exercises the real `src/surface.cyr` symbol.
+- **[LOW-1]/[LOW-2] struct-header comment corrections.**
+  `NativeRenderPipeline` ("320 bytes" → real 644) and `RenderTarget`
+  ("48 bytes" → real 64) header comments now match the load-bearing size
+  constants. Runtime was already safe; the comments were the editing hazard.
+- **[LOW-3] `surface_state_new` / `_resize` reject non-positive dims.**
+  The v2 surface path used `== 0` guards; a negative dim truncated to a
+  huge u32 extent at the wgpu boundary. Now `<= 0`, matching the v3 path.
+- **[LOW-4] `clock_gettime` return checked in native dispatch.** Both
+  native compute/render dispatch sites discarded the syscall return and
+  read an uninitialized `t_now`, risking a garbage syncobj deadline on
+  failure. Now `memset` + return-check at both sites.
+- **[LOW-6] `gpu_timestamps_resolve`/`_map` guard negative counts.** A
+  negative `query_count` survived the upper-bound clamp and fed `count*8`
+  as a huge unsigned size into wgpu; clamped below at 0.
+
+### Security
+
+- Full-surface audit + amdgpu/DRM + wgpu/WebGPU CVE sweep
+  (2026-04-30 → 2026-06-14). No CRITICAL findings; no remotely-reachable
+  issue under the trusted-caller model. The two in-window amdgpu CVEs
+  whose bug-classes touch mabda's hand-laid ioctls were code-verified as
+  **non-reachable**: CVE-2026-23468 (BO-list entry count) — mabda
+  hardcodes `bo_number = 5` (the fixed BO set), not a consumer-controlled
+  count; CVE-2026-46220 (SDMA4 `BUG_ON(addr & 0x3)`) — mabda submits only
+  to GFX/COMPUTE (never SDMA) and passes a fixed, DWORD-aligned
+  `fence_offset = 32`.
+- **Defense-in-depth: `native_cs_submit_4chunk` now rejects a
+  non-DWORD-aligned `fence_offset`** with `-EINVAL` before the CS ioctl.
+  Guards a future regression (a new caller or an SDMA submit path) from
+  reaching the kernel BUG_ON the CVE-2026-46220 class describes; a no-op
+  for today's fixed offset. Regression test added.
+
 ## [3.0.3] — 2026-06-14
 
 **Toolchain + dep tracking patch.** Documents the cyrius pin already at

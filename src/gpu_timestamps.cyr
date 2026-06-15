@@ -72,12 +72,24 @@ fn gpu_timestamps_new(device, queue, max_passes): i64 {
     var resolve_desc = wgpu_buffer_descriptor("timestamp_resolve",
     resolve_usage, buffer_size, 0);
     var resolve_buffer = wgpu_device_create_buffer(device, resolve_desc);
+    # Audit 2026-06-14 [MED-5]: a null buffer handle stored into the
+    # wrapper would later be deref'd inside wgpu-native by resolve/map.
+    # Fail loudly, releasing the resources already acquired.
+    if (resolve_buffer == 0) {
+        wgpu_query_set_release(qs);
+        return gpu_err_result_msg(GPU_ERR_OTHER, "wgpuDeviceCreateBuffer (timestamp_resolve) returned null");
+    }
 
     # 3. Read buffer: COPY_DST | MAP_READ
     var read_usage = WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_MAP_READ;
     var read_desc = wgpu_buffer_descriptor("timestamp_read",
     read_usage, buffer_size, 0);
     var read_buffer = wgpu_device_create_buffer(device, read_desc);
+    if (read_buffer == 0) {
+        wgpu_buffer_release(resolve_buffer);
+        wgpu_query_set_release(qs);
+        return gpu_err_result_msg(GPU_ERR_OTHER, "wgpuDeviceCreateBuffer (timestamp_read) returned null");
+    }
 
     # 4. Record the hardware timestamp period
     var period_bits = wgpu_queue_get_timestamp_period_bits(queue);
@@ -117,6 +129,9 @@ fn gpu_timestamps_resolve(ts, encoder, query_count): i64 {
     var max = load64(ts + 24);
     var count = query_count;
     if (count > max) { count = max; }
+    # Audit [LOW-6]: a negative count would feed count*8 as a huge u64
+    # size to wgpu resolve/copy.
+    if (count < 0)   { count = 0; }
     var qs      = load64(ts + 0);
     var resolve = load64(ts + 8);
     var read    = load64(ts + 16);
@@ -134,6 +149,7 @@ fn gpu_timestamps_map(ts, device, query_count): i64 {
     var max = load64(ts + 24);
     var count = query_count;
     if (count > max) { count = max; }
+    if (count < 0)   { count = 0; }   # Audit [LOW-6]: see gpu_timestamps_resolve
     var read = load64(ts + 16);
     var status = wgpu_buffer_map_sync(device, read, WGPU_MAP_MODE_READ, 0, count * 8);
     if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {

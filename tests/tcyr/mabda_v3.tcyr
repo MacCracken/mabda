@@ -730,6 +730,29 @@ fn test_gpu_compute_dispatch_null_ctx_returns_err() {
     return 0;
 }
 
+# Audit 2026-06-14 [MED-3]: the v3 gpu_compute_dispatch dropped the
+# workgroup-count validation its v2 sibling compute_dispatch enforces.
+# Restored — invalid counts must be rejected BEFORE the slot fires (and
+# before they bake into a PM4 dispatch + CS submit on native).
+fn test_gpu_compute_dispatch_rejects_bad_dims() {
+    _step3g_dispatch_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_step3g_dispatch_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0 - 1, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x<0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 0, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "y=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 1, 0, 0), GPU_ERR_WORKGROUP_LIMIT, "z=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 65536, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x>65535 rejected");
+    assert_eq(_step3g_dispatch_count, 0, "slot never reached for invalid dims");
+    # a valid dispatch still flows through to the slot
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 64, 1, 1, 0), 0xD15A, "valid dispatch reaches slot");
+    assert_eq(_step3g_dispatch_count, 1, "slot fired once for valid dims");
+    return 0;
+}
+
 # ================================================================
 # v3 Step 4c — native Backend slot wrappers + builder
 # ================================================================
@@ -1416,6 +1439,66 @@ fn test_gpu_texture_create_dispatches_through_backend() {
     assert_eq(_step57_create_ctx, ctx, "arg 1 = ctx");
     assert_eq(_step57_create_w, 64, "arg 2 = width");
     assert_eq(_step57_create_h, 32, "arg 3 = height");
+    return 0;
+}
+
+# Audit 2026-06-14 [HIGH-1]: the v3 gpu_texture_create_2d_rgba8 dropped
+# the dimension validation its v2 sibling texture_create_rgba8 enforces.
+# Restored — non-positive / oversized dims must be rejected (returning 0)
+# BEFORE the slot fires, so an unvalidated width*height*4 never reaches
+# the native GEM_CREATE ioctl + mmap.
+fn test_gpu_texture_create_2d_rgba8_validates_dims() {
+    _step57_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, &_step57_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 0, 16), 0, "width=0 rejected");
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 16, 0 - 1), 0, "height<0 rejected");
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 100000, 100000), 0, "oversized rejected (no overflow to slot)");
+    assert_eq(_step57_create_count, 0, "slot never reached for invalid dims");
+    var t = gpu_texture_create_2d_rgba8(ctx, 256, 256);
+    assert_eq(t, 0xCAFE, "valid dims reach slot");
+    assert_eq(_step57_create_count, 1, "slot fired once for valid dims");
+    return 0;
+}
+
+# Audit 2026-06-14 [HIGH-3]/[MED-4]: WGSL shader source must not be
+# truncated at the 4 KiB label cap. wgpu_shader_source_wgsl_len writes the
+# exact caller-supplied length; the cstr path scans up to the (1 MiB)
+# shader-source cap, not WGPU_LABEL_MAX_BYTES.
+fn test_wgsl_source_explicit_length() {
+    var src = wgpu_shader_source_wgsl_len(0xCAFE, 9000);
+    # WGPUShaderSourceWGSL.code StringView at +16: data @ +16, length @ +24.
+    assert_eq(load64(src + 16), 0xCAFE, "source data ptr stored");
+    assert_eq(load64(src + 24), 9000, "explicit length stored uncapped");
+    return 0;
+}
+
+fn test_wgsl_source_cstr_not_truncated_at_4k() {
+    var n = 5000;
+    var buf = alloc(n + 1);
+    memset(buf, 65, n);        # 'A' filler — no embedded NUL
+    store8(buf + n, 0);        # NUL terminator at byte 5000
+    var src = wgpu_shader_source_wgsl(buf);
+    assert_eq(load64(src + 24), 5000, "5000-byte WGSL source not capped at 4096");
+    return 0;
+}
+
+# Audit 2026-06-14 (defense-in-depth, CVE-2026-46220 class):
+# native_cs_submit_4chunk rejects a non-DWORD-aligned fence writeback
+# offset with -EINVAL BEFORE issuing the CS ioctl, so a future caller (or
+# an SDMA submit path) can't trip the kernel's BUG_ON(addr & 0x3). The
+# guard returns before touching the fd — safe to drive with a dummy fd.
+fn test_cs_submit_rejects_unaligned_fence_offset() {
+    var bo_list_in[24];
+    memset(&bo_list_in, 0, 24);
+    # fence_offset is the 9th arg; 1 and 3 are non-DWORD-aligned -> -EINVAL.
+    assert_eq(native_cs_submit_4chunk(0, 0, &bo_list_in, 0, 0,
+    AMDGPU_HW_IP_COMPUTE, 0, 0, 1, 0), 0 - 22, "fence_offset=1 rejected (-EINVAL)");
+    assert_eq(native_cs_submit_4chunk(0, 0, &bo_list_in, 0, 0,
+    AMDGPU_HW_IP_COMPUTE, 0, 0, 3, 0), 0 - 22, "fence_offset=3 rejected (-EINVAL)");
     return 0;
 }
 
@@ -2832,6 +2915,7 @@ fn main() {
     # v3 Step 3g — gpu_compute_dispatch (fncall6) (2)
     test_gpu_compute_dispatch_dispatches_through_backend();
     test_gpu_compute_dispatch_null_ctx_returns_err();
+    test_gpu_compute_dispatch_rejects_bad_dims();
 
     # v3 Step 4c — native Backend slot wrappers + builder (6)
     test_backend_native_new_is_complete();
@@ -2893,6 +2977,10 @@ fn main() {
 
     # v3 Step 5.7 — public gpu_texture_* dispatch (5)
     test_gpu_texture_create_dispatches_through_backend();
+    test_gpu_texture_create_2d_rgba8_validates_dims();
+    test_wgsl_source_explicit_length();
+    test_wgsl_source_cstr_not_truncated_at_4k();
+    test_cs_submit_rejects_unaligned_fence_offset();
     test_gpu_texture_write_dispatches_through_backend();
     test_gpu_texture_read_dispatches_through_backend();
     test_gpu_texture_release_dispatches_through_backend();

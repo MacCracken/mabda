@@ -858,6 +858,7 @@ fn main() {
     test_gpu_ctx_wgpu_surface_handle_round_trip();
     test_gpu_ctx_native_card_fd_round_trip();
     test_native_surface_struct_field_offsets();
+    test_native_surface_mark_master_owned();
     test_gpu_surface_configure_wgpu_null_safe();
     test_gpu_surface_configure_native_kiosk_null_safe();
     test_gpu_surface_configure_native_logind_uninit_samvada();
@@ -953,8 +954,14 @@ fn test_native_surface_struct_field_offsets() {
     assert_eq(NATIVE_SURFACE_FRONT_IS_B, 88,  "front_is_b");
     assert_eq(NATIVE_SURFACE_WIDTH,      96,  "width");
     assert_eq(NATIVE_SURFACE_HEIGHT,     100, "height");
-    assert_eq(NATIVE_SURFACE_PITCH,      104, "pitch");
-    assert_eq(NATIVE_SURFACE_SIZE,       120, "size");
+    assert_eq(NATIVE_SURFACE_PITCH,        104, "pitch");
+    # Audit 2026-06-14 [HIGH-2 NEW]: master-fd provenance fields live in
+    # the free tail of the 120-byte struct (master_minor ends at +116).
+    assert_eq(NATIVE_SURFACE_MASTER_OWNED, 108, "master_owned");
+    assert_eq(NATIVE_SURFACE_MASTER_MINOR, 112, "master_minor");
+    assert_eq(NATIVE_SURFACE_SIZE,         120, "size");
+    assert(NATIVE_SURFACE_MASTER_MINOR + 4 <= NATIVE_SURFACE_SIZE,
+    "provenance fields fit within the struct");
     # Sanity: scanout + 40-byte size = fb_b offset; fb_b + 32 = front_is_b.
     assert_eq(NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_SIZE,
     NATIVE_SURFACE_FB_B,
@@ -962,6 +969,23 @@ fn test_native_surface_struct_field_offsets() {
     assert_eq(NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_SIZE,
     NATIVE_SURFACE_FRONT_IS_B,
     "fb_b-end aligns with front_is_b");
+    return 0;
+}
+
+# Audit 2026-06-14 [HIGH-2 NEW]: a logind/samvada-acquired master fd is
+# mabda-owned and must be released + closed by gpu_surface_release.
+# native_surface_mark_master_owned records the provenance the release
+# path reads; the kiosk path leaves it 0 (consumer owns the fd).
+fn test_native_surface_mark_master_owned() {
+    var surf[120];
+    memset(&surf, 0, 120);
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 0, "default: not mabda-owned");
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 0, "default minor 0");
+    native_surface_mark_master_owned(&surf, 1);
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 1, "marked mabda-owned");
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 1, "minor recorded");
+    # null surface is a safe no-op
+    assert_eq(native_surface_mark_master_owned(0, 1), 0 - 1, "null surface returns -1");
     return 0;
 }
 

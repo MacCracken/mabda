@@ -17,6 +17,13 @@
 # us a non-null-terminated pointer. Audit LOW-4.
 var WGPU_LABEL_MAX_BYTES = 4096;
 
+# Bounded shader-SOURCE strlen ceiling. Distinct from the 4 KB label cap:
+# real WGSL compute/render shaders routinely exceed 4 KB, so bounding the
+# source NUL-scan at the label cap silently truncated them mid-token.
+# 1 MiB is generous for any realistic shader while still preventing a
+# runaway scan on a non-terminated pointer. Audit 2026-06-14 [HIGH-3].
+var WGPU_SHADER_SOURCE_MAX_BYTES = 1048576;
+
 # Read at most `max` bytes from `cstr`; return the index of the
 # first NUL or `max`, whichever comes first. Used by the bounded
 # string-view writer below.
@@ -173,11 +180,28 @@ fn wgpu_buffer_descriptor(label, usage, size, mapped): i64 {
 #   +16: code (StringView = 16)
 # ================================================================
 
+# Build from a NUL-terminated WGSL source string (the v2 cstr-shader
+# path). Audit 2026-06-14 [HIGH-3]: bound the NUL scan at the
+# shader-source cap, NOT WGPU_LABEL_MAX_BYTES — the latter truncated any
+# shader >= 4 KiB. Callers that already know the exact byte length should
+# use wgpu_shader_source_wgsl_len to skip the scan entirely.
 fn wgpu_shader_source_wgsl(wgsl_code): i64 {
     var src = alloc(32);
     memset(src, 0, 32);
     wgpu_chained_struct(src, WGPU_STYPE_SHADER_SOURCE_WGSL);
-    wgpu_string_view(src + 16, wgsl_code);
+    var len = _wgpu_strnlen(wgsl_code, WGPU_SHADER_SOURCE_MAX_BYTES);
+    wgpu_string_view_len(src + 16, wgsl_code, len);
+    return src;
+}
+
+# Build with an explicit byte length (the v3 gpu_shader_module_create
+# path threads `n` all the way here). No NUL scan, no cap — the caller
+# supplied the exact length. Audit 2026-06-14 [HIGH-3]/[MED-4].
+fn wgpu_shader_source_wgsl_len(wgsl_code, n): i64 {
+    var src = alloc(32);
+    memset(src, 0, 32);
+    wgpu_chained_struct(src, WGPU_STYPE_SHADER_SOURCE_WGSL);
+    wgpu_string_view_len(src + 16, wgsl_code, n);
     return src;
 }
 

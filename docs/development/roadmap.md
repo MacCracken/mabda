@@ -1,9 +1,12 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 30 domain modules, ~4,500 lines, 387 CPU assertions + 4 GPU
-> integration programs + 13 GPU benchmarks. `dist/mabda.cyr`
-> bundle at ~4,900 lines.
+> 38 domain modules, ~12,500 lines, 1991 CPU assertions across 3 test
+> files + 10 GPU integration programs + 9 CPU benches + 13 GPU
+> benchmarks. `dist/mabda.cyr` bundle at ~12,500 lines.
+>
+> _Header stats current as of the 3.0.4 P(-1) hardening pass
+> (full-surface audit 2026-06-14; see `docs/audit/2026-06-14-audit.md`)._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
@@ -233,7 +236,7 @@ multi-day observation that informs the post-GA patch stream.
   `programs/render_graph_e2e.cyr` all pass under both backends.
 - On NVIDIA / Intel / macOS / Windows: same programs pass under the
   `wgpu` backend (regression check — native is not expected to run).
-- All 387 CPU assertions + 13 GPU benches pass under both backends
+- All 1991 CPU assertions + 13 GPU benches pass under both backends
   on AMD (CPU assertions are backend-agnostic and should be untouched).
 - soorat / rasa / ranga / bijli / aethersafta / kiran continue to
   build and run under the `wgpu` default on every supported platform;

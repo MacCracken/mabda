@@ -997,6 +997,34 @@ fn test_pipeline_cache_large_key() {
     return 0;
 }
 
+# Audit 2026-06-14 [HIGH-4]: caller keys 0 (MAP_U64_EMPTY) and
+# 0xFFFFFFFFFFFFFFFF (MAP_U64_TOMB) collided with map_u64's reserved
+# in-band sentinels and were silently dropped. _cache_safe_key remaps
+# them so set/get/has round-trip. This test would have failed before the
+# fix (every get returned 0).
+fn test_cache_sentinel_keys() {
+    var pc = pipeline_cache_new();
+    pipeline_cache_set(pc, 0, 0x1111);
+    assert_eq(pipeline_cache_get(pc, 0), 0x1111, "pipeline key=0 round-trip");
+    assert_eq(pipeline_cache_has(pc, 0), 1, "pipeline key=0 has");
+    pipeline_cache_set(pc, 0xFFFFFFFFFFFFFFFF, 0x2222);
+    assert_eq(pipeline_cache_get(pc, 0xFFFFFFFFFFFFFFFF), 0x2222, "pipeline key=MAX round-trip");
+    assert_eq(pipeline_cache_has(pc, 0xFFFFFFFFFFFFFFFF), 1, "pipeline key=MAX has");
+    # the two remapped sentinels must not alias each other
+    assert_eq(pipeline_cache_get(pc, 0), 0x1111, "key=0 unaffected by key=MAX");
+    # a normal key still works alongside the remapped sentinels
+    pipeline_cache_set(pc, 42, 0x3333);
+    assert_eq(pipeline_cache_get(pc, 42), 0x3333, "normal key alongside sentinels");
+
+    var bc = bind_group_cache_new();
+    bind_group_cache_set(bc, 0, 0xAAAA);
+    assert_eq(bind_group_cache_get(bc, 0), 0xAAAA, "bind_group key=0 round-trip");
+    assert_eq(bind_group_cache_has(bc, 0), 1, "bind_group key=0 has");
+    bind_group_cache_set(bc, 0xFFFFFFFFFFFFFFFF, 0xBBBB);
+    assert_eq(bind_group_cache_get(bc, 0xFFFFFFFFFFFFFFFF), 0xBBBB, "bind_group key=MAX round-trip");
+    return 0;
+}
+
 # ================================================================
 # bind_group_cache get/set/has
 # ================================================================
@@ -1049,26 +1077,16 @@ fn test_bind_group_cache_clear_returns_fresh() {
 # so we inline just the constants + pure helpers we want to test.
 
 # ================================================================
-# Present mode preferences — copied from surface.cyr
+# Present mode preferences + present_mode_to_wgpu
 # ================================================================
-var PRESENT_VSYNC     = 0;
-var PRESENT_NO_VSYNC  = 1;
-var PRESENT_IMMEDIATE = 2;
-var PRESENT_MAILBOX   = 3;
-
-# WGPUPresentMode v29 values
-var WGPU_PRESENT_MODE_FIFO         = 1;
-var WGPU_PRESENT_MODE_FIFO_RELAXED = 2;
-var WGPU_PRESENT_MODE_IMMEDIATE    = 3;
-var WGPU_PRESENT_MODE_MAILBOX      = 4;
-
-fn present_mode_to_wgpu(pref) {
-    if (pref == PRESENT_VSYNC)     { return WGPU_PRESENT_MODE_FIFO; }
-    if (pref == PRESENT_NO_VSYNC)  { return WGPU_PRESENT_MODE_FIFO_RELAXED; }
-    if (pref == PRESENT_IMMEDIATE) { return WGPU_PRESENT_MODE_IMMEDIATE; }
-    if (pref == PRESENT_MAILBOX)   { return WGPU_PRESENT_MODE_MAILBOX; }
-    return WGPU_PRESENT_MODE_FIFO;
-}
+# Audit 2026-06-14 [MED-6]: these (PRESENT_*, WGPU_PRESENT_MODE_*, and
+# present_mode_to_wgpu) come from src/surface.cyr via the `include
+# "src/lib.cyr"` at the top of this file. They used to be re-declared
+# here verbatim, which (a) shadowed the production present_mode_to_wgpu
+# under "last definition wins" — so test_present_mode_mapping below
+# validated this file's stale copy, not surface.cyr — and (b) emitted a
+# duplicate-fn build warning against the zero-warning gate. Removed so the
+# tests exercise the real symbols.
 
 # ================================================================
 # Tests
@@ -2602,6 +2620,7 @@ fn main() {
     test_pipeline_cache_set_and_get();
     test_pipeline_cache_distinct_keys();
     test_pipeline_cache_large_key();
+    test_cache_sentinel_keys();
     test_bind_group_cache_miss();
     test_bind_group_cache_set_and_get();
     test_bind_group_cache_distinct();
