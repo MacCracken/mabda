@@ -155,6 +155,16 @@ build/render_graph_e2e: build/render_graph_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/render_graph_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+# v3.2 T.8 — wgpu compressed (BC1) create+upload, verified by byte-exact
+# copy-back round-trip. Requires wgpu-native + a BC-capable adapter.
+build/compressed_texture_e2e: build/compressed_texture_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/compressed_texture_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-compressed-texture-e2e
+test-compressed-texture-e2e: build/compressed_texture_e2e
+	./build/compressed_texture_e2e
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
