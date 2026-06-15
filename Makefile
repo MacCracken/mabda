@@ -19,7 +19,11 @@
 #   make clean          — scrub build/
 
 CYRIUS     ?= cyrius
-CC5        ?= cc5
+# The Cyrius C-backend object compiler. Renamed cc5 -> cycc in cyrius 6.1
+# (6.0.x shipped cc5/cc5_aarch64/cc5_win; 6.1+ ship cycc/cycc_aarch64/
+# cycc_win). The wgpu integration programs link against deps/wgpu_main.c
+# and build via this object-mode path. Override with CYCC=... if needed.
+CYCC       ?= cycc
 GCC        ?= gcc
 WGPU_DIR   ?= deps/wgpu-native
 
@@ -115,7 +119,7 @@ test-all: version-check dist test fuzz
 # ---------------------------------------------------------------------------
 # GPU integration tests (require wgpu-native + deps/wgpu_main.c shim)
 #
-# `object;` mode is the one sanctioned direct-cc5 invocation (see CLAUDE.md).
+# `object;` mode is the one sanctioned direct-cycc invocation (see CLAUDE.md).
 # A future `cyrius build --object` (queued upstream for 5.4.10+) will retire it.
 # ---------------------------------------------------------------------------
 
@@ -128,7 +132,7 @@ deps/wgpu_main.o: deps/wgpu_main.c
 # Pattern rule for all programs/*.cyr GPU programs.
 build/%.o: programs/%.cyr src/*.cyr
 	@mkdir -p build
-	printf 'object;\n' | cat - $< | $(CC5) > $@
+	printf 'object;\n' | cat - $< | $(CYCC) > $@
 	objcopy $(LOCALIZE_FLAGS) -L print_num -L println $@
 
 build/phase0: build/phase0.o deps/wgpu_main.o
@@ -223,6 +227,16 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 .PHONY: test-native-compute-store
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
+
+# v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
+# write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
+build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_compressed_store_e2e.cyr $@
+
+.PHONY: test-native-compressed-store
+test-native-compressed-store: build/native_compressed_store_e2e
+	./build/native_compressed_store_e2e
 
 # v3.1 Q.3c — native multi-queue compute: dispatch on a logical COMPUTE
 # queue (async, timeline-signalled), wait via gpu_queue_wait_idle, verify
