@@ -1,0 +1,83 @@
+# @public — texture format breadth (v3.2 Phase T)
+# texture_format.cyr — mabda's backend-agnostic texture format ids +
+# block geometry. Pure Cyrius: no FFI, no syscalls, no HW.
+#
+# This is the foundation of the v3.2.0 compressed-texture work
+# (docs/proposals/v3.2-compressed-textures.md, punchlist Phase T). A
+# `MABDA_TEXFMT_*` id is the format a consumer passes to the (T.5)
+# `gpu_texture_create_2d(ctx, w, h, fmt)` API; T.2 maps each id to its
+# v29 `WGPUTextureFormat` value; T.3 uses the block geometry here for the
+# block-based size math (`ceil(w/bw)*ceil(h/bh)*block_bytes`).
+#
+# Block-compressed formats are addressed in fixed-size texel blocks, not
+# per-texel: BC/ETC2 are 4x4 blocks; ASTC blocks vary (4x4 / 6x6 / 8x8).
+# `block_bytes` is the encoded size of ONE block. Uncompressed RGBA8 is
+# modeled as a 1x1 "block" of 4 bytes so the same block math covers it.
+
+# ================================================================
+# Format ids (stable ABI — consumers pass these to gpu_texture_create_2d)
+# ================================================================
+# RGBA8 is 0 so the uncompressed default is the zero value. The
+# compressed families follow; MABDA_TEXFMT_COUNT bounds validation +
+# iteration. Adding a format appends before COUNT — never renumber.
+enum MabdaTexFmt {
+    MABDA_TEXFMT_RGBA8       = 0;
+    MABDA_TEXFMT_BC1        = 1;   # DXT1  — RGB(+1bit A), 4x4, 8 B
+    MABDA_TEXFMT_BC3        = 2;   # DXT5  — RGBA,         4x4, 16 B
+    MABDA_TEXFMT_BC4        = 3;   # 1-channel,            4x4, 8 B
+    MABDA_TEXFMT_BC5        = 4;   # 2-channel,            4x4, 16 B
+    MABDA_TEXFMT_BC6H       = 5;   # HDR RGB,              4x4, 16 B
+    MABDA_TEXFMT_BC7        = 6;   # RGBA hi-q,            4x4, 16 B
+    MABDA_TEXFMT_ETC2_RGB8  = 7;   # ETC2 RGB,            4x4, 8 B
+    MABDA_TEXFMT_ETC2_RGBA8 = 8;   # ETC2 RGBA,           4x4, 16 B
+    MABDA_TEXFMT_ASTC_4X4   = 9;   # ASTC 4x4,            4x4, 16 B
+    MABDA_TEXFMT_ASTC_6X6   = 10;  # ASTC 6x6,            6x6, 16 B
+    MABDA_TEXFMT_ASTC_8X8   = 11;  # ASTC 8x8,            8x8, 16 B
+    MABDA_TEXFMT_COUNT      = 12;
+}
+
+# ================================================================
+# Block geometry accessors
+# ================================================================
+# All return 0 for an out-of-range / unknown id (callers treat
+# block_bytes == 0 as "invalid format"). Every compressed format mabda
+# ships has a square block, so block_width == block_height; both
+# accessors exist so the block math reads symmetrically and a future
+# non-square format only touches one of them.
+
+# 1 if `fmt` is a block-compressed format, 0 for RGBA8 or an invalid id.
+fn mabda_texfmt_is_compressed(fmt): i64 {
+    if (fmt <= MABDA_TEXFMT_RGBA8) { return 0; }   # RGBA8 (0) or negative
+    if (fmt >= MABDA_TEXFMT_COUNT) { return 0; }   # out of range
+    return 1;
+}
+
+# Block width in texels (1 for uncompressed; 4/6/8 for compressed).
+fn mabda_texfmt_block_width(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)     { return 1; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6)  { return 6; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 4; }
+    return 0;
+}
+
+# Block height in texels (square blocks today, so == block_width).
+fn mabda_texfmt_block_height(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)     { return 1; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6)  { return 6; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 4; }
+    return 0;
+}
+
+# Encoded bytes of ONE block (4 for RGBA8's 1x1 "block"). The 8-byte
+# compressed formats are BC1, BC4, and ETC2_RGB8; every other compressed
+# format is 16 bytes/block (including all ASTC, regardless of block dims).
+fn mabda_texfmt_block_bytes(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)      { return 4; }
+    if (fmt == MABDA_TEXFMT_BC1)        { return 8; }
+    if (fmt == MABDA_TEXFMT_BC4)        { return 8; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 16; }
+    return 0;
+}
