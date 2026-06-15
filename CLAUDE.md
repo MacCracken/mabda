@@ -10,7 +10,7 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 5.11.28+ (`cyrius.cyml: cyrius = "5.11.28"`)
+- **Language**: Cyrius 6.2.6+ (`cyrius.cyml: cyrius = "6.2.6"`)
 - **Version**: 3.0.0-rc.2 in tree — official 3.0.0 ships after the
   rc.3 (≤6h soak proof) and rc.4 (24h → 3-day soak) cuts. rc.2
   closed out the audit punchlist
@@ -460,7 +460,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.11.28"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.6"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts
