@@ -6,8 +6,9 @@
 > 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle at
 > ~12,500 lines.
 >
-> _Header stats current as of the v3.1 mipmap work (2026-06-15): native
-> mipmap generation HW-verified on Cezanne; tests reorganized by domain._
+> _Header stats current as of v3.1.1 (2026-06-15): mipmaps (3.1.0) +
+> multi-queue (3.1.1) shipped, native HW-verified on Cezanne; v3.2 arc
+> (texture & shader breadth) planned, `v3.2` branch cut, not yet started._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
@@ -53,8 +54,10 @@ cross-vendor default.
   v3.0             ─▶  dual-backend — native Cyrius (AMD/amdgpu/GFX9)
                         added alongside wgpu+C; API unchanged; A/B
                         bench matrix
-  v3.1             ─▶  mipmaps (3.1.0) + multi-queue (3.1.1+) — arc
-  v3.2             ─▶  compressed textures + SPIR-V + f64 compute (texture/shader breadth)
+  v3.1   [SHIPPED] ─▶  mipmaps (3.1.0) + multi-queue (3.1.1) — arc done
+  v3.2   [ACTIVE]  ─▶  compressed textures (3.2.0 SHIPPED) + SPIR-V +
+                        native SPIR-V→GFX9 compiler (3.2.2–3.2.6) +
+                        f64 compute (3.2.4/3.2.7+) — texture/shader breadth
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
@@ -218,12 +221,12 @@ The path from rc.2 → 3.0.0 was re-shaped 2026-05-12 to split the
 soak window across two rc cuts:
 
 - **rc.3** — ≤6h burn-in proof (the dirty-fast gate). Detail in
-  [`3-0-rc-3-punchlist.md`](3-0-rc-3-punchlist.md).
+  [`3-0-rc-3-punchlist.md`](../archive/punchlists/3-0-rc-3-punchlist.md).
 - **rc.4** — 24h → 3-day soak. **24h-clean is the earliest cut
   for 3.0.0 GA.** The 3-day window is the focus of the first few
   3.0.x patches (anything surfacing between 24h and 72h goes to
   the patch backlog, not the GA gate). Detail in
-  [`3-0-rc-4-punchlist.md`](3-0-rc-4-punchlist.md).
+  [`3-0-rc-4-punchlist.md`](../archive/punchlists/3-0-rc-4-punchlist.md).
 
 This split keeps regressions cheap to catch (you spend 6h, not 3
 days, before learning something is broken) while preserving the
@@ -258,7 +261,7 @@ home now that the v3.0 backend abstraction exists. They are
 first. Planned 2026-06-15 (subsystem map + design decisions); see the
 **punchlist** and two **design proposals**:
 
-- Punchlist: [`3-1-punchlist.md`](3-1-punchlist.md)
+- Punchlist (archived, shipped): [`3-1-punchlist.md`](../archive/punchlists/3-1-punchlist.md)
 - Mipmaps: [`docs/proposals/v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md)
 - Multi-queue: [`docs/proposals/v3.1-multiqueue.md`](../proposals/v3.1-multiqueue.md)
 
@@ -309,26 +312,98 @@ transfer).
 
 ## v3.2 — Texture & Shader Breadth
 
-- **Compressed textures (BC / ETC2 / ASTC)** — format enums,
-  validation, upload path. Builds on the texture FFI (now native).
-  Driven by kiran and aethersafta's asset sizes.
-- **SPIR-V shader support** — alternative path to WGSL. Shader
-  cache keyed on source kind. Reuses `shader_cache.cyr`.
-- **f64 (double-precision) compute** — gated on the SPIR-V path above.
-  WGSL has no f64 (gpuweb #2805, deferred Milestone 4+), but SPIR-V +
-  Vulkan's `shaderFloat64` does; expose it as an optional, driver-gated
-  device capability (wgpu surfaces it as the `SHADER_F64` feature —
-  native Vulkan only, not WebGPU / Metal / DX12). Consumer:
-  **attn11** (the f64, hand-derived, grad-checked transformer — its GPU
-  compute backend needs f64 to preserve the CPU f64 oracle every op is
-  validated against; the f32-only WGSL path cannot carry it). Caveats to
-  document for consumers: f64 is ~16–64× slower than f32 on consumer RDNA
-  (FP64-throttled, ~1:16–1:32) and full-rate only on CDNA/Instinct (FP64
-  MFMA, 1:1 matrix via `V_MFMA_F64`); naga may not validate f64, so a raw
-  SPIR-V passthrough may be required. The fully-sovereign, full-rate route
-  — f64 compute on the **native AMD GFX9+ PM4 path** (CDNA `V_MFMA_F64`) —
-  is the heavier follow-on once native compute dispatch is mature (v3.x+ /
-  alongside the v4 native expansion).
+A sequenced **3.2.x arc** (maintainer decisions 2026-06-15): the roadmap's
+texture/shader breadth — **compressed textures → SPIR-V → f64**, SPIR-V/f64
+on **both backends** (which pulls the native **SPIR-V → GFX9 compiler**,
+Phase N, into the line) — **plus** every item that would otherwise have
+been deferred: native compressed *sampling*, the v3.1.2 TRANSFER/buffer-copy
+work, and render-graph multi-queue. **Nothing in this arc defers to v3.3 or
+v4** — the arc grows to fit (**3.2.0 → 3.2.13**). The two items blocked only
+by absent dev-box hardware (ASTC/ETC2 native decode; full-rate `V_MFMA_F64`)
+ship their code in-arc with the HW-verification gap flagged in the
+punchlist, not dropped. Planned 2026-06-15 (subsystem map + seven design
+proposals); see the **punchlist** + **proposals**:
+
+- Punchlist: [`3-2-punchlist.md`](3-2-punchlist.md)
+- Compressed textures (storage): [`v3.2-compressed-textures.md`](../proposals/v3.2-compressed-textures.md)
+- TRANSFER + buffer-copy: [`v3.2-transfer-copy.md`](../proposals/v3.2-transfer-copy.md)
+- Native compressed sampling: [`v3.2-native-compressed-sampling.md`](../proposals/v3.2-native-compressed-sampling.md)
+- SPIR-V (wgpu): [`v3.2-spirv-ingestion-wgpu.md`](../proposals/v3.2-spirv-ingestion-wgpu.md)
+- SPIR-V → GFX9 native compiler: [`v3.2-spirv-gfx9-native-lowering.md`](../proposals/v3.2-spirv-gfx9-native-lowering.md)
+- f64 compute: [`v3.2-f64-compute.md`](../proposals/v3.2-f64-compute.md)
+- Render-graph multi-queue: [`v3.2-render-graph-multiqueue.md`](../proposals/v3.2-render-graph-multiqueue.md)
+
+The version map + bite-level steps live in the punchlist. Phase summaries:
+
+### 3.2.0 — Compressed textures, storage (Phase T) — ✅ SHIPPED 2026-06-15
+
+BC1–BC7 / ETC2 / ASTC: format enums + v29 `WGPUTextureFormat` mapping,
+block-based size math/validation, format-parameterized create/upload,
+capability gating. wgpu is full (create/upload/bind/sample). Native ships
+storage + readback this minor; **native compressed *sampling* lands in
+Phase TS (3.2.2–3.2.3), in this arc** — it is not deferred. Consumers:
+kiran, aethersafta.
+
+### 3.2.1 — TRANSFER ring + public buffer-copy (Phase X)
+
+Absorbs the v3.1.2 carryover. Real native `gpu_buffer_*` (create/write/
+read/release are stubs today); `_native_queue_kind_to_ring(TRANSFER)`
+flips to `AMDGPU_HW_IP_DMA`; public `gpu_buffer_copy` /
+`gpu_queue_transfer_copy` on both backends (native SDMA `COPY_LINEAR`,
+already HW-proven; wgpu `copyBufferToBuffer`).
+
+### 3.2.2–3.2.3 — Native compressed (and general) sampling (Phase TS)
+
+Re-introduces the GFX9 **T# image descriptor + S# sampler + tiled surface +
+`image_sample`** path the v3.1 mipmap pivot deleted — native AMD can now
+*sample* textures. Uncompressed (linear + T#/S#) sampling MVP first
+(3.2.2), then the tiled-swizzle compressed path (BC on Cezanne, 3.2.3);
+ETC2/ASTC native decode is a flagged HW-verification gap (code ships, cap
+bit gated on silicon). Strikes Phase T's native storage-only limitation.
+
+### 3.2.4 — SPIR-V ingestion, wgpu path (Phase S)
+
+An explicit shader **source-kind tag** (WGSL / SPIR-V / GFX9-ISA) on the
+byte-polymorphic boundary; `gpu_shader_module_create_spirv` +
+`WGPUShaderSourceSPIRV` (codeSize in **words**) + source-kind-aware cache +
+the consumer launcher gate. Native SPIR-V is Phase N. HW e2e is render-path
+(wgpu compute is still a v3.0 stub).
+
+### 3.2.5–3.2.9 — SPIR-V → GFX9 native compiler (Phase N)
+
+**The dominant, highest-risk effort** — an in-tree, compute-only,
+GFX9/Cezanne-only SPIR-V → GFX9 compiler behind the existing shader slot
+(no new slot), its own AGNOS package. Staged: encoder-lift + byte-oracle
+(N.0) → parser (N.1) → MIR + uniformity (N.2) → instruction selection
+(N.3) → regalloc + waitcnt (N.4) → **MVP: recompile the downsample shader
+from SPIR-V and byte-match it** (N.5) → novel kernel (N.6) → control flow
+(N.7) → op breadth (N.8). A compiler emits bytes no human checked for
+inputs no human saw — the entire mitigation is *manufactured oracles*. The
+hand-authored shaders stay as oracle + fallback.
+
+### 3.2.10–3.2.11 — f64 (double-precision) compute (Phase F)
+
+Consumer: **attn11**. f64 hard-gates on SPIR-V on both backends — there is
+**no** `WGPUFeatureName_ShaderF64` and WGSL has no f64 (gpuweb #2805); the
+only routes are wgpu `SpirvShaderPassthrough` + Vulkan `shaderFloat64`, and
+the Phase N native emitter. The wgpu path + a native hand-authored f64
+reference kernel (`V_FMA_F64`, HW-proven on Cezanne, decoupled from Phase N)
+land at 3.2.10; **general native f64 routes consumer SPIR-V through Phase N
+and is a committed 3.2.11 minor** (Phase N is also in-arc). Correctness,
+not speed, is the deliverable: f64 is ~1:16–1:32 on Cezanne; full-rate
+`V_MFMA_F64` needs CDNA (no dev-box silicon → code ships, HW-verification
+flagged in the punchlist). naga may not validate f64 → raw SPIR-V
+passthrough. (The earlier "`SHADER_F64` feature" framing was wrong for
+wgpu-native v29 — corrected here.)
+
+### 3.2.12–3.2.13 — Render-graph multi-queue scheduling (Phase R)
+
+Absorbs the v3.1.2 carryover. The v2.5 render graph is single-submit; this
+adds per-node queue affinity + cross-queue fence edges (lowered to the
+v3.1.1 `gpu_queue_barrier` in-CS timeline waits) + per-queue submit
+batching — composing the existing queue primitives (no new Backend slots).
+Multi-queue is opt-in (omitting affinity reproduces v2.5 ordering exactly);
+wgpu is serialized-equivalent, native gets real overlap.
 
 ---
 

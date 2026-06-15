@@ -1,0 +1,106 @@
+# programs/native_compressed_store_e2e.cyr — v3.2 T.8 (native storage)
+#
+# End-to-end native block-compressed texture STORAGE round-trip on real AMD
+# hardware. Native textures are LINEAR GTT BOs, so a compressed texture is
+# opaque block bytes the CPU writes + reads back byte-identical via memcpy
+# (the BO's bytes ARE the data). This proves the v3.2.0 native compressed
+# path: gpu_texture_create_2d(fmt) -> block-sized page-aligned BO ->
+# gpu_texture_write/read against the logical block size.
+#
+# Native CANNOT sample a compressed texture this minor (no T#/sampler path
+# — that's Phase TS); there is no native sample/bind API to call, so this
+# program validates STORAGE + READBACK only, which is the complete native
+# contract for 3.2.0 (asset staging / transfer round-trips).
+#
+# Exit codes:
+#   0  — BC1 (8x8) and BC7 (16x16) round-trip byte-identical
+#   1  — gpu_context_new_native failed
+#   2  — BC1 create returned 0
+#   3  — BC1 write returned non-zero
+#   4  — BC1 read returned non-zero
+#   5  — BC1 byte mismatch
+#   6  — BC1 wrong-size write was NOT rejected (guard regression)
+#   7  — BC7 create returned 0
+#   8  — BC7 round-trip failed / mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Round-trip `fmt` at w x h through create/write/read; verify byte-exact.
+# Returns 0 on success, or a stage code (2/3/4/5) on failure.
+fn roundtrip_fmt(ctx, w, h, fmt): i64 {
+    var n = mabda_texfmt_data_size(fmt, w, h);
+    var tex = gpu_texture_create_2d(ctx, w, h, fmt);
+    if (tex == 0) { return 2; }
+    # Build a known per-dword pattern in src.
+    var src[1024];
+    var dst[1024];
+    memset(&src, 0, 1024);
+    memset(&dst, 0, 1024);
+    var dwords = n / 4;
+    var i = 0;
+    while (i < dwords) { store32((&src) + i * 4, 0xBC000000 + i); i = i + 1; }
+    if (gpu_texture_write(ctx, tex, &src, n) != 0) { return 3; }
+    if (gpu_texture_read(ctx, tex, &dst, n) != 0)  { return 4; }
+    var j = 0;
+    while (j < dwords) {
+        if (load32((&dst) + j * 4) != 0xBC000000 + j) { return 5; }
+        j = j + 1;
+    }
+    gpu_texture_release(ctx, tex);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native COMPRESSED store e2e (v3.2 T.8)\n");
+    print_cstr("--------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+
+    # ---- BC1 8x8 (2x2 blocks * 8 B = 32 bytes) ----
+    print_cstr("BC1 8x8 data_size="); print_i64(mabda_texfmt_data_size(MABDA_TEXFMT_BC1, 8, 8));
+    print_cstr("\n");
+    var rc = roundtrip_fmt(ctx, 8, 8, MABDA_TEXFMT_BC1);
+    if (rc != 0) { print_cstr("FAIL: BC1 stage "); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return rc; }
+    print_cstr("BC1 round-trip byte-identical\n");
+
+    # ---- Wrong-size write must be rejected (block-aware n guard) ----
+    var tex = gpu_texture_create_2d(ctx, 8, 8, MABDA_TEXFMT_BC1);
+    if (tex == 0) { gpu_context_release(ctx); return 2; }
+    var junk[8];
+    memset(&junk, 0, 8);
+    # n=8 != data_size(32) must fail (GPU_ERR_BUFFER), not silently accept.
+    if (gpu_texture_write(ctx, tex, &junk, 8) == 0) {
+        print_cstr("FAIL: wrong-size write accepted\n");
+        gpu_context_release(ctx); return 6;
+    }
+    gpu_texture_release(ctx, tex);
+    print_cstr("wrong-size write rejected (block-aware n guard)\n");
+
+    # ---- BC7 16x16 (4x4 blocks * 16 B = 256 bytes) ----
+    print_cstr("BC7 16x16 data_size="); print_i64(mabda_texfmt_data_size(MABDA_TEXFMT_BC7, 16, 16));
+    print_cstr("\n");
+    rc = roundtrip_fmt(ctx, 16, 16, MABDA_TEXFMT_BC7);
+    if (rc != 0) { print_cstr("FAIL: BC7 stage "); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 8; }
+    print_cstr("BC7 round-trip byte-identical\n");
+
+    gpu_context_release(ctx);
+    print_cstr("OK — native compressed storage round-trips (BC1 + BC7)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

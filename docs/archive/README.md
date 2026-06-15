@@ -20,6 +20,24 @@ a live workqueue. Live items live under `docs/issues/` and
 |------------|--------------------------------------------------------------------------------------|------------|
 | 2026-04-19 | [Render-pass FFI expansion](proposals/2026-04-19-render-pass-ffi.md)                 | v2.4.3 (7 FFI slots, 2 struct-packing shims, `programs/render_e2e.cyr`) |
 
+### Shipped punchlists
+
+Per-arc release punch lists, archived once the arc shipped. Each is the
+original scoping + tick-list, preserved for post-mortem; the authoritative
+record of what shipped is `CHANGELOG.md`.
+
+| Arc   | Punchlist                                                       | Shipped |
+|-------|----------------------------------------------------------------|---------|
+| v3.0  | [`3-0-punchlist.md`](punchlists/3-0-punchlist.md)              | 3.0.0 GA 2026-06-02 |
+| v3.0  | [`3-0-rc-2-punchlist.md`](punchlists/3-0-rc-2-punchlist.md)    | 3.0.0-rc.2 |
+| v3.0  | [`3-0-rc-3-punchlist.md`](punchlists/3-0-rc-3-punchlist.md)    | 3.0.0-rc.3 |
+| v3.0  | [`3-0-rc-4-punchlist.md`](punchlists/3-0-rc-4-punchlist.md)    | 3.0.0-rc.4 (24 h soak) |
+| v3.1  | [`3-1-punchlist.md`](punchlists/3-1-punchlist.md)             | 3.1.0 (mipmaps) + 3.1.1 (multi-queue), 2026-06-15 |
+
+> v3.1's punchlist notes items deferred to **3.1.2** (TRANSFER→SDMA ring
+> flip + public buffer-copy API; render-graph multi-queue scheduling) —
+> still a live backlog, tracked in `docs/development/roadmap.md`.
+
 Cross-reference the `CHANGELOG.md` entries for the release each item
 shipped in; this directory is just the original analysis / scoping
 document, preserved for context.

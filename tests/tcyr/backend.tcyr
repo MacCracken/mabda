@@ -499,7 +499,13 @@ fn test_backend_struct_layout() {
     assert_eq(BACKEND_QUEUE_SLOTS_END,                    248, "queue range ends 248");
     assert_eq(BACKEND_QUEUE_SLOTS_BEGIN, BACKEND_MIPMAP_SLOTS_END,
     "queue range starts where mipmap range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               248, "total = 248");
+    # v3.2 T.5: texfmt create slot appended at 248..256.
+    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_FMT,         248, "texfmt create at 248");
+    assert_eq(BACKEND_TEXFMT_SLOTS_BEGIN,                 248, "texfmt range begins 248");
+    assert_eq(BACKEND_TEXFMT_SLOTS_END,                   256, "texfmt range ends 256");
+    assert_eq(BACKEND_TEXFMT_SLOTS_BEGIN, BACKEND_QUEUE_SLOTS_END,
+    "texfmt range starts where queue range ends (no gap/overlap)");
+    assert_eq(BACKEND_SIZE,                               256, "total = 256");
     return 0;
 }
 
@@ -634,8 +640,23 @@ fn test_backend_is_complete_detects_missing_slot() {
         backend_set_slot(b, off6, &_backend_smoke_sentinel);
         off6 = off6 + 8;
     }
+    # v0..queue alone no longer complete — v3.2 texfmt range (248..256)
+    # also has a fnptr slot that backend_is_complete checks (T.7).
+    assert_eq(backend_is_complete(b), 0,
+    "v0..queue filled but texfmt range still zero");
+    var off7 = BACKEND_TEXFMT_SLOTS_BEGIN;
+    while (off7 < BACKEND_TEXFMT_SLOTS_END) {
+        backend_set_slot(b, off7, &_backend_smoke_sentinel);
+        off7 = off7 + 8;
+    }
     assert_eq(backend_is_complete(b), 1,
-    "all fnptr slots set across all six ranges -> complete");
+    "all fnptr slots set across all seven ranges -> complete");
+    # Wiping the texfmt slot drops completeness.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT, 0);
+    assert_eq(backend_is_complete(b), 0,
+    "wiped texfmt slot drops completeness");
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT,
+    &_backend_smoke_sentinel);
     # Wiping a queue slot drops completeness.
     backend_set_slot(b, BACKEND_SLOT_QUEUE_BARRIER, 0);
     assert_eq(backend_is_complete(b), 0,
@@ -1101,8 +1122,56 @@ fn test_backend_wgpu_texture_write_size_mismatch_err() {
     store32(&tex + 28, 16);
     var src[64];
     memset(&src, 0, 64);
-    # 16x16 RGBA8 = 1024 bytes; passing 100 mismatches.
+    # 16x16 RGBA8 = 1024 bytes (fmt id 0 at tex+16); passing 100 mismatches.
     assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 100), GPU_ERR_BUFFER, "n != w*h*4");
+    return 0;
+}
+
+# v3.2 T.6 — the unified write slot validates n against the BLOCK size
+# (data_size) for the format stashed at tex+16. The n-mismatch reject
+# happens before the wgpu FFI, so it's CPU-testable; the n==expected path
+# is HW-gated (queue.writeTexture) and exercised by the T.8 e2e.
+fn test_backend_wgpu_texture_write_compressed_block_size() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    var src[64];
+    memset(&src, 0, 64);
+    # BC1 8x8 = 2*2 blocks * 8 B = 32; 31/33 mismatch -> reject pre-FFI.
+    store64(&tex + 16, MABDA_TEXFMT_BC1);
+    store32(&tex + 24, 8);
+    store32(&tex + 28, 8);
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 31), GPU_ERR_BUFFER, "BC1 8x8 n=31 reject");
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 33), GPU_ERR_BUFFER, "BC1 8x8 n=33 reject");
+    # ASTC_6x6 7x7 = ceil(7/6)^2 * 16 = 2*2*16 = 64; 63 mismatch.
+    store64(&tex + 16, MABDA_TEXFMT_ASTC_6X6);
+    store32(&tex + 24, 7);
+    store32(&tex + 28, 7);
+    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 63), GPU_ERR_BUFFER, "ASTC6x6 7x7 n=63 reject");
+    return 0;
+}
+
+# v3.2 T.9 (audit fix): wgpu compressed READBACK via gpu_texture_read needs
+# 256-padded block-row handling not implemented this minor — it must fail
+# loud (NOT_IMPLEMENTED), not mis-validate. Returns before any FFI.
+fn test_backend_wgpu_texture_read_compressed_fail_loud() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex + 16, MABDA_TEXFMT_BC1);   # compressed fmt at +16
+    store32(&tex + 24, 8);
+    store32(&tex + 28, 8);
+    var dst[64];
+    memset(&dst, 0, 64);
+    assert_eq(_backend_wgpu_texture_read(ctx, &tex, &dst, 32),
+    GPU_ERR_NOT_IMPLEMENTED, "wgpu compressed read -> NOT_IMPLEMENTED (fail-loud)");
+    # An uncompressed (RGBA8, fmt 0) tex still takes the normal path: a
+    # size mismatch is rejected with GPU_ERR_BUFFER (not NOT_IMPLEMENTED).
+    store64(&tex + 16, MABDA_TEXFMT_RGBA8);
+    assert_eq(_backend_wgpu_texture_read(ctx, &tex, &dst, 999),
+    GPU_ERR_BUFFER, "RGBA8 read size mismatch -> BUFFER");
     return 0;
 }
 
@@ -1442,6 +1511,8 @@ fn main() {
     test_backend_wgpu_texture_create_zero_dim_returns_zero();
     test_backend_wgpu_texture_write_null_args_err();
     test_backend_wgpu_texture_write_size_mismatch_err();
+    test_backend_wgpu_texture_write_compressed_block_size();
+    test_backend_wgpu_texture_read_compressed_fail_loud();
     test_backend_wgpu_texture_read_null_args_err();
     test_backend_wgpu_texture_release_null_safe();
     test_gpu_texture_create_dispatches_through_backend();

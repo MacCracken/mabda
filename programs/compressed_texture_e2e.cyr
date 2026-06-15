@@ -1,0 +1,124 @@
+# programs/compressed_texture_e2e.cyr — v3.2 T.8 (wgpu compressed)
+#
+# End-to-end wgpu block-compressed texture create + upload, verified on real
+# hardware by a BYTE-EXACT copy-back round-trip. This proves MABDA's wgpu
+# compressed contribution: gpu_texture_create_2d(BC1) makes a texture of the
+# right WGPUTextureFormat, and gpu_texture_write uploads the opaque blocks
+# with the correct block-derived layout (bytesPerRow = blocks_x*block_bytes,
+# rowsPerImage = block_rows) such that copy_texture_to_buffer returns them
+# byte-identical. (HW BC *decode* at sample time is wgpu/Vulkan's job, not
+# mabda's; the full bind+sample demo needs textured-render infra and is
+# tracked separately.)
+#
+# Uses BC1 8x8 = 2x2 blocks = 32 bytes (2 block rows), so the multi-row
+# upload layout + the 256-byte copy-to-buffer row padding are both exercised.
+# Linked with deps/wgpu_main.c via the Makefile target.
+#
+# Skips cleanly if no GPU or the adapter lacks BC (gate via gpu_caps).
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue  = gpu_ctx_queue(_gpu_ctx);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    # --- Gate on BC support (reliably present on desktop AMD) ---
+    var caps_mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(_gpu_ctx));
+    if ((caps_mask & MABDA_TEXCOMP_BC) == 0) {
+        syscall(1, 2, "SKIP: adapter lacks TextureCompressionBC\n", 41);
+        return 0;
+    }
+    syscall(1, 1, "PASS: adapter advertises BC\n", 28);
+
+    # --- 1. Create a BC1 8x8 texture (2x2 blocks, 32 bytes) ---
+    var W = 8;
+    var H = 8;
+    var N = mabda_texfmt_data_size(MABDA_TEXFMT_BC1, W, H);   # 32
+    var tex = gpu_texture_create_2d(_gpu_ctx, W, H, MABDA_TEXFMT_BC1);
+    if (tex == 0) { return _fail("FAIL: BC1 create\n", 17); }
+    var handle = load64(tex + 0);
+    syscall(1, 1, "PASS: BC1 8x8 created\n", 22);
+
+    # --- 2. Build 32 known block bytes (per-dword pattern) + upload ---
+    var src[32];
+    memset(&src, 0, 32);
+    var i = 0;
+    while (i < N / 4) { store32((&src) + i * 4, 0xBC100000 + i); i = i + 1; }
+    if (gpu_texture_write(_gpu_ctx, tex, &src, N) != 0) {
+        return _fail("FAIL: BC1 upload\n", 17);
+    }
+    syscall(1, 1, "PASS: BC1 blocks uploaded\n", 26);
+
+    # --- 3. Copy texture -> MAP_READ buffer (256-byte padded block rows) ---
+    # BC1 8x8: blocks_x=2 -> 16 bytes/block-row, padded to 256; 2 block rows.
+    var BPR = 256;
+    var ROWS = 2;
+    var BUF_SIZE = 512;   # BPR * ROWS
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("bc1-readback", read_usage, BUF_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return _fail("FAIL: readback buffer\n", 22); }
+
+    var enc = wgpu_device_create_command_encoder(device, "bc1-enc");
+    if (enc == 0) { return _fail("FAIL: encoder\n", 14); }
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  handle);     # src_texture
+    store32(cargs + 8,  0);          # mip
+    store32(cargs + 12, 0);          # origin x
+    store32(cargs + 16, 0);          # origin y
+    store32(cargs + 20, 0);          # origin z
+    store32(cargs + 24, 0);          # aspect = All
+    store64(cargs + 32, read_buf);   # dst_buffer
+    store64(cargs + 40, 0);          # dst_offset
+    store32(cargs + 48, BPR);        # dst_bytes_per_row (256-aligned)
+    store32(cargs + 52, ROWS);       # dst_rows_per_image (block rows)
+    store32(cargs + 56, W);          # copy_w (texels)
+    store32(cargs + 60, H);          # copy_h (texels)
+    store32(cargs + 64, 1);          # copy_depth
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+
+    var cmd = wgpu_command_encoder_finish(enc, "bc1-cmd");
+    if (cmd == 0) { return _fail("FAIL: cmd finish\n", 17); }
+    wgpu_queue_submit_one(queue, cmd);
+
+    # --- 4. Map + verify both block rows round-trip byte-identical ---
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("FAIL: map readback\n", 19);
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
+    if (mapped == 0) { return _fail("FAIL: get mapped range\n", 23); }
+
+    # Block-row 0 = src dwords 0..3 at buffer offset 0; block-row 1 = src
+    # dwords 4..7 at buffer offset BPR (256).
+    var bad = 0;
+    var d = 0;
+    while (d < 4) {
+        if (load32(mapped + d * 4) != 0xBC100000 + d) { bad = 1; }
+        if (load32(mapped + BPR + d * 4) != 0xBC100000 + (d + 4)) { bad = 1; }
+        d = d + 1;
+    }
+    wgpu_buffer_unmap(read_buf);
+    if (bad != 0) { return _fail("FAIL: BC1 block bytes did not round-trip\n", 41); }
+    syscall(1, 1, "PASS: BC1 blocks round-trip byte-identical (2 rows, 256-padded)\n", 63);
+
+    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    return 0;
+}

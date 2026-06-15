@@ -45,6 +45,21 @@ long wgpu_shim_request_adapter(WGPUInstance instance, long power_pref, long* res
 // Request device: (adapter, result_ptr) → device handle in *result_ptr
 long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     WGPUDeviceDescriptor desc = WGPU_DEVICE_DESCRIPTOR_INIT;
+    // v3.2 (T.8): enable the block-compressed texture device features the
+    // adapter supports, so consumers can create BC/ETC2/ASTC textures
+    // (wgpuDeviceCreateTexture aborts on a format whose feature is not
+    // enabled at device creation). Requesting a feature the adapter lacks
+    // fails device creation, so filter by wgpuAdapterHasFeature first.
+    WGPUFeatureName feats[3];
+    size_t nfeat = 0;
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionBC))
+        feats[nfeat++] = WGPUFeatureName_TextureCompressionBC;
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionETC2))
+        feats[nfeat++] = WGPUFeatureName_TextureCompressionETC2;
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionASTC))
+        feats[nfeat++] = WGPUFeatureName_TextureCompressionASTC;
+    desc.requiredFeatures = feats;
+    desc.requiredFeatureCount = nfeat;
     WGPURequestDeviceCallbackInfo cb = {
         .mode = WGPUCallbackMode_AllowSpontaneous,
         .callback = c_on_device,

@@ -1,0 +1,195 @@
+# @public — texture format breadth (v3.2 Phase T)
+# texture_format.cyr — mabda's backend-agnostic texture format ids +
+# block geometry. Pure Cyrius: no FFI, no syscalls, no HW.
+#
+# This is the foundation of the v3.2.0 compressed-texture work
+# (docs/proposals/v3.2-compressed-textures.md, punchlist Phase T). A
+# `MABDA_TEXFMT_*` id is the format a consumer passes to the (T.5)
+# `gpu_texture_create_2d(ctx, w, h, fmt)` API; T.2 maps each id to its
+# v29 `WGPUTextureFormat` value; T.3 uses the block geometry here for the
+# block-based size math (`ceil(w/bw)*ceil(h/bh)*block_bytes`).
+#
+# Block-compressed formats are addressed in fixed-size texel blocks, not
+# per-texel: BC/ETC2 are 4x4 blocks; ASTC blocks vary (4x4 / 6x6 / 8x8).
+# `block_bytes` is the encoded size of ONE block. Uncompressed RGBA8 is
+# modeled as a 1x1 "block" of 4 bytes so the same block math covers it.
+
+# ================================================================
+# Format ids (stable ABI — consumers pass these to gpu_texture_create_2d)
+# ================================================================
+# RGBA8 is 0 so the uncompressed default is the zero value. The
+# compressed families follow; MABDA_TEXFMT_COUNT bounds validation +
+# iteration. Adding a format appends before COUNT — never renumber.
+enum MabdaTexFmt {
+    MABDA_TEXFMT_RGBA8       = 0;
+    MABDA_TEXFMT_BC1        = 1;   # DXT1  — RGB(+1bit A), 4x4, 8 B
+    MABDA_TEXFMT_BC3        = 2;   # DXT5  — RGBA,         4x4, 16 B
+    MABDA_TEXFMT_BC4        = 3;   # 1-channel,            4x4, 8 B
+    MABDA_TEXFMT_BC5        = 4;   # 2-channel,            4x4, 16 B
+    MABDA_TEXFMT_BC6H       = 5;   # HDR RGB,              4x4, 16 B
+    MABDA_TEXFMT_BC7        = 6;   # RGBA hi-q,            4x4, 16 B
+    MABDA_TEXFMT_ETC2_RGB8  = 7;   # ETC2 RGB,            4x4, 8 B
+    MABDA_TEXFMT_ETC2_RGBA8 = 8;   # ETC2 RGBA,           4x4, 16 B
+    MABDA_TEXFMT_ASTC_4X4   = 9;   # ASTC 4x4,            4x4, 16 B
+    MABDA_TEXFMT_ASTC_6X6   = 10;  # ASTC 6x6,            6x6, 16 B
+    MABDA_TEXFMT_ASTC_8X8   = 11;  # ASTC 8x8,            8x8, 16 B
+    MABDA_TEXFMT_COUNT      = 12;
+}
+
+# ================================================================
+# Block geometry accessors
+# ================================================================
+# All return 0 for an out-of-range / unknown id (callers treat
+# block_bytes == 0 as "invalid format"). Every compressed format mabda
+# ships has a square block, so block_width == block_height; both
+# accessors exist so the block math reads symmetrically and a future
+# non-square format only touches one of them.
+
+# 1 if `fmt` is a block-compressed format, 0 for RGBA8 or an invalid id.
+fn mabda_texfmt_is_compressed(fmt): i64 {
+    if (fmt <= MABDA_TEXFMT_RGBA8) { return 0; }   # RGBA8 (0) or negative
+    if (fmt >= MABDA_TEXFMT_COUNT) { return 0; }   # out of range
+    return 1;
+}
+
+# Block width in texels (1 for uncompressed; 4/6/8 for compressed).
+fn mabda_texfmt_block_width(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)     { return 1; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6)  { return 6; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 4; }
+    return 0;
+}
+
+# Block height in texels (square blocks today, so == block_width).
+fn mabda_texfmt_block_height(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)     { return 1; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6)  { return 6; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 4; }
+    return 0;
+}
+
+# Encoded bytes of ONE block (4 for RGBA8's 1x1 "block"). The 8-byte
+# compressed formats are BC1, BC4, and ETC2_RGB8; every other compressed
+# format is 16 bytes/block (including all ASTC, regardless of block dims).
+fn mabda_texfmt_block_bytes(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)      { return 4; }
+    if (fmt == MABDA_TEXFMT_BC1)        { return 8; }
+    if (fmt == MABDA_TEXFMT_BC4)        { return 8; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8)  { return 8; }
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return 16; }
+    return 0;
+}
+
+# ================================================================
+# v3.2 T.2 — mabda id -> v29 WGPUTextureFormat value
+# ================================================================
+# The wgpu backend (T.6) hands this value to wgpu_texture_descriptor_*;
+# native ignores it (it keys off the mabda id). Returns 0 for an unknown
+# id — 0 is WGPUTextureFormat_Undefined in v29, so the wgpu path can treat
+# a 0 result as "reject". BC6H maps to the unsigned-float variant
+# (BC6HRGBUfloat); the signed BC6HRGBFloat is not exposed as a separate
+# mabda id today. Each value is the constant from wgpu_types.cyr, itself
+# pinned against webgpu.h v29 line-by-line.
+fn mabda_texfmt_to_wgpu(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8)       { return WGPU_TEXTURE_FORMAT_RGBA8_UNORM; }
+    if (fmt == MABDA_TEXFMT_BC1)         { return WGPU_TEXTURE_FORMAT_BC1_RGBA_UNORM; }
+    if (fmt == MABDA_TEXFMT_BC3)         { return WGPU_TEXTURE_FORMAT_BC3_RGBA_UNORM; }
+    if (fmt == MABDA_TEXFMT_BC4)         { return WGPU_TEXTURE_FORMAT_BC4_R_UNORM; }
+    if (fmt == MABDA_TEXFMT_BC5)         { return WGPU_TEXTURE_FORMAT_BC5_RG_UNORM; }
+    if (fmt == MABDA_TEXFMT_BC6H)        { return WGPU_TEXTURE_FORMAT_BC6H_RGB_UFLOAT; }
+    if (fmt == MABDA_TEXFMT_BC7)         { return WGPU_TEXTURE_FORMAT_BC7_RGBA_UNORM; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8)   { return WGPU_TEXTURE_FORMAT_ETC2_RGB8_UNORM; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGBA8)  { return WGPU_TEXTURE_FORMAT_ETC2_RGBA8_UNORM; }
+    if (fmt == MABDA_TEXFMT_ASTC_4X4)    { return WGPU_TEXTURE_FORMAT_ASTC_4X4_UNORM; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6)    { return WGPU_TEXTURE_FORMAT_ASTC_6X6_UNORM; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8)    { return WGPU_TEXTURE_FORMAT_ASTC_8X8_UNORM; }
+    return 0;   # WGPUTextureFormat_Undefined
+}
+
+# ================================================================
+# v3.2 T.3 — block size math + the dimension/overflow bound
+# ================================================================
+# WebGPU spec minimum maxTextureDimension2D = 8192; larger creations are
+# rejected before hitting the backend (Audit LOW-3). Lives here (the
+# foundation module) so this block math and texture.cyr's
+# validate_dimensions share one bound.
+var MABDA_MAX_TEXTURE_DIM_2D = 8192;
+
+# Number of blocks spanning `dim` texels for a block edge of `b`:
+# ceil(dim / b) = (dim + b - 1) / b. Returns 0 for a non-positive dim or
+# block edge (invalid input).
+fn mabda_texfmt_blocks_for_dim(dim, b): i64 {
+    if (dim <= 0) { return 0; }
+    if (b <= 0)   { return 0; }
+    return (dim + b - 1) / b;
+}
+
+# Total encoded bytes for a w x h texture in `fmt`:
+# blocks_x * blocks_y * block_bytes. Returns 0 on invalid format,
+# non-positive dims, or dims past MABDA_MAX_TEXTURE_DIM_2D.
+#
+# Overflow re-derivation (security checklist, not inferred): both dims are
+# capped at 8192 before the multiply. The largest product is RGBA8's
+# 8192*8192*4 = 268,435,456 B (256 MiB); the compressed worst case is
+# 16 B/block over ceil(8192/4)^2 = 2048*2048 blocks = 67,108,864 B
+# (64 MiB) — compressed is always <= the RGBA8 size for the same dims. Both
+# are far under i64 max, so after the dim cap the bx*by*bytes multiply
+# cannot overflow.
+fn mabda_texfmt_data_size(fmt, w, h): i64 {
+    var bytes = mabda_texfmt_block_bytes(fmt);
+    if (bytes == 0) { return 0; }                       # invalid format
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    if (w > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }     # overflow guard (dim cap)
+    if (h > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }
+    var bx = mabda_texfmt_blocks_for_dim(w, mabda_texfmt_block_width(fmt));
+    var by = mabda_texfmt_blocks_for_dim(h, mabda_texfmt_block_height(fmt));
+    return bx * by * bytes;
+}
+
+# ================================================================
+# v3.2 T.4 — compression families + capability gating
+# ================================================================
+# Compressed formats group into three families that a GPU adapter
+# advertises (or doesn't) as a unit. These are bit FLAGS — the caps
+# bitset (gpu_caps_texture_compression, capabilities.cyr) ORs together
+# the families the active adapter supports. wgpu populates it from
+# WGPUFeatureName_TextureCompression{BC,ETC2,ASTC} (T.6); native leaves it
+# 0 this minor (storage/readback only — sampling is Phase TS).
+var MABDA_TEXCOMP_BC   = 1;
+var MABDA_TEXCOMP_ETC2 = 2;
+var MABDA_TEXCOMP_ASTC = 4;
+
+# The compression family bit for `fmt`, or 0 for uncompressed / invalid.
+fn mabda_texfmt_compression_family(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_BC1)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC3)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC4)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC5)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC6H) { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC7)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8)  { return MABDA_TEXCOMP_ETC2; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGBA8) { return MABDA_TEXCOMP_ETC2; }
+    if (fmt == MABDA_TEXFMT_ASTC_4X4) { return MABDA_TEXCOMP_ASTC; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6) { return MABDA_TEXCOMP_ASTC; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8) { return MABDA_TEXCOMP_ASTC; }
+    return 0;
+}
+
+# 1 if `caps` supports creating/binding a texture of `fmt`, else 0.
+# Uncompressed RGBA8 is always supported. A compressed format needs its
+# family bit set in the caps compression bitset. An invalid id is never
+# supported. Consumers call this BEFORE gpu_texture_create_2d to choose a
+# format or report GPU_ERR_FORMAT_UNSUPPORTED themselves — the pointer-
+# returning create API signals failure only via 0 (it does not return the
+# code), and the wgpu create slot also rejects an adapter-unsupported family
+# before reaching the FFI.
+fn gpu_caps_supports_format(caps, fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 1; }          # uncompressed: always
+    if (mabda_texfmt_is_compressed(fmt) == 0) { return 0; }   # invalid id
+    var fam = mabda_texfmt_compression_family(fmt);
+    if ((gpu_caps_texture_compression(caps) & fam) != 0) { return 1; }
+    return 0;
+}

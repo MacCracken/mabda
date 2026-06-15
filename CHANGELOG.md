@@ -18,6 +18,80 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.0] — 2026-06-15
+
+**Compressed textures (BC / ETC2 / ASTC).** First feature of the v3.2.x
+"texture & shader breadth" arc (`docs/development/3-2-punchlist.md`
+Phase T; `docs/proposals/v3.2-compressed-textures.md`). A consumer creates
+a texture in a block-compressed format and uploads the opaque blocks; the
+upload threads the block-derived layout (`bytesPerRow` in block-rows). Same
+public API both backends — **wgpu** creates + uploads + samples (HW BC
+decode), **native AMD** stores + reads back byte-identical (sampling lands
+in **Phase TS, this arc** — not deferred). HW-verified on Cezanne:
+`native_compressed_store_e2e` (BC1+BC7 round-trip) and the wgpu
+`compressed_texture_e2e` (BC1 byte-exact copy-back). CPU suite 2265 →
+**2434** assertions. Toolchain pin 6.2.8 → **6.2.10**.
+
+### Added
+
+- **`gpu_texture_create_2d(ctx, w, h, fmt)`** — format-parameterized 2D
+  texture create; `gpu_texture_create_2d_rgba8` is the RGBA8 fast path.
+- **`src/texture_format.cyr`** — `MABDA_TEXFMT_*` ids (RGBA8 + BC1/3/4/5/6H/7,
+  ETC2 RGB8/RGBA8, ASTC 4x4/6x6/8x8); block geometry accessors;
+  `mabda_texfmt_to_wgpu` (v29 `WGPUTextureFormat`, header-pinned);
+  `blocks_for_dim`/`data_size` block math with an explicit overflow/dim
+  bound; `MABDA_TEXCOMP_*` families + `gpu_caps_supports_format`.
+- **Capability gating** — `GpuCapabilities` texture-compression bitset +
+  `gpu_caps_texture_compression`; `gpu_caps_detect_texture_compression`
+  (wgpu, from `wgpuAdapterHasFeature`); `GPU_ERR_FORMAT_UNSUPPORTED`.
+- Backend create slot filled on both backends (block-aware wgpu upload;
+  block-sized page-aligned native linear BO). e2e programs +
+  `make test-compressed-texture-e2e` / `test-native-compressed-store`.
+
+### Changed
+
+- `Backend` 248 → 256 B (texfmt create slot); `backend_is_complete` walks it.
+- `GpuCapabilities` 120 → 128 B; `NativeTexture` stashes fmt at +44.
+- The reference launcher (`deps/wgpu_main.c`) now enables the adapter-
+  supported compressed device features at device creation (without it,
+  `wgpuDeviceCreateTexture` aborts on a compressed format).
+- **Toolchain pin 6.2.8 → 6.2.10.**
+
+### Fixed
+
+- **The entire wgpu program suite was un-buildable** — the Makefile called
+  `cc5`, which cyrius 6.1 renamed `cycc`; fixed. Their hand-maintained
+  selective include lists had also rotted (the native backend's
+  `compute`/`queue`/`texture_format` deps outgrew them since v3.1) — all
+  switched to `src/lib.cyr`. `phase0`/`render_e2e`/`compute_e2e` etc. build
+  + run + pass on Cezanne again.
+- P(-1) audit fixes (`docs/audit/2026-06-15-audit.md`): wgpu compressed
+  read fails loud (`NOT_IMPLEMENTED`) instead of mis-validating; wgpu
+  create gained the redundant dim cap + an adapter-family pre-check
+  (graceful 0 instead of a process abort on an unsupported family).
+
+### Limitations / Deferred (within the arc)
+
+- **Native compressed *sampling*** is Phase TS (3.2.2–3.2.3, this arc) —
+  it re-introduces the GFX9 T#/tiling/sampler path. Native is storage +
+  readback this minor.
+- **wgpu compressed readback via `gpu_texture_read`** is fail-loud
+  (`NOT_IMPLEMENTED`) — needs 256-padded block-row handling; consumers use
+  a padded copy-back meanwhile. Native compressed read works.
+- **ETC2/ASTC native decode** is HW-verification-gated (BC verified on
+  Cezanne; ETC2/ASTC need capable AMD silicon) — see the punchlist
+  Hardware-verification gaps.
+
+### Security
+
+- P(-1) adversarial audit of the diff — **0 HIGH / 0 MEDIUM**, 5 LOW all
+  fixed. `docs/audit/2026-06-15-audit.md`.
+
+### Next
+
+- **Phase X (3.2.1)** — TRANSFER→DMA ring + public buffer-copy; then
+  Phase TS native sampling, Phase S/N SPIR-V, Phase F f64.
+
 ## [3.1.1] — 2026-06-15
 
 **Multi-queue coordination (native AMD).** Second feature of the v3.1.x

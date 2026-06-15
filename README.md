@@ -8,15 +8,13 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.1.1 (dual backend — wgpu + native AMD; see
-*Hardware support* below. GA (3.0.0) cut 2026-06-02 after the 24-hour
-soak gate cleared — `--workload=all` ran 26 h 13 m with RSS flat and
-dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`. 3.0.4 was a P(-1)
-security-hardening patch. 3.1.0 added on-device mipmap generation
-(native AMD HW-verified). 3.1.1 adds multi-queue coordination: a logical
-queue abstraction with native GFX/COMPUTE timeline queues + a cross-ring
-barrier, HW-verified on Cezanne; wgpu aliases the single device queue
-(no real overlap). See the CHANGELOG.)
+Version: 3.2.0 (dual backend — wgpu + native AMD; see
+*Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
+mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
+HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
+block-compressed textures (BC / ETC2 / ASTC): wgpu creates + uploads +
+samples; native AMD stores + reads back (sampling lands later in the 3.2.x
+arc). HW-verified on Cezanne. See the CHANGELOG.)
 
 ## Features
 
