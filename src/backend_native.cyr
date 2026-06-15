@@ -499,6 +499,70 @@ fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count)
     return tex;
 }
 
+# v3.1 [M.6b]: native mipmap generation. Fills levels 1..mip_count-1 of a
+# chain texture by GPU 2x2-box-filter downsample — one compute dispatch
+# per level via the cached-IB path, src/dst level VAs computed from the
+# texture's chain base. Read-after-write between levels is handled by the
+# per-dispatch syncobj wait (level n completes before n+1 submits) plus
+# the composer's ACQUIRE_MEM cache-invalidate before each dispatch (L2 is
+# the coherence point for the global_load/store). Returns 0 | GPU_ERR_*.
+#
+# The downsample shader BO is allocated + loaded here (R|X), VA from the
+# texture sub-allocator (fresh, no collision). It is bump-leaked for the
+# ctx lifetime — generate is infrequent; caching it on the ctx is a future
+# optimization (a ctx field like the IB/fence cache).
+fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    var mip_count = load32(tex + NATIVE_TEX_FIELD_MIP_COUNT);
+    if (mip_count < 2) { return 0; }   # single level: nothing to generate
+    var fd = native_ctx_fd(ctx);
+    var width  = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var height = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var tex_handle = load64(tex + NATIVE_TEX_FIELD_HANDLE);
+    var stub_va = native_ctx_stub_va(ctx);
+    # Allocate + load the downsample shader BO (R|X).
+    var sh_size = GFX9_DOWNSAMPLE_2X2_SIZE;
+    var sh_va = native_ctx_alloc_texture_va(ctx, sh_size);
+    if (sh_va == 0) { return GPU_ERR_OTHER; }
+    var sh_bo[16];
+    var rc = native_bo_create_gtt(fd, sh_size, &sh_bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var sh_handle = load64(&sh_bo + 0);
+    var sh_addr   = load64(&sh_bo + 8);
+    native_gfx9_shader_downsample_2x2(sh_addr, 0);
+    rc = native_gem_va_map(fd, sh_handle, sh_va, sh_size, _NATIVE_PERM_SHADER);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, sh_handle, sh_addr, sh_size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    # Dispatch one downsample per level.
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
+    var level = 1;
+    while (level < mip_count) {
+        var src_va = native_texture_level_va(tex, level - 1);
+        var dst_va = native_texture_level_va(tex, level);
+        var dw = mip_level_dim(width, level);
+        var dh = mip_level_dim(height, level);
+        memset(pm4, 0, 256);
+        var n = native_pm4_build_compute_downsample(pm4, sh_va, stub_va,
+        src_va, dst_va, dw, dh);
+        var t_now[16];
+        memset(&t_now, 0, 16);
+        var trc = syscall(228, 1, &t_now);
+        if (trc != 0) { return GPU_ERR_OTHER; }
+        var deadline = load64(&t_now + 0) * 1000000000
+        + load64(&t_now + 8) + 15000000000;
+        rc = native_compute_dispatch_cached(ctx, pm4, n, sh_handle,
+        tex_handle, deadline);
+        if (rc != 0) { return rc; }
+        level = level + 1;
+    }
+    return 0;
+}
+
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -965,6 +1029,8 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_create_2d_rgba8);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
     &_backend_native_texture_create_2d_rgba8_mipped);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS,
+    &_backend_native_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,

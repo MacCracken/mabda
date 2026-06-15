@@ -151,8 +151,8 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
   (`native_pm4_event_write_cache_flush_and_inv`) is wired in the M.6
   `generate` loop** (it sits between dispatches, not inside this
   single-level composer). HW dispatch validation: M.7.
-- [~] **M.6** — Slot fillers + public dispatchers + `backend_is_complete`
-  walk. Split into create (M.6a) + generate (M.6b):
+- [x] **M.6** — Slot fillers + public dispatchers + `backend_is_complete`
+  walk (both backends; 2026-06-15). Split into create (M.6a) + generate (M.6b):
   - [x] **M.6a** — `create_mipped` (2026-06-15). native:
     `native_texture_create_mipped_2d_rgba8` (one chain BO via the M.1
     allocator) + `_backend_native_texture_create_2d_rgba8_mipped` slot.
@@ -163,13 +163,22 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     guards + mip-count bound (`0` = full chain). Mock dispatch CPU test
     (routing, mip_count=0 expansion, validation). Native single-level
     texture e2e still byte-exact on Cezanne. 2093 asserts; gate clean.
-  - [ ] **M.6b** — `generate_mipmaps` (both backends) + its public
-    dispatcher + extend `backend_is_complete` over the mipmap range (the
-    M.2 deferral). native: cache a downsample-shader BO on the ctx, loop
-    levels dispatching `native_pm4_build_compute_downsample` via the
-    cached-IB path with `native_pm4_event_write_cache_flush_and_inv`
-    between levels. wgpu: per-level views + storage bind groups + dispatch
-    loop over the WGSL shader. Next.
+  - [x] **M.6b** — `generate_mipmaps` (2026-06-15). **native = real**:
+    `_backend_native_texture_generate_mipmaps` allocates+loads the
+    downsample shader BO (R|X, VA from the texture sub-allocator) and
+    dispatches one `native_pm4_build_compute_downsample` per level via the
+    cached-IB path; read-after-write between levels rides the per-dispatch
+    syncobj wait + the composer's ACQUIRE_MEM (L2 coherence). **wgpu =
+    fail-loud `GPU_ERR_NOT_IMPLEMENTED`** — DISCOVERY: the wgpu COMPUTE
+    path (`_backend_wgpu_compute_dispatch`) is itself a v3.0 stub, so wgpu
+    mipmap generation is blocked on real wgpu compute (a v3.x item);
+    wgpu `create_mipped` still works. Public `gpu_texture_generate_mipmaps`
+    dispatcher; both slots installed; `backend_is_complete` extended over
+    the mipmap range (the M.2 deferral). Mock dispatch test + the
+    is_complete fifth-range test updated. 2102 asserts; gate clean; native
+    single-level e2e intact. (The explicit between-level cache flush the
+    plan mentioned is unnecessary with separate dispatches + ACQUIRE_MEM;
+    M.7 confirms on HW, adds it if stale.)
 - [ ] **M.7** — `programs/native_mipmap_e2e.cyr` + `programs/mipmap_e2e.cyr`
   (wgpu): generate a chain from a known level-0 pattern, CPU-read each
   level, verify 2×2 averaging numerically. HW-gated on AMD (renderD128).
