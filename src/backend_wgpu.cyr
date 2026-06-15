@@ -325,8 +325,22 @@ fn _backend_wgpu_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     if (ctx == 0) { return 0; }
     if (width <= 0) { return 0; }
     if (height <= 0) { return 0; }
+    # Audit 2026-06-15 LOW: cap dims independently of the public dispatcher
+    # (mirrors the native sibling + the v2 audit MED-1 slot-independence rule).
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
     var wfmt = mabda_texfmt_to_wgpu(fmt);
     if (wfmt == 0) { return 0; }            # unknown / Undefined
+    # Audit 2026-06-15 LOW: fail loud (graceful 0) if the adapter lacks this
+    # format's compression family — otherwise wgpuDeviceCreateTexture aborts
+    # the process (uncaptured wgpu error) on an unsupported format. (Consumers
+    # should pre-check gpu_caps_supports_format; this is the backend guard.)
+    var fam = mabda_texfmt_compression_family(fmt);
+    if (fam != 0) {
+        var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
+        if ((mask & fam) == 0) { return 0; }
+    }
     var device = gpu_ctx_device(ctx);
     # COPY_SRC lets a consumer (and the T.8 e2e) copy the compressed blocks
     # back out for verification; COPY_DST for upload; TEXTURE_BINDING for
@@ -389,8 +403,17 @@ fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
     var device = gpu_ctx_device(ctx);
     var queue  = gpu_ctx_queue(ctx);
     var handle = load64(tex +  0);
+    var fmt    = load64(tex + 16);
     var width  = load32(tex + 24);
     var height = load32(tex + 28);
+    # Audit 2026-06-15: the write slot is block-aware, but block-compressed
+    # READBACK via copy_texture_to_buffer needs 256-byte-padded block rows +
+    # an un-pad copy (the path below assumes texel rows). Not implemented for
+    # wgpu this minor — fail loud rather than mis-validate / return wrong
+    # bytes. Native compressed read works (linear memcpy); a wgpu consumer
+    # reads blocks via a 256-padded copy-back, as
+    # programs/compressed_texture_e2e.cyr does.
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return GPU_ERR_NOT_IMPLEMENTED; }
     var expected = width * height * 4;
     if (n != expected) { return GPU_ERR_BUFFER; }
 

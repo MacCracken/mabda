@@ -55,7 +55,7 @@ cross-vendor default.
                         added alongside wgpu+C; API unchanged; A/B
                         bench matrix
   v3.1   [SHIPPED] ─▶  mipmaps (3.1.0) + multi-queue (3.1.1) — arc done
-  v3.2   [PLANNED] ─▶  compressed textures (3.2.0) + SPIR-V (3.2.1) +
+  v3.2   [ACTIVE]  ─▶  compressed textures (3.2.0 SHIPPED) + SPIR-V +
                         native SPIR-V→GFX9 compiler (3.2.2–3.2.6) +
                         f64 compute (3.2.4/3.2.7+) — texture/shader breadth
   v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
@@ -335,7 +335,7 @@ proposals); see the **punchlist** + **proposals**:
 
 The version map + bite-level steps live in the punchlist. Phase summaries:
 
-### 3.2.0 — Compressed textures, storage (Phase T)
+### 3.2.0 — Compressed textures, storage (Phase T) — ✅ SHIPPED 2026-06-15
 
 BC1–BC7 / ETC2 / ASTC: format enums + v29 `WGPUTextureFormat` mapping,
 block-based size math/validation, format-parameterized create/upload,
