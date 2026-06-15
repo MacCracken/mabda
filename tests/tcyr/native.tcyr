@@ -465,6 +465,81 @@ fn test_native_cs_chunk_ids_and_ip_types() {
     return 0;
 }
 
+# ================================================================
+# v3.1 Q.3a — timeline syncobj ABI
+# ================================================================
+fn test_native_timeline_ioctl_encodings() {
+    # _IOWR('d', nr, struct ..) — cross-check the precomputed constants
+    # against native_ioc_encode and the C-verified literals.
+    var wait_expected  = native_ioc_encode(3, DRM_SYNCOBJ_TIMELINE_WAIT_SIZE,
+    DRM_IOCTL_TYPE, 0xCA);
+    var query_expected = native_ioc_encode(3, DRM_SYNCOBJ_TIMELINE_ARRAY_SIZE,
+    DRM_IOCTL_TYPE, 0xCB);
+    assert_eq(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, wait_expected,
+    "TIMELINE_WAIT ioctl via encode");
+    assert_eq(DRM_IOCTL_SYNCOBJ_QUERY, query_expected,
+    "SYNCOBJ_QUERY ioctl via encode");
+    assert_eq(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xC03064CA,
+    "TIMELINE_WAIT = 0xC03064CA (48-byte struct)");
+    assert_eq(DRM_IOCTL_SYNCOBJ_QUERY, 0xC01864CB,
+    "SYNCOBJ_QUERY = 0xC01864CB (24-byte struct)");
+    return 0;
+}
+
+fn test_native_timeline_struct_sizes_and_chunk_ids() {
+    assert_eq(DRM_SYNCOBJ_TIMELINE_WAIT_SIZE,  48,
+    "drm_syncobj_timeline_wait = 48");
+    assert_eq(DRM_SYNCOBJ_TIMELINE_ARRAY_SIZE, 24,
+    "drm_syncobj_timeline_array = 24");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_IN,            0x04, "CHUNK_ID_SYNCOBJ_IN");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,   0x08, "CHUNK_ID_TIMELINE_WAIT");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL, 0x09, "CHUNK_ID_TIMELINE_SIGNAL");
+    return 0;
+}
+
+fn test_native_cs_chunk_syncobj_layout() {
+    # drm_amdgpu_cs_chunk_syncobj = {handle u32, flags u32, point u64}.
+    var buf[16];
+    memset(&buf, 0, 16);
+    native_build_cs_chunk_syncobj(&buf, 0x1234, 0, 0x123456789);
+    assert_eq(load32(&buf + 0), 0x1234,     "handle at +0");
+    assert_eq(load32(&buf + 4), 0,          "flags at +4");
+    assert_eq(load64(&buf + 8), 0x123456789, "point (u64) at +8 spans 32-bit boundary");
+    # Non-zero flags + small point round-trip.
+    native_build_cs_chunk_syncobj(&buf, 0xABCD, 0x2, 7);
+    assert_eq(load32(&buf + 0), 0xABCD, "handle overwritten");
+    assert_eq(load32(&buf + 4), 0x2,    "flags round-trip");
+    assert_eq(load64(&buf + 8), 7,      "point round-trip");
+    return 0;
+}
+
+fn test_native_cs_submit_timeline_fence_align_guard() {
+    # Unaligned fence_offset trips the DWORD-align guard (CVE-2026-46220
+    # class) and returns -EINVAL before any ioctl — so the fake fd is
+    # never touched.
+    var rc = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 1, 0, 0, 5, 33, 0);
+    assert_eq(rc, 0 - 22, "unaligned fence_offset -> -EINVAL, no syscall");
+    return 0;
+}
+
+fn test_native_cs_submit_timeline_point_guards() {
+    # Signalling timeline point 0 is a kernel -EINVAL trap (points are
+    # strictly monotonic from 0); the guard short-circuits before any
+    # ioctl. fence_offset=32 is aligned so it's the point guard, not the
+    # align guard, that fires.
+    var rc0 = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 0, 0, 0, 5, 32, 0);
+    assert_eq(rc0, 0 - 22, "signal_point 0 -> -EINVAL, no syscall");
+    # Waiting on point 0 (with a non-zero wait syncobj) is likewise
+    # rejected: signal_point=1 is valid, wait_syncobj=7 includes a wait,
+    # wait_point=0 trips the wait-point guard.
+    var rcw = native_cs_submit_timeline(0 - 1, 0, 0, 0, 0, AMDGPU_HW_IP_COMPUTE,
+    1, 1, 7, 0, 5, 32, 0);
+    assert_eq(rcw, 0 - 22, "wait_point 0 with a wait chunk -> -EINVAL, no syscall");
+    return 0;
+}
+
 fn test_native_pm4_builder_composability() {
     # Chain operations: NOP(pad=2) + SET_SH_REG(one) + DISPATCH_DIRECT.
     # NOP pad=2 (minimum useful per Session 25b): 1 header + 1 filler dword.
@@ -2293,6 +2368,11 @@ fn main() {
     test_native_cs_ioctl_encoding();
     test_native_cs_struct_sizes();
     test_native_cs_chunk_ids_and_ip_types();
+    test_native_timeline_ioctl_encodings();
+    test_native_timeline_struct_sizes_and_chunk_ids();
+    test_native_cs_chunk_syncobj_layout();
+    test_native_cs_submit_timeline_fence_align_guard();
+    test_native_cs_submit_timeline_point_guards();
     test_native_pm4_builder_composability();
     test_backend_native_new_is_complete();
     test_backend_native_slot_identities();

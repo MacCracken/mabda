@@ -543,6 +543,99 @@ fn native_syncobj_wait(fd, handle, timeout_ns): i64 {
 }
 
 # ================================================================
+# v3.1 Q.3 — timeline syncobj (multi-queue coordination)
+# ================================================================
+# A timeline syncobj is an ordinary syncobj (created via
+# native_syncobj_create) read/written at monotonically increasing u64
+# "points" instead of the binary signaled/unsignaled state. The native
+# multi-queue path (Q.3) gives each logical Queue ONE persistent
+# timeline syncobj: every queue-targeted submit signals point N+1 on
+# GPU completion (via a CS TIMELINE_SIGNAL chunk), wait_idle waits for
+# the queue's latest point, and gpu_queue_barrier (Q.4) makes a
+# consumer ring wait on a producer ring's point (a CS TIMELINE_WAIT
+# chunk). Persistent + monotonic avoids the reset/reuse races a binary
+# syncobj would hit across repeated cross-ring submits.
+#
+# ABI ground-truthed against /usr/include/drm/{drm.h,amdgpu_drm.h} on
+# this box (kernel 7.0): see the struct/ioctl notes below.
+
+# struct drm_syncobj_timeline_wait = {handles u64, points u64,
+#   timeout_nsec s64, count_handles u32, flags u32, first_signaled u32,
+#   pad u32, deadline_nsec u64} = 48 bytes.
+# DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT = DRM_IOWR(0xCA, .. 48) = 0xC03064CA.
+var DRM_SYNCOBJ_TIMELINE_WAIT_SIZE = 48;
+var DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT = 0xC03064CA;
+
+# struct drm_syncobj_timeline_array = {handles u64, points u64,
+#   count_handles u32, flags u32} = 24 bytes.
+# DRM_IOCTL_SYNCOBJ_QUERY = DRM_IOWR(0xCB, .. 24) = 0xC01864CB — reads
+# back each syncobj's last-signaled point (used to verify point
+# accounting on HW in the Q.6 e2e).
+var DRM_SYNCOBJ_TIMELINE_ARRAY_SIZE = 24;
+var DRM_IOCTL_SYNCOBJ_QUERY = 0xC01864CB;
+
+# amdgpu CS chunk IDs for cross-ring sync. SYNCOBJ_IN/OUT (0x04/0x05)
+# carry a 4-byte sem (handle only, binary); the TIMELINE variants
+# (0x08/0x09) carry the 16-byte drm_amdgpu_cs_chunk_syncobj
+# {handle u32, flags u32, point u64}.
+var AMDGPU_CHUNK_ID_SYNCOBJ_IN            = 0x04;
+var AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT   = 0x08;
+var AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL = 0x09;
+
+# Pure byte-builder: write a 16-byte drm_amdgpu_cs_chunk_syncobj at
+# `buf`. Factored out so the chunk layout is CPU-testable independent
+# of the (HW-gated) CS submit. flags is 0 for both signal and wait on
+# the GFX/COMPUTE rings today.
+fn native_build_cs_chunk_syncobj(buf, handle, flags, point): i64 {
+    store32(buf + 0, handle);
+    store32(buf + 4, flags);
+    store64(buf + 8, point);
+    return 0;
+}
+
+# Wait until `handle` reaches timeline `point`. `timeout_ns` is
+# absolute CLOCK_MONOTONIC ns. WAIT_FOR_SUBMIT covers the case where
+# the signalling submit hasn't landed yet. Returns 0 on reached,
+# negative errno on timeout/error. (HW-gated.)
+fn native_syncobj_timeline_wait(fd, handle, point, timeout_ns): i64 {
+    var handles[8];
+    store64(&handles + 0, handle);
+    var points[8];
+    store64(&points + 0, point);
+    var req[48];
+    memset(&req, 0, 48);
+    store64(&req + 0,  &handles);       # handles ptr
+    store64(&req + 8,  &points);        # points ptr
+    store64(&req + 16, timeout_ns);     # timeout_nsec (absolute)
+    store32(&req + 24, 1);              # count_handles
+    store32(&req + 28, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT);
+    store32(&req + 32, 0);              # first_signaled (out)
+    store32(&req + 36, 0);              # pad
+    store64(&req + 40, 0);              # deadline_nsec
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &req);
+}
+
+# Read back `handle`'s last-signaled timeline point into
+# out_point_ptr. Returns 0 on success, negative errno on failure.
+# (HW-gated; used to verify point accounting end-to-end.)
+fn native_syncobj_timeline_query(fd, handle, out_point_ptr): i64 {
+    var handles[8];
+    store64(&handles + 0, handle);
+    var points[8];
+    store64(&points + 0, 0);
+    var req[24];
+    memset(&req, 0, 24);
+    store64(&req + 0,  &handles);       # handles ptr
+    store64(&req + 8,  &points);        # points ptr (out)
+    store32(&req + 16, 1);              # count_handles
+    store32(&req + 20, 0);              # flags
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_QUERY, &req);
+    if (rc != 0) { return rc; }
+    store64(out_point_ptr, load64(&points + 0));
+    return 0;
+}
+
+# ================================================================
 # v3 Phase B.3.d — CS (command submission) ioctl
 # ================================================================
 # union drm_amdgpu_cs { in (24) | out (8) } = 24
@@ -788,5 +881,126 @@ syncobj_handle, fence_kh, fence_offset, ib_flags): i64 {
     store64(&req_4 + 16, &chunk_ptrs_4);
 
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
+}
+
+# v3.1 Q.3 — timeline-syncobj CS submit (queue-targeted path). Same
+# Mesa 4-chunk shape as native_cs_submit_4chunk (BO_HANDLES + FENCE + IB
+# — the FENCE chunk is what actually queues a compute IB to MEC on this
+# kernel; dropping it lets the syncobj signal on TDR instead of real
+# completion), but SYNCOBJ_OUT is swapped for a TIMELINE_SIGNAL chunk
+# and an optional TIMELINE_WAIT chunk is prepended for cross-ring
+# barriers (Q.4). Chunk order:
+#   BO_HANDLES, [TIMELINE_WAIT], TIMELINE_SIGNAL, FENCE, IB
+# The GPU signals `signal_syncobj` at `signal_point` on completion;
+# when `wait_syncobj != 0` the submission first waits for that syncobj
+# to reach `wait_point`. Returns 0 on accepted, negative errno on
+# failure. (HW-gated; chunk byte layout is CPU-tested via the pure
+# native_build_cs_chunk_syncobj helper.)
+fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
+signal_syncobj, signal_point, wait_syncobj, wait_point, fence_kh, fence_offset, ib_flags): i64 {
+    if ((fence_offset & 3) != 0) { return 0 - 22; }   # -EINVAL: DWORD-align guard
+    # Timeline points are strictly monotonic from an initial 0, so the
+    # kernel rejects a SIGNAL of point 0 (drm_syncobj_add_point requires
+    # new > current) and would fail the whole CS with -EINVAL. Guard it
+    # here — same validation-parity posture as the fence-align guard. The
+    # queue path never trips this (queue_bump_point starts at 1); this
+    # catches a stray caller.
+    if (signal_point == 0) { return 0 - 22; }
+
+    var ib_chunk[32];
+    memset(&ib_chunk, 0, 32);
+    store32(&ib_chunk + 0,  0);
+    store32(&ib_chunk + 4,  ib_flags);
+    store64(&ib_chunk + 8,  ib_va);
+    store32(&ib_chunk + 16, ib_bytes);
+    store32(&ib_chunk + 20, ip_type);
+    store32(&ib_chunk + 24, 0);
+    store32(&ib_chunk + 28, 0);
+
+    # SIGNAL chunk: flags unused on signal; the GPU signals (handle,
+    # point) on completion.
+    var signal_chunk[16];
+    native_build_cs_chunk_syncobj(&signal_chunk, signal_syncobj, 0, signal_point);
+
+    var wait_chunk[16];
+    var include_wait = 1;
+    if (wait_syncobj == 0) { include_wait = 0; }
+    if (include_wait == 1) {
+        # Waiting on timeline point 0 is meaningless (nothing is signalled
+        # at 0); reject rather than submit a dead dependency.
+        if (wait_point == 0) { return 0 - 22; }
+        # WAIT chunk: the amdgpu CS parser routes flags through
+        # drm_syncobj_find_fence, which reads WAIT_FLAGS_WAIT_FOR_SUBMIT
+        # (0x2). Setting it (the Mesa/RADV choice) makes the in-CS wait
+        # tolerate a consumer submit that races ahead of the producer —
+        # the dependency resolves once the producer's fence installs,
+        # instead of failing -ENOENT. Harmless for our barrier path
+        # (which waits on already-signalled points), robust against
+        # future render-graph cross-queue scheduling (3.1.2).
+        native_build_cs_chunk_syncobj(&wait_chunk, wait_syncobj,
+        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, wait_point);
+    }
+
+    var fence_chunk[8];
+    store32(&fence_chunk + 0, fence_kh);
+    store32(&fence_chunk + 4, fence_offset);
+
+    # Chunk descriptors (16 bytes each) + parallel pointer array.
+    var chunks[80];
+    memset(&chunks, 0, 80);
+    var chunk_ptrs[40];
+    memset(&chunk_ptrs, 0, 40);
+
+    var co = 0;     # byte cursor into chunks
+    var po = 0;     # byte cursor into chunk_ptrs
+
+    store32(&chunks + co + 0, AMDGPU_CHUNK_ID_BO_HANDLES);
+    store32(&chunks + co + 4, 6);                    # bo_list_in = 24 B = 6 dw
+    store64(&chunks + co + 8, bo_list_in_ptr);
+    store64(&chunk_ptrs + po, &chunks + co);
+    co = co + 16;
+    po = po + 8;
+
+    if (include_wait == 1) {
+        store32(&chunks + co + 0, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT);
+        store32(&chunks + co + 4, 4);               # chunk_syncobj = 16 B = 4 dw
+        store64(&chunks + co + 8, &wait_chunk);
+        store64(&chunk_ptrs + po, &chunks + co);
+        co = co + 16;
+        po = po + 8;
+    }
+
+    store32(&chunks + co + 0, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL);
+    store32(&chunks + co + 4, 4);                    # chunk_syncobj = 16 B = 4 dw
+    store64(&chunks + co + 8, &signal_chunk);
+    store64(&chunk_ptrs + po, &chunks + co);
+    co = co + 16;
+    po = po + 8;
+
+    store32(&chunks + co + 0, AMDGPU_CHUNK_ID_FENCE);
+    store32(&chunks + co + 4, 2);                    # cs_chunk_fence = 8 B = 2 dw
+    store64(&chunks + co + 8, &fence_chunk);
+    store64(&chunk_ptrs + po, &chunks + co);
+    co = co + 16;
+    po = po + 8;
+
+    store32(&chunks + co + 0, AMDGPU_CHUNK_ID_IB);
+    store32(&chunks + co + 4, 8);                    # cs_chunk_ib = 32 B = 8 dw
+    store64(&chunks + co + 8, &ib_chunk);
+    store64(&chunk_ptrs + po, &chunks + co);
+    co = co + 16;
+    po = po + 8;
+
+    var num_chunks = 4 + include_wait;
+
+    var req[24];
+    memset(&req, 0, 24);
+    store32(&req + 0,  ctx_id);
+    store32(&req + 4,  0);                  # bo_list_handle unused (BO_HANDLES chunk)
+    store32(&req + 8,  num_chunks);
+    store32(&req + 12, 0);
+    store64(&req + 16, &chunk_ptrs);
+
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
 }
 
