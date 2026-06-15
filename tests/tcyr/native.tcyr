@@ -1,762 +1,490 @@
-# tests/tcyr/mabda_v3.tcyr — v3 backend abstraction tests
-# Split from mabda.tcyr 2026-04-28 to work around the cyrius lint
-# file-size threshold bug (see
-# docs/development/issues/2026-04-28-cyrlint-multi-line-assert.md).
-# All tests for src/backend.cyr + src/backend_wgpu.cyr + the
-# v3-shape ctx-aware public dispatchers (gpu_buffer_*,
-# gpu_shader_module_*, gpu_device_wait_idle, gpu_compute_dispatch).
-# v2.x and v3 Phase A/B.1-B.4 tests stay in mabda.tcyr.
-
+# tests/tcyr/native.tcyr — native AMD backend impl (amdgpu/PM4/GFX9 ISA/textures/render)
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
-# ================================================================
-# v3 Phase B5 — backend abstraction (src/backend.cyr)
-# ================================================================
-# Step 1 lands the @internal Backend struct + smoke test only;
-# wgpu and native backend slot fills are subsequent steps. The
-# load-bearing test here is test_backend_fncall_through_slot_smoke
-# — proves Cyrius-fn-via-fnptr-via-struct-slot dispatch works
-# before any backend implementation depends on it.
-
-fn test_backend_struct_layout() {
-    assert_eq(BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,  0, "ctx_create at 0");
-    assert_eq(BACKEND_SLOT_CTX_RELEASE,              8, "ctx_release at 8");
-    assert_eq(BACKEND_SLOT_BUFFER_CREATE,           16, "buffer_create at 16");
-    assert_eq(BACKEND_SLOT_BUFFER_WRITE,            24, "buffer_write at 24");
-    assert_eq(BACKEND_SLOT_BUFFER_READ,             32, "buffer_read at 32");
-    assert_eq(BACKEND_SLOT_BUFFER_RELEASE,          40, "buffer_release at 40");
-    assert_eq(BACKEND_SLOT_SHADER_MODULE_CREATE,    48, "shader_module_create at 48");
-    assert_eq(BACKEND_SLOT_SHADER_MODULE_RELEASE,   56, "shader_module_release at 56");
-    assert_eq(BACKEND_SLOT_COMPUTE_DISPATCH,        64, "compute_dispatch at 64");
-    assert_eq(BACKEND_SLOT_DEVICE_WAIT_IDLE,        72, "device_wait_idle at 72");
-    assert_eq(BACKEND_SLOT_KIND,                    80, "kind at 80");
-    assert_eq(BACKEND_FNPTR_SLOTS_END,              80, "v0 fnptr slots end at 80");
-    # v1 texture slots (Step 5.4)
-    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, 88,  "tex_create_2d_rgba8 at 88");
-    assert_eq(BACKEND_SLOT_TEXTURE_WRITE,           96,  "tex_write at 96");
-    assert_eq(BACKEND_SLOT_TEXTURE_READ,            104, "tex_read at 104");
-    assert_eq(BACKEND_SLOT_TEXTURE_RELEASE,         112, "tex_release at 112");
-    assert_eq(BACKEND_TEXTURE_SLOTS_BEGIN,          88,  "texture range begins 88");
-    assert_eq(BACKEND_TEXTURE_SLOTS_END,             120, "texture range ends 120");
-    # v2 render slots (Step 6.8a)
-    assert_eq(BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8, 120, "rt_create_2d_rgba8 at 120");
-    assert_eq(BACKEND_SLOT_RENDER_TARGET_RELEASE,         128, "rt_release at 128");
-    assert_eq(BACKEND_SLOT_RENDER_PIPELINE_CREATE,        136, "render_pipeline_create at 136");
-    assert_eq(BACKEND_SLOT_RENDER_PIPELINE_RELEASE,       144, "render_pipeline_release at 144");
-    assert_eq(BACKEND_SLOT_RENDER_PASS_BEGIN,             152, "render_pass_begin at 152");
-    assert_eq(BACKEND_SLOT_RENDER_PASS_DRAW,              160, "render_pass_draw at 160");
-    assert_eq(BACKEND_SLOT_RENDER_PASS_END,               168, "render_pass_end at 168");
-    assert_eq(BACKEND_RENDER_SLOTS_BEGIN,                 120, "render range begins 120");
-    assert_eq(BACKEND_RENDER_SLOTS_END,                   176, "render range ends 176");
-    # v3 surface slots (Step 7.5)
-    assert_eq(BACKEND_SLOT_SURFACE_CONFIGURE,             176, "surface_configure at 176");
-    assert_eq(BACKEND_SLOT_SURFACE_ACQUIRE,               184, "surface_acquire at 184");
-    assert_eq(BACKEND_SLOT_SURFACE_PRESENT,               192, "surface_present at 192");
-    assert_eq(BACKEND_SLOT_SURFACE_RELEASE,               200, "surface_release at 200");
-    assert_eq(BACKEND_SURFACE_SLOTS_BEGIN,                176, "surface range begins 176");
-    assert_eq(BACKEND_SURFACE_SLOTS_END,                  208, "surface range ends 208");
-    # v3.1 M.2: mipmap slot block appended at 208..224.
-    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED, 208, "mipped_create at 208");
-    assert_eq(BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS,       216, "generate_mipmaps at 216");
-    assert_eq(BACKEND_MIPMAP_SLOTS_BEGIN,                 208, "mipmap range begins 208");
-    assert_eq(BACKEND_MIPMAP_SLOTS_END,                   224, "mipmap range ends 224");
-    assert_eq(BACKEND_MIPMAP_SLOTS_BEGIN, BACKEND_SURFACE_SLOTS_END,
-    "mipmap range starts where surface range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               224, "total = 224");
+fn test_native_ioc_encode_directions() {
+    # dir lives in bits 30-31. Each direction swaps bit patterns there.
+    assert_eq(native_ioc_encode(0, 0, 0, 0), 0x00000000, "NONE dir = 0 upper bits");
+    assert_eq(native_ioc_encode(1, 0, 0, 0), 0x40000000, "WRITE dir = 0x40000000");
+    assert_eq(native_ioc_encode(2, 0, 0, 0), 0x80000000, "READ dir = 0x80000000");
+    assert_eq(native_ioc_encode(3, 0, 0, 0), 0xC0000000, "RW dir = 0xC0000000");
     return 0;
 }
 
-fn test_backend_kind_constants_distinct() {
-    assert(BACKEND_KIND_NULL   != BACKEND_KIND_WGPU,    "null != wgpu");
-    assert(BACKEND_KIND_WGPU   != BACKEND_KIND_AMD,     "wgpu != amd");
-    assert(BACKEND_KIND_AMD    != BACKEND_KIND_NVIDIA,  "amd != nvidia");
-    assert(BACKEND_KIND_NVIDIA != BACKEND_KIND_INTEL,   "nvidia != intel");
-    assert_eq(BACKEND_KIND_NULL,   0, "null = 0");
-    assert_eq(BACKEND_KIND_WGPU,   1, "wgpu = 1");
-    assert_eq(BACKEND_KIND_AMD,    2, "amd  = 2");
-    assert_eq(BACKEND_KIND_NVIDIA, 3, "nvidia = 3");
-    assert_eq(BACKEND_KIND_INTEL,  4, "intel  = 4");
+fn test_native_ioc_encode_size_in_bits_16_to_29() {
+    # Size field is 14 bits wide (bits 16-29). Small size packs cleanly.
+    assert_eq(native_ioc_encode(0, 1, 0, 0), 0x00010000, "size=1 at bit 16");
+    assert_eq(native_ioc_encode(0, 64, 0, 0), 0x00400000, "size=64 at bit 16+6");
+    assert_eq(native_ioc_encode(0, 0x3FFF, 0, 0), 0x3FFF0000, "size=max (14 bits all set)");
+    # Size overflow: 0x4000 wraps to 0 (14-bit mask).
+    assert_eq(native_ioc_encode(0, 0x4000, 0, 0), 0x00000000, "size overflow masks to 0");
     return 0;
 }
 
-fn test_backend_new_zero_initialized() {
-    var b = backend_new();
-    var off = 0;
-    while (off < BACKEND_SIZE) {
-        assert_eq(load64(b + off), 0, "slot zero on new");
-        off = off + 8;
-    }
-    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "kind starts NULL");
+fn test_native_ioc_encode_type_and_nr() {
+    # type is bits 8-15, nr is bits 0-7. Both byte-sized.
+    assert_eq(native_ioc_encode(0, 0, 0x64, 0), 0x00006400, "type=0x64 at bits 8-15");
+    assert_eq(native_ioc_encode(0, 0, 0, 0xFF), 0x000000FF, "nr=0xFF at bits 0-7");
+    assert_eq(native_ioc_encode(0, 0, 0xFF, 0xFF), 0x0000FFFF, "type+nr combined");
     return 0;
 }
 
-fn test_backend_kind_round_trip() {
-    var b = backend_new();
-    backend_set_kind(b, BACKEND_KIND_WGPU);
-    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "wgpu round-trips");
-    backend_set_kind(b, BACKEND_KIND_AMD);
-    assert_eq(backend_kind(b), BACKEND_KIND_AMD,  "amd round-trips");
-    backend_set_kind(b, BACKEND_KIND_NULL);
-    assert_eq(backend_kind(b), BACKEND_KIND_NULL, "null round-trips");
+fn test_native_render_node_path() {
+    # Constant must equal the canonical first-render-node path.
+    var expected = "/dev/dri/renderD128";
+    assert_eq(strlen(DRM_RENDER_NODE_PATH), strlen(expected), "path length matches");
+    assert_eq(memeq(DRM_RENDER_NODE_PATH, expected, strlen(expected)), 1, "path contents match");
     return 0;
 }
 
-fn test_backend_set_get_slot_round_trip() {
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0x1234);
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
-    0x1234, "fnptr stored at buffer_create slot");
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, 0xDEADBEEF);
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
-    0xDEADBEEF, "slot overwritten");
-    # Setting one slot does not perturb its neighbours.
-    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, 0xAA);
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE, 0xBB);
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
-    0xDEADBEEF, "neighbour writes do not bleed");
+fn test_native_amdgpu_ioctl_nr_offsets() {
+    assert_eq(DRM_AMDGPU_GEM_CREATE, 0x00, "GEM_CREATE nr offset");
+    assert_eq(DRM_AMDGPU_GEM_MMAP,   0x01, "GEM_MMAP nr offset");
     return 0;
 }
 
-fn test_backend_fncall_through_slot_smoke() {
-    # Step 1's load-bearing test: prove Cyrius-fn-via-fnptr-via-
-    # struct-slot dispatch works. The v2.x codebase only fncalls
-    # against extern-C function pointers; the entire backend
-    # abstraction relies on Cyrius-to-Cyrius dispatch through a
-    # slot. If this fails, the design is unviable.
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
-    &_backend_smoke_sentinel);
-    var fp = backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE);
-    assert(fp != 0, "stored fnptr loads back non-zero");
-    var got = fncall1(fp, 100);
-    assert_eq(got, BACKEND_SMOKE_SENTINEL + 100,
-    "fncall1 through struct slot returns sentinel + arg");
-    # Same fn, mounted on a different slot, behaves identically.
-    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
-    &_backend_smoke_sentinel);
-    var fp2 = backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE);
-    var got2 = fncall1(fp2, 7);
-    assert_eq(got2, BACKEND_SMOKE_SENTINEL + 7,
-    "slot identity does not affect dispatch");
+fn test_native_gem_create_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0, union drm_amdgpu_gem_create) with 32-byte union.
+    var expected = native_ioc_encode(3, DRM_AMDGPU_GEM_CREATE_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_CREATE, expected, "GEM_CREATE ioctl = 0xC0206440");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_CREATE, 0xC0206440, "precomputed constant");
     return 0;
 }
 
-fn test_backend_is_complete_detects_missing_slot() {
-    var b = backend_new();
-    assert_eq(backend_is_complete(b), 0,
-    "fresh backend not complete (all slots zero)");
-    # Fill v0 fnptr range (0..80) — kind at +80 stays zero (it's a
-    # value, not a fnptr).
-    var off = 0;
-    while (off < BACKEND_FNPTR_SLOTS_END) {
-        backend_set_slot(b, off, &_backend_smoke_sentinel);
-        off = off + 8;
-    }
-    # v0-only fill is no longer enough — v1 texture range (88..120)
-    # also has fnptr slots that backend_is_complete checks.
-    assert_eq(backend_is_complete(b), 0,
-    "v0 fnptrs filled but v1 texture range still zero");
-    var off2 = BACKEND_TEXTURE_SLOTS_BEGIN;
-    while (off2 < BACKEND_TEXTURE_SLOTS_END) {
-        backend_set_slot(b, off2, &_backend_smoke_sentinel);
-        off2 = off2 + 8;
-    }
-    # v0+v1 alone no longer complete — v2 render range (120..176)
-    # also has fnptr slots that backend_is_complete checks (Step 6.8b).
-    assert_eq(backend_is_complete(b), 0,
-    "v0+v1 fnptrs filled but v2 render range still zero");
-    var off3 = BACKEND_RENDER_SLOTS_BEGIN;
-    while (off3 < BACKEND_RENDER_SLOTS_END) {
-        backend_set_slot(b, off3, &_backend_smoke_sentinel);
-        off3 = off3 + 8;
-    }
-    # v0+v1+v2 alone no longer complete — v3 surface range (176..208)
-    # also has fnptr slots that backend_is_complete checks (Step 7.6).
-    assert_eq(backend_is_complete(b), 0,
-    "v0+v1+v2 fnptrs filled but v3 surface range still zero");
-    var off4 = BACKEND_SURFACE_SLOTS_BEGIN;
-    while (off4 < BACKEND_SURFACE_SLOTS_END) {
-        backend_set_slot(b, off4, &_backend_smoke_sentinel);
-        off4 = off4 + 8;
-    }
-    assert_eq(backend_is_complete(b), 1,
-    "all fnptr slots set across all four ranges -> complete");
-    # Wiping one v0 slot drops completeness.
-    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, 0);
-    assert_eq(backend_is_complete(b), 0,
-    "wiped v0 slot drops completeness");
-    # Restore v0, then wipe a v1 texture slot — also drops.
-    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
-    &_backend_smoke_sentinel);
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, 0);
-    assert_eq(backend_is_complete(b), 0,
-    "wiped v1 texture slot drops completeness");
-    # Restore v1, then wipe a v2 render slot — also drops.
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
-    &_backend_smoke_sentinel);
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW, 0);
-    assert_eq(backend_is_complete(b), 0,
-    "wiped v2 render slot drops completeness");
-    # Restore v2, then wipe a v3 surface slot — also drops.
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
-    &_backend_smoke_sentinel);
-    backend_set_slot(b, BACKEND_SLOT_SURFACE_PRESENT, 0);
-    assert_eq(backend_is_complete(b), 0,
-    "wiped v3 surface slot drops completeness");
+fn test_native_gem_mmap_ioctl_encoding() {
+    # _IOWR('d', 0x41, union drm_amdgpu_gem_mmap) with 8-byte union.
+    var expected = native_ioc_encode(3, DRM_AMDGPU_GEM_MMAP_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_MMAP, expected, "GEM_MMAP ioctl = 0xC0086441");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_MMAP, 0xC0086441, "precomputed constant");
+    return 0;
+}
+
+fn test_native_gem_close_ioctl_encoding() {
+    # _IOW('d', 0x09, struct drm_gem_close) with 8-byte struct.
+    var expected = native_ioc_encode(1, DRM_GEM_CLOSE_SIZE, DRM_IOCTL_TYPE, 0x09);
+    assert_eq(DRM_IOCTL_GEM_CLOSE, expected, "GEM_CLOSE ioctl = 0x40086409");
+    assert_eq(DRM_IOCTL_GEM_CLOSE, 0x40086409, "precomputed constant");
+    return 0;
+}
+
+fn test_native_amdgpu_gem_domains() {
+    # Domain bit values mirror kernel UAPI. They are disjoint single bits.
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU,  0x1, "CPU = 0x1");
+    assert_eq(AMDGPU_GEM_DOMAIN_GTT,  0x2, "GTT = 0x2");
+    assert_eq(AMDGPU_GEM_DOMAIN_VRAM, 0x4, "VRAM = 0x4");
+    # Single-bit invariant: each is a power of 2, no shared bits.
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU & AMDGPU_GEM_DOMAIN_GTT,  0, "CPU/GTT disjoint");
+    assert_eq(AMDGPU_GEM_DOMAIN_GTT & AMDGPU_GEM_DOMAIN_VRAM, 0, "GTT/VRAM disjoint");
+    assert_eq(AMDGPU_GEM_DOMAIN_CPU & AMDGPU_GEM_DOMAIN_VRAM, 0, "CPU/VRAM disjoint");
+    return 0;
+}
+
+fn test_native_gem_create_request_layout() {
+    # drm_amdgpu_gem_create_in: {bo_size, alignment, domains, domain_flags}
+    # each u64, packed — 32 bytes total.
+    var req[32];
+    memset(&req, 0, 32);
+    store64(&req + 0,  0x1000);   # bo_size = 4096
+    store64(&req + 8,  0x0100);   # alignment = 256
+    store64(&req + 16, 0x2);      # domains = GTT
+    store64(&req + 24, 0);        # domain_flags
+    assert_eq(load64(&req + 0),  0x1000, "bo_size slot");
+    assert_eq(load64(&req + 8),  0x0100, "alignment slot");
+    assert_eq(load64(&req + 16), 0x2,    "domains slot");
+    assert_eq(load64(&req + 24), 0,      "domain_flags slot");
+    return 0;
+}
+
+fn test_native_gem_mmap_request_layout() {
+    # drm_amdgpu_gem_mmap_in: {handle u32, _pad u32} = 8 bytes.
+    # Out variant: {addr_ptr u64} at the same memory.
+    var req[8];
+    memset(&req, 0, 8);
+    store32(&req + 0, 42);    # handle
+    assert_eq(load32(&req + 0), 42, "handle at +0");
+    # After kernel writes, the same 8 bytes become an i64 addr_ptr.
+    memset(&req, 0, 8);
+    store64(&req + 0, 0xDEAD00);
+    assert_eq(load64(&req + 0), 0xDEAD00, "addr_ptr at +0 (union)");
     return 0;
 }
 
 # ================================================================
-# v3 Phase B5 — wgpu Backend implementation (src/backend_wgpu.cyr)
+# v3 Phase B.3.a — submission infrastructure constants
 # ================================================================
-# Step 2 lands the wgpu wrapper fns + builder. The wrappers
-# themselves drive real wgpu calls, which can't run without
-# wgpu-native loaded — those paths are exercised via the GPU
-# integration programs (phase0, compute_e2e, etc.). CPU tests
-# here verify shape only: builder produces a complete backend,
-# kind = WGPU, slots resolve to the expected wrapper addresses.
 
-fn test_backend_wgpu_new_is_complete() {
-    var b = backend_wgpu_new();
-    assert(b != 0, "backend_wgpu_new returns non-null");
-    assert_eq(backend_is_complete(b), 1,
-    "wgpu backend has all 25 fnptr slots filled (v0+v1+v2+v3)");
-    assert_eq(backend_kind(b), BACKEND_KIND_WGPU,
-    "wgpu backend kind = BACKEND_KIND_WGPU");
-    # v3 surface stubs all installed (Step 7.6).
-    var off = BACKEND_SURFACE_SLOTS_BEGIN;
-    while (off < BACKEND_SURFACE_SLOTS_END) {
-        assert(load64(b + off) != 0, "v3 surface slot filled on wgpu");
-        off = off + 8;
-    }
+fn test_native_phase_b3a_nr_offsets() {
+    assert_eq(DRM_AMDGPU_CTX,     0x02, "CTX nr offset");
+    assert_eq(DRM_AMDGPU_BO_LIST, 0x03, "BO_LIST nr offset");
+    assert_eq(DRM_AMDGPU_GEM_VA,  0x08, "GEM_VA nr offset");
     return 0;
 }
 
-fn test_backend_wgpu_slot_identities() {
-    # Each slot must point at the matching wrapper. Catches
-    # builder typos (wrong fnptr in wrong slot) at CPU-test time.
-    var b = backend_wgpu_new();
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT),
-    &_backend_wgpu_ctx_create_from_preinit,
-    "slot 0 = ctx_create_from_preinit");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE),
-    &_backend_wgpu_ctx_release,
-    "slot 8 = ctx_release");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE),
-    &_backend_wgpu_buffer_create,
-    "slot 16 = buffer_create");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_WRITE),
-    &_backend_wgpu_buffer_write,
-    "slot 24 = buffer_write");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_READ),
-    &_backend_wgpu_buffer_read,
-    "slot 32 = buffer_read");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_RELEASE),
-    &_backend_wgpu_buffer_release,
-    "slot 40 = buffer_release");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
-    &_backend_wgpu_shader_module_create,
-    "slot 48 = shader_module_create");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE),
-    &_backend_wgpu_shader_module_release,
-    "slot 56 = shader_module_release");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH),
-    &_backend_wgpu_compute_dispatch,
-    "slot 64 = compute_dispatch");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE),
-    &_backend_wgpu_device_wait_idle,
-    "slot 72 = device_wait_idle");
+fn test_native_ctx_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_CTX_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_CTX);
+    assert_eq(DRM_IOCTL_AMDGPU_CTX, expected, "CTX ioctl = 0xC0106442");
+    assert_eq(DRM_IOCTL_AMDGPU_CTX, 0xC0106442, "precomputed constant");
     return 0;
 }
 
-fn test_backend_wgpu_render_slot_identities() {
-    # v2 render slot identity checks (Step 6.8b). Catches builder
-    # typos in the render half of backend_wgpu_new at CPU-test time.
-    var b = backend_wgpu_new();
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8),
-    &_backend_wgpu_render_target_create_2d_rgba8,
-    "slot 120 = render_target_create_2d_rgba8");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE),
-    &_backend_wgpu_render_target_release,
-    "slot 128 = render_target_release");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE),
-    &_backend_wgpu_render_pipeline_create,
-    "slot 136 = render_pipeline_create");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE),
-    &_backend_wgpu_render_pipeline_release,
-    "slot 144 = render_pipeline_release");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN),
-    &_backend_wgpu_render_pass_begin,
-    "slot 152 = render_pass_begin");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW),
-    &_backend_wgpu_render_pass_draw,
-    "slot 160 = render_pass_draw");
-    assert_eq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END),
-    &_backend_wgpu_render_pass_end,
-    "slot 168 = render_pass_end");
+fn test_native_bo_list_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_BO_LIST_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_BO_LIST);
+    assert_eq(DRM_IOCTL_AMDGPU_BO_LIST, expected, "BO_LIST ioctl = 0xC0186443");
+    assert_eq(DRM_IOCTL_AMDGPU_BO_LIST, 0xC0186443, "precomputed constant");
     return 0;
 }
 
-fn test_backend_wgpu_compute_dispatch_stub_returns_err() {
-    # Step 2 stub returns GPU_ERR_OTHER unconditionally. Lock that
-    # contract in so Step 3's full implementation has to actively
-    # replace this assertion (proving the stub was retired).
-    var b = backend_wgpu_new();
-    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
-    var rc = fncall6(fp, 0, 0, 0, 0, 0, 0);
-    assert_eq(rc, GPU_ERR_OTHER,
-    "compute_dispatch stub returns GPU_ERR_OTHER");
+fn test_native_gem_va_ioctl_encoding() {
+    # GEM_VA is WRITE-only (kernel reads everything from the struct,
+    # writes nothing back). dir=1, size=64.
+    var expected = native_ioc_encode(1, DRM_AMDGPU_GEM_VA_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA);
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_VA, expected, "GEM_VA ioctl = 0x40406448");
+    assert_eq(DRM_IOCTL_AMDGPU_GEM_VA, 0x40406448, "precomputed constant");
     return 0;
 }
 
-fn test_backend_wgpu_two_builders_are_distinct() {
-    # Each backend_wgpu_new() returns a fresh allocation so callers
-    # holding two backends don't share state.
-    var a = backend_wgpu_new();
-    var b = backend_wgpu_new();
-    assert(a != b, "distinct allocations");
-    assert_eq(backend_kind(a), BACKEND_KIND_WGPU, "a kind = WGPU");
-    assert_eq(backend_kind(b), BACKEND_KIND_WGPU, "b kind = WGPU");
-    # Mutating one does not affect the other.
-    backend_set_slot(a, BACKEND_SLOT_CTX_RELEASE, 0);
-    assert(backend_get_slot(b, BACKEND_SLOT_CTX_RELEASE) != 0,
-    "b unaffected by a's mutation");
+fn test_native_struct_sizes() {
+    assert_eq(DRM_AMDGPU_CTX_SIZE,           16, "drm_amdgpu_ctx union = 16");
+    assert_eq(DRM_AMDGPU_BO_LIST_SIZE,       24, "drm_amdgpu_bo_list union = 24");
+    assert_eq(DRM_AMDGPU_GEM_VA_SIZE,        64, "drm_amdgpu_gem_va struct = 64");
+    assert_eq(DRM_AMDGPU_BO_LIST_ENTRY_SIZE,  8, "drm_amdgpu_bo_list_entry = 8");
+    return 0;
+}
+
+fn test_native_ctx_opcodes() {
+    assert_eq(AMDGPU_CTX_OP_ALLOC_CTX, 1, "ALLOC_CTX = 1");
+    assert_eq(AMDGPU_CTX_OP_FREE_CTX,  2, "FREE_CTX = 2");
+    return 0;
+}
+
+fn test_native_bo_list_opcodes() {
+    assert_eq(AMDGPU_BO_LIST_OP_CREATE,  0, "BO_LIST_OP_CREATE = 0");
+    assert_eq(AMDGPU_BO_LIST_OP_DESTROY, 1, "BO_LIST_OP_DESTROY = 1");
+    return 0;
+}
+
+fn test_native_va_opcodes_and_flags() {
+    assert_eq(AMDGPU_VA_OP_MAP,            1,   "VA_OP_MAP = 1");
+    assert_eq(AMDGPU_VA_OP_UNMAP,          2,   "VA_OP_UNMAP = 2");
+    assert_eq(AMDGPU_VM_PAGE_READABLE,     0x2, "PAGE_READABLE = 0x2");
+    assert_eq(AMDGPU_VM_PAGE_WRITEABLE,    0x4, "PAGE_WRITEABLE = 0x4");
+    assert_eq(AMDGPU_VM_PAGE_EXECUTABLE,   0x8, "PAGE_EXECUTABLE = 0x8");
+    return 0;
+}
+
+fn test_native_bo_list_entry_layout() {
+    # drm_amdgpu_bo_list_entry: {bo_handle u32, bo_priority u32} = 8 bytes.
+    var e[8];
+    memset(&e, 0, 8);
+    store32(&e + 0, 7);
+    store32(&e + 4, 3);
+    assert_eq(load32(&e + 0), 7, "bo_handle at +0");
+    assert_eq(load32(&e + 4), 3, "bo_priority at +4");
     return 0;
 }
 
 # ================================================================
-# v3 Phase B5 / Step 3a — GpuContext backend plumbing
+# v3 Phase B.3.b — PM4 packet builder
 # ================================================================
-# Step 3a grew GpuContext from 32 to 40 bytes, adding a Backend*
-# slot at +32. The +0..+24 wgpu fields stay in place. Tests below
-# synthesise a 40-byte ctx (no real wgpu handles) and verify the
-# accessors land at the expected offsets. End-to-end validation
-# that gpu_context_from_preinit attaches a real backend lives in
-# the GPU integration programs (phase0, compute_e2e, etc.) — those
-# need wgpu-native loaded and run via `make test-gpu`.
 
-fn test_gpu_ctx_backend_accessor() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 0,  0x111);   # instance
-    store64(ctx + 8,  0x222);   # adapter
-    store64(ctx + 16, 0x333);   # device
-    store64(ctx + 24, 0x444);   # queue
-    store64(ctx + 32, 0x555);   # backend
-    assert_eq(gpu_ctx_instance(ctx), 0x111, "instance at +0");
-    assert_eq(gpu_ctx_adapter(ctx),  0x222, "adapter at +8");
-    assert_eq(gpu_ctx_device(ctx),   0x333, "device at +16");
-    assert_eq(gpu_ctx_queue(ctx),    0x444, "queue at +24");
-    assert_eq(gpu_ctx_backend(ctx),  0x555, "backend at +32");
+fn test_native_pm4_opcodes() {
+    assert_eq(IT_NOP,             0x10, "IT_NOP opcode");
+    assert_eq(IT_SET_SH_REG,      0x76, "IT_SET_SH_REG opcode");
+    assert_eq(IT_DISPATCH_DIRECT, 0x15, "IT_DISPATCH_DIRECT opcode");
+    assert_eq(IT_ACQUIRE_MEM,     0x58, "IT_ACQUIRE_MEM opcode");
+    assert_eq(IT_RELEASE_MEM,     0x49, "IT_RELEASE_MEM opcode");
+    assert_eq(IT_EVENT_WRITE,     0x46, "IT_EVENT_WRITE opcode");
     return 0;
 }
 
-fn test_gpu_ctx_backend_field_isolated() {
-    # Mutating the backend slot does not perturb wgpu fields at
-    # +0..+24. Tests the layout is by-byte what the comment claims.
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 0,  0xAAAA);
-    store64(ctx + 8,  0xBBBB);
-    store64(ctx + 16, 0xCCCC);
-    store64(ctx + 24, 0xDDDD);
-    store64(ctx + 32, 0xEEEE);
-    # Overwrite backend slot with a different value.
-    store64(ctx + 32, 0xFFFF);
-    assert_eq(gpu_ctx_instance(ctx), 0xAAAA, "instance untouched");
-    assert_eq(gpu_ctx_adapter(ctx),  0xBBBB, "adapter untouched");
-    assert_eq(gpu_ctx_device(ctx),   0xCCCC, "device untouched");
-    assert_eq(gpu_ctx_queue(ctx),    0xDDDD, "queue untouched");
-    assert_eq(gpu_ctx_backend(ctx),  0xFFFF, "backend overwritten");
+fn test_native_sh_reg_byte_offsets() {
+    # Offsets verified against Mesa rusticl AMD_DEBUG=ib dump on
+    # gfx90c (Cezanne APU). The whole block lives at 0xB830-0xB868.
+    assert_eq(R_COMPUTE_DISPATCH_INITIATOR, 0xB800, "DISPATCH_INITIATOR byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_X,       0xB81C, "NUM_THREAD_X byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_Y,       0xB820, "NUM_THREAD_Y byte offset");
+    assert_eq(R_COMPUTE_NUM_THREAD_Z,       0xB824, "NUM_THREAD_Z byte offset");
+    assert_eq(R_COMPUTE_PGM_LO,             0xB830, "COMPUTE_PGM_LO byte offset");
+    assert_eq(R_COMPUTE_PGM_HI,             0xB834, "COMPUTE_PGM_HI byte offset");
+    assert_eq(R_COMPUTE_PGM_RSRC1,          0xB848, "PGM_RSRC1 byte offset");
+    assert_eq(R_COMPUTE_PGM_RSRC2,          0xB84C, "PGM_RSRC2 byte offset");
+    assert_eq(R_COMPUTE_USER_DATA_0,        0xB900, "USER_DATA_0 byte offset");
     return 0;
 }
 
-# ================================================================
-# v3 Step 3b — gpu_context_release dispatches through backend slot
-# ================================================================
-# Counter incremented by the slot fn. Tests synthesise a ctx with
-# a fake backend whose ctx_release slot points at the counter; if
-# gpu_context_release dispatches through the slot, the counter
-# bumps. Set back to 0 in each test.
-
-var _step3b_ctx_release_count = 0;
-var _step3b_ctx_release_arg   = 0;
-
-fn _step3b_release_counter(ctx) {
-    _step3b_ctx_release_count = _step3b_ctx_release_count + 1;
-    _step3b_ctx_release_arg   = ctx;
+fn test_native_sh_reg_offset_encoding() {
+    # (byte_offset - 0xB000) / 4; values cross-checked against
+    # Mesa AMD_DEBUG=ib dump.
+    assert_eq(native_sh_reg_offset(R_COMPUTE_DISPATCH_INITIATOR), 0x200, "DISPATCH_INITIATOR → 0x200");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_NUM_THREAD_X),       0x207, "NUM_THREAD_X → 0x207");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_LO),             0x20C, "PGM_LO → 0x20C");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_HI),             0x20D, "PGM_HI → 0x20D");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_RSRC1),          0x212, "PGM_RSRC1 → 0x212");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_PGM_RSRC2),          0x213, "PGM_RSRC2 → 0x213");
+    assert_eq(native_sh_reg_offset(R_COMPUTE_USER_DATA_0),        0x240, "USER_DATA_0 → 0x240");
     return 0;
 }
 
-fn test_gpu_context_release_dispatches_through_backend() {
-    _step3b_ctx_release_count = 0;
-    _step3b_ctx_release_arg   = 0;
-    # Build a synthetic ctx whose +32 backend points at a stub
-    # backend whose ctx_release slot points at the counter fn.
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, &_step3b_release_counter);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    gpu_context_release(ctx);
-    assert_eq(_step3b_ctx_release_count, 1,
-    "slot dispatched exactly once");
-    assert_eq(_step3b_ctx_release_arg, ctx,
-    "slot received the ctx pointer as arg 1");
+fn test_native_pm4_pkt3_header() {
+    # PKT3(IT_NOP, 1, 0): type=3, count=0, opcode=0x10, predicate=0.
+    # Expected: (3<<30) | (0<<16) | (0x10<<8) | 0 = 0xC0001000
+    assert_eq(native_pm4_pkt3_header(IT_NOP, 1, 0), 0xC0001000, "NOP count=1");
+    # PKT3(IT_SET_SH_REG, 2, 0): count-1=1, opcode=0x76.
+    # Expected: (3<<30) | (1<<16) | (0x76<<8) | 0 = 0xC0017600
+    assert_eq(native_pm4_pkt3_header(IT_SET_SH_REG, 2, 0), 0xC0017600, "SET_SH_REG count=2");
+    # PKT3(IT_DISPATCH_DIRECT, 4, 0): count-1=3, opcode=0x15.
+    # Expected: (3<<30) | (3<<16) | (0x15<<8) | 0 = 0xC0031500
+    assert_eq(native_pm4_pkt3_header(IT_DISPATCH_DIRECT, 4, 0), 0xC0031500, "DISPATCH_DIRECT count=4");
+    # Predicate bit in the low byte.
+    assert_eq(native_pm4_pkt3_header(IT_NOP, 1, 1), 0xC0001001, "predicate bit set");
     return 0;
 }
 
-fn test_gpu_context_release_null_ctx_is_safe() {
-    # Null ctx must short-circuit before trying to load backend.
-    _step3b_ctx_release_count = 0;
-    gpu_context_release(0);
-    assert_eq(_step3b_ctx_release_count, 0,
-    "null ctx does not dispatch");
+fn test_native_pm4_set_sh_reg_one_layout() {
+    # Setting one register: header + offset + value = 3 dwords.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_set_sh_reg_one(&buf, 0, R_COMPUTE_PGM_LO, 0xDEADBEEF);
+    assert_eq(pos, 12, "SET_SH_REG one = 3 dwords = 12 bytes");
+    # Header: PKT3(IT_SET_SH_REG, count=2, 0) = 0xC0017600.
+    assert_eq(load32(&buf + 0), 0xC0017600, "header");
+    # Register offset (SH-reg form): 0x212.
+    assert_eq(load32(&buf + 4), 0x20C, "SH-reg offset for PGM_LO");
+    # Value we wrote.
+    assert_eq(load32(&buf + 8), 0xDEADBEEF, "value");
     return 0;
 }
 
-# ================================================================
-# v3 Step 3c — gpu_buffer_read dispatches through backend slot
-# ================================================================
-# Counter + arg-capture stub for the buffer_read slot. Verifies the
-# 5-arg fncall threading is correct (ctx, buf, off, ptr, n).
-
-var _step3c_buffer_read_count = 0;
-var _step3c_buffer_read_ctx   = 0;
-var _step3c_buffer_read_buf   = 0;
-var _step3c_buffer_read_off   = 0;
-var _step3c_buffer_read_ptr   = 0;
-var _step3c_buffer_read_n     = 0;
-
-fn _step3c_buffer_read_capture(ctx, buf, off, ptr, n) {
-    _step3c_buffer_read_count = _step3c_buffer_read_count + 1;
-    _step3c_buffer_read_ctx = ctx;
-    _step3c_buffer_read_buf = buf;
-    _step3c_buffer_read_off = off;
-    _step3c_buffer_read_ptr = ptr;
-    _step3c_buffer_read_n   = n;
-    return 0xC3CAB;
-}
-
-fn test_gpu_buffer_read_dispatches_through_backend() {
-    _step3c_buffer_read_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
-    &_step3c_buffer_read_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_buffer_read(ctx, 0xBEEF, 16, 0xCAFE, 64);
-    assert_eq(rc, 0xC3CAB, "slot return value is propagated");
-    assert_eq(_step3c_buffer_read_count, 1,
-    "slot dispatched exactly once");
-    assert_eq(_step3c_buffer_read_ctx, ctx,    "arg 1 = ctx");
-    assert_eq(_step3c_buffer_read_buf, 0xBEEF, "arg 2 = buf");
-    assert_eq(_step3c_buffer_read_off, 16,     "arg 3 = off");
-    assert_eq(_step3c_buffer_read_ptr, 0xCAFE, "arg 4 = ptr");
-    assert_eq(_step3c_buffer_read_n,   64,     "arg 5 = n");
+fn test_native_pm4_set_sh_reg_multi_layout() {
+    # Setting 3 contiguous regs (PGM_LO, PGM_HI, PGM_RSRC1): header +
+    # offset + 3 values = 5 dwords.
+    var vals[12];
+    store32(&vals + 0, 0x1111);
+    store32(&vals + 4, 0x2222);
+    store32(&vals + 8, 0x3333);
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_set_sh_reg(&buf, 0, R_COMPUTE_PGM_LO, 3, &vals);
+    assert_eq(pos, 20, "3-reg SET = 5 dwords = 20 bytes");
+    # Header: PKT3(IT_SET_SH_REG, count=4, 0) — count-1 = 3 → (3<<16) | (0x76<<8) | 0xC0000000 = 0xC0037600.
+    assert_eq(load32(&buf + 0),  0xC0037600, "header for 3 regs");
+    assert_eq(load32(&buf + 4),  0x20C,      "SH-reg offset for PGM_LO base");
+    assert_eq(load32(&buf + 8),  0x1111,     "value 1");
+    assert_eq(load32(&buf + 12), 0x2222,     "value 2");
+    assert_eq(load32(&buf + 16), 0x3333,     "value 3");
     return 0;
 }
 
-fn test_gpu_buffer_read_null_ctx_returns_err() {
-    _step3c_buffer_read_count = 0;
-    var rc = gpu_buffer_read(0, 0, 0, 0, 0);
-    assert_eq(rc, GPU_ERR_BUFFER, "null ctx returns GPU_ERR_BUFFER");
-    assert_eq(_step3c_buffer_read_count, 0,
-    "null ctx does not dispatch");
+fn test_native_pm4_dispatch_direct_layout() {
+    # DISPATCH_DIRECT: header + 4 data dwords = 5 dwords = 20 bytes.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_dispatch_direct(&buf, 0, 8, 4, 2, COMPUTE_DISPATCH_INITIATOR_MIN);
+    assert_eq(pos, 20, "DISPATCH_DIRECT = 5 dwords");
+    # Header: PKT3(IT_DISPATCH_DIRECT, 4, shader_type=2) = 0xC0031502.
+    # Low byte is shader_type (compute), not predicate — verified against
+    # Mesa AMD_DEBUG=ib: `c0031502`.
+    assert_eq(load32(&buf + 0),  0xC0031502, "header (shader_type=compute)");
+    assert_eq(load32(&buf + 4),  8, "dim_x");
+    assert_eq(load32(&buf + 8),  4, "dim_y");
+    assert_eq(load32(&buf + 12), 2, "dim_z");
+    assert_eq(load32(&buf + 16), 1, "initiator (COMPUTE_SHADER_EN)");
     return 0;
 }
 
-# ================================================================
-# v3 Step 3d — gpu_buffer_create / write / release dispatch
-# ================================================================
-# Three more ctx-aware buffer dispatchers, each through its own
-# slot. Together they exercise fncall2 (release), fncall3 (create),
-# and fncall5 (write) in the public-API → backend slot direction.
-
-var _step3d_create_count = 0;
-var _step3d_create_ctx   = 0;
-var _step3d_create_size  = 0;
-var _step3d_create_usage = 0;
-
-fn _step3d_create_capture(ctx, size, usage) {
-    _step3d_create_count = _step3d_create_count + 1;
-    _step3d_create_ctx   = ctx;
-    _step3d_create_size  = size;
-    _step3d_create_usage = usage;
-    return 0xCAFE;
-}
-
-fn test_gpu_buffer_create_dispatches_through_backend() {
-    _step3d_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
-    &_step3d_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var got = gpu_buffer_create(ctx, 1024, 0xF);
-    assert_eq(got, 0xCAFE, "slot return value propagates");
-    assert_eq(_step3d_create_count, 1, "slot dispatched once");
-    assert_eq(_step3d_create_ctx,  ctx,    "arg 1 = ctx");
-    assert_eq(_step3d_create_size,  1024,  "arg 2 = size");
-    assert_eq(_step3d_create_usage, 0xF,   "arg 3 = usage");
+fn test_native_pm4_acquire_mem_layout() {
+    # ACQUIRE_MEM on GFX9 (shader_type=compute): header + 6 data dwords
+    # = 7 dwords = 28 bytes. Mesa emits header c0055802:
+    #   type=3, count-1=5 (6 data dwords), opcode=0x58, shader_type=2.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = native_pm4_acquire_mem_full_invalidate(&buf, 0);
+    assert_eq(pos, 28, "ACQUIRE_MEM = 7 dwords = 28 bytes");
+    # Header must exactly match Mesa's byte-for-byte or the CP
+    # misreads the dword count and desynchronizes the IB stream.
+    assert_eq(load32(&buf + 0),  0xC0055802, "header byte-exact Mesa match");
+    # coher_cntl = 0x28C40000 — RADV-captured byte-exact. Bit 31
+    # (TC_NC_ACTION_ENA) was dropped 2026-05-13 to fix the GFX-ring
+    # TDR; see backend_native_pm4.cyr:_for_ring helper for the why.
+    assert_eq(load32(&buf + 4),  0x28C40000, "coher_cntl");
+    assert_eq(load32(&buf + 8),  0xFFFFFFFF, "coher_size_lo");
+    assert_eq(load32(&buf + 12), 0x00FFFFFF, "coher_size_hi");
+    assert_eq(load32(&buf + 16), 0,          "coher_base_lo");
+    assert_eq(load32(&buf + 20), 0,          "coher_base_hi");
+    assert_eq(load32(&buf + 24), 0x0A,       "poll_interval");
     return 0;
 }
 
-var _step3d_write_count = 0;
-var _step3d_write_ctx   = 0;
-var _step3d_write_buf   = 0;
-var _step3d_write_off   = 0;
-var _step3d_write_ptr   = 0;
-var _step3d_write_n     = 0;
-
-fn _step3d_write_capture(ctx, buf, off, ptr, n) {
-    _step3d_write_count = _step3d_write_count + 1;
-    _step3d_write_ctx = ctx;
-    _step3d_write_buf = buf;
-    _step3d_write_off = off;
-    _step3d_write_ptr = ptr;
-    _step3d_write_n   = n;
+fn test_native_pm4_nop_padding() {
+    # Encoding contract (Session 25b — see CHANGELOG [3.0.0-dev]):
+    # pad_dwords is the TOTAL packet size in dwords (header + body).
+    # Body = pad_dwords - 1 filler dwords; header encodes count_minus_1
+    # = pad_dwords - 2 (because pkt3_header subtracts another 1 from
+    # the count argument). Minimum useful pad_dwords = 2.
+    # NOP with pad_dwords=4: header + 3 filler dwords = 4 dwords = 16 bytes.
+    var buf[64];
+    memset(&buf, 0xFF, 64);
+    var pos = native_pm4_nop(&buf, 0, 4);
+    assert_eq(pos, 16, "NOP pad=4 → 16 bytes");
+    # Header: PKT3(IT_NOP, count=3, 0) → wire count_minus_1 = 2.
+    # = (3<<30) | (2<<16) | (0x10<<8) = 0xC0021000.
+    assert_eq(load32(&buf + 0),  0xC0021000, "NOP pad=4 header");
+    # Filler dwords zeroed.
+    assert_eq(load32(&buf + 4),  0, "filler 1");
+    assert_eq(load32(&buf + 8),  0, "filler 2");
+    assert_eq(load32(&buf + 12), 0, "filler 3");
+    # NOP with pad_dwords=2 (minimum useful): header + 1 filler = 2 dwords.
+    # Wire count_minus_1 = 0; header = 0xC0001000.
+    memset(&buf, 0xFF, 64);
+    pos = native_pm4_nop(&buf, 0, 2);
+    assert_eq(pos, 8, "NOP pad=2 → 8 bytes");
+    assert_eq(load32(&buf + 0), 0xC0001000, "NOP pad=2 header");
+    assert_eq(load32(&buf + 4), 0,          "NOP pad=2 filler");
+    # NOP with pad_dwords=1 is rejected (no body slot to claim);
+    # function returns pos unchanged and writes nothing.
+    memset(&buf, 0xFF, 64);
+    pos = native_pm4_nop(&buf, 0, 1);
+    assert_eq(pos, 0, "NOP pad=1 rejected (returns pos unchanged)");
+    assert_eq(load32(&buf + 0), 0xFFFFFFFF, "NOP pad=1 wrote nothing");
     return 0;
 }
 
-fn test_gpu_buffer_write_dispatches_through_backend() {
-    _step3d_write_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
-    &_step3d_write_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_buffer_write(ctx, 0xBEEF, 8, 0xCAFE, 32);
-    assert_eq(rc, 0, "slot return value propagates");
-    assert_eq(_step3d_write_count, 1, "slot dispatched once");
-    assert_eq(_step3d_write_ctx, ctx,    "arg 1 = ctx");
-    assert_eq(_step3d_write_buf, 0xBEEF, "arg 2 = buf");
-    assert_eq(_step3d_write_off, 8,      "arg 3 = off");
-    assert_eq(_step3d_write_ptr, 0xCAFE, "arg 4 = ptr");
-    assert_eq(_step3d_write_n,   32,     "arg 5 = n");
+fn test_native_gfx9_shader_constants() {
+    # s_endpgm (SOPP format): 0xBF810000 on GFX9. Stable across GFX6-11.
+    assert_eq(GFX9_S_ENDPGM, 0xBF810000, "s_endpgm encoding");
+    # PGM_RSRC1: FLOAT_MODE=0xC0 | SGPRS=1 | DX10_CLAMP=1 (IEEE_MODE=0
+    # per Mesa rusticl verified dump on gfx90c).
+    # = (0xC0 << 12) | (1 << 6) | (1 << 21) = 0x002C0040.
+    assert_eq(GFX9_COMPUTE_PGM_RSRC1_MIN, 0x2C0040, "RSRC1 = 0x002C0040 (matches Mesa rusticl)");
+    assert_eq(GFX9_COMPUTE_PGM_RSRC2_MIN, 0, "RSRC2 min (no user SGPR / scratch / LDS)");
+    # DISPATCH_INITIATOR: 0x45 (Mesa-verified).
+    assert_eq(GFX9_DISPATCH_INITIATOR, 0x45, "DISPATCH_INITIATOR = 0x45");
     return 0;
 }
 
-var _step3d_release_count = 0;
-var _step3d_release_ctx   = 0;
-var _step3d_release_buf   = 0;
-
-fn _step3d_release_capture(ctx, buf) {
-    _step3d_release_count = _step3d_release_count + 1;
-    _step3d_release_ctx = ctx;
-    _step3d_release_buf = buf;
+fn test_native_gfx9_extended_register_offsets() {
+    # Offsets from Mesa AMD_DEBUG=ib dump on gfx90c.
+    assert_eq(R_COMPUTE_RESOURCE_LIMITS,        0xB854, "RESOURCE_LIMITS byte offset");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE0, 0xB858, "STATIC_THREAD_MGMT_SE0");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE1, 0xB85C, "STATIC_THREAD_MGMT_SE1");
+    assert_eq(R_COMPUTE_TMPRING_SIZE,           0xB860, "TMPRING_SIZE");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE2, 0xB864, "STATIC_THREAD_MGMT_SE2");
+    assert_eq(R_COMPUTE_STATIC_THREAD_MGMT_SE3, 0xB868, "STATIC_THREAD_MGMT_SE3");
     return 0;
 }
 
-fn test_gpu_buffer_release_dispatches_through_backend() {
-    _step3d_release_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
-    &_step3d_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_buffer_release(ctx, 0xBEEF);
-    assert_eq(rc, 0, "slot return value propagates");
-    assert_eq(_step3d_release_count, 1, "slot dispatched once");
-    assert_eq(_step3d_release_ctx, ctx,    "arg 1 = ctx");
-    assert_eq(_step3d_release_buf, 0xBEEF, "arg 2 = buf");
+fn test_native_gfx9_shader_endpgm_writes_bytes() {
+    var buf[16];
+    memset(&buf, 0xFF, 16);
+    var pos = native_gfx9_shader_endpgm(&buf, 0);
+    assert_eq(pos, 4, "endpgm wrote 4 bytes");
+    assert_eq(load32(&buf + 0), 0xBF810000, "endpgm bytes");
     return 0;
 }
 
-fn test_gpu_buffer_dispatchers_null_ctx_safe() {
-    _step3d_create_count = 0;
-    _step3d_write_count = 0;
-    _step3d_release_count = 0;
-    assert_eq(gpu_buffer_create(0, 1024, 0xF), 0, "create null returns 0");
-    assert_eq(gpu_buffer_write(0, 0, 0, 0, 0), GPU_ERR_BUFFER, "write null returns err");
-    assert_eq(gpu_buffer_release(0, 0), 0, "release null returns 0");
+fn test_native_gfx9_shader_store_deadbeef_writes_bytes() {
+    # Byte-exact assertion against clang -target amdgcn--amdhsa
+    # -mcpu=gfx90c output. If clang's encoding of any of these
+    # instructions ever changes (unlikely for a stable ISA), this
+    # test is the canary.
+    var buf[128];
+    memset(&buf, 0xFF, 128);
+    var pos = native_gfx9_shader_store_deadbeef(&buf, 0);
+    assert_eq(pos, 96, "store shader total = 32 B instr + 64 B NOP pad");
+    assert_eq(load32(&buf +  0), 0x7E000200, "v_mov_b32_e32 v0, s0");
+    assert_eq(load32(&buf +  4), 0x7E020201, "v_mov_b32_e32 v1, s1");
+    assert_eq(load32(&buf +  8), 0x7E0402FF, "v_mov_b32_e32 v2, <literal>");
+    assert_eq(load32(&buf + 12), 0xDEADBEEF, "literal 0xDEADBEEF");
+    assert_eq(load32(&buf + 16), 0xDC738000, "global_store_dword dword 1 (FLAT + glc + slc)");
+    assert_eq(load32(&buf + 20), 0x007F0200, "global_store_dword dword 2 (addr=v0 data=v2 saddr=off)");
+    assert_eq(load32(&buf + 24), 0xBF8C0070, "s_waitcnt vmcnt(0) lgkmcnt(0)");
+    assert_eq(load32(&buf + 28), 0xBF810000, "s_endpgm");
+    assert_eq(load32(&buf + 32), 0xBF800000, "NOP pad [0]");
+    assert_eq(load32(&buf + 92), 0xBF800000, "NOP pad [15]");
     return 0;
 }
 
-# ================================================================
-# v3 Step 3e — gpu_shader_module_create / release dispatch
-# ================================================================
-# fncall3 (create, 3 args + ctx) and fncall2 (release, 2 args + ctx)
-# re-validation on a different slot pair than buffer.cyr.
-
-var _step3e_create_count = 0;
-var _step3e_create_ctx   = 0;
-var _step3e_create_bytes = 0;
-var _step3e_create_n     = 0;
-var _step3e_release_count = 0;
-var _step3e_release_ctx   = 0;
-var _step3e_release_handle = 0;
-
-fn _step3e_shmod_create_capture(ctx, bp, n) {
-    _step3e_create_count = _step3e_create_count + 1;
-    _step3e_create_ctx = ctx;
-    _step3e_create_bytes = bp;
-    _step3e_create_n = n;
-    return 0xBA5;
-}
-
-fn _step3e_shmod_release_capture(ctx, h) {
-    _step3e_release_count = _step3e_release_count + 1;
-    _step3e_release_ctx = ctx;
-    _step3e_release_handle = h;
+fn test_native_syncobj_ioctl_encodings() {
+    # All three are _IOWR('d', nr, struct syncobj_*).
+    var create_expected  = native_ioc_encode(3, DRM_SYNCOBJ_CREATE_SIZE,  DRM_IOCTL_TYPE, 0xBF);
+    var destroy_expected = native_ioc_encode(3, DRM_SYNCOBJ_DESTROY_SIZE, DRM_IOCTL_TYPE, 0xC0);
+    var wait_expected    = native_ioc_encode(3, DRM_SYNCOBJ_WAIT_SIZE,    DRM_IOCTL_TYPE, 0xC3);
+    assert_eq(DRM_IOCTL_SYNCOBJ_CREATE,  create_expected,  "SYNCOBJ_CREATE ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_DESTROY, destroy_expected, "SYNCOBJ_DESTROY ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_WAIT,    wait_expected,    "SYNCOBJ_WAIT ioctl");
+    assert_eq(DRM_IOCTL_SYNCOBJ_CREATE,  0xC00864BF, "SYNCOBJ_CREATE = 0xC00864BF");
+    assert_eq(DRM_IOCTL_SYNCOBJ_DESTROY, 0xC00864C0, "SYNCOBJ_DESTROY = 0xC00864C0");
+    assert_eq(DRM_IOCTL_SYNCOBJ_WAIT,    0xC02864C3, "SYNCOBJ_WAIT = 0xC02864C3 (40-byte struct)");
     return 0;
 }
 
-fn test_gpu_shader_module_create_dispatches_through_backend() {
-    _step3e_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE, &_step3e_shmod_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var got = gpu_shader_module_create(ctx, 0xCAFE, 256);
-    assert_eq(got, 0xBA5, "slot return propagates");
-    assert_eq(_step3e_create_count, 1, "slot dispatched once");
-    assert_eq(_step3e_create_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step3e_create_bytes, 0xCAFE, "arg 2 = bytes");
-    assert_eq(_step3e_create_n, 256, "arg 3 = n");
+fn test_native_syncobj_sizes_and_flags() {
+    assert_eq(DRM_SYNCOBJ_CREATE_SIZE,  8,  "syncobj_create = 8");
+    assert_eq(DRM_SYNCOBJ_DESTROY_SIZE, 8,  "syncobj_destroy = 8");
+    assert_eq(DRM_SYNCOBJ_WAIT_SIZE,    40, "syncobj_wait = 40");
+    assert_eq(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,        0x1, "WAIT_ALL = 0x1");
+    assert_eq(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, 0x2, "WAIT_FOR_SUBMIT = 0x2");
     return 0;
 }
 
-fn test_gpu_shader_module_release_dispatches_through_backend() {
-    _step3e_release_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE, &_step3e_shmod_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_shader_module_release(ctx, 0x5EED);
-    assert_eq(rc, 0, "slot return propagates");
-    assert_eq(_step3e_release_count, 1, "slot dispatched once");
-    assert_eq(_step3e_release_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step3e_release_handle, 0x5EED, "arg 2 = handle");
+fn test_native_cs_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_AMDGPU_CS_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + DRM_AMDGPU_CS);
+    assert_eq(DRM_IOCTL_AMDGPU_CS, expected, "AMDGPU_CS ioctl");
+    assert_eq(DRM_IOCTL_AMDGPU_CS, 0xC0186444, "precomputed constant");
+    assert_eq(DRM_AMDGPU_CS, 0x04, "CS nr offset");
     return 0;
 }
 
-fn test_gpu_shader_module_dispatchers_null_ctx_safe() {
-    _step3e_create_count = 0;
-    _step3e_release_count = 0;
-    assert_eq(gpu_shader_module_create(0, 0xCAFE, 256), 0, "create null = 0");
-    assert_eq(gpu_shader_module_release(0, 0x5EED), 0, "release null = 0");
-    assert_eq(_step3e_create_count, 0, "create did not dispatch");
-    assert_eq(_step3e_release_count, 0, "release did not dispatch");
+fn test_native_cs_struct_sizes() {
+    assert_eq(DRM_AMDGPU_CS_SIZE,               24, "union drm_amdgpu_cs = 24");
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SIZE,         16, "drm_amdgpu_cs_chunk = 16");
+    assert_eq(DRM_AMDGPU_CS_CHUNK_IB_SIZE,      32, "drm_amdgpu_cs_chunk_ib = 32");
+    # _sem struct: u32 handle only, used by SYNCOBJ_OUT / SYNCOBJ_IN /
+    # DEPENDENCIES / SCHEDULED_DEPENDENCIES chunks.
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SEM_SIZE,      4, "drm_amdgpu_cs_chunk_sem = 4");
+    # _syncobj struct: 16 bytes, used by SYNCOBJ_TIMELINE_WAIT/SIGNAL only.
+    assert_eq(DRM_AMDGPU_CS_CHUNK_SYNCOBJ_SIZE, 16, "drm_amdgpu_cs_chunk_syncobj = 16");
     return 0;
 }
 
-# ================================================================
-# v3 Step 3f — gpu_device_wait_idle dispatch
-# ================================================================
-# Single-arg dispatcher; validates fncall1 on a third distinct
-# slot (ctx_release in 3b, smoke test in 1, this slot now).
-
-var _step3f_wait_count = 0;
-var _step3f_wait_ctx = 0;
-
-fn _step3f_wait_capture(ctx) {
-    _step3f_wait_count = _step3f_wait_count + 1;
-    _step3f_wait_ctx = ctx;
+fn test_native_cs_chunk_ids_and_ip_types() {
+    assert_eq(AMDGPU_CHUNK_ID_IB,          0x01, "CHUNK_ID_IB");
+    assert_eq(AMDGPU_CHUNK_ID_FENCE,       0x02, "CHUNK_ID_FENCE");
+    assert_eq(AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 0x05, "CHUNK_ID_SYNCOBJ_OUT");
+    assert_eq(AMDGPU_HW_IP_GFX,     0, "HW_IP_GFX");
+    assert_eq(AMDGPU_HW_IP_COMPUTE, 1, "HW_IP_COMPUTE");
     return 0;
 }
 
-fn test_gpu_device_wait_idle_dispatches_through_backend() {
-    _step3f_wait_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE, &_step3f_wait_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_device_wait_idle(ctx);
-    assert_eq(rc, 0, "slot return propagates");
-    assert_eq(_step3f_wait_count, 1, "slot dispatched once");
-    assert_eq(_step3f_wait_ctx, ctx, "arg 1 = ctx");
-    return 0;
-}
-
-fn test_gpu_device_wait_idle_null_ctx_safe() {
-    _step3f_wait_count = 0;
-    assert_eq(gpu_device_wait_idle(0), 0, "null ctx returns 0");
-    assert_eq(_step3f_wait_count, 0, "did not dispatch");
-    return 0;
-}
-
-# ================================================================
-# v3 Step 3g — gpu_compute_dispatch dispatch (fncall6)
-# ================================================================
-# Highest-arity slot. First Cyrius-to-Cyrius fncall6 through a
-# struct slot in mabda. Distinct sentinels chosen for each arg so
-# any swap/rotation surfaces as a specific assertion failure.
-
-var _step3g_dispatch_count = 0;
-var _step3g_dispatch_ctx = 0;
-var _step3g_dispatch_shmod = 0;
-var _step3g_dispatch_x = 0;
-var _step3g_dispatch_y = 0;
-var _step3g_dispatch_z = 0;
-var _step3g_dispatch_bp = 0;
-
-fn _step3g_dispatch_capture(ctx, shmod, x, y, z, bp) {
-    _step3g_dispatch_count = _step3g_dispatch_count + 1;
-    _step3g_dispatch_ctx = ctx;
-    _step3g_dispatch_shmod = shmod;
-    _step3g_dispatch_x = x;
-    _step3g_dispatch_y = y;
-    _step3g_dispatch_z = z;
-    _step3g_dispatch_bp = bp;
-    return 0xD15A;
-}
-
-fn test_gpu_compute_dispatch_dispatches_through_backend() {
-    _step3g_dispatch_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_step3g_dispatch_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_compute_dispatch(ctx, 0xBEEF, 64, 32, 16, 0xCAFE);
-    assert_eq(rc, 0xD15A, "slot return propagates through fncall6");
-    assert_eq(_step3g_dispatch_count, 1, "slot dispatched once");
-    assert_eq(_step3g_dispatch_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step3g_dispatch_shmod, 0xBEEF, "arg 2 = shmod");
-    assert_eq(_step3g_dispatch_x, 64, "arg 3 = x");
-    assert_eq(_step3g_dispatch_y, 32, "arg 4 = y");
-    assert_eq(_step3g_dispatch_z, 16, "arg 5 = z");
-    assert_eq(_step3g_dispatch_bp, 0xCAFE, "arg 6 = bp");
-    return 0;
-}
-
-fn test_gpu_compute_dispatch_null_ctx_returns_err() {
-    _step3g_dispatch_count = 0;
-    var rc = gpu_compute_dispatch(0, 0, 0, 0, 0, 0);
-    assert_eq(rc, GPU_ERR_OTHER, "null ctx returns err");
-    assert_eq(_step3g_dispatch_count, 0, "did not dispatch");
-    return 0;
-}
-
-# Audit 2026-06-14 [MED-3]: the v3 gpu_compute_dispatch dropped the
-# workgroup-count validation its v2 sibling compute_dispatch enforces.
-# Restored — invalid counts must be rejected BEFORE the slot fires (and
-# before they bake into a PM4 dispatch + CS submit on native).
-fn test_gpu_compute_dispatch_rejects_bad_dims() {
-    _step3g_dispatch_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_step3g_dispatch_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x=0 rejected");
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0 - 1, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x<0 rejected");
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 0, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "y=0 rejected");
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 1, 0, 0), GPU_ERR_WORKGROUP_LIMIT, "z=0 rejected");
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 65536, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x>65535 rejected");
-    assert_eq(_step3g_dispatch_count, 0, "slot never reached for invalid dims");
-    # a valid dispatch still flows through to the slot
-    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 64, 1, 1, 0), 0xD15A, "valid dispatch reaches slot");
-    assert_eq(_step3g_dispatch_count, 1, "slot fired once for valid dims");
+fn test_native_pm4_builder_composability() {
+    # Chain operations: NOP(pad=2) + SET_SH_REG(one) + DISPATCH_DIRECT.
+    # NOP pad=2 (minimum useful per Session 25b): 1 header + 1 filler dword.
+    # Expected layout:
+    #   0x00-0x03: NOP header (count_minus_1 = 0)
+    #   0x04-0x07: NOP filler (zero)
+    #   0x08-0x13: SET_SH_REG DISPATCH_INITIATOR = 1 (3 dwords)
+    #   0x14-0x27: DISPATCH_DIRECT 1,1,1, init=1 (5 dwords)
+    # Total: 10 dwords = 40 bytes.
+    var buf[64];
+    memset(&buf, 0, 64);
+    var pos = 0;
+    pos = native_pm4_nop(&buf, pos, 2);
+    pos = native_pm4_set_sh_reg_one(&buf, pos, R_COMPUTE_DISPATCH_INITIATOR, 1);
+    pos = native_pm4_dispatch_direct(&buf, pos, 1, 1, 1, COMPUTE_DISPATCH_INITIATOR_MIN);
+    assert_eq(pos, 40, "composed stream = 40 bytes");
+    # Spot check: each header at its expected offset.
+    assert_eq(load32(&buf + 0),  0xC0001000, "NOP header at 0");
+    assert_eq(load32(&buf + 8),  0xC0017600, "SET_SH_REG header at 8");
+    assert_eq(load32(&buf + 20), 0xC0031502, "DISPATCH_DIRECT header at 20 (shader_type=compute)");
     return 0;
 }
 
@@ -896,19 +624,6 @@ fn test_backend_native_compute_dispatch_null_args_err() {
     return 0;
 }
 
-# ================================================================
-# v3 Step 4e — MABDA_BACKEND_KIND selector + stub_addr accessor
-# ================================================================
-# The constant defaults to WGPU. Native programs opt in via the
-# explicit gpu_context_new_native() entry point regardless of the
-# global default. Layout test below exercises the +40 stub_addr
-# field that grew GpuContext from 40 → 48 bytes.
-
-fn test_mabda_backend_kind_default_is_wgpu() {
-    assert_eq(MABDA_BACKEND_KIND, BACKEND_KIND_WGPU, "default selector = WGPU");
-    return 0;
-}
-
 fn test_native_ctx_stub_addr_accessor() {
     var ctx = alloc(112);
     memset(ctx, 0, 112);
@@ -996,114 +711,6 @@ fn test_native_perm_bits_distinct() {
     assert(AMDGPU_VM_PAGE_READABLE != AMDGPU_VM_PAGE_WRITEABLE, "R != W");
     assert(AMDGPU_VM_PAGE_WRITEABLE != AMDGPU_VM_PAGE_EXECUTABLE, "W != X");
     assert(AMDGPU_VM_PAGE_READABLE != AMDGPU_VM_PAGE_EXECUTABLE, "R != X");
-    return 0;
-}
-
-# ================================================================
-# v3 Step 4f.iii — Resource tracker ctx-aware integration
-# ================================================================
-# FrameResources grew from 16 → 24 bytes; +0 holds an optional
-# GpuContext*. frame_resources_release_buffers routes through
-# gpu_buffer_release(ctx, h), which dispatches through
-# ctx->backend->buffer_release. Mock-backend tests below verify
-# dispatch semantics; counter increments per call confirm the
-# tracker calls the slot exactly once per tracked handle.
-
-var _step4f3_release_count = 0;
-var _step4f3_release_handles[64];
-
-fn _step4f3_release_capture(ctx, buf) {
-    var idx = _step4f3_release_count;
-    if (idx < 8) {
-        store64(&_step4f3_release_handles + idx * 8, buf);
-    }
-    _step4f3_release_count = _step4f3_release_count + 1;
-    return 0;
-}
-
-fn test_frame_resources_new_legacy_no_ctx() {
-    var fr = frame_resources_new();
-    assert(fr != 0, "fr non-null");
-    assert_eq(frame_resources_ctx(fr), 0, "legacy ctor leaves ctx zero");
-    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
-    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
-    return 0;
-}
-
-fn test_frame_resources_new_for_stores_ctx() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    var fr = frame_resources_new_for(ctx);
-    assert_eq(frame_resources_ctx(fr), ctx, "ctx stored at +0");
-    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
-    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
-    return 0;
-}
-
-fn test_frame_resources_track_buffers_and_textures() {
-    var fr = frame_resources_new();
-    frame_resources_track_buffer(fr, 0xAA01);
-    frame_resources_track_buffer(fr, 0xAA02);
-    frame_resources_track_buffer(fr, 0xAA03);
-    frame_resources_track_texture(fr, 0xBB01);
-    frame_resources_track_texture(fr, 0xBB02);
-    assert_eq(frame_resources_buffer_count(fr), 3, "3 buffers");
-    assert_eq(frame_resources_texture_count(fr), 2, "2 textures");
-    return 0;
-}
-
-fn test_frame_resources_clear_pops_all() {
-    var fr = frame_resources_new();
-    frame_resources_track_buffer(fr, 0xCAFE);
-    frame_resources_track_texture(fr, 0xBEEF);
-    assert_eq(frame_resources_buffer_count(fr), 1, "1 buffer pre-clear");
-    assert_eq(frame_resources_texture_count(fr), 1, "1 texture pre-clear");
-    frame_resources_clear(fr);
-    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty post-clear");
-    assert_eq(frame_resources_texture_count(fr), 0, "textures empty post-clear");
-    return 0;
-}
-
-fn test_frame_resources_release_buffers_dispatches_through_backend() {
-    # Synth a ctx with a mock backend whose buffer_release slot
-    # counts calls and captures handles.
-    _step4f3_release_count = 0;
-    memset(&_step4f3_release_handles, 0, 64);
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE, &_step4f3_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var fr = frame_resources_new_for(ctx);
-    frame_resources_track_buffer(fr, 0xAA01);
-    frame_resources_track_buffer(fr, 0xAA02);
-    frame_resources_track_buffer(fr, 0xAA03);
-    var n = frame_resources_release_buffers(fr);
-    assert_eq(n, 3, "released 3 buffers");
-    assert_eq(_step4f3_release_count, 3, "slot dispatched 3 times");
-    assert_eq(frame_resources_buffer_count(fr), 0, "tracker drained");
-    # All 3 handles passed through — order is LIFO since we vec_pop.
-    var h0 = load64(&_step4f3_release_handles + 0);
-    var h1 = load64(&_step4f3_release_handles + 8);
-    var h2 = load64(&_step4f3_release_handles + 16);
-    assert(h0 != 0, "handle 0 captured");
-    assert(h1 != 0, "handle 1 captured");
-    assert(h2 != 0, "handle 2 captured");
-    # Sum check (any order — all 3 must have been seen)
-    var total = h0 + h1 + h2;
-    assert_eq(total, 0xAA01 + 0xAA02 + 0xAA03, "all 3 handles seen");
-    return 0;
-}
-
-fn test_frame_resources_release_buffers_no_ctx_is_noop() {
-    _step4f3_release_count = 0;
-    var fr = frame_resources_new();    # legacy, no ctx
-    frame_resources_track_buffer(fr, 0xDEAD);
-    var n = frame_resources_release_buffers(fr);
-    assert_eq(n, 0, "no-ctx fr releases 0");
-    assert_eq(_step4f3_release_count, 0, "did not dispatch");
-    # Buffer remains tracked — caller must clear manually.
-    assert_eq(frame_resources_buffer_count(fr), 1, "buffer still tracked");
     return 0;
 }
 
@@ -1287,84 +894,6 @@ fn test_native_texture_release_zero_handle_safe() {
 }
 
 # ================================================================
-# v3 Step 5.5 — wgpu texture wrapper null-arg safety
-# ================================================================
-# The wgpu texture slot wrappers call into wgpu_device / queue
-# primitives that need a real GPU. CPU-only tests cover the
-# guard paths (null ctx, null tex, n mismatch, etc.) that
-# short-circuit before any wgpu call. End-to-end validation
-# happens in Step 5.9 via a phase0 Test 12 family.
-
-fn test_backend_wgpu_texture_create_null_ctx_returns_zero() {
-    var rc = _backend_wgpu_texture_create_2d_rgba8(0, 16, 16);
-    assert_eq(rc, 0, "null ctx → 0 (no struct allocated)");
-    return 0;
-}
-
-fn test_backend_wgpu_texture_create_zero_dim_returns_zero() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 0, 16),  0, "w=0 → 0");
-    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 16, 0),  0, "h=0 → 0");
-    assert_eq(_backend_wgpu_texture_create_2d_rgba8(ctx, 0, 0),   0, "0x0 → 0");
-    return 0;
-}
-
-fn test_backend_wgpu_texture_write_null_args_err() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    var tex[32];
-    memset(&tex, 0, 32);
-    store32(&tex + 24, 16);
-    store32(&tex + 28, 16);
-    var src[64];
-    memset(&src, 0, 64);
-    assert_eq(_backend_wgpu_texture_write(0, &tex, &src, 1024),  GPU_ERR_OTHER,  "null ctx");
-    assert_eq(_backend_wgpu_texture_write(ctx, 0, &src, 1024),   GPU_ERR_OTHER,  "null tex");
-    assert_eq(_backend_wgpu_texture_write(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null src");
-    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 0),   GPU_ERR_BUFFER, "n=0");
-    return 0;
-}
-
-fn test_backend_wgpu_texture_write_size_mismatch_err() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    var tex[32];
-    memset(&tex, 0, 32);
-    store32(&tex + 24, 16);
-    store32(&tex + 28, 16);
-    var src[64];
-    memset(&src, 0, 64);
-    # 16x16 RGBA8 = 1024 bytes; passing 100 mismatches.
-    assert_eq(_backend_wgpu_texture_write(ctx, &tex, &src, 100), GPU_ERR_BUFFER, "n != w*h*4");
-    return 0;
-}
-
-fn test_backend_wgpu_texture_read_null_args_err() {
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    var tex[32];
-    memset(&tex, 0, 32);
-    store32(&tex + 24, 16);
-    store32(&tex + 28, 16);
-    var dst[64];
-    memset(&dst, 0, 64);
-    assert_eq(_backend_wgpu_texture_read(0, &tex, &dst, 1024),  GPU_ERR_OTHER,  "null ctx");
-    assert_eq(_backend_wgpu_texture_read(ctx, 0, &dst, 1024),   GPU_ERR_OTHER,  "null tex");
-    assert_eq(_backend_wgpu_texture_read(ctx, &tex, 0, 1024),   GPU_ERR_BUFFER, "null dst");
-    assert_eq(_backend_wgpu_texture_read(ctx, &tex, &dst, 0),   GPU_ERR_BUFFER, "n=0");
-    return 0;
-}
-
-fn test_backend_wgpu_texture_release_null_safe() {
-    assert_eq(_backend_wgpu_texture_release(0, 0), 0, "null ctx is safe");
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    assert_eq(_backend_wgpu_texture_release(ctx, 0), 0, "null tex is safe");
-    return 0;
-}
-
-# ================================================================
 # v3 Step 5.6 — native texture wrapper safety
 # ================================================================
 # Native side wraps the Step 5.1+5.2 primitives. Create needs a
@@ -1451,86 +980,6 @@ fn test_backend_native_texture_release_null_safe() {
     var ctx = alloc(112);
     memset(ctx, 0, 112);
     assert_eq(_backend_native_texture_release(ctx, 0), 0, "null tex is safe");
-    return 0;
-}
-
-# ================================================================
-# v3 Step 5.7 — public gpu_texture_* dispatch through backend
-# ================================================================
-# Mock backend with counter+capture. Validates fncall threading on
-# all 4 dispatchers. fncall4 (write/read) is the new shape this
-# step exercises end-to-end.
-
-var _step57_create_count = 0;
-var _step57_create_ctx   = 0;
-var _step57_create_w     = 0;
-var _step57_create_h     = 0;
-
-fn _step57_create_capture(ctx, w, h) {
-    _step57_create_count = _step57_create_count + 1;
-    _step57_create_ctx = ctx;
-    _step57_create_w = w;
-    _step57_create_h = h;
-    return 0xCAFE;
-}
-
-fn test_gpu_texture_create_dispatches_through_backend() {
-    _step57_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, &_step57_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var got = gpu_texture_create_2d_rgba8(ctx, 64, 32);
-    assert_eq(got, 0xCAFE, "slot return propagates");
-    assert_eq(_step57_create_count, 1, "slot dispatched once");
-    assert_eq(_step57_create_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step57_create_w, 64, "arg 2 = width");
-    assert_eq(_step57_create_h, 32, "arg 3 = height");
-    return 0;
-}
-
-# Audit 2026-06-14 [HIGH-1]: the v3 gpu_texture_create_2d_rgba8 dropped
-# the dimension validation its v2 sibling texture_create_rgba8 enforces.
-# Restored — non-positive / oversized dims must be rejected (returning 0)
-# BEFORE the slot fires, so an unvalidated width*height*4 never reaches
-# the native GEM_CREATE ioctl + mmap.
-fn test_gpu_texture_create_2d_rgba8_validates_dims() {
-    _step57_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, &_step57_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    assert_eq(gpu_texture_create_2d_rgba8(ctx, 0, 16), 0, "width=0 rejected");
-    assert_eq(gpu_texture_create_2d_rgba8(ctx, 16, 0 - 1), 0, "height<0 rejected");
-    assert_eq(gpu_texture_create_2d_rgba8(ctx, 100000, 100000), 0, "oversized rejected (no overflow to slot)");
-    assert_eq(_step57_create_count, 0, "slot never reached for invalid dims");
-    var t = gpu_texture_create_2d_rgba8(ctx, 256, 256);
-    assert_eq(t, 0xCAFE, "valid dims reach slot");
-    assert_eq(_step57_create_count, 1, "slot fired once for valid dims");
-    return 0;
-}
-
-# Audit 2026-06-14 [HIGH-3]/[MED-4]: WGSL shader source must not be
-# truncated at the 4 KiB label cap. wgpu_shader_source_wgsl_len writes the
-# exact caller-supplied length; the cstr path scans up to the (1 MiB)
-# shader-source cap, not WGPU_LABEL_MAX_BYTES.
-fn test_wgsl_source_explicit_length() {
-    var src = wgpu_shader_source_wgsl_len(0xCAFE, 9000);
-    # WGPUShaderSourceWGSL.code StringView at +16: data @ +16, length @ +24.
-    assert_eq(load64(src + 16), 0xCAFE, "source data ptr stored");
-    assert_eq(load64(src + 24), 9000, "explicit length stored uncapped");
-    return 0;
-}
-
-fn test_wgsl_source_cstr_not_truncated_at_4k() {
-    var n = 5000;
-    var buf = alloc(n + 1);
-    memset(buf, 65, n);        # 'A' filler — no embedded NUL
-    store8(buf + n, 0);        # NUL terminator at byte 5000
-    var src = wgpu_shader_source_wgsl(buf);
-    assert_eq(load64(src + 24), 5000, "5000-byte WGSL source not capped at 4096");
     return 0;
 }
 
@@ -1623,171 +1072,6 @@ fn test_native_gfx9_shader_downsample_2x2() {
         i = i + 4;
     }
     assert_eq(sum, 179445143226, "downsample shader dword checksum");
-    return 0;
-}
-
-# v3.1 [M.3(wgpu)]: per-level view descriptor sets baseMipLevel; the rest
-# matches the base view builder (mipLevelCount=1, single layer).
-fn test_wgpu_texture_view_descriptor_level() {
-    var d = wgpu_texture_view_descriptor_level("mip", WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
-    WGPU_TEXTURE_VIEW_DIMENSION_2D, 3);
-    assert_eq(load32(d + 24), WGPU_TEXTURE_FORMAT_RGBA8_UNORM, "format @24");
-    assert_eq(load32(d + 28), WGPU_TEXTURE_VIEW_DIMENSION_2D,  "dimension @28");
-    assert_eq(load32(d + 32), 3, "baseMipLevel @32 = requested level");
-    assert_eq(load32(d + 36), 1, "mipLevelCount @36 = 1 (single level)");
-    assert_eq(load32(d + 44), 1, "arrayLayerCount @44 = 1");
-    return 0;
-}
-
-# v3.1 [M.3(wgpu)]: sampled + storage BGL entries (sub-struct offsets
-# cross-checked against webgpu.h v29).
-fn test_wgpu_bgl_entry_texture() {
-    var e[120];
-    wgpu_bgl_entry_texture(&e, 0, WGPU_SHADER_STAGE_COMPUTE,
-    WGPU_TEXTURE_SAMPLE_TYPE_FLOAT, WGPU_TEXTURE_VIEW_DIMENSION_2D, 0);
-    assert_eq(load32(&e + 8),  0, "binding @8");
-    assert_eq(load64(&e + 16), WGPU_SHADER_STAGE_COMPUTE, "visibility @16");
-    assert_eq(load32(&e + 80), WGPU_TEXTURE_SAMPLE_TYPE_FLOAT, "sampleType @80");
-    assert_eq(load32(&e + 84), WGPU_TEXTURE_VIEW_DIMENSION_2D, "viewDimension @84");
-    assert_eq(load32(&e + 88), 0, "multisampled @88 = false");
-    # other binding-layout sub-structs left zero (BindingNotUsed)
-    assert_eq(load32(&e + 40), 0, "buffer.type @40 = 0");
-    assert_eq(load32(&e + 104), 0, "storageTexture.access @104 = 0");
-    return 0;
-}
-
-fn test_wgpu_bgl_entry_storage_texture() {
-    var e[120];
-    wgpu_bgl_entry_storage_texture(&e, 1, WGPU_SHADER_STAGE_COMPUTE,
-    WGPU_STORAGE_TEXTURE_ACCESS_WRITE_ONLY, WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
-    WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    assert_eq(load32(&e + 8),   1, "binding @8");
-    assert_eq(load64(&e + 16),  WGPU_SHADER_STAGE_COMPUTE, "visibility @16");
-    assert_eq(load32(&e + 104), WGPU_STORAGE_TEXTURE_ACCESS_WRITE_ONLY, "access @104");
-    assert_eq(load32(&e + 108), WGPU_TEXTURE_FORMAT_RGBA8_UNORM, "format @108");
-    assert_eq(load32(&e + 112), WGPU_TEXTURE_VIEW_DIMENSION_2D, "viewDimension @112");
-    assert_eq(load32(&e + 80),  0, "texture.sampleType @80 = 0");
-    return 0;
-}
-
-# v3.1 [M.4(wgpu)]: the WGSL downsample shader source — smoke checks
-# (full validation is on wgpu HW in M.7, like the native shader).
-fn test_wgsl_downsample_source() {
-    var buf[640];
-    memset(&buf, 0, 640);
-    var len = mabda_wgsl_downsample_2x2(&buf);
-    assert(len > 200, "WGSL source is non-trivial length");
-    assert(len < 640, "WGSL fits the documented 640-byte buffer");
-    assert_eq(load8(&buf), 0x40, "starts with '@' (@group)");
-    assert_eq(load8(&buf + len), 0, "NUL-terminated at returned length");
-    # the builder length matches an independent NUL scan
-    assert_eq(_wgpu_strnlen(&buf, 4096), len, "strnlen agrees with builder length");
-    return 0;
-}
-
-var _step57_write_count = 0;
-var _step57_write_ctx = 0;
-var _step57_write_tex = 0;
-var _step57_write_src = 0;
-var _step57_write_n   = 0;
-
-fn _step57_write_capture(ctx, tex, src, n) {
-    _step57_write_count = _step57_write_count + 1;
-    _step57_write_ctx = ctx;
-    _step57_write_tex = tex;
-    _step57_write_src = src;
-    _step57_write_n = n;
-    return 0;
-}
-
-fn test_gpu_texture_write_dispatches_through_backend() {
-    _step57_write_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_step57_write_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_texture_write(ctx, 0xBEEF, 0xCAFE, 1024);
-    assert_eq(rc, 0, "slot return propagates");
-    assert_eq(_step57_write_count, 1, "slot dispatched once");
-    assert_eq(_step57_write_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step57_write_tex, 0xBEEF, "arg 2 = tex");
-    assert_eq(_step57_write_src, 0xCAFE, "arg 3 = src");
-    assert_eq(_step57_write_n, 1024, "arg 4 = n");
-    return 0;
-}
-
-var _step57_read_count = 0;
-var _step57_read_ctx = 0;
-var _step57_read_tex = 0;
-var _step57_read_dst = 0;
-var _step57_read_n   = 0;
-
-fn _step57_read_capture(ctx, tex, dst, n) {
-    _step57_read_count = _step57_read_count + 1;
-    _step57_read_ctx = ctx;
-    _step57_read_tex = tex;
-    _step57_read_dst = dst;
-    _step57_read_n = n;
-    return 0;
-}
-
-fn test_gpu_texture_read_dispatches_through_backend() {
-    _step57_read_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ, &_step57_read_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_texture_read(ctx, 0xBEEF, 0xDEED, 2048);
-    assert_eq(rc, 0, "slot return propagates");
-    assert_eq(_step57_read_count, 1, "slot dispatched once");
-    assert_eq(_step57_read_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step57_read_tex, 0xBEEF, "arg 2 = tex");
-    assert_eq(_step57_read_dst, 0xDEED, "arg 3 = dst");
-    assert_eq(_step57_read_n, 2048, "arg 4 = n");
-    return 0;
-}
-
-var _step57_release_count = 0;
-var _step57_release_ctx = 0;
-var _step57_release_tex = 0;
-
-fn _step57_release_capture(ctx, tex) {
-    _step57_release_count = _step57_release_count + 1;
-    _step57_release_ctx = ctx;
-    _step57_release_tex = tex;
-    return 0;
-}
-
-fn test_gpu_texture_release_dispatches_through_backend() {
-    _step57_release_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_step57_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_texture_release(ctx, 0xBEEF);
-    assert_eq(rc, 0, "slot return propagates");
-    assert_eq(_step57_release_count, 1, "slot dispatched once");
-    assert_eq(_step57_release_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step57_release_tex, 0xBEEF, "arg 2 = tex");
-    return 0;
-}
-
-fn test_gpu_texture_dispatchers_null_ctx_safe() {
-    _step57_create_count = 0;
-    _step57_write_count = 0;
-    _step57_read_count = 0;
-    _step57_release_count = 0;
-    assert_eq(gpu_texture_create_2d_rgba8(0, 16, 16), 0, "create null ctx = 0");
-    assert_eq(gpu_texture_write(0, 0, 0, 0), GPU_ERR_OTHER, "write null ctx = err");
-    assert_eq(gpu_texture_read(0, 0, 0, 0), GPU_ERR_OTHER, "read null ctx = err");
-    assert_eq(gpu_texture_release(0, 0), 0, "release null ctx = 0");
-    assert_eq(_step57_create_count, 0, "create did not dispatch");
-    assert_eq(_step57_write_count, 0, "write did not dispatch");
-    assert_eq(_step57_read_count, 0, "read did not dispatch");
-    assert_eq(_step57_release_count, 0, "release did not dispatch");
     return 0;
 }
 
@@ -2815,200 +2099,6 @@ fn test_native_pm4_event_write_advances_pos() {
     return 0;
 }
 
-# v3 Phase D (Step 7.x) tests live in tests/tcyr/mabda_v3_phase_d.tcyr
-# — moved 2026-04-30 to keep this file under cyrlint's 128 KiB cap.
-
-# ================================================================
-# v3 Step 6.9 — public render-* dispatchers route through Backend
-# ================================================================
-# 7 mock-backend dispatch tests proving each public gpu_render_*
-# fn correctly threads ctx + args through ctx->backend->slot via
-# the right fncallN. Wgpu wires up the real bodies (Step 6.8b);
-# native gets bodies in Step 6.8c.
-
-var _step69_rt_create_count = 0;
-var _step69_rt_create_ctx = 0;
-var _step69_rt_create_w = 0;
-var _step69_rt_create_h = 0;
-fn _step69_rt_create_capture(ctx, w, h) {
-    _step69_rt_create_count = _step69_rt_create_count + 1;
-    _step69_rt_create_ctx = ctx;
-    _step69_rt_create_w = w;
-    _step69_rt_create_h = h;
-    return 0xCAFE01;
-}
-fn test_gpu_render_target_create_dispatches_through_backend() {
-    _step69_rt_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
-    &_step69_rt_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var got = gpu_render_target_create_2d_rgba8(ctx, 256, 128);
-    assert_eq(got, 0xCAFE01, "slot return value propagates");
-    assert_eq(_step69_rt_create_count, 1, "slot dispatched once");
-    assert_eq(_step69_rt_create_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step69_rt_create_w, 256, "arg 2 = width");
-    assert_eq(_step69_rt_create_h, 128, "arg 3 = height");
-    return 0;
-}
-
-var _step69_rt_release_count = 0;
-var _step69_rt_release_ctx = 0;
-var _step69_rt_release_rt = 0;
-fn _step69_rt_release_capture(ctx, rt) {
-    _step69_rt_release_count = _step69_rt_release_count + 1;
-    _step69_rt_release_ctx = ctx;
-    _step69_rt_release_rt = rt;
-    return 0;
-}
-fn test_gpu_render_target_release_dispatches_through_backend() {
-    _step69_rt_release_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
-    &_step69_rt_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    gpu_render_target_release(ctx, 0xBEEF02);
-    assert_eq(_step69_rt_release_count, 1, "slot dispatched once");
-    assert_eq(_step69_rt_release_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step69_rt_release_rt, 0xBEEF02, "arg 2 = rt");
-    return 0;
-}
-
-var _step69_pipe_create_count = 0;
-var _step69_pipe_create_ctx = 0;
-var _step69_pipe_create_vs = 0;
-var _step69_pipe_create_fs = 0;
-var _step69_pipe_create_fmt = 0;
-fn _step69_pipe_create_capture(ctx, vs, fs, fmt) {
-    _step69_pipe_create_count = _step69_pipe_create_count + 1;
-    _step69_pipe_create_ctx = ctx;
-    _step69_pipe_create_vs = vs;
-    _step69_pipe_create_fs = fs;
-    _step69_pipe_create_fmt = fmt;
-    return 0xCAFE03;
-}
-fn test_gpu_render_pipeline_create_dispatches_through_backend() {
-    _step69_pipe_create_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
-    &_step69_pipe_create_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var got = gpu_render_pipeline_create(ctx, 0x1111, 0x2222, 28);
-    assert_eq(got, 0xCAFE03, "slot return value propagates");
-    assert_eq(_step69_pipe_create_count, 1, "slot dispatched once");
-    assert_eq(_step69_pipe_create_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step69_pipe_create_vs, 0x1111, "arg 2 = vs_mod");
-    assert_eq(_step69_pipe_create_fs, 0x2222, "arg 3 = fs_mod");
-    assert_eq(_step69_pipe_create_fmt, 28, "arg 4 = color_fmt");
-    return 0;
-}
-
-var _step69_pipe_release_count = 0;
-fn _step69_pipe_release_capture(ctx, pipe) {
-    _step69_pipe_release_count = _step69_pipe_release_count + 1;
-    return 0;
-}
-fn test_gpu_render_pipeline_release_dispatches_through_backend() {
-    _step69_pipe_release_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
-    &_step69_pipe_release_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    gpu_render_pipeline_release(ctx, 0xBEEF04);
-    assert_eq(_step69_pipe_release_count, 1, "slot dispatched once");
-    return 0;
-}
-
-var _step69_pass_begin_count = 0;
-var _step69_pass_begin_ctx = 0;
-var _step69_pass_begin_rt = 0;
-var _step69_pass_begin_color = 0;
-fn _step69_pass_begin_capture(ctx, rt, color) {
-    _step69_pass_begin_count = _step69_pass_begin_count + 1;
-    _step69_pass_begin_ctx = ctx;
-    _step69_pass_begin_rt = rt;
-    _step69_pass_begin_color = color;
-    return 0xCAFE05;
-}
-fn test_gpu_render_pass_begin_dispatches_through_backend() {
-    _step69_pass_begin_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
-    &_step69_pass_begin_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var color[32];
-    memset(&color, 0, 32);
-    var got = gpu_render_pass_begin(ctx, 0xBEEF06, &color);
-    assert_eq(got, 0xCAFE05, "slot return value propagates");
-    assert_eq(_step69_pass_begin_count, 1, "slot dispatched once");
-    assert_eq(_step69_pass_begin_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step69_pass_begin_rt, 0xBEEF06, "arg 2 = rt");
-    assert_eq(_step69_pass_begin_color, &color, "arg 3 = color_ptr");
-    return 0;
-}
-
-var _step69_pass_draw_count = 0;
-var _step69_pass_draw_ctx = 0;
-var _step69_pass_draw_pass = 0;
-var _step69_pass_draw_pipe = 0;
-var _step69_pass_draw_vc = 0;
-var _step69_pass_draw_ic = 0;
-fn _step69_pass_draw_capture(ctx, pass, pipe, vc, ic) {
-    _step69_pass_draw_count = _step69_pass_draw_count + 1;
-    _step69_pass_draw_ctx = ctx;
-    _step69_pass_draw_pass = pass;
-    _step69_pass_draw_pipe = pipe;
-    _step69_pass_draw_vc = vc;
-    _step69_pass_draw_ic = ic;
-    return 0;
-}
-fn test_gpu_render_pass_draw_dispatches_through_backend() {
-    _step69_pass_draw_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
-    &_step69_pass_draw_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    var rc = gpu_render_pass_draw(ctx, 0xBEEF07, 0xBEEF08, 3, 1);
-    assert_eq(rc, 0, "slot return value propagates");
-    assert_eq(_step69_pass_draw_count, 1, "slot dispatched once");
-    assert_eq(_step69_pass_draw_ctx, ctx, "arg 1 = ctx");
-    assert_eq(_step69_pass_draw_pass, 0xBEEF07, "arg 2 = pass");
-    assert_eq(_step69_pass_draw_pipe, 0xBEEF08, "arg 3 = pipe");
-    assert_eq(_step69_pass_draw_vc, 3, "arg 4 = vertex_count");
-    assert_eq(_step69_pass_draw_ic, 1, "arg 5 = instance_count");
-    return 0;
-}
-
-var _step69_pass_end_count = 0;
-fn _step69_pass_end_capture(ctx, pass) {
-    _step69_pass_end_count = _step69_pass_end_count + 1;
-    return 0;
-}
-fn test_gpu_render_pass_end_dispatches_through_backend() {
-    _step69_pass_end_count = 0;
-    var b = backend_new();
-    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
-    &_step69_pass_end_capture);
-    var ctx = alloc(112);
-    memset(ctx, 0, 112);
-    store64(ctx + 32, b);
-    gpu_render_pass_end(ctx, 0xBEEF09);
-    assert_eq(_step69_pass_end_count, 1, "slot dispatched once");
-    return 0;
-}
-
 # Audit LOW-4: native render-draw slot enforces the new contract on
 # (vc, ic) before any alloc — vc <= 0 → GPU_ERR_OTHER, ic != 1 →
 # GPU_ERR_NOT_IMPLEMENTED. The early returns happen before the rt /
@@ -3033,158 +2123,170 @@ fn test_native_render_pass_draw_rejects_bad_vc_ic() {
     return 0;
 }
 
-fn test_gpu_render_dispatchers_null_ctx_safe() {
-    # All seven render dispatchers must short-circuit on null ctx
-    # without dispatching. No mock backend needed.
-    assert_eq(gpu_render_target_create_2d_rgba8(0, 64, 64), 0, "rt_create null ctx -> 0");
-    assert_eq(gpu_render_target_release(0, 0xDEAD), 0, "rt_release null ctx -> 0");
-    assert_eq(gpu_render_pipeline_create(0, 1, 2, 28), 0, "pipe_create null ctx -> 0");
-    assert_eq(gpu_render_pipeline_release(0, 0xDEAD), 0, "pipe_release null ctx -> 0");
-    var color[32];
-    memset(&color, 0, 32);
-    assert_eq(gpu_render_pass_begin(0, 0xDEAD, &color), 0, "pass_begin null ctx -> 0");
-    assert_eq(gpu_render_pass_draw(0, 1, 2, 3, 1), GPU_ERR_OTHER, "pass_draw null ctx -> ERR");
-    assert_eq(gpu_render_pass_end(0, 0xDEAD), 0, "pass_end null ctx -> 0");
+# Audit LOW-3: native gpu_buffer_* / gpu_shader_module_* slots are
+# diagnostic stubs in v3.0. Buffer write/read return
+# GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "native
+# backend doesn't support this yet" from generic failures.
+fn test_native_buffer_stubs_return_not_implemented() {
+    assert_eq(_backend_native_buffer_write(0, 0, 0, 0, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "buffer_write");
+    assert_eq(_backend_native_buffer_read(0, 0, 0, 0, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "buffer_read");
+    # create returns 0-as-no-handle; release is no-op success.
+    assert_eq(_backend_native_buffer_create(0, 0, 0),  0, "buffer_create no handle");
+    assert_eq(_backend_native_buffer_release(0, 0),    0, "buffer_release no-op");
+    assert_eq(_backend_native_shader_module_create(0, 0, 0), 0, "shmod_create no handle");
+    assert_eq(_backend_native_shader_module_release(0, 0),   0, "shmod_release no-op");
+    return 0;
+}
+
+# Audit MED-7: stability contract — once `gpu_context_new_native`
+# stashes the PM4 scratch ptr at +112, every dispatch reads the same
+# value through `native_ctx_pm4_scratch`. The accessor never re-allocs
+# under us; if it does, this assertion catches the regression.
+fn test_native_ctx_pm4_scratch_is_stable() {
+    var ctx[120];
+    memset(&ctx, 0, 120);
+    # Sentinel ptr stashed once; two consecutive accessor calls
+    # return the same address (no per-call alloc).
+    store64(&ctx + 112, 0xCAFEBABE);
+    var p1 = native_ctx_pm4_scratch(&ctx);
+    var p2 = native_ctx_pm4_scratch(&ctx);
+    assert_eq(p1, 0xCAFEBABE, "scratch read");
+    assert_eq(p2, 0xCAFEBABE, "scratch stable across calls");
+    assert_eq(p1, p2, "two reads identical");
+    # wgpu-side ctx leaves +112 as 0 — accessor returns 0, slot
+    # short-circuits with GPU_ERR_OTHER (already covered by the
+    # dispatch fns' explicit `if (pm4 == 0)` guards).
+    memset(&ctx, 0, 120);
+    assert_eq(native_ctx_pm4_scratch(&ctx), 0, "wgpu/zero ctx → 0");
+    return 0;
+}
+
+fn test_gpu_ctx_native_card_fd_round_trip() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_ctx_native_card_fd(&ctx), 0, "starts zero");
+    gpu_ctx_set_native_card_fd(&ctx, 42);
+    assert_eq(gpu_ctx_native_card_fd(&ctx), 42, "round-trip");
+    assert_eq(gpu_ctx_set_native_card_fd(0, 7), -1, "null ctx → -1");
+    return 0;
+}
+
+# v3 audit 2026-04-30 — MED-3: native_rt_create_2d_rgba8 must reject
+# odd width/height because native_pm4_build_render_pass_target's
+# viewport math uses integer (rt_width / 2). Rejection happens in the
+# allocator BEFORE any ioctl, so a fake fd is fine — the dim guard
+# fires first.
+fn test_native_rt_create_rejects_odd_dims() {
+    var out[40];
+    memset(&out, 0, 40);
+    var fake_fd = 999;
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 3,  4, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "odd width rejected");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 4,  5, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "odd height rejected");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 1,  2, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "1x2 width is odd");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 2,  1, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "2x1 height is odd");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, 7, 13, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "both odd rejected");
+    return 0;
+}
+
+fn test_native_rt_create_rejects_nonpositive_dims() {
+    var out[40];
+    memset(&out, 0, 40);
+    var fake_fd = 999;
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  0,  4, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "zero width");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4,  0, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "zero height");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd, -2,  4, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "negative width");
+    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4, -2, &out),
+    GPU_ERR_TEXTURE_DIMENSION, "negative height");
     return 0;
 }
 
 fn main() {
     alloc_init();
     color_init();
-
-    # v3 Phase B5 — backend abstraction (7)
-    test_backend_struct_layout();
-    test_backend_kind_constants_distinct();
-    test_backend_new_zero_initialized();
-    test_backend_kind_round_trip();
-    test_backend_set_get_slot_round_trip();
-    test_backend_fncall_through_slot_smoke();
-    test_backend_is_complete_detects_missing_slot();
-
-    # v3 Phase B5 — wgpu backend implementation (4)
-    test_backend_wgpu_new_is_complete();
-    test_backend_wgpu_slot_identities();
-    test_backend_wgpu_render_slot_identities();
-    test_backend_wgpu_compute_dispatch_stub_returns_err();
-    test_backend_wgpu_two_builders_are_distinct();
-
-    # v3 Step 3a — GpuContext backend plumbing (2)
-    test_gpu_ctx_backend_accessor();
-    test_gpu_ctx_backend_field_isolated();
-
-    # v3 Step 3b — gpu_context_release dispatches through backend (2)
-    test_gpu_context_release_dispatches_through_backend();
-    test_gpu_context_release_null_ctx_is_safe();
-
-    # v3 Step 3c — gpu_buffer_read dispatches through backend (2)
-    test_gpu_buffer_read_dispatches_through_backend();
-    test_gpu_buffer_read_null_ctx_returns_err();
-
-    # v3 Step 3d — gpu_buffer_create / write / release dispatch (4)
-    test_gpu_buffer_create_dispatches_through_backend();
-    test_gpu_buffer_write_dispatches_through_backend();
-    test_gpu_buffer_release_dispatches_through_backend();
-    test_gpu_buffer_dispatchers_null_ctx_safe();
-
-    # v3 Step 3e — gpu_shader_module dispatch (3)
-    test_gpu_shader_module_create_dispatches_through_backend();
-    test_gpu_shader_module_release_dispatches_through_backend();
-    test_gpu_shader_module_dispatchers_null_ctx_safe();
-
-    # v3 Step 3f — gpu_device_wait_idle dispatch (2)
-    test_gpu_device_wait_idle_dispatches_through_backend();
-    test_gpu_device_wait_idle_null_ctx_safe();
-
-    # v3 Step 3g — gpu_compute_dispatch (fncall6) (2)
-    test_gpu_compute_dispatch_dispatches_through_backend();
-    test_gpu_compute_dispatch_null_ctx_returns_err();
-    test_gpu_compute_dispatch_rejects_bad_dims();
-
-    # v3 Step 4c — native Backend slot wrappers + builder (6)
+    test_native_ioc_encode_directions();
+    test_native_ioc_encode_size_in_bits_16_to_29();
+    test_native_ioc_encode_type_and_nr();
+    test_native_render_node_path();
+    test_native_amdgpu_ioctl_nr_offsets();
+    test_native_gem_create_ioctl_encoding();
+    test_native_gem_mmap_ioctl_encoding();
+    test_native_gem_close_ioctl_encoding();
+    test_native_amdgpu_gem_domains();
+    test_native_gem_create_request_layout();
+    test_native_gem_mmap_request_layout();
+    test_native_phase_b3a_nr_offsets();
+    test_native_ctx_ioctl_encoding();
+    test_native_bo_list_ioctl_encoding();
+    test_native_gem_va_ioctl_encoding();
+    test_native_struct_sizes();
+    test_native_ctx_opcodes();
+    test_native_bo_list_opcodes();
+    test_native_va_opcodes_and_flags();
+    test_native_bo_list_entry_layout();
+    test_native_pm4_opcodes();
+    test_native_sh_reg_byte_offsets();
+    test_native_sh_reg_offset_encoding();
+    test_native_pm4_pkt3_header();
+    test_native_pm4_set_sh_reg_one_layout();
+    test_native_pm4_set_sh_reg_multi_layout();
+    test_native_pm4_dispatch_direct_layout();
+    test_native_pm4_acquire_mem_layout();
+    test_native_pm4_nop_padding();
+    test_native_gfx9_shader_constants();
+    test_native_gfx9_extended_register_offsets();
+    test_native_gfx9_shader_endpgm_writes_bytes();
+    test_native_gfx9_shader_store_deadbeef_writes_bytes();
+    test_native_syncobj_ioctl_encodings();
+    test_native_syncobj_sizes_and_flags();
+    test_native_cs_ioctl_encoding();
+    test_native_cs_struct_sizes();
+    test_native_cs_chunk_ids_and_ip_types();
+    test_native_pm4_builder_composability();
     test_backend_native_new_is_complete();
     test_backend_native_slot_identities();
     test_backend_native_distinct_from_wgpu();
     test_native_ctx_field_accessors();
     test_native_buf_pair_write();
     test_backend_native_compute_dispatch_null_args_err();
-
-    # v3 Step 4e — backend selector + stub_addr accessor (2)
-    test_mabda_backend_kind_default_is_wgpu();
     test_native_ctx_stub_addr_accessor();
-
-    # v3 Step 4f.i — errno → GpuErr mapping (3)
     test_native_errno_to_gpu_err_classifies();
     test_native_errno_to_gpu_err_default_other();
     test_native_neg_rc_to_gpu_err_sign_flip();
-
-    # v3 Step 4f.ii — BO page-perm constants (2)
     test_native_perm_constants_present();
     test_native_perm_bits_distinct();
-
-    # v3 Step 4f.iii — FrameResources ctx-aware integration (6)
-    test_frame_resources_new_legacy_no_ctx();
-    test_frame_resources_new_for_stores_ctx();
-    test_frame_resources_track_buffers_and_textures();
-    test_frame_resources_clear_pops_all();
-    test_frame_resources_release_buffers_dispatches_through_backend();
-    test_frame_resources_release_buffers_no_ctx_is_noop();
-
-    # v3 Step 4f.iv — per-context IB + fence cache (2)
     test_native_ctx_ib_fence_accessors();
     test_native_ctx_layout_isolation_step4iv();
-
-    # v3 Step 5.1 — native 2D RGBA8 texture primitives (4)
     test_native_texture_size_2d_rgba8_formula();
     test_native_texture_struct_field_offsets();
     test_native_texture_va_range_distinct();
     test_native_texture_va_allocator();
     test_native_texture_struct_round_trip();
-
-    # v3 Step 5.2 — native_texture_release_2d_rgba8 (2)
     test_native_texture_release_null_tex_safe();
     test_native_texture_release_zero_handle_safe();
-
-    # v3 Step 5.5 — wgpu texture wrapper null-arg safety (6)
-    test_backend_wgpu_texture_create_null_ctx_returns_zero();
-    test_backend_wgpu_texture_create_zero_dim_returns_zero();
-    test_backend_wgpu_texture_write_null_args_err();
-    test_backend_wgpu_texture_write_size_mismatch_err();
-    test_backend_wgpu_texture_read_null_args_err();
-    test_backend_wgpu_texture_release_null_safe();
-
-    # v3 Step 5.6 — native texture wrapper safety (5)
     test_backend_native_texture_create_null_ctx_returns_zero();
     test_backend_native_texture_create_zero_dim_returns_zero();
     test_backend_native_texture_write_memcpy_round_trip();
     test_backend_native_texture_write_null_args_err();
     test_backend_native_texture_release_null_safe();
-
-    # v3 Step 5.7 — public gpu_texture_* dispatch (5)
-    test_gpu_texture_create_dispatches_through_backend();
-    test_gpu_texture_create_2d_rgba8_validates_dims();
-    test_wgsl_source_explicit_length();
-    test_wgsl_source_cstr_not_truncated_at_4k();
     test_cs_submit_rejects_unaligned_fence_offset();
     test_native_mip_chain_layout();
     test_native_texture_level_va();
     test_native_gfx9_shader_downsample_2x2();
-    test_wgpu_texture_view_descriptor_level();
-    test_wgpu_bgl_entry_texture();
-    test_wgpu_bgl_entry_storage_texture();
-    test_wgsl_downsample_source();
-    test_gpu_texture_write_dispatches_through_backend();
-    test_gpu_texture_read_dispatches_through_backend();
-    test_gpu_texture_release_dispatches_through_backend();
-    test_gpu_texture_dispatchers_null_ctx_safe();
-
-    # v3 Step 6.3 — native render target primitives (5)
     test_native_rt_size_formula();
     test_native_rt_struct_field_offsets();
     test_native_rt_va_distinct_from_other_pools();
     test_native_rt_struct_round_trip();
     test_native_rt_release_safe_zero();
-
-    # v3 Step 6.4 — SET_CONTEXT_REG + DRAW_INDEX_AUTO builders (7)
     test_native_pm4_opcodes_extended();
     test_native_context_reg_offset_encoding();
     test_native_pm4_set_context_reg_one_layout();
@@ -3192,8 +2294,6 @@ fn main() {
     test_native_pm4_set_context_reg_multi_layout();
     test_native_pm4_draw_index_auto_layout();
     test_native_pm4_di_src_sel_constant();
-
-    # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums (7)
     test_gfx9_vs_sh_register_addresses();
     test_gfx9_ps_sh_register_addresses();
     test_gfx9_spi_format_register_addresses();
@@ -3201,22 +2301,14 @@ fn main() {
     test_gfx9_pgm_rsrc_minimums();
     test_gfx9_spi_format_field_values();
     test_gfx9_fullscreen_triangle_vertex_count();
-
-    # v3 Step 6.2(b) — fragment shader bytes (2)
     test_gfx9_fs_solid_red_byte_pattern();
     test_gfx9_fs_solid_red_alignment();
-
-    # v3 Step 6.2(b) — vertex shader bytes (2)
     test_gfx9_vs_fullscreen_triangle_byte_pattern();
     test_gfx9_vs_fullscreen_triangle_alignment();
-
-    # v3 Step 6.5(a) — clear-triangle PM4 register addresses + values (4)
     test_gfx9_pipeline_ctx_register_addresses();
     test_gfx9_pass_target_register_addresses();
     test_gfx9_uconfig_graphics_register_addresses();
     test_gfx9_pipeline_ctx_value_constants();
-
-    # v3 Step 6.5(b) — PM4 stream composer for clear-triangle (8)
     test_native_int_to_f32_bits_and_negate();
     test_native_pm4_render_pipeline_sh_layout();
     test_native_pm4_render_pipeline_ctx_size_and_anchors();
@@ -3226,43 +2318,23 @@ fn main() {
     test_native_pm4_render_draw_tail_honours_vertex_count();
     test_native_pm4_render_clear_triangle_top_level();
     test_native_pm4_render_clear_triangle_block_sizes();
-
-    # v3 Step 6.6 — render-ring dispatch helpers (3)
     test_native_render_handles_write_layout();
     test_native_render_bo_list_pack_layout();
     test_native_render_bo_list_pack_distinct_from_compute();
-
-    # v3 Step 6.8(c) — NativeRenderPipeline + NativePass (4)
     test_native_render_pipeline_struct_field_offsets();
     test_native_render_pipeline_pack_matches_composer();
     test_native_render_pipeline_pack_null_out();
     test_native_render_pass_struct_field_offsets();
-
-    # v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV (5)
     test_gfx9_event_type_constants();
     test_native_pm4_event_write_layout();
     test_native_pm4_event_write_packs_event_index();
     test_native_pm4_event_write_cache_flush_and_inv();
     test_native_pm4_event_write_advances_pos();
-
-    # v3 Step 6.9 — public render-* dispatchers (8)
-    test_gpu_render_target_create_dispatches_through_backend();
-    test_gpu_render_target_release_dispatches_through_backend();
-    test_gpu_render_pipeline_create_dispatches_through_backend();
-    test_gpu_render_pipeline_release_dispatches_through_backend();
-    test_gpu_render_pass_begin_dispatches_through_backend();
-    test_gpu_render_pass_draw_dispatches_through_backend();
-    test_gpu_render_pass_end_dispatches_through_backend();
-    test_gpu_render_dispatchers_null_ctx_safe();
-
-    # v3 audit 2026-04-30 → rc.2 fixes (LOW-4) — native render
-    # draw slot honours vc, rejects ic != 1.
     test_native_render_pass_draw_rejects_bad_vc_ic();
-
-    # v3 Phase D (Step 7.x) tests run in tests/tcyr/mabda_v3_phase_d.tcyr.
-
+    test_native_buffer_stubs_return_not_implemented();
+    test_native_ctx_pm4_scratch_is_stable();
+    test_gpu_ctx_native_card_fd_round_trip();
+    test_native_rt_create_rejects_odd_dims();
+    test_native_rt_create_rejects_nonpositive_dims();
     return assert_summary();
 }
-
-var exit_code = main();
-syscall(60, exit_code);

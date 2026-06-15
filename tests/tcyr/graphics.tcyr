@@ -1,0 +1,227 @@
+# tests/tcyr/graphics.tcyr — vertex, blend, sampler, depth, bind_group, instancing
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# ================================================================
+# state
+# ================================================================
+# test_state.tcyr — pure-data tests for blend, sampler, depth
+# Ported from the Rust v1.0.0 {blend,sampler,depth}.rs tests — see git tag 1.0.0.
+# All three modules produce byte layouts for wgpu descriptor structs, so
+# the tests verify the layouts independently of any GPU device.
+
+# NB: sampler.cyr and depth.cyr use wgpu_descriptors.cyr::wgpu_string_view
+
+# ================================================================
+# blend.cyr — preset byte layouts
+#
+# Layout (24 bytes): color (12) + alpha (12)
+# Each component is { op (u32), srcFactor (u32), dstFactor (u32) }
+# ================================================================
+
+fn _u32_at(ptr, off) { return load32(ptr + off); }
+
+# ================================================================
+# vertex
+# ================================================================
+# test_vertex.tcyr — tests for vertex.cyr and blend.cyr
+
+fn test_vertex2d_size() {
+    assert_eq(VERTEX_2D_SIZE, 32, "Vertex2D = 32 bytes");
+    assert_eq(VERTEX_3D_SIZE, 48, "Vertex3D = 48 bytes");
+    assert_eq(SKINNED_3D_SIZE, 96, "SkinnedVertex3D = 96 bytes");
+    return 0;
+}
+
+fn test_vertex2d_new() {
+    var v = vertex2d_new(F64_1, F64_0, F64_0, F64_1, F64_1, F64_1, F64_1, F64_1);
+    # position[0] should be 1.0 as f32 = 0x3F800000
+    assert_eq(load32(v), 0x3F800000, "v2d position.x = 1.0");
+    # position[1] should be 0.0
+    assert_eq(load32(v + 4), 0, "v2d position.y = 0.0");
+    # color[0] should be 1.0
+    assert_eq(load32(v + 16), 0x3F800000, "v2d color.r = 1.0");
+    return 0;
+}
+
+fn test_vertex2d_write() {
+    var buf[32];
+    vertex2d_write(&buf, F64_HALF, F64_HALF, F64_0, F64_0, F64_1, F64_0, F64_0, F64_1);
+    # position[0] should be 0.5 as f32 = 0x3F000000
+    assert_eq(load32(&buf), 0x3F000000, "write position.x = 0.5");
+    return 0;
+}
+
+fn test_vertex2d_attributes() {
+    var attrs = vertex2d_attributes();
+    assert(attrs != 0, "attributes allocated");
+    # First attribute: format=Float32x2 (21), offset=0, location=0
+    assert_eq(load32(attrs), WGPU_VERTEX_FORMAT_FLOAT32X2, "attr0 format");
+    assert_eq(load64(attrs + 8), 0, "attr0 offset=0");
+    assert_eq(load32(attrs + 16), 0, "attr0 location=0");
+    # Third attribute: format=Float32x4 (23), offset=16, location=2
+    assert_eq(load32(attrs + 48), WGPU_VERTEX_FORMAT_FLOAT32X4, "attr2 format");
+    assert_eq(load64(attrs + 56), 16, "attr2 offset=16");
+    assert_eq(load32(attrs + 64), 2, "attr2 location=2");
+    return 0;
+}
+
+fn test_blend_opaque() {
+    var bs = blend_state_new(BLEND_OPAQUE);
+    # color: op=ADD, src=ONE, dst=ZERO
+    assert_eq(_u32_at(bs, 0),  WGPU_BLEND_OP_ADD,            "opaque color op");
+    assert_eq(_u32_at(bs, 4),  WGPU_BLEND_FACTOR_ONE,        "opaque color src");
+    assert_eq(_u32_at(bs, 8),  WGPU_BLEND_FACTOR_ZERO,       "opaque color dst");
+    # alpha: op=ADD, src=ONE, dst=ZERO
+    assert_eq(_u32_at(bs, 12), WGPU_BLEND_OP_ADD,            "opaque alpha op");
+    assert_eq(_u32_at(bs, 16), WGPU_BLEND_FACTOR_ONE,        "opaque alpha src");
+    assert_eq(_u32_at(bs, 20), WGPU_BLEND_FACTOR_ZERO,       "opaque alpha dst");
+    return 0;
+}
+
+fn test_blend_alpha_blend() {
+    var bs = blend_state_new(BLEND_ALPHA_BLEND);
+    # color: src=SrcAlpha, dst=OneMinusSrcAlpha
+    assert_eq(_u32_at(bs, 4),  WGPU_BLEND_FACTOR_SRC_ALPHA,            "alpha color src");
+    assert_eq(_u32_at(bs, 8),  WGPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,  "alpha color dst");
+    # alpha channel: src=ONE, dst=OneMinusSrcAlpha
+    assert_eq(_u32_at(bs, 16), WGPU_BLEND_FACTOR_ONE,                  "alpha alpha src");
+    assert_eq(_u32_at(bs, 20), WGPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,  "alpha alpha dst");
+    return 0;
+}
+
+fn test_blend_premultiplied() {
+    var bs = blend_state_new(BLEND_PREMULTIPLIED_ALPHA);
+    assert_eq(_u32_at(bs, 4),  WGPU_BLEND_FACTOR_ONE,                 "pma color src");
+    assert_eq(_u32_at(bs, 8),  WGPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, "pma color dst");
+    assert_eq(_u32_at(bs, 16), WGPU_BLEND_FACTOR_ONE,                 "pma alpha src");
+    assert_eq(_u32_at(bs, 20), WGPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, "pma alpha dst");
+    return 0;
+}
+
+fn test_blend_additive() {
+    var bs = blend_state_new(BLEND_ADDITIVE);
+    assert_eq(_u32_at(bs, 4),  WGPU_BLEND_FACTOR_ONE, "additive color src");
+    assert_eq(_u32_at(bs, 8),  WGPU_BLEND_FACTOR_ONE, "additive color dst");
+    assert_eq(_u32_at(bs, 16), WGPU_BLEND_FACTOR_ONE, "additive alpha src");
+    assert_eq(_u32_at(bs, 20), WGPU_BLEND_FACTOR_ONE, "additive alpha dst");
+    return 0;
+}
+
+fn test_blend_multiply() {
+    var bs = blend_state_new(BLEND_MULTIPLY);
+    assert_eq(_u32_at(bs, 4),  WGPU_BLEND_FACTOR_DST,       "multiply color src");
+    assert_eq(_u32_at(bs, 8),  WGPU_BLEND_FACTOR_ZERO,      "multiply color dst");
+    assert_eq(_u32_at(bs, 16), WGPU_BLEND_FACTOR_DST_ALPHA, "multiply alpha src");
+    assert_eq(_u32_at(bs, 20), WGPU_BLEND_FACTOR_ZERO,      "multiply alpha dst");
+    return 0;
+}
+
+# ================================================================
+# sampler.cyr — preset byte layouts
+#
+# Layout (64 bytes, rounded up from the 56-byte WGPUSamplerDescriptor):
+#   +36: magFilter
+#   +40: minFilter
+#   +44: mipmapFilter
+#   +56: compare
+#   +60: maxAnisotropy (u16)
+# ================================================================
+
+fn test_sampler_nearest() {
+    var d = sampler_descriptor(SAMPLER_NEAREST);
+    assert_eq(_u32_at(d, 36), WGPU_FILTER_MODE_NEAREST,     "nearest mag");
+    assert_eq(_u32_at(d, 40), WGPU_FILTER_MODE_NEAREST,     "nearest min");
+    assert_eq(_u32_at(d, 44), WGPU_MIPMAP_FILTER_NEAREST,   "nearest mip");
+    return 0;
+}
+
+fn test_sampler_linear() {
+    var d = sampler_descriptor(SAMPLER_LINEAR);
+    assert_eq(_u32_at(d, 36), WGPU_FILTER_MODE_LINEAR,    "linear mag");
+    assert_eq(_u32_at(d, 40), WGPU_FILTER_MODE_LINEAR,    "linear min");
+    assert_eq(_u32_at(d, 44), WGPU_MIPMAP_FILTER_LINEAR,  "linear mip");
+    return 0;
+}
+
+fn test_sampler_anisotropic() {
+    var d = sampler_descriptor(SAMPLER_ANISOTROPIC);
+    assert_eq(_u32_at(d, 36), WGPU_FILTER_MODE_LINEAR,    "aniso mag");
+    assert_eq(_u32_at(d, 40), WGPU_FILTER_MODE_LINEAR,    "aniso min");
+    assert_eq(_u32_at(d, 44), WGPU_MIPMAP_FILTER_LINEAR,  "aniso mip");
+    # maxAnisotropy is a u16 at offset 60
+    assert_eq(load16(d + 60), 16, "aniso maxAnisotropy=16");
+    return 0;
+}
+
+fn test_sampler_comparison() {
+    var d = sampler_descriptor(SAMPLER_COMPARISON);
+    assert_eq(_u32_at(d, 36), WGPU_FILTER_MODE_LINEAR,   "cmp mag");
+    assert_eq(_u32_at(d, 40), WGPU_FILTER_MODE_LINEAR,   "cmp min");
+    assert_eq(_u32_at(d, 44), WGPU_MIPMAP_FILTER_NEAREST, "cmp mip");
+    assert_eq(_u32_at(d, 56), WGPU_COMPARE_LESS_EQUAL,   "cmp func");
+    return 0;
+}
+
+fn test_sampler_address_mode_clamp() {
+    var d = sampler_descriptor(SAMPLER_LINEAR);
+    assert_eq(_u32_at(d, 24), WGPU_ADDRESS_MODE_CLAMP_TO_EDGE, "u mode=clamp");
+    assert_eq(_u32_at(d, 28), WGPU_ADDRESS_MODE_CLAMP_TO_EDGE, "v mode=clamp");
+    assert_eq(_u32_at(d, 32), WGPU_ADDRESS_MODE_CLAMP_TO_EDGE, "w mode=clamp");
+    return 0;
+}
+
+# ================================================================
+# depth.cyr — format constants + DepthTexture struct
+# ================================================================
+
+fn test_depth_format_constants() {
+    # wgpu-native v29 format codes
+    assert_eq(DEPTH_FORMAT_DEPTH32_FLOAT, 0x30, "Depth32Float format code (v29=0x30)");
+    assert_eq(DEPTH_FORMAT_DEPTH24_PLUS_STENCIL8, 0x2F, "Depth24PlusStencil8 code (v29=0x2F)");
+    assert_eq(DEPTH_DEFAULT_FORMAT, DEPTH_FORMAT_DEPTH32_FLOAT, "default is Depth32Float");
+    return 0;
+}
+
+fn test_depth_stencil_state_layout() {
+    var s[80];
+    memset(&s, 0, 72);
+    depth_stencil_state(&s, DEPTH_FORMAT_DEPTH32_FLOAT);
+    # format at +8
+    assert_eq(load32(&s + 8),  DEPTH_FORMAT_DEPTH32_FLOAT, "format stored");
+    # depthWriteEnabled = OptionalBool_True = 2 at +12
+    assert_eq(load32(&s + 12), 2, "depthWriteEnabled=True");
+    # depthCompare = LESS at +16
+    assert_eq(load32(&s + 16), WGPU_COMPARE_LESS, "depthCompare=LESS");
+    # stencilReadMask = 0xFFFFFFFF at +52
+    assert_eq(load32(&s + 52), 0xFFFFFFFF, "stencilReadMask");
+    # stencilWriteMask = 0xFFFFFFFF at +56
+    assert_eq(load32(&s + 56), 0xFFFFFFFF, "stencilWriteMask");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_vertex2d_size();
+    test_vertex2d_new();
+    test_vertex2d_write();
+    test_vertex2d_attributes();
+    test_blend_opaque();
+    test_blend_alpha_blend();
+    test_blend_premultiplied();
+    test_blend_additive();
+    test_blend_multiply();
+    test_sampler_nearest();
+    test_sampler_linear();
+    test_sampler_anisotropic();
+    test_sampler_comparison();
+    test_sampler_address_mode_clamp();
+    test_depth_format_constants();
+    test_depth_stencil_state_layout();
+    return assert_summary();
+}

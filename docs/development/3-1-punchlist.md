@@ -211,8 +211,18 @@ The multi-queue feature's whole point is overlap; it needs a number.
 
 ## Tier 4 — Documentation
 
+- [x] **Test suite reorganized by functionality (2026-06-15).** Replaced
+  the version-named `mabda.tcyr` / `mabda_v3.tcyr` / `mabda_v3_phase_d.tcyr`
+  trio with **11 domain-named suites** under `tests/tcyr/` (core, buffer,
+  compute, texture, graphics, render, backend, caches, surface, native,
+  kms), mirroring `src/`. Each is standalone (own `main` + `assert_summary`)
+  and self-contained (needed mocks inlined). 2076 asserts preserved exactly
+  (verified file-by-file). Makefile/CI/release now glob `tests/tcyr/*.tcyr`.
+  Also fixed a latent gap: the old `mabda_v3.tcyr` had grown to 148 KiB,
+  past the 128 KiB lint/fmt cap (its tail was silently unchecked); every
+  new file is well under (native, the largest, is 113 KiB).
 - [ ] `CLAUDE.md` updated for v3.1 surface (new slots, queue/mip API,
-  `BACKEND_SIZE` growth, assert count).
+  `BACKEND_SIZE` growth, assert count). *(test-layout section done.)*
 - [ ] `roadmap.md` v3.1 section reflects the shipped shape (mipmaps 3.1.0,
   multi-queue 3.1.1+, render-graph-mq possibly 3.1.2/own minor).
 - [ ] `CHANGELOG.md` `[3.1.0]` and `[3.1.1]` sections (Added/Changed/…).

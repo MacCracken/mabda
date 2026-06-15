@@ -1,0 +1,268 @@
+# tests/tcyr/surface.tcyr — surface (v2 surface_state + v3 gpu_surface_*)
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ================================================================
+# is_recoverable — mirror the Rust test cases exactly
+# ================================================================
+fn test_recoverable_surface_timeout() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_SURFACE_TIMEOUT), 1, "timeout recoverable");
+    return 0;
+}
+
+fn test_recoverable_surface_outdated() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_SURFACE_OUTDATED), 1, "outdated recoverable");
+    return 0;
+}
+
+fn test_recoverable_surface_config() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_SURFACE_CONFIG), 1, "config recoverable");
+    return 0;
+}
+
+fn test_not_recoverable_surface_lost() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_SURFACE_LOST), 0, "lost not recoverable");
+    return 0;
+}
+
+# ================================================================
+# surface
+# ================================================================
+# test_surface.tcyr — pure-data tests for surface.cyr
+# Ported from the Rust v1.0.0 surface.rs tests — see git tag 1.0.0.
+# Skips any tests that need a
+# real WGPUSurface handle (no windowing system in a standalone test).
+
+# surface.cyr references wgpu_surface_configure etc. which live in
+# wgpu_ffi.cyr. We can't pull wgpu_ffi in here without the function table,
+# so we inline just the constants + pure helpers we want to test.
+
+# ================================================================
+# Present mode preferences + present_mode_to_wgpu
+# ================================================================
+# Audit 2026-06-14 [MED-6]: these (PRESENT_*, WGPU_PRESENT_MODE_*, and
+# present_mode_to_wgpu) come from src/surface.cyr via the `include
+# "src/lib.cyr"` at the top of this file. They used to be re-declared
+# here verbatim, which (a) shadowed the production present_mode_to_wgpu
+# under "last definition wins" — so test_present_mode_mapping below
+# validated this file's stale copy, not surface.cyr — and (b) emitted a
+# duplicate-fn build warning against the zero-warning gate. Removed so the
+# tests exercise the real symbols.
+
+# ================================================================
+# Tests
+# ================================================================
+
+fn test_present_mode_constants() {
+    # Verify the v29 enum values (these must match wgpu-native webgpu.h)
+    assert_eq(WGPU_PRESENT_MODE_FIFO,         1, "Fifo=1");
+    assert_eq(WGPU_PRESENT_MODE_FIFO_RELAXED, 2, "FifoRelaxed=2");
+    assert_eq(WGPU_PRESENT_MODE_IMMEDIATE,    3, "Immediate=3");
+    assert_eq(WGPU_PRESENT_MODE_MAILBOX,      4, "Mailbox=4");
+    return 0;
+}
+
+fn test_present_mode_mapping() {
+    assert_eq(present_mode_to_wgpu(PRESENT_VSYNC),     WGPU_PRESENT_MODE_FIFO,         "vsync → fifo");
+    assert_eq(present_mode_to_wgpu(PRESENT_NO_VSYNC),  WGPU_PRESENT_MODE_FIFO_RELAXED, "no vsync → relaxed");
+    assert_eq(present_mode_to_wgpu(PRESENT_IMMEDIATE), WGPU_PRESENT_MODE_IMMEDIATE,    "immediate");
+    assert_eq(present_mode_to_wgpu(PRESENT_MAILBOX),   WGPU_PRESENT_MODE_MAILBOX,      "mailbox");
+    # Unknown preference should default to Fifo
+    assert_eq(present_mode_to_wgpu(99), WGPU_PRESENT_MODE_FIFO, "unknown → fifo");
+    return 0;
+}
+
+# ================================================================
+# WGPUSurfaceConfiguration descriptor layout test
+# ================================================================
+# Mirrors surface_state_configure's descriptor building without needing
+# the FFI function table to be populated.
+fn test_surface_configuration_layout() {
+    var fake_device  = 0xdeadbeef;
+    var usage        = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    var cfg = wgpu_surface_configuration(fake_device,
+    WGPU_TEXTURE_FORMAT_BGRA8_UNORM,
+    1920, 1080, usage,
+    WGPU_PRESENT_MODE_FIFO);
+    assert_eq(load64(cfg + 8),  fake_device,                    "device stored");
+    assert_eq(load32(cfg + 16), WGPU_TEXTURE_FORMAT_BGRA8_UNORM, "format stored");
+    assert_eq(load64(cfg + 24), usage,                          "usage stored");
+    assert_eq(load32(cfg + 32), 1920,                           "width stored");
+    assert_eq(load32(cfg + 36), 1080,                           "height stored");
+    assert_eq(load64(cfg + 40), 0,                              "viewFormatCount=0");
+    assert_eq(load64(cfg + 48), 0,                              "viewFormats=NULL");
+    assert_eq(load32(cfg + 56), 0,                              "alphaMode=Auto(0)");
+    assert_eq(load32(cfg + 60), WGPU_PRESENT_MODE_FIFO,         "presentMode stored");
+    return 0;
+}
+
+fn test_surface_configuration_zero_init() {
+    # A second build should produce a fresh struct with no leakage.
+    var cfg1 = wgpu_surface_configuration(0, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 100, 200,
+    WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    WGPU_PRESENT_MODE_FIFO_RELAXED);
+    var cfg2 = wgpu_surface_configuration(0, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 300, 400,
+    WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    WGPU_PRESENT_MODE_IMMEDIATE);
+    assert_eq(load32(cfg1 + 32), 100, "cfg1 width=100");
+    assert_eq(load32(cfg1 + 36), 200, "cfg1 height=200");
+    assert_eq(load32(cfg2 + 32), 300, "cfg2 width=300");
+    assert_eq(load32(cfg2 + 36), 400, "cfg2 height=400");
+    assert_eq(load32(cfg1 + 60), WGPU_PRESENT_MODE_FIFO_RELAXED, "cfg1 present mode");
+    assert_eq(load32(cfg2 + 60), WGPU_PRESENT_MODE_IMMEDIATE,    "cfg2 present mode");
+    return 0;
+}
+
+# ================================================================
+# audit-2026-04-19 — regression tests for HIGH / MEDIUM findings
+# ================================================================
+# Each test asserts a fix from docs/audit/2026-04-19-audit.md.
+
+# HIGH-1: the renamed present helper exists (and the accessor returns
+# the configured mode, not the garbage the old shadow left behind).
+fn test_audit_surface_present_accessor() {
+    var ss = alloc(48);
+    memset(ss, 0, 48);
+    store32(ss + 40, WGPU_PRESENT_MODE_MAILBOX);
+    assert_eq(surface_state_present(ss), WGPU_PRESENT_MODE_MAILBOX,
+    "surface_state_present reads configured mode");
+    return 0;
+}
+
+fn test_gpu_ctx_wgpu_surface_handle_round_trip() {
+    # Stack-local — heap-alloc tests at this point in the file
+    # exhaust the bump allocator. Fixed-size array gives the same
+    # observable shape with zero heap pressure.
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0, "starts zero");
+    gpu_ctx_set_wgpu_surface_handle(&ctx, 0xDEADBEEF);
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0xDEADBEEF, "round-trip");
+    assert_eq(gpu_ctx_set_wgpu_surface_handle(0, 1), -1, "null ctx → -1");
+    return 0;
+}
+
+fn test_native_surface_struct_field_offsets() {
+    assert_eq(NATIVE_SURFACE_CARD_FD,    0,   "card_fd");
+    assert_eq(NATIVE_SURFACE_RENDER_FD,  4,   "render_fd");
+    assert_eq(NATIVE_SURFACE_STATE,      8,   "state");
+    assert_eq(NATIVE_SURFACE_SCANOUT,    16,  "scanout");
+    assert_eq(NATIVE_SURFACE_FB_B,       56,  "fb_b");
+    assert_eq(NATIVE_SURFACE_FRONT_IS_B, 88,  "front_is_b");
+    assert_eq(NATIVE_SURFACE_WIDTH,      96,  "width");
+    assert_eq(NATIVE_SURFACE_HEIGHT,     100, "height");
+    assert_eq(NATIVE_SURFACE_PITCH,        104, "pitch");
+    # Audit 2026-06-14 [HIGH-2 NEW]: master-fd provenance fields live in
+    # the free tail of the 120-byte struct (master_minor ends at +116).
+    assert_eq(NATIVE_SURFACE_MASTER_OWNED, 108, "master_owned");
+    assert_eq(NATIVE_SURFACE_MASTER_MINOR, 112, "master_minor");
+    assert_eq(NATIVE_SURFACE_SIZE,         120, "size");
+    assert(NATIVE_SURFACE_MASTER_MINOR + 4 <= NATIVE_SURFACE_SIZE,
+    "provenance fields fit within the struct");
+    # Sanity: scanout + 40-byte size = fb_b offset; fb_b + 32 = front_is_b.
+    assert_eq(NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_SIZE,
+    NATIVE_SURFACE_FB_B,
+    "scanout-end aligns with fb_b-start");
+    assert_eq(NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_SIZE,
+    NATIVE_SURFACE_FRONT_IS_B,
+    "fb_b-end aligns with front_is_b");
+    return 0;
+}
+
+# Audit 2026-06-14 [HIGH-2 NEW]: a logind/samvada-acquired master fd is
+# mabda-owned and must be released + closed by gpu_surface_release.
+# native_surface_mark_master_owned records the provenance the release
+# path reads; the kiosk path leaves it 0 (consumer owns the fd).
+fn test_native_surface_mark_master_owned() {
+    var surf[120];
+    memset(&surf, 0, 120);
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 0, "default: not mabda-owned");
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 0, "default minor 0");
+    native_surface_mark_master_owned(&surf, 1);
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 1, "marked mabda-owned");
+    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 1, "minor recorded");
+    # null surface is a safe no-op
+    assert_eq(native_surface_mark_master_owned(0, 1), 0 - 1, "null surface returns -1");
+    return 0;
+}
+
+fn test_gpu_surface_configure_wgpu_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_wgpu(0,    0xCAFE, 256, 256), 0, "null ctx");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0,      256, 256), 0, "null surface");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 0,   256), 0, "zero w");
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256,   0), 0, "zero h");
+    # No backend = no slot = 0.
+    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256, 256), 0, "no backend");
+    return 0;
+}
+
+fn test_gpu_surface_configure_native_kiosk_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_native_kiosk(0,     7, 256, 256), 0, "null ctx");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  0, 256, 256), 0, "card_fd=0");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx, -1, 256, 256), 0, "card_fd<0");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7,   0, 256), 0, "zero w");
+    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7, 256,   0), 0, "zero h");
+    return 0;
+}
+
+fn test_gpu_surface_configure_native_logind_uninit_samvada() {
+    # samvada is the gating dependency. In CPU tests, no C-shim
+    # has been linked, so samvada's static fn-table is null
+    # (`_samvada_table == 0`) → samvada_session_take_device
+    # returns -22 (EINVAL) → this dispatcher falls through to 0.
+    # The "logind works" path is HW-gated through the consumer
+    # program, not exercised here.
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 256), 0,
+    "uninit samvada → 0");
+    assert_eq(gpu_surface_configure_native_logind(0, 256, 256), 0,
+    "null ctx still 0");
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 0, 256), 0,
+    "zero w");
+    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 0), 0,
+    "zero h");
+    return 0;
+}
+
+fn test_gpu_surface_per_frame_ops_null_safe() {
+    var ctx[112];
+    memset(&ctx, 0, 112);
+    assert_eq(gpu_surface_acquire(0,    0xC0FFEE), 0, "acquire null ctx");
+    assert_eq(gpu_surface_acquire(&ctx, 0),        0, "acquire null surface");
+    assert_eq(gpu_surface_acquire(&ctx, 0xC0FFEE), 0, "acquire no backend");
+    assert_eq(gpu_surface_present(0,    0xC0FFEE), GPU_ERR_OTHER, "present null ctx");
+    assert_eq(gpu_surface_present(&ctx, 0),        GPU_ERR_OTHER, "present null surface");
+    assert_eq(gpu_surface_release(0,    0xC0FFEE), 0, "release null ctx");
+    assert_eq(gpu_surface_release(&ctx, 0),        0, "release null surface");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_recoverable_surface_timeout();
+    test_recoverable_surface_outdated();
+    test_recoverable_surface_config();
+    test_not_recoverable_surface_lost();
+    test_present_mode_constants();
+    test_present_mode_mapping();
+    test_surface_configuration_layout();
+    test_surface_configuration_zero_init();
+    test_audit_surface_present_accessor();
+    test_gpu_ctx_wgpu_surface_handle_round_trip();
+    test_native_surface_struct_field_offsets();
+    test_native_surface_mark_master_owned();
+    test_gpu_surface_configure_wgpu_null_safe();
+    test_gpu_surface_configure_native_kiosk_null_safe();
+    test_gpu_surface_configure_native_logind_uninit_samvada();
+    test_gpu_surface_per_frame_ops_null_safe();
+    return assert_summary();
+}

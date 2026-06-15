@@ -1,0 +1,541 @@
+# tests/tcyr/render.tcyr — render_target, render_pipeline, render_pass, render_graph
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# HIGH-2: rpb_new's allocation is large enough for the label slot at +76.
+# Writing then reading back the label must round-trip.
+fn test_audit_rpb_label_fits() {
+    var b = rpb_new(0, 0, 0);
+    rpb_label(b, "audit-label");
+    assert_eq(load64(b + 76), "audit-label", "rpb_label round-trips");
+    return 0;
+}
+
+# LOW-4: _wgpu_strnlen caps at the supplied bound. A normal short
+# string returns its actual length; a max-length probe must not
+# overshoot.
+fn test_audit_strnlen_short_string() {
+    assert_eq(_wgpu_strnlen("hello", 4096), 5,
+    "_wgpu_strnlen returns actual length when below bound");
+    return 0;
+}
+
+fn test_audit_rpb_pass_color_offsets() {
+    # After rpb_pass_color writes an attachment, every field must land at
+    # its v29 offset so the C shim can pass the array through without
+    # repacking. clearColor should be the opaque red we passed.
+    var rpb = rpb_pass_new();
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);  # (1.0, 0.0, 0.0, 1.0)
+    rpb_pass_color(rpb, 0xDEADBEEFCAFEBABE, clear);
+    assert_eq(rpb_pass_color_count(rpb), 1, "one color attachment recorded");
+    var arr = rpb_pass_color_array(rpb);
+    assert_neq(arr, 0, "color array allocated");
+    assert_eq(load64(arr), 0, "att.nextInChain @ +0 is 0");
+    assert_eq(load64(arr + 8), 0xDEADBEEFCAFEBABE, "att.view @ +8");
+    assert_eq(load32(arr + 16), 0xFFFFFFFF,
+    "att.depthSlice @ +16 = WGPU_DEPTH_SLICE_UNDEFINED");
+    assert_eq(load64(arr + 24), 0,
+    "att.resolveTarget @ +24 is 0 when no MSAA");
+    assert_eq(load32(arr + 32), WGPU_LOAD_OP_CLEAR, "att.loadOp @ +32 = Clear");
+    assert_eq(load32(arr + 36), WGPU_STORE_OP_STORE, "att.storeOp @ +36 = Store");
+    # clearValue is 4x f64 — just check r and a matched (1.0 bit-pattern).
+    assert_eq(load64(arr + 40), F64_1, "att.clearValue.r @ +40 = 1.0");
+    assert_eq(load64(arr + 40 + 24), F64_1,
+    "att.clearValue.a @ +64 = 1.0 (opaque)");
+    return 0;
+}
+
+fn test_audit_rpb_pass_begin_empty_short_circuits() {
+    # wgpu rejects render passes with zero color attachments when no
+    # depth/stencil is attached either — our dispatcher short-circuits
+    # to 0 before making that trip to the GPU.
+    var rpb = rpb_pass_new();
+    assert_eq(rpb_pass_begin(0xDEAD, rpb), 0,
+    "rpb_pass_begin with empty builder short-circuits");
+    return 0;
+}
+
+fn test_audit_render_target_rgba8_rejects_invalid() {
+    # Same validation envelope as texture_create_rgba8 — 0/neg/>MAX are
+    # rejected before reaching wgpu-native. v2.4.3 LOW.
+    assert_eq(texture_create_render_target_rgba8(0, 0, 256, "w0"), 0,
+    "render_target_rgba8(w=0) rejected");
+    assert_eq(texture_create_render_target_rgba8(0, 256, 0, "h0"), 0,
+    "render_target_rgba8(h=0) rejected");
+    assert_eq(texture_create_render_target_rgba8(0, 9000, 256, "w>max"), 0,
+    "render_target_rgba8(w>MAX) rejected");
+    return 0;
+}
+
+# ================================================================
+# v2.5.0 — render graph
+# ================================================================
+
+fn test_rg_new_initial_state() {
+    var g = rg_new();
+    assert_neq(g, 0, "rg_new allocates a graph");
+    assert_eq(rg_node_count(g), 0, "new graph has no nodes");
+    assert_eq(rg_transient_count(g), 0, "new graph has no transients");
+    assert_eq(rg_is_built(g), 0, "new graph is not built");
+    return 0;
+}
+
+fn test_rg_add_compute_returns_incrementing_ids() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var n0 = rg_add_compute(g, 0, 0, &dims, "a");
+    var n1 = rg_add_compute(g, 0, 0, &dims, "b");
+    var n2 = rg_add_compute(g, 0, 0, &dims, "c");
+    assert_eq(n0, 0, "first compute node id = 0");
+    assert_eq(n1, 1, "second compute node id = 1");
+    assert_eq(n2, 2, "third compute node id = 2");
+    assert_eq(rg_node_count(g), 3, "node count reflects adds");
+    return 0;
+}
+
+fn test_rg_add_render_and_copy_nodes() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r = rg_add_render(g, 0, 0, 0, "render");
+    var c = rg_add_copy_buf_buf(g, 0, 0, 0, 0, 64);
+    var k = rg_add_compute(g, 0, 0, &dims, "cmp");
+    assert_eq(r, 0, "render node id");
+    assert_eq(c, 1, "copy node id");
+    assert_eq(k, 2, "compute node id");
+    assert_eq(rg_node_count(g), 3, "three mixed-kind nodes");
+    return 0;
+}
+
+fn test_rg_add_transient_buffer_incrementing_ids() {
+    var g = rg_new();
+    var r0 = rg_add_transient_buffer(g, 4096, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 256,  0x04, "r1");
+    assert_eq(r0, 0, "first transient id = 0");
+    assert_eq(r1, 1, "second transient id = 1");
+    assert_eq(rg_transient_count(g), 2, "two transients recorded");
+    return 0;
+}
+
+fn test_rg_add_transient_texture() {
+    var g = rg_new();
+    var t0 = rg_add_transient_texture(g, 1920, 1080, 18, 0x10, "rt");
+    assert_eq(t0, 0, "first transient texture id = 0");
+    assert_eq(rg_transient_count(g), 1, "one transient recorded");
+    return 0;
+}
+
+fn test_rg_node_reads_writes_guards_out_of_range() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    assert_eq(rg_node_reads(g, 0 - 1, 0), 0,
+    "reads(-1, _) short-circuits");
+    assert_eq(rg_node_reads(g, 99, 0), 0,
+    "reads(out-of-range, _) short-circuits");
+    assert_eq(rg_node_writes(g, 0 - 1, 0), 0,
+    "writes(-1, _) short-circuits");
+    assert_eq(rg_node_writes(g, 99, 0), 0,
+    "writes(out-of-range, _) short-circuits");
+    return 0;
+}
+
+fn test_rg_build_sets_built_flag() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    assert_eq(rg_build(g, 0), 0, "rg_build succeeds on trivial graph");
+    assert_eq(rg_is_built(g), 1, "built flag set after rg_build");
+    return 0;
+}
+
+fn test_rg_build_empty_graph_is_fine() {
+    var g = rg_new();
+    assert_eq(rg_build(g, 0), 0, "rg_build on empty graph returns 0");
+    assert_eq(rg_is_built(g), 1, "built flag still set for empty graph");
+    return 0;
+}
+
+fn test_rg_build_is_idempotent() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_build(g, 0);
+    assert_eq(rg_build(g, 0), 0,
+    "second rg_build short-circuits to success");
+    return 0;
+}
+
+fn test_rg_build_linear_chain_preserves_order() {
+    # A writes r0, B reads r0 — sort order must be A, B.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    assert_eq(rg_build(g, 0), 0, "linear chain builds");
+    # After rg_build, nodes[0].sort_idx == 0, nodes[1].sort_idx == 1.
+    var nodes = load64(g + 0);
+    assert_eq(load64(vec_get(nodes, 0) + 48), 0,
+    "A sort_idx = 0");
+    assert_eq(load64(vec_get(nodes, 1) + 48), 1,
+    "B sort_idx = 1");
+    return 0;
+}
+
+fn test_rg_build_diamond_shape() {
+    # A writes r0; B and C both read r0; D reads r0 and depends on
+    # both B and C indirectly via a write to r1 and r2 respectively.
+    # For v2.5.0 insertion-order semantics, A is sort 0, then B/C in
+    # insertion order, then D last.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    rg_node_reads(g, c, r0);
+    var d = rg_add_compute(g, 0, 0, &dims, "D");
+    rg_node_reads(g, d, r0);
+    assert_eq(rg_build(g, 0), 0, "diamond graph builds");
+    var nodes = load64(g + 0);
+    assert_eq(load64(vec_get(nodes, 0) + 48), 0, "A first");
+    # B, C, D ordering among themselves: all have in-degree 1 then
+    # drop to 0 together once A drains; queue processes them in
+    # insertion order B, C, D. Sort idx 1, 2, 3.
+    assert_eq(load64(vec_get(nodes, 1) + 48), 1, "B second");
+    assert_eq(load64(vec_get(nodes, 2) + 48), 2, "C third");
+    assert_eq(load64(vec_get(nodes, 3) + 48), 3, "D last");
+    return 0;
+}
+
+fn test_rg_execute_unbuilt_fails_fast() {
+    # rg_execute must refuse a graph that hasn't been built yet.
+    var g = rg_new();
+    assert_eq(rg_execute(g, 0, 0), 1,
+    "rg_execute on unbuilt graph returns 1 (error)");
+    return 0;
+}
+
+fn test_rg_execute_null_device_fails_fast() {
+    # After build, executing against a null device should return
+    # non-zero (the inner wgpu_device_create_command_encoder returns
+    # 0; rg_execute propagates the failure).
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    rg_build(g, 0);
+    # Without a real device fn-table, wgpu_device_create_command_encoder
+    # returns 0 and rg_execute returns 1.
+    assert_eq(rg_execute(g, 0, 0), 1,
+    "rg_execute with null device returns 1");
+    return 0;
+}
+
+fn test_rg_transient_handle_before_build_is_label_ptr() {
+    # Before rg_build, the handle slot holds the label pointer (the
+    # struct layout doubles the slot up as a staging area). This is
+    # a load-bearing implementation detail documented in the module
+    # header — the assertion guards against accidental refactors.
+    var g = rg_new();
+    var r = rg_add_transient_buffer(g, 64, 0x08, "label-str");
+    # Before build, handle field holds the label pointer.
+    assert_neq(rg_transient_handle(g, r), 0,
+    "pre-build handle slot holds label ptr, not 0");
+    return 0;
+}
+
+fn test_rg_transient_handle_out_of_range() {
+    var g = rg_new();
+    rg_add_transient_buffer(g, 64, 0x08, "r");
+    assert_eq(rg_transient_handle(g, 0 - 1), 0,
+    "rg_transient_handle(-1) = 0");
+    assert_eq(rg_transient_handle(g, 99), 0,
+    "rg_transient_handle(out-of-range) = 0");
+    assert_eq(rg_transient_view(g, 0 - 1), 0,
+    "rg_transient_view(-1) = 0");
+    assert_eq(rg_transient_view(g, 99), 0,
+    "rg_transient_view(out-of-range) = 0");
+    return 0;
+}
+
+fn test_rg_release_null_is_safe() {
+    assert_eq(rg_release(0), 0, "rg_release(0) is a no-op");
+    return 0;
+}
+
+fn test_rg_aliasing_flag_round_trip() {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    assert_eq(load64(g + 24), 1, "aliasing flag set to 1");
+    rg_aliasing(g, 0);
+    assert_eq(load64(g + 24), 0, "aliasing flag set to 0");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase A — transient aliasing planner
+# ================================================================
+
+fn test_rg_plan_unbuilt_returns_error() {
+    var g = rg_new();
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 1, "plan on unbuilt graph returns 1");
+    return 0;
+}
+
+fn test_rg_plan_empty_graph() {
+    var g = rg_new();
+    assert_eq(rg_build(g, 0), 0, "empty build ok");
+    var stats[24];
+    memset(&stats, 0xFF, 24);
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan on empty returns 0");
+    assert_eq(load64(&stats + 0), 0, "empty: 0 slots");
+    assert_eq(load64(&stats + 8), 0, "empty: 0 naive");
+    assert_eq(load64(&stats + 16), 0, "empty: 0 aliased");
+    return 0;
+}
+
+fn test_rg_plan_unused_transient_excluded() {
+    var g = rg_new();
+    var orphan = rg_add_transient_buffer(g, 256, 0, "orphan");
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(load64(&stats + 0), 0, "unused transient: 0 slots");
+    assert_eq(load64(&stats + 8), 0, "unused transient: 0 naive");
+    assert_eq(rg_transient_first_use(g, orphan), 0 - 1, "orphan first_use stays -1");
+    assert_eq(rg_transient_last_use(g, orphan), 0 - 1, "orphan last_use stays -1");
+    return 0;
+}
+
+fn test_rg_plan_single_buffer_offset_zero() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r = rg_add_transient_buffer(g, 256, 0, "only");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(rg_transient_offset(g, r), 0, "single transient at offset 0");
+    assert_eq(load64(&stats + 0), 1, "1 slot");
+    assert_eq(load64(&stats + 8), 256, "naive = 256");
+    assert_eq(load64(&stats + 16), 256, "aliased = 256");
+    return 0;
+}
+
+fn test_rg_plan_overlapping_buffers_different_offsets() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # Two buffers both alive at the same node: A writes both, B reads both.
+    # Lifetimes [0,1] and [0,1] — overlapping entirely.
+    var r0 = rg_add_transient_buffer(g, 256, 0, "r0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_writes(g, a, r0);
+    rg_node_writes(g, a, r1);
+    rg_node_reads(g, b, r0);
+    rg_node_reads(g, b, r1);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    var off0 = rg_transient_offset(g, r0);
+    var off1 = rg_transient_offset(g, r1);
+    assert(off0 != off1, "overlapping r0/r1 get different offsets");
+    assert_eq(load64(&stats + 0), 2, "2 slots for overlapping pair");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    return 0;
+}
+
+fn test_rg_plan_disjoint_buffers_share_offset() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # 4-node linear chain: A→B→C→D. Three transients staggered.
+    # buf0 lifetime [0,1], scratch [1,2], buf1 [2,3].
+    # buf0 and buf1 are pairwise disjoint (can share). scratch overlaps both.
+    var r0 = rg_add_transient_buffer(g, 256, 0, "buf0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "scratch");
+    var r2 = rg_add_transient_buffer(g, 256, 0, "buf1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    var d = rg_add_compute(g, 0, 0, &dims, "D");
+    rg_node_writes(g, a, r0);
+    rg_node_reads(g, b, r0);
+    rg_node_writes(g, b, r1);
+    rg_node_reads(g, c, r1);
+    rg_node_writes(g, c, r2);
+    rg_node_reads(g, d, r2);
+    assert_eq(rg_build(g, 0), 0, "linear chain builds");
+    # Lifetimes
+    assert_eq(rg_transient_first_use(g, r0), 0, "buf0 first_use=0");
+    assert_eq(rg_transient_last_use(g, r0),  1, "buf0 last_use=1");
+    assert_eq(rg_transient_first_use(g, r1), 1, "scratch first_use=1");
+    assert_eq(rg_transient_last_use(g, r1),  2, "scratch last_use=2");
+    assert_eq(rg_transient_first_use(g, r2), 2, "buf1 first_use=2");
+    assert_eq(rg_transient_last_use(g, r2),  3, "buf1 last_use=3");
+    # Planner should give buf0 and buf1 the same offset (slot 1),
+    # scratch a separate offset (slot 2). 2 slots total.
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(rg_transient_offset(g, r0), 0,   "buf0 offset=0");
+    assert_eq(rg_transient_offset(g, r1), 256, "scratch offset=256");
+    assert_eq(rg_transient_offset(g, r2), 0,   "buf1 reuses buf0 slot");
+    assert_eq(load64(&stats + 0), 2,   "2 slots");
+    assert_eq(load64(&stats + 8), 768, "naive = 3 * 256");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    return 0;
+}
+
+fn test_rg_plan_buffers_and_textures_separate() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var buf = rg_add_transient_buffer(g, 256, 0, "buf");
+    # 4x4 RGBA8 texture = 64 bytes → aligns up to 256.
+    var tex = rg_add_transient_texture(g, 4, 4, 18, 0, "tex");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, buf);
+    rg_node_reads(g, n, tex);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    # Buffers placed first, textures after — kept in separate sub-ranges.
+    assert_eq(rg_transient_offset(g, buf), 0,   "buffer at offset 0");
+    assert_eq(rg_transient_offset(g, tex), 256, "texture after buffer range");
+    assert_eq(load64(&stats + 0), 2, "2 slots across kinds");
+    return 0;
+}
+
+fn test_rg_plan_alignment_256() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # 100-byte buffer — must align up to 256.
+    var r = rg_add_transient_buffer(g, 100, 0, "small");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    assert_eq(load64(&stats + 8), 256, "naive aligned up from 100 to 256");
+    assert_eq(load64(&stats + 16), 256, "aliased aligned up from 100 to 256");
+    return 0;
+}
+
+fn test_rg_first_use_last_use_across_multiple_reads() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    # One writer, three readers — lifetime spans writer through last reader.
+    var r = rg_add_transient_buffer(g, 256, 0, "shared");
+    var w  = rg_add_compute(g, 0, 0, &dims, "W");
+    var r1 = rg_add_compute(g, 0, 0, &dims, "R1");
+    var r2 = rg_add_compute(g, 0, 0, &dims, "R2");
+    var r3 = rg_add_compute(g, 0, 0, &dims, "R3");
+    rg_node_writes(g, w, r);
+    rg_node_reads(g, r1, r);
+    rg_node_reads(g, r2, r);
+    rg_node_reads(g, r3, r);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    assert_eq(rg_transient_first_use(g, r), 0, "first_use = W");
+    assert_eq(rg_transient_last_use(g, r), 3, "last_use = R3");
+    return 0;
+}
+
+fn test_rg_plan_reclaim_ratio_chain() {
+    # 6-node linear chain with 5 transients. Each node hands off to the
+    # next via a distinct transient. Classic staggered interval graph —
+    # heavy aliasing opportunity.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var bufs[40];
+    var i = 0;
+    while (i < 5) {
+        store64(&bufs + i * 8, rg_add_transient_buffer(g, 256, 0, "b"));
+        i = i + 1;
+    }
+    var nodes[48];
+    i = 0;
+    while (i < 6) {
+        store64(&nodes + i * 8, rg_add_compute(g, 0, 0, &dims, "n"));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        rg_node_writes(g, load64(&nodes + i * 8), load64(&bufs + i * 8));
+        rg_node_reads(g, load64(&nodes + (i + 1) * 8), load64(&bufs + i * 8));
+        i = i + 1;
+    }
+    assert_eq(rg_build(g, 0), 0, "chain builds");
+    var stats[24];
+    assert_eq(rg_plan_aliasing_stats(g, &stats), 0, "plan ok");
+    # naive = 5 * 256 = 1280. Staggered pairs: b0/b2/b4 can share one
+    # slot (lifetimes [0,1], [2,3], [4,5] — disjoint); b1/b3 share
+    # another ([1,2], [3,4] — disjoint). 2 slots, aliased = 512.
+    assert_eq(load64(&stats + 0), 2, "2 slots");
+    assert_eq(load64(&stats + 8), 1280, "naive = 5 * 256");
+    assert_eq(load64(&stats + 16), 512, "aliased = 2 * 256");
+    var reclaim = (load64(&stats + 8) - load64(&stats + 16)) * 100 / load64(&stats + 8);
+    assert(reclaim >= 30, "reclaim >= 30%");
+    return 0;
+}
+
+fn test_gpu_render_dispatchers_null_ctx_safe() {
+    # All seven render dispatchers must short-circuit on null ctx
+    # without dispatching. No mock backend needed.
+    assert_eq(gpu_render_target_create_2d_rgba8(0, 64, 64), 0, "rt_create null ctx -> 0");
+    assert_eq(gpu_render_target_release(0, 0xDEAD), 0, "rt_release null ctx -> 0");
+    assert_eq(gpu_render_pipeline_create(0, 1, 2, 28), 0, "pipe_create null ctx -> 0");
+    assert_eq(gpu_render_pipeline_release(0, 0xDEAD), 0, "pipe_release null ctx -> 0");
+    var color[32];
+    memset(&color, 0, 32);
+    assert_eq(gpu_render_pass_begin(0, 0xDEAD, &color), 0, "pass_begin null ctx -> 0");
+    assert_eq(gpu_render_pass_draw(0, 1, 2, 3, 1), GPU_ERR_OTHER, "pass_draw null ctx -> ERR");
+    assert_eq(gpu_render_pass_end(0, 0xDEAD), 0, "pass_end null ctx -> 0");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_audit_rpb_label_fits();
+    test_audit_strnlen_short_string();
+    test_audit_rpb_pass_color_offsets();
+    test_audit_rpb_pass_begin_empty_short_circuits();
+    test_audit_render_target_rgba8_rejects_invalid();
+    test_rg_new_initial_state();
+    test_rg_add_compute_returns_incrementing_ids();
+    test_rg_add_render_and_copy_nodes();
+    test_rg_add_transient_buffer_incrementing_ids();
+    test_rg_add_transient_texture();
+    test_rg_node_reads_writes_guards_out_of_range();
+    test_rg_build_sets_built_flag();
+    test_rg_build_empty_graph_is_fine();
+    test_rg_build_is_idempotent();
+    test_rg_build_linear_chain_preserves_order();
+    test_rg_build_diamond_shape();
+    test_rg_execute_unbuilt_fails_fast();
+    test_rg_execute_null_device_fails_fast();
+    test_rg_transient_handle_before_build_is_label_ptr();
+    test_rg_transient_handle_out_of_range();
+    test_rg_release_null_is_safe();
+    test_rg_aliasing_flag_round_trip();
+    test_rg_plan_unbuilt_returns_error();
+    test_rg_plan_empty_graph();
+    test_rg_plan_unused_transient_excluded();
+    test_rg_plan_single_buffer_offset_zero();
+    test_rg_plan_overlapping_buffers_different_offsets();
+    test_rg_plan_disjoint_buffers_share_offset();
+    test_rg_plan_buffers_and_textures_separate();
+    test_rg_plan_alignment_256();
+    test_rg_first_use_last_use_across_multiple_reads();
+    test_rg_plan_reclaim_ratio_chain();
+    test_gpu_render_dispatchers_null_ctx_safe();
+    return assert_summary();
+}

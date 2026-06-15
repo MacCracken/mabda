@@ -1,0 +1,328 @@
+# tests/tcyr/buffer.tcyr — buffer, typed_buffer, gpu_timestamps
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# ================================================================
+# GpuCapabilities struct — accessors mirror stored values
+# ================================================================
+fn _build_test_caps() {
+    var c = gpu_caps_new();
+    gpu_caps_set_adapter_name(c, "Test GPU");
+    gpu_caps_set_backend(c, "Vulkan");
+    gpu_caps_set_timestamp_query(c, 1);
+    gpu_caps_set_max_texture_2d(c, 16384);
+    gpu_caps_set_max_uniform(c, 65536);
+    gpu_caps_set_max_storage(c, 134217728);
+    gpu_caps_set_max_buffer(c, 268435456);
+    gpu_caps_set_max_bind_groups(c, 4);
+    gpu_caps_set_max_vertex_buf(c, 8);
+    gpu_caps_set_compute_wg(c, 256, 256, 64);
+    gpu_caps_set_compute_wgs_dim(c, 65535);
+    gpu_caps_set_multi_draw(c, 0);
+    return c;
+}
+
+# ================================================================
+# typed_buffer
+# ================================================================
+# test_typed_buffer.tcyr — pure-data tests for typed_buffer.cyr
+# Ported from typed_buffer.rs tests (the alignment_check test + layout checks).
+# GPU-backed tests live in test_phase0.tcyr.
+
+# ================================================================
+# Alignment predicate — mirrors is_multiple_of(16) from Rust
+# ================================================================
+fn _is_multiple_of_16(size) {
+    if ((size & 15) == 0) { return 1; }
+    return 0;
+}
+
+# ================================================================
+# Error-path tests — uniform_buffer_new validation without touching GPU
+# ================================================================
+#
+# We can exercise the validation branches of uniform_buffer_new by passing
+# size=0 and size=12. The function only hits the GPU creation path after
+# validation passes, so these return Err(...) without any device call.
+# Pass device=0, queue=0, data=0 — unreachable past the early returns.
+
+# Re-implement the validation path standalone (can't include typed_buffer.cyr
+# without pulling in the wgpu FFI function table, which only exists in the
+# object-mode GPU test binary).
+fn _validate_uniform_size(size) {
+    if (size == 0) {
+        return gpu_err_result_msg(GPU_ERR_BUFFER, "uniform buffer size is zero");
+    }
+    if ((size & 15) != 0) {
+        return gpu_err_result_msg(GPU_ERR_BUFFER, "uniform buffer size must be multiple of 16");
+    }
+    return gpu_ok(size);
+}
+
+# ================================================================
+# Storage buffer capacity math
+# ================================================================
+fn _capacity(count, element_size) { return count * element_size; }
+
+# ================================================================
+# v3 Step 3c — gpu_buffer_read dispatches through backend slot
+# ================================================================
+# Counter + arg-capture stub for the buffer_read slot. Verifies the
+# 5-arg fncall threading is correct (ctx, buf, off, ptr, n).
+
+var _step3c_buffer_read_count = 0;
+
+# ================================================================
+# v3 Step 4f.iii — Resource tracker ctx-aware integration
+# ================================================================
+# FrameResources grew from 16 → 24 bytes; +0 holds an optional
+# GpuContext*. frame_resources_release_buffers routes through
+# gpu_buffer_release(ctx, h), which dispatches through
+# ctx->backend->buffer_release. Mock-backend tests below verify
+# dispatch semantics; counter increments per call confirm the
+# tracker calls the slot exactly once per tracked handle.
+
+var _step4f3_release_count = 0;
+
+fn test_not_recoverable_readback() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_READBACK_CHANNEL), 0, "readback not recoverable");
+    return 0;
+}
+
+fn test_webgpu_uniform_fits() {
+    assert_eq(webgpu_uniform_fits(1024),  1, "1024 fits");
+    assert_eq(webgpu_uniform_fits(65536), 1, "65536 fits (at boundary)");
+    assert_eq(webgpu_uniform_fits(65537), 0, "65537 rejected (over limit)");
+    return 0;
+}
+
+# ================================================================
+# Instance-level validation helpers (uniform_fits, storage_fits)
+# Port of test_capabilities_uniform_storage_fits from Rust.
+# ================================================================
+fn test_caps_uniform_fits() {
+    var c = _build_test_caps();
+    assert_eq(gpu_caps_uniform_fits(c, 1024),   1, "1024 fits in 65536");
+    assert_eq(gpu_caps_uniform_fits(c, 65536),  1, "boundary fits");
+    assert_eq(gpu_caps_uniform_fits(c, 65537),  0, "65537 over limit");
+    return 0;
+}
+
+fn test_caps_storage_fits() {
+    var c = _build_test_caps();
+    assert_eq(gpu_caps_storage_fits(c, 1024),       1, "1024 fits in 128 MiB");
+    assert_eq(gpu_caps_storage_fits(c, 134217728),  1, "boundary fits");
+    assert_eq(gpu_caps_storage_fits(c, 134217729),  0, "over 128 MiB rejected");
+    return 0;
+}
+
+fn test_alignment_predicate() {
+    assert_eq(_is_multiple_of_16(16), 1, "16 aligned");
+    assert_eq(_is_multiple_of_16(32), 1, "32 aligned");
+    assert_eq(_is_multiple_of_16(48), 1, "48 aligned");
+    assert_eq(_is_multiple_of_16(64), 1, "64 aligned");
+    assert_eq(_is_multiple_of_16(128), 1, "128 aligned");
+    assert_eq(_is_multiple_of_16(12), 0, "12 not aligned");
+    assert_eq(_is_multiple_of_16(1),  0, "1 not aligned");
+    assert_eq(_is_multiple_of_16(15), 0, "15 not aligned");
+    assert_eq(_is_multiple_of_16(17), 0, "17 not aligned");
+    return 0;
+}
+
+fn test_uniform_size_zero_rejected() {
+    var r = _validate_uniform_size(0);
+    assert_eq(is_err_result(r), 1, "size=0 → Err");
+    var e = payload(r);
+    assert_eq(gpu_err_code(e), GPU_ERR_BUFFER, "code=GPU_ERR_BUFFER");
+    return 0;
+}
+
+fn test_uniform_size_unaligned_rejected() {
+    var r = _validate_uniform_size(12);
+    assert_eq(is_err_result(r), 1, "size=12 → Err");
+    var e = payload(r);
+    assert_eq(gpu_err_code(e), GPU_ERR_BUFFER, "code=GPU_ERR_BUFFER");
+    return 0;
+}
+
+fn test_uniform_size_16_accepted() {
+    var r = _validate_uniform_size(16);
+    assert_eq(is_ok(r), 1, "size=16 → Ok");
+    assert_eq(payload(r), 16, "payload preserved");
+    return 0;
+}
+
+fn test_uniform_size_32_accepted() {
+    var r = _validate_uniform_size(32);
+    assert_eq(is_ok(r), 1, "size=32 → Ok");
+    return 0;
+}
+
+fn test_uniform_size_48_accepted() {
+    var r = _validate_uniform_size(48);
+    assert_eq(is_ok(r), 1, "size=48 → Ok");
+    return 0;
+}
+
+fn test_uniform_size_64_accepted() {
+    var r = _validate_uniform_size(64);
+    assert_eq(is_ok(r), 1, "size=64 → Ok");
+    return 0;
+}
+
+fn test_storage_capacity_math() {
+    assert_eq(_capacity(8, 4),    32, "8 × f32 = 32 bytes");
+    assert_eq(_capacity(256, 4),  1024, "256 × f32 = 1024 bytes");
+    assert_eq(_capacity(16, 16),  256, "16 × vec4 = 256 bytes");
+    assert_eq(_capacity(0, 4),    0, "0 × f32 = 0 bytes");
+    return 0;
+}
+
+fn test_storage_write_capacity_check() {
+    # Mirrors storage_buffer_write's capacity guard
+    var stored_count = 8;
+    assert_eq(4 > stored_count, 0, "write 4 into 8 OK");
+    assert_eq(8 > stored_count, 0, "write 8 into 8 OK (at capacity)");
+    assert_eq(9 > stored_count, 1, "write 9 into 8 rejected");
+    assert_eq(16 > stored_count, 1, "write 16 into 8 rejected");
+    return 0;
+}
+
+# MED-2: growable_buffer's cap*2 guard — we can't reach the overflow
+# at runtime without a real device, but the math is exercised by
+# seeding a synthetic struct with a near-boundary cap and calling the
+# public accessor path. If the guard compiles and links, the fix shipped.
+fn test_audit_growable_buffer_accessors() {
+    var gb = alloc(32);
+    store64(gb,      0);
+    store64(gb + 8,  0x4000000000000000);   # cap near the overflow boundary
+    store64(gb + 16, 0);
+    store64(gb + 24, 0);
+    assert_eq(growable_buffer_capacity(gb), 0x4000000000000000,
+    "growable_buffer_capacity round-trip");
+    return 0;
+}
+
+# MED-4: storage_buffer_write rejects write_count * element_size overflow.
+# We seed a wrapper with count = 4, element_size = i64_max/3 (overflows on *4).
+fn test_audit_storage_buffer_write_overflow() {
+    var sb = storage_buffer_wrap_raw(1, 64, 4, 0x7FFFFFFFFFFFFFFF / 3);
+    var res = storage_buffer_write(0, sb, 0, 4);
+    assert_eq(is_err_result(res), 1, "storage_buffer_write rejects overflow");
+    return 0;
+}
+
+# MED-5: storage_buffer_wrap rejects inconsistent (capacity, count, element_size)
+# by zeroing element_size to 1. An inconsistent wrap at (cap=64, count=16,
+# elem=8) requires 128 bytes > 64 cap → elem gets clamped to 1.
+fn test_audit_storage_buffer_wrap_consistency() {
+    var sb = storage_buffer_wrap(1, 64, 16, 8);
+    assert_eq(storage_buffer_element_size(sb), 1,
+    "wrap clamps element_size on capacity violation");
+    return 0;
+}
+
+# A valid wrap keeps the element_size intact.
+fn test_audit_storage_buffer_wrap_valid() {
+    var sb = storage_buffer_wrap(1, 64, 8, 8);
+    assert_eq(storage_buffer_element_size(sb), 8,
+    "wrap preserves element_size when consistent");
+    return 0;
+}
+
+# LOW-2: read_buffer enforces a size cap and rejects bad sizes before
+# allocating a staging buffer or host memory. A zero/negative size must
+# return 0 unconditionally; a size exceeding the cap must do likewise.
+fn test_audit_read_buffer_zero_size_rejected() {
+    assert_eq(read_buffer_capped(0, 0, 0, 0, 1024), 0,
+    "read_buffer_capped(size=0) returns 0");
+    assert_eq(read_buffer_capped(0, 0, 0, -1, 1024), 0,
+    "read_buffer_capped(size<0) returns 0");
+    return 0;
+}
+
+fn test_audit_read_buffer_exceeds_cap_rejected() {
+    assert_eq(read_buffer_capped(0, 0, 0, 2048, 1024), 0,
+    "read_buffer_capped(size>cap) returns 0");
+    return 0;
+}
+
+# ================================================================
+# v2.4.2 — GPU runtime validation regressions
+# ================================================================
+# The following assertions guard the FFI descriptor / enum drift bugs
+# caught when mabda v2.4.1 first exercised a real wgpu-native GPU on a
+# Mesa/Vulkan Linux box. Each assertion is written so that reintroducing
+# the bug (wrong enum value, wrong struct offset) fails the CPU suite
+# immediately — no GPU required. See `docs/issues/2026-04-20-*` and the
+# v2.4.2 CHANGELOG entry for the full narrative.
+
+fn test_audit_buffer_binding_type_values() {
+    # v29 renumbering: BindingNotUsed=0 was inserted, shifting every
+    # subsequent value up by one. Pre-fix, STORAGE was mistakenly 2
+    # and the runtime treated storage bindings as uniform bindings.
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_BINDING_NOT_USED, 0,
+    "BufferBindingType BindingNotUsed = 0 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_UNDEFINED, 1,
+    "BufferBindingType Undefined = 1 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_UNIFORM, 2,
+    "BufferBindingType Uniform = 2 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_STORAGE, 3,
+    "BufferBindingType Storage = 3 (v29)");
+    assert_eq(WGPU_BUFFER_BINDING_TYPE_READ_ONLY_STORAGE, 4,
+    "BufferBindingType ReadOnlyStorage = 4 (v29)");
+    return 0;
+}
+
+fn test_gpu_buffer_read_null_ctx_returns_err() {
+    _step3c_buffer_read_count = 0;
+    var rc = gpu_buffer_read(0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_BUFFER, "null ctx returns GPU_ERR_BUFFER");
+    assert_eq(_step3c_buffer_read_count, 0,
+    "null ctx does not dispatch");
+    return 0;
+}
+
+fn test_frame_resources_release_buffers_no_ctx_is_noop() {
+    _step4f3_release_count = 0;
+    var fr = frame_resources_new();    # legacy, no ctx
+    frame_resources_track_buffer(fr, 0xDEAD);
+    var n = frame_resources_release_buffers(fr);
+    assert_eq(n, 0, "no-ctx fr releases 0");
+    assert_eq(_step4f3_release_count, 0, "did not dispatch");
+    # Buffer remains tracked — caller must clear manually.
+    assert_eq(frame_resources_buffer_count(fr), 1, "buffer still tracked");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_not_recoverable_readback();
+    test_webgpu_uniform_fits();
+    test_caps_uniform_fits();
+    test_caps_storage_fits();
+    test_alignment_predicate();
+    test_uniform_size_zero_rejected();
+    test_uniform_size_unaligned_rejected();
+    test_uniform_size_16_accepted();
+    test_uniform_size_32_accepted();
+    test_uniform_size_48_accepted();
+    test_uniform_size_64_accepted();
+    test_storage_capacity_math();
+    test_storage_write_capacity_check();
+    test_audit_growable_buffer_accessors();
+    test_audit_storage_buffer_write_overflow();
+    test_audit_storage_buffer_wrap_consistency();
+    test_audit_storage_buffer_wrap_valid();
+    test_audit_read_buffer_zero_size_rejected();
+    test_audit_read_buffer_exceeds_cap_rejected();
+    test_audit_buffer_binding_type_values();
+    test_gpu_buffer_read_null_ctx_returns_err();
+    test_frame_resources_release_buffers_no_ctx_is_noop();
+    return assert_summary();
+}

@@ -5,7 +5,7 @@
 # links against wgpu-native through a C launcher (deps/wgpu_main.c).
 #
 # Quick reference:
-#   make test           — CPU-only tests (`cyrius test tests/tcyr/mabda.tcyr`)
+#   make test           — CPU-only tests (globs tests/tcyr/*.tcyr domain suites)
 #   make bench          — CPU-only benchmarks
 #   make fuzz           — invariant harnesses under fuzz/*.fcyr
 #   make build          — link-check the library (programs/smoke.cyr)
@@ -49,10 +49,11 @@ build: check-lib-wiring
 	@echo "smoke: $$(wc -c < build/mabda_smoke) bytes"
 
 .PHONY: test
+# Functionality-grouped CPU suites (v3.1 test reorg 2026-06-15): one
+# file per domain under tests/tcyr/. Globbed so new domain files are
+# picked up automatically; each is a standalone suite with its own main().
 test: check-lib-wiring
-	$(CYRIUS) test tests/tcyr/mabda.tcyr
-	$(CYRIUS) test tests/tcyr/mabda_v3.tcyr
-	$(CYRIUS) test tests/tcyr/mabda_v3_phase_d.tcyr
+	@for f in tests/tcyr/*.tcyr; do $(CYRIUS) test "$$f" || exit 1; done
 
 .PHONY: bench
 bench: check-lib-wiring

@@ -1,0 +1,677 @@
+# tests/tcyr/core.tcyr — error, color, capabilities, profiler, resource, debug, observability
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# ================================================================
+# GpuCapabilities struct — accessors mirror stored values
+# ================================================================
+fn _build_test_caps() {
+    var c = gpu_caps_new();
+    gpu_caps_set_adapter_name(c, "Test GPU");
+    gpu_caps_set_backend(c, "Vulkan");
+    gpu_caps_set_timestamp_query(c, 1);
+    gpu_caps_set_max_texture_2d(c, 16384);
+    gpu_caps_set_max_uniform(c, 65536);
+    gpu_caps_set_max_storage(c, 134217728);
+    gpu_caps_set_max_buffer(c, 268435456);
+    gpu_caps_set_max_bind_groups(c, 4);
+    gpu_caps_set_max_vertex_buf(c, 8);
+    gpu_caps_set_compute_wg(c, 256, 256, 64);
+    gpu_caps_set_compute_wgs_dim(c, 65535);
+    gpu_caps_set_multi_draw(c, 0);
+    return c;
+}
+
+# ================================================================
+# error
+# ================================================================
+# test_error.tcyr — pure-data tests for error.cyr
+# Ported from the Rust v1.0.0 error.rs tests — see git tag 1.0.0.
+# (Excludes wgpu:: variants that
+# don't have a Cyrius analogue — Send/Sync, source chain, Box<dyn Error>).
+
+# ================================================================
+# Error code constants are distinct
+# ================================================================
+fn test_error_codes_unique() {
+    assert(GPU_ERR_NONE             != GPU_ERR_ADAPTER_NOT_FOUND, "none != adapter");
+    assert(GPU_ERR_ADAPTER_NOT_FOUND != GPU_ERR_DEVICE_REQUEST,   "adapter != device");
+    assert(GPU_ERR_SURFACE_CONFIG   != GPU_ERR_SURFACE_TIMEOUT,   "config != timeout");
+    assert(GPU_ERR_SURFACE_OUTDATED != GPU_ERR_SURFACE_LOST,      "outdated != lost");
+    assert(GPU_ERR_BUFFER           != GPU_ERR_TEXTURE,           "buffer != texture");
+    assert(GPU_ERR_FFI_LOAD         != GPU_ERR_FFI_SYMBOL,        "ffi load != ffi sym");
+    return 0;
+}
+
+# ================================================================
+# gpu_err_result struct construction + accessors
+# ================================================================
+fn test_gpu_err_new() {
+    var e = gpu_err_new(GPU_ERR_BUFFER, "out of memory");
+    assert_eq(gpu_err_code(e), GPU_ERR_BUFFER, "code stored");
+    var d = gpu_err_detail(e);
+    assert(d != 0, "detail stored");
+    assert_eq(strlen(d), 13, "detail string length");
+    return 0;
+}
+
+fn test_gpu_err_no_detail() {
+    var e = gpu_err(GPU_ERR_ADAPTER_NOT_FOUND);
+    assert_eq(gpu_err_code(e), GPU_ERR_ADAPTER_NOT_FOUND, "code stored");
+    assert_eq(gpu_err_detail(e), 0, "detail is null");
+    return 0;
+}
+
+fn test_not_recoverable_adapter() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_ADAPTER_NOT_FOUND), 0, "adapter not recoverable");
+    return 0;
+}
+
+fn test_not_recoverable_shader() {
+    assert_eq(gpu_err_is_recoverable(GPU_ERR_SHADER), 0, "shader not recoverable");
+    return 0;
+}
+
+# ================================================================
+# Name lookup coverage
+# ================================================================
+fn test_name_adapter_not_found() {
+    var n = gpu_err_name(GPU_ERR_ADAPTER_NOT_FOUND);
+    assert(n != 0, "name non-null");
+    # strstr-free check: just verify length > 0 and first char
+    assert(strlen(n) > 0, "name non-empty");
+    return 0;
+}
+
+fn test_name_unknown_code() {
+    var n = gpu_err_name(9999);
+    assert(strlen(n) > 0, "unknown returns placeholder");
+    return 0;
+}
+
+fn test_name_none() {
+    var n = gpu_err_name(GPU_ERR_NONE);
+    assert_eq(strlen(n), 4, "name('none') length 4");
+    return 0;
+}
+
+# ================================================================
+# Result / tagged-union helpers (gpu_ok, gpu_err_result, gpu_err_result_msg)
+# ================================================================
+fn test_gpu_ok_tag() {
+    var r = gpu_ok(42);
+    assert_eq(is_ok(r), 1, "gpu_ok → is_ok");
+    assert_eq(is_err_result(r), 0, "gpu_ok → not err");
+    assert_eq(payload(r), 42, "payload preserved");
+    return 0;
+}
+
+fn test_gpu_err_tag() {
+    var r = gpu_err_result(GPU_ERR_BUFFER);
+    assert_eq(is_err_result(r), 1, "gpu_err_result → is_err");
+    assert_eq(is_ok(r), 0, "gpu_err_result → not ok");
+    var e = payload(r);
+    assert_eq(gpu_err_code(e), GPU_ERR_BUFFER, "code preserved");
+    return 0;
+}
+
+fn test_gpu_err_msg_tag() {
+    var r = gpu_err_result_msg(GPU_ERR_PIPELINE, "link failed");
+    assert_eq(is_err_result(r), 1, "gpu_err_result_msg → is_err");
+    var e = payload(r);
+    assert_eq(gpu_err_code(e), GPU_ERR_PIPELINE, "code preserved");
+    assert(gpu_err_detail(e) != 0, "detail stored");
+    return 0;
+}
+
+# ================================================================
+# color
+# ================================================================
+# test_color.tcyr — tests for color.cyr
+# Ported from mabda/src/color.rs tests
+
+# ================================================================
+# Tests
+# ================================================================
+
+fn test_color_constants() {
+    var w = COLOR_WHITE();
+    assert(color_r(w) == F64_1, "white r=1");
+    assert(color_g(w) == F64_1, "white g=1");
+    assert(color_b(w) == F64_1, "white b=1");
+    assert(color_a(w) == F64_1, "white a=1");
+
+    var b = COLOR_BLACK();
+    assert(color_r(b) == F64_0, "black r=0");
+    assert(color_g(b) == F64_0, "black g=0");
+    assert(color_b(b) == F64_0, "black b=0");
+    assert(color_a(b) == F64_1, "black a=1");
+
+    var t = COLOR_TRANSPARENT();
+    assert(color_a(t) == F64_0, "transparent a=0");
+    assert(color_r(t) == F64_0, "transparent r=0");
+    return 0;
+}
+
+fn test_color_rgb_constants() {
+    var r = COLOR_RED();
+    assert(color_r(r) == F64_1, "red r=1");
+    assert(color_g(r) == F64_0, "red g=0");
+    assert(color_b(r) == F64_0, "red b=0");
+
+    var g = COLOR_GREEN();
+    assert(color_g(g) == F64_1, "green g=1");
+    assert(color_r(g) == F64_0, "green r=0");
+
+    var bl = COLOR_BLUE();
+    assert(color_b(bl) == F64_1, "blue b=1");
+    assert(color_r(bl) == F64_0, "blue r=0");
+    return 0;
+}
+
+fn test_color_cornflower() {
+    var cb = COLOR_CORNFLOWER_BLUE();
+    assert(color_r(cb) == F64_CB_R, "cornflower r");
+    assert(color_g(cb) == F64_CB_G, "cornflower g");
+    assert(color_b(cb) == F64_CB_B, "cornflower b");
+    assert(color_a(cb) == F64_1, "cornflower a=1");
+    return 0;
+}
+
+fn test_color_from_rgba8() {
+    var c = color_from_rgba8(255, 0, 0, 255);
+    # r should be 255/255 = 1.0
+    assert(color_r(c) == F64_1, "rgba8 255 = 1.0");
+    assert(color_g(c) == F64_0, "rgba8 0 = 0.0");
+    assert(color_a(c) == F64_1, "rgba8 alpha 255 = 1.0");
+
+    # All zeros = transparent
+    var t = color_from_rgba8(0, 0, 0, 0);
+    assert(color_eq(t, COLOR_TRANSPARENT()) == 1, "rgba8(0,0,0,0) = transparent");
+
+    # All 255 = white
+    var w = color_from_rgba8(255, 255, 255, 255);
+    assert(color_eq(w, COLOR_WHITE()) == 1, "rgba8(255,255,255,255) = white");
+    return 0;
+}
+
+fn test_color_from_hex() {
+    # 0xFF0000FF = opaque red
+    var red = color_from_hex(0xFF0000FF);
+    assert(color_r(red) == F64_1, "hex red r=1");
+    assert(color_g(red) == F64_0, "hex red g=0");
+    assert(color_b(red) == F64_0, "hex red b=0");
+    assert(color_a(red) == F64_1, "hex red a=1");
+
+    # 0x00000000 = transparent
+    var t = color_from_hex(0x00000000);
+    assert(color_eq(t, COLOR_TRANSPARENT()) == 1, "hex 0 = transparent");
+    return 0;
+}
+
+fn test_color_lerp() {
+    var black = COLOR_BLACK();
+    var white = COLOR_WHITE();
+    var mid = color_lerp(black, white, F64_HALF);
+
+    # mid.r should be ~0.5
+    var mr = color_r(mid);
+    var diff = f64_sub(mr, F64_HALF);
+    # Check abs(diff) < 0.001
+    if (f64_lt(diff, F64_0) == 1) { diff = f64_neg(diff); }
+    var eps = 4547007087734592512;  # 0.001
+    assert(f64_lt(diff, eps) == 1, "lerp midpoint r ~0.5");
+    return 0;
+}
+
+fn test_color_lerp_clamp() {
+    var black = COLOR_BLACK();
+    var white = COLOR_WHITE();
+
+    # t=0 returns first color
+    var at0 = color_lerp(black, white, F64_0);
+    assert(color_eq(at0, black) == 1, "lerp t=0 = first");
+
+    # t=1 returns second color
+    var at1 = color_lerp(black, white, F64_1);
+    assert(color_eq(at1, white) == 1, "lerp t=1 = second");
+
+    # t<0 clamps to first
+    var neg = f64_neg(F64_1);
+    var clamped = color_lerp(black, white, neg);
+    assert(color_eq(clamped, black) == 1, "lerp t<0 clamps");
+
+    # t>1 clamps to second
+    var over = color_lerp(black, white, F64_TWO);
+    assert(color_eq(over, white) == 1, "lerp t>1 clamps");
+    return 0;
+}
+
+fn test_color_luminance() {
+    # White luminance ~ 1.0
+    var wl = color_luminance(COLOR_WHITE());
+    var diff_w = f64_sub(wl, F64_1);
+    if (f64_lt(diff_w, F64_0) == 1) { diff_w = f64_neg(diff_w); }
+    var eps = 4562254508917369856;  # 0.01
+    assert(f64_lt(diff_w, eps) == 1, "white luminance ~1.0");
+
+    # Black luminance = 0.0
+    var bl = color_luminance(COLOR_BLACK());
+    assert(bl == F64_0, "black luminance = 0.0");
+
+    # Red luminance < Green luminance (Rec. 709)
+    var rl = color_luminance(COLOR_RED());
+    var gl = color_luminance(COLOR_GREEN());
+    assert(f64_lt(rl, gl) == 1, "red lum < green lum");
+    return 0;
+}
+
+fn test_color_f64_to_f32() {
+    # 1.0 as f64 → 1.0 as f32 (0x3F800000)
+    var f32_one = f64_to_f32(F64_1);
+    assert_eq(f32_one, 0x3F800000, "f64_to_f32(1.0) = 0x3F800000");
+
+    # 0.0 as f64 → 0.0 as f32 (0x00000000)
+    var f32_zero = f64_to_f32(F64_0);
+    assert_eq(f32_zero, 0, "f64_to_f32(0.0) = 0");
+
+    # Roundtrip: f64 → f32 → f64
+    var rt = f32_to_f64(f64_to_f32(F64_1));
+    assert(rt == F64_1, "f32 roundtrip 1.0");
+    return 0;
+}
+
+fn test_color_write_f32() {
+    var red = COLOR_RED();
+    var buf[16];
+    color_write_f32(red, &buf);
+    # r = 1.0 f32 = 0x3F800000
+    assert_eq(load32(&buf), 0x3F800000, "write_f32 red r");
+    # g = 0.0 f32 = 0x00000000
+    assert_eq(load32(&buf + 4), 0, "write_f32 red g");
+    # b = 0.0
+    assert_eq(load32(&buf + 8), 0, "write_f32 red b");
+    # a = 1.0
+    assert_eq(load32(&buf + 12), 0x3F800000, "write_f32 red a");
+    return 0;
+}
+
+fn test_color_rgb() {
+    var c = color_rgb(F64_HALF, F64_HALF, F64_HALF);
+    assert(color_a(c) == F64_1, "rgb alpha = 1.0");
+    assert(color_r(c) == F64_HALF, "rgb r = 0.5");
+    return 0;
+}
+
+# ================================================================
+# capabilities
+# ================================================================
+# test_capabilities.tcyr — pure-data tests for capabilities.cyr
+# Ported from the Rust v1.0.0 capabilities.rs tests — see git tag 1.0.0.
+# (Skips serde roundtrip and
+# GPU from_context — no equivalents in Cyrius).
+
+# ================================================================
+# WebGPU constants
+# ================================================================
+fn test_webgpu_constants() {
+    assert_eq(WEBGPU_MAX_BIND_GROUPS, 4, "MAX_BIND_GROUPS=4");
+    assert_eq(WEBGPU_MAX_UNIFORM_BUFFER, 65536, "MAX_UNIFORM_BUFFER=65536");
+    assert_eq(WEBGPU_MAX_STORAGE_BUFFER, 134217728, "MAX_STORAGE_BUFFER=128 MiB");
+    assert_eq(WEBGPU_MAX_TEXTURE_2D, 8192, "MAX_TEXTURE_2D=8192");
+    return 0;
+}
+
+fn test_caps_accessors() {
+    var c = _build_test_caps();
+
+    var n = gpu_caps_adapter_name(c);
+    assert(n != 0, "adapter_name non-null");
+    assert_eq(strlen(n), 8, "adapter_name='Test GPU' (8 chars)");
+
+    var b = gpu_caps_backend(c);
+    assert(b != 0, "backend non-null");
+    assert_eq(strlen(b), 6, "backend='Vulkan' (6 chars)");
+
+    assert_eq(gpu_caps_timestamp_query(c),     1, "timestamp_query=true");
+    assert_eq(gpu_caps_compute_shaders(c),     1, "compute_shaders=true (default)");
+    assert_eq(gpu_caps_max_texture_2d(c),      16384, "max_texture_2d");
+    assert_eq(gpu_caps_max_uniform_buffer(c),  65536, "max_uniform_buffer");
+    assert_eq(gpu_caps_max_storage_buffer(c),  134217728, "max_storage_buffer");
+    assert_eq(gpu_caps_max_buffer_size(c),     268435456, "max_buffer_size");
+    assert_eq(gpu_caps_max_bind_groups(c),     4, "max_bind_groups");
+    assert_eq(gpu_caps_max_vertex_buffers(c),  8, "max_vertex_buffers");
+    assert_eq(gpu_caps_max_compute_wg_x(c),   256, "wg_x=256");
+    assert_eq(gpu_caps_max_compute_wg_y(c),   256, "wg_y=256");
+    assert_eq(gpu_caps_max_compute_wg_z(c),   64,  "wg_z=64");
+    assert_eq(gpu_caps_max_compute_wgs_dim(c), 65535, "wgs_per_dim");
+    assert_eq(gpu_caps_multi_draw_indirect(c), 0, "multi_draw=false");
+    return 0;
+}
+
+# ================================================================
+# Newly-constructed caps has compute_shaders=1 by convention
+# ================================================================
+fn test_caps_defaults() {
+    var c = gpu_caps_new();
+    assert_eq(gpu_caps_compute_shaders(c), 1, "compute_shaders defaults to true");
+    assert_eq(gpu_caps_timestamp_query(c), 0, "timestamp_query defaults to false");
+    assert_eq(gpu_caps_adapter_name(c),    0, "adapter_name defaults to null");
+    assert_eq(gpu_caps_max_uniform_buffer(c), 0, "max_uniform defaults to 0");
+    return 0;
+}
+
+# ================================================================
+# profiler
+# ================================================================
+# test_profiler.tcyr — tests for profiler.cyr
+
+fn test_profiler_new() {
+    var p = profiler_new();
+    assert(p != 0, "profiler allocated");
+    assert_eq(profiler_frame_count(p), 0, "initial frame_count=0");
+    return 0;
+}
+
+fn test_profiler_frame() {
+    var p = profiler_new();
+    profiler_begin_frame(p);
+    # Small busy wait
+    var sum = 0;
+    for (var i = 0; i < 10000; i = i + 1) { sum = sum + i; }
+    var elapsed = profiler_end_frame(p);
+
+    assert_eq(profiler_frame_count(p), 1, "frame_count=1 after one frame");
+    # elapsed should be > 0
+    assert(f64_gt(elapsed, F64_0) == 1, "elapsed > 0");
+    # cpu_frame_ms should match elapsed
+    assert(profiler_cpu_frame_ms(p) == elapsed, "cpu_frame_ms matches");
+    return 0;
+}
+
+fn test_profiler_ema() {
+    var p = profiler_new();
+    # Run 10 frames
+    for (var i = 0; i < 10; i = i + 1) {
+        profiler_begin_frame(p);
+        var sum = 0;
+        for (var j = 0; j < 1000; j = j + 1) { sum = sum + j; }
+        profiler_end_frame(p);
+    }
+    assert_eq(profiler_frame_count(p), 10, "10 frames counted");
+    # avg_frame_ms should be > 0
+    assert(f64_gt(profiler_avg_frame_ms(p), F64_0) == 1, "avg > 0");
+    # fps should be > 0
+    assert(f64_gt(profiler_fps(p), F64_0) == 1, "fps > 0");
+    return 0;
+}
+
+fn test_profiler_history() {
+    var p = profiler_with_alpha_and_history(
+    f64_div(f64_from(5), f64_from(100)),
+    5  # small history for testing
+    );
+    # Run 8 frames — should keep only last 5
+    for (var i = 0; i < 8; i = i + 1) {
+        profiler_begin_frame(p);
+        profiler_end_frame(p);
+    }
+    var history = load64(p + 56);
+    assert_eq(vec_len(history), 5, "history capped at 5");
+    return 0;
+}
+
+fn test_profiler_worst_best() {
+    var p = profiler_new();
+    # Run some frames
+    for (var i = 0; i < 5; i = i + 1) {
+        profiler_begin_frame(p);
+        var sum = 0;
+        for (var j = 0; j < 1000; j = j + 1) { sum = sum + j; }
+        profiler_end_frame(p);
+    }
+    var worst = profiler_worst_frame_ms(p);
+    var best = profiler_best_frame_ms(p);
+    # worst >= best
+    assert(f64_gt(worst, F64_0) == 1, "worst > 0");
+    assert(f64_gt(best, F64_0) == 1, "best > 0");
+    # worst >= best (or equal if all frames identical)
+    var ge = f64_gt(worst, best);
+    if (ge != 1) { ge = (worst == best); }
+    assert(ge == 1, "worst >= best");
+    return 0;
+}
+
+fn test_profiler_reset() {
+    var p = profiler_new();
+    profiler_begin_frame(p);
+    profiler_end_frame(p);
+    assert_eq(profiler_frame_count(p), 1, "count=1 before reset");
+    profiler_reset(p);
+    assert_eq(profiler_frame_count(p), 0, "count=0 after reset");
+    return 0;
+}
+
+fn test_profile_scope() {
+    var start = profile_begin();
+    var sum = 0;
+    for (var i = 0; i < 10000; i = i + 1) { sum = sum + i; }
+    var dur = profile_end(start);
+    assert(f64_gt(dur, F64_0) == 1, "profile scope duration > 0");
+    return 0;
+}
+
+# LOW-1: GpuCapabilities comment said 128 bytes but alloc was 120 — a
+# reader writing a new field at +120 would clobber the next heap slab.
+# Exercise the last documented field to pin the layout.
+fn test_audit_gpu_caps_last_field_at_112() {
+    var c = gpu_caps_new();
+    gpu_caps_set_multi_draw(c, 1);
+    assert_eq(gpu_caps_multi_draw_indirect(c), 1,
+    "multi_draw_indirect persists at +112 within 120-byte alloc");
+    return 0;
+}
+
+# LOW-6: _clamp_unit folds out-of-range f64 components to [0.0, 1.0]
+# before the u8 conversion so wrapping arithmetic can't produce a
+# garbage edge pixel.
+fn test_audit_clamp_unit_in_range() {
+    assert_eq(_clamp_unit(F64_0), F64_0, "_clamp_unit(0.0) = 0.0");
+    assert_eq(_clamp_unit(F64_1), F64_1, "_clamp_unit(1.0) = 1.0");
+    return 0;
+}
+
+fn test_audit_clamp_unit_above_one() {
+    assert_eq(_clamp_unit(f64_from(2)), F64_1,
+    "_clamp_unit(2.0) clamps to 1.0");
+    return 0;
+}
+
+fn test_audit_clamp_unit_below_zero() {
+    var neg = f64_from(0);
+    neg = f64_sub(F64_0, F64_1);   # -1.0
+    assert_eq(_clamp_unit(neg), F64_0,
+    "_clamp_unit(-1.0) clamps to 0.0");
+    return 0;
+}
+
+fn test_audit_load_op_values() {
+    # Pre-fix these were swapped (CLEAR=1, LOAD=2) — render passes
+    # flipped clear/load semantics silently.
+    assert_eq(WGPU_LOAD_OP_UNDEFINED, 0, "LoadOp Undefined = 0 (v29)");
+    assert_eq(WGPU_LOAD_OP_LOAD, 1, "LoadOp Load = 1 (v29)");
+    assert_eq(WGPU_LOAD_OP_CLEAR, 2, "LoadOp Clear = 2 (v29)");
+    assert_eq(WGPU_STORE_OP_UNDEFINED, 0, "StoreOp Undefined = 0 (v29)");
+    assert_eq(WGPU_STORE_OP_STORE, 1, "StoreOp Store = 1 (v29)");
+    assert_eq(WGPU_STORE_OP_DISCARD, 2, "StoreOp Discard = 2 (v29)");
+    return 0;
+}
+
+fn test_audit_color_attachment_size_72() {
+    # v29 WGPURenderPassColorAttachment is 72 bytes (nextInChain@0,
+    # view@8, depthSlice@16+pad, resolveTarget@24, loadOp@32, storeOp@36,
+    # clearValue@40). Pre-fix, mabda had COLOR_ATTACHMENT_SIZE = 64 and
+    # was writing view@0 / loadOp@24 / storeOp@28 / clearValue@32 —
+    # everything off by 8 and the total size wrong by 8 too.
+    assert_eq(COLOR_ATTACHMENT_SIZE, 72,
+    "COLOR_ATTACHMENT_SIZE matches v29 WGPURenderPassColorAttachment (72)");
+    return 0;
+}
+
+# ================================================================
+# v2.4.1 — sakshi observability wiring
+# ================================================================
+# These assertions verify the gating contract: mabda emits sakshi
+# events when explicitly enabled, and is silent otherwise. The ring
+# buffer output target keeps tests from polluting stderr.
+
+fn test_obs_disabled_by_default() {
+    assert_eq(mabda_observability_is_enabled(), 0,
+    "observability disabled by default");
+    return 0;
+}
+
+fn test_obs_enable_disable_flips_flag() {
+    mabda_observability_enable();
+    assert_eq(mabda_observability_is_enabled(), 1,
+    "enable() sets flag");
+    mabda_observability_disable();
+    assert_eq(mabda_observability_is_enabled(), 0,
+    "disable() clears flag");
+    return 0;
+}
+
+fn test_obs_disabled_no_sakshi_emission() {
+    sakshi_output_buffer();
+    sakshi_set_level(SK_TRACE);
+    sakshi_ring_clear();
+    mabda_observability_disable();
+    var before = sakshi_ring_event_count();
+    gpu_err_result(GPU_ERR_SHADER);
+    assert_eq(sakshi_ring_event_count(), before,
+    "no sakshi event when observability disabled");
+    return 0;
+}
+
+fn test_obs_enabled_emits_on_err_result() {
+    sakshi_output_buffer();
+    sakshi_set_level(SK_TRACE);
+    sakshi_ring_clear();
+    mabda_observability_enable();
+    var before = sakshi_ring_event_count();
+    gpu_err_result(GPU_ERR_SHADER);
+    assert_eq(sakshi_ring_event_count(), before + 1,
+    "one sakshi event per gpu_err_result when observability enabled");
+    mabda_observability_disable();
+    return 0;
+}
+
+fn test_obs_frame_span_balanced() {
+    sakshi_output_buffer();
+    sakshi_set_level(SK_TRACE);
+    mabda_observability_enable();
+    var depth_before = sakshi_span_depth();
+    var p = profiler_new();
+    profiler_begin_frame(p);
+    profiler_end_frame(p);
+    assert_eq(sakshi_span_depth(), depth_before,
+    "begin/end_frame leave sakshi span depth unchanged");
+    mabda_observability_disable();
+    return 0;
+}
+
+fn test_frame_resources_new_legacy_no_ctx() {
+    var fr = frame_resources_new();
+    assert(fr != 0, "fr non-null");
+    assert_eq(frame_resources_ctx(fr), 0, "legacy ctor leaves ctx zero");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_new_for_stores_ctx() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var fr = frame_resources_new_for(ctx);
+    assert_eq(frame_resources_ctx(fr), ctx, "ctx stored at +0");
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty");
+    return 0;
+}
+
+fn test_frame_resources_clear_pops_all() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xCAFE);
+    frame_resources_track_texture(fr, 0xBEEF);
+    assert_eq(frame_resources_buffer_count(fr), 1, "1 buffer pre-clear");
+    assert_eq(frame_resources_texture_count(fr), 1, "1 texture pre-clear");
+    frame_resources_clear(fr);
+    assert_eq(frame_resources_buffer_count(fr), 0, "buffers empty post-clear");
+    assert_eq(frame_resources_texture_count(fr), 0, "textures empty post-clear");
+    return 0;
+}
+
+fn test_gpu_err_not_implemented_constant_and_name() {
+    assert_eq(GPU_ERR_NOT_IMPLEMENTED, 18, "code value");
+    var name = gpu_err_name(GPU_ERR_NOT_IMPLEMENTED);
+    # Non-empty name — distinct from "unknown error" sentinel.
+    assert_eq(strlen(name) > 0, 1, "name non-empty");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_error_codes_unique();
+    test_gpu_err_new();
+    test_gpu_err_no_detail();
+    test_not_recoverable_adapter();
+    test_not_recoverable_shader();
+    test_name_adapter_not_found();
+    test_name_unknown_code();
+    test_name_none();
+    test_gpu_ok_tag();
+    test_gpu_err_tag();
+    test_gpu_err_msg_tag();
+    test_color_constants();
+    test_color_rgb_constants();
+    test_color_cornflower();
+    test_color_from_rgba8();
+    test_color_from_hex();
+    test_color_lerp();
+    test_color_lerp_clamp();
+    test_color_luminance();
+    test_color_f64_to_f32();
+    test_color_write_f32();
+    test_color_rgb();
+    test_webgpu_constants();
+    test_caps_accessors();
+    test_caps_defaults();
+    test_profiler_new();
+    test_profiler_frame();
+    test_profiler_ema();
+    test_profiler_history();
+    test_profiler_worst_best();
+    test_profiler_reset();
+    test_profile_scope();
+    test_audit_gpu_caps_last_field_at_112();
+    test_audit_clamp_unit_in_range();
+    test_audit_clamp_unit_above_one();
+    test_audit_clamp_unit_below_zero();
+    test_audit_load_op_values();
+    test_audit_color_attachment_size_72();
+    test_obs_disabled_by_default();
+    test_obs_enable_disable_flips_flag();
+    test_obs_disabled_no_sakshi_emission();
+    test_obs_enabled_emits_on_err_result();
+    test_obs_frame_span_balanced();
+    test_frame_resources_new_legacy_no_ctx();
+    test_frame_resources_new_for_stores_ctx();
+    test_frame_resources_clear_pops_all();
+    test_gpu_err_not_implemented_constant_and_name();
+    return assert_summary();
+}

@@ -1,17 +1,78 @@
-# tests/tcyr/mabda_v3_phase_d.tcyr — v3 Phase D (DRM/KMS surface) tests
-#
-# Split from mabda_v3.tcyr 2026-04-30 to keep that file under
-# cyrius lint's 128 KiB read-buffer cap (see
-# `feedback_cyrlint_128k_buffer_cap` memory + the CHANGELOG entry
-# under "Step 7.1(a) Fixed"). The boundary is clean: every test
-# here exercises `src/backend_native_kms.cyr` exclusively, which
-# is the home for all DRM/KMS modesetting state. As 7.x grows
-# (per-connector + per-encoder enumeration in 7.1(b/c), modeset
-# in 7.2, framebuffer in 7.3, page-flip in 7.4, present in 7.5,
-# release in 7.6, public API in 7.7) the new tests land here.
-
+# tests/tcyr/kms.tcyr — native KMS/DRM display (Phase D)
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
 include "src/lib.cyr"
 include "lib/assert.cyr"
+
+fn test_audit_rpb_pass_begin_null_encoder() {
+    # rpb_pass_begin must refuse a null encoder — otherwise the shim
+    # fncalls into wgpu-native with a NULL handle and crashes inside
+    # Device::create_command_encoder (see v2.4.2 audit).
+    var rpb = rpb_pass_new();
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    rpb_pass_color(rpb, 1, clear);
+    assert_eq(rpb_pass_begin(0, rpb), 0,
+    "rpb_pass_begin(0, rpb) short-circuits");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B.1 — native backend: ioctl encoding + constants
+# Pure-math assertions only; hardware-dependent probing lives in
+# programs/native_device_enum.cyr under `make test-native-enum`.
+# ================================================================
+
+fn test_native_ioc_encode_drm_version() {
+    # DRM_IOCTL_VERSION = _IOWR('d', 0x00, struct drm_version)
+    # dir=3 (RW), type='d'=0x64, nr=0x00, size=64 → 0xC0406400
+    assert_eq(native_ioc_encode(3, 64, 0x64, 0), 0xC0406400, "DRM_IOCTL_VERSION encodes correctly");
+    assert_eq(native_ioc_encode(3, 64, 0x64, 0), DRM_IOCTL_VERSION, "constant matches encoder");
+    return 0;
+}
+
+fn test_native_drm_constants() {
+    assert_eq(DRM_IOCTL_TYPE, 0x64, "DRM type is 'd'");
+    assert_eq(DRM_VERSION_SIZE, 64, "drm_version is 64 bytes on x86_64");
+    return 0;
+}
+
+fn test_native_drm_version_struct_layout() {
+    # Verify we can round-trip values at the documented offsets.
+    # If the layout drifts (e.g., mabda grows a helper that assumes
+    # different offsets), these assertions catch it before the ioctl
+    # hits the kernel.
+    var v[64];
+    memset(&v, 0, 64);
+    store32(&v + 0,  1);       # version_major
+    store32(&v + 4,  2);       # version_minor
+    store32(&v + 8,  3);       # version_patchlevel
+    store64(&v + 16, 13);      # name_len
+    store64(&v + 24, 0xAAAA);  # name_ptr
+    store64(&v + 32, 14);      # date_len
+    store64(&v + 40, 0xBBBB);  # date_ptr
+    store64(&v + 48, 15);      # desc_len
+    store64(&v + 56, 0xCCCC);  # desc_ptr
+    assert_eq(load32(&v + 0),  1,      "major at +0");
+    assert_eq(load32(&v + 4),  2,      "minor at +4");
+    assert_eq(load32(&v + 8),  3,      "patch at +8");
+    assert_eq(load64(&v + 16), 13,     "name_len at +16");
+    assert_eq(load64(&v + 24), 0xAAAA, "name_ptr at +24");
+    assert_eq(load64(&v + 32), 14,     "date_len at +32");
+    assert_eq(load64(&v + 40), 0xBBBB, "date_ptr at +40");
+    assert_eq(load64(&v + 48), 15,     "desc_len at +48");
+    assert_eq(load64(&v + 56), 0xCCCC, "desc_ptr at +56");
+    return 0;
+}
+
+# ================================================================
+# v3 Phase B.2 — GEM BO lifecycle (AMDGPU) — pure-math constants
+# ================================================================
+
+fn test_native_drm_command_base() {
+    assert_eq(DRM_COMMAND_BASE, 0x40, "DRM_COMMAND_BASE = 0x40");
+    return 0;
+}
 
 # ================================================================
 # v3 Step 7.1(a) — DRM/KMS GetResources foundation
@@ -711,31 +772,6 @@ fn test_kms_summary_print_u32_buf_holds_max_i64() {
     return 0;
 }
 
-# Audit LOW-3: native gpu_buffer_* / gpu_shader_module_* slots are
-# diagnostic stubs in v3.0. Buffer write/read return
-# GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "native
-# backend doesn't support this yet" from generic failures.
-fn test_native_buffer_stubs_return_not_implemented() {
-    assert_eq(_backend_native_buffer_write(0, 0, 0, 0, 0),
-    GPU_ERR_NOT_IMPLEMENTED, "buffer_write");
-    assert_eq(_backend_native_buffer_read(0, 0, 0, 0, 0),
-    GPU_ERR_NOT_IMPLEMENTED, "buffer_read");
-    # create returns 0-as-no-handle; release is no-op success.
-    assert_eq(_backend_native_buffer_create(0, 0, 0),  0, "buffer_create no handle");
-    assert_eq(_backend_native_buffer_release(0, 0),    0, "buffer_release no-op");
-    assert_eq(_backend_native_shader_module_create(0, 0, 0), 0, "shmod_create no handle");
-    assert_eq(_backend_native_shader_module_release(0, 0),   0, "shmod_release no-op");
-    return 0;
-}
-
-fn test_gpu_err_not_implemented_constant_and_name() {
-    assert_eq(GPU_ERR_NOT_IMPLEMENTED, 18, "code value");
-    var name = gpu_err_name(GPU_ERR_NOT_IMPLEMENTED);
-    # Non-empty name — distinct from "unknown error" sentinel.
-    assert_eq(strlen(name) > 0, 1, "name non-empty");
-    return 0;
-}
-
 # Audit MED-2: caller-supplied dimension overflow guards. Validate
 # the shared math helper at the boundaries: max-dims pass; just-
 # over-cap rejects; non-positive rejects; null out-ptrs reject.
@@ -782,63 +818,52 @@ fn test_native_kms_alloc_fb_rejects_oversized_dims() {
 }
 
 fn main() {
-    # v3 Step 7.1(a) — DRM/KMS GetResources foundation (5)
+    alloc_init();
+    color_init();
+    test_audit_rpb_pass_begin_null_encoder();
+    test_native_ioc_encode_drm_version();
+    test_native_drm_constants();
+    test_native_drm_version_struct_layout();
+    test_native_drm_command_base();
     test_drm_mode_ioctl_numbers();
     test_drm_mode_card_res_field_offsets();
     test_kms_state_field_offsets();
     test_kms_state_accessors_round_trip();
     test_native_kms_release_safe();
-
-    # v3 Step 7.1(b) — DRM connector ioctl + struct shapes (4)
     test_drm_mode_get_connector_field_offsets();
     test_drm_mode_modeinfo_field_offsets();
     test_drm_mode_connection_status_constants();
     test_drm_mode_connector_type_constants();
-
-    # v3 Step 7.1(c) — Encoder ioctl + topology summary (6)
     test_drm_mode_get_encoder_field_offsets();
     test_drm_mode_encoder_type_constants();
     test_native_drm_connector_type_name_lookup();
     test_native_drm_encoder_type_name_lookup();
     test_native_drm_connection_status_name_lookup();
     test_native_kms_summary_null_safe();
-
-    # v3 Step 7.2(a) — per-connector mode enum + preferred pick (7)
     test_drm_mode_type_constants();
     test_native_kms_get_connector_modes_null_safe();
     test_native_kms_pick_preferred_null_or_empty();
     test_native_kms_pick_preferred_finds_first_preferred();
     test_native_kms_pick_preferred_falls_back_to_zero();
     test_native_kms_mode_dim_accessors();
-    test_native_kms_mode_refresh_hz_computation();
-
-    # v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB) (5)
     test_drm_mode_fb_ioctl_numbers();
     test_drm_mode_fb_cmd2_field_offsets();
     test_drm_format_fourcc_constants();
     test_native_kms_add_fb_xrgb8888_null_safe();
     test_native_kms_rm_fb_null_safe();
-
-    # v3 Step 7.2(b) — SETCRTC primitive (4)
     test_drm_mode_set_crtc_ioctl_number();
     test_drm_mode_crtc_field_offsets();
     test_native_kms_set_crtc_null_safe();
     test_native_kms_disable_crtc_null_safe();
-
-    # v3 Step 7.2(c) — PRIME cross-fd BO bridge (4)
     test_drm_prime_ioctl_numbers();
     test_drm_prime_handle_field_offsets();
     test_drm_prime_flag_constants();
     test_native_kms_import_bo_null_safe();
-
-    # v3 Step 7.2(d) — end-to-end modeset driver (5)
     test_native_kms_lowest_set_bit();
     test_native_kms_scanout_struct_field_offsets();
     test_native_kms_modeset_first_connected_null_safe();
     test_drm_master_ioctl_numbers();
     test_native_kms_release_scanout_idempotent_on_zero();
-
-    # v3 Step 7.4 — page-flip + event read (6)
     test_drm_mode_page_flip_ioctl_number();
     test_drm_mode_page_flip_struct_field_offsets();
     test_drm_mode_page_flip_flag_constants();
@@ -846,241 +871,14 @@ fn main() {
     test_drm_event_struct_constants();
     test_drm_event_accessors_round_trip();
     test_native_drm_read_event_null_safe();
-
-    # v3 Step 7.5 — native_kms_present + FB alloc (4)
     test_native_kms_fb_struct_field_offsets();
     test_native_kms_alloc_fb_null_safe();
     test_native_kms_release_fb_idempotent_on_zero();
     test_native_kms_present_null_safe();
-
-    # v3 Step 7.7 — public surface API (8)
-    test_gpu_context_size_extended_to_128();
-    test_gpu_ctx_wgpu_surface_handle_round_trip();
-    test_gpu_ctx_native_card_fd_round_trip();
-    test_native_surface_struct_field_offsets();
-    test_native_surface_mark_master_owned();
-    test_gpu_surface_configure_wgpu_null_safe();
-    test_gpu_surface_configure_native_kiosk_null_safe();
-    test_gpu_surface_configure_native_logind_uninit_samvada();
-    test_gpu_surface_per_frame_ops_null_safe();
-
-    # v3 audit 2026-04-30 — ship-blocker fixes (MED-3)
-    test_native_rt_create_rejects_odd_dims();
-    test_native_rt_create_rejects_nonpositive_dims();
-
-    # v3 audit 2026-04-30 → rc.2 fixes (LOW-1, LOW-2, LOW-3)
+    test_native_kms_mode_refresh_hz_computation();
     test_native_drm_master_fd_guard();
     test_kms_summary_print_u32_buf_holds_max_i64();
-    test_native_buffer_stubs_return_not_implemented();
-    test_gpu_err_not_implemented_constant_and_name();
-
-    # v3 audit 2026-04-30 → rc.2 fixes (MED-2)
     test_kms_validate_fb_dims_caps();
     test_native_kms_alloc_fb_rejects_oversized_dims();
-
-    # v3 audit 2026-04-30 → rc.2 fixes (MED-7)
-    test_native_ctx_pm4_scratch_is_stable();
-
     return assert_summary();
 }
-
-# v3 Step 7.7 — public surface API
-
-fn test_gpu_context_size_extended_to_128() {
-    # The GpuContext layout: 112 → 120 at v3 rc.2 audit MED-7 (PM4
-    # scratch at +112); 120 → 128 at v3.1 M.1(c) (texture VA bump cursor
-    # at +120). Pin the size + the new field offset so a future refactor
-    # can't silently shrink the struct.
-    assert_eq(GPU_CONTEXT_SIZE, 128, "extended ctx = 128");
-    # PM4 scratch buffer size kept in sync — the slot fns memset 256
-    # (compute) or 1024 (render) of this buffer; bumping above 1024
-    # requires updating both slots.
-    assert_eq(_NATIVE_PM4_SCRATCH_BYTES, 1024, "scratch = 1024 bytes");
-    return 0;
-}
-
-# Audit MED-7: stability contract — once `gpu_context_new_native`
-# stashes the PM4 scratch ptr at +112, every dispatch reads the same
-# value through `native_ctx_pm4_scratch`. The accessor never re-allocs
-# under us; if it does, this assertion catches the regression.
-fn test_native_ctx_pm4_scratch_is_stable() {
-    var ctx[120];
-    memset(&ctx, 0, 120);
-    # Sentinel ptr stashed once; two consecutive accessor calls
-    # return the same address (no per-call alloc).
-    store64(&ctx + 112, 0xCAFEBABE);
-    var p1 = native_ctx_pm4_scratch(&ctx);
-    var p2 = native_ctx_pm4_scratch(&ctx);
-    assert_eq(p1, 0xCAFEBABE, "scratch read");
-    assert_eq(p2, 0xCAFEBABE, "scratch stable across calls");
-    assert_eq(p1, p2, "two reads identical");
-    # wgpu-side ctx leaves +112 as 0 — accessor returns 0, slot
-    # short-circuits with GPU_ERR_OTHER (already covered by the
-    # dispatch fns' explicit `if (pm4 == 0)` guards).
-    memset(&ctx, 0, 120);
-    assert_eq(native_ctx_pm4_scratch(&ctx), 0, "wgpu/zero ctx → 0");
-    return 0;
-}
-
-fn test_gpu_ctx_wgpu_surface_handle_round_trip() {
-    # Stack-local — heap-alloc tests at this point in the file
-    # exhaust the bump allocator. Fixed-size array gives the same
-    # observable shape with zero heap pressure.
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0, "starts zero");
-    gpu_ctx_set_wgpu_surface_handle(&ctx, 0xDEADBEEF);
-    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0xDEADBEEF, "round-trip");
-    assert_eq(gpu_ctx_set_wgpu_surface_handle(0, 1), -1, "null ctx → -1");
-    return 0;
-}
-
-fn test_gpu_ctx_native_card_fd_round_trip() {
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_ctx_native_card_fd(&ctx), 0, "starts zero");
-    gpu_ctx_set_native_card_fd(&ctx, 42);
-    assert_eq(gpu_ctx_native_card_fd(&ctx), 42, "round-trip");
-    assert_eq(gpu_ctx_set_native_card_fd(0, 7), -1, "null ctx → -1");
-    return 0;
-}
-
-fn test_native_surface_struct_field_offsets() {
-    assert_eq(NATIVE_SURFACE_CARD_FD,    0,   "card_fd");
-    assert_eq(NATIVE_SURFACE_RENDER_FD,  4,   "render_fd");
-    assert_eq(NATIVE_SURFACE_STATE,      8,   "state");
-    assert_eq(NATIVE_SURFACE_SCANOUT,    16,  "scanout");
-    assert_eq(NATIVE_SURFACE_FB_B,       56,  "fb_b");
-    assert_eq(NATIVE_SURFACE_FRONT_IS_B, 88,  "front_is_b");
-    assert_eq(NATIVE_SURFACE_WIDTH,      96,  "width");
-    assert_eq(NATIVE_SURFACE_HEIGHT,     100, "height");
-    assert_eq(NATIVE_SURFACE_PITCH,        104, "pitch");
-    # Audit 2026-06-14 [HIGH-2 NEW]: master-fd provenance fields live in
-    # the free tail of the 120-byte struct (master_minor ends at +116).
-    assert_eq(NATIVE_SURFACE_MASTER_OWNED, 108, "master_owned");
-    assert_eq(NATIVE_SURFACE_MASTER_MINOR, 112, "master_minor");
-    assert_eq(NATIVE_SURFACE_SIZE,         120, "size");
-    assert(NATIVE_SURFACE_MASTER_MINOR + 4 <= NATIVE_SURFACE_SIZE,
-    "provenance fields fit within the struct");
-    # Sanity: scanout + 40-byte size = fb_b offset; fb_b + 32 = front_is_b.
-    assert_eq(NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_SIZE,
-    NATIVE_SURFACE_FB_B,
-    "scanout-end aligns with fb_b-start");
-    assert_eq(NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_SIZE,
-    NATIVE_SURFACE_FRONT_IS_B,
-    "fb_b-end aligns with front_is_b");
-    return 0;
-}
-
-# Audit 2026-06-14 [HIGH-2 NEW]: a logind/samvada-acquired master fd is
-# mabda-owned and must be released + closed by gpu_surface_release.
-# native_surface_mark_master_owned records the provenance the release
-# path reads; the kiosk path leaves it 0 (consumer owns the fd).
-fn test_native_surface_mark_master_owned() {
-    var surf[120];
-    memset(&surf, 0, 120);
-    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 0, "default: not mabda-owned");
-    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 0, "default minor 0");
-    native_surface_mark_master_owned(&surf, 1);
-    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_OWNED), 1, "marked mabda-owned");
-    assert_eq(load32(&surf + NATIVE_SURFACE_MASTER_MINOR), 1, "minor recorded");
-    # null surface is a safe no-op
-    assert_eq(native_surface_mark_master_owned(0, 1), 0 - 1, "null surface returns -1");
-    return 0;
-}
-
-fn test_gpu_surface_configure_wgpu_null_safe() {
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_surface_configure_wgpu(0,    0xCAFE, 256, 256), 0, "null ctx");
-    assert_eq(gpu_surface_configure_wgpu(&ctx, 0,      256, 256), 0, "null surface");
-    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 0,   256), 0, "zero w");
-    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256,   0), 0, "zero h");
-    # No backend = no slot = 0.
-    assert_eq(gpu_surface_configure_wgpu(&ctx, 0xCAFE, 256, 256), 0, "no backend");
-    return 0;
-}
-
-fn test_gpu_surface_configure_native_kiosk_null_safe() {
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_surface_configure_native_kiosk(0,     7, 256, 256), 0, "null ctx");
-    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  0, 256, 256), 0, "card_fd=0");
-    assert_eq(gpu_surface_configure_native_kiosk(&ctx, -1, 256, 256), 0, "card_fd<0");
-    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7,   0, 256), 0, "zero w");
-    assert_eq(gpu_surface_configure_native_kiosk(&ctx,  7, 256,   0), 0, "zero h");
-    return 0;
-}
-
-fn test_gpu_surface_configure_native_logind_uninit_samvada() {
-    # samvada is the gating dependency. In CPU tests, no C-shim
-    # has been linked, so samvada's static fn-table is null
-    # (`_samvada_table == 0`) → samvada_session_take_device
-    # returns -22 (EINVAL) → this dispatcher falls through to 0.
-    # The "logind works" path is HW-gated through the consumer
-    # program, not exercised here.
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 256), 0,
-    "uninit samvada → 0");
-    assert_eq(gpu_surface_configure_native_logind(0, 256, 256), 0,
-    "null ctx still 0");
-    assert_eq(gpu_surface_configure_native_logind(&ctx, 0, 256), 0,
-    "zero w");
-    assert_eq(gpu_surface_configure_native_logind(&ctx, 256, 0), 0,
-    "zero h");
-    return 0;
-}
-
-fn test_gpu_surface_per_frame_ops_null_safe() {
-    var ctx[112];
-    memset(&ctx, 0, 112);
-    assert_eq(gpu_surface_acquire(0,    0xC0FFEE), 0, "acquire null ctx");
-    assert_eq(gpu_surface_acquire(&ctx, 0),        0, "acquire null surface");
-    assert_eq(gpu_surface_acquire(&ctx, 0xC0FFEE), 0, "acquire no backend");
-    assert_eq(gpu_surface_present(0,    0xC0FFEE), GPU_ERR_OTHER, "present null ctx");
-    assert_eq(gpu_surface_present(&ctx, 0),        GPU_ERR_OTHER, "present null surface");
-    assert_eq(gpu_surface_release(0,    0xC0FFEE), 0, "release null ctx");
-    assert_eq(gpu_surface_release(&ctx, 0),        0, "release null surface");
-    return 0;
-}
-
-# v3 audit 2026-04-30 — MED-3: native_rt_create_2d_rgba8 must reject
-# odd width/height because native_pm4_build_render_pass_target's
-# viewport math uses integer (rt_width / 2). Rejection happens in the
-# allocator BEFORE any ioctl, so a fake fd is fine — the dim guard
-# fires first.
-fn test_native_rt_create_rejects_odd_dims() {
-    var out[40];
-    memset(&out, 0, 40);
-    var fake_fd = 999;
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, 3,  4, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "odd width rejected");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, 4,  5, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "odd height rejected");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, 1,  2, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "1x2 width is odd");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, 2,  1, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "2x1 height is odd");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, 7, 13, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "both odd rejected");
-    return 0;
-}
-
-fn test_native_rt_create_rejects_nonpositive_dims() {
-    var out[40];
-    memset(&out, 0, 40);
-    var fake_fd = 999;
-    assert_eq(native_rt_create_2d_rgba8(fake_fd,  0,  4, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "zero width");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4,  0, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "zero height");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd, -2,  4, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "negative width");
-    assert_eq(native_rt_create_2d_rgba8(fake_fd,  4, -2, &out),
-    GPU_ERR_TEXTURE_DIMENSION, "negative height");
-    return 0;
-}
-
-var exit_code = main();
-syscall(60, exit_code);
