@@ -18,6 +18,70 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.1.0] — 2026-06-15
+
+**On-device mipmap generation (native AMD).** First feature of the v3.1.x
+arc (`docs/development/3-1-punchlist.md` Phase M;
+`docs/proposals/v3.1-mipmap-generation.md`). A consumer creates a texture
+with N mip levels, writes level 0, and asks mabda to fill levels 1..N-1
+by GPU 2×2 box-filter downsample. **Native AMD is fully implemented and
+HW-verified on Cezanne** (gfx90c); the public API is the same on both
+backends but wgpu `generate` is deferred (see Limitations). No change to
+existing public API. CPU suite 1991 → **2102** assertions, reorganized
+into 11 functionality-named domain files. Verified green on 6.2.6.
+
+### Added
+
+- **`gpu_texture_create_2d_rgba8_mipped(ctx, w, h, mip_count)`** — create
+  a 2D RGBA8 texture with a mip chain (`mip_count == 0` = full chain).
+- **`gpu_texture_generate_mipmaps(ctx, tex)`** — GPU-fill levels 1..N-1
+  from level 0. Native: one compute dispatch per level. wgpu: see below.
+- Native mipmap stack: contiguous mip-chain BO + a per-context texture VA
+  sub-allocator; a hand-authored GFX9 ISA 2×2 downsample compute shader
+  (`native_gfx9_shader_downsample_2x2`, llvm-mc round-trip-verified) using
+  flat `global_load`/`global_store` (native textures are linear — no image
+  descriptor table needed); a PM4 compute-downsample composer
+  (`native_pm4_build_compute_downsample`, RSRC1/RSRC2 for the shader's 16
+  VGPR / 24 SGPR + TGID enables). `programs/native_mipmap_e2e.cyr` proves
+  generated levels are byte-exact vs a CPU box-filter on real hardware.
+- wgpu: `wgpu_texture_descriptor_mipped`, per-level view descriptor +
+  sampled/storage bind-group-layout entry builders (v29-offset-verified).
+
+### Changed
+
+- `Backend` struct 208 → 224 B (two mipmap slots, append-after-KIND);
+  `backend_is_complete` walks the new range.
+- `GpuContext` 120 → 128 B (per-context texture VA cursor at +120).
+- `NativeTexture` 32 → 48 B (width/height/mip_count); offsets 0..24
+  unchanged. Native texture VA region moved to `0xFFFF800180000000`
+  (2 GiB) so a mip chain fits.
+- **Tests reorganized by functionality** — the version-named
+  `mabda.tcyr` / `mabda_v3.tcyr` / `mabda_v3_phase_d.tcyr` trio is
+  replaced by 11 domain-named suites under `tests/tcyr/` (core, buffer,
+  compute, texture, graphics, render, backend, caches, surface, native,
+  kms); Makefile/CI/release glob `tests/tcyr/*.tcyr`. Every file now sits
+  under the 128 KiB lint/fmt cap (the old `mabda_v3.tcyr` had reached
+  148 KiB, past the cap — its tail was silently unchecked).
+
+### Fixed
+
+- **Native `GEM_VA` map requires a 4 KiB-page-aligned size.** Sub-page
+  BO/VA-map sizes failed (`rc=99`); the mip-chain BO and the downsample
+  shader BO are now page-aligned. (Single-level textures were unaffected —
+  all current sizes are page-aligned.)
+
+### Limitations / Deferred
+
+- **wgpu `gpu_texture_generate_mipmaps` returns `GPU_ERR_NOT_IMPLEMENTED`.**
+  It needs a real wgpu compute pipeline, but the wgpu compute path itself
+  (`_backend_wgpu_compute_dispatch`) has been a stub since v3.0. wgpu
+  mipmap *generation* is therefore blocked on a wgpu-compute project
+  (v3.x). wgpu `create_mipped` works, so a wgpu consumer can create a
+  mipped texture and upload all levels manually meanwhile. The native
+  backend is the working generation path.
+- Multi-queue (the arc's second feature) remains v3.1.1+ — see the
+  punchlist Phase Q.
+
 ## [3.0.4] — 2026-06-15
 
 **P(-1) security-hardening patch.** First full-surface security audit

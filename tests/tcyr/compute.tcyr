@@ -1,0 +1,180 @@
+# tests/tcyr/compute.tcyr — compute (workgroup math, dispatch, ping-pong)
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# ================================================================
+# v3 Step 3d — gpu_buffer_create / write / release dispatch
+# ================================================================
+# Three more ctx-aware buffer dispatchers, each through its own
+# slot. Together they exercise fncall2 (release), fncall3 (create),
+# and fncall5 (write) in the public-API → backend slot direction.
+
+var _step3d_create_count = 0;
+
+var _step3d_write_count = 0;
+
+var _step3d_release_count = 0;
+
+# ================================================================
+# v3 Step 3e — gpu_shader_module_create / release dispatch
+# ================================================================
+# fncall3 (create, 3 args + ctx) and fncall2 (release, 2 args + ctx)
+# re-validation on a different slot pair than buffer.cyr.
+
+var _step3e_create_count = 0;
+
+var _step3e_release_count = 0;
+
+# ================================================================
+# v3 Step 3g — gpu_compute_dispatch dispatch (fncall6)
+# ================================================================
+# Highest-arity slot. First Cyrius-to-Cyrius fncall6 through a
+# struct slot in mabda. Distinct sentinels chosen for each arg so
+# any swap/rotation surfaces as a specific assertion failure.
+
+var _step3g_dispatch_count = 0;
+
+var _step3g_dispatch_ctx = 0;
+
+var _step3g_dispatch_shmod = 0;
+
+var _step3g_dispatch_x = 0;
+
+var _step3g_dispatch_y = 0;
+
+var _step3g_dispatch_z = 0;
+
+var _step3g_dispatch_bp = 0;
+
+fn _step3g_dispatch_capture(ctx, shmod, x, y, z, bp) {
+    _step3g_dispatch_count = _step3g_dispatch_count + 1;
+    _step3g_dispatch_ctx = ctx;
+    _step3g_dispatch_shmod = shmod;
+    _step3g_dispatch_x = x;
+    _step3g_dispatch_y = y;
+    _step3g_dispatch_z = z;
+    _step3g_dispatch_bp = bp;
+    return 0xD15A;
+}
+
+# MED-1: workgroups_1d returns 0 on workgroup_size == 0 (no SIGFPE).
+fn test_audit_workgroups_1d_zero_divisor() {
+    assert_eq(workgroups_1d(42, 0), 0, "workgroups_1d(_, 0) returns 0");
+    return 0;
+}
+
+fn test_audit_workgroups_2d_zero_divisor() {
+    var out[16];
+    store64(&out, 999);
+    store64(&out + 8, 999);
+    workgroups_2d(&out, 10, 10, 0, 4);
+    assert_eq(load64(&out), 0, "wg_x=0 leaves x zeroed");
+    workgroups_2d(&out, 10, 10, 4, 0);
+    assert_eq(load64(&out + 8), 0, "wg_y=0 leaves y zeroed");
+    return 0;
+}
+
+# LOW-3: compute_dispatch and texture_create_rgba8 reject inputs that
+# exceed WebGPU spec-default limits before reaching wgpu-native.
+# compute_dispatch takes a dims_xyz pointer (3 packed u32) to stay at 5
+# parameters — see the note in src/compute.cyr.
+fn test_audit_compute_dispatch_zero_dim_rejected() {
+    var d0x[12]; store32(&d0x, 0); store32(&d0x + 4, 1); store32(&d0x + 8, 1);
+    var d0y[12]; store32(&d0y, 1); store32(&d0y + 4, 0); store32(&d0y + 8, 1);
+    var d0z[12]; store32(&d0z, 1); store32(&d0z + 4, 1); store32(&d0z + 8, 0);
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0x), 0,
+    "compute_dispatch(x=0) short-circuits");
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0y), 0,
+    "compute_dispatch(y=0) short-circuits");
+    assert_eq(compute_dispatch(0, 0, 0, 0, &d0z), 0,
+    "compute_dispatch(z=0) short-circuits");
+    return 0;
+}
+
+fn test_audit_compute_dispatch_exceeds_max_rejected() {
+    var dmax[12]; store32(&dmax, 70000); store32(&dmax + 4, 1); store32(&dmax + 8, 1);
+    assert_eq(compute_dispatch(0, 0, 0, 0, &dmax), 0,
+    "compute_dispatch(x>MAX) short-circuits");
+    return 0;
+}
+
+# LOW-5: compute_pipeline_new rejects nonsensical storage_count without
+# leaking GPU handles. Resource cleanup on mid-construction failures is
+# tested indirectly: any device=0 / wgsl="" call must return 0 cleanly.
+fn test_audit_compute_pipeline_zero_storage_rejected() {
+    assert_eq(compute_pipeline_new(0, "", "main", 0), 0,
+    "compute_pipeline_new(storage_count=0) returns 0");
+    assert_eq(compute_pipeline_new(0, "", "main", -1), 0,
+    "compute_pipeline_new(storage_count<0) returns 0");
+    return 0;
+}
+
+fn test_gpu_buffer_dispatchers_null_ctx_safe() {
+    _step3d_create_count = 0;
+    _step3d_write_count = 0;
+    _step3d_release_count = 0;
+    assert_eq(gpu_buffer_create(0, 1024, 0xF), 0, "create null returns 0");
+    assert_eq(gpu_buffer_write(0, 0, 0, 0, 0), GPU_ERR_BUFFER, "write null returns err");
+    assert_eq(gpu_buffer_release(0, 0), 0, "release null returns 0");
+    return 0;
+}
+
+fn test_gpu_shader_module_dispatchers_null_ctx_safe() {
+    _step3e_create_count = 0;
+    _step3e_release_count = 0;
+    assert_eq(gpu_shader_module_create(0, 0xCAFE, 256), 0, "create null = 0");
+    assert_eq(gpu_shader_module_release(0, 0x5EED), 0, "release null = 0");
+    assert_eq(_step3e_create_count, 0, "create did not dispatch");
+    assert_eq(_step3e_release_count, 0, "release did not dispatch");
+    return 0;
+}
+
+fn test_gpu_compute_dispatch_null_ctx_returns_err() {
+    _step3g_dispatch_count = 0;
+    var rc = gpu_compute_dispatch(0, 0, 0, 0, 0, 0);
+    assert_eq(rc, GPU_ERR_OTHER, "null ctx returns err");
+    assert_eq(_step3g_dispatch_count, 0, "did not dispatch");
+    return 0;
+}
+
+# Audit 2026-06-14 [MED-3]: the v3 gpu_compute_dispatch dropped the
+# workgroup-count validation its v2 sibling compute_dispatch enforces.
+# Restored — invalid counts must be rejected BEFORE the slot fires (and
+# before they bake into a PM4 dispatch + CS submit on native).
+fn test_gpu_compute_dispatch_rejects_bad_dims() {
+    _step3g_dispatch_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_step3g_dispatch_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 0 - 1, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x<0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 0, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "y=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 1, 1, 0, 0), GPU_ERR_WORKGROUP_LIMIT, "z=0 rejected");
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 65536, 1, 1, 0), GPU_ERR_WORKGROUP_LIMIT, "x>65535 rejected");
+    assert_eq(_step3g_dispatch_count, 0, "slot never reached for invalid dims");
+    # a valid dispatch still flows through to the slot
+    assert_eq(gpu_compute_dispatch(ctx, 0xBEEF, 64, 1, 1, 0), 0xD15A, "valid dispatch reaches slot");
+    assert_eq(_step3g_dispatch_count, 1, "slot fired once for valid dims");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_audit_workgroups_1d_zero_divisor();
+    test_audit_workgroups_2d_zero_divisor();
+    test_audit_compute_dispatch_zero_dim_rejected();
+    test_audit_compute_dispatch_exceeds_max_rejected();
+    test_audit_compute_pipeline_zero_storage_rejected();
+    test_gpu_buffer_dispatchers_null_ctx_safe();
+    test_gpu_shader_module_dispatchers_null_ctx_safe();
+    test_gpu_compute_dispatch_null_ctx_returns_err();
+    test_gpu_compute_dispatch_rejects_bad_dims();
+    return assert_summary();
+}

@@ -1,0 +1,163 @@
+# programs/native_mipmap_e2e.cyr — v3.1 Phase M (M.7)
+#
+# End-to-end native mipmap generation on real AMD hardware. Validates the
+# whole M.1–M.6 native chain: gpu_texture_create_2d_rgba8_mipped (one
+# chain BO) → write level 0 via the CPU mmap → gpu_texture_generate_mipmaps
+# (one GPU 2x2-box-filter compute dispatch per level via
+# native_pm4_build_compute_downsample + native_gfx9_shader_downsample_2x2)
+# → CPU-read each level and compare against a CPU box-filter reference
+# computing the identical (a+b+c+d)>>2 per channel.
+#
+# Texture: 8x8 RGBA8, full chain (4 levels: 8x8, 4x4, 2x2, 1x1).
+#
+# Exit codes:
+#   0  — every generated level matches the CPU reference
+#   1  — gpu_context_new_native failed
+#   2  — gpu_texture_create_2d_rgba8_mipped returned 0
+#   3  — gpu_texture_generate_mipmaps returned non-zero
+#   4  — a generated level mismatched the reference
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# CPU 2x2 box-filter — identical math to native_gfx9_shader_downsample_2x2
+# (per-channel (a+b+c+d)>>2). Source is (2*dst_w) x (2*dst_h) wide.
+fn cpu_downsample(src_ptr, dst_ptr, dst_w, dst_h): i64 {
+    var sw = dst_w * 2;
+    var y = 0;
+    while (y < dst_h) {
+        var x = 0;
+        while (x < dst_w) {
+            var sx = x * 2;
+            var sy = y * 2;
+            var a = load32(src_ptr + (sy * sw + sx) * 4);
+            var b = load32(src_ptr + (sy * sw + sx + 1) * 4);
+            var c = load32(src_ptr + ((sy + 1) * sw + sx) * 4);
+            var d = load32(src_ptr + ((sy + 1) * sw + sx + 1) * 4);
+            var r  = ((a & 0xFF) + (b & 0xFF) + (c & 0xFF) + (d & 0xFF)) >> 2;
+            var g  = (((a >> 8) & 0xFF) + ((b >> 8) & 0xFF) + ((c >> 8) & 0xFF) + ((d >> 8) & 0xFF)) >> 2;
+            var bl = (((a >> 16) & 0xFF) + ((b >> 16) & 0xFF) + ((c >> 16) & 0xFF) + ((d >> 16) & 0xFF)) >> 2;
+            var al = (((a >> 24) & 0xFF) + ((b >> 24) & 0xFF) + ((c >> 24) & 0xFF) + ((d >> 24) & 0xFF)) >> 2;
+            store32(dst_ptr + (y * dst_w + x) * 4, r | (g << 8) | (bl << 16) | (al << 24));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Compare a GPU level (at gpu_base + native_mip_level_offset) against an
+# expected CPU buffer. Returns the number of mismatching dwords.
+fn verify_level(gpu_base, width, height, level, expected, level_w, level_h): i64 {
+    var off = native_mip_level_offset(width, height, level);
+    var n = level_w * level_h;
+    var i = 0;
+    var bad = 0;
+    while (i < n) {
+        var got = load32(gpu_base + off + i * 4);
+        var want = load32(expected + i * 4);
+        if (got != want) {
+            if (bad < 4) {
+                print_cstr("  level "); print_i64(level);
+                print_cstr(" texel "); print_i64(i);
+                print_cstr(": got 0x"); print_i64(got);
+                print_cstr(" want 0x"); print_i64(want); print_cstr("\n");
+            }
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native mipmap generation e2e (v3.1 M.7)\n");
+    print_cstr("---------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        return 1;
+    }
+    var ctx = payload(ctx_res);
+    print_cstr("ctx ready (fd="); print_i64(native_ctx_fd(ctx)); print_cstr(")\n");
+
+    var W = 8;
+    var H = 8;
+    var mip_count = mip_level_count(W, H);   # 4 levels for 8x8
+    print_cstr("mip_count="); print_i64(mip_count); print_cstr("\n");
+
+    var tex = gpu_texture_create_2d_rgba8_mipped(ctx, W, H, mip_count);
+    if (tex == 0) {
+        print_cstr("FAIL: gpu_texture_create_2d_rgba8_mipped\n");
+        gpu_context_release(ctx);
+        return 2;
+    }
+    var base_addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    print_cstr("mipped texture created (8x8, chain)\n");
+
+    # Build a varied level-0 pattern directly into the mmap (level 0 is at
+    # offset 0). texel(x,y) = R=x*32, G=y*32, B=(x+y)*16, A=255.
+    var lvl0 = alloc(W * H * 4);
+    var y0 = 0;
+    while (y0 < H) {
+        var x0 = 0;
+        while (x0 < W) {
+            var r = (x0 * 32) & 0xFF;
+            var g = (y0 * 32) & 0xFF;
+            var b = ((x0 + y0) * 16) & 0xFF;
+            var px = r | (g << 8) | (b << 16) | (255 << 24);
+            store32(lvl0 + (y0 * W + x0) * 4, px);
+            store32(base_addr + (y0 * W + x0) * 4, px);   # write into level 0
+            x0 = x0 + 1;
+        }
+        y0 = y0 + 1;
+    }
+    print_cstr("level 0 written\n");
+
+    # CPU reference chain: exp1 (4x4), exp2 (2x2), exp3 (1x1).
+    var exp1 = alloc(4 * 4 * 4);
+    var exp2 = alloc(2 * 2 * 4);
+    var exp3 = alloc(1 * 1 * 4);
+    cpu_downsample(lvl0, exp1, 4, 4);
+    cpu_downsample(exp1, exp2, 2, 2);
+    cpu_downsample(exp2, exp3, 1, 1);
+
+    var rc_g = gpu_texture_generate_mipmaps(ctx, tex);
+    if (rc_g != 0) {
+        print_cstr("FAIL: gpu_texture_generate_mipmaps rc="); print_i64(rc_g); print_cstr("\n");
+        gpu_texture_release(ctx, tex);
+        gpu_context_release(ctx);
+        return 3;
+    }
+    print_cstr("generate_mipmaps dispatched\n");
+
+    var bad = 0;
+    bad = bad + verify_level(base_addr, W, H, 1, exp1, 4, 4);
+    bad = bad + verify_level(base_addr, W, H, 2, exp2, 2, 2);
+    bad = bad + verify_level(base_addr, W, H, 3, exp3, 1, 1);
+    if (bad > 0) {
+        print_cstr("FAIL: "); print_i64(bad); print_cstr(" texel(s) mismatched the CPU reference\n");
+        gpu_texture_release(ctx, tex);
+        gpu_context_release(ctx);
+        return 4;
+    }
+    print_cstr("verify OK: levels 1-3 match the 2x2 box-filter reference\n");
+
+    gpu_texture_release(ctx, tex);
+    gpu_context_release(ctx);
+    print_cstr("OK — native mipmap generation works on AMD hardware\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

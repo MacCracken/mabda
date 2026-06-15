@@ -8,12 +8,13 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.0.4 (dual backend — wgpu + native AMD; see
+Version: 3.1.0 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02 after the 24-hour
 soak gate cleared — `--workload=all` ran 26 h 13 m with RSS flat and
-dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`. 3.0.3 tracks
-the cyrius pin to 6.2.6 and the samvada dep to 0.4.1; 3.0.4 is a P(-1)
-security-hardening patch — see `docs/audit/2026-06-14-audit.md`.)
+dmesg Δ = 0; see `docs/handoff/soak-20260601T222652Z/`. 3.0.4 was a P(-1)
+security-hardening patch — see `docs/audit/2026-06-14-audit.md`. 3.1.0
+adds on-device mipmap generation: native AMD is HW-verified; wgpu
+`generate` is deferred pending a wgpu compute path. See the CHANGELOG.)
 
 ## Features
 

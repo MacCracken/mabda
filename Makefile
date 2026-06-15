@@ -5,7 +5,7 @@
 # links against wgpu-native through a C launcher (deps/wgpu_main.c).
 #
 # Quick reference:
-#   make test           — CPU-only tests (`cyrius test tests/tcyr/mabda.tcyr`)
+#   make test           — CPU-only tests (globs tests/tcyr/*.tcyr domain suites)
 #   make bench          — CPU-only benchmarks
 #   make fuzz           — invariant harnesses under fuzz/*.fcyr
 #   make build          — link-check the library (programs/smoke.cyr)
@@ -49,10 +49,11 @@ build: check-lib-wiring
 	@echo "smoke: $$(wc -c < build/mabda_smoke) bytes"
 
 .PHONY: test
+# Functionality-grouped CPU suites (v3.1 test reorg 2026-06-15): one
+# file per domain under tests/tcyr/. Globbed so new domain files are
+# picked up automatically; each is a standalone suite with its own main().
 test: check-lib-wiring
-	$(CYRIUS) test tests/tcyr/mabda.tcyr
-	$(CYRIUS) test tests/tcyr/mabda_v3.tcyr
-	$(CYRIUS) test tests/tcyr/mabda_v3_phase_d.tcyr
+	@for f in tests/tcyr/*.tcyr; do $(CYRIUS) test "$$f" || exit 1; done
 
 .PHONY: bench
 bench: check-lib-wiring
@@ -243,6 +244,18 @@ build/native_texture_e2e: programs/native_texture_e2e.cyr src/*.cyr
 .PHONY: test-native-texture-e2e
 test-native-texture-e2e: build/native_texture_e2e
 	./build/native_texture_e2e
+
+# v3.1 M.7 — native mipmap generation e2e. Creates a mipped texture,
+# writes level 0, GPU-downsamples the chain, verifies each level against a
+# CPU box-filter reference. Requires amdgpu render node; renderD128 only
+# (no DRM master), so it runs in any session.
+build/native_mipmap_e2e: programs/native_mipmap_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_mipmap_e2e.cyr $@
+
+.PHONY: test-native-mipmap-e2e
+test-native-mipmap-e2e: build/native_mipmap_e2e
+	./build/native_mipmap_e2e
 
 # v3 Step 6.9(b) — native render end-to-end (mirror of render_e2e
 # on the native graphics ring). HW-gated; runs the full 6.x chain

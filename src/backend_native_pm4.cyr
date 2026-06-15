@@ -575,6 +575,87 @@ out_va, x, y, z): i64 {
     return pos;
 }
 
+# v3.1 [M.5]: PM4 stream that dispatches native_gfx9_shader_downsample_2x2
+# to fill one mip level from its parent. Mirrors the deadbeef composer
+# (same STATIC_THREAD_MGMT / COHER / BC_BASE / ACQUIRE_MEM / RESOURCE_LIMITS
+# / completion-marker scaffold proven on Cezanne) but with the downsample
+# shader's ABI:
+#   RSRC1 = 0x2C0083 — VGPRS=3 (16 VGPRs, shader uses v0..v14), SGPRS=2
+#           (24 SGPRs, uses s0..s19), FLOAT_MODE=0xC0, DX10_CLAMP (the
+#           deadbeef MIN 0x2C0040 only reserves 4 VGPRs / 16 SGPRs).
+#   RSRC2 = 0x18C — USER_SGPR=6 (s0..s5) | TGID_X_EN (bit 7) | TGID_Y_EN
+#           (bit 8): the CP loads the workgroup id into s6/s7. NUM_THREAD
+#           is 1/1/1, so one workgroup == one dst texel and tgid == (x, y).
+#   USER_DATA_0/1 = src level VA, _2/3 = dst level VA, _4 = dst_w.
+#   DISPATCH grid = (dst_w, dst_h, 1).
+# stub_va is used only for the post-dispatch WR_CONFIRM marker (no scratch
+# is enabled — the shader does not spill). Pure-Cyrius (7 params is fine;
+# the fncall6 ceiling is only for fns that fncall into wgpu).
+fn native_pm4_build_compute_downsample(buf, shader_va, stub_va,
+src_va, dst_va, dst_w, dst_h): i64 {
+    var pos = 0;
+    var pgm_lo = (shader_va >> 8) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va >> 40) & 0xFF;
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, pgm_hi);
+    var thread_mgmt_01[8];
+    store32(&thread_mgmt_01 + 0, 0xFFFFFFFF);
+    store32(&thread_mgmt_01 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0,
+    2, &thread_mgmt_01);
+    var thread_mgmt_23[8];
+    store32(&thread_mgmt_23 + 0, 0);
+    store32(&thread_mgmt_23 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2,
+    2, &thread_mgmt_23);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_CP_COHER_START_DELAY, 0);
+    var bc_va = 0;
+    var bc_pair[8];
+    store32(&bc_pair + 0, (bc_va >> 8) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va >> 40) & 0xFF);
+    pos = native_pm4_set_uconfig_reg_pair(buf, pos, R_TA_CS_BC_BASE_ADDR,
+    &bc_pair);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_LO, pgm_lo);
+    var rsrc[8];
+    store32(&rsrc + 0, 0x2C0083);
+    store32(&rsrc + 4, 0x18C);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_TMPRING_SIZE, 0x100);
+    var user23[8];
+    store32(&user23 + 0, dst_va & 0xFFFFFFFF);
+    store32(&user23 + 4, (dst_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 8,
+    2, &user23);
+    var user01[8];
+    store32(&user01 + 0, src_va & 0xFFFFFFFF);
+    store32(&user01 + 4, (src_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0,
+    2, &user01);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_USER_DATA_0 + 16,
+    dst_w);
+    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    pos = native_pm4_set_sh_reg_one(buf, pos,
+    R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    var nt[12];
+    store32(&nt + 0, 1);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    pos = native_pm4_dispatch_direct(buf, pos, dst_w, dst_h, 1,
+    GFX9_DISPATCH_INITIATOR);
+    store32(buf + pos +  0, 0xC0033700);
+    store32(buf + pos +  4, 0x00100500);
+    store32(buf + pos +  8, (stub_va + 4) & 0xFFFFFFFF);
+    store32(buf + pos + 12, ((stub_va + 4) >> 32) & 0xFFFFFFFF);
+    store32(buf + pos + 16, 0xC0FFEE12);
+    pos = pos + 20;
+    var cur_dwords = pos / 4;
+    var target_dwords = 64;
+    if (cur_dwords < target_dwords) {
+        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
+    }
+    return pos;
+}
+
 # ================================================================
 # v3 Step 6.5(b) — PM4 stream composer for clear-triangle dispatch
 # ================================================================

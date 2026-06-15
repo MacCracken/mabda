@@ -1,0 +1,248 @@
+# tests/tcyr/texture.tcyr — texture.cyr public API + mip math
+# Functionality-grouped CPU suite (v3.1 test reorg 2026-06-15).
+# Self-contained: the helpers/mocks each domain's tests need are inlined
+# (a few small helpers are shared across domains by design).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# --- shared test helpers / mocks ---
+# ================================================================
+# v3 Step 5.7 — public gpu_texture_* dispatch through backend
+# ================================================================
+# Mock backend with counter+capture. Validates fncall threading on
+# all 4 dispatchers. fncall4 (write/read) is the new shape this
+# step exercises end-to-end.
+
+var _step57_create_count = 0;
+
+var _step57_create_ctx   = 0;
+
+var _step57_create_w     = 0;
+
+var _step57_create_h     = 0;
+
+fn _step57_create_capture(ctx, w, h) {
+    _step57_create_count = _step57_create_count + 1;
+    _step57_create_ctx = ctx;
+    _step57_create_w = w;
+    _step57_create_h = h;
+    return 0xCAFE;
+}
+
+var _step57_write_count = 0;
+
+var _step57_read_count = 0;
+
+var _step57_release_count = 0;
+
+fn test_vertex_blend_opaque() {
+    var bs = blend_state_new(BLEND_OPAQUE);
+    # color.operation = Add (1)
+    assert_eq(load32(bs), WGPU_BLEND_OP_ADD, "opaque color op=Add");
+    # color.srcFactor = One (2)
+    assert_eq(load32(bs + 4), WGPU_BLEND_FACTOR_ONE, "opaque src=One");
+    # color.dstFactor = Zero (1)
+    assert_eq(load32(bs + 8), WGPU_BLEND_FACTOR_ZERO, "opaque dst=Zero");
+    return 0;
+}
+
+fn test_vertex_blend_alpha() {
+    var bs = blend_state_new(BLEND_ALPHA_BLEND);
+    # color.srcFactor = SrcAlpha (5)
+    assert_eq(load32(bs + 4), WGPU_BLEND_FACTOR_SRC_ALPHA, "alpha src=SrcAlpha");
+    # color.dstFactor = OneMinusSrcAlpha (6)
+    assert_eq(load32(bs + 8), WGPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, "alpha dst=1-SrcAlpha");
+    return 0;
+}
+
+fn test_depth_texture_accessors() {
+    # Construct the DepthTexture struct directly — depth_texture_new calls
+    # into the FFI layer, which isn't available in a standalone test.
+    # Layout (40 bytes): handle(8) | view(8) | format(u32@16) | w(8@24) | h(8@32)
+    var dt = alloc(40);
+    store64(dt, 0);
+    store64(dt + 8, 0);
+    store32(dt + 16, DEPTH_FORMAT_DEPTH32_FLOAT);
+    store64(dt + 24, 1920);
+    store64(dt + 32, 1080);
+
+    assert_eq(depth_texture_width(dt),  1920, "width stored");
+    assert_eq(depth_texture_height(dt), 1080, "height stored");
+    assert_eq(depth_texture_format(dt), DEPTH_FORMAT_DEPTH32_FLOAT, "format stored");
+    return 0;
+}
+
+# MED-3: texture_upload_rgba8 short-circuits on zero/negative dimensions.
+# We can't hit wgpu without a GPU, but calling with w=0 must return 0
+# without segfaulting on the (0,0,1) extent.
+fn test_audit_texture_upload_zero_dim() {
+    # queue=0, texture=0 — never reached because we short-circuit first.
+    assert_eq(texture_upload_rgba8(0, 0, 0, 0, 10), 0,
+    "upload(0×10) short-circuits");
+    assert_eq(texture_upload_rgba8(0, 0, 0, 10, 0), 0,
+    "upload(10×0) short-circuits");
+    assert_eq(texture_upload_rgba8(0, 0, 0, -1, 10), 0,
+    "upload(-1×10) rejected");
+    return 0;
+}
+
+fn test_audit_texture_create_exceeds_max_rejected() {
+    assert_eq(texture_create_rgba8(0, 9000, 256, "too-wide"), 0,
+    "texture_create_rgba8(width>MAX) returns 0");
+    assert_eq(texture_create_rgba8(0, 256, 9000, "too-tall"), 0,
+    "texture_create_rgba8(height>MAX) returns 0");
+    return 0;
+}
+
+# v3.1 [M.1]: shared mip math. mip_level_count = floor(log2(max))+1;
+# mip_level_dim halves per level, floors, clamps to 1.
+fn test_mip_level_count() {
+    assert_eq(mip_level_count(256, 256), 9, "256x256 -> 9 levels");
+    assert_eq(mip_level_count(1, 1),     1, "1x1 -> 1 level");
+    assert_eq(mip_level_count(256, 1),   9, "non-square uses max dim");
+    assert_eq(mip_level_count(5, 5),     3, "5x5 -> 3 (5->2->1)");
+    return 0;
+}
+
+fn test_mip_level_dim() {
+    assert_eq(mip_level_dim(256, 0),   256, "level 0 = full");
+    assert_eq(mip_level_dim(256, 1),   128, "level 1 = half");
+    assert_eq(mip_level_dim(256, 8),   1,   "256 floors to 1 at level 8");
+    assert_eq(mip_level_dim(256, 100), 1,   "clamps at 1 past the chain");
+    assert_eq(mip_level_dim(1, 5),     1,   "1px stays 1");
+    assert_eq(mip_level_dim(100, 1),   50,  "100 -> 50");
+    assert_eq(mip_level_dim(100, 3),   12,  "100->50->25->12 (floor)");
+    assert_eq(mip_level_dim(3, 1),     1,   "3/2 floors to 1");
+    return 0;
+}
+
+fn test_frame_resources_track_buffers_and_textures() {
+    var fr = frame_resources_new();
+    frame_resources_track_buffer(fr, 0xAA01);
+    frame_resources_track_buffer(fr, 0xAA02);
+    frame_resources_track_buffer(fr, 0xAA03);
+    frame_resources_track_texture(fr, 0xBB01);
+    frame_resources_track_texture(fr, 0xBB02);
+    assert_eq(frame_resources_buffer_count(fr), 3, "3 buffers");
+    assert_eq(frame_resources_texture_count(fr), 2, "2 textures");
+    return 0;
+}
+
+# Audit 2026-06-14 [HIGH-1]: the v3 gpu_texture_create_2d_rgba8 dropped
+# the dimension validation its v2 sibling texture_create_rgba8 enforces.
+# Restored — non-positive / oversized dims must be rejected (returning 0)
+# BEFORE the slot fires, so an unvalidated width*height*4 never reaches
+# the native GEM_CREATE ioctl + mmap.
+fn test_gpu_texture_create_2d_rgba8_validates_dims() {
+    _step57_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8, &_step57_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 0, 16), 0, "width=0 rejected");
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 16, 0 - 1), 0, "height<0 rejected");
+    assert_eq(gpu_texture_create_2d_rgba8(ctx, 100000, 100000), 0, "oversized rejected (no overflow to slot)");
+    assert_eq(_step57_create_count, 0, "slot never reached for invalid dims");
+    var t = gpu_texture_create_2d_rgba8(ctx, 256, 256);
+    assert_eq(t, 0xCAFE, "valid dims reach slot");
+    assert_eq(_step57_create_count, 1, "slot fired once for valid dims");
+    return 0;
+}
+
+# v3.1 [M.6]: mipped-create dispatcher — routes (w, h, mip_count) through
+# the mipmap slot, expands mip_count==0 to the full chain, and rejects
+# bad dims / out-of-range mip counts before the slot.
+var _mip_create_count = 0;
+var _mip_create_mc = 0;
+fn _mip_create_capture(ctx, w, h, mc) {
+    _mip_create_count = _mip_create_count + 1;
+    _mip_create_mc = mc;
+    return 0xABCD;
+}
+
+fn test_gpu_texture_create_mipped_dispatch() {
+    _mip_create_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED, &_mip_create_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var t = gpu_texture_create_2d_rgba8_mipped(ctx, 256, 256, 4);
+    assert_eq(t, 0xABCD, "valid mipped create reaches slot");
+    assert_eq(_mip_create_count, 1, "slot fired once");
+    assert_eq(_mip_create_mc, 4, "mip_count threaded through");
+    gpu_texture_create_2d_rgba8_mipped(ctx, 256, 256, 0);
+    assert_eq(_mip_create_mc, 9, "mip_count=0 expands to full chain (256 -> 9)");
+    assert_eq(gpu_texture_create_2d_rgba8_mipped(ctx, 0, 16, 1), 0, "width=0 rejected");
+    assert_eq(gpu_texture_create_2d_rgba8_mipped(ctx, 100000, 100000, 1), 0, "oversized rejected");
+    assert_eq(gpu_texture_create_2d_rgba8_mipped(ctx, 256, 256, 99), 0, "mip>full rejected");
+    assert_eq(gpu_texture_create_2d_rgba8_mipped(0, 256, 256, 4), 0, "null ctx rejected");
+    assert_eq(_mip_create_count, 2, "slot only fired for the 2 valid calls");
+    return 0;
+}
+
+# v3.1 [M.6b]: generate dispatcher routes (ctx, tex) through the slot;
+# null args fail loud. wgpu's generate is GPU_ERR_NOT_IMPLEMENTED (wgpu
+# compute is a v3.0 stub); native's is the real path (HW-tested in M.7).
+var _mip_gen_count = 0;
+var _mip_gen_tex = 0;
+fn _mip_gen_capture(ctx, tex) {
+    _mip_gen_count = _mip_gen_count + 1;
+    _mip_gen_tex = tex;
+    return 0;
+}
+
+fn test_gpu_texture_generate_mipmaps_dispatch() {
+    _mip_gen_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS, &_mip_gen_capture);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+    var rc = gpu_texture_generate_mipmaps(ctx, 0xDEAD);
+    assert_eq(rc, 0, "generate routes to slot");
+    assert_eq(_mip_gen_count, 1, "slot fired once");
+    assert_eq(_mip_gen_tex, 0xDEAD, "tex threaded through");
+    assert_eq(gpu_texture_generate_mipmaps(0, 0xDEAD), GPU_ERR_OTHER, "null ctx -> err");
+    assert_eq(gpu_texture_generate_mipmaps(ctx, 0), GPU_ERR_OTHER, "null tex -> err");
+    assert_eq(_mip_gen_count, 1, "slot not fired for null args");
+    # wgpu generate is fail-loud NOT_IMPLEMENTED until wgpu compute lands.
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(0, 0), GPU_ERR_NOT_IMPLEMENTED,
+    "wgpu generate returns NOT_IMPLEMENTED");
+    return 0;
+}
+
+fn test_gpu_texture_dispatchers_null_ctx_safe() {
+    _step57_create_count = 0;
+    _step57_write_count = 0;
+    _step57_read_count = 0;
+    _step57_release_count = 0;
+    assert_eq(gpu_texture_create_2d_rgba8(0, 16, 16), 0, "create null ctx = 0");
+    assert_eq(gpu_texture_write(0, 0, 0, 0), GPU_ERR_OTHER, "write null ctx = err");
+    assert_eq(gpu_texture_read(0, 0, 0, 0), GPU_ERR_OTHER, "read null ctx = err");
+    assert_eq(gpu_texture_release(0, 0), 0, "release null ctx = 0");
+    assert_eq(_step57_create_count, 0, "create did not dispatch");
+    assert_eq(_step57_write_count, 0, "write did not dispatch");
+    assert_eq(_step57_read_count, 0, "read did not dispatch");
+    assert_eq(_step57_release_count, 0, "release did not dispatch");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    color_init();
+    test_vertex_blend_opaque();
+    test_vertex_blend_alpha();
+    test_depth_texture_accessors();
+    test_audit_texture_upload_zero_dim();
+    test_audit_texture_create_exceeds_max_rejected();
+    test_mip_level_count();
+    test_mip_level_dim();
+    test_frame_resources_track_buffers_and_textures();
+    test_gpu_texture_create_2d_rgba8_validates_dims();
+    test_gpu_texture_create_mipped_dispatch();
+    test_gpu_texture_generate_mipmaps_dispatch();
+    test_gpu_texture_dispatchers_null_ctx_safe();
+    return assert_summary();
+}
