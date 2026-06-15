@@ -139,10 +139,18 @@ Proposal: [`v3.1-mipmap-generation.md`](../proposals/v3.1-mipmap-generation.md).
     validation lands with M.5/M.6 (byte-pinned-before-HW, like deadbeef).
     NOTE for M.5: RSRC1 must reserve VGPRs v0..v14 (16) + SGPRs s0..s19
     (24); RSRC2 must enable TGID_X|TGID_Y; USER_SGPR=6.
-- [ ] **M.5** — `native_pm4_build_compute_downsample(buf, src_va, dst_va,
-  w, h)` + inter-level barrier wiring
-  (`native_pm4_event_write_cache_flush_and_inv` between levels). CPU
-  byte-exact composer test.
+- [x] **M.5** — `native_pm4_build_compute_downsample(buf, shader_va,
+  stub_va, src_va, dst_va, dst_w, dst_h)` (2026-06-15). 64-dword PM4
+  stream mirroring the deadbeef composer's proven scaffold, with the
+  downsample ABI: RSRC1 `0x2C0083` (16 VGPR / 24 SGPR), RSRC2 `0x18C`
+  (USER_SGPR=6 + TGID_X|Y so the workgroup id loads into s6/s7),
+  USER_DATA_0/1=src VA, _2/3=dst VA, _4=dst_w, NUM_THREAD 1/1/1,
+  DISPATCH (dst_w, dst_h, 1). Structural CPU test (size + scan for the
+  wired RSRC/VA/dim/marker values). Build/lint/fmt/distlib clean; 2084
+  asserts green. **The inter-level cache-flush barrier
+  (`native_pm4_event_write_cache_flush_and_inv`) is wired in the M.6
+  `generate` loop** (it sits between dispatches, not inside this
+  single-level composer). HW dispatch validation: M.7.
 - [ ] **M.6** — Slot fillers (`_backend_wgpu_texture_*_mipped` /
   `_backend_native_*`) + public `gpu_texture_create_2d_rgba8_mipped` /
   `gpu_texture_generate_mipmaps` dispatchers in `src/texture.cyr` with
