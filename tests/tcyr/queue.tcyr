@@ -310,6 +310,70 @@ fn test_gpu_queue_wait_idle_null_slot_not_implemented() {
     return 0;
 }
 
+# ================================================================
+# wgpu queue fillers (Q.2)
+# ================================================================
+# Exercise the REAL wgpu fillers through the public dispatcher with a
+# fake ctx carrying a wgpu backend + a sentinel WGPUQueue handle at
+# +24. The happy path of queue_wait_idle calls wgpu_device_poll and is
+# HW-gated; CPU tests cover the aliasing/idempotency bookkeeping and
+# the null guards.
+var _WGPU_FAKE_QUEUE = 0xDEAD2222;
+
+fn _wire_wgpu_ctx(ctxbuf) {
+    memset(ctxbuf, 0, GPU_CONTEXT_SIZE);
+    store64(ctxbuf + 24, _WGPU_FAKE_QUEUE);
+    store64(ctxbuf + 32, backend_wgpu_new());
+    return 0;
+}
+
+fn test_wgpu_queue_get_aliases_single_queue() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var q = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert(q != 0, "wgpu queue_get returns a queue");
+    assert_eq(queue_kind(q), QUEUE_KIND_GRAPHICS, "kind set");
+    assert_eq(queue_ring(q), _WGPU_FAKE_QUEUE, "ring aliases the WGPUQueue");
+    assert_eq(queue_syncobj(q), 0, "no timeline syncobj on wgpu");
+    return 0;
+}
+
+fn test_wgpu_queue_get_idempotent_per_kind() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var a = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    var b = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    assert_eq(a, b, "same kind returns cached queue (idempotent)");
+    var g = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert(g != a, "different kind -> distinct Queue handle");
+    assert_eq(queue_ring(g), queue_ring(a),
+    "but both alias the same WGPUQueue (no real overlap)");
+    return 0;
+}
+
+fn test_wgpu_queue_barrier_is_ordered_noop() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var c = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    var g = gpu_queue_get(&ctx, QUEUE_KIND_GRAPHICS);
+    assert_eq(gpu_queue_barrier(&ctx, c, g), 0,
+    "wgpu barrier returns 0 (submit-order pin, no-op)");
+    return 0;
+}
+
+fn test_wgpu_queue_wait_idle_filler_null_guards() {
+    var ctx[160];
+    _wire_wgpu_ctx(&ctx);
+    var c = gpu_queue_get(&ctx, QUEUE_KIND_COMPUTE);
+    # The filler's happy path calls wgpu_device_poll (HW-gated); only
+    # the null guards (which return before any wgpu call) are CPU-safe.
+    assert_eq(_backend_wgpu_queue_wait_idle(0, c), GPU_ERR_OTHER,
+    "filler null ctx guarded");
+    assert_eq(_backend_wgpu_queue_wait_idle(&ctx, 0), GPU_ERR_OTHER,
+    "filler null queue guarded");
+    return 0;
+}
+
 fn main() {
     test_queue_kind_constants();
     test_queue_struct_offsets();
@@ -331,5 +395,9 @@ fn main() {
     test_gpu_queue_wait_idle_dispatches_through_slot();
     test_gpu_queue_wait_idle_validates_input();
     test_gpu_queue_wait_idle_null_slot_not_implemented();
+    test_wgpu_queue_get_aliases_single_queue();
+    test_wgpu_queue_get_idempotent_per_kind();
+    test_wgpu_queue_barrier_is_ordered_noop();
+    test_wgpu_queue_wait_idle_filler_null_guards();
     return assert_summary();
 }
