@@ -41,6 +41,7 @@ enum GpuErrCode {
     GPU_ERR_FFI_LOAD                = 16;
     GPU_ERR_FFI_SYMBOL              = 17;
     GPU_ERR_NOT_IMPLEMENTED         = 18;
+    GPU_ERR_FORMAT_UNSUPPORTED      = 19;   # v3.2 T.4 — format unsupported by the active adapter/backend
     GPU_ERR_OTHER                   = 99;
 }
 
@@ -180,6 +181,7 @@ fn gpu_err_name(code): i64 {
     if (code == GPU_ERR_FFI_LOAD)           { return "FFI library load failed"; }
     if (code == GPU_ERR_FFI_SYMBOL)         { return "FFI symbol not found"; }
     if (code == GPU_ERR_NOT_IMPLEMENTED)    { return "operation not implemented on this backend"; }
+    if (code == GPU_ERR_FORMAT_UNSUPPORTED) { return "texture format unsupported by this adapter/backend"; }
     if (code == GPU_ERR_OTHER)              { return "other error"; }
     return "unknown error";
 }
@@ -450,7 +452,8 @@ fn COLOR_CORNFLOWER_BLUE(): i64 {
 # capabilities.cyr — GPU capability reporting
 # Ported from mabda/src/capabilities.rs
 #
-# GpuCapabilities struct layout (120 bytes):
+# GpuCapabilities struct layout (128 bytes — grew 120 -> 128 at v3.2 T.4
+# for the texture-compression bitset):
 #   +0:  adapter_name     (str ptr)
 #   +8:  backend          (str ptr)
 #   +16: timestamp_query  (i64 bool)
@@ -466,10 +469,14 @@ fn COLOR_CORNFLOWER_BLUE(): i64 {
 #   +96: max_compute_wg_z          (i64)
 #   +104: max_compute_wgs_per_dim  (i64)
 #   +112: multi_draw_indirect      (i64 bool)
+#   +120: texture_compression      (i64 bitset: MABDA_TEXCOMP_BC/ETC2/ASTC,
+#                                    defined in texture_format.cyr. 0 =
+#                                    no compressed-family support — the
+#                                    native default this minor, storage-only)
 
 fn gpu_caps_new(): i64 {
-    var c = alloc(120);
-    memset(c, 0, 120);
+    var c = alloc(128);
+    memset(c, 0, 128);
     store64(c + 24, 1);   # compute_shaders = true (always for wgpu)
     return c;
 }
@@ -490,6 +497,9 @@ fn gpu_caps_max_compute_wg_y(c): i64 { return load64(c + 88); }
 fn gpu_caps_max_compute_wg_z(c): i64 { return load64(c + 96); }
 fn gpu_caps_max_compute_wgs_dim(c): i64 { return load64(c + 104); }
 fn gpu_caps_multi_draw_indirect(c): i64 { return load64(c + 112); }
+# v3.2 T.4 — texture-compression family bitset (MABDA_TEXCOMP_* mask).
+# gpu_caps_supports_format (texture_format.cyr) reads it.
+fn gpu_caps_texture_compression(c): i64 { return load64(c + 120); }
 
 # Setters (used by from_context to populate)
 fn gpu_caps_set_adapter_name(c, v): i64 { store64(c, v); return 0; }
@@ -509,6 +519,7 @@ fn gpu_caps_set_compute_wg(c, x, y, z): i64 {
 }
 fn gpu_caps_set_compute_wgs_dim(c, v): i64 { store64(c + 104, v); return 0; }
 fn gpu_caps_set_multi_draw(c, v): i64 { store64(c + 112, v); return 0; }
+fn gpu_caps_set_texture_compression(c, mask): i64 { store64(c + 120, mask); return 0; }
 
 # Validation helpers
 fn gpu_caps_uniform_fits(c, size): i64 {
@@ -1139,6 +1150,48 @@ fn mabda_texfmt_data_size(fmt, w, h): i64 {
     var bx = mabda_texfmt_blocks_for_dim(w, mabda_texfmt_block_width(fmt));
     var by = mabda_texfmt_blocks_for_dim(h, mabda_texfmt_block_height(fmt));
     return bx * by * bytes;
+}
+
+# ================================================================
+# v3.2 T.4 — compression families + capability gating
+# ================================================================
+# Compressed formats group into three families that a GPU adapter
+# advertises (or doesn't) as a unit. These are bit FLAGS — the caps
+# bitset (gpu_caps_texture_compression, capabilities.cyr) ORs together
+# the families the active adapter supports. wgpu populates it from
+# WGPUFeatureName_TextureCompression{BC,ETC2,ASTC} (T.6); native leaves it
+# 0 this minor (storage/readback only — sampling is Phase TS).
+var MABDA_TEXCOMP_BC   = 1;
+var MABDA_TEXCOMP_ETC2 = 2;
+var MABDA_TEXCOMP_ASTC = 4;
+
+# The compression family bit for `fmt`, or 0 for uncompressed / invalid.
+fn mabda_texfmt_compression_family(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_BC1)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC3)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC4)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC5)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC6H) { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_BC7)  { return MABDA_TEXCOMP_BC; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8)  { return MABDA_TEXCOMP_ETC2; }
+    if (fmt == MABDA_TEXFMT_ETC2_RGBA8) { return MABDA_TEXCOMP_ETC2; }
+    if (fmt == MABDA_TEXFMT_ASTC_4X4) { return MABDA_TEXCOMP_ASTC; }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6) { return MABDA_TEXCOMP_ASTC; }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8) { return MABDA_TEXCOMP_ASTC; }
+    return 0;
+}
+
+# 1 if `caps` supports creating/binding a texture of `fmt`, else 0.
+# Uncompressed RGBA8 is always supported. A compressed format needs its
+# family bit set in the caps compression bitset. An invalid id is never
+# supported. The create path (T.5) returns GPU_ERR_FORMAT_UNSUPPORTED /
+# 0 when this returns 0 — the format is rejected before reaching the FFI.
+fn gpu_caps_supports_format(caps, fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 1; }          # uncompressed: always
+    if (mabda_texfmt_is_compressed(fmt) == 0) { return 0; }   # invalid id
+    var fam = mabda_texfmt_compression_family(fmt);
+    if ((gpu_caps_texture_compression(caps) & fam) != 0) { return 1; }
+    return 0;
 }
 
 # --- wgpu_descriptors.cyr ---
@@ -3200,6 +3253,33 @@ fn _backend_wgpu_queue_wait_idle(ctx, queue): i64 {
     var device = gpu_ctx_device(ctx);
     wgpu_device_poll(device, 1);
     return 0;
+}
+
+# ================================================================
+# Texture-compression capability detection (v3.2 T.4)
+# ================================================================
+# WGPUFeatureName_TextureCompression{BC,ETC2,ASTC} values from webgpu.h
+# v29 (lines 645/647/648). gpu_caps_detect_texture_compression queries the
+# adapter for each family and ORs the MABDA_TEXCOMP_* bits the consumer
+# stores via gpu_caps_set_texture_compression. (HW path — needs a real
+# adapter; the bit math is CPU-tested via gpu_caps_supports_format.)
+var WGPU_FEATURE_TEXTURE_COMPRESSION_BC   = 0x4;
+var WGPU_FEATURE_TEXTURE_COMPRESSION_ETC2 = 0x6;
+var WGPU_FEATURE_TEXTURE_COMPRESSION_ASTC = 0x7;
+
+fn gpu_caps_detect_texture_compression(adapter): i64 {
+    if (adapter == 0) { return 0; }
+    var mask = 0;
+    if (wgpu_adapter_has_feature(adapter, WGPU_FEATURE_TEXTURE_COMPRESSION_BC) != 0) {
+        mask = mask | MABDA_TEXCOMP_BC;
+    }
+    if (wgpu_adapter_has_feature(adapter, WGPU_FEATURE_TEXTURE_COMPRESSION_ETC2) != 0) {
+        mask = mask | MABDA_TEXCOMP_ETC2;
+    }
+    if (wgpu_adapter_has_feature(adapter, WGPU_FEATURE_TEXTURE_COMPRESSION_ASTC) != 0) {
+        mask = mask | MABDA_TEXCOMP_ASTC;
+    }
+    return mask;
 }
 
 # ================================================================
