@@ -69,9 +69,9 @@ dwords_to_bytes \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
 
 echo
-echo "=== FS (textured_sample, image_sample/BC decode, 60 bytes instr; v3.2 TS.7) ==="
+echo "=== FS (textured_sample, image_sample/BC decode, unnormalized S#, 52 bytes instr; v3.2 TS.7) ==="
 dwords_to_bytes \
-    7E0C0202 7E0E0203 C00A0200 00000020 C00E0000 00000000 BF8CC07F \
-    0A080D02 0A0A0F03 F0800F00 00400004 BF8C0F70 C400180F 03020100 \
+    C00A0200 00000020 C00E0000 00000000 BF8CC07F \
+    7E080302 7E0A0303 F0800F00 00400004 BF8C0F70 C400180F 03020100 \
     BF810000 \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
