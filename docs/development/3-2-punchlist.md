@@ -252,11 +252,15 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   reuses the screen-pos oracle but divides by texture dims (reciprocals in
   user-SGPRs s2/s3) for normalized coords; loads T# (s[0:7]) + S# (s[8:11])
   from the descriptor BO; `GFX9_PS_PGM_RSRC2_SAMPLE`=0x8 (USER_SGPR=4).
-  **Remaining:** (b) tiled `create_sampleable` (SDMA-tiled BO + the
-  addrlib-exact `epitch`/size + the BC T# with SW_64KB_S) + write(L2T)/read(T2L);
-  (c) wire the sample FS into the draw (RSRC2=0x8 + USER_DATA rcp_w/rcp_h) +
-  `native_compressed_sample_e2e.cyr` (BC1 sample vs CPU decode) + on-device
-  geometry iteration; flip native BC cap bit to 1.
+  **TS.7b done:** `native_tiled_geometry` — SW_64KB_S 2D block dims + aligned
+  pitch (epitch) + 64 KiB-aligned BO size, sourced from addrlib
+  (`Block256_2d`<<4 / `ComputeThinBlockDimension`; BC1 128×64, RGBA8 128×128,
+  BC7 64×64 blocks), CPU-pinned. **Remaining:** (c) wire it — tiled
+  `create_sampleable` (geometry-sized BO + BC T# with SW_64KB_S + epitch) +
+  write(L2T)/read(T2L) via the TS.6 packet + the sample-FS draw override
+  (RSRC2=0x8, USER_DATA rcp_w/rcp_h) + `native_compressed_sample_e2e.cyr` (BC1
+  sample vs CPU decode) + on-device verification (where SDMA tiling meets the
+  TA); flip native BC cap bit to 1.
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
   limitation**; cut the TS minors.

@@ -1730,6 +1730,61 @@ fn _native_align_up(n, align): i64 {
     return ((n + (align - 1)) / align) * align;
 }
 
+# ================================================================
+# v3.2 TS.7 — GFX9 SW_64KB_S tiled-surface geometry
+# ================================================================
+# The SDMA engine applies the swizzle (TS.6), but the SDMA tiled packet AND the
+# T# descriptor both need the addrlib-exact tiled geometry — aligned pitch
+# (epitch) + the 64 KiB-aligned surface size — or the TA reads garbage. Block
+# dims come from addrlib's Block256_2d (256-byte micro-tile) << 4 (the 64 KiB
+# block: log2BlkSize=16, log2blkSizeIn256B=8, widthAmp=heightAmp=4) — sourced
+# from Mesa src/amd/addrlib (gfx9addrlib.cpp ComputeThinBlockDimension +
+# addrlib2.cpp Block256_2d). Indexed by log2(element_bytes), 1/2/4/8/16 B.
+
+fn _native_log2(n): i64 {
+    var r = 0;
+    var v = n;
+    while (v > 1) { v = v / 2; r = r + 1; }
+    return r;
+}
+
+# addrlib Block256_2d[log2(eb)] packed (w<<8)|h: {16,16},{16,8},{8,8},{8,4},{4,4}.
+fn _native_block256_2d(esize_log2): i64 {
+    if (esize_log2 == 0) { return (16 << 8) | 16; }
+    if (esize_log2 == 1) { return (16 << 8) | 8; }
+    if (esize_log2 == 2) { return (8 << 8) | 8; }
+    if (esize_log2 == 3) { return (8 << 8) | 4; }
+    if (esize_log2 == 4) { return (4 << 8) | 4; }
+    return 0;
+}
+
+# SW_64KB_S 2D block dims in ELEMENTS = Block256_2d << 4.
+fn native_tiled_block_w(esize_log2): i64 {
+    return ((_native_block256_2d(esize_log2) >> 8) & 0xFF) << 4;
+}
+fn native_tiled_block_h(esize_log2): i64 {
+    return (_native_block256_2d(esize_log2) & 0xFF) << 4;
+}
+
+# Compute SW_64KB_S geometry for a `wb`×`hb`-element surface of `element_bytes`.
+# Writes 5 i64 to `out`: +0 block_w, +8 block_h, +16 aligned_wb (= epitch+1),
+# +24 aligned_hb, +32 size (64 KiB-aligned BO bytes). For BC the elements are
+# 4x4 blocks (wb/hb in blocks, element_bytes = block bytes).
+fn native_tiled_geometry(out, element_bytes, wb, hb): i64 {
+    var es = _native_log2(element_bytes);
+    var bw = native_tiled_block_w(es);
+    var bh = native_tiled_block_h(es);
+    var awb = _native_align_up(wb, bw);
+    var ahb = _native_align_up(hb, bh);
+    var size = _native_align_up(awb * ahb * element_bytes, 65536);
+    store64(out +  0, bw);
+    store64(out +  8, bh);
+    store64(out + 16, awb);
+    store64(out + 24, ahb);
+    store64(out + 32, size);
+    return 0;
+}
+
 # Byte offset of mip `level` within the contiguous chain (the sum of the
 # 256-aligned sizes of all lower levels). level 0 -> 0. Reusing
 # native_mip_chain_size(w, h, level) gives the same value (the chain up to
