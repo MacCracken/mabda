@@ -427,6 +427,64 @@ fn native_gfx9_shader_fullscreen_triangle_vs(buf, pos): i64 {
 var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
 
 # ================================================================
+# v3.2 TS.4 — textured fragment shader (image_load bring-up oracle)
+# ================================================================
+# The sampling-path replacement for native_gfx9_shader_solid_red: each
+# fragment LOADS the texel at its own screen position and exports it, so a
+# fullscreen quad over a W×H render target sampling a W×H texture reproduces
+# the texture (RT[x,y] = tex[x,y]) — the exact, zero-interpolation oracle
+# TS.5 verifies on Cezanne. (Normalized-UV `image_sample` + the UV-export VS
+# come at TS.7 for the compressed/scaled path.)
+#
+# ABI:
+#   - s[0:1] = PS user-data (the T#+S# descriptor BO VA; pipeline SET_SH_REGs
+#     SPI_SHADER_USER_DATA_PS_0/1 at bind, TS.5). RSRC2_PS USER_SGPR=2.
+#   - SPI_PS_INPUT_ENA = GFX9_SPI_PS_INPUT_TEXTURED (0x302): PERSP_CENTER
+#     (hang-quirk, VGPRs v0/v1 unused) + POS_X_FLOAT + POS_Y_FLOAT, so the
+#     fragment screen position arrives as floats in v2 (x) / v3 (y).
+#   - High-water: VGPRs v0..v5 (6), SGPRs s[0:7] (8, the loaded T#). TS.5's
+#     PM4 sets RSRC1_PS accordingly.
+#
+# Source (assembled + round-tripped via `llvm-mc -mcpu=gfx90c`, per
+# feedback_verify_gfx9_shader_bytes_with_llvm_mc):
+#   s_load_dwordx8 s[0:7], s[0:1], 0x0   ; load the T# from the descriptor BO
+#   s_waitcnt lgkmcnt(0)
+#   v_cvt_i32_f32_e32 v4, v2             ; tx = int(pos_x)
+#   v_cvt_i32_f32_e32 v5, v3             ; ty = int(pos_y)
+#   image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm
+#   s_waitcnt vmcnt(0)
+#   exp mrt0 v0, v1, v2, v3 done vm
+#   s_endpgm
+# exp word0 = 0xC400180F — identical to the proven solid-red EXP encoding.
+# Returns pos + 108 (44 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
+    store32(buf + pos +  0, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (w0)
+    store32(buf + pos +  4, 0x00000000);   # s_load_dwordx8 (w1)
+    store32(buf + pos +  8, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
+    store32(buf + pos + 12, 0x7E081102);   # v_cvt_i32_f32_e32 v4, v2  (POS_X -> tx)
+    store32(buf + pos + 16, 0x7E0A1103);   # v_cvt_i32_f32_e32 v5, v3  (POS_Y -> ty)
+    store32(buf + pos + 20, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
+    store32(buf + pos + 24, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    store32(buf + pos + 28, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(buf + pos + 32, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    store32(buf + pos + 36, 0x03020100);   # exp (w1)
+    store32(buf + pos + 40, 0xBF810000);   # s_endpgm
+    var i = 0;
+    while (i < 16) {
+        store32(buf + pos + 44 + i * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
+        i = i + 1;
+    }
+    return pos + 108;
+}
+
+var GFX9_FS_TEXTURED_LOAD_SIZE = 108;
+
+# SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
+# gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
+# POS_Y_FLOAT_ENA[9]. (1<<1)|(1<<8)|(1<<9) = 0x302.
+var GFX9_SPI_PS_INPUT_TEXTURED = 0x302;
+
+# ================================================================
 # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
 # ================================================================
 # Spec-anchor for the trivial vertex+fragment pipeline that Step
@@ -473,6 +531,12 @@ var R_SPI_SHADER_PGM_LO_PS    = 0xB020;
 var R_SPI_SHADER_PGM_HI_PS    = 0xB024;
 var R_SPI_SHADER_PGM_RSRC1_PS = 0xB028;
 var R_SPI_SHADER_PGM_RSRC2_PS = 0xB02C;
+# v3.2 TS.4 — PS user-data SH registers (Mesa R_00B03{0,4}). The textured FS's
+# 2 user SGPRs (s[0:1]) hold the bound texture's T#+S# descriptor BO VA; the
+# pipeline SET_SH_REGs these at bind/draw time (TS.5). RSRC2_PS USER_SGPR=2
+# (GFX9_PS_PGM_RSRC2_MIN = 0x4 already encodes 2).
+var R_SPI_SHADER_USER_DATA_PS_0 = 0xB030;
+var R_SPI_SHADER_USER_DATA_PS_1 = 0xB034;
 
 # SPI shader output format context registers
 # (Mesa gfx9.json: R_02870C_SPI_SHADER_POS_FORMAT,

@@ -176,9 +176,15 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `gpu_render_pass_bind_texture` dispatchers (mock-tested). **Remaining (→ TS.5):**
   the `backend_is_complete` walk over 264..280 activates once both backends
   fill the slots ("activate when both fill").
-- [ ] **TS.4** — Textured FS + UV-export VS in hand-authored GFX9 ISA
-  (`image_load` oracle then `image_sample`; SPI input wiring); llvm-mc
-  byte-pinned.
+- [~] **TS.4** — textured FS **done**: `native_gfx9_shader_textured_load_fs`
+  — the `image_load` bring-up oracle (each fragment loads the texel at its
+  own screen position → RT[x,y]=tex[x,y]; zero interpolation, reuses the
+  existing fullscreen VS). Assembled + round-tripped via `llvm-mc -mcpu=gfx90c`,
+  byte-pinned + added to `scripts/disasm-shaders.sh`. SPI wiring constants
+  (`GFX9_SPI_PS_INPUT_TEXTURED=0x302` = PERSP_CENTER|POS_X|POS_Y;
+  `R_SPI_SHADER_USER_DATA_PS_0/1`). **Deferred to TS.7** (with the scaled
+  compressed path): the UV-export VS + normalized `image_sample` FS — not
+  needed for the RT-sized RGBA8 MVP, which the screen-pos oracle covers.
 - [ ] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne**
   (`native_texture_sample_e2e.cyr`) — proves T#/S#/`image_sample` with zero
   tiling risk.
