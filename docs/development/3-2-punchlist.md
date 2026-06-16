@@ -368,8 +368,13 @@ byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
   @+16, code ptr @+24 — webgpu.h v29-pinned) + `_spirv_validate(ptr, byte_len)`
   (magic/align/bound + 16 Mi-word cap; 6 distinct codes incl. byte-swapped-magic
   detection) — all in `wgpu_descriptors.cyr`, CPU-tested (backend.tcyr).
-- [ ] **S.2** — Widen shader-create slot `(…,kind)` (fncall3→4); wgpu
-  branches on kind; `gpu_shader_module_create_spirv`.
+- [x] **S.2** — done. `ShaderSourceKind` enum (WGSL/SPIRV/GFX9, backend.cyr);
+  shader-create slot widened `(ctx,bytes,n,kind)` (fncall3→4, no offset change);
+  wgpu filler branches WGSL/SPIRV (validate + `wgpu_shader_source_spirv`, codeSize
+  n/4); native stub takes kind (SPIRV→0 fail-loud, Phase N). `gpu_shader_module_create`
+  forwards the bound backend's default (WGSL/GFX9 — no call-site churn) +
+  `gpu_shader_module_create_spirv` forwards SPIRV. Dispatch tests assert all three
+  kinds route. (Also fixed a pre-existing awb-1 comment fmt drift v3.2 had inherited.)
 - [ ] **S.3** — Source-kind-aware shader cache (`_shader_hash_n`, kind in
   the seed; WGSL/SPIR-V non-collision).
 - [ ] **S.4** — Reference launcher gate (`ShaderSourceSPIRV` instance

@@ -238,16 +238,28 @@ fn mabda_wgsl_downsample_2x2(dst): i64 {
 # WGSL programs can exceed that 4 KB though; this is a Step-3-era
 # follow-up to pass an explicit length to wgpu_string_view_len.
 
-fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n): i64 {
+# v3.2 Phase S — `kind` carries the source format (the slot widened to fncall4).
+# WGSL: build a StringView source from the n bytes. SPIRV: validate the binary
+# (`_spirv_validate` — magic/align/bound) then build a WGPUShaderSourceSPIRV with
+# codeSize = n/4 WORDS. A failed validation or an unknown kind returns 0 (the
+# fail-loud null; e.g. SPIR-V against an instance lacking the feature also nulls
+# at the create call). `n` is the BYTE length for both.
+fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     if (ctx == 0)       { return 0; }
     if (bytes_ptr == 0) { return 0; }
     if (n <= 0)         { return 0; }
     var device = gpu_ctx_device(ctx);
-    # Audit 2026-06-14 [MED-4]: thread the explicit, validated length n
-    # through instead of dropping it and re-deriving a 4 KiB-capped NUL
-    # scan — that truncated any WGSL >= 4 KiB. wgpu-native reads exactly
-    # StringView.length bytes.
-    var src = wgpu_shader_source_wgsl_len(bytes_ptr, n);
+    var src = 0;
+    if (kind == SHADER_SRC_SPIRV) {
+        if (_spirv_validate(bytes_ptr, n) != 0) { return 0; }   # reject malformed
+        src = wgpu_shader_source_spirv(bytes_ptr, n / 4);       # codeSize in WORDS
+    } else {
+        if (kind != SHADER_SRC_WGSL) { return 0; }   # native GFX9 isn't a wgpu input
+        # Audit 2026-06-14 [MED-4]: thread the explicit, validated length n
+        # through instead of a 4 KiB-capped NUL scan. wgpu reads exactly
+        # StringView.length bytes.
+        src = wgpu_shader_source_wgsl_len(bytes_ptr, n);
+    }
     var desc = wgpu_shader_module_descriptor(0, src);
     return wgpu_device_create_shader_module(device, desc);
 }

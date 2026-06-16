@@ -2358,6 +2358,17 @@ enum BackendKind {
     BACKEND_KIND_INTEL   = 4;
 }
 
+# v3.2 Phase S — shader-source kind, the explicit tag the shader-create slot
+# now carries across the byte-polymorphic boundary (the bytes' meaning is no
+# longer purely a function of the bound backend, since wgpu accepts both WGSL
+# and SPIR-V). GFX9 is reserved up front for when Phase N gives native a real
+# ISA-vs-SPIR-V choice.
+enum ShaderSourceKind {
+    SHADER_SRC_WGSL  = 0;   # UTF-8 text (default; today's wgpu path)
+    SHADER_SRC_SPIRV = 1;   # u32-word binary, magic 0x07230203 (wgpu, Phase S)
+    SHADER_SRC_GFX9  = 2;   # pre-compiled GFX9 ISA (native today)
+}
+
 # ================================================================
 # Backend selector (v3 Step 4e, ADR 006) — compile-time choice
 # ================================================================
@@ -2956,16 +2967,28 @@ fn mabda_wgsl_downsample_2x2(dst): i64 {
 # WGSL programs can exceed that 4 KB though; this is a Step-3-era
 # follow-up to pass an explicit length to wgpu_string_view_len.
 
-fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n): i64 {
+# v3.2 Phase S — `kind` carries the source format (the slot widened to fncall4).
+# WGSL: build a StringView source from the n bytes. SPIRV: validate the binary
+# (`_spirv_validate` — magic/align/bound) then build a WGPUShaderSourceSPIRV with
+# codeSize = n/4 WORDS. A failed validation or an unknown kind returns 0 (the
+# fail-loud null; e.g. SPIR-V against an instance lacking the feature also nulls
+# at the create call). `n` is the BYTE length for both.
+fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     if (ctx == 0)       { return 0; }
     if (bytes_ptr == 0) { return 0; }
     if (n <= 0)         { return 0; }
     var device = gpu_ctx_device(ctx);
-    # Audit 2026-06-14 [MED-4]: thread the explicit, validated length n
-    # through instead of dropping it and re-deriving a 4 KiB-capped NUL
-    # scan — that truncated any WGSL >= 4 KiB. wgpu-native reads exactly
-    # StringView.length bytes.
-    var src = wgpu_shader_source_wgsl_len(bytes_ptr, n);
+    var src = 0;
+    if (kind == SHADER_SRC_SPIRV) {
+        if (_spirv_validate(bytes_ptr, n) != 0) { return 0; }   # reject malformed
+        src = wgpu_shader_source_spirv(bytes_ptr, n / 4);       # codeSize in WORDS
+    } else {
+        if (kind != SHADER_SRC_WGSL) { return 0; }   # native GFX9 isn't a wgpu input
+        # Audit 2026-06-14 [MED-4]: thread the explicit, validated length n
+        # through instead of a 4 KiB-capped NUL scan. wgpu reads exactly
+        # StringView.length bytes.
+        src = wgpu_shader_source_wgsl_len(bytes_ptr, n);
+    }
     var desc = wgpu_shader_module_descriptor(0, src);
     return wgpu_device_create_shader_module(device, desc);
 }
@@ -8238,7 +8261,10 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
 # wrapped at canonical-high VA), not from this public API.
 # `_shader_module_create` returns 0 ("no module") on failure;
 # `_release` is a no-op success.
-fn _backend_native_shader_module_create(ctx, bytes_ptr, n): i64 {
+# v3.2 Phase S: the slot widened to carry `kind` (fncall4). Native accepts only
+# GFX9 ISA today; SPIR-V→GFX9 lowering is Phase N — so a SPIR-V kind here returns
+# 0 (fail-loud), same as the GFX9 stub. The param is accepted for the widened ABI.
+fn _backend_native_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     return 0;
 }
 
@@ -8567,9 +8593,9 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
         var tp[56];
         if (native_tex_tiled_params(fmt, width, height, &tp) != 0) { return 0; }
         sw_mode = GFX9_SW_MODE_64KB_S;
-        epitch = load64(&tp + 16) - 1;     # awb - 1 (tile-aligned block pitch;
-                                           # the TS.7c-3 SDMA write MUST use the
-                                           # same awb-1 so the layout matches)
+        # epitch = awb-1 (the tile-aligned block pitch). The TS.7c-3 SDMA write
+        # MUST use the same awb-1 so the tiled layout matches the T#.
+        epitch = load64(&tp + 16) - 1;
         surf_size = load64(&tp + 32);      # tiled_size (64 KiB-aligned)
     }
 
@@ -12613,11 +12639,27 @@ fn compute_pipeline_release(cp): i64 {
 #   wgpu  — UTF-8 WGSL source, possibly null-terminated
 #   AMD   — pre-compiled GFX9 ISA bytes (Step 3g consumer)
 
+# Forwards the bound backend's default source kind: WGSL on wgpu, GFX9 ISA on
+# native — byte-for-byte the v3.0 meaning, no call-site churn. SPIR-V uses the
+# sibling gpu_shader_module_create_spirv. The slot carries `kind` (v3.2 Phase S).
 fn gpu_shader_module_create(ctx, bytes_ptr, n): i64 {
     if (ctx == 0) { return 0; }
-    var slot = backend_get_slot(gpu_ctx_backend(ctx),
-    BACKEND_SLOT_SHADER_MODULE_CREATE);
-    return fncall3(slot, ctx, bytes_ptr, n);
+    var b = gpu_ctx_backend(ctx);
+    var kind = SHADER_SRC_GFX9;
+    if (backend_kind(b) == BACKEND_KIND_WGPU) { kind = SHADER_SRC_WGSL; }
+    return fncall4(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
+    ctx, bytes_ptr, n, kind);
+}
+
+# @public — create a shader module from a SPIR-V binary (wgpu path). `words_ptr`
+# = u32 word stream (magic 0x07230203); `byte_len` = word_count * 4. The wgpu
+# instance MUST be built with the ShaderSourceSPIRV feature (deps/wgpu_main.c) —
+# otherwise create returns 0 (the fail-loud null; mabda can't detect the missing
+# feature before the call). Native returns 0 (SPIR-V→GFX9 lowering is Phase N).
+fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
+    if (ctx == 0) { return 0; }
+    return fncall4(backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_SHADER_MODULE_CREATE), ctx, words_ptr, byte_len, SHADER_SRC_SPIRV);
 }
 
 fn gpu_shader_module_release(ctx, shmod): i64 {
