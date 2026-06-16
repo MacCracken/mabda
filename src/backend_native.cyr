@@ -1484,8 +1484,9 @@ fn backend_native_new(): i64 {
 # CPU-uploaded textures + compute-shader writes; tiled / mipped /
 # format-rich textures are subsequent Phase C chunks (5.x).
 #
-# NativeTexture struct layout (48 bytes — grew 32 → 48 at v3.1 M.1(b)
-# to carry mip metadata; offsets 0..24 unchanged):
+# NativeTexture struct layout (64 bytes — grew 32 → 48 at v3.1 M.1(b) for
+# mip metadata; 48 → 64 at v3.2 TS.3 for sampleable surfaces; offsets 0..44
+# unchanged):
 #   +0:  handle    (u64, KMS handle)
 #   +8:  va        (u64, canonical-high GPU VA of level 0)
 #   +16: addr      (u64, CPU mmap pointer to level 0)
@@ -1495,7 +1496,12 @@ fn backend_native_new(): i64 {
 #   +36: height    (u32, level-0 height)
 #   +40: mip_count (u32, 1 = single level; per-level VA = va +
 #                   native_mip_level_offset(width, height, level))
-#   +44: pad       (u32)
+#   +44: fmt       (u32, MABDA_TEXFMT_* — 0 = RGBA8; v3.2 T.7)
+#   +48: sw_mode   (u32, GFX9 SW_MODE — LINEAR(0) storage/uncompressed;
+#                   a tiled mode for sampleable compressed; v3.2 TS.3)
+#   +52: t_va      (u64, GPU VA of this texture's 48-byte T#+S# descriptor
+#                   BO, or 0 if not sampleable; v3.2 TS.3)
+#   +60: pad       (u32)
 #
 # v3.1 M.1(c): the texture VA region is a per-context bump-allocated
 # range (native_ctx_alloc_texture_va), not a single hardcoded VA. It was
@@ -1548,7 +1554,16 @@ var NATIVE_TEX_FIELD_WIDTH     = 32;
 var NATIVE_TEX_FIELD_HEIGHT    = 36;
 var NATIVE_TEX_FIELD_MIP_COUNT = 40;
 var NATIVE_TEX_FIELD_FMT       = 44;   # v3.2 T.7 — MABDA_TEXFMT_* (0 = RGBA8); was pad
-var NATIVE_TEX_STRUCT_SIZE     = 48;
+var NATIVE_TEX_FIELD_SW_MODE   = 48;   # v3.2 TS.3 — GFX9 SW_MODE (0 = LINEAR)
+var NATIVE_TEX_FIELD_T_VA      = 52;   # v3.2 TS.3 — VA of the T#+S# descriptor BO (0 = none)
+var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable)
+
+# v3.2 TS.3 — NativeTexture sampleable-field accessors.
+fn native_tex_fmt(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_FMT); }
+fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE); }
+fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
+fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
+fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.
@@ -1914,17 +1929,21 @@ fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va): i64 {
     return 0;
 }
 
-# NativePass struct layout (32 bytes — matches wgpu pass struct
-# shape from src/backend_wgpu.cyr for parity, with native-specific
-# field interpretations):
+# NativePass struct layout (40 bytes — grew 32 → 40 at v3.2 TS.3 for the
+# bound-texture descriptor VA; offsets 0..24 unchanged):
 #   +0:  ctx_ref         (u64, GpuContext for pass_draw + pass_end)
 #   +8:  reserved        (u64, parallel to wgpu's pass-encoder slot)
 #   +16: rt_ptr          (u64, NativeRenderTarget — provides VA / w / h)
 #   +24: clear_color_ptr (u64, 32-byte f64 RGBA — captured for v2.1;
 #                         v2-native ignores because the FS shader
 #                         hardcodes solid red, see Step 6.2(b) FS)
+#   +32: tex_desc_va     (u64, VA of the bound texture's T#+S# descriptor
+#                         BO, or 0 if no texture bound; v3.2 TS.3 —
+#                         bind_for_sample stashes it, render_pass_draw
+#                         emits SET_SH_REG of the PS USER_DATA from it)
 var NATIVE_PASS_FIELD_CTX         = 0;
 var NATIVE_PASS_FIELD_RESERVED    = 8;
 var NATIVE_PASS_FIELD_RT          = 16;
 var NATIVE_PASS_FIELD_CLEAR_COLOR = 24;
-var NATIVE_PASS_STRUCT_SIZE       = 32;
+var NATIVE_PASS_FIELD_TEX_DESC_VA = 32;   # v3.2 TS.3
+var NATIVE_PASS_STRUCT_SIZE       = 40;

@@ -2419,7 +2419,24 @@ var BACKEND_SLOT_TEXTURE_CREATE_2D_FMT   = 248;
 # would falsely report wgpu incomplete between X.5 and X.6.
 var BACKEND_SLOT_BUFFER_COPY             = 256;
 
-var BACKEND_SIZE                         = 264;
+# v3.2 sampleable-texture block (TS.3) — native texture SAMPLING. Appended
+# after the buffer-copy slot; offsets 0..256 unchanged. Slot signatures
+# (fillers land in TS.5):
+#   texture_create_2d_sampleable (ctx, w, h, fmt) -> tex_ptr | 0
+#       wgpu : a TEXTURE_BINDING view; native: tiled-or-linear BO + a
+#              T#/S# descriptor BO stashed on the (grown) NativeTexture.
+#   texture_bind_for_sample (ctx, pass, tex, sampler) -> 0|err
+#       wgpu : builds the bind group (view + WGPUSampler) on the pass;
+#              native: stashes the tex's T#/S# VA on the pass struct so the
+#              next render_pass_draw emits the PS USER_DATA SET_SH_REG.
+# 4 args max -> within the fncall ceiling. The backend_is_complete walk over
+# this range activates in TS.5 once both backends fill it (the M.6b / Q.3b /
+# T.7 "activate when both fill" pattern) — adding it now would falsely report
+# both backends incomplete between TS.3 and TS.5.
+var BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE = 264;
+var BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE      = 272;
+
+var BACKEND_SIZE                         = 280;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -2472,6 +2489,12 @@ var BACKEND_TEXFMT_SLOTS_END             = 256;
 # native filler) — same "activate when both backends fill" deferral as T.7.
 var BACKEND_BUFFERCOPY_SLOTS_BEGIN       = 256;
 var BACKEND_BUFFERCOPY_SLOTS_END         = 264;
+
+# v3.2 sampleable fnptr block: 264..280. Ninth range. backend_is_complete()'s
+# walk over it is deferred to TS.5 (when both backends fill create_sampleable
+# + bind_for_sample) — same "activate when both fill" deferral as T.7 / X.6.
+var BACKEND_SAMPLE_SLOTS_BEGIN           = 264;
+var BACKEND_SAMPLE_SLOTS_END             = 280;
 
 # ================================================================
 # Backend struct construction
@@ -8674,8 +8697,9 @@ fn backend_native_new(): i64 {
 # CPU-uploaded textures + compute-shader writes; tiled / mipped /
 # format-rich textures are subsequent Phase C chunks (5.x).
 #
-# NativeTexture struct layout (48 bytes — grew 32 → 48 at v3.1 M.1(b)
-# to carry mip metadata; offsets 0..24 unchanged):
+# NativeTexture struct layout (64 bytes — grew 32 → 48 at v3.1 M.1(b) for
+# mip metadata; 48 → 64 at v3.2 TS.3 for sampleable surfaces; offsets 0..44
+# unchanged):
 #   +0:  handle    (u64, KMS handle)
 #   +8:  va        (u64, canonical-high GPU VA of level 0)
 #   +16: addr      (u64, CPU mmap pointer to level 0)
@@ -8685,7 +8709,12 @@ fn backend_native_new(): i64 {
 #   +36: height    (u32, level-0 height)
 #   +40: mip_count (u32, 1 = single level; per-level VA = va +
 #                   native_mip_level_offset(width, height, level))
-#   +44: pad       (u32)
+#   +44: fmt       (u32, MABDA_TEXFMT_* — 0 = RGBA8; v3.2 T.7)
+#   +48: sw_mode   (u32, GFX9 SW_MODE — LINEAR(0) storage/uncompressed;
+#                   a tiled mode for sampleable compressed; v3.2 TS.3)
+#   +52: t_va      (u64, GPU VA of this texture's 48-byte T#+S# descriptor
+#                   BO, or 0 if not sampleable; v3.2 TS.3)
+#   +60: pad       (u32)
 #
 # v3.1 M.1(c): the texture VA region is a per-context bump-allocated
 # range (native_ctx_alloc_texture_va), not a single hardcoded VA. It was
@@ -8738,7 +8767,16 @@ var NATIVE_TEX_FIELD_WIDTH     = 32;
 var NATIVE_TEX_FIELD_HEIGHT    = 36;
 var NATIVE_TEX_FIELD_MIP_COUNT = 40;
 var NATIVE_TEX_FIELD_FMT       = 44;   # v3.2 T.7 — MABDA_TEXFMT_* (0 = RGBA8); was pad
-var NATIVE_TEX_STRUCT_SIZE     = 48;
+var NATIVE_TEX_FIELD_SW_MODE   = 48;   # v3.2 TS.3 — GFX9 SW_MODE (0 = LINEAR)
+var NATIVE_TEX_FIELD_T_VA      = 52;   # v3.2 TS.3 — VA of the T#+S# descriptor BO (0 = none)
+var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable)
+
+# v3.2 TS.3 — NativeTexture sampleable-field accessors.
+fn native_tex_fmt(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_FMT); }
+fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE); }
+fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
+fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
+fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.
@@ -9104,20 +9142,24 @@ fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va): i64 {
     return 0;
 }
 
-# NativePass struct layout (32 bytes — matches wgpu pass struct
-# shape from src/backend_wgpu.cyr for parity, with native-specific
-# field interpretations):
+# NativePass struct layout (40 bytes — grew 32 → 40 at v3.2 TS.3 for the
+# bound-texture descriptor VA; offsets 0..24 unchanged):
 #   +0:  ctx_ref         (u64, GpuContext for pass_draw + pass_end)
 #   +8:  reserved        (u64, parallel to wgpu's pass-encoder slot)
 #   +16: rt_ptr          (u64, NativeRenderTarget — provides VA / w / h)
 #   +24: clear_color_ptr (u64, 32-byte f64 RGBA — captured for v2.1;
 #                         v2-native ignores because the FS shader
 #                         hardcodes solid red, see Step 6.2(b) FS)
+#   +32: tex_desc_va     (u64, VA of the bound texture's T#+S# descriptor
+#                         BO, or 0 if no texture bound; v3.2 TS.3 —
+#                         bind_for_sample stashes it, render_pass_draw
+#                         emits SET_SH_REG of the PS USER_DATA from it)
 var NATIVE_PASS_FIELD_CTX         = 0;
 var NATIVE_PASS_FIELD_RESERVED    = 8;
 var NATIVE_PASS_FIELD_RT          = 16;
 var NATIVE_PASS_FIELD_CLEAR_COLOR = 24;
-var NATIVE_PASS_STRUCT_SIZE       = 32;
+var NATIVE_PASS_FIELD_TEX_DESC_VA = 32;   # v3.2 TS.3
+var NATIVE_PASS_STRUCT_SIZE       = 40;
 
 # --- backend_native_kms.cyr ---
 
@@ -12231,6 +12273,37 @@ fn sampler_descriptor(preset): i64 {
     return desc;
 }
 
+# ================================================================
+# v3.2 TS.3 — public sampler intent (both backends)
+# ================================================================
+# gpu_sampler_create returns a backend-agnostic sampler-intent HANDLE that
+# packs the filter + address mode (NATIVE_SAMP_FILTER_* / NATIVE_SAMP_ADDR_*).
+# It is NOT a backend object: the actual GFX9 S# (native) / WGPUSampler (wgpu)
+# is materialized at gpu_render_pass_bind_texture time from this intent (TS.5),
+# so there is no per-sampler backend slot. A non-zero tag in the high bits
+# means a (point, clamp) = (0, 0) intent is never mistaken for a 0 failure.
+# Returns 0 on null ctx or an out-of-range filter/addr.
+var MABDA_SAMPLER_TAG = 0x5A4D0000;   # 'ZM' marker in bits [31:16]
+
+fn gpu_sampler_create(ctx, filter, addr): i64 {
+    if (ctx == 0) { return 0; }
+    if (filter != NATIVE_SAMP_FILTER_POINT) {
+        if (filter != NATIVE_SAMP_FILTER_BILINEAR) { return 0; }
+    }
+    if (addr != NATIVE_SAMP_ADDR_CLAMP) {
+        if (addr != NATIVE_SAMP_ADDR_WRAP) { return 0; }
+    }
+    return MABDA_SAMPLER_TAG | ((addr & 0xFF) << 8) | (filter & 0xFF);
+}
+
+# Unpack a gpu_sampler_create handle (used by the bind_for_sample fillers).
+fn gpu_sampler_filter(s): i64 { return s & 0xFF; }
+fn gpu_sampler_addr(s): i64 { return (s >> 8) & 0xFF; }
+fn gpu_sampler_is_valid(s): i64 {
+    if ((s & 0xFFFF0000) == MABDA_SAMPLER_TAG) { return 1; }
+    return 0;
+}
+
 # --- depth.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
@@ -12720,6 +12793,26 @@ fn gpu_texture_create_2d(ctx, width, height, fmt): i64 {
     if (mabda_texfmt_block_bytes(fmt) == 0) { return 0; }   # unknown format id
     var slot = backend_get_slot(gpu_ctx_backend(ctx),
     BACKEND_SLOT_TEXTURE_CREATE_2D_FMT);
+    return fncall4(slot, ctx, width, height, fmt);
+}
+
+# v3.2 TS.3 — create a 2D texture that can be SAMPLED in a fragment shader
+# (not just stored). Same validation as gpu_texture_create_2d; routes through
+# the sampleable backend slot. On native: a tiled-or-linear BO + a T#/S#
+# descriptor BO (TS.5/TS.7). On wgpu: a TEXTURE_BINDING view. Returns an
+# opaque tex_ptr, or 0 on invalid dims/format or an unfilled backend slot
+# (the slot's fillers land in TS.5, so this returns 0 until then).
+fn gpu_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    if (mabda_texfmt_block_bytes(fmt) == 0) { return 0; }   # unknown format id
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE);
+    if (slot == 0) { return 0; }
     return fncall4(slot, ctx, width, height, fmt);
 }
 
@@ -13448,6 +13541,23 @@ fn gpu_render_pass_end(ctx, pass): i64 {
     var slot = backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END);
     if (slot == 0) { return 0; }
     return fncall2(slot, ctx, pass);
+}
+
+# v3.2 TS.3 — bind a sampleable texture + sampler into a render pass so the
+# bound pipeline's FS samples it. `tex` is from gpu_texture_create_2d_sampleable,
+# `sampler` from gpu_sampler_create. Routes through the bind_for_sample slot:
+# native stashes the tex's T#/S# VA on the pass (NATIVE_PASS_FIELD_TEX_DESC_VA)
+# for the next draw's SET_SH_REG; wgpu builds the bind group. Returns
+# 0|GPU_ERR_* (GPU_ERR_NOT_IMPLEMENTED until the TS.5 fillers land).
+fn gpu_render_pass_bind_texture(ctx, pass, tex, sampler): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0)  { return GPU_ERR_TEXTURE; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0)    { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }
+    return fncall4(slot, ctx, pass, tex, sampler);
 }
 
 # --- render_graph.cyr ---

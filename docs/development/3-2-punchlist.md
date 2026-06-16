@@ -163,13 +163,19 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   TYPE=2D, PITCH, MAX_MIP) pinned vs gfx9.json `SQ_IMG_RSRC_WORD0..6` +
   `SQ_SEL_XYZW01`/`SQ_RSRC_IMG_TYPE`. Bit positions authoritative; value
   semantics (linear PITCH alignment, MIN_LOD) HW-cross-checked at TS.5.
-- [~] **TS.2** — GFX9 S# sampler-descriptor builder **done**
-  (`native_gfx9_sampler_descriptor`, 4 dwords pinned vs gfx9.json
-  `SQ_IMG_SAMP_WORD0..3` + `SQ_TEX_*` enums; point/clamp + bilinear/wrap) +
-  `NATIVE_SAMP_*` intents. **Remaining (→ TS.3):** `gpu_sampler_create`
-  dispatcher + wgpu `WGPUSampler` filler.
-- [ ] **TS.3** — Struct + slot growth (`NativeTexture` 48→64; slots
-  `CREATE_2D_SAMPLEABLE` + `BIND_FOR_SAMPLE`; `BACKEND_SIZE`→280; extend walk).
+- [x] **TS.2** — GFX9 S# sampler-descriptor builder
+  (`native_gfx9_sampler_descriptor`, pinned vs gfx9.json) + `NATIVE_SAMP_*`
+  intents + **`gpu_sampler_create`** (backend-agnostic packed intent handle;
+  the WGPUSampler / S# materialize at bind time, TS.5 — so no per-sampler
+  slot, keeping the 2-slot plan). wgpu `WGPUSampler` build folds into the
+  TS.5 wgpu `bind_for_sample`.
+- [~] **TS.3** — struct + slot scaffolding **done**: `NativeTexture` 48→64
+  (sw_mode@48, t_va@52 + accessors); NativePass 32→40 (tex_desc_va@32); slots
+  `CREATE_2D_SAMPLEABLE`@264 + `BIND_FOR_SAMPLE`@272, `BACKEND_SIZE` 264→280,
+  `BACKEND_SAMPLE_SLOTS_*` range; public `gpu_texture_create_2d_sampleable` +
+  `gpu_render_pass_bind_texture` dispatchers (mock-tested). **Remaining (→ TS.5):**
+  the `backend_is_complete` walk over 264..280 activates once both backends
+  fill the slots ("activate when both fill").
 - [ ] **TS.4** — Textured FS + UV-export VS in hand-authored GFX9 ISA
   (`image_load` oracle then `image_sample`; SPI input wiring); llvm-mc
   byte-pinned.
