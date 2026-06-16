@@ -8,7 +8,7 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.2.3 (dual backend — wgpu + native AMD; see
+Version: 3.2.4 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -18,9 +18,11 @@ both backends (native SDMA on a real DMA ring with >4 MiB chaining; wgpu
 copy_buffer_to_buffer). 3.2.2 adds native RGBA8 texture *sampling* (GFX9 T#/S#
 + a textured FS). 3.2.3 completes native sampling: **block-compressed (BC1/BC3/
 BC4/BC5/BC7) sampling** via SDMA SW_64KB_S tiling + the image_sample FS, and
-**bilinear / scaled** filtering — all HW-verified pixel-exact on Cezanne.
-ETC2/ASTC are HW-blocked on AMD (no decode unit). HW-verified on Cezanne. See
-the CHANGELOG.)
+**bilinear / scaled** filtering — all HW-verified pixel-exact on Cezanne
+(ETC2/ASTC are HW-blocked on AMD). 3.2.4 adds **SPIR-V shader ingestion** on
+wgpu — a SPIR-V binary is a peer frontend to WGSL (kind-tagged shader-create +
+SPIR-V validation + source-kind-aware cache), HW-verified byte-identical to WGSL.
+See the CHANGELOG.)
 
 ## Features
 

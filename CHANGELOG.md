@@ -18,6 +18,79 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.4] — 2026-06-16
+
+**SPIR-V shader ingestion on wgpu (Phase S).** The byte-polymorphic shader
+boundary gains an explicit source-KIND tag, so a consumer can hand mabda a
+pre-assembled **SPIR-V** binary (`u32` word stream, magic `0x07230203`) and the
+wgpu backend creates a shader module from it — a peer frontend to WGSL, which
+stays the default. HW-verified on a wgpu-native box: a SPIR-V module renders
+**byte-identical** to the equivalent WGSL (`spirv_e2e` cross-source identity).
+Native SPIR-V→GFX9 lowering is Phase N (fail-loud here). Toolchain
+**6.2.12 → 6.2.14**. CPU suite 2882 → **2908** assertions.
+
+### Added
+
+- **`gpu_shader_module_create_spirv(ctx, words_ptr, byte_len)`** — create a
+  shader module from a SPIR-V binary (wgpu). `byte_len = word_count * 4`.
+- **`ShaderSourceKind`** enum (`SHADER_SRC_WGSL`/`SPIRV`/`GFX9`) — the explicit
+  tag the shader-create slot now carries (the bytes' meaning is no longer purely
+  the bound backend, since wgpu accepts both WGSL and SPIR-V).
+- `wgpu_shader_source_spirv` (the `WGPUShaderSourceSPIRV` descriptor, codeSize in
+  **words**) + `WGPU_STYPE_SHADER_SOURCE_SPIRV` + `_spirv_validate`
+  (magic/align/bound + a 16 Mi-word cap; rejects byte-swapped binaries) — all
+  pinned vs webgpu.h v29.
+- Source-kind-aware shader cache: `_shader_hash_n` (length-explicit — SPIR-V has
+  embedded NULs — with the kind folded into the seed; WGSL is the identity fold,
+  so legacy keys are byte-stable) + `shader_cache_{get,set,get_or_compile}_spirv`.
+- `deps/wgpu_main.c` requests the `ShaderSourceSPIRV` instance feature (the
+  reference launcher; see Migration).
+- `programs/spirv_e2e.cyr` + `make test-spirv-e2e` — the HW cross-source-identity
+  e2e (a glslang+spirv-link, spirv-val-clean fullscreen-triangle module).
+
+### Changed
+
+- **Toolchain pin 6.2.12 → 6.2.14.**
+- The shader-create backend slot widened `(ctx, bytes, n, kind)` (fncall3→4) —
+  **no slot-offset / `BACKEND_SIZE` change**, the completeness walk is untouched.
+  `gpu_shader_module_create` keeps its public signature and forwards the bound
+  backend's default kind (WGSL on wgpu, GFX9 on native) — no consumer call-site
+  churn.
+
+### Fixed
+
+- **Validate-before-hash** in `shader_cache_get_or_compile_spirv` — never key the
+  cache on a malformed SPIR-V blob (defense-in-depth; Phase S review).
+
+### Breaking / Migration
+
+- **Consumers that copy `deps/wgpu_main.c` must carry the 4-line instance-feature
+  edit** (`requiredFeatureCount=1` + `requiredFeatures = {ShaderSourceSPIRV}`) to
+  use SPIR-V shaders. WGSL is unaffected. mabda cannot detect a feature-less
+  instance before the create call, so a SPIR-V `createShaderModule` against an
+  un-updated launcher returns `0` (the fail-loud null) — `gpu_shader_module_create_spirv`
+  surfaces that as a clean 0, not a crash.
+
+### Security
+
+- One adversarial review workflow over the Phase S diff (FFI descriptor offsets +
+  `_spirv_validate` completeness + the slot/kind/cache integration) — **0 CONFIRMED
+  findings** (one LOW defense-in-depth note on the dead-in-tree cache path,
+  dismissed; the validate-before-hash reorder lands anyway). SPIR-V binaries are
+  structurally validated before crossing the FFI; the embedded test binary is
+  `spirv-val`-clean. `docs/audit/2026-06-16-phaseS-audit.md`.
+
+### Metrics
+
+- CPU assertions 2882 → **2908**. Toolchain 6.2.12 → 6.2.14. `Backend` unchanged
+  (280 B — the slot widened in signature only, no new offset).
+
+### Next
+
+- **Phase N (3.2.5–3.2.9)** — native SPIR-V→GFX9 ISA compiler (encoder-lift +
+  byte-oracle → MIR → regalloc → kernels). Then Phase F (f64), Phase R
+  (render-graph multi-queue). Plus the TS follow-ons (from_context caps, BC6H).
+
 ## [3.2.3] — 2026-06-16
 
 **Native compressed (BC) + filtered texture sampling (Phase TS.6–8).** Completes

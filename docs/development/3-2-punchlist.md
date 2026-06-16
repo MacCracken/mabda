@@ -399,7 +399,12 @@ byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
   **HW-verified on the wgpu-native box** — exercises S.2 (slot+entry) + S.4
   (instance feature) end-to-end. (Fullscreen triangle → whole RT red, so the
   identity holds regardless of the WGSL-vs-Vulkan Y convention.)
-- [ ] **S.6** — **Cut 3.2.4.**
+- [x] **S.6** — **Cut 3.2.4** (2026-06-16). VERSION/cyrius.cyml/CHANGELOG/README/
+  CLAUDE.md → 3.2.4; toolchain pinned `6.2.14`; Phase S audit filed
+  (`docs/audit/2026-06-16-phaseS-audit.md`, 0 confirmed / 1 LOW dismissed); dist
+  regenerated idempotent (`b894948`); `version-check.sh` consistent. Full gate
+  green: smoke build OK, **2908/0** across 12 tcyr suites, 0 lint warnings, 0 fmt
+  drift (file-first `cyrius fmt <f> --check`).
 
 ---
 
