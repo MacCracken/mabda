@@ -196,13 +196,17 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `_backend_wgpu_texture_bind_for_sample` (stashes tex/sampler on the wgpu
   pass, grown 32→40); both wgpu slots installed; **`backend_is_complete` walk
   over 264..280 ACTIVATED** (9th range, both backends complete). Sequencing
-  chosen 2026-06-15: "3, 2, 1". **(2) wgpu sample path — foundation done:**
+  chosen 2026-06-15: "3, 2, 1". **(2) wgpu sample path — DONE + HW-verified.**
   `wgpu_texture_bind_group_descriptor` (bind_group.cyr) +
-  `wgpu_sampler_descriptor_from_intent` (sampler.cyr), pinned vs webgpu.h v29;
-  the rest of the FFI (BGL/pipeline-layout/bind-group/sampler/set_bind_group)
-  already present. *(2) remaining:* WGSL textured shader + BGL/pipeline-layout
-  /textured-pipeline + wire bind-group-build+set_bind_group into the wgpu draw
-  + `wgpu_texture_sample_e2e.cyr` (runnable — wgpu-native present on this box).
+  `wgpu_sampler_descriptor_from_intent` (sampler.cyr) pinned vs webgpu.h v29;
+  added `wgpu_render_pipeline_get_bind_group_layout` FFI (fp65 + C-shim
+  fn_table[65], FN_COUNT 65→66); `_backend_wgpu_render_pass_draw` gained a
+  textured branch (build sampler+bind-group from the pipeline's auto-BGL +
+  `set_bind_group`); `programs/wgpu_texture_sample_e2e.cyr` **passes on the
+  Cezanne** (RT == sampled color via the public API). Adversarial review
+  (`review-wgpu-sample-ts5`, 4 confirmed) → fixed: per-draw sampler/bind-group
+  /BGL **handle leak** (release after set_bind_group; HIGH) + null-guards on
+  the create chain (LOW). No regression (render_e2e still green).
   **Remaining:** (1) the native PM4 render surgery — textured-FS pipeline (image_load),
   `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA `SET_SH_REG`, RSRC1 high-water —
   wired into `render_pass_draw` + `native_texture_sample_e2e.cyr` + on-device

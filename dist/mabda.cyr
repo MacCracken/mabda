@@ -2028,6 +2028,9 @@ fn wgpu_device_create_compute_pipeline(device, desc): i64 { return fncall2(_fp(1
 fn wgpu_device_create_bind_group_layout(device, desc): i64 { return fncall2(_fp(18), device, desc); }
 fn wgpu_device_create_pipeline_layout(device, desc): i64 { return fncall2(_fp(19), device, desc); }
 fn wgpu_device_create_bind_group(device, desc): i64 { return fncall2(_fp(20), device, desc); }
+# v3.2 TS.5 — fetch a render pipeline's auto-generated bind-group layout for
+# group `idx` (the textured wgpu draw builds its bind group against it).
+fn wgpu_render_pipeline_get_bind_group_layout(pipe, idx): i64 { return fncall2(_fp(65), pipe, idx); }
 fn wgpu_shader_module_release(m): i64 { fncall1(_fp(21), m); return 0; }
 fn wgpu_compute_pipeline_release(p): i64 { fncall1(_fp(22), p); return 0; }
 fn wgpu_bind_group_release(bg): i64 { fncall1(_fp(23), bg); return 0; }
@@ -3365,6 +3368,37 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (pass_enc == 0)    { return GPU_ERR_OTHER; }
     if (pipe_handle == 0) { return GPU_ERR_OTHER; }
     wgpu_render_pass_encoder_set_pipeline(pass_enc, pipe_handle);
+    # v3.2 TS.5 — if a sampleable texture was bound (gpu_render_pass_bind_texture
+    # stashed it at +24, its sampler intent at +32), build + set its bind group
+    # at group 0 from the pipeline's auto-generated BGL. The bound pipeline must
+    # be a textured pipeline (WGSL @group(0): texture@0, sampler@1).
+    var bound_tex = load64(pass + 24);
+    if (bound_tex != 0) {
+        var view = load64(bound_tex + 8);   # wgpu tex struct: view @ +8
+        if (view == 0) { return GPU_ERR_TEXTURE; }
+        var device = gpu_ctx_device(ctx);
+        var intent = load64(pass + 32);
+        var sdesc = wgpu_sampler_descriptor_from_intent(
+        gpu_sampler_filter(intent), gpu_sampler_addr(intent));
+        var sampler = wgpu_device_create_sampler(device, sdesc);
+        if (sampler == 0) { return GPU_ERR_OTHER; }
+        var bgl = wgpu_render_pipeline_get_bind_group_layout(pipe_handle, 0);
+        if (bgl == 0) { wgpu_sampler_release(sampler); return GPU_ERR_OTHER; }
+        var bgdesc = wgpu_texture_bind_group_descriptor(bgl, view, sampler);
+        var bg = wgpu_device_create_bind_group(device, bgdesc);
+        if (bg == 0) {
+            wgpu_bind_group_layout_release(bgl);
+            wgpu_sampler_release(sampler);
+            return GPU_ERR_OTHER;
+        }
+        wgpu_render_pass_encoder_set_bind_group(pass_enc, 0, bg, 0, 0);
+        # Audit 2026-06-15 HIGH — release our refs now: wgpu-native retains its
+        # own refs to the recorded bind group (and the group AddRef'd the
+        # view + sampler), so dropping ours here avoids a per-draw handle leak.
+        wgpu_bind_group_release(bg);
+        wgpu_bind_group_layout_release(bgl);
+        wgpu_sampler_release(sampler);
+    }
     wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
     return 0;
 }

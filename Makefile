@@ -176,6 +176,16 @@ build/wgpu_transfer_copy_e2e: build/wgpu_transfer_copy_e2e.o deps/wgpu_main.o
 test-wgpu-transfer-copy-e2e: build/wgpu_transfer_copy_e2e
 	./build/wgpu_transfer_copy_e2e
 
+# v3.2 TS.5 — wgpu bind+sample render path: create a sampleable texture, bind
+# + sample it across a fullscreen quad, verify the RT is the sampled color.
+build/wgpu_texture_sample_e2e: build/wgpu_texture_sample_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_texture_sample_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-texture-sample-e2e
+test-wgpu-texture-sample-e2e: build/wgpu_texture_sample_e2e
+	./build/wgpu_texture_sample_e2e
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
