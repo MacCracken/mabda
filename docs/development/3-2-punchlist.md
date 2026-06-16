@@ -150,10 +150,22 @@ compressed (tiled + swizzle + T#/S#); the tiling swizzle is the
 high-risk half, sequenced last. **This is the work I wrongly punted to
 "v4-scale"; it is in the arc.**
 
-- [ ] **TS.1** — GFX9 T# image-descriptor builder (256-bit) +
-  format→IMG-format table; every dword cited vs Mesa gfx9.json / radv.
-- [ ] **TS.2** — GFX9 S# sampler-descriptor builder (128-bit) +
-  `gpu_sampler_create` + wgpu `WGPUSampler` filler (point/clamp first).
+> **Sequencing (2026-06-15, maintainer):** "3 then 1, you are on HW" — do
+> the lower-risk S#/format-table pieces first, then the T#; descriptor bytes
+> sourced from gfx9.json (via the GitLab API, see memory) + HW-verified at
+> TS.5 on the Cezanne. Builders land as pure CPU-pinned byte-writers; the
+> `gpu_sampler_create` dispatcher + wgpu filler + the two slots fold into TS.3.
+
+- [~] **TS.1** — format→IMG-format table **done** (`native_gfx9_texfmt_to_img_format`
+  + `native_img_data_format`/`_num_format`, every row pinned vs gfx9.json
+  `IMG_DATA_FORMAT`/`IMG_NUM_FORMAT`). **Remaining:** the 256-bit T#
+  image-descriptor builder (`SQ_IMG_RSRC_WORD1..6` layout already pulled from
+  gfx9.json) — NEXT.
+- [~] **TS.2** — GFX9 S# sampler-descriptor builder **done**
+  (`native_gfx9_sampler_descriptor`, 4 dwords pinned vs gfx9.json
+  `SQ_IMG_SAMP_WORD0..3` + `SQ_TEX_*` enums; point/clamp + bilinear/wrap) +
+  `NATIVE_SAMP_*` intents. **Remaining (→ TS.3):** `gpu_sampler_create`
+  dispatcher + wgpu `WGPUSampler` filler.
 - [ ] **TS.3** — Struct + slot growth (`NativeTexture` 48→64; slots
   `CREATE_2D_SAMPLEABLE` + `BIND_FOR_SAMPLE`; `BACKEND_SIZE`→280; extend walk).
 - [ ] **TS.4** — Textured FS + UV-export VS in hand-authored GFX9 ISA

@@ -5813,6 +5813,132 @@ var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x00028028;
 # enum was not in the gfx9.json snapshot, so flag for HW verify.
 var GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000;
 
+# ================================================================
+# v3.2 TS.2 — GFX9 sampler (S#) descriptor + format->IMG table
+# ================================================================
+# Re-introduces the sampler/image-format descriptor infra the v3.1 mipmap
+# PIVOT deleted, so native AMD can SAMPLE textures (Phase TS). Pure byte
+# builders + a format table — no HW here; the bytes are HW-verified at the
+# TS.5 sampling MVP. Every field/enum value is cited from the authoritative
+# Mesa register DB src/amd/registers/gfx9.json (per
+# feedback_gfx9_register_authoritative_source): `enums` for the value
+# tables, `register_types` for the bit layouts.
+
+# --- GFX9 image data/num-format enum values (gfx9.json enums
+#     IMG_DATA_FORMAT / IMG_NUM_FORMAT). ---
+var GFX9_IMG_DATA_FORMAT_8_8_8_8   = 10;
+var GFX9_IMG_DATA_FORMAT_ETC2_RGB  = 24;
+var GFX9_IMG_DATA_FORMAT_ETC2_RGBA = 25;
+var GFX9_IMG_DATA_FORMAT_BC1       = 35;
+var GFX9_IMG_DATA_FORMAT_BC3       = 37;
+var GFX9_IMG_DATA_FORMAT_BC4       = 38;
+var GFX9_IMG_DATA_FORMAT_BC5       = 39;
+var GFX9_IMG_DATA_FORMAT_BC6       = 40;
+var GFX9_IMG_DATA_FORMAT_BC7       = 41;
+var GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR = 46;
+var GFX9_IMG_NUM_FORMAT_UNORM = 0;
+var GFX9_IMG_NUM_FORMAT_FLOAT = 7;
+var GFX9_IMG_NUM_FORMAT_SRGB  = 9;
+
+# Map a MABDA_TEXFMT_* id to a packed GFX9 (data_format, num_format) pair:
+# `(data_format << 8) | num_format`. Returns -1 for an unsupported id (the
+# T# builder / create rejects). The native T# analog of mabda_texfmt_to_wgpu.
+# BC6H is unsigned-float HDR (NUM_FORMAT_FLOAT); the rest decode UNORM. The
+# three ASTC ids all map to GFX9's single ASTC_2D_LDR data-format — ASTC
+# per-block-size + HW-decode presence on Cezanne is a TS.8 verification item.
+fn native_gfx9_texfmt_to_img_format(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) {
+        return (GFX9_IMG_DATA_FORMAT_8_8_8_8 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC1) {
+        return (GFX9_IMG_DATA_FORMAT_BC1 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC3) {
+        return (GFX9_IMG_DATA_FORMAT_BC3 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC4) {
+        return (GFX9_IMG_DATA_FORMAT_BC4 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC5) {
+        return (GFX9_IMG_DATA_FORMAT_BC5 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC6H) {
+        return (GFX9_IMG_DATA_FORMAT_BC6 << 8) | GFX9_IMG_NUM_FORMAT_FLOAT;
+    }
+    if (fmt == MABDA_TEXFMT_BC7) {
+        return (GFX9_IMG_DATA_FORMAT_BC7 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8) {
+        return (GFX9_IMG_DATA_FORMAT_ETC2_RGB << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ETC2_RGBA8) {
+        return (GFX9_IMG_DATA_FORMAT_ETC2_RGBA << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_4X4) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    return 0 - 1;
+}
+
+# Unpack the (data_format, num_format) pair from native_gfx9_texfmt_to_img_format.
+# DATA_FORMAT is the 6-bit IMG field, NUM_FORMAT the 4-bit field.
+fn native_img_data_format(packed): i64 { return (packed >> 8) & 0x3F; }
+fn native_img_num_format(packed): i64 { return packed & 0xF; }
+
+# --- mabda sampler intent (backend-agnostic). The native builder maps
+#     these to GFX9 enums; the wgpu filler (TS.3) to WGPU{Filter,Address}Mode. ---
+var NATIVE_SAMP_FILTER_POINT    = 0;
+var NATIVE_SAMP_FILTER_BILINEAR = 1;
+var NATIVE_SAMP_ADDR_CLAMP      = 0;   # clamp-to-edge
+var NATIVE_SAMP_ADDR_WRAP       = 1;   # repeat
+
+# --- GFX9 sampler-field enum values (gfx9.json enums SQ_TEX_CLAMP /
+#     SQ_TEX_XY_FILTER / SQ_TEX_{Z,MIP}_FILTER / SQ_IMG_FILTER_TYPE). ---
+var GFX9_SQ_TEX_WRAP               = 0;   # SQ_TEX_CLAMP.SQ_TEX_WRAP
+var GFX9_SQ_TEX_CLAMP_LAST_TEXEL   = 2;   # clamp-to-edge
+var GFX9_SQ_TEX_XY_FILTER_POINT    = 0;
+var GFX9_SQ_TEX_XY_FILTER_BILINEAR = 1;
+var GFX9_SQ_TEX_Z_FILTER_NONE      = 0;
+var GFX9_SQ_TEX_MIP_FILTER_NONE    = 0;
+var GFX9_SQ_IMG_FILTER_MODE_BLEND  = 0;
+
+# Build a 128-bit (4-dword) GFX9 S# sampler descriptor into buf at pos.
+# Bit layout cited from gfx9.json register_types SQ_IMG_SAMP_WORD0..3:
+#   W0: CLAMP_X[0:2] CLAMP_Y[3:5] CLAMP_Z[6:8] FILTER_MODE[29:30]
+#   W1: MIN_LOD[0:11] MAX_LOD[12:23]
+#   W2: XY_MAG_FILTER[20:21] XY_MIN_FILTER[22:23] Z_FILTER[24:25] MIP_FILTER[26:27]
+#   W3: BORDER_COLOR_PTR[0:11] BORDER_COLOR_TYPE[30:31]
+# `filter`/`addr` are NATIVE_SAMP_* intents. point+clamp is the MVP sampler
+# (deterministic, CPU-verifiable); bilinear/wrap are field swaps. MAX_LOD =
+# 0xFFF (U4.8 max) so a mipped texture can sample every level; MIP_FILTER =
+# NONE keeps single-level sampling deterministic. FILTER_MODE = BLEND
+# (normal, non-min/max). Returns pos + 16.  @internal
+fn native_gfx9_sampler_descriptor(buf, pos, filter, addr): i64 {
+    var clamp = GFX9_SQ_TEX_WRAP;
+    if (addr == NATIVE_SAMP_ADDR_CLAMP) { clamp = GFX9_SQ_TEX_CLAMP_LAST_TEXEL; }
+    var xy = GFX9_SQ_TEX_XY_FILTER_POINT;
+    if (filter == NATIVE_SAMP_FILTER_BILINEAR) { xy = GFX9_SQ_TEX_XY_FILTER_BILINEAR; }
+
+    var w0 = (clamp & 0x7) | ((clamp & 0x7) << 3) | ((clamp & 0x7) << 6);
+    w0 = w0 | ((GFX9_SQ_IMG_FILTER_MODE_BLEND & 0x3) << 29);
+    var w1 = (0 & 0xFFF) | ((0xFFF & 0xFFF) << 12);   # MIN_LOD=0, MAX_LOD=max
+    var w2 = ((xy & 0x3) << 20) | ((xy & 0x3) << 22);
+    w2 = w2 | ((GFX9_SQ_TEX_Z_FILTER_NONE & 0x3) << 24);
+    w2 = w2 | ((GFX9_SQ_TEX_MIP_FILTER_NONE & 0x3) << 26);
+    var w3 = 0;
+    store32(buf + pos +  0, w0);
+    store32(buf + pos +  4, w1);
+    store32(buf + pos +  8, w2);
+    store32(buf + pos + 12, w3);
+    return pos + 16;
+}
+
 # --- backend_native_pm4.cyr ---
 
 # @internal — native GPU backend, PM4 packet builders + composers
