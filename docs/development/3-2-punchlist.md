@@ -248,19 +248,34 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   decode.
 - [~] **TS.7** — **BC1/BC7 compressed sampling on Cezanne** (delivered in
   sub-bites). **TS.7a done:** `native_gfx9_shader_textured_sample_fs` — the
-  `image_sample` (BC-decoding) FS (llvm-mc + byte-pinned + disasm round-trip);
-  reuses the screen-pos oracle but divides by texture dims (reciprocals in
-  user-SGPRs s2/s3) for normalized coords; loads T# (s[0:7]) + S# (s[8:11])
-  from the descriptor BO; `GFX9_PS_PGM_RSRC2_SAMPLE`=0x8 (USER_SGPR=4).
+  `image_sample` (BC-decoding) FS (llvm-mc + byte-pinned + disasm round-trip).
   **TS.7b done:** `native_tiled_geometry` — SW_64KB_S 2D block dims + aligned
   pitch (epitch) + 64 KiB-aligned BO size, sourced from addrlib
   (`Block256_2d`<<4 / `ComputeThinBlockDimension`; BC1 128×64, RGBA8 128×128,
-  BC7 64×64 blocks), CPU-pinned. **Remaining:** (c) wire it — tiled
-  `create_sampleable` (geometry-sized BO + BC T# with SW_64KB_S + epitch) +
-  write(L2T)/read(T2L) via the TS.6 packet + the sample-FS draw override
-  (RSRC2=0x8, USER_DATA rcp_w/rcp_h) + `native_compressed_sample_e2e.cyr` (BC1
-  sample vs CPU decode) + on-device verification (where SDMA tiling meets the
-  TA); flip native BC cap bit to 1.
+  BC7 64×64 blocks), CPU-pinned. **TS.7c-1 done:** switched the sample FS + the
+  default S# to **unnormalized** coords (S# `FORCE_UNNORMALIZED`); the FS now
+  feeds the fragment position straight to `image_sample` (no rcp / UV divide),
+  giving it the *same 2-user-SGPR ABI as the image_load FS* — so the TS.5 draw
+  override is reused unchanged (no per-format draw path). FS is 112 B;
+  `GFX9_PS_PGM_RSRC2_SAMPLE` removed. **TS.7c-2 done:** tiled
+  `create_sampleable` foundation — `native_gfx9_image_descriptor` gained an
+  explicit `epitch` param; `GFX9_SW_MODE_64KB_S`(9); `native_tex_tiled_params`
+  (compressed fmt → block geometry); the create compressed branch builds a
+  geometry-sized SW_64KB_S surface + BC T# (epitch = awb-1) + unnorm S#. A
+  native backend caps gate (`NATIVE_TEXCOMP_SUPPORTED`, =0) keeps compressed
+  `create` returning 0 (pre-ioctl) until write + HW verify land — no dead-end
+  resource; mirrors the wgpu backend caps guard. write/read reject a tiled tex
+  (`GPU_ERR_TEXTURE`) until TS.7c-3. **Remaining:**
+  - **(TS.7c-3)** write(L2T)/read(T2L) via the TS.6 COPY_TILED packet —
+    **MUST derive epitch from `native_tex_tiled_params` (awb-1), the SAME source
+    as the T#** (the TS.6 round-trip program uses `epitch=W-1` in *blocks*, which
+    only coincides with awb-1 on a block_w-aligned surface — do NOT copy it for a
+    real write or a non-aligned BC surface will sample garbage). Remove the
+    tiled write/read guard. Add a non-block_w-aligned BC1 fixture (e.g. 256×256
+    texels = 64 blocks, awb=128) so the awb-vs-wb divergence is exercised.
+  - **(TS.7c-4)** `native_compressed_sample_e2e.cyr` (BC1 sample vs CPU decode)
+    + on-device verification (where SDMA tiling meets the TA); then flip
+    `NATIVE_TEXCOMP_SUPPORTED` → `MABDA_TEXCOMP_BC` (the native BC cap bit).
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
   limitation**; cut the TS minors.

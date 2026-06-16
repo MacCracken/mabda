@@ -1204,6 +1204,10 @@ var GFX9_SQ_SEL_Z       = 6;
 var GFX9_SQ_SEL_W       = 7;
 var GFX9_SQ_RSRC_IMG_2D = 9;
 var GFX9_SW_MODE_LINEAR = 0;
+# ADDR_SW_64KB_S — the 64 KiB standard-swizzle tiled mode used for compressed
+# sampling (TS.7c). Value 9 matches the swizzle_mode the SDMA COPY_TILED packet
+# (TS.6) tiles with, so the SDMA-written layout and the TA's read agree.
+var GFX9_SW_MODE_64KB_S = 9;
 
 # Build a 256-bit (8-dword) GFX9 T# image descriptor into buf at pos.
 # base_va: GPU VA of the surface (canonical-high; the 48-bit form is stored
@@ -1218,15 +1222,17 @@ var GFX9_SW_MODE_LINEAR = 0;
 #   W3: DST_SEL_X[0:2] Y[3:5] Z[6:8] W[9:11] (identity RGBA = X/Y/Z/W)
 #       BASE_LEVEL[12:15]=0  LAST_LEVEL[16:19]=mips-1  SW_MODE[20:24]
 #       TYPE[28:31]=SQ_RSRC_IMG_2D
-#   W4: DEPTH[0:12]=0  PITCH[13:28]   BC_SWIZZLE[29:31]=0
-#       (PITCH = w-1 for LINEAR; tiled derives its own row pitch, left 0)
+#   W4: DEPTH[0:12]=0  PITCH[13:28]=epitch   BC_SWIZZLE[29:31]=0
+#       (epitch = w-1 for LINEAR; for a SW_64KB_S tiled compressed surface it
+#        is the tile-aligned block pitch - 1 = awb-1, matching the SDMA
+#        COPY_TILED epitch the surface was tiled with — TS.7c)
 #   W5: MAX_MIP[28:31]=mips-1     W6/W7: 0 (no DCC / metadata)
 # Returns pos + 32, or -1 if fmt is unsupported / dims invalid (caller
 # rejects). NOTE: bit POSITIONS are gfx9.json-authoritative; field VALUE
-# semantics (linear PITCH alignment, MIN_LOD/MAX_MIP) are HW-cross-checked
-# at the TS.5 sampling MVP on Cezanne. @internal
+# semantics (PITCH alignment, MIN_LOD/MAX_MIP) are HW-cross-checked at the
+# TS.5 (linear) / TS.7c (tiled) sampling e2e on Cezanne. @internal
 fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
-fmt, sw_mode, mip_count): i64 {
+fmt, sw_mode, mip_count, epitch): i64 {
     if (width <= 0)  { return 0 - 1; }
     if (height <= 0) { return 0 - 1; }
     var packed = native_gfx9_texfmt_to_img_format(fmt);
@@ -1249,10 +1255,8 @@ fmt, sw_mode, mip_count): i64 {
     w3 = w3 | ((GFX9_SQ_SEL_Z & 0x7) << 6) | ((GFX9_SQ_SEL_W & 0x7) << 9);
     w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
     w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
-    # W4: PITCH[13:28] = w-1 for LINEAR (tiled derives its own).
-    var pitch = 0;
-    if (sw_mode == GFX9_SW_MODE_LINEAR) { pitch = width - 1; }
-    var w4 = (pitch & 0xFFFF) << 13;
+    # W4: PITCH[13:28] = epitch (caller supplies: w-1 for LINEAR, awb-1 tiled).
+    var w4 = (epitch & 0xFFFF) << 13;
     # W5: MAX_MIP[28:31].
     var w5 = (last_level & 0xF) << 28;
     store32(buf + pos +  0, w0);
