@@ -190,12 +190,17 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   (linear surface BO + a descriptor BO carrying the T# at +0 and a default
   point/clamp S# at +32; descriptor BO bump-leaked per the create-once model)
   + `_backend_native_texture_bind_for_sample` (stashes the descriptor VA on
-  the pass); both native slots installed + CPU-tested. **Remaining:** (b) wgpu
-  `create_sampleable`/`bind_for_sample` fillers + activate the
-  `backend_is_complete` walk over 264..280; (c) the PM4 render surgery —
-  textured-FS pipeline (image_load), `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA
-  `SET_SH_REG` of the descriptor VA, RSRC1 high-water — wired into
-  `render_pass_draw`; (d) `programs/native_texture_sample_e2e.cyr` + on-device
+  the pass); both native slots installed + CPU-tested. **TS.5b done** (minimal
+  wgpu + walk): `_backend_wgpu_texture_create_2d_sampleable` (real — the
+  fmt-create already makes a TEXTURE_BINDING texture + view) +
+  `_backend_wgpu_texture_bind_for_sample` (stashes tex/sampler on the wgpu
+  pass, grown 32→40); both wgpu slots installed; **`backend_is_complete` walk
+  over 264..280 ACTIVATED** (9th range, both backends complete). Sequencing
+  chosen 2026-06-15: "3, 2, 1". **Remaining:** (2) the wgpu sample render path
+  (BGL + textured pipeline + bind group + `set_bind_group` + WGSL shader +
+  e2e); (1) the native PM4 render surgery — textured-FS pipeline (image_load),
+  `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA `SET_SH_REG`, RSRC1 high-water —
+  wired into `render_pass_draw` + `native_texture_sample_e2e.cyr` + on-device
   iteration.
 - [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
   remap; round-trip-identity + addrlib-reference CPU tests.
