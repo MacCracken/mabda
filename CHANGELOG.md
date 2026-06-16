@@ -18,6 +18,87 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.1] — 2026-06-15
+
+**Buffer-to-buffer copy + real native buffers (Phase X).** Second feature of
+the v3.2.x arc (`docs/development/3-2-punchlist.md` Phase X). A consumer
+copies bytes between GPU buffers through one public API on both backends —
+**native AMD** runs an SDMA `COPY_LINEAR` on a real DMA (TRANSFER) ring,
+**wgpu** a `copy_buffer_to_buffer` on its single device queue — and the
+native `gpu_buffer_*` family is now real (linear GTT BOs) rather than
+diagnostic stubs. HW-verified on Cezanne (`native_transfer_copy_e2e`): a
+public-API round-trip, a compute-produce → barrier → `gpu_queue_transfer_copy`
+consume, and a 6 MiB chunked copy byte-exact across the 4 MiB packet
+boundary. Absorbs the v3.1.2-carryover TRANSFER/buffer-copy items. CPU suite
+2434 → **2530** assertions. Toolchain pin 6.2.10 → **6.2.11**.
+
+### Added
+
+- **`gpu_buffer_copy(ctx, src, dst, bytes)`** — synchronous buffer→buffer
+  copy on an implicit TRANSFER queue; **`gpu_queue_transfer_copy(ctx, queue,
+  src, dst, bytes)`** is the explicit-queue variant. Both route through the
+  new `BACKEND_SLOT_BUFFER_COPY` and enforce a 4-byte-multiple size.
+- **Real native `gpu_buffer_*`** — `NativeBuf` (page-aligned GTT BO + VA
+  sub-allocation); `create` / `write` / `read` / `release` are bounds-checked
+  memcpy over the coherent mmap (the v3.0 diagnostic stubs are retired).
+- **`native_transfer_copy_timeline`** — SDMA driver on the DMA ring: chained
+  `COPY_LINEAR` packets, 4-entry BO residency, in-CS `TIMELINE_WAIT` from a
+  cross-ring barrier, timeline-signalling submit.
+- **`native_sdma_build_copy_chained`** — splits a copy across N ≤4 MiB
+  packets (per-chunk VA offsets) so one submission moves buffers larger than
+  a single packet's 22-bit count field allows.
+- **`GPU_ERR_TRANSFER`** (20) — a compute/render dispatch routed onto a
+  DMA/TRANSFER queue, or a copy onto a non-DMA queue, is rejected with it.
+- e2e programs `native_transfer_copy_e2e` (3 legs, HW-verified) +
+  `wgpu_transfer_copy_e2e` (serialized verify); `make test-native-transfer-copy-e2e`
+  / `test-wgpu-transfer-copy-e2e`.
+
+### Changed
+
+- The logical TRANSFER queue now maps to a real **`AMDGPU_HW_IP_DMA`** ring
+  (was a COMPUTE-ring fallback); compute dispatch onto a DMA-ring queue is
+  rejected (`GPU_ERR_TRANSFER`) before any PM4.
+- `Backend` 256 → 264 B (buffer_copy slot); `backend_is_complete` walks it
+  (8th range, activated once both backends fill it).
+- `_backend_wgpu_buffer_create` OR's in `COPY_SRC|COPY_DST` (MAP-aware) so
+  every mabda-created wgpu buffer is a valid copy operand — matching native's
+  usage-agnostic linear BOs.
+- **Toolchain pin 6.2.10 → 6.2.11.**
+
+### Fixed
+
+- P(-1)/work-loop audit (`docs/audit/2026-06-15-buffer-copy-audit.md`,
+  adversarial workflow — 7 confirmed / 4 dismissed): **(HIGH)** the public
+  copy now rejects non-4-byte-multiple sizes uniformly, closing a
+  succeed-on-native / fault-on-wgpu split; **(HIGH)** SDMA copies >4 MiB are
+  chained (were silently corrupting via the 22-bit count field); **(MED)**
+  the COPY-usage asymmetry above. Each landed with a regression assertion.
+
+### Limitations / Deferred (within the arc)
+
+- **Producer/consumer overlap** through the single per-context cached IB is
+  not supported (the consumer's packet would clobber the producer's); the
+  transfer-copy e2e serializes with `wait_idle` like `native_multiqueue_e2e`.
+  True overlap needs per-submission IB staging → **R.5 (3.2.13)**.
+- A single SDMA submission tops out at ~146 packets (~584 MiB); larger copies
+  (multi-submission) are future work, well beyond realistic buffer sizes.
+
+### Security
+
+- Adversarial review of the diff — **0 CRITICAL / 2 HIGH / 1 MEDIUM**, all
+  fixed before the cut. `docs/audit/2026-06-15-buffer-copy-audit.md`.
+
+### Metrics
+
+- CPU assertions 2434 → **2530**. `Backend` 256 → 264 B. New error code
+  `GPU_ERR_TRANSFER` (20).
+
+### Next
+
+- **Phase TS (3.2.2–3.2.3)** — native compressed-texture *sampling* (GFX9
+  T#/tiling/sampler), then Phase S/N SPIR-V, Phase F f64, Phase R
+  render-graph multi-queue.
+
 ## [3.2.0] — 2026-06-15
 
 **Compressed textures (BC / ETC2 / ASTC).** First feature of the v3.2.x

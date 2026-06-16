@@ -1,0 +1,82 @@
+# programs/wgpu_transfer_copy_e2e.cyr — v3.2 X.7 (wgpu transfer-copy)
+#
+# The wgpu serialized counterpart to native_transfer_copy_e2e: drives the
+# PUBLIC buffer-copy API on a real wgpu device and verifies the same
+# observable result. On wgpu the logical TRANSFER queue aliases the single
+# device queue, so the copy is just a copy_buffer_to_buffer on that queue
+# (no real concurrency) — same bytes out.
+#
+# Also proves the X.6 MED-3 fix: gpu_buffer_create OR's COPY_SRC|COPY_DST
+# into every buffer's usage, so a plain STORAGE buffer is a valid copy
+# operand here (without it, copy_buffer_to_buffer would fail wgpu validation).
+#
+#   gpu_buffer_create x2 -> gpu_buffer_write(src, pattern) ->
+#   gpu_buffer_copy(src -> dst) -> gpu_buffer_read(dst) -> byte-exact verify;
+#   then assert a 67-byte copy is rejected (alignment guard).
+#
+# Linked with deps/wgpu_main.c via the Makefile target. Skips cleanly if no
+# GPU is available.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    var N = 4096;
+    var usage = WGPU_BUFFER_USAGE_STORAGE;   # COPY_SRC/DST added by the backend
+
+    var src = gpu_buffer_create(_gpu_ctx, N, usage);
+    if (src == 0) { return _fail("FAIL: src create\n", 17); }
+    var dst = gpu_buffer_create(_gpu_ctx, N, usage);
+    if (dst == 0) { return _fail("FAIL: dst create\n", 17); }
+    syscall(1, 1, "PASS: buffers created\n", 22);
+
+    var pat = alloc(N);
+    var i = 0;
+    while (i < N / 4) { store32(pat + i * 4, 0xA5A50000 + i); i = i + 1; }
+    if (gpu_buffer_write(_gpu_ctx, src, 0, pat, N) != 0) {
+        return _fail("FAIL: src write\n", 16); }
+
+    if (gpu_buffer_copy(_gpu_ctx, src, dst, N) != 0) {
+        return _fail("FAIL: gpu_buffer_copy\n", 22); }
+    syscall(1, 1, "PASS: gpu_buffer_copy submitted\n", 32);
+
+    var out = alloc(N);
+    memset(out, 0, N);
+    if (gpu_buffer_read(_gpu_ctx, dst, 0, out, N) != 0) {
+        return _fail("FAIL: dst read\n", 15); }
+
+    var bad = 0;
+    var j = 0;
+    while (j < N / 4) {
+        if (load32(out + j * 4) != 0xA5A50000 + j) { bad = 1; }
+        j = j + 1;
+    }
+    if (bad != 0) { return _fail("FAIL: copy did not round-trip\n", 30); }
+    syscall(1, 1, "PASS: 4096B copy round-trips byte-exact\n", 40);
+
+    # Alignment guard: a non-4-byte-multiple size must be rejected.
+    if (gpu_buffer_copy(_gpu_ctx, src, dst, 67) == 0) {
+        return _fail("FAIL: 67-byte copy was NOT rejected\n", 36); }
+    syscall(1, 1, "PASS: 67-byte copy rejected (alignment guard)\n", 46);
+
+    gpu_buffer_release(_gpu_ctx, src);
+    gpu_buffer_release(_gpu_ctx, dst);
+    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    return 0;
+}

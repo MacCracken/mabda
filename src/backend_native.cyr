@@ -181,6 +181,109 @@ shader_handle, out_handle, queue, ip_type): i64 {
 }
 
 # ================================================================
+# v3.2 X.4 — SDMA buffer-copy on the DMA ring (timeline path)
+# ================================================================
+# The SDMA analog of native_compute_dispatch_cached_timeline. Copies
+# `bytes` from src_va to dst_va on the AMDGPU DMA (SDMA) ring via a
+# single COPY_LINEAR packet, signalling the queue's persistent timeline
+# on completion. Lifts the HW-proven submit shape from the v3.1 Q.6
+# native_multiqueue_e2e leg 3 (manual SDMA leg) into a reusable driver
+# the public gpu_buffer_copy / gpu_queue_transfer_copy slot (X.5) calls.
+#
+# Differences from the compute/render timeline drivers:
+#   - ip_type is hard-wired to AMDGPU_HW_IP_DMA — this driver only runs
+#     on the SDMA ring, and rejects a queue bound to any other ring.
+#   - 4-entry BO_HANDLES list (fence, ib, src, dst): no shader/stub BO,
+#     src+dst are the copy operands. Residency priorities match the
+#     native_sdma_copy_e2e spike (fence=1, ib=10, src/dst=3).
+#   - ib_flags = 0 — SDMA needs no TC writeback hook.
+# Pending cross-ring waits recorded by gpu_queue_barrier are consumed
+# into an in-CS TIMELINE_WAIT exactly as on the compute path.
+fn native_transfer_copy_timeline(ctx, src_handle, src_va,
+dst_handle, dst_va, bytes, queue): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    # SDMA-ring-only: a copy aimed at a GFX/compute queue is a mis-route.
+    if (queue_ring(queue) != AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
+    if (bytes <= 0) { return GPU_ERR_BUFFER; }
+    # Note: no single-packet 4 MiB cap here anymore — the chained builder
+    # below (v3.2 X.8) splits `bytes` across packets and rejects only if the
+    # chain overflows the IB.
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+
+    var fd  = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+
+    # Stage the SDMA copy into the cached IB BO — chained into as many
+    # COPY_LINEAR packets as `bytes` needs (each <= 4 MiB; v3.2 X.8). A copy
+    # too large to fit the IB's packet chain returns 0 here -> GPU_ERR_BUFFER
+    # (nothing submitted); the ceiling is ~146 packets / ~584 MiB per submit.
+    memset(ib_addr, 0, _NATIVE_IB_SIZE);
+    var sdma_bytes = native_sdma_build_copy_chained(ib_addr, src_va, dst_va,
+    bytes, _NATIVE_IB_SIZE);
+    if (sdma_bytes == 0) { return GPU_ERR_BUFFER; }
+
+    # 4-entry inline BO_HANDLES list (fence, ib, src, dst).
+    var entries[32];
+    store32(&entries +  0, fence_handle); store32(&entries +  4, 1);
+    store32(&entries +  8, ib_handle);    store32(&entries + 12, 10);
+    store32(&entries + 16, src_handle);   store32(&entries + 20, 3);
+    store32(&entries + 24, dst_handle);   store32(&entries + 28, 3);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 4);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+
+    # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
+    # TIMELINE_WAIT; read + clear before submit so queue state is clean.
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+
+    # Reserve this copy's timeline point and submit signalling it on
+    # completion. ib_flags = 0 (SDMA needs no TC writeback hook).
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, sdma_bytes,
+    AMDGPU_HW_IP_DMA, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
+# v3.2 X.5 — buffer_copy backend slot (native). Copies `bytes` from
+# src_buf to dst_buf (both NativeBuf*) on `queue`'s SDMA ring, then
+# blocks until the copy retires so dst is readable on return (the v3.0
+# synchronous buffer write/read contract). The public dispatchers
+# (gpu_buffer_copy / gpu_queue_transfer_copy in buffer.cyr / queue.cyr)
+# resolve the queue and route here through BACKEND_SLOT_BUFFER_COPY.
+# Bounds the copy by both buffers' logical sizes; the queue-ring (DMA)
+# check lives in native_transfer_copy_timeline. Returns 0|GPU_ERR_*.
+fn _backend_native_buffer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (src_buf == 0) { return GPU_ERR_BUFFER; }
+    if (dst_buf == 0) { return GPU_ERR_BUFFER; }
+    if (queue == 0)   { return GPU_ERR_OTHER; }
+    if (bytes <= 0)   { return GPU_ERR_BUFFER; }
+    var src_size = load64(src_buf + NATIVE_BUF_FIELD_SIZE);
+    var dst_size = load64(dst_buf + NATIVE_BUF_FIELD_SIZE);
+    if (bytes > src_size) { return GPU_ERR_BUFFER; }
+    if (bytes > dst_size) { return GPU_ERR_BUFFER; }
+    var src_handle = load64(src_buf + NATIVE_BUF_FIELD_HANDLE);
+    var src_va     = load64(src_buf + NATIVE_BUF_FIELD_VA);
+    var dst_handle = load64(dst_buf + NATIVE_BUF_FIELD_HANDLE);
+    var dst_va     = load64(dst_buf + NATIVE_BUF_FIELD_VA);
+    var rc = native_transfer_copy_timeline(ctx, src_handle, src_va,
+    dst_handle, dst_va, bytes, queue);
+    if (rc != 0) { return rc; }
+    return _backend_native_queue_wait_idle(ctx, queue);
+}
+
+# ================================================================
 # v3 Step 6.6 — GFX-ring dispatch (clear-triangle composer's submit path)
 # ================================================================
 # Mirrors native_compute_dispatch_cached but on the GFX ring. Same
@@ -418,37 +521,109 @@ fn _backend_native_ctx_release(ctx): i64 {
 
 # Buffer slots — diagnostic stubs (audit LOW-3).
 #
-# The public `gpu_buffer_*` API is intentionally not implemented on
-# the native AMD backend in v3.0 — consumers that need native today
-# (the in-tree `programs/native_*.cyr`) all use `native_buf_pair_*`
-# directly, and cross-backend portable buffer code is blocked by
-# LOW-4 (vc/ic in render dispatch) anyway. v3.x will port these to
-# `native_buf_pair_*` underneath.
+# Public gpu_buffer_* on native AMD — REAL as of v3.2 (Phase X). A native
+# buffer is a linear GTT BO (the same primitive textures use): the BO's
+# mmap address IS the data, so write/read collapse to memcpy (X.2). This
+# unblocks the public transfer-copy API (gpu_buffer_copy, X.5) + portable
+# consumer buffer code.
 #
-# Slot semantics:
-#   - `_buffer_create` returns a handle (i64) — 0 means "create
-#     failed, no handle." Callers MUST null-check the return.
-#   - `_buffer_write` / `_buffer_read` return a GpuErr code — 0 is
-#     success, anything else is a failure. We return
-#     GPU_ERR_NOT_IMPLEMENTED so callers can distinguish "the
-#     native backend doesn't support gpu_buffer_* yet" from
-#     generic GPU_ERR_OTHER failures.
-#   - `_buffer_release` is a no-op success — releasing a never-
-#     created handle is sensibly a no-op, and propagating an error
-#     here would leak detail through every cleanup path.
+# NativeBuf struct (32 bytes — NativeTexture shape):
+#   +0:  handle  (u64, KMS handle)
+#   +8:  va      (u64, canonical-high GPU VA)
+#   +16: addr    (u64, CPU mmap pointer)
+#   +24: size    (u64, LOGICAL byte count requested; the BO + VA map use a
+#                 4 KiB-page-aligned size since native_gem_va_map rejects a
+#                 sub-page size — see reference_gem_va_map_page_align)
+var NATIVE_BUF_FIELD_HANDLE = 0;
+var NATIVE_BUF_FIELD_VA     = 8;
+var NATIVE_BUF_FIELD_ADDR   = 16;
+var NATIVE_BUF_FIELD_SIZE   = 24;
+var NATIVE_BUF_STRUCT_SIZE  = 32;
+
+# Create a native buffer of `size` bytes. `usage` is ignored on native (a
+# GTT BO is general-purpose; wgpu uses it). Returns a NativeBuf* or 0 on
+# bad input / region exhaustion / ioctl failure. (HW path; the guards are
+# CPU-tested, the BO create/map is HW.)
 fn _backend_native_buffer_create(ctx, size, usage): i64 {
+    if (ctx == 0) { return 0; }
+    if (size <= 0) { return 0; }
+    # Bound size so _native_align_up can't overflow + the VA region can hold
+    # it (the allocator also returns 0 on exhaustion).
+    if (size > _NATIVE_TEXTURE_VA_REGION) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var bo_size = _native_align_up(size, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, bo_size, &bo);
+    if (rc != 0) { return 0; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return 0;
+    }
+    var buf = alloc(NATIVE_BUF_STRUCT_SIZE);
+    memset(buf, 0, NATIVE_BUF_STRUCT_SIZE);
+    store64(buf + NATIVE_BUF_FIELD_HANDLE, handle);
+    store64(buf + NATIVE_BUF_FIELD_VA,     va);
+    store64(buf + NATIVE_BUF_FIELD_ADDR,   addr);
+    store64(buf + NATIVE_BUF_FIELD_SIZE,   size);   # logical
+    return buf;
+}
+
+# Write `n` bytes from `ptr` into the buffer at byte offset `off`. The BO's
+# mmap address IS the data (linear GTT, coherent), so this is a bounds-
+# checked memcpy. Bounds are overflow-safe: `off > size` is rejected before
+# computing `size - off`, so `off + n` never overflows. Returns 0|GPU_ERR_*.
+fn _backend_native_buffer_write(ctx, buf, off, ptr, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (buf == 0) { return GPU_ERR_OTHER; }
+    if (ptr == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (off < 0)  { return GPU_ERR_BUFFER; }
+    var size = load64(buf + NATIVE_BUF_FIELD_SIZE);
+    var addr = load64(buf + NATIVE_BUF_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (off > size) { return GPU_ERR_BUFFER; }
+    if (n > size - off) { return GPU_ERR_BUFFER; }   # off+n > size, overflow-safe
+    memcpy(addr + off, ptr, n);
     return 0;
 }
 
-fn _backend_native_buffer_write(ctx, buf, off, ptr, n): i64 {
-    return GPU_ERR_NOT_IMPLEMENTED;
-}
-
+# Read `n` bytes from the buffer at offset `off` into `ptr`. Symmetric
+# bounds-checked memcpy. Returns 0|GPU_ERR_*.
 fn _backend_native_buffer_read(ctx, buf, off, ptr, n): i64 {
-    return GPU_ERR_NOT_IMPLEMENTED;
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (buf == 0) { return GPU_ERR_OTHER; }
+    if (ptr == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (off < 0)  { return GPU_ERR_BUFFER; }
+    var size = load64(buf + NATIVE_BUF_FIELD_SIZE);
+    var addr = load64(buf + NATIVE_BUF_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (off > size) { return GPU_ERR_BUFFER; }
+    if (n > size - off) { return GPU_ERR_BUFFER; }
+    memcpy(ptr, addr + off, n);
+    return 0;
 }
 
+# Release a native buffer: VA-unmap + BO-release using the same page-aligned
+# size the create mapped, then zero the struct. Null-safe.
 fn _backend_native_buffer_release(ctx, buf): i64 {
+    if (ctx == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var handle = load64(buf + NATIVE_BUF_FIELD_HANDLE);
+    var va     = load64(buf + NATIVE_BUF_FIELD_VA);
+    var addr   = load64(buf + NATIVE_BUF_FIELD_ADDR);
+    var bo_size = _native_align_up(load64(buf + NATIVE_BUF_FIELD_SIZE), 4096);
+    if (handle != 0) {
+        native_gem_va_unmap(fd, handle, va, bo_size);
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+    }
+    memset(buf, 0, NATIVE_BUF_STRUCT_SIZE);
     return 0;
 }
 
@@ -488,6 +663,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         return GPU_ERR_WORKGROUP_LIMIT;
     }
 
+    # v3.2 X.3: a compute dispatch targeted at a DMA-ring (TRANSFER) queue
+    # is a mis-route — SDMA cannot execute PM4 compute. Reject before
+    # building the PM4 stream. (Zero stash = legacy single-ring path.)
+    var cq = gpu_ctx_current_queue(ctx);
+    if (cq != 0) {
+        if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
+    }
+
     var stub_va = native_ctx_stub_va(ctx);
     var shader_handle = load64(shmod + 0);
     var shader_va     = load64(shmod + 8);
@@ -500,12 +683,11 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     var pm4_bytes = native_pm4_build_compute_store_deadbeef(pm4,
     shader_va, stub_va, out_va, x, y, z);
 
-    # v3.1 Q.3c: if a logical queue is the current dispatch target,
-    # route through the async timeline path on that queue's ring
-    # (signals the queue's persistent timeline; caller waits via
-    # gpu_queue_wait_idle / gpu_queue_barrier). A zero stash preserves
-    # the v3.0 synchronous single-ring path verbatim below.
-    var cq = gpu_ctx_current_queue(ctx);
+    # v3.1 Q.3c: if a logical queue is the current dispatch target (read +
+    # DMA-guarded above), route through the async timeline path on that
+    # queue's ring (signals the queue's persistent timeline; caller waits
+    # via gpu_queue_wait_idle / gpu_queue_barrier). Zero stash = the v3.0
+    # synchronous single-ring path verbatim below.
     if (cq != 0) {
         return native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
         shader_handle, out_handle, cq, queue_ring(cq));
@@ -549,18 +731,16 @@ fn _backend_native_device_wait_idle(ctx): i64 {
 # latest point, and gpu_queue_barrier (Q.4) makes one ring wait on
 # another's point.
 
-# Map a logical queue kind to its AMDGPU HW ring (HW_IP). TRANSFER
-# shares the COMPUTE ring in 3.1.1. The SDMA COPY_LINEAR path is brought
-# up + HW-verified in Q.5 (native_sdma_build_copy_linear + the DMA-ring
-# submit proven by programs/native_sdma_copy_e2e.cyr), but TRANSFER does
-# NOT flip to AMDGPU_HW_IP_DMA yet: there is no public buffer-copy op to
-# drive it, and a DMA-ring queue would mis-route a compute dispatch. The
-# flip lands atomically with the public transfer-copy API (+ wgpu parity)
-# in 3.1.2. Returns -1 on bad kind.
+# Map a logical queue kind to its AMDGPU HW ring (HW_IP). As of v3.2 X.3
+# TRANSFER maps to the real SDMA ring (AMDGPU_HW_IP_DMA), driven by the
+# public buffer-copy API (X.5) over native_transfer_copy_timeline (X.4).
+# Compute/render dispatch onto a DMA-ring queue is rejected with
+# GPU_ERR_TRANSFER (SDMA cannot run PM4 shaders) — see the guard in
+# _backend_native_compute_dispatch. Returns -1 on bad kind.
 fn _native_queue_kind_to_ring(kind): i64 {
     if (kind == QUEUE_KIND_GRAPHICS) { return AMDGPU_HW_IP_GFX; }
     if (kind == QUEUE_KIND_COMPUTE)  { return AMDGPU_HW_IP_COMPUTE; }
-    if (kind == QUEUE_KIND_TRANSFER) { return AMDGPU_HW_IP_COMPUTE; }   # 3.1.2 -> _DMA
+    if (kind == QUEUE_KIND_TRANSFER) { return AMDGPU_HW_IP_DMA; }
     return 0 - 1;
 }
 
@@ -1287,6 +1467,11 @@ fn backend_native_new(): i64 {
     &_backend_native_queue_barrier);
     backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,
     &_backend_native_queue_wait_idle);
+    # v3.2 X.5 — buffer-copy (SDMA transfer). Native fills the slot now;
+    # the backend_is_complete walk over the range activates in X.6 once
+    # the wgpu filler lands too ("activate when both fill").
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
+    &_backend_native_buffer_copy);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }

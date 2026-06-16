@@ -92,24 +92,51 @@ Absorbs the v3.1.2 carryover. Also lands **real native `gpu_buffer_*`**
 (create/write/read/release are stubs today). SDMA `COPY_LINEAR` already
 HW-proven (`native_sdma_copy_e2e.cyr`).
 
-- [ ] **X.1** — `NativeBuf` struct + real `_backend_native_buffer_create`/
+- [x] **X.1** — `NativeBuf` struct + real `_backend_native_buffer_create`/
   `_release` (page-align, VA sub-alloc, GEM/VA map). Retires the stubs.
-- [ ] **X.2** — real native `buffer_write`/`_read` (memcpy + `off+n<=size`
+- [x] **X.2** — real native `buffer_write`/`_read` (memcpy + `off+n<=size`
   guard). Native `gpu_buffer_*` now real on both backends.
-- [ ] **X.3** — DMA-ring flip (`_native_queue_kind_to_ring(TRANSFER)`→
+- [x] **X.3** — DMA-ring flip (`_native_queue_kind_to_ring(TRANSFER)`→
   `AMDGPU_HW_IP_DMA`) + compute-on-DMA-queue mis-route guard +
-  `GPU_ERR_TRANSFER=19`.
-- [ ] **X.4** — `native_transfer_copy_timeline` driver (SDMA into cached
+  `GPU_ERR_TRANSFER=20` (19 is `FORMAT_UNSUPPORTED`).
+- [x] **X.4** — `native_transfer_copy_timeline` driver (SDMA into cached
   IB; BO_HANDLES fence/ib/src/dst; consume pending-wait → in-CS
   TIMELINE_WAIT; signal timeline).
-- [ ] **X.5** — `BACKEND_SLOT_BUFFER_COPY` (`BACKEND_SIZE`→264) + public
+- [x] **X.5** — `BACKEND_SLOT_BUFFER_COPY` (`BACKEND_SIZE`→264) + public
   `gpu_buffer_copy(ctx,src,dst,size)` + `gpu_queue_transfer_copy(...)`;
-  extend completeness walk.
-- [ ] **X.6** — wgpu fill (`copy_buffer_to_buffer` via the existing shim +
-  submit); install both backends; document COPY_SRC/DST.
-- [ ] **X.7** — HW e2e (`native_transfer_copy_e2e.cyr`: compute-produce →
-  barrier → transfer-copy-consume; wgpu serialized verify).
-- [ ] **X.8** — **Cut 3.2.1.**
+  completeness walk (8th range, activated at X.6).
+- [x] **X.6** — wgpu fill (`copy_buffer_to_buffer` + submit + poll);
+  install both backends; activate completeness walk. **+ audit fixes
+  (2026-06-15 review):** 4-byte-multiple size guard in both dispatchers
+  (HIGH-1), native SDMA >4 MiB reject via `_NATIVE_SDMA_COPY_MAX_BYTES`
+  (HIGH-2), `_backend_wgpu_buffer_create` OR's in COPY_SRC|COPY_DST so
+  any mabda buffer is a copy operand, matching native (MED-3).
+- [x] **(interrupt)** — toolchain pin `6.2.10`→`6.2.11` (latest); was the
+  X.9 fold-in, done early.
+- [x] **X.7** — HW e2e. `native_transfer_copy_e2e.cyr` (HW-verified on
+  Cezanne): leg A public `gpu_buffer_copy` 4096B round-trip + alignment-guard
+  reject; leg B compute-produce → barrier → public `gpu_queue_transfer_copy`
+  consume (consumed == [0xDEADBEEF, pattern...]). `wgpu_transfer_copy_e2e.cyr`
+  serialized verify (compile-checked; HW-gated). Makefile targets
+  `test-native-transfer-copy-e2e` / `test-wgpu-transfer-copy-e2e`. **Finding:**
+  producer/consumer can't OVERLAP through the single per-context cached IB
+  (the consumer's packet clobbers the producer's) — the e2e serializes with
+  `wait_idle`, matching `native_multiqueue_e2e`. True overlap needs per-IB
+  staging → **reinforces R.5 (3.2.13)**. No regression in the other native
+  HW programs (compute_store / multiqueue / sdma_copy / queue_compute all
+  still exit 0).
+- [x] **X.8** — Native SDMA **chunking**. `native_sdma_build_copy_chained`
+  loops `COPY_LINEAR` packets (each ≤4 MiB, per-chunk src/dst VA offsets) into
+  the cached IB; `native_transfer_copy_timeline` no longer rejects at 4 MiB —
+  it chains, and only rejects (`GPU_ERR_BUFFER`) a chain that overflows the IB
+  (~146 packets / ~584 MiB per submission; >that = multi-submission, future).
+  CPU test for the chunk/VA-offset/overflow math; HW e2e **leg C** (6 MiB =
+  2 packets, byte-exact across the boundary, verified on Cezanne). Closes the
+  >4 MiB native gap for all realistic buffers.
+- [x] **X.9** — **Cut 3.2.1.** VERSION 3.2.0→3.2.1; CHANGELOG `[3.2.1]`;
+  CLAUDE.md / README version + state synced (2530 asserts); audit doc
+  `docs/audit/2026-06-15-buffer-copy-audit.md`; `version-check.sh` OK; dist
+  regenerated (embeds 3.2.1) + idempotent. Phase X **complete**.
 
 ---
 
