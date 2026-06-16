@@ -229,8 +229,18 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   asserts, struct/BACKEND_SIZE deltas); version-check OK; dist regen (embeds
   3.2.2) + idempotent; closeout green (suite 2702/0, 9 benches, 7 HW programs
   exit 0 on Cezanne incl. native+wgpu texture-sample). TS.6–8 → 3.2.3.
-- [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
-  remap; round-trip-identity + addrlib-reference CPU tests.
+- [~] **TS.6** — Tile-swizzle for SW_64KB_S compressed surfaces.
+  **Approach (maintainer, 2026-06-15): "try SDMA HW tiling first"** — the GFX9
+  swizzle is config-dependent addrlib (no pattern table to transcribe), so
+  instead of a pure-Cyrius swizzle port, use an **SDMA `COPY_TILED_SUB_WINDOW`**
+  (sub-op 5) linear↔tiled copy and let the GPU apply the swizzle (write = L2T,
+  read = T2L). **Done this bite:** `native_sdma_build_copy_tiled` — the 14-dword
+  packet builder (transcribed from Mesa `ac_emit_sdma_copy_tiled_sub_window`,
+  SDMA_4_0; `info_dword = element_size | swizzle_mode<<3 | dim<<9 | epitch<<16`),
+  CPU-pinned. **Remaining:** tiled-surface geometry (the `SW_64KB_S` swizzle_mode
+  value + `epitch` + tiled BO size — the addrlib-equivalent geometry the HW
+  still needs supplied) + a HW L2T→T2L round-trip to confirm the mechanism on
+  Cezanne, then fold into TS.7.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**
   (`native_compressed_sample_e2e.cyr`, CPU-decode verify); flip native BC
   cap bit to 1.

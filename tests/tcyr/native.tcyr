@@ -688,6 +688,38 @@ fn test_native_gfx9_sampler_descriptor() {
 # v3.2 X.8 — SDMA COPY_LINEAR chaining: split a copy across N <=4 MiB
 # packets with per-chunk VA offsets, and reject (return 0) a chain that
 # won't fit the IB. Pure byte-builder, fully CPU-checkable.
+# v3.2 TS.6 — SDMA COPY_TILED_SUB_WINDOW packet (linear<->tiled; HW applies the
+# swizzle). Bytes pinned vs Mesa ac_emit_sdma_copy_tiled_sub_window (SDMA_4_0).
+fn test_native_sdma_build_copy_tiled() {
+    var buf[56];
+    memset(&buf, 0, 56);
+    # BC1-ish: element_size=3 (8-byte block), swizzle=9, dim=1, epitch=15,
+    # 16x16 block extent, linear pitch 16 / slice 256, full-surface copy, L2T.
+    var n = native_sdma_build_copy_tiled(&buf, 0xFFFF800180000000, 0xFFFF800180100000,
+    3, 9, 1, 15, 16, 16, 16, 256, 16, 16, 0);
+    assert_eq(n, 56, "returns 56 (14 dwords)");
+    assert_eq(load32(&buf +  0), 0x501, "DW0 COPY/TILED_SUB_WINDOW (L2T)");
+    assert_eq(load32(&buf +  4), 0x80000000, "DW1 tiled va lo");
+    assert_eq(load32(&buf +  8), 0xFFFF8001, "DW2 tiled va hi");
+    assert_eq(load32(&buf + 12), 0, "DW3 tiled offset x|y");
+    assert_eq(load32(&buf + 16), 0xF0000, "DW4 (ext_w-1)<<16");
+    assert_eq(load32(&buf + 20), 0xF, "DW5 ext_h-1");
+    assert_eq(load32(&buf + 24), 0xF024B, "DW6 info elem|sw<<3|dim<<9|epitch<<16");
+    assert_eq(load32(&buf + 28), 0x80100000, "DW7 linear va lo");
+    assert_eq(load32(&buf + 32), 0xFFFF8001, "DW8 linear va hi");
+    assert_eq(load32(&buf + 36), 0, "DW9 linear offset x|y");
+    assert_eq(load32(&buf + 40), 0xF0000, "DW10 (lin_pitch-1)<<16");
+    assert_eq(load32(&buf + 44), 0xFF, "DW11 lin_slice_pitch-1");
+    assert_eq(load32(&buf + 48), 0xF000F, "DW12 (copy_w-1)|(copy_h-1)<<16");
+    assert_eq(load32(&buf + 52), 0, "DW13 copy_d-1");
+    # detile (T2L) sets DW0 bit 31.
+    memset(&buf, 0, 56);
+    native_sdma_build_copy_tiled(&buf, 0xFFFF800180000000, 0xFFFF800180100000,
+    3, 9, 1, 15, 16, 16, 16, 256, 16, 16, 1);
+    assert_eq(load32(&buf + 0), 0x80000501, "DW0 detile (T2L) sets bit 31");
+    return 0;
+}
+
 fn test_native_sdma_build_copy_chained() {
     assert_eq(_NATIVE_SDMA_COPY_MAX_BYTES, 4194304, "per-packet cap = 4 MiB");
     var buf[128];
@@ -2968,6 +3000,7 @@ fn main() {
     test_native_gfx9_image_descriptor();
     test_native_gfx9_texfmt_to_img_format();
     test_native_gfx9_sampler_descriptor();
+    test_native_sdma_build_copy_tiled();
     test_native_sdma_build_copy_chained();
     test_native_transfer_copy_timeline_driver();
     test_native_buffer_copy_guards();
