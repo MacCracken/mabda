@@ -6,11 +6,11 @@
 # write path) finally meets the texture addressing unit — the absolute
 # correctness check the TS.6 round-trip (self-consistent bijection) could not give.
 #
-# Covers BC1 (RGB565 endpoints), BC4 (1-channel red), and BC5 (2-channel RG) —
-# spanning the channel-mapping spectrum that the native identity-swizzle T#
-# (DST_SEL X/Y/Z/W) is responsible for: BC4 -> (R,0,0,1), BC5 -> (R,G,0,1),
-# BC1 -> full RGB. (BC3 = BC1-color + BC4-alpha and BC7 = complex modes ride the
-# same verified UNORM path; their bespoke sample oracle is a follow-up.)
+# Covers BC1 (RGB565 endpoints), BC3 (BC1-color + BC4-alpha block, 4-channel),
+# BC4 (1-channel red), and BC5 (2-channel RG) — spanning the channel-mapping
+# spectrum the per-format DST_SEL T# is responsible for: BC1/BC3 -> full RGBA,
+# BC4 -> (R,0,0,1), BC5 -> (R,G,0,1). (BC7's complex modes ride the same verified
+# UNORM path; a BC7 sample oracle is a follow-up. BC6H is gated off — HDR float.)
 #
 # Test data design (NO interpolation -> no TA-vs-CPU rounding ambiguity): every
 # texel uses an ENDPOINT index, never an interpolated one. In BC1 palette[0]/[1]
@@ -75,6 +75,8 @@ fn blk_c1(bx, by): i64 { return pack565(0x1F, (bx * 2) & 0x3F, by & 0x1F); }
 # --- BC4/BC5: per-block u8 endpoints (index 0 -> these verbatim) ---
 fn bc4_red0(bx, by): i64 { return (bx * 16 + by) & 0xFF; }   # unique per block in 16x16
 fn bc5_grn0(bx, by): i64 { return (by * 16 + bx) & 0xFF; }
+# --- BC3 (DXT5): BC1 color + a BC4-style alpha block. Per-block alpha endpoint. ---
+fn bc3_a0(bx, by): i64 { return (bx * 13 + by * 7 + 1) & 0xFF; }   # nonzero, per-block
 
 # Expected RGBA8 for texel (x,y) of `fmt` (matches the block data filled below).
 fn want_texel(fmt, x, y): i64 {
@@ -90,6 +92,12 @@ fn want_texel(fmt, x, y): i64 {
     }
     if (fmt == MABDA_TEXFMT_BC5) {            # (R,G,0,1)
         return (bc4_red0(bx, by) & 0xFF) | ((bc5_grn0(bx, by) & 0xFF) << 8) | (0xFF << 24);
+    }
+    if (fmt == MABDA_TEXFMT_BC3) {            # BC1-RGB checker + per-block alpha
+        var checker3 = ((x & 3) + (y & 3)) & 1;
+        var rgb = expand565(blk_c0(bx, by)) & 0x00FFFFFF;
+        if (checker3 != 0) { rgb = expand565(blk_c1(bx, by)) & 0x00FFFFFF; }
+        return rgb | ((bc3_a0(bx, by) & 0xFF) << 24);
     }
     return 0;
 }
@@ -126,6 +134,22 @@ fn fill_blocks(fmt, blocks, BX, BY): i64 {
                 memset(blk5, 0, 16);
                 store8(blk5 + 0, bc4_red0(bx, by));    # red endpoint
                 store8(blk5 + 8, bc5_grn0(bx, by));    # green endpoint
+            }
+            if (fmt == MABDA_TEXFMT_BC3) {
+                # 16B: [alpha BC4-style sub-block (all index 0 -> a0) | BC1 color].
+                var blk3 = blocks + (by * BX + bx) * 16;
+                memset(blk3, 0, 16);
+                store8(blk3 + 0, bc3_a0(bx, by));      # alpha endpoint a0
+                var c0 = blk_c0(bx, by);
+                var c1 = blk_c1(bx, by);
+                store8(blk3 +  8, c0 & 0xFF);
+                store8(blk3 +  9, (c0 >> 8) & 0xFF);
+                store8(blk3 + 10, c1 & 0xFF);
+                store8(blk3 + 11, (c1 >> 8) & 0xFF);
+                store8(blk3 + 12, 0x44);               # color checker indices 0/1
+                store8(blk3 + 13, 0x11);
+                store8(blk3 + 14, 0x44);
+                store8(blk3 + 15, 0x11);
             }
             bx = bx + 1;
         }
@@ -197,8 +221,8 @@ fn run_fmt(ctx, rt, samp, pipe, fmt, bb): i64 {
 fn main(): i64 {
     alloc_init();
     color_init();
-    print_cstr("mabda native COMPRESSED (BC1/BC4/BC5) sample e2e (v3.2 TS.7c-4)\n");
-    print_cstr("---------------------------------------------------------------\n");
+    print_cstr("mabda native COMPRESSED (BC1/BC3/BC4/BC5) sample e2e (v3.2 TS.8)\n");
+    print_cstr("-----------------------------------------------------------------\n");
 
     # Open the create gate ahead of / alongside the in-tree cap flip.
     NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
@@ -256,8 +280,12 @@ fn main(): i64 {
     var r5 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC5, 16);
     if (r5 != 0) { print_cstr("FAIL: BC5 sample\n"); return r5; }
     print_cstr("PASS: BC5 RT[x,y] == CPU decode (2-channel -> R,G,0,1)\n");
+
+    var r3 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC3, 16);
+    if (r3 != 0) { print_cstr("FAIL: BC3 sample\n"); return r3; }
+    print_cstr("PASS: BC3 RT[x,y] == CPU decode (RGB + per-block alpha)\n");
     var ms = (mono_ns() - t0) / 1000;
-    print_cstr("3 formats sampled+verified in "); print_i64(ms); print_cstr(" us\n");
+    print_cstr("4 formats sampled+verified in "); print_i64(ms); print_cstr(" us\n");
 
     gpu_render_pipeline_release(ctx, pipe);
     gpu_render_target_release(ctx, rt);
@@ -266,7 +294,7 @@ fn main(): i64 {
     native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
     native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
     gpu_context_release(ctx);
-    print_cstr("OK - native BC1/BC4/BC5 compressed sampling live on Cezanne\n");
+    print_cstr("OK - native BC1/BC3/BC4/BC5 compressed sampling live on Cezanne\n");
     return 0;
 }
 

@@ -289,13 +289,14 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
         (R,R,R,R)). BC4 → X,0,0,1, BC5 → X,Y,0,1; 4-channel formats stay identity.
         Caught by adding the BC4/BC5 sample probes — a real wrong-color bug fixed
         before it shipped.
-    - *Residual (honest):* BC1/BC4/BC5 are pixel-exact-verified; BC3 (= BC1-RGB +
-      BC4-alpha, both components verified, identity swizzle) and BC7 (tiling-
-      verified, complex modes) ride the same path with no bespoke sample oracle
-      (a BC7 encoder is nontrivial). The native caps ADVISORY
-      (`gpu_caps_supports_format`) still reports BC unsupported because native
-      never builds a caps struct at all — wiring native caps is TS.8's "strike
-      Phase T's storage-only limitation."
+    - *Sample coverage:* BC1/BC3/BC4/BC5 are now ALL pixel-exact-verified on HW
+      (TS.8 added BC3 = BC1-RGB checker + per-block alpha endpoint, closing the
+      earlier residual). Only **BC7** (complex modes — a BC7 encoder is nontrivial)
+      rides the path on the family bet (tiling HW-verified, sample oracle a
+      follow-up). BC6H gated off (HDR float).
+    - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
+      reports BC unsupported because native never builds a caps struct at all —
+      wiring native caps is TS.8's "strike Phase T's storage-only limitation."
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
   limitation**; cut the TS minors. Also:
@@ -305,8 +306,8 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     create+sample now works (review 2026-06-16). Populate native caps from
     `NATIVE_TEXCOMP_SUPPORTED` (+ texture limits) so the advisory and the create
     gate agree — part of striking the storage-only limitation.
-  - **BC3/BC7 sample oracle** (+ BC6H once an HDR RT path lands) to close the
-    TS.7c-4 residual.
+  - **BC7 sample oracle** (+ BC6H once an HDR RT path lands) — BC1/BC3/BC4/BC5
+    are now HW-sample-verified; BC7's complex-mode encoder is the remaining gap.
 
 ---
 
