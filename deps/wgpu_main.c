@@ -393,8 +393,21 @@ static int preinit_gpu(void) {
     extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
     extras.backends = WGPUInstanceBackend_Vulkan;
 
+    // v3.2 Phase S — request the SPIR-V shader-source instance feature so
+    // gpu_shader_module_create_spirv works. wgpu-native v29 rejects
+    // WGPUShaderSourceSPIRV unless the instance was built with this feature;
+    // without it, every SPIR-V createShaderModule returns NULL (the fail-loud
+    // path mabda surfaces as a 0 module). WGSL is unaffected. Consumers that
+    // copy this launcher must carry this edit to use SPIR-V — see the migration
+    // note in CHANGELOG / docs/proposals/v3.2-spirv-ingestion-wgpu.md.
+    static const WGPUInstanceFeatureName k_required_features[] = {
+        WGPUInstanceFeatureName_ShaderSourceSPIRV,
+    };
+
     WGPUInstanceDescriptor desc = {0};
     desc.nextInChain = (const WGPUChainedStruct*)&extras;
+    desc.requiredFeatureCount = 1;
+    desc.requiredFeatures = k_required_features;
 
     preinit.instance = wgpuCreateInstance(&desc);
     if (!preinit.instance) return 0;

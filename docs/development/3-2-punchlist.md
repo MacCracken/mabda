@@ -382,8 +382,15 @@ byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
   `shader_cache_get_spirv` / `_set_spirv` / `_get_or_compile_spirv` (validates +
   builds the SPIRV source). CPU-tested (caches.tcyr: kind separation, embedded-NUL,
   round-trip).
-- [ ] **S.4** — Reference launcher gate (`ShaderSourceSPIRV` instance
-  feature in `deps/wgpu_main.c`); consumer migration note.
+- [x] **S.4** — done. `deps/wgpu_main.c` instance descriptor now requests
+  `WGPUInstanceFeatureName_ShaderSourceSPIRV` (requiredFeatureCount=1 +
+  requiredFeatures); without it every SPIR-V createShaderModule nulls. Verified
+  with `cc -fsyntax-only -I deps/wgpu-native/include` (const-correct; the only
+  warning is the pre-existing `nextInChain` cast). **Consumer migration note**
+  (→ goes in the 3.2.4 CHANGELOG Breaking/Migration at S.6): consumers that copy
+  the launcher must carry this 4-line edit to use SPIR-V shaders; WGSL is
+  unaffected. mabda can't detect a missing-feature instance before the create —
+  the fail-loud 0 module is the contract.
 - [ ] **S.5** — wgpu HW e2e (`spirv_e2e.cyr`, render path — wgpu compute
   is still a v3.0 stub; cross-source identity vs WGSL).
 - [ ] **S.6** — **Cut 3.2.4.**
