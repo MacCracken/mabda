@@ -81,7 +81,24 @@ fn _backend_wgpu_ctx_release(ctx): i64 {
 
 fn _backend_wgpu_buffer_create(ctx, size, usage): i64 {
     var device = gpu_ctx_device(ctx);
-    var desc = wgpu_buffer_descriptor(0, usage, size, 0);
+    # v3.2 X.6 (audit 2026-06-15 MED-3): ensure every mabda-created buffer
+    # can serve as a gpu_buffer_copy operand, matching native's permissive
+    # LINEAR BOs (which ignore usage). WebGPU forbids MAP_READ|COPY_SRC and
+    # MAP_WRITE|COPY_DST, so for mappable buffers add only the compatible
+    # COPY flag; otherwise add both. Removes the prior cross-backend
+    # asymmetry where a STORAGE-only buffer copied fine on native but
+    # failed wgpu validation.
+    var u = usage;
+    if ((u & WGPU_BUFFER_USAGE_MAP_READ) != 0) {
+        u = u | WGPU_BUFFER_USAGE_COPY_DST;
+    } else {
+        if ((u & WGPU_BUFFER_USAGE_MAP_WRITE) != 0) {
+            u = u | WGPU_BUFFER_USAGE_COPY_SRC;
+        } else {
+            u = u | WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
+        }
+    }
+    var desc = wgpu_buffer_descriptor(0, u, size, 0);
     return wgpu_device_create_buffer(device, desc);
 }
 
@@ -138,6 +155,38 @@ fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n): i64 {
 fn _backend_wgpu_buffer_release(ctx, buf): i64 {
     if (ctx == 0) { return 0; }
     wgpu_buffer_release(buf);
+    return 0;
+}
+
+# v3.2 X.6 — buffer_copy backend slot (wgpu). Copies `bytes` from
+# src_buf to dst_buf via a command-encoder copy_buffer_to_buffer on the
+# single device queue, then polls until it retires so dst is readable on
+# return (the v3.0 synchronous contract, matching the native filler).
+# The `queue` arg is a logical Queue aliasing the one WGPUQueue — wgpu
+# has a single queue, so it's accepted (non-null) but otherwise unused;
+# the device queue is read from ctx. copy_buffer_to_buffer requires the
+# source carry COPY_SRC usage and the dest COPY_DST — _backend_wgpu_buffer_create
+# OR's both into every mabda-created buffer's usage, so any buffer from
+# gpu_buffer_create is a valid operand. Bounds the copy by each buffer's
+# allocated size; the public dispatchers enforce the 4-byte-multiple size.
+# Returns 0|GPU_ERR_*.
+fn _backend_wgpu_buffer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
+    if (ctx == 0)     { return GPU_ERR_OTHER; }
+    if (queue == 0)   { return GPU_ERR_OTHER; }
+    if (src_buf == 0) { return GPU_ERR_BUFFER; }
+    if (dst_buf == 0) { return GPU_ERR_BUFFER; }
+    if (bytes <= 0)   { return GPU_ERR_BUFFER; }
+    var src_size = wgpu_buffer_get_size(src_buf);
+    var dst_size = wgpu_buffer_get_size(dst_buf);
+    if (bytes > src_size) { return GPU_ERR_BUFFER; }
+    if (bytes > dst_size) { return GPU_ERR_BUFFER; }
+    var device = gpu_ctx_device(ctx);
+    var dqueue = gpu_ctx_queue(ctx);
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, src_buf, 0, dst_buf, 0, bytes);
+    var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_queue_submit_one(dqueue, cmd_buf);
+    wgpu_device_poll(device, 1);
     return 0;
 }
 
@@ -885,6 +934,11 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_queue_barrier);
     backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,
     &_backend_wgpu_queue_wait_idle);
+    # v3.2 X.6 — buffer-copy (copy_buffer_to_buffer). Both backends now
+    # fill the buffer_copy slot (native X.5), so the backend_is_complete
+    # walk over the range activates this step ("activate when both fill").
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
+    &_backend_wgpu_buffer_copy);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }
