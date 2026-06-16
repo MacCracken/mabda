@@ -1291,6 +1291,50 @@ fn test_wgsl_source_cstr_not_truncated_at_4k() {
     return 0;
 }
 
+# v3.2 S.1 — WGPUShaderSourceSPIRV (32 B): chain@0 (sType@8), codeSize@16 in
+# WORDS, code ptr@24. The words-vs-bytes codeSize is the #1 SPIRV bug; pin it.
+fn test_spirv_source_builder() {
+    var src = wgpu_shader_source_spirv(0xBEEF, 5);   # 5 words
+    assert_eq(load64(src + 0), 0, "chain.next = NULL");
+    assert_eq(load32(src + 8), WGPU_STYPE_SHADER_SOURCE_SPIRV, "sType = SPIRV(1)");
+    assert_eq(load32(src + 16), 5, "codeSize = 5 WORDS (not bytes)");
+    assert_eq(load64(src + 24), 0xBEEF, "code ptr stored at +24");
+    assert_eq(WGPU_STYPE_SHADER_SOURCE_SPIRV, 1, "SPIRV sType constant = 0x1");
+    return 0;
+}
+
+# v3.2 S.1 — _spirv_validate structural checks (magic/align/bound + cap), each
+# returning its distinct code. Builds a minimal valid 5-word SPIR-V header.
+fn test_spirv_validate() {
+    var buf[20];
+    store32(&buf +  0, MABDA_SPIRV_MAGIC);   # word0 magic
+    store32(&buf +  4, 0x00010300);          # word1 version
+    store32(&buf +  8, 0);                    # word2 generator
+    store32(&buf + 12, 1);                    # word3 id-bound = 1
+    store32(&buf + 16, 0);                    # word4 schema
+    assert_eq(_spirv_validate(&buf, 20), 0, "valid 5-word header -> 0");
+    assert_eq(_spirv_validate(&buf, 16), 1, "too short (16B) -> 1");
+    assert_eq(_spirv_validate(&buf, 21), 2, "not u32-aligned (21B) -> 2");
+    # bad magic.
+    store32(&buf + 0, 0xDEADBEEF);
+    assert_eq(_spirv_validate(&buf, 20), 3, "bad magic -> 3");
+    # byte-swapped (big-endian) magic.
+    store32(&buf + 0, MABDA_SPIRV_MAGIC_SWAPPED);
+    assert_eq(_spirv_validate(&buf, 20), 4, "byte-swapped magic -> 4");
+    # restore magic; bound malformed.
+    store32(&buf + 0, MABDA_SPIRV_MAGIC);
+    store32(&buf + 12, 0);
+    assert_eq(_spirv_validate(&buf, 20), 5, "id-bound 0 -> 5");
+    store32(&buf + 12, 0x40000000);
+    assert_eq(_spirv_validate(&buf, 20), 5, "id-bound too large -> 5");
+    # restore bound; runaway word-count cap (small buffer, huge byte_len param —
+    # validate only reads word0 + word3, both in-bounds).
+    store32(&buf + 12, 1);
+    assert_eq(_spirv_validate(&buf, (MABDA_MAX_SPIRV_WORDS + 1) * 4), 6,
+    "word count over cap -> 6");
+    return 0;
+}
+
 # v3.1 [M.3(wgpu)]: per-level view descriptor sets baseMipLevel; the rest
 # matches the base view builder (mipLevelCount=1, single layer).
 fn test_wgpu_texture_view_descriptor_level() {
@@ -1821,6 +1865,8 @@ fn main() {
     test_gpu_texture_create_dispatches_through_backend();
     test_wgsl_source_explicit_length();
     test_wgsl_source_cstr_not_truncated_at_4k();
+    test_spirv_source_builder();
+    test_spirv_validate();
     test_wgpu_texture_view_descriptor_level();
     test_wgpu_bgl_entry_texture();
     test_wgpu_bgl_entry_storage_texture();

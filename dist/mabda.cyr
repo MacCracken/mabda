@@ -1024,7 +1024,8 @@ enum WGPUStoreOp {
 # WGPUChainedStruct sType (wgpu-native v29 values)
 # ================================================================
 enum WGPUSType {
-    WGPU_STYPE_SHADER_SOURCE_WGSL = 0x00000002;
+    WGPU_STYPE_SHADER_SOURCE_SPIRV = 0x00000001;   # webgpu.h v29 (Phase S)
+    WGPU_STYPE_SHADER_SOURCE_WGSL  = 0x00000002;
 }
 
 # ================================================================
@@ -1437,6 +1438,52 @@ fn wgpu_shader_source_wgsl_len(wgsl_code, n): i64 {
     wgpu_chained_struct(src, WGPU_STYPE_SHADER_SOURCE_WGSL);
     wgpu_string_view_len(src + 16, wgsl_code, n);
     return src;
+}
+
+# ================================================================
+# WGPUShaderSourceSPIRV (32 bytes, wgpu-native v29) — Phase S.1
+# ================================================================
+# Layout verified vs deps/wgpu-native/include/webgpu/webgpu.h:
+#   +0:  chain (ChainedStruct = 16; next@0 NULL, sType@8 = SPIRV)
+#   +16: codeSize (u32)  -- COUNT OF u32 WORDS, NOT bytes (the #1 SPIRV
+#                           integration bug; pinned by a test)
+#   +20: (4 padding — `code` is 8-byte aligned)
+#   +24: code (const uint32_t*, 8)
+# Contrast WGSL's payload: a 16-byte StringView (data+len) at +16. Here it's
+# a u32 word-count at +16 and a u32* at +24.
+var MABDA_SPIRV_MAGIC         = 0x07230203;   # SPIR-V header word[0] (host LE)
+var MABDA_SPIRV_MAGIC_SWAPPED = 0x03022307;   # big-endian (byte-swapped) binary
+var MABDA_MAX_SPIRV_WORDS     = 16777216;     # 16 Mi words = 64 MiB runaway cap
+
+fn wgpu_shader_source_spirv(words_ptr, word_count): i64 {
+    var src = alloc(32);
+    memset(src, 0, 32);
+    wgpu_chained_struct(src, WGPU_STYPE_SHADER_SOURCE_SPIRV);
+    store32(src + 16, word_count);   # codeSize in WORDS
+    store64(src + 24, words_ptr);    # code ptr
+    return src;
+}
+
+# Cheap structural validation of a SPIR-V binary BEFORE it crosses into
+# wgpu-native's parser (P(-1) input-validation / buffer-safety). Returns 0 on
+# ok, else a distinct nonzero code (callers treat any nonzero as reject):
+#   1 too short (< 5-word/20-byte header)   2 byte length not u32-aligned
+#   3 bad magic (not SPIR-V)                4 byte-swapped (big-endian binary)
+#   5 id-bound (word[3]) malformed (0 or wildly large)
+#   6 word count exceeds the runaway cap
+# Full validation is SPIRV-Tools' job (not vendored); this catches the common
+# feeds-garbage feeds before the driver. @internal
+fn _spirv_validate(ptr, byte_len): i64 {
+    if (byte_len < 20)        { return 1; }   # header = 5 words
+    if ((byte_len & 3) != 0)  { return 2; }   # u32 word stream
+    var magic = load32(ptr);                  # word[0], host-LE read
+    if (magic == MABDA_SPIRV_MAGIC_SWAPPED) { return 4; }   # big-endian binary
+    if (magic != MABDA_SPIRV_MAGIC)         { return 3; }   # not SPIR-V
+    var bound = load32(ptr + 12);             # word[3] = id bound
+    if (bound == 0)           { return 5; }
+    if (bound >= 0x40000000)  { return 5; }   # loose upper guard
+    if ((byte_len / 4) > MABDA_MAX_SPIRV_WORDS) { return 6; }
+    return 0;
 }
 
 # ================================================================

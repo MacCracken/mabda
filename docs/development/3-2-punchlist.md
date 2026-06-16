@@ -363,8 +363,11 @@ Proposal: [`v3.2-spirv-ingestion-wgpu.md`](../proposals/v3.2-spirv-ingestion-wgp
 Adds an explicit shader **source-kind tag** (WGSL/SPIR-V/GFX9-ISA) to the
 byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
 
-- [ ] **S.1** — Constants + `WGPUShaderSourceSPIRV` builder (codeSize in
-  **words**) + structural validation (magic/align/bound).
+- [x] **S.1** — done. `WGPU_STYPE_SHADER_SOURCE_SPIRV=0x1` (wgpu_types) +
+  `wgpu_shader_source_spirv(words_ptr, word_count)` (32 B; codeSize in **words**
+  @+16, code ptr @+24 — webgpu.h v29-pinned) + `_spirv_validate(ptr, byte_len)`
+  (magic/align/bound + 16 Mi-word cap; 6 distinct codes incl. byte-swapped-magic
+  detection) — all in `wgpu_descriptors.cyr`, CPU-tested (backend.tcyr).
 - [ ] **S.2** — Widen shader-create slot `(…,kind)` (fncall3→4); wgpu
   branches on kind; `gpu_shader_module_create_spirv`.
 - [ ] **S.3** — Source-kind-aware shader cache (`_shader_hash_n`, kind in
