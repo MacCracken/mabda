@@ -391,8 +391,14 @@ byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
   the launcher must carry this 4-line edit to use SPIR-V shaders; WGSL is
   unaffected. mabda can't detect a missing-feature instance before the create —
   the fail-loud 0 module is the contract.
-- [ ] **S.5** — wgpu HW e2e (`spirv_e2e.cyr`, render path — wgpu compute
-  is still a v3.0 stub; cross-source identity vs WGSL).
+- [x] **S.5** — done. `programs/spirv_e2e.cyr` (+ `make test-spirv-e2e`): a
+  fullscreen-triangle+red SPIR-V module (glslang `-e vs_main`/`-e fs_main` +
+  spirv-link, spirv-val-clean, 339 words embedded) created via
+  `gpu_shader_module_create_spirv`, rendered through `render_pipeline_create_simple`,
+  read back, and **byte-identical to the WGSL twin** (cross-source identity).
+  **HW-verified on the wgpu-native box** — exercises S.2 (slot+entry) + S.4
+  (instance feature) end-to-end. (Fullscreen triangle → whole RT red, so the
+  identity holds regardless of the WGSL-vs-Vulkan Y convention.)
 - [ ] **S.6** — **Cut 3.2.4.**
 
 ---
