@@ -246,9 +246,17 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   addrlib-exact tiled geometry (`epitch` + tiled BO size that the TA agrees
   with) — confirmed at TS.7 by sampling the SDMA-tiled BC surface vs a CPU
   decode.
-- [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**
-  (`native_compressed_sample_e2e.cyr`, CPU-decode verify); flip native BC
-  cap bit to 1.
+- [~] **TS.7** — **BC1/BC7 compressed sampling on Cezanne** (delivered in
+  sub-bites). **TS.7a done:** `native_gfx9_shader_textured_sample_fs` — the
+  `image_sample` (BC-decoding) FS (llvm-mc + byte-pinned + disasm round-trip);
+  reuses the screen-pos oracle but divides by texture dims (reciprocals in
+  user-SGPRs s2/s3) for normalized coords; loads T# (s[0:7]) + S# (s[8:11])
+  from the descriptor BO; `GFX9_PS_PGM_RSRC2_SAMPLE`=0x8 (USER_SGPR=4).
+  **Remaining:** (b) tiled `create_sampleable` (SDMA-tiled BO + the
+  addrlib-exact `epitch`/size + the BC T# with SW_64KB_S) + write(L2T)/read(T2L);
+  (c) wire the sample FS into the draw (RSRC2=0x8 + USER_DATA rcp_w/rcp_h) +
+  `native_compressed_sample_e2e.cyr` (BC1 sample vs CPU decode) + on-device
+  geometry iteration; flip native BC cap bit to 1.
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
   limitation**; cut the TS minors.
