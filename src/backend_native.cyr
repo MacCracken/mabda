@@ -1122,14 +1122,19 @@ fn _native_dma_submit_oneshot(ctx, h_lin, h_tiled, sdma_bytes): i64 {
     var sbuf[8];
     if (native_syncobj_create(fd, &sbuf) != 0) { return 0 - 1; }
     var so = load64(&sbuf);
-    var rc = native_cs_submit_4chunk(fd, native_ctx_id(ctx), &bo_list_in,
-    native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
-    native_ctx_fence_handle(ctx), 32, 0);
-    if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
+    # Compute the wait deadline BEFORE the submit so the ONLY post-submit step is
+    # the wait. (Review 2026-06-16 LOW: if clock_gettime ran after a successful
+    # submit and failed, we'd destroy the syncobj + return without waiting, then
+    # the caller would free the staging BO while the SDMA CS still reads/writes
+    # it — a GPU-side UAF. Now a clock failure happens with nothing in flight.)
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { native_syncobj_destroy(fd, so); return 0 - 1; }
     var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var rc = native_cs_submit_4chunk(fd, native_ctx_id(ctx), &bo_list_in,
+    native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
+    native_ctx_fence_handle(ctx), 32, 0);
+    if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
     var wrc = native_syncobj_wait(fd, so, deadline);
     native_syncobj_destroy(fd, so);
     return wrc;
@@ -1156,10 +1161,11 @@ fn _native_texture_tiled_copy(ctx, tex, host, n, detile): i64 {
     if (n != wb * hb * bb) { return GPU_ERR_BUFFER; }
 
     var fd = native_ctx_fd(ctx);
-    # Transient linear staging BO (page-aligned for GEM_VA).
+    # Transient linear staging BO mapped at the DEDICATED, re-used staging VA
+    # (page-aligned size; the fixed slot avoids leaking the texture VA region).
     var stage_size = _native_align_up(n, 4096);
-    var stage_va = native_ctx_alloc_texture_va(ctx, stage_size);
-    if (stage_va == 0) { return GPU_ERR_OTHER; }
+    if (stage_size > _NATIVE_STAGING_VA_REGION) { return GPU_ERR_BUFFER; }
+    var stage_va = _NATIVE_STAGING_VA;
     var sbo[16];
     if (native_bo_create_gtt(fd, stage_size, &sbo) != 0) { return GPU_ERR_OTHER; }
     var stage_h = load64(&sbo + 0);
@@ -1183,8 +1189,11 @@ fn _native_texture_tiled_copy(ctx, tex, host, n, detile): i64 {
     }
     native_gem_va_unmap(fd, stage_h, stage_va, stage_size);
     native_bo_release_gtt(fd, stage_h, stage_a, stage_size);
-    if (rc != 0) { return GPU_ERR_TEXTURE; }
-    return 0;
+    # Preserve the SDMA errno (timeout vs OOM vs busy) like the sibling buffer
+    # path (native_transfer_copy_timeline); a packet-build failure (sdma_bytes<=0,
+    # rc left -1) maps to a texture error. (Review 2026-06-16 LOW consistency.)
+    if (sdma_bytes <= 0) { return GPU_ERR_TEXTURE; }
+    return _native_neg_rc_to_gpu_err(rc);
 }
 
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
@@ -1804,6 +1813,18 @@ fn backend_native_new(): i64 {
 var _NATIVE_TEXTURE_VA_BASE   = 0xFFFF800180000000;
 var _NATIVE_TEXTURE_VA_REGION = 0x80000000;   # 2 GiB
 var _NATIVE_TEXTURE_VA_ALIGN  = 0x10000;      # 64 KiB per allocation
+
+# v3.2 TS.7c-3 — fixed per-context staging VA for the tiled-copy bounce buffer.
+# The tiled write/read path needs a transient linear staging BO; mapping it at a
+# DEDICATED, RE-USED VA each call (rather than bump-allocating a fresh one)
+# avoids permanently consuming the forward-only texture VA region — without it a
+# streaming consumer exhausts the 2 GiB budget after ~32K copies (review
+# 2026-06-16 MEDIUM). Tiled copies are synchronous (each waits before returning),
+# so the single slot is never live across two copies. Sits in the free gap below
+# the texture region; 256 MiB caps the largest single staging map (>= any 8192²
+# compressed surface, ~64 MiB).
+var _NATIVE_STAGING_VA        = 0xFFFF800140000000;
+var _NATIVE_STAGING_VA_REGION = 0x10000000;   # 256 MiB
 
 # Bump-allocate an aligned texture VA range of `size` bytes from the
 # per-context region. Returns the base VA, or 0 on region exhaustion
