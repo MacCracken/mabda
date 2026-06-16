@@ -297,11 +297,12 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
       reports BC unsupported because native never builds a caps struct at all —
       wiring native caps is TS.8's "strike Phase T's storage-only limitation."
-- [~] **TS.8** — Bilinear: **TS.8a done** (scale plumbing, see below), TS.8b remaining;
-  ETC2/ASTC **RESOLVED — HW-blocked on AMD** (vulkaninfo: ETC2/ASTC=false, BC=true;
-  cap correctly NOT flipped, see below); native caps advertisement **done**;
-  **strike Phase T's storage-only limitation** (BC done; full from_context caps
-  builder remaining); cut the TS minors. Details:
+- [~] **TS.8** — Bilinear **DONE** (TS.8a scale plumbing + TS.8b observable e2e,
+  HW-verified, see below); ETC2/ASTC **RESOLVED — HW-blocked on AMD** (vulkaninfo:
+  ETC2/ASTC=false, BC=true; cap correctly NOT flipped, see below); native caps
+  advertisement **done**; **strike Phase T's storage-only limitation** (BC done;
+  full from_context caps builder remaining); BC6H needs an HDR RT path. Remaining:
+  from_context caps builder, BC6H, then cut the TS minors. Details:
   - **Bilinear TS.8a done (scale plumbing @ scale=1.0, regression-only)** — both
     textured FS builders (image_load + image_sample) now `s_load_dwordx2` a per-draw
     scale (f32) from descriptor+48/+52 and `v_mul_f32` the fragment position before
@@ -317,12 +318,17 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     rt_dim)` (equal dims → exactly 1.0, so the existing e2es stay pixel-exact —
     HW-re-verified); (3) `bind_for_sample` rebuilds the S# from the bound sampler
     (BILINEAR/POINT + CLAMP/WRAP, unnorm kept) — POINT/CLAMP rebuilds byte-identical
-    to the create default (regression-safe, CPU-asserted). **TS.8b remaining (the
-    observable bite):** a `native_bilinear_sample_e2e` (small tex over a larger RT,
-    scale<1 → fractional coords → blend; ±2 interior oracle + POINT-vs-BILINEAR
-    discriminator) + HW verify. Per the design workflow, unnormalized bilinear at
-    texture EDGES is a documented precision limitation (the normalized-UV path is
-    the edge-faithful follow-on).
+    to the create default (regression-safe, CPU-asserted). **TS.8b done
+    (observable):** `native_bilinear_sample_e2e` samples a 32×32 gradient texture
+    (R=x*8) over a 64×64 RT (scale 0.5 → fractional coords) with POINT then
+    BILINEAR. Convention-independent discriminator on RT row 32 — **POINT = 0
+    intermediates** (every R a multiple of 8, exact texels), **BILINEAR = 62
+    intermediates** (blends adjacent columns), edges clamp for both. **HW-verified
+    on Cezanne — native bilinear filtering is live.** EXACT interior weights + edge
+    fidelity for arbitrary unnormalized scaling are a documented precision
+    limitation; the edge-faithful normalized-UV path (UV-export VS + rcp FS) is the
+    follow-on — a convention refinement, not missing functionality.
+    **Bilinear/scaled sampling (TS.8) is complete.**
   - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
     (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
     consumer populates a native context's caps the same way:

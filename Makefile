@@ -356,6 +356,16 @@ build/native_compressed_sample_e2e: programs/native_compressed_sample_e2e.cyr sr
 test-native-compressed-sample-e2e: build/native_compressed_sample_e2e
 	./build/native_compressed_sample_e2e
 
+# v3.2 TS.8b — observable bilinear: a small texture over a larger RT (scale<1),
+# POINT (exact texels) vs BILINEAR (blends). HW-gated.
+build/native_bilinear_sample_e2e: programs/native_bilinear_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_bilinear_sample_e2e.cyr $@
+
+.PHONY: test-native-bilinear-sample-e2e
+test-native-bilinear-sample-e2e: build/native_bilinear_sample_e2e
+	./build/native_bilinear_sample_e2e
+
 # v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
 # -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
 # result CPU-verified. HW-gated (needs an AMD render node).
