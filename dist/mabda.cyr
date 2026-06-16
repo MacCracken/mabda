@@ -12489,6 +12489,27 @@ fn gpu_sampler_is_valid(s): i64 {
     return 0;
 }
 
+# v3.2 TS.5 (wgpu sample path) — build a 64-byte WGPUSamplerDescriptor from a
+# NATIVE_SAMP_* intent (filter + addr), ready for wgpu_device_create_sampler.
+# NEAREST/CLAMP_TO_EDGE is the point/clamp MVP; BILINEAR -> LINEAR, WRAP ->
+# REPEAT. mipmapFilter NEAREST, lodMaxClamp 32.0, maxAnisotropy 1 (a 0 trips a
+# wgpu validation error). Field offsets pinned vs the layout above.
+fn wgpu_sampler_descriptor_from_intent(filter, addr): i64 {
+    var d = alloc(64);
+    _sampler_desc_init(d, 0);
+    var amode = WGPU_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (addr == NATIVE_SAMP_ADDR_WRAP) { amode = WGPU_ADDRESS_MODE_REPEAT; }
+    store32(d + 24, amode);   # addressModeU
+    store32(d + 28, amode);   # addressModeV
+    store32(d + 32, amode);   # addressModeW
+    var fmode = WGPU_FILTER_MODE_NEAREST;
+    if (filter == NATIVE_SAMP_FILTER_BILINEAR) { fmode = WGPU_FILTER_MODE_LINEAR; }
+    store32(d + 36, fmode);   # magFilter
+    store32(d + 40, fmode);   # minFilter
+    store32(d + 44, WGPU_MIPMAP_FILTER_NEAREST);   # mipmapFilter
+    return d;
+}
+
 # --- depth.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
@@ -12700,6 +12721,36 @@ fn bglb_build_entries(b): i64 {
         memcpy(arr + i * 120, src, 120);
     }
     return arr;
+}
+
+# ================================================================
+# v3.2 TS.5 (wgpu sample path) — bind-GROUP descriptor builder
+# ================================================================
+# Builds a WGPUBindGroupDescriptor for the textured-sample group:
+# binding 0 = texture view, binding 1 = sampler. `bgl` is the matching
+# bind-group LAYOUT (bglb: texture_2d@0 + sampler@1). Allocates the 48-byte
+# descriptor + the 2-entry (56 B each) array; returns the descriptor ptr for
+# wgpu_device_create_bind_group. Layouts pinned vs webgpu.h v29:
+#   WGPUBindGroupEntry (56 B): nextInChain@0 binding@8 buffer@16 offset@24
+#                              size@32 sampler@40 textureView@48
+#   WGPUBindGroupDescriptor (48 B): nextInChain@0 label@8(StringView,16)
+#                              layout@24 entryCount@32 entries@40
+fn wgpu_texture_bind_group_descriptor(bgl, view, sampler): i64 {
+    var entries = alloc(112);   # 2 × 56
+    memset(entries, 0, 112);
+    # entry 0: texture view at binding 0
+    store32(entries + 8,  0);          # binding
+    store64(entries + 48, view);       # textureView
+    # entry 1: sampler at binding 1
+    store32(entries + 56 + 8,  1);     # binding
+    store64(entries + 56 + 40, sampler);   # sampler
+    var desc = alloc(48);
+    memset(desc, 0, 48);
+    wgpu_string_view_null(desc + 8);   # label (empty)
+    store64(desc + 24, bgl);           # layout
+    store64(desc + 32, 2);             # entryCount
+    store64(desc + 40, entries);       # entries
+    return desc;
 }
 
 # --- texture.cyr ---

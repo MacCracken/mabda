@@ -196,9 +196,14 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `_backend_wgpu_texture_bind_for_sample` (stashes tex/sampler on the wgpu
   pass, grown 32→40); both wgpu slots installed; **`backend_is_complete` walk
   over 264..280 ACTIVATED** (9th range, both backends complete). Sequencing
-  chosen 2026-06-15: "3, 2, 1". **Remaining:** (2) the wgpu sample render path
-  (BGL + textured pipeline + bind group + `set_bind_group` + WGSL shader +
-  e2e); (1) the native PM4 render surgery — textured-FS pipeline (image_load),
+  chosen 2026-06-15: "3, 2, 1". **(2) wgpu sample path — foundation done:**
+  `wgpu_texture_bind_group_descriptor` (bind_group.cyr) +
+  `wgpu_sampler_descriptor_from_intent` (sampler.cyr), pinned vs webgpu.h v29;
+  the rest of the FFI (BGL/pipeline-layout/bind-group/sampler/set_bind_group)
+  already present. *(2) remaining:* WGSL textured shader + BGL/pipeline-layout
+  /textured-pipeline + wire bind-group-build+set_bind_group into the wgpu draw
+  + `wgpu_texture_sample_e2e.cyr` (runnable — wgpu-native present on this box).
+  **Remaining:** (1) the native PM4 render surgery — textured-FS pipeline (image_load),
   `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA `SET_SH_REG`, RSRC1 high-water —
   wired into `render_pass_draw` + `native_texture_sample_e2e.cyr` + on-device
   iteration.
