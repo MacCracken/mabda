@@ -18,6 +18,100 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.3] — 2026-06-16
+
+**Native compressed (BC) + filtered texture sampling (Phase TS.6–8).** Completes
+the v3.2.x arc's native-sampling story (`docs/development/3-2-punchlist.md`
+Phase TS): the **native AMD** backend now samples **block-compressed** textures
+(BC1/BC3/BC4/BC5/BC7) and does **bilinear / scaled** filtering — not just the
+RGBA8/linear point sampling of 3.2.2. The whole path is HW-verified on Cezanne:
+SDMA SW_64KB_S tiling (TS.6) → BC sampling pixel-exact vs a CPU decode (TS.7) →
+bilinear blends vs point (TS.8). **ETC2/ASTC are resolved HW-blocked on AMD**
+(`vulkaninfo`: `textureCompressionBC=true`, `ETC2`/`ASTC=false`) — the cap stays
+BC-only. Toolchain **6.2.11 → 6.2.12**. CPU suite 2702 → **2882** assertions.
+
+### Added
+
+- **Native BC compressed sampling (BC1/BC3/BC4/BC5/BC7).** A compressed
+  `gpu_texture_create_2d_sampleable` builds a SW_64KB_S-tiled surface + a BC T#;
+  `gpu_texture_write`/`read` route through an SDMA `COPY_TILED_SUB_WINDOW`
+  (L2T/T2L) bridge; the `image_sample` FS does the TA block-decode. HW-verified
+  pixel-exact vs a CPU decode by `native_compressed_sample_e2e` (BC1 RGB565
+  endpoints + checker, BC4→(R,0,0,1), BC5→(R,G,0,1), BC3 RGB+alpha, BC7 mode-6).
+- **Native bilinear / scaled sampling (TS.8).** The textured FS multiplies the
+  fragment position by a per-draw scale (`tex_dim/rt_dim`, f32, from the
+  descriptor tail), and `gpu_render_pass_bind_texture` rebuilds the S# from the
+  bound `gpu_sampler_create` (POINT/BILINEAR × CLAMP/WRAP). HW-verified by
+  `native_bilinear_sample_e2e` (POINT = exact texels, BILINEAR = blends).
+- **Native capability advertisement** — `gpu_caps_native_texture_compression()`
+  (sibling of the wgpu adapter detector) + `native_texfmt_sampleable(fmt)` (the
+  per-format source of truth, BC6H-aware), so a consumer populates a native
+  context's caps the same way as wgpu (strikes the "storage-only" limitation).
+- Byte-builders + helpers: `native_sdma_build_copy_tiled` (TS.6 COPY_TILED),
+  `native_tex_tiled_params` / `native_tex_build_tiled_copy_packet` (awb-1 epitch),
+  `native_tex_desc_cpu_addr`, `int_ratio_to_f32` (the float shim — see below).
+- e2e programs `native_tiled_texture_roundtrip` (BC1+BC7 L2T→T2L identity),
+  `native_compressed_sample_e2e`, `native_bilinear_sample_e2e` + `make` targets.
+
+### Changed
+
+- **Toolchain pin 6.2.11 → 6.2.12.**
+- Both textured FS builders (`image_load`, `image_sample`) gained the per-draw
+  scale `s_load_dwordx2` + `v_mul_f32` (108/112 → **124** B each; llvm-mc-verified
+  + byte-pinned). No PS register/ABI change (`s[12:13]` fits `RSRC1_PS MIN|1`).
+- `native_gfx9_image_descriptor` gained an explicit `epitch` param + per-format
+  `DST_SEL` (BC4→X001, BC5→XY01, ETC2_RGB→XYZ1; else identity).
+  `native_gfx9_sampler_descriptor` gained `unnorm` (FORCE_UNNORMALIZED).
+- `NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC` — native BC create+sample on by
+  default; the create slot gates per-format via `native_texfmt_sampleable`.
+
+### Fixed
+
+- Adversarial-review fixes (3 review workflows; `docs/audit/`): **BC6H gated off**
+  (HDR float decoded into an RGBA8_UNORM RT = silently-wrong; HIGH); **per-format
+  DST_SEL** (identity swizzle broadcast a 1-channel BC4 to (R,R,R,R); HIGH, caught
+  by adding the BC4/BC5 sample probes); **staging-VA leak** (per-copy bump-VA
+  exhaustion → a fixed re-used staging VA; MED); **partial-create GEM handle leak**
+  (root-fixed in `_native_bo_create_domain`; LOW, codebase-wide); **clock-before-
+  submit UAF window** + **errno-preserving error class** on the SDMA copy (LOW).
+- Latent **probe-buffer overflow** in the sample e2es (`var X[N]` is N bytes; the
+  `[8]`/`[5]` arrays held 1 i64 but stored 8/5 — passed only by stack luck).
+
+### Resolved / HW gaps
+
+- **ETC2/ASTC — HW-blocked on AMD** (`vulkaninfo` confirms no decode; the GFX9
+  IMG_DATA_FORMAT enum has them but the silicon/driver doesn't implement it). Cap
+  stays BC-only; the generic per-format groundwork (ETC2_RGB DST_SEL) is kept for
+  a future arch. See `project_etc2_astc_cezanne_black` memory.
+- **BC6H** sampling needs an HDR (float) render-target path — gated off until then.
+- **Unnormalized bilinear** edge fidelity (half-texel/clamp convention) is a
+  documented precision limitation; the edge-faithful normalized-UV path
+  (UV-export VS + rcp FS) is the follow-on, not missing functionality.
+
+### Unblocked
+
+- Filed a Cyrius toolchain proposal for **native float arithmetic**
+  (`cyrius/docs/development/proposals/2026-06-16-native-float-arithmetic.md`):
+  mabda computes the blit scale via the inline-SSE2 `int_ratio_to_f32` **shim**
+  because Cyrius has no float ops; the proposal replaces all three asm float
+  shims with first-class floats (also unblocks non-x86-64 targets).
+
+### Security
+
+- Three adversarial review workflows over the diffs (TS.7c-2/-3/-4) — **0
+  CRITICAL**, **2 HIGH→fixed**, several MED/LOW→fixed before the cut. Each fix
+  landed with a test or is HW-covered. `docs/audit/2026-06-16-ts678-audit.md`.
+
+### Metrics
+
+- CPU assertions 2702 → **2882**. Both textured FS 108/112 → 124 B. Toolchain
+  6.2.11 → 6.2.12. `Backend` unchanged (280 B — caps advertisement is non-slot).
+
+### Next
+
+- **from_context caps builder** + **BC6H** (HDR RT) finish Phase TS; then Phase S
+  (SPIR-V), Phase N (native SPIR-V→GFX9), Phase F (f64), Phase R (render-graph MQ).
+
 ## [3.2.2] — 2026-06-15
 
 **Native texture sampling (Phase TS.1–5).** Third feature of the v3.2.x arc
