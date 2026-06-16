@@ -133,7 +133,10 @@ HW-proven (`native_sdma_copy_e2e.cyr`).
   CPU test for the chunk/VA-offset/overflow math; HW e2e **leg C** (6 MiB =
   2 packets, byte-exact across the boundary, verified on Cezanne). Closes the
   >4 MiB native gap for all realistic buffers.
-- [ ] **X.9** — **Cut 3.2.1.**
+- [x] **X.9** — **Cut 3.2.1.** VERSION 3.2.0→3.2.1; CHANGELOG `[3.2.1]`;
+  CLAUDE.md / README version + state synced (2530 asserts); audit doc
+  `docs/audit/2026-06-15-buffer-copy-audit.md`; `version-check.sh` OK; dist
+  regenerated (embeds 3.2.1) + idempotent. Phase X **complete**.
 
 ---
 
