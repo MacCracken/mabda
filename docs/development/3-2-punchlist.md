@@ -156,11 +156,13 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
 > TS.5 on the Cezanne. Builders land as pure CPU-pinned byte-writers; the
 > `gpu_sampler_create` dispatcher + wgpu filler + the two slots fold into TS.3.
 
-- [~] **TS.1** — format→IMG-format table **done** (`native_gfx9_texfmt_to_img_format`
-  + `native_img_data_format`/`_num_format`, every row pinned vs gfx9.json
-  `IMG_DATA_FORMAT`/`IMG_NUM_FORMAT`). **Remaining:** the 256-bit T#
-  image-descriptor builder (`SQ_IMG_RSRC_WORD1..6` layout already pulled from
-  gfx9.json) — NEXT.
+- [x] **TS.1** — **done.** format→IMG-format table (`native_gfx9_texfmt_to_img_format`
+  + `native_img_data_format`/`_num_format`) + the 256-bit T# builder
+  (`native_gfx9_image_descriptor`): all 8 dwords + every field (BASE_ADDRESS
+  hi/lo, DATA/NUM_FORMAT, WIDTH/HEIGHT, identity DST_SEL, LAST_LEVEL, SW_MODE,
+  TYPE=2D, PITCH, MAX_MIP) pinned vs gfx9.json `SQ_IMG_RSRC_WORD0..6` +
+  `SQ_SEL_XYZW01`/`SQ_RSRC_IMG_TYPE`. Bit positions authoritative; value
+  semantics (linear PITCH alignment, MIN_LOD) HW-cross-checked at TS.5.
 - [~] **TS.2** — GFX9 S# sampler-descriptor builder **done**
   (`native_gfx9_sampler_descriptor`, 4 dwords pinned vs gfx9.json
   `SQ_IMG_SAMP_WORD0..3` + `SQ_TEX_*` enums; point/clamp + bilinear/wrap) +

@@ -576,6 +576,57 @@ fn test_native_compute_dispatch_on_dma_queue_rejected() {
 # point-bump / pending-wait-consume bookkeeping on the full path
 # (fake fd makes the submit fail without HW).
 
+# v3.2 TS.1 — T# image descriptor: every dword + field pinned against the
+# gfx9.json SQ_IMG_RSRC_WORD0..6 bit layout + SQ_SEL/IMG_TYPE enums.
+fn test_native_gfx9_image_descriptor() {
+    var buf[32];
+    memset(&buf, 0, 32);
+    # RGBA8 2D, 256x256, LINEAR, single level, canonical-high VA.
+    var end = native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1);
+    assert_eq(end, 32, "returns pos + 32");
+    var w0 = load32(&buf + 0);
+    var w1 = load32(&buf + 4);
+    var w2 = load32(&buf + 8);
+    var w3 = load32(&buf + 12);
+    var w4 = load32(&buf + 16);
+    var w5 = load32(&buf + 20);
+    assert_eq(w0, 0x01800000, "W0 = va[39:8]");
+    assert_eq(w1 & 0xFF, 0x80, "W1 BASE_ADDRESS_HI[0:7] = va[47:40]");
+    assert_eq((w1 >> 20) & 0x3F, 10, "W1 DATA_FORMAT[20:25] = 8_8_8_8(10)");
+    assert_eq((w1 >> 26) & 0xF, 0, "W1 NUM_FORMAT[26:29] = UNORM(0)");
+    assert_eq(w2 & 0x3FFF, 255, "W2 WIDTH[0:13] = w-1");
+    assert_eq((w2 >> 14) & 0x3FFF, 255, "W2 HEIGHT[14:27] = h-1");
+    assert_eq(w3 & 0x7, 4, "W3 DST_SEL_X = SQ_SEL_X(4)");
+    assert_eq((w3 >> 3) & 0x7, 5, "W3 DST_SEL_Y = SQ_SEL_Y(5)");
+    assert_eq((w3 >> 6) & 0x7, 6, "W3 DST_SEL_Z = SQ_SEL_Z(6)");
+    assert_eq((w3 >> 9) & 0x7, 7, "W3 DST_SEL_W = SQ_SEL_W(7)");
+    assert_eq((w3 >> 16) & 0xF, 0, "W3 LAST_LEVEL = 0 (single level)");
+    assert_eq((w3 >> 20) & 0x1F, 0, "W3 SW_MODE = LINEAR(0)");
+    assert_eq((w3 >> 28) & 0xF, 9, "W3 TYPE = SQ_RSRC_IMG_2D(9)");
+    assert_eq(w4, 0x1FE000, "W4 PITCH[13:28] = (w-1) for linear");
+    assert_eq(w5, 0, "W5 MAX_MIP = 0 (single level)");
+    assert_eq(load32(&buf + 24), 0, "W6 = 0 (no DCC)");
+    assert_eq(load32(&buf + 28), 0, "W7 = 0 (no meta)");
+    # BC1 swaps only the DATA_FORMAT field.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_LINEAR, 1);
+    assert_eq((load32(&buf + 4) >> 20) & 0x3F, 35, "BC1 DATA_FORMAT = 35");
+    # 4-level mip: LAST_LEVEL + MAX_MIP both = 3.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 4);
+    assert_eq((load32(&buf + 12) >> 16) & 0xF, 3, "4-level LAST_LEVEL = 3");
+    assert_eq((load32(&buf + 20) >> 28) & 0xF, 3, "4-level MAX_MIP = 3");
+    # Rejections.
+    assert_eq(native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    256, 256, 99, GFX9_SW_MODE_LINEAR, 1), 0 - 1, "unsupported fmt -> -1");
+    assert_eq(native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    0, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1), 0 - 1, "w<=0 -> -1");
+    return 0;
+}
+
 # v3.2 TS.2 — format->IMG-format table: every row pinned against the
 # gfx9.json IMG_DATA_FORMAT / IMG_NUM_FORMAT enum values.
 fn test_native_gfx9_texfmt_to_img_format() {
@@ -2792,6 +2843,7 @@ fn main() {
     test_native_cs_submit_timeline_point_guards();
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
+    test_native_gfx9_image_descriptor();
     test_native_gfx9_texfmt_to_img_format();
     test_native_gfx9_sampler_descriptor();
     test_native_sdma_build_copy_chained();
