@@ -297,9 +297,10 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
       reports BC unsupported because native never builds a caps struct at all —
       wiring native caps is TS.8's "strike Phase T's storage-only limitation."
-- [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
-  HW decode verifies — see HW gaps); **strike Phase T's storage-only
-  limitation**; cut the TS minors. Also:
+- [~] **TS.8** — Bilinear (remaining); ETC2/ASTC **RESOLVED — HW-blocked on AMD**
+  (vulkaninfo: ETC2/ASTC=false, BC=true; cap correctly NOT flipped, see below);
+  native caps advertisement **done**; **strike Phase T's storage-only limitation**
+  (BC done; full from_context caps builder remaining); cut the TS minors. Details:
   - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
     (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
     consumer populates a native context's caps the same way:
@@ -312,24 +313,19 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     cleanup.
   - **BC6H sample** once an HDR RT path lands (BC1/BC3/BC4/BC5/BC7 are all
     HW-sample-verified; BC6H is the only BC format still gated, on HDR grounds).
-  - **ETC2/ASTC — flagged, cap stays OFF.** gfx9.json confirms GFX9's
-    IMG_DATA_FORMAT enum HAS ETC2_RGB=24 / ETC2_RGBA=25 / ASTC_2D_LDR=46, and the
-    sample path is format-generic (ETC2_RGB = 8 B/block tiles byte-identically to
-    BC1). Groundwork laid: the ETC2_RGB 3-channel DST_SEL (W=SEL_1) + format-table
-    rows + CPU tests. BUT a TS.8 HW probe (ETC2_RGB8 differential-uniform block,
-    sampled via the proven image_sample path) returned **uniformly black RGB
-    (alpha correct), IDENTICALLY for both big- and little-endian block byte
-    orders** — i.e. the TA's output is insensitive to the block bytes, so it isn't
-    decoding the ETC2 data. Since the tiling/write is byte-identical to BC1 (which
-    round-trips) and the T# DATA_FORMAT is 24, the likely cause is **gfx90c
-    (Cezanne) not having an actual ETC2 TA *decode* unit** (the format enum existing
-    ≠ the APU decoding it), or a setup detail (required swizzle mode / block bit
-    layout) not derivable from gfx9.json. **To disambiguate** (encoding-wrong vs
-    no-HW-decode): upload the SAME block bytes to a wgpu ETC2 texture (wgpu = a
-    known-correct Vulkan ETC2 decoder) and compare, or obtain a known-good ETC2
-    block from an external encoder. Until disambiguated, ETC2/ASTC stay off
-    (NATIVE_TEXCOMP_SUPPORTED = BC only). The non-working HW probe was removed
-    rather than shipped.
+  - **ETC2/ASTC — CONFIRMED HW-blocked on AMD; cap stays OFF (final).** A TS.8 HW
+    probe sampled an ETC2_RGB8 block via the proven image_sample path and got
+    uniform black, byte-order-insensitive (TA not decoding). Disambiguated against
+    the same AMD HW through Vulkan: **`vulkaninfo` reports `textureCompressionBC =
+    true`, `textureCompressionETC2 = false`, `textureCompressionASTC_LDR = false`**.
+    So AMD (Cezanne/gfx90c, and AMD desktop/APU generally) does NOT decode
+    ETC2/ASTC — the gfx9.json IMG_DATA_FORMAT enum has the values (24/25/46) but
+    the silicon/driver doesn't implement the decode. This was the right call to
+    flag, not a mabda bug. `NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC` is correct
+    and final for the AMD backend. The non-working probe was removed; the generic
+    per-format DST_SEL groundwork (ETC2_RGB 3-channel → W=SEL_1) + format-table
+    rows + CPU tests stay (correct descriptor-builder behavior, ready for any
+    future arch that does decode ETC2 — e.g. a v4 NVIDIA/Intel native backend).
 
 ---
 
