@@ -312,6 +312,24 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     cleanup.
   - **BC6H sample** once an HDR RT path lands (BC1/BC3/BC4/BC5/BC7 are all
     HW-sample-verified; BC6H is the only BC format still gated, on HDR grounds).
+  - **ETC2/ASTC — flagged, cap stays OFF.** gfx9.json confirms GFX9's
+    IMG_DATA_FORMAT enum HAS ETC2_RGB=24 / ETC2_RGBA=25 / ASTC_2D_LDR=46, and the
+    sample path is format-generic (ETC2_RGB = 8 B/block tiles byte-identically to
+    BC1). Groundwork laid: the ETC2_RGB 3-channel DST_SEL (W=SEL_1) + format-table
+    rows + CPU tests. BUT a TS.8 HW probe (ETC2_RGB8 differential-uniform block,
+    sampled via the proven image_sample path) returned **uniformly black RGB
+    (alpha correct), IDENTICALLY for both big- and little-endian block byte
+    orders** — i.e. the TA's output is insensitive to the block bytes, so it isn't
+    decoding the ETC2 data. Since the tiling/write is byte-identical to BC1 (which
+    round-trips) and the T# DATA_FORMAT is 24, the likely cause is **gfx90c
+    (Cezanne) not having an actual ETC2 TA *decode* unit** (the format enum existing
+    ≠ the APU decoding it), or a setup detail (required swizzle mode / block bit
+    layout) not derivable from gfx9.json. **To disambiguate** (encoding-wrong vs
+    no-HW-decode): upload the SAME block bytes to a wgpu ETC2 texture (wgpu = a
+    known-correct Vulkan ETC2 decoder) and compare, or obtain a known-good ETC2
+    block from an external encoder. Until disambiguated, ETC2/ASTC stay off
+    (NATIVE_TEXCOMP_SUPPORTED = BC only). The non-working HW probe was removed
+    rather than shipped.
 
 ---
 
