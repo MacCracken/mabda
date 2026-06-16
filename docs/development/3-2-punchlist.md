@@ -309,13 +309,20 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     descriptor tail unconditionally (TS.8a: literal 1.0); create defaults the tail
     to 1.0. No ABI/draw-override change (s[12:13] fits MIN|1). HW-verified: BC1/3/4/
     5/7 + RGBA8 sample e2es stay **pixel-exact** (scale 1.0 → coord==fragment).
-    `native_tex_desc_cpu_addr` helper added. **TS.8b remaining:** bind_for_sample
-    rebuilds the S# from the bound sampler (BILINEAR/POINT + addr); the draw computes
-    the real `tex_dim/rt_dim` scale (needs an f32 float-division asm helper — Cyrius
-    has only `f64_to_f32`, no int→f64/div); a `native_bilinear_sample_e2e` (small tex
-    over a larger RT, ±2 interior oracle + POINT-vs-BILINEAR discriminator). Per the
-    design workflow, unnormalized bilinear at texture EDGES is a documented precision
-    limitation (the normalized-UV path is the edge-faithful follow-on).
+    `native_tex_desc_cpu_addr` helper added. **TS.8b done (wiring):** (1) the
+    float shim `int_ratio_to_f32(num,den)` (inline SSE2, CPU-tested) since Cyrius
+    has no native float arithmetic — filed a toolchain proposal
+    (`cyrius/docs/development/proposals/2026-06-16-native-float-arithmetic.md`) to
+    replace it; (2) the draw now computes the REAL scale = `int_ratio_to_f32(tex_dim,
+    rt_dim)` (equal dims → exactly 1.0, so the existing e2es stay pixel-exact —
+    HW-re-verified); (3) `bind_for_sample` rebuilds the S# from the bound sampler
+    (BILINEAR/POINT + CLAMP/WRAP, unnorm kept) — POINT/CLAMP rebuilds byte-identical
+    to the create default (regression-safe, CPU-asserted). **TS.8b remaining (the
+    observable bite):** a `native_bilinear_sample_e2e` (small tex over a larger RT,
+    scale<1 → fractional coords → blend; ±2 interior oracle + POINT-vs-BILINEAR
+    discriminator) + HW verify. Per the design workflow, unnormalized bilinear at
+    texture EDGES is a documented precision limitation (the normalized-UV path is
+    the edge-faithful follow-on).
   - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
     (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
     consumer populates a native context's caps the same way:
