@@ -165,6 +165,17 @@ build/compressed_texture_e2e: build/compressed_texture_e2e.o deps/wgpu_main.o
 test-compressed-texture-e2e: build/compressed_texture_e2e
 	./build/compressed_texture_e2e
 
+# v3.2 X.7 — wgpu serialized buffer-copy verify: public gpu_buffer_copy
+# round-trip on a real wgpu device (the TRANSFER queue aliases the single
+# device queue). Requires wgpu-native + deps/wgpu_main.c.
+build/wgpu_transfer_copy_e2e: build/wgpu_transfer_copy_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_transfer_copy_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-transfer-copy-e2e
+test-wgpu-transfer-copy-e2e: build/wgpu_transfer_copy_e2e
+	./build/wgpu_transfer_copy_e2e
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
@@ -294,6 +305,17 @@ build/native_multiqueue_e2e: programs/native_multiqueue_e2e.cyr src/*.cyr
 .PHONY: test-native-multiqueue-e2e
 test-native-multiqueue-e2e: build/native_multiqueue_e2e
 	./build/native_multiqueue_e2e
+
+# v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
+# -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
+# result CPU-verified. HW-gated (needs an AMD render node).
+build/native_transfer_copy_e2e: programs/native_transfer_copy_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_transfer_copy_e2e.cyr $@
+
+.PHONY: test-native-transfer-copy-e2e
+test-native-transfer-copy-e2e: build/native_transfer_copy_e2e
+	./build/native_transfer_copy_e2e
 
 # v3 rc.2 — radv_capture Phase 2 helper. Builds the same PM4 stream
 # that the live compute_store dispatch produces, but writes the

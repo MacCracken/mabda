@@ -1,0 +1,236 @@
+# programs/native_transfer_copy_e2e.cyr — v3.2 X.7 (native transfer-copy)
+#
+# End-to-end validation of the v3.2 PUBLIC buffer-copy API on real AMD HW
+# (Cezanne), exercising the whole X.1–X.6 stack through the public surface
+# (no raw primitives in the hot path):
+#
+#   Leg A — pure copy round-trip:
+#     gpu_buffer_create x2 -> gpu_buffer_write(src, pattern) ->
+#     gpu_buffer_copy(src -> dst) [implicit TRANSFER queue, SDMA ring] ->
+#     gpu_buffer_read(dst) -> byte-exact verify. Plus the alignment guard:
+#     a 67-byte copy must be rejected (GPU_ERR_BUFFER), not run.
+#
+#   Leg B — compute-produce -> barrier -> public transfer-copy-consume:
+#     A compute dispatch on the COMPUTE queue writes 0xDEADBEEF into
+#     `produced` (over a CPU-prefilled pattern). We then wait the compute
+#     queue idle, exercise gpu_queue_barrier (COMPUTE->TRANSFER), and use
+#     gpu_queue_transfer_copy on the explicit TRANSFER queue to copy
+#     produced -> consumed. consumed is verified == [0xDEADBEEF, pattern...]
+#     — proving compute ran, the public transfer-copy consumed its output,
+#     and the whole buffer moved. (consumed is pre-seeded with a sentinel so
+#     a no-op copy can't false-pass.)
+#
+#     NOTE: the wait_idle after compute is load-bearing, not a convenience.
+#     compute and the SDMA copy both stage into the SINGLE per-context cached
+#     IB, so they must serialize — an async producer would have its PM4
+#     clobbered by the consumer's packet before the GPU reads it. This
+#     matches native_multiqueue_e2e's proven pattern (it also waits between
+#     legs; its in-CS TIMELINE_WAIT is trivially satisfied). True
+#     producer/consumer OVERLAP needs per-submission IB staging — that's
+#     Phase R (3.2.13, render-graph multi-queue), in-arc.
+#
+# This is the public-API counterpart to native_multiqueue_e2e's manual
+# leg 3: same SDMA-consume semantics, driven through gpu_queue_transfer_copy.
+#
+# Exit codes:
+#   0  — both legs passed
+#   1  — gpu_context_new_native failed
+#   2  — buffer create failed
+#   3  — buffer write failed
+#   4  — leg A copy/read failed
+#   5  — leg A verify mismatch
+#   6  — leg A alignment guard did not reject a 67-byte copy
+#   7  — shader BO setup failed
+#   8  — gpu_queue_get failed
+#   9  — compute dispatch failed
+#   10 — barrier failed
+#   11 — transfer-copy failed
+#   12 — leg B verify mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native transfer-copy e2e (v3.2 X.7)\n");
+    print_cstr("-----------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var N = 4096;
+    var usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
+
+    # =============================================================
+    # Leg A — public gpu_buffer_copy round-trip
+    # =============================================================
+    var src = gpu_buffer_create(ctx, N, usage);
+    if (src == 0) { print_cstr("FAIL: src create\n"); gpu_context_release(ctx); return 2; }
+    var dst = gpu_buffer_create(ctx, N, usage);
+    if (dst == 0) { print_cstr("FAIL: dst create\n"); gpu_context_release(ctx); return 2; }
+
+    var pat = alloc(N);
+    var i = 0;
+    while (i < N / 4) { store32(pat + i * 4, 0xA5A50000 + i); i = i + 1; }
+    if (gpu_buffer_write(ctx, src, 0, pat, N) != 0) {
+        print_cstr("FAIL: src write\n"); gpu_context_release(ctx); return 3; }
+
+    if (gpu_buffer_copy(ctx, src, dst, N) != 0) {
+        print_cstr("FAIL: gpu_buffer_copy\n"); gpu_context_release(ctx); return 4; }
+
+    var out = alloc(N);
+    memset(out, 0, N);
+    if (gpu_buffer_read(ctx, dst, 0, out, N) != 0) {
+        print_cstr("FAIL: dst read\n"); gpu_context_release(ctx); return 4; }
+
+    var bad = 0 - 1;
+    var j = 0;
+    while (j < N / 4) {
+        if (load32(out + j * 4) != 0xA5A50000 + j) { bad = j; j = N; }
+        j = j + 1;
+    }
+    if (bad != 0 - 1) {
+        print_cstr("FAIL: leg A mismatch at dword "); print_i64(bad); print_cstr("\n");
+        gpu_context_release(ctx); return 5;
+    }
+    print_cstr("leg A: gpu_buffer_copy 4096B round-trip byte-exact\n");
+
+    # Alignment guard: a non-4-byte-multiple size must be rejected uniformly.
+    if (gpu_buffer_copy(ctx, src, dst, 67) == 0) {
+        print_cstr("FAIL: 67-byte copy was NOT rejected\n");
+        gpu_context_release(ctx); return 6;
+    }
+    print_cstr("leg A: 67-byte copy rejected (4-byte alignment guard)\n");
+
+    # =============================================================
+    # Leg B — compute-produce -> barrier -> public transfer-copy
+    # =============================================================
+    # Shader BO (deadbeef store). Manually mapped PERM_SHADER at a VA below
+    # the texture-VA allocator base (0xFFFF800180000000), so it can't collide
+    # with the gpu_buffer_create allocations below.
+    var shader_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &shader_bo) != 0) {
+        print_cstr("FAIL: shader bo\n"); gpu_context_release(ctx); return 7; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, 4096);
+    native_gfx9_shader_store_deadbeef(shader_map, 0);
+    var shader_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, shader_handle, shader_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: shader va\n"); gpu_context_release(ctx); return 7; }
+    var shmod[16];
+    native_buf_pair_write(&shmod, shader_handle, shader_va);
+
+    # produced = compute output + copy source; consumed = copy dest. Both via
+    # the public allocator; the first 16 bytes of a NativeBuf are exactly a
+    # (handle, va) pair, so `produced` doubles as the compute dispatch's
+    # output-buffer pair.
+    var produced = gpu_buffer_create(ctx, N, usage);
+    var consumed = gpu_buffer_create(ctx, N, usage);
+    if (produced == 0) { print_cstr("FAIL: produced create\n"); gpu_context_release(ctx); return 2; }
+    if (consumed == 0) { print_cstr("FAIL: consumed create\n"); gpu_context_release(ctx); return 2; }
+
+    # Pre-fill produced with a pattern (compute overwrites only dword 0) and
+    # seed consumed with a sentinel so a no-op copy can't false-pass.
+    var i2 = 0;
+    while (i2 < N / 4) { store32(pat + i2 * 4, 0x5A5A0000 + i2); i2 = i2 + 1; }
+    if (gpu_buffer_write(ctx, produced, 0, pat, N) != 0) {
+        print_cstr("FAIL: produced prefill\n"); gpu_context_release(ctx); return 3; }
+    var seed = alloc(N);
+    var i3 = 0;
+    while (i3 < N / 4) { store32(seed + i3 * 4, 0xBAADF00D); i3 = i3 + 1; }
+    if (gpu_buffer_write(ctx, consumed, 0, seed, N) != 0) {
+        print_cstr("FAIL: consumed seed\n"); gpu_context_release(ctx); return 3; }
+
+    var qc = gpu_queue_get(ctx, QUEUE_KIND_COMPUTE);
+    var qt = gpu_queue_get(ctx, QUEUE_KIND_TRANSFER);
+    if (qc == 0) { print_cstr("FAIL: COMPUTE queue\n"); gpu_context_release(ctx); return 8; }
+    if (qt == 0) { print_cstr("FAIL: TRANSFER queue\n"); gpu_context_release(ctx); return 8; }
+    print_cstr("rings: compute="); print_i64(queue_ring(qc));
+    print_cstr(" transfer="); print_i64(queue_ring(qt));
+    print_cstr(" (DMA="); print_i64(AMDGPU_HW_IP_DMA); print_cstr(")\n");
+
+    # Compute-produce on the COMPUTE ring, then wait it idle: the cached IB
+    # is shared, so the producer must complete before the consumer stages
+    # its packet (see the header note; overlap is Phase R).
+    gpu_ctx_set_current_queue(ctx, qc);
+    if (gpu_compute_dispatch(ctx, &shmod, 1, 1, 1, produced) != 0) {
+        print_cstr("FAIL: compute dispatch\n"); gpu_context_release(ctx); return 9; }
+    if (gpu_queue_wait_idle(ctx, qc) != 0) {
+        print_cstr("FAIL: compute wait\n"); gpu_context_release(ctx); return 9; }
+
+    # Confirm compute actually produced its output before the copy.
+    var chk = alloc(4);
+    if (gpu_buffer_read(ctx, produced, 0, chk, 4) != 0) {
+        print_cstr("FAIL: produced read\n"); gpu_context_release(ctx); return 9; }
+    if (load32(chk + 0) != 0xDEADBEEF) {
+        print_cstr("FAIL: compute did not write produced, got ");
+        print_hex32(load32(chk + 0)); print_cstr("\n");
+        gpu_context_release(ctx); return 9;
+    }
+    print_cstr("leg B: compute produced 0xDEADBEEF (point ");
+    print_i64(queue_point(qc)); print_cstr(")\n");
+
+    # Exercise the cross-ring barrier, then copy through the public API on
+    # the explicit TRANSFER queue (synchronous: waits the SDMA point).
+    if (gpu_queue_barrier(ctx, qc, qt) != 0) {
+        print_cstr("FAIL: barrier\n"); gpu_context_release(ctx); return 10; }
+    if (gpu_queue_transfer_copy(ctx, qt, produced, consumed, N) != 0) {
+        print_cstr("FAIL: gpu_queue_transfer_copy\n"); gpu_context_release(ctx); return 11; }
+
+    var out2 = alloc(N);
+    memset(out2, 0, N);
+    if (gpu_buffer_read(ctx, consumed, 0, out2, N) != 0) {
+        print_cstr("FAIL: consumed read\n"); gpu_context_release(ctx); return 11; }
+
+    print_cstr("leg B: consumed[0]="); print_hex32(load32(out2 + 0)); print_cstr("\n");
+    var bad2 = 0 - 1;
+    if (load32(out2 + 0) != 0xDEADBEEF) { bad2 = 0; }
+    var k = 1;
+    while (k < N / 4) {
+        if (load32(out2 + k * 4) != 0x5A5A0000 + k) { bad2 = k; k = N; }
+        k = k + 1;
+    }
+    if (bad2 != 0 - 1) {
+        print_cstr("FAIL: leg B mismatch at dword "); print_i64(bad2); print_cstr("\n");
+        gpu_context_release(ctx); return 12;
+    }
+    print_cstr("leg B: compute -> barrier -> transfer_copy consumed compute output\n");
+
+    gpu_buffer_release(ctx, src);
+    gpu_buffer_release(ctx, dst);
+    gpu_buffer_release(ctx, produced);
+    gpu_buffer_release(ctx, consumed);
+    native_gem_va_unmap(fd, shader_handle, shader_va, 4096);
+    native_bo_release_gtt(fd, shader_handle, shader_map, 4096);
+    gpu_context_release(ctx);
+    print_cstr("OK — public gpu_buffer_copy + gpu_queue_transfer_copy on the SDMA ring\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

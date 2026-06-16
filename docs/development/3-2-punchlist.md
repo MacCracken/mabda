@@ -113,8 +113,18 @@ HW-proven (`native_sdma_copy_e2e.cyr`).
   any mabda buffer is a copy operand, matching native (MED-3).
 - [x] **(interrupt)** — toolchain pin `6.2.10`→`6.2.11` (latest); was the
   X.9 fold-in, done early.
-- [ ] **X.7** — HW e2e (`native_transfer_copy_e2e.cyr`: compute-produce →
-  barrier → transfer-copy-consume; wgpu serialized verify). **NEXT.**
+- [x] **X.7** — HW e2e. `native_transfer_copy_e2e.cyr` (HW-verified on
+  Cezanne): leg A public `gpu_buffer_copy` 4096B round-trip + alignment-guard
+  reject; leg B compute-produce → barrier → public `gpu_queue_transfer_copy`
+  consume (consumed == [0xDEADBEEF, pattern...]). `wgpu_transfer_copy_e2e.cyr`
+  serialized verify (compile-checked; HW-gated). Makefile targets
+  `test-native-transfer-copy-e2e` / `test-wgpu-transfer-copy-e2e`. **Finding:**
+  producer/consumer can't OVERLAP through the single per-context cached IB
+  (the consumer's packet clobbers the producer's) — the e2e serializes with
+  `wait_idle`, matching `native_multiqueue_e2e`. True overlap needs per-IB
+  staging → **reinforces R.5 (3.2.13)**. No regression in the other native
+  HW programs (compute_store / multiqueue / sdma_copy / queue_compute all
+  still exit 0).
 - [ ] **X.8** — Native SDMA **chunking**: lift the 4 MiB single-packet cap
   by looping `COPY_LINEAR` packets (per-chunk src/dst VA offsets) in one
   IB; closes the >4 MiB cross-backend gap (wgpu has no cap). CPU test for
