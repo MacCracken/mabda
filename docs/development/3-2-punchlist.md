@@ -150,18 +150,85 @@ compressed (tiled + swizzle + T#/S#); the tiling swizzle is the
 high-risk half, sequenced last. **This is the work I wrongly punted to
 "v4-scale"; it is in the arc.**
 
-- [ ] **TS.1** — GFX9 T# image-descriptor builder (256-bit) +
-  format→IMG-format table; every dword cited vs Mesa gfx9.json / radv.
-- [ ] **TS.2** — GFX9 S# sampler-descriptor builder (128-bit) +
-  `gpu_sampler_create` + wgpu `WGPUSampler` filler (point/clamp first).
-- [ ] **TS.3** — Struct + slot growth (`NativeTexture` 48→64; slots
-  `CREATE_2D_SAMPLEABLE` + `BIND_FOR_SAMPLE`; `BACKEND_SIZE`→280; extend walk).
-- [ ] **TS.4** — Textured FS + UV-export VS in hand-authored GFX9 ISA
-  (`image_load` oracle then `image_sample`; SPI input wiring); llvm-mc
-  byte-pinned.
-- [ ] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne**
-  (`native_texture_sample_e2e.cyr`) — proves T#/S#/`image_sample` with zero
-  tiling risk.
+> **Sequencing (2026-06-15, maintainer):** "3 then 1, you are on HW" — do
+> the lower-risk S#/format-table pieces first, then the T#; descriptor bytes
+> sourced from gfx9.json (via the GitLab API, see memory) + HW-verified at
+> TS.5 on the Cezanne. Builders land as pure CPU-pinned byte-writers; the
+> `gpu_sampler_create` dispatcher + wgpu filler + the two slots fold into TS.3.
+
+- [x] **TS.1** — **done.** format→IMG-format table (`native_gfx9_texfmt_to_img_format`
+  + `native_img_data_format`/`_num_format`) + the 256-bit T# builder
+  (`native_gfx9_image_descriptor`): all 8 dwords + every field (BASE_ADDRESS
+  hi/lo, DATA/NUM_FORMAT, WIDTH/HEIGHT, identity DST_SEL, LAST_LEVEL, SW_MODE,
+  TYPE=2D, PITCH, MAX_MIP) pinned vs gfx9.json `SQ_IMG_RSRC_WORD0..6` +
+  `SQ_SEL_XYZW01`/`SQ_RSRC_IMG_TYPE`. Bit positions authoritative; value
+  semantics (linear PITCH alignment, MIN_LOD) HW-cross-checked at TS.5.
+- [x] **TS.2** — GFX9 S# sampler-descriptor builder
+  (`native_gfx9_sampler_descriptor`, pinned vs gfx9.json) + `NATIVE_SAMP_*`
+  intents + **`gpu_sampler_create`** (backend-agnostic packed intent handle;
+  the WGPUSampler / S# materialize at bind time, TS.5 — so no per-sampler
+  slot, keeping the 2-slot plan). wgpu `WGPUSampler` build folds into the
+  TS.5 wgpu `bind_for_sample`.
+- [~] **TS.3** — struct + slot scaffolding **done**: `NativeTexture` 48→64
+  (sw_mode@48, t_va@52 + accessors); NativePass 32→40 (tex_desc_va@32); slots
+  `CREATE_2D_SAMPLEABLE`@264 + `BIND_FOR_SAMPLE`@272, `BACKEND_SIZE` 264→280,
+  `BACKEND_SAMPLE_SLOTS_*` range; public `gpu_texture_create_2d_sampleable` +
+  `gpu_render_pass_bind_texture` dispatchers (mock-tested). **Remaining (→ TS.5):**
+  the `backend_is_complete` walk over 264..280 activates once both backends
+  fill the slots ("activate when both fill").
+- [~] **TS.4** — textured FS **done**: `native_gfx9_shader_textured_load_fs`
+  — the `image_load` bring-up oracle (each fragment loads the texel at its
+  own screen position → RT[x,y]=tex[x,y]; zero interpolation, reuses the
+  existing fullscreen VS). Assembled + round-tripped via `llvm-mc -mcpu=gfx90c`,
+  byte-pinned + added to `scripts/disasm-shaders.sh`. SPI wiring constants
+  (`GFX9_SPI_PS_INPUT_TEXTURED=0x302` = PERSP_CENTER|POS_X|POS_Y;
+  `R_SPI_SHADER_USER_DATA_PS_0/1`). **Deferred to TS.7** (with the scaled
+  compressed path): the UV-export VS + normalized `image_sample` FS — not
+  needed for the RT-sized RGBA8 MVP, which the screen-pos oracle covers.
+- [x] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne** (delivered in
+  sub-bites). **TS.5a done:** native `_backend_native_texture_create_2d_sampleable`
+  (linear surface BO + a descriptor BO carrying the T# at +0 and a default
+  point/clamp S# at +32; descriptor BO bump-leaked per the create-once model)
+  + `_backend_native_texture_bind_for_sample` (stashes the descriptor VA on
+  the pass); both native slots installed + CPU-tested. **TS.5b done** (minimal
+  wgpu + walk): `_backend_wgpu_texture_create_2d_sampleable` (real — the
+  fmt-create already makes a TEXTURE_BINDING texture + view) +
+  `_backend_wgpu_texture_bind_for_sample` (stashes tex/sampler on the wgpu
+  pass, grown 32→40); both wgpu slots installed; **`backend_is_complete` walk
+  over 264..280 ACTIVATED** (9th range, both backends complete). Sequencing
+  chosen 2026-06-15: "3, 2, 1". **(2) wgpu sample path — DONE + HW-verified.**
+  `wgpu_texture_bind_group_descriptor` (bind_group.cyr) +
+  `wgpu_sampler_descriptor_from_intent` (sampler.cyr) pinned vs webgpu.h v29;
+  added `wgpu_render_pipeline_get_bind_group_layout` FFI (fp65 + C-shim
+  fn_table[65], FN_COUNT 65→66); `_backend_wgpu_render_pass_draw` gained a
+  textured branch (build sampler+bind-group from the pipeline's auto-BGL +
+  `set_bind_group`); `programs/wgpu_texture_sample_e2e.cyr` **passes on the
+  Cezanne** (RT == sampled color via the public API). Adversarial review
+  (`review-wgpu-sample-ts5`, 4 confirmed) → fixed: per-draw sampler/bind-group
+  /BGL **handle leak** (release after set_bind_group; HIGH) + null-guards on
+  the create chain (LOW). No regression (render_e2e still green).
+  **(1) native HW sampling — DONE + HW-verified on Cezanne.** Single-BO
+  sampleable create (surface + descriptor tail); `render_pass_draw` emits the
+  textured override (`SPI_PS_INPUT_ENA=0x302`, `RSRC1_PS` VGPR bump, PS
+  USER_DATA = descriptor VA) after the pipeline blocks (last-write) + adds the
+  surface BO to a 6-entry residency list; `_NATIVE_PM4_SCRATCH_BYTES` 1024→2048
+  (the override pushes the stream to ~261 dwords). `programs/native_texture_sample_e2e.cyr`
+  **passes pixel-exact (RT[x,y]==tex[x,y])** — the only bug was the scratch
+  overflow; the gfx9.json descriptors + llvm-mc shader + SPI/RSRC were correct
+  first-try (no TDR iteration). Adversarial review (`review-native-sample-ts5`,
+  6 confirmed) → fixed: sampleable release size mismatch (recompute bo_size
+  from t_va; MED), release now clears t_va (use-after-bind; MED), per-draw
+  bound_tex clear (LOW), reject compressed-sampleable until TS.7 (LOW), stale
+  docstrings (NIT). No regression (native_render_e2e green).
+
+  **TS.5 COMPLETE** — native + wgpu RGBA8 sampling both HW-verified. The
+  T#/S#/image_load/descriptor/sampleable infra works on both backends.
+- [x] **Cut 3.2.2** (2026-06-15) — TS.1–TS.5 content-complete (per the version
+  map). VERSION 3.2.1→3.2.2; CHANGELOG `[3.2.2]`; audit
+  `docs/audit/2026-06-15-ts-sampling-audit.md`; CLAUDE.md/README synced (2702
+  asserts, struct/BACKEND_SIZE deltas); version-check OK; dist regen (embeds
+  3.2.2) + idempotent; closeout green (suite 2702/0, 9 benches, 7 HW programs
+  exit 0 on Cezanne incl. native+wgpu texture-sample). TS.6–8 → 3.2.3.
 - [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
   remap; round-trip-identity + addrlib-reference CPU tests.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**

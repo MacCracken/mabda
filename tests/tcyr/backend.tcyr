@@ -511,7 +511,14 @@ fn test_backend_struct_layout() {
     assert_eq(BACKEND_BUFFERCOPY_SLOTS_END,              264, "buffercopy range ends 264");
     assert_eq(BACKEND_BUFFERCOPY_SLOTS_BEGIN, BACKEND_TEXFMT_SLOTS_END,
     "buffercopy range starts where texfmt range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               264, "total = 264");
+    # v3.2 TS.3: sampleable-texture slots appended at 264..280.
+    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, 264, "create_sampleable at 264");
+    assert_eq(BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,      272, "bind_for_sample at 272");
+    assert_eq(BACKEND_SAMPLE_SLOTS_BEGIN,                264, "sample range begins 264");
+    assert_eq(BACKEND_SAMPLE_SLOTS_END,                 280, "sample range ends 280");
+    assert_eq(BACKEND_SAMPLE_SLOTS_BEGIN, BACKEND_BUFFERCOPY_SLOTS_END,
+    "sample range starts where buffercopy range ends (no gap/overlap)");
+    assert_eq(BACKEND_SIZE,                               280, "total = 280");
     return 0;
 }
 
@@ -664,8 +671,23 @@ fn test_backend_is_complete_detects_missing_slot() {
         backend_set_slot(b, off8, &_backend_smoke_sentinel);
         off8 = off8 + 8;
     }
+    # v0..buffercopy alone no longer complete — v3.2 sampleable range
+    # (264..280) also has fnptr slots backend_is_complete checks (TS.5).
+    assert_eq(backend_is_complete(b), 0,
+    "v0..buffercopy filled but sample range still zero");
+    var off9 = BACKEND_SAMPLE_SLOTS_BEGIN;
+    while (off9 < BACKEND_SAMPLE_SLOTS_END) {
+        backend_set_slot(b, off9, &_backend_smoke_sentinel);
+        off9 = off9 + 8;
+    }
     assert_eq(backend_is_complete(b), 1,
-    "all fnptr slots set across all eight ranges -> complete");
+    "all fnptr slots set across all nine ranges -> complete");
+    # Wiping a sampleable slot drops completeness.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE, 0);
+    assert_eq(backend_is_complete(b), 0,
+    "wiped bind_for_sample slot drops completeness");
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
+    &_backend_smoke_sentinel);
     # Wiping the buffer-copy slot drops completeness.
     backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY, 0);
     assert_eq(backend_is_complete(b), 0,
@@ -767,6 +789,13 @@ fn test_backend_wgpu_slot_identities() {
     assert_eq(backend_get_slot(b, BACKEND_SLOT_BUFFER_COPY),
     &_backend_wgpu_buffer_copy,
     "slot 256 = buffer_copy");
+    # v3.2 TS.5 sampleable-texture slot identities.
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE),
+    &_backend_wgpu_texture_create_2d_sampleable,
+    "slot 264 = create_sampleable");
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE),
+    &_backend_wgpu_texture_bind_for_sample,
+    "slot 272 = bind_for_sample");
     assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
     &_backend_wgpu_shader_module_create,
     "slot 48 = shader_module_create");
@@ -1496,7 +1525,7 @@ fn test_gpu_context_size_extended_to_160() {
     # PM4 scratch buffer size kept in sync — the slot fns memset 256
     # (compute) or 1024 (render) of this buffer; bumping above 1024
     # requires updating both slots.
-    assert_eq(_NATIVE_PM4_SCRATCH_BYTES, 1024, "scratch = 1024 bytes");
+    assert_eq(_NATIVE_PM4_SCRATCH_BYTES, 2048, "scratch = 2048 bytes (v3.2 TS.5)");
     return 0;
 }
 
@@ -1618,6 +1647,137 @@ fn test_wgpu_buffer_copy_guards() {
     return 0;
 }
 
+# v3.2 TS.3 — sampleable-texture scaffolding: sampler intent + the two new
+# public dispatchers routing through the (TS.5-filled) backend slots.
+var _ts3_cs_count = 0;
+var _ts3_cs_ctx = 0;
+var _ts3_cs_w = 0;
+var _ts3_cs_h = 0;
+var _ts3_cs_fmt = 0;
+fn _ts3_cs_capture(ctx, w, h, fmt): i64 {
+    _ts3_cs_count = _ts3_cs_count + 1;
+    _ts3_cs_ctx = ctx; _ts3_cs_w = w; _ts3_cs_h = h; _ts3_cs_fmt = fmt;
+    return 0xC5A;
+}
+var _ts3_bind_count = 0;
+var _ts3_bind_ctx = 0;
+var _ts3_bind_pass = 0;
+var _ts3_bind_tex = 0;
+var _ts3_bind_samp = 0;
+fn _ts3_bind_capture(ctx, pass, tex, samp): i64 {
+    _ts3_bind_count = _ts3_bind_count + 1;
+    _ts3_bind_ctx = ctx; _ts3_bind_pass = pass; _ts3_bind_tex = tex; _ts3_bind_samp = samp;
+    return 0;
+}
+
+fn test_gpu_sampler_create() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    var s = gpu_sampler_create(&ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    assert(s != 0, "point+clamp -> non-zero handle (tag avoids 0)");
+    assert_eq(gpu_sampler_is_valid(s), 1, "tagged valid");
+    assert_eq(gpu_sampler_filter(s), NATIVE_SAMP_FILTER_POINT, "filter unpacks POINT");
+    assert_eq(gpu_sampler_addr(s), NATIVE_SAMP_ADDR_CLAMP, "addr unpacks CLAMP");
+    var s2 = gpu_sampler_create(&ctx, NATIVE_SAMP_FILTER_BILINEAR, NATIVE_SAMP_ADDR_WRAP);
+    assert_eq(gpu_sampler_filter(s2), NATIVE_SAMP_FILTER_BILINEAR, "filter unpacks BILINEAR");
+    assert_eq(gpu_sampler_addr(s2), NATIVE_SAMP_ADDR_WRAP, "addr unpacks WRAP");
+    assert_eq(gpu_sampler_create(0, 0, 0), 0, "null ctx -> 0");
+    assert_eq(gpu_sampler_create(&ctx, 99, 0), 0, "bad filter -> 0");
+    assert_eq(gpu_sampler_create(&ctx, 0, 99), 0, "bad addr -> 0");
+    assert_eq(gpu_sampler_is_valid(0), 0, "0 is not a valid handle");
+    return 0;
+}
+
+fn test_gpu_texture_create_2d_sampleable_dispatch() {
+    _ts3_cs_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_ts3_cs_capture);
+    var ctx = alloc(160);
+    memset(ctx, 0, 160);
+    store64(ctx + 32, b);
+    var r = gpu_texture_create_2d_sampleable(ctx, 64, 64, MABDA_TEXFMT_RGBA8);
+    assert_eq(r, 0xC5A, "slot return propagated");
+    assert_eq(_ts3_cs_count, 1, "dispatched once");
+    assert_eq(_ts3_cs_ctx, ctx, "arg1 ctx");
+    assert_eq(_ts3_cs_w, 64, "arg2 width");
+    assert_eq(_ts3_cs_h, 64, "arg3 height");
+    assert_eq(_ts3_cs_fmt, MABDA_TEXFMT_RGBA8, "arg4 fmt");
+    # null slot (the TS.3/TS.5 gap) -> 0; guards return before the slot.
+    var b2 = backend_new();
+    var ctx2 = alloc(160);
+    memset(ctx2, 0, 160);
+    store64(ctx2 + 32, b2);
+    assert_eq(gpu_texture_create_2d_sampleable(ctx2, 64, 64, MABDA_TEXFMT_RGBA8),
+    0, "null slot -> 0");
+    assert_eq(gpu_texture_create_2d_sampleable(0, 64, 64, 0), 0, "null ctx -> 0");
+    assert_eq(gpu_texture_create_2d_sampleable(ctx, 0, 64, 0), 0, "w<=0 -> 0");
+    assert_eq(gpu_texture_create_2d_sampleable(ctx, 64, 64, 99), 0, "bad fmt -> 0");
+    return 0;
+}
+
+fn test_gpu_render_pass_bind_texture_dispatch() {
+    _ts3_bind_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE, &_ts3_bind_capture);
+    var ctx = alloc(160);
+    memset(ctx, 0, 160);
+    store64(ctx + 32, b);
+    var rc = gpu_render_pass_bind_texture(ctx, 0xAA, 0xBB, 0xCC);
+    assert_eq(rc, 0, "slot return propagated");
+    assert_eq(_ts3_bind_count, 1, "dispatched once");
+    assert_eq(_ts3_bind_ctx, ctx, "arg1 ctx");
+    assert_eq(_ts3_bind_pass, 0xAA, "arg2 pass");
+    assert_eq(_ts3_bind_tex, 0xBB, "arg3 tex");
+    assert_eq(_ts3_bind_samp, 0xCC, "arg4 sampler");
+    # null slot -> NOT_IMPLEMENTED; guards return before the slot.
+    var b2 = backend_new();
+    var ctx2 = alloc(160);
+    memset(ctx2, 0, 160);
+    store64(ctx2 + 32, b2);
+    assert_eq(gpu_render_pass_bind_texture(ctx2, 0xAA, 0xBB, 0xCC),
+    GPU_ERR_NOT_IMPLEMENTED, "null slot -> NOT_IMPLEMENTED");
+    assert_eq(gpu_render_pass_bind_texture(0, 0xAA, 0xBB, 0xCC),
+    GPU_ERR_OTHER, "null ctx -> GPU_ERR_OTHER");
+    assert_eq(gpu_render_pass_bind_texture(ctx, 0, 0xBB, 0xCC),
+    GPU_ERR_OTHER, "null pass -> GPU_ERR_OTHER");
+    assert_eq(gpu_render_pass_bind_texture(ctx, 0xAA, 0, 0xCC),
+    GPU_ERR_TEXTURE, "null tex -> GPU_ERR_TEXTURE");
+    return 0;
+}
+
+# v3.2 TS.5 (wgpu sample path) — bind-group descriptor builder byte layout
+# (webgpu.h v29 WGPUBindGroupEntry/Descriptor).
+fn test_wgpu_texture_bind_group_descriptor() {
+    var d = wgpu_texture_bind_group_descriptor(0xB6, 0x71E, 0x5A);
+    assert_eq(load64(d + 24), 0xB6, "descriptor layout");
+    assert_eq(load64(d + 32), 2, "entryCount = 2");
+    var entries = load64(d + 40);
+    assert_eq(load32(entries + 8),  0,     "entry0 binding = 0");
+    assert_eq(load64(entries + 48), 0x71E, "entry0 textureView");
+    assert_eq(load64(entries + 40), 0,     "entry0 sampler null");
+    assert_eq(load32(entries + 56 + 8),  1,    "entry1 binding = 1");
+    assert_eq(load64(entries + 56 + 40), 0x5A, "entry1 sampler");
+    assert_eq(load64(entries + 56 + 48), 0,    "entry1 textureView null");
+    return 0;
+}
+
+# v3.2 TS.5 (wgpu sample path) — sampler-descriptor-from-intent mapping.
+fn test_wgpu_sampler_descriptor_from_intent() {
+    var d = wgpu_sampler_descriptor_from_intent(NATIVE_SAMP_FILTER_POINT,
+    NATIVE_SAMP_ADDR_CLAMP);
+    assert_eq(load32(d + 24), WGPU_ADDRESS_MODE_CLAMP_TO_EDGE, "addrU = clamp");
+    assert_eq(load32(d + 28), WGPU_ADDRESS_MODE_CLAMP_TO_EDGE, "addrV = clamp");
+    assert_eq(load32(d + 36), WGPU_FILTER_MODE_NEAREST, "magFilter = nearest");
+    assert_eq(load32(d + 40), WGPU_FILTER_MODE_NEAREST, "minFilter = nearest");
+    var d2 = wgpu_sampler_descriptor_from_intent(NATIVE_SAMP_FILTER_BILINEAR,
+    NATIVE_SAMP_ADDR_WRAP);
+    assert_eq(load32(d2 + 24), WGPU_ADDRESS_MODE_REPEAT, "addrU = repeat");
+    assert_eq(load32(d2 + 36), WGPU_FILTER_MODE_LINEAR, "magFilter = linear");
+    assert_eq(load32(d2 + 40), WGPU_FILTER_MODE_LINEAR, "minFilter = linear");
+    assert_eq(load32(d2 + 60) & 0xFFFF, 1, "maxAnisotropy = 1");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1680,5 +1840,10 @@ fn main() {
     test_gpu_buffer_copy_positive_path();
     test_gpu_buffer_copy_guards();
     test_wgpu_buffer_copy_guards();
+    test_gpu_sampler_create();
+    test_gpu_texture_create_2d_sampleable_dispatch();
+    test_gpu_render_pass_bind_texture_dispatch();
+    test_wgpu_texture_bind_group_descriptor();
+    test_wgpu_sampler_descriptor_from_intent();
     return assert_summary();
 }

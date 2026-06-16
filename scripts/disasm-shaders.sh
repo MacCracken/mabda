@@ -59,3 +59,11 @@ dwords_to_bytes \
     28101708 7E000212 7E020213 DC708000 007F0800 BF8C0070 \
     BF810000 \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+
+echo
+echo "=== FS (textured_load, image_load oracle, 44 bytes instr; v3.2 TS.4) ==="
+dwords_to_bytes \
+    C00E0000 00000000 BF8CC07F 7E081102 7E0A1103 \
+    F0001F00 00000004 BF8C0F70 C400180F 03020100 \
+    BF810000 \
+    | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c

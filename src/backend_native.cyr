@@ -311,10 +311,11 @@ fn _backend_native_buffer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
 # block. Mirror of native_buf_pair_write for the render dispatch
 # slot. Caller allocates 24 bytes for `dst` (typically a stack-local
 # `var triple[24]`); this helper writes the three u64 fields.
-fn native_render_handles_write(dst, vs_h, fs_h, rt_h): i64 {
+fn native_render_handles_write(dst, vs_h, fs_h, rt_h, tex_h): i64 {
     store64(dst +  0, vs_h);
     store64(dst +  8, fs_h);
     store64(dst + 16, rt_h);
+    store64(dst + 24, tex_h);   # v3.2 TS.5 — sampled texture BO, 0 if none
     return 0;
 }
 
@@ -335,6 +336,19 @@ fn native_render_bo_list_pack(entries40, fence_h, vs_h, fs_h, rt_h, ib_h): i64 {
     store32(entries40 + 16, fs_h);    store32(entries40 + 20, 4);
     store32(entries40 + 24, rt_h);    store32(entries40 + 28, 3);
     store32(entries40 + 32, ib_h);    store32(entries40 + 36, 10);
+    return 0;
+}
+
+# v3.2 TS.5 — 6-entry variant adding the sampled texture's surface BO (which,
+# in the single-BO sampleable layout, also carries the T#/S# descriptor) to
+# residency so the textured FS's s_load_dwordx8 + image_load don't fault.
+fn native_render_bo_list_pack6(entries48, fence_h, vs_h, fs_h, rt_h, tex_h, ib_h): i64 {
+    store32(entries48 +  0, fence_h); store32(entries48 +  4, 1);
+    store32(entries48 +  8, vs_h);    store32(entries48 + 12, 4);
+    store32(entries48 + 16, fs_h);    store32(entries48 + 20, 4);
+    store32(entries48 + 24, rt_h);    store32(entries48 + 28, 3);
+    store32(entries48 + 32, tex_h);   store32(entries48 + 36, 3);
+    store32(entries48 + 40, ib_h);    store32(entries48 + 44, 10);
     return 0;
 }
 
@@ -360,6 +374,7 @@ render_handles_ptr, timeout_ns): i64 {
     var vs_handle = load64(render_handles_ptr +  0);
     var fs_handle = load64(render_handles_ptr +  8);
     var rt_handle = load64(render_handles_ptr + 16);
+    var tex_handle = load64(render_handles_ptr + 24);   # v3.2 TS.5 (0 = none)
 
     # Stage PM4 into the cached IB BO (memset + memcpy; no alloc).
     memset(ib_addr, 0, 4096);
@@ -368,14 +383,22 @@ render_handles_ptr, timeout_ns): i64 {
     # Pre-zero the user-fence slot so the kernel's seqno write is observable.
     store64(fence_addr + 32, 0);
 
-    # 5-entry BO_HANDLES list (Mesa-shape): fence / vs / fs / rt / ib.
-    var entries[40];
-    native_render_bo_list_pack(&entries, fence_handle,
-    vs_handle, fs_handle, rt_handle, ib_handle);
+    # BO_HANDLES list (Mesa-shape): fence / vs / fs / rt / [tex] / ib. The
+    # sampled texture BO joins residency only when one is bound (TS.5).
+    var entries[48];
+    var n_entries = 5;
+    if (tex_handle != 0) {
+        native_render_bo_list_pack6(&entries, fence_handle,
+        vs_handle, fs_handle, rt_handle, tex_handle, ib_handle);
+        n_entries = 6;
+    } else {
+        native_render_bo_list_pack(&entries, fence_handle,
+        vs_handle, fs_handle, rt_handle, ib_handle);
+    }
     var bo_list_in[24];
     store32(&bo_list_in +  0, 0xFFFFFFFF);
     store32(&bo_list_in +  4, 0xFFFFFFFF);
-    store32(&bo_list_in +  8, 5);
+    store32(&bo_list_in +  8, n_entries);
     store32(&bo_list_in + 12, 8);
     store64(&bo_list_in + 16, &entries);
 
@@ -869,6 +892,93 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     return tex;
 }
 
+# v3.2 TS.5 — sampleable 2D texture create (native). Differs from the storage
+# create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) + S#(16)], so
+# one handle covers both for CS residency and t_va points at the descriptor in
+# the BO tail. Builds the GFX9 T# (image resource, +0) + a default point/clamp
+# S# (sampler, +32); stashes t_va + sw_mode on the (64-byte) tex. The textured
+# FS (TS.4) s_load_dwordx8's the T# from t_va. RGBA8/LINEAR only — compressed
+# sampling (tiled SW_MODE + swizzle) is TS.7 and is rejected here until then.
+#
+# NATIVE_TEX_FIELD_SIZE stays the logical surface bytes (write/read bounds);
+# texture_release recomputes the real mapped bo_size from t_va. Returns a
+# tex_ptr, or 0 on invalid dims/format, a compressed fmt, region exhaustion, or
+# an ioctl failure. (HW: the BO alloc/map; the guards + descriptor build are
+# deterministic.)
+fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
+    # v3.2 TS.5: native sampleable is RGBA8/LINEAR only. A compressed format
+    # here would build a LINEAR texel-pitch T# that the TA samples as garbage —
+    # compressed sampling needs the tiled SW_MODE + swizzle (TS.7). Reject until
+    # then (gpu_caps_supports_format keeps the native compressed bits 0 to match).
+    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }
+    var logical = mabda_texfmt_data_size(fmt, width, height);
+    if (logical == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var sw_mode = GFX9_SW_MODE_LINEAR;   # MVP; tiled compressed = TS.7
+
+    # ONE BO holds [surface | pad-to-256 | T#(32) + S#(16)]: a single handle
+    # covers both for CS residency (the descriptor BO handle would otherwise be
+    # untracked), and t_va points at the descriptor inside the same BO.
+    var desc_off = _native_align_up(logical, 256);
+    var bo_size = _native_align_up(desc_off + 64, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) { return 0; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return 0;
+    }
+    # Build the T# (+0) + a default point/clamp S# (+32) in the descriptor tail.
+    var daddr = addr + desc_off;
+    memset(daddr, 0, 64);
+    native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1);
+    native_gfx9_sampler_descriptor(daddr, 32,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(tex + NATIVE_TEX_FIELD_VA,     va);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   logical);   # logical (write/read bounds)
+    store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
+    native_tex_set_sw_mode(tex, sw_mode);
+    native_tex_set_t_va(tex, va + desc_off);
+    return tex;
+}
+
+# v3.2 TS.5 — bind a sampleable texture into a render pass (native). Stashes
+# the texture's T#/S# descriptor VA on the pass; the next render_pass_draw
+# emits the PS USER_DATA SET_SH_REG from it (the textured-FS PM4 path, next
+# sub-bite). `sampler` is accepted for API stability but unused on the
+# image_load MVP path (the FS reads no S#); rebuilding the S# from an explicit
+# sampler is TS.7 (image_sample). Returns 0|GPU_ERR_*.
+fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0)  { return GPU_ERR_TEXTURE; }
+    if (native_tex_t_va(tex) == 0) { return GPU_ERR_TEXTURE; }   # not sampleable
+    # Stash the tex pointer: the draw derives the descriptor VA
+    # (native_tex_t_va, for the PS USER_DATA) + the surface BO handle (for
+    # residency) from it. (image_load reads no S#, so `sampler` is unused on
+    # the MVP path; S#-from-sampler is TS.7.)
+    store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, tex);
+    return 0;
+}
+
 # v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
 # whole mip pyramid; generate (M.6b) downsamples level-by-level into it.
 fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
@@ -1099,13 +1209,13 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (fs_handle == 0) { return GPU_ERR_OTHER; }
 
     # Build the IB stream into the per-context cached PM4 scratch
-    # (audit MED-7) — replaces a per-draw alloc(1024) that bumped
-    # the allocator forward on every frame. The 1024-byte scratch
-    # is also the worst-case render stream size, matching the
-    # 256-dword padded shape of native_pm4_build_render_clear_triangle.
+    # (audit MED-7) — replaces a per-draw alloc that bumped the allocator
+    # forward on every frame. The scratch is _NATIVE_PM4_SCRATCH_BYTES (2048
+    # at v3.2 TS.5): the clear-triangle stream pads to the 256-dword/1024-B
+    # minimum, and the textured-sample override appends ~15 more dwords.
     var pm4 = native_ctx_pm4_scratch(ctx);
     if (pm4 == 0) { return GPU_ERR_OTHER; }
-    memset(pm4, 0, 1024);
+    memset(pm4, 0, _NATIVE_PM4_SCRATCH_BYTES);
     var pos = 0;
     pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(pm4, pos);
     # PIPELINESTAT_START — unblocks the GPU stat-counter pipeline.
@@ -1129,6 +1239,29 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
     pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
     rt_width, rt_height);
+    # v3.2 TS.5 — textured sample override. If a sampleable texture is bound
+    # (bind_for_sample stashed the tex ptr), re-emit the PS state the textured
+    # FS (image_load) needs AFTER the pipeline's sh/ctx blocks (last-write
+    # wins): SPI_PS_INPUT_ENA/_ADDR = 0x302 (screen pos arrives in v2/v3),
+    # RSRC1_PS VGPRS 0->1 (4->8 VGPRs for the FS's v0..v5; MIN's 16 SGPRs
+    # already cover s[0:7]), and the PS USER_DATA = the T#/S# descriptor VA
+    # (the FS s_load_dwordx8's the T# from it). The surface BO joins residency.
+    var bound_tex = load64(pass + NATIVE_PASS_FIELD_BOUND_TEX);
+    var tex_handle = 0;
+    if (bound_tex != 0) {
+        var desc_va = native_tex_t_va(bound_tex);
+        tex_handle = load64(bound_tex + NATIVE_TEX_FIELD_HANDLE);
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
+        GFX9_GFX_PGM_RSRC1_MIN | 1);
+        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
+        GFX9_SPI_PS_INPUT_TEXTURED);
+        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ADDR,
+        GFX9_SPI_PS_INPUT_TEXTURED);
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_0,
+        desc_va & 0xFFFFFFFF);
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_1,
+        (desc_va >> 32) & 0xFFFFFFFF);
+    }
     # Pre-draw pixel-pipeline drain — captured byte-exact from radv's
     # main IB. Without these, in-flight pixel waves from prior
     # contexts (e.g. the compositor) keep the pixel pipeline busy past
@@ -1156,8 +1289,8 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
         pos = native_pm4_nop(pm4, pos, 256 - cur_dwords);
     }
 
-    var triple[24];
-    native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle);
+    var triple[32];
+    native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle, tex_handle);
 
     var t_now[16];
     memset(&t_now, 0, 16);
@@ -1169,7 +1302,12 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     var ns_now = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8);
     var deadline = ns_now + 15000000000;
 
-    return native_render_dispatch_simple(ctx, pm4, pos, &triple, deadline);
+    var draw_rc = native_render_dispatch_simple(ctx, pm4, pos, &triple, deadline);
+    # v3.2 TS.5 (audit LOW): per-draw bind — clear the stash so a later draw in
+    # the same pass must re-bind to sample again (else it would re-emit a stale
+    # descriptor once multi-draw-per-pass lands). A fresh pass starts at 0.
+    store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, 0);
+    return draw_rc;
 }
 
 fn _backend_native_render_pass_end(ctx, pass): i64 {
@@ -1472,6 +1610,13 @@ fn backend_native_new(): i64 {
     # the wgpu filler lands too ("activate when both fill").
     backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
     &_backend_native_buffer_copy);
+    # v3.2 TS.5 — sampleable-texture slots. The backend_is_complete walk over
+    # 264..280 activates once wgpu fills these too (next sub-bite); native
+    # fills them now.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE,
+    &_backend_native_texture_create_2d_sampleable);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
+    &_backend_native_texture_bind_for_sample);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
@@ -1484,8 +1629,9 @@ fn backend_native_new(): i64 {
 # CPU-uploaded textures + compute-shader writes; tiled / mipped /
 # format-rich textures are subsequent Phase C chunks (5.x).
 #
-# NativeTexture struct layout (48 bytes — grew 32 → 48 at v3.1 M.1(b)
-# to carry mip metadata; offsets 0..24 unchanged):
+# NativeTexture struct layout (64 bytes — grew 32 → 48 at v3.1 M.1(b) for
+# mip metadata; 48 → 64 at v3.2 TS.3 for sampleable surfaces; offsets 0..44
+# unchanged):
 #   +0:  handle    (u64, KMS handle)
 #   +8:  va        (u64, canonical-high GPU VA of level 0)
 #   +16: addr      (u64, CPU mmap pointer to level 0)
@@ -1495,7 +1641,12 @@ fn backend_native_new(): i64 {
 #   +36: height    (u32, level-0 height)
 #   +40: mip_count (u32, 1 = single level; per-level VA = va +
 #                   native_mip_level_offset(width, height, level))
-#   +44: pad       (u32)
+#   +44: fmt       (u32, MABDA_TEXFMT_* — 0 = RGBA8; v3.2 T.7)
+#   +48: sw_mode   (u32, GFX9 SW_MODE — LINEAR(0) storage/uncompressed;
+#                   a tiled mode for sampleable compressed; v3.2 TS.3)
+#   +52: t_va      (u64, GPU VA of this texture's 48-byte T#+S# descriptor
+#                   BO, or 0 if not sampleable; v3.2 TS.3)
+#   +60: pad       (u32)
 #
 # v3.1 M.1(c): the texture VA region is a per-context bump-allocated
 # range (native_ctx_alloc_texture_va), not a single hardcoded VA. It was
@@ -1548,7 +1699,16 @@ var NATIVE_TEX_FIELD_WIDTH     = 32;
 var NATIVE_TEX_FIELD_HEIGHT    = 36;
 var NATIVE_TEX_FIELD_MIP_COUNT = 40;
 var NATIVE_TEX_FIELD_FMT       = 44;   # v3.2 T.7 — MABDA_TEXFMT_* (0 = RGBA8); was pad
-var NATIVE_TEX_STRUCT_SIZE     = 48;
+var NATIVE_TEX_FIELD_SW_MODE   = 48;   # v3.2 TS.3 — GFX9 SW_MODE (0 = LINEAR)
+var NATIVE_TEX_FIELD_T_VA      = 52;   # v3.2 TS.3 — VA of the T#+S# descriptor BO (0 = none)
+var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable)
+
+# v3.2 TS.3 — NativeTexture sampleable-field accessors.
+fn native_tex_fmt(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_FMT); }
+fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE); }
+fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
+fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
+fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.
@@ -1719,12 +1879,23 @@ fn native_texture_release_2d_rgba8(fd, tex): i64 {
     var va   = load64(tex + NATIVE_TEX_FIELD_VA);
     var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
     var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
-    native_gem_va_unmap(fd, handle, va, size);
-    native_bo_release_gtt(fd, handle, addr, size);
+    # v3.2 TS.5 (audit MED): a sampleable tex (t_va != 0) is a single BO mapped
+    # at the descriptor-tail-padded bo_size, NOT `size` (= the logical surface
+    # bytes kept for write/read bounds). Unmap/release the real mapped size or
+    # a CPU-mmap page + the GPU-VA reservation leak per release. Storage/mipped
+    # textures (t_va == 0) keep the existing `size` path unchanged.
+    var t_va = native_tex_t_va(tex);
+    var unmap_size = size;
+    if (t_va != 0) {
+        unmap_size = _native_align_up((t_va - va) + 64, 4096);
+    }
+    native_gem_va_unmap(fd, handle, va, unmap_size);
+    native_bo_release_gtt(fd, handle, addr, unmap_size);
     store64(tex + NATIVE_TEX_FIELD_HANDLE, 0);
     store64(tex + NATIVE_TEX_FIELD_VA,     0);
     store64(tex + NATIVE_TEX_FIELD_ADDR,   0);
     store64(tex + NATIVE_TEX_FIELD_SIZE,   0);
+    native_tex_set_t_va(tex, 0);   # so a released sampleable tex no longer binds
     return 0;
 }
 
@@ -1914,17 +2085,22 @@ fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va): i64 {
     return 0;
 }
 
-# NativePass struct layout (32 bytes — matches wgpu pass struct
-# shape from src/backend_wgpu.cyr for parity, with native-specific
-# field interpretations):
+# NativePass struct layout (40 bytes — grew 32 → 40 at v3.2 TS.3 for the
+# bound-texture descriptor VA; offsets 0..24 unchanged):
 #   +0:  ctx_ref         (u64, GpuContext for pass_draw + pass_end)
 #   +8:  reserved        (u64, parallel to wgpu's pass-encoder slot)
 #   +16: rt_ptr          (u64, NativeRenderTarget — provides VA / w / h)
 #   +24: clear_color_ptr (u64, 32-byte f64 RGBA — captured for v2.1;
 #                         v2-native ignores because the FS shader
 #                         hardcodes solid red, see Step 6.2(b) FS)
+#   +32: bound_tex       (u64, the bound NativeTexture* or 0; v3.2 TS.3/TS.5 —
+#                         bind_for_sample stashes the tex pointer so the draw
+#                         derives both the T#/S# descriptor VA (native_tex_t_va,
+#                         for the PS USER_DATA SET_SH_REG) and the surface BO
+#                         handle (for residency — the single sampleable BO))
 var NATIVE_PASS_FIELD_CTX         = 0;
 var NATIVE_PASS_FIELD_RESERVED    = 8;
 var NATIVE_PASS_FIELD_RT          = 16;
 var NATIVE_PASS_FIELD_CLEAR_COLOR = 24;
-var NATIVE_PASS_STRUCT_SIZE       = 32;
+var NATIVE_PASS_FIELD_BOUND_TEX   = 32;   # v3.2 TS.3/TS.5 (was TEX_DESC_VA)
+var NATIVE_PASS_STRUCT_SIZE       = 40;

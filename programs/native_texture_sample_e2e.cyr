@@ -1,0 +1,188 @@
+# programs/native_texture_sample_e2e.cyr — v3.2 TS.5 (native RGBA8 sampling MVP)
+#
+# First HW run of the whole native T#/image_load sampling path (the proposal's
+# TS.5 MVP). Drives the PUBLIC gpu_render_* + sampleable-texture API on the
+# native GFX ring:
+#
+#   1. native ctx + VS (fullscreen triangle) + FS (textured_load_fs) shader BOs
+#   2. gpu_texture_create_2d_sampleable(64x64, RGBA8) — single BO: surface +
+#      T#/S# descriptor; gpu_texture_write uploads a per-texel pattern
+#      tex[x,y] = (x, y, 0xC0, 0xFF).
+#   3. gpu_render_target_create_2d_rgba8(64,64); gpu_sampler_create(point,clamp)
+#   4. gpu_render_pipeline_create(vs, textured-fs); gpu_render_pass_begin
+#   5. gpu_render_pass_bind_texture(tex, sampler) — stashes the tex on the pass
+#   6. gpu_render_pass_draw — the draw emits the textured override
+#      (SPI_PS_INPUT=0x302, RSRC1_PS VGPR bump, PS USER_DATA = descriptor VA)
+#      + adds the surface BO to residency; the FS loads the texel at each
+#      fragment's screen position and exports it.
+#   7. Verify RT[x,y] == tex[x,y] at several pixels — the screen-pos oracle is
+#      pixel-exact (fragment (x,y) image_load's texel (x,y)), so this proves
+#      T#/image_load + the descriptor + the residency + the SPI/USER_DATA wiring
+#      with ZERO tiling risk (linear surface).
+#
+# Exit codes: 0 pass; 1 ctx; 2 vs bo; 3 fs bo; 4 tex create; 5 tex upload;
+#   6 rt; 7 sampler/pipeline; 8 pass begin; 9 bind; 10 draw (TDR?); 11 mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+fn mono_ns(): i64 {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+# Expected RGBA byte for texel (x, y): (x, y, 0xC0, 0xFF) packed little-endian
+# (R in byte 0). Returns the 32-bit value as it sits in memory.
+fn _texel(x, y): i64 {
+    return (x & 0xFF) | ((y & 0xFF) << 8) | (0xC0 << 16) | (0xFF << 24);
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native texture-sample e2e (v3.2 TS.5)\n");
+    print_cstr("-------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # ---- VS (fullscreen triangle) ----
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { print_cstr("FAIL: vs bo\n"); return 2; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n"); return 2; }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+
+    # ---- FS (textured image_load) ----
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { print_cstr("FAIL: fs bo\n"); return 3; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    memset(fs_addr, 0, 4096);
+    native_gfx9_shader_textured_load_fs(fs_addr, 0);
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n"); return 3; }
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+    print_cstr("PASS: VS + textured FS shaders\n");
+
+    # ---- Sampleable texture + per-texel pattern ----
+    var W = 64;
+    var H = 64;
+    var N = W * H * 4;
+    var tex = gpu_texture_create_2d_sampleable(ctx, W, H, MABDA_TEXFMT_RGBA8);
+    if (tex == 0) { print_cstr("FAIL: tex create\n"); return 4; }
+    var src = alloc(N);
+    var y = 0;
+    while (y < H) {
+        var x = 0;
+        while (x < W) {
+            store32(src + (y * W + x) * 4, _texel(x, y));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (gpu_texture_write(ctx, tex, src, N) != 0) { print_cstr("FAIL: tex upload\n"); return 5; }
+    print_cstr("PASS: sampleable tex 64x64 + per-texel pattern\n");
+
+    # ---- RT + sampler + pipeline ----
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { print_cstr("FAIL: rt\n"); return 6; }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, N);   # sentinel — distinct from any expected texel
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { print_cstr("FAIL: sampler\n"); return 7; }
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); return 7; }
+    print_cstr("PASS: RT + sampler + textured pipeline\n");
+
+    # ---- Pass: bind + draw ----
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { print_cstr("FAIL: pass begin\n"); return 8; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) {
+        print_cstr("FAIL: bind_texture\n"); return 9; }
+    var t0 = mono_ns();
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    var ms = (mono_ns() - t0) / 1000000;
+    print_cstr("draw: "); print_i64(ms); print_cstr(" ms");
+    if (ms >= 9000) { print_cstr(" (likely TDR)"); }
+    print_cstr("\n");
+    if (rc != 0) { print_cstr("FAIL: draw rc="); print_i64(rc); print_cstr("\n");
+        gpu_render_pass_end(ctx, pass); return 10; }
+    gpu_render_pass_end(ctx, pass);
+    print_cstr("PASS: bound + drew textured sample\n");
+
+    # ---- Verify RT[x,y] == tex[x,y] at several probes (screen-pos oracle) ----
+    var bad = 0;
+    var probes_x[5];
+    var probes_y[5];
+    store64(&probes_x + 0,  0); store64(&probes_y + 0,  0);
+    store64(&probes_x + 8,  1); store64(&probes_y + 8,  0);
+    store64(&probes_x + 16, 0); store64(&probes_y + 16, 1);
+    store64(&probes_x + 24, 10); store64(&probes_y + 24, 20);
+    store64(&probes_x + 32, 63); store64(&probes_y + 32, 63);
+    var pi = 0;
+    while (pi < 5) {
+        var px = load64(&probes_x + pi * 8);
+        var py = load64(&probes_y + pi * 8);
+        var got = load32(rt_addr + (py * W + px) * 4);
+        var want = _texel(px, py);
+        if (got != want) {
+            print_cstr("MISMATCH px="); print_i64(px); print_cstr(" py="); print_i64(py);
+            print_cstr(" got="); print_hex32(got); print_cstr(" want="); print_hex32(want);
+            print_cstr("\n");
+            bad = 1;
+        }
+        pi = pi + 1;
+    }
+    if (bad != 0) { print_cstr("FAIL: sampled pixels != texture\n"); return 11; }
+    print_cstr("PASS: RT[x,y] == tex[x,y] (T#/image_load sampling verified)\n");
+
+    # Teardown — exercises the fixed sampleable release (single-BO bo_size
+    # unmap + t_va clear) on HW.
+    gpu_texture_release(ctx, tex);
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    native_gem_va_unmap(fd, fs_handle, fs_va, 4096);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, 4096);
+    native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
+    gpu_context_release(ctx);
+    print_cstr("OK — native RGBA8 sampling live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -8,15 +8,18 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.2.1 (dual backend — wgpu + native AMD; see
+Version: 3.2.2 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
 block-compressed textures (BC / ETC2 / ASTC): wgpu creates + uploads +
 samples; native AMD stores + reads back (sampling lands later in the 3.2.x
 arc). 3.2.1 adds buffer-to-buffer copy on both backends (native SDMA on a
-real DMA ring with >4 MiB chaining; wgpu copy_buffer_to_buffer). HW-verified
-on Cezanne. See the CHANGELOG.)
+real DMA ring with >4 MiB chaining; wgpu copy_buffer_to_buffer). 3.2.2 adds
+native texture *sampling* — GFX9 T#/S# + a textured image_load FS so native
+AMD samples a texture in a fragment shader (RT[x,y]==tex[x,y] verified);
+native compressed sampling lands in 3.2.3. HW-verified on Cezanne. See the
+CHANGELOG.)
 
 ## Features
 

@@ -416,6 +416,28 @@ fn _backend_wgpu_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     return t;
 }
 
+# v3.2 TS.5 — sampleable 2D texture create (wgpu). The fmt-create above
+# already makes a TEXTURE_BINDING texture + a 2D view, which is exactly a
+# sampleable resource on wgpu, so this is a thin alias. (The native sibling
+# differs materially — it builds a tiled-or-linear BO + a T#/S# descriptor.)
+fn _backend_wgpu_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
+    return _backend_wgpu_texture_create_2d_fmt(ctx, width, height, fmt);
+}
+
+# v3.2 TS.5 (minimal) — bind a sampleable texture into a render pass (wgpu).
+# Stashes the bound texture + sampler intent on the pass struct (bound_tex
+# @+24, bound_sampler @+32); the bind-group build + render_pass_encoder
+# set_bind_group + the textured pipeline are the wgpu sample render path
+# (next bite). Returns 0|GPU_ERR_*.
+fn _backend_wgpu_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0)  { return GPU_ERR_TEXTURE; }
+    store64(pass + 24, tex);
+    store64(pass + 32, sampler);
+    return 0;
+}
+
 # v3.2 [T.6]: block-aware write. Reads the format id at tex+16 (0 = RGBA8
 # for legacy textures created by the rgba8 path, whose +16 is zeroed), so
 # this one slot uploads RGBA8 and block-compressed data alike: expected
@@ -687,8 +709,10 @@ fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
         return 0;
     }
 
-    var p = alloc(32);
-    memset(p, 0, 32);
+    # 40 bytes (grew 32 → 40 at v3.2 TS.5): +24 bound_tex / +32 bound_sampler
+    # for bind_for_sample; both default 0 (no texture bound).
+    var p = alloc(40);
+    memset(p, 0, 40);
     store64(p +  0, encoder);
     store64(p +  8, pass);
     store64(p + 16, rt);
@@ -704,6 +728,37 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (pass_enc == 0)    { return GPU_ERR_OTHER; }
     if (pipe_handle == 0) { return GPU_ERR_OTHER; }
     wgpu_render_pass_encoder_set_pipeline(pass_enc, pipe_handle);
+    # v3.2 TS.5 — if a sampleable texture was bound (gpu_render_pass_bind_texture
+    # stashed it at +24, its sampler intent at +32), build + set its bind group
+    # at group 0 from the pipeline's auto-generated BGL. The bound pipeline must
+    # be a textured pipeline (WGSL @group(0): texture@0, sampler@1).
+    var bound_tex = load64(pass + 24);
+    if (bound_tex != 0) {
+        var view = load64(bound_tex + 8);   # wgpu tex struct: view @ +8
+        if (view == 0) { return GPU_ERR_TEXTURE; }
+        var device = gpu_ctx_device(ctx);
+        var intent = load64(pass + 32);
+        var sdesc = wgpu_sampler_descriptor_from_intent(
+        gpu_sampler_filter(intent), gpu_sampler_addr(intent));
+        var sampler = wgpu_device_create_sampler(device, sdesc);
+        if (sampler == 0) { return GPU_ERR_OTHER; }
+        var bgl = wgpu_render_pipeline_get_bind_group_layout(pipe_handle, 0);
+        if (bgl == 0) { wgpu_sampler_release(sampler); return GPU_ERR_OTHER; }
+        var bgdesc = wgpu_texture_bind_group_descriptor(bgl, view, sampler);
+        var bg = wgpu_device_create_bind_group(device, bgdesc);
+        if (bg == 0) {
+            wgpu_bind_group_layout_release(bgl);
+            wgpu_sampler_release(sampler);
+            return GPU_ERR_OTHER;
+        }
+        wgpu_render_pass_encoder_set_bind_group(pass_enc, 0, bg, 0, 0);
+        # Audit 2026-06-15 HIGH — release our refs now: wgpu-native retains its
+        # own refs to the recorded bind group (and the group AddRef'd the
+        # view + sampler), so dropping ours here avoids a per-draw handle leak.
+        wgpu_bind_group_release(bg);
+        wgpu_bind_group_layout_release(bgl);
+        wgpu_sampler_release(sampler);
+    }
     wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
     return 0;
 }
@@ -939,6 +994,12 @@ fn backend_wgpu_new(): i64 {
     # walk over the range activates this step ("activate when both fill").
     backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
     &_backend_wgpu_buffer_copy);
+    # v3.2 TS.5 — sampleable-texture slots. Both backends fill these now
+    # (native TS.5a), so the backend_is_complete walk over 264..280 activates.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE,
+    &_backend_wgpu_texture_create_2d_sampleable);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
+    &_backend_wgpu_texture_bind_for_sample);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }

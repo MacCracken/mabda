@@ -286,7 +286,7 @@ long wgpu_shim_get_timestamp_period_bits(WGPUQueue queue) {
 }
 
 // === Function table ===
-#define FN_COUNT 65
+#define FN_COUNT 66
 static void* fn_table[FN_COUNT];
 
 static void build_fn_table(void) {
@@ -368,6 +368,9 @@ static void build_fn_table(void) {
     fn_table[i++] = (void*)wgpuRenderPassEncoderEnd;                      // 62
     fn_table[i++] = (void*)wgpuRenderPassEncoderRelease;                  // 63
     fn_table[i++] = (void*)wgpu_shim_command_encoder_copy_texture_to_buffer;  // 64 (shim: packs src/dst/size)
+    // v3.2 TS.5 — wgpu sample render path: the textured draw fetches the
+    // pipeline's auto-generated BGL to build the (texture, sampler) bind group.
+    fn_table[i++] = (void*)wgpuRenderPipelineGetBindGroupLayout;          // 65
 }
 
 // Pre-initialize GPU context in C (before Cyrius code runs)

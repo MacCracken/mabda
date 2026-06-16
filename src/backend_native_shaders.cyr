@@ -427,6 +427,64 @@ fn native_gfx9_shader_fullscreen_triangle_vs(buf, pos): i64 {
 var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
 
 # ================================================================
+# v3.2 TS.4 — textured fragment shader (image_load bring-up oracle)
+# ================================================================
+# The sampling-path replacement for native_gfx9_shader_solid_red: each
+# fragment LOADS the texel at its own screen position and exports it, so a
+# fullscreen quad over a W×H render target sampling a W×H texture reproduces
+# the texture (RT[x,y] = tex[x,y]) — the exact, zero-interpolation oracle
+# TS.5 verifies on Cezanne. (Normalized-UV `image_sample` + the UV-export VS
+# come at TS.7 for the compressed/scaled path.)
+#
+# ABI:
+#   - s[0:1] = PS user-data (the T#+S# descriptor BO VA; pipeline SET_SH_REGs
+#     SPI_SHADER_USER_DATA_PS_0/1 at bind, TS.5). RSRC2_PS USER_SGPR=2.
+#   - SPI_PS_INPUT_ENA = GFX9_SPI_PS_INPUT_TEXTURED (0x302): PERSP_CENTER
+#     (hang-quirk, VGPRs v0/v1 unused) + POS_X_FLOAT + POS_Y_FLOAT, so the
+#     fragment screen position arrives as floats in v2 (x) / v3 (y).
+#   - High-water: VGPRs v0..v5 (6), SGPRs s[0:7] (8, the loaded T#). TS.5's
+#     PM4 sets RSRC1_PS accordingly.
+#
+# Source (assembled + round-tripped via `llvm-mc -mcpu=gfx90c`, per
+# feedback_verify_gfx9_shader_bytes_with_llvm_mc):
+#   s_load_dwordx8 s[0:7], s[0:1], 0x0   ; load the T# from the descriptor BO
+#   s_waitcnt lgkmcnt(0)
+#   v_cvt_i32_f32_e32 v4, v2             ; tx = int(pos_x)
+#   v_cvt_i32_f32_e32 v5, v3             ; ty = int(pos_y)
+#   image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm
+#   s_waitcnt vmcnt(0)
+#   exp mrt0 v0, v1, v2, v3 done vm
+#   s_endpgm
+# exp word0 = 0xC400180F — identical to the proven solid-red EXP encoding.
+# Returns pos + 108 (44 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
+    store32(buf + pos +  0, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (w0)
+    store32(buf + pos +  4, 0x00000000);   # s_load_dwordx8 (w1)
+    store32(buf + pos +  8, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
+    store32(buf + pos + 12, 0x7E081102);   # v_cvt_i32_f32_e32 v4, v2  (POS_X -> tx)
+    store32(buf + pos + 16, 0x7E0A1103);   # v_cvt_i32_f32_e32 v5, v3  (POS_Y -> ty)
+    store32(buf + pos + 20, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
+    store32(buf + pos + 24, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    store32(buf + pos + 28, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(buf + pos + 32, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    store32(buf + pos + 36, 0x03020100);   # exp (w1)
+    store32(buf + pos + 40, 0xBF810000);   # s_endpgm
+    var i = 0;
+    while (i < 16) {
+        store32(buf + pos + 44 + i * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
+        i = i + 1;
+    }
+    return pos + 108;
+}
+
+var GFX9_FS_TEXTURED_LOAD_SIZE = 108;
+
+# SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
+# gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
+# POS_Y_FLOAT_ENA[9]. (1<<1)|(1<<8)|(1<<9) = 0x302.
+var GFX9_SPI_PS_INPUT_TEXTURED = 0x302;
+
+# ================================================================
 # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
 # ================================================================
 # Spec-anchor for the trivial vertex+fragment pipeline that Step
@@ -473,6 +531,12 @@ var R_SPI_SHADER_PGM_LO_PS    = 0xB020;
 var R_SPI_SHADER_PGM_HI_PS    = 0xB024;
 var R_SPI_SHADER_PGM_RSRC1_PS = 0xB028;
 var R_SPI_SHADER_PGM_RSRC2_PS = 0xB02C;
+# v3.2 TS.4 — PS user-data SH registers (Mesa R_00B03{0,4}). The textured FS's
+# 2 user SGPRs (s[0:1]) hold the bound texture's T#+S# descriptor BO VA; the
+# pipeline SET_SH_REGs these at bind/draw time (TS.5). RSRC2_PS USER_SGPR=2
+# (GFX9_PS_PGM_RSRC2_MIN = 0x4 already encodes 2).
+var R_SPI_SHADER_USER_DATA_PS_0 = 0xB030;
+var R_SPI_SHADER_USER_DATA_PS_1 = 0xB034;
 
 # SPI shader output format context registers
 # (Mesa gfx9.json: R_02870C_SPI_SHADER_POS_FORMAT,
@@ -951,4 +1015,203 @@ var GFX9_CB_COLOR0_INFO_RGBA8_UNORM = 0x00028028;
 # RESOURCE_TYPE encoding cited from radv source pattern; field
 # enum was not in the gfx9.json snapshot, so flag for HW verify.
 var GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8 = 0x10000000;
+
+# ================================================================
+# v3.2 TS.2 — GFX9 sampler (S#) descriptor + format->IMG table
+# ================================================================
+# Re-introduces the sampler/image-format descriptor infra the v3.1 mipmap
+# PIVOT deleted, so native AMD can SAMPLE textures (Phase TS). Pure byte
+# builders + a format table — no HW here; the bytes are HW-verified at the
+# TS.5 sampling MVP. Every field/enum value is cited from the authoritative
+# Mesa register DB src/amd/registers/gfx9.json (per
+# feedback_gfx9_register_authoritative_source): `enums` for the value
+# tables, `register_types` for the bit layouts.
+
+# --- GFX9 image data/num-format enum values (gfx9.json enums
+#     IMG_DATA_FORMAT / IMG_NUM_FORMAT). ---
+var GFX9_IMG_DATA_FORMAT_8_8_8_8   = 10;
+var GFX9_IMG_DATA_FORMAT_ETC2_RGB  = 24;
+var GFX9_IMG_DATA_FORMAT_ETC2_RGBA = 25;
+var GFX9_IMG_DATA_FORMAT_BC1       = 35;
+var GFX9_IMG_DATA_FORMAT_BC3       = 37;
+var GFX9_IMG_DATA_FORMAT_BC4       = 38;
+var GFX9_IMG_DATA_FORMAT_BC5       = 39;
+var GFX9_IMG_DATA_FORMAT_BC6       = 40;
+var GFX9_IMG_DATA_FORMAT_BC7       = 41;
+var GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR = 46;
+var GFX9_IMG_NUM_FORMAT_UNORM = 0;
+var GFX9_IMG_NUM_FORMAT_FLOAT = 7;
+var GFX9_IMG_NUM_FORMAT_SRGB  = 9;
+
+# Map a MABDA_TEXFMT_* id to a packed GFX9 (data_format, num_format) pair:
+# `(data_format << 8) | num_format`. Returns -1 for an unsupported id (the
+# T# builder / create rejects). The native T# analog of mabda_texfmt_to_wgpu.
+# BC6H is unsigned-float HDR (NUM_FORMAT_FLOAT); the rest decode UNORM. The
+# three ASTC ids all map to GFX9's single ASTC_2D_LDR data-format — ASTC
+# per-block-size + HW-decode presence on Cezanne is a TS.8 verification item.
+fn native_gfx9_texfmt_to_img_format(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) {
+        return (GFX9_IMG_DATA_FORMAT_8_8_8_8 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC1) {
+        return (GFX9_IMG_DATA_FORMAT_BC1 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC3) {
+        return (GFX9_IMG_DATA_FORMAT_BC3 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC4) {
+        return (GFX9_IMG_DATA_FORMAT_BC4 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC5) {
+        return (GFX9_IMG_DATA_FORMAT_BC5 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_BC6H) {
+        return (GFX9_IMG_DATA_FORMAT_BC6 << 8) | GFX9_IMG_NUM_FORMAT_FLOAT;
+    }
+    if (fmt == MABDA_TEXFMT_BC7) {
+        return (GFX9_IMG_DATA_FORMAT_BC7 << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ETC2_RGB8) {
+        return (GFX9_IMG_DATA_FORMAT_ETC2_RGB << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ETC2_RGBA8) {
+        return (GFX9_IMG_DATA_FORMAT_ETC2_RGBA << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_4X4) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_6X6) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    if (fmt == MABDA_TEXFMT_ASTC_8X8) {
+        return (GFX9_IMG_DATA_FORMAT_ASTC_2D_LDR << 8) | GFX9_IMG_NUM_FORMAT_UNORM;
+    }
+    return 0 - 1;
+}
+
+# Unpack the (data_format, num_format) pair from native_gfx9_texfmt_to_img_format.
+# DATA_FORMAT is the 6-bit IMG field, NUM_FORMAT the 4-bit field.
+fn native_img_data_format(packed): i64 { return (packed >> 8) & 0x3F; }
+fn native_img_num_format(packed): i64 { return packed & 0xF; }
+
+# --- mabda sampler intent (backend-agnostic). The native builder maps
+#     these to GFX9 enums; the wgpu filler (TS.3) to WGPU{Filter,Address}Mode. ---
+var NATIVE_SAMP_FILTER_POINT    = 0;
+var NATIVE_SAMP_FILTER_BILINEAR = 1;
+var NATIVE_SAMP_ADDR_CLAMP      = 0;   # clamp-to-edge
+var NATIVE_SAMP_ADDR_WRAP       = 1;   # repeat
+
+# --- GFX9 sampler-field enum values (gfx9.json enums SQ_TEX_CLAMP /
+#     SQ_TEX_XY_FILTER / SQ_TEX_{Z,MIP}_FILTER / SQ_IMG_FILTER_TYPE). ---
+var GFX9_SQ_TEX_WRAP               = 0;   # SQ_TEX_CLAMP.SQ_TEX_WRAP
+var GFX9_SQ_TEX_CLAMP_LAST_TEXEL   = 2;   # clamp-to-edge
+var GFX9_SQ_TEX_XY_FILTER_POINT    = 0;
+var GFX9_SQ_TEX_XY_FILTER_BILINEAR = 1;
+var GFX9_SQ_TEX_Z_FILTER_NONE      = 0;
+var GFX9_SQ_TEX_MIP_FILTER_NONE    = 0;
+var GFX9_SQ_IMG_FILTER_MODE_BLEND  = 0;
+
+# Build a 128-bit (4-dword) GFX9 S# sampler descriptor into buf at pos.
+# Bit layout cited from gfx9.json register_types SQ_IMG_SAMP_WORD0..3:
+#   W0: CLAMP_X[0:2] CLAMP_Y[3:5] CLAMP_Z[6:8] FILTER_MODE[29:30]
+#   W1: MIN_LOD[0:11] MAX_LOD[12:23]
+#   W2: XY_MAG_FILTER[20:21] XY_MIN_FILTER[22:23] Z_FILTER[24:25] MIP_FILTER[26:27]
+#   W3: BORDER_COLOR_PTR[0:11] BORDER_COLOR_TYPE[30:31]
+# `filter`/`addr` are NATIVE_SAMP_* intents. point+clamp is the MVP sampler
+# (deterministic, CPU-verifiable); bilinear/wrap are field swaps. MAX_LOD =
+# 0xFFF (U4.8 max) so a mipped texture can sample every level; MIP_FILTER =
+# NONE keeps single-level sampling deterministic. FILTER_MODE = BLEND
+# (normal, non-min/max). Returns pos + 16.  @internal
+fn native_gfx9_sampler_descriptor(buf, pos, filter, addr): i64 {
+    var clamp = GFX9_SQ_TEX_WRAP;
+    if (addr == NATIVE_SAMP_ADDR_CLAMP) { clamp = GFX9_SQ_TEX_CLAMP_LAST_TEXEL; }
+    var xy = GFX9_SQ_TEX_XY_FILTER_POINT;
+    if (filter == NATIVE_SAMP_FILTER_BILINEAR) { xy = GFX9_SQ_TEX_XY_FILTER_BILINEAR; }
+
+    var w0 = (clamp & 0x7) | ((clamp & 0x7) << 3) | ((clamp & 0x7) << 6);
+    w0 = w0 | ((GFX9_SQ_IMG_FILTER_MODE_BLEND & 0x3) << 29);
+    var w1 = (0 & 0xFFF) | ((0xFFF & 0xFFF) << 12);   # MIN_LOD=0, MAX_LOD=max
+    var w2 = ((xy & 0x3) << 20) | ((xy & 0x3) << 22);
+    w2 = w2 | ((GFX9_SQ_TEX_Z_FILTER_NONE & 0x3) << 24);
+    w2 = w2 | ((GFX9_SQ_TEX_MIP_FILTER_NONE & 0x3) << 26);
+    var w3 = 0;
+    store32(buf + pos +  0, w0);
+    store32(buf + pos +  4, w1);
+    store32(buf + pos +  8, w2);
+    store32(buf + pos + 12, w3);
+    return pos + 16;
+}
+
+# --- GFX9 image-descriptor field enum values (gfx9.json enums
+#     SQ_SEL_XYZW01 / SQ_RSRC_IMG_TYPE). SW_MODE has no register enum (raw
+#     5-bit field); SW_LINEAR = 0 (matches COLOR_SW_MODE=0 linear, used by
+#     GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8). The tiled SW_64KB_S value is
+#     an addrlib mode pinned at TS.6 with the swizzle transform. ---
+var GFX9_SQ_SEL_X       = 4;
+var GFX9_SQ_SEL_Y       = 5;
+var GFX9_SQ_SEL_Z       = 6;
+var GFX9_SQ_SEL_W       = 7;
+var GFX9_SQ_RSRC_IMG_2D = 9;
+var GFX9_SW_MODE_LINEAR = 0;
+
+# Build a 256-bit (8-dword) GFX9 T# image descriptor into buf at pos.
+# base_va: GPU VA of the surface (canonical-high; the 48-bit form is stored
+# as BASE_ADDRESS[47:8]). fmt: MABDA_TEXFMT_* -> GFX9 (data,num) format via
+# native_gfx9_texfmt_to_img_format. sw_mode: GFX9 SW_MODE (LINEAR for
+# uncompressed; a tiled mode for compressed, TS.6/7). mip_count >= 1.
+# Bit layout cited from gfx9.json register_types SQ_IMG_RSRC_WORD0..6:
+#   W0: BASE_ADDRESS[31:0]        = va[39:8]
+#   W1: BASE_ADDRESS_HI[0:7]=va[47:40]  MIN_LOD[8:19]=0
+#       DATA_FORMAT[20:25]  NUM_FORMAT[26:29]
+#   W2: WIDTH[0:13]=w-1   HEIGHT[14:27]=h-1
+#   W3: DST_SEL_X[0:2] Y[3:5] Z[6:8] W[9:11] (identity RGBA = X/Y/Z/W)
+#       BASE_LEVEL[12:15]=0  LAST_LEVEL[16:19]=mips-1  SW_MODE[20:24]
+#       TYPE[28:31]=SQ_RSRC_IMG_2D
+#   W4: DEPTH[0:12]=0  PITCH[13:28]   BC_SWIZZLE[29:31]=0
+#       (PITCH = w-1 for LINEAR; tiled derives its own row pitch, left 0)
+#   W5: MAX_MIP[28:31]=mips-1     W6/W7: 0 (no DCC / metadata)
+# Returns pos + 32, or -1 if fmt is unsupported / dims invalid (caller
+# rejects). NOTE: bit POSITIONS are gfx9.json-authoritative; field VALUE
+# semantics (linear PITCH alignment, MIN_LOD/MAX_MIP) are HW-cross-checked
+# at the TS.5 sampling MVP on Cezanne. @internal
+fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
+fmt, sw_mode, mip_count): i64 {
+    if (width <= 0)  { return 0 - 1; }
+    if (height <= 0) { return 0 - 1; }
+    var packed = native_gfx9_texfmt_to_img_format(fmt);
+    if (packed < 0) { return 0 - 1; }
+    var df = native_img_data_format(packed);
+    var nf = native_img_num_format(packed);
+    var levels = mip_count;
+    if (levels < 1) { levels = 1; }
+    var last_level = levels - 1;
+
+    # W0: low 32 of (va >> 8). `>>` is logical (no sign-extend); mask to 32.
+    var w0 = (base_va >> 8) & 0xFFFFFFFF;
+    # W1: BASE_ADDRESS_HI[0:7] | DATA_FORMAT[20:25] | NUM_FORMAT[26:29].
+    var base_hi = (base_va >> 40) & 0xFF;
+    var w1 = (base_hi & 0xFF) | ((df & 0x3F) << 20) | ((nf & 0xF) << 26);
+    # W2: WIDTH[0:13]=w-1, HEIGHT[14:27]=h-1.
+    var w2 = ((width - 1) & 0x3FFF) | (((height - 1) & 0x3FFF) << 14);
+    # W3: identity swizzle + LAST_LEVEL + SW_MODE + TYPE=2D.
+    var w3 = (GFX9_SQ_SEL_X & 0x7) | ((GFX9_SQ_SEL_Y & 0x7) << 3);
+    w3 = w3 | ((GFX9_SQ_SEL_Z & 0x7) << 6) | ((GFX9_SQ_SEL_W & 0x7) << 9);
+    w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
+    w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
+    # W4: PITCH[13:28] = w-1 for LINEAR (tiled derives its own).
+    var pitch = 0;
+    if (sw_mode == GFX9_SW_MODE_LINEAR) { pitch = width - 1; }
+    var w4 = (pitch & 0xFFFF) << 13;
+    # W5: MAX_MIP[28:31].
+    var w5 = (last_level & 0xF) << 28;
+    store32(buf + pos +  0, w0);
+    store32(buf + pos +  4, w1);
+    store32(buf + pos +  8, w2);
+    store32(buf + pos + 12, w3);
+    store32(buf + pos + 16, w4);
+    store32(buf + pos + 20, w5);
+    store32(buf + pos + 24, 0);
+    store32(buf + pos + 28, 0);
+    return pos + 32;
+}
 

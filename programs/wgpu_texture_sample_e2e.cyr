@@ -1,0 +1,167 @@
+# programs/wgpu_texture_sample_e2e.cyr — v3.2 TS.5 (wgpu sample path)
+#
+# Proves the wgpu BIND + SAMPLE render path end-to-end through the PUBLIC API
+# (the path Phase T did NOT wire — its e2e was copy-back, not a shader sample):
+#
+#   gpu_texture_create_2d_sampleable(RGBA8) + gpu_texture_write (solid color)
+#   -> gpu_sampler_create(point, clamp)
+#   -> textured pipeline (one WGSL module, @group(0): texture@0 + sampler@1)
+#   -> gpu_render_pass_begin (clear black)
+#   -> gpu_render_pass_bind_texture(tex, sampler)   [stashes on the pass]
+#   -> gpu_render_pass_draw                          [builds + sets the bind
+#      group from the pipeline's auto-BGL, then draws a fullscreen triangle]
+#   -> gpu_render_pass_end (submit)
+#   -> copy RT -> MAP_READ buffer -> verify the RT is the sampled texture
+#      color (NOT the clear color — so the texture was genuinely bound +
+#      sampled; if the bind group were missing, the draw would fail and the
+#      RT would stay black).
+#
+# Solid distinctive color (0x40,0x80,0xC0,0xFF) is a robust bind+sample proof
+# (the color's only source is the texture); pixel-exact SPATIAL sampling is
+# the native screen-pos image_load e2e's job (TS.5 option 1).
+#
+# Linked with deps/wgpu_main.c. Skips cleanly if no GPU.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+fn _textured_wgsl(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var t: texture_2d<f32>; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(1) var s: sampler; ");
+    str_builder_add_cstr(sb, "struct VOut { @builtin(position) pos: vec4<f32>, ");
+    str_builder_add_cstr(sb, "@location(0) uv: vec2<f32> }; ");
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> VOut { ");
+    str_builder_add_cstr(sb, "var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), ");
+    str_builder_add_cstr(sb, "vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); ");
+    str_builder_add_cstr(sb, "var o: VOut; o.pos = vec4<f32>(p[vid], 0.0, 1.0); ");
+    str_builder_add_cstr(sb, "o.uv = (p[vid] + vec2<f32>(1.0, 1.0)) * 0.5; return o; } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main(inp: VOut) -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return textureSample(t, s, inp.uv); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue  = gpu_ctx_queue(_gpu_ctx);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    var W = 64;
+    var H = 64;
+    var N = W * H * 4;
+
+    # --- 1. Sampleable RGBA8 texture, filled with a solid distinctive color ---
+    var tex = gpu_texture_create_2d_sampleable(_gpu_ctx, W, H, MABDA_TEXFMT_RGBA8);
+    if (tex == 0) { return _fail("FAIL: create_sampleable\n", 24); }
+    var src = alloc(N);
+    var i = 0;
+    while (i < W * H) {
+        store8(src + i * 4 + 0, 0x40);
+        store8(src + i * 4 + 1, 0x80);
+        store8(src + i * 4 + 2, 0xC0);
+        store8(src + i * 4 + 3, 0xFF);
+        i = i + 1;
+    }
+    if (gpu_texture_write(_gpu_ctx, tex, src, N) != 0) {
+        return _fail("FAIL: texture upload\n", 21);
+    }
+    syscall(1, 1, "PASS: sampleable texture created + uploaded\n", 44);
+
+    # --- 2. Sampler + textured pipeline (one module, vs_main + fs_main) ---
+    var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { return _fail("FAIL: sampler create\n", 21); }
+    var wgsl = _textured_wgsl();
+    var shmod = gpu_shader_module_create(_gpu_ctx, wgsl, strlen(wgsl));
+    if (shmod == 0) { return _fail("FAIL: shader module\n", 20); }
+    var pipe = gpu_render_pipeline_create(_gpu_ctx, shmod, shmod,
+    WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (pipe == 0) { return _fail("FAIL: render pipeline\n", 22); }
+    syscall(1, 1, "PASS: sampler + textured pipeline\n", 34);
+
+    # --- 3. Render target + a pass that binds the texture and draws ---
+    var rt = gpu_render_target_create_2d_rgba8(_gpu_ctx, W, H);
+    if (rt == 0) { return _fail("FAIL: render target\n", 20); }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);   # black
+    var pass = gpu_render_pass_begin(_gpu_ctx, rt, clear);
+    if (pass == 0) { return _fail("FAIL: pass begin\n", 17); }
+    if (gpu_render_pass_bind_texture(_gpu_ctx, pass, tex, samp) != 0) {
+        return _fail("FAIL: bind_texture\n", 19);
+    }
+    if (gpu_render_pass_draw(_gpu_ctx, pass, pipe, 3, 1) != 0) {
+        return _fail("FAIL: draw\n", 11);
+    }
+    gpu_render_pass_end(_gpu_ctx, pass);
+    syscall(1, 1, "PASS: bound texture + drew fullscreen sample\n", 45);
+
+    # --- 4. Copy RT -> MAP_READ buffer (64*4 = 256 = bytesPerRow, no pad) ---
+    var rt_handle = load64(rt + 0);
+    var BPR = 256;
+    var BUF_SIZE = 16384;   # H * BPR
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("sample-readback", read_usage, BUF_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return _fail("FAIL: readback buffer\n", 22); }
+    var enc = wgpu_device_create_command_encoder(device, "sample-readback-enc");
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  rt_handle);
+    store32(cargs + 24, 0);
+    store64(cargs + 32, read_buf);
+    store32(cargs + 48, BPR);
+    store32(cargs + 52, H);
+    store32(cargs + 56, W);
+    store32(cargs + 60, H);
+    store32(cargs + 64, 1);
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "sample-readback-cmd");
+    wgpu_queue_submit_one(queue, cmd);
+
+    # --- 5. Map + verify: every probed pixel is the sampled texture color ---
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("FAIL: map readback\n", 19);
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
+    if (mapped == 0) { return _fail("FAIL: get mapped range\n", 23); }
+    # Probe pixel(0,0), pixel(W-1, 0), and the center — all must be the
+    # texture color (proves the whole quad sampled, not the clear color).
+    var bad = 0;
+    var off0 = 0;
+    var off1 = (W - 1) * 4;
+    var offc = (H / 2) * BPR + (W / 2) * 4;
+    var probes[3];
+    store64(&probes + 0, off0);
+    store64(&probes + 8, off1);
+    store64(&probes + 16, offc);
+    var pi = 0;
+    while (pi < 3) {
+        var o = load64(&probes + pi * 8);
+        if (load8(mapped + o + 0) != 0x40) { bad = 1; }
+        if (load8(mapped + o + 1) != 0x80) { bad = 1; }
+        if (load8(mapped + o + 2) != 0xC0) { bad = 1; }
+        if (load8(mapped + o + 3) != 0xFF) { bad = 1; }
+        pi = pi + 1;
+    }
+    wgpu_buffer_unmap(read_buf);
+    if (bad != 0) {
+        return _fail("FAIL: RT is not the sampled texture color\n", 42);
+    }
+    syscall(1, 1, "PASS: RT = sampled texture color (0x40,0x80,0xC0,0xFF)\n", 54);
+
+    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    return 0;
+}
