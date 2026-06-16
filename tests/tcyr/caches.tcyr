@@ -84,6 +84,50 @@ fn test_shader_cache_distinct_keys() {
     return 0;
 }
 
+# v3.2 S.3 — length-explicit + kind-folded hash. The kind fold separates
+# WGSL/SPIRV/GFX9 namespaces; WGSL (kind 0) is the identity fold (legacy keys).
+fn test_shader_hash_n_kind_separation() {
+    var buf[8];
+    store64(&buf, 0x0102030405060708);
+    var w = _shader_hash_n(&buf, 8, SHADER_SRC_WGSL);
+    var s = _shader_hash_n(&buf, 8, SHADER_SRC_SPIRV);
+    var g = _shader_hash_n(&buf, 8, SHADER_SRC_GFX9);
+    assert(w != s, "same bytes, WGSL vs SPIRV -> different hash");
+    assert(w != g, "WGSL vs GFX9 -> different");
+    assert(s != g, "SPIRV vs GFX9 -> different");
+    # kind=WGSL(0) is identity -> matches the legacy NUL-terminated _shader_hash.
+    var str[4];
+    store8(&str + 0, 65); store8(&str + 1, 66); store8(&str + 2, 67); store8(&str + 3, 0);
+    assert_eq(_shader_hash_n(&str, 3, SHADER_SRC_WGSL), _shader_hash(&str),
+    "WGSL kind fold is identity (legacy keys stable)");
+    return 0;
+}
+
+# v3.2 S.3 — length-explicit hash distinguishes blobs that differ AFTER an
+# embedded NUL (the SPIR-V case the NUL-terminated _shader_hash can't see).
+fn test_shader_hash_n_embedded_nul() {
+    var a[8];
+    var b[8];
+    var i = 0;
+    while (i < 8) { store8(&a + i, 0); store8(&b + i, 0); i = i + 1; }
+    store8(&a + 0, 0x03); store8(&b + 0, 0x03);   # same first byte, byte[1]=NUL
+    store8(&a + 4, 0xAA); store8(&b + 4, 0xBB);    # differ only past the NUL
+    assert(_shader_hash_n(&a, 8, SHADER_SRC_SPIRV) != _shader_hash_n(&b, 8, SHADER_SRC_SPIRV),
+    "differ after embedded NUL -> different hash (length-explicit)");
+    return 0;
+}
+
+# v3.2 S.3 — SPIR-V cache peers round-trip (kind-folded key).
+fn test_shader_cache_spirv_roundtrip() {
+    var cache = shader_cache_new();
+    var words[8];
+    store64(&words, 0xCAFEBABE12345678);
+    assert_eq(shader_cache_get_spirv(cache, &words, 8), 0, "spirv miss -> 0");
+    shader_cache_set_spirv(cache, &words, 8, 0xABCD);
+    assert_eq(shader_cache_get_spirv(cache, &words, 8), 0xABCD, "spirv round-trip");
+    return 0;
+}
+
 fn test_shader_cache_update_overwrites() {
     var cache = shader_cache_new();
     shader_cache_set(cache, "same key", 100);
@@ -207,6 +251,9 @@ fn main() {
     test_shader_cache_miss();
     test_shader_cache_set_and_get();
     test_shader_cache_distinct_keys();
+    test_shader_hash_n_kind_separation();
+    test_shader_hash_n_embedded_nul();
+    test_shader_cache_spirv_roundtrip();
     test_shader_cache_update_overwrites();
     test_pipeline_cache_miss();
     test_pipeline_cache_set_and_get();

@@ -375,8 +375,13 @@ byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
   forwards the bound backend's default (WGSL/GFX9 — no call-site churn) +
   `gpu_shader_module_create_spirv` forwards SPIRV. Dispatch tests assert all three
   kinds route. (Also fixed a pre-existing awb-1 comment fmt drift v3.2 had inherited.)
-- [ ] **S.3** — Source-kind-aware shader cache (`_shader_hash_n`, kind in
-  the seed; WGSL/SPIR-V non-collision).
+- [x] **S.3** — done. `_shader_hash_n(ptr, byte_len, kind)` — length-explicit
+  FNV-1a (SPIR-V has embedded NULs) with the kind folded into the seed; WGSL
+  (kind 0) is the identity fold so legacy keys are byte-stable, while WGSL/SPIRV/
+  GFX9 namespaces never collide. `_shader_hash` delegates to it. SPIR-V peers
+  `shader_cache_get_spirv` / `_set_spirv` / `_get_or_compile_spirv` (validates +
+  builds the SPIRV source). CPU-tested (caches.tcyr: kind separation, embedded-NUL,
+  round-trip).
 - [ ] **S.4** — Reference launcher gate (`ShaderSourceSPIRV` instance
   feature in `deps/wgpu_main.c`); consumer migration note.
 - [ ] **S.5** — wgpu HW e2e (`spirv_e2e.cyr`, render path — wgpu compute
