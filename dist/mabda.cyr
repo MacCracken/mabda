@@ -6159,6 +6159,8 @@ fn native_gfx9_sampler_descriptor(buf, pos, filter, addr, unnorm): i64 {
 #     5-bit field); SW_LINEAR = 0 (matches COLOR_SW_MODE=0 linear, used by
 #     GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8). The tiled SW_64KB_S value is
 #     an addrlib mode pinned at TS.6 with the swizzle transform. ---
+var GFX9_SQ_SEL_0       = 0;
+var GFX9_SQ_SEL_1       = 1;
 var GFX9_SQ_SEL_X       = 4;
 var GFX9_SQ_SEL_Y       = 5;
 var GFX9_SQ_SEL_Z       = 6;
@@ -6211,9 +6213,24 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var w1 = (base_hi & 0xFF) | ((df & 0x3F) << 20) | ((nf & 0xF) << 26);
     # W2: WIDTH[0:13]=w-1, HEIGHT[14:27]=h-1.
     var w2 = ((width - 1) & 0x3FFF) | (((height - 1) & 0x3FFF) << 14);
-    # W3: identity swizzle + LAST_LEVEL + SW_MODE + TYPE=2D.
-    var w3 = (GFX9_SQ_SEL_X & 0x7) | ((GFX9_SQ_SEL_Y & 0x7) << 3);
-    w3 = w3 | ((GFX9_SQ_SEL_Z & 0x7) << 6) | ((GFX9_SQ_SEL_W & 0x7) << 9);
+    # W3: DST_SEL (per component count) + LAST_LEVEL + SW_MODE + TYPE=2D.
+    # 4-component formats (RGBA8 / BC1 / BC3 / BC7) take identity X/Y/Z/W. The
+    # single/dual-channel BC formats must override Z/W (and Y) to SEL_0/SEL_1 —
+    # else the TA broadcasts the present channel(s) to RGBA (BC4 sampled (R,R,R,R)
+    # instead of (R,0,0,1); HW-confirmed TS.7c-4). BC4 = R -> (X,0,0,1);
+    # BC5 = RG -> (X,Y,0,1).
+    var sel_x = GFX9_SQ_SEL_X;
+    var sel_y = GFX9_SQ_SEL_Y;
+    var sel_z = GFX9_SQ_SEL_Z;
+    var sel_w = GFX9_SQ_SEL_W;
+    if (fmt == MABDA_TEXFMT_BC4) {
+        sel_y = GFX9_SQ_SEL_0; sel_z = GFX9_SQ_SEL_0; sel_w = GFX9_SQ_SEL_1;
+    }
+    if (fmt == MABDA_TEXFMT_BC5) {
+        sel_z = GFX9_SQ_SEL_0; sel_w = GFX9_SQ_SEL_1;
+    }
+    var w3 = (sel_x & 0x7) | ((sel_y & 0x7) << 3);
+    w3 = w3 | ((sel_z & 0x7) << 6) | ((sel_w & 0x7) << 9);
     w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
     w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
     # W4: PITCH[13:28] = epitch (caller supplies: w-1 for LINEAR, awb-1 tiled).
@@ -8351,13 +8368,14 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
 }
 
 # v3.2 TS.7c — bitmask of texture-compression families native AMD can SAMPLE.
-# 0 today: the SW_64KB_S tiled surface + BC T# are built (below) but the L2T/T2L
-# write path (TS.7c-3) and a HW pixel-exact verify (TS.7c-4) aren't landed yet,
-# so create must NOT hand back a compressed sampleable texture the public write
-# API can't populate. Flips to MABDA_TEXCOMP_BC once BC sampling is HW-verified
-# (then ETC2/ASTC at TS.8, each iff HW-verified). The native analog of the wgpu
-# backend's adapter-family caps guard.
-var NATIVE_TEXCOMP_SUPPORTED = 0;
+# MABDA_TEXCOMP_BC: BC sampling is HW-verified on Cezanne (TS.7c-4 —
+# programs/native_compressed_sample_e2e samples a SW_64KB_S tiled BC1 surface in
+# an FS and matches a CPU decode pixel-exact, proving the full create -> L2T tiled
+# write -> image_sample path). ETC2/ASTC stay gated off until their own HW decode
+# verify (TS.8). The create slot rejects a compressed family not in this mask
+# (pre-ioctl) so a consumer never gets a sampleable texture it can't populate —
+# the native analog of the wgpu backend's adapter-family caps guard.
+var NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
 
 # v3.2 TS.5/TS.7c — sampleable 2D texture create (native). Differs from the
 # storage create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) +
@@ -8397,6 +8415,13 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     var fam = mabda_texfmt_compression_family(fmt);
     if (fam != 0) {
         if ((NATIVE_TEXCOMP_SUPPORTED & fam) == 0) { return 0; }
+        # BC6H is HDR unsigned-float (T# NUM_FORMAT=FLOAT): the TA decodes it to
+        # values that legitimately exceed [0,1], but the native sample path only
+        # exports to an RGBA8_UNORM render target, which clamps/quantizes them — a
+        # silently-wrong decode, not a faithful one. The BC family bit (above)
+        # admits BC6H; reject it here until an HDR-capable RT path exists. (Review
+        # 2026-06-16 HIGH; the other BC formats are UNORM/[0,1] and export cleanly.)
+        if (fmt == MABDA_TEXFMT_BC6H) { return 0; }
     }
     var fd = native_ctx_fd(ctx);
 

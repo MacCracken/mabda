@@ -1198,6 +1198,8 @@ fn native_gfx9_sampler_descriptor(buf, pos, filter, addr, unnorm): i64 {
 #     5-bit field); SW_LINEAR = 0 (matches COLOR_SW_MODE=0 linear, used by
 #     GFX9_CB_COLOR0_ATTRIB_2D_LINEAR_RGBA8). The tiled SW_64KB_S value is
 #     an addrlib mode pinned at TS.6 with the swizzle transform. ---
+var GFX9_SQ_SEL_0       = 0;
+var GFX9_SQ_SEL_1       = 1;
 var GFX9_SQ_SEL_X       = 4;
 var GFX9_SQ_SEL_Y       = 5;
 var GFX9_SQ_SEL_Z       = 6;
@@ -1250,9 +1252,24 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var w1 = (base_hi & 0xFF) | ((df & 0x3F) << 20) | ((nf & 0xF) << 26);
     # W2: WIDTH[0:13]=w-1, HEIGHT[14:27]=h-1.
     var w2 = ((width - 1) & 0x3FFF) | (((height - 1) & 0x3FFF) << 14);
-    # W3: identity swizzle + LAST_LEVEL + SW_MODE + TYPE=2D.
-    var w3 = (GFX9_SQ_SEL_X & 0x7) | ((GFX9_SQ_SEL_Y & 0x7) << 3);
-    w3 = w3 | ((GFX9_SQ_SEL_Z & 0x7) << 6) | ((GFX9_SQ_SEL_W & 0x7) << 9);
+    # W3: DST_SEL (per component count) + LAST_LEVEL + SW_MODE + TYPE=2D.
+    # 4-component formats (RGBA8 / BC1 / BC3 / BC7) take identity X/Y/Z/W. The
+    # single/dual-channel BC formats must override Z/W (and Y) to SEL_0/SEL_1 —
+    # else the TA broadcasts the present channel(s) to RGBA (BC4 sampled (R,R,R,R)
+    # instead of (R,0,0,1); HW-confirmed TS.7c-4). BC4 = R -> (X,0,0,1);
+    # BC5 = RG -> (X,Y,0,1).
+    var sel_x = GFX9_SQ_SEL_X;
+    var sel_y = GFX9_SQ_SEL_Y;
+    var sel_z = GFX9_SQ_SEL_Z;
+    var sel_w = GFX9_SQ_SEL_W;
+    if (fmt == MABDA_TEXFMT_BC4) {
+        sel_y = GFX9_SQ_SEL_0; sel_z = GFX9_SQ_SEL_0; sel_w = GFX9_SQ_SEL_1;
+    }
+    if (fmt == MABDA_TEXFMT_BC5) {
+        sel_z = GFX9_SQ_SEL_0; sel_w = GFX9_SQ_SEL_1;
+    }
+    var w3 = (sel_x & 0x7) | ((sel_y & 0x7) << 3);
+    w3 = w3 | ((sel_z & 0x7) << 6) | ((sel_w & 0x7) << 9);
     w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
     w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
     # W4: PITCH[13:28] = epitch (caller supplies: w-1 for LINEAR, awb-1 tiled).

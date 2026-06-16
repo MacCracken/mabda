@@ -246,7 +246,7 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   addrlib-exact tiled geometry (`epitch` + tiled BO size that the TA agrees
   with) — confirmed at TS.7 by sampling the SDMA-tiled BC surface vs a CPU
   decode.
-- [~] **TS.7** — **BC1/BC7 compressed sampling on Cezanne** (delivered in
+- [x] **TS.7** — **BC1/BC7 compressed sampling on Cezanne** (delivered in
   sub-bites). **TS.7a done:** `native_gfx9_shader_textured_sample_fs` — the
   `image_sample` (BC-decoding) FS (llvm-mc + byte-pinned + disasm round-trip).
   **TS.7b done:** `native_tiled_geometry` — SW_64KB_S 2D block dims + aligned
@@ -266,19 +266,47 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `create` returning 0 (pre-ioctl) until write + HW verify land — no dead-end
   resource; mirrors the wgpu backend caps guard. write/read reject a tiled tex
   (`GPU_ERR_TEXTURE`) until TS.7c-3. **Remaining:**
-  - **(TS.7c-3)** write(L2T)/read(T2L) via the TS.6 COPY_TILED packet —
-    **MUST derive epitch from `native_tex_tiled_params` (awb-1), the SAME source
-    as the T#** (the TS.6 round-trip program uses `epitch=W-1` in *blocks*, which
-    only coincides with awb-1 on a block_w-aligned surface — do NOT copy it for a
-    real write or a non-aligned BC surface will sample garbage). Remove the
-    tiled write/read guard. Add a non-block_w-aligned BC1 fixture (e.g. 256×256
-    texels = 64 blocks, awb=128) so the awb-vs-wb divergence is exercised.
-  - **(TS.7c-4)** `native_compressed_sample_e2e.cyr` (BC1 sample vs CPU decode)
-    + on-device verification (where SDMA tiling meets the TA); then flip
-    `NATIVE_TEXCOMP_SUPPORTED` → `MABDA_TEXCOMP_BC` (the native BC cap bit).
+  - **TS.7c-3 done:** wired write(L2T)/read(T2L) via `native_tex_build_tiled_copy_packet`
+    + a transient staging BO + `_native_dma_submit_oneshot` on the DMA ring. epitch
+    is derived from `native_tex_tiled_params` (awb-1) — the SAME source as the T# —
+    so the SDMA layout and the T# can't drift. HW-verified by
+    `native_tiled_texture_roundtrip` (BC1 256×256 = 64 blocks, awb=128 → epitch=127,
+    a NON-block_w-aligned surface the TS.6 256-block probe couldn't catch).
+  - **TS.7c-4 done:** `native_compressed_sample_e2e.cyr` samples SW_64KB_S tiled
+    surfaces in the image_sample FS and matches a CPU decode **pixel-exact on
+    Cezanne** for **BC1 (RGB565 endpoints + within-block checker), BC4 (1-channel
+    → R,0,0,1), and BC5 (2-channel → R,G,0,1)** — spanning the channel-mapping
+    spectrum. The tiled round-trip also HW-verifies **BC7 (16-byte block)** tiling
+    alongside BC1 (8-byte). Flipped `NATIVE_TEXCOMP_SUPPORTED` → `MABDA_TEXCOMP_BC`.
+    **BC compressed sampling is live on native AMD.**
+    - **Review fixes (2026-06-16):**
+      - **BC6H rejected at create** — it is HDR unsigned-float (T# NUM_FORMAT=FLOAT)
+        but the native sample path only has an RGBA8_UNORM render target, which
+        clamps/quantizes HDR values → a silently-wrong decode. Gated off until an
+        HDR-capable RT path exists (the BC family bit otherwise admits it).
+      - **Per-component DST_SEL in the T#** — identity X/Y/Z/W broadcasts a 1-/2-
+        channel format's present channel(s) across RGBA (HW-confirmed: BC4 sampled
+        (R,R,R,R)). BC4 → X,0,0,1, BC5 → X,Y,0,1; 4-channel formats stay identity.
+        Caught by adding the BC4/BC5 sample probes — a real wrong-color bug fixed
+        before it shipped.
+    - *Residual (honest):* BC1/BC4/BC5 are pixel-exact-verified; BC3 (= BC1-RGB +
+      BC4-alpha, both components verified, identity swizzle) and BC7 (tiling-
+      verified, complex modes) ride the same path with no bespoke sample oracle
+      (a BC7 encoder is nontrivial). The native caps ADVISORY
+      (`gpu_caps_supports_format`) still reports BC unsupported because native
+      never builds a caps struct at all — wiring native caps is TS.8's "strike
+      Phase T's storage-only limitation."
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
-  limitation**; cut the TS minors.
+  limitation**; cut the TS minors. Also:
+  - **Wire native caps advertisement** — a native `GpuContext` never builds a
+    `GpuCapabilities` struct (no native caps path; the bitset stays 0), so
+    `gpu_caps_supports_format(BC)` reports unsupported even though native BC
+    create+sample now works (review 2026-06-16). Populate native caps from
+    `NATIVE_TEXCOMP_SUPPORTED` (+ texture limits) so the advisory and the create
+    gate agree — part of striking the storage-only limitation.
+  - **BC3/BC7 sample oracle** (+ BC6H once an HDR RT path lands) to close the
+    TS.7c-4 residual.
 
 ---
 

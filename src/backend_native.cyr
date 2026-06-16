@@ -893,13 +893,14 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
 }
 
 # v3.2 TS.7c — bitmask of texture-compression families native AMD can SAMPLE.
-# 0 today: the SW_64KB_S tiled surface + BC T# are built (below) but the L2T/T2L
-# write path (TS.7c-3) and a HW pixel-exact verify (TS.7c-4) aren't landed yet,
-# so create must NOT hand back a compressed sampleable texture the public write
-# API can't populate. Flips to MABDA_TEXCOMP_BC once BC sampling is HW-verified
-# (then ETC2/ASTC at TS.8, each iff HW-verified). The native analog of the wgpu
-# backend's adapter-family caps guard.
-var NATIVE_TEXCOMP_SUPPORTED = 0;
+# MABDA_TEXCOMP_BC: BC sampling is HW-verified on Cezanne (TS.7c-4 —
+# programs/native_compressed_sample_e2e samples a SW_64KB_S tiled BC1 surface in
+# an FS and matches a CPU decode pixel-exact, proving the full create -> L2T tiled
+# write -> image_sample path). ETC2/ASTC stay gated off until their own HW decode
+# verify (TS.8). The create slot rejects a compressed family not in this mask
+# (pre-ioctl) so a consumer never gets a sampleable texture it can't populate —
+# the native analog of the wgpu backend's adapter-family caps guard.
+var NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
 
 # v3.2 TS.5/TS.7c — sampleable 2D texture create (native). Differs from the
 # storage create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) +
@@ -939,6 +940,13 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     var fam = mabda_texfmt_compression_family(fmt);
     if (fam != 0) {
         if ((NATIVE_TEXCOMP_SUPPORTED & fam) == 0) { return 0; }
+        # BC6H is HDR unsigned-float (T# NUM_FORMAT=FLOAT): the TA decodes it to
+        # values that legitimately exceed [0,1], but the native sample path only
+        # exports to an RGBA8_UNORM render target, which clamps/quantizes them — a
+        # silently-wrong decode, not a faithful one. The BC family bit (above)
+        # admits BC6H; reject it here until an HDR-capable RT path exists. (Review
+        # 2026-06-16 HIGH; the other BC formats are UNORM/[0,1] and export cleanly.)
+        if (fmt == MABDA_TEXFMT_BC6H) { return 0; }
     }
     var fd = native_ctx_fd(ctx);
 

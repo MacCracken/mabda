@@ -346,6 +346,16 @@ build/native_tiled_texture_roundtrip: programs/native_tiled_texture_roundtrip.cy
 test-native-tiled-texture-roundtrip: build/native_tiled_texture_roundtrip
 	./build/native_tiled_texture_roundtrip
 
+# v3.2 TS.7c-4 — sample a TILED BC1 texture in an FS and verify the TA decode
+# pixel-exact vs a CPU decode (where SDMA tiling meets the texture unit). HW-gated.
+build/native_compressed_sample_e2e: programs/native_compressed_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_compressed_sample_e2e.cyr $@
+
+.PHONY: test-native-compressed-sample-e2e
+test-native-compressed-sample-e2e: build/native_compressed_sample_e2e
+	./build/native_compressed_sample_e2e
+
 # v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
 # -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
 # result CPU-verified. HW-gated (needs an AMD render node).

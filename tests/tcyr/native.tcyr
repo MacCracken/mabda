@@ -622,6 +622,28 @@ fn test_native_gfx9_image_descriptor() {
     assert_eq((load32(&buf + 12) >> 20) & 0x1F, 9, "tiled W3 SW_MODE = 64KB_S(9)");
     assert_eq((load32(&buf + 16) >> 13) & 0xFFFF, 127, "tiled W4 PITCH = epitch(127)");
     assert_eq(load32(&buf + 8) & 0x3FFF, 255, "tiled W2 WIDTH = texels-1 (255)");
+    # v3.2 TS.7c-4 — per-component DST_SEL. BC1 (4-channel) keeps identity X/Y/Z/W;
+    # BC4 (1-channel R) -> X,0,0,1; BC5 (2-channel RG) -> X,Y,0,1. Else the TA
+    # broadcasts the present channel(s) to RGBA (HW-confirmed: BC4 gave (R,R,R,R)).
+    var w3bc1 = load32(&buf + 12);
+    assert_eq(w3bc1 & 0x7, 4, "BC1 DST_SEL_X = X(4)");
+    assert_eq((w3bc1 >> 9) & 0x7, 7, "BC1 DST_SEL_W = W(7) (4-channel identity)");
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_BC4, GFX9_SW_MODE_64KB_S, 1, 15);
+    var w3bc4 = load32(&buf + 12);
+    assert_eq(w3bc4 & 0x7, 4, "BC4 DST_SEL_X = X(4)");
+    assert_eq((w3bc4 >> 3) & 0x7, 0, "BC4 DST_SEL_Y = 0");
+    assert_eq((w3bc4 >> 6) & 0x7, 0, "BC4 DST_SEL_Z = 0");
+    assert_eq((w3bc4 >> 9) & 0x7, 1, "BC4 DST_SEL_W = 1");
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_BC5, GFX9_SW_MODE_64KB_S, 1, 15);
+    var w3bc5 = load32(&buf + 12);
+    assert_eq(w3bc5 & 0x7, 4, "BC5 DST_SEL_X = X(4)");
+    assert_eq((w3bc5 >> 3) & 0x7, 5, "BC5 DST_SEL_Y = Y(5)");
+    assert_eq((w3bc5 >> 6) & 0x7, 0, "BC5 DST_SEL_Z = 0");
+    assert_eq((w3bc5 >> 9) & 0x7, 1, "BC5 DST_SEL_W = 1");
     # 4-level mip: LAST_LEVEL + MAX_MIP both = 3.
     memset(&buf, 0, 32);
     native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
@@ -1055,16 +1077,22 @@ fn test_native_texture_create_2d_sampleable_guards() {
     0, "w>max -> 0");
     assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 64, 64, 99),
     0, "unsupported fmt -> 0");
-    # v3.2 TS.7c (review fix): native sampleable rejects a compressed family that
-    # NATIVE_TEXCOMP_SUPPORTED doesn't carry — a PRE-IOCTL caps reject, so it's
-    # green for the right reason (not a fake-fd ioctl failure). BC is gated until
-    # TS.7c-4 flips the bit after HW verify; the BO build is never reached here.
-    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_BC, 0,
-    "BC not yet HW-verified on native (gate closed)");
-    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_BC1),
-    0, "compressed BC1 rejected by caps gate (TS.7c)");
-    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_BC7),
-    0, "compressed BC7 rejected by caps gate (TS.7c)");
+    # v3.2 TS.7c-4: BC sampling is HW-verified, so the BC gate is OPEN; ETC2/ASTC
+    # stay gated until their own HW verify (TS.8). The create slot rejects an
+    # un-gated compressed family PRE-IOCTL (right reason — not a fake-fd failure),
+    # so these asserts hold with a zeroed ctx (the BO build is never reached).
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_BC, MABDA_TEXCOMP_BC,
+    "BC gate open (HW-verified on Cezanne)");
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_ETC2, 0, "ETC2 gate closed (TS.8)");
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_ASTC, 0, "ASTC gate closed (TS.8)");
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_ETC2_RGB8),
+    0, "ETC2 rejected by caps gate (pre-ioctl, TS.8)");
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_ASTC_4X4),
+    0, "ASTC rejected by caps gate (pre-ioctl, TS.8)");
+    # BC6H is in the BC family (gate open) but is HDR-float — rejected pre-ioctl
+    # because the native sample path is RGBA8_UNORM only (would clamp HDR).
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_BC6H),
+    0, "BC6H rejected (HDR float vs RGBA8 RT) even though BC gate open");
     return 0;
 }
 
