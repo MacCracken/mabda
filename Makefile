@@ -155,6 +155,13 @@ build/render_graph_e2e: build/render_graph_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/render_graph_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+# v3.2 S.5 — wgpu SPIR-V shader ingestion e2e (SPIR-V vs WGSL cross-source
+# identity). Requires wgpu-native + an instance built with ShaderSourceSPIRV
+# (deps/wgpu_main.c, S.4).
+build/spirv_e2e: build/spirv_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/spirv_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 # v3.2 T.8 — wgpu compressed (BC1) create+upload, verified by byte-exact
 # copy-back round-trip. Requires wgpu-native + a BC-capable adapter.
 build/compressed_texture_e2e: build/compressed_texture_e2e.o deps/wgpu_main.o
@@ -197,6 +204,10 @@ test-compute-e2e: build/compute_e2e
 .PHONY: test-render-e2e
 test-render-e2e: build/render_e2e
 	./build/render_e2e
+
+.PHONY: test-spirv-e2e
+test-spirv-e2e: build/spirv_e2e
+	./build/spirv_e2e
 
 .PHONY: test-render-graph-e2e
 test-render-graph-e2e: build/render_graph_e2e

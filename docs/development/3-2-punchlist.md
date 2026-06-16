@@ -363,17 +363,48 @@ Proposal: [`v3.2-spirv-ingestion-wgpu.md`](../proposals/v3.2-spirv-ingestion-wgp
 Adds an explicit shader **source-kind tag** (WGSL/SPIR-V/GFX9-ISA) to the
 byte-polymorphic boundary. Native SPIR-V is Phase N (fail-loud here).
 
-- [ ] **S.1** — Constants + `WGPUShaderSourceSPIRV` builder (codeSize in
-  **words**) + structural validation (magic/align/bound).
-- [ ] **S.2** — Widen shader-create slot `(…,kind)` (fncall3→4); wgpu
-  branches on kind; `gpu_shader_module_create_spirv`.
-- [ ] **S.3** — Source-kind-aware shader cache (`_shader_hash_n`, kind in
-  the seed; WGSL/SPIR-V non-collision).
-- [ ] **S.4** — Reference launcher gate (`ShaderSourceSPIRV` instance
-  feature in `deps/wgpu_main.c`); consumer migration note.
-- [ ] **S.5** — wgpu HW e2e (`spirv_e2e.cyr`, render path — wgpu compute
-  is still a v3.0 stub; cross-source identity vs WGSL).
-- [ ] **S.6** — **Cut 3.2.4.**
+- [x] **S.1** — done. `WGPU_STYPE_SHADER_SOURCE_SPIRV=0x1` (wgpu_types) +
+  `wgpu_shader_source_spirv(words_ptr, word_count)` (32 B; codeSize in **words**
+  @+16, code ptr @+24 — webgpu.h v29-pinned) + `_spirv_validate(ptr, byte_len)`
+  (magic/align/bound + 16 Mi-word cap; 6 distinct codes incl. byte-swapped-magic
+  detection) — all in `wgpu_descriptors.cyr`, CPU-tested (backend.tcyr).
+- [x] **S.2** — done. `ShaderSourceKind` enum (WGSL/SPIRV/GFX9, backend.cyr);
+  shader-create slot widened `(ctx,bytes,n,kind)` (fncall3→4, no offset change);
+  wgpu filler branches WGSL/SPIRV (validate + `wgpu_shader_source_spirv`, codeSize
+  n/4); native stub takes kind (SPIRV→0 fail-loud, Phase N). `gpu_shader_module_create`
+  forwards the bound backend's default (WGSL/GFX9 — no call-site churn) +
+  `gpu_shader_module_create_spirv` forwards SPIRV. Dispatch tests assert all three
+  kinds route. (Also fixed a pre-existing awb-1 comment fmt drift v3.2 had inherited.)
+- [x] **S.3** — done. `_shader_hash_n(ptr, byte_len, kind)` — length-explicit
+  FNV-1a (SPIR-V has embedded NULs) with the kind folded into the seed; WGSL
+  (kind 0) is the identity fold so legacy keys are byte-stable, while WGSL/SPIRV/
+  GFX9 namespaces never collide. `_shader_hash` delegates to it. SPIR-V peers
+  `shader_cache_get_spirv` / `_set_spirv` / `_get_or_compile_spirv` (validates +
+  builds the SPIRV source). CPU-tested (caches.tcyr: kind separation, embedded-NUL,
+  round-trip).
+- [x] **S.4** — done. `deps/wgpu_main.c` instance descriptor now requests
+  `WGPUInstanceFeatureName_ShaderSourceSPIRV` (requiredFeatureCount=1 +
+  requiredFeatures); without it every SPIR-V createShaderModule nulls. Verified
+  with `cc -fsyntax-only -I deps/wgpu-native/include` (const-correct; the only
+  warning is the pre-existing `nextInChain` cast). **Consumer migration note**
+  (→ goes in the 3.2.4 CHANGELOG Breaking/Migration at S.6): consumers that copy
+  the launcher must carry this 4-line edit to use SPIR-V shaders; WGSL is
+  unaffected. mabda can't detect a missing-feature instance before the create —
+  the fail-loud 0 module is the contract.
+- [x] **S.5** — done. `programs/spirv_e2e.cyr` (+ `make test-spirv-e2e`): a
+  fullscreen-triangle+red SPIR-V module (glslang `-e vs_main`/`-e fs_main` +
+  spirv-link, spirv-val-clean, 339 words embedded) created via
+  `gpu_shader_module_create_spirv`, rendered through `render_pipeline_create_simple`,
+  read back, and **byte-identical to the WGSL twin** (cross-source identity).
+  **HW-verified on the wgpu-native box** — exercises S.2 (slot+entry) + S.4
+  (instance feature) end-to-end. (Fullscreen triangle → whole RT red, so the
+  identity holds regardless of the WGSL-vs-Vulkan Y convention.)
+- [x] **S.6** — **Cut 3.2.4** (2026-06-16). VERSION/cyrius.cyml/CHANGELOG/README/
+  CLAUDE.md → 3.2.4; toolchain pinned `6.2.14`; Phase S audit filed
+  (`docs/audit/2026-06-16-phaseS-audit.md`, 0 confirmed / 1 LOW dismissed); dist
+  regenerated idempotent (`b894948`); `version-check.sh` consistent. Full gate
+  green: smoke build OK, **2908/0** across 12 tcyr suites, 0 lint warnings, 0 fmt
+  drift (file-first `cyrius fmt <f> --check`).
 
 ---
 

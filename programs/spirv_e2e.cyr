@@ -1,0 +1,481 @@
+# programs/spirv_e2e.cyr — v3.2 S.5: wgpu SPIR-V shader ingestion HW e2e
+#
+# Proves the Phase S SPIR-V path end-to-end on a wgpu-native box: create a
+# shader module from a SPIR-V binary (gpu_shader_module_create_spirv, S.2) on an
+# instance built with the ShaderSourceSPIRV feature (deps/wgpu_main.c, S.4), use
+# it in a render pipeline, draw, and read back — then assert the result is
+# byte-identical to the SAME shader expressed as WGSL (cross-source identity).
+#
+# Shaders: a fullscreen triangle VS + solid-red FS, in one module with entry
+# points vs_main + fs_main (what render_pipeline_create_simple expects). The
+# SPIR-V was glslang-compiled (-e vs_main / -e fs_main) + spirv-link'd into one
+# module + spirv-val-clean; embedded below as its 339 u32 words. The triangle
+# covers the WHOLE 256x256 RT, so both renders are entirely red -> the identity
+# holds regardless of the WGSL-vs-Vulkan Y convention.
+#
+# Linked with deps/wgpu_main.c via `make test-spirv-e2e`. Render path only —
+# wgpu compute is a v3.0 stub. SKIPs cleanly if no GPU.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+# The vs_main + fs_main SPIR-V module (fullscreen triangle + red FS), 339 words.
+fn _spirv_blob(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010000);
+    store32(buf + 8, 0x00110000);
+    store32(buf + 12, 0x00000030);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x0006000b);
+    store32(buf + 32, 0x00000001);
+    store32(buf + 36, 0x4c534c47);
+    store32(buf + 40, 0x6474732e);
+    store32(buf + 44, 0x3035342e);
+    store32(buf + 48, 0x00000000);
+    store32(buf + 52, 0x0003000e);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x00000001);
+    store32(buf + 64, 0x0007000f);
+    store32(buf + 68, 0x00000000);
+    store32(buf + 72, 0x00000002);
+    store32(buf + 76, 0x6d5f7376);
+    store32(buf + 80, 0x006e6961);
+    store32(buf + 84, 0x00000003);
+    store32(buf + 88, 0x00000004);
+    store32(buf + 92, 0x0006000f);
+    store32(buf + 96, 0x00000004);
+    store32(buf + 100, 0x00000005);
+    store32(buf + 104, 0x6d5f7366);
+    store32(buf + 108, 0x006e6961);
+    store32(buf + 112, 0x00000006);
+    store32(buf + 116, 0x00030010);
+    store32(buf + 120, 0x00000005);
+    store32(buf + 124, 0x00000007);
+    store32(buf + 128, 0x00030003);
+    store32(buf + 132, 0x00000002);
+    store32(buf + 136, 0x000001c2);
+    store32(buf + 140, 0x00030003);
+    store32(buf + 144, 0x00000002);
+    store32(buf + 148, 0x000001c2);
+    store32(buf + 152, 0x00040005);
+    store32(buf + 156, 0x00000002);
+    store32(buf + 160, 0x6d5f7376);
+    store32(buf + 164, 0x006e6961);
+    store32(buf + 168, 0x00030005);
+    store32(buf + 172, 0x00000007);
+    store32(buf + 176, 0x00000078);
+    store32(buf + 180, 0x00060005);
+    store32(buf + 184, 0x00000003);
+    store32(buf + 188, 0x565f6c67);
+    store32(buf + 192, 0x65747265);
+    store32(buf + 196, 0x646e4978);
+    store32(buf + 200, 0x00007865);
+    store32(buf + 204, 0x00030005);
+    store32(buf + 208, 0x00000008);
+    store32(buf + 212, 0x00000079);
+    store32(buf + 216, 0x00060005);
+    store32(buf + 220, 0x00000009);
+    store32(buf + 224, 0x505f6c67);
+    store32(buf + 228, 0x65567265);
+    store32(buf + 232, 0x78657472);
+    store32(buf + 236, 0x00000000);
+    store32(buf + 240, 0x00060006);
+    store32(buf + 244, 0x00000009);
+    store32(buf + 248, 0x00000000);
+    store32(buf + 252, 0x505f6c67);
+    store32(buf + 256, 0x7469736f);
+    store32(buf + 260, 0x006e6f69);
+    store32(buf + 264, 0x00070006);
+    store32(buf + 268, 0x00000009);
+    store32(buf + 272, 0x00000001);
+    store32(buf + 276, 0x505f6c67);
+    store32(buf + 280, 0x746e696f);
+    store32(buf + 284, 0x657a6953);
+    store32(buf + 288, 0x00000000);
+    store32(buf + 292, 0x00070006);
+    store32(buf + 296, 0x00000009);
+    store32(buf + 300, 0x00000002);
+    store32(buf + 304, 0x435f6c67);
+    store32(buf + 308, 0x4470696c);
+    store32(buf + 312, 0x61747369);
+    store32(buf + 316, 0x0065636e);
+    store32(buf + 320, 0x00070006);
+    store32(buf + 324, 0x00000009);
+    store32(buf + 328, 0x00000003);
+    store32(buf + 332, 0x435f6c67);
+    store32(buf + 336, 0x446c6c75);
+    store32(buf + 340, 0x61747369);
+    store32(buf + 344, 0x0065636e);
+    store32(buf + 348, 0x00030005);
+    store32(buf + 352, 0x00000004);
+    store32(buf + 356, 0x00000000);
+    store32(buf + 360, 0x00040005);
+    store32(buf + 364, 0x00000005);
+    store32(buf + 368, 0x6d5f7366);
+    store32(buf + 372, 0x006e6961);
+    store32(buf + 376, 0x00040005);
+    store32(buf + 380, 0x00000006);
+    store32(buf + 384, 0x6f6c6f63);
+    store32(buf + 388, 0x00000072);
+    store32(buf + 392, 0x00040047);
+    store32(buf + 396, 0x00000003);
+    store32(buf + 400, 0x0000000b);
+    store32(buf + 404, 0x0000002a);
+    store32(buf + 408, 0x00030047);
+    store32(buf + 412, 0x00000009);
+    store32(buf + 416, 0x00000002);
+    store32(buf + 420, 0x00050048);
+    store32(buf + 424, 0x00000009);
+    store32(buf + 428, 0x00000000);
+    store32(buf + 432, 0x0000000b);
+    store32(buf + 436, 0x00000000);
+    store32(buf + 440, 0x00050048);
+    store32(buf + 444, 0x00000009);
+    store32(buf + 448, 0x00000001);
+    store32(buf + 452, 0x0000000b);
+    store32(buf + 456, 0x00000001);
+    store32(buf + 460, 0x00050048);
+    store32(buf + 464, 0x00000009);
+    store32(buf + 468, 0x00000002);
+    store32(buf + 472, 0x0000000b);
+    store32(buf + 476, 0x00000003);
+    store32(buf + 480, 0x00050048);
+    store32(buf + 484, 0x00000009);
+    store32(buf + 488, 0x00000003);
+    store32(buf + 492, 0x0000000b);
+    store32(buf + 496, 0x00000004);
+    store32(buf + 500, 0x00040047);
+    store32(buf + 504, 0x00000006);
+    store32(buf + 508, 0x0000001e);
+    store32(buf + 512, 0x00000000);
+    store32(buf + 516, 0x00020013);
+    store32(buf + 520, 0x0000000a);
+    store32(buf + 524, 0x00030021);
+    store32(buf + 528, 0x0000000b);
+    store32(buf + 532, 0x0000000a);
+    store32(buf + 536, 0x00030016);
+    store32(buf + 540, 0x0000000c);
+    store32(buf + 544, 0x00000020);
+    store32(buf + 548, 0x00040020);
+    store32(buf + 552, 0x0000000d);
+    store32(buf + 556, 0x00000007);
+    store32(buf + 560, 0x0000000c);
+    store32(buf + 564, 0x00040015);
+    store32(buf + 568, 0x0000000e);
+    store32(buf + 572, 0x00000020);
+    store32(buf + 576, 0x00000001);
+    store32(buf + 580, 0x00040020);
+    store32(buf + 584, 0x0000000f);
+    store32(buf + 588, 0x00000001);
+    store32(buf + 592, 0x0000000e);
+    store32(buf + 596, 0x0004003b);
+    store32(buf + 600, 0x0000000f);
+    store32(buf + 604, 0x00000003);
+    store32(buf + 608, 0x00000001);
+    store32(buf + 612, 0x0004002b);
+    store32(buf + 616, 0x0000000e);
+    store32(buf + 620, 0x00000010);
+    store32(buf + 624, 0x00000001);
+    store32(buf + 628, 0x0004002b);
+    store32(buf + 632, 0x0000000e);
+    store32(buf + 636, 0x00000011);
+    store32(buf + 640, 0x00000002);
+    store32(buf + 644, 0x0004002b);
+    store32(buf + 648, 0x0000000c);
+    store32(buf + 652, 0x00000012);
+    store32(buf + 656, 0x40000000);
+    store32(buf + 660, 0x0004002b);
+    store32(buf + 664, 0x0000000c);
+    store32(buf + 668, 0x00000013);
+    store32(buf + 672, 0x3f800000);
+    store32(buf + 676, 0x00040017);
+    store32(buf + 680, 0x00000014);
+    store32(buf + 684, 0x0000000c);
+    store32(buf + 688, 0x00000004);
+    store32(buf + 692, 0x00040015);
+    store32(buf + 696, 0x00000015);
+    store32(buf + 700, 0x00000020);
+    store32(buf + 704, 0x00000000);
+    store32(buf + 708, 0x0004002b);
+    store32(buf + 712, 0x00000015);
+    store32(buf + 716, 0x00000016);
+    store32(buf + 720, 0x00000001);
+    store32(buf + 724, 0x0004001c);
+    store32(buf + 728, 0x00000017);
+    store32(buf + 732, 0x0000000c);
+    store32(buf + 736, 0x00000016);
+    store32(buf + 740, 0x0006001e);
+    store32(buf + 744, 0x00000009);
+    store32(buf + 748, 0x00000014);
+    store32(buf + 752, 0x0000000c);
+    store32(buf + 756, 0x00000017);
+    store32(buf + 760, 0x00000017);
+    store32(buf + 764, 0x00040020);
+    store32(buf + 768, 0x00000018);
+    store32(buf + 772, 0x00000003);
+    store32(buf + 776, 0x00000009);
+    store32(buf + 780, 0x0004003b);
+    store32(buf + 784, 0x00000018);
+    store32(buf + 788, 0x00000004);
+    store32(buf + 792, 0x00000003);
+    store32(buf + 796, 0x0004002b);
+    store32(buf + 800, 0x0000000e);
+    store32(buf + 804, 0x00000019);
+    store32(buf + 808, 0x00000000);
+    store32(buf + 812, 0x0004002b);
+    store32(buf + 816, 0x0000000c);
+    store32(buf + 820, 0x0000001a);
+    store32(buf + 824, 0x00000000);
+    store32(buf + 828, 0x00040020);
+    store32(buf + 832, 0x0000001b);
+    store32(buf + 836, 0x00000003);
+    store32(buf + 840, 0x00000014);
+    store32(buf + 844, 0x0004003b);
+    store32(buf + 848, 0x0000001b);
+    store32(buf + 852, 0x00000006);
+    store32(buf + 856, 0x00000003);
+    store32(buf + 860, 0x0004002b);
+    store32(buf + 864, 0x0000000c);
+    store32(buf + 868, 0x0000001c);
+    store32(buf + 872, 0x3f800000);
+    store32(buf + 876, 0x0004002b);
+    store32(buf + 880, 0x0000000c);
+    store32(buf + 884, 0x0000001d);
+    store32(buf + 888, 0x00000000);
+    store32(buf + 892, 0x0007002c);
+    store32(buf + 896, 0x00000014);
+    store32(buf + 900, 0x0000001e);
+    store32(buf + 904, 0x0000001c);
+    store32(buf + 908, 0x0000001d);
+    store32(buf + 912, 0x0000001d);
+    store32(buf + 916, 0x0000001c);
+    store32(buf + 920, 0x00050036);
+    store32(buf + 924, 0x0000000a);
+    store32(buf + 928, 0x00000002);
+    store32(buf + 932, 0x00000000);
+    store32(buf + 936, 0x0000000b);
+    store32(buf + 940, 0x000200f8);
+    store32(buf + 944, 0x0000001f);
+    store32(buf + 948, 0x0004003b);
+    store32(buf + 952, 0x0000000d);
+    store32(buf + 956, 0x00000007);
+    store32(buf + 960, 0x00000007);
+    store32(buf + 964, 0x0004003b);
+    store32(buf + 968, 0x0000000d);
+    store32(buf + 972, 0x00000008);
+    store32(buf + 976, 0x00000007);
+    store32(buf + 980, 0x0004003d);
+    store32(buf + 984, 0x0000000e);
+    store32(buf + 988, 0x00000020);
+    store32(buf + 992, 0x00000003);
+    store32(buf + 996, 0x000500c4);
+    store32(buf + 1000, 0x0000000e);
+    store32(buf + 1004, 0x00000021);
+    store32(buf + 1008, 0x00000020);
+    store32(buf + 1012, 0x00000010);
+    store32(buf + 1016, 0x000500c7);
+    store32(buf + 1020, 0x0000000e);
+    store32(buf + 1024, 0x00000022);
+    store32(buf + 1028, 0x00000021);
+    store32(buf + 1032, 0x00000011);
+    store32(buf + 1036, 0x0004006f);
+    store32(buf + 1040, 0x0000000c);
+    store32(buf + 1044, 0x00000023);
+    store32(buf + 1048, 0x00000022);
+    store32(buf + 1052, 0x00050085);
+    store32(buf + 1056, 0x0000000c);
+    store32(buf + 1060, 0x00000024);
+    store32(buf + 1064, 0x00000023);
+    store32(buf + 1068, 0x00000012);
+    store32(buf + 1072, 0x00050083);
+    store32(buf + 1076, 0x0000000c);
+    store32(buf + 1080, 0x00000025);
+    store32(buf + 1084, 0x00000024);
+    store32(buf + 1088, 0x00000013);
+    store32(buf + 1092, 0x0003003e);
+    store32(buf + 1096, 0x00000007);
+    store32(buf + 1100, 0x00000025);
+    store32(buf + 1104, 0x0004003d);
+    store32(buf + 1108, 0x0000000e);
+    store32(buf + 1112, 0x00000026);
+    store32(buf + 1116, 0x00000003);
+    store32(buf + 1120, 0x000500c7);
+    store32(buf + 1124, 0x0000000e);
+    store32(buf + 1128, 0x00000027);
+    store32(buf + 1132, 0x00000026);
+    store32(buf + 1136, 0x00000011);
+    store32(buf + 1140, 0x0004006f);
+    store32(buf + 1144, 0x0000000c);
+    store32(buf + 1148, 0x00000028);
+    store32(buf + 1152, 0x00000027);
+    store32(buf + 1156, 0x00050085);
+    store32(buf + 1160, 0x0000000c);
+    store32(buf + 1164, 0x00000029);
+    store32(buf + 1168, 0x00000028);
+    store32(buf + 1172, 0x00000012);
+    store32(buf + 1176, 0x00050083);
+    store32(buf + 1180, 0x0000000c);
+    store32(buf + 1184, 0x0000002a);
+    store32(buf + 1188, 0x00000029);
+    store32(buf + 1192, 0x00000013);
+    store32(buf + 1196, 0x0003003e);
+    store32(buf + 1200, 0x00000008);
+    store32(buf + 1204, 0x0000002a);
+    store32(buf + 1208, 0x0004003d);
+    store32(buf + 1212, 0x0000000c);
+    store32(buf + 1216, 0x0000002b);
+    store32(buf + 1220, 0x00000007);
+    store32(buf + 1224, 0x0004003d);
+    store32(buf + 1228, 0x0000000c);
+    store32(buf + 1232, 0x0000002c);
+    store32(buf + 1236, 0x00000008);
+    store32(buf + 1240, 0x00070050);
+    store32(buf + 1244, 0x00000014);
+    store32(buf + 1248, 0x0000002d);
+    store32(buf + 1252, 0x0000002b);
+    store32(buf + 1256, 0x0000002c);
+    store32(buf + 1260, 0x0000001a);
+    store32(buf + 1264, 0x00000013);
+    store32(buf + 1268, 0x00050041);
+    store32(buf + 1272, 0x0000001b);
+    store32(buf + 1276, 0x0000002e);
+    store32(buf + 1280, 0x00000004);
+    store32(buf + 1284, 0x00000019);
+    store32(buf + 1288, 0x0003003e);
+    store32(buf + 1292, 0x0000002e);
+    store32(buf + 1296, 0x0000002d);
+    store32(buf + 1300, 0x000100fd);
+    store32(buf + 1304, 0x00010038);
+    store32(buf + 1308, 0x00050036);
+    store32(buf + 1312, 0x0000000a);
+    store32(buf + 1316, 0x00000005);
+    store32(buf + 1320, 0x00000000);
+    store32(buf + 1324, 0x0000000b);
+    store32(buf + 1328, 0x000200f8);
+    store32(buf + 1332, 0x0000002f);
+    store32(buf + 1336, 0x0003003e);
+    store32(buf + 1340, 0x00000006);
+    store32(buf + 1344, 0x0000001e);
+    store32(buf + 1348, 0x000100fd);
+    store32(buf + 1352, 0x00010038);
+    return 1356;
+}
+
+# Render the triangle with `module` into `read_buf` (MAP_READ, 256x256 RGBA8).
+# Returns 0 on success, 1 on any failure.
+fn _render(device, queue, module, read_buf): i64 {
+    var W = 256;
+    var H = 256;
+    var target = texture_create_render_target_rgba8(device, W, H, "spv-rt");
+    if (target == 0) { return 1; }
+    var view = texture_view_create_rgba8(target, "spv-view");
+    if (view == 0) { return 1; }
+    var rp = render_pipeline_create_simple(device, module, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (rp == 0) { return 1; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);   # black clear; triangle fills red
+    var rpb = rpb_pass_new();
+    rpb_pass_color(rpb, view, clear);
+    var enc = wgpu_device_create_command_encoder(device, "spv-enc");
+    if (enc == 0) { return 1; }
+    var pass = rpb_pass_begin(enc, rpb);
+    if (pass == 0) { return 1; }
+    wgpu_render_pass_encoder_set_pipeline(pass, render_pipeline_handle(rp));
+    wgpu_render_pass_encoder_draw(pass, 3, 1, 0, 0);
+    wgpu_render_pass_encoder_end(pass);
+    wgpu_render_pass_encoder_release(pass);
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  target);     # src_texture
+    store64(cargs + 32, read_buf);   # dst_buffer
+    store32(cargs + 48, 1024);       # bytes_per_row (256*4, 256-aligned)
+    store32(cargs + 52, H);          # rows_per_image
+    store32(cargs + 56, W);          # copy_w
+    store32(cargs + 60, H);          # copy_h
+    store32(cargs + 64, 1);          # copy_depth
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "spv-cmd");
+    if (cmd == 0) { return 1; }
+    wgpu_queue_submit_one(queue, cmd);
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) { syscall(1, 2, "SKIP: no GPU available\n", 23); return 0; }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    # WGSL twin (fullscreen triangle + red FS) — exercises the widened slot's
+    # WGSL branch. Built via str_builder to stay under the 120-char line cap.
+    var _sb = str_builder_new();
+    str_builder_add_cstr(_sb, "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> ");
+    str_builder_add_cstr(_sb, "@builtin(position) vec4<f32> { ");
+    str_builder_add_cstr(_sb, "let x = f32((i << 1u) & 2u) * 2.0 - 1.0; ");
+    str_builder_add_cstr(_sb, "let y = f32(i & 2u) * 2.0 - 1.0; ");
+    str_builder_add_cstr(_sb, "return vec4<f32>(x, y, 0.0, 1.0); } ");
+    str_builder_add_cstr(_sb, "@fragment fn fs_main() -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(_sb, "return vec4<f32>(1.0, 0.0, 0.0, 1.0); }");
+    var wgsl = str_cstr(str_builder_build(_sb));
+    var wmod = gpu_shader_module_create(_gpu_ctx, wgsl, strlen(wgsl));
+    if (wmod == 0) { return _fail("FAIL: WGSL module create\n", 25); }
+    syscall(1, 1, "PASS: WGSL shader module\n", 25);
+
+    # SPIR-V module (gpu_shader_module_create_spirv, S.2; needs the S.4 feature).
+    var sbuf = alloc(1356);
+    _spirv_blob(sbuf);
+    var smod = gpu_shader_module_create_spirv(_gpu_ctx, sbuf, 1356);
+    if (smod == 0) { return _fail("FAIL: SPIR-V module create (instance feature / validation?)\n", 60); }
+    syscall(1, 1, "PASS: SPIR-V shader module\n", 27);
+
+    var BUF = 262144;
+    var usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var rb_w = wgpu_device_create_buffer(device, wgpu_buffer_descriptor("rb-w", usage, BUF, 0));
+    var rb_s = wgpu_device_create_buffer(device, wgpu_buffer_descriptor("rb-s", usage, BUF, 0));
+    if (rb_w == 0) { return _fail("FAIL: readback buffer (wgsl)\n", 29); }
+    if (rb_s == 0) { return _fail("FAIL: readback buffer (spirv)\n", 30); }
+    if (_render(device, queue, wmod, rb_w) != 0) { return _fail("FAIL: WGSL render\n", 18); }
+    if (_render(device, queue, smod, rb_s) != 0) { return _fail("FAIL: SPIR-V render\n", 20); }
+    syscall(1, 1, "PASS: rendered WGSL + SPIR-V passes\n", 35);
+
+    var mst_w = wgpu_buffer_map_sync(device, rb_w, WGPU_MAP_MODE_READ, 0, BUF);
+    if (mst_w != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("FAIL: map wgsl\n", 15); }
+    var mst_s = wgpu_buffer_map_sync(device, rb_s, WGPU_MAP_MODE_READ, 0, BUF);
+    if (mst_s != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("FAIL: map spirv\n", 16); }
+    var mw = wgpu_buffer_get_const_mapped_range(rb_w, 0, BUF);
+    var ms = wgpu_buffer_get_const_mapped_range(rb_s, 0, BUF);
+    if (mw == 0) { return _fail("FAIL: mapped range wgsl\n", 24); }
+    if (ms == 0) { return _fail("FAIL: mapped range spirv\n", 25); }
+
+    # Center pixel must be red (the triangle filled the RT).
+    var ctr = (128 * 256 + 128) * 4;
+    var red_ok = 0;
+    if (load8(mw + ctr) == 0xFF) { if (load8(mw + ctr + 1) == 0) {
+            if (load8(mw + ctr + 2) == 0) { if (load8(mw + ctr + 3) == 0xFF) { red_ok = 1; } } } }
+
+    # Cross-source identity: every byte of the two readbacks equal.
+    var diff = 0;
+    var i = 0;
+    while (i < BUF) {
+        if (load8(mw + i) != load8(ms + i)) { diff = diff + 1; i = BUF; }
+        i = i + 1;
+    }
+    wgpu_buffer_unmap(rb_w);
+    wgpu_buffer_unmap(rb_s);
+
+    if (red_ok == 0) { return _fail("FAIL: center pixel not red (shader did not fill)\n", 49); }
+    if (diff != 0)   { return _fail("FAIL: SPIR-V output != WGSL output\n", 35); }
+    syscall(1, 1, "PASS: SPIR-V render == WGSL render (cross-source identity)\n", 58);
+    syscall(1, 1, "\nOK - wgpu SPIR-V shader ingestion live\n", 40);
+    return 0;
+}

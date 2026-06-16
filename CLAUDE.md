@@ -10,8 +10,8 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 6.2.12+ (`cyrius.cyml: cyrius = "6.2.12"`)
-- **Version**: 3.2.3 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Language**: Cyrius 6.2.14+ (`cyrius.cyml: cyrius = "6.2.14"`)
+- **Version**: 3.2.4 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -38,6 +38,13 @@ detection.
   BILINEAR HW-verified; native caps advertisement (`gpu_caps_native_texture_compression`).
   **ETC2/ASTC are HW-blocked on AMD** (`vulkaninfo`: BC=true, ETC2/ASTC=false) —
   cap stays BC-only; **BC6H** needs an HDR RT (gated). Toolchain 6.2.11→6.2.12.
+  **3.2.4** → SPIR-V shader ingestion on wgpu (Phase S): a source-KIND tag on
+  the byte-polymorphic shader boundary (`ShaderSourceKind`), the widened
+  shader-create slot `(…,kind)`, `gpu_shader_module_create_spirv` + the
+  `WGPUShaderSourceSPIRV` builder + `_spirv_validate` + a kind-folded shader
+  cache, and the launcher `ShaderSourceSPIRV` instance feature. HW-verified
+  byte-identical to WGSL (`spirv_e2e` cross-source identity). Native SPIR-V→GFX9
+  is Phase N (fail-loud). Toolchain 6.2.12→6.2.14.
   The v3.1.2-deferred TRANSFER/buffer-copy + render-graph multi-queue were
   pulled INTO the v3.2.x arc (Phases X / R) per maintainer decision — the
   arc spans 3.2.0→3.2.13, nothing deferred to v3.3/v4 (see the punchlist).
@@ -66,14 +73,14 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.2.3, 2026-06-16)
+## Current State (post 3.2.4, 2026-06-16)
 
 - **Source**: 40 domain modules under `src/*.cyr`, ~14,100 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
   to land under cyrius lint/fmt's 128 KiB cap).
-- **Tests**: **2882 CPU-only assertions** across **12 functionality-named
+- **Tests**: **2908 CPU-only assertions** across **12 functionality-named
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
@@ -82,12 +89,14 @@ doesn't change between paths.
     v3.2 TS.8b `int_ratio_to_f32` float shim)
   - `buffer` 53 · `compute` 26 · `texture` 207 (incl. v3.2 compressed
     format table / block math / caps gating / create dispatch) · `graphics` 61
-  - `render` 122 · `backend` 406 (abstraction + wgpu FFI + dispatch mocks
+  - `render` 122 · `backend` 424 (abstraction + wgpu FFI + dispatch mocks
     + v3.2 block-aware texture write/read + X buffer-copy + TS sampleable
-    slots / sampler / bind-group + wgpu-sampler descriptor builders)
-  - `caches` 35 · `surface` 73 · `kms` 335 · `queue` 102 (v3.1.1
-    multi-queue: layout + wgpu/native fillers + barrier + dispatch)
-  - `native` 1310 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
+    slots / sampler / bind-group + wgpu-sampler descriptor builders + S SPIRV
+    descriptor/validate + kind-routed shader-create slot)
+  - `caches` 42 · `surface` 73 · `kms` 335 · `queue` 102 (v3.1.1
+    multi-queue: layout + wgpu/native fillers + barrier + dispatch; `caches`
+    adds S kind-folded `_shader_hash_n` + SPIR-V cache peers)
+  - `native` 1311 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
     timeline syncobjs / SDMA copy / queue fillers + v3.2 fmt create +
     X real buffers / transfer-copy / SDMA chaining + TS T#/S#/IMG-format
     builders / TS.6 COPY_TILED + TS.7 BC tiled create/write-read/params +
@@ -96,7 +105,8 @@ doesn't change between paths.
   Splitting also kept every file under the 128 KiB lint/fmt cap (the old
   `mabda_v3.tcyr` had grown to 148 KiB, past the cap).
   Plus GPU integration programs: `phase0`, `compute_e2e`,
-  `render_e2e`, `render_graph_e2e` for wgpu; `native_compute_store`,
+  `render_e2e`, `render_graph_e2e`, `spirv_e2e` (3.2.4 — SPIR-V vs WGSL
+  cross-source identity) for wgpu; `native_compute_store`,
   `native_texture_e2e`, `native_render_e2e`, `native_mipmap_e2e`
   (v3.1 — mip-chain generate verified vs a CPU box-filter on Cezanne),
   and the v3.1.1 multi-queue set `native_queue_compute_e2e` /
@@ -205,7 +215,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 2882 CPU assertions across 12 domain files
+make test                                            # 2908 CPU assertions across 12 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -284,7 +294,7 @@ mabda/
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
 │   ├── tcyr/                        — 12 functionality-named domain suites
-│   │   │                              (2882 asserts total; `make test` globs
+│   │   │                              (2908 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -383,7 +393,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 2882 CPU assertions across 12 domain test
+- **Tests are the way** — 2908 CPU assertions across 12 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -432,7 +442,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 2882+ assertions pass across all 12 domain test files,
+2. Test sweep: 2908+ assertions pass across all 12 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -505,7 +515,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 12 `tests/tcyr/*.tcyr` domain suites); 2882+
+   (all 12 `tests/tcyr/*.tcyr` domain suites); 2908+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
@@ -524,7 +534,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.2.12"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.14"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts

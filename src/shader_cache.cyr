@@ -11,17 +11,30 @@
 # existing-key. See cyrius v5.5.20 CHANGELOG for the stdlib side.
 
 # FNV-1a hash for shader source deduplication
-fn _shader_hash(source): i64 {
-    var hash = 14695981039346656037;  # FNV offset basis (u64)
+# FNV-1a hash over an EXPLICIT byte length, with the shader-source KIND folded
+# into the seed (v3.2 Phase S.3). Length-explicit because a SPIR-V blob has
+# embedded NUL bytes (it's a u32 word stream) — the NUL-terminated scan below
+# would stop at the first zero and collide wildly. The kind fold seeds the basis
+# with `kind * prime`; SHADER_SRC_WGSL = 0 leaves the basis UNCHANGED, so WGSL
+# keys are byte-identical to the legacy hash, while a WGSL string and a SPIR-V
+# blob can never share a key.
+fn _shader_hash_n(ptr, byte_len, kind): i64 {
+    var hash = 14695981039346656037;        # FNV-1a offset basis (u64)
+    hash = hash ^ (kind * 1099511628211);   # kind fold (identity for WGSL=0)
     var i = 0;
-    var c = load8(source + i);
-    while (c != 0) {
-        hash = hash ^ c;
-        hash = hash * 1099511628211;  # FNV prime
+    while (i < byte_len) {
+        hash = hash ^ load8(ptr + i);
+        hash = hash * 1099511628211;         # FNV prime
         i = i + 1;
-        c = load8(source + i);
     }
     return hash;
+}
+
+# FNV-1a hash for WGSL source dedup (NUL-terminated). Kept for the unchanged
+# WGSL cache callers; delegates to _shader_hash_n folded with SHADER_SRC_WGSL,
+# so existing keys are byte-stable.
+fn _shader_hash(source): i64 {
+    return _shader_hash_n(source, strlen(source), SHADER_SRC_WGSL);
 }
 
 fn shader_cache_new(): i64 {
@@ -51,6 +64,41 @@ fn shader_cache_get_or_compile(cache, device, wgsl_source, label): i64 {
 
     if (module != 0) {
         shader_cache_set(cache, wgsl_source, module);
+    }
+    return module;
+}
+
+# ================================================================
+# v3.2 Phase S.3 — SPIR-V cache peers (kind-folded, length-explicit)
+# ================================================================
+# `words_ptr` = u32 word stream; `byte_len` = word_count * 4. The hash folds
+# SHADER_SRC_SPIRV, so a SPIR-V blob never collides with a WGSL string of the
+# same bytes. (wgpu path — SPIR-V→GFX9 native lowering is Phase N.)
+
+fn shader_cache_get_spirv(cache, words_ptr, byte_len): i64 {
+    return map_u64_get(cache, _shader_hash_n(words_ptr, byte_len, SHADER_SRC_SPIRV));
+}
+
+fn shader_cache_set_spirv(cache, words_ptr, byte_len, module): i64 {
+    map_u64_set(cache, _shader_hash_n(words_ptr, byte_len, SHADER_SRC_SPIRV), module);
+    return 0;
+}
+
+# Get-or-compile a SPIR-V module. Validates the binary (magic/align/bound) before
+# building the WGPUShaderSourceSPIRV (codeSize = byte_len/4 WORDS); a malformed
+# blob returns 0 without caching. wgpu instance must have the ShaderSourceSPIRV
+# feature (else the create nulls — fail-loud).
+fn shader_cache_get_or_compile_spirv(cache, device, words_ptr, byte_len, label): i64 {
+    # Validate BEFORE hashing/caching — never key the cache on a malformed blob
+    # (defense-in-depth; Phase S review 2026-06-16).
+    if (_spirv_validate(words_ptr, byte_len) != 0) { return 0; }
+    var existing = shader_cache_get_spirv(cache, words_ptr, byte_len);
+    if (existing != 0) { return existing; }
+    var src = wgpu_shader_source_spirv(words_ptr, byte_len / 4);
+    var desc = wgpu_shader_module_descriptor(label, src);
+    var module = wgpu_device_create_shader_module(device, desc);
+    if (module != 0) {
+        shader_cache_set_spirv(cache, words_ptr, byte_len, module);
     }
     return module;
 }

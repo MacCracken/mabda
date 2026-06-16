@@ -124,17 +124,20 @@ var _step3e_create_bytes = 0;
 
 var _step3e_create_n     = 0;
 
+var _step3e_create_kind  = 0;
+
 var _step3e_release_count = 0;
 
 var _step3e_release_ctx   = 0;
 
 var _step3e_release_handle = 0;
 
-fn _step3e_shmod_create_capture(ctx, bp, n) {
+fn _step3e_shmod_create_capture(ctx, bp, n, kind) {
     _step3e_create_count = _step3e_create_count + 1;
     _step3e_create_ctx = ctx;
     _step3e_create_bytes = bp;
     _step3e_create_n = n;
+    _step3e_create_kind = kind;
     return 0xBA5;
 }
 
@@ -1015,6 +1018,7 @@ fn test_gpu_buffer_release_dispatches_through_backend() {
 fn test_gpu_shader_module_create_dispatches_through_backend() {
     _step3e_create_count = 0;
     var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_WGPU);
     backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE, &_step3e_shmod_create_capture);
     var ctx = alloc(112);
     memset(ctx, 0, 112);
@@ -1025,6 +1029,17 @@ fn test_gpu_shader_module_create_dispatches_through_backend() {
     assert_eq(_step3e_create_ctx, ctx, "arg 1 = ctx");
     assert_eq(_step3e_create_bytes, 0xCAFE, "arg 2 = bytes");
     assert_eq(_step3e_create_n, 256, "arg 3 = n");
+    # v3.2 Phase S — wgpu backend forwards SHADER_SRC_WGSL by default.
+    assert_eq(_step3e_create_kind, SHADER_SRC_WGSL, "arg 4 = kind WGSL (wgpu default)");
+    # A native (AMD) backend forwards SHADER_SRC_GFX9.
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    gpu_shader_module_create(ctx, 0xCAFE, 256);
+    assert_eq(_step3e_create_kind, SHADER_SRC_GFX9, "native default kind = GFX9");
+    # gpu_shader_module_create_spirv forwards SHADER_SRC_SPIRV regardless of backend.
+    gpu_shader_module_create_spirv(ctx, 0xBEEF, 20);
+    assert_eq(_step3e_create_kind, SHADER_SRC_SPIRV, "create_spirv forwards SPIRV");
+    assert_eq(_step3e_create_bytes, 0xBEEF, "spirv words_ptr forwarded");
+    assert_eq(_step3e_create_n, 20, "spirv byte_len forwarded");
     return 0;
 }
 
@@ -1288,6 +1303,50 @@ fn test_wgsl_source_cstr_not_truncated_at_4k() {
     store8(buf + n, 0);        # NUL terminator at byte 5000
     var src = wgpu_shader_source_wgsl(buf);
     assert_eq(load64(src + 24), 5000, "5000-byte WGSL source not capped at 4096");
+    return 0;
+}
+
+# v3.2 S.1 — WGPUShaderSourceSPIRV (32 B): chain@0 (sType@8), codeSize@16 in
+# WORDS, code ptr@24. The words-vs-bytes codeSize is the #1 SPIRV bug; pin it.
+fn test_spirv_source_builder() {
+    var src = wgpu_shader_source_spirv(0xBEEF, 5);   # 5 words
+    assert_eq(load64(src + 0), 0, "chain.next = NULL");
+    assert_eq(load32(src + 8), WGPU_STYPE_SHADER_SOURCE_SPIRV, "sType = SPIRV(1)");
+    assert_eq(load32(src + 16), 5, "codeSize = 5 WORDS (not bytes)");
+    assert_eq(load64(src + 24), 0xBEEF, "code ptr stored at +24");
+    assert_eq(WGPU_STYPE_SHADER_SOURCE_SPIRV, 1, "SPIRV sType constant = 0x1");
+    return 0;
+}
+
+# v3.2 S.1 — _spirv_validate structural checks (magic/align/bound + cap), each
+# returning its distinct code. Builds a minimal valid 5-word SPIR-V header.
+fn test_spirv_validate() {
+    var buf[20];
+    store32(&buf +  0, MABDA_SPIRV_MAGIC);   # word0 magic
+    store32(&buf +  4, 0x00010300);          # word1 version
+    store32(&buf +  8, 0);                    # word2 generator
+    store32(&buf + 12, 1);                    # word3 id-bound = 1
+    store32(&buf + 16, 0);                    # word4 schema
+    assert_eq(_spirv_validate(&buf, 20), 0, "valid 5-word header -> 0");
+    assert_eq(_spirv_validate(&buf, 16), 1, "too short (16B) -> 1");
+    assert_eq(_spirv_validate(&buf, 21), 2, "not u32-aligned (21B) -> 2");
+    # bad magic.
+    store32(&buf + 0, 0xDEADBEEF);
+    assert_eq(_spirv_validate(&buf, 20), 3, "bad magic -> 3");
+    # byte-swapped (big-endian) magic.
+    store32(&buf + 0, MABDA_SPIRV_MAGIC_SWAPPED);
+    assert_eq(_spirv_validate(&buf, 20), 4, "byte-swapped magic -> 4");
+    # restore magic; bound malformed.
+    store32(&buf + 0, MABDA_SPIRV_MAGIC);
+    store32(&buf + 12, 0);
+    assert_eq(_spirv_validate(&buf, 20), 5, "id-bound 0 -> 5");
+    store32(&buf + 12, 0x40000000);
+    assert_eq(_spirv_validate(&buf, 20), 5, "id-bound too large -> 5");
+    # restore bound; runaway word-count cap (small buffer, huge byte_len param —
+    # validate only reads word0 + word3, both in-bounds).
+    store32(&buf + 12, 1);
+    assert_eq(_spirv_validate(&buf, (MABDA_MAX_SPIRV_WORDS + 1) * 4), 6,
+    "word count over cap -> 6");
     return 0;
 }
 
@@ -1821,6 +1880,8 @@ fn main() {
     test_gpu_texture_create_dispatches_through_backend();
     test_wgsl_source_explicit_length();
     test_wgsl_source_cstr_not_truncated_at_4k();
+    test_spirv_source_builder();
+    test_spirv_validate();
     test_wgpu_texture_view_descriptor_level();
     test_wgpu_bgl_entry_texture();
     test_wgpu_bgl_entry_storage_texture();
