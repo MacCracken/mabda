@@ -8554,6 +8554,93 @@ fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
     return 0;
 }
 
+# v3.2 TS.7c-3 — one-shot SDMA submit on the DMA ring: a 4-entry BO_HANDLES
+# list (fence, ib, lin, tiled), a transient syncobj, submit + blocking wait. The
+# texture write/read contract is synchronous, so we don't use the persistent
+# queue timeline (native_transfer_copy_timeline) here — a per-call syncobj is
+# simpler and the copies are infrequent. Lifts the HW-proven submit shape from
+# the TS.6 native_sdma_tiled_roundtrip probe. Returns 0 | neg-rc.
+fn _native_dma_submit_oneshot(ctx, h_lin, h_tiled, sdma_bytes): i64 {
+    var fd = native_ctx_fd(ctx);
+    var entries[32];
+    store32(&entries +  0, native_ctx_fence_handle(ctx)); store32(&entries +  4, 1);
+    store32(&entries +  8, native_ctx_ib_handle(ctx));    store32(&entries + 12, 10);
+    store32(&entries + 16, h_lin);                        store32(&entries + 20, 3);
+    store32(&entries + 24, h_tiled);                      store32(&entries + 28, 3);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 4);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var sbuf[8];
+    if (native_syncobj_create(fd, &sbuf) != 0) { return 0 - 1; }
+    var so = load64(&sbuf);
+    var rc = native_cs_submit_4chunk(fd, native_ctx_id(ctx), &bo_list_in,
+    native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
+    native_ctx_fence_handle(ctx), 32, 0);
+    if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    if (syscall(228, 1, &t_now) != 0) { native_syncobj_destroy(fd, so); return 0 - 1; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var wrc = native_syncobj_wait(fd, so, deadline);
+    native_syncobj_destroy(fd, so);
+    return wrc;
+}
+
+# v3.2 TS.7c-3 — move `n` bytes of block-compressed data between a host buffer
+# and a SW_64KB_S tiled texture surface via SDMA COPY_TILED_SUB_WINDOW. The
+# consumer's compressed data is row-major linear (block pitch = wb); the surface
+# is tiled, so a transient linear staging BO bridges them:
+#   write (detile=0): memcpy host->staging, then L2T staging->surface
+#   read  (detile=1): T2L surface->staging, then memcpy staging->host
+# `n` must equal the LOGICAL linear footprint (wb*hb*block_bytes = the tex's
+# NATIVE_TEX_FIELD_SIZE). Pure-validation rejects (uncompressed fmt, n mismatch)
+# return BEFORE any ioctl. Returns 0 | GPU_ERR_*.
+fn _native_texture_tiled_copy(ctx, tex, host, n, detile): i64 {
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var tp[56];
+    if (native_tex_tiled_params(fmt, w, h, &tp) != 0) { return GPU_ERR_TEXTURE; }
+    var wb = load64(&tp +  0);
+    var hb = load64(&tp +  8);
+    var bb = load64(&tp + 48);
+    if (n != wb * hb * bb) { return GPU_ERR_BUFFER; }
+
+    var fd = native_ctx_fd(ctx);
+    # Transient linear staging BO (page-aligned for GEM_VA).
+    var stage_size = _native_align_up(n, 4096);
+    var stage_va = native_ctx_alloc_texture_va(ctx, stage_size);
+    if (stage_va == 0) { return GPU_ERR_OTHER; }
+    var sbo[16];
+    if (native_bo_create_gtt(fd, stage_size, &sbo) != 0) { return GPU_ERR_OTHER; }
+    var stage_h = load64(&sbo + 0);
+    var stage_a = load64(&sbo + 8);
+    if (native_gem_va_map(fd, stage_h, stage_va, stage_size, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, stage_h, stage_a, stage_size);
+        return GPU_ERR_OTHER;
+    }
+    if (detile == 0) { memcpy(stage_a, host, n); }   # host -> staging before L2T
+
+    var ib_addr = native_ctx_ib_addr(ctx);
+    memset(ib_addr, 0, _NATIVE_IB_SIZE);
+    var sdma_bytes = native_tex_build_tiled_copy_packet(ib_addr, tex, stage_va, detile);
+    var rc = 0 - 1;
+    if (sdma_bytes > 0) {
+        rc = _native_dma_submit_oneshot(ctx, stage_h,
+        load64(tex + NATIVE_TEX_FIELD_HANDLE), sdma_bytes);
+    }
+    if (rc == 0) {
+        if (detile != 0) { memcpy(host, stage_a, n); }   # staging -> host after T2L
+    }
+    native_gem_va_unmap(fd, stage_h, stage_va, stage_size);
+    native_bo_release_gtt(fd, stage_h, stage_a, stage_size);
+    if (rc != 0) { return GPU_ERR_TEXTURE; }
+    return 0;
+}
+
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -8563,11 +8650,12 @@ fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
     if (addr == 0)   { return GPU_ERR_BUFFER; }
     if (n != size)   { return GPU_ERR_BUFFER; }
-    # A SW_64KB_S tiled surface (compressed sampleable, TS.7c) is NOT linear —
-    # a raw memcpy would lay the blocks down un-swizzled and sample as garbage.
-    # The L2T COPY_TILED write path lands in TS.7c-3; until then, reject rather
-    # than corrupt. (Tiled textures are cap-gated off, so no consumer hits this.)
-    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) { return GPU_ERR_TEXTURE; }
+    # A SW_64KB_S tiled surface (compressed sampleable) is NOT linear — route it
+    # through the L2T COPY_TILED path so the blocks land swizzled the way the TA
+    # reads them; a raw memcpy would sample as garbage.
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return _native_texture_tiled_copy(ctx, tex, src, n, 0);
+    }
     memcpy(addr, src, n);
     return 0;
 }
@@ -8581,9 +8669,10 @@ fn _backend_native_texture_read(ctx, tex, dst, n): i64 {
     var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
     if (addr == 0)   { return GPU_ERR_BUFFER; }
     if (n != size)   { return GPU_ERR_BUFFER; }
-    # Tiled (compressed) readback needs the T2L COPY_TILED path (TS.7c-3); a raw
-    # memcpy would return swizzled bytes. Reject until then.
-    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) { return GPU_ERR_TEXTURE; }
+    # Tiled (compressed) readback de-tiles via T2L COPY_TILED into a staging BO.
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return _native_texture_tiled_copy(ctx, tex, dst, n, 1);
+    }
     memcpy(dst, addr, n);
     return 0;
 }
@@ -9314,6 +9403,37 @@ fn native_tex_tiled_params(fmt, width, height, out): i64 {
     store64(out + 40, _native_log2(bb));    # esize_log2
     store64(out + 48, bb);                  # block_bytes
     return 0;
+}
+
+# v3.2 TS.7c-3 — build the SDMA COPY_TILED_SUB_WINDOW packet that moves a
+# compressed `tex`'s surface to/from a linear staging VA. `buf` = packet dest,
+# `lin_va` = staging BO VA, `detile` = 0 (L2T: linear->tiled write) | 1 (T2L:
+# tiled->linear read). Pure byte-builder (no fd/ioctl) so the param derivation
+# is CPU-pinnable.
+#
+# CONTRACT (review HIGH, 2026-06-15): the SDMA epitch MUST equal the T#'s epitch
+# = awb-1 (the tile-ALIGNED block pitch - 1, from native_tex_tiled_params), NOT
+# wb-1 (the unaligned block count - 1). The TS.6 round-trip probe used wb-1, which
+# only coincides with awb-1 on a block_w-aligned surface; reusing it on a
+# non-aligned BC surface would tile a layout the TA disagrees with -> garbage. We
+# read awb straight from the same params the T# was built from, so they can't drift.
+# Returns the packet byte length (56), or -1 if `tex`'s fmt isn't compressed.
+fn native_tex_build_tiled_copy_packet(buf, tex, lin_va, detile): i64 {
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var tp[56];
+    if (native_tex_tiled_params(fmt, w, h, &tp) != 0) { return 0 - 1; }
+    var wb  = load64(&tp +  0);
+    var hb  = load64(&tp +  8);
+    var awb = load64(&tp + 16);
+    var esize = load64(&tp + 40);
+    var tiled_va = load64(tex + NATIVE_TEX_FIELD_VA);   # surface at BO +0
+    var sw = native_tex_sw_mode(tex);
+    # epitch = awb-1 (see CONTRACT); ext/copy region + linear pitch in BLOCKS
+    # (the tiled element); linear slice = wb*hb blocks; dim = 2D(1).
+    return native_sdma_build_copy_tiled(buf, tiled_va, lin_va,
+    esize, sw, 1, awb - 1, wb, hb, wb, wb * hb, wb, hb, detile);
 }
 
 # Byte offset of mip `level` within the contiguous chain (the sum of the

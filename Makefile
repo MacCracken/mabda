@@ -336,6 +336,16 @@ build/native_sdma_tiled_roundtrip: programs/native_sdma_tiled_roundtrip.cyr src/
 test-native-sdma-tiled-roundtrip: build/native_sdma_tiled_roundtrip
 	./build/native_sdma_tiled_roundtrip
 
+# v3.2 TS.7c-3 — tiled BC1 texture write(L2T)/read(T2L) round-trip through the
+# wired public gpu_texture_* path on a non-block_w-aligned surface. HW-gated.
+build/native_tiled_texture_roundtrip: programs/native_tiled_texture_roundtrip.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_tiled_texture_roundtrip.cyr $@
+
+.PHONY: test-native-tiled-texture-roundtrip
+test-native-tiled-texture-roundtrip: build/native_tiled_texture_roundtrip
+	./build/native_tiled_texture_roundtrip
+
 # v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
 # -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
 # result CPU-verified. HW-gated (needs an AMD render node).
