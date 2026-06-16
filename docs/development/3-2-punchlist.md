@@ -125,11 +125,14 @@ HW-proven (`native_sdma_copy_e2e.cyr`).
   staging → **reinforces R.5 (3.2.13)**. No regression in the other native
   HW programs (compute_store / multiqueue / sdma_copy / queue_compute all
   still exit 0).
-- [ ] **X.8** — Native SDMA **chunking**: lift the 4 MiB single-packet cap
-  by looping `COPY_LINEAR` packets (per-chunk src/dst VA offsets) in one
-  IB; closes the >4 MiB cross-backend gap (wgpu has no cap). CPU test for
-  chunk-count math + HW e2e leg. *(Sequencing chosen 2026-06-15: e2e
-  before chunking; both land before the cut.)*
+- [x] **X.8** — Native SDMA **chunking**. `native_sdma_build_copy_chained`
+  loops `COPY_LINEAR` packets (each ≤4 MiB, per-chunk src/dst VA offsets) into
+  the cached IB; `native_transfer_copy_timeline` no longer rejects at 4 MiB —
+  it chains, and only rejects (`GPU_ERR_BUFFER`) a chain that overflows the IB
+  (~146 packets / ~584 MiB per submission; >that = multi-submission, future).
+  CPU test for the chunk/VA-offset/overflow math; HW e2e **leg C** (6 MiB =
+  2 packets, byte-exact across the boundary, verified on Cezanne). Closes the
+  >4 MiB native gap for all realistic buffers.
 - [ ] **X.9** — **Cut 3.2.1.**
 
 ---

@@ -575,6 +575,39 @@ fn test_native_compute_dispatch_on_dma_queue_rejected() {
 # v3.2 X.4 — SDMA buffer-copy timeline driver: guard ladder + the
 # point-bump / pending-wait-consume bookkeeping on the full path
 # (fake fd makes the submit fail without HW).
+# v3.2 X.8 — SDMA COPY_LINEAR chaining: split a copy across N <=4 MiB
+# packets with per-chunk VA offsets, and reject (return 0) a chain that
+# won't fit the IB. Pure byte-builder, fully CPU-checkable.
+fn test_native_sdma_build_copy_chained() {
+    assert_eq(_NATIVE_SDMA_COPY_MAX_BYTES, 4194304, "per-packet cap = 4 MiB");
+    var buf[128];
+    memset(&buf, 0, 128);
+    # Single chunk: 4096 bytes -> one 28-byte packet.
+    var n1 = native_sdma_build_copy_chained(&buf, 0x1000, 0x9000, 4096, 128);
+    assert_eq(n1, 28, "4096B -> 1 packet");
+    assert_eq(load32(&buf + 4), 4095, "packet0 count = bytes-1");
+    assert_eq(load32(&buf + 12), 0x1000, "packet0 src_lo");
+    assert_eq(load32(&buf + 20), 0x9000, "packet0 dst_lo");
+    # Two chunks: 4 MiB + 8 -> two packets; 2nd advanced by one full chunk.
+    memset(&buf, 0, 128);
+    var n2 = native_sdma_build_copy_chained(&buf, 0x1000, 0x9000,
+    _NATIVE_SDMA_COPY_MAX_BYTES + 8, 128);
+    assert_eq(n2, 56, "4MiB+8 -> 2 packets");
+    assert_eq(load32(&buf + 4), _NATIVE_SDMA_COPY_MAX_BYTES - 1, "chunk0 count = 4MiB-1");
+    assert_eq(load32(&buf + 12), 0x1000, "chunk0 src_lo");
+    assert_eq(load32(&buf + 32), 7, "chunk1 count = 8-1");
+    assert_eq(load32(&buf + 40), 0x1000 + _NATIVE_SDMA_COPY_MAX_BYTES,
+    "chunk1 src_lo advanced by one chunk");
+    assert_eq(load32(&buf + 48), 0x9000 + _NATIVE_SDMA_COPY_MAX_BYTES,
+    "chunk1 dst_lo advanced by one chunk");
+    # buf_cap fits only one packet but two are needed -> 0 (caller rejects).
+    memset(&buf, 0, 128);
+    var n3 = native_sdma_build_copy_chained(&buf, 0x1000, 0x9000,
+    _NATIVE_SDMA_COPY_MAX_BYTES + 8, 28);
+    assert_eq(n3, 0, "chain exceeding buf_cap -> 0");
+    return 0;
+}
+
 fn test_native_transfer_copy_timeline_driver() {
     var ctx[160];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
@@ -592,12 +625,6 @@ fn test_native_transfer_copy_timeline_driver() {
     queue_set_syncobj(qt, 7);
     assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 0, qt),
     GPU_ERR_BUFFER, "zero bytes -> GPU_ERR_BUFFER");
-    # Audit HIGH-2: > 4 MiB overflows the 22-bit SDMA count field; reject
-    # (checked before the syncobj/HW path, so qt's syncobj state is moot).
-    assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200,
-    _NATIVE_SDMA_COPY_MAX_BYTES + 1, qt),
-    GPU_ERR_BUFFER, "> 4 MiB -> GPU_ERR_BUFFER (count-field cap)");
-    assert_eq(_NATIVE_SDMA_COPY_MAX_BYTES, 4194304, "SDMA copy cap = 4 MiB");
     # DMA queue, no syncobj -> GPU_ERR_OTHER.
     var qns = queue_new(QUEUE_KIND_TRANSFER);
     queue_set_ring(qns, AMDGPU_HW_IP_DMA);
@@ -615,6 +642,19 @@ fn test_native_transfer_copy_timeline_driver() {
     assert(rc != 0, "fake-fd submit fails gracefully");
     assert_eq(queue_point(qt), 1, "timeline point bumped 0->1");
     assert_eq(queue_pending_wait_syncobj(qt), 0, "pending wait consumed");
+    # X.8: a > 4 MiB copy is no longer rejected — it chunks into multiple
+    # COPY_LINEAR packets and proceeds to submit (fails on the fake fd, but
+    # the point bumps, proving it reached submit rather than early-rejecting).
+    var rc2 = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200,
+    _NATIVE_SDMA_COPY_MAX_BYTES + 4, qt);
+    assert(rc2 != 0, "4MiB+4 chunks + submits (fake-fd fail), not rejected");
+    assert_eq(queue_point(qt), 2, "point bumped 1->2 (reached submit)");
+    # X.8: a copy too large for the IB packet chain (>146 packets) is
+    # rejected pre-submit with GPU_ERR_BUFFER (point NOT bumped).
+    var rc3 = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200,
+    _NATIVE_SDMA_COPY_MAX_BYTES * 147, qt);
+    assert_eq(rc3, GPU_ERR_BUFFER, "oversize chain -> GPU_ERR_BUFFER");
+    assert_eq(queue_point(qt), 2, "oversize rejected pre-submit (point unchanged)");
     return 0;
 }
 
@@ -2693,6 +2733,7 @@ fn main() {
     test_native_cs_submit_timeline_point_guards();
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
+    test_native_sdma_build_copy_chained();
     test_native_transfer_copy_timeline_driver();
     test_native_buffer_copy_guards();
     test_native_queue_get_guards();

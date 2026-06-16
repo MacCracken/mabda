@@ -221,6 +221,42 @@ fn main(): i64 {
     }
     print_cstr("leg B: compute -> barrier -> transfer_copy consumed compute output\n");
 
+    # =============================================================
+    # Leg C — chunked copy: a 6 MiB transfer spans >1 SDMA packet
+    # =============================================================
+    # 6 MiB = one 4 MiB COPY_LINEAR packet + one 2 MiB packet (X.8 chaining).
+    # A byte-exact round-trip over the whole buffer proves both chunks landed
+    # and the 4 MiB chunk boundary is seamless.
+    var BIG = 6291456;
+    var bsrc = gpu_buffer_create(ctx, BIG, usage);
+    var bdst = gpu_buffer_create(ctx, BIG, usage);
+    if (bsrc == 0) { print_cstr("FAIL: big src create\n"); gpu_context_release(ctx); return 2; }
+    if (bdst == 0) { print_cstr("FAIL: big dst create\n"); gpu_context_release(ctx); return 2; }
+    var bpat = alloc(BIG);
+    var bi = 0;
+    while (bi < BIG / 4) { store32(bpat + bi * 4, 0xC0DE0000 + bi); bi = bi + 1; }
+    if (gpu_buffer_write(ctx, bsrc, 0, bpat, BIG) != 0) {
+        print_cstr("FAIL: big src write\n"); gpu_context_release(ctx); return 3; }
+    if (gpu_buffer_copy(ctx, bsrc, bdst, BIG) != 0) {
+        print_cstr("FAIL: 6 MiB gpu_buffer_copy\n"); gpu_context_release(ctx); return 13; }
+    var bout = alloc(BIG);
+    memset(bout, 0, BIG);
+    if (gpu_buffer_read(ctx, bdst, 0, bout, BIG) != 0) {
+        print_cstr("FAIL: big dst read\n"); gpu_context_release(ctx); return 13; }
+    var bbad = 0 - 1;
+    var bj = 0;
+    while (bj < BIG / 4) {
+        if (load32(bout + bj * 4) != 0xC0DE0000 + bj) { bbad = bj; bj = BIG; }
+        bj = bj + 1;
+    }
+    if (bbad != 0 - 1) {
+        print_cstr("FAIL: leg C mismatch at dword "); print_i64(bbad); print_cstr("\n");
+        gpu_context_release(ctx); return 13;
+    }
+    print_cstr("leg C: 6 MiB chunked copy (2 SDMA packets) byte-exact across boundary\n");
+
+    gpu_buffer_release(ctx, bsrc);
+    gpu_buffer_release(ctx, bdst);
     gpu_buffer_release(ctx, src);
     gpu_buffer_release(ctx, dst);
     gpu_buffer_release(ctx, produced);

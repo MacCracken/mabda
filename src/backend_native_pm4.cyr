@@ -1119,11 +1119,11 @@ rt_va, rt_width, rt_height): i64 {
 var SDMA_OP_COPY           = 0x1;
 var SDMA_SUBOP_COPY_LINEAR = 0x0;
 
-# Max bytes a single GFX9 SDMA COPY_LINEAR packet can move. The COUNT
-# field (dword 1 = byte_count - 1) is 22 bits wide, so byte_count tops
-# out at 1<<22 = 4 MiB. A larger copy would spill bits past [21:0] into
-# reserved space and silently corrupt the transfer (audit 2026-06-15
-# HIGH-2). Callers must reject (or, future work, chunk) above this.
+# Max bytes ONE GFX9 SDMA COPY_LINEAR packet can move. The COUNT field
+# (dword 1 = byte_count - 1) is 22 bits wide, so byte_count tops out at
+# 1<<22 = 4 MiB; more would spill past bit 21 and silently corrupt the
+# copy (audit 2026-06-15 HIGH-2). Larger transfers chain multiple packets
+# (native_sdma_build_copy_chained, v3.2 X.8) — each chunk is capped here.
 var _NATIVE_SDMA_COPY_MAX_BYTES = 4194304;
 
 # Build a 7-dword SDMA COPY_LINEAR packet at `buf`. Returns 28 (bytes).
@@ -1140,5 +1140,33 @@ fn native_sdma_build_copy_linear(buf, src_va, dst_va, bytes): i64 {
     store32(buf + 20, dst_va & 0xFFFFFFFF);        # dst_addr_lo
     store32(buf + 24, (dst_va >> 32) & 0xFFFFFFFF); # dst_addr_hi
     return 28;
+}
+
+# v3.2 X.8 — chain N SDMA COPY_LINEAR packets covering `bytes` from src_va
+# to dst_va, each chunk capped at _NATIVE_SDMA_COPY_MAX_BYTES (4 MiB), so a
+# single DMA submission can move buffers larger than one packet's 22-bit
+# count field allows. Successive chunks advance the src/dst VAs by the bytes
+# already copied. Pure byte-builder — writes contiguous 28-byte packets into
+# `buf`; the submit is the caller's job.
+#
+# `buf_cap` is the IB byte budget (the cached IB is _NATIVE_IB_SIZE). Returns
+# the total packet bytes written (a multiple of 28), or 0 if the chain would
+# exceed buf_cap — the caller rejects (the per-IB ceiling is ~146 packets =
+# ~584 MiB; bigger copies need multiple submissions, future work). Nothing
+# partial is submitted on the 0 path. Precondition: bytes > 0.
+fn native_sdma_build_copy_chained(buf, src_va, dst_va, bytes, buf_cap): i64 {
+    var remaining = bytes;
+    var off = 0;        # bytes already covered (VA advance)
+    var written = 0;    # packet bytes staged into buf
+    while (remaining > 0) {
+        if (written + 28 > buf_cap) { return 0; }   # chain won't fit the IB
+        var chunk = remaining;
+        if (chunk > _NATIVE_SDMA_COPY_MAX_BYTES) { chunk = _NATIVE_SDMA_COPY_MAX_BYTES; }
+        native_sdma_build_copy_linear(buf + written, src_va + off, dst_va + off, chunk);
+        written = written + 28;
+        off = off + chunk;
+        remaining = remaining - chunk;
+    }
+    return written;
 }
 

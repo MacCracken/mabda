@@ -206,10 +206,9 @@ dst_handle, dst_va, bytes, queue): i64 {
     # SDMA-ring-only: a copy aimed at a GFX/compute queue is a mis-route.
     if (queue_ring(queue) != AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
     if (bytes <= 0) { return GPU_ERR_BUFFER; }
-    # A single SDMA COPY_LINEAR packet's 22-bit count field caps at 4 MiB;
-    # reject above it rather than silently corrupting (audit 2026-06-15
-    # HIGH-2). Multi-packet chunking for larger copies is tracked follow-up.
-    if (bytes > _NATIVE_SDMA_COPY_MAX_BYTES) { return GPU_ERR_BUFFER; }
+    # Note: no single-packet 4 MiB cap here anymore — the chained builder
+    # below (v3.2 X.8) splits `bytes` across packets and rejects only if the
+    # chain overflows the IB.
     var syncobj = queue_syncobj(queue);
     if (syncobj == 0) { return GPU_ERR_OTHER; }
 
@@ -220,9 +219,14 @@ dst_handle, dst_va, bytes, queue): i64 {
     var ib_addr      = native_ctx_ib_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
 
-    # Stage the SDMA COPY_LINEAR packet into the cached IB BO.
-    memset(ib_addr, 0, 4096);
-    var sdma_bytes = native_sdma_build_copy_linear(ib_addr, src_va, dst_va, bytes);
+    # Stage the SDMA copy into the cached IB BO — chained into as many
+    # COPY_LINEAR packets as `bytes` needs (each <= 4 MiB; v3.2 X.8). A copy
+    # too large to fit the IB's packet chain returns 0 here -> GPU_ERR_BUFFER
+    # (nothing submitted); the ceiling is ~146 packets / ~584 MiB per submit.
+    memset(ib_addr, 0, _NATIVE_IB_SIZE);
+    var sdma_bytes = native_sdma_build_copy_chained(ib_addr, src_va, dst_va,
+    bytes, _NATIVE_IB_SIZE);
+    if (sdma_bytes == 0) { return GPU_ERR_BUFFER; }
 
     # 4-entry inline BO_HANDLES list (fence, ib, src, dst).
     var entries[32];
