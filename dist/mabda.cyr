@@ -5401,48 +5401,60 @@ var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
 # TS.5 verifies on Cezanne. (Normalized-UV `image_sample` + the UV-export VS
 # come at TS.7 for the compressed/scaled path.)
 #
+# v3.2 TS.8 — SCALED: the FS now multiplies the fragment position by a per-draw
+# scale (scale_x/scale_y = tex_dim/rt_dim, f32, loaded from descriptor+48/+52)
+# before the int-cvt, so a W×H texture maps over an arbitrary RT. The draw writes
+# scale=1.0 for equal dims, so RT[x,y]==tex[x,y] stays bit-exact (1.0*x == x).
+#
 # ABI:
 #   - s[0:1] = PS user-data (the T#+S# descriptor BO VA; pipeline SET_SH_REGs
 #     SPI_SHADER_USER_DATA_PS_0/1 at bind, TS.5). RSRC2_PS USER_SGPR=2.
 #   - SPI_PS_INPUT_ENA = GFX9_SPI_PS_INPUT_TEXTURED (0x302): PERSP_CENTER
 #     (hang-quirk, VGPRs v0/v1 unused) + POS_X_FLOAT + POS_Y_FLOAT, so the
 #     fragment screen position arrives as floats in v2 (x) / v3 (y).
-#   - High-water: VGPRs v0..v5 (6), SGPRs s[0:7] (8, the loaded T#). TS.5's
-#     PM4 sets RSRC1_PS accordingly.
+#   - High-water: VGPRs v0..v5 (6), SGPRs s[0:13] (T# s[0:7] + scale s[12:13]) —
+#     both fit RSRC1_PS MIN|1 (8 VGPR / 16 SGPR), so the TS.5 draw override + ABI
+#     are unchanged.
 #
 # Source (assembled + round-tripped via `llvm-mc -mcpu=gfx90c`, per
 # feedback_verify_gfx9_shader_bytes_with_llvm_mc):
 #   s_load_dwordx8 s[0:7], s[0:1], 0x0   ; load the T# from the descriptor BO
+#   s_load_dwordx2 s[12:13], s[0:1], 0x30 ; scale_x@+48 -> s12, scale_y@+52 -> s13
 #   s_waitcnt lgkmcnt(0)
-#   v_cvt_i32_f32_e32 v4, v2             ; tx = int(pos_x)
-#   v_cvt_i32_f32_e32 v5, v3             ; ty = int(pos_y)
+#   v_mul_f32 v2, s12, v2 ; v_mul_f32 v3, s13, v3   ; pos *= scale
+#   v_cvt_i32_f32_e32 v4, v2             ; tx = int(scaled pos_x)
+#   v_cvt_i32_f32_e32 v5, v3             ; ty = int(scaled pos_y)
 #   image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm
 #   s_waitcnt vmcnt(0)
 #   exp mrt0 v0, v1, v2, v3 done vm
 #   s_endpgm
 # exp word0 = 0xC400180F — identical to the proven solid-red EXP encoding.
-# Returns pos + 108 (44 B code + 16 × s_nop 0 prefetch pad). @internal
+# Returns pos + 124 (60 B code + 16 × s_nop 0 prefetch pad). @internal
 fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
-    store32(buf + pos +  0, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (w0)
+    store32(buf + pos +  0, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (T# w0)
     store32(buf + pos +  4, 0x00000000);   # s_load_dwordx8 (w1)
-    store32(buf + pos +  8, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
-    store32(buf + pos + 12, 0x7E081102);   # v_cvt_i32_f32_e32 v4, v2  (POS_X -> tx)
-    store32(buf + pos + 16, 0x7E0A1103);   # v_cvt_i32_f32_e32 v5, v3  (POS_Y -> ty)
-    store32(buf + pos + 20, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
-    store32(buf + pos + 24, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
-    store32(buf + pos + 28, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
-    store32(buf + pos + 32, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
-    store32(buf + pos + 36, 0x03020100);   # exp (w1)
-    store32(buf + pos + 40, 0xBF810000);   # s_endpgm
+    store32(buf + pos +  8, 0xC0060300);   # s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale w0)
+    store32(buf + pos + 12, 0x00000030);   # s_load_dwordx2 (w1: offset 0x30 = descriptor+48)
+    store32(buf + pos + 16, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
+    store32(buf + pos + 20, 0x0A04040C);   # v_mul_f32 v2, s12, v2  (pos_x *= scale_x)
+    store32(buf + pos + 24, 0x0A06060D);   # v_mul_f32 v3, s13, v3  (pos_y *= scale_y)
+    store32(buf + pos + 28, 0x7E081102);   # v_cvt_i32_f32_e32 v4, v2  (scaled POS_X -> tx)
+    store32(buf + pos + 32, 0x7E0A1103);   # v_cvt_i32_f32_e32 v5, v3  (scaled POS_Y -> ty)
+    store32(buf + pos + 36, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
+    store32(buf + pos + 40, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    store32(buf + pos + 44, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(buf + pos + 48, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    store32(buf + pos + 52, 0x03020100);   # exp (w1)
+    store32(buf + pos + 56, 0xBF810000);   # s_endpgm
     var i = 0;
     while (i < 16) {
-        store32(buf + pos + 44 + i * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
+        store32(buf + pos + 60 + i * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
         i = i + 1;
     }
-    return pos + 108;
+    return pos + 124;
 }
 
-var GFX9_FS_TEXTURED_LOAD_SIZE = 108;
+var GFX9_FS_TEXTURED_LOAD_SIZE = 124;
 
 # SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
 # gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
@@ -5459,42 +5471,53 @@ var GFX9_SPI_PS_INPUT_TEXTURED = 0x302;
 # (no UV divide, no rcp). This keeps the ABI identical to the image_load FS, so
 # the render_pass_draw textured override (TS.5) is reused unchanged.
 #
+# v3.2 TS.8 — SCALED (same as the image_load FS): the coord = fragment_pos *
+# scale (scale_x/scale_y = tex_dim/rt_dim, f32, from descriptor+48/+52), so a
+# texture maps over an arbitrary RT with the S#'s filter (POINT or BILINEAR). The
+# v_mov pos->coord became v_mul (the multiply reads the scale SGPR as src0, so no
+# extra v_mov). Equal dims -> scale 1.0 -> coord==pos (bit-exact, BC path stays
+# pixel-exact). The S# stays FORCE_UNNORMALIZED (coords are texel-space).
+#
 # ABI (same as the image_load FS — 2 user SGPRs, RSRC2_PS=MIN, RSRC1=MIN|1):
 #   s0,s1 = T#/S# descriptor BO VA (T# at +0, S# at +32; S# is FORCE_UNNORMALIZED).
 #   SPI_PS_INPUT = GFX9_SPI_PS_INPUT_TEXTURED (pos in v2/v3).
-#   High-water: VGPRs v0..v5 (6), SGPRs s0..s11 (T# s[0:7] + S# s[8:11]).
+#   High-water: VGPRs v0..v5 (6), SGPRs s0..s13 (T# s[0:7] + S# s[8:11] + scale
+#   s[12:13]) — both fit MIN|1 (8 VGPR / 16 SGPR); draw override unchanged.
 #
 # Source (llvm-mc -mcpu=gfx90c, round-tripped):
 #   s_load_dwordx4 s[8:11], s[0:1], 0x20     ; S# (descriptor + 32)
 #   s_load_dwordx8 s[0:7], s[0:1], 0x0       ; T# (descriptor + 0)
+#   s_load_dwordx2 s[12:13], s[0:1], 0x30    ; scale_x@+48 -> s12, scale_y@+52 -> s13
 #   s_waitcnt lgkmcnt(0)
-#   v_mov_b32 v4, v2 ; v_mov_b32 v5, v3      ; coord = fragment pos (unnormalized)
+#   v_mul_f32 v4, s12, v2 ; v_mul_f32 v5, s13, v3   ; coord = scale * pos
 #   image_sample v[0:3], v[4:5], s[0:7], s[8:11] dmask:0xf
 #   s_waitcnt vmcnt(0) ; exp mrt0 v0,v1,v2,v3 done vm ; s_endpgm
-# Returns pos + 112 (48 B code + 16 × s_nop 0). @internal
+# Returns pos + 124 (60 B code + 16 × s_nop 0). @internal
 fn native_gfx9_shader_textured_sample_fs(buf, pos): i64 {
     store32(buf + pos +  0, 0xC00A0200);   # s_load_dwordx4 s[8:11], s[0:1], 0x20 (S# w0)
     store32(buf + pos +  4, 0x00000020);   # s_load_dwordx4 (w1: offset 0x20)
     store32(buf + pos +  8, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (T# w0)
     store32(buf + pos + 12, 0x00000000);   # s_load_dwordx8 (w1)
-    store32(buf + pos + 16, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
-    store32(buf + pos + 20, 0x7E080302);   # v_mov_b32 v4, v2 (coord x = pos_x)
-    store32(buf + pos + 24, 0x7E0A0303);   # v_mov_b32 v5, v3 (coord y = pos_y)
-    store32(buf + pos + 28, 0xF0800F00);   # image_sample v[0:3], v[4:5], s[0:7], s[8:11] dmask:0xf (w0)
-    store32(buf + pos + 32, 0x00400004);   # image_sample (w1)
-    store32(buf + pos + 36, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
-    store32(buf + pos + 40, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
-    store32(buf + pos + 44, 0x03020100);   # exp (w1)
-    store32(buf + pos + 48, 0xBF810000);   # s_endpgm
+    store32(buf + pos + 16, 0xC0060300);   # s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale w0)
+    store32(buf + pos + 20, 0x00000030);   # s_load_dwordx2 (w1: offset 0x30 = descriptor+48)
+    store32(buf + pos + 24, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
+    store32(buf + pos + 28, 0x0A08040C);   # v_mul_f32 v4, s12, v2 (coord x = scale_x * pos_x)
+    store32(buf + pos + 32, 0x0A0A060D);   # v_mul_f32 v5, s13, v3 (coord y = scale_y * pos_y)
+    store32(buf + pos + 36, 0xF0800F00);   # image_sample v[0:3], v[4:5], s[0:7], s[8:11] dmask:0xf (w0)
+    store32(buf + pos + 40, 0x00400004);   # image_sample (w1)
+    store32(buf + pos + 44, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(buf + pos + 48, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    store32(buf + pos + 52, 0x03020100);   # exp (w1)
+    store32(buf + pos + 56, 0xBF810000);   # s_endpgm
     var i = 0;
     while (i < 16) {
-        store32(buf + pos + 52 + i * 4, 0xBF800000);   # s_nop 0
+        store32(buf + pos + 60 + i * 4, 0xBF800000);   # s_nop 0
         i = i + 1;
     }
-    return pos + 112;
+    return pos + 124;
 }
 
-var GFX9_FS_TEXTURED_SAMPLE_SIZE = 112;
+var GFX9_FS_TEXTURED_SAMPLE_SIZE = 124;
 
 # ================================================================
 # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
@@ -8497,6 +8520,12 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1, epitch);
     native_gfx9_sampler_descriptor(daddr, 32,
     NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);   # unnormalized (image_sample FS)
+    # v3.2 TS.8 — scale_x/scale_y (f32, descriptor+48/+52) the FS multiplies the
+    # fragment position by. Default 1.0 (= equal-dims, fragment==texel); the draw
+    # overwrites per-draw from tex_dim/rt_dim. Defaulting to 1.0 (not the memset 0)
+    # means a sample without a draw-write reads coord==pos, never coord*0.
+    store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
+    store32(daddr + 52, 0x3F800000);   # scale_y = 1.0f
 
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
@@ -8910,6 +8939,17 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (bound_tex != 0) {
         var desc_va = native_tex_t_va(bound_tex);
         tex_handle = load64(bound_tex + NATIVE_TEX_FIELD_HANDLE);
+        # v3.2 TS.8 — write the per-draw scale (f32) into the descriptor tail the
+        # FS s_loads (+48/+52). TS.8a plumbs it at the equal-dims literal 1.0
+        # (bit-exact: 1.0*pos == pos, so the BC/RGBA8 RT[x,y]==texel oracle holds);
+        # genuine tex_dim/rt_dim scaling for filtered blits lands in TS.8b. Written
+        # UNCONDITIONALLY so the FS never reads a stale tail; the IB-head
+        # ACQUIRE_MEM invalidate makes the TA see the fresh bytes.
+        var dcpu = native_tex_desc_cpu_addr(bound_tex);
+        if (dcpu != 0) {
+            store32(dcpu + 48, 0x3F800000);   # scale_x = 1.0f
+            store32(dcpu + 52, 0x3F800000);   # scale_y = 1.0f
+        }
         pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
         GFX9_GFX_PGM_RSRC1_MIN | 1);
         pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
@@ -9380,6 +9420,14 @@ fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE);
 fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
 fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
 fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
+# v3.2 TS.8 — CPU (mmap'd) address of the descriptor tail (T#/S#/scale BO), for
+# draw-time writes into +48/+52. The descriptor sits at the same offset in the BO
+# as t_va is past va, so addr + (t_va - va) is its CPU address. 0 if not sampleable.
+fn native_tex_desc_cpu_addr(tex): i64 {
+    if (native_tex_t_va(tex) == 0) { return 0; }
+    return load64(tex + NATIVE_TEX_FIELD_ADDR)
+    + (native_tex_t_va(tex) - load64(tex + NATIVE_TEX_FIELD_VA));
+}
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.

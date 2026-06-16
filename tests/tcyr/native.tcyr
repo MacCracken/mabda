@@ -1077,6 +1077,23 @@ fn test_native_texture_create_2d_fmt_guards() {
 # v3.2 TS.8 — native sample-format capability: the per-format SoT
 # (native_texfmt_sampleable, handles BC6H) + the family-granular consumer
 # advisory (gpu_caps_native_texture_compression, parity with the wgpu detector).
+# v3.2 TS.8 — descriptor-tail CPU address: addr + (t_va - va), or 0 if not
+# sampleable (t_va == 0). The draw writes the per-draw scale there (+48/+52).
+fn test_native_tex_desc_cpu_addr() {
+    var tex[64];
+    memset(&tex, 0, 64);
+    # Not sampleable (t_va == 0) -> 0.
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, 0x4000);
+    store64(&tex + NATIVE_TEX_FIELD_VA,   0xFFFF800180000000);
+    assert_eq(native_tex_desc_cpu_addr(&tex), 0, "t_va==0 -> 0 (not sampleable)");
+    # Sampleable: descriptor sits at the same BO offset past addr as t_va past va.
+    # desc_off = 0x10000 -> t_va = va + 0x10000, cpu = addr + 0x10000.
+    store64(&tex + NATIVE_TEX_FIELD_T_VA, 0xFFFF800180010000);
+    assert_eq(native_tex_desc_cpu_addr(&tex), 0x4000 + 0x10000,
+    "cpu = addr + (t_va - va)");
+    return 0;
+}
+
 fn test_native_texfmt_sampleable() {
     assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_RGBA8), 1, "RGBA8 sampleable");
     assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC1),  1, "BC1 sampleable");
@@ -2331,29 +2348,35 @@ fn test_gfx9_fs_solid_red_byte_pattern() {
 # via llvm-mc -mcpu=gfx90c; pinned here so a refactor can't silently change
 # the ISA (the EXP/COL_FORMAT class of bug). HW exercise is TS.5.
 fn test_gfx9_fs_textured_load_byte_pattern() {
-    var buf[108];
-    memset(&buf, 0xCC, 108);
+    var buf[124];
+    memset(&buf, 0xCC, 124);
     var pos = native_gfx9_shader_textured_load_fs(&buf, 0);
-    assert_eq(pos, GFX9_FS_TEXTURED_LOAD_SIZE, "textured FS writes 108 bytes");
-    assert_eq(GFX9_FS_TEXTURED_LOAD_SIZE, 108, "FS size constant");
+    assert_eq(pos, GFX9_FS_TEXTURED_LOAD_SIZE, "textured FS writes 124 bytes");
+    assert_eq(GFX9_FS_TEXTURED_LOAD_SIZE, 124, "FS size constant");
     # s_load_dwordx8 s[0:7], s[0:1], 0x0 — load the T# from the descriptor BO.
     assert_eq(load32(&buf +  0), 0xC00E0000, "s_load_dwordx8 word 0");
     assert_eq(load32(&buf +  4), 0x00000000, "s_load_dwordx8 word 1");
-    assert_eq(load32(&buf +  8), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
-    # screen pos (v2,v3) -> integer texel coords (v4,v5).
-    assert_eq(load32(&buf + 12), 0x7E081102, "v_cvt_i32_f32 v4, v2");
-    assert_eq(load32(&buf + 16), 0x7E0A1103, "v_cvt_i32_f32 v5, v3");
+    # v3.2 TS.8 — s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale_x/y @ descriptor+48).
+    assert_eq(load32(&buf +  8), 0xC0060300, "s_load_dwordx2 scale w0");
+    assert_eq(load32(&buf + 12), 0x00000030, "s_load_dwordx2 offset 0x30 (+48)");
+    assert_eq(load32(&buf + 16), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    # pos *= scale (v_mul reads the scale SGPR as src0).
+    assert_eq(load32(&buf + 20), 0x0A04040C, "v_mul_f32 v2, s12, v2 (pos_x*scale_x)");
+    assert_eq(load32(&buf + 24), 0x0A06060D, "v_mul_f32 v3, s13, v3 (pos_y*scale_y)");
+    # scaled screen pos (v2,v3) -> integer texel coords (v4,v5).
+    assert_eq(load32(&buf + 28), 0x7E081102, "v_cvt_i32_f32 v4, v2");
+    assert_eq(load32(&buf + 32), 0x7E0A1103, "v_cvt_i32_f32 v5, v3");
     # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (MIMG, 2 dwords).
-    assert_eq(load32(&buf + 20), 0xF0001F00, "image_load word 0 (dmask 0xf unorm)");
-    assert_eq(load32(&buf + 24), 0x00000004, "image_load word 1 (vaddr v4, srsrc s[0:7])");
-    assert_eq(load32(&buf + 28), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 36), 0xF0001F00, "image_load word 0 (dmask 0xf unorm)");
+    assert_eq(load32(&buf + 40), 0x00000004, "image_load word 1 (vaddr v4, srsrc s[0:7])");
+    assert_eq(load32(&buf + 44), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
     # exp mrt0 — identical EXP encoding to solid_red (the proven 0xC4 class).
-    assert_eq(load32(&buf + 32), 0xC400180F, "exp mrt0 done vm word 0");
-    assert_eq(load32(&buf + 36), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
-    assert_eq(load32(&buf + 40), 0xBF810000, "s_endpgm");
+    assert_eq(load32(&buf + 48), 0xC400180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 52), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
+    assert_eq(load32(&buf + 56), 0xBF810000, "s_endpgm");
     var i = 0;
     while (i < 16) {
-        assert_eq(load32(&buf + 44 + i * 4), 0xBF800000, "s_nop padding");
+        assert_eq(load32(&buf + 60 + i * 4), 0xBF800000, "s_nop padding");
         i = i + 1;
     }
     assert_eq(GFX9_SPI_PS_INPUT_TEXTURED, 0x302,
@@ -2367,27 +2390,31 @@ fn test_gfx9_fs_textured_load_byte_pattern() {
 # FS (2 user SGPRs), so the TS.5 draw override is reused unchanged. HW exercise
 # is TS.7c's BC1 sampling e2e.
 fn test_gfx9_fs_textured_sample_byte_pattern() {
-    var buf[112];
-    memset(&buf, 0xCC, 112);
+    var buf[124];
+    memset(&buf, 0xCC, 124);
     var pos = native_gfx9_shader_textured_sample_fs(&buf, 0);
-    assert_eq(pos, GFX9_FS_TEXTURED_SAMPLE_SIZE, "image_sample FS writes 112 bytes");
-    assert_eq(GFX9_FS_TEXTURED_SAMPLE_SIZE, 112, "size constant");
+    assert_eq(pos, GFX9_FS_TEXTURED_SAMPLE_SIZE, "image_sample FS writes 124 bytes");
+    assert_eq(GFX9_FS_TEXTURED_SAMPLE_SIZE, 124, "size constant");
     assert_eq(load32(&buf +  0), 0xC00A0200, "s_load_dwordx4 S# w0");
     assert_eq(load32(&buf +  4), 0x00000020, "s_load_dwordx4 offset 0x20");
     assert_eq(load32(&buf +  8), 0xC00E0000, "s_load_dwordx8 T# w0");
     assert_eq(load32(&buf + 12), 0x00000000, "s_load_dwordx8 w1");
-    assert_eq(load32(&buf + 16), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
-    assert_eq(load32(&buf + 20), 0x7E080302, "v_mov v4, v2 (coord x = pos_x)");
-    assert_eq(load32(&buf + 24), 0x7E0A0303, "v_mov v5, v3 (coord y = pos_y)");
-    assert_eq(load32(&buf + 28), 0xF0800F00, "image_sample word 0 (dmask 0xf)");
-    assert_eq(load32(&buf + 32), 0x00400004, "image_sample word 1 (T# s[0:7] S# s[8:11])");
-    assert_eq(load32(&buf + 36), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
-    assert_eq(load32(&buf + 40), 0xC400180F, "exp mrt0 done vm word 0");
-    assert_eq(load32(&buf + 44), 0x03020100, "exp vsrc0..3 = v0..v3");
-    assert_eq(load32(&buf + 48), 0xBF810000, "s_endpgm");
+    # v3.2 TS.8 — s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale @ descriptor+48).
+    assert_eq(load32(&buf + 16), 0xC0060300, "s_load_dwordx2 scale w0");
+    assert_eq(load32(&buf + 20), 0x00000030, "s_load_dwordx2 offset 0x30 (+48)");
+    assert_eq(load32(&buf + 24), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    # coord = scale * pos (v_mul reads the scale SGPR as src0; replaces the v_mov).
+    assert_eq(load32(&buf + 28), 0x0A08040C, "v_mul_f32 v4, s12, v2 (coord x)");
+    assert_eq(load32(&buf + 32), 0x0A0A060D, "v_mul_f32 v5, s13, v3 (coord y)");
+    assert_eq(load32(&buf + 36), 0xF0800F00, "image_sample word 0 (dmask 0xf)");
+    assert_eq(load32(&buf + 40), 0x00400004, "image_sample word 1 (T# s[0:7] S# s[8:11])");
+    assert_eq(load32(&buf + 44), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 48), 0xC400180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 52), 0x03020100, "exp vsrc0..3 = v0..v3");
+    assert_eq(load32(&buf + 56), 0xBF810000, "s_endpgm");
     var i = 0;
     while (i < 16) {
-        assert_eq(load32(&buf + 52 + i * 4), 0xBF800000, "s_nop padding");
+        assert_eq(load32(&buf + 60 + i * 4), 0xBF800000, "s_nop padding");
         i = i + 1;
     }
     return 0;
@@ -3298,6 +3325,7 @@ fn main() {
     test_native_queue_barrier_guards();
     test_native_queue_barrier_records_pending_wait();
     test_native_texture_create_2d_fmt_guards();
+    test_native_tex_desc_cpu_addr();
     test_native_texfmt_sampleable();
     test_native_texture_create_2d_sampleable_guards();
     test_native_texture_bind_for_sample();

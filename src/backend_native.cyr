@@ -1012,6 +1012,12 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1, epitch);
     native_gfx9_sampler_descriptor(daddr, 32,
     NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);   # unnormalized (image_sample FS)
+    # v3.2 TS.8 — scale_x/scale_y (f32, descriptor+48/+52) the FS multiplies the
+    # fragment position by. Default 1.0 (= equal-dims, fragment==texel); the draw
+    # overwrites per-draw from tex_dim/rt_dim. Defaulting to 1.0 (not the memset 0)
+    # means a sample without a draw-write reads coord==pos, never coord*0.
+    store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
+    store32(daddr + 52, 0x3F800000);   # scale_y = 1.0f
 
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
@@ -1425,6 +1431,17 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (bound_tex != 0) {
         var desc_va = native_tex_t_va(bound_tex);
         tex_handle = load64(bound_tex + NATIVE_TEX_FIELD_HANDLE);
+        # v3.2 TS.8 — write the per-draw scale (f32) into the descriptor tail the
+        # FS s_loads (+48/+52). TS.8a plumbs it at the equal-dims literal 1.0
+        # (bit-exact: 1.0*pos == pos, so the BC/RGBA8 RT[x,y]==texel oracle holds);
+        # genuine tex_dim/rt_dim scaling for filtered blits lands in TS.8b. Written
+        # UNCONDITIONALLY so the FS never reads a stale tail; the IB-head
+        # ACQUIRE_MEM invalidate makes the TA see the fresh bytes.
+        var dcpu = native_tex_desc_cpu_addr(bound_tex);
+        if (dcpu != 0) {
+            store32(dcpu + 48, 0x3F800000);   # scale_x = 1.0f
+            store32(dcpu + 52, 0x3F800000);   # scale_y = 1.0f
+        }
         pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
         GFX9_GFX_PGM_RSRC1_MIN | 1);
         pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
@@ -1895,6 +1912,14 @@ fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE);
 fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
 fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
 fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
+# v3.2 TS.8 — CPU (mmap'd) address of the descriptor tail (T#/S#/scale BO), for
+# draw-time writes into +48/+52. The descriptor sits at the same offset in the BO
+# as t_va is past va, so addr + (t_va - va) is its CPU address. 0 if not sampleable.
+fn native_tex_desc_cpu_addr(tex): i64 {
+    if (native_tex_t_va(tex) == 0) { return 0; }
+    return load64(tex + NATIVE_TEX_FIELD_ADDR)
+    + (native_tex_t_va(tex) - load64(tex + NATIVE_TEX_FIELD_VA));
+}
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.

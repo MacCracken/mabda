@@ -297,10 +297,25 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
       reports BC unsupported because native never builds a caps struct at all —
       wiring native caps is TS.8's "strike Phase T's storage-only limitation."
-- [~] **TS.8** — Bilinear (remaining); ETC2/ASTC **RESOLVED — HW-blocked on AMD**
-  (vulkaninfo: ETC2/ASTC=false, BC=true; cap correctly NOT flipped, see below);
-  native caps advertisement **done**; **strike Phase T's storage-only limitation**
-  (BC done; full from_context caps builder remaining); cut the TS minors. Details:
+- [~] **TS.8** — Bilinear: **TS.8a done** (scale plumbing, see below), TS.8b remaining;
+  ETC2/ASTC **RESOLVED — HW-blocked on AMD** (vulkaninfo: ETC2/ASTC=false, BC=true;
+  cap correctly NOT flipped, see below); native caps advertisement **done**;
+  **strike Phase T's storage-only limitation** (BC done; full from_context caps
+  builder remaining); cut the TS minors. Details:
+  - **Bilinear TS.8a done (scale plumbing @ scale=1.0, regression-only)** — both
+    textured FS builders (image_load + image_sample) now `s_load_dwordx2` a per-draw
+    scale (f32) from descriptor+48/+52 and `v_mul_f32` the fragment position before
+    sampling (llvm-mc-verified, byte-pinned). The draw writes the scale into the
+    descriptor tail unconditionally (TS.8a: literal 1.0); create defaults the tail
+    to 1.0. No ABI/draw-override change (s[12:13] fits MIN|1). HW-verified: BC1/3/4/
+    5/7 + RGBA8 sample e2es stay **pixel-exact** (scale 1.0 → coord==fragment).
+    `native_tex_desc_cpu_addr` helper added. **TS.8b remaining:** bind_for_sample
+    rebuilds the S# from the bound sampler (BILINEAR/POINT + addr); the draw computes
+    the real `tex_dim/rt_dim` scale (needs an f32 float-division asm helper — Cyrius
+    has only `f64_to_f32`, no int→f64/div); a `native_bilinear_sample_e2e` (small tex
+    over a larger RT, ±2 interior oracle + POINT-vs-BILINEAR discriminator). Per the
+    design workflow, unnormalized bilinear at texture EDGES is a documented precision
+    limitation (the normalized-UV path is the edge-faithful follow-on).
   - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
     (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
     consumer populates a native context's caps the same way:
