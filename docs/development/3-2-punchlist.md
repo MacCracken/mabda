@@ -289,11 +289,11 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
         (R,R,R,R)). BC4 → X,0,0,1, BC5 → X,Y,0,1; 4-channel formats stay identity.
         Caught by adding the BC4/BC5 sample probes — a real wrong-color bug fixed
         before it shipped.
-    - *Sample coverage:* BC1/BC3/BC4/BC5 are now ALL pixel-exact-verified on HW
-      (TS.8 added BC3 = BC1-RGB checker + per-block alpha endpoint, closing the
-      earlier residual). Only **BC7** (complex modes — a BC7 encoder is nontrivial)
-      rides the path on the family bet (tiling HW-verified, sample oracle a
-      follow-up). BC6H gated off (HDR float).
+    - *Sample coverage:* **BC1/BC3/BC4/BC5/BC7 are ALL pixel-exact-verified on HW**
+      (TS.8). BC7 uses a hand-encoded mode-6 block (single-partition RGBA, 7-bit
+      endpoints + P-bit, all-index-0 → endpoint0 exact). Every sampleable BC
+      format is now verified — no family-bet residual. BC6H is gated off (HDR
+      float vs RGBA8 RT).
     - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
       reports BC unsupported because native never builds a caps struct at all —
       wiring native caps is TS.8's "strike Phase T's storage-only limitation."
@@ -306,8 +306,8 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
     create+sample now works (review 2026-06-16). Populate native caps from
     `NATIVE_TEXCOMP_SUPPORTED` (+ texture limits) so the advisory and the create
     gate agree — part of striking the storage-only limitation.
-  - **BC7 sample oracle** (+ BC6H once an HDR RT path lands) — BC1/BC3/BC4/BC5
-    are now HW-sample-verified; BC7's complex-mode encoder is the remaining gap.
+  - **BC6H sample** once an HDR RT path lands (BC1/BC3/BC4/BC5/BC7 are all
+    HW-sample-verified; BC6H is the only BC format still gated, on HDR grounds).
 
 ---
 

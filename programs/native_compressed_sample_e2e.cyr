@@ -6,11 +6,11 @@
 # write path) finally meets the texture addressing unit — the absolute
 # correctness check the TS.6 round-trip (self-consistent bijection) could not give.
 #
-# Covers BC1 (RGB565 endpoints), BC3 (BC1-color + BC4-alpha block, 4-channel),
-# BC4 (1-channel red), and BC5 (2-channel RG) — spanning the channel-mapping
-# spectrum the per-format DST_SEL T# is responsible for: BC1/BC3 -> full RGBA,
-# BC4 -> (R,0,0,1), BC5 -> (R,G,0,1). (BC7's complex modes ride the same verified
-# UNORM path; a BC7 sample oracle is a follow-up. BC6H is gated off — HDR float.)
+# Covers BC1 (RGB565 endpoints), BC3 (BC1-color + BC4-alpha block), BC4 (1-channel
+# red), BC5 (2-channel RG), and BC7 (mode-6 RGBA, 7-bit endpoints + P-bit) —
+# spanning the channel-mapping spectrum the per-format DST_SEL T# is responsible
+# for: BC1/BC3/BC7 -> full RGBA, BC4 -> (R,0,0,1), BC5 -> (R,G,0,1). Every BC
+# sample format is now pixel-verified. (BC6H is gated off — HDR float vs RGBA8 RT.)
 #
 # Test data design (NO interpolation -> no TA-vs-CPU rounding ambiguity): every
 # texel uses an ENDPOINT index, never an interpolated one. In BC1 palette[0]/[1]
@@ -78,6 +78,29 @@ fn bc5_grn0(bx, by): i64 { return (by * 16 + bx) & 0xFF; }
 # --- BC3 (DXT5): BC1 color + a BC4-style alpha block. Per-block alpha endpoint. ---
 fn bc3_a0(bx, by): i64 { return (bx * 13 + by * 7 + 1) & 0xFF; }   # nonzero, per-block
 
+# --- BC7 mode 6 (single-partition RGBA, 7-bit endpoints + shared P-bit) ---
+# OR `nbits` of `value` into the 16-byte block at LSB-first bit offset `bit_off`.
+fn bc7_set_bits(blk, bit_off, value, nbits): i64 {
+    var i = 0;
+    while (i < nbits) {
+        if (((value >> i) & 1) != 0) {
+            var pos = bit_off + i;
+            var byte = pos / 8;
+            var b = pos & 7;
+            store8(blk + byte, load8(blk + byte) | (1 << b));
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+# Per-block 7-bit endpoint0 components (endpoint1 unused: all indices are 0). The
+# mode-6 channel value is (comp7 << 1) | P0; with P0=0 it is comp7 << 1 — an exact
+# 8-bit value (no further expansion), so the CPU oracle matches the TA bit-for-bit.
+fn bc7_r7(bx, by): i64 { return (bx * 8) & 0x7F; }
+fn bc7_g7(bx, by): i64 { return (by * 8) & 0x7F; }
+fn bc7_b7(bx, by): i64 { return 0x40; }
+fn bc7_a7(bx, by): i64 { return 0x7F; }
+
 # Expected RGBA8 for texel (x,y) of `fmt` (matches the block data filled below).
 fn want_texel(fmt, x, y): i64 {
     var bx = x / 4;
@@ -98,6 +121,13 @@ fn want_texel(fmt, x, y): i64 {
         var rgb = expand565(blk_c0(bx, by)) & 0x00FFFFFF;
         if (checker3 != 0) { rgb = expand565(blk_c1(bx, by)) & 0x00FFFFFF; }
         return rgb | ((bc3_a0(bx, by) & 0xFF) << 24);
+    }
+    if (fmt == MABDA_TEXFMT_BC7) {            # mode-6 endpoint0 = (comp7<<1)
+        var r = (bc7_r7(bx, by) << 1) & 0xFF;
+        var g = (bc7_g7(bx, by) << 1) & 0xFF;
+        var b = (bc7_b7(bx, by) << 1) & 0xFF;
+        var a = (bc7_a7(bx, by) << 1) & 0xFF;
+        return r | (g << 8) | (b << 16) | (a << 24);
     }
     return 0;
 }
@@ -150,6 +180,18 @@ fn fill_blocks(fmt, blocks, BX, BY): i64 {
                 store8(blk3 + 13, 0x11);
                 store8(blk3 + 14, 0x44);
                 store8(blk3 + 15, 0x11);
+            }
+            if (fmt == MABDA_TEXFMT_BC7) {
+                # mode 6, single partition, RGBA. All indices 0 -> endpoint0 every
+                # texel. Layout (LSB-first): mode[0:6]=0x40, R0@7 R1@14 G0@21 G1@28
+                # B0@35 B1@42 A0@49 A1@56 P0@63 P1@64 idx@65. endpoint1/P/idx = 0.
+                var blk7 = blocks + (by * BX + bx) * 16;
+                memset(blk7, 0, 16);
+                store8(blk7 + 0, 0x40);                 # mode-6 marker (bit 6)
+                bc7_set_bits(blk7,  7, bc7_r7(bx, by), 7);   # R0
+                bc7_set_bits(blk7, 21, bc7_g7(bx, by), 7);   # G0
+                bc7_set_bits(blk7, 35, bc7_b7(bx, by), 7);   # B0
+                bc7_set_bits(blk7, 49, bc7_a7(bx, by), 7);   # A0
             }
             bx = bx + 1;
         }
@@ -221,8 +263,8 @@ fn run_fmt(ctx, rt, samp, pipe, fmt, bb): i64 {
 fn main(): i64 {
     alloc_init();
     color_init();
-    print_cstr("mabda native COMPRESSED (BC1/BC3/BC4/BC5) sample e2e (v3.2 TS.8)\n");
-    print_cstr("-----------------------------------------------------------------\n");
+    print_cstr("mabda native COMPRESSED (BC1/BC3/BC4/BC5/BC7) sample e2e (v3.2 TS.8)\n");
+    print_cstr("---------------------------------------------------------------------\n");
 
     # Open the create gate ahead of / alongside the in-tree cap flip.
     NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
@@ -284,8 +326,12 @@ fn main(): i64 {
     var r3 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC3, 16);
     if (r3 != 0) { print_cstr("FAIL: BC3 sample\n"); return r3; }
     print_cstr("PASS: BC3 RT[x,y] == CPU decode (RGB + per-block alpha)\n");
+
+    var r7 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC7, 16);
+    if (r7 != 0) { print_cstr("FAIL: BC7 sample\n"); return r7; }
+    print_cstr("PASS: BC7 RT[x,y] == CPU decode (mode-6 RGBA endpoints)\n");
     var ms = (mono_ns() - t0) / 1000;
-    print_cstr("4 formats sampled+verified in "); print_i64(ms); print_cstr(" us\n");
+    print_cstr("5 formats sampled+verified in "); print_i64(ms); print_cstr(" us\n");
 
     gpu_render_pipeline_release(ctx, pipe);
     gpu_render_target_release(ctx, rt);
@@ -294,7 +340,7 @@ fn main(): i64 {
     native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
     native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
     gpu_context_release(ctx);
-    print_cstr("OK - native BC1/BC3/BC4/BC5 compressed sampling live on Cezanne\n");
+    print_cstr("OK - native BC1/BC3/BC4/BC5/BC7 compressed sampling live on Cezanne\n");
     return 0;
 }
 
