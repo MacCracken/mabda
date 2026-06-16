@@ -581,9 +581,9 @@ fn test_native_compute_dispatch_on_dma_queue_rejected() {
 fn test_native_gfx9_image_descriptor() {
     var buf[32];
     memset(&buf, 0, 32);
-    # RGBA8 2D, 256x256, LINEAR, single level, canonical-high VA.
+    # RGBA8 2D, 256x256, LINEAR, single level, canonical-high VA, epitch w-1.
     var end = native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
-    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1);
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 255);
     assert_eq(end, 32, "returns pos + 32");
     var w0 = load32(&buf + 0);
     var w1 = load32(&buf + 4);
@@ -611,19 +611,60 @@ fn test_native_gfx9_image_descriptor() {
     # BC1 swaps only the DATA_FORMAT field.
     memset(&buf, 0, 32);
     native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
-    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_LINEAR, 1);
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_LINEAR, 1, 255);
     assert_eq((load32(&buf + 4) >> 20) & 0x3F, 35, "BC1 DATA_FORMAT = 35");
+    # v3.2 TS.7c — BC1 256x256 SW_64KB_S tiled: W3 SW_MODE = 64KB_S(9), W4 PITCH
+    # = epitch (awb-1) for the tiled block pitch. 256x256 BC1 = 64x64 blocks,
+    # 8 B/block -> awb=align_up(64,128)=128, epitch=127. WIDTH/HEIGHT stay texels.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_64KB_S, 1, 127);
+    assert_eq((load32(&buf + 12) >> 20) & 0x1F, 9, "tiled W3 SW_MODE = 64KB_S(9)");
+    assert_eq((load32(&buf + 16) >> 13) & 0xFFFF, 127, "tiled W4 PITCH = epitch(127)");
+    assert_eq(load32(&buf + 8) & 0x3FFF, 255, "tiled W2 WIDTH = texels-1 (255)");
+    # v3.2 TS.7c-4 — per-component DST_SEL. BC1 (4-channel) keeps identity X/Y/Z/W;
+    # BC4 (1-channel R) -> X,0,0,1; BC5 (2-channel RG) -> X,Y,0,1. Else the TA
+    # broadcasts the present channel(s) to RGBA (HW-confirmed: BC4 gave (R,R,R,R)).
+    var w3bc1 = load32(&buf + 12);
+    assert_eq(w3bc1 & 0x7, 4, "BC1 DST_SEL_X = X(4)");
+    assert_eq((w3bc1 >> 9) & 0x7, 7, "BC1 DST_SEL_W = W(7) (4-channel identity)");
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_BC4, GFX9_SW_MODE_64KB_S, 1, 15);
+    var w3bc4 = load32(&buf + 12);
+    assert_eq(w3bc4 & 0x7, 4, "BC4 DST_SEL_X = X(4)");
+    assert_eq((w3bc4 >> 3) & 0x7, 0, "BC4 DST_SEL_Y = 0");
+    assert_eq((w3bc4 >> 6) & 0x7, 0, "BC4 DST_SEL_Z = 0");
+    assert_eq((w3bc4 >> 9) & 0x7, 1, "BC4 DST_SEL_W = 1");
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_BC5, GFX9_SW_MODE_64KB_S, 1, 15);
+    var w3bc5 = load32(&buf + 12);
+    assert_eq(w3bc5 & 0x7, 4, "BC5 DST_SEL_X = X(4)");
+    assert_eq((w3bc5 >> 3) & 0x7, 5, "BC5 DST_SEL_Y = Y(5)");
+    assert_eq((w3bc5 >> 6) & 0x7, 0, "BC5 DST_SEL_Z = 0");
+    assert_eq((w3bc5 >> 9) & 0x7, 1, "BC5 DST_SEL_W = 1");
+    # ETC2_RGB (3-channel): X,Y,Z identity, W forced SEL_1 (no alpha).
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_ETC2_RGB8, GFX9_SW_MODE_64KB_S, 1, 15);
+    var w3etc = load32(&buf + 12);
+    assert_eq(w3etc & 0x7, 4, "ETC2_RGB DST_SEL_X = X(4)");
+    assert_eq((w3etc >> 3) & 0x7, 5, "ETC2_RGB DST_SEL_Y = Y(5)");
+    assert_eq((w3etc >> 6) & 0x7, 6, "ETC2_RGB DST_SEL_Z = Z(6)");
+    assert_eq((w3etc >> 9) & 0x7, 1, "ETC2_RGB DST_SEL_W = 1 (no alpha)");
+    assert_eq((load32(&buf + 4) >> 20) & 0x3F, 24, "ETC2_RGB DATA_FORMAT = 24");
     # 4-level mip: LAST_LEVEL + MAX_MIP both = 3.
     memset(&buf, 0, 32);
     native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
-    64, 64, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 4);
+    64, 64, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 4, 63);
     assert_eq((load32(&buf + 12) >> 16) & 0xF, 3, "4-level LAST_LEVEL = 3");
     assert_eq((load32(&buf + 20) >> 28) & 0xF, 3, "4-level MAX_MIP = 3");
     # Rejections.
     assert_eq(native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
-    256, 256, 99, GFX9_SW_MODE_LINEAR, 1), 0 - 1, "unsupported fmt -> -1");
+    256, 256, 99, GFX9_SW_MODE_LINEAR, 1, 255), 0 - 1, "unsupported fmt -> -1");
     assert_eq(native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
-    0, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1), 0 - 1, "w<=0 -> -1");
+    0, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 0), 0 - 1, "w<=0 -> -1");
     return 0;
 }
 
@@ -658,7 +699,7 @@ fn test_native_gfx9_sampler_descriptor() {
     var buf[16];
     memset(&buf, 0, 16);
     var end = native_gfx9_sampler_descriptor(&buf, 0,
-    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 0);
     assert_eq(end, 16, "returns pos + 16");
     var w0 = load32(&buf + 0);
     var w1 = load32(&buf + 4);
@@ -668,6 +709,7 @@ fn test_native_gfx9_sampler_descriptor() {
     assert_eq(w0 & 0x7, 2, "CLAMP_X[0:2] = LAST_TEXEL(2)");
     assert_eq((w0 >> 3) & 0x7, 2, "CLAMP_Y[3:5] = 2");
     assert_eq((w0 >> 6) & 0x7, 2, "CLAMP_Z[6:8] = 2");
+    assert_eq((w0 >> 15) & 0x1, 0, "FORCE_UNNORMALIZED[15] = 0 (unnorm=0)");
     assert_eq((w0 >> 29) & 0x3, 0, "FILTER_MODE[29:30] = BLEND(0)");
     assert_eq(w1, 0xFFF000, "W1 MIN_LOD=0 MAX_LOD[12:23]=0xFFF");
     assert_eq(w2, 0, "point: XY_MAG/MIN_FILTER = POINT(0)");
@@ -675,19 +717,127 @@ fn test_native_gfx9_sampler_descriptor() {
     # bilinear + wrap: CLAMP -> WRAP(0), XY filters -> BILINEAR(1).
     memset(&buf, 0, 16);
     native_gfx9_sampler_descriptor(&buf, 0,
-    NATIVE_SAMP_FILTER_BILINEAR, NATIVE_SAMP_ADDR_WRAP);
+    NATIVE_SAMP_FILTER_BILINEAR, NATIVE_SAMP_ADDR_WRAP, 0);
     var b0 = load32(&buf + 0);
     var b2 = load32(&buf + 8);
     assert_eq(b0, 0, "wrap: CLAMP_X/Y/Z = WRAP(0)");
     assert_eq((b2 >> 20) & 0x3, 1, "XY_MAG_FILTER[20:21] = BILINEAR(1)");
     assert_eq((b2 >> 22) & 0x3, 1, "XY_MIN_FILTER[22:23] = BILINEAR(1)");
     assert_eq(b2, 0x500000, "bilinear W2");
+    # unnorm=1 sets FORCE_UNNORMALIZED[15] — the image_sample FS (TS.7) feeds
+    # the fragment position as a texel coord, so the S# must be unnormalized.
+    memset(&buf, 0, 16);
+    native_gfx9_sampler_descriptor(&buf, 0,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);
+    var u0 = load32(&buf + 0);
+    assert_eq((u0 >> 15) & 0x1, 1, "FORCE_UNNORMALIZED[15] = 1 (unnorm=1)");
+    assert_eq(u0, 0x8092, "unnorm W0 = base 0x92 | bit15");
     return 0;
 }
 
 # v3.2 X.8 — SDMA COPY_LINEAR chaining: split a copy across N <=4 MiB
 # packets with per-chunk VA offsets, and reject (return 0) a chain that
 # won't fit the IB. Pure byte-builder, fully CPU-checkable.
+# v3.2 TS.6 — SDMA COPY_TILED_SUB_WINDOW packet (linear<->tiled; HW applies the
+# swizzle). Bytes pinned vs Mesa ac_emit_sdma_copy_tiled_sub_window (SDMA_4_0).
+fn test_native_sdma_build_copy_tiled() {
+    var buf[56];
+    memset(&buf, 0, 56);
+    # BC1-ish: element_size=3 (8-byte block), swizzle=9, dim=1, epitch=15,
+    # 16x16 block extent, linear pitch 16 / slice 256, full-surface copy, L2T.
+    var n = native_sdma_build_copy_tiled(&buf, 0xFFFF800180000000, 0xFFFF800180100000,
+    3, 9, 1, 15, 16, 16, 16, 256, 16, 16, 0);
+    assert_eq(n, 56, "returns 56 (14 dwords)");
+    assert_eq(load32(&buf +  0), 0x501, "DW0 COPY/TILED_SUB_WINDOW (L2T)");
+    assert_eq(load32(&buf +  4), 0x80000000, "DW1 tiled va lo");
+    assert_eq(load32(&buf +  8), 0xFFFF8001, "DW2 tiled va hi");
+    assert_eq(load32(&buf + 12), 0, "DW3 tiled offset x|y");
+    assert_eq(load32(&buf + 16), 0xF0000, "DW4 (ext_w-1)<<16");
+    assert_eq(load32(&buf + 20), 0xF, "DW5 ext_h-1");
+    assert_eq(load32(&buf + 24), 0xF024B, "DW6 info elem|sw<<3|dim<<9|epitch<<16");
+    assert_eq(load32(&buf + 28), 0x80100000, "DW7 linear va lo");
+    assert_eq(load32(&buf + 32), 0xFFFF8001, "DW8 linear va hi");
+    assert_eq(load32(&buf + 36), 0, "DW9 linear offset x|y");
+    assert_eq(load32(&buf + 40), 0xF0000, "DW10 (lin_pitch-1)<<16");
+    assert_eq(load32(&buf + 44), 0xFF, "DW11 lin_slice_pitch-1");
+    assert_eq(load32(&buf + 48), 0xF000F, "DW12 (copy_w-1)|(copy_h-1)<<16");
+    assert_eq(load32(&buf + 52), 0, "DW13 copy_d-1");
+    # detile (T2L) sets DW0 bit 31.
+    memset(&buf, 0, 56);
+    native_sdma_build_copy_tiled(&buf, 0xFFFF800180000000, 0xFFFF800180100000,
+    3, 9, 1, 15, 16, 16, 16, 256, 16, 16, 1);
+    assert_eq(load32(&buf + 0), 0x80000501, "DW0 detile (T2L) sets bit 31");
+    return 0;
+}
+
+# v3.2 TS.7 — SW_64KB_S tiled geometry (block dims + aligned pitch/size).
+# Block dims pinned vs addrlib Block256_2d<<4.
+fn test_native_tiled_geometry() {
+    assert_eq(_native_log2(8), 3, "log2(8)=3");
+    assert_eq(_native_log2(16), 4, "log2(16)=4");
+    assert_eq(_native_log2(4), 2, "log2(4)=2");
+    assert_eq(native_tiled_block_w(3), 128, "BC1 (8B) block_w=128");
+    assert_eq(native_tiled_block_h(3), 64, "BC1 (8B) block_h=64");
+    assert_eq(native_tiled_block_w(2), 128, "RGBA8 (4B) block_w=128");
+    assert_eq(native_tiled_block_h(2), 128, "RGBA8 (4B) block_h=128");
+    assert_eq(native_tiled_block_w(4), 64, "BC7 (16B) block_w=64");
+    assert_eq(native_tiled_block_h(4), 64, "BC7 (16B) block_h=64");
+    var out[40];
+    # BC1 512x256 texels = 128x64 blocks (already block-aligned).
+    memset(&out, 0, 40);
+    native_tiled_geometry(&out, 8, 128, 64);
+    assert_eq(load64(&out +  0), 128, "BC1 block_w");
+    assert_eq(load64(&out +  8), 64,  "BC1 block_h");
+    assert_eq(load64(&out + 16), 128, "BC1 aligned_wb (epitch+1)");
+    assert_eq(load64(&out + 24), 64,  "BC1 aligned_hb");
+    assert_eq(load64(&out + 32), 65536, "BC1 size 64KB");
+    # Non-aligned width pads up to a block multiple + a bigger 64KB-aligned BO.
+    memset(&out, 0, 40);
+    native_tiled_geometry(&out, 8, 130, 64);
+    assert_eq(load64(&out + 16), 256, "BC1 130 blocks -> aligned 256");
+    assert_eq(load64(&out + 32), 131072, "BC1 padded size 128KB");
+    # RGBA8 64x64 pads to the 128x128 block.
+    memset(&out, 0, 40);
+    native_tiled_geometry(&out, 4, 64, 64);
+    assert_eq(load64(&out + 16), 128, "RGBA8 aligned_wb=128");
+    assert_eq(load64(&out + 24), 128, "RGBA8 aligned_hb=128");
+    assert_eq(load64(&out + 32), 65536, "RGBA8 size 64KB");
+    return 0;
+}
+
+# v3.2 TS.7c — native_tex_tiled_params maps a compressed (fmt,w,h) to its
+# SW_64KB_S tiled geometry in BLOCK units (wb/hb/awb/ahb/size + esize/bb).
+fn test_native_tex_tiled_params() {
+    var p[56];
+    # BC1 256x256 texels -> 64x64 blocks, 8 B/block, esize log2=3.
+    memset(&p, 0, 56);
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC1, 256, 256, &p), 0, "BC1 ok");
+    assert_eq(load64(&p +  0), 64,  "BC1 wb = 256/4");
+    assert_eq(load64(&p +  8), 64,  "BC1 hb = 256/4");
+    assert_eq(load64(&p + 16), 128, "BC1 awb = align(64,128)");
+    assert_eq(load64(&p + 24), 64,  "BC1 ahb = align(64,64)");
+    assert_eq(load64(&p + 32), 65536, "BC1 tiled_size = 64KB");
+    assert_eq(load64(&p + 40), 3,   "BC1 esize_log2 = log2(8)");
+    assert_eq(load64(&p + 48), 8,   "BC1 block_bytes = 8");
+    # BC7 128x128 texels -> 32x32 blocks, 16 B/block, esize log2=4.
+    memset(&p, 0, 56);
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC7, 128, 128, &p), 0, "BC7 ok");
+    assert_eq(load64(&p +  0), 32,  "BC7 wb = 128/4");
+    assert_eq(load64(&p + 16), 64,  "BC7 awb = align(32,64)");
+    assert_eq(load64(&p + 40), 4,   "BC7 esize_log2 = log2(16)");
+    assert_eq(load64(&p + 48), 16,  "BC7 block_bytes = 16");
+    # Non-block-multiple dims round up: BC1 130x66 -> 33x17 blocks.
+    memset(&p, 0, 56);
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC1, 130, 66, &p), 0, "BC1 odd ok");
+    assert_eq(load64(&p + 0), 33, "BC1 130 texels -> 33 blocks");
+    assert_eq(load64(&p + 8), 17, "BC1 66 texels -> 17 blocks");
+    # Uncompressed / invalid -> -1.
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_RGBA8, 64, 64, &p), 0 - 1,
+    "RGBA8 (uncompressed) -> -1");
+    assert_eq(native_tex_tiled_params(99, 64, 64, &p), 0 - 1, "bad fmt -> -1");
+    return 0;
+}
+
 fn test_native_sdma_build_copy_chained() {
     assert_eq(_NATIVE_SDMA_COPY_MAX_BYTES, 4194304, "per-packet cap = 4 MiB");
     var buf[128];
@@ -924,6 +1074,49 @@ fn test_native_texture_create_2d_fmt_guards() {
 # v3.2 TS.5 — sampleable create guards (all return before any ioctl; the real
 # surface+descriptor BO build + the T#/S# write are HW, exercised by the TS.5
 # e2e on Cezanne).
+# v3.2 TS.8 — native sample-format capability: the per-format SoT
+# (native_texfmt_sampleable, handles BC6H) + the family-granular consumer
+# advisory (gpu_caps_native_texture_compression, parity with the wgpu detector).
+# v3.2 TS.8 — descriptor-tail CPU address: addr + (t_va - va), or 0 if not
+# sampleable (t_va == 0). The draw writes the per-draw scale there (+48/+52).
+fn test_native_tex_desc_cpu_addr() {
+    var tex[64];
+    memset(&tex, 0, 64);
+    # Not sampleable (t_va == 0) -> 0.
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, 0x4000);
+    store64(&tex + NATIVE_TEX_FIELD_VA,   0xFFFF800180000000);
+    assert_eq(native_tex_desc_cpu_addr(&tex), 0, "t_va==0 -> 0 (not sampleable)");
+    # Sampleable: descriptor sits at the same BO offset past addr as t_va past va.
+    # desc_off = 0x10000 -> t_va = va + 0x10000, cpu = addr + 0x10000.
+    store64(&tex + NATIVE_TEX_FIELD_T_VA, 0xFFFF800180010000);
+    assert_eq(native_tex_desc_cpu_addr(&tex), 0x4000 + 0x10000,
+    "cpu = addr + (t_va - va)");
+    return 0;
+}
+
+fn test_native_texfmt_sampleable() {
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_RGBA8), 1, "RGBA8 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC1),  1, "BC1 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC3),  1, "BC3 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC4),  1, "BC4 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC5),  1, "BC5 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC7),  1, "BC7 sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC6H), 0, "BC6H NOT (HDR vs RGBA8 RT)");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ETC2_RGB8), 0, "ETC2 NOT (gated, TS.8)");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ASTC_4X4),  0, "ASTC NOT (gated, TS.8)");
+    assert_eq(native_texfmt_sampleable(99), 0, "unknown fmt NOT");
+    # Family-granular advisory + the populate-then-query flow (wgpu parity).
+    assert_eq(gpu_caps_native_texture_compression(), MABDA_TEXCOMP_BC,
+    "native advertises the BC family");
+    var c = gpu_caps_new();
+    gpu_caps_set_texture_compression(c, gpu_caps_native_texture_compression());
+    assert_eq(gpu_caps_supports_format(c, MABDA_TEXFMT_BC1), 1,
+    "caps(BC1)=supported after native populate (storage-only struck)");
+    assert_eq(gpu_caps_supports_format(c, MABDA_TEXFMT_ETC2_RGB8), 0,
+    "caps(ETC2)=unsupported on native");
+    return 0;
+}
+
 fn test_native_texture_create_2d_sampleable_guards() {
     assert_eq(_backend_native_texture_create_2d_sampleable(0, 64, 64, MABDA_TEXFMT_RGBA8),
     0, "null ctx -> 0");
@@ -937,10 +1130,22 @@ fn test_native_texture_create_2d_sampleable_guards() {
     0, "w>max -> 0");
     assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 64, 64, 99),
     0, "unsupported fmt -> 0");
-    # v3.2 TS.5 audit: native sampleable rejects compressed (linear-only until
-    # TS.7 tiling) — a BC1 sampleable would sample garbage, so refuse it.
-    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_BC1),
-    0, "compressed fmt -> 0 (TS.7)");
+    # v3.2 TS.7c-4: BC sampling is HW-verified, so the BC gate is OPEN; ETC2/ASTC
+    # stay gated until their own HW verify (TS.8). The create slot rejects an
+    # un-gated compressed family PRE-IOCTL (right reason — not a fake-fd failure),
+    # so these asserts hold with a zeroed ctx (the BO build is never reached).
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_BC, MABDA_TEXCOMP_BC,
+    "BC gate open (HW-verified on Cezanne)");
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_ETC2, 0, "ETC2 gate closed (TS.8)");
+    assert_eq(NATIVE_TEXCOMP_SUPPORTED & MABDA_TEXCOMP_ASTC, 0, "ASTC gate closed (TS.8)");
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_ETC2_RGB8),
+    0, "ETC2 rejected by caps gate (pre-ioctl, TS.8)");
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_ASTC_4X4),
+    0, "ASTC rejected by caps gate (pre-ioctl, TS.8)");
+    # BC6H is in the BC family (gate open) but is HDR-float — rejected pre-ioctl
+    # because the native sample path is RGBA8_UNORM only (would clamp HDR).
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx, 8, 8, MABDA_TEXFMT_BC6H),
+    0, "BC6H rejected (HDR float vs RGBA8 RT) even though BC gate open");
     return 0;
 }
 
@@ -968,6 +1173,47 @@ fn test_native_texture_bind_for_sample() {
     0, "binds -> 0");
     assert_eq(load64(&pass + NATIVE_PASS_FIELD_BOUND_TEX), &tex,
     "bound tex pointer stashed on the pass");
+    return 0;
+}
+
+# v3.2 TS.8b — bind_for_sample rebuilds the S# (descriptor +32) from the bound
+# sampler. POINT/CLAMP must rebuild BYTE-IDENTICALLY to the create-baked default
+# (regression-safety for the existing point-sample e2es); BILINEAR/WRAP flips the
+# filter + addr while keeping FORCE_UNNORMALIZED set.
+fn test_bind_for_sample_s_rebuild() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var pass[40];
+    memset(&pass, 0, 40);
+    var descbuf[64];
+    memset(&descbuf, 0, 64);
+    var tex[64];
+    memset(&tex, 0, 64);
+    # dcpu = addr + (t_va - va); va == t_va so the descriptor CPU addr == &descbuf.
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, &descbuf);
+    store64(&tex + NATIVE_TEX_FIELD_VA,   0x2000);
+    store64(&tex + NATIVE_TEX_FIELD_T_VA, 0x2000);
+    # Reference: the create-baked POINT/CLAMP unnormalized S#.
+    var want[16];
+    memset(&want, 0, 16);
+    native_gfx9_sampler_descriptor(&want, 0,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);
+    # Bind POINT/CLAMP -> S# at descbuf+32 byte-identical to the default.
+    var sp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    assert_eq(_backend_native_texture_bind_for_sample(ctx, &pass, &tex, sp), 0, "bind point");
+    assert_eq(load32(&descbuf + 32), load32(&want +  0), "S# W0 point/clamp identical");
+    assert_eq(load32(&descbuf + 36), load32(&want +  4), "S# W1 identical");
+    assert_eq(load32(&descbuf + 40), load32(&want +  8), "S# W2 identical");
+    assert_eq(load32(&descbuf + 44), load32(&want + 12), "S# W3 identical");
+    # Bind BILINEAR/WRAP -> filter + addr change, FORCE_UNNORMALIZED stays set.
+    var sb = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_BILINEAR, NATIVE_SAMP_ADDR_WRAP);
+    assert_eq(_backend_native_texture_bind_for_sample(ctx, &pass, &tex, sb), 0, "bind bilinear");
+    var w0 = load32(&descbuf + 32);
+    var w2 = load32(&descbuf + 40);
+    assert_eq(w0 & 0x7, 0, "bilinear/wrap: CLAMP_X = WRAP(0)");
+    assert_eq((w0 >> 15) & 1, 1, "FORCE_UNNORMALIZED still set");
+    assert_eq((w2 >> 20) & 0x3, 1, "XY_MAG_FILTER = BILINEAR(1)");
+    assert_eq((w2 >> 22) & 0x3, 1, "XY_MIN_FILTER = BILINEAR(1)");
     return 0;
 }
 
@@ -1544,8 +1790,8 @@ fn test_backend_native_texture_write_memcpy_round_trip() {
     memset(ctx, 0, 112);
     var pixels[16];
     memset(&pixels, 0, 16);
-    var tex[32];
-    memset(&tex, 0, 32);
+    var tex[64];
+    memset(&tex, 0, 64);   # sw_mode (+48) zeroed = LINEAR (memcpy path)
     store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);  # non-zero so it doesn't look uninitialised
     store64(&tex + NATIVE_TEX_FIELD_ADDR,   &pixels);
     store64(&tex + NATIVE_TEX_FIELD_SIZE,   16);
@@ -1569,6 +1815,105 @@ fn test_backend_native_texture_write_memcpy_round_trip() {
         assert_eq(load8(&dst + k), k + 1, "dst byte matches pixel");
         k = k + 1;
     }
+    return 0;
+}
+
+# v3.2 TS.7c-3 — a SW_64KB_S tiled (compressed) texture ROUTES write/read through
+# the L2T/T2L SDMA path, NOT the linear memcpy. With a zeroed (fd=0) ctx the
+# staging-BO ioctl fails, so a tiled write/read returns a non-zero error (never a
+# silent memcpy success). A LINEAR tex with the same addr/size still memcpys,
+# proving the route keys only off sw_mode.
+fn test_backend_native_texture_write_tiled_routes() {
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    var pixels[16];
+    memset(&pixels, 0, 16);
+    var tex[64];
+    memset(&tex, 0, 64);
+    store64(&tex + NATIVE_TEX_FIELD_HANDLE, 1);
+    store64(&tex + NATIVE_TEX_FIELD_ADDR,   &pixels);
+    # BC1 8x8 -> 2x2 blocks x 8 B = 32 logical bytes; tiled.
+    store32(&tex + NATIVE_TEX_FIELD_FMT,    MABDA_TEXFMT_BC1);
+    store32(&tex + NATIVE_TEX_FIELD_WIDTH,  8);
+    store32(&tex + NATIVE_TEX_FIELD_HEIGHT, 8);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE,   32);
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_64KB_S);   # tiled
+    var src[32];
+    memset(&src, 0, 32);
+    var dst[32];
+    memset(&dst, 0, 32);
+    assert(_backend_native_texture_write(ctx, &tex, &src, 32) != 0,
+    "tiled write routes to SDMA (no silent memcpy)");
+    assert(_backend_native_texture_read(ctx, &tex, &dst, 32) != 0,
+    "tiled read routes to SDMA");
+    # The tiled path never writes to the linear addr (no swizzled garbage left).
+    var i = 0;
+    while (i < 16) { assert_eq(load8(&pixels + i), 0, "tiled write left addr untouched"); i = i + 1; }
+    # Same struct, LINEAR -> memcpy succeeds (route is sw_mode-keyed).
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_LINEAR);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE, 16);
+    assert_eq(_backend_native_texture_write(ctx, &tex, &src, 16), 0, "linear write ok");
+    assert_eq(_backend_native_texture_read(ctx, &tex, &dst, 16), 0, "linear read ok");
+    return 0;
+}
+
+# v3.2 TS.7c-3 — _native_texture_tiled_copy pre-ioctl validation: an uncompressed
+# fmt (no tiled geometry) rejects with GPU_ERR_TEXTURE, and an n that doesn't match
+# the logical block footprint rejects with GPU_ERR_BUFFER — both BEFORE any BO/ioctl.
+fn test_native_texture_tiled_copy_validation() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    var host[64];
+    memset(&host, 0, 64);
+    var tex[64];
+    memset(&tex, 0, 64);
+    store32(&tex + NATIVE_TEX_FIELD_WIDTH,  8);
+    store32(&tex + NATIVE_TEX_FIELD_HEIGHT, 8);
+    # Uncompressed (RGBA8): native_tex_tiled_params fails -> GPU_ERR_TEXTURE.
+    store32(&tex + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_RGBA8);
+    assert_eq(_native_texture_tiled_copy(&ctx, &tex, &host, 256, 0), GPU_ERR_TEXTURE,
+    "uncompressed fmt -> GPU_ERR_TEXTURE (pre-ioctl)");
+    # BC1 8x8 logical = 32; an n != 32 rejects with GPU_ERR_BUFFER (pre-ioctl).
+    store32(&tex + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_BC1);
+    assert_eq(_native_texture_tiled_copy(&ctx, &tex, &host, 16, 0), GPU_ERR_BUFFER,
+    "n mismatch -> GPU_ERR_BUFFER (pre-ioctl)");
+    return 0;
+}
+
+# v3.2 TS.7c-3 — native_tex_build_tiled_copy_packet: the COPY_TILED packet the
+# tiled write/read submits. CRITICAL (review HIGH): epitch MUST be awb-1 (the
+# tile-ALIGNED block pitch), NOT wb-1 (unaligned block count), so the SDMA-tiled
+# layout matches the T#. BC1 256x256 texels = 64 blocks, awb=128 -> epitch=127
+# (NOT 63). Exercises a non-block_w-aligned surface where awb != wb.
+fn test_native_tex_build_tiled_copy_packet() {
+    var tex[64];
+    memset(&tex, 0, 64);
+    store32(&tex + NATIVE_TEX_FIELD_FMT,    MABDA_TEXFMT_BC1);
+    store32(&tex + NATIVE_TEX_FIELD_WIDTH,  256);
+    store32(&tex + NATIVE_TEX_FIELD_HEIGHT, 256);
+    store64(&tex + NATIVE_TEX_FIELD_VA,     0xFFFF800180000000);
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_64KB_S);
+    var pkt[56];
+    memset(&pkt, 0, 56);
+    var n = native_tex_build_tiled_copy_packet(&pkt, &tex, 0xFFFF800200000000, 0);
+    assert_eq(n, 56, "COPY_TILED packet = 56 bytes");
+    # info dword (offset 24): element_size[0:2] | swizzle[3:7] | dim[9:11] | epitch[16:31].
+    var info = load32(&pkt + 24);
+    assert_eq(info & 0x7, 3, "BC1 element_size = log2(8) = 3");
+    assert_eq((info >> 3) & 0x1F, 9, "swizzle_mode = SW_64KB_S(9)");
+    assert_eq((info >> 9) & 0x7, 1, "dim = 2D(1)");
+    assert_eq((info >> 16) & 0xFFFF, 127, "epitch = awb-1 = 127 (NOT wb-1=63)");
+    # tiled VA in words 1/2.
+    assert_eq(load32(&pkt + 4), 0x80000000, "tiled_va lo");
+    # detile flag in header bit 31: 0 for L2T, 1 for T2L.
+    assert_eq((load32(&pkt + 0) >> 31) & 1, 0, "L2T header (detile=0)");
+    var n2 = native_tex_build_tiled_copy_packet(&pkt, &tex, 0xFFFF800200000000, 1);
+    assert_eq(n2, 56, "T2L packet = 56 bytes");
+    assert_eq((load32(&pkt + 0) >> 31) & 1, 1, "T2L header (detile=1)");
+    # Uncompressed fmt -> -1 (no tiled packet).
+    store32(&tex + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_RGBA8);
+    assert_eq(native_tex_build_tiled_copy_packet(&pkt, &tex, 0, 0), 0 - 1,
+    "uncompressed -> -1");
     return 0;
 }
 
@@ -2044,33 +2389,75 @@ fn test_gfx9_fs_solid_red_byte_pattern() {
 # via llvm-mc -mcpu=gfx90c; pinned here so a refactor can't silently change
 # the ISA (the EXP/COL_FORMAT class of bug). HW exercise is TS.5.
 fn test_gfx9_fs_textured_load_byte_pattern() {
-    var buf[108];
-    memset(&buf, 0xCC, 108);
+    var buf[124];
+    memset(&buf, 0xCC, 124);
     var pos = native_gfx9_shader_textured_load_fs(&buf, 0);
-    assert_eq(pos, GFX9_FS_TEXTURED_LOAD_SIZE, "textured FS writes 108 bytes");
-    assert_eq(GFX9_FS_TEXTURED_LOAD_SIZE, 108, "FS size constant");
+    assert_eq(pos, GFX9_FS_TEXTURED_LOAD_SIZE, "textured FS writes 124 bytes");
+    assert_eq(GFX9_FS_TEXTURED_LOAD_SIZE, 124, "FS size constant");
     # s_load_dwordx8 s[0:7], s[0:1], 0x0 — load the T# from the descriptor BO.
     assert_eq(load32(&buf +  0), 0xC00E0000, "s_load_dwordx8 word 0");
     assert_eq(load32(&buf +  4), 0x00000000, "s_load_dwordx8 word 1");
-    assert_eq(load32(&buf +  8), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
-    # screen pos (v2,v3) -> integer texel coords (v4,v5).
-    assert_eq(load32(&buf + 12), 0x7E081102, "v_cvt_i32_f32 v4, v2");
-    assert_eq(load32(&buf + 16), 0x7E0A1103, "v_cvt_i32_f32 v5, v3");
+    # v3.2 TS.8 — s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale_x/y @ descriptor+48).
+    assert_eq(load32(&buf +  8), 0xC0060300, "s_load_dwordx2 scale w0");
+    assert_eq(load32(&buf + 12), 0x00000030, "s_load_dwordx2 offset 0x30 (+48)");
+    assert_eq(load32(&buf + 16), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    # pos *= scale (v_mul reads the scale SGPR as src0).
+    assert_eq(load32(&buf + 20), 0x0A04040C, "v_mul_f32 v2, s12, v2 (pos_x*scale_x)");
+    assert_eq(load32(&buf + 24), 0x0A06060D, "v_mul_f32 v3, s13, v3 (pos_y*scale_y)");
+    # scaled screen pos (v2,v3) -> integer texel coords (v4,v5).
+    assert_eq(load32(&buf + 28), 0x7E081102, "v_cvt_i32_f32 v4, v2");
+    assert_eq(load32(&buf + 32), 0x7E0A1103, "v_cvt_i32_f32 v5, v3");
     # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (MIMG, 2 dwords).
-    assert_eq(load32(&buf + 20), 0xF0001F00, "image_load word 0 (dmask 0xf unorm)");
-    assert_eq(load32(&buf + 24), 0x00000004, "image_load word 1 (vaddr v4, srsrc s[0:7])");
-    assert_eq(load32(&buf + 28), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 36), 0xF0001F00, "image_load word 0 (dmask 0xf unorm)");
+    assert_eq(load32(&buf + 40), 0x00000004, "image_load word 1 (vaddr v4, srsrc s[0:7])");
+    assert_eq(load32(&buf + 44), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
     # exp mrt0 — identical EXP encoding to solid_red (the proven 0xC4 class).
-    assert_eq(load32(&buf + 32), 0xC400180F, "exp mrt0 done vm word 0");
-    assert_eq(load32(&buf + 36), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
-    assert_eq(load32(&buf + 40), 0xBF810000, "s_endpgm");
+    assert_eq(load32(&buf + 48), 0xC400180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 52), 0x03020100, "exp mrt0 vsrc0..3 = v0..v3");
+    assert_eq(load32(&buf + 56), 0xBF810000, "s_endpgm");
     var i = 0;
     while (i < 16) {
-        assert_eq(load32(&buf + 44 + i * 4), 0xBF800000, "s_nop padding");
+        assert_eq(load32(&buf + 60 + i * 4), 0xBF800000, "s_nop padding");
         i = i + 1;
     }
     assert_eq(GFX9_SPI_PS_INPUT_TEXTURED, 0x302,
     "SPI_PS_INPUT = PERSP_CENTER|POS_X|POS_Y");
+    return 0;
+}
+
+# v3.2 TS.7 — image_sample (BC-decoding) FS. llvm-mc-assembled + round-tripped;
+# byte-pinned. The S# is FORCE_UNNORMALIZED, so the FS feeds the fragment
+# position straight to image_sample (no UV divide) — ABI matches the image_load
+# FS (2 user SGPRs), so the TS.5 draw override is reused unchanged. HW exercise
+# is TS.7c's BC1 sampling e2e.
+fn test_gfx9_fs_textured_sample_byte_pattern() {
+    var buf[124];
+    memset(&buf, 0xCC, 124);
+    var pos = native_gfx9_shader_textured_sample_fs(&buf, 0);
+    assert_eq(pos, GFX9_FS_TEXTURED_SAMPLE_SIZE, "image_sample FS writes 124 bytes");
+    assert_eq(GFX9_FS_TEXTURED_SAMPLE_SIZE, 124, "size constant");
+    assert_eq(load32(&buf +  0), 0xC00A0200, "s_load_dwordx4 S# w0");
+    assert_eq(load32(&buf +  4), 0x00000020, "s_load_dwordx4 offset 0x20");
+    assert_eq(load32(&buf +  8), 0xC00E0000, "s_load_dwordx8 T# w0");
+    assert_eq(load32(&buf + 12), 0x00000000, "s_load_dwordx8 w1");
+    # v3.2 TS.8 — s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale @ descriptor+48).
+    assert_eq(load32(&buf + 16), 0xC0060300, "s_load_dwordx2 scale w0");
+    assert_eq(load32(&buf + 20), 0x00000030, "s_load_dwordx2 offset 0x30 (+48)");
+    assert_eq(load32(&buf + 24), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    # coord = scale * pos (v_mul reads the scale SGPR as src0; replaces the v_mov).
+    assert_eq(load32(&buf + 28), 0x0A08040C, "v_mul_f32 v4, s12, v2 (coord x)");
+    assert_eq(load32(&buf + 32), 0x0A0A060D, "v_mul_f32 v5, s13, v3 (coord y)");
+    assert_eq(load32(&buf + 36), 0xF0800F00, "image_sample word 0 (dmask 0xf)");
+    assert_eq(load32(&buf + 40), 0x00400004, "image_sample word 1 (T# s[0:7] S# s[8:11])");
+    assert_eq(load32(&buf + 44), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 48), 0xC400180F, "exp mrt0 done vm word 0");
+    assert_eq(load32(&buf + 52), 0x03020100, "exp vsrc0..3 = v0..v3");
+    assert_eq(load32(&buf + 56), 0xBF810000, "s_endpgm");
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 60 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -2968,6 +3355,9 @@ fn main() {
     test_native_gfx9_image_descriptor();
     test_native_gfx9_texfmt_to_img_format();
     test_native_gfx9_sampler_descriptor();
+    test_native_sdma_build_copy_tiled();
+    test_native_tiled_geometry();
+    test_native_tex_tiled_params();
     test_native_sdma_build_copy_chained();
     test_native_transfer_copy_timeline_driver();
     test_native_buffer_copy_guards();
@@ -2976,8 +3366,11 @@ fn main() {
     test_native_queue_barrier_guards();
     test_native_queue_barrier_records_pending_wait();
     test_native_texture_create_2d_fmt_guards();
+    test_native_tex_desc_cpu_addr();
+    test_native_texfmt_sampleable();
     test_native_texture_create_2d_sampleable_guards();
     test_native_texture_bind_for_sample();
+    test_bind_for_sample_s_rebuild();
     test_native_buffer_create_release_guards();
     test_native_buffer_write_read_roundtrip();
     test_native_buffer_write_read_bounds();
@@ -3008,6 +3401,9 @@ fn main() {
     test_backend_native_texture_create_null_ctx_returns_zero();
     test_backend_native_texture_create_zero_dim_returns_zero();
     test_backend_native_texture_write_memcpy_round_trip();
+    test_backend_native_texture_write_tiled_routes();
+    test_native_texture_tiled_copy_validation();
+    test_native_tex_build_tiled_copy_packet();
     test_backend_native_texture_write_null_args_err();
     test_backend_native_texture_release_null_safe();
     test_cs_submit_rejects_unaligned_fence_offset();
@@ -3036,6 +3432,7 @@ fn main() {
     test_gfx9_fullscreen_triangle_vertex_count();
     test_gfx9_fs_solid_red_byte_pattern();
     test_gfx9_fs_textured_load_byte_pattern();
+    test_gfx9_fs_textured_sample_byte_pattern();
     test_gfx9_fs_solid_red_alignment();
     test_gfx9_vs_fullscreen_triangle_byte_pattern();
     test_gfx9_vs_fullscreen_triangle_alignment();

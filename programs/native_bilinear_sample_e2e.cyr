@@ -1,0 +1,174 @@
+# programs/native_bilinear_sample_e2e.cyr — v3.2 TS.8b
+#
+# Observable bilinear filtering on native AMD (Cezanne): sample a SMALL texture
+# over a LARGER render target so the per-draw scale (tex_dim/rt_dim < 1) makes the
+# fragment->texel coords FRACTIONAL, and prove the bound sampler's BILINEAR filter
+# blends while POINT does not. This exercises the full TS.8 path: bind_for_sample
+# rebuilds the S# from the sampler, the draw writes scale = int_ratio_to_f32(tex,
+# rt) into the descriptor tail, and the scaled FS multiplies the fragment position.
+#
+# Texture: 32x32 RGBA8 horizontal grayscale GRADIENT, texel (x,y) = (x*8, x*8,
+# x*8, 255) — adjacent columns differ by 8, so a POINT sample is always an exact
+# multiple of 8, while a BILINEAR blend of two adjacent columns lands BETWEEN
+# multiples of 8. RT 64x64, scale = 32/64 = 0.5 (exact f32) -> coord_x =
+# (rt_x+0.5)*0.5 is never on a texel center, so bilinear always blends.
+#
+# Convention-INDEPENDENT discriminator (avoids the unnormalized half-texel
+# precision question): scan RT row 32 —
+#   - POINT: every R is a multiple of 8 (exact texel) -> count(R%8 != 0) == 0.
+#   - BILINEAR: many R fall between multiples of 8 -> count(R%8 != 0) > 0.
+#   - Edges clamp the same for both (leftmost ~0, rightmost ~248).
+# This proves the BILINEAR filter reaches the TA + blends, without asserting an
+# exact (convention-dependent) blend weight. Exact interior weights + edge
+# fidelity for arbitrary scaling are the normalized-UV follow-on.
+#
+# Exit codes: 0 pass; 1 ctx; 2 vs; 3 fs; 4 tex; 5 upload; 6 rt; 7 pipe;
+#   8 point pass; 9 bilinear pass; 10 point not exact (has grays); 11 bilinear
+#   did not blend (no grays); 12 edge clamp wrong
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Run one pass: bind `tex` with `sampler`, draw, and snapshot RT row 32 (64 px)
+# into `out` (64 i64, the R byte of each pixel). Returns 0 | exit code.
+fn run_pass(ctx, rt, pipe, tex, sampler, out): i64 {
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, 64 * 64 * 4);
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return 8; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, sampler) != 0) {
+        gpu_render_pass_end(ctx, pass); return 9; }
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return 9; }
+    var x = 0;
+    while (x < 64) {
+        store64(out + x * 8, load32(rt_addr + (32 * 64 + x) * 4) & 0xFF);   # R byte
+        x = x + 1;
+    }
+    return 0;
+}
+
+fn count_grays(arr): i64 {
+    var n = 0;
+    var x = 0;
+    while (x < 64) {
+        var r = load64(arr + x * 8);
+        if ((r & 0x7) != 0) { n = n + 1; }   # R not a multiple of 8 -> a blend
+        x = x + 1;
+    }
+    return n;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native BILINEAR sample e2e (v3.2 TS.8b)\n");
+    print_cstr("---------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { print_cstr("FAIL: vs bo\n"); return 2; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n"); return 2; }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { print_cstr("FAIL: fs bo\n"); return 3; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    memset(fs_addr, 0, 4096);
+    native_gfx9_shader_textured_sample_fs(fs_addr, 0);
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n"); return 3; }
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+    print_cstr("PASS: VS + image_sample FS\n");
+
+    # 32x32 RGBA8 gradient: texel (x,y) = (x*8, x*8, x*8, 255).
+    var TW = 32;
+    var TH = 32;
+    var N = TW * TH * 4;
+    var tex = gpu_texture_create_2d_sampleable(ctx, TW, TH, MABDA_TEXFMT_RGBA8);
+    if (tex == 0) { print_cstr("FAIL: tex create\n"); return 4; }
+    var src = alloc(N);
+    var y = 0;
+    while (y < TH) {
+        var x = 0;
+        while (x < TW) {
+            var g = (x * 8) & 0xFF;
+            store32(src + (y * TW + x) * 4, g | (g << 8) | (g << 16) | (0xFF << 24));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (gpu_texture_write(ctx, tex, src, N) != 0) { print_cstr("FAIL: upload\n"); return 5; }
+    print_cstr("PASS: 32x32 gradient texture (R=x*8)\n");
+
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt == 0) { print_cstr("FAIL: rt\n"); return 6; }
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); return 7; }
+    print_cstr("PASS: RT 64x64 + pipeline (scale = 32/64 = 0.5)\n");
+
+    var row_point[512];      # 64 i64
+    var row_bilin[512];
+    var sp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    var rcp = run_pass(ctx, rt, pipe, tex, sp, &row_point);
+    if (rcp != 0) { print_cstr("FAIL: point pass\n"); return rcp; }
+    var sb = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_BILINEAR, NATIVE_SAMP_ADDR_CLAMP);
+    var rcb = run_pass(ctx, rt, pipe, tex, sb, &row_bilin);
+    if (rcb != 0) { print_cstr("FAIL: bilinear pass\n"); return rcb; }
+    print_cstr("PASS: drew POINT + BILINEAR passes\n");
+
+    var gp = count_grays(&row_point);
+    var gb = count_grays(&row_bilin);
+    print_cstr("row32 intermediates: POINT="); print_i64(gp);
+    print_cstr(" BILINEAR="); print_i64(gb); print_cstr("\n");
+
+    # POINT: exact texels -> every R a multiple of 8 -> zero intermediates.
+    if (gp != 0) { print_cstr("FAIL: POINT has grays (not exact texels)\n"); return 10; }
+    # BILINEAR: blends adjacent columns -> intermediates present.
+    if (gb == 0) { print_cstr("FAIL: BILINEAR did not blend (no grays)\n"); return 11; }
+
+    # Edge clamp (both filters): leftmost ~0, rightmost ~248 (texel 31).
+    if (load64(&row_point + 0) > 8)  { print_cstr("FAIL: point left edge\n"); return 12; }
+    if (load64(&row_bilin + 0) > 8)  { print_cstr("FAIL: bilinear left edge\n"); return 12; }
+    if (load64(&row_point + 63 * 8) < 240) { print_cstr("FAIL: point right edge\n"); return 12; }
+    if (load64(&row_bilin + 63 * 8) < 240) { print_cstr("FAIL: bilinear right edge\n"); return 12; }
+    print_cstr("PASS: POINT exact (0 grays) / BILINEAR blends / edges clamp\n");
+
+    gpu_texture_release(ctx, tex);
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    native_gem_va_unmap(fd, fs_handle, fs_va, 4096);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, 4096);
+    native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
+    gpu_context_release(ctx);
+    print_cstr("OK - native bilinear filtering live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

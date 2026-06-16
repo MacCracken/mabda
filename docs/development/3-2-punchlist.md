@@ -229,14 +229,131 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   asserts, struct/BACKEND_SIZE deltas); version-check OK; dist regen (embeds
   3.2.2) + idempotent; closeout green (suite 2702/0, 9 benches, 7 HW programs
   exit 0 on Cezanne incl. native+wgpu texture-sample). TS.6–8 → 3.2.3.
-- [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
-  remap; round-trip-identity + addrlib-reference CPU tests.
-- [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**
-  (`native_compressed_sample_e2e.cyr`, CPU-decode verify); flip native BC
-  cap bit to 1.
-- [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
-  HW decode verifies — see HW gaps); **strike Phase T's storage-only
-  limitation**; cut the TS minors.
+- [~] **TS.6** — Tile-swizzle for SW_64KB_S compressed surfaces.
+  **Approach (maintainer, 2026-06-15): "try SDMA HW tiling first"** — the GFX9
+  swizzle is config-dependent addrlib (no pattern table to transcribe), so
+  instead of a pure-Cyrius swizzle port, use an **SDMA `COPY_TILED_SUB_WINDOW`**
+  (sub-op 5) linear↔tiled copy and let the GPU apply the swizzle (write = L2T,
+  read = T2L). **Done this bite:** `native_sdma_build_copy_tiled` — the 14-dword
+  packet builder (transcribed from Mesa `ac_emit_sdma_copy_tiled_sub_window`,
+  SDMA_4_0; `info_dword = element_size | swizzle_mode<<3 | dim<<9 | epitch<<16`),
+  CPU-pinned. **SDMA-tiling mechanism PROVEN on Cezanne:**
+  `programs/native_sdma_tiled_roundtrip.cyr` — a linear→tiled→linear round-trip
+  (`ADDR_SW_64KB_S`=9, `RADEON_RESOURCE_2D`=1, 8-byte/BC1 element, 256×256)
+  comes back byte-identical, so the `COPY_TILED_SUB_WINDOW` packet is accepted
+  and the HW applies + reverses the swizzle. (Round-trip = self-consistency;
+  ABSOLUTE TA-match is TS.7's sampling test.) **Remaining → TS.7:** the
+  addrlib-exact tiled geometry (`epitch` + tiled BO size that the TA agrees
+  with) — confirmed at TS.7 by sampling the SDMA-tiled BC surface vs a CPU
+  decode.
+- [x] **TS.7** — **BC1/BC7 compressed sampling on Cezanne** (delivered in
+  sub-bites). **TS.7a done:** `native_gfx9_shader_textured_sample_fs` — the
+  `image_sample` (BC-decoding) FS (llvm-mc + byte-pinned + disasm round-trip).
+  **TS.7b done:** `native_tiled_geometry` — SW_64KB_S 2D block dims + aligned
+  pitch (epitch) + 64 KiB-aligned BO size, sourced from addrlib
+  (`Block256_2d`<<4 / `ComputeThinBlockDimension`; BC1 128×64, RGBA8 128×128,
+  BC7 64×64 blocks), CPU-pinned. **TS.7c-1 done:** switched the sample FS + the
+  default S# to **unnormalized** coords (S# `FORCE_UNNORMALIZED`); the FS now
+  feeds the fragment position straight to `image_sample` (no rcp / UV divide),
+  giving it the *same 2-user-SGPR ABI as the image_load FS* — so the TS.5 draw
+  override is reused unchanged (no per-format draw path). FS is 112 B;
+  `GFX9_PS_PGM_RSRC2_SAMPLE` removed. **TS.7c-2 done:** tiled
+  `create_sampleable` foundation — `native_gfx9_image_descriptor` gained an
+  explicit `epitch` param; `GFX9_SW_MODE_64KB_S`(9); `native_tex_tiled_params`
+  (compressed fmt → block geometry); the create compressed branch builds a
+  geometry-sized SW_64KB_S surface + BC T# (epitch = awb-1) + unnorm S#. A
+  native backend caps gate (`NATIVE_TEXCOMP_SUPPORTED`, =0) keeps compressed
+  `create` returning 0 (pre-ioctl) until write + HW verify land — no dead-end
+  resource; mirrors the wgpu backend caps guard. write/read reject a tiled tex
+  (`GPU_ERR_TEXTURE`) until TS.7c-3. **Remaining:**
+  - **TS.7c-3 done:** wired write(L2T)/read(T2L) via `native_tex_build_tiled_copy_packet`
+    + a transient staging BO + `_native_dma_submit_oneshot` on the DMA ring. epitch
+    is derived from `native_tex_tiled_params` (awb-1) — the SAME source as the T# —
+    so the SDMA layout and the T# can't drift. HW-verified by
+    `native_tiled_texture_roundtrip` (BC1 256×256 = 64 blocks, awb=128 → epitch=127,
+    a NON-block_w-aligned surface the TS.6 256-block probe couldn't catch).
+  - **TS.7c-4 done:** `native_compressed_sample_e2e.cyr` samples SW_64KB_S tiled
+    surfaces in the image_sample FS and matches a CPU decode **pixel-exact on
+    Cezanne** for **BC1 (RGB565 endpoints + within-block checker), BC4 (1-channel
+    → R,0,0,1), and BC5 (2-channel → R,G,0,1)** — spanning the channel-mapping
+    spectrum. The tiled round-trip also HW-verifies **BC7 (16-byte block)** tiling
+    alongside BC1 (8-byte). Flipped `NATIVE_TEXCOMP_SUPPORTED` → `MABDA_TEXCOMP_BC`.
+    **BC compressed sampling is live on native AMD.**
+    - **Review fixes (2026-06-16):**
+      - **BC6H rejected at create** — it is HDR unsigned-float (T# NUM_FORMAT=FLOAT)
+        but the native sample path only has an RGBA8_UNORM render target, which
+        clamps/quantizes HDR values → a silently-wrong decode. Gated off until an
+        HDR-capable RT path exists (the BC family bit otherwise admits it).
+      - **Per-component DST_SEL in the T#** — identity X/Y/Z/W broadcasts a 1-/2-
+        channel format's present channel(s) across RGBA (HW-confirmed: BC4 sampled
+        (R,R,R,R)). BC4 → X,0,0,1, BC5 → X,Y,0,1; 4-channel formats stay identity.
+        Caught by adding the BC4/BC5 sample probes — a real wrong-color bug fixed
+        before it shipped.
+    - *Sample coverage:* **BC1/BC3/BC4/BC5/BC7 are ALL pixel-exact-verified on HW**
+      (TS.8). BC7 uses a hand-encoded mode-6 block (single-partition RGBA, 7-bit
+      endpoints + P-bit, all-index-0 → endpoint0 exact). Every sampleable BC
+      format is now verified — no family-bet residual. BC6H is gated off (HDR
+      float vs RGBA8 RT).
+    - *Residual:* the native caps ADVISORY (`gpu_caps_supports_format`) still
+      reports BC unsupported because native never builds a caps struct at all —
+      wiring native caps is TS.8's "strike Phase T's storage-only limitation."
+- [~] **TS.8** — Bilinear **DONE** (TS.8a scale plumbing + TS.8b observable e2e,
+  HW-verified, see below); ETC2/ASTC **RESOLVED — HW-blocked on AMD** (vulkaninfo:
+  ETC2/ASTC=false, BC=true; cap correctly NOT flipped, see below); native caps
+  advertisement **done**; **strike Phase T's storage-only limitation** (BC done;
+  full from_context caps builder remaining); BC6H needs an HDR RT path. Remaining:
+  from_context caps builder, BC6H, then cut the TS minors. Details:
+  - **Bilinear TS.8a done (scale plumbing @ scale=1.0, regression-only)** — both
+    textured FS builders (image_load + image_sample) now `s_load_dwordx2` a per-draw
+    scale (f32) from descriptor+48/+52 and `v_mul_f32` the fragment position before
+    sampling (llvm-mc-verified, byte-pinned). The draw writes the scale into the
+    descriptor tail unconditionally (TS.8a: literal 1.0); create defaults the tail
+    to 1.0. No ABI/draw-override change (s[12:13] fits MIN|1). HW-verified: BC1/3/4/
+    5/7 + RGBA8 sample e2es stay **pixel-exact** (scale 1.0 → coord==fragment).
+    `native_tex_desc_cpu_addr` helper added. **TS.8b done (wiring):** (1) the
+    float shim `int_ratio_to_f32(num,den)` (inline SSE2, CPU-tested) since Cyrius
+    has no native float arithmetic — filed a toolchain proposal
+    (`cyrius/docs/development/proposals/2026-06-16-native-float-arithmetic.md`) to
+    replace it; (2) the draw now computes the REAL scale = `int_ratio_to_f32(tex_dim,
+    rt_dim)` (equal dims → exactly 1.0, so the existing e2es stay pixel-exact —
+    HW-re-verified); (3) `bind_for_sample` rebuilds the S# from the bound sampler
+    (BILINEAR/POINT + CLAMP/WRAP, unnorm kept) — POINT/CLAMP rebuilds byte-identical
+    to the create default (regression-safe, CPU-asserted). **TS.8b done
+    (observable):** `native_bilinear_sample_e2e` samples a 32×32 gradient texture
+    (R=x*8) over a 64×64 RT (scale 0.5 → fractional coords) with POINT then
+    BILINEAR. Convention-independent discriminator on RT row 32 — **POINT = 0
+    intermediates** (every R a multiple of 8, exact texels), **BILINEAR = 62
+    intermediates** (blends adjacent columns), edges clamp for both. **HW-verified
+    on Cezanne — native bilinear filtering is live.** EXACT interior weights + edge
+    fidelity for arbitrary unnormalized scaling are a documented precision
+    limitation; the edge-faithful normalized-UV path (UV-export VS + rcp FS) is the
+    follow-on — a convention refinement, not missing functionality.
+    **Bilinear/scaled sampling (TS.8) is complete.**
+  - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
+    (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
+    consumer populates a native context's caps the same way:
+    `gpu_caps_set_texture_compression(caps, gpu_caps_native_texture_compression())`
+    then `gpu_caps_supports_format` — closing the storage-only gap (review
+    2026-06-16) to wgpu parity. The per-format truth (incl. the BC6H HDR exclusion
+    the family bitset can't express) lives in `native_texfmt_sampleable(fmt)`, the
+    single source of truth the create gate also uses. A full backend-abstracted
+    `from_context` caps builder (texture limits etc.) is the remaining storage-only
+    cleanup.
+  - **BC6H sample** once an HDR RT path lands (BC1/BC3/BC4/BC5/BC7 are all
+    HW-sample-verified; BC6H is the only BC format still gated, on HDR grounds).
+  - **ETC2/ASTC — CONFIRMED HW-blocked on AMD; cap stays OFF (final).** A TS.8 HW
+    probe sampled an ETC2_RGB8 block via the proven image_sample path and got
+    uniform black, byte-order-insensitive (TA not decoding). Disambiguated against
+    the same AMD HW through Vulkan: **`vulkaninfo` reports `textureCompressionBC =
+    true`, `textureCompressionETC2 = false`, `textureCompressionASTC_LDR = false`**.
+    So AMD (Cezanne/gfx90c, and AMD desktop/APU generally) does NOT decode
+    ETC2/ASTC — the gfx9.json IMG_DATA_FORMAT enum has the values (24/25/46) but
+    the silicon/driver doesn't implement the decode. This was the right call to
+    flag, not a mabda bug. `NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC` is correct
+    and final for the AMD backend. The non-working probe was removed; the generic
+    per-format DST_SEL groundwork (ETC2_RGB 3-channel → W=SEL_1) + format-table
+    rows + CPU tests stay (correct descriptor-builder behavior, ready for any
+    future arch that does decode ETC2 — e.g. a v4 NVIDIA/Intel native backend).
 
 ---
 

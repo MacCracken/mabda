@@ -61,9 +61,18 @@ dwords_to_bytes \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
 
 echo
-echo "=== FS (textured_load, image_load oracle, 44 bytes instr; v3.2 TS.4) ==="
+echo "=== FS (textured_load, image_load + TS.8 scale, 60 bytes instr; v3.2 TS.4/TS.8) ==="
 dwords_to_bytes \
-    C00E0000 00000000 BF8CC07F 7E081102 7E0A1103 \
+    C00E0000 00000000 C0060300 00000030 BF8CC07F \
+    0A04040C 0A06060D 7E081102 7E0A1103 \
     F0001F00 00000004 BF8C0F70 C400180F 03020100 \
+    BF810000 \
+    | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+
+echo
+echo "=== FS (textured_sample, image_sample/BC + TS.8 scale, unnormalized S#, 60 bytes instr; v3.2 TS.7/TS.8) ==="
+dwords_to_bytes \
+    C00A0200 00000020 C00E0000 00000000 C0060300 00000030 BF8CC07F \
+    0A08040C 0A0A060D F0800F00 00400004 BF8C0F70 C400180F 03020100 \
     BF810000 \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c

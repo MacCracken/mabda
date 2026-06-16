@@ -892,19 +892,64 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     return tex;
 }
 
-# v3.2 TS.5 — sampleable 2D texture create (native). Differs from the storage
-# create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) + S#(16)], so
-# one handle covers both for CS residency and t_va points at the descriptor in
-# the BO tail. Builds the GFX9 T# (image resource, +0) + a default point/clamp
-# S# (sampler, +32); stashes t_va + sw_mode on the (64-byte) tex. The textured
-# FS (TS.4) s_load_dwordx8's the T# from t_va. RGBA8/LINEAR only — compressed
-# sampling (tiled SW_MODE + swizzle) is TS.7 and is rejected here until then.
+# v3.2 TS.7c — bitmask of texture-compression families native AMD can SAMPLE.
+# MABDA_TEXCOMP_BC: BC sampling is HW-verified on Cezanne (TS.7c-4 —
+# programs/native_compressed_sample_e2e samples a SW_64KB_S tiled BC1 surface in
+# an FS and matches a CPU decode pixel-exact, proving the full create -> L2T tiled
+# write -> image_sample path). ETC2/ASTC stay gated off until their own HW decode
+# verify (TS.8). The create slot rejects a compressed family not in this mask
+# (pre-ioctl) so a consumer never gets a sampleable texture it can't populate —
+# the native analog of the wgpu backend's adapter-family caps guard.
+var NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
+
+# v3.2 TS.8 — the single source of truth for "can native SAMPLE `fmt`", at
+# PER-FORMAT granularity (the family bitset alone can't express BC6H). 1 for
+# RGBA8 (always) + any BC format whose family is in NATIVE_TEXCOMP_SUPPORTED,
+# EXCEPT BC6H (HDR float — the native sample path only has an RGBA8_UNORM RT, so
+# it would clamp/quantize; gated until an HDR RT path exists). 0 for unsupported
+# compressed families (ETC2/ASTC) and unknown ids. The create slot gates on this;
+# consumers can call it to pre-check a format before create.
+fn native_texfmt_sampleable(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 1; }
+    var fam = mabda_texfmt_compression_family(fmt);
+    if (fam == 0) { return 0; }                            # unknown / non-sampleable id
+    if ((NATIVE_TEXCOMP_SUPPORTED & fam) == 0) { return 0; }   # family not supported
+    if (fmt == MABDA_TEXFMT_BC6H) { return 0; }            # HDR float vs RGBA8 RT
+    return 1;
+}
+
+# v3.2 TS.8 — native sibling of the wgpu gpu_caps_detect_texture_compression
+# (backend_wgpu.cyr): returns the compression-family bitset native AMD supports
+# for sampling, so a consumer building a native context's GpuCapabilities can
+# `gpu_caps_set_texture_compression(caps, gpu_caps_native_texture_compression())`
+# — the same populate-then-`gpu_caps_supports_format` flow as wgpu (closes the
+# native storage-only gap). FAMILY-granular like the caps bitset; the per-format
+# BC6H exclusion (see native_texfmt_sampleable) is finer than this advisory can
+# express, so a BC6H pre-check should use native_texfmt_sampleable.
+fn gpu_caps_native_texture_compression(): i64 {
+    return NATIVE_TEXCOMP_SUPPORTED;
+}
+
+# v3.2 TS.5/TS.7c — sampleable 2D texture create (native). Differs from the
+# storage create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) +
+# S#(16)], so one handle covers both for CS residency and t_va points at the
+# descriptor in the BO tail. Builds the GFX9 T# (image resource, +0) + a default
+# point/clamp unnormalized S# (sampler, +32); stashes t_va + sw_mode on the
+# (64-byte) tex. The textured FS (TS.4/TS.7) s_load_dwordx8's the T# from t_va.
 #
-# NATIVE_TEX_FIELD_SIZE stays the logical surface bytes (write/read bounds);
-# texture_release recomputes the real mapped bo_size from t_va. Returns a
-# tex_ptr, or 0 on invalid dims/format, a compressed fmt, region exhaustion, or
-# an ioctl failure. (HW: the BO alloc/map; the guards + descriptor build are
-# deterministic.)
+# Two surface layouts, keyed off the format's compression:
+#   - UNCOMPRESSED (RGBA8): LINEAR surface, epitch = w-1, surface = data_size.
+#   - COMPRESSED (BC/ETC2/ASTC): a SW_64KB_S TILED surface sized to the
+#     block-aligned tiled footprint (native_tex_tiled_params), epitch = awb-1.
+#     The block-compressed data must be SDMA-tiled into the surface before it
+#     samples right — texture_write routes compressed writes through the L2T
+#     COPY_TILED path (TS.7c), so a raw linear blit here would sample garbage.
+#
+# NATIVE_TEX_FIELD_SIZE stays the LOGICAL (linear) surface bytes — the consumer
+# always hands write/read that many bytes; the tiled BO is larger. texture_release
+# recomputes the real mapped bo_size from t_va. Returns a tex_ptr, or 0 on invalid
+# dims/format, region exhaustion, or an ioctl failure. (HW: the BO alloc/map; the
+# guards + geometry + descriptor build are deterministic.)
 fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     if (ctx == 0) { return 0; }
     if (width <= 0)  { return 0; }
@@ -913,20 +958,43 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
         return 0;
     }
     if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
-    # v3.2 TS.5: native sampleable is RGBA8/LINEAR only. A compressed format
-    # here would build a LINEAR texel-pitch T# that the TA samples as garbage —
-    # compressed sampling needs the tiled SW_MODE + swizzle (TS.7). Reject until
-    # then (gpu_caps_supports_format keeps the native compressed bits 0 to match).
-    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }
     var logical = mabda_texfmt_data_size(fmt, width, height);
     if (logical == 0) { return 0; }
+    # Backend caps gate (pre-ioctl): reject a compressed family native can't yet
+    # sample, so a consumer never gets a tiled BC texture it can't populate via
+    # the public write API (which rejects tiled until TS.7c-3). Mirrors the wgpu
+    # backend guard. Until NATIVE_TEXCOMP_SUPPORTED flips, this returns 0 BEFORE
+    # any allocation — a genuine reject, not an ioctl-failure-on-fake-fd.
+    # Backend caps gate (pre-ioctl), per-format: a compressed format native can't
+    # faithfully sample (unsupported family, or BC6H's HDR-vs-RGBA8-RT mismatch) is
+    # rejected here before any allocation, so a consumer never gets a sampleable
+    # texture it can't populate. native_texfmt_sampleable is the single source of
+    # truth shared with the consumer-facing pre-check. (RGBA8 -> 1, passes through.)
+    var fam = mabda_texfmt_compression_family(fmt);
+    if (fam != 0) {
+        if (native_texfmt_sampleable(fmt) == 0) { return 0; }
+    }
     var fd = native_ctx_fd(ctx);
-    var sw_mode = GFX9_SW_MODE_LINEAR;   # MVP; tiled compressed = TS.7
+
+    # Pick the surface layout: LINEAR for uncompressed, SW_64KB_S tiled (sized to
+    # the block-aligned footprint) for compressed.
+    var sw_mode = GFX9_SW_MODE_LINEAR;
+    var epitch = width - 1;
+    var surf_size = logical;
+    if (fam != 0) {
+        var tp[56];
+        if (native_tex_tiled_params(fmt, width, height, &tp) != 0) { return 0; }
+        sw_mode = GFX9_SW_MODE_64KB_S;
+        epitch = load64(&tp + 16) - 1;     # awb - 1 (tile-aligned block pitch;
+                                           # the TS.7c-3 SDMA write MUST use the
+                                           # same awb-1 so the layout matches)
+        surf_size = load64(&tp + 32);      # tiled_size (64 KiB-aligned)
+    }
 
     # ONE BO holds [surface | pad-to-256 | T#(32) + S#(16)]: a single handle
     # covers both for CS residency (the descriptor BO handle would otherwise be
     # untracked), and t_va points at the descriptor inside the same BO.
-    var desc_off = _native_align_up(logical, 256);
+    var desc_off = _native_align_up(surf_size, 256);
     var bo_size = _native_align_up(desc_off + 64, 4096);
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
@@ -938,19 +1006,25 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
         native_bo_release_gtt(fd, handle, addr, bo_size);
         return 0;
     }
-    # Build the T# (+0) + a default point/clamp S# (+32) in the descriptor tail.
+    # Build the T# (+0) + a default point/clamp unnormalized S# (+32) in the tail.
     var daddr = addr + desc_off;
     memset(daddr, 0, 64);
-    native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1);
+    native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1, epitch);
     native_gfx9_sampler_descriptor(daddr, 32,
-    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);   # unnormalized (image_sample FS)
+    # v3.2 TS.8 — scale_x/scale_y (f32, descriptor+48/+52) the FS multiplies the
+    # fragment position by. Default 1.0 (= equal-dims, fragment==texel); the draw
+    # overwrites per-draw from tex_dim/rt_dim. Defaulting to 1.0 (not the memset 0)
+    # means a sample without a draw-write reads coord==pos, never coord*0.
+    store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
+    store32(daddr + 52, 0x3F800000);   # scale_y = 1.0f
 
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
     store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
     store64(tex + NATIVE_TEX_FIELD_VA,     va);
     store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
-    store64(tex + NATIVE_TEX_FIELD_SIZE,   logical);   # logical (write/read bounds)
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   logical);   # logical linear bytes (write/read bounds)
     store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
@@ -971,10 +1045,21 @@ fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (tex == 0)  { return GPU_ERR_TEXTURE; }
     if (native_tex_t_va(tex) == 0) { return GPU_ERR_TEXTURE; }   # not sampleable
+    # v3.2 TS.8b — rebuild the S# (descriptor +32) from the bound sampler's
+    # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes effect.
+    # unnorm stays 1 (the FS feeds texel-space coords). A POINT/CLAMP sampler
+    # rebuilds byte-identically to the create-baked default, so the existing
+    # (POINT) sample e2es are unaffected; only fires for a valid sampler.
+    if (gpu_sampler_is_valid(sampler) != 0) {
+        var dcpu = native_tex_desc_cpu_addr(tex);
+        if (dcpu != 0) {
+            native_gfx9_sampler_descriptor(dcpu, 32,
+            gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), 1);
+        }
+    }
     # Stash the tex pointer: the draw derives the descriptor VA
     # (native_tex_t_va, for the PS USER_DATA) + the surface BO handle (for
-    # residency) from it. (image_load reads no S#, so `sampler` is unused on
-    # the MVP path; S#-from-sampler is TS.7.)
+    # residency) from it.
     store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, tex);
     return 0;
 }
@@ -1066,6 +1151,102 @@ fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
     return 0;
 }
 
+# v3.2 TS.7c-3 — one-shot SDMA submit on the DMA ring: a 4-entry BO_HANDLES
+# list (fence, ib, lin, tiled), a transient syncobj, submit + blocking wait. The
+# texture write/read contract is synchronous, so we don't use the persistent
+# queue timeline (native_transfer_copy_timeline) here — a per-call syncobj is
+# simpler and the copies are infrequent. Lifts the HW-proven submit shape from
+# the TS.6 native_sdma_tiled_roundtrip probe. Returns 0 | neg-rc.
+fn _native_dma_submit_oneshot(ctx, h_lin, h_tiled, sdma_bytes): i64 {
+    var fd = native_ctx_fd(ctx);
+    var entries[32];
+    store32(&entries +  0, native_ctx_fence_handle(ctx)); store32(&entries +  4, 1);
+    store32(&entries +  8, native_ctx_ib_handle(ctx));    store32(&entries + 12, 10);
+    store32(&entries + 16, h_lin);                        store32(&entries + 20, 3);
+    store32(&entries + 24, h_tiled);                      store32(&entries + 28, 3);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 4);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var sbuf[8];
+    if (native_syncobj_create(fd, &sbuf) != 0) { return 0 - 1; }
+    var so = load64(&sbuf);
+    # Compute the wait deadline BEFORE the submit so the ONLY post-submit step is
+    # the wait. (Review 2026-06-16 LOW: if clock_gettime ran after a successful
+    # submit and failed, we'd destroy the syncobj + return without waiting, then
+    # the caller would free the staging BO while the SDMA CS still reads/writes
+    # it — a GPU-side UAF. Now a clock failure happens with nothing in flight.)
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    if (syscall(228, 1, &t_now) != 0) { native_syncobj_destroy(fd, so); return 0 - 1; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var rc = native_cs_submit_4chunk(fd, native_ctx_id(ctx), &bo_list_in,
+    native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
+    native_ctx_fence_handle(ctx), 32, 0);
+    if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
+    var wrc = native_syncobj_wait(fd, so, deadline);
+    native_syncobj_destroy(fd, so);
+    return wrc;
+}
+
+# v3.2 TS.7c-3 — move `n` bytes of block-compressed data between a host buffer
+# and a SW_64KB_S tiled texture surface via SDMA COPY_TILED_SUB_WINDOW. The
+# consumer's compressed data is row-major linear (block pitch = wb); the surface
+# is tiled, so a transient linear staging BO bridges them:
+#   write (detile=0): memcpy host->staging, then L2T staging->surface
+#   read  (detile=1): T2L surface->staging, then memcpy staging->host
+# `n` must equal the LOGICAL linear footprint (wb*hb*block_bytes = the tex's
+# NATIVE_TEX_FIELD_SIZE). Pure-validation rejects (uncompressed fmt, n mismatch)
+# return BEFORE any ioctl. Returns 0 | GPU_ERR_*.
+fn _native_texture_tiled_copy(ctx, tex, host, n, detile): i64 {
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var tp[56];
+    if (native_tex_tiled_params(fmt, w, h, &tp) != 0) { return GPU_ERR_TEXTURE; }
+    var wb = load64(&tp +  0);
+    var hb = load64(&tp +  8);
+    var bb = load64(&tp + 48);
+    if (n != wb * hb * bb) { return GPU_ERR_BUFFER; }
+
+    var fd = native_ctx_fd(ctx);
+    # Transient linear staging BO mapped at the DEDICATED, re-used staging VA
+    # (page-aligned size; the fixed slot avoids leaking the texture VA region).
+    var stage_size = _native_align_up(n, 4096);
+    if (stage_size > _NATIVE_STAGING_VA_REGION) { return GPU_ERR_BUFFER; }
+    var stage_va = _NATIVE_STAGING_VA;
+    var sbo[16];
+    if (native_bo_create_gtt(fd, stage_size, &sbo) != 0) { return GPU_ERR_OTHER; }
+    var stage_h = load64(&sbo + 0);
+    var stage_a = load64(&sbo + 8);
+    if (native_gem_va_map(fd, stage_h, stage_va, stage_size, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, stage_h, stage_a, stage_size);
+        return GPU_ERR_OTHER;
+    }
+    if (detile == 0) { memcpy(stage_a, host, n); }   # host -> staging before L2T
+
+    var ib_addr = native_ctx_ib_addr(ctx);
+    memset(ib_addr, 0, _NATIVE_IB_SIZE);
+    var sdma_bytes = native_tex_build_tiled_copy_packet(ib_addr, tex, stage_va, detile);
+    var rc = 0 - 1;
+    if (sdma_bytes > 0) {
+        rc = _native_dma_submit_oneshot(ctx, stage_h,
+        load64(tex + NATIVE_TEX_FIELD_HANDLE), sdma_bytes);
+    }
+    if (rc == 0) {
+        if (detile != 0) { memcpy(host, stage_a, n); }   # staging -> host after T2L
+    }
+    native_gem_va_unmap(fd, stage_h, stage_va, stage_size);
+    native_bo_release_gtt(fd, stage_h, stage_a, stage_size);
+    # Preserve the SDMA errno (timeout vs OOM vs busy) like the sibling buffer
+    # path (native_transfer_copy_timeline); a packet-build failure (sdma_bytes<=0,
+    # rc left -1) maps to a texture error. (Review 2026-06-16 LOW consistency.)
+    if (sdma_bytes <= 0) { return GPU_ERR_TEXTURE; }
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
 fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -1075,6 +1256,12 @@ fn _backend_native_texture_write(ctx, tex, src, n): i64 {
     var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
     if (addr == 0)   { return GPU_ERR_BUFFER; }
     if (n != size)   { return GPU_ERR_BUFFER; }
+    # A SW_64KB_S tiled surface (compressed sampleable) is NOT linear — route it
+    # through the L2T COPY_TILED path so the blocks land swizzled the way the TA
+    # reads them; a raw memcpy would sample as garbage.
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return _native_texture_tiled_copy(ctx, tex, src, n, 0);
+    }
     memcpy(addr, src, n);
     return 0;
 }
@@ -1088,6 +1275,10 @@ fn _backend_native_texture_read(ctx, tex, dst, n): i64 {
     var size = load64(tex + NATIVE_TEX_FIELD_SIZE);
     if (addr == 0)   { return GPU_ERR_BUFFER; }
     if (n != size)   { return GPU_ERR_BUFFER; }
+    # Tiled (compressed) readback de-tiles via T2L COPY_TILED into a staging BO.
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return _native_texture_tiled_copy(ctx, tex, dst, n, 1);
+    }
     memcpy(dst, addr, n);
     return 0;
 }
@@ -1251,6 +1442,20 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
     if (bound_tex != 0) {
         var desc_va = native_tex_t_va(bound_tex);
         tex_handle = load64(bound_tex + NATIVE_TEX_FIELD_HANDLE);
+        # v3.2 TS.8 — write the per-draw scale (f32) into the descriptor tail the
+        # FS s_loads (+48/+52): scale = tex_dim / rt_dim, so a W×H texture maps
+        # over the RT (equal dims -> 1.0 -> coord==fragment, bit-exact; smaller
+        # texture -> <1 -> fractional coords -> the S#'s filter blends). Written
+        # UNCONDITIONALLY so the FS never reads a stale tail; the IB-head
+        # ACQUIRE_MEM invalidate makes the TA see the fresh bytes. int_ratio_to_f32
+        # is the float shim (no native Cyrius float div yet — see the proposal).
+        var dcpu = native_tex_desc_cpu_addr(bound_tex);
+        if (dcpu != 0) {
+            var tw = load32(bound_tex + NATIVE_TEX_FIELD_WIDTH);
+            var th = load32(bound_tex + NATIVE_TEX_FIELD_HEIGHT);
+            store32(dcpu + 48, int_ratio_to_f32(tw, rt_width));   # scale_x
+            store32(dcpu + 52, int_ratio_to_f32(th, rt_height));  # scale_y
+        }
         pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
         GFX9_GFX_PGM_RSRC1_MIN | 1);
         pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
@@ -1674,6 +1879,18 @@ var _NATIVE_TEXTURE_VA_BASE   = 0xFFFF800180000000;
 var _NATIVE_TEXTURE_VA_REGION = 0x80000000;   # 2 GiB
 var _NATIVE_TEXTURE_VA_ALIGN  = 0x10000;      # 64 KiB per allocation
 
+# v3.2 TS.7c-3 — fixed per-context staging VA for the tiled-copy bounce buffer.
+# The tiled write/read path needs a transient linear staging BO; mapping it at a
+# DEDICATED, RE-USED VA each call (rather than bump-allocating a fresh one)
+# avoids permanently consuming the forward-only texture VA region — without it a
+# streaming consumer exhausts the 2 GiB budget after ~32K copies (review
+# 2026-06-16 MEDIUM). Tiled copies are synchronous (each waits before returning),
+# so the single slot is never live across two copies. Sits in the free gap below
+# the texture region; 256 MiB caps the largest single staging map (>= any 8192²
+# compressed surface, ~64 MiB).
+var _NATIVE_STAGING_VA        = 0xFFFF800140000000;
+var _NATIVE_STAGING_VA_REGION = 0x10000000;   # 256 MiB
+
 # Bump-allocate an aligned texture VA range of `size` bytes from the
 # per-context region. Returns the base VA, or 0 on region exhaustion
 # (caller treats 0 as a create failure). Lazy-inits the cursor to
@@ -1709,6 +1926,14 @@ fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE);
 fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
 fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
 fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
+# v3.2 TS.8 — CPU (mmap'd) address of the descriptor tail (T#/S#/scale BO), for
+# draw-time writes into +48/+52. The descriptor sits at the same offset in the BO
+# as t_va is past va, so addr + (t_va - va) is its CPU address. 0 if not sampleable.
+fn native_tex_desc_cpu_addr(tex): i64 {
+    if (native_tex_t_va(tex) == 0) { return 0; }
+    return load64(tex + NATIVE_TEX_FIELD_ADDR)
+    + (native_tex_t_va(tex) - load64(tex + NATIVE_TEX_FIELD_VA));
+}
 
 # Compute the byte size of a 2D RGBA8 texture. Pure math; safe to
 # call without a fd. width × height × 4 bytes per pixel.
@@ -1728,6 +1953,127 @@ var _NATIVE_MIP_ALIGN = 256;
 
 fn _native_align_up(n, align): i64 {
     return ((n + (align - 1)) / align) * align;
+}
+
+# ================================================================
+# v3.2 TS.7 — GFX9 SW_64KB_S tiled-surface geometry
+# ================================================================
+# The SDMA engine applies the swizzle (TS.6), but the SDMA tiled packet AND the
+# T# descriptor both need the addrlib-exact tiled geometry — aligned pitch
+# (epitch) + the 64 KiB-aligned surface size — or the TA reads garbage. Block
+# dims come from addrlib's Block256_2d (256-byte micro-tile) << 4 (the 64 KiB
+# block: log2BlkSize=16, log2blkSizeIn256B=8, widthAmp=heightAmp=4) — sourced
+# from Mesa src/amd/addrlib (gfx9addrlib.cpp ComputeThinBlockDimension +
+# addrlib2.cpp Block256_2d). Indexed by log2(element_bytes), 1/2/4/8/16 B.
+
+fn _native_log2(n): i64 {
+    var r = 0;
+    var v = n;
+    while (v > 1) { v = v / 2; r = r + 1; }
+    return r;
+}
+
+# addrlib Block256_2d[log2(eb)] packed (w<<8)|h: {16,16},{16,8},{8,8},{8,4},{4,4}.
+fn _native_block256_2d(esize_log2): i64 {
+    if (esize_log2 == 0) { return (16 << 8) | 16; }
+    if (esize_log2 == 1) { return (16 << 8) | 8; }
+    if (esize_log2 == 2) { return (8 << 8) | 8; }
+    if (esize_log2 == 3) { return (8 << 8) | 4; }
+    if (esize_log2 == 4) { return (4 << 8) | 4; }
+    return 0;
+}
+
+# SW_64KB_S 2D block dims in ELEMENTS = Block256_2d << 4.
+fn native_tiled_block_w(esize_log2): i64 {
+    return ((_native_block256_2d(esize_log2) >> 8) & 0xFF) << 4;
+}
+fn native_tiled_block_h(esize_log2): i64 {
+    return (_native_block256_2d(esize_log2) & 0xFF) << 4;
+}
+
+# Compute SW_64KB_S geometry for a `wb`×`hb`-element surface of `element_bytes`.
+# Writes 5 i64 to `out`: +0 block_w, +8 block_h, +16 aligned_wb (= epitch+1),
+# +24 aligned_hb, +32 size (64 KiB-aligned BO bytes). For BC the elements are
+# 4x4 blocks (wb/hb in blocks, element_bytes = block bytes).
+fn native_tiled_geometry(out, element_bytes, wb, hb): i64 {
+    var es = _native_log2(element_bytes);
+    var bw = native_tiled_block_w(es);
+    var bh = native_tiled_block_h(es);
+    var awb = _native_align_up(wb, bw);
+    var ahb = _native_align_up(hb, bh);
+    var size = _native_align_up(awb * ahb * element_bytes, 65536);
+    store64(out +  0, bw);
+    store64(out +  8, bh);
+    store64(out + 16, awb);
+    store64(out + 24, ahb);
+    store64(out + 32, size);
+    return 0;
+}
+
+# v3.2 TS.7c — SW_64KB_S tiled geometry for a *compressed* `fmt` at
+# `width`x`height`, in BLOCK units (a BC/ETC2/ASTC block is the tiled element).
+# Writes 7 i64 to `out`:
+#   +0 wb (blocks_x)             +8 hb (blocks_y)
+#   +16 awb (tile-aligned blocks_x = T#/SDMA epitch + 1)
+#   +24 ahb (tile-aligned blocks_y)
+#   +32 tiled_size (64 KiB-aligned tiled-BO surface bytes)
+#   +40 esize_log2 (SDMA element_size = log2(block_bytes))
+#   +48 block_bytes
+# Returns 0, or -1 for a non-compressed / invalid fmt or degenerate dims.
+# Pure arithmetic over texture_format.cyr block math — fully CPU-checkable.
+fn native_tex_tiled_params(fmt, width, height, out): i64 {
+    if (mabda_texfmt_is_compressed(fmt) == 0) { return 0 - 1; }
+    var bw_tex = mabda_texfmt_block_width(fmt);
+    var bh_tex = mabda_texfmt_block_height(fmt);
+    var bb = mabda_texfmt_block_bytes(fmt);
+    if (bw_tex <= 0) { return 0 - 1; }
+    if (bh_tex <= 0) { return 0 - 1; }
+    if (bb <= 0)     { return 0 - 1; }
+    var wb = mabda_texfmt_blocks_for_dim(width, bw_tex);
+    var hb = mabda_texfmt_blocks_for_dim(height, bh_tex);
+    if (wb <= 0) { return 0 - 1; }
+    if (hb <= 0) { return 0 - 1; }
+    var geo[40];
+    native_tiled_geometry(&geo, bb, wb, hb);
+    store64(out +  0, wb);
+    store64(out +  8, hb);
+    store64(out + 16, load64(&geo + 16));   # awb
+    store64(out + 24, load64(&geo + 24));   # ahb
+    store64(out + 32, load64(&geo + 32));   # tiled_size
+    store64(out + 40, _native_log2(bb));    # esize_log2
+    store64(out + 48, bb);                  # block_bytes
+    return 0;
+}
+
+# v3.2 TS.7c-3 — build the SDMA COPY_TILED_SUB_WINDOW packet that moves a
+# compressed `tex`'s surface to/from a linear staging VA. `buf` = packet dest,
+# `lin_va` = staging BO VA, `detile` = 0 (L2T: linear->tiled write) | 1 (T2L:
+# tiled->linear read). Pure byte-builder (no fd/ioctl) so the param derivation
+# is CPU-pinnable.
+#
+# CONTRACT (review HIGH, 2026-06-15): the SDMA epitch MUST equal the T#'s epitch
+# = awb-1 (the tile-ALIGNED block pitch - 1, from native_tex_tiled_params), NOT
+# wb-1 (the unaligned block count - 1). The TS.6 round-trip probe used wb-1, which
+# only coincides with awb-1 on a block_w-aligned surface; reusing it on a
+# non-aligned BC surface would tile a layout the TA disagrees with -> garbage. We
+# read awb straight from the same params the T# was built from, so they can't drift.
+# Returns the packet byte length (56), or -1 if `tex`'s fmt isn't compressed.
+fn native_tex_build_tiled_copy_packet(buf, tex, lin_va, detile): i64 {
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var tp[56];
+    if (native_tex_tiled_params(fmt, w, h, &tp) != 0) { return 0 - 1; }
+    var wb  = load64(&tp +  0);
+    var hb  = load64(&tp +  8);
+    var awb = load64(&tp + 16);
+    var esize = load64(&tp + 40);
+    var tiled_va = load64(tex + NATIVE_TEX_FIELD_VA);   # surface at BO +0
+    var sw = native_tex_sw_mode(tex);
+    # epitch = awb-1 (see CONTRACT); ext/copy region + linear pitch in BLOCKS
+    # (the tiled element); linear slice = wb*hb blocks; dim = 2D(1).
+    return native_sdma_build_copy_tiled(buf, tiled_va, lin_va,
+    esize, sw, 1, awb - 1, wb, hb, wb, wb * hb, wb, hb, detile);
 }
 
 # Byte offset of mip `level` within the contiguous chain (the sum of the

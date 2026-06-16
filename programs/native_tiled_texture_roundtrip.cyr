@@ -1,0 +1,107 @@
+# programs/native_tiled_texture_roundtrip.cyr — v3.2 TS.7c-3
+#
+# End-to-end write->read identity through a SW_64KB_S TILED block-compressed
+# (BC1) sampleable texture on real AMD hardware. Validates the tiled data path
+# wired in TS.7c-3:
+#   public gpu_texture_write (L2T) -> _backend_native_texture_write ->
+#   _native_texture_tiled_copy -> native_tex_build_tiled_copy_packet (epitch=awb-1)
+#   -> SDMA COPY_TILED_SUB_WINDOW -> _native_dma_submit_oneshot (DMA ring)
+# then gpu_texture_read (T2L) back, byte-compare.
+#
+# The L2T then T2L apply + reverse the SAME swizzle (a bijection), so dst==src
+# proves the wired path is accepted, internally consistent, and the staging/
+# submit/cleanup is correct on Cezanne. ABSOLUTE TA-agreement (does the TA
+# sample this layout right) is TS.7c-4's sampling test. This is the FIRST tiled
+# copy on a NON-block_w-aligned surface (256x256 texels = 64 blocks, awb=128 ->
+# epitch=127 != wb-1=63), exercising the awb-vs-wb distinction the TS.6 256-block
+# round-trip could not (review HIGH, 2026-06-15).
+#
+# Native compressed sampling is cap-gated off in tree (NATIVE_TEXCOMP_SUPPORTED
+# = 0 until TS.7c-4 HW-verify), so this probe FLIPS the gate locally to reach
+# the create path ahead of the cap flip.
+#
+# Exit codes: 0 identity; 1 ctx; 2 create; 3 write(L2T); 4 read(T2L); 5 mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Create a tiled `fmt` sampleable texture (W x H, `bb` bytes/block), write a
+# per-dword counter pattern via the L2T path, read it back via T2L, and verify
+# byte-identity. L2T+T2L apply+reverse the SAME swizzle (a bijection), so a
+# match proves the wired tiled write/read path + the block-size-specific tiling
+# geometry are accepted + self-consistent on HW. Returns 0 | exit code (2/3/4/5).
+fn roundtrip_fmt(ctx, fmt, W, H, bb): i64 {
+    var N = (W / 4) * (H / 4) * bb;
+    var tex = gpu_texture_create_2d_sampleable(ctx, W, H, fmt);
+    if (tex == 0) { print_cstr("FAIL: create returned 0\n"); return 2; }
+    var src = alloc(N);
+    var i = 0;
+    while (i < N / 4) { store32(src + i * 4, 0xB10C0000 + i); i = i + 1; }
+    var rc_w = gpu_texture_write(ctx, tex, src, N);
+    if (rc_w != 0) {
+        print_cstr("FAIL: write(L2T) rc="); print_i64(rc_w); print_cstr("\n");
+        gpu_texture_release(ctx, tex); return 3;
+    }
+    var dst = alloc(N);
+    memset(dst, 0, N);
+    var rc_r = gpu_texture_read(ctx, tex, dst, N);
+    if (rc_r != 0) {
+        print_cstr("FAIL: read(T2L) rc="); print_i64(rc_r); print_cstr("\n");
+        gpu_texture_release(ctx, tex); return 4;
+    }
+    var bad = 0 - 1;
+    var j = 0;
+    while (j < N / 4) {
+        if (load32(dst + j * 4) != 0xB10C0000 + j) { bad = j; j = N; }
+        j = j + 1;
+    }
+    gpu_texture_release(ctx, tex);
+    if (bad != 0 - 1) {
+        print_cstr("FAIL: mismatch at dword "); print_i64(bad);
+        print_cstr(" got "); print_i64(load32(dst + bad * 4)); print_cstr("\n");
+        return 5;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native TILED BC texture round-trip (v3.2 TS.7c-3)\n");
+    print_cstr("-------------------------------------------------------\n");
+
+    # Open the create gate (no-op once the in-tree TS.7c-4 flip lands).
+    NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    print_cstr("ctx ready (fd="); print_i64(native_ctx_fd(ctx)); print_cstr(")\n");
+
+    # BC1 (8B block): 256x256 texels = 64 blocks; 8B-element tiled block_w=128,
+    # so awb=128 != wb=64 — a NON-block_w-aligned surface (epitch=awb-1=127).
+    var rc1 = roundtrip_fmt(ctx, MABDA_TEXFMT_BC1, 256, 256, 8);
+    if (rc1 != 0) { gpu_context_release(ctx); return rc1; }
+    print_cstr("PASS: BC1 (8B block, 256x256, awb=128) L2T->T2L round-trips\n");
+
+    # BC7 (16B block): 160x160 texels = 40 blocks; 16B-element tiled block_w=64,
+    # so awb=64 != wb=40 — also NON-aligned. Exercises the 16-byte-element tiling
+    # geometry the cap-for-all-BC flip enables.
+    var rc7 = roundtrip_fmt(ctx, MABDA_TEXFMT_BC7, 160, 160, 16);
+    if (rc7 != 0) { gpu_context_release(ctx); return rc7; }
+    print_cstr("PASS: BC7 (16B block, 160x160, awb=64) L2T->T2L round-trips\n");
+
+    gpu_context_release(ctx);
+    print_cstr("OK - tiled BC1+BC7 L2T->T2L round-trip (epitch=awb-1); path wired\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

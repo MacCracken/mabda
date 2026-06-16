@@ -187,6 +187,33 @@ fn f32_to_f64(val): i64 {
     return result;
 }
 
+# SHIM (v3.2 TS.8b) — f32 bit pattern of (double)num / (double)den.
+# Cyrius has no native float arithmetic (only the f64_to_f32 / f32_to_f64 cvt
+# shims), so the texture-blit scale (tex_dim / rt_dim) is computed via inline
+# x86-64 SSE2 here. This is a TEMPORARY mabda-side shim — the proper fix is
+# first-class float arithmetic in the Cyrius toolchain; see
+# cyrius/docs/development/proposal/2026-06-16-native-float-arithmetic.md.
+# Args: num @ [rbp-8], den @ [rbp-16]; local result @ [rbp-24] (verified by the
+# int_ratio_to_f32 CPU test — 1/1=0x3F800000, 1/2=0x3E800000, 2/64=0x3D000000).
+fn int_ratio_to_f32(num, den): i64 {
+    var result = 0;
+    asm {
+        # cvtsi2sd xmm0, [rbp-8]  (xmm0 = (double)num)
+        0xF2; 0x48; 0x0F; 0x2A; 0x45; 0xF8;
+        # cvtsi2sd xmm1, [rbp-16] (xmm1 = (double)den)
+        0xF2; 0x48; 0x0F; 0x2A; 0x4D; 0xF0;
+        # divsd xmm0, xmm1        (xmm0 = num/den, double)
+        0xF2; 0x0F; 0x5E; 0xC1;
+        # cvtsd2ss xmm0, xmm0     (xmm0 = (float) result)
+        0xF2; 0x0F; 0x5A; 0xC0;
+        # movd eax, xmm0
+        0x66; 0x0F; 0x7E; 0xC0;
+        # mov [rbp-24], rax       (result)
+        0x48; 0x89; 0x45; 0xE8;
+    }
+    return result;
+}
+
 # Write color as 4x f32 (16 bytes) to destination pointer
 # Used for vertex color data, uniform buffers, etc.
 fn color_write_f32(c, dst): i64 {

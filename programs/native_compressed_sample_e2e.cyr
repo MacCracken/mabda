@@ -1,0 +1,348 @@
+# programs/native_compressed_sample_e2e.cyr — v3.2 TS.7c-4
+#
+# THE culmination of Phase TS on native AMD: sample SW_64KB_S TILED,
+# block-compressed textures in a fragment shader on Cezanne and verify the TA's
+# decode pixel-exact against a CPU decode. This is where the SDMA tiling (TS.7c-3
+# write path) finally meets the texture addressing unit — the absolute
+# correctness check the TS.6 round-trip (self-consistent bijection) could not give.
+#
+# Covers BC1 (RGB565 endpoints), BC3 (BC1-color + BC4-alpha block), BC4 (1-channel
+# red), BC5 (2-channel RG), and BC7 (mode-6 RGBA, 7-bit endpoints + P-bit) —
+# spanning the channel-mapping spectrum the per-format DST_SEL T# is responsible
+# for: BC1/BC3/BC7 -> full RGBA, BC4 -> (R,0,0,1), BC5 -> (R,G,0,1). Every BC
+# sample format is now pixel-verified. (BC6H is gated off — HDR float vs RGBA8 RT.)
+#
+# Test data design (NO interpolation -> no TA-vs-CPU rounding ambiguity): every
+# texel uses an ENDPOINT index, never an interpolated one. In BC1 palette[0]/[1]
+# are the two endpoints verbatim; in BC4/BC5 index 0 is endpoint red0/grn0
+# verbatim. An endpoint decodes (TA) then converts back through the RGBA8_UNORM
+# CB to exactly the stored value, so the CPU oracle matches the HW bit-for-bit.
+# Per-block distinct colors prove block-level tiling/addressing; BC1's
+# within-block checkerboard also exercises index decode.
+#
+# Native compressed sampling is cap-gated; this probe flips NATIVE_TEXCOMP_SUPPORTED
+# locally so it runs even before the in-tree cap flip lands.
+#
+# Exit codes: 0 pass; 1 ctx; 2 vs; 3 fs; 4 tex create; 5 tex upload; 6 rt;
+#   7 sampler/pipeline; 8 pass begin; 9 bind; 10 draw (TDR?); 11 mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+fn mono_ns(): i64 {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+# --- BC1: RGB565 endpoints + RGB565->RGBA8 expansion (the TA's high-bit-replicate) ---
+fn pack565(r5, g6, b5): i64 {
+    return ((r5 & 0x1F) << 11) | ((g6 & 0x3F) << 5) | (b5 & 0x1F);
+}
+fn expand565(c): i64 {
+    var r5 = (c >> 11) & 0x1F;
+    var g6 = (c >> 5) & 0x3F;
+    var b5 = c & 0x1F;
+    var r = (r5 << 3) | (r5 >> 2);
+    var g = (g6 << 2) | (g6 >> 4);
+    var b = (b5 << 3) | (b5 >> 2);
+    return (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (0xFF << 24);
+}
+fn blk_c0(bx, by): i64 { return pack565(bx & 0x1F, (by * 3) & 0x3F, 0x1F); }
+fn blk_c1(bx, by): i64 { return pack565(0x1F, (bx * 2) & 0x3F, by & 0x1F); }
+
+# --- BC4/BC5: per-block u8 endpoints (index 0 -> these verbatim) ---
+fn bc4_red0(bx, by): i64 { return (bx * 16 + by) & 0xFF; }   # unique per block in 16x16
+fn bc5_grn0(bx, by): i64 { return (by * 16 + bx) & 0xFF; }
+# --- BC3 (DXT5): BC1 color + a BC4-style alpha block. Per-block alpha endpoint. ---
+fn bc3_a0(bx, by): i64 { return (bx * 13 + by * 7 + 1) & 0xFF; }   # nonzero, per-block
+
+# --- BC7 mode 6 (single-partition RGBA, 7-bit endpoints + shared P-bit) ---
+# OR `nbits` of `value` into the 16-byte block at LSB-first bit offset `bit_off`.
+fn bc7_set_bits(blk, bit_off, value, nbits): i64 {
+    var i = 0;
+    while (i < nbits) {
+        if (((value >> i) & 1) != 0) {
+            var pos = bit_off + i;
+            var byte = pos / 8;
+            var b = pos & 7;
+            store8(blk + byte, load8(blk + byte) | (1 << b));
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+# Per-block 7-bit endpoint0 components (endpoint1 unused: all indices are 0). The
+# mode-6 channel value is (comp7 << 1) | P0; with P0=0 it is comp7 << 1 — an exact
+# 8-bit value (no further expansion), so the CPU oracle matches the TA bit-for-bit.
+fn bc7_r7(bx, by): i64 { return (bx * 8) & 0x7F; }
+fn bc7_g7(bx, by): i64 { return (by * 8) & 0x7F; }
+fn bc7_b7(bx, by): i64 { return 0x40; }
+fn bc7_a7(bx, by): i64 { return 0x7F; }
+
+# Expected RGBA8 for texel (x,y) of `fmt` (matches the block data filled below).
+fn want_texel(fmt, x, y): i64 {
+    var bx = x / 4;
+    var by = y / 4;
+    if (fmt == MABDA_TEXFMT_BC1) {
+        var checker = ((x & 3) + (y & 3)) & 1;
+        if (checker == 0) { return expand565(blk_c0(bx, by)); }
+        return expand565(blk_c1(bx, by));
+    }
+    if (fmt == MABDA_TEXFMT_BC4) {            # (R,0,0,1)
+        return (bc4_red0(bx, by) & 0xFF) | (0xFF << 24);
+    }
+    if (fmt == MABDA_TEXFMT_BC5) {            # (R,G,0,1)
+        return (bc4_red0(bx, by) & 0xFF) | ((bc5_grn0(bx, by) & 0xFF) << 8) | (0xFF << 24);
+    }
+    if (fmt == MABDA_TEXFMT_BC3) {            # BC1-RGB checker + per-block alpha
+        var checker3 = ((x & 3) + (y & 3)) & 1;
+        var rgb = expand565(blk_c0(bx, by)) & 0x00FFFFFF;
+        if (checker3 != 0) { rgb = expand565(blk_c1(bx, by)) & 0x00FFFFFF; }
+        return rgb | ((bc3_a0(bx, by) & 0xFF) << 24);
+    }
+    if (fmt == MABDA_TEXFMT_BC7) {            # mode-6 endpoint0 = (comp7<<1)
+        var r = (bc7_r7(bx, by) << 1) & 0xFF;
+        var g = (bc7_g7(bx, by) << 1) & 0xFF;
+        var b = (bc7_b7(bx, by) << 1) & 0xFF;
+        var a = (bc7_a7(bx, by) << 1) & 0xFF;
+        return r | (g << 8) | (b << 16) | (a << 24);
+    }
+    return 0;
+}
+
+# Fill `blocks` (BX x BY blocks) with `fmt` data using only endpoint indices.
+fn fill_blocks(fmt, blocks, BX, BY): i64 {
+    var by = 0;
+    while (by < BY) {
+        var bx = 0;
+        while (bx < BX) {
+            if (fmt == MABDA_TEXFMT_BC1) {
+                var blk = blocks + (by * BX + bx) * 8;
+                var c0 = blk_c0(bx, by);
+                var c1 = blk_c1(bx, by);
+                store8(blk + 0, c0 & 0xFF);
+                store8(blk + 1, (c0 >> 8) & 0xFF);
+                store8(blk + 2, c1 & 0xFF);
+                store8(blk + 3, (c1 >> 8) & 0xFF);
+                # checkerboard indices 0/1: rows 0x44,0x11,0x44,0x11.
+                store8(blk + 4, 0x44);
+                store8(blk + 5, 0x11);
+                store8(blk + 6, 0x44);
+                store8(blk + 7, 0x11);
+            }
+            if (fmt == MABDA_TEXFMT_BC4) {
+                # 8B: red0, red1, then 6 index bytes (0 = all texels -> red0).
+                var blk4 = blocks + (by * BX + bx) * 8;
+                memset(blk4, 0, 8);
+                store8(blk4 + 0, bc4_red0(bx, by));
+            }
+            if (fmt == MABDA_TEXFMT_BC5) {
+                # 16B: [red BC4 sub-block | green BC4 sub-block], both all-index-0.
+                var blk5 = blocks + (by * BX + bx) * 16;
+                memset(blk5, 0, 16);
+                store8(blk5 + 0, bc4_red0(bx, by));    # red endpoint
+                store8(blk5 + 8, bc5_grn0(bx, by));    # green endpoint
+            }
+            if (fmt == MABDA_TEXFMT_BC3) {
+                # 16B: [alpha BC4-style sub-block (all index 0 -> a0) | BC1 color].
+                var blk3 = blocks + (by * BX + bx) * 16;
+                memset(blk3, 0, 16);
+                store8(blk3 + 0, bc3_a0(bx, by));      # alpha endpoint a0
+                var c0 = blk_c0(bx, by);
+                var c1 = blk_c1(bx, by);
+                store8(blk3 +  8, c0 & 0xFF);
+                store8(blk3 +  9, (c0 >> 8) & 0xFF);
+                store8(blk3 + 10, c1 & 0xFF);
+                store8(blk3 + 11, (c1 >> 8) & 0xFF);
+                store8(blk3 + 12, 0x44);               # color checker indices 0/1
+                store8(blk3 + 13, 0x11);
+                store8(blk3 + 14, 0x44);
+                store8(blk3 + 15, 0x11);
+            }
+            if (fmt == MABDA_TEXFMT_BC7) {
+                # mode 6, single partition, RGBA. All indices 0 -> endpoint0 every
+                # texel. Layout (LSB-first): mode[0:6]=0x40, R0@7 R1@14 G0@21 G1@28
+                # B0@35 B1@42 A0@49 A1@56 P0@63 P1@64 idx@65. endpoint1/P/idx = 0.
+                var blk7 = blocks + (by * BX + bx) * 16;
+                memset(blk7, 0, 16);
+                store8(blk7 + 0, 0x40);                 # mode-6 marker (bit 6)
+                bc7_set_bits(blk7,  7, bc7_r7(bx, by), 7);   # R0
+                bc7_set_bits(blk7, 21, bc7_g7(bx, by), 7);   # G0
+                bc7_set_bits(blk7, 35, bc7_b7(bx, by), 7);   # B0
+                bc7_set_bits(blk7, 49, bc7_a7(bx, by), 7);   # A0
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return 0;
+}
+
+# Create a tiled `fmt` sampleable texture, upload endpoint-only block data (L2T),
+# render the image_sample FS into `rt`, and verify RT[x,y] == CPU decode at 8
+# probes spanning distinct blocks. Reuses the caller's RT/sampler/pipeline.
+# Returns 0 | exit code.
+fn run_fmt(ctx, rt, samp, pipe, fmt, bb): i64 {
+    var W = 64;
+    var H = 64;
+    var BX = W / 4;
+    var BY = H / 4;
+    var N = BX * BY * bb;
+    var tex = gpu_texture_create_2d_sampleable(ctx, W, H, fmt);
+    if (tex == 0) { print_cstr("FAIL: tex create\n"); return 4; }
+    var blocks = alloc(N);
+    fill_blocks(fmt, blocks, BX, BY);
+    if (gpu_texture_write(ctx, tex, blocks, N) != 0) {
+        print_cstr("FAIL: upload (L2T)\n"); gpu_texture_release(ctx, tex); return 5; }
+
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, W * H * 4);   # sentinel
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { print_cstr("FAIL: pass begin\n"); gpu_texture_release(ctx, tex); return 8; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) {
+        print_cstr("FAIL: bind\n"); gpu_render_pass_end(ctx, pass);
+        gpu_texture_release(ctx, tex); return 9; }
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { print_cstr("FAIL: draw rc="); print_i64(rc); print_cstr("\n");
+        gpu_texture_release(ctx, tex); return 10; }
+
+    var probes_x[64];   # 8 i64 probes = 64 bytes (var X[N] is N BYTES)
+    var probes_y[64];
+    store64(&probes_x +  0,  0); store64(&probes_y +  0,  0);
+    store64(&probes_x +  8,  1); store64(&probes_y +  8,  0);
+    store64(&probes_x + 16,  0); store64(&probes_y + 16,  1);
+    store64(&probes_x + 24,  5); store64(&probes_y + 24,  3);
+    store64(&probes_x + 32, 12); store64(&probes_y + 32, 28);
+    store64(&probes_x + 40, 63); store64(&probes_y + 40, 63);
+    store64(&probes_x + 48, 33); store64(&probes_y + 48, 17);
+    store64(&probes_x + 56, 40); store64(&probes_y + 56, 41);
+    var bad = 0;
+    var pi = 0;
+    while (pi < 8) {
+        var px = load64(&probes_x + pi * 8);
+        var py = load64(&probes_y + pi * 8);
+        var got = load32(rt_addr + (py * W + px) * 4);
+        var wnt = want_texel(fmt, px, py);
+        if (got != wnt) {
+            print_cstr("MISMATCH px="); print_i64(px); print_cstr(" py="); print_i64(py);
+            print_cstr(" got="); print_hex32(got); print_cstr(" want="); print_hex32(wnt);
+            print_cstr("\n");
+            bad = 1;
+        }
+        pi = pi + 1;
+    }
+    gpu_texture_release(ctx, tex);
+    if (bad != 0) { return 11; }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native COMPRESSED (BC1/BC3/BC4/BC5/BC7) sample e2e (v3.2 TS.8)\n");
+    print_cstr("---------------------------------------------------------------------\n");
+
+    # Open the create gate ahead of / alongside the in-tree cap flip.
+    NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # ---- VS (fullscreen triangle) ----
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { print_cstr("FAIL: vs bo\n"); return 2; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n"); return 2; }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+
+    # ---- FS (image_sample, BC-decoding, unnormalized) ----
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { print_cstr("FAIL: fs bo\n"); return 3; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    memset(fs_addr, 0, 4096);
+    native_gfx9_shader_textured_sample_fs(fs_addr, 0);
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n"); return 3; }
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+    print_cstr("PASS: VS + image_sample FS shaders\n");
+
+    # ---- shared RT + sampler + pipeline ----
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt == 0) { print_cstr("FAIL: rt\n"); return 6; }
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { print_cstr("FAIL: sampler\n"); return 7; }
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); return 7; }
+    print_cstr("PASS: RT + sampler + image_sample pipeline\n");
+
+    var t0 = mono_ns();
+    var r1 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC1, 8);
+    if (r1 != 0) { print_cstr("FAIL: BC1 sample\n"); return r1; }
+    print_cstr("PASS: BC1 RT[x,y] == CPU decode (RGB565 endpoints + checker)\n");
+
+    var r4 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC4, 8);
+    if (r4 != 0) { print_cstr("FAIL: BC4 sample\n"); return r4; }
+    print_cstr("PASS: BC4 RT[x,y] == CPU decode (1-channel -> R,0,0,1)\n");
+
+    var r5 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC5, 16);
+    if (r5 != 0) { print_cstr("FAIL: BC5 sample\n"); return r5; }
+    print_cstr("PASS: BC5 RT[x,y] == CPU decode (2-channel -> R,G,0,1)\n");
+
+    var r3 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC3, 16);
+    if (r3 != 0) { print_cstr("FAIL: BC3 sample\n"); return r3; }
+    print_cstr("PASS: BC3 RT[x,y] == CPU decode (RGB + per-block alpha)\n");
+
+    var r7 = run_fmt(ctx, rt, samp, pipe, MABDA_TEXFMT_BC7, 16);
+    if (r7 != 0) { print_cstr("FAIL: BC7 sample\n"); return r7; }
+    print_cstr("PASS: BC7 RT[x,y] == CPU decode (mode-6 RGBA endpoints)\n");
+    var ms = (mono_ns() - t0) / 1000;
+    print_cstr("5 formats sampled+verified in "); print_i64(ms); print_cstr(" us\n");
+
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    native_gem_va_unmap(fd, fs_handle, fs_va, 4096);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, 4096);
+    native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
+    gpu_context_release(ctx);
+    print_cstr("OK - native BC1/BC3/BC4/BC5/BC7 compressed sampling live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

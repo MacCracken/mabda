@@ -1170,3 +1170,52 @@ fn native_sdma_build_copy_chained(buf, src_va, dst_va, bytes, buf_cap): i64 {
     return written;
 }
 
+# v3.2 TS.6 — SDMA COPY_TILED_SUB_WINDOW (sub-op 5): a linear<->tiled copy
+# where the SDMA engine applies the tiled surface's swizzle, so mabda does NOT
+# compute the GFX9 SW_64KB_S equation in software (the "let the HW tile it"
+# path). A compressed-texture write becomes L2T (detile=0), a read T2L
+# (detile=1). 14-dword (56-byte) no-DCC, single-level, depth-1, zero-origin
+# full-surface packet. Format transcribed from Mesa
+# ac_emit_sdma_copy_tiled_sub_window (SDMA_4_0 path) + sid.h SDMA opcodes:
+#   DW0  SDMA_PACKET(COPY=1, TILED_SUB_WINDOW=5, 0) | detile<<31
+#   DW1/2  tiled VA lo/hi
+#   DW3  tiled offset.x|y (0)
+#   DW4  tiled offset.z(0) | (ext_w-1)<<16
+#   DW5  (ext_h-1) | (ext_d-1=0)<<16
+#   DW6  info = element_size | swizzle_mode<<3 | dim<<9 | epitch<<16
+#   DW7/8  linear VA lo/hi
+#   DW9  linear offset.x|y (0)
+#   DW10 linear offset.z(0) | (lin_pitch-1)<<16
+#   DW11 lin_slice_pitch-1
+#   DW12 (copy_w-1) | (copy_h-1)<<16
+#   DW13 (copy_d-1 = 0)
+# element_size = log2(bytes per tiled element/block); swizzle_mode = GFX9
+# SW_MODE; dim = gfx9 resource type; epitch = tiled extended pitch in elements
+# minus 1; extents/pitches/rect are in ELEMENTS (blocks, for compressed). The
+# tiled-surface geometry (swizzle_mode value, epitch, size) is TS.7's job; this
+# is the pure packet byte-builder. Returns 56.
+var SDMA_SUBOP_COPY_TILED_SUB_WINDOW = 0x5;
+
+fn native_sdma_build_copy_tiled(buf, tiled_va, lin_va, element_size, swizzle_mode,
+dim, epitch, ext_w, ext_h, lin_pitch, lin_slice_pitch, copy_w, copy_h, detile): i64 {
+    var header = SDMA_OP_COPY | (SDMA_SUBOP_COPY_TILED_SUB_WINDOW << 8);
+    if (detile != 0) { header = header | (1 << 31); }
+    store32(buf +  0, header);
+    store32(buf +  4, tiled_va & 0xFFFFFFFF);
+    store32(buf +  8, (tiled_va >> 32) & 0xFFFFFFFF);
+    store32(buf + 12, 0);                                   # tiled offset x|y
+    store32(buf + 16, ((ext_w - 1) & 0x3FFF) << 16);        # offset.z=0 | ext_w-1
+    store32(buf + 20, (ext_h - 1) & 0x3FFF);                # ext_h-1 | ext_d-1=0
+    var info = (element_size & 0x7) | ((swizzle_mode & 0x1F) << 3);
+    info = info | ((dim & 0x7) << 9) | ((epitch & 0xFFFF) << 16);
+    store32(buf + 24, info);
+    store32(buf + 28, lin_va & 0xFFFFFFFF);
+    store32(buf + 32, (lin_va >> 32) & 0xFFFFFFFF);
+    store32(buf + 36, 0);                                   # linear offset x|y
+    store32(buf + 40, ((lin_pitch - 1) & 0x3FFF) << 16);    # offset.z=0 | lin_pitch-1
+    store32(buf + 44, lin_slice_pitch - 1);
+    store32(buf + 48, ((copy_w - 1) & 0x3FFF) | (((copy_h - 1) & 0x3FFF) << 16));
+    store32(buf + 52, 0);                                   # copy_d - 1 = 0
+    return 56;
+}
+
