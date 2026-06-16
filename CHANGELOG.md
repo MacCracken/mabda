@@ -18,6 +18,86 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.2] — 2026-06-15
+
+**Native texture sampling (Phase TS.1–5).** Third feature of the v3.2.x arc
+(`docs/development/3-2-punchlist.md` Phase TS;
+`docs/proposals/v3.2-native-compressed-sampling.md`). Re-introduces the GFX9
+T#/S#/`image_sample` infrastructure the v3.1 mipmap pivot deleted, so the
+**native AMD** backend can now **sample** a texture in a fragment shader — not
+just store/readback. A consumer creates a sampleable texture, a sampler, binds
+them into a render pass, and the bound pipeline's FS samples it — the same
+public API on both backends. **HW-verified on Cezanne**: `native_texture_sample_e2e`
+samples a known RGBA8 texture pixel-exact (`RT[x,y]==tex[x,y]` via screen-pos
+`image_load`); `wgpu_texture_sample_e2e` renders the sampled color through the
+real wgpu bind-group path (which Phase T had not actually wired). This is the
+work the maintainer pulled out of "v4-scale" into the arc. **Native compressed
+sampling (BC/ETC2/ASTC) is Phase TS.6–8 (3.2.3)** — native sampleable is
+RGBA8/linear this minor (compressed needs the tiled `SW_MODE` + swizzle). CPU
+suite 2530 → **2702** assertions.
+
+### Added
+
+- **`gpu_texture_create_2d_sampleable(ctx, w, h, fmt)`** — a 2D texture that can
+  be sampled (vs `gpu_texture_create_2d`'s storage BO). Native: a single BO
+  carrying the surface + a GFX9 T#/S# descriptor in the tail; wgpu: a
+  `TEXTURE_BINDING` view.
+- **`gpu_sampler_create(ctx, filter, addr)`** — a backend-agnostic sampler
+  intent (point/bilinear × clamp/wrap); materialized as a GFX9 S# / `WGPUSampler`
+  at bind time.
+- **`gpu_render_pass_bind_texture(ctx, pass, tex, sampler)`** — binds a
+  sampleable texture so the bound pipeline's FS samples it.
+- GFX9 descriptor builders (`native_gfx9_image_descriptor` T#,
+  `native_gfx9_sampler_descriptor` S#, `native_gfx9_texfmt_to_img_format`) —
+  every dword/field pinned vs the authoritative Mesa `gfx9.json`.
+- `native_gfx9_shader_textured_load_fs` — the textured `image_load` FS
+  (llvm-mc-assembled + byte-pinned + in `scripts/disasm-shaders.sh`).
+- wgpu `wgpu_render_pipeline_get_bind_group_layout` FFI + the bind-group /
+  sampler-from-intent descriptor builders.
+- e2e programs `native_texture_sample_e2e` / `wgpu_texture_sample_e2e` +
+  `make test-native-texture-sample-e2e` / `test-wgpu-texture-sample-e2e`.
+
+### Changed
+
+- `Backend` 264 → 280 B (two sample slots: `create_2d_sampleable` @264,
+  `bind_for_sample` @272); `backend_is_complete` walks the 9th range.
+- `NativeTexture` 48 → 64 B (`sw_mode`@48, `t_va`@52); `NativePass` 32 → 40 B
+  (`bound_tex`@32); `_NATIVE_PM4_SCRATCH_BYTES` 1024 → 2048 (the textured draw
+  override appends ~15 dwords past the 256-dword minimum pad).
+- Toolchain pin unchanged (6.2.11).
+
+### Fixed
+
+- Adversarial-review fixes (`docs/audit/2026-06-15-ts-sampling-audit.md`, two
+  workflows): wgpu per-draw sampler/bind-group/BGL **handle leak** (HIGH);
+  native sampleable **release size mismatch** + uncleared `t_va` (MED, both
+  leaked / use-after-bind); per-draw `bound_tex` clear + reject compressed-
+  sampleable on native (LOW). Each landed with a test or is HW-covered.
+
+### Limitations / Deferred (within the arc)
+
+- **Native compressed sampling** (BC/ETC2/ASTC) — TS.6 (tile-swizzle) + TS.7
+  (BC sampling) + TS.8 (bilinear/ETC2/ASTC), all **3.2.3, this arc**. Native
+  sampleable is RGBA8/linear at 3.2.2; `gpu_caps_supports_format(BC)` stays 0
+  on native until TS.7 flips it.
+- wgpu samples compressed already (Phase T); the new slots now drive a real
+  wgpu bind+sample render path.
+
+### Security
+
+- Two adversarial reviews of the diff — **0 CRITICAL / 2 HIGH (fixed)**, all
+  findings resolved before the cut. `docs/audit/2026-06-15-ts-sampling-audit.md`.
+
+### Metrics
+
+- CPU assertions 2530 → **2702**. `Backend` 264 → 280 B; `NativeTexture`
+  48 → 64 B; `NativePass` 32 → 40 B; PM4 scratch 1024 → 2048 B.
+
+### Next
+
+- **Phase TS.6–8 (3.2.3)** — tile-swizzle + BC/ETC2/ASTC native sampling +
+  bilinear; then Phase S/N (SPIR-V), Phase F (f64), Phase R (render-graph MQ).
+
 ## [3.2.1] — 2026-06-15
 
 **Buffer-to-buffer copy + real native buffers (Phase X).** Second feature of

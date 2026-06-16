@@ -223,6 +223,12 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
 
   **TS.5 COMPLETE** — native + wgpu RGBA8 sampling both HW-verified. The
   T#/S#/image_load/descriptor/sampleable infra works on both backends.
+- [x] **Cut 3.2.2** (2026-06-15) — TS.1–TS.5 content-complete (per the version
+  map). VERSION 3.2.1→3.2.2; CHANGELOG `[3.2.2]`; audit
+  `docs/audit/2026-06-15-ts-sampling-audit.md`; CLAUDE.md/README synced (2702
+  asserts, struct/BACKEND_SIZE deltas); version-check OK; dist regen (embeds
+  3.2.2) + idempotent; closeout green (suite 2702/0, 9 benches, 7 HW programs
+  exit 0 on Cezanne incl. native+wgpu texture-sample). TS.6–8 → 3.2.3.
 - [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
   remap; round-trip-identity + addrlib-reference CPU tests.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**
