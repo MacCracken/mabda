@@ -902,6 +902,34 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
 # the native analog of the wgpu backend's adapter-family caps guard.
 var NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
 
+# v3.2 TS.8 — the single source of truth for "can native SAMPLE `fmt`", at
+# PER-FORMAT granularity (the family bitset alone can't express BC6H). 1 for
+# RGBA8 (always) + any BC format whose family is in NATIVE_TEXCOMP_SUPPORTED,
+# EXCEPT BC6H (HDR float — the native sample path only has an RGBA8_UNORM RT, so
+# it would clamp/quantize; gated until an HDR RT path exists). 0 for unsupported
+# compressed families (ETC2/ASTC) and unknown ids. The create slot gates on this;
+# consumers can call it to pre-check a format before create.
+fn native_texfmt_sampleable(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 1; }
+    var fam = mabda_texfmt_compression_family(fmt);
+    if (fam == 0) { return 0; }                            # unknown / non-sampleable id
+    if ((NATIVE_TEXCOMP_SUPPORTED & fam) == 0) { return 0; }   # family not supported
+    if (fmt == MABDA_TEXFMT_BC6H) { return 0; }            # HDR float vs RGBA8 RT
+    return 1;
+}
+
+# v3.2 TS.8 — native sibling of the wgpu gpu_caps_detect_texture_compression
+# (backend_wgpu.cyr): returns the compression-family bitset native AMD supports
+# for sampling, so a consumer building a native context's GpuCapabilities can
+# `gpu_caps_set_texture_compression(caps, gpu_caps_native_texture_compression())`
+# — the same populate-then-`gpu_caps_supports_format` flow as wgpu (closes the
+# native storage-only gap). FAMILY-granular like the caps bitset; the per-format
+# BC6H exclusion (see native_texfmt_sampleable) is finer than this advisory can
+# express, so a BC6H pre-check should use native_texfmt_sampleable.
+fn gpu_caps_native_texture_compression(): i64 {
+    return NATIVE_TEXCOMP_SUPPORTED;
+}
+
 # v3.2 TS.5/TS.7c — sampleable 2D texture create (native). Differs from the
 # storage create_2d_fmt: a SINGLE BO holds [surface | pad-to-256 | T#(32) +
 # S#(16)], so one handle covers both for CS residency and t_va points at the
@@ -937,16 +965,14 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     # the public write API (which rejects tiled until TS.7c-3). Mirrors the wgpu
     # backend guard. Until NATIVE_TEXCOMP_SUPPORTED flips, this returns 0 BEFORE
     # any allocation — a genuine reject, not an ioctl-failure-on-fake-fd.
+    # Backend caps gate (pre-ioctl), per-format: a compressed format native can't
+    # faithfully sample (unsupported family, or BC6H's HDR-vs-RGBA8-RT mismatch) is
+    # rejected here before any allocation, so a consumer never gets a sampleable
+    # texture it can't populate. native_texfmt_sampleable is the single source of
+    # truth shared with the consumer-facing pre-check. (RGBA8 -> 1, passes through.)
     var fam = mabda_texfmt_compression_family(fmt);
     if (fam != 0) {
-        if ((NATIVE_TEXCOMP_SUPPORTED & fam) == 0) { return 0; }
-        # BC6H is HDR unsigned-float (T# NUM_FORMAT=FLOAT): the TA decodes it to
-        # values that legitimately exceed [0,1], but the native sample path only
-        # exports to an RGBA8_UNORM render target, which clamps/quantizes them — a
-        # silently-wrong decode, not a faithful one. The BC family bit (above)
-        # admits BC6H; reject it here until an HDR-capable RT path exists. (Review
-        # 2026-06-16 HIGH; the other BC formats are UNORM/[0,1] and export cleanly.)
-        if (fmt == MABDA_TEXFMT_BC6H) { return 0; }
+        if (native_texfmt_sampleable(fmt) == 0) { return 0; }
     }
     var fd = native_ctx_fd(ctx);
 

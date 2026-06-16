@@ -300,12 +300,16 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
 - [ ] **TS.8** — Bilinear; ETC2/ASTC path authored (cap bit flipped IFF
   HW decode verifies — see HW gaps); **strike Phase T's storage-only
   limitation**; cut the TS minors. Also:
-  - **Wire native caps advertisement** — a native `GpuContext` never builds a
-    `GpuCapabilities` struct (no native caps path; the bitset stays 0), so
-    `gpu_caps_supports_format(BC)` reports unsupported even though native BC
-    create+sample now works (review 2026-06-16). Populate native caps from
-    `NATIVE_TEXCOMP_SUPPORTED` (+ texture limits) so the advisory and the create
-    gate agree — part of striking the storage-only limitation.
+  - **Native caps advertisement (done)** — added `gpu_caps_native_texture_compression()`
+    (native sibling of wgpu's `gpu_caps_detect_texture_compression(adapter)`), so a
+    consumer populates a native context's caps the same way:
+    `gpu_caps_set_texture_compression(caps, gpu_caps_native_texture_compression())`
+    then `gpu_caps_supports_format` — closing the storage-only gap (review
+    2026-06-16) to wgpu parity. The per-format truth (incl. the BC6H HDR exclusion
+    the family bitset can't express) lives in `native_texfmt_sampleable(fmt)`, the
+    single source of truth the create gate also uses. A full backend-abstracted
+    `from_context` caps builder (texture limits etc.) is the remaining storage-only
+    cleanup.
   - **BC6H sample** once an HDR RT path lands (BC1/BC3/BC4/BC5/BC7 are all
     HW-sample-verified; BC6H is the only BC format still gated, on HDR grounds).
 
