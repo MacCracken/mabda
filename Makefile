@@ -326,6 +326,16 @@ build/native_texture_sample_e2e: programs/native_texture_sample_e2e.cyr src/*.cy
 test-native-texture-sample-e2e: build/native_texture_sample_e2e
 	./build/native_texture_sample_e2e
 
+# v3.2 TS.6 — SDMA tiling probe: L2T->T2L round-trip proves the SW_64KB_S
+# COPY_TILED_SUB_WINDOW path works on Cezanne. HW-gated.
+build/native_sdma_tiled_roundtrip: programs/native_sdma_tiled_roundtrip.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_sdma_tiled_roundtrip.cyr $@
+
+.PHONY: test-native-sdma-tiled-roundtrip
+test-native-sdma-tiled-roundtrip: build/native_sdma_tiled_roundtrip
+	./build/native_sdma_tiled_roundtrip
+
 # v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
 # -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
 # result CPU-verified. HW-gated (needs an AMD render node).

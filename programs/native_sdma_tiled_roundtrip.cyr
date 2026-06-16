@@ -1,0 +1,152 @@
+# programs/native_sdma_tiled_roundtrip.cyr — v3.2 TS.6 SDMA-tiling probe
+#
+# Confirms the "let the HW tile it" approach (maintainer pick): can the SDMA
+# engine apply the GFX9 SW_64KB_S swizzle via COPY_TILED_SUB_WINDOW, so mabda
+# doesn't port the addrlib swizzle equation? Probe = a round-trip:
+#
+#   linear src (per-element pattern)  --L2T-->  tiled BO  --T2L-->  linear dst
+#
+# Both directions use IDENTICAL tiled params, so the swizzle is a bijection
+# that cancels — dst == src iff the SDMA tiled copy works + is self-consistent
+# on Cezanne. (ABSOLUTE correctness vs the TA's expectation is TS.7's sampling
+# test; this just proves the mechanism + that the packet is accepted.)
+#
+# Uses an 8-byte element (element_size=3, the BC1 block size) at 256x256 blocks
+# = 512 KiB linear; the tiled BO is over-allocated (1 MiB, 64 KiB-aligned) so
+# the swizzle footprint can't overflow. swizzle_mode=ADDR_SW_64KB_S(9),
+# dim=RADEON_RESOURCE_2D(1).
+#
+# Exit codes: 0 round-trip identity; 1 ctx; 2/3/4 BO setup; 8 syncobj;
+#   9 L2T submit/wait; 10 T2L submit/wait; 11 mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn mono_ns(): i64 {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+# Submit the 56-byte SDMA tiled packet already staged in the cached IB, with a
+# 4-entry BO list (fence / ib / linear / tiled). Returns 0 | neg-rc.
+fn _submit_dma(ctx, lin_handle, tiled_handle, sdma_bytes): i64 {
+    var fd = native_ctx_fd(ctx);
+    var entries[32];
+    store32(&entries +  0, native_ctx_fence_handle(ctx)); store32(&entries +  4, 1);
+    store32(&entries +  8, native_ctx_ib_handle(ctx));    store32(&entries + 12, 10);
+    store32(&entries + 16, lin_handle);                   store32(&entries + 20, 3);
+    store32(&entries + 24, tiled_handle);                 store32(&entries + 28, 3);
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, 4);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var sbuf[8];
+    if (native_syncobj_create(fd, &sbuf) != 0) { return 0 - 1; }
+    var so = load64(&sbuf);
+    var rc = native_cs_submit_4chunk(fd, native_ctx_id(ctx), &bo_list_in,
+    native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
+    native_ctx_fence_handle(ctx), 32, 0);
+    if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
+    var wrc = native_syncobj_wait(fd, so, mono_ns() + 15000000000);
+    native_syncobj_destroy(fd, so);
+    return wrc;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda SDMA tiled round-trip probe (v3.2 TS.6)\n");
+    print_cstr("---------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var W = 256;
+    var H = 256;
+    var ELEM = 8;          # bytes per element (BC1 block size)
+    var ESIZE = 3;         # log2(8)
+    var lin_bytes = W * H * ELEM;          # 512 KiB
+    var tiled_bytes = lin_bytes * 2;       # 1 MiB headroom, 64 KiB-aligned
+
+    # src linear (pattern), dst linear (zeroed), tiled (scratch).
+    var src_va = native_ctx_alloc_texture_va(ctx, lin_bytes);
+    var sbo[16];
+    if (native_bo_create_gtt(fd, lin_bytes, &sbo) != 0) { print_cstr("FAIL: src bo\n"); return 2; }
+    var src_h = load64(&sbo + 0);
+    var src_a = load64(&sbo + 8);
+    if (native_gem_va_map(fd, src_h, src_va, lin_bytes, _NATIVE_PERM_DATA) != 0) {
+        print_cstr("FAIL: src va\n"); return 2; }
+    var i = 0;
+    while (i < lin_bytes / 4) { store32(src_a + i * 4, 0xC0DE0000 + i); i = i + 1; }
+
+    var dst_va = native_ctx_alloc_texture_va(ctx, lin_bytes);
+    var dbo[16];
+    if (native_bo_create_gtt(fd, lin_bytes, &dbo) != 0) { print_cstr("FAIL: dst bo\n"); return 3; }
+    var dst_h = load64(&dbo + 0);
+    var dst_a = load64(&dbo + 8);
+    if (native_gem_va_map(fd, dst_h, dst_va, lin_bytes, _NATIVE_PERM_DATA) != 0) {
+        print_cstr("FAIL: dst va\n"); return 3; }
+    memset(dst_a, 0, lin_bytes);
+
+    var tiled_va = native_ctx_alloc_texture_va(ctx, tiled_bytes);
+    var tbo[16];
+    if (native_bo_create_gtt(fd, tiled_bytes, &tbo) != 0) { print_cstr("FAIL: tiled bo\n"); return 4; }
+    var tiled_h = load64(&tbo + 0);
+    var tiled_a = load64(&tbo + 8);
+    if (native_gem_va_map(fd, tiled_h, tiled_va, tiled_bytes, _NATIVE_PERM_DATA) != 0) {
+        print_cstr("FAIL: tiled va\n"); return 4; }
+    memset(tiled_a, 0, tiled_bytes);
+    print_cstr("PASS: BOs (256x256 8B blocks, 512KiB lin / 1MiB tiled)\n");
+
+    var ib_addr = native_ctx_ib_addr(ctx);
+    var epitch = W - 1;     # extended pitch (elements) - 1
+    var slice = W * H;      # linear slice pitch (elements)
+
+    # ---- L2T: linear src -> tiled (HW applies SW_64KB_S) ----
+    memset(ib_addr, 0, 4096);
+    var n1 = native_sdma_build_copy_tiled(ib_addr, tiled_va, src_va,
+    ESIZE, 9, 1, epitch, W, H, W, slice, W, H, 0);
+    var rc = _submit_dma(ctx, src_h, tiled_h, n1);
+    if (rc != 0) { print_cstr("FAIL: L2T rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 9; }
+    print_cstr("PASS: L2T (linear -> tiled) submitted + signaled\n");
+
+    # ---- T2L: tiled -> linear dst (same params, detile=1) ----
+    memset(ib_addr, 0, 4096);
+    var n2 = native_sdma_build_copy_tiled(ib_addr, tiled_va, dst_va,
+    ESIZE, 9, 1, epitch, W, H, W, slice, W, H, 1);
+    rc = _submit_dma(ctx, dst_h, tiled_h, n2);
+    if (rc != 0) { print_cstr("FAIL: T2L rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 10; }
+    print_cstr("PASS: T2L (tiled -> linear) submitted + signaled\n");
+
+    # ---- Verify dst == src (the swizzle round-tripped) ----
+    var bad = 0 - 1;
+    var j = 0;
+    while (j < lin_bytes / 4) {
+        if (load32(dst_a + j * 4) != 0xC0DE0000 + j) { bad = j; j = lin_bytes; }
+        j = j + 1;
+    }
+    if (bad != 0 - 1) {
+        print_cstr("FAIL: mismatch at dword "); print_i64(bad);
+        print_cstr(" got "); print_i64(load32(dst_a + bad * 4)); print_cstr("\n");
+        gpu_context_release(ctx); return 11;
+    }
+    gpu_context_release(ctx);
+    print_cstr("OK — SDMA SW_64KB_S L2T->T2L round-trips; HW tiling works\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

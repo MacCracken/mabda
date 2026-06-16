@@ -237,10 +237,15 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   read = T2L). **Done this bite:** `native_sdma_build_copy_tiled` — the 14-dword
   packet builder (transcribed from Mesa `ac_emit_sdma_copy_tiled_sub_window`,
   SDMA_4_0; `info_dword = element_size | swizzle_mode<<3 | dim<<9 | epitch<<16`),
-  CPU-pinned. **Remaining:** tiled-surface geometry (the `SW_64KB_S` swizzle_mode
-  value + `epitch` + tiled BO size — the addrlib-equivalent geometry the HW
-  still needs supplied) + a HW L2T→T2L round-trip to confirm the mechanism on
-  Cezanne, then fold into TS.7.
+  CPU-pinned. **SDMA-tiling mechanism PROVEN on Cezanne:**
+  `programs/native_sdma_tiled_roundtrip.cyr` — a linear→tiled→linear round-trip
+  (`ADDR_SW_64KB_S`=9, `RADEON_RESOURCE_2D`=1, 8-byte/BC1 element, 256×256)
+  comes back byte-identical, so the `COPY_TILED_SUB_WINDOW` packet is accepted
+  and the HW applies + reverses the swizzle. (Round-trip = self-consistency;
+  ABSOLUTE TA-match is TS.7's sampling test.) **Remaining → TS.7:** the
+  addrlib-exact tiled geometry (`epitch` + tiled BO size that the TA agrees
+  with) — confirmed at TS.7 by sampling the SDMA-tiled BC surface vs a CPU
+  decode.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**
   (`native_compressed_sample_e2e.cyr`, CPU-decode verify); flip native BC
   cap bit to 1.
