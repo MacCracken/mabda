@@ -185,7 +185,7 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `R_SPI_SHADER_USER_DATA_PS_0/1`). **Deferred to TS.7** (with the scaled
   compressed path): the UV-export VS + normalized `image_sample` FS — not
   needed for the RT-sized RGBA8 MVP, which the screen-pos oracle covers.
-- [~] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne** (delivered in
+- [x] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne** (delivered in
   sub-bites). **TS.5a done:** native `_backend_native_texture_create_2d_sampleable`
   (linear surface BO + a descriptor BO carrying the T# at +0 and a default
   point/clamp S# at +32; descriptor BO bump-leaked per the create-once model)
@@ -207,10 +207,22 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   (`review-wgpu-sample-ts5`, 4 confirmed) → fixed: per-draw sampler/bind-group
   /BGL **handle leak** (release after set_bind_group; HIGH) + null-guards on
   the create chain (LOW). No regression (render_e2e still green).
-  **Remaining:** (1) the native PM4 render surgery — textured-FS pipeline (image_load),
-  `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA `SET_SH_REG`, RSRC1 high-water —
-  wired into `render_pass_draw` + `native_texture_sample_e2e.cyr` + on-device
-  iteration.
+  **(1) native HW sampling — DONE + HW-verified on Cezanne.** Single-BO
+  sampleable create (surface + descriptor tail); `render_pass_draw` emits the
+  textured override (`SPI_PS_INPUT_ENA=0x302`, `RSRC1_PS` VGPR bump, PS
+  USER_DATA = descriptor VA) after the pipeline blocks (last-write) + adds the
+  surface BO to a 6-entry residency list; `_NATIVE_PM4_SCRATCH_BYTES` 1024→2048
+  (the override pushes the stream to ~261 dwords). `programs/native_texture_sample_e2e.cyr`
+  **passes pixel-exact (RT[x,y]==tex[x,y])** — the only bug was the scratch
+  overflow; the gfx9.json descriptors + llvm-mc shader + SPI/RSRC were correct
+  first-try (no TDR iteration). Adversarial review (`review-native-sample-ts5`,
+  6 confirmed) → fixed: sampleable release size mismatch (recompute bo_size
+  from t_va; MED), release now clears t_va (use-after-bind; MED), per-draw
+  bound_tex clear (LOW), reject compressed-sampleable until TS.7 (LOW), stale
+  docstrings (NIT). No regression (native_render_e2e green).
+
+  **TS.5 COMPLETE** — native + wgpu RGBA8 sampling both HW-verified. The
+  T#/S#/image_load/descriptor/sampleable infra works on both backends.
 - [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
   remap; round-trip-identity + addrlib-reference CPU tests.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**

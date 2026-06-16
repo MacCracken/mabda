@@ -316,6 +316,16 @@ build/native_multiqueue_e2e: programs/native_multiqueue_e2e.cyr src/*.cyr
 test-native-multiqueue-e2e: build/native_multiqueue_e2e
 	./build/native_multiqueue_e2e
 
+# v3.2 TS.5 — native RGBA8 sampling MVP: T#/image_load sample a texture across
+# a fullscreen quad, verify RT[x,y]==tex[x,y]. HW-gated (AMD render node).
+build/native_texture_sample_e2e: programs/native_texture_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_texture_sample_e2e.cyr $@
+
+.PHONY: test-native-texture-sample-e2e
+test-native-texture-sample-e2e: build/native_texture_sample_e2e
+	./build/native_texture_sample_e2e
+
 # v3.2 X.7 — public buffer-copy e2e: gpu_buffer_copy round-trip + compute
 # -> barrier -> gpu_queue_transfer_copy consume on the SDMA ring, every
 # result CPU-verified. HW-gated (needs an AMD render node).
