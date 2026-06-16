@@ -185,9 +185,18 @@ high-risk half, sequenced last. **This is the work I wrongly punted to
   `R_SPI_SHADER_USER_DATA_PS_0/1`). **Deferred to TS.7** (with the scaled
   compressed path): the UV-export VS + normalized `image_sample` FS — not
   needed for the RT-sized RGBA8 MVP, which the screen-pos oracle covers.
-- [ ] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne**
-  (`native_texture_sample_e2e.cyr`) — proves T#/S#/`image_sample` with zero
-  tiling risk.
+- [~] **TS.5** — **Uncompressed RGBA8 sampling MVP on Cezanne** (delivered in
+  sub-bites). **TS.5a done:** native `_backend_native_texture_create_2d_sampleable`
+  (linear surface BO + a descriptor BO carrying the T# at +0 and a default
+  point/clamp S# at +32; descriptor BO bump-leaked per the create-once model)
+  + `_backend_native_texture_bind_for_sample` (stashes the descriptor VA on
+  the pass); both native slots installed + CPU-tested. **Remaining:** (b) wgpu
+  `create_sampleable`/`bind_for_sample` fillers + activate the
+  `backend_is_complete` walk over 264..280; (c) the PM4 render surgery —
+  textured-FS pipeline (image_load), `SPI_PS_INPUT_ENA=0x302`, PS USER_DATA
+  `SET_SH_REG` of the descriptor VA, RSRC1 high-water — wired into
+  `render_pass_draw`; (d) `programs/native_texture_sample_e2e.cyr` + on-device
+  iteration.
 - [ ] **TS.6** — Tile-swizzle transform (SW_64KB_S) — pure-Cyrius per-block
   remap; round-trip-identity + addrlib-reference CPU tests.
 - [ ] **TS.7** — **BC1/BC7 compressed sampling on Cezanne**

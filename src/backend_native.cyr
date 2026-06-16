@@ -869,6 +869,83 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     return tex;
 }
 
+# v3.2 TS.5 — sampleable 2D texture create (native). Differs from the storage
+# create_2d_fmt: besides the surface BO it allocates a small DESCRIPTOR BO and
+# builds the GFX9 T# (image resource, +0) + a default point/clamp S# (sampler,
+# +32) into it, stashing the descriptor VA + sw_mode on the (64-byte) tex.
+# The textured FS (TS.4) s_load_dwordx8's the T# from this VA. MVP path is
+# LINEAR/RGBA8 — compressed sampling needs a tiled SW_MODE + swizzle (TS.7);
+# until then `fmt` is accepted but the surface stays linear.
+#
+# Two BOs: the surface is released normally by texture_release (SIZE = logical
+# surface bytes, so write/read bounds are unchanged); the descriptor BO is
+# bump-leaked for the ctx lifetime (like the generate-mipmaps shader BO — the
+# native allocator is create-once and never reclaims). Returns a tex_ptr, or 0
+# on invalid dims/format, region exhaustion, or an ioctl failure. (HW path:
+# the BO alloc/map is HW; the guards + descriptor build are deterministic.)
+fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
+    var logical = mabda_texfmt_data_size(fmt, width, height);
+    if (logical == 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var sw_mode = GFX9_SW_MODE_LINEAR;   # MVP; tiled compressed = TS.7
+
+    # Surface BO (+ the base tex fields) via the storage helper.
+    var bo_size = _native_align_up(logical, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    if (native_texture_create_2d_fmt(fd, va, width, height, fmt, tex) != 0) {
+        return 0;
+    }
+
+    # Descriptor BO (4 KiB): T# at +0, default S# at +32.
+    var dva = native_ctx_alloc_texture_va(ctx, 4096);
+    if (dva == 0) { native_texture_release_2d_rgba8(fd, tex); return 0; }
+    var dbo[16];
+    if (native_bo_create_gtt(fd, 4096, &dbo) != 0) {
+        native_texture_release_2d_rgba8(fd, tex); return 0;
+    }
+    var dhandle = load64(&dbo + 0);
+    var daddr   = load64(&dbo + 8);
+    if (native_gem_va_map(fd, dhandle, dva, 4096, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, dhandle, daddr, 4096);
+        native_texture_release_2d_rgba8(fd, tex);
+        return 0;
+    }
+    memset(daddr, 0, 4096);
+    native_gfx9_image_descriptor(daddr, 0, va, width, height, fmt, sw_mode, 1);
+    native_gfx9_sampler_descriptor(daddr, 32,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+
+    native_tex_set_sw_mode(tex, sw_mode);
+    native_tex_set_t_va(tex, dva);
+    return tex;
+}
+
+# v3.2 TS.5 — bind a sampleable texture into a render pass (native). Stashes
+# the texture's T#/S# descriptor VA on the pass; the next render_pass_draw
+# emits the PS USER_DATA SET_SH_REG from it (the textured-FS PM4 path, next
+# sub-bite). `sampler` is accepted for API stability but unused on the
+# image_load MVP path (the FS reads no S#); rebuilding the S# from an explicit
+# sampler is TS.7 (image_sample). Returns 0|GPU_ERR_*.
+fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0)  { return GPU_ERR_TEXTURE; }
+    var dva = native_tex_t_va(tex);
+    if (dva == 0) { return GPU_ERR_TEXTURE; }   # not a sampleable texture
+    store64(pass + NATIVE_PASS_FIELD_TEX_DESC_VA, dva);
+    return 0;
+}
+
 # v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
 # whole mip pyramid; generate (M.6b) downsamples level-by-level into it.
 fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
@@ -1472,6 +1549,13 @@ fn backend_native_new(): i64 {
     # the wgpu filler lands too ("activate when both fill").
     backend_set_slot(b, BACKEND_SLOT_BUFFER_COPY,
     &_backend_native_buffer_copy);
+    # v3.2 TS.5 — sampleable-texture slots. The backend_is_complete walk over
+    # 264..280 activates once wgpu fills these too (next sub-bite); native
+    # fills them now.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE,
+    &_backend_native_texture_create_2d_sampleable);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
+    &_backend_native_texture_bind_for_sample);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
