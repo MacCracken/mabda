@@ -15,12 +15,23 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-### Next
-- N.5g — the named MVP exit: hand-author the downsample SPIR-V, compile it through
-  the same path, and pixel-match `native_mipmap_e2e` on Cezanne (per the analysis,
-  a naive compiled downsample likely needs no new ops). N.6 — a generic
-  multi-binding/TGID compute dispatcher + the `_backend_native_shader_module_create`
-  slot wiring (so consumers compile SPIR-V through the public API). 3.2.7.
+### Added — Phase N.6 (multi-binding dispatch + a novel kernel on the GPU)
+- **A compiled kernel the compiler never saw as hand-authored bytes runs on
+  Cezanne with two real storage buffers.** `programs/native_spirv_saxpy_e2e.cyr`:
+  a SAXPY-shape `y[lid.x] = 3*x[lid.x] + y[lid.x]` (uint, LocalSize 8) →
+  `gfx9_compile` → dispatch reading `x` (binding 0 → `s0:s1`) and read-modify-
+  writing `y` (binding 1 → `s2:s3`) → `y[i]` becomes `3*i + 100` for all 8 lanes.
+  `make test-native-spirv-saxpy-e2e`.
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_dispatch`: a generic
+  N-binding compute composer that lays each binding VA into USER_DATA per the
+  compiler's ABI (binding k → `s[2k:2k+1]`) and uses the compiler's RSRC1/RSRC2
+  verbatim (no scratch — a compiled MVP kernel does not spill).
+- `src/backend_native.cyr` — `native_compute_dispatch_cached_n`: the cached submit
+  with a variable BO list (fence + stub + each binding handle + shader + IB) so
+  every storage buffer is resident.
+- `tests/tcyr/native.tcyr` +4 asserts: a structural CPU test that N binding VAs
+  land in the right USER_DATA slots with the compiler's RSRC. (Bounded by the
+  16-SGPR USER_DATA limit ⇒ ≤8 bindings.)
 
 ## [3.2.6] — 2026-06-17
 

@@ -632,8 +632,16 @@ hand-authored shaders stay as oracle + fallback.
     `v_mov` materialization for FLAT addresses.
   - [ ] **N.5g** — downsample SPIR-V → full pipeline; proven-equivalent assert +
     `native_mipmap_e2e` pixel-match on Cezanne. **MVP exit.**
-- [ ] **N.6** *(3.2.8)* — First novel kernel (SAXPY); differential CPU oracle;
-  generic dispatcher.
+- [~] **N.6** *(3.2.8)* — First novel kernel + generic dispatcher.
+  - [x] **N.6 core (2026-06-17) — HW-verified on Cezanne.** A novel 2-binding
+    SAXPY-shape kernel (`y[lid.x]=3*x[lid.x]+y[lid.x]`, the compiler never saw it
+    as bytes) compiles + dispatches reading/writing two real buffers (binding k →
+    `s[2k:2k+1]`), `y[i]==3*i+100` all lanes. `native_pm4_build_compute_dispatch`
+    (N-binding composer) + `native_compute_dispatch_cached_n` (variable BO list) +
+    `programs/native_spirv_saxpy_e2e.cyr` + a CPU structural test.
+  - [ ] **N.6 remainder** — `_backend_native_shader_module_create` slot wiring (so
+    consumers compile SPIR-V through the public `gpu_*` API), the TGID/2-D dispatch
+    path, and a fuller differential CPU oracle.
 - [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
   EXEC-mask); divergent-vs-uniform test matrix. May split into two bites.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

@@ -280,6 +280,16 @@ build/native_spirv_compute_e2e: programs/native_spirv_compute_e2e.cyr src/*.cyr
 test-native-spirv-compute-e2e: build/native_spirv_compute_e2e
 	./build/native_spirv_compute_e2e
 
+# N.6: a novel 2-binding SAXPY-shape kernel compiled in-tree + dispatched on the
+# GPU (multi-binding dispatch — USER_DATA s0:s1=x, s2:s3=y).
+build/native_spirv_saxpy_e2e: programs/native_spirv_saxpy_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_saxpy_e2e.cyr $@
+
+.PHONY: test-native-spirv-saxpy-e2e
+test-native-spirv-saxpy-e2e: build/native_spirv_saxpy_e2e
+	./build/native_spirv_saxpy_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

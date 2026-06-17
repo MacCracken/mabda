@@ -9471,6 +9471,58 @@ rsrc1, rsrc2, b0_va, ntx, gx): i64 {
     return pos;
 }
 
+# N.6: generic MULTI-binding compute dispatch for a compiled shader. Lays each of
+# `n_binds` storage-buffer VAs (a caller [n_binds] array of 64-bit VAs) into the
+# compiler's USER_DATA ABI — binding k → USER_DATA_{2k}/{2k+1} = s[2k:2k+1] — and
+# uses the compiler's RSRC1/RSRC2 verbatim (USER_SGPR = 2*n_binds, TGID enables).
+# No scratch (TMPRING=0): a compiled MVP kernel does not spill, and every USER_DATA
+# slot is a real binding. NUM_THREAD_X = LocalSize_x; grid = (gx,1,1). Returns the
+# 64-dword byte length.
+fn native_pm4_build_compute_dispatch(buf, shader_va, rsrc1, rsrc2,
+binds, n_binds, ntx, gx): i64 {
+    var pos = 0;
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, (shader_va >> 40) & 0xFF);
+    var tm01[8];
+    store32(&tm01 + 0, 0xFFFFFFFF);
+    store32(&tm01 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 2, &tm01);
+    var tm23[8];
+    store32(&tm23 + 0, 0);
+    store32(&tm23 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 2, &tm23);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_CP_COHER_START_DELAY, 0);
+    var bc_pair[8];
+    store32(&bc_pair + 0, 0);
+    store32(&bc_pair + 4, 0);
+    pos = native_pm4_set_uconfig_reg_pair(buf, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_LO, (shader_va >> 8) & 0xFFFFFFFF);
+    var rsrc[8];
+    store32(&rsrc + 0, rsrc1);
+    store32(&rsrc + 4, rsrc2);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_TMPRING_SIZE, 0);
+    var bi = 0;
+    while (bi < n_binds) {
+        var va = load64(binds + bi * 8);
+        var pair[8];
+        store32(&pair + 0, va & 0xFFFFFFFF);
+        store32(&pair + 4, (va >> 32) & 0xFFFFFFFF);
+        pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + bi * 8, 2, &pair);
+        bi = bi + 1;
+    }
+    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    var nt[12];
+    store32(&nt + 0, ntx);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    pos = native_pm4_dispatch_direct(buf, pos, gx, 1, 1, GFX9_DISPATCH_INITIATOR);
+    var cur2 = pos / 4;
+    if (cur2 < 64) { pos = native_pm4_nop(buf, pos, 64 - cur2); }
+    return pos;
+}
+
 # v3.1 [M.5]: PM4 stream that dispatches native_gfx9_shader_downsample_2x2
 # to fill one mip level from its parent. Mirrors the deadbeef composer
 # (same STATIC_THREAD_MGMT / COHER / BC_BASE / ACQUIRE_MEM / RESOURCE_LIMITS
@@ -10231,6 +10283,71 @@ shader_handle, out_handle, timeout_ns): i64 {
         return _native_neg_rc_to_gpu_err(rc_save);
     }
 
+    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    native_syncobj_destroy(fd, syncobj_handle);
+    return _native_neg_rc_to_gpu_err(wait_rc);
+}
+
+# ================================================================
+# N.6 — multi-binding compute dispatch (cached path, N storage BOs)
+# ================================================================
+# Like native_compute_dispatch_cached but the BO list carries N binding handles
+# (a caller [n] array of GEM handles) instead of a single out_handle — so a
+# compiled kernel reading/writing several storage buffers (e.g. a 2-binding
+# SAXPY) gets every buffer resident. BO list = fence + stub + bind[0..n) +
+# shader + ib. Synchronous (creates/waits/destroys an ephemeral syncobj).
+fn native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+binds, n_binds, timeout_ns): i64 {
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var ib_handle = native_ctx_ib_handle(ctx);
+    var ib_va = native_ctx_ib_va(ctx);
+    var ib_addr = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_addr = native_ctx_fence_addr(ctx);
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    store64(fence_addr + 32, 0);
+    # entries: fence(1) + stub(3) + each binding(3) + shader(4) + ib(10).
+    var entries[256];
+    var ne = 0;
+    store32(&entries + ne * 8, fence_handle);
+    store32(&entries + ne * 8 + 4, 1);
+    ne = ne + 1;
+    store32(&entries + ne * 8, stub_handle);
+    store32(&entries + ne * 8 + 4, 3);
+    ne = ne + 1;
+    var bi = 0;
+    while (bi < n_binds) {
+        store32(&entries + ne * 8, load64(binds + bi * 8));
+        store32(&entries + ne * 8 + 4, 3);
+        ne = ne + 1;
+        bi = bi + 1;
+    }
+    store32(&entries + ne * 8, shader_handle);
+    store32(&entries + ne * 8 + 4, 4);
+    ne = ne + 1;
+    store32(&entries + ne * 8, ib_handle);
+    store32(&entries + ne * 8 + 4, 10);
+    ne = ne + 1;
+    var bo_list_in[24];
+    store32(&bo_list_in + 0, 0xFFFFFFFF);
+    store32(&bo_list_in + 4, 0xFFFFFFFF);
+    store32(&bo_list_in + 8, ne);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var syncobj_handle = load64(&syncobj_buf);
+    rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    AMDGPU_HW_IP_COMPUTE, syncobj_handle, fence_handle, 32, 0x08);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_syncobj_destroy(fd, syncobj_handle);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
     var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
     native_syncobj_destroy(fd, syncobj_handle);
     return _native_neg_rc_to_gpu_err(wait_rc);
