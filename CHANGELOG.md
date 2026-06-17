@@ -288,6 +288,22 @@ for the immediate forward pointer.
   llvm-mc gfx900 (binding 0→`s0`, binding 1→`s2` via the ABI). Adversarially
   reviewed (workflow). (`GISEL_EXTRACT` builtin resolution stays N.5c.)
 
+### Fixed — N.5b-2 adversarial review (3 confirmed FLAT-path gaps, fixed pre-N.5c)
+- The FLAT emitters read the offset/value operands via raw `gfx9_reg` without
+  validating them, so three not-yet-handled shapes silently emitted wrong bytes
+  (all latent today — the pipeline is unwired — but they go live the moment N.5c
+  wires it, so hardened now). The emitters now route those operands through a
+  checked resolver + a binding range-check and **fail loud**:
+  - a **const-offset access chain** (`off_id`=0) used to encode `vaddr=v255` and
+    drop the byte offset → `CMP_ERR_FLAT_CONST_OFFSET` (the FLAT immediate-offset
+    form is a later bite);
+  - a **uniform / non-VGPR offset or store value** used to emit an SGPR index into
+    the VGPR `vaddr`/`data` field → `CMP_ERR_FLAT_NONVGPR` (SGPR→VGPR
+    materialization is a later bite);
+  - a **binding past the loaded USER_DATA region** → `CMP_ERR_BINDING_RANGE`, and
+    `gfx9_abi_assign` now rejects >8 bindings (`ABI_ERR_TOO_MANY_BINDINGS`, the
+    16-SGPR USER_DATA cap). +4 regression asserts.
+
 ### Changed
 - **Toolchain pin → `cyrius = "6.2.17"`** (tracking upstream; was 6.2.15).
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules

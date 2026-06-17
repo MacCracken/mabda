@@ -32,6 +32,9 @@ var CMP_ERR_BAD_SALU_OPERAND    = 73;   # a SALU op handed a VGPR operand
 var CMP_ERR_TWO_LITERALS        = 74;   # >1 literal in one instruction (illegal)
 var CMP_ERR_TOO_MANY_IDS        = 75;   # cap_ids beyond the file-map scratch
 var CMP_ERR_VOP3_LITERAL        = 76;   # a 32-bit literal operand in a VOP3 (no literal form)
+var CMP_ERR_FLAT_CONST_OFFSET   = 77;   # const-offset access chain (off_id 0); immediate-offset form is a later bite
+var CMP_ERR_FLAT_NONVGPR        = 78;   # a FLAT offset/data operand not in a VGPR (uniform → needs materialization)
+var CMP_ERR_BINDING_RANGE       = 79;   # a binding outside the loaded USER_DATA region
 
 # ================================================================
 # Operand resolution
@@ -195,13 +198,36 @@ fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
 }
 
+# A FLAT address/data operand must be an SSA value living in a VGPR (a per-lane
+# offset or store value). Returns the raw VGPR index, or fails loud: id-0 is the
+# const-offset access chain (off_id 0 — the FLAT immediate-offset form is a later
+# bite); a non-SSA / SGPR-file value is a uniform operand that would need a
+# SGPR→VGPR materialization (also later) — NOT silently emitted as a VGPR index.
+# (N.5b-2 review: the FLAT emitters used to read gfx9_reg(alloc, field) raw, so an
+# id-0 const offset became v255 and a uniform offset read an unrelated VGPR.)
+fn _cmp_vgpr_operand(m, alloc, isvgpr, field): i64 {
+    if (field == 0) { return 0 - CMP_ERR_FLAT_CONST_OFFSET; }
+    if (mir_val_kind(m, field) != MIR_VK_SSA) { return 0 - CMP_ERR_FLAT_NONVGPR; }
+    if (load64(isvgpr + field * 8) == 0) { return 0 - CMP_ERR_FLAT_NONVGPR; }
+    return gfx9_reg(alloc, field);
+}
+
+# The binding (flags bits 8+) must index a buffer actually loaded into USER_DATA.
+fn _cmp_flat_saddr(abi, isel, i): i64 {
+    var binding = (gisel_flags(isel, i) >> 8) & 0xFF;
+    if (binding >= gfx9_abi_num_bindings(abi)) { return 0 - CMP_ERR_BINDING_RANGE; }
+    return gfx9_abi_binding_sgpr(abi, binding);
+}
+
 # FLAT global load (SADDR form): the 64-bit base lives in the binding's USER_DATA
 # SGPR pair (saddr), the per-lane byte offset in a VGPR (vaddr). dst = the loaded
 # VGPR. a = offset vreg, binding in flags bits 8+. No SGPR→VGPR move or 64-bit add
 # needed — the divergent offset rides the vaddr field.
-fn _emit_flat_load(m, isel, i, alloc, abi, buf, pos): i64 {
-    var saddr = gfx9_abi_binding_sgpr(abi, (gisel_flags(isel, i) >> 8) & 0xFF);
-    var vaddr = gfx9_reg(alloc, gisel_a(isel, i));
+fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+    var saddr = _cmp_flat_saddr(abi, isel, i);
+    if (saddr < 0) { return saddr; }
+    var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (vaddr < 0) { return vaddr; }
     var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
     var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_LOAD_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(vdst, saddr, 0, vaddr));
@@ -209,10 +235,13 @@ fn _emit_flat_load(m, isel, i, alloc, abi, buf, pos): i64 {
 
 # FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
 # flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
-fn _emit_flat_store(m, isel, i, alloc, abi, buf, pos): i64 {
-    var saddr = gfx9_abi_binding_sgpr(abi, (gisel_flags(isel, i) >> 8) & 0xFF);
-    var vaddr = gfx9_reg(alloc, gisel_a(isel, i));
-    var data = gfx9_reg(alloc, gisel_c(isel, i));
+fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+    var saddr = _cmp_flat_saddr(abi, isel, i);
+    if (saddr < 0) { return saddr; }
+    var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (vaddr < 0) { return vaddr; }
+    var data = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_c(isel, i));
+    if (data < 0) { return data; }
     var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
@@ -253,8 +282,8 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_V_MUL_LO_U32) {
         return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32);
     }
-    if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, buf, pos); }
-    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, buf, pos); }
+    if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
+    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     return 0 - CMP_ERR_UNSUPPORTED_OP;

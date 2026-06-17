@@ -1902,6 +1902,63 @@ fn test_gfx9_emit_flat_vop3() {
     return 0;
 }
 
+# N.5b-2 review: the FLAT emitters must FAIL LOUD on the operand shapes they do
+# not yet handle, rather than emitting v255 / an SGPR index / a wrapped binding.
+fn test_gfx9_flat_review_guards() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_bufvar(&m, 13, 0);
+    _mir_set_val(&m, 5, MIR_VK_SSA, MIR_T_U32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    mir_set_const(&m, 7, MIR_T_U32, 1);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 5 * 16, 8);
+    store64(&alloc + 6 * 16, 2);
+    var built[128];
+    var isel[120];
+    # (a) const-offset access chain (offset operand id 0) -> fail loud, not v255
+    _gisel_emit(&isel, 0, GISEL_GLOBAL_LOAD, 6, 0, 0, 0, 0);
+    var ra = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    assert_eq(ra, 0 - CMP_ERR_FLAT_CONST_OFFSET, "const-offset load fails loud");
+    # (b) uniform (SGPR-file) offset -> fail loud, not an SGPR index in vaddr.
+    # %5 is defined by an S_* op so the file-map marks it SGPR.
+    _gisel_emit(&isel, 0, GISEL_S_ADD_I32, 5, 7, 7, 0, 0);
+    _gisel_emit(&isel, 1, GISEL_GLOBAL_LOAD, 6, 5, 0, 0, 0);
+    var rb = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    assert_eq(rb, 0 - CMP_ERR_FLAT_NONVGPR, "uniform offset fails loud");
+    # (c) a binding past the loaded USER_DATA region -> fail loud
+    _gisel_emit(&isel, 0, GISEL_V_CVT_F32_I32, 6, 6, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 1, GISEL_GLOBAL_LOAD, 6, 6, 0, 0, 3 << 8);
+    var rc = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    assert_eq(rc, 0 - CMP_ERR_BINDING_RANGE, "out-of-range binding fails loud");
+    return 0;
+}
+
+# N.5b-2 review: too many buffer bindings to fit USER_DATA fails loud.
+fn test_gfx9_abi_too_many_bindings() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    var b = 0;
+    while (b < 9) {
+        mir_set_bufvar(&m, 5 + b, b);
+        b = b + 1;
+    }
+    var abi[64];
+    assert_eq(gfx9_abi_assign(&m, &abi), 0 - ABI_ERR_TOO_MANY_BINDINGS, "9 bindings overflow USER_DATA");
+    return 0;
+}
+
 # The canonical ABI assignment: 2 buffer bindings + GlobalInvocationId.
 fn test_gfx9_abi_assign() {
     var m[80];
@@ -1982,5 +2039,7 @@ fn main(): i64 {
     test_gfx9_abi_rsrc();
     test_gfx9_abi_assign();
     test_gfx9_emit_flat_vop3();
+    test_gfx9_flat_review_guards();
+    test_gfx9_abi_too_many_bindings();
     return assert_summary();
 }

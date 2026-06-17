@@ -578,8 +578,12 @@ hand-authored shaders stay as oracle + fallback.
       `v_mul_lo_u32` (0x285) + `GFX9_FLAT_GLOBAL_LOAD_DWORD` (0x14). `gfx9_emit_program`
       gained the `abi` param. 10 asserts: load→mul→store byte-matches llvm-mc.
       **N.5b-1 review fix folded in:** `gfx9_rsrc1` now fails loud on a VGPRS/SGPRS
-      field overflow (was a silent `& 0xF` wrap; LOW, defense-in-depth). Adversarial
-      review (workflow). `GISEL_EXTRACT` builtin resolution → N.5c.
+      field overflow (was a silent `& 0xF` wrap; LOW, defense-in-depth).
+      **N.5b-2 review (workflow): 3 confirmed FLAT-path gaps fixed** — the offset/
+      value operands are now checked (fail loud on const-offset `off_id`=0, on a
+      uniform/non-VGPR operand, and on an out-of-range binding; `gfx9_abi_assign`
+      caps bindings at the 16-SGPR USER_DATA limit). All latent (unwired) but go
+      live in N.5c. `GISEL_EXTRACT` builtin resolution → N.5c.
   - [ ] **N.5c** — SAXPY first oracle: top-level `gfx9_compile` (validate→lower→
     uniformity→isel→regalloc→abi→waitcnt→emit→pad) + byte fixture.
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
