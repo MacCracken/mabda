@@ -468,6 +468,293 @@ fn test_spirv_decoration_table() {
     return 0;
 }
 
+# ================================================================
+# Phase N.2a — MIR data model + uniformity pass (mir.cyr)
+# ================================================================
+# Type-distill fixture: int(signed/unsigned), float(32/64), vec4(f32/f64/count5).
+fn _spv_build_distill_types(buf): i64 {
+    store32(buf +   0, 0x07230203);
+    store32(buf +   4, 0x00010300);
+    store32(buf +   8, 0);
+    store32(buf +  12, 16);            # id-bound
+    store32(buf +  16, 0);
+    store32(buf +  20, (4 << 16) | 21);   # OpTypeInt %2 32 1 (signed -> I32)
+    store32(buf +  24, 2);
+    store32(buf +  28, 32);
+    store32(buf +  32, 1);
+    store32(buf +  36, (4 << 16) | 21);   # OpTypeInt %3 32 0 (unsigned -> U32)
+    store32(buf +  40, 3);
+    store32(buf +  44, 32);
+    store32(buf +  48, 0);
+    store32(buf +  52, (3 << 16) | 22);   # OpTypeFloat %4 32 (-> F32)
+    store32(buf +  56, 4);
+    store32(buf +  60, 32);
+    store32(buf +  64, (3 << 16) | 22);   # OpTypeFloat %5 64 (-> UNSUPPORTED)
+    store32(buf +  68, 5);
+    store32(buf +  72, 64);
+    store32(buf +  76, (4 << 16) | 23);   # OpTypeVector %6 %4 4 (vec4 f32)
+    store32(buf +  80, 6);
+    store32(buf +  84, 4);
+    store32(buf +  88, 4);
+    store32(buf +  92, (4 << 16) | 23);   # OpTypeVector %7 %5 4 (vec4 f64 -> UNSUPPORTED)
+    store32(buf +  96, 7);
+    store32(buf + 100, 5);
+    store32(buf + 104, 4);
+    store32(buf + 108, (4 << 16) | 23);   # OpTypeVector %8 %4 5 (count 5 -> UNSUPPORTED)
+    store32(buf + 112, 8);
+    store32(buf + 116, 4);
+    store32(buf + 120, 5);
+    return 124;
+}
+
+fn test_mir_type_distill() {
+    var buf[128];
+    var n = _spv_build_distill_types(&buf);
+    var types[384];
+    spirv_build_type_table(&buf, n, 16, &types);
+    assert_eq(_mir_lower_type(&types, 2), MIR_T_I32, "signed int32 -> I32");
+    assert_eq(_mir_lower_type(&types, 3), MIR_T_U32, "unsigned int32 -> U32");
+    assert_eq(_mir_lower_type(&types, 4), MIR_T_F32, "float32 -> F32");
+    assert_eq(_mir_lower_type(&types, 5), MIR_T_UNSUPPORTED, "float64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 6), MIR_T_F32 | (4 << 8), "vec4 f32 -> F32|count4");
+    assert_eq(_mir_lower_type(&types, 7), MIR_T_UNSUPPORTED, "vec4 f64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8), MIR_T_UNSUPPORTED, "vec count5 -> UNSUPPORTED");
+    return 0;
+}
+
+fn test_mir_type_helpers() {
+    assert_eq(mir_type_base(MIR_T_F32), MIR_T_F32, "scalar base");
+    assert_eq(mir_type_count(MIR_T_F32), 1, "scalar count = 1");
+    assert_eq(mir_type_base(MIR_T_F32 | (4 << 8)), MIR_T_F32, "vec base = f32");
+    assert_eq(mir_type_count(MIR_T_F32 | (4 << 8)), 4, "vec count = 4");
+    assert_eq(mir_type_count(MIR_T_I32 | (2 << 8)), 2, "vec2 count = 2");
+    return 0;
+}
+
+fn test_mir_meet_truth_table() {
+    assert_eq(_mir_meet(MIR_UNIFORM, MIR_UNIFORM), MIR_UNIFORM, "U,U -> U");
+    assert_eq(_mir_meet(MIR_UNIFORM, MIR_DIVERGENT), MIR_DIVERGENT, "U,D -> D");
+    assert_eq(_mir_meet(MIR_DIVERGENT, MIR_UNIFORM), MIR_DIVERGENT, "D,U -> D");
+    assert_eq(_mir_meet(MIR_DIVERGENT, MIR_DIVERGENT), MIR_DIVERGENT, "D,D -> D");
+    return 0;
+}
+
+fn test_mir_builtin_unif() {
+    assert_eq(_mir_builtin_unif(MIR_BI_WORKGROUP_ID), MIR_UNIFORM, "WorkgroupId uniform");
+    assert_eq(_mir_builtin_unif(MIR_BI_LOCAL_INVOC_ID), MIR_DIVERGENT, "LocalInvocId divergent");
+    assert_eq(_mir_builtin_unif(MIR_BI_GLOBAL_INVOC_ID), MIR_DIVERGENT, "GlobalInvocId divergent");
+    return 0;
+}
+
+fn test_mir_value_builders() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 42);
+    assert_eq(mir_val_kind(&m, 1), MIR_VK_CONST, "const kind");
+    assert_eq(mir_val_type(&m, 1), MIR_T_U32, "const type");
+    assert_eq(mir_val_unif(&m, 1), MIR_UNIFORM, "const uniform");
+    assert_eq(mir_val_payload(&m, 1), 42, "const payload 42");
+    assert_eq(mir_val_def(&m, 1), 0 - 1, "const def -1");
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    assert_eq(mir_val_kind(&m, 2), MIR_VK_BUILTIN, "builtin kind");
+    assert_eq(mir_val_unif(&m, 2), MIR_DIVERGENT, "gid divergent");
+    assert_eq(mir_val_payload(&m, 2), MIR_BI_GLOBAL_INVOC_ID, "builtin payload");
+    mir_set_bufvar(&m, 3, 1);
+    assert_eq(mir_val_kind(&m, 3), MIR_VK_BUFVAR, "bufvar kind");
+    assert_eq(mir_val_unif(&m, 3), MIR_UNIFORM, "bufvar uniform");
+    assert_eq(mir_val_payload(&m, 3), 1, "bufvar binding 1");
+    assert_eq(mir_val_kind(&m, 10), MIR_VK_NONE, "unset id is NONE");
+    return 0;
+}
+
+fn test_mir_emit_and_accessors() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    var idx = mir_emit(&m, MIR_OP_IADD, 5, MIR_T_I32, 2, 3, 0, 0);
+    assert_eq(idx, 0, "first instr index 0");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_IADD, "op IADD");
+    assert_eq(mir_instr_result(&m, 0), 5, "result 5");
+    assert_eq(mir_instr_type(&m, 0), MIR_T_I32, "type I32");
+    assert_eq(mir_instr_a(&m, 0), 2, "operand a = 2");
+    assert_eq(mir_instr_b(&m, 0), 3, "operand b = 3");
+    assert_eq(mir_instr_c(&m, 0), 0, "operand c = 0");
+    assert_eq(mir_val_kind(&m, 5), MIR_VK_SSA, "result is SSA");
+    assert_eq(mir_val_type(&m, 5), MIR_T_I32, "result type I32");
+    assert_eq(mir_val_unif(&m, 5), MIR_UNKNOWN, "result unif UNKNOWN pre-sweep");
+    assert_eq(mir_val_def(&m, 5), 0, "result def = instr 0");
+    # a vec-typed FMA exercises the 3rd operand + a >8-bit type value round-trip
+    var vt = MIR_T_F32 | (4 << 8);
+    var idx2 = mir_emit(&m, MIR_OP_FMA, 6, vt, 7, 8, 9, MIR_FLAG_C_IMM);
+    assert_eq(idx2, 1, "second instr index 1");
+    assert_eq(mir_instr_type(&m, 1), vt, "vec type round-trips");
+    assert_eq(mir_instr_c(&m, 1), 9, "operand c = 9");
+    assert_eq(mir_instr_flags(&m, 1), MIR_FLAG_C_IMM, "flags = C_IMM");
+    assert_eq(mir_n_instrs(&m), 2, "n_instrs 2");
+    return 0;
+}
+
+fn test_mir_add_ptr() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    var p = mir_add_ptr(&m, 5, 0, MIR_T_F32, 7, 0, 1);
+    assert_eq(p, 0, "first ptr index 0");
+    assert_eq(mir_ptr_binding(&m, 0), 0, "binding 0");
+    assert_eq(mir_ptr_elem_type(&m, 0), MIR_T_F32, "elem f32");
+    assert_eq(mir_ptr_off_id(&m, 0), 7, "off_id 7");
+    assert_eq(mir_ptr_const_off(&m, 0), 0, "const_off 0");
+    assert_eq(mir_ptr_dynamic(&m, 0), 1, "dynamic 1");
+    assert_eq(mir_val_kind(&m, 5), MIR_VK_PTR, "val 5 is PTR");
+    assert_eq(mir_val_payload(&m, 5), 0, "val 5 payload = ptr 0");
+    var p2 = mir_add_ptr(&m, 6, 1, MIR_T_F32, 0, 16, 0);
+    assert_eq(p2, 1, "second ptr index 1");
+    assert_eq(mir_ptr_binding(&m, 1), 1, "binding 1");
+    assert_eq(mir_ptr_const_off(&m, 1), 16, "const_off 16");
+    assert_eq(mir_ptr_dynamic(&m, 1), 0, "dynamic 0");
+    return 0;
+}
+
+# The load-bearing test: a SAXPY-shape hand-built MIR; assert every value's
+# GFX9 uniformity after the forward sweep. Divergent path = indexed by
+# GlobalInvocationId; uniform path = WorkgroupId / const offset.
+fn test_mir_uniformity() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 4);                             # stride
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);     # divergent
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_WORKGROUP_ID);        # uniform
+    mir_set_bufvar(&m, 4, 0);                                      # uniform
+    mir_emit(&m, MIR_OP_IMUL, 5, MIR_T_U32, 2, 1, 0, 0);          # gid*stride -> div
+    mir_emit(&m, MIR_OP_IADD, 6, MIR_T_U32, 3, 1, 0, 0);          # wgid+stride -> unif
+    mir_emit(&m, MIR_OP_LOAD, 7, MIR_T_F32, 5, 0, 0, 0);          # load off div -> div
+    mir_emit(&m, MIR_OP_LOAD, 8, MIR_T_F32, 6, 0, 0, 0);          # load off unif -> unif
+    mir_emit(&m, MIR_OP_LOAD, 9, MIR_T_F32, 0, 0, 0, 0);          # load const off -> unif
+    mir_emit(&m, MIR_OP_FMUL, 10, MIR_T_F32, 7, 8, 0, 0);         # div*unif -> div
+    mir_emit(&m, MIR_OP_IADD, 11, MIR_T_U32, 3, 2, 0, MIR_FLAG_B_IMM);  # b immediate -> skip -> unif
+    mir_emit(&m, MIR_OP_STORE, 0, MIR_T_VOID, 5, 0, 10, 0);       # store (no result)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 5), MIR_DIVERGENT, "gid*stride divergent");
+    assert_eq(mir_val_unif(&m, 6), MIR_UNIFORM, "wgid+stride uniform");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "divergent-offset load divergent");
+    assert_eq(mir_val_unif(&m, 8), MIR_UNIFORM, "uniform-offset load uniform");
+    assert_eq(mir_val_unif(&m, 9), MIR_UNIFORM, "const-offset load uniform");
+    assert_eq(mir_val_unif(&m, 10), MIR_DIVERGENT, "div*unif -> divergent");
+    assert_eq(mir_val_unif(&m, 11), MIR_UNIFORM, "immediate operand skipped -> uniform");
+    return 0;
+}
+
+fn test_mir_blocks_and_synth() {
+    var m[80];
+    var vals[800];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # id_bound 16, cap_ids 20 -> synth ids 16..19 have backing storage (vals 20*40)
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 20);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_finalize_block0(&m);
+    assert_eq(mir_block_count_total(&m), 1, "MVP single block");
+    assert_eq(mir_block_first(&m, 0), 0, "block first instr 0");
+    assert_eq(mir_block_count(&m, 0), 2, "block instr count 2");
+    assert_eq(mir_block_term(&m, 0), MIR_TERM_RETURN, "terminator RETURN");
+    var s0 = mir_alloc_synth_id(&m);
+    assert_eq(s0, 16, "synth id starts at id_bound");
+    assert_eq(mir_alloc_synth_id(&m), 17, "synth id increments");
+    # a synth id IS usable as an SSA result (cap_ids headroom) — review N.2a #1
+    assert_eq(mir_emit(&m, MIR_OP_IMUL, s0, MIR_T_U32, 0, 0, 0, 0), 2, "synth-id result emitted");
+    assert_eq(mir_val_kind(&m, s0), MIR_VK_SSA, "synth id became an SSA value");
+    return 0;
+}
+
+# Pathological-vector fixture for the type-distill audit (review N.2a #3/#4):
+# vec4 f32 (valid), vector-of-vector (component is a vector), and a
+# self-referential vector (component == own id).
+fn _spv_build_bad_vectors(buf): i64 {
+    store32(buf +  0, 0x07230203);
+    store32(buf +  4, 0x00010300);
+    store32(buf +  8, 0);
+    store32(buf + 12, 16);
+    store32(buf + 16, 0);
+    store32(buf + 20, (3 << 16) | 22);   # OpTypeFloat %4 32
+    store32(buf + 24, 4);
+    store32(buf + 28, 32);
+    store32(buf + 32, (4 << 16) | 23);   # OpTypeVector %6 %4 4 (valid vec4 f32)
+    store32(buf + 36, 6);
+    store32(buf + 40, 4);
+    store32(buf + 44, 4);
+    store32(buf + 48, (4 << 16) | 23);   # OpTypeVector %7 %6 2 (component is a vector)
+    store32(buf + 52, 7);
+    store32(buf + 56, 6);
+    store32(buf + 60, 2);
+    store32(buf + 64, (4 << 16) | 23);   # OpTypeVector %8 %8 4 (self-referential)
+    store32(buf + 68, 8);
+    store32(buf + 72, 8);
+    store32(buf + 76, 4);
+    return 80;
+}
+
+# Regression tests for the N.2a adversarial review (5 confirmed findings).
+fn test_mir_review_n2a() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    # #5: mir_set_* bound-check the value-id ceiling + the id-0 sentinel
+    assert_eq(mir_set_const(&m, 5, MIR_T_U32, 1), 0, "set_const valid id ok");
+    assert_eq(mir_set_const(&m, 16, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR, "set_const id == cap -> OOR");
+    assert_eq(mir_set_const(&m, 0, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR, "set_const id 0 -> OOR");
+    assert_eq(mir_set_bufvar(&m, 0, 0), 0 - MIR_ERR_ID_OOR, "set_bufvar id 0 -> OOR");
+    # #2: mir_add_ptr rejects result_id 0 (sentinel) and the ceiling
+    assert_eq(mir_add_ptr(&m, 0, 0, MIR_T_F32, 0, 0, 0), 0 - MIR_ERR_ID_OOR, "add_ptr id 0 -> OOR");
+    assert_eq(mir_add_ptr(&m, 16, 0, MIR_T_F32, 0, 0, 0), 0 - MIR_ERR_ID_OOR, "add_ptr id == cap -> OOR");
+    # vals[0] sentinel intact after the rejected writes
+    assert_eq(mir_val_kind(&m, 0), MIR_VK_NONE, "vals[0] sentinel preserved");
+    # #3/#4: type distillation rejects pathological vectors (no crash, no corruption)
+    var buf[128];
+    var n = _spv_build_bad_vectors(&buf);
+    var types[384];
+    spirv_build_type_table(&buf, n, 16, &types);
+    assert_eq(_mir_lower_type(&types, 6), MIR_T_F32 | (4 << 8), "valid vec4 f32 ok");
+    assert_eq(_mir_lower_type(&types, 7), MIR_T_UNSUPPORTED, "vector-of-vector -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8), MIR_T_UNSUPPORTED, "self-ref vector -> UNSUPPORTED (no crash)");
+    return 0;
+}
+
+fn test_mir_emit_errors() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # cap_instrs = 1: the second emit overflows
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 1, 2, 16, 16);
+    assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0, "first emit ok");
+    assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0 - MIR_ERR_CAP_EXCEEDED, "cap exceeded");
+    # result id >= id_bound -> ID_OOR
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 16, MIR_T_I32, 1, 1, 0, 0), 0 - MIR_ERR_ID_OOR, "result id OOR");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -488,5 +775,16 @@ fn main(): i64 {
     test_spirv_type_table();
     test_spirv_const_table();
     test_spirv_decoration_table();
+    test_mir_type_distill();
+    test_mir_type_helpers();
+    test_mir_meet_truth_table();
+    test_mir_builtin_unif();
+    test_mir_value_builders();
+    test_mir_emit_and_accessors();
+    test_mir_add_ptr();
+    test_mir_uniformity();
+    test_mir_blocks_and_synth();
+    test_mir_emit_errors();
+    test_mir_review_n2a();
     return assert_summary();
 }

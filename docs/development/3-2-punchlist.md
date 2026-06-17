@@ -453,8 +453,23 @@ hand-authored shaders stay as oracle + fallback.
   decoration table (27 asserts on a typed-module fixture). Pure CPU.
   **3.2.5 content (N.0 + N.1) is COMPLETE** — ready to cut on the maintainer's
   word. Next phase: N.2 (MIR + uniformity lowering) at 3.2.6.
-- [ ] **N.2** *(3.2.6)* — MIR + uniformity lowering (`src/mir.cyr`,
-  `src/spirv_lower.cyr`).
+- [~] **N.2** *(3.2.6)* — MIR + uniformity lowering. Design via a 3-lens panel +
+  synthesis (workflow). **N.2a done (2026-06-16):** `src/mir.cyr` — the SSA IR
+  data model (a MirMod header over four caller-provided, `<id>`-indexed buffers:
+  values / instructions / access side-table / blocks; operands stored as SPIR-V
+  `<id>`s for 1:1 SSA), builders + accessors, type distillation (`_mir_lower_type`:
+  i32/u32/f32/vec2-4, non-32-bit → UNSUPPORTED), and the **GFX9 uniformity pass**
+  (`_mir_meet` + seed + single forward sweep — UNIFORM→SGPR/SALU vs
+  DIVERGENT→VGPR/VALU). 87 asserts incl. the `_mir_meet` truth table + a
+  SAXPY-shape hand-built MIR proving every value's class + immediate-operand skip
+  + the cap/id-OOR error paths. Pure CPU, no SPIR-V walk (testable in isolation).
+  **Adversarial review (workflow): 5 confirmed findings, all fixed pre-merge** —
+  synth-id headroom/OOB (split `cap_ids` from `id_bound`), `mir_set_*` + 
+  `mir_add_ptr` bounds/sentinel guards, and `_mir_lower_type` unbounded recursion
+  + vector-of-vector corruption (require scalar vector component); regression
+  asserts added. **N.2b (next):** `src/spirv_lower.cyr` — the
+  SPIR-V-module→MIR walk + the BuiltIn/StorageClass gap-closing passes the N.1b
+  parser does not provide.
 - [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
   (`src/gfx9_isel.cyr`).
 - [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,

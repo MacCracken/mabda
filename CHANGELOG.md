@@ -15,8 +15,58 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
-section when they ship.
+### Added — Phase N.2a (MIR data model + GFX9 uniformity pass)
+- `src/mir.cyr` — the SSA IR the SPIR-V→GFX9 compiler lowers through (stage N.2
+  of `docs/proposals/v3.2-spirv-gfx9-native-lowering.md`; design via a 3-lens
+  panel + synthesis). A `MirMod` header (80 B) wires four caller-provided,
+  `<id>`-indexed buffers — values (40 B records: kind / distilled type /
+  **uniformity** / def / payload), instructions (32 B, operands stored as SPIR-V
+  `<id>`s so the SSA graph maps 1:1), an `OpAccessChain` access side-table, and
+  blocks (one for the MVP, pre-shaped for N.7 control flow). Builders + accessors,
+  `_mir_lower_type` (i32/u32/f32 + vec2-4; non-32-bit → `MIR_T_UNSUPPORTED`), and
+  the **uniformity pass** (`_mir_meet` + a seed + single forward sweep:
+  UNIFORM→SGPR/SALU vs DIVERGENT→VGPR/VALU — constants/WorkgroupId/buffer-base
+  uniform, LocalInvocationId/GlobalInvocationId/divergent-offset-loads divergent).
+  Pure data structures; the only dependency is the read-only N.1b type-table
+  accessors, so it is testable in isolation with hand-built MIR.
+- `tests/tcyr/compiler.tcyr` +87 asserts: type-distillation matrix, the
+  `_mir_meet` truth table, builder/accessor round-trips, a SAXPY-shape hand-built
+  MIR proving every value's GFX9 uniformity + the immediate-operand skip, block /
+  synth-id helpers, the cap-exceeded / id-out-of-range error paths, plus the
+  adversarial-review regression set (below).
+
+### Fixed — N.2a adversarial review (5 confirmed findings, all fixed pre-merge)
+- **Synth-id headroom / value-table OOB:** `mir_alloc_synth_id` hands out ids ≥
+  `id_bound`, but the value-id ceiling and the vals[] capacity were both exactly
+  `id_bound` — so synth ids were unusable (rejected by `mir_emit`/`mir_add_ptr`)
+  and, via the unguarded `mir_set_*` builders, caused a 40-byte out-of-bounds
+  write. Split the ceiling from `id_bound`: `mir_mod_init` gains a `cap_ids`
+  param (vals sized `cap_ids * 40`); all value writes bound-check `cap_ids`.
+- **`_mir_set_val` / `mir_set_*` missing bounds check:** added the id-0 sentinel
+  + `cap_ids` guard the sibling builders already had (was an OOB-write gap on an
+  untrusted/synth id).
+- **`mir_add_ptr` accepted `result_id` 0:** clobbered the id-0 "no value"
+  sentinel; now rejected.
+- **`_mir_lower_type` unbounded recursion:** a crafted self-/mutually-referential
+  vector component `<id>` recursed forever (untrusted-input stack-overflow DoS).
+- **`_mir_lower_type` vector-of-vector corruption:** a nested-vector component
+  produced a bogus non-`UNSUPPORTED` type (wrong base, lane count 6). Both fixed
+  by requiring the vector component kind ∈ {INT,FLOAT,BOOL} before lowering.
+- Regression asserts for all five added to `compiler.tcyr` (`test_mir_review_n2a`
+  + a synth-id-as-result case).
+
+### Changed
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/mir.cyr` (after
+  `spirv_parse.cyr` — it consumes the type-table accessors).
+
+### Notes
+- Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
+  is `m`, not `mod`.
+
+### Next
+- N.2b — `src/spirv_lower.cyr`: the SPIR-V-module→MIR walk + the BuiltIn /
+  StorageClass gap-closing probe passes the N.1b parser does not build. Closes
+  N.2; then N.3 (instruction selection) for 3.2.6.
 
 ## [3.2.5] — 2026-06-16
 

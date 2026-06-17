@@ -5632,6 +5632,372 @@ fn spirv_build_decoration_table(ptr, byte_len, id_bound, out): i64 {
 fn spirv_deco_binding(out, id): i64 { return load64(out + id * SPIRV_DECO_REC + 0); }
 fn spirv_deco_set(out, id): i64 { return load64(out + id * SPIRV_DECO_REC + 8); }
 
+# --- mir.cyr ---
+
+# @internal — mabda-IR (MIR): the SSA IR the SPIR-V→GFX9 compiler lowers through
+# mir.cyr — Phase N.2a: the MIR data model + builders + accessors + the GFX9
+# uniformity pass. Pure data structures; no SPIR-V dependency beyond the
+# read-only N.1b type-table accessors (`spirv_type_kind`/`_p0`/`_p1`), so this
+# module is testable in isolation with hand-built MIR (no parser walk). The
+# SPIR-V→MIR lowering itself is N.2b (`spirv_lower.cyr`).
+#
+# Design (see the N.2 design synthesis): a small SSA IR shaped for GFX9, split
+# into FOUR caller-provided buffers wired through one MirMod header. Operands are
+# stored as SPIR-V <id>s (not instruction indices) so SPIR-V's SSA graph maps 1:1
+# with zero renumbering. Each value carries kind + distilled MIR type +
+# GFX9 UNIFORMITY (the load-bearing scalar-vs-vector classification) + a
+# defining-instruction back-pointer. Buffers are caller-provided fixed-size
+# records indexed directly by <id> (ids are dense, < id_bound) — the same
+# stack-friendly, alloc-free pattern as spirv_parse.cyr's tables.
+#
+# Sentinels: SPIR-V <id> 0 is always invalid, so 0 = "no operand / no value".
+# Index-returning builders (mir_emit / mir_add_ptr) return the index (>= 0) on
+# success or a NEGATIVE error code on failure (indices and error codes would
+# otherwise collide). Pure byte math; no syscalls.
+
+# ================================================================
+# Value kinds (value record slot 0)
+# ================================================================
+var MIR_VK_NONE    = 0;   # id is not (yet) a value — the memset-0 default
+var MIR_VK_CONST   = 1;   # payload = 32-bit constant bits
+var MIR_VK_BUILTIN = 2;   # payload = MIR_BI_* code
+var MIR_VK_BUFVAR  = 3;   # payload = binding number (a StorageBuffer/Uniform var)
+var MIR_VK_SSA     = 4;   # def = defining instruction index
+var MIR_VK_PTR     = 5;   # payload = index into the ptrs[] access side-table
+
+# Uniformity (value record slot 2). UNIFORM → SGPR/SALU, DIVERGENT → VGPR/VALU.
+var MIR_UNIFORM   = 0;
+var MIR_DIVERGENT = 1;
+var MIR_UNKNOWN   = 2;   # transient: an SSA result before the propagate sweep
+
+# Distilled MIR scalar types (value/instr type slot). Vectors encode as
+# base | (count << 8) with count in 2..4; a scalar has count 0.
+var MIR_T_VOID        = 0;
+var MIR_T_I32         = 1;
+var MIR_T_U32         = 2;
+var MIR_T_F32         = 3;
+var MIR_T_BOOL        = 4;
+var MIR_T_UNSUPPORTED = 255;
+
+# Built-in codes (value payload for MIR_VK_BUILTIN).
+var MIR_BI_LOCAL_INVOC_ID  = 0;
+var MIR_BI_WORKGROUP_ID    = 1;
+var MIR_BI_GLOBAL_INVOC_ID = 2;
+
+# Block terminators (block record slot 3). N.7 adds _BRANCH / _COND_BRANCH.
+var MIR_TERM_RETURN = 1;
+
+# MIR op codes — 1:1 with the gfx9_encode formats N.3 selects (the MIR→GFX9
+# seam is a flat switch on (op, result-uniformity)).
+var MIR_OP_IADD    = 1;
+var MIR_OP_ISUB    = 2;
+var MIR_OP_IMUL    = 3;
+var MIR_OP_SHL     = 4;
+var MIR_OP_SHR     = 5;
+var MIR_OP_AND     = 6;
+var MIR_OP_OR      = 7;
+var MIR_OP_XOR     = 8;
+var MIR_OP_FADD    = 9;
+var MIR_OP_FSUB    = 10;
+var MIR_OP_FMUL    = 11;
+var MIR_OP_FMA     = 12;
+var MIR_OP_CVT_F32 = 13;
+var MIR_OP_CVT_I32 = 14;
+var MIR_OP_EXTRACT = 15;
+var MIR_OP_LOAD    = 16;
+var MIR_OP_STORE   = 17;
+var MIR_OP_RET     = 18;
+
+# Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
+# Index-returning builders return these NEGATED; status fns return them positive.
+var MIR_ERR_UNSUPPORTED_OP   = 20;
+var MIR_ERR_UNSUPPORTED_TYPE = 21;
+var MIR_ERR_CAP_EXCEEDED     = 22;
+var MIR_ERR_BAD_ACCESS_CHAIN = 23;
+var MIR_ERR_OVERFLOW         = 24;
+var MIR_ERR_ID_OOR           = 25;
+
+# Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
+# fields (uniformity especially). The instr/ptr records pack two <id>/flag
+# halves per slot only where both halves are < 2^32 (SPIR-V id_bound is a
+# 32-bit header field, capped < 2^30 by _spirv_validate).
+var MIR_VAL_REC   = 40;   # [kind, type, unif, def, payload]
+var MIR_INSTR_REC = 32;   # [op, result|type<<32, a|b<<32, c|flags<<32]
+var MIR_PTR_REC   = 32;   # [binding, elem_type, off_id, const_off|dynamic<<32]
+var MIR_BLOCK_REC = 32;   # [first_instr, instr_count, label_id, terminator]
+
+# instr flags bits (high 32 of slot +24): which operands are immediates (so the
+# uniformity meet skips them — an immediate is wave-uniform).
+var MIR_FLAG_A_IMM = 2;
+var MIR_FLAG_B_IMM = 4;
+var MIR_FLAG_C_IMM = 8;
+
+# ================================================================
+# MirMod header (80 bytes; caller stack `var m[80]`)
+#   +0 vals  +8 instrs  +16 ptrs  +24 blocks
+#   +32 n_instrs  +40 cap_instrs  +48 n_ptrs  +56 cap_ptrs
+#   +64 cap_ids  +72 next_synth
+# ================================================================
+# `cap_ids` is the value-id CEILING = the vals[] backing-store capacity in
+# records (>= id_bound + synth headroom). It is the bound every value write is
+# checked against — DISTINCT from the SPIR-V id_bound, because mir_alloc_synth_id
+# hands out fresh ids >= id_bound for synthesized terms (e.g. the
+# GlobalInvocationId expansion). Caller MUST size vals[] as cap_ids * MIR_VAL_REC.
+# `next_synth` starts at id_bound so synth ids occupy [id_bound, cap_ids).
+fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, cap_ids): i64 {
+    store64(m + 0, vals);
+    store64(m + 8, instrs);
+    store64(m + 16, ptrs);
+    store64(m + 24, blocks);
+    store64(m + 32, 0);
+    store64(m + 40, cap_instrs);
+    store64(m + 48, 0);
+    store64(m + 56, cap_ptrs);
+    store64(m + 64, cap_ids);
+    store64(m + 72, id_bound);
+    memset(vals, 0, cap_ids * MIR_VAL_REC);
+    store64(blocks + 0, 0);
+    store64(blocks + 8, 0);
+    store64(blocks + 16, 0);
+    store64(blocks + 24, MIR_TERM_RETURN);
+    return 0;
+}
+
+# Allocate a fresh <id> >= id_bound (for synthesized terms, e.g. the
+# GlobalInvocationId = WorkgroupId*localsize + LocalInvocationId expansion).
+fn mir_alloc_synth_id(m): i64 {
+    var s = load64(m + 72);
+    store64(m + 72, s + 1);
+    return s;
+}
+
+# ================================================================
+# Value table (vals + id * 40)
+# ================================================================
+# Write a value record. Bound-checks `id` against the id-0 sentinel and the
+# cap_ids ceiling so the mir_set_* builders (which forward their return) can
+# never write outside the vals[] buffer on an untrusted/synth id. Returns 0 or
+# a NEGATIVE error.
+fn _mir_set_val(m, id, kind, type, unif, def, payload): i64 {
+    if (id == 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (id >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    var b = load64(m + 0) + id * MIR_VAL_REC;
+    store64(b + 0, kind);
+    store64(b + 8, type);
+    store64(b + 16, unif);
+    store64(b + 24, def);
+    store64(b + 32, payload);
+    return 0;
+}
+
+fn mir_set_const(m, id, type, value): i64 {
+    return _mir_set_val(m, id, MIR_VK_CONST, type, MIR_UNIFORM, 0 - 1, value);
+}
+
+fn mir_set_builtin(m, id, type, bi_code): i64 {
+    return _mir_set_val(m, id, MIR_VK_BUILTIN, type, _mir_builtin_unif(bi_code), 0 - 1, bi_code);
+}
+
+fn mir_set_bufvar(m, id, binding): i64 {
+    return _mir_set_val(m, id, MIR_VK_BUFVAR, MIR_T_VOID, MIR_UNIFORM, 0 - 1, binding);
+}
+
+fn mir_val_kind(m, id): i64 { return load64(load64(m + 0) + id * MIR_VAL_REC + 0); }
+fn mir_val_type(m, id): i64 { return load64(load64(m + 0) + id * MIR_VAL_REC + 8); }
+fn mir_val_unif(m, id): i64 { return load64(load64(m + 0) + id * MIR_VAL_REC + 16); }
+fn mir_val_def(m, id): i64 { return load64(load64(m + 0) + id * MIR_VAL_REC + 24); }
+fn mir_val_payload(m, id): i64 { return load64(load64(m + 0) + id * MIR_VAL_REC + 32); }
+
+fn _mir_set_val_unif(m, id, unif): i64 {
+    store64(load64(m + 0) + id * MIR_VAL_REC + 16, unif);
+    return 0;
+}
+
+# ================================================================
+# Instruction array (instrs + i * 32, program order)
+# ================================================================
+# Append an instruction. If result != 0 the result <id> becomes an SSA value
+# (kind SSA, type, unif UNKNOWN until mir_run_uniformity, def = this index).
+# Returns the instruction index (>= 0), or a NEGATIVE error.
+fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
+    var n = load64(m + 32);
+    if (n >= load64(m + 40)) { return 0 - MIR_ERR_CAP_EXCEEDED; }
+    if (result != 0) {
+        if (result >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    }
+    var base = load64(m + 8) + n * MIR_INSTR_REC;
+    store64(base + 0, op);
+    store64(base + 8, result | (type << 32));
+    store64(base + 16, a | (b << 32));
+    store64(base + 24, c | (flags << 32));
+    if (result != 0) {
+        _mir_set_val(m, result, MIR_VK_SSA, type, MIR_UNKNOWN, n, 0);
+    }
+    store64(m + 32, n + 1);
+    return n;
+}
+
+fn mir_n_instrs(m): i64 { return load64(m + 32); }
+fn mir_instr_op(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 0); }
+fn mir_instr_result(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 8) & 0xFFFFFFFF; }
+fn mir_instr_type(m, i): i64 { return (load64(load64(m + 8) + i * MIR_INSTR_REC + 8) >> 32) & 0xFFFFFFFF; }
+fn mir_instr_a(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 16) & 0xFFFFFFFF; }
+fn mir_instr_b(m, i): i64 { return (load64(load64(m + 8) + i * MIR_INSTR_REC + 16) >> 32) & 0xFFFFFFFF; }
+fn mir_instr_c(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 24) & 0xFFFFFFFF; }
+fn mir_instr_flags(m, i): i64 { return (load64(load64(m + 8) + i * MIR_INSTR_REC + 24) >> 32) & 0xFFFFFFFF; }
+
+# ================================================================
+# Access (ptr) side-table (ptrs + idx * 32) — OpAccessChain results
+# ================================================================
+# Records a (binding, byte-offset-expression) buffer access. `off_id` is the SSA
+# <id> giving the dynamic byte offset (0 = none → const offset only). Sets
+# vals[result_id] = PTR (payload = ptr index). Returns the ptr index or a
+# NEGATIVE error.
+fn mir_add_ptr(m, result_id, binding, elem_type, off_id, const_off, dynamic): i64 {
+    var n = load64(m + 48);
+    if (n >= load64(m + 56)) { return 0 - MIR_ERR_CAP_EXCEEDED; }
+    if (result_id == 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (result_id >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    var base = load64(m + 16) + n * MIR_PTR_REC;
+    store64(base + 0, binding);
+    store64(base + 8, elem_type);
+    store64(base + 16, off_id);
+    store64(base + 24, (const_off & 0xFFFFFFFF) | (dynamic << 32));
+    _mir_set_val(m, result_id, MIR_VK_PTR, MIR_T_VOID, MIR_UNIFORM, 0 - 1, n);
+    store64(m + 48, n + 1);
+    return n;
+}
+
+fn mir_n_ptrs(m): i64 { return load64(m + 48); }
+fn mir_ptr_binding(m, idx): i64 { return load64(load64(m + 16) + idx * MIR_PTR_REC + 0); }
+fn mir_ptr_elem_type(m, idx): i64 { return load64(load64(m + 16) + idx * MIR_PTR_REC + 8); }
+fn mir_ptr_off_id(m, idx): i64 { return load64(load64(m + 16) + idx * MIR_PTR_REC + 16); }
+fn mir_ptr_const_off(m, idx): i64 { return load64(load64(m + 16) + idx * MIR_PTR_REC + 24) & 0xFFFFFFFF; }
+fn mir_ptr_dynamic(m, idx): i64 { return (load64(load64(m + 16) + idx * MIR_PTR_REC + 24) >> 32) & 0xFFFFFFFF; }
+
+# ================================================================
+# Blocks (blocks + b * 32) — MVP is a single block
+# ================================================================
+fn mir_finalize_block0(m): i64 {
+    store64(load64(m + 24) + 8, load64(m + 32));   # block0.instr_count = n_instrs
+    return 0;
+}
+
+fn mir_block_first(m, b): i64 { return load64(load64(m + 24) + b * MIR_BLOCK_REC + 0); }
+fn mir_block_count(m, b): i64 { return load64(load64(m + 24) + b * MIR_BLOCK_REC + 8); }
+fn mir_block_label(m, b): i64 { return load64(load64(m + 24) + b * MIR_BLOCK_REC + 16); }
+fn mir_block_term(m, b): i64 { return load64(load64(m + 24) + b * MIR_BLOCK_REC + 24); }
+fn mir_block_count_total(m): i64 { return 1; }   # MVP: one block (N.7 adds n_blocks)
+
+# ================================================================
+# Type distillation (SPIR-V type table → MIR type byte)
+# ================================================================
+# `types` is a spirv_parse.cyr type table; `spv_tid` a SPIR-V type <id>. i32/u32
+# by signedness, f32, bool, and vec2..4 of a supported scalar. Anything else
+# (non-32-bit width, matrices, images, unknown) → MIR_T_UNSUPPORTED so the
+# lowering can fail loud.
+fn _mir_lower_type(types, spv_tid): i64 {
+    var k = spirv_type_kind(types, spv_tid);
+    if (k == SPIRV_TYK_INT) {
+        if (spirv_type_p0(types, spv_tid) != 32) { return MIR_T_UNSUPPORTED; }
+        if (spirv_type_p1(types, spv_tid) == 1) { return MIR_T_I32; }
+        return MIR_T_U32;
+    }
+    if (k == SPIRV_TYK_FLOAT) {
+        if (spirv_type_p0(types, spv_tid) != 32) { return MIR_T_UNSUPPORTED; }
+        return MIR_T_F32;
+    }
+    if (k == SPIRV_TYK_BOOL) { return MIR_T_BOOL; }
+    if (k == SPIRV_TYK_VECTOR) {
+        var comp_id = spirv_type_p0(types, spv_tid);
+        # The component MUST be a scalar (INT/FLOAT/BOOL). This rejects
+        # vector-of-vector / vector-of-aggregate as UNSUPPORTED AND bounds the
+        # recursion: a crafted self-/mutually-referential component <id> would
+        # otherwise recurse forever (untrusted-input stack-overflow). A scalar
+        # component recurses exactly one level and terminates.
+        var ck = spirv_type_kind(types, comp_id);
+        if (ck != SPIRV_TYK_INT) {
+            if (ck != SPIRV_TYK_FLOAT) {
+                if (ck != SPIRV_TYK_BOOL) { return MIR_T_UNSUPPORTED; }
+            }
+        }
+        var comp = _mir_lower_type(types, comp_id);
+        if (comp == MIR_T_UNSUPPORTED) { return MIR_T_UNSUPPORTED; }
+        var count = spirv_type_p1(types, spv_tid);
+        if (count < 2) { return MIR_T_UNSUPPORTED; }
+        if (count > 4) { return MIR_T_UNSUPPORTED; }
+        return comp | (count << 8);
+    }
+    return MIR_T_UNSUPPORTED;
+}
+
+fn mir_type_base(t): i64 { return t & 0xFF; }
+
+fn mir_type_count(t): i64 {
+    var c = (t >> 8) & 0xFF;
+    if (c == 0) { return 1; }
+    return c;
+}
+
+# ================================================================
+# Uniformity classification (GFX9 SGPR/SALU vs VGPR/VALU)
+# ================================================================
+# meet: DIVERGENT dominates (no || in Cyrius → nested ifs).
+fn _mir_meet(u0, u1): i64 {
+    if (u0 == MIR_DIVERGENT) { return MIR_DIVERGENT; }
+    if (u1 == MIR_DIVERGENT) { return MIR_DIVERGENT; }
+    return MIR_UNIFORM;
+}
+
+# WorkgroupId is uniform across the wave (one TGID per workgroup); the
+# per-invocation ids are per-lane divergent.
+fn _mir_builtin_unif(bi_code): i64 {
+    if (bi_code == MIR_BI_WORKGROUP_ID) { return MIR_UNIFORM; }
+    return MIR_DIVERGENT;
+}
+
+# The uniformity of instruction `i`'s result. LOAD follows its byte-offset
+# operand (a = off_id; 0 = const offset → uniform load). Other ops meet over
+# their live, non-immediate operands (a/b/c); immediates and absent (0) operands
+# are wave-uniform and skipped.
+fn _mir_instr_unif(m, i): i64 {
+    var op = mir_instr_op(m, i);
+    var a = mir_instr_a(m, i);
+    if (op == MIR_OP_LOAD) {
+        if (a == 0) { return MIR_UNIFORM; }
+        return mir_val_unif(m, a);
+    }
+    var flags = mir_instr_flags(m, i);
+    var b = mir_instr_b(m, i);
+    var c = mir_instr_c(m, i);
+    var u = MIR_UNIFORM;
+    if (a != 0) {
+        if ((flags & MIR_FLAG_A_IMM) == 0) { u = _mir_meet(u, mir_val_unif(m, a)); }
+    }
+    if (b != 0) {
+        if ((flags & MIR_FLAG_B_IMM) == 0) { u = _mir_meet(u, mir_val_unif(m, b)); }
+    }
+    if (c != 0) {
+        if ((flags & MIR_FLAG_C_IMM) == 0) { u = _mir_meet(u, mir_val_unif(m, c)); }
+    }
+    return u;
+}
+
+# Single forward sweep over instrs 0..n_instrs. Exact for straight-line SSA (no
+# back-edges; every operand is defined before use). Writes each result's
+# uniformity into its value record. N.7 (control flow) adds a worklist +
+# divergent-region re-seed. After this, no live SSA result is MIR_UNKNOWN.
+fn mir_run_uniformity(m): i64 {
+    var n = load64(m + 32);
+    var i = 0;
+    while (i < n) {
+        var result = mir_instr_result(m, i);
+        if (result != 0) { _mir_set_val_unif(m, result, _mir_instr_unif(m, i)); }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # --- backend_native_shaders.cyr ---
 
 # @internal — native GPU backend, GFX9 ISA shader libraries + register addresses
