@@ -15,6 +15,26 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Next
+- N.5g — the named MVP exit: hand-author the downsample SPIR-V, compile it through
+  the same path, and pixel-match `native_mipmap_e2e` on Cezanne (per the analysis,
+  a naive compiled downsample likely needs no new ops). N.6 — a generic
+  multi-binding/TGID compute dispatcher + the `_backend_native_shader_module_create`
+  slot wiring (so consumers compile SPIR-V through the public API). 3.2.7.
+
+## [3.2.6] — 2026-06-17
+
+**Native SPIR-V → GFX9 compute compiler — HW-verified end-to-end on Cezanne
+(Phases N.2–N.5).** Building on the N.0/N.1 foundation (3.2.5), the in-tree
+compiler now lowers a SPIR-V compute kernel all the way to GFX9 ISA + a dispatch
+descriptor and **runs it correctly on the AMD GPU**: SPIR-V parse → SSA MIR + GFX9
+uniformity → instruction selection (SALU/VALU) → linear-scan register allocation →
+`s_waitcnt` insertion → ISA encode → ABI/RSRC wiring → on-GPU dispatch. A compiled
+`out[gl_LocalInvocationID.x] = lid.x*3 + 7` produced the correct per-lane results
+on Cezanne (`native_spirv_compute_e2e`). All-CPU compiler, pure-Cyrius, no public
+API change; toolchain pin → 6.2.18 (native f32 builtins — the hand-rolled f32 asm
+shims retired). Every stage adversarially reviewed; ~20 findings fixed pre-merge.
+
 ### Added — Phase N.2a (MIR data model + GFX9 uniformity pass)
 - `src/mir.cyr` — the SSA IR the SPIR-V→GFX9 compiler lowers through (stage N.2
   of `docs/proposals/v3.2-spirv-gfx9-native-lowering.md`; design via a 3-lens
@@ -446,15 +466,6 @@ for the immediate forward pointer.
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
-
-### Next
-- N.5d — dispatch seam: fill `_backend_native_shader_module_create` (currently
-  returns 0 for the SPIR-V kind) to call `gfx9_compile` into a GTT BO + VA-map it,
-  return the (handle, va) pair, and parameterize `native_pm4_build_compute_*` to
-  accept the compiler-derived `rsrc1`/`rsrc2` (today hardcoded). Then N.5e (VOP3
-  add3/bfe/or3), N.5f (64-bit carry + SGPR→VGPR moves), N.5g (downsample
-  pixel-match — the MVP exit). Per the 2026-06-17 scoping: proven-equivalent +
-  Cezanne pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 
