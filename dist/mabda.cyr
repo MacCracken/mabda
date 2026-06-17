@@ -5137,6 +5137,9 @@ var GFX9_SOP2_S_LSHL_B32    = 0x1C;
 var GFX9_SOP2_S_LSHR_B32    = 0x1E;
 var GFX9_SOP2_S_MUL_I32     = 0x24;
 
+# SOP1 (single-dword) — bits 15-8 opcode.
+var GFX9_SOP1_S_MOV_B32     = 0x00;
+
 # SOPP (single-dword) — bits 22-16 opcode.
 var GFX9_SOPP_S_NOP         = 0x00;
 var GFX9_SOPP_S_ENDPGM      = 0x01;
@@ -5194,6 +5197,15 @@ fn gfx9_enc_vop3a_hi(src0, src1, src2): i64 {
 # s_addc_u32 s13,s1,0 = 0x820D8001.
 fn gfx9_enc_sop2(op, sdst, ssrc0, ssrc1): i64 {
     return 0x80000000 | ((op & 0x7F) << 23) | ((sdst & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
+}
+
+# ================================================================
+# SOP1 — scalar ALU, one source.  0xBE800000 | sdst<<16 | op<<8 | ssrc0
+# ================================================================
+# Marker bits 31-23 = 0b101111101. ssrc0 is 8-bit (SGPR or inline). Reproduces
+# s_mov_b32 s8,s6 = 0xBE880006.
+fn gfx9_enc_sop1(op, sdst, ssrc0): i64 {
+    return 0xBE800000 | ((sdst & 0x7F) << 16) | ((op & 0xFF) << 8) | (ssrc0 & 0xFF);
 }
 
 # ================================================================
@@ -6470,6 +6482,20 @@ fn gisel_writes_vgpr(op): i64 {
     return 1;
 }
 
+# The register file of instruction `i`'s RESULT (1 = VGPR, 0 = SGPR). For most ops
+# it is the op's destination class (gisel_writes_vgpr). EXTRACT is the exception:
+# it reads a builtin's register, whose file is the builtin's uniformity
+# (WorkgroupId → SGPR; Local/GlobalInvocationId → VGPR), so an EXTRACT result
+# follows its OWN uniformity. Used by both regalloc and the encode file-map so the
+# two agree. (gisel_writes_vgpr can't decide EXTRACT — it lacks the operand.)
+fn gisel_result_is_vgpr(m, out, i): i64 {
+    if (gisel_op(out, i) == GISEL_EXTRACT) {
+        if (mir_val_unif(m, gisel_dst(out, i)) == MIR_DIVERGENT) { return 1; }
+        return 0;
+    }
+    return gisel_writes_vgpr(gisel_op(out, i));
+}
+
 fn gisel_op(out, i): i64 { return load64(out + i * GISEL_REC + 0); }
 fn gisel_dst(out, i): i64 { return load64(out + i * GISEL_REC + 8); }
 fn gisel_a(out, i): i64 { return load64(out + i * GISEL_REC + 16); }
@@ -6516,7 +6542,16 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     }
     if (op == MIR_OP_CVT_F32) { return _gisel_emit(out, k, GISEL_V_CVT_F32_I32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_CVT_I32) { return _gisel_emit(out, k, GISEL_V_CVT_I32_F32, dst, a, 0, 0, flags); }
-    if (op == MIR_OP_EXTRACT) { return _gisel_emit(out, k, GISEL_EXTRACT, dst, a, b, c, flags); }
+    if (op == MIR_OP_EXTRACT) {
+        # The EXTRACT result's register file is decided from its uniformity
+        # (gisel_result_is_vgpr), so a result-less or UNKNOWN-uniformity extract
+        # (the N.2 sweep not run / a value it missed) would be silently mis-filed
+        # to an SGPR — fail loud instead, mirroring the integer-ALU guard. (N.5c-2a
+        # review.)
+        if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        if (mir_val_unif(m, dst) == MIR_UNKNOWN) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        return _gisel_emit(out, k, GISEL_EXTRACT, dst, a, b, c, flags);
+    }
     # float ALU: always VALU
     var fop = _gisel_float_op(op);
     if (fop != 0) { return _gisel_emit(out, k, fop, dst, a, b, c, flags); }
@@ -6677,7 +6712,7 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
                 # into an SGPR. Integer S_*/V_* already track uniformity in isel,
                 # so the two agree there. (A uniform value held in a VGPR feeding
                 # a later SALU op is the operand-class-coercion case — N.8.)
-                if (gisel_writes_vgpr(gisel_op(isel, i)) == 1) {
+                if (gisel_result_is_vgpr(m, isel, i) == 1) {
                     var rv = _ra_claim(&vfreeat, vgpr_base, vgpr_cap, i, freeat_new);
                     if (rv < 0) { return 0 - RA_ERR_VGPR_OVERFLOW; }
                     store64(alloc + d2 * RA_REC + 0, rv);
@@ -7245,9 +7280,21 @@ fn _emit_extract(m, isel, i, alloc, abi, buf, pos): i64 {
     var bid = gisel_a(isel, i);
     if (mir_val_kind(m, bid) != MIR_VK_BUILTIN) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
     var bi = mir_val_payload(m, bid);
-    if (bi != MIR_BI_LOCAL_INVOC_ID) { return 0 - CMP_ERR_UNSUPPORTED_BUILTIN; }
-    var src = gfx9_vgpr(gfx9_abi_builtin_reg(abi, MIR_BI_LOCAL_INVOC_ID, gisel_c(isel, i)));
-    return gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, gfx9_reg(alloc, gisel_dst(isel, i)), src));
+    var comp = gisel_c(isel, i);
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    # LocalInvocationId.comp = v[comp] (divergent → the result is a VGPR): v_mov.
+    if (bi == MIR_BI_LOCAL_INVOC_ID) {
+        var lsrc = gfx9_vgpr(gfx9_abi_builtin_reg(abi, MIR_BI_LOCAL_INVOC_ID, comp));
+        return gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst, lsrc));
+    }
+    # WorkgroupId.comp = the TGID SGPR s[user_sgpr+comp] (uniform → the result is an
+    # SGPR, via the EXTRACT file-class rule): s_mov. (GlobalInvocationId is never a
+    # GISEL_EXTRACT operand — the lowering expands it to wgid*size+lid.)
+    if (bi == MIR_BI_WORKGROUP_ID) {
+        var ssrc = gfx9_abi_builtin_reg(abi, MIR_BI_WORKGROUP_ID, comp);
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B32, dst, ssrc));
+    }
+    return 0 - CMP_ERR_UNSUPPORTED_BUILTIN;
 }
 
 # ================================================================
@@ -7312,7 +7359,7 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         var d = gisel_dst(isel, i);
         if (d != 0) {
             if (mir_val_kind(m, d) == MIR_VK_SSA) {
-                store64(&isvgpr + d * 8, gisel_writes_vgpr(gisel_op(isel, i)));
+                store64(&isvgpr + d * 8, gisel_result_is_vgpr(m, isel, i));
             }
         }
         i = i + 1;

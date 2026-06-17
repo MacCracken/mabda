@@ -594,9 +594,19 @@ hand-authored shaders stay as oracle + fallback.
     gate used `< 0` but the gate returns positive codes, so malformed input bypassed
     it into OOB table reads; now `!= 0` + a bad-magic regression test. GID expansion
     → N.5c-2.
-  - [ ] **N.5c-2** — GlobalInvocationId expansion in the lowering (`gid.c =
-    wgid.c*local_size_c + lid.c`) + `EXTRACT(WorkgroupId)`→`s[tgid]`, so the real
-    GID-indexed SAXPY compiles. Then the dynamic-offset HW path is general.
+  - [~] **N.5c-2** — GlobalInvocationId expansion + `EXTRACT(WorkgroupId)`→`s[tgid]`.
+    - [x] **N.5c-2a (2026-06-17)** — the encode/regalloc foundation: EXTRACT
+      file-class fix (`gisel_result_is_vgpr` — EXTRACT follows uniformity, used by
+      both regalloc + the encode file-map), SOP1 `s_mov` encoder, and
+      `EXTRACT(WorkgroupId)`→`s_mov` from the TGID SGPR. 9 asserts (WGID extract →
+      SGPR `s_mov`, LID extract → VGPR `v_mov`). **Adversarial review (workflow):
+      1 confirmed, fixed** — `_gisel_one` now fails loud on an UNKNOWN-uniformity
+      EXTRACT (would have mis-filed to SGPR), mirroring the N.3 ALU guard.
+    - [ ] **N.5c-2b** — the lowering expansion in `spirv_lower`: lower
+      `EXTRACT(OpLoad(GID).comp)` to `wgid.comp*local_size_comp + lid.comp`
+      (synth WGID+LID builtins via `mir_alloc_synth_id`, `local_size` from
+      `spirv_find_local_size`, `IMUL`+`IADD`), so the real GID-indexed SAXPY
+      compiles end-to-end (uniform `s_mul` + divergent `v_add`).
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
     `gfx9_compile` into a BO; parameterize the PM4 composer's rsrc1/rsrc2.
   - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL

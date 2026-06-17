@@ -1975,6 +1975,60 @@ fn test_gfx9_emit_extract_lid() {
     return 0;
 }
 
+# N.5c-2a review: an EXTRACT whose result uniformity is UNKNOWN (the sweep not run)
+# must fail loud in isel — its register file is decided from that uniformity, so a
+# silent UNKNOWN would mis-file it to an SGPR.
+fn test_gfx9_isel_extract_unknown_unif() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);
+    var isel[256];
+    # deliberately NO mir_run_uniformity → %6 stays MIR_UNKNOWN
+    assert_eq(gfx9_isel(&m, &isel, 8), 0 - GISEL_ERR_UNSUPPORTED_OP, "EXTRACT with UNKNOWN unif fails loud");
+    return 0;
+}
+
+# N.5c-2a: EXTRACT file-class fix + EXTRACT(WorkgroupId)→s_mov. A uniform WGID
+# extract must land in an SGPR (s_mov from s[tgid]); a divergent LID extract in a
+# VGPR (v_mov from v0). Proves both the regalloc file decision and the encode.
+fn test_gfx9_emit_extract_wgid() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_bufvar(&m, 13, 0);   # 1 binding → user_sgpr=2, TGID at s2
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    mir_set_builtin(&m, 6, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_U32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    assert_eq(gfx9_abi_sgpr_base(&abi), 3, "sgpr_base = 2 user + 1 tgid");
+    var isel[120];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 10, 5, 0, 0, MIR_FLAG_C_IMM);
+    _gisel_emit(&isel, 1, GISEL_EXTRACT, 11, 6, 0, 0, MIR_FLAG_C_IMM);
+    var alloc[512];
+    var hw[16];
+    var rr = gfx9_regalloc(&m, &isel, 2, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, &hw);
+    assert_eq(rr, 0, "regalloc ok");
+    assert_eq(gfx9_reg(&alloc, 10), 3, "uniform WGID extract -> s3 (SGPR file)");
+    assert_eq(gfx9_reg(&alloc, 11), 1, "divergent LID extract -> v1 (VGPR file)");
+    var built[64];
+    memset(&built, 0, 64);
+    var e = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    assert_eq(e, 8, "two moves = 8 bytes");
+    assert_eq(load32(&built + 0), 0xBE830002, "EXTRACT(WGID.x) -> s_mov s3, s2");
+    assert_eq(load32(&built + 4), 0x7E020300, "EXTRACT(LID.x) -> v_mov v1, v0");
+    return 0;
+}
+
 # The SAXPY fixture re-indexed by LocalInvocationId (BuiltIn 27) instead of
 # GlobalInvocationId (28) — so the index IS v0 (EXTRACT(LID)→v_mov, no wgid*size+lid
 # expansion). The first-oracle end-to-end target until GID expansion lands (N.5c-2).
@@ -2153,6 +2207,8 @@ fn main(): i64 {
     test_gfx9_emit_flat_vop3();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();
+    test_gfx9_isel_extract_unknown_unif();
+    test_gfx9_emit_extract_wgid();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();

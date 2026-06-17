@@ -282,9 +282,21 @@ fn _emit_extract(m, isel, i, alloc, abi, buf, pos): i64 {
     var bid = gisel_a(isel, i);
     if (mir_val_kind(m, bid) != MIR_VK_BUILTIN) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
     var bi = mir_val_payload(m, bid);
-    if (bi != MIR_BI_LOCAL_INVOC_ID) { return 0 - CMP_ERR_UNSUPPORTED_BUILTIN; }
-    var src = gfx9_vgpr(gfx9_abi_builtin_reg(abi, MIR_BI_LOCAL_INVOC_ID, gisel_c(isel, i)));
-    return gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, gfx9_reg(alloc, gisel_dst(isel, i)), src));
+    var comp = gisel_c(isel, i);
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    # LocalInvocationId.comp = v[comp] (divergent → the result is a VGPR): v_mov.
+    if (bi == MIR_BI_LOCAL_INVOC_ID) {
+        var lsrc = gfx9_vgpr(gfx9_abi_builtin_reg(abi, MIR_BI_LOCAL_INVOC_ID, comp));
+        return gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst, lsrc));
+    }
+    # WorkgroupId.comp = the TGID SGPR s[user_sgpr+comp] (uniform → the result is an
+    # SGPR, via the EXTRACT file-class rule): s_mov. (GlobalInvocationId is never a
+    # GISEL_EXTRACT operand — the lowering expands it to wgid*size+lid.)
+    if (bi == MIR_BI_WORKGROUP_ID) {
+        var ssrc = gfx9_abi_builtin_reg(abi, MIR_BI_WORKGROUP_ID, comp);
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B32, dst, ssrc));
+    }
+    return 0 - CMP_ERR_UNSUPPORTED_BUILTIN;
 }
 
 # ================================================================
@@ -349,7 +361,7 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         var d = gisel_dst(isel, i);
         if (d != 0) {
             if (mir_val_kind(m, d) == MIR_VK_SSA) {
-                store64(&isvgpr + d * 8, gisel_writes_vgpr(gisel_op(isel, i)));
+                store64(&isvgpr + d * 8, gisel_result_is_vgpr(m, isel, i));
             }
         }
         i = i + 1;

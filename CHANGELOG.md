@@ -335,6 +335,36 @@ for the immediate forward pointer.
   module is rejected, not crashed). (Caught by a read-only Explore-agent review —
   the no-file-write rule held: zero scratch files left behind.)
 
+### Added — Phase N.5c-2a (EXTRACT file-class fix + SOP1 `s_mov` + `EXTRACT(WGID)`)
+- `src/gfx9_isel.cyr` — `gisel_result_is_vgpr(m, out, i)`: the authoritative
+  register-file of an instruction's result. For `GISEL_EXTRACT` it follows the
+  result's **uniformity** (`WorkgroupId` → SGPR, `Local`/`GlobalInvocationId` →
+  VGPR) — a builtin extract just reads that builtin's register; for every other op
+  it stays `gisel_writes_vgpr(op)`. Replaces the bare `gisel_writes_vgpr` call in
+  **both** `gfx9_regalloc` (the file decision) and `gfx9_compile`'s encode
+  file-map so the two never disagree. (`gisel_writes_vgpr` alone can't decide
+  EXTRACT — it lacks the operand.)
+- `src/gfx9_encode.cyr` — `gfx9_enc_sop1` + `GFX9_SOP1_S_MOV_B32` (llvm-mc-verified,
+  `s_mov_b32 s8,s6 = 0xBE880006`).
+- `src/gfx9_compile.cyr` — `_emit_extract` resolves `WorkgroupId.comp` →
+  `s_mov(result, s[user_sgpr+comp])` (the TGID SGPR); `LocalInvocationId.comp`
+  stays `v_mov(result, v[comp])`. `GlobalInvocationId` still fails loud (the
+  lowering expands it — N.5c-2b).
+- `tests/tcyr/compiler.tcyr` +9 asserts: a uniform WGID extract is allocated an
+  SGPR and emits `s_mov s3, s2`; a divergent LID extract is allocated a VGPR and
+  emits `v_mov v1, v0` (the file-class fix proven through regalloc + encode); plus
+  the review-regression below. All prior divergent extracts unchanged.
+
+### Fixed — N.5c-2a adversarial review (1 confirmed, fixed pre-merge)
+- **`EXTRACT` didn't fail loud on an `UNKNOWN`-uniformity result.** Its register
+  file is now decided from the result's uniformity, so an unclassified result
+  (the N.2 sweep not run / a value it missed) would be silently filed to an SGPR —
+  a LID extract that should be a VGPR would then get a `v_mov` with an SGPR dst.
+  `_gisel_one` now rejects a result-less or `MIR_UNKNOWN` EXTRACT with
+  `GISEL_ERR_UNSUPPORTED_OP`, mirroring the integer-ALU guard (N.3). Not reachable
+  in the normal `gfx9_compile` flow (uniformity always runs before isel) —
+  defensive hardening; regression test added.
+
 ### Changed
 - **Toolchain pin → `cyrius = "6.2.18"`** (tracking upstream; was 6.2.15).
   6.2.18 lands the native-float `f32_from` / `f32_to` builtins (the f32 conversion
