@@ -1650,6 +1650,171 @@ fn test_gfx9_waitcnt_errors() {
     return 0;
 }
 
+# ================================================================
+# Phase N.5a — encode driver (gfx9_compile.cyr)
+# ================================================================
+# A self-consistent straight-line program (every SSA operand defined earlier, so
+# the file-map covers it) exercising every N.5a format + operand path:
+#   [0] s_lshl_b32 s8, 1, 2        (SOP2, two IMM-inline operands)
+#   [1] s_add_i32  s9, s8, 7       (SOP2, SGPR + CONST operand)
+#   [2] v_cvt_f32_i32 v4, s8       (VOP1, SGPR -> VGPR src; bootstraps a VGPR)
+#   [3] v_mul_f32  v5, v4, v4      (VOP2 commutative, two VGPR operands)
+#   [4] v_cvt_i32_f32 v6, v5       (VOP1)
+#   [5] v_and_b32  v7, 0xff, v6    (VOP2 commutative, CONST -> literal dword)
+#   [6] v_lshrrev_b32 v8, 2, v6    (VOP2 rev: value=vsrc1, IMM amount=src0)
+#   [7] s_waitcnt vmcnt(0)         (SOPP, IMM simm)
+#   [8] s_endpgm                   (SOPP)
+# Expected dwords are llvm-mc gfx900 ground-truth (see the N.5a commit notes).
+fn test_gfx9_emit_alu_program() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    # SSA results (file comes from the defining op, not these unif values)
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 20, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 24, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 21, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 25, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 26, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    mir_set_const(&m, 12, MIR_T_I32, 7);
+    mir_set_const(&m, 23, MIR_T_I32, 255);
+    # GISEL list
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_S_LSHL_B32, 10, 1, 2, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+    _gisel_emit(&isel, 1, GISEL_S_ADD_I32, 11, 10, 12, 0, 0);
+    _gisel_emit(&isel, 2, GISEL_V_CVT_F32_I32, 20, 10, 0, 0, 0);
+    _gisel_emit(&isel, 3, GISEL_V_MUL_F32, 24, 20, 20, 0, 0);
+    _gisel_emit(&isel, 4, GISEL_V_CVT_I32_F32, 21, 24, 0, 0, 0);
+    _gisel_emit(&isel, 5, GISEL_V_AND_B32, 25, 21, 23, 0, 0);
+    _gisel_emit(&isel, 6, GISEL_V_LSHRREV_B32, 26, 21, 2, 0, MIR_FLAG_B_IMM);
+    _gisel_emit(&isel, 7, GISEL_S_WAITCNT, 0, 3952, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 8, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    # regalloc map: id*16 -> phys reg
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 10 * 16, 8);
+    store64(&alloc + 11 * 16, 9);
+    store64(&alloc + 20 * 16, 4);
+    store64(&alloc + 24 * 16, 5);
+    store64(&alloc + 21 * 16, 6);
+    store64(&alloc + 25 * 16, 7);
+    store64(&alloc + 26 * 16, 8);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 9, &alloc, &built, 0);
+    assert_eq(endp, 40, "emit_program end at 40 bytes (10 dwords)");
+    # llvm-mc gfx900 ground-truth
+    var truth[256];
+    var tp = 0;
+    tp = gfx9_emit32(&truth, tp, 0x8E088281);
+    tp = gfx9_emit32(&truth, tp, 0x81098708);
+    tp = gfx9_emit32(&truth, tp, 0x7E080A08);
+    tp = gfx9_emit32(&truth, tp, 0x0A0A0904);
+    tp = gfx9_emit32(&truth, tp, 0x7E0C1105);
+    tp = gfx9_emit32(&truth, tp, 0x260E0CFF);
+    tp = gfx9_emit32(&truth, tp, 0x000000FF);
+    tp = gfx9_emit32(&truth, tp, 0x20100C82);
+    tp = gfx9_emit32(&truth, tp, 0xBF8C0F70);
+    tp = gfx9_emit32(&truth, tp, 0xBF810000);
+    assert_eq(memeq(&built, &truth, 40), 1, "emit_program byte-matches llvm-mc");
+    return 0;
+}
+
+# N.5a fail-loud paths: an op N.5a does not encode, a builtin operand (N.5b),
+# and cap_ids beyond the file-map scratch.
+fn test_gfx9_emit_errors() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    _mir_set_val(&m, 20, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 21, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 20 * 16, 4);
+    store64(&alloc + 21 * 16, 5);
+    var built[128];
+    # an unsupported op (FLAT load lands in N.5b)
+    var isel[120];
+    _gisel_emit(&isel, 0, GISEL_GLOBAL_LOAD, 20, 0, 0, 0, 0);
+    assert_eq(gfx9_emit_program(&m, &isel, 1, &alloc, &built, 0), 0 - CMP_ERR_UNSUPPORTED_OP, "unsupported op");
+    # a builtin operand (ABI resolution is N.5b): bootstrap %20 as a VGPR in-list,
+    # then add a builtin — the resolve of %5 fails loud.
+    _gisel_emit(&isel, 0, GISEL_V_CVT_F32_I32, 20, 5, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 1, GISEL_V_ADD_U32, 21, 20, 5, 0, 0);
+    assert_eq(gfx9_emit_program(&m, &isel, 2, &alloc, &built, 0), 0 - CMP_ERR_UNSUPPORTED_OPERAND, "builtin operand");
+    # cap_ids beyond the scratch
+    var fake[80];
+    memset(&fake, 0, 80);
+    store64(&fake + 64, 300);
+    assert_eq(gfx9_emit_program(&fake, &isel, 0, &alloc, &built, 0), 0 - CMP_ERR_TOO_MANY_IDS, "cap_ids too large");
+    return 0;
+}
+
+# N.5a review: subtraction is NON-commutative. The driver must emit v_sub when
+# the subtrahend (b) is the VGPR and v_subrev when the minuend (a) is the VGPR and
+# the subtrahend is a constant/SGPR — both yielding a - b. The commutative path
+# would negate the (vgpr minuend - const) case. All three operand-file cases for
+# ISUB + the float peer, byte-checked against llvm-mc gfx900.
+fn test_gfx9_emit_sub_noncommutative() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 32, 32);
+    _mir_set_val(&m, 20, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 21, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 22, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 23, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 24, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 25, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 26, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    mir_set_const(&m, 30, MIR_T_I32, 5);
+    mir_set_const(&m, 31, MIR_T_F32, 0x40400000);   # 3.0f
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_V_CVT_F32_I32, 20, 9, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 1, GISEL_V_CVT_I32_F32, 21, 20, 0, 0, 0);
+    _gisel_emit(&isel, 2, GISEL_V_CVT_I32_F32, 22, 20, 0, 0, 0);
+    # case2: minuend %21 (VGPR) - subtrahend const 5  -> v_subrev_u32 v7, 5, v5
+    _gisel_emit(&isel, 3, GISEL_V_SUB_U32, 23, 21, 30, 0, 0);
+    # case1: minuend const 5 - subtrahend %21 (VGPR)  -> v_sub_u32 v8, 5, v5
+    _gisel_emit(&isel, 4, GISEL_V_SUB_U32, 24, 30, 21, 0, 0);
+    # case3: both VGPR %21 - %22                       -> v_sub_u32 v9, v5, v6
+    _gisel_emit(&isel, 5, GISEL_V_SUB_U32, 25, 21, 22, 0, 0);
+    # FSUB case2: minuend %20 (VGPR f32) - const 3.0   -> v_subrev_f32 v10, lit, v4
+    _gisel_emit(&isel, 6, GISEL_V_SUB_F32, 26, 20, 31, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 32 * 16);
+    store64(&alloc + 20 * 16, 4);
+    store64(&alloc + 21 * 16, 5);
+    store64(&alloc + 22 * 16, 6);
+    store64(&alloc + 23 * 16, 7);
+    store64(&alloc + 24 * 16, 8);
+    store64(&alloc + 25 * 16, 9);
+    store64(&alloc + 26 * 16, 10);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 7, &alloc, &built, 0);
+    assert_eq(endp, 32, "sub program end at 32 bytes");
+    assert_eq(load32(&built + 0), 0x7E080A89, "cvt_f32_i32 v4,9");
+    assert_eq(load32(&built + 4), 0x7E0A1104, "cvt_i32_f32 v5,v4");
+    assert_eq(load32(&built + 8), 0x7E0C1104, "cvt_i32_f32 v6,v4");
+    assert_eq(load32(&built + 12), 0x6C0E0A85, "v_subrev_u32 v7,5,v5 (vgpr minuend - const)");
+    assert_eq(load32(&built + 16), 0x6A100A85, "v_sub_u32 v8,5,v5 (const - vgpr)");
+    assert_eq(load32(&built + 20), 0x6A120D05, "v_sub_u32 v9,v5,v6 (both vgpr)");
+    assert_eq(load32(&built + 24), 0x061408FF, "v_subrev_f32 v10,lit,v4");
+    assert_eq(load32(&built + 28), 0x40400000, "v_subrev_f32 literal 3.0");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -1698,5 +1863,8 @@ fn main(): i64 {
     test_gfx9_waitcnt_saxpy();
     test_gfx9_waitcnt_none();
     test_gfx9_waitcnt_errors();
+    test_gfx9_emit_alu_program();
+    test_gfx9_emit_sub_noncommutative();
+    test_gfx9_emit_errors();
     return assert_summary();
 }

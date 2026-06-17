@@ -212,20 +212,56 @@ for the immediate forward pointer.
   un-waited load. Adversarial review (workflow): clean — 1 candidate, 0 confirmed
   (no under-wait / bounds gap survived verification).
 
+### Added — Phase N.5a (GFX9 encode driver)
+- `src/gfx9_compile.cyr` — the encode driver: walks the N.4 selected-instruction
+  (GISEL) list + the regalloc map and emits a GFX9 ISA dword stream through the
+  `gfx9_encode.cyr` encoders. `gfx9_emit_program(m, isel, n_isel, alloc, buf,
+  pos)` returns the end byte position (the caller appends the prefetch pad).
+  Resolves each operand to a physical register (regalloc map + a per-value
+  file-map keyed by the *defining op's* class via `gisel_writes_vgpr` — not
+  uniformity, the N.4a lesson), an inline constant, or a trailing 32-bit literal
+  dword. Covers the single-dword formats the current isel emits — SOP2, VOP1
+  (CVT), VOP2 (incl. the rev-operand shifts: value → `vsrc1`, amount → `src0`),
+  SOPP (`s_waitcnt`/`s_endpgm`). Fail-loud (`CMP_ERR_*`) on FLAT / VOP3 / EXTRACT
+  / builtin / buffer operands (N.5b+), the ≤1-literal-per-instruction rule, and a
+  VGPR operand handed to a SALU op.
+- `src/gfx9_encode.cyr` — added the SOP2 (`S_SUB_I32`/`S_LSHR_B32`/`S_AND_B32`/
+  `S_OR_B32`/`S_XOR_B32`) and VOP2 (`V_ADD_F32`/`V_SUB_F32`/`V_XOR_B32`/
+  `V_SUB_U32`) opcodes the full GISEL ALU set needs, each **llvm-mc gfx900
+  verified**.
+- `tests/tcyr/compiler.tcyr` +14 asserts: a self-consistent 9-instruction program
+  (SOP2 inline+const, VOP1 CVT bootstrapping a VGPR, VOP2 commutative + literal,
+  VOP2 rev-shift, SOPP) whose emitted bytes **byte-match llvm-mc gfx900
+  ground-truth**, the unsupported-op / builtin-operand / cap_ids fail-louds, and
+  the subtraction operand-file matrix below. Adversarially reviewed (workflow).
+
+### Fixed — N.5a adversarial review (1 confirmed, fixed pre-merge)
+- **Non-commutative subtraction was routed through the commutative VOP2 path and
+  silently negated.** GFX9 `v_sub` computes `src0 - vsrc1` and `vsrc1` must be a
+  VGPR, so a `divergent_var - constant` (VGPR minuend, non-VGPR subtrahend — the
+  ubiquitous `idx - 1` pattern) had its operands swapped, computing `const - var`.
+  Added a dedicated `_emit_vop2_sub` that emits `v_sub` when the subtrahend is the
+  VGPR and `v_subrev` (new opcodes `V_SUBREV_U32`=0x36 / `V_SUBREV_F32`=0x03,
+  llvm-mc-verified) when the minuend is the VGPR — both yielding `a - b`. (`ISUB`
+  was untested by the original oracle, so the path was unexercised; the fix lands
+  with a 3-case operand-file matrix for `ISUB` + `FSUB`.)
+
 ### Changed
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
   `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
-  `gfx9_waitcnt.cyr` (after `spirv_parse.cyr`).
+  `gfx9_waitcnt.cyr` / `gfx9_compile.cyr` (after `spirv_parse.cyr`).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- N.5 — **the MVP payoff**: GFX9 encode (`GISEL_*` → bytes via `gfx9_encode.cyr`,
-  resolving the regalloc map + constants + builtins + the ptr side-table) + ABI
-  wiring, then the bring-up oracle: recompile the downsample shader from SPIR-V
-  and byte-match the hand-authored GFX9. 3.2.7.
+- N.5b — FLAT load/store + VOP3 (`v_mul_lo_u32`) encode + `src/gfx9_abi.cyr`
+  (canonical compute ABI: builtin → v0/s6/s7, binding → USER_DATA SGPR pairs) +
+  `gfx9_rsrc1`/`gfx9_rsrc2`. Then N.5c (SAXPY first oracle: full `gfx9_compile`
+  SPIR-V→ISA), N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3), N.5f (64-bit carry
+  + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP exit). Per the
+  2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 

@@ -1,0 +1,251 @@
+# @internal — GFX9 encode driver (Phase N.5a, the compiler's output stage)
+# gfx9_compile.cyr — walks the N.4 selected-instruction list + the regalloc map
+# and emits a GFX9 ISA byte stream through the gfx9_encode.cyr encoders. This is
+# the stage that finally turns the abstract GISEL records (op / dst / a / b / c /
+# flags, operands = MIR <id>s) into runnable dwords: each operand resolves to a
+# physical register (regalloc map + the per-value file), an inline constant, a
+# 32-bit literal dword, or (N.5b) an ABI register; each op dispatches to the
+# right encoder + format.
+#
+# N.5a SCOPE: the single-dword ALU/control formats the current isel already
+# produces over SSA-or-constant operands — SOP2, VOP1 (CVT), VOP2 (incl. the
+# rev-operand shifts), SOPP (s_waitcnt / s_endpgm) — plus the literal-dword path.
+# FLAT load/store, VOP3 (v_mul_lo_u32 / add3 / bfe / or3), GISEL_EXTRACT, and
+# builtin/buffer operands fail loud (CMP_ERR_*) — they land with the ABI module
+# in N.5b+. The driver returns the end byte position so the caller appends
+# gfx9_emit_prefetch_pad. Pure byte math; no syscalls. Included after
+# gfx9_waitcnt.cyr (drives gfx9_isel + gfx9_regalloc + gfx9_encode accessors).
+#
+# The OPERAND FILE (VGPR vs SGPR) of an SSA value is the destination class of the
+# instruction that DEFINES it (gisel_writes_vgpr) — NOT its uniformity (the N.4a
+# lesson: a uniform float/CVT result lives in a VGPR). The driver builds a
+# file-map over the list's results in a first pass, then resolves operands
+# against it. Every SSA operand of a straight-line program is defined earlier in
+# the same list, so the map covers them all.
+
+# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52,
+# waitcnt 60-61).
+var CMP_ERR_UNSUPPORTED_OP      = 70;   # a GISEL op N.5a does not encode yet
+var CMP_ERR_UNSUPPORTED_OPERAND = 71;   # a builtin/buffer/ptr operand (N.5b)
+var CMP_ERR_NO_VGPR_OPERAND     = 72;   # a VALU op with no VGPR operand for vsrc1
+var CMP_ERR_BAD_SALU_OPERAND    = 73;   # a SALU op handed a VGPR operand
+var CMP_ERR_TWO_LITERALS        = 74;   # >1 literal in one instruction (illegal)
+var CMP_ERR_TOO_MANY_IDS        = 75;   # cap_ids beyond the file-map scratch
+
+# ================================================================
+# Operand resolution
+# ================================================================
+# Resolve a GISEL operand to a 9-bit VOP src code (SGPR 0-101 / inline 128-208 /
+# VGPR 256+n / GFX9_SRC_LITERAL 255 = a literal dword follows). `is_imm` non-zero
+# means the field IS an inline immediate value; otherwise the field is a MIR <id>
+# (CONST -> its bits; SSA -> its physical register + file). Returns a negative
+# error for a builtin/buffer/ptr operand (N.5b) or the id-0 sentinel.
+fn _cmp_resolve(m, alloc, isvgpr, field, is_imm): i64 {
+    if (is_imm != 0) { return gfx9_inline_int(field); }
+    if (field == 0) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
+    var k = mir_val_kind(m, field);
+    if (k == MIR_VK_CONST) { return gfx9_inline_int(mir_val_payload(m, field)); }
+    if (k == MIR_VK_SSA) {
+        var r = gfx9_reg(alloc, field);
+        if (load64(isvgpr + field * 8) != 0) { return gfx9_vgpr(r); }
+        return gfx9_sgpr(r);
+    }
+    return 0 - CMP_ERR_UNSUPPORTED_OPERAND;
+}
+
+# The 32-bit literal value for an operand whose _cmp_resolve returned LITERAL.
+fn _cmp_lit(m, field, is_imm): i64 {
+    if (is_imm != 0) { return field; }
+    return mir_val_payload(m, field);
+}
+
+# 1 if the operand resolves to a VGPR (a non-immediate SSA value in the VGPR
+# file); 0 otherwise (immediate / constant / SGPR value).
+fn _cmp_is_vgpr(m, isvgpr, field, is_imm): i64 {
+    if (is_imm != 0) { return 0; }
+    if (field == 0) { return 0; }
+    if (mir_val_kind(m, field) != MIR_VK_SSA) { return 0; }
+    if (load64(isvgpr + field * 8) != 0) { return 1; }
+    return 0;
+}
+
+# ================================================================
+# Per-format emitters — each returns the new byte position or a negative error.
+# ================================================================
+# SOP2: scalar ALU, sdst = a OP b. ssrc0/ssrc1 are 8-bit (SGPR / inline /
+# literal); a VGPR operand is illegal. At most one literal.
+fn _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var ssrc0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (ssrc0 < 0) { return ssrc0; }
+    var ssrc1 = _cmp_resolve(m, alloc, isvgpr, b, fl & MIR_FLAG_B_IMM);
+    if (ssrc1 < 0) { return ssrc1; }
+    if (ssrc0 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc1 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc0 == GFX9_SRC_LITERAL) { if (ssrc1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_TWO_LITERALS; } }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_sop2(opc, gfx9_reg(alloc, gisel_dst(isel, i)), ssrc0, ssrc1));
+    if (ssrc0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    if (ssrc1 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM)); }
+    return p;
+}
+
+# VOP1: vector ALU, one source (the CVT ops). vdst = OP(src0).
+fn _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0));
+    if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    return p;
+}
+
+# VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
+# (an 8-bit VGPR index). `is_rev` ops (v_lshlrev/lshrrev) are vdst = vsrc1 OP
+# src0 with src0 = the shift amount, so the value operand (a) MUST be the VGPR
+# vsrc1. Commutative ops place the VGPR operand in vsrc1 and the other in src0.
+fn _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, opc, is_rev): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var aimm = fl & MIR_FLAG_A_IMM;
+    var bimm = fl & MIR_FLAG_B_IMM;
+    var src0 = 0;
+    var vsrc1 = 0;
+    var lit_field = 0;
+    var lit_imm = 0;
+    if (is_rev != 0) {
+        if (_cmp_is_vgpr(m, isvgpr, a, aimm) == 0) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }
+        vsrc1 = gfx9_reg(alloc, a);
+        src0 = _cmp_resolve(m, alloc, isvgpr, b, bimm);
+        lit_field = b;
+        lit_imm = bimm;
+    } else {
+        if (_cmp_is_vgpr(m, isvgpr, b, bimm) != 0) {
+            vsrc1 = gfx9_reg(alloc, b);
+            src0 = _cmp_resolve(m, alloc, isvgpr, a, aimm);
+            lit_field = a;
+            lit_imm = aimm;
+        } else {
+            if (_cmp_is_vgpr(m, isvgpr, a, aimm) == 0) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }
+            vsrc1 = gfx9_reg(alloc, a);
+            src0 = _cmp_resolve(m, alloc, isvgpr, b, bimm);
+            lit_field = b;
+            lit_imm = bimm;
+        }
+    }
+    if (src0 < 0) { return src0; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0, vsrc1));
+    if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, lit_field, lit_imm)); }
+    return p;
+}
+
+# VOP2 SUBTRACTION (NON-commutative): result = a (minuend) - b (subtrahend).
+# GFX9 v_sub computes src0 - vsrc1; v_subrev computes vsrc1 - src0; vsrc1 must be
+# a VGPR. So: if b is a VGPR, emit v_sub with src0 = a, vsrc1 = b (a - b). Else
+# (b is a constant/SGPR) a MUST be the VGPR, so emit v_subrev with vsrc1 = a,
+# src0 = b (still a - b). The commutative path would silently negate the
+# minuend-is-VGPR / subtrahend-is-const case (N.5a review).
+fn _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, sub_opc, subrev_opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var aimm = fl & MIR_FLAG_A_IMM;
+    var bimm = fl & MIR_FLAG_B_IMM;
+    var opc = 0;
+    var src0 = 0;
+    var vsrc1 = 0;
+    var lit_field = 0;
+    var lit_imm = 0;
+    if (_cmp_is_vgpr(m, isvgpr, b, bimm) != 0) {
+        opc = sub_opc;
+        vsrc1 = gfx9_reg(alloc, b);
+        src0 = _cmp_resolve(m, alloc, isvgpr, a, aimm);
+        lit_field = a;
+        lit_imm = aimm;
+    } else {
+        if (_cmp_is_vgpr(m, isvgpr, a, aimm) == 0) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }
+        opc = subrev_opc;
+        vsrc1 = gfx9_reg(alloc, a);
+        src0 = _cmp_resolve(m, alloc, isvgpr, b, bimm);
+        lit_field = b;
+        lit_imm = bimm;
+    }
+    if (src0 < 0) { return src0; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0, vsrc1));
+    if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, lit_field, lit_imm)); }
+    return p;
+}
+
+# ================================================================
+# Op dispatch — one GISEL record -> its encoder(s).
+# ================================================================
+fn _cmp_emit_one(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var op = gisel_op(isel, i);
+    if (op == GISEL_S_ADD_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_ADD_I32); }
+    if (op == GISEL_S_SUB_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_SUB_I32); }
+    if (op == GISEL_S_MUL_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_MUL_I32); }
+    if (op == GISEL_S_LSHL_B32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_LSHL_B32); }
+    if (op == GISEL_S_LSHR_B32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_LSHR_B32); }
+    if (op == GISEL_S_AND_B32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_AND_B32); }
+    if (op == GISEL_S_OR_B32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_OR_B32); }
+    if (op == GISEL_S_XOR_B32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_XOR_B32); }
+    if (op == GISEL_V_ADD_U32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_ADD_U32, 0); }
+    if (op == GISEL_V_SUB_U32) {
+        return _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_SUB_U32, GFX9_VOP2_V_SUBREV_U32);
+    }
+    if (op == GISEL_V_AND_B32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_AND_B32, 0); }
+    if (op == GISEL_V_OR_B32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_OR_B32, 0); }
+    if (op == GISEL_V_XOR_B32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_XOR_B32, 0); }
+    if (op == GISEL_V_ADD_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_ADD_F32, 0); }
+    if (op == GISEL_V_SUB_F32) {
+        return _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_SUB_F32, GFX9_VOP2_V_SUBREV_F32);
+    }
+    if (op == GISEL_V_MUL_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MUL_F32, 0); }
+    if (op == GISEL_V_LSHLREV_B32) {
+        return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHLREV_B32, 1);
+    }
+    if (op == GISEL_V_LSHRREV_B32) {
+        return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHRREV_B32, 1);
+    }
+    if (op == GISEL_V_CVT_F32_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_I32); }
+    if (op == GISEL_V_CVT_I32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F32); }
+    if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
+    if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
+    return 0 - CMP_ERR_UNSUPPORTED_OP;
+}
+
+# ================================================================
+# Driver
+# ================================================================
+# Encode the selected-instruction list `isel` (n_isel instrs) over the MIR `m`
+# and the regalloc map `alloc`, writing the ISA byte stream into `buf` starting
+# at `pos`. Returns the end byte position or a negative error. The caller appends
+# gfx9_emit_prefetch_pad to the returned position.
+fn gfx9_emit_program(m, isel, n_isel, alloc, buf, pos): i64 {
+    var cap_ids = load64(m + 64);
+    if (cap_ids > RA_MAX_REGS) { return 0 - CMP_ERR_TOO_MANY_IDS; }
+    var isvgpr[2048];   # per-id file-map: 1 = the value lives in a VGPR
+    memset(&isvgpr, 0, cap_ids * 8);
+    var i = 0;
+    while (i < n_isel) {
+        var d = gisel_dst(isel, i);
+        if (d != 0) {
+            if (mir_val_kind(m, d) == MIR_VK_SSA) {
+                store64(&isvgpr + d * 8, gisel_writes_vgpr(gisel_op(isel, i)));
+            }
+        }
+        i = i + 1;
+    }
+    var p = pos;
+    i = 0;
+    while (i < n_isel) {
+        var rc = _cmp_emit_one(m, isel, i, alloc, &isvgpr, buf, p);
+        if (rc < 0) { return rc; }
+        p = rc;
+        i = i + 1;
+    }
+    return p;
+}

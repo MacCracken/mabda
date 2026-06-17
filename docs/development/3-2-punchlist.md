@@ -545,8 +545,39 @@ hand-authored shaders stay as oracle + fallback.
   17 asserts incl. a `_wc_check_invariant` walker that proves no output instr
   reads an un-waited load. **Adversarial review (workflow): clean (1 candidate,
   0 confirmed).** **N.4 COMPLETE.**
-- [ ] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + recompile the
-  downsample shader from SPIR-V and byte-match it** on Cezanne. MVP exit.
+- [~] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + the downsample bring-up
+  oracle.** Scoped 2026-06-17 (user, [[project_n5_saxpy_first_proven_equiv]]):
+  the downsample needs 5 isel/ABI features the gid/SAXPY-built pipeline lacks
+  (VOP3 fusion, 64-bit carry, SGPR→VGPR moves, builtin→ABI-SGPR,
+  binding→USER_DATA), so the arc grows to absorb them — **SAXPY is the first
+  oracle** (intermediate milestone, green gates throughout) and the downsample
+  stays the **named** MVP exit (N.5g) as **proven-equivalent + Cezanne
+  pixel-match** (not literal byte-match). Sub-bites:
+  - [x] **N.5a (2026-06-17)** — `src/gfx9_compile.cyr` encode driver:
+    `gfx9_emit_program` walks the GISEL list + regalloc map → ISA dwords via the
+    `gfx9_encode` encoders, resolving operands to phys reg (file-map from the
+    defining op's class) / inline const / 32-bit literal. Covers SOP2 / VOP1
+    (CVT) / VOP2 (incl. rev-shift) / SOPP; fail-loud on FLAT/VOP3/EXTRACT/builtin/
+    buffer (N.5b+), the ≤1-literal rule, and a SALU-VGPR operand. Added the
+    missing SOP2/VOP2 opcodes (llvm-mc gfx900-verified). 14 asserts: a 9-instr
+    program byte-matches llvm-mc ground-truth + the fail-louds + the subtraction
+    operand-file matrix. **Adversarial review (workflow): 1 confirmed, fixed** —
+    non-commutative `v_sub` was on the commutative path and negated
+    `vgpr - const`; dedicated `_emit_vop2_sub` picks `v_sub`/`v_subrev` (new
+    opcodes) to always compute `a - b`, regression-tested 3 operand-file cases.
+  - [ ] **N.5b** — FLAT load/store + VOP3 `v_mul_lo_u32` encode + `gfx9_abi.cyr`
+    (canonical ABI: builtin→v0/s6/s7, binding→USER_DATA SGPR pairs) +
+    `gfx9_rsrc1`/`gfx9_rsrc2` (assert `rsrc1(14,19)==0x2C0083`, `rsrc2==0x18C`).
+  - [ ] **N.5c** — SAXPY first oracle: top-level `gfx9_compile` (validate→lower→
+    uniformity→isel→regalloc→abi→waitcnt→emit→pad) + byte fixture.
+  - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
+    `gfx9_compile` into a BO; parameterize the PM4 composer's rsrc1/rsrc2.
+  - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL
+    ops + isel rules + 3-src encode).
+  - [ ] **N.5f** — 64-bit carry SALU (`s_add_u32`/`s_addc_u32` split) + SGPR→VGPR
+    `v_mov` materialization for FLAT addresses.
+  - [ ] **N.5g** — downsample SPIR-V → full pipeline; proven-equivalent assert +
+    `native_mipmap_e2e` pixel-match on Cezanne. **MVP exit.**
 - [ ] **N.6** *(3.2.8)* — First novel kernel (SAXPY); differential CPU oracle;
   generic dispatcher.
 - [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
