@@ -33,23 +33,36 @@ for the immediate forward pointer.
   representative encoder output per GFX9 format, each decoded to confirm it is a
   valid gfx90c encoding of the expected mnemonic (independent of the Cyrius
   oracle).
+- `gfx9_encode.cyr` emit helpers: `gfx9_emit32` (store one dword + advance — the
+  stream primitive the N.5 encode stage will drive) and `gfx9_emit_prefetch_pad`
+  (the AMDGPU-mandated 16 × `s_nop 0` tail, lifted from the loop that was
+  duplicated in all six shader builders).
 
-### Changed
-- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/gfx9_encode.cyr`
-  (after `backend_native_shaders.cyr`, before `_pm4.cyr` — same "no deps" tier).
+### Changed — N.0 follow-on refactor (shader builders now emit through the encoders)
+- All six hand-authored builders in `backend_native_shaders.cyr`
+  (`store_deadbeef`, `downsample_2x2`, `solid_red`, `fullscreen_triangle_vs`,
+  the two textured FSes) re-expressed from raw `store32(0xLITERAL)` dwords to
+  operand-level `gfx9_emit32(buf, p, gfx9_enc_*(...))` calls — self-documenting,
+  no magic dwords, and the proposal's "each fixed shader round-trips to its
+  known bytes through the new encoders" regression check. **Byte-identical:**
+  guarded by the pre-existing per-dword golden / checksum tests in `native.tcyr`
+  (e.g. the downsample's `179445143226` dword checksum) — the full suite is the
+  proof the produced bytes did not move. The duplicated `s_nop` pad loop is now
+  one `gfx9_emit_prefetch_pad` call.
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr`: `src/gfx9_encode.cyr` moved to
+  **before** `backend_native_shaders.cyr` (it is now the builders' dependency;
+  same "no deps" tier, after `_amdgpu`).
 
 ### Notes
-- The hand-authored `native_gfx9_shader_*` builders are UNCHANGED — they remain
-  the HW-verified ground truth and the bring-up oracle; these encoders are a new,
-  independently-proven library the later N.5 encode stage will drive.
-- **Scope (matches the proposal's compute-only boundary):** EXP (graphics
-  color/pos export) and MIMG (image load/sample) encoders are deliberately NOT
-  lifted in N.0 — they belong to a future graphics/texture compiler phase. The
-  hand-authored EXP/MIMG dwords keep their existing byte-pinned tests.
+- EXP (graphics color/pos export) and MIMG (image load/sample) dwords stay raw
+  literals in the builders — the proposal scopes the compiler compute-only, so
+  those encoders land with a future graphics/texture phase. Flagged inline in
+  each affected builder; the existing byte-pinned tests still cover them.
 
 ### Metrics
 - CPU suite **2908 → 3026** assertions; **13** domain test files (new
-  `compiler.tcyr`). Bundle 16094 → **16416** lines (gfx9_encode added).
+  `compiler.tcyr`). Bundle 16094 → **16472** lines (gfx9_encode + emit helpers;
+  the builder bodies grew slightly trading magic dwords for encoder calls).
 
 ### Next
 - N.1 — SPIR-V parser (`src/spirv_parse.cyr`): header + instruction stream +

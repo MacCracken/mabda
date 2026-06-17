@@ -22,7 +22,9 @@
 # Authorities: GFX9/Vega ISA reference (instruction-format bit layouts) +
 # the byte constants in backend_native_shaders.cyr (the regression oracle).
 # Pure byte math: no syscalls, no fn deps, no allocation. Included in the
-# build chain right after backend_native_shaders.cyr (same "no deps" tier).
+# build chain BEFORE backend_native_shaders.cyr — the hand-authored shader
+# builders there were refactored (N.0 follow-on) to emit through these
+# encoders, so this module is now their dependency.
 #
 # SCOPE (matches the proposal's compute-only compiler boundary): this lifts
 # the formats the compute compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP,
@@ -198,4 +200,30 @@ fn gfx9_enc_flat_lo(op, seg, offset, glc, slc): i64 {
 
 fn gfx9_enc_flat_hi(vdst, saddr, data, vaddr): i64 {
     return ((vdst & 0xFF) << 24) | ((saddr & 0x7F) << 16) | ((data & 0xFF) << 8) | (vaddr & 0xFF);
+}
+
+# ================================================================
+# Emit helpers — store an encoded dword into an ISA stream and advance.
+# ================================================================
+# The N.5 compiler encode stage and the (refactored) hand-authored shader
+# builders both lay down a contiguous GFX9 ISA byte stream. gfx9_emit32 stores
+# one dword at `pos` and returns the next write position (pos + 4) — the
+# running-position idiom that replaces manual `buf + pos + N` offset math.
+fn gfx9_emit32(buf, pos, dword): i64 {
+    store32(buf + pos, dword);
+    return pos + 4;
+}
+
+# Append the AMDGPU-mandated 16 × s_nop 0 prefetch padding (64 bytes) that
+# every GFX9 shader needs after s_endpgm: the CP prefetches past the program
+# end, and without the pad it can fetch into an unmapped page. Returns
+# pos + 64. (Lifted from the identical loop duplicated in every shader builder.)
+fn gfx9_emit_prefetch_pad(buf, pos): i64 {
+    var p = pos;
+    var i = 0;
+    while (i < 16) {
+        p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_NOP, 0));
+        i = i + 1;
+    }
+    return p;
 }

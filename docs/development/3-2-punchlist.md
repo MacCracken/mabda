@@ -432,7 +432,13 @@ hand-authored shaders stay as oracle + fallback.
   truth). EXP (graphics export) + MIMG (image ops) encoders are NOT lifted —
   the proposal scopes the compiler compute-only; they land with a future
   graphics/texture compiler phase (flagged here, not silently dropped). Pure
-  CPU. Wired into `[lib].modules` + `src/lib.cyr` (after shaders, before pm4).
+  CPU. Wired into `[lib].modules` + `src/lib.cyr` (before shaders, after amdgpu).
+  **Follow-on refactor (same bite):** all six hand-authored builders in
+  `backend_native_shaders.cyr` re-expressed to emit through the encoders
+  (`gfx9_emit32` + `gfx9_enc_*`) + a shared `gfx9_emit_prefetch_pad` for the
+  16×`s_nop` tail — the proposal's "round-trip the fixed shaders through the new
+  encoders" check; **byte-identical** (native.tcyr golden/checksum tests
+  unchanged-green). EXP/MIMG dwords stay raw (compute-only scope).
 - [ ] **N.1** *(3.2.5)* — SPIR-V parser (`src/spirv_parse.cyr`); untrusted-input
   rejection tests.
 - [ ] **N.2** *(3.2.6)* — MIR + uniformity lowering (`src/mir.cyr`,

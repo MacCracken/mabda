@@ -5058,6 +5058,238 @@ signal_syncobj, signal_point, wait_syncobj, wait_point, fence_kh, fence_offset, 
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
 }
 
+# --- gfx9_encode.cyr ---
+
+# @internal — GFX9 instruction encoders (Phase N.0, the compiler's output stage)
+# gfx9_encode.cyr — operand-parameterized GFX9 ISA encoders
+#
+# Phase N (docs/proposals/v3.2-spirv-gfx9-native-lowering.md) builds an
+# in-tree SPIR-V → GFX9 compute compiler. N.0 is the SAFETY NET that lands
+# before any generated code exists: it lifts the fixed, hand-verified byte
+# emitters in backend_native_shaders.cyr into general, operand-parameterized
+# encoders — one pure function per GFX9 instruction FORMAT — so the later
+# instruction-selection / register-allocation stages emit bytes through a
+# stage that is already proven correct.
+#
+# THE ORACLE (tests/tcyr/compiler.tcyr): every encoder is regression-tested
+# to reproduce, byte-for-byte, the exact dwords the hand-authored shaders in
+# backend_native_shaders.cyr already pin (each of which is itself
+# llvm-mc-round-tripped on gfx90c per
+# feedback_verify_gfx9_shader_bytes_with_llvm_mc). So an encoder bug is
+# caught against ~90 known-good dwords *before* it can reach hardware. The
+# hand-authored shader builders are LEFT UNTOUCHED — they stay the
+# HW-verified ground truth; these encoders are a new, independently-proven
+# library the compiler's N.5 encode stage will drive.
+#
+# Authorities: GFX9/Vega ISA reference (instruction-format bit layouts) +
+# the byte constants in backend_native_shaders.cyr (the regression oracle).
+# Pure byte math: no syscalls, no fn deps, no allocation. Included in the
+# build chain BEFORE backend_native_shaders.cyr — the hand-authored shader
+# builders there were refactored (N.0 follow-on) to emit through these
+# encoders, so this module is now their dependency.
+#
+# SCOPE (matches the proposal's compute-only compiler boundary): this lifts
+# the formats the compute compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP,
+# SMEM, FLAT(global). EXP (graphics color/pos export) and MIMG (image
+# load/sample) are NOT lifted here: the proposal scopes the compiler
+# "compute-only, no graphics shaders, no texture sampling", so their
+# encoders land with a future graphics/texture compiler phase, not N.0.
+# The hand-authored EXP/MIMG dwords keep their existing byte-pinned tests.
+
+# ================================================================
+# Operand encoding — VOP src field (9-bit) value table
+# ================================================================
+# GFX9 VOP source operands share a 9-bit encoding:
+#   0..101    SGPR 0..101
+#   124..127  m0 / exec / etc. (special; not emitted here)
+#   128       inline constant 0
+#   129..192  inline constants 1..64
+#   193..208  inline constants -1..-16
+#   240..247  inline f32 0.5/-0.5/1.0/-1.0/2.0/-2.0/4.0/-4.0
+#   255       a 32-bit literal follows in the next dword
+#   256..511  VGPR 0..255  (256 + index)
+var GFX9_SRC_LITERAL = 255;            # src0 = 255 → literal dword follows
+var GFX9_INLINE_F32_0_0 = 128;         # inline f32 0.0
+var GFX9_INLINE_F32_1_0 = 242;         # inline f32 1.0
+var GFX9_SADDR_OFF = 127;              # FLAT SADDR field = 127 → "off" (no scalar addr)
+var GFX9_FLAT_SEG_GLOBAL = 2;          # FLAT SEG field: 0=flat, 1=scratch, 2=global
+
+# A VGPR as a 9-bit VOP src operand.
+fn gfx9_vgpr(n): i64 {
+    return 256 + (n & 0xFF);
+}
+
+# An SGPR as a 9-bit VOP src operand (identity 0..101; documents intent).
+fn gfx9_sgpr(n): i64 {
+    return n & 0xFF;
+}
+
+# An integer inline-constant as a 9-bit VOP src operand.
+# Returns GFX9_SRC_LITERAL (255) when k is outside the inline range
+# [-16, 64] — the caller then emits k as a trailing literal dword.
+fn gfx9_inline_int(k): i64 {
+    if (k >= 0) {
+        if (k <= 64) { return 128 + k; }
+        return GFX9_SRC_LITERAL;
+    }
+    var neg = 0 - k;
+    if (neg <= 16) { return 192 + neg; }
+    return GFX9_SRC_LITERAL;
+}
+
+# ================================================================
+# Per-format opcode constants (GFX9 numbering)
+# ================================================================
+# VOP1 (single-dword) — bits 16-9 opcode.
+var GFX9_VOP1_V_MOV_B32     = 0x01;
+var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
+var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
+
+# VOP2 (single-dword) — bits 30-25 opcode.
+var GFX9_VOP2_V_MUL_F32     = 0x05;
+var GFX9_VOP2_V_LSHRREV_B32 = 0x10;
+var GFX9_VOP2_V_LSHLREV_B32 = 0x12;
+var GFX9_VOP2_V_AND_B32     = 0x13;
+var GFX9_VOP2_V_OR_B32      = 0x14;
+var GFX9_VOP2_V_ADD_U32     = 0x34;
+
+# VOP3a (two-dword) — bits 25-16 opcode (10-bit).
+var GFX9_VOP3_V_BFE_U32     = 0x1C8;
+var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
+var GFX9_VOP3_V_OR3_B32     = 0x202;
+
+# SOP2 (single-dword) — bits 29-23 opcode.
+var GFX9_SOP2_S_ADD_U32     = 0x00;
+var GFX9_SOP2_S_ADD_I32     = 0x02;
+var GFX9_SOP2_S_ADDC_U32    = 0x04;
+var GFX9_SOP2_S_LSHL_B32    = 0x1C;
+var GFX9_SOP2_S_MUL_I32     = 0x24;
+
+# SOPP (single-dword) — bits 22-16 opcode.
+var GFX9_SOPP_S_NOP         = 0x00;
+var GFX9_SOPP_S_ENDPGM      = 0x01;
+var GFX9_SOPP_S_WAITCNT     = 0x0C;
+
+# SMEM (two-dword) — bits 25-18 opcode.
+var GFX9_SMEM_S_LOAD_DWORD   = 0x00;
+var GFX9_SMEM_S_LOAD_DWORDX2 = 0x01;
+var GFX9_SMEM_S_LOAD_DWORDX4 = 0x02;
+var GFX9_SMEM_S_LOAD_DWORDX8 = 0x03;
+
+# FLAT/global (two-dword) — bits 24-18 opcode.
+var GFX9_FLAT_GLOBAL_LOAD_DWORDX2 = 0x15;
+var GFX9_FLAT_GLOBAL_STORE_DWORD  = 0x1C;
+
+# ================================================================
+# VOP1 — vector ALU, one source.   0x7E000000 | vdst<<17 | op<<9 | src0
+# ================================================================
+# Marker bits 31-25 = 0b0111111. Reproduces e.g. v_mov_b32 v0,s0 = 0x7E000200.
+fn gfx9_enc_vop1(op, vdst, src0): i64 {
+    return 0x7E000000 | ((vdst & 0xFF) << 17) | ((op & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOP2 — vector ALU, two sources.  op<<25 | vdst<<17 | vsrc1<<9 | src0
+# ================================================================
+# Marker bit 31 = 0. src0 is the full 9-bit operand (SGPR/VGPR/inline/literal);
+# vsrc1 is always a VGPR (8-bit index). Reproduces v_lshlrev_b32 v2,1,v0 =
+# 0x24040081 and v_mul_f32 v2,s12,v2 = 0x0A04040C.
+fn gfx9_enc_vop2(op, vdst, src0, vsrc1): i64 {
+    return ((op & 0x3F) << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOP3a — vector ALU, three sources (two dwords).
+# ================================================================
+# Word 0: 0xD0000000 | op<<16 | vdst   (clamp/opsel/abs = 0 for the MVP).
+# Word 1: src2<<18 | src1<<9 | src0     (omod/neg = 0).
+# Marker bits 31-26 = 0b110100. Reproduces v_add3_u32 v8,v8,v9,v10 =
+# 0xD1FF0008 / 0x042A1308.
+fn gfx9_enc_vop3a_lo(op, vdst): i64 {
+    return 0xD0000000 | ((op & 0x3FF) << 16) | (vdst & 0xFF);
+}
+
+fn gfx9_enc_vop3a_hi(src0, src1, src2): i64 {
+    return ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# SOP2 — scalar ALU, two sources.  0x80000000 | op<<23 | sdst<<16 | ssrc1<<8 | ssrc0
+# ================================================================
+# Marker bits 31-30 = 0b10. ssrc0/ssrc1 are 8-bit (SGPR or inline constant);
+# inline 0 = 128. Reproduces s_mul_i32 s8,s7,s4 = 0x92080407 and
+# s_addc_u32 s13,s1,0 = 0x820D8001.
+fn gfx9_enc_sop2(op, sdst, ssrc0, ssrc1): i64 {
+    return 0x80000000 | ((op & 0x7F) << 23) | ((sdst & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
+}
+
+# ================================================================
+# SOPP — scalar program control.  0xBF800000 | op<<16 | simm16
+# ================================================================
+# Marker bits 31-23 = 0b101111111. Reproduces s_endpgm = 0xBF810000,
+# s_nop 0 = 0xBF800000, s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070.
+fn gfx9_enc_sopp(op, simm16): i64 {
+    return 0xBF800000 | ((op & 0x7F) << 16) | (simm16 & 0xFFFF);
+}
+
+# ================================================================
+# SMEM — scalar memory load (two dwords).
+# ================================================================
+# Word 0: 0xC0000000 | op<<18 | IMM(1)<<17 | glc<<16 | sdata<<6 | sbase
+# Word 1: the immediate byte offset.
+# `sbase` is the SBASE FIELD = (base SGPR index >> 1) (SMEM bases are SGPR
+# pairs). `sdata` is the destination SGPR index. IMM is always 1 (immediate
+# offset form). Reproduces s_load_dwordx8 s[0:7],s[0:1],0x0 = 0xC00E0000 and
+# s_load_dwordx2 s[12:13],s[0:1],0x30 = 0xC0060300 / 0x30.
+fn gfx9_enc_smem_lo(op, sdata, sbase, glc): i64 {
+    return 0xC0000000 | ((op & 0xFF) << 18) | (1 << 17) | ((glc & 1) << 16) | ((sdata & 0x7F) << 6) | (sbase & 0x3F);
+}
+
+# ================================================================
+# FLAT (global segment) — vector memory (two dwords).
+# ================================================================
+# Word 0: 0xDC000000 | op<<18 | slc<<17 | glc<<16 | seg<<14 | offset(13-bit)
+# Word 1: vdst<<24 | saddr<<16 | data<<8 | vaddr
+# For a global op pass seg = GFX9_FLAT_SEG_GLOBAL and saddr = GFX9_SADDR_OFF
+# (off → address comes wholly from the v[addr:addr+1] VGPR pair). `data` is
+# the store-source VGPR (stores) and `vdst` the load-dest VGPR (loads).
+# Reproduces global_store_dword v[0:1],v2,off glc slc = 0xDC738000 / 0x007F0200
+# and global_load_dwordx2 v[4:5],v[0:1],off = 0xDC548000 / 0x047F0000.
+fn gfx9_enc_flat_lo(op, seg, offset, glc, slc): i64 {
+    var w = 0xDC000000 | ((op & 0x7F) << 18) | ((slc & 1) << 17) | ((glc & 1) << 16);
+    return w | ((seg & 3) << 14) | (offset & 0x1FFF);
+}
+
+fn gfx9_enc_flat_hi(vdst, saddr, data, vaddr): i64 {
+    return ((vdst & 0xFF) << 24) | ((saddr & 0x7F) << 16) | ((data & 0xFF) << 8) | (vaddr & 0xFF);
+}
+
+# ================================================================
+# Emit helpers — store an encoded dword into an ISA stream and advance.
+# ================================================================
+# The N.5 compiler encode stage and the (refactored) hand-authored shader
+# builders both lay down a contiguous GFX9 ISA byte stream. gfx9_emit32 stores
+# one dword at `pos` and returns the next write position (pos + 4) — the
+# running-position idiom that replaces manual `buf + pos + N` offset math.
+fn gfx9_emit32(buf, pos, dword): i64 {
+    store32(buf + pos, dword);
+    return pos + 4;
+}
+
+# Append the AMDGPU-mandated 16 × s_nop 0 prefetch padding (64 bytes) that
+# every GFX9 shader needs after s_endpgm: the CP prefetches past the program
+# end, and without the pad it can fetch into an unmapped page. Returns
+# pos + 64. (Lifted from the identical loop duplicated in every shader builder.)
+fn gfx9_emit_prefetch_pad(buf, pos): i64 {
+    var p = pos;
+    var i = 0;
+    while (i < 16) {
+        p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_NOP, 0));
+        i = i + 1;
+    }
+    return p;
+}
+
 # --- backend_native_shaders.cyr ---
 
 # @internal — native GPU backend, GFX9 ISA shader libraries + register addresses
@@ -5116,8 +5348,7 @@ var GFX9_DISPATCH_INITIATOR = 0x45;
 
 # Write the s_endpgm shader into buf at pos. Returns new pos.
 fn native_gfx9_shader_endpgm(buf, pos): i64 {
-    store32(buf + pos, GFX9_S_ENDPGM);
-    return pos + 4;
+    return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));
 }
 
 # Write a "store 0xDEADBEEF to buffer[0]" shader at `pos` in `buf`.
@@ -5156,20 +5387,17 @@ fn native_gfx9_shader_endpgm(buf, pos): i64 {
 # is RSRC2 = 0x8 (USER_SGPR=4) with USER_DATA_0/1 = VA low/high and
 # USER_DATA_2/3 = Mesa's scratch-V# stub (0x00200000/0).
 fn native_gfx9_shader_store_deadbeef(buf, pos): i64 {
-    store32(buf + pos +  0, 0x7E000200);   # v_mov_b32_e32 v0, s0
-    store32(buf + pos +  4, 0x7E020201);   # v_mov_b32_e32 v1, s1
-    store32(buf + pos +  8, 0x7E0402FF);   # v_mov_b32_e32 v2, <literal>
-    store32(buf + pos + 12, 0xDEADBEEF);   # literal
-    store32(buf + pos + 16, 0xDC738000);   # global_store_dword v[0:1], v2, off glc slc (dword 1)
-    store32(buf + pos + 20, 0x007F0200);   # global_store_dword (dword 2: addr=v0, data=v2, saddr=off)
-    store32(buf + pos + 24, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
-    store32(buf + pos + 28, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 32 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 96;
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, gfx9_sgpr(0)));   # v_mov_b32 v0, s0
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, gfx9_sgpr(1)));   # v_mov_b32 v1, s1
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 2, GFX9_SRC_LITERAL));   # v_mov v2, <lit>
+    p = gfx9_emit32(buf, p, 0xDEADBEEF);   # literal
+    # global_store_dword v[0:1], v2, off glc slc (cache-bypassing write-through)
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 1, 1));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, GFX9_SADDR_OFF, 2, 0));   # addr=v0, data=v2, saddr=off
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0070));   # s_waitcnt vmcnt(0) lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 # v3.1 [M.4]: 2×2 box-filter downsample compute shader (RGBA8 → RGBA8),
@@ -5195,91 +5423,125 @@ fn native_gfx9_shader_store_deadbeef(buf, pos): i64 {
 #   Register usage (for RSRC1): VGPRs v0..v14 (15 → alloc 16), SGPRs
 #   s0..s19 (20 → alloc 24). RSRC1 must reserve at least that.
 fn native_gfx9_shader_downsample_2x2(buf, pos): i64 {
-    store32(buf + pos +   0, 0x92080407);   # s_mul_i32 s8, s7, s4   (y*dst_w)
-    store32(buf + pos +   4, 0x8E098408);   # s_lshl_b32 s9, s8, 4
-    store32(buf + pos +   8, 0x8E0A8306);   # s_lshl_b32 s10, s6, 3
-    store32(buf + pos +  12, 0x81090A09);   # s_add_i32 s9, s9, s10  (off_a bytes)
-    store32(buf + pos +  16, 0x800C0900);   # s_add_u32 s12, s0, s9  (src_a lo)
-    store32(buf + pos +  20, 0x820D8001);   # s_addc_u32 s13, s1, 0  (src_a hi)
-    store32(buf + pos +  24, 0x8E0B8304);   # s_lshl_b32 s11, s4, 3  (8*dst_w)
-    store32(buf + pos +  28, 0x800E0B0C);   # s_add_u32 s14, s12, s11 (src_c lo)
-    store32(buf + pos +  32, 0x820F800D);   # s_addc_u32 s15, s13, 0  (src_c hi)
-    store32(buf + pos +  36, 0x8E108208);   # s_lshl_b32 s16, s8, 2
-    store32(buf + pos +  40, 0x8E118206);   # s_lshl_b32 s17, s6, 2
-    store32(buf + pos +  44, 0x81101110);   # s_add_i32 s16, s16, s17 (dst_off)
-    store32(buf + pos +  48, 0x80121002);   # s_add_u32 s18, s2, s16  (dst lo)
-    store32(buf + pos +  52, 0x82138003);   # s_addc_u32 s19, s3, 0   (dst hi)
-    store32(buf + pos +  56, 0x7E00020C);   # v_mov_b32 v0, s12
-    store32(buf + pos +  60, 0x7E02020D);   # v_mov_b32 v1, s13
-    store32(buf + pos +  64, 0x7E04020E);   # v_mov_b32 v2, s14
-    store32(buf + pos +  68, 0x7E06020F);   # v_mov_b32 v3, s15
-    store32(buf + pos +  72, 0xDC548000);   # global_load_dwordx2 v[4:5], v[0:1], off
-    store32(buf + pos +  76, 0x047F0000);   #   (cont: a=v4, b=v5)
-    store32(buf + pos +  80, 0xDC548000);   # global_load_dwordx2 v[6:7], v[2:3], off
-    store32(buf + pos +  84, 0x067F0002);   #   (cont: c=v6, d=v7)
-    store32(buf + pos +  88, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
-    store32(buf + pos +  92, 0x261008FF);   # v_and_b32 v8, 0xff, v4   (r: a)
-    store32(buf + pos +  96, 0x000000FF);   #   (literal 0xff)
-    store32(buf + pos + 100, 0x26120AFF);   # v_and_b32 v9, 0xff, v5   (r: b)
-    store32(buf + pos + 104, 0x000000FF);   #   (literal)
-    store32(buf + pos + 108, 0x26140CFF);   # v_and_b32 v10, 0xff, v6  (r: c)
-    store32(buf + pos + 112, 0x000000FF);   #   (literal)
-    store32(buf + pos + 116, 0x26160EFF);   # v_and_b32 v11, 0xff, v7  (r: d)
-    store32(buf + pos + 120, 0x000000FF);   #   (literal)
-    store32(buf + pos + 124, 0xD1FF0008);   # v_add3_u32 v8, v8, v9, v10
-    store32(buf + pos + 128, 0x042A1308);   #   (cont)
-    store32(buf + pos + 132, 0x68101708);   # v_add_u32 v8, v8, v11
-    store32(buf + pos + 136, 0x20101082);   # v_lshrrev_b32 v8, 2, v8  (r avg)
-    store32(buf + pos + 140, 0xD1C80009);   # v_bfe_u32 v9, v4, 8, 8   (g: a)
-    store32(buf + pos + 144, 0x02211104);   #   (cont)
-    store32(buf + pos + 148, 0xD1C8000A);   # v_bfe_u32 v10, v5, 8, 8  (g: b)
-    store32(buf + pos + 152, 0x02211105);   #   (cont)
-    store32(buf + pos + 156, 0xD1C8000B);   # v_bfe_u32 v11, v6, 8, 8  (g: c)
-    store32(buf + pos + 160, 0x02211106);   #   (cont)
-    store32(buf + pos + 164, 0xD1C8000C);   # v_bfe_u32 v12, v7, 8, 8  (g: d)
-    store32(buf + pos + 168, 0x02211107);   #   (cont)
-    store32(buf + pos + 172, 0xD1FF0009);   # v_add3_u32 v9, v9, v10, v11
-    store32(buf + pos + 176, 0x042E1509);   #   (cont)
-    store32(buf + pos + 180, 0x68121909);   # v_add_u32 v9, v9, v12
-    store32(buf + pos + 184, 0x20121282);   # v_lshrrev_b32 v9, 2, v9  (g avg)
-    store32(buf + pos + 188, 0x24121288);   # v_lshlrev_b32 v9, 8, v9  (g<<8)
-    store32(buf + pos + 192, 0xD1C8000A);   # v_bfe_u32 v10, v4, 16, 8 (b: a)
-    store32(buf + pos + 196, 0x02212104);   #   (cont)
-    store32(buf + pos + 200, 0xD1C8000B);   # v_bfe_u32 v11, v5, 16, 8 (b: b)
-    store32(buf + pos + 204, 0x02212105);   #   (cont)
-    store32(buf + pos + 208, 0xD1C8000C);   # v_bfe_u32 v12, v6, 16, 8 (b: c)
-    store32(buf + pos + 212, 0x02212106);   #   (cont)
-    store32(buf + pos + 216, 0xD1C8000D);   # v_bfe_u32 v13, v7, 16, 8 (b: d)
-    store32(buf + pos + 220, 0x02212107);   #   (cont)
-    store32(buf + pos + 224, 0xD1FF000A);   # v_add3_u32 v10, v10, v11, v12
-    store32(buf + pos + 228, 0x0432170A);   #   (cont)
-    store32(buf + pos + 232, 0x68141B0A);   # v_add_u32 v10, v10, v13
-    store32(buf + pos + 236, 0x20141482);   # v_lshrrev_b32 v10, 2, v10 (b avg)
-    store32(buf + pos + 240, 0x24141490);   # v_lshlrev_b32 v10, 16, v10 (b<<16)
-    store32(buf + pos + 244, 0x20160898);   # v_lshrrev_b32 v11, 24, v4 (a: a)
-    store32(buf + pos + 248, 0x20180A98);   # v_lshrrev_b32 v12, 24, v5 (a: b)
-    store32(buf + pos + 252, 0x201A0C98);   # v_lshrrev_b32 v13, 24, v6 (a: c)
-    store32(buf + pos + 256, 0x201C0E98);   # v_lshrrev_b32 v14, 24, v7 (a: d)
-    store32(buf + pos + 260, 0xD1FF000B);   # v_add3_u32 v11, v11, v12, v13
-    store32(buf + pos + 264, 0x0436190B);   #   (cont)
-    store32(buf + pos + 268, 0x68161D0B);   # v_add_u32 v11, v11, v14
-    store32(buf + pos + 272, 0x20161682);   # v_lshrrev_b32 v11, 2, v11 (a avg)
-    store32(buf + pos + 276, 0x24161698);   # v_lshlrev_b32 v11, 24, v11 (a<<24)
-    store32(buf + pos + 280, 0xD2020008);   # v_or3_b32 v8, v8, v9, v10
-    store32(buf + pos + 284, 0x042A1308);   #   (cont)
-    store32(buf + pos + 288, 0x28101708);   # v_or_b32 v8, v8, v11  (packed RGBA8)
-    store32(buf + pos + 292, 0x7E000212);   # v_mov_b32 v0, s18
-    store32(buf + pos + 296, 0x7E020213);   # v_mov_b32 v1, s19
-    store32(buf + pos + 300, 0xDC708000);   # global_store_dword v[0:1], v8, off
-    store32(buf + pos + 304, 0x007F0800);   #   (cont)
-    store32(buf + pos + 308, 0xBF8C0070);   # s_waitcnt vmcnt(0) lgkmcnt(0)
-    store32(buf + pos + 312, 0xBF810000);   # s_endpgm
-    var j = 0;
-    while (j < 16) {
-        store32(buf + pos + 316 + j * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
-        j = j + 1;
-    }
-    return pos + GFX9_DOWNSAMPLE_2X2_SIZE;
+    # Opcode + operand aliases keep the emit body assembler-clean (the encoder
+    # call + alias names ARE the mnemonic; the per-dword bytes are pinned by
+    # tests/tcyr/compiler.tcyr + native.tcyr's checksum). vN = gfx9_vgpr(N).
+    var mov = GFX9_VOP1_V_MOV_B32;
+    var smul = GFX9_SOP2_S_MUL_I32;
+    var slsh = GFX9_SOP2_S_LSHL_B32;
+    var saddi = GFX9_SOP2_S_ADD_I32;
+    var saddu = GFX9_SOP2_S_ADD_U32;
+    var saddc = GFX9_SOP2_S_ADDC_U32;
+    var vand = GFX9_VOP2_V_AND_B32;
+    var vor2 = GFX9_VOP2_V_OR_B32;
+    var vadd = GFX9_VOP2_V_ADD_U32;
+    var vsr = GFX9_VOP2_V_LSHRREV_B32;
+    var vsl = GFX9_VOP2_V_LSHLREV_B32;
+    var add3 = GFX9_VOP3_V_ADD3_U32;
+    var bfe = GFX9_VOP3_V_BFE_U32;
+    var or3 = GFX9_VOP3_V_OR3_B32;
+    var ld2 = GFX9_FLAT_GLOBAL_LOAD_DWORDX2;
+    var st1 = GFX9_FLAT_GLOBAL_STORE_DWORD;
+    var glob = GFX9_FLAT_SEG_GLOBAL;
+    var noff = GFX9_SADDR_OFF;
+    var lit = GFX9_SRC_LITERAL;
+    var i0 = gfx9_inline_int(0);
+    var i2 = gfx9_inline_int(2);
+    var i3 = gfx9_inline_int(3);
+    var i4 = gfx9_inline_int(4);
+    var i8 = gfx9_inline_int(8);
+    var i16 = gfx9_inline_int(16);
+    var i24 = gfx9_inline_int(24);
+    var p = pos;
+    # Address math (all SALU — every input is uniform): src_a / src_c / dst
+    # byte offsets, then base+offset into 64-bit VAs (s12:13, s14:15, s18:19).
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(smul, 8, gfx9_sgpr(7), gfx9_sgpr(4)));   # y*dst_w
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(slsh, 9, gfx9_sgpr(8), i4));
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(slsh, 10, gfx9_sgpr(6), i3));
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddi, 9, gfx9_sgpr(9), gfx9_sgpr(10)));   # off_a
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddu, 12, gfx9_sgpr(0), gfx9_sgpr(9)));   # src_a lo
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddc, 13, gfx9_sgpr(1), i0));             # src_a hi
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(slsh, 11, gfx9_sgpr(4), i3));              # 8*dst_w
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddu, 14, gfx9_sgpr(12), gfx9_sgpr(11)));  # src_c lo
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddc, 15, gfx9_sgpr(13), i0));            # src_c hi
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(slsh, 16, gfx9_sgpr(8), i2));
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(slsh, 17, gfx9_sgpr(6), i2));
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddi, 16, gfx9_sgpr(16), gfx9_sgpr(17)));  # dst_off
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddu, 18, gfx9_sgpr(2), gfx9_sgpr(16)));   # dst lo
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(saddc, 19, gfx9_sgpr(3), i0));             # dst hi
+    # Move the src VA pairs into VGPRs for the global loads.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 0, gfx9_sgpr(12)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 1, gfx9_sgpr(13)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 2, gfx9_sgpr(14)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 3, gfx9_sgpr(15)));
+    # Fetch the 2x2 block: row a/b (v[4:5]) and row c/d (v[6:7]); src is 2*dst_w.
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(ld2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(4, noff, 0, 0));   # v[4:5] <- v[0:1]
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(ld2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(6, noff, 0, 2));   # v[6:7] <- v[2:3]
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    # R channel: low byte of each of a/b/c/d (literal 0xff follows the AND), sum, /4.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 8, lit, 4));
+    p = gfx9_emit32(buf, p, 0x000000FF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 9, lit, 5));
+    p = gfx9_emit32(buf, p, 0x000000FF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 10, lit, 6));
+    p = gfx9_emit32(buf, p, 0x000000FF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 11, lit, 7));
+    p = gfx9_emit32(buf, p, 0x000000FF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(add3, 8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(8), gfx9_vgpr(9), gfx9_vgpr(10)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 8, gfx9_vgpr(8), 11));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 8, i2, 8));   # r avg
+    # G channel: byte 1 of each (bfe off=8 w=8), sum, /4, <<8.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 9));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(4), i8, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 10));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(5), i8, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 11));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(6), i8, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 12));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(7), i8, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(add3, 9));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(9), gfx9_vgpr(10), gfx9_vgpr(11)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 9, gfx9_vgpr(9), 12));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 9, i2, 9));   # g avg
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsl, 9, i8, 9));   # g<<8
+    # B channel: byte 2 of each (bfe off=16 w=8), sum, /4, <<16.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 10));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(4), i16, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 11));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(5), i16, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 12));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(6), i16, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(bfe, 13));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(7), i16, i8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(add3, 10));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(10), gfx9_vgpr(11), gfx9_vgpr(12)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 10, gfx9_vgpr(10), 13));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 10, i2, 10));   # b avg
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsl, 10, i16, 10));   # b<<16
+    # A channel: byte 3 of each (lshrrev 24), sum, /4, <<24.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 11, i24, 4));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 12, i24, 5));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 13, i24, 6));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 14, i24, 7));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(add3, 11));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(11), gfx9_vgpr(12), gfx9_vgpr(13)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 11, gfx9_vgpr(11), 14));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsr, 11, i2, 11));   # a avg
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsl, 11, i24, 11));   # a<<24
+    # Pack R|G|B|A into v8, then store the packed texel.
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(or3, 8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(8), gfx9_vgpr(9), gfx9_vgpr(10)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vor2, 8, gfx9_vgpr(8), 11));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 0, gfx9_sgpr(18)));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 1, gfx9_sgpr(19)));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(st1, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, noff, 8, 0));   # v[0:1] <- v8
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0070));   # vmcnt(0) lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 var GFX9_DOWNSAMPLE_2X2_SIZE = 380;
@@ -5361,10 +5623,12 @@ var GFX9_COMPUTE_PGM_RSRC2_USER_SGPR_2 = 0x04;
 #
 # Returns new pos (pos + 92).
 fn native_gfx9_shader_solid_red(buf, pos): i64 {
-    store32(buf + pos +  0, 0x7E0002F2);   # v_mov_b32_e32 v0, 1.0
-    store32(buf + pos +  4, 0x7E020280);   # v_mov_b32_e32 v1, 0.0
-    store32(buf + pos +  8, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
-    store32(buf + pos + 12, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
+    var mov = GFX9_VOP1_V_MOV_B32;
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 0, GFX9_INLINE_F32_1_0));   # v0 = 1.0
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 1, GFX9_INLINE_F32_0_0));   # v1 = 0.0
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 2, GFX9_INLINE_F32_0_0));   # v2 = 0.0
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 3, GFX9_INLINE_F32_1_0));   # v3 = 1.0
     # exp mrt0 v0,v1,v2,v3 done vm — word 0 = 0xC400180F (NOT 0xF800180F).
     # Top byte is 0xC4 (bits 31-26 = 110001 = EXP opcode class), not 0xF8.
     # The 0xF8 in the prior code came from a wrong reading of the GFX9
@@ -5376,15 +5640,12 @@ fn native_gfx9_shader_solid_red(buf, pos): i64 {
     # malformed exp, silently failed to publish position/color, and
     # the VGT hung waiting for output → 2-second GFX TDR. THIS was
     # the rc.2 native_render_e2e root cause.
-    store32(buf + pos + 16, 0xC400180F);   # exp mrt0 done vm (word 0)
-    store32(buf + pos + 20, 0x03020100);   # exp word 1 (v0..v3)
-    store32(buf + pos + 24, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 28 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 92;
+    # EXP is a graphics export — out of the N.0 compute-encoder scope, so the
+    # two exp dwords stay raw literals (a future graphics phase lifts gfx9_enc_exp).
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 done vm (word 0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp word 1 (v0..v3)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 # Total byte count produced by native_gfx9_shader_solid_red. The PM4
@@ -5458,30 +5719,33 @@ var GFX9_FS_SOLID_RED_SIZE = 92;
 # SPI_SHADER_POS_FORMAT: 4 (POS_FLOAT_4 — VS exports 4 f32 lanes).
 # Returns new pos (pos + 116).
 fn native_gfx9_shader_fullscreen_triangle_vs(buf, pos): i64 {
-    store32(buf + pos +  0, 0x24040081);   # v_lshlrev_b32_e32 v2, 1, v0
-    store32(buf + pos +  4, 0x24000082);   # v_lshlrev_b32_e32 v0, 2, v0
-    store32(buf + pos +  8, 0x26000084);   # v_and_b32_e32 v0, 4, v0
-    store32(buf + pos + 12, 0x26040484);   # v_and_b32_e32 v2, 4, v2
-    store32(buf + pos + 16, 0x680000C1);   # v_add_u32_e32 v0, -1, v0
-    store32(buf + pos + 20, 0x680404C1);   # v_add_u32_e32 v2, -1, v2
-    store32(buf + pos + 24, 0x7E000B00);   # v_cvt_f32_i32_e32 v0, v0
-    store32(buf + pos + 28, 0x7E020B02);   # v_cvt_f32_i32_e32 v1, v2
-    store32(buf + pos + 32, 0x7E040280);   # v_mov_b32_e32 v2, 0.0
-    store32(buf + pos + 36, 0x7E0602F2);   # v_mov_b32_e32 v3, 1.0
+    var mov = GFX9_VOP1_V_MOV_B32;
+    var cvt = GFX9_VOP1_V_CVT_F32_I32;
+    var vand = GFX9_VOP2_V_AND_B32;
+    var vsl = GFX9_VOP2_V_LSHLREV_B32;
+    var vadd = GFX9_VOP2_V_ADD_U32;
+    var im1 = gfx9_inline_int(0 - 1);
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsl, 2, gfx9_inline_int(1), 0));   # v2 = vid<<1
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vsl, 0, gfx9_inline_int(2), 0));   # v0 = vid<<2
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 0, gfx9_inline_int(4), 0));   # v0 = (vid&1)*4
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vand, 2, gfx9_inline_int(4), 2));   # v2 = ((vid>>1)&1)*4
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 0, im1, 0));   # v0 = x int
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(vadd, 2, im1, 2));   # v2 = y int
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(cvt, 0, gfx9_vgpr(0)));   # v0 = float(x)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(cvt, 1, gfx9_vgpr(2)));   # v1 = float(y)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 2, GFX9_INLINE_F32_0_0));   # v2 = 0.0 (z)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(mov, 3, GFX9_INLINE_F32_1_0));   # v3 = 1.0 (w)
     # exp pos0 v0,v1,v2,v3 done — word 0 = 0xC40008CF (NOT 0xF80008CF).
     # Same encoding fix as the FS — top byte is 0xC4 (EXP opcode class
     # on GFX9), not 0xF8. See the comment in native_gfx9_shader_solid_red
     # for the full root-cause writeup. Verified by `llvm-mc --disassemble
     # --arch=amdgcn --mcpu=gfx90c` on the corrected encoding.
-    store32(buf + pos + 40, 0xC40008CF);   # exp pos0 done (word 0)
-    store32(buf + pos + 44, 0x03020100);   # exp word 1 (v0..v3)
-    store32(buf + pos + 48, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 52 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 116;
+    # EXP is a graphics export — out of N.0 compute-encoder scope; raw literals.
+    p = gfx9_emit32(buf, p, 0xC40008CF);   # exp pos0 done (word 0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp word 1 (v0..v3)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 # Total byte count produced by native_gfx9_shader_fullscreen_triangle_vs.
@@ -5528,27 +5792,25 @@ var GFX9_VS_FULLSCREEN_TRIANGLE_SIZE = 116;
 # exp word0 = 0xC400180F — identical to the proven solid-red EXP encoding.
 # Returns pos + 124 (60 B code + 16 × s_nop 0 prefetch pad). @internal
 fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
-    store32(buf + pos +  0, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (T# w0)
-    store32(buf + pos +  4, 0x00000000);   # s_load_dwordx8 (w1)
-    store32(buf + pos +  8, 0xC0060300);   # s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale w0)
-    store32(buf + pos + 12, 0x00000030);   # s_load_dwordx2 (w1: offset 0x30 = descriptor+48)
-    store32(buf + pos + 16, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
-    store32(buf + pos + 20, 0x0A04040C);   # v_mul_f32 v2, s12, v2  (pos_x *= scale_x)
-    store32(buf + pos + 24, 0x0A06060D);   # v_mul_f32 v3, s13, v3  (pos_y *= scale_y)
-    store32(buf + pos + 28, 0x7E081102);   # v_cvt_i32_f32_e32 v4, v2  (scaled POS_X -> tx)
-    store32(buf + pos + 32, 0x7E0A1103);   # v_cvt_i32_f32_e32 v5, v3  (scaled POS_Y -> ty)
-    store32(buf + pos + 36, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
-    store32(buf + pos + 40, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
-    store32(buf + pos + 44, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
-    store32(buf + pos + 48, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
-    store32(buf + pos + 52, 0x03020100);   # exp (w1)
-    store32(buf + pos + 56, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 60 + i * 4, 0xBF800000);   # s_nop 0 (prefetch pad)
-        i = i + 1;
-    }
-    return pos + 124;
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX2, 12, 0, 0));   # scale s[12:13]
+    p = gfx9_emit32(buf, p, 0x00000030);   # offset 0x30 (descriptor+48)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 2, gfx9_sgpr(12), 2));   # pos_x *= scale_x
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 3, gfx9_sgpr(13), 3));   # pos_y *= scale_y
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 4, gfx9_vgpr(2)));   # POS_X -> tx
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 5, gfx9_vgpr(3)));   # POS_Y -> ty
+    # image_load + exp are graphics/texture ops — out of N.0 compute-encoder
+    # scope, so their dwords stay raw literals (a future phase lifts the encoders).
+    p = gfx9_emit32(buf, p, 0xF0001F00);   # image_load v[0:3], v[4:5], s[0:7] dmask:0xf unorm (w0)
+    p = gfx9_emit32(buf, p, 0x00000004);   # image_load (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 var GFX9_FS_TEXTURED_LOAD_SIZE = 124;
@@ -5591,27 +5853,25 @@ var GFX9_SPI_PS_INPUT_TEXTURED = 0x302;
 #   s_waitcnt vmcnt(0) ; exp mrt0 v0,v1,v2,v3 done vm ; s_endpgm
 # Returns pos + 124 (60 B code + 16 × s_nop 0). @internal
 fn native_gfx9_shader_textured_sample_fs(buf, pos): i64 {
-    store32(buf + pos +  0, 0xC00A0200);   # s_load_dwordx4 s[8:11], s[0:1], 0x20 (S# w0)
-    store32(buf + pos +  4, 0x00000020);   # s_load_dwordx4 (w1: offset 0x20)
-    store32(buf + pos +  8, 0xC00E0000);   # s_load_dwordx8 s[0:7], s[0:1], 0x0 (T# w0)
-    store32(buf + pos + 12, 0x00000000);   # s_load_dwordx8 (w1)
-    store32(buf + pos + 16, 0xC0060300);   # s_load_dwordx2 s[12:13], s[0:1], 0x30 (scale w0)
-    store32(buf + pos + 20, 0x00000030);   # s_load_dwordx2 (w1: offset 0x30 = descriptor+48)
-    store32(buf + pos + 24, 0xBF8CC07F);   # s_waitcnt lgkmcnt(0)
-    store32(buf + pos + 28, 0x0A08040C);   # v_mul_f32 v4, s12, v2 (coord x = scale_x * pos_x)
-    store32(buf + pos + 32, 0x0A0A060D);   # v_mul_f32 v5, s13, v3 (coord y = scale_y * pos_y)
-    store32(buf + pos + 36, 0xF0800F00);   # image_sample v[0:3], v[4:5], s[0:7], s[8:11] dmask:0xf (w0)
-    store32(buf + pos + 40, 0x00400004);   # image_sample (w1)
-    store32(buf + pos + 44, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
-    store32(buf + pos + 48, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
-    store32(buf + pos + 52, 0x03020100);   # exp (w1)
-    store32(buf + pos + 56, 0xBF810000);   # s_endpgm
-    var i = 0;
-    while (i < 16) {
-        store32(buf + pos + 60 + i * 4, 0xBF800000);   # s_nop 0
-        i = i + 1;
-    }
-    return pos + 124;
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 8, 0, 0));   # S# s[8:11]
+    p = gfx9_emit32(buf, p, 0x00000020);   # offset 0x20 (descriptor+32)
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX2, 12, 0, 0));   # scale s[12:13]
+    p = gfx9_emit32(buf, p, 0x00000030);   # offset 0x30 (descriptor+48)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 4, gfx9_sgpr(12), 2));   # coord x
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 5, gfx9_sgpr(13), 3));   # coord y
+    # image_sample + exp are graphics/texture ops — out of N.0 compute-encoder
+    # scope, so their dwords stay raw literals (a future phase lifts the encoders).
+    p = gfx9_emit32(buf, p, 0xF0800F00);   # image_sample v[0:3], v[4:5], s[0:7], s[8:11] dmask:0xf (w0)
+    p = gfx9_emit32(buf, p, 0x00400004);   # image_sample (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
 }
 
 var GFX9_FS_TEXTURED_SAMPLE_SIZE = 124;
@@ -6376,210 +6636,6 @@ fmt, sw_mode, mip_count, epitch): i64 {
     store32(buf + pos + 24, 0);
     store32(buf + pos + 28, 0);
     return pos + 32;
-}
-
-# --- gfx9_encode.cyr ---
-
-# @internal — GFX9 instruction encoders (Phase N.0, the compiler's output stage)
-# gfx9_encode.cyr — operand-parameterized GFX9 ISA encoders
-#
-# Phase N (docs/proposals/v3.2-spirv-gfx9-native-lowering.md) builds an
-# in-tree SPIR-V → GFX9 compute compiler. N.0 is the SAFETY NET that lands
-# before any generated code exists: it lifts the fixed, hand-verified byte
-# emitters in backend_native_shaders.cyr into general, operand-parameterized
-# encoders — one pure function per GFX9 instruction FORMAT — so the later
-# instruction-selection / register-allocation stages emit bytes through a
-# stage that is already proven correct.
-#
-# THE ORACLE (tests/tcyr/compiler.tcyr): every encoder is regression-tested
-# to reproduce, byte-for-byte, the exact dwords the hand-authored shaders in
-# backend_native_shaders.cyr already pin (each of which is itself
-# llvm-mc-round-tripped on gfx90c per
-# feedback_verify_gfx9_shader_bytes_with_llvm_mc). So an encoder bug is
-# caught against ~90 known-good dwords *before* it can reach hardware. The
-# hand-authored shader builders are LEFT UNTOUCHED — they stay the
-# HW-verified ground truth; these encoders are a new, independently-proven
-# library the compiler's N.5 encode stage will drive.
-#
-# Authorities: GFX9/Vega ISA reference (instruction-format bit layouts) +
-# the byte constants in backend_native_shaders.cyr (the regression oracle).
-# Pure byte math: no syscalls, no fn deps, no allocation. Included in the
-# build chain right after backend_native_shaders.cyr (same "no deps" tier).
-#
-# SCOPE (matches the proposal's compute-only compiler boundary): this lifts
-# the formats the compute compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP,
-# SMEM, FLAT(global). EXP (graphics color/pos export) and MIMG (image
-# load/sample) are NOT lifted here: the proposal scopes the compiler
-# "compute-only, no graphics shaders, no texture sampling", so their
-# encoders land with a future graphics/texture compiler phase, not N.0.
-# The hand-authored EXP/MIMG dwords keep their existing byte-pinned tests.
-
-# ================================================================
-# Operand encoding — VOP src field (9-bit) value table
-# ================================================================
-# GFX9 VOP source operands share a 9-bit encoding:
-#   0..101    SGPR 0..101
-#   124..127  m0 / exec / etc. (special; not emitted here)
-#   128       inline constant 0
-#   129..192  inline constants 1..64
-#   193..208  inline constants -1..-16
-#   240..247  inline f32 0.5/-0.5/1.0/-1.0/2.0/-2.0/4.0/-4.0
-#   255       a 32-bit literal follows in the next dword
-#   256..511  VGPR 0..255  (256 + index)
-var GFX9_SRC_LITERAL = 255;            # src0 = 255 → literal dword follows
-var GFX9_INLINE_F32_0_0 = 128;         # inline f32 0.0
-var GFX9_INLINE_F32_1_0 = 242;         # inline f32 1.0
-var GFX9_SADDR_OFF = 127;              # FLAT SADDR field = 127 → "off" (no scalar addr)
-var GFX9_FLAT_SEG_GLOBAL = 2;          # FLAT SEG field: 0=flat, 1=scratch, 2=global
-
-# A VGPR as a 9-bit VOP src operand.
-fn gfx9_vgpr(n): i64 {
-    return 256 + (n & 0xFF);
-}
-
-# An SGPR as a 9-bit VOP src operand (identity 0..101; documents intent).
-fn gfx9_sgpr(n): i64 {
-    return n & 0xFF;
-}
-
-# An integer inline-constant as a 9-bit VOP src operand.
-# Returns GFX9_SRC_LITERAL (255) when k is outside the inline range
-# [-16, 64] — the caller then emits k as a trailing literal dword.
-fn gfx9_inline_int(k): i64 {
-    if (k >= 0) {
-        if (k <= 64) { return 128 + k; }
-        return GFX9_SRC_LITERAL;
-    }
-    var neg = 0 - k;
-    if (neg <= 16) { return 192 + neg; }
-    return GFX9_SRC_LITERAL;
-}
-
-# ================================================================
-# Per-format opcode constants (GFX9 numbering)
-# ================================================================
-# VOP1 (single-dword) — bits 16-9 opcode.
-var GFX9_VOP1_V_MOV_B32     = 0x01;
-var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
-var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
-
-# VOP2 (single-dword) — bits 30-25 opcode.
-var GFX9_VOP2_V_MUL_F32     = 0x05;
-var GFX9_VOP2_V_LSHRREV_B32 = 0x10;
-var GFX9_VOP2_V_LSHLREV_B32 = 0x12;
-var GFX9_VOP2_V_AND_B32     = 0x13;
-var GFX9_VOP2_V_OR_B32      = 0x14;
-var GFX9_VOP2_V_ADD_U32     = 0x34;
-
-# VOP3a (two-dword) — bits 25-16 opcode (10-bit).
-var GFX9_VOP3_V_BFE_U32     = 0x1C8;
-var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
-var GFX9_VOP3_V_OR3_B32     = 0x202;
-
-# SOP2 (single-dword) — bits 29-23 opcode.
-var GFX9_SOP2_S_ADD_U32     = 0x00;
-var GFX9_SOP2_S_ADD_I32     = 0x02;
-var GFX9_SOP2_S_ADDC_U32    = 0x04;
-var GFX9_SOP2_S_LSHL_B32    = 0x1C;
-var GFX9_SOP2_S_MUL_I32     = 0x24;
-
-# SOPP (single-dword) — bits 22-16 opcode.
-var GFX9_SOPP_S_NOP         = 0x00;
-var GFX9_SOPP_S_ENDPGM      = 0x01;
-var GFX9_SOPP_S_WAITCNT     = 0x0C;
-
-# SMEM (two-dword) — bits 25-18 opcode.
-var GFX9_SMEM_S_LOAD_DWORD   = 0x00;
-var GFX9_SMEM_S_LOAD_DWORDX2 = 0x01;
-var GFX9_SMEM_S_LOAD_DWORDX4 = 0x02;
-var GFX9_SMEM_S_LOAD_DWORDX8 = 0x03;
-
-# FLAT/global (two-dword) — bits 24-18 opcode.
-var GFX9_FLAT_GLOBAL_LOAD_DWORDX2 = 0x15;
-var GFX9_FLAT_GLOBAL_STORE_DWORD  = 0x1C;
-
-# ================================================================
-# VOP1 — vector ALU, one source.   0x7E000000 | vdst<<17 | op<<9 | src0
-# ================================================================
-# Marker bits 31-25 = 0b0111111. Reproduces e.g. v_mov_b32 v0,s0 = 0x7E000200.
-fn gfx9_enc_vop1(op, vdst, src0): i64 {
-    return 0x7E000000 | ((vdst & 0xFF) << 17) | ((op & 0xFF) << 9) | (src0 & 0x1FF);
-}
-
-# ================================================================
-# VOP2 — vector ALU, two sources.  op<<25 | vdst<<17 | vsrc1<<9 | src0
-# ================================================================
-# Marker bit 31 = 0. src0 is the full 9-bit operand (SGPR/VGPR/inline/literal);
-# vsrc1 is always a VGPR (8-bit index). Reproduces v_lshlrev_b32 v2,1,v0 =
-# 0x24040081 and v_mul_f32 v2,s12,v2 = 0x0A04040C.
-fn gfx9_enc_vop2(op, vdst, src0, vsrc1): i64 {
-    return ((op & 0x3F) << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
-}
-
-# ================================================================
-# VOP3a — vector ALU, three sources (two dwords).
-# ================================================================
-# Word 0: 0xD0000000 | op<<16 | vdst   (clamp/opsel/abs = 0 for the MVP).
-# Word 1: src2<<18 | src1<<9 | src0     (omod/neg = 0).
-# Marker bits 31-26 = 0b110100. Reproduces v_add3_u32 v8,v8,v9,v10 =
-# 0xD1FF0008 / 0x042A1308.
-fn gfx9_enc_vop3a_lo(op, vdst): i64 {
-    return 0xD0000000 | ((op & 0x3FF) << 16) | (vdst & 0xFF);
-}
-
-fn gfx9_enc_vop3a_hi(src0, src1, src2): i64 {
-    return ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
-}
-
-# ================================================================
-# SOP2 — scalar ALU, two sources.  0x80000000 | op<<23 | sdst<<16 | ssrc1<<8 | ssrc0
-# ================================================================
-# Marker bits 31-30 = 0b10. ssrc0/ssrc1 are 8-bit (SGPR or inline constant);
-# inline 0 = 128. Reproduces s_mul_i32 s8,s7,s4 = 0x92080407 and
-# s_addc_u32 s13,s1,0 = 0x820D8001.
-fn gfx9_enc_sop2(op, sdst, ssrc0, ssrc1): i64 {
-    return 0x80000000 | ((op & 0x7F) << 23) | ((sdst & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
-}
-
-# ================================================================
-# SOPP — scalar program control.  0xBF800000 | op<<16 | simm16
-# ================================================================
-# Marker bits 31-23 = 0b101111111. Reproduces s_endpgm = 0xBF810000,
-# s_nop 0 = 0xBF800000, s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070.
-fn gfx9_enc_sopp(op, simm16): i64 {
-    return 0xBF800000 | ((op & 0x7F) << 16) | (simm16 & 0xFFFF);
-}
-
-# ================================================================
-# SMEM — scalar memory load (two dwords).
-# ================================================================
-# Word 0: 0xC0000000 | op<<18 | IMM(1)<<17 | glc<<16 | sdata<<6 | sbase
-# Word 1: the immediate byte offset.
-# `sbase` is the SBASE FIELD = (base SGPR index >> 1) (SMEM bases are SGPR
-# pairs). `sdata` is the destination SGPR index. IMM is always 1 (immediate
-# offset form). Reproduces s_load_dwordx8 s[0:7],s[0:1],0x0 = 0xC00E0000 and
-# s_load_dwordx2 s[12:13],s[0:1],0x30 = 0xC0060300 / 0x30.
-fn gfx9_enc_smem_lo(op, sdata, sbase, glc): i64 {
-    return 0xC0000000 | ((op & 0xFF) << 18) | (1 << 17) | ((glc & 1) << 16) | ((sdata & 0x7F) << 6) | (sbase & 0x3F);
-}
-
-# ================================================================
-# FLAT (global segment) — vector memory (two dwords).
-# ================================================================
-# Word 0: 0xDC000000 | op<<18 | slc<<17 | glc<<16 | seg<<14 | offset(13-bit)
-# Word 1: vdst<<24 | saddr<<16 | data<<8 | vaddr
-# For a global op pass seg = GFX9_FLAT_SEG_GLOBAL and saddr = GFX9_SADDR_OFF
-# (off → address comes wholly from the v[addr:addr+1] VGPR pair). `data` is
-# the store-source VGPR (stores) and `vdst` the load-dest VGPR (loads).
-# Reproduces global_store_dword v[0:1],v2,off glc slc = 0xDC738000 / 0x007F0200
-# and global_load_dwordx2 v[4:5],v[0:1],off = 0xDC548000 / 0x047F0000.
-fn gfx9_enc_flat_lo(op, seg, offset, glc, slc): i64 {
-    var w = 0xDC000000 | ((op & 0x7F) << 18) | ((slc & 1) << 17) | ((glc & 1) << 16);
-    return w | ((seg & 3) << 14) | (offset & 0x1FFF);
-}
-
-fn gfx9_enc_flat_hi(vdst, saddr, data, vaddr): i64 {
-    return ((vdst & 0xFF) << 24) | ((saddr & 0x7F) << 16) | ((data & 0xFF) << 8) | (vaddr & 0xFF);
 }
 
 # --- backend_native_pm4.cyr ---
