@@ -1537,6 +1537,119 @@ fn test_gfx9_regalloc_valu_uniform() {
     return 0;
 }
 
+# ================================================================
+# Phase N.4b — s_waitcnt insertion (gfx9_waitcnt.cyr)
+# ================================================================
+# The by-construction proof: walk the waitcnt'd list and confirm NO instruction
+# ever reads the result of a still-outstanding load. Returns 1 if the invariant
+# holds, 0 on the first violation. Both emitted simms wait vmcnt(0), so either
+# s_waitcnt clears the outstanding set.
+fn _wc_check_invariant(out, n): i64 {
+    var outstanding[2048];
+    memset(&outstanding, 0, 2048);
+    var i = 0;
+    while (i < n) {
+        var op = gisel_op(out, i);
+        if (_wc_uses_outstanding(out, i, &outstanding) == 1) { return 0; }
+        if (op == GISEL_S_WAITCNT) { memset(&outstanding, 0, 2048); }
+        if (op == GISEL_GLOBAL_LOAD) { store64(&outstanding + gisel_dst(out, i) * 8, 1); }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# SAXPY: two loads then a use of each. The use of x[i] (instr 5) gets vmcnt(0)
+# before it; that single wait covers BOTH loads, so the use of y[i] (instr 6)
+# needs none. A final vmcnt(0) lgkmcnt(0) drains the store before s_endpgm. This
+# is the hand-authored downsample wait pattern (0x0F70 then 0x0070).
+fn test_gfx9_waitcnt_saxpy() {
+    var buf[640];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    var n = _spv_build_saxpy(&buf);
+    _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
+    var isel[480];
+    var ic = gfx9_isel(&m, &isel, 10);
+    var out[640];
+    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 13);
+    assert_eq(wc, 11, "9 isel + 2 waits = 11");
+    # the vmcnt(0) lands right before the first use of a load (the f32 multiply)
+    assert_eq(gisel_op(&out, 5), GISEL_S_WAITCNT, "5 is a waitcnt");
+    assert_eq(gisel_a(&out, 5), GFX9_WAITCNT_VM, "5 simm = vmcnt(0) 0x0F70");
+    assert_eq(gisel_op(&out, 6), GISEL_V_MUL_F32, "6 a*x (the consumer)");
+    assert_eq(gisel_op(&out, 7), GISEL_V_ADD_F32, "7 +y needs no extra wait");
+    assert_eq(gisel_op(&out, 8), GISEL_GLOBAL_STORE, "8 store");
+    # the drain wait precedes s_endpgm
+    assert_eq(gisel_op(&out, 9), GISEL_S_WAITCNT, "9 is a waitcnt");
+    assert_eq(gisel_a(&out, 9), GFX9_WAITCNT_VM_LGKM, "9 simm = vmcnt(0) lgkmcnt(0) 0x0070");
+    assert_eq(gisel_op(&out, 10), GISEL_S_ENDPGM, "10 endpgm");
+    # the waitcnt carries an immediate operand (no register)
+    assert_eq(gisel_flags(&out, 5) & MIR_FLAG_A_IMM, MIR_FLAG_A_IMM, "wait simm is immediate");
+    assert_eq(_wc_check_invariant(&out, wc), 1, "no use-before-wait in the output");
+    return 0;
+}
+
+# A kernel with no memory ops gets no waits at all (not even before s_endpgm).
+fn test_gfx9_waitcnt_none() {
+    var buf[384];
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    var n = _spv_build_gid_kernel(&buf);
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_const_table(&buf, n, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    var out[256];
+    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 8);
+    assert_eq(wc, 5, "no memory -> no waits, count unchanged");
+    assert_eq(gisel_op(&out, 4), GISEL_S_ENDPGM, "endpgm not preceded by a wait");
+    # no S_WAITCNT anywhere
+    var i = 0;
+    var waits = 0;
+    while (i < wc) {
+        if (gisel_op(&out, i) == GISEL_S_WAITCNT) { waits = waits + 1; }
+        i = i + 1;
+    }
+    assert_eq(waits, 0, "zero waitcnts emitted");
+    assert_eq(_wc_check_invariant(&out, wc), 1, "trivially holds");
+    return 0;
+}
+
+fn test_gfx9_waitcnt_errors() {
+    var buf[640];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    var n = _spv_build_saxpy(&buf);
+    _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
+    var isel[480];
+    var ic = gfx9_isel(&m, &isel, 10);
+    var out[640];
+    # an output cap too small to hold the spliced list fails loud
+    assert_eq(gfx9_waitcnt(&m, &isel, ic, &out, 3), 0 - WC_ERR_CAP, "output cap exceeded");
+    # cap_ids beyond the outstanding-tracker scratch fails loud
+    var fake[80];
+    memset(&fake, 0, 80);
+    store64(&fake + 64, 300);
+    assert_eq(gfx9_waitcnt(&fake, &isel, 0, &out, 8), 0 - WC_ERR_TOO_MANY_IDS, "cap_ids too large");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -1582,5 +1695,8 @@ fn main(): i64 {
     test_gfx9_regalloc_saxpy();
     test_gfx9_regalloc_errors();
     test_gfx9_regalloc_valu_uniform();
+    test_gfx9_waitcnt_saxpy();
+    test_gfx9_waitcnt_none();
+    test_gfx9_waitcnt_errors();
     return assert_summary();
 }

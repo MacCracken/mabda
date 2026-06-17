@@ -518,7 +518,7 @@ hand-authored shaders stay as oracle + fallback.
   the integer path silently picked SALU for a result-less op (vals[0] sentinel)
   and for an UNKNOWN-uniformity result (sweep not run); both now fail loud,
   regression-tested. **Next:** N.4 (register allocation + `s_waitcnt`) for 3.2.7.
-- [~] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt`. **N.4a done
+- [x] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt`. **N.4a done
   (2026-06-17):** `src/gfx9_regalloc.cyr` — linear-scan allocation of the N.3
   virtual regs (MIR SSA ids) to physical VGPR/SGPR. Two independent files keyed
   by N.2 uniformity (UNIFORM→SGPR, DIVERGENT→VGPR); per-register "free-at" reuse
@@ -534,8 +534,17 @@ hand-authored shaders stay as oracle + fallback.
   (always VALU) with a uniform result was misfiled into an SGPR; the file now
   follows the selected op class (`gisel_writes_vgpr`), not uniformity (a uniform
   value in a VGPR feeding a later SALU op is the N.8 operand-coercion case).
-  **N.4b (next):** `s_waitcnt` insertion (vmcnt/lgkmcnt after memory ops, before
-  the first use of the result).
+  **N.4b done (2026-06-17):** `src/gfx9_waitcnt.cyr` — splices `s_waitcnt` so no
+  instruction reads a still-outstanding memory result (async loads = garbage if
+  read early; the compiler's top-tier correctness risk). Use-before-wait is
+  **impossible by construction**: `vmcnt(0)` (0x0F70) before the first consumer of
+  an outstanding load, `vmcnt(0) lgkmcnt(0)` (0x0070) before `s_endpgm` if any
+  memory op ran — the hand-authored downsample pattern (for the N.5 byte-match).
+  MVP = conservative (a use waits for ALL outstanding loads; per-load count is
+  N.8). New `GISEL_S_WAITCNT`; runs on the isel list independently of regalloc.
+  17 asserts incl. a `_wc_check_invariant` walker that proves no output instr
+  reads an un-waited load. **Adversarial review (workflow): clean (1 candidate,
+  0 confirmed).** **N.4 COMPLETE.**
 - [ ] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + recompile the
   downsample shader from SPIR-V and byte-match it** on Cezanne. MVP exit.
 - [ ] **N.6** *(3.2.8)* — First novel kernel (SAXPY); differential CPU oracle;

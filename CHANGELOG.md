@@ -188,19 +188,44 @@ for the immediate forward pointer.
   result lands in a VGPR. (A uniform value held in a VGPR later feeding a SALU op
   is the operand-class-coercion case — flagged N.8.)
 
+### Added — Phase N.4b (s_waitcnt insertion)
+- `src/gfx9_waitcnt.cyr` — splices `s_waitcnt` into the N.3 selected-instruction
+  list so no instruction reads the result of a still-outstanding memory op. GFX9
+  loads are asynchronous (the dst register is invalid until the hardware `vmcnt`
+  counter drains); reading early reads garbage — the compiler's top-tier
+  correctness risk. The pass makes a use-before-wait **impossible by
+  construction**: `vmcnt(0)` (`0x0F70`) before the first instruction that
+  consumes an outstanding load result, and `vmcnt(0) lgkmcnt(0)` (`0x0070`)
+  before `s_endpgm` whenever any memory op ran (so the wave does not retire
+  before its stores land) — exactly the hand-authored downsample pattern, for the
+  N.5 byte-match oracle. MVP policy is deliberately **conservative**: a use of any
+  outstanding load waits for *all* of them (over-waiting is safe; the danger is
+  under-waiting; the per-load count is N.8). Outstanding loads tracked by result
+  `<id>`; runs on the isel list independently of regalloc (waits carry no
+  register, the reg-map is id-keyed). New `GISEL_S_WAITCNT` op (simm in `a`,
+  flagged immediate). Returns the new count or a negative error.
+- `tests/tcyr/compiler.tcyr` +17 asserts: the **SAXPY** kernel (two loads, one
+  `vmcnt(0)` before the f32 multiply covering both loads, the drain before
+  `s_endpgm`, the exact simms), a no-memory kernel (zero waits, none before
+  `s_endpgm`), the cap-exceeded / cap_ids-too-large fail-louds, and a
+  `_wc_check_invariant` walker that **proves** no output instruction reads an
+  un-waited load. Adversarial review (workflow): clean — 1 candidate, 0 confirmed
+  (no under-wait / bounds gap survived verification).
+
 ### Changed
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
-  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` (after
-  `spirv_parse.cyr`).
+  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
+  `gfx9_waitcnt.cyr` (after `spirv_parse.cyr`).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- N.4b — `s_waitcnt` insertion (vmcnt/lgkmcnt after each memory op, before the
-  first use of its result) — its own dense correctness suite. Then N.5 (encode +
-  the downsample-from-SPIR-V byte-match MVP). 3.2.7.
+- N.5 — **the MVP payoff**: GFX9 encode (`GISEL_*` → bytes via `gfx9_encode.cyr`,
+  resolving the regalloc map + constants + builtins + the ptr side-table) + ABI
+  wiring, then the bring-up oracle: recompile the downsample shader from SPIR-V
+  and byte-match the hand-authored GFX9. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 
