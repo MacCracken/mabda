@@ -5494,13 +5494,28 @@ var SPIRV_TYK_STRUCT        = 8;   # p0 = member count, p1 = first member type <
 var SPIRV_TYK_POINTER       = 9;   # p0 = storage class, p1 = pointee type <id>
 var SPIRV_TYK_FUNCTION      = 10;  # p0 = return type <id>
 
-# Record sizes (bytes). Caller sizes each table buffer to id_bound * REC.
+# Record sizes (bytes). Caller sizes each table buffer to >= `cap` records and
+# passes `cap` so the builder can reject a SPIR-V `id_bound` (UNTRUSTED, from the
+# header) that would write past it. The validate gate only caps `id_bound` at a
+# loose 0x40000000, unrelated to the caller's fixed buffer — without `cap` a
+# crafted oversized `id_bound` silently corrupts memory (the `memset` below and
+# every per-id write index by `id`). N-HARDEN.1 (found via N.5g adversarial review).
 var SPIRV_TYPE_REC  = 24;   # [kind, p0, p1]
 var SPIRV_CONST_REC = 16;   # [result-type <id>, value]
 var SPIRV_DECO_REC  = 16;   # [binding, descriptor-set]  (-1 = absent)
 
+# Builder error: a SPIR-V <id> / id_bound exceeds the caller's table capacity.
+# Distinct from the malformed-stream `-1` so the driver can surface "module too
+# large for the configured tables" separately from "bad bytes".
+var SPIRV_ERR_ID_CAP = 2;
+
 # ---- type table ----
-fn _spirv_set_type(out, id, kind, p0, p1): i64 {
+# Guarded write: skip id 0 (unused in SPIR-V) and any id >= cap (a malformed
+# stream whose result <id> exceeds the declared id_bound — defense in depth on
+# top of the id_bound > cap gate the builders apply up front).
+fn _spirv_set_type(out, id, kind, p0, p1, cap): i64 {
+    if (id <= 0) { return 0; }
+    if (id >= cap) { return 0; }
     var base = out + id * SPIRV_TYPE_REC;
     store64(base + 0, kind);
     store64(base + 8, p0);
@@ -5509,10 +5524,12 @@ fn _spirv_set_type(out, id, kind, p0, p1): i64 {
 }
 
 # Build the type table: out[id] = (kind, p0, p1) for every OpType* in the
-# stream. Returns 0, or -1 on a malformed (zero-wc) instruction. Per-op `wc`
-# guards keep operand reads inside the instruction (a compiler ingests
+# stream. Returns 0, -1 on a malformed (zero-wc) instruction, or
+# -SPIRV_ERR_ID_CAP if id_bound exceeds the caller's `cap`-record table. Per-op
+# `wc` guards keep operand reads inside the instruction (a compiler ingests
 # untrusted input). `a` = word 2, `b` = word 3 (read only when wc allows).
-fn spirv_build_type_table(ptr, byte_len, id_bound, out): i64 {
+fn spirv_build_type_table(ptr, byte_len, id_bound, cap, out): i64 {
+    if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_TYPE_REC);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -5527,31 +5544,31 @@ fn spirv_build_type_table(ptr, byte_len, id_bound, out): i64 {
             var b = 0;
             if (wc >= 3) { a = spirv_word(ptr, off + 2); }
             if (wc >= 4) { b = spirv_word(ptr, off + 3); }
-            if (op == SPIRV_OP_TYPE_VOID) { _spirv_set_type(out, id, SPIRV_TYK_VOID, 0, 0); }
-            if (op == SPIRV_OP_TYPE_BOOL) { _spirv_set_type(out, id, SPIRV_TYK_BOOL, 0, 0); }
+            if (op == SPIRV_OP_TYPE_VOID) { _spirv_set_type(out, id, SPIRV_TYK_VOID, 0, 0, cap); }
+            if (op == SPIRV_OP_TYPE_BOOL) { _spirv_set_type(out, id, SPIRV_TYK_BOOL, 0, 0, cap); }
             if (op == SPIRV_OP_TYPE_FLOAT) {
-                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FLOAT, a, 0); }
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FLOAT, a, 0, cap); }
             }
             if (op == SPIRV_OP_TYPE_FUNCTION) {
-                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FUNCTION, a, 0); }
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FUNCTION, a, 0, cap); }
             }
             if (op == SPIRV_OP_TYPE_RUNTIME_ARRAY) {
-                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_RUNTIME_ARRAY, a, 0); }
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_RUNTIME_ARRAY, a, 0, cap); }
             }
             if (op == SPIRV_OP_TYPE_STRUCT) {
-                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_STRUCT, wc - 2, a); }
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_STRUCT, wc - 2, a, cap); }
             }
             if (op == SPIRV_OP_TYPE_INT) {
-                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_INT, a, b); }
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_INT, a, b, cap); }
             }
             if (op == SPIRV_OP_TYPE_VECTOR) {
-                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_VECTOR, a, b); }
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_VECTOR, a, b, cap); }
             }
             if (op == SPIRV_OP_TYPE_ARRAY) {
-                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_ARRAY, a, b); }
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_ARRAY, a, b, cap); }
             }
             if (op == SPIRV_OP_TYPE_POINTER) {
-                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_POINTER, a, b); }
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_POINTER, a, b, cap); }
             }
         }
         off = off + wc;
@@ -5566,7 +5583,8 @@ fn spirv_type_p1(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 16); 
 # ---- constant table ----
 # out[result-id] = (result-type <id>, value). Scalar OpConstant only (the 32-bit
 # value is word 3); composite/64-bit constants land when the lowering needs them.
-fn spirv_build_const_table(ptr, byte_len, id_bound, out): i64 {
+fn spirv_build_const_table(ptr, byte_len, id_bound, cap, out): i64 {
+    if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_CONST_REC);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -5577,8 +5595,10 @@ fn spirv_build_const_table(ptr, byte_len, id_bound, out): i64 {
         if (spirv_op(w0) == SPIRV_OP_CONSTANT) {
             if (wc >= 4) {
                 var rid = spirv_word(ptr, off + 2);
-                store64(out + rid * SPIRV_CONST_REC + 0, spirv_word(ptr, off + 1));
-                store64(out + rid * SPIRV_CONST_REC + 8, spirv_word(ptr, off + 3));
+                if (rid > 0) { if (rid < cap) {
+                    store64(out + rid * SPIRV_CONST_REC + 0, spirv_word(ptr, off + 1));
+                    store64(out + rid * SPIRV_CONST_REC + 8, spirv_word(ptr, off + 3));
+                } }
             }
         }
         off = off + wc;
@@ -5592,7 +5612,8 @@ fn spirv_const_value(out, id): i64 { return load64(out + id * SPIRV_CONST_REC + 
 # ---- decoration table ----
 # out[target-id] = (Binding, DescriptorSet); both default to -1 (absent). Only
 # the two binding decorations N.2 needs to resolve buffer slots are recorded.
-fn spirv_build_decoration_table(ptr, byte_len, id_bound, out): i64 {
+fn spirv_build_decoration_table(ptr, byte_len, id_bound, cap, out): i64 {
+    if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0xFF, id_bound * SPIRV_DECO_REC);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -5605,8 +5626,10 @@ fn spirv_build_decoration_table(ptr, byte_len, id_bound, out): i64 {
                 var tid = spirv_word(ptr, off + 1);
                 var deco = spirv_word(ptr, off + 2);
                 var operand = spirv_word(ptr, off + 3);
-                if (deco == SPIRV_DECO_BINDING) { store64(out + tid * SPIRV_DECO_REC + 0, operand); }
-                if (deco == SPIRV_DECO_DESCRIPTOR_SET) { store64(out + tid * SPIRV_DECO_REC + 8, operand); }
+                if (tid > 0) { if (tid < cap) {
+                    if (deco == SPIRV_DECO_BINDING) { store64(out + tid * SPIRV_DECO_REC + 0, operand); }
+                    if (deco == SPIRV_DECO_DESCRIPTOR_SET) { store64(out + tid * SPIRV_DECO_REC + 8, operand); }
+                } }
             }
         }
         off = off + wc;
@@ -6087,6 +6110,12 @@ fn _spirv_builtin_to_mir(k): i64 {
 # decoration table records Binding/DescriptorSet but NOT BuiltIn). `out_bi` is a
 # caller-provided array of `id_bound` i64s; -1 = not a (recognized) builtin.
 fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi): i64 {
+    # PRECONDITION (untrusted id_bound): out_bi must hold >= id_bound i64s. On the
+    # public path this is guaranteed — gfx9_compile gates id_bound <= CC_CAP_IDS via
+    # the table builders before reaching here, and CC_CAP_IDS's contract sizes OUTBI
+    # for >= CC_CAP_IDS records (see CC_CAP_IDS in gfx9_compile.cyr). The per-id
+    # store below is independently bounded (`tid < id_bound`, N.2b-1); this memset
+    # trusts that contract. A direct caller bypassing gfx9_compile owns the sizing.
     memset(out_bi, 0xFF, id_bound * 8);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -7094,6 +7123,8 @@ var CMP_ERR_FLAT_NONVGPR        = 78;   # a FLAT offset/data operand not in a VG
 var CMP_ERR_BINDING_RANGE       = 79;   # a binding outside the loaded USER_DATA region
 var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not resolve yet (WGID/GID)
 var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
+var CMP_ERR_TABLE               = 85;   # a type/const/deco table builder rejected the
+                                        # input (malformed, or id_bound > CC_CAP_IDS) (N-HARDEN.1)
 
 # Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
 # `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
@@ -7108,6 +7139,13 @@ var CC_ISEL2  = 48;   # waitcnt-spliced list (same size)
 var CC_ALLOC  = 56;
 var CC_HW     = 64;
 var CC_ABI    = 72;
+var CC_CAP_IDS = 80;  # capacity (in records) of the <id>-indexed scratch tables.
+                      # The caller MUST size ALL of types (CC_CAP_IDS*24 B), consts
+                      # (*16), deco (*16) AND the OUTBI builtin table (*8) for at
+                      # least CC_CAP_IDS records, and set this field. The table
+                      # builders reject id_bound > CC_CAP_IDS (N-HARDEN.1) before any
+                      # write, which — because OUTBI is in this same contract — also
+                      # bounds the OUTBI memset in _spirv_resolve_builtins downstream.
 
 # Compile output descriptor (caller buffer, 40 B).
 var DESC_ISA_LEN      = 0;    # ISA byte length (incl. the prefetch pad)
@@ -7452,9 +7490,14 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     var types = load64(ctx + CC_TYPES);
     var consts = load64(ctx + CC_CONSTS);
     var deco = load64(ctx + CC_DECO);
-    spirv_build_type_table(spirv, n, idb, types);
-    spirv_build_const_table(spirv, n, idb, consts);
-    spirv_build_decoration_table(spirv, n, idb, deco);
+    # The SPIR-V id_bound is untrusted (header field); the table builders reject any
+    # id_bound that would overflow the caller's CC_CAP_IDS-record tables, and guard
+    # every per-id write, so a crafted module fails loud instead of corrupting
+    # memory (N-HARDEN.1, found via the N.5g adversarial review).
+    var cap = load64(ctx + CC_CAP_IDS);
+    if (spirv_build_type_table(spirv, n, idb, cap, types) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_const_table(spirv, n, idb, cap, consts) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_decoration_table(spirv, n, idb, cap, deco) < 0) { return 0 - CMP_ERR_TABLE; }
     var m = load64(ctx + CC_M);
     var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI));
     if (lr < 0) { return lr; }

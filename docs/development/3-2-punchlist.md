@@ -657,20 +657,22 @@ hand-authored shaders stay as oracle + fallback.
   - [ ] **N.6 remainder** — `_backend_native_shader_module_create` slot wiring (so
     consumers compile SPIR-V through the public `gpu_*` API), the TGID/2-D dispatch
     path, and a fuller differential CPU oracle.
-  - [ ] **N-HARDEN.1 (security, found during N.5g via adversarial review)** —
-    **unchecked OOB write in the SPIR-V table builders on untrusted `id_bound`.**
-    `spirv_build_type_table` / `_const_table` / `_decoration_table`
-    (`src/spirv_parse.cyr:236/290/316`) write `out + id*stride` for every result
-    `<id>` with **no capacity parameter and no bounds check**; the validate gate
-    only caps `id_bound` at a loose `0x40000000` (`wgpu_descriptors.cyr:249`),
-    unrelated to the caller's fixed buffer size. A crafted oversized `id_bound`
-    (within that ceiling) → silent heap corruption, surfacing much later as a
-    spurious `MIR_ERR_ID_OOR`. Manifested in dev as a confusing `-25` when the
-    downsample's table buffers were sized for `cap_ids` instead of `id_bound`.
-    **Fix:** add a `cap_ids`/capacity arg to the three builders + fail-loud
-    (`id == 0 || id >= cap`), thread it from `gfx9_compile` (the CC ctx already
-    knows its buffer sizes); regression assert per builder. Slot **before** the
-    next public-API surface (N.6 remainder exposes this path to consumers).
+  - [x] **N-HARDEN.1 (2026-06-17) — security, found during N.5g via adversarial
+    review.** **Unchecked OOB write in the SPIR-V table builders on untrusted
+    `id_bound`, now gated.** `spirv_build_type_table` / `_const_table` /
+    `_decoration_table` (`src/spirv_parse.cyr`) wrote `out + id*stride` for every
+    result `<id>` (and an up-front `memset(out, 0, id_bound*REC)`) with **no
+    capacity parameter and no bounds check**; the validate gate only caps
+    `id_bound` at a loose `0x40000000` (`wgpu_descriptors.cyr`), unrelated to the
+    caller's fixed buffer → a crafted oversized `id_bound` silently corrupted
+    memory, surfacing much later as a spurious `MIR_ERR_ID_OOR` (it bit dev as a
+    confusing `-25`). **Fix:** each builder takes `cap` (table capacity in
+    records), rejects `id_bound > cap` with `-SPIRV_ERR_ID_CAP` before touching
+    `out`, and guards each per-id write (`id == 0 || id >= cap`); `gfx9_compile`
+    threads the capacity from a new `CC_CAP_IDS` ctx field and maps any rejection
+    to `CMP_ERR_TABLE`. +8 asserts (per-builder reject + untouched canary +
+    `gfx9_compile` over-capacity integration reject). Landed **before** the N.6
+    remainder exposes this path through `gpu_shader_module_create`.
 - [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
   EXEC-mask); divergent-vs-uniform test matrix. May split into two bites.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

@@ -15,6 +15,25 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Security — Phase N-HARDEN.1 (unchecked OOB write in the SPIR-V table builders)
+- **The SPIR-V→GFX9 table builders no longer trust the header `id_bound`.**
+  `spirv_build_type_table` / `_const_table` / `_decoration_table`
+  (`src/spirv_parse.cyr`) index a caller-provided buffer by every result `<id>`
+  using the (untrusted) `id_bound`, and previously took no buffer-capacity
+  parameter — so a crafted oversized `id_bound` (the validate gate only caps it at
+  a loose `0x40000000`) ran the up-front `memset` and every per-id write past the
+  buffer, silently corrupting memory and surfacing much later as a spurious
+  `MIR_ERR_ID_OOR`. Each builder now takes a `cap` (table capacity in records),
+  rejects `id_bound > cap` with `-SPIRV_ERR_ID_CAP` **before touching `out`**, and
+  guards each per-id write (`id == 0 || id >= cap`). `gfx9_compile` threads the
+  capacity from a new `CC_CAP_IDS` context field and surfaces any builder
+  rejection as `CMP_ERR_TABLE`. Found via the N.5g adversarial review; it had
+  already bitten development as a confusing `-25` when a caller sized its tables
+  for `cap_ids` instead of `id_bound`. +8 asserts in `tests/tcyr/compiler.tcyr`
+  (per-builder rejection + untouched-canary + the `gfx9_compile` integration
+  reject). Closes the gap **before** N.6's `gpu_shader_module_create` SPIR-V path
+  exposes the compiler to consumers.
+
 ### Added — Phase N.6 (multi-binding dispatch + a novel kernel on the GPU)
 - **A compiled kernel the compiler never saw as hand-authored bytes runs on
   Cezanne with two real storage buffers.** `programs/native_spirv_saxpy_e2e.cyr`:

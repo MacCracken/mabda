@@ -37,6 +37,8 @@ var CMP_ERR_FLAT_NONVGPR        = 78;   # a FLAT offset/data operand not in a VG
 var CMP_ERR_BINDING_RANGE       = 79;   # a binding outside the loaded USER_DATA region
 var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not resolve yet (WGID/GID)
 var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
+var CMP_ERR_TABLE               = 85;   # a type/const/deco table builder rejected the
+                                        # input (malformed, or id_bound > CC_CAP_IDS) (N-HARDEN.1)
 
 # Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
 # `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
@@ -51,6 +53,13 @@ var CC_ISEL2  = 48;   # waitcnt-spliced list (same size)
 var CC_ALLOC  = 56;
 var CC_HW     = 64;
 var CC_ABI    = 72;
+var CC_CAP_IDS = 80;  # capacity (in records) of the <id>-indexed scratch tables.
+                      # The caller MUST size ALL of types (CC_CAP_IDS*24 B), consts
+                      # (*16), deco (*16) AND the OUTBI builtin table (*8) for at
+                      # least CC_CAP_IDS records, and set this field. The table
+                      # builders reject id_bound > CC_CAP_IDS (N-HARDEN.1) before any
+                      # write, which — because OUTBI is in this same contract — also
+                      # bounds the OUTBI memset in _spirv_resolve_builtins downstream.
 
 # Compile output descriptor (caller buffer, 40 B).
 var DESC_ISA_LEN      = 0;    # ISA byte length (incl. the prefetch pad)
@@ -395,9 +404,14 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     var types = load64(ctx + CC_TYPES);
     var consts = load64(ctx + CC_CONSTS);
     var deco = load64(ctx + CC_DECO);
-    spirv_build_type_table(spirv, n, idb, types);
-    spirv_build_const_table(spirv, n, idb, consts);
-    spirv_build_decoration_table(spirv, n, idb, deco);
+    # The SPIR-V id_bound is untrusted (header field); the table builders reject any
+    # id_bound that would overflow the caller's CC_CAP_IDS-record tables, and guard
+    # every per-id write, so a crafted module fails loud instead of corrupting
+    # memory (N-HARDEN.1, found via the N.5g adversarial review).
+    var cap = load64(ctx + CC_CAP_IDS);
+    if (spirv_build_type_table(spirv, n, idb, cap, types) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_const_table(spirv, n, idb, cap, consts) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_decoration_table(spirv, n, idb, cap, deco) < 0) { return 0 - CMP_ERR_TABLE; }
     var m = load64(ctx + CC_M);
     var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI));
     if (lr < 0) { return lr; }
