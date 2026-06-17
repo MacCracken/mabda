@@ -399,7 +399,31 @@ for the immediate forward pointer.
   Regression test: a `cap_ids` too tight for the GID expansion fails loud
   (`MIR_ERR_ID_OOR`), not a corrupt write.
 
-### Changed
+### Added — Phase N.5d-2 (a compiled SPIR-V kernel runs on the GPU — MVP reached)
+- **The in-tree SPIR-V→GFX9 compiler is HW-verified end-to-end on Cezanne.**
+  `programs/native_spirv_compute_e2e.cyr` hand-authors the SPIR-V for
+  `out[gl_LocalInvocationID.x] = lid.x*3 + 7` (LocalSize 8), runs it through
+  `gfx9_compile` to GFX9 ISA + an RSRC descriptor, publishes the ISA to a GTT BO,
+  dispatches one 8-thread workgroup, and reads back **all 8 lanes correct**
+  (7,10,13,16,19,22,25,28) from the GPU — per-lane arithmetic, so it cannot be a
+  constant store. `make test-native-spirv-compute-e2e`.
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_generic`: a generic
+  single-binding compute dispatch composer (the proven Cezanne scaffold with
+  parameterized RSRC1/RSRC2, binding-0 USER_DATA VA, and NUM_THREAD_X) that
+  dispatches a compiled shader rather than a hand-authored one.
+- `tests/tcyr/native.tcyr` +4 asserts: a structural CPU test that the compiler
+  RSRC, binding VA, and NUM_THREAD wire into the generic composer's PM4. (Scope:
+  1 binding, LID index, no TGID — the multi-binding/TGID generic dispatcher is
+  N.6.)
+
+### Changed — Phase N.5d-1 (dispatch seam: parameterized compute RSRC)
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_downsample` now takes
+  `rsrc1`/`rsrc2` as parameters instead of hardcoding `0x2C0083`/`0x18C`, so a
+  **compiler-derived** `gfx9_rsrc1`/`gfx9_rsrc2` can flow into the compute dispatch
+  packet (the N.5d seam). The internal mipmap caller passes the hand-authored
+  shader's values; `tests/tcyr/native.tcyr` proves an alternate (compiler-shaped)
+  RSRC flows through where the hardcode used to be. (The `_store_deadbeef` composer
+  stays fixed — it dispatches the constant test shader, not a compiled one.)
 - **Toolchain pin → `cyrius = "6.2.18"`** (tracking upstream; was 6.2.15).
   6.2.18 lands the native-float `f32_from` / `f32_to` builtins (the f32 conversion
   gap — `cvtsd2ss`/`cvtss2sd` on x86, `fcvt` on aarch64).

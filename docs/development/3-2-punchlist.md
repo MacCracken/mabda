@@ -613,8 +613,19 @@ hand-authored shaders stay as oracle + fallback.
       at the `cap_ids` ceiling (was silent OOB), callers + `_mir_set_val` (`id<=0`)
       guard it; regression-tested. **N.5c-2 + N.5c COMPLETE** — a divergent-index
       compute kernel goes SPIR-V → GFX9 ISA + RSRC.
-  - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
-    `gfx9_compile` into a BO; parameterize the PM4 composer's rsrc1/rsrc2.
+  - [~] **N.5d** — dispatch seam.
+    - [x] **N.5d-1 (2026-06-17)** — parameterized `native_pm4_build_compute_downsample`
+      to take `rsrc1`/`rsrc2` (was hardcoded `0x2C0083`/`0x18C`), so a compiler-derived
+      RSRC flows into the dispatch packet; CPU-tested both the hand-authored + an
+      alternate RSRC flow through.
+    - [x] **N.5d-2 (2026-06-17) — HW-VERIFIED on Cezanne.** A compiled SPIR-V
+      kernel `out[lid.x] = lid.x*3+7` runs correctly on the GPU (all 8 lanes
+      7..28). `native_pm4_build_compute_generic` (generic 1-binding compute
+      composer: compiler RSRC + binding VA + NUM_THREAD) + `programs/native_spirv_
+      compute_e2e.cyr` (compile → BO → dispatch → readback) +
+      `make test-native-spirv-compute-e2e` + a CPU structural test. **The compiler
+      is HW-verified end-to-end — MVP reached.** (`_backend_native_shader_module_create`
+      slot wiring + the multi-binding/TGID generic dispatcher remain for N.6.)
   - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL
     ops + isel rules + 3-src encode).
   - [ ] **N.5f** — 64-bit carry SALU (`s_add_u32`/`s_addc_u32` split) + SGPR→VGPR
