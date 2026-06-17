@@ -25,6 +25,10 @@
 # OR in. (= GFX9_COMPUTE_PGM_RSRC1_MIN 0x2C0040 with its SGPRS=1 field cleared.)
 var GFX9_RSRC1_FLAGS = 0x2C0000;
 
+# Error codes (disjoint from the compile module's CMP_ERR_* 70-76).
+var ABI_ERR_VGPR_OVERFLOW = 80;   # VGPRS field (6-bit) would overflow
+var ABI_ERR_SGPR_OVERFLOW = 81;   # SGPRS field (4-bit) would overflow
+
 # ABI descriptor record (caller buffer, 64 B): field byte offsets.
 var ABI_USER_SGPR    = 0;    # # of preloaded USER_DATA SGPRs (= 2 * #bindings)
 var ABI_NUM_BINDINGS = 8;
@@ -41,14 +45,21 @@ var ABI_VGPR_BASE    = 56;   # first allocatable VGPR (above the LID v0..)
 # COMPUTE_PGM_RSRC1 from the VGPR/SGPR high-water marks (max reg used + 1, incl.
 # the ABI region). VGPRS = ceil(vgpr_hw/4) - 1; SGPRS = ceil((sgpr_hw+2)/8) - 1
 # (+2 reserves VCC), floored at 1 (16 SGPRs — SGPRS=0 gives only 8, too few once
-# VCC is live; matches the hand-authored RSRC1_MIN rationale).
+# VCC is live; matches the hand-authored RSRC1_MIN rationale). FAIL LOUD (negative
+# error) if either field would overflow its width rather than silently masking to
+# a too-small allocation (N.5b-1 review): the SGPRS field is only 4 bits (≤128
+# SGPRs) so sgpr_hw > 120 must be rejected, not wrapped. (A correctly-bounded
+# regalloc keeps both inside range; this guards a future driver passing the wrong
+# file cap — see the regalloc SGPR-cap note in the punchlist.)
 fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
     var vgprs = (vgpr_hw + 3) / 4;
     if (vgprs > 0) { vgprs = vgprs - 1; }
     var sgprs = (sgpr_hw + 2 + 7) / 8;
     if (sgprs > 0) { sgprs = sgprs - 1; }
     if (sgprs < 1) { sgprs = 1; }
-    return GFX9_RSRC1_FLAGS | (vgprs & 0x3F) | ((sgprs & 0xF) << 6);
+    if (vgprs > 0x3F) { return 0 - ABI_ERR_VGPR_OVERFLOW; }
+    if (sgprs > 0xF) { return 0 - ABI_ERR_SGPR_OVERFLOW; }
+    return GFX9_RSRC1_FLAGS | vgprs | (sgprs << 6);
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN

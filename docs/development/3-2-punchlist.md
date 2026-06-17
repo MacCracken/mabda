@@ -573,9 +573,13 @@ hand-authored shaders stay as oracle + fallback.
       (binding k→`s[2k]`, WGID→`s[user_sgpr..]`, LID→`v0..`, sgpr/vgpr bases;
       GID→-1 needs-expansion). 12 asserts. Pin bumped 6.2.15→6.2.16. Adversarial
       review (workflow).
-    - [ ] **N.5b-2** — FLAT load/store (SADDR: offset VGPR + binding USER_DATA
-      base SGPR) + VOP3 `v_mul_lo_u32` + `GISEL_EXTRACT` builtin resolution, in
-      `gfx9_compile.cyr` through the ABI.
+    - [x] **N.5b-2 (2026-06-17)** — `gfx9_compile.cyr`: FLAT load/store (SADDR:
+      offset VGPR + binding USER_DATA base SGPR via the ABI) + VOP3
+      `v_mul_lo_u32` (0x285) + `GFX9_FLAT_GLOBAL_LOAD_DWORD` (0x14). `gfx9_emit_program`
+      gained the `abi` param. 10 asserts: load→mul→store byte-matches llvm-mc.
+      **N.5b-1 review fix folded in:** `gfx9_rsrc1` now fails loud on a VGPRS/SGPRS
+      field overflow (was a silent `& 0xF` wrap; LOW, defense-in-depth). Adversarial
+      review (workflow). `GISEL_EXTRACT` builtin resolution → N.5c.
   - [ ] **N.5c** — SAXPY first oracle: top-level `gfx9_compile` (validate→lower→
     uniformity→isel→regalloc→abi→waitcnt→emit→pad) + byte fixture.
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls

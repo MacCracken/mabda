@@ -5163,6 +5163,7 @@ var GFX9_VOP2_V_SUBREV_U32  = 0x36;   # D = vsrc1 - src0 (subtrahend in src0)
 var GFX9_VOP3_V_BFE_U32     = 0x1C8;
 var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
 var GFX9_VOP3_V_OR3_B32     = 0x202;
+var GFX9_VOP3_V_MUL_LO_U32  = 0x285;   # VOP3-only on GFX9 (no VOP2 form); llvm-mc-verified
 
 # SOP2 (single-dword) — bits 29-23 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_SOP2_S_ADD_U32     = 0x00;
@@ -5188,6 +5189,7 @@ var GFX9_SMEM_S_LOAD_DWORDX4 = 0x02;
 var GFX9_SMEM_S_LOAD_DWORDX8 = 0x03;
 
 # FLAT/global (two-dword) — bits 24-18 opcode.
+var GFX9_FLAT_GLOBAL_LOAD_DWORD   = 0x14;   # llvm-mc-verified
 var GFX9_FLAT_GLOBAL_LOAD_DWORDX2 = 0x15;
 var GFX9_FLAT_GLOBAL_STORE_DWORD  = 0x1C;
 
@@ -6880,6 +6882,10 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, cap_out): i64 {
 # OR in. (= GFX9_COMPUTE_PGM_RSRC1_MIN 0x2C0040 with its SGPRS=1 field cleared.)
 var GFX9_RSRC1_FLAGS = 0x2C0000;
 
+# Error codes (disjoint from the compile module's CMP_ERR_* 70-76).
+var ABI_ERR_VGPR_OVERFLOW = 80;   # VGPRS field (6-bit) would overflow
+var ABI_ERR_SGPR_OVERFLOW = 81;   # SGPRS field (4-bit) would overflow
+
 # ABI descriptor record (caller buffer, 64 B): field byte offsets.
 var ABI_USER_SGPR    = 0;    # # of preloaded USER_DATA SGPRs (= 2 * #bindings)
 var ABI_NUM_BINDINGS = 8;
@@ -6896,14 +6902,21 @@ var ABI_VGPR_BASE    = 56;   # first allocatable VGPR (above the LID v0..)
 # COMPUTE_PGM_RSRC1 from the VGPR/SGPR high-water marks (max reg used + 1, incl.
 # the ABI region). VGPRS = ceil(vgpr_hw/4) - 1; SGPRS = ceil((sgpr_hw+2)/8) - 1
 # (+2 reserves VCC), floored at 1 (16 SGPRs — SGPRS=0 gives only 8, too few once
-# VCC is live; matches the hand-authored RSRC1_MIN rationale).
+# VCC is live; matches the hand-authored RSRC1_MIN rationale). FAIL LOUD (negative
+# error) if either field would overflow its width rather than silently masking to
+# a too-small allocation (N.5b-1 review): the SGPRS field is only 4 bits (≤128
+# SGPRs) so sgpr_hw > 120 must be rejected, not wrapped. (A correctly-bounded
+# regalloc keeps both inside range; this guards a future driver passing the wrong
+# file cap — see the regalloc SGPR-cap note in the punchlist.)
 fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
     var vgprs = (vgpr_hw + 3) / 4;
     if (vgprs > 0) { vgprs = vgprs - 1; }
     var sgprs = (sgpr_hw + 2 + 7) / 8;
     if (sgprs > 0) { sgprs = sgprs - 1; }
     if (sgprs < 1) { sgprs = 1; }
-    return GFX9_RSRC1_FLAGS | (vgprs & 0x3F) | ((sgprs & 0xF) << 6);
+    if (vgprs > 0x3F) { return 0 - ABI_ERR_VGPR_OVERFLOW; }
+    if (sgprs > 0xF) { return 0 - ABI_ERR_SGPR_OVERFLOW; }
+    return GFX9_RSRC1_FLAGS | vgprs | (sgprs << 6);
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN
@@ -7016,6 +7029,7 @@ var CMP_ERR_NO_VGPR_OPERAND     = 72;   # a VALU op with no VGPR operand for vsr
 var CMP_ERR_BAD_SALU_OPERAND    = 73;   # a SALU op handed a VGPR operand
 var CMP_ERR_TWO_LITERALS        = 74;   # >1 literal in one instruction (illegal)
 var CMP_ERR_TOO_MANY_IDS        = 75;   # cap_ids beyond the file-map scratch
+var CMP_ERR_VOP3_LITERAL        = 76;   # a 32-bit literal operand in a VOP3 (no literal form)
 
 # ================================================================
 # Operand resolution
@@ -7164,10 +7178,47 @@ fn _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, sub_opc, subrev_opc): i64
     return p;
 }
 
+# VOP3 two-source (v_mul_lo_u32: VOP3-only on GFX9). vdst = a OP b. VOP3 has no
+# 32-bit-literal form, so a literal operand fails loud (an out-of-inline-range
+# constant must be materialized into a register — not needed for the MVP strides).
+fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
+}
+
+# FLAT global load (SADDR form): the 64-bit base lives in the binding's USER_DATA
+# SGPR pair (saddr), the per-lane byte offset in a VGPR (vaddr). dst = the loaded
+# VGPR. a = offset vreg, binding in flags bits 8+. No SGPR→VGPR move or 64-bit add
+# needed — the divergent offset rides the vaddr field.
+fn _emit_flat_load(m, isel, i, alloc, abi, buf, pos): i64 {
+    var saddr = gfx9_abi_binding_sgpr(abi, (gisel_flags(isel, i) >> 8) & 0xFF);
+    var vaddr = gfx9_reg(alloc, gisel_a(isel, i));
+    var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_LOAD_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    return gfx9_emit32(buf, p, gfx9_enc_flat_hi(vdst, saddr, 0, vaddr));
+}
+
+# FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
+# flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
+fn _emit_flat_store(m, isel, i, alloc, abi, buf, pos): i64 {
+    var saddr = gfx9_abi_binding_sgpr(abi, (gisel_flags(isel, i) >> 8) & 0xFF);
+    var vaddr = gfx9_reg(alloc, gisel_a(isel, i));
+    var data = gfx9_reg(alloc, gisel_c(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
+}
+
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
-fn _cmp_emit_one(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     var op = gisel_op(isel, i);
     if (op == GISEL_S_ADD_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_ADD_I32); }
     if (op == GISEL_S_SUB_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_SUB_I32); }
@@ -7197,6 +7248,11 @@ fn _cmp_emit_one(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     }
     if (op == GISEL_V_CVT_F32_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_I32); }
     if (op == GISEL_V_CVT_I32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F32); }
+    if (op == GISEL_V_MUL_LO_U32) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32);
+    }
+    if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, buf, pos); }
+    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     return 0 - CMP_ERR_UNSUPPORTED_OP;
@@ -7205,11 +7261,12 @@ fn _cmp_emit_one(m, isel, i, alloc, isvgpr, buf, pos): i64 {
 # ================================================================
 # Driver
 # ================================================================
-# Encode the selected-instruction list `isel` (n_isel instrs) over the MIR `m`
-# and the regalloc map `alloc`, writing the ISA byte stream into `buf` starting
-# at `pos`. Returns the end byte position or a negative error. The caller appends
-# gfx9_emit_prefetch_pad to the returned position.
-fn gfx9_emit_program(m, isel, n_isel, alloc, buf, pos): i64 {
+# Encode the selected-instruction list `isel` (n_isel instrs) over the MIR `m`,
+# the regalloc map `alloc`, and the ABI descriptor `abi` (for binding→SGPR on FLAT
+# ops), writing the ISA byte stream into `buf` starting at `pos`. Returns the end
+# byte position or a negative error. The caller appends gfx9_emit_prefetch_pad to
+# the returned position.
+fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
     var cap_ids = load64(m + 64);
     if (cap_ids > RA_MAX_REGS) { return 0 - CMP_ERR_TOO_MANY_IDS; }
     var isvgpr[2048];   # per-id file-map: 1 = the value lives in a VGPR
@@ -7227,7 +7284,7 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, buf, pos): i64 {
     var p = pos;
     i = 0;
     while (i < n_isel) {
-        var rc = _cmp_emit_one(m, isel, i, alloc, &isvgpr, buf, p);
+        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p);
         if (rc < 0) { return rc; }
         p = rc;
         i = i + 1;

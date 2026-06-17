@@ -264,8 +264,32 @@ for the immediate forward pointer.
   GlobalInvocationId ABI layout (user_sgpr, bases, binding/builtin resolution).
   Adversarially reviewed (workflow).
 
+### Fixed — N.5b-1 adversarial review (1 confirmed LOW, fixed pre-merge)
+- **`gfx9_rsrc1` SGPRS 4-bit field silently wrapped past 120 SGPRs.** `(sgprs &
+  0xF) << 6` masked an overflow to a too-small allocation (`sgpr_hw=128` →
+  SGPRS=0 = 8 SGPRs) instead of failing. Not currently reachable (no driver feeds
+  large counts yet; GFX9 HW caps near 104 SGPRs) — defense-in-depth before the
+  N.6 driver. `gfx9_rsrc1` now returns `-ABI_ERR_SGPR_OVERFLOW` /
+  `-ABI_ERR_VGPR_OVERFLOW` on a field overflow; regression-tested (`rsrc1(4,120)`
+  ok, `rsrc1(4,128)` / `rsrc1(300,20)` fail loud). (Noted for follow-up:
+  `gfx9_regalloc` validates the SGPR cap against `RA_MAX_REGS`=256, the VGPR file
+  size, not the ~104 GFX9 SGPR limit.)
+
+### Added — Phase N.5b-2 (FLAT load/store + VOP3 mul encode)
+- `src/gfx9_compile.cyr` — `gfx9_emit_program` now takes the `abi` descriptor and
+  encodes `GISEL_GLOBAL_LOAD`/`_STORE` (FLAT **SADDR form**: the binding's
+  USER_DATA base SGPR pair as `saddr` + the per-lane byte-offset VGPR as `vaddr` —
+  no SGPR→VGPR move or 64-bit add for the divergent-offset case) and
+  `GISEL_V_MUL_LO_U32` (VOP3 two-source, the `idx*stride` offset multiply; VOP3
+  has no literal form, so an out-of-inline-range constant fails loud).
+- `src/gfx9_encode.cyr` — `GFX9_FLAT_GLOBAL_LOAD_DWORD`=0x14 +
+  `GFX9_VOP3_V_MUL_LO_U32`=0x285 (llvm-mc-verified).
+- `tests/tcyr/compiler.tcyr` +10 asserts: a load→mul→store program byte-matching
+  llvm-mc gfx900 (binding 0→`s0`, binding 1→`s2` via the ABI). Adversarially
+  reviewed (workflow). (`GISEL_EXTRACT` builtin resolution stays N.5c.)
+
 ### Changed
-- **Toolchain pin → `cyrius = "6.2.16"`** (tracking upstream; was 6.2.15).
+- **Toolchain pin → `cyrius = "6.2.17"`** (tracking upstream; was 6.2.15).
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
   `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
   `gfx9_waitcnt.cyr` / `gfx9_abi.cyr` / `gfx9_compile.cyr` (after
@@ -276,12 +300,13 @@ for the immediate forward pointer.
   is `m`, not `mod`.
 
 ### Next
-- N.5b-2 — FLAT load/store (SADDR form: per-lane offset VGPR + binding's
-  USER_DATA base SGPR) + VOP3 `v_mul_lo_u32` encode + `GISEL_EXTRACT` builtin
-  resolution, all through the N.5b-1 ABI. Then N.5c (SAXPY first oracle: full
-  `gfx9_compile` SPIR-V→ISA), N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3),
-  N.5f (64-bit carry + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP
-  exit). Per the 2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne
+- N.5c — SAXPY first oracle: the top-level `gfx9_compile` driver
+  (validate→lower→uniformity→isel→regalloc→abi→waitcnt→emit→pad) +
+  `GISEL_EXTRACT` builtin resolution + the GlobalInvocationId-vs-LocalInvocationId
+  index decision, compiled from a SAXPY SPIR-V fixture to an ISA byte stream +
+  RSRC descriptor. Then N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3), N.5f
+  (64-bit carry + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP exit).
+  Per the 2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne
   pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16

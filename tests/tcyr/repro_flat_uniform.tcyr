@@ -1,0 +1,77 @@
+object;
+
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# Reproduce the claimed FLAT-uniform-operand bug at the encode-stage level.
+# A uniform store value / uniform offset lives in the SGPR file (selected as an
+# S_* op -> gisel_writes_vgpr == 0 -> SGPR), so its physical register number is
+# an SGPR index. The FLAT emitter places it via raw gfx9_reg into the VGPR
+# field (vaddr / data) — no _cmp_resolve file check.
+#
+# Program:
+#   [0] s_mul_i32 s7, s5, s6     uniform offset off_id = %10 -> s7
+#   [1] s_add_i32 s8, s5, s6     uniform value  val   = %12 -> s8
+#   [2] global_load_dword  vdst=%11(v2), off=%10 (uniform s7!), binding 0 -> saddr s0
+#   [3] global_store_dword off=%10 (uniform s7!), val=%12 (uniform s8!), binding 1 -> saddr s2
+#   [4] s_endpgm
+fn test_repro() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 8, 4, 30, 30);
+    _mir_set_val(&m, 5, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
+    mir_set_bufvar(&m, 13, 0);
+    mir_set_bufvar(&m, 14, 1);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_S_MUL_I32, 10, 5, 6, 0, 0);
+    _gisel_emit(&isel, 1, GISEL_S_ADD_I32, 12, 5, 6, 0, 0);
+    _gisel_emit(&isel, 2, GISEL_GLOBAL_LOAD, 11, 10, 0, 0, 0);
+    _gisel_emit(&isel, 3, GISEL_GLOBAL_STORE, 0, 10, 0, 12, 1 << 8);
+    _gisel_emit(&isel, 4, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 5 * 16, 5);
+    store64(&alloc + 6 * 16, 6);
+    store64(&alloc + 10 * 16, 7);    # off_id -> s7
+    store64(&alloc + 11 * 16, 2);    # load dst -> v2
+    store64(&alloc + 12 * 16, 8);    # val -> s8
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 5, &alloc, &abi, &built, 0);
+    # If this fails loud (negative) the bug is masked. Assert it does NOT.
+    assert_eq(endp >= 0, 1, "emit_program did NOT fail loud on uniform FLAT operands");
+    # SOP2 s_mul (4B) + SOP2 s_add (4B) = 8 bytes; then load lo@8 hi@12,
+    # store lo@16 hi@20.
+    var load_hi = load32(&built + 12);
+    var store_hi = load32(&built + 20);
+    # CORRECT behavior would require materializing the uniform offset into a VGPR
+    # (s_mul should never have been chosen for an address operand) OR rejecting it.
+    # The BUG places the SGPR NUMBER directly into the VGPR vaddr/data fields:
+    #   load_hi  vaddr field (bits 0-7) == 7  (s7 mis-encoded as v7)
+    #   store_hi vaddr field (bits 0-7) == 7  (s7 mis-encoded as v7)
+    #   store_hi data  field (bits 8-15) == 8 (s8 mis-encoded as v8)
+    assert_eq(load_hi & 0xFF, 7, "BUG: load vaddr field = 7 (SGPR s7 in VGPR slot)");
+    assert_eq(store_hi & 0xFF, 7, "BUG: store vaddr field = 7 (SGPR s7 in VGPR slot)");
+    assert_eq((store_hi >> 8) & 0xFF, 8, "BUG: store data field = 8 (SGPR s8 in VGPR slot)");
+    # And the saddr field is still correct (binding base): load saddr=0, store saddr=2.
+    assert_eq((load_hi >> 16) & 0x7F, 0, "load saddr = s0 (binding 0)");
+    assert_eq((store_hi >> 16) & 0x7F, 2, "store saddr = s2 (binding 1)");
+    # The full wrong dwords claimed:
+    assert_eq(load_hi, 0x02000007, "BUG: full load_hi dword (vaddr=v7 instead of using s7)");
+    assert_eq(store_hi, 0x00020807, "BUG: full store_hi dword (vaddr=v7, data=v8)");
+    return 0;
+}
+
+fn main(): i64 {
+    test_repro();
+    return 0;
+}
