@@ -453,14 +453,185 @@ hand-authored shaders stay as oracle + fallback.
   decoration table (27 asserts on a typed-module fixture). Pure CPU.
   **3.2.5 content (N.0 + N.1) is COMPLETE** — ready to cut on the maintainer's
   word. Next phase: N.2 (MIR + uniformity lowering) at 3.2.6.
-- [ ] **N.2** *(3.2.6)* — MIR + uniformity lowering (`src/mir.cyr`,
-  `src/spirv_lower.cyr`).
-- [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
-  (`src/gfx9_isel.cyr`).
-- [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,
-  fail-loud over cap; ABI-reservation first).
-- [ ] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + recompile the
-  downsample shader from SPIR-V and byte-match it** on Cezanne. MVP exit.
+- [~] **N.2** *(3.2.6)* — MIR + uniformity lowering. Design via a 3-lens panel +
+  synthesis (workflow). **N.2a done (2026-06-16):** `src/mir.cyr` — the SSA IR
+  data model (a MirMod header over four caller-provided, `<id>`-indexed buffers:
+  values / instructions / access side-table / blocks; operands stored as SPIR-V
+  `<id>`s for 1:1 SSA), builders + accessors, type distillation (`_mir_lower_type`:
+  i32/u32/f32/vec2-4, non-32-bit → UNSUPPORTED), and the **GFX9 uniformity pass**
+  (`_mir_meet` + seed + single forward sweep — UNIFORM→SGPR/SALU vs
+  DIVERGENT→VGPR/VALU). 87 asserts incl. the `_mir_meet` truth table + a
+  SAXPY-shape hand-built MIR proving every value's class + immediate-operand skip
+  + the cap/id-OOR error paths. Pure CPU, no SPIR-V walk (testable in isolation).
+  **Adversarial review (workflow): 5 confirmed findings, all fixed pre-merge** —
+  synth-id headroom/OOB (split `cap_ids` from `id_bound`), `mir_set_*` + 
+  `mir_add_ptr` bounds/sentinel guards, and `_mir_lower_type` unbounded recursion
+  + vector-of-vector corruption (require scalar vector component); regression
+  asserts added.
+  **N.2b-1 done (2026-06-16):** `src/spirv_lower.cyr` — the SPIR-V-module→MIR walk
+  for the NON-MEMORY subset + the BuiltIn-resolution gap-closing pass the N.1b
+  parser does not provide (`_spirv_resolve_builtins`). `spirv_lower_module`
+  validates the entry point, seeds globals (constants + StorageBuffer/Uniform/
+  PushConstant vars → BUFVAR, Input+BuiltIn vars → BUILTIN), walks the entry
+  function body dispatching ALU (IADD/ISUB/IMUL/SHL/SHR/AND/OR/XOR/FADD/FSUB/FMUL),
+  conversions, OpCompositeExtract, the builtin OpLoad alias, and OpReturn, then
+  runs the uniformity sweep. Control flow → `LOWER_ERR_CONTROL_FLOW`, unmapped →
+  `MIR_ERR_UNSUPPORTED_OP`, no entry → `LOWER_ERR_NO_ENTRY` (all fail loud). 33
+  asserts: a GlobalInvocationId-arithmetic kernel lowered end-to-end (builtin
+  resolve + load-alias + extract + ALU + uniformity), the StorageBuffer seed
+  path, and the 3 fail-loud negatives.
+  **Adversarial review (workflow): 9 confirmed findings, all fixed pre-merge** —
+  the untrusted-id OOB class (a controlled-offset OOB *write* via the
+  `OpDecorate BuiltIn` target + wild OOB *reads* from operand / result-type /
+  load-source / seed-var ids: `spirv_validate_stream` never bounds in-instruction
+  ids, and the lowering indexed tables with them) and a silent empty-body
+  success; all now bound-checked / fail-loud, with 5 crafted-module regression
+  asserts.
+  **N.2b-2 done (2026-06-16):** the buffer memory path. `_spirv_lower_access_chain`
+  (MVP shape pointer→struct{runtimearray<scalar>}, 2 indices) records a
+  `(binding, byte-offset)` access in the ptr side-table — a constant array index
+  folds to `const_off` (overflow-guarded `civ > 0x7FFFFFFF/stride`), a dynamic
+  index emits a synth `IMUL(index, stride)`; `OpLoad`/`OpStore` of the pointer
+  emit `MIR_OP_LOAD`/`STORE`. 40 asserts: the **full SAXPY** (`y[gid.x] =
+  a*x[gid.x] + y[gid.x]`) lowered end-to-end — 9-instr stream, the 2 ptr records
+  + bindings, and every value's uniformity (GID-indexed loads + arithmetic all
+  divergent) — plus access-chain variants (const-index fold, offset overflow,
+  bad member). **Adversarial review (workflow): 2 confirmed findings, both fixed
+  pre-merge** — vec3/non-scalar element stride miscomputation (now requires a
+  scalar element, fail-loud) and a constant array index not validated as an
+  integer (now requires i32/u32, fail-loud); regression asserts added. The
+  binding-range and dynamic-offset-range checks remain flagged N.6/audit gates.
+  **N.2 is COMPLETE.**
+  **Next:** N.3 (instruction selection, `src/gfx9_isel.cyr`) for 3.2.6.
+- [~] **N.3** *(3.2.6, 2026-06-16)* — Instruction selection (`src/gfx9_isel.cyr`).
+  `gfx9_isel` walks the MIR and selects one abstract GFX9 op (`GISEL_*`) per
+  instruction over VIRTUAL registers (= MIR SSA ids; N.4 assigns physical regs).
+  The load-bearing SALU-vs-VALU choice falls out of the N.2 uniformity: integer
+  ops pick `S_*` (uniform) / `V_*` (divergent), float ops are always VALU;
+  load/store carry the ptr-table index + binding, RET → `S_ENDPGM`. No
+  class-coercion copies (the straight-line uniformity guarantees compatible
+  operand classes; constant-bus cases are N.8). 41 asserts: the SALU/VALU
+  op-selection table, the **SAXPY** and **gid** kernels selected end-to-end
+  (proving uniform `1<<2` → `S_LSHL_B32` vs divergent `i*4` → `V_MUL_LO_U32`,
+  the f32 ALU → VALU, load/store binding flow), + cap/unsupported negatives.
+  **Adversarial review (workflow): 2 confirmed findings, both fixed pre-merge** —
+  the integer path silently picked SALU for a result-less op (vals[0] sentinel)
+  and for an UNKNOWN-uniformity result (sweep not run); both now fail loud,
+  regression-tested. **Next:** N.4 (register allocation + `s_waitcnt`) for 3.2.7.
+- [x] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt`. **N.4a done
+  (2026-06-17):** `src/gfx9_regalloc.cyr` — linear-scan allocation of the N.3
+  virtual regs (MIR SSA ids) to physical VGPR/SGPR. Two independent files keyed
+  by N.2 uniformity (UNIFORM→SGPR, DIVERGENT→VGPR); per-register "free-at" reuse
+  (a freed VGPR is reclaimed by a later divergent value — the reuse the
+  downsample byte-match needs); ABI-reserved registers skipped via caller
+  `sgpr_base`/`vgpr_base` (USER_DATA+TGID, v0=LID); NO SPILL → fail loud over the
+  file cap; VGPR/SGPR high-water marks for RSRC1 (N.6). Only SSA results are
+  allocated (constants inline, builtins/buffers ABI/binding). 18 asserts: the
+  **gid** kernel allocated exactly (incl. `%14` reclaiming `%12`'s freed `v1`,
+  the uniform `1<<2` → `s8`), the **SAXPY** (7 divergent values reuse into v1-v4,
+  high-water 5, no SGPR use), and the VGPR-overflow / cap-too-large fail-louds.
+  **Adversarial review (workflow): 1 confirmed HIGH, fixed** — a float/CVT op
+  (always VALU) with a uniform result was misfiled into an SGPR; the file now
+  follows the selected op class (`gisel_writes_vgpr`), not uniformity (a uniform
+  value in a VGPR feeding a later SALU op is the N.8 operand-coercion case).
+  **N.4b done (2026-06-17):** `src/gfx9_waitcnt.cyr` — splices `s_waitcnt` so no
+  instruction reads a still-outstanding memory result (async loads = garbage if
+  read early; the compiler's top-tier correctness risk). Use-before-wait is
+  **impossible by construction**: `vmcnt(0)` (0x0F70) before the first consumer of
+  an outstanding load, `vmcnt(0) lgkmcnt(0)` (0x0070) before `s_endpgm` if any
+  memory op ran — the hand-authored downsample pattern (for the N.5 byte-match).
+  MVP = conservative (a use waits for ALL outstanding loads; per-load count is
+  N.8). New `GISEL_S_WAITCNT`; runs on the isel list independently of regalloc.
+  17 asserts incl. a `_wc_check_invariant` walker that proves no output instr
+  reads an un-waited load. **Adversarial review (workflow): clean (1 candidate,
+  0 confirmed).** **N.4 COMPLETE.**
+- [~] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + the downsample bring-up
+  oracle.** Scoped 2026-06-17 (user, [[project_n5_saxpy_first_proven_equiv]]):
+  the downsample needs 5 isel/ABI features the gid/SAXPY-built pipeline lacks
+  (VOP3 fusion, 64-bit carry, SGPR→VGPR moves, builtin→ABI-SGPR,
+  binding→USER_DATA), so the arc grows to absorb them — **SAXPY is the first
+  oracle** (intermediate milestone, green gates throughout) and the downsample
+  stays the **named** MVP exit (N.5g) as **proven-equivalent + Cezanne
+  pixel-match** (not literal byte-match). Sub-bites:
+  - [x] **N.5a (2026-06-17)** — `src/gfx9_compile.cyr` encode driver:
+    `gfx9_emit_program` walks the GISEL list + regalloc map → ISA dwords via the
+    `gfx9_encode` encoders, resolving operands to phys reg (file-map from the
+    defining op's class) / inline const / 32-bit literal. Covers SOP2 / VOP1
+    (CVT) / VOP2 (incl. rev-shift) / SOPP; fail-loud on FLAT/VOP3/EXTRACT/builtin/
+    buffer (N.5b+), the ≤1-literal rule, and a SALU-VGPR operand. Added the
+    missing SOP2/VOP2 opcodes (llvm-mc gfx900-verified). 14 asserts: a 9-instr
+    program byte-matches llvm-mc ground-truth + the fail-louds + the subtraction
+    operand-file matrix. **Adversarial review (workflow): 1 confirmed, fixed** —
+    non-commutative `v_sub` was on the commutative path and negated
+    `vgpr - const`; dedicated `_emit_vop2_sub` picks `v_sub`/`v_subrev` (new
+    opcodes) to always compute `a - b`, regression-tested 3 operand-file cases.
+  - [~] **N.5b** — FLAT load/store + VOP3 `v_mul_lo_u32` encode + `gfx9_abi.cyr`
+    (canonical ABI: builtin→v0/s6/s7, binding→USER_DATA SGPR pairs) +
+    `gfx9_rsrc1`/`gfx9_rsrc2`.
+    - [x] **N.5b-1 (2026-06-17)** — `src/gfx9_abi.cyr`: `gfx9_rsrc1`/`gfx9_rsrc2`
+      (downsample `0x2C0083`/`0x18C` + deadbeef `0x44` oracles) + `gfx9_abi_assign`
+      (binding k→`s[2k]`, WGID→`s[user_sgpr..]`, LID→`v0..`, sgpr/vgpr bases;
+      GID→-1 needs-expansion). 12 asserts. Pin bumped 6.2.15→6.2.16. Adversarial
+      review (workflow).
+    - [x] **N.5b-2 (2026-06-17)** — `gfx9_compile.cyr`: FLAT load/store (SADDR:
+      offset VGPR + binding USER_DATA base SGPR via the ABI) + VOP3
+      `v_mul_lo_u32` (0x285) + `GFX9_FLAT_GLOBAL_LOAD_DWORD` (0x14). `gfx9_emit_program`
+      gained the `abi` param. 10 asserts: load→mul→store byte-matches llvm-mc.
+      **N.5b-1 review fix folded in:** `gfx9_rsrc1` now fails loud on a VGPRS/SGPRS
+      field overflow (was a silent `& 0xF` wrap; LOW, defense-in-depth).
+      **N.5b-2 review (workflow): 3 confirmed FLAT-path gaps fixed** — the offset/
+      value operands are now checked (fail loud on const-offset `off_id`=0, on a
+      uniform/non-VGPR operand, and on an out-of-range binding; `gfx9_abi_assign`
+      caps bindings at the 16-SGPR USER_DATA limit). All latent (unwired) but go
+      live in N.5c. `GISEL_EXTRACT` builtin resolution → N.5c.
+  - [x] **N.5c (2026-06-17)** — top-level `gfx9_compile(ctx, spirv, n, isa, desc)`
+    chaining validate→tables→lower(+uniformity)→isel→abi→regalloc→waitcnt→emit→pad,
+    writing the ISA + `[isa_len,rsrc1,rsrc2,user_sgpr,num_bindings]` descriptor +
+    `_emit_extract` (LID→`v_mov` v[comp]; WGID/GID fail loud). **First end-to-end
+    oracle:** `_spv_build_saxpy_lid` (SAXPY re-indexed by LocalInvocationId) compiles
+    to a coherent ISA + descriptor (12 asserts). **Adversarial review (workflow,
+    read-only Explore agents): 1 confirmed CRITICAL, fixed** — the SPIR-V validate
+    gate used `< 0` but the gate returns positive codes, so malformed input bypassed
+    it into OOB table reads; now `!= 0` + a bad-magic regression test. GID expansion
+    → N.5c-2.
+  - [~] **N.5c-2** — GlobalInvocationId expansion + `EXTRACT(WorkgroupId)`→`s[tgid]`.
+    - [x] **N.5c-2a (2026-06-17)** — the encode/regalloc foundation: EXTRACT
+      file-class fix (`gisel_result_is_vgpr` — EXTRACT follows uniformity, used by
+      both regalloc + the encode file-map), SOP1 `s_mov` encoder, and
+      `EXTRACT(WorkgroupId)`→`s_mov` from the TGID SGPR. 9 asserts (WGID extract →
+      SGPR `s_mov`, LID extract → VGPR `v_mov`). **Adversarial review (workflow):
+      1 confirmed, fixed** — `_gisel_one` now fails loud on an UNKNOWN-uniformity
+      EXTRACT (would have mis-filed to SGPR), mirroring the N.3 ALU guard.
+    - [x] **N.5c-2b (2026-06-17)** — `_spirv_expand_gid` lowers
+      `EXTRACT(OpLoad(GID).comp)` to `wgid.comp*local_size_comp + lid.comp` (synth
+      WGID+LID builtins, `local_size` via `spirv_find_local_size` threaded down,
+      `IMUL`+`IADD`; `comp` bounded ≤2). Uniformity → uniform `s_mul` + divergent
+      `v_add`; file-class → wgid SGPR / lid VGPR. **Real GID-SAXPY compiles
+      end-to-end** + a lowering-shape test; pipeline fixtures re-indexed to LID,
+      `_spv_build_saxpy_gid` for the GID path. **Adversarial review (workflow): 2
+      confirmed (same root), fixed** — `mir_alloc_synth_id` now fails loud (`-1`)
+      at the `cap_ids` ceiling (was silent OOB), callers + `_mir_set_val` (`id<=0`)
+      guard it; regression-tested. **N.5c-2 + N.5c COMPLETE** — a divergent-index
+      compute kernel goes SPIR-V → GFX9 ISA + RSRC.
+  - [~] **N.5d** — dispatch seam.
+    - [x] **N.5d-1 (2026-06-17)** — parameterized `native_pm4_build_compute_downsample`
+      to take `rsrc1`/`rsrc2` (was hardcoded `0x2C0083`/`0x18C`), so a compiler-derived
+      RSRC flows into the dispatch packet; CPU-tested both the hand-authored + an
+      alternate RSRC flow through.
+    - [x] **N.5d-2 (2026-06-17) — HW-VERIFIED on Cezanne.** A compiled SPIR-V
+      kernel `out[lid.x] = lid.x*3+7` runs correctly on the GPU (all 8 lanes
+      7..28). `native_pm4_build_compute_generic` (generic 1-binding compute
+      composer: compiler RSRC + binding VA + NUM_THREAD) + `programs/native_spirv_
+      compute_e2e.cyr` (compile → BO → dispatch → readback) +
+      `make test-native-spirv-compute-e2e` + a CPU structural test. **The compiler
+      is HW-verified end-to-end — MVP reached.** (`_backend_native_shader_module_create`
+      slot wiring + the multi-binding/TGID generic dispatcher remain for N.6.)
+  - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL
+    ops + isel rules + 3-src encode).
+  - [ ] **N.5f** — 64-bit carry SALU (`s_add_u32`/`s_addc_u32` split) + SGPR→VGPR
+    `v_mov` materialization for FLAT addresses.
+  - [ ] **N.5g** — downsample SPIR-V → full pipeline; proven-equivalent assert +
+    `native_mipmap_e2e` pixel-match on Cezanne. **MVP exit.**
 - [ ] **N.6** *(3.2.8)* — First novel kernel (SAXPY); differential CPU oracle;
   generic dispatcher.
 - [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent

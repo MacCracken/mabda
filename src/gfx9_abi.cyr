@@ -1,0 +1,143 @@
+# @internal — GFX9 compute ABI + RSRC wiring (Phase N.5b)
+# gfx9_abi.cyr — the canonical compute ABI the SPIR-V→GFX9 compiler always emits,
+# plus the COMPUTE_PGM_RSRC1/RSRC2 dword computation from the regalloc high-water
+# marks + the ABI. This is the seam between the abstract MIR/regalloc world and
+# the hardware dispatch contract (USER_DATA layout, TGID enables, register
+# counts) that native_pm4_build_compute_* consumes.
+#
+# CANONICAL ABI (one layout for every compiled compute kernel — see
+# project_n5_saxpy_first_proven_equiv): the HW preloads, in order,
+#   USER_DATA SGPRs s0..s[user_sgpr-1] : buffer base VAs, binding k → s[2k:2k+1]
+#   TGID SGPRs      s[user_sgpr..]      : WorkgroupId .x/.y/.z (RSRC2 TGID_*_EN)
+#   v0 / v1 / v2                        : LocalInvocationId .x/.y/.z
+# So the first register the allocator may hand out is sgpr_base = user_sgpr +
+# (#tgid) and vgpr_base = (#lid). GlobalInvocationId is NOT a register — it is
+# wgid*local_size + lid, materialized by a lowering step (later sub-bite); the
+# ABI only pins the primitive builtins.
+#
+# MVP scope: 1-D dispatch (TGID_X + LID.x); the .y/.z TGID/LID detection +
+# scalar push-constant slots refine in N.5g. Pure integer math; no syscalls.
+# Included after mir.cyr (reads the value table) and before gfx9_compile.cyr
+# (which resolves binding/builtin operands through these accessors).
+
+# COMPUTE_PGM_RSRC1: the fixed FLOAT_MODE(0xC0)+DX10_CLAMP flags with the VGPRS
+# (bits 0-5) and SGPRS (bits 6-9) fields ZEROED — the per-shader register counts
+# OR in. (= GFX9_COMPUTE_PGM_RSRC1_MIN 0x2C0040 with its SGPRS=1 field cleared.)
+var GFX9_RSRC1_FLAGS = 0x2C0000;
+
+# Error codes (disjoint from the compile module's CMP_ERR_* 70-79).
+var ABI_ERR_VGPR_OVERFLOW     = 80;   # VGPRS field (6-bit) would overflow
+var ABI_ERR_SGPR_OVERFLOW     = 81;   # SGPRS field (4-bit) would overflow
+var ABI_ERR_TOO_MANY_BINDINGS = 82;   # binding VA pairs exceed the 16-SGPR USER_DATA capacity
+
+# GFX9 USER_DATA capacity: s0..s15 are HW-preloadable, so at most 8 binding VA pairs.
+var GFX9_USER_DATA_MAX = 16;
+
+# ABI descriptor record (caller buffer, 64 B): field byte offsets.
+var ABI_USER_SGPR    = 0;    # # of preloaded USER_DATA SGPRs (= 2 * #bindings)
+var ABI_NUM_BINDINGS = 8;
+var ABI_TGID_X       = 16;   # RSRC2 TGID_X_EN (0/1)
+var ABI_TGID_Y       = 24;
+var ABI_TGID_Z       = 32;
+var ABI_LID_COUNT    = 40;   # # of LocalInvocationId components (v0..)
+var ABI_SGPR_BASE    = 48;   # first allocatable SGPR (above USER_DATA + TGID)
+var ABI_VGPR_BASE    = 56;   # first allocatable VGPR (above the LID v0..)
+
+# ================================================================
+# RSRC1 / RSRC2 from the regalloc high-water marks + the ABI
+# ================================================================
+# COMPUTE_PGM_RSRC1 from the VGPR/SGPR high-water marks (max reg used + 1, incl.
+# the ABI region). VGPRS = ceil(vgpr_hw/4) - 1; SGPRS = ceil((sgpr_hw+2)/8) - 1
+# (+2 reserves VCC), floored at 1 (16 SGPRs — SGPRS=0 gives only 8, too few once
+# VCC is live; matches the hand-authored RSRC1_MIN rationale). FAIL LOUD (negative
+# error) if either field would overflow its width rather than silently masking to
+# a too-small allocation (N.5b-1 review): the SGPRS field is only 4 bits (≤128
+# SGPRs) so sgpr_hw > 120 must be rejected, not wrapped. (A correctly-bounded
+# regalloc keeps both inside range; this guards a future driver passing the wrong
+# file cap — see the regalloc SGPR-cap note in the punchlist.)
+fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
+    var vgprs = (vgpr_hw + 3) / 4;
+    if (vgprs > 0) { vgprs = vgprs - 1; }
+    var sgprs = (sgpr_hw + 2 + 7) / 8;
+    if (sgprs > 0) { sgprs = sgprs - 1; }
+    if (sgprs < 1) { sgprs = 1; }
+    if (vgprs > 0x3F) { return 0 - ABI_ERR_VGPR_OVERFLOW; }
+    if (sgprs > 0xF) { return 0 - ABI_ERR_SGPR_OVERFLOW; }
+    return GFX9_RSRC1_FLAGS | vgprs | (sgprs << 6);
+}
+
+# COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN
+# (bit 7), TGID_Y_EN (bit 8). (TGID_Z bit 9 + LDS/scratch fields are MVP-zero.)
+fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
+    var r = (user_sgpr & 0x1F) << 1;
+    if (trap != 0) { r = r | 0x40; }
+    if (tgid_x != 0) { r = r | 0x80; }
+    if (tgid_y != 0) { r = r | 0x100; }
+    return r;
+}
+
+# ================================================================
+# ABI assignment — scan the MIR for bindings + builtins, fill the descriptor
+# ================================================================
+fn gfx9_abi_assign(m, abi): i64 {
+    var cap_ids = load64(m + 64);
+    var max_binding = 0 - 1;
+    var use_tgid = 0;
+    var use_lid = 0;
+    var i = 1;
+    while (i < cap_ids) {
+        var k = mir_val_kind(m, i);
+        if (k == MIR_VK_BUFVAR) {
+            var bind = mir_val_payload(m, i);
+            if (bind > max_binding) { max_binding = bind; }
+        }
+        if (k == MIR_VK_BUILTIN) {
+            var bi = mir_val_payload(m, i);
+            if (bi == MIR_BI_WORKGROUP_ID) { use_tgid = 1; }
+            if (bi == MIR_BI_GLOBAL_INVOC_ID) {
+                use_tgid = 1;
+                use_lid = 1;
+            }
+            if (bi == MIR_BI_LOCAL_INVOC_ID) { use_lid = 1; }
+        }
+        i = i + 1;
+    }
+    var num_bindings = max_binding + 1;
+    var user_sgpr = num_bindings * 2;
+    if (user_sgpr > GFX9_USER_DATA_MAX) { return 0 - ABI_ERR_TOO_MANY_BINDINGS; }
+    var lid = 0;
+    if (use_lid != 0) { lid = 1; }
+    store64(abi + ABI_NUM_BINDINGS, num_bindings);
+    store64(abi + ABI_USER_SGPR, user_sgpr);
+    store64(abi + ABI_TGID_X, use_tgid);
+    store64(abi + ABI_TGID_Y, 0);
+    store64(abi + ABI_TGID_Z, 0);
+    store64(abi + ABI_LID_COUNT, lid);
+    store64(abi + ABI_SGPR_BASE, user_sgpr + use_tgid);
+    store64(abi + ABI_VGPR_BASE, lid);
+    return 0;
+}
+
+# ================================================================
+# Accessors + operand resolution
+# ================================================================
+fn gfx9_abi_user_sgpr(abi): i64 { return load64(abi + ABI_USER_SGPR); }
+fn gfx9_abi_num_bindings(abi): i64 { return load64(abi + ABI_NUM_BINDINGS); }
+fn gfx9_abi_tgid_x(abi): i64 { return load64(abi + ABI_TGID_X); }
+fn gfx9_abi_tgid_y(abi): i64 { return load64(abi + ABI_TGID_Y); }
+fn gfx9_abi_tgid_z(abi): i64 { return load64(abi + ABI_TGID_Z); }
+fn gfx9_abi_sgpr_base(abi): i64 { return load64(abi + ABI_SGPR_BASE); }
+fn gfx9_abi_vgpr_base(abi): i64 { return load64(abi + ABI_VGPR_BASE); }
+
+# Buffer binding k → its USER_DATA base-VA SGPR (the low half of the pair s[2k:2k+1]).
+fn gfx9_abi_binding_sgpr(abi, binding): i64 { return binding * 2; }
+
+# A primitive builtin component → its ABI register number. LocalInvocationId → a
+# VGPR (v0..); WorkgroupId → an SGPR (above USER_DATA). The CALLER picks the file
+# from the builtin code. GlobalInvocationId returns -1 (must be expanded, not a
+# single register).
+fn gfx9_abi_builtin_reg(abi, bi_code, comp): i64 {
+    if (bi_code == MIR_BI_LOCAL_INVOC_ID) { return comp; }
+    if (bi_code == MIR_BI_WORKGROUP_ID) { return load64(abi + ABI_USER_SGPR) + comp; }
+    return 0 - 1;
+}

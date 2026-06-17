@@ -1,0 +1,113 @@
+# @internal — GFX9 s_waitcnt insertion (Phase N.4b)
+# gfx9_waitcnt.cyr — inserts s_waitcnt instructions into the N.3 selected-
+# instruction list so no instruction ever reads the result of a memory op that
+# has not yet completed. GFX9 memory ops are ASYNCHRONOUS: a global_load issues
+# and returns immediately; its destination VGPR is not valid until the hardware
+# vmcnt counter (outstanding vmem ops) drains. Reading it early reads STALE /
+# GARBAGE memory — a silent data-corruption class, the top-tier correctness risk
+# of the compiler. This pass makes a use-before-wait IMPOSSIBLE BY CONSTRUCTION:
+# before the first instruction that consumes an outstanding load result it emits
+# s_waitcnt vmcnt(0), and before s_endpgm (if any memory op ran) it emits
+# s_waitcnt vmcnt(0) lgkmcnt(0) so the wave does not retire before its stores
+# (and any smem) complete. This is exactly the hand-authored downsample pattern
+# (0xBF8C0F70 after the loads, 0xBF8C0070 before the end), so the N.5 byte-match
+# oracle reproduces it.
+#
+# MVP policy = CONSERVATIVE vmcnt(0): a use of any outstanding load waits for ALL
+# outstanding vmem ops (never under-waits — correctness over a tighter count;
+# the per-load count is N.8). Tracks outstanding loads by result <id>. Runs on
+# the isel list independently of regalloc (waits carry no register, and the
+# regalloc reg-map is id-keyed so it is unaffected by the index shift). N.5 walks
+# this output and resolves regs via the regalloc map.
+#
+# Output: a NEW caller-provided buffer of 48-byte GISEL records (the input copied
+# with s_waitcnt records spliced in). gfx9_waitcnt returns the new instruction
+# count (>= 0) or a NEGATIVE error. Included after gfx9_regalloc.cyr. Pure byte
+# math; no syscalls.
+
+# s_waitcnt simm16 operands (GFX9). vmcnt is split [3:0]+[15:14]; lgkmcnt [11:8];
+# expcnt [6:4]; a maxed field means "don't care". These two match the downsample:
+var GFX9_WAITCNT_VM      = 3952;  # 0x0F70: vmcnt(0), lgkm/exp don't-care
+var GFX9_WAITCNT_VM_LGKM = 112;   # 0x0070: vmcnt(0) AND lgkmcnt(0), exp don't-care
+
+# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52).
+var WC_ERR_CAP          = 60;   # output buffer cap exceeded
+var WC_ERR_TOO_MANY_IDS = 61;   # cap_ids beyond the outstanding-tracker scratch
+
+# ================================================================
+# Helpers
+# ================================================================
+# Copy selected instruction `i` from `src` into `dst` slot `k` verbatim.
+fn _wc_copy(src, i, dst, k): i64 {
+    return _gisel_emit(dst, k, gisel_op(src, i), gisel_dst(src, i),
+    gisel_a(src, i), gisel_b(src, i), gisel_c(src, i), gisel_flags(src, i));
+}
+
+# 1 if instruction `i` reads a register operand that is an outstanding (un-waited)
+# load result; 0 otherwise. Immediate operands (flagged) and the load/store ptr
+# index are not register reads, so they never trigger a wait.
+fn _wc_uses_outstanding(src, i, outstanding): i64 {
+    var fl = gisel_flags(src, i);
+    var a = gisel_a(src, i);
+    var b = gisel_b(src, i);
+    var c = gisel_c(src, i);
+    if (a != 0) { if ((fl & MIR_FLAG_A_IMM) == 0) { if (load64(outstanding + a * 8) == 1) { return 1; } } }
+    if (b != 0) { if ((fl & MIR_FLAG_B_IMM) == 0) { if (load64(outstanding + b * 8) == 1) { return 1; } } }
+    if (c != 0) { if ((fl & MIR_FLAG_C_IMM) == 0) { if (load64(outstanding + c * 8) == 1) { return 1; } } }
+    return 0;
+}
+
+# Emit an s_waitcnt with simm `s` into `dst` slot `k` (a = simm, flagged
+# immediate so no later pass treats it as a register).
+fn _wc_emit_wait(dst, k, s): i64 {
+    return _gisel_emit(dst, k, GISEL_S_WAITCNT, 0, s, 0, 0, MIR_FLAG_A_IMM);
+}
+
+# ================================================================
+# Driver
+# ================================================================
+# Splice s_waitcnt into the selected-instruction list `in_buf` (n_in instrs) into
+# the caller buffer `out` (sized cap_out * GISEL_REC). Returns the new count or a
+# negative error.
+fn gfx9_waitcnt(m, in_buf, n_in, out, cap_out): i64 {
+    var cap_ids = load64(m + 64);
+    if (cap_ids > RA_MAX_REGS) { return 0 - WC_ERR_TOO_MANY_IDS; }
+    var outstanding[2048];   # RA_MAX_REGS (256) i64; 1 = id is an un-waited load
+    memset(&outstanding, 0, cap_ids * 8);
+    var any_vmem = 0;
+    var k = 0;
+    var i = 0;
+    while (i < n_in) {
+        var op = gisel_op(in_buf, i);
+        if (op == GISEL_S_ENDPGM) {
+            # Drain all memory before the wave retires (stores must land).
+            if (any_vmem == 1) {
+                if (k >= cap_out) { return 0 - WC_ERR_CAP; }
+                _wc_emit_wait(out, k, GFX9_WAITCNT_VM_LGKM);
+                k = k + 1;
+            }
+            if (k >= cap_out) { return 0 - WC_ERR_CAP; }
+            _wc_copy(in_buf, i, out, k);
+            k = k + 1;
+        } else {
+            # Wait before consuming an outstanding load result. vmcnt(0) clears
+            # ALL outstanding loads, so one wait covers every prior load.
+            if (_wc_uses_outstanding(in_buf, i, &outstanding) == 1) {
+                if (k >= cap_out) { return 0 - WC_ERR_CAP; }
+                _wc_emit_wait(out, k, GFX9_WAITCNT_VM);
+                k = k + 1;
+                memset(&outstanding, 0, cap_ids * 8);
+            }
+            if (k >= cap_out) { return 0 - WC_ERR_CAP; }
+            _wc_copy(in_buf, i, out, k);
+            k = k + 1;
+            if (op == GISEL_GLOBAL_LOAD) {
+                store64(&outstanding + gisel_dst(in_buf, i) * 8, 1);
+                any_vmem = 1;
+            }
+            if (op == GISEL_GLOBAL_STORE) { any_vmem = 1; }
+        }
+        i = i + 1;
+    }
+    return k;
+}

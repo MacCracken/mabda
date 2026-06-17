@@ -15,8 +15,457 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
-section when they ship.
+### Next
+- N.5g — the named MVP exit: hand-author the downsample SPIR-V, compile it through
+  the same path, and pixel-match `native_mipmap_e2e` on Cezanne (per the analysis,
+  a naive compiled downsample likely needs no new ops). N.6 — a generic
+  multi-binding/TGID compute dispatcher + the `_backend_native_shader_module_create`
+  slot wiring (so consumers compile SPIR-V through the public API). 3.2.7.
+
+## [3.2.6] — 2026-06-17
+
+**Native SPIR-V → GFX9 compute compiler — HW-verified end-to-end on Cezanne
+(Phases N.2–N.5).** Building on the N.0/N.1 foundation (3.2.5), the in-tree
+compiler now lowers a SPIR-V compute kernel all the way to GFX9 ISA + a dispatch
+descriptor and **runs it correctly on the AMD GPU**: SPIR-V parse → SSA MIR + GFX9
+uniformity → instruction selection (SALU/VALU) → linear-scan register allocation →
+`s_waitcnt` insertion → ISA encode → ABI/RSRC wiring → on-GPU dispatch. A compiled
+`out[gl_LocalInvocationID.x] = lid.x*3 + 7` produced the correct per-lane results
+on Cezanne (`native_spirv_compute_e2e`). All-CPU compiler, pure-Cyrius, no public
+API change; toolchain pin → 6.2.18 (native f32 builtins — the hand-rolled f32 asm
+shims retired). Every stage adversarially reviewed; ~20 findings fixed pre-merge.
+
+### Added — Phase N.2a (MIR data model + GFX9 uniformity pass)
+- `src/mir.cyr` — the SSA IR the SPIR-V→GFX9 compiler lowers through (stage N.2
+  of `docs/proposals/v3.2-spirv-gfx9-native-lowering.md`; design via a 3-lens
+  panel + synthesis). A `MirMod` header (80 B) wires four caller-provided,
+  `<id>`-indexed buffers — values (40 B records: kind / distilled type /
+  **uniformity** / def / payload), instructions (32 B, operands stored as SPIR-V
+  `<id>`s so the SSA graph maps 1:1), an `OpAccessChain` access side-table, and
+  blocks (one for the MVP, pre-shaped for N.7 control flow). Builders + accessors,
+  `_mir_lower_type` (i32/u32/f32 + vec2-4; non-32-bit → `MIR_T_UNSUPPORTED`), and
+  the **uniformity pass** (`_mir_meet` + a seed + single forward sweep:
+  UNIFORM→SGPR/SALU vs DIVERGENT→VGPR/VALU — constants/WorkgroupId/buffer-base
+  uniform, LocalInvocationId/GlobalInvocationId/divergent-offset-loads divergent).
+  Pure data structures; the only dependency is the read-only N.1b type-table
+  accessors, so it is testable in isolation with hand-built MIR.
+- `tests/tcyr/compiler.tcyr` +87 asserts: type-distillation matrix, the
+  `_mir_meet` truth table, builder/accessor round-trips, a SAXPY-shape hand-built
+  MIR proving every value's GFX9 uniformity + the immediate-operand skip, block /
+  synth-id helpers, the cap-exceeded / id-out-of-range error paths, plus the
+  adversarial-review regression set (below).
+
+### Fixed — N.2a adversarial review (5 confirmed findings, all fixed pre-merge)
+- **Synth-id headroom / value-table OOB:** `mir_alloc_synth_id` hands out ids ≥
+  `id_bound`, but the value-id ceiling and the vals[] capacity were both exactly
+  `id_bound` — so synth ids were unusable (rejected by `mir_emit`/`mir_add_ptr`)
+  and, via the unguarded `mir_set_*` builders, caused a 40-byte out-of-bounds
+  write. Split the ceiling from `id_bound`: `mir_mod_init` gains a `cap_ids`
+  param (vals sized `cap_ids * 40`); all value writes bound-check `cap_ids`.
+- **`_mir_set_val` / `mir_set_*` missing bounds check:** added the id-0 sentinel
+  + `cap_ids` guard the sibling builders already had (was an OOB-write gap on an
+  untrusted/synth id).
+- **`mir_add_ptr` accepted `result_id` 0:** clobbered the id-0 "no value"
+  sentinel; now rejected.
+- **`_mir_lower_type` unbounded recursion:** a crafted self-/mutually-referential
+  vector component `<id>` recursed forever (untrusted-input stack-overflow DoS).
+- **`_mir_lower_type` vector-of-vector corruption:** a nested-vector component
+  produced a bogus non-`UNSUPPORTED` type (wrong base, lane count 6). Both fixed
+  by requiring the vector component kind ∈ {INT,FLOAT,BOOL} before lowering.
+- Regression asserts for all five added to `compiler.tcyr` (`test_mir_review_n2a`
+  + a synth-id-as-result case).
+
+### Added — Phase N.2b-1 (SPIR-V → MIR lowering, non-memory subset)
+- `src/spirv_lower.cyr` — walks a validated SPIR-V compute module (via the N.1b
+  parser + tables) and builds MIR (the N.2a model). `spirv_lower_module`
+  validates the entry point, runs the **builtin-resolution gap-closing pass**
+  (`_spirv_resolve_builtins` — the N.1b parser records Binding/DescriptorSet but
+  NOT `OpDecorate BuiltIn`), seeds globals (constants → CONST; StorageBuffer/
+  Uniform/PushConstant vars → BUFVAR with binding; Input+BuiltIn vars → BUILTIN),
+  walks the entry-function body dispatching the i32/u32/f32 ALU set + conversions
+  + `OpCompositeExtract` + the builtin `OpLoad` alias + `OpReturn`, then runs the
+  N.2a uniformity sweep. Control flow → `LOWER_ERR_CONTROL_FLOW`, unmapped op →
+  `MIR_ERR_UNSUPPORTED_OP`, missing GLCompute entry → `LOWER_ERR_NO_ENTRY` (all
+  fail loud). The buffer memory path (`OpAccessChain` + buffer `OpLoad`/`OpStore`)
+  is N.2b-2 and currently fails loud. Returns 0 or a negative error.
+- `tests/tcyr/compiler.tcyr` +38 asserts: a GlobalInvocationId-arithmetic kernel
+  lowered end-to-end (builtin resolve → load-alias → extract → ALU → uniformity,
+  asserting the instruction stream + every value's class), the StorageBuffer seed
+  path (on the N.1b typed-module fixture), the three fail-loud negatives
+  (no-entry, control-flow, unmapped op), and the review-regression set (below).
+
+### Fixed — N.2b-1 adversarial review (9 confirmed findings, all fixed pre-merge)
+- **Untrusted-id out-of-bounds class (the big one).** `spirv_validate_stream`
+  checks structure but NOT that in-instruction `<id>`s are `< id_bound`, and the
+  lowering used them as raw table indices. A structurally-valid (validator-
+  passing) crafted module could drive: (a) a **controlled-offset OOB write** —
+  an `OpDecorate BuiltIn` target id into `out_bi[]`; (b) wild OOB **reads** — an
+  ALU/extract/convert operand id (via `mir_emit` → `mir_run_uniformity`'s
+  `vals[]` read), an `OpLoad` source id (`mir_val_kind`), a result-type/pointee
+  id (`_mir_lower_type` → type table), and the seed-path variable id (`deco`/
+  `out_bi` reads). Fixes: `mir_emit` now bounds non-immediate operands against
+  `cap_ids`; `_mir_lower_type` takes `id_bound` and bounds its type ids (incl.
+  the vector-component recursion); `_spirv_resolve_builtins` bounds the decorate
+  target before the store; `_spirv_lower_load` bounds the source; the seed bounds
+  the variable id + pointer-type id. All reject with a fail-loud error code.
+- **Silent empty-body success.** An entry `<id>` with no matching `OpFunction`
+  (or a body with no `OpFunctionEnd`) lowered to an empty MIR and returned OK;
+  `_spirv_lower_body` now fails loud (`LOWER_ERR_NO_ENTRY`).
+- Regression asserts for all of these added (`test_spirv_lower_n2b1_review`,
+  5 crafted-module cases proving fail-loud + no OOB).
+
+### Added — Phase N.2b-2 (SPIR-V → MIR lowering, buffer memory path) — completes N.2
+- `spirv_lower.cyr` gains the memory path. `_spirv_lower_access_chain` (MVP shape
+  pointer → struct{ runtimearray<scalar> }, exactly two indices) records a
+  `(binding, byte-offset)` access in the ptr side-table: a **constant** array
+  index folds to a `const_off` (overflow-guarded — `civ > 0x7FFFFFFF / stride`
+  → `MIR_ERR_OVERFLOW`); a **dynamic** index emits a synth `IMUL(index, stride)`
+  whose result is the offset. `_spirv_lower_load` (PTR src) and
+  `_spirv_lower_store` emit `MIR_OP_LOAD` / `MIR_OP_STORE` referencing the ptr
+  record (`a` = off_id so the uniformity sweep classifies the load; `b` = ptr
+  index). Deeper nesting / non-zero struct member / non-pointer result-type all
+  fail loud (`MIR_ERR_BAD_ACCESS_CHAIN`). The dynamic-index range-vs-array-length
+  check is flagged as an N.6 / audit gate (the runtime length is not static here).
+  The `consts` table threads back through the lowering (the access chain needs
+  the member/array-index constant values).
+- `tests/tcyr/compiler.tcyr` +42 asserts: the **full SAXPY** (`y[gid.x] =
+  a*x[gid.x] + y[gid.x]`, two StorageBuffer bindings) lowered end-to-end — the
+  9-instruction stream, the synth offset `IMUL`s, the two ptr records + bindings,
+  and every value's uniformity (GID-indexed loads + the arithmetic all divergent)
+  — plus access-chain variants (constant-index fold, offset overflow, bad member,
+  and the review-regression cases below).
+
+### Fixed — N.2b-2 adversarial review (2 confirmed findings, both fixed pre-merge)
+- **vec3 (non-scalar) element stride miscomputation:** `stride = mir_type_count
+  (elem) * 4` gives 12 for a `vec3` runtime-array element, but the buffer array
+  stride is 16 — and nothing enforced the documented scalar-element MVP. The
+  access chain now requires a scalar element (`MIR_ERR_BAD_ACCESS_CHAIN`
+  otherwise); vector/aggregate elements + the `ArrayStride` decoration are
+  deferred. (Latent: the wrong stride would become a GPU wrong-write once N.3
+  ships.)
+- **Constant array index not validated as an integer:** the const-fold path
+  checked "is it a constant?" but not "is it an integer?", so a float constant's
+  bits could be reinterpreted as the index. It now requires an i32/u32 const
+  index (`MIR_ERR_BAD_ACCESS_CHAIN` otherwise) before the overflow-guarded fold.
+- Regression asserts added (vec-element → bad-access-chain, float-index →
+  bad-access-chain, integer huge-index → overflow).
+
+### Added — Phase N.3 (GFX9 instruction selection)
+- `src/gfx9_isel.cyr` — selects one abstract GFX9 op (`GISEL_*`) per MIR
+  instruction over VIRTUAL registers (= MIR SSA `<id>`s; N.4 assigns physical
+  regs, N.5 encodes). The load-bearing **SALU-vs-VALU** choice falls out of the
+  N.2 uniformity: integer ops select the `S_*` form when the result is uniform
+  and the `V_*` form when divergent; float ops are always VALU (GFX9 has no
+  scalar f32 ALU). Load/store carry the ptr-table index + the access binding;
+  `OpReturn` → `S_ENDPGM`. No class-coercion copies — the straight-line
+  uniformity guarantees compatible operand classes (a uniform result has
+  all-uniform operands); constant-bus / multi-SGPR cases are N.8. Output is a
+  caller-provided buffer of 48-byte selected-instruction records; `gfx9_isel`
+  returns the count or a negative error.
+- `tests/tcyr/compiler.tcyr` +43 asserts: the SALU/VALU op-selection table, the
+  **SAXPY** and **gid** kernels selected end-to-end (uniform `1<<2` →
+  `S_LSHL_B32` vs divergent `i*4` → `V_MUL_LO_U32`, the f32 ALU → VALU, the
+  load/store ptr-index + binding flow), plus cap-exceeded / unsupported-op /
+  review-regression negatives.
+
+### Fixed — N.3 adversarial review (2 confirmed findings, both fixed pre-merge)
+- The integer-selection path read the result's uniformity without guarding two
+  sentinel cases, silently picking the SALU form instead of failing loud: (a) a
+  **result-less** integer ALU op (`dst` 0) read the `vals[0]` sentinel (= UNIFORM)
+  → SALU; (b) an **UNKNOWN-uniformity** result (the N.2 sweep not run / a value it
+  missed) → `div=0` → SALU for a possibly-divergent value. `_gisel_one` now
+  rejects both with `GISEL_ERR_UNSUPPORTED_OP` (defensive hardening — N.4/N.5 are
+  not wired yet, so no live miscompile, but it converts a silent mis-selection
+  into a loud error). Regression asserts added.
+
+### Added — Phase N.4a (register allocation)
+- `src/gfx9_regalloc.cyr` — linear-scan allocation of the N.3 virtual registers
+  (MIR SSA `<id>`s) to physical VGPR/SGPR numbers. Two independent files keyed by
+  the N.2 uniformity (UNIFORM → SGPR, DIVERGENT → VGPR — the scalar-vs-vector
+  decision is already made). Reuse via a per-register "free-at" step: a freed
+  VGPR is reclaimed by a later divergent value (the reuse that lets a kernel's
+  many SSA values fit a small register budget). NO SPILL — fail loud over the
+  file cap (`RA_ERR_VGPR_OVERFLOW` / `_SGPR_OVERFLOW`). ABI-fixed registers are
+  reserved by the caller via `sgpr_base`/`vgpr_base` (USER_DATA + TGID SGPRs,
+  v0 = LocalInvocationId). Emits the VGPR/SGPR high-water marks N.6 feeds into
+  RSRC1. Only SSA results are allocated (constants inline, builtins/buffers
+  ABI/binding-resolved). Returns 0 or a negative error.
+- `tests/tcyr/compiler.tcyr` +24 asserts: the **gid** kernel allocated exactly
+  (incl. `%14` reclaiming `%12`'s freed `v1` and the uniform `1<<2` → `s8`), the
+  **SAXPY** (7 divergent values reuse into v1-v4, VGPR high-water 5, no SGPR
+  use), the VGPR-overflow / cap-too-large fail-louds, and the review-regression
+  case below.
+
+### Fixed — N.4a adversarial review (1 confirmed HIGH, fixed pre-merge)
+- **VALU-op result misfiled into an SGPR.** isel always selects a VALU (`V_*`)
+  op for float / `CVT` (GFX9 has no scalar f32 ALU), but regalloc chose the
+  register file from the value's *uniformity* — so a float/CVT op with a
+  **uniform** result (e.g. `CVT_F32` of `WorkgroupId`) had its VGPR-writing
+  instruction assigned an SGPR (invalid encoding / silent corruption). The file
+  now follows the selected op's destination class (`gisel_writes_vgpr`): `S_*`
+  → SGPR, everything else with a result → VGPR. Integer ops already agreed (isel
+  picks `S_*`/`V_*` by the same uniformity). Regression: a uniform `CVT_F32`
+  result lands in a VGPR. (A uniform value held in a VGPR later feeding a SALU op
+  is the operand-class-coercion case — flagged N.8.)
+
+### Added — Phase N.4b (s_waitcnt insertion)
+- `src/gfx9_waitcnt.cyr` — splices `s_waitcnt` into the N.3 selected-instruction
+  list so no instruction reads the result of a still-outstanding memory op. GFX9
+  loads are asynchronous (the dst register is invalid until the hardware `vmcnt`
+  counter drains); reading early reads garbage — the compiler's top-tier
+  correctness risk. The pass makes a use-before-wait **impossible by
+  construction**: `vmcnt(0)` (`0x0F70`) before the first instruction that
+  consumes an outstanding load result, and `vmcnt(0) lgkmcnt(0)` (`0x0070`)
+  before `s_endpgm` whenever any memory op ran (so the wave does not retire
+  before its stores land) — exactly the hand-authored downsample pattern, for the
+  N.5 byte-match oracle. MVP policy is deliberately **conservative**: a use of any
+  outstanding load waits for *all* of them (over-waiting is safe; the danger is
+  under-waiting; the per-load count is N.8). Outstanding loads tracked by result
+  `<id>`; runs on the isel list independently of regalloc (waits carry no
+  register, the reg-map is id-keyed). New `GISEL_S_WAITCNT` op (simm in `a`,
+  flagged immediate). Returns the new count or a negative error.
+- `tests/tcyr/compiler.tcyr` +17 asserts: the **SAXPY** kernel (two loads, one
+  `vmcnt(0)` before the f32 multiply covering both loads, the drain before
+  `s_endpgm`, the exact simms), a no-memory kernel (zero waits, none before
+  `s_endpgm`), the cap-exceeded / cap_ids-too-large fail-louds, and a
+  `_wc_check_invariant` walker that **proves** no output instruction reads an
+  un-waited load. Adversarial review (workflow): clean — 1 candidate, 0 confirmed
+  (no under-wait / bounds gap survived verification).
+
+### Added — Phase N.5a (GFX9 encode driver)
+- `src/gfx9_compile.cyr` — the encode driver: walks the N.4 selected-instruction
+  (GISEL) list + the regalloc map and emits a GFX9 ISA dword stream through the
+  `gfx9_encode.cyr` encoders. `gfx9_emit_program(m, isel, n_isel, alloc, buf,
+  pos)` returns the end byte position (the caller appends the prefetch pad).
+  Resolves each operand to a physical register (regalloc map + a per-value
+  file-map keyed by the *defining op's* class via `gisel_writes_vgpr` — not
+  uniformity, the N.4a lesson), an inline constant, or a trailing 32-bit literal
+  dword. Covers the single-dword formats the current isel emits — SOP2, VOP1
+  (CVT), VOP2 (incl. the rev-operand shifts: value → `vsrc1`, amount → `src0`),
+  SOPP (`s_waitcnt`/`s_endpgm`). Fail-loud (`CMP_ERR_*`) on FLAT / VOP3 / EXTRACT
+  / builtin / buffer operands (N.5b+), the ≤1-literal-per-instruction rule, and a
+  VGPR operand handed to a SALU op.
+- `src/gfx9_encode.cyr` — added the SOP2 (`S_SUB_I32`/`S_LSHR_B32`/`S_AND_B32`/
+  `S_OR_B32`/`S_XOR_B32`) and VOP2 (`V_ADD_F32`/`V_SUB_F32`/`V_XOR_B32`/
+  `V_SUB_U32`) opcodes the full GISEL ALU set needs, each **llvm-mc gfx900
+  verified**.
+- `tests/tcyr/compiler.tcyr` +14 asserts: a self-consistent 9-instruction program
+  (SOP2 inline+const, VOP1 CVT bootstrapping a VGPR, VOP2 commutative + literal,
+  VOP2 rev-shift, SOPP) whose emitted bytes **byte-match llvm-mc gfx900
+  ground-truth**, the unsupported-op / builtin-operand / cap_ids fail-louds, and
+  the subtraction operand-file matrix below. Adversarially reviewed (workflow).
+
+### Fixed — N.5a adversarial review (1 confirmed, fixed pre-merge)
+- **Non-commutative subtraction was routed through the commutative VOP2 path and
+  silently negated.** GFX9 `v_sub` computes `src0 - vsrc1` and `vsrc1` must be a
+  VGPR, so a `divergent_var - constant` (VGPR minuend, non-VGPR subtrahend — the
+  ubiquitous `idx - 1` pattern) had its operands swapped, computing `const - var`.
+  Added a dedicated `_emit_vop2_sub` that emits `v_sub` when the subtrahend is the
+  VGPR and `v_subrev` (new opcodes `V_SUBREV_U32`=0x36 / `V_SUBREV_F32`=0x03,
+  llvm-mc-verified) when the minuend is the VGPR — both yielding `a - b`. (`ISUB`
+  was untested by the original oracle, so the path was unexercised; the fix lands
+  with a 3-case operand-file matrix for `ISUB` + `FSUB`.)
+
+### Added — Phase N.5b-1 (compute ABI + RSRC wiring)
+- `src/gfx9_abi.cyr` — the canonical compute ABI the compiler always emits, plus
+  the `COMPUTE_PGM_RSRC1`/`RSRC2` dword computation. `gfx9_rsrc1(vgpr_hw,
+  sgpr_hw)` derives the VGPRS/SGPRS fields from the regalloc high-water marks
+  (`ceil(v/4)-1`; `ceil((s+2)/8)-1` with a +2 VCC reserve, floored at SGPRS=1);
+  `gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap)` packs the dispatch enables.
+  `gfx9_abi_assign` scans the MIR for buffer bindings + builtins and fills a
+  descriptor: binding k → USER_DATA SGPR pair `s[2k:2k+1]`, `WorkgroupId` →
+  `s[user_sgpr..]` (TGID), `LocalInvocationId` → `v0..`, and the `sgpr_base`/
+  `vgpr_base` the allocator reserves above the ABI region. `GlobalInvocationId`
+  resolves to `-1` (it is `wgid*size+lid`, materialized by a later lowering step,
+  not a single register).
+- `tests/tcyr/compiler.tcyr` +12 asserts: `rsrc1(15,20)==0x2C0083` and
+  `rsrc2(6,1,1,0)==0x18C` (the HW-verified downsample values), `rsrc1(4,4)` =
+  `RSRC1_MIN`, `rsrc2(2,0,0,1)==0x44` (deadbeef), and the 2-binding +
+  GlobalInvocationId ABI layout (user_sgpr, bases, binding/builtin resolution).
+  Adversarially reviewed (workflow).
+
+### Fixed — N.5b-1 adversarial review (1 confirmed LOW, fixed pre-merge)
+- **`gfx9_rsrc1` SGPRS 4-bit field silently wrapped past 120 SGPRs.** `(sgprs &
+  0xF) << 6` masked an overflow to a too-small allocation (`sgpr_hw=128` →
+  SGPRS=0 = 8 SGPRs) instead of failing. Not currently reachable (no driver feeds
+  large counts yet; GFX9 HW caps near 104 SGPRs) — defense-in-depth before the
+  N.6 driver. `gfx9_rsrc1` now returns `-ABI_ERR_SGPR_OVERFLOW` /
+  `-ABI_ERR_VGPR_OVERFLOW` on a field overflow; regression-tested (`rsrc1(4,120)`
+  ok, `rsrc1(4,128)` / `rsrc1(300,20)` fail loud). (Noted for follow-up:
+  `gfx9_regalloc` validates the SGPR cap against `RA_MAX_REGS`=256, the VGPR file
+  size, not the ~104 GFX9 SGPR limit.)
+
+### Added — Phase N.5b-2 (FLAT load/store + VOP3 mul encode)
+- `src/gfx9_compile.cyr` — `gfx9_emit_program` now takes the `abi` descriptor and
+  encodes `GISEL_GLOBAL_LOAD`/`_STORE` (FLAT **SADDR form**: the binding's
+  USER_DATA base SGPR pair as `saddr` + the per-lane byte-offset VGPR as `vaddr` —
+  no SGPR→VGPR move or 64-bit add for the divergent-offset case) and
+  `GISEL_V_MUL_LO_U32` (VOP3 two-source, the `idx*stride` offset multiply; VOP3
+  has no literal form, so an out-of-inline-range constant fails loud).
+- `src/gfx9_encode.cyr` — `GFX9_FLAT_GLOBAL_LOAD_DWORD`=0x14 +
+  `GFX9_VOP3_V_MUL_LO_U32`=0x285 (llvm-mc-verified).
+- `tests/tcyr/compiler.tcyr` +10 asserts: a load→mul→store program byte-matching
+  llvm-mc gfx900 (binding 0→`s0`, binding 1→`s2` via the ABI). Adversarially
+  reviewed (workflow). (`GISEL_EXTRACT` builtin resolution stays N.5c.)
+
+### Fixed — N.5b-2 adversarial review (3 confirmed FLAT-path gaps, fixed pre-N.5c)
+- The FLAT emitters read the offset/value operands via raw `gfx9_reg` without
+  validating them, so three not-yet-handled shapes silently emitted wrong bytes
+  (all latent today — the pipeline is unwired — but they go live the moment N.5c
+  wires it, so hardened now). The emitters now route those operands through a
+  checked resolver + a binding range-check and **fail loud**:
+  - a **const-offset access chain** (`off_id`=0) used to encode `vaddr=v255` and
+    drop the byte offset → `CMP_ERR_FLAT_CONST_OFFSET` (the FLAT immediate-offset
+    form is a later bite);
+  - a **uniform / non-VGPR offset or store value** used to emit an SGPR index into
+    the VGPR `vaddr`/`data` field → `CMP_ERR_FLAT_NONVGPR` (SGPR→VGPR
+    materialization is a later bite);
+  - a **binding past the loaded USER_DATA region** → `CMP_ERR_BINDING_RANGE`, and
+    `gfx9_abi_assign` now rejects >8 bindings (`ABI_ERR_TOO_MANY_BINDINGS`, the
+    16-SGPR USER_DATA cap). +4 regression asserts.
+
+### Added — Phase N.5c (top-level driver + EXTRACT — the first SPIR-V→GFX9 oracle)
+- `src/gfx9_compile.cyr` — **`gfx9_compile(ctx, spirv, n, isa, desc)`**, the
+  top-level driver that chains the whole compiler over a caller-provided scratch
+  context: `spirv_validate_stream` → type/const/decoration tables →
+  `spirv_lower_module` (incl. the uniformity sweep) → `gfx9_isel` →
+  `gfx9_abi_assign` → `gfx9_regalloc` (ABI-reserved `sgpr_base`/`vgpr_base`;
+  GFX9 file caps 104/256) → `gfx9_waitcnt` → `gfx9_emit_program` →
+  `gfx9_emit_prefetch_pad`. Writes the GFX9 ISA byte stream + a
+  `[isa_len, rsrc1, rsrc2, user_sgpr, num_bindings]` descriptor; any stage's
+  negative error short-circuits.
+- `_emit_extract` — `GISEL_EXTRACT` of `LocalInvocationId.comp` → `v_mov(result,
+  v[comp])` (the HW-loaded per-lane id). `WorkgroupId`/`GlobalInvocationId` fail
+  loud (`CMP_ERR_UNSUPPORTED_BUILTIN`; the `wgid*size+lid` expansion is N.5c-2).
+- `tests/tcyr/compiler.tcyr` +12 asserts: the **`EXTRACT(LID)→v_mov v?,v0`**
+  byte-match (+ GID fail-loud), and **the first end-to-end oracle** —
+  `_spv_build_saxpy_lid` (the SAXPY fixture re-indexed by LocalInvocationId)
+  compiled through `gfx9_compile` to a coherent ISA stream (first instr the LID
+  `v_mov`, terminating `s_endpgm` + the 64-byte prefetch pad) + the right
+  descriptor (2 bindings, `user_sgpr=4`, `rsrc2=0x48` LID-only-no-TGID, RSRC1
+  FLOAT_MODE flags).
+
+### Fixed — N.5c adversarial review (1 confirmed CRITICAL, fixed pre-merge)
+- **The SPIR-V validation gate was inverted — malformed input bypassed it.**
+  `gfx9_compile` checked `spirv_validate_stream(...) < 0`, but that gate returns a
+  *positive* error code (0 = OK, 1–11 = errors), so `< 0` never fired: a bad-magic
+  / truncated / overrun module sailed past validation into the table builders
+  (which assume a validated stream) → out-of-bounds reads on untrusted input. Now
+  rejects any non-zero with `CMP_ERR_VALIDATE`; regression test added (a bad-magic
+  module is rejected, not crashed). (Caught by a read-only Explore-agent review —
+  the no-file-write rule held: zero scratch files left behind.)
+
+### Added — Phase N.5c-2a (EXTRACT file-class fix + SOP1 `s_mov` + `EXTRACT(WGID)`)
+- `src/gfx9_isel.cyr` — `gisel_result_is_vgpr(m, out, i)`: the authoritative
+  register-file of an instruction's result. For `GISEL_EXTRACT` it follows the
+  result's **uniformity** (`WorkgroupId` → SGPR, `Local`/`GlobalInvocationId` →
+  VGPR) — a builtin extract just reads that builtin's register; for every other op
+  it stays `gisel_writes_vgpr(op)`. Replaces the bare `gisel_writes_vgpr` call in
+  **both** `gfx9_regalloc` (the file decision) and `gfx9_compile`'s encode
+  file-map so the two never disagree. (`gisel_writes_vgpr` alone can't decide
+  EXTRACT — it lacks the operand.)
+- `src/gfx9_encode.cyr` — `gfx9_enc_sop1` + `GFX9_SOP1_S_MOV_B32` (llvm-mc-verified,
+  `s_mov_b32 s8,s6 = 0xBE880006`).
+- `src/gfx9_compile.cyr` — `_emit_extract` resolves `WorkgroupId.comp` →
+  `s_mov(result, s[user_sgpr+comp])` (the TGID SGPR); `LocalInvocationId.comp`
+  stays `v_mov(result, v[comp])`. `GlobalInvocationId` still fails loud (the
+  lowering expands it — N.5c-2b).
+- `tests/tcyr/compiler.tcyr` +9 asserts: a uniform WGID extract is allocated an
+  SGPR and emits `s_mov s3, s2`; a divergent LID extract is allocated a VGPR and
+  emits `v_mov v1, v0` (the file-class fix proven through regalloc + encode); plus
+  the review-regression below. All prior divergent extracts unchanged.
+
+### Fixed — N.5c-2a adversarial review (1 confirmed, fixed pre-merge)
+- **`EXTRACT` didn't fail loud on an `UNKNOWN`-uniformity result.** Its register
+  file is now decided from the result's uniformity, so an unclassified result
+  (the N.2 sweep not run / a value it missed) would be silently filed to an SGPR —
+  a LID extract that should be a VGPR would then get a `v_mov` with an SGPR dst.
+  `_gisel_one` now rejects a result-less or `MIR_UNKNOWN` EXTRACT with
+  `GISEL_ERR_UNSUPPORTED_OP`, mirroring the integer-ALU guard (N.3). Not reachable
+  in the normal `gfx9_compile` flow (uniformity always runs before isel) —
+  defensive hardening; regression test added.
+
+### Added — Phase N.5c-2b (GlobalInvocationId expansion — the real GID SAXPY compiles)
+- `src/spirv_lower.cyr` — `OpCompositeExtract` of a `GlobalInvocationId` load now
+  **expands** to `gid.comp = WorkgroupId.comp · local_size_comp +
+  LocalInvocationId.comp` (it is not a hardware register). `_spirv_expand_gid`
+  synthesizes the two primitive builtins + their extracts + an `IMUL` (by the
+  `LocalSize` dim, via `spirv_find_local_size`, default 1) + an `IADD` keeping the
+  original result `<id>`. The uniformity sweep then classifies the wgid-extract +
+  mul **UNIFORM** (→ `s_mul`) and the lid-extract + add **DIVERGENT** (→ `v_add`),
+  and the N.5c-2a file-class rule places wgid in an SGPR, lid in a VGPR — the
+  natural compute index lowering. `local_size` is threaded
+  `spirv_lower_module → _spirv_lower_body → _spirv_lower_one_instr`; the `comp`
+  is bounded ≤ 2 (vec3) before the `lsz` read (untrusted-input guard).
+- `tests/tcyr/compiler.tcyr` — the **real GlobalInvocationId-indexed SAXPY now
+  compiles end-to-end** (`test_gfx9_compile_saxpy_gid`: `rsrc2` gains `TGID_X`,
+  first two instrs the wgid `s_mov` + lid `v_mov`) and a direct lowering-shape
+  test (`test_spirv_lower_gid_expansion`: instrs 0-3 = extract/extract/imul(×64)/
+  iadd with the right builtins + uniformity). The two base fixtures
+  (`_spv_build_saxpy`, `_spv_build_gid_kernel`) were re-indexed to
+  **LocalInvocationId** so the pipeline-shape tests stay single-extract;
+  `_spv_build_saxpy_gid` re-indexes by GID for the expansion tests. **Closes
+  N.5c-2 — a divergent-index compute kernel compiles SPIR-V → GFX9 end-to-end.**
+
+### Fixed — N.5c-2b adversarial review (2 confirmed, same root, fixed pre-merge)
+- **Synth-id overflow could silently OOB-write `vals[]`.** `mir_alloc_synth_id`
+  had no `cap_ids` ceiling check, and `_spirv_expand_gid` didn't check the
+  `mir_set_builtin` returns — so with tight `cap_ids` headroom (a kernel whose
+  synth ids — 5 per GID extract + the access-chain offsets — exceed `cap_ids`) an
+  out-of-range id could be written past the value table (defended only
+  coincidentally by downstream `mir_emit` operand bounds). `mir_alloc_synth_id`
+  now returns `-1` at the ceiling; every caller (`_spirv_expand_gid`, the
+  access-chain offset) checks it; `_mir_set_val` rejects `id <= 0` (was `== 0`).
+  Regression test: a `cap_ids` too tight for the GID expansion fails loud
+  (`MIR_ERR_ID_OOR`), not a corrupt write.
+
+### Added — Phase N.5d-2 (a compiled SPIR-V kernel runs on the GPU — MVP reached)
+- **The in-tree SPIR-V→GFX9 compiler is HW-verified end-to-end on Cezanne.**
+  `programs/native_spirv_compute_e2e.cyr` hand-authors the SPIR-V for
+  `out[gl_LocalInvocationID.x] = lid.x*3 + 7` (LocalSize 8), runs it through
+  `gfx9_compile` to GFX9 ISA + an RSRC descriptor, publishes the ISA to a GTT BO,
+  dispatches one 8-thread workgroup, and reads back **all 8 lanes correct**
+  (7,10,13,16,19,22,25,28) from the GPU — per-lane arithmetic, so it cannot be a
+  constant store. `make test-native-spirv-compute-e2e`.
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_generic`: a generic
+  single-binding compute dispatch composer (the proven Cezanne scaffold with
+  parameterized RSRC1/RSRC2, binding-0 USER_DATA VA, and NUM_THREAD_X) that
+  dispatches a compiled shader rather than a hand-authored one.
+- `tests/tcyr/native.tcyr` +4 asserts: a structural CPU test that the compiler
+  RSRC, binding VA, and NUM_THREAD wire into the generic composer's PM4. (Scope:
+  1 binding, LID index, no TGID — the multi-binding/TGID generic dispatcher is
+  N.6.)
+
+### Changed — Phase N.5d-1 (dispatch seam: parameterized compute RSRC)
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_downsample` now takes
+  `rsrc1`/`rsrc2` as parameters instead of hardcoding `0x2C0083`/`0x18C`, so a
+  **compiler-derived** `gfx9_rsrc1`/`gfx9_rsrc2` can flow into the compute dispatch
+  packet (the N.5d seam). The internal mipmap caller passes the hand-authored
+  shader's values; `tests/tcyr/native.tcyr` proves an alternate (compiler-shaped)
+  RSRC flows through where the hardcode used to be. (The `_store_deadbeef` composer
+  stays fixed — it dispatches the constant test shader, not a compiled one.)
+- **Toolchain pin → `cyrius = "6.2.18"`** (tracking upstream; was 6.2.15).
+  6.2.18 lands the native-float `f32_from` / `f32_to` builtins (the f32 conversion
+  gap — `cvtsd2ss`/`cvtss2sd` on x86, `fcvt` on aarch64).
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
+  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
+  `gfx9_waitcnt.cyr` / `gfx9_abi.cyr` / `gfx9_compile.cyr` (after
+  `spirv_parse.cyr`).
+
+### Removed — f32 inline-asm shims (the 6.2.19 toolchain fold-in)
+- `src/color.cyr` — retired the three hand-rolled **x86-64 SSE2 inline-asm**
+  float shims now that the toolchain provides native-float builtins:
+  `f64_to_f32` → `f32_from`, `f32_to_f64` → `f32_to`, and `int_ratio_to_f32` →
+  `f32_from(f64_div(f64_from(n), f64_from(d)))`. The descriptive names are kept as
+  the GPU-boundary idiom (thin builtin wrappers; ~30 call sites in `color.cyr` /
+  `vertex.cyr` / `backend_native.cyr` unchanged). Byte-identical f32 output
+  (the pinned `int_ratio` / conversion vectors in `core.tcyr` pass unchanged) and
+  **`src/` now contains zero inline asm** — fully portable Cyrius, with the
+  aarch64 NEON path carried by the builtins.
+
+### Notes
+- Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
+  is `m`, not `mod`.
 
 ## [3.2.5] — 2026-06-16
 

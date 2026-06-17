@@ -270,6 +270,16 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+# N.5d: a SPIR-V kernel compiled in-tree (gfx9_compile) and dispatched on the
+# AMD GPU — the SPIR-V→GFX9 compiler's hardware bring-up oracle.
+build/native_spirv_compute_e2e: programs/native_spirv_compute_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_compute_e2e.cyr $@
+
+.PHONY: test-native-spirv-compute-e2e
+test-native-spirv-compute-e2e: build/native_spirv_compute_e2e
+	./build/native_spirv_compute_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

@@ -1,0 +1,138 @@
+# @internal — GFX9 register allocation (Phase N.4a, virtual regs → physical)
+# gfx9_regalloc.cyr — linear-scan allocation of the N.3 virtual registers (MIR
+# SSA value <id>s) to physical VGPR / SGPR numbers. Two independent register
+# files: a value's file is its N.2 uniformity (UNIFORM → SGPR, DIVERGENT → VGPR),
+# so the scalar-vs-vector decision is already made; this pass only assigns
+# numbers within each file and tracks the high-water marks N.6 feeds into RSRC1.
+#
+# Linear-scan with per-register "free-at" reuse: each physical register records
+# the step at which its current occupant dies (last_use + 1); a later value
+# claims the lowest register that is free at its definition step. So a divergent
+# value reclaims a freed VGPR (the reuse that lets the downsample's many SSA
+# values fit the hand-authored ~15-VGPR budget — the N.5 byte-match oracle).
+# MVP = NO SPILL: if a file is exhausted the compile FAILS LOUD (a wrong spill
+# beats nothing, ADR-006 spirit). ABI-fixed registers are reserved by the caller
+# via sgpr_base / vgpr_base (USER_DATA + TGID SGPRs, v0 = LocalInvocationId);
+# the allocator hands out [base, cap) so it never collides with them.
+#
+# Only SSA results are allocated. Constants are inline operands; builtins live in
+# ABI registers; buffer vars are USER_DATA VAs reached via the binding — all
+# skipped (operand uses are filtered by the immediate flags + value kind).
+#
+# `alloc` is a caller buffer of `cap_ids` 16-byte records [phys_reg, last_use]
+# (reg = -1 if unallocated); `hw` is a caller [2] = [sgpr_hw, vgpr_hw]. Returns
+# 0 or a NEGATIVE error. Included after gfx9_isel.cyr. Pure byte math.
+
+var RA_REC     = 16;    # per-id record: +0 phys_reg, +8 last_use
+var RA_HW_SGPR = 0;     # hw[] offsets
+var RA_HW_VGPR = 8;
+var RA_MAX_REGS = 256;  # free-at scratch size (the full GFX9 VGPR file)
+
+var RA_ERR_SGPR_OVERFLOW = 50;
+var RA_ERR_VGPR_OVERFLOW = 51;
+var RA_ERR_CAP_TOO_LARGE = 52;
+
+# ================================================================
+# Accessors
+# ================================================================
+fn gfx9_reg(alloc, id): i64 { return load64(alloc + id * RA_REC + 0); }
+fn gfx9_reg_lastuse(alloc, id): i64 { return load64(alloc + id * RA_REC + 8); }
+fn gfx9_hw_sgpr(hw): i64 { return load64(hw + RA_HW_SGPR); }
+fn gfx9_hw_vgpr(hw): i64 { return load64(hw + RA_HW_VGPR); }
+
+# ================================================================
+# Live-interval helpers
+# ================================================================
+# Extend value `id`'s last-use to step `i` (max). Only SSA values are tracked.
+fn _ra_use(m, alloc, op, i): i64 {
+    if (op != 0) {
+        if (mir_val_kind(m, op) == MIR_VK_SSA) {
+            if (i > load64(alloc + op * RA_REC + 8)) { store64(alloc + op * RA_REC + 8, i); }
+        }
+    }
+    return 0;
+}
+
+# Claim the lowest physical register in [base, cap) that is free at `step`
+# (free-at <= step; never-used = 0). Marks it busy until `freeat_new`. Returns
+# the register number, or -1 if the file is exhausted.
+fn _ra_claim(freeat, base, cap, step, freeat_new): i64 {
+    var r = base;
+    while (r < cap) {
+        if (load64(freeat + r * 8) <= step) {
+            store64(freeat + r * 8, freeat_new);
+            return r;
+        }
+        r = r + 1;
+    }
+    return 0 - 1;
+}
+
+# ================================================================
+# Driver
+# ================================================================
+# Allocate physical registers for every SSA result of the selected-instruction
+# list `isel` (n_isel instrs), over the MIR `m`. sgpr_base/vgpr_base = first
+# allocatable register in each file (above the ABI-reserved region);
+# sgpr_cap/vgpr_cap = file ceilings (<= RA_MAX_REGS). Writes the per-id reg into
+# `alloc` and the high-water marks into `hw`. Returns 0 or a negative error.
+fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, alloc, hw): i64 {
+    if (sgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
+    if (vgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
+    var cap_ids = load64(m + 64);
+    memset(alloc, 0xFF, cap_ids * RA_REC);   # reg = -1, last_use = -1
+    var sfreeat[2048];
+    var vfreeat[2048];
+    memset(&sfreeat, 0, 2048);
+    memset(&vfreeat, 0, 2048);
+    # Pass 1 — live intervals: a result is defined at its step; an operand use
+    # extends that operand's interval. Immediate operands (flagged) and the
+    # ptr-index of a load/store are not register uses.
+    var i = 0;
+    while (i < n_isel) {
+        var dst = gisel_dst(isel, i);
+        if (dst != 0) {
+            if (mir_val_kind(m, dst) == MIR_VK_SSA) {
+                if (i > load64(alloc + dst * RA_REC + 8)) { store64(alloc + dst * RA_REC + 8, i); }
+            }
+        }
+        var fl = gisel_flags(isel, i);
+        if ((fl & MIR_FLAG_A_IMM) == 0) { _ra_use(m, alloc, gisel_a(isel, i), i); }
+        if ((fl & MIR_FLAG_B_IMM) == 0) { _ra_use(m, alloc, gisel_b(isel, i), i); }
+        if ((fl & MIR_FLAG_C_IMM) == 0) { _ra_use(m, alloc, gisel_c(isel, i), i); }
+        i = i + 1;
+    }
+    # Pass 2 — allocate each SSA result in its file, reusing freed registers.
+    var sgpr_hw = sgpr_base;
+    var vgpr_hw = vgpr_base;
+    i = 0;
+    while (i < n_isel) {
+        var d2 = gisel_dst(isel, i);
+        if (d2 != 0) {
+            if (mir_val_kind(m, d2) == MIR_VK_SSA) {
+                var freeat_new = load64(alloc + d2 * RA_REC + 8) + 1;
+                # The file follows the SELECTED op's destination class, not the
+                # value's uniformity: a float/CVT op is always VALU (writes a
+                # VGPR) even for a uniform result, so uniformity would misfile it
+                # into an SGPR. Integer S_*/V_* already track uniformity in isel,
+                # so the two agree there. (A uniform value held in a VGPR feeding
+                # a later SALU op is the operand-class-coercion case — N.8.)
+                if (gisel_result_is_vgpr(m, isel, i) == 1) {
+                    var rv = _ra_claim(&vfreeat, vgpr_base, vgpr_cap, i, freeat_new);
+                    if (rv < 0) { return 0 - RA_ERR_VGPR_OVERFLOW; }
+                    store64(alloc + d2 * RA_REC + 0, rv);
+                    if (rv + 1 > vgpr_hw) { vgpr_hw = rv + 1; }
+                } else {
+                    var rs = _ra_claim(&sfreeat, sgpr_base, sgpr_cap, i, freeat_new);
+                    if (rs < 0) { return 0 - RA_ERR_SGPR_OVERFLOW; }
+                    store64(alloc + d2 * RA_REC + 0, rs);
+                    if (rs + 1 > sgpr_hw) { sgpr_hw = rs + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    store64(hw + RA_HW_SGPR, sgpr_hw);
+    store64(hw + RA_HW_VGPR, vgpr_hw);
+    return 0;
+}

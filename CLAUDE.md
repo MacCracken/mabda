@@ -99,7 +99,8 @@ doesn't change between paths.
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
   mirroring the `src/` domains; `make test` globs them all:
   - `core` 152 (error/color/capabilities/profiler/resource/debug/obs +
-    v3.2 TS.8b `int_ratio_to_f32` float shim)
+    `int_ratio_to_f32` / `f64_to_f32` f32 conversions — native `f32_from`/`f32_to`
+    builtins since the 6.2.18 fold-in; the former x86 SSE2 shims were retired)
   - `buffer` 53 · `compute` 26 · `texture` 207 (incl. v3.2 compressed
     format table / block math / caps gating / create dispatch) · `graphics` 61
   - `render` 122 · `backend` 424 (abstraction + wgpu FFI + dispatch mocks
