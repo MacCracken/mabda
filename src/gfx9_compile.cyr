@@ -35,6 +35,33 @@ var CMP_ERR_VOP3_LITERAL        = 76;   # a 32-bit literal operand in a VOP3 (no
 var CMP_ERR_FLAT_CONST_OFFSET   = 77;   # const-offset access chain (off_id 0); immediate-offset form is a later bite
 var CMP_ERR_FLAT_NONVGPR        = 78;   # a FLAT offset/data operand not in a VGPR (uniform → needs materialization)
 var CMP_ERR_BINDING_RANGE       = 79;   # a binding outside the loaded USER_DATA region
+var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not resolve yet (WGID/GID)
+var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
+
+# Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
+# `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
+# the per-stage tables/lists the driver fills.
+var CC_TYPES  = 0;
+var CC_CONSTS = 8;
+var CC_DECO   = 16;
+var CC_M      = 24;
+var CC_OUTBI  = 32;
+var CC_ISEL   = 40;   # selected-instruction list (>= CMP_ISEL_CAP * GISEL_REC)
+var CC_ISEL2  = 48;   # waitcnt-spliced list (same size)
+var CC_ALLOC  = 56;
+var CC_HW     = 64;
+var CC_ABI    = 72;
+
+# Compile output descriptor (caller buffer, 40 B).
+var DESC_ISA_LEN      = 0;    # ISA byte length (incl. the prefetch pad)
+var DESC_RSRC1        = 8;
+var DESC_RSRC2        = 16;
+var DESC_USER_SGPR    = 24;
+var DESC_NUM_BINDINGS = 32;
+
+var CMP_ISEL_CAP  = 128;   # max selected instrs (caller sizes isel/isel2 to match)
+var GFX9_SGPR_CAP = 104;   # GFX9 SGPR file limit (s0..s103) — the regalloc ceiling
+var GFX9_VGPR_CAP = 256;   # GFX9 VGPR file
 
 # ================================================================
 # Operand resolution
@@ -246,6 +273,20 @@ fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
 
+# GISEL_EXTRACT of a builtin component → the builtin's ABI register, moved into the
+# allocated result register. a = the builtin value, c = the component index. MVP:
+# LocalInvocationId.comp lives in v[comp] → v_mov into the result VGPR. WorkgroupId
+# / GlobalInvocationId need the uniform-SGPR / wgid*size+lid expansion (N.5c-2) and
+# fail loud here.
+fn _emit_extract(m, isel, i, alloc, abi, buf, pos): i64 {
+    var bid = gisel_a(isel, i);
+    if (mir_val_kind(m, bid) != MIR_VK_BUILTIN) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
+    var bi = mir_val_payload(m, bid);
+    if (bi != MIR_BI_LOCAL_INVOC_ID) { return 0 - CMP_ERR_UNSUPPORTED_BUILTIN; }
+    var src = gfx9_vgpr(gfx9_abi_builtin_reg(abi, MIR_BI_LOCAL_INVOC_ID, gisel_c(isel, i)));
+    return gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, gfx9_reg(alloc, gisel_dst(isel, i)), src));
+}
+
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
@@ -282,6 +323,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_V_MUL_LO_U32) {
         return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32);
     }
+    if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
     if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
     if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
@@ -321,4 +363,56 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         i = i + 1;
     }
     return p;
+}
+
+# ================================================================
+# Top-level driver: SPIR-V bytes -> GFX9 ISA + RSRC descriptor
+# ================================================================
+# Chains the whole compiler over the caller-provided context `ctx` (stage scratch
+# pointers; `m` pre-initialized): validate -> type/const/decoration tables ->
+# lower (+ uniformity) -> isel -> ABI assign -> regalloc (ABI-reserved bases) ->
+# s_waitcnt -> encode -> prefetch pad. Writes the ISA byte stream into `isa` and
+# the [isa_len, rsrc1, rsrc2, user_sgpr, num_bindings] descriptor into `desc`.
+# Returns 0 or a NEGATIVE error from whichever stage rejected the input.
+fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
+    # spirv_validate_stream returns 0 (OK) or a POSITIVE error code — the untrusted-
+    # input gate must reject any non-zero, NOT `< 0` (which never fires and would let
+    # malformed SPIR-V reach the table builders → OOB reads). (N.5c review, CRITICAL.)
+    if (spirv_validate_stream(spirv, n) != 0) { return 0 - CMP_ERR_VALIDATE; }
+    var idb = spirv_hdr_id_bound(spirv);
+    var types = load64(ctx + CC_TYPES);
+    var consts = load64(ctx + CC_CONSTS);
+    var deco = load64(ctx + CC_DECO);
+    spirv_build_type_table(spirv, n, idb, types);
+    spirv_build_const_table(spirv, n, idb, consts);
+    spirv_build_decoration_table(spirv, n, idb, deco);
+    var m = load64(ctx + CC_M);
+    var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI));
+    if (lr < 0) { return lr; }
+    var isel = load64(ctx + CC_ISEL);
+    var ni = gfx9_isel(m, isel, CMP_ISEL_CAP);
+    if (ni < 0) { return ni; }
+    var abi = load64(ctx + CC_ABI);
+    var ar = gfx9_abi_assign(m, abi);
+    if (ar < 0) { return ar; }
+    var alloc = load64(ctx + CC_ALLOC);
+    var hw = load64(ctx + CC_HW);
+    var rr = gfx9_regalloc(m, isel, ni, gfx9_abi_sgpr_base(abi), gfx9_abi_vgpr_base(abi),
+    GFX9_SGPR_CAP, GFX9_VGPR_CAP, alloc, hw);
+    if (rr < 0) { return rr; }
+    var isel2 = load64(ctx + CC_ISEL2);
+    var ni2 = gfx9_waitcnt(m, isel, ni, isel2, CMP_ISEL_CAP);
+    if (ni2 < 0) { return ni2; }
+    var ep = gfx9_emit_program(m, isel2, ni2, alloc, abi, isa, 0);
+    if (ep < 0) { return ep; }
+    ep = gfx9_emit_prefetch_pad(isa, ep);
+    var r1 = gfx9_rsrc1(gfx9_hw_vgpr(hw), gfx9_hw_sgpr(hw));
+    if (r1 < 0) { return r1; }
+    var r2 = gfx9_rsrc2(gfx9_abi_user_sgpr(abi), gfx9_abi_tgid_x(abi), gfx9_abi_tgid_y(abi), 1);
+    store64(desc + DESC_ISA_LEN, ep);
+    store64(desc + DESC_RSRC1, r1);
+    store64(desc + DESC_RSRC2, r2);
+    store64(desc + DESC_USER_SGPR, gfx9_abi_user_sgpr(abi));
+    store64(desc + DESC_NUM_BINDINGS, gfx9_abi_num_bindings(abi));
+    return 0;
 }

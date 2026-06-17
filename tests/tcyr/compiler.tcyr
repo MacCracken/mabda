@@ -1745,9 +1745,9 @@ fn test_gfx9_emit_errors() {
     var built[128];
     var abi[64];
     memset(&abi, 0, 64);
-    # an unsupported op (GISEL_EXTRACT builtin resolution lands in N.5c)
+    # an unsupported op (V_FMA_F32 is VOP3 3-src, lands in a later bite)
     var isel[120];
-    _gisel_emit(&isel, 0, GISEL_EXTRACT, 20, 5, 0, 0, 0);
+    _gisel_emit(&isel, 0, GISEL_V_FMA_F32, 20, 0, 0, 0, 0);
     assert_eq(gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0), 0 - CMP_ERR_UNSUPPORTED_OP, "unsupported op");
     # a builtin operand (ABI resolution is N.5c): bootstrap %20 as a VGPR in-list,
     # then add a builtin — the resolve of %5 fails loud.
@@ -1941,6 +1941,118 @@ fn test_gfx9_flat_review_guards() {
     return 0;
 }
 
+# N.5c: GISEL_EXTRACT of LocalInvocationId.x → v_mov result, v0 (the HW-loaded
+# per-lane id). WorkgroupId/GlobalInvocationId fail loud (expansion is N.5c-2).
+fn test_gfx9_emit_extract_lid() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_set_builtin(&m, 6, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    _mir_set_val(&m, 7, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 8, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 7 * 16, 3);
+    store64(&alloc + 8 * 16, 4);
+    var isel[120];
+    var built[64];
+    memset(&built, 0, 64);
+    # EXTRACT(LID, comp 0) -> %7 (v3): v_mov v3, v0
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 7, 5, 0, 0, MIR_FLAG_C_IMM);
+    var e = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    assert_eq(e, 4, "extract -> one v_mov dword");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (LID.x)");
+    # EXTRACT(GID) fails loud (needs wgid*size+lid expansion, N.5c-2)
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 8, 6, 0, 0, MIR_FLAG_C_IMM);
+    var e2 = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    assert_eq(e2, 0 - CMP_ERR_UNSUPPORTED_BUILTIN, "extract GID fails loud");
+    return 0;
+}
+
+# The SAXPY fixture re-indexed by LocalInvocationId (BuiltIn 27) instead of
+# GlobalInvocationId (28) — so the index IS v0 (EXTRACT(LID)→v_mov, no wgid*size+lid
+# expansion). The first-oracle end-to-end target until GID expansion lands (N.5c-2).
+fn _spv_build_saxpy_lid(buf): i64 {
+    var n = _spv_build_saxpy(buf);
+    store32(buf + 100, 27);   # OpDecorate %12 BuiltIn: GlobalInvocationId(28) -> LocalInvocationId(27)
+    return n;
+}
+
+# N.5c first oracle: compile the LID-SAXPY SPIR-V end-to-end through gfx9_compile
+# (validate→lower→isel→abi→regalloc→waitcnt→encode→pad) and verify the ISA shape +
+# RSRC descriptor. LID-only ⇒ no TGID; 2 storage bindings ⇒ user_sgpr=4.
+fn test_gfx9_compile_saxpy_lid() {
+    var buf[640];
+    var n = _spv_build_saxpy_lid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 30);
+    var outbi[256];
+    var isel[768];
+    var isel2[768];
+    var alloc[512];
+    var hw[16];
+    var abi[64];
+    var ctx[80];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    var isa[512];
+    memset(&isa, 0, 512);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "saxpy-lid compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 4, "user_sgpr = 4 (2 VA pairs)");
+    assert_eq(load64(&desc + DESC_RSRC2), 0x48, "rsrc2: user=4, trap, no TGID (LID-only)");
+    # first instruction is the EXTRACT(LID.x) -> v_mov reading v0
+    var d0 = load32(&isa + 0);
+    assert_eq((d0 >> 25) & 0x7F, 0x3F, "first instr is a VOP1 (v_mov)");
+    assert_eq(d0 & 0x1FF, 0x100, "v_mov src0 = v0 (LocalInvocationId.x)");
+    # ends with s_endpgm then the 64-byte (16x s_nop) prefetch pad
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(load32(&isa + len - 68), 0xBF810000, "s_endpgm before the prefetch pad");
+    assert_eq(load32(&isa + len - 4), 0xBF800000, "last dword is an s_nop pad");
+    # RSRC1 carries the fixed FLOAT_MODE 0xC0 + DX10_CLAMP flags (+ the reg counts)
+    var d1 = load64(&desc + DESC_RSRC1);
+    assert_eq(d1 & GFX9_RSRC1_FLAGS, GFX9_RSRC1_FLAGS, "rsrc1 has FLOAT_MODE 0xC0 + DX10_CLAMP");
+    assert_eq((d1 >> 12) & 0xFF, 0xC0, "rsrc1 FLOAT_MODE field = 0xC0");
+    return 0;
+}
+
+# N.5c review (CRITICAL): the validate gate returns POSITIVE codes, so gfx9_compile
+# must reject malformed SPIR-V with `!= 0`, not `< 0` (which never fired and let
+# bad input reach the table builders). A bad-magic module must fail loud here.
+fn test_gfx9_compile_rejects_malformed() {
+    var bad[20];
+    memset(&bad, 0, 20);
+    store32(&bad + 0, 0xDEADBEEF);   # wrong magic (not 0x07230203)
+    var ctx[80];
+    memset(&ctx, 0, 80);
+    var isa[64];
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &bad, 20, &isa, &desc), 0 - CMP_ERR_VALIDATE, "malformed SPIR-V rejected");
+    return 0;
+}
+
 # N.5b-2 review: too many buffer bindings to fit USER_DATA fails loud.
 fn test_gfx9_abi_too_many_bindings() {
     var m[80];
@@ -2040,6 +2152,9 @@ fn main(): i64 {
     test_gfx9_abi_assign();
     test_gfx9_emit_flat_vop3();
     test_gfx9_flat_review_guards();
+    test_gfx9_emit_extract_lid();
+    test_gfx9_compile_saxpy_lid();
+    test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();
     return assert_summary();
 }

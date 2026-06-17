@@ -584,8 +584,19 @@ hand-authored shaders stay as oracle + fallback.
       uniform/non-VGPR operand, and on an out-of-range binding; `gfx9_abi_assign`
       caps bindings at the 16-SGPR USER_DATA limit). All latent (unwired) but go
       live in N.5c. `GISEL_EXTRACT` builtin resolution → N.5c.
-  - [ ] **N.5c** — SAXPY first oracle: top-level `gfx9_compile` (validate→lower→
-    uniformity→isel→regalloc→abi→waitcnt→emit→pad) + byte fixture.
+  - [x] **N.5c (2026-06-17)** — top-level `gfx9_compile(ctx, spirv, n, isa, desc)`
+    chaining validate→tables→lower(+uniformity)→isel→abi→regalloc→waitcnt→emit→pad,
+    writing the ISA + `[isa_len,rsrc1,rsrc2,user_sgpr,num_bindings]` descriptor +
+    `_emit_extract` (LID→`v_mov` v[comp]; WGID/GID fail loud). **First end-to-end
+    oracle:** `_spv_build_saxpy_lid` (SAXPY re-indexed by LocalInvocationId) compiles
+    to a coherent ISA + descriptor (12 asserts). **Adversarial review (workflow,
+    read-only Explore agents): 1 confirmed CRITICAL, fixed** — the SPIR-V validate
+    gate used `< 0` but the gate returns positive codes, so malformed input bypassed
+    it into OOB table reads; now `!= 0` + a bad-magic regression test. GID expansion
+    → N.5c-2.
+  - [ ] **N.5c-2** — GlobalInvocationId expansion in the lowering (`gid.c =
+    wgid.c*local_size_c + lid.c`) + `EXTRACT(WorkgroupId)`→`s[tgid]`, so the real
+    GID-indexed SAXPY compiles. Then the dynamic-offset HW path is general.
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
     `gfx9_compile` into a BO; parameterize the PM4 composer's rsrc1/rsrc2.
   - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL

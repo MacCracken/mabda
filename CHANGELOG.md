@@ -304,6 +304,37 @@ for the immediate forward pointer.
     `gfx9_abi_assign` now rejects >8 bindings (`ABI_ERR_TOO_MANY_BINDINGS`, the
     16-SGPR USER_DATA cap). +4 regression asserts.
 
+### Added — Phase N.5c (top-level driver + EXTRACT — the first SPIR-V→GFX9 oracle)
+- `src/gfx9_compile.cyr` — **`gfx9_compile(ctx, spirv, n, isa, desc)`**, the
+  top-level driver that chains the whole compiler over a caller-provided scratch
+  context: `spirv_validate_stream` → type/const/decoration tables →
+  `spirv_lower_module` (incl. the uniformity sweep) → `gfx9_isel` →
+  `gfx9_abi_assign` → `gfx9_regalloc` (ABI-reserved `sgpr_base`/`vgpr_base`;
+  GFX9 file caps 104/256) → `gfx9_waitcnt` → `gfx9_emit_program` →
+  `gfx9_emit_prefetch_pad`. Writes the GFX9 ISA byte stream + a
+  `[isa_len, rsrc1, rsrc2, user_sgpr, num_bindings]` descriptor; any stage's
+  negative error short-circuits.
+- `_emit_extract` — `GISEL_EXTRACT` of `LocalInvocationId.comp` → `v_mov(result,
+  v[comp])` (the HW-loaded per-lane id). `WorkgroupId`/`GlobalInvocationId` fail
+  loud (`CMP_ERR_UNSUPPORTED_BUILTIN`; the `wgid*size+lid` expansion is N.5c-2).
+- `tests/tcyr/compiler.tcyr` +12 asserts: the **`EXTRACT(LID)→v_mov v?,v0`**
+  byte-match (+ GID fail-loud), and **the first end-to-end oracle** —
+  `_spv_build_saxpy_lid` (the SAXPY fixture re-indexed by LocalInvocationId)
+  compiled through `gfx9_compile` to a coherent ISA stream (first instr the LID
+  `v_mov`, terminating `s_endpgm` + the 64-byte prefetch pad) + the right
+  descriptor (2 bindings, `user_sgpr=4`, `rsrc2=0x48` LID-only-no-TGID, RSRC1
+  FLOAT_MODE flags).
+
+### Fixed — N.5c adversarial review (1 confirmed CRITICAL, fixed pre-merge)
+- **The SPIR-V validation gate was inverted — malformed input bypassed it.**
+  `gfx9_compile` checked `spirv_validate_stream(...) < 0`, but that gate returns a
+  *positive* error code (0 = OK, 1–11 = errors), so `< 0` never fired: a bad-magic
+  / truncated / overrun module sailed past validation into the table builders
+  (which assume a validated stream) → out-of-bounds reads on untrusted input. Now
+  rejects any non-zero with `CMP_ERR_VALIDATE`; regression test added (a bad-magic
+  module is rejected, not crashed). (Caught by a read-only Explore-agent review —
+  the no-file-write rule held: zero scratch files left behind.)
+
 ### Changed
 - **Toolchain pin → `cyrius = "6.2.17"`** (tracking upstream; was 6.2.15).
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
@@ -316,14 +347,13 @@ for the immediate forward pointer.
   is `m`, not `mod`.
 
 ### Next
-- N.5c — SAXPY first oracle: the top-level `gfx9_compile` driver
-  (validate→lower→uniformity→isel→regalloc→abi→waitcnt→emit→pad) +
-  `GISEL_EXTRACT` builtin resolution + the GlobalInvocationId-vs-LocalInvocationId
-  index decision, compiled from a SAXPY SPIR-V fixture to an ISA byte stream +
-  RSRC descriptor. Then N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3), N.5f
+- N.5c-2 — GlobalInvocationId expansion in the lowering (`gid.c = wgid.c *
+  local_size_c + lid.c`, the uniform `s_mul` + divergent `v_add`), so the real
+  GID-indexed SAXPY compiles (and `EXTRACT(WorkgroupId)` resolves to `s[tgid]`).
+  Then N.5d (dispatch seam: `_backend_native_shader_module_create` calls
+  `gfx9_compile` into a BO + parameterized PM4), N.5e (VOP3 add3/bfe/or3), N.5f
   (64-bit carry + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP exit).
-  Per the 2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne
-  pixel-match. 3.2.7.
+  Per the 2026-06-17 scoping: proven-equivalent + Cezanne pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 
