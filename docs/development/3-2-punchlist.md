@@ -503,8 +503,21 @@ hand-authored shaders stay as oracle + fallback.
   binding-range and dynamic-offset-range checks remain flagged N.6/audit gates.
   **N.2 is COMPLETE.**
   **Next:** N.3 (instruction selection, `src/gfx9_isel.cyr`) for 3.2.6.
-- [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
-  (`src/gfx9_isel.cyr`).
+- [~] **N.3** *(3.2.6, 2026-06-16)* — Instruction selection (`src/gfx9_isel.cyr`).
+  `gfx9_isel` walks the MIR and selects one abstract GFX9 op (`GISEL_*`) per
+  instruction over VIRTUAL registers (= MIR SSA ids; N.4 assigns physical regs).
+  The load-bearing SALU-vs-VALU choice falls out of the N.2 uniformity: integer
+  ops pick `S_*` (uniform) / `V_*` (divergent), float ops are always VALU;
+  load/store carry the ptr-table index + binding, RET → `S_ENDPGM`. No
+  class-coercion copies (the straight-line uniformity guarantees compatible
+  operand classes; constant-bus cases are N.8). 41 asserts: the SALU/VALU
+  op-selection table, the **SAXPY** and **gid** kernels selected end-to-end
+  (proving uniform `1<<2` → `S_LSHL_B32` vs divergent `i*4` → `V_MUL_LO_U32`,
+  the f32 ALU → VALU, load/store binding flow), + cap/unsupported negatives.
+  **Adversarial review (workflow): 2 confirmed findings, both fixed pre-merge** —
+  the integer path silently picked SALU for a result-less op (vals[0] sentinel)
+  and for an UNKNOWN-uniformity result (sweep not run); both now fail loud,
+  regression-tested. **Next:** N.4 (register allocation + `s_waitcnt`) for 3.2.7.
 - [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,
   fail-loud over cap; ABI-reservation first).
 - [ ] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + recompile the

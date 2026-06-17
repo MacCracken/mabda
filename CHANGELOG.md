@@ -130,18 +130,47 @@ for the immediate forward pointer.
 - Regression asserts added (vec-element → bad-access-chain, float-index →
   bad-access-chain, integer huge-index → overflow).
 
+### Added — Phase N.3 (GFX9 instruction selection)
+- `src/gfx9_isel.cyr` — selects one abstract GFX9 op (`GISEL_*`) per MIR
+  instruction over VIRTUAL registers (= MIR SSA `<id>`s; N.4 assigns physical
+  regs, N.5 encodes). The load-bearing **SALU-vs-VALU** choice falls out of the
+  N.2 uniformity: integer ops select the `S_*` form when the result is uniform
+  and the `V_*` form when divergent; float ops are always VALU (GFX9 has no
+  scalar f32 ALU). Load/store carry the ptr-table index + the access binding;
+  `OpReturn` → `S_ENDPGM`. No class-coercion copies — the straight-line
+  uniformity guarantees compatible operand classes (a uniform result has
+  all-uniform operands); constant-bus / multi-SGPR cases are N.8. Output is a
+  caller-provided buffer of 48-byte selected-instruction records; `gfx9_isel`
+  returns the count or a negative error.
+- `tests/tcyr/compiler.tcyr` +43 asserts: the SALU/VALU op-selection table, the
+  **SAXPY** and **gid** kernels selected end-to-end (uniform `1<<2` →
+  `S_LSHL_B32` vs divergent `i*4` → `V_MUL_LO_U32`, the f32 ALU → VALU, the
+  load/store ptr-index + binding flow), plus cap-exceeded / unsupported-op /
+  review-regression negatives.
+
+### Fixed — N.3 adversarial review (2 confirmed findings, both fixed pre-merge)
+- The integer-selection path read the result's uniformity without guarding two
+  sentinel cases, silently picking the SALU form instead of failing loud: (a) a
+  **result-less** integer ALU op (`dst` 0) read the `vals[0]` sentinel (= UNIFORM)
+  → SALU; (b) an **UNKNOWN-uniformity** result (the N.2 sweep not run / a value it
+  missed) → `div=0` → SALU for a possibly-divergent value. `_gisel_one` now
+  rejects both with `GISEL_ERR_UNSUPPORTED_OP` (defensive hardening — N.4/N.5 are
+  not wired yet, so no live miscompile, but it converts a silent mis-selection
+  into a loud error). Regression asserts added.
+
 ### Changed
-- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/mir.cyr` +
-  `src/spirv_lower.cyr` (after `spirv_parse.cyr` — they consume its accessors).
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
+  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` (after `spirv_parse.cyr`).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- **N.2 is complete** (MIR + uniformity + SPIR-V→MIR lowering). Next: N.3 —
-  instruction selection (`src/gfx9_isel.cyr`): MIR op + result-uniformity → GFX9
-  virtual-register instructions, driving the gfx9_encode encoders. 3.2.6.
+- N.4 — register allocation (`src/gfx9_regalloc.cyr`): virtual regs (MIR ids) →
+  physical VGPR/SGPR (linear-scan, no spill / fail-loud over cap; ABI-register
+  reservation) + `s_waitcnt` insertion. Then N.5 (encode + the downsample MVP).
+  3.2.7.
 
 ## [3.2.5] — 2026-06-16
 
