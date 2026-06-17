@@ -158,19 +158,49 @@ for the immediate forward pointer.
   not wired yet, so no live miscompile, but it converts a silent mis-selection
   into a loud error). Regression asserts added.
 
+### Added — Phase N.4a (register allocation)
+- `src/gfx9_regalloc.cyr` — linear-scan allocation of the N.3 virtual registers
+  (MIR SSA `<id>`s) to physical VGPR/SGPR numbers. Two independent files keyed by
+  the N.2 uniformity (UNIFORM → SGPR, DIVERGENT → VGPR — the scalar-vs-vector
+  decision is already made). Reuse via a per-register "free-at" step: a freed
+  VGPR is reclaimed by a later divergent value (the reuse that lets a kernel's
+  many SSA values fit a small register budget). NO SPILL — fail loud over the
+  file cap (`RA_ERR_VGPR_OVERFLOW` / `_SGPR_OVERFLOW`). ABI-fixed registers are
+  reserved by the caller via `sgpr_base`/`vgpr_base` (USER_DATA + TGID SGPRs,
+  v0 = LocalInvocationId). Emits the VGPR/SGPR high-water marks N.6 feeds into
+  RSRC1. Only SSA results are allocated (constants inline, builtins/buffers
+  ABI/binding-resolved). Returns 0 or a negative error.
+- `tests/tcyr/compiler.tcyr` +24 asserts: the **gid** kernel allocated exactly
+  (incl. `%14` reclaiming `%12`'s freed `v1` and the uniform `1<<2` → `s8`), the
+  **SAXPY** (7 divergent values reuse into v1-v4, VGPR high-water 5, no SGPR
+  use), the VGPR-overflow / cap-too-large fail-louds, and the review-regression
+  case below.
+
+### Fixed — N.4a adversarial review (1 confirmed HIGH, fixed pre-merge)
+- **VALU-op result misfiled into an SGPR.** isel always selects a VALU (`V_*`)
+  op for float / `CVT` (GFX9 has no scalar f32 ALU), but regalloc chose the
+  register file from the value's *uniformity* — so a float/CVT op with a
+  **uniform** result (e.g. `CVT_F32` of `WorkgroupId`) had its VGPR-writing
+  instruction assigned an SGPR (invalid encoding / silent corruption). The file
+  now follows the selected op's destination class (`gisel_writes_vgpr`): `S_*`
+  → SGPR, everything else with a result → VGPR. Integer ops already agreed (isel
+  picks `S_*`/`V_*` by the same uniformity). Regression: a uniform `CVT_F32`
+  result lands in a VGPR. (A uniform value held in a VGPR later feeding a SALU op
+  is the operand-class-coercion case — flagged N.8.)
+
 ### Changed
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
-  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` (after `spirv_parse.cyr`).
+  `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` (after
+  `spirv_parse.cyr`).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- N.4 — register allocation (`src/gfx9_regalloc.cyr`): virtual regs (MIR ids) →
-  physical VGPR/SGPR (linear-scan, no spill / fail-loud over cap; ABI-register
-  reservation) + `s_waitcnt` insertion. Then N.5 (encode + the downsample MVP).
-  3.2.7.
+- N.4b — `s_waitcnt` insertion (vmcnt/lgkmcnt after each memory op, before the
+  first use of its result) — its own dense correctness suite. Then N.5 (encode +
+  the downsample-from-SPIR-V byte-match MVP). 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 

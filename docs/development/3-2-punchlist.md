@@ -518,8 +518,24 @@ hand-authored shaders stay as oracle + fallback.
   the integer path silently picked SALU for a result-less op (vals[0] sentinel)
   and for an UNKNOWN-uniformity result (sweep not run); both now fail loud,
   regression-tested. **Next:** N.4 (register allocation + `s_waitcnt`) for 3.2.7.
-- [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,
-  fail-loud over cap; ABI-reservation first).
+- [~] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt`. **N.4a done
+  (2026-06-17):** `src/gfx9_regalloc.cyr` — linear-scan allocation of the N.3
+  virtual regs (MIR SSA ids) to physical VGPR/SGPR. Two independent files keyed
+  by N.2 uniformity (UNIFORM→SGPR, DIVERGENT→VGPR); per-register "free-at" reuse
+  (a freed VGPR is reclaimed by a later divergent value — the reuse the
+  downsample byte-match needs); ABI-reserved registers skipped via caller
+  `sgpr_base`/`vgpr_base` (USER_DATA+TGID, v0=LID); NO SPILL → fail loud over the
+  file cap; VGPR/SGPR high-water marks for RSRC1 (N.6). Only SSA results are
+  allocated (constants inline, builtins/buffers ABI/binding). 18 asserts: the
+  **gid** kernel allocated exactly (incl. `%14` reclaiming `%12`'s freed `v1`,
+  the uniform `1<<2` → `s8`), the **SAXPY** (7 divergent values reuse into v1-v4,
+  high-water 5, no SGPR use), and the VGPR-overflow / cap-too-large fail-louds.
+  **Adversarial review (workflow): 1 confirmed HIGH, fixed** — a float/CVT op
+  (always VALU) with a uniform result was misfiled into an SGPR; the file now
+  follows the selected op class (`gisel_writes_vgpr`), not uniformity (a uniform
+  value in a VGPR feeding a later SALU op is the N.8 operand-coercion case).
+  **N.4b (next):** `s_waitcnt` insertion (vmcnt/lgkmcnt after memory ops, before
+  the first use of the result).
 - [ ] **N.5** *(3.2.7)* — **MVP: encode + ABI wiring + recompile the
   downsample shader from SPIR-V and byte-match it** on Cezanne. MVP exit.
 - [ ] **N.6** *(3.2.8)* — First novel kernel (SAXPY); differential CPU oracle;

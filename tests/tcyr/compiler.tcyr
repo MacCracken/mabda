@@ -1419,6 +1419,124 @@ fn test_gfx9_isel_errors() {
     return 0;
 }
 
+# ================================================================
+# Phase N.4a — register allocation (gfx9_regalloc.cyr)
+# ================================================================
+# gid kernel: %12 gid.x, %13 x+1, %14 *2 (all divergent -> VGPR), %15 1<<2
+# (uniform -> SGPR). Linear-scan reuse: %12 dies after instr1, so %14 (instr2)
+# reclaims its VGPR. ABI: v0 reserved (LID), s0..s7 reserved (USER_DATA+TGID).
+fn test_gfx9_regalloc_gid() {
+    var buf[384];
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    var n = _spv_build_gid_kernel(&buf);
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_const_table(&buf, n, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "gid regalloc ok");
+    assert_eq(gfx9_reg(&alloc, 12), 1, "gid.x -> v1");
+    assert_eq(gfx9_reg(&alloc, 13), 2, "x+1 -> v2");
+    assert_eq(gfx9_reg(&alloc, 14), 1, "*2 -> v1 (reuses freed v1)");
+    assert_eq(gfx9_reg(&alloc, 15), 8, "1<<2 uniform -> s8 (sgpr_base)");
+    assert_eq(gfx9_hw_vgpr(&hw), 3, "vgpr high-water 3 (v0 reserved + v1,v2)");
+    assert_eq(gfx9_hw_sgpr(&hw), 9, "sgpr high-water 9 (s8 used)");
+    return 0;
+}
+
+fn test_gfx9_regalloc_saxpy() {
+    var buf[640];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    var n = _spv_build_saxpy(&buf);
+    _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
+    var isel[480];
+    var ic = gfx9_isel(&m, &isel, 10);
+    var alloc[512];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "saxpy regalloc ok");
+    # all 7 SSA values are divergent -> VGPRs; none uniform -> sgpr hw stays at base
+    assert_eq(gfx9_hw_sgpr(&hw), 8, "no uniform results -> sgpr hw = base");
+    assert_eq(gfx9_hw_vgpr(&hw), 5, "7 divergent values reuse into v1-v4");
+    # linear-scan reuse: off_x (%26) freed before off_y (%27); gid.x (%19) before y[i] (%23)
+    assert_eq(gfx9_reg(&alloc, 26), gfx9_reg(&alloc, 27), "off_x and off_y share a VGPR");
+    assert_eq(gfx9_reg(&alloc, 19), gfx9_reg(&alloc, 23), "gid.x and y[i] share a VGPR");
+    assert_eq(gfx9_reg(&alloc, 19), 1, "gid.x -> v1");
+    assert_eq(gfx9_reg(&alloc, 24), 4, "a*x -> v4");
+    return 0;
+}
+
+fn test_gfx9_regalloc_errors() {
+    var buf[384];
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    var isel[256];
+    var alloc[256];
+    var hw[16];
+    var n = _spv_build_gid_kernel(&buf);
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_const_table(&buf, n, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    var ic = gfx9_isel(&m, &isel, 8);
+    # vgpr_cap 2 leaves only v1 allocatable (base 1) -> the 2nd VGPR overflows
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 2, &alloc, &hw), 0 - RA_ERR_VGPR_OVERFLOW, "vgpr overflow");
+    # a cap beyond the free-at scratch limit (256) fails loud
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 300, &alloc, &hw), 0 - RA_ERR_CAP_TOO_LARGE, "cap too large");
+    return 0;
+}
+
+# review N.4a: a float/CVT op is always VALU and writes a VGPR, even when its
+# result is UNIFORM. The file must follow the op class, not the uniformity, or a
+# vector instruction's dst lands in an SGPR (invalid encoding). A CVT_F32 of a
+# uniform constant is the minimal trigger.
+fn test_gfx9_regalloc_valu_uniform() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_const(&m, 1, MIR_T_I32, 5);
+    mir_emit(&m, MIR_OP_CVT_F32, 2, MIR_T_F32, 1, 0, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 2), MIR_UNIFORM, "cvt of a const is uniform");
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    assert_eq(gisel_op(&isel, 0), GISEL_V_CVT_F32_I32, "cvt -> VALU op");
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "regalloc ok");
+    assert_eq(gfx9_reg(&alloc, 2), 1, "uniform VALU result -> VGPR v1 (not s8)");
+    assert_eq(gfx9_hw_vgpr(&hw), 2, "one VGPR used");
+    assert_eq(gfx9_hw_sgpr(&hw), 8, "no SGPR used (VALU result lives in a VGPR)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -1460,5 +1578,9 @@ fn main(): i64 {
     test_gfx9_isel_saxpy();
     test_gfx9_isel_gid_salu_valu();
     test_gfx9_isel_errors();
+    test_gfx9_regalloc_gid();
+    test_gfx9_regalloc_saxpy();
+    test_gfx9_regalloc_errors();
+    test_gfx9_regalloc_valu_uniform();
     return assert_summary();
 }
