@@ -336,11 +336,24 @@ for the immediate forward pointer.
   the no-file-write rule held: zero scratch files left behind.)
 
 ### Changed
-- **Toolchain pin → `cyrius = "6.2.17"`** (tracking upstream; was 6.2.15).
+- **Toolchain pin → `cyrius = "6.2.18"`** (tracking upstream; was 6.2.15).
+  6.2.18 lands the native-float `f32_from` / `f32_to` builtins (the f32 conversion
+  gap — `cvtsd2ss`/`cvtss2sd` on x86, `fcvt` on aarch64).
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
   `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
   `gfx9_waitcnt.cyr` / `gfx9_abi.cyr` / `gfx9_compile.cyr` (after
   `spirv_parse.cyr`).
+
+### Removed — f32 inline-asm shims (the 6.2.19 toolchain fold-in)
+- `src/color.cyr` — retired the three hand-rolled **x86-64 SSE2 inline-asm**
+  float shims now that the toolchain provides native-float builtins:
+  `f64_to_f32` → `f32_from`, `f32_to_f64` → `f32_to`, and `int_ratio_to_f32` →
+  `f32_from(f64_div(f64_from(n), f64_from(d)))`. The descriptive names are kept as
+  the GPU-boundary idiom (thin builtin wrappers; ~30 call sites in `color.cyr` /
+  `vertex.cyr` / `backend_native.cyr` unchanged). Byte-identical f32 output
+  (the pinned `int_ratio` / conversion vectors in `core.tcyr` pass unchanged) and
+  **`src/` now contains zero inline asm** — fully portable Cyrius, with the
+  aarch64 NEON path carried by the builtins.
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter

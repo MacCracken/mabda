@@ -348,68 +348,28 @@ fn color_eq(a, b): i64 {
 # ================================================================
 # GPU conversion — write color as 4x f32 to a buffer
 # ================================================================
-# wgpu expects f64 for wgpu::Color (clear colors) and f32 for vertex data.
-# f64→f32 via inline asm: cvtsd2ss (SSE2)
+# wgpu expects f64 for wgpu::Color (clear colors) and f32 for vertex data. The
+# f64↔f32 conversions use the Cyrius toolchain's native-float builtins (since
+# 6.2.18): `f32_from` (f64→f32 bits, cvtsd2ss/fcvt) and `f32_to` (f32→f64). These
+# replace the former hand-rolled x86-64 SSE2 inline-asm shims — now cross-platform
+# (the builtins carry the aarch64 NEON path too). The descriptive mabda names are
+# kept as the GPU-boundary idiom (see CLAUDE.md: "f32 at the GPU boundary").
 
-# Convert f64 bit pattern to f32 bit pattern (in low 32 bits of i64)
+# Convert an f64 bit pattern to an f32 bit pattern (in the low 32 bits).
 fn f64_to_f32(val): i64 {
-    var result = 0;
-    # movq xmm0, val; cvtsd2ss xmm0, xmm0; movd eax, xmm0; mov result, rax
-    asm {
-        # movq xmm0, [rbp-8] (val)
-        0x66; 0x48; 0x0F; 0x6E; 0x45; 0xF8;
-        # cvtsd2ss xmm0, xmm0
-        0xF2; 0x0F; 0x5A; 0xC0;
-        # movd eax, xmm0
-        0x66; 0x0F; 0x7E; 0xC0;
-        # mov [rbp-16], rax (result)
-        0x48; 0x89; 0x45; 0xF0;
-    }
-    return result;
+    return f32_from(val);
 }
 
-# Convert f32 bit pattern (low 32 bits) to f64 bit pattern
+# Convert an f32 bit pattern (low 32 bits) to an f64 bit pattern.
 fn f32_to_f64(val): i64 {
-    var result = 0;
-    # movd xmm0, eax(val); cvtss2sd xmm0, xmm0; movq result, xmm0
-    asm {
-        # mov eax, [rbp-8] (val — only low 32 bits matter)
-        0x8B; 0x45; 0xF8;
-        # movd xmm0, eax
-        0x66; 0x0F; 0x6E; 0xC0;
-        # cvtss2sd xmm0, xmm0
-        0xF3; 0x0F; 0x5A; 0xC0;
-        # movq [rbp-16], xmm0 (result)
-        0x66; 0x48; 0x0F; 0x7E; 0x45; 0xF0;
-    }
-    return result;
+    return f32_to(val);
 }
 
-# SHIM (v3.2 TS.8b) — f32 bit pattern of (double)num / (double)den.
-# Cyrius has no native float arithmetic (only the f64_to_f32 / f32_to_f64 cvt
-# shims), so the texture-blit scale (tex_dim / rt_dim) is computed via inline
-# x86-64 SSE2 here. This is a TEMPORARY mabda-side shim — the proper fix is
-# first-class float arithmetic in the Cyrius toolchain; see
-# cyrius/docs/development/proposal/2026-06-16-native-float-arithmetic.md.
-# Args: num @ [rbp-8], den @ [rbp-16]; local result @ [rbp-24] (verified by the
-# int_ratio_to_f32 CPU test — 1/1=0x3F800000, 1/2=0x3E800000, 2/64=0x3D000000).
+# f32 bit pattern of (double)num / (double)den (the texture-blit scale tex_dim /
+# rt_dim). Now expressed in native builtins: integer → f64 → divide → f32.
+# CPU-tested: 1/1=0x3F800000, 1/2=0x3F000000, 2/64=0x3D000000.
 fn int_ratio_to_f32(num, den): i64 {
-    var result = 0;
-    asm {
-        # cvtsi2sd xmm0, [rbp-8]  (xmm0 = (double)num)
-        0xF2; 0x48; 0x0F; 0x2A; 0x45; 0xF8;
-        # cvtsi2sd xmm1, [rbp-16] (xmm1 = (double)den)
-        0xF2; 0x48; 0x0F; 0x2A; 0x4D; 0xF0;
-        # divsd xmm0, xmm1        (xmm0 = num/den, double)
-        0xF2; 0x0F; 0x5E; 0xC1;
-        # cvtsd2ss xmm0, xmm0     (xmm0 = (float) result)
-        0xF2; 0x0F; 0x5A; 0xC0;
-        # movd eax, xmm0
-        0x66; 0x0F; 0x7E; 0xC0;
-        # mov [rbp-24], rax       (result)
-        0x48; 0x89; 0x45; 0xE8;
-    }
-    return result;
+    return f32_from(f64_div(f64_from(num), f64_from(den)));
 }
 
 # Write color as 4x f32 (16 bytes) to destination pointer
