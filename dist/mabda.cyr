@@ -5290,6 +5290,183 @@ fn gfx9_emit_prefetch_pad(buf, pos): i64 {
     return p;
 }
 
+# --- spirv_parse.cyr ---
+
+# @internal — SPIR-V word-stream parser (Phase N.1, the compiler's front end)
+# spirv_parse.cyr — header validation + instruction iterator + module probes
+#
+# Stage N.1 of the in-tree SPIR-V → GFX9 compute compiler
+# (docs/proposals/v3.2-spirv-gfx9-native-lowering.md). A compiler ingests
+# FULLY UNTRUSTED bytes — a consumer's toolchain produced the SPIR-V — so
+# structural validation is the first audit gate: every field is bounds-checked
+# before use, and a malformed stream is rejected (never walked into UB).
+#
+# SPIR-V is a u32 word stream (SPIR-V spec §2.3): a 5-word header
+#   [0] magic 0x07230203   [1] version   [2] generator   [3] id-bound
+#   [4] schema (reserved, 0)
+# followed by instructions, each led by a word whose low 16 bits are the opcode
+# and whose high 16 bits are the word count (INCLUDING the leading word).
+#
+# N.1a (this file's first cut) provides: header accessors, the
+# (opcode, wordcount) decode, a whole-stream validator (the rejection gate),
+# instruction counting, and entry-point / LocalSize probes. The type /
+# constant / decoration LOOKUP TABLES (the SSA model N.2 lowers from) land at
+# N.1b. Reuses MABDA_SPIRV_MAGIC + `_spirv_validate` (the Phase S header check
+# in wgpu_descriptors.cyr) — this module is included after it. Pure byte
+# walking: no syscalls, no allocation.
+
+# ================================================================
+# SPIR-V opcodes (the subset N.1 references; SPIR-V spec §3.37)
+# ================================================================
+var SPIRV_OP_MEMORY_MODEL   = 14;
+var SPIRV_OP_ENTRY_POINT    = 15;
+var SPIRV_OP_EXECUTION_MODE = 16;
+var SPIRV_OP_CAPABILITY     = 17;
+var SPIRV_OP_FUNCTION       = 54;
+var SPIRV_OP_FUNCTION_END   = 56;
+var SPIRV_OP_LABEL          = 248;
+
+# Execution model (OpEntryPoint word 1) + execution mode (OpExecutionMode word 2)
+var SPIRV_EXEC_MODEL_GLCOMPUTE = 5;
+var SPIRV_EXEC_MODE_LOCAL_SIZE = 17;
+
+# The header is 5 words (20 bytes); instructions begin at word index 5.
+var SPIRV_HEADER_WORDS = 5;
+
+# Parse result codes. Header errors 1-6 PASS THROUGH from `_spirv_validate`
+# (1 too-short, 2 unaligned, 3 bad-magic, 4 byte-swapped, 5 id-bound-bad,
+# 6 over-cap). Instruction-stream errors use a disjoint 10+ range.
+var SPIRV_PARSE_OK          = 0;
+var SPIRV_PARSE_ERR_ZERO_WC = 10;   # an instruction declared word count 0 (would not advance)
+var SPIRV_PARSE_ERR_TRUNC   = 11;   # an instruction's words run past the end of the stream
+
+# ================================================================
+# Word + instruction-header accessors
+# ================================================================
+fn spirv_word(ptr, idx): i64 {
+    return load32(ptr + idx * 4);
+}
+
+fn spirv_hdr_magic(ptr): i64 {
+    return spirv_word(ptr, 0);
+}
+
+fn spirv_hdr_version(ptr): i64 {
+    return spirv_word(ptr, 1);
+}
+
+fn spirv_hdr_generator(ptr): i64 {
+    return spirv_word(ptr, 2);
+}
+
+fn spirv_hdr_id_bound(ptr): i64 {
+    return spirv_word(ptr, 3);
+}
+
+fn spirv_hdr_schema(ptr): i64 {
+    return spirv_word(ptr, 4);
+}
+
+# Opcode = low 16 bits of an instruction's leading word.
+fn spirv_op(word0): i64 {
+    return word0 & 0xFFFF;
+}
+
+# Word count (incl. the leading word) = high 16 bits. `>>` is logical on i64
+# (feedback_cyrius_logical_right_shift) and load32 zero-extends, so no masking
+# of sign bits is needed before the &.
+fn spirv_op_wordcount(word0): i64 {
+    return (word0 >> 16) & 0xFFFF;
+}
+
+# ================================================================
+# The rejection gate — validate the WHOLE stream before any walk
+# ================================================================
+# Header via `_spirv_validate`, then every instruction: word count must be >= 1
+# (a 0 would loop forever) and the instruction's words must not run past the
+# end. Returns SPIRV_PARSE_OK or the first error encountered. Call this before
+# any of the probe/walk fns below — they assume a validated stream.
+fn spirv_validate_stream(ptr, byte_len): i64 {
+    var hv = _spirv_validate(ptr, byte_len);
+    if (hv != 0) { return hv; }
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var wc = spirv_op_wordcount(spirv_word(ptr, off));
+        if (wc == 0) { return SPIRV_PARSE_ERR_ZERO_WC; }
+        if (off + wc > total) { return SPIRV_PARSE_ERR_TRUNC; }
+        off = off + wc;
+    }
+    return SPIRV_PARSE_OK;
+}
+
+# ================================================================
+# Probes (assume a validated stream)
+# ================================================================
+# Count instructions. Self-guards: returns -1 if the stream is malformed, so it
+# is safe to call without a prior validate.
+fn spirv_count_instructions(ptr, byte_len): i64 {
+    if (spirv_validate_stream(ptr, byte_len) != 0) { return 0 - 1; }
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    var n = 0;
+    while (off < total) {
+        off = off + spirv_op_wordcount(spirv_word(ptr, off));
+        n = n + 1;
+    }
+    return n;
+}
+
+# The GLCompute entry point's target <id>, or -1 if there is no OpEntryPoint
+# with the GLCompute execution model. Layout (SPIR-V spec OpEntryPoint):
+#   word0 | ExecutionModel (word1) | entry <id> (word2) | name... | iface...
+# The wc >= 3 guard keeps the word1/word2 reads inside the instruction even if a
+# (validated-but-odd) stream carries a short OpEntryPoint.
+fn spirv_find_entry_point(ptr, byte_len): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_ENTRY_POINT) {
+            if (wc >= 3) {
+                if (spirv_word(ptr, off + 1) == SPIRV_EXEC_MODEL_GLCOMPUTE) {
+                    return spirv_word(ptr, off + 2);
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0 - 1;
+}
+
+# Find the LocalSize execution mode for `entry_id`: writes x/y/z (3 × i64) to
+# `out_xyz` and returns 1, or returns 0 (out_xyz untouched) if absent. Layout:
+#   word0 | entry <id> (word1) | mode (word2) | x (word3) y (word4) z (word5)
+# The wc >= 6 guard keeps the x/y/z reads inside the instruction.
+fn spirv_find_local_size(ptr, byte_len, entry_id, out_xyz): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_EXECUTION_MODE) {
+            if (wc >= 6) {
+                if (spirv_word(ptr, off + 1) == entry_id) {
+                    if (spirv_word(ptr, off + 2) == SPIRV_EXEC_MODE_LOCAL_SIZE) {
+                        store64(out_xyz + 0, spirv_word(ptr, off + 3));
+                        store64(out_xyz + 8, spirv_word(ptr, off + 4));
+                        store64(out_xyz + 16, spirv_word(ptr, off + 5));
+                        return 1;
+                    }
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
 # --- backend_native_shaders.cyr ---
 
 # @internal — native GPU backend, GFX9 ISA shader libraries + register addresses

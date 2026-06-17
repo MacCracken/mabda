@@ -53,6 +53,28 @@ for the immediate forward pointer.
   **before** `backend_native_shaders.cyr` (it is now the builders' dependency;
   same "no deps" tier, after `_amdgpu`).
 
+### Unblocked
+- Toolchain pin **6.2.14 → 6.2.15** (`cyrius.cyml` + CLAUDE.md): upstream 6.2.15
+  repairs the macOS benchmark-timing path and a stdlib fix. `cycc` on the dev box
+  is already 6.2.15; the full suite + smoke + dist are green on it.
+
+### Added — Phase N.1a (SPIR-V parser foundation)
+- `src/spirv_parse.cyr` — the compiler's front end (stage N.1 of
+  `docs/proposals/v3.2-spirv-gfx9-native-lowering.md`). Word/header accessors,
+  `(opcode, wordcount)` instruction decode, and `spirv_validate_stream` — the
+  UNTRUSTED-INPUT REJECTION GATE: header via the Phase S `_spirv_validate`
+  (bad-magic / short / unaligned / byte-swapped / id-bound / over-cap) plus a
+  whole-stream instruction walk that rejects a zero word count (would not
+  advance) and any instruction that runs past the end. Plus probes:
+  `spirv_count_instructions`, `spirv_find_entry_point` (GLCompute), and
+  `spirv_find_local_size`. Pure byte walking, no syscalls/alloc; included after
+  `wgpu_descriptors.cyr` so it reuses `_spirv_validate`.
+- `tests/tcyr/compiler.tcyr` +24 asserts: a hand-built minimal GLCompute module
+  fixture exercises every accessor/probe, plus **5 rejection cases** (bad magic,
+  truncated header, zero id-bound, zero word count, instruction overrun).
+- **N.1b (next):** the type / constant / decoration lookup tables — the SSA
+  module model N.2 lowers from.
+
 ### Notes
 - EXP (graphics color/pos export) and MIMG (image load/sample) dwords stay raw
   literals in the builders — the proposal scopes the compiler compute-only, so
@@ -60,14 +82,14 @@ for the immediate forward pointer.
   each affected builder; the existing byte-pinned tests still cover them.
 
 ### Metrics
-- CPU suite **2908 → 3026** assertions; **13** domain test files (new
-  `compiler.tcyr`). Bundle 16094 → **16472** lines (gfx9_encode + emit helpers;
-  the builder bodies grew slightly trading magic dwords for encoder calls).
+- CPU suite **2908 → 3050** assertions (N.0 encoder oracle +118, N.1a parser
+  +24); **13** domain test files (new `compiler.tcyr`). Bundle 16094 → **16649**
+  lines (gfx9_encode + emit helpers + spirv_parse; builder bodies trade magic
+  dwords for encoder calls).
 
 ### Next
-- N.1 — SPIR-V parser (`src/spirv_parse.cyr`): header + instruction stream +
-  type/constant/decoration tables + entry-point/exec-mode, with untrusted-input
-  rejection tests. Closes out 3.2.5 with N.0.
+- N.1b — SPIR-V type / constant / decoration lookup tables (the SSA module model
+  N.2 lowers from), then N.2 (MIR + uniformity lowering). N.1b closes 3.2.5.
 
 ## [3.2.4] — 2026-06-16
 

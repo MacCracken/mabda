@@ -439,8 +439,15 @@ hand-authored shaders stay as oracle + fallback.
   16×`s_nop` tail — the proposal's "round-trip the fixed shaders through the new
   encoders" check; **byte-identical** (native.tcyr golden/checksum tests
   unchanged-green). EXP/MIMG dwords stay raw (compute-only scope).
-- [ ] **N.1** *(3.2.5)* — SPIR-V parser (`src/spirv_parse.cyr`); untrusted-input
-  rejection tests.
+- [~] **N.1** *(3.2.5)* — SPIR-V parser (`src/spirv_parse.cyr`). **N.1a done
+  (2026-06-16):** word/header accessors + `(opcode, wordcount)` decode + the
+  whole-stream VALIDATOR (the untrusted-input rejection gate — bad-magic /
+  short / unaligned / byte-swapped / id-bound via `_spirv_validate`, plus
+  zero-wordcount and truncated-instruction) + instruction count + GLCompute
+  entry-point / `LocalSize` probes. 24 asserts incl. 5 rejection cases
+  (`compiler.tcyr`). Pure CPU; reuses the Phase S `_spirv_validate` header check.
+  **N.1b (next):** type / constant / decoration lookup tables — the SSA module
+  model N.2 lowers from.
 - [ ] **N.2** *(3.2.6)* — MIR + uniformity lowering (`src/mir.cyr`,
   `src/spirv_lower.cyr`).
 - [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
