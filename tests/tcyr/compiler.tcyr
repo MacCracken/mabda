@@ -1,0 +1,257 @@
+# tests/tcyr/compiler.tcyr — SPIR-V → GFX9 native compiler backend (Phase N)
+# Functionality-grouped CPU suite. Mirrors the new src/ compiler modules
+# (gfx9_encode.cyr at N.0; spirv_parse/mir/isel/regalloc/compile land later).
+# Self-contained: own main() + assert_summary().
+#
+# N.0 ORACLE: every gfx9_encode.cyr encoder is asserted to reproduce, byte
+# for byte, the exact dwords the hand-authored shaders in
+# backend_native_shaders.cyr already pin (each llvm-mc-round-tripped on
+# gfx90c). A single mis-encoded bit-field shows up here as a failed assert
+# against a known-good constant — the safety net the proposal requires
+# before any *generated* code reaches hardware.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ================================================================
+# Operand-encoding helpers
+# ================================================================
+fn test_gfx9_operand_helpers() {
+    assert_eq(gfx9_vgpr(0), 256, "VGPR0 = 256");
+    assert_eq(gfx9_vgpr(4), 260, "VGPR4 = 260");
+    assert_eq(gfx9_vgpr(11), 267, "VGPR11 = 267");
+    assert_eq(gfx9_sgpr(0), 0, "SGPR0 = 0");
+    assert_eq(gfx9_sgpr(12), 12, "SGPR12 = 12");
+    # inline-constant table: 0->128, 1..64->129..192, -1..-16->193..208
+    assert_eq(gfx9_inline_int(0), 128, "inline 0 = 128");
+    assert_eq(gfx9_inline_int(1), 129, "inline 1 = 129");
+    assert_eq(gfx9_inline_int(2), 130, "inline 2 = 130");
+    assert_eq(gfx9_inline_int(4), 132, "inline 4 = 132");
+    assert_eq(gfx9_inline_int(8), 136, "inline 8 = 136");
+    assert_eq(gfx9_inline_int(16), 144, "inline 16 = 144");
+    assert_eq(gfx9_inline_int(24), 152, "inline 24 = 152");
+    assert_eq(gfx9_inline_int(64), 192, "inline 64 = 192");
+    assert_eq(gfx9_inline_int(0 - 1), 193, "inline -1 = 193");
+    assert_eq(gfx9_inline_int(0 - 16), 208, "inline -16 = 208");
+    # out of inline range -> literal sentinel 255
+    assert_eq(gfx9_inline_int(65), 255, "inline 65 OOR -> literal");
+    assert_eq(gfx9_inline_int(0 - 17), 255, "inline -17 OOR -> literal");
+    return 0;
+}
+
+# ================================================================
+# VOP1 — every hand-authored v_mov / v_cvt dword
+# ================================================================
+fn test_gfx9_enc_vop1() {
+    # store_deadbeef: v_mov_b32 v{0,1} from s{0,1}, v2 from literal
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, gfx9_sgpr(0)), 0x7E000200, "v_mov v0,s0");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, gfx9_sgpr(1)), 0x7E020201, "v_mov v1,s1");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 2, GFX9_SRC_LITERAL), 0x7E0402FF, "v_mov v2,lit");
+    # downsample: v_mov from the address SGPRs
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, gfx9_sgpr(12)), 0x7E00020C, "v_mov v0,s12");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, gfx9_sgpr(13)), 0x7E02020D, "v_mov v1,s13");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 2, gfx9_sgpr(14)), 0x7E04020E, "v_mov v2,s14");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 3, gfx9_sgpr(15)), 0x7E06020F, "v_mov v3,s15");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, gfx9_sgpr(18)), 0x7E000212, "v_mov v0,s18");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, gfx9_sgpr(19)), 0x7E020213, "v_mov v1,s19");
+    # solid_red FS / VS tail: v_mov from inline f32 0.0 / 1.0
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, GFX9_INLINE_F32_1_0), 0x7E0002F2, "v_mov v0,1.0");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, GFX9_INLINE_F32_0_0), 0x7E020280, "v_mov v1,0.0");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 2, GFX9_INLINE_F32_0_0), 0x7E040280, "v_mov v2,0.0");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 3, GFX9_INLINE_F32_1_0), 0x7E0602F2, "v_mov v3,1.0");
+    # VS: v_cvt_f32_i32 from VGPRs
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F32_I32, 0, gfx9_vgpr(0)), 0x7E000B00, "v_cvt_f32_i32 v0,v0");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F32_I32, 1, gfx9_vgpr(2)), 0x7E020B02, "v_cvt_f32_i32 v1,v2");
+    # textured FS: v_cvt_i32_f32 from VGPRs
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 4, gfx9_vgpr(2)), 0x7E081102, "v_cvt_i32_f32 v4,v2");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 5, gfx9_vgpr(3)), 0x7E0A1103, "v_cvt_i32_f32 v5,v3");
+    return 0;
+}
+
+# ================================================================
+# VOP2 — every hand-authored two-source vector-ALU dword
+# ================================================================
+fn test_gfx9_enc_vop2() {
+    # VS: lshlrev / and / add_u32 with inline constants
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 2, gfx9_inline_int(1), 0), 0x24040081, "v_lshlrev v2,1,v0");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 0, gfx9_inline_int(2), 0), 0x24000082, "v_lshlrev v0,2,v0");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 0, gfx9_inline_int(4), 0), 0x26000084, "v_and v0,4,v0");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 2, gfx9_inline_int(4), 2), 0x26040484, "v_and v2,4,v2");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 0, gfx9_inline_int(0 - 1), 0), 0x680000C1, "v_add_u32 v0,-1,v0");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 2, gfx9_inline_int(0 - 1), 2), 0x680404C1, "v_add_u32 v2,-1,v2");
+    # downsample: and with a 0xff literal, lshrrev/lshlrev, add_u32 across VGPRs
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 8, GFX9_SRC_LITERAL, 4), 0x261008FF, "v_and v8,lit,v4");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 9, GFX9_SRC_LITERAL, 5), 0x26120AFF, "v_and v9,lit,v5");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 10, GFX9_SRC_LITERAL, 6), 0x26140CFF, "v_and v10,lit,v6");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, 11, GFX9_SRC_LITERAL, 7), 0x26160EFF, "v_and v11,lit,v7");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 8, gfx9_vgpr(8), 11), 0x68101708, "v_add_u32 v8,v8,v11");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 8, gfx9_inline_int(2), 8), 0x20101082, "v_lshrrev v8,2,v8");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 9, gfx9_vgpr(9), 12), 0x68121909, "v_add_u32 v9,v9,v12");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 9, gfx9_inline_int(2), 9), 0x20121282, "v_lshrrev v9,2,v9");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 9, gfx9_inline_int(8), 9), 0x24121288, "v_lshlrev v9,8,v9");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 10, gfx9_vgpr(10), 13), 0x68141B0A, "v_add_u32 v10,v10,v13");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 10, gfx9_inline_int(2), 10), 0x20141482, "v_lshrrev v10,2,v10");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 10, gfx9_inline_int(16), 10), 0x24141490, "v_lshlrev v10,16,v10");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 11, gfx9_inline_int(24), 4), 0x20160898, "v_lshrrev v11,24,v4");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 12, gfx9_inline_int(24), 5), 0x20180A98, "v_lshrrev v12,24,v5");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 13, gfx9_inline_int(24), 6), 0x201A0C98, "v_lshrrev v13,24,v6");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 14, gfx9_inline_int(24), 7), 0x201C0E98, "v_lshrrev v14,24,v7");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_ADD_U32, 11, gfx9_vgpr(11), 14), 0x68161D0B, "v_add_u32 v11,v11,v14");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHRREV_B32, 11, gfx9_inline_int(2), 11), 0x20161682, "v_lshrrev v11,2,v11");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 11, gfx9_inline_int(24), 11), 0x24161698, "v_lshlrev v11,24,v11");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_OR_B32, 8, gfx9_vgpr(8), 11), 0x28101708, "v_or_b32 v8,v8,v11");
+    # textured FS: v_mul_f32 with a scalar src0 (the per-draw scale SGPR)
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 2, gfx9_sgpr(12), 2), 0x0A04040C, "v_mul_f32 v2,s12,v2");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 3, gfx9_sgpr(13), 3), 0x0A06060D, "v_mul_f32 v3,s13,v3");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 4, gfx9_sgpr(12), 2), 0x0A08040C, "v_mul_f32 v4,s12,v2");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 5, gfx9_sgpr(13), 3), 0x0A0A060D, "v_mul_f32 v5,s13,v3");
+    return 0;
+}
+
+# ================================================================
+# VOP3a — every hand-authored three-source dword (two dwords each)
+# ================================================================
+fn test_gfx9_enc_vop3a() {
+    var add3 = GFX9_VOP3_V_ADD3_U32;
+    var bfe = GFX9_VOP3_V_BFE_U32;
+    var i8 = gfx9_inline_int(8);
+    var i16 = gfx9_inline_int(16);
+    # v_add3_u32 chain (downsample averages)
+    assert_eq(gfx9_enc_vop3a_lo(add3, 8), 0xD1FF0008, "v_add3 v8 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(8), gfx9_vgpr(9), gfx9_vgpr(10)), 0x042A1308, "v_add3 v8 hi");
+    assert_eq(gfx9_enc_vop3a_lo(add3, 9), 0xD1FF0009, "v_add3 v9 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(9), gfx9_vgpr(10), gfx9_vgpr(11)), 0x042E1509, "v_add3 v9 hi");
+    assert_eq(gfx9_enc_vop3a_lo(add3, 10), 0xD1FF000A, "v_add3 v10 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(10), gfx9_vgpr(11), gfx9_vgpr(12)), 0x0432170A, "v_add3 v10 hi");
+    assert_eq(gfx9_enc_vop3a_lo(add3, 11), 0xD1FF000B, "v_add3 v11 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(11), gfx9_vgpr(12), gfx9_vgpr(13)), 0x0436190B, "v_add3 v11 hi");
+    # v_bfe_u32 (byte extraction): offset 8 / width 8 (green channel)
+    assert_eq(gfx9_enc_vop3a_lo(bfe, 9), 0xD1C80009, "v_bfe v9 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(4), i8, i8), 0x02211104, "v_bfe v9,v4,8,8 hi");
+    assert_eq(gfx9_enc_vop3a_lo(bfe, 10), 0xD1C8000A, "v_bfe v10 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(5), i8, i8), 0x02211105, "v_bfe v10,v5,8,8 hi");
+    assert_eq(gfx9_enc_vop3a_lo(bfe, 11), 0xD1C8000B, "v_bfe v11 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(6), i8, i8), 0x02211106, "v_bfe v11,v6,8,8 hi");
+    assert_eq(gfx9_enc_vop3a_lo(bfe, 12), 0xD1C8000C, "v_bfe v12 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(7), i8, i8), 0x02211107, "v_bfe v12,v7,8,8 hi");
+    # v_bfe_u32: offset 16 / width 8 (blue channel)
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(4), i16, i8), 0x02212104, "v_bfe v?,v4,16,8 hi");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(5), i16, i8), 0x02212105, "v_bfe v?,v5,16,8 hi");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(6), i16, i8), 0x02212106, "v_bfe v?,v6,16,8 hi");
+    assert_eq(gfx9_enc_vop3a_lo(bfe, 13), 0xD1C8000D, "v_bfe v13 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(7), i16, i8), 0x02212107, "v_bfe v13,v7,16,8 hi");
+    # v_or3_b32 (pack RGBA)
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_OR3_B32, 8), 0xD2020008, "v_or3 v8 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(8), gfx9_vgpr(9), gfx9_vgpr(10)), 0x042A1308, "v_or3 v8 hi");
+    return 0;
+}
+
+# ================================================================
+# SOP2 — every hand-authored scalar two-source dword (downsample addr math)
+# ================================================================
+fn test_gfx9_enc_sop2() {
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_MUL_I32, 8, gfx9_sgpr(7), gfx9_sgpr(4)), 0x92080407, "s_mul_i32 s8,s7,s4");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_LSHL_B32, 9, gfx9_sgpr(8), gfx9_inline_int(4)), 0x8E098408, "s_lshl s9,s8,4");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_LSHL_B32, 10, gfx9_sgpr(6), gfx9_inline_int(3)), 0x8E0A8306, "s_lshl s10,s6,3");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADD_I32, 9, gfx9_sgpr(9), gfx9_sgpr(10)), 0x81090A09, "s_add_i32 s9,s9,s10");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADD_U32, 12, gfx9_sgpr(0), gfx9_sgpr(9)), 0x800C0900, "s_add_u32 s12,s0,s9");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADDC_U32, 13, gfx9_sgpr(1), gfx9_inline_int(0)), 0x820D8001, "s_addc s13,s1,0");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_LSHL_B32, 11, gfx9_sgpr(4), gfx9_inline_int(3)), 0x8E0B8304, "s_lshl s11,s4,3");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADD_U32, 14, gfx9_sgpr(12), gfx9_sgpr(11)), 0x800E0B0C, "s_add s14,s12,s11");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADDC_U32, 15, gfx9_sgpr(13), gfx9_inline_int(0)), 0x820F800D, "s_addc s15,s13");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_LSHL_B32, 16, gfx9_sgpr(8), gfx9_inline_int(2)), 0x8E108208, "s_lshl s16,s8,2");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_LSHL_B32, 17, gfx9_sgpr(6), gfx9_inline_int(2)), 0x8E118206, "s_lshl s17,s6,2");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADD_I32, 16, gfx9_sgpr(16), gfx9_sgpr(17)), 0x81101110, "s_add_i32 s16,s16");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADD_U32, 18, gfx9_sgpr(2), gfx9_sgpr(16)), 0x80121002, "s_add_u32 s18,s2,s16");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ADDC_U32, 19, gfx9_sgpr(3), gfx9_inline_int(0)), 0x82138003, "s_addc s19,s3,0");
+    return 0;
+}
+
+# ================================================================
+# SOPP — s_endpgm / s_nop / s_waitcnt (all variants the shaders use)
+# ================================================================
+fn test_gfx9_enc_sopp() {
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0), 0xBF810000, "s_endpgm");
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_NOP, 0), 0xBF800000, "s_nop 0");
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0070), 0xBF8C0070, "s_waitcnt vm(0) lgkm(0)");
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    return 0;
+}
+
+# ================================================================
+# SMEM — s_load_dwordx{2,4,8} (textured FS descriptor loads, two dwords)
+# ================================================================
+fn test_gfx9_enc_smem() {
+    # s_load_dwordx8 s[0:7], s[0:1], 0x0
+    assert_eq(gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0), 0xC00E0000, "s_load_dwordx8 lo");
+    # s_load_dwordx2 s[12:13], s[0:1], 0x30
+    assert_eq(gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX2, 12, 0, 0), 0xC0060300, "s_load_dwordx2 lo");
+    # s_load_dwordx4 s[8:11], s[0:1], 0x20
+    assert_eq(gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 8, 0, 0), 0xC00A0200, "s_load_dwordx4 lo");
+    return 0;
+}
+
+# ================================================================
+# FLAT (global) — global_load_dwordx2 / global_store_dword (two dwords)
+# ================================================================
+fn test_gfx9_enc_flat() {
+    var st = GFX9_FLAT_GLOBAL_STORE_DWORD;
+    var ld2 = GFX9_FLAT_GLOBAL_LOAD_DWORDX2;
+    var g = GFX9_FLAT_SEG_GLOBAL;
+    var off = GFX9_SADDR_OFF;
+    # global_store_dword v[0:1], v2, off glc slc  (store_deadbeef: cache-bypassing)
+    assert_eq(gfx9_enc_flat_lo(st, g, 0, 1, 1), 0xDC738000, "global_store glc slc lo");
+    assert_eq(gfx9_enc_flat_hi(0, off, 2, 0), 0x007F0200, "global_store v2 hi");
+    # global_load_dwordx2 v[4:5], v[0:1], off  (downsample: no glc/slc)
+    assert_eq(gfx9_enc_flat_lo(ld2, g, 0, 0, 0), 0xDC548000, "global_load_dwordx2 lo");
+    assert_eq(gfx9_enc_flat_hi(4, off, 0, 0), 0x047F0000, "global_load v[4:5] hi");
+    assert_eq(gfx9_enc_flat_hi(6, off, 0, 2), 0x067F0002, "global_load v[6:7] from v[2:3] hi");
+    # global_store_dword v[0:1], v8, off  (downsample: plain store)
+    assert_eq(gfx9_enc_flat_lo(st, g, 0, 0, 0), 0xDC708000, "global_store (plain) lo");
+    assert_eq(gfx9_enc_flat_hi(0, off, 8, 0), 0x007F0800, "global_store v8 hi");
+    return 0;
+}
+
+# ================================================================
+# Capstone: rebuild store_deadbeef wholly through the encoders and
+# memcmp against the HW-verified hand-authored builder, byte-for-byte.
+# Proves the encoders COMPOSE into a real shader's exact byte stream
+# (not just per-dword). The full downsample-stream rebuild lands with
+# the N.5 encode driver, where stream sequencing is the deliverable.
+# ================================================================
+fn test_gfx9_rebuild_store_deadbeef_byte_identical() {
+    var truth[128];
+    var built[128];
+    var truth_end = native_gfx9_shader_store_deadbeef(&truth, 0);
+    assert_eq(truth_end, 96, "deadbeef is 96 bytes");
+
+    # Rebuild the identical stream from the encoders + raw literal/pad dwords.
+    store32(&built +  0, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 0, gfx9_sgpr(0)));
+    store32(&built +  4, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 1, gfx9_sgpr(1)));
+    store32(&built +  8, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 2, GFX9_SRC_LITERAL));
+    store32(&built + 12, 0xDEADBEEF);
+    store32(&built + 16, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 1, 1));
+    store32(&built + 20, gfx9_enc_flat_hi(0, GFX9_SADDR_OFF, 2, 0));
+    store32(&built + 24, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0070));
+    store32(&built + 28, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));
+    var i = 0;
+    while (i < 16) {
+        store32(&built + 32 + i * 4, gfx9_enc_sopp(GFX9_SOPP_S_NOP, 0));
+        i = i + 1;
+    }
+    assert_eq(memeq(&built, &truth, 96), 1, "rebuilt deadbeef == hand-authored bytes");
+    return 0;
+}
+
+fn main(): i64 {
+    test_gfx9_operand_helpers();
+    test_gfx9_enc_vop1();
+    test_gfx9_enc_vop2();
+    test_gfx9_enc_vop3a();
+    test_gfx9_enc_sop2();
+    test_gfx9_enc_sopp();
+    test_gfx9_enc_smem();
+    test_gfx9_enc_flat();
+    test_gfx9_rebuild_store_deadbeef_byte_identical();
+    return assert_summary();
+}

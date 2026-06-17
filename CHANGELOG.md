@@ -15,8 +15,46 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
-section when they ship.
+### Added — Phase N.0 (native SPIR-V→GFX9 compiler: encoder lift + byte oracle)
+- `src/gfx9_encode.cyr` — operand-parameterized GFX9 instruction encoders, the
+  output stage of the in-tree SPIR-V→GFX9 compute compiler
+  (`docs/proposals/v3.2-spirv-gfx9-native-lowering.md`). One pure encoder per
+  compute-format the compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP, SMEM,
+  FLAT(global) — plus VOP src-operand helpers (`gfx9_vgpr` / `gfx9_sgpr` /
+  `gfx9_inline_int`) and per-format opcode constants. Pure byte math, no deps.
+- `tests/tcyr/compiler.tcyr` — the N.0 regression ORACLE (118 asserts): every
+  encoder reproduces, byte-for-byte, the hand-authored dwords in
+  `backend_native_shaders.cyr` (each already llvm-mc-round-tripped on gfx90c) —
+  the `store_deadbeef` shader, the full `downsample_2x2` SOP2/VOP1/VOP2/VOP3a
+  stream, and the textured-FS SMEM/`v_mul_f32`/`v_cvt` dwords — plus a capstone
+  that rebuilds `store_deadbeef` wholly through the encoders and `memeq`s the
+  HW-verified builder's output. The safety net before any *generated* code exists.
+- `scripts/disasm-shaders.sh` — a per-form llvm-mc round-trip section: one
+  representative encoder output per GFX9 format, each decoded to confirm it is a
+  valid gfx90c encoding of the expected mnemonic (independent of the Cyrius
+  oracle).
+
+### Changed
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/gfx9_encode.cyr`
+  (after `backend_native_shaders.cyr`, before `_pm4.cyr` — same "no deps" tier).
+
+### Notes
+- The hand-authored `native_gfx9_shader_*` builders are UNCHANGED — they remain
+  the HW-verified ground truth and the bring-up oracle; these encoders are a new,
+  independently-proven library the later N.5 encode stage will drive.
+- **Scope (matches the proposal's compute-only boundary):** EXP (graphics
+  color/pos export) and MIMG (image load/sample) encoders are deliberately NOT
+  lifted in N.0 — they belong to a future graphics/texture compiler phase. The
+  hand-authored EXP/MIMG dwords keep their existing byte-pinned tests.
+
+### Metrics
+- CPU suite **2908 → 3026** assertions; **13** domain test files (new
+  `compiler.tcyr`). Bundle 16094 → **16416** lines (gfx9_encode added).
+
+### Next
+- N.1 — SPIR-V parser (`src/spirv_parse.cyr`): header + instruction stream +
+  type/constant/decoration tables + entry-point/exec-mode, with untrusted-input
+  rejection tests. Closes out 3.2.5 with N.0.
 
 ## [3.2.4] — 2026-06-16
 
