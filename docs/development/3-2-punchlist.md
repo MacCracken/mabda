@@ -627,11 +627,26 @@ hand-authored shaders stay as oracle + fallback.
       is HW-verified end-to-end — MVP reached.** (`_backend_native_shader_module_create`
       slot wiring + the multi-binding/TGID generic dispatcher remain for N.6.)
   - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL
-    ops + isel rules + 3-src encode).
+    ops + isel rules + 3-src encode). *Not on the MVP critical path — N.5g shows
+    the box-filter compiles with the base 2-input ALU set; these are throughput
+    fusions for a later optimization pass.*
   - [ ] **N.5f** — 64-bit carry SALU (`s_add_u32`/`s_addc_u32` split) + SGPR→VGPR
-    `v_mov` materialization for FLAT addresses.
-  - [ ] **N.5g** — downsample SPIR-V → full pipeline; proven-equivalent assert +
-    `native_mipmap_e2e` pixel-match on Cezanne. **MVP exit.**
+    `v_mov` materialization for FLAT addresses. *Not on the MVP critical path —
+    the SADDR FLAT form + the power-of-2 offset math reach the downsample without
+    64-bit address splitting; needed when buffers exceed 32-bit VA offsets.*
+  - [x] **N.5g (2026-06-17) — HW-VERIFIED on Cezanne. MVP exit reached.** A 2×2
+    box-filter downsample compiled in-tree from SPIR-V pixel-matches an
+    independent CPU box-filter on the GPU. `dst[i] = (src[a]+src[b]+src[c]+
+    src[d]) >> 2` over each 2×2 source block (`dst` 4×4, `src` 8×8, LocalSize 16);
+    2-binding dispatch (`src`→`s0:s1`, `dst`→`s2:s3`); all 16 texels correct, with
+    a `0xBAADF00D` dst sentinel guarding against a spurious pass. Power-of-2 dims
+    keep index math in shifts/masks (no div/mod). **No new compiler code** — reuses
+    the N.6 multi-binding composer + cached submit; the compiler drove a real
+    image kernel (5 `OpAccessChain`, 2×2 offset arithmetic, accumulate, shift)
+    through N.2–N.5 unchanged. `programs/native_spirv_downsample_e2e.cyr` +
+    `make test-native-spirv-downsample-e2e`. *(Single-channel; the RGBA
+    channel-pack variant is mechanical channel repetition over the same op set —
+    an optional N.5g-2 follow-up, proves nothing new about the compiler.)*
 - [~] **N.6** *(3.2.8)* — First novel kernel + generic dispatcher.
   - [x] **N.6 core (2026-06-17) — HW-verified on Cezanne.** A novel 2-binding
     SAXPY-shape kernel (`y[lid.x]=3*x[lid.x]+y[lid.x]`, the compiler never saw it
@@ -642,6 +657,20 @@ hand-authored shaders stay as oracle + fallback.
   - [ ] **N.6 remainder** — `_backend_native_shader_module_create` slot wiring (so
     consumers compile SPIR-V through the public `gpu_*` API), the TGID/2-D dispatch
     path, and a fuller differential CPU oracle.
+  - [ ] **N-HARDEN.1 (security, found during N.5g via adversarial review)** —
+    **unchecked OOB write in the SPIR-V table builders on untrusted `id_bound`.**
+    `spirv_build_type_table` / `_const_table` / `_decoration_table`
+    (`src/spirv_parse.cyr:236/290/316`) write `out + id*stride` for every result
+    `<id>` with **no capacity parameter and no bounds check**; the validate gate
+    only caps `id_bound` at a loose `0x40000000` (`wgpu_descriptors.cyr:249`),
+    unrelated to the caller's fixed buffer size. A crafted oversized `id_bound`
+    (within that ceiling) → silent heap corruption, surfacing much later as a
+    spurious `MIR_ERR_ID_OOR`. Manifested in dev as a confusing `-25` when the
+    downsample's table buffers were sized for `cap_ids` instead of `id_bound`.
+    **Fix:** add a `cap_ids`/capacity arg to the three builders + fail-loud
+    (`id == 0 || id >= cap`), thread it from `gfx9_compile` (the CC ctx already
+    knows its buffer sizes); regression assert per builder. Slot **before** the
+    next public-API surface (N.6 remainder exposes this path to consumers).
 - [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
   EXEC-mask); divergent-vs-uniform test matrix. May split into two bites.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

@@ -33,6 +33,22 @@ for the immediate forward pointer.
   land in the right USER_DATA slots with the compiler's RSRC. (Bounded by the
   16-SGPR USER_DATA limit ⇒ ≤8 bindings.)
 
+### Added — Phase N.5g (a compiled image kernel — the MVP-exit downsample)
+- **A 2×2 box-filter downsample, compiled in-tree from SPIR-V, pixel-matches a
+  CPU box-filter on Cezanne.** `programs/native_spirv_downsample_e2e.cyr`: a
+  single-channel `dst[i] = (src[a]+src[b]+src[c]+src[d]) >> 2` over each 2×2
+  source block (`dst` 4×4, `src` 8×8, LocalSize 16) → `gfx9_compile` → 2-binding
+  dispatch (`src` binding 0 → `s0:s1`, `dst` binding 1 → `s2:s3`) → every one of
+  the 16 destination texels equals the average of its 2×2 source block. The
+  reference is an **independent** CPU box-filter over the same seeded source, and
+  `dst` is pre-seeded with a `0xBAADF00D` sentinel, so a no-op or wrong kernel
+  fails rather than passing spuriously. Power-of-2 dims keep all index math in
+  shifts/masks (`x=i&3`, `y=i>>2`, `aoff=(y<<4)+(x<<1)`) — no div/mod, which the
+  compiler does not lower. The compiler handled a real image kernel (5
+  `OpAccessChain` loads/store, the 2×2 offset arithmetic, accumulate, shift)
+  through the full N.2–N.5 pipeline with no new compiler code — it reuses the N.6
+  multi-binding composer + cached submit. `make test-native-spirv-downsample-e2e`.
+
 ## [3.2.6] — 2026-06-17
 
 **Native SPIR-V → GFX9 compute compiler — HW-verified end-to-end on Cezanne
