@@ -602,11 +602,17 @@ hand-authored shaders stay as oracle + fallback.
       SGPR `s_mov`, LID extract → VGPR `v_mov`). **Adversarial review (workflow):
       1 confirmed, fixed** — `_gisel_one` now fails loud on an UNKNOWN-uniformity
       EXTRACT (would have mis-filed to SGPR), mirroring the N.3 ALU guard.
-    - [ ] **N.5c-2b** — the lowering expansion in `spirv_lower`: lower
-      `EXTRACT(OpLoad(GID).comp)` to `wgid.comp*local_size_comp + lid.comp`
-      (synth WGID+LID builtins via `mir_alloc_synth_id`, `local_size` from
-      `spirv_find_local_size`, `IMUL`+`IADD`), so the real GID-indexed SAXPY
-      compiles end-to-end (uniform `s_mul` + divergent `v_add`).
+    - [x] **N.5c-2b (2026-06-17)** — `_spirv_expand_gid` lowers
+      `EXTRACT(OpLoad(GID).comp)` to `wgid.comp*local_size_comp + lid.comp` (synth
+      WGID+LID builtins, `local_size` via `spirv_find_local_size` threaded down,
+      `IMUL`+`IADD`; `comp` bounded ≤2). Uniformity → uniform `s_mul` + divergent
+      `v_add`; file-class → wgid SGPR / lid VGPR. **Real GID-SAXPY compiles
+      end-to-end** + a lowering-shape test; pipeline fixtures re-indexed to LID,
+      `_spv_build_saxpy_gid` for the GID path. **Adversarial review (workflow): 2
+      confirmed (same root), fixed** — `mir_alloc_synth_id` now fails loud (`-1`)
+      at the `cap_ids` ceiling (was silent OOB), callers + `_mir_set_val` (`id<=0`)
+      guard it; regression-tested. **N.5c-2 + N.5c COMPLETE** — a divergent-index
+      compute kernel goes SPIR-V → GFX9 ISA + RSRC.
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
     `gfx9_compile` into a BO; parameterize the PM4 composer's rsrc1/rsrc2.
   - [ ] **N.5e** — VOP3 ops `v_add3_u32`/`v_bfe_u32`/`v_or3_b32` (new MIR/GISEL

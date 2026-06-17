@@ -759,7 +759,11 @@ fn test_mir_emit_errors() {
 # Phase N.2b-1 — SPIR-V → MIR lowering (spirv_lower.cyr)
 # ================================================================
 # A memory-free GLCompute kernel (id-bound 16, 352 bytes): loads
-# GlobalInvocationId, extracts .x, does int arithmetic on it + two constants.
+# LocalInvocationId, extracts .x, does int arithmetic on it + two constants.
+# (Indexed by LocalInvocationId, NOT GlobalInvocationId, so the index lowers to a
+# single OpCompositeExtract — these pipeline-shape tests assert that straight-line
+# form. The GlobalInvocationId EXPANSION, gid = wgid*size + lid, is exercised by
+# the _gid e2e/lowering tests, which would add the wgid/lid/mul/add prelude here.)
 # Exercises builtin-resolve, the seed, the builtin OpLoad alias,
 # OpCompositeExtract, the ALU dispatch, OpReturn, and the uniformity sweep —
 # end-to-end, no buffer access (that is N.2b-2).
@@ -789,10 +793,10 @@ fn _spv_build_gid_kernel(buf): i64 {
     store32(buf +  76, 64);
     store32(buf +  80, 1);
     store32(buf +  84, 1);
-    store32(buf +  88, (4 << 16) | 71);   # OpDecorate %7 BuiltIn GlobalInvocationId
+    store32(buf +  88, (4 << 16) | 71);   # OpDecorate %7 BuiltIn LocalInvocationId
     store32(buf +  92, 7);
     store32(buf +  96, 11);
-    store32(buf + 100, 28);
+    store32(buf + 100, 27);
     store32(buf + 104, (2 << 16) | 19);   # OpTypeVoid %1
     store32(buf + 108, 1);
     store32(buf + 112, (3 << 16) | 33);   # OpTypeFunction %2 %1
@@ -877,7 +881,7 @@ fn test_spirv_lower_gid_kernel() {
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
     # builtin resolution (the gap the N.1b parser does not fill)
-    assert_eq(_spirv_builtin_for_var(&outbi, 7), MIR_BI_GLOBAL_INVOC_ID, "gid var resolved");
+    assert_eq(_spirv_builtin_for_var(&outbi, 7), MIR_BI_LOCAL_INVOC_ID, "lid var resolved");
     # seed
     assert_eq(mir_val_kind(&m, 7), MIR_VK_BUILTIN, "gid is builtin");
     assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "gid divergent");
@@ -1045,6 +1049,9 @@ fn test_spirv_lower_n2b1_review() {
 # ================================================================
 # A SAXPY-shape GLCompute kernel (id-bound 26, 588 bytes): two StorageBuffer
 # bindings X(b0) Y(b1) of struct{ runtimearray<float> }, a float constant a, and
+# indexed by LocalInvocationId (so the index is a single OpCompositeExtract — the
+# pipeline-shape tests assert that). `_spv_build_saxpy_gid` re-indexes it by
+# GlobalInvocationId to exercise the gid = wgid*size + lid expansion (N.5c-2b).
 # y[gid.x] = a * x[gid.x] + y[gid.x]. Exercises the full memory path:
 # OpAccessChain (dynamic index -> synth IMUL offset), buffer OpLoad/OpStore, and
 # the uniformity of indexed loads.
@@ -1075,10 +1082,10 @@ fn _spv_build_saxpy(buf): i64 {
     store32(buf +  76, 64);
     store32(buf +  80, 1);
     store32(buf +  84, 1);
-    store32(buf +  88, (4 << 16) | 71);   # OpDecorate %12 BuiltIn GlobalInvocationId
+    store32(buf +  88, (4 << 16) | 71);   # OpDecorate %12 BuiltIn LocalInvocationId
     store32(buf +  92, 12);
     store32(buf +  96, 11);
-    store32(buf + 100, 28);
+    store32(buf + 100, 27);
     store32(buf + 104, (4 << 16) | 71);   # OpDecorate %13 Binding 0
     store32(buf + 108, 13);
     store32(buf + 112, 33);
@@ -2034,7 +2041,15 @@ fn test_gfx9_emit_extract_wgid() {
 # expansion). The first-oracle end-to-end target until GID expansion lands (N.5c-2).
 fn _spv_build_saxpy_lid(buf): i64 {
     var n = _spv_build_saxpy(buf);
-    store32(buf + 100, 27);   # OpDecorate %12 BuiltIn: GlobalInvocationId(28) -> LocalInvocationId(27)
+    store32(buf + 100, 27);   # OpDecorate %12 BuiltIn LocalInvocationId (the base is already LID)
+    return n;
+}
+
+# The SAXPY fixture re-indexed by GlobalInvocationId (BuiltIn 28) — the index then
+# lowers to gid.x = wgid.x*local_size_x + lid.x (the N.5c-2b expansion).
+fn _spv_build_saxpy_gid(buf): i64 {
+    var n = _spv_build_saxpy(buf);
+    store32(buf + 100, 28);   # OpDecorate %12 BuiltIn GlobalInvocationId
     return n;
 }
 
@@ -2089,6 +2104,113 @@ fn test_gfx9_compile_saxpy_lid() {
     var d1 = load64(&desc + DESC_RSRC1);
     assert_eq(d1 & GFX9_RSRC1_FLAGS, GFX9_RSRC1_FLAGS, "rsrc1 has FLOAT_MODE 0xC0 + DX10_CLAMP");
     assert_eq((d1 >> 12) & 0xFF, 0xC0, "rsrc1 FLOAT_MODE field = 0xC0");
+    return 0;
+}
+
+# N.5c-2b: the REAL GlobalInvocationId-indexed SAXPY now compiles end-to-end — the
+# lowering expands gid.x = wgid.x*64 + lid.x, so the first two instrs are the wgid
+# s_mov + the lid v_mov, and the kernel uses TGID (rsrc2 gains TGID_X vs the LID-only
+# 0x48). LocalSize is 64,1,1 in the fixture.
+fn test_gfx9_compile_saxpy_gid() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);   # re-indexed by BuiltIn GlobalInvocationId
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var m[80];
+    var vals[1920];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
+    var outbi[256];
+    var isel[960];
+    var isel2[960];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[80];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    var isa[640];
+    memset(&isa, 0, 640);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "GID SAXPY compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 4, "user_sgpr = 4");
+    assert_eq(load64(&desc + DESC_RSRC2), 0xC8, "rsrc2: user=4, trap, TGID_X (gid uses WorkgroupId)");
+    # the GID expansion lands first: wgid extract = s_mov (SOP1), lid extract = v_mov (VOP1)
+    assert_eq((load32(&isa + 0) >> 23) & 0x1FF, 0x17D, "instr 0 = SOP1 (wgid s_mov)");
+    assert_eq((load32(&isa + 4) >> 25) & 0x7F, 0x3F, "instr 1 = VOP1 (lid v_mov)");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(load32(&isa + len - 68), 0xBF810000, "s_endpgm before the prefetch pad");
+    return 0;
+}
+
+# N.5c-2b: the GID expansion produces the right MIR — the first four body instrs
+# are extract(wgid), extract(lid), imul(wgid * local_size), iadd(+lid = gid) — with
+# wgid+mul classified UNIFORM (→ SALU) and the +lid add DIVERGENT (→ VALU).
+fn test_spirv_lower_gid_expansion() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1920];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 26, &types);
+    spirv_build_const_table(&buf, n, 26, &consts);
+    spirv_build_decoration_table(&buf, n, 26, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "gid saxpy lowers");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_EXTRACT, "1: extract lid.x");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "2: wgid * local_size");
+    assert_eq(mir_instr_b(&m, 2), 64, "imul by local_size_x = 64");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_IADD, "3: scaled + lid = gid");
+    assert_eq(mir_val_payload(&m, mir_instr_a(&m, 0)), MIR_BI_WORKGROUP_ID, "extract 0 from WorkgroupId");
+    assert_eq(mir_val_payload(&m, mir_instr_a(&m, 1)), MIR_BI_LOCAL_INVOC_ID, "extract 1 from LocalInvocationId");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 0)), MIR_UNIFORM, "wgid.x uniform");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 1)), MIR_DIVERGENT, "lid.x divergent");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 2)), MIR_UNIFORM, "wgid*size uniform (→ SALU)");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 3)), MIR_DIVERGENT, "gid divergent (→ VALU)");
+    return 0;
+}
+
+# N.5c-2b review: synth-id exhaustion (cap_ids too tight for the GID expansion's
+# 5 synth ids) must FAIL LOUD — mir_alloc_synth_id now returns -1 at the ceiling
+# and _spirv_expand_gid propagates it, rather than silently OOB-writing vals[].
+fn test_spirv_lower_synth_exhaustion() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 26, &types);
+    spirv_build_const_table(&buf, n, 26, &consts);
+    spirv_build_decoration_table(&buf, n, 26, &deco);
+    # cap_ids = id_bound(26) + 2 → only 2 synth slots, but the GID expansion needs 5
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 28);
+    var lr = spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    assert_eq(lr, 0 - MIR_ERR_ID_OOR, "synth exhaustion fails loud");
     return 0;
 }
 
@@ -2210,6 +2332,9 @@ fn main(): i64 {
     test_gfx9_isel_extract_unknown_unif();
     test_gfx9_emit_extract_wgid();
     test_gfx9_compile_saxpy_lid();
+    test_gfx9_compile_saxpy_gid();
+    test_spirv_lower_gid_expansion();
+    test_spirv_lower_synth_exhaustion();
     test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();
     return assert_summary();

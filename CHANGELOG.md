@@ -365,6 +365,40 @@ for the immediate forward pointer.
   in the normal `gfx9_compile` flow (uniformity always runs before isel) —
   defensive hardening; regression test added.
 
+### Added — Phase N.5c-2b (GlobalInvocationId expansion — the real GID SAXPY compiles)
+- `src/spirv_lower.cyr` — `OpCompositeExtract` of a `GlobalInvocationId` load now
+  **expands** to `gid.comp = WorkgroupId.comp · local_size_comp +
+  LocalInvocationId.comp` (it is not a hardware register). `_spirv_expand_gid`
+  synthesizes the two primitive builtins + their extracts + an `IMUL` (by the
+  `LocalSize` dim, via `spirv_find_local_size`, default 1) + an `IADD` keeping the
+  original result `<id>`. The uniformity sweep then classifies the wgid-extract +
+  mul **UNIFORM** (→ `s_mul`) and the lid-extract + add **DIVERGENT** (→ `v_add`),
+  and the N.5c-2a file-class rule places wgid in an SGPR, lid in a VGPR — the
+  natural compute index lowering. `local_size` is threaded
+  `spirv_lower_module → _spirv_lower_body → _spirv_lower_one_instr`; the `comp`
+  is bounded ≤ 2 (vec3) before the `lsz` read (untrusted-input guard).
+- `tests/tcyr/compiler.tcyr` — the **real GlobalInvocationId-indexed SAXPY now
+  compiles end-to-end** (`test_gfx9_compile_saxpy_gid`: `rsrc2` gains `TGID_X`,
+  first two instrs the wgid `s_mov` + lid `v_mov`) and a direct lowering-shape
+  test (`test_spirv_lower_gid_expansion`: instrs 0-3 = extract/extract/imul(×64)/
+  iadd with the right builtins + uniformity). The two base fixtures
+  (`_spv_build_saxpy`, `_spv_build_gid_kernel`) were re-indexed to
+  **LocalInvocationId** so the pipeline-shape tests stay single-extract;
+  `_spv_build_saxpy_gid` re-indexes by GID for the expansion tests. **Closes
+  N.5c-2 — a divergent-index compute kernel compiles SPIR-V → GFX9 end-to-end.**
+
+### Fixed — N.5c-2b adversarial review (2 confirmed, same root, fixed pre-merge)
+- **Synth-id overflow could silently OOB-write `vals[]`.** `mir_alloc_synth_id`
+  had no `cap_ids` ceiling check, and `_spirv_expand_gid` didn't check the
+  `mir_set_builtin` returns — so with tight `cap_ids` headroom (a kernel whose
+  synth ids — 5 per GID extract + the access-chain offsets — exceed `cap_ids`) an
+  out-of-range id could be written past the value table (defended only
+  coincidentally by downstream `mir_emit` operand bounds). `mir_alloc_synth_id`
+  now returns `-1` at the ceiling; every caller (`_spirv_expand_gid`, the
+  access-chain offset) checks it; `_mir_set_val` rejects `id <= 0` (was `== 0`).
+  Regression test: a `cap_ids` too tight for the GID expansion fails loud
+  (`MIR_ERR_ID_OOR`), not a corrupt write.
+
 ### Changed
 - **Toolchain pin → `cyrius = "6.2.18"`** (tracking upstream; was 6.2.15).
   6.2.18 lands the native-float `f32_from` / `f32_to` builtins (the f32 conversion
@@ -390,13 +424,13 @@ for the immediate forward pointer.
   is `m`, not `mod`.
 
 ### Next
-- N.5c-2 — GlobalInvocationId expansion in the lowering (`gid.c = wgid.c *
-  local_size_c + lid.c`, the uniform `s_mul` + divergent `v_add`), so the real
-  GID-indexed SAXPY compiles (and `EXTRACT(WorkgroupId)` resolves to `s[tgid]`).
-  Then N.5d (dispatch seam: `_backend_native_shader_module_create` calls
-  `gfx9_compile` into a BO + parameterized PM4), N.5e (VOP3 add3/bfe/or3), N.5f
-  (64-bit carry + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP exit).
-  Per the 2026-06-17 scoping: proven-equivalent + Cezanne pixel-match. 3.2.7.
+- N.5d — dispatch seam: fill `_backend_native_shader_module_create` (currently
+  returns 0 for the SPIR-V kind) to call `gfx9_compile` into a GTT BO + VA-map it,
+  return the (handle, va) pair, and parameterize `native_pm4_build_compute_*` to
+  accept the compiler-derived `rsrc1`/`rsrc2` (today hardcoded). Then N.5e (VOP3
+  add3/bfe/or3), N.5f (64-bit carry + SGPR→VGPR moves), N.5g (downsample
+  pixel-match — the MVP exit). Per the 2026-06-17 scoping: proven-equivalent +
+  Cezanne pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 
