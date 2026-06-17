@@ -246,22 +246,43 @@ for the immediate forward pointer.
   was untested by the original oracle, so the path was unexercised; the fix lands
   with a 3-case operand-file matrix for `ISUB` + `FSUB`.)
 
+### Added — Phase N.5b-1 (compute ABI + RSRC wiring)
+- `src/gfx9_abi.cyr` — the canonical compute ABI the compiler always emits, plus
+  the `COMPUTE_PGM_RSRC1`/`RSRC2` dword computation. `gfx9_rsrc1(vgpr_hw,
+  sgpr_hw)` derives the VGPRS/SGPRS fields from the regalloc high-water marks
+  (`ceil(v/4)-1`; `ceil((s+2)/8)-1` with a +2 VCC reserve, floored at SGPRS=1);
+  `gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap)` packs the dispatch enables.
+  `gfx9_abi_assign` scans the MIR for buffer bindings + builtins and fills a
+  descriptor: binding k → USER_DATA SGPR pair `s[2k:2k+1]`, `WorkgroupId` →
+  `s[user_sgpr..]` (TGID), `LocalInvocationId` → `v0..`, and the `sgpr_base`/
+  `vgpr_base` the allocator reserves above the ABI region. `GlobalInvocationId`
+  resolves to `-1` (it is `wgid*size+lid`, materialized by a later lowering step,
+  not a single register).
+- `tests/tcyr/compiler.tcyr` +12 asserts: `rsrc1(15,20)==0x2C0083` and
+  `rsrc2(6,1,1,0)==0x18C` (the HW-verified downsample values), `rsrc1(4,4)` =
+  `RSRC1_MIN`, `rsrc2(2,0,0,1)==0x44` (deadbeef), and the 2-binding +
+  GlobalInvocationId ABI layout (user_sgpr, bases, binding/builtin resolution).
+  Adversarially reviewed (workflow).
+
 ### Changed
+- **Toolchain pin → `cyrius = "6.2.16"`** (tracking upstream; was 6.2.15).
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include the compiler modules
   `mir.cyr` / `spirv_lower.cyr` / `gfx9_isel.cyr` / `gfx9_regalloc.cyr` /
-  `gfx9_waitcnt.cyr` / `gfx9_compile.cyr` (after `spirv_parse.cyr`).
+  `gfx9_waitcnt.cyr` / `gfx9_abi.cyr` / `gfx9_compile.cyr` (after
+  `spirv_parse.cyr`).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- N.5b — FLAT load/store + VOP3 (`v_mul_lo_u32`) encode + `src/gfx9_abi.cyr`
-  (canonical compute ABI: builtin → v0/s6/s7, binding → USER_DATA SGPR pairs) +
-  `gfx9_rsrc1`/`gfx9_rsrc2`. Then N.5c (SAXPY first oracle: full `gfx9_compile`
-  SPIR-V→ISA), N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3), N.5f (64-bit carry
-  + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP exit). Per the
-  2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne pixel-match. 3.2.7.
+- N.5b-2 — FLAT load/store (SADDR form: per-lane offset VGPR + binding's
+  USER_DATA base SGPR) + VOP3 `v_mul_lo_u32` encode + `GISEL_EXTRACT` builtin
+  resolution, all through the N.5b-1 ABI. Then N.5c (SAXPY first oracle: full
+  `gfx9_compile` SPIR-V→ISA), N.5d (dispatch seam), N.5e (VOP3 add3/bfe/or3),
+  N.5f (64-bit carry + SGPR→VGPR moves), N.5g (downsample pixel-match — the MVP
+  exit). Per the 2026-06-17 scoping: SAXPY-first, proven-equivalent + Cezanne
+  pixel-match. 3.2.7.
 
 ## [3.2.5] — 2026-06-16
 

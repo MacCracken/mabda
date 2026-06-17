@@ -1815,6 +1815,49 @@ fn test_gfx9_emit_sub_noncommutative() {
     return 0;
 }
 
+# ================================================================
+# Phase N.5b-1 — compute ABI + RSRC wiring (gfx9_abi.cyr)
+# ================================================================
+# RSRC1/RSRC2 from the regalloc high-water + ABI, with the hand-authored
+# downsample (0x2C0083 / 0x18C) and deadbeef (0x44) as known-value oracles.
+fn test_gfx9_abi_rsrc() {
+    # downsample: v0..v14 (15 -> alloc 16, VGPRS=3), s0..s19 (20 -> alloc 24, SGPRS=2)
+    assert_eq(gfx9_rsrc1(15, 20), 0x2C0083, "downsample rsrc1");
+    # a tiny kernel floors SGPRS at 1 (16 regs) and VGPRS at 0 (4 regs) = MIN
+    assert_eq(gfx9_rsrc1(4, 4), 0x2C0040, "small rsrc1 = MIN");
+    # downsample RSRC2: user_sgpr=6, tgid_x|y, no trap
+    assert_eq(gfx9_rsrc2(6, 1, 1, 0), 0x18C, "downsample rsrc2");
+    # deadbeef RSRC2: user_sgpr=2, trap, no tgid
+    assert_eq(gfx9_rsrc2(2, 0, 0, 1), 0x44, "deadbeef rsrc2");
+    return 0;
+}
+
+# The canonical ABI assignment: 2 buffer bindings + GlobalInvocationId.
+fn test_gfx9_abi_assign() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_bufvar(&m, 5, 0);
+    mir_set_bufvar(&m, 6, 1);
+    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    assert_eq(gfx9_abi_num_bindings(&abi), 2, "2 bindings");
+    assert_eq(gfx9_abi_user_sgpr(&abi), 4, "user_sgpr=4 (2 VA pairs)");
+    assert_eq(gfx9_abi_tgid_x(&abi), 1, "GID -> tgid_x enabled");
+    assert_eq(gfx9_abi_sgpr_base(&abi), 5, "sgpr_base = 4 user + 1 tgid");
+    assert_eq(gfx9_abi_vgpr_base(&abi), 1, "vgpr_base = 1 (v0 = LID)");
+    assert_eq(gfx9_abi_binding_sgpr(&abi, 0), 0, "binding 0 -> s0");
+    assert_eq(gfx9_abi_binding_sgpr(&abi, 1), 2, "binding 1 -> s2");
+    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_WORKGROUP_ID, 0), 4, "wgid.x -> s4");
+    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_LOCAL_INVOC_ID, 0), 0, "lid.x -> v0");
+    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_GLOBAL_INVOC_ID, 0), 0 - 1, "gid -> -1 (needs expansion)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -1866,5 +1909,7 @@ fn main(): i64 {
     test_gfx9_emit_alu_program();
     test_gfx9_emit_sub_noncommutative();
     test_gfx9_emit_errors();
+    test_gfx9_abi_rsrc();
+    test_gfx9_abi_assign();
     return assert_summary();
 }

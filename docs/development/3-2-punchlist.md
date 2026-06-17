@@ -565,9 +565,17 @@ hand-authored shaders stay as oracle + fallback.
     non-commutative `v_sub` was on the commutative path and negated
     `vgpr - const`; dedicated `_emit_vop2_sub` picks `v_sub`/`v_subrev` (new
     opcodes) to always compute `a - b`, regression-tested 3 operand-file cases.
-  - [ ] **N.5b** — FLAT load/store + VOP3 `v_mul_lo_u32` encode + `gfx9_abi.cyr`
+  - [~] **N.5b** — FLAT load/store + VOP3 `v_mul_lo_u32` encode + `gfx9_abi.cyr`
     (canonical ABI: builtin→v0/s6/s7, binding→USER_DATA SGPR pairs) +
-    `gfx9_rsrc1`/`gfx9_rsrc2` (assert `rsrc1(14,19)==0x2C0083`, `rsrc2==0x18C`).
+    `gfx9_rsrc1`/`gfx9_rsrc2`.
+    - [x] **N.5b-1 (2026-06-17)** — `src/gfx9_abi.cyr`: `gfx9_rsrc1`/`gfx9_rsrc2`
+      (downsample `0x2C0083`/`0x18C` + deadbeef `0x44` oracles) + `gfx9_abi_assign`
+      (binding k→`s[2k]`, WGID→`s[user_sgpr..]`, LID→`v0..`, sgpr/vgpr bases;
+      GID→-1 needs-expansion). 12 asserts. Pin bumped 6.2.15→6.2.16. Adversarial
+      review (workflow).
+    - [ ] **N.5b-2** — FLAT load/store (SADDR: offset VGPR + binding USER_DATA
+      base SGPR) + VOP3 `v_mul_lo_u32` + `GISEL_EXTRACT` builtin resolution, in
+      `gfx9_compile.cyr` through the ABI.
   - [ ] **N.5c** — SAXPY first oracle: top-level `gfx9_compile` (validate→lower→
     uniformity→isel→regalloc→abi→waitcnt→emit→pad) + byte fixture.
   - [ ] **N.5d** — dispatch seam: `_backend_native_shader_module_create` calls
