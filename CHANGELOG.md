@@ -94,6 +94,42 @@ for the immediate forward pointer.
 - Regression asserts for all of these added (`test_spirv_lower_n2b1_review`,
   5 crafted-module cases proving fail-loud + no OOB).
 
+### Added — Phase N.2b-2 (SPIR-V → MIR lowering, buffer memory path) — completes N.2
+- `spirv_lower.cyr` gains the memory path. `_spirv_lower_access_chain` (MVP shape
+  pointer → struct{ runtimearray<scalar> }, exactly two indices) records a
+  `(binding, byte-offset)` access in the ptr side-table: a **constant** array
+  index folds to a `const_off` (overflow-guarded — `civ > 0x7FFFFFFF / stride`
+  → `MIR_ERR_OVERFLOW`); a **dynamic** index emits a synth `IMUL(index, stride)`
+  whose result is the offset. `_spirv_lower_load` (PTR src) and
+  `_spirv_lower_store` emit `MIR_OP_LOAD` / `MIR_OP_STORE` referencing the ptr
+  record (`a` = off_id so the uniformity sweep classifies the load; `b` = ptr
+  index). Deeper nesting / non-zero struct member / non-pointer result-type all
+  fail loud (`MIR_ERR_BAD_ACCESS_CHAIN`). The dynamic-index range-vs-array-length
+  check is flagged as an N.6 / audit gate (the runtime length is not static here).
+  The `consts` table threads back through the lowering (the access chain needs
+  the member/array-index constant values).
+- `tests/tcyr/compiler.tcyr` +42 asserts: the **full SAXPY** (`y[gid.x] =
+  a*x[gid.x] + y[gid.x]`, two StorageBuffer bindings) lowered end-to-end — the
+  9-instruction stream, the synth offset `IMUL`s, the two ptr records + bindings,
+  and every value's uniformity (GID-indexed loads + the arithmetic all divergent)
+  — plus access-chain variants (constant-index fold, offset overflow, bad member,
+  and the review-regression cases below).
+
+### Fixed — N.2b-2 adversarial review (2 confirmed findings, both fixed pre-merge)
+- **vec3 (non-scalar) element stride miscomputation:** `stride = mir_type_count
+  (elem) * 4` gives 12 for a `vec3` runtime-array element, but the buffer array
+  stride is 16 — and nothing enforced the documented scalar-element MVP. The
+  access chain now requires a scalar element (`MIR_ERR_BAD_ACCESS_CHAIN`
+  otherwise); vector/aggregate elements + the `ArrayStride` decoration are
+  deferred. (Latent: the wrong stride would become a GPU wrong-write once N.3
+  ships.)
+- **Constant array index not validated as an integer:** the const-fold path
+  checked "is it a constant?" but not "is it an integer?", so a float constant's
+  bits could be reinterpreted as the index. It now requires an i32/u32 const
+  index (`MIR_ERR_BAD_ACCESS_CHAIN` otherwise) before the overflow-guarded fold.
+- Regression asserts added (vec-element → bad-access-chain, float-index →
+  bad-access-chain, integer huge-index → overflow).
+
 ### Changed
 - `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/mir.cyr` +
   `src/spirv_lower.cyr` (after `spirv_parse.cyr` — they consume its accessors).
@@ -103,9 +139,9 @@ for the immediate forward pointer.
   is `m`, not `mod`.
 
 ### Next
-- N.2b-2 — the buffer memory path in `spirv_lower.cyr`: `OpAccessChain` +
-  `OpLoad`/`OpStore` of a StorageBuffer + the offset-overflow audit guard (the
-  full SAXPY). Closes N.2; then N.3 (instruction selection) for 3.2.6.
+- **N.2 is complete** (MIR + uniformity + SPIR-V→MIR lowering). Next: N.3 —
+  instruction selection (`src/gfx9_isel.cyr`): MIR op + result-uniformity → GFX9
+  virtual-register instructions, driving the gfx9_encode encoders. 3.2.6.
 
 ## [3.2.5] — 2026-06-16
 

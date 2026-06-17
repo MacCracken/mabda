@@ -487,8 +487,22 @@ hand-authored shaders stay as oracle + fallback.
   ids, and the lowering indexed tables with them) and a silent empty-body
   success; all now bound-checked / fail-loud, with 5 crafted-module regression
   asserts.
-  **N.2b-2 (next):** the buffer memory path — `OpAccessChain` + `OpLoad`/`OpStore`
-  of a StorageBuffer + the offset-overflow audit guard (the full SAXPY).
+  **N.2b-2 done (2026-06-16):** the buffer memory path. `_spirv_lower_access_chain`
+  (MVP shape pointer→struct{runtimearray<scalar>}, 2 indices) records a
+  `(binding, byte-offset)` access in the ptr side-table — a constant array index
+  folds to `const_off` (overflow-guarded `civ > 0x7FFFFFFF/stride`), a dynamic
+  index emits a synth `IMUL(index, stride)`; `OpLoad`/`OpStore` of the pointer
+  emit `MIR_OP_LOAD`/`STORE`. 40 asserts: the **full SAXPY** (`y[gid.x] =
+  a*x[gid.x] + y[gid.x]`) lowered end-to-end — 9-instr stream, the 2 ptr records
+  + bindings, and every value's uniformity (GID-indexed loads + arithmetic all
+  divergent) — plus access-chain variants (const-index fold, offset overflow,
+  bad member). **Adversarial review (workflow): 2 confirmed findings, both fixed
+  pre-merge** — vec3/non-scalar element stride miscomputation (now requires a
+  scalar element, fail-loud) and a constant array index not validated as an
+  integer (now requires i32/u32, fail-loud); regression asserts added. The
+  binding-range and dynamic-offset-range checks remain flagged N.6/audit gates.
+  **N.2 is COMPLETE.**
+  **Next:** N.3 (instruction selection, `src/gfx9_isel.cyr`) for 3.2.6.
 - [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
   (`src/gfx9_isel.cyr`).
 - [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,

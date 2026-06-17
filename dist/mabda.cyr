@@ -6214,22 +6214,108 @@ fn _spirv_lower_unary(ptr, off, wc, mop, types, m): i64 {
 }
 
 # OpLoad: a load of a builtin variable aliases the result to the seeded builtin
-# value (no instruction). A load of a buffer pointer is N.2b-2 (fail loud here).
+# value (no instruction); a load of a buffer pointer (an OpAccessChain result,
+# kind PTR) emits MIR_OP_LOAD referencing the ptr side-table record (a = off_id
+# so the uniformity sweep classifies the load; b = ptr index for N.3).
 fn _spirv_lower_load(ptr, off, wc, m): i64 {
     if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     var src = spirv_word(ptr, off + 3);
     # `src` indexes vals[] (sized cap_ids) — bound it before mir_val_kind reads it.
     if (src == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     if (src >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
-    if (mir_val_kind(m, src) == MIR_VK_BUILTIN) {
+    var k = mir_val_kind(m, src);
+    if (k == MIR_VK_BUILTIN) {
         return _mir_set_val(m, spirv_word(ptr, off + 2), MIR_VK_BUILTIN,
         mir_val_type(m, src), mir_val_unif(m, src), 0 - 1, mir_val_payload(m, src));
+    }
+    if (k == MIR_VK_PTR) {
+        var pidx = mir_val_payload(m, src);
+        var e = mir_emit(m, MIR_OP_LOAD, spirv_word(ptr, off + 2), mir_ptr_elem_type(m, pidx),
+        mir_ptr_off_id(m, pidx), pidx, 0, MIR_FLAG_B_IMM);
+        if (e < 0) { return e; }
+        return 0;
     }
     return 0 - MIR_ERR_UNSUPPORTED_OP;
 }
 
+# OpStore %pointer %object: pointer(w1, a PTR), object(w2, the value). Emits
+# MIR_OP_STORE (no result; a = off_id, b = ptr index, c = value id).
+fn _spirv_lower_store(ptr, off, wc, m): i64 {
+    if (wc < 3) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var pid = spirv_word(ptr, off + 1);
+    if (pid == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    if (pid >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    if (mir_val_kind(m, pid) != MIR_VK_PTR) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var pidx = mir_val_payload(m, pid);
+    var e = mir_emit(m, MIR_OP_STORE, 0, MIR_T_VOID, mir_ptr_off_id(m, pidx), pidx,
+    spirv_word(ptr, off + 2), MIR_FLAG_B_IMM);
+    if (e < 0) { return e; }
+    return 0;
+}
+
+fn _spirv_finish_ptr(m, rid, binding, elem, off_id, const_off, dynamic): i64 {
+    var pr = mir_add_ptr(m, rid, binding, elem, off_id, const_off, dynamic);
+    if (pr < 0) { return pr; }
+    return 0;
+}
+
+# OpAccessChain, MVP shape: pointer -> struct{ runtimearray<scalar> }, exactly two
+# indices: result-type(w1, pointer-to-element), result(w2, %ptr), base(w3, %var),
+# member-index(w4, const = 0), array-index(w5, id). Records a (binding, byte-
+# offset) access; byte offset = array_index * element_stride. A constant index
+# folds to const_off (overflow-guarded); a dynamic index emits a synth IMUL whose
+# result is off_id. Deeper nesting / non-zero member / non-pointer result-type all
+# fail loud (deferred). The dynamic-index range vs the array length is an N.6/audit
+# gate (the runtime length is not statically known here).
+fn _spirv_lower_access_chain(ptr, off, wc, types, consts, deco, m): i64 {
+    var idb = spirv_hdr_id_bound(ptr);
+    if (wc != 6) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    var rty = spirv_word(ptr, off + 1);
+    var rid = spirv_word(ptr, off + 2);
+    var base = spirv_word(ptr, off + 3);
+    var midx = spirv_word(ptr, off + 4);
+    var aidx = spirv_word(ptr, off + 5);
+    if (rty == 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    if (rty >= idb) { return 0 - MIR_ERR_ID_OOR; }
+    if (base == 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    if (base >= idb) { return 0 - MIR_ERR_ID_OOR; }
+    if (midx >= idb) { return 0 - MIR_ERR_ID_OOR; }
+    if (aidx == 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    if (aidx >= idb) { return 0 - MIR_ERR_ID_OOR; }
+    if (spirv_type_kind(types, rty) != SPIRV_TYK_POINTER) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    var elem = _mir_lower_type(types, spirv_type_p1(types, rty), idb);
+    if (elem == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    # MVP element must be a SCALAR: a vector/aggregate element needs the buffer
+    # layout array stride (e.g. vec3 -> 16, NOT count*4) plus the ArrayStride
+    # decoration the N.1b parser does not record. Deferred — fail loud. With a
+    # scalar element the stride is the 4-byte scalar size.
+    if (mir_type_count(elem) != 1) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    var stride = 4;
+    # MVP: single-member struct, the member index must be the constant 0.
+    if (spirv_const_type(consts, midx) == 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    if (spirv_const_value(consts, midx) != 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+    var binding = spirv_deco_binding(deco, base);
+    # constant array index -> fold to a const byte offset. The index must be an
+    # INTEGER constant (else its bits would be reinterpreted as the index), and
+    # the resulting byte offset must not overflow i32.
+    if (spirv_const_type(consts, aidx) != 0) {
+        var aty = _mir_lower_type(types, spirv_const_type(consts, aidx), idb);
+        if (aty != MIR_T_I32) {
+            if (aty != MIR_T_U32) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
+        }
+        var civ = spirv_const_value(consts, aidx);
+        if (civ > (0x7FFFFFFF / stride)) { return 0 - MIR_ERR_OVERFLOW; }
+        return _spirv_finish_ptr(m, rid, binding, elem, 0, civ * stride, 0);
+    }
+    # dynamic array index -> off_id = aidx * stride (synth IMUL; stride immediate).
+    var off_id = mir_alloc_synth_id(m);
+    var e = mir_emit(m, MIR_OP_IMUL, off_id, MIR_T_U32, aidx, stride, 0, MIR_FLAG_B_IMM);
+    if (e < 0) { return e; }
+    return _spirv_finish_ptr(m, rid, binding, elem, off_id, 0, 1);
+}
+
 # Lower one executable body instruction. Returns 0, or a negative error.
-fn _spirv_lower_one_instr(ptr, off, wc, op, types, m): i64 {
+fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m): i64 {
     if (op == SPIRV_OP_BRANCH) { return 0 - LOWER_ERR_CONTROL_FLOW; }
     if (op == SPIRV_OP_BRANCH_CONDITIONAL) { return 0 - LOWER_ERR_CONTROL_FLOW; }
     if (op == SPIRV_OP_SELECTION_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
@@ -6263,14 +6349,16 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, m): i64 {
         if (e2 < 0) { return e2; }
         return 0;
     }
+    if (op == SPIRV_OP_ACCESS_CHAIN) { return _spirv_lower_access_chain(ptr, off, wc, types, consts, deco, m); }
     if (op == SPIRV_OP_LOAD) { return _spirv_lower_load(ptr, off, wc, m); }
+    if (op == SPIRV_OP_STORE) { return _spirv_lower_store(ptr, off, wc, m); }
     return 0 - MIR_ERR_UNSUPPORTED_OP;
 }
 
 # Walk to the entry function's OpFunction (result <id> == entry_id), then lower
 # its body up to OpFunctionEnd. Globals/types/decorations (before OpFunction) are
 # never re-seen here — the seed pass owns them.
-fn _spirv_lower_body(ptr, byte_len, types, m, entry_id): i64 {
+fn _spirv_lower_body(ptr, byte_len, types, consts, deco, m, entry_id): i64 {
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
     var in_body = 0;
@@ -6286,7 +6374,7 @@ fn _spirv_lower_body(ptr, byte_len, types, m, entry_id): i64 {
             }
         } else {
             if (op == SPIRV_OP_FUNCTION_END) { return 0; }
-            var r = _spirv_lower_one_instr(ptr, off, wc, op, types, m);
+            var r = _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m);
             if (r < 0) { return r; }
         }
         off = off + wc;
@@ -6301,15 +6389,15 @@ fn _spirv_lower_body(ptr, byte_len, types, m, entry_id): i64 {
 # Top-level driver
 # ================================================================
 # Lower a validated SPIR-V compute module into MIR. `m` is an initialized MirMod;
-# `types`/`deco` are N.1b tables; `out_bi` is a caller-provided id_bound-sized
-# builtin side-table. Returns SPIRV_LOWER_OK or a negative error.
-fn spirv_lower_module(ptr, byte_len, types, deco, m, out_bi): i64 {
+# `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided
+# id_bound-sized builtin side-table. Returns SPIRV_LOWER_OK or a negative error.
+fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
     var entry = spirv_find_entry_point(ptr, byte_len);
     if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
     _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
     var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
     if (sr < 0) { return sr; }
-    var br = _spirv_lower_body(ptr, byte_len, types, m, entry);
+    var br = _spirv_lower_body(ptr, byte_len, types, consts, deco, m, entry);
     if (br < 0) { return br; }
     mir_finalize_block0(m);
     mir_run_uniformity(m);
