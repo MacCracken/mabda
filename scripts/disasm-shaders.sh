@@ -76,3 +76,31 @@ dwords_to_bytes \
     0A08040C 0A0A060D F0800F00 00400004 BF8C0F70 C400180F 03020100 \
     BF810000 \
     | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+
+# ================================================================
+# Phase N.0 — per-FORM encoder round-trip (src/gfx9_encode.cyr)
+# ================================================================
+# One representative dword (or dword pair) per GFX9 instruction format the
+# operand-parameterized encoders in gfx9_encode.cyr emit. These are the SAME
+# bytes the gfx9_encode unit oracle (tests/tcyr/compiler.tcyr) asserts the
+# encoders produce — disassembling them here is the INDEPENDENT llvm-mc check
+# that each format is a valid gfx90c encoding decoding to the expected
+# mnemonic (per feedback_verify_gfx9_shader_bytes_with_llvm_mc). If an encoder
+# bit-field is one off, the Cyrius oracle catches the byte and THIS catches
+# the meaning. Compute-only formats (EXP/MIMG are out of the N compiler scope).
+echo
+echo "=== Phase N.0 per-form encoder round-trip ==="
+echo "--- VOP1: v_mov_b32_e32 v0, s0 (0x7E000200) ---"
+dwords_to_bytes 7E000200 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- VOP2: v_lshlrev_b32_e32 v2, 1, v0 (0x24040081) ---"
+dwords_to_bytes 24040081 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- VOP3a: v_add3_u32 v8, v8, v9, v10 (0xD1FF0008 0x042A1308) ---"
+dwords_to_bytes D1FF0008 042A1308 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- SOP2: s_mul_i32 s8, s7, s4 (0x92080407) ---"
+dwords_to_bytes 92080407 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- SOPP: s_waitcnt vmcnt(0) lgkmcnt(0) (0xBF8C0070) ---"
+dwords_to_bytes BF8C0070 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- SMEM: s_load_dwordx8 s[0:7], s[0:1], 0x0 (0xC00E0000 0x00000000) ---"
+dwords_to_bytes C00E0000 00000000 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c
+echo "--- FLAT(global): global_load_dwordx2 v[4:5], v[0:1], off (0xDC548000 0x047F0000) ---"
+dwords_to_bytes DC548000 047F0000 | llvm-mc --disassemble --arch=amdgcn --mcpu=gfx90c

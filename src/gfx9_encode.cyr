@@ -1,0 +1,229 @@
+# @internal — GFX9 instruction encoders (Phase N.0, the compiler's output stage)
+# gfx9_encode.cyr — operand-parameterized GFX9 ISA encoders
+#
+# Phase N (docs/proposals/v3.2-spirv-gfx9-native-lowering.md) builds an
+# in-tree SPIR-V → GFX9 compute compiler. N.0 is the SAFETY NET that lands
+# before any generated code exists: it lifts the fixed, hand-verified byte
+# emitters in backend_native_shaders.cyr into general, operand-parameterized
+# encoders — one pure function per GFX9 instruction FORMAT — so the later
+# instruction-selection / register-allocation stages emit bytes through a
+# stage that is already proven correct.
+#
+# THE ORACLE (tests/tcyr/compiler.tcyr): every encoder is regression-tested
+# to reproduce, byte-for-byte, the exact dwords the hand-authored shaders in
+# backend_native_shaders.cyr already pin (each of which is itself
+# llvm-mc-round-tripped on gfx90c per
+# feedback_verify_gfx9_shader_bytes_with_llvm_mc). So an encoder bug is
+# caught against ~90 known-good dwords *before* it can reach hardware. The
+# hand-authored shader builders are LEFT UNTOUCHED — they stay the
+# HW-verified ground truth; these encoders are a new, independently-proven
+# library the compiler's N.5 encode stage will drive.
+#
+# Authorities: GFX9/Vega ISA reference (instruction-format bit layouts) +
+# the byte constants in backend_native_shaders.cyr (the regression oracle).
+# Pure byte math: no syscalls, no fn deps, no allocation. Included in the
+# build chain BEFORE backend_native_shaders.cyr — the hand-authored shader
+# builders there were refactored (N.0 follow-on) to emit through these
+# encoders, so this module is now their dependency.
+#
+# SCOPE (matches the proposal's compute-only compiler boundary): this lifts
+# the formats the compute compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP,
+# SMEM, FLAT(global). EXP (graphics color/pos export) and MIMG (image
+# load/sample) are NOT lifted here: the proposal scopes the compiler
+# "compute-only, no graphics shaders, no texture sampling", so their
+# encoders land with a future graphics/texture compiler phase, not N.0.
+# The hand-authored EXP/MIMG dwords keep their existing byte-pinned tests.
+
+# ================================================================
+# Operand encoding — VOP src field (9-bit) value table
+# ================================================================
+# GFX9 VOP source operands share a 9-bit encoding:
+#   0..101    SGPR 0..101
+#   124..127  m0 / exec / etc. (special; not emitted here)
+#   128       inline constant 0
+#   129..192  inline constants 1..64
+#   193..208  inline constants -1..-16
+#   240..247  inline f32 0.5/-0.5/1.0/-1.0/2.0/-2.0/4.0/-4.0
+#   255       a 32-bit literal follows in the next dword
+#   256..511  VGPR 0..255  (256 + index)
+var GFX9_SRC_LITERAL = 255;            # src0 = 255 → literal dword follows
+var GFX9_INLINE_F32_0_0 = 128;         # inline f32 0.0
+var GFX9_INLINE_F32_1_0 = 242;         # inline f32 1.0
+var GFX9_SADDR_OFF = 127;              # FLAT SADDR field = 127 → "off" (no scalar addr)
+var GFX9_FLAT_SEG_GLOBAL = 2;          # FLAT SEG field: 0=flat, 1=scratch, 2=global
+
+# A VGPR as a 9-bit VOP src operand.
+fn gfx9_vgpr(n): i64 {
+    return 256 + (n & 0xFF);
+}
+
+# An SGPR as a 9-bit VOP src operand (identity 0..101; documents intent).
+fn gfx9_sgpr(n): i64 {
+    return n & 0xFF;
+}
+
+# An integer inline-constant as a 9-bit VOP src operand.
+# Returns GFX9_SRC_LITERAL (255) when k is outside the inline range
+# [-16, 64] — the caller then emits k as a trailing literal dword.
+fn gfx9_inline_int(k): i64 {
+    if (k >= 0) {
+        if (k <= 64) { return 128 + k; }
+        return GFX9_SRC_LITERAL;
+    }
+    var neg = 0 - k;
+    if (neg <= 16) { return 192 + neg; }
+    return GFX9_SRC_LITERAL;
+}
+
+# ================================================================
+# Per-format opcode constants (GFX9 numbering)
+# ================================================================
+# VOP1 (single-dword) — bits 16-9 opcode.
+var GFX9_VOP1_V_MOV_B32     = 0x01;
+var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
+var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
+
+# VOP2 (single-dword) — bits 30-25 opcode.
+var GFX9_VOP2_V_MUL_F32     = 0x05;
+var GFX9_VOP2_V_LSHRREV_B32 = 0x10;
+var GFX9_VOP2_V_LSHLREV_B32 = 0x12;
+var GFX9_VOP2_V_AND_B32     = 0x13;
+var GFX9_VOP2_V_OR_B32      = 0x14;
+var GFX9_VOP2_V_ADD_U32     = 0x34;
+
+# VOP3a (two-dword) — bits 25-16 opcode (10-bit).
+var GFX9_VOP3_V_BFE_U32     = 0x1C8;
+var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
+var GFX9_VOP3_V_OR3_B32     = 0x202;
+
+# SOP2 (single-dword) — bits 29-23 opcode.
+var GFX9_SOP2_S_ADD_U32     = 0x00;
+var GFX9_SOP2_S_ADD_I32     = 0x02;
+var GFX9_SOP2_S_ADDC_U32    = 0x04;
+var GFX9_SOP2_S_LSHL_B32    = 0x1C;
+var GFX9_SOP2_S_MUL_I32     = 0x24;
+
+# SOPP (single-dword) — bits 22-16 opcode.
+var GFX9_SOPP_S_NOP         = 0x00;
+var GFX9_SOPP_S_ENDPGM      = 0x01;
+var GFX9_SOPP_S_WAITCNT     = 0x0C;
+
+# SMEM (two-dword) — bits 25-18 opcode.
+var GFX9_SMEM_S_LOAD_DWORD   = 0x00;
+var GFX9_SMEM_S_LOAD_DWORDX2 = 0x01;
+var GFX9_SMEM_S_LOAD_DWORDX4 = 0x02;
+var GFX9_SMEM_S_LOAD_DWORDX8 = 0x03;
+
+# FLAT/global (two-dword) — bits 24-18 opcode.
+var GFX9_FLAT_GLOBAL_LOAD_DWORDX2 = 0x15;
+var GFX9_FLAT_GLOBAL_STORE_DWORD  = 0x1C;
+
+# ================================================================
+# VOP1 — vector ALU, one source.   0x7E000000 | vdst<<17 | op<<9 | src0
+# ================================================================
+# Marker bits 31-25 = 0b0111111. Reproduces e.g. v_mov_b32 v0,s0 = 0x7E000200.
+fn gfx9_enc_vop1(op, vdst, src0): i64 {
+    return 0x7E000000 | ((vdst & 0xFF) << 17) | ((op & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOP2 — vector ALU, two sources.  op<<25 | vdst<<17 | vsrc1<<9 | src0
+# ================================================================
+# Marker bit 31 = 0. src0 is the full 9-bit operand (SGPR/VGPR/inline/literal);
+# vsrc1 is always a VGPR (8-bit index). Reproduces v_lshlrev_b32 v2,1,v0 =
+# 0x24040081 and v_mul_f32 v2,s12,v2 = 0x0A04040C.
+fn gfx9_enc_vop2(op, vdst, src0, vsrc1): i64 {
+    return ((op & 0x3F) << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOP3a — vector ALU, three sources (two dwords).
+# ================================================================
+# Word 0: 0xD0000000 | op<<16 | vdst   (clamp/opsel/abs = 0 for the MVP).
+# Word 1: src2<<18 | src1<<9 | src0     (omod/neg = 0).
+# Marker bits 31-26 = 0b110100. Reproduces v_add3_u32 v8,v8,v9,v10 =
+# 0xD1FF0008 / 0x042A1308.
+fn gfx9_enc_vop3a_lo(op, vdst): i64 {
+    return 0xD0000000 | ((op & 0x3FF) << 16) | (vdst & 0xFF);
+}
+
+fn gfx9_enc_vop3a_hi(src0, src1, src2): i64 {
+    return ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# SOP2 — scalar ALU, two sources.  0x80000000 | op<<23 | sdst<<16 | ssrc1<<8 | ssrc0
+# ================================================================
+# Marker bits 31-30 = 0b10. ssrc0/ssrc1 are 8-bit (SGPR or inline constant);
+# inline 0 = 128. Reproduces s_mul_i32 s8,s7,s4 = 0x92080407 and
+# s_addc_u32 s13,s1,0 = 0x820D8001.
+fn gfx9_enc_sop2(op, sdst, ssrc0, ssrc1): i64 {
+    return 0x80000000 | ((op & 0x7F) << 23) | ((sdst & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
+}
+
+# ================================================================
+# SOPP — scalar program control.  0xBF800000 | op<<16 | simm16
+# ================================================================
+# Marker bits 31-23 = 0b101111111. Reproduces s_endpgm = 0xBF810000,
+# s_nop 0 = 0xBF800000, s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070.
+fn gfx9_enc_sopp(op, simm16): i64 {
+    return 0xBF800000 | ((op & 0x7F) << 16) | (simm16 & 0xFFFF);
+}
+
+# ================================================================
+# SMEM — scalar memory load (two dwords).
+# ================================================================
+# Word 0: 0xC0000000 | op<<18 | IMM(1)<<17 | glc<<16 | sdata<<6 | sbase
+# Word 1: the immediate byte offset.
+# `sbase` is the SBASE FIELD = (base SGPR index >> 1) (SMEM bases are SGPR
+# pairs). `sdata` is the destination SGPR index. IMM is always 1 (immediate
+# offset form). Reproduces s_load_dwordx8 s[0:7],s[0:1],0x0 = 0xC00E0000 and
+# s_load_dwordx2 s[12:13],s[0:1],0x30 = 0xC0060300 / 0x30.
+fn gfx9_enc_smem_lo(op, sdata, sbase, glc): i64 {
+    return 0xC0000000 | ((op & 0xFF) << 18) | (1 << 17) | ((glc & 1) << 16) | ((sdata & 0x7F) << 6) | (sbase & 0x3F);
+}
+
+# ================================================================
+# FLAT (global segment) — vector memory (two dwords).
+# ================================================================
+# Word 0: 0xDC000000 | op<<18 | slc<<17 | glc<<16 | seg<<14 | offset(13-bit)
+# Word 1: vdst<<24 | saddr<<16 | data<<8 | vaddr
+# For a global op pass seg = GFX9_FLAT_SEG_GLOBAL and saddr = GFX9_SADDR_OFF
+# (off → address comes wholly from the v[addr:addr+1] VGPR pair). `data` is
+# the store-source VGPR (stores) and `vdst` the load-dest VGPR (loads).
+# Reproduces global_store_dword v[0:1],v2,off glc slc = 0xDC738000 / 0x007F0200
+# and global_load_dwordx2 v[4:5],v[0:1],off = 0xDC548000 / 0x047F0000.
+fn gfx9_enc_flat_lo(op, seg, offset, glc, slc): i64 {
+    var w = 0xDC000000 | ((op & 0x7F) << 18) | ((slc & 1) << 17) | ((glc & 1) << 16);
+    return w | ((seg & 3) << 14) | (offset & 0x1FFF);
+}
+
+fn gfx9_enc_flat_hi(vdst, saddr, data, vaddr): i64 {
+    return ((vdst & 0xFF) << 24) | ((saddr & 0x7F) << 16) | ((data & 0xFF) << 8) | (vaddr & 0xFF);
+}
+
+# ================================================================
+# Emit helpers — store an encoded dword into an ISA stream and advance.
+# ================================================================
+# The N.5 compiler encode stage and the (refactored) hand-authored shader
+# builders both lay down a contiguous GFX9 ISA byte stream. gfx9_emit32 stores
+# one dword at `pos` and returns the next write position (pos + 4) — the
+# running-position idiom that replaces manual `buf + pos + N` offset math.
+fn gfx9_emit32(buf, pos, dword): i64 {
+    store32(buf + pos, dword);
+    return pos + 4;
+}
+
+# Append the AMDGPU-mandated 16 × s_nop 0 prefetch padding (64 bytes) that
+# every GFX9 shader needs after s_endpgm: the CP prefetches past the program
+# end, and without the pad it can fetch into an unmapped page. Returns
+# pos + 64. (Lifted from the identical loop duplicated in every shader builder.)
+fn gfx9_emit_prefetch_pad(buf, pos): i64 {
+    var p = pos;
+    var i = 0;
+    while (i < 16) {
+        p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_NOP, 0));
+        i = i + 1;
+    }
+    return p;
+}

@@ -18,6 +18,111 @@ for the immediate forward pointer.
 Nothing staged yet. File changes under a dated `## [X.Y.Z] — YYYY-MM-DD`
 section when they ship.
 
+## [3.2.5] — 2026-06-16
+
+**Native SPIR-V → GFX9 compiler — foundation (Phases N.0 + N.1).** The first two
+stages of the in-tree compute compiler
+(`docs/proposals/v3.2-spirv-gfx9-native-lowering.md`), both pure CPU with no
+public-API change. **N.0** lifts the hand-authored GFX9 ISA into
+operand-parameterized encoders proven byte-identical against ~90 known-good
+dwords, then re-expresses the six HW-verified shader builders through them (zero
+byte change, the proposal's round-trip regression check). **N.1** adds the SPIR-V
+front end: `spirv_validate_stream`, the untrusted-input rejection gate, plus the
+type / constant / decoration lookup tables the lowering (N.2) will consume.
+Toolchain **6.2.14 → 6.2.15**. CPU suite 2908 → **3077** assertions.
+
+### Added — Phase N.0 (native SPIR-V→GFX9 compiler: encoder lift + byte oracle)
+- `src/gfx9_encode.cyr` — operand-parameterized GFX9 instruction encoders, the
+  output stage of the in-tree SPIR-V→GFX9 compute compiler
+  (`docs/proposals/v3.2-spirv-gfx9-native-lowering.md`). One pure encoder per
+  compute-format the compiler emits — VOP1, VOP2, VOP3a, SOP2, SOPP, SMEM,
+  FLAT(global) — plus VOP src-operand helpers (`gfx9_vgpr` / `gfx9_sgpr` /
+  `gfx9_inline_int`) and per-format opcode constants. Pure byte math, no deps.
+- `tests/tcyr/compiler.tcyr` — the N.0 regression ORACLE (118 asserts): every
+  encoder reproduces, byte-for-byte, the hand-authored dwords in
+  `backend_native_shaders.cyr` (each already llvm-mc-round-tripped on gfx90c) —
+  the `store_deadbeef` shader, the full `downsample_2x2` SOP2/VOP1/VOP2/VOP3a
+  stream, and the textured-FS SMEM/`v_mul_f32`/`v_cvt` dwords — plus a capstone
+  that rebuilds `store_deadbeef` wholly through the encoders and `memeq`s the
+  HW-verified builder's output. The safety net before any *generated* code exists.
+- `scripts/disasm-shaders.sh` — a per-form llvm-mc round-trip section: one
+  representative encoder output per GFX9 format, each decoded to confirm it is a
+  valid gfx90c encoding of the expected mnemonic (independent of the Cyrius
+  oracle).
+- `gfx9_encode.cyr` emit helpers: `gfx9_emit32` (store one dword + advance — the
+  stream primitive the N.5 encode stage will drive) and `gfx9_emit_prefetch_pad`
+  (the AMDGPU-mandated 16 × `s_nop 0` tail, lifted from the loop that was
+  duplicated in all six shader builders).
+
+### Changed — N.0 follow-on refactor (shader builders now emit through the encoders)
+- All six hand-authored builders in `backend_native_shaders.cyr`
+  (`store_deadbeef`, `downsample_2x2`, `solid_red`, `fullscreen_triangle_vs`,
+  the two textured FSes) re-expressed from raw `store32(0xLITERAL)` dwords to
+  operand-level `gfx9_emit32(buf, p, gfx9_enc_*(...))` calls — self-documenting,
+  no magic dwords, and the proposal's "each fixed shader round-trips to its
+  known bytes through the new encoders" regression check. **Byte-identical:**
+  guarded by the pre-existing per-dword golden / checksum tests in `native.tcyr`
+  (e.g. the downsample's `179445143226` dword checksum) — the full suite is the
+  proof the produced bytes did not move. The duplicated `s_nop` pad loop is now
+  one `gfx9_emit_prefetch_pad` call.
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr`: `src/gfx9_encode.cyr` moved to
+  **before** `backend_native_shaders.cyr` (it is now the builders' dependency;
+  same "no deps" tier, after `_amdgpu`).
+
+### Unblocked
+- Toolchain pin **6.2.14 → 6.2.15** (`cyrius.cyml` + CLAUDE.md): upstream 6.2.15
+  repairs the macOS benchmark-timing path and a stdlib fix. `cycc` on the dev box
+  is already 6.2.15; the full suite + smoke + dist are green on it.
+
+### Added — Phase N.1 (SPIR-V parser: validate gate + lookup tables)
+- `src/spirv_parse.cyr` — the compiler's front end (stage N.1 of
+  `docs/proposals/v3.2-spirv-gfx9-native-lowering.md`). Word/header accessors,
+  `(opcode, wordcount)` instruction decode, and `spirv_validate_stream` — the
+  UNTRUSTED-INPUT REJECTION GATE: header via the Phase S `_spirv_validate`
+  (bad-magic / short / unaligned / byte-swapped / id-bound / over-cap) plus a
+  whole-stream instruction walk that rejects a zero word count (would not
+  advance) and any instruction that runs past the end. Plus probes:
+  `spirv_count_instructions`, `spirv_find_entry_point` (GLCompute), and
+  `spirv_find_local_size`. Pure byte walking, no syscalls/alloc; included after
+  `wgpu_descriptors.cyr` so it reuses `_spirv_validate`.
+- `spirv_parse.cyr` N.1b — the type / constant / decoration LOOKUP TABLES the
+  SSA model N.2 lowers from: caller-provided buffers of `id_bound` fixed-size
+  records indexed directly by `<id>` (no hashmap, no alloc → callers/tests stay
+  stack-based). `spirv_build_type_table` (void/bool/int/float/vector/array/
+  runtime-array/struct/pointer/function, with per-op `wc` guards so operand
+  reads stay inside each instruction), `spirv_build_const_table` (scalar
+  OpConstant), `spirv_build_decoration_table` (Binding / DescriptorSet, -1 =
+  absent) + their accessors.
+- `tests/tcyr/compiler.tcyr` +51 parser asserts: a minimal GLCompute fixture for
+  N.1a (every accessor/probe + **5 rejection cases** — bad magic, truncated
+  header, zero id-bound, zero word count, instruction overrun) and a typed-module
+  fixture for N.1b (type/const/decoration table contents + absent-id defaults).
+
+### Notes
+- EXP (graphics color/pos export) and MIMG (image load/sample) dwords stay raw
+  literals in the builders — the proposal scopes the compiler compute-only, so
+  those encoders land with a future graphics/texture phase. Flagged inline in
+  each affected builder; the existing byte-pinned tests still cover them.
+
+### Security
+- The SPIR-V parser is a new UNTRUSTED-INPUT boundary (a consumer's toolchain
+  produced the bytes). `spirv_validate_stream` is the rejection gate — header via
+  `_spirv_validate` (bad-magic / short / unaligned / byte-swapped / id-bound /
+  over-cap) + a per-instruction word-count walk rejecting zero-wc (would not
+  advance) and stream overrun — and every table builder bounds-guards each
+  operand read by the instruction's declared word count. 5 malformed-input
+  rejection tests. Audit: `docs/audit/2026-06-16-phaseN01-audit.md` — 0 findings.
+
+### Metrics
+- CPU suite **2908 → 3077** assertions (N.0 encoder oracle +118, N.1 parser +51);
+  **13** domain test files (new `compiler.tcyr`). Bundle 16094 → **16814** lines
+  (gfx9_encode + emit helpers + spirv_parse; builder bodies trade magic dwords
+  for encoder calls).
+
+### Next
+- **3.2.5 content (N.0 + N.1) is complete** — ready to cut. Then N.2 (MIR +
+  uniformity lowering, `src/mir.cyr` + `src/spirv_lower.cyr`) opens 3.2.6.
+
 ## [3.2.4] — 2026-06-16
 
 **SPIR-V shader ingestion on wgpu (Phase S).** The byte-polymorphic shader

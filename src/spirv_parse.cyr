@@ -1,0 +1,339 @@
+# @internal — SPIR-V word-stream parser (Phase N.1, the compiler's front end)
+# spirv_parse.cyr — header validation + instruction iterator + module probes
+#
+# Stage N.1 of the in-tree SPIR-V → GFX9 compute compiler
+# (docs/proposals/v3.2-spirv-gfx9-native-lowering.md). A compiler ingests
+# FULLY UNTRUSTED bytes — a consumer's toolchain produced the SPIR-V — so
+# structural validation is the first audit gate: every field is bounds-checked
+# before use, and a malformed stream is rejected (never walked into UB).
+#
+# SPIR-V is a u32 word stream (SPIR-V spec §2.3): a 5-word header
+#   [0] magic 0x07230203   [1] version   [2] generator   [3] id-bound
+#   [4] schema (reserved, 0)
+# followed by instructions, each led by a word whose low 16 bits are the opcode
+# and whose high 16 bits are the word count (INCLUDING the leading word).
+#
+# N.1a (this file's first cut) provides: header accessors, the
+# (opcode, wordcount) decode, a whole-stream validator (the rejection gate),
+# instruction counting, and entry-point / LocalSize probes. The type /
+# constant / decoration LOOKUP TABLES (the SSA model N.2 lowers from) land at
+# N.1b. Reuses MABDA_SPIRV_MAGIC + `_spirv_validate` (the Phase S header check
+# in wgpu_descriptors.cyr) — this module is included after it. Pure byte
+# walking: no syscalls, no allocation.
+
+# ================================================================
+# SPIR-V opcodes (the subset N.1 references; SPIR-V spec §3.37)
+# ================================================================
+var SPIRV_OP_MEMORY_MODEL   = 14;
+var SPIRV_OP_ENTRY_POINT    = 15;
+var SPIRV_OP_EXECUTION_MODE = 16;
+var SPIRV_OP_CAPABILITY     = 17;
+var SPIRV_OP_FUNCTION       = 54;
+var SPIRV_OP_FUNCTION_END   = 56;
+var SPIRV_OP_LABEL          = 248;
+
+# Execution model (OpEntryPoint word 1) + execution mode (OpExecutionMode word 2)
+var SPIRV_EXEC_MODEL_GLCOMPUTE = 5;
+var SPIRV_EXEC_MODE_LOCAL_SIZE = 17;
+
+# The header is 5 words (20 bytes); instructions begin at word index 5.
+var SPIRV_HEADER_WORDS = 5;
+
+# Parse result codes. Header errors 1-6 PASS THROUGH from `_spirv_validate`
+# (1 too-short, 2 unaligned, 3 bad-magic, 4 byte-swapped, 5 id-bound-bad,
+# 6 over-cap). Instruction-stream errors use a disjoint 10+ range.
+var SPIRV_PARSE_OK          = 0;
+var SPIRV_PARSE_ERR_ZERO_WC = 10;   # an instruction declared word count 0 (would not advance)
+var SPIRV_PARSE_ERR_TRUNC   = 11;   # an instruction's words run past the end of the stream
+
+# ================================================================
+# Word + instruction-header accessors
+# ================================================================
+fn spirv_word(ptr, idx): i64 {
+    return load32(ptr + idx * 4);
+}
+
+fn spirv_hdr_magic(ptr): i64 {
+    return spirv_word(ptr, 0);
+}
+
+fn spirv_hdr_version(ptr): i64 {
+    return spirv_word(ptr, 1);
+}
+
+fn spirv_hdr_generator(ptr): i64 {
+    return spirv_word(ptr, 2);
+}
+
+fn spirv_hdr_id_bound(ptr): i64 {
+    return spirv_word(ptr, 3);
+}
+
+fn spirv_hdr_schema(ptr): i64 {
+    return spirv_word(ptr, 4);
+}
+
+# Opcode = low 16 bits of an instruction's leading word.
+fn spirv_op(word0): i64 {
+    return word0 & 0xFFFF;
+}
+
+# Word count (incl. the leading word) = high 16 bits. `>>` is logical on i64
+# (feedback_cyrius_logical_right_shift) and load32 zero-extends, so no masking
+# of sign bits is needed before the &.
+fn spirv_op_wordcount(word0): i64 {
+    return (word0 >> 16) & 0xFFFF;
+}
+
+# ================================================================
+# The rejection gate — validate the WHOLE stream before any walk
+# ================================================================
+# Header via `_spirv_validate`, then every instruction: word count must be >= 1
+# (a 0 would loop forever) and the instruction's words must not run past the
+# end. Returns SPIRV_PARSE_OK or the first error encountered. Call this before
+# any of the probe/walk fns below — they assume a validated stream.
+fn spirv_validate_stream(ptr, byte_len): i64 {
+    var hv = _spirv_validate(ptr, byte_len);
+    if (hv != 0) { return hv; }
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var wc = spirv_op_wordcount(spirv_word(ptr, off));
+        if (wc == 0) { return SPIRV_PARSE_ERR_ZERO_WC; }
+        if (off + wc > total) { return SPIRV_PARSE_ERR_TRUNC; }
+        off = off + wc;
+    }
+    return SPIRV_PARSE_OK;
+}
+
+# ================================================================
+# Probes (assume a validated stream)
+# ================================================================
+# Count instructions. Self-guards: returns -1 if the stream is malformed, so it
+# is safe to call without a prior validate.
+fn spirv_count_instructions(ptr, byte_len): i64 {
+    if (spirv_validate_stream(ptr, byte_len) != 0) { return 0 - 1; }
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    var n = 0;
+    while (off < total) {
+        off = off + spirv_op_wordcount(spirv_word(ptr, off));
+        n = n + 1;
+    }
+    return n;
+}
+
+# The GLCompute entry point's target <id>, or -1 if there is no OpEntryPoint
+# with the GLCompute execution model. Layout (SPIR-V spec OpEntryPoint):
+#   word0 | ExecutionModel (word1) | entry <id> (word2) | name... | iface...
+# The wc >= 3 guard keeps the word1/word2 reads inside the instruction even if a
+# (validated-but-odd) stream carries a short OpEntryPoint.
+fn spirv_find_entry_point(ptr, byte_len): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_ENTRY_POINT) {
+            if (wc >= 3) {
+                if (spirv_word(ptr, off + 1) == SPIRV_EXEC_MODEL_GLCOMPUTE) {
+                    return spirv_word(ptr, off + 2);
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0 - 1;
+}
+
+# Find the LocalSize execution mode for `entry_id`: writes x/y/z (3 × i64) to
+# `out_xyz` and returns 1, or returns 0 (out_xyz untouched) if absent. Layout:
+#   word0 | entry <id> (word1) | mode (word2) | x (word3) y (word4) z (word5)
+# The wc >= 6 guard keeps the x/y/z reads inside the instruction.
+fn spirv_find_local_size(ptr, byte_len, entry_id, out_xyz): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_EXECUTION_MODE) {
+            if (wc >= 6) {
+                if (spirv_word(ptr, off + 1) == entry_id) {
+                    if (spirv_word(ptr, off + 2) == SPIRV_EXEC_MODE_LOCAL_SIZE) {
+                        store64(out_xyz + 0, spirv_word(ptr, off + 3));
+                        store64(out_xyz + 8, spirv_word(ptr, off + 4));
+                        store64(out_xyz + 16, spirv_word(ptr, off + 5));
+                        return 1;
+                    }
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+# ================================================================
+# Phase N.1b — type / constant / decoration lookup tables
+# ================================================================
+# The SSA module model N.2 lowers from. Each table is a CALLER-PROVIDED buffer
+# of `id_bound` fixed-size records indexed directly by SPIR-V <id> (ids are
+# dense and < id_bound, so direct indexing beats a hashmap AND keeps callers/
+# tests stack-based — no bump-allocator pressure). The build fns ASSUME a
+# validated stream (call spirv_validate_stream first); they self-initialize
+# their buffer and bail (-1) if a zero-word-count instruction slips through.
+
+# Type-defining opcodes — the result <id> is word 1 for all of them.
+var SPIRV_OP_TYPE_VOID          = 19;
+var SPIRV_OP_TYPE_BOOL          = 20;
+var SPIRV_OP_TYPE_INT           = 21;
+var SPIRV_OP_TYPE_FLOAT         = 22;
+var SPIRV_OP_TYPE_VECTOR        = 23;
+var SPIRV_OP_TYPE_ARRAY         = 28;
+var SPIRV_OP_TYPE_RUNTIME_ARRAY = 29;
+var SPIRV_OP_TYPE_STRUCT        = 30;
+var SPIRV_OP_TYPE_POINTER       = 32;
+var SPIRV_OP_TYPE_FUNCTION      = 33;
+var SPIRV_OP_CONSTANT           = 43;
+var SPIRV_OP_VARIABLE           = 59;
+var SPIRV_OP_DECORATE           = 71;
+
+# Decoration operands (OpDecorate word 2).
+var SPIRV_DECO_BINDING        = 33;
+var SPIRV_DECO_DESCRIPTOR_SET = 34;
+
+# Type-table record kinds (slot 0 of a type record; 0 = id is not a type).
+var SPIRV_TYK_NONE          = 0;
+var SPIRV_TYK_VOID          = 1;
+var SPIRV_TYK_BOOL          = 2;
+var SPIRV_TYK_INT           = 3;   # p0 = width, p1 = signedness
+var SPIRV_TYK_FLOAT         = 4;   # p0 = width
+var SPIRV_TYK_VECTOR        = 5;   # p0 = component type <id>, p1 = count
+var SPIRV_TYK_ARRAY         = 6;   # p0 = element type <id>, p1 = length <id>
+var SPIRV_TYK_RUNTIME_ARRAY = 7;   # p0 = element type <id>
+var SPIRV_TYK_STRUCT        = 8;   # p0 = member count, p1 = first member type <id>
+var SPIRV_TYK_POINTER       = 9;   # p0 = storage class, p1 = pointee type <id>
+var SPIRV_TYK_FUNCTION      = 10;  # p0 = return type <id>
+
+# Record sizes (bytes). Caller sizes each table buffer to id_bound * REC.
+var SPIRV_TYPE_REC  = 24;   # [kind, p0, p1]
+var SPIRV_CONST_REC = 16;   # [result-type <id>, value]
+var SPIRV_DECO_REC  = 16;   # [binding, descriptor-set]  (-1 = absent)
+
+# ---- type table ----
+fn _spirv_set_type(out, id, kind, p0, p1): i64 {
+    var base = out + id * SPIRV_TYPE_REC;
+    store64(base + 0, kind);
+    store64(base + 8, p0);
+    store64(base + 16, p1);
+    return 0;
+}
+
+# Build the type table: out[id] = (kind, p0, p1) for every OpType* in the
+# stream. Returns 0, or -1 on a malformed (zero-wc) instruction. Per-op `wc`
+# guards keep operand reads inside the instruction (a compiler ingests
+# untrusted input). `a` = word 2, `b` = word 3 (read only when wc allows).
+fn spirv_build_type_table(ptr, byte_len, id_bound, out): i64 {
+    memset(out, 0, id_bound * SPIRV_TYPE_REC);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - 1; }
+        var op = spirv_op(w0);
+        if (wc >= 2) {
+            var id = spirv_word(ptr, off + 1);
+            var a = 0;
+            var b = 0;
+            if (wc >= 3) { a = spirv_word(ptr, off + 2); }
+            if (wc >= 4) { b = spirv_word(ptr, off + 3); }
+            if (op == SPIRV_OP_TYPE_VOID) { _spirv_set_type(out, id, SPIRV_TYK_VOID, 0, 0); }
+            if (op == SPIRV_OP_TYPE_BOOL) { _spirv_set_type(out, id, SPIRV_TYK_BOOL, 0, 0); }
+            if (op == SPIRV_OP_TYPE_FLOAT) {
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FLOAT, a, 0); }
+            }
+            if (op == SPIRV_OP_TYPE_FUNCTION) {
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_FUNCTION, a, 0); }
+            }
+            if (op == SPIRV_OP_TYPE_RUNTIME_ARRAY) {
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_RUNTIME_ARRAY, a, 0); }
+            }
+            if (op == SPIRV_OP_TYPE_STRUCT) {
+                if (wc >= 3) { _spirv_set_type(out, id, SPIRV_TYK_STRUCT, wc - 2, a); }
+            }
+            if (op == SPIRV_OP_TYPE_INT) {
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_INT, a, b); }
+            }
+            if (op == SPIRV_OP_TYPE_VECTOR) {
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_VECTOR, a, b); }
+            }
+            if (op == SPIRV_OP_TYPE_ARRAY) {
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_ARRAY, a, b); }
+            }
+            if (op == SPIRV_OP_TYPE_POINTER) {
+                if (wc >= 4) { _spirv_set_type(out, id, SPIRV_TYK_POINTER, a, b); }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+fn spirv_type_kind(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 0); }
+fn spirv_type_p0(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 8); }
+fn spirv_type_p1(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 16); }
+
+# ---- constant table ----
+# out[result-id] = (result-type <id>, value). Scalar OpConstant only (the 32-bit
+# value is word 3); composite/64-bit constants land when the lowering needs them.
+fn spirv_build_const_table(ptr, byte_len, id_bound, out): i64 {
+    memset(out, 0, id_bound * SPIRV_CONST_REC);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - 1; }
+        if (spirv_op(w0) == SPIRV_OP_CONSTANT) {
+            if (wc >= 4) {
+                var rid = spirv_word(ptr, off + 2);
+                store64(out + rid * SPIRV_CONST_REC + 0, spirv_word(ptr, off + 1));
+                store64(out + rid * SPIRV_CONST_REC + 8, spirv_word(ptr, off + 3));
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+fn spirv_const_type(out, id): i64 { return load64(out + id * SPIRV_CONST_REC + 0); }
+fn spirv_const_value(out, id): i64 { return load64(out + id * SPIRV_CONST_REC + 8); }
+
+# ---- decoration table ----
+# out[target-id] = (Binding, DescriptorSet); both default to -1 (absent). Only
+# the two binding decorations N.2 needs to resolve buffer slots are recorded.
+fn spirv_build_decoration_table(ptr, byte_len, id_bound, out): i64 {
+    memset(out, 0xFF, id_bound * SPIRV_DECO_REC);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - 1; }
+        if (spirv_op(w0) == SPIRV_OP_DECORATE) {
+            if (wc >= 4) {
+                var tid = spirv_word(ptr, off + 1);
+                var deco = spirv_word(ptr, off + 2);
+                var operand = spirv_word(ptr, off + 3);
+                if (deco == SPIRV_DECO_BINDING) { store64(out + tid * SPIRV_DECO_REC + 0, operand); }
+                if (deco == SPIRV_DECO_DESCRIPTOR_SET) { store64(out + tid * SPIRV_DECO_REC + 8, operand); }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+fn spirv_deco_binding(out, id): i64 { return load64(out + id * SPIRV_DECO_REC + 0); }
+fn spirv_deco_set(out, id): i64 { return load64(out + id * SPIRV_DECO_REC + 8); }
