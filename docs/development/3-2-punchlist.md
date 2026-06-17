@@ -467,9 +467,28 @@ hand-authored shaders stay as oracle + fallback.
   synth-id headroom/OOB (split `cap_ids` from `id_bound`), `mir_set_*` + 
   `mir_add_ptr` bounds/sentinel guards, and `_mir_lower_type` unbounded recursion
   + vector-of-vector corruption (require scalar vector component); regression
-  asserts added. **N.2b (next):** `src/spirv_lower.cyr` — the
-  SPIR-V-module→MIR walk + the BuiltIn/StorageClass gap-closing passes the N.1b
-  parser does not provide.
+  asserts added.
+  **N.2b-1 done (2026-06-16):** `src/spirv_lower.cyr` — the SPIR-V-module→MIR walk
+  for the NON-MEMORY subset + the BuiltIn-resolution gap-closing pass the N.1b
+  parser does not provide (`_spirv_resolve_builtins`). `spirv_lower_module`
+  validates the entry point, seeds globals (constants + StorageBuffer/Uniform/
+  PushConstant vars → BUFVAR, Input+BuiltIn vars → BUILTIN), walks the entry
+  function body dispatching ALU (IADD/ISUB/IMUL/SHL/SHR/AND/OR/XOR/FADD/FSUB/FMUL),
+  conversions, OpCompositeExtract, the builtin OpLoad alias, and OpReturn, then
+  runs the uniformity sweep. Control flow → `LOWER_ERR_CONTROL_FLOW`, unmapped →
+  `MIR_ERR_UNSUPPORTED_OP`, no entry → `LOWER_ERR_NO_ENTRY` (all fail loud). 33
+  asserts: a GlobalInvocationId-arithmetic kernel lowered end-to-end (builtin
+  resolve + load-alias + extract + ALU + uniformity), the StorageBuffer seed
+  path, and the 3 fail-loud negatives.
+  **Adversarial review (workflow): 9 confirmed findings, all fixed pre-merge** —
+  the untrusted-id OOB class (a controlled-offset OOB *write* via the
+  `OpDecorate BuiltIn` target + wild OOB *reads* from operand / result-type /
+  load-source / seed-var ids: `spirv_validate_stream` never bounds in-instruction
+  ids, and the lowering indexed tables with them) and a silent empty-body
+  success; all now bound-checked / fail-loud, with 5 crafted-module regression
+  asserts.
+  **N.2b-2 (next):** the buffer memory path — `OpAccessChain` + `OpLoad`/`OpStore`
+  of a StorageBuffer + the offset-overflow audit guard (the full SAXPY).
 - [ ] **N.3** *(3.2.6)* — Instruction selection, straight-line f32/i32/u32
   (`src/gfx9_isel.cyr`).
 - [ ] **N.4** *(3.2.7)* — Register allocation + `s_waitcnt` (no spill,

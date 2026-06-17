@@ -186,9 +186,17 @@ fn _mir_set_val_unif(m, id, unif): i64 {
 fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
     var n = load64(m + 32);
     if (n >= load64(m + 40)) { return 0 - MIR_ERR_CAP_EXCEEDED; }
+    var cap = load64(m + 64);
     if (result != 0) {
-        if (result >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        if (result >= cap) { return 0 - MIR_ERR_ID_OOR; }
     }
+    # Bound every NON-immediate operand against cap_ids: operands become vals[]
+    # indices in mir_run_uniformity, and an untrusted SPIR-V operand <id> would
+    # otherwise drive a wild OOB read there. Immediate operands (lane indices,
+    # etc.) are not ids and are skipped. (N.2b-1 adversarial review.)
+    if (a != 0) { if ((flags & MIR_FLAG_A_IMM) == 0) { if (a >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
+    if (b != 0) { if ((flags & MIR_FLAG_B_IMM) == 0) { if (b >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
+    if (c != 0) { if ((flags & MIR_FLAG_C_IMM) == 0) { if (c >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
     var base = load64(m + 8) + n * MIR_INSTR_REC;
     store64(base + 0, op);
     store64(base + 8, result | (type << 32));
@@ -260,7 +268,12 @@ fn mir_block_count_total(m): i64 { return 1; }   # MVP: one block (N.7 adds n_bl
 # by signedness, f32, bool, and vec2..4 of a supported scalar. Anything else
 # (non-32-bit width, matrices, images, unknown) → MIR_T_UNSUPPORTED so the
 # lowering can fail loud.
-fn _mir_lower_type(types, spv_tid): i64 {
+fn _mir_lower_type(types, spv_tid, id_bound): i64 {
+    # `spv_tid` comes from untrusted instruction words; the type table is sized
+    # id_bound records, so reject any id outside (0, id_bound) before indexing it
+    # (the recursion below re-enters with the component id, bounding it too).
+    if (spv_tid == 0) { return MIR_T_UNSUPPORTED; }
+    if (spv_tid >= id_bound) { return MIR_T_UNSUPPORTED; }
     var k = spirv_type_kind(types, spv_tid);
     if (k == SPIRV_TYK_INT) {
         if (spirv_type_p0(types, spv_tid) != 32) { return MIR_T_UNSUPPORTED; }
@@ -274,18 +287,20 @@ fn _mir_lower_type(types, spv_tid): i64 {
     if (k == SPIRV_TYK_BOOL) { return MIR_T_BOOL; }
     if (k == SPIRV_TYK_VECTOR) {
         var comp_id = spirv_type_p0(types, spv_tid);
-        # The component MUST be a scalar (INT/FLOAT/BOOL). This rejects
-        # vector-of-vector / vector-of-aggregate as UNSUPPORTED AND bounds the
-        # recursion: a crafted self-/mutually-referential component <id> would
-        # otherwise recurse forever (untrusted-input stack-overflow). A scalar
-        # component recurses exactly one level and terminates.
+        # Bound the component id before reading its kind (it is a table index from
+        # the stream too), then require it to be a scalar (INT/FLOAT/BOOL): this
+        # rejects vector-of-vector / vector-of-aggregate as UNSUPPORTED AND bounds
+        # the recursion (a crafted self-/mutually-referential component would
+        # otherwise recurse forever). A scalar component recurses one level.
+        if (comp_id == 0) { return MIR_T_UNSUPPORTED; }
+        if (comp_id >= id_bound) { return MIR_T_UNSUPPORTED; }
         var ck = spirv_type_kind(types, comp_id);
         if (ck != SPIRV_TYK_INT) {
             if (ck != SPIRV_TYK_FLOAT) {
                 if (ck != SPIRV_TYK_BOOL) { return MIR_T_UNSUPPORTED; }
             }
         }
-        var comp = _mir_lower_type(types, comp_id);
+        var comp = _mir_lower_type(types, comp_id, id_bound);
         if (comp == MIR_T_UNSUPPORTED) { return MIR_T_UNSUPPORTED; }
         var count = spirv_type_p1(types, spv_tid);
         if (count < 2) { return MIR_T_UNSUPPORTED; }

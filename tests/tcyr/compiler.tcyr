@@ -512,13 +512,13 @@ fn test_mir_type_distill() {
     var n = _spv_build_distill_types(&buf);
     var types[384];
     spirv_build_type_table(&buf, n, 16, &types);
-    assert_eq(_mir_lower_type(&types, 2), MIR_T_I32, "signed int32 -> I32");
-    assert_eq(_mir_lower_type(&types, 3), MIR_T_U32, "unsigned int32 -> U32");
-    assert_eq(_mir_lower_type(&types, 4), MIR_T_F32, "float32 -> F32");
-    assert_eq(_mir_lower_type(&types, 5), MIR_T_UNSUPPORTED, "float64 -> UNSUPPORTED");
-    assert_eq(_mir_lower_type(&types, 6), MIR_T_F32 | (4 << 8), "vec4 f32 -> F32|count4");
-    assert_eq(_mir_lower_type(&types, 7), MIR_T_UNSUPPORTED, "vec4 f64 -> UNSUPPORTED");
-    assert_eq(_mir_lower_type(&types, 8), MIR_T_UNSUPPORTED, "vec count5 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 2, 16), MIR_T_I32, "signed int32 -> I32");
+    assert_eq(_mir_lower_type(&types, 3, 16), MIR_T_U32, "unsigned int32 -> U32");
+    assert_eq(_mir_lower_type(&types, 4, 16), MIR_T_F32, "float32 -> F32");
+    assert_eq(_mir_lower_type(&types, 5, 16), MIR_T_UNSUPPORTED, "float64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "vec4 f32 -> F32|count4");
+    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vec4 f64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "vec count5 -> UNSUPPORTED");
     return 0;
 }
 
@@ -733,9 +733,9 @@ fn test_mir_review_n2a() {
     var n = _spv_build_bad_vectors(&buf);
     var types[384];
     spirv_build_type_table(&buf, n, 16, &types);
-    assert_eq(_mir_lower_type(&types, 6), MIR_T_F32 | (4 << 8), "valid vec4 f32 ok");
-    assert_eq(_mir_lower_type(&types, 7), MIR_T_UNSUPPORTED, "vector-of-vector -> UNSUPPORTED");
-    assert_eq(_mir_lower_type(&types, 8), MIR_T_UNSUPPORTED, "self-ref vector -> UNSUPPORTED (no crash)");
+    assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "valid vec4 f32 ok");
+    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vector-of-vector -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "self-ref vector -> UNSUPPORTED (no crash)");
     return 0;
 }
 
@@ -752,6 +752,271 @@ fn test_mir_emit_errors() {
     # result id >= id_bound -> ID_OOR
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
     assert_eq(mir_emit(&m, MIR_OP_IADD, 16, MIR_T_I32, 1, 1, 0, 0), 0 - MIR_ERR_ID_OOR, "result id OOR");
+    return 0;
+}
+
+# ================================================================
+# Phase N.2b-1 — SPIR-V → MIR lowering (spirv_lower.cyr)
+# ================================================================
+# A memory-free GLCompute kernel (id-bound 16, 352 bytes): loads
+# GlobalInvocationId, extracts .x, does int arithmetic on it + two constants.
+# Exercises builtin-resolve, the seed, the builtin OpLoad alias,
+# OpCompositeExtract, the ALU dispatch, OpReturn, and the uniformity sweep —
+# end-to-end, no buffer access (that is N.2b-2).
+#   %1 void  %2 fn()  %3 uint  %4 uvec3  %5 ptr Input uvec3  %6 main  %7 gid var
+#   %8 const 1  %9 const 2  %10 label  %11 load gid  %12 gid.x
+#   %13 x+1  %14 (x+1)*2  %15 1<<2 (both const -> uniform)
+fn _spv_build_gid_kernel(buf): i64 {
+    store32(buf +   0, 0x07230203);
+    store32(buf +   4, 0x00010300);
+    store32(buf +   8, 0);
+    store32(buf +  12, 16);
+    store32(buf +  16, 0);
+    store32(buf +  20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf +  24, 1);
+    store32(buf +  28, (3 << 16) | 14);   # OpMemoryModel Logical GLSL450
+    store32(buf +  32, 0);
+    store32(buf +  36, 1);
+    store32(buf +  40, (6 << 16) | 15);   # OpEntryPoint GLCompute %6 "main" %7
+    store32(buf +  44, 5);
+    store32(buf +  48, 6);
+    store32(buf +  52, 0x6E69616D);
+    store32(buf +  56, 0);
+    store32(buf +  60, 7);
+    store32(buf +  64, (6 << 16) | 16);   # OpExecutionMode %6 LocalSize 64 1 1
+    store32(buf +  68, 6);
+    store32(buf +  72, 17);
+    store32(buf +  76, 64);
+    store32(buf +  80, 1);
+    store32(buf +  84, 1);
+    store32(buf +  88, (4 << 16) | 71);   # OpDecorate %7 BuiltIn GlobalInvocationId
+    store32(buf +  92, 7);
+    store32(buf +  96, 11);
+    store32(buf + 100, 28);
+    store32(buf + 104, (2 << 16) | 19);   # OpTypeVoid %1
+    store32(buf + 108, 1);
+    store32(buf + 112, (3 << 16) | 33);   # OpTypeFunction %2 %1
+    store32(buf + 116, 2);
+    store32(buf + 120, 1);
+    store32(buf + 124, (4 << 16) | 21);   # OpTypeInt %3 32 0
+    store32(buf + 128, 3);
+    store32(buf + 132, 32);
+    store32(buf + 136, 0);
+    store32(buf + 140, (4 << 16) | 23);   # OpTypeVector %4 %3 3
+    store32(buf + 144, 4);
+    store32(buf + 148, 3);
+    store32(buf + 152, 3);
+    store32(buf + 156, (4 << 16) | 32);   # OpTypePointer %5 Input %4
+    store32(buf + 160, 5);
+    store32(buf + 164, 1);
+    store32(buf + 168, 4);
+    store32(buf + 172, (4 << 16) | 43);   # OpConstant %3 %8 1
+    store32(buf + 176, 3);
+    store32(buf + 180, 8);
+    store32(buf + 184, 1);
+    store32(buf + 188, (4 << 16) | 43);   # OpConstant %3 %9 2
+    store32(buf + 192, 3);
+    store32(buf + 196, 9);
+    store32(buf + 200, 2);
+    store32(buf + 204, (4 << 16) | 59);   # OpVariable %5 %7 Input
+    store32(buf + 208, 5);
+    store32(buf + 212, 7);
+    store32(buf + 216, 1);
+    store32(buf + 220, (5 << 16) | 54);   # OpFunction %1 %6 None %2
+    store32(buf + 224, 1);
+    store32(buf + 228, 6);
+    store32(buf + 232, 0);
+    store32(buf + 236, 2);
+    store32(buf + 240, (2 << 16) | 248);  # OpLabel %10
+    store32(buf + 244, 10);
+    store32(buf + 248, (4 << 16) | 61);   # OpLoad %4 %11 %7
+    store32(buf + 252, 4);
+    store32(buf + 256, 11);
+    store32(buf + 260, 7);
+    store32(buf + 264, (5 << 16) | 81);   # OpCompositeExtract %3 %12 %11 0
+    store32(buf + 268, 3);
+    store32(buf + 272, 12);
+    store32(buf + 276, 11);
+    store32(buf + 280, 0);
+    store32(buf + 284, (5 << 16) | 128);  # OpIAdd %3 %13 %12 %8
+    store32(buf + 288, 3);
+    store32(buf + 292, 13);
+    store32(buf + 296, 12);
+    store32(buf + 300, 8);
+    store32(buf + 304, (5 << 16) | 132);  # OpIMul %3 %14 %13 %9
+    store32(buf + 308, 3);
+    store32(buf + 312, 14);
+    store32(buf + 316, 13);
+    store32(buf + 320, 9);
+    store32(buf + 324, (5 << 16) | 196);  # OpShiftLeftLogical %3 %15 %8 %9
+    store32(buf + 328, 3);
+    store32(buf + 332, 15);
+    store32(buf + 336, 8);
+    store32(buf + 340, 9);
+    store32(buf + 344, (1 << 16) | 253);  # OpReturn
+    store32(buf + 348, (1 << 16) | 56);   # OpFunctionEnd
+    return 352;
+}
+
+fn test_spirv_lower_gid_kernel() {
+    var buf[384];
+    var n = _spv_build_gid_kernel(&buf);
+    assert_eq(spirv_validate_stream(&buf, n), 0, "gid kernel valid");
+    var types[384];
+    var deco[256];
+    var outbi[128];
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0, "lower ok");
+    # builtin resolution (the gap the N.1b parser does not fill)
+    assert_eq(_spirv_builtin_for_var(&outbi, 7), MIR_BI_GLOBAL_INVOC_ID, "gid var resolved");
+    # seed
+    assert_eq(mir_val_kind(&m, 7), MIR_VK_BUILTIN, "gid is builtin");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "gid divergent");
+    assert_eq(mir_val_kind(&m, 8), MIR_VK_CONST, "c1 const");
+    assert_eq(mir_val_payload(&m, 8), 1, "c1 value 1");
+    # instr stream: EXTRACT, IADD, IMUL, SHL, RET (the builtin load is an alias)
+    assert_eq(mir_n_instrs(&m), 5, "5 instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "i0 extract");
+    assert_eq(mir_instr_result(&m, 0), 12, "extract -> %12");
+    assert_eq(mir_instr_flags(&m, 0), MIR_FLAG_C_IMM, "extract lane is immediate");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_IADD, "i1 iadd");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "i2 imul");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_SHL, "i3 shl");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_RET, "i4 ret");
+    # the builtin OpLoad aliased %11 to the builtin value (no instruction)
+    assert_eq(mir_val_kind(&m, 11), MIR_VK_BUILTIN, "load aliases builtin");
+    assert_eq(mir_val_unif(&m, 11), MIR_DIVERGENT, "loaded gid divergent");
+    # uniformity sweep
+    assert_eq(mir_val_unif(&m, 12), MIR_DIVERGENT, "gid.x divergent");
+    assert_eq(mir_val_unif(&m, 13), MIR_DIVERGENT, "x+1 divergent");
+    assert_eq(mir_val_unif(&m, 14), MIR_DIVERGENT, "(x+1)*2 divergent");
+    assert_eq(mir_val_unif(&m, 15), MIR_UNIFORM, "1<<2 uniform (both const)");
+    # block
+    assert_eq(mir_block_term(&m, 0), MIR_TERM_RETURN, "ret terminator");
+    assert_eq(mir_block_count(&m, 0), 5, "block has 5 instrs");
+    return 0;
+}
+
+# The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
+# variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
+fn test_spirv_lower_seed_bufvar() {
+    var buf[256];
+    var n = _spv_build_typed_module(&buf);
+    var types[480];
+    var deco[320];
+    var outbi[160];
+    spirv_build_type_table(&buf, n, 20, &types);
+    spirv_build_decoration_table(&buf, n, 20, &deco);
+    _spirv_resolve_builtins(&buf, n, 20, &outbi);
+    var m[80];
+    var vals[800];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_seed_globals(&buf, n, &types, &deco, &m, &outbi), 0, "seed ok");
+    assert_eq(mir_val_kind(&m, 12), MIR_VK_BUFVAR, "var %12 is a buffer var");
+    assert_eq(mir_val_payload(&m, 12), 0, "var %12 binding 0");
+    assert_eq(mir_val_unif(&m, 12), MIR_UNIFORM, "buffer base uniform");
+    assert_eq(mir_val_kind(&m, 13), MIR_VK_CONST, "const %13 seeded");
+    assert_eq(mir_val_payload(&m, 13), 42, "const %13 value 42");
+    assert_eq(mir_val_type(&m, 13), MIR_T_I32, "const %13 type I32");
+    return 0;
+}
+
+fn test_spirv_lower_negatives() {
+    var buf[384];
+    var types[384];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # no GLCompute entry point -> LOWER_ERR_NO_ENTRY
+    var n = _spv_build_gid_kernel(&buf);
+    store32(&buf + 44, 0);   # OpEntryPoint execution model GLCompute(5) -> Vertex(0)
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - LOWER_ERR_NO_ENTRY, "no entry rejected");
+    # a control-flow op in the body -> LOWER_ERR_CONTROL_FLOW (fail loud, N.7)
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 324, (5 << 16) | 249);   # OpShiftLeftLogical -> OpBranch
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - LOWER_ERR_CONTROL_FLOW, "CF rejected");
+    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 324, (5 << 16) | 136);   # OpShiftLeftLogical -> OpFDiv (unmapped)
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - MIR_ERR_UNSUPPORTED_OP, "unmapped op err");
+    return 0;
+}
+
+# Regression tests for the N.2b-1 adversarial review (untrusted-id OOB class +
+# fail-loud gaps). Each corrupts one word of the valid gid kernel to a crafted
+# out-of-range id; spirv_validate_stream still passes (structure intact), and the
+# lowering must reject it (fail loud) with NO out-of-bounds access.
+fn test_spirv_lower_n2b1_review() {
+    var buf[384];
+    var types[384];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # #1 untrusted ALU operand id -> bounded in mir_emit (was an OOB read in the
+    # uniformity sweep). IADD operand a is at buf+296.
+    var n = _spv_build_gid_kernel(&buf);
+    store32(&buf + 296, 0x3FFFFFFF);
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - MIR_ERR_ID_OOR, "operand OOB rejected");
+    # #2 untrusted result-type id -> bounded in _mir_lower_type (was OOB type read).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 288, 0x3FFFFFFF);   # IADD result-type word
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - MIR_ERR_UNSUPPORTED_TYPE, "type OOB");
+    # #3 untrusted OpLoad source id -> bounded in _spirv_lower_load (was OOB read).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 260, 0x3FFFFFFF);   # OpLoad source word
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - MIR_ERR_ID_OOR, "load src OOB rejected");
+    # #4 untrusted OpDecorate BuiltIn target id -> bounded in _spirv_resolve_builtins
+    # (was a controlled-offset OOB WRITE). The store is skipped; the now-unresolved
+    # gid var makes the body OpLoad fail loud (no crash, no corruption).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 92, 0x3FFFFFFF);   # OpDecorate target word
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - MIR_ERR_UNSUPPORTED_OP, "deco OOB safe");
+    # #5 entry id with no matching OpFunction -> fail loud (was silent empty body).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 228, 99);   # OpFunction result id 6 -> 99 (entry point still names 6)
+    spirv_build_type_table(&buf, n, 16, &types);
+    spirv_build_decoration_table(&buf, n, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &deco, &m, &outbi), 0 - LOWER_ERR_NO_ENTRY, "empty body fail-loud");
     return 0;
 }
 
@@ -786,5 +1051,9 @@ fn main(): i64 {
     test_mir_blocks_and_synth();
     test_mir_emit_errors();
     test_mir_review_n2a();
+    test_spirv_lower_gid_kernel();
+    test_spirv_lower_seed_bufvar();
+    test_spirv_lower_negatives();
+    test_spirv_lower_n2b1_review();
     return assert_summary();
 }

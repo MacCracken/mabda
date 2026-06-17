@@ -55,18 +55,57 @@ for the immediate forward pointer.
 - Regression asserts for all five added to `compiler.tcyr` (`test_mir_review_n2a`
   + a synth-id-as-result case).
 
+### Added — Phase N.2b-1 (SPIR-V → MIR lowering, non-memory subset)
+- `src/spirv_lower.cyr` — walks a validated SPIR-V compute module (via the N.1b
+  parser + tables) and builds MIR (the N.2a model). `spirv_lower_module`
+  validates the entry point, runs the **builtin-resolution gap-closing pass**
+  (`_spirv_resolve_builtins` — the N.1b parser records Binding/DescriptorSet but
+  NOT `OpDecorate BuiltIn`), seeds globals (constants → CONST; StorageBuffer/
+  Uniform/PushConstant vars → BUFVAR with binding; Input+BuiltIn vars → BUILTIN),
+  walks the entry-function body dispatching the i32/u32/f32 ALU set + conversions
+  + `OpCompositeExtract` + the builtin `OpLoad` alias + `OpReturn`, then runs the
+  N.2a uniformity sweep. Control flow → `LOWER_ERR_CONTROL_FLOW`, unmapped op →
+  `MIR_ERR_UNSUPPORTED_OP`, missing GLCompute entry → `LOWER_ERR_NO_ENTRY` (all
+  fail loud). The buffer memory path (`OpAccessChain` + buffer `OpLoad`/`OpStore`)
+  is N.2b-2 and currently fails loud. Returns 0 or a negative error.
+- `tests/tcyr/compiler.tcyr` +38 asserts: a GlobalInvocationId-arithmetic kernel
+  lowered end-to-end (builtin resolve → load-alias → extract → ALU → uniformity,
+  asserting the instruction stream + every value's class), the StorageBuffer seed
+  path (on the N.1b typed-module fixture), the three fail-loud negatives
+  (no-entry, control-flow, unmapped op), and the review-regression set (below).
+
+### Fixed — N.2b-1 adversarial review (9 confirmed findings, all fixed pre-merge)
+- **Untrusted-id out-of-bounds class (the big one).** `spirv_validate_stream`
+  checks structure but NOT that in-instruction `<id>`s are `< id_bound`, and the
+  lowering used them as raw table indices. A structurally-valid (validator-
+  passing) crafted module could drive: (a) a **controlled-offset OOB write** —
+  an `OpDecorate BuiltIn` target id into `out_bi[]`; (b) wild OOB **reads** — an
+  ALU/extract/convert operand id (via `mir_emit` → `mir_run_uniformity`'s
+  `vals[]` read), an `OpLoad` source id (`mir_val_kind`), a result-type/pointee
+  id (`_mir_lower_type` → type table), and the seed-path variable id (`deco`/
+  `out_bi` reads). Fixes: `mir_emit` now bounds non-immediate operands against
+  `cap_ids`; `_mir_lower_type` takes `id_bound` and bounds its type ids (incl.
+  the vector-component recursion); `_spirv_resolve_builtins` bounds the decorate
+  target before the store; `_spirv_lower_load` bounds the source; the seed bounds
+  the variable id + pointer-type id. All reject with a fail-loud error code.
+- **Silent empty-body success.** An entry `<id>` with no matching `OpFunction`
+  (or a body with no `OpFunctionEnd`) lowered to an empty MIR and returned OK;
+  `_spirv_lower_body` now fails loud (`LOWER_ERR_NO_ENTRY`).
+- Regression asserts for all of these added (`test_spirv_lower_n2b1_review`,
+  5 crafted-module cases proving fail-loud + no OOB).
+
 ### Changed
-- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/mir.cyr` (after
-  `spirv_parse.cyr` — it consumes the type-table accessors).
+- `cyrius.cyml` `[lib].modules` + `src/lib.cyr` include `src/mir.cyr` +
+  `src/spirv_lower.cyr` (after `spirv_parse.cyr` — they consume its accessors).
 
 ### Notes
 - Cyrius reserves `mod` (modulo) as a keyword — the MIR module handle parameter
   is `m`, not `mod`.
 
 ### Next
-- N.2b — `src/spirv_lower.cyr`: the SPIR-V-module→MIR walk + the BuiltIn /
-  StorageClass gap-closing probe passes the N.1b parser does not build. Closes
-  N.2; then N.3 (instruction selection) for 3.2.6.
+- N.2b-2 — the buffer memory path in `spirv_lower.cyr`: `OpAccessChain` +
+  `OpLoad`/`OpStore` of a StorageBuffer + the offset-overflow audit guard (the
+  full SAXPY). Closes N.2; then N.3 (instruction selection) for 3.2.6.
 
 ## [3.2.5] — 2026-06-16
 

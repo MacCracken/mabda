@@ -5822,9 +5822,17 @@ fn _mir_set_val_unif(m, id, unif): i64 {
 fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
     var n = load64(m + 32);
     if (n >= load64(m + 40)) { return 0 - MIR_ERR_CAP_EXCEEDED; }
+    var cap = load64(m + 64);
     if (result != 0) {
-        if (result >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        if (result >= cap) { return 0 - MIR_ERR_ID_OOR; }
     }
+    # Bound every NON-immediate operand against cap_ids: operands become vals[]
+    # indices in mir_run_uniformity, and an untrusted SPIR-V operand <id> would
+    # otherwise drive a wild OOB read there. Immediate operands (lane indices,
+    # etc.) are not ids and are skipped. (N.2b-1 adversarial review.)
+    if (a != 0) { if ((flags & MIR_FLAG_A_IMM) == 0) { if (a >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
+    if (b != 0) { if ((flags & MIR_FLAG_B_IMM) == 0) { if (b >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
+    if (c != 0) { if ((flags & MIR_FLAG_C_IMM) == 0) { if (c >= cap) { return 0 - MIR_ERR_ID_OOR; } } }
     var base = load64(m + 8) + n * MIR_INSTR_REC;
     store64(base + 0, op);
     store64(base + 8, result | (type << 32));
@@ -5896,7 +5904,12 @@ fn mir_block_count_total(m): i64 { return 1; }   # MVP: one block (N.7 adds n_bl
 # by signedness, f32, bool, and vec2..4 of a supported scalar. Anything else
 # (non-32-bit width, matrices, images, unknown) → MIR_T_UNSUPPORTED so the
 # lowering can fail loud.
-fn _mir_lower_type(types, spv_tid): i64 {
+fn _mir_lower_type(types, spv_tid, id_bound): i64 {
+    # `spv_tid` comes from untrusted instruction words; the type table is sized
+    # id_bound records, so reject any id outside (0, id_bound) before indexing it
+    # (the recursion below re-enters with the component id, bounding it too).
+    if (spv_tid == 0) { return MIR_T_UNSUPPORTED; }
+    if (spv_tid >= id_bound) { return MIR_T_UNSUPPORTED; }
     var k = spirv_type_kind(types, spv_tid);
     if (k == SPIRV_TYK_INT) {
         if (spirv_type_p0(types, spv_tid) != 32) { return MIR_T_UNSUPPORTED; }
@@ -5910,18 +5923,20 @@ fn _mir_lower_type(types, spv_tid): i64 {
     if (k == SPIRV_TYK_BOOL) { return MIR_T_BOOL; }
     if (k == SPIRV_TYK_VECTOR) {
         var comp_id = spirv_type_p0(types, spv_tid);
-        # The component MUST be a scalar (INT/FLOAT/BOOL). This rejects
-        # vector-of-vector / vector-of-aggregate as UNSUPPORTED AND bounds the
-        # recursion: a crafted self-/mutually-referential component <id> would
-        # otherwise recurse forever (untrusted-input stack-overflow). A scalar
-        # component recurses exactly one level and terminates.
+        # Bound the component id before reading its kind (it is a table index from
+        # the stream too), then require it to be a scalar (INT/FLOAT/BOOL): this
+        # rejects vector-of-vector / vector-of-aggregate as UNSUPPORTED AND bounds
+        # the recursion (a crafted self-/mutually-referential component would
+        # otherwise recurse forever). A scalar component recurses one level.
+        if (comp_id == 0) { return MIR_T_UNSUPPORTED; }
+        if (comp_id >= id_bound) { return MIR_T_UNSUPPORTED; }
         var ck = spirv_type_kind(types, comp_id);
         if (ck != SPIRV_TYK_INT) {
             if (ck != SPIRV_TYK_FLOAT) {
                 if (ck != SPIRV_TYK_BOOL) { return MIR_T_UNSUPPORTED; }
             }
         }
-        var comp = _mir_lower_type(types, comp_id);
+        var comp = _mir_lower_type(types, comp_id, id_bound);
         if (comp == MIR_T_UNSUPPORTED) { return MIR_T_UNSUPPORTED; }
         var count = spirv_type_p1(types, spv_tid);
         if (count < 2) { return MIR_T_UNSUPPORTED; }
@@ -5996,6 +6011,309 @@ fn mir_run_uniformity(m): i64 {
         i = i + 1;
     }
     return 0;
+}
+
+# --- spirv_lower.cyr ---
+
+# @internal — SPIR-V module → MIR lowering (Phase N.2b)
+# spirv_lower.cyr — walks a *validated* SPIR-V compute module (via the N.1b
+# parser + tables) and builds MIR (the N.2a data model) for a STRAIGHT-LINE
+# compute function. Plus the gap-closing probe passes the N.1b parser does NOT
+# provide: OpDecorate BuiltIn resolution (the N.2 design + adversarial review
+# flagged this as the highest-risk gap — a mis-resolved builtin silently flips a
+# value's uniformity).
+#
+# N.2b-1 (this cut): the non-memory subset — constants, builtins, the builtin
+# OpLoad alias, OpCompositeExtract, the i32/u32/f32 ALU + conversion ops, and
+# OpReturn; control flow is rejected (LOWER_ERR_CONTROL_FLOW), unmapped ops fail
+# loud (MIR_ERR_UNSUPPORTED_OP). N.2b-2 adds the buffer memory path
+# (OpAccessChain + OpLoad/OpStore of a StorageBuffer + the offset-overflow
+# guard) — those ops currently fail loud, not silently.
+#
+# Returns: 0 (SPIRV_LOWER_OK) on success, or a NEGATIVE error code (mirrors the
+# mir.cyr index-builder convention so a single `r < 0` check propagates).
+# Included after mir.cyr (it drives the mir_* builders + the spirv_* tables).
+
+# Executable / memory / structural opcodes (spec §3.37) not already declared in
+# spirv_parse.cyr (which owns the type/constant/decorate/function opcodes).
+var SPIRV_OP_EXT_INST          = 12;
+var SPIRV_OP_LOAD              = 61;
+var SPIRV_OP_STORE             = 62;
+var SPIRV_OP_ACCESS_CHAIN      = 65;
+var SPIRV_OP_COMPOSITE_EXTRACT = 81;
+var SPIRV_OP_CONVERT_F_TO_S    = 110;
+var SPIRV_OP_CONVERT_S_TO_F    = 111;
+var SPIRV_OP_CONVERT_U_TO_F    = 112;
+var SPIRV_OP_IADD              = 128;
+var SPIRV_OP_FADD              = 129;
+var SPIRV_OP_ISUB             = 130;
+var SPIRV_OP_FSUB             = 131;
+var SPIRV_OP_IMUL             = 132;
+var SPIRV_OP_FMUL             = 133;
+var SPIRV_OP_SHR_LOGICAL      = 194;
+var SPIRV_OP_SHL              = 196;
+var SPIRV_OP_BITWISE_OR       = 197;
+var SPIRV_OP_BITWISE_XOR      = 198;
+var SPIRV_OP_BITWISE_AND      = 199;
+var SPIRV_OP_RETURN           = 253;
+
+# Control-flow ops the straight-line MVP rejects (fail loud → N.7).
+var SPIRV_OP_LOOP_MERGE          = 246;
+var SPIRV_OP_SELECTION_MERGE     = 247;
+var SPIRV_OP_BRANCH              = 249;
+var SPIRV_OP_BRANCH_CONDITIONAL  = 250;
+var SPIRV_OP_PHI                 = 245;
+
+# OpDecorate Decoration = BuiltIn, and the compute BuiltIn enum values.
+var SPIRV_DECO_BUILTIN              = 11;
+var SPIRV_BI_WORKGROUP_ID          = 26;
+var SPIRV_BI_LOCAL_INVOCATION_ID   = 27;
+var SPIRV_BI_GLOBAL_INVOCATION_ID  = 28;
+
+# StorageClass values (OpVariable word 3).
+var SPIRV_SC_INPUT          = 1;
+var SPIRV_SC_UNIFORM        = 2;
+var SPIRV_SC_PUSH_CONSTANT  = 9;
+var SPIRV_SC_STORAGE_BUFFER = 12;
+
+# Lowering error codes (disjoint from spirv_parse 1-11 and mir 20-25).
+var SPIRV_LOWER_OK          = 0;
+var LOWER_ERR_CONTROL_FLOW  = 26;
+var LOWER_ERR_NO_ENTRY      = 27;
+
+# ================================================================
+# Gap-closing pass: OpDecorate BuiltIn → a per-<id> side-table
+# ================================================================
+# Map the SPIR-V BuiltIn enum to a MIR_BI_* code (or -1 for builtins outside the
+# compute MVP).
+fn _spirv_builtin_to_mir(k): i64 {
+    if (k == SPIRV_BI_GLOBAL_INVOCATION_ID) { return MIR_BI_GLOBAL_INVOC_ID; }
+    if (k == SPIRV_BI_LOCAL_INVOCATION_ID) { return MIR_BI_LOCAL_INVOC_ID; }
+    if (k == SPIRV_BI_WORKGROUP_ID) { return MIR_BI_WORKGROUP_ID; }
+    return 0 - 1;
+}
+
+# Build out_bi[<id>] = MIR_BI_* for every `OpDecorate %v BuiltIn k` (the N.1b
+# decoration table records Binding/DescriptorSet but NOT BuiltIn). `out_bi` is a
+# caller-provided array of `id_bound` i64s; -1 = not a (recognized) builtin.
+fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi): i64 {
+    memset(out_bi, 0xFF, id_bound * 8);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_DECORATE) {
+            if (wc >= 4) {
+                if (spirv_word(ptr, off + 2) == SPIRV_DECO_BUILTIN) {
+                    var tid = spirv_word(ptr, off + 1);
+                    var bi = _spirv_builtin_to_mir(spirv_word(ptr, off + 3));
+                    # Bound the (untrusted) target <id> before the store — out_bi
+                    # is id_bound-sized and this is a WRITE (controlled-offset OOB
+                    # write otherwise). N.2b-1 adversarial review.
+                    if (bi != 0 - 1) {
+                        if (tid != 0) {
+                            if (tid < id_bound) { store64(out_bi + tid * 8, bi); }
+                        }
+                    }
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+fn _spirv_builtin_for_var(out_bi, vid): i64 {
+    return load64(out_bi + vid * 8);
+}
+
+# ================================================================
+# Seed pass: globals (constants + variables) → MIR values
+# ================================================================
+# A StorageBuffer/Uniform/PushConstant variable → a bound buffer value; an Input
+# variable decorated BuiltIn → a builtin value (typed as the pointee). `off` is
+# the OpVariable instruction offset (word 1 = its pointer result-type).
+fn _spirv_seed_variable(types, deco, m, out_bi, ptr, off, vid, sclass): i64 {
+    var idb = spirv_hdr_id_bound(ptr);
+    # `vid` indexes the id_bound-sized deco / out_bi tables — bound it first.
+    if (vid == 0) { return 0; }
+    if (vid >= idb) { return 0; }
+    if (sclass == SPIRV_SC_STORAGE_BUFFER) { return mir_set_bufvar(m, vid, spirv_deco_binding(deco, vid)); }
+    if (sclass == SPIRV_SC_UNIFORM) { return mir_set_bufvar(m, vid, spirv_deco_binding(deco, vid)); }
+    if (sclass == SPIRV_SC_PUSH_CONSTANT) { return mir_set_bufvar(m, vid, spirv_deco_binding(deco, vid)); }
+    if (sclass == SPIRV_SC_INPUT) {
+        var bi = _spirv_builtin_for_var(out_bi, vid);
+        if (bi != 0 - 1) {
+            var ptype = spirv_word(ptr, off + 1);
+            if (ptype == 0) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+            if (ptype >= idb) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+            var bty = _mir_lower_type(types, spirv_type_p1(types, ptype), idb);
+            if (bty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+            return mir_set_builtin(m, vid, bty, bi);
+        }
+    }
+    return 0;
+}
+
+fn _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi): i64 {
+    var idb = spirv_hdr_id_bound(ptr);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        var op = spirv_op(w0);
+        if (op == SPIRV_OP_CONSTANT) {
+            if (wc >= 4) {
+                var cty = _mir_lower_type(types, spirv_word(ptr, off + 1), idb);
+                if (cty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                var cr = mir_set_const(m, spirv_word(ptr, off + 2), cty, spirv_word(ptr, off + 3));
+                if (cr < 0) { return cr; }
+            }
+        }
+        if (op == SPIRV_OP_VARIABLE) {
+            if (wc >= 4) {
+                var vr = _spirv_seed_variable(types, deco, m, out_bi, ptr, off,
+                spirv_word(ptr, off + 2), spirv_word(ptr, off + 3));
+                if (vr < 0) { return vr; }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+# ================================================================
+# Body pass: the entry function's executable instructions → MIR
+# ================================================================
+# SPIR-V binary-ALU opcode → MIR op, or 0 if not a binary ALU we lower.
+fn _spirv_alu_to_mir(op): i64 {
+    if (op == SPIRV_OP_IADD) { return MIR_OP_IADD; }
+    if (op == SPIRV_OP_ISUB) { return MIR_OP_ISUB; }
+    if (op == SPIRV_OP_IMUL) { return MIR_OP_IMUL; }
+    if (op == SPIRV_OP_SHL) { return MIR_OP_SHL; }
+    if (op == SPIRV_OP_SHR_LOGICAL) { return MIR_OP_SHR; }
+    if (op == SPIRV_OP_BITWISE_AND) { return MIR_OP_AND; }
+    if (op == SPIRV_OP_BITWISE_OR) { return MIR_OP_OR; }
+    if (op == SPIRV_OP_BITWISE_XOR) { return MIR_OP_XOR; }
+    if (op == SPIRV_OP_FADD) { return MIR_OP_FADD; }
+    if (op == SPIRV_OP_FSUB) { return MIR_OP_FSUB; }
+    if (op == SPIRV_OP_FMUL) { return MIR_OP_FMUL; }
+    return 0;
+}
+
+# A unary op (conversion): result-type(w1), result(w2), src(w3).
+fn _spirv_lower_unary(ptr, off, wc, mop, types, m): i64 {
+    if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+    if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var e = mir_emit(m, mop, spirv_word(ptr, off + 2), rty, spirv_word(ptr, off + 3), 0, 0, 0);
+    if (e < 0) { return e; }
+    return 0;
+}
+
+# OpLoad: a load of a builtin variable aliases the result to the seeded builtin
+# value (no instruction). A load of a buffer pointer is N.2b-2 (fail loud here).
+fn _spirv_lower_load(ptr, off, wc, m): i64 {
+    if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var src = spirv_word(ptr, off + 3);
+    # `src` indexes vals[] (sized cap_ids) — bound it before mir_val_kind reads it.
+    if (src == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    if (src >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    if (mir_val_kind(m, src) == MIR_VK_BUILTIN) {
+        return _mir_set_val(m, spirv_word(ptr, off + 2), MIR_VK_BUILTIN,
+        mir_val_type(m, src), mir_val_unif(m, src), 0 - 1, mir_val_payload(m, src));
+    }
+    return 0 - MIR_ERR_UNSUPPORTED_OP;
+}
+
+# Lower one executable body instruction. Returns 0, or a negative error.
+fn _spirv_lower_one_instr(ptr, off, wc, op, types, m): i64 {
+    if (op == SPIRV_OP_BRANCH) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    if (op == SPIRV_OP_BRANCH_CONDITIONAL) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    if (op == SPIRV_OP_SELECTION_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    if (op == SPIRV_OP_LOOP_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    if (op == SPIRV_OP_PHI) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    if (op == SPIRV_OP_LABEL) { return 0; }
+    if (op == SPIRV_OP_RETURN) {
+        var er = mir_emit(m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+        if (er < 0) { return er; }
+        return 0;
+    }
+    var mop = _spirv_alu_to_mir(op);
+    if (mop != 0) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+        if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        var e = mir_emit(m, mop, spirv_word(ptr, off + 2), rty,
+        spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
+        if (e < 0) { return e; }
+        return 0;
+    }
+    if (op == SPIRV_OP_CONVERT_S_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
+    if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
+    if (op == SPIRV_OP_CONVERT_F_TO_S) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m); }
+    if (op == SPIRV_OP_COMPOSITE_EXTRACT) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var ety = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+        if (ety == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        var e2 = mir_emit(m, MIR_OP_EXTRACT, spirv_word(ptr, off + 2), ety,
+        spirv_word(ptr, off + 3), 0, spirv_word(ptr, off + 4), MIR_FLAG_C_IMM);
+        if (e2 < 0) { return e2; }
+        return 0;
+    }
+    if (op == SPIRV_OP_LOAD) { return _spirv_lower_load(ptr, off, wc, m); }
+    return 0 - MIR_ERR_UNSUPPORTED_OP;
+}
+
+# Walk to the entry function's OpFunction (result <id> == entry_id), then lower
+# its body up to OpFunctionEnd. Globals/types/decorations (before OpFunction) are
+# never re-seen here — the seed pass owns them.
+fn _spirv_lower_body(ptr, byte_len, types, m, entry_id): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    var in_body = 0;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        var op = spirv_op(w0);
+        if (in_body == 0) {
+            if (op == SPIRV_OP_FUNCTION) {
+                if (wc >= 3) {
+                    if (spirv_word(ptr, off + 2) == entry_id) { in_body = 1; }
+                }
+            }
+        } else {
+            if (op == SPIRV_OP_FUNCTION_END) { return 0; }
+            var r = _spirv_lower_one_instr(ptr, off, wc, op, types, m);
+            if (r < 0) { return r; }
+        }
+        off = off + wc;
+    }
+    # Reached end-of-stream without an OpFunctionEnd return: the entry function's
+    # OpFunction was never matched (in_body stayed 0) or its body was truncated.
+    # Fail loud rather than silently producing an empty body. N.2b-1 review.
+    return 0 - LOWER_ERR_NO_ENTRY;
+}
+
+# ================================================================
+# Top-level driver
+# ================================================================
+# Lower a validated SPIR-V compute module into MIR. `m` is an initialized MirMod;
+# `types`/`deco` are N.1b tables; `out_bi` is a caller-provided id_bound-sized
+# builtin side-table. Returns SPIRV_LOWER_OK or a negative error.
+fn spirv_lower_module(ptr, byte_len, types, deco, m, out_bi): i64 {
+    var entry = spirv_find_entry_point(ptr, byte_len);
+    if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
+    _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
+    var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
+    if (sr < 0) { return sr; }
+    var br = _spirv_lower_body(ptr, byte_len, types, m, entry);
+    if (br < 0) { return br; }
+    mir_finalize_block0(m);
+    mir_run_uniformity(m);
+    return SPIRV_LOWER_OK;
 }
 
 # --- backend_native_shaders.cyr ---
