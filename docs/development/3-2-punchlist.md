@@ -809,10 +809,11 @@ hand-authored shaders stay as oracle + fallback.
     - [x] **N.9b-1 (2026-06-18) — primitives plumbed.** 6 primitive ops (VMOV/CVT_F32_U/
       CVT_U_F32/RCP_IFLAG/MUL_HI/CNDMASK) MIR→isel→emit; vector-only → uniformity-forced
       DIVERGENT. Dedicated `_emit_cndmask` (VCC implicit, a=false/b=true). +10 byte asserts.
-    - [ ] **N.9b-2 — OpUDiv macro lowering + HW.** `_spirv_lower_udiv` expands OpUDiv (134)
-      to the ~21-op MIR macro (VMOV N,D → force VGPR; the 19-op reciprocal sequence; synth
-      ids; the 2 cmp+cndmask correction pairs contiguous so VCC survives). HW e2e on Cezanne
-      over the edge matrix incl. b=0 (pin the 0xFFFFFFFF saturate). Adversarial review.
+    - [x] **N.9b-2 (2026-06-18) — OpUDiv macro + HW.** `_spirv_lower_udiv` expands OpUDiv to
+      the float-reciprocal vector macro (VMOV N/D → force VGPR; 19-op reciprocal; synth ids;
+      contiguous cmp/cndmask). b=0 → deterministic 0xFFFFFFFF guard (the natural saturate
+      is a-derived garbage — confirmed on HW, per design risk #1). `native_spirv_udiv_e2e.cyr`
+      value-exact on Cezanne over the edge matrix. Adversarial review + HW-stress.
     - [ ] **N.9c — u32 OpUMod (137).** Reuse the core; select the remainder m + one final
       cmp+cndmask. b=0 → r=N (pinned).
     - [ ] **N.9d — signed OpSDiv/OpSMod/OpSRem.** Sign-magnitude wrapper (v_ashrrev_i32 31

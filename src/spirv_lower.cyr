@@ -33,6 +33,7 @@ var SPIRV_OP_ISUB             = 130;
 var SPIRV_OP_FSUB             = 131;
 var SPIRV_OP_IMUL             = 132;
 var SPIRV_OP_FMUL             = 133;
+var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
 var SPIRV_OP_SHR_LOGICAL      = 194;
 var SPIRV_OP_SHL              = 196;
 var SPIRV_OP_BITWISE_OR       = 197;
@@ -413,6 +414,61 @@ fn _spirv_expand_gid(m, result, ety, comp, lsz_c): i64 {
     return mir_emit(m, MIR_OP_IADD, result, ety, scaled, lcid, 0, 0);
 }
 
+# Allocate a fresh synth id and emit one op into it; returns the id (>= 1) or a negative
+# error. The udiv macro chains these.
+fn _udiv_op(m, op, type, a, b, c, flags): i64 {
+    var id = mir_alloc_synth_id(m);
+    if (id < 0) { return 0 - MIR_ERR_ID_OOR; }
+    var e = mir_emit(m, op, id, type, a, b, c, flags);
+    if (e < 0) { return e; }
+    return id;
+}
+
+# OpUDiv(result, N, D) → LLVM's gfx900 float-reciprocal VECTOR macro (N.9b). Loop-free,
+# 19 core ops; N/D are first VMOV'd into VGPRs (force-vector, so uniform/const operands
+# work). The two cmp_ge/cndmask correction pairs are emitted contiguously so the implicit
+# VCC survives (nothing between writes VCC; no waitcnt is inserted there). 0x4F7FFFFE is
+# the magic reciprocal scale (biases the estimate down so v_rcp's ≤1-ULP error can't
+# overshoot). b=0 → q saturates to 0xFFFFFFFF (pinned in the HW test).
+fn _spirv_lower_udiv(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var nn = spirv_word(ptr, off + 3);
+    var dd = spirv_word(ptr, off + 4);
+    var u = MIR_T_U32;
+    var f = MIR_T_F32;
+    var nc = _udiv_op(m, MIR_OP_VMOV, u, nn, 0, 0, 0);            if (nc < 0) { return nc; }
+    var dc = _udiv_op(m, MIR_OP_VMOV, u, dd, 0, 0, 0);            if (dc < 0) { return dc; }
+    var r1 = _udiv_op(m, MIR_OP_CVT_F32_U, f, dc, 0, 0, 0);       if (r1 < 0) { return r1; }
+    var r2 = _udiv_op(m, MIR_OP_RCP_IFLAG, f, r1, 0, 0, 0);       if (r2 < 0) { return r2; }
+    var r3 = _udiv_op(m, MIR_OP_FMUL, f, r2, 0x4F7FFFFE, 0, MIR_FLAG_B_IMM); if (r3 < 0) { return r3; }
+    var r4 = _udiv_op(m, MIR_OP_CVT_U_F32, u, r3, 0, 0, 0);       if (r4 < 0) { return r4; }
+    var t1 = _udiv_op(m, MIR_OP_ISUB, u, 0, dc, 0, MIR_FLAG_A_IMM); if (t1 < 0) { return t1; }
+    var t2 = _udiv_op(m, MIR_OP_IMUL, u, t1, r4, 0, 0);          if (t2 < 0) { return t2; }
+    var t3 = _udiv_op(m, MIR_OP_MUL_HI, u, r4, t2, 0, 0);        if (t3 < 0) { return t3; }
+    var r5 = _udiv_op(m, MIR_OP_IADD, u, r4, t3, 0, 0);          if (r5 < 0) { return r5; }
+    var q1 = _udiv_op(m, MIR_OP_MUL_HI, u, nc, r5, 0, 0);        if (q1 < 0) { return q1; }
+    var t4 = _udiv_op(m, MIR_OP_IMUL, u, q1, dc, 0, 0);          if (t4 < 0) { return t4; }
+    var m1 = _udiv_op(m, MIR_OP_ISUB, u, nc, t4, 0, 0);          if (m1 < 0) { return m1; }
+    var s1 = _udiv_op(m, MIR_OP_IADD, u, q1, 1, 0, MIR_FLAG_B_IMM); if (s1 < 0) { return s1; }
+    var c1 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m1, dc, 0, 0);      if (c1 < 0) { return c1; }
+    var t5 = _udiv_op(m, MIR_OP_ISUB, u, m1, dc, 0, 0);          if (t5 < 0) { return t5; }
+    var q2 = _udiv_op(m, MIR_OP_CNDMASK, u, q1, s1, 0, 0);       if (q2 < 0) { return q2; }
+    var m2 = _udiv_op(m, MIR_OP_CNDMASK, u, m1, t5, 0, 0);       if (m2 < 0) { return m2; }
+    var s2 = _udiv_op(m, MIR_OP_IADD, u, q2, 1, 0, MIR_FLAG_B_IMM); if (s2 < 0) { return s2; }
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);      if (c2 < 0) { return c2; }
+    var qf = _udiv_op(m, MIR_OP_CNDMASK, u, q2, s2, 0, 0);       if (qf < 0) { return qf; }
+    # Divide-by-zero is UNDEFINED in SPIR-V; the bare macro yields a-derived garbage (the
+    # +inf reciprocal is mangled by the corrections), so pin a DETERMINISTIC 0xFFFFFFFF
+    # (the common GPU all-ones convention). ones is materialized to a VGPR; the ICMP_EQ +
+    # CNDMASK are contiguous so VCC survives.
+    var ones = _udiv_op(m, MIR_OP_VMOV, u, 0xFFFFFFFF, 0, 0, MIR_FLAG_A_IMM); if (ones < 0) { return ones; }
+    var cz = _udiv_op(m, MIR_OP_ICMP_EQ, u, 0, dc, 0, MIR_FLAG_A_IMM);  if (cz < 0) { return cz; }
+    var er = mir_emit(m, MIR_OP_CNDMASK, result, u, qf, ones, 0, 0);  # (dc==0) ? ones : qf
+    if (er < 0) { return er; }
+    return 0;
+}
+
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
     # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
@@ -448,6 +504,8 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         return 0;
     }
     # Integer comparisons → ICMP (a bool result the COND_BRANCH consumes). The
+    # OpUDiv expands to the float-reciprocal macro (no GFX9 integer divide). N.9b.
+    if (op == SPIRV_OP_UDIV) { return _spirv_lower_udiv(ptr, off, wc, m); }
     # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
     # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
     var cop = _spirv_cmp_to_mir(op);

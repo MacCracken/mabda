@@ -453,6 +453,16 @@ build/native_spirv_const_fold_e2e: programs/native_spirv_const_fold_e2e.cyr src/
 test-native-spirv-const-fold-e2e: build/native_spirv_const_fold_e2e
 	./build/native_spirv_const_fold_e2e
 
+# N.9b-2: u32 OpUDiv via the float-reciprocal macro (GFX9 has no integer divide).
+# `out[gid] = a[gid] / b[gid]` over an edge matrix incl. b=0. HW-verified on Cezanne.
+build/native_spirv_udiv_e2e: programs/native_spirv_udiv_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_udiv_e2e.cyr $@
+
+.PHONY: test-native-spirv-udiv-e2e
+test-native-spirv-udiv-e2e: build/native_spirv_udiv_e2e
+	./build/native_spirv_udiv_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

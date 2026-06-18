@@ -15,6 +15,21 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9b-2 (u32 `OpUDiv` — integer division runs on Cezanne)
+- **GFX9 has no integer divide, so `OpUDiv` (134) expands to LLVM's float-reciprocal
+  vector macro** (`src/spirv_lower.cyr` `_spirv_lower_udiv`): N/D are VMOV'd into VGPRs
+  (force-vector), then the 19-op reciprocal sequence (`cvt_f32_u32 → rcp_iflag → ×0x4F7FFFFE
+  → cvt_u32_f32 → Newton → estimate → 2× cmp_ge/cndmask correction`) with synth ids; the
+  cmp/cndmask pairs are contiguous so the implicit VCC survives.
+- **Divide-by-zero**: SPIR-V undefined; the bare macro yields a-derived garbage, so a guard
+  pins a deterministic **`0xFFFFFFFF`** (`ICMP_EQ(0,D)` + `cndmask`) — the common GPU
+  all-ones convention. (The HW run revealed the natural saturate is NOT 0xFFFFFFFF, exactly
+  as the design's risk #1 warned — hence the explicit guard.)
+- **HW: `programs/native_spirv_udiv_e2e.cyr`** — `out[gid]=a[gid]/b[gid]` over an 8-lane
+  edge matrix (0, a<b, a=b, b=1 float-trap, max/2, b=0, b=sign-bit) **value-exact vs a CPU
+  reference on Cezanne**, including the float-precision traps. Integer division — the
+  hardest op of the arc — works on real silicon.
+
 ### Added — Phase N.9b-1 (integer-division primitives plumbed — MIR → isel → emit)
 - The six udiv-macro primitive ops are wired end-to-end: `MIR_OP_VMOV`/`CVT_F32_U`/
   `CVT_U_F32`/`RCP_IFLAG`/`MUL_HI`/`CNDMASK` (`src/mir.cyr`) → `GISEL_V_MOV`/
