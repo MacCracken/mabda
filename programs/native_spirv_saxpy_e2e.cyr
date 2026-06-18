@@ -1,0 +1,313 @@
+# programs/native_spirv_saxpy_e2e.cyr — N.6: a NOVEL multi-binding compute kernel
+# compiled in-tree and dispatched on Cezanne.
+#
+# `y[gl_LocalInvocationID.x] = 3*x[lid.x] + y[lid.x]` (uint, LocalSize 8) — a
+# two-storage-binding SAXPY-shape kernel the compiler has never seen as
+# hand-authored bytes. Hand-authored SPIR-V → gfx9_compile → GFX9 ISA + RSRC,
+# published to a BO, dispatched (8 threads) with BOTH buffers resident via the
+# generic multi-binding composer + the N-BO cached submit, then verified per-lane:
+# seed x[i]=i, y[i]=100 ⇒ y[i] must become 3*i + 100. Proves multi-binding
+# dispatch (USER_DATA s0:s1=x, s2:s3=y) end-to-end on real hardware.
+#
+# Exit: 0 = all 8 lanes 3*i+100; 2 = compile failed; 3..9 = setup/dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# SPIR-V (id-bound 25, 576 bytes): y[lid.x] = 3*x[lid.x] + y[lid.x], LocalSize 8.
+# Bindings: %13 x (binding 0), %14 y (binding 1).
+fn build_saxpy_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 25);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);   # OpMemoryModel Logical GLSL450
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (6 << 16) | 15);   # OpEntryPoint GLCompute %15 "main" %12
+    store32(buf + 44, 5);
+    store32(buf + 48, 15);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 12);
+    store32(buf + 64, (6 << 16) | 16);   # OpExecutionMode %15 LocalSize 8 1 1
+    store32(buf + 68, 15);
+    store32(buf + 72, 17);
+    store32(buf + 76, 8);
+    store32(buf + 80, 1);
+    store32(buf + 84, 1);
+    store32(buf + 88, (4 << 16) | 71);   # OpDecorate %12 BuiltIn LocalInvocationId
+    store32(buf + 92, 12);
+    store32(buf + 96, 11);
+    store32(buf + 100, 27);
+    store32(buf + 104, (4 << 16) | 71);  # OpDecorate %13 Binding 0
+    store32(buf + 108, 13);
+    store32(buf + 112, 33);
+    store32(buf + 116, 0);
+    store32(buf + 120, (4 << 16) | 71);  # OpDecorate %13 DescriptorSet 0
+    store32(buf + 124, 13);
+    store32(buf + 128, 34);
+    store32(buf + 132, 0);
+    store32(buf + 136, (4 << 16) | 71);  # OpDecorate %14 Binding 1
+    store32(buf + 140, 14);
+    store32(buf + 144, 33);
+    store32(buf + 148, 1);
+    store32(buf + 152, (4 << 16) | 71);  # OpDecorate %14 DescriptorSet 0
+    store32(buf + 156, 14);
+    store32(buf + 160, 34);
+    store32(buf + 164, 0);
+    store32(buf + 168, (2 << 16) | 19);  # OpTypeVoid %1
+    store32(buf + 172, 1);
+    store32(buf + 176, (3 << 16) | 33);  # OpTypeFunction %2 %1
+    store32(buf + 180, 2);
+    store32(buf + 184, 1);
+    store32(buf + 188, (4 << 16) | 21);  # OpTypeInt %3 32 0
+    store32(buf + 192, 3);
+    store32(buf + 196, 32);
+    store32(buf + 200, 0);
+    store32(buf + 204, (4 << 16) | 23);  # OpTypeVector %4 %3 3
+    store32(buf + 208, 4);
+    store32(buf + 212, 3);
+    store32(buf + 216, 3);
+    store32(buf + 220, (4 << 16) | 32);  # OpTypePointer %5 Input %4
+    store32(buf + 224, 5);
+    store32(buf + 228, 1);
+    store32(buf + 232, 4);
+    store32(buf + 236, (3 << 16) | 29);  # OpTypeRuntimeArray %6 %3
+    store32(buf + 240, 6);
+    store32(buf + 244, 3);
+    store32(buf + 248, (3 << 16) | 30);  # OpTypeStruct %7 %6
+    store32(buf + 252, 7);
+    store32(buf + 256, 6);
+    store32(buf + 260, (4 << 16) | 32);  # OpTypePointer %8 StorageBuffer %7
+    store32(buf + 264, 8);
+    store32(buf + 268, 12);
+    store32(buf + 272, 7);
+    store32(buf + 276, (4 << 16) | 32);  # OpTypePointer %9 StorageBuffer %3
+    store32(buf + 280, 9);
+    store32(buf + 284, 12);
+    store32(buf + 288, 3);
+    store32(buf + 292, (4 << 16) | 43);  # OpConstant %3 %10 3
+    store32(buf + 296, 3);
+    store32(buf + 300, 10);
+    store32(buf + 304, 3);
+    store32(buf + 308, (4 << 16) | 43);  # OpConstant %3 %11 0
+    store32(buf + 312, 3);
+    store32(buf + 316, 11);
+    store32(buf + 320, 0);
+    store32(buf + 324, (4 << 16) | 59);  # OpVariable %5 %12 Input
+    store32(buf + 328, 5);
+    store32(buf + 332, 12);
+    store32(buf + 336, 1);
+    store32(buf + 340, (4 << 16) | 59);  # OpVariable %8 %13 StorageBuffer
+    store32(buf + 344, 8);
+    store32(buf + 348, 13);
+    store32(buf + 352, 12);
+    store32(buf + 356, (4 << 16) | 59);  # OpVariable %8 %14 StorageBuffer
+    store32(buf + 360, 8);
+    store32(buf + 364, 14);
+    store32(buf + 368, 12);
+    store32(buf + 372, (5 << 16) | 54);  # OpFunction %1 %15 None %2
+    store32(buf + 376, 1);
+    store32(buf + 380, 15);
+    store32(buf + 384, 0);
+    store32(buf + 388, 2);
+    store32(buf + 392, (2 << 16) | 248); # OpLabel %16
+    store32(buf + 396, 16);
+    store32(buf + 400, (4 << 16) | 61);  # OpLoad %4 %17 %12
+    store32(buf + 404, 4);
+    store32(buf + 408, 17);
+    store32(buf + 412, 12);
+    store32(buf + 416, (5 << 16) | 81);  # OpCompositeExtract %3 %18 %17 0
+    store32(buf + 420, 3);
+    store32(buf + 424, 18);
+    store32(buf + 428, 17);
+    store32(buf + 432, 0);
+    store32(buf + 436, (6 << 16) | 65);  # OpAccessChain %9 %19 %13 %11 %18  (x[idx])
+    store32(buf + 440, 9);
+    store32(buf + 444, 19);
+    store32(buf + 448, 13);
+    store32(buf + 452, 11);
+    store32(buf + 456, 18);
+    store32(buf + 460, (4 << 16) | 61);  # OpLoad %3 %20 %19  (xv)
+    store32(buf + 464, 3);
+    store32(buf + 468, 20);
+    store32(buf + 472, 19);
+    store32(buf + 476, (6 << 16) | 65);  # OpAccessChain %9 %21 %14 %11 %18  (y[idx])
+    store32(buf + 480, 9);
+    store32(buf + 484, 21);
+    store32(buf + 488, 14);
+    store32(buf + 492, 11);
+    store32(buf + 496, 18);
+    store32(buf + 500, (4 << 16) | 61);  # OpLoad %3 %22 %21  (yv)
+    store32(buf + 504, 3);
+    store32(buf + 508, 22);
+    store32(buf + 512, 21);
+    store32(buf + 516, (5 << 16) | 132); # OpIMul %3 %23 %20 %10  (3*xv)
+    store32(buf + 520, 3);
+    store32(buf + 524, 23);
+    store32(buf + 528, 20);
+    store32(buf + 532, 10);
+    store32(buf + 536, (5 << 16) | 128); # OpIAdd %3 %24 %23 %22  (m + yv)
+    store32(buf + 540, 3);
+    store32(buf + 544, 24);
+    store32(buf + 548, 23);
+    store32(buf + 552, 22);
+    store32(buf + 556, (3 << 16) | 62);  # OpStore %21 %24
+    store32(buf + 560, 21);
+    store32(buf + 564, 24);
+    store32(buf + 568, (1 << 16) | 253); # OpReturn
+    store32(buf + 572, (1 << 16) | 56);  # OpFunctionEnd
+    return 576;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V multi-binding e2e (N.6) — novel 2-buffer kernel on Cezanne\n");
+    print_cstr("----------------------------------------------------------------------------\n");
+
+    var spv[640];
+    var n = build_saxpy_kernel(&spv);
+
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1440];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 25, 40);
+    var isel[768];
+    var isel2[768];
+    var alloc[640];
+    var hw[16];
+    var abi[64];
+    var cc[88];
+    store64(&cc + CC_TYPES, &types);
+    store64(&cc + CC_CONSTS, &consts);
+    store64(&cc + CC_DECO, &deco);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_OUTBI, &outbi);
+    store64(&cc + CC_ISEL, &isel);
+    store64(&cc + CC_ISEL2, &isel2);
+    store64(&cc + CC_ALLOC, &alloc);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    store64(&cc + CC_CAP_IDS, 26);  # types[640]/24 = 26 records (the min table cap)
+    var isa[512];
+    memset(&isa, 0, 512);
+    var desc[64];
+    var crc = gfx9_compile(&cc, &spv, n, &isa, &desc);
+    if (crc != 0) {
+        print_cstr("FAIL: gfx9_compile rc="); print_i64(crc); print_cstr("\n");
+        return 2;
+    }
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var rsrc1 = load64(&desc + DESC_RSRC1);
+    var rsrc2 = load64(&desc + DESC_RSRC2);
+    print_cstr("compiled: isa_len="); print_i64(isa_len);
+    print_cstr(" user_sgpr="); print_i64(load64(&desc + DESC_USER_SGPR));
+    print_cstr(" bindings="); print_i64(load64(&desc + DESC_NUM_BINDINGS));
+    print_cstr("\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shader_size = 4096;
+    var shader_bo[16];
+    if (native_bo_create_gtt(fd, shader_size, &shader_bo) != 0) { return 4; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map = load64(&shader_bo + 8);
+    memset(shader_map, 0, shader_size);
+    var w = 0;
+    while (w < isa_len) { store32(shader_map + w, load32(&isa + w)); w = w + 4; }
+    var shader_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, shader_handle, shader_va, shader_size, _NATIVE_PERM_SHADER) != 0) { return 4; }
+
+    # x BO (binding 0): seed x[i] = i.
+    var xb[16];
+    if (native_bo_create_gtt(fd, 4096, &xb) != 0) { return 5; }
+    var x_handle = load64(&xb + 0);
+    var x_map = load64(&xb + 8);
+    var i = 0;
+    while (i < 8) { store32(x_map + i * 4, i); i = i + 1; }
+    var x_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, x_handle, x_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    # y BO (binding 1): seed y[i] = 100.
+    var yb[16];
+    var ycr = native_bo_create_gtt(fd, 4096, &yb);
+    if (ycr != 0) { print_cstr("FAIL: y bo create rc="); print_i64(ycr); print_cstr("\n"); return 6; }
+    var y_handle = load64(&yb + 0);
+    var y_map = load64(&yb + 8);
+    i = 0;
+    while (i < 8) { store32(y_map + i * 4, 100); i = i + 1; }
+    var y_va = 0xFFFF800100800000;   # 0x600000 is reserved by a context BO
+    var ymr = native_gem_va_map(fd, y_handle, y_va, 4096, _NATIVE_PERM_DATA);
+    if (ymr != 0) { print_cstr("FAIL: y va_map rc="); print_i64(ymr); print_cstr("\n"); return 6; }
+
+    # Dispatch: binding 0 = x, binding 1 = y; 8 threads, 1 workgroup; compiler RSRC.
+    var bind_vas[16];
+    store64(&bind_vas + 0, x_va);
+    store64(&bind_vas + 8, y_va);
+    var bind_handles[16];
+    store64(&bind_handles + 0, x_handle);
+    store64(&bind_handles + 8, y_handle);
+
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return 7; }
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
+    &bind_vas, 2, 8, 1);
+
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    if (syscall(228, 1, &t_now) != 0) { return 8; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var rc = native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+    &bind_handles, 2, deadline);
+    if (rc != 0) { print_cstr("FAIL: dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    # Verify y[i] == 3*i + 100.
+    var ok = 1;
+    i = 0;
+    while (i < 8) {
+        var got = load32(y_map + i * 4);
+        var want = 3 * i + 100;
+        print_cstr("y["); print_i64(i); print_cstr("] = "); print_i64(got);
+        print_cstr(" (want "); print_i64(want); print_cstr(")");
+        if (got != want) { print_cstr("  MISMATCH"); ok = 0; }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    native_gem_va_unmap(fd, y_handle, y_va, 4096);
+    native_bo_release_gtt(fd, y_handle, y_map, 4096);
+    native_gem_va_unmap(fd, x_handle, x_va, 4096);
+    native_bo_release_gtt(fd, x_handle, x_map, 4096);
+    native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+    native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: readback mismatch\n"); return 11; }
+    print_cstr("OK — novel 2-binding compiled kernel ran correctly on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

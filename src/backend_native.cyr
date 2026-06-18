@@ -117,6 +117,71 @@ shader_handle, out_handle, timeout_ns): i64 {
 }
 
 # ================================================================
+# N.6 — multi-binding compute dispatch (cached path, N storage BOs)
+# ================================================================
+# Like native_compute_dispatch_cached but the BO list carries N binding handles
+# (a caller [n] array of GEM handles) instead of a single out_handle — so a
+# compiled kernel reading/writing several storage buffers (e.g. a 2-binding
+# SAXPY) gets every buffer resident. BO list = fence + stub + bind[0..n) +
+# shader + ib. Synchronous (creates/waits/destroys an ephemeral syncobj).
+fn native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+binds, n_binds, timeout_ns): i64 {
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle = native_ctx_stub_handle(ctx);
+    var ib_handle = native_ctx_ib_handle(ctx);
+    var ib_va = native_ctx_ib_va(ctx);
+    var ib_addr = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_addr = native_ctx_fence_addr(ctx);
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    store64(fence_addr + 32, 0);
+    # entries: fence(1) + stub(3) + each binding(3) + shader(4) + ib(10).
+    var entries[256];
+    var ne = 0;
+    store32(&entries + ne * 8, fence_handle);
+    store32(&entries + ne * 8 + 4, 1);
+    ne = ne + 1;
+    store32(&entries + ne * 8, stub_handle);
+    store32(&entries + ne * 8 + 4, 3);
+    ne = ne + 1;
+    var bi = 0;
+    while (bi < n_binds) {
+        store32(&entries + ne * 8, load64(binds + bi * 8));
+        store32(&entries + ne * 8 + 4, 3);
+        ne = ne + 1;
+        bi = bi + 1;
+    }
+    store32(&entries + ne * 8, shader_handle);
+    store32(&entries + ne * 8 + 4, 4);
+    ne = ne + 1;
+    store32(&entries + ne * 8, ib_handle);
+    store32(&entries + ne * 8 + 4, 10);
+    ne = ne + 1;
+    var bo_list_in[24];
+    store32(&bo_list_in + 0, 0xFFFFFFFF);
+    store32(&bo_list_in + 4, 0xFFFFFFFF);
+    store32(&bo_list_in + 8, ne);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var syncobj_buf[8];
+    var rc = native_syncobj_create(fd, &syncobj_buf);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var syncobj_handle = load64(&syncobj_buf);
+    rc = native_cs_submit_4chunk(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    AMDGPU_HW_IP_COMPUTE, syncobj_handle, fence_handle, 32, 0x08);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_syncobj_destroy(fd, syncobj_handle);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    native_syncobj_destroy(fd, syncobj_handle);
+    return _native_neg_rc_to_gpu_err(wait_rc);
+}
+
+# ================================================================
 # v3.1 Q.3c — queue-targeted compute dispatch (async, timeline)
 # ================================================================
 # Like native_compute_dispatch_cached but submits on `queue`'s ring,
@@ -650,21 +715,228 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
     return 0;
 }
 
-# Shader-module slots — diagnostic stubs (audit LOW-3). Same
-# rationale as the buffer slots: native shader modules in v3.0
-# come from `native_shader_lib_*` helpers (pre-compiled GFX9 ISA
-# wrapped at canonical-high VA), not from this public API.
-# `_shader_module_create` returns 0 ("no module") on failure;
-# `_release` is a no-op success.
-# v3.2 Phase S: the slot widened to carry `kind` (fncall4). Native accepts only
-# GFX9 ISA today; SPIR-V→GFX9 lowering is Phase N — so a SPIR-V kind here returns
-# 0 (fail-loud), same as the GFX9 stub. The param is accepted for the widened ABI.
+# Native compiled shader-module struct (N.6r). The compute-dispatch slot must
+# distinguish a COMPILED kernel (carrying the compiler's RSRC + binding count +
+# local size, dispatched through the generic composer) from the legacy 16-byte
+# (handle,va) "deadbeef" pair that native_compute_store / the queue programs pass
+# straight to the hardcoded composer. They share the first words, so a magic tag
+# at +0 is the discriminator: a legacy pair holds a small u32 GEM handle there,
+# never this 64-bit value. Fields:
+#   +0  magic   (NATIVE_SHMOD_MAGIC_VAL)
+#   +8  handle  (GTT BO handle of the ISA)
+#   +16 va      (GPU VA of the ISA, _NATIVE_PERM_SHADER)
+#   +24 addr    (CPU mmap pointer — needed for bo-release)
+#   +32 rsrc1   (COMPUTE_PGM_RSRC1 from gfx9_compile)
+#   +40 rsrc2   (COMPUTE_PGM_RSRC2)
+#   +48 nbind   (binding count — bindings k→USER_DATA s[2k:2k+1])
+#   +56 local_x (LocalSize.x → PM4 NUM_THREAD_X; must match the compiled shader)
+#   +64 isa_len (ISA byte length, incl. the prefetch pad)
+var NATIVE_SHMOD_MAGIC_VAL = 0x4D42444153484D31;   # "MBDASHM1"
+var NATIVE_SHMOD_MAGIC   = 0;
+var NATIVE_SHMOD_HANDLE  = 8;
+var NATIVE_SHMOD_VA      = 16;
+var NATIVE_SHMOD_ADDR    = 24;
+var NATIVE_SHMOD_RSRC1   = 32;
+var NATIVE_SHMOD_RSRC2   = 40;
+var NATIVE_SHMOD_NBIND   = 48;
+var NATIVE_SHMOD_LOCALX  = 56;
+var NATIVE_SHMOD_ISALEN  = 64;
+var NATIVE_SHMOD_SIZE    = 72;
+
+# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
+# scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
+# → CMP_ERR_TABLE → this returns 0). 128 covers the MVP kernels; raising it grows
+# the stack frame (the tables are id-indexed). The MVP exit (downsample) used 45.
+var NATIVE_SHADER_CAP_IDS = 128;
+
+# Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
+# at a context-allocated VA, and return a magic-tagged shmod struct the compute
+# dispatch consumes. Returns 0 on ANY failure (validate / compile / VA / BO /
+# va-map / OOM) — the fail-loud null per the slot contract. All compile scratch is
+# stack-transient (freed on return); only the 72-B shmod is alloc'd (it must
+# outlive the call), and the ISA BO is a GPU resource freed by _release.
+fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
+    if (ctx == 0)       { return 0; }
+    if (words_ptr == 0) { return 0; }
+    # The SPIR-V header is 5 words (20 B); reject anything shorter BEFORE reading
+    # spirv_hdr_id_bound (word 3, offset 12) below — gfx9_compile's validate gate
+    # runs only later, so without this a 1..19-byte buffer is an OOB header read
+    # (N.6r review, HIGH). 20 is the floor; full structural validation is the gate's.
+    if (byte_len < 20) { return 0; }
+
+    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS ids ---
+    var types[3072];     # 128 * SPIRV_TYPE_REC(24)
+    var consts[2048];    # 128 * SPIRV_CONST_REC(16)
+    var deco[2048];      # 128 * SPIRV_DECO_REC(16)
+    var outbi[1024];     # 128 * 8
+    var m[80];
+    var vals[5120];      # 128 * MIR_VAL_REC(40)
+    var instrs[8192];    # 256 * MIR_INSTR_REC(32)
+    var ptrs[1024];
+    var blocks[32];
+    # The MIR synth-id counter starts right after the SPIR-V ids (the header's
+    # id_bound), so synthesized values (access-chain offsets, GID expansion) get
+    # fresh ids in [id_bound, NATIVE_SHADER_CAP_IDS). Passing the cap as the start
+    # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
+    # table-build gate (CMP_ERR_TABLE).
+    var idb = spirv_hdr_id_bound(words_ptr);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 256, 64, idb,
+    NATIVE_SHADER_CAP_IDS);
+    var isel[6144];      # CMP_ISEL_CAP(128) * GISEL_REC(48)
+    var isel2[6144];
+    var alloc[2048];     # 128 * RA_REC(16)
+    var hw[16];
+    var abi[64];
+    var cc[88];
+    store64(&cc + CC_TYPES, &types);
+    store64(&cc + CC_CONSTS, &consts);
+    store64(&cc + CC_DECO, &deco);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_OUTBI, &outbi);
+    store64(&cc + CC_ISEL, &isel);
+    store64(&cc + CC_ISEL2, &isel2);
+    store64(&cc + CC_ALLOC, &alloc);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    store64(&cc + CC_CAP_IDS, NATIVE_SHADER_CAP_IDS);
+    var isa[8192];
+    memset(&isa, 0, 8192);
+    var desc[72];
+    if (gfx9_compile(&cc, words_ptr, byte_len, &isa, &desc) != 0) { return 0; }
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    if (isa_len <= 0)    { return 0; }
+    if (isa_len > 8192)  { return 0; }
+
+    # --- LocalSize.x (drives PM4 NUM_THREAD_X; the kernel was compiled for it) ---
+    var entry = spirv_find_entry_point(words_ptr, byte_len);
+    var lsz[24];
+    store64(&lsz + 0, 1);
+    store64(&lsz + 8, 1);
+    store64(&lsz + 16, 1);
+    spirv_find_local_size(words_ptr, byte_len, entry, &lsz);
+    var local_x = load64(&lsz + 0);
+    if (local_x <= 0) { local_x = 1; }
+
+    # --- stage the ISA in a GTT BO at a context-allocated VA ---
+    var fd = native_ctx_fd(ctx);
+    var bo_size = _native_align_up(isa_len, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    # Every post-VA-alloc error path reclaims the just-reserved VA (LIFO, no
+    # intervening alloc) so a transient failure does not permanently consume the
+    # 2 GiB region (N.6r review, HIGH).
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) {
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    memset(addr, 0, bo_size);
+    memcpy(addr, &isa, isa_len);
+    if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_SHADER) != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
+
+    # --- the persistent (alloc'd) shmod struct ---
+    var sh = alloc(NATIVE_SHMOD_SIZE);
+    if (sh == 0) {
+        native_gem_va_unmap(fd, handle, va, bo_size);
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
+    store64(sh + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);
+    store64(sh + NATIVE_SHMOD_HANDLE, handle);
+    store64(sh + NATIVE_SHMOD_VA, va);
+    store64(sh + NATIVE_SHMOD_ADDR, addr);
+    store64(sh + NATIVE_SHMOD_RSRC1, load64(&desc + DESC_RSRC1));
+    store64(sh + NATIVE_SHMOD_RSRC2, load64(&desc + DESC_RSRC2));
+    store64(sh + NATIVE_SHMOD_NBIND, load64(&desc + DESC_NUM_BINDINGS));
+    store64(sh + NATIVE_SHMOD_LOCALX, local_x);
+    store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
+    return sh;
+}
+
+# Shader-module create slot (N.6r). SPIR-V is compiled in-tree (Phase N) → a
+# magic-tagged compiled shmod. WGSL and pre-compiled GFX9 are NOT accepted here:
+# WGSL needs an in-mabda frontend (v3.x), and raw GFX9 ISA carries no RSRC /
+# binding metadata for the dispatch to wire — both return 0 (fail-loud).
 fn _backend_native_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
+    if (ctx == 0) { return 0; }
+    if (kind == SHADER_SRC_SPIRV) {
+        return _native_shader_compile_spirv(ctx, bytes_ptr, n);
+    }
     return 0;
 }
 
+# Release a compiled shmod: VA-unmap + BO-release + zero the struct. Null-safe and
+# tag-checked — a legacy (handle,va) pair (no magic) is left untouched (its BO is
+# owned by the caller that built the pair). The GPU BO — the scarce resource — is
+# freed. NOT reclaimed: the 72-B struct (bump allocator has no reclaim) AND the
+# shader VA from the forward-only texture region (release can run at any time, not
+# LIFO, so the cursor cannot roll back — same policy as gpu_buffer/texture release).
+# A consumer churning create/release exhausts the per-context 2 GiB region after
+# ~32K shaders; the on-error path DOES reclaim (LIFO) — see _native_shader_compile_spirv.
 fn _backend_native_shader_module_release(ctx, shmod): i64 {
+    if (ctx == 0)    { return 0; }
+    if (shmod == 0)  { return 0; }
+    if (load64(shmod + NATIVE_SHMOD_MAGIC) != NATIVE_SHMOD_MAGIC_VAL) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var handle  = load64(shmod + NATIVE_SHMOD_HANDLE);
+    var va      = load64(shmod + NATIVE_SHMOD_VA);
+    var addr    = load64(shmod + NATIVE_SHMOD_ADDR);
+    var bo_size = _native_align_up(load64(shmod + NATIVE_SHMOD_ISALEN), 4096);
+    if (handle != 0) {
+        native_gem_va_unmap(fd, handle, va, bo_size);
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+    }
+    memset(shmod, 0, NATIVE_SHMOD_SIZE);
     return 0;
+}
+
+# N.6r — dispatch a COMPILED shmod through the generic N-binding composer. `x` is
+# the grid X (workgroup count); the shmod's LocalSize.x is NUM_THREAD_X. `bp` is a
+# count-prefixed binding array (the compiled-path binding ABI): bp+0 = count, then
+# count × (handle, va) 16-byte pairs. The count MUST equal the compiler's binding
+# count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a caller error. Bindings
+# are capped at 16 (the USER_DATA ceiling the ABI already enforces). Synchronous
+# (cached_n); a logical-queue/timeline compiled path is a later bite.
+fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
+    if (bp == 0) { return GPU_ERR_OTHER; }
+    var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
+    var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
+    var rsrc1   = load64(shmod + NATIVE_SHMOD_RSRC1);
+    var rsrc2   = load64(shmod + NATIVE_SHMOD_RSRC2);
+    var nbind   = load64(shmod + NATIVE_SHMOD_NBIND);
+    var local_x = load64(shmod + NATIVE_SHMOD_LOCALX);
+    if (nbind < 0)   { return GPU_ERR_OTHER; }
+    if (nbind > 16)  { return GPU_ERR_OTHER; }
+    if (local_x <= 0) { return GPU_ERR_OTHER; }
+    # The caller's binding array count must match the kernel's binding count, else
+    # we would load USER_DATA / residency from unrelated memory.
+    if (load64(bp + 0) != nbind) { return GPU_ERR_OTHER; }
+    var bind_vas[128];      # 16 * 8
+    var bind_handles[128];
+    var i = 0;
+    while (i < nbind) {
+        store64(&bind_handles + i * 8, load64(bp + 8 + i * 16 + 0));
+        store64(&bind_vas + i * 8, load64(bp + 8 + i * 16 + 8));
+        i = i + 1;
+    }
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return GPU_ERR_OTHER; }
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
+    &bind_vas, nbind, local_x, x);
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    return native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+    &bind_handles, nbind, deadline);
 }
 
 # Compute dispatch — the load-bearing slot. Step 4c lands this
@@ -695,6 +967,20 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     var cq = gpu_ctx_current_queue(ctx);
     if (cq != 0) {
         if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
+    }
+
+    # N.6r — COMPILED-kernel path. A magic-tagged shmod (from
+    # gpu_shader_module_create_spirv) carries the compiler's RSRC + binding count
+    # + LocalSize, so we dispatch through the generic N-binding composer instead of
+    # the hardcoded deadbeef one below. The legacy (handle,va) pair has no magic
+    # and falls through to the v3.0 deadbeef path unchanged.
+    if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
+        # MVP: the compiled path is 1-D (grid = x). Reject a multi-dim grid rather
+        # than silently dropping the y/z workgroups — fail loud beats wrong results.
+        # 2-D/3-D grid + 2-D LocalSize is the deferred N.6 TGID enhancement.
+        if (y != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
+        if (z != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
+        return _native_dispatch_compiled(ctx, shmod, x, bp);
     }
 
     var stub_va = native_ctx_stub_va(ctx);
@@ -1912,6 +2198,21 @@ fn native_ctx_alloc_texture_va(ctx, size): i64 {
     }
     native_ctx_set_tex_va_next(ctx, next);
     return cur;
+}
+
+# Roll back the LAST native_ctx_alloc_texture_va of `size` (LIFO). The forward-only
+# cursor cannot reclaim an arbitrary freed VA, but an error path that fails right
+# after allocating — with no intervening texture-VA allocation (Cyrius is single-
+# threaded and these slots are not re-entrant) — can hand the just-reserved range
+# back so a transient BO-create / va-map failure does not permanently consume the
+# 2 GiB region (N.6r review, HIGH). ONLY valid immediately after the matching alloc.
+fn native_ctx_free_texture_va(ctx, size): i64 {
+    if (ctx == 0) { return 0 - 1; }
+    var step = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
+    var cur = native_ctx_tex_va_next(ctx);
+    if (cur == 0) { return 0; }
+    native_ctx_set_tex_va_next(ctx, cur - step);
+    return 0;
 }
 
 var NATIVE_TEX_FIELD_HANDLE    = 0;

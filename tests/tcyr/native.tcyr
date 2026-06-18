@@ -2131,6 +2131,38 @@ fn test_native_pm4_compute_generic() {
     return 0;
 }
 
+# N.6: multi-binding compute dispatch — N storage-buffer VAs into USER_DATA
+# (binding k → s[2k:2k+1]) with the compiler's RSRC. HW validation is
+# programs/native_spirv_saxpy_e2e.cyr (a 2-binding kernel, HW-verified on Cezanne).
+fn test_native_pm4_compute_dispatch_n() {
+    var buf[256];
+    memset(&buf, 0, 256);
+    var binds[16];
+    store64(&binds + 0, 0x1111000000001000);   # binding 0 (low dword 0x00001000)
+    store64(&binds + 8, 0x2222000000002000);   # binding 1 (low dword 0x00002000)
+    var n = native_pm4_build_compute_dispatch(&buf, 0xFFFF800180000000, 0x2C0040, 0x48,
+    &binds, 2, 8, 1);
+    assert_eq(n, 256, "padded to 64 dwords");
+    var b0 = 0;
+    var b1 = 0;
+    var r2 = 0;
+    var nt = 0;
+    var i = 0;
+    while (i < 256) {
+        var d = load32(&buf + i);
+        if (d == 0x00001000) { b0 = 1; }
+        if (d == 0x00002000) { b1 = 1; }
+        if (d == 0x48)       { r2 = 1; }
+        if (d == 8)          { nt = 1; }
+        i = i + 4;
+    }
+    assert_eq(b0, 1, "binding-0 VA -> USER_DATA_0 (s0:s1)");
+    assert_eq(b1, 1, "binding-1 VA -> USER_DATA_2 (s2:s3)");
+    assert_eq(r2, 1, "compiler RSRC2 (USER_SGPR=4) wired");
+    assert_eq(nt, 1, "NUM_THREAD_X wired");
+    return 0;
+}
+
 # ================================================================
 # v3 Step 6.3 — native render target primitives (Phase C render)
 # ================================================================
@@ -3276,13 +3308,131 @@ fn test_native_render_pass_draw_rejects_bad_vc_ic() {
 # stubs — no native shader compiler yet (SPIR-V->GFX9 is Phase N).
 fn test_native_shader_module_stubs() {
     assert_eq(_backend_native_shader_module_create(0, 0, 0, SHADER_SRC_GFX9), 0,
-    "shmod_create GFX9 stub -> 0");
+    "shmod_create null ctx -> 0 (GFX9)");
     assert_eq(_backend_native_shader_module_create(0, 0, 0, SHADER_SRC_SPIRV), 0,
-    "shmod_create SPIRV -> 0 (Phase N, fail-loud)");
+    "shmod_create null ctx -> 0 (SPIRV)");
     assert_eq(_backend_native_shader_module_release(0, 0),   0, "shmod_release no-op");
     # Buffer create/release reject null (full behaviour in the X.1/X.2 tests).
     assert_eq(_backend_native_buffer_create(0, 0, 0), 0, "buffer_create null ctx -> 0");
     assert_eq(_backend_native_buffer_release(0, 0),   0, "buffer_release null -> 0");
+    return 0;
+}
+
+# N.6r — the compiled native shader-module struct layout (the magic discriminator
+# + field offsets the dispatch reads). A change here without updating the slot/
+# dispatch in lockstep is a latent OOB; this pins the contract.
+fn test_native_shmod_struct_layout() {
+    assert_eq(NATIVE_SHMOD_MAGIC, 0,   "magic at +0");
+    assert_eq(NATIVE_SHMOD_HANDLE, 8,  "handle at +8");
+    assert_eq(NATIVE_SHMOD_VA, 16,     "va at +16");
+    assert_eq(NATIVE_SHMOD_ADDR, 24,   "addr at +24");
+    assert_eq(NATIVE_SHMOD_RSRC1, 32,  "rsrc1 at +32");
+    assert_eq(NATIVE_SHMOD_RSRC2, 40,  "rsrc2 at +40");
+    assert_eq(NATIVE_SHMOD_NBIND, 48,  "nbind at +48");
+    assert_eq(NATIVE_SHMOD_LOCALX, 56, "local_x at +56");
+    assert_eq(NATIVE_SHMOD_ISALEN, 64, "isa_len at +64");
+    assert_eq(NATIVE_SHMOD_SIZE, 72,   "struct size 72");
+    # The magic must have non-zero high 32 bits so it can never collide with a
+    # legacy (handle,va) pair's u32 GEM handle at +0.
+    assert_eq((NATIVE_SHMOD_MAGIC_VAL >> 32) != 0, 1, "magic high word non-zero");
+    return 0;
+}
+
+# N.6r — the create slot accepts ONLY SPIR-V on native (compiled in-tree); WGSL
+# and pre-compiled GFX9 fail loud (return 0). With a non-null mock ctx the SPIR-V
+# path runs the compiler, which rejects bad bytes — also 0.
+fn test_native_shader_module_create_kind_gate() {
+    var b = backend_native_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE);
+    var ctx[120];
+    memset(&ctx, 0, 120);
+    var bytes[32];
+    memset(&bytes, 0, 32);
+    assert_eq(fncall4(fp, &ctx, &bytes, 32, SHADER_SRC_WGSL), 0, "WGSL -> 0 on native");
+    assert_eq(fncall4(fp, &ctx, &bytes, 32, SHADER_SRC_GFX9), 0, "GFX9 -> 0 on native");
+    # SPIR-V kind, but the bytes are not a valid stream (zero magic) -> compiler's
+    # validate gate rejects -> 0 (no BO touched).
+    assert_eq(fncall4(fp, &ctx, &bytes, 32, SHADER_SRC_SPIRV), 0, "invalid SPIR-V -> 0");
+    # A byte_len shorter than the 5-word (20 B) SPIR-V header is rejected BEFORE the
+    # header read (spirv_hdr_id_bound reads word 3) — guards an OOB read (N.6r review).
+    assert_eq(fncall4(fp, &ctx, &bytes, 16, SHADER_SRC_SPIRV), 0, "byte_len 16 < 20 -> 0");
+    assert_eq(fncall4(fp, &ctx, &bytes, 4, SHADER_SRC_SPIRV), 0, "byte_len 4 < 20 -> 0");
+    return 0;
+}
+
+# N.6r review (HIGH): an on-error path can hand the just-reserved texture VA back
+# (LIFO) so a transient BO-create / va-map failure does not permanently consume the
+# 2 GiB region. The freed range is reused by the next allocation.
+fn test_native_free_texture_va_lifo() {
+    var ctx[128];
+    memset(&ctx, 0, 128);
+    var va1 = native_ctx_alloc_texture_va(&ctx, 4096);
+    var va2 = native_ctx_alloc_texture_va(&ctx, 4096);
+    assert_eq(va2 > va1, 1, "cursor advances");
+    native_ctx_free_texture_va(&ctx, 4096);     # roll back the va2 reservation
+    var va3 = native_ctx_alloc_texture_va(&ctx, 4096);
+    assert_eq(va3, va2, "freed VA range is reused (LIFO rollback)");
+    return 0;
+}
+
+# N.6r — the compute-dispatch slot routes a magic-tagged shmod to the compiled
+# path, whose binding-array guards fire BEFORE any ioctl: a bp count that disagrees
+# with the kernel's binding count, or an out-of-range binding count, is rejected.
+fn test_native_dispatch_compiled_binding_guards() {
+    var b = backend_native_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
+    var ctx[120];
+    memset(&ctx, 0, 120);
+    var shmod[72];
+    memset(&shmod, 0, 72);
+    store64(&shmod + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);
+    store64(&shmod + NATIVE_SHMOD_NBIND, 2);
+    store64(&shmod + NATIVE_SHMOD_LOCALX, 8);
+    var bp[40];
+    memset(&bp, 0, 40);
+    store64(&bp + 0, 3);   # caller passes 3 bindings, kernel wants 2
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
+    "binding count mismatch -> err (pre-ioctl)");
+    # An out-of-range binding count is rejected too (USER_DATA ceiling is 16).
+    store64(&shmod + NATIVE_SHMOD_NBIND, 20);
+    store64(&bp + 0, 20);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
+    "nbind > 16 -> err");
+    # local_x must be positive (drives NUM_THREAD_X).
+    store64(&shmod + NATIVE_SHMOD_NBIND, 1);
+    store64(&shmod + NATIVE_SHMOD_LOCALX, 0);
+    store64(&bp + 0, 1);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
+    "local_x 0 -> err");
+    # A multi-dim grid (y>1 or z>1) is rejected for the compiled MVP path — fail
+    # loud rather than silently dropping the extra workgroups.
+    store64(&shmod + NATIVE_SHMOD_LOCALX, 8);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 2, 1, &bp), GPU_ERR_WORKGROUP_LIMIT,
+    "compiled grid y>1 -> err");
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 2, &bp), GPU_ERR_WORKGROUP_LIMIT,
+    "compiled grid z>1 -> err");
+    return 0;
+}
+
+# N.6r — release is tag-checked + null-safe: a legacy (handle,va) pair without the
+# magic is left untouched (its BO belongs to the caller), and a magic shmod with a
+# zero handle zeroes the struct without an ioctl.
+fn test_native_shader_module_release_tag_check() {
+    var b = backend_native_new();
+    var fp = backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE);
+    var ctx[120];
+    memset(&ctx, 0, 120);
+    assert_eq(fncall2(fp, &ctx, 0), 0, "null shmod -> 0");
+    var legacy[16];
+    store64(&legacy + 0, 5);        # a small GEM handle, no magic
+    store64(&legacy + 8, 0xABC);
+    assert_eq(fncall2(fp, &ctx, &legacy), 0, "legacy pair -> no-op 0");
+    assert_eq(load64(&legacy + 0), 5, "legacy pair untouched (not zeroed)");
+    var sh[72];
+    memset(&sh, 0, 72);
+    store64(&sh + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);   # handle stays 0
+    assert_eq(fncall2(fp, &ctx, &sh), 0, "magic + handle 0 -> 0 (no ioctl)");
+    assert_eq(load64(&sh + NATIVE_SHMOD_MAGIC), 0, "magic shmod zeroed after release");
     return 0;
 }
 
@@ -3465,6 +3615,7 @@ fn main() {
     test_native_gfx9_shader_downsample_2x2();
     test_native_pm4_compute_downsample();
     test_native_pm4_compute_generic();
+    test_native_pm4_compute_dispatch_n();
     test_native_rt_size_formula();
     test_native_rt_struct_field_offsets();
     test_native_rt_va_distinct_from_other_pools();
@@ -3518,6 +3669,11 @@ fn main() {
     test_native_pm4_event_write_advances_pos();
     test_native_render_pass_draw_rejects_bad_vc_ic();
     test_native_shader_module_stubs();
+    test_native_shmod_struct_layout();
+    test_native_shader_module_create_kind_gate();
+    test_native_free_texture_va_lifo();
+    test_native_dispatch_compiled_binding_guards();
+    test_native_shader_module_release_tag_check();
     test_native_ctx_pm4_scratch_is_stable();
     test_gpu_ctx_native_card_fd_round_trip();
     test_native_rt_create_rejects_odd_dims();

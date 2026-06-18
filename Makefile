@@ -280,6 +280,38 @@ build/native_spirv_compute_e2e: programs/native_spirv_compute_e2e.cyr src/*.cyr
 test-native-spirv-compute-e2e: build/native_spirv_compute_e2e
 	./build/native_spirv_compute_e2e
 
+# N.6: a novel 2-binding SAXPY-shape kernel compiled in-tree + dispatched on the
+# GPU (multi-binding dispatch — USER_DATA s0:s1=x, s2:s3=y).
+build/native_spirv_saxpy_e2e: programs/native_spirv_saxpy_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_saxpy_e2e.cyr $@
+
+.PHONY: test-native-spirv-saxpy-e2e
+test-native-spirv-saxpy-e2e: build/native_spirv_saxpy_e2e
+	./build/native_spirv_saxpy_e2e
+
+# N.5g: a 2x2 box-filter downsample compiled in-tree + dispatched on the GPU,
+# pixel-matched against a CPU box-filter (the named MVP-exit image kernel; 2
+# bindings src/dst, power-of-2 dims so index math is shifts/masks).
+build/native_spirv_downsample_e2e: programs/native_spirv_downsample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_downsample_e2e.cyr $@
+
+.PHONY: test-native-spirv-downsample-e2e
+test-native-spirv-downsample-e2e: build/native_spirv_downsample_e2e
+	./build/native_spirv_downsample_e2e
+
+# N.6r: a compiled SPIR-V kernel run through the PUBLIC gpu_* API end-to-end —
+# gpu_shader_module_create_spirv (native slot compiles + stages the ISA) +
+# gpu_compute_dispatch (consumes the compiled RSRC/bindings/LocalSize).
+build/native_spirv_public_api_e2e: programs/native_spirv_public_api_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_public_api_e2e.cyr $@
+
+.PHONY: test-native-spirv-public-api-e2e
+test-native-spirv-public-api-e2e: build/native_spirv_public_api_e2e
+	./build/native_spirv_public_api_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

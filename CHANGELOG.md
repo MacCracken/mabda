@@ -15,12 +15,103 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-### Next
-- N.5g — the named MVP exit: hand-author the downsample SPIR-V, compile it through
-  the same path, and pixel-match `native_mipmap_e2e` on Cezanne (per the analysis,
-  a naive compiled downsample likely needs no new ops). N.6 — a generic
-  multi-binding/TGID compute dispatcher + the `_backend_native_shader_module_create`
-  slot wiring (so consumers compile SPIR-V through the public API). 3.2.7.
+## [3.2.7] — 2026-06-17
+
+**The native SPIR-V → GFX9 compute compiler reaches the public API.** Building on
+3.2.6 (the compiler HW-verified end-to-end, Phases N.2–N.5), this release closes the
+v3.2.x native-compiler arc to the consumer surface: a real image kernel (a 2×2
+box-filter downsample) compiles in-tree and **pixel-matches** a CPU reference on
+Cezanne (N.5g — the named MVP exit); a consumer compiles + dispatches SPIR-V entirely
+through `gpu_shader_module_create_spirv` + `gpu_compute_dispatch`, with the native
+backend doing the compile, ISA staging, and RSRC/binding/LocalSize wiring behind the
+slot (N.6 + N.6r); and the SPIR-V→GFX9 table builders are hardened against an
+untrusted `id_bound` OOB write **before** that public path exposes the compiler
+(N-HARDEN.1). Every phase adversarially reviewed; all findings fixed pre-merge. All
+3461 CPU assertions pass; pin → 6.2.19.
+
+### Added — Phase N.6r (SPIR-V compiled through the PUBLIC gpu_* API on native)
+- **A consumer can now compile a SPIR-V compute kernel and dispatch it entirely
+  through the public API on the native AMD backend** — no compiler internals at the
+  call site. `gpu_shader_module_create_spirv(ctx, words, len)` routes to the native
+  slot, which runs `gfx9_compile`, stages the ISA in a GTT BO at a context-allocated
+  VA, and records the compiler's RSRC1/RSRC2 + binding count + LocalSize in a
+  magic-tagged shader-module struct; `gpu_compute_dispatch(ctx, shmod, gx,1,1, bp)`
+  detects the tag and dispatches through the generic N-binding composer (binding
+  k → USER_DATA `s[2k:2k+1]`, NUM_THREAD_X = the compiled LocalSize). HW-verified on
+  Cezanne: `programs/native_spirv_public_api_e2e.cyr` runs the 2-binding SAXPY
+  (`y[i] = 3*x[i] + y[i]`) and all 8 lanes are correct. `make test-native-spirv-public-api-e2e`.
+- The legacy 16-byte `(handle, va)` "deadbeef" dispatch path is untouched — the magic
+  tag (`0x4D42444153484D31`, never a u32 GEM handle) discriminates a compiled module
+  from the legacy pair, so `native_compute_store` + the three queue programs still pass.
+- `src/backend_native.cyr` — `_backend_native_shader_module_create` (SPIR-V → compiled
+  module; WGSL / pre-compiled GFX9 fail loud), `_backend_native_shader_module_release`
+  (tag-checked VA-unmap + BO-release), and `_native_dispatch_compiled` (the compiled
+  dispatch path with binding-array guards). bindings ≤ 16 (the USER_DATA ceiling); the
+  binding array is count-prefixed `(handle, va)` pairs and its count must match the
+  kernel's. +22 asserts in `tests/tcyr/native.tcyr` (struct layout + the kind gate +
+  the dispatch binding guards + the tag-checked release).
+- *MVP scope:* 1-D grid (a multi-dim grid is **rejected** — `GPU_ERR_WORKGROUP_LIMIT` —
+  rather than silently dropping `y`/`z` workgroups); SPIR-V `id_bound` ≤ 128 (larger
+  fails loud via the N-HARDEN.1 table gate); synchronous submit (a logical-queue/timeline
+  compiled path is a later bite).
+- *Adversarially reviewed (4 findings fixed pre-commit):* a sub-header (`byte_len < 20`)
+  SPIR-V now fails before the `id_bound` header read (was an OOB read); the shader VA is
+  reclaimed (LIFO) on every on-error path so a transient BO-create / va-map failure no
+  longer permanently consumes the 2 GiB region; the release path's VA-not-reclaimed
+  policy is documented.
+
+### Security — Phase N-HARDEN.1 (unchecked OOB write in the SPIR-V table builders)
+- **The SPIR-V→GFX9 table builders no longer trust the header `id_bound`.**
+  `spirv_build_type_table` / `_const_table` / `_decoration_table`
+  (`src/spirv_parse.cyr`) index a caller-provided buffer by every result `<id>`
+  using the (untrusted) `id_bound`, and previously took no buffer-capacity
+  parameter — so a crafted oversized `id_bound` (the validate gate only caps it at
+  a loose `0x40000000`) ran the up-front `memset` and every per-id write past the
+  buffer, silently corrupting memory and surfacing much later as a spurious
+  `MIR_ERR_ID_OOR`. Each builder now takes a `cap` (table capacity in records),
+  rejects `id_bound > cap` with `-SPIRV_ERR_ID_CAP` **before touching `out`**, and
+  guards each per-id write (`id == 0 || id >= cap`). `gfx9_compile` threads the
+  capacity from a new `CC_CAP_IDS` context field and surfaces any builder
+  rejection as `CMP_ERR_TABLE`. Found via the N.5g adversarial review; it had
+  already bitten development as a confusing `-25` when a caller sized its tables
+  for `cap_ids` instead of `id_bound`. +8 asserts in `tests/tcyr/compiler.tcyr`
+  (per-builder rejection + untouched-canary + the `gfx9_compile` integration
+  reject). Closes the gap **before** N.6's `gpu_shader_module_create` SPIR-V path
+  exposes the compiler to consumers.
+
+### Added — Phase N.6 (multi-binding dispatch + a novel kernel on the GPU)
+- **A compiled kernel the compiler never saw as hand-authored bytes runs on
+  Cezanne with two real storage buffers.** `programs/native_spirv_saxpy_e2e.cyr`:
+  a SAXPY-shape `y[lid.x] = 3*x[lid.x] + y[lid.x]` (uint, LocalSize 8) →
+  `gfx9_compile` → dispatch reading `x` (binding 0 → `s0:s1`) and read-modify-
+  writing `y` (binding 1 → `s2:s3`) → `y[i]` becomes `3*i + 100` for all 8 lanes.
+  `make test-native-spirv-saxpy-e2e`.
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_dispatch`: a generic
+  N-binding compute composer that lays each binding VA into USER_DATA per the
+  compiler's ABI (binding k → `s[2k:2k+1]`) and uses the compiler's RSRC1/RSRC2
+  verbatim (no scratch — a compiled MVP kernel does not spill).
+- `src/backend_native.cyr` — `native_compute_dispatch_cached_n`: the cached submit
+  with a variable BO list (fence + stub + each binding handle + shader + IB) so
+  every storage buffer is resident.
+- `tests/tcyr/native.tcyr` +4 asserts: a structural CPU test that N binding VAs
+  land in the right USER_DATA slots with the compiler's RSRC. (Bounded by the
+  16-SGPR USER_DATA limit ⇒ ≤8 bindings.)
+
+### Added — Phase N.5g (a compiled image kernel — the MVP-exit downsample)
+- **A 2×2 box-filter downsample, compiled in-tree from SPIR-V, pixel-matches a
+  CPU box-filter on Cezanne.** `programs/native_spirv_downsample_e2e.cyr`: a
+  single-channel `dst[i] = (src[a]+src[b]+src[c]+src[d]) >> 2` over each 2×2
+  source block (`dst` 4×4, `src` 8×8, LocalSize 16) → `gfx9_compile` → 2-binding
+  dispatch (`src` binding 0 → `s0:s1`, `dst` binding 1 → `s2:s3`) → every one of
+  the 16 destination texels equals the average of its 2×2 source block. The
+  reference is an **independent** CPU box-filter over the same seeded source, and
+  `dst` is pre-seeded with a `0xBAADF00D` sentinel, so a no-op or wrong kernel
+  fails rather than passing spuriously. Power-of-2 dims keep all index math in
+  shifts/masks (`x=i&3`, `y=i>>2`, `aoff=(y<<4)+(x<<1)`) — no div/mod, which the
+  compiler does not lower. The compiler handled a real image kernel (5
+  `OpAccessChain` loads/store, the 2×2 offset arithmetic, accumulate, shift)
+  through the full N.2–N.5 pipeline with no new compiler code — it reuses the N.6
+  multi-binding composer + cached submit. `make test-native-spirv-downsample-e2e`.
 
 ## [3.2.6] — 2026-06-17
 

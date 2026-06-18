@@ -1,0 +1,414 @@
+# programs/native_spirv_downsample_e2e.cyr — N.5g(-1): a 2x2 box-filter downsample
+# compiled in-tree and dispatched on Cezanne, pixel-matched vs a CPU box-filter.
+#
+# The box-filter CORE of the named MVP-exit downsample: dst[i] = average of the
+# 2x2 source block. Single-channel uint texels (the RGBA channel-pack version is
+# N.5g-2). Power-of-2 dims (dst 4x4, src 8x8) so the index math is pure shifts/
+# masks — no div/mod. For dst texel i: x = i&3, y = i>>2; src offsets a=(y<<4)+(x<<1),
+# b=a+1, c=a+8, d=a+9 (the 2x2 block at rows 2y,2y+1 of an 8-wide source);
+# dst[i] = (src[a]+src[b]+src[c]+src[d]) >> 2.
+#
+# Hand-authored SPIR-V → gfx9_compile → GFX9 ISA → dispatch (16 threads, src→s0:s1,
+# dst→s2:s3) → verified per-texel against a CPU box-filter. Seed src[k]=k ⇒
+# dst[i] = 16*(i>>2) + 2*(i&3) + 4.
+#
+# Exit: 0 = all 16 dst texels match the CPU reference; 2 = compile; 3..9 = setup/
+# dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# SPIR-V (id-bound 45, 960 bytes): the box-filter. Bindings: %18 src(0), %19 dst(1).
+fn build_downsample_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 45);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);   # OpMemoryModel Logical GLSL450
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (6 << 16) | 15);   # OpEntryPoint GLCompute %20 "main" %17
+    store32(buf + 44, 5);
+    store32(buf + 48, 20);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 17);
+    store32(buf + 64, (6 << 16) | 16);   # OpExecutionMode %20 LocalSize 16 1 1
+    store32(buf + 68, 20);
+    store32(buf + 72, 17);
+    store32(buf + 76, 16);
+    store32(buf + 80, 1);
+    store32(buf + 84, 1);
+    store32(buf + 88, (4 << 16) | 71);   # OpDecorate %17 BuiltIn LocalInvocationId
+    store32(buf + 92, 17);
+    store32(buf + 96, 11);
+    store32(buf + 100, 27);
+    store32(buf + 104, (4 << 16) | 71);  # OpDecorate %18 Binding 0
+    store32(buf + 108, 18);
+    store32(buf + 112, 33);
+    store32(buf + 116, 0);
+    store32(buf + 120, (4 << 16) | 71);  # OpDecorate %18 DescriptorSet 0
+    store32(buf + 124, 18);
+    store32(buf + 128, 34);
+    store32(buf + 132, 0);
+    store32(buf + 136, (4 << 16) | 71);  # OpDecorate %19 Binding 1
+    store32(buf + 140, 19);
+    store32(buf + 144, 33);
+    store32(buf + 148, 1);
+    store32(buf + 152, (4 << 16) | 71);  # OpDecorate %19 DescriptorSet 0
+    store32(buf + 156, 19);
+    store32(buf + 160, 34);
+    store32(buf + 164, 0);
+    store32(buf + 168, (2 << 16) | 19);  # OpTypeVoid %1
+    store32(buf + 172, 1);
+    store32(buf + 176, (3 << 16) | 33);  # OpTypeFunction %2 %1
+    store32(buf + 180, 2);
+    store32(buf + 184, 1);
+    store32(buf + 188, (4 << 16) | 21);  # OpTypeInt %3 32 0
+    store32(buf + 192, 3);
+    store32(buf + 196, 32);
+    store32(buf + 200, 0);
+    store32(buf + 204, (4 << 16) | 23);  # OpTypeVector %4 %3 3
+    store32(buf + 208, 4);
+    store32(buf + 212, 3);
+    store32(buf + 216, 3);
+    store32(buf + 220, (4 << 16) | 32);  # OpTypePointer %5 Input %4
+    store32(buf + 224, 5);
+    store32(buf + 228, 1);
+    store32(buf + 232, 4);
+    store32(buf + 236, (3 << 16) | 29);  # OpTypeRuntimeArray %6 %3
+    store32(buf + 240, 6);
+    store32(buf + 244, 3);
+    store32(buf + 248, (3 << 16) | 30);  # OpTypeStruct %7 %6
+    store32(buf + 252, 7);
+    store32(buf + 256, 6);
+    store32(buf + 260, (4 << 16) | 32);  # OpTypePointer %8 StorageBuffer %7
+    store32(buf + 264, 8);
+    store32(buf + 268, 12);
+    store32(buf + 272, 7);
+    store32(buf + 276, (4 << 16) | 32);  # OpTypePointer %9 StorageBuffer %3
+    store32(buf + 280, 9);
+    store32(buf + 284, 12);
+    store32(buf + 288, 3);
+    store32(buf + 292, (4 << 16) | 43);  # OpConstant %3 %10 3
+    store32(buf + 296, 3);
+    store32(buf + 300, 10);
+    store32(buf + 304, 3);
+    store32(buf + 308, (4 << 16) | 43);  # OpConstant %3 %11 2
+    store32(buf + 312, 3);
+    store32(buf + 316, 11);
+    store32(buf + 320, 2);
+    store32(buf + 324, (4 << 16) | 43);  # OpConstant %3 %12 4
+    store32(buf + 328, 3);
+    store32(buf + 332, 12);
+    store32(buf + 336, 4);
+    store32(buf + 340, (4 << 16) | 43);  # OpConstant %3 %13 1
+    store32(buf + 344, 3);
+    store32(buf + 348, 13);
+    store32(buf + 352, 1);
+    store32(buf + 356, (4 << 16) | 43);  # OpConstant %3 %14 8
+    store32(buf + 360, 3);
+    store32(buf + 364, 14);
+    store32(buf + 368, 8);
+    store32(buf + 372, (4 << 16) | 43);  # OpConstant %3 %15 9
+    store32(buf + 376, 3);
+    store32(buf + 380, 15);
+    store32(buf + 384, 9);
+    store32(buf + 388, (4 << 16) | 43);  # OpConstant %3 %16 0
+    store32(buf + 392, 3);
+    store32(buf + 396, 16);
+    store32(buf + 400, 0);
+    store32(buf + 404, (4 << 16) | 59);  # OpVariable %5 %17 Input
+    store32(buf + 408, 5);
+    store32(buf + 412, 17);
+    store32(buf + 416, 1);
+    store32(buf + 420, (4 << 16) | 59);  # OpVariable %8 %18 StorageBuffer
+    store32(buf + 424, 8);
+    store32(buf + 428, 18);
+    store32(buf + 432, 12);
+    store32(buf + 436, (4 << 16) | 59);  # OpVariable %8 %19 StorageBuffer
+    store32(buf + 440, 8);
+    store32(buf + 444, 19);
+    store32(buf + 448, 12);
+    store32(buf + 452, (5 << 16) | 54);  # OpFunction %1 %20 None %2
+    store32(buf + 456, 1);
+    store32(buf + 460, 20);
+    store32(buf + 464, 0);
+    store32(buf + 468, 2);
+    store32(buf + 472, (2 << 16) | 248); # OpLabel %21
+    store32(buf + 476, 21);
+    store32(buf + 480, (4 << 16) | 61);  # OpLoad %4 %22 %17
+    store32(buf + 484, 4);
+    store32(buf + 488, 22);
+    store32(buf + 492, 17);
+    store32(buf + 496, (5 << 16) | 81);  # OpCompositeExtract %3 %23 %22 0  (i = lid.x)
+    store32(buf + 500, 3);
+    store32(buf + 504, 23);
+    store32(buf + 508, 22);
+    store32(buf + 512, 0);
+    store32(buf + 516, (5 << 16) | 199); # OpBitwiseAnd %3 %24 %23 %10  (x = i & 3)
+    store32(buf + 520, 3);
+    store32(buf + 524, 24);
+    store32(buf + 528, 23);
+    store32(buf + 532, 10);
+    store32(buf + 536, (5 << 16) | 194); # OpShiftRightLogical %3 %25 %23 %11  (y = i >> 2)
+    store32(buf + 540, 3);
+    store32(buf + 544, 25);
+    store32(buf + 548, 23);
+    store32(buf + 552, 11);
+    store32(buf + 556, (5 << 16) | 196); # OpShiftLeftLogical %3 %26 %25 %12  (y16 = y << 4)
+    store32(buf + 560, 3);
+    store32(buf + 564, 26);
+    store32(buf + 568, 25);
+    store32(buf + 572, 12);
+    store32(buf + 576, (5 << 16) | 196); # OpShiftLeftLogical %3 %27 %24 %13  (x2 = x << 1)
+    store32(buf + 580, 3);
+    store32(buf + 584, 27);
+    store32(buf + 588, 24);
+    store32(buf + 592, 13);
+    store32(buf + 596, (5 << 16) | 128); # OpIAdd %3 %28 %26 %27  (aoff = y16 + x2)
+    store32(buf + 600, 3);
+    store32(buf + 604, 28);
+    store32(buf + 608, 26);
+    store32(buf + 612, 27);
+    store32(buf + 616, (5 << 16) | 128); # OpIAdd %3 %29 %28 %13  (boff = aoff + 1)
+    store32(buf + 620, 3);
+    store32(buf + 624, 29);
+    store32(buf + 628, 28);
+    store32(buf + 632, 13);
+    store32(buf + 636, (5 << 16) | 128); # OpIAdd %3 %30 %28 %14  (coff = aoff + 8)
+    store32(buf + 640, 3);
+    store32(buf + 644, 30);
+    store32(buf + 648, 28);
+    store32(buf + 652, 14);
+    store32(buf + 656, (5 << 16) | 128); # OpIAdd %3 %31 %28 %15  (doff = aoff + 9)
+    store32(buf + 660, 3);
+    store32(buf + 664, 31);
+    store32(buf + 668, 28);
+    store32(buf + 672, 15);
+    store32(buf + 676, (6 << 16) | 65);  # OpAccessChain %9 %32 %18 %16 %28  (&src[aoff])
+    store32(buf + 680, 9);
+    store32(buf + 684, 32);
+    store32(buf + 688, 18);
+    store32(buf + 692, 16);
+    store32(buf + 696, 28);
+    store32(buf + 700, (4 << 16) | 61);  # OpLoad %3 %33 %32  (a)
+    store32(buf + 704, 3);
+    store32(buf + 708, 33);
+    store32(buf + 712, 32);
+    store32(buf + 716, (6 << 16) | 65);  # OpAccessChain %9 %34 %18 %16 %29  (&src[boff])
+    store32(buf + 720, 9);
+    store32(buf + 724, 34);
+    store32(buf + 728, 18);
+    store32(buf + 732, 16);
+    store32(buf + 736, 29);
+    store32(buf + 740, (4 << 16) | 61);  # OpLoad %3 %35 %34  (b)
+    store32(buf + 744, 3);
+    store32(buf + 748, 35);
+    store32(buf + 752, 34);
+    store32(buf + 756, (6 << 16) | 65);  # OpAccessChain %9 %36 %18 %16 %30  (&src[coff])
+    store32(buf + 760, 9);
+    store32(buf + 764, 36);
+    store32(buf + 768, 18);
+    store32(buf + 772, 16);
+    store32(buf + 776, 30);
+    store32(buf + 780, (4 << 16) | 61);  # OpLoad %3 %37 %36  (c)
+    store32(buf + 784, 3);
+    store32(buf + 788, 37);
+    store32(buf + 792, 36);
+    store32(buf + 796, (6 << 16) | 65);  # OpAccessChain %9 %38 %18 %16 %31  (&src[doff])
+    store32(buf + 800, 9);
+    store32(buf + 804, 38);
+    store32(buf + 808, 18);
+    store32(buf + 812, 16);
+    store32(buf + 816, 31);
+    store32(buf + 820, (4 << 16) | 61);  # OpLoad %3 %39 %38  (d)
+    store32(buf + 824, 3);
+    store32(buf + 828, 39);
+    store32(buf + 832, 38);
+    store32(buf + 836, (5 << 16) | 128); # OpIAdd %3 %40 %33 %35  (a + b)
+    store32(buf + 840, 3);
+    store32(buf + 844, 40);
+    store32(buf + 848, 33);
+    store32(buf + 852, 35);
+    store32(buf + 856, (5 << 16) | 128); # OpIAdd %3 %41 %40 %37  (+ c)
+    store32(buf + 860, 3);
+    store32(buf + 864, 41);
+    store32(buf + 868, 40);
+    store32(buf + 872, 37);
+    store32(buf + 876, (5 << 16) | 128); # OpIAdd %3 %42 %41 %39  (+ d)
+    store32(buf + 880, 3);
+    store32(buf + 884, 42);
+    store32(buf + 888, 41);
+    store32(buf + 892, 39);
+    store32(buf + 896, (5 << 16) | 194); # OpShiftRightLogical %3 %43 %42 %11  (avg = sum >> 2)
+    store32(buf + 900, 3);
+    store32(buf + 904, 43);
+    store32(buf + 908, 42);
+    store32(buf + 912, 11);
+    store32(buf + 916, (6 << 16) | 65);  # OpAccessChain %9 %44 %19 %16 %23  (&dst[i])
+    store32(buf + 920, 9);
+    store32(buf + 924, 44);
+    store32(buf + 928, 19);
+    store32(buf + 932, 16);
+    store32(buf + 936, 23);
+    store32(buf + 940, (3 << 16) | 62);  # OpStore %44 %43
+    store32(buf + 944, 44);
+    store32(buf + 948, 43);
+    store32(buf + 952, (1 << 16) | 253); # OpReturn
+    store32(buf + 956, (1 << 16) | 56);  # OpFunctionEnd
+    return 960;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V downsample e2e (N.5g) — 2x2 box-filter on Cezanne\n");
+    print_cstr("--------------------------------------------------------------------\n");
+
+    var spv[1024];
+    var n = build_downsample_kernel(&spv);
+
+    # Tables are indexed by SPIR-V <id> (id-bound 45), so size them for that, not
+    # for cap_ids — the N.1 table builders do not bound-check the output buffer.
+    var types[1536];
+    var consts[1024];
+    var deco[1024];
+    var outbi[512];
+    var m[80];
+    var vals[2560];
+    var instrs[1536];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 45, 64);
+    var isel[1536];
+    var isel2[1536];
+    var alloc[1024];
+    var hw[16];
+    var abi[64];
+    var cc[88];
+    store64(&cc + CC_TYPES, &types);
+    store64(&cc + CC_CONSTS, &consts);
+    store64(&cc + CC_DECO, &deco);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_OUTBI, &outbi);
+    store64(&cc + CC_ISEL, &isel);
+    store64(&cc + CC_ISEL2, &isel2);
+    store64(&cc + CC_ALLOC, &alloc);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    store64(&cc + CC_CAP_IDS, 64);  # types[1536]/24 = 64 records (the min table cap)
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    var crc = gfx9_compile(&cc, &spv, n, &isa, &desc);
+    if (crc != 0) {
+        print_cstr("FAIL: gfx9_compile rc="); print_i64(crc); print_cstr("\n");
+        return 2;
+    }
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var rsrc1 = load64(&desc + DESC_RSRC1);
+    var rsrc2 = load64(&desc + DESC_RSRC2);
+    print_cstr("compiled: isa_len="); print_i64(isa_len);
+    print_cstr(" bindings="); print_i64(load64(&desc + DESC_NUM_BINDINGS));
+    print_cstr("\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shader_size = 4096;
+    var shader_bo[16];
+    if (native_bo_create_gtt(fd, shader_size, &shader_bo) != 0) { return 4; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map = load64(&shader_bo + 8);
+    memset(shader_map, 0, shader_size);
+    var w = 0;
+    while (w < isa_len) { store32(shader_map + w, load32(&isa + w)); w = w + 4; }
+    var shader_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, shader_handle, shader_va, shader_size, _NATIVE_PERM_SHADER) != 0) { return 4; }
+
+    # src BO (binding 0): seed src[k] = k for k in 0..63 (an 8x8 image).
+    var sb[16];
+    if (native_bo_create_gtt(fd, 4096, &sb) != 0) { return 5; }
+    var src_handle = load64(&sb + 0);
+    var src_map = load64(&sb + 8);
+    var k = 0;
+    while (k < 64) { store32(src_map + k * 4, k); k = k + 1; }
+    var src_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, src_handle, src_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    # dst BO (binding 1): a 4x4 destination, seeded with a sentinel.
+    var db[16];
+    if (native_bo_create_gtt(fd, 4096, &db) != 0) { return 6; }
+    var dst_handle = load64(&db + 0);
+    var dst_map = load64(&db + 8);
+    var di = 0;
+    while (di < 16) { store32(dst_map + di * 4, 0xBAADF00D); di = di + 1; }
+    var dst_va = 0xFFFF800100800000;
+    if (native_gem_va_map(fd, dst_handle, dst_va, 4096, _NATIVE_PERM_DATA) != 0) { return 6; }
+
+    var bind_vas[16];
+    store64(&bind_vas + 0, src_va);
+    store64(&bind_vas + 8, dst_va);
+    var bind_handles[16];
+    store64(&bind_handles + 0, src_handle);
+    store64(&bind_handles + 8, dst_handle);
+
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return 7; }
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
+    &bind_vas, 2, 16, 1);
+
+    var t_now[16];
+    memset(&t_now, 0, 16);
+    if (syscall(228, 1, &t_now) != 0) { return 8; }
+    var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var rc = native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+    &bind_handles, 2, deadline);
+    if (rc != 0) { print_cstr("FAIL: dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    # Verify each dst texel against a CPU box-filter of the seeded source.
+    var ok = 1;
+    var i = 0;
+    while (i < 16) {
+        var x = i & 3;
+        var y = i >> 2;
+        var aoff = (y << 4) + (x << 1);
+        var want = (load32(src_map + aoff * 4) + load32(src_map + (aoff + 1) * 4) + load32(src_map + (aoff + 8) * 4) + load32(src_map + (aoff + 9) * 4)) >> 2;
+        var got = load32(dst_map + i * 4);
+        if (got != want) {
+            print_cstr("dst["); print_i64(i); print_cstr("] = "); print_i64(got);
+            print_cstr(" (want "); print_i64(want); print_cstr(")  MISMATCH\n");
+            ok = 0;
+        }
+        i = i + 1;
+    }
+
+    native_gem_va_unmap(fd, dst_handle, dst_va, 4096);
+    native_bo_release_gtt(fd, dst_handle, dst_map, 4096);
+    native_gem_va_unmap(fd, src_handle, src_va, 4096);
+    native_bo_release_gtt(fd, src_handle, src_map, 4096);
+    native_gem_va_unmap(fd, shader_handle, shader_va, shader_size);
+    native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: downsample pixel mismatch\n"); return 11; }
+    print_cstr("OK — compiled 2x2 box-filter downsample pixel-matches CPU on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
