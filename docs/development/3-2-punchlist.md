@@ -797,7 +797,7 @@ hand-authored shaders stay as oracle + fallback.
     HW-verified on Cezanne (`native_spirv_const_fold_e2e.cyr`, `gid.x+6*7`). +14 asserts;
     the gid-kernel fixtures' `1<<2` now folds (tests updated) + uniform-SALU coverage moved
     to `test_gfx9_regalloc_uniform_salu`. **→ ready to cut 3.2.8.**
-  - [~] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide → LLVM's float-
+  - [x] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide → LLVM's float-
     reciprocal **vector** udiv macro (19 loop-free instrs: cvt→rcp_iflag→×0x4F7FFFFE→cvt
     →Newton(sub/mul_lo/mul_hi/add)→estimate(mul_hi/mul_lo/sub)→2 correction cmp+cndmask).
     Design-verified over 5M+ pairs + ULP-perturbation (the magic constant biases the
@@ -821,9 +821,12 @@ hand-authored shaders stay as oracle + fallback.
       (ASHR-31 sign masks + branchless abs) → `_udiv_core` on magnitudes → sign-apply
       (`signA⊕signB` for div, `signA` for rem). New `MIR_OP_ASHR` → `v_ashrrev_i32` 0x11 /
       `s_ashr_i32` 0x20. HW-verified on Cezanne (8 signed cases each) + HW-stress.
-    - [ ] **N.9d-2 — OpSMod (139), floored.** Reuse SRem, then the floored fixup: when the
-      remainder is nonzero and signs differ, add the divisor (smod follows the divisor's
-      sign). HW e2e. → 3.2.9 (int div/mod) complete after this.
+    - [x] **N.9d-2 (2026-06-18) — OpSMod (139), floored.** `_spirv_lower_smod` = SRem + the
+      floored fixup: two `ICMP_NE`-gated `CNDMASK`s add the divisor iff (remainder nonzero
+      AND signs differ), so the result follows the divisor's sign (GLSL `mod`). No new
+      encoders/isel — reuses VMOV/XOR/ASHR/ICMP_NE/CNDMASK/IADD/ISUB (37 MIR instrs).
+      `native_spirv_smod_e2e.cyr` value-exact on Cezanne (8-lane signed matrix) + the
+      `test_spirv_lower_smod` structural unit test. **→ 3.2.9 (int div/mod) COMPLETE.**
   - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).

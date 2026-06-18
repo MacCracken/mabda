@@ -37,6 +37,7 @@ var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
 var SPIRV_OP_SDIV             = 135;   # N.9d — sign-magnitude over the udiv core
 var SPIRV_OP_UMOD             = 137;   # N.9c — udiv core, remainder select
 var SPIRV_OP_SREM             = 138;   # N.9d — signed remainder (dividend sign)
+var SPIRV_OP_SMOD             = 139;   # N.9d — floored modulo (divisor sign)
 var SPIRV_OP_SHR_LOGICAL      = 194;
 var SPIRV_OP_SHL              = 196;
 var SPIRV_OP_BITWISE_OR       = 197;
@@ -578,6 +579,42 @@ fn _spirv_lower_srem(ptr, off, wc, m): i64 {
     return 0;
 }
 
+# OpSMod (139): floored modulo, sign of the DIVISOR. Compute the truncated remainder (srem,
+# sign of dividend), then the floored fixup: when srem != 0 AND the operand signs differ, add
+# the divisor (two chained CNDMASKs gate the add → adj = b iff both hold; else adj = 0).
+fn _spirv_lower_smod(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var aa_id = spirv_word(ptr, off + 3);
+    var bb_id = spirv_word(ptr, off + 4);
+    var u = MIR_T_U32;
+    var bc = _udiv_op(m, MIR_OP_VMOV, u, bb_id, 0, 0, 0);          if (bc < 0) { return bc; }
+    var sp[32];
+    var rp = _signed_prep(m, aa_id, bb_id, &sp);                   if (rp < 0) { return rp; }
+    var sa = load64(&sp + 0);
+    var sb = load64(&sp + 8);
+    var co[32];
+    var rc = _udiv_core(m, load64(&sp + 16), load64(&sp + 24), &co);  if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var m2 = load64(&co + 24);
+    # unsigned remainder of the magnitudes, then srem = (r ^ signA) - signA
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);        if (c2 < 0) { return c2; }
+    var t6 = _udiv_op(m, MIR_OP_ISUB, u, m2, dc, 0, 0);            if (t6 < 0) { return t6; }
+    var mf = _udiv_op(m, MIR_OP_CNDMASK, u, m2, t6, 0, 0);         if (mf < 0) { return mf; }
+    var xr = _udiv_op(m, MIR_OP_XOR, u, mf, sa, 0, 0);            if (xr < 0) { return xr; }
+    var sr = _udiv_op(m, MIR_OP_ISUB, u, xr, sa, 0, 0);           if (sr < 0) { return sr; }
+    # floored fixup: adj = (signs differ AND sr != 0) ? b : 0 ; smod = sr + adj
+    var rs = _udiv_op(m, MIR_OP_XOR, u, sa, sb, 0, 0);            if (rs < 0) { return rs; }
+    var zv = _udiv_op(m, MIR_OP_VMOV, u, 0, 0, 0, MIR_FLAG_A_IMM); if (zv < 0) { return zv; }
+    var cd = _udiv_op(m, MIR_OP_ICMP_NE, u, 0, rs, 0, MIR_FLAG_A_IMM);  if (cd < 0) { return cd; }
+    var bs = _udiv_op(m, MIR_OP_CNDMASK, u, zv, bc, 0, 0);         if (bs < 0) { return bs; }
+    var cr = _udiv_op(m, MIR_OP_ICMP_NE, u, 0, sr, 0, MIR_FLAG_A_IMM);  if (cr < 0) { return cr; }
+    var aj = _udiv_op(m, MIR_OP_CNDMASK, u, zv, bs, 0, 0);         if (aj < 0) { return aj; }
+    var er = mir_emit(m, MIR_OP_IADD, result, u, sr, aj, 0, 0);    # sr + adj
+    if (er < 0) { return er; }
+    return 0;
+}
+
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
     # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
@@ -619,6 +656,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_UMOD) { return _spirv_lower_umod(ptr, off, wc, m); }
     if (op == SPIRV_OP_SDIV) { return _spirv_lower_sdiv(ptr, off, wc, m); }
     if (op == SPIRV_OP_SREM) { return _spirv_lower_srem(ptr, off, wc, m); }
+    if (op == SPIRV_OP_SMOD) { return _spirv_lower_smod(ptr, off, wc, m); }
     # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
     # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
     var cop = _spirv_cmp_to_mir(op);

@@ -15,6 +15,19 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9d-2 (`OpSMod` — floored modulo; **3.2.9 int div/mod complete**)
+- **Floored modulo via SRem + a sign-aware fixup** (`src/spirv_lower.cyr`,
+  `_spirv_lower_smod`): compute the truncated remainder (sign of the dividend), then add the
+  divisor when the remainder is nonzero **and** the operand signs differ — so the result
+  follows the **divisor's** sign (GLSL `mod` semantics). The conditional add is two chained
+  `CNDMASK`s gated by `ICMP_NE` (signs-differ then remainder-nonzero); `adj = divisor` iff
+  both hold, else `0`. No new encoders/isel ops — reuses the existing `VMOV`/`XOR`/`ASHR`/
+  `ICMP_NE`/`CNDMASK`/`IADD`/`ISUB` (`OpSMod` = 139). 37 MIR instrs total.
+- **HW**: `native_spirv_smod_e2e.cyr` — value-exact on Cezanne over an 8-lane signed matrix
+  (all sign combos incl. `-7 smod 2 = 1`, `7 smod -2 = -1`, divisible, `INT_MIN`) vs an
+  independent CPU reference. CPU suite +11 (`test_spirv_lower_smod`: 37-instr structure +
+  the fixup shape). **This completes 3.2.9 (integer division & remainder).**
+
 ### Added — Phase N.9d-1 (signed `OpSDiv` / `OpSRem`)
 - **Signed division + remainder via a sign-magnitude shell over `_udiv_core`**
   (`src/spirv_lower.cyr`): `_signed_prep` computes the sign masks (`ASHR 31`) and the

@@ -1046,6 +1046,38 @@ fn test_spirv_const_fold() {
     return 0;
 }
 
+# N.9d-2 — OpSMod lowers to SRem + the floored fixup. 37 MIR instrs: VMOV(divisor copy) +
+# signed-prep(6) + udiv-core(18) + remainder-correction(3) + srem(2) + the fixup(6, two
+# ICMP_NE-gated CNDMASKs) + the final IADD. Divergent operands → the whole body is VALU.
+fn test_spirv_lower_smod() {
+    var w[64];
+    store32(&w + 0, (5 << 16) | 139);   # OpSMod
+    store32(&w + 4, 2);                  # result type
+    store32(&w + 8, 5);                  # result id
+    store32(&w + 12, 3);                 # operand a
+    store32(&w + 16, 4);                 # operand b
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);    # a — divergent
+    mir_set_builtin(&m, 4, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # b — divergent
+    assert_eq(_spirv_lower_smod(&w, 0, 5, &m), 0, "smod lowers");
+    assert_eq(mir_n_instrs(&m), 37, "smod = 37 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "0: VMOV divisor copy");
+    assert_eq(mir_instr_op(&m, 28), MIR_OP_XOR, "28: r ^ signA");
+    assert_eq(mir_instr_op(&m, 29), MIR_OP_ISUB, "29: srem = (r^signA)-signA");
+    assert_eq(mir_instr_op(&m, 30), MIR_OP_XOR, "30: rs = signA ^ signB");
+    assert_eq(mir_instr_op(&m, 32), MIR_OP_ICMP_NE, "32: signs-differ compare");
+    assert_eq(mir_instr_op(&m, 33), MIR_OP_CNDMASK, "33: differ ? divisor : 0");
+    assert_eq(mir_instr_op(&m, 34), MIR_OP_ICMP_NE, "34: srem-nonzero compare");
+    assert_eq(mir_instr_op(&m, 35), MIR_OP_CNDMASK, "35: nonzero ? bsel : 0");
+    assert_eq(mir_instr_op(&m, 36), MIR_OP_IADD, "36: smod = srem + adj");
+    return 0;
+}
+
 # The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
 # variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
 fn test_spirv_lower_seed_bufvar() {
@@ -3432,6 +3464,7 @@ fn main(): i64 {
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_spirv_const_fold();
+    test_spirv_lower_smod();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
     test_gfx9_emit_fma_inline_float();
