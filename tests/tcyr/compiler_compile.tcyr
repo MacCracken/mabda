@@ -1,0 +1,368 @@
+# tests/tcyr/compiler_compile.tcyr — Phase N SPIR-V->GFX9 compiler:
+# ABI + the top-level gfx9_compile e2e + capacity/hardening rejects (N.5/N.6/N-HARDEN).
+# Fixtures + include chain live in compiler_common.cyr (shared across the compiler_*.tcyr).
+include "tests/tcyr/compiler_common.cyr"
+
+# ================================================================
+# Phase N.5b-1 — compute ABI + RSRC wiring (gfx9_abi.cyr)
+# ================================================================
+# RSRC1/RSRC2 from the regalloc high-water + ABI, with the hand-authored
+# downsample (0x2C0083 / 0x18C) and deadbeef (0x44) as known-value oracles.
+fn test_gfx9_abi_rsrc() {
+    # downsample: v0..v14 (15 -> alloc 16, VGPRS=3), s0..s19 (20 -> alloc 24, SGPRS=2)
+    assert_eq(gfx9_rsrc1(15, 20), 0x2C0083, "downsample rsrc1");
+    # a tiny kernel floors SGPRS at 1 (16 regs) and VGPRS at 0 (4 regs) = MIN
+    assert_eq(gfx9_rsrc1(4, 4), 0x2C0040, "small rsrc1 = MIN");
+    # downsample RSRC2: user_sgpr=6, tgid_x|y, no tgid_z, tidig 0, no trap
+    assert_eq(gfx9_rsrc2(6, 1, 1, 0, 0, 0), 0x18C, "downsample rsrc2");
+    # deadbeef RSRC2: user_sgpr=2, trap, no tgid
+    assert_eq(gfx9_rsrc2(2, 0, 0, 0, 0, 1), 0x44, "deadbeef rsrc2");
+    # N.6 2-D: TGID_Z_EN (bit 9) + TIDIG_COMP_CNT=1 (bits 11-12) for a 2-D kernel.
+    assert_eq(gfx9_rsrc2(2, 1, 1, 0, 1, 0), 0x800 | 0x100 | 0x80 | 0x4, "2-D rsrc2 (tidig=1)");
+    assert_eq(gfx9_rsrc2(2, 1, 1, 1, 2, 0), 0x1000 | 0x200 | 0x100 | 0x80 | 0x4, "3-D rsrc2 (tgid_z + tidig=2)");
+    # review N.5b-1: the SGPRS 4-bit field must FAIL LOUD past 120 SGPRs, not
+    # silently wrap via & 0xF to a too-small allocation.
+    assert_eq(gfx9_rsrc1(4, 120), 0x2C03C0, "sgpr_hw 120 -> SGPRS=15 (the field max)");
+    assert_eq(gfx9_rsrc1(4, 128), 0 - ABI_ERR_SGPR_OVERFLOW, "sgpr_hw 128 fails loud");
+    assert_eq(gfx9_rsrc1(300, 20), 0 - ABI_ERR_VGPR_OVERFLOW, "vgpr_hw 300 fails loud");
+    return 0;
+}
+
+# N.5c first oracle: compile the LID-SAXPY SPIR-V end-to-end through gfx9_compile
+# (validate→lower→isel→abi→regalloc→waitcnt→encode→pad) and verify the ISA shape +
+# RSRC descriptor. LID-only ⇒ no TGID; 2 storage bindings ⇒ user_sgpr=4.
+fn test_gfx9_compile_saxpy_lid() {
+    var buf[640];
+    var n = _spv_build_saxpy_lid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 30);
+    var outbi[256];
+    var isel[768];
+    var isel2[768];
+    var alloc[512];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 26);  # types[640]/24 = 26 records
+    var isa[512];
+    memset(&isa, 0, 512);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "saxpy-lid compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 4, "user_sgpr = 4 (2 VA pairs)");
+    assert_eq(load64(&desc + DESC_RSRC2), 0x48, "rsrc2: user=4, trap, no TGID (LID-only)");
+    # first instruction is the EXTRACT(LID.x) -> v_mov reading v0
+    var d0 = load32(&isa + 0);
+    assert_eq((d0 >> 25) & 0x7F, 0x3F, "first instr is a VOP1 (v_mov)");
+    assert_eq(d0 & 0x1FF, 0x100, "v_mov src0 = v0 (LocalInvocationId.x)");
+    # ends with s_endpgm then the 64-byte (16x s_nop) prefetch pad
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(load32(&isa + len - 68), 0xBF810000, "s_endpgm before the prefetch pad");
+    assert_eq(load32(&isa + len - 4), 0xBF800000, "last dword is an s_nop pad");
+    # RSRC1 carries the fixed FLOAT_MODE 0xC0 + DX10_CLAMP flags (+ the reg counts)
+    var d1 = load64(&desc + DESC_RSRC1);
+    assert_eq(d1 & GFX9_RSRC1_FLAGS, GFX9_RSRC1_FLAGS, "rsrc1 has FLOAT_MODE 0xC0 + DX10_CLAMP");
+    assert_eq((d1 >> 12) & 0xFF, 0xC0, "rsrc1 FLOAT_MODE field = 0xC0");
+    return 0;
+}
+
+# N.5c-2b: the REAL GlobalInvocationId-indexed SAXPY now compiles end-to-end — the
+# lowering expands gid.x = wgid.x*64 + lid.x, so the first two instrs are the wgid
+# s_mov + the lid v_mov, and the kernel uses TGID (rsrc2 gains TGID_X vs the LID-only
+# 0x48). LocalSize is 64,1,1 in the fixture.
+fn test_gfx9_compile_saxpy_gid() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);   # re-indexed by BuiltIn GlobalInvocationId
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var m[80];
+    var vals[1920];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
+    var outbi[256];
+    var isel[960];
+    var isel2[960];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 26);  # types[640]/24 = 26 records
+    var isa[640];
+    memset(&isa, 0, 640);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "GID SAXPY compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 4, "user_sgpr = 4");
+    assert_eq(load64(&desc + DESC_RSRC2), 0xC8, "rsrc2: user=4, trap, TGID_X (gid uses WorkgroupId)");
+    # the GID expansion lands first: wgid extract = s_mov (SOP1), lid extract = v_mov (VOP1)
+    assert_eq((load32(&isa + 0) >> 23) & 0x1FF, 0x17D, "instr 0 = SOP1 (wgid s_mov)");
+    assert_eq((load32(&isa + 4) >> 25) & 0x7F, 0x3F, "instr 1 = VOP1 (lid v_mov)");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(load32(&isa + len - 68), 0xBF810000, "s_endpgm before the prefetch pad");
+    return 0;
+}
+
+# N.7b-2b — compile the uniform-if end to end (gfx9_compile) and check the two-pass
+# branch resolution: the s_cbranch_scc0 skips the then's s_branch (simm 1), and the
+# then's s_branch falls through to the merge (simm 0). Both bytes llvm-mc-shaped.
+fn test_gfx9_compile_uniform_if() {
+    var buf[640];
+    var n = _spv_build_uniform_if(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
+    var isel[1536];
+    var isel2[1536];
+    var alloc[512];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 24);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "uniform-if compiles end-to-end");
+    # Scan the ISA for the resolved branches.
+    var saw_cbranch = 0;
+    var saw_branch = 0;
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var w = 0;
+    while (w < isa_len) {
+        var dw = load32(&isa + w);
+        if (dw == 0xBF840001) { saw_cbranch = 1; }   # s_cbranch_scc0 +1 (skip the s_branch)
+        if (dw == 0xBF820000) { saw_branch = 1; }     # s_branch +0 (then → merge fall-through)
+        w = w + 4;
+    }
+    assert_eq(saw_cbranch, 1, "s_cbranch_scc0 +1 (skip then to merge)");
+    assert_eq(saw_branch, 1, "s_branch +0 (then to merge)");
+    return 0;
+}
+
+# N.5c review (CRITICAL): the validate gate returns POSITIVE codes, so gfx9_compile
+# must reject malformed SPIR-V with `!= 0`, not `< 0` (which never fired and let
+# bad input reach the table builders). A bad-magic module must fail loud here.
+fn test_gfx9_compile_rejects_malformed() {
+    var bad[20];
+    memset(&bad, 0, 20);
+    store32(&bad + 0, 0xDEADBEEF);   # wrong magic (not 0x07230203)
+    var ctx[88];
+    memset(&ctx, 0, 88);
+    var isa[64];
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &bad, 20, &isa, &desc), 0 - CMP_ERR_VALIDATE, "malformed SPIR-V rejected");
+    return 0;
+}
+
+# N-HARDEN.1 (security, found via the N.5g adversarial review): the table builders
+# take the SPIR-V id_bound (UNTRUSTED header field) and index a caller buffer by
+# every result <id>. Without a capacity gate, a crafted oversized id_bound makes
+# even the up-front memset (and every per-id write) run past the buffer — silent
+# heap corruption, surfacing much later as a spurious MIR_ERR_ID_OOR. Each builder
+# must reject id_bound > cap with -SPIRV_ERR_ID_CAP, BEFORE touching `out`.
+fn test_spirv_table_builders_reject_oversized_id_bound() {
+    # A small but well-formed module (valid magic, real instructions) so we know
+    # the rejection comes from the cap gate, not malformed-stream handling.
+    var buf[640];
+    var n = _spv_build_saxpy(&buf);   # id-bound 25-ish, valid stream
+    # Sentinel-fill tiny tables; if a builder writes despite the cap gate, these
+    # canaries change. Cap = 4 records, far below the module's id_bound.
+    var types[96];     # 4 * SPIRV_TYPE_REC
+    var consts[64];    # 4 * SPIRV_CONST_REC
+    var deco[64];      # 4 * SPIRV_DECO_REC
+    memset(&types, 0xAB, 96);
+    memset(&consts, 0xAB, 64);
+    memset(&deco, 0xAB, 64);
+    var idb = spirv_hdr_id_bound(&buf);
+    assert_eq(idb > 4, 1, "fixture id_bound exceeds the 4-record cap");
+    assert_eq(spirv_build_type_table(&buf, n, idb, 4, &types), 0 - SPIRV_ERR_ID_CAP,
+    "type table rejects id_bound > cap");
+    assert_eq(spirv_build_const_table(&buf, n, idb, 4, &consts), 0 - SPIRV_ERR_ID_CAP,
+    "const table rejects id_bound > cap");
+    assert_eq(spirv_build_decoration_table(&buf, n, idb, 4, &deco), 0 - SPIRV_ERR_ID_CAP,
+    "deco table rejects id_bound > cap");
+    # The gate fires before any write: the sentinel bytes are untouched.
+    assert_eq(load64(&types + 0), 0xABABABABABABABAB, "type table untouched on reject");
+    assert_eq(load64(&consts + 0), 0xABABABABABABABAB, "const table untouched on reject");
+    assert_eq(load64(&deco + 0), 0xABABABABABABABAB, "deco table untouched on reject");
+    return 0;
+}
+
+# N-HARDEN.1 integration: gfx9_compile surfaces an over-capacity module as
+# CMP_ERR_TABLE (the tables can't hold it) rather than corrupting memory and
+# failing loud later in lowering. A valid fixture + a deliberately tiny CC_CAP_IDS.
+fn test_gfx9_compile_rejects_over_capacity() {
+    var buf[640];
+    var n = _spv_build_saxpy(&buf);
+    var types[96];
+    var consts[64];
+    var deco[64];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 4, 8);
+    var isel[640];
+    var isel2[640];
+    var alloc[256];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 4);   # far below the fixture's id_bound
+    var isa[512];
+    memset(&isa, 0, 512);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0 - CMP_ERR_TABLE,
+    "over-capacity module rejected as CMP_ERR_TABLE");
+    return 0;
+}
+
+# N.5b-2 review: too many buffer bindings to fit USER_DATA fails loud.
+fn test_gfx9_abi_too_many_bindings() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    var b = 0;
+    while (b < 9) {
+        mir_set_bufvar(&m, 5 + b, b);
+        b = b + 1;
+    }
+    var abi[64];
+    assert_eq(gfx9_abi_assign(&m, &abi), 0 - ABI_ERR_TOO_MANY_BINDINGS, "9 bindings overflow USER_DATA");
+    return 0;
+}
+
+# The canonical ABI assignment: 2 buffer bindings + a 1-D GlobalInvocationId (which
+# the lowering expands to wgid.x + lid.x EXTRACTs). The ABI derives the TGID/LID
+# enables from the MAX component each builtin is extracted with (N.6).
+fn test_gfx9_abi_assign() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 8, 4, 30, 30);
+    mir_set_bufvar(&m, 5, 0);
+    mir_set_bufvar(&m, 6, 1);
+    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 9, MIR_T_U32, 7, 0, 0, MIR_FLAG_C_IMM);    # wgid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 10, MIR_T_U32, 8, 0, 0, MIR_FLAG_C_IMM);   # lid.x
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    assert_eq(gfx9_abi_num_bindings(&abi), 2, "2 bindings");
+    assert_eq(gfx9_abi_user_sgpr(&abi), 4, "user_sgpr=4 (2 VA pairs)");
+    assert_eq(gfx9_abi_tgid_x(&abi), 1, "wgid.x -> tgid_x enabled");
+    assert_eq(gfx9_abi_tgid_y(&abi), 0, "no wgid.y -> tgid_y off");
+    assert_eq(gfx9_abi_lid_count(&abi), 1, "lid.x only -> lid_count 1");
+    assert_eq(gfx9_abi_sgpr_base(&abi), 5, "sgpr_base = 4 user + 1 tgid");
+    assert_eq(gfx9_abi_vgpr_base(&abi), 1, "vgpr_base = 1 (v0 = LID.x)");
+    assert_eq(gfx9_abi_binding_sgpr(&abi, 0), 0, "binding 0 -> s0");
+    assert_eq(gfx9_abi_binding_sgpr(&abi, 1), 2, "binding 1 -> s2");
+    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_WORKGROUP_ID, 0), 4, "wgid.x -> s4");
+    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_LOCAL_INVOC_ID, 0), 0, "lid.x -> v0");
+    return 0;
+}
+
+# N.6 2-D ABI: a kernel extracting wgid.y / lid.y enables TGID_Y + a second LID
+# component, so the HW preloads s[user+1]=wgid.y and v1=lid.y.
+fn test_gfx9_abi_assign_2d() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 8, 4, 30, 30);
+    mir_set_bufvar(&m, 5, 0);
+    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 9, MIR_T_U32, 7, 0, 0, MIR_FLAG_C_IMM);    # wgid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 10, MIR_T_U32, 7, 0, 1, MIR_FLAG_C_IMM);   # wgid.y
+    mir_emit(&m, MIR_OP_EXTRACT, 11, MIR_T_U32, 8, 0, 0, MIR_FLAG_C_IMM);   # lid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 12, MIR_T_U32, 8, 0, 1, MIR_FLAG_C_IMM);   # lid.y
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    assert_eq(gfx9_abi_tgid_x(&abi), 1, "tgid_x on");
+    assert_eq(gfx9_abi_tgid_y(&abi), 1, "wgid.y -> tgid_y on");
+    assert_eq(gfx9_abi_tgid_z(&abi), 0, "no wgid.z -> tgid_z off");
+    assert_eq(gfx9_abi_lid_count(&abi), 2, "lid.x+y -> lid_count 2");
+    assert_eq(gfx9_abi_user_sgpr(&abi), 2, "1 binding -> 2 user sgpr");
+    assert_eq(gfx9_abi_sgpr_base(&abi), 4, "sgpr_base = 2 user + 2 tgid");
+    assert_eq(gfx9_abi_vgpr_base(&abi), 2, "vgpr_base = 2 (v0,v1 = LID.x/y)");
+    return 0;
+}
+
+fn main(): i64 {
+    test_gfx9_abi_rsrc();
+    test_gfx9_compile_saxpy_lid();
+    test_gfx9_compile_saxpy_gid();
+    test_gfx9_compile_uniform_if();
+    test_gfx9_compile_rejects_malformed();
+    test_spirv_table_builders_reject_oversized_id_bound();
+    test_gfx9_compile_rejects_over_capacity();
+    test_gfx9_abi_too_many_bindings();
+    test_gfx9_abi_assign();
+    test_gfx9_abi_assign_2d();
+    return assert_summary();
+}

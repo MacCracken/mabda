@@ -82,7 +82,7 @@ dwords_to_bytes \
 # ================================================================
 # One representative dword (or dword pair) per GFX9 instruction format the
 # operand-parameterized encoders in gfx9_encode.cyr emit. These are the SAME
-# bytes the gfx9_encode unit oracle (tests/tcyr/compiler.tcyr) asserts the
+# bytes the gfx9_encode unit oracle (tests/tcyr/compiler_encode.tcyr) asserts the
 # encoders produce — disassembling them here is the INDEPENDENT llvm-mc check
 # that each format is a valid gfx90c encoding decoding to the expected
 # mnemonic (per feedback_verify_gfx9_shader_bytes_with_llvm_mc). If an encoder

@@ -19,6 +19,7 @@
 
 # Executable / memory / structural opcodes (spec §3.37) not already declared in
 # spirv_parse.cyr (which owns the type/constant/decorate/function opcodes).
+var SPIRV_OP_EXT_INST_IMPORT   = 11;
 var SPIRV_OP_EXT_INST          = 12;
 var SPIRV_OP_LOAD              = 61;
 var SPIRV_OP_STORE             = 62;
@@ -69,10 +70,10 @@ var SPIRV_OP_SGREATERTHANEQUAL   = 175;
 var SPIRV_OP_SLESSTHAN           = 177;
 var SPIRV_OP_SLESSTHANEQUAL      = 179;
 
-# GLSL.std.450 extended-instruction numbers (the `OpExtInst` instruction field). The
-# MVP assumes the only imported ext set is GLSL.std.450 (the standard shader math
-# library); a non-GLSL set's number would map here too — acceptable until per-set
-# tracking (N.8b+). Sqrt is unary; FMin/FMax are binary.
+# GLSL.std.450 extended-instruction numbers (the `OpExtInst` instruction field). N.11 verifies
+# (via `_spirv_check_ext_sets`) that every OpExtInst references the actual GLSL.std.450 import,
+# so these numbers are only ever decoded for that set — a non-GLSL set fails loud up front.
+# Sqrt is unary; FMin/FMax are binary.
 var GLSL_STD450_FABS             = 4;
 var GLSL_STD450_FLOOR            = 8;
 var GLSL_STD450_FMA              = 50;
@@ -98,6 +99,7 @@ var SPIRV_LOWER_OK          = 0;
 var LOWER_ERR_CONTROL_FLOW  = 26;
 var LOWER_ERR_NO_ENTRY      = 27;
 var LOWER_ERR_ARRAY_STRIDE  = 28;   # an array ArrayStride disagrees with the assumed std430
+var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450 ext set
 
 var SPIRV_DECO_ARRAY_STRIDE = 6;    # OpDecorate %arrayType ArrayStride <n>
 
@@ -1047,6 +1049,62 @@ fn _spirv_check_array_strides(ptr, byte_len, types, idb): i64 {
     return 0;
 }
 
+# Find the result <id> of the `OpExtInstImport "GLSL.std.450"` (the only ext set the back end
+# implements). The name rides as a packed null-terminated literal string: "GLSL.std.450\0" is
+# exactly four words. Returns the import <id>, or 0 if no such import is present. (N.11)
+fn _spirv_find_glsl_ext_set(ptr, byte_len): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_EXT_INST_IMPORT) {
+            # op + result + the 4 string words of "GLSL.std.450\0" → exactly 6 words.
+            if (wc >= 6) {
+                if (spirv_word(ptr, off + 2) == 0x4C534C47) {         # "GLSL"
+                    if (spirv_word(ptr, off + 3) == 0x6474732E) {     # ".std"
+                        if (spirv_word(ptr, off + 4) == 0x3035342E) { # ".450"
+                            # The 13th byte (low byte of this word) must be the nul terminator;
+                            # the spec zero-pads the rest, but check only the nul byte so a
+                            # non-zero-padded producer is not false-rejected (a longer name has
+                            # a non-nul 13th byte, so this still rejects "GLSL.std.450X…").
+                            if ((spirv_word(ptr, off + 5) & 0xFF) == 0) {
+                                return spirv_word(ptr, off + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
+# The OpExtInst handler only implements GLSL.std.450 numbers. Drop the MVP "the only imported
+# set is GLSL.std.450" assumption: every OpExtInst must reference the actual GLSL.std.450
+# import <id>. A reference to any other ext set — or an OpExtInst with no GLSL.std.450 import at
+# all (glsl == 0, so set != glsl) — fails loud rather than mis-decoding another set's numbers. (N.11)
+fn _spirv_check_ext_sets(ptr, byte_len): i64 {
+    var glsl = _spirv_find_glsl_ext_set(ptr, byte_len);
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (spirv_op(w0) == SPIRV_OP_EXT_INST) {
+            if (wc >= 4) {
+                # No GLSL.std.450 import at all → reject ANY OpExtInst (covers a malformed
+                # set==0, which would otherwise pass the `!= glsl` test when glsl is also 0).
+                if (glsl == 0) { return 0 - LOWER_ERR_EXT_SET; }
+                if (spirv_word(ptr, off + 3) != glsl) { return 0 - LOWER_ERR_EXT_SET; }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
 # ================================================================
 # Top-level driver
 # ================================================================
@@ -1058,6 +1116,8 @@ fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
     if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
     var as_chk = _spirv_check_array_strides(ptr, byte_len, types, spirv_hdr_id_bound(ptr));
     if (as_chk < 0) { return as_chk; }
+    var es_chk = _spirv_check_ext_sets(ptr, byte_len);
+    if (es_chk < 0) { return es_chk; }
     _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
     var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
     if (sr < 0) { return sr; }
