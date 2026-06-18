@@ -817,9 +817,13 @@ hand-authored shaders stay as oracle + fallback.
     - [x] **N.9c (2026-06-18) — u32 OpUMod (137).** Factored `_udiv_core` (shared by udiv);
       umod applies the remainder's correction-2 + a b=0→N guard. udiv re-verified byte-
       identical. `native_spirv_umod_e2e.cyr` value-exact on Cezanne + HW-stress.
-    - [ ] **N.9d — signed OpSDiv/OpSMod/OpSRem.** Sign-magnitude wrapper (v_ashrrev_i32 31
-      sign masks → abs → unsigned core → sign restore); SMod follows divisor sign, SRem
-      the dividend. New encoder `GFX9_VOP2_V_ASHRREV_I32` (verify via llvm-mc at this bite).
+    - [x] **N.9d-1 (2026-06-18) — signed OpSDiv (135) + OpSRem (138).** `_signed_prep`
+      (ASHR-31 sign masks + branchless abs) → `_udiv_core` on magnitudes → sign-apply
+      (`signA⊕signB` for div, `signA` for rem). New `MIR_OP_ASHR` → `v_ashrrev_i32` 0x11 /
+      `s_ashr_i32` 0x20. HW-verified on Cezanne (8 signed cases each) + HW-stress.
+    - [ ] **N.9d-2 — OpSMod (139), floored.** Reuse SRem, then the floored fixup: when the
+      remainder is nonzero and signs differ, add the divisor (smod follows the divisor's
+      sign). HW e2e. → 3.2.9 (int div/mod) complete after this.
   - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).

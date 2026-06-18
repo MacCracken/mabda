@@ -15,6 +15,18 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9d-1 (signed `OpSDiv` / `OpSRem`)
+- **Signed division + remainder via a sign-magnitude shell over `_udiv_core`**
+  (`src/spirv_lower.cyr`): `_signed_prep` computes the sign masks (`ASHR 31`) and the
+  branchless magnitudes (`(x^sign)-sign`); the unsigned core runs on `|a|/|b|`; then
+  `OpSDiv` (135) applies the result sign `signA⊕signB` via `(q^rs)-rs`, and `OpSRem` (138)
+  applies the dividend's sign `(r^signA)-signA` (C `%` semantics). One new primitive,
+  arithmetic-shift-right (`MIR_OP_ASHR` → `v_ashrrev_i32` 0x11 / `s_ashr_i32` 0x20,
+  llvm-mc-verified). Div-by-zero and INT_MIN/-1 are UB in SPIR-V (not asserted).
+- **HW**: `native_spirv_sdiv_e2e.cyr` + `native_spirv_srem_e2e.cyr` — both value-exact on
+  Cezanne over an 8-lane signed matrix (all four sign combinations, INT_MIN/2, |a|<|b|,
+  zero dividend) vs an independent CPU sign-magnitude reference (unsigned ops only).
+
 ### Added — Phase N.9c (u32 `OpUMod` — integer remainder)
 - **`OpUMod` (137) reuses the udiv macro core**, selecting the corrected REMAINDER instead
   of the quotient. `src/spirv_lower.cyr` factors the shared `_udiv_core` (VMOV N/D + the

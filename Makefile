@@ -473,6 +473,23 @@ build/native_spirv_umod_e2e: programs/native_spirv_umod_e2e.cyr src/*.cyr
 test-native-spirv-umod-e2e: build/native_spirv_umod_e2e
 	./build/native_spirv_umod_e2e
 
+# N.9d: signed OpSDiv / OpSRem (sign-magnitude over the udiv core). HW-verified on Cezanne.
+build/native_spirv_sdiv_e2e: programs/native_spirv_sdiv_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_sdiv_e2e.cyr $@
+
+.PHONY: test-native-spirv-sdiv-e2e
+test-native-spirv-sdiv-e2e: build/native_spirv_sdiv_e2e
+	./build/native_spirv_sdiv_e2e
+
+build/native_spirv_srem_e2e: programs/native_spirv_srem_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_srem_e2e.cyr $@
+
+.PHONY: test-native-spirv-srem-e2e
+test-native-spirv-srem-e2e: build/native_spirv_srem_e2e
+	./build/native_spirv_srem_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr
