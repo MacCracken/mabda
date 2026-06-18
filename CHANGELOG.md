@@ -15,6 +15,31 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.10c (vector `OpLoad` / `OpStore` for `array<vecN>`, HW-verified)
+- **Vector buffer access** (`src/spirv_lower.cyr`): `OpAccessChain` now accepts a vecN element,
+  using the **std430 array stride** (vec2 → 8, vec3/vec4 → 16; vec3 padded), computed from the
+  element type — std430 is the SSBO default, so no `ArrayStride` decoration lookup is needed
+  (an MVP layout assumption like the existing single-member-struct / member-0 limits). A vecN
+  `OpLoad` (`_spirv_lower_vec_load`) scalarizes into **N consecutive 4-byte loads** at
+  `element_base + j*4` producing a packed `MIR_VK_VECTOR`; a vecN `OpStore`
+  (`_spirv_lower_vec_store`) into N stores of the packed components. Count-matched, fail-loud
+  on a scalar/mismatched-count store.
+- **HW**: `programs/native_spirv_vector_load_store_e2e.cyr` — `out[i] = a[i] + b[i]` over
+  three `array<vec4<f32>>` SSBOs, gid-indexed across 4 elements, **value-exact on Cezanne**
+  (all 16 floats; distinct `a[i]` per element confirms the std430 stride + gid indexing).
+- **Fail-loud `ArrayStride` validation (adversarial review):** `spirv_lower_module` scans
+  `OpDecorate ArrayStride` and rejects (`LOWER_ERR_ARRAY_STRIDE`) any Array/RuntimeArray whose
+  declared stride disagrees with the assumed std430 — so a non-std430 layout (e.g. a
+  tightly-packed `array<vec3>` stride 12) fails loud instead of silently mis-addressing.
+  std430 (or an absent decoration) is accepted. The dynamic-index `aidx*stride` is left
+  unguarded by design: an out-of-bounds array index is UB in SPIR-V (a runtime value the
+  consumer owns), unlike the compile-time-foldable constant index.
+- CPU suite +46 (`test_spirv_lower_vec_load_store`: vec2/vec3/vec4 offset math + packing +
+  store guards; `test_spirv_lower_vec_access_chain`: std430 stride for vec2/vec4 + the dynamic
+  IMUL path; `test_spirv_array_stride_validation`); the former "vec-element arrays rejected"
+  assertion removed (now supported). Bite adversarially reviewed (5 findings: 2 fixed via the
+  stride validation, 2 closed with the added coverage, 1 documented as SPIR-V UB).
+
 ### Added — Phase N.10b (component-wise vector arithmetic + constant-index buffer access, HW-verified)
 - **Component-wise vector arithmetic** (`src/spirv_lower.cyr`, `_spirv_lower_vec_binop`): a
   vecN ALU op (`OpFAdd`/`OpFMul`/`OpIAdd`/…) lowers to **N scalar ops** over the packed

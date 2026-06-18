@@ -851,8 +851,16 @@ hand-authored shaders stay as oracle + fallback.
       `CMP_ERR_FLAT_CONST_OFFSET`). HW: `native_spirv_vector_add_e2e.cyr` vec3 add+mul
       value-exact on Cezanne (+18 CPU asserts). The immediate-offset FLAT form (avoid the
       extra VMOV) is a later optimization.
-    - [ ] **N.10c — vector load/store.** `ArrayStride` parse + vector `OpAccessChain` /
-      `OpLoad` / `OpStore` (N consecutive scalar loads/stores); HW (`array<vec4>`).
+    - [x] **N.10c (2026-06-18) — vector load/store.** `OpAccessChain` accepts a vecN element
+      (std430 stride computed from the element type — vec2→8, vec3/vec4→16; no `ArrayStride`
+      lookup, an MVP layout assumption); `_spirv_lower_vec_load` / `_spirv_lower_vec_store`
+      scalarize a vecN load/store into N consecutive 4-byte accesses (`element_base + j*4`).
+      HW: `native_spirv_vector_load_store_e2e.cyr` (`out[i]=a[i]+b[i]` over `array<vec4>`,
+      gid-indexed) value-exact on Cezanne (+46 CPU asserts). Adversarial review: a non-std430
+      `ArrayStride` now **fails loud** (`_spirv_check_array_strides`) instead of silently
+      mis-addressing; vec2/vec3/dynamic-index coverage added; the dynamic-index overflow is
+      documented as SPIR-V UB (OOB index, runtime bounds-checking out of scope). Multi-member
+      struct stays deferred (single-member, member-0 MVP).
     - [ ] **N.10d — `OpConstantComposite` + splat.** Vector constants; HW.
     - [ ] **N.10e — cut 3.2.10.**
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
