@@ -75,6 +75,22 @@ fn gfx9_inline_int(k): i64 {
     return GFX9_SRC_LITERAL;
 }
 
+# An f32 inline-constant as a 9-bit VOP src operand. GFX9 has dedicated operand codes for
+# a fixed set of float constants (no literal dword): ±0.5/±1.0/±2.0/±4.0 → 240..247.
+# `bits` is the f32 bit pattern (zero-extended). Returns GFX9_SRC_LITERAL for any other
+# value — the caller then emits it as a trailing literal dword (VOP2) or fails loud (VOP3).
+fn gfx9_inline_float(bits): i64 {
+    if (bits == 0x3F000000) { return 240; }   # 0.5
+    if (bits == 0xBF000000) { return 241; }   # -0.5
+    if (bits == 0x3F800000) { return 242; }   # 1.0
+    if (bits == 0xBF800000) { return 243; }   # -1.0
+    if (bits == 0x40000000) { return 244; }   # 2.0
+    if (bits == 0xC0000000) { return 245; }   # -2.0
+    if (bits == 0x40800000) { return 246; }   # 4.0
+    if (bits == 0xC0800000) { return 247; }   # -4.0
+    return GFX9_SRC_LITERAL;
+}
+
 # ================================================================
 # Per-format opcode constants (GFX9 numbering)
 # ================================================================
@@ -82,12 +98,16 @@ fn gfx9_inline_int(k): i64 {
 var GFX9_VOP1_V_MOV_B32     = 0x01;
 var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
 var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
+var GFX9_VOP1_V_SQRT_F32    = 0x27;   # GLSL.std.450 Sqrt (N.8b)
+var GFX9_VOP1_V_FLOOR_F32   = 0x1F;   # GLSL.std.450 Floor (N.8b)
 
 # VOP2 (single-dword) — bits 30-25 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_VOP2_V_ADD_F32     = 0x01;
 var GFX9_VOP2_V_SUB_F32     = 0x02;
 var GFX9_VOP2_V_SUBREV_F32  = 0x03;   # D = vsrc1 - src0 (subtrahend in src0)
 var GFX9_VOP2_V_MUL_F32     = 0x05;
+var GFX9_VOP2_V_MIN_F32     = 0x0A;   # GLSL.std.450 FMin (N.8b)
+var GFX9_VOP2_V_MAX_F32     = 0x0B;   # GLSL.std.450 FMax (N.8b)
 var GFX9_VOP2_V_LSHRREV_B32 = 0x10;
 var GFX9_VOP2_V_LSHLREV_B32 = 0x12;
 var GFX9_VOP2_V_AND_B32     = 0x13;
@@ -97,11 +117,27 @@ var GFX9_VOP2_V_ADD_U32     = 0x34;
 var GFX9_VOP2_V_SUB_U32     = 0x35;
 var GFX9_VOP2_V_SUBREV_U32  = 0x36;   # D = vsrc1 - src0 (subtrahend in src0)
 
+# VOPC (single-dword) — vector compare → VCC. bits 24-17 opcode. (N.7c, divergent
+# control flow.) llvm-mc gfx900-verified; consecutive u32 forms.
+var GFX9_VOPC_V_CMP_LT_U32  = 0xC9;
+var GFX9_VOPC_V_CMP_EQ_U32  = 0xCA;
+var GFX9_VOPC_V_CMP_LE_U32  = 0xCB;
+var GFX9_VOPC_V_CMP_GT_U32  = 0xCC;
+var GFX9_VOPC_V_CMP_NE_U32  = 0xCD;
+var GFX9_VOPC_V_CMP_GE_U32  = 0xCE;
+# Signed i32 vector compares (N.8b-4). llvm-mc gfx900-verified.
+var GFX9_VOPC_V_CMP_LT_I32  = 0xC1;
+var GFX9_VOPC_V_CMP_LE_I32  = 0xC3;
+var GFX9_VOPC_V_CMP_GT_I32  = 0xC4;
+var GFX9_VOPC_V_CMP_GE_I32  = 0xC6;
+
 # VOP3a (two-dword) — bits 25-16 opcode (10-bit).
 var GFX9_VOP3_V_BFE_U32     = 0x1C8;
 var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
 var GFX9_VOP3_V_OR3_B32     = 0x202;
 var GFX9_VOP3_V_MUL_LO_U32  = 0x285;   # VOP3-only on GFX9 (no VOP2 form); llvm-mc-verified
+var GFX9_VOP3_V_FMA_F32     = 0x1CB;   # GLSL.std.450 Fma (3-src); llvm-mc-verified
+var GFX9_VOP3_V_MED3_F32    = 0x1D6;   # GLSL.std.450 FClamp = median-of-3; llvm-mc-verified
 
 # SOP2 (single-dword) — bits 29-23 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_SOP2_S_ADD_U32     = 0x00;
@@ -114,14 +150,42 @@ var GFX9_SOP2_S_XOR_B32     = 0x10;
 var GFX9_SOP2_S_LSHL_B32    = 0x1C;
 var GFX9_SOP2_S_LSHR_B32    = 0x1E;
 var GFX9_SOP2_S_MUL_I32     = 0x24;
+# 64-bit EXEC-mask ops for divergent control flow (N.7). llvm-mc gfx900-verified.
+var GFX9_SOP2_S_OR_B64      = 0x0F;
+var GFX9_SOP2_S_ANDN2_B64   = 0x13;
 
 # SOP1 (single-dword) — bits 15-8 opcode.
-var GFX9_SOP1_S_MOV_B32     = 0x00;
+var GFX9_SOP1_S_MOV_B32           = 0x00;
+var GFX9_SOP1_S_MOV_B64           = 0x01;   # N.7: save/restore EXEC (64-bit)
+var GFX9_SOP1_S_AND_SAVEEXEC_B64  = 0x20;   # N.7: divergent if — mask EXEC, save old
 
 # SOPP (single-dword) — bits 22-16 opcode.
-var GFX9_SOPP_S_NOP         = 0x00;
-var GFX9_SOPP_S_ENDPGM      = 0x01;
-var GFX9_SOPP_S_WAITCNT     = 0x0C;
+var GFX9_SOPP_S_NOP             = 0x00;
+var GFX9_SOPP_S_ENDPGM          = 0x01;
+var GFX9_SOPP_S_BRANCH          = 0x02;   # N.7: unconditional PC-relative branch
+var GFX9_SOPP_S_CBRANCH_SCC0    = 0x04;   # N.7: branch if SCC == 0 (uniform)
+var GFX9_SOPP_S_CBRANCH_SCC1    = 0x05;   # N.7: branch if SCC == 1 (uniform)
+var GFX9_SOPP_S_CBRANCH_EXECZ   = 0x08;   # N.7: branch if EXEC == 0 (divergent skip)
+var GFX9_SOPP_S_CBRANCH_EXECNZ  = 0x09;
+var GFX9_SOPP_S_WAITCNT         = 0x0C;
+
+# SOPC (single-dword) — scalar compare, sets SCC. bits 22-16 opcode. The u32
+# compares the uniform-branch path needs (signed i32 variants are 0x00..0x05).
+var GFX9_SOPC_S_CMP_EQ_U32  = 0x06;
+var GFX9_SOPC_S_CMP_LG_U32  = 0x07;   # "lg" = not-equal
+var GFX9_SOPC_S_CMP_GT_U32  = 0x08;
+var GFX9_SOPC_S_CMP_GE_U32  = 0x09;
+var GFX9_SOPC_S_CMP_LT_U32  = 0x0A;
+var GFX9_SOPC_S_CMP_LE_U32  = 0x0B;
+# Signed i32 scalar compares (N.8b-4). llvm-mc gfx900-verified.
+var GFX9_SOPC_S_CMP_GT_I32  = 0x02;
+var GFX9_SOPC_S_CMP_GE_I32  = 0x03;
+var GFX9_SOPC_S_CMP_LT_I32  = 0x04;
+var GFX9_SOPC_S_CMP_LE_I32  = 0x05;
+
+# GFX9 special scalar registers (operand codes).
+var GFX9_REG_EXEC_LO = 126;   # EXEC pair s[126:127]; the 64-bit ops name EXEC_LO
+var GFX9_REG_VCC_LO  = 106;   # VCC pair s[106:107]; v_cmp writes it, s_and_saveexec reads it
 
 # SMEM (two-dword) — bits 25-18 opcode.
 var GFX9_SMEM_S_LOAD_DWORD   = 0x00;
@@ -150,6 +214,18 @@ fn gfx9_enc_vop1(op, vdst, src0): i64 {
 # 0x24040081 and v_mul_f32 v2,s12,v2 = 0x0A04040C.
 fn gfx9_enc_vop2(op, vdst, src0, vsrc1): i64 {
     return ((op & 0x3F) << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOPC — vector compare → VCC.   0x7C000000 | op<<17 | vsrc1<<9 | src0
+# ================================================================
+# Marker bits 31-25 = 0b0111110. The result is the implicit VCC mask (no vdst).
+# src0 is the full 9-bit operand (VGPR/inline); vsrc1 is an 8-bit VGPR index. To
+# compare a VGPR against a constant, put the constant in src0 and flip the predicate
+# (e.g. `v < 8` ⇒ v_cmp_gt_u32 vcc, 8, v). Reproduces v_cmp_lt_u32 vcc,v1,v2 =
+# 0x7D920501 and v_cmp_lt_u32 vcc,8,v2 = 0x7D920488.
+fn gfx9_enc_vopc(op, src0, vsrc1): i64 {
+    return 0x7C000000 | ((op & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
 }
 
 # ================================================================
@@ -193,6 +269,16 @@ fn gfx9_enc_sop1(op, sdst, ssrc0): i64 {
 # s_nop 0 = 0xBF800000, s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070.
 fn gfx9_enc_sopp(op, simm16): i64 {
     return 0xBF800000 | ((op & 0x7F) << 16) | (simm16 & 0xFFFF);
+}
+
+# ================================================================
+# SOPC — scalar compare (sets SCC).  0xBF000000 | op<<16 | ssrc1<<8 | ssrc0
+# ================================================================
+# Marker bits 31-23 = 0b101111110. ssrc0/ssrc1 are 8-bit (SGPR or inline; inline
+# 0 = 128). Reproduces s_cmp_eq_u32 s2,s3 = 0xBF060302 and s_cmp_eq_u32 s2,0 =
+# 0xBF068002. SCC is then the branch predicate for s_cbranch_scc0/scc1.
+fn gfx9_enc_sopc(op, ssrc0, ssrc1): i64 {
+    return 0xBF000000 | ((op & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
 }
 
 # ================================================================

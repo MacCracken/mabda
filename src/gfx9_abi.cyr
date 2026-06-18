@@ -15,10 +15,10 @@
 # wgid*local_size + lid, materialized by a lowering step (later sub-bite); the
 # ABI only pins the primitive builtins.
 #
-# MVP scope: 1-D dispatch (TGID_X + LID.x); the .y/.z TGID/LID detection +
-# scalar push-constant slots refine in N.5g. Pure integer math; no syscalls.
-# Included after mir.cyr (reads the value table) and before gfx9_compile.cyr
-# (which resolves binding/builtin operands through these accessors).
+# Full 3-D dispatch: TGID_X/Y/Z + LID.x/y/z enables are derived from the max
+# component each builtin is actually extracted with (gfx9_abi_assign). Pure integer
+# math; no syscalls. Included after mir.cyr (reads the value table + instr list)
+# and before gfx9_compile.cyr (which resolves binding/builtin operands here).
 
 # COMPUTE_PGM_RSRC1: the fixed FLOAT_MODE(0xC0)+DX10_CLAMP flags with the VGPRS
 # (bits 0-5) and SGPRS (bits 6-9) fields ZEROED — the per-shader register counts
@@ -67,12 +67,17 @@ fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN
-# (bit 7), TGID_Y_EN (bit 8). (TGID_Z bit 9 + LDS/scratch fields are MVP-zero.)
-fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
+# (bit 7), TGID_Y_EN (bit 8), TGID_Z_EN (bit 9), TIDIG_COMP_CNT (bits 11-12 — the
+# number of LocalInvocationId components MINUS 1 the HW writes to v0/v1/v2). Without
+# the right TGID_*_EN / TIDIG_COMP_CNT the HW never loads wgid.y/z or lid.y/z, so a
+# 2-D/3-D kernel reads uninitialized registers (the N.6 2-D bug). (LDS/scratch zero.)
+fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, tgid_z, tidig_comp_cnt, trap): i64 {
     var r = (user_sgpr & 0x1F) << 1;
     if (trap != 0) { r = r | 0x40; }
     if (tgid_x != 0) { r = r | 0x80; }
     if (tgid_y != 0) { r = r | 0x100; }
+    if (tgid_z != 0) { r = r | 0x200; }
+    r = r | ((tidig_comp_cnt & 0x3) << 11);
     return r;
 }
 
@@ -82,41 +87,68 @@ fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
 fn gfx9_abi_assign(m, abi): i64 {
     var cap_ids = load64(m + 64);
     var max_binding = 0 - 1;
-    var use_tgid = 0;
-    var use_lid = 0;
     var i = 1;
     while (i < cap_ids) {
-        var k = mir_val_kind(m, i);
-        if (k == MIR_VK_BUFVAR) {
+        if (mir_val_kind(m, i) == MIR_VK_BUFVAR) {
             var bind = mir_val_payload(m, i);
             if (bind > max_binding) { max_binding = bind; }
         }
-        if (k == MIR_VK_BUILTIN) {
-            var bi = mir_val_payload(m, i);
-            if (bi == MIR_BI_WORKGROUP_ID) { use_tgid = 1; }
-            if (bi == MIR_BI_GLOBAL_INVOC_ID) {
-                use_tgid = 1;
-                use_lid = 1;
-            }
-            if (bi == MIR_BI_LOCAL_INVOC_ID) { use_lid = 1; }
-        }
         i = i + 1;
+    }
+    # The number of WorkgroupId / LocalInvocationId components the kernel actually
+    # uses is the MAX component subscript across its EXTRACT instructions on those
+    # builtins (the GlobalInvocationId expansion already lowered to wgid/lid extracts).
+    # That fixes how many TGID SGPRs / LID VGPRs the HW must preload — a 2-D kernel
+    # needs TGID_Y_EN + TIDIG_COMP_CNT=1, which the 1-D MVP never set.
+    var max_wgid = 0 - 1;
+    var max_lid  = 0 - 1;
+    var ni = mir_n_instrs(m);
+    var j = 0;
+    while (j < ni) {
+        if (mir_instr_op(m, j) == MIR_OP_EXTRACT) {
+            var a = mir_instr_a(m, j);
+            var comp = mir_instr_c(m, j);
+            if (a > 0) {
+                if (a < cap_ids) {
+                    if (mir_val_kind(m, a) == MIR_VK_BUILTIN) {
+                        var bi = mir_val_payload(m, a);
+                        if (bi == MIR_BI_WORKGROUP_ID) { if (comp > max_wgid) { max_wgid = comp; } }
+                        if (bi == MIR_BI_LOCAL_INVOC_ID) { if (comp > max_lid) { max_lid = comp; } }
+                    }
+                }
+            }
+        }
+        j = j + 1;
     }
     var num_bindings = max_binding + 1;
     var user_sgpr = num_bindings * 2;
     if (user_sgpr > GFX9_USER_DATA_MAX) { return 0 - ABI_ERR_TOO_MANY_BINDINGS; }
-    var lid = 0;
-    if (use_lid != 0) { lid = 1; }
+    # Enable TGID_X..TGID_{max_wgid} contiguously so wgid.comp maps to s[user+comp]
+    # (gfx9_abi_builtin_reg); likewise LID v0..v{max_lid}.
+    var tgid_x = 0;
+    var tgid_y = 0;
+    var tgid_z = 0;
+    if (max_wgid >= 0) { tgid_x = 1; }
+    if (max_wgid >= 1) { tgid_y = 1; }
+    if (max_wgid >= 2) { tgid_z = 1; }
+    var n_tgid = 0;
+    if (max_wgid >= 0) { n_tgid = max_wgid + 1; }
+    var lid_count = 0;
+    if (max_lid >= 0) { lid_count = max_lid + 1; }
     store64(abi + ABI_NUM_BINDINGS, num_bindings);
     store64(abi + ABI_USER_SGPR, user_sgpr);
-    store64(abi + ABI_TGID_X, use_tgid);
-    store64(abi + ABI_TGID_Y, 0);
-    store64(abi + ABI_TGID_Z, 0);
-    store64(abi + ABI_LID_COUNT, lid);
-    store64(abi + ABI_SGPR_BASE, user_sgpr + use_tgid);
-    store64(abi + ABI_VGPR_BASE, lid);
+    store64(abi + ABI_TGID_X, tgid_x);
+    store64(abi + ABI_TGID_Y, tgid_y);
+    store64(abi + ABI_TGID_Z, tgid_z);
+    store64(abi + ABI_LID_COUNT, lid_count);
+    store64(abi + ABI_SGPR_BASE, user_sgpr + n_tgid);
+    store64(abi + ABI_VGPR_BASE, lid_count);
     return 0;
 }
+
+# Number of LocalInvocationId components the kernel uses (v0..). RSRC2's
+# TIDIG_COMP_CNT = max(lid_count - 1, 0).
+fn gfx9_abi_lid_count(abi): i64 { return load64(abi + ABI_LID_COUNT); }
 
 # ================================================================
 # Accessors + operand resolution

@@ -1,0 +1,241 @@
+# programs/native_spirv_uniform_if_e2e.cyr — N.7b-2: a UNIFORM `if` compiled in-tree
+# and dispatched on Cezanne, proving the structured-control-flow back-end.
+#
+# Kernel: `if (gl_WorkGroupID.x == 0) { out[gid.x] = gid.x + 7; }` — LocalSize 8,
+# dispatched over a 2×1×1 WORKGROUP grid (16 global lanes). The condition is UNIFORM
+# (WorkgroupId is one value per wave) → the s_cmp + s_cbranch_scc0 path. Workgroup 0
+# takes the then and writes out[0..7]; workgroup 1's condition is false, so it skips
+# the body and out[8..15] stays the sentinel. That gap is the observable proof the
+# branch gated an entire workgroup.
+#
+# Seed out[0..15] = 0xBAADF00D. Verify out[i]=i+7 for i in 0..7, sentinel for 8..15.
+# Exit: 0 = correct; 2 = compile; 3/5 = setup; 9 = dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# SPIR-V (id-bound 27, 604 bytes). Builtins: %13 WorkgroupId, %14 GlobalInvocationId.
+# Binding: %15 out (binding 0).
+fn build_uniform_if_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 27);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);   # OpMemoryModel Logical GLSL450
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (7 << 16) | 15);   # OpEntryPoint GLCompute %16 "main" %13 %14
+    store32(buf + 44, 5);
+    store32(buf + 48, 16);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 13);
+    store32(buf + 64, 14);
+    store32(buf + 68, (6 << 16) | 16);   # OpExecutionMode %16 LocalSize 8 1 1
+    store32(buf + 72, 16);
+    store32(buf + 76, 17);
+    store32(buf + 80, 8);
+    store32(buf + 84, 1);
+    store32(buf + 88, 1);
+    store32(buf + 92, (4 << 16) | 71);   # OpDecorate %13 BuiltIn WorkgroupId
+    store32(buf + 96, 13);
+    store32(buf + 100, 11);
+    store32(buf + 104, 26);
+    store32(buf + 108, (4 << 16) | 71);  # OpDecorate %14 BuiltIn GlobalInvocationId
+    store32(buf + 112, 14);
+    store32(buf + 116, 11);
+    store32(buf + 120, 28);
+    store32(buf + 124, (4 << 16) | 71);  # OpDecorate %15 Binding 0
+    store32(buf + 128, 15);
+    store32(buf + 132, 33);
+    store32(buf + 136, 0);
+    store32(buf + 140, (4 << 16) | 71);  # OpDecorate %15 DescriptorSet 0
+    store32(buf + 144, 15);
+    store32(buf + 148, 34);
+    store32(buf + 152, 0);
+    store32(buf + 156, (2 << 16) | 19);  # %1 void
+    store32(buf + 160, 1);
+    store32(buf + 164, (3 << 16) | 33);  # %2 fn
+    store32(buf + 168, 2);
+    store32(buf + 172, 1);
+    store32(buf + 176, (4 << 16) | 21);  # %3 uint
+    store32(buf + 180, 3);
+    store32(buf + 184, 32);
+    store32(buf + 188, 0);
+    store32(buf + 192, (4 << 16) | 23);  # %4 v3uint
+    store32(buf + 196, 4);
+    store32(buf + 200, 3);
+    store32(buf + 204, 3);
+    store32(buf + 208, (4 << 16) | 32);  # %5 ptr Input v3uint
+    store32(buf + 212, 5);
+    store32(buf + 216, 1);
+    store32(buf + 220, 4);
+    store32(buf + 224, (2 << 16) | 20);  # %6 bool
+    store32(buf + 228, 6);
+    store32(buf + 232, (3 << 16) | 29);  # %7 runtime array uint
+    store32(buf + 236, 7);
+    store32(buf + 240, 3);
+    store32(buf + 244, (3 << 16) | 30);  # %8 struct { %7 }
+    store32(buf + 248, 8);
+    store32(buf + 252, 7);
+    store32(buf + 256, (4 << 16) | 32);  # %9 ptr StorageBuffer struct
+    store32(buf + 260, 9);
+    store32(buf + 264, 12);
+    store32(buf + 268, 8);
+    store32(buf + 272, (4 << 16) | 32);  # %10 ptr StorageBuffer uint
+    store32(buf + 276, 10);
+    store32(buf + 280, 12);
+    store32(buf + 284, 3);
+    store32(buf + 288, (4 << 16) | 43);  # %11 const 0
+    store32(buf + 292, 3);
+    store32(buf + 296, 11);
+    store32(buf + 300, 0);
+    store32(buf + 304, (4 << 16) | 43);  # %12 const 7
+    store32(buf + 308, 3);
+    store32(buf + 312, 12);
+    store32(buf + 316, 7);
+    store32(buf + 320, (4 << 16) | 59);  # %13 wgid var (Input)
+    store32(buf + 324, 5);
+    store32(buf + 328, 13);
+    store32(buf + 332, 1);
+    store32(buf + 336, (4 << 16) | 59);  # %14 gid var (Input)
+    store32(buf + 340, 5);
+    store32(buf + 344, 14);
+    store32(buf + 348, 1);
+    store32(buf + 352, (4 << 16) | 59);  # %15 out var (StorageBuffer)
+    store32(buf + 356, 9);
+    store32(buf + 360, 15);
+    store32(buf + 364, 12);
+    store32(buf + 368, (5 << 16) | 54);  # OpFunction %16
+    store32(buf + 372, 1);
+    store32(buf + 376, 16);
+    store32(buf + 380, 0);
+    store32(buf + 384, 2);
+    store32(buf + 388, (2 << 16) | 248); # OpLabel %17 (entry)
+    store32(buf + 392, 17);
+    store32(buf + 396, (4 << 16) | 61);  # OpLoad %18 = wgid
+    store32(buf + 400, 4);
+    store32(buf + 404, 18);
+    store32(buf + 408, 13);
+    store32(buf + 412, (5 << 16) | 81);  # OpCompositeExtract %19 = wgid.x
+    store32(buf + 416, 3);
+    store32(buf + 420, 19);
+    store32(buf + 424, 18);
+    store32(buf + 428, 0);
+    store32(buf + 432, (5 << 16) | 170); # OpIEqual %20 = (wgid.x == 0)
+    store32(buf + 436, 6);
+    store32(buf + 440, 20);
+    store32(buf + 444, 19);
+    store32(buf + 448, 11);
+    store32(buf + 452, (3 << 16) | 247); # OpSelectionMerge %26 None
+    store32(buf + 456, 26);
+    store32(buf + 460, 0);
+    store32(buf + 464, (4 << 16) | 250); # OpBranchConditional %20 %21 %26
+    store32(buf + 468, 20);
+    store32(buf + 472, 21);
+    store32(buf + 476, 26);
+    store32(buf + 480, (2 << 16) | 248); # OpLabel %21 (then)
+    store32(buf + 484, 21);
+    store32(buf + 488, (4 << 16) | 61);  # OpLoad %22 = gid
+    store32(buf + 492, 4);
+    store32(buf + 496, 22);
+    store32(buf + 500, 14);
+    store32(buf + 504, (5 << 16) | 81);  # OpCompositeExtract %23 = gid.x
+    store32(buf + 508, 3);
+    store32(buf + 512, 23);
+    store32(buf + 516, 22);
+    store32(buf + 520, 0);
+    store32(buf + 524, (5 << 16) | 128); # OpIAdd %24 = gid.x + 7
+    store32(buf + 528, 3);
+    store32(buf + 532, 24);
+    store32(buf + 536, 23);
+    store32(buf + 540, 12);
+    store32(buf + 544, (6 << 16) | 65);  # OpAccessChain %25 = &out[gid.x]
+    store32(buf + 548, 10);
+    store32(buf + 552, 25);
+    store32(buf + 556, 15);
+    store32(buf + 560, 11);
+    store32(buf + 564, 23);
+    store32(buf + 568, (3 << 16) | 62);  # OpStore %25 %24
+    store32(buf + 572, 25);
+    store32(buf + 576, 24);
+    store32(buf + 580, (2 << 16) | 249); # OpBranch %26
+    store32(buf + 584, 26);
+    store32(buf + 588, (2 << 16) | 248); # OpLabel %26 (merge)
+    store32(buf + 592, 26);
+    store32(buf + 596, (1 << 16) | 253); # OpReturn
+    store32(buf + 600, (1 << 16) | 56);  # OpFunctionEnd
+    return 604;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V uniform-if e2e (N.7b-2) on Cezanne\n");
+    print_cstr("------------------------------------------------------\n");
+
+    var spv[768];
+    var n = build_uniform_if_kernel(&spv);
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (shmod == 0) { print_cstr("FAIL: shader_module_create_spirv -> 0\n"); return 2; }
+
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 5; }
+    var out_handle = load64(&ob + 0);
+    var out_map = load64(&ob + 8);
+    var k = 0;
+    while (k < 16) { store32(out_map + k * 4, 0xBAADF00D); k = k + 1; }
+    var out_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, out_handle, out_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    var bp[24];
+    store64(&bp + 0, 1);
+    store64(&bp + 8, out_handle);
+    store64(&bp + 16, out_va);
+
+    # PUBLIC API: 2 workgroups × LocalSize 8 = 16 lanes; the uniform condition gates
+    # workgroup 1 out entirely.
+    var rc = gpu_compute_dispatch(ctx, shmod, 2, 1, 1, &bp);
+    if (rc != 0) { print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    var ok = 1;
+    var i = 0;
+    while (i < 16) {
+        var got = load32(out_map + i * 4);
+        var want = i + 7;
+        if (i >= 8) { want = 0xBAADF00D; }   # wg1 skipped → sentinel
+        print_cstr("out["); print_i64(i); print_cstr("] = ");
+        if (got == 0xBAADF00D) { print_cstr("<sentinel>"); } else { print_i64(got); }
+        if (got != want) { print_cstr("  MISMATCH"); ok = 0; }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    gpu_shader_module_release(ctx, shmod);
+    native_gem_va_unmap(fd, out_handle, out_va, 4096);
+    native_bo_release_gtt(fd, out_handle, out_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: uniform-if dispatch mismatch\n"); return 11; }
+    print_cstr("OK — uniform `if (wgid.x==0)` gated workgroup 1 on Cezanne (out[8..15] untouched)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

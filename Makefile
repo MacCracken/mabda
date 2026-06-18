@@ -312,6 +312,147 @@ build/native_spirv_public_api_e2e: programs/native_spirv_public_api_e2e.cyr src/
 test-native-spirv-public-api-e2e: build/native_spirv_public_api_e2e
 	./build/native_spirv_public_api_e2e
 
+# N.6: a compiled SPIR-V kernel with a 2-D/3-D workgroup grid + 2-D LocalSize via
+# gl_GlobalInvocationId.x/.y (TGID_Y + TIDIG_COMP_CNT), HW-verified on Cezanne.
+build/native_spirv_2d_dispatch_e2e: programs/native_spirv_2d_dispatch_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_2d_dispatch_e2e.cyr $@
+
+.PHONY: test-native-spirv-2d-dispatch-e2e
+test-native-spirv-2d-dispatch-e2e: build/native_spirv_2d_dispatch_e2e
+	./build/native_spirv_2d_dispatch_e2e
+
+# N.6: a compiled SPIR-V kernel dispatched on a LOGICAL COMPUTE QUEUE (the queue's
+# persistent timeline), waited via gpu_queue_wait_idle. HW-verified on Cezanne.
+build/native_spirv_queue_dispatch_e2e: programs/native_spirv_queue_dispatch_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_queue_dispatch_e2e.cyr $@
+
+.PHONY: test-native-spirv-queue-dispatch-e2e
+test-native-spirv-queue-dispatch-e2e: build/native_spirv_queue_dispatch_e2e
+	./build/native_spirv_queue_dispatch_e2e
+
+# N.7b: a compiled SPIR-V kernel with a UNIFORM `if (wgid.x==0)` — the s_cmp +
+# s_cbranch_scc0 path. Grid 2 → workgroup 1 is gated out. HW-verified on Cezanne.
+build/native_spirv_uniform_if_e2e: programs/native_spirv_uniform_if_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_uniform_if_e2e.cyr $@
+
+.PHONY: test-native-spirv-uniform-if-e2e
+test-native-spirv-uniform-if-e2e: build/native_spirv_uniform_if_e2e
+	./build/native_spirv_uniform_if_e2e
+
+# N.7c: a compiled SPIR-V kernel with a DIVERGENT `if (gid.x<4)` — v_cmp → VCC +
+# s_and_saveexec_b64 + s_cbranch_execz + s_or_b64 restore. One wave, lanes 4-7 masked
+# out of the store (out[4..7] untouched). HW-verified on Cezanne.
+build/native_spirv_divergent_if_e2e: programs/native_spirv_divergent_if_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_divergent_if_e2e.cyr $@
+
+.PHONY: test-native-spirv-divergent-if-e2e
+test-native-spirv-divergent-if-e2e: build/native_spirv_divergent_if_e2e
+	./build/native_spirv_divergent_if_e2e
+
+# N.8a: a compiled SPIR-V kernel multiplying by a NON-INLINE constant (`gid.x*100`) —
+# v_mul_lo_u32 (VOP3a) has no literal form, so 100 is materialized via v_mov_b32 into a
+# scratch VGPR first. HW-verified on Cezanne (the documented N.6 VOP3-literal carry).
+build/native_spirv_mul_literal_e2e: programs/native_spirv_mul_literal_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_mul_literal_e2e.cyr $@
+
+.PHONY: test-native-spirv-mul-literal-e2e
+test-native-spirv-mul-literal-e2e: build/native_spirv_mul_literal_e2e
+	./build/native_spirv_mul_literal_e2e
+
+# N.8b: a compiled SPIR-V kernel using a GLSL.std.450 OpExtInst (`max(float(gid.x),
+# 4.0)`) — the ext-instruction front end → v_max_f32. HW-verified on Cezanne.
+build/native_spirv_glsl_max_e2e: programs/native_spirv_glsl_max_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_glsl_max_e2e.cyr $@
+
+.PHONY: test-native-spirv-glsl-max-e2e
+test-native-spirv-glsl-max-e2e: build/native_spirv_glsl_max_e2e
+	./build/native_spirv_glsl_max_e2e
+
+# N.8b-2: a compiled SPIR-V kernel using a GLSL.std.450 Fma (ternary OpExtInst) →
+# v_fma_f32 (VOP3 3-src). `fma(gid,gid,gid)` = gid*gid+gid. HW-verified on Cezanne.
+build/native_spirv_fma_e2e: programs/native_spirv_fma_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fma_e2e.cyr $@
+
+.PHONY: test-native-spirv-fma-e2e
+test-native-spirv-fma-e2e: build/native_spirv_fma_e2e
+	./build/native_spirv_fma_e2e
+
+# N.8b-3: a compiled SPIR-V kernel using f32 INLINE constants (`fma(gid, 2.0, 1.0)`) —
+# 2.0/1.0 pack into the VOP3 source fields (codes 244/242), no literal. HW-verified.
+build/native_spirv_fma_const_e2e: programs/native_spirv_fma_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fma_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-fma-const-e2e
+test-native-spirv-fma-const-e2e: build/native_spirv_fma_const_e2e
+	./build/native_spirv_fma_const_e2e
+
+# N.8b-4: GLSL.std.450 FClamp via v_med3_f32 (median-of-3). clamp(float(gid.x),1.0,4.0).
+build/native_spirv_fclamp_e2e: programs/native_spirv_fclamp_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fclamp_e2e.cyr $@
+
+.PHONY: test-native-spirv-fclamp-e2e
+test-native-spirv-fclamp-e2e: build/native_spirv_fclamp_e2e
+	./build/native_spirv_fclamp_e2e
+
+# N.8b-4: a SIGNED compare (v_cmp_lt_i32) — `if (int(gid.x)-4 < 0)` selects gid 0..3
+# (an unsigned compare would select none). HW-verified on Cezanne.
+build/native_spirv_signed_if_e2e: programs/native_spirv_signed_if_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_signed_if_e2e.cyr $@
+
+.PHONY: test-native-spirv-signed-if-e2e
+test-native-spirv-signed-if-e2e: build/native_spirv_signed_if_e2e
+	./build/native_spirv_signed_if_e2e
+
+# N.8b-5: storing a CONSTANT value (`out[gid.x] = 0xCAFE`) — FLAT store data must be a
+# VGPR, so the constant is materialized via v_mov_b32 first. HW-verified on Cezanne.
+build/native_spirv_store_const_e2e: programs/native_spirv_store_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_store_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-store-const-e2e
+test-native-spirv-store-const-e2e: build/native_spirv_store_const_e2e
+	./build/native_spirv_store_const_e2e
+
+# N.8b-6: a binary VOP2 op with a constant operand (`float(gid.x) * 2.0`) — the const
+# rides src0 (inline float) and the VGPR rides vsrc1. HW-verified on Cezanne.
+build/native_spirv_vop2_const_e2e: programs/native_spirv_vop2_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_vop2_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-vop2-const-e2e
+test-native-spirv-vop2-const-e2e: build/native_spirv_vop2_const_e2e
+	./build/native_spirv_vop2_const_e2e
+
+# N.8b-7: GLSL.std.450 FAbs via v_and_b32 0x7FFFFFFF (clear the f32 sign bit).
+# `abs(float(gid.x) - 4.0)`. HW-verified on Cezanne.
+build/native_spirv_fabs_e2e: programs/native_spirv_fabs_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fabs_e2e.cyr $@
+
+.PHONY: test-native-spirv-fabs-e2e
+test-native-spirv-fabs-e2e: build/native_spirv_fabs_e2e
+	./build/native_spirv_fabs_e2e
+
+# N.8b-8: a two-constant op const-folded at compile time (`gid.x + 6*7` → `gid.x + 42`).
+# HW-verified on Cezanne.
+build/native_spirv_const_fold_e2e: programs/native_spirv_const_fold_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_const_fold_e2e.cyr $@
+
+.PHONY: test-native-spirv-const-fold-e2e
+test-native-spirv-const-fold-e2e: build/native_spirv_const_fold_e2e
+	./build/native_spirv_const_fold_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

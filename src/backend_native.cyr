@@ -245,6 +245,62 @@ shader_handle, out_handle, queue, ip_type): i64 {
     return _native_neg_rc_to_gpu_err(rc);
 }
 
+# N.6 — the N-binding analog of native_compute_dispatch_cached_timeline: a COMPILED
+# kernel reading/writing N storage buffers, dispatched on a LOGICAL QUEUE's ring,
+# signalling the queue's persistent timeline (and consuming any pending cross-ring
+# barrier as an in-CS wait — same Q.4 contract as the deadbeef timeline path). BO
+# list = fence + stub + each binding + shader + ib (the cached_n shape). The caller
+# waits via gpu_queue_wait_idle / orders with gpu_queue_barrier.
+fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
+binds, n_binds, queue, ip_type): i64 {
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+    var fd  = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle  = native_ctx_stub_handle(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    # entries: fence(1) + stub(3) + each binding(3) + shader(4) + ib(10).
+    var entries[256];
+    var ne = 0;
+    store32(&entries + ne * 8, fence_handle);
+    store32(&entries + ne * 8 + 4, 1);
+    ne = ne + 1;
+    store32(&entries + ne * 8, stub_handle);
+    store32(&entries + ne * 8 + 4, 3);
+    ne = ne + 1;
+    var bi = 0;
+    while (bi < n_binds) {
+        store32(&entries + ne * 8, load64(binds + bi * 8));
+        store32(&entries + ne * 8 + 4, 3);
+        ne = ne + 1;
+        bi = bi + 1;
+    }
+    store32(&entries + ne * 8, shader_handle);
+    store32(&entries + ne * 8 + 4, 4);
+    ne = ne + 1;
+    store32(&entries + ne * 8, ib_handle);
+    store32(&entries + ne * 8 + 4, 10);
+    ne = ne + 1;
+    var bo_list_in[24];
+    store32(&bo_list_in + 0, 0xFFFFFFFF);
+    store32(&bo_list_in + 4, 0xFFFFFFFF);
+    store32(&bo_list_in + 8, ne);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
 # ================================================================
 # v3.2 X.4 — SDMA buffer-copy on the DMA ring (timeline path)
 # ================================================================
@@ -731,6 +787,7 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
 #   +48 nbind   (binding count — bindings k→USER_DATA s[2k:2k+1])
 #   +56 local_x (LocalSize.x → PM4 NUM_THREAD_X; must match the compiled shader)
 #   +64 isa_len (ISA byte length, incl. the prefetch pad)
+#   +72 local_y / +80 local_z (LocalSize.y/.z → NUM_THREAD_Y/Z — full 3-D geometry)
 var NATIVE_SHMOD_MAGIC_VAL = 0x4D42444153484D31;   # "MBDASHM1"
 var NATIVE_SHMOD_MAGIC   = 0;
 var NATIVE_SHMOD_HANDLE  = 8;
@@ -741,13 +798,17 @@ var NATIVE_SHMOD_RSRC2   = 40;
 var NATIVE_SHMOD_NBIND   = 48;
 var NATIVE_SHMOD_LOCALX  = 56;
 var NATIVE_SHMOD_ISALEN  = 64;
-var NATIVE_SHMOD_SIZE    = 72;
+var NATIVE_SHMOD_LOCALY  = 72;
+var NATIVE_SHMOD_LOCALZ  = 80;
+var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
+# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the compile
 # scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
-# → CMP_ERR_TABLE → this returns 0). 128 covers the MVP kernels; raising it grows
-# the stack frame (the tables are id-indexed). The MVP exit (downsample) used 45.
-var NATIVE_SHADER_CAP_IDS = 128;
+# → CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
+# free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
+# RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
+# further needs growing those internal scratch buffers (a deeper N.8 change).
+var NATIVE_SHADER_CAP_IDS = 256;
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
 # at a context-allocated VA, and return a magic-tagged shmod struct the compute
@@ -764,15 +825,15 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # (N.6r review, HIGH). 20 is the floor; full structural validation is the gate's.
     if (byte_len < 20) { return 0; }
 
-    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS ids ---
-    var types[3072];     # 128 * SPIRV_TYPE_REC(24)
-    var consts[2048];    # 128 * SPIRV_CONST_REC(16)
-    var deco[2048];      # 128 * SPIRV_DECO_REC(16)
-    var outbi[1024];     # 128 * 8
+    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
     var m[80];
-    var vals[5120];      # 128 * MIR_VAL_REC(40)
-    var instrs[8192];    # 256 * MIR_INSTR_REC(32)
-    var ptrs[1024];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[2048];      # 128 * MIR_PTR_REC(16)
     var blocks[32];
     # The MIR synth-id counter starts right after the SPIR-V ids (the header's
     # id_bound), so synthesized values (access-chain offsets, GID expansion) get
@@ -780,11 +841,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
     # table-build gate (CMP_ERR_TABLE).
     var idb = spirv_hdr_id_bound(words_ptr);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 256, 64, idb,
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 512, 128, idb,
     NATIVE_SHADER_CAP_IDS);
-    var isel[6144];      # CMP_ISEL_CAP(128) * GISEL_REC(48)
-    var isel2[6144];
-    var alloc[2048];     # 128 * RA_REC(16)
+    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
+    var isel2[12288];
+    var alloc[4096];     # 256 * RA_REC(16)
     var hw[16];
     var abi[64];
     var cc[88];
@@ -807,7 +868,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     if (isa_len <= 0)    { return 0; }
     if (isa_len > 8192)  { return 0; }
 
-    # --- LocalSize.x (drives PM4 NUM_THREAD_X; the kernel was compiled for it) ---
+    # --- LocalSize x/y/z (drive PM4 NUM_THREAD_X/Y/Z; the kernel was compiled for them) ---
     var entry = spirv_find_entry_point(words_ptr, byte_len);
     var lsz[24];
     store64(&lsz + 0, 1);
@@ -815,7 +876,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(&lsz + 16, 1);
     spirv_find_local_size(words_ptr, byte_len, entry, &lsz);
     var local_x = load64(&lsz + 0);
+    var local_y = load64(&lsz + 8);
+    var local_z = load64(&lsz + 16);
     if (local_x <= 0) { local_x = 1; }
+    if (local_y <= 0) { local_y = 1; }
+    if (local_z <= 0) { local_z = 1; }
 
     # --- stage the ISA in a GTT BO at a context-allocated VA ---
     var fd = native_ctx_fd(ctx);
@@ -857,6 +922,8 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(sh + NATIVE_SHMOD_NBIND, load64(&desc + DESC_NUM_BINDINGS));
     store64(sh + NATIVE_SHMOD_LOCALX, local_x);
     store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
+    store64(sh + NATIVE_SHMOD_LOCALY, local_y);
+    store64(sh + NATIVE_SHMOD_LOCALZ, local_z);
     return sh;
 }
 
@@ -897,14 +964,15 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
     return 0;
 }
 
-# N.6r — dispatch a COMPILED shmod through the generic N-binding composer. `x` is
-# the grid X (workgroup count); the shmod's LocalSize.x is NUM_THREAD_X. `bp` is a
-# count-prefixed binding array (the compiled-path binding ABI): bp+0 = count, then
-# count × (handle, va) 16-byte pairs. The count MUST equal the compiler's binding
-# count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a caller error. Bindings
-# are capped at 16 (the USER_DATA ceiling the ABI already enforces). Synchronous
-# (cached_n); a logical-queue/timeline compiled path is a later bite (see docs/development/3-2-punchlist.md).
-fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
+# N.6 — dispatch a COMPILED shmod through the generic N-binding composer. `(x,y,z)`
+# are the grid (workgroup counts); the shmod's LocalSize x/y/z are NUM_THREAD_X/Y/Z
+# (the kernel's enabled WorkgroupId dims are already encoded in rsrc2 by the ABI).
+# `bp` is a count-prefixed binding array (the compiled-path binding ABI): bp+0 =
+# count, then count × (handle, va) 16-byte pairs. The count MUST equal the
+# compiler's binding count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a
+# caller error. Bindings are capped at 16 (the USER_DATA ceiling the ABI enforces).
+# Synchronous (cached_n).
+fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq): i64 {
     if (bp == 0) { return GPU_ERR_OTHER; }
     var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
     var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
@@ -912,9 +980,13 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     var rsrc2   = load64(shmod + NATIVE_SHMOD_RSRC2);
     var nbind   = load64(shmod + NATIVE_SHMOD_NBIND);
     var local_x = load64(shmod + NATIVE_SHMOD_LOCALX);
+    var local_y = load64(shmod + NATIVE_SHMOD_LOCALY);
+    var local_z = load64(shmod + NATIVE_SHMOD_LOCALZ);
     if (nbind < 0)   { return GPU_ERR_OTHER; }
     if (nbind > 16)  { return GPU_ERR_OTHER; }
     if (local_x <= 0) { return GPU_ERR_OTHER; }
+    if (local_y <= 0) { return GPU_ERR_OTHER; }
+    if (local_z <= 0) { return GPU_ERR_OTHER; }
     # The caller's binding array count must match the kernel's binding count, else
     # we would load USER_DATA / residency from unrelated memory.
     if (load64(bp + 0) != nbind) { return GPU_ERR_OTHER; }
@@ -930,7 +1002,14 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
-    &bind_vas, nbind, local_x, x);
+    &bind_vas, nbind, local_x, local_y, local_z, x, y, z);
+    # On a logical queue (cq != 0) signal its persistent timeline so the caller can
+    # order it via gpu_queue_barrier / wait via gpu_queue_wait_idle (the DMA-ring
+    # mis-route was rejected upstream). cq == 0 is the v3.0 synchronous single-ring path.
+    if (cq != 0) {
+        return native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes,
+        shader_handle, &bind_handles, nbind, cq, queue_ring(cq));
+    }
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
@@ -969,18 +1048,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
     }
 
-    # N.6r — COMPILED-kernel path. A magic-tagged shmod (from
+    # N.6 — COMPILED-kernel path. A magic-tagged shmod (from
     # gpu_shader_module_create_spirv) carries the compiler's RSRC + binding count
     # + LocalSize, so we dispatch through the generic N-binding composer instead of
-    # the hardcoded deadbeef one below. The legacy (handle,va) pair has no magic
-    # and falls through to the v3.0 deadbeef path unchanged.
+    # the hardcoded deadbeef one below. Full 3-D grid (x,y,z workgroups) + 3-D
+    # LocalSize. The legacy (handle,va) pair has no magic and falls through to the
+    # v3.0 deadbeef path unchanged.
     if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
-        # MVP: the compiled path is 1-D (grid = x). Reject a multi-dim grid rather
-        # than silently dropping the y/z workgroups — fail loud beats wrong results.
-        # 2-D/3-D grid + 2-D LocalSize is the deferred N.6 TGID enhancement (see docs/development/3-2-punchlist.md).
-        if (y != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        if (z != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        return _native_dispatch_compiled(ctx, shmod, x, bp);
+        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq);
     }
 
     var stub_va = native_ctx_stub_va(ctx);

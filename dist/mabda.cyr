@@ -5105,6 +5105,22 @@ fn gfx9_inline_int(k): i64 {
     return GFX9_SRC_LITERAL;
 }
 
+# An f32 inline-constant as a 9-bit VOP src operand. GFX9 has dedicated operand codes for
+# a fixed set of float constants (no literal dword): ±0.5/±1.0/±2.0/±4.0 → 240..247.
+# `bits` is the f32 bit pattern (zero-extended). Returns GFX9_SRC_LITERAL for any other
+# value — the caller then emits it as a trailing literal dword (VOP2) or fails loud (VOP3).
+fn gfx9_inline_float(bits): i64 {
+    if (bits == 0x3F000000) { return 240; }   # 0.5
+    if (bits == 0xBF000000) { return 241; }   # -0.5
+    if (bits == 0x3F800000) { return 242; }   # 1.0
+    if (bits == 0xBF800000) { return 243; }   # -1.0
+    if (bits == 0x40000000) { return 244; }   # 2.0
+    if (bits == 0xC0000000) { return 245; }   # -2.0
+    if (bits == 0x40800000) { return 246; }   # 4.0
+    if (bits == 0xC0800000) { return 247; }   # -4.0
+    return GFX9_SRC_LITERAL;
+}
+
 # ================================================================
 # Per-format opcode constants (GFX9 numbering)
 # ================================================================
@@ -5112,12 +5128,16 @@ fn gfx9_inline_int(k): i64 {
 var GFX9_VOP1_V_MOV_B32     = 0x01;
 var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
 var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
+var GFX9_VOP1_V_SQRT_F32    = 0x27;   # GLSL.std.450 Sqrt (N.8b)
+var GFX9_VOP1_V_FLOOR_F32   = 0x1F;   # GLSL.std.450 Floor (N.8b)
 
 # VOP2 (single-dword) — bits 30-25 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_VOP2_V_ADD_F32     = 0x01;
 var GFX9_VOP2_V_SUB_F32     = 0x02;
 var GFX9_VOP2_V_SUBREV_F32  = 0x03;   # D = vsrc1 - src0 (subtrahend in src0)
 var GFX9_VOP2_V_MUL_F32     = 0x05;
+var GFX9_VOP2_V_MIN_F32     = 0x0A;   # GLSL.std.450 FMin (N.8b)
+var GFX9_VOP2_V_MAX_F32     = 0x0B;   # GLSL.std.450 FMax (N.8b)
 var GFX9_VOP2_V_LSHRREV_B32 = 0x10;
 var GFX9_VOP2_V_LSHLREV_B32 = 0x12;
 var GFX9_VOP2_V_AND_B32     = 0x13;
@@ -5127,11 +5147,27 @@ var GFX9_VOP2_V_ADD_U32     = 0x34;
 var GFX9_VOP2_V_SUB_U32     = 0x35;
 var GFX9_VOP2_V_SUBREV_U32  = 0x36;   # D = vsrc1 - src0 (subtrahend in src0)
 
+# VOPC (single-dword) — vector compare → VCC. bits 24-17 opcode. (N.7c, divergent
+# control flow.) llvm-mc gfx900-verified; consecutive u32 forms.
+var GFX9_VOPC_V_CMP_LT_U32  = 0xC9;
+var GFX9_VOPC_V_CMP_EQ_U32  = 0xCA;
+var GFX9_VOPC_V_CMP_LE_U32  = 0xCB;
+var GFX9_VOPC_V_CMP_GT_U32  = 0xCC;
+var GFX9_VOPC_V_CMP_NE_U32  = 0xCD;
+var GFX9_VOPC_V_CMP_GE_U32  = 0xCE;
+# Signed i32 vector compares (N.8b-4). llvm-mc gfx900-verified.
+var GFX9_VOPC_V_CMP_LT_I32  = 0xC1;
+var GFX9_VOPC_V_CMP_LE_I32  = 0xC3;
+var GFX9_VOPC_V_CMP_GT_I32  = 0xC4;
+var GFX9_VOPC_V_CMP_GE_I32  = 0xC6;
+
 # VOP3a (two-dword) — bits 25-16 opcode (10-bit).
 var GFX9_VOP3_V_BFE_U32     = 0x1C8;
 var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
 var GFX9_VOP3_V_OR3_B32     = 0x202;
 var GFX9_VOP3_V_MUL_LO_U32  = 0x285;   # VOP3-only on GFX9 (no VOP2 form); llvm-mc-verified
+var GFX9_VOP3_V_FMA_F32     = 0x1CB;   # GLSL.std.450 Fma (3-src); llvm-mc-verified
+var GFX9_VOP3_V_MED3_F32    = 0x1D6;   # GLSL.std.450 FClamp = median-of-3; llvm-mc-verified
 
 # SOP2 (single-dword) — bits 29-23 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_SOP2_S_ADD_U32     = 0x00;
@@ -5144,14 +5180,42 @@ var GFX9_SOP2_S_XOR_B32     = 0x10;
 var GFX9_SOP2_S_LSHL_B32    = 0x1C;
 var GFX9_SOP2_S_LSHR_B32    = 0x1E;
 var GFX9_SOP2_S_MUL_I32     = 0x24;
+# 64-bit EXEC-mask ops for divergent control flow (N.7). llvm-mc gfx900-verified.
+var GFX9_SOP2_S_OR_B64      = 0x0F;
+var GFX9_SOP2_S_ANDN2_B64   = 0x13;
 
 # SOP1 (single-dword) — bits 15-8 opcode.
-var GFX9_SOP1_S_MOV_B32     = 0x00;
+var GFX9_SOP1_S_MOV_B32           = 0x00;
+var GFX9_SOP1_S_MOV_B64           = 0x01;   # N.7: save/restore EXEC (64-bit)
+var GFX9_SOP1_S_AND_SAVEEXEC_B64  = 0x20;   # N.7: divergent if — mask EXEC, save old
 
 # SOPP (single-dword) — bits 22-16 opcode.
-var GFX9_SOPP_S_NOP         = 0x00;
-var GFX9_SOPP_S_ENDPGM      = 0x01;
-var GFX9_SOPP_S_WAITCNT     = 0x0C;
+var GFX9_SOPP_S_NOP             = 0x00;
+var GFX9_SOPP_S_ENDPGM          = 0x01;
+var GFX9_SOPP_S_BRANCH          = 0x02;   # N.7: unconditional PC-relative branch
+var GFX9_SOPP_S_CBRANCH_SCC0    = 0x04;   # N.7: branch if SCC == 0 (uniform)
+var GFX9_SOPP_S_CBRANCH_SCC1    = 0x05;   # N.7: branch if SCC == 1 (uniform)
+var GFX9_SOPP_S_CBRANCH_EXECZ   = 0x08;   # N.7: branch if EXEC == 0 (divergent skip)
+var GFX9_SOPP_S_CBRANCH_EXECNZ  = 0x09;
+var GFX9_SOPP_S_WAITCNT         = 0x0C;
+
+# SOPC (single-dword) — scalar compare, sets SCC. bits 22-16 opcode. The u32
+# compares the uniform-branch path needs (signed i32 variants are 0x00..0x05).
+var GFX9_SOPC_S_CMP_EQ_U32  = 0x06;
+var GFX9_SOPC_S_CMP_LG_U32  = 0x07;   # "lg" = not-equal
+var GFX9_SOPC_S_CMP_GT_U32  = 0x08;
+var GFX9_SOPC_S_CMP_GE_U32  = 0x09;
+var GFX9_SOPC_S_CMP_LT_U32  = 0x0A;
+var GFX9_SOPC_S_CMP_LE_U32  = 0x0B;
+# Signed i32 scalar compares (N.8b-4). llvm-mc gfx900-verified.
+var GFX9_SOPC_S_CMP_GT_I32  = 0x02;
+var GFX9_SOPC_S_CMP_GE_I32  = 0x03;
+var GFX9_SOPC_S_CMP_LT_I32  = 0x04;
+var GFX9_SOPC_S_CMP_LE_I32  = 0x05;
+
+# GFX9 special scalar registers (operand codes).
+var GFX9_REG_EXEC_LO = 126;   # EXEC pair s[126:127]; the 64-bit ops name EXEC_LO
+var GFX9_REG_VCC_LO  = 106;   # VCC pair s[106:107]; v_cmp writes it, s_and_saveexec reads it
 
 # SMEM (two-dword) — bits 25-18 opcode.
 var GFX9_SMEM_S_LOAD_DWORD   = 0x00;
@@ -5180,6 +5244,18 @@ fn gfx9_enc_vop1(op, vdst, src0): i64 {
 # 0x24040081 and v_mul_f32 v2,s12,v2 = 0x0A04040C.
 fn gfx9_enc_vop2(op, vdst, src0, vsrc1): i64 {
     return ((op & 0x3F) << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
+}
+
+# ================================================================
+# VOPC — vector compare → VCC.   0x7C000000 | op<<17 | vsrc1<<9 | src0
+# ================================================================
+# Marker bits 31-25 = 0b0111110. The result is the implicit VCC mask (no vdst).
+# src0 is the full 9-bit operand (VGPR/inline); vsrc1 is an 8-bit VGPR index. To
+# compare a VGPR against a constant, put the constant in src0 and flip the predicate
+# (e.g. `v < 8` ⇒ v_cmp_gt_u32 vcc, 8, v). Reproduces v_cmp_lt_u32 vcc,v1,v2 =
+# 0x7D920501 and v_cmp_lt_u32 vcc,8,v2 = 0x7D920488.
+fn gfx9_enc_vopc(op, src0, vsrc1): i64 {
+    return 0x7C000000 | ((op & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF);
 }
 
 # ================================================================
@@ -5223,6 +5299,16 @@ fn gfx9_enc_sop1(op, sdst, ssrc0): i64 {
 # s_nop 0 = 0xBF800000, s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070.
 fn gfx9_enc_sopp(op, simm16): i64 {
     return 0xBF800000 | ((op & 0x7F) << 16) | (simm16 & 0xFFFF);
+}
+
+# ================================================================
+# SOPC — scalar compare (sets SCC).  0xBF000000 | op<<16 | ssrc1<<8 | ssrc0
+# ================================================================
+# Marker bits 31-23 = 0b101111110. ssrc0/ssrc1 are 8-bit (SGPR or inline; inline
+# 0 = 128). Reproduces s_cmp_eq_u32 s2,s3 = 0xBF060302 and s_cmp_eq_u32 s2,0 =
+# 0xBF068002. SCC is then the branch predicate for s_cbranch_scc0/scc1.
+fn gfx9_enc_sopc(op, ssrc0, ssrc1): i64 {
+    return 0xBF000000 | ((op & 0x7F) << 16) | ((ssrc1 & 0xFF) << 8) | (ssrc0 & 0xFF);
 }
 
 # ================================================================
@@ -5723,6 +5809,35 @@ var MIR_OP_EXTRACT = 15;
 var MIR_OP_LOAD    = 16;
 var MIR_OP_STORE   = 17;
 var MIR_OP_RET     = 18;
+# N.7 control flow — modelled as instructions in the flat list (no separate block
+# array): the back-end derives block layout by scanning for LABEL, then patches each
+# branch's PC-relative offset to its target LABEL. LABEL: a = label <id>, 0 bytes.
+# BRANCH: a = target label. COND_BRANCH: a = cond value, b = true label (the
+# fall-through then-block), c = false label (the merge). ICMP_*: a,b -> a bool result
+# (a uniform compare sets SCC; the divergent VCC path is N.7c).
+var MIR_OP_LABEL       = 19;
+var MIR_OP_BRANCH      = 20;
+var MIR_OP_COND_BRANCH = 21;
+var MIR_OP_ICMP_EQ     = 22;
+var MIR_OP_ICMP_NE     = 23;
+var MIR_OP_ICMP_ULT    = 24;
+var MIR_OP_ICMP_UGT    = 25;
+var MIR_OP_ICMP_ULE    = 26;
+var MIR_OP_ICMP_UGE    = 27;
+# GLSL.std.450 float math (N.8b). Uniformity is generic (meet of operands); the result
+# is always VALU (float), like FMUL.
+var MIR_OP_FMIN        = 28;
+var MIR_OP_FMAX        = 29;
+var MIR_OP_FSQRT       = 30;
+var MIR_OP_FFLOOR      = 31;
+# (MIR_OP_FMA = 12, defined above; GLSL.std.450 Fma reaches it via the ExtInst front end.)
+# Signed integer compares (N.8b-4). EQ/NE are sign-agnostic (reuse ICMP_EQ/NE).
+var MIR_OP_ICMP_SLT    = 32;
+var MIR_OP_ICMP_SGT    = 33;
+var MIR_OP_ICMP_SLE    = 34;
+var MIR_OP_ICMP_SGE    = 35;
+var MIR_OP_FCLAMP      = 36;   # GLSL.std.450 FClamp = median-of-3 (v_med3_f32)
+var MIR_OP_FABS        = 37;   # GLSL.std.450 FAbs = clear sign bit (v_and_b32 0x7FFFFFFF)
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6078,12 +6193,39 @@ var SPIRV_OP_BITWISE_XOR      = 198;
 var SPIRV_OP_BITWISE_AND      = 199;
 var SPIRV_OP_RETURN           = 253;
 
-# Control-flow ops the straight-line MVP rejects (fail loud → N.7).
+# Control-flow ops. N.7: BRANCH/BRANCH_CONDITIONAL/SELECTION_MERGE lower; LOOP_MERGE
+# (back-edges break the forward linear-scan) + PHI (the MVP forbids merge-consumed
+# values) still fail loud.
 var SPIRV_OP_LOOP_MERGE          = 246;
 var SPIRV_OP_SELECTION_MERGE     = 247;
 var SPIRV_OP_BRANCH              = 249;
 var SPIRV_OP_BRANCH_CONDITIONAL  = 250;
 var SPIRV_OP_PHI                 = 245;
+
+# Integer comparison opcodes (N.7) → MIR_OP_ICMP_*. Unsigned forms (indices are
+# unsigned); the signed variants land when a kernel needs them.
+var SPIRV_OP_IEQUAL              = 170;
+var SPIRV_OP_INOTEQUAL           = 171;
+var SPIRV_OP_UGREATERTHAN        = 172;
+var SPIRV_OP_UGREATERTHANEQUAL   = 174;
+var SPIRV_OP_ULESSTHAN           = 176;
+var SPIRV_OP_ULESSTHANEQUAL      = 178;
+var SPIRV_OP_SGREATERTHAN        = 173;
+var SPIRV_OP_SGREATERTHANEQUAL   = 175;
+var SPIRV_OP_SLESSTHAN           = 177;
+var SPIRV_OP_SLESSTHANEQUAL      = 179;
+
+# GLSL.std.450 extended-instruction numbers (the `OpExtInst` instruction field). The
+# MVP assumes the only imported ext set is GLSL.std.450 (the standard shader math
+# library); a non-GLSL set's number would map here too — acceptable until per-set
+# tracking (N.8b+). Sqrt is unary; FMin/FMax are binary.
+var GLSL_STD450_FABS             = 4;
+var GLSL_STD450_FLOOR            = 8;
+var GLSL_STD450_FMA              = 50;
+var GLSL_STD450_FCLAMP           = 43;
+var GLSL_STD450_SQRT             = 31;
+var GLSL_STD450_FMIN             = 37;
+var GLSL_STD450_FMAX             = 40;
 
 # OpDecorate Decoration = BuiltIn, and the compute BuiltIn enum values.
 var SPIRV_DECO_BUILTIN              = 11;
@@ -6227,6 +6369,56 @@ fn _spirv_alu_to_mir(op): i64 {
     if (op == SPIRV_OP_FADD) { return MIR_OP_FADD; }
     if (op == SPIRV_OP_FSUB) { return MIR_OP_FSUB; }
     if (op == SPIRV_OP_FMUL) { return MIR_OP_FMUL; }
+    return 0;
+}
+
+# 1 if both `a` and `b` are compile-time constants (so a binary op over them folds).
+# Bounds-guarded against the untrusted id range (cap_ids = m+64), like the table builders.
+fn _spirv_both_const(m, a, b): i64 {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var cap = load64(m + 64);
+    if (a >= cap) { return 0; }
+    if (b >= cap) { return 0; }
+    if (mir_val_kind(m, a) != MIR_VK_CONST) { return 0; }
+    if (mir_val_kind(m, b) != MIR_VK_CONST) { return 0; }
+    return 1;
+}
+
+# Fold a binary ALU op over two constant operands → the 32-bit result value. Integer ops
+# use i64 arithmetic masked to 32 bits (`>>` is logical, correct for SHR); float ops
+# decode the f32 bits to f64, compute, and re-encode (f32_to / f64_* / f32_from). Only
+# called for the ops _spirv_alu_to_mir returns, so the trailing return is unreachable.
+fn _spirv_const_fold(m, mop, a, b): i64 {
+    var va = mir_val_payload(m, a) & 0xFFFFFFFF;
+    var vb = mir_val_payload(m, b) & 0xFFFFFFFF;
+    if (mop == MIR_OP_IADD) { return (va + vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_ISUB) { return (va - vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_IMUL) { return (va * vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_AND) { return va & vb; }
+    if (mop == MIR_OP_OR) { return va | vb; }
+    if (mop == MIR_OP_XOR) { return va ^ vb; }
+    if (mop == MIR_OP_SHL) { return (va << (vb & 31)) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_SHR) { return (va >> (vb & 31)) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FADD) { return f32_from(f64_add(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FSUB) { return f32_from(f64_sub(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FMUL) { return f32_from(f64_mul(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    return va;
+}
+
+# SPIR-V integer-comparison opcode → MIR_OP_ICMP_*, or 0 if not a comparison we
+# lower. The result is a bool the COND_BRANCH consumes (a uniform compare → SCC).
+fn _spirv_cmp_to_mir(op): i64 {
+    if (op == SPIRV_OP_IEQUAL) { return MIR_OP_ICMP_EQ; }
+    if (op == SPIRV_OP_INOTEQUAL) { return MIR_OP_ICMP_NE; }
+    if (op == SPIRV_OP_UGREATERTHAN) { return MIR_OP_ICMP_UGT; }
+    if (op == SPIRV_OP_UGREATERTHANEQUAL) { return MIR_OP_ICMP_UGE; }
+    if (op == SPIRV_OP_ULESSTHAN) { return MIR_OP_ICMP_ULT; }
+    if (op == SPIRV_OP_ULESSTHANEQUAL) { return MIR_OP_ICMP_ULE; }
+    if (op == SPIRV_OP_SGREATERTHAN) { return MIR_OP_ICMP_SGT; }
+    if (op == SPIRV_OP_SGREATERTHANEQUAL) { return MIR_OP_ICMP_SGE; }
+    if (op == SPIRV_OP_SLESSTHAN) { return MIR_OP_ICMP_SLT; }
+    if (op == SPIRV_OP_SLESSTHANEQUAL) { return MIR_OP_ICMP_SLE; }
     return 0;
 }
 
@@ -6375,26 +6567,121 @@ fn _spirv_expand_gid(m, result, ety, comp, lsz_c): i64 {
 }
 
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
-    if (op == SPIRV_OP_BRANCH) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_BRANCH_CONDITIONAL) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_SELECTION_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
+    # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
     if (op == SPIRV_OP_LOOP_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
     if (op == SPIRV_OP_PHI) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_LABEL) { return 0; }
+    # SelectionMerge is a structured hint (the merge block id); the back-end derives
+    # layout from the LABELs, so it is a no-op here.
+    if (op == SPIRV_OP_SELECTION_MERGE) { return 0; }
+    # OpLabel %L → a 0-byte LABEL marker (a = label <id>) the back-end resolves
+    # branch offsets against. The ENTRY label (the first instruction emitted) is
+    # skipped: it is always laid out at offset 0 and is never a branch target in a
+    # forward if, so emitting it would shift every straight-line kernel's MIR.
+    if (op == SPIRV_OP_LABEL) {
+        if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (mir_n_instrs(m) == 0) { return 0; }
+        return mir_emit(m, MIR_OP_LABEL, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
+    }
+    # OpBranch %target → unconditional branch (a = target label).
+    if (op == SPIRV_OP_BRANCH) {
+        if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
+    }
+    # OpBranchConditional %cond %true %false → a = cond value, b = true (the
+    # fall-through then), c = false (the merge); b/c are labels (immediate tags).
+    if (op == SPIRV_OP_BRANCH_CONDITIONAL) {
+        if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1),
+        spirv_word(ptr, off + 2), spirv_word(ptr, off + 3), MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    }
     if (op == SPIRV_OP_RETURN) {
         var er = mir_emit(m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
         if (er < 0) { return er; }
         return 0;
+    }
+    # Integer comparisons → ICMP (a bool result the COND_BRANCH consumes). The
+    # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
+    # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
+    var cop = _spirv_cmp_to_mir(op);
+    if (cop != 0) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, cop, spirv_word(ptr, off + 2), MIR_T_U32,
+        spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
     }
     var mop = _spirv_alu_to_mir(op);
     if (mop != 0) {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
         if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
-        var e = mir_emit(m, mop, spirv_word(ptr, off + 2), rty,
-        spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
+        var aop = spirv_word(ptr, off + 3);
+        var bop = spirv_word(ptr, off + 4);
+        var rid = spirv_word(ptr, off + 2);
+        # Const-fold: both operands compile-time constants → one materialized constant
+        # (instead of an op that would fail loud once both sources are non-VGPR).
+        if (_spirv_both_const(m, aop, bop) == 1) {
+            var ec = mir_set_const(m, rid, rty, _spirv_const_fold(m, mop, aop, bop));
+            if (ec < 0) { return ec; }
+            return 0;
+        }
+        var e = mir_emit(m, mop, rid, rty, aop, bop, 0, 0);
         if (e < 0) { return e; }
         return 0;
+    }
+    # OpExtInst: result_type(+1) result(+2) set(+3) instruction(+4) operand0(+5) [op1(+6)].
+    # GLSL.std.450 math → MIR float ops (uniformity is generic; result is VALU). Unknown
+    # ext instructions fail loud (N.8b+).
+    if (op == SPIRV_OP_EXT_INST) {
+        if (wc < 6) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var ety = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+        if (ety == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        var glsl = spirv_word(ptr, off + 4);
+        var rid = spirv_word(ptr, off + 2);
+        var x0 = spirv_word(ptr, off + 5);
+        # Unary: Sqrt, Floor.
+        if (glsl == GLSL_STD450_SQRT) {
+            var es = mir_emit(m, MIR_OP_FSQRT, rid, ety, x0, 0, 0, 0);
+            if (es < 0) { return es; }
+            return 0;
+        }
+        if (glsl == GLSL_STD450_FLOOR) {
+            var ef = mir_emit(m, MIR_OP_FFLOOR, rid, ety, x0, 0, 0, 0);
+            if (ef < 0) { return ef; }
+            return 0;
+        }
+        if (glsl == GLSL_STD450_FABS) {
+            var ea = mir_emit(m, MIR_OP_FABS, rid, ety, x0, 0, 0, 0);
+            if (ea < 0) { return ea; }
+            return 0;
+        }
+        # Binary: FMin, FMax.
+        if (wc < 7) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var x1 = spirv_word(ptr, off + 6);
+        if (glsl == GLSL_STD450_FMIN) {
+            var en = mir_emit(m, MIR_OP_FMIN, rid, ety, x0, x1, 0, 0);
+            if (en < 0) { return en; }
+            return 0;
+        }
+        if (glsl == GLSL_STD450_FMAX) {
+            var ex = mir_emit(m, MIR_OP_FMAX, rid, ety, x0, x1, 0, 0);
+            if (ex < 0) { return ex; }
+            return 0;
+        }
+        # Ternary: Fma (a*b + c).
+        if (wc < 8) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var x2 = spirv_word(ptr, off + 7);
+        if (glsl == GLSL_STD450_FMA) {
+            var em = mir_emit(m, MIR_OP_FMA, rid, ety, x0, x1, x2, 0);
+            if (em < 0) { return em; }
+            return 0;
+        }
+        # FClamp(x, lo, hi) = median(x, lo, hi) when lo <= hi → a single v_med3_f32.
+        if (glsl == GLSL_STD450_FCLAMP) {
+            var ec = mir_emit(m, MIR_OP_FCLAMP, rid, ety, x0, x1, x2, 0);
+            if (ec < 0) { return ec; }
+            return 0;
+        }
+        return 0 - MIR_ERR_UNSUPPORTED_OP;
     }
     if (op == SPIRV_OP_CONVERT_S_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
@@ -6539,12 +6826,39 @@ var GISEL_GLOBAL_LOAD   = 24;   # b = ptr-table index; flags bits 8+ = binding
 var GISEL_GLOBAL_STORE  = 25;   # a = off vreg, c = value vreg, b = ptr index
 var GISEL_S_ENDPGM      = 26;
 var GISEL_S_WAITCNT     = 27;   # a = simm16 (immediate); inserted by N.4b
+# N.7 control flow. LABEL: a = label <id>, 0 bytes (the emit records its offset).
+# S_BRANCH: a = target label. S_CBRANCH: c = target label (the merge/false target —
+# branch there if SCC==0, i.e. the condition the preceding S_CMP set is false).
+# S_CMP: dst = 0 (result is SCC, not a register), a/b = compared operands, the SOPC
+# compare opcode rides in flags bits 8+ (like GLOBAL_LOAD's binding).
+var GISEL_LABEL         = 28;
+var GISEL_S_BRANCH      = 29;
+var GISEL_S_CBRANCH     = 30;
+var GISEL_S_CMP         = 31;
+# V_CMP: a DIVERGENT compare → the implicit VCC mask (N.7c). dst = 0 (VCC is implicit),
+# a = src0 (9-bit operand, VGPR/inline), b = vsrc1 (a VGPR), VOPC opcode in flags 8+.
+var GISEL_V_CMP         = 32;
+# The divergent-if EXEC-mask trio (N.7c-2b). SAVEEXEC: EXEC &= VCC, save old EXEC to the
+# reserved pair. S_CBRANCH_EXECZ: skip to the merge (c) when no lane is active. S_OR_EXEC:
+# restore EXEC at the merge. The reserved pair + VCC are implicit (no register operands).
+var GISEL_S_SAVEEXEC      = 33;
+var GISEL_S_CBRANCH_EXECZ = 34;
+var GISEL_S_OR_EXEC       = 35;
+# GLSL.std.450 float math (N.8b): min/max are VOP2, sqrt is VOP1.
+var GISEL_V_MIN_F32       = 36;
+var GISEL_V_MAX_F32       = 37;
+var GISEL_V_SQRT_F32      = 38;
+var GISEL_V_FLOOR_F32     = 39;
+var GISEL_V_MED3_F32      = 40;   # GLSL.std.450 FClamp (N.8b-4)
+var GISEL_V_ABS_F32       = 41;   # GLSL.std.450 FAbs = clear sign bit (N.8b-7)
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
-# Error codes (disjoint from mir 20-25 and lower 26-27).
-var GISEL_ERR_UNSUPPORTED_OP = 40;
-var GISEL_ERR_CAP_EXCEEDED   = 41;
+# Error codes — based at 100 so they stay clear of the GISEL op enum (positive opcode
+# tags) above; errors are always returned NEGATED, but a shared literal value with an op
+# is a needless smell. Disjoint from mir 20-25, lower 26-27, and CMP 70-87.
+var GISEL_ERR_UNSUPPORTED_OP = 100;
+var GISEL_ERR_CAP_EXCEEDED   = 101;
 
 # ================================================================
 # Selected-instruction emit + accessors
@@ -6623,12 +6937,104 @@ fn _gisel_float_op(mop): i64 {
     if (mop == MIR_OP_FSUB) { return GISEL_V_SUB_F32; }
     if (mop == MIR_OP_FMUL) { return GISEL_V_MUL_F32; }
     if (mop == MIR_OP_FMA) { return GISEL_V_FMA_F32; }
+    if (mop == MIR_OP_FMIN) { return GISEL_V_MIN_F32; }
+    if (mop == MIR_OP_FMAX) { return GISEL_V_MAX_F32; }
+    if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
+    if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
+    if (mop == MIR_OP_FCLAMP) { return GISEL_V_MED3_F32; }
+    if (mop == MIR_OP_FABS) { return GISEL_V_ABS_F32; }
     return 0;
+}
+
+# Integer-compare MIR op → the SOPC scalar-compare opcode (uniform path → SCC).
+fn _gisel_cmp_sopc(mop): i64 {
+    if (mop == MIR_OP_ICMP_EQ) { return GFX9_SOPC_S_CMP_EQ_U32; }
+    if (mop == MIR_OP_ICMP_NE) { return GFX9_SOPC_S_CMP_LG_U32; }
+    if (mop == MIR_OP_ICMP_ULT) { return GFX9_SOPC_S_CMP_LT_U32; }
+    if (mop == MIR_OP_ICMP_UGT) { return GFX9_SOPC_S_CMP_GT_U32; }
+    if (mop == MIR_OP_ICMP_ULE) { return GFX9_SOPC_S_CMP_LE_U32; }
+    if (mop == MIR_OP_ICMP_UGE) { return GFX9_SOPC_S_CMP_GE_U32; }
+    if (mop == MIR_OP_ICMP_SLT) { return GFX9_SOPC_S_CMP_LT_I32; }
+    if (mop == MIR_OP_ICMP_SGT) { return GFX9_SOPC_S_CMP_GT_I32; }
+    if (mop == MIR_OP_ICMP_SLE) { return GFX9_SOPC_S_CMP_LE_I32; }
+    if (mop == MIR_OP_ICMP_SGE) { return GFX9_SOPC_S_CMP_GE_I32; }
+    return 0 - 1;
+}
+
+# Integer-compare MIR op → the VOPC vector-compare opcode (divergent path → VCC). When
+# the constant operand must move to src0 (vsrc1 is VGPR-only), `flip` reverses the
+# predicate so (b flip a) ≡ (a op b): lt↔gt, le↔ge; eq/ne are symmetric.
+fn _gisel_vcmp(mop, flip): i64 {
+    if (mop == MIR_OP_ICMP_EQ) { return GFX9_VOPC_V_CMP_EQ_U32; }
+    if (mop == MIR_OP_ICMP_NE) { return GFX9_VOPC_V_CMP_NE_U32; }
+    if (mop == MIR_OP_ICMP_ULT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GT_U32; }
+        return GFX9_VOPC_V_CMP_LT_U32;
+    }
+    if (mop == MIR_OP_ICMP_UGT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LT_U32; }
+        return GFX9_VOPC_V_CMP_GT_U32;
+    }
+    if (mop == MIR_OP_ICMP_ULE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GE_U32; }
+        return GFX9_VOPC_V_CMP_LE_U32;
+    }
+    if (mop == MIR_OP_ICMP_UGE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LE_U32; }
+        return GFX9_VOPC_V_CMP_GE_U32;
+    }
+    if (mop == MIR_OP_ICMP_SLT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GT_I32; }
+        return GFX9_VOPC_V_CMP_LT_I32;
+    }
+    if (mop == MIR_OP_ICMP_SGT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LT_I32; }
+        return GFX9_VOPC_V_CMP_GT_I32;
+    }
+    if (mop == MIR_OP_ICMP_SLE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GE_I32; }
+        return GFX9_VOPC_V_CMP_LE_I32;
+    }
+    if (mop == MIR_OP_ICMP_SGE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LE_I32; }
+        return GFX9_VOPC_V_CMP_GE_I32;
+    }
+    return 0 - 1;
 }
 
 # Select + emit the GFX9 instruction for one MIR instruction.
 fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RET) { return _gisel_emit(out, k, GISEL_S_ENDPGM, 0, 0, 0, 0, 0); }
+    # N.7 control flow. LABEL/BRANCH carry the label <id> in `a`; COND_BRANCH skips to
+    # its FALSE/merge target (c) when SCC==0 (the preceding S_CMP set SCC = condition).
+    if (op == MIR_OP_LABEL) { return _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0); }
+    if (op == MIR_OP_BRANCH) { return _gisel_emit(out, k, GISEL_S_BRANCH, 0, a, 0, 0, 0); }
+    # A UNIFORM cond branches on SCC (s_cbranch_scc0 → merge). A DIVERGENT cond needs
+    # the EXEC-mask sequence (s_and_saveexec_b64 + s_cbranch_execz + restore) — N.7c-2b.
+    if (op == MIR_OP_COND_BRANCH) {
+        if (mir_val_unif(m, a) == MIR_DIVERGENT) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        return _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, 0);
+    }
+    var sop = _gisel_cmp_sopc(op);
+    if (sop >= 0) {
+        if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        var cu = mir_val_unif(m, dst);
+        # UNIFORM compare → SCC via s_cmp.
+        if (cu == MIR_UNIFORM) {
+            return _gisel_emit(out, k, GISEL_S_CMP, 0, a, b, 0, flags | (sop << 8));
+        }
+        # DIVERGENT compare → VCC via v_cmp. vsrc1 must be a VGPR, so when the second
+        # operand is a constant, move it to src0 and flip the predicate.
+        if (cu == MIR_DIVERGENT) {
+            if (mir_val_kind(m, b) == MIR_VK_CONST) {
+                var vopf = _gisel_vcmp(op, 1);
+                return _gisel_emit(out, k, GISEL_V_CMP, 0, b, a, 0, flags | (vopf << 8));
+            }
+            var vop = _gisel_vcmp(op, 0);
+            return _gisel_emit(out, k, GISEL_V_CMP, 0, a, b, 0, flags | (vop << 8));
+        }
+        return 0 - GISEL_ERR_UNSUPPORTED_OP;
+    }
     if (op == MIR_OP_LOAD) {
         # b = ptr-table index; carry binding in flags bits 8+ (b stays immediate).
         return _gisel_emit(out, k, GISEL_GLOBAL_LOAD, dst, a, b, 0, flags | (mir_ptr_binding(m, b) << 8));
@@ -6676,14 +7082,52 @@ fn gfx9_isel(m, out, cap): i64 {
     var n = mir_n_instrs(m);
     var i = 0;
     var k = 0;
+    var pending_merge = 0;   # merge label of an open divergent if (0 = none; MVP = no nesting)
     while (i < n) {
         if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
-        var rc = _gisel_one(m, out, k, mir_instr_op(m, i), mir_instr_result(m, i),
-        mir_instr_a(m, i), mir_instr_b(m, i), mir_instr_c(m, i), mir_instr_flags(m, i));
-        if (rc < 0) { return rc; }
-        k = k + 1;
+        var op = mir_instr_op(m, i);
+        var a = mir_instr_a(m, i);
+        var c = mir_instr_c(m, i);
+        var handled = 0;
+        # A DIVERGENT cond branch opens the EXEC-mask region: save+mask EXEC, then skip
+        # the then-block entirely when no lane is active. The restore is emitted at merge.
+        if (op == MIR_OP_COND_BRANCH) {
+            if (mir_val_unif(m, a) == MIR_DIVERGENT) {
+                if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+                if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                _gisel_emit(out, k, GISEL_S_SAVEEXEC, 0, 0, 0, 0, 0);
+                _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, c, 0);
+                k = k + 2;
+                pending_merge = c;
+                handled = 1;
+            }
+        }
+        # Its merge label closes the region: the label points at the EXEC restore, so a
+        # skip OR a fall-through both land on it. Label first (records the offset), then
+        # the s_or_b64 restore as the first real instruction there.
+        if (handled == 0) {
+            if (op == MIR_OP_LABEL) {
+                if (pending_merge != 0) {
+                    if (a == pending_merge) {
+                        if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                        _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0);
+                        _gisel_emit(out, k + 1, GISEL_S_OR_EXEC, 0, 0, 0, 0, 0);
+                        k = k + 2;
+                        pending_merge = 0;
+                        handled = 1;
+                    }
+                }
+            }
+        }
+        if (handled == 0) {
+            var rc = _gisel_one(m, out, k, op, mir_instr_result(m, i),
+            a, mir_instr_b(m, i), c, mir_instr_flags(m, i));
+            if (rc < 0) { return rc; }
+            k = k + 1;
+        }
         i = i + 1;
     }
+    if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }   # unclosed divergent if
     return k;
 }
 
@@ -6862,7 +7306,7 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
 var GFX9_WAITCNT_VM      = 3952;  # 0x0F70: vmcnt(0), lgkm/exp don't-care
 var GFX9_WAITCNT_VM_LGKM = 112;   # 0x0070: vmcnt(0) AND lgkmcnt(0), exp don't-care
 
-# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52).
+# Error codes (disjoint from mir 20-25, lower 26-27, regalloc 50-52, cmp 70-87, gisel 100-101).
 var WC_ERR_CAP          = 60;   # output buffer cap exceeded
 var WC_ERR_TOO_MANY_IDS = 61;   # cap_ids beyond the outstanding-tracker scratch
 
@@ -6963,10 +7407,10 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, cap_out): i64 {
 # wgid*local_size + lid, materialized by a lowering step (later sub-bite); the
 # ABI only pins the primitive builtins.
 #
-# MVP scope: 1-D dispatch (TGID_X + LID.x); the .y/.z TGID/LID detection +
-# scalar push-constant slots refine in N.5g. Pure integer math; no syscalls.
-# Included after mir.cyr (reads the value table) and before gfx9_compile.cyr
-# (which resolves binding/builtin operands through these accessors).
+# Full 3-D dispatch: TGID_X/Y/Z + LID.x/y/z enables are derived from the max
+# component each builtin is actually extracted with (gfx9_abi_assign). Pure integer
+# math; no syscalls. Included after mir.cyr (reads the value table + instr list)
+# and before gfx9_compile.cyr (which resolves binding/builtin operands here).
 
 # COMPUTE_PGM_RSRC1: the fixed FLOAT_MODE(0xC0)+DX10_CLAMP flags with the VGPRS
 # (bits 0-5) and SGPRS (bits 6-9) fields ZEROED — the per-shader register counts
@@ -7015,12 +7459,17 @@ fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN
-# (bit 7), TGID_Y_EN (bit 8). (TGID_Z bit 9 + LDS/scratch fields are MVP-zero.)
-fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
+# (bit 7), TGID_Y_EN (bit 8), TGID_Z_EN (bit 9), TIDIG_COMP_CNT (bits 11-12 — the
+# number of LocalInvocationId components MINUS 1 the HW writes to v0/v1/v2). Without
+# the right TGID_*_EN / TIDIG_COMP_CNT the HW never loads wgid.y/z or lid.y/z, so a
+# 2-D/3-D kernel reads uninitialized registers (the N.6 2-D bug). (LDS/scratch zero.)
+fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, tgid_z, tidig_comp_cnt, trap): i64 {
     var r = (user_sgpr & 0x1F) << 1;
     if (trap != 0) { r = r | 0x40; }
     if (tgid_x != 0) { r = r | 0x80; }
     if (tgid_y != 0) { r = r | 0x100; }
+    if (tgid_z != 0) { r = r | 0x200; }
+    r = r | ((tidig_comp_cnt & 0x3) << 11);
     return r;
 }
 
@@ -7030,41 +7479,68 @@ fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
 fn gfx9_abi_assign(m, abi): i64 {
     var cap_ids = load64(m + 64);
     var max_binding = 0 - 1;
-    var use_tgid = 0;
-    var use_lid = 0;
     var i = 1;
     while (i < cap_ids) {
-        var k = mir_val_kind(m, i);
-        if (k == MIR_VK_BUFVAR) {
+        if (mir_val_kind(m, i) == MIR_VK_BUFVAR) {
             var bind = mir_val_payload(m, i);
             if (bind > max_binding) { max_binding = bind; }
         }
-        if (k == MIR_VK_BUILTIN) {
-            var bi = mir_val_payload(m, i);
-            if (bi == MIR_BI_WORKGROUP_ID) { use_tgid = 1; }
-            if (bi == MIR_BI_GLOBAL_INVOC_ID) {
-                use_tgid = 1;
-                use_lid = 1;
-            }
-            if (bi == MIR_BI_LOCAL_INVOC_ID) { use_lid = 1; }
-        }
         i = i + 1;
+    }
+    # The number of WorkgroupId / LocalInvocationId components the kernel actually
+    # uses is the MAX component subscript across its EXTRACT instructions on those
+    # builtins (the GlobalInvocationId expansion already lowered to wgid/lid extracts).
+    # That fixes how many TGID SGPRs / LID VGPRs the HW must preload — a 2-D kernel
+    # needs TGID_Y_EN + TIDIG_COMP_CNT=1, which the 1-D MVP never set.
+    var max_wgid = 0 - 1;
+    var max_lid  = 0 - 1;
+    var ni = mir_n_instrs(m);
+    var j = 0;
+    while (j < ni) {
+        if (mir_instr_op(m, j) == MIR_OP_EXTRACT) {
+            var a = mir_instr_a(m, j);
+            var comp = mir_instr_c(m, j);
+            if (a > 0) {
+                if (a < cap_ids) {
+                    if (mir_val_kind(m, a) == MIR_VK_BUILTIN) {
+                        var bi = mir_val_payload(m, a);
+                        if (bi == MIR_BI_WORKGROUP_ID) { if (comp > max_wgid) { max_wgid = comp; } }
+                        if (bi == MIR_BI_LOCAL_INVOC_ID) { if (comp > max_lid) { max_lid = comp; } }
+                    }
+                }
+            }
+        }
+        j = j + 1;
     }
     var num_bindings = max_binding + 1;
     var user_sgpr = num_bindings * 2;
     if (user_sgpr > GFX9_USER_DATA_MAX) { return 0 - ABI_ERR_TOO_MANY_BINDINGS; }
-    var lid = 0;
-    if (use_lid != 0) { lid = 1; }
+    # Enable TGID_X..TGID_{max_wgid} contiguously so wgid.comp maps to s[user+comp]
+    # (gfx9_abi_builtin_reg); likewise LID v0..v{max_lid}.
+    var tgid_x = 0;
+    var tgid_y = 0;
+    var tgid_z = 0;
+    if (max_wgid >= 0) { tgid_x = 1; }
+    if (max_wgid >= 1) { tgid_y = 1; }
+    if (max_wgid >= 2) { tgid_z = 1; }
+    var n_tgid = 0;
+    if (max_wgid >= 0) { n_tgid = max_wgid + 1; }
+    var lid_count = 0;
+    if (max_lid >= 0) { lid_count = max_lid + 1; }
     store64(abi + ABI_NUM_BINDINGS, num_bindings);
     store64(abi + ABI_USER_SGPR, user_sgpr);
-    store64(abi + ABI_TGID_X, use_tgid);
-    store64(abi + ABI_TGID_Y, 0);
-    store64(abi + ABI_TGID_Z, 0);
-    store64(abi + ABI_LID_COUNT, lid);
-    store64(abi + ABI_SGPR_BASE, user_sgpr + use_tgid);
-    store64(abi + ABI_VGPR_BASE, lid);
+    store64(abi + ABI_TGID_X, tgid_x);
+    store64(abi + ABI_TGID_Y, tgid_y);
+    store64(abi + ABI_TGID_Z, tgid_z);
+    store64(abi + ABI_LID_COUNT, lid_count);
+    store64(abi + ABI_SGPR_BASE, user_sgpr + n_tgid);
+    store64(abi + ABI_VGPR_BASE, lid_count);
     return 0;
 }
+
+# Number of LocalInvocationId components the kernel uses (v0..). RSRC2's
+# TIDIG_COMP_CNT = max(lid_count - 1, 0).
+fn gfx9_abi_lid_count(abi): i64 { return load64(abi + ABI_LID_COUNT); }
 
 # ================================================================
 # Accessors + operand resolution
@@ -7117,8 +7593,8 @@ fn gfx9_abi_builtin_reg(abi, bi_code, comp): i64 {
 # against it. Every SSA operand of a straight-line program is defined earlier in
 # the same list, so the map covers them all.
 
-# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52,
-# waitcnt 60-61).
+# Error codes (disjoint from mir 20-25, lower 26-27, regalloc 50-52, waitcnt 60-61,
+# gisel 100-101).
 var CMP_ERR_UNSUPPORTED_OP      = 70;   # a GISEL op N.5a does not encode yet
 var CMP_ERR_UNSUPPORTED_OPERAND = 71;   # a builtin/buffer/ptr operand (N.5b)
 var CMP_ERR_NO_VGPR_OPERAND     = 72;   # a VALU op with no VGPR operand for vsrc1
@@ -7134,6 +7610,8 @@ var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not 
 var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
 var CMP_ERR_TABLE               = 85;   # a type/const/deco table builder rejected the
 # input (malformed, or id_bound > CC_CAP_IDS) (N-HARDEN.1)
+var CMP_ERR_UNRESOLVED_LABEL    = 86;   # a branch targets a label not in the program (N.7)
+var CMP_ERR_TOO_MANY_BRANCHES   = 87;   # branch count exceeds the patch-list scratch (N.7)
 
 # Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
 # `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
@@ -7163,9 +7641,17 @@ var DESC_RSRC2        = 16;
 var DESC_USER_SGPR    = 24;
 var DESC_NUM_BINDINGS = 32;
 
-var CMP_ISEL_CAP  = 128;   # max selected instrs (caller sizes isel/isel2 to match)
+var CMP_ISEL_CAP  = 256;   # max selected instrs (caller sizes isel/isel2 to match) —
+# matched to the RA_MAX_REGS=256 id ceiling so a kernel at
+# the cap can still select an instr per value.
 var GFX9_SGPR_CAP = 104;   # GFX9 SGPR file limit (s0..s103) — the regalloc ceiling
 var GFX9_VGPR_CAP = 256;   # GFX9 VGPR file
+# Divergent control flow saves the old EXEC mask into a fixed 64-bit SGPR pair at the
+# top of the usable general-SGPR range (s[100:101] — s102+ are reserved for FLAT_SCRATCH
+# / XNACK / VCC on GFX9). When a kernel has divergent CF, the regalloc cap drops to this
+# so the pair is never allocated, and the rsrc1 SGPR count is bumped to cover s101.
+var GFX9_EXEC_SAVE_SGPR  = 100;
+var GFX9_EXEC_SAVE_COUNT = 102;   # general-SGPR count that covers s[100:101]
 
 # ================================================================
 # Operand resolution
@@ -7179,7 +7665,12 @@ fn _cmp_resolve(m, alloc, isvgpr, field, is_imm): i64 {
     if (is_imm != 0) { return gfx9_inline_int(field); }
     if (field == 0) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
     var k = mir_val_kind(m, field);
-    if (k == MIR_VK_CONST) { return gfx9_inline_int(mir_val_payload(m, field)); }
+    if (k == MIR_VK_CONST) {
+        # An f32 constant uses the float inline-operand codes (±0.5/1/2/4); integers use
+        # the integer inline range. Anything else resolves to a literal.
+        if (mir_val_type(m, field) == MIR_T_F32) { return gfx9_inline_float(mir_val_payload(m, field)); }
+        return gfx9_inline_int(mir_val_payload(m, field));
+    }
     if (k == MIR_VK_SSA) {
         var r = gfx9_reg(alloc, field);
         if (load64(isvgpr + field * 8) != 0) { return gfx9_vgpr(r); }
@@ -7235,6 +7726,17 @@ fn _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0));
     if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
     return p;
+}
+
+# GLSL FAbs(x) = clear the f32 sign bit: v_and_b32 dst, 0x7FFFFFFF, x (the mask rides
+# src0 as a trailing literal; x is vsrc1, so x must be a VGPR). Correct for finite/inf
+# (sign cleared) and nan (stays nan). One operand — no commutative-swap needed.
+fn _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var x = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (x < 0) { return x; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, dst, GFX9_SRC_LITERAL, x));
+    return gfx9_emit32(buf, p, 0x7FFFFFFF);
 }
 
 # VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
@@ -7317,16 +7819,91 @@ fn _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, sub_opc, subrev_opc): i64
 # VOP3 two-source (v_mul_lo_u32: VOP3-only on GFX9). vdst = a OP b. VOP3 has no
 # 32-bit-literal form, so a literal operand fails loud (an out-of-inline-range
 # constant must be materialized into a register — not needed for the MVP strides).
-fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc, scratch_vgpr): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
     var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
     if (src1 < 0) { return src1; }
+    var p = pos;
+    # VOP3a has no literal form, so a non-inline constant operand is first materialized
+    # into the scratch VGPR (the first free VGPR) via v_mov_b32. At most one operand is a
+    # literal (the other is a VGPR/inline); two literals are const-foldable (N.8+).
+    if (src0 == GFX9_SRC_LITERAL) {
+        if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+        if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_VOP3_LITERAL; }
+        p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, GFX9_SRC_LITERAL));
+        p = gfx9_emit32(buf, p, _cmp_lit(m, gisel_a(isel, i), fl & MIR_FLAG_A_IMM));
+        src0 = gfx9_vgpr(scratch_vgpr);
+    } else {
+        if (src1 == GFX9_SRC_LITERAL) {
+            if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_VOP3_LITERAL; }
+            p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, GFX9_SRC_LITERAL));
+            p = gfx9_emit32(buf, p, _cmp_lit(m, gisel_b(isel, i), fl & MIR_FLAG_B_IMM));
+            src1 = gfx9_vgpr(scratch_vgpr);
+        }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
+}
+
+# VOP3a 3-source (e.g. v_fma_f32). All three operands resolve to VGPR/SGPR/inline; VOP3
+# has no literal form, so a non-inline constant operand fails loud (3-src materialization
+# is N.8b+). Most FMA operands are computed VGPRs, so this is rarely hit.
+fn _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
     if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
-    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
+}
+
+# 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
+fn _cmp_operand_is_literal(m, field, is_imm): i64 {
+    if (is_imm != 0) {
+        if (gfx9_inline_int(field) == GFX9_SRC_LITERAL) { return 1; }
+        return 0;
+    }
+    if (field == 0) { return 0; }
+    if (mir_val_kind(m, field) != MIR_VK_CONST) { return 0; }
+    if (gfx9_inline_int(mir_val_payload(m, field)) == GFX9_SRC_LITERAL) { return 1; }
+    return 0;
+}
+
+# 1 if a global-store value operand is a constant — FLAT store data must be a VGPR, so
+# the constant is materialized into the scratch VGPR (any const, inline or literal).
+fn _cmp_store_value_is_const(m, field, fl): i64 {
+    if ((fl & MIR_FLAG_C_IMM) != 0) { return 1; }
+    if (field == 0) { return 0; }
+    if (mir_val_kind(m, field) == MIR_VK_CONST) { return 1; }
+    return 0;
+}
+
+# 1 if the program needs the materialization scratch VGPR: a VOP3a op with a literal
+# operand, OR a global store of a constant value. The driver then bumps the rsrc1 VGPR
+# count to cover the scratch.
+fn _cmp_needs_scratch(m, isel, ni): i64 {
+    var i = 0;
+    while (i < ni) {
+        var op = gisel_op(isel, i);
+        if (op == GISEL_V_MUL_LO_U32) {
+            var fl = gisel_flags(isel, i);
+            if (_cmp_operand_is_literal(m, gisel_a(isel, i), fl & MIR_FLAG_A_IMM) == 1) { return 1; }
+            if (_cmp_operand_is_literal(m, gisel_b(isel, i), fl & MIR_FLAG_B_IMM) == 1) { return 1; }
+        }
+        if (op == GISEL_GLOBAL_STORE) {
+            if (_cmp_store_value_is_const(m, gisel_c(isel, i), gisel_flags(isel, i)) == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # A FLAT address/data operand must be an SSA value living in a VGPR (a per-lane
@@ -7366,14 +7943,29 @@ fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
 
 # FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
 # flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
-fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
     if (vaddr < 0) { return vaddr; }
-    var data = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_c(isel, i));
-    if (data < 0) { return data; }
-    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    var cfield = gisel_c(isel, i);
+    var fl = gisel_flags(isel, i);
+    var p = pos;
+    var data = 0;
+    # FLAT store data must be a VGPR; a constant value is first materialized into the
+    # scratch VGPR with v_mov_b32 (inline or trailing-literal source).
+    if (_cmp_store_value_is_const(m, cfield, fl) == 1) {
+        if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_FLAT_NONVGPR; }
+        var v = _cmp_resolve(m, alloc, isvgpr, cfield, fl & MIR_FLAG_C_IMM);
+        if (v < 0) { return v; }
+        p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, v));
+        if (v == GFX9_SRC_LITERAL) { p = gfx9_emit32(buf, p, _cmp_lit(m, cfield, fl & MIR_FLAG_C_IMM)); }
+        data = scratch_vgpr;
+    } else {
+        data = _cmp_vgpr_operand(m, alloc, isvgpr, cfield);
+        if (data < 0) { return data; }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
 
@@ -7403,10 +7995,48 @@ fn _emit_extract(m, isel, i, alloc, abi, buf, pos): i64 {
     return 0 - CMP_ERR_UNSUPPORTED_BUILTIN;
 }
 
+# GISEL_S_CMP → SOPC scalar compare (sets SCC for the following s_cbranch). The SOPC
+# opcode rides in flags bits 8+. Operands resolve like SOP2: SGPR / inline / literal;
+# a VGPR operand is illegal (a divergent compare was rejected in isel → N.7c).
+fn _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var sopc_op = fl >> 8;
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var ssrc0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (ssrc0 < 0) { return ssrc0; }
+    var ssrc1 = _cmp_resolve(m, alloc, isvgpr, b, fl & MIR_FLAG_B_IMM);
+    if (ssrc1 < 0) { return ssrc1; }
+    if (ssrc0 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc1 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc0 == GFX9_SRC_LITERAL) { if (ssrc1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_TWO_LITERALS; } }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_sopc(sopc_op, ssrc0, ssrc1));
+    if (ssrc0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    if (ssrc1 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM)); }
+    return p;
+}
+
+# GISEL_V_CMP → VOPC vector compare (sets VCC for the EXEC-mask sequence). The VOPC
+# opcode rides in flags bits 8+. a = src0 (the full 9-bit operand: VGPR / inline /
+# literal), b = vsrc1 (a VGPR — isel guaranteed it by flipping a constant to src0).
+fn _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var vop = fl >> 8;
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var vsrc1 = _cmp_vgpr_operand(m, alloc, isvgpr, b);
+    if (vsrc1 < 0) { return vsrc1; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vopc(vop, src0, vsrc1));
+    if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    return p;
+}
+
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
-fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     var op = gisel_op(isel, i);
     if (op == GISEL_S_ADD_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_ADD_I32); }
     if (op == GISEL_S_SUB_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_SUB_I32); }
@@ -7428,6 +8058,13 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
         return _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_SUB_F32, GFX9_VOP2_V_SUBREV_F32);
     }
     if (op == GISEL_V_MUL_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MUL_F32, 0); }
+    if (op == GISEL_V_MIN_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MIN_F32, 0); }
+    if (op == GISEL_V_MAX_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MAX_F32, 0); }
+    if (op == GISEL_V_SQRT_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_SQRT_F32); }
+    if (op == GISEL_V_FLOOR_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_FLOOR_F32); }
+    if (op == GISEL_V_FMA_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32); }
+    if (op == GISEL_V_MED3_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MED3_F32); }
+    if (op == GISEL_V_ABS_F32) { return _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_LSHLREV_B32) {
         return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHLREV_B32, 1);
     }
@@ -7437,13 +8074,26 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_V_CVT_F32_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_I32); }
     if (op == GISEL_V_CVT_I32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F32); }
     if (op == GISEL_V_MUL_LO_U32) {
-        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32);
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32, scratch_vgpr);
     }
     if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
     if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
-    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos); }
+    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
+    if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    # Divergent-if EXEC mask: save+AND EXEC with VCC into the reserved pair; restore it.
+    if (op == GISEL_S_SAVEEXEC) {
+        return gfx9_emit32(buf, pos,
+        gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, GFX9_EXEC_SAVE_SGPR, GFX9_REG_VCC_LO));
+    }
+    if (op == GISEL_S_OR_EXEC) {
+        return gfx9_emit32(buf, pos,
+        gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_EXEC_SAVE_SGPR));
+    }
+    # LABEL / S_BRANCH / S_CBRANCH are handled in gfx9_emit_program's layout loop (they
+    # need the label-offset map + branch patch list), never here.
     return 0 - CMP_ERR_UNSUPPORTED_OP;
 }
 
@@ -7470,15 +8120,88 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         }
         i = i + 1;
     }
+    # The scratch VGPR for VOP3-literal materialization is the first free one: the VGPR
+    # high-water (ABI region + every allocated VGPR result). Matches gfx9_hw_vgpr(hw), so
+    # the driver's rsrc1 VGPR bump and this stay in lock-step.
+    var scratch_vgpr = gfx9_abi_vgpr_base(abi);
+    i = 0;
+    while (i < cap_ids) {
+        if (load64(&isvgpr + i * 8) != 0) {
+            var r = gfx9_reg(alloc, i);
+            if (r + 1 > scratch_vgpr) { scratch_vgpr = r + 1; }
+        }
+        i = i + 1;
+    }
+    # N.7 control flow: a LABEL emits 0 bytes but records its byte offset; a branch
+    # emits a placeholder simm16 and is patched after all labels are known (forward
+    # branches resolve here). laboff is id-indexed (-1 = unseen); the patch list pairs
+    # each branch's byte position with its target label.
+    var laboff[2048];   # cap_ids (<= RA_MAX_REGS 256) i64
+    memset(&laboff, 0xFF, cap_ids * 8);
+    var patch_off[2048];
+    var patch_tgt[2048];
+    var npatch = 0;
     var p = pos;
     i = 0;
     while (i < n_isel) {
-        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p);
-        if (rc < 0) { return rc; }
-        p = rc;
+        var op = gisel_op(isel, i);
+        if (op == GISEL_LABEL) {
+            store64(&laboff + gisel_a(isel, i) * 8, p);
+        } else {
+            if (op == GISEL_S_BRANCH) {
+                if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
+                store64(&patch_off + npatch * 8, p);
+                store64(&patch_tgt + npatch * 8, gisel_a(isel, i));
+                npatch = npatch + 1;
+                p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_BRANCH, 0));
+            } else {
+                if (op == GISEL_S_CBRANCH) {
+                    if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
+                    store64(&patch_off + npatch * 8, p);
+                    store64(&patch_tgt + npatch * 8, gisel_c(isel, i));
+                    npatch = npatch + 1;
+                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_SCC0, 0));
+                } else {
+                    if (op == GISEL_S_CBRANCH_EXECZ) {
+                        if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
+                        store64(&patch_off + npatch * 8, p);
+                        store64(&patch_tgt + npatch * 8, gisel_c(isel, i));
+                        npatch = npatch + 1;
+                        p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_EXECZ, 0));
+                    } else {
+                        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p, scratch_vgpr);
+                        if (rc < 0) { return rc; }
+                        p = rc;
+                    }
+                }
+            }
+        }
         i = i + 1;
     }
+    # Patch each branch: SOPP simm16 = (target - (branch + 4)) / 4 dwords (signed,
+    # PC-relative to the instruction after the branch).
+    var j = 0;
+    while (j < npatch) {
+        var boff = load64(&patch_off + j * 8);
+        var toff = load64(&laboff + load64(&patch_tgt + j * 8) * 8);
+        if (toff < 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        var simm = (toff - (boff + 4)) / 4;
+        var dw = load32(buf + boff);
+        store32(buf + boff, (dw & 0xFFFF0000) | (simm & 0xFFFF));
+        j = j + 1;
+    }
     return p;
+}
+
+# 1 if the selected list uses the divergent-if EXEC mask (an s_and_saveexec) — the
+# driver then reserves the saved-EXEC SGPR pair and bumps the rsrc1 SGPR count.
+fn _cmp_has_exec_save(isel, ni): i64 {
+    var i = 0;
+    while (i < ni) {
+        if (gisel_op(isel, i) == GISEL_S_SAVEEXEC) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # ================================================================
@@ -7518,8 +8241,13 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     if (ar < 0) { return ar; }
     var alloc = load64(ctx + CC_ALLOC);
     var hw = load64(ctx + CC_HW);
+    # A divergent if reserves s[100:101] for the saved EXEC, so the regalloc must not
+    # allocate that high (cap drops to GFX9_EXEC_SAVE_SGPR).
+    var div_cf = _cmp_has_exec_save(isel, ni);
+    var scap = GFX9_SGPR_CAP;
+    if (div_cf == 1) { scap = GFX9_EXEC_SAVE_SGPR; }
     var rr = gfx9_regalloc(m, isel, ni, gfx9_abi_sgpr_base(abi), gfx9_abi_vgpr_base(abi),
-    GFX9_SGPR_CAP, GFX9_VGPR_CAP, alloc, hw);
+    scap, GFX9_VGPR_CAP, alloc, hw);
     if (rr < 0) { return rr; }
     var isel2 = load64(ctx + CC_ISEL2);
     var ni2 = gfx9_waitcnt(m, isel, ni, isel2, CMP_ISEL_CAP);
@@ -7527,9 +8255,21 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     var ep = gfx9_emit_program(m, isel2, ni2, alloc, abi, isa, 0);
     if (ep < 0) { return ep; }
     ep = gfx9_emit_prefetch_pad(isa, ep);
-    var r1 = gfx9_rsrc1(gfx9_hw_vgpr(hw), gfx9_hw_sgpr(hw));
+    # The saved-EXEC pair lives at s[100:101], so the grant must cover s101 even though
+    # the regalloc high-water (allocated GPRs only) is lower.
+    var sgpr_count = gfx9_hw_sgpr(hw);
+    if (div_cf == 1) { if (sgpr_count < GFX9_EXEC_SAVE_COUNT) { sgpr_count = GFX9_EXEC_SAVE_COUNT; } }
+    # VOP3-literal materialization parks its constant in the first free VGPR
+    # (gfx9_hw_vgpr(hw)), so the grant must cover that one extra register.
+    var vgpr_count = gfx9_hw_vgpr(hw);
+    if (_cmp_needs_scratch(m, isel2, ni2) == 1) { vgpr_count = vgpr_count + 1; }
+    var r1 = gfx9_rsrc1(vgpr_count, sgpr_count);
     if (r1 < 0) { return r1; }
-    var r2 = gfx9_rsrc2(gfx9_abi_user_sgpr(abi), gfx9_abi_tgid_x(abi), gfx9_abi_tgid_y(abi), 1);
+    var lidc = gfx9_abi_lid_count(abi);
+    var tidig = 0;
+    if (lidc > 0) { tidig = lidc - 1; }
+    var r2 = gfx9_rsrc2(gfx9_abi_user_sgpr(abi), gfx9_abi_tgid_x(abi), gfx9_abi_tgid_y(abi),
+    gfx9_abi_tgid_z(abi), tidig, 1);
     store64(desc + DESC_ISA_LEN, ep);
     store64(desc + DESC_RSRC1, r1);
     store64(desc + DESC_RSRC2, r2);
@@ -9527,10 +10267,11 @@ rsrc1, rsrc2, b0_va, ntx, gx): i64 {
 # compiler's USER_DATA ABI — binding k → USER_DATA_{2k}/{2k+1} = s[2k:2k+1] — and
 # uses the compiler's RSRC1/RSRC2 verbatim (USER_SGPR = 2*n_binds, TGID enables).
 # No scratch (TMPRING=0): a compiled MVP kernel does not spill, and every USER_DATA
-# slot is a real binding. NUM_THREAD_X = LocalSize_x; grid = (gx,1,1). Returns the
-# 64-dword byte length.
+# slot is a real binding. NUM_THREAD_{X,Y,Z} = LocalSize; grid = (gx,gy,gz) work-
+# groups (the compiled kernel's WorkgroupId.y/z are enabled in rsrc2 by the ABI).
+# Returns the 64-dword byte length.
 fn native_pm4_build_compute_dispatch(buf, shader_va, rsrc1, rsrc2,
-binds, n_binds, ntx, gx): i64 {
+binds, n_binds, ntx, nty, ntz, gx, gy, gz): i64 {
     var pos = 0;
     pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, (shader_va >> 40) & 0xFF);
     var tm01[8];
@@ -9565,10 +10306,10 @@ binds, n_binds, ntx, gx): i64 {
     pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
     var nt[12];
     store32(&nt + 0, ntx);
-    store32(&nt + 4, 1);
-    store32(&nt + 8, 1);
+    store32(&nt + 4, nty);
+    store32(&nt + 8, ntz);
     pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
-    pos = native_pm4_dispatch_direct(buf, pos, gx, 1, 1, GFX9_DISPATCH_INITIATOR);
+    pos = native_pm4_dispatch_direct(buf, pos, gx, gy, gz, GFX9_DISPATCH_INITIATOR);
     var cur2 = pos / 4;
     if (cur2 < 64) { pos = native_pm4_nop(buf, pos, 64 - cur2); }
     return pos;
@@ -10468,6 +11209,62 @@ shader_handle, out_handle, queue, ip_type): i64 {
     return _native_neg_rc_to_gpu_err(rc);
 }
 
+# N.6 — the N-binding analog of native_compute_dispatch_cached_timeline: a COMPILED
+# kernel reading/writing N storage buffers, dispatched on a LOGICAL QUEUE's ring,
+# signalling the queue's persistent timeline (and consuming any pending cross-ring
+# barrier as an in-CS wait — same Q.4 contract as the deadbeef timeline path). BO
+# list = fence + stub + each binding + shader + ib (the cached_n shape). The caller
+# waits via gpu_queue_wait_idle / orders with gpu_queue_barrier.
+fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
+binds, n_binds, queue, ip_type): i64 {
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+    var fd  = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle  = native_ctx_stub_handle(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    # entries: fence(1) + stub(3) + each binding(3) + shader(4) + ib(10).
+    var entries[256];
+    var ne = 0;
+    store32(&entries + ne * 8, fence_handle);
+    store32(&entries + ne * 8 + 4, 1);
+    ne = ne + 1;
+    store32(&entries + ne * 8, stub_handle);
+    store32(&entries + ne * 8 + 4, 3);
+    ne = ne + 1;
+    var bi = 0;
+    while (bi < n_binds) {
+        store32(&entries + ne * 8, load64(binds + bi * 8));
+        store32(&entries + ne * 8 + 4, 3);
+        ne = ne + 1;
+        bi = bi + 1;
+    }
+    store32(&entries + ne * 8, shader_handle);
+    store32(&entries + ne * 8 + 4, 4);
+    ne = ne + 1;
+    store32(&entries + ne * 8, ib_handle);
+    store32(&entries + ne * 8 + 4, 10);
+    ne = ne + 1;
+    var bo_list_in[24];
+    store32(&bo_list_in + 0, 0xFFFFFFFF);
+    store32(&bo_list_in + 4, 0xFFFFFFFF);
+    store32(&bo_list_in + 8, ne);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
 # ================================================================
 # v3.2 X.4 — SDMA buffer-copy on the DMA ring (timeline path)
 # ================================================================
@@ -10954,6 +11751,7 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
 #   +48 nbind   (binding count — bindings k→USER_DATA s[2k:2k+1])
 #   +56 local_x (LocalSize.x → PM4 NUM_THREAD_X; must match the compiled shader)
 #   +64 isa_len (ISA byte length, incl. the prefetch pad)
+#   +72 local_y / +80 local_z (LocalSize.y/.z → NUM_THREAD_Y/Z — full 3-D geometry)
 var NATIVE_SHMOD_MAGIC_VAL = 0x4D42444153484D31;   # "MBDASHM1"
 var NATIVE_SHMOD_MAGIC   = 0;
 var NATIVE_SHMOD_HANDLE  = 8;
@@ -10964,13 +11762,17 @@ var NATIVE_SHMOD_RSRC2   = 40;
 var NATIVE_SHMOD_NBIND   = 48;
 var NATIVE_SHMOD_LOCALX  = 56;
 var NATIVE_SHMOD_ISALEN  = 64;
-var NATIVE_SHMOD_SIZE    = 72;
+var NATIVE_SHMOD_LOCALY  = 72;
+var NATIVE_SHMOD_LOCALZ  = 80;
+var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
+# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the compile
 # scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
-# → CMP_ERR_TABLE → this returns 0). 128 covers the MVP kernels; raising it grows
-# the stack frame (the tables are id-indexed). The MVP exit (downsample) used 45.
-var NATIVE_SHADER_CAP_IDS = 128;
+# → CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
+# free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
+# RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
+# further needs growing those internal scratch buffers (a deeper N.8 change).
+var NATIVE_SHADER_CAP_IDS = 256;
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
 # at a context-allocated VA, and return a magic-tagged shmod struct the compute
@@ -10987,15 +11789,15 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # (N.6r review, HIGH). 20 is the floor; full structural validation is the gate's.
     if (byte_len < 20) { return 0; }
 
-    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS ids ---
-    var types[3072];     # 128 * SPIRV_TYPE_REC(24)
-    var consts[2048];    # 128 * SPIRV_CONST_REC(16)
-    var deco[2048];      # 128 * SPIRV_DECO_REC(16)
-    var outbi[1024];     # 128 * 8
+    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
     var m[80];
-    var vals[5120];      # 128 * MIR_VAL_REC(40)
-    var instrs[8192];    # 256 * MIR_INSTR_REC(32)
-    var ptrs[1024];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[2048];      # 128 * MIR_PTR_REC(16)
     var blocks[32];
     # The MIR synth-id counter starts right after the SPIR-V ids (the header's
     # id_bound), so synthesized values (access-chain offsets, GID expansion) get
@@ -11003,11 +11805,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
     # table-build gate (CMP_ERR_TABLE).
     var idb = spirv_hdr_id_bound(words_ptr);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 256, 64, idb,
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 512, 128, idb,
     NATIVE_SHADER_CAP_IDS);
-    var isel[6144];      # CMP_ISEL_CAP(128) * GISEL_REC(48)
-    var isel2[6144];
-    var alloc[2048];     # 128 * RA_REC(16)
+    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
+    var isel2[12288];
+    var alloc[4096];     # 256 * RA_REC(16)
     var hw[16];
     var abi[64];
     var cc[88];
@@ -11030,7 +11832,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     if (isa_len <= 0)    { return 0; }
     if (isa_len > 8192)  { return 0; }
 
-    # --- LocalSize.x (drives PM4 NUM_THREAD_X; the kernel was compiled for it) ---
+    # --- LocalSize x/y/z (drive PM4 NUM_THREAD_X/Y/Z; the kernel was compiled for them) ---
     var entry = spirv_find_entry_point(words_ptr, byte_len);
     var lsz[24];
     store64(&lsz + 0, 1);
@@ -11038,7 +11840,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(&lsz + 16, 1);
     spirv_find_local_size(words_ptr, byte_len, entry, &lsz);
     var local_x = load64(&lsz + 0);
+    var local_y = load64(&lsz + 8);
+    var local_z = load64(&lsz + 16);
     if (local_x <= 0) { local_x = 1; }
+    if (local_y <= 0) { local_y = 1; }
+    if (local_z <= 0) { local_z = 1; }
 
     # --- stage the ISA in a GTT BO at a context-allocated VA ---
     var fd = native_ctx_fd(ctx);
@@ -11080,6 +11886,8 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(sh + NATIVE_SHMOD_NBIND, load64(&desc + DESC_NUM_BINDINGS));
     store64(sh + NATIVE_SHMOD_LOCALX, local_x);
     store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
+    store64(sh + NATIVE_SHMOD_LOCALY, local_y);
+    store64(sh + NATIVE_SHMOD_LOCALZ, local_z);
     return sh;
 }
 
@@ -11120,14 +11928,15 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
     return 0;
 }
 
-# N.6r — dispatch a COMPILED shmod through the generic N-binding composer. `x` is
-# the grid X (workgroup count); the shmod's LocalSize.x is NUM_THREAD_X. `bp` is a
-# count-prefixed binding array (the compiled-path binding ABI): bp+0 = count, then
-# count × (handle, va) 16-byte pairs. The count MUST equal the compiler's binding
-# count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a caller error. Bindings
-# are capped at 16 (the USER_DATA ceiling the ABI already enforces). Synchronous
-# (cached_n); a logical-queue/timeline compiled path is a later bite (see docs/development/3-2-punchlist.md).
-fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
+# N.6 — dispatch a COMPILED shmod through the generic N-binding composer. `(x,y,z)`
+# are the grid (workgroup counts); the shmod's LocalSize x/y/z are NUM_THREAD_X/Y/Z
+# (the kernel's enabled WorkgroupId dims are already encoded in rsrc2 by the ABI).
+# `bp` is a count-prefixed binding array (the compiled-path binding ABI): bp+0 =
+# count, then count × (handle, va) 16-byte pairs. The count MUST equal the
+# compiler's binding count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a
+# caller error. Bindings are capped at 16 (the USER_DATA ceiling the ABI enforces).
+# Synchronous (cached_n).
+fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq): i64 {
     if (bp == 0) { return GPU_ERR_OTHER; }
     var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
     var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
@@ -11135,9 +11944,13 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     var rsrc2   = load64(shmod + NATIVE_SHMOD_RSRC2);
     var nbind   = load64(shmod + NATIVE_SHMOD_NBIND);
     var local_x = load64(shmod + NATIVE_SHMOD_LOCALX);
+    var local_y = load64(shmod + NATIVE_SHMOD_LOCALY);
+    var local_z = load64(shmod + NATIVE_SHMOD_LOCALZ);
     if (nbind < 0)   { return GPU_ERR_OTHER; }
     if (nbind > 16)  { return GPU_ERR_OTHER; }
     if (local_x <= 0) { return GPU_ERR_OTHER; }
+    if (local_y <= 0) { return GPU_ERR_OTHER; }
+    if (local_z <= 0) { return GPU_ERR_OTHER; }
     # The caller's binding array count must match the kernel's binding count, else
     # we would load USER_DATA / residency from unrelated memory.
     if (load64(bp + 0) != nbind) { return GPU_ERR_OTHER; }
@@ -11153,7 +11966,14 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
-    &bind_vas, nbind, local_x, x);
+    &bind_vas, nbind, local_x, local_y, local_z, x, y, z);
+    # On a logical queue (cq != 0) signal its persistent timeline so the caller can
+    # order it via gpu_queue_barrier / wait via gpu_queue_wait_idle (the DMA-ring
+    # mis-route was rejected upstream). cq == 0 is the v3.0 synchronous single-ring path.
+    if (cq != 0) {
+        return native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes,
+        shader_handle, &bind_handles, nbind, cq, queue_ring(cq));
+    }
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
@@ -11192,18 +12012,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
     }
 
-    # N.6r — COMPILED-kernel path. A magic-tagged shmod (from
+    # N.6 — COMPILED-kernel path. A magic-tagged shmod (from
     # gpu_shader_module_create_spirv) carries the compiler's RSRC + binding count
     # + LocalSize, so we dispatch through the generic N-binding composer instead of
-    # the hardcoded deadbeef one below. The legacy (handle,va) pair has no magic
-    # and falls through to the v3.0 deadbeef path unchanged.
+    # the hardcoded deadbeef one below. Full 3-D grid (x,y,z workgroups) + 3-D
+    # LocalSize. The legacy (handle,va) pair has no magic and falls through to the
+    # v3.0 deadbeef path unchanged.
     if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
-        # MVP: the compiled path is 1-D (grid = x). Reject a multi-dim grid rather
-        # than silently dropping the y/z workgroups — fail loud beats wrong results.
-        # 2-D/3-D grid + 2-D LocalSize is the deferred N.6 TGID enhancement (see docs/development/3-2-punchlist.md).
-        if (y != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        if (z != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        return _native_dispatch_compiled(ctx, shmod, x, bp);
+        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq);
     }
 
     var stub_va = native_ctx_stub_va(ctx);

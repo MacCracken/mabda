@@ -666,10 +666,32 @@ hand-authored shaders stay as oracle + fallback.
     gate / dispatch binding guards / tag-checked release). Adversarially reviewed.
     *MVP scope:* 1-D grid (public `y`/`z` validated, compiled path uses `x`); SPIR-V
     `id_bound` ≤ 128; synchronous submit.
-  - [ ] **N.6 remainder (deferred enhancements, NOT MVP-blocking)** — the TGID/2-D
-    dispatch path (compiled `y`/`z` grid + 2-D LocalSize), a logical-queue/timeline
-    compiled dispatch, raising the `id_bound` ceiling, and a fuller differential CPU
-    oracle. None block the milestone (the public SPIR-V path is HW-proven).
+  - [x] **N.6 — 2-D / TGID compiled dispatch (2026-06-17) — HW-verified on Cezanne.**
+    `gfx9_abi_assign` derives TGID_X/Y/Z + LID component enables from the max
+    component each builtin is extracted with (MIR EXTRACT scan); `gfx9_rsrc2` gained
+    `tgid_z` + `tidig_comp_cnt`; `native_pm4_build_compute_dispatch` +
+    `_native_dispatch_compiled` carry full `(ntx,nty,ntz, gx,gy,gz)` + `local_y/z`.
+    Fixed the bug where `gid.y` aliased `gid.x` (HW never preloaded `wgid.y`/`lid.y`).
+    `programs/native_spirv_2d_dispatch_e2e.cyr` (4×4 global, 16/16 correct) +
+    `test_gfx9_abi_assign_2d` + the 2-D rsrc2 oracles.
+  - [x] **N.6 — timeline-queue compiled dispatch (2026-06-17) — HW-verified.**
+    `native_compute_dispatch_cached_n_timeline` (N-binding analog of the deadbeef
+    timeline submit) + the compiled dispatch routes to it on a current logical queue
+    (signals the queue's persistent timeline; consumes a pending cross-ring barrier
+    as an in-CS wait, Q.4 contract). `programs/native_spirv_queue_dispatch_e2e.cyr`
+    (`out[i]=3i+7` on the COMPUTE queue, `gpu_queue_wait_idle`, 8/8 correct).
+  - [x] **N.6 — id_bound ceiling 128 → 256 (2026-06-17).** `NATIVE_SHADER_CAP_IDS` +
+    `CMP_ISEL_CAP` raised to the ARCHITECTURAL max: `RA_MAX_REGS=256` sizes the
+    regalloc free-at scratch + the `gfx9_compile`/`gfx9_waitcnt` per-id file-maps, so
+    >256 is rejected by those stages and needs growing their internal scratch (N.8).
+  - [x] **N.6 — fuller CPU oracle (2026-06-17).** The 2-D path is CPU-cross-checked
+    (`test_gfx9_abi_assign` 1-D + `test_gfx9_abi_assign_2d` + the 2-D/3-D `gfx9_rsrc2`
+    oracles + the compiled-dispatch binding/grid guards); the six `native_spirv_*_e2e`
+    programs are the end-to-end differential oracle on real silicon. **N.6 COMPLETE.**
+  - [ ] **N.8 op-breadth carry: VOP3 literal materialization** — a VALU multiply by a
+    constant > 64 (no VOP3 inline form) → `CMP_ERR_VOP3_LITERAL`. Needs a `v_mov` of
+    the 32-bit literal into a register before the VOP3. Found via the N.6 2-D kernel
+    (`gid.x * 100`); worked around there with an inline (`*16`) multiplier.
   - [x] **N-HARDEN.1 (2026-06-17) — security, found during N.5g via adversarial
     review.** **Unchecked OOB write in the SPIR-V table builders on untrusted
     `id_bound`, now gated.** `spirv_build_type_table` / `_const_table` /
@@ -686,10 +708,101 @@ hand-authored shaders stay as oracle + fallback.
     to `CMP_ERR_TABLE`. +8 asserts (per-builder reject + untouched canary +
     `gfx9_compile` over-capacity integration reject). Landed **before** the N.6
     remainder exposes this path through `gpu_shader_module_create`.
-- [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
-  EXEC-mask); divergent-vs-uniform test matrix. May split into two bites.
-- [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
-  SPIR-V f32 compiler **complete**.
+- [x] **N.7** *(3.2.8)* **(2026-06-17) — COMPLETE, HW-verified on Cezanne.** Control
+  flow: uniform `if` (`s_cbranch_scc0`) + divergent `if` (EXEC mask). Loops / `OpPhi` /
+  nested ifs fail loud (N.8+).
+  - [x] **N.7a (2026-06-17) — control-flow encoders + byte-oracle.** SOPP branches
+    (`s_branch`, `s_cbranch_scc0/scc1`, `s_cbranch_execz/execnz`), the new
+    `gfx9_enc_sopc` + u32 `s_cmp_*` (→ SCC), and the EXEC-mask ops
+    (`s_and_saveexec_b64` / `s_andn2_b64` / `s_or_b64` / `s_mov_b64`) — all
+    llvm-mc-verified, +14 asserts (`test_gfx9_enc_control_flow`).
+  - [x] **N.7b — uniform `if` pipeline (2026-06-17) — COMPLETE, HW-verified on Cezanne.**
+    - [x] **N.7b-1 (2026-06-17) — control-flow front-end.** `OpLabel`/`OpBranch`/
+      `OpBranchConditional`/`OpSelectionMerge` + integer comparisons lower to new MIR
+      ops (`LABEL`/`BRANCH`/`COND_BRANCH`/`ICMP_*`), modelled as flat-list instructions
+      (no block array → no `mir_mod_init` change). Entry label skipped (straight-line
+      kernels unchanged); `ICMP` uniformity = meet of operands (`wgid.x==c` → uniform).
+      Loops + phi still fail loud. `test_spirv_lower_uniform_if` (+17 asserts).
+    - [x] **N.7b-2a (2026-06-17) — control-flow isel.** `LABEL`/`BRANCH`/`COND_BRANCH`/
+      `ICMP_*` → `GISEL_LABEL`/`S_BRANCH`/`S_CBRANCH`/`S_CMP` (SCC; SOPC op in flags<<8;
+      divergent compare fails loud → N.7c). Regalloc + s_waitcnt traverse the CF list
+      unchanged (new ops carry no SSA result). `test_gfx9_isel_uniform_if` (+15).
+    - [x] **N.7b-2b (2026-06-17) — emit + HW. The uniform `if` is COMPLETE.** Two-pass
+      branch layout in `gfx9_emit_program` (LABEL records its byte offset / 0 bytes;
+      branches patched `simm16 = (target-(branch+4))/4`); `_emit_sopc` for `S_CMP`.
+      `test_gfx9_compile_uniform_if` (empty-if → `s_cbranch_scc0 +1` / `s_branch +0`)
+      + `programs/native_spirv_uniform_if_e2e.cyr` HW-verified on Cezanne
+      (`if (wgid.x==0){out[gid.x]=gid.x+7}`, grid 2 → wg1 gated out, out[8..15] sentinel).
+      Straight-line kernels byte-identical (no LABEL/branch).
+  - [x] **N.7c — divergent `if`** (2026-06-17) — COMPLETE, HW-verified on Cezanne.
+    - [x] **N.7c-1 (2026-06-17) — VOPC `v_cmp` encoders.** `gfx9_enc_vopc` + u32
+      `v_cmp_*` (lt/eq/le/gt/ne/ge) → VCC, llvm-mc-verified (`test_gfx9_enc_vopc`, +7).
+    - [x] **N.7c-2a (2026-06-17) — divergent compare selection.** `_gisel_vcmp` +
+      `GISEL_V_CMP` (divergent ICMP → `v_cmp`→VCC; uniform stays `s_cmp`→SCC); constant
+      second operand → src0 + flipped predicate. `_emit_vopc` in the back-end. Divergent
+      COND_BRANCH fails loud (EXEC mask is N.7c-2b). +12 asserts.
+    - [x] **N.7c-2b (2026-06-17) — EXEC-masking branch + HW. The divergent `if` is
+      COMPLETE.** Divergent COND_BRANCH → `s_and_saveexec_b64` + `s_cbranch_execz`;
+      merge LABEL precedes its `s_or_b64` EXEC restore. Saved EXEC parks in `s[100:101]`
+      (regalloc cap→100 + rsrc1 SGPR bump, only when divergent CF — non-divergent kernels
+      byte-identical). Nested ifs fail loud (N.8). `native_spirv_divergent_if_e2e.cyr`
+      HW-verified on Cezanne (`if (gid.x<4){out[gid.x]=gid.x+7}`, one wave, lanes 4-7
+      masked, out[4..7] sentinel). +13 asserts.
+- [~] **N.8** *(3.2.8)* — Scalar SPIR-V f32 compiler **complete** (FAbs + const-fold
+  close it). **REVISED VERSION PLAN (maintainer, 2026-06-17):** the remaining big-ticket
+  op breadth is split across its own minors instead of one "N.8":
+  **3.2.8** = scalar f32 complete (N.8b-7 FAbs ✓ + N.8b-8 const-fold) →
+  **3.2.9** = int div/mod (no HW divide → reciprocal/Newton) →
+  **3.2.10** = vectors (component-wise vec2/3/4) →
+  **3.2.11** = per-ext-set tracking (verify `OpExtInst` set is GLSL.std.450) →
+  then resume the previously-roadmapped 3.2.x arc (Phase F f64, Phase R render-graph
+  multi-queue, …) which all shift down accordingly.
+  - [x] **N.8a (2026-06-17) — VOP3-literal materialization.** A non-inline constant
+    operand of a VOP3a op (`gid.x*100`) is materialized into the first-free scratch VGPR
+    via `v_mov_b32`, then used; rsrc1 VGPR count bumped only when materializing
+    (non-materializing kernels byte-identical). `native_spirv_mul_literal_e2e.cyr`
+    HW-verified on Cezanne. +7 asserts. Two-literal VOP3 still fails loud (const-fold).
+  - [x] **N.8b-1 (2026-06-17) — GLSL.std.450 math.** `OpExtInst` front end (assumes the
+    GLSL.std.450 set): FMin/FMax → `v_min_f32`/`v_max_f32` (VOP2), Sqrt → `v_sqrt_f32`
+    (VOP1); unknown numbers fail loud. `native_spirv_glsl_max_e2e.cyr` HW-verified on
+    Cezanne (exact f32). +17 asserts (lower parse + emit byte-exact).
+  - [x] **N.8b-2 (2026-06-17) — GLSL Floor + ternary Fma.** `Floor` → `v_floor_f32`
+    (VOP1); `Fma` → `v_fma_f32` (VOP3 3-src via the new `_emit_vop3_3src`; the ext-inst
+    handler gained ternary arity). `native_spirv_fma_e2e.cyr` HW-verified on Cezanne
+    (gid²+gid, exact f32). +15 asserts. A non-inline FLOAT const in a VOP3 fails loud.
+  - [x] **N.8b-3 (2026-06-17) — float inline constants.** `gfx9_inline_float`
+    (±0.5/1/2/4 → 240..247) + `_cmp_resolve` routes f32 consts through it.
+    `native_spirv_fma_const_e2e.cyr` (`fma(gid,2.0,1.0)`=2·gid+1) HW-verified on Cezanne.
+    `0.25` is NOT inline → downsample byte/RSRC oracle unchanged (verified). +14 asserts.
+    VOP2 still needs the const in src0 (operand placement → N.8b-4).
+  - [x] **N.8b-4 (2026-06-17) — signed int compares + GLSL FClamp.** SLT/SGT/SLE/SGE →
+    i32 SOPC/VOPC (EQ/NE stay sign-agnostic); FClamp → `v_med3_f32`. HW-verified on
+    Cezanne (`native_spirv_signed_if_e2e.cyr`, `native_spirv_fclamp_e2e.cyr`). +33 asserts.
+  - [x] **N.8b-5 (2026-06-17) — store-constant materialization.** `out[i]=<const>` —
+    the constant is materialized into the scratch VGPR (`v_mov_b32`) before the FLAT store
+    (SSA stores byte-identical). HW-verified on Cezanne (`native_spirv_store_const_e2e.cyr`,
+    `out[gid.x]=0xCAFE`). +7 asserts.
+  - [x] **N.8b-6 (2026-06-17) — VOP2 const-operand (ALREADY IMPLEMENTED; verified +
+    covered).** `_emit_vop2`'s commutative path already swaps a non-VGPR operand into src0;
+    with N.8b-3 inline floats, `x*2.0`/`x+1.0`/`x|5` all compile. HW-verified
+    (`native_spirv_vop2_const_e2e.cyr`, `float(gid.x)*2.0`) + byte-exact CPU test (+5).
+    No new src code — the N.8b-3 "VOP2 placement pending" note was wrong.
+  - [x] **N.8b-7 (2026-06-17) — GLSL FAbs.** `abs(x)` → `v_and_b32 x, 0x7FFFFFFF` (clear
+    the sign bit; correct for finite/±inf/nan/±0). HW-verified on Cezanne
+    (`native_spirv_fabs_e2e.cyr`, `abs(float(gid.x)-4.0)`). +7 asserts. Also rebased the
+    GISEL error codes 40/41 → 100/101 (op enum reached 41).
+  - [x] **N.8b-8 (2026-06-17) — const-fold two-literal ops. SCALAR f32 COMPILER
+    COMPLETE.** `_spirv_both_const` + `_spirv_const_fold` (int i64-masked, float via the
+    f32/f64 builtins) fold a two-const binary op into one constant at lowering time.
+    HW-verified on Cezanne (`native_spirv_const_fold_e2e.cyr`, `gid.x+6*7`). +14 asserts;
+    the gid-kernel fixtures' `1<<2` now folds (tests updated) + uniform-SALU coverage moved
+    to `test_gfx9_regalloc_uniform_salu`. **→ ready to cut 3.2.8.**
+  - [ ] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide; lower UDiv/SDiv/
+    UMod/SMod via the reciprocal + Newton-Raphson correction expansion.
+  - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+  - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
+    verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
+    Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
 
 ---
 
