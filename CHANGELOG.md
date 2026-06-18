@@ -15,6 +15,29 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.10b (component-wise vector arithmetic + constant-index buffer access, HW-verified)
+- **Component-wise vector arithmetic** (`src/spirv_lower.cyr`, `_spirv_lower_vec_binop`): a
+  vecN ALU op (`OpFAdd`/`OpFMul`/`OpIAdd`/…) lowers to **N scalar ops** over the packed
+  components (routed ahead of the scalar const-fold). Each operand is a vecN of matching
+  count+base type (component-wise) or a scalar (broadcast to every lane); count/base
+  mismatches fail loud. The scalar back end is reused unchanged.
+- **Constant-index buffer access enabler** (`_spirv_lower_access_chain`): a constant
+  `OpAccessChain` array index now **materializes its byte offset into a VGPR** (`v_mov_b32`)
+  instead of folding to a `const_off` the FLAT load/store emitter cannot consume. Every prior
+  native kernel indexed by the dynamic `gl_GlobalInvocationID`, so the constant-index → FLAT
+  path was never exercised end-to-end (it returned `CMP_ERR_FLAT_CONST_OFFSET`); this is what
+  lets a single-workgroup vector kernel address `a[0]`/`a[1]`/`a[2]`. The immediate-offset
+  FLAT form remains a later optimization.
+- **HW**: `programs/native_spirv_vector_add_e2e.cyr` — a vec3 kernel (`vec3(a0,a1,a2)` +
+  `vec3(b0,b1,b2)` component-wise add → `out[0..2]`, multiply → `out[3..5]`) compiled in-tree
+  and **value-exact on Cezanne** (`[5,7,9]` / `[4,10,18]`).
+- CPU suite +19 (`test_spirv_lower_vec_binop`: component-wise FADD via the dispatch, scalar
+  broadcast, count/base-type mismatch guards; plus a high-bit-index regression test proving a
+  `0xFFFFFFFF` array index is caught by the overflow guard — `load32` zero-extends, so the
+  VMOV materialization never sees a negative offset); the constant-index access-chain test
+  updated for the VGPR-materialized offset. Bite adversarially reviewed (3 findings, all
+  false alarms — bindings HW-confirmed, high-bit index overflow-guarded).
+
 ### Added — Phase N.10a (vector infrastructure + `OpCompositeConstruct` / `OpCompositeExtract`)
 - **Scalarize-on-lower vectors** (3.2.10 groundwork): a vecN is a new `MIR_VK_VECTOR` value
   whose payload packs its N component scalar `<id>`s (16 bits each, low component first); the

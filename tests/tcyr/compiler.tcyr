@@ -1202,6 +1202,59 @@ fn test_spirv_vec_robustness() {
     return 0;
 }
 
+# N.10b — component-wise vector arithmetic: a vecN OpFAdd lowers to N scalar FADDs over the
+# packed components; a scalar operand broadcasts to every lane; count / base-type mismatches
+# fail loud.
+fn test_spirv_lower_vec_binop() {
+    var buf[64];
+    store32(&buf + 12, 64);   # id bound (word 3)
+    var types[1536];          # 64 ids * 24 bytes
+    memset(&types, 0, 1536);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 64);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 64);   # vec3<f32>
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    mir_set_const(&m, 10, MIR_T_F32, 0x3F800000); mir_set_const(&m, 11, MIR_T_F32, 0x40000000);
+    mir_set_const(&m, 12, MIR_T_F32, 0x40400000); mir_set_const(&m, 13, MIR_T_F32, 0x3F800000);
+    mir_set_const(&m, 14, MIR_T_F32, 0x40000000); mir_set_const(&m, 15, MIR_T_F32, 0x40400000);
+    mir_set_const(&m, 16, MIR_T_F32, 0x40800000);   # scalar (broadcast)
+    mir_set_vector(&m, 30, MIR_T_F32 | (3 << 8), 10 | (11 << 16) | (12 << 32));
+    mir_set_vector(&m, 31, MIR_T_F32 | (3 << 8), 13 | (14 << 16) | (15 << 32));
+    # component-wise OpFAdd %6 %32 %30 %31 via the full dispatch (off 5, wc 5)
+    store32(&buf + 20, (5 << 16) | 129);   # OpFAdd
+    store32(&buf + 24, 6); store32(&buf + 28, 32);
+    store32(&buf + 32, 30); store32(&buf + 36, 31);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 129, &types, 0, 0, &m, &lsz), 0, "vec fadd ok");
+    assert_eq(mir_is_vector(&m, 32), 1, "result is a vector");
+    assert_eq(mir_type_count(mir_val_type(&m, 32)), 3, "result vec3");
+    assert_eq(mir_n_instrs(&m), 3, "3 component FADDs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_FADD, "comp0 op FADD");
+    assert_eq(mir_instr_a(&m, 0), 10, "comp0 a = va.x");
+    assert_eq(mir_instr_b(&m, 0), 13, "comp0 b = vb.x");
+    assert_eq(mir_instr_a(&m, 2), 12, "comp2 a = va.z");
+    assert_eq(mir_instr_b(&m, 2), 15, "comp2 b = vb.z");
+    assert_eq(mir_vec_comp(&m, 32, 0), mir_instr_result(&m, 0), "vec comp0 = FADD0 result");
+    assert_eq(mir_vec_comp(&m, 32, 2), mir_instr_result(&m, 2), "vec comp2 = FADD2 result");
+    # broadcast: a scalar operand applies to every lane (direct call, FMUL)
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FMUL, MIR_T_F32 | (3 << 8), 33, 30, 16), 0, "broadcast ok");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_FMUL, "broadcast op FMUL");
+    assert_eq(mir_instr_a(&m, 3), 10, "broadcast a = va.x");
+    assert_eq(mir_instr_b(&m, 3), 16, "broadcast b = scalar (lane 0)");
+    assert_eq(mir_instr_b(&m, 5), 16, "broadcast b = scalar (lane 2)");
+    # count mismatch (vec2 operand vs vec3 result) and base-type mismatch (vec3<u32> vs f32) fail
+    mir_set_vector(&m, 34, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FADD, MIR_T_F32 | (3 << 8), 35, 34, 31) < 0, 1, "count mismatch fails");
+    mir_set_vector(&m, 36, MIR_T_U32 | (3 << 8), 13 | (14 << 16) | (15 << 32));
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FADD, MIR_T_F32 | (3 << 8), 37, 36, 31) < 0, 1, "base mismatch fails");
+    return 0;
+}
+
 # The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
 # variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
 fn test_spirv_lower_seed_bufvar() {
@@ -1574,12 +1627,13 @@ fn test_spirv_lower_access_chain_variants() {
     var instrs[1024];
     var ptrs[128];
     var blocks[32];
-    # constant array index -> folds to a const byte offset (dynamic 0, no IMUL)
+    # constant array index -> the byte offset is VMOV-materialized into a VGPR (N.10b: the
+    # FLAT emitter needs a VGPR per-lane offset), so the ptr is dynamic with const_off 0.
     var n = _spv_build_saxpy(&buf);
     store32(&buf + 468, 16);   # first access chain array index %19 -> %16 (const 0)
     assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks), 0, "const-index lower ok");
-    assert_eq(mir_ptr_dynamic(&m, 0), 0, "const index -> not dynamic");
-    assert_eq(mir_ptr_const_off(&m, 0), 0, "const index 0 -> offset 0");
+    assert_eq(mir_ptr_dynamic(&m, 0), 1, "const index -> VGPR-materialized offset");
+    assert_eq(mir_ptr_const_off(&m, 0), 0, "const_off folded into the VGPR (0)");
     # integer const array index whose byte offset overflows i32 -> MIR_ERR_OVERFLOW.
     # Repoint %15 to the uint type so it is an integer const of value 0x40000000.
     _spv_build_saxpy(&buf);
@@ -1587,6 +1641,15 @@ fn test_spirv_lower_access_chain_variants() {
     store32(&buf + 468, 15);   # array index -> %15 (uint 0x40000000; *4 overflows)
     assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
     0 - MIR_ERR_OVERFLOW, "offset overflow");
+    # a high-bit index (0xFFFFFFFF, the bit pattern of a signed -1) is NOT a negative offset:
+    # load32 zero-extends, so it reads as 4294967295 and is caught by the same overflow guard
+    # — the N.10b VMOV materialization is never reached with a negative byte offset.
+    _spv_build_saxpy(&buf);
+    store32(&buf + 308, 4);            # %15 -> uint
+    store32(&buf + 316, 0xFFFFFFFF);   # %15 value = 0xFFFFFFFF (high bit set)
+    store32(&buf + 468, 15);           # array index -> %15
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
+    0 - MIR_ERR_OVERFLOW, "high-bit index rejected (no negative offset)");
     # non-integer (float) const array index -> BAD_ACCESS_CHAIN (review N.2b-2 #2:
     # the bits must not be reinterpreted as an index).
     _spv_build_saxpy(&buf);
@@ -3592,6 +3655,7 @@ fn main(): i64 {
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();
     test_spirv_vec_robustness();
+    test_spirv_lower_vec_binop();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
     test_gfx9_emit_fma_inline_float();

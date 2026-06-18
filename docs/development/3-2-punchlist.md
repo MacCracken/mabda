@@ -843,9 +843,14 @@ hand-authored shaders stay as oracle + fallback.
       component for all vec3 builtins; Construct requires scalar CONST/SSA operands. **Deferred
       (fail loud):** vector/nested operands to Construct + non-scalar-per-component arity —
       land with broader Construct breadth later in N.10.
-    - [ ] **N.10b — component-wise binary arith + first HW.** vec `OpFAdd/FMul/...` → N
-      scalar ops + scalar broadcast; HW e2e on Cezanne (vec3 add/mul via scalar-array
-      construct/extract).
+    - [x] **N.10b (2026-06-18) — component-wise binary arith + first vector HW.** vec
+      `OpFAdd/FMul/...` → N scalar ops (`_spirv_lower_vec_binop`) + scalar broadcast +
+      count/base guards. **Plus a prerequisite enabler:** a constant `OpAccessChain` index now
+      VMOV-materializes its byte offset into a VGPR (the FLAT emitter requires a VGPR offset;
+      prior kernels only ever used the dynamic gid offset, so constant-index access returned
+      `CMP_ERR_FLAT_CONST_OFFSET`). HW: `native_spirv_vector_add_e2e.cyr` vec3 add+mul
+      value-exact on Cezanne (+18 CPU asserts). The immediate-offset FLAT form (avoid the
+      extra VMOV) is a later optimization.
     - [ ] **N.10c — vector load/store.** `ArrayStride` parse + vector `OpAccessChain` /
       `OpLoad` / `OpStore` (N consecutive scalar loads/stores); HW (`array<vec4>`).
     - [ ] **N.10d — `OpConstantComposite` + splat.** Vector constants; HW.
