@@ -40,6 +40,8 @@ var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not 
 var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
 var CMP_ERR_TABLE               = 85;   # a type/const/deco table builder rejected the
 # input (malformed, or id_bound > CC_CAP_IDS) (N-HARDEN.1)
+var CMP_ERR_UNRESOLVED_LABEL    = 86;   # a branch targets a label not in the program (N.7)
+var CMP_ERR_TOO_MANY_BRANCHES   = 87;   # branch count exceeds the patch-list scratch (N.7)
 
 # Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
 # `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
@@ -311,6 +313,27 @@ fn _emit_extract(m, isel, i, alloc, abi, buf, pos): i64 {
     return 0 - CMP_ERR_UNSUPPORTED_BUILTIN;
 }
 
+# GISEL_S_CMP → SOPC scalar compare (sets SCC for the following s_cbranch). The SOPC
+# opcode rides in flags bits 8+. Operands resolve like SOP2: SGPR / inline / literal;
+# a VGPR operand is illegal (a divergent compare was rejected in isel → N.7c).
+fn _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var sopc_op = fl >> 8;
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var ssrc0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (ssrc0 < 0) { return ssrc0; }
+    var ssrc1 = _cmp_resolve(m, alloc, isvgpr, b, fl & MIR_FLAG_B_IMM);
+    if (ssrc1 < 0) { return ssrc1; }
+    if (ssrc0 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc1 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (ssrc0 == GFX9_SRC_LITERAL) { if (ssrc1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_TWO_LITERALS; } }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_sopc(sopc_op, ssrc0, ssrc1));
+    if (ssrc0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    if (ssrc1 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM)); }
+    return p;
+}
+
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
@@ -352,6 +375,9 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
+    if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    # LABEL / S_BRANCH / S_CBRANCH are handled in gfx9_emit_program's layout loop (they
+    # need the label-offset map + branch patch list), never here.
     return 0 - CMP_ERR_UNSUPPORTED_OP;
 }
 
@@ -378,13 +404,55 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         }
         i = i + 1;
     }
+    # N.7 control flow: a LABEL emits 0 bytes but records its byte offset; a branch
+    # emits a placeholder simm16 and is patched after all labels are known (forward
+    # branches resolve here). laboff is id-indexed (-1 = unseen); the patch list pairs
+    # each branch's byte position with its target label.
+    var laboff[2048];   # cap_ids (<= RA_MAX_REGS 256) i64
+    memset(&laboff, 0xFF, cap_ids * 8);
+    var patch_off[2048];
+    var patch_tgt[2048];
+    var npatch = 0;
     var p = pos;
     i = 0;
     while (i < n_isel) {
-        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p);
-        if (rc < 0) { return rc; }
-        p = rc;
+        var op = gisel_op(isel, i);
+        if (op == GISEL_LABEL) {
+            store64(&laboff + gisel_a(isel, i) * 8, p);
+        } else {
+            if (op == GISEL_S_BRANCH) {
+                if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
+                store64(&patch_off + npatch * 8, p);
+                store64(&patch_tgt + npatch * 8, gisel_a(isel, i));
+                npatch = npatch + 1;
+                p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_BRANCH, 0));
+            } else {
+                if (op == GISEL_S_CBRANCH) {
+                    if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
+                    store64(&patch_off + npatch * 8, p);
+                    store64(&patch_tgt + npatch * 8, gisel_c(isel, i));
+                    npatch = npatch + 1;
+                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_SCC0, 0));
+                } else {
+                    var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p);
+                    if (rc < 0) { return rc; }
+                    p = rc;
+                }
+            }
+        }
         i = i + 1;
+    }
+    # Patch each branch: SOPP simm16 = (target - (branch + 4)) / 4 dwords (signed,
+    # PC-relative to the instruction after the branch).
+    var j = 0;
+    while (j < npatch) {
+        var boff = load64(&patch_off + j * 8);
+        var toff = load64(&laboff + load64(&patch_tgt + j * 8) * 8);
+        if (toff < 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        var simm = (toff - (boff + 4)) / 4;
+        var dw = load32(buf + boff);
+        store32(buf + boff, (dw & 0xFFFF0000) | (simm & 0xFFFF));
+        j = j + 1;
     }
     return p;
 }

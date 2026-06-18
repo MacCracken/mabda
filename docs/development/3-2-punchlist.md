@@ -715,7 +715,7 @@ hand-authored shaders stay as oracle + fallback.
     `gfx9_enc_sopc` + u32 `s_cmp_*` (→ SCC), and the EXEC-mask ops
     (`s_and_saveexec_b64` / `s_andn2_b64` / `s_or_b64` / `s_mov_b64`) — all
     llvm-mc-verified, +14 asserts (`test_gfx9_enc_control_flow`).
-  - [~] **N.7b — uniform `if` pipeline.**
+  - [x] **N.7b — uniform `if` pipeline (2026-06-17) — COMPLETE, HW-verified on Cezanne.**
     - [x] **N.7b-1 (2026-06-17) — control-flow front-end.** `OpLabel`/`OpBranch`/
       `OpBranchConditional`/`OpSelectionMerge` + integer comparisons lower to new MIR
       ops (`LABEL`/`BRANCH`/`COND_BRANCH`/`ICMP_*`), modelled as flat-list instructions
@@ -726,10 +726,13 @@ hand-authored shaders stay as oracle + fallback.
       `ICMP_*` → `GISEL_LABEL`/`S_BRANCH`/`S_CBRANCH`/`S_CMP` (SCC; SOPC op in flags<<8;
       divergent compare fails loud → N.7c). Regalloc + s_waitcnt traverse the CF list
       unchanged (new ops carry no SSA result). `test_gfx9_isel_uniform_if` (+15).
-    - [ ] **N.7b-2b — emit + HW.** Two-pass byte layout in `gfx9_emit_program`: pass 1
-      records each LABEL's byte offset + emits branches with a placeholder simm16; a
-      patch pass sets each branch's `simm16 = (target - (branch+4))/4`. Plus an
-      `if (wgid.x==0){ out[lid.x]=… }` HW e2e on Cezanne (grid 2 → only wg0 writes).
+    - [x] **N.7b-2b (2026-06-17) — emit + HW. The uniform `if` is COMPLETE.** Two-pass
+      branch layout in `gfx9_emit_program` (LABEL records its byte offset / 0 bytes;
+      branches patched `simm16 = (target-(branch+4))/4`); `_emit_sopc` for `S_CMP`.
+      `test_gfx9_compile_uniform_if` (empty-if → `s_cbranch_scc0 +1` / `s_branch +0`)
+      + `programs/native_spirv_uniform_if_e2e.cyr` HW-verified on Cezanne
+      (`if (wgid.x==0){out[gid.x]=gid.x+7}`, grid 2 → wg1 gated out, out[8..15] sentinel).
+      Straight-line kernels byte-identical (no LABEL/branch).
   - [ ] **N.7c — divergent `if`** — per-lane condition via `s_and_saveexec_b64` +
     `s_cbranch_execz` skip + `s_or_b64` EXEC restore at the merge; divergent e2e.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

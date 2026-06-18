@@ -2434,6 +2434,59 @@ fn test_gfx9_isel_uniform_if() {
     return 0;
 }
 
+# N.7b-2b — compile the uniform-if end to end (gfx9_compile) and check the two-pass
+# branch resolution: the s_cbranch_scc0 skips the then's s_branch (simm 1), and the
+# then's s_branch falls through to the merge (simm 0). Both bytes llvm-mc-shaped.
+fn test_gfx9_compile_uniform_if() {
+    var buf[640];
+    var n = _spv_build_uniform_if(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
+    var isel[1536];
+    var isel2[1536];
+    var alloc[512];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 24);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "uniform-if compiles end-to-end");
+    # Scan the ISA for the resolved branches.
+    var saw_cbranch = 0;
+    var saw_branch = 0;
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var w = 0;
+    while (w < isa_len) {
+        var dw = load32(&isa + w);
+        if (dw == 0xBF840001) { saw_cbranch = 1; }   # s_cbranch_scc0 +1 (skip the s_branch)
+        if (dw == 0xBF820000) { saw_branch = 1; }     # s_branch +0 (then → merge fall-through)
+        w = w + 4;
+    }
+    assert_eq(saw_cbranch, 1, "s_cbranch_scc0 +1 (skip then to merge)");
+    assert_eq(saw_branch, 1, "s_branch +0 (then to merge)");
+    return 0;
+}
+
 # N.5c review (CRITICAL): the validate gate returns POSITIVE codes, so gfx9_compile
 # must reject malformed SPIR-V with `!= 0`, not `< 0` (which never fired and let
 # bad input reach the table builders). A bad-magic module must fail loud here.
@@ -2667,6 +2720,7 @@ fn main(): i64 {
     test_spirv_lower_gid_expansion();
     test_spirv_lower_uniform_if();
     test_gfx9_isel_uniform_if();
+    test_gfx9_compile_uniform_if();
     test_spirv_lower_synth_exhaustion();
     test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();

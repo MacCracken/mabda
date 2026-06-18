@@ -15,6 +15,19 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7b-2b (control-flow back-end + HW — the uniform `if` is complete)
+- **A compiled SPIR-V kernel with a uniform `if` runs correctly on Cezanne.**
+  `programs/native_spirv_uniform_if_e2e.cyr`: `if (gl_WorkGroupID.x == 0) { out[gid.x]
+  = gid.x + 7; }` over a 2-workgroup grid — workgroup 0 writes `out[0..7]`, and the
+  `s_cbranch_scc0` gates workgroup 1 out entirely (`out[8..15]` stays the sentinel).
+- `src/gfx9_compile.cyr` — `gfx9_emit_program` gained a **two-pass branch layout**: a
+  `LABEL` emits 0 bytes but records its byte offset; `S_BRANCH`/`S_CBRANCH` emit with
+  a placeholder `simm16` and are patched afterward (`simm16 = (target − (branch+4))/4`,
+  so forward branches resolve). `_emit_sopc` emits `S_CMP` (the SOPC opcode from
+  `flags`>>8). Straight-line kernels are byte-identical (no LABEL/branch). +3 asserts
+  (`test_gfx9_compile_uniform_if`: the empty-if resolves to `s_cbranch_scc0 +1` +
+  `s_branch +0`). **N.7b — the uniform `if` — is complete.** (Divergent `if` is N.7c.)
+
 ### Added — Phase N.7b-2a (control-flow instruction selection)
 - **The control-flow MIR ops now select to GFX9.** `src/gfx9_isel.cyr`: `MIR_OP_LABEL`
   → `GISEL_LABEL` (0-byte marker), `MIR_OP_BRANCH` → `GISEL_S_BRANCH`,
