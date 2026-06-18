@@ -15,6 +15,21 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7c-2a (divergent compare selection — `ICMP` → `v_cmp` → VCC)
+- **A divergent integer compare now selects to `v_cmp` (VCC), not `s_cmp` (SCC).**
+  `src/gfx9_isel.cyr`: `_gisel_vcmp` (MIR compare op → VOPC opcode) + `GISEL_V_CMP`; a
+  divergent `ICMP` lowers to `V_CMP`, a uniform one stays `S_CMP`. Because VOPC's
+  `vsrc1` is VGPR-only, when the second operand is a constant the isel moves it to
+  `src0` and **flips the predicate** (`gid < 8` ⇒ `v_cmp_gt_u32 vcc, 8, gid`).
+- `src/gfx9_compile.cyr`: `_emit_vopc` (resolves src0 via the shared operand path,
+  `vsrc1` as a VGPR, VOPC opcode from `flags`>>8, trailing literal when needed) +
+  the `GISEL_V_CMP` dispatch. regalloc + waitcnt already scan operands generically, so
+  a divergent VGPR feeding a `v_cmp` extends its interval and waits on an outstanding
+  load with no per-op change.
+- **A divergent COND_BRANCH fails loud** (the EXEC-mask sequence is N.7c-2b) — never
+  mis-emits an SCC branch on a VCC predicate. +12 asserts (`test_gfx9_isel_divergent_compare`
+  covers both the flip and no-flip operand orders; `test_gfx9_isel_divergent_branch_rejected`).
+
 ### Added — Phase N.7c-1 (VOPC `v_cmp` encoders — divergent-branch foundation)
 - **The GFX9 vector-compare encoder, llvm-mc gfx900-verified.** `src/gfx9_encode.cyr`:
   `gfx9_enc_vopc` + the u32 `v_cmp_*` opcodes (`lt`/`eq`/`le`/`gt`/`ne`/`ge`) — a

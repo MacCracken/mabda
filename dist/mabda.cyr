@@ -6670,6 +6670,9 @@ var GISEL_LABEL         = 28;
 var GISEL_S_BRANCH      = 29;
 var GISEL_S_CBRANCH     = 30;
 var GISEL_S_CMP         = 31;
+# V_CMP: a DIVERGENT compare → the implicit VCC mask (N.7c). dst = 0 (VCC is implicit),
+# a = src0 (9-bit operand, VGPR/inline), b = vsrc1 (a VGPR), VOPC opcode in flags 8+.
+var GISEL_V_CMP         = 32;
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -6768,6 +6771,31 @@ fn _gisel_cmp_sopc(mop): i64 {
     return 0 - 1;
 }
 
+# Integer-compare MIR op → the VOPC vector-compare opcode (divergent path → VCC). When
+# the constant operand must move to src0 (vsrc1 is VGPR-only), `flip` reverses the
+# predicate so (b flip a) ≡ (a op b): lt↔gt, le↔ge; eq/ne are symmetric.
+fn _gisel_vcmp(mop, flip): i64 {
+    if (mop == MIR_OP_ICMP_EQ) { return GFX9_VOPC_V_CMP_EQ_U32; }
+    if (mop == MIR_OP_ICMP_NE) { return GFX9_VOPC_V_CMP_NE_U32; }
+    if (mop == MIR_OP_ICMP_ULT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GT_U32; }
+        return GFX9_VOPC_V_CMP_LT_U32;
+    }
+    if (mop == MIR_OP_ICMP_UGT) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LT_U32; }
+        return GFX9_VOPC_V_CMP_GT_U32;
+    }
+    if (mop == MIR_OP_ICMP_ULE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_GE_U32; }
+        return GFX9_VOPC_V_CMP_LE_U32;
+    }
+    if (mop == MIR_OP_ICMP_UGE) {
+        if (flip == 1) { return GFX9_VOPC_V_CMP_LE_U32; }
+        return GFX9_VOPC_V_CMP_GE_U32;
+    }
+    return 0 - 1;
+}
+
 # Select + emit the GFX9 instruction for one MIR instruction.
 fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RET) { return _gisel_emit(out, k, GISEL_S_ENDPGM, 0, 0, 0, 0, 0); }
@@ -6775,14 +6803,31 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     # its FALSE/merge target (c) when SCC==0 (the preceding S_CMP set SCC = condition).
     if (op == MIR_OP_LABEL) { return _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0); }
     if (op == MIR_OP_BRANCH) { return _gisel_emit(out, k, GISEL_S_BRANCH, 0, a, 0, 0, 0); }
-    if (op == MIR_OP_COND_BRANCH) { return _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, 0); }
+    # A UNIFORM cond branches on SCC (s_cbranch_scc0 → merge). A DIVERGENT cond needs
+    # the EXEC-mask sequence (s_and_saveexec_b64 + s_cbranch_execz + restore) — N.7c-2b.
+    if (op == MIR_OP_COND_BRANCH) {
+        if (mir_val_unif(m, a) == MIR_DIVERGENT) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        return _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, 0);
+    }
     var sop = _gisel_cmp_sopc(op);
     if (sop >= 0) {
-        # The MVP lowers only UNIFORM comparisons (→ SCC via s_cmp); a divergent
-        # compare needs v_cmp → VCC + EXEC masking (N.7c). Fail loud otherwise.
         if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
-        if (mir_val_unif(m, dst) != MIR_UNIFORM) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
-        return _gisel_emit(out, k, GISEL_S_CMP, 0, a, b, 0, flags | (sop << 8));
+        var cu = mir_val_unif(m, dst);
+        # UNIFORM compare → SCC via s_cmp.
+        if (cu == MIR_UNIFORM) {
+            return _gisel_emit(out, k, GISEL_S_CMP, 0, a, b, 0, flags | (sop << 8));
+        }
+        # DIVERGENT compare → VCC via v_cmp. vsrc1 must be a VGPR, so when the second
+        # operand is a constant, move it to src0 and flip the predicate.
+        if (cu == MIR_DIVERGENT) {
+            if (mir_val_kind(m, b) == MIR_VK_CONST) {
+                var vopf = _gisel_vcmp(op, 1);
+                return _gisel_emit(out, k, GISEL_V_CMP, 0, b, a, 0, flags | (vopf << 8));
+            }
+            var vop = _gisel_vcmp(op, 0);
+            return _gisel_emit(out, k, GISEL_V_CMP, 0, a, b, 0, flags | (vop << 8));
+        }
+        return 0 - GISEL_ERR_UNSUPPORTED_OP;
     }
     if (op == MIR_OP_LOAD) {
         # b = ptr-table index; carry binding in flags bits 8+ (b stays immediate).
@@ -7615,6 +7660,23 @@ fn _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     return p;
 }
 
+# GISEL_V_CMP → VOPC vector compare (sets VCC for the EXEC-mask sequence). The VOPC
+# opcode rides in flags bits 8+. a = src0 (the full 9-bit operand: VGPR / inline /
+# literal), b = vsrc1 (a VGPR — isel guaranteed it by flipping a constant to src0).
+fn _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var vop = fl >> 8;
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var vsrc1 = _cmp_vgpr_operand(m, alloc, isvgpr, b);
+    if (vsrc1 < 0) { return vsrc1; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vopc(vop, src0, vsrc1));
+    if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    return p;
+}
+
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
@@ -7657,6 +7719,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
     # LABEL / S_BRANCH / S_CBRANCH are handled in gfx9_emit_program's layout loop (they
     # need the label-offset map + branch patch list), never here.
     return 0 - CMP_ERR_UNSUPPORTED_OP;

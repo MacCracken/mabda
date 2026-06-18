@@ -2449,6 +2449,63 @@ fn test_gfx9_isel_uniform_if() {
     return 0;
 }
 
+# N.7c-2a — a DIVERGENT compare selects to v_cmp → VCC (not s_cmp → SCC). When the
+# second operand is a constant it can't ride vsrc1 (VGPR-only), so isel moves it to
+# src0 and flips the predicate; (gid < 8) ⇒ v_cmp_gt_u32 vcc, 8, gid.
+fn test_gfx9_isel_divergent_compare() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);                          # bound (constant)
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);  # divergent
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);   # divergent
+    mir_emit(&m, MIR_OP_ICMP_ULT, 4, MIR_T_U32, 2, 1, 0, 0);    # (gid < 8)  → flip
+    mir_emit(&m, MIR_OP_ICMP_ULT, 5, MIR_T_U32, 2, 3, 0, 0);    # (gid < lid) → no flip
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 4), MIR_DIVERGENT, "gid<8 divergent");
+    var isel[512];
+    var ni = gfx9_isel(&m, &isel, 16);
+    assert_eq(ni, 3, "3 selected (2 v_cmp + endpgm)");
+    # gid < 8: b is the constant → moved to src0, predicate flipped lt → gt.
+    assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp (divergent compare)");
+    assert_eq(gisel_flags(&isel, 0) >> 8, GFX9_VOPC_V_CMP_GT_U32, "v_cmp op = gt_u32 (flipped)");
+    assert_eq(gisel_a(&isel, 0), 1, "src0 = the constant %1");
+    assert_eq(gisel_b(&isel, 0), 2, "vsrc1 = gid %2 (VGPR)");
+    # gid < lid: both VGPR → direct, predicate kept lt, operand order preserved.
+    assert_eq(gisel_op(&isel, 1), GISEL_V_CMP, "1: v_cmp (both divergent)");
+    assert_eq(gisel_flags(&isel, 1) >> 8, GFX9_VOPC_V_CMP_LT_U32, "v_cmp op = lt_u32 (no flip)");
+    assert_eq(gisel_a(&isel, 1), 2, "src0 = gid %2");
+    assert_eq(gisel_b(&isel, 1), 3, "vsrc1 = lid %3");
+    assert_eq(gisel_op(&isel, 2), GISEL_S_ENDPGM, "2: s_endpgm");
+    return 0;
+}
+
+# N.7c-2a — a DIVERGENT cond branch is rejected here; its EXEC-mask sequence lands in
+# N.7c-2b (docs/development/3-2-punchlist.md). isel fails loud rather than mis-emit an
+# SCC branch on a VCC predicate.
+fn test_gfx9_isel_divergent_branch_rejected() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);    # divergent cond
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 5, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[512];
+    var ni = gfx9_isel(&m, &isel, 16);
+    assert_eq(ni < 0, 1, "divergent cond branch fails loud (EXEC mask is N.7c-2b)");
+    return 0;
+}
+
 # N.7b-2b — compile the uniform-if end to end (gfx9_compile) and check the two-pass
 # branch resolution: the s_cbranch_scc0 skips the then's s_branch (simm 1), and the
 # then's s_branch falls through to the merge (simm 0). Both bytes llvm-mc-shaped.
@@ -2736,6 +2793,8 @@ fn main(): i64 {
     test_spirv_lower_gid_expansion();
     test_spirv_lower_uniform_if();
     test_gfx9_isel_uniform_if();
+    test_gfx9_isel_divergent_compare();
+    test_gfx9_isel_divergent_branch_rejected();
     test_gfx9_compile_uniform_if();
     test_spirv_lower_synth_exhaustion();
     test_gfx9_compile_rejects_malformed();

@@ -736,10 +736,14 @@ hand-authored shaders stay as oracle + fallback.
   - [~] **N.7c — divergent `if`** (per-lane condition via EXEC masking).
     - [x] **N.7c-1 (2026-06-17) — VOPC `v_cmp` encoders.** `gfx9_enc_vopc` + u32
       `v_cmp_*` (lt/eq/le/gt/ne/ge) → VCC, llvm-mc-verified (`test_gfx9_enc_vopc`, +7).
-    - [ ] **N.7c-2 — EXEC-masking pipeline + HW.** Divergent ICMP → `v_cmp` (VCC);
-      divergent COND_BRANCH → `s_and_saveexec_b64 saved, vcc` + `s_cbranch_execz merge`;
-      `s_or_b64 exec, exec, saved` restore at the merge (needs a 64-bit saved-EXEC SGPR
-      pair — reserve above the regalloc range). Divergent `if (gid.x<8){…}` HW e2e.
+    - [x] **N.7c-2a (2026-06-17) — divergent compare selection.** `_gisel_vcmp` +
+      `GISEL_V_CMP` (divergent ICMP → `v_cmp`→VCC; uniform stays `s_cmp`→SCC); constant
+      second operand → src0 + flipped predicate. `_emit_vopc` in the back-end. Divergent
+      COND_BRANCH fails loud (EXEC mask is N.7c-2b). +12 asserts.
+    - [ ] **N.7c-2b — EXEC-masking branch + HW.** Divergent COND_BRANCH →
+      `s_and_saveexec_b64 saved, vcc` + `s_cbranch_execz merge`; `s_or_b64 exec, exec,
+      saved` restore at the merge (needs a 64-bit saved-EXEC SGPR pair — reserve above
+      the regalloc range). Divergent `if (gid.x<4){…}` HW e2e (partial-wave masking).
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
   SPIR-V f32 compiler **complete**.
 
