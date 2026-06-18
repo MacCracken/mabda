@@ -15,6 +15,32 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase F.3 (f64 shader gate — create-time fail-loud)
+- **`spirv_uses_f64(ptr, byte_len)`** (`src/spirv_parse.cyr`): scans for `OpCapability Float64`
+  (cap 10) — the reusable "does this module compute in f64" primitive (bounded + zero-wordcount-
+  safe on untrusted bytes; usable by the native gate now and the F.8 wgpu probe later).
+- **Native create-time f64 gate** (`src/backend_native.cyr`): an f64 SPIR-V module is rejected
+  up front (returns 0) while `MABDA_NATIVE_F64 == 0` (pre-F.7) — an explicit feature decision,
+  not a deeper `gfx9_compile` failure on the 64-bit float type. F.7 flips `MABDA_NATIVE_F64` and
+  the gate opens.
+- **Design adaptation:** the proposal's *dispatch-time* guard is enforced at **create** instead.
+  Native rejects f64 at create (this gate / the compiler's 64-bit-type rejection in
+  `_mir_lower_type`); wgpu f64 is simply **not functional until F.8** wires the passthrough path
+  (the launcher must request `SpirvShaderPassthrough` in `requiredFeatures` — the reference
+  `deps/wgpu_main.c` does not yet; review F.2/F.3), so no f64 wgpu module successfully creates or
+  dispatches either. A dispatch guard — plus a flag threaded onto the opaque shader-module handle
+  — would therefore never fire. The consumer's primary contract stays the F.2 capability check
+  (`gpu_caps_shader_f64` = 0 → attn11 hard-fails before creating); this create gate is the
+  secondary defense.
+- **Hardening (adversarial review):** `spirv_uses_f64` — and the sibling scanners
+  `spirv_find_entry_point` / `spirv_find_local_size` — now bound each instruction
+  (`off + wc > total → stop`) before reading operands, closing an out-of-bounds read on a
+  truncated instruction at the stream end / a non-multiple-of-4 `byte_len` (`spirv_uses_f64` runs
+  on untrusted bytes *before* full validation, so this matters most there).
+- CPU suite +5 (`compiler_encode.tcyr`: Float64 detected / absent / header-only-no-loop /
+  truncated-OpCapability-no-OOB / odd-byte_len-bounded); `native_spirv_smod_e2e` (a non-f64
+  native kernel) still runs value-exact on Cezanne (no false-reject).
+
 ### Added — Phase F.2 (per-backend f64 detection)
 - **native** (`src/backend_native.cyr`): `MABDA_NATIVE_F64` (0) + `gpu_caps_native_shader_f64()`
   → 0. GFX9+ HW *runs* f64 (the throttled FP64 ALU exists on Cezanne), but mabda has no native

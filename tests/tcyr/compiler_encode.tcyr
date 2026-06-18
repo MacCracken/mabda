@@ -464,6 +464,31 @@ fn test_spirv_decoration_table() {
     return 0;
 }
 
+# v3.2 F.3 — the f64 shader gate keys on `OpCapability Float64` (cap 10). spirv_uses_f64
+# detects it (and is bounded / zero-wordcount-safe on untrusted bytes).
+fn test_spirv_uses_f64() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203);   # magic
+    store32(&buf + 12, 8);           # id bound
+    # OpCapability Shader (1) at word 5, OpCapability Float64 (10) at word 7 — byte_len 36
+    store32(&buf + 20, (2 << 16) | 17); store32(&buf + 24, 1);
+    store32(&buf + 28, (2 << 16) | 17); store32(&buf + 32, 10);
+    assert_eq(spirv_uses_f64(&buf, 36), 1, "OpCapability Float64 detected");
+    store32(&buf + 32, 1);   # second capability -> Shader, no Float64
+    assert_eq(spirv_uses_f64(&buf, 36), 0, "no Float64 capability -> 0");
+    # a header-only / too-small module has no capabilities -> 0 (and does not loop)
+    assert_eq(spirv_uses_f64(&buf, 20), 0, "header-only module -> 0");
+    # review F.3: a truncated OpCapability at the stream end (header fits, operand word does not)
+    # must return 0 WITHOUT an out-of-bounds operand read (this runs on untrusted bytes).
+    var b2[64];
+    store32(&b2 + 0, 0x07230203); store32(&b2 + 12, 8);
+    store32(&b2 + 20, (2 << 16) | 17);   # OpCapability (wc 2) at word 5; stream ends at word 6
+    assert_eq(spirv_uses_f64(&b2, 24), 0, "truncated OpCapability at end -> 0 (no OOB read)");
+    # a non-multiple-of-4 byte_len is bounded (no read past total*4 = byte_len floor)
+    assert_eq(spirv_uses_f64(&b2, 23), 0, "odd byte_len -> 0 (bounded)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
     test_gfx9_enc_vop1();
@@ -481,6 +506,7 @@ fn main(): i64 {
     test_gfx9_rebuild_store_deadbeef_byte_identical();
     test_spirv_header_accessors();
     test_spirv_op_decode();
+    test_spirv_uses_f64();
     test_spirv_validate_stream_valid();
     test_spirv_validate_stream_rejects();
     test_spirv_count_instructions();

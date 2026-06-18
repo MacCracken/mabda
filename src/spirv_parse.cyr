@@ -36,6 +36,10 @@ var SPIRV_OP_LABEL          = 248;
 var SPIRV_EXEC_MODEL_GLCOMPUTE = 5;
 var SPIRV_EXEC_MODE_LOCAL_SIZE = 17;
 
+# OpCapability operand for double-precision floats (SPIR-V spec, Capability). A module that
+# computes in f64 declares `OpCapability Float64`; v3.2 F.3 keys the f64 shader gate on it.
+var SPIRV_CAPABILITY_FLOAT64   = 10;
+
 # The header is 5 words (20 bytes); instructions begin at word index 5.
 var SPIRV_HEADER_WORDS = 5;
 
@@ -128,12 +132,42 @@ fn spirv_count_instructions(ptr, byte_len): i64 {
 #   word0 | ExecutionModel (word1) | entry <id> (word2) | name... | iface...
 # The wc >= 3 guard keeps the word1/word2 reads inside the instruction even if a
 # (validated-but-odd) stream carries a short OpEntryPoint.
+# v3.2 F.3 — does this module compute in f64? Scans for `OpCapability Float64` — the
+# spec-MANDATED marker for f64 (SPIR-V §2.4: a module using the Float64 type MUST declare it),
+# so detecting the capability is the correct conformant-input signal. (A non-conformant module
+# that uses 64-bit OpTypeFloat WITHOUT the capability would slip this gate, but is then caught
+# downstream by _mir_lower_type rejecting the 64-bit float type — defense in depth.) Runs on
+# untrusted bytes (the shader-create f64 gate, BEFORE full validation), so it bounds the stream,
+# breaks on a zero word-count, and stops before a truncated instruction's operands. 1 if f64.
+fn spirv_uses_f64(ptr, byte_len): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0; }
+        # A truncated instruction (its words run past the stream) is malformed — stop before
+        # reading an operand past the buffer (this runs on untrusted bytes pre-validation, and
+        # also covers a non-multiple-of-4 byte_len, where total = byte_len/4 floors). F.3 review.
+        if (off + wc > total) { return 0; }
+        if (spirv_op(w0) == SPIRV_OP_CAPABILITY) {
+            if (wc >= 2) {
+                if (spirv_word(ptr, off + 1) == SPIRV_CAPABILITY_FLOAT64) { return 1; }
+            }
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
 fn spirv_find_entry_point(ptr, byte_len): i64 {
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
     while (off < total) {
         var w0 = spirv_word(ptr, off);
         var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - 1; }
+        if (off + wc > total) { return 0 - 1; }   # truncated instruction — operand reads would OOB
         if (spirv_op(w0) == SPIRV_OP_ENTRY_POINT) {
             if (wc >= 3) {
                 if (spirv_word(ptr, off + 1) == SPIRV_EXEC_MODEL_GLCOMPUTE) {
@@ -156,6 +190,8 @@ fn spirv_find_local_size(ptr, byte_len, entry_id, out_xyz): i64 {
     while (off < total) {
         var w0 = spirv_word(ptr, off);
         var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0; }
+        if (off + wc > total) { return 0; }   # truncated instruction — x/y/z reads would OOB
         if (spirv_op(w0) == SPIRV_OP_EXECUTION_MODE) {
             if (wc >= 6) {
                 if (spirv_word(ptr, off + 1) == entry_id) {

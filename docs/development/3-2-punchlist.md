@@ -902,7 +902,15 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   reference launcher doesn't request passthrough yet so it returns 0 today (review #3); the honest
   wgpu f64 detect (compose the gate + a real-module probe + the launcher request) is **F.8**, so
   F.2 populates NO wgpu f64 field. +5 core asserts.
-- [ ] **F.3** *(3.2.12)* — Shader-module f64 flag + fail-loud dispatch guard.
+- [x] **F.3** *(3.2.12)* (2026-06-18) — f64 shader gate. `spirv_uses_f64` (`spirv_parse.cyr`)
+  scans `OpCapability Float64` (bounded, zero-wc-safe); the native shader-create rejects an f64
+  module up front while `MABDA_NATIVE_F64 == 0` (pre-F.7). **Adapted** the proposal's dispatch
+  guard to **create-time** — both backends already reject f64-on-unsupported at create (native
+  gate/compiler; wgpu f64 non-functional until F.8 wires passthrough + the launcher request), so
+  a dispatch guard + a flag on the opaque shmod would never fire; the F.2 cap check stays the
+  consumer's primary hard-fail. **Adversarial review:** closed an OOB operand read in
+  `spirv_uses_f64` + the sibling scanners (`off + wc > total` bound, for untrusted/odd-length
+  bytes). +5 asserts; non-f64 native kernel (`smod_e2e`) unaffected on Cezanne.
 - [ ] **F.4** *(3.2.12)* — `native_gfx9_shader_fma_f64` hand-authored
   reference kernel (`V_FMA_F64`, doubled-VGPR RSRC1); llvm-mc byte-pinned.
 - [ ] **F.5** *(3.2.12)* — `native_pm4_build_compute_fma_f64` composer.
