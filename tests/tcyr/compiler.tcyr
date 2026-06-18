@@ -219,6 +219,22 @@ fn test_gfx9_enc_vopc() {
     return 0;
 }
 
+# N.8b-3 — the f32 inline-operand codes (no literal dword): ±0.5/1/2/4 → 240..247.
+# Anything else (0.25, 3.7, ...) resolves to a literal.
+fn test_gfx9_inline_float() {
+    assert_eq(gfx9_inline_float(0x3F000000), 240, "0.5");
+    assert_eq(gfx9_inline_float(0xBF000000), 241, "-0.5");
+    assert_eq(gfx9_inline_float(0x3F800000), 242, "1.0");
+    assert_eq(gfx9_inline_float(0xBF800000), 243, "-1.0");
+    assert_eq(gfx9_inline_float(0x40000000), 244, "2.0");
+    assert_eq(gfx9_inline_float(0xC0000000), 245, "-2.0");
+    assert_eq(gfx9_inline_float(0x40800000), 246, "4.0");
+    assert_eq(gfx9_inline_float(0xC0800000), 247, "-4.0");
+    assert_eq(gfx9_inline_float(0x3E800000), GFX9_SRC_LITERAL, "0.25 → literal (not inline)");
+    assert_eq(gfx9_inline_float(0x40490FDB), GFX9_SRC_LITERAL, "pi → literal");
+    return 0;
+}
+
 # ================================================================
 # SMEM — s_load_dwordx{2,4,8} (textured FS descriptor loads, two dwords)
 # ================================================================
@@ -2173,6 +2189,42 @@ fn test_gfx9_emit_glsl_fma_floor() {
     return 0;
 }
 
+# N.8b-3 — FMA with f32 inline constants: fma(v3, 2.0, 1.0) packs 2.0→244 and 1.0→242
+# directly into the VOP3 source fields (no literal dword, no scratch). Bytes are llvm-mc
+# truth (v_fma_f32 v5, v3, 2.0, 1.0).
+fn test_gfx9_emit_fma_inline_float() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # gid → v3
+    mir_set_const(&m, 10, MIR_T_F32, 0x40000000);                       # 2.0
+    mir_set_const(&m, 11, MIR_T_F32, 0x3F800000);                       # 1.0
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # fma → v5
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_FMA_F32, 12, 9, 10, 11, 0);           # v5 = v3*2.0 + 1.0
+    _gisel_emit(&isel, 2, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 12 * 16, 5);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    assert_eq(endp, 16, "fma-inline-float program end at 16 bytes (no literal dword)");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
+    assert_eq(load32(&built + 4), 0xD1CB0005, "v_fma_f32 v5,v3,2.0,1.0 lo");
+    assert_eq(load32(&built + 8), 0x03C9E903, "v_fma_f32 hi (v3, 2.0=244, 1.0=242)");
+    assert_eq(load32(&built + 12), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.5b-2 review: the FLAT emitters must FAIL LOUD on the operand shapes they do
 # not yet handle (see docs/development/3-2-punchlist.md), rather than emitting
 # v255 / an SGPR index / a wrapped binding.
@@ -2994,6 +3046,7 @@ fn main(): i64 {
     test_gfx9_enc_sopp();
     test_gfx9_enc_control_flow();
     test_gfx9_enc_vopc();
+    test_gfx9_inline_float();
     test_gfx9_enc_smem();
     test_gfx9_enc_flat();
     test_gfx9_rebuild_store_deadbeef_byte_identical();
@@ -3046,6 +3099,7 @@ fn main(): i64 {
     test_spirv_lower_glsl_extinst();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
+    test_gfx9_emit_fma_inline_float();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();
     test_gfx9_isel_extract_unknown_unif();

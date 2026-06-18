@@ -5105,6 +5105,22 @@ fn gfx9_inline_int(k): i64 {
     return GFX9_SRC_LITERAL;
 }
 
+# An f32 inline-constant as a 9-bit VOP src operand. GFX9 has dedicated operand codes for
+# a fixed set of float constants (no literal dword): ±0.5/±1.0/±2.0/±4.0 → 240..247.
+# `bits` is the f32 bit pattern (zero-extended). Returns GFX9_SRC_LITERAL for any other
+# value — the caller then emits it as a trailing literal dword (VOP2) or fails loud (VOP3).
+fn gfx9_inline_float(bits): i64 {
+    if (bits == 0x3F000000) { return 240; }   # 0.5
+    if (bits == 0xBF000000) { return 241; }   # -0.5
+    if (bits == 0x3F800000) { return 242; }   # 1.0
+    if (bits == 0xBF800000) { return 243; }   # -1.0
+    if (bits == 0x40000000) { return 244; }   # 2.0
+    if (bits == 0xC0000000) { return 245; }   # -2.0
+    if (bits == 0x40800000) { return 246; }   # 4.0
+    if (bits == 0xC0800000) { return 247; }   # -4.0
+    return GFX9_SRC_LITERAL;
+}
+
 # ================================================================
 # Per-format opcode constants (GFX9 numbering)
 # ================================================================
@@ -7541,7 +7557,12 @@ fn _cmp_resolve(m, alloc, isvgpr, field, is_imm): i64 {
     if (is_imm != 0) { return gfx9_inline_int(field); }
     if (field == 0) { return 0 - CMP_ERR_UNSUPPORTED_OPERAND; }
     var k = mir_val_kind(m, field);
-    if (k == MIR_VK_CONST) { return gfx9_inline_int(mir_val_payload(m, field)); }
+    if (k == MIR_VK_CONST) {
+        # An f32 constant uses the float inline-operand codes (±0.5/1/2/4); integers use
+        # the integer inline range. Anything else resolves to a literal.
+        if (mir_val_type(m, field) == MIR_T_F32) { return gfx9_inline_float(mir_val_payload(m, field)); }
+        return gfx9_inline_int(mir_val_payload(m, field));
+    }
     if (k == MIR_VK_SSA) {
         var r = gfx9_reg(alloc, field);
         if (load64(isvgpr + field * 8) != 0) { return gfx9_vgpr(r); }

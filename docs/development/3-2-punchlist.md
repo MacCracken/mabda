@@ -763,14 +763,15 @@ hand-authored shaders stay as oracle + fallback.
     (VOP1); `Fma` → `v_fma_f32` (VOP3 3-src via the new `_emit_vop3_3src`; the ext-inst
     handler gained ternary arity). `native_spirv_fma_e2e.cyr` HW-verified on Cezanne
     (gid²+gid, exact f32). +15 asserts. A non-inline FLOAT const in a VOP3 fails loud.
-  - [ ] **N.8b-3 — float inline constants.** Map the GFX9 inline float codes
-    (0.5→240, 1.0→242, 2.0→244, 4.0→246, ±) so `fma(x,2.0,1.0)` / FADD/FMUL with float
-    consts compile without materialization. NOTE: this re-touches the downsample
-    `×0.25` emit (literal → inline) → re-verify its RSRC/byte oracle.
+  - [x] **N.8b-3 (2026-06-17) — float inline constants.** `gfx9_inline_float`
+    (±0.5/1/2/4 → 240..247) + `_cmp_resolve` routes f32 consts through it.
+    `native_spirv_fma_const_e2e.cyr` (`fma(gid,2.0,1.0)`=2·gid+1) HW-verified on Cezanne.
+    `0.25` is NOT inline → downsample byte/RSRC oracle unchanged (verified). +14 asserts.
+    VOP2 still needs the const in src0 (operand placement → N.8b-4).
   - [ ] **N.8b-4 — remaining op breadth.** GLSL FAbs/FClamp/etc.; signed int compares
-    (SLT/SGT) + div/mod; const-fold two-literal ops; vector (vec2/3/4) ops; per-ext-set
-    tracking; dispatcher polish. Then "native SPIR-V f32 compiler complete." (Loops /
-    `OpPhi` / nested ifs stay fail-loud.)
+    (SLT/SGT) + div/mod; const-fold two-literal ops; VOP2 commutative const→src0
+    reordering; vector (vec2/3/4) ops; per-ext-set tracking; dispatcher polish. Then
+    "native SPIR-V f32 compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
 
 ---
 

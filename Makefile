@@ -384,6 +384,16 @@ build/native_spirv_fma_e2e: programs/native_spirv_fma_e2e.cyr src/*.cyr
 test-native-spirv-fma-e2e: build/native_spirv_fma_e2e
 	./build/native_spirv_fma_e2e
 
+# N.8b-3: a compiled SPIR-V kernel using f32 INLINE constants (`fma(gid, 2.0, 1.0)`) —
+# 2.0/1.0 pack into the VOP3 source fields (codes 244/242), no literal. HW-verified.
+build/native_spirv_fma_const_e2e: programs/native_spirv_fma_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fma_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-fma-const-e2e
+test-native-spirv-fma-const-e2e: build/native_spirv_fma_const_e2e
+	./build/native_spirv_fma_const_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

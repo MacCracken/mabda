@@ -15,6 +15,21 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-3 (f32 inline constants — `fma(x, 2.0, 1.0)` compiles)
+- **f32 constants in the GFX9 inline set (`±0.5/±1.0/±2.0/±4.0`) now encode as inline
+  operands** instead of failing/needing a literal. `src/gfx9_encode.cyr`:
+  `gfx9_inline_float` (bit-pattern → operand code 240..247, llvm-mc-verified).
+  `src/gfx9_compile.cyr`: `_cmp_resolve` routes an f32-typed `OpConstant` through it
+  (integers keep the integer inline range). This closes the N.8b-2 reject —
+  `programs/native_spirv_fma_const_e2e.cyr` (`fma(float(gid.x), 2.0, 1.0)` = 2·gid+1)
+  compiles + runs on Cezanne with `2.0`/`1.0` packed straight into the `v_fma_f32`
+  source fields (no literal dword, no scratch).
+- **Non-inline f32 constants are unchanged** — `0.25` is not in the inline set, so the
+  downsample `×0.25` still emits a literal: its RSRC/byte oracle and all 9 prior
+  compiled-kernel HW programs are byte-identical (verified). +14 asserts
+  (`test_gfx9_inline_float` oracle incl. `0.25`/π → literal; `test_gfx9_emit_fma_inline_float`
+  byte-exact). VOP2 ops still need the float const in src0 (operand placement is N.8b-4).
+
 ### Added — Phase N.8b-2 (GLSL.std.450 math — `Floor` + ternary `Fma`)
 - **`Floor` and `Fma` join the ext-instruction front end.** `src/spirv_lower.cyr`:
   `Floor` → `MIR_OP_FFLOOR` (unary), `Fma` → `MIR_OP_FMA` (the ext-inst handler gained a
