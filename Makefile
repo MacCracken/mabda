@@ -423,6 +423,16 @@ build/native_spirv_store_const_e2e: programs/native_spirv_store_const_e2e.cyr sr
 test-native-spirv-store-const-e2e: build/native_spirv_store_const_e2e
 	./build/native_spirv_store_const_e2e
 
+# N.8b-6: a binary VOP2 op with a constant operand (`float(gid.x) * 2.0`) — the const
+# rides src0 (inline float) and the VGPR rides vsrc1. HW-verified on Cezanne.
+build/native_spirv_vop2_const_e2e: programs/native_spirv_vop2_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_vop2_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-vop2-const-e2e
+test-native-spirv-vop2-const-e2e: build/native_spirv_vop2_const_e2e
+	./build/native_spirv_vop2_const_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

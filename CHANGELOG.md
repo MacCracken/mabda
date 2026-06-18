@@ -15,6 +15,16 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-6 (VOP2 const-operand — verified + covered)
+- **A binary VOP2 op with a constant operand compiles** (`x * 2.0`, `x + 1.0`, `x | 5`):
+  the constant rides `src0` (inline-capable, or a trailing literal) and the VGPR rides
+  `vsrc1`. This was already correct — `_emit_vop2`'s commutative path swaps a non-VGPR
+  operand into `src0` (and the downsample's `×0.25` literal already exercised it on HW) —
+  so N.8b-6 adds coverage rather than new code: a byte-exact CPU test
+  (`test_gfx9_emit_vop2_const`: `v_mul_f32 v5,2.0,v3` / `v_add_f32 v6,1.0,v3`, e32, no
+  literal dword) + a HW program (`native_spirv_vop2_const_e2e.cyr`, `float(gid.x)*2.0`).
+  Corrects the N.8b-3 note that implied VOP2 const placement was still pending.
+
 ### Added — Phase N.8b-5 (store-constant materialization)
 - **Storing a constant value to a global buffer now compiles** (`out[i] = <const>`).
   A FLAT global store's data operand must be a VGPR, so `_emit_flat_store`

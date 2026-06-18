@@ -775,10 +775,11 @@ hand-authored shaders stay as oracle + fallback.
     the constant is materialized into the scratch VGPR (`v_mov_b32`) before the FLAT store
     (SSA stores byte-identical). HW-verified on Cezanne (`native_spirv_store_const_e2e.cyr`,
     `out[gid.x]=0xCAFE`). +7 asserts.
-  - [ ] **N.8b-6 — VOP2 commutative const→src0 reordering.** `x + 1.0` / `x * 2.0` (and
-    int peers): for a commutative VOP2 op with the const in operand b, swap so the const
-    rides src0 (inline-capable) and the VGPR rides vsrc1. Enables binary ops with a
-    constant operand without a separate materialize.
+  - [x] **N.8b-6 (2026-06-17) — VOP2 const-operand (ALREADY IMPLEMENTED; verified +
+    covered).** `_emit_vop2`'s commutative path already swaps a non-VGPR operand into src0;
+    with N.8b-3 inline floats, `x*2.0`/`x+1.0`/`x|5` all compile. HW-verified
+    (`native_spirv_vop2_const_e2e.cyr`, `float(gid.x)*2.0`) + byte-exact CPU test (+5).
+    No new src code — the N.8b-3 "VOP2 placement pending" note was wrong.
   - [ ] **N.8b-7 — final breadth.** GLSL FAbs (sign-bit clear); int div/mod (no HW divide
     — reciprocal/Newton); const-fold two-literal ops; vector (vec2/3/4) ops; per-ext-set
     tracking. Assess "f32 compiler complete" (scalar) here. (Loops/`OpPhi`/nested-if

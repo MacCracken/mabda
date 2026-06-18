@@ -2024,6 +2024,46 @@ fn test_gfx9_emit_store_const() {
     return 0;
 }
 
+# N.8b-6 — a commutative VOP2 op with the constant in operand b emits the constant in
+# src0 (inline-capable) and the VGPR in vsrc1 (the existing _emit_vop2 swap + N.8b-3
+# inline floats): x*2.0 → v_mul_f32 v5, 2.0, v3; x+1.0 → v_add_f32 v6, 1.0, v3. Bytes
+# are llvm-mc gfx900 truth (the e32 forms).
+fn test_gfx9_emit_vop2_const() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # x → v3
+    mir_set_const(&m, 10, MIR_T_F32, 0x40000000);                       # 2.0
+    mir_set_const(&m, 11, MIR_T_F32, 0x3F800000);                       # 1.0
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # mul → v5
+    _mir_set_val(&m, 13, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # add → v6
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_MUL_F32, 12, 9, 10, 0, 0);            # v5 = x * 2.0 (const in b)
+    _gisel_emit(&isel, 2, GISEL_V_ADD_F32, 13, 9, 11, 0, 0);            # v6 = x + 1.0 (const in b)
+    _gisel_emit(&isel, 3, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 12 * 16, 5);
+    store64(&alloc + 13 * 16, 6);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 4, &alloc, &abi, &built, 0);
+    assert_eq(endp, 16, "vop2-const program end at 16 bytes (no literal dword — inline floats)");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
+    assert_eq(load32(&built + 4), 0x0A0A06F4, "v_mul_f32 v5, 2.0, v3 (const swapped to src0)");
+    assert_eq(load32(&built + 8), 0x020C06F2, "v_add_f32 v6, 1.0, v3 (const swapped to src0)");
+    assert_eq(load32(&built + 12), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.8a — VOP3a has no literal operand form, so a non-inline constant (100 > 64) is
 # materialized into the scratch VGPR (the first free one = v6 here) with v_mov_b32, then
 # multiplied. A leading EXTRACT puts gid.x in v3 (so it resolves as a real VGPR operand,
@@ -3192,6 +3232,7 @@ fn main(): i64 {
     test_gfx9_abi_assign_2d();
     test_gfx9_emit_flat_vop3();
     test_gfx9_emit_store_const();
+    test_gfx9_emit_vop2_const();
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_gfx9_emit_glsl_math();
