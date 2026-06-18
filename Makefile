@@ -342,6 +342,17 @@ build/native_spirv_uniform_if_e2e: programs/native_spirv_uniform_if_e2e.cyr src/
 test-native-spirv-uniform-if-e2e: build/native_spirv_uniform_if_e2e
 	./build/native_spirv_uniform_if_e2e
 
+# N.7c: a compiled SPIR-V kernel with a DIVERGENT `if (gid.x<4)` — v_cmp → VCC +
+# s_and_saveexec_b64 + s_cbranch_execz + s_or_b64 restore. One wave, lanes 4-7 masked
+# out of the store (out[4..7] untouched). HW-verified on Cezanne.
+build/native_spirv_divergent_if_e2e: programs/native_spirv_divergent_if_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_divergent_if_e2e.cyr $@
+
+.PHONY: test-native-spirv-divergent-if-e2e
+test-native-spirv-divergent-if-e2e: build/native_spirv_divergent_if_e2e
+	./build/native_spirv_divergent_if_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

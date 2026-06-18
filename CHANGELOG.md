@@ -15,6 +15,26 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7c-2b (EXEC-mask branch + HW — the divergent `if` is complete)
+- **A compiled SPIR-V kernel with a divergent `if` runs correctly on Cezanne, with
+  per-lane masking.** `programs/native_spirv_divergent_if_e2e.cyr`: `if
+  (gl_GlobalInvocationID.x < 4) { out[gid.x] = gid.x + 7; }` over ONE workgroup of 8 —
+  lanes 0-3 write `out[0..3]`, lanes 4-7 are masked off and `out[4..7]` stays the
+  sentinel. That gap *within a single wave* is the proof EXEC gated individual lanes.
+- `src/gfx9_isel.cyr` — a divergent `COND_BRANCH` lowers to `s_and_saveexec_b64`
+  (EXEC &= VCC, old EXEC saved) + `s_cbranch_execz` (skip the then when no lane is
+  active); the merge `LABEL` precedes its `s_or_b64` EXEC restore so a skip *or* a
+  fall-through both land on the restore. Nested divergent ifs fail loud (single saved
+  pair — N.8). `src/gfx9_compile.cyr` — `_emit_vopc` peer emitters for the trio,
+  `S_CBRANCH_EXECZ` in the two-pass branch layout, and (only when the kernel has
+  divergent CF) the saved EXEC is parked in the reserved pair `s[100:101]`: the regalloc
+  cap drops to 100 and the rsrc1 SGPR count is bumped to cover s101 — non-divergent
+  kernels are byte-identical (the downsample RSRC oracle is unchanged).
+- `src/gfx9_encode.cyr` — `GFX9_REG_VCC_LO` (106). +13 asserts
+  (`test_gfx9_isel_divergent_if` asserts the full 8-instr sequence;
+  `test_gfx9_isel_divergent_if_nesting_rejected`). **N.7c — the divergent `if` — is
+  complete, and with it N.7 control flow (uniform + divergent `if`).**
+
 ### Added — Phase N.7c-2a (divergent compare selection — `ICMP` → `v_cmp` → VCC)
 - **A divergent integer compare now selects to `v_cmp` (VCC), not `s_cmp` (SCC).**
   `src/gfx9_isel.cyr`: `_gisel_vcmp` (MIR compare op → VOPC opcode) + `GISEL_V_CMP`; a

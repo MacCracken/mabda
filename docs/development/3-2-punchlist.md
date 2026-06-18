@@ -708,8 +708,9 @@ hand-authored shaders stay as oracle + fallback.
     to `CMP_ERR_TABLE`. +8 asserts (per-builder reject + untouched canary +
     `gfx9_compile` over-capacity integration reject). Landed **before** the N.6
     remainder exposes this path through `gpu_shader_module_create`.
-- [~] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
-  EXEC-mask); divergent-vs-uniform test matrix.
+- [x] **N.7** *(3.2.8)* **(2026-06-17) — COMPLETE, HW-verified on Cezanne.** Control
+  flow: uniform `if` (`s_cbranch_scc0`) + divergent `if` (EXEC mask). Loops / `OpPhi` /
+  nested ifs fail loud (N.8+).
   - [x] **N.7a (2026-06-17) — control-flow encoders + byte-oracle.** SOPP branches
     (`s_branch`, `s_cbranch_scc0/scc1`, `s_cbranch_execz/execnz`), the new
     `gfx9_enc_sopc` + u32 `s_cmp_*` (→ SCC), and the EXEC-mask ops
@@ -733,17 +734,20 @@ hand-authored shaders stay as oracle + fallback.
       + `programs/native_spirv_uniform_if_e2e.cyr` HW-verified on Cezanne
       (`if (wgid.x==0){out[gid.x]=gid.x+7}`, grid 2 → wg1 gated out, out[8..15] sentinel).
       Straight-line kernels byte-identical (no LABEL/branch).
-  - [~] **N.7c — divergent `if`** (per-lane condition via EXEC masking).
+  - [x] **N.7c — divergent `if`** (2026-06-17) — COMPLETE, HW-verified on Cezanne.
     - [x] **N.7c-1 (2026-06-17) — VOPC `v_cmp` encoders.** `gfx9_enc_vopc` + u32
       `v_cmp_*` (lt/eq/le/gt/ne/ge) → VCC, llvm-mc-verified (`test_gfx9_enc_vopc`, +7).
     - [x] **N.7c-2a (2026-06-17) — divergent compare selection.** `_gisel_vcmp` +
       `GISEL_V_CMP` (divergent ICMP → `v_cmp`→VCC; uniform stays `s_cmp`→SCC); constant
       second operand → src0 + flipped predicate. `_emit_vopc` in the back-end. Divergent
       COND_BRANCH fails loud (EXEC mask is N.7c-2b). +12 asserts.
-    - [ ] **N.7c-2b — EXEC-masking branch + HW.** Divergent COND_BRANCH →
-      `s_and_saveexec_b64 saved, vcc` + `s_cbranch_execz merge`; `s_or_b64 exec, exec,
-      saved` restore at the merge (needs a 64-bit saved-EXEC SGPR pair — reserve above
-      the regalloc range). Divergent `if (gid.x<4){…}` HW e2e (partial-wave masking).
+    - [x] **N.7c-2b (2026-06-17) — EXEC-masking branch + HW. The divergent `if` is
+      COMPLETE.** Divergent COND_BRANCH → `s_and_saveexec_b64` + `s_cbranch_execz`;
+      merge LABEL precedes its `s_or_b64` EXEC restore. Saved EXEC parks in `s[100:101]`
+      (regalloc cap→100 + rsrc1 SGPR bump, only when divergent CF — non-divergent kernels
+      byte-identical). Nested ifs fail loud (N.8). `native_spirv_divergent_if_e2e.cyr`
+      HW-verified on Cezanne (`if (gid.x<4){out[gid.x]=gid.x+7}`, one wave, lanes 4-7
+      masked, out[4..7] sentinel). +13 asserts.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
   SPIR-V f32 compiler **complete**.
 

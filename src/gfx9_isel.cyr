@@ -62,6 +62,12 @@ var GISEL_S_CMP         = 31;
 # V_CMP: a DIVERGENT compare → the implicit VCC mask (N.7c). dst = 0 (VCC is implicit),
 # a = src0 (9-bit operand, VGPR/inline), b = vsrc1 (a VGPR), VOPC opcode in flags 8+.
 var GISEL_V_CMP         = 32;
+# The divergent-if EXEC-mask trio (N.7c-2b). SAVEEXEC: EXEC &= VCC, save old EXEC to the
+# reserved pair. S_CBRANCH_EXECZ: skip to the merge (c) when no lane is active. S_OR_EXEC:
+# restore EXEC at the merge. The reserved pair + VCC are implicit (no register operands).
+var GISEL_S_SAVEEXEC      = 33;
+var GISEL_S_CBRANCH_EXECZ = 34;
+var GISEL_S_OR_EXEC       = 35;
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -265,13 +271,51 @@ fn gfx9_isel(m, out, cap): i64 {
     var n = mir_n_instrs(m);
     var i = 0;
     var k = 0;
+    var pending_merge = 0;   # merge label of an open divergent if (0 = none; MVP = no nesting)
     while (i < n) {
         if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
-        var rc = _gisel_one(m, out, k, mir_instr_op(m, i), mir_instr_result(m, i),
-        mir_instr_a(m, i), mir_instr_b(m, i), mir_instr_c(m, i), mir_instr_flags(m, i));
-        if (rc < 0) { return rc; }
-        k = k + 1;
+        var op = mir_instr_op(m, i);
+        var a = mir_instr_a(m, i);
+        var c = mir_instr_c(m, i);
+        var handled = 0;
+        # A DIVERGENT cond branch opens the EXEC-mask region: save+mask EXEC, then skip
+        # the then-block entirely when no lane is active. The restore is emitted at merge.
+        if (op == MIR_OP_COND_BRANCH) {
+            if (mir_val_unif(m, a) == MIR_DIVERGENT) {
+                if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+                if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                _gisel_emit(out, k, GISEL_S_SAVEEXEC, 0, 0, 0, 0, 0);
+                _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, c, 0);
+                k = k + 2;
+                pending_merge = c;
+                handled = 1;
+            }
+        }
+        # Its merge label closes the region: the label points at the EXEC restore, so a
+        # skip OR a fall-through both land on it. Label first (records the offset), then
+        # the s_or_b64 restore as the first real instruction there.
+        if (handled == 0) {
+            if (op == MIR_OP_LABEL) {
+                if (pending_merge != 0) {
+                    if (a == pending_merge) {
+                        if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                        _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0);
+                        _gisel_emit(out, k + 1, GISEL_S_OR_EXEC, 0, 0, 0, 0, 0);
+                        k = k + 2;
+                        pending_merge = 0;
+                        handled = 1;
+                    }
+                }
+            }
+        }
+        if (handled == 0) {
+            var rc = _gisel_one(m, out, k, op, mir_instr_result(m, i),
+            a, mir_instr_b(m, i), c, mir_instr_flags(m, i));
+            if (rc < 0) { return rc; }
+            k = k + 1;
+        }
         i = i + 1;
     }
+    if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }   # unclosed divergent if
     return k;
 }
