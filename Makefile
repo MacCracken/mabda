@@ -433,6 +433,16 @@ build/native_spirv_vop2_const_e2e: programs/native_spirv_vop2_const_e2e.cyr src/
 test-native-spirv-vop2-const-e2e: build/native_spirv_vop2_const_e2e
 	./build/native_spirv_vop2_const_e2e
 
+# N.8b-7: GLSL.std.450 FAbs via v_and_b32 0x7FFFFFFF (clear the f32 sign bit).
+# `abs(float(gid.x) - 4.0)`. HW-verified on Cezanne.
+build/native_spirv_fabs_e2e: programs/native_spirv_fabs_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fabs_e2e.cyr $@
+
+.PHONY: test-native-spirv-fabs-e2e
+test-native-spirv-fabs-e2e: build/native_spirv_fabs_e2e
+	./build/native_spirv_fabs_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

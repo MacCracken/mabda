@@ -23,8 +23,8 @@
 # against it. Every SSA operand of a straight-line program is defined earlier in
 # the same list, so the map covers them all.
 
-# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52,
-# waitcnt 60-61).
+# Error codes (disjoint from mir 20-25, lower 26-27, regalloc 50-52, waitcnt 60-61,
+# gisel 100-101).
 var CMP_ERR_UNSUPPORTED_OP      = 70;   # a GISEL op N.5a does not encode yet
 var CMP_ERR_UNSUPPORTED_OPERAND = 71;   # a builtin/buffer/ptr operand (N.5b)
 var CMP_ERR_NO_VGPR_OPERAND     = 72;   # a VALU op with no VGPR operand for vsrc1
@@ -156,6 +156,17 @@ fn _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0));
     if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
     return p;
+}
+
+# GLSL FAbs(x) = clear the f32 sign bit: v_and_b32 dst, 0x7FFFFFFF, x (the mask rides
+# src0 as a trailing literal; x is vsrc1, so x must be a VGPR). Correct for finite/inf
+# (sign cleared) and nan (stays nan). One operand — no commutative-swap needed.
+fn _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var x = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (x < 0) { return x; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, dst, GFX9_SRC_LITERAL, x));
+    return gfx9_emit32(buf, p, 0x7FFFFFFF);
 }
 
 # VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
@@ -483,6 +494,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_V_FLOOR_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_FLOOR_F32); }
     if (op == GISEL_V_FMA_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32); }
     if (op == GISEL_V_MED3_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MED3_F32); }
+    if (op == GISEL_V_ABS_F32) { return _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_LSHLREV_B32) {
         return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHLREV_B32, 1);
     }

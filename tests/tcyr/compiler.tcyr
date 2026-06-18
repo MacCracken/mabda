@@ -2064,6 +2064,39 @@ fn test_gfx9_emit_vop2_const() {
     return 0;
 }
 
+# N.8b-7 — GLSL FAbs(x) clears the f32 sign bit: v_and_b32 v5, 0x7FFFFFFF, v3 with the
+# mask as a trailing literal dword. Bytes are llvm-mc gfx900 truth.
+fn test_gfx9_emit_fabs() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # x → v3
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # abs → v5
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_ABS_F32, 10, 9, 0, 0, 0);             # v5 = |v3|
+    _gisel_emit(&isel, 2, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 10 * 16, 5);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    assert_eq(endp, 16, "fabs: extract(1) + v_and(2) + endpgm(1) = 16 bytes");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
+    assert_eq(load32(&built + 4), 0x260A06FF, "v_and_b32 v5, 0x7FFFFFFF, v3");
+    assert_eq(load32(&built + 8), 0x7FFFFFFF, "the sign-clear mask dword");
+    assert_eq(load32(&built + 12), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.8a — VOP3a has no literal operand form, so a non-inline constant (100 > 64) is
 # materialized into the scratch VGPR (the first free one = v6 here) with v_mov_b32, then
 # multiplied. A leading EXTRACT puts gid.x in v3 (so it resolves as a real VGPR operand,
@@ -2173,6 +2206,18 @@ fn test_spirv_lower_glsl_extinst() {
     assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m4, &lsz), 0,
     "Floor extinst lowers");
     assert_eq(mir_instr_op(&m4, 0), MIR_OP_FFLOOR, "op = FFLOOR");
+    # FAbs is unary too.
+    store32(&buf + 36, 4);                 # GLSL.std.450 FAbs
+    var mab[80];
+    var valsab[640];
+    var instrsab[512];
+    var ptrsab[64];
+    var blocksab[32];
+    mir_mod_init(&mab, &valsab, &instrsab, &ptrsab, &blocksab, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &mab, &lsz), 0,
+    "FAbs extinst lowers");
+    assert_eq(mir_instr_op(&mab, 0), MIR_OP_FABS, "op = FABS");
+    store32(&buf + 36, 8);                  # restore Floor for the Fma case below
     # Fma is ternary (wc 8, three operands at +5/+6/+7).
     store32(&buf + 20, (8 << 16) | 12);
     store32(&buf + 36, 50);                # GLSL.std.450 Fma
@@ -3233,6 +3278,7 @@ fn main(): i64 {
     test_gfx9_emit_flat_vop3();
     test_gfx9_emit_store_const();
     test_gfx9_emit_vop2_const();
+    test_gfx9_emit_fabs();
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_gfx9_emit_glsl_math();

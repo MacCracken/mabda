@@ -5837,6 +5837,7 @@ var MIR_OP_ICMP_SGT    = 33;
 var MIR_OP_ICMP_SLE    = 34;
 var MIR_OP_ICMP_SGE    = 35;
 var MIR_OP_FCLAMP      = 36;   # GLSL.std.450 FClamp = median-of-3 (v_med3_f32)
+var MIR_OP_FABS        = 37;   # GLSL.std.450 FAbs = clear sign bit (v_and_b32 0x7FFFFFFF)
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6218,6 +6219,7 @@ var SPIRV_OP_SLESSTHANEQUAL      = 179;
 # MVP assumes the only imported ext set is GLSL.std.450 (the standard shader math
 # library); a non-GLSL set's number would map here too — acceptable until per-set
 # tracking (N.8b+). Sqrt is unary; FMin/FMax are binary.
+var GLSL_STD450_FABS             = 4;
 var GLSL_STD450_FLOOR            = 8;
 var GLSL_STD450_FMA              = 50;
 var GLSL_STD450_FCLAMP           = 43;
@@ -6604,6 +6606,11 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
             if (ef < 0) { return ef; }
             return 0;
         }
+        if (glsl == GLSL_STD450_FABS) {
+            var ea = mir_emit(m, MIR_OP_FABS, rid, ety, x0, 0, 0, 0);
+            if (ea < 0) { return ea; }
+            return 0;
+        }
         # Binary: FMin, FMax.
         if (wc < 7) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var x1 = spirv_word(ptr, off + 6);
@@ -6800,12 +6807,15 @@ var GISEL_V_MAX_F32       = 37;
 var GISEL_V_SQRT_F32      = 38;
 var GISEL_V_FLOOR_F32     = 39;
 var GISEL_V_MED3_F32      = 40;   # GLSL.std.450 FClamp (N.8b-4)
+var GISEL_V_ABS_F32       = 41;   # GLSL.std.450 FAbs = clear sign bit (N.8b-7)
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
-# Error codes (disjoint from mir 20-25 and lower 26-27).
-var GISEL_ERR_UNSUPPORTED_OP = 40;
-var GISEL_ERR_CAP_EXCEEDED   = 41;
+# Error codes — based at 100 so they stay clear of the GISEL op enum (positive opcode
+# tags) above; errors are always returned NEGATED, but a shared literal value with an op
+# is a needless smell. Disjoint from mir 20-25, lower 26-27, and CMP 70-87.
+var GISEL_ERR_UNSUPPORTED_OP = 100;
+var GISEL_ERR_CAP_EXCEEDED   = 101;
 
 # ================================================================
 # Selected-instruction emit + accessors
@@ -6889,6 +6899,7 @@ fn _gisel_float_op(mop): i64 {
     if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
     if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
     if (mop == MIR_OP_FCLAMP) { return GISEL_V_MED3_F32; }
+    if (mop == MIR_OP_FABS) { return GISEL_V_ABS_F32; }
     return 0;
 }
 
@@ -7252,7 +7263,7 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
 var GFX9_WAITCNT_VM      = 3952;  # 0x0F70: vmcnt(0), lgkm/exp don't-care
 var GFX9_WAITCNT_VM_LGKM = 112;   # 0x0070: vmcnt(0) AND lgkmcnt(0), exp don't-care
 
-# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52).
+# Error codes (disjoint from mir 20-25, lower 26-27, regalloc 50-52, cmp 70-87, gisel 100-101).
 var WC_ERR_CAP          = 60;   # output buffer cap exceeded
 var WC_ERR_TOO_MANY_IDS = 61;   # cap_ids beyond the outstanding-tracker scratch
 
@@ -7539,8 +7550,8 @@ fn gfx9_abi_builtin_reg(abi, bi_code, comp): i64 {
 # against it. Every SSA operand of a straight-line program is defined earlier in
 # the same list, so the map covers them all.
 
-# Error codes (disjoint from mir 20-25, lower 26-27, gisel 40-41, regalloc 50-52,
-# waitcnt 60-61).
+# Error codes (disjoint from mir 20-25, lower 26-27, regalloc 50-52, waitcnt 60-61,
+# gisel 100-101).
 var CMP_ERR_UNSUPPORTED_OP      = 70;   # a GISEL op N.5a does not encode yet
 var CMP_ERR_UNSUPPORTED_OPERAND = 71;   # a builtin/buffer/ptr operand (N.5b)
 var CMP_ERR_NO_VGPR_OPERAND     = 72;   # a VALU op with no VGPR operand for vsrc1
@@ -7672,6 +7683,17 @@ fn _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(opc, gfx9_reg(alloc, gisel_dst(isel, i)), src0));
     if (src0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
     return p;
+}
+
+# GLSL FAbs(x) = clear the f32 sign bit: v_and_b32 dst, 0x7FFFFFFF, x (the mask rides
+# src0 as a trailing literal; x is vsrc1, so x must be a VGPR). Correct for finite/inf
+# (sign cleared) and nan (stays nan). One operand — no commutative-swap needed.
+fn _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var x = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (x < 0) { return x; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_AND_B32, dst, GFX9_SRC_LITERAL, x));
+    return gfx9_emit32(buf, p, 0x7FFFFFFF);
 }
 
 # VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
@@ -7999,6 +8021,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_V_FLOOR_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_FLOOR_F32); }
     if (op == GISEL_V_FMA_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32); }
     if (op == GISEL_V_MED3_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MED3_F32); }
+    if (op == GISEL_V_ABS_F32) { return _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_LSHLREV_B32) {
         return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHLREV_B32, 1);
     }

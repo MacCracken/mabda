@@ -748,8 +748,15 @@ hand-authored shaders stay as oracle + fallback.
       byte-identical). Nested ifs fail loud (N.8). `native_spirv_divergent_if_e2e.cyr`
       HW-verified on Cezanne (`if (gid.x<4){out[gid.x]=gid.x+7}`, one wave, lanes 4-7
       masked, out[4..7] sentinel). +13 asserts.
-- [~] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
-  SPIR-V f32 compiler **complete**.
+- [~] **N.8** *(3.2.8)* — Scalar SPIR-V f32 compiler **complete** (FAbs + const-fold
+  close it). **REVISED VERSION PLAN (maintainer, 2026-06-17):** the remaining big-ticket
+  op breadth is split across its own minors instead of one "N.8":
+  **3.2.8** = scalar f32 complete (N.8b-7 FAbs ✓ + N.8b-8 const-fold) →
+  **3.2.9** = int div/mod (no HW divide → reciprocal/Newton) →
+  **3.2.10** = vectors (component-wise vec2/3/4) →
+  **3.2.11** = per-ext-set tracking (verify `OpExtInst` set is GLSL.std.450) →
+  then resume the previously-roadmapped 3.2.x arc (Phase F f64, Phase R render-graph
+  multi-queue, …) which all shift down accordingly.
   - [x] **N.8a (2026-06-17) — VOP3-literal materialization.** A non-inline constant
     operand of a VOP3a op (`gid.x*100`) is materialized into the first-free scratch VGPR
     via `v_mov_b32`, then used; rsrc1 VGPR count bumped only when materializing
@@ -780,10 +787,20 @@ hand-authored shaders stay as oracle + fallback.
     with N.8b-3 inline floats, `x*2.0`/`x+1.0`/`x|5` all compile. HW-verified
     (`native_spirv_vop2_const_e2e.cyr`, `float(gid.x)*2.0`) + byte-exact CPU test (+5).
     No new src code — the N.8b-3 "VOP2 placement pending" note was wrong.
-  - [ ] **N.8b-7 — final breadth.** GLSL FAbs (sign-bit clear); int div/mod (no HW divide
-    — reciprocal/Newton); const-fold two-literal ops; vector (vec2/3/4) ops; per-ext-set
-    tracking. Assess "f32 compiler complete" (scalar) here. (Loops/`OpPhi`/nested-if
-    stay fail-loud — v3.3+.)
+  - [x] **N.8b-7 (2026-06-17) — GLSL FAbs.** `abs(x)` → `v_and_b32 x, 0x7FFFFFFF` (clear
+    the sign bit; correct for finite/±inf/nan/±0). HW-verified on Cezanne
+    (`native_spirv_fabs_e2e.cyr`, `abs(float(gid.x)-4.0)`). +7 asserts. Also rebased the
+    GISEL error codes 40/41 → 100/101 (op enum reached 41).
+  - [ ] **N.8b-8 — const-fold two-literal ops (closes 3.2.8).** Fold a binary op whose
+    BOTH operands are constants at compile time (e.g. `2 * 3`, currently fail-loud in the
+    VOP3-2src / two-literal paths) into a single materialized constant. After this the
+    **scalar f32 compiler is complete** → cut 3.2.8.
+  - [ ] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide; lower UDiv/SDiv/
+    UMod/SMod via the reciprocal + Newton-Raphson correction expansion.
+  - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+  - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
+    verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
+    Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
 
 ---
 

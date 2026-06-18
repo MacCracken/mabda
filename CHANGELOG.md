@@ -15,6 +15,18 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-7 (GLSL `FAbs` — closes the scalar f32 math library)
+- **GLSL.std.450 `FAbs`** → `v_and_b32 dst, 0x7FFFFFFF, x` (clear the f32 sign bit;
+  correct for finite/±inf/nan/±0). `MIR_OP_FABS` + `GISEL_V_ABS_F32` + `_emit_fabs`
+  (the mask rides src0 as a trailing literal, x is vsrc1). HW: `native_spirv_fabs_e2e.cyr`
+  (`abs(float(gid.x) - 4.0)` = 4,3,2,1,0,1,2,3 exact on Cezanne). +7 asserts (byte-exact
+  emit + the lowering parse).
+- **Cleanup:** the GISEL error codes were rebased 40/41 → 100/101 so they no longer
+  share literal values with the (now-larger) GISEL op-tag enum — the op enum reached 41
+  with `GISEL_V_ABS_F32`. All references are by-name; values stay disjoint from the MIR
+  (20-27) and CMP (70-87) error bands. (Resolves the cosmetic overlap the N.8b-4 review
+  flagged-and-refuted.)
+
 ### Added — Phase N.8b-6 (VOP2 const-operand — verified + covered)
 - **A binary VOP2 op with a constant operand compiles** (`x * 2.0`, `x + 1.0`, `x | 5`):
   the constant rides `src0` (inline-capable, or a trailing literal) and the VGPR rides
