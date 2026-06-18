@@ -296,15 +296,29 @@ fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     return 0;
 }
 
-# 1 if any VOP3a op carries a literal operand (so the driver reserves a scratch VGPR for
-# materialization and bumps the rsrc1 VGPR count to cover it).
-fn _cmp_needs_vop3_scratch(m, isel, ni): i64 {
+# 1 if a global-store value operand is a constant — FLAT store data must be a VGPR, so
+# the constant is materialized into the scratch VGPR (any const, inline or literal).
+fn _cmp_store_value_is_const(m, field, fl): i64 {
+    if ((fl & MIR_FLAG_C_IMM) != 0) { return 1; }
+    if (field == 0) { return 0; }
+    if (mir_val_kind(m, field) == MIR_VK_CONST) { return 1; }
+    return 0;
+}
+
+# 1 if the program needs the materialization scratch VGPR: a VOP3a op with a literal
+# operand, OR a global store of a constant value. The driver then bumps the rsrc1 VGPR
+# count to cover the scratch.
+fn _cmp_needs_scratch(m, isel, ni): i64 {
     var i = 0;
     while (i < ni) {
-        if (gisel_op(isel, i) == GISEL_V_MUL_LO_U32) {
+        var op = gisel_op(isel, i);
+        if (op == GISEL_V_MUL_LO_U32) {
             var fl = gisel_flags(isel, i);
             if (_cmp_operand_is_literal(m, gisel_a(isel, i), fl & MIR_FLAG_A_IMM) == 1) { return 1; }
             if (_cmp_operand_is_literal(m, gisel_b(isel, i), fl & MIR_FLAG_B_IMM) == 1) { return 1; }
+        }
+        if (op == GISEL_GLOBAL_STORE) {
+            if (_cmp_store_value_is_const(m, gisel_c(isel, i), gisel_flags(isel, i)) == 1) { return 1; }
         }
         i = i + 1;
     }
@@ -348,14 +362,29 @@ fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
 
 # FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
 # flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
-fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
     if (vaddr < 0) { return vaddr; }
-    var data = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_c(isel, i));
-    if (data < 0) { return data; }
-    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    var cfield = gisel_c(isel, i);
+    var fl = gisel_flags(isel, i);
+    var p = pos;
+    var data = 0;
+    # FLAT store data must be a VGPR; a constant value is first materialized into the
+    # scratch VGPR with v_mov_b32 (inline or trailing-literal source).
+    if (_cmp_store_value_is_const(m, cfield, fl) == 1) {
+        if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_FLAT_NONVGPR; }
+        var v = _cmp_resolve(m, alloc, isvgpr, cfield, fl & MIR_FLAG_C_IMM);
+        if (v < 0) { return v; }
+        p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, v));
+        if (v == GFX9_SRC_LITERAL) { p = gfx9_emit32(buf, p, _cmp_lit(m, cfield, fl & MIR_FLAG_C_IMM)); }
+        data = scratch_vgpr;
+    } else {
+        data = _cmp_vgpr_operand(m, alloc, isvgpr, cfield);
+        if (data < 0) { return data; }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
 
@@ -467,7 +496,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
     if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
-    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos); }
+    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
@@ -651,7 +680,7 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     # VOP3-literal materialization parks its constant in the first free VGPR
     # (gfx9_hw_vgpr(hw)), so the grant must cover that one extra register.
     var vgpr_count = gfx9_hw_vgpr(hw);
-    if (_cmp_needs_vop3_scratch(m, isel2, ni2) == 1) { vgpr_count = vgpr_count + 1; }
+    if (_cmp_needs_scratch(m, isel2, ni2) == 1) { vgpr_count = vgpr_count + 1; }
     var r1 = gfx9_rsrc1(vgpr_count, sgpr_count);
     if (r1 < 0) { return r1; }
     var lidc = gfx9_abi_lid_count(abi);

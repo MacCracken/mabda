@@ -15,6 +15,17 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-5 (store-constant materialization)
+- **Storing a constant value to a global buffer now compiles** (`out[i] = <const>`).
+  A FLAT global store's data operand must be a VGPR, so `_emit_flat_store`
+  (`src/gfx9_compile.cyr`) materializes a constant value into the scratch VGPR (the
+  first-free one) with `v_mov_b32` — inline or trailing-literal source — then stores it.
+  SSA-value stores are byte-identical (gated by `_cmp_store_value_is_const`).
+  `_cmp_needs_vop3_scratch` → `_cmp_needs_scratch` now also detects store-const so the
+  rsrc1 VGPR count covers the scratch. HW: `native_spirv_store_const_e2e.cyr`
+  (`out[gid.x] = 0xCAFE`) on Cezanne. +7 byte-exact asserts (`test_gfx9_emit_store_const`).
+  This closes the N.8b-4 limit (the signed-if test can now store a literal directly).
+
 ### Added — Phase N.8b-4 (signed integer compares + GLSL `FClamp`)
 - **Signed integer compares** (`SLessThan`/`SGreaterThan`/`SLessThanOrEqual`/
   `SGreaterThanOrEqual`) lower through the existing S_CMP/V_CMP slots with the i32

@@ -771,11 +771,18 @@ hand-authored shaders stay as oracle + fallback.
   - [x] **N.8b-4 (2026-06-17) — signed int compares + GLSL FClamp.** SLT/SGT/SLE/SGE →
     i32 SOPC/VOPC (EQ/NE stay sign-agnostic); FClamp → `v_med3_f32`. HW-verified on
     Cezanne (`native_spirv_signed_if_e2e.cyr`, `native_spirv_fclamp_e2e.cyr`). +33 asserts.
-  - [ ] **N.8b-5 — remaining op breadth.** GLSL FAbs (sign-bit clear); int div/mod
-    (no HW divide — needs the reciprocal/Newton expansion); store-CONSTANT materialization
-    (`out[i]=100`); VOP2 commutative const→src0 reordering; const-fold two-literal ops;
-    vector (vec2/3/4) ops; per-ext-set tracking. Then "native SPIR-V f32 compiler
-    complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
+  - [x] **N.8b-5 (2026-06-17) — store-constant materialization.** `out[i]=<const>` —
+    the constant is materialized into the scratch VGPR (`v_mov_b32`) before the FLAT store
+    (SSA stores byte-identical). HW-verified on Cezanne (`native_spirv_store_const_e2e.cyr`,
+    `out[gid.x]=0xCAFE`). +7 asserts.
+  - [ ] **N.8b-6 — VOP2 commutative const→src0 reordering.** `x + 1.0` / `x * 2.0` (and
+    int peers): for a commutative VOP2 op with the const in operand b, swap so the const
+    rides src0 (inline-capable) and the VGPR rides vsrc1. Enables binary ops with a
+    constant operand without a separate materialize.
+  - [ ] **N.8b-7 — final breadth.** GLSL FAbs (sign-bit clear); int div/mod (no HW divide
+    — reciprocal/Newton); const-fold two-literal ops; vector (vec2/3/4) ops; per-ext-set
+    tracking. Assess "f32 compiler complete" (scalar) here. (Loops/`OpPhi`/nested-if
+    stay fail-loud — v3.3+.)
 
 ---
 

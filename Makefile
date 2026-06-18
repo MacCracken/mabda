@@ -413,6 +413,16 @@ build/native_spirv_signed_if_e2e: programs/native_spirv_signed_if_e2e.cyr src/*.
 test-native-spirv-signed-if-e2e: build/native_spirv_signed_if_e2e
 	./build/native_spirv_signed_if_e2e
 
+# N.8b-5: storing a CONSTANT value (`out[gid.x] = 0xCAFE`) — FLAT store data must be a
+# VGPR, so the constant is materialized via v_mov_b32 first. HW-verified on Cezanne.
+build/native_spirv_store_const_e2e: programs/native_spirv_store_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_store_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-store-const-e2e
+test-native-spirv-store-const-e2e: build/native_spirv_store_const_e2e
+	./build/native_spirv_store_const_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr
