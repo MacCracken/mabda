@@ -1472,6 +1472,39 @@ fn test_spirv_array_stride_validation() {
     return 0;
 }
 
+# N.11 — per-ext-set tracking: find the GLSL.std.450 import id and require every OpExtInst to
+# reference it; a wrong set, or no GLSL import at all, fails loud.
+fn test_spirv_ext_set_validation() {
+    var buf[128];
+    store32(&buf + 0, 0x07230203);
+    store32(&buf + 12, 32);   # id bound
+    # OpExtInstImport %1 "GLSL.std.450" (words 5..10)
+    store32(&buf + 20, (6 << 16) | 11); store32(&buf + 24, 1);
+    store32(&buf + 28, 0x4C534C47); store32(&buf + 32, 0x6474732E);
+    store32(&buf + 36, 0x3035342E); store32(&buf + 40, 0);
+    # OpExtInst %2 %3 %1 FMax(40) %4 %5 (words 11..17), set = %1
+    store32(&buf + 44, (7 << 16) | 12); store32(&buf + 48, 2); store32(&buf + 52, 3);
+    store32(&buf + 56, 1); store32(&buf + 60, 40); store32(&buf + 64, 4); store32(&buf + 68, 5);
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 1, "GLSL.std.450 import is %1");
+    assert_eq(_spirv_check_ext_sets(&buf, 72), 0, "OpExtInst -> GLSL import accepted");
+    store32(&buf + 56, 7);   # set -> %7 (not the GLSL import)
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "wrong ext set rejected");
+    store32(&buf + 56, 1);   # restore the set
+    store32(&buf + 36, 0x39393939);   # corrupt the import name (no longer ".450")
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 0, "non-GLSL import not found");
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "OpExtInst with no GLSL import rejected");
+    # review #1: a malformed set==0 with no GLSL import still fails loud (not the 0!=0 hole)
+    store32(&buf + 56, 0);
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "set==0 with no GLSL import rejected");
+    # review #2: a valid name with NON-zero padding after the nul byte still matches
+    store32(&buf + 36, 0x3035342E);   # restore ".450"
+    store32(&buf + 40, 0x12345600);   # nul byte (low) + non-zero padding
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 1, "non-zero padding after nul still matches");
+    store32(&buf + 56, 1);
+    assert_eq(_spirv_check_ext_sets(&buf, 72), 0, "accepted with padded import name");
+    return 0;
+}
+
 # The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
 # variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
 fn test_spirv_lower_seed_bufvar() {
@@ -3872,6 +3905,7 @@ fn main(): i64 {
     test_spirv_lower_vec_load_store();
     test_spirv_lower_vec_access_chain();
     test_spirv_array_stride_validation();
+    test_spirv_ext_set_validation();
     test_spirv_lower_constant_composite();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();

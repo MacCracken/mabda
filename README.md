@@ -8,7 +8,7 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.2.10 (dual backend — wgpu + native AMD; see
+Version: 3.2.11 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -32,7 +32,9 @@ the public API; 3.2.8 adds structured control flow + scalar f32/i32 op breadth;
 3.2.9 completes integer division & remainder (UDiv / UMod / SDiv / SRem / SMod via
 GFX9's float-reciprocal macro, all HW-verified); 3.2.10 adds vectors — component-wise
 vec2/3/4 arithmetic, `OpCompositeConstruct`/`Extract`, `array<vecN>` load/store (std430
-stride), and `OpConstantComposite` constants, all HW-verified on Cezanne. See the CHANGELOG.)
+stride), and `OpConstantComposite` constants, all HW-verified on Cezanne; 3.2.11 adds
+per-ext-set tracking (every `OpExtInst` must reference the actual GLSL.std.450 import),
+completing the v3.2.x compiler-breadth arc. See the CHANGELOG.)
 
 ## Features
 

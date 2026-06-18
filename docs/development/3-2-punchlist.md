@@ -872,9 +872,11 @@ hand-authored shaders stay as oracle + fallback.
     - [x] **N.10e (2026-06-18) — cut 3.2.10.** VERSION/README/CHANGELOG/CLAUDE.md bumped;
       dist re-stamped; closeout green (suite 3800, bench, vector HW arc on Cezanne);
       release-readiness audit. **→ 3.2.10 (vectors) shipped.**
-  - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
-    verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
-    Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
+  - [x] **N.11 *(3.2.11)* (2026-06-18) — per-ext-set tracking.** `_spirv_find_glsl_ext_set`
+    resolves the `OpExtInstImport "GLSL.std.450"` id (packed-string match); `_spirv_check_ext_sets`
+    (in `spirv_lower_module`) requires every `OpExtInst` to reference it, else `LOWER_ERR_EXT_SET`
+    — drops the MVP "only GLSL.std.450 imported" assumption. No HW change (existing GLSL kernels
+    still run on Cezanne); +5 CPU asserts. Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
 
 ---
 

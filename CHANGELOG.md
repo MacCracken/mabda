@@ -13,6 +13,37 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.2.11] — 2026-06-18
+
+The native **SPIR-V→GFX9 per-ext-set tracking** (**Phase N.11**) — and the close of the v3.2.x
+**compiler-breadth arc**. The compiler now resolves the `OpExtInstImport "GLSL.std.450"` id and
+requires every `OpExtInst` to reference it, dropping the MVP "the only imported ext set is
+GLSL.std.450" assumption: an `OpExtInst` against any other ext set (or with no GLSL.std.450
+import) fails loud rather than mis-decoding another set's instruction numbers as GLSL math. No
+new HW capability (a validation/rejection bite); the existing GLSL.std.450 kernels still run
+value-exact on Cezanne. Toolchain pin 6.2.21. With this, **N.7–N.11 (control flow → scalar
+f32/i32 → int div/mod → vectors → ext-set tracking)** are complete; 3.2.12+ resumes the
+previously-roadmapped Phase F (f64) and Phase R (render-graph multi-queue).
+
+### Added — Phase N.11 (per-ext-set tracking — `OpExtInst` set validation)
+- **Drop the "the only imported ext set is GLSL.std.450" MVP assumption** (`src/spirv_lower.cyr`):
+  `spirv_lower_module` now resolves the `OpExtInstImport` whose name is exactly `"GLSL.std.450"`
+  (`_spirv_find_glsl_ext_set`, matching the packed `0x4C534C47`/`0x6474732E`/`0x3035342E`/`0`
+  string words) and requires every `OpExtInst` to reference that import (`_spirv_check_ext_sets`).
+  An `OpExtInst` against any other ext set — or with no GLSL.std.450 import at all — fails loud
+  (`LOWER_ERR_EXT_SET`) instead of mis-decoding another set's instruction numbers as GLSL math.
+- No HW behavior change: the existing GLSL.std.450 kernels (`native_spirv_{glsl_max,fma,fclamp,…}_e2e`)
+  still compile + run value-exact on Cezanne (the validation accepts the real GLSL.std.450 import).
+- **Adversarial review hardening:** (1) reject *any* `OpExtInst` when no GLSL.std.450 import is
+  present — closes a `set==0` hole where `0 != 0` would have skipped rejection; (2) the import-name
+  matcher checks only the nul byte (`& 0xFF`) past `".450"`, not the full padding word, so a
+  non-zero-padded (but conformant-string) producer is not false-rejected, while a longer name is
+  still rejected (its 13th byte is non-nul).
+- CPU suite +8 (`test_spirv_ext_set_validation`: GLSL import resolution, accept the matching set,
+  reject a wrong set + a missing/renamed import + a `set==0` hole + non-zero padding). **This
+  completes Phase N.11 — the v3.2.x compiler-breadth arc; 3.2.12+ resumes Phase F (f64) /
+  Phase R (render-graph).**
+
 ## [3.2.10] — 2026-06-18
 
 The native **SPIR-V→GFX9 vector support** — vec2/vec3/vec4 across construct/extract,
