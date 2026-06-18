@@ -715,10 +715,18 @@ hand-authored shaders stay as oracle + fallback.
     `gfx9_enc_sopc` + u32 `s_cmp_*` (→ SCC), and the EXEC-mask ops
     (`s_and_saveexec_b64` / `s_andn2_b64` / `s_or_b64` / `s_mov_b64`) — all
     llvm-mc-verified, +14 asserts (`test_gfx9_enc_control_flow`).
-  - [ ] **N.7b — uniform `if` pipeline** — multi-block SPIR-V parse + MIR blocks +
-    branch terminators + comparison lowering (→ SCC) + isel + block layout/offset
-    resolution + cross-block (linear-scan over flattened forward blocks) regalloc +
-    an `if (wgid uniform) {...}` HW e2e on Cezanne.
+  - [~] **N.7b — uniform `if` pipeline.**
+    - [x] **N.7b-1 (2026-06-17) — control-flow front-end.** `OpLabel`/`OpBranch`/
+      `OpBranchConditional`/`OpSelectionMerge` + integer comparisons lower to new MIR
+      ops (`LABEL`/`BRANCH`/`COND_BRANCH`/`ICMP_*`), modelled as flat-list instructions
+      (no block array → no `mir_mod_init` change). Entry label skipped (straight-line
+      kernels unchanged); `ICMP` uniformity = meet of operands (`wgid.x==c` → uniform).
+      Loops + phi still fail loud. `test_spirv_lower_uniform_if` (+17 asserts).
+    - [ ] **N.7b-2 — back-end + HW.** isel (`ICMP`→`s_cmp` SCC, `COND_BRANCH`→
+      `s_cbranch_scc0` to the merge, `BRANCH`→`s_branch`, `LABEL`→marker) + a two-pass
+      block layout (record label byte offsets, patch each branch's `simm16`) +
+      cross-block linear-scan regalloc over the flattened forward blocks + an
+      `if (wgid.x==0){...}` HW e2e on Cezanne (grid 2 → only wg0 writes).
   - [ ] **N.7c — divergent `if`** — per-lane condition via `s_and_saveexec_b64` +
     `s_cbranch_execz` skip + `s_or_b64` EXEC restore at the merge; divergent e2e.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

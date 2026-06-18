@@ -40,12 +40,23 @@ var SPIRV_OP_BITWISE_XOR      = 198;
 var SPIRV_OP_BITWISE_AND      = 199;
 var SPIRV_OP_RETURN           = 253;
 
-# Control-flow ops the straight-line MVP rejects (fail loud → N.7).
+# Control-flow ops. N.7: BRANCH/BRANCH_CONDITIONAL/SELECTION_MERGE lower; LOOP_MERGE
+# (back-edges break the forward linear-scan) + PHI (the MVP forbids merge-consumed
+# values) still fail loud.
 var SPIRV_OP_LOOP_MERGE          = 246;
 var SPIRV_OP_SELECTION_MERGE     = 247;
 var SPIRV_OP_BRANCH              = 249;
 var SPIRV_OP_BRANCH_CONDITIONAL  = 250;
 var SPIRV_OP_PHI                 = 245;
+
+# Integer comparison opcodes (N.7) → MIR_OP_ICMP_*. Unsigned forms (indices are
+# unsigned); the signed variants land when a kernel needs them.
+var SPIRV_OP_IEQUAL              = 170;
+var SPIRV_OP_INOTEQUAL           = 171;
+var SPIRV_OP_UGREATERTHAN        = 172;
+var SPIRV_OP_UGREATERTHANEQUAL   = 174;
+var SPIRV_OP_ULESSTHAN           = 176;
+var SPIRV_OP_ULESSTHANEQUAL      = 178;
 
 # OpDecorate Decoration = BuiltIn, and the compute BuiltIn enum values.
 var SPIRV_DECO_BUILTIN              = 11;
@@ -189,6 +200,18 @@ fn _spirv_alu_to_mir(op): i64 {
     if (op == SPIRV_OP_FADD) { return MIR_OP_FADD; }
     if (op == SPIRV_OP_FSUB) { return MIR_OP_FSUB; }
     if (op == SPIRV_OP_FMUL) { return MIR_OP_FMUL; }
+    return 0;
+}
+
+# SPIR-V integer-comparison opcode → MIR_OP_ICMP_*, or 0 if not a comparison we
+# lower. The result is a bool the COND_BRANCH consumes (a uniform compare → SCC).
+fn _spirv_cmp_to_mir(op): i64 {
+    if (op == SPIRV_OP_IEQUAL) { return MIR_OP_ICMP_EQ; }
+    if (op == SPIRV_OP_INOTEQUAL) { return MIR_OP_ICMP_NE; }
+    if (op == SPIRV_OP_UGREATERTHAN) { return MIR_OP_ICMP_UGT; }
+    if (op == SPIRV_OP_UGREATERTHANEQUAL) { return MIR_OP_ICMP_UGE; }
+    if (op == SPIRV_OP_ULESSTHAN) { return MIR_OP_ICMP_ULT; }
+    if (op == SPIRV_OP_ULESSTHANEQUAL) { return MIR_OP_ICMP_ULE; }
     return 0;
 }
 
@@ -337,16 +360,47 @@ fn _spirv_expand_gid(m, result, ety, comp, lsz_c): i64 {
 }
 
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
-    if (op == SPIRV_OP_BRANCH) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_BRANCH_CONDITIONAL) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_SELECTION_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
+    # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
     if (op == SPIRV_OP_LOOP_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
     if (op == SPIRV_OP_PHI) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_LABEL) { return 0; }
+    # SelectionMerge is a structured hint (the merge block id); the back-end derives
+    # layout from the LABELs, so it is a no-op here.
+    if (op == SPIRV_OP_SELECTION_MERGE) { return 0; }
+    # OpLabel %L → a 0-byte LABEL marker (a = label <id>) the back-end resolves
+    # branch offsets against. The ENTRY label (the first instruction emitted) is
+    # skipped: it is always laid out at offset 0 and is never a branch target in a
+    # forward if, so emitting it would shift every straight-line kernel's MIR.
+    if (op == SPIRV_OP_LABEL) {
+        if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (mir_n_instrs(m) == 0) { return 0; }
+        return mir_emit(m, MIR_OP_LABEL, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
+    }
+    # OpBranch %target → unconditional branch (a = target label).
+    if (op == SPIRV_OP_BRANCH) {
+        if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
+    }
+    # OpBranchConditional %cond %true %false → a = cond value, b = true (the
+    # fall-through then), c = false (the merge); b/c are labels (immediate tags).
+    if (op == SPIRV_OP_BRANCH_CONDITIONAL) {
+        if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1),
+        spirv_word(ptr, off + 2), spirv_word(ptr, off + 3), MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    }
     if (op == SPIRV_OP_RETURN) {
         var er = mir_emit(m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
         if (er < 0) { return er; }
         return 0;
+    }
+    # Integer comparisons → ICMP (a bool result the COND_BRANCH consumes). The
+    # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
+    # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
+    var cop = _spirv_cmp_to_mir(op);
+    if (cop != 0) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        return mir_emit(m, cop, spirv_word(ptr, off + 2), MIR_T_U32,
+        spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
     }
     var mop = _spirv_alu_to_mir(op);
     if (mop != 0) {

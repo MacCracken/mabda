@@ -983,15 +983,16 @@ fn test_spirv_lower_negatives() {
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
     0 - LOWER_ERR_NO_ENTRY, "no entry rejected");
-    # a control-flow op in the body -> LOWER_ERR_CONTROL_FLOW (fail loud, N.7)
+    # N.7: BRANCH/SELECTION_MERGE now lower; LOOP_MERGE + PHI still fail loud
+    # (loops break the forward linear-scan; the MVP forbids merge-consumed values).
     _spv_build_gid_kernel(&buf);
-    store32(&buf + 324, (5 << 16) | 249);   # OpShiftLeftLogical -> OpBranch
+    store32(&buf + 324, (5 << 16) | 245);   # OpShiftLeftLogical -> OpPhi (still rejected)
     spirv_build_type_table(&buf, n, 16, 16, &types);
     spirv_build_const_table(&buf, n, 16, 16, &consts);
     spirv_build_decoration_table(&buf, n, 16, 16, &deco);
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
-    0 - LOWER_ERR_CONTROL_FLOW, "CF rejected");
+    0 - LOWER_ERR_CONTROL_FLOW, "PHI still rejected");
     # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP
     _spv_build_gid_kernel(&buf);
     store32(&buf + 324, (5 << 16) | 136);   # OpShiftLeftLogical -> OpFDiv (unmapped)
@@ -2251,6 +2252,141 @@ fn test_spirv_lower_synth_exhaustion() {
     return 0;
 }
 
+# N.7b — a uniform `if (wgid.x == 0) {}` structured-CF module (id-bound 16):
+# entry %10 [extract wgid.x, ICMP_EQ, cond-branch to then/merge] / then %14 [branch
+# merge] / merge %15 [return]. Exercises OpLabel/OpSelectionMerge/OpBranchConditional/
+# OpBranch/OpIEqual lowering.
+fn _spv_build_uniform_if(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 16);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);   # OpMemoryModel
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (6 << 16) | 15);   # OpEntryPoint %9 "main" %8
+    store32(buf + 44, 5);
+    store32(buf + 48, 9);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 8);
+    store32(buf + 64, (6 << 16) | 16);   # OpExecutionMode LocalSize 8 1 1
+    store32(buf + 68, 9);
+    store32(buf + 72, 17);
+    store32(buf + 76, 8);
+    store32(buf + 80, 1);
+    store32(buf + 84, 1);
+    store32(buf + 88, (4 << 16) | 71);   # OpDecorate %8 BuiltIn WorkgroupId
+    store32(buf + 92, 8);
+    store32(buf + 96, 11);
+    store32(buf + 100, 26);
+    store32(buf + 104, (2 << 16) | 19);  # %1 void
+    store32(buf + 108, 1);
+    store32(buf + 112, (3 << 16) | 33);  # %2 fn
+    store32(buf + 116, 2);
+    store32(buf + 120, 1);
+    store32(buf + 124, (4 << 16) | 21);  # %3 uint
+    store32(buf + 128, 3);
+    store32(buf + 132, 32);
+    store32(buf + 136, 0);
+    store32(buf + 140, (4 << 16) | 23);  # %4 v3uint
+    store32(buf + 144, 4);
+    store32(buf + 148, 3);
+    store32(buf + 152, 3);
+    store32(buf + 156, (4 << 16) | 32);  # %5 ptr Input
+    store32(buf + 160, 5);
+    store32(buf + 164, 1);
+    store32(buf + 168, 4);
+    store32(buf + 172, (2 << 16) | 20);  # %6 bool
+    store32(buf + 176, 6);
+    store32(buf + 180, (4 << 16) | 43);  # %7 const 0
+    store32(buf + 184, 3);
+    store32(buf + 188, 7);
+    store32(buf + 192, 0);
+    store32(buf + 196, (4 << 16) | 59);  # %8 wgid var
+    store32(buf + 200, 5);
+    store32(buf + 204, 8);
+    store32(buf + 208, 1);
+    store32(buf + 212, (5 << 16) | 54);  # OpFunction %9
+    store32(buf + 216, 1);
+    store32(buf + 220, 9);
+    store32(buf + 224, 0);
+    store32(buf + 228, 2);
+    store32(buf + 232, (2 << 16) | 248); # OpLabel %10 (entry)
+    store32(buf + 236, 10);
+    store32(buf + 240, (4 << 16) | 61);  # OpLoad %11
+    store32(buf + 244, 4);
+    store32(buf + 248, 11);
+    store32(buf + 252, 8);
+    store32(buf + 256, (5 << 16) | 81);  # OpCompositeExtract wgid.x %12
+    store32(buf + 260, 3);
+    store32(buf + 264, 12);
+    store32(buf + 268, 11);
+    store32(buf + 272, 0);
+    store32(buf + 276, (5 << 16) | 170); # OpIEqual %13
+    store32(buf + 280, 6);
+    store32(buf + 284, 13);
+    store32(buf + 288, 12);
+    store32(buf + 292, 7);
+    store32(buf + 296, (3 << 16) | 247); # OpSelectionMerge %15
+    store32(buf + 300, 15);
+    store32(buf + 304, 0);
+    store32(buf + 308, (4 << 16) | 250); # OpBranchConditional %13 %14 %15
+    store32(buf + 312, 13);
+    store32(buf + 316, 14);
+    store32(buf + 320, 15);
+    store32(buf + 324, (2 << 16) | 248); # OpLabel %14 (then)
+    store32(buf + 328, 14);
+    store32(buf + 332, (2 << 16) | 249); # OpBranch %15
+    store32(buf + 336, 15);
+    store32(buf + 340, (2 << 16) | 248); # OpLabel %15 (merge)
+    store32(buf + 344, 15);
+    store32(buf + 348, (1 << 16) | 253); # OpReturn
+    store32(buf + 352, (1 << 16) | 56);  # OpFunctionEnd
+    return 356;
+}
+
+fn test_spirv_lower_uniform_if() {
+    var buf[640];
+    var n = _spv_build_uniform_if(&buf);
+    assert_eq(spirv_validate_stream(&buf, n), 0, "uniform-if valid");
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "uniform-if lowers");
+    # The entry label is skipped (laid out at 0); then/merge get LABEL markers.
+    assert_eq(mir_n_instrs(&m), 7, "7 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_ICMP_EQ, "1: icmp_eq");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_COND_BRANCH, "2: cond-branch");
+    assert_eq(mir_instr_a(&m, 2), 13, "cond = %13 (the icmp)");
+    assert_eq(mir_instr_b(&m, 2), 14, "true label = then %14");
+    assert_eq(mir_instr_c(&m, 2), 15, "false label = merge %15");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_LABEL, "3: then label");
+    assert_eq(mir_instr_a(&m, 3), 14, "then label id 14");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_BRANCH, "4: branch to merge");
+    assert_eq(mir_instr_a(&m, 4), 15, "branch target = merge %15");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_LABEL, "5: merge label");
+    assert_eq(mir_instr_a(&m, 5), 15, "merge label id 15");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_RET, "6: return");
+    # The condition is UNIFORM (wgid.x + a constant) → the s_cbranch_scc path.
+    assert_eq(mir_val_unif(&m, 13), MIR_UNIFORM, "icmp_eq result uniform (uniform branch)");
+    return 0;
+}
+
 # N.5c review (CRITICAL): the validate gate returns POSITIVE codes, so gfx9_compile
 # must reject malformed SPIR-V with `!= 0`, not `< 0` (which never fired and let
 # bad input reach the table builders). A bad-magic module must fail loud here.
@@ -2482,6 +2618,7 @@ fn main(): i64 {
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_spirv_lower_gid_expansion();
+    test_spirv_lower_uniform_if();
     test_spirv_lower_synth_exhaustion();
     test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();

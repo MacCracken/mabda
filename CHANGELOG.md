@@ -15,6 +15,22 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7b-1 (control-flow front-end — multi-block lowering)
+- **The SPIR-V→GFX9 compiler now lowers structured control flow into MIR.**
+  `src/spirv_lower.cyr`: `OpLabel`/`OpBranch`/`OpBranchConditional`/`OpSelectionMerge`
+  + the integer comparisons (`OpIEqual`/`OpINotEqual`/`OpU{Less,Greater}Than{,Equal}`)
+  now lower (they previously failed loud). New MIR ops (`src/mir.cyr`):
+  `MIR_OP_LABEL`/`BRANCH`/`COND_BRANCH`/`ICMP_*` — control flow is modelled as
+  instructions in the flat list (no separate block array, so no `mir_mod_init`
+  signature change), and the back-end will derive block layout by scanning for
+  `LABEL`. The entry label is skipped (always at offset 0, never a branch target),
+  so straight-line kernels lower byte-identically. The uniformity pass classifies an
+  `ICMP` result as the meet of its operands — `wgid.x == const` is **uniform** (the
+  `s_cbranch_scc` path). Loops (`OpLoopMerge`) + `OpPhi` still fail loud (a back-edge
+  breaks the forward linear-scan; the MVP carries no merge-consumed values).
+  +17 asserts (`test_spirv_lower_uniform_if` over a 3-block `if (wgid.x==0){}`).
+  Codegen (isel/layout/regalloc/encode → HW) is N.7b-2.
+
 ### Added — Phase N.7a (control-flow encoders — the foundation)
 - **The GFX9 control-flow instruction encoders, all llvm-mc gfx900-verified.**
   `src/gfx9_encode.cyr`: SOPP branches (`s_branch`, `s_cbranch_scc0/scc1` — the
