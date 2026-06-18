@@ -13,6 +13,111 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.2.10] — 2026-06-18
+
+The native **SPIR-V→GFX9 vector support** — vec2/vec3/vec4 across construct/extract,
+component-wise arithmetic, `array<vecN>` buffer load/store, and constants (**Phase N.10**),
+all HW-verified on Cezanne. GFX9 has no vector registers, so the approach is **scalarize-on-
+lower**: a vecN is a `MIR_VK_VECTOR` value packing its N component scalar `<id>`s, and every
+vector op emits N scalar ops — the entire scalar back end (isel/regalloc/waitcnt/emit) is
+reused unchanged. **N.10a** `OpCompositeConstruct`/`OpCompositeExtract`; **N.10b** component-
+wise binary arithmetic + the constant-index FLAT enabler (a constant `OpAccessChain` index now
+VMOV-materializes its offset into a VGPR); **N.10c** `array<vecN>` `OpLoad`/`OpStore` (std430
+stride, with a fail-loud non-std430 `ArrayStride` gate); **N.10d** `OpConstantComposite` + splat
+(with per-component const-fold). Four HW e2e programs value-exact on Cezanne; every bite
+adversarially reviewed (Workflow). Toolchain pin 6.2.21. (per-ext-set tracking is 3.2.11.)
+
+### Added — Phase N.10d (`OpConstantComposite` vector constants + splat, HW-verified)
+- **Vector constants** (`src/spirv_lower.cyr`): `OpConstantComposite` (44) is structurally
+  identical to `OpCompositeConstruct` (same `[type, result, constituents…]` layout, all
+  constituents are scalar `OpConstant`s already seeded), so the seed pass reuses
+  `_spirv_lower_composite_construct` to pack the constituent const `<id>`s into a
+  `MIR_VK_VECTOR` (zero instructions). A const array/struct composite is non-vector → fails
+  loud. **Splat** (`vecN(x)`) needs no new code — glslang emits it as a Construct /
+  ConstantComposite with the operand repeated, which the packer already handles.
+- **HW**: `programs/native_spirv_vector_const_e2e.cyr` — `out[i] = a[i] + vec4(10,20,30,40)`
+  over `array<vec4<f32>>`, gid-indexed, **value-exact on Cezanne** (all 16 floats). The
+  non-inline constants (10/20/30/40) exercise the VOP2 32-bit-literal operand path in the
+  per-component `v_add_f32` (loaded VGPR + constant) — handled cleanly, no gap.
+- **Per-component const-fold (adversarial review):** `_spirv_lower_vec_binop` now folds a
+  component whose two operands are both constants (mirroring the scalar ALU fold), so a vecN
+  op over two vector constants folds to a constant vector instead of emitting per-component
+  `v_add(const, const)` — which a VOP2 can't encode (two non-VGPR operands). glslang folds
+  these itself, so the HW path (loaded-VGPR + const) was unaffected.
+- CPU suite +16 (`test_spirv_lower_constant_composite`: the vec4 constant via the seed pass +
+  a splat check; `test_spirv_lower_vec_binop_fold`: the vec const+const fold; the runtime
+  component-wise test now uses non-const operands so it still exercises the emit path).
+  **This completes Phase N.10 (vectors) — the 3.2.10 arc.**
+
+### Added — Phase N.10c (vector `OpLoad` / `OpStore` for `array<vecN>`, HW-verified)
+- **Vector buffer access** (`src/spirv_lower.cyr`): `OpAccessChain` now accepts a vecN element,
+  using the **std430 array stride** (vec2 → 8, vec3/vec4 → 16; vec3 padded), computed from the
+  element type — std430 is the SSBO default, so no `ArrayStride` decoration lookup is needed
+  (an MVP layout assumption like the existing single-member-struct / member-0 limits). A vecN
+  `OpLoad` (`_spirv_lower_vec_load`) scalarizes into **N consecutive 4-byte loads** at
+  `element_base + j*4` producing a packed `MIR_VK_VECTOR`; a vecN `OpStore`
+  (`_spirv_lower_vec_store`) into N stores of the packed components. Count-matched, fail-loud
+  on a scalar/mismatched-count store.
+- **HW**: `programs/native_spirv_vector_load_store_e2e.cyr` — `out[i] = a[i] + b[i]` over
+  three `array<vec4<f32>>` SSBOs, gid-indexed across 4 elements, **value-exact on Cezanne**
+  (all 16 floats; distinct `a[i]` per element confirms the std430 stride + gid indexing).
+- **Fail-loud `ArrayStride` validation (adversarial review):** `spirv_lower_module` scans
+  `OpDecorate ArrayStride` and rejects (`LOWER_ERR_ARRAY_STRIDE`) any Array/RuntimeArray whose
+  declared stride disagrees with the assumed std430 — so a non-std430 layout (e.g. a
+  tightly-packed `array<vec3>` stride 12) fails loud instead of silently mis-addressing.
+  std430 (or an absent decoration) is accepted. The dynamic-index `aidx*stride` is left
+  unguarded by design: an out-of-bounds array index is UB in SPIR-V (a runtime value the
+  consumer owns), unlike the compile-time-foldable constant index.
+- CPU suite +46 (`test_spirv_lower_vec_load_store`: vec2/vec3/vec4 offset math + packing +
+  store guards; `test_spirv_lower_vec_access_chain`: std430 stride for vec2/vec4 + the dynamic
+  IMUL path; `test_spirv_array_stride_validation`); the former "vec-element arrays rejected"
+  assertion removed (now supported). Bite adversarially reviewed (5 findings: 2 fixed via the
+  stride validation, 2 closed with the added coverage, 1 documented as SPIR-V UB).
+
+### Added — Phase N.10b (component-wise vector arithmetic + constant-index buffer access, HW-verified)
+- **Component-wise vector arithmetic** (`src/spirv_lower.cyr`, `_spirv_lower_vec_binop`): a
+  vecN ALU op (`OpFAdd`/`OpFMul`/`OpIAdd`/…) lowers to **N scalar ops** over the packed
+  components (routed ahead of the scalar const-fold). Each operand is a vecN of matching
+  count+base type (component-wise) or a scalar (broadcast to every lane); count/base
+  mismatches fail loud. The scalar back end is reused unchanged.
+- **Constant-index buffer access enabler** (`_spirv_lower_access_chain`): a constant
+  `OpAccessChain` array index now **materializes its byte offset into a VGPR** (`v_mov_b32`)
+  instead of folding to a `const_off` the FLAT load/store emitter cannot consume. Every prior
+  native kernel indexed by the dynamic `gl_GlobalInvocationID`, so the constant-index → FLAT
+  path was never exercised end-to-end (it returned `CMP_ERR_FLAT_CONST_OFFSET`); this is what
+  lets a single-workgroup vector kernel address `a[0]`/`a[1]`/`a[2]`. The immediate-offset
+  FLAT form remains a later optimization.
+- **HW**: `programs/native_spirv_vector_add_e2e.cyr` — a vec3 kernel (`vec3(a0,a1,a2)` +
+  `vec3(b0,b1,b2)` component-wise add → `out[0..2]`, multiply → `out[3..5]`) compiled in-tree
+  and **value-exact on Cezanne** (`[5,7,9]` / `[4,10,18]`).
+- CPU suite +19 (`test_spirv_lower_vec_binop`: component-wise FADD via the dispatch, scalar
+  broadcast, count/base-type mismatch guards; plus a high-bit-index regression test proving a
+  `0xFFFFFFFF` array index is caught by the overflow guard — `load32` zero-extends, so the
+  VMOV materialization never sees a negative offset); the constant-index access-chain test
+  updated for the VGPR-materialized offset. Bite adversarially reviewed (3 findings, all
+  false alarms — bindings HW-confirmed, high-bit index overflow-guarded).
+
+### Added — Phase N.10a (vector infrastructure + `OpCompositeConstruct` / `OpCompositeExtract`)
+- **Scalarize-on-lower vectors** (3.2.10 groundwork): a vecN is a new `MIR_VK_VECTOR` value
+  whose payload packs its N component scalar `<id>`s (16 bits each, low component first); the
+  count rides in the packed MIR type. GFX9 has no vector registers, so every vector op will
+  emit N scalar ops — the scalar back end (isel/regalloc/waitcnt/emit) is reused unchanged.
+  Helpers `mir_set_vector` / `mir_is_vector` / `mir_vec_comp` (`src/mir.cyr`).
+- **`OpCompositeConstruct` (80)** packs the operand `<id>`s into the result vector and emits
+  **no instructions**; **`OpCompositeExtract` (81)** from a vector lowers to a single
+  `MIR_OP_VMOV` from the packed component (the GID vec3 builtin special-case stays ahead of
+  it; non-GID builtins still use the legacy `MIR_OP_EXTRACT` path).
+- **Fail-loud hardening (adversarial review):** `mir_emit` now centrally rejects a
+  `MIR_VK_VECTOR` operand — a vecN must be scalarized before reaching the scalar emit boundary,
+  so an unimplemented vector op (e.g. vec arith, landing in N.10b) fails loud instead of
+  silently reading the vector record's placeholder uniformity. `OpCompositeExtract` bounds the
+  component index for **all** vec3 builtins (not just `GlobalInvocationId`), and
+  `OpCompositeConstruct` requires scalar CONST/SSA operands (rejecting nested vectors, raw
+  builtins, pointers, and the null id).
+- CPU suite +24 (`test_spirv_lower_vec_construct_extract` + `_guards` + `_vec_robustness`).
+  Design-validated via an N.10 design workflow; bite adversarially reviewed (7 confirmed
+  findings fixed pre-commit).
+
 ## [3.2.9] — 2026-06-18
 
 The native **SPIR-V→GFX9 integer division & remainder** family — the full int div/mod set

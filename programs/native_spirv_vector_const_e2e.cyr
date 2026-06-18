@@ -1,0 +1,318 @@
+# programs/native_spirv_vector_const_e2e.cyr — N.10d: SPIR-V vec4 OpConstantComposite
+# constant added to a loaded `array<vec4<f32>>` element, compiled in-tree and dispatched on
+# Cezanne, verified bit-exact (f32) vs a CPU reference.
+#
+# Kernel (LocalSize 4,1,1; gid-indexed via gl_GlobalInvocationID.x):
+#   const vec4 K = vec4(10.0, 20.0, 30.0, 40.0);  // 4x OpConstant + OpConstantComposite (44)
+#   uint i  = gl_GlobalInvocationID.x;
+#   vec4 va = a[i];        // OpAccessChain into array<vec4> + vec4 OpLoad (61)
+#   vec4 vc = va + K;      // component-wise OpFAdd (129): loaded vec4 + vec4 const
+#   out[i]  = vc;          // vec4 OpStore (62)
+# Two StorageBuffers, each a runtime array of vec4<f32>: A (binding 0), Out (binding 1).
+# K is a vec4 constant assembled in the constants section (before OpFunction) from four scalar
+# OpConstants via OpConstantComposite (opcode 44) — the NEW N.10d path. The component-wise
+# OpFAdd scalarizes to 4 v_add_f32, each adding a loaded component (VGPR) and a constant
+# component. The four constants 10/20/30/40 (0x41200000/0x41A00000/0x41F00000/0x42200000) are
+# NOT inline-representable f32s, so they exercise the VOP2 32-bit literal operand path (the
+# constant rides src0 via the commutative VOP2 swap). std430 stride is 16 bytes — ArrayStride 16
+# is emitted on %rtarr (the compiler validates it matches std430 and fails the compile otherwise).
+#
+# SPIR-V is the byte-exact output of `spirv-as --target-env spv1.3` (validated with spirv-val);
+# header word 2 = 0x00010300 (1.3), id-bound = 29 (< 128 compiler cap). 173 words / 692 bytes.
+#
+# Inputs (exact small integers → exact in f32): a[i] = (i, i+1, i+2, i+3).
+# CPU reference: out[i].xyzw = (a[i].x + 10, a[i].y + 20, a[i].z + 30, a[i].w + 40).
+# Exit: 0 = correct; 2 = compile; 3/5 = setup; 9 = dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex(n): i64 {
+    var buf[16];
+    var d = 0;
+    while (d < 8) {
+        var nib = (n >> ((7 - d) * 4)) & 0xF;
+        var ch = 48 + nib;
+        if (nib > 9) { ch = 87 + nib; }
+        store8(&buf + d, ch);
+        d = d + 1;
+    }
+    syscall(1, 1, &buf, 8);
+    return 0;
+}
+
+# SPIR-V (1.3, id-bound 29, 692 bytes). Byte-exact from spirv-as; round-trip verified.
+# Kernel: out[gid.x] = a[gid.x] + vec4(10,20,30,40) over vec4<f32> elements (std430 stride 16).
+fn build_vector_const_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x0000001D); # id-bound 29
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011); # OpCapability Shader
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x0003000E); # OpMemoryModel Logical GLSL450
+    store32(buf + 32, 0x00000000);
+    store32(buf + 36, 0x00000001);
+    store32(buf + 40, 0x0006000F); # OpEntryPoint GLCompute %1 "main" %gid
+    store32(buf + 44, 0x00000005);
+    store32(buf + 48, 0x00000001);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x00000002);
+    store32(buf + 64, 0x00060010); # OpExecutionMode %1 LocalSize 4 1 1
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x00000011);
+    store32(buf + 76, 0x00000004);
+    store32(buf + 80, 0x00000001);
+    store32(buf + 84, 0x00000001);
+    store32(buf + 88, 0x00040047); # OpDecorate %gid BuiltIn GlobalInvocationId
+    store32(buf + 92, 0x00000002);
+    store32(buf + 96, 0x0000000B);
+    store32(buf + 100, 0x0000001C);
+    store32(buf + 104, 0x00040047); # OpDecorate %rtarr ArrayStride 16
+    store32(buf + 108, 0x00000003);
+    store32(buf + 112, 0x00000006);
+    store32(buf + 116, 0x00000010);
+    store32(buf + 120, 0x00050048); # OpMemberDecorate %ssbo 0 Offset 0
+    store32(buf + 124, 0x00000004);
+    store32(buf + 128, 0x00000000);
+    store32(buf + 132, 0x00000023);
+    store32(buf + 136, 0x00000000);
+    store32(buf + 140, 0x00030047); # OpDecorate %ssbo Block
+    store32(buf + 144, 0x00000004);
+    store32(buf + 148, 0x00000002);
+    store32(buf + 152, 0x00040047); # OpDecorate %A DescriptorSet 0
+    store32(buf + 156, 0x00000005);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047); # OpDecorate %A Binding 0
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000000);
+    store32(buf + 184, 0x00040047); # OpDecorate %Out DescriptorSet 0
+    store32(buf + 188, 0x00000006);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00040047); # OpDecorate %Out Binding 1
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00000021);
+    store32(buf + 212, 0x00000001);
+    store32(buf + 216, 0x00020013); # %void = OpTypeVoid
+    store32(buf + 220, 0x00000007);
+    store32(buf + 224, 0x00030021); # %fnvoid = OpTypeFunction %void
+    store32(buf + 228, 0x00000008);
+    store32(buf + 232, 0x00000007);
+    store32(buf + 236, 0x00030016); # %f32 = OpTypeFloat 32
+    store32(buf + 240, 0x00000009);
+    store32(buf + 244, 0x00000020);
+    store32(buf + 248, 0x00040017); # %v4f = OpTypeVector %f32 4
+    store32(buf + 252, 0x0000000A);
+    store32(buf + 256, 0x00000009);
+    store32(buf + 260, 0x00000004);
+    store32(buf + 264, 0x00040015); # %u32 = OpTypeInt 32 0
+    store32(buf + 268, 0x0000000B);
+    store32(buf + 272, 0x00000020);
+    store32(buf + 276, 0x00000000);
+    store32(buf + 280, 0x00040017); # %v3u32 = OpTypeVector %u32 3
+    store32(buf + 284, 0x0000000C);
+    store32(buf + 288, 0x0000000B);
+    store32(buf + 292, 0x00000003);
+    store32(buf + 296, 0x0003001D); # %rtarr = OpTypeRuntimeArray %v4f
+    store32(buf + 300, 0x00000003);
+    store32(buf + 304, 0x0000000A);
+    store32(buf + 308, 0x0003001E); # %ssbo = OpTypeStruct %rtarr
+    store32(buf + 312, 0x00000004);
+    store32(buf + 316, 0x00000003);
+    store32(buf + 320, 0x00040020); # %ptr_ssbo = OpTypePointer StorageBuffer %ssbo
+    store32(buf + 324, 0x0000000D);
+    store32(buf + 328, 0x0000000C);
+    store32(buf + 332, 0x00000004);
+    store32(buf + 336, 0x00040020); # %ptr_v4f = OpTypePointer StorageBuffer %v4f
+    store32(buf + 340, 0x0000000E);
+    store32(buf + 344, 0x0000000C);
+    store32(buf + 348, 0x0000000A);
+    store32(buf + 352, 0x00040020); # %ptr_in_v3u = OpTypePointer Input %v3u32
+    store32(buf + 356, 0x0000000F);
+    store32(buf + 360, 0x00000001);
+    store32(buf + 364, 0x0000000C);
+    store32(buf + 368, 0x0004002B); # %k0 = OpConstant %f32 10.0  (0x41200000)
+    store32(buf + 372, 0x00000009);
+    store32(buf + 376, 0x00000010);
+    store32(buf + 380, 0x41200000);
+    store32(buf + 384, 0x0004002B); # %k1 = OpConstant %f32 20.0  (0x41A00000)
+    store32(buf + 388, 0x00000009);
+    store32(buf + 392, 0x00000011);
+    store32(buf + 396, 0x41A00000);
+    store32(buf + 400, 0x0004002B); # %k2 = OpConstant %f32 30.0  (0x41F00000)
+    store32(buf + 404, 0x00000009);
+    store32(buf + 408, 0x00000012);
+    store32(buf + 412, 0x41F00000);
+    store32(buf + 416, 0x0004002B); # %k3 = OpConstant %f32 40.0  (0x42200000)
+    store32(buf + 420, 0x00000009);
+    store32(buf + 424, 0x00000013);
+    store32(buf + 428, 0x42200000);
+    store32(buf + 432, 0x0007002C); # %K = OpConstantComposite %v4f %k0 %k1 %k2 %k3 (opcode 44)
+    store32(buf + 436, 0x0000000A);
+    store32(buf + 440, 0x00000014);
+    store32(buf + 444, 0x00000010);
+    store32(buf + 448, 0x00000011);
+    store32(buf + 452, 0x00000012);
+    store32(buf + 456, 0x00000013);
+    store32(buf + 460, 0x0004002B); # %u0 = OpConstant %u32 0
+    store32(buf + 464, 0x0000000B);
+    store32(buf + 468, 0x00000015);
+    store32(buf + 472, 0x00000000);
+    store32(buf + 476, 0x0004003B); # %A = OpVariable %ptr_ssbo StorageBuffer
+    store32(buf + 480, 0x0000000D);
+    store32(buf + 484, 0x00000005);
+    store32(buf + 488, 0x0000000C);
+    store32(buf + 492, 0x0004003B); # %Out = OpVariable %ptr_ssbo StorageBuffer
+    store32(buf + 496, 0x0000000D);
+    store32(buf + 500, 0x00000006);
+    store32(buf + 504, 0x0000000C);
+    store32(buf + 508, 0x0004003B); # %gid = OpVariable %ptr_in_v3u Input
+    store32(buf + 512, 0x0000000F);
+    store32(buf + 516, 0x00000002);
+    store32(buf + 520, 0x00000001);
+    store32(buf + 524, 0x00050036); # %main = OpFunction %void None %fnvoid
+    store32(buf + 528, 0x00000007);
+    store32(buf + 532, 0x00000001);
+    store32(buf + 536, 0x00000000);
+    store32(buf + 540, 0x00000008);
+    store32(buf + 544, 0x000200F8); # %entry = OpLabel
+    store32(buf + 548, 0x00000016);
+    store32(buf + 552, 0x0004003D); # %gidvec = OpLoad %v3u32 %gid
+    store32(buf + 556, 0x0000000C);
+    store32(buf + 560, 0x00000017);
+    store32(buf + 564, 0x00000002);
+    store32(buf + 568, 0x00050051); # %idx = OpCompositeExtract %u32 %gidvec 0
+    store32(buf + 572, 0x0000000B);
+    store32(buf + 576, 0x00000018);
+    store32(buf + 580, 0x00000017);
+    store32(buf + 584, 0x00000000);
+    store32(buf + 588, 0x00060041); # %pa = OpAccessChain %ptr_v4f %A %u0 %idx
+    store32(buf + 592, 0x0000000E);
+    store32(buf + 596, 0x00000019);
+    store32(buf + 600, 0x00000005);
+    store32(buf + 604, 0x00000015);
+    store32(buf + 608, 0x00000018);
+    store32(buf + 612, 0x0004003D); # %va = OpLoad %v4f %pa  (vec4 load → 4 scalar loads)
+    store32(buf + 616, 0x0000000A);
+    store32(buf + 620, 0x0000001A);
+    store32(buf + 624, 0x00000019);
+    store32(buf + 628, 0x00050081); # %vc = OpFAdd %v4f %va %K  (loaded vec4 + vec4 const)
+    store32(buf + 632, 0x0000000A);
+    store32(buf + 636, 0x0000001B);
+    store32(buf + 640, 0x0000001A);
+    store32(buf + 644, 0x00000014);
+    store32(buf + 648, 0x00060041); # %po = OpAccessChain %ptr_v4f %Out %u0 %idx
+    store32(buf + 652, 0x0000000E);
+    store32(buf + 656, 0x0000001C);
+    store32(buf + 660, 0x00000006);
+    store32(buf + 664, 0x00000015);
+    store32(buf + 668, 0x00000018);
+    store32(buf + 672, 0x0003003E); # OpStore %po %vc  (vec4 store → 4 scalar stores)
+    store32(buf + 676, 0x0000001C);
+    store32(buf + 680, 0x0000001B);
+    store32(buf + 684, 0x000100FD); # OpReturn
+    store32(buf + 688, 0x00010038); # OpFunctionEnd
+    return 692;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V vec4 OpConstantComposite e2e (N.10d) on Cezanne\n");
+    print_cstr("------------------------------------------------------------------\n");
+
+    var spv[1024];
+    var n = build_vector_const_kernel(&spv);
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (shmod == 0) { print_cstr("FAIL: shader_module_create_spirv -> 0\n"); return 2; }
+
+    # 4 vec4 elements per buffer (16 floats each). Inputs are exact small integers (→ exact in
+    # f32): a[i] = (i, i+1, i+2, i+3). K = (10, 20, 30, 40) is the vec4 constant in the shader.
+    var av[64];
+    var want[64];
+    var i = 0;
+    while (i < 4) {
+        var c = 0;
+        while (c < 4) {
+            store32(&av + (i * 4 + c) * 4, int_ratio_to_f32(i + c, 1));
+            store32(&want + (i * 4 + c) * 4, int_ratio_to_f32(i + c + (c + 1) * 10, 1));
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+
+    var ab[16];
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ab) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 5; }
+    var a_handle = load64(&ab + 0); var a_map = load64(&ab + 8);
+    var o_handle = load64(&ob + 0); var o_map = load64(&ob + 8);
+    i = 0;
+    while (i < 16) {
+        store32(a_map + i * 4, load32(&av + i * 4));
+        store32(o_map + i * 4, 0xBAADF00D);
+        i = i + 1;
+    }
+    var a_va = 0xFFFF800100400000;
+    var o_va = 0xFFFF800100402000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    # Binding table: binding 0 = A, binding 1 = Out (matches the SPIR-V Binding decorations).
+    var bp[40];
+    store64(&bp + 0, 2);
+    store64(&bp + 8, a_handle);  store64(&bp + 16, a_va);
+    store64(&bp + 24, o_handle); store64(&bp + 32, o_va);
+
+    # LocalSize 4,1,1 (in the SPIR-V) × 1 workgroup = 4 invocations, one per vec4 element.
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, &bp);
+    if (rc != 0) { print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    var ok = 1;
+    print_cstr("  out[i] = a[i] + vec4(10,20,30,40)  (gid-indexed):\n");
+    i = 0;
+    while (i < 4) {
+        print_cstr("  elem["); print_i64(i); print_cstr("]:");
+        var c = 0;
+        while (c < 4) {
+            var got = load32(o_map + (i * 4 + c) * 4);
+            var w = load32(&want + (i * 4 + c) * 4);
+            print_cstr(" 0x"); print_hex(got);
+            if (got != w) { print_cstr("(MISMATCH want=0x"); print_hex(w); print_cstr(")"); ok = 0; }
+            c = c + 1;
+        }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    gpu_shader_module_release(ctx, shmod);
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: vec4 OpConstantComposite dispatch mismatch\n"); return 11; }
+    print_cstr("OK — vec4 OpConstantComposite (out=a+K) correct on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

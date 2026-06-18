@@ -498,6 +498,30 @@ build/native_spirv_smod_e2e: programs/native_spirv_smod_e2e.cyr src/*.cyr
 test-native-spirv-smod-e2e: build/native_spirv_smod_e2e
 	./build/native_spirv_smod_e2e
 
+build/native_spirv_vector_add_e2e: programs/native_spirv_vector_add_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_vector_add_e2e.cyr $@
+
+.PHONY: test-native-spirv-vector-add-e2e
+test-native-spirv-vector-add-e2e: build/native_spirv_vector_add_e2e
+	./build/native_spirv_vector_add_e2e
+
+build/native_spirv_vector_load_store_e2e: programs/native_spirv_vector_load_store_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_vector_load_store_e2e.cyr $@
+
+.PHONY: test-native-spirv-vector-load-store-e2e
+test-native-spirv-vector-load-store-e2e: build/native_spirv_vector_load_store_e2e
+	./build/native_spirv_vector_load_store_e2e
+
+build/native_spirv_vector_const_e2e: programs/native_spirv_vector_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_vector_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-vector-const-e2e
+test-native-spirv-vector-const-e2e: build/native_spirv_vector_const_e2e
+	./build/native_spirv_vector_const_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

@@ -829,7 +829,49 @@ hand-authored shaders stay as oracle + fallback.
       encoders/isel — reuses VMOV/XOR/ASHR/ICMP_NE/CNDMASK/IADD/ISUB (37 MIR instrs).
       `native_spirv_smod_e2e.cyr` value-exact on Cezanne (8-lane signed matrix) + the
       `test_spirv_lower_smod` structural unit test. **→ 3.2.9 (int div/mod) COMPLETE.**
-  - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+  - [x] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+    Scalarize-on-lower: a vecN is a `MIR_VK_VECTOR` value packing its N component scalar
+    `<id>`s (16 bits each) into the payload; count rides in the packed type. Every vector op
+    emits N scalar ops, so the scalar back end (isel/regalloc/waitcnt/emit) is reused
+    unchanged. Design-validated via the N.10 design workflow.
+    - [x] **N.10a (2026-06-18) — infra + Construct + Extract.** `MIR_VK_VECTOR` +
+      `mir_set_vector` / `mir_is_vector` / `mir_vec_comp`; `OpCompositeConstruct` (80) packs the
+      operand ids (no instructions); `OpCompositeExtract` (81) from a vec → one `VMOV` from the
+      packed component (the GID vec3 special-case stays ahead of it). CPU-only (+24 asserts).
+      Adversarial review (7 findings fixed): `mir_emit` centrally rejects a `MIR_VK_VECTOR`
+      operand (unimplemented vector ops fail loud, not silent-wrong); Extract bounds the
+      component for all vec3 builtins; Construct requires scalar CONST/SSA operands. **Deferred
+      (fail loud):** vector/nested operands to Construct + non-scalar-per-component arity —
+      land with broader Construct breadth later in N.10.
+    - [x] **N.10b (2026-06-18) — component-wise binary arith + first vector HW.** vec
+      `OpFAdd/FMul/...` → N scalar ops (`_spirv_lower_vec_binop`) + scalar broadcast +
+      count/base guards. **Plus a prerequisite enabler:** a constant `OpAccessChain` index now
+      VMOV-materializes its byte offset into a VGPR (the FLAT emitter requires a VGPR offset;
+      prior kernels only ever used the dynamic gid offset, so constant-index access returned
+      `CMP_ERR_FLAT_CONST_OFFSET`). HW: `native_spirv_vector_add_e2e.cyr` vec3 add+mul
+      value-exact on Cezanne (+18 CPU asserts). The immediate-offset FLAT form (avoid the
+      extra VMOV) is a later optimization.
+    - [x] **N.10c (2026-06-18) — vector load/store.** `OpAccessChain` accepts a vecN element
+      (std430 stride computed from the element type — vec2→8, vec3/vec4→16; no `ArrayStride`
+      lookup, an MVP layout assumption); `_spirv_lower_vec_load` / `_spirv_lower_vec_store`
+      scalarize a vecN load/store into N consecutive 4-byte accesses (`element_base + j*4`).
+      HW: `native_spirv_vector_load_store_e2e.cyr` (`out[i]=a[i]+b[i]` over `array<vec4>`,
+      gid-indexed) value-exact on Cezanne (+46 CPU asserts). Adversarial review: a non-std430
+      `ArrayStride` now **fails loud** (`_spirv_check_array_strides`) instead of silently
+      mis-addressing; vec2/vec3/dynamic-index coverage added; the dynamic-index overflow is
+      documented as SPIR-V UB (OOB index, runtime bounds-checking out of scope). Multi-member
+      struct stays deferred (single-member, member-0 MVP).
+    - [x] **N.10d (2026-06-18) — `OpConstantComposite` + splat.** Vector constants: the seed
+      pass reuses the Construct packer (constituents are seeded scalar consts) → a
+      `MIR_VK_VECTOR`; splat is Construct/ConstantComposite with a repeated operand (no new
+      code). HW: `native_spirv_vector_const_e2e.cyr` (`out[i]=a[i]+vec4(10,20,30,40)`)
+      value-exact on Cezanne — the non-inline constants exercise the VOP2-literal path (+16
+      CPU asserts). Adversarial review: `_spirv_lower_vec_binop` now const-folds a component
+      with two const operands (a vec const+const would otherwise emit an unencodable
+      `v_add(const,const)`). **→ Phase N.10 (vectors) complete.**
+    - [x] **N.10e (2026-06-18) — cut 3.2.10.** VERSION/README/CHANGELOG/CLAUDE.md bumped;
+      dist re-stamped; closeout green (suite 3800, bench, vector HW arc on Cezanne);
+      release-readiness audit. **→ 3.2.10 (vectors) shipped.**
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
     Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
