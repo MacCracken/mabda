@@ -1,0 +1,1257 @@
+# tests/tcyr/compiler_lower.tcyr — Phase N SPIR-V->GFX9 compiler:
+# MIR model (N.2a) + SPIR-V -> MIR lowering (N.2b + breadth: div/mod/vectors/ext-set/control-flow).
+# Fixtures + include chain live in compiler_common.cyr (shared across the compiler_*.tcyr).
+include "tests/tcyr/compiler_common.cyr"
+
+fn test_mir_type_distill() {
+    var buf[128];
+    var n = _spv_build_distill_types(&buf);
+    var types[384];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    assert_eq(_mir_lower_type(&types, 2, 16), MIR_T_I32, "signed int32 -> I32");
+    assert_eq(_mir_lower_type(&types, 3, 16), MIR_T_U32, "unsigned int32 -> U32");
+    assert_eq(_mir_lower_type(&types, 4, 16), MIR_T_F32, "float32 -> F32");
+    assert_eq(_mir_lower_type(&types, 5, 16), MIR_T_UNSUPPORTED, "float64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "vec4 f32 -> F32|count4");
+    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vec4 f64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "vec count5 -> UNSUPPORTED");
+    return 0;
+}
+
+fn test_mir_type_helpers() {
+    assert_eq(mir_type_base(MIR_T_F32), MIR_T_F32, "scalar base");
+    assert_eq(mir_type_count(MIR_T_F32), 1, "scalar count = 1");
+    assert_eq(mir_type_base(MIR_T_F32 | (4 << 8)), MIR_T_F32, "vec base = f32");
+    assert_eq(mir_type_count(MIR_T_F32 | (4 << 8)), 4, "vec count = 4");
+    assert_eq(mir_type_count(MIR_T_I32 | (2 << 8)), 2, "vec2 count = 2");
+    return 0;
+}
+
+fn test_mir_meet_truth_table() {
+    assert_eq(_mir_meet(MIR_UNIFORM, MIR_UNIFORM), MIR_UNIFORM, "U,U -> U");
+    assert_eq(_mir_meet(MIR_UNIFORM, MIR_DIVERGENT), MIR_DIVERGENT, "U,D -> D");
+    assert_eq(_mir_meet(MIR_DIVERGENT, MIR_UNIFORM), MIR_DIVERGENT, "D,U -> D");
+    assert_eq(_mir_meet(MIR_DIVERGENT, MIR_DIVERGENT), MIR_DIVERGENT, "D,D -> D");
+    return 0;
+}
+
+fn test_mir_builtin_unif() {
+    assert_eq(_mir_builtin_unif(MIR_BI_WORKGROUP_ID), MIR_UNIFORM, "WorkgroupId uniform");
+    assert_eq(_mir_builtin_unif(MIR_BI_LOCAL_INVOC_ID), MIR_DIVERGENT, "LocalInvocId divergent");
+    assert_eq(_mir_builtin_unif(MIR_BI_GLOBAL_INVOC_ID), MIR_DIVERGENT, "GlobalInvocId divergent");
+    return 0;
+}
+
+fn test_mir_value_builders() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 42);
+    assert_eq(mir_val_kind(&m, 1), MIR_VK_CONST, "const kind");
+    assert_eq(mir_val_type(&m, 1), MIR_T_U32, "const type");
+    assert_eq(mir_val_unif(&m, 1), MIR_UNIFORM, "const uniform");
+    assert_eq(mir_val_payload(&m, 1), 42, "const payload 42");
+    assert_eq(mir_val_def(&m, 1), 0 - 1, "const def -1");
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    assert_eq(mir_val_kind(&m, 2), MIR_VK_BUILTIN, "builtin kind");
+    assert_eq(mir_val_unif(&m, 2), MIR_DIVERGENT, "gid divergent");
+    assert_eq(mir_val_payload(&m, 2), MIR_BI_GLOBAL_INVOC_ID, "builtin payload");
+    mir_set_bufvar(&m, 3, 1);
+    assert_eq(mir_val_kind(&m, 3), MIR_VK_BUFVAR, "bufvar kind");
+    assert_eq(mir_val_unif(&m, 3), MIR_UNIFORM, "bufvar uniform");
+    assert_eq(mir_val_payload(&m, 3), 1, "bufvar binding 1");
+    assert_eq(mir_val_kind(&m, 10), MIR_VK_NONE, "unset id is NONE");
+    return 0;
+}
+
+fn test_mir_emit_and_accessors() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    var idx = mir_emit(&m, MIR_OP_IADD, 5, MIR_T_I32, 2, 3, 0, 0);
+    assert_eq(idx, 0, "first instr index 0");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_IADD, "op IADD");
+    assert_eq(mir_instr_result(&m, 0), 5, "result 5");
+    assert_eq(mir_instr_type(&m, 0), MIR_T_I32, "type I32");
+    assert_eq(mir_instr_a(&m, 0), 2, "operand a = 2");
+    assert_eq(mir_instr_b(&m, 0), 3, "operand b = 3");
+    assert_eq(mir_instr_c(&m, 0), 0, "operand c = 0");
+    assert_eq(mir_val_kind(&m, 5), MIR_VK_SSA, "result is SSA");
+    assert_eq(mir_val_type(&m, 5), MIR_T_I32, "result type I32");
+    assert_eq(mir_val_unif(&m, 5), MIR_UNKNOWN, "result unif UNKNOWN pre-sweep");
+    assert_eq(mir_val_def(&m, 5), 0, "result def = instr 0");
+    # a vec-typed FMA exercises the 3rd operand + a >8-bit type value round-trip
+    var vt = MIR_T_F32 | (4 << 8);
+    var idx2 = mir_emit(&m, MIR_OP_FMA, 6, vt, 7, 8, 9, MIR_FLAG_C_IMM);
+    assert_eq(idx2, 1, "second instr index 1");
+    assert_eq(mir_instr_type(&m, 1), vt, "vec type round-trips");
+    assert_eq(mir_instr_c(&m, 1), 9, "operand c = 9");
+    assert_eq(mir_instr_flags(&m, 1), MIR_FLAG_C_IMM, "flags = C_IMM");
+    assert_eq(mir_n_instrs(&m), 2, "n_instrs 2");
+    return 0;
+}
+
+fn test_mir_add_ptr() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    var p = mir_add_ptr(&m, 5, 0, MIR_T_F32, 7, 0, 1);
+    assert_eq(p, 0, "first ptr index 0");
+    assert_eq(mir_ptr_binding(&m, 0), 0, "binding 0");
+    assert_eq(mir_ptr_elem_type(&m, 0), MIR_T_F32, "elem f32");
+    assert_eq(mir_ptr_off_id(&m, 0), 7, "off_id 7");
+    assert_eq(mir_ptr_const_off(&m, 0), 0, "const_off 0");
+    assert_eq(mir_ptr_dynamic(&m, 0), 1, "dynamic 1");
+    assert_eq(mir_val_kind(&m, 5), MIR_VK_PTR, "val 5 is PTR");
+    assert_eq(mir_val_payload(&m, 5), 0, "val 5 payload = ptr 0");
+    var p2 = mir_add_ptr(&m, 6, 1, MIR_T_F32, 0, 16, 0);
+    assert_eq(p2, 1, "second ptr index 1");
+    assert_eq(mir_ptr_binding(&m, 1), 1, "binding 1");
+    assert_eq(mir_ptr_const_off(&m, 1), 16, "const_off 16");
+    assert_eq(mir_ptr_dynamic(&m, 1), 0, "dynamic 0");
+    return 0;
+}
+
+# The load-bearing test: a SAXPY-shape hand-built MIR; assert every value's
+# GFX9 uniformity after the forward sweep. Divergent path = indexed by
+# GlobalInvocationId; uniform path = WorkgroupId / const offset.
+fn test_mir_uniformity() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 4);                             # stride
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);     # divergent
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_WORKGROUP_ID);        # uniform
+    mir_set_bufvar(&m, 4, 0);                                      # uniform
+    mir_emit(&m, MIR_OP_IMUL, 5, MIR_T_U32, 2, 1, 0, 0);          # gid*stride -> div
+    mir_emit(&m, MIR_OP_IADD, 6, MIR_T_U32, 3, 1, 0, 0);          # wgid+stride -> unif
+    mir_emit(&m, MIR_OP_LOAD, 7, MIR_T_F32, 5, 0, 0, 0);          # load off div -> div
+    mir_emit(&m, MIR_OP_LOAD, 8, MIR_T_F32, 6, 0, 0, 0);          # load off unif -> unif
+    mir_emit(&m, MIR_OP_LOAD, 9, MIR_T_F32, 0, 0, 0, 0);          # load const off -> unif
+    mir_emit(&m, MIR_OP_FMUL, 10, MIR_T_F32, 7, 8, 0, 0);         # div*unif -> div
+    mir_emit(&m, MIR_OP_IADD, 11, MIR_T_U32, 3, 2, 0, MIR_FLAG_B_IMM);  # b immediate -> skip -> unif
+    mir_emit(&m, MIR_OP_STORE, 0, MIR_T_VOID, 5, 0, 10, 0);       # store (no result)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 5), MIR_DIVERGENT, "gid*stride divergent");
+    assert_eq(mir_val_unif(&m, 6), MIR_UNIFORM, "wgid+stride uniform");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "divergent-offset load divergent");
+    assert_eq(mir_val_unif(&m, 8), MIR_UNIFORM, "uniform-offset load uniform");
+    assert_eq(mir_val_unif(&m, 9), MIR_UNIFORM, "const-offset load uniform");
+    assert_eq(mir_val_unif(&m, 10), MIR_DIVERGENT, "div*unif -> divergent");
+    assert_eq(mir_val_unif(&m, 11), MIR_UNIFORM, "immediate operand skipped -> uniform");
+    return 0;
+}
+
+fn test_mir_blocks_and_synth() {
+    var m[80];
+    var vals[800];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # id_bound 16, cap_ids 20 -> synth ids 16..19 have backing storage (vals 20*40)
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 20);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_finalize_block0(&m);
+    assert_eq(mir_block_count_total(&m), 1, "MVP single block");
+    assert_eq(mir_block_first(&m, 0), 0, "block first instr 0");
+    assert_eq(mir_block_count(&m, 0), 2, "block instr count 2");
+    assert_eq(mir_block_term(&m, 0), MIR_TERM_RETURN, "terminator RETURN");
+    var s0 = mir_alloc_synth_id(&m);
+    assert_eq(s0, 16, "synth id starts at id_bound");
+    assert_eq(mir_alloc_synth_id(&m), 17, "synth id increments");
+    # a synth id IS usable as an SSA result (cap_ids headroom) — review N.2a #1
+    assert_eq(mir_emit(&m, MIR_OP_IMUL, s0, MIR_T_U32, 0, 0, 0, 0), 2, "synth-id result emitted");
+    assert_eq(mir_val_kind(&m, s0), MIR_VK_SSA, "synth id became an SSA value");
+    return 0;
+}
+
+# Regression tests for the N.2a adversarial review (5 confirmed findings).
+fn test_mir_review_n2a() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    # #5: mir_set_* bound-check the value-id ceiling + the id-0 sentinel
+    assert_eq(mir_set_const(&m, 5, MIR_T_U32, 1), 0, "set_const valid id ok");
+    assert_eq(mir_set_const(&m, 16, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR, "set_const id == cap -> OOR");
+    assert_eq(mir_set_const(&m, 0, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR, "set_const id 0 -> OOR");
+    assert_eq(mir_set_bufvar(&m, 0, 0), 0 - MIR_ERR_ID_OOR, "set_bufvar id 0 -> OOR");
+    # #2: mir_add_ptr rejects result_id 0 (sentinel) and the ceiling
+    assert_eq(mir_add_ptr(&m, 0, 0, MIR_T_F32, 0, 0, 0), 0 - MIR_ERR_ID_OOR, "add_ptr id 0 -> OOR");
+    assert_eq(mir_add_ptr(&m, 16, 0, MIR_T_F32, 0, 0, 0), 0 - MIR_ERR_ID_OOR, "add_ptr id == cap -> OOR");
+    # vals[0] sentinel intact after the rejected writes
+    assert_eq(mir_val_kind(&m, 0), MIR_VK_NONE, "vals[0] sentinel preserved");
+    # #3/#4: type distillation rejects pathological vectors (no crash, no corruption)
+    var buf[128];
+    var n = _spv_build_bad_vectors(&buf);
+    var types[384];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "valid vec4 f32 ok");
+    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vector-of-vector -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "self-ref vector -> UNSUPPORTED (no crash)");
+    return 0;
+}
+
+fn test_mir_emit_errors() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # cap_instrs = 1: the second emit overflows
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 1, 2, 16, 16);
+    assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0, "first emit ok");
+    assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0 - MIR_ERR_CAP_EXCEEDED, "cap exceeded");
+    # result id >= id_bound -> ID_OOR
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 16, MIR_T_I32, 1, 1, 0, 0), 0 - MIR_ERR_ID_OOR, "result id OOR");
+    return 0;
+}
+
+fn test_spirv_lower_gid_kernel() {
+    var buf[384];
+    var n = _spv_build_gid_kernel(&buf);
+    assert_eq(spirv_validate_stream(&buf, n), 0, "gid kernel valid");
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
+    # builtin resolution (the gap the N.1b parser does not fill)
+    assert_eq(_spirv_builtin_for_var(&outbi, 7), MIR_BI_LOCAL_INVOC_ID, "lid var resolved");
+    # seed
+    assert_eq(mir_val_kind(&m, 7), MIR_VK_BUILTIN, "gid is builtin");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "gid divergent");
+    assert_eq(mir_val_kind(&m, 8), MIR_VK_CONST, "c1 const");
+    assert_eq(mir_val_payload(&m, 8), 1, "c1 value 1");
+    # instr stream: EXTRACT, IADD, IMUL, RET (the builtin load is an alias; the SHL of
+    # two constants %8<<%9 is const-folded away — N.8b-8).
+    assert_eq(mir_n_instrs(&m), 4, "4 instrs (1<<2 folded)");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "i0 extract");
+    assert_eq(mir_instr_result(&m, 0), 12, "extract -> %12");
+    assert_eq(mir_instr_flags(&m, 0), MIR_FLAG_C_IMM, "extract lane is immediate");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_IADD, "i1 iadd");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "i2 imul");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_RET, "i3 ret (shl folded away)");
+    # the builtin OpLoad aliased %11 to the builtin value (no instruction)
+    assert_eq(mir_val_kind(&m, 11), MIR_VK_BUILTIN, "load aliases builtin");
+    assert_eq(mir_val_unif(&m, 11), MIR_DIVERGENT, "loaded gid divergent");
+    # uniformity sweep
+    assert_eq(mir_val_unif(&m, 12), MIR_DIVERGENT, "gid.x divergent");
+    assert_eq(mir_val_unif(&m, 13), MIR_DIVERGENT, "x+1 divergent");
+    assert_eq(mir_val_unif(&m, 14), MIR_DIVERGENT, "(x+1)*2 divergent");
+    # 1<<2 (both const) const-folds to the constant 4 (uniform) — no SHL instruction.
+    assert_eq(mir_val_kind(&m, 15), MIR_VK_CONST, "1<<2 folded to a constant");
+    assert_eq(mir_val_payload(&m, 15), 4, "1<<2 folds to 4");
+    assert_eq(mir_val_unif(&m, 15), MIR_UNIFORM, "folded const is uniform");
+    # block
+    assert_eq(mir_block_term(&m, 0), MIR_TERM_RETURN, "ret terminator");
+    assert_eq(mir_block_count(&m, 0), 4, "block has 4 instrs");
+    return 0;
+}
+
+# N.8b-8 — const-fold arithmetic over two constant operands. Integers use i64 math
+# masked to 32 bits (`>>` logical); floats decode/compute/re-encode via the f32/f64
+# builtins. `_spirv_both_const` is the foldability gate.
+fn test_spirv_const_fold() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 6);
+    mir_set_const(&m, 2, MIR_T_U32, 7);
+    mir_set_const(&m, 3, MIR_T_U32, 0xF0);
+    mir_set_const(&m, 4, MIR_T_U32, 0x0F);
+    mir_set_const(&m, 5, MIR_T_U32, 1);
+    mir_set_const(&m, 6, MIR_T_U32, 2);
+    mir_set_const(&m, 7, MIR_T_U32, 4);
+    mir_set_const(&m, 8, MIR_T_F32, 0x40000000);   # 2.0
+    mir_set_const(&m, 9, MIR_T_F32, 0x3F800000);   # 1.0
+    mir_set_const(&m, 10, MIR_T_F32, 0x40400000);  # 3.0
+    # foldability gate
+    assert_eq(_spirv_both_const(&m, 1, 2), 1, "two consts foldable");
+    assert_eq(_spirv_both_const(&m, 1, 0), 0, "id-0 operand not foldable");
+    mir_set_builtin(&m, 11, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    assert_eq(_spirv_both_const(&m, 1, 11), 0, "builtin operand not foldable");
+    # integer
+    assert_eq(_spirv_const_fold(&m, MIR_OP_IADD, 1, 2), 13, "6+7=13");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_IMUL, 1, 2), 42, "6*7=42");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_ISUB, 2, 1), 1, "7-6=1");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_AND, 3, 4), 0, "0xF0 & 0x0F = 0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_OR, 3, 4), 0xFF, "0xF0 | 0x0F = 0xFF");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_XOR, 3, 4), 0xFF, "0xF0 ^ 0x0F = 0xFF");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_SHL, 5, 6), 4, "1 << 2 = 4");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_SHR, 3, 7), 0xF, "0xF0 >> 4 = 0xF");
+    # float (bit patterns)
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FADD, 8, 9), 0x40400000, "2.0 + 1.0 = 3.0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FMUL, 8, 10), 0x40C00000, "2.0 * 3.0 = 6.0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FSUB, 10, 9), 0x40000000, "3.0 - 1.0 = 2.0");
+    return 0;
+}
+
+# N.9d-2 — OpSMod lowers to SRem + the floored fixup. 37 MIR instrs: VMOV(divisor copy) +
+# signed-prep(6) + udiv-core(18) + remainder-correction(3) + srem(2) + the fixup(6, two
+# ICMP_NE-gated CNDMASKs) + the final IADD. Divergent operands → the whole body is VALU.
+fn test_spirv_lower_smod() {
+    var w[64];
+    store32(&w + 0, (5 << 16) | 139);   # OpSMod
+    store32(&w + 4, 2);                  # result type
+    store32(&w + 8, 5);                  # result id
+    store32(&w + 12, 3);                 # operand a
+    store32(&w + 16, 4);                 # operand b
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);    # a — divergent
+    mir_set_builtin(&m, 4, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # b — divergent
+    assert_eq(_spirv_lower_smod(&w, 0, 5, &m), 0, "smod lowers");
+    assert_eq(mir_n_instrs(&m), 37, "smod = 37 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "0: VMOV divisor copy");
+    assert_eq(mir_instr_op(&m, 28), MIR_OP_XOR, "28: r ^ signA");
+    assert_eq(mir_instr_op(&m, 29), MIR_OP_ISUB, "29: srem = (r^signA)-signA");
+    assert_eq(mir_instr_op(&m, 30), MIR_OP_XOR, "30: rs = signA ^ signB");
+    assert_eq(mir_instr_op(&m, 32), MIR_OP_ICMP_NE, "32: signs-differ compare");
+    assert_eq(mir_instr_op(&m, 33), MIR_OP_CNDMASK, "33: differ ? divisor : 0");
+    assert_eq(mir_instr_op(&m, 34), MIR_OP_ICMP_NE, "34: srem-nonzero compare");
+    assert_eq(mir_instr_op(&m, 35), MIR_OP_CNDMASK, "35: nonzero ? bsel : 0");
+    assert_eq(mir_instr_op(&m, 36), MIR_OP_IADD, "36: smod = srem + adj");
+    return 0;
+}
+
+# N.10a — OpCompositeConstruct packs N scalar component <id>s into a MIR_VK_VECTOR (no
+# instructions); OpCompositeExtract pulls a component out via a single VMOV. A 5-word SPIR-V
+# header (id_bound at word 3) precedes both instructions at off 5 / off 11.
+fn test_spirv_lower_vec_construct_extract() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203);   # magic
+    store32(&buf + 12, 32);          # word 3 = id bound
+    var types[768];                  # 32 ids * 24 bytes
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);   # vec3<f32>
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_set_const(&m, 10, MIR_T_F32, 0x3F800000);   # 1.0
+    mir_set_const(&m, 11, MIR_T_F32, 0x40000000);   # 2.0
+    mir_set_const(&m, 12, MIR_T_F32, 0x40400000);   # 3.0
+    # OpCompositeConstruct %6 %13 %10 %11 %12 at off 5 (wc 6)
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6);  store32(&buf + 28, 13);
+    store32(&buf + 32, 10); store32(&buf + 36, 11); store32(&buf + 40, 12);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m), 0, "construct ok");
+    assert_eq(mir_is_vector(&m, 13), 1, "%13 is a vector");
+    assert_eq(mir_type_count(mir_val_type(&m, 13)), 3, "vec3 count");
+    assert_eq(mir_vec_comp(&m, 13, 0), 10, "comp0 = %10");
+    assert_eq(mir_vec_comp(&m, 13, 1), 11, "comp1 = %11");
+    assert_eq(mir_vec_comp(&m, 13, 2), 12, "comp2 = %12");
+    assert_eq(mir_n_instrs(&m), 0, "construct emits no instrs");
+    # OpCompositeExtract %5 %14 %13 1 at off 11 (wc 5) — via the full dispatch
+    store32(&buf + 44, (5 << 16) | 81);
+    store32(&buf + 48, 5);  store32(&buf + 52, 14);
+    store32(&buf + 56, 13); store32(&buf + 60, 1);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    assert_eq(_spirv_lower_one_instr(&buf, 11, 5, 81, &types, 0, 0, &m, &lsz), 0, "extract ok");
+    assert_eq(mir_n_instrs(&m), 1, "extract emits 1 VMOV");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "extract -> VMOV");
+    assert_eq(mir_instr_result(&m, 0), 14, "VMOV result = %14");
+    assert_eq(mir_instr_a(&m, 0), 11, "VMOV source = comp1 (%11)");
+    # OOB component (3 >= count 3) fails loud, emits nothing more
+    store32(&buf + 60, 3);
+    assert_eq(_spirv_lower_one_instr(&buf, 11, 5, 81, &types, 0, 0, &m, &lsz) < 0, 1, "extract OOB comp fails");
+    assert_eq(mir_n_instrs(&m), 1, "OOB extract emits nothing");
+    return 0;
+}
+
+# N.10a — construct guards: wrong operand arity and a vector operand both fail loud.
+fn test_spirv_lower_vec_construct_guards() {
+    var buf[64];
+    store32(&buf + 12, 32);
+    var types[768];
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_set_const(&m, 10, MIR_T_F32, 0);
+    mir_set_const(&m, 11, MIR_T_F32, 0);
+    # vec3 with only 2 operands (wc 5 → wc-3 = 2 != 3) → fail
+    store32(&buf + 20, (5 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 13);
+    store32(&buf + 32, 10); store32(&buf + 36, 11);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 5, &types, &m) < 0, 1, "wrong arity fails");
+    # a vector operand (%20) → nested-vector fails loud (deferred — see docs/development/3-2-punchlist.md, N.10)
+    mir_set_vector(&m, 20, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 14);
+    store32(&buf + 32, 20); store32(&buf + 36, 11); store32(&buf + 40, 10);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "vector operand fails");
+    return 0;
+}
+
+# N.10a review hardening: (1) mir_emit centrally rejects a MIR_VK_VECTOR operand (a vecN must
+# be scalarized first); (2) OpCompositeExtract bounds the component for vec3 builtins; (3)
+# OpCompositeConstruct rejects zero / non-scalar (builtin) operands.
+fn test_spirv_vec_robustness() {
+    var buf[64];
+    store32(&buf + 12, 32);
+    var types[768];
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);
+    _spirv_set_type(&types, 7, SPIRV_TYK_INT, 32, 0, 32);   # u32 (builtin extract result)
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    # (1) mir_emit rejects a vector operand in either source position
+    mir_set_const(&m, 10, MIR_T_F32, 0);
+    mir_set_const(&m, 11, MIR_T_F32, 0);
+    mir_set_vector(&m, 12, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 13, MIR_T_U32, 12, 10, 0, 0) < 0, 1, "mir_emit rejects vector operand a");
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 13, MIR_T_U32, 10, 12, 0, 0) < 0, 1, "mir_emit rejects vector operand b");
+    assert_eq(mir_n_instrs(&m), 0, "rejected emits add nothing");
+    # (2) extract comp 3 from a vec3 builtin (LocalInvocationId) fails; comp 1 → legacy EXTRACT
+    mir_set_builtin(&m, 20, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    store32(&buf + 20, (5 << 16) | 81);
+    store32(&buf + 24, 7); store32(&buf + 28, 21);
+    store32(&buf + 32, 20); store32(&buf + 36, 3);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 81, &types, 0, 0, &m, &lsz) < 0, 1, "builtin extract comp 3 fails");
+    store32(&buf + 36, 1);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 81, &types, 0, 0, &m, &lsz), 0, "builtin extract comp 1 ok");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "builtin extract -> EXTRACT");
+    # (3) construct rejects a zero operand and a builtin operand
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 22);
+    store32(&buf + 32, 10); store32(&buf + 36, 0); store32(&buf + 40, 11);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "construct zero operand fails");
+    store32(&buf + 36, 20);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "construct builtin operand fails");
+    return 0;
+}
+
+# N.10b — component-wise vector arithmetic: a vecN OpFAdd lowers to N scalar FADDs over the
+# packed components; a scalar operand broadcasts to every lane; count / base-type mismatches
+# fail loud.
+fn test_spirv_lower_vec_binop() {
+    var buf[64];
+    store32(&buf + 12, 64);   # id bound (word 3)
+    var types[1536];          # 64 ids * 24 bytes
+    memset(&types, 0, 1536);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 64);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 64);   # vec3<f32>
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    # %30's components are non-const (builtins) so the component-wise op stays a RUNTIME FADD
+    # (two const components would const-fold — covered separately below).
+    mir_set_builtin(&m, 10, MIR_T_F32, MIR_BI_LOCAL_INVOC_ID);
+    mir_set_builtin(&m, 11, MIR_T_F32, MIR_BI_LOCAL_INVOC_ID);
+    mir_set_builtin(&m, 12, MIR_T_F32, MIR_BI_LOCAL_INVOC_ID);
+    mir_set_const(&m, 13, MIR_T_F32, 0x3F800000);
+    mir_set_const(&m, 14, MIR_T_F32, 0x40000000); mir_set_const(&m, 15, MIR_T_F32, 0x40400000);
+    mir_set_const(&m, 16, MIR_T_F32, 0x40800000);   # scalar (broadcast)
+    mir_set_vector(&m, 30, MIR_T_F32 | (3 << 8), 10 | (11 << 16) | (12 << 32));
+    mir_set_vector(&m, 31, MIR_T_F32 | (3 << 8), 13 | (14 << 16) | (15 << 32));
+    # component-wise OpFAdd %6 %32 %30 %31 via the full dispatch (off 5, wc 5)
+    store32(&buf + 20, (5 << 16) | 129);   # OpFAdd
+    store32(&buf + 24, 6); store32(&buf + 28, 32);
+    store32(&buf + 32, 30); store32(&buf + 36, 31);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 129, &types, 0, 0, &m, &lsz), 0, "vec fadd ok");
+    assert_eq(mir_is_vector(&m, 32), 1, "result is a vector");
+    assert_eq(mir_type_count(mir_val_type(&m, 32)), 3, "result vec3");
+    assert_eq(mir_n_instrs(&m), 3, "3 component FADDs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_FADD, "comp0 op FADD");
+    assert_eq(mir_instr_a(&m, 0), 10, "comp0 a = va.x");
+    assert_eq(mir_instr_b(&m, 0), 13, "comp0 b = vb.x");
+    assert_eq(mir_instr_a(&m, 2), 12, "comp2 a = va.z");
+    assert_eq(mir_instr_b(&m, 2), 15, "comp2 b = vb.z");
+    assert_eq(mir_vec_comp(&m, 32, 0), mir_instr_result(&m, 0), "vec comp0 = FADD0 result");
+    assert_eq(mir_vec_comp(&m, 32, 2), mir_instr_result(&m, 2), "vec comp2 = FADD2 result");
+    # broadcast: a scalar operand applies to every lane (direct call, FMUL)
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FMUL, MIR_T_F32 | (3 << 8), 33, 30, 16), 0, "broadcast ok");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_FMUL, "broadcast op FMUL");
+    assert_eq(mir_instr_a(&m, 3), 10, "broadcast a = va.x");
+    assert_eq(mir_instr_b(&m, 3), 16, "broadcast b = scalar (lane 0)");
+    assert_eq(mir_instr_b(&m, 5), 16, "broadcast b = scalar (lane 2)");
+    # count mismatch (vec2 operand vs vec3 result) and base-type mismatch (vec3<u32> vs f32) fail
+    mir_set_vector(&m, 34, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FADD, MIR_T_F32 | (3 << 8), 35, 34, 31) < 0, 1, "count mismatch fails");
+    mir_set_vector(&m, 36, MIR_T_U32 | (3 << 8), 13 | (14 << 16) | (15 << 32));
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FADD, MIR_T_F32 | (3 << 8), 37, 36, 31) < 0, 1, "base mismatch fails");
+    return 0;
+}
+
+# N.10d review — a vec op over TWO vector constants const-folds per component (no runtime op;
+# a VOP2 cannot take two non-VGPR operands), mirroring the scalar ALU fold.
+fn test_spirv_lower_vec_binop_fold() {
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
+    mir_set_const(&m, 10, MIR_T_F32, 0x3F800000);   # 1.0
+    mir_set_const(&m, 11, MIR_T_F32, 0x40000000);   # 2.0
+    mir_set_const(&m, 12, MIR_T_F32, 0x40400000);   # 3.0
+    mir_set_const(&m, 13, MIR_T_F32, 0x40800000);   # 4.0
+    mir_set_vector(&m, 30, MIR_T_F32 | (2 << 8), 10 | (11 << 16));   # vec2(1,2) const
+    mir_set_vector(&m, 31, MIR_T_F32 | (2 << 8), 12 | (13 << 16));   # vec2(3,4) const
+    assert_eq(_spirv_lower_vec_binop(&m, MIR_OP_FADD, MIR_T_F32 | (2 << 8), 32, 30, 31), 0, "vec const fold ok");
+    assert_eq(mir_n_instrs(&m), 0, "vec const+const folds -> no runtime ops");
+    assert_eq(mir_is_vector(&m, 32), 1, "fold result is a vector");
+    var c0 = mir_vec_comp(&m, 32, 0);
+    var c1 = mir_vec_comp(&m, 32, 1);
+    assert_eq(mir_val_kind(&m, c0), MIR_VK_CONST, "comp0 folded to a const");
+    assert_eq(mir_val_payload(&m, c0), 0x40800000, "1.0 + 3.0 = 4.0");
+    assert_eq(mir_val_payload(&m, c1), 0x40C00000, "2.0 + 4.0 = 6.0");
+    return 0;
+}
+
+# N.10c — vector OpLoad/OpStore scalarize to N consecutive 4-byte accesses (off_id + j*4).
+# Tested via the helpers directly: a vec4 element PTR (off_id 5) loads into 4 components, then
+# a vec4 value stores back; non-vector / mismatched-count stores fail loud.
+fn test_spirv_lower_vec_load_store() {
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
+    mir_set_const(&m, 5, MIR_T_U32, 64);   # stand-in off_id (a non-vector value id)
+    var pr = mir_add_ptr(&m, 10, 0, MIR_T_F32 | (4 << 8), 5, 0, 1);   # PTR: elem vec4<f32>, off_id 5
+    assert_eq(pr, 0, "ptr added");
+    assert_eq(mir_type_count(mir_ptr_elem_type(&m, 0)), 4, "elem is vec4");
+    # vec4 load -> 4 LOADs (off 5, then IADD off+4/+8/+12) interleaved = 7 instrs
+    assert_eq(_spirv_lower_vec_load(&m, 11, mir_ptr_elem_type(&m, 0), 4, 5, 0), 0, "vec load ok");
+    assert_eq(mir_is_vector(&m, 11), 1, "load result is a vector");
+    assert_eq(mir_type_count(mir_val_type(&m, 11)), 4, "load result vec4");
+    assert_eq(mir_n_instrs(&m), 7, "vec4 load = 4 LOAD + 3 IADD");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_LOAD, "comp0 LOAD");
+    assert_eq(mir_instr_a(&m, 0), 5, "comp0 offset = off_id (no add)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_IADD, "comp1 offset IADD");
+    assert_eq(mir_instr_a(&m, 1), 5, "IADD base = off_id");
+    assert_eq(mir_instr_b(&m, 1), 4, "IADD +4");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_LOAD, "comp1 LOAD");
+    assert_eq(mir_instr_b(&m, 5), 12, "comp3 offset +12");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_LOAD, "comp3 LOAD");
+    assert_eq(mir_vec_comp(&m, 11, 0), mir_instr_result(&m, 0), "vec comp0 = LOAD0 result");
+    assert_eq(mir_vec_comp(&m, 11, 3), mir_instr_result(&m, 6), "vec comp3 = LOAD3 result");
+    # vec4 store of a vector value -> 4 STOREs (+ 3 IADD)
+    mir_set_const(&m, 13, MIR_T_F32, 0); mir_set_const(&m, 14, MIR_T_F32, 0);
+    mir_set_const(&m, 15, MIR_T_F32, 0); mir_set_const(&m, 16, MIR_T_F32, 0);
+    mir_set_vector(&m, 12, MIR_T_F32 | (4 << 8), 13 | (14 << 16) | (15 << 32) | (16 << 48));
+    var n0 = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_vec_store(&m, MIR_T_F32 | (4 << 8), 4, 5, 0, 12), 0, "vec store ok");
+    assert_eq(mir_n_instrs(&m), n0 + 7, "vec4 store = 4 STORE + 3 IADD");
+    assert_eq(mir_instr_op(&m, n0 + 0), MIR_OP_STORE, "store0");
+    assert_eq(mir_instr_c(&m, n0 + 0), 13, "store0 value = comp0");
+    assert_eq(mir_instr_op(&m, n0 + 6), MIR_OP_STORE, "store3");
+    assert_eq(mir_instr_c(&m, n0 + 6), 16, "store3 value = comp3");
+    # storing a scalar, or a mismatched-count vector, to a vec4 ptr fails loud
+    assert_eq(_spirv_lower_vec_store(&m, MIR_T_F32 | (4 << 8), 4, 5, 0, 13) < 0, 1, "scalar->vec store fails");
+    mir_set_vector(&m, 17, MIR_T_F32 | (2 << 8), 13 | (14 << 16));
+    assert_eq(_spirv_lower_vec_store(&m, MIR_T_F32 | (4 << 8), 4, 5, 0, 17) < 0, 1, "count mismatch store fails");
+    # vec2 load -> 2 LOAD + 1 IADD = 3 instrs; vec3 load -> 3 LOAD + 2 IADD = 5 instrs
+    var n2 = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_vec_load(&m, 18, MIR_T_F32 | (2 << 8), 2, 5, 0), 0, "vec2 load ok");
+    assert_eq(mir_n_instrs(&m), n2 + 3, "vec2 load = 2 LOAD + 1 IADD");
+    assert_eq(mir_type_count(mir_val_type(&m, 18)), 2, "vec2 load result");
+    var n3 = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_vec_load(&m, 19, MIR_T_F32 | (3 << 8), 3, 5, 0), 0, "vec3 load ok");
+    assert_eq(mir_n_instrs(&m), n3 + 5, "vec3 load = 3 LOAD + 2 IADD");
+    assert_eq(mir_type_count(mir_val_type(&m, 19)), 3, "vec3 load result");
+    assert_eq(mir_instr_b(&m, n3 + 3), 8, "vec3 comp2 offset +8");   # last IADD before the 3rd LOAD
+    return 0;
+}
+
+# N.10c — vector OpAccessChain uses the std430 element stride (vec2 -> 8, vec4 -> 16); a
+# constant index VMOV-materializes index*stride.
+fn test_spirv_lower_vec_access_chain() {
+    var buf[64];
+    store32(&buf + 12, 64);   # id bound
+    var types[1536];
+    memset(&types, 0, 1536);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 64);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 4, 64);    # vec4<f32>
+    _spirv_set_type(&types, 7, SPIRV_TYK_INT, 32, 0, 64);      # u32
+    _spirv_set_type(&types, 8, SPIRV_TYK_POINTER, 12, 6, 64);  # ptr(StorageBuffer, vec4)
+    var consts[1024];         # 64 ids * 16 bytes
+    memset(&consts, 0, 1024);
+    store64(&consts + 20 * 16 + 0, 7); store64(&consts + 20 * 16 + 8, 0);   # %20 = u32 0 (member)
+    store64(&consts + 21 * 16 + 0, 7); store64(&consts + 21 * 16 + 8, 1);   # %21 = u32 1 (array idx)
+    var deco[1024];
+    memset(&deco, 0xFF, 1024);
+    store64(&deco + 30 * 16 + 0, 0);   # %30 binding 0
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
+    mir_set_bufvar(&m, 30, 0);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    # OpAccessChain %8 %40 %30 %20 %21  (off 5, wc 6) — index 1 into array<vec4> -> offset 16
+    store32(&buf + 20, (6 << 16) | 65);
+    store32(&buf + 24, 8); store32(&buf + 28, 40);
+    store32(&buf + 32, 30); store32(&buf + 36, 20); store32(&buf + 40, 21);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, 65, &types, &consts, &deco, &m, &lsz), 0, "vec access-chain ok");
+    assert_eq(mir_val_kind(&m, 40), MIR_VK_PTR, "%40 is a PTR");
+    assert_eq(mir_type_count(mir_ptr_elem_type(&m, mir_val_payload(&m, 40))), 4, "ptr elem vec4");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "const index -> VMOV offset");
+    assert_eq(mir_instr_a(&m, 0), 16, "offset = index 1 * std430 vec4 stride 16");
+    # dynamic index (non-const) -> IMUL(index, stride=16). %22 is a non-const value.
+    mir_set_builtin(&m, 22, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    store32(&buf + 24, 8); store32(&buf + 28, 41); store32(&buf + 32, 30);
+    store32(&buf + 36, 20); store32(&buf + 40, 22);   # array index -> %22 (dynamic)
+    var nd = mir_n_instrs(&m);
+    var dr = _spirv_lower_one_instr(&buf, 5, 6, 65, &types, &consts, &deco, &m, &lsz);
+    assert_eq(dr, 0, "dynamic vec access-chain ok");
+    assert_eq(mir_instr_op(&m, nd), MIR_OP_IMUL, "dynamic index -> IMUL");
+    assert_eq(mir_instr_a(&m, nd), 22, "IMUL index = %22");
+    assert_eq(mir_instr_b(&m, nd), 16, "IMUL stride = vec4 std430 16");
+    # a vec2 element -> std430 stride 8 (const index 1 -> offset 8)
+    _spirv_set_type(&types, 9, SPIRV_TYK_VECTOR, 5, 2, 64);     # vec2<f32>
+    _spirv_set_type(&types, 10, SPIRV_TYK_POINTER, 12, 9, 64);  # ptr(StorageBuffer, vec2)
+    store32(&buf + 24, 10); store32(&buf + 28, 42); store32(&buf + 32, 30);
+    store32(&buf + 36, 20); store32(&buf + 40, 21);   # const index 1
+    var nv2 = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, 65, &types, &consts, &deco, &m, &lsz), 0, "vec2 access-chain ok");
+    assert_eq(mir_instr_op(&m, nv2), MIR_OP_VMOV, "vec2 const index -> VMOV");
+    assert_eq(mir_instr_a(&m, nv2), 8, "offset = index 1 * std430 vec2 stride 8");
+    return 0;
+}
+
+# N.10d — OpConstantComposite (a vecN constant) seeds to a MIR_VK_VECTOR packing its scalar
+# constituent consts (reusing the Construct packer in the seed pass); a splat (vecN of a
+# repeated scalar) packs the same id N times.
+fn test_spirv_lower_constant_composite() {
+    var buf[128];
+    store32(&buf + 0, 0x07230203);
+    store32(&buf + 12, 32);   # id bound
+    var types[768];
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 4, 32);   # vec4<f32>
+    # OpConstant x4 (words 5/9/13/17), then OpConstantComposite %6 %14 %10..%13 (word 21)
+    store32(&buf + 20, (4 << 16) | 43); store32(&buf + 24, 5); store32(&buf + 28, 10); store32(&buf + 32, 0x3F800000);
+    store32(&buf + 36, (4 << 16) | 43); store32(&buf + 40, 5); store32(&buf + 44, 11); store32(&buf + 48, 0x40000000);
+    store32(&buf + 52, (4 << 16) | 43); store32(&buf + 56, 5); store32(&buf + 60, 12); store32(&buf + 64, 0x40400000);
+    store32(&buf + 68, (4 << 16) | 43); store32(&buf + 72, 5); store32(&buf + 76, 13); store32(&buf + 80, 0x40800000);
+    store32(&buf + 84, (7 << 16) | 44); store32(&buf + 88, 6); store32(&buf + 92, 14);
+    store32(&buf + 96, 10); store32(&buf + 100, 11); store32(&buf + 104, 12); store32(&buf + 108, 13);
+    var m[80];
+    var vals[1600];
+    var instrs[256];
+    var ptrs[64];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 32, 40);
+    var deco[640];
+    memset(&deco, 0xFF, 640);
+    var outbi[320];
+    memset(&outbi, 0, 320);
+    assert_eq(_spirv_lower_seed_globals(&buf, 112, &types, &deco, &m, &outbi), 0, "seed ok");
+    assert_eq(mir_val_kind(&m, 10), MIR_VK_CONST, "constituent %10 seeded const");
+    assert_eq(mir_is_vector(&m, 14), 1, "%14 is a vector constant");
+    assert_eq(mir_type_count(mir_val_type(&m, 14)), 4, "vec4 const");
+    assert_eq(mir_vec_comp(&m, 14, 0), 10, "comp0 = %10");
+    assert_eq(mir_vec_comp(&m, 14, 3), 13, "comp3 = %13");
+    assert_eq(mir_n_instrs(&m), 0, "constant composite emits no instrs");
+    # splat: vec3(x) constructs a vector of the repeated scalar id
+    var b2[64];
+    store32(&b2 + 12, 32);
+    _spirv_set_type(&types, 7, SPIRV_TYK_VECTOR, 5, 3, 32);   # vec3<f32>
+    store32(&b2 + 20, (6 << 16) | 80); store32(&b2 + 24, 7); store32(&b2 + 28, 15);
+    store32(&b2 + 32, 10); store32(&b2 + 36, 10); store32(&b2 + 40, 10);
+    assert_eq(_spirv_lower_composite_construct(&b2, 5, 6, &types, &m), 0, "splat construct ok");
+    assert_eq(mir_vec_comp(&m, 15, 0), 10, "splat comp0 = %10");
+    assert_eq(mir_vec_comp(&m, 15, 2), 10, "splat comp2 = %10");
+    return 0;
+}
+
+# N.10c review — reject a non-std430 ArrayStride on a vec-element array (would silently
+# mis-address). std430 (or absent) is accepted; a mismatch fails loud.
+fn test_spirv_array_stride_validation() {
+    var buf[64];
+    store32(&buf + 12, 64);   # id bound
+    var types[1536];
+    memset(&types, 0, 1536);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 64);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 4, 64);          # vec4
+    _spirv_set_type(&types, 7, SPIRV_TYK_VECTOR, 5, 3, 64);          # vec3
+    _spirv_set_type(&types, 8, SPIRV_TYK_RUNTIME_ARRAY, 6, 0, 64);   # array<vec4>
+    _spirv_set_type(&types, 9, SPIRV_TYK_RUNTIME_ARRAY, 7, 0, 64);   # array<vec3>
+    # OpDecorate %8 ArrayStride 16 (vec4 std430) at off 5, wc 4 — byte_len 36 = 9 words
+    store32(&buf + 20, (4 << 16) | 71); store32(&buf + 24, 8);
+    store32(&buf + 28, 6); store32(&buf + 32, 16);
+    assert_eq(_spirv_check_array_strides(&buf, 36, &types, 64), 0, "vec4 stride 16 ok");
+    store32(&buf + 32, 32);   # ArrayStride 32 -> non-std430
+    assert_eq(_spirv_check_array_strides(&buf, 36, &types, 64) < 0, 1, "vec4 stride 32 rejected");
+    store32(&buf + 24, 9); store32(&buf + 32, 16);   # %9 (vec3) ArrayStride 16 (std430 padded)
+    assert_eq(_spirv_check_array_strides(&buf, 36, &types, 64), 0, "vec3 stride 16 ok");
+    store32(&buf + 32, 12);   # vec3 tightly-packed 12 -> non-std430
+    assert_eq(_spirv_check_array_strides(&buf, 36, &types, 64) < 0, 1, "vec3 stride 12 rejected");
+    return 0;
+}
+
+# N.11 — per-ext-set tracking: find the GLSL.std.450 import id and require every OpExtInst to
+# reference it; a wrong set, or no GLSL import at all, fails loud.
+fn test_spirv_ext_set_validation() {
+    var buf[128];
+    store32(&buf + 0, 0x07230203);
+    store32(&buf + 12, 32);   # id bound
+    # OpExtInstImport %1 "GLSL.std.450" (words 5..10)
+    store32(&buf + 20, (6 << 16) | 11); store32(&buf + 24, 1);
+    store32(&buf + 28, 0x4C534C47); store32(&buf + 32, 0x6474732E);
+    store32(&buf + 36, 0x3035342E); store32(&buf + 40, 0);
+    # OpExtInst %2 %3 %1 FMax(40) %4 %5 (words 11..17), set = %1
+    store32(&buf + 44, (7 << 16) | 12); store32(&buf + 48, 2); store32(&buf + 52, 3);
+    store32(&buf + 56, 1); store32(&buf + 60, 40); store32(&buf + 64, 4); store32(&buf + 68, 5);
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 1, "GLSL.std.450 import is %1");
+    assert_eq(_spirv_check_ext_sets(&buf, 72), 0, "OpExtInst -> GLSL import accepted");
+    store32(&buf + 56, 7);   # set -> %7 (not the GLSL import)
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "wrong ext set rejected");
+    store32(&buf + 56, 1);   # restore the set
+    store32(&buf + 36, 0x39393939);   # corrupt the import name (no longer ".450")
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 0, "non-GLSL import not found");
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "OpExtInst with no GLSL import rejected");
+    # review #1: a malformed set==0 with no GLSL import still fails loud (not the 0!=0 hole)
+    store32(&buf + 56, 0);
+    assert_eq(_spirv_check_ext_sets(&buf, 72) < 0, 1, "set==0 with no GLSL import rejected");
+    # review #2: a valid name with NON-zero padding after the nul byte still matches
+    store32(&buf + 36, 0x3035342E);   # restore ".450"
+    store32(&buf + 40, 0x12345600);   # nul byte (low) + non-zero padding
+    assert_eq(_spirv_find_glsl_ext_set(&buf, 72), 1, "non-zero padding after nul still matches");
+    store32(&buf + 56, 1);
+    assert_eq(_spirv_check_ext_sets(&buf, 72), 0, "accepted with padded import name");
+    return 0;
+}
+
+# The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
+# variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
+fn test_spirv_lower_seed_bufvar() {
+    var buf[256];
+    var n = _spv_build_typed_module(&buf);
+    var types[480];
+    var deco[320];
+    var outbi[160];
+    spirv_build_type_table(&buf, n, 20, 20, &types);
+    spirv_build_decoration_table(&buf, n, 20, 20, &deco);
+    _spirv_resolve_builtins(&buf, n, 20, &outbi);
+    var m[80];
+    var vals[800];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_seed_globals(&buf, n, &types, &deco, &m, &outbi), 0, "seed ok");
+    assert_eq(mir_val_kind(&m, 12), MIR_VK_BUFVAR, "var %12 is a buffer var");
+    assert_eq(mir_val_payload(&m, 12), 0, "var %12 binding 0");
+    assert_eq(mir_val_unif(&m, 12), MIR_UNIFORM, "buffer base uniform");
+    assert_eq(mir_val_kind(&m, 13), MIR_VK_CONST, "const %13 seeded");
+    assert_eq(mir_val_payload(&m, 13), 42, "const %13 value 42");
+    assert_eq(mir_val_type(&m, 13), MIR_T_I32, "const %13 type I32");
+    return 0;
+}
+
+fn test_spirv_lower_negatives() {
+    var buf[384];
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # no GLCompute entry point -> LOWER_ERR_NO_ENTRY
+    var n = _spv_build_gid_kernel(&buf);
+    store32(&buf + 44, 0);   # OpEntryPoint execution model GLCompute(5) -> Vertex(0)
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - LOWER_ERR_NO_ENTRY, "no entry rejected");
+    # N.7: BRANCH/SELECTION_MERGE now lower; LOOP_MERGE + PHI still fail loud
+    # (loops break the forward linear-scan; the MVP forbids merge-consumed values).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 324, (5 << 16) | 245);   # OpShiftLeftLogical -> OpPhi (still rejected)
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - LOWER_ERR_CONTROL_FLOW, "PHI still rejected");
+    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 324, (5 << 16) | 136);   # OpShiftLeftLogical -> OpFDiv (unmapped)
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - MIR_ERR_UNSUPPORTED_OP, "unmapped op err");
+    return 0;
+}
+
+# Regression tests for the N.2b-1 adversarial review (untrusted-id OOB class +
+# fail-loud gaps). Each corrupts one word of the valid gid kernel to a crafted
+# out-of-range id; spirv_validate_stream still passes (structure intact), and the
+# lowering must reject it (fail loud) with NO out-of-bounds access.
+fn test_spirv_lower_n2b1_review() {
+    var buf[384];
+    var types[384];
+    var consts[256];
+    var deco[256];
+    var outbi[128];
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    # #1 untrusted ALU operand id -> bounded in mir_emit (was an OOB read in the
+    # uniformity sweep). IADD operand a is at buf+296.
+    var n = _spv_build_gid_kernel(&buf);
+    store32(&buf + 296, 0x3FFFFFFF);
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - MIR_ERR_ID_OOR, "operand OOB rejected");
+    # #2 untrusted result-type id -> bounded in _mir_lower_type (was OOB type read).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 288, 0x3FFFFFFF);   # IADD result-type word
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - MIR_ERR_UNSUPPORTED_TYPE, "type OOB");
+    # #3 untrusted OpLoad source id -> bounded in _spirv_lower_load (was OOB read).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 260, 0x3FFFFFFF);   # OpLoad source word
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - MIR_ERR_ID_OOR, "load src OOB rejected");
+    # #4 untrusted OpDecorate BuiltIn target id -> bounded in _spirv_resolve_builtins
+    # (was a controlled-offset OOB WRITE). The store is skipped; the now-unresolved
+    # gid var makes the body OpLoad fail loud (no crash, no corruption).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 92, 0x3FFFFFFF);   # OpDecorate target word
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - MIR_ERR_UNSUPPORTED_OP, "deco OOB safe");
+    # #5 entry id with no matching OpFunction -> fail loud (was silent empty body).
+    _spv_build_gid_kernel(&buf);
+    store32(&buf + 228, 99);   # OpFunction result id 6 -> 99 (entry point still names 6)
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    0 - LOWER_ERR_NO_ENTRY, "empty body fail-loud");
+    return 0;
+}
+
+fn test_spirv_lower_saxpy() {
+    var buf[640];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    var n = _spv_build_saxpy(&buf);
+    assert_eq(spirv_validate_stream(&buf, n), 0, "saxpy valid");
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks), 0, "saxpy lower ok");
+    # seed: two bound buffers + the float const + the builtin
+    assert_eq(mir_val_kind(&m, 13), MIR_VK_BUFVAR, "x is bufvar");
+    assert_eq(mir_val_payload(&m, 13), 0, "x binding 0");
+    assert_eq(mir_val_payload(&m, 14), 1, "y binding 1");
+    assert_eq(mir_val_kind(&m, 15), MIR_VK_CONST, "a is const");
+    assert_eq(mir_val_type(&m, 15), MIR_T_F32, "a is f32");
+    # instruction stream
+    assert_eq(mir_n_instrs(&m), 9, "9 instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "i0 extract gid.x");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_IMUL, "i1 index*stride (x)");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_LOAD, "i2 load x[i]");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_IMUL, "i3 index*stride (y)");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_LOAD, "i4 load y[i]");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_FMUL, "i5 a*x");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_FADD, "i6 +y");
+    assert_eq(mir_instr_op(&m, 7), MIR_OP_STORE, "i7 store y[i]");
+    assert_eq(mir_instr_op(&m, 8), MIR_OP_RET, "i8 ret");
+    # the synth offset IMUL: result is a synth id (>= id_bound 26), a=i(19), b=4 imm
+    assert_eq(mir_instr_result(&m, 1), 26, "offset uses synth id 26");
+    assert_eq(mir_instr_a(&m, 1), 19, "offset = i (gid.x) * ...");
+    assert_eq(mir_instr_b(&m, 1), 4, "stride 4 bytes (f32)");
+    assert_eq(mir_instr_flags(&m, 1), MIR_FLAG_B_IMM, "stride is immediate");
+    # the store carries the value %25 and references the y ptr
+    assert_eq(mir_instr_result(&m, 7), 0, "store has no result");
+    assert_eq(mir_instr_c(&m, 7), 25, "store value = %25");
+    # ptr side-table
+    assert_eq(mir_n_ptrs(&m), 2, "2 access-chain ptrs");
+    assert_eq(mir_ptr_binding(&m, 0), 0, "ptr0 binding 0");
+    assert_eq(mir_ptr_elem_type(&m, 0), MIR_T_F32, "ptr0 elem f32");
+    assert_eq(mir_ptr_dynamic(&m, 0), 1, "ptr0 dynamic");
+    assert_eq(mir_ptr_binding(&m, 1), 1, "ptr1 binding 1");
+    assert_eq(mir_val_kind(&m, 20), MIR_VK_PTR, "%20 is a ptr");
+    assert_eq(mir_val_payload(&m, 20), 0, "%20 -> ptr 0");
+    # uniformity: GID-indexed loads + the arithmetic are all divergent
+    assert_eq(mir_val_unif(&m, 19), MIR_DIVERGENT, "gid.x divergent");
+    assert_eq(mir_val_unif(&m, 21), MIR_DIVERGENT, "x[i] load divergent");
+    assert_eq(mir_val_unif(&m, 23), MIR_DIVERGENT, "y[i] load divergent");
+    assert_eq(mir_val_unif(&m, 24), MIR_DIVERGENT, "a*x divergent");
+    assert_eq(mir_val_unif(&m, 25), MIR_DIVERGENT, "a*x+y divergent");
+    return 0;
+}
+
+fn test_spirv_lower_access_chain_variants() {
+    var buf[640];
+    var m[80];
+    var vals[1216];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    # constant array index -> the byte offset is VMOV-materialized into a VGPR (N.10b: the
+    # FLAT emitter needs a VGPR per-lane offset), so the ptr is dynamic with const_off 0.
+    var n = _spv_build_saxpy(&buf);
+    store32(&buf + 468, 16);   # first access chain array index %19 -> %16 (const 0)
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks), 0, "const-index lower ok");
+    assert_eq(mir_ptr_dynamic(&m, 0), 1, "const index -> VGPR-materialized offset");
+    assert_eq(mir_ptr_const_off(&m, 0), 0, "const_off folded into the VGPR (0)");
+    # integer const array index whose byte offset overflows i32 -> MIR_ERR_OVERFLOW.
+    # Repoint %15 to the uint type so it is an integer const of value 0x40000000.
+    _spv_build_saxpy(&buf);
+    store32(&buf + 308, 4);    # %15 result-type float(%3) -> uint(%4)
+    store32(&buf + 468, 15);   # array index -> %15 (uint 0x40000000; *4 overflows)
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
+    0 - MIR_ERR_OVERFLOW, "offset overflow");
+    # a high-bit index (0xFFFFFFFF, the bit pattern of a signed -1) is NOT a negative offset:
+    # load32 zero-extends, so it reads as 4294967295 and is caught by the same overflow guard
+    # — the N.10b VMOV materialization is never reached with a negative byte offset.
+    _spv_build_saxpy(&buf);
+    store32(&buf + 308, 4);            # %15 -> uint
+    store32(&buf + 316, 0xFFFFFFFF);   # %15 value = 0xFFFFFFFF (high bit set)
+    store32(&buf + 468, 15);           # array index -> %15
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
+    0 - MIR_ERR_OVERFLOW, "high-bit index rejected (no negative offset)");
+    # non-integer (float) const array index -> BAD_ACCESS_CHAIN (review N.2b-2 #2:
+    # the bits must not be reinterpreted as an index).
+    _spv_build_saxpy(&buf);
+    store32(&buf + 468, 15);   # array index -> %15 (float const, not an integer)
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
+    0 - MIR_ERR_BAD_ACCESS_CHAIN, "non-int index");
+    # (vector-element runtime arrays are now SUPPORTED with the std430 stride — see
+    # test_spirv_lower_vec_load_store; N.10c removed the former scalar-only rejection here.)
+    # non-zero struct member index -> BAD_ACCESS_CHAIN (multi-member deferred; see docs/development/3-2-punchlist.md)
+    _spv_build_saxpy(&buf);
+    store32(&buf + 464, 15);   # member index -> %15 (value != 0)
+    assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks),
+    0 - MIR_ERR_BAD_ACCESS_CHAIN, "bad member");
+    return 0;
+}
+
+# N.8b — the OpExtInst front end: GLSL.std.450 FMax/Sqrt lower to MIR float ops; an
+# unsupported ext-instruction number fails loud. The instruction sits at word 5 (after
+# the 5-word header, whose id_bound at word 3 bounds the result-type lookup).
+fn test_spirv_lower_glsl_extinst() {
+    var buf[256];
+    memset(&buf, 0, 256);
+    store32(&buf + 12, 20);                # header id_bound (word 3)
+    store32(&buf + 20, (7 << 16) | 12);    # word5: OpExtInst, wc 7
+    store32(&buf + 24, 3);                 # result type = %3 (float)
+    store32(&buf + 28, 10);                # result id
+    store32(&buf + 32, 1);                 # ext set id
+    store32(&buf + 36, 40);                # GLSL.std.450 FMax
+    store32(&buf + 40, 4);                 # operand 0
+    store32(&buf + 44, 5);                 # operand 1
+    var types[480];
+    memset(&types, 0, 480);
+    store64(&types + 3 * 24 + 0, SPIRV_TYK_FLOAT);
+    store64(&types + 3 * 24 + 8, 32);
+    var consts[8];
+    var deco[8];
+    var lsz[24];
+    memset(&lsz, 0, 24);
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m, &lsz), 0,
+    "FMax extinst lowers");
+    assert_eq(mir_n_instrs(&m), 1, "one MIR instr");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_FMAX, "op = FMAX");
+    assert_eq(mir_instr_a(&m, 0), 4, "operand a = %4");
+    assert_eq(mir_instr_b(&m, 0), 5, "operand b = %5");
+    assert_eq(mir_instr_result(&m, 0), 10, "result = %10");
+    # Sqrt is unary (wc 6, one operand).
+    store32(&buf + 20, (6 << 16) | 12);
+    store32(&buf + 36, 31);                # GLSL.std.450 Sqrt
+    var m2[80];
+    var vals2[640];
+    var instrs2[512];
+    var ptrs2[64];
+    var blocks2[32];
+    mir_mod_init(&m2, &vals2, &instrs2, &ptrs2, &blocks2, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m2, &lsz), 0,
+    "Sqrt extinst lowers");
+    assert_eq(mir_instr_op(&m2, 0), MIR_OP_FSQRT, "op = FSQRT");
+    assert_eq(mir_instr_a(&m2, 0), 4, "sqrt operand = %4");
+    # An unsupported GLSL ext instruction fails loud (not silently dropped).
+    store32(&buf + 20, (7 << 16) | 12);
+    store32(&buf + 36, 99);
+    var m3[80];
+    var vals3[640];
+    var instrs3[512];
+    var ptrs3[64];
+    var blocks3[32];
+    mir_mod_init(&m3, &vals3, &instrs3, &ptrs3, &blocks3, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m3, &lsz) < 0, 1,
+    "unsupported ext instruction fails loud");
+    # Floor is unary (wc 6).
+    store32(&buf + 20, (6 << 16) | 12);
+    store32(&buf + 36, 8);                 # GLSL.std.450 Floor
+    var m4[80];
+    var vals4[640];
+    var instrs4[512];
+    var ptrs4[64];
+    var blocks4[32];
+    mir_mod_init(&m4, &vals4, &instrs4, &ptrs4, &blocks4, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m4, &lsz), 0,
+    "Floor extinst lowers");
+    assert_eq(mir_instr_op(&m4, 0), MIR_OP_FFLOOR, "op = FFLOOR");
+    # FAbs is unary too.
+    store32(&buf + 36, 4);                 # GLSL.std.450 FAbs
+    var mab[80];
+    var valsab[640];
+    var instrsab[512];
+    var ptrsab[64];
+    var blocksab[32];
+    mir_mod_init(&mab, &valsab, &instrsab, &ptrsab, &blocksab, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &mab, &lsz), 0,
+    "FAbs extinst lowers");
+    assert_eq(mir_instr_op(&mab, 0), MIR_OP_FABS, "op = FABS");
+    store32(&buf + 36, 8);                  # restore Floor for the Fma case below
+    # Fma is ternary (wc 8, three operands at +5/+6/+7).
+    store32(&buf + 20, (8 << 16) | 12);
+    store32(&buf + 36, 50);                # GLSL.std.450 Fma
+    store32(&buf + 48, 6);                 # operand 2 (word 12)
+    var m5[80];
+    var vals5[640];
+    var instrs5[512];
+    var ptrs5[64];
+    var blocks5[32];
+    mir_mod_init(&m5, &vals5, &instrs5, &ptrs5, &blocks5, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m5, &lsz), 0,
+    "Fma extinst lowers");
+    assert_eq(mir_instr_op(&m5, 0), MIR_OP_FMA, "op = FMA");
+    assert_eq(mir_instr_a(&m5, 0), 4, "fma a = %4");
+    assert_eq(mir_instr_b(&m5, 0), 5, "fma b = %5");
+    assert_eq(mir_instr_c(&m5, 0), 6, "fma c = %6");
+    # FClamp is ternary too (clamp(x, lo, hi) → median).
+    store32(&buf + 36, 43);                # GLSL.std.450 FClamp
+    var m6[80];
+    var vals6[640];
+    var instrs6[512];
+    var ptrs6[64];
+    var blocks6[32];
+    mir_mod_init(&m6, &vals6, &instrs6, &ptrs6, &blocks6, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m6, &lsz), 0,
+    "FClamp extinst lowers");
+    assert_eq(mir_instr_op(&m6, 0), MIR_OP_FCLAMP, "op = FCLAMP");
+    assert_eq(mir_instr_c(&m6, 0), 6, "fclamp hi = %6");
+    return 0;
+}
+
+# N.5c-2b: the GID expansion produces the right MIR — the first four body instrs
+# are extract(wgid), extract(lid), imul(wgid * local_size), iadd(+lid = gid) — with
+# wgid+mul classified UNIFORM (→ SALU) and the +lid add DIVERGENT (→ VALU).
+fn test_spirv_lower_gid_expansion() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1920];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 26, 26, &types);
+    spirv_build_const_table(&buf, n, 26, 26, &consts);
+    spirv_build_decoration_table(&buf, n, 26, 26, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "gid saxpy lowers");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_EXTRACT, "1: extract lid.x");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "2: wgid * local_size");
+    assert_eq(mir_instr_b(&m, 2), 64, "imul by local_size_x = 64");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_IADD, "3: scaled + lid = gid");
+    assert_eq(mir_val_payload(&m, mir_instr_a(&m, 0)), MIR_BI_WORKGROUP_ID, "extract 0 from WorkgroupId");
+    assert_eq(mir_val_payload(&m, mir_instr_a(&m, 1)), MIR_BI_LOCAL_INVOC_ID, "extract 1 from LocalInvocationId");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 0)), MIR_UNIFORM, "wgid.x uniform");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 1)), MIR_DIVERGENT, "lid.x divergent");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 2)), MIR_UNIFORM, "wgid*size uniform (→ SALU)");
+    assert_eq(mir_val_unif(&m, mir_instr_result(&m, 3)), MIR_DIVERGENT, "gid divergent (→ VALU)");
+    return 0;
+}
+
+# N.5c-2b review: synth-id exhaustion (cap_ids too tight for the GID expansion's
+# 5 synth ids) must FAIL LOUD — mir_alloc_synth_id now returns -1 at the ceiling
+# and _spirv_expand_gid propagates it, rather than silently OOB-writing vals[].
+fn test_spirv_lower_synth_exhaustion() {
+    var buf[640];
+    var n = _spv_build_saxpy_gid(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 26, 26, &types);
+    spirv_build_const_table(&buf, n, 26, 26, &consts);
+    spirv_build_decoration_table(&buf, n, 26, 26, &deco);
+    # cap_ids = id_bound(26) + 2 → only 2 synth slots, but the GID expansion needs 5
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 28);
+    var lr = spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    assert_eq(lr, 0 - MIR_ERR_ID_OOR, "synth exhaustion fails loud");
+    return 0;
+}
+
+fn test_spirv_lower_uniform_if() {
+    var buf[640];
+    var n = _spv_build_uniform_if(&buf);
+    assert_eq(spirv_validate_stream(&buf, n), 0, "uniform-if valid");
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "uniform-if lowers");
+    # The entry label is skipped (laid out at 0); then/merge get LABEL markers.
+    assert_eq(mir_n_instrs(&m), 7, "7 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_ICMP_EQ, "1: icmp_eq");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_COND_BRANCH, "2: cond-branch");
+    assert_eq(mir_instr_a(&m, 2), 13, "cond = %13 (the icmp)");
+    assert_eq(mir_instr_b(&m, 2), 14, "true label = then %14");
+    assert_eq(mir_instr_c(&m, 2), 15, "false label = merge %15");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_LABEL, "3: then label");
+    assert_eq(mir_instr_a(&m, 3), 14, "then label id 14");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_BRANCH, "4: branch to merge");
+    assert_eq(mir_instr_a(&m, 4), 15, "branch target = merge %15");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_LABEL, "5: merge label");
+    assert_eq(mir_instr_a(&m, 5), 15, "merge label id 15");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_RET, "6: return");
+    # The condition is UNIFORM (wgid.x + a constant) → the s_cbranch_scc path.
+    assert_eq(mir_val_unif(&m, 13), MIR_UNIFORM, "icmp_eq result uniform (uniform branch)");
+    return 0;
+}
+
+fn main(): i64 {
+    test_mir_type_distill();
+    test_mir_type_helpers();
+    test_mir_meet_truth_table();
+    test_mir_builtin_unif();
+    test_mir_value_builders();
+    test_mir_emit_and_accessors();
+    test_mir_add_ptr();
+    test_mir_uniformity();
+    test_mir_blocks_and_synth();
+    test_mir_review_n2a();
+    test_mir_emit_errors();
+    test_spirv_lower_gid_kernel();
+    test_spirv_const_fold();
+    test_spirv_lower_smod();
+    test_spirv_lower_vec_construct_extract();
+    test_spirv_lower_vec_construct_guards();
+    test_spirv_vec_robustness();
+    test_spirv_lower_vec_binop();
+    test_spirv_lower_vec_binop_fold();
+    test_spirv_lower_vec_load_store();
+    test_spirv_lower_vec_access_chain();
+    test_spirv_lower_constant_composite();
+    test_spirv_array_stride_validation();
+    test_spirv_ext_set_validation();
+    test_spirv_lower_seed_bufvar();
+    test_spirv_lower_negatives();
+    test_spirv_lower_n2b1_review();
+    test_spirv_lower_saxpy();
+    test_spirv_lower_access_chain_variants();
+    test_spirv_lower_glsl_extinst();
+    test_spirv_lower_gid_expansion();
+    test_spirv_lower_synth_exhaustion();
+    test_spirv_lower_uniform_if();
+    return assert_summary();
+}

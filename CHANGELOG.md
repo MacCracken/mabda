@@ -25,6 +25,18 @@ value-exact on Cezanne. Toolchain pin 6.2.21. With this, **N.7–N.11 (control f
 f32/i32 → int div/mod → vectors → ext-set tracking)** are complete; 3.2.12+ resumes the
 previously-roadmapped Phase F (f64) and Phase R (render-graph multi-queue).
 
+### Changed — compiler test suite reorganized (compiler.tcyr split 4 ways)
+- The 190 KiB / 3933-line `tests/tcyr/compiler.tcyr` was split by compiler pipeline stage into
+  **`compiler_encode.tcyr`** (217 — N.0 gfx9_encode oracle + N.1 parse), **`compiler_lower.tcyr`**
+  (358 — N.2 MIR + SPIR-V→MIR lowering + the div/mod/vector/ext-set/control-flow breadth),
+  **`compiler_backend.tcyr`** (225 — N.3 isel + N.4 regalloc/waitcnt + N.5 emit), and
+  **`compiler_compile.tcyr`** (57 — ABI + the top-level `gfx9_compile` e2e + capacity/hardening
+  rejects). The shared `_spv_build_*` SPIR-V fixtures + the include chain moved to
+  **`compiler_common.cyr`** (a `.cyr` helper each suite includes — not globbed by `make test`).
+  Assertion total unchanged (857 across the four files; full suite still **3808**); the v3.1
+  test reorg's "one standalone suite per src domain" convention is preserved, just at finer grain
+  for the large Phase-N compiler domain. (`tests/tcyr/` is now 16 suites.)
+
 ### Added — Phase N.11 (per-ext-set tracking — `OpExtInst` set validation)
 - **Drop the "the only imported ext set is GLSL.std.450" MVP assumption** (`src/spirv_lower.cyr`):
   `spirv_lower_module` now resolves the `OpExtInstImport` whose name is exactly `"GLSL.std.450"`

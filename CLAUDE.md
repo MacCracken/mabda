@@ -49,7 +49,7 @@ detection.
   pure CPU, no public-API change). **N.0:** `gfx9_encode.cyr` —
   operand-parameterized GFX9 encoders (VOP1/VOP2/VOP3a/SOP2/SOPP/SMEM/FLAT) +
   emit helpers, proven byte-identical against ~90 hand-authored dwords
-  (`compiler.tcyr` oracle + per-form llvm-mc round-trip); the six
+  (the `compiler_encode.tcyr` oracle + per-form llvm-mc round-trip); the six
   `native_gfx9_shader_*` builders were then re-expressed to emit through the
   encoders (zero byte change — the proposal's round-trip check). **N.1:**
   `spirv_parse.cyr` — the SPIR-V front end: `spirv_validate_stream` (the
@@ -185,7 +185,7 @@ doesn't change between paths.
   added 9 no-deps-tier modules before `_shaders.cyr` — `gfx9_encode` +
   `spirv_parse` (3.2.5) then `mir` / `spirv_lower` / `gfx9_isel` /
   `gfx9_regalloc` / `gfx9_waitcnt` / `gfx9_abi` / `gfx9_compile` (3.2.6)).
-- **Tests**: **3808 CPU-only assertions** across **13 functionality-named
+- **Tests**: **3808 CPU-only assertions** across **16 functionality-named
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
@@ -211,7 +211,11 @@ doesn't change between paths.
     rsrc-parameterized compute composers + N.6r the magic-tagged compiled
     shmod struct / kind gate / compiled-dispatch binding guards / tag-checked
     release / LIFO texture-VA reclaim)
-  - `compiler` 857 (Phase N SPIR-V→GFX9: N.0 `gfx9_encode` oracle + N.1
+  - `compiler` 857, **split across 4 files** (2026-06-18) sharing the `compiler_common.cyr`
+    `_spv_build_*` fixtures: `compiler_encode` 217 (N.0 oracle + N.1 parse) · `compiler_lower`
+    358 (N.2 MIR + lowering) · `compiler_backend` 225 (N.3 isel + N.4 regalloc/waitcnt + N.5
+    emit) · `compiler_compile` 57 (ABI + `gfx9_compile` e2e + capacity/hardening rejects).
+    (Phase N SPIR-V→GFX9: N.0 `gfx9_encode` oracle + N.1
     `spirv_parse` rejection gate; N.2 MIR + uniformity sweep + SPIR-V lowering
     (ALU/access-chain/GID-expansion); N.3 isel SALU/VALU; N.4 regalloc reuse +
     `s_waitcnt` use-before-wait invariant; N.5 encode (byte-matched to llvm-mc) +
@@ -340,7 +344,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 3808 CPU assertions across 13 domain files
+make test                                            # 3808 CPU assertions across 16 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -429,7 +433,7 @@ mabda/
 │   ├── instancing.cyr               — instance buffer + identity helpers
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
-│   ├── tcyr/                        — 13 functionality-named domain suites
+│   ├── tcyr/                        — 16 functionality-named domain suites
 │   │   │                              (3808 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
@@ -437,8 +441,12 @@ mabda/
 │   │   ├── core.tcyr  buffer.tcyr  compute.tcyr  texture.tcyr
 │   │   ├── graphics.tcyr  render.tcyr  backend.tcyr  caches.tcyr
 │   │   ├── surface.tcyr  native.tcyr  kms.tcyr  queue.tcyr
-│   │   └── compiler.tcyr  (Phase N: encode oracle + parse + MIR/lower/isel/
-│   │                        regalloc/waitcnt/encode/ABI + gfx9_compile e2e)
+│   │   ├── compiler_encode.tcyr   (Phase N: N.0 gfx9_encode oracle + N.1 parse)
+│   │   ├── compiler_lower.tcyr    (N.2 MIR + SPIR-V→MIR lowering + breadth)
+│   │   ├── compiler_backend.tcyr  (N.3 isel + N.4 regalloc/waitcnt + N.5 emit)
+│   │   ├── compiler_compile.tcyr  (ABI + gfx9_compile e2e + capacity rejects)
+│   │   └── compiler_common.cyr    (@shared, not a .tcyr — `_spv_build_*` fixtures
+│   │                               + include chain for the four compiler_*.tcyr)
 │   └── bcyr/mabda.bcyr              — CPU benchmark harness (9 benches)
 ├── programs/
 │   ├── smoke.cyr                    — link-check for the full include chain
@@ -542,7 +550,7 @@ Same fn-table pattern:
 
 ### CPU testing (no GPU, no master, no dbus)
 
-`cyrius test` runs the three `tests/tcyr/*.tcyr` files against
+`cyrius test` runs all the `tests/tcyr/*.tcyr` files against
 `src/lib.cyr` — no wgpu-native, no amdgpu hardware, no libsystemd
 needed. Backend-abstraction routing exercised via mock-fnptr
 sentinels; native ioctls / wgpu calls / sd_bus calls all surface
@@ -551,7 +559,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 3808 CPU assertions across 13 domain test
+- **Tests are the way** — 3808 CPU assertions across 16 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -601,7 +609,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 3808+ assertions pass across all 13 domain test files,
+2. Test sweep: 3808+ assertions pass across all 16 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -674,7 +682,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 13 `tests/tcyr/*.tcyr` domain suites); 3808+
+   (all 16 `tests/tcyr/*.tcyr` domain suites); 3808+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
