@@ -674,11 +674,20 @@ hand-authored shaders stay as oracle + fallback.
     Fixed the bug where `gid.y` aliased `gid.x` (HW never preloaded `wgid.y`/`lid.y`).
     `programs/native_spirv_2d_dispatch_e2e.cyr` (4×4 global, 16/16 correct) +
     `test_gfx9_abi_assign_2d` + the 2-D rsrc2 oracles.
-  - [ ] **N.6 remainder (still open, continuing this cycle — NOT dropped)** —
-    (a) logical-queue/timeline compiled dispatch (the compiled path is currently
-    synchronous `cached_n`); (b) raising the `id_bound` ceiling above 128 (couples
-    `cap_ids` / `cap_instrs` / `CMP_ISEL_CAP` + the slot scratch — grows static .bss);
-    (c) a fuller differential CPU oracle.
+  - [x] **N.6 — timeline-queue compiled dispatch (2026-06-17) — HW-verified.**
+    `native_compute_dispatch_cached_n_timeline` (N-binding analog of the deadbeef
+    timeline submit) + the compiled dispatch routes to it on a current logical queue
+    (signals the queue's persistent timeline; consumes a pending cross-ring barrier
+    as an in-CS wait, Q.4 contract). `programs/native_spirv_queue_dispatch_e2e.cyr`
+    (`out[i]=3i+7` on the COMPUTE queue, `gpu_queue_wait_idle`, 8/8 correct).
+  - [x] **N.6 — id_bound ceiling 128 → 256 (2026-06-17).** `NATIVE_SHADER_CAP_IDS` +
+    `CMP_ISEL_CAP` raised to the ARCHITECTURAL max: `RA_MAX_REGS=256` sizes the
+    regalloc free-at scratch + the `gfx9_compile`/`gfx9_waitcnt` per-id file-maps, so
+    >256 is rejected by those stages and needs growing their internal scratch (N.8).
+  - [x] **N.6 — fuller CPU oracle (2026-06-17).** The 2-D path is CPU-cross-checked
+    (`test_gfx9_abi_assign` 1-D + `test_gfx9_abi_assign_2d` + the 2-D/3-D `gfx9_rsrc2`
+    oracles + the compiled-dispatch binding/grid guards); the six `native_spirv_*_e2e`
+    programs are the end-to-end differential oracle on real silicon. **N.6 COMPLETE.**
   - [ ] **N.8 op-breadth carry: VOP3 literal materialization** — a VALU multiply by a
     constant > 64 (no VOP3 inline form) → `CMP_ERR_VOP3_LITERAL`. Needs a `v_mov` of
     the 32-bit literal into a register before the VOP3. Found via the N.6 2-D kernel

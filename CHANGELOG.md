@@ -15,11 +15,19 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-### Added — Phase N.6 (2-D / TGID compiled dispatch — completing the N.6 remainder)
+### Added — Phase N.6 remainder (2-D/TGID + timeline-queue + id_bound ceiling)
 - **A compiled SPIR-V kernel can now use a 2-D/3-D workgroup grid + 2-D/3-D
   LocalSize, HW-verified on Cezanne.** `programs/native_spirv_2d_dispatch_e2e.cyr`:
   `out[gid.y*4 + gid.x] = gid.x*16 + gid.y` over a 2×2 workgroup grid × 2×2 LocalSize
   (4×4 global), via `gl_GlobalInvocationId.x/.y` — all 16 texels correct.
+- **A compiled kernel can be dispatched on a logical COMPUTE queue (the queue's
+  persistent timeline), HW-verified on Cezanne.** `native_compute_dispatch_cached_n_
+  timeline` (the N-binding analog of the deadbeef timeline submit) + the compiled
+  dispatch routes to it when a queue is current; `gpu_queue_wait_idle` blocks on the
+  point. `programs/native_spirv_queue_dispatch_e2e.cyr` (`out[i]=3i+7`, 8/8 correct).
+- **The SPIR-V `id_bound` ceiling is raised 128 → 256** (`NATIVE_SHADER_CAP_IDS`,
+  `CMP_ISEL_CAP`) — the architectural max, since the regalloc free-at scratch +
+  the `gfx9_compile`/`gfx9_waitcnt` per-id file-maps are `RA_MAX_REGS=256`-sized.
 - `src/gfx9_abi.cyr` — `gfx9_abi_assign` now derives the TGID_X/Y/Z and
   LocalInvocationId component enables from the **max component each builtin is
   actually extracted with** (scanning the MIR EXTRACT instructions), instead of the

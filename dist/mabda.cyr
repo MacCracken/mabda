@@ -7195,7 +7195,9 @@ var DESC_RSRC2        = 16;
 var DESC_USER_SGPR    = 24;
 var DESC_NUM_BINDINGS = 32;
 
-var CMP_ISEL_CAP  = 128;   # max selected instrs (caller sizes isel/isel2 to match)
+var CMP_ISEL_CAP  = 256;   # max selected instrs (caller sizes isel/isel2 to match) —
+# matched to the RA_MAX_REGS=256 id ceiling so a kernel at
+# the cap can still select an instr per value.
 var GFX9_SGPR_CAP = 104;   # GFX9 SGPR file limit (s0..s103) — the regalloc ceiling
 var GFX9_VGPR_CAP = 256;   # GFX9 VGPR file
 
@@ -10505,6 +10507,62 @@ shader_handle, out_handle, queue, ip_type): i64 {
     return _native_neg_rc_to_gpu_err(rc);
 }
 
+# N.6 — the N-binding analog of native_compute_dispatch_cached_timeline: a COMPILED
+# kernel reading/writing N storage buffers, dispatched on a LOGICAL QUEUE's ring,
+# signalling the queue's persistent timeline (and consuming any pending cross-ring
+# barrier as an in-CS wait — same Q.4 contract as the deadbeef timeline path). BO
+# list = fence + stub + each binding + shader + ib (the cached_n shape). The caller
+# waits via gpu_queue_wait_idle / orders with gpu_queue_barrier.
+fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
+binds, n_binds, queue, ip_type): i64 {
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+    var fd  = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var stub_handle  = native_ctx_stub_handle(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    memset(ib_addr, 0, 4096);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    # entries: fence(1) + stub(3) + each binding(3) + shader(4) + ib(10).
+    var entries[256];
+    var ne = 0;
+    store32(&entries + ne * 8, fence_handle);
+    store32(&entries + ne * 8 + 4, 1);
+    ne = ne + 1;
+    store32(&entries + ne * 8, stub_handle);
+    store32(&entries + ne * 8 + 4, 3);
+    ne = ne + 1;
+    var bi = 0;
+    while (bi < n_binds) {
+        store32(&entries + ne * 8, load64(binds + bi * 8));
+        store32(&entries + ne * 8 + 4, 3);
+        ne = ne + 1;
+        bi = bi + 1;
+    }
+    store32(&entries + ne * 8, shader_handle);
+    store32(&entries + ne * 8 + 4, 4);
+    ne = ne + 1;
+    store32(&entries + ne * 8, ib_handle);
+    store32(&entries + ne * 8 + 4, 10);
+    ne = ne + 1;
+    var bo_list_in[24];
+    store32(&bo_list_in + 0, 0xFFFFFFFF);
+    store32(&bo_list_in + 4, 0xFFFFFFFF);
+    store32(&bo_list_in + 8, ne);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
 # ================================================================
 # v3.2 X.4 — SDMA buffer-copy on the DMA ring (timeline path)
 # ================================================================
@@ -11006,11 +11064,13 @@ var NATIVE_SHMOD_LOCALY  = 72;
 var NATIVE_SHMOD_LOCALZ  = 80;
 var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
+# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the compile
 # scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
-# → CMP_ERR_TABLE → this returns 0). 128 covers the MVP kernels; raising it grows
-# the stack frame (the tables are id-indexed). The MVP exit (downsample) used 45.
-var NATIVE_SHADER_CAP_IDS = 128;
+# → CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
+# free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
+# RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
+# further needs growing those internal scratch buffers (a deeper N.8 change).
+var NATIVE_SHADER_CAP_IDS = 256;
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
 # at a context-allocated VA, and return a magic-tagged shmod struct the compute
@@ -11027,15 +11087,15 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # (N.6r review, HIGH). 20 is the floor; full structural validation is the gate's.
     if (byte_len < 20) { return 0; }
 
-    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS ids ---
-    var types[3072];     # 128 * SPIRV_TYPE_REC(24)
-    var consts[2048];    # 128 * SPIRV_CONST_REC(16)
-    var deco[2048];      # 128 * SPIRV_DECO_REC(16)
-    var outbi[1024];     # 128 * 8
+    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
     var m[80];
-    var vals[5120];      # 128 * MIR_VAL_REC(40)
-    var instrs[8192];    # 256 * MIR_INSTR_REC(32)
-    var ptrs[1024];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[2048];      # 128 * MIR_PTR_REC(16)
     var blocks[32];
     # The MIR synth-id counter starts right after the SPIR-V ids (the header's
     # id_bound), so synthesized values (access-chain offsets, GID expansion) get
@@ -11043,11 +11103,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
     # table-build gate (CMP_ERR_TABLE).
     var idb = spirv_hdr_id_bound(words_ptr);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 256, 64, idb,
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 512, 128, idb,
     NATIVE_SHADER_CAP_IDS);
-    var isel[6144];      # CMP_ISEL_CAP(128) * GISEL_REC(48)
-    var isel2[6144];
-    var alloc[2048];     # 128 * RA_REC(16)
+    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
+    var isel2[12288];
+    var alloc[4096];     # 256 * RA_REC(16)
     var hw[16];
     var abi[64];
     var cc[88];
@@ -11174,7 +11234,7 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
 # compiler's binding count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a
 # caller error. Bindings are capped at 16 (the USER_DATA ceiling the ABI enforces).
 # Synchronous (cached_n).
-fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp): i64 {
+fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq): i64 {
     if (bp == 0) { return GPU_ERR_OTHER; }
     var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
     var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
@@ -11205,6 +11265,13 @@ fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp): i64 {
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
     &bind_vas, nbind, local_x, local_y, local_z, x, y, z);
+    # On a logical queue (cq != 0) signal its persistent timeline so the caller can
+    # order it via gpu_queue_barrier / wait via gpu_queue_wait_idle (the DMA-ring
+    # mis-route was rejected upstream). cq == 0 is the v3.0 synchronous single-ring path.
+    if (cq != 0) {
+        return native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes,
+        shader_handle, &bind_handles, nbind, cq, queue_ring(cq));
+    }
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
@@ -11250,7 +11317,7 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     # LocalSize. The legacy (handle,va) pair has no magic and falls through to the
     # v3.0 deadbeef path unchanged.
     if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
-        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp);
+        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp, cq);
     }
 
     var stub_va = native_ctx_stub_va(ctx);

@@ -312,6 +312,26 @@ build/native_spirv_public_api_e2e: programs/native_spirv_public_api_e2e.cyr src/
 test-native-spirv-public-api-e2e: build/native_spirv_public_api_e2e
 	./build/native_spirv_public_api_e2e
 
+# N.6: a compiled SPIR-V kernel with a 2-D/3-D workgroup grid + 2-D LocalSize via
+# gl_GlobalInvocationId.x/.y (TGID_Y + TIDIG_COMP_CNT), HW-verified on Cezanne.
+build/native_spirv_2d_dispatch_e2e: programs/native_spirv_2d_dispatch_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_2d_dispatch_e2e.cyr $@
+
+.PHONY: test-native-spirv-2d-dispatch-e2e
+test-native-spirv-2d-dispatch-e2e: build/native_spirv_2d_dispatch_e2e
+	./build/native_spirv_2d_dispatch_e2e
+
+# N.6: a compiled SPIR-V kernel dispatched on a LOGICAL COMPUTE QUEUE (the queue's
+# persistent timeline), waited via gpu_queue_wait_idle. HW-verified on Cezanne.
+build/native_spirv_queue_dispatch_e2e: programs/native_spirv_queue_dispatch_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_queue_dispatch_e2e.cyr $@
+
+.PHONY: test-native-spirv-queue-dispatch-e2e
+test-native-spirv-queue-dispatch-e2e: build/native_spirv_queue_dispatch_e2e
+	./build/native_spirv_queue_dispatch_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

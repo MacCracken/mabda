@@ -1,0 +1,217 @@
+# programs/native_spirv_queue_dispatch_e2e.cyr — N.6: a COMPILED SPIR-V kernel
+# dispatched on a LOGICAL COMPUTE QUEUE (timeline path), through the public API.
+#
+# Unlike native_spirv_public_api_e2e (synchronous single-ring), this routes the
+# compiled dispatch through the queue's persistent timeline: gpu_queue_get(COMPUTE)
+# + gpu_ctx_set_current_queue makes the dispatch async on that ring, signalling the
+# timeline; gpu_queue_wait_idle blocks on it. Proves native_compute_dispatch_cached_
+# n_timeline (the N-binding timeline submit) end-to-end on Cezanne.
+#
+# Kernel: `out[lid.x] = lid.x*3 + 7` (LocalSize 8), 1 binding. Verify out[i]=3i+7.
+# Exit: 0 = all 8 lanes; 2 = compile; 3/5 = setup; 6 = queue; 9 = dispatch;
+# 10 = wait_idle; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# SPIR-V (id-bound 22, 488 bytes): out[lid.x] = lid.x*3 + 7, LocalSize 8. Binding %14.
+fn build_idx_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 22);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (6 << 16) | 15);
+    store32(buf + 44, 5);
+    store32(buf + 48, 15);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 13);
+    store32(buf + 64, (6 << 16) | 16);
+    store32(buf + 68, 15);
+    store32(buf + 72, 17);
+    store32(buf + 76, 8);
+    store32(buf + 80, 1);
+    store32(buf + 84, 1);
+    store32(buf + 88, (4 << 16) | 71);
+    store32(buf + 92, 13);
+    store32(buf + 96, 11);
+    store32(buf + 100, 27);
+    store32(buf + 104, (4 << 16) | 71);
+    store32(buf + 108, 14);
+    store32(buf + 112, 33);
+    store32(buf + 116, 0);
+    store32(buf + 120, (4 << 16) | 71);
+    store32(buf + 124, 14);
+    store32(buf + 128, 34);
+    store32(buf + 132, 0);
+    store32(buf + 136, (2 << 16) | 19);
+    store32(buf + 140, 1);
+    store32(buf + 144, (3 << 16) | 33);
+    store32(buf + 148, 2);
+    store32(buf + 152, 1);
+    store32(buf + 156, (4 << 16) | 21);
+    store32(buf + 160, 3);
+    store32(buf + 164, 32);
+    store32(buf + 168, 0);
+    store32(buf + 172, (4 << 16) | 23);
+    store32(buf + 176, 4);
+    store32(buf + 180, 3);
+    store32(buf + 184, 3);
+    store32(buf + 188, (4 << 16) | 32);
+    store32(buf + 192, 5);
+    store32(buf + 196, 1);
+    store32(buf + 200, 4);
+    store32(buf + 204, (3 << 16) | 29);
+    store32(buf + 208, 6);
+    store32(buf + 212, 3);
+    store32(buf + 216, (3 << 16) | 30);
+    store32(buf + 220, 7);
+    store32(buf + 224, 6);
+    store32(buf + 228, (4 << 16) | 32);
+    store32(buf + 232, 8);
+    store32(buf + 236, 12);
+    store32(buf + 240, 7);
+    store32(buf + 244, (4 << 16) | 32);
+    store32(buf + 248, 9);
+    store32(buf + 252, 12);
+    store32(buf + 256, 3);
+    store32(buf + 260, (4 << 16) | 43);
+    store32(buf + 264, 3);
+    store32(buf + 268, 10);
+    store32(buf + 272, 3);
+    store32(buf + 276, (4 << 16) | 43);
+    store32(buf + 280, 3);
+    store32(buf + 284, 11);
+    store32(buf + 288, 7);
+    store32(buf + 292, (4 << 16) | 43);
+    store32(buf + 296, 3);
+    store32(buf + 300, 12);
+    store32(buf + 304, 0);
+    store32(buf + 308, (4 << 16) | 59);
+    store32(buf + 312, 5);
+    store32(buf + 316, 13);
+    store32(buf + 320, 1);
+    store32(buf + 324, (4 << 16) | 59);
+    store32(buf + 328, 8);
+    store32(buf + 332, 14);
+    store32(buf + 336, 12);
+    store32(buf + 340, (5 << 16) | 54);
+    store32(buf + 344, 1);
+    store32(buf + 348, 15);
+    store32(buf + 352, 0);
+    store32(buf + 356, 2);
+    store32(buf + 360, (2 << 16) | 248);
+    store32(buf + 364, 16);
+    store32(buf + 368, (4 << 16) | 61);
+    store32(buf + 372, 4);
+    store32(buf + 376, 17);
+    store32(buf + 380, 13);
+    store32(buf + 384, (5 << 16) | 81);
+    store32(buf + 388, 3);
+    store32(buf + 392, 18);
+    store32(buf + 396, 17);
+    store32(buf + 400, 0);
+    store32(buf + 404, (5 << 16) | 132);
+    store32(buf + 408, 3);
+    store32(buf + 412, 19);
+    store32(buf + 416, 18);
+    store32(buf + 420, 10);
+    store32(buf + 424, (5 << 16) | 128);
+    store32(buf + 428, 3);
+    store32(buf + 432, 20);
+    store32(buf + 436, 19);
+    store32(buf + 440, 11);
+    store32(buf + 444, (6 << 16) | 65);
+    store32(buf + 448, 9);
+    store32(buf + 452, 21);
+    store32(buf + 456, 14);
+    store32(buf + 460, 12);
+    store32(buf + 464, 18);
+    store32(buf + 468, (3 << 16) | 62);
+    store32(buf + 472, 21);
+    store32(buf + 476, 20);
+    store32(buf + 480, (1 << 16) | 253);
+    store32(buf + 484, (1 << 16) | 56);
+    return 488;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V queue (timeline) compiled dispatch e2e (N.6) on Cezanne\n");
+    print_cstr("--------------------------------------------------------------------------\n");
+
+    var spv[640];
+    var n = build_idx_kernel(&spv);
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # Acquire the COMPUTE logical queue + make it the dispatch target → the compiled
+    # dispatch routes through the queue's persistent timeline.
+    var q = gpu_queue_get(ctx, QUEUE_KIND_COMPUTE);
+    if (q == 0) { print_cstr("FAIL: gpu_queue_get(COMPUTE)\n"); return 6; }
+    gpu_ctx_set_current_queue(ctx, q);
+
+    var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (shmod == 0) { print_cstr("FAIL: shader_module_create_spirv -> 0\n"); return 2; }
+
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 5; }
+    var out_handle = load64(&ob + 0);
+    var out_map = load64(&ob + 8);
+    var k = 0;
+    while (k < 8) { store32(out_map + k * 4, 0xBAADF00D); k = k + 1; }
+    var out_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, out_handle, out_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    var bp[24];
+    store64(&bp + 0, 1);
+    store64(&bp + 8, out_handle);
+    store64(&bp + 16, out_va);
+
+    # PUBLIC API: dispatch (async on the COMPUTE queue) then block on its timeline.
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, &bp);
+    if (rc != 0) { print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+    rc = gpu_queue_wait_idle(ctx, q);
+    if (rc != 0) { print_cstr("FAIL: gpu_queue_wait_idle rc="); print_i64(rc); print_cstr("\n"); return 10; }
+
+    var ok = 1;
+    var i = 0;
+    while (i < 8) {
+        var got = load32(out_map + i * 4);
+        var want = i * 3 + 7;
+        print_cstr("out["); print_i64(i); print_cstr("] = "); print_i64(got);
+        print_cstr(" (want "); print_i64(want); print_cstr(")");
+        if (got != want) { print_cstr("  MISMATCH"); ok = 0; }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    gpu_shader_module_release(ctx, shmod);
+    native_gem_va_unmap(fd, out_handle, out_va, 4096);
+    native_bo_release_gtt(fd, out_handle, out_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: timeline-queue compiled dispatch mismatch\n"); return 11; }
+    print_cstr("OK — compiled kernel on a COMPUTE queue (timeline) correct on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
