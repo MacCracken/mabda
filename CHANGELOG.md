@@ -15,6 +15,17 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+## [3.2.8] — 2026-06-17
+
+The native **SPIR-V→GFX9 scalar f32/i32 compiler** — control flow plus full op breadth,
+HW-verified on Cezanne. Builds on the 3.2.5–3.2.7 compiler MVP: **Phase N.7** adds
+structured control flow (uniform `if` via `s_cbranch_scc0`, divergent `if` via the EXEC
+mask), and **Phase N.8** adds the op breadth that makes scalar f32/i32 kernels real —
+VOP3-literal + store + float-inline + const-fold constants, signed compares, the
+GLSL.std.450 math library (min/max/sqrt/floor/fma/clamp/abs), and VOP2 const operands.
+Every path is verified on real silicon; every bite was adversarially reviewed. Toolchain
+pin 6.2.19 → 6.2.21. (int div/mod, vectors, and per-ext-set tracking are 3.2.9–3.2.11.)
+
 ### Added — Phase N.8b-8 (const-fold two-literal ops — scalar f32 compiler complete)
 - **A binary op over two compile-time constants folds at lowering time** into a single
   materialized constant (`src/spirv_lower.cyr`: `_spirv_both_const` gate + `_spirv_const_fold`),
