@@ -791,10 +791,12 @@ hand-authored shaders stay as oracle + fallback.
     the sign bit; correct for finite/±inf/nan/±0). HW-verified on Cezanne
     (`native_spirv_fabs_e2e.cyr`, `abs(float(gid.x)-4.0)`). +7 asserts. Also rebased the
     GISEL error codes 40/41 → 100/101 (op enum reached 41).
-  - [ ] **N.8b-8 — const-fold two-literal ops (closes 3.2.8).** Fold a binary op whose
-    BOTH operands are constants at compile time (e.g. `2 * 3`, currently fail-loud in the
-    VOP3-2src / two-literal paths) into a single materialized constant. After this the
-    **scalar f32 compiler is complete** → cut 3.2.8.
+  - [x] **N.8b-8 (2026-06-17) — const-fold two-literal ops. SCALAR f32 COMPILER
+    COMPLETE.** `_spirv_both_const` + `_spirv_const_fold` (int i64-masked, float via the
+    f32/f64 builtins) fold a two-const binary op into one constant at lowering time.
+    HW-verified on Cezanne (`native_spirv_const_fold_e2e.cyr`, `gid.x+6*7`). +14 asserts;
+    the gid-kernel fixtures' `1<<2` now folds (tests updated) + uniform-SALU coverage moved
+    to `test_gfx9_regalloc_uniform_salu`. **→ ready to cut 3.2.8.**
   - [ ] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide; lower UDiv/SDiv/
     UMod/SMod via the reciprocal + Newton-Raphson correction expansion.
   - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).

@@ -6372,6 +6372,40 @@ fn _spirv_alu_to_mir(op): i64 {
     return 0;
 }
 
+# 1 if both `a` and `b` are compile-time constants (so a binary op over them folds).
+# Bounds-guarded against the untrusted id range (cap_ids = m+64), like the table builders.
+fn _spirv_both_const(m, a, b): i64 {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var cap = load64(m + 64);
+    if (a >= cap) { return 0; }
+    if (b >= cap) { return 0; }
+    if (mir_val_kind(m, a) != MIR_VK_CONST) { return 0; }
+    if (mir_val_kind(m, b) != MIR_VK_CONST) { return 0; }
+    return 1;
+}
+
+# Fold a binary ALU op over two constant operands → the 32-bit result value. Integer ops
+# use i64 arithmetic masked to 32 bits (`>>` is logical, correct for SHR); float ops
+# decode the f32 bits to f64, compute, and re-encode (f32_to / f64_* / f32_from). Only
+# called for the ops _spirv_alu_to_mir returns, so the trailing return is unreachable.
+fn _spirv_const_fold(m, mop, a, b): i64 {
+    var va = mir_val_payload(m, a) & 0xFFFFFFFF;
+    var vb = mir_val_payload(m, b) & 0xFFFFFFFF;
+    if (mop == MIR_OP_IADD) { return (va + vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_ISUB) { return (va - vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_IMUL) { return (va * vb) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_AND) { return va & vb; }
+    if (mop == MIR_OP_OR) { return va | vb; }
+    if (mop == MIR_OP_XOR) { return va ^ vb; }
+    if (mop == MIR_OP_SHL) { return (va << (vb & 31)) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_SHR) { return (va >> (vb & 31)) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FADD) { return f32_from(f64_add(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FSUB) { return f32_from(f64_sub(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    if (mop == MIR_OP_FMUL) { return f32_from(f64_mul(f32_to(va), f32_to(vb))) & 0xFFFFFFFF; }
+    return va;
+}
+
 # SPIR-V integer-comparison opcode → MIR_OP_ICMP_*, or 0 if not a comparison we
 # lower. The result is a bool the COND_BRANCH consumes (a uniform compare → SCC).
 fn _spirv_cmp_to_mir(op): i64 {
@@ -6580,8 +6614,17 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
         if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
-        var e = mir_emit(m, mop, spirv_word(ptr, off + 2), rty,
-        spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
+        var aop = spirv_word(ptr, off + 3);
+        var bop = spirv_word(ptr, off + 4);
+        var rid = spirv_word(ptr, off + 2);
+        # Const-fold: both operands compile-time constants → one materialized constant
+        # (instead of an op that would fail loud once both sources are non-VGPR).
+        if (_spirv_both_const(m, aop, bop) == 1) {
+            var ec = mir_set_const(m, rid, rty, _spirv_const_fold(m, mop, aop, bop));
+            if (ec < 0) { return ec; }
+            return 0;
+        }
+        var e = mir_emit(m, mop, rid, rty, aop, bop, 0, 0);
         if (e < 0) { return e; }
         return 0;
     }

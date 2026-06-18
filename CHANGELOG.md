@@ -15,6 +15,23 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-8 (const-fold two-literal ops — scalar f32 compiler complete)
+- **A binary op over two compile-time constants folds at lowering time** into a single
+  materialized constant (`src/spirv_lower.cyr`: `_spirv_both_const` gate + `_spirv_const_fold`),
+  instead of fail-loud once both sources are non-VGPR. Integers use i64 math masked to
+  32 bits (logical `>>`); floats decode→f64-op→re-encode via the f32/f64 builtins. The
+  folded result flows downstream as a constant (store-const materializes it, an add takes
+  it inline). HW: `native_spirv_const_fold_e2e.cyr` (`gid.x + 6*7` → `gid.x + 42`).
+- +14 fold-arith asserts (`test_spirv_const_fold`, int + float + the foldability gate);
+  the `_spv_build_gid_kernel` tests were updated (its `1<<2` example now folds → 4 instrs)
+  and a `test_gfx9_regalloc_uniform_salu` added to preserve the uniform-SALU→SGPR coverage
+  that the folded `1<<2` used to provide (via `wgid.x << 2`, which doesn't fold).
+- **With this, the native SPIR-V scalar f32/i32 compiler is complete** — arithmetic
+  (+const operands), shifts/bitwise, converts, signed+unsigned compares, uniform+divergent
+  control flow, GLSL min/max/sqrt/floor/fma/clamp/abs, inline constants, const-fold,
+  load/store + store-const, all builtins, 1-D/2-D/3-D dispatch — all HW-verified on
+  Cezanne. (int div/mod, vectors, per-ext-set → 3.2.9/3.2.10/3.2.11.)
+
 ### Added — Phase N.8b-7 (GLSL `FAbs` — closes the scalar f32 math library)
 - **GLSL.std.450 `FAbs`** → `v_and_b32 dst, 0x7FFFFFFF, x` (clear the f32 sign bit;
   correct for finite/±inf/nan/±0). `MIR_OP_FABS` + `GISEL_V_ABS_F32` + `_emit_fabs`

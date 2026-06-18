@@ -443,6 +443,16 @@ build/native_spirv_fabs_e2e: programs/native_spirv_fabs_e2e.cyr src/*.cyr
 test-native-spirv-fabs-e2e: build/native_spirv_fabs_e2e
 	./build/native_spirv_fabs_e2e
 
+# N.8b-8: a two-constant op const-folded at compile time (`gid.x + 6*7` → `gid.x + 42`).
+# HW-verified on Cezanne.
+build/native_spirv_const_fold_e2e: programs/native_spirv_const_fold_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_const_fold_e2e.cyr $@
+
+.PHONY: test-native-spirv-const-fold-e2e
+test-native-spirv-const-fold-e2e: build/native_spirv_const_fold_e2e
+	./build/native_spirv_const_fold_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

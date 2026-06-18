@@ -961,15 +961,15 @@ fn test_spirv_lower_gid_kernel() {
     assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "gid divergent");
     assert_eq(mir_val_kind(&m, 8), MIR_VK_CONST, "c1 const");
     assert_eq(mir_val_payload(&m, 8), 1, "c1 value 1");
-    # instr stream: EXTRACT, IADD, IMUL, SHL, RET (the builtin load is an alias)
-    assert_eq(mir_n_instrs(&m), 5, "5 instrs");
+    # instr stream: EXTRACT, IADD, IMUL, RET (the builtin load is an alias; the SHL of
+    # two constants %8<<%9 is const-folded away — N.8b-8).
+    assert_eq(mir_n_instrs(&m), 4, "4 instrs (1<<2 folded)");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "i0 extract");
     assert_eq(mir_instr_result(&m, 0), 12, "extract -> %12");
     assert_eq(mir_instr_flags(&m, 0), MIR_FLAG_C_IMM, "extract lane is immediate");
     assert_eq(mir_instr_op(&m, 1), MIR_OP_IADD, "i1 iadd");
     assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "i2 imul");
-    assert_eq(mir_instr_op(&m, 3), MIR_OP_SHL, "i3 shl");
-    assert_eq(mir_instr_op(&m, 4), MIR_OP_RET, "i4 ret");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_RET, "i3 ret (shl folded away)");
     # the builtin OpLoad aliased %11 to the builtin value (no instruction)
     assert_eq(mir_val_kind(&m, 11), MIR_VK_BUILTIN, "load aliases builtin");
     assert_eq(mir_val_unif(&m, 11), MIR_DIVERGENT, "loaded gid divergent");
@@ -977,10 +977,54 @@ fn test_spirv_lower_gid_kernel() {
     assert_eq(mir_val_unif(&m, 12), MIR_DIVERGENT, "gid.x divergent");
     assert_eq(mir_val_unif(&m, 13), MIR_DIVERGENT, "x+1 divergent");
     assert_eq(mir_val_unif(&m, 14), MIR_DIVERGENT, "(x+1)*2 divergent");
-    assert_eq(mir_val_unif(&m, 15), MIR_UNIFORM, "1<<2 uniform (both const)");
+    # 1<<2 (both const) const-folds to the constant 4 (uniform) — no SHL instruction.
+    assert_eq(mir_val_kind(&m, 15), MIR_VK_CONST, "1<<2 folded to a constant");
+    assert_eq(mir_val_payload(&m, 15), 4, "1<<2 folds to 4");
+    assert_eq(mir_val_unif(&m, 15), MIR_UNIFORM, "folded const is uniform");
     # block
     assert_eq(mir_block_term(&m, 0), MIR_TERM_RETURN, "ret terminator");
-    assert_eq(mir_block_count(&m, 0), 5, "block has 5 instrs");
+    assert_eq(mir_block_count(&m, 0), 4, "block has 4 instrs");
+    return 0;
+}
+
+# N.8b-8 — const-fold arithmetic over two constant operands. Integers use i64 math
+# masked to 32 bits (`>>` logical); floats decode/compute/re-encode via the f32/f64
+# builtins. `_spirv_both_const` is the foldability gate.
+fn test_spirv_const_fold() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 6);
+    mir_set_const(&m, 2, MIR_T_U32, 7);
+    mir_set_const(&m, 3, MIR_T_U32, 0xF0);
+    mir_set_const(&m, 4, MIR_T_U32, 0x0F);
+    mir_set_const(&m, 5, MIR_T_U32, 1);
+    mir_set_const(&m, 6, MIR_T_U32, 2);
+    mir_set_const(&m, 7, MIR_T_U32, 4);
+    mir_set_const(&m, 8, MIR_T_F32, 0x40000000);   # 2.0
+    mir_set_const(&m, 9, MIR_T_F32, 0x3F800000);   # 1.0
+    mir_set_const(&m, 10, MIR_T_F32, 0x40400000);  # 3.0
+    # foldability gate
+    assert_eq(_spirv_both_const(&m, 1, 2), 1, "two consts foldable");
+    assert_eq(_spirv_both_const(&m, 1, 0), 0, "id-0 operand not foldable");
+    mir_set_builtin(&m, 11, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    assert_eq(_spirv_both_const(&m, 1, 11), 0, "builtin operand not foldable");
+    # integer
+    assert_eq(_spirv_const_fold(&m, MIR_OP_IADD, 1, 2), 13, "6+7=13");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_IMUL, 1, 2), 42, "6*7=42");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_ISUB, 2, 1), 1, "7-6=1");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_AND, 3, 4), 0, "0xF0 & 0x0F = 0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_OR, 3, 4), 0xFF, "0xF0 | 0x0F = 0xFF");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_XOR, 3, 4), 0xFF, "0xF0 ^ 0x0F = 0xFF");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_SHL, 5, 6), 4, "1 << 2 = 4");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_SHR, 3, 7), 0xF, "0xF0 >> 4 = 0xF");
+    # float (bit patterns)
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FADD, 8, 9), 0x40400000, "2.0 + 1.0 = 3.0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FMUL, 8, 10), 0x40C00000, "2.0 * 3.0 = 6.0");
+    assert_eq(_spirv_const_fold(&m, MIR_OP_FSUB, 10, 9), 0x40000000, "3.0 - 1.0 = 2.0");
     return 0;
 }
 
@@ -1464,12 +1508,12 @@ fn test_gfx9_isel_gid_salu_valu() {
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "gid lower ok");
     var isel[256];
     var ic = gfx9_isel(&m, &isel, 5);
-    assert_eq(ic, 5, "5 selected instrs");
+    # The 1<<2 SHL const-folds away (N.8b-8), so only the divergent ops + endpgm remain.
+    assert_eq(ic, 4, "4 selected instrs (shl folded)");
     assert_eq(gisel_op(&isel, 0), GISEL_EXTRACT, "0 extract gid.x");
     assert_eq(gisel_op(&isel, 1), GISEL_V_ADD_U32, "1 x+1 divergent -> VALU");
     assert_eq(gisel_op(&isel, 2), GISEL_V_MUL_LO_U32, "2 *2 divergent -> VALU");
-    assert_eq(gisel_op(&isel, 3), GISEL_S_LSHL_B32, "3 1<<2 uniform -> SALU");
-    assert_eq(gisel_op(&isel, 4), GISEL_S_ENDPGM, "4 endpgm");
+    assert_eq(gisel_op(&isel, 3), GISEL_S_ENDPGM, "3 endpgm");
     return 0;
 }
 
@@ -1532,9 +1576,39 @@ fn test_gfx9_regalloc_gid() {
     assert_eq(gfx9_reg(&alloc, 12), 1, "gid.x -> v1");
     assert_eq(gfx9_reg(&alloc, 13), 2, "x+1 -> v2");
     assert_eq(gfx9_reg(&alloc, 14), 1, "*2 -> v1 (reuses freed v1)");
-    assert_eq(gfx9_reg(&alloc, 15), 8, "1<<2 uniform -> s8 (sgpr_base)");
+    # %15 (1<<2) const-folds away (N.8b-8), so no SGPR is allocated here; the dedicated
+    # uniform-SALU→SGPR regalloc test (test_gfx9_regalloc_uniform_salu) covers that path.
     assert_eq(gfx9_hw_vgpr(&hw), 3, "vgpr high-water 3 (v0 reserved + v1,v2)");
-    assert_eq(gfx9_hw_sgpr(&hw), 9, "sgpr high-water 9 (s8 used)");
+    assert_eq(gfx9_hw_sgpr(&hw), 8, "sgpr high-water 8 (base only; no uniform op)");
+    return 0;
+}
+
+# N.8b-8 coverage — uniform SALU arithmetic → SGPR regalloc, preserved after the gid
+# kernel's 1<<2 example began const-folding. A uniform SHL (wgid.x << const, wgid is a
+# uniform builtin so it does NOT fold) selects to s_lshl_b32 and allocates an SGPR.
+fn test_gfx9_regalloc_uniform_salu() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_WORKGROUP_ID);   # uniform
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);  # wgid.x (uniform)
+    mir_emit(&m, MIR_OP_SHL, 7, MIR_T_U32, 6, 2, 0, MIR_FLAG_B_IMM);      # wgid.x << 2 (uniform)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 7), MIR_UNIFORM, "wgid<<2 uniform");
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    assert_eq(gisel_op(&isel, 1), GISEL_S_LSHL_B32, "uniform shl -> SALU");
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "uniform-salu regalloc ok");
+    # %6 (wgid.x extract) and %7 (shl) are both uniform → SGPRs at/above the base (8);
+    # assert SGPR-range + a non-trivial SGPR high-water rather than pinning exact regs.
+    assert_eq(gfx9_reg(&alloc, 7) >= 8, 1, "wgid<<2 allocated to an SGPR (>= base)");
+    assert_eq(gfx9_hw_sgpr(&hw) >= 9, 1, "an SGPR was allocated above the base");
     return 0;
 }
 
@@ -1696,8 +1770,9 @@ fn test_gfx9_waitcnt_none() {
     var ic = gfx9_isel(&m, &isel, 8);
     var out[256];
     var wc = gfx9_waitcnt(&m, &isel, ic, &out, 8);
-    assert_eq(wc, 5, "no memory -> no waits, count unchanged");
-    assert_eq(gisel_op(&out, 4), GISEL_S_ENDPGM, "endpgm not preceded by a wait");
+    # 4 selected instrs (the 1<<2 SHL const-folds away, N.8b-8); no memory -> no waits.
+    assert_eq(wc, 4, "no memory -> no waits, count unchanged");
+    assert_eq(gisel_op(&out, 3), GISEL_S_ENDPGM, "endpgm not preceded by a wait");
     # no S_WAITCNT anywhere
     var i = 0;
     var waits = 0;
@@ -3263,6 +3338,7 @@ fn main(): i64 {
     test_gfx9_isel_gid_salu_valu();
     test_gfx9_isel_errors();
     test_gfx9_regalloc_gid();
+    test_gfx9_regalloc_uniform_salu();
     test_gfx9_regalloc_saxpy();
     test_gfx9_regalloc_errors();
     test_gfx9_regalloc_valu_uniform();
@@ -3281,6 +3357,7 @@ fn main(): i64 {
     test_gfx9_emit_fabs();
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
+    test_spirv_const_fold();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
     test_gfx9_emit_fma_inline_float();
