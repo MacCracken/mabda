@@ -15,6 +15,16 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9c (u32 `OpUMod` — integer remainder)
+- **`OpUMod` (137) reuses the udiv macro core**, selecting the corrected REMAINDER instead
+  of the quotient. `src/spirv_lower.cyr` factors the shared `_udiv_core` (VMOV N/D + the
+  reciprocal sequence through correction-1, returning `[dc, nc, q2, m2]`); `_spirv_lower_udiv`
+  applies the quotient's correction-2 + the 0xFFFFFFFF guard, `_spirv_lower_umod` applies
+  the remainder's correction-2 (`m2-D when m2>=D`) + a `b=0 → r=N` guard (the standard
+  remainder-of-zero convention). The udiv refactor is byte-identical (re-verified on HW).
+- **HW: `programs/native_spirv_umod_e2e.cyr`** — `out[gid]=a[gid]%b[gid]` over the 8-lane
+  edge matrix value-exact on Cezanne (incl. `100%0=100`, `max%0x80000000=0x7FFFFFFF`).
+
 ### Added — Phase N.9b-2 (u32 `OpUDiv` — integer division runs on Cezanne)
 - **GFX9 has no integer divide, so `OpUDiv` (134) expands to LLVM's float-reciprocal
   vector macro** (`src/spirv_lower.cyr` `_spirv_lower_udiv`): N/D are VMOV'd into VGPRs

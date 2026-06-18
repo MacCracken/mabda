@@ -814,8 +814,9 @@ hand-authored shaders stay as oracle + fallback.
       contiguous cmp/cndmask). b=0 → deterministic 0xFFFFFFFF guard (the natural saturate
       is a-derived garbage — confirmed on HW, per design risk #1). `native_spirv_udiv_e2e.cyr`
       value-exact on Cezanne over the edge matrix. Adversarial review + HW-stress.
-    - [ ] **N.9c — u32 OpUMod (137).** Reuse the core; select the remainder m + one final
-      cmp+cndmask. b=0 → r=N (pinned).
+    - [x] **N.9c (2026-06-18) — u32 OpUMod (137).** Factored `_udiv_core` (shared by udiv);
+      umod applies the remainder's correction-2 + a b=0→N guard. udiv re-verified byte-
+      identical. `native_spirv_umod_e2e.cyr` value-exact on Cezanne + HW-stress.
     - [ ] **N.9d — signed OpSDiv/OpSMod/OpSRem.** Sign-magnitude wrapper (v_ashrrev_i32 31
       sign masks → abs → unsigned core → sign restore); SMod follows divisor sign, SRem
       the dividend. New encoder `GFX9_VOP2_V_ASHRREV_I32` (verify via llvm-mc at this bite).

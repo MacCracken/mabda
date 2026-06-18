@@ -34,6 +34,7 @@ var SPIRV_OP_FSUB             = 131;
 var SPIRV_OP_IMUL             = 132;
 var SPIRV_OP_FMUL             = 133;
 var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
+var SPIRV_OP_UMOD             = 137;   # N.9c — udiv core, remainder select
 var SPIRV_OP_SHR_LOGICAL      = 194;
 var SPIRV_OP_SHL              = 196;
 var SPIRV_OP_BITWISE_OR       = 197;
@@ -430,11 +431,11 @@ fn _udiv_op(m, op, type, a, b, c, flags): i64 {
 # VCC survives (nothing between writes VCC; no waitcnt is inserted there). 0x4F7FFFFE is
 # the magic reciprocal scale (biases the estimate down so v_rcp's ≤1-ULP error can't
 # overshoot). b=0 → q saturates to 0xFFFFFFFF (pinned in the HW test).
-fn _spirv_lower_udiv(ptr, off, wc, m): i64 {
-    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-    var result = spirv_word(ptr, off + 2);
-    var nn = spirv_word(ptr, off + 3);
-    var dd = spirv_word(ptr, off + 4);
+# The shared u32 division CORE: VMOV N/D into VGPRs, then LLVM's float-reciprocal
+# sequence through correction-1 (the Newton-refined reciprocal, the quotient estimate,
+# remainder, and the first correction). Writes [dc, nc, q2, m2] into out (4 i64 slots) for
+# OpUDiv/OpUMod (and later signed peers) to apply their final correction + zero guard.
+fn _udiv_core(m, nn, dd, out): i64 {
     var u = MIR_T_U32;
     var f = MIR_T_F32;
     var nc = _udiv_op(m, MIR_OP_VMOV, u, nn, 0, 0, 0);            if (nc < 0) { return nc; }
@@ -455,16 +456,53 @@ fn _spirv_lower_udiv(ptr, off, wc, m): i64 {
     var t5 = _udiv_op(m, MIR_OP_ISUB, u, m1, dc, 0, 0);          if (t5 < 0) { return t5; }
     var q2 = _udiv_op(m, MIR_OP_CNDMASK, u, q1, s1, 0, 0);       if (q2 < 0) { return q2; }
     var m2 = _udiv_op(m, MIR_OP_CNDMASK, u, m1, t5, 0, 0);       if (m2 < 0) { return m2; }
+    store64(out + 0, dc);
+    store64(out + 8, nc);
+    store64(out + 16, q2);
+    store64(out + 24, m2);
+    return 0;
+}
+
+# OpUDiv: the core + the quotient's correction-2 (q+1 when m2>=D), then a divide-by-zero
+# guard pinning a deterministic 0xFFFFFFFF (the bare macro yields a-derived garbage; the
+# common GPU all-ones convention — N.9b-2).
+fn _spirv_lower_udiv(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var co[32];
+    var rc = _udiv_core(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var q2 = load64(&co + 16);
+    var m2 = load64(&co + 24);
+    var u = MIR_T_U32;
     var s2 = _udiv_op(m, MIR_OP_IADD, u, q2, 1, 0, MIR_FLAG_B_IMM); if (s2 < 0) { return s2; }
     var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);      if (c2 < 0) { return c2; }
     var qf = _udiv_op(m, MIR_OP_CNDMASK, u, q2, s2, 0, 0);       if (qf < 0) { return qf; }
-    # Divide-by-zero is UNDEFINED in SPIR-V; the bare macro yields a-derived garbage (the
-    # +inf reciprocal is mangled by the corrections), so pin a DETERMINISTIC 0xFFFFFFFF
-    # (the common GPU all-ones convention). ones is materialized to a VGPR; the ICMP_EQ +
-    # CNDMASK are contiguous so VCC survives.
     var ones = _udiv_op(m, MIR_OP_VMOV, u, 0xFFFFFFFF, 0, 0, MIR_FLAG_A_IMM); if (ones < 0) { return ones; }
     var cz = _udiv_op(m, MIR_OP_ICMP_EQ, u, 0, dc, 0, MIR_FLAG_A_IMM);  if (cz < 0) { return cz; }
     var er = mir_emit(m, MIR_OP_CNDMASK, result, u, qf, ones, 0, 0);  # (dc==0) ? ones : qf
+    if (er < 0) { return er; }
+    return 0;
+}
+
+# OpUMod: the same core, then the REMAINDER's correction-2 (m2-D when m2>=D). Divide-by-
+# zero → r = N (the dividend) — the standard remainder-of-zero convention (N.9c).
+fn _spirv_lower_umod(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var co[32];
+    var rc = _udiv_core(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var nc = load64(&co + 8);
+    var m2 = load64(&co + 24);
+    var u = MIR_T_U32;
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);      if (c2 < 0) { return c2; }
+    var t6 = _udiv_op(m, MIR_OP_ISUB, u, m2, dc, 0, 0);          if (t6 < 0) { return t6; }
+    var mf = _udiv_op(m, MIR_OP_CNDMASK, u, m2, t6, 0, 0);       if (mf < 0) { return mf; }
+    var cz = _udiv_op(m, MIR_OP_ICMP_EQ, u, 0, dc, 0, MIR_FLAG_A_IMM);  if (cz < 0) { return cz; }
+    var er = mir_emit(m, MIR_OP_CNDMASK, result, u, mf, nc, 0, 0);  # (dc==0) ? nc : mf
     if (er < 0) { return er; }
     return 0;
 }
@@ -504,8 +542,9 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         return 0;
     }
     # Integer comparisons → ICMP (a bool result the COND_BRANCH consumes). The
-    # OpUDiv expands to the float-reciprocal macro (no GFX9 integer divide). N.9b.
+    # OpUDiv / OpUMod expand to the float-reciprocal macro (no GFX9 integer divide). N.9b/c.
     if (op == SPIRV_OP_UDIV) { return _spirv_lower_udiv(ptr, off, wc, m); }
+    if (op == SPIRV_OP_UMOD) { return _spirv_lower_umod(ptr, off, wc, m); }
     # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
     # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
     var cop = _spirv_cmp_to_mir(op);
