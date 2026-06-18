@@ -15,6 +15,20 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+## [3.2.7] — 2026-06-17
+
+**The native SPIR-V → GFX9 compute compiler reaches the public API.** Building on
+3.2.6 (the compiler HW-verified end-to-end, Phases N.2–N.5), this release closes the
+v3.2.x native-compiler arc to the consumer surface: a real image kernel (a 2×2
+box-filter downsample) compiles in-tree and **pixel-matches** a CPU reference on
+Cezanne (N.5g — the named MVP exit); a consumer compiles + dispatches SPIR-V entirely
+through `gpu_shader_module_create_spirv` + `gpu_compute_dispatch`, with the native
+backend doing the compile, ISA staging, and RSRC/binding/LocalSize wiring behind the
+slot (N.6 + N.6r); and the SPIR-V→GFX9 table builders are hardened against an
+untrusted `id_bound` OOB write **before** that public path exposes the compiler
+(N-HARDEN.1). Every phase adversarially reviewed; all findings fixed pre-merge. All
+3461 CPU assertions pass; pin → 6.2.19.
+
 ### Added — Phase N.6r (SPIR-V compiled through the PUBLIC gpu_* API on native)
 - **A consumer can now compile a SPIR-V compute kernel and dispatch it entirely
   through the public API on the native AMD backend** — no compiler internals at the
