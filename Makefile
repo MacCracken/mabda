@@ -301,6 +301,17 @@ build/native_spirv_downsample_e2e: programs/native_spirv_downsample_e2e.cyr src/
 test-native-spirv-downsample-e2e: build/native_spirv_downsample_e2e
 	./build/native_spirv_downsample_e2e
 
+# N.6r: a compiled SPIR-V kernel run through the PUBLIC gpu_* API end-to-end —
+# gpu_shader_module_create_spirv (native slot compiles + stages the ISA) +
+# gpu_compute_dispatch (consumes the compiled RSRC/bindings/LocalSize).
+build/native_spirv_public_api_e2e: programs/native_spirv_public_api_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_public_api_e2e.cyr $@
+
+.PHONY: test-native-spirv-public-api-e2e
+test-native-spirv-public-api-e2e: build/native_spirv_public_api_e2e
+	./build/native_spirv_public_api_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

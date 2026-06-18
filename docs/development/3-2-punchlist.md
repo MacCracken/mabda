@@ -654,9 +654,22 @@ hand-authored shaders stay as oracle + fallback.
     `s[2k:2k+1]`), `y[i]==3*i+100` all lanes. `native_pm4_build_compute_dispatch`
     (N-binding composer) + `native_compute_dispatch_cached_n` (variable BO list) +
     `programs/native_spirv_saxpy_e2e.cyr` + a CPU structural test.
-  - [ ] **N.6 remainder** — `_backend_native_shader_module_create` slot wiring (so
-    consumers compile SPIR-V through the public `gpu_*` API), the TGID/2-D dispatch
-    path, and a fuller differential CPU oracle.
+  - [x] **N.6r (2026-06-17) — HW-verified on Cezanne. The compiler is reachable
+    through the public API.** `gpu_shader_module_create_spirv` → the native slot
+    compiles SPIR-V (`gfx9_compile`) into a GTT BO at a context VA + records RSRC +
+    bindings + LocalSize in a **magic-tagged** shader-module struct;
+    `gpu_compute_dispatch` detects the tag and dispatches via the generic N-binding
+    composer (the legacy 16-byte deadbeef pair is discriminated by the absence of the
+    magic — `native_compute_store` + the queue programs untouched).
+    `programs/native_spirv_public_api_e2e.cyr` (2-binding SAXPY, all 8 lanes) +
+    `make test-native-spirv-public-api-e2e` + 22 CPU asserts (struct layout / kind
+    gate / dispatch binding guards / tag-checked release). Adversarially reviewed.
+    *MVP scope:* 1-D grid (public `y`/`z` validated, compiled path uses `x`); SPIR-V
+    `id_bound` ≤ 128; synchronous submit.
+  - [ ] **N.6 remainder (deferred enhancements, NOT MVP-blocking)** — the TGID/2-D
+    dispatch path (compiled `y`/`z` grid + 2-D LocalSize), a logical-queue/timeline
+    compiled dispatch, raising the `id_bound` ceiling, and a fuller differential CPU
+    oracle. None block the milestone (the public SPIR-V path is HW-proven).
   - [x] **N-HARDEN.1 (2026-06-17) — security, found during N.5g via adversarial
     review.** **Unchecked OOB write in the SPIR-V table builders on untrusted
     `id_bound`, now gated.** `spirv_build_type_table` / `_const_table` /

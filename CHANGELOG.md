@@ -15,6 +15,37 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.6r (SPIR-V compiled through the PUBLIC gpu_* API on native)
+- **A consumer can now compile a SPIR-V compute kernel and dispatch it entirely
+  through the public API on the native AMD backend** — no compiler internals at the
+  call site. `gpu_shader_module_create_spirv(ctx, words, len)` routes to the native
+  slot, which runs `gfx9_compile`, stages the ISA in a GTT BO at a context-allocated
+  VA, and records the compiler's RSRC1/RSRC2 + binding count + LocalSize in a
+  magic-tagged shader-module struct; `gpu_compute_dispatch(ctx, shmod, gx,1,1, bp)`
+  detects the tag and dispatches through the generic N-binding composer (binding
+  k → USER_DATA `s[2k:2k+1]`, NUM_THREAD_X = the compiled LocalSize). HW-verified on
+  Cezanne: `programs/native_spirv_public_api_e2e.cyr` runs the 2-binding SAXPY
+  (`y[i] = 3*x[i] + y[i]`) and all 8 lanes are correct. `make test-native-spirv-public-api-e2e`.
+- The legacy 16-byte `(handle, va)` "deadbeef" dispatch path is untouched — the magic
+  tag (`0x4D42444153484D31`, never a u32 GEM handle) discriminates a compiled module
+  from the legacy pair, so `native_compute_store` + the three queue programs still pass.
+- `src/backend_native.cyr` — `_backend_native_shader_module_create` (SPIR-V → compiled
+  module; WGSL / pre-compiled GFX9 fail loud), `_backend_native_shader_module_release`
+  (tag-checked VA-unmap + BO-release), and `_native_dispatch_compiled` (the compiled
+  dispatch path with binding-array guards). bindings ≤ 16 (the USER_DATA ceiling); the
+  binding array is count-prefixed `(handle, va)` pairs and its count must match the
+  kernel's. +22 asserts in `tests/tcyr/native.tcyr` (struct layout + the kind gate +
+  the dispatch binding guards + the tag-checked release).
+- *MVP scope:* 1-D grid (a multi-dim grid is **rejected** — `GPU_ERR_WORKGROUP_LIMIT` —
+  rather than silently dropping `y`/`z` workgroups); SPIR-V `id_bound` ≤ 128 (larger
+  fails loud via the N-HARDEN.1 table gate); synchronous submit (a logical-queue/timeline
+  compiled path is a later bite).
+- *Adversarially reviewed (4 findings fixed pre-commit):* a sub-header (`byte_len < 20`)
+  SPIR-V now fails before the `id_bound` header read (was an OOB read); the shader VA is
+  reclaimed (LIFO) on every on-error path so a transient BO-create / va-map failure no
+  longer permanently consumes the 2 GiB region; the release path's VA-not-reclaimed
+  policy is documented.
+
 ### Security — Phase N-HARDEN.1 (unchecked OOB write in the SPIR-V table builders)
 - **The SPIR-V→GFX9 table builders no longer trust the header `id_bound`.**
   `spirv_build_type_table` / `_const_table` / `_decoration_table`
