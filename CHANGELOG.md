@@ -13,7 +13,19 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [Unreleased]
+## [3.2.10] — 2026-06-18
+
+The native **SPIR-V→GFX9 vector support** — vec2/vec3/vec4 across construct/extract,
+component-wise arithmetic, `array<vecN>` buffer load/store, and constants (**Phase N.10**),
+all HW-verified on Cezanne. GFX9 has no vector registers, so the approach is **scalarize-on-
+lower**: a vecN is a `MIR_VK_VECTOR` value packing its N component scalar `<id>`s, and every
+vector op emits N scalar ops — the entire scalar back end (isel/regalloc/waitcnt/emit) is
+reused unchanged. **N.10a** `OpCompositeConstruct`/`OpCompositeExtract`; **N.10b** component-
+wise binary arithmetic + the constant-index FLAT enabler (a constant `OpAccessChain` index now
+VMOV-materializes its offset into a VGPR); **N.10c** `array<vecN>` `OpLoad`/`OpStore` (std430
+stride, with a fail-loud non-std430 `ArrayStride` gate); **N.10d** `OpConstantComposite` + splat
+(with per-component const-fold). Four HW e2e programs value-exact on Cezanne; every bite
+adversarially reviewed (Workflow). Toolchain pin 6.2.21. (per-ext-set tracking is 3.2.11.)
 
 ### Added — Phase N.10d (`OpConstantComposite` vector constants + splat, HW-verified)
 - **Vector constants** (`src/spirv_lower.cyr`): `OpConstantComposite` (44) is structurally

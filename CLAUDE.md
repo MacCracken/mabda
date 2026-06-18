@@ -11,7 +11,7 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.21+ (`cyrius.cyml: cyrius = "6.2.21"`)
-- **Version**: 3.2.9 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Version**: 3.2.10 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -120,7 +120,24 @@ detection.
   (`v_ashrrev_i32` 0x11 / `s_ashr_i32` 0x20). Five `native_spirv_{udiv,umod,sdiv,srem,
   smod}_e2e` HW programs, value-exact vs independent CPU references (8-lane edge matrices
   + 32-lane HW-stress sweeps); every bite adversarially reviewed (Workflow). Toolchain
-  6.2.21. vectors + per-ext-set tracking are 3.2.10–3.2.11; multi-dim grid + `id_bound`≤128 raised.
+  6.2.21.
+  **3.2.10** → **native SPIR-V→GFX9 vector support** (vec2/3/4, **Phase N.10**), HW-verified
+  on Cezanne. GFX9 has no vector registers → **scalarize-on-lower**: a vecN is a
+  `MIR_VK_VECTOR` value packing its N component scalar `<id>`s (16 bits each; count in the
+  packed type), and every vector op emits N scalar ops, so the whole scalar back end is reused
+  unchanged. **N.10a** `OpCompositeConstruct` (packs operand ids, no instrs) / `OpCompositeExtract`
+  (one `VMOV` from the packed component; GID vec3 special-case kept ahead). **N.10b**
+  component-wise binary arith (`_spirv_lower_vec_binop` → N scalar ops + scalar broadcast +
+  per-component const-fold) + the **constant-index FLAT enabler** (a constant `OpAccessChain`
+  index VMOV-materializes its byte offset into a VGPR — the FLAT emitter needs a VGPR offset;
+  prior kernels only used the dynamic gid offset). **N.10c** `array<vecN>` `OpLoad`/`OpStore`
+  (N consecutive 4-byte accesses at `base+j*4`) with the **std430 array stride** computed from
+  the element type (vec2→8, vec3/vec4→16) + a fail-loud `_spirv_check_array_strides` gate
+  rejecting a non-std430 `ArrayStride`. **N.10d** `OpConstantComposite` (seed pass reuses the
+  Construct packer) + splat. Central enforcement: `mir_emit` rejects a `MIR_VK_VECTOR` operand
+  (vectors must be scalarized first). Four `native_spirv_vector_{add,load_store,const}_e2e` +
+  `…_load_store` HW programs value-exact on Cezanne; every bite adversarially reviewed
+  (Workflow). Toolchain 6.2.21. per-ext-set tracking is 3.2.11; multi-dim grid + `id_bound`≤128 raised.
   The v3.1.2-deferred TRANSFER/buffer-copy + render-graph multi-queue were
   pulled INTO the v3.2.x arc (Phases X / R) per maintainer decision — with the
   N.10/N.11 (vectors + per-ext-set) insert shifting Phase F/R down, the
@@ -150,9 +167,9 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.2.9, 2026-06-18)
+## Current State (post 3.2.10, 2026-06-18)
 
-- **Source**: 49 domain modules under `src/*.cyr`, ~20,200 lines
+- **Source**: 49 domain modules under `src/*.cyr`, ~20,500 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
@@ -160,7 +177,7 @@ doesn't change between paths.
   added 9 no-deps-tier modules before `_shaders.cyr` — `gfx9_encode` +
   `spirv_parse` (3.2.5) then `mir` / `spirv_lower` / `gfx9_isel` /
   `gfx9_regalloc` / `gfx9_waitcnt` / `gfx9_abi` / `gfx9_compile` (3.2.6)).
-- **Tests**: **3695 CPU-only assertions** across **13 functionality-named
+- **Tests**: **3800 CPU-only assertions** across **13 functionality-named
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
@@ -186,7 +203,7 @@ doesn't change between paths.
     rsrc-parameterized compute composers + N.6r the magic-tagged compiled
     shmod struct / kind gate / compiled-dispatch binding guards / tag-checked
     release / LIFO texture-VA reclaim)
-  - `compiler` 744 (Phase N SPIR-V→GFX9: N.0 `gfx9_encode` oracle + N.1
+  - `compiler` 849 (Phase N SPIR-V→GFX9: N.0 `gfx9_encode` oracle + N.1
     `spirv_parse` rejection gate; N.2 MIR + uniformity sweep + SPIR-V lowering
     (ALU/access-chain/GID-expansion); N.3 isel SALU/VALU; N.4 regalloc reuse +
     `s_waitcnt` use-before-wait invariant; N.5 encode (byte-matched to llvm-mc) +
@@ -197,7 +214,10 @@ doesn't change between paths.
     GLSL min/max/sqrt/floor/fma/clamp/abs, VOP3-literal/store/float-inline/const-fold
     constants); **3.2.9** adds N.9 int div/mod (the float-reciprocal udiv primitives +
     oracle, the `_signed_prep` ASHR primitive, and the `test_spirv_lower_smod` 37-instr
-    floored-modulo structure). Every stage's adversarial-review regressions live here too)
+    floored-modulo structure); **3.2.10** adds N.10 vectors (`MIR_VK_VECTOR` construct/extract,
+    component-wise binop + fold, vec load/store + std430 stride + ArrayStride gate, constant
+    composite, the mir_emit vector-operand guard). Every stage's adversarial-review regressions
+    live here too)
   Splitting also kept every file under the 128 KiB lint/fmt cap (the old
   `mabda_v3.tcyr` had grown to 148 KiB, past the cap).
   Plus GPU integration programs: `phase0`, `compute_e2e`,
@@ -311,7 +331,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 3695 CPU assertions across 13 domain files
+make test                                            # 3800 CPU assertions across 13 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -401,7 +421,7 @@ mabda/
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
 │   ├── tcyr/                        — 13 functionality-named domain suites
-│   │   │                              (3695 asserts total; `make test` globs
+│   │   │                              (3800 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -439,6 +459,9 @@ mabda/
 │   ├── native_spirv_udiv_e2e.cyr / native_spirv_umod_e2e.cyr — 3.2.9 N.9b-2/c: u32 div/rem (HW)
 │   ├── native_spirv_sdiv_e2e.cyr / native_spirv_srem_e2e.cyr — 3.2.9 N.9d-1: signed div/rem (HW)
 │   ├── native_spirv_smod_e2e.cyr — 3.2.9 N.9d-2: floored modulo (divisor sign, HW)
+│   ├── native_spirv_vector_add_e2e.cyr — 3.2.10 N.10b: vec3 construct + add/mul + extract (HW)
+│   ├── native_spirv_vector_load_store_e2e.cyr — 3.2.10 N.10c: array<vec4> load/op/store (HW)
+│   ├── native_spirv_vector_const_e2e.cyr — 3.2.10 N.10d: OpConstantComposite vec4 + add (HW)
 │   ├── native_compressed_store_e2e.cyr — v3.2: native BC1/BC7 store round-trip
 │   ├── compressed_texture_e2e.cyr   — v3.2: wgpu BC1 create+upload+copy-back (verify)
 │   ├── native_queue_compute_e2e.cyr — v3.1.1: compute on a COMPUTE queue + timeline
@@ -519,7 +542,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 3695 CPU assertions across 13 domain test
+- **Tests are the way** — 3800 CPU assertions across 13 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -569,7 +592,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 3695+ assertions pass across all 13 domain test files,
+2. Test sweep: 3800+ assertions pass across all 13 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -642,7 +665,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 13 `tests/tcyr/*.tcyr` domain suites); 3695+
+   (all 13 `tests/tcyr/*.tcyr` domain suites); 3800+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with

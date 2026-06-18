@@ -869,7 +869,9 @@ hand-authored shaders stay as oracle + fallback.
       CPU asserts). Adversarial review: `_spirv_lower_vec_binop` now const-folds a component
       with two const operands (a vec const+const would otherwise emit an unencodable
       `v_add(const,const)`). **→ Phase N.10 (vectors) complete.**
-    - [ ] **N.10e — cut 3.2.10.** (vectors complete; ready to cut after this bite lands)
+    - [x] **N.10e (2026-06-18) — cut 3.2.10.** VERSION/README/CHANGELOG/CLAUDE.md bumped;
+      dist re-stamped; closeout green (suite 3800, bench, vector HW arc on Cezanne);
+      release-readiness audit. **→ 3.2.10 (vectors) shipped.**
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
     Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).
