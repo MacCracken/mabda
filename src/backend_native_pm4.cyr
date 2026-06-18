@@ -686,6 +686,76 @@ binds, n_binds, ntx, nty, ntz, gx, gy, gz): i64 {
     return pos;
 }
 
+# v3.2 F.5: PM4 stream that dispatches native_gfx9_shader_fma_f64 — the first
+# native f64 (double-precision) compute on Cezanne. Computes, per lane i in a
+# single workgroup of `ntx` (= LocalSize_x) lanes:
+#   out[i] = fma(a[i], b[i], c[i])   over four f64 StorageBuffers.
+#
+# The kernel's 4-binding ABI (binding k → USER_DATA s[2k:2k+1]) means every
+# USER_DATA SGPR pair s0..s7 is a real binding — there is NO scratch stub
+# slot (the shader has no spills), so this composer uses TMPRING_SIZE = 0 and
+# loads the four base VAs into USER_DATA_0/1, _2/3, _4/5, _6/7 (the same
+# generic shape as the N.6 native_pm4_build_compute_dispatch, specialized +
+# documented for the f64 ABI). RSRC1/RSRC2 are the f64 kernel's
+# (GFX9_COMPUTE_PGM_RSRC1_FMA_F64 / _RSRC2_FMA_F64). NUM_THREAD = (ntx,1,1);
+# grid = (1,1,1) workgroup, so lid.x in v0 ranges 0..ntx-1 — one lane per
+# element. The proven Cezanne scaffold (STATIC_THREAD_MGMT / COHER / BC_BASE /
+# ACQUIRE_MEM / RESOURCE_LIMITS) is identical to the other compute composers.
+# `a_va`/`b_va`/`c_va`/`out_va` are the four binding base VAs. Returns the
+# 64-dword byte length.
+fn native_pm4_build_compute_fma_f64(buf, shader_va, rsrc1, rsrc2,
+a_va, b_va, c_va, out_va, ntx): i64 {
+    var pos = 0;
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, (shader_va >> 40) & 0xFF);
+    var tm01[8];
+    store32(&tm01 + 0, 0xFFFFFFFF);
+    store32(&tm01 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE0, 2, &tm01);
+    var tm23[8];
+    store32(&tm23 + 0, 0);
+    store32(&tm23 + 4, 0);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_STATIC_THREAD_MGMT_SE2, 2, &tm23);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_CP_COHER_START_DELAY, 0);
+    var bc_pair[8];
+    store32(&bc_pair + 0, 0);
+    store32(&bc_pair + 4, 0);
+    pos = native_pm4_set_uconfig_reg_pair(buf, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_LO, (shader_va >> 8) & 0xFFFFFFFF);
+    var rsrc[8];
+    store32(&rsrc + 0, rsrc1);
+    store32(&rsrc + 4, rsrc2);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_PGM_RSRC1, 2, &rsrc);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_TMPRING_SIZE, 0);
+    # USER_DATA: binding 0 = a (s0:1), 1 = b (s2:3), 2 = c (s4:5), 3 = out (s6:7).
+    var u01[8];
+    store32(&u01 + 0, a_va & 0xFFFFFFFF);
+    store32(&u01 + 4, (a_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 0, 2, &u01);
+    var u23[8];
+    store32(&u23 + 0, b_va & 0xFFFFFFFF);
+    store32(&u23 + 4, (b_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 8, 2, &u23);
+    var u45[8];
+    store32(&u45 + 0, c_va & 0xFFFFFFFF);
+    store32(&u45 + 4, (c_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 16, 2, &u45);
+    var u67[8];
+    store32(&u67 + 0, out_va & 0xFFFFFFFF);
+    store32(&u67 + 4, (out_va >> 32) & 0xFFFFFFFF);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_USER_DATA_0 + 24, 2, &u67);
+    pos = native_pm4_acquire_mem_full_invalidate(buf, pos);
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
+    var nt[12];
+    store32(&nt + 0, ntx);
+    store32(&nt + 4, 1);
+    store32(&nt + 8, 1);
+    pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
+    pos = native_pm4_dispatch_direct(buf, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
+    var cur = pos / 4;
+    if (cur < 64) { pos = native_pm4_nop(buf, pos, 64 - cur); }
+    return pos;
+}
+
 # v3.1 [M.5]: PM4 stream that dispatches native_gfx9_shader_downsample_2x2
 # to fill one mip level from its parent. Mirrors the deadbeef composer
 # (same STATIC_THREAD_MGMT / COHER / BC_BASE / ACQUIRE_MEM / RESOURCE_LIMITS

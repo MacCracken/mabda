@@ -911,11 +911,13 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   consumer's primary hard-fail. **Adversarial review:** closed an OOB operand read in
   `spirv_uses_f64` + the sibling scanners (`off + wc > total` bound, for untrusted/odd-length
   bytes). +5 asserts; non-f64 native kernel (`smod_e2e`) unaffected on Cezanne.
-- [ ] **F.4** *(3.2.12)* — `native_gfx9_shader_fma_f64` hand-authored
-  reference kernel (`V_FMA_F64`, doubled-VGPR RSRC1); llvm-mc byte-pinned.
-- [ ] **F.5** *(3.2.12)* — `native_pm4_build_compute_fma_f64` composer.
-- [ ] **F.6** *(3.2.12)* — `native_f64_fma_e2e.cyr` (Cezanne): a*b+c
-  **bit-exact vs CPU f64**. f64-on-HW proof, decoupled from Phase N.
+- [x] **F.4–F.6** *(3.2.12)* (2026-06-18) — **first native f64 on Cezanne.** `native_gfx9_shader_fma_f64`
+  (`V_FMA_F64` VOP3 0x1CC + `GLOBAL_LOAD/STORE_DWORDX2`, RSRC1 0x2C0042 = 10 VGPRs; llvm-mc-pinned
+  + `test_gfx9_enc_f64` oracle) + `native_pm4_build_compute_fma_f64` composer + `native_f64_fma_e2e.cyr`:
+  `out=a*b+c` **bit-exact vs a fused-FMA reference** (8 lanes). Fused-rounding proven — the GPU's
+  single-rounding `v_fma_f64` matches `math.fma` (not the unfused `mul`+`add`, which differs by 1 ULP
+  on lanes like `0.1*0.1+0.1`); Cyrius has no fused builtin so the reference is embedded + math.fma-
+  validated. +4 asserts; no regression (smod/vector_const still pass on Cezanne). Decoupled from Phase N.
 - [ ] **F.8** *(3.2.12)* — wgpu f64: the **rigorous probe** (build a minimal f64 SPIR-V module,
   `gpu_shader_module_create_spirv`, non-null ⇒ f64) composed with `gpu_wgpu_spirv_passthrough_supported`
   **+ the launcher requesting `SpirvShaderPassthrough` in `requiredFeatures`** (reference

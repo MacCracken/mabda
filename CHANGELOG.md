@@ -15,6 +15,27 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase F.4–F.6 (first native f64 compute — `V_FMA_F64`, bit-exact on Cezanne)
+- **The first double-precision compute on real AMD silicon, decoupled from the Phase N compiler.**
+  A hand-authored GFX9 kernel computes `out[i] = a[i]*b[i] + c[i]` in IEEE-754 double and is
+  **bit-exact vs a fused-FMA CPU reference** across 8 lanes on Cezanne.
+- **F.4** `native_gfx9_shader_fma_f64` (`src/backend_native_shaders.cyr`): the kernel emitted
+  through the existing encoders — per-lane f64 offset (`lid.x*8`), three `GLOBAL_LOAD_DWORDX2`
+  (SADDR form, a→s[0:1] b→s[2:3] c→s[4:5]), `s_waitcnt vmcnt(0)`, `v_fma_f64 v[8:9],v[2:3],v[4:5],
+  v[6:7]` (VOP3 0x1CC), `GLOBAL_STORE_DWORDX2` → out (s[6:7]). RSRC1 = 0x2C0042 (10 VGPRs for the
+  five 64-bit pairs), RSRC2 = 0x10 (8 USER_SGPR for the four binding VA pairs). The f64 ISA is
+  llvm-mc gfx900-pinned (`GFX9_VOP3_V_FMA_F64`, `GFX9_FLAT_GLOBAL_LOAD/STORE_DWORDX2`) + a
+  byte-oracle (`test_gfx9_enc_f64`).
+- **F.5** `native_pm4_build_compute_fma_f64` (`src/backend_native_pm4.cyr`): the PM4 dispatch
+  composer loading the four binding base addresses into USER_DATA `s0..s7` + the grid.
+- **F.6** `programs/native_f64_fma_e2e.cyr`: HW e2e on Cezanne. **Fused-rounding correctness** —
+  `v_fma_f64` does a *single* IEEE rounding of `a*b+c`; Cyrius has no fused-FMA builtin (its
+  `f64v_fmadd` lowers to unfused `mulpd`+`addpd`), so the reference is the authoritative
+  single-rounding `fma()` (`math.fma`-validated over 200k inputs). Lanes 0/1/6 (e.g. `0.1*0.1+0.1`)
+  differ between fused and unfused in the last ULP, and the GPU matches the **fused** value —
+  proving the silicon does a true fused multiply-add. CPU suite +4 (the encode oracle); full
+  suite green; the existing native e2e programs (smod, vector_const) still pass on Cezanne.
+
 ### Added — Phase F.3 (f64 shader gate — create-time fail-loud)
 - **`spirv_uses_f64(ptr, byte_len)`** (`src/spirv_parse.cyr`): scans for `OpCapability Float64`
   (cap 10) — the reusable "does this module compute in f64" primitive (bounded + zero-wordcount-

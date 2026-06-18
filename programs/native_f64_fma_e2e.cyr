@@ -1,0 +1,220 @@
+# programs/native_f64_fma_e2e.cyr — v3.2 Phase F.6: FIRST native f64 (double-
+# precision) compute on the Cezanne AMD GPU.
+#
+# A hand-authored GFX9 kernel (native_gfx9_shader_fma_f64) computes, per lane i:
+#   out[i] = fma(a[i], b[i], c[i])      (IEEE-754 double, ONE rounding)
+# over four f64 StorageBuffers via V_FMA_F64 (GFX9_VOP3_V_FMA_F64 = 0x1CC). The
+# kernel + its PM4 composer (native_pm4_build_compute_fma_f64) are dispatched on
+# the COMPUTE ring and the result is read back and compared BIT-EXACT (all 8
+# bytes) to a CPU f64 reference.
+#
+# THE REFERENCE — FUSED vs UNFUSED (the whole point of this test):
+# The GPU's v_fma_f64 fuses the multiply-add: it computes a*b+c with a SINGLE
+# IEEE rounding. A naive CPU `a*b` then `+c` rounds TWICE (round the product,
+# then round the sum) and can differ by 1 ULP. So the bit-exact reference MUST
+# be a TRUE fused FMA.
+#   - `want[]` below holds the authoritative single-rounding FMA result computed
+#     offline via the C library `fma()` (Python `math.fma`, an IEEE-754
+#     round-to-nearest-even fused multiply-add), embedded as exact 8-byte
+#     patterns. This is the GPU's expected output.
+#   - The program ALSO computes, in-process, the UNFUSED value via Cyrius
+#     `f64_add(f64_mul(a,b), c)` (mulsd then addsd — two roundings) and prints
+#     it next to each lane, so the divergence is visible: on lanes 0/1/6 the
+#     unfused value is 1 ULP off from the fused `want[]`, and the GPU matches
+#     the FUSED value — proving the silicon does a single-rounding fused FMA.
+#   (Cyrius has no fused-FMA builtin on x86: `f64v_fmadd` lowers to mulpd+addpd,
+#   i.e. unfused, so it could not serve as the reference here.)
+# REGENERATION GUARD: if `want[]` is ever regenerated, use a TRUE fused FMA (C
+#   `fma()` / Python 3.13+ `math.fma`), never `a*b+c`. The test is self-checking
+#   on this: lanes 0/1/6 are fused!=unfused, so a `want[]` accidentally filled
+#   with the unfused value would MISMATCH the (fused) GPU there and exit 11.
+#
+# Inputs are written as raw IEEE-754 bit patterns (the GPU and the in-process
+# unfused reference both read the identical bytes — zero conversion ambiguity).
+# Lanes 0/1/6 are fused!=unfused triples (0.1*0.1+0.1 etc.); the rest cover a
+# negative operand, a large+small magnitude mix, and two exactly-representable
+# cases. LocalSize_x = 8 (one workgroup, one lane per element).
+#
+# Exit: 0 = all 8 lanes bit-exact; 2 = shader build/setup; 3 = ctx; 5 = BO setup;
+#       9 = dispatch; 11 = bit-exact mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[18];
+    store8(&buf + 0, 48);    # '0'
+    store8(&buf + 1, 120);   # 'x'
+    var i = 0;
+    while (i < 16) {
+        var nib = (v >> ((15 - i) * 4)) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nib));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 18);
+    return 0;
+}
+
+# Absolute monotonic nanoseconds (CLOCK_MONOTONIC = 1). The native syncobj wait
+# deadline is ABSOLUTE, so the dispatch timeout must be mono_ns() + budget.
+fn mono_ns(): i64 {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+var N_LANES = 8;
+
+# Fill a/b/c/want with the 8 test triples as raw IEEE-754 f64 bit patterns.
+# `want` = the FUSED FMA (single rounding) computed offline via libc fma().
+fn fill_tests(a, b, c, want): i64 {
+    # lane 0: 0.1*0.1+0.1   (fused 0x...C29 != unfused 0x...C2A)
+    store64(a + 0,    0x3FB999999999999A); store64(b + 0,    0x3FB999999999999A);
+    store64(c + 0,    0x3FB999999999999A); store64(want + 0,    0x3FBC28F5C28F5C29);
+    # lane 1: 0.1*0.3+0.3   (fused 0x...51F != unfused 0x...51E)
+    store64(a + 8,    0x3FB999999999999A); store64(b + 8,    0x3FD3333333333333);
+    store64(c + 8,    0x3FD3333333333333); store64(want + 8,    0x3FD51EB851EB851F);
+    # lane 2: 1.0000000001*3+0.1   (not exactly representable; fused==unfused here)
+    store64(a + 16,   0x3FF000000006DF38); store64(b + 16,   0x4008000000000000);
+    store64(c + 16,   0x3FB999999999999A); store64(want + 16,   0x4008CCCCCCD71BA1);
+    # lane 3: -1.0000000001*3+0.1   (negative operand)
+    store64(a + 24,   0xBFF000000006DF38); store64(b + 24,   0x4008000000000000);
+    store64(c + 24,   0x3FB999999999999A); store64(want + 24,   0xC0073333333D8207);
+    # lane 4: 1e15*1e-15+1   (large+small magnitude mix -> 2.0)
+    store64(a + 32,   0x430C6BF526340000); store64(b + 32,   0x3CD203AF9EE75616);
+    store64(c + 32,   0x3FF0000000000000); store64(want + 32,   0x4000000000000000);
+    # lane 5: 2*3+4   (exactly representable -> 10.0)
+    store64(a + 40,   0x4000000000000000); store64(b + 40,   0x4008000000000000);
+    store64(c + 40,   0x4010000000000000); store64(want + 40,   0x4024000000000000);
+    # lane 6: 0.1*0.7+0.1   (fused 0x...5C3 != unfused 0x...5C2)
+    store64(a + 48,   0x3FB999999999999A); store64(b + 48,   0x3FE6666666666666);
+    store64(c + 48,   0x3FB999999999999A); store64(want + 48,   0x3FC5C28F5C28F5C3);
+    # lane 7: -3.5*-2.25+7.125   (exactly representable -> 15.0, negative operands)
+    store64(a + 56,   0xC00C000000000000); store64(b + 56,   0xC002000000000000);
+    store64(c + 56,   0x401C800000000000); store64(want + 56,   0x402E000000000000);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native f64 FMA compute (v3.2 Phase F.6) — FIRST double-precision on Cezanne\n");
+    print_cstr("--------------------------------------------------------------------------------\n");
+    print_cstr("kernel: out[i] = fma(a[i], b[i], c[i])  via V_FMA_F64 (single-rounding fused)\n\n");
+
+    var av[64];
+    var bv[64];
+    var cv[64];
+    var want[64];
+    fill_tests(&av, &bv, &cv, &want);
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: gpu_context_new_native\n"); return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # ---- Shader BO: 4 KiB GTT, the f64 FMA kernel at offset 0 ----
+    var shader_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &shader_bo) != 0) { print_cstr("FAIL: shader bo\n"); return 2; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, 4096);
+    native_gfx9_shader_fma_f64(shader_map, 0);
+    var shader_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, shader_handle, shader_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: shader va_map\n"); return 2;
+    }
+
+    # ---- 4 data BOs (a, b, c, out), 4 KiB GTT each ----
+    var abo[16]; var bbo[16]; var cbo[16]; var obo[16];
+    if (native_bo_create_gtt(fd, 4096, &abo) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &bbo) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &cbo) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &obo) != 0) { return 5; }
+    var a_handle = load64(&abo + 0); var a_map = load64(&abo + 8);
+    var b_handle = load64(&bbo + 0); var b_map = load64(&bbo + 8);
+    var c_handle = load64(&cbo + 0); var c_map = load64(&cbo + 8);
+    var o_handle = load64(&obo + 0); var o_map = load64(&obo + 8);
+
+    # Seed inputs (8-byte f64 stride); seed out with a sentinel.
+    var i = 0;
+    while (i < N_LANES) {
+        store64(a_map + i * 8, load64(&av + i * 8));
+        store64(b_map + i * 8, load64(&bv + i * 8));
+        store64(c_map + i * 8, load64(&cv + i * 8));
+        store64(o_map + i * 8, 0xBAADF00DBAADF00D);
+        i = i + 1;
+    }
+
+    var a_va = 0xFFFF800100400000;
+    var b_va = 0xFFFF800100402000;
+    var c_va = 0xFFFF800100404000;
+    var o_va = 0xFFFF800100406000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, b_handle, b_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, c_handle, c_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    # ---- Build the F.5 PM4 stream + dispatch through the N-binding submit ----
+    # Bindings: 0=a (s0:1), 1=b (s2:3), 2=c (s4:5), 3=out (s6:7). LocalSize_x = 8.
+    var pm4[512];
+    var pm4_bytes = native_pm4_build_compute_fma_f64(&pm4, shader_va,
+    GFX9_COMPUTE_PGM_RSRC1_FMA_F64, GFX9_COMPUTE_PGM_RSRC2_FMA_F64,
+    a_va, b_va, c_va, o_va, N_LANES);
+
+    var binds[32];
+    store64(&binds + 0,  a_handle);
+    store64(&binds + 8,  b_handle);
+    store64(&binds + 16, c_handle);
+    store64(&binds + 24, o_handle);
+
+    # ABSOLUTE deadline = now + 15 s (the syncobj wait deadline is absolute).
+    var deadline = mono_ns() + 15000000000;
+    var rc = native_compute_dispatch_cached_n(ctx, &pm4, pm4_bytes, shader_handle,
+    &binds, 4, deadline);
+    if (rc != 0) { print_cstr("FAIL: dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    # ---- Verify bit-exact vs the FUSED reference; show the unfused contrast ----
+    print_cstr("  lane :        a*b+c (got, hex)  |   want (fused FMA)  |  unfused CPU (mul+add)\n");
+    var ok = 1;
+    i = 0;
+    while (i < N_LANES) {
+        var got = load64(o_map + i * 8);
+        var w   = load64(&want + i * 8);
+        # in-process UNFUSED CPU value: f64_add(f64_mul(a,b), c) — two roundings.
+        var unfused = f64_add(f64_mul(load64(&av + i * 8), load64(&bv + i * 8)), load64(&cv + i * 8));
+        print_cstr("  ["); print_i64(i); print_cstr("]  : ");
+        print_hex64(got); print_cstr("  |  "); print_hex64(w); print_cstr("  |  "); print_hex64(unfused);
+        if (got != w) { print_cstr("   <-- MISMATCH"); ok = 0; }
+        if (w != unfused) { print_cstr("   (fused != unfused: GPU matches FUSED)"); }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    # ---- Teardown ----
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_gem_va_unmap(fd, b_handle, b_va, 4096);
+    native_gem_va_unmap(fd, c_handle, c_va, 4096);
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_gem_va_unmap(fd, shader_handle, shader_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    native_bo_release_gtt(fd, b_handle, b_map, 4096);
+    native_bo_release_gtt(fd, c_handle, c_map, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    native_bo_release_gtt(fd, shader_handle, shader_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("\nFAIL: f64 FMA dispatch not bit-exact vs fused reference\n"); return 11; }
+    print_cstr("\nOK — all 8 lanes BIT-EXACT vs the fused-FMA reference (first native f64 on Cezanne)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

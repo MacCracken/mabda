@@ -270,6 +270,14 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+build/native_f64_fma_e2e: programs/native_f64_fma_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_f64_fma_e2e.cyr $@
+
+.PHONY: test-native-f64-fma-e2e
+test-native-f64-fma-e2e: build/native_f64_fma_e2e
+	./build/native_f64_fma_e2e
+
 # N.5d: a SPIR-V kernel compiled in-tree (gfx9_compile) and dispatched on the
 # AMD GPU — the SPIR-V→GFX9 compiler's hardware bring-up oracle.
 build/native_spirv_compute_e2e: programs/native_spirv_compute_e2e.cyr src/*.cyr
