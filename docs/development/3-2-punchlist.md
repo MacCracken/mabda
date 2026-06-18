@@ -893,21 +893,32 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   "+120→128" was stale) + `gpu_caps_shader_f64` accessor / `gpu_caps_set_shader_f64` setter +
   `gpu_caps_new` sized up. +3 core asserts. (F.2–F.10 still annotated 3.2.10/3.2.11 — reflow to
   3.2.12/3.2.13 lands with F.10.)
-- [ ] **F.2** *(3.2.10)* — `gpu_caps_shader_f64(ctx)` (wgpu: probe-module +
-  `SpirvShaderPassthrough`; native: `MABDA_NATIVE_F64`).
-- [ ] **F.3** *(3.2.10)* — Shader-module f64 flag + fail-loud dispatch guard.
-- [ ] **F.4** *(3.2.10)* — `native_gfx9_shader_fma_f64` hand-authored
+- [x] **F.2** *(3.2.12)* (2026-06-18) — per-backend f64 detection. native
+  `gpu_caps_native_shader_f64()` → `MABDA_NATIVE_F64` (the f64 ANSWER, 0 until F.7) + the wgpu
+  NECESSARY-gate `gpu_wgpu_spirv_passthrough_supported(device)` → `has_feature(SpirvShaderPassthrough
+  0x00030017)`. Kept F.1's struct accessor `gpu_caps_shader_f64(c)` (the proposal's
+  `gpu_caps_shader_f64(ctx)` would clash). **Adversarial review:** the wgpu helper is deliberately
+  NOT named `*_shader_f64` — passthrough-available ≠ Vulkan `shaderFloat64` (review #1), and the
+  reference launcher doesn't request passthrough yet so it returns 0 today (review #3); the honest
+  wgpu f64 detect (compose the gate + a real-module probe + the launcher request) is **F.8**, so
+  F.2 populates NO wgpu f64 field. +5 core asserts.
+- [ ] **F.3** *(3.2.12)* — Shader-module f64 flag + fail-loud dispatch guard.
+- [ ] **F.4** *(3.2.12)* — `native_gfx9_shader_fma_f64` hand-authored
   reference kernel (`V_FMA_F64`, doubled-VGPR RSRC1); llvm-mc byte-pinned.
-- [ ] **F.5** *(3.2.10)* — `native_pm4_build_compute_fma_f64` composer.
-- [ ] **F.6** *(3.2.10)* — `native_f64_fma_e2e.cyr` (Cezanne): a*b+c
+- [ ] **F.5** *(3.2.12)* — `native_pm4_build_compute_fma_f64` composer.
+- [ ] **F.6** *(3.2.12)* — `native_f64_fma_e2e.cyr` (Cezanne): a*b+c
   **bit-exact vs CPU f64**. f64-on-HW proof, decoupled from Phase N.
-- [ ] **F.8** *(3.2.10)* — wgpu f64 module via SPIR-V passthrough + probe
-  (`f64_compute_e2e.cyr`; dispatch gated on real wgpu compute → M.6b posture).
-- [ ] **F.7** *(3.2.11)* — General native f64: route consumer f64 SPIR-V
-  through the Phase N emitter (`V_*_F64`); per-op f64 conformance.
-- [ ] **F.9** *(3.2.11)* — attn11 consumer smoke (one real f64 kernel,
+- [ ] **F.8** *(3.2.12)* — wgpu f64: the **rigorous probe** (build a minimal f64 SPIR-V module,
+  `gpu_shader_module_create_spirv`, non-null ⇒ f64) composed with `gpu_wgpu_spirv_passthrough_supported`
+  **+ the launcher requesting `SpirvShaderPassthrough` in `requiredFeatures`** (reference
+  `deps/wgpu_main.c` lacks it — review F.2 #3) → the honest wgpu `gpu_caps_shader_f64` populate.
+  `f64_compute_e2e.cyr`; dispatch gated on real wgpu compute → M.6b posture.
+- [ ] **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V
+  through the Phase N emitter (`V_*_F64`); per-op f64 conformance. Flip `MABDA_NATIVE_F64`→1
+  ONLY when f64 runs end-to-end for every op attn11 uses — a partial emitter keeps it 0 (review F.2 #2).
+- [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,
   bit-faithful vs the CPU f64 oracle). Acceptance proof.
-- [ ] **F.10** *(3.2.11)* — Docs (throughput caveats) + **roadmap reflow
+- [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow
   correcting the `SHADER_F64` framing**; cut.
 
 ---

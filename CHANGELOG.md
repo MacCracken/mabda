@@ -15,6 +15,24 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase F.2 (per-backend f64 detection)
+- **native** (`src/backend_native.cyr`): `MABDA_NATIVE_F64` (0) + `gpu_caps_native_shader_f64()`
+  → 0. GFX9+ HW *runs* f64 (the throttled FP64 ALU exists on Cezanne), but mabda has no native
+  shader compiler until the Phase N SPIR-V→GFX9 f64 emitter (F.7) — so it can't *emit* `V_*_F64`
+  yet. Reporting 0 is the honest "HW can, mabda can't yet" (attn11 must not trust a lie); F.7
+  flips it to 1.
+- **wgpu** (`src/backend_wgpu.cyr`): `WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH` (0x00030017)
+  + `gpu_wgpu_spirv_passthrough_supported(device)` → `wgpu_device_has_feature(device, passthrough)`.
+  f64 reaches a wgpu device *only* through SPIR-V passthrough (there is no
+  `WGPUFeatureName_ShaderF64`; WGSL has no f64) — but passthrough-available is the **necessary,
+  not sufficient**, gate (it does not imply Vulkan `shaderFloat64`). Deliberately **not** named
+  `*_shader_f64`: F.2 does not claim wgpu f64. The honest wgpu f64 detect (compose this gate with
+  a real f64-SPIR-V-module probe, and have the launcher request passthrough in `requiredFeatures`
+  — the reference `deps/wgpu_main.c` does not yet) is **F.8**; until then nothing populates the
+  wgpu caps `shader_f64` field. (Adversarial review F.2 #1/#3.)
+- CPU suite +5 (`core.tcyr`: native = 0, the passthrough constant, the null-device guard, the
+  populate-then-read flow). The live passthrough/probe path is gated on a real wgpu device (F.8).
+
 ### Added — Phase F.1 (f64 capability field) — opens Phase F (double-precision compute)
 - **`GpuCapabilities` gains a `shader_f64` field** (`src/capabilities.cyr`): a new i64 bool at
   offset +128, growing the struct 128 → 136 bytes (`gpu_caps_new` allocs/zeroes 136). Accessor

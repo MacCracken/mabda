@@ -3608,6 +3608,22 @@ fn _backend_wgpu_queue_wait_idle(ctx, queue): i64 {
 var WGPU_FEATURE_TEXTURE_COMPRESSION_BC   = 0x4;
 var WGPU_FEATURE_TEXTURE_COMPRESSION_ETC2 = 0x6;
 var WGPU_FEATURE_TEXTURE_COMPRESSION_ASTC = 0x7;
+# wgpu-native vendor feature (wgpu.h) — the ONLY route to f64 on wgpu (there is no
+# WGPUFeatureName_ShaderF64; WGSL has no f64). An f64 SPIR-V binary rides this. v3.2 F.2.
+var WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH = 0x00030017;
+
+# v3.2 F.2 — the NECESSARY (not sufficient) gate for wgpu f64: f64 SPIR-V reaches the device
+# only via SpirvShaderPassthrough. This is deliberately NOT named *_shader_f64 — passthrough
+# being available does NOT mean the device's Vulkan shaderFloat64 is true. The honest wgpu f64
+# answer is `passthrough_supported AND a real f64 SPIR-V module compiles`; that probe (and the
+# launcher's passthrough requiredFeatures request, without which this returns 0) is F.8. Until
+# F.8 composes those, NOTHING populates the wgpu caps shader_f64 field — a consumer must not read
+# this as "f64 works". Device, not adapter (the gpu_timestamps_supported precedent: the feature
+# must be requested at device creation).
+fn gpu_wgpu_spirv_passthrough_supported(device): i64 {
+    if (device == 0) { return 0; }
+    return wgpu_device_has_feature(device, WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH);
+}
 
 fn gpu_caps_detect_texture_compression(adapter): i64 {
     if (adapter == 0) { return 0; }
@@ -12863,6 +12879,13 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
 # the native analog of the wgpu backend's adapter-family caps guard.
 var NATIVE_TEXCOMP_SUPPORTED = MABDA_TEXCOMP_BC;
 
+# v3.2 F.2 — native f64 (double-precision) compute support. GFX9+ AMD HW *runs* f64
+# (the throttled FP64 ALU exists on Vega/Cezanne), but mabda has no native shader
+# COMPILER until the Phase N SPIR-V→GFX9 f64 emitter lands (F.7) — so native cannot
+# yet EMIT `V_*_F64`, and reporting f64 here would be a lie attn11 must not trust.
+# Stays 0 until F.7 flips it to 1 (the honest "HW can, mabda can't yet"). v3.2 F.2.
+var MABDA_NATIVE_F64 = 0;
+
 # v3.2 TS.8 — the single source of truth for "can native SAMPLE `fmt`", at
 # PER-FORMAT granularity (the family bitset alone can't express BC6H). 1 for
 # RGBA8 (always) + any BC format whose family is in NATIVE_TEXCOMP_SUPPORTED,
@@ -12889,6 +12912,16 @@ fn native_texfmt_sampleable(fmt): i64 {
 # express, so a BC6H pre-check should use native_texfmt_sampleable.
 fn gpu_caps_native_texture_compression(): i64 {
     return NATIVE_TEXCOMP_SUPPORTED;
+}
+
+# v3.2 F.2 — the native f64 ANSWER (unlike the wgpu side, native needs no probe — there is
+# ground truth): does the native AMD path support f64 compute? The HW does, but mabda can only
+# EMIT f64 once the Phase N SPIR-V→GFX9 f64 emitter lands (F.7), so this returns MABDA_NATIVE_F64
+# (0 until F.7). F.7 may flip it to 1 ONLY when f64 runs end-to-end for every op attn11 uses (a
+# partial emitter must keep reporting 0 — review F.2 #2). A consumer populates a native context's
+# caps via `gpu_caps_set_shader_f64(caps, gpu_caps_native_shader_f64())`.
+fn gpu_caps_native_shader_f64(): i64 {
+    return MABDA_NATIVE_F64;
 }
 
 # v3.2 TS.5/TS.7c — sampleable 2D texture create (native). Differs from the
