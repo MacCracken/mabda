@@ -829,7 +829,27 @@ hand-authored shaders stay as oracle + fallback.
       encoders/isel — reuses VMOV/XOR/ASHR/ICMP_NE/CNDMASK/IADD/ISUB (37 MIR instrs).
       `native_spirv_smod_e2e.cyr` value-exact on Cezanne (8-lane signed matrix) + the
       `test_spirv_lower_smod` structural unit test. **→ 3.2.9 (int div/mod) COMPLETE.**
-  - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+  - [~] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+    Scalarize-on-lower: a vecN is a `MIR_VK_VECTOR` value packing its N component scalar
+    `<id>`s (16 bits each) into the payload; count rides in the packed type. Every vector op
+    emits N scalar ops, so the scalar back end (isel/regalloc/waitcnt/emit) is reused
+    unchanged. Design-validated via the N.10 design workflow.
+    - [x] **N.10a (2026-06-18) — infra + Construct + Extract.** `MIR_VK_VECTOR` +
+      `mir_set_vector` / `mir_is_vector` / `mir_vec_comp`; `OpCompositeConstruct` (80) packs the
+      operand ids (no instructions); `OpCompositeExtract` (81) from a vec → one `VMOV` from the
+      packed component (the GID vec3 special-case stays ahead of it). CPU-only (+24 asserts).
+      Adversarial review (7 findings fixed): `mir_emit` centrally rejects a `MIR_VK_VECTOR`
+      operand (unimplemented vector ops fail loud, not silent-wrong); Extract bounds the
+      component for all vec3 builtins; Construct requires scalar CONST/SSA operands. **Deferred
+      (fail loud):** vector/nested operands to Construct + non-scalar-per-component arity —
+      land with broader Construct breadth later in N.10.
+    - [ ] **N.10b — component-wise binary arith + first HW.** vec `OpFAdd/FMul/...` → N
+      scalar ops + scalar broadcast; HW e2e on Cezanne (vec3 add/mul via scalar-array
+      construct/extract).
+    - [ ] **N.10c — vector load/store.** `ArrayStride` parse + vector `OpAccessChain` /
+      `OpLoad` / `OpStore` (N consecutive scalar loads/stores); HW (`array<vec4>`).
+    - [ ] **N.10d — `OpConstantComposite` + splat.** Vector constants; HW.
+    - [ ] **N.10e — cut 3.2.10.**
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
     Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).

@@ -23,6 +23,7 @@ var SPIRV_OP_EXT_INST          = 12;
 var SPIRV_OP_LOAD              = 61;
 var SPIRV_OP_STORE             = 62;
 var SPIRV_OP_ACCESS_CHAIN      = 65;
+var SPIRV_OP_COMPOSITE_CONSTRUCT = 80;
 var SPIRV_OP_COMPOSITE_EXTRACT = 81;
 var SPIRV_OP_CONVERT_F_TO_S    = 110;
 var SPIRV_OP_CONVERT_S_TO_F    = 111;
@@ -615,6 +616,38 @@ fn _spirv_lower_smod(ptr, off, wc, m): i64 {
     return 0;
 }
 
+# OpCompositeConstruct %vecT %r %c0 %c1 [%c2 %c3] — build a vecN from N scalar components.
+# GFX9 has no vector registers, so this emits NO instructions: the result is a MIR_VK_VECTOR
+# packing the operand <id>s, which consumers (extract / component-wise ops / store) read back
+# via mir_vec_comp. MVP: exactly `count` SCALAR operands (a vector operand, or fewer/more than
+# count, fails loud; broader Construct deferred — see docs/development/3-2-punchlist.md, N.10). N.10a.
+fn _spirv_lower_composite_construct(ptr, off, wc, types, m): i64 {
+    if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var idb = spirv_hdr_id_bound(ptr);
+    var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), idb);
+    if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var count = mir_type_count(rty);
+    if (count < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    if (wc - 3 != count) { return 0 - MIR_ERR_UNSUPPORTED_OP; }   # scalar-per-component MVP
+    var cap = load64(m + 64);
+    var packed = 0;
+    var i = 0;
+    while (i < count) {
+        var c = spirv_word(ptr, off + 3 + i);
+        if (c == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (c >= cap) { return 0 - MIR_ERR_ID_OOR; }
+        if (c >= 0x10000) { return 0 - MIR_ERR_ID_OOR; }          # 16-bit component-pack ceiling (defensive)
+        # Components must be scalar CONST/SSA values — the kinds the back end resolves as a
+        # VMOV/op source. This rejects a nested vector operand, a raw builtin, a pointer, or
+        # an undefined id (nested/mixed vectors deferred — see docs/development/3-2-punchlist.md, N.10).
+        var ck = mir_val_kind(m, c);
+        if (ck != MIR_VK_CONST) { if (ck != MIR_VK_SSA) { return 0 - MIR_ERR_UNSUPPORTED_OP; } }
+        packed = packed | (c << (i * 16));
+        i = i + 1;
+    }
+    return mir_set_vector(m, spirv_word(ptr, off + 2), rty, packed);
+}
+
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
     # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
@@ -742,6 +775,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_CONVERT_S_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_F_TO_S) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m); }
+    if (op == SPIRV_OP_COMPOSITE_CONSTRUCT) { return _spirv_lower_composite_construct(ptr, off, wc, types, m); }
     if (op == SPIRV_OP_COMPOSITE_EXTRACT) {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var ety = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
@@ -753,12 +787,24 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         if (composite != 0) {
             if (composite < load64(m + 64)) {
                 if (mir_val_kind(m, composite) == MIR_VK_BUILTIN) {
+                    # Every supported builtin (LocalInvocationId / WorkgroupId /
+                    # GlobalInvocationId) is a vec3 → comp ∈ {0,1,2}. A larger (malformed)
+                    # component would OOB-read the 3-entry lsz here, or (for lid/wgid falling
+                    # through to the legacy EXTRACT below) make the back end read a register
+                    # past the builtin's 3 ABI slots — bound it for ALL builtins. (N.10a review.)
+                    if (comp > 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
                     if (mir_val_payload(m, composite) == MIR_BI_GLOBAL_INVOC_ID) {
-                        # GlobalInvocationId is a vec3 — comp ∈ {0,1,2}. A larger
-                        # (malformed) component would OOB-read the 3-entry lsz.
-                        if (comp > 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
                         return _spirv_expand_gid(m, spirv_word(ptr, off + 2), ety, comp, load64(lsz + comp * 8));
                     }
+                }
+                # vecN component extract → VMOV from the packed component <id> (a CONST/SSA
+                # value the back end resolves). A scalarized vec carries no EXTRACT op. N.10a.
+                if (mir_is_vector(m, composite) == 1) {
+                    if (comp >= mir_type_count(mir_val_type(m, composite))) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+                    var ev = mir_emit(m, MIR_OP_VMOV, spirv_word(ptr, off + 2), ety,
+                    mir_vec_comp(m, composite, comp), 0, 0, 0);
+                    if (ev < 0) { return ev; }
+                    return 0;
                 }
             }
         }

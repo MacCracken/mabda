@@ -1078,6 +1078,130 @@ fn test_spirv_lower_smod() {
     return 0;
 }
 
+# N.10a — OpCompositeConstruct packs N scalar component <id>s into a MIR_VK_VECTOR (no
+# instructions); OpCompositeExtract pulls a component out via a single VMOV. A 5-word SPIR-V
+# header (id_bound at word 3) precedes both instructions at off 5 / off 11.
+fn test_spirv_lower_vec_construct_extract() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203);   # magic
+    store32(&buf + 12, 32);          # word 3 = id bound
+    var types[768];                  # 32 ids * 24 bytes
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);   # vec3<f32>
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_set_const(&m, 10, MIR_T_F32, 0x3F800000);   # 1.0
+    mir_set_const(&m, 11, MIR_T_F32, 0x40000000);   # 2.0
+    mir_set_const(&m, 12, MIR_T_F32, 0x40400000);   # 3.0
+    # OpCompositeConstruct %6 %13 %10 %11 %12 at off 5 (wc 6)
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6);  store32(&buf + 28, 13);
+    store32(&buf + 32, 10); store32(&buf + 36, 11); store32(&buf + 40, 12);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m), 0, "construct ok");
+    assert_eq(mir_is_vector(&m, 13), 1, "%13 is a vector");
+    assert_eq(mir_type_count(mir_val_type(&m, 13)), 3, "vec3 count");
+    assert_eq(mir_vec_comp(&m, 13, 0), 10, "comp0 = %10");
+    assert_eq(mir_vec_comp(&m, 13, 1), 11, "comp1 = %11");
+    assert_eq(mir_vec_comp(&m, 13, 2), 12, "comp2 = %12");
+    assert_eq(mir_n_instrs(&m), 0, "construct emits no instrs");
+    # OpCompositeExtract %5 %14 %13 1 at off 11 (wc 5) — via the full dispatch
+    store32(&buf + 44, (5 << 16) | 81);
+    store32(&buf + 48, 5);  store32(&buf + 52, 14);
+    store32(&buf + 56, 13); store32(&buf + 60, 1);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    assert_eq(_spirv_lower_one_instr(&buf, 11, 5, 81, &types, 0, 0, &m, &lsz), 0, "extract ok");
+    assert_eq(mir_n_instrs(&m), 1, "extract emits 1 VMOV");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "extract -> VMOV");
+    assert_eq(mir_instr_result(&m, 0), 14, "VMOV result = %14");
+    assert_eq(mir_instr_a(&m, 0), 11, "VMOV source = comp1 (%11)");
+    # OOB component (3 >= count 3) fails loud, emits nothing more
+    store32(&buf + 60, 3);
+    assert_eq(_spirv_lower_one_instr(&buf, 11, 5, 81, &types, 0, 0, &m, &lsz) < 0, 1, "extract OOB comp fails");
+    assert_eq(mir_n_instrs(&m), 1, "OOB extract emits nothing");
+    return 0;
+}
+
+# N.10a — construct guards: wrong operand arity and a vector operand both fail loud.
+fn test_spirv_lower_vec_construct_guards() {
+    var buf[64];
+    store32(&buf + 12, 32);
+    var types[768];
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_set_const(&m, 10, MIR_T_F32, 0);
+    mir_set_const(&m, 11, MIR_T_F32, 0);
+    # vec3 with only 2 operands (wc 5 → wc-3 = 2 != 3) → fail
+    store32(&buf + 20, (5 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 13);
+    store32(&buf + 32, 10); store32(&buf + 36, 11);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 5, &types, &m) < 0, 1, "wrong arity fails");
+    # a vector operand (%20) → nested-vector fails loud (deferred — see docs/development/3-2-punchlist.md, N.10)
+    mir_set_vector(&m, 20, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 14);
+    store32(&buf + 32, 20); store32(&buf + 36, 11); store32(&buf + 40, 10);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "vector operand fails");
+    return 0;
+}
+
+# N.10a review hardening: (1) mir_emit centrally rejects a MIR_VK_VECTOR operand (a vecN must
+# be scalarized first); (2) OpCompositeExtract bounds the component for vec3 builtins; (3)
+# OpCompositeConstruct rejects zero / non-scalar (builtin) operands.
+fn test_spirv_vec_robustness() {
+    var buf[64];
+    store32(&buf + 12, 32);
+    var types[768];
+    memset(&types, 0, 768);
+    _spirv_set_type(&types, 5, SPIRV_TYK_FLOAT, 32, 0, 32);
+    _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 32);
+    _spirv_set_type(&types, 7, SPIRV_TYK_INT, 32, 0, 32);   # u32 (builtin extract result)
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    # (1) mir_emit rejects a vector operand in either source position
+    mir_set_const(&m, 10, MIR_T_F32, 0);
+    mir_set_const(&m, 11, MIR_T_F32, 0);
+    mir_set_vector(&m, 12, MIR_T_F32 | (2 << 8), 10 | (11 << 16));
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 13, MIR_T_U32, 12, 10, 0, 0) < 0, 1, "mir_emit rejects vector operand a");
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 13, MIR_T_U32, 10, 12, 0, 0) < 0, 1, "mir_emit rejects vector operand b");
+    assert_eq(mir_n_instrs(&m), 0, "rejected emits add nothing");
+    # (2) extract comp 3 from a vec3 builtin (LocalInvocationId) fails; comp 1 → legacy EXTRACT
+    mir_set_builtin(&m, 20, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    store32(&buf + 20, (5 << 16) | 81);
+    store32(&buf + 24, 7); store32(&buf + 28, 21);
+    store32(&buf + 32, 20); store32(&buf + 36, 3);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 81, &types, 0, 0, &m, &lsz) < 0, 1, "builtin extract comp 3 fails");
+    store32(&buf + 36, 1);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 5, 81, &types, 0, 0, &m, &lsz), 0, "builtin extract comp 1 ok");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "builtin extract -> EXTRACT");
+    # (3) construct rejects a zero operand and a builtin operand
+    store32(&buf + 20, (6 << 16) | 80);
+    store32(&buf + 24, 6); store32(&buf + 28, 22);
+    store32(&buf + 32, 10); store32(&buf + 36, 0); store32(&buf + 40, 11);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "construct zero operand fails");
+    store32(&buf + 36, 20);
+    assert_eq(_spirv_lower_composite_construct(&buf, 5, 6, &types, &m) < 0, 1, "construct builtin operand fails");
+    return 0;
+}
+
 # The StorageBuffer seed path (reusing the N.1b typed-module fixture): a bound
 # variable seeds to a BUFVAR carrying its binding; a scalar OpConstant seeds too.
 fn test_spirv_lower_seed_bufvar() {
@@ -3465,6 +3589,9 @@ fn main(): i64 {
     test_spirv_lower_glsl_extinst();
     test_spirv_const_fold();
     test_spirv_lower_smod();
+    test_spirv_lower_vec_construct_extract();
+    test_spirv_lower_vec_construct_guards();
+    test_spirv_vec_robustness();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
     test_gfx9_emit_fma_inline_float();

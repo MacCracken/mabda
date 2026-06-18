@@ -13,6 +13,29 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [Unreleased]
+
+### Added — Phase N.10a (vector infrastructure + `OpCompositeConstruct` / `OpCompositeExtract`)
+- **Scalarize-on-lower vectors** (3.2.10 groundwork): a vecN is a new `MIR_VK_VECTOR` value
+  whose payload packs its N component scalar `<id>`s (16 bits each, low component first); the
+  count rides in the packed MIR type. GFX9 has no vector registers, so every vector op will
+  emit N scalar ops — the scalar back end (isel/regalloc/waitcnt/emit) is reused unchanged.
+  Helpers `mir_set_vector` / `mir_is_vector` / `mir_vec_comp` (`src/mir.cyr`).
+- **`OpCompositeConstruct` (80)** packs the operand `<id>`s into the result vector and emits
+  **no instructions**; **`OpCompositeExtract` (81)** from a vector lowers to a single
+  `MIR_OP_VMOV` from the packed component (the GID vec3 builtin special-case stays ahead of
+  it; non-GID builtins still use the legacy `MIR_OP_EXTRACT` path).
+- **Fail-loud hardening (adversarial review):** `mir_emit` now centrally rejects a
+  `MIR_VK_VECTOR` operand — a vecN must be scalarized before reaching the scalar emit boundary,
+  so an unimplemented vector op (e.g. vec arith, landing in N.10b) fails loud instead of
+  silently reading the vector record's placeholder uniformity. `OpCompositeExtract` bounds the
+  component index for **all** vec3 builtins (not just `GlobalInvocationId`), and
+  `OpCompositeConstruct` requires scalar CONST/SSA operands (rejecting nested vectors, raw
+  builtins, pointers, and the null id).
+- CPU suite +24 (`test_spirv_lower_vec_construct_extract` + `_guards` + `_vec_robustness`).
+  Design-validated via an N.10 design workflow; bite adversarially reviewed (7 confirmed
+  findings fixed pre-commit).
+
 ## [3.2.9] — 2026-06-18
 
 The native **SPIR-V→GFX9 integer division & remainder** family — the full int div/mod set
