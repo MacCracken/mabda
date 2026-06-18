@@ -2190,6 +2190,60 @@ fn test_gfx9_emit_fabs() {
     return 0;
 }
 
+# N.9b-1 — the integer-division primitives selected + emitted: v_cvt_f32_u32, v_rcp_iflag,
+# v_cvt_u32_f32, v_mul_hi_u32, v_mov, v_cndmask (VCC implicit, a=false src0 / b=true vsrc1).
+# A leading EXTRACT puts the source in v3. Bytes are llvm-mc gfx900 truth.
+fn test_gfx9_emit_div_primitives() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);    # x → v3
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v4
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v5
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v6
+    _mir_set_val(&m, 13, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v7
+    _mir_set_val(&m, 14, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v8
+    _mir_set_val(&m, 15, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v9
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_CVT_F32_U32, 10, 9, 0, 0, 0);         # v4 = (f32)v3
+    _gisel_emit(&isel, 2, GISEL_V_RCP_IFLAG_F32, 11, 10, 0, 0, 0);      # v5 = 1/v4
+    _gisel_emit(&isel, 3, GISEL_V_CVT_U32_F32, 12, 11, 0, 0, 0);        # v6 = (u32)v5
+    _gisel_emit(&isel, 4, GISEL_V_MUL_HI_U32, 13, 9, 12, 0, 0);         # v7 = hi(v3*v6)
+    _gisel_emit(&isel, 5, GISEL_V_MOV, 14, 9, 0, 0, 0);                 # v8 = v3
+    _gisel_emit(&isel, 6, GISEL_V_CNDMASK, 15, 13, 14, 0, 0);           # v9 = vcc ? v8 : v7
+    _gisel_emit(&isel, 7, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 10 * 16, 4);
+    store64(&alloc + 11 * 16, 5);
+    store64(&alloc + 12 * 16, 6);
+    store64(&alloc + 13 * 16, 7);
+    store64(&alloc + 14 * 16, 8);
+    store64(&alloc + 15 * 16, 9);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 8, &alloc, &abi, &built, 0);
+    assert_eq(endp, 36, "div-primitives program end at 36 bytes");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (extract)");
+    assert_eq(load32(&built + 4), 0x7E080D03, "v_cvt_f32_u32 v4, v3");
+    assert_eq(load32(&built + 8), 0x7E0A4704, "v_rcp_iflag_f32 v5, v4");
+    assert_eq(load32(&built + 12), 0x7E0C0F05, "v_cvt_u32_f32 v6, v5");
+    assert_eq(load32(&built + 16), 0xD2860007, "v_mul_hi_u32 v7,v3,v6 lo");
+    assert_eq(load32(&built + 20), 0x00020D03, "v_mul_hi_u32 hi (v3, v6)");
+    assert_eq(load32(&built + 24), 0x7E100303, "v_mov_b32 v8, v3");
+    assert_eq(load32(&built + 28), 0x00121107, "v_cndmask_b32 v9, v7, v8, vcc");
+    assert_eq(load32(&built + 32), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.8a — VOP3a has no literal operand form, so a non-inline constant (100 > 64) is
 # materialized into the scratch VGPR (the first free one = v6 here) with v_mov_b32, then
 # multiplied. A leading EXTRACT puts gid.x in v3 (so it resolves as a real VGPR operand,
@@ -3374,6 +3428,7 @@ fn main(): i64 {
     test_gfx9_emit_store_const();
     test_gfx9_emit_vop2_const();
     test_gfx9_emit_fabs();
+    test_gfx9_emit_div_primitives();
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_spirv_const_fold();

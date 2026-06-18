@@ -15,6 +15,19 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9b-1 (integer-division primitives plumbed — MIR → isel → emit)
+- The six udiv-macro primitive ops are wired end-to-end: `MIR_OP_VMOV`/`CVT_F32_U`/
+  `CVT_U_F32`/`RCP_IFLAG`/`MUL_HI`/`CNDMASK` (`src/mir.cyr`) → `GISEL_V_MOV`/
+  `V_CVT_F32_U32`/`V_CVT_U32_F32`/`V_RCP_IFLAG_F32`/`V_MUL_HI_U32`/`V_CNDMASK`
+  (`src/gfx9_isel.cyr`) → emit (`src/gfx9_compile.cyr`: unary forms reuse `_emit_vop1`,
+  `MUL_HI` reuses the VOP3 2-src emit, `CNDMASK` gets a dedicated `_emit_cndmask` —
+  non-commutative, a=src0 false / b=vsrc1 true, VCC implicit).
+- These are GFX9 **vector-only** ops, so the uniformity sweep forces their result
+  DIVERGENT (`_mir_instr_unif`: `op >= VMOV && op <= CNDMASK → DIVERGENT`) — the udiv
+  macro is then fully vector even for uniform operands (each lane computes identically).
+- +10 byte-exact asserts (`test_gfx9_emit_div_primitives`). No behavior change to existing
+  kernels (nothing produces these ops yet — the OpUDiv macro lowering is N.9b-2).
+
 ### Added — Phase N.9a (integer-division reciprocal encoders — 3.2.9 foundation)
 - The GFX9 instruction encoders for the u32 float-reciprocal division macro (3.2.9):
   `src/gfx9_encode.cyr` adds `GFX9_VOP1_V_CVT_F32_U32` (0x06), `_V_CVT_U32_F32` (0x07),
