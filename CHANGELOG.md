@@ -15,6 +15,28 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.10d (`OpConstantComposite` vector constants + splat, HW-verified)
+- **Vector constants** (`src/spirv_lower.cyr`): `OpConstantComposite` (44) is structurally
+  identical to `OpCompositeConstruct` (same `[type, result, constituents…]` layout, all
+  constituents are scalar `OpConstant`s already seeded), so the seed pass reuses
+  `_spirv_lower_composite_construct` to pack the constituent const `<id>`s into a
+  `MIR_VK_VECTOR` (zero instructions). A const array/struct composite is non-vector → fails
+  loud. **Splat** (`vecN(x)`) needs no new code — glslang emits it as a Construct /
+  ConstantComposite with the operand repeated, which the packer already handles.
+- **HW**: `programs/native_spirv_vector_const_e2e.cyr` — `out[i] = a[i] + vec4(10,20,30,40)`
+  over `array<vec4<f32>>`, gid-indexed, **value-exact on Cezanne** (all 16 floats). The
+  non-inline constants (10/20/30/40) exercise the VOP2 32-bit-literal operand path in the
+  per-component `v_add_f32` (loaded VGPR + constant) — handled cleanly, no gap.
+- **Per-component const-fold (adversarial review):** `_spirv_lower_vec_binop` now folds a
+  component whose two operands are both constants (mirroring the scalar ALU fold), so a vecN
+  op over two vector constants folds to a constant vector instead of emitting per-component
+  `v_add(const, const)` — which a VOP2 can't encode (two non-VGPR operands). glslang folds
+  these itself, so the HW path (loaded-VGPR + const) was unaffected.
+- CPU suite +16 (`test_spirv_lower_constant_composite`: the vec4 constant via the seed pass +
+  a splat check; `test_spirv_lower_vec_binop_fold`: the vec const+const fold; the runtime
+  component-wise test now uses non-const operands so it still exercises the emit path).
+  **This completes Phase N.10 (vectors) — the 3.2.10 arc.**
+
 ### Added — Phase N.10c (vector `OpLoad` / `OpStore` for `array<vecN>`, HW-verified)
 - **Vector buffer access** (`src/spirv_lower.cyr`): `OpAccessChain` now accepts a vecN element,
   using the **std430 array stride** (vec2 → 8, vec3/vec4 → 16; vec3 padded), computed from the

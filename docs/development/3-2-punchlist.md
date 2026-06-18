@@ -829,7 +829,7 @@ hand-authored shaders stay as oracle + fallback.
       encoders/isel — reuses VMOV/XOR/ASHR/ICMP_NE/CNDMASK/IADD/ISUB (37 MIR instrs).
       `native_spirv_smod_e2e.cyr` value-exact on Cezanne (8-lane signed matrix) + the
       `test_spirv_lower_smod` structural unit test. **→ 3.2.9 (int div/mod) COMPLETE.**
-  - [~] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
+  - [x] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
     Scalarize-on-lower: a vecN is a `MIR_VK_VECTOR` value packing its N component scalar
     `<id>`s (16 bits each) into the payload; count rides in the packed type. Every vector op
     emits N scalar ops, so the scalar back end (isel/regalloc/waitcnt/emit) is reused
@@ -861,8 +861,15 @@ hand-authored shaders stay as oracle + fallback.
       mis-addressing; vec2/vec3/dynamic-index coverage added; the dynamic-index overflow is
       documented as SPIR-V UB (OOB index, runtime bounds-checking out of scope). Multi-member
       struct stays deferred (single-member, member-0 MVP).
-    - [ ] **N.10d — `OpConstantComposite` + splat.** Vector constants; HW.
-    - [ ] **N.10e — cut 3.2.10.**
+    - [x] **N.10d (2026-06-18) — `OpConstantComposite` + splat.** Vector constants: the seed
+      pass reuses the Construct packer (constituents are seeded scalar consts) → a
+      `MIR_VK_VECTOR`; splat is Construct/ConstantComposite with a repeated operand (no new
+      code). HW: `native_spirv_vector_const_e2e.cyr` (`out[i]=a[i]+vec4(10,20,30,40)`)
+      value-exact on Cezanne — the non-inline constants exercise the VOP2-literal path (+16
+      CPU asserts). Adversarial review: `_spirv_lower_vec_binop` now const-folds a component
+      with two const operands (a vec const+const would otherwise emit an unencodable
+      `v_add(const,const)`). **→ Phase N.10 (vectors) complete.**
+    - [ ] **N.10e — cut 3.2.10.** (vectors complete; ready to cut after this bite lands)
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
     Loops / `OpPhi` / nested-if stay fail-loud (v3.3+).

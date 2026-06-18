@@ -23,6 +23,7 @@ var SPIRV_OP_EXT_INST          = 12;
 var SPIRV_OP_LOAD              = 61;
 var SPIRV_OP_STORE             = 62;
 var SPIRV_OP_ACCESS_CHAIN      = 65;
+var SPIRV_OP_CONSTANT_COMPOSITE = 44;
 var SPIRV_OP_COMPOSITE_CONSTRUCT = 80;
 var SPIRV_OP_COMPOSITE_EXTRACT = 81;
 var SPIRV_OP_CONVERT_F_TO_S    = 110;
@@ -196,6 +197,14 @@ fn _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi): i64 {
                 var cr = mir_set_const(m, spirv_word(ptr, off + 2), cty, spirv_word(ptr, off + 3));
                 if (cr < 0) { return cr; }
             }
+        }
+        # OpConstantComposite is structurally identical to OpCompositeConstruct (same
+        # [type, result, constituents…] layout); its constituents are scalar OpConstants
+        # already seeded above (they precede it in the stream), so the same packer registers
+        # the vecN constant. A const array/struct composite is non-vector → fails loud. (N.10d)
+        if (op == SPIRV_OP_CONSTANT_COMPOSITE) {
+            var ccr = _spirv_lower_composite_construct(ptr, off, wc, types, m);
+            if (ccr < 0) { return ccr; }
         }
         if (op == SPIRV_OP_VARIABLE) {
             if (wc >= 4) {
@@ -770,8 +779,16 @@ fn _spirv_lower_vec_binop(m, mop, rty, rid, aop, bop): i64 {
         if (mir_is_vector(m, aop) == 1) { ai = mir_vec_comp(m, aop, i); }
         var bi = bop;
         if (mir_is_vector(m, bop) == 1) { bi = mir_vec_comp(m, bop, i); }
-        var e = mir_emit(m, mop, base + i, base_ty, ai, bi, 0, 0);
-        if (e < 0) { return e; }
+        # Per-component const-fold, mirroring the scalar ALU path (the vector op is routed before
+        # that fold). Two constant components must NOT emit a runtime op — a VOP2 cannot take two
+        # non-VGPR operands, so it would fail/mis-encode (e.g. vec const + vec const). N.10d review.
+        if (_spirv_both_const(m, ai, bi) == 1) {
+            var ec = mir_set_const(m, base + i, base_ty, _spirv_const_fold(m, mop, ai, bi));
+            if (ec < 0) { return ec; }
+        } else {
+            var e = mir_emit(m, mop, base + i, base_ty, ai, bi, 0, 0);
+            if (e < 0) { return e; }
+        }
         packed = packed | ((base + i) << (i * 16));
         i = i + 1;
     }
