@@ -15,6 +15,15 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7c-1 (VOPC `v_cmp` encoders — divergent-branch foundation)
+- **The GFX9 vector-compare encoder, llvm-mc gfx900-verified.** `src/gfx9_encode.cyr`:
+  `gfx9_enc_vopc` + the u32 `v_cmp_*` opcodes (`lt`/`eq`/`le`/`gt`/`ne`/`ge`) — a
+  per-lane compare whose result is the implicit VCC mask. This is the predicate for a
+  divergent `if` (EXEC masking, N.7c-2): `s_and_saveexec_b64 saved, vcc` then
+  `s_cbranch_execz merge`. src0 is the 9-bit operand (VGPR/inline), vsrc1 a VGPR — a
+  VGPR-vs-constant compare puts the constant in src0 and flips the predicate. +7
+  byte-oracle asserts (`test_gfx9_enc_vopc`). The EXEC-masking pipeline is N.7c-2.
+
 ### Added — Phase N.7b-2b (control-flow back-end + HW — the uniform `if` is complete)
 - **A compiled SPIR-V kernel with a uniform `if` runs correctly on Cezanne.**
   `programs/native_spirv_uniform_if_e2e.cyr`: `if (gl_WorkGroupID.x == 0) { out[gid.x]

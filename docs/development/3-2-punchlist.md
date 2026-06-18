@@ -733,8 +733,13 @@ hand-authored shaders stay as oracle + fallback.
       + `programs/native_spirv_uniform_if_e2e.cyr` HW-verified on Cezanne
       (`if (wgid.x==0){out[gid.x]=gid.x+7}`, grid 2 → wg1 gated out, out[8..15] sentinel).
       Straight-line kernels byte-identical (no LABEL/branch).
-  - [ ] **N.7c — divergent `if`** — per-lane condition via `s_and_saveexec_b64` +
-    `s_cbranch_execz` skip + `s_or_b64` EXEC restore at the merge; divergent e2e.
+  - [~] **N.7c — divergent `if`** (per-lane condition via EXEC masking).
+    - [x] **N.7c-1 (2026-06-17) — VOPC `v_cmp` encoders.** `gfx9_enc_vopc` + u32
+      `v_cmp_*` (lt/eq/le/gt/ne/ge) → VCC, llvm-mc-verified (`test_gfx9_enc_vopc`, +7).
+    - [ ] **N.7c-2 — EXEC-masking pipeline + HW.** Divergent ICMP → `v_cmp` (VCC);
+      divergent COND_BRANCH → `s_and_saveexec_b64 saved, vcc` + `s_cbranch_execz merge`;
+      `s_or_b64 exec, exec, saved` restore at the merge (needs a 64-bit saved-EXEC SGPR
+      pair — reserve above the regalloc range). Divergent `if (gid.x<8){…}` HW e2e.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
   SPIR-V f32 compiler **complete**.
 
