@@ -15,6 +15,25 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase F.8a (wgpu f64 plumbing — SPIR-V passthrough FFI)
+- **The FFI path that lets f64 SPIR-V reach a wgpu device.** The standard `WGPUShaderSourceSPIRV`
+  path (Phase S, 3.2.4) runs through naga, which has no f64; f64 needs the *passthrough* path
+  (`wgpuDeviceCreateShaderModuleSpirV`, doc: "shader code isn't parsed or interpreted in any way").
+- `deps/wgpu_main.c`: `wgpu_shim_request_device` now also requests `SpirvShaderPassthrough`
+  (`0x00030017`) in the device `requiredFeatures`, gated by `wgpuAdapterHasFeature` (so a launcher
+  on an adapter without it still creates a device); `feats[3]`→`feats[4]`. New C shim
+  `wgpu_shim_create_shader_module_spirv(device, words, word_count)` packs a
+  `WGPUShaderModuleDescriptorSpirV` and calls the passthrough creator → `fn_table[66]`
+  (`FN_COUNT` 66→67).
+- `src/wgpu_ffi.cyr`: `wgpu_device_create_shader_module_spirv_passthrough(device, words_ptr,
+  word_count)` (`_fp(66)`); FFI-table layout comment updated ([65]/[66]).
+- Closes the F.2 #3 review item (the launcher did not request passthrough; without it
+  `gpu_wgpu_spirv_passthrough_supported` could only ever return 0). Plumbing only — the probe +
+  honest `gpu_caps_shader_f64` populate that *use* this wrapper are F.8b.
+- **Verified:** smoke + full CPU suite + lint/fmt/dist/version-check clean; **launcher
+  regression — `spirv_e2e` all-PASS + exit 0 on Cezanne** (the added device feature + table
+  entry do not break the standard SPIR-V / WGSL path).
+
 ### Added — Phase F.4–F.6 (first native f64 compute — `V_FMA_F64`, bit-exact on Cezanne)
 - **The first double-precision compute on real AMD silicon, decoupled from the Phase N compiler.**
   A hand-authored GFX9 kernel computes `out[i] = a[i]*b[i] + c[i]` in IEEE-754 double and is

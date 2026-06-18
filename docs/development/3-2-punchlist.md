@@ -918,11 +918,22 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   single-rounding `v_fma_f64` matches `math.fma` (not the unfused `mul`+`add`, which differs by 1 ULP
   on lanes like `0.1*0.1+0.1`); Cyrius has no fused builtin so the reference is embedded + math.fma-
   validated. +4 asserts; no regression (smod/vector_const still pass on Cezanne). Decoupled from Phase N.
-- [ ] **F.8** *(3.2.12)* — wgpu f64: the **rigorous probe** (build a minimal f64 SPIR-V module,
-  `gpu_shader_module_create_spirv`, non-null ⇒ f64) composed with `gpu_wgpu_spirv_passthrough_supported`
-  **+ the launcher requesting `SpirvShaderPassthrough` in `requiredFeatures`** (reference
-  `deps/wgpu_main.c` lacks it — review F.2 #3) → the honest wgpu `gpu_caps_shader_f64` populate.
-  `f64_compute_e2e.cyr`; dispatch gated on real wgpu compute → M.6b posture.
+- [x] **F.8a** *(3.2.12)* (2026-06-18) — wgpu f64 **plumbing**: the launcher now requests
+  `SpirvShaderPassthrough` (0x00030017) in the device `requiredFeatures` (gated by
+  `wgpuAdapterHasFeature`, `feats[3]`→`[4]`), and a new C shim
+  `wgpu_shim_create_shader_module_spirv(device, words, word_count)` wraps
+  `wgpuDeviceCreateShaderModuleSpirV` (the naga-bypass path — naga has no f64) → `fn_table[66]`
+  (`FN_COUNT` 66→67) → the Cyrius wrapper `wgpu_device_create_shader_module_spirv_passthrough`
+  (`src/wgpu_ffi.cyr`, `_fp(66)`). Closes review F.2 #3. **Launcher regression: `spirv_e2e`
+  all-PASS + exit 0 on Cezanne** (the added device feature + table entry don't break the
+  standard SPIR-V / WGSL path). Plumbing only — nothing calls the wrapper yet (F.8b does).
+- [ ] **F.8b** *(3.2.12)* — wgpu f64 **probe + caps**: a minimal f64 SPIR-V probe module
+  (`OpCapability Float64` + `OpTypeFloat 64` + a 1-elem `OpFMul`) created via the F.8a passthrough
+  wrapper; `gpu_caps_shader_f64` (wgpu) = `gpu_wgpu_spirv_passthrough_supported` AND the probe
+  returns a non-null module → the honest wgpu `gpu_caps_shader_f64` populate in
+  `gpu_caps_from_context`. (CPU-test the probe-module byte builder; HW-verify the probe call.)
+- [ ] **F.8c** *(3.2.12)* — `programs/f64_compute_e2e.cyr` (wgpu): probe + f64 module-create proven
+  on Cezanne; dispatch gated on real wgpu compute → M.6b fail-loud `GPU_ERR_NOT_IMPLEMENTED` posture.
 - [ ] **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V
   through the Phase N emitter (`V_*_F64`); per-op f64 conformance. Flip `MABDA_NATIVE_F64`→1
   ONLY when f64 runs end-to-end for every op attn11 uses — a partial emitter keeps it 0 (review F.2 #2).
