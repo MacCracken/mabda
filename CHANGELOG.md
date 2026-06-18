@@ -15,6 +15,15 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.9a (integer-division reciprocal encoders — 3.2.9 foundation)
+- The GFX9 instruction encoders for the u32 float-reciprocal division macro (3.2.9):
+  `src/gfx9_encode.cyr` adds `GFX9_VOP1_V_CVT_F32_U32` (0x06), `_V_CVT_U32_F32` (0x07),
+  `_V_RCP_IFLAG_F32` (0x23), `GFX9_VOP3_V_MUL_HI_U32` (0x286), `GFX9_VOP2_V_CNDMASK_B32`
+  (0x00) — all llvm-mc gfx900-verified, all reusing the existing parameterized encoders
+  (no new encoder functions). +7 byte-oracle asserts (`test_gfx9_enc_div_primitives`,
+  incl. the magic-constant `v_mul_f32 v, 0x4F7FFFFE, v`). The expansion (LLVM's 19-op
+  vector udiv, design-verified over 5M+ pairs) lands in N.9b.
+
 ## [3.2.8] — 2026-06-17
 
 The native **SPIR-V→GFX9 scalar f32/i32 compiler** — control flow plus full op breadth,

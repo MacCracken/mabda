@@ -797,8 +797,24 @@ hand-authored shaders stay as oracle + fallback.
     HW-verified on Cezanne (`native_spirv_const_fold_e2e.cyr`, `gid.x+6*7`). +14 asserts;
     the gid-kernel fixtures' `1<<2` now folds (tests updated) + uniform-SALU coverage moved
     to `test_gfx9_regalloc_uniform_salu`. **→ ready to cut 3.2.8.**
-  - [ ] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide; lower UDiv/SDiv/
-    UMod/SMod via the reciprocal + Newton-Raphson correction expansion.
+  - [~] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide → LLVM's float-
+    reciprocal **vector** udiv macro (19 loop-free instrs: cvt→rcp_iflag→×0x4F7FFFFE→cvt
+    →Newton(sub/mul_lo/mul_hi/add)→estimate(mul_hi/mul_lo/sub)→2 correction cmp+cndmask).
+    Design-verified over 5M+ pairs + ULP-perturbation (the magic constant biases the
+    reciprocal down so v_rcp's ≤1-ULP error can't overshoot; 2 +1 corrections repair the
+    underestimate). b=0 → 0xFFFFFFFF (natural saturate; pinned in the HW test).
+    - [x] **N.9a (2026-06-17) — encoders + oracle.** 5 opcode constants (cvt_f32_u32 0x06,
+      cvt_u32_f32 0x07, rcp_iflag_f32 0x23, mul_hi_u32 0x286, cndmask_b32 0x00), all
+      llvm-mc-verified, reusing existing encoders. +7 byte-oracle asserts.
+    - [ ] **N.9b — u32 OpUDiv expansion + HW.** Lower OpUDiv (134) to the 19-op MIR macro
+      (new primitive MIR/GISEL ops: CVT_F32_U/CVT_U_F32/RCP_IFLAG/MUL_HI/CNDMASK; cndmask
+      emits contiguous after its v_cmp — no reorder); operands forced VGPR. HW e2e on
+      Cezanne over the edge matrix incl. b=0.
+    - [ ] **N.9c — u32 OpUMod (137).** Reuse the core; select the remainder m + one final
+      cmp+cndmask. b=0 → r=N (pinned).
+    - [ ] **N.9d — signed OpSDiv/OpSMod/OpSRem.** Sign-magnitude wrapper (v_ashrrev_i32 31
+      sign masks → abs → unsigned core → sign restore); SMod follows divisor sign, SRem
+      the dividend. New encoder `GFX9_VOP2_V_ASHRREV_I32` (verify via llvm-mc at this bite).
   - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
