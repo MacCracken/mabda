@@ -235,6 +235,23 @@ fn test_gfx9_inline_float() {
     return 0;
 }
 
+# N.8b-4 — signed i32 compare encoders (VOPC → VCC, SOPC → SCC) + v_med3_f32 (FClamp).
+# All bytes llvm-mc gfx900-verified.
+fn test_gfx9_enc_signed_cmp() {
+    var v1 = gfx9_vgpr(1);
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_LT_I32, v1, 2), 0x7D820501, "v_cmp_lt_i32 vcc,v1,v2");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_LE_I32, v1, 2), 0x7D860501, "v_cmp_le_i32 vcc,v1,v2");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_GT_I32, v1, 2), 0x7D880501, "v_cmp_gt_i32 vcc,v1,v2");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_GE_I32, v1, 2), 0x7D8C0501, "v_cmp_ge_i32 vcc,v1,v2");
+    assert_eq(gfx9_enc_sopc(GFX9_SOPC_S_CMP_LT_I32, 2, 3), 0xBF040302, "s_cmp_lt_i32 s2,s3");
+    assert_eq(gfx9_enc_sopc(GFX9_SOPC_S_CMP_GT_I32, 2, 3), 0xBF020302, "s_cmp_gt_i32 s2,s3");
+    assert_eq(gfx9_enc_sopc(GFX9_SOPC_S_CMP_LE_I32, 2, 3), 0xBF050302, "s_cmp_le_i32 s2,s3");
+    assert_eq(gfx9_enc_sopc(GFX9_SOPC_S_CMP_GE_I32, 2, 3), 0xBF030302, "s_cmp_ge_i32 s2,s3");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MED3_F32, 5), 0xD1D60005, "v_med3_f32 v5 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(1), gfx9_vgpr(2), gfx9_vgpr(3)), 0x040E0501, "v_med3 hi v1,v2,v3");
+    return 0;
+}
+
 # ================================================================
 # SMEM — s_load_dwordx{2,4,8} (textured FS descriptor loads, two dwords)
 # ================================================================
@@ -2096,6 +2113,18 @@ fn test_spirv_lower_glsl_extinst() {
     assert_eq(mir_instr_a(&m5, 0), 4, "fma a = %4");
     assert_eq(mir_instr_b(&m5, 0), 5, "fma b = %5");
     assert_eq(mir_instr_c(&m5, 0), 6, "fma c = %6");
+    # FClamp is ternary too (clamp(x, lo, hi) → median).
+    store32(&buf + 36, 43);                # GLSL.std.450 FClamp
+    var m6[80];
+    var vals6[640];
+    var instrs6[512];
+    var ptrs6[64];
+    var blocks6[32];
+    mir_mod_init(&m6, &vals6, &instrs6, &ptrs6, &blocks6, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m6, &lsz), 0,
+    "FClamp extinst lowers");
+    assert_eq(mir_instr_op(&m6, 0), MIR_OP_FCLAMP, "op = FCLAMP");
+    assert_eq(mir_instr_c(&m6, 0), 6, "fclamp hi = %6");
     return 0;
 }
 
@@ -2755,6 +2784,36 @@ fn test_gfx9_isel_divergent_compare() {
     return 0;
 }
 
+# N.8b-4 — SIGNED compares route through the same S_CMP/V_CMP slots with the i32 opcodes:
+# a uniform `wgid < 8` → s_cmp_lt_i32 (SCC); a divergent `gid < 8` → v_cmp (VCC), and the
+# constant flips lt → gt (v_cmp_gt_i32).
+fn test_gfx9_isel_signed_compare() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);  # divergent
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_WORKGROUP_ID);     # uniform
+    mir_emit(&m, MIR_OP_ICMP_SLT, 4, MIR_T_U32, 2, 1, 0, 0);    # (gid < 8) signed → flip
+    mir_emit(&m, MIR_OP_ICMP_SLT, 5, MIR_T_U32, 3, 1, 0, 0);    # (wgid < 8) signed uniform
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[512];
+    var ni = gfx9_isel(&m, &isel, 16);
+    assert_eq(ni, 3, "3 selected (v_cmp + s_cmp + endpgm)");
+    assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp (divergent signed)");
+    assert_eq(gisel_flags(&isel, 0) >> 8, GFX9_VOPC_V_CMP_GT_I32, "v_cmp op = gt_i32 (flipped)");
+    assert_eq(gisel_a(&isel, 0), 1, "src0 = const %1");
+    assert_eq(gisel_b(&isel, 0), 2, "vsrc1 = gid %2");
+    assert_eq(gisel_op(&isel, 1), GISEL_S_CMP, "1: s_cmp (uniform signed)");
+    assert_eq(gisel_flags(&isel, 1) >> 8, GFX9_SOPC_S_CMP_LT_I32, "s_cmp op = lt_i32");
+    assert_eq(gisel_op(&isel, 2), GISEL_S_ENDPGM, "2: s_endpgm");
+    return 0;
+}
+
 # N.7c-2b — a DIVERGENT if lowers to the EXEC-mask trio: save+mask EXEC, skip the then
 # when no lane is active, restore EXEC at the merge. The merge LABEL precedes its
 # S_OR_EXEC so a skip or a fall-through both land on the restore.
@@ -3047,6 +3106,7 @@ fn main(): i64 {
     test_gfx9_enc_control_flow();
     test_gfx9_enc_vopc();
     test_gfx9_inline_float();
+    test_gfx9_enc_signed_cmp();
     test_gfx9_enc_smem();
     test_gfx9_enc_flat();
     test_gfx9_rebuild_store_deadbeef_byte_identical();
@@ -3110,6 +3170,7 @@ fn main(): i64 {
     test_spirv_lower_uniform_if();
     test_gfx9_isel_uniform_if();
     test_gfx9_isel_divergent_compare();
+    test_gfx9_isel_signed_compare();
     test_gfx9_isel_divergent_if();
     test_gfx9_isel_divergent_if_nesting_rejected();
     test_gfx9_compile_uniform_if();

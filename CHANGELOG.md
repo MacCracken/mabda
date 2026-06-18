@@ -15,6 +15,24 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-4 (signed integer compares + GLSL `FClamp`)
+- **Signed integer compares** (`SLessThan`/`SGreaterThan`/`SLessThanOrEqual`/
+  `SGreaterThanOrEqual`) lower through the existing S_CMP/V_CMP slots with the i32
+  opcodes (`s_cmp_*_i32` → SCC for uniform, `v_cmp_*_i32` → VCC for divergent, with the
+  same constant-operand predicate flip). `EQ`/`NE` stay sign-agnostic (reuse the u32
+  forms). `src/gfx9_encode.cyr` adds the i32 SOPC/VOPC opcodes (llvm-mc-verified);
+  `mir.cyr` the `ICMP_S*` ops; `spirv_lower.cyr` the opcodes + map; `gfx9_isel.cyr` the
+  `_gisel_cmp_sopc`/`_gisel_vcmp` signed cases. HW: `native_spirv_signed_if_e2e.cyr`
+  (`if (int(gid.x)-4 < 0)` selects gid 0..3 — an unsigned compare would select none).
+- **GLSL.std.450 `FClamp`** → a single `v_med3_f32` (median-of-3 == clamp when lo≤hi).
+  `MIR_OP_FCLAMP` + `GISEL_V_MED3_F32` (reuses the 3-src emit). HW:
+  `native_spirv_fclamp_e2e.cyr` (`clamp(float(gid.x), 1.0, 4.0)`, f32 exact, bounds are
+  inline floats from N.8b-3).
+- +33 asserts (`test_gfx9_enc_signed_cmp` byte-oracle; `test_gfx9_isel_signed_compare`
+  routing+flip; the lowering test gained FClamp). **Limit, tracked:** storing a *constant*
+  value (`out[i] = 100`) needs VGPR materialization (FLAT store data must be a VGPR) —
+  N.8b+ (the signed-if HW test stores `gid.x` instead).
+
 ### Added — Phase N.8b-3 (f32 inline constants — `fma(x, 2.0, 1.0)` compiles)
 - **f32 constants in the GFX9 inline set (`±0.5/±1.0/±2.0/±4.0`) now encode as inline
   operands** instead of failing/needing a literal. `src/gfx9_encode.cyr`:

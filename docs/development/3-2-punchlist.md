@@ -768,10 +768,14 @@ hand-authored shaders stay as oracle + fallback.
     `native_spirv_fma_const_e2e.cyr` (`fma(gid,2.0,1.0)`=2·gid+1) HW-verified on Cezanne.
     `0.25` is NOT inline → downsample byte/RSRC oracle unchanged (verified). +14 asserts.
     VOP2 still needs the const in src0 (operand placement → N.8b-4).
-  - [ ] **N.8b-4 — remaining op breadth.** GLSL FAbs/FClamp/etc.; signed int compares
-    (SLT/SGT) + div/mod; const-fold two-literal ops; VOP2 commutative const→src0
-    reordering; vector (vec2/3/4) ops; per-ext-set tracking; dispatcher polish. Then
-    "native SPIR-V f32 compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
+  - [x] **N.8b-4 (2026-06-17) — signed int compares + GLSL FClamp.** SLT/SGT/SLE/SGE →
+    i32 SOPC/VOPC (EQ/NE stay sign-agnostic); FClamp → `v_med3_f32`. HW-verified on
+    Cezanne (`native_spirv_signed_if_e2e.cyr`, `native_spirv_fclamp_e2e.cyr`). +33 asserts.
+  - [ ] **N.8b-5 — remaining op breadth.** GLSL FAbs (sign-bit clear); int div/mod
+    (no HW divide — needs the reciprocal/Newton expansion); store-CONSTANT materialization
+    (`out[i]=100`); VOP2 commutative const→src0 reordering; const-fold two-literal ops;
+    vector (vec2/3/4) ops; per-ext-set tracking. Then "native SPIR-V f32 compiler
+    complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
 
 ---
 

@@ -394,6 +394,25 @@ build/native_spirv_fma_const_e2e: programs/native_spirv_fma_const_e2e.cyr src/*.
 test-native-spirv-fma-const-e2e: build/native_spirv_fma_const_e2e
 	./build/native_spirv_fma_const_e2e
 
+# N.8b-4: GLSL.std.450 FClamp via v_med3_f32 (median-of-3). clamp(float(gid.x),1.0,4.0).
+build/native_spirv_fclamp_e2e: programs/native_spirv_fclamp_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_fclamp_e2e.cyr $@
+
+.PHONY: test-native-spirv-fclamp-e2e
+test-native-spirv-fclamp-e2e: build/native_spirv_fclamp_e2e
+	./build/native_spirv_fclamp_e2e
+
+# N.8b-4: a SIGNED compare (v_cmp_lt_i32) — `if (int(gid.x)-4 < 0)` selects gid 0..3
+# (an unsigned compare would select none). HW-verified on Cezanne.
+build/native_spirv_signed_if_e2e: programs/native_spirv_signed_if_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_signed_if_e2e.cyr $@
+
+.PHONY: test-native-spirv-signed-if-e2e
+test-native-spirv-signed-if-e2e: build/native_spirv_signed_if_e2e
+	./build/native_spirv_signed_if_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr
