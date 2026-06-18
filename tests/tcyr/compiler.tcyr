@@ -1840,10 +1840,13 @@ fn test_gfx9_abi_rsrc() {
     assert_eq(gfx9_rsrc1(15, 20), 0x2C0083, "downsample rsrc1");
     # a tiny kernel floors SGPRS at 1 (16 regs) and VGPRS at 0 (4 regs) = MIN
     assert_eq(gfx9_rsrc1(4, 4), 0x2C0040, "small rsrc1 = MIN");
-    # downsample RSRC2: user_sgpr=6, tgid_x|y, no trap
-    assert_eq(gfx9_rsrc2(6, 1, 1, 0), 0x18C, "downsample rsrc2");
+    # downsample RSRC2: user_sgpr=6, tgid_x|y, no tgid_z, tidig 0, no trap
+    assert_eq(gfx9_rsrc2(6, 1, 1, 0, 0, 0), 0x18C, "downsample rsrc2");
     # deadbeef RSRC2: user_sgpr=2, trap, no tgid
-    assert_eq(gfx9_rsrc2(2, 0, 0, 1), 0x44, "deadbeef rsrc2");
+    assert_eq(gfx9_rsrc2(2, 0, 0, 0, 0, 1), 0x44, "deadbeef rsrc2");
+    # N.6 2-D: TGID_Z_EN (bit 9) + TIDIG_COMP_CNT=1 (bits 11-12) for a 2-D kernel.
+    assert_eq(gfx9_rsrc2(2, 1, 1, 0, 1, 0), 0x800 | 0x100 | 0x80 | 0x4, "2-D rsrc2 (tidig=1)");
+    assert_eq(gfx9_rsrc2(2, 1, 1, 1, 2, 0), 0x1000 | 0x200 | 0x100 | 0x80 | 0x4, "3-D rsrc2 (tgid_z + tidig=2)");
     # review N.5b-1: the SGPRS 4-bit field must FAIL LOUD past 120 SGPRs, not
     # silently wrap via & 0xF to a too-small allocation.
     assert_eq(gfx9_rsrc1(4, 120), 0x2C03C0, "sgpr_hw 120 -> SGPRS=15 (the field max)");
@@ -2014,6 +2017,11 @@ fn test_gfx9_emit_extract_wgid() {
     mir_set_bufvar(&m, 13, 0);   # 1 binding → user_sgpr=2, TGID at s2
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_WORKGROUP_ID);
     mir_set_builtin(&m, 6, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    # The MIR EXTRACT instrs the lowering emits — gfx9_abi_assign scans them to
+    # enable TGID_X (wgid.x) + 1 LID component (lid.x). The matching gisel records
+    # below drive regalloc/emit.
+    mir_emit(&m, MIR_OP_EXTRACT, 10, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # wgid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 11, MIR_T_U32, 6, 0, 0, MIR_FLAG_C_IMM);   # lid.x
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_U32, MIR_UNIFORM, 0, 0);
     _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
     var abi[64];
@@ -2325,29 +2333,63 @@ fn test_gfx9_abi_too_many_bindings() {
     return 0;
 }
 
-# The canonical ABI assignment: 2 buffer bindings + GlobalInvocationId.
+# The canonical ABI assignment: 2 buffer bindings + a 1-D GlobalInvocationId (which
+# the lowering expands to wgid.x + lid.x EXTRACTs). The ABI derives the TGID/LID
+# enables from the MAX component each builtin is extracted with (N.6).
 fn test_gfx9_abi_assign() {
     var m[80];
     var vals[1280];
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 8, 4, 30, 30);
     mir_set_bufvar(&m, 5, 0);
     mir_set_bufvar(&m, 6, 1);
-    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 9, MIR_T_U32, 7, 0, 0, MIR_FLAG_C_IMM);    # wgid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 10, MIR_T_U32, 8, 0, 0, MIR_FLAG_C_IMM);   # lid.x
     var abi[64];
     gfx9_abi_assign(&m, &abi);
     assert_eq(gfx9_abi_num_bindings(&abi), 2, "2 bindings");
     assert_eq(gfx9_abi_user_sgpr(&abi), 4, "user_sgpr=4 (2 VA pairs)");
-    assert_eq(gfx9_abi_tgid_x(&abi), 1, "GID -> tgid_x enabled");
+    assert_eq(gfx9_abi_tgid_x(&abi), 1, "wgid.x -> tgid_x enabled");
+    assert_eq(gfx9_abi_tgid_y(&abi), 0, "no wgid.y -> tgid_y off");
+    assert_eq(gfx9_abi_lid_count(&abi), 1, "lid.x only -> lid_count 1");
     assert_eq(gfx9_abi_sgpr_base(&abi), 5, "sgpr_base = 4 user + 1 tgid");
-    assert_eq(gfx9_abi_vgpr_base(&abi), 1, "vgpr_base = 1 (v0 = LID)");
+    assert_eq(gfx9_abi_vgpr_base(&abi), 1, "vgpr_base = 1 (v0 = LID.x)");
     assert_eq(gfx9_abi_binding_sgpr(&abi, 0), 0, "binding 0 -> s0");
     assert_eq(gfx9_abi_binding_sgpr(&abi, 1), 2, "binding 1 -> s2");
     assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_WORKGROUP_ID, 0), 4, "wgid.x -> s4");
     assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_LOCAL_INVOC_ID, 0), 0, "lid.x -> v0");
-    assert_eq(gfx9_abi_builtin_reg(&abi, MIR_BI_GLOBAL_INVOC_ID, 0), 0 - 1, "gid -> -1 (needs expansion)");
+    return 0;
+}
+
+# N.6 2-D ABI: a kernel extracting wgid.y / lid.y enables TGID_Y + a second LID
+# component, so the HW preloads s[user+1]=wgid.y and v1=lid.y.
+fn test_gfx9_abi_assign_2d() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 8, 4, 30, 30);
+    mir_set_bufvar(&m, 5, 0);
+    mir_set_builtin(&m, 7, MIR_T_U32, MIR_BI_WORKGROUP_ID);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 9, MIR_T_U32, 7, 0, 0, MIR_FLAG_C_IMM);    # wgid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 10, MIR_T_U32, 7, 0, 1, MIR_FLAG_C_IMM);   # wgid.y
+    mir_emit(&m, MIR_OP_EXTRACT, 11, MIR_T_U32, 8, 0, 0, MIR_FLAG_C_IMM);   # lid.x
+    mir_emit(&m, MIR_OP_EXTRACT, 12, MIR_T_U32, 8, 0, 1, MIR_FLAG_C_IMM);   # lid.y
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    assert_eq(gfx9_abi_tgid_x(&abi), 1, "tgid_x on");
+    assert_eq(gfx9_abi_tgid_y(&abi), 1, "wgid.y -> tgid_y on");
+    assert_eq(gfx9_abi_tgid_z(&abi), 0, "no wgid.z -> tgid_z off");
+    assert_eq(gfx9_abi_lid_count(&abi), 2, "lid.x+y -> lid_count 2");
+    assert_eq(gfx9_abi_user_sgpr(&abi), 2, "1 binding -> 2 user sgpr");
+    assert_eq(gfx9_abi_sgpr_base(&abi), 4, "sgpr_base = 2 user + 2 tgid");
+    assert_eq(gfx9_abi_vgpr_base(&abi), 2, "vgpr_base = 2 (v0,v1 = LID.x/y)");
     return 0;
 }
 
@@ -2404,6 +2446,7 @@ fn main(): i64 {
     test_gfx9_emit_errors();
     test_gfx9_abi_rsrc();
     test_gfx9_abi_assign();
+    test_gfx9_abi_assign_2d();
     test_gfx9_emit_flat_vop3();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();

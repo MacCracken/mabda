@@ -15,6 +15,26 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.6 (2-D / TGID compiled dispatch — completing the N.6 remainder)
+- **A compiled SPIR-V kernel can now use a 2-D/3-D workgroup grid + 2-D/3-D
+  LocalSize, HW-verified on Cezanne.** `programs/native_spirv_2d_dispatch_e2e.cyr`:
+  `out[gid.y*4 + gid.x] = gid.x*16 + gid.y` over a 2×2 workgroup grid × 2×2 LocalSize
+  (4×4 global), via `gl_GlobalInvocationId.x/.y` — all 16 texels correct.
+- `src/gfx9_abi.cyr` — `gfx9_abi_assign` now derives the TGID_X/Y/Z and
+  LocalInvocationId component enables from the **max component each builtin is
+  actually extracted with** (scanning the MIR EXTRACT instructions), instead of the
+  1-D-only assumption. `gfx9_rsrc2` gained `tgid_z` + `tidig_comp_cnt` (RSRC2 bits 9
+  + 11-12). Fixes the bug where a 2-D kernel read uninitialized registers for
+  `wgid.y`/`lid.y` (the HW never preloaded them) — `gid.y` had been aliasing `gid.x`.
+- `src/backend_native_pm4.cyr` — `native_pm4_build_compute_dispatch` takes the full
+  `(ntx,nty,ntz, gx,gy,gz)`; `src/backend_native.cyr` — the compiled shmod carries
+  `local_y`/`local_z` and the dispatch slot passes the `y/z` grid through (the prior
+  fail-loud `y!=1` reject is removed). +tests in `compiler.tcyr` / `native.tcyr`.
+- **Known gap (tracked, NOT silently dropped):** a VALU multiply by a constant > 64
+  (e.g. `gid.x * 100`) hits `CMP_ERR_VOP3_LITERAL` — VOP3 has no inline form for a
+  32-bit literal, so it needs constant materialization (a `v_mov` of the literal
+  into a register first). That is Phase N.8 op-breadth; see the v3.2 punchlist.
+
 ## [3.2.7] — 2026-06-17
 
 **The native SPIR-V → GFX9 compute compiler reaches the public API.** Building on

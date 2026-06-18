@@ -6963,10 +6963,10 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, cap_out): i64 {
 # wgid*local_size + lid, materialized by a lowering step (later sub-bite); the
 # ABI only pins the primitive builtins.
 #
-# MVP scope: 1-D dispatch (TGID_X + LID.x); the .y/.z TGID/LID detection +
-# scalar push-constant slots refine in N.5g. Pure integer math; no syscalls.
-# Included after mir.cyr (reads the value table) and before gfx9_compile.cyr
-# (which resolves binding/builtin operands through these accessors).
+# Full 3-D dispatch: TGID_X/Y/Z + LID.x/y/z enables are derived from the max
+# component each builtin is actually extracted with (gfx9_abi_assign). Pure integer
+# math; no syscalls. Included after mir.cyr (reads the value table + instr list)
+# and before gfx9_compile.cyr (which resolves binding/builtin operands here).
 
 # COMPUTE_PGM_RSRC1: the fixed FLOAT_MODE(0xC0)+DX10_CLAMP flags with the VGPRS
 # (bits 0-5) and SGPRS (bits 6-9) fields ZEROED — the per-shader register counts
@@ -7015,12 +7015,17 @@ fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN
-# (bit 7), TGID_Y_EN (bit 8). (TGID_Z bit 9 + LDS/scratch fields are MVP-zero.)
-fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
+# (bit 7), TGID_Y_EN (bit 8), TGID_Z_EN (bit 9), TIDIG_COMP_CNT (bits 11-12 — the
+# number of LocalInvocationId components MINUS 1 the HW writes to v0/v1/v2). Without
+# the right TGID_*_EN / TIDIG_COMP_CNT the HW never loads wgid.y/z or lid.y/z, so a
+# 2-D/3-D kernel reads uninitialized registers (the N.6 2-D bug). (LDS/scratch zero.)
+fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, tgid_z, tidig_comp_cnt, trap): i64 {
     var r = (user_sgpr & 0x1F) << 1;
     if (trap != 0) { r = r | 0x40; }
     if (tgid_x != 0) { r = r | 0x80; }
     if (tgid_y != 0) { r = r | 0x100; }
+    if (tgid_z != 0) { r = r | 0x200; }
+    r = r | ((tidig_comp_cnt & 0x3) << 11);
     return r;
 }
 
@@ -7030,41 +7035,68 @@ fn gfx9_rsrc2(user_sgpr, tgid_x, tgid_y, trap): i64 {
 fn gfx9_abi_assign(m, abi): i64 {
     var cap_ids = load64(m + 64);
     var max_binding = 0 - 1;
-    var use_tgid = 0;
-    var use_lid = 0;
     var i = 1;
     while (i < cap_ids) {
-        var k = mir_val_kind(m, i);
-        if (k == MIR_VK_BUFVAR) {
+        if (mir_val_kind(m, i) == MIR_VK_BUFVAR) {
             var bind = mir_val_payload(m, i);
             if (bind > max_binding) { max_binding = bind; }
         }
-        if (k == MIR_VK_BUILTIN) {
-            var bi = mir_val_payload(m, i);
-            if (bi == MIR_BI_WORKGROUP_ID) { use_tgid = 1; }
-            if (bi == MIR_BI_GLOBAL_INVOC_ID) {
-                use_tgid = 1;
-                use_lid = 1;
-            }
-            if (bi == MIR_BI_LOCAL_INVOC_ID) { use_lid = 1; }
-        }
         i = i + 1;
+    }
+    # The number of WorkgroupId / LocalInvocationId components the kernel actually
+    # uses is the MAX component subscript across its EXTRACT instructions on those
+    # builtins (the GlobalInvocationId expansion already lowered to wgid/lid extracts).
+    # That fixes how many TGID SGPRs / LID VGPRs the HW must preload — a 2-D kernel
+    # needs TGID_Y_EN + TIDIG_COMP_CNT=1, which the 1-D MVP never set.
+    var max_wgid = 0 - 1;
+    var max_lid  = 0 - 1;
+    var ni = mir_n_instrs(m);
+    var j = 0;
+    while (j < ni) {
+        if (mir_instr_op(m, j) == MIR_OP_EXTRACT) {
+            var a = mir_instr_a(m, j);
+            var comp = mir_instr_c(m, j);
+            if (a > 0) {
+                if (a < cap_ids) {
+                    if (mir_val_kind(m, a) == MIR_VK_BUILTIN) {
+                        var bi = mir_val_payload(m, a);
+                        if (bi == MIR_BI_WORKGROUP_ID) { if (comp > max_wgid) { max_wgid = comp; } }
+                        if (bi == MIR_BI_LOCAL_INVOC_ID) { if (comp > max_lid) { max_lid = comp; } }
+                    }
+                }
+            }
+        }
+        j = j + 1;
     }
     var num_bindings = max_binding + 1;
     var user_sgpr = num_bindings * 2;
     if (user_sgpr > GFX9_USER_DATA_MAX) { return 0 - ABI_ERR_TOO_MANY_BINDINGS; }
-    var lid = 0;
-    if (use_lid != 0) { lid = 1; }
+    # Enable TGID_X..TGID_{max_wgid} contiguously so wgid.comp maps to s[user+comp]
+    # (gfx9_abi_builtin_reg); likewise LID v0..v{max_lid}.
+    var tgid_x = 0;
+    var tgid_y = 0;
+    var tgid_z = 0;
+    if (max_wgid >= 0) { tgid_x = 1; }
+    if (max_wgid >= 1) { tgid_y = 1; }
+    if (max_wgid >= 2) { tgid_z = 1; }
+    var n_tgid = 0;
+    if (max_wgid >= 0) { n_tgid = max_wgid + 1; }
+    var lid_count = 0;
+    if (max_lid >= 0) { lid_count = max_lid + 1; }
     store64(abi + ABI_NUM_BINDINGS, num_bindings);
     store64(abi + ABI_USER_SGPR, user_sgpr);
-    store64(abi + ABI_TGID_X, use_tgid);
-    store64(abi + ABI_TGID_Y, 0);
-    store64(abi + ABI_TGID_Z, 0);
-    store64(abi + ABI_LID_COUNT, lid);
-    store64(abi + ABI_SGPR_BASE, user_sgpr + use_tgid);
-    store64(abi + ABI_VGPR_BASE, lid);
+    store64(abi + ABI_TGID_X, tgid_x);
+    store64(abi + ABI_TGID_Y, tgid_y);
+    store64(abi + ABI_TGID_Z, tgid_z);
+    store64(abi + ABI_LID_COUNT, lid_count);
+    store64(abi + ABI_SGPR_BASE, user_sgpr + n_tgid);
+    store64(abi + ABI_VGPR_BASE, lid_count);
     return 0;
 }
+
+# Number of LocalInvocationId components the kernel uses (v0..). RSRC2's
+# TIDIG_COMP_CNT = max(lid_count - 1, 0).
+fn gfx9_abi_lid_count(abi): i64 { return load64(abi + ABI_LID_COUNT); }
 
 # ================================================================
 # Accessors + operand resolution
@@ -7529,7 +7561,11 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     ep = gfx9_emit_prefetch_pad(isa, ep);
     var r1 = gfx9_rsrc1(gfx9_hw_vgpr(hw), gfx9_hw_sgpr(hw));
     if (r1 < 0) { return r1; }
-    var r2 = gfx9_rsrc2(gfx9_abi_user_sgpr(abi), gfx9_abi_tgid_x(abi), gfx9_abi_tgid_y(abi), 1);
+    var lidc = gfx9_abi_lid_count(abi);
+    var tidig = 0;
+    if (lidc > 0) { tidig = lidc - 1; }
+    var r2 = gfx9_rsrc2(gfx9_abi_user_sgpr(abi), gfx9_abi_tgid_x(abi), gfx9_abi_tgid_y(abi),
+    gfx9_abi_tgid_z(abi), tidig, 1);
     store64(desc + DESC_ISA_LEN, ep);
     store64(desc + DESC_RSRC1, r1);
     store64(desc + DESC_RSRC2, r2);
@@ -9527,10 +9563,11 @@ rsrc1, rsrc2, b0_va, ntx, gx): i64 {
 # compiler's USER_DATA ABI — binding k → USER_DATA_{2k}/{2k+1} = s[2k:2k+1] — and
 # uses the compiler's RSRC1/RSRC2 verbatim (USER_SGPR = 2*n_binds, TGID enables).
 # No scratch (TMPRING=0): a compiled MVP kernel does not spill, and every USER_DATA
-# slot is a real binding. NUM_THREAD_X = LocalSize_x; grid = (gx,1,1). Returns the
-# 64-dword byte length.
+# slot is a real binding. NUM_THREAD_{X,Y,Z} = LocalSize; grid = (gx,gy,gz) work-
+# groups (the compiled kernel's WorkgroupId.y/z are enabled in rsrc2 by the ABI).
+# Returns the 64-dword byte length.
 fn native_pm4_build_compute_dispatch(buf, shader_va, rsrc1, rsrc2,
-binds, n_binds, ntx, gx): i64 {
+binds, n_binds, ntx, nty, ntz, gx, gy, gz): i64 {
     var pos = 0;
     pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_PGM_HI, (shader_va >> 40) & 0xFF);
     var tm01[8];
@@ -9565,10 +9602,10 @@ binds, n_binds, ntx, gx): i64 {
     pos = native_pm4_set_sh_reg_one(buf, pos, R_COMPUTE_RESOURCE_LIMITS, 0x140);
     var nt[12];
     store32(&nt + 0, ntx);
-    store32(&nt + 4, 1);
-    store32(&nt + 8, 1);
+    store32(&nt + 4, nty);
+    store32(&nt + 8, ntz);
     pos = native_pm4_set_sh_reg(buf, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
-    pos = native_pm4_dispatch_direct(buf, pos, gx, 1, 1, GFX9_DISPATCH_INITIATOR);
+    pos = native_pm4_dispatch_direct(buf, pos, gx, gy, gz, GFX9_DISPATCH_INITIATOR);
     var cur2 = pos / 4;
     if (cur2 < 64) { pos = native_pm4_nop(buf, pos, 64 - cur2); }
     return pos;
@@ -10954,6 +10991,7 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
 #   +48 nbind   (binding count — bindings k→USER_DATA s[2k:2k+1])
 #   +56 local_x (LocalSize.x → PM4 NUM_THREAD_X; must match the compiled shader)
 #   +64 isa_len (ISA byte length, incl. the prefetch pad)
+#   +72 local_y / +80 local_z (LocalSize.y/.z → NUM_THREAD_Y/Z — full 3-D geometry)
 var NATIVE_SHMOD_MAGIC_VAL = 0x4D42444153484D31;   # "MBDASHM1"
 var NATIVE_SHMOD_MAGIC   = 0;
 var NATIVE_SHMOD_HANDLE  = 8;
@@ -10964,7 +11002,9 @@ var NATIVE_SHMOD_RSRC2   = 40;
 var NATIVE_SHMOD_NBIND   = 48;
 var NATIVE_SHMOD_LOCALX  = 56;
 var NATIVE_SHMOD_ISALEN  = 64;
-var NATIVE_SHMOD_SIZE    = 72;
+var NATIVE_SHMOD_LOCALY  = 72;
+var NATIVE_SHMOD_LOCALZ  = 80;
+var NATIVE_SHMOD_SIZE    = 88;
 
 # Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
 # scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
@@ -11030,7 +11070,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     if (isa_len <= 0)    { return 0; }
     if (isa_len > 8192)  { return 0; }
 
-    # --- LocalSize.x (drives PM4 NUM_THREAD_X; the kernel was compiled for it) ---
+    # --- LocalSize x/y/z (drive PM4 NUM_THREAD_X/Y/Z; the kernel was compiled for them) ---
     var entry = spirv_find_entry_point(words_ptr, byte_len);
     var lsz[24];
     store64(&lsz + 0, 1);
@@ -11038,7 +11078,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(&lsz + 16, 1);
     spirv_find_local_size(words_ptr, byte_len, entry, &lsz);
     var local_x = load64(&lsz + 0);
+    var local_y = load64(&lsz + 8);
+    var local_z = load64(&lsz + 16);
     if (local_x <= 0) { local_x = 1; }
+    if (local_y <= 0) { local_y = 1; }
+    if (local_z <= 0) { local_z = 1; }
 
     # --- stage the ISA in a GTT BO at a context-allocated VA ---
     var fd = native_ctx_fd(ctx);
@@ -11080,6 +11124,8 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(sh + NATIVE_SHMOD_NBIND, load64(&desc + DESC_NUM_BINDINGS));
     store64(sh + NATIVE_SHMOD_LOCALX, local_x);
     store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
+    store64(sh + NATIVE_SHMOD_LOCALY, local_y);
+    store64(sh + NATIVE_SHMOD_LOCALZ, local_z);
     return sh;
 }
 
@@ -11120,14 +11166,15 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
     return 0;
 }
 
-# N.6r — dispatch a COMPILED shmod through the generic N-binding composer. `x` is
-# the grid X (workgroup count); the shmod's LocalSize.x is NUM_THREAD_X. `bp` is a
-# count-prefixed binding array (the compiled-path binding ABI): bp+0 = count, then
-# count × (handle, va) 16-byte pairs. The count MUST equal the compiler's binding
-# count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a caller error. Bindings
-# are capped at 16 (the USER_DATA ceiling the ABI already enforces). Synchronous
-# (cached_n); a logical-queue/timeline compiled path is a later bite (see docs/development/3-2-punchlist.md).
-fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
+# N.6 — dispatch a COMPILED shmod through the generic N-binding composer. `(x,y,z)`
+# are the grid (workgroup counts); the shmod's LocalSize x/y/z are NUM_THREAD_X/Y/Z
+# (the kernel's enabled WorkgroupId dims are already encoded in rsrc2 by the ABI).
+# `bp` is a count-prefixed binding array (the compiled-path binding ABI): bp+0 =
+# count, then count × (handle, va) 16-byte pairs. The count MUST equal the
+# compiler's binding count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a
+# caller error. Bindings are capped at 16 (the USER_DATA ceiling the ABI enforces).
+# Synchronous (cached_n).
+fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp): i64 {
     if (bp == 0) { return GPU_ERR_OTHER; }
     var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
     var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
@@ -11135,9 +11182,13 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     var rsrc2   = load64(shmod + NATIVE_SHMOD_RSRC2);
     var nbind   = load64(shmod + NATIVE_SHMOD_NBIND);
     var local_x = load64(shmod + NATIVE_SHMOD_LOCALX);
+    var local_y = load64(shmod + NATIVE_SHMOD_LOCALY);
+    var local_z = load64(shmod + NATIVE_SHMOD_LOCALZ);
     if (nbind < 0)   { return GPU_ERR_OTHER; }
     if (nbind > 16)  { return GPU_ERR_OTHER; }
     if (local_x <= 0) { return GPU_ERR_OTHER; }
+    if (local_y <= 0) { return GPU_ERR_OTHER; }
+    if (local_z <= 0) { return GPU_ERR_OTHER; }
     # The caller's binding array count must match the kernel's binding count, else
     # we would load USER_DATA / residency from unrelated memory.
     if (load64(bp + 0) != nbind) { return GPU_ERR_OTHER; }
@@ -11153,7 +11204,7 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
-    &bind_vas, nbind, local_x, x);
+    &bind_vas, nbind, local_x, local_y, local_z, x, y, z);
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
@@ -11192,18 +11243,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
     }
 
-    # N.6r — COMPILED-kernel path. A magic-tagged shmod (from
+    # N.6 — COMPILED-kernel path. A magic-tagged shmod (from
     # gpu_shader_module_create_spirv) carries the compiler's RSRC + binding count
     # + LocalSize, so we dispatch through the generic N-binding composer instead of
-    # the hardcoded deadbeef one below. The legacy (handle,va) pair has no magic
-    # and falls through to the v3.0 deadbeef path unchanged.
+    # the hardcoded deadbeef one below. Full 3-D grid (x,y,z workgroups) + 3-D
+    # LocalSize. The legacy (handle,va) pair has no magic and falls through to the
+    # v3.0 deadbeef path unchanged.
     if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
-        # MVP: the compiled path is 1-D (grid = x). Reject a multi-dim grid rather
-        # than silently dropping the y/z workgroups — fail loud beats wrong results.
-        # 2-D/3-D grid + 2-D LocalSize is the deferred N.6 TGID enhancement (see docs/development/3-2-punchlist.md).
-        if (y != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        if (z != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        return _native_dispatch_compiled(ctx, shmod, x, bp);
+        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp);
     }
 
     var stub_va = native_ctx_stub_va(ctx);

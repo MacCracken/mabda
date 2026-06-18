@@ -2141,7 +2141,7 @@ fn test_native_pm4_compute_dispatch_n() {
     store64(&binds + 0, 0x1111000000001000);   # binding 0 (low dword 0x00001000)
     store64(&binds + 8, 0x2222000000002000);   # binding 1 (low dword 0x00002000)
     var n = native_pm4_build_compute_dispatch(&buf, 0xFFFF800180000000, 0x2C0040, 0x48,
-    &binds, 2, 8, 1);
+    &binds, 2, 8, 1, 1, 1, 1, 1);
     assert_eq(n, 256, "padded to 64 dwords");
     var b0 = 0;
     var b1 = 0;
@@ -3331,7 +3331,9 @@ fn test_native_shmod_struct_layout() {
     assert_eq(NATIVE_SHMOD_NBIND, 48,  "nbind at +48");
     assert_eq(NATIVE_SHMOD_LOCALX, 56, "local_x at +56");
     assert_eq(NATIVE_SHMOD_ISALEN, 64, "isa_len at +64");
-    assert_eq(NATIVE_SHMOD_SIZE, 72,   "struct size 72");
+    assert_eq(NATIVE_SHMOD_LOCALY, 72, "local_y at +72");
+    assert_eq(NATIVE_SHMOD_LOCALZ, 80, "local_z at +80");
+    assert_eq(NATIVE_SHMOD_SIZE, 88,   "struct size 88");
     # The magic must have non-zero high 32 bits so it can never collide with a
     # legacy (handle,va) pair's u32 GEM handle at +0.
     assert_eq((NATIVE_SHMOD_MAGIC_VAL >> 32) != 0, 1, "magic high word non-zero");
@@ -3383,11 +3385,13 @@ fn test_native_dispatch_compiled_binding_guards() {
     var fp = backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH);
     var ctx[120];
     memset(&ctx, 0, 120);
-    var shmod[72];
-    memset(&shmod, 0, 72);
+    var shmod[88];
+    memset(&shmod, 0, 88);
     store64(&shmod + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);
     store64(&shmod + NATIVE_SHMOD_NBIND, 2);
     store64(&shmod + NATIVE_SHMOD_LOCALX, 8);
+    store64(&shmod + NATIVE_SHMOD_LOCALY, 1);
+    store64(&shmod + NATIVE_SHMOD_LOCALZ, 1);
     var bp[40];
     memset(&bp, 0, 40);
     store64(&bp + 0, 3);   # caller passes 3 bindings, kernel wants 2
@@ -3398,19 +3402,23 @@ fn test_native_dispatch_compiled_binding_guards() {
     store64(&bp + 0, 20);
     assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
     "nbind > 16 -> err");
-    # local_x must be positive (drives NUM_THREAD_X).
+    # local_x/y/z must each be positive (they drive NUM_THREAD_X/Y/Z).
     store64(&shmod + NATIVE_SHMOD_NBIND, 1);
-    store64(&shmod + NATIVE_SHMOD_LOCALX, 0);
     store64(&bp + 0, 1);
-    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
-    "local_x 0 -> err");
-    # A multi-dim grid (y>1 or z>1) is rejected for the compiled MVP path — fail
-    # loud rather than silently dropping the extra workgroups.
+    store64(&shmod + NATIVE_SHMOD_LOCALX, 0);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER, "local_x 0 -> err");
     store64(&shmod + NATIVE_SHMOD_LOCALX, 8);
-    assert_eq(fncall6(fp, &ctx, &shmod, 1, 2, 1, &bp), GPU_ERR_WORKGROUP_LIMIT,
-    "compiled grid y>1 -> err");
-    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 2, &bp), GPU_ERR_WORKGROUP_LIMIT,
-    "compiled grid z>1 -> err");
+    store64(&shmod + NATIVE_SHMOD_LOCALY, 0);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER, "local_y 0 -> err");
+    store64(&shmod + NATIVE_SHMOD_LOCALY, 1);
+    store64(&shmod + NATIVE_SHMOD_LOCALZ, 0);
+    assert_eq(fncall6(fp, &ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER, "local_z 0 -> err");
+    # A 2-D/3-D grid is now ACCEPTED (no longer rejected) — with a mock ctx the
+    # valid path reaches the (null) PM4 scratch and returns GPU_ERR_OTHER, proving
+    # it passed the guards and entered the compiled dispatch rather than bailing.
+    store64(&shmod + NATIVE_SHMOD_LOCALZ, 1);
+    assert_eq(fncall6(fp, &ctx, &shmod, 4, 4, 1, &bp), GPU_ERR_OTHER,
+    "2-D grid accepted (reaches dispatch, not rejected)");
     return 0;
 }
 
@@ -3428,8 +3436,8 @@ fn test_native_shader_module_release_tag_check() {
     store64(&legacy + 8, 0xABC);
     assert_eq(fncall2(fp, &ctx, &legacy), 0, "legacy pair -> no-op 0");
     assert_eq(load64(&legacy + 0), 5, "legacy pair untouched (not zeroed)");
-    var sh[72];
-    memset(&sh, 0, 72);
+    var sh[88];
+    memset(&sh, 0, 88);
     store64(&sh + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);   # handle stays 0
     assert_eq(fncall2(fp, &ctx, &sh), 0, "magic + handle 0 -> 0 (no ioctl)");
     assert_eq(load64(&sh + NATIVE_SHMOD_MAGIC), 0, "magic shmod zeroed after release");

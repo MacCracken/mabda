@@ -731,6 +731,7 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
 #   +48 nbind   (binding count — bindings k→USER_DATA s[2k:2k+1])
 #   +56 local_x (LocalSize.x → PM4 NUM_THREAD_X; must match the compiled shader)
 #   +64 isa_len (ISA byte length, incl. the prefetch pad)
+#   +72 local_y / +80 local_z (LocalSize.y/.z → NUM_THREAD_Y/Z — full 3-D geometry)
 var NATIVE_SHMOD_MAGIC_VAL = 0x4D42444153484D31;   # "MBDASHM1"
 var NATIVE_SHMOD_MAGIC   = 0;
 var NATIVE_SHMOD_HANDLE  = 8;
@@ -741,7 +742,9 @@ var NATIVE_SHMOD_RSRC2   = 40;
 var NATIVE_SHMOD_NBIND   = 48;
 var NATIVE_SHMOD_LOCALX  = 56;
 var NATIVE_SHMOD_ISALEN  = 64;
-var NATIVE_SHMOD_SIZE    = 72;
+var NATIVE_SHMOD_LOCALY  = 72;
+var NATIVE_SHMOD_LOCALZ  = 80;
+var NATIVE_SHMOD_SIZE    = 88;
 
 # Compile cap for shader-module-create: id_bound / cap_ids ceiling for the stack
 # scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
@@ -807,7 +810,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     if (isa_len <= 0)    { return 0; }
     if (isa_len > 8192)  { return 0; }
 
-    # --- LocalSize.x (drives PM4 NUM_THREAD_X; the kernel was compiled for it) ---
+    # --- LocalSize x/y/z (drive PM4 NUM_THREAD_X/Y/Z; the kernel was compiled for them) ---
     var entry = spirv_find_entry_point(words_ptr, byte_len);
     var lsz[24];
     store64(&lsz + 0, 1);
@@ -815,7 +818,11 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(&lsz + 16, 1);
     spirv_find_local_size(words_ptr, byte_len, entry, &lsz);
     var local_x = load64(&lsz + 0);
+    var local_y = load64(&lsz + 8);
+    var local_z = load64(&lsz + 16);
     if (local_x <= 0) { local_x = 1; }
+    if (local_y <= 0) { local_y = 1; }
+    if (local_z <= 0) { local_z = 1; }
 
     # --- stage the ISA in a GTT BO at a context-allocated VA ---
     var fd = native_ctx_fd(ctx);
@@ -857,6 +864,8 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(sh + NATIVE_SHMOD_NBIND, load64(&desc + DESC_NUM_BINDINGS));
     store64(sh + NATIVE_SHMOD_LOCALX, local_x);
     store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
+    store64(sh + NATIVE_SHMOD_LOCALY, local_y);
+    store64(sh + NATIVE_SHMOD_LOCALZ, local_z);
     return sh;
 }
 
@@ -897,14 +906,15 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
     return 0;
 }
 
-# N.6r — dispatch a COMPILED shmod through the generic N-binding composer. `x` is
-# the grid X (workgroup count); the shmod's LocalSize.x is NUM_THREAD_X. `bp` is a
-# count-prefixed binding array (the compiled-path binding ABI): bp+0 = count, then
-# count × (handle, va) 16-byte pairs. The count MUST equal the compiler's binding
-# count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a caller error. Bindings
-# are capped at 16 (the USER_DATA ceiling the ABI already enforces). Synchronous
-# (cached_n); a logical-queue/timeline compiled path is a later bite (see docs/development/3-2-punchlist.md).
-fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
+# N.6 — dispatch a COMPILED shmod through the generic N-binding composer. `(x,y,z)`
+# are the grid (workgroup counts); the shmod's LocalSize x/y/z are NUM_THREAD_X/Y/Z
+# (the kernel's enabled WorkgroupId dims are already encoded in rsrc2 by the ABI).
+# `bp` is a count-prefixed binding array (the compiled-path binding ABI): bp+0 =
+# count, then count × (handle, va) 16-byte pairs. The count MUST equal the
+# compiler's binding count (binding k → USER_DATA s[2k:2k+1]); a mismatch is a
+# caller error. Bindings are capped at 16 (the USER_DATA ceiling the ABI enforces).
+# Synchronous (cached_n).
+fn _native_dispatch_compiled(ctx, shmod, x, y, z, bp): i64 {
     if (bp == 0) { return GPU_ERR_OTHER; }
     var shader_handle = load64(shmod + NATIVE_SHMOD_HANDLE);
     var shader_va     = load64(shmod + NATIVE_SHMOD_VA);
@@ -912,9 +922,13 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     var rsrc2   = load64(shmod + NATIVE_SHMOD_RSRC2);
     var nbind   = load64(shmod + NATIVE_SHMOD_NBIND);
     var local_x = load64(shmod + NATIVE_SHMOD_LOCALX);
+    var local_y = load64(shmod + NATIVE_SHMOD_LOCALY);
+    var local_z = load64(shmod + NATIVE_SHMOD_LOCALZ);
     if (nbind < 0)   { return GPU_ERR_OTHER; }
     if (nbind > 16)  { return GPU_ERR_OTHER; }
     if (local_x <= 0) { return GPU_ERR_OTHER; }
+    if (local_y <= 0) { return GPU_ERR_OTHER; }
+    if (local_z <= 0) { return GPU_ERR_OTHER; }
     # The caller's binding array count must match the kernel's binding count, else
     # we would load USER_DATA / residency from unrelated memory.
     if (load64(bp + 0) != nbind) { return GPU_ERR_OTHER; }
@@ -930,7 +944,7 @@ fn _native_dispatch_compiled(ctx, shmod, x, bp): i64 {
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, 256);
     var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
-    &bind_vas, nbind, local_x, x);
+    &bind_vas, nbind, local_x, local_y, local_z, x, y, z);
     var t_now[16];
     memset(&t_now, 0, 16);
     if (syscall(228, 1, &t_now) != 0) { return GPU_ERR_OTHER; }
@@ -969,18 +983,14 @@ fn _backend_native_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
         if (queue_ring(cq) == AMDGPU_HW_IP_DMA) { return GPU_ERR_TRANSFER; }
     }
 
-    # N.6r — COMPILED-kernel path. A magic-tagged shmod (from
+    # N.6 — COMPILED-kernel path. A magic-tagged shmod (from
     # gpu_shader_module_create_spirv) carries the compiler's RSRC + binding count
     # + LocalSize, so we dispatch through the generic N-binding composer instead of
-    # the hardcoded deadbeef one below. The legacy (handle,va) pair has no magic
-    # and falls through to the v3.0 deadbeef path unchanged.
+    # the hardcoded deadbeef one below. Full 3-D grid (x,y,z workgroups) + 3-D
+    # LocalSize. The legacy (handle,va) pair has no magic and falls through to the
+    # v3.0 deadbeef path unchanged.
     if (load64(shmod + NATIVE_SHMOD_MAGIC) == NATIVE_SHMOD_MAGIC_VAL) {
-        # MVP: the compiled path is 1-D (grid = x). Reject a multi-dim grid rather
-        # than silently dropping the y/z workgroups — fail loud beats wrong results.
-        # 2-D/3-D grid + 2-D LocalSize is the deferred N.6 TGID enhancement (see docs/development/3-2-punchlist.md).
-        if (y != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        if (z != 1) { return GPU_ERR_WORKGROUP_LIMIT; }
-        return _native_dispatch_compiled(ctx, shmod, x, bp);
+        return _native_dispatch_compiled(ctx, shmod, x, y, z, bp);
     }
 
     var stub_va = native_ctx_stub_va(ctx);

@@ -666,10 +666,23 @@ hand-authored shaders stay as oracle + fallback.
     gate / dispatch binding guards / tag-checked release). Adversarially reviewed.
     *MVP scope:* 1-D grid (public `y`/`z` validated, compiled path uses `x`); SPIR-V
     `id_bound` ≤ 128; synchronous submit.
-  - [ ] **N.6 remainder (deferred enhancements, NOT MVP-blocking)** — the TGID/2-D
-    dispatch path (compiled `y`/`z` grid + 2-D LocalSize), a logical-queue/timeline
-    compiled dispatch, raising the `id_bound` ceiling, and a fuller differential CPU
-    oracle. None block the milestone (the public SPIR-V path is HW-proven).
+  - [x] **N.6 — 2-D / TGID compiled dispatch (2026-06-17) — HW-verified on Cezanne.**
+    `gfx9_abi_assign` derives TGID_X/Y/Z + LID component enables from the max
+    component each builtin is extracted with (MIR EXTRACT scan); `gfx9_rsrc2` gained
+    `tgid_z` + `tidig_comp_cnt`; `native_pm4_build_compute_dispatch` +
+    `_native_dispatch_compiled` carry full `(ntx,nty,ntz, gx,gy,gz)` + `local_y/z`.
+    Fixed the bug where `gid.y` aliased `gid.x` (HW never preloaded `wgid.y`/`lid.y`).
+    `programs/native_spirv_2d_dispatch_e2e.cyr` (4×4 global, 16/16 correct) +
+    `test_gfx9_abi_assign_2d` + the 2-D rsrc2 oracles.
+  - [ ] **N.6 remainder (still open, continuing this cycle — NOT dropped)** —
+    (a) logical-queue/timeline compiled dispatch (the compiled path is currently
+    synchronous `cached_n`); (b) raising the `id_bound` ceiling above 128 (couples
+    `cap_ids` / `cap_instrs` / `CMP_ISEL_CAP` + the slot scratch — grows static .bss);
+    (c) a fuller differential CPU oracle.
+  - [ ] **N.8 op-breadth carry: VOP3 literal materialization** — a VALU multiply by a
+    constant > 64 (no VOP3 inline form) → `CMP_ERR_VOP3_LITERAL`. Needs a `v_mov` of
+    the 32-bit literal into a register before the VOP3. Found via the N.6 2-D kernel
+    (`gid.x * 100`); worked around there with an inline (`*16`) multiplier.
   - [x] **N-HARDEN.1 (2026-06-17) — security, found during N.5g via adversarial
     review.** **Unchecked OOB write in the SPIR-V table builders on untrusted
     `id_bound`, now gated.** `spirv_build_type_table` / `_const_table` /
