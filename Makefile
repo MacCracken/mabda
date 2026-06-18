@@ -353,6 +353,17 @@ build/native_spirv_divergent_if_e2e: programs/native_spirv_divergent_if_e2e.cyr 
 test-native-spirv-divergent-if-e2e: build/native_spirv_divergent_if_e2e
 	./build/native_spirv_divergent_if_e2e
 
+# N.8a: a compiled SPIR-V kernel multiplying by a NON-INLINE constant (`gid.x*100`) —
+# v_mul_lo_u32 (VOP3a) has no literal form, so 100 is materialized via v_mov_b32 into a
+# scratch VGPR first. HW-verified on Cezanne (the documented N.6 VOP3-literal carry).
+build/native_spirv_mul_literal_e2e: programs/native_spirv_mul_literal_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_mul_literal_e2e.cyr $@
+
+.PHONY: test-native-spirv-mul-literal-e2e
+test-native-spirv-mul-literal-e2e: build/native_spirv_mul_literal_e2e
+	./build/native_spirv_mul_literal_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

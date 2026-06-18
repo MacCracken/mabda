@@ -15,6 +15,21 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8a (VOP3-literal materialization — `gid * 100` compiles)
+- **A VALU multiply (or any VOP3a op) by a non-inline constant now compiles + runs on
+  Cezanne** — `programs/native_spirv_mul_literal_e2e.cyr`: `out[gid.x] = gid.x * 100`
+  yields `out[i] = i*100`. This was the documented N.6 carry (`gid*100` used to fail
+  `CMP_ERR_VOP3_LITERAL`; the 2-D test worked around it with `*16`).
+- `src/gfx9_compile.cyr` — VOP3a has no literal operand form, so `_emit_vop3_2src`
+  materializes a non-inline constant operand into a **scratch VGPR** (`v_mov_b32 vS,
+  lit`) then uses it. The scratch is the first free VGPR (`gfx9_emit_program` computes it
+  from the VGPR high-water — matches `gfx9_hw_vgpr`, no new public signature); when a
+  kernel actually materializes, the rsrc1 VGPR count is bumped by one to cover it.
+  Non-materializing kernels are byte-identical (the downsample/saxpy oracles + all 6
+  prior compiled-kernel HW programs are unchanged). Two-literal VOP3 (const-foldable)
+  still fails loud (N.8+). +7 asserts (`test_gfx9_emit_vop3_literal_materialize`,
+  llvm-mc byte-exact for the `v_mov`/`v_mul` pair).
+
 ### Added — Phase N.7c-2b (EXEC-mask branch + HW — the divergent `if` is complete)
 - **A compiled SPIR-V kernel with a divergent `if` runs correctly on Cezanne, with
   per-lane masking.** `programs/native_spirv_divergent_if_e2e.cyr`: `if

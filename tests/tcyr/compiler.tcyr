@@ -1954,6 +1954,44 @@ fn test_gfx9_emit_flat_vop3() {
     return 0;
 }
 
+# N.8a — VOP3a has no literal operand form, so a non-inline constant (100 > 64) is
+# materialized into the scratch VGPR (the first free one = v6 here) with v_mov_b32, then
+# multiplied. A leading EXTRACT puts gid.x in v3 (so it resolves as a real VGPR operand,
+# as in a real compile). Bytes are llvm-mc gfx900 ground-truth.
+fn test_gfx9_emit_vop3_literal_materialize() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 9, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # gid.x → v3 (extract)
+    mir_set_const(&m, 11, MIR_T_U32, 100);                              # the literal 100
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # result → v5
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 10, 9, 0, 0, MIR_FLAG_C_IMM);  # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_MUL_LO_U32, 12, 10, 11, 0, 0);        # %12 = %10 * 100
+    _gisel_emit(&isel, 2, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 10 * 16, 3);
+    store64(&alloc + 12 * 16, 5);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    assert_eq(endp, 24, "materialize: extract(1) + v_mov(2) + v_mul(2) + endpgm(1) = 24 bytes");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (gid.x extract)");
+    assert_eq(load32(&built + 4), 0x7E0C02FF, "v_mov_b32 v6, literal");
+    assert_eq(load32(&built + 8), 100, "the literal 100 dword");
+    assert_eq(load32(&built + 12), 0xD2850005, "v_mul_lo_u32 v5,v3,v6 lo");
+    assert_eq(load32(&built + 16), 0x00020D03, "v_mul_lo_u32 hi (src0 v3, src1 v6 scratch)");
+    assert_eq(load32(&built + 20), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.5b-2 review: the FLAT emitters must FAIL LOUD on the operand shapes they do
 # not yet handle (see docs/development/3-2-punchlist.md), rather than emitting
 # v255 / an SGPR index / a wrapped binding.
@@ -2823,6 +2861,7 @@ fn main(): i64 {
     test_gfx9_abi_assign();
     test_gfx9_abi_assign_2d();
     test_gfx9_emit_flat_vop3();
+    test_gfx9_emit_vop3_literal_materialize();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();
     test_gfx9_isel_extract_unknown_unif();

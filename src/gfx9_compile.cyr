@@ -233,16 +233,59 @@ fn _emit_vop2_sub(m, isel, i, alloc, isvgpr, buf, pos, sub_opc, subrev_opc): i64
 # VOP3 two-source (v_mul_lo_u32: VOP3-only on GFX9). vdst = a OP b. VOP3 has no
 # 32-bit-literal form, so a literal operand fails loud (an out-of-inline-range
 # constant must be materialized into a register — not needed for the MVP strides).
-fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc, scratch_vgpr): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
     var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
     if (src1 < 0) { return src1; }
-    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
-    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
-    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
+    var p = pos;
+    # VOP3a has no literal form, so a non-inline constant operand is first materialized
+    # into the scratch VGPR (the first free VGPR) via v_mov_b32. At most one operand is a
+    # literal (the other is a VGPR/inline); two literals are const-foldable (N.8+).
+    if (src0 == GFX9_SRC_LITERAL) {
+        if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+        if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_VOP3_LITERAL; }
+        p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, GFX9_SRC_LITERAL));
+        p = gfx9_emit32(buf, p, _cmp_lit(m, gisel_a(isel, i), fl & MIR_FLAG_A_IMM));
+        src0 = gfx9_vgpr(scratch_vgpr);
+    } else {
+        if (src1 == GFX9_SRC_LITERAL) {
+            if (scratch_vgpr >= GFX9_VGPR_CAP) { return 0 - CMP_ERR_VOP3_LITERAL; }
+            p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, scratch_vgpr, GFX9_SRC_LITERAL));
+            p = gfx9_emit32(buf, p, _cmp_lit(m, gisel_b(isel, i), fl & MIR_FLAG_B_IMM));
+            src1 = gfx9_vgpr(scratch_vgpr);
+        }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
+}
+
+# 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
+fn _cmp_operand_is_literal(m, field, is_imm): i64 {
+    if (is_imm != 0) {
+        if (gfx9_inline_int(field) == GFX9_SRC_LITERAL) { return 1; }
+        return 0;
+    }
+    if (field == 0) { return 0; }
+    if (mir_val_kind(m, field) != MIR_VK_CONST) { return 0; }
+    if (gfx9_inline_int(mir_val_payload(m, field)) == GFX9_SRC_LITERAL) { return 1; }
+    return 0;
+}
+
+# 1 if any VOP3a op carries a literal operand (so the driver reserves a scratch VGPR for
+# materialization and bumps the rsrc1 VGPR count to cover it).
+fn _cmp_needs_vop3_scratch(m, isel, ni): i64 {
+    var i = 0;
+    while (i < ni) {
+        if (gisel_op(isel, i) == GISEL_V_MUL_LO_U32) {
+            var fl = gisel_flags(isel, i);
+            if (_cmp_operand_is_literal(m, gisel_a(isel, i), fl & MIR_FLAG_A_IMM) == 1) { return 1; }
+            if (_cmp_operand_is_literal(m, gisel_b(isel, i), fl & MIR_FLAG_B_IMM) == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # A FLAT address/data operand must be an SSA value living in a VGPR (a per-lane
@@ -360,7 +403,7 @@ fn _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos): i64 {
 # ================================================================
 # Op dispatch — one GISEL record -> its encoder(s).
 # ================================================================
-fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     var op = gisel_op(isel, i);
     if (op == GISEL_S_ADD_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_ADD_I32); }
     if (op == GISEL_S_SUB_I32) { return _emit_sop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_SOP2_S_SUB_I32); }
@@ -391,7 +434,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
     if (op == GISEL_V_CVT_F32_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_I32); }
     if (op == GISEL_V_CVT_I32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F32); }
     if (op == GISEL_V_MUL_LO_U32) {
-        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32);
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_LO_U32, scratch_vgpr);
     }
     if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
     if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
@@ -437,6 +480,18 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
         }
         i = i + 1;
     }
+    # The scratch VGPR for VOP3-literal materialization is the first free one: the VGPR
+    # high-water (ABI region + every allocated VGPR result). Matches gfx9_hw_vgpr(hw), so
+    # the driver's rsrc1 VGPR bump and this stay in lock-step.
+    var scratch_vgpr = gfx9_abi_vgpr_base(abi);
+    i = 0;
+    while (i < cap_ids) {
+        if (load64(&isvgpr + i * 8) != 0) {
+            var r = gfx9_reg(alloc, i);
+            if (r + 1 > scratch_vgpr) { scratch_vgpr = r + 1; }
+        }
+        i = i + 1;
+    }
     # N.7 control flow: a LABEL emits 0 bytes but records its byte offset; a branch
     # emits a placeholder simm16 and is patched after all labels are known (forward
     # branches resolve here). laboff is id-indexed (-1 = unseen); the patch list pairs
@@ -474,7 +529,7 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
                         npatch = npatch + 1;
                         p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_EXECZ, 0));
                     } else {
-                        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p);
+                        var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p, scratch_vgpr);
                         if (rc < 0) { return rc; }
                         p = rc;
                     }
@@ -564,7 +619,11 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     # the regalloc high-water (allocated GPRs only) is lower.
     var sgpr_count = gfx9_hw_sgpr(hw);
     if (div_cf == 1) { if (sgpr_count < GFX9_EXEC_SAVE_COUNT) { sgpr_count = GFX9_EXEC_SAVE_COUNT; } }
-    var r1 = gfx9_rsrc1(gfx9_hw_vgpr(hw), sgpr_count);
+    # VOP3-literal materialization parks its constant in the first free VGPR
+    # (gfx9_hw_vgpr(hw)), so the grant must cover that one extra register.
+    var vgpr_count = gfx9_hw_vgpr(hw);
+    if (_cmp_needs_vop3_scratch(m, isel2, ni2) == 1) { vgpr_count = vgpr_count + 1; }
+    var r1 = gfx9_rsrc1(vgpr_count, sgpr_count);
     if (r1 < 0) { return r1; }
     var lidc = gfx9_abi_lid_count(abi);
     var tidig = 0;

@@ -748,8 +748,16 @@ hand-authored shaders stay as oracle + fallback.
       byte-identical). Nested ifs fail loud (N.8). `native_spirv_divergent_if_e2e.cyr`
       HW-verified on Cezanne (`if (gid.x<4){out[gid.x]=gid.x+7}`, one wave, lanes 4-7
       masked, out[4..7] sentinel). +13 asserts.
-- [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
+- [~] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
   SPIR-V f32 compiler **complete**.
+  - [x] **N.8a (2026-06-17) — VOP3-literal materialization.** A non-inline constant
+    operand of a VOP3a op (`gid.x*100`) is materialized into the first-free scratch VGPR
+    via `v_mov_b32`, then used; rsrc1 VGPR count bumped only when materializing
+    (non-materializing kernels byte-identical). `native_spirv_mul_literal_e2e.cyr`
+    HW-verified on Cezanne. +7 asserts. Two-literal VOP3 still fails loud (const-fold).
+  - [ ] **N.8b — remaining op breadth.** const-fold for two-literal ops; any missing
+    SPIR-V ALU/convert ops; vector (vec2/3/4) ops; dispatcher polish. Then "native
+    SPIR-V f32 compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
 
 ---
 
