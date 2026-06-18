@@ -13,6 +13,20 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [Unreleased]
+
+### Added — Phase F.1 (f64 capability field) — opens Phase F (double-precision compute)
+- **`GpuCapabilities` gains a `shader_f64` field** (`src/capabilities.cyr`): a new i64 bool at
+  offset +128, growing the struct 128 → 136 bytes (`gpu_caps_new` allocs/zeroes 136). Accessor
+  `gpu_caps_shader_f64(c)` + setter `gpu_caps_set_shader_f64(c, v)`, mirroring the
+  texture-compression field. 0 in a fresh caps; the F.2 detection will populate it (wgpu via the
+  Vulkan `shaderFloat64` feature behind SPIR-V passthrough, native via the SPIR-V→GFX9 f64
+  emitter), and the F.3 dispatch guard will read it. (The proposal's "+120 → 128" was stale —
+  T.4's texture-compression bitset already took +120, so f64 lands at +128.)
+- CPU suite +3 (`core.tcyr`: shader_f64 default-false + set/get round-trip). Phase F (f64,
+  consumer **attn11**) is hard-gated on the SPIR-V path on both backends — see
+  `docs/proposals/v3.2-f64-compute.md`.
+
 ## [3.2.11] — 2026-06-18
 
 The native **SPIR-V→GFX9 per-ext-set tracking** (**Phase N.11**) — and the close of the v3.2.x

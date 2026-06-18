@@ -888,8 +888,11 @@ Consumer: **attn11**. f64 hard-gates on SPIR-V on **both** backends (no
 not speed, is the deliverable. **No escape hatch — general native f64 is a
 committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
 
-- [ ] **F.1** *(3.2.10)* — `GpuCapabilities` f64 field (+120, struct→128) +
-  accessors.
+- [x] **F.1** *(3.2.12)* (2026-06-18) — `GpuCapabilities` `shader_f64` field at **+128**,
+  struct **128→136** (T.4's texture-compression bitset already took +120, so the proposal's
+  "+120→128" was stale) + `gpu_caps_shader_f64` accessor / `gpu_caps_set_shader_f64` setter +
+  `gpu_caps_new` sized up. +3 core asserts. (F.2–F.10 still annotated 3.2.10/3.2.11 — reflow to
+  3.2.12/3.2.13 lands with F.10.)
 - [ ] **F.2** *(3.2.10)* — `gpu_caps_shader_f64(ctx)` (wgpu: probe-module +
   `SpirvShaderPassthrough`; native: `MABDA_NATIVE_F64`).
 - [ ] **F.3** *(3.2.10)* — Shader-module f64 flag + fail-loud dispatch guard.
