@@ -2387,6 +2387,53 @@ fn test_spirv_lower_uniform_if() {
     return 0;
 }
 
+# N.7b-2a — isel the uniform-if MIR: ICMP→S_CMP (op in flags<<8), COND_BRANCH→
+# S_CBRANCH (skip to merge), BRANCH→S_BRANCH, LABEL→marker; then regalloc + waitcnt
+# pass over the control-flow list without error (the new ops carry no SSA result).
+fn test_gfx9_isel_uniform_if() {
+    var buf[640];
+    var n = _spv_build_uniform_if(&buf);
+    var types[640];
+    var consts[448];
+    var deco[448];
+    var outbi[256];
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_const_table(&buf, n, 16, 16, &consts);
+    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
+    var isel[1536];
+    var ni = gfx9_isel(&m, &isel, 32);
+    assert_eq(ni, 7, "7 selected instrs");
+    assert_eq(gisel_op(&isel, 0), GISEL_EXTRACT, "0: extract wgid.x");
+    assert_eq(gisel_op(&isel, 1), GISEL_S_CMP, "1: s_cmp");
+    assert_eq(gisel_flags(&isel, 1) >> 8, GFX9_SOPC_S_CMP_EQ_U32, "s_cmp op = eq_u32");
+    assert_eq(gisel_op(&isel, 2), GISEL_S_CBRANCH, "2: s_cbranch");
+    assert_eq(gisel_c(&isel, 2), 15, "cbranch skip-target = merge %15");
+    assert_eq(gisel_op(&isel, 3), GISEL_LABEL, "3: then label");
+    assert_eq(gisel_a(&isel, 3), 14, "then label = %14");
+    assert_eq(gisel_op(&isel, 4), GISEL_S_BRANCH, "4: s_branch");
+    assert_eq(gisel_a(&isel, 4), 15, "branch target = merge %15");
+    assert_eq(gisel_op(&isel, 5), GISEL_LABEL, "5: merge label");
+    assert_eq(gisel_op(&isel, 6), GISEL_S_ENDPGM, "6: s_endpgm");
+    # regalloc + waitcnt traverse the control-flow list without error.
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var alloc[512];
+    var hw[16];
+    var rr = gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, &hw);
+    assert_eq(rr, 0, "regalloc over control flow ok");
+    var isel2[1536];
+    var ni2 = gfx9_waitcnt(&m, &isel, ni, &isel2, 32);
+    assert_eq(ni2 >= ni, 1, "waitcnt passes control flow through");
+    return 0;
+}
+
 # N.5c review (CRITICAL): the validate gate returns POSITIVE codes, so gfx9_compile
 # must reject malformed SPIR-V with `!= 0`, not `< 0` (which never fired and let
 # bad input reach the table builders). A bad-magic module must fail loud here.
@@ -2619,6 +2666,7 @@ fn main(): i64 {
     test_gfx9_compile_saxpy_gid();
     test_spirv_lower_gid_expansion();
     test_spirv_lower_uniform_if();
+    test_gfx9_isel_uniform_if();
     test_spirv_lower_synth_exhaustion();
     test_gfx9_compile_rejects_malformed();
     test_gfx9_abi_too_many_bindings();

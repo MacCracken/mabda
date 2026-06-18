@@ -722,11 +722,14 @@ hand-authored shaders stay as oracle + fallback.
       (no block array → no `mir_mod_init` change). Entry label skipped (straight-line
       kernels unchanged); `ICMP` uniformity = meet of operands (`wgid.x==c` → uniform).
       Loops + phi still fail loud. `test_spirv_lower_uniform_if` (+17 asserts).
-    - [ ] **N.7b-2 — back-end + HW.** isel (`ICMP`→`s_cmp` SCC, `COND_BRANCH`→
-      `s_cbranch_scc0` to the merge, `BRANCH`→`s_branch`, `LABEL`→marker) + a two-pass
-      block layout (record label byte offsets, patch each branch's `simm16`) +
-      cross-block linear-scan regalloc over the flattened forward blocks + an
-      `if (wgid.x==0){...}` HW e2e on Cezanne (grid 2 → only wg0 writes).
+    - [x] **N.7b-2a (2026-06-17) — control-flow isel.** `LABEL`/`BRANCH`/`COND_BRANCH`/
+      `ICMP_*` → `GISEL_LABEL`/`S_BRANCH`/`S_CBRANCH`/`S_CMP` (SCC; SOPC op in flags<<8;
+      divergent compare fails loud → N.7c). Regalloc + s_waitcnt traverse the CF list
+      unchanged (new ops carry no SSA result). `test_gfx9_isel_uniform_if` (+15).
+    - [ ] **N.7b-2b — emit + HW.** Two-pass byte layout in `gfx9_emit_program`: pass 1
+      records each LABEL's byte offset + emits branches with a placeholder simm16; a
+      patch pass sets each branch's `simm16 = (target - (branch+4))/4`. Plus an
+      `if (wgid.x==0){ out[lid.x]=… }` HW e2e on Cezanne (grid 2 → only wg0 writes).
   - [ ] **N.7c — divergent `if`** — per-lane condition via `s_and_saveexec_b64` +
     `s_cbranch_execz` skip + `s_or_b64` EXEC restore at the merge; divergent e2e.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native

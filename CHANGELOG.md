@@ -15,6 +15,18 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.7b-2a (control-flow instruction selection)
+- **The control-flow MIR ops now select to GFX9.** `src/gfx9_isel.cyr`: `MIR_OP_LABEL`
+  → `GISEL_LABEL` (0-byte marker), `MIR_OP_BRANCH` → `GISEL_S_BRANCH`,
+  `MIR_OP_COND_BRANCH` → `GISEL_S_CBRANCH` (skip to the merge/false target when
+  `SCC==0`), and `MIR_OP_ICMP_*` → `GISEL_S_CMP` (result is SCC, not a register; the
+  SOPC compare opcode rides in `flags` bits 8+). A divergent compare fails loud
+  (v_cmp/VCC + EXEC is N.7c). Register allocation + s_waitcnt already traverse the
+  control-flow list unchanged — the new ops carry no SSA result (LABEL/BRANCH/CBRANCH)
+  and the S_CMP's operands are ordinary SSA/const reads. +15 asserts
+  (`test_gfx9_isel_uniform_if`: lower→isel→regalloc→waitcnt over `if (wgid.x==0){}`).
+  Byte emission (two-pass label/branch layout) + HW is N.7b-2b.
+
 ### Added — Phase N.7b-1 (control-flow front-end — multi-block lowering)
 - **The SPIR-V→GFX9 compiler now lowers structured control flow into MIR.**
   `src/spirv_lower.cyr`: `OpLabel`/`OpBranch`/`OpBranchConditional`/`OpSelectionMerge`

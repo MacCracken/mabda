@@ -50,6 +50,15 @@ var GISEL_GLOBAL_LOAD   = 24;   # b = ptr-table index; flags bits 8+ = binding
 var GISEL_GLOBAL_STORE  = 25;   # a = off vreg, c = value vreg, b = ptr index
 var GISEL_S_ENDPGM      = 26;
 var GISEL_S_WAITCNT     = 27;   # a = simm16 (immediate); inserted by N.4b
+# N.7 control flow. LABEL: a = label <id>, 0 bytes (the emit records its offset).
+# S_BRANCH: a = target label. S_CBRANCH: c = target label (the merge/false target —
+# branch there if SCC==0, i.e. the condition the preceding S_CMP set is false).
+# S_CMP: dst = 0 (result is SCC, not a register), a/b = compared operands, the SOPC
+# compare opcode rides in flags bits 8+ (like GLOBAL_LOAD's binding).
+var GISEL_LABEL         = 28;
+var GISEL_S_BRANCH      = 29;
+var GISEL_S_CBRANCH     = 30;
+var GISEL_S_CMP         = 31;
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -137,9 +146,33 @@ fn _gisel_float_op(mop): i64 {
     return 0;
 }
 
+# Integer-compare MIR op → the SOPC scalar-compare opcode (uniform path → SCC).
+fn _gisel_cmp_sopc(mop): i64 {
+    if (mop == MIR_OP_ICMP_EQ) { return GFX9_SOPC_S_CMP_EQ_U32; }
+    if (mop == MIR_OP_ICMP_NE) { return GFX9_SOPC_S_CMP_LG_U32; }
+    if (mop == MIR_OP_ICMP_ULT) { return GFX9_SOPC_S_CMP_LT_U32; }
+    if (mop == MIR_OP_ICMP_UGT) { return GFX9_SOPC_S_CMP_GT_U32; }
+    if (mop == MIR_OP_ICMP_ULE) { return GFX9_SOPC_S_CMP_LE_U32; }
+    if (mop == MIR_OP_ICMP_UGE) { return GFX9_SOPC_S_CMP_GE_U32; }
+    return 0 - 1;
+}
+
 # Select + emit the GFX9 instruction for one MIR instruction.
 fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RET) { return _gisel_emit(out, k, GISEL_S_ENDPGM, 0, 0, 0, 0, 0); }
+    # N.7 control flow. LABEL/BRANCH carry the label <id> in `a`; COND_BRANCH skips to
+    # its FALSE/merge target (c) when SCC==0 (the preceding S_CMP set SCC = condition).
+    if (op == MIR_OP_LABEL) { return _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0); }
+    if (op == MIR_OP_BRANCH) { return _gisel_emit(out, k, GISEL_S_BRANCH, 0, a, 0, 0, 0); }
+    if (op == MIR_OP_COND_BRANCH) { return _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, 0); }
+    var sop = _gisel_cmp_sopc(op);
+    if (sop >= 0) {
+        # The MVP lowers only UNIFORM comparisons (→ SCC via s_cmp); a divergent
+        # compare needs v_cmp → VCC + EXEC masking (N.7c). Fail loud otherwise.
+        if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        if (mir_val_unif(m, dst) != MIR_UNIFORM) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        return _gisel_emit(out, k, GISEL_S_CMP, 0, a, b, 0, flags | (sop << 8));
+    }
     if (op == MIR_OP_LOAD) {
         # b = ptr-table index; carry binding in flags bits 8+ (b stays immediate).
         return _gisel_emit(out, k, GISEL_GLOBAL_LOAD, dst, a, b, 0, flags | (mir_ptr_binding(m, b) << 8));
