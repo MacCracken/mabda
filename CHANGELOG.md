@@ -13,7 +13,91 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [Unreleased]
+## [3.2.9] — 2026-06-18
+
+The native **SPIR-V→GFX9 integer division & remainder** family — the full int div/mod set
+(`OpUDiv` / `OpUMod` / `OpSDiv` / `OpSRem` / `OpSMod`) compiled in-tree and HW-verified on
+Cezanne (**Phase N.9**). GFX9 has no integer-divide instruction, so unsigned division expands
+to LLVM's loop-free float-reciprocal **vector** macro (a Newton-refined reciprocal + two
+correction steps, the `0x4F7FFFFE` magic constant biasing the estimate down so `v_rcp`'s
+≤1-ULP error can't overshoot); `OpUMod` selects the corrected remainder from the shared
+`_udiv_core`; the signed ops wrap that core in a sign-magnitude shell (`_signed_prep` +
+sign re-application), and `OpSMod` adds a floored fixup so the result follows the divisor's
+sign. Every op is value-exact vs an independent CPU reference on real silicon (8-lane edge
+matrices + 32-lane HW-stress sweeps); every bite was adversarially reviewed. Toolchain pin
+6.2.21. (vectors and per-ext-set tracking are 3.2.10–3.2.11.)
+
+### Added — Phase N.9d-2 (`OpSMod` — floored modulo; **3.2.9 int div/mod complete**)
+- **Floored modulo via SRem + a sign-aware fixup** (`src/spirv_lower.cyr`,
+  `_spirv_lower_smod`): compute the truncated remainder (sign of the dividend), then add the
+  divisor when the remainder is nonzero **and** the operand signs differ — so the result
+  follows the **divisor's** sign (GLSL `mod` semantics). The conditional add is two chained
+  `CNDMASK`s gated by `ICMP_NE` (signs-differ then remainder-nonzero); `adj = divisor` iff
+  both hold, else `0`. No new encoders/isel ops — reuses the existing `VMOV`/`XOR`/`ASHR`/
+  `ICMP_NE`/`CNDMASK`/`IADD`/`ISUB` (`OpSMod` = 139). 37 MIR instrs total.
+- **HW**: `native_spirv_smod_e2e.cyr` — value-exact on Cezanne over an 8-lane signed matrix
+  (all sign combos incl. `-7 smod 2 = 1`, `7 smod -2 = -1`, divisible, `INT_MIN`) vs an
+  independent CPU reference. CPU suite +11 (`test_spirv_lower_smod`: 37-instr structure +
+  the fixup shape). **This completes 3.2.9 (integer division & remainder).**
+
+### Added — Phase N.9d-1 (signed `OpSDiv` / `OpSRem`)
+- **Signed division + remainder via a sign-magnitude shell over `_udiv_core`**
+  (`src/spirv_lower.cyr`): `_signed_prep` computes the sign masks (`ASHR 31`) and the
+  branchless magnitudes (`(x^sign)-sign`); the unsigned core runs on `|a|/|b|`; then
+  `OpSDiv` (135) applies the result sign `signA⊕signB` via `(q^rs)-rs`, and `OpSRem` (138)
+  applies the dividend's sign `(r^signA)-signA` (C `%` semantics). One new primitive,
+  arithmetic-shift-right (`MIR_OP_ASHR` → `v_ashrrev_i32` 0x11 / `s_ashr_i32` 0x20,
+  llvm-mc-verified). Div-by-zero and INT_MIN/-1 are UB in SPIR-V (not asserted).
+- **HW**: `native_spirv_sdiv_e2e.cyr` + `native_spirv_srem_e2e.cyr` — both value-exact on
+  Cezanne over an 8-lane signed matrix (all four sign combinations, INT_MIN/2, |a|<|b|,
+  zero dividend) vs an independent CPU sign-magnitude reference (unsigned ops only).
+
+### Added — Phase N.9c (u32 `OpUMod` — integer remainder)
+- **`OpUMod` (137) reuses the udiv macro core**, selecting the corrected REMAINDER instead
+  of the quotient. `src/spirv_lower.cyr` factors the shared `_udiv_core` (VMOV N/D + the
+  reciprocal sequence through correction-1, returning `[dc, nc, q2, m2]`); `_spirv_lower_udiv`
+  applies the quotient's correction-2 + the 0xFFFFFFFF guard, `_spirv_lower_umod` applies
+  the remainder's correction-2 (`m2-D when m2>=D`) + a `b=0 → r=N` guard (the standard
+  remainder-of-zero convention). The udiv refactor is byte-identical (re-verified on HW).
+- **HW: `programs/native_spirv_umod_e2e.cyr`** — `out[gid]=a[gid]%b[gid]` over the 8-lane
+  edge matrix value-exact on Cezanne (incl. `100%0=100`, `max%0x80000000=0x7FFFFFFF`).
+
+### Added — Phase N.9b-2 (u32 `OpUDiv` — integer division runs on Cezanne)
+- **GFX9 has no integer divide, so `OpUDiv` (134) expands to LLVM's float-reciprocal
+  vector macro** (`src/spirv_lower.cyr` `_spirv_lower_udiv`): N/D are VMOV'd into VGPRs
+  (force-vector), then the 19-op reciprocal sequence (`cvt_f32_u32 → rcp_iflag → ×0x4F7FFFFE
+  → cvt_u32_f32 → Newton → estimate → 2× cmp_ge/cndmask correction`) with synth ids; the
+  cmp/cndmask pairs are contiguous so the implicit VCC survives.
+- **Divide-by-zero**: SPIR-V undefined; the bare macro yields a-derived garbage, so a guard
+  pins a deterministic **`0xFFFFFFFF`** (`ICMP_EQ(0,D)` + `cndmask`) — the common GPU
+  all-ones convention. (The HW run revealed the natural saturate is NOT 0xFFFFFFFF, exactly
+  as the design's risk #1 warned — hence the explicit guard.)
+- **HW: `programs/native_spirv_udiv_e2e.cyr`** — `out[gid]=a[gid]/b[gid]` over an 8-lane
+  edge matrix (0, a<b, a=b, b=1 float-trap, max/2, b=0, b=sign-bit) **value-exact vs a CPU
+  reference on Cezanne**, including the float-precision traps. Integer division — the
+  hardest op of the arc — works on real silicon.
+
+### Added — Phase N.9b-1 (integer-division primitives plumbed — MIR → isel → emit)
+- The six udiv-macro primitive ops are wired end-to-end: `MIR_OP_VMOV`/`CVT_F32_U`/
+  `CVT_U_F32`/`RCP_IFLAG`/`MUL_HI`/`CNDMASK` (`src/mir.cyr`) → `GISEL_V_MOV`/
+  `V_CVT_F32_U32`/`V_CVT_U32_F32`/`V_RCP_IFLAG_F32`/`V_MUL_HI_U32`/`V_CNDMASK`
+  (`src/gfx9_isel.cyr`) → emit (`src/gfx9_compile.cyr`: unary forms reuse `_emit_vop1`,
+  `MUL_HI` reuses the VOP3 2-src emit, `CNDMASK` gets a dedicated `_emit_cndmask` —
+  non-commutative, a=src0 false / b=vsrc1 true, VCC implicit).
+- These are GFX9 **vector-only** ops, so the uniformity sweep forces their result
+  DIVERGENT (`_mir_instr_unif`: `op >= VMOV && op <= CNDMASK → DIVERGENT`) — the udiv
+  macro is then fully vector even for uniform operands (each lane computes identically).
+- +10 byte-exact asserts (`test_gfx9_emit_div_primitives`). No behavior change to existing
+  kernels (nothing produces these ops yet — the OpUDiv macro lowering is N.9b-2).
+
+### Added — Phase N.9a (integer-division reciprocal encoders — 3.2.9 foundation)
+- The GFX9 instruction encoders for the u32 float-reciprocal division macro (3.2.9):
+  `src/gfx9_encode.cyr` adds `GFX9_VOP1_V_CVT_F32_U32` (0x06), `_V_CVT_U32_F32` (0x07),
+  `_V_RCP_IFLAG_F32` (0x23), `GFX9_VOP3_V_MUL_HI_U32` (0x286), `GFX9_VOP2_V_CNDMASK_B32`
+  (0x00) — all llvm-mc gfx900-verified, all reusing the existing parameterized encoders
+  (no new encoder functions). +7 byte-oracle asserts (`test_gfx9_enc_div_primitives`,
+  incl. the magic-constant `v_mul_f32 v, 0x4F7FFFFE, v`). The expansion (LLVM's 19-op
+  vector udiv, design-verified over 5M+ pairs) lands in N.9b.
 
 ## [3.2.8] — 2026-06-17
 

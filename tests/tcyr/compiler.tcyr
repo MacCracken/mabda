@@ -252,6 +252,24 @@ fn test_gfx9_enc_signed_cmp() {
     return 0;
 }
 
+# N.9a — the integer-division primitives (the float-reciprocal udiv macro): conversions,
+# the iflag reciprocal, mul-hi, cndmask (VCC implicit), and the magic-constant v_mul_f32
+# (src0 = literal 0x4F7FFFFE). All bytes llvm-mc gfx900-verified.
+fn test_gfx9_enc_div_primitives() {
+    var v1 = gfx9_vgpr(1);
+    var v3 = gfx9_vgpr(3);
+    var v4 = gfx9_vgpr(4);
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F32_U32, 3, v1), 0x7E060D01, "v_cvt_f32_u32 v3, v1");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_U32_F32, 3, v3), 0x7E060F03, "v_cvt_u32_f32 v3, v3");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_RCP_IFLAG_F32, 3, v3), 0x7E064703, "v_rcp_iflag_f32 v3, v3");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MUL_HI_U32, 4), 0xD2860004, "v_mul_hi_u32 v4 lo");
+    assert_eq(gfx9_enc_vop3a_hi(v3, v4, 0), 0x00020903, "v_mul_hi_u32 hi (v3, v4)");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, 3, v3, 5), 0x00060B03, "v_cndmask_b32 v3, v3, v5, vcc");
+    # the magic-constant reciprocal scale: v_mul_f32 v3, 0x4F7FFFFE, v3 (literal src0).
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 3, GFX9_SRC_LITERAL, 3), 0x0A0606FF, "v_mul_f32 v3, lit, v3");
+    return 0;
+}
+
 # ================================================================
 # SMEM — s_load_dwordx{2,4,8} (textured FS descriptor loads, two dwords)
 # ================================================================
@@ -1025,6 +1043,38 @@ fn test_spirv_const_fold() {
     assert_eq(_spirv_const_fold(&m, MIR_OP_FADD, 8, 9), 0x40400000, "2.0 + 1.0 = 3.0");
     assert_eq(_spirv_const_fold(&m, MIR_OP_FMUL, 8, 10), 0x40C00000, "2.0 * 3.0 = 6.0");
     assert_eq(_spirv_const_fold(&m, MIR_OP_FSUB, 10, 9), 0x40000000, "3.0 - 1.0 = 2.0");
+    return 0;
+}
+
+# N.9d-2 — OpSMod lowers to SRem + the floored fixup. 37 MIR instrs: VMOV(divisor copy) +
+# signed-prep(6) + udiv-core(18) + remainder-correction(3) + srem(2) + the fixup(6, two
+# ICMP_NE-gated CNDMASKs) + the final IADD. Divergent operands → the whole body is VALU.
+fn test_spirv_lower_smod() {
+    var w[64];
+    store32(&w + 0, (5 << 16) | 139);   # OpSMod
+    store32(&w + 4, 2);                  # result type
+    store32(&w + 8, 5);                  # result id
+    store32(&w + 12, 3);                 # operand a
+    store32(&w + 16, 4);                 # operand b
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);    # a — divergent
+    mir_set_builtin(&m, 4, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # b — divergent
+    assert_eq(_spirv_lower_smod(&w, 0, 5, &m), 0, "smod lowers");
+    assert_eq(mir_n_instrs(&m), 37, "smod = 37 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_VMOV, "0: VMOV divisor copy");
+    assert_eq(mir_instr_op(&m, 28), MIR_OP_XOR, "28: r ^ signA");
+    assert_eq(mir_instr_op(&m, 29), MIR_OP_ISUB, "29: srem = (r^signA)-signA");
+    assert_eq(mir_instr_op(&m, 30), MIR_OP_XOR, "30: rs = signA ^ signB");
+    assert_eq(mir_instr_op(&m, 32), MIR_OP_ICMP_NE, "32: signs-differ compare");
+    assert_eq(mir_instr_op(&m, 33), MIR_OP_CNDMASK, "33: differ ? divisor : 0");
+    assert_eq(mir_instr_op(&m, 34), MIR_OP_ICMP_NE, "34: srem-nonzero compare");
+    assert_eq(mir_instr_op(&m, 35), MIR_OP_CNDMASK, "35: nonzero ? bsel : 0");
+    assert_eq(mir_instr_op(&m, 36), MIR_OP_IADD, "36: smod = srem + adj");
     return 0;
 }
 
@@ -2172,6 +2222,60 @@ fn test_gfx9_emit_fabs() {
     return 0;
 }
 
+# N.9b-1 — the integer-division primitives selected + emitted: v_cvt_f32_u32, v_rcp_iflag,
+# v_cvt_u32_f32, v_mul_hi_u32, v_mov, v_cndmask (VCC implicit, a=false src0 / b=true vsrc1).
+# A leading EXTRACT puts the source in v3. Bytes are llvm-mc gfx900 truth.
+fn test_gfx9_emit_div_primitives() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);    # x → v3
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v4
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v5
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v6
+    _mir_set_val(&m, 13, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v7
+    _mir_set_val(&m, 14, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v8
+    _mir_set_val(&m, 15, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # → v9
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_V_CVT_F32_U32, 10, 9, 0, 0, 0);         # v4 = (f32)v3
+    _gisel_emit(&isel, 2, GISEL_V_RCP_IFLAG_F32, 11, 10, 0, 0, 0);      # v5 = 1/v4
+    _gisel_emit(&isel, 3, GISEL_V_CVT_U32_F32, 12, 11, 0, 0, 0);        # v6 = (u32)v5
+    _gisel_emit(&isel, 4, GISEL_V_MUL_HI_U32, 13, 9, 12, 0, 0);         # v7 = hi(v3*v6)
+    _gisel_emit(&isel, 5, GISEL_V_MOV, 14, 9, 0, 0, 0);                 # v8 = v3
+    _gisel_emit(&isel, 6, GISEL_V_CNDMASK, 15, 13, 14, 0, 0);           # v9 = vcc ? v8 : v7
+    _gisel_emit(&isel, 7, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 10 * 16, 4);
+    store64(&alloc + 11 * 16, 5);
+    store64(&alloc + 12 * 16, 6);
+    store64(&alloc + 13 * 16, 7);
+    store64(&alloc + 14 * 16, 8);
+    store64(&alloc + 15 * 16, 9);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 8, &alloc, &abi, &built, 0);
+    assert_eq(endp, 36, "div-primitives program end at 36 bytes");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (extract)");
+    assert_eq(load32(&built + 4), 0x7E080D03, "v_cvt_f32_u32 v4, v3");
+    assert_eq(load32(&built + 8), 0x7E0A4704, "v_rcp_iflag_f32 v5, v4");
+    assert_eq(load32(&built + 12), 0x7E0C0F05, "v_cvt_u32_f32 v6, v5");
+    assert_eq(load32(&built + 16), 0xD2860007, "v_mul_hi_u32 v7,v3,v6 lo");
+    assert_eq(load32(&built + 20), 0x00020D03, "v_mul_hi_u32 hi (v3, v6)");
+    assert_eq(load32(&built + 24), 0x7E100303, "v_mov_b32 v8, v3");
+    assert_eq(load32(&built + 28), 0x00121107, "v_cndmask_b32 v9, v7, v8, vcc");
+    assert_eq(load32(&built + 32), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.8a — VOP3a has no literal operand form, so a non-inline constant (100 > 64) is
 # materialized into the scratch VGPR (the first free one = v6 here) with v_mov_b32, then
 # multiplied. A leading EXTRACT puts gid.x in v3 (so it resolves as a real VGPR operand,
@@ -3303,6 +3407,7 @@ fn main(): i64 {
     test_gfx9_enc_vopc();
     test_gfx9_inline_float();
     test_gfx9_enc_signed_cmp();
+    test_gfx9_enc_div_primitives();
     test_gfx9_enc_smem();
     test_gfx9_enc_flat();
     test_gfx9_rebuild_store_deadbeef_byte_identical();
@@ -3355,9 +3460,11 @@ fn main(): i64 {
     test_gfx9_emit_store_const();
     test_gfx9_emit_vop2_const();
     test_gfx9_emit_fabs();
+    test_gfx9_emit_div_primitives();
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_spirv_const_fold();
+    test_spirv_lower_smod();
     test_gfx9_emit_glsl_math();
     test_gfx9_emit_glsl_fma_floor();
     test_gfx9_emit_fma_inline_float();

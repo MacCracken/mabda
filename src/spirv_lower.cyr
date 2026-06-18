@@ -33,6 +33,11 @@ var SPIRV_OP_ISUB             = 130;
 var SPIRV_OP_FSUB             = 131;
 var SPIRV_OP_IMUL             = 132;
 var SPIRV_OP_FMUL             = 133;
+var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
+var SPIRV_OP_SDIV             = 135;   # N.9d — sign-magnitude over the udiv core
+var SPIRV_OP_UMOD             = 137;   # N.9c — udiv core, remainder select
+var SPIRV_OP_SREM             = 138;   # N.9d — signed remainder (dividend sign)
+var SPIRV_OP_SMOD             = 139;   # N.9d — floored modulo (divisor sign)
 var SPIRV_OP_SHR_LOGICAL      = 194;
 var SPIRV_OP_SHL              = 196;
 var SPIRV_OP_BITWISE_OR       = 197;
@@ -413,6 +418,203 @@ fn _spirv_expand_gid(m, result, ety, comp, lsz_c): i64 {
     return mir_emit(m, MIR_OP_IADD, result, ety, scaled, lcid, 0, 0);
 }
 
+# Allocate a fresh synth id and emit one op into it; returns the id (>= 1) or a negative
+# error. The udiv macro chains these.
+fn _udiv_op(m, op, type, a, b, c, flags): i64 {
+    var id = mir_alloc_synth_id(m);
+    if (id < 0) { return 0 - MIR_ERR_ID_OOR; }
+    var e = mir_emit(m, op, id, type, a, b, c, flags);
+    if (e < 0) { return e; }
+    return id;
+}
+
+# OpUDiv(result, N, D) → LLVM's gfx900 float-reciprocal VECTOR macro (N.9b). Loop-free,
+# 19 core ops; N/D are first VMOV'd into VGPRs (force-vector, so uniform/const operands
+# work). The two cmp_ge/cndmask correction pairs are emitted contiguously so the implicit
+# VCC survives (nothing between writes VCC; no waitcnt is inserted there). 0x4F7FFFFE is
+# the magic reciprocal scale (biases the estimate down so v_rcp's ≤1-ULP error can't
+# overshoot). b=0 → q saturates to 0xFFFFFFFF (pinned in the HW test).
+# The shared u32 division CORE: VMOV N/D into VGPRs, then LLVM's float-reciprocal
+# sequence through correction-1 (the Newton-refined reciprocal, the quotient estimate,
+# remainder, and the first correction). Writes [dc, nc, q2, m2] into out (4 i64 slots) for
+# OpUDiv/OpUMod (and later signed peers) to apply their final correction + zero guard.
+fn _udiv_core(m, nn, dd, out): i64 {
+    var u = MIR_T_U32;
+    var f = MIR_T_F32;
+    var nc = _udiv_op(m, MIR_OP_VMOV, u, nn, 0, 0, 0);            if (nc < 0) { return nc; }
+    var dc = _udiv_op(m, MIR_OP_VMOV, u, dd, 0, 0, 0);            if (dc < 0) { return dc; }
+    var r1 = _udiv_op(m, MIR_OP_CVT_F32_U, f, dc, 0, 0, 0);       if (r1 < 0) { return r1; }
+    var r2 = _udiv_op(m, MIR_OP_RCP_IFLAG, f, r1, 0, 0, 0);       if (r2 < 0) { return r2; }
+    var r3 = _udiv_op(m, MIR_OP_FMUL, f, r2, 0x4F7FFFFE, 0, MIR_FLAG_B_IMM); if (r3 < 0) { return r3; }
+    var r4 = _udiv_op(m, MIR_OP_CVT_U_F32, u, r3, 0, 0, 0);       if (r4 < 0) { return r4; }
+    var t1 = _udiv_op(m, MIR_OP_ISUB, u, 0, dc, 0, MIR_FLAG_A_IMM); if (t1 < 0) { return t1; }
+    var t2 = _udiv_op(m, MIR_OP_IMUL, u, t1, r4, 0, 0);          if (t2 < 0) { return t2; }
+    var t3 = _udiv_op(m, MIR_OP_MUL_HI, u, r4, t2, 0, 0);        if (t3 < 0) { return t3; }
+    var r5 = _udiv_op(m, MIR_OP_IADD, u, r4, t3, 0, 0);          if (r5 < 0) { return r5; }
+    var q1 = _udiv_op(m, MIR_OP_MUL_HI, u, nc, r5, 0, 0);        if (q1 < 0) { return q1; }
+    var t4 = _udiv_op(m, MIR_OP_IMUL, u, q1, dc, 0, 0);          if (t4 < 0) { return t4; }
+    var m1 = _udiv_op(m, MIR_OP_ISUB, u, nc, t4, 0, 0);          if (m1 < 0) { return m1; }
+    var s1 = _udiv_op(m, MIR_OP_IADD, u, q1, 1, 0, MIR_FLAG_B_IMM); if (s1 < 0) { return s1; }
+    var c1 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m1, dc, 0, 0);      if (c1 < 0) { return c1; }
+    var t5 = _udiv_op(m, MIR_OP_ISUB, u, m1, dc, 0, 0);          if (t5 < 0) { return t5; }
+    var q2 = _udiv_op(m, MIR_OP_CNDMASK, u, q1, s1, 0, 0);       if (q2 < 0) { return q2; }
+    var m2 = _udiv_op(m, MIR_OP_CNDMASK, u, m1, t5, 0, 0);       if (m2 < 0) { return m2; }
+    store64(out + 0, dc);
+    store64(out + 8, nc);
+    store64(out + 16, q2);
+    store64(out + 24, m2);
+    return 0;
+}
+
+# OpUDiv: the core + the quotient's correction-2 (q+1 when m2>=D), then a divide-by-zero
+# guard pinning a deterministic 0xFFFFFFFF (the bare macro yields a-derived garbage; the
+# common GPU all-ones convention — N.9b-2).
+fn _spirv_lower_udiv(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var co[32];
+    var rc = _udiv_core(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var q2 = load64(&co + 16);
+    var m2 = load64(&co + 24);
+    var u = MIR_T_U32;
+    var s2 = _udiv_op(m, MIR_OP_IADD, u, q2, 1, 0, MIR_FLAG_B_IMM); if (s2 < 0) { return s2; }
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);      if (c2 < 0) { return c2; }
+    var qf = _udiv_op(m, MIR_OP_CNDMASK, u, q2, s2, 0, 0);       if (qf < 0) { return qf; }
+    var ones = _udiv_op(m, MIR_OP_VMOV, u, 0xFFFFFFFF, 0, 0, MIR_FLAG_A_IMM); if (ones < 0) { return ones; }
+    var cz = _udiv_op(m, MIR_OP_ICMP_EQ, u, 0, dc, 0, MIR_FLAG_A_IMM);  if (cz < 0) { return cz; }
+    var er = mir_emit(m, MIR_OP_CNDMASK, result, u, qf, ones, 0, 0);  # (dc==0) ? ones : qf
+    if (er < 0) { return er; }
+    return 0;
+}
+
+# OpUMod: the same core, then the REMAINDER's correction-2 (m2-D when m2>=D). Divide-by-
+# zero → r = N (the dividend) — the standard remainder-of-zero convention (N.9c).
+fn _spirv_lower_umod(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var co[32];
+    var rc = _udiv_core(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var nc = load64(&co + 8);
+    var m2 = load64(&co + 24);
+    var u = MIR_T_U32;
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);      if (c2 < 0) { return c2; }
+    var t6 = _udiv_op(m, MIR_OP_ISUB, u, m2, dc, 0, 0);          if (t6 < 0) { return t6; }
+    var mf = _udiv_op(m, MIR_OP_CNDMASK, u, m2, t6, 0, 0);       if (mf < 0) { return mf; }
+    var cz = _udiv_op(m, MIR_OP_ICMP_EQ, u, 0, dc, 0, MIR_FLAG_A_IMM);  if (cz < 0) { return cz; }
+    var er = mir_emit(m, MIR_OP_CNDMASK, result, u, mf, nc, 0, 0);  # (dc==0) ? nc : mf
+    if (er < 0) { return er; }
+    return 0;
+}
+
+# Signed-division prep: sign masks (ASHR 31 → 0 or 0xFFFFFFFF) + magnitudes via the
+# branchless abs (x^sign)-sign. Writes [signA, signB, absA, absB] into out (N.9d).
+fn _signed_prep(m, a, b, out): i64 {
+    var u = MIR_T_U32;
+    var sa = _udiv_op(m, MIR_OP_ASHR, u, a, 31, 0, MIR_FLAG_B_IMM);  if (sa < 0) { return sa; }
+    var sb = _udiv_op(m, MIR_OP_ASHR, u, b, 31, 0, MIR_FLAG_B_IMM);  if (sb < 0) { return sb; }
+    var xa = _udiv_op(m, MIR_OP_XOR, u, a, sa, 0, 0);               if (xa < 0) { return xa; }
+    var aa = _udiv_op(m, MIR_OP_ISUB, u, xa, sa, 0, 0);             if (aa < 0) { return aa; }
+    var xb = _udiv_op(m, MIR_OP_XOR, u, b, sb, 0, 0);               if (xb < 0) { return xb; }
+    var ab = _udiv_op(m, MIR_OP_ISUB, u, xb, sb, 0, 0);            if (ab < 0) { return ab; }
+    store64(out + 0, sa);
+    store64(out + 8, sb);
+    store64(out + 16, aa);
+    store64(out + 24, ab);
+    return 0;
+}
+
+# OpSDiv (135): truncated signed division (toward zero). Sign-magnitude wrapper — run the
+# unsigned quotient on |a|/|b|, then apply the result sign (signA ⊕ signB) via (q^rs)-rs.
+# Div-by-zero / INT_MIN/-1 are UB in SPIR-V (the value is pinned in the HW test).
+fn _spirv_lower_sdiv(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var u = MIR_T_U32;
+    var sp[32];
+    var rp = _signed_prep(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &sp);
+    if (rp < 0) { return rp; }
+    var sa = load64(&sp + 0);
+    var sb = load64(&sp + 8);
+    var co[32];
+    var rc = _udiv_core(m, load64(&sp + 16), load64(&sp + 24), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var q2 = load64(&co + 16);
+    var m2 = load64(&co + 24);
+    var s2 = _udiv_op(m, MIR_OP_IADD, u, q2, 1, 0, MIR_FLAG_B_IMM); if (s2 < 0) { return s2; }
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);        if (c2 < 0) { return c2; }
+    var qf = _udiv_op(m, MIR_OP_CNDMASK, u, q2, s2, 0, 0);         if (qf < 0) { return qf; }
+    var rs = _udiv_op(m, MIR_OP_XOR, u, sa, sb, 0, 0);            if (rs < 0) { return rs; }
+    var xq = _udiv_op(m, MIR_OP_XOR, u, qf, rs, 0, 0);            if (xq < 0) { return xq; }
+    var er = mir_emit(m, MIR_OP_ISUB, result, u, xq, rs, 0, 0);    # (qf ^ rs) - rs
+    if (er < 0) { return er; }
+    return 0;
+}
+
+# OpSRem (138): signed remainder, sign of the DIVIDEND (C `%`). Unsigned remainder of the
+# magnitudes, then apply signA via (r^signA)-signA.
+fn _spirv_lower_srem(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var u = MIR_T_U32;
+    var sp[32];
+    var rp = _signed_prep(m, spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), &sp);
+    if (rp < 0) { return rp; }
+    var sa = load64(&sp + 0);
+    var co[32];
+    var rc = _udiv_core(m, load64(&sp + 16), load64(&sp + 24), &co);
+    if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var m2 = load64(&co + 24);
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);        if (c2 < 0) { return c2; }
+    var t6 = _udiv_op(m, MIR_OP_ISUB, u, m2, dc, 0, 0);            if (t6 < 0) { return t6; }
+    var mf = _udiv_op(m, MIR_OP_CNDMASK, u, m2, t6, 0, 0);         if (mf < 0) { return mf; }
+    var xr = _udiv_op(m, MIR_OP_XOR, u, mf, sa, 0, 0);            if (xr < 0) { return xr; }
+    var er = mir_emit(m, MIR_OP_ISUB, result, u, xr, sa, 0, 0);    # (r ^ signA) - signA
+    if (er < 0) { return er; }
+    return 0;
+}
+
+# OpSMod (139): floored modulo, sign of the DIVISOR. Compute the truncated remainder (srem,
+# sign of dividend), then the floored fixup: when srem != 0 AND the operand signs differ, add
+# the divisor (two chained CNDMASKs gate the add → adj = b iff both hold; else adj = 0).
+fn _spirv_lower_smod(ptr, off, wc, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var result = spirv_word(ptr, off + 2);
+    var aa_id = spirv_word(ptr, off + 3);
+    var bb_id = spirv_word(ptr, off + 4);
+    var u = MIR_T_U32;
+    var bc = _udiv_op(m, MIR_OP_VMOV, u, bb_id, 0, 0, 0);          if (bc < 0) { return bc; }
+    var sp[32];
+    var rp = _signed_prep(m, aa_id, bb_id, &sp);                   if (rp < 0) { return rp; }
+    var sa = load64(&sp + 0);
+    var sb = load64(&sp + 8);
+    var co[32];
+    var rc = _udiv_core(m, load64(&sp + 16), load64(&sp + 24), &co);  if (rc < 0) { return rc; }
+    var dc = load64(&co + 0);
+    var m2 = load64(&co + 24);
+    # unsigned remainder of the magnitudes, then srem = (r ^ signA) - signA
+    var c2 = _udiv_op(m, MIR_OP_ICMP_UGE, u, m2, dc, 0, 0);        if (c2 < 0) { return c2; }
+    var t6 = _udiv_op(m, MIR_OP_ISUB, u, m2, dc, 0, 0);            if (t6 < 0) { return t6; }
+    var mf = _udiv_op(m, MIR_OP_CNDMASK, u, m2, t6, 0, 0);         if (mf < 0) { return mf; }
+    var xr = _udiv_op(m, MIR_OP_XOR, u, mf, sa, 0, 0);            if (xr < 0) { return xr; }
+    var sr = _udiv_op(m, MIR_OP_ISUB, u, xr, sa, 0, 0);           if (sr < 0) { return sr; }
+    # floored fixup: adj = (signs differ AND sr != 0) ? b : 0 ; smod = sr + adj
+    var rs = _udiv_op(m, MIR_OP_XOR, u, sa, sb, 0, 0);            if (rs < 0) { return rs; }
+    var zv = _udiv_op(m, MIR_OP_VMOV, u, 0, 0, 0, MIR_FLAG_A_IMM); if (zv < 0) { return zv; }
+    var cd = _udiv_op(m, MIR_OP_ICMP_NE, u, 0, rs, 0, MIR_FLAG_A_IMM);  if (cd < 0) { return cd; }
+    var bs = _udiv_op(m, MIR_OP_CNDMASK, u, zv, bc, 0, 0);         if (bs < 0) { return bs; }
+    var cr = _udiv_op(m, MIR_OP_ICMP_NE, u, 0, sr, 0, MIR_FLAG_A_IMM);  if (cr < 0) { return cr; }
+    var aj = _udiv_op(m, MIR_OP_CNDMASK, u, zv, bs, 0, 0);         if (aj < 0) { return aj; }
+    var er = mir_emit(m, MIR_OP_IADD, result, u, sr, aj, 0, 0);    # sr + adj
+    if (er < 0) { return er; }
+    return 0;
+}
+
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
     # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
@@ -448,6 +650,13 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         return 0;
     }
     # Integer comparisons → ICMP (a bool result the COND_BRANCH consumes). The
+    # OpUDiv / OpUMod / OpSDiv / OpSRem expand to the float-reciprocal macro (no GFX9
+    # integer divide); signed ops wrap it in a sign-magnitude shell. N.9b/c/d.
+    if (op == SPIRV_OP_UDIV) { return _spirv_lower_udiv(ptr, off, wc, m); }
+    if (op == SPIRV_OP_UMOD) { return _spirv_lower_umod(ptr, off, wc, m); }
+    if (op == SPIRV_OP_SDIV) { return _spirv_lower_sdiv(ptr, off, wc, m); }
+    if (op == SPIRV_OP_SREM) { return _spirv_lower_srem(ptr, off, wc, m); }
+    if (op == SPIRV_OP_SMOD) { return _spirv_lower_smod(ptr, off, wc, m); }
     # SPIR-V result type is OpTypeBool (not a scalar _mir_lower_type recognizes); the
     # bool is realized as SCC in isel, so a fixed MIR_T_U32 (0/1) suffices here.
     var cop = _spirv_cmp_to_mir(op);

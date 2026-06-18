@@ -38,12 +38,14 @@ they land.
 | 3.2.5   | **N** (1) | Native SPIR-V→GFX9 compiler: encoder-lift + byte-oracle, SPIR-V parser (N.0–1). | 256 (no slot) |
 | 3.2.6   | **N** (2) | MIR + uniformity lowering, instruction selection f32/i32 (N.2–3). | — |
 | 3.2.7   | **N** (3) | Register allocation + waitcnt, encode + **downsample byte-oracle MVP** (N.4–5). | — |
-| 3.2.8   | **N** (4) | First novel kernel / SAXPY, control flow (N.6–7). | — |
-| 3.2.9   | **N** (5) | Op breadth + vectors + generic dispatcher (N.8). Native SPIR-V **f32 compiler complete**. | — |
-| 3.2.10  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
-| 3.2.11  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
-| 3.2.12  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
-| 3.2.13  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
+| 3.2.8   | **N** (4) | Control flow + op breadth (N.7–8): uniform/divergent `if`, GLSL math, signed compares, VOP3-literal/inline/store/const-fold constants. Scalar SPIR-V **f32/i32 compiler complete**. | — |
+| 3.2.9   | **N** (5) | Int div/mod (N.9): no HW integer divide → float-reciprocal macro. OpUDiv/UMod/SDiv/SRem/SMod, all HW-verified on Cezanne. | — |
+| 3.2.10  | **N** (6) | Vectors (N.10): component-wise vec2/3/4 ops. | — |
+| 3.2.11  | **N** (7) | Per-ext-set tracking (N.11): verify `OpExtInst` set is GLSL.std.450. | — |
+| 3.2.12  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
+| 3.2.13  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
+| 3.2.14  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
+| 3.2.15  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
 
 `BACKEND_SIZE` / slot offsets are append-after-KIND in **landing order**;
 the absolute `+N` in each proposal is nominal and finalized per the order
@@ -797,8 +799,36 @@ hand-authored shaders stay as oracle + fallback.
     HW-verified on Cezanne (`native_spirv_const_fold_e2e.cyr`, `gid.x+6*7`). +14 asserts;
     the gid-kernel fixtures' `1<<2` now folds (tests updated) + uniform-SALU coverage moved
     to `test_gfx9_regalloc_uniform_salu`. **→ ready to cut 3.2.8.**
-  - [ ] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide; lower UDiv/SDiv/
-    UMod/SMod via the reciprocal + Newton-Raphson correction expansion.
+  - [x] **N.9 *(3.2.9)* — int div/mod.** GFX9 has no integer divide → LLVM's float-
+    reciprocal **vector** udiv macro (19 loop-free instrs: cvt→rcp_iflag→×0x4F7FFFFE→cvt
+    →Newton(sub/mul_lo/mul_hi/add)→estimate(mul_hi/mul_lo/sub)→2 correction cmp+cndmask).
+    Design-verified over 5M+ pairs + ULP-perturbation (the magic constant biases the
+    reciprocal down so v_rcp's ≤1-ULP error can't overshoot; 2 +1 corrections repair the
+    underestimate). b=0 → 0xFFFFFFFF (natural saturate; pinned in the HW test).
+    - [x] **N.9a (2026-06-17) — encoders + oracle.** 5 opcode constants (cvt_f32_u32 0x06,
+      cvt_u32_f32 0x07, rcp_iflag_f32 0x23, mul_hi_u32 0x286, cndmask_b32 0x00), all
+      llvm-mc-verified, reusing existing encoders. +7 byte-oracle asserts.
+    - [x] **N.9b-1 (2026-06-18) — primitives plumbed.** 6 primitive ops (VMOV/CVT_F32_U/
+      CVT_U_F32/RCP_IFLAG/MUL_HI/CNDMASK) MIR→isel→emit; vector-only → uniformity-forced
+      DIVERGENT. Dedicated `_emit_cndmask` (VCC implicit, a=false/b=true). +10 byte asserts.
+    - [x] **N.9b-2 (2026-06-18) — OpUDiv macro + HW.** `_spirv_lower_udiv` expands OpUDiv to
+      the float-reciprocal vector macro (VMOV N/D → force VGPR; 19-op reciprocal; synth ids;
+      contiguous cmp/cndmask). b=0 → deterministic 0xFFFFFFFF guard (the natural saturate
+      is a-derived garbage — confirmed on HW, per design risk #1). `native_spirv_udiv_e2e.cyr`
+      value-exact on Cezanne over the edge matrix. Adversarial review + HW-stress.
+    - [x] **N.9c (2026-06-18) — u32 OpUMod (137).** Factored `_udiv_core` (shared by udiv);
+      umod applies the remainder's correction-2 + a b=0→N guard. udiv re-verified byte-
+      identical. `native_spirv_umod_e2e.cyr` value-exact on Cezanne + HW-stress.
+    - [x] **N.9d-1 (2026-06-18) — signed OpSDiv (135) + OpSRem (138).** `_signed_prep`
+      (ASHR-31 sign masks + branchless abs) → `_udiv_core` on magnitudes → sign-apply
+      (`signA⊕signB` for div, `signA` for rem). New `MIR_OP_ASHR` → `v_ashrrev_i32` 0x11 /
+      `s_ashr_i32` 0x20. HW-verified on Cezanne (8 signed cases each) + HW-stress.
+    - [x] **N.9d-2 (2026-06-18) — OpSMod (139), floored.** `_spirv_lower_smod` = SRem + the
+      floored fixup: two `ICMP_NE`-gated `CNDMASK`s add the divisor iff (remainder nonzero
+      AND signs differ), so the result follows the divisor's sign (GLSL `mod`). No new
+      encoders/isel — reuses VMOV/XOR/ASHR/ICMP_NE/CNDMASK/IADD/ISUB (37 MIR instrs).
+      `native_spirv_smod_e2e.cyr` value-exact on Cezanne (8-lane signed matrix) + the
+      `test_spirv_lower_smod` structural unit test. **→ 3.2.9 (int div/mod) COMPLETE.**
   - [ ] **N.10 *(3.2.10)* — vectors.** Component-wise vec2/3/4 ops (load/store/arith).
   - [ ] **N.11 *(3.2.11)* — per-ext-set tracking.** Track the OpExtInstImport id and
     verify each OpExtInst references the GLSL.std.450 set (drop the MVP assumption).
