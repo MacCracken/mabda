@@ -13,7 +13,19 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [Unreleased]
+## [3.2.9] — 2026-06-18
+
+The native **SPIR-V→GFX9 integer division & remainder** family — the full int div/mod set
+(`OpUDiv` / `OpUMod` / `OpSDiv` / `OpSRem` / `OpSMod`) compiled in-tree and HW-verified on
+Cezanne (**Phase N.9**). GFX9 has no integer-divide instruction, so unsigned division expands
+to LLVM's loop-free float-reciprocal **vector** macro (a Newton-refined reciprocal + two
+correction steps, the `0x4F7FFFFE` magic constant biasing the estimate down so `v_rcp`'s
+≤1-ULP error can't overshoot); `OpUMod` selects the corrected remainder from the shared
+`_udiv_core`; the signed ops wrap that core in a sign-magnitude shell (`_signed_prep` +
+sign re-application), and `OpSMod` adds a floored fixup so the result follows the divisor's
+sign. Every op is value-exact vs an independent CPU reference on real silicon (8-lane edge
+matrices + 32-lane HW-stress sweeps); every bite was adversarially reviewed. Toolchain pin
+6.2.21. (vectors and per-ext-set tracking are 3.2.10–3.2.11.)
 
 ### Added — Phase N.9d-2 (`OpSMod` — floored modulo; **3.2.9 int div/mod complete**)
 - **Floored modulo via SRem + a sign-aware fixup** (`src/spirv_lower.cyr`,

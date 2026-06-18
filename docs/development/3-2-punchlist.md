@@ -38,12 +38,14 @@ they land.
 | 3.2.5   | **N** (1) | Native SPIR-V→GFX9 compiler: encoder-lift + byte-oracle, SPIR-V parser (N.0–1). | 256 (no slot) |
 | 3.2.6   | **N** (2) | MIR + uniformity lowering, instruction selection f32/i32 (N.2–3). | — |
 | 3.2.7   | **N** (3) | Register allocation + waitcnt, encode + **downsample byte-oracle MVP** (N.4–5). | — |
-| 3.2.8   | **N** (4) | First novel kernel / SAXPY, control flow (N.6–7). | — |
-| 3.2.9   | **N** (5) | Op breadth + vectors + generic dispatcher (N.8). Native SPIR-V **f32 compiler complete**. | — |
-| 3.2.10  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
-| 3.2.11  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
-| 3.2.12  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
-| 3.2.13  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
+| 3.2.8   | **N** (4) | Control flow + op breadth (N.7–8): uniform/divergent `if`, GLSL math, signed compares, VOP3-literal/inline/store/const-fold constants. Scalar SPIR-V **f32/i32 compiler complete**. | — |
+| 3.2.9   | **N** (5) | Int div/mod (N.9): no HW integer divide → float-reciprocal macro. OpUDiv/UMod/SDiv/SRem/SMod, all HW-verified on Cezanne. | — |
+| 3.2.10  | **N** (6) | Vectors (N.10): component-wise vec2/3/4 ops. | — |
+| 3.2.11  | **N** (7) | Per-ext-set tracking (N.11): verify `OpExtInst` set is GLSL.std.450. | — |
+| 3.2.12  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
+| 3.2.13  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
+| 3.2.14  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
+| 3.2.15  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
 
 `BACKEND_SIZE` / slot offsets are append-after-KIND in **landing order**;
 the absolute `+N` in each proposal is nominal and finalized per the order
