@@ -708,8 +708,19 @@ hand-authored shaders stay as oracle + fallback.
     to `CMP_ERR_TABLE`. +8 asserts (per-builder reject + untouched canary +
     `gfx9_compile` over-capacity integration reject). Landed **before** the N.6
     remainder exposes this path through `gpu_shader_module_create`.
-- [ ] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
-  EXEC-mask); divergent-vs-uniform test matrix. May split into two bites.
+- [~] **N.7** *(3.2.8)* — Control flow (uniform `s_cbranch`; divergent
+  EXEC-mask); divergent-vs-uniform test matrix.
+  - [x] **N.7a (2026-06-17) — control-flow encoders + byte-oracle.** SOPP branches
+    (`s_branch`, `s_cbranch_scc0/scc1`, `s_cbranch_execz/execnz`), the new
+    `gfx9_enc_sopc` + u32 `s_cmp_*` (→ SCC), and the EXEC-mask ops
+    (`s_and_saveexec_b64` / `s_andn2_b64` / `s_or_b64` / `s_mov_b64`) — all
+    llvm-mc-verified, +14 asserts (`test_gfx9_enc_control_flow`).
+  - [ ] **N.7b — uniform `if` pipeline** — multi-block SPIR-V parse + MIR blocks +
+    branch terminators + comparison lowering (→ SCC) + isel + block layout/offset
+    resolution + cross-block (linear-scan over flattened forward blocks) regalloc +
+    an `if (wgid uniform) {...}` HW e2e on Cezanne.
+  - [ ] **N.7c — divergent `if`** — per-lane condition via `s_and_saveexec_b64` +
+    `s_cbranch_execz` skip + `s_or_b64` EXEC restore at the merge; divergent e2e.
 - [ ] **N.8** *(3.2.9)* — Op breadth + vectors + dispatcher polish. Native
   SPIR-V f32 compiler **complete**.
 

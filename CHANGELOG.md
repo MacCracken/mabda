@@ -15,7 +15,15 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-### Added — Phase N.6 remainder (2-D/TGID + timeline-queue + id_bound ceiling)
+### Added — Phase N.7a (control-flow encoders — the foundation)
+- **The GFX9 control-flow instruction encoders, all llvm-mc gfx900-verified.**
+  `src/gfx9_encode.cyr`: SOPP branches (`s_branch`, `s_cbranch_scc0/scc1` — the
+  uniform path; `s_cbranch_execz/execnz` — the divergent path), a new `gfx9_enc_sopc`
+  scalar-compare encoder + the u32 `s_cmp_*` opcodes (set SCC), and the 64-bit
+  EXEC-mask ops (`s_and_saveexec_b64`, `s_andn2_b64`, `s_or_b64`, `s_mov_b64`) for
+  divergent control flow. +14 byte-oracle asserts in `compiler.tcyr`. No pipeline yet
+  (the MIR/lower/isel/regalloc/layout wiring for an `if`/merge is N.7b–c) — this is the
+  verified-primitives bite, mirroring how N.0 lifted the base ISA before the compiler.
 - **A compiled SPIR-V kernel can now use a 2-D/3-D workgroup grid + 2-D/3-D
   LocalSize, HW-verified on Cezanne.** `programs/native_spirv_2d_dispatch_e2e.cyr`:
   `out[gid.y*4 + gid.x] = gid.x*16 + gid.y` over a 2×2 workgroup grid × 2×2 LocalSize
