@@ -755,9 +755,14 @@ hand-authored shaders stay as oracle + fallback.
     via `v_mov_b32`, then used; rsrc1 VGPR count bumped only when materializing
     (non-materializing kernels byte-identical). `native_spirv_mul_literal_e2e.cyr`
     HW-verified on Cezanne. +7 asserts. Two-literal VOP3 still fails loud (const-fold).
-  - [ ] **N.8b — remaining op breadth.** const-fold for two-literal ops; any missing
-    SPIR-V ALU/convert ops; vector (vec2/3/4) ops; dispatcher polish. Then "native
-    SPIR-V f32 compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
+  - [x] **N.8b-1 (2026-06-17) — GLSL.std.450 math.** `OpExtInst` front end (assumes the
+    GLSL.std.450 set): FMin/FMax → `v_min_f32`/`v_max_f32` (VOP2), Sqrt → `v_sqrt_f32`
+    (VOP1); unknown numbers fail loud. `native_spirv_glsl_max_e2e.cyr` HW-verified on
+    Cezanne (exact f32). +17 asserts (lower parse + emit byte-exact).
+  - [ ] **N.8b-2 — remaining op breadth.** More GLSL math (FAbs/Floor/Fma/FMin-int
+    peers); signed int compares (SLT/SGT) + div/mod; const-fold two-literal ops; vector
+    (vec2/3/4) ops; per-ext-set tracking; dispatcher polish. Then "native SPIR-V f32
+    compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
 
 ---
 

@@ -1992,6 +1992,113 @@ fn test_gfx9_emit_vop3_literal_materialize() {
     return 0;
 }
 
+# N.8b — the OpExtInst front end: GLSL.std.450 FMax/Sqrt lower to MIR float ops; an
+# unsupported ext-instruction number fails loud. The instruction sits at word 5 (after
+# the 5-word header, whose id_bound at word 3 bounds the result-type lookup).
+fn test_spirv_lower_glsl_extinst() {
+    var buf[256];
+    memset(&buf, 0, 256);
+    store32(&buf + 12, 20);                # header id_bound (word 3)
+    store32(&buf + 20, (7 << 16) | 12);    # word5: OpExtInst, wc 7
+    store32(&buf + 24, 3);                 # result type = %3 (float)
+    store32(&buf + 28, 10);                # result id
+    store32(&buf + 32, 1);                 # ext set id
+    store32(&buf + 36, 40);                # GLSL.std.450 FMax
+    store32(&buf + 40, 4);                 # operand 0
+    store32(&buf + 44, 5);                 # operand 1
+    var types[480];
+    memset(&types, 0, 480);
+    store64(&types + 3 * 24 + 0, SPIRV_TYK_FLOAT);
+    store64(&types + 3 * 24 + 8, 32);
+    var consts[8];
+    var deco[8];
+    var lsz[24];
+    memset(&lsz, 0, 24);
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m, &lsz), 0,
+    "FMax extinst lowers");
+    assert_eq(mir_n_instrs(&m), 1, "one MIR instr");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_FMAX, "op = FMAX");
+    assert_eq(mir_instr_a(&m, 0), 4, "operand a = %4");
+    assert_eq(mir_instr_b(&m, 0), 5, "operand b = %5");
+    assert_eq(mir_instr_result(&m, 0), 10, "result = %10");
+    # Sqrt is unary (wc 6, one operand).
+    store32(&buf + 20, (6 << 16) | 12);
+    store32(&buf + 36, 31);                # GLSL.std.450 Sqrt
+    var m2[80];
+    var vals2[640];
+    var instrs2[512];
+    var ptrs2[64];
+    var blocks2[32];
+    mir_mod_init(&m2, &vals2, &instrs2, &ptrs2, &blocks2, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m2, &lsz), 0,
+    "Sqrt extinst lowers");
+    assert_eq(mir_instr_op(&m2, 0), MIR_OP_FSQRT, "op = FSQRT");
+    assert_eq(mir_instr_a(&m2, 0), 4, "sqrt operand = %4");
+    # An unsupported GLSL ext instruction fails loud (not silently dropped).
+    store32(&buf + 20, (7 << 16) | 12);
+    store32(&buf + 36, 99);
+    var m3[80];
+    var vals3[640];
+    var instrs3[512];
+    var ptrs3[64];
+    var blocks3[32];
+    mir_mod_init(&m3, &vals3, &instrs3, &ptrs3, &blocks3, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m3, &lsz) < 0, 1,
+    "unsupported ext instruction fails loud");
+    return 0;
+}
+
+# N.8b — GLSL.std.450 math: FMin/FMax are VOP2 (v_min_f32/v_max_f32), Sqrt is VOP1
+# (v_sqrt_f32). Leading EXTRACTs put the operands in v3/v4 (real VGPRs). The operand
+# "type" doesn't change the encoding (the regs are just bits). Bytes are llvm-mc truth.
+fn test_gfx9_emit_glsl_math() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # operand a → v3
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # operand b → v4
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # min → v5
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # max → v6
+    _mir_set_val(&m, 13, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # sqrt → v7
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);  # v3 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_EXTRACT, 10, 8, 0, 0, MIR_FLAG_C_IMM); # v4 = LID.x (v0)
+    _gisel_emit(&isel, 2, GISEL_V_MIN_F32, 11, 9, 10, 0, 0);
+    _gisel_emit(&isel, 3, GISEL_V_MAX_F32, 12, 9, 10, 0, 0);
+    _gisel_emit(&isel, 4, GISEL_V_SQRT_F32, 13, 9, 0, 0, 0);
+    _gisel_emit(&isel, 5, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 3);
+    store64(&alloc + 10 * 16, 4);
+    store64(&alloc + 11 * 16, 5);
+    store64(&alloc + 12 * 16, 6);
+    store64(&alloc + 13 * 16, 7);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0);
+    assert_eq(endp, 24, "glsl-math program end at 24 bytes");
+    assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
+    assert_eq(load32(&built + 4), 0x7E080300, "v_mov v4, v0");
+    assert_eq(load32(&built + 8), 0x140A0903, "v_min_f32 v5, v3, v4");
+    assert_eq(load32(&built + 12), 0x160C0903, "v_max_f32 v6, v3, v4");
+    assert_eq(load32(&built + 16), 0x7E0E4F03, "v_sqrt_f32 v7, v3");
+    assert_eq(load32(&built + 20), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
 # N.5b-2 review: the FLAT emitters must FAIL LOUD on the operand shapes they do
 # not yet handle (see docs/development/3-2-punchlist.md), rather than emitting
 # v255 / an SGPR index / a wrapped binding.
@@ -2862,6 +2969,8 @@ fn main(): i64 {
     test_gfx9_abi_assign_2d();
     test_gfx9_emit_flat_vop3();
     test_gfx9_emit_vop3_literal_materialize();
+    test_spirv_lower_glsl_extinst();
+    test_gfx9_emit_glsl_math();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();
     test_gfx9_isel_extract_unknown_unif();

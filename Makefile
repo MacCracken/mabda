@@ -364,6 +364,16 @@ build/native_spirv_mul_literal_e2e: programs/native_spirv_mul_literal_e2e.cyr sr
 test-native-spirv-mul-literal-e2e: build/native_spirv_mul_literal_e2e
 	./build/native_spirv_mul_literal_e2e
 
+# N.8b: a compiled SPIR-V kernel using a GLSL.std.450 OpExtInst (`max(float(gid.x),
+# 4.0)`) — the ext-instruction front end → v_max_f32. HW-verified on Cezanne.
+build/native_spirv_glsl_max_e2e: programs/native_spirv_glsl_max_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_glsl_max_e2e.cyr $@
+
+.PHONY: test-native-spirv-glsl-max-e2e
+test-native-spirv-glsl-max-e2e: build/native_spirv_glsl_max_e2e
+	./build/native_spirv_glsl_max_e2e
+
 # v3.2 T.8 — native block-compressed texture STORAGE round-trip (BC1 + BC7
 # write -> read byte-identical on Cezanne; block-aware n guard). HW-gated.
 build/native_compressed_store_e2e: programs/native_compressed_store_e2e.cyr src/*.cyr

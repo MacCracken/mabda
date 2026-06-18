@@ -15,6 +15,19 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-1 (GLSL.std.450 math — `OpExtInst` min/max/sqrt)
+- **The GLSL.std.450 ext-instruction front end** — `OpExtInst` now lowers (it was
+  unhandled). `src/spirv_lower.cyr`: `FMin`/`FMax` → `MIR_OP_FMIN`/`FMAX` (binary),
+  `Sqrt` → `MIR_OP_FSQRT` (unary); unsupported instruction numbers fail loud. The MVP
+  assumes the imported set is GLSL.std.450 (per-set tracking is N.8b+).
+- `src/gfx9_isel.cyr` / `src/gfx9_encode.cyr` / `src/gfx9_compile.cyr` — `v_min_f32`
+  / `v_max_f32` (VOP2) + `v_sqrt_f32` (VOP1), all llvm-mc gfx900-verified; the result is
+  always VALU (float), uniformity is the generic operand meet (no special-casing).
+- `programs/native_spirv_glsl_max_e2e.cyr` — `out[gid.x] = max(float(gid.x), 4.0)`
+  compiles + runs on Cezanne; the f32 bit patterns match exactly (`max` is exact). +17
+  asserts: `test_spirv_lower_glsl_extinst` (the CI-visible parse of FMax/Sqrt + fail-loud
+  on an unknown number) and `test_gfx9_emit_glsl_math` (byte-exact min/max/sqrt).
+
 ### Added — Phase N.8a (VOP3-literal materialization — `gid * 100` compiles)
 - **A VALU multiply (or any VOP3a op) by a non-inline constant now compiles + runs on
   Cezanne** — `programs/native_spirv_mul_literal_e2e.cyr`: `out[gid.x] = gid.x * 100`
