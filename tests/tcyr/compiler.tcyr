@@ -1796,7 +1796,8 @@ fn test_gfx9_emit_errors() {
     memset(&abi, 0, 64);
     # an unsupported op (V_FMA_F32 is VOP3 3-src, lands in a later bite; see docs/development/3-2-punchlist.md)
     var isel[120];
-    _gisel_emit(&isel, 0, GISEL_V_FMA_F32, 20, 0, 0, 0, 0);
+    # 200 is not a defined GISEL op → _cmp_emit_one falls through to fail loud.
+    _gisel_emit(&isel, 0, 200, 20, 0, 0, 0, 0);
     assert_eq(gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0), 0 - CMP_ERR_UNSUPPORTED_OP, "unsupported op");
     # a builtin operand (ABI resolution is N.5c): bootstrap %20 as a VGPR in-list,
     # then add a builtin — the resolve of %5 fails loud.
@@ -2051,6 +2052,34 @@ fn test_spirv_lower_glsl_extinst() {
     mir_mod_init(&m3, &vals3, &instrs3, &ptrs3, &blocks3, 16, 2, 20, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m3, &lsz) < 0, 1,
     "unsupported ext instruction fails loud");
+    # Floor is unary (wc 6).
+    store32(&buf + 20, (6 << 16) | 12);
+    store32(&buf + 36, 8);                 # GLSL.std.450 Floor
+    var m4[80];
+    var vals4[640];
+    var instrs4[512];
+    var ptrs4[64];
+    var blocks4[32];
+    mir_mod_init(&m4, &vals4, &instrs4, &ptrs4, &blocks4, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m4, &lsz), 0,
+    "Floor extinst lowers");
+    assert_eq(mir_instr_op(&m4, 0), MIR_OP_FFLOOR, "op = FFLOOR");
+    # Fma is ternary (wc 8, three operands at +5/+6/+7).
+    store32(&buf + 20, (8 << 16) | 12);
+    store32(&buf + 36, 50);                # GLSL.std.450 Fma
+    store32(&buf + 48, 6);                 # operand 2 (word 12)
+    var m5[80];
+    var vals5[640];
+    var instrs5[512];
+    var ptrs5[64];
+    var blocks5[32];
+    mir_mod_init(&m5, &vals5, &instrs5, &ptrs5, &blocks5, 16, 2, 20, 20);
+    assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m5, &lsz), 0,
+    "Fma extinst lowers");
+    assert_eq(mir_instr_op(&m5, 0), MIR_OP_FMA, "op = FMA");
+    assert_eq(mir_instr_a(&m5, 0), 4, "fma a = %4");
+    assert_eq(mir_instr_b(&m5, 0), 5, "fma b = %5");
+    assert_eq(mir_instr_c(&m5, 0), 6, "fma c = %6");
     return 0;
 }
 
@@ -2096,6 +2125,51 @@ fn test_gfx9_emit_glsl_math() {
     assert_eq(load32(&built + 12), 0x160C0903, "v_max_f32 v6, v3, v4");
     assert_eq(load32(&built + 16), 0x7E0E4F03, "v_sqrt_f32 v7, v3");
     assert_eq(load32(&built + 20), 0xBF810000, "s_endpgm");
+    return 0;
+}
+
+# N.8b-2 — GLSL.std.450 Fma is VOP3 3-src (v_fma_f32), Floor is VOP1 (v_floor_f32).
+# Leading EXTRACTs put the operands in v1/v2/v3. Bytes are llvm-mc gfx900 truth.
+fn test_gfx9_emit_glsl_fma_floor() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[512];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # → v1
+    _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v2
+    _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v3
+    _mir_set_val(&m, 12, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # fma → v5
+    _mir_set_val(&m, 13, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # floor → v6
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_EXTRACT, 9, 8, 0, 0, MIR_FLAG_C_IMM);   # v1 = LID.x (v0)
+    _gisel_emit(&isel, 1, GISEL_EXTRACT, 10, 8, 0, 0, MIR_FLAG_C_IMM);  # v2 = LID.x (v0)
+    _gisel_emit(&isel, 2, GISEL_EXTRACT, 11, 8, 0, 0, MIR_FLAG_C_IMM);  # v3 = LID.x (v0)
+    _gisel_emit(&isel, 3, GISEL_V_FMA_F32, 12, 9, 10, 11, 0);           # v5 = v1*v2+v3
+    _gisel_emit(&isel, 4, GISEL_V_FLOOR_F32, 13, 11, 0, 0, 0);          # v6 = floor(v3)
+    _gisel_emit(&isel, 5, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[512];
+    memset(&alloc, 0xFF, 30 * 16);
+    store64(&alloc + 9 * 16, 1);
+    store64(&alloc + 10 * 16, 2);
+    store64(&alloc + 11 * 16, 3);
+    store64(&alloc + 12 * 16, 5);
+    store64(&alloc + 13 * 16, 6);
+    var built[256];
+    memset(&built, 0, 256);
+    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0);
+    assert_eq(endp, 28, "fma/floor program end at 28 bytes");
+    assert_eq(load32(&built + 0), 0x7E020300, "v_mov v1, v0");
+    assert_eq(load32(&built + 4), 0x7E040300, "v_mov v2, v0");
+    assert_eq(load32(&built + 8), 0x7E060300, "v_mov v3, v0");
+    assert_eq(load32(&built + 12), 0xD1CB0005, "v_fma_f32 v5,v1,v2,v3 lo");
+    assert_eq(load32(&built + 16), 0x040E0501, "v_fma_f32 hi (v1,v2,v3)");
+    assert_eq(load32(&built + 20), 0x7E0C3F03, "v_floor_f32 v6, v3");
+    assert_eq(load32(&built + 24), 0xBF810000, "s_endpgm");
     return 0;
 }
 
@@ -2971,6 +3045,7 @@ fn main(): i64 {
     test_gfx9_emit_vop3_literal_materialize();
     test_spirv_lower_glsl_extinst();
     test_gfx9_emit_glsl_math();
+    test_gfx9_emit_glsl_fma_floor();
     test_gfx9_flat_review_guards();
     test_gfx9_emit_extract_lid();
     test_gfx9_isel_extract_unknown_unif();

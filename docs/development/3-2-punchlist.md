@@ -759,10 +759,18 @@ hand-authored shaders stay as oracle + fallback.
     GLSL.std.450 set): FMin/FMax → `v_min_f32`/`v_max_f32` (VOP2), Sqrt → `v_sqrt_f32`
     (VOP1); unknown numbers fail loud. `native_spirv_glsl_max_e2e.cyr` HW-verified on
     Cezanne (exact f32). +17 asserts (lower parse + emit byte-exact).
-  - [ ] **N.8b-2 — remaining op breadth.** More GLSL math (FAbs/Floor/Fma/FMin-int
-    peers); signed int compares (SLT/SGT) + div/mod; const-fold two-literal ops; vector
-    (vec2/3/4) ops; per-ext-set tracking; dispatcher polish. Then "native SPIR-V f32
-    compiler complete." (Loops / `OpPhi` / nested ifs stay fail-loud.)
+  - [x] **N.8b-2 (2026-06-17) — GLSL Floor + ternary Fma.** `Floor` → `v_floor_f32`
+    (VOP1); `Fma` → `v_fma_f32` (VOP3 3-src via the new `_emit_vop3_3src`; the ext-inst
+    handler gained ternary arity). `native_spirv_fma_e2e.cyr` HW-verified on Cezanne
+    (gid²+gid, exact f32). +15 asserts. A non-inline FLOAT const in a VOP3 fails loud.
+  - [ ] **N.8b-3 — float inline constants.** Map the GFX9 inline float codes
+    (0.5→240, 1.0→242, 2.0→244, 4.0→246, ±) so `fma(x,2.0,1.0)` / FADD/FMUL with float
+    consts compile without materialization. NOTE: this re-touches the downsample
+    `×0.25` emit (literal → inline) → re-verify its RSRC/byte oracle.
+  - [ ] **N.8b-4 — remaining op breadth.** GLSL FAbs/FClamp/etc.; signed int compares
+    (SLT/SGT) + div/mod; const-fold two-literal ops; vector (vec2/3/4) ops; per-ext-set
+    tracking; dispatcher polish. Then "native SPIR-V f32 compiler complete." (Loops /
+    `OpPhi` / nested ifs stay fail-loud.)
 
 ---
 

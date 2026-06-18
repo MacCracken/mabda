@@ -5113,6 +5113,7 @@ var GFX9_VOP1_V_MOV_B32     = 0x01;
 var GFX9_VOP1_V_CVT_F32_I32 = 0x05;
 var GFX9_VOP1_V_CVT_I32_F32 = 0x08;
 var GFX9_VOP1_V_SQRT_F32    = 0x27;   # GLSL.std.450 Sqrt (N.8b)
+var GFX9_VOP1_V_FLOOR_F32   = 0x1F;   # GLSL.std.450 Floor (N.8b)
 
 # VOP2 (single-dword) — bits 30-25 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_VOP2_V_ADD_F32     = 0x01;
@@ -5144,6 +5145,7 @@ var GFX9_VOP3_V_BFE_U32     = 0x1C8;
 var GFX9_VOP3_V_ADD3_U32    = 0x1FF;
 var GFX9_VOP3_V_OR3_B32     = 0x202;
 var GFX9_VOP3_V_MUL_LO_U32  = 0x285;   # VOP3-only on GFX9 (no VOP2 form); llvm-mc-verified
+var GFX9_VOP3_V_FMA_F32     = 0x1CB;   # GLSL.std.450 Fma (3-src); llvm-mc-verified
 
 # SOP2 (single-dword) — bits 29-23 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_SOP2_S_ADD_U32     = 0x00;
@@ -5800,6 +5802,8 @@ var MIR_OP_ICMP_UGE    = 27;
 var MIR_OP_FMIN        = 28;
 var MIR_OP_FMAX        = 29;
 var MIR_OP_FSQRT       = 30;
+var MIR_OP_FFLOOR      = 31;
+# (MIR_OP_FMA = 12, defined above; GLSL.std.450 Fma reaches it via the ExtInst front end.)
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6177,6 +6181,8 @@ var SPIRV_OP_ULESSTHANEQUAL      = 178;
 # MVP assumes the only imported ext set is GLSL.std.450 (the standard shader math
 # library); a non-GLSL set's number would map here too — acceptable until per-set
 # tracking (N.8b+). Sqrt is unary; FMin/FMax are binary.
+var GLSL_STD450_FLOOR            = 8;
+var GLSL_STD450_FMA              = 50;
 var GLSL_STD450_SQRT             = 31;
 var GLSL_STD450_FMIN             = 37;
 var GLSL_STD450_FMAX             = 40;
@@ -6545,11 +6551,18 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         var glsl = spirv_word(ptr, off + 4);
         var rid = spirv_word(ptr, off + 2);
         var x0 = spirv_word(ptr, off + 5);
+        # Unary: Sqrt, Floor.
         if (glsl == GLSL_STD450_SQRT) {
             var es = mir_emit(m, MIR_OP_FSQRT, rid, ety, x0, 0, 0, 0);
             if (es < 0) { return es; }
             return 0;
         }
+        if (glsl == GLSL_STD450_FLOOR) {
+            var ef = mir_emit(m, MIR_OP_FFLOOR, rid, ety, x0, 0, 0, 0);
+            if (ef < 0) { return ef; }
+            return 0;
+        }
+        # Binary: FMin, FMax.
         if (wc < 7) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var x1 = spirv_word(ptr, off + 6);
         if (glsl == GLSL_STD450_FMIN) {
@@ -6560,6 +6573,14 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         if (glsl == GLSL_STD450_FMAX) {
             var ex = mir_emit(m, MIR_OP_FMAX, rid, ety, x0, x1, 0, 0);
             if (ex < 0) { return ex; }
+            return 0;
+        }
+        # Ternary: Fma (a*b + c).
+        if (wc < 8) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var x2 = spirv_word(ptr, off + 7);
+        if (glsl == GLSL_STD450_FMA) {
+            var em = mir_emit(m, MIR_OP_FMA, rid, ety, x0, x1, x2, 0);
+            if (em < 0) { return em; }
             return 0;
         }
         return 0 - MIR_ERR_UNSUPPORTED_OP;
@@ -6729,6 +6750,7 @@ var GISEL_S_OR_EXEC       = 35;
 var GISEL_V_MIN_F32       = 36;
 var GISEL_V_MAX_F32       = 37;
 var GISEL_V_SQRT_F32      = 38;
+var GISEL_V_FLOOR_F32     = 39;
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -6816,6 +6838,7 @@ fn _gisel_float_op(mop): i64 {
     if (mop == MIR_OP_FMIN) { return GISEL_V_MIN_F32; }
     if (mop == MIR_OP_FMAX) { return GISEL_V_MAX_F32; }
     if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
+    if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
     return 0;
 }
 
@@ -7684,6 +7707,24 @@ fn _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, opc, scratch_vgpr): i64 
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0));
 }
 
+# VOP3a 3-source (e.g. v_fma_f32). All three operands resolve to VGPR/SGPR/inline; VOP3
+# has no literal form, so a non-inline constant operand fails loud (3-src materialization
+# is N.8b+). Most FMA operands are computed VGPRs, so this is rarely hit.
+fn _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(opc, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
+}
+
 # 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
 fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     if (is_imm != 0) {
@@ -7851,6 +7892,8 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_V_MIN_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MIN_F32, 0); }
     if (op == GISEL_V_MAX_F32) { return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_MAX_F32, 0); }
     if (op == GISEL_V_SQRT_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_SQRT_F32); }
+    if (op == GISEL_V_FLOOR_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_FLOOR_F32); }
+    if (op == GISEL_V_FMA_F32) { return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32); }
     if (op == GISEL_V_LSHLREV_B32) {
         return _emit_vop2(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP2_V_LSHLREV_B32, 1);
     }

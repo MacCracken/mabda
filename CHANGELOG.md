@@ -15,6 +15,21 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase N.8b-2 (GLSL.std.450 math — `Floor` + ternary `Fma`)
+- **`Floor` and `Fma` join the ext-instruction front end.** `src/spirv_lower.cyr`:
+  `Floor` → `MIR_OP_FFLOOR` (unary), `Fma` → `MIR_OP_FMA` (the ext-inst handler gained a
+  ternary arity, operand 2 at word 7). `Fma` reaches the long-scaffolded
+  `GISEL_V_FMA_F32`, which was mapped but never emitted before.
+- `src/gfx9_compile.cyr` — `_emit_vop3_3src` (the VOP3 3-source emit, the encoder
+  already packed `src2`) + `v_floor_f32` (VOP1); both opcodes llvm-mc gfx900-verified.
+- `programs/native_spirv_fma_e2e.cyr` — `out[gid.x] = fma(float(gid.x), float(gid.x),
+  float(gid.x))` = gid²+gid runs on Cezanne, f32 bits exact. **A non-inline FLOAT
+  constant operand of a VOP3 (e.g. `fma(x, 2.0, 1.0)`) fails loud** — float-inline
+  encoding (1.0→242, 2.0→244) is N.8b-3 (it will also re-touch the downsample RSRC/byte
+  oracle, so it is its own bite). +15 asserts (`test_gfx9_emit_glsl_fma_floor` byte-exact;
+  the lowering test gained Floor + the ternary Fma parse). The stale "unsupported op"
+  emit sentinel (which used `V_FMA_F32`) now points at an invalid op number.
+
 ### Added — Phase N.8b-1 (GLSL.std.450 math — `OpExtInst` min/max/sqrt)
 - **The GLSL.std.450 ext-instruction front end** — `OpExtInst` now lowers (it was
   unhandled). `src/spirv_lower.cyr`: `FMin`/`FMax` → `MIR_OP_FMIN`/`FMAX` (binary),
