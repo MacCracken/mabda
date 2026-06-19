@@ -310,6 +310,16 @@ build/native_spirv_saxpy_e2e: programs/native_spirv_saxpy_e2e.cyr src/*.cyr
 test-native-spirv-saxpy-e2e: build/native_spirv_saxpy_e2e
 	./build/native_spirv_saxpy_e2e
 
+# v3.2 F.7e — the first COMPILED f64 on silicon: an f64 FMA SPIR-V kernel compiled in-tree
+# (gfx9_compile) + dispatched on Cezanne, bit-exact vs the fused-FMA reference.
+build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_fma_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-fma-e2e
+test-native-spirv-f64-fma-e2e: build/native_spirv_f64_fma_e2e
+	./build/native_spirv_f64_fma_e2e
+
 # N.5g: a 2x2 box-filter downsample compiled in-tree + dispatched on the GPU,
 # pixel-matched against a CPU box-filter (the named MVP-exit image kernel; 2
 # bindings src/dst, power-of-2 dims so index math is shifts/masks).

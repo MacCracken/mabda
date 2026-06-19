@@ -6710,12 +6710,16 @@ fn _spirv_lower_unary(ptr, off, wc, mop, types, m): i64 {
 # OpLoad: a load of a builtin variable aliases the result to the seeded builtin
 # value (no instruction); a load of a buffer pointer (an OpAccessChain result,
 # kind PTR) emits MIR_OP_LOAD referencing the ptr side-table record (a = off_id
-# OpLoad of a vecN element (N.10c): emit N scalar loads at consecutive 4-byte offsets
-# (off_id + j*4) into N consecutive component synths, then register the result vector. The
-# base byte offset (off_id, a VGPR) already accounts for the array index * element stride;
-# the per-component +j*4 is a synth IADD (j>0). The components are packed MIR_VK_VECTOR.
+# OpLoad of a vecN element (N.10c): emit N scalar loads at consecutive `esize`-byte offsets
+# (off_id + j*esize) into N consecutive component synths, then register the result vector. The
+# base byte offset (off_id, a VGPR) already accounts for the array index * element stride; the
+# per-component +j*esize is a synth IADD (j>0). esize = 4 for i32/f32 components, 8 for f64
+# (F.7e review: a hardcoded *4 mis-addressed f64 vec components, which are 8 bytes apart). The
+# components are packed MIR_VK_VECTOR. (HW-tested for f32 vec; f64 vec arrays land with breadth.)
 fn _spirv_lower_vec_load(m, result, elem, count, off_id, pidx): i64 {
     var base_ty = mir_type_base(elem);
+    var esize = 4;
+    if (base_ty == MIR_T_F64) { esize = 8; }
     var base = mir_alloc_synth_id(m);
     if (base < 0) { return 0 - MIR_ERR_ID_OOR; }
     var k = 1;
@@ -6732,7 +6736,7 @@ fn _spirv_lower_vec_load(m, result, elem, count, off_id, pidx): i64 {
         if (i > 0) {
             coff = mir_alloc_synth_id(m);
             if (coff < 0) { return 0 - MIR_ERR_ID_OOR; }
-            var ea = mir_emit(m, MIR_OP_IADD, coff, MIR_T_U32, off_id, i * 4, 0, MIR_FLAG_B_IMM);
+            var ea = mir_emit(m, MIR_OP_IADD, coff, MIR_T_U32, off_id, i * esize, 0, MIR_FLAG_B_IMM);
             if (ea < 0) { return ea; }
         }
         var e = mir_emit(m, MIR_OP_LOAD, base + i, base_ty, coff, pidx, 0, MIR_FLAG_B_IMM);
@@ -6743,18 +6747,21 @@ fn _spirv_lower_vec_load(m, result, elem, count, off_id, pidx): i64 {
     return mir_set_vector(m, result, elem, packed);
 }
 
-# OpStore of a vecN value to a vecN element (N.10c): N scalar stores of the packed components
-# at off_id + j*4. The value MUST be a matching-count vector (else fail loud).
+# OpStore of a vecN value to a vecN element (N.10c): N scalar stores of the packed components at
+# off_id + j*esize (esize = 4 for i32/f32, 8 for f64 — F.7e review). The value MUST be a
+# matching-count vector (else fail loud).
 fn _spirv_lower_vec_store(m, elem, count, off_id, pidx, value): i64 {
     if (mir_is_vector(m, value) != 1) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     if (mir_type_count(mir_val_type(m, value)) != count) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var esize = 4;
+    if (mir_type_base(elem) == MIR_T_F64) { esize = 8; }
     var i = 0;
     while (i < count) {
         var coff = off_id;
         if (i > 0) {
             coff = mir_alloc_synth_id(m);
             if (coff < 0) { return 0 - MIR_ERR_ID_OOR; }
-            var ea = mir_emit(m, MIR_OP_IADD, coff, MIR_T_U32, off_id, i * 4, 0, MIR_FLAG_B_IMM);
+            var ea = mir_emit(m, MIR_OP_IADD, coff, MIR_T_U32, off_id, i * esize, 0, MIR_FLAG_B_IMM);
             if (ea < 0) { return ea; }
         }
         var e = mir_emit(m, MIR_OP_STORE, 0, MIR_T_VOID, coff, pidx, mir_vec_comp(m, value, i), MIR_FLAG_B_IMM);
@@ -6843,15 +6850,17 @@ fn _spirv_lower_access_chain(ptr, off, wc, types, consts, deco, m): i64 {
     if (spirv_type_kind(types, rty) != SPIRV_TYK_POINTER) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
     var elem = _mir_lower_type(types, spirv_type_p1(types, rty), idb);
     if (elem == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
-    # Element stride: a scalar element is 4 bytes; a vecN element uses the std430 array stride
-    # (vec2 → 8, vec3/vec4 → 16; vec3 is padded to 16). N.10c: this is what lets `array<vecN>`
-    # be indexed, with OpLoad/OpStore scalarizing the element into N consecutive 4-byte
-    # components. std430 is the SSBO default — a non-default ArrayStride decoration is not
-    # consulted (an MVP layout assumption, like the single-member-struct / member-0 limits).
+    # Element stride: a scalar element is `esize` bytes (4 for i32/f32, 8 for f64 — F.7e); a vecN
+    # element uses the std430 array stride (vec2 → 2*esize, vec3/vec4 → 4*esize; vec3 is padded).
+    # N.10c: this is what lets `array<vecN>` be indexed, with OpLoad/OpStore scalarizing the
+    # element into consecutive components. std430 is the SSBO default — a non-default ArrayStride
+    # decoration is not consulted (an MVP layout assumption, like the single-member-struct limit).
+    var esize = 4;
+    if (mir_type_base(elem) == MIR_T_F64) { esize = 8; }
     var ecount = mir_type_count(elem);
-    var stride = 4;
+    var stride = esize;
     if (ecount != 1) {
-        if (ecount == 2) { stride = 8; } else { stride = 16; }
+        if (ecount == 2) { stride = esize * 2; } else { stride = esize * 4; }
     }
     # MVP: single-member struct, the member index must be the constant 0.
     if (spirv_const_type(consts, midx) == 0) { return 0 - MIR_ERR_BAD_ACCESS_CHAIN; }
@@ -7409,15 +7418,19 @@ fn _spirv_lower_body(ptr, byte_len, types, consts, deco, m, entry_id, lsz): i64 
 }
 
 # An array type's ArrayStride must match the std430 stride the access-chain assumes (computed
-# from the element type: scalar 4, vec2 8, vec3/vec4 16). Returns 0 if it matches (or the
-# element is one we don't lower — the access-chain rejects it later), else a NEGATIVE error.
+# from the element type: scalar `esize`, vec2 2*esize, vec3/vec4 4*esize; esize = 4 for i32/f32,
+# 8 for f64 — F.7e). Returns 0 if it matches (or the element is one we don't lower — the
+# access-chain rejects it later), else a NEGATIVE error. Kept in lock-step with the stride
+# computed in _spirv_lower_access_chain.
 fn _spirv_std430_stride_ok(types, array_tid, idb, declared): i64 {
     var elem = _mir_lower_type(types, spirv_type_p0(types, array_tid), idb);
     if (elem == MIR_T_UNSUPPORTED) { return 0; }
+    var es = 4;
+    if (mir_type_base(elem) == MIR_T_F64) { es = 8; }
     var ec = mir_type_count(elem);
-    var expect = 4;
-    if (ec == 2) { expect = 8; }
-    if (ec > 2) { expect = 16; }
+    var expect = es;
+    if (ec == 2) { expect = es * 2; }
+    if (ec > 2) { expect = es * 4; }
     if (declared != expect) { return 0 - LOWER_ERR_ARRAY_STRIDE; }
     return 0;
 }

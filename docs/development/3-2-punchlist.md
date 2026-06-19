@@ -960,11 +960,17 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     load/store → `GISEL_GLOBAL_{LOAD,STORE}_DWORDX2`; compile dispatch reuses the VOP3 emitters
     (regalloc's even low reg = the pair) + parameterized FLAT opcode; `gfx9_waitcnt` tracks DWORDX2.
     Tests: `_gisel_float_op` f32/f64 + an f64 isel check (DWORDX2 routing integration-tested in F.7e).
-  - [ ] **F.7e** — *(HW)* compile + dispatch an f64 FMA SPIR-V kernel on Cezanne, value-exact vs CPU —
-    **first compiled f64 on silicon** (proves F.7a–d compose).
+  - [x] **F.7e** *(2026-06-18)* — *(HW)* **first COMPILED f64 on silicon.** f64 FMA SPIR-V →
+    `gfx9_compile` → dispatched on Cezanne, all 8 lanes bit-exact vs the fused-FMA reference;
+    RSRC1 `0x2C0042` matches the F.4 oracle (regalloc produced the same budget). Fixed the f64
+    access-chain stride (esize 8) in `_spirv_lower_access_chain` + `_spirv_std430_stride_ok`.
+    `native_spirv_f64_fma_e2e.cyr` + `_spv_build_f64_fma` + a `gfx9_compile` CPU test (4 bindings,
+    8 user-SGPRs, v_fma_f64 in the ISA). Proves F.7a–d compose end-to-end.
   - [ ] **F.7f+** — op breadth (HW each): FAdd/FSub/FMul, **FDiv** (f64 reciprocal macro — complex),
     GLSL sqrt/min/max/abs/clamp, f32↔f64 conversions, f64 compares, inline f64 constants (materialize
-    via two i32 moves — `MIR_VK_CONST` payload is already i64).
+    via two i32 moves — `MIR_VK_CONST` payload is already i64). Also **`array<vecN-f64>` load/store**:
+    the per-component offset fix (`i*esize`) landed in F.7e (review), but needs a dedicated HW e2e
+    (no kernel exercises vec-f64 arrays yet) — verify here with the rest of vec-f64.
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
     attn11 uses, end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,

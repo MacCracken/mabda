@@ -50,7 +50,24 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   even low reg, which the encoders name as the pair) + parameterizes the FLAT emitters with the
   DWORDX2 opcode; `gfx9_waitcnt.cyr` tracks the DWORDX2 load/store. Tests (`compiler_backend.tcyr`):
   the extended `_gisel_float_op` f32-vs-f64 selection + an f64 FMUL/FMA isel check. (DWORDX2
-  load/store routing is integration-tested by the F.7e fixture.) (F.7e the compiled FMA e2e — pending.)
+  load/store routing is integration-tested by the F.7e fixture.)
+- **F.7e** — **the milestone: the first *compiled* f64 kernel on Cezanne.** An f64 FMA SPIR-V
+  (`out[lid.x]=fma(a,b,c)`, 4 f64 StorageBuffers, `OpExtInst Fma`) compiles in-tree via
+  `gfx9_compile` and runs on the GPU **bit-exact** (all 8 lanes) vs the fused-FMA reference —
+  decoupled proof that F.7a–d compose (MIR_T_F64 + even-aligned pairs + V_FMA_F64 + DWORDX2 +
+  the f64 access-chain stride). The compiler's RSRC1 is **`0x2C0042`** — identical to the F.4
+  hand-authored oracle (regalloc independently produced the 10-VGPR/VGPRS=2 budget). Fixed the
+  f64 **access-chain stride** (`_spirv_lower_access_chain` / `_spirv_std430_stride_ok` now derive
+  the element size: 8 for f64, 4 for i32/f32 — was hardcoded 4). `programs/native_spirv_f64_fma_e2e.cyr`
+  + `_spv_build_f64_fma` (`compiler_common.cyr`) + a `gfx9_compile` CPU test
+  (`compiler_compile.tcyr`: 4 bindings, 8 user-SGPRs, `v_fma_f64` in the ISA). Lanes 0/1/6
+  discriminate fused-vs-unfused. **The compiled-f64 MVP is reached.**
+  - Adversarial review (6 confirmed: 5 stride-fix confirmations + 1 real) also caught + fixed a
+    **latent f64 vec offset bug**: `_spirv_lower_vec_load`/`_store` hardcoded the per-component
+    offset as `i*4` (right for f32 vec, wrong for f64 vec — components are 8 bytes apart). Now
+    `i*esize`. Latent (no kernel uses `array<vecN-f64>` yet — F.7e is scalar f64), but reachable
+    since F.7a accepts vec-f64 types; the comprehensive `array<vec-f64>` HW test lands with the
+    vec-f64 breadth bite (F.7f+). i32/f32 vec path byte-identical (non-regression).
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

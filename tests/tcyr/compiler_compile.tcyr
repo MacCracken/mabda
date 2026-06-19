@@ -353,8 +353,66 @@ fn test_gfx9_abi_assign_2d() {
     return 0;
 }
 
+# v3.2 F.7e — the COMPILER produces correct f64 ISA end-to-end: the f64 FMA kernel (4 storage
+# bindings, OpExtInst Fma on double, DWORDX2 loads/store) compiles, advertises 4 bindings + 8
+# user-SGPRs (4 VA pairs), and the ISA contains a v_fma_f64 (VOP3 op 0x1CC). The HW value-exact
+# proof is programs/native_spirv_f64_fma_e2e.cyr; this is the CPU-side correctness gate.
+fn _isa_has_vfma_f64(isa, len): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        # VOP3: bits 31:26 = 0b110100 (0x34); op = bits 25:16. v_fma_f64 = 0x1CC.
+        if ((d >> 26) == 0x34) { if (((d >> 16) & 0x3FF) == 0x1CC) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
+fn test_gfx9_compile_f64_fma() {
+    var buf[800];
+    var n = _spv_build_f64_fma(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);   # >= id-bound 30; tables sized 32 records
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 FMA compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 4, "4 storage bindings (a,b,c,out)");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 8, "user_sgpr = 8 (4 binding VA pairs)");
+    assert_eq(_isa_has_vfma_f64(&isa, load64(&desc + DESC_ISA_LEN)), 1, "ISA contains v_fma_f64 (0x1CC)");
+    var d1 = load64(&desc + DESC_RSRC1);
+    assert_eq((d1 >> 12) & 0xFF, 0xC0, "rsrc1 FLOAT_MODE field = 0xC0");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_abi_rsrc();
+    test_gfx9_compile_f64_fma();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_gfx9_compile_uniform_if();
