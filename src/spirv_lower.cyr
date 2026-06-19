@@ -48,6 +48,14 @@ var SPIRV_OP_SHL              = 196;
 var SPIRV_OP_BITWISE_OR       = 197;
 var SPIRV_OP_BITWISE_XOR      = 198;
 var SPIRV_OP_BITWISE_AND      = 199;
+# v3.2 F.7f.8 — ordered f64 comparisons (→ a bool the consumer feeds to OpSelect / a branch).
+var SPIRV_OP_FORD_EQUAL          = 180;
+var SPIRV_OP_FORD_NOTEQUAL       = 182;
+var SPIRV_OP_FORD_LESSTHAN       = 184;
+var SPIRV_OP_FORD_GREATERTHAN    = 186;
+var SPIRV_OP_FORD_LESSTHANEQUAL  = 188;
+var SPIRV_OP_FORD_GREATERTHANEQUAL = 190;
+var SPIRV_OP_SELECT           = 169;   # F.7f.8 — cond ? x : y (v_bfi_b32 blend)
 var SPIRV_OP_RETURN           = 253;
 
 # Control-flow ops. N.7: BRANCH/BRANCH_CONDITIONAL/SELECTION_MERGE lower; LOOP_MERGE
@@ -318,6 +326,59 @@ fn _spirv_cmp_to_mir(op): i64 {
     if (op == SPIRV_OP_SLESSTHAN) { return MIR_OP_ICMP_SLT; }
     if (op == SPIRV_OP_SLESSTHANEQUAL) { return MIR_OP_ICMP_SLE; }
     return 0;
+}
+
+# Ordered f64 comparison SPIR-V opcode → the GFX9 f64 VOPC opcode (or 0 if not an f64 ordered cmp).
+# F.7f.8. (Unordered OpFUnord* not wired; tracked in docs/development/3-2-punchlist.md.)
+fn _spirv_fcmp_to_vopc(op): i64 {
+    if (op == SPIRV_OP_FORD_LESSTHAN) { return GFX9_VOPC_V_CMP_LT_F64; }
+    if (op == SPIRV_OP_FORD_GREATERTHAN) { return GFX9_VOPC_V_CMP_GT_F64; }
+    if (op == SPIRV_OP_FORD_LESSTHANEQUAL) { return GFX9_VOPC_V_CMP_LE_F64; }
+    if (op == SPIRV_OP_FORD_GREATERTHANEQUAL) { return GFX9_VOPC_V_CMP_GE_F64; }
+    if (op == SPIRV_OP_FORD_EQUAL) { return GFX9_VOPC_V_CMP_EQ_F64; }
+    if (op == SPIRV_OP_FORD_NOTEQUAL) { return GFX9_VOPC_V_CMP_LG_F64; }
+    return 0;
+}
+
+# OpFOrd*(result, a, b) → an i32 bool (0/1). f64 compare → VCC (MIR_OP_F64_CMP, opcode in flags),
+# then cndmask(0, 1) reads VCC → result. The compare + cndmask are emitted adjacently (mabda-
+# generated, so VCC is live by construction); the bool is then a normal VGPR value (order-independent,
+# unlike a bare VCC). f64-const operands are materialized first (VOP3/VOPC has no 64-bit literal). F.7f.8.
+fn _spirv_lower_fcmp(m, vopc, a, b, result): i64 {
+    var ma = _spirv_f64_arg(m, a);  if (ma < 0) { return ma; }
+    var mb = _spirv_f64_arg(m, b);  if (mb < 0) { return mb; }
+    var ec = mir_emit(m, MIR_OP_F64_CMP, 0, MIR_T_U32, ma, mb, 0, vopc << 8);  if (ec < 0) { return ec; }
+    var z = _udiv_op(m, MIR_OP_VMOV, MIR_T_U32, 0, 0, 0, MIR_FLAG_A_IMM);          if (z < 0) { return z; }
+    var ones = _udiv_op(m, MIR_OP_VMOV, MIR_T_U32, 0xFFFFFFFF, 0, 0, MIR_FLAG_A_IMM); if (ones < 0) { return ones; }
+    # 0/-1 MASK (not 0/1): OpSelect blends it with v_bfi_b32 (mask ? x : y) branchlessly. An i32
+    # OpSelect of int consts still gets 0/1 (bfi(mask,1,0)). result = VCC ? -1 : 0. The result type is
+    # MIR_T_BOOL — the MARKER that distinguishes a 0/-1 select mask (which OpSelect requires) from an
+    # integer-compare bool (MIR_T_U32, lowered to VCC/SCC not a mask). (F.7f.8 review.)
+    var er = mir_emit(m, MIR_OP_CNDMASK, result, MIR_T_BOOL, z, ones, 0, 0);    if (er < 0) { return er; }
+    return 0;
+}
+
+# OpSelect(result, cond, obj1, obj2) → obj1 if cond true else obj2, via v_bfi_b32 (MIR_OP_SELECT).
+# `cond` must be a 0/-1 MASK — i.e. the result of an OpFOrd* compare (F.7f.8). f64-const obj1/obj2
+# are materialized to VGPR pairs first. (A non-mask cond — e.g. from an integer compare, which lowers
+# to VCC/SCC not a mask value — is not supported here; that needs a unified bool representation.)
+fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
+    if (wc < 6) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+    if (rty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    if (mir_type_count(rty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }   # vector select not wired (punchlist)
+    var result = spirv_word(ptr, off + 2);
+    var cond = spirv_word(ptr, off + 3);
+    # ENFORCE: cond must be a 0/-1 select MASK — an OpFOrd* result (SSA, MIR_T_BOOL). v_bfi_b32 needs
+    # exactly 0/0xFFFFFFFF; any other cond (a bool CONSTANT, or an integer-compare bool which lowers to
+    # VCC/SCC with no mask register) would silently corrupt the blend. Fail loud instead. (F.7f.8 review.)
+    if (cond == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    if (cond >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    if (mir_val_kind(m, cond) != MIR_VK_SSA) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    if (mir_type_base(mir_val_type(m, cond)) != MIR_T_BOOL) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var x = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (x < 0) { return x; }   # obj1 (true)
+    var y = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (y < 0) { return y; }   # obj2 (false)
+    return mir_emit(m, MIR_OP_SELECT, result, rty, cond, x, y, 0);
 }
 
 # A unary op (conversion): result-type(w1), result(w2), src(w3).
@@ -978,6 +1039,16 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         return mir_emit(m, cop, spirv_word(ptr, off + 2), MIR_T_U32,
         spirv_word(ptr, off + 3), spirv_word(ptr, off + 4), 0, 0);
     }
+    # Ordered f64 comparison → an i32 bool (F.7f.8). f64-only (the f64 VOPC opcodes); f32 float
+    # compares are not wired (punchlist). Operand type checked from the first operand's MIR value.
+    var fvopc = _spirv_fcmp_to_vopc(op);
+    if (fvopc != 0) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var fa = spirv_word(ptr, off + 3);
+        if (mir_type_base(mir_val_type(m, fa)) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        return _spirv_lower_fcmp(m, fvopc, fa, spirv_word(ptr, off + 4), spirv_word(ptr, off + 2));
+    }
+    if (op == SPIRV_OP_SELECT) { return _spirv_lower_select(ptr, off, wc, types, m); }
     var mop = _spirv_alu_to_mir(op);
     if (mop != 0) {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }

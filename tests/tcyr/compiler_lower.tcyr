@@ -444,6 +444,38 @@ fn test_spirv_lower_fsqrt() {
     return 0;
 }
 
+# F.7f.8 review — OpSelect must FAIL LOUD unless its cond is a 0/-1 select mask (an OpFOrd* result:
+# SSA + MIR_T_BOOL). A non-mask cond (an integer-compare bool = U32, or a bool CONSTANT) would
+# silently corrupt the v_bfi_b32 blend, so it is rejected (the silent-wrong bug the review found).
+fn test_spirv_lower_select_rejects_nonmask() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (6 << 16) | 169);   # OpSelect (169) at word 5, wc=6
+    store32(&buf + 24, 2);                   # result type id (-> f64)
+    store32(&buf + 28, 5);                   # result id
+    store32(&buf + 32, 6);                   # cond id
+    store32(&buf + 36, 7);                   # obj1 (true)
+    store32(&buf + 40, 8);                   # obj2 (false)
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    # cond = a U32 SSA (an integer-compare bool, NOT a 0/-1 mask) -> reject
+    _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a U32 (int-compare) cond");
+    # cond = a bool CONSTANT -> reject (not SSA; would mis-encode in bfi)
+    mir_set_const(&m, 6, MIR_T_BOOL, 1);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a bool-constant cond");
+    return 0;
+}
+
 # F.7f.9 — _spirv_f64_arg materializes an f64-const operand into a MIR_OP_F64_CONST (the 64-bit
 # payload split lo/hi), the path that lets consumers use f64 literals in arith (VOP3 has no 64-bit
 # literal). A non-f64 operand (f32 const / SSA) is returned unchanged. Pins the full-64-bit handling
@@ -1359,6 +1391,7 @@ fn main(): i64 {
     test_spirv_lower_fdiv_f32_rejects();
     test_spirv_lower_fsqrt();
     test_spirv_f64_arg();
+    test_spirv_lower_select_rejects_nonmask();
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();
     test_spirv_vec_robustness();

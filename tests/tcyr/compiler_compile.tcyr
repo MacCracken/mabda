@@ -390,6 +390,17 @@ fn _isa_has_vop1(isa, len, op): i64 {
     return 0;
 }
 
+# VOPC e32: prefix 0x7C (bits 31-25 = 0x3E); opcode in bits 17-24. (F.7f.8.)
+fn _isa_has_vopc(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 25) == 0x3E) { if (((d >> 17) & 0xFF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
 fn test_gfx9_compile_f64_fma() {
     var buf[800];
     var n = _spv_build_f64_fma(&buf);
@@ -720,6 +731,49 @@ fn test_gfx9_compile_f64_sqrt() {
     return 0;
 }
 
+# v3.2 F.7f.8 — f64 compare + OpSelect (out = (a>b)?a:b) compiles: an ordered f64 VOPC compare
+# (v_cmp_gt_f64) → mask, then a v_bfi_b32 blend (the OpSelect). The argmax/masking primitive.
+fn test_gfx9_compile_f64_select() {
+    var buf[800];
+    var n = _spv_build_f64_select(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 32, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 compare+select compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vopc(&isa, len, 0x64), 1, "ISA has v_cmp_gt_f64 (0x64)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CA), 1, "ISA has v_bfi_b32 (0x1CA; the OpSelect blend)");
+    return 0;
+}
+
 # v3.2 F.7f.10 — OpExtInst Ldexp (f64) compiles to v_ldexp_f64 (reuses MIR_OP_F64_LDEXP). The 2^k
 # primitive consumers use to reconstruct a hand-rolled exp.
 fn test_gfx9_compile_f64_ldexp() {
@@ -902,6 +956,7 @@ fn main(): i64 {
     test_gfx9_compile_f64_const();
     test_gfx9_compile_f64_store_const();
     test_gfx9_compile_f64_ldexp();
+    test_gfx9_compile_f64_select();
     test_gfx9_compile_f64_i32_cvt();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();

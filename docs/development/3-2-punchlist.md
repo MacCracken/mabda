@@ -1060,10 +1060,24 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
       bit-exact vs SPIR-V round-TOWARD-ZERO — confirming GFX9 `v_cvt_i32_f64` TRUNCATES (a design agent
       wrongly claimed round-to-nearest). `native_spirv_f64_cvt_e2e.cyr`. The conformant salvage of the
       exp work; the cvt ops + F64_CONST primitive are kept (FSqrt + consumers use them).
-  - [ ] **F.7f.8 (f64 compares)** — public float-compare path (V_CMP_*_F64 VOPC → bool/SCC) for consumer
-    OpFOrdLessThan/etc. → bool/branch (attn11 max/argmax/masking; also the consumer-rolled transcendental
-    special cases). The internal VCC-only compares (CMP_GT/CMP_CLASS) exist from FSqrt; this is the
-    bool-producing path.
+  - [x] **F.7f.8 (f64 compares + OpSelect)** *(2026-06-19)* — **HW-verified on Cezanne**: the public
+    bool-producing path for attn11's argmax/masking. An ordered `OpFOrd*` (LT/GT/LE/GE/EQ/LG, VOPC
+    0x61–0x66) → `v_cmp_*_f64`→VCC→cndmask → a **0/-1 MASK** (a normal VGPR value — robust, not VCC-
+    fragile); `OpSelect` → `v_bfi_b32(mask, x, y)` per 32-bit lane (1 for i32/f32, 2 for an f64 pair),
+    no VCC at select time → order-independent. New: `MIR_OP_F64_CMP` (reuses GISEL_V_CMP/_emit_vopc) +
+    `MIR_OP_SELECT` + the bfi encoder/emit. `out=(a>b)?a:b` (max) bit-exact on all 8 lanes incl. the
+    equal (→false) + signed-zero cases — `native_spirv_f64_select_e2e.cyr` + byte-oracle + compile test.
+    Adversarially reviewed (Workflow, 2 dims / 11 agents): **6 confirmed**, all one root cause —
+    OpSelect didn't ENFORCE its cond is a 0/-1 mask, so a non-OpFOrd* cond (an integer-compare bool →
+    VCC/SCC with no mask reg → an unallocated VGPR; or a bool CONSTANT → an inline code) would silently
+    corrupt the bfi blend. Fixed: the f64-compare mask is now typed `MIR_T_BOOL` (the marker), and
+    `_spirv_lower_select` FAILS LOUD unless cond is an SSA `MIR_T_BOOL` (pinned by
+    `test_spirv_lower_select_rejects_nonmask`). The non-mask cases are the tracked follow-ups.
+    - [ ] **F.7f.8 follow-ups** *(deferred — not attn11-blocking)* — unordered `OpFUnord*` compares
+      (the 0x69.. VOPC set, true on NaN); f32 float compares (`v_cmp_*_f32`); vector OpSelect (per-
+      component); and OpSelect on a non-OpFOrd* condition (integer compares lower to VCC/SCC, not a
+      0/-1 mask — needs a unified bool representation). All fail loud today, none blocking attn11's
+      f64 hand-rolled kernels.
   - [x] **F.7f.9 (SPIR-V f64 OpConstant)** *(2026-06-19)* — **HW-verified on Cezanne**: f64 literals
     flow end-to-end. The const table (`spirv_build_const_table`) + `mir_set_const` now keep the full
     64-bit value (word-count wc>=5 discriminator; the MIR payload is already 64-bit); `_spirv_f64_arg`

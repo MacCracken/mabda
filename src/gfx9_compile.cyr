@@ -452,6 +452,27 @@ fn _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst + 1, gfx9_vgpr(fa + 1), tb + 1));
 }
 
+# v3.2 F.7f.8 — OpSelect blend via v_bfi_b32 (d = (mask & x) | (~mask & y) = mask ? x : y). The cond
+# MASK (0/-1) is src0, the true/false values src1/src2. One bfi for i32/f32; two (lo+hi, same mask)
+# for an f64 pair. No VCC — order-independent (the mask is a normal VGPR value).
+fn _emit_select(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var mask = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);  if (mask < 0) { return mask; }
+    var x = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);      if (x < 0) { return x; }
+    var y = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);      if (y < 0) { return y; }
+    if (mask == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (x == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (y == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_BFI_B32, dst));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(mask, x, y));
+    if (mir_type_base(mir_val_type(m, gisel_dst(isel, i))) == MIR_T_F64) {
+        p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(GFX9_VOP3_V_BFI_B32, dst + 1));
+        return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(mask, x + 1, y + 1));
+    }
+    return p;
+}
+
 # 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
 fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     if (is_imm != 0) {
@@ -753,6 +774,7 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_SELECT) { return _emit_select(m, isel, i, alloc, isvgpr, buf, pos); }
     # Divergent-if EXEC mask: save+AND EXEC with VCC into the reserved pair; restore it.
     if (op == GISEL_S_SAVEEXEC) {
         return gfx9_emit32(buf, pos,
