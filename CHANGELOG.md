@@ -15,6 +15,12 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Changed — toolchain pin 6.2.21 → 6.2.22
+- `cyrius.cyml` `cyrius = "6.2.22"` (+ CLAUDE.md pin refs); `rm -rf lib && cyrius deps` re-resolved
+  (`cyrius.lock` updated — the AGNOS-target `syscalls_x86_64_agnos.cyr` differs in 6.2.22). Clean
+  bump: smoke + full CPU suite (exit 0) + per-file lint (0/0) + fmt (no drift) + `cyrius distlib`
+  (byte-identical, idempotent) + version-check all pass on 6.2.22; clears the pin-drift warning.
+
 ### Added — Phase F.7 (general native f64 via the SPIR-V→GFX9 compiler — IN PROGRESS)
 The big native-f64 lift: teach the in-tree compiler to emit `V_*_F64`. The central new concept
 is **64-bit register pairs** (even-aligned `v[2:3]`) threaded as `MIR_T_F64` through MIR → isel →
