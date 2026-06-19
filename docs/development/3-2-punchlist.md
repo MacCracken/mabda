@@ -955,7 +955,11 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     (`mir_val_type` base == `MIR_T_F64` → claim pair, `hw += 2`). `compiler_backend.tcyr` +2 tests
     (direct `_ra_claim_pair` align/reuse/half-busy/exhaustion + a divergent f64 chain → v[2:3], v[4:5],
     hw 6). ABI RSRC1 `ceil(hw/4)-1` already pair-correct (F.4 oracle).
-  - [ ] **F.7d** — isel f64 op routing (`_gisel_float_op(mop, type)`) + DWORDX2 f64 load/store + waitcnt.
+  - [x] **F.7d** *(2026-06-18)* — isel f64 routing: type-aware `_gisel_float_op(mop, tbase)` →
+    `GISEL_V_{ADD,MUL,FMA,MIN,MAX}_F64` (f64 SUB/SQRT/FLOOR/CLAMP/ABS fail loud, breadth); f64
+    load/store → `GISEL_GLOBAL_{LOAD,STORE}_DWORDX2`; compile dispatch reuses the VOP3 emitters
+    (regalloc's even low reg = the pair) + parameterized FLAT opcode; `gfx9_waitcnt` tracks DWORDX2.
+    Tests: `_gisel_float_op` f32/f64 + an f64 isel check (DWORDX2 routing integration-tested in F.7e).
   - [ ] **F.7e** — *(HW)* compile + dispatch an f64 FMA SPIR-V kernel on Cezanne, value-exact vs CPU —
     **first compiled f64 on silicon** (proves F.7a–d compose).
   - [ ] **F.7f+** — op breadth (HW each): FAdd/FSub/FMul, **FDiv** (f64 reciprocal macro — complex),

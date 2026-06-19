@@ -86,6 +86,18 @@ var GISEL_V_CNDMASK       = 47;
 # Arithmetic shift right (N.9d): SALU (uniform) vs VALU (divergent), like LSHR.
 var GISEL_V_ASHRREV_I32   = 48;
 var GISEL_S_ASHR_I32      = 49;
+# v3.2 F.7d — f64 (double) ALU. All VALU/VOP3 over 64-bit VGPR pairs; the dispatch reuses the
+# scalar VOP3/VOP1 emitters because regalloc hands out the EVEN (low) reg of each pair and the
+# encoders name a pair by its low reg (F.7c). f64 SUB/SQRT/FLOOR/CLAMP/ABS + f32<->f64 CVT are
+# breadth bites (no single f64 opcode / need the negate-or-modifier or lowering logic).
+var GISEL_V_ADD_F64          = 50;
+var GISEL_V_MUL_F64          = 51;
+var GISEL_V_FMA_F64          = 52;
+var GISEL_V_MIN_F64          = 53;
+var GISEL_V_MAX_F64          = 54;
+# 64-bit (f64) global load/store — DWORDX2 variants of GLOBAL_LOAD/STORE (same operands).
+var GISEL_GLOBAL_LOAD_DWORDX2  = 55;
+var GISEL_GLOBAL_STORE_DWORDX2 = 56;
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -166,15 +178,21 @@ fn _gisel_int_op(mop, divergent): i64 {
     return 0;
 }
 
-# Float MIR op → GFX9 VALU op (always vector; GFX9 has no scalar f32 ALU).
-# Returns 0 if `mop` is not a float ALU op.
-fn _gisel_float_op(mop): i64 {
-    if (mop == MIR_OP_FADD) { return GISEL_V_ADD_F32; }
+# Float MIR op → GFX9 VALU op (always vector; GFX9 has no scalar float ALU). `tbase` is the
+# result's MIR type BASE (MIR_T_F32 / MIR_T_F64); f64 selects the V_*_F64 form. Returns 0 if
+# `mop` is not a float ALU op OR the f64 variant is a breadth bite (SUB/SQRT/FLOOR/CLAMP/ABS on
+# f64) — the caller then fails loud rather than silently emitting the f32 opcode on a pair.
+fn _gisel_float_op(mop, tbase): i64 {
+    var f64 = 0;
+    if (tbase == MIR_T_F64) { f64 = 1; }
+    if (mop == MIR_OP_FADD) { if (f64 == 1) { return GISEL_V_ADD_F64; } return GISEL_V_ADD_F32; }
+    if (mop == MIR_OP_FMUL) { if (f64 == 1) { return GISEL_V_MUL_F64; } return GISEL_V_MUL_F32; }
+    if (mop == MIR_OP_FMA) { if (f64 == 1) { return GISEL_V_FMA_F64; } return GISEL_V_FMA_F32; }
+    if (mop == MIR_OP_FMIN) { if (f64 == 1) { return GISEL_V_MIN_F64; } return GISEL_V_MIN_F32; }
+    if (mop == MIR_OP_FMAX) { if (f64 == 1) { return GISEL_V_MAX_F64; } return GISEL_V_MAX_F32; }
+    # f64 has no single SUB/SQRT/FLOOR/CLAMP/ABS opcode → fail loud (return 0) until breadth.
+    if (f64 == 1) { return 0; }
     if (mop == MIR_OP_FSUB) { return GISEL_V_SUB_F32; }
-    if (mop == MIR_OP_FMUL) { return GISEL_V_MUL_F32; }
-    if (mop == MIR_OP_FMA) { return GISEL_V_FMA_F32; }
-    if (mop == MIR_OP_FMIN) { return GISEL_V_MIN_F32; }
-    if (mop == MIR_OP_FMAX) { return GISEL_V_MAX_F32; }
     if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
     if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
     if (mop == MIR_OP_FCLAMP) { return GISEL_V_MED3_F32; }
@@ -272,11 +290,17 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
         return 0 - GISEL_ERR_UNSUPPORTED_OP;
     }
     if (op == MIR_OP_LOAD) {
-        # b = ptr-table index; carry binding in flags bits 8+ (b stays immediate).
-        return _gisel_emit(out, k, GISEL_GLOBAL_LOAD, dst, a, b, 0, flags | (mir_ptr_binding(m, b) << 8));
+        # b = ptr-table index; carry binding in flags bits 8+ (b stays immediate). An f64
+        # result is a 64-bit load → DWORDX2 (F.7d).
+        var lop = GISEL_GLOBAL_LOAD;
+        if (mir_type_base(mir_val_type(m, dst)) == MIR_T_F64) { lop = GISEL_GLOBAL_LOAD_DWORDX2; }
+        return _gisel_emit(out, k, lop, dst, a, b, 0, flags | (mir_ptr_binding(m, b) << 8));
     }
     if (op == MIR_OP_STORE) {
-        return _gisel_emit(out, k, GISEL_GLOBAL_STORE, 0, a, b, c, flags | (mir_ptr_binding(m, b) << 8));
+        # c = the stored value; an f64 value is a 64-bit store → DWORDX2 (F.7d).
+        var sop = GISEL_GLOBAL_STORE;
+        if (mir_type_base(mir_val_type(m, c)) == MIR_T_F64) { sop = GISEL_GLOBAL_STORE_DWORDX2; }
+        return _gisel_emit(out, k, sop, 0, a, b, c, flags | (mir_ptr_binding(m, b) << 8));
     }
     if (op == MIR_OP_CVT_F32) { return _gisel_emit(out, k, GISEL_V_CVT_F32_I32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_CVT_I32) { return _gisel_emit(out, k, GISEL_V_CVT_I32_F32, dst, a, 0, 0, flags); }
@@ -299,8 +323,8 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
         if (mir_val_unif(m, dst) == MIR_UNKNOWN) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
         return _gisel_emit(out, k, GISEL_EXTRACT, dst, a, b, c, flags);
     }
-    # float ALU: always VALU
-    var fop = _gisel_float_op(op);
+    # float ALU: always VALU. The result type base picks the f32 vs f64 (V_*_F64) opcode (F.7d).
+    var fop = _gisel_float_op(op, mir_type_base(mir_val_type(m, dst)));
     if (fop != 0) { return _gisel_emit(out, k, fop, dst, a, b, c, flags); }
     # integer ALU: SALU (uniform) vs VALU (divergent) per the result's uniformity.
     var u = mir_val_unif(m, dst);

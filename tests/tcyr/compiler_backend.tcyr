@@ -21,11 +21,43 @@ fn test_gfx9_isel_op_selection() {
     assert_eq(_gisel_int_op(MIR_OP_OR, 1), GISEL_V_OR_B32, "or divergent");
     assert_eq(_gisel_int_op(MIR_OP_XOR, 0), GISEL_S_XOR_B32, "xor uniform");
     assert_eq(_gisel_int_op(MIR_OP_FADD, 0), 0, "fadd is not an int op");
-    assert_eq(_gisel_float_op(MIR_OP_FADD), GISEL_V_ADD_F32, "fadd -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FSUB), GISEL_V_SUB_F32, "fsub -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FMUL), GISEL_V_MUL_F32, "fmul -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FMA), GISEL_V_FMA_F32, "fma -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_IADD), 0, "iadd is not a float op");
+    assert_eq(_gisel_float_op(MIR_OP_FADD, MIR_T_F32), GISEL_V_ADD_F32, "fadd f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FSUB, MIR_T_F32), GISEL_V_SUB_F32, "fsub f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FMUL, MIR_T_F32), GISEL_V_MUL_F32, "fmul f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FMA, MIR_T_F32), GISEL_V_FMA_F32, "fma f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_IADD, MIR_T_F32), 0, "iadd is not a float op");
+    # v3.2 F.7d — f64 selects the V_*_F64 form; ops with no single f64 opcode fail loud (0).
+    assert_eq(_gisel_float_op(MIR_OP_FADD, MIR_T_F64), GISEL_V_ADD_F64, "fadd f64 -> V_ADD_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMUL, MIR_T_F64), GISEL_V_MUL_F64, "fmul f64 -> V_MUL_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMA, MIR_T_F64), GISEL_V_FMA_F64, "fma f64 -> V_FMA_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMIN, MIR_T_F64), GISEL_V_MIN_F64, "fmin f64 -> V_MIN_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMAX, MIR_T_F64), GISEL_V_MAX_F64, "fmax f64 -> V_MAX_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FSUB, MIR_T_F64), 0, "fsub f64 has no opcode -> fail loud");
+    assert_eq(_gisel_float_op(MIR_OP_FSQRT, MIR_T_F64), 0, "fsqrt f64 deferred -> fail loud");
+    return 0;
+}
+
+# v3.2 F.7d — the isel driver passes the result type, so an f64 FMUL/FMA selects the V_*_F64
+# form. (f64 load/store -> DWORDX2 needs a ptr-table set-up; it is integration-tested by the
+# F.7e compiled-FMA fixture.)
+fn test_gfx9_isel_f64() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # divergent u32
+    mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 mul
+    mir_emit(&m, MIR_OP_FMA, 8, MIR_T_F64, 7, 7, 7, 0);                    # f64 fma
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    # isel order: 0=EXTRACT, 1=FMUL(f64), 2=FMA(f64), 3=ENDPGM
+    assert_eq(gisel_op(&isel, 1), GISEL_V_MUL_F64, "f64 FMUL -> GISEL_V_MUL_F64");
+    assert_eq(gisel_op(&isel, 2), GISEL_V_FMA_F64, "f64 FMA -> GISEL_V_FMA_F64");
     return 0;
 }
 
@@ -1283,6 +1315,7 @@ fn main(): i64 {
     test_gfx9_regalloc_valu_uniform();
     test_ra_claim_pair();
     test_gfx9_regalloc_f64_pairs();
+    test_gfx9_isel_f64();
     test_gfx9_waitcnt_saxpy();
     test_gfx9_waitcnt_none();
     test_gfx9_waitcnt_errors();

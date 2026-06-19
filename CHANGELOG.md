@@ -43,7 +43,14 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   high-water by 2 (so the RSRC1 `ceil(hw/4)-1` formula counts pairs — the F.4 `v[8:9]`→VGPRS 2
   oracle). Tests (`compiler_backend.tcyr` +2): direct `_ra_claim_pair` (align / both-free / reuse /
   one-half-busy / exhaustion) + a divergent f64 chain → `%7`→`v[2:3]`, `%8`→`v[4:5]`, hw 6.
-  (F.7d isel + DWORDX2 routing, F.7e the compiled FMA e2e — pending.)
+- **F.7d** — isel f64 routing: `_gisel_float_op(mop, tbase)` is type-aware (`MIR_T_F64` → the
+  `GISEL_V_{ADD,MUL,FMA,MIN,MAX}_F64` form; f64 SUB/SQRT/FLOOR/CLAMP/ABS fail loud until breadth);
+  f64 `OpLoad`/`OpStore` route to `GISEL_GLOBAL_{LOAD,STORE}_DWORDX2`; the compile dispatch
+  (`gfx9_compile.cyr`) maps the f64 arith through the **existing** VOP3 emitters (regalloc gives the
+  even low reg, which the encoders name as the pair) + parameterizes the FLAT emitters with the
+  DWORDX2 opcode; `gfx9_waitcnt.cyr` tracks the DWORDX2 load/store. Tests (`compiler_backend.tcyr`):
+  the extended `_gisel_float_op` f32-vs-f64 selection + an f64 FMUL/FMA isel check. (DWORDX2
+  load/store routing is integration-tested by the F.7e fixture.) (F.7e the compiled FMA e2e — pending.)
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

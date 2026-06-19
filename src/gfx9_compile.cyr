@@ -374,19 +374,19 @@ fn _cmp_flat_saddr(abi, isel, i): i64 {
 # SGPR pair (saddr), the per-lane byte offset in a VGPR (vaddr). dst = the loaded
 # VGPR. a = offset vreg, binding in flags bits 8+. No SGPR→VGPR move or 64-bit add
 # needed — the divergent offset rides the vaddr field.
-fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, load_opc): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
     if (vaddr < 0) { return vaddr; }
     var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
-    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_LOAD_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(load_opc, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(vdst, saddr, 0, vaddr));
 }
 
 # FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
 # flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
-fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
+fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, store_opc): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
@@ -408,7 +408,7 @@ fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64
         data = _cmp_vgpr_operand(m, alloc, isvgpr, cfield);
         if (data < 0) { return data; }
     }
-    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(store_opc, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
 
@@ -536,8 +536,35 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_V_CNDMASK) { return _emit_cndmask(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
-    if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
-    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr); }
+    if (op == GISEL_GLOBAL_LOAD) {
+        return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, GFX9_FLAT_GLOBAL_LOAD_DWORD);
+    }
+    if (op == GISEL_GLOBAL_STORE) {
+        return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, GFX9_FLAT_GLOBAL_STORE_DWORD);
+    }
+    # v3.2 F.7d — f64: DWORDX2 global load/store + the V_*_F64 ALU (VOP3, reusing the scalar
+    # emitters — regalloc gave the EVEN low reg of each pair, which the encoders name directly).
+    if (op == GISEL_GLOBAL_LOAD_DWORDX2) {
+        return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, GFX9_FLAT_GLOBAL_LOAD_DWORDX2);
+    }
+    if (op == GISEL_GLOBAL_STORE_DWORDX2) {
+        return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, GFX9_FLAT_GLOBAL_STORE_DWORDX2);
+    }
+    if (op == GISEL_V_ADD_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_ADD_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MUL_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MIN_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MIN_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MAX_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MAX_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_FMA_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F64);
+    }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
