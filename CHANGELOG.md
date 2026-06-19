@@ -89,6 +89,14 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
     wrong register size — since mabda's light `spirv_validate_stream` doesn't reject it (untrusted
     input, ADR-006). Added an **operand-width guard** in isel (widen requires an f32 src, narrow an
     f64 src, else fail loud `GISEL_ERR_UNSUPPORTED_OP`) + a `compiler_backend.tcyr` fail-loud test.
+- **F.7f.3** — f64 FSub + FAbs via VOP3 **source modifiers** (GFX9 has no `V_SUB_F64`/`V_ABS_F64`).
+  FSub `a−b` = `v_add_f64(a, −b)` (NEG src1 = hi bit 30 = `0x40000000`); FAbs `|x|` =
+  `v_max_f64(|x|,|x|)` (ABS src0+src1 = lo bits 8,9 = `0x300`) — both llvm-mc-verified, reusing the
+  F.7b `V_ADD_F64`/`V_MAX_F64` opcodes (no new encoders). `GISEL_V_SUB_F64`/`GISEL_V_ABS_F64` +
+  type-aware `_gisel_float_op` + dedicated `_emit_fsub_f64`/`_emit_fabs_f64`. HW-verified:
+  `out=abs(a−b)` bit-exact vs in-process `f64_abs(f64_sub(a,b))` (abs flips the sign on several
+  lanes). `native_spirv_f64_subabs_e2e.cyr` + `_spv_build_f64_subabs` + a `gfx9_compile` CPU test
+  (the neg/abs modifier bits in the ISA) + a modifier byte-oracle (`compiler_encode.tcyr`).
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

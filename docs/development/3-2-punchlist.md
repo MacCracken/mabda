@@ -975,11 +975,14 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     result-type-dispatched isel (f64→V_CVT_F64_F32 widen, f32→V_CVT_F32_F64 narrow) through `_emit_vop1`
     + the F.7b encoders. HW-verified: `out=double(float(a))` bit-exact vs `f32_to_f64(f64_to_f32(a))`.
     `native_spirv_f64_cvt_e2e.cyr` + `_spv_build_f64_cvt` + a `gfx9_compile` CPU test.
-  - [ ] **F.7f.3+** — remaining op breadth (HW each, each adds src logic): **FSub** (V_ADD_F64 + negate
-    src-mod) + **FAbs** (sign-bit clear on the high dword); **FDiv** (f64 reciprocal macro — complex);
-    **FSqrt**; **f64 compares** (V_CMP_*_F64); **inline f64 constants** (materialize via two i32 moves —
-    `MIR_VK_CONST` payload is already i64); **`array<vecN-f64>` load/store** (the `i*esize` offset fix
-    landed F.7e — needs a dedicated HW e2e).
+  - [x] **F.7f.3** *(2026-06-18)* — f64 **FSub + FAbs** via VOP3 source modifiers: FSub = V_ADD_F64 +
+    NEG src1 (hi 0x40000000); FAbs = V_MAX_F64(|x|,|x|) + ABS src0+src1 (lo 0x300), llvm-mc-verified,
+    reusing the F.7b opcodes. `GISEL_V_SUB_F64`/`GISEL_V_ABS_F64` + `_emit_fsub_f64`/`_emit_fabs_f64`.
+    HW-verified `out=abs(a-b)` bit-exact vs `f64_abs(f64_sub(a,b))`. `native_spirv_f64_subabs_e2e.cyr`.
+  - [ ] **F.7f.4+** — remaining op breadth (HW each): **FDiv** (f64 reciprocal macro — complex); **FSqrt**
+    (V_SQRT_F64 or rsq+Newton); **f64 compares** (V_CMP_*_F64); **inline f64 constants** (materialize via
+    two i32 moves — `MIR_VK_CONST` payload is already i64); **`array<vecN-f64>` load/store** (the `i*esize`
+    offset fix landed F.7e — needs a dedicated HW e2e).
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
     attn11 uses, end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,

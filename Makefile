@@ -842,3 +842,12 @@ build-gpu-programs:
 .PHONY: clean
 clean:
 	rm -rf build/
+
+# v3.2 F.7f.3 — compiled f64 sub+abs (source-modifier ops) on Cezanne, bit-exact vs in-process ref.
+build/native_spirv_f64_subabs_e2e: programs/native_spirv_f64_subabs_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_subabs_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-subabs-e2e
+test-native-spirv-f64-subabs-e2e: build/native_spirv_f64_subabs_e2e
+	./build/native_spirv_f64_subabs_e2e

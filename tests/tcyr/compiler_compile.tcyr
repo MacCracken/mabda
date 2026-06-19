@@ -522,11 +522,74 @@ fn test_gfx9_compile_f64_cvt() {
     return 0;
 }
 
+# v3.2 F.7f.3 — the f64 sub+abs kernel (out=abs(a-b)) compiles end-to-end. FSub = v_add_f64 with
+# NEG src1 (hi bit 30 = 0x40000000); FAbs = v_max_f64 with ABS src0+src1 (lo bits 8,9 = 0x300).
+# The ISA must contain a v_add_f64 (0x280) with the neg bit + a v_max_f64 (0x283) with the abs bits.
+fn test_gfx9_compile_f64_subabs() {
+    var buf[800];
+    var n = _spv_build_f64_subabs(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[1792];
+    var instrs[1152];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 44, 16, 28, 44);
+    var outbi[352];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[704];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 sub+abs compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    # FSub: a v_add_f64 (0x280) VOP3 dword with the NEG-src1 bit (hi bit 30) — scan the HI dwords.
+    var p = 0;
+    var fsub = 0;
+    var fabs = 0;
+    while (p < len) {
+        var d = load32(&isa + p);
+        if ((d >> 26) == 0x34) {
+            var opc = (d >> 16) & 0x3FF;
+            if (opc == 0x280) {
+                var hi = load32(&isa + p + 4);
+                if ((hi & 0x40000000) != 0) { fsub = 1; }
+            }
+            if (opc == 0x283) {
+                if ((d & 0x300) == 0x300) { fabs = 1; }   # ABS src0+src1 in the lo dword
+            }
+        }
+        p = p + 4;
+    }
+    assert_eq(fsub, 1, "ISA has v_add_f64 with NEG src1 (fsub)");
+    assert_eq(fabs, 1, "ISA has v_max_f64 with ABS src0+src1 (fabs)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_abi_rsrc();
     test_gfx9_compile_f64_fma();
     test_gfx9_compile_f64_arith();
     test_gfx9_compile_f64_cvt();
+    test_gfx9_compile_f64_subabs();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_gfx9_compile_uniform_if();
