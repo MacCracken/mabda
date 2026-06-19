@@ -234,6 +234,58 @@ fn test_gfx9_regalloc_errors() {
     return 0;
 }
 
+# v3.2 F.7c — _ra_claim_pair: even-aligned 64-bit register pairs (f64). Pure free-at math.
+fn test_ra_claim_pair() {
+    var freeat[2048];
+    memset(&freeat, 0, 2048);                                      # all free (free-at 0)
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 2, "odd base 1 rounds up -> v[2:3]");
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 4, "second pair -> v[4:5]");
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 6, "third pair -> v[6:7]");
+    # at step 5 the first pair's free-at (5) <= step, so it is reusable again
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 5, 9), 2, "reuse freed pair v[2:3] at step 5");
+    # one odd half busy: v3 occupied until step 100 forces the scan past v[2:3] to v[4:5]
+    memset(&freeat, 0, 2048);
+    store64(&freeat + 3 * 8, 100);
+    assert_eq(_ra_claim_pair(&freeat, 2, 256, 0, 5), 4, "v3 busy -> skip v[2:3], take v[4:5]");
+    # exhaustion: cap=3 leaves no room for an even pair (need r+1 < cap)
+    memset(&freeat, 0, 2048);
+    assert_eq(_ra_claim_pair(&freeat, 2, 3, 0, 5), 0 - 1, "cap 3 -> no aligned pair fits");
+    return 0;
+}
+
+# v3.2 F.7c — driver: f64 SSA results get even-aligned VGPR pairs + high-water counts both halves.
+# A divergent f64 chain (lid.x -> FMUL f64 -> FADD f64). isel still selects the f32 opcode (F.7d
+# fixes that), but regalloc keys on the VALUE type (MIR_T_F64), so the pairing is exercised here.
+# Layout (vgpr_base 1): %6 u32 -> v1 (single); %7 f64 -> v[2:3]; %8 f64 -> v[4:5]; hw 6.
+fn test_gfx9_regalloc_f64_pairs() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # lid.x (divergent u32)
+    mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 #1 (divergent)
+    mir_emit(&m, MIR_OP_FADD, 8, MIR_T_F64, 7, 6, 0, 0);                   # f64 #2 (uses %7, %6)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "f64 regalloc ok");
+    assert_eq(gfx9_reg(&alloc, 6), 1, "u32 single -> v1 (coexists with the f64 pairs)");
+    var r7 = gfx9_reg(&alloc, 7);
+    var r8 = gfx9_reg(&alloc, 8);
+    assert_eq(r7 & 1, 0, "f64 #1 lands on an even reg (pair)");
+    assert_eq(r8 & 1, 0, "f64 #2 lands on an even reg (pair)");
+    assert_eq(r7, 2, "f64 #1 -> v[2:3]");
+    assert_eq(r8, 4, "f64 #2 -> v[4:5]");
+    assert_eq(gfx9_hw_vgpr(&hw), 6, "vgpr high-water counts both halves of the last pair");
+    return 0;
+}
+
 # review N.4a: a float/CVT op is always VALU and writes a VGPR, even when its
 # result is UNIFORM. The file must follow the op class, not the uniformity, or a
 # vector instruction's dst lands in an SGPR (invalid encoding). A CVT_F32 of a
@@ -1229,6 +1281,8 @@ fn main(): i64 {
     test_gfx9_regalloc_saxpy();
     test_gfx9_regalloc_errors();
     test_gfx9_regalloc_valu_uniform();
+    test_ra_claim_pair();
+    test_gfx9_regalloc_f64_pairs();
     test_gfx9_waitcnt_saxpy();
     test_gfx9_waitcnt_none();
     test_gfx9_waitcnt_errors();

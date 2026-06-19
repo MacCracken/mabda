@@ -31,7 +31,13 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   `V_CVT_F32_F64`=0x0F / `V_CVT_{F64_I32,I32_F64,F64_U32,U32_F64}`. (`V_FMA_F64`=0x1CC + DWORDX2
   load/store already landed in F.4.) GFX9 has no `V_SUB_F64`/`V_ABS_F64` (negate/abs src-mods) and
   FDiv/FSqrt are multi-instruction macros — deferred to the F.7 breadth bites with their isel logic.
-  (F.7c regalloc pairs, F.7d isel + DWORDX2 routing, F.7e the compiled FMA e2e — pending.)
+- **F.7c** — regalloc **even-aligned 64-bit pairs** (`src/gfx9_regalloc.cyr`): `_ra_claim_pair`
+  (lowest even register with both halves free at the step; odd base rounds up; step by 2) + the
+  driver detects f64 results (`mir_val_type` base == `MIR_T_F64`) → claims a pair and bumps the
+  high-water by 2 (so the RSRC1 `ceil(hw/4)-1` formula counts pairs — the F.4 `v[8:9]`→VGPRS 2
+  oracle). Tests (`compiler_backend.tcyr` +2): direct `_ra_claim_pair` (align / both-free / reuse /
+  one-half-busy / exhaustion) + a divergent f64 chain → `%7`→`v[2:3]`, `%8`→`v[4:5]`, hw 6.
+  (F.7d isel + DWORDX2 routing, F.7e the compiled FMA e2e — pending.)
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

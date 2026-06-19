@@ -950,8 +950,11 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     V_MIN_F64=0x282 / V_MAX_F64=0x283 + VOP1 CVT_F64_F32=0x10 / CVT_F32_F64=0x0F / CVT_{F64_I32,
     I32_F64,F64_U32,U32_F64} (V_FMA_F64=0x1CC + DWORDX2 from F.4). No V_SUB_F64/V_ABS_F64 (src-mods);
     FDiv/FSqrt macros deferred to breadth. GISEL_V_*_F64 enum + GISEL→GFX9 dispatch land with isel (F.7d).
-  - [ ] **F.7c** — regalloc **even-aligned 64-bit pairs** (`_ra_claim` width param; `hw += 2`); the
-    central mechanism. (ABI RSRC1 formula already pair-correct.)
+  - [x] **F.7c** *(2026-06-18)* — regalloc **even-aligned 64-bit pairs**: `_ra_claim_pair` (lowest
+    even reg, both halves free; odd base rounds up; step 2) + driver f64 width detection
+    (`mir_val_type` base == `MIR_T_F64` → claim pair, `hw += 2`). `compiler_backend.tcyr` +2 tests
+    (direct `_ra_claim_pair` align/reuse/half-busy/exhaustion + a divergent f64 chain → v[2:3], v[4:5],
+    hw 6). ABI RSRC1 `ceil(hw/4)-1` already pair-correct (F.4 oracle).
   - [ ] **F.7d** — isel f64 op routing (`_gisel_float_op(mop, type)`) + DWORDX2 f64 load/store + waitcnt.
   - [ ] **F.7e** — *(HW)* compile + dispatch an f64 FMA SPIR-V kernel on Cezanne, value-exact vs CPU —
     **first compiled f64 on silicon** (proves F.7a–d compose).
