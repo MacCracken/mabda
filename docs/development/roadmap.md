@@ -62,7 +62,8 @@ cross-vendor default.
                         native sampling + SPIR-V + native SPIR-V→GFX9
                         compiler + f64 + render-graph multi-queue
                         (3.2.0–3.2.14) — arc done
-  v3.3             ─▶  image loading (gated on pure-Cyrius decoder)
+  v3.3   [ACTIVE]  ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
+                        new chitra package); arrays/cubes + JPEG → v3.4+
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
                         retires (AMD consumers run on AMD native only)
@@ -162,12 +163,39 @@ consumer request arrives. Listed so they don't get lost.
 
 ---
 
-## v3.3 — Asset Loading
+## v3.3 — Asset Loading (ACTIVE)
 
-- **Image loading (PNG / JPEG)** — adopted only once a pure-Cyrius
-  decoder exists in the AGNOS ecosystem. **Dependency-gated**: if
-  no decoder ships by the 3.3 window, this moves to 3.4+. No C
-  image library will be vendored to force the issue.
+mabda can create + sample textures but cannot yet **load** one from a
+file / byte buffer. v3.3 closes that with three loaders behind one split —
+**decode is CPU (in a package); container-parse + GPU upload is in mabda.**
+Planned 2026-06-19 (`33x` branch, toolchain 6.2.23); see the **punchlist** +
+two **proposals**:
+
+- Punchlist: [`3-3-punchlist.md`](3-3-punchlist.md)
+- Asset loading (mabda): [`v3.3-asset-loading.md`](../proposals/v3.3-asset-loading.md)
+- chitra PNG decoder package: [`v3.3-chitra-png-decoder-package.md`](../proposals/v3.3-chitra-png-decoder-package.md)
+
+**The original "dependency-gated, no decoder exists" framing was wrong.** The
+stdlib `sankoch` already ships zlib/DEFLATE inflate, and `kii` already has a
+fuzz-hardened PNG decoder. So v3.3:
+
+- **KTX2 + DDS** — parsed in mabda; GPU-ready blocks (mips, BC/compressed)
+  placed per level. **Ungated** — rides the 3.2.x compressed-texture stack.
+- **PNG** — decoded to RGBA8 by a **new pure-Cyrius sibling package, `chitra`**
+  (a fork+adaptation of kii's PNG core over `sankoch`), which mabda deps; mabda
+  uploads the RGBA8.
+
+Adds to mabda: a VkFormat/DXGI→`MABDA_TEXFMT_*` map, per-mip-level upload +
+generalized mipped create (two new Backend slots, `BACKEND_SIZE` 280→296), a
+caps-on-ctx gate, and the `gpu_texture_load_{ktx2,dds,png}` + sniffer API.
+Arc spans **3.3.0 → 3.3.7** (smallest-risk-first; the chitra package cut is the
+one cross-repo edge).
+
+**Still gated / deferred (tracked, not dropped):** KTX2 supercompression
+(BasisLZ/Zstd/ZLIB — needs a Zstd/Basis decoder); **JPEG** (chitra v0.2+);
+**array layers / cubemaps** (parsed-and-rejected-loud in 3.3.x → real support
+in v3.4, Phase AL-ARRAY); ETC2/ASTC sampling stays HW-blocked on Cezanne (caps
+gate catches it). sRGB policy decided in AL.0.
 
 ---
 

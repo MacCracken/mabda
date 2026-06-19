@@ -199,7 +199,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.22+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.23+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
