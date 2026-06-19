@@ -6115,6 +6115,12 @@ var MIR_OP_F64_MUL_HALF   = 56;   # v_mul_f64(a, 0.5) — inline-0.5 src1
 var MIR_OP_F64_CONST      = 57;   # materialize f64 const (a = lo dword imm, b = hi dword imm)
 var MIR_OP_F64_LDEXP      = 58;   # v_ldexp_f64 (a = f64, b = i32 exponent)
 var MIR_OP_F64_CMP_GT     = 59;   # v_cmp_gt_f64 (a, b) → VCC; dst unused
+# v3.2 F.7f.10 — i32<->f64 conversions (the exp range reduction: k_i32 = round(x*invln2),
+# k_f64 = (f64)k_i32). VOP1, round-to-nearest-even (GFX9 v_cvt_i32_f64). NOT forced-DIVERGENT
+# (general conversions, meet-classified like the i32<->f32 CVTs; the exp chain gets divergence
+# from the F64_CONST operands anyway). The f32<->f64 FCONVERT (45) is a different op.
+var MIR_OP_CVT_I32_F64    = 60;   # (i32)f64 round-to-nearest (v_cvt_i32_f64 0x03)
+var MIR_OP_CVT_F64_I32    = 61;   # (f64)i32 (v_cvt_f64_i32 0x04)
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -7500,9 +7506,24 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         }
         return 0 - MIR_ERR_UNSUPPORTED_OP;
     }
-    if (op == SPIRV_OP_CONVERT_S_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
+    # i32<->float conversions. The f64 variants (F.7f.10) route to the i32<->f64 cvt ops; f32 keeps
+    # the i32<->f32 ones. SToF picks by the RESULT type (f64 → CVT_F64_I32); FToS by the OPERAND type
+    # (f64 operand → CVT_I32_F64). (OpConvertSToF/FToS are valid SPIR-V core ops for f64, unlike the
+    # GLSL.std.450 transcendentals — see the F.7f arithmetic-only decision.)
+    if (op == SPIRV_OP_CONVERT_S_TO_F) {
+        if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var srt = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+        if (mir_type_base(srt) == MIR_T_F64) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F64_I32, types, m); }
+        return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m);
+    }
     if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
-    if (op == SPIRV_OP_CONVERT_F_TO_S) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m); }
+    if (op == SPIRV_OP_CONVERT_F_TO_S) {
+        if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (mir_type_base(mir_val_type(m, spirv_word(ptr, off + 3))) == MIR_T_F64) {
+            return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32_F64, types, m);
+        }
+        return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m);
+    }
     if (op == SPIRV_OP_FCONVERT) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_FCONVERT, types, m); }
     if (op == SPIRV_OP_COMPOSITE_CONSTRUCT) { return _spirv_lower_composite_construct(ptr, off, wc, types, m); }
     if (op == SPIRV_OP_COMPOSITE_EXTRACT) {
@@ -7848,6 +7869,9 @@ var GISEL_V_MUL_F64_HALF      = 71;   # v_mul_f64(a, 0.5)
 var GISEL_V_CONST_F64         = 72;   # materialize f64 const into a VGPR pair
 var GISEL_V_LDEXP_F64         = 73;   # v_ldexp_f64 (f64, i32)
 var GISEL_V_CMP_GT_F64        = 74;   # v_cmp_gt_f64 (a, b) → VCC
+# v3.2 F.7f.10 — i32<->f64 conversions (exp range reduction). VOP1, reuse _emit_vop1.
+var GISEL_V_CVT_I32_F64       = 75;   # (i32)f64 round-nearest
+var GISEL_V_CVT_F64_I32       = 76;   # (f64)i32
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -8106,6 +8130,9 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_F64_CONST) { return _gisel_emit(out, k, GISEL_V_CONST_F64, dst, a, b, 0, flags); }
     if (op == MIR_OP_F64_LDEXP) { return _gisel_emit(out, k, GISEL_V_LDEXP_F64, dst, a, b, 0, flags); }
     if (op == MIR_OP_F64_CMP_GT) { return _gisel_emit(out, k, GISEL_V_CMP_GT_F64, 0, a, b, 0, flags); }
+    # F.7f.10 i32<->f64 cvt (exp reduction): unary, reuse _emit_vop1. Result type drives the reg file.
+    if (op == MIR_OP_CVT_I32_F64) { return _gisel_emit(out, k, GISEL_V_CVT_I32_F64, dst, a, 0, 0, flags); }
+    if (op == MIR_OP_CVT_F64_I32) { return _gisel_emit(out, k, GISEL_V_CVT_F64_I32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_EXTRACT) {
         # The EXTRACT result's register file is decided from its uniformity
         # (gisel_result_is_vgpr), so a result-less or UNKNOWN-uniformity extract
@@ -9410,6 +9437,9 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_V_CMP_GT_F64) {
         return _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOPC_V_CMP_GT_F64);
     }
+    # F.7f.10 i32<->f64 cvt (exp reduction): VOP1, reuse _emit_vop1 with the existing encoders.
+    if (op == GISEL_V_CVT_I32_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F64); }
+    if (op == GISEL_V_CVT_F64_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F64_I32); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }

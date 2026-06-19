@@ -876,3 +876,11 @@ build/native_spirv_f64_vec_e2e: programs/native_spirv_f64_vec_e2e.cyr src/*.cyr
 .PHONY: test-native-spirv-f64-vec-e2e
 test-native-spirv-f64-vec-e2e: build/native_spirv_f64_vec_e2e
 	./build/native_spirv_f64_vec_e2e
+
+build/native_spirv_f64_i32_cvt_e2e: programs/native_spirv_f64_i32_cvt_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_i32_cvt_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-i32-cvt-e2e
+test-native-spirv-f64-i32-cvt-e2e: build/native_spirv_f64_i32_cvt_e2e
+	./build/native_spirv_f64_i32_cvt_e2e

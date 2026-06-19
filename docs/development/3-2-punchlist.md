@@ -1047,25 +1047,33 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
       because the GFX9 core handles subnormals unscaled, masking it). Fixed: carry the f64 const as
       two 32-bit halves (a=lo, b=hi); re-verified — the subnormals now exercise ACTIVE scaling and
       still pass bit-exact. Pinned by a threshold-VALUE assert + [[reference_mir_operand_32bit_packing]].
-  - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing)
-    for consumer OpFOrdLessThan/etc. → bool/branch (attn11 max/argmax/masking). The internal VCC-only
-    f64 compares (CMP_GT/CMP_CLASS) already exist from FSqrt; this is the public bool-producing path.
-  - [ ] **F.7f.9 (SPIR-V f64 OpConstant)** — the COMPILER-INTERNAL f64-const primitive (`MIR_OP_F64_CONST`)
-    shipped with F.7f.7c. This remaining piece is the SPIR-V path: `spirv_build_const_table` stores only
-    word-3 today (f64 OpConstant is 64-bit, words 3+4 — currently TRUNCATED), so consumer f64 literals
-    (attn11's epsilon 1e-5, GELU coeffs) need the table to keep both words + the binop operand-resolution
-    to pre-materialize an f64-const operand via `MIR_OP_F64_CONST`. The transcendentals don't need this
-    (their coefficients are compiler-generated, not SPIR-V literals).
-  - [ ] **F.7f.10 (exp f64)** — range reduction (k=round(x/ln2), r=x-k·ln2) + Horner polynomial +
-    `v_ldexp_f64` scale-by-2^k; value-exact vs CPU `exp`. attn11 softmax/SSM blocker.
-  - [ ] **F.7f.11 (ln f64)** — `v_frexp_f64` mantissa/exp split + polynomial on the reduced mantissa +
-    `+exp·ln2`; value-exact vs CPU `log`. attn11 cross-entropy/softplus blocker.
-  - [ ] **F.7f.12 (tanh f64)** — built on F.7f.10 exp: `tanh(x)=(e^2x-1)/(e^2x+1)` with the large-|x|
-    saturation guard; value-exact vs CPU `tanh`. attn11 GELU blocker.
-  - [ ] **F.7f.13 (pow f64)** — `pow(b,e)=exp(e·ln(b))` reusing F.7f.10/F.7f.11 + the b≤0/edge guards;
-    value-exact vs CPU `pow`. attn11 RoPE/Adam blocker.
-  - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
-    attn11 uses (the full {add,sub,mul,div,sqrt,fma,exp,ln,tanh,pow,cmp,cvt} set), end-to-end on Cezanne.
+  - **F.7f transcendentals — ARITHMETIC-ONLY** *(maintainer decision 2026-06-19)* — mabda does NOT
+    provide f64 exp/ln/tanh/pow as `OpExtInst` intrinsics. **GLSL.std.450 Exp/Log/Exp2/Log2/Pow/Sin
+    are 16/32-bit-only** — `spirv-val` rejects them on f64 (only Sqrt/FAbs/Floor/FMin/FMax + core
+    OpFDiv are f64-valid). A conformant Vulkan consumer can't invoke an f64 exp intrinsic. So consumers
+    (attn11) **hand-roll** exp/ln/tanh/pow as polynomials using mabda's f64 arithmetic; mabda compiles
+    the arithmetic. A fully-built degree-13 exp macro (≤1 ULP) was **backed out** (uninvocable). The
+    deliverable is the CONFORMANT TOOLKIT so consumers can hand-roll. See
+    [[project_f64_transcendentals_arithmetic_only]]. (Former F.7f.10–13 exp/ln/tanh/pow intrinsics: dropped.)
+    - [x] **F.7f.10 (i32↔f64 OpConvert)** *(2026-06-19)* — **HW-verified on Cezanne**: OpConvertFToS
+      (f64→i32) → `CVT_I32_F64` (0x03), OpConvertSToF (i32→f64) → `CVT_F64_I32` (0x04). `out=(double)(int)a`
+      bit-exact vs SPIR-V round-TOWARD-ZERO — confirming GFX9 `v_cvt_i32_f64` TRUNCATES (a design agent
+      wrongly claimed round-to-nearest). `native_spirv_f64_cvt_e2e.cyr`. The conformant salvage of the
+      exp work; the cvt ops + F64_CONST primitive are kept (FSqrt + consumers use them).
+  - [ ] **F.7f.8 (f64 compares)** — public float-compare path (V_CMP_*_F64 VOPC → bool/SCC) for consumer
+    OpFOrdLessThan/etc. → bool/branch (attn11 max/argmax/masking; also the consumer-rolled transcendental
+    special cases). The internal VCC-only compares (CMP_GT/CMP_CLASS) exist from FSqrt; this is the
+    bool-producing path.
+  - [ ] **F.7f.9 (SPIR-V f64 OpConstant)** — `MIR_OP_F64_CONST` (the primitive) shipped with F.7f.7c.
+    The SPIR-V path remains: `spirv_build_const_table` stores only word-3 today (f64 OpConstant is 64-bit,
+    words 3+4 — TRUNCATED), so consumer f64 literals (attn11 epsilon 1e-5, hand-rolled exp coeffs) need
+    the table to keep both words + the binop operand-resolution to pre-materialize an f64-const operand.
+    REQUIRED for consumers to hand-roll transcendentals (the coefficients are SPIR-V literals).
+  - [ ] **F.7f.Ldexp** — if GLSL.std.450 Ldexp is f64-valid (likely — it's general-float like Sqrt),
+    wire `OpExtInst Ldexp` (f64) → `MIR_OP_F64_LDEXP` (encoder + MIR op exist from F.7f.7a/c) so consumers
+    get 2^k for their hand-rolled exp without bit tricks.
+  - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the conformant op set attn11's hand-rolled f64
+    kernels need is HW-verified: {add,sub,mul,div,sqrt,fma,cmp,cvt(i32↔f64 + f32↔f64),const,ldexp}.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,
   bit-faithful vs the CPU f64 oracle). Acceptance proof.
 - [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow
