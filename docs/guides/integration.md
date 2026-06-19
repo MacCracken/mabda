@@ -1,6 +1,6 @@
 # Consumer Integration Guide
 
-> Written against mabda 3.0.0-rc.2 / Cyrius 5.11.28. Full launcher-wiring
+> Written against mabda 3.2.14 / Cyrius 6.2.22. Full launcher-wiring
 > walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
 
 ## How to Depend on Mabda
@@ -10,7 +10,7 @@ Declare mabda in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "3.0.0-rc.1"
+tag = "3.2.14"
 modules = ["dist/mabda.cyr"]
 ```
 

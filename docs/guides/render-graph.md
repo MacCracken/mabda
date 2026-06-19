@@ -161,9 +161,19 @@ Consequences:
 - Single-pass workloads. The boilerplate of `rg_new` + `rg_add_*` +
   `rg_build` + `rg_execute` isn't worth it for one dispatch.
 
-## Out of scope for v2.5.0
+## Shipped since v2.5.0
 
-Everything below is roadmap material, not current behavior:
+- **Cross-queue coordination (multi-queue render graph).** **Shipped in
+  v3.2.13–v3.2.14 (Phase R).** Declare per-node queue affinity with
+  `rg_node_queue(g, node_id, kind)` and execute with `rg_execute_mq(g, ctx)`:
+  on native AMD the scheduler runs nodes on distinct HW rings (GFX / COMPUTE)
+  ordered by in-CS timeline waits; on wgpu it is serialized-equivalent (one
+  device queue). Omitting affinity reproduces the v2.5 single-queue ordering.
+  The original `rg_execute(g, device, queue)` single-submit path is unchanged.
+
+## Out of scope (current)
+
+Roadmap material, not current behavior:
 
 - Full topological sort for out-of-order node insertion (today:
   insertion-order + cycle detection).
@@ -174,15 +184,15 @@ Everything below is roadmap material, not current behavior:
   own pass; there is no graph-level "shared render pass with N draws
   across N nodes" construct. That belongs in a higher-level
   frame authoring layer.
-- Cross-queue coordination (compute on one queue, graphics on
-  another). Single-queue only. Revisited in v3.1 with multi-queue.
 
 ## Reference
 
 - Module source: [`src/render_graph.cyr`](../../src/render_graph.cyr)
-- Regression tests: [`tests/tcyr/mabda.tcyr`](../../tests/tcyr/mabda.tcyr)
+- Regression tests: [`tests/tcyr/render.tcyr`](../../tests/tcyr/render.tcyr)
   (search for `test_rg_*`)
-- GPU integration program:
-  [`programs/render_graph_e2e.cyr`](../../programs/render_graph_e2e.cyr)
+- GPU integration programs:
+  [`programs/render_graph_e2e.cyr`](../../programs/render_graph_e2e.cyr) (wgpu)
+  and [`programs/native_render_graph_mq_e2e.cyr`](../../programs/native_render_graph_mq_e2e.cyr)
+  (native multi-queue, HW-verified on Cezanne).
 - `make test-render-graph-e2e` runs the integration against a live
   wgpu-native + Vulkan driver.

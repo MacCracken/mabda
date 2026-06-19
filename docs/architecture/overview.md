@@ -2,10 +2,15 @@
 
 ## What Mabda Is
 
-Mabda is a GPU foundation library written in Cyrius. It owns the
-wgpu-native FFI boundary and provides shared GPU infrastructure so
-that every AGNOS consumer builds on one consistent base instead of
-duplicating device management, buffer creation, and pipeline setup.
+Mabda is a GPU foundation library written in Cyrius. As of v3.0 it owns
+**two GPU backends behind one public API**: the wgpu-native FFI boundary
+(the cross-vendor default) and a pure-Cyrius DRM/KMS **native AMD** backend
+(direct `amdgpu` ioctls, GFX9 PM4, and — as of the v3.2.x arc — an in-tree
+SPIR-V→GFX9 compute compiler). It provides shared GPU infrastructure so
+every AGNOS consumer builds on one consistent base instead of duplicating
+device management, buffer creation, and pipeline setup; the backend choice
+is invisible to consumer code (the `@public` API is byte-identical across
+both, routed through an `@internal` `Backend` slot table).
 
 ## Module Map
 
@@ -15,52 +20,55 @@ duplicating device management, buffer creation, and pipeline setup.
 └─────────────────┬───────────────────────────────────────┘
                   │
 ┌─────────────────▼───────────────────────────────────────┐
-│ mabda (30 @public + 3 @internal)                         │
+│ mabda (30 @public + 19 @internal; 49 domain modules)     │
 │                                                          │
 │  Core:      error, color, capabilities, context,         │
 │             profiler, resource, debug                     │
-│                                                          │
-│  Buffers:   buffer, typed_buffer, compute, gpu_timestamps │
-│             shader_cache, pipeline_cache,                 │
-│             bind_group_cache (all u64-keyed since v2.4.5) │
-│                                                          │
+│  Buffers:   buffer, typed_buffer, compute, gpu_timestamps,│
+│             shader_cache, pipeline_cache, bind_group_cache│
 │  Graphics:  vertex, blend, sampler, depth, texture,       │
-│             bind_group, instancing                        │
+│             texture_format, bind_group, instancing        │
+│  Render:    render_target, render_pipeline, render_pass,  │
+│             render_graph, surface, surface_v3, queue       │
 │                                                          │
-│  Render:    render_target, render_pipeline,               │
-│             render_pass, render_graph, surface            │
-│                                                          │
-│  FFI (@internal):                                         │
-│             wgpu_types, wgpu_descriptors, wgpu_ffi        │
-└─────────────────┬───────────────────────────────────────┘
-                  │
-┌─────────────────▼───────────────────────────────────────┐
-│ wgpu-native C API (v29) via 65-slot function table       │
-│ C launcher (deps/wgpu_main.c) handles 7 struct-packing   │
-│ shims for struct-by-value / 6+ i64-arg calls             │
-└─────────────────┬───────────────────────────────────────┘
-                  │
-┌─────────────────▼───────────────────────────────────────┐
-│ Vulkan / Metal / DX12 (GPU driver)                       │
-└─────────────────────────────────────────────────────────┘
+│  @internal Backend slot table → routes every @public call │
+│  to ONE of the two backends below (same call-site shape): │
+└──────────┬──────────────────────────────────┬───────────┘
+           │ wgpu fillers                      │ native AMD fillers
+┌──────────▼─────────────────────┐ ┌──────────▼───────────────────────┐
+│ wgpu-native C API (v29) via a   │ │ direct amdgpu DRM ioctls (no      │
+│ 65-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
+│ (deps/wgpu_main.c) — 7 struct-  │ │ + KMS; SPIR-V→GFX9 compute compiler│
+│ packing shims                   │ │ (gfx9_encode/spirv_parse/mir/      │
+│                                 │ │ spirv_lower/gfx9_isel/regalloc/    │
+│                                 │ │ waitcnt/abi/compile)               │
+└──────────┬─────────────────────┘ └──────────┬───────────────────────┘
+           │                                   │
+┌──────────▼─────────────────────┐ ┌──────────▼───────────────────────┐
+│ Vulkan / Metal / DX12 driver    │ │ Linux amdgpu kernel driver (AMD)  │
+└─────────────────────────────────┘ └───────────────────────────────────┘
 ```
 
 ## Flat Layout
 
 ```
-src/
-├── lib.cyr              — single include chain (stdlib + domain)
-├── error.cyr            — GpuErr codes + Result helpers
-├── color.cyr, capabilities.cyr, profiler.cyr, resource.cyr
-├── wgpu_types.cyr, wgpu_descriptors.cyr, wgpu_ffi.cyr   (@internal)
-├── context.cyr          — GpuContext (instance/adapter/device/queue)
-├── buffer.cyr, typed_buffer.cyr, gpu_timestamps.cyr
-├── compute.cyr          — compute pipeline + PingPongBuffer
+src/   (49 modules — see CLAUDE.md "Architecture" for the annotated tree)
+├── lib.cyr              — single include chain (stdlib + domain modules)
+├── error.cyr, color.cyr, capabilities.cyr, profiler.cyr, resource.cyr, debug.cyr
+├── context.cyr          — GpuContext (wgpu instance/adapter/device/queue OR
+│                          native fd/ctx_id/BO handles, dual-interpreted)
+├── buffer.cyr, typed_buffer.cyr, gpu_timestamps.cyr, compute.cyr
 ├── shader_cache.cyr, pipeline_cache.cyr, bind_group_cache.cyr
-├── vertex.cyr, blend.cyr, sampler.cyr, depth.cyr
-├── bind_group.cyr, texture.cyr, render_target.cyr
-├── render_pipeline.cyr, render_pass.cyr, render_graph.cyr
-├── surface.cyr, instancing.cyr, debug.cyr
+├── vertex.cyr, blend.cyr, sampler.cyr, depth.cyr, bind_group.cyr
+├── texture.cyr, texture_format.cyr, render_target.cyr, render_pipeline.cyr
+├── render_pass.cyr, render_graph.cyr, queue.cyr, surface.cyr, surface_v3.cyr, instancing.cyr
+├── @internal wgpu FFI:  wgpu_types.cyr, wgpu_descriptors.cyr, wgpu_ffi.cyr
+├── @internal backend:   backend.cyr, backend_wgpu.cyr, backend_native.cyr,
+│                        backend_native_amdgpu.cyr, backend_native_pm4.cyr,
+│                        backend_native_shaders.cyr, backend_native_kms.cyr
+└── @internal SPIR-V→GFX9 compiler (v3.2.x): gfx9_encode.cyr, spirv_parse.cyr,
+                         mir.cyr, spirv_lower.cyr, gfx9_isel.cyr,
+                         gfx9_regalloc.cyr, gfx9_waitcnt.cyr, gfx9_abi.cyr, gfx9_compile.cyr
 ```
 
 Stdlib includes live **only** in `src/lib.cyr`. Domain modules are
@@ -126,8 +134,8 @@ Key requirements (all validated in v2.4.x runtime sweep):
   strstr and crashing Mesa's driver-string probing.
 
 For non-GPU modules, `cyrius build programs/smoke.cyr` or
-`cyrius test tests/tcyr/mabda.tcyr` drives everything; no object
-mode, no C linker.
+`make test` (globs `tests/tcyr/*.tcyr`, 16 domain suites) drives
+everything; no object mode, no C linker.
 
 ## Struct-Packing Shim Pattern
 

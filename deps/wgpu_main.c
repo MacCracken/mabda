@@ -434,7 +434,7 @@ static int preinit_gpu(void) {
     // without it, every SPIR-V createShaderModule returns NULL (the fail-loud
     // path mabda surfaces as a 0 module). WGSL is unaffected. Consumers that
     // copy this launcher must carry this edit to use SPIR-V — see the migration
-    // note in CHANGELOG / docs/proposals/v3.2-spirv-ingestion-wgpu.md.
+    // note in CHANGELOG / docs/archive/proposals/v3.2-spirv-ingestion-wgpu.md.
     static const WGPUInstanceFeatureName k_required_features[] = {
         WGPUInstanceFeatureName_ShaderSourceSPIRV,
     };

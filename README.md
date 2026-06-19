@@ -199,7 +199,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 5.5.20+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.22+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -210,8 +210,8 @@ cyrius deps
 # Full gate sweep (lint, fmt, vet, version-check, distlib-sync, tests, bench)
 make test-all
 
-# CPU-only unit suite (1991 assertions across 3 files)
-make test            # mabda.tcyr (633) + mabda_v3.tcyr (968) + mabda_v3_phase_d.tcyr (390)
+# CPU-only unit suite (4079 assertions across 16 domain files)
+make test            # globs tests/tcyr/*.tcyr (count via scripts/count-test-assertions.sh)
 
 # CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
 cyrius bench tests/bcyr/mabda.bcyr
@@ -229,14 +229,16 @@ make bench-gpu                                # 13 GPU benches
 
 ```
 mabda/
-├── src/                 38 modules (28 @public + 10 @internal FFI)
+├── src/                 49 modules (30 @public + 19 @internal FFI/backend)
 │                        (src/lib.cyr is the single include chain)
 ├── tests/
-│   ├── tcyr/mabda.tcyr           v2 backend-agnostic suite (633 asserts)
-│   ├── tcyr/mabda_v3.tcyr        v3 backend + compute + render (968 asserts)
-│   ├── tcyr/mabda_v3_phase_d.tcyr  Phase D KMS + 7.7 surface (390 asserts)
+│   ├── tcyr/                     16 functionality-named domain suites — core,
+│   │                            buffer, compute, texture, graphics, render,
+│   │                            backend, caches, surface, native, kms, queue,
+│   │                            compiler_{encode,lower,backend,compile}
+│   │                            (4079 asserts; `make test` globs them all)
 │   └── bcyr/mabda.bcyr           CPU-only benchmark harness (9 benches)
-├── programs/            10 GPU integration programs + dev spikes + `benchmarks.cyr`
+├── programs/            GPU integration programs (wgpu + native) + dev spikes + `benchmarks.cyr`
 │   ├── smoke.cyr                Link-check — `cyrius build` entry point
 │   ├── phase0.cyr               wgpu buffer/texture/pipeline smoke
 │   ├── compute_e2e.cyr          wgpu compute dispatch round-trip
@@ -259,7 +261,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              3.0.3
+├── VERSION              3.2.14
 └── CHANGELOG.md
 ```
 

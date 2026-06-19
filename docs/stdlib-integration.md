@@ -1,10 +1,13 @@
 # Stdlib Integration Guide
 
-> **Heads-up:** this guide documents a **transitional** integration
-> path. The C launcher + wgpu-native requirement is scaffolding that
-> exists only because the native Cyrius GPU backend isn't ready yet.
-> When v3.0 lands, every section marked **[transitional]** below
-> disappears. Your `src/main.cyr` does not change.
+> **Heads-up:** this guide covers the **wgpu** integration path (C launcher
+> + wgpu-native), which is the cross-vendor default and remains load-bearing
+> across the entire v3.x line. v3.0 (2026-06-02) added a pure-Cyrius **native
+> AMD** backend *alongside* wgpu — not replacing it — so the C launcher does
+> NOT disappear at v3.0; per the roadmap the wgpu+C path retires per-vendor
+> (AMD at v4.0, then NVIDIA, then Intel) only once each vendor's native
+> backend is in production. Either way your `src/main.cyr` does not change —
+> the `@public` API is identical across backends.
 
 Mabda is a Cyrius stdlib-trusted dep starting with v2.3.0. This guide
 walks a new consumer project through the one-time setup to compile
@@ -18,7 +21,7 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "5.5.20"
+cyrius = "6.2.22"
 
 [build]
 entry = "src/main.cyr"
@@ -29,7 +32,7 @@ stdlib = ["alloc", "string", "fmt", "syscalls", "tagged", "fnptr"]
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "2.5.0"
+tag = "3.2.14"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -75,7 +78,7 @@ your project's `deps/` directory). It does exactly four things:
    `wgpuInstanceRequestAdapter` → `wgpuAdapterRequestDevice` →
    `wgpuDeviceGetQueue`. Packages the four handles into a
    `WgpuPreinit` struct.
-3. **Build the 58-slot function table.** Populates function pointers
+3. **Build the 65-slot function table.** Populates function pointers
    for every wgpu entry mabda uses, including struct-packing shims
    that route around Cyrius's `fncall6`-plus-wgpu crash bug:
    - `wgpu_shim_copy_buffer_to_buffer` — 6-arg wgpu call packed into
@@ -147,7 +150,7 @@ it still compiles against the v3.0 mabda tag, the contract held.
 ## Known transitional warnings
 
 When compiling the bundled `dist/mabda.cyr`, cc5 emits
-`undefined function` warnings for the 58 wgpu function-table slots.
+`undefined function` warnings for the 65 wgpu function-table slots.
 These are **expected and benign** — the slots are globals populated
 by the C launcher at runtime. In v3.0 these warnings disappear
 because the functions become real Cyrius definitions.
@@ -180,5 +183,5 @@ that's a bug; please file it at
 Mabda 2.3.0 shipped the last audit-gated stdlib-candidate pass.
 Findings + remediation in
 [`docs/audit/2026-04-19-audit.md`](audit/2026-04-19-audit.md). Every
-HIGH / MED finding landed with a regression assertion in
-`tests/tcyr/mabda.tcyr`. See `SECURITY.md` for the policy.
+HIGH / MED finding landed with a regression assertion in the relevant
+`tests/tcyr/*.tcyr` domain suite. See `SECURITY.md` for the policy.

@@ -205,7 +205,7 @@ doesn't change between paths.
 
 ## Current State (post 3.2.14, 2026-06-19)
 
-- **Source**: 49 domain modules under `src/*.cyr`, ~21,100 lines
+- **Source**: 49 domain modules under `src/*.cyr`, ~22,300 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
@@ -306,7 +306,7 @@ doesn't change between paths.
   the wgpu path). Reference Rust numbers in
   `docs/benchmarks-rust-v-cyrius.md`. Native-on-AMD bench cell
   is Tier 3 work pending a consumer flip.
-- **Dist bundle**: `dist/mabda.cyr` — ~19,000 lines.
+- **Dist bundle**: `dist/mabda.cyr` — ~22,300 lines.
   `cyrius distlib` regenerates it.
 - **Integration**: consumed by soorat, rasa, ranga, bijli, aethersafta,
   kiran (via soorat). Six-consumer regression sweep is Tier 2 ship
