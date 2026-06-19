@@ -652,29 +652,48 @@ fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
     return 0;
 }
 
-# GLSL.std.450 Sqrt (f64) → the LLVM Newton-Goldschmidt expansion (F.7f.7b). GFX9 has no f64
-# sqrt and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so: a v_rsq_f64 seed, then
-# the simultaneous sqrt/rsqrt Newton refinement (h≈√x, g≈0.5/√x) — two correction rounds give a
-# correctly-rounded result for NORMAL inputs. A v_cmp_class_f64 (mask 0x260 = +0/-0/+inf) then
-# passes those special classes through unchanged (the Newton path would yield 0·inf=NaN); NaN and
-# negatives take the Newton path → NaN (correct). SUBNORMAL inputs are approximate here — the LLVM
-# ldexp scale-up/down wrapper that makes them correctly-rounded is F.7f.7c (it needs the f64-const
-# materialization shared with F.7f.9). See docs/development/3-2-punchlist.md.
+# GLSL.std.450 Sqrt (f64) → the full-range LLVM gfx900 expansion (F.7f.7b core + 7c wrapper). GFX9
+# has no f64 sqrt and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so:
+#  (1) subnormal scale-up — vcc_sub = (2^-767 > x); scale tiny x up by 2^256 (else 2^0) so the
+#      Newton core keeps full precision (rsq/products of a subnormal would underflow);
+#  (2) Newton-Goldschmidt — v_rsq_f64 seed + simultaneous sqrt/rsqrt refinement (h≈√xs, g≈0.5/√xs),
+#      two correction rounds → correctly-rounded sqrt(xs);
+#  (3) rescale — multiply the result by 2^-128 when x was scaled (sqrt halves the exponent shift);
+#  (4) special-case — v_cmp_class_f64 (mask 0x260 = +0/-0/+inf) passes those classes through (the
+#      Newton path would give 0·inf=NaN). NaN/negative take the Newton path → NaN (correct).
+# DUAL VCC: vcc_sub (from CMP_GT) drives BOTH cndmasks (scale-up + rescale) and must survive the
+# whole core — only VMOV/LDEXP/FMA/MUL sit between, none of which write VCC; then CMP_CLASS
+# overwrites VCC with vcc_class for the final pair-select. The chain is emitted in this exact order.
 fn _spirv_lower_fsqrt_f64(m, x, result): i64 {
     var t = MIR_T_F64;
-    var rsq = _udiv_op(m, MIR_OP_F64_RSQ, t, x, 0, 0, 0);          if (rsq < 0) { return rsq; }
-    var h = _udiv_op(m, MIR_OP_FMUL, t, x, rsq, 0, 0);            if (h < 0) { return h; }
-    var g = _udiv_op(m, MIR_OP_F64_MUL_HALF, t, rsq, 0, 0, 0);    if (g < 0) { return g; }
-    var r = _udiv_op(m, MIR_OP_F64_FMA_N0_HALF, t, g, h, 0, 0);   if (r < 0) { return r; }  # 0.5 - g*h
-    var h2 = _udiv_op(m, MIR_OP_FMA, t, h, r, h, 0);              if (h2 < 0) { return h2; } # h + h*r
-    var g2 = _udiv_op(m, MIR_OP_FMA, t, g, r, g, 0);             if (g2 < 0) { return g2; } # g + g*r
-    var d = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h2, h2, x, 0);     if (d < 0) { return d; }   # x - h*h
-    var h3 = _udiv_op(m, MIR_OP_FMA, t, d, g2, h2, 0);           if (h3 < 0) { return h3; } # h + d*g
-    var d2 = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h3, h3, x, 0);    if (d2 < 0) { return d2; } # x - h*h
-    var core = _udiv_op(m, MIR_OP_FMA, t, d2, g2, h3, 0);        if (core < 0) { return core; } # h + d*g
-    var mask = _udiv_op(m, MIR_OP_VMOV, MIR_T_U32, 0x260, 0, 0, MIR_FLAG_A_IMM); if (mask < 0) { return mask; }
-    var ecc = mir_emit(m, MIR_OP_F64_CMP_CLASS, 0, MIR_T_U32, x, mask, 0, 0);    if (ecc < 0) { return ecc; }
-    var ecm = mir_emit(m, MIR_OP_F64_CNDMASK, result, t, core, x, 0, 0);  # VCC ? x : core
+    var u = MIR_T_U32;
+    # (1) subnormal gate + scale-up. threshold f64 = 0x1000000000000000 (2^-767): lo dword 0,
+    # hi dword 0x10000000 (split across a/b — the MIR record packs operands into 32-bit halves).
+    var thr = _udiv_op(m, MIR_OP_F64_CONST, t, 0, 0x10000000, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+    if (thr < 0) { return thr; }
+    var ecg = mir_emit(m, MIR_OP_F64_CMP_GT, 0, u, thr, x, 0, 0);  if (ecg < 0) { return ecg; }  # VCC=thr>x
+    var z = _udiv_op(m, MIR_OP_VMOV, u, 0, 0, 0, MIR_FLAG_A_IMM);          if (z < 0) { return z; }
+    var c256 = _udiv_op(m, MIR_OP_VMOV, u, 256, 0, 0, MIR_FLAG_A_IMM);     if (c256 < 0) { return c256; }
+    var sup = _udiv_op(m, MIR_OP_CNDMASK, u, z, c256, 0, 0);               if (sup < 0) { return sup; }
+    var xs = _udiv_op(m, MIR_OP_F64_LDEXP, t, x, sup, 0, 0);               if (xs < 0) { return xs; }
+    # (2) Newton-Goldschmidt core on the scaled input xs.
+    var rsq = _udiv_op(m, MIR_OP_F64_RSQ, t, xs, 0, 0, 0);                 if (rsq < 0) { return rsq; }
+    var h = _udiv_op(m, MIR_OP_FMUL, t, xs, rsq, 0, 0);                    if (h < 0) { return h; }
+    var g = _udiv_op(m, MIR_OP_F64_MUL_HALF, t, rsq, 0, 0, 0);            if (g < 0) { return g; }
+    var r = _udiv_op(m, MIR_OP_F64_FMA_N0_HALF, t, g, h, 0, 0);           if (r < 0) { return r; }  # 0.5-g*h
+    var h2 = _udiv_op(m, MIR_OP_FMA, t, h, r, h, 0);                      if (h2 < 0) { return h2; }
+    var g2 = _udiv_op(m, MIR_OP_FMA, t, g, r, g, 0);                     if (g2 < 0) { return g2; }
+    var d = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h2, h2, xs, 0);            if (d < 0) { return d; }  # xs-h*h
+    var h3 = _udiv_op(m, MIR_OP_FMA, t, d, g2, h2, 0);                   if (h3 < 0) { return h3; }
+    var d2 = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h3, h3, xs, 0);           if (d2 < 0) { return d2; }
+    var core = _udiv_op(m, MIR_OP_FMA, t, d2, g2, h3, 0);                if (core < 0) { return core; }
+    # (3) rescale-down (reads the SAME vcc_sub) + (4) special-case passthrough (new vcc_class).
+    var cn = _udiv_op(m, MIR_OP_VMOV, u, 0xFFFFFF80, 0, 0, MIR_FLAG_A_IMM); if (cn < 0) { return cn; }  # -128
+    var resc = _udiv_op(m, MIR_OP_CNDMASK, u, z, cn, 0, 0);               if (resc < 0) { return resc; }
+    var mask = _udiv_op(m, MIR_OP_VMOV, u, 0x260, 0, 0, MIR_FLAG_A_IMM);  if (mask < 0) { return mask; }
+    var ecl = mir_emit(m, MIR_OP_F64_CMP_CLASS, 0, u, xs, mask, 0, 0);    if (ecl < 0) { return ecl; }  # VCC=class
+    var rr = _udiv_op(m, MIR_OP_F64_LDEXP, t, core, resc, 0, 0);          if (rr < 0) { return rr; }
+    var ecm = mir_emit(m, MIR_OP_F64_CNDMASK, result, t, rr, xs, 0, 0);   # vcc_class ? xs : rr
     if (ecm < 0) { return ecm; }
     return 0;
 }

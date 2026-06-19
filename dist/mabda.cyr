@@ -6107,6 +6107,14 @@ var MIR_OP_F64_CMP_CLASS  = 53;   # v_cmp_class_f64 (a=x, b=mask vreg) → VCC; 
 var MIR_OP_F64_CNDMASK    = 54;   # f64-pair select: dst = VCC ? b(true) : a(false)
 var MIR_OP_F64_FMA_N0_HALF = 55;  # v_fma_f64(-a, b, 0.5) — NEG src0 + inline-0.5 src2
 var MIR_OP_F64_MUL_HALF   = 56;   # v_mul_f64(a, 0.5) — inline-0.5 src1
+# v3.2 F.7f.7c — f64 sqrt subnormal-scaling wrapper (the LLVM full-range expansion). F64_CONST
+# materializes an f64 from its TWO 32-bit halves (a = low dword, b = high dword, both IMM) via 2×
+# v_mov_b32 — the MIR record packs a/b into 32-bit slots, so a single 64-bit imm would truncate
+# (the F.7f.7c review). The F.7f.9 primitive — the 2^-767 threshold, later transcendental coeffs.
+# LDEXP scales an f64 by 2^(i32 exponent); CMP_GT writes VCC (the subnormal gate). Vector-only.
+var MIR_OP_F64_CONST      = 57;   # materialize f64 const (a = lo dword imm, b = hi dword imm)
+var MIR_OP_F64_LDEXP      = 58;   # v_ldexp_f64 (a = f64, b = i32 exponent)
+var MIR_OP_F64_CMP_GT     = 59;   # v_cmp_gt_f64 (a, b) → VCC; dst unused
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6427,13 +6435,13 @@ fn _mir_instr_unif(m, i): i64 {
     if (op >= MIR_OP_VMOV) {
         if (op <= MIR_OP_CNDMASK) { return MIR_DIVERGENT; }
     }
-    # v3.2 F.7f.6b/7b — the f64 division + sqrt macro primitives (RCP / DIV_SCALE / DIV_FMAS /
-    # DIV_FIXUP / FMA_N0 / FMA_N0_ONE [46–51]; RSQ / CMP_CLASS / CNDMASK / FMA_N0_HALF / MUL_HALF
-    # [52–56]) are the same class: VOP1/VOP3/VOPC-only with implicit per-lane VCC, no scalar form.
+    # v3.2 F.7f.6b/7b/7c — the f64 division + sqrt macro primitives (RCP..FMA_N0_ONE [46–51];
+    # RSQ..MUL_HALF [52–56]; F64_CONST / LDEXP / CMP_GT [57–59]) are the same class: VOP1/VOP3/VOPC-
+    # only with implicit per-lane VCC, no scalar form (F64_CONST is a 2× v_mov_b32 into a VGPR pair).
     # Force DIVERGENT (a uniform-operand FDiv/FSqrt must not classify them UNIFORM and become an
     # SGPR-coalescing candidate — they have no SALU form). (F.7f.6b adversarial review.)
     if (op >= MIR_OP_F64_RCP) {
-        if (op <= MIR_OP_F64_MUL_HALF) { return MIR_DIVERGENT; }
+        if (op <= MIR_OP_F64_CMP_GT) { return MIR_DIVERGENT; }
     }
     var flags = mir_instr_flags(m, i);
     var b = mir_instr_b(m, i);
@@ -7122,29 +7130,48 @@ fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
     return 0;
 }
 
-# GLSL.std.450 Sqrt (f64) → the LLVM Newton-Goldschmidt expansion (F.7f.7b). GFX9 has no f64
-# sqrt and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so: a v_rsq_f64 seed, then
-# the simultaneous sqrt/rsqrt Newton refinement (h≈√x, g≈0.5/√x) — two correction rounds give a
-# correctly-rounded result for NORMAL inputs. A v_cmp_class_f64 (mask 0x260 = +0/-0/+inf) then
-# passes those special classes through unchanged (the Newton path would yield 0·inf=NaN); NaN and
-# negatives take the Newton path → NaN (correct). SUBNORMAL inputs are approximate here — the LLVM
-# ldexp scale-up/down wrapper that makes them correctly-rounded is F.7f.7c (it needs the f64-const
-# materialization shared with F.7f.9). See docs/development/3-2-punchlist.md.
+# GLSL.std.450 Sqrt (f64) → the full-range LLVM gfx900 expansion (F.7f.7b core + 7c wrapper). GFX9
+# has no f64 sqrt and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so:
+#  (1) subnormal scale-up — vcc_sub = (2^-767 > x); scale tiny x up by 2^256 (else 2^0) so the
+#      Newton core keeps full precision (rsq/products of a subnormal would underflow);
+#  (2) Newton-Goldschmidt — v_rsq_f64 seed + simultaneous sqrt/rsqrt refinement (h≈√xs, g≈0.5/√xs),
+#      two correction rounds → correctly-rounded sqrt(xs);
+#  (3) rescale — multiply the result by 2^-128 when x was scaled (sqrt halves the exponent shift);
+#  (4) special-case — v_cmp_class_f64 (mask 0x260 = +0/-0/+inf) passes those classes through (the
+#      Newton path would give 0·inf=NaN). NaN/negative take the Newton path → NaN (correct).
+# DUAL VCC: vcc_sub (from CMP_GT) drives BOTH cndmasks (scale-up + rescale) and must survive the
+# whole core — only VMOV/LDEXP/FMA/MUL sit between, none of which write VCC; then CMP_CLASS
+# overwrites VCC with vcc_class for the final pair-select. The chain is emitted in this exact order.
 fn _spirv_lower_fsqrt_f64(m, x, result): i64 {
     var t = MIR_T_F64;
-    var rsq = _udiv_op(m, MIR_OP_F64_RSQ, t, x, 0, 0, 0);          if (rsq < 0) { return rsq; }
-    var h = _udiv_op(m, MIR_OP_FMUL, t, x, rsq, 0, 0);            if (h < 0) { return h; }
-    var g = _udiv_op(m, MIR_OP_F64_MUL_HALF, t, rsq, 0, 0, 0);    if (g < 0) { return g; }
-    var r = _udiv_op(m, MIR_OP_F64_FMA_N0_HALF, t, g, h, 0, 0);   if (r < 0) { return r; }  # 0.5 - g*h
-    var h2 = _udiv_op(m, MIR_OP_FMA, t, h, r, h, 0);              if (h2 < 0) { return h2; } # h + h*r
-    var g2 = _udiv_op(m, MIR_OP_FMA, t, g, r, g, 0);             if (g2 < 0) { return g2; } # g + g*r
-    var d = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h2, h2, x, 0);     if (d < 0) { return d; }   # x - h*h
-    var h3 = _udiv_op(m, MIR_OP_FMA, t, d, g2, h2, 0);           if (h3 < 0) { return h3; } # h + d*g
-    var d2 = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h3, h3, x, 0);    if (d2 < 0) { return d2; } # x - h*h
-    var core = _udiv_op(m, MIR_OP_FMA, t, d2, g2, h3, 0);        if (core < 0) { return core; } # h + d*g
-    var mask = _udiv_op(m, MIR_OP_VMOV, MIR_T_U32, 0x260, 0, 0, MIR_FLAG_A_IMM); if (mask < 0) { return mask; }
-    var ecc = mir_emit(m, MIR_OP_F64_CMP_CLASS, 0, MIR_T_U32, x, mask, 0, 0);    if (ecc < 0) { return ecc; }
-    var ecm = mir_emit(m, MIR_OP_F64_CNDMASK, result, t, core, x, 0, 0);  # VCC ? x : core
+    var u = MIR_T_U32;
+    # (1) subnormal gate + scale-up. threshold f64 = 0x1000000000000000 (2^-767): lo dword 0,
+    # hi dword 0x10000000 (split across a/b — the MIR record packs operands into 32-bit halves).
+    var thr = _udiv_op(m, MIR_OP_F64_CONST, t, 0, 0x10000000, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+    if (thr < 0) { return thr; }
+    var ecg = mir_emit(m, MIR_OP_F64_CMP_GT, 0, u, thr, x, 0, 0);  if (ecg < 0) { return ecg; }  # VCC=thr>x
+    var z = _udiv_op(m, MIR_OP_VMOV, u, 0, 0, 0, MIR_FLAG_A_IMM);          if (z < 0) { return z; }
+    var c256 = _udiv_op(m, MIR_OP_VMOV, u, 256, 0, 0, MIR_FLAG_A_IMM);     if (c256 < 0) { return c256; }
+    var sup = _udiv_op(m, MIR_OP_CNDMASK, u, z, c256, 0, 0);               if (sup < 0) { return sup; }
+    var xs = _udiv_op(m, MIR_OP_F64_LDEXP, t, x, sup, 0, 0);               if (xs < 0) { return xs; }
+    # (2) Newton-Goldschmidt core on the scaled input xs.
+    var rsq = _udiv_op(m, MIR_OP_F64_RSQ, t, xs, 0, 0, 0);                 if (rsq < 0) { return rsq; }
+    var h = _udiv_op(m, MIR_OP_FMUL, t, xs, rsq, 0, 0);                    if (h < 0) { return h; }
+    var g = _udiv_op(m, MIR_OP_F64_MUL_HALF, t, rsq, 0, 0, 0);            if (g < 0) { return g; }
+    var r = _udiv_op(m, MIR_OP_F64_FMA_N0_HALF, t, g, h, 0, 0);           if (r < 0) { return r; }  # 0.5-g*h
+    var h2 = _udiv_op(m, MIR_OP_FMA, t, h, r, h, 0);                      if (h2 < 0) { return h2; }
+    var g2 = _udiv_op(m, MIR_OP_FMA, t, g, r, g, 0);                     if (g2 < 0) { return g2; }
+    var d = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h2, h2, xs, 0);            if (d < 0) { return d; }  # xs-h*h
+    var h3 = _udiv_op(m, MIR_OP_FMA, t, d, g2, h2, 0);                   if (h3 < 0) { return h3; }
+    var d2 = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h3, h3, xs, 0);           if (d2 < 0) { return d2; }
+    var core = _udiv_op(m, MIR_OP_FMA, t, d2, g2, h3, 0);                if (core < 0) { return core; }
+    # (3) rescale-down (reads the SAME vcc_sub) + (4) special-case passthrough (new vcc_class).
+    var cn = _udiv_op(m, MIR_OP_VMOV, u, 0xFFFFFF80, 0, 0, MIR_FLAG_A_IMM); if (cn < 0) { return cn; }  # -128
+    var resc = _udiv_op(m, MIR_OP_CNDMASK, u, z, cn, 0, 0);               if (resc < 0) { return resc; }
+    var mask = _udiv_op(m, MIR_OP_VMOV, u, 0x260, 0, 0, MIR_FLAG_A_IMM);  if (mask < 0) { return mask; }
+    var ecl = mir_emit(m, MIR_OP_F64_CMP_CLASS, 0, u, xs, mask, 0, 0);    if (ecl < 0) { return ecl; }  # VCC=class
+    var rr = _udiv_op(m, MIR_OP_F64_LDEXP, t, core, resc, 0, 0);          if (rr < 0) { return rr; }
+    var ecm = mir_emit(m, MIR_OP_F64_CNDMASK, result, t, rr, xs, 0, 0);   # vcc_class ? xs : rr
     if (ecm < 0) { return ecm; }
     return 0;
 }
@@ -7816,6 +7843,11 @@ var GISEL_V_CMP_CLASS_F64     = 68;   # v_cmp_class_f64 (a=x, b=mask) → VCC
 var GISEL_V_CNDMASK_F64       = 69;   # f64-pair select on VCC
 var GISEL_V_FMA_F64_N0_HALF   = 70;   # v_fma_f64(-a, b, 0.5)
 var GISEL_V_MUL_F64_HALF      = 71;   # v_mul_f64(a, 0.5)
+# v3.2 F.7f.7c — f64 sqrt subnormal-scaling ops. CONST_F64 = 2× v_mov_b32 (an f64 literal into a
+# pair); LDEXP_F64 is VOP3 2-src; CMP_GT_F64 is VOPC (→ VCC, dst=0).
+var GISEL_V_CONST_F64         = 72;   # materialize f64 const into a VGPR pair
+var GISEL_V_LDEXP_F64         = 73;   # v_ldexp_f64 (f64, i32)
+var GISEL_V_CMP_GT_F64        = 74;   # v_cmp_gt_f64 (a, b) → VCC
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -8069,6 +8101,11 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_F64_CNDMASK) { return _gisel_emit(out, k, GISEL_V_CNDMASK_F64, dst, a, b, 0, flags); }
     if (op == MIR_OP_F64_FMA_N0_HALF) { return _gisel_emit(out, k, GISEL_V_FMA_F64_N0_HALF, dst, a, b, 0, flags); }
     if (op == MIR_OP_F64_MUL_HALF) { return _gisel_emit(out, k, GISEL_V_MUL_F64_HALF, dst, a, 0, 0, flags); }
+    # F.7f.7c sqrt subnormal wrapper. CONST carries the 64-bit value in a (immediate); LDEXP is
+    # binary (f64 a, i32 b); CMP_GT writes the implicit VCC (dst=0, like V_CMP).
+    if (op == MIR_OP_F64_CONST) { return _gisel_emit(out, k, GISEL_V_CONST_F64, dst, a, b, 0, flags); }
+    if (op == MIR_OP_F64_LDEXP) { return _gisel_emit(out, k, GISEL_V_LDEXP_F64, dst, a, b, 0, flags); }
+    if (op == MIR_OP_F64_CMP_GT) { return _gisel_emit(out, k, GISEL_V_CMP_GT_F64, 0, a, b, 0, flags); }
     if (op == MIR_OP_EXTRACT) {
         # The EXTRACT result's register file is decided from its uniformity
         # (gisel_result_is_vgpr), so a result-less or UNKNOWN-uniformity extract
@@ -9040,15 +9077,31 @@ fn _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, GFX9_INLINE_F32_0_5, 0));
 }
 
-# v3.2 F.7f.7b — f64 v_cmp_class_f64: classify x (src0, an f64 pair) against the bitmask in vsrc1
-# (a VGPR), result → the implicit VCC (no register dst). The FSqrt special-case gate (+0/-0/+inf).
-fn _emit_cmp_class_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+# v3.2 F.7f.7b/7c — f64 VOPC compare → the implicit VCC (no register dst). src0 is the f64 pair
+# (resolved 9-bit operand), vsrc1 a VGPR (the f64 pair's low reg for CMP_GT, or the i32 class mask
+# for CMP_CLASS). The FSqrt subnormal gate (CMP_GT) + special-case gate (CMP_CLASS) share this.
+fn _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
     var vsrc1 = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
     if (vsrc1 < 0) { return vsrc1; }
-    return gfx9_emit32(buf, pos, gfx9_enc_vopc(GFX9_VOPC_V_CMP_CLASS_F64, src0, vsrc1));
+    return gfx9_emit32(buf, pos, gfx9_enc_vopc(opc, src0, vsrc1));
+}
+
+# v3.2 F.7f.7c — materialize an f64 constant into a VGPR pair via two v_mov_b32 literals. The value
+# arrives as TWO 32-bit immediates — gisel_a = low dword, gisel_b = high dword — NOT one 64-bit imm:
+# the MIR instr record packs a/b into 32-bit halves (mir_instr_a masks &0xFFFFFFFF), so a single
+# 64-bit immediate would be truncated (the F.7f.7c review CRITICAL). Both are MIR_FLAG_*_IMM so
+# waitcnt/regalloc don't treat them as value ids. The F.7f.9 primitive (sqrt threshold, coeffs).
+fn _emit_f64_const(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var lo = gisel_a(isel, i);
+    var hi = gisel_b(isel, i);
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst, GFX9_SRC_LITERAL));
+    p = gfx9_emit32(buf, p, lo & 0xFFFFFFFF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst + 1, GFX9_SRC_LITERAL));
+    return gfx9_emit32(buf, p, hi & 0xFFFFFFFF);
 }
 
 # v3.2 F.7f.7b — f64-pair cndmask: dst = VCC ? b(true) : a(false), realized as TWO v_cndmask_b32
@@ -9345,8 +9398,18 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_V_RSQ_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RSQ_F64); }
     if (op == GISEL_V_FMA_F64_N0_HALF) { return _emit_fma_n0_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_MUL_F64_HALF) { return _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
-    if (op == GISEL_V_CMP_CLASS_F64) { return _emit_cmp_class_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CMP_CLASS_F64) {
+        return _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOPC_V_CMP_CLASS_F64);
+    }
     if (op == GISEL_V_CNDMASK_F64) { return _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.7c sqrt subnormal wrapper: f64-const materialize, ldexp scale (VOP3 2-src), the GT gate.
+    if (op == GISEL_V_CONST_F64) { return _emit_f64_const(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_LDEXP_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_LDEXP_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_CMP_GT_F64) {
+        return _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOPC_V_CMP_GT_F64);
+    }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }

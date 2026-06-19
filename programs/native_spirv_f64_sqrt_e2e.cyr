@@ -1,12 +1,12 @@
-# programs/native_spirv_f64_sqrt_e2e.cyr — v3.2 Phase F.7f.7b: compiled f64 SQRT on Cezanne.
+# programs/native_spirv_f64_sqrt_e2e.cyr — v3.2 Phase F.7f.7b/7c: full-range compiled f64 SQRT.
 #
 # An f64 SPIR-V kernel — out[lid.x] = sqrt(a[lid.x]) (OpExtInst GLSL.std.450 Sqrt) over two f64
 # StorageBuffers — compiled in-tree (gfx9_compile) and dispatched (8 threads). GFX9 has no f64 sqrt
 # and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so Sqrt lowers to the LLVM
-# Newton-Goldschmidt macro: a v_rsq_f64 seed + the simultaneous sqrt/rsqrt refinement (correctly
-# rounded for NORMAL inputs) + a v_cmp_class_f64 (+0/-0/+inf) passthrough. The GPU result must
-# BIT-MATCH the offline math.sqrt reference for the finite lanes; the negative lane must be NaN.
-# (Subnormal inputs are approximate pending F.7f.7c — none are tested here.)
+# full-range macro: subnormal scale-up (cmp_gt + ldexp) → v_rsq_f64 seed + simultaneous sqrt/rsqrt
+# Newton refinement → rescale-down → a v_cmp_class_f64 (+0/-0/+inf) passthrough (F.7f.7c). The GPU
+# result must BIT-MATCH the offline math.sqrt reference for every finite lane — incl. 3 genuine
+# SUBNORMALS (5e-324 / 2.5e-310 / 1.5e-308) — and the negative lane must be NaN.
 #
 # Linked native (renderD128) via `make test-native-spirv-f64-sqrt-e2e`.
 # Exit: 0 = pass; 2 = compile; 3 = ctx; 5 = BO setup; 9 = dispatch; 11 = mismatch.
@@ -44,31 +44,33 @@ fn mono_ns(): i64 {
 
 var N_LANES = 8;
 
-# 8 f64 inputs as raw IEEE-754 bit patterns: normals (incl. irrational-sqrt 2/3/1e-5), perfect
-# squares (4/1e10/0.25), +0 (passthrough), and a negative (-> NaN).
+# 8 f64 inputs as raw IEEE-754 bit patterns, chosen to exercise the FULL range (F.7f.7c): normal
+# irrationals (2/3), THREE genuine SUBNORMALS (2^-1074, 2.5e-310, 1.5e-308 — the 7b-reduced macro
+# without the ldexp scaling would get these wrong), a perfect square (1e10), +0 (passthrough), and a
+# negative (-> NaN). DBL_MIN (smallest normal) = 2.2e-308; anything below is subnormal.
 fn fill_inputs(a): i64 {
-    store64(a + 0 , 0x4000000000000000);   # 2
-    store64(a + 8 , 0x4010000000000000);   # 4
-    store64(a + 16, 0x0000000000000000);   # 0  (special: +0 passthrough)
-    store64(a + 24, 0x3EE4F8B588E368F1);   # 1e-5  (attn11 layernorm-ish)
-    store64(a + 32, 0x4008000000000000);   # 3
-    store64(a + 40, 0x4202A05F20000000);   # 1e10
-    store64(a + 48, 0x3FD0000000000000);   # 0.25
-    store64(a + 56, 0xBFF0000000000000);   # -1  (special: negative -> NaN)
+    store64(a + 0 , 0x4000000000000000);   # 2          (normal irrational)
+    store64(a + 8 , 0x0000000000000001);   # 5e-324     SUBNORMAL (smallest, 2^-1074)
+    store64(a + 16, 0x0000000000000000);   # +0         (special: passthrough)
+    store64(a + 24, 0x00002E055C9A3F6C);   # 2.5e-310   SUBNORMAL
+    store64(a + 32, 0x4008000000000000);   # 3          (normal irrational)
+    store64(a + 40, 0x4202A05F20000000);   # 1e10       (perfect square)
+    store64(a + 48, 0x000AC941B426DD3B);   # 1.5e-308   SUBNORMAL (just below DBL_MIN)
+    store64(a + 56, 0xBFF0000000000000);   # -1         (special: negative -> NaN)
     return 0;
 }
 
-# Offline math.sqrt references (Cyrius has no f64 sqrt builtin). The compiled macro is
-# correctly-rounded for these normal/zero inputs, so the GPU must match bit-for-bit. Lane 7 is the
-# negative input; its want is a sentinel and the result is checked for NaN-ness instead.
+# Offline math.sqrt references (Cyrius has no f64 sqrt builtin), correctly-rounded incl. the
+# subnormal inputs. The compiled full-range macro must match bit-for-bit. Lane 7 is the negative
+# input; its want is a sentinel and the result is checked for NaN-ness instead.
 fn fill_wants(want): i64 {
     store64(want + 0 , 0x3FF6A09E667F3BCD);   # sqrt(2)
-    store64(want + 8 , 0x4000000000000000);   # sqrt(4) = 2
-    store64(want + 16, 0x0000000000000000);   # sqrt(0) = 0
-    store64(want + 24, 0x3F69E7C6E43390B7);   # sqrt(1e-5)
+    store64(want + 8 , 0x1E60000000000000);   # sqrt(5e-324)   = 2.22e-162  (subnormal in)
+    store64(want + 16, 0x0000000000000000);   # sqrt(+0) = 0
+    store64(want + 24, 0x1FCB22AFD2CCDC38);   # sqrt(2.5e-310) = 1.58e-155  (subnormal in)
     store64(want + 32, 0x3FFBB67AE8584CAA);   # sqrt(3)
     store64(want + 40, 0x40F86A0000000000);   # sqrt(1e10) = 100000
-    store64(want + 48, 0x3FE0000000000000);   # sqrt(0.25) = 0.5
+    store64(want + 48, 0x1FFA4619BFBC68AD);   # sqrt(1.5e-308) = 1.22e-154  (subnormal in)
     store64(want + 56, 0x0000000000000000);   # lane 7 = NaN sentinel (checked by class)
     return 0;
 }
@@ -360,6 +362,6 @@ fn main(): i64 {
     gpu_context_release(ctx);
 
     if (ok == 0) { print_cstr("\nFAIL: compiled f64 sqrt not bit-exact vs the math.sqrt reference\n"); return 11; }
-    print_cstr("\nOK — all 8 lanes correct: compiled f64 OpExtInst Sqrt (Newton-Goldschmidt) on Cezanne (F.7f.7b)\n");
+    print_cstr("\nOK — all 8 lanes correct incl. 3 subnormals: full-range f64 Sqrt on Cezanne (F.7f.7c)\n");
     return 0;
 }

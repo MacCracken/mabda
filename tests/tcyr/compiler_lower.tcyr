@@ -413,9 +413,11 @@ fn test_spirv_lower_fdiv_f32_rejects() {
     return 0;
 }
 
-# F.7f.7b — OpExtInst Sqrt (f64) lowers to the 13-op Newton-Goldschmidt macro: rsq seed → h=x*rsq
-# → g=0.5*rsq → r=0.5-g*h → 2 refinement rounds → result_core, then a VMOV class mask + cmp_class →
-# VCC + an f64-pair cndmask (VCC ? x : core) for the +0/-0/+inf passthrough.
+# F.7f.7b/7c — OpExtInst Sqrt (f64) lowers to the full-range 22-op macro: a subnormal gate
+# (F64_CONST threshold → CMP_GT → cndmask the 2^256 scale-up → LDEXP), the Newton-Goldschmidt core
+# (rsq → h=x*rsq → g=0.5*rsq → r=0.5-g*h → 2 rounds → core), then rescale (cndmask 2^-128 → LDEXP)
+# + the +0/-0/+inf passthrough (CMP_CLASS → f64-pair CNDMASK). The two scale cndmasks (i4, i17)
+# read the SAME vcc_sub and must precede CMP_CLASS (i19) which overwrites VCC.
 fn test_spirv_lower_fsqrt() {
     var m[80];
     var vals[2560];
@@ -424,15 +426,21 @@ fn test_spirv_lower_fsqrt() {
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
     assert_eq(_spirv_lower_fsqrt_f64(&m, 3, 5), 0, "fsqrt f64 lowers");   # x=id 3, result=id 5
-    assert_eq(mir_n_instrs(&m), 13, "fsqrt = 13 MIR instrs");
-    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_RSQ, "0: rsq seed");
-    assert_eq(mir_instr_op(&m, 1), MIR_OP_FMUL, "1: h = x*rsq");
-    assert_eq(mir_instr_op(&m, 2), MIR_OP_F64_MUL_HALF, "2: g = 0.5*rsq");
-    assert_eq(mir_instr_op(&m, 3), MIR_OP_F64_FMA_N0_HALF, "3: r = 0.5 - g*h");
-    assert_eq(mir_instr_op(&m, 6), MIR_OP_F64_FMA_N0, "6: d = x - h*h");
-    assert_eq(mir_instr_op(&m, 10), MIR_OP_VMOV, "10: class-mask materialize");
-    assert_eq(mir_instr_op(&m, 11), MIR_OP_F64_CMP_CLASS, "11: cmp_class -> VCC");
-    assert_eq(mir_instr_op(&m, 12), MIR_OP_F64_CNDMASK, "12: select VCC ? x : core");
+    assert_eq(mir_n_instrs(&m), 22, "fsqrt = 22 MIR instrs (full range)");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_CONST, "0: threshold f64-const");
+    # The 2^-767 threshold MUST survive as two 32-bit halves (lo=0, hi=0x10000000). A single 64-bit
+    # immediate would truncate (MIR packs a/b into 32-bit slots) → threshold 0.0 → dead scaling.
+    assert_eq(mir_instr_a(&m, 0), 0, "0: threshold lo dword = 0");
+    assert_eq(mir_instr_b(&m, 0), 0x10000000, "0: threshold hi dword = 0x10000000 (2^-767)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_F64_CMP_GT, "1: subnormal gate (thr > x) -> VCC");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_CNDMASK, "4: scale-up exponent select");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_F64_LDEXP, "5: scale x up");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_F64_RSQ, "6: rsq seed");
+    assert_eq(mir_instr_op(&m, 12), MIR_OP_F64_FMA_N0, "12: d = xs - h*h");
+    assert_eq(mir_instr_op(&m, 17), MIR_OP_CNDMASK, "17: rescale exponent select (vcc_sub reuse)");
+    assert_eq(mir_instr_op(&m, 19), MIR_OP_F64_CMP_CLASS, "19: cmp_class -> vcc_class");
+    assert_eq(mir_instr_op(&m, 20), MIR_OP_F64_LDEXP, "20: rescale result down");
+    assert_eq(mir_instr_op(&m, 21), MIR_OP_F64_CNDMASK, "21: vcc_class ? xs : rr");
     return 0;
 }
 

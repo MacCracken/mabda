@@ -1033,13 +1033,29 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
       bit-exact vs offline `math.sqrt` for the irrational sqrts (2/3/1e-5) + exact squares (4/1e10/
       0.25), `sqrt(0)=0` via the +0 cmp_class passthrough, `sqrt(-1)=NaN` via the Newton path —
       `native_spirv_f64_sqrt_e2e.cyr`. The new ops are in the forced-DIVERGENT guard (51→56).
-    - [ ] **F.7f.7c (subnormal scaling)** — the LLVM `cmp_gt`/`ldexp` scale-up + rescale-down wrapper
-      that makes SUBNORMAL inputs correctly-rounded (the 7b core is approximate for them; normal/0/inf/
-      NaN are exact). Needs `V_LDEXP_F64`/`V_CMP_GT_F64` (encoders done in 7a) + an f64-const
-      materialization op (the 2^-767 threshold) — shared with **F.7f.9** (inline f64 consts), so 7c
-      lands with/after that. attn11 never feeds subnormals to sqrt, so this is non-blocking for it.
-  - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing).
-  - [ ] **F.7f.9 (inline f64 consts)** — const-table words-3+4 split + two-i32-mov pair materialization.
+    - [x] **F.7f.7c (subnormal scaling)** *(2026-06-19)* — **HW-verified on Cezanne, FSqrt now
+      full-range correctly-rounded**. Wraps the 7b core with the LLVM scale-up/rescale: `MIR_OP_F64_CONST`
+      (the F.7f.9 primitive — 2× v_mov_b32 of the 2^-767 threshold) → `CMP_GT` subnormal gate →
+      cndmask 2^256 scale-up → `LDEXP` → [core] → cndmask 2^-128 rescale → `LDEXP`, with `vcc_sub`
+      from CMP_GT driving BOTH cndmasks across the core (only VMOV/LDEXP/FMA/MUL between — none write
+      VCC) before CMP_CLASS overwrites it. 3 new ops (F64_CONST/LDEXP/CMP_GT 57–59, forced-DIVERGENT).
+      `out=sqrt(a)` bit-exact vs `math.sqrt` on all 8 lanes **incl. 3 genuine subnormals** (5e-324 /
+      2.5e-310 / 1.5e-308) — `native_spirv_f64_sqrt_e2e.cyr` (the macro grew 208→272 bytes).
+      Adversarially reviewed (Workflow, 3 dims / 13 agents; 9 refuted): one confirmed **CRITICAL** —
+      `MIR_OP_F64_CONST` passed the 64-bit threshold as a single imm in `a`, but MIR packs operands
+      into 32-bit halves so it truncated to 0.0 → the subnormal gate was DEAD (the lanes passed only
+      because the GFX9 core handles subnormals unscaled, masking it). Fixed: carry the f64 const as
+      two 32-bit halves (a=lo, b=hi); re-verified — the subnormals now exercise ACTIVE scaling and
+      still pass bit-exact. Pinned by a threshold-VALUE assert + [[reference_mir_operand_32bit_packing]].
+  - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing)
+    for consumer OpFOrdLessThan/etc. → bool/branch (attn11 max/argmax/masking). The internal VCC-only
+    f64 compares (CMP_GT/CMP_CLASS) already exist from FSqrt; this is the public bool-producing path.
+  - [ ] **F.7f.9 (SPIR-V f64 OpConstant)** — the COMPILER-INTERNAL f64-const primitive (`MIR_OP_F64_CONST`)
+    shipped with F.7f.7c. This remaining piece is the SPIR-V path: `spirv_build_const_table` stores only
+    word-3 today (f64 OpConstant is 64-bit, words 3+4 — currently TRUNCATED), so consumer f64 literals
+    (attn11's epsilon 1e-5, GELU coeffs) need the table to keep both words + the binop operand-resolution
+    to pre-materialize an f64-const operand via `MIR_OP_F64_CONST`. The transcendentals don't need this
+    (their coefficients are compiler-generated, not SPIR-V literals).
   - [ ] **F.7f.10 (exp f64)** — range reduction (k=round(x/ln2), r=x-k·ln2) + Horner polynomial +
     `v_ldexp_f64` scale-by-2^k; value-exact vs CPU `exp`. attn11 softmax/SSM blocker.
   - [ ] **F.7f.11 (ln f64)** — `v_frexp_f64` mantissa/exp split + polynomial on the reduced mantissa +

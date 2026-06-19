@@ -142,6 +142,14 @@ var MIR_OP_F64_CMP_CLASS  = 53;   # v_cmp_class_f64 (a=x, b=mask vreg) → VCC; 
 var MIR_OP_F64_CNDMASK    = 54;   # f64-pair select: dst = VCC ? b(true) : a(false)
 var MIR_OP_F64_FMA_N0_HALF = 55;  # v_fma_f64(-a, b, 0.5) — NEG src0 + inline-0.5 src2
 var MIR_OP_F64_MUL_HALF   = 56;   # v_mul_f64(a, 0.5) — inline-0.5 src1
+# v3.2 F.7f.7c — f64 sqrt subnormal-scaling wrapper (the LLVM full-range expansion). F64_CONST
+# materializes an f64 from its TWO 32-bit halves (a = low dword, b = high dword, both IMM) via 2×
+# v_mov_b32 — the MIR record packs a/b into 32-bit slots, so a single 64-bit imm would truncate
+# (the F.7f.7c review). The F.7f.9 primitive — the 2^-767 threshold, later transcendental coeffs.
+# LDEXP scales an f64 by 2^(i32 exponent); CMP_GT writes VCC (the subnormal gate). Vector-only.
+var MIR_OP_F64_CONST      = 57;   # materialize f64 const (a = lo dword imm, b = hi dword imm)
+var MIR_OP_F64_LDEXP      = 58;   # v_ldexp_f64 (a = f64, b = i32 exponent)
+var MIR_OP_F64_CMP_GT     = 59;   # v_cmp_gt_f64 (a, b) → VCC; dst unused
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -462,13 +470,13 @@ fn _mir_instr_unif(m, i): i64 {
     if (op >= MIR_OP_VMOV) {
         if (op <= MIR_OP_CNDMASK) { return MIR_DIVERGENT; }
     }
-    # v3.2 F.7f.6b/7b — the f64 division + sqrt macro primitives (RCP / DIV_SCALE / DIV_FMAS /
-    # DIV_FIXUP / FMA_N0 / FMA_N0_ONE [46–51]; RSQ / CMP_CLASS / CNDMASK / FMA_N0_HALF / MUL_HALF
-    # [52–56]) are the same class: VOP1/VOP3/VOPC-only with implicit per-lane VCC, no scalar form.
+    # v3.2 F.7f.6b/7b/7c — the f64 division + sqrt macro primitives (RCP..FMA_N0_ONE [46–51];
+    # RSQ..MUL_HALF [52–56]; F64_CONST / LDEXP / CMP_GT [57–59]) are the same class: VOP1/VOP3/VOPC-
+    # only with implicit per-lane VCC, no scalar form (F64_CONST is a 2× v_mov_b32 into a VGPR pair).
     # Force DIVERGENT (a uniform-operand FDiv/FSqrt must not classify them UNIFORM and become an
     # SGPR-coalescing candidate — they have no SALU form). (F.7f.6b adversarial review.)
     if (op >= MIR_OP_F64_RCP) {
-        if (op <= MIR_OP_F64_MUL_HALF) { return MIR_DIVERGENT; }
+        if (op <= MIR_OP_F64_CMP_GT) { return MIR_DIVERGENT; }
     }
     var flags = mir_instr_flags(m, i);
     var b = mir_instr_b(m, i);
