@@ -205,7 +205,13 @@ doesn't change between paths.
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
-  mirroring the `src/` domains; `make test` globs them all:
+  mirroring the `src/` domains; `make test` globs them all.
+  **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
+  `make test | grep` (or `awk`) treats it as binary and **silently drops
+  texture's 207** — the naive total reads **3776**, not the true **3983**. Use
+  `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
+  accurate count; the trap has fooled humans and review agents alike.
+  Domain breakdown:
   - `core` 160 (error/color/capabilities/profiler/resource/debug/obs +
     `int_ratio_to_f32` / `f64_to_f32` f32 conversions — native `f32_from`/`f32_to`
     builtins since the 6.2.18 fold-in; the former x86 SSE2 shims were retired +

@@ -123,7 +123,7 @@ HW-proven (`native_sdma_copy_e2e.cyr`).
   producer/consumer can't OVERLAP through the single per-context cached IB
   (the consumer's packet clobbers the producer's) — the e2e serializes with
   `wait_idle`, matching `native_multiqueue_e2e`. True overlap needs per-IB
-  staging → **reinforces R.5 (3.2.13)**. No regression in the other native
+  staging → **reinforces R.5 (3.2.14)**. No regression in the other native
   HW programs (compute_store / multiqueue / sdma_copy / queue_compute all
   still exit 0).
 - [x] **X.8** — Native SDMA **chunking**. `native_sdma_build_copy_chained`
