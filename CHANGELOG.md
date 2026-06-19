@@ -84,6 +84,11 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   `out=double(float(a))` is **bit-exact** vs in-process `f32_to_f64(f64_to_f32(a))` — narrowed
   lanes (0.1, π) lose precision, exact-in-f32 (2.0, −3.5) pass through. `native_spirv_f64_cvt_e2e.cyr`
   + `_spv_build_f64_cvt` + a `gfx9_compile` CPU test (v_cvt_f32_f64 0x0F + v_cvt_f64_f32 0x10 in the ISA).
+  - Adversarial review (6 confirmed: 5 confirmations + 1 HIGH, fixed): the result-type-only dispatch
+    would silently miscompile a malformed same-width `OpFConvert` (f64→f64) — emit a CVT reading the
+    wrong register size — since mabda's light `spirv_validate_stream` doesn't reject it (untrusted
+    input, ADR-006). Added an **operand-width guard** in isel (widen requires an f32 src, narrow an
+    f64 src, else fail loud `GISEL_ERR_UNSUPPORTED_OP`) + a `compiler_backend.tcyr` fail-loud test.
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**
