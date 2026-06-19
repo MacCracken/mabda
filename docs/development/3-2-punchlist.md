@@ -979,10 +979,15 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     NEG src1 (hi 0x40000000); FAbs = V_MAX_F64(|x|,|x|) + ABS src0+src1 (lo 0x300), llvm-mc-verified,
     reusing the F.7b opcodes. `GISEL_V_SUB_F64`/`GISEL_V_ABS_F64` + `_emit_fsub_f64`/`_emit_fabs_f64`.
     HW-verified `out=abs(a-b)` bit-exact vs `f64_abs(f64_sub(a,b))`. `native_spirv_f64_subabs_e2e.cyr`.
-  - [ ] **F.7f.4+** — remaining op breadth (HW each): **FDiv** (f64 reciprocal macro — complex); **FSqrt**
-    (V_SQRT_F64 or rsq+Newton); **f64 compares** (V_CMP_*_F64); **inline f64 constants** (materialize via
-    two i32 moves — `MIR_VK_CONST` payload is already i64); **`array<vecN-f64>` load/store** (the `i*esize`
-    offset fix landed F.7e — needs a dedicated HW e2e).
+  - [x] **F.7f.4** *(2026-06-18)* — **`array<vecN-f64>` load/store HW-verified** (closes the F.7e
+    tracked gap): `out=a+b` over `array<dvec2>` bit-exact on Cezanne (x+y), confirming the f64
+    access-chain stride (std430 dvec2=16) + the i*8 per-component offset. No src change (N.10 + F.7a-e
+    wiring). `native_spirv_f64_vec_e2e.cyr`. Found the buffer-sizing trap (vec kernels need ~2× cap_ids
+    buffers or the memsets corrupt — [[reference_compiler_test_buffer_sizing]]).
+  - [ ] **F.7f.5+** — remaining op breadth (HW each): **FSqrt** (V_SQRT_F64 = 0x28 single VOP1, exists —
+    but verify GFX9 rounding vs a correctly-rounded ref); **FDiv** (f64 reciprocal macro via V_RCP_F64
+    0x25 — complex); **f64 compares** (no float-compare path exists yet — from-scratch VOPC + the
+    SCC/VCC routing); **inline f64 constants** (const-table words-3+4 split + two-i32-mov pair materialize).
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
     attn11 uses, end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,

@@ -851,3 +851,12 @@ build/native_spirv_f64_subabs_e2e: programs/native_spirv_f64_subabs_e2e.cyr src/
 .PHONY: test-native-spirv-f64-subabs-e2e
 test-native-spirv-f64-subabs-e2e: build/native_spirv_f64_subabs_e2e
 	./build/native_spirv_f64_subabs_e2e
+
+# v3.2 F.7f.4 — compiled array<dvec2> add on Cezanne (verifies the F.7e f64 vec stride/offset).
+build/native_spirv_f64_vec_e2e: programs/native_spirv_f64_vec_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_vec_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-vec-e2e
+test-native-spirv-f64-vec-e2e: build/native_spirv_f64_vec_e2e
+	./build/native_spirv_f64_vec_e2e

@@ -97,6 +97,14 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   `out=abs(a−b)` bit-exact vs in-process `f64_abs(f64_sub(a,b))` (abs flips the sign on several
   lanes). `native_spirv_f64_subabs_e2e.cyr` + `_spv_build_f64_subabs` + a `gfx9_compile` CPU test
   (the neg/abs modifier bits in the ISA) + a modifier byte-oracle (`compiler_encode.tcyr`).
+- **F.7f.4** — `array<vecN-f64>` load/store HW-verified (the verification the F.7e review tracked).
+  `out=a+b` over `array<dvec2>` compiles + runs on Cezanne, all 8 lanes **both x and y bit-exact**
+  vs in-process per-component `f64_add` — confirming the F.7e f64 access-chain stride (std430 dvec2
+  = 16) + the vec load/store per-component offset (i*8) on hardware (varied lanes catch a wrong
+  stride). No `src/` change (the path was wired via N.10 vec + F.7a–e f64) — `native_spirv_f64_vec_e2e.cyr`
+  + `_spv_build_f64_vec` + a `gfx9_compile` CPU test. (Test-authoring note: the dvec2 kernel
+  scalarizes to ~2× the MIR values/instrs, so the id-indexed buffers must be sized for the larger
+  `cap_ids` or the memsets corrupt the stack — see the F.7e CPU test's buffer sizing.)
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**
