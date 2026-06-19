@@ -319,6 +319,171 @@ fn test_rg_execute_mq_forwards_v25() {
     return 0;
 }
 
+# --- R.2 + R.3 (v3.2.13): rg_schedule (per-queue batches + cross-queue
+#     fence-edge classification) ---
+
+fn test_rg_schedule_requires_build() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    assert_eq(rg_is_scheduled(g), 0, "unscheduled before rg_schedule");
+    assert_eq(rg_schedule(g), 1, "rg_schedule on unbuilt graph returns 1");
+    assert_eq(rg_is_scheduled(g), 0, "still unscheduled after failed schedule");
+    rg_build(g, 0);
+    assert_eq(rg_schedule(g), 0, "rg_schedule succeeds after build");
+    assert_eq(rg_is_scheduled(g), 1, "scheduled flag set");
+    assert_eq(rg_schedule(g), 0, "rg_schedule is idempotent");
+    return 0;
+}
+
+fn test_rg_schedule_node_batch_idx_default() {
+    # batch_idx is -1 before rg_schedule, set after.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var c = rg_add_compute(g, 0, 0, &dims, "c");
+    assert_eq(rg_node_batch_idx(g, c), 0 - 1, "batch_idx -1 pre-schedule");
+    rg_build(g, 0);
+    rg_schedule(g);
+    assert_eq(rg_node_batch_idx(g, c), 0, "compute node in batch 0 post-schedule");
+    assert_eq(rg_node_batch_idx(g, 0 - 1), 0 - 1, "batch_idx(-1) = -1");
+    assert_eq(rg_node_batch_idx(g, 99), 0 - 1, "batch_idx(out-of-range) = -1");
+    return 0;
+}
+
+fn test_rg_schedule_single_queue_no_fences() {
+    # A→B→C all compute (one queue): one batch, three nodes, zero fences.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 64, 0x08, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0); rg_node_writes(g, b, r1);
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    rg_node_reads(g, c, r1);
+    rg_build(g, 0);
+    rg_schedule(g);
+    assert_eq(rg_schedule_batch_count(g), 1, "one batch (all COMPUTE)");
+    assert_eq(rg_schedule_batch_queue(g, 0), QUEUE_KIND_COMPUTE, "batch 0 is COMPUTE");
+    assert_eq(rg_schedule_batch_node_count(g, 0), 3, "batch 0 holds all 3 nodes");
+    assert_eq(rg_schedule_batch_min_sort(g, 0), 0, "batch 0 min sort = 0");
+    assert_eq(rg_schedule_fence_count(g), 0, "intra-queue chain has no fence edges");
+    return 0;
+}
+
+fn test_rg_schedule_cross_queue_fence() {
+    # A (compute, default COMPUTE) writes r0; B (render, default GRAPHICS)
+    # reads r0 → one cross-queue fence edge COMPUTE→GRAPHICS.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_render(g, 0, 0, 0, "B");
+    rg_node_reads(g, b, r0);
+    rg_build(g, 0);
+    rg_schedule(g);
+    assert_eq(rg_schedule_batch_count(g), 2, "two batches (COMPUTE + GRAPHICS)");
+    # Batches in ascending min-sort order: COMPUTE (A, sort 0) then GRAPHICS (B, sort 1).
+    assert_eq(rg_schedule_batch_queue(g, 0), QUEUE_KIND_COMPUTE, "batch 0 = COMPUTE (min sort)");
+    assert_eq(rg_schedule_batch_min_sort(g, 0), 0, "batch 0 min sort 0");
+    assert_eq(rg_schedule_batch_queue(g, 1), QUEUE_KIND_GRAPHICS, "batch 1 = GRAPHICS");
+    assert_eq(rg_schedule_batch_min_sort(g, 1), 1, "batch 1 min sort 1");
+    assert_eq(rg_schedule_fence_count(g), 1, "one cross-queue fence edge");
+    assert_eq(rg_schedule_fence_producer_queue(g, 0), QUEUE_KIND_COMPUTE, "producer COMPUTE");
+    assert_eq(rg_schedule_fence_producer_node(g, 0), 0, "producer is sort_idx 0");
+    assert_eq(rg_schedule_fence_consumer_queue(g, 0), QUEUE_KIND_GRAPHICS, "consumer GRAPHICS");
+    assert_eq(rg_schedule_fence_consumer_node(g, 0), 1, "consumer is sort_idx 1");
+    return 0;
+}
+
+fn test_rg_schedule_intra_queue_edge_not_fence() {
+    # A→B both forced onto COMPUTE: the dependency is intra-queue, so it is
+    # satisfied by submit order, NOT a fence edge.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_render(g, 0, 0, 0, "B");
+    rg_node_reads(g, b, r0);
+    rg_node_queue(g, b, QUEUE_KIND_COMPUTE);   # force B onto COMPUTE too
+    rg_build(g, 0);
+    rg_schedule(g);
+    assert_eq(rg_schedule_batch_count(g), 1, "both on COMPUTE → one batch");
+    assert_eq(rg_schedule_fence_count(g), 0, "intra-queue edge is not a fence");
+    return 0;
+}
+
+fn test_rg_schedule_fence_dedup() {
+    # A writes r0 AND r1; B reads both. Cross-queue, but the two shared
+    # resources collapse to ONE fence edge.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 64, 0x08, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0); rg_node_writes(g, a, r1);
+    var b = rg_add_render(g, 0, 0, 0, "B");
+    rg_node_reads(g, b, r0); rg_node_reads(g, b, r1);
+    rg_build(g, 0);
+    rg_schedule(g);
+    assert_eq(rg_schedule_fence_count(g), 1, "two shared resources → one fence edge");
+    return 0;
+}
+
+fn test_rg_schedule_batches_ascending_min_sort() {
+    # The step-3 deviation case: an independent EARLY graphics node shares
+    # the GRAPHICS queue with a LATE consumer. Verifies (a) batches order
+    # by ascending min-sort and (b) the cross-queue dependency is captured
+    # as a fence edge (the global-sort-idx executor, R.4, relies on this —
+    # a naive batch-by-batch submit would run the consumer before its
+    # producer; the fence edge is what makes the correct ordering explicit).
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var early = rg_add_render(g, 0, 0, 0, "early-gfx");   # GRAPHICS, independent
+    var prod = rg_add_compute(g, 0, 0, &dims, "prod");    # COMPUTE, writes r0
+    rg_node_writes(g, prod, r0);
+    var cons = rg_add_render(g, 0, 0, 0, "cons-gfx");     # GRAPHICS, reads r0
+    rg_node_reads(g, cons, r0);
+    rg_build(g, 0);
+    rg_schedule(g);
+    # sort order: early=0 (GRAPHICS), prod=1 (COMPUTE), cons=2 (GRAPHICS).
+    assert_eq(rg_schedule_batch_count(g), 2, "GRAPHICS + COMPUTE batches");
+    assert_eq(rg_schedule_batch_queue(g, 0), QUEUE_KIND_GRAPHICS,
+    "batch 0 = GRAPHICS (min sort 0)");
+    assert_eq(rg_schedule_batch_min_sort(g, 0), 0, "GRAPHICS batch min sort 0");
+    assert_eq(rg_schedule_batch_node_count(g, 0), 2, "GRAPHICS batch holds early + cons");
+    assert_eq(rg_schedule_batch_queue(g, 1), QUEUE_KIND_COMPUTE,
+    "batch 1 = COMPUTE (min sort 1)");
+    assert_eq(rg_schedule_batch_min_sort(g, 1), 1, "COMPUTE batch min sort 1");
+    # The cross-queue edge: producer prod (sort 1) → consumer cons (sort 2).
+    assert_eq(rg_schedule_fence_count(g), 1, "one cross-queue fence edge");
+    assert_eq(rg_schedule_fence_producer_node(g, 0), 1, "producer sort_idx 1 (prod)");
+    assert_eq(rg_schedule_fence_consumer_node(g, 0), 2, "consumer sort_idx 2 (cons)");
+    return 0;
+}
+
+fn test_rg_schedule_accessor_guards() {
+    # Accessors on an unscheduled graph and out-of-range indices.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    rg_build(g, 0);
+    assert_eq(rg_schedule_batch_count(g), 0, "batch count 0 before schedule");
+    assert_eq(rg_schedule_fence_count(g), 0, "fence count 0 before schedule");
+    assert_eq(rg_schedule_batch_queue(g, 0), 0 - 1, "batch_queue pre-schedule = -1");
+    rg_schedule(g);
+    assert_eq(rg_schedule_batch_queue(g, 99), 0 - 1, "batch_queue(out-of-range) = -1");
+    assert_eq(rg_schedule_batch_min_sort(g, 99), 0 - 1, "batch_min_sort(oob) = -1");
+    assert_eq(rg_schedule_batch_node_count(g, 99), 0, "batch_node_count(oob) = 0");
+    assert_eq(rg_schedule_fence_producer_node(g, 99), 0 - 1, "fence_producer_node(oob) = -1");
+    assert_eq(rg_schedule_fence_consumer_queue(g, 0 - 1), 0 - 1, "fence_consumer_queue(-1) = -1");
+    return 0;
+}
+
 fn test_rg_transient_handle_before_build_is_label_ptr() {
     # Before rg_build, the handle slot holds the label pointer (the
     # struct layout doubles the slot up as a staging area). This is
@@ -608,6 +773,14 @@ fn main() {
     test_rg_node_queue_guards();
     test_rg_execute_mq_null_ctx_fails();
     test_rg_execute_mq_forwards_v25();
+    test_rg_schedule_requires_build();
+    test_rg_schedule_node_batch_idx_default();
+    test_rg_schedule_single_queue_no_fences();
+    test_rg_schedule_cross_queue_fence();
+    test_rg_schedule_intra_queue_edge_not_fence();
+    test_rg_schedule_fence_dedup();
+    test_rg_schedule_batches_ascending_min_sort();
+    test_rg_schedule_accessor_guards();
     test_rg_transient_handle_before_build_is_label_ptr();
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();

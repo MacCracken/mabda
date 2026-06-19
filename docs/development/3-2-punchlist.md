@@ -1138,10 +1138,24 @@ ordering exactly. wgpu serialized-equivalent.
   `queue.cyr` moved ahead of `render_graph.cyr` in `lib.cyr` + the manifest module list
   (QUEUE_KIND_* now in scope; LSP-clean). +15 CPU asserts (render 122→137; suite
   3983→3998). Smoke/lint/fmt/vet/distlib green.
-- [ ] **R.2** *(3.2.13)* — Cross-queue edge classification (same-queue =
-  order; cross-queue = fence edge); build-time cycle check covers it.
-- [ ] **R.3** *(3.2.13)* — Per-queue submit batching (group a queue's
-  nodes; `RenderGraph` 40→48 schedule ptr).
+- [x] **R.2 + R.3 (2026-06-19)** *(3.2.13)* — `rg_schedule(g)`, the pure-CPU
+  pass between `rg_build` and the executor. **R.3 batching:** walks nodes in
+  sort_idx order, buckets each into its `queue_kind` Batch (created on first
+  sight → batches come out in ascending min-sort order), sets `node.batch_idx`.
+  `RenderGraph` grown 40→48 (schedule ptr at +40, append-only); `Schedule`/
+  `Batch`/`FenceEdge` structs. **R.2 classification:** re-scans writer→reader
+  deps (same inference as `rg_build`); same-queue = satisfied by submit order,
+  cross-queue = a deduped `FenceEdge` (producer/consumer queue + sort_idx).
+  Build-time cycle check still covers cross-queue cycles (subset of build edges).
+  **Deviation flagged:** the executor (R.4) must submit in GLOBAL sort_idx order,
+  not batch-by-batch min-sort — an independent early node sharing a queue with a
+  late consumer would otherwise submit the consumer before its producer; the
+  fence edges carry the real ordering (proposal step 3's per-batch order is
+  insufficient — see the `rg_schedule` header comment + the
+  `test_rg_schedule_batches_ascending_min_sort` case). Full accessor set +
+  `rg_is_scheduled`; `rg_execute_mq` now runs `rg_schedule` (idempotent, no-op on
+  the wgpu serialized path). +45 CPU asserts (render 137→182; suite 3998→4043).
+  Smoke/lint/fmt/vet/distlib green.
 - [ ] **R.4** *(3.2.13)* — `native_render_dispatch_timeline` (GFX-ring
   timeline variant of the render submit; the missing piece for render
   nodes to join cross-ring overlap).
