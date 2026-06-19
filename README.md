@@ -8,7 +8,7 @@ that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.2.14 (dual backend — wgpu + native AMD; see
+Version: 3.3.0 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -199,7 +199,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.22+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.23+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 

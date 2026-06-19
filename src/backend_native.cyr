@@ -1599,6 +1599,28 @@ fn _backend_native_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count)
     return tex;
 }
 
+# v3.3 AL.2 — native filler for gpu_texture_create_2d_fmt_mipped. LINEAR mipped
+# storage of any MABDA_TEXFMT_*; per-level fill via gpu_texture_write_level.
+fn _backend_native_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    if (mabda_texfmt_block_bytes(fmt) == 0) { return 0; }   # unknown format id
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var fd = native_ctx_fd(ctx);
+    var size = _native_align_up(native_tex_chain_size(fmt, width, height, mip_count), 4096);
+    var va = native_ctx_alloc_texture_va(ctx, size);
+    if (va == 0) { return 0; }
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    var rc = native_texture_create_mipped_2d_fmt(fd, va, width, height, mip_count, fmt, tex);
+    if (rc != 0) { return 0; }
+    return tex;
+}
+
 # v3.1 [M.6b]: native mipmap generation. Fills levels 1..mip_count-1 of a
 # chain texture by GPU 2x2-box-filter downsample — one compute dispatch
 # per level via the cached-IB path, src/dst level VAs computed from the
@@ -1805,6 +1827,37 @@ fn _backend_native_texture_release(ctx, tex): i64 {
     if (tex == 0) { return 0; }
     var fd = native_ctx_fd(ctx);
     native_texture_release_2d_rgba8(fd, tex);
+    return 0;
+}
+
+# v3.3 AL.1 — write `n` bytes into mip `level` of a native texture. Validates
+# level in [0, mip_count) and n == the level's block-based data size, then
+# memcpy's into the single-BO mip chain at the format-aware per-level offset
+# (linear surfaces). A tiled (compressed sampleable) surface only supports the
+# whole-surface level-0 path here (reuses the L2T tiled copy); per-level tiled
+# upload is AL.3 work (when sampleable compressed mips land) and fails loud.
+fn _backend_native_texture_write_level(ctx, tex, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    if (level >= load32(tex + NATIVE_TEX_FIELD_MIP_COUNT)) { return GPU_ERR_TEXTURE; }
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var lw = mip_level_dim(w, level);
+    var lh = mip_level_dim(h, level);
+    var expected = mabda_texfmt_data_size(fmt, lw, lh);
+    if (expected == 0) { return GPU_ERR_TEXTURE; }      # invalid fmt/dims
+    if (n != expected) { return GPU_ERR_BUFFER; }       # per-level size mismatch
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        if (level == 0) { return _native_texture_tiled_copy(ctx, tex, src, n, 0); }
+        return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+    }
+    memcpy(addr + native_tex_level_offset(fmt, w, h, level), src, n);
     return 0;
 }
 
@@ -2300,10 +2353,14 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_create_2d_fmt);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
     &_backend_native_texture_create_2d_rgba8_mipped);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED,
+    &_backend_native_texture_create_2d_fmt_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS,
     &_backend_native_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
+    &_backend_native_texture_write_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
@@ -2645,6 +2702,29 @@ fn native_mip_chain_size(width, height, count): i64 {
     return native_mip_level_offset(width, height, count);
 }
 
+# v3.3 AL.1 — format-aware byte offset of mip `level` within a single-BO
+# mip chain of `fmt`. Generalizes native_mip_level_offset (which is the
+# RGBA8 case): each level is the block-based data size, 256-aligned, summed.
+# For fmt == RGBA8 (data_size = w*h*4) this is byte-identical to
+# native_mip_level_offset, so the RGBA8 mipped layout is unchanged; AL.2's
+# generalized mipped create uses this same function so create + write_level
+# agree on one layout. native_tex_chain_size(level==count) is the total.
+fn native_tex_level_offset(fmt, width, height, level): i64 {
+    var off = 0;
+    var i = 0;
+    while (i < level) {
+        var w = mip_level_dim(width, i);
+        var h = mip_level_dim(height, i);
+        off = off + _native_align_up(mabda_texfmt_data_size(fmt, w, h), _NATIVE_MIP_ALIGN);
+        i = i + 1;
+    }
+    return off;
+}
+
+fn native_tex_chain_size(fmt, width, height, count): i64 {
+    return native_tex_level_offset(fmt, width, height, count);
+}
+
 # v3.1 [M.3]: GPU VA of mip `level` within a NativeTexture's chain.
 # Because native textures are LINEAR GTT BOs, per-level "access" is just
 # an address — the chain base VA plus the contiguous-chain byte offset
@@ -2756,6 +2836,37 @@ fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, 
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
+    return 0;
+}
+
+# v3.3 AL.2 — format-aware mipped create (generalizes the RGBA8 helper above).
+# LINEAR storage of any MABDA_TEXFMT_*; the single BO is the format-aware mip
+# chain (native_tex_chain_size), page-aligned, and gpu_texture_write_level fills
+# each level at native_tex_level_offset (same layout). For RGBA8 this is
+# byte-identical to native_texture_create_mipped_2d_rgba8 plus FMT stored.
+# (Native SAMPLING of compressed mips needs the tiled TS.7 path — this is the
+# linear storage/upload foundation; sampling-compressed-mips is tracked.)
+fn native_texture_create_mipped_2d_fmt(fd, va_base, width, height, mip_count, fmt, out): i64 {
+    var size = _native_align_up(native_tex_chain_size(fmt, width, height, mip_count), 4096);
+    var bo[16];
+    var rc = native_bo_create_gtt(fd, size, &bo);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    rc = native_gem_va_map(fd, handle, va_base, size, _NATIVE_PERM_DATA);
+    if (rc != 0) {
+        var rc_save = rc;
+        native_bo_release_gtt(fd, handle, addr, size);
+        return _native_neg_rc_to_gpu_err(rc_save);
+    }
+    store64(out + NATIVE_TEX_FIELD_HANDLE,    handle);
+    store64(out + NATIVE_TEX_FIELD_VA,        va_base);
+    store64(out + NATIVE_TEX_FIELD_ADDR,      addr);
+    store64(out + NATIVE_TEX_FIELD_SIZE,      size);
+    store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
+    store32(out + NATIVE_TEX_FIELD_FMT,       fmt);
     return 0;
 }
 

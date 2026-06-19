@@ -1,0 +1,348 @@
+# @public - asset container loading (v3.3 Phase AL)
+# asset_load.cyr - parse GPU-texture containers (DDS now; KTX2 in AL.4) and
+# upload their levels through mabda's texture API. No external decoder: the
+# blocks are already GPU-ready (BC/compressed or RGBA8). PNG (which DOES need a
+# CPU decoder) routes through the chitra package in AL.5.
+#
+# Multi-byte fields are little-endian (DDS + KTX2 are LE formats); load32 reads
+# host byte order, which is LE on every AGNOS target. Every read is bounds-
+# checked against `len` before use (untrusted input).
+
+# ----------------------------------------------------------------
+# Caps-on-ctx gate (AL.0e, landed with its first consumer per AL.3).
+# ----------------------------------------------------------------
+# 1 if the active backend on `ctx` can create+sample a texture of `fmt`, else 0.
+# RGBA8 is always supported. A compressed format needs its family bit in the
+# active adapter/backend's compression mask: native -> the BC-only native cap
+# (ETC2/ASTC are HW-blocked on Cezanne), wgpu -> the adapter-detected mask.
+# The loaders call this BEFORE create so an unsupported container fails loud
+# (GPU_ERR_FORMAT_UNSUPPORTED) instead of creating a texture it cannot sample.
+fn gpu_ctx_supports_format(ctx, fmt): i64 {
+    if (ctx == 0) { return 0; }
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 1; }
+    if (mabda_texfmt_is_compressed(fmt) == 0) { return 0; }   # invalid id
+    var fam = mabda_texfmt_compression_family(fmt);
+    var mask = 0;
+    if (backend_kind(gpu_ctx_backend(ctx)) == BACKEND_KIND_AMD) {
+        mask = gpu_caps_native_texture_compression();
+    } else {
+        mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
+    }
+    if ((mask & fam) != 0) { return 1; }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# DDS (AL.3)
+# ----------------------------------------------------------------
+# DDS layout: u32 magic 'DDS ' + 124-byte DDS_HEADER + optional 20-byte
+# DDS_HEADER_DXT10 (when ddpf.dwFourCC == 'DX10'), then the mip data. File
+# offsets (header starts at +4): dwHeight@12, dwWidth@16, dwMipMapCount@28,
+# ddpf.dwFlags@80, ddpf.dwFourCC@84, ddpf.dwRGBBitCount@88, dwCaps2@112;
+# DXT10: dxgiFormat@128, miscFlag@136, arraySize@140; data @128 (legacy) or @148.
+var _DDS_MAGIC          = 0x20534444;   # 'DDS '
+var _DDS_FOURCC_DXT1    = 0x31545844;   # 'DXT1' -> BC1
+var _DDS_FOURCC_DXT3    = 0x33545844;   # 'DXT3' -> BC2 (no mabda id)
+var _DDS_FOURCC_DXT5    = 0x35545844;   # 'DXT5' -> BC3
+var _DDS_FOURCC_DX10    = 0x30315844;   # 'DX10' -> DXGI path
+var _DDPF_FOURCC        = 0x4;
+var _DDSCAPS2_CUBEMAP   = 0x200;
+var _DDS_MISC_CUBE      = 0x4;          # DXT10 miscFlag DDS_RESOURCE_MISC_TEXTURECUBE
+
+# DdsParse `out` (48 bytes): fmt@0, width@8, height@16, mip_count@24,
+# data_offset@32, srgb@40 (1 if the source is sRGB-encoded - it maps to the
+# UNORM mabda id, see asset_format.cyr's sRGB policy).
+var _DDS_OUT_FMT        = 0;
+var _DDS_OUT_WIDTH      = 8;
+var _DDS_OUT_HEIGHT     = 16;
+var _DDS_OUT_MIPCOUNT   = 24;
+var _DDS_OUT_DATAOFF    = 32;
+var _DDS_OUT_SRGB       = 40;
+
+# Parse a DDS header into `out` (48 B). Returns 0 on success, or a GPU_ERR_*:
+# GPU_ERR_CONTAINER_PARSE (bad magic / truncated / unsupported FourCC or layout)
+# or GPU_ERR_FORMAT_UNSUPPORTED (no mabda id, or array/cubemap which are v3.4).
+fn _dds_parse(bytes, len, out): i64 {
+    if (bytes == 0) { return GPU_ERR_CONTAINER_PARSE; }
+    if (len < 128)  { return GPU_ERR_CONTAINER_PARSE; }   # magic + 124-byte header
+    if (load32(bytes + 0) != _DDS_MAGIC) { return GPU_ERR_CONTAINER_PARSE; }
+    if (load32(bytes + 4) != 124) { return GPU_ERR_CONTAINER_PARSE; }   # dwSize sanity
+
+    var height = load32(bytes + 12);
+    var width  = load32(bytes + 16);
+    if (width <= 0)  { return GPU_ERR_CONTAINER_PARSE; }
+    if (height <= 0) { return GPU_ERR_CONTAINER_PARSE; }
+    var mipc = load32(bytes + 28);
+    if (mipc < 1) { mipc = 1; }                            # 0 means single level
+
+    # Legacy cubemap (dwCaps2) - arrays/cubes are v3.4 (Phase AL-ARRAY).
+    if ((load32(bytes + 112) & _DDSCAPS2_CUBEMAP) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+
+    var ddpf_flags = load32(bytes + 80);
+    var fmt = 0 - 1;   # unmapped until a FourCC/DXGI branch sets it (0 = RGBA8 is valid)
+    var srgb = 0;
+    var data_off = 128;
+    if ((ddpf_flags & _DDPF_FOURCC) == 0) {
+        # Legacy uncompressed (bitmask) DDS is out of v3.3 scope - the
+        # byte-order/mask interpretation is tracked in the 3-3 punchlist (AL.3).
+        # Modern RGBA8 DDS uses the DX10/DXGI path below. Fail loud, never mis-read.
+        return GPU_ERR_CONTAINER_PARSE;
+    }
+    var fourcc = load32(bytes + 84);
+    if (fourcc == _DDS_FOURCC_DXT1) { fmt = MABDA_TEXFMT_BC1; }
+    if (fourcc == _DDS_FOURCC_DXT5) { fmt = MABDA_TEXFMT_BC3; }
+    if (fourcc == _DDS_FOURCC_DXT3) { return GPU_ERR_FORMAT_UNSUPPORTED; }  # BC2: no id
+    if (fourcc == _DDS_FOURCC_DX10) {
+        if (len < 148) { return GPU_ERR_CONTAINER_PARSE; }  # + 20-byte DXT10 header
+        var dxgi = load32(bytes + 128);
+        if ((load32(bytes + 136) & _DDS_MISC_CUBE) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+        if (load32(bytes + 140) > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # arraySize
+        fmt = mabda_texfmt_from_dxgi_format(dxgi);
+        srgb = mabda_dxgi_format_is_srgb(dxgi);
+        data_off = 148;
+    }
+    # fmt < 0 = unknown FourCC or unmapped DXGI (0 = RGBA8 via DX10 is valid).
+    if (fmt < 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+    store64(out + _DDS_OUT_FMT,      fmt);
+    store64(out + _DDS_OUT_WIDTH,    width);
+    store64(out + _DDS_OUT_HEIGHT,   height);
+    store64(out + _DDS_OUT_MIPCOUNT, mipc);
+    store64(out + _DDS_OUT_DATAOFF,  data_off);
+    store64(out + _DDS_OUT_SRGB,     srgb);
+    return 0;
+}
+
+# Load a DDS texture from a byte buffer. Returns Ok(texture handle) | Err.
+# Parses the header, gates the format against the active backend's caps, creates
+# a mipped texture, and uploads each level via gpu_texture_write_level walking
+# the contiguous level data (every level's byte span bounds-checked vs `len`).
+fn gpu_texture_load_dds_result(ctx, bytes, len): i64 {
+    if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
+    var out[48];
+    var prc = _dds_parse(bytes, len, &out);
+    if (prc != 0) { return gpu_err_result(prc); }
+    var fmt    = load64(&out + _DDS_OUT_FMT);
+    var width  = load64(&out + _DDS_OUT_WIDTH);
+    var height = load64(&out + _DDS_OUT_HEIGHT);
+    var mipc   = load64(&out + _DDS_OUT_MIPCOUNT);
+    var off    = load64(&out + _DDS_OUT_DATAOFF);
+    # A mip_count larger than the natural chain is a malformed container.
+    if (mipc > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    # Caps gate BEFORE create - an ETC2/ASTC DDS on native (BC-only) fails loud
+    # here instead of creating an unsampleable texture.
+    if (gpu_ctx_supports_format(ctx, fmt) == 0) { return gpu_err_result(GPU_ERR_FORMAT_UNSUPPORTED); }
+    var tex = gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mipc);
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var level = 0;
+    while (level < mipc) {
+        var lw = mip_level_dim(width, level);
+        var lh = mip_level_dim(height, level);
+        var n = mabda_texfmt_data_size(fmt, lw, lh);
+        if (n <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+        if (off + n > len) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }  # truncated
+        var wrc = gpu_texture_write_level(ctx, tex, level, bytes + off, n);
+        if (wrc != 0) { return gpu_err_result(wrc); }
+        off = off + n;
+        level = level + 1;
+    }
+    return gpu_ok(tex);
+}
+
+# Thin handle|0 wrapper over gpu_texture_load_dds_result. # @public
+fn gpu_texture_load_dds(ctx, bytes, len): i64 {
+    var r = gpu_texture_load_dds_result(ctx, bytes, len);
+    if (is_err_result(r) == 1) { return 0; }
+    return payload(r);
+}
+
+# ----------------------------------------------------------------
+# KTX2 (AL.4) - the uncompressed (supercompressionScheme == 0) subset.
+# ----------------------------------------------------------------
+# Layout: 12-byte identifier, then the header (vkFormat@12, typeSize@16,
+# pixelWidth@20, pixelHeight@24, pixelDepth@28, layerCount@32, faceCount@36,
+# levelCount@40, supercompressionScheme@44), then the index (dfd/kvd offsets@48..,
+# sgd u64@64/@72), then the level index @80 (levelCount entries x 24 bytes:
+# byteOffset u64, byteLength u64, uncompressedByteLength u64), then DFD/KVD/SGD
+# and the mip data (located via each level's byteOffset). The 12-byte identifier
+# is read as three masked u32s (one byte has the high bit set, so mask to avoid
+# any sign-extension in load32).
+var _KTX2_ID0 = 0x58544BAB;   # 0xAB 'K' 'T' 'X'
+var _KTX2_ID1 = 0xBB303220;   # ' ' '2' '0' 0xBB
+var _KTX2_ID2 = 0x0A1A0A0D;   # 0x0D 0x0A 0x1A 0x0A
+var _KTX2_LEVELIDX_OFF = 80;  # first level-index entry
+var _KTX2_LEVELIDX_SZ  = 24;  # bytes per level-index entry
+
+# Ktx2Parse `out` (48 bytes): fmt@0, width@8, height@16, level_count@24, srgb@40.
+# Parse a KTX2 header. Returns 0 on success, or GPU_ERR_CONTAINER_PARSE
+# (bad identifier / truncated / 1D) / GPU_ERR_FORMAT_UNSUPPORTED (super-
+# compression, array/cubemap, or an unmapped vkFormat).
+fn _ktx2_parse(bytes, len, out): i64 {
+    if (bytes == 0) { return GPU_ERR_CONTAINER_PARSE; }
+    if (len < 80)   { return GPU_ERR_CONTAINER_PARSE; }   # identifier + header + index
+    if ((load32(bytes + 0) & 0xFFFFFFFF) != _KTX2_ID0) { return GPU_ERR_CONTAINER_PARSE; }
+    if ((load32(bytes + 4) & 0xFFFFFFFF) != _KTX2_ID1) { return GPU_ERR_CONTAINER_PARSE; }
+    if ((load32(bytes + 8) & 0xFFFFFFFF) != _KTX2_ID2) { return GPU_ERR_CONTAINER_PARSE; }
+
+    var width  = load32(bytes + 20);
+    var height = load32(bytes + 24);
+    if (width <= 0)  { return GPU_ERR_CONTAINER_PARSE; }
+    if (height <= 0) { return GPU_ERR_CONTAINER_PARSE; }   # pixelHeight 0 = 1D (unsupported)
+
+    # supercompressionScheme != 0 (BasisLZ/Zstd/ZLIB) needs a decompressor mabda
+    # does not have - the decoder gate, fail loud (tracked, post-v3.3).
+    if (load32(bytes + 44) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+    # faceCount 6 (cubemap) / layerCount > 1 (array) are v3.4 (Phase AL-ARRAY).
+    if (load32(bytes + 36) != 1) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # faceCount
+    if (load32(bytes + 32) > 1)  { return GPU_ERR_FORMAT_UNSUPPORTED; }   # layerCount (0 or 1 ok)
+
+    var levels = load32(bytes + 40);
+    if (levels < 1) { levels = 1; }    # levelCount 0 = single base level present
+    # The level index must fit within the buffer.
+    if (len < _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ) { return GPU_ERR_CONTAINER_PARSE; }
+
+    var vk = load32(bytes + 12);
+    var fmt = mabda_texfmt_from_vk_format(vk);
+    if (fmt < 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # 0 = RGBA8 (vk 37/43) is valid
+    store64(out + 0,  fmt);
+    store64(out + 8,  width);
+    store64(out + 16, height);
+    store64(out + 24, levels);
+    store64(out + 40, mabda_vk_format_is_srgb(vk));
+    return 0;
+}
+
+# Load a KTX2 texture from a byte buffer (uncompressed subset). Returns
+# Ok(texture handle) | Err. Each mip level's data is located via its level-index
+# byteOffset; for scheme==0 byteLength == uncompressedByteLength == the format's
+# per-level size. Every span is bounds-checked vs `len`.
+fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
+    if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
+    var out[48];
+    var prc = _ktx2_parse(bytes, len, &out);
+    if (prc != 0) { return gpu_err_result(prc); }
+    var fmt    = load64(&out + 0);
+    var width  = load64(&out + 8);
+    var height = load64(&out + 16);
+    var levels = load64(&out + 24);
+    if (levels > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (gpu_ctx_supports_format(ctx, fmt) == 0) { return gpu_err_result(GPU_ERR_FORMAT_UNSUPPORTED); }
+    var tex = gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, levels);
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var level = 0;
+    while (level < levels) {
+        var idx = _KTX2_LEVELIDX_OFF + level * _KTX2_LEVELIDX_SZ;
+        var boff = load64(bytes + idx + 0);
+        var blen = load64(bytes + idx + 8);
+        var ulen = load64(bytes + idx + 16);
+        var expected = mabda_texfmt_data_size(fmt, mip_level_dim(width, level), mip_level_dim(height, level));
+        if (expected <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+        if (blen != expected) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # wrong level size
+        if (ulen != blen)     { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
+        if (boff < _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ) {
+            return gpu_err_result(GPU_ERR_CONTAINER_PARSE);   # overlaps index/header (also rejects boff < 0)
+        }
+        # SECURITY: boff is an untrusted i64 - check WITHOUT computing boff+blen.
+        # `boff + blen > len` overflows for boff near i64_max (wraps negative, the
+        # comparison silently passes) -> OOB read. blen here is already == expected
+        # (> 0, dim-bounded), so `len - blen` is a safe subtraction; if blen > len
+        # it goes negative and any in-range boff (>= 104 above) is rejected.
+        if (boff > len - blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }  # truncated / OOB
+        var wrc = gpu_texture_write_level(ctx, tex, level, bytes + boff, blen);
+        if (wrc != 0) { return gpu_err_result(wrc); }
+        level = level + 1;
+    }
+    return gpu_ok(tex);
+}
+
+# Thin handle|0 wrapper over gpu_texture_load_ktx2_result. # @public
+fn gpu_texture_load_ktx2(ctx, bytes, len): i64 {
+    var r = gpu_texture_load_ktx2_result(ctx, bytes, len);
+    if (is_err_result(r) == 1) { return 0; }
+    return payload(r);
+}
+
+# ----------------------------------------------------------------
+# PNG (AL.5) - CPU-decoded by the chitra sibling package to RGBA8, uploaded
+# by mabda. The decode-in-package / upload-in-mabda split: chitra owns the
+# PNG framing/inflate/unfilter/color-normalization (color types 0/2/3/4/6 @
+# depth 8, tRNS) over `[deps.chitra] tag="0.1.0"`; mabda owns the GPU upload.
+# ----------------------------------------------------------------
+# Decode a PNG to RGBA8 and upload as a single-level RGBA8 texture.
+# Returns Ok(texture handle) | Err (GPU_ERR_IMAGE_DECODE on a chitra failure).
+fn gpu_texture_load_png_result(ctx, bytes, len): i64 {
+    if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
+    var w = 0;
+    var h = 0;
+    var pixels = chitra_png_decode_rgba8(bytes, len, &w, &h);
+    if (pixels == 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    if (w <= 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    if (h <= 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    # Sampleable (not plain create_2d): a loaded texture exists to be sampled.
+    # create_2d_sampleable is the TS.5 HW-verified RGBA8 sample path (gpu_texture_
+    # write populates it); plain create_2d is LINEAR storage, not sampleable on native.
+    var tex = gpu_texture_create_2d_sampleable(ctx, w, h, MABDA_TEXFMT_RGBA8);
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var wrc = gpu_texture_write(ctx, tex, pixels, w * h * 4);
+    if (wrc != 0) { return gpu_err_result(wrc); }
+    return gpu_ok(tex);
+}
+
+# Thin handle|0 wrapper over gpu_texture_load_png_result. # @public
+fn gpu_texture_load_png(ctx, bytes, len): i64 {
+    var r = gpu_texture_load_png_result(ctx, bytes, len);
+    if (is_err_result(r) == 1) { return 0; }
+    return payload(r);
+}
+
+# Mipped PNG load: decode to RGBA8, create a full RGBA8 mip chain, write level
+# 0, GPU-generate the rest. On wgpu, gpu_texture_generate_mipmaps returns an
+# error (its compute path is a v3.x stub) - surfaced honestly via Err (no
+# silent single-level fallback); native generates the chain. Ok(handle)|Err. # @public
+fn gpu_texture_load_png_mipped_result(ctx, bytes, len): i64 {
+    if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
+    var w = 0;
+    var h = 0;
+    var pixels = chitra_png_decode_rgba8(bytes, len, &w, &h);
+    if (pixels == 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    if (w <= 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    if (h <= 0) { return gpu_err_result(GPU_ERR_IMAGE_DECODE); }
+    var tex = gpu_texture_create_2d_rgba8_mipped(ctx, w, h, 0);   # 0 = full chain
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var wrc = gpu_texture_write_level(ctx, tex, 0, pixels, w * h * 4);
+    if (wrc != 0) { return gpu_err_result(wrc); }
+    var grc = gpu_texture_generate_mipmaps(ctx, tex);
+    if (grc != 0) { return gpu_err_result(grc); }
+    return gpu_ok(tex);
+}
+
+fn gpu_texture_load_png_mipped(ctx, bytes, len): i64 {
+    var r = gpu_texture_load_png_mipped_result(ctx, bytes, len);
+    if (is_err_result(r) == 1) { return 0; }
+    return payload(r);
+}
+
+# ----------------------------------------------------------------
+# Sniffer (AL.6) - format-agnostic load by magic-byte detection.
+# ----------------------------------------------------------------
+# Detect the container from its leading bytes and route to the matching loader:
+# PNG (0x89 'P' 'N' 'G'), KTX2 (0xAB 'K' 'T' 'X' ...), DDS ('DDS '). An unknown
+# magic / too-short buffer fails loud (GPU_ERR_CONTAINER_PARSE). The first u32
+# uniquely discriminates all three (each loader re-validates its own full
+# signature). Returns Ok(texture handle) | Err. # @public
+fn gpu_texture_load_result(ctx, bytes, len): i64 {
+    if (ctx == 0)   { return gpu_err_result(GPU_ERR_OTHER); }
+    if (bytes == 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (len < 4)    { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    var m = load32(bytes + 0) & 0xFFFFFFFF;
+    if (m == 0x474E5089) { return gpu_texture_load_png_result(ctx, bytes, len); }   # PNG
+    if (m == _KTX2_ID0)  { return gpu_texture_load_ktx2_result(ctx, bytes, len); }  # KTX2
+    if (m == _DDS_MAGIC) { return gpu_texture_load_dds_result(ctx, bytes, len); }   # DDS
+    return gpu_err_result(GPU_ERR_CONTAINER_PARSE);   # unknown container
+}
+
+# Thin handle|0 wrapper over gpu_texture_load_result. # @public
+fn gpu_texture_load(ctx, bytes, len): i64 {
+    var r = gpu_texture_load_result(ctx, bytes, len);
+    if (is_err_result(r) == 1) { return 0; }
+    return payload(r);
+}

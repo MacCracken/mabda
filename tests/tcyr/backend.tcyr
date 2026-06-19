@@ -521,7 +521,19 @@ fn test_backend_struct_layout() {
     assert_eq(BACKEND_SAMPLE_SLOTS_END,                 280, "sample range ends 280");
     assert_eq(BACKEND_SAMPLE_SLOTS_BEGIN, BACKEND_BUFFERCOPY_SLOTS_END,
     "sample range starts where buffercopy range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               280, "total = 280");
+    # v3.3 AL.1: per-mip-level upload slot appended at 280..288.
+    assert_eq(BACKEND_SLOT_TEXTURE_WRITE_LEVEL,          280, "texture_write_level at 280");
+    assert_eq(BACKEND_WRITELEVEL_SLOTS_BEGIN,            280, "writelevel range begins 280");
+    assert_eq(BACKEND_WRITELEVEL_SLOTS_END,              288, "writelevel range ends 288");
+    assert_eq(BACKEND_WRITELEVEL_SLOTS_BEGIN, BACKEND_SAMPLE_SLOTS_END,
+    "writelevel range starts where sample range ends (no gap/overlap)");
+    # v3.3 AL.2: fmt-mipped create slot appended at 288..296.
+    assert_eq(BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, 288, "create_2d_fmt_mipped at 288");
+    assert_eq(BACKEND_FMTMIPPED_SLOTS_BEGIN,             288, "fmtmipped range begins 288");
+    assert_eq(BACKEND_FMTMIPPED_SLOTS_END,               296, "fmtmipped range ends 296");
+    assert_eq(BACKEND_FMTMIPPED_SLOTS_BEGIN, BACKEND_WRITELEVEL_SLOTS_END,
+    "fmtmipped range starts where writelevel range ends (no gap/overlap)");
+    assert_eq(BACKEND_SIZE,                               296, "total = 296");
     return 0;
 }
 
@@ -1774,6 +1786,91 @@ fn test_gpu_texture_create_2d_sampleable_dispatch() {
     return 0;
 }
 
+# v3.3 AL.1 — gpu_texture_write_level routes (ctx,tex,level,src,n) through
+# BACKEND_SLOT_TEXTURE_WRITE_LEVEL via fncall5; guards reject before the slot.
+var _al1_count = 0;
+var _al1_ctx = 0;
+var _al1_tex = 0;
+var _al1_level = 0;
+var _al1_src = 0;
+var _al1_n = 0;
+fn _al1_capture(ctx, tex, level, src, n) {
+    _al1_count = _al1_count + 1;
+    _al1_ctx = ctx;
+    _al1_tex = tex;
+    _al1_level = level;
+    _al1_src = src;
+    _al1_n = n;
+    return 0xABC;
+}
+
+fn test_gpu_texture_write_level_dispatch() {
+    _al1_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_al1_capture);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 32, b);
+    var rc = gpu_texture_write_level(ctx, 0x111, 2, 0x222, 64);
+    assert_eq(rc, 0xABC, "slot return propagated");
+    assert_eq(_al1_count, 1, "dispatched once");
+    assert_eq(_al1_ctx, ctx, "arg1 ctx");
+    assert_eq(_al1_tex, 0x111, "arg2 tex");
+    assert_eq(_al1_level, 2, "arg3 level");
+    assert_eq(_al1_src, 0x222, "arg4 src");
+    assert_eq(_al1_n, 64, "arg5 n");
+    # Guards return before the slot.
+    _al1_count = 0;
+    assert_eq(gpu_texture_write_level(0, 0x111, 0, 0x222, 64), GPU_ERR_OTHER, "null ctx -> OTHER");
+    assert_eq(gpu_texture_write_level(ctx, 0x111, 0 - 1, 0x222, 64), GPU_ERR_TEXTURE, "neg level -> TEXTURE");
+    assert_eq(_al1_count, 0, "guards reject before dispatch");
+    return 0;
+}
+
+# v3.3 AL.2 — gpu_texture_create_2d_fmt_mipped routes (ctx,w,h,fmt,mc) through
+# BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED via fncall5; mip_count 0 -> full
+# chain; bad fmt / dims / over-chain / null ctx reject before the slot.
+var _al2_count = 0;
+var _al2_w = 0;
+var _al2_h = 0;
+var _al2_fmt = 0;
+var _al2_mc = 0;
+fn _al2_capture(ctx, w, h, fmt, mc) {
+    _al2_count = _al2_count + 1;
+    _al2_w = w;
+    _al2_h = h;
+    _al2_fmt = fmt;
+    _al2_mc = mc;
+    return 0xD2;
+}
+
+fn test_gpu_texture_create_2d_fmt_mipped_dispatch() {
+    _al2_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_al2_capture);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 32, b);
+    var r = gpu_texture_create_2d_fmt_mipped(ctx, 64, 64, MABDA_TEXFMT_BC1, 3);
+    assert_eq(r, 0xD2, "slot return propagated");
+    assert_eq(_al2_count, 1, "dispatched once");
+    assert_eq(_al2_w, 64, "arg2 width");
+    assert_eq(_al2_h, 64, "arg3 height");
+    assert_eq(_al2_fmt, MABDA_TEXFMT_BC1, "arg4 fmt");
+    assert_eq(_al2_mc, 3, "arg5 mip_count");
+    # mip_count 0 -> full chain resolved before the slot.
+    gpu_texture_create_2d_fmt_mipped(ctx, 64, 64, MABDA_TEXFMT_RGBA8, 0);
+    assert_eq(_al2_mc, mip_level_count(64, 64), "mip_count 0 -> full chain");
+    # Guards reject before the slot.
+    _al2_count = 0;
+    assert_eq(gpu_texture_create_2d_fmt_mipped(ctx, 64, 64, 99, 1), 0, "bad fmt -> 0");
+    assert_eq(gpu_texture_create_2d_fmt_mipped(ctx, 0, 64, MABDA_TEXFMT_RGBA8, 1), 0, "w<=0 -> 0");
+    assert_eq(gpu_texture_create_2d_fmt_mipped(ctx, 64, 64, MABDA_TEXFMT_RGBA8, 999), 0, "mip>full -> 0");
+    assert_eq(gpu_texture_create_2d_fmt_mipped(0, 64, 64, MABDA_TEXFMT_RGBA8, 1), 0, "null ctx -> 0");
+    assert_eq(_al2_count, 0, "guards reject before dispatch");
+    return 0;
+}
+
 fn test_gpu_render_pass_bind_texture_dispatch() {
     _ts3_bind_count = 0;
     var b = backend_new();
@@ -1929,6 +2026,8 @@ fn main() {
     test_wgpu_buffer_copy_guards();
     test_gpu_sampler_create();
     test_gpu_texture_create_2d_sampleable_dispatch();
+    test_gpu_texture_write_level_dispatch();
+    test_gpu_texture_create_2d_fmt_mipped_dispatch();
     test_gpu_render_pass_bind_texture_dispatch();
     test_wgpu_texture_bind_group_descriptor();
     test_wgpu_sampler_descriptor_from_intent();

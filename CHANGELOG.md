@@ -13,6 +13,79 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.3.0] — 2026-06-19
+
+**Asset loading — Phase AL, opens the v3.3 arc; native PNG path HW-verified on Cezanne.**
+mabda could create + upload textures but had no way to ingest a *container* — a `.dds`/`.ktx2`
+GPU-texture file or a `.png` image. v3.3 adds a backend-agnostic asset-loading layer
+(`src/asset_load.cyr`): parse the container header (bounds-checked against attacker-controlled
+input), map its format to a `MABDA_TEXFMT_*` id, gate it against the active backend's capabilities,
+create a texture, and upload each level. **DDS** (FourCC DXT1/3/5 + the modern DX10/DXGI path) and
+**KTX2** (uncompressed subset) are parsed in-tree (no external dep — the blocks are already
+GPU-ready); **PNG** is CPU-decoded by a new pure-Cyrius sibling package, **chitra** (`[deps.chitra]
+tag="0.1.0"`), then uploaded as RGBA8. A magic-byte sniffer (`gpu_texture_load`) routes any of the
+three by leading bytes. **HW-verified end-to-end on Cezanne** (`programs/native_load_png_e2e.cyr`): a
+real 64×64 `.png` is read from disk, decoded by chitra, uploaded into a native sampleable RGBA8
+texture, sampled through the public render path, and pixel-verified `RT[x,y] == decoded PNG[x,y]`.
+Arrays/cubemaps are parsed-and-rejected-loud (real support is v3.4 / Phase AL-ARRAY); KTX2
+supercompression (BasisLZ/Zstd/ZLIB) fails loud (no decoder); native *sampling* of compressed mips
+awaits the tiled compressed-mipped path (linear storage/upload ships now). Nothing silently dropped —
+see `docs/development/3-3-punchlist.md`.
+
+### Added — Phase AL (asset loading)
+- **AL.0 — format mapping** (`src/asset_format.cyr`): `mabda_texfmt_from_vk_format` (KTX2 VkFormat)
+  and `mabda_texfmt_from_dxgi_format` (DDS DX10) → `MABDA_TEXFMT_*`, plus `mabda_{vk,dxgi}_format_is_srgb`.
+  Numbers pinned against Vulkan-Headers `vulkan_core.h` + the system `dxgiformat.h` (a wrong number is
+  a silent-wrong load). sRGB variants collapse to the UNORM id but the sRGB-ness stays *queryable*
+  (documented, detectable — never silent); SNORM/SFLOAT/BC2/ETC2-R8G8B8A1 have no faithful id and
+  return -1 (fail loud).
+- **AL.1 — per-mip-level upload**: `gpu_texture_write_level(ctx, tex, level, src, n)` +
+  `BACKEND_SLOT_TEXTURE_WRITE_LEVEL` (both backends); native `native_tex_level_offset` /
+  `native_tex_chain_size` (format-aware, RGBA8 byte-identical to the existing mip math).
+- **AL.2 — generalized mipped create**: `gpu_texture_create_2d_fmt_mipped(ctx, w, h, fmt, mip_count)`
+  + `BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED` — a mip chain of any `MABDA_TEXFMT_*` (RGBA8 +
+  BC/ETC2/ASTC families), caps-gated on wgpu. The wgpu mipped-texture struct gained `fmt@28` so
+  `write_level` is format-aware (RGBA8 path stores 0 = RGBA8, both paths agree).
+- **AL.3 — DDS loader**: `gpu_texture_load_dds` / `_result` + `_dds_parse` (magic, bounds-checked
+  124-byte header; DXT1→BC1/DXT5→BC3, **DXT3/BC2 fail loud**; DX10/DXGI with sRGB capture; legacy
+  + DX10 cubemap/array rejected). New `GPU_ERR_CONTAINER_PARSE = 21`. The caps-on-ctx gate
+  `gpu_ctx_supports_format(ctx, fmt)` (backend-routed: native BC-only cap vs wgpu adapter-detect)
+  runs before create.
+- **AL.4 — KTX2 loader**: `gpu_texture_load_ktx2` / `_result` + `_ktx2_parse` (12-byte identifier as
+  masked u32s, bounds-checked header, **supercompression gated**, **cube/array rejected**, level-index
+  walk with the scheme-0 size invariant + overlap/truncation checks).
+- **AL.5 — PNG via chitra**: `[deps.chitra] tag="0.1.0"` (+ `thread`/`sankoch` stdlib deps for
+  chitra's inflate/crc32); `gpu_texture_load_png` / `_result` (decode → `create_2d_sampleable` +
+  `write`) and `gpu_texture_load_png_mipped` (+ `generate_mipmaps`; wgpu's not-implemented surfaced
+  via Err, native generates). Decode failure → `GPU_ERR_IMAGE_DECODE`.
+- **AL.6 — sniffer + HW e2e**: `gpu_texture_load` / `_result` magic-byte dispatch (PNG/KTX2/DDS;
+  unknown → `CONTAINER_PARSE`). `programs/native_load_png_e2e.cyr` + `tests/assets/load_test_64.png`
+  + `make test-native-load-png-e2e` (HW-gated, Cezanne).
+- **Tests**: a new `tests/tcyr/asset_load.tcyr` (the **17th** domain suite) — 138 asserts covering
+  format mapping, both parsers' fixtures + reject paths, the caps gate, mock-backend load
+  orchestration for all three formats, and the sniffer routing.
+
+### Changed
+- **Format-map unmapped sentinel is now -1, not 0** (`asset_format.cyr`): `MABDA_TEXFMT_RGBA8 == 0`
+  collided with "0 = unmapped", which would have silently rejected RGBA8 containers (DDS DX10 dxgi 28,
+  KTX2 vk 37/43). The map fns return -1 for unmapped; loaders reject on `fmt < 0`. (Caught during AL.4
+  cross-format work, fixed at the source, RGBA8-via-container tests added.)
+- **`BACKEND_SIZE` 280 → 296** (two new texture slots: write-level @280, fmt-mipped create @288).
+- **New stdlib deps**: `thread` + `sankoch` (chitra's transitive deps — its bundle excludes its own
+  stdlib deps, mabda provides them). **Consumers of mabda's dist must likewise add `[deps.chitra]` +
+  `thread`/`sankoch`** (the established samvada-style transitive-dep pattern).
+
+### Security
+- The DDS/KTX2 parsers consume **untrusted input** (attacker-controlled bytes + claimed length).
+  Every read off the buffer is bounds-checked against `len` before use; the KTX2 level-index walk
+  validates each `byteOffset`/`byteLength` (in-bounds, past the index, exact level size) before
+  `write_level`; the 12-byte KTX2 identifier is read as masked u32s (no sign-extension mis-validate).
+  Adversarially reviewed before the cut — **1 CRITICAL found + fixed**: a KTX2
+  level-index `byteOffset` signed-overflow (`boff + blen` wraps negative for
+  `boff` near i64_max, defeating the truncation guard → OOB read in
+  `write_level`); fixed to the overflow-safe `boff > len - blen` + regression
+  test. See `docs/audit/2026-06-19-asset-loading-audit.md`.
+
 ## [3.2.14] — 2026-06-19
 
 **Render-graph multi-queue scheduling — Phase R, HW-verified on Cezanne; closes the v3.2.x arc.**

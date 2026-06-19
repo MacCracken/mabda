@@ -10,8 +10,8 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 6.2.22+ (`cyrius.cyml: cyrius = "6.2.22"`)
-- **Version**: 3.2.14 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Language**: Cyrius 6.2.23+ (`cyrius.cyml: cyrius = "6.2.23"`)
+- **Version**: 3.3.0 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -178,6 +178,23 @@ detection.
   N.10/N.11 (vectors + per-ext-set) insert shifting Phase F/R down, the
   arc spans 3.2.0→3.2.14 (F shipped as a single 3.2.12 cut, R is 3.2.13–3.2.14),
   nothing deferred to v3.3/v4 (see the punchlist).
+  **3.3.0** → opens v3.3 with **asset loading (Phase AL)**, shipped as a single cut
+  (AL.0–AL.6). A backend-agnostic loader layer (`src/asset_load.cyr` + `asset_format.cyr`):
+  parse a container header (bounds-checked against untrusted input), map its format to a
+  `MABDA_TEXFMT_*` id, caps-gate it, create + upload each level. **DDS** (FourCC DXT1/3/5 +
+  DX10/DXGI) and **KTX2** (uncompressed subset) parsed in-tree; **PNG** CPU-decoded by the new
+  pure-Cyrius sibling package **chitra** (`[deps.chitra] tag="0.1.0"`, + `thread`/`sankoch`
+  transitive stdlib deps) then uploaded RGBA8; a magic-byte sniffer (`gpu_texture_load`) routes
+  all three. New public API: `gpu_texture_load{,_dds,_ktx2,_png,_png_mipped}` (+ `_result`),
+  `gpu_texture_create_2d_fmt_mipped`, `gpu_texture_write_level`, `gpu_ctx_supports_format`; two new
+  Backend slots (`BACKEND_SIZE` 280→296); `GPU_ERR_CONTAINER_PARSE = 21`; format-map unmapped
+  sentinel is **-1** (0 is the valid RGBA8 id). **Native PNG path HW-verified on Cezanne**
+  (`native_load_png_e2e`: file→decode→upload→sample→pixel-exact). Pre-cut adversarial security
+  review of the untrusted-input parsers found+fixed **1 CRITICAL** (KTX2 `byteOffset`
+  signed-overflow OOB → `boff > len - blen`) + regression test
+  (`docs/audit/2026-06-19-asset-loading-audit.md`). Arrays/cubemaps parsed-and-rejected-loud
+  (v3.4); KTX2 supercompression fails loud; native compressed-mip *sampling* awaits the tiled
+  path (linear storage/upload ships). Toolchain 6.2.23.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -203,9 +220,9 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.2.14, 2026-06-19)
+## Current State (post 3.3.0, 2026-06-19)
 
-- **Source**: 49 domain modules under `src/*.cyr`, ~22,300 lines
+- **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
@@ -218,15 +235,18 @@ doesn't change between paths.
   Phase R extended `render_graph.cyr` (scheduler + native MQ executor), `queue.cyr`
   ordering, `context.cyr` (IB-slot cursor, ctx 160→168), and `backend_native.cyr`
   (`native_render_dispatch_timeline` + IB staging + queue-aware render draw) in place
-  — no new module).
-- **Tests**: **4079 CPU-only assertions** across **16 functionality-named
-  domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
+  — no new module; 3.3.0 Phase AL added two modules — `asset_format.cyr` (format-id
+  mapping) + `asset_load.cyr` (DDS/KTX2 parsers + the PNG/sniffer load API) — and
+  the `chitra` dep at `lib/chitra.cyr`).
+- **Tests**: **4276 CPU-only assertions** across **17 functionality-named
+  domain files** under `tests/tcyr/` (3.3.0 added `asset_load.tcyr`, the 17th;
+  reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
   mirroring the `src/` domains; `make test` globs them all.
   **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
   `make test | grep` (or `awk`) treats it as binary and **silently drops
-  texture's 207** — the naive total reads **3872**, not the true **4079**. Use
+  texture's 207** — the naive total reads **4069**, not the true **4276**. Use
   `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
   accurate count; the trap has fooled humans and review agents alike.
   Domain breakdown:
@@ -347,7 +367,14 @@ doesn't change between paths.
 
 - **Cyrius stdlib** — `string`, `fmt`, `alloc`, `vec`, `str`, `io`,
   `args`, `hashmap`, `syscalls`, `tagged`, `fnptr`, `mmap`, `dynlib`,
-  `sakshi` (ships with Cyrius >= 5.4.7)
+  `sakshi` (ships with Cyrius >= 5.4.7), plus `thread` + `sankoch`
+  (added v3.3.0 — chitra's transitive deps: mutex + zlib/DEFLATE inflate)
+- **`chitra` (AGNOS dep)** — pure-Cyrius PNG decoder (sibling package).
+  Pinned via `[deps.chitra] tag = "0.1.0"`; bundle at `lib/chitra.cyr`.
+  `asset_load.cyr`'s `gpu_texture_load_png` decodes through it to RGBA8.
+  Its bundle excludes its own stdlib deps, so mabda provides `thread` +
+  `sankoch` (above). **Consumers of mabda's dist must likewise add
+  `[deps.chitra]` + `thread`/`sankoch`** (the samvada-style pattern).
 - **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
   delegation. Pinned via `[deps.samvada] tag = "0.4.1"` in
   `cyrius.cyml`. mabda doesn't link libsystemd directly — consumer
@@ -397,7 +424,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 4079 CPU assertions across 16 domain files
+make test                                            # 4276 CPU assertions across 17 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -487,7 +514,7 @@ mabda/
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
 │   ├── tcyr/                        — 16 functionality-named domain suites
-│   │   │                              (4079 asserts total; `make test` globs
+│   │   │                              (4276 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -613,7 +640,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 4079 CPU assertions across 16 domain test
+- **Tests are the way** — 4276 CPU assertions across 17 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -663,7 +690,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 4079+ assertions pass across all 16 domain test files,
+2. Test sweep: 4276+ assertions pass across all 17 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -736,7 +763,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 16 `tests/tcyr/*.tcyr` domain suites); 4079+
+   (all 17 `tests/tcyr/*.tcyr` domain suites); 4276+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
@@ -755,7 +782,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.2.22"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.23"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts
