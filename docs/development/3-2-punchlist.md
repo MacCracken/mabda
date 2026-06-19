@@ -1205,9 +1205,20 @@ ordering exactly. wgpu serialized-equivalent.
   capture-mock executor test pinning the compute→barrier→render→wait order +
   barrier endpoints (render 182→196; suite 4065→4079). Smoke/lint/fmt/vet/distlib
   green. **HW e2e is R.7.**
-- [ ] **R.7** *(3.2.14)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
-  compute→cross-queue-edge→render, distinct rings, no CPU stall; wgpu
-  parity vs `render_graph_e2e.cyr`); cut.
+- [x] **R.7 (2026-06-19) — HW e2e HW-VERIFIED on Cezanne.**
+  `programs/native_render_graph_mq_e2e.cyr` builds a compute→render graph through
+  the public render-graph API (rg_add_compute/rg_add_render/rg_node_writes/reads/
+  rg_build/rg_execute_mq): node C writes buf_a (default COMPUTE), node R clear-
+  triangles a 64×64 RT red (default GRAPHICS), C-writes-7/R-reads-7 → the scheduler
+  classifies the cross-queue fence edge and `_rg_execute_native_mq` emits the
+  COMPUTE→GRAPHICS barrier (in-CS timeline wait) before R's GFX submit. **5/5
+  stable runs on Cezanne**: schedule = 2 batches + 1 fence edge; rings compute=1 /
+  graphics=0 (DISTINCT), each at timeline point 1; buf_a == 0xDEADBEEF (compute
+  leg) AND RT pixel(0,0) == (0xFF,0,0,0xFF) red (render leg). Per-node IB staging
+  (R.5) keeps C on slice 0 and R on slice 1. Makefile target
+  `test-native-render-graph-mq-e2e`; program lint/fmt clean. The 3.2.14 **cut**
+  (VERSION/CHANGELOG/CLAUDE/dist/version-check) is the remaining closeout step.
+  **→ Phase R complete; the v3.2.x arc's last feature work is done.**
 
 ---
 
