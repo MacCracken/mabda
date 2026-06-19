@@ -3094,6 +3094,64 @@ fn test_native_render_bo_list_pack_distinct_from_compute() {
     return 0;
 }
 
+# v3.2.13 R.4 — native_render_dispatch_timeline guard ladder + the
+# fake-fd bookkeeping path (ring/null/bytes/syncobj guards, then the
+# point-bump + pending-wait-consume that must run even when the HW
+# submit fails). The real GFX-ring submit is the R.7 e2e (HW-gated).
+fn test_native_render_dispatch_timeline_driver() {
+    var ctx[160];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    var pm4[64];
+    memset(&pm4, 0, 64);
+    var triple[32];
+    native_render_handles_write(&triple, 0x11, 0x22, 0x33, 0);  # tex=0 → 5-entry
+
+    # A GFX queue with a syncobj — the happy-path queue.
+    var qg = queue_new(QUEUE_KIND_GRAPHICS);
+    queue_set_ring(qg, AMDGPU_HW_IP_GFX);
+    queue_set_syncobj(qg, 9);
+
+    assert_eq(native_render_dispatch_timeline(0, &pm4, 32, &triple, qg),
+    GPU_ERR_OTHER, "null ctx -> GPU_ERR_OTHER");
+    assert_eq(native_render_dispatch_timeline(&ctx, &pm4, 32, &triple, 0),
+    GPU_ERR_OTHER, "null queue -> GPU_ERR_OTHER");
+
+    # Non-GFX (compute) queue is a mis-route — render PM4 only runs on GFX.
+    var qc = queue_new(QUEUE_KIND_COMPUTE);
+    queue_set_ring(qc, AMDGPU_HW_IP_COMPUTE);
+    queue_set_syncobj(qc, 8);
+    assert_eq(native_render_dispatch_timeline(&ctx, &pm4, 32, &triple, qc),
+    GPU_ERR_OTHER, "render on non-GFX queue -> GPU_ERR_OTHER");
+
+    # GFX queue, zero / oversize pm4_bytes (checked before the IB memcpy).
+    assert_eq(native_render_dispatch_timeline(&ctx, &pm4, 0, &triple, qg),
+    GPU_ERR_OTHER, "zero pm4_bytes -> GPU_ERR_OTHER");
+    assert_eq(native_render_dispatch_timeline(&ctx, &pm4, _NATIVE_IB_SIZE + 1, &triple, qg),
+    GPU_ERR_OTHER, "pm4_bytes > IB size -> GPU_ERR_OTHER");
+
+    # GFX queue, valid bytes, but no syncobj -> GPU_ERR_OTHER.
+    var qns = queue_new(QUEUE_KIND_GRAPHICS);
+    queue_set_ring(qns, AMDGPU_HW_IP_GFX);
+    assert_eq(native_render_dispatch_timeline(&ctx, &pm4, 32, &triple, qns),
+    GPU_ERR_OTHER, "GFX queue, syncobj 0 -> GPU_ERR_OTHER");
+
+    # Full path: GFX queue + syncobj + ib/fence backing + fake fd. The
+    # submit fails (no HW) but the queue bookkeeping must still run:
+    # timeline point bumped 0->1, the recorded cross-ring barrier consumed.
+    queue_set_pending_wait(qg, 0x55, 3);
+    store64((&ctx) + 0, 0 - 1);             # fd = -1
+    var ib_scratch[4096];
+    store64((&ctx) + 64, &ib_scratch);      # ib_addr
+    var fence_scratch[64];
+    store64((&ctx) + 88, &fence_scratch);   # fence_addr (driver writes +32)
+    assert_eq(queue_point(qg), 0, "point starts 0");
+    var rc = native_render_dispatch_timeline(&ctx, &pm4, 32, &triple, qg);
+    assert(rc != 0, "fake-fd submit fails gracefully");
+    assert_eq(queue_point(qg), 1, "timeline point bumped 0->1");
+    assert_eq(queue_pending_wait_syncobj(qg), 0, "pending wait consumed");
+    return 0;
+}
+
 # ================================================================
 # v3 Step 6.8(c) — NativeRenderPipeline + NativePass layouts
 # ================================================================
@@ -3666,6 +3724,7 @@ fn main() {
     test_native_render_bo_list_pack6_layout();
     test_native_render_bo_list_pack_layout();
     test_native_render_bo_list_pack_distinct_from_compute();
+    test_native_render_dispatch_timeline_driver();
     test_native_render_pipeline_struct_field_offsets();
     test_native_render_pipeline_pack_matches_composer();
     test_native_render_pipeline_pack_null_out();

@@ -13229,6 +13229,98 @@ render_handles_ptr, timeout_ns): i64 {
 }
 
 # ================================================================
+# v3.2.13 R.4 — queue-targeted render dispatch (async, timeline)
+# ================================================================
+# The render analog of native_compute_dispatch_cached_timeline: submits a
+# pre-built render PM4 stream on `queue`'s GFX ring, signalling that
+# queue's PERSISTENT timeline syncobj at the next point (queue_bump_point)
+# instead of an ephemeral binary syncobj, and consuming any pending
+# cross-ring barrier (gpu_queue_barrier, Q.4) as an in-CS TIMELINE_WAIT.
+# It does NOT wait — the caller controls completion via
+# gpu_queue_wait_idle / orders with gpu_queue_barrier. This is the missing
+# piece that lets render NODES join cross-ring overlap in the multi-queue
+# render graph (Phase R); the synchronous native_render_dispatch_simple
+# stays the single-shot path the v2.5 executor uses.
+#
+# Same BO_HANDLES shape + ib_flags=0 as native_render_dispatch_simple
+# (fence / vs / fs / rt / [tex] / ib; the GFX PM4's ACQUIRE_MEM preamble
+# does the cache invalidate, so no TC writeback hook). render_handles_ptr
+# is a triple packed by native_render_handles_write.
+#
+# Ring guard: render PM4 (draw packets + graphics registers) only runs on
+# the GFX ring, so a queue bound to any other ring is a mis-route
+# (GPU_ERR_OTHER) — mirroring native_transfer_copy_timeline's DMA-only
+# guard. The pm4_bytes > IB-size guard stops a malformed stream from
+# overrunning the cached IB BO (R.4 audit: IB-staging bound check).
+#
+# MVP caveat (same as the compute timeline path): the cached IB BO is
+# shared per context, so the contract is one in-flight queue-targeted
+# render dispatch per queue before a wait/barrier. R.5 lifts this with
+# per-node IB staging. Returns 0|GPU_ERR_*.
+fn native_render_dispatch_timeline(ctx, pm4, pm4_bytes,
+render_handles_ptr, queue): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    # GFX-ring-only: a render stream aimed at a compute/DMA queue mis-routes.
+    if (queue_ring(queue) != AMDGPU_HW_IP_GFX) { return GPU_ERR_OTHER; }
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
+    var syncobj = queue_syncobj(queue);
+    if (syncobj == 0) { return GPU_ERR_OTHER; }
+
+    var fd = native_ctx_fd(ctx);
+    var cid = native_ctx_id(ctx);
+    var ib_handle    = native_ctx_ib_handle(ctx);
+    var ib_va        = native_ctx_ib_va(ctx);
+    var ib_addr      = native_ctx_ib_addr(ctx);
+    var fence_handle = native_ctx_fence_handle(ctx);
+    var fence_addr   = native_ctx_fence_addr(ctx);
+
+    var vs_handle  = load64(render_handles_ptr +  0);
+    var fs_handle  = load64(render_handles_ptr +  8);
+    var rt_handle  = load64(render_handles_ptr + 16);
+    var tex_handle = load64(render_handles_ptr + 24);   # TS.5 (0 = none)
+
+    # Stage PM4 into the cached IB BO.
+    memset(ib_addr, 0, _NATIVE_IB_SIZE);
+    memcpy(ib_addr, pm4, pm4_bytes);
+    # Pre-zero the user-fence slot so the kernel's seqno write is observable.
+    store64(fence_addr + 32, 0);
+
+    # BO_HANDLES list: fence / vs / fs / rt / [tex] / ib (TS.5 6-entry
+    # when a sampled texture is bound).
+    var entries[48];
+    var n_entries = 5;
+    if (tex_handle != 0) {
+        native_render_bo_list_pack6(&entries, fence_handle,
+        vs_handle, fs_handle, rt_handle, tex_handle, ib_handle);
+        n_entries = 6;
+    } else {
+        native_render_bo_list_pack(&entries, fence_handle,
+        vs_handle, fs_handle, rt_handle, ib_handle);
+    }
+    var bo_list_in[24];
+    store32(&bo_list_in +  0, 0xFFFFFFFF);
+    store32(&bo_list_in +  4, 0xFFFFFFFF);
+    store32(&bo_list_in +  8, n_entries);
+    store32(&bo_list_in + 12, 8);
+    store64(&bo_list_in + 16, &entries);
+
+    # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
+    # TIMELINE_WAIT; read + clear before submit so queue state is clean.
+    var wait_so = queue_pending_wait_syncobj(queue);
+    var wait_pt = queue_pending_wait_point(queue);
+    queue_clear_pending_wait(queue);
+
+    # Reserve this dispatch's timeline point and submit signalling it on
+    # completion. ib_flags=0 (GFX ACQUIRE_MEM handles cache invalidation).
+    var point = queue_bump_point(queue);
+    var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
+    AMDGPU_HW_IP_GFX, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+    return _native_neg_rc_to_gpu_err(rc);
+}
+
+# ================================================================
 # v3 Step 4c — native Backend interface implementation
 # ================================================================
 # Fills the @internal Backend struct (src/backend.cyr) with native

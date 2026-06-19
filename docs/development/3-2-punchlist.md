@@ -1156,9 +1156,22 @@ ordering exactly. wgpu serialized-equivalent.
   `rg_is_scheduled`; `rg_execute_mq` now runs `rg_schedule` (idempotent, no-op on
   the wgpu serialized path). +45 CPU asserts (render 137→182; suite 3998→4043).
   Smoke/lint/fmt/vet/distlib green.
-- [ ] **R.4** *(3.2.13)* — `native_render_dispatch_timeline` (GFX-ring
-  timeline variant of the render submit; the missing piece for render
-  nodes to join cross-ring overlap).
+- [x] **R.4 (2026-06-19)** *(3.2.13)* — `native_render_dispatch_timeline`
+  (`src/backend_native.cyr`), the GFX-ring timeline analog of
+  `native_compute_dispatch_cached_timeline`: stages the render PM4 into the
+  cached IB, builds the fence/vs/fs/rt/[tex]/ib BO list (TS.5 6-entry when a
+  sampled texture is bound, same as `native_render_dispatch_simple`), consumes
+  any pending `gpu_queue_barrier` cross-ring wait as an in-CS TIMELINE_WAIT,
+  bumps the queue's persistent timeline point, and submits via
+  `native_cs_submit_timeline(… AMDGPU_HW_IP_GFX … ib_flags=0)` **without
+  blocking** — the missing piece letting render nodes join cross-ring overlap.
+  Guards: GFX-ring-only (non-GFX queue → GPU_ERR_OTHER, mirroring the transfer
+  driver's DMA-only check), null ctx/queue, `pm4_bytes` 0/over-IB-size (audit:
+  IB-staging bound check), syncobj-0. CPU-tested via the guard ladder + the
+  fake-fd bookkeeping path (point 0→1, pending-wait consumed even when the HW
+  submit fails); +10 asserts (native 1354→1364; suite 4043→4053). The real
+  GFX-ring timeline submit is exercised by the R.7 HW e2e on Cezanne.
+  Smoke/lint/fmt/vet/distlib green.
 - [ ] **R.5** *(3.2.14)* — Per-node IB staging (fixes the shared-cached-IB
   clobber under genuine overlap; explicit, never a silent serialization).
 - [ ] **R.6** *(3.2.14)* — Scheduler (per-queue toposort + cross-queue
