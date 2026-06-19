@@ -1,0 +1,81 @@
+# programs/f64_compute_e2e.cyr — v3.2 Phase F.8: wgpu f64 via WGPUNativeFeature_ShaderF64.
+#
+# Proves the wgpu HALF of Phase F's f64 story that CAN be proven today on Cezanne:
+#   (1) the device advertises f64 — WGPUNativeFeature_ShaderF64 (0x0003001D) is enabled (the
+#       F.8b launcher edit, gated by the adapter's Vulkan shaderFloat64), and
+#   (2) an f64 SPIR-V compute module (OpCapability Float64 + OpTypeFloat 64 + an f64 OpFMul)
+#       CREATES through the ORDINARY gpu_shader_module_create_spirv path — naga's SPIR-V
+#       frontend accepts f64 once ShaderF64 is on. NO passthrough is needed: F.8b corrected the
+#       F.2/proposal premise that "passthrough is the only f64 route" (it isn't, and passthrough
+#       is in fact unsupported on this RADV adapter). Passthrough (F.8a) is a separate general
+#       raw-SPIR-V escape hatch, exercised in step (3) only where the adapter supports it.
+#
+# It also proves the HONEST capability posture: gpu_caps_wgpu_shader_f64(device) == 0. wgpu
+# compute DISPATCH is a v3.0 stub (_backend_wgpu_compute_dispatch returns GPU_ERR_OTHER), so
+# f64 — like any compute — cannot run END-TO-END on wgpu yet. Per the Phase F contract a
+# consumer (attn11) must hard-fail rather than silently fall back to f32, so the cap reports 0
+# even though the module creates (the M.6b mipmap-generate posture). When wgpu compute lands,
+# flip MABDA_WGPU_COMPUTE and the cap becomes the ShaderF64 device bit.
+#
+# Linked with deps/wgpu_main.c via `make test-f64-compute-e2e` (needs wgpu-native + a GPU).
+# Exit: 0 = ShaderF64 enabled + f64 module created + caps honest (or SKIP: no GPU); 2 = ShaderF64
+#       missing / module-create failed; 3 = caps not honest (reported f64 on a stubbed path).
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, code): i64 { syscall(1, 2, msg, strlen(msg)); return code; }
+fn _ok(msg): i64 { syscall(1, 1, msg, strlen(msg)); return 0; }
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) { syscall(1, 2, "SKIP: no GPU available\n", 23); return 0; }
+    _gpu_ctx = payload(res);
+    var device = gpu_ctx_device(_gpu_ctx);
+    _ok("PASS: GPU context created\n");
+
+    # (1) the device must advertise f64 — the authoritative WGPUNativeFeature_ShaderF64 bit
+    #     (requested by the F.8b launcher edit, gated by the adapter's Vulkan shaderFloat64).
+    if (gpu_wgpu_shader_f64_supported(device) == 0) {
+        return _fail("FAIL: ShaderF64 not enabled (adapter lacks f64, or launcher missing F.8b?)\n", 2);
+    }
+    _ok("PASS: WGPUNativeFeature_ShaderF64 enabled (device supports f64)\n");
+
+    # (2) the milestone: an f64 SPIR-V compute module (OpCapability Float64) CREATES through the
+    #     ordinary gpu_shader_module_create_spirv path — naga's SPIR-V frontend accepts f64 once
+    #     ShaderF64 is on. No passthrough needed (that was the corrected F.2/proposal premise).
+    var buf[224];
+    var n = _wgpu_f64_probe_spirv(&buf);
+    var smod = gpu_shader_module_create_spirv(_gpu_ctx, &buf, n);
+    if (smod == 0) {
+        return _fail("FAIL: f64 SPIR-V module create (standard naga path) returned 0\n", 2);
+    }
+    _ok("PASS: f64 SPIR-V module created via standard naga path (OpCapability Float64)\n");
+
+    # (3) the raw-SPIR-V passthrough escape hatch (F.8a) — orthogonal to f64. Demonstrate it
+    #     where the adapter supports it; on RADV/Cezanne it is unsupported, so report + skip
+    #     (calling the passthrough creator without the feature would fault loudly in wgpu).
+    if (gpu_wgpu_spirv_passthrough_supported(device) != 0) {
+        var pm = wgpu_device_create_shader_module_spirv_passthrough(device, &buf, n / 4);
+        if (pm == 0) { return _fail("FAIL: passthrough create returned 0 despite support\n", 2); }
+        wgpu_shader_module_release(pm);
+        _ok("PASS: raw-SPIR-V passthrough escape hatch also created the module\n");
+    } else {
+        _ok("INFO: SpirvShaderPassthrough unsupported on this adapter (escape hatch skipped)\n");
+    }
+
+    # (4) honest capability: 0 because wgpu compute dispatch is a v3.0 stub (M.6b) — no f64
+    #     end-to-end on wgpu yet, so no silent f32 fallback path for a consumer to trip over.
+    if (gpu_caps_wgpu_shader_f64(device) != 0) {
+        return _fail("FAIL: gpu_caps_wgpu_shader_f64 must be 0 while wgpu compute is stubbed\n", 3);
+    }
+    _ok("PASS: gpu_caps_wgpu_shader_f64 == 0 (honest: dispatch stubbed, no silent f32 fallback)\n");
+
+    _ok("OK - wgpu f64 (ShaderF64 + naga SPIR-V) module-create live on Cezanne; caps honest (M.6b)\n");
+    return 0;
+}

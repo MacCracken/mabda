@@ -21,7 +21,7 @@ they land.
 > backends**) **and absorbs every item that was previously going to be
 > deferred** — native compressed *sampling*, the v3.1.2 TRANSFER/buffer-copy
 > work, and render-graph multi-queue. **Nothing in this plan defers to
-> v3.3 or v4.** The arc grows to fit (3.2.0 → 3.2.13). Where work is
+> v3.3 or v4.** The arc grows to fit (3.2.0 → 3.2.14). Where work is
 > blocked *only* by hardware absent from the dev box, the code still ships
 > in-arc and the **HW-verification gap is flagged for the maintainer**
 > (see the Hardware-verification gaps section) — never silently dropped.
@@ -42,10 +42,9 @@ they land.
 | 3.2.9   | **N** (5) | Int div/mod (N.9): no HW integer divide → float-reciprocal macro. OpUDiv/UMod/SDiv/SRem/SMod, all HW-verified on Cezanne. | — |
 | 3.2.10  | **N** (6) | Vectors (N.10): component-wise vec2/3/4 ops. | — |
 | 3.2.11  | **N** (7) | Per-ext-set tracking (N.11): verify `OpExtInst` set is GLSL.std.450. | — |
-| 3.2.12  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
-| 3.2.13  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
-| 3.2.14  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
-| 3.2.15  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
+| 3.2.12  | **F** (1) | f64 (double-precision) compute, **HW-verified on Cezanne**: caps surface + native hand-authored proof + wgpu ShaderF64 module + the general native SPIR-V→GFX9 f64 **arithmetic** toolkit (add/sub/mul/div/sqrt/fma, cvt, const, ldexp, compares, select) + attn11 acceptance (F.1–F.10). Transcendentals arithmetic-only (consumers hand-roll). f64 **complete**. | — |
+| 3.2.13  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
+| 3.2.14  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
 
 `BACKEND_SIZE` / slot offsets are append-after-KIND in **landing order**;
 the absolute `+N` in each proposal is nominal and finalized per the order
@@ -888,28 +887,239 @@ Consumer: **attn11**. f64 hard-gates on SPIR-V on **both** backends (no
 not speed, is the deliverable. **No escape hatch — general native f64 is a
 committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
 
-- [ ] **F.1** *(3.2.10)* — `GpuCapabilities` f64 field (+120, struct→128) +
-  accessors.
-- [ ] **F.2** *(3.2.10)* — `gpu_caps_shader_f64(ctx)` (wgpu: probe-module +
-  `SpirvShaderPassthrough`; native: `MABDA_NATIVE_F64`).
-- [ ] **F.3** *(3.2.10)* — Shader-module f64 flag + fail-loud dispatch guard.
-- [ ] **F.4** *(3.2.10)* — `native_gfx9_shader_fma_f64` hand-authored
-  reference kernel (`V_FMA_F64`, doubled-VGPR RSRC1); llvm-mc byte-pinned.
-- [ ] **F.5** *(3.2.10)* — `native_pm4_build_compute_fma_f64` composer.
-- [ ] **F.6** *(3.2.10)* — `native_f64_fma_e2e.cyr` (Cezanne): a*b+c
-  **bit-exact vs CPU f64**. f64-on-HW proof, decoupled from Phase N.
-- [ ] **F.8** *(3.2.10)* — wgpu f64 module via SPIR-V passthrough + probe
-  (`f64_compute_e2e.cyr`; dispatch gated on real wgpu compute → M.6b posture).
-- [ ] **F.7** *(3.2.11)* — General native f64: route consumer f64 SPIR-V
-  through the Phase N emitter (`V_*_F64`); per-op f64 conformance.
-- [ ] **F.9** *(3.2.11)* — attn11 consumer smoke (one real f64 kernel,
-  bit-faithful vs the CPU f64 oracle). Acceptance proof.
-- [ ] **F.10** *(3.2.11)* — Docs (throughput caveats) + **roadmap reflow
-  correcting the `SHADER_F64` framing**; cut.
+- [x] **F.1** *(3.2.12)* (2026-06-18) — `GpuCapabilities` `shader_f64` field at **+128**,
+  struct **128→136** (T.4's texture-compression bitset already took +120, so the proposal's
+  "+120→128" was stale) + `gpu_caps_shader_f64` accessor / `gpu_caps_set_shader_f64` setter +
+  `gpu_caps_new` sized up. +3 core asserts. (F.10 reflowed the whole Phase F to the single
+  **3.2.12** cut; Phase R moved to 3.2.13–3.2.14.)
+- [x] **F.2** *(3.2.12)* (2026-06-18) — per-backend f64 detection. native
+  `gpu_caps_native_shader_f64()` → `MABDA_NATIVE_F64` (the f64 ANSWER, 0 until F.7) + the wgpu
+  NECESSARY-gate `gpu_wgpu_spirv_passthrough_supported(device)` → `has_feature(SpirvShaderPassthrough
+  0x00030017)`. Kept F.1's struct accessor `gpu_caps_shader_f64(c)` (the proposal's
+  `gpu_caps_shader_f64(ctx)` would clash). **Adversarial review:** the wgpu helper is deliberately
+  NOT named `*_shader_f64` — passthrough-available ≠ Vulkan `shaderFloat64` (review #1), and the
+  reference launcher doesn't request passthrough yet so it returns 0 today (review #3); the honest
+  wgpu f64 detect (compose the gate + a real-module probe + the launcher request) is **F.8**, so
+  F.2 populates NO wgpu f64 field. +5 core asserts.
+- [x] **F.3** *(3.2.12)* (2026-06-18) — f64 shader gate. `spirv_uses_f64` (`spirv_parse.cyr`)
+  scans `OpCapability Float64` (bounded, zero-wc-safe); the native shader-create rejects an f64
+  module up front while `MABDA_NATIVE_F64 == 0` (pre-F.7). **Adapted** the proposal's dispatch
+  guard to **create-time** — both backends already reject f64-on-unsupported at create (native
+  gate/compiler; wgpu f64 non-functional until F.8 wires passthrough + the launcher request), so
+  a dispatch guard + a flag on the opaque shmod would never fire; the F.2 cap check stays the
+  consumer's primary hard-fail. **Adversarial review:** closed an OOB operand read in
+  `spirv_uses_f64` + the sibling scanners (`off + wc > total` bound, for untrusted/odd-length
+  bytes). +5 asserts; non-f64 native kernel (`smod_e2e`) unaffected on Cezanne.
+- [x] **F.4–F.6** *(3.2.12)* (2026-06-18) — **first native f64 on Cezanne.** `native_gfx9_shader_fma_f64`
+  (`V_FMA_F64` VOP3 0x1CC + `GLOBAL_LOAD/STORE_DWORDX2`, RSRC1 0x2C0042 = 10 VGPRs; llvm-mc-pinned
+  + `test_gfx9_enc_f64` oracle) + `native_pm4_build_compute_fma_f64` composer + `native_f64_fma_e2e.cyr`:
+  `out=a*b+c` **bit-exact vs a fused-FMA reference** (8 lanes). Fused-rounding proven — the GPU's
+  single-rounding `v_fma_f64` matches `math.fma` (not the unfused `mul`+`add`, which differs by 1 ULP
+  on lanes like `0.1*0.1+0.1`); Cyrius has no fused builtin so the reference is embedded + math.fma-
+  validated. +4 asserts; no regression (smod/vector_const still pass on Cezanne). Decoupled from Phase N.
+- [x] **F.8a** *(3.2.12)* (2026-06-18) — wgpu **raw-SPIR-V passthrough escape hatch** (FFI
+  plumbing): a new C shim `wgpu_shim_create_shader_module_spirv(device, words, word_count)` wraps
+  `wgpuDeviceCreateShaderModuleSpirV` (naga-bypass) → `fn_table[66]` (`FN_COUNT` 66→67) → the
+  Cyrius wrapper `wgpu_device_create_shader_module_spirv_passthrough` (`src/wgpu_ffi.cyr`,
+  `_fp(66)`); the launcher requests `SpirvShaderPassthrough` gated by `wgpuAdapterHasFeature`.
+  **Launcher regression: `spirv_e2e` all-PASS + exit 0 on Cezanne.** NOTE (F.8b): this is **not**
+  the f64 route — f64 uses `ShaderF64` + the standard naga path; passthrough is a general escape
+  hatch for SPIR-V naga can't carry, kept + exercised by the e2e where the adapter supports it
+  (unsupported on RADV/Cezanne).
+- [x] **F.8b** *(3.2.12)* (2026-06-18) — wgpu f64 via **`WGPUNativeFeature_ShaderF64`**, HW-verified
+  on Cezanne. **Corrected the F.2/proposal premise** ("passthrough is the only f64 route" — wrong):
+  wgpu-native has a real `ShaderF64` (0x0003001D) and naga's SPIR-V frontend accepts f64 once it is
+  enabled, so f64 rides the ordinary `gpu_shader_module_create_spirv` path. Launcher requests
+  `ShaderF64` (gated); `gpu_wgpu_shader_f64_supported(device)` is the authoritative bit;
+  `gpu_caps_wgpu_shader_f64` = that bit gated by `MABDA_WGPU_COMPUTE` (0 today — wgpu compute
+  dispatch is a v3.0 stub → honest 0, no silent f32 fallback, M.6b). `_wgpu_f64_probe_spirv`
+  (55 spirv-as words). `programs/f64_compute_e2e.cyr` (HW: ShaderF64 on, f64 module creates via
+  naga, passthrough skipped-unsupported, caps 0) + `backend.tcyr` +2 tests. Folds in the former F.8c.
+  See [[project_wgpu_f64_via_shaderf64_not_passthrough]].
+- [x] **F.7** *(3.2.12)* — General native f64: route consumer f64 SPIR-V through the SPIR-V→GFX9
+  compiler (`V_*_F64`). Central new concept: **64-bit register pairs** (even-aligned) as `MIR_T_F64`
+  threaded MIR→isel→regalloc→encode. Milestone-first, then breadth; flip `MABDA_NATIVE_F64`→1 ONLY
+  when f64 runs end-to-end for every op attn11 uses — partial back end stays 0 (review F.2 #2). The
+  9-module understand map (2026-06-18) confirmed the ABI/RSRC1 `ceil(vgpr_hw/4)-1` formula already
+  handles pairs; the load-bearing change is regalloc pair allocation (F.7c).
+  - [x] **F.7a** *(2026-06-18)* — front-end f64 type: `MIR_T_F64` + `_mir_lower_type` accepts
+    `OpTypeFloat 64` (scalar + vec); `compiler_lower.tcyr` f64 assertions flipped from UNSUPPORTED.
+  - [x] **F.7b** *(2026-06-18)* — `V_*_F64` GFX9 encoders, llvm-mc gfx900-verified + byte-oracle'd
+    (`compiler_encode.tcyr` `test_gfx9_enc_f64_alu`, +11): VOP3 V_ADD_F64=0x280 / V_MUL_F64=0x281 /
+    V_MIN_F64=0x282 / V_MAX_F64=0x283 + VOP1 CVT_F64_F32=0x10 / CVT_F32_F64=0x0F / CVT_{F64_I32,
+    I32_F64,F64_U32,U32_F64} (V_FMA_F64=0x1CC + DWORDX2 from F.4). No V_SUB_F64/V_ABS_F64 (src-mods);
+    FDiv/FSqrt macros deferred to breadth. GISEL_V_*_F64 enum + GISEL→GFX9 dispatch land with isel (F.7d).
+  - [x] **F.7c** *(2026-06-18)* — regalloc **even-aligned 64-bit pairs**: `_ra_claim_pair` (lowest
+    even reg, both halves free; odd base rounds up; step 2) + driver f64 width detection
+    (`mir_val_type` base == `MIR_T_F64` → claim pair, `hw += 2`). `compiler_backend.tcyr` +2 tests
+    (direct `_ra_claim_pair` align/reuse/half-busy/exhaustion + a divergent f64 chain → v[2:3], v[4:5],
+    hw 6). ABI RSRC1 `ceil(hw/4)-1` already pair-correct (F.4 oracle).
+  - [x] **F.7d** *(2026-06-18)* — isel f64 routing: type-aware `_gisel_float_op(mop, tbase)` →
+    `GISEL_V_{ADD,MUL,FMA,MIN,MAX}_F64` (f64 SUB/SQRT/FLOOR/CLAMP/ABS fail loud, breadth); f64
+    load/store → `GISEL_GLOBAL_{LOAD,STORE}_DWORDX2`; compile dispatch reuses the VOP3 emitters
+    (regalloc's even low reg = the pair) + parameterized FLAT opcode; `gfx9_waitcnt` tracks DWORDX2.
+    Tests: `_gisel_float_op` f32/f64 + an f64 isel check (DWORDX2 routing integration-tested in F.7e).
+  - [x] **F.7e** *(2026-06-18)* — *(HW)* **first COMPILED f64 on silicon.** f64 FMA SPIR-V →
+    `gfx9_compile` → dispatched on Cezanne, all 8 lanes bit-exact vs the fused-FMA reference;
+    RSRC1 `0x2C0042` matches the F.4 oracle (regalloc produced the same budget). Fixed the f64
+    access-chain stride (esize 8) in `_spirv_lower_access_chain` + `_spirv_std430_stride_ok`.
+    `native_spirv_f64_fma_e2e.cyr` + `_spv_build_f64_fma` + a `gfx9_compile` CPU test (4 bindings,
+    8 user-SGPRs, v_fma_f64 in the ISA). Proves F.7a–d compose end-to-end.
+  - [x] **F.7f.1** *(2026-06-18)* — FADD + FMUL + GLSL FMin + FMax (already wired by F.7b/d) HW-verified:
+    `out=max(min(a*b+c,b),a)` compiled + dispatched on Cezanne, all 8 lanes bit-exact vs an in-process
+    f64 reference (f64_add/mul + f64_lt/gt min/max). `native_spirv_f64_arith_e2e.cyr` + `_spv_build_f64_arith`
+    + a `gfx9_compile` CPU test (v_add/mul/min/max_f64 in the ISA). Lane 6 shows UNFUSED (...5C2) vs the
+    F.7e FUSED (...5C3) — separate OpFMul+OpFAdd round twice. (Min/max NaN/±0 conformance: breadth.)
+  - [x] **F.7f.2** *(2026-06-18)* — **f32↔f64 CVT** (OpFConvert): `MIR_OP_FCONVERT` + lowering +
+    result-type-dispatched isel (f64→V_CVT_F64_F32 widen, f32→V_CVT_F32_F64 narrow) through `_emit_vop1`
+    + the F.7b encoders. HW-verified: `out=double(float(a))` bit-exact vs `f32_to_f64(f64_to_f32(a))`.
+    `native_spirv_f64_cvt_e2e.cyr` + `_spv_build_f64_cvt` + a `gfx9_compile` CPU test.
+  - [x] **F.7f.3** *(2026-06-18)* — f64 **FSub + FAbs** via VOP3 source modifiers: FSub = V_ADD_F64 +
+    NEG src1 (hi 0x40000000); FAbs = V_MAX_F64(|x|,|x|) + ABS src0+src1 (lo 0x300), llvm-mc-verified,
+    reusing the F.7b opcodes. `GISEL_V_SUB_F64`/`GISEL_V_ABS_F64` + `_emit_fsub_f64`/`_emit_fabs_f64`.
+    HW-verified `out=abs(a-b)` bit-exact vs `f64_abs(f64_sub(a,b))`. `native_spirv_f64_subabs_e2e.cyr`.
+  - [x] **F.7f.4** *(2026-06-18)* — **`array<vecN-f64>` load/store HW-verified** (closes the F.7e
+    tracked gap): `out=a+b` over `array<dvec2>` bit-exact on Cezanne (x+y), confirming the f64
+    access-chain stride (std430 dvec2=16) + the i*8 per-component offset. No src change (N.10 + F.7a-e
+    wiring). `native_spirv_f64_vec_e2e.cyr`. Found the buffer-sizing trap (vec kernels need ~2× cap_ids
+    buffers or the memsets corrupt — [[reference_compiler_test_buffer_sizing]]).
+  - **F.7f.5 finding** *(2026-06-18)* — **GFX9 `v_sqrt_f64` is an ~f32-precision APPROXIMATION**, not
+    correctly-rounded (HW-proven: every lane ~2^26 ULP off, even sqrt(4)). The single-op attempt was
+    reverted to fail-loud. f64 **FSqrt** AND **FDiv** therefore need the LLVM-style Newton-refinement
+    macro (`v_rsq_f64`/`v_rcp_f64` seed + `v_fma_f64` iterations + `v_div_fixup_f64`) — the hardest f64
+    ops, same class as the N.9 int udiv. See [[project_gfx9_f64_transcendentals_approximate]].
+  - **F.7f libm arc** *(maintainer decision 2026-06-18, after the attn11 scope)* — attn11's f64 GPU
+    path is M18/M19 (deferred, no consumer yet), but its blocking f64 op set is {sqrt, exp, ln, tanh,
+    div} — all transcendentals. Decision: **build the full GFX9 f64 transcendental libm now** rather
+    than stop at the algebraic MVP. Dependency order: **FDiv → FSqrt → exp → ln → tanh → pow** (div's
+    reciprocal pattern seeds sqrt; tanh is built on exp; pow = exp(e·ln(b))). Each op is the LLVM
+    gfx900 expansion, byte-oracle'd then HW-verified value-exact vs a CPU f64 reference.
+  - **F.7f.6 (FDiv macro)** — correctly-rounded f64 div, the LLVM 11-instr reciprocal Newton macro
+    (`v_div_scale_f64` VOP3B + `v_rcp_f64` seed + `v_fma_f64` iterations + `v_div_fmas_f64` + the
+    `v_div_fixup_f64` rounding fixup, with VCC threaded scale→fmas).
+    - [x] **F.7f.6a** *(2026-06-18)* — encoder foundation: `V_RCP_F64`/`V_DIV_SCALE_F64`/
+      `V_DIV_FMAS_F64`/`V_DIV_FIXUP_F64` opcodes + the `gfx9_enc_vop3b_lo` VOP3B form (SDST in
+      lo[14:8]) + the `test_gfx9_enc_f64_div` byte-oracle (llvm-mc gfx900-matched). No lowering yet.
+    - [x] **F.7f.6b** *(2026-06-18)* — **HW-verified on Cezanne**: OpFDiv → the 11-op reciprocal-Newton
+      MIR macro (`_spirv_lower_fdiv`) → 6 new MIR/GISEL ops (RCP/DIV_SCALE/DIV_FMAS/DIV_FIXUP +
+      the NEG-src0 FMA_N0/FMA_N0_ONE) → 3 new emit helpers (div_scale VOP3B→VCC, the two NEG-src0
+      FMAs); regalloc claims the f64 pairs op-agnostically, waitcnt passes them through, VCC threads
+      2nd-DIV_SCALE→DIV_FMAS by emission contiguity. `out=a/b` **BIT-EXACT vs CPU f64_div** on all 8
+      lanes incl. the repeating-fraction cases (1/3, 22/7, 355/113, 1e10/3, 1/1e6) —
+      `native_spirv_f64_div_e2e.cyr`. f32 FDiv fails loud (see the native-f32-div note below).
+      Adversarially reviewed (Workflow, 4 dims / 11 agents; 5 findings refuted): the one confirmed
+      finding — the new f64 div macro primitives weren't in `_mir_instr_unif`'s forced-DIVERGENT
+      guard (latent: masked today by regalloc forcing VGPR for V_* ops, but a foot-gun) — was fixed
+      (guard extended to ops 46–51, pinned by `test_mir_unif_f64_div_ops_forced_divergent`).
+    - [ ] **native-f32-div** *(deferred, no consumer)* — `_spirv_lower_fdiv` rejects f32 (returns
+      UNSUPPORTED_TYPE; pinned by `test_spirv_lower_fdiv_f32_rejects`). The f32 parallel macro
+      (v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32) is straightforward but
+      unneeded: attn11's f32 portable path runs on wgpu (naga lowers f32 div). Add when a native
+      f32-div consumer appears.
+  - **F.7f.7 (FSqrt macro)** — correctly-rounded f64 sqrt, the ~22-instr LLVM gfx900 expansion:
+    a `v_rsq_f64` seed + the Newton-Goldschmidt refinement (mul + 7×fma with NEG-src0/inline-0.5),
+    wrapped by subnormal scaling (`v_cmp_gt_f64` gate → cndmask the 2^256 scale exponent →
+    `v_ldexp_f64` up, then `v_ldexp_f64` down by 2^-128) and a special-case passthrough
+    (`v_cmp_class_f64` mask 0x260 = +0/-0/+inf → cndmask the input through, so sqrt(0)=0 / sqrt(inf)=inf
+    instead of the Newton 0·inf=NaN). +normal computes; negative/NaN take the Newton path → NaN.
+    - [x] **F.7f.7a** *(2026-06-19)* — encoder foundation: `V_RSQ_F64` (VOP1 0x26), `V_LDEXP_F64`
+      (VOP3 0x284, f64,i32), `V_CMP_GT_F64`/`V_CMP_CLASS_F64` (VOPC 0x64/0x12) opcodes — all reuse the
+      existing vop1/vop3a/vopc encoders — + the `test_gfx9_enc_f64_sqrt` byte-oracle (llvm-mc-matched).
+    - [x] **F.7f.7b** *(2026-06-19)* — **HW-verified on Cezanne**: OpExtInst Sqrt (f64) → the
+      Newton-Goldschmidt macro (`_spirv_lower_fsqrt_f64`) → 5 new MIR/GISEL ops (RSQ / CMP_CLASS /
+      CNDMASK / FMA_N0_HALF / MUL_HALF) + 4 emit helpers (the inline-0.5 FMA/MUL, the VCC-writing
+      cmp_class, the f64-pair cndmask = 2× v_cndmask_b32). `out=sqrt(a)` correct on all 8 lanes —
+      bit-exact vs offline `math.sqrt` for the irrational sqrts (2/3/1e-5) + exact squares (4/1e10/
+      0.25), `sqrt(0)=0` via the +0 cmp_class passthrough, `sqrt(-1)=NaN` via the Newton path —
+      `native_spirv_f64_sqrt_e2e.cyr`. The new ops are in the forced-DIVERGENT guard (51→56).
+    - [x] **F.7f.7c (subnormal scaling)** *(2026-06-19)* — **HW-verified on Cezanne, FSqrt now
+      full-range correctly-rounded**. Wraps the 7b core with the LLVM scale-up/rescale: `MIR_OP_F64_CONST`
+      (the F.7f.9 primitive — 2× v_mov_b32 of the 2^-767 threshold) → `CMP_GT` subnormal gate →
+      cndmask 2^256 scale-up → `LDEXP` → [core] → cndmask 2^-128 rescale → `LDEXP`, with `vcc_sub`
+      from CMP_GT driving BOTH cndmasks across the core (only VMOV/LDEXP/FMA/MUL between — none write
+      VCC) before CMP_CLASS overwrites it. 3 new ops (F64_CONST/LDEXP/CMP_GT 57–59, forced-DIVERGENT).
+      `out=sqrt(a)` bit-exact vs `math.sqrt` on all 8 lanes **incl. 3 genuine subnormals** (5e-324 /
+      2.5e-310 / 1.5e-308) — `native_spirv_f64_sqrt_e2e.cyr` (the macro grew 208→272 bytes).
+      Adversarially reviewed (Workflow, 3 dims / 13 agents; 9 refuted): one confirmed **CRITICAL** —
+      `MIR_OP_F64_CONST` passed the 64-bit threshold as a single imm in `a`, but MIR packs operands
+      into 32-bit halves so it truncated to 0.0 → the subnormal gate was DEAD (the lanes passed only
+      because the GFX9 core handles subnormals unscaled, masking it). Fixed: carry the f64 const as
+      two 32-bit halves (a=lo, b=hi); re-verified — the subnormals now exercise ACTIVE scaling and
+      still pass bit-exact. Pinned by a threshold-VALUE assert + [[reference_mir_operand_32bit_packing]].
+  - **F.7f transcendentals — ARITHMETIC-ONLY** *(maintainer decision 2026-06-19)* — mabda does NOT
+    provide f64 exp/ln/tanh/pow as `OpExtInst` intrinsics. **GLSL.std.450 Exp/Log/Exp2/Log2/Pow/Sin
+    are 16/32-bit-only** — `spirv-val` rejects them on f64 (only Sqrt/FAbs/Floor/FMin/FMax + core
+    OpFDiv are f64-valid). A conformant Vulkan consumer can't invoke an f64 exp intrinsic. So consumers
+    (attn11) **hand-roll** exp/ln/tanh/pow as polynomials using mabda's f64 arithmetic; mabda compiles
+    the arithmetic. A fully-built degree-13 exp macro (≤1 ULP) was **backed out** (uninvocable). The
+    deliverable is the CONFORMANT TOOLKIT so consumers can hand-roll. See
+    [[project_f64_transcendentals_arithmetic_only]]. (Former F.7f.10–13 exp/ln/tanh/pow intrinsics: dropped.)
+    - [x] **F.7f.10 (i32↔f64 OpConvert)** *(2026-06-19)* — **HW-verified on Cezanne**: OpConvertFToS
+      (f64→i32) → `CVT_I32_F64` (0x03), OpConvertSToF (i32→f64) → `CVT_F64_I32` (0x04). `out=(double)(int)a`
+      bit-exact vs SPIR-V round-TOWARD-ZERO — confirming GFX9 `v_cvt_i32_f64` TRUNCATES (a design agent
+      wrongly claimed round-to-nearest). `native_spirv_f64_cvt_e2e.cyr`. The conformant salvage of the
+      exp work; the cvt ops + F64_CONST primitive are kept (FSqrt + consumers use them).
+  - [x] **F.7f.8 (f64 compares + OpSelect)** *(2026-06-19)* — **HW-verified on Cezanne**: the public
+    bool-producing path for attn11's argmax/masking. An ordered `OpFOrd*` (LT/GT/LE/GE/EQ/LG, VOPC
+    0x61–0x66) → `v_cmp_*_f64`→VCC→cndmask → a **0/-1 MASK** (a normal VGPR value — robust, not VCC-
+    fragile); `OpSelect` → `v_bfi_b32(mask, x, y)` per 32-bit lane (1 for i32/f32, 2 for an f64 pair),
+    no VCC at select time → order-independent. New: `MIR_OP_F64_CMP` (reuses GISEL_V_CMP/_emit_vopc) +
+    `MIR_OP_SELECT` + the bfi encoder/emit. `out=(a>b)?a:b` (max) bit-exact on all 8 lanes incl. the
+    equal (→false) + signed-zero cases — `native_spirv_f64_select_e2e.cyr` + byte-oracle + compile test.
+    Adversarially reviewed (Workflow, 2 dims / 11 agents): **6 confirmed**, all one root cause —
+    OpSelect didn't ENFORCE its cond is a 0/-1 mask, so a non-OpFOrd* cond (an integer-compare bool →
+    VCC/SCC with no mask reg → an unallocated VGPR; or a bool CONSTANT → an inline code) would silently
+    corrupt the bfi blend. Fixed: the f64-compare mask is now typed `MIR_T_BOOL` (the marker), and
+    `_spirv_lower_select` FAILS LOUD unless cond is an SSA `MIR_T_BOOL` (pinned by
+    `test_spirv_lower_select_rejects_nonmask`). The non-mask cases are the tracked follow-ups.
+    - [ ] **F.7f.8 follow-ups** *(deferred — not attn11-blocking)* — unordered `OpFUnord*` compares
+      (the 0x69.. VOPC set, true on NaN); f32 float compares (`v_cmp_*_f32`); vector OpSelect (per-
+      component); and OpSelect on a non-OpFOrd* condition (integer compares lower to VCC/SCC, not a
+      0/-1 mask — needs a unified bool representation). All fail loud today, none blocking attn11's
+      f64 hand-rolled kernels.
+  - [x] **F.7f.9 (SPIR-V f64 OpConstant)** *(2026-06-19)* — **HW-verified on Cezanne**: f64 literals
+    flow end-to-end. The const table (`spirv_build_const_table`) + `mir_set_const` now keep the full
+    64-bit value (word-count wc>=5 discriminator; the MIR payload is already 64-bit); `_spirv_f64_arg`
+    pre-materializes an f64-const OPERAND into a VGPR pair via `MIR_OP_F64_CONST` (VOP3 has no 64-bit
+    literal), applied at the scalar binop (FADD/FSUB/FMUL), OpExtInst x0/x1/x2 (FMA/min/max/sqrt/abs/
+    floor), and OpFDiv (a/b); the 32-bit const-fold is skipped for f64 (`_spirv_both_const` returns 0).
+    `out=0.5a²+1.5a+2.5` via two FMAs with f64 const coeffs **bit-exact** vs the fused reference —
+    `native_spirv_f64_const_e2e.cyr` + the `_spirv_f64_arg` materialization unit test. The hand-rolled-
+    polynomial enabler. Adversarially reviewed (Workflow, 2 dims / 10 agents): **7 confirmed** — and
+    the vec-binop/store/vec-store gaps were SILENT-WRONG (not fail-loud as first assumed: the emit
+    truncated an f64 literal to its low dword → 0.0 for 0.5/1.0/1.5/…). Fixed: (a) a fail-loud BACKSTOP
+    in `_cmp_resolve` (an f64-const operand reaching the emit unmaterialized now errors, never
+    truncates); (b) `_spirv_f64_arg` applied at the vec binop, OpStore, vec store, and OpFDiv operand
+    sites; (c) type-gated the wc≥5 hi-word pack (only f64; a malformed f64 wc<5 fails loud) + reverted
+    the redundant untyped pack in `spirv_build_const_table` (it serves only i32 access-chain indices).
+    Pinned by `test_spirv_f64_arg` + a store-const compile test.
+  - [x] **F.7f.Ldexp** *(2026-06-19)* — **HW-verified on Cezanne**: GLSL.std.450 Ldexp IS f64-valid
+    (general-float, like Sqrt — spirv-val confirms). Wired `OpExtInst Ldexp` (f64) → `MIR_OP_F64_LDEXP`
+    (the encoder + MIR op + emit already existed from F.7f.7a/c). `out=ldexp(a,3)=a·8` bit-exact on all
+    8 lanes — `native_spirv_f64_ldexp_e2e.cyr` + a compile test. Consumers get 2^k for hand-rolled exp.
+    (f32 Ldexp unwired — no native consumer; wgpu covers f32.)
+  - [x] **F.7-flip** *(2026-06-19)* — **`MABDA_NATIVE_F64 = 1`**. The conformant op set attn11's
+    hand-rolled f64 kernels need is HW-verified on Cezanne: {add,sub,mul,div,sqrt,fma,cmp,select,
+    cvt(i32↔f64 + f32↔f64),const,ldexp}. The `_backend_native_shader_module_create` f64 gate now opens
+    and `gpu_caps_native_shader_f64()` honestly returns 1. (Tests at `core.tcyr` updated to the post-
+    flip state.) Consumers hand-roll exp/ln/tanh/pow from the toolkit (GLSL transcendentals are f32-only).
+- [x] **F.9** *(2026-06-19)* — **attn11 consumer smoke via the PUBLIC API, HW-verified on Cezanne**:
+  `out[i] = (x[i] - mean[i]) / sqrt(var[i] + 1e-5)` (a real layernorm-normalize step — FSub + FAdd +
+  f64 OpConstant + OpExtInst Sqrt + OpFDiv) compiled + dispatched entirely through
+  `gpu_shader_module_create_spirv` → `gpu_compute_dispatch` (not internal gfx9_compile), **bit-exact**
+  on all 8 lanes vs the step-by-step in-process f64 reference — `native_spirv_f64_layernorm_e2e.cyr`.
+  Proves the f64 toolkit works end-to-end through the public surface as a consumer uses it.
+- [x] **F.10** *(3.2.12, 2026-06-19)* — Docs reflow + version cut. Corrected the
+  stale `SHADER_F64`/"passthrough is the only f64 route" framing in `roadmap.md` +
+  the proposal banner (wgpu f64 = ShaderF64 + naga standard path; native f64 = the
+  SPIR-V→GFX9 compiler), documented the **arithmetic-only** transcendental story +
+  the FP64-throughput caveat (Cezanne ~1:16–1:32 — correctness, not speed), reflowed
+  the version annotations (Phase F → 3.2.12, Phase R → 3.2.13–3.2.14). VERSION 3.2.12,
+  CHANGELOG `[3.2.12]`, CLAUDE.md Current State (asserts 3776→**3983**), README. cut.
 
 ---
 
-## Phase R — Render-graph multi-queue scheduling → 3.2.12–3.2.13
+## Phase R — Render-graph multi-queue scheduling → 3.2.13–3.2.14
 
 Proposal: [`v3.2-render-graph-multiqueue.md`](../proposals/v3.2-render-graph-multiqueue.md).
 Absorbs the v3.1.2 carryover (was "Phase Q.7"). The v2.5 render graph is
@@ -918,20 +1128,20 @@ single-submit; this adds per-node queue affinity + cross-queue fence edges
 Backend slots). Multi-queue is opt-in; omitting affinity reproduces v2.5
 ordering exactly. wgpu serialized-equivalent.
 
-- [ ] **R.1** *(3.2.12)* — `rg_node_queue` affinity (Node 72→80,
+- [ ] **R.1** *(3.2.13)* — `rg_node_queue` affinity (Node 72→80,
   append-only) + `rg_execute_mq` entry; default reproduces v2.5.
-- [ ] **R.2** *(3.2.12)* — Cross-queue edge classification (same-queue =
+- [ ] **R.2** *(3.2.13)* — Cross-queue edge classification (same-queue =
   order; cross-queue = fence edge); build-time cycle check covers it.
-- [ ] **R.3** *(3.2.12)* — Per-queue submit batching (group a queue's
+- [ ] **R.3** *(3.2.13)* — Per-queue submit batching (group a queue's
   nodes; `RenderGraph` 40→48 schedule ptr).
-- [ ] **R.4** *(3.2.12)* — `native_render_dispatch_timeline` (GFX-ring
+- [ ] **R.4** *(3.2.13)* — `native_render_dispatch_timeline` (GFX-ring
   timeline variant of the render submit; the missing piece for render
   nodes to join cross-ring overlap).
-- [ ] **R.5** *(3.2.13)* — Per-node IB staging (fixes the shared-cached-IB
+- [ ] **R.5** *(3.2.14)* — Per-node IB staging (fixes the shared-cached-IB
   clobber under genuine overlap; explicit, never a silent serialization).
-- [ ] **R.6** *(3.2.13)* — Scheduler (per-queue toposort + cross-queue
+- [ ] **R.6** *(3.2.14)* — Scheduler (per-queue toposort + cross-queue
   barrier insertion + batch submit); pure-CPU graph-math tests.
-- [ ] **R.7** *(3.2.13)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
+- [ ] **R.7** *(3.2.14)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
   compute→cross-queue-edge→render, distinct rings, no CPU stall; wgpu
   parity vs `render_graph_e2e.cyr`); cut.
 

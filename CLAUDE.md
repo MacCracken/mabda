@@ -10,8 +10,8 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 6.2.21+ (`cyrius.cyml: cyrius = "6.2.21"`)
-- **Version**: 3.2.11 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Language**: Cyrius 6.2.22+ (`cyrius.cyml: cyrius = "6.2.22"`)
+- **Version**: 3.2.12 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -144,12 +144,26 @@ detection.
   `_spirv_check_ext_sets` requires every `OpExtInst` to reference it (else `LOWER_ERR_EXT_SET`) —
   dropping the MVP "only GLSL.std.450 imported" assumption (a foreign ext set, or no GLSL import,
   fails loud rather than mis-decoding its numbers as GLSL math). Validation-only (no new HW
-  capability); existing GLSL kernels still run on Cezanne. Toolchain 6.2.21. **N.7–N.11 complete**;
-  3.2.12+ resumes Phase F (f64) / Phase R (render-graph); multi-dim grid + `id_bound`≤128 raised.
+  capability); existing GLSL kernels still run on Cezanne. Toolchain 6.2.21. **N.7–N.11 complete**.
+  **3.2.12** → general native **f64** (double-precision) compute (**Phase F**), HW-verified bit-exact
+  on Cezanne. The SPIR-V→GFX9 compiler emits `V_*_F64` for the conformant **arithmetic** toolkit —
+  64-bit register pairs (even-aligned `v[2:3]`) threaded as `MIR_T_F64` through MIR→isel→regalloc→
+  encode — covering add/sub/mul/**div** (correctly-rounded reciprocal-Newton macro)/**sqrt**
+  (correctly-rounded, full-range incl. subnormals)/fma, i32↔f64 + f32↔f64 convert, OpConstant,
+  Ldexp, ordered compares, and OpSelect (via `v_bfi_b32` on a 0/-1 mask). `MABDA_NATIVE_F64` flipped
+  to **1**; `gpu_caps_native_shader_f64()` returns 1. **Transcendentals are arithmetic-only**:
+  GLSL.std.450 Exp/Log/Pow are f32-only (spirv-val rejects f64), so consumers (attn11) hand-roll
+  exp/ln/tanh/pow as polynomials over the toolkit (a complete degree-13 exp macro was backed out as
+  uninvocable). The F.9 layernorm smoke runs through the public API (`gpu_shader_module_create_spirv`
+  → `gpu_compute_dispatch`). Every bite adversarially reviewed (Workflow); five reviews caught real
+  silent-wrong bugs (forced-DIVERGENT, 64-bit MIR-operand truncation, vec/store const, OpSelect mask)
+  — each fixed + pinned. Toolchain 6.2.21→6.2.22. **3.2.13+** opens Phase R (render-graph multi-queue);
+  multi-dim grid + `id_bound`≤128 still to be raised.
   The v3.1.2-deferred TRANSFER/buffer-copy + render-graph multi-queue were
   pulled INTO the v3.2.x arc (Phases X / R) per maintainer decision — with the
   N.10/N.11 (vectors + per-ext-set) insert shifting Phase F/R down, the
-  arc spans 3.2.0→3.2.15, nothing deferred to v3.3/v4 (see the punchlist).
+  arc spans 3.2.0→3.2.14 (F shipped as a single 3.2.12 cut, R is 3.2.13–3.2.14),
+  nothing deferred to v3.3/v4 (see the punchlist).
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -175,27 +189,30 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.2.11, 2026-06-18)
+## Current State (post 3.2.12, 2026-06-19)
 
-- **Source**: 49 domain modules under `src/*.cyr`, ~20,550 lines
+- **Source**: 49 domain modules under `src/*.cyr`, ~20,900 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
   to land under cyrius lint/fmt's 128 KiB cap; the SPIR-V→GFX9 compiler
   added 9 no-deps-tier modules before `_shaders.cyr` — `gfx9_encode` +
   `spirv_parse` (3.2.5) then `mir` / `spirv_lower` / `gfx9_isel` /
-  `gfx9_regalloc` / `gfx9_waitcnt` / `gfx9_abi` / `gfx9_compile` (3.2.6)).
-- **Tests**: **3808 CPU-only assertions** across **16 functionality-named
+  `gfx9_regalloc` / `gfx9_waitcnt` / `gfx9_abi` / `gfx9_compile` (3.2.6);
+  3.2.12 Phase F extended `gfx9_encode` / `mir` / `spirv_lower` / `gfx9_isel` /
+  `gfx9_compile` in place with the f64 `V_*_F64` path — no new module).
+- **Tests**: **3983 CPU-only assertions** across **16 functionality-named
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
   mirroring the `src/` domains; `make test` globs them all:
-  - `core` 152 (error/color/capabilities/profiler/resource/debug/obs +
+  - `core` 160 (error/color/capabilities/profiler/resource/debug/obs +
     `int_ratio_to_f32` / `f64_to_f32` f32 conversions — native `f32_from`/`f32_to`
-    builtins since the 6.2.18 fold-in; the former x86 SSE2 shims were retired)
+    builtins since the 6.2.18 fold-in; the former x86 SSE2 shims were retired +
+    F.1–F.3/F.7-flip `shader_f64` caps: native = 1 post-flip)
   - `buffer` 53 · `compute` 26 · `texture` 207 (incl. v3.2 compressed
     format table / block math / caps gating / create dispatch) · `graphics` 61
-  - `render` 122 · `backend` 424 (abstraction + wgpu FFI + dispatch mocks
+  - `render` 122 · `backend` 432 (abstraction + wgpu FFI + dispatch mocks
     + v3.2 block-aware texture write/read + X buffer-copy + TS sampleable
     slots / sampler / bind-group + wgpu-sampler descriptor builders + S SPIRV
     descriptor/validate + kind-routed shader-create slot)
@@ -211,10 +228,11 @@ doesn't change between paths.
     rsrc-parameterized compute composers + N.6r the magic-tagged compiled
     shmod struct / kind gate / compiled-dispatch binding guards / tag-checked
     release / LIFO texture-VA reclaim)
-  - `compiler` 857, **split across 4 files** (2026-06-18) sharing the `compiler_common.cyr`
-    `_spv_build_*` fixtures: `compiler_encode` 217 (N.0 oracle + N.1 parse) · `compiler_lower`
-    358 (N.2 MIR + lowering) · `compiler_backend` 225 (N.3 isel + N.4 regalloc/waitcnt + N.5
-    emit) · `compiler_compile` 57 (ABI + `gfx9_compile` e2e + capacity/hardening rejects).
+  - `compiler` 1016, **split across 4 files** (2026-06-18) sharing the `compiler_common.cyr`
+    `_spv_build_*` fixtures: `compiler_encode` 259 (N.0 oracle + N.1 parse + F.7 f64 encoders)
+    · `compiler_lower` 394 (N.2 MIR + lowering + F.7 f64 lower/select) · `compiler_backend` 255
+    (N.3 isel + N.4 regalloc/waitcnt + N.5 emit + F.7 f64 pairs/forced-divergent) ·
+    `compiler_compile` 108 (ABI + `gfx9_compile` e2e + capacity/hardening rejects + F.7 f64 e2e).
     (Phase N SPIR-V→GFX9: N.0 `gfx9_encode` oracle + N.1
     `spirv_parse` rejection gate; N.2 MIR + uniformity sweep + SPIR-V lowering
     (ALU/access-chain/GID-expansion); N.3 isel SALU/VALU; N.4 regalloc reuse +
@@ -229,7 +247,10 @@ doesn't change between paths.
     floored-modulo structure); **3.2.10** adds N.10 vectors (`MIR_VK_VECTOR` construct/extract,
     component-wise binop + fold, vec load/store + std430 stride + ArrayStride gate, constant
     composite, the mir_emit vector-operand guard); **3.2.11** adds N.11 per-ext-set tracking
-    (the GLSL.std.450 import resolver + the OpExtInst set-validation gate). Every stage's
+    (the GLSL.std.450 import resolver + the OpExtInst set-validation gate); **3.2.12** adds
+    Phase F f64 (the `V_*_F64` encoder oracles, MIR_T_F64 64-bit-pair regalloc, the FDiv
+    reciprocal-Newton + FSqrt + i32↔f64 cvt + f64-const-materialization lowering, the
+    forced-DIVERGENT guard, and the OpSelect-mask-enforcement reject). Every stage's
     adversarial-review regressions live here too)
   Splitting also kept every file under the 128 KiB lint/fmt cap (the old
   `mabda_v3.tcyr` had grown to 148 KiB, past the cap).
@@ -245,7 +266,11 @@ doesn't change between paths.
   `native_texture_sample_e2e` (TS.5 RGBA8), `native_sdma_tiled_roundtrip` +
   `native_tiled_texture_roundtrip` (TS.6/7 tiling), `native_compressed_sample_e2e`
   (TS.7 BC1/3/4/5/7 vs CPU decode), `native_bilinear_sample_e2e` (TS.8 POINT-vs-
-  BILINEAR), all HW-verified on Cezanne; plus
+  BILINEAR), all HW-verified on Cezanne; the v3.2.12 Phase F **f64** set
+  `native_f64_fma_e2e` (F.4–F.6 hand-authored), `native_spirv_f64_{fma,arith,cvt,subabs,
+  vec,div,sqrt,i32_cvt,const,ldexp,select}_e2e` (the compiled toolkit), and
+  `native_spirv_f64_layernorm_e2e` (F.9 public-API smoke) — all bit-exact on Cezanne —
+  plus the wgpu `f64_compute_e2e` (F.8b ShaderF64); plus
   `native_kms_summary`, `native_kms_modeset_smoke`, `native_present_e2e`
   for Phase D.
 - **Benchmarks**: `tests/bcyr/mabda.bcyr` — 9 CPU benches. GPU
@@ -344,7 +369,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 3808 CPU assertions across 16 domain files
+make test                                            # 3983 CPU assertions across 16 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -434,7 +459,7 @@ mabda/
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
 │   ├── tcyr/                        — 16 functionality-named domain suites
-│   │   │                              (3808 asserts total; `make test` globs
+│   │   │                              (3983 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -559,7 +584,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 3808 CPU assertions across 16 domain test
+- **Tests are the way** — 3983 CPU assertions across 16 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -609,7 +634,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 3808+ assertions pass across all 16 domain test files,
+2. Test sweep: 3983+ assertions pass across all 16 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -682,7 +707,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 16 `tests/tcyr/*.tcyr` domain suites); 3808+
+   (all 16 `tests/tcyr/*.tcyr` domain suites); 3983+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
@@ -701,7 +726,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.2.21"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.22"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts

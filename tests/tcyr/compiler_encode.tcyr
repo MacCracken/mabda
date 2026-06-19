@@ -464,8 +464,124 @@ fn test_spirv_decoration_table() {
     return 0;
 }
 
+# v3.2 F.3 — the f64 shader gate keys on `OpCapability Float64` (cap 10). spirv_uses_f64
+# detects it (and is bounded / zero-wordcount-safe on untrusted bytes).
+fn test_spirv_uses_f64() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203);   # magic
+    store32(&buf + 12, 8);           # id bound
+    # OpCapability Shader (1) at word 5, OpCapability Float64 (10) at word 7 — byte_len 36
+    store32(&buf + 20, (2 << 16) | 17); store32(&buf + 24, 1);
+    store32(&buf + 28, (2 << 16) | 17); store32(&buf + 32, 10);
+    assert_eq(spirv_uses_f64(&buf, 36), 1, "OpCapability Float64 detected");
+    store32(&buf + 32, 1);   # second capability -> Shader, no Float64
+    assert_eq(spirv_uses_f64(&buf, 36), 0, "no Float64 capability -> 0");
+    # a header-only / too-small module has no capabilities -> 0 (and does not loop)
+    assert_eq(spirv_uses_f64(&buf, 20), 0, "header-only module -> 0");
+    # review F.3: a truncated OpCapability at the stream end (header fits, operand word does not)
+    # must return 0 WITHOUT an out-of-bounds operand read (this runs on untrusted bytes).
+    var b2[64];
+    store32(&b2 + 0, 0x07230203); store32(&b2 + 12, 8);
+    store32(&b2 + 20, (2 << 16) | 17);   # OpCapability (wc 2) at word 5; stream ends at word 6
+    assert_eq(spirv_uses_f64(&b2, 24), 0, "truncated OpCapability at end -> 0 (no OOB read)");
+    # a non-multiple-of-4 byte_len is bounded (no read past total*4 = byte_len floor)
+    assert_eq(spirv_uses_f64(&b2, 23), 0, "odd byte_len -> 0 (bounded)");
+    return 0;
+}
+
+# v3.2 F.4 — the f64 GFX9 ISA encode oracle (llvm-mc gfx900-verified bytes the hand-authored
+# native_gfx9_shader_fma_f64 emits through the existing encoders): v_fma_f64 + the dwordx2 FLAT.
+fn test_gfx9_enc_f64() {
+    # v_fma_f64 v[8:9], v[2:3], v[4:5], v[6:7]  ->  D1CC0008 041A0902
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, 8), 0xD1CC0008, "v_fma_f64 v[8:9] lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(4), gfx9_vgpr(6)), 0x041A0902,
+    "v_fma_f64 v[2:3],v[4:5],v[6:7] hi");
+    # global_load_dwordx2 / global_store_dwordx2 (saddr form) lo dwords
+    assert_eq(gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_LOAD_DWORDX2, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0),
+    0xDC548000, "global_load_dwordx2 lo");
+    assert_eq(gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORDX2, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0),
+    0xDC748000, "global_store_dwordx2 lo");
+    return 0;
+}
+
+# v3.2 F.7b — f64 ALU encoders byte-oracle. Each expected dword is the llvm-mc gfx900 encoding
+# (e.g. `v_add_f64 v[0:1], v[2:3], v[4:5]` -> D2800000 00020902). f64 operands name the EVEN
+# reg of the pair: gfx9_vgpr(2) = v[2:3], gfx9_vgpr(4) = v[4:5].
+fn test_gfx9_enc_f64_alu() {
+    # VOP3 2-src arith: lo = D0000000|(op<<16)|vdst ; hi = src1<<9 | src0 (no src2)
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(4), 0), 0x00020902, "v[2:3],v[4:5] 2-src hi");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_ADD_F64, 0), 0xD2800000, "v_add_f64 v[0:1] lo");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MUL_F64, 0), 0xD2810000, "v_mul_f64 v[0:1] lo");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MIN_F64, 0), 0xD2820000, "v_min_f64 v[0:1] lo");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MAX_F64, 0), 0xD2830000, "v_max_f64 v[0:1] lo");
+    # VOP1 conversions: 7E000000 | (vdst<<17) | (op<<9) | src0 ; src0 = v[2:3]/v2 = gfx9_vgpr(2)
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F64_F32, 0, gfx9_vgpr(2)), 0x7E002102, "v_cvt_f64_f32 v[0:1],v2");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F32_F64, 0, gfx9_vgpr(2)), 0x7E001F02, "v_cvt_f32_f64 v0,v[2:3]");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F64_I32, 0, gfx9_vgpr(2)), 0x7E000902, "v_cvt_f64_i32 v[0:1],v2");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F64, 0, gfx9_vgpr(2)), 0x7E000702, "v_cvt_i32_f64 v0,v[2:3]");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_F64_U32, 0, gfx9_vgpr(2)), 0x7E002D02, "v_cvt_f64_u32 v[0:1],v2");
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_CVT_U32_F64, 0, gfx9_vgpr(2)), 0x7E002B02, "v_cvt_u32_f64 v0,v[2:3]");
+    # v3.2 F.7f.3 — source-modifier bits (llvm-mc-verified). FSub = v_add_f64 with NEG src1 (hi bit
+    # 30): `v_add_f64 v[0:1], v[2:3], -v[4:5]` -> D2800000 40020902. FAbs = v_max_f64 with ABS src0+
+    # src1 (lo bits 8,9), operands x,x: `v_max_f64 v[0:1], |v[2:3]|, |v[2:3]|` -> D2830300 00020502.
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(4), 0) | 0x40000000, 0x40020902, "v_add_f64 -src1 (fsub) hi");
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_MAX_F64, 0) | 0x300, 0xD2830300, "v_max_f64 |abs| (fabs) lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(2), 0), 0x00020502, "v_max_f64 x,x (fabs) hi");
+    return 0;
+}
+
+# v3.2 F.7f.6 — f64 division macro encoders byte-oracle. The dwords are the llvm-mc gfx900
+# encoding of the LLVM fdiv expansion: v_div_scale_f64 is VOP3B (a second SGPR-pair output
+# s[4:5] in lo[14:8]); v_rcp_f64 is the VOP1 reciprocal seed; v_div_fmas/_fixup are plain VOP3.
+fn test_gfx9_enc_f64_div() {
+    # v_rcp_f64_e32 v[6:7], v[4:5]  ->  7E0C4B04 (VOP1 seed)
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_RCP_F64, 6, gfx9_vgpr(4)), 0x7E0C4B04, "v_rcp_f64 v[6:7],v[4:5]");
+    # v_div_scale_f64 v[4:5], s[4:5], v[2:3], v[2:3], v[0:1]  ->  D1E10404 04020502 (VOP3B, sdst=4)
+    assert_eq(gfx9_enc_vop3b_lo(GFX9_VOP3_V_DIV_SCALE_F64, 4, 4), 0xD1E10404, "v_div_scale_f64 lo (vop3b sdst)");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(2), gfx9_vgpr(0)), 0x04020502, "v_div_scale_f64 hi");
+    # v_div_fmas_f64 v[4:5], v[4:5], v[6:7], v[10:11]  ->  D1E30004 042A0D04 (reads VCC)
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_DIV_FMAS_F64, 4), 0xD1E30004, "v_div_fmas_f64 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(4), gfx9_vgpr(6), gfx9_vgpr(10)), 0x042A0D04, "v_div_fmas_f64 hi");
+    # v_div_fixup_f64 v[0:1], v[4:5], v[2:3], v[0:1]  ->  D1DF0000 04020504 (rounding fixup)
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_DIV_FIXUP_F64, 0), 0xD1DF0000, "v_div_fixup_f64 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(4), gfx9_vgpr(2), gfx9_vgpr(0)), 0x04020504, "v_div_fixup_f64 hi");
+    return 0;
+}
+
+# v3.2 F.7f.7 — f64 sqrt macro primitive encoders byte-oracle. The dwords are the llvm-mc gfx900
+# encoding of the LLVM sqrt expansion: v_rsq_f64 seed (VOP1), v_ldexp_f64 scale (VOP3 2-src f64,i32),
+# and the two VCC-writing VOPC compares (v_cmp_gt_f64 subnormal gate, v_cmp_class_f64 special-case).
+fn test_gfx9_enc_f64_sqrt() {
+    # v_rsq_f64_e32 v[2:3], v[0:1]  ->  7E044D00 (VOP1 0x26 seed)
+    assert_eq(gfx9_enc_vop1(GFX9_VOP1_V_RSQ_F64, 2, gfx9_vgpr(0)), 0x7E044D00, "v_rsq_f64 v[2:3],v[0:1]");
+    # v_ldexp_f64 v[0:1], v[0:1], v2  ->  D2840000 00020500 (VOP3 f64,i32)
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_LDEXP_F64, 0), 0xD2840000, "v_ldexp_f64 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(0), gfx9_vgpr(2), 0), 0x00020500, "v_ldexp_f64 hi (f64 src0, i32 src1)");
+    # v_cmp_gt_f64_e32 vcc, s[4:5], v[0:1]  ->  7CC80004 (VOPC 0x64; src0=s4, vsrc1=v0)
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_GT_F64, 4, 0), 0x7CC80004, "v_cmp_gt_f64 vcc,s[4:5],v[0:1]");
+    # v_cmp_class_f64_e32 vcc, v[0:1], v5  ->  7C240B00 (VOPC 0x12; src0=v[0:1], vsrc1=v5)
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_CLASS_F64, gfx9_vgpr(0), 5), 0x7C240B00, "v_cmp_class_f64 vcc,v[0:1],v5");
+    return 0;
+}
+
+# v3.2 F.7f.8 — the ordered f64 VOPC compares (→ VCC) + v_bfi_b32 (the OpSelect blend) byte-oracle,
+# llvm-mc gfx900-matched. Compares reuse the VOPC encoder; bfi is VOP3 3-src.
+fn test_gfx9_enc_f64_cmp() {
+    # v_cmp_lt_f64_e32 vcc, v[0:1], v[2:3]  ->  7CC20500 (VOPC 0x61; src0=v[0:1], vsrc1=v2)
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_LT_F64, gfx9_vgpr(0), 2), 0x7CC20500, "v_cmp_lt_f64");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_EQ_F64, gfx9_vgpr(0), 2), 0x7CC40500, "v_cmp_eq_f64 (0x62)");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_LE_F64, gfx9_vgpr(0), 2), 0x7CC60500, "v_cmp_le_f64 (0x63)");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_LG_F64, gfx9_vgpr(0), 2), 0x7CCA0500, "v_cmp_lg_f64 (0x65)");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_GE_F64, gfx9_vgpr(0), 2), 0x7CCC0500, "v_cmp_ge_f64 (0x66)");
+    # v_bfi_b32 v0, v1, v2, v3  ->  D1CA0000 040E0501 (VOP3 0x1CA)
+    assert_eq(gfx9_enc_vop3a_lo(GFX9_VOP3_V_BFI_B32, 0), 0xD1CA0000, "v_bfi_b32 lo");
+    assert_eq(gfx9_enc_vop3a_hi(gfx9_vgpr(1), gfx9_vgpr(2), gfx9_vgpr(3)), 0x040E0501, "v_bfi_b32 hi");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_operand_helpers();
+    test_gfx9_enc_f64_cmp();
     test_gfx9_enc_vop1();
     test_gfx9_enc_vop2();
     test_gfx9_enc_vop3a();
@@ -481,6 +597,11 @@ fn main(): i64 {
     test_gfx9_rebuild_store_deadbeef_byte_identical();
     test_spirv_header_accessors();
     test_spirv_op_decode();
+    test_spirv_uses_f64();
+    test_gfx9_enc_f64();
+    test_gfx9_enc_f64_alu();
+    test_gfx9_enc_f64_div();
+    test_gfx9_enc_f64_sqrt();
     test_spirv_validate_stream_valid();
     test_spirv_validate_stream_rejects();
     test_spirv_count_instructions();

@@ -353,8 +353,611 @@ fn test_gfx9_abi_assign_2d() {
     return 0;
 }
 
+# v3.2 F.7e — the COMPILER produces correct f64 ISA end-to-end: the f64 FMA kernel (4 storage
+# bindings, OpExtInst Fma on double, DWORDX2 loads/store) compiles, advertises 4 bindings + 8
+# user-SGPRs (4 VA pairs), and the ISA contains a v_fma_f64 (VOP3 op 0x1CC). The HW value-exact
+# proof is programs/native_spirv_f64_fma_e2e.cyr; this is the CPU-side correctness gate.
+fn _isa_has_vfma_f64(isa, len): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        # VOP3: bits 31:26 = 0b110100 (0x34); op = bits 25:16. v_fma_f64 = 0x1CC.
+        if ((d >> 26) == 0x34) { if (((d >> 16) & 0x3FF) == 0x1CC) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
+# 1 if the ISA contains a VOP3 dword with opcode `op` (bits 25:16; VOP3 prefix 0x34 in 31:26).
+fn _isa_has_vop3(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 26) == 0x34) { if (((d >> 16) & 0x3FF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
+# 1 if the ISA contains a VOP1 dword with opcode `op` (bits 16:9; VOP1 prefix 0x3F in 31:25).
+fn _isa_has_vop1(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 25) == 0x3F) { if (((d >> 9) & 0xFF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
+# VOPC e32: prefix 0x7C (bits 31-25 = 0x3E); opcode in bits 17-24. (F.7f.8.)
+fn _isa_has_vopc(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 25) == 0x3E) { if (((d >> 17) & 0xFF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
+fn test_gfx9_compile_f64_fma() {
+    var buf[800];
+    var n = _spv_build_f64_fma(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);   # >= id-bound 30; tables sized 32 records
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 FMA compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 4, "4 storage bindings (a,b,c,out)");
+    assert_eq(load64(&desc + DESC_USER_SGPR), 8, "user_sgpr = 8 (4 binding VA pairs)");
+    assert_eq(_isa_has_vfma_f64(&isa, load64(&desc + DESC_ISA_LEN)), 1, "ISA contains v_fma_f64 (0x1CC)");
+    var d1 = load64(&desc + DESC_RSRC1);
+    assert_eq((d1 >> 12) & 0xFF, 0xC0, "rsrc1 FLOAT_MODE field = 0xC0");
+    return 0;
+}
+
+# v3.2 F.7f — the f64 arith breadth kernel (out=max(min(a*b+c,b),a)) compiles end-to-end and the
+# ISA contains all four already-wired f64 VOP3 ops: V_MUL_F64 0x281, V_ADD_F64 0x280, V_MIN_F64
+# 0x282, V_MAX_F64 0x283. (HW value-exact: programs/native_spirv_f64_arith_e2e.cyr.)
+fn test_gfx9_compile_f64_arith() {
+    var buf[900];
+    var n = _spv_build_f64_arith(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 33, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 36);   # >= id-bound 33
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 arith compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 4, "4 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x281), 1, "ISA has v_mul_f64 (0x281)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x280), 1, "ISA has v_add_f64 (0x280)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x282), 1, "ISA has v_min_f64 (0x282)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x283), 1, "ISA has v_max_f64 (0x283)");
+    return 0;
+}
+
+# v3.2 F.7f.2 — the f32<->f64 CVT round-trip (out=double(float(a))) compiles end-to-end and the
+# ISA contains BOTH VOP1 conversions: V_CVT_F32_F64 0x0F (narrow) + V_CVT_F64_F32 0x10 (widen).
+# (HW value-exact: programs/native_spirv_f64_cvt_e2e.cyr.)
+fn test_gfx9_compile_f64_cvt() {
+    var buf[640];
+    var n = _spv_build_f64_cvt(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[1600];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 40, 16, 25, 40);
+    var outbi[320];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[640];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 28);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 CVT compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x0F), 1, "ISA has v_cvt_f32_f64 (0x0F, narrow)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x10), 1, "ISA has v_cvt_f64_f32 (0x10, widen)");
+    return 0;
+}
+
+# v3.2 F.7f.3 — the f64 sub+abs kernel (out=abs(a-b)) compiles end-to-end. FSub = v_add_f64 with
+# NEG src1 (hi bit 30 = 0x40000000); FAbs = v_max_f64 with ABS src0+src1 (lo bits 8,9 = 0x300).
+# The ISA must contain a v_add_f64 (0x280) with the neg bit + a v_max_f64 (0x283) with the abs bits.
+fn test_gfx9_compile_f64_subabs() {
+    var buf[800];
+    var n = _spv_build_f64_subabs(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[1792];
+    var instrs[1152];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 44, 16, 28, 44);
+    var outbi[352];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[704];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 sub+abs compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    # FSub: a v_add_f64 (0x280) VOP3 dword with the NEG-src1 bit (hi bit 30) — scan the HI dwords.
+    var p = 0;
+    var fsub = 0;
+    var fabs = 0;
+    while (p < len) {
+        var d = load32(&isa + p);
+        if ((d >> 26) == 0x34) {
+            var opc = (d >> 16) & 0x3FF;
+            if (opc == 0x280) {
+                var hi = load32(&isa + p + 4);
+                if ((hi & 0x40000000) != 0) { fsub = 1; }
+            }
+            if (opc == 0x283) {
+                if ((d & 0x300) == 0x300) { fabs = 1; }   # ABS src0+src1 in the lo dword
+            }
+        }
+        p = p + 4;
+    }
+    assert_eq(fsub, 1, "ISA has v_add_f64 with NEG src1 (fsub)");
+    assert_eq(fabs, 1, "ISA has v_max_f64 with ABS src0+src1 (fabs)");
+    return 0;
+}
+
+# v3.2 F.7f.4 — array<dvec2> add compiles end-to-end (verifies the F.7e f64 access-chain stride +
+# the vec load/store per-component offset). The dvec2 add scalarizes to TWO v_add_f64 (0x280); the
+# loads/stores are DWORDX2. Confirms the compiler handles f64 vectors via existing wiring.
+fn test_gfx9_compile_f64_vec() {
+    var buf[800];
+    var n = _spv_build_f64_vec(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    # The dvec2 add scalarizes to ~2x the MIR values/instrs of a scalar kernel, so size the
+    # id-indexed buffers for cap_ids=64: vals 64*40, alloc 64*16, instrs 64*24 (undersizing them
+    # makes mir_mod_init / regalloc memset past the buffer and corrupt the stack -> garbage error).
+    var vals[2560];
+    var instrs[1536];
+    var ptrs[384];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 27, 64);
+    var outbi[512];
+    var isel[2048];
+    var isel2[2048];
+    var alloc[1024];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "array<dvec2> add compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings");
+    assert_eq(_isa_has_vop3(&isa, load64(&desc + DESC_ISA_LEN), 0x280), 1, "ISA has v_add_f64 (per component)");
+    return 0;
+}
+
+# v3.2 F.7f.6b — OpFDiv lowers to the reciprocal-Newton macro end-to-end. Sized like the vec test
+# (the macro adds ~10 synth ids: cap_ids=64, vals 64*40, etc. — undersizing corrupts the stack).
+fn test_gfx9_compile_f64_div() {
+    var buf[800];
+    var n = _spv_build_f64_div(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2560];
+    var instrs[1536];
+    var ptrs[384];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 27, 64);
+    var outbi[512];
+    var isel[2048];
+    var isel2[2048];
+    var alloc[1024];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 div compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings (a,b,out)");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x1E1), 1, "ISA has v_div_scale_f64 (0x1E1)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1E3), 1, "ISA has v_div_fmas_f64 (0x1E3)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1DF), 1, "ISA has v_div_fixup_f64 (0x1DF)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CC), 1, "ISA has v_fma_f64 Newton steps (0x1CC)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x25), 1, "ISA has v_rcp_f64 seed (0x25)");
+    return 0;
+}
+
+# v3.2 F.7f.7b — OpExtInst Sqrt (f64) lowers to the Newton-Goldschmidt macro end-to-end. Same
+# generous sizing (the macro adds ~12 synth ids). Checks the ISA carries the macro's signature ops.
+fn test_gfx9_compile_f64_sqrt() {
+    var buf[800];
+    var n = _spv_build_f64_sqrt(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2560];
+    var instrs[1536];
+    var ptrs[384];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 24, 64);
+    var outbi[512];
+    var isel[2048];
+    var isel2[2048];
+    var alloc[1024];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 sqrt compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings (a,out)");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x26), 1, "ISA has v_rsq_f64 seed (0x26)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CC), 1, "ISA has v_fma_f64 Newton steps (0x1CC)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x281), 1, "ISA has v_mul_f64 (0x281; h=x*rsq / g=0.5*rsq)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x284), 1, "ISA has v_ldexp_f64 (0x284; subnormal scale, F.7f.7c)");
+    return 0;
+}
+
+# v3.2 F.7f.8 — f64 compare + OpSelect (out = (a>b)?a:b) compiles: an ordered f64 VOPC compare
+# (v_cmp_gt_f64) → mask, then a v_bfi_b32 blend (the OpSelect). The argmax/masking primitive.
+fn test_gfx9_compile_f64_select() {
+    var buf[800];
+    var n = _spv_build_f64_select(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 32, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 compare+select compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 3, "3 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vopc(&isa, len, 0x64), 1, "ISA has v_cmp_gt_f64 (0x64)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CA), 1, "ISA has v_bfi_b32 (0x1CA; the OpSelect blend)");
+    return 0;
+}
+
+# v3.2 F.7f.10 — OpExtInst Ldexp (f64) compiles to v_ldexp_f64 (reuses MIR_OP_F64_LDEXP). The 2^k
+# primitive consumers use to reconstruct a hand-rolled exp.
+fn test_gfx9_compile_f64_ldexp() {
+    var buf[700];
+    var n = _spv_build_f64_ldexp(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 28, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 ldexp compiles end-to-end");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x284), 1, "ISA has v_ldexp_f64 (0x284)");
+    return 0;
+}
+
+# v3.2 F.7f.9 review — store of an f64 OpConstant (out[i] = 2.5) compiles: the store VALUE is
+# materialized via F64_CONST (a DWORDX2 store of a VGPR pair). Before the fix this silently truncated
+# to the low dword (0.0); now the emit backstop would fail-loud if unmaterialized, so a clean compile
+# proves the store-const path materializes. Catches a regression of that gap.
+fn test_gfx9_compile_f64_store_const() {
+    var buf[600];
+    var n = _spv_build_f64_store_const(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 22, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64-const store compiles (materialized, not truncated)");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 1, "1 storage binding");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x01), 1, "ISA has v_mov_b32 (F64_CONST value materialize)");
+    return 0;
+}
+
+# v3.2 F.7f.9 — f64 OpConstant operands (the Horner-polynomial path consumers use for transcendentals)
+# compile end-to-end: 3 f64 consts (0.5/1.5/2.5) materialize via F64_CONST (v_mov_b32 pairs) + 2 FMAs.
+fn test_gfx9_compile_f64_const() {
+    var buf[800];
+    var n = _spv_build_f64_const(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64-const poly compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CC), 1, "ISA has v_fma_f64 (0x1CC)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x01), 1, "ISA has v_mov_b32 (0x01; F64_CONST coeff materialize)");
+    return 0;
+}
+
+# v3.2 F.7f.10 — i32<->f64 conversions (OpConvertFToS/SToF) compile end-to-end. The conformant
+# part of the (dropped) transcendental work — consumers hand-roll exp/ln using these + the arith.
+fn test_gfx9_compile_f64_i32_cvt() {
+    var buf[700];
+    var n = _spv_build_f64_i32_cvt(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 28, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64<->i32 cvt compiles end-to-end");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x03), 1, "ISA has v_cvt_i32_f64 (0x03, OpConvertFToS, truncating)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x04), 1, "ISA has v_cvt_f64_i32 (0x04, OpConvertSToF)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_abi_rsrc();
+    test_gfx9_compile_f64_fma();
+    test_gfx9_compile_f64_arith();
+    test_gfx9_compile_f64_cvt();
+    test_gfx9_compile_f64_subabs();
+    test_gfx9_compile_f64_vec();
+    test_gfx9_compile_f64_div();
+    test_gfx9_compile_f64_sqrt();
+    test_gfx9_compile_f64_const();
+    test_gfx9_compile_f64_store_const();
+    test_gfx9_compile_f64_ldexp();
+    test_gfx9_compile_f64_select();
+    test_gfx9_compile_f64_i32_cvt();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_gfx9_compile_uniform_if();

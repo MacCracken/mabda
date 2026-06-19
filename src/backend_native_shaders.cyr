@@ -582,6 +582,104 @@ fn native_gfx9_shader_textured_sample_fs(buf, pos): i64 {
 var GFX9_FS_TEXTURED_SAMPLE_SIZE = 124;
 
 # ================================================================
+# v3.2 F.4 — first native f64 (double-precision) compute shader
+# ================================================================
+# A hand-authored GFX9 compute kernel computing, per lane i:
+#   out[i] = fma(a[i], b[i], c[i])   (IEEE-754 double, single rounding)
+# over four StorageBuffers of f64 (8-byte stride). This is the first
+# native double-precision GPU compute in mabda — the V_FMA_F64 path
+# (GFX9_VOP3_V_FMA_F64 = 0x1CC), proven byte-identical to llvm-mc and
+# dispatched bit-exact vs a CPU fused reference on Cezanne (Phase F.6).
+#
+# Canonical compute ABI (the F.5 PM4 composer sets this up — binding k →
+# USER_DATA s[2k:2k+1]):
+#   s[0:1] = a base VA      s[2:3] = b base VA
+#   s[4:5] = c base VA      s[6:7] = out base VA
+#   v0     = lid.x (the CP loads the per-lane id into v0; one workgroup of
+#            LocalSize_x lanes, so lid.x ∈ 0..ntx-1 indexes the element).
+#   USER_SGPR = 8 (s0..s7) — RSRC2 = GFX9_COMPUTE_PGM_RSRC2_FMA_F64 = 0x10.
+#
+# f64 occupies an even-aligned VGPR pair; the kernel uses v[2:3]/v[4:5]/
+# v[6:7] for a/b/c and v[8:9] for the result, plus v0 (lid) and v1 (the
+# per-lane byte offset). High-water VGPR = v9 ⇒ 10 VGPRs ⇒ VGPRS field =
+# ceil(10/4) - 1 = 2, so RSRC1 = GFX9_COMPUTE_PGM_RSRC1_MIN | 2 =
+# GFX9_COMPUTE_PGM_RSRC1_FMA_F64 = 0x2C0042.
+#
+# The FLAT ops use the SADDR form: the 64-bit base lives in the binding's
+# USER_DATA SGPR pair (saddr field = that SGPR index), and the per-lane
+# 32-bit byte offset (lid.x * 8) rides vaddr (v1). This needs no in-shader
+# 64-bit address add — the SADDR form does base+offset in HW.
+#
+# Source (assembled + round-tripped via `llvm-mc -mcpu=gfx90c -show-encoding`,
+# per feedback_verify_gfx9_shader_bytes_with_llvm_mc):
+#   v_lshlrev_b32_e32   v1, 3, v0                  ; v1 = lid.x * 8 (f64 stride)
+#   global_load_dwordx2 v[2:3], v1, s[0:1]         ; a[i]
+#   global_load_dwordx2 v[4:5], v1, s[2:3]         ; b[i]
+#   global_load_dwordx2 v[6:7], v1, s[4:5]         ; c[i]
+#   s_waitcnt vmcnt(0)                             ; all three loads done
+#   v_fma_f64 v[8:9], v[2:3], v[4:5], v[6:7]       ; out = a*b + c (one rounding)
+#   global_store_dwordx2 v1, v[8:9], s[6:7]        ; out[i]
+#   s_waitcnt vmcnt(0) lgkmcnt(0)                  ; store visible
+#   s_endpgm
+#
+# Layout (bytes; total = 120 = 56 B code + 64 B prefetch pad):
+#   +0:  0x24020083  v_lshlrev_b32_e32 v1, 3, v0
+#   +4:  0xDC548000  global_load_dwordx2 (lo)
+#   +8:  0x02000001  v[2:3] <- v1, s[0:1]  (hi: vdst=2, saddr=0, vaddr=1)
+#   +12: 0xDC548000  global_load_dwordx2 (lo)
+#   +16: 0x04020001  v[4:5] <- v1, s[2:3]  (hi: vdst=4, saddr=2, vaddr=1)
+#   +20: 0xDC548000  global_load_dwordx2 (lo)
+#   +24: 0x06040001  v[6:7] <- v1, s[4:5]  (hi: vdst=6, saddr=4, vaddr=1)
+#   +28: 0xBF8C0F70  s_waitcnt vmcnt(0)
+#   +32: 0xD1CC0008  v_fma_f64 v[8:9] (lo) — GFX9_VOP3_V_FMA_F64
+#   +36: 0x041A0902  v_fma_f64 (hi: src0=v2, src1=v4, src2=v6)
+#   +40: 0xDC748000  global_store_dwordx2 (lo)
+#   +44: 0x00060801  v1, v[8:9], s[6:7]  (hi: data=8, saddr=6, vaddr=1)
+#   +48: 0xBF8C0070  s_waitcnt vmcnt(0) lgkmcnt(0)
+#   +52: 0xBF810000  s_endpgm
+#   +56..+119: 16 × 0xBF800000  s_nop 0  (AMDGPU prefetch padding)
+#
+# Returns new pos (pos + 120). @internal
+fn native_gfx9_shader_fma_f64(buf, pos): i64 {
+    var ld2 = GFX9_FLAT_GLOBAL_LOAD_DWORDX2;
+    var st2 = GFX9_FLAT_GLOBAL_STORE_DWORDX2;
+    var glob = GFX9_FLAT_SEG_GLOBAL;
+    var p = pos;
+    # v1 = lid.x * 8 (the f64-stride per-lane byte offset).
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_LSHLREV_B32, 1, gfx9_inline_int(3), 0));
+    # Three f64 loads (SADDR form): base in s[2k:2k+1], 32-bit offset in v1.
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(ld2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(2, gfx9_sgpr(0), 0, 1));   # a -> v[2:3]
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(ld2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(4, gfx9_sgpr(2), 0, 1));   # b -> v[4:5]
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(ld2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(6, gfx9_sgpr(4), 0, 1));   # c -> v[6:7]
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    # out = a*b + c in IEEE-754 double, single rounding (the fused multiply-add).
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, 8));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(4), gfx9_vgpr(6)));
+    # Store the f64 result (SADDR form): out base in s[6:7], offset in v1.
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(st2, glob, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, gfx9_sgpr(6), 8, 1));   # v[8:9] -> out[i]
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0070));   # vmcnt(0) lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));
+    return gfx9_emit_prefetch_pad(buf, p);
+}
+
+# Total byte count produced by native_gfx9_shader_fma_f64 (56 B code + 64 B pad).
+var GFX9_FMA_F64_SIZE = 120;
+
+# RSRC1 for the f64 FMA kernel: MIN | VGPRS=2 (10 VGPRs, v0..v9). See the
+# builder's header for the ceil(10/4)-1 = 2 derivation.
+var GFX9_COMPUTE_PGM_RSRC1_FMA_F64 = 0x2C0042;
+
+# RSRC2 for the f64 FMA kernel: USER_SGPR = 8 (s0..s7, the four binding VA
+# pairs). USER_SGPR occupies bits 1-5, value 8 → 8 << 1 = 0x10. No TGID
+# (a single workgroup of LocalSize_x lanes — lid.x in v0 is sufficient),
+# no scratch, no LDS.
+var GFX9_COMPUTE_PGM_RSRC2_FMA_F64 = 0x10;
+
+# ================================================================
 # v3 Step 6.2(a) — graphics-pipeline register addresses + minimums
 # ================================================================
 # Spec-anchor for the trivial vertex+fragment pipeline that Step

@@ -21,11 +21,66 @@ fn test_gfx9_isel_op_selection() {
     assert_eq(_gisel_int_op(MIR_OP_OR, 1), GISEL_V_OR_B32, "or divergent");
     assert_eq(_gisel_int_op(MIR_OP_XOR, 0), GISEL_S_XOR_B32, "xor uniform");
     assert_eq(_gisel_int_op(MIR_OP_FADD, 0), 0, "fadd is not an int op");
-    assert_eq(_gisel_float_op(MIR_OP_FADD), GISEL_V_ADD_F32, "fadd -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FSUB), GISEL_V_SUB_F32, "fsub -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FMUL), GISEL_V_MUL_F32, "fmul -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_FMA), GISEL_V_FMA_F32, "fma -> VALU");
-    assert_eq(_gisel_float_op(MIR_OP_IADD), 0, "iadd is not a float op");
+    assert_eq(_gisel_float_op(MIR_OP_FADD, MIR_T_F32), GISEL_V_ADD_F32, "fadd f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FSUB, MIR_T_F32), GISEL_V_SUB_F32, "fsub f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FMUL, MIR_T_F32), GISEL_V_MUL_F32, "fmul f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_FMA, MIR_T_F32), GISEL_V_FMA_F32, "fma f32 -> VALU");
+    assert_eq(_gisel_float_op(MIR_OP_IADD, MIR_T_F32), 0, "iadd is not a float op");
+    # v3.2 F.7d — f64 selects the V_*_F64 form; ops with no single f64 opcode fail loud (0).
+    assert_eq(_gisel_float_op(MIR_OP_FADD, MIR_T_F64), GISEL_V_ADD_F64, "fadd f64 -> V_ADD_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMUL, MIR_T_F64), GISEL_V_MUL_F64, "fmul f64 -> V_MUL_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMA, MIR_T_F64), GISEL_V_FMA_F64, "fma f64 -> V_FMA_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMIN, MIR_T_F64), GISEL_V_MIN_F64, "fmin f64 -> V_MIN_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FMAX, MIR_T_F64), GISEL_V_MAX_F64, "fmax f64 -> V_MAX_F64");
+    assert_eq(_gisel_float_op(MIR_OP_FSUB, MIR_T_F64), GISEL_V_SUB_F64, "fsub f64 -> V_SUB_F64 (F.7f.3)");
+    assert_eq(_gisel_float_op(MIR_OP_FABS, MIR_T_F64), GISEL_V_ABS_F64, "fabs f64 -> V_ABS_F64 (F.7f.3)");
+    assert_eq(_gisel_float_op(MIR_OP_FSQRT, MIR_T_F64), 0, "fsqrt f64 deferred (needs Newton macro) -> fail loud");
+    return 0;
+}
+
+# v3.2 F.7d — the isel driver passes the result type, so an f64 FMUL/FMA selects the V_*_F64
+# form. (f64 load/store -> DWORDX2 needs a ptr-table set-up; it is integration-tested by the
+# F.7e compiled-FMA fixture.)
+fn test_gfx9_isel_f64() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # divergent u32
+    mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 mul
+    mir_emit(&m, MIR_OP_FMA, 8, MIR_T_F64, 7, 7, 7, 0);                    # f64 fma
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    # isel order: 0=EXTRACT, 1=FMUL(f64), 2=FMA(f64), 3=ENDPGM
+    assert_eq(gisel_op(&isel, 1), GISEL_V_MUL_F64, "f64 FMUL -> GISEL_V_MUL_F64");
+    assert_eq(gisel_op(&isel, 2), GISEL_V_FMA_F64, "f64 FMA -> GISEL_V_FMA_F64");
+    return 0;
+}
+
+# v3.2 F.7f.2 review #1 — a same-width OpFConvert (f64->f64, invalid per spec) must FAIL LOUD in
+# isel rather than emit a CVT that reads the wrong register size (mabda's light validate gate does
+# not reject it; untrusted input). The dispatch keys on the result type, so the operand width is
+# the load-bearing guard.
+fn test_gfx9_isel_fconvert_rejects_same_width() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_FMUL, 6, MIR_T_F64, 5, 5, 0, 0);                                  # an f64 value
+    mir_emit(&m, MIR_OP_FCONVERT, 7, MIR_T_F64, 6, 0, 0, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM); # f64->f64 (invalid)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    assert_eq(ic, 0 - GISEL_ERR_UNSUPPORTED_OP, "f64->f64 FCONVERT fails loud (operand width mismatch)");
     return 0;
 }
 
@@ -234,6 +289,58 @@ fn test_gfx9_regalloc_errors() {
     return 0;
 }
 
+# v3.2 F.7c — _ra_claim_pair: even-aligned 64-bit register pairs (f64). Pure free-at math.
+fn test_ra_claim_pair() {
+    var freeat[2048];
+    memset(&freeat, 0, 2048);                                      # all free (free-at 0)
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 2, "odd base 1 rounds up -> v[2:3]");
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 4, "second pair -> v[4:5]");
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 0, 5), 6, "third pair -> v[6:7]");
+    # at step 5 the first pair's free-at (5) <= step, so it is reusable again
+    assert_eq(_ra_claim_pair(&freeat, 1, 256, 5, 9), 2, "reuse freed pair v[2:3] at step 5");
+    # one odd half busy: v3 occupied until step 100 forces the scan past v[2:3] to v[4:5]
+    memset(&freeat, 0, 2048);
+    store64(&freeat + 3 * 8, 100);
+    assert_eq(_ra_claim_pair(&freeat, 2, 256, 0, 5), 4, "v3 busy -> skip v[2:3], take v[4:5]");
+    # exhaustion: cap=3 leaves no room for an even pair (need r+1 < cap)
+    memset(&freeat, 0, 2048);
+    assert_eq(_ra_claim_pair(&freeat, 2, 3, 0, 5), 0 - 1, "cap 3 -> no aligned pair fits");
+    return 0;
+}
+
+# v3.2 F.7c — driver: f64 SSA results get even-aligned VGPR pairs + high-water counts both halves.
+# A divergent f64 chain (lid.x -> FMUL f64 -> FADD f64). isel still selects the f32 opcode (F.7d
+# fixes that), but regalloc keys on the VALUE type (MIR_T_F64), so the pairing is exercised here.
+# Layout (vgpr_base 1): %6 u32 -> v1 (single); %7 f64 -> v[2:3]; %8 f64 -> v[4:5]; hw 6.
+fn test_gfx9_regalloc_f64_pairs() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # lid.x (divergent u32)
+    mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 #1 (divergent)
+    mir_emit(&m, MIR_OP_FADD, 8, MIR_T_F64, 7, 6, 0, 0);                   # f64 #2 (uses %7, %6)
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[256];
+    var ic = gfx9_isel(&m, &isel, 8);
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "f64 regalloc ok");
+    assert_eq(gfx9_reg(&alloc, 6), 1, "u32 single -> v1 (coexists with the f64 pairs)");
+    var r7 = gfx9_reg(&alloc, 7);
+    var r8 = gfx9_reg(&alloc, 8);
+    assert_eq(r7 & 1, 0, "f64 #1 lands on an even reg (pair)");
+    assert_eq(r8 & 1, 0, "f64 #2 lands on an even reg (pair)");
+    assert_eq(r7, 2, "f64 #1 -> v[2:3]");
+    assert_eq(r8, 4, "f64 #2 -> v[4:5]");
+    assert_eq(gfx9_hw_vgpr(&hw), 6, "vgpr high-water counts both halves of the last pair");
+    return 0;
+}
+
 # review N.4a: a float/CVT op is always VALU and writes a VGPR, even when its
 # result is UNIFORM. The file must follow the op class, not the uniformity, or a
 # vector instruction's dst lands in an SGPR (invalid encoding). A CVT_F32 of a
@@ -259,6 +366,37 @@ fn test_gfx9_regalloc_valu_uniform() {
     assert_eq(gfx9_reg(&alloc, 2), 1, "uniform VALU result -> VGPR v1 (not s8)");
     assert_eq(gfx9_hw_vgpr(&hw), 2, "one VGPR used");
     assert_eq(gfx9_hw_sgpr(&hw), 8, "no SGPR used (VALU result lives in a VGPR)");
+    return 0;
+}
+
+# F.7f.6b review — the f64 division macro primitives are vector-only (VOP1/VOP3 with implicit VCC,
+# no scalar form) and must classify DIVERGENT even when every operand is UNIFORM, exactly like the
+# udiv primitives. Each op here takes only uniform f64 constants; the forced-DIVERGENT guard in
+# _mir_instr_unif must override the would-be-UNIFORM meet (else a future SGPR-coalescing pass could
+# pick them — no SALU form exists). Without the guard each result classifies UNIFORM (the bug).
+fn test_mir_unif_f64_div_ops_forced_divergent() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_const(&m, 1, MIR_T_F64, 0);
+    mir_set_const(&m, 2, MIR_T_F64, 0);
+    mir_emit(&m, MIR_OP_F64_RCP, 3, MIR_T_F64, 1, 0, 0, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_SCALE, 4, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_FMA_N0_ONE, 5, MIR_T_F64, 1, 2, 0, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_FMAS, 6, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_FIXUP, 7, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_FMA_N0, 8, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 3), MIR_DIVERGENT, "F64_RCP forced divergent");
+    assert_eq(mir_val_unif(&m, 4), MIR_DIVERGENT, "F64_DIV_SCALE forced divergent");
+    assert_eq(mir_val_unif(&m, 5), MIR_DIVERGENT, "F64_FMA_N0_ONE forced divergent");
+    assert_eq(mir_val_unif(&m, 6), MIR_DIVERGENT, "F64_DIV_FMAS forced divergent");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "F64_DIV_FIXUP forced divergent");
+    assert_eq(mir_val_unif(&m, 8), MIR_DIVERGENT, "F64_FMA_N0 forced divergent");
     return 0;
 }
 
@@ -1229,6 +1367,11 @@ fn main(): i64 {
     test_gfx9_regalloc_saxpy();
     test_gfx9_regalloc_errors();
     test_gfx9_regalloc_valu_uniform();
+    test_mir_unif_f64_div_ops_forced_divergent();
+    test_ra_claim_pair();
+    test_gfx9_regalloc_f64_pairs();
+    test_gfx9_isel_f64();
+    test_gfx9_isel_fconvert_rejects_same_width();
     test_gfx9_waitcnt_saxpy();
     test_gfx9_waitcnt_none();
     test_gfx9_waitcnt_errors();

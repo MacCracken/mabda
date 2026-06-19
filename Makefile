@@ -162,6 +162,14 @@ build/spirv_e2e: build/spirv_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/spirv_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+# v3.2 F.8 — wgpu f64 via SPIR-V passthrough: proves an f64 SPIR-V compute module
+# CREATES via the passthrough path (naga cannot carry f64) on a shaderFloat64 device,
+# and that gpu_caps_wgpu_shader_f64 is honestly 0 (wgpu compute dispatch is a v3.0
+# stub — M.6b). Requires wgpu-native + the SpirvShaderPassthrough device feature (F.8a).
+build/f64_compute_e2e: build/f64_compute_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/f64_compute_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 # v3.2 T.8 — wgpu compressed (BC1) create+upload, verified by byte-exact
 # copy-back round-trip. Requires wgpu-native + a BC-capable adapter.
 build/compressed_texture_e2e: build/compressed_texture_e2e.o deps/wgpu_main.o
@@ -208,6 +216,10 @@ test-render-e2e: build/render_e2e
 .PHONY: test-spirv-e2e
 test-spirv-e2e: build/spirv_e2e
 	./build/spirv_e2e
+
+.PHONY: test-f64-compute-e2e
+test-f64-compute-e2e: build/f64_compute_e2e
+	./build/f64_compute_e2e
 
 .PHONY: test-render-graph-e2e
 test-render-graph-e2e: build/render_graph_e2e
@@ -270,6 +282,14 @@ build/native_compute_store: programs/native_compute_store.cyr src/*.cyr
 test-native-compute-store: build/native_compute_store
 	./build/native_compute_store
 
+build/native_f64_fma_e2e: programs/native_f64_fma_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_f64_fma_e2e.cyr $@
+
+.PHONY: test-native-f64-fma-e2e
+test-native-f64-fma-e2e: build/native_f64_fma_e2e
+	./build/native_f64_fma_e2e
+
 # N.5d: a SPIR-V kernel compiled in-tree (gfx9_compile) and dispatched on the
 # AMD GPU — the SPIR-V→GFX9 compiler's hardware bring-up oracle.
 build/native_spirv_compute_e2e: programs/native_spirv_compute_e2e.cyr src/*.cyr
@@ -289,6 +309,51 @@ build/native_spirv_saxpy_e2e: programs/native_spirv_saxpy_e2e.cyr src/*.cyr
 .PHONY: test-native-spirv-saxpy-e2e
 test-native-spirv-saxpy-e2e: build/native_spirv_saxpy_e2e
 	./build/native_spirv_saxpy_e2e
+
+# v3.2 F.7e — the first COMPILED f64 on silicon: an f64 FMA SPIR-V kernel compiled in-tree
+# (gfx9_compile) + dispatched on Cezanne, bit-exact vs the fused-FMA reference.
+build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_fma_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-fma-e2e
+test-native-spirv-f64-fma-e2e: build/native_spirv_f64_fma_e2e
+	./build/native_spirv_f64_fma_e2e
+
+# v3.2 F.7f — compiled f64 arith breadth (FADD/FMUL/FMIN/FMAX) on Cezanne, bit-exact vs an
+# in-process f64 reference.
+build/native_spirv_f64_arith_e2e: programs/native_spirv_f64_arith_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_arith_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-arith-e2e
+test-native-spirv-f64-arith-e2e: build/native_spirv_f64_arith_e2e
+	./build/native_spirv_f64_arith_e2e
+
+build/native_spirv_f64_div_e2e: programs/native_spirv_f64_div_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_div_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-div-e2e
+test-native-spirv-f64-div-e2e: build/native_spirv_f64_div_e2e
+	./build/native_spirv_f64_div_e2e
+
+build/native_spirv_f64_sqrt_e2e: programs/native_spirv_f64_sqrt_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_sqrt_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-sqrt-e2e
+test-native-spirv-f64-sqrt-e2e: build/native_spirv_f64_sqrt_e2e
+	./build/native_spirv_f64_sqrt_e2e
+
+# v3.2 F.7f.2 — compiled f32<->f64 CVT round-trip on Cezanne, bit-exact vs an in-process reference.
+build/native_spirv_f64_cvt_e2e: programs/native_spirv_f64_cvt_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_cvt_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-cvt-e2e
+test-native-spirv-f64-cvt-e2e: build/native_spirv_f64_cvt_e2e
+	./build/native_spirv_f64_cvt_e2e
 
 # N.5g: a 2x2 box-filter downsample compiled in-tree + dispatched on the GPU,
 # pixel-matched against a CPU box-filter (the named MVP-exit image kernel; 2
@@ -793,3 +858,61 @@ build-gpu-programs:
 .PHONY: clean
 clean:
 	rm -rf build/
+
+# v3.2 F.7f.3 — compiled f64 sub+abs (source-modifier ops) on Cezanne, bit-exact vs in-process ref.
+build/native_spirv_f64_subabs_e2e: programs/native_spirv_f64_subabs_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_subabs_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-subabs-e2e
+test-native-spirv-f64-subabs-e2e: build/native_spirv_f64_subabs_e2e
+	./build/native_spirv_f64_subabs_e2e
+
+# v3.2 F.7f.4 — compiled array<dvec2> add on Cezanne (verifies the F.7e f64 vec stride/offset).
+build/native_spirv_f64_vec_e2e: programs/native_spirv_f64_vec_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_vec_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-vec-e2e
+test-native-spirv-f64-vec-e2e: build/native_spirv_f64_vec_e2e
+	./build/native_spirv_f64_vec_e2e
+
+build/native_spirv_f64_i32_cvt_e2e: programs/native_spirv_f64_i32_cvt_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_i32_cvt_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-i32-cvt-e2e
+test-native-spirv-f64-i32-cvt-e2e: build/native_spirv_f64_i32_cvt_e2e
+	./build/native_spirv_f64_i32_cvt_e2e
+
+build/native_spirv_f64_const_e2e: programs/native_spirv_f64_const_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_const_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-const-e2e
+test-native-spirv-f64-const-e2e: build/native_spirv_f64_const_e2e
+	./build/native_spirv_f64_const_e2e
+
+build/native_spirv_f64_ldexp_e2e: programs/native_spirv_f64_ldexp_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_ldexp_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-ldexp-e2e
+test-native-spirv-f64-ldexp-e2e: build/native_spirv_f64_ldexp_e2e
+	./build/native_spirv_f64_ldexp_e2e
+
+build/native_spirv_f64_select_e2e: programs/native_spirv_f64_select_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_select_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-select-e2e
+test-native-spirv-f64-select-e2e: build/native_spirv_f64_select_e2e
+	./build/native_spirv_f64_select_e2e
+
+build/native_spirv_f64_layernorm_e2e: programs/native_spirv_f64_layernorm_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_layernorm_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-layernorm-e2e
+test-native-spirv-f64-layernorm-e2e: build/native_spirv_f64_layernorm_e2e
+	./build/native_spirv_f64_layernorm_e2e

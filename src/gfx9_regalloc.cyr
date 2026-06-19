@@ -68,6 +68,26 @@ fn _ra_claim(freeat, base, cap, step, freeat_new): i64 {
     return 0 - 1;
 }
 
+# v3.2 F.7c — claim the lowest EVEN-aligned register PAIR [r, r+1] in [base, cap) with BOTH
+# halves free at `step`; mark both busy until `freeat_new`. f64 (64-bit) values occupy
+# even-aligned pairs (v[2:3] / s[0:1]) on GFX9, so an odd `base` rounds up and r steps by 2.
+# Returns the low (even) register, or -1 if no aligned pair fits the file.
+fn _ra_claim_pair(freeat, base, cap, step, freeat_new): i64 {
+    var r = base;
+    if ((r & 1) != 0) { r = r + 1; }   # round up to the next even register
+    while (r + 1 < cap) {
+        if (load64(freeat + r * 8) <= step) {
+            if (load64(freeat + (r + 1) * 8) <= step) {
+                store64(freeat + r * 8, freeat_new);
+                store64(freeat + (r + 1) * 8, freeat_new);
+                return r;
+            }
+        }
+        r = r + 2;
+    }
+    return 0 - 1;
+}
+
 # ================================================================
 # Driver
 # ================================================================
@@ -111,6 +131,12 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
         if (d2 != 0) {
             if (mir_val_kind(m, d2) == MIR_VK_SSA) {
                 var freeat_new = load64(alloc + d2 * RA_REC + 8) + 1;
+                # v3.2 F.7c — register WIDTH: an f64 value occupies an even-aligned
+                # 64-bit PAIR (2 regs), everything else a single reg. The high-water
+                # bumps by `w`, so the RSRC1 ceil(hw/4)-1 formula already counts pairs
+                # (a kernel ending at v[8:9] → hw 10 → VGPRS 2, the F.4 oracle).
+                var w = 1;
+                if (mir_type_base(mir_val_type(m, d2)) == MIR_T_F64) { w = 2; }
                 # The file follows the SELECTED op's destination class, not the
                 # value's uniformity: a float/CVT op is always VALU (writes a
                 # VGPR) even for a uniform result, so uniformity would misfile it
@@ -118,15 +144,19 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
                 # so the two agree there. (A uniform value held in a VGPR feeding
                 # a later SALU op is the operand-class-coercion case — N.8.)
                 if (gisel_result_is_vgpr(m, isel, i) == 1) {
-                    var rv = _ra_claim(&vfreeat, vgpr_base, vgpr_cap, i, freeat_new);
+                    var rv = 0;
+                    if (w == 2) { rv = _ra_claim_pair(&vfreeat, vgpr_base, vgpr_cap, i, freeat_new); }
+                    else { rv = _ra_claim(&vfreeat, vgpr_base, vgpr_cap, i, freeat_new); }
                     if (rv < 0) { return 0 - RA_ERR_VGPR_OVERFLOW; }
                     store64(alloc + d2 * RA_REC + 0, rv);
-                    if (rv + 1 > vgpr_hw) { vgpr_hw = rv + 1; }
+                    if (rv + w > vgpr_hw) { vgpr_hw = rv + w; }
                 } else {
-                    var rs = _ra_claim(&sfreeat, sgpr_base, sgpr_cap, i, freeat_new);
+                    var rs = 0;
+                    if (w == 2) { rs = _ra_claim_pair(&sfreeat, sgpr_base, sgpr_cap, i, freeat_new); }
+                    else { rs = _ra_claim(&sfreeat, sgpr_base, sgpr_cap, i, freeat_new); }
                     if (rs < 0) { return 0 - RA_ERR_SGPR_OVERFLOW; }
                     store64(alloc + d2 * RA_REC + 0, rs);
-                    if (rs + 1 > sgpr_hw) { sgpr_hw = rs + 1; }
+                    if (rs + w > sgpr_hw) { sgpr_hw = rs + w; }
                 }
             }
         }

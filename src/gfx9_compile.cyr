@@ -99,6 +99,11 @@ fn _cmp_resolve(m, alloc, isvgpr, field, is_imm): i64 {
         # An f32 constant uses the float inline-operand codes (±0.5/1/2/4); integers use
         # the integer inline range. Anything else resolves to a literal.
         if (mir_val_type(m, field) == MIR_T_F32) { return gfx9_inline_float(mir_val_payload(m, field)); }
+        # An f64 constant is a 64-bit value VOP3 cannot encode as a literal — it MUST be
+        # pre-materialized into a VGPR pair via MIR_OP_F64_CONST in spirv_lower (_spirv_f64_arg).
+        # Fail loud if one reaches here unmaterialized rather than silently truncating to the low
+        # dword (which is 0.0 for 0.5/1.0/1.5/... → silent corruption). (F.7f.9 review backstop.)
+        if (mir_type_base(mir_val_type(m, field)) == MIR_T_F64) { return 0 - CMP_ERR_VOP3_LITERAL; }
         return gfx9_inline_int(mir_val_payload(m, field));
     }
     if (k == MIR_VK_SSA) {
@@ -308,6 +313,166 @@ fn _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
 }
 
+# v3.2 F.7f.3 — f64 SUB: a - b = v_add_f64(a, -b). GFX9 has no V_SUB_F64; the NEGATE-src1 source
+# modifier is hi bit 30 (NEG[1]). Operands are f64 register pairs (f64 inline consts are a later
+# bite; a literal is unencodable in VOP3 → fail loud).
+fn _emit_fsub_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_ADD_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, 0) | 0x40000000);
+}
+
+# v3.2 F.7f.3 — f64 ABS: |x| = v_max_f64(|x|, |x|). GFX9 has no V_ABS_F64; the ABS-src0/src1 source
+# modifiers are lo bits 8,9 (ABS[0], ABS[1]). x is the single operand, fed as both srcs.
+fn _emit_fabs_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var x = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (x < 0) { return x; }
+    if (x == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_MAX_F64, gfx9_reg(alloc, gisel_dst(isel, i))) | 0x300);
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(x, x, 0));
+}
+
+# v3.2 F.7f.6b — f64 div_scale: VOP3B writing the per-lane scale flag to VCC (consumed by the
+# later div_fmas). 3 VGPR-pair operands; the scaled value → vdst. (The two scale operands are
+# the operand being scaled + the other; the macro in spirv_lower wires D,D,N / N,D,N.)
+fn _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3b_lo(GFX9_VOP3_V_DIV_SCALE_F64, GFX9_REG_VCC_LO, vdst));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
+}
+
+# v3.2 F.7f.6b — f64 fma(-a, b, c): the Newton residual/correction FMAs with a NEGATE-src0
+# source modifier (hi bit 29 = 0x20000000). All three operands are computed VGPR pairs.
+fn _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2) | 0x20000000);
+}
+
+# v3.2 F.7f.6b — f64 fma(-a, b, 1.0): the Newton refinement step. NEGATE src0 (0x20000000) +
+# the inline-1.0 constant in src2 (GFX9_INLINE_F32_1_0 = 242; the same code denotes f64 1.0).
+fn _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_1_0) | 0x20000000);
+}
+
+# v3.2 F.7f.7b — f64 fma(-a, b, 0.5): the FSqrt Newton-Goldschmidt residual r = 0.5 - g*h. NEGATE
+# src0 + the inline-0.5 src2 (GFX9_INLINE_F32_0_5 = 240; the same code denotes f64 0.5).
+fn _emit_fma_n0_half_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_0_5) | 0x20000000);
+}
+
+# v3.2 F.7f.7b — f64 mul(a, 0.5): g = 0.5 * rsq. The inline-0.5 rides in src1 (a 2-src VOP3).
+fn _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_MUL_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, GFX9_INLINE_F32_0_5, 0));
+}
+
+# v3.2 F.7f.7b/7c — f64 VOPC compare → the implicit VCC (no register dst). src0 is the f64 pair
+# (resolved 9-bit operand), vsrc1 a VGPR (the f64 pair's low reg for CMP_GT, or the i32 class mask
+# for CMP_CLASS). The FSqrt subnormal gate (CMP_GT) + special-case gate (CMP_CLASS) share this.
+fn _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, opc): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var vsrc1 = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
+    if (vsrc1 < 0) { return vsrc1; }
+    return gfx9_emit32(buf, pos, gfx9_enc_vopc(opc, src0, vsrc1));
+}
+
+# v3.2 F.7f.7c — materialize an f64 constant into a VGPR pair via two v_mov_b32 literals. The value
+# arrives as TWO 32-bit immediates — gisel_a = low dword, gisel_b = high dword — NOT one 64-bit imm:
+# the MIR instr record packs a/b into 32-bit halves (mir_instr_a masks &0xFFFFFFFF), so a single
+# 64-bit immediate would be truncated (the F.7f.7c review CRITICAL). Both are MIR_FLAG_*_IMM so
+# waitcnt/regalloc don't treat them as value ids. The F.7f.9 primitive (sqrt threshold, coeffs).
+fn _emit_f64_const(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var lo = gisel_a(isel, i);
+    var hi = gisel_b(isel, i);
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst, GFX9_SRC_LITERAL));
+    p = gfx9_emit32(buf, p, lo & 0xFFFFFFFF);
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, dst + 1, GFX9_SRC_LITERAL));
+    return gfx9_emit32(buf, p, hi & 0xFFFFFFFF);
+}
+
+# v3.2 F.7f.7b — f64-pair cndmask: dst = VCC ? b(true) : a(false), realized as TWO v_cndmask_b32
+# (the lo and hi 32-bit halves of each pair). VCC is implicit; both value operands are VGPR pairs.
+fn _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fa = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (fa < 0) { return fa; }
+    var tb = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
+    if (tb < 0) { return tb; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, gfx9_vgpr(fa), tb));
+    return gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst + 1, gfx9_vgpr(fa + 1), tb + 1));
+}
+
+# v3.2 F.7f.8 — OpSelect blend via v_bfi_b32 (d = (mask & x) | (~mask & y) = mask ? x : y). The cond
+# MASK (0/-1) is src0, the true/false values src1/src2. One bfi for i32/f32; two (lo+hi, same mask)
+# for an f64 pair. No VCC — order-independent (the mask is a normal VGPR value).
+fn _emit_select(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var mask = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);  if (mask < 0) { return mask; }
+    var x = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);      if (x < 0) { return x; }
+    var y = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);      if (y < 0) { return y; }
+    if (mask == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (x == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (y == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_BFI_B32, dst));
+    p = gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(mask, x, y));
+    if (mir_type_base(mir_val_type(m, gisel_dst(isel, i))) == MIR_T_F64) {
+        p = gfx9_emit32(buf, p, gfx9_enc_vop3a_lo(GFX9_VOP3_V_BFI_B32, dst + 1));
+        return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(mask, x + 1, y + 1));
+    }
+    return p;
+}
+
 # 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
 fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     if (is_imm != 0) {
@@ -374,19 +539,19 @@ fn _cmp_flat_saddr(abi, isel, i): i64 {
 # SGPR pair (saddr), the per-lane byte offset in a VGPR (vaddr). dst = the loaded
 # VGPR. a = offset vreg, binding in flags bits 8+. No SGPR→VGPR move or 64-bit add
 # needed — the divergent offset rides the vaddr field.
-fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos): i64 {
+fn _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, load_opc): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
     if (vaddr < 0) { return vaddr; }
     var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
-    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_LOAD_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_flat_lo(load_opc, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(vdst, saddr, 0, vaddr));
 }
 
 # FLAT global store (SADDR form): a = offset vreg, c = value vreg, binding in
 # flags bits 8+. saddr = binding base pair, data = value VGPR, vaddr = offset.
-fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
+fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, store_opc): i64 {
     var saddr = _cmp_flat_saddr(abi, isel, i);
     if (saddr < 0) { return saddr; }
     var vaddr = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
@@ -408,7 +573,7 @@ fn _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64
         data = _cmp_vgpr_operand(m, alloc, isvgpr, cfield);
         if (data < 0) { return data; }
     }
-    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(GFX9_FLAT_GLOBAL_STORE_DWORD, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
+    p = gfx9_emit32(buf, p, gfx9_enc_flat_lo(store_opc, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0));
     return gfx9_emit32(buf, p, gfx9_enc_flat_hi(0, saddr, data, vaddr));
 }
 
@@ -536,12 +701,80 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_V_CNDMASK) { return _emit_cndmask(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_EXTRACT) { return _emit_extract(m, isel, i, alloc, abi, buf, pos); }
-    if (op == GISEL_GLOBAL_LOAD) { return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos); }
-    if (op == GISEL_GLOBAL_STORE) { return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr); }
+    if (op == GISEL_GLOBAL_LOAD) {
+        return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, GFX9_FLAT_GLOBAL_LOAD_DWORD);
+    }
+    if (op == GISEL_GLOBAL_STORE) {
+        return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, GFX9_FLAT_GLOBAL_STORE_DWORD);
+    }
+    # v3.2 F.7d — f64: DWORDX2 global load/store + the V_*_F64 ALU (VOP3, reusing the scalar
+    # emitters — regalloc gave the EVEN low reg of each pair, which the encoders name directly).
+    if (op == GISEL_GLOBAL_LOAD_DWORDX2) {
+        return _emit_flat_load(m, isel, i, alloc, abi, isvgpr, buf, pos, GFX9_FLAT_GLOBAL_LOAD_DWORDX2);
+    }
+    if (op == GISEL_GLOBAL_STORE_DWORDX2) {
+        return _emit_flat_store(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr, GFX9_FLAT_GLOBAL_STORE_DWORDX2);
+    }
+    if (op == GISEL_V_ADD_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_ADD_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MUL_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MUL_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MIN_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MIN_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_MAX_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_MAX_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_FMA_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F64);
+    }
+    if (op == GISEL_V_CVT_F64_F32) {
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F64_F32);
+    }
+    if (op == GISEL_V_CVT_F32_F64) {
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_F64);
+    }
+    if (op == GISEL_V_SUB_F64) { return _emit_fsub_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_ABS_F64) { return _emit_fabs_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.6b f64 division macro. RCP reuses _emit_vop1; DIV_FMAS/DIV_FIXUP reuse _emit_vop3_3src
+    # (VCC is implicit for DIV_FMAS — no extra encoding); div_scale + the NEG-src0 FMAs are dedicated.
+    if (op == GISEL_V_RCP_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RCP_F64); }
+    if (op == GISEL_V_DIV_SCALE_F64) { return _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_DIV_FMAS_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FMAS_F64);
+    }
+    if (op == GISEL_V_DIV_FIXUP_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FIXUP_F64);
+    }
+    if (op == GISEL_V_FMA_F64_N0) { return _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_FMA_F64_N0_ONE) { return _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.7b f64 sqrt macro. RSQ reuses _emit_vop1; the rest are dedicated (the inline-0.5 FMA/MUL,
+    # the VCC-writing cmp_class, the f64-pair cndmask).
+    if (op == GISEL_V_RSQ_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RSQ_F64); }
+    if (op == GISEL_V_FMA_F64_N0_HALF) { return _emit_fma_n0_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_MUL_F64_HALF) { return _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CMP_CLASS_F64) {
+        return _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOPC_V_CMP_CLASS_F64);
+    }
+    if (op == GISEL_V_CNDMASK_F64) { return _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.7c sqrt subnormal wrapper: f64-const materialize, ldexp scale (VOP3 2-src), the GT gate.
+    if (op == GISEL_V_CONST_F64) { return _emit_f64_const(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_LDEXP_F64) {
+        return _emit_vop3_2src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_LDEXP_F64, scratch_vgpr);
+    }
+    if (op == GISEL_V_CMP_GT_F64) {
+        return _emit_vopc_f64(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOPC_V_CMP_GT_F64);
+    }
+    # F.7f.10 i32<->f64 cvt (exp reduction): VOP1, reuse _emit_vop1 with the existing encoders.
+    if (op == GISEL_V_CVT_I32_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_I32_F64); }
+    if (op == GISEL_V_CVT_F64_I32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F64_I32); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_SELECT) { return _emit_select(m, isel, i, alloc, isvgpr, buf, pos); }
     # Divergent-if EXEC mask: save+AND EXEC with VCC into the reserved pair; restore it.
     if (op == GISEL_S_SAVEEXEC) {
         return gfx9_emit32(buf, pos,

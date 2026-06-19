@@ -11,9 +11,9 @@ fn test_mir_type_distill() {
     assert_eq(_mir_lower_type(&types, 2, 16), MIR_T_I32, "signed int32 -> I32");
     assert_eq(_mir_lower_type(&types, 3, 16), MIR_T_U32, "unsigned int32 -> U32");
     assert_eq(_mir_lower_type(&types, 4, 16), MIR_T_F32, "float32 -> F32");
-    assert_eq(_mir_lower_type(&types, 5, 16), MIR_T_UNSUPPORTED, "float64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 5, 16), MIR_T_F64, "float64 -> F64 (v3.2 F.7a)");
     assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "vec4 f32 -> F32|count4");
-    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vec4 f64 -> UNSUPPORTED");
+    assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_F64 | (4 << 8), "vec4 f64 -> F64|count4 (F.7a)");
     assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "vec count5 -> UNSUPPORTED");
     return 0;
 }
@@ -345,6 +345,158 @@ fn test_spirv_lower_smod() {
     assert_eq(mir_instr_op(&m, 34), MIR_OP_ICMP_NE, "34: srem-nonzero compare");
     assert_eq(mir_instr_op(&m, 35), MIR_OP_CNDMASK, "35: nonzero ? bsel : 0");
     assert_eq(mir_instr_op(&m, 36), MIR_OP_IADD, "36: smod = srem + adj");
+    return 0;
+}
+
+# F.7f.6b — OpFDiv (f64) lowers to the 11-op reciprocal-Newton macro. A minimal module header (so
+# spirv_hdr_id_bound reads a real bound) + a single OpFDiv; types[2] = f64. The chain: DIV_SCALE
+# (D,D,N) → RCP → FMA_N0_ONE → FMA → DIV_SCALE (N,D,N, flag→VCC) → FMA_N0_ONE → FMA → FMUL →
+# FMA_N0 → DIV_FMAS (reads VCC) → DIV_FIXUP. The 2nd DIV_SCALE (i4) must precede DIV_FMAS (i9)
+# with only FMA/MUL between (no VCC writer) — the contiguity the VCC liveness depends on.
+fn test_spirv_lower_fdiv() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 4, 0x00010300); store32(&buf + 8, 0);
+    store32(&buf + 12, 16);   # id bound
+    store32(&buf + 16, 0);
+    store32(&buf + 20, (5 << 16) | 136);   # OpFDiv
+    store32(&buf + 24, 2);                  # result type id (-> f64)
+    store32(&buf + 28, 5);                  # result id
+    store32(&buf + 32, 3);                  # operand a (dividend N)
+    store32(&buf + 36, 4);                  # operand b (divisor D)
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);   # result type = f64
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m), 0, "fdiv f64 lowers");
+    assert_eq(mir_n_instrs(&m), 11, "fdiv = 11 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_DIV_SCALE, "0: div_scale(D,D,N)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_F64_RCP, "1: rcp seed");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_F64_FMA_N0_ONE, "2: fma(-s0,rcp,1)");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_FMA, "3: fma(rcp,e1,rcp)");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_F64_DIV_SCALE, "4: div_scale(N,D,N) -> VCC");
+    assert_eq(mir_instr_op(&m, 7), MIR_OP_FMUL, "7: q = s1*rcp3");
+    assert_eq(mir_instr_op(&m, 8), MIR_OP_F64_FMA_N0, "8: r = fma(-s0,q,s1)");
+    assert_eq(mir_instr_op(&m, 9), MIR_OP_F64_DIV_FMAS, "9: div_fmas (reads VCC)");
+    assert_eq(mir_instr_op(&m, 10), MIR_OP_F64_DIV_FIXUP, "10: div_fixup (rounding)");
+    return 0;
+}
+
+# F.7f.6b — OpFDiv on f32 has no native macro yet (wgpu/naga covers the f32 path) → FAIL LOUD
+# rather than silently lowering with f64 ops. Same module, types[2] = f32.
+fn test_spirv_lower_fdiv_f32_rejects() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 4, 0x00010300); store32(&buf + 8, 0);
+    store32(&buf + 12, 16);
+    store32(&buf + 16, 0);
+    store32(&buf + 20, (5 << 16) | 136);   # OpFDiv
+    store32(&buf + 24, 2);                  # result type id (-> f32)
+    store32(&buf + 28, 5);
+    store32(&buf + 32, 3);
+    store32(&buf + 36, 4);
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 32, 0, 16);   # result type = f32
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_TYPE, "fdiv f32 fails loud");
+    assert_eq(mir_n_instrs(&m), 0, "f32 fdiv emits no MIR");
+    return 0;
+}
+
+# F.7f.7b/7c — OpExtInst Sqrt (f64) lowers to the full-range 22-op macro: a subnormal gate
+# (F64_CONST threshold → CMP_GT → cndmask the 2^256 scale-up → LDEXP), the Newton-Goldschmidt core
+# (rsq → h=x*rsq → g=0.5*rsq → r=0.5-g*h → 2 rounds → core), then rescale (cndmask 2^-128 → LDEXP)
+# + the +0/-0/+inf passthrough (CMP_CLASS → f64-pair CNDMASK). The two scale cndmasks (i4, i17)
+# read the SAME vcc_sub and must precede CMP_CLASS (i19) which overwrites VCC.
+fn test_spirv_lower_fsqrt() {
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    assert_eq(_spirv_lower_fsqrt_f64(&m, 3, 5), 0, "fsqrt f64 lowers");   # x=id 3, result=id 5
+    assert_eq(mir_n_instrs(&m), 22, "fsqrt = 22 MIR instrs (full range)");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_CONST, "0: threshold f64-const");
+    # The 2^-767 threshold MUST survive as two 32-bit halves (lo=0, hi=0x10000000). A single 64-bit
+    # immediate would truncate (MIR packs a/b into 32-bit slots) → threshold 0.0 → dead scaling.
+    assert_eq(mir_instr_a(&m, 0), 0, "0: threshold lo dword = 0");
+    assert_eq(mir_instr_b(&m, 0), 0x10000000, "0: threshold hi dword = 0x10000000 (2^-767)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_F64_CMP_GT, "1: subnormal gate (thr > x) -> VCC");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_CNDMASK, "4: scale-up exponent select");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_F64_LDEXP, "5: scale x up");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_F64_RSQ, "6: rsq seed");
+    assert_eq(mir_instr_op(&m, 12), MIR_OP_F64_FMA_N0, "12: d = xs - h*h");
+    assert_eq(mir_instr_op(&m, 17), MIR_OP_CNDMASK, "17: rescale exponent select (vcc_sub reuse)");
+    assert_eq(mir_instr_op(&m, 19), MIR_OP_F64_CMP_CLASS, "19: cmp_class -> vcc_class");
+    assert_eq(mir_instr_op(&m, 20), MIR_OP_F64_LDEXP, "20: rescale result down");
+    assert_eq(mir_instr_op(&m, 21), MIR_OP_F64_CNDMASK, "21: vcc_class ? xs : rr");
+    return 0;
+}
+
+# F.7f.8 review — OpSelect must FAIL LOUD unless its cond is a 0/-1 select mask (an OpFOrd* result:
+# SSA + MIR_T_BOOL). A non-mask cond (an integer-compare bool = U32, or a bool CONSTANT) would
+# silently corrupt the v_bfi_b32 blend, so it is rejected (the silent-wrong bug the review found).
+fn test_spirv_lower_select_rejects_nonmask() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (6 << 16) | 169);   # OpSelect (169) at word 5, wc=6
+    store32(&buf + 24, 2);                   # result type id (-> f64)
+    store32(&buf + 28, 5);                   # result id
+    store32(&buf + 32, 6);                   # cond id
+    store32(&buf + 36, 7);                   # obj1 (true)
+    store32(&buf + 40, 8);                   # obj2 (false)
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    # cond = a U32 SSA (an integer-compare bool, NOT a 0/-1 mask) -> reject
+    _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a U32 (int-compare) cond");
+    # cond = a bool CONSTANT -> reject (not SSA; would mis-encode in bfi)
+    mir_set_const(&m, 6, MIR_T_BOOL, 1);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a bool-constant cond");
+    return 0;
+}
+
+# F.7f.9 — _spirv_f64_arg materializes an f64-const operand into a MIR_OP_F64_CONST (the 64-bit
+# payload split lo/hi), the path that lets consumers use f64 literals in arith (VOP3 has no 64-bit
+# literal). A non-f64 operand (f32 const / SSA) is returned unchanged. Pins the full-64-bit handling
+# (the F.7f.7c/.9 truncation class) + the lo/hi split.
+fn test_spirv_f64_arg() {
+    var m[80];
+    var vals[2560];
+    var instrs[512];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_set_const(&m, 5, MIR_T_F64, 0x400921FB54442D18);   # pi as an f64 const
+    var r = _spirv_f64_arg(&m, 5);
+    assert_eq(mir_n_instrs(&m), 1, "f64 const → 1 F64_CONST materialized");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_CONST, "op = F64_CONST");
+    assert_eq(mir_instr_a(&m, 0), 0x54442D18, "lo dword (no truncation)");
+    assert_eq(mir_instr_b(&m, 0), 0x400921FB, "hi dword preserved");
+    assert_eq(r >= 16, 1, "returns a fresh materialized value id (not the const)");
+    mir_set_const(&m, 6, MIR_T_F32, 0x3F800000);   # f32 const — left for the f32 literal/inline path
+    assert_eq(_spirv_f64_arg(&m, 6), 6, "f32 const returned unchanged");
+    assert_eq(mir_n_instrs(&m), 1, "no extra op for a non-f64 operand");
     return 0;
 }
 
@@ -832,9 +984,10 @@ fn test_spirv_lower_negatives() {
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
     0 - LOWER_ERR_CONTROL_FLOW, "PHI still rejected");
-    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP
+    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP (OpFDiv (136) is now lowered as the
+    # F.7f.6b macro, so use OpFRem (140) — still unmapped — for the generic-unsupported path).
     _spv_build_gid_kernel(&buf);
-    store32(&buf + 324, (5 << 16) | 136);   # OpShiftLeftLogical -> OpFDiv (unmapped)
+    store32(&buf + 324, (5 << 16) | 140);   # OpShiftLeftLogical -> OpFRem (unmapped)
     spirv_build_type_table(&buf, n, 16, 16, &types);
     spirv_build_const_table(&buf, n, 16, 16, &consts);
     spirv_build_decoration_table(&buf, n, 16, 16, &deco);
@@ -1234,6 +1387,11 @@ fn main(): i64 {
     test_spirv_lower_gid_kernel();
     test_spirv_const_fold();
     test_spirv_lower_smod();
+    test_spirv_lower_fdiv();
+    test_spirv_lower_fdiv_f32_rejects();
+    test_spirv_lower_fsqrt();
+    test_spirv_f64_arg();
+    test_spirv_lower_select_rejects_nonmask();
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();
     test_spirv_vec_robustness();
