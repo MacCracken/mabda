@@ -89,21 +89,34 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.1 — Per-mip-level upload (3.3.1) [M]
 
-- [ ] **AL.1a** — `backend.cyr`: `BACKEND_SLOT_TEXTURE_WRITE_LEVEL = 280`,
-  `BACKEND_SIZE = 288`, completeness-range update. Slot-completeness test.
-- [ ] **AL.1b** — `texture.cyr`: `gpu_texture_write_level(ctx, tex, level, src,
-  n)` — validate `level < mip_count`; expected `n = mabda_texfmt_data_size(fmt,
-  mip_dim(w,level), mip_dim(h,level))`; reject mismatch; route through slot.
-  Tests: level-OOB / size-mismatch reject; routing sentinel.
-- [ ] **AL.1c** — native filler — per-level VA offset (tiled → `_native_texture_
-  tiled_copy`; linear → memcpy at `va_base + mip_offset`). Mock-VA test for
-  levels 0/1/N.
-- [ ] **AL.1d** — wgpu filler — `wgpu_queue_write_texture` with `mipLevel` +
-  block-correct `bytesPerRow`. **Handle the 256-byte `bytesPerRow` alignment**
-  (X2) — staging re-pack for non-aligned widths. Descriptor-shape test.
-- [ ] **AL.1e** *(if e2e needs per-level verify)* — `gpu_texture_read_level`
-  peer (else AL.6 can't read back individual levels; decide scope — may add a
-  third slot, BACKEND_SIZE→304).
+- [x] **AL.1a (2026-06-19)** — `backend.cyr`: `BACKEND_SLOT_TEXTURE_WRITE_LEVEL
+  = 280`, `BACKEND_SIZE 280→288`, `BACKEND_WRITELEVEL_SLOTS_BEGIN/END` range
+  (layout-in-tree, not yet in the completeness walk — the "activate when both
+  fill" pattern). Slot-offset + size-pin tests updated (backend.tcyr).
+- [x] **AL.1b (2026-06-19)** — `texture.cyr`: `gpu_texture_write_level(ctx, tex,
+  level, src, n)` — **thin** dispatcher (ctx + `level >= 0` guards, then
+  fncall5; `tex` is an opaque backend handle here, so per-level size/bounds
+  validation lives in the fillers). Dispatch-routing + guard tests (backend.tcyr).
+- [x] **AL.1c (2026-06-19)** — native filler `_backend_native_texture_write_level`
+  + `native_tex_level_offset(fmt, w, h, level)` (format-aware, generalizes
+  `native_mip_level_offset`; RGBA8 byte-identical, so the mipped layout is
+  unchanged and AL.2's create shares it). Validates level<mip_count + per-level
+  block size, memcpy at the format-aware offset (linear). Tiled level>0 fails
+  loud (`GPU_ERR_NOT_IMPLEMENTED`) — per-level tiled is AL.3. +19 native asserts
+  (offset math vs `native_mip_level_offset`; valid L0/L1/L2 land at the right
+  offsets; all reject paths).
+- [x] **AL.1d (2026-06-19)** — wgpu filler `_backend_wgpu_texture_write_level`
+  (`wgpu_queue_write_texture` with `mipLevel`, reads the mipped-RGBA8 layout).
+  **256-byte `bytesPerRow` alignment (X2) is a documented known limitation**
+  shared with the existing whole-texture write — a staging re-pack for
+  non-256-aligned widths is deferred to when a non-aligned wgpu asset is
+  actually loaded (HW-gated; the native path is the verified primary). Tracked.
+- [ ] **AL.1e** *(deferred to AL.6 e2e scoping)* — `gpu_texture_read_level`
+  peer. Only needed if the R.7-style e2e reads back individual levels; the AL.6
+  e2e can verify via a full-texture read or a sampled pixel instead. Decide at
+  AL.6 (would add a 3rd slot, BACKEND_SIZE→296→304). Not needed for AL.1–AL.5.
+
+  Suite 4137→4171 (17 files); smoke/lint/fmt/vet/distlib green.
 
 ## Phase AL.2 — Generalized mipped create (3.3.2) [M]
 

@@ -1808,6 +1808,37 @@ fn _backend_native_texture_release(ctx, tex): i64 {
     return 0;
 }
 
+# v3.3 AL.1 — write `n` bytes into mip `level` of a native texture. Validates
+# level in [0, mip_count) and n == the level's block-based data size, then
+# memcpy's into the single-BO mip chain at the format-aware per-level offset
+# (linear surfaces). A tiled (compressed sampleable) surface only supports the
+# whole-surface level-0 path here (reuses the L2T tiled copy); per-level tiled
+# upload is AL.3 work (when sampleable compressed mips land) and fails loud.
+fn _backend_native_texture_write_level(ctx, tex, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    if (level >= load32(tex + NATIVE_TEX_FIELD_MIP_COUNT)) { return GPU_ERR_TEXTURE; }
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var lw = mip_level_dim(w, level);
+    var lh = mip_level_dim(h, level);
+    var expected = mabda_texfmt_data_size(fmt, lw, lh);
+    if (expected == 0) { return GPU_ERR_TEXTURE; }      # invalid fmt/dims
+    if (n != expected) { return GPU_ERR_BUFFER; }       # per-level size mismatch
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        if (level == 0) { return _native_texture_tiled_copy(ctx, tex, src, n, 0); }
+        return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+    }
+    memcpy(addr + native_tex_level_offset(fmt, w, h, level), src, n);
+    return 0;
+}
+
 # ----------------------------------------------------------------
 # Render slot wrappers (v3 Step 6.8(c))
 # ----------------------------------------------------------------
@@ -2304,6 +2335,8 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
+    &_backend_native_texture_write_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
@@ -2643,6 +2676,29 @@ fn native_mip_level_offset(width, height, level): i64 {
 # mipped texture create path (M.2).
 fn native_mip_chain_size(width, height, count): i64 {
     return native_mip_level_offset(width, height, count);
+}
+
+# v3.3 AL.1 — format-aware byte offset of mip `level` within a single-BO
+# mip chain of `fmt`. Generalizes native_mip_level_offset (which is the
+# RGBA8 case): each level is the block-based data size, 256-aligned, summed.
+# For fmt == RGBA8 (data_size = w*h*4) this is byte-identical to
+# native_mip_level_offset, so the RGBA8 mipped layout is unchanged; AL.2's
+# generalized mipped create uses this same function so create + write_level
+# agree on one layout. native_tex_chain_size(level==count) is the total.
+fn native_tex_level_offset(fmt, width, height, level): i64 {
+    var off = 0;
+    var i = 0;
+    while (i < level) {
+        var w = mip_level_dim(width, i);
+        var h = mip_level_dim(height, i);
+        off = off + _native_align_up(mabda_texfmt_data_size(fmt, w, h), _NATIVE_MIP_ALIGN);
+        i = i + 1;
+    }
+    return off;
+}
+
+fn native_tex_chain_size(fmt, width, height, count): i64 {
+    return native_tex_level_offset(fmt, width, height, count);
 }
 
 # v3.1 [M.3]: GPU VA of mip `level` within a NativeTexture's chain.

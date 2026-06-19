@@ -1666,6 +1666,66 @@ fn test_native_tex_sampleable_accessors() {
     return 0;
 }
 
+# v3.3 AL.1 — format-aware per-level offset (generalizes native_mip_level_offset).
+fn test_native_tex_level_offset_math() {
+    # RGBA8 must be byte-identical to native_mip_level_offset (layout unchanged).
+    assert_eq(native_tex_level_offset(MABDA_TEXFMT_RGBA8, 256, 256, 0),
+    native_mip_level_offset(256, 256, 0), "RGBA8 level 0 == mip offset");
+    assert_eq(native_tex_level_offset(MABDA_TEXFMT_RGBA8, 256, 256, 1),
+    native_mip_level_offset(256, 256, 1), "RGBA8 level 1 == mip offset");
+    assert_eq(native_tex_level_offset(MABDA_TEXFMT_RGBA8, 256, 256, 3),
+    native_mip_level_offset(256, 256, 3), "RGBA8 level 3 == mip offset");
+    # BC1 16x16 level 0 = ceil(16/4)^2 * 8 = 128 -> 256-aligned.
+    assert_eq(native_tex_level_offset(MABDA_TEXFMT_BC1, 16, 16, 0), 0, "BC1 level 0 offset 0");
+    assert_eq(native_tex_level_offset(MABDA_TEXFMT_BC1, 16, 16, 1), 256, "BC1 level 1 offset 256");
+    return 0;
+}
+
+# v3.3 AL.1 — native per-mip-level upload: validation + linear memcpy at offset.
+fn test_native_texture_write_level() {
+    var ctxbuf[8];
+    store64(&ctxbuf, 1);             # non-null dummy ctx (linear path never derefs it)
+    var scratch[1024];
+    memset(&scratch, 0xEE, 1024);    # sentinel
+    var tex[64];
+    memset(&tex, 0, 64);             # sw_mode 0 = LINEAR
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, &scratch);
+    store32(&tex + NATIVE_TEX_FIELD_WIDTH, 4);
+    store32(&tex + NATIVE_TEX_FIELD_HEIGHT, 4);
+    store32(&tex + NATIVE_TEX_FIELD_MIP_COUNT, 3);
+    store32(&tex + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_RGBA8);
+
+    var s0[64]; memset(&s0, 0x11, 64);     # level 0: 4x4 RGBA8 = 64 B -> offset 0
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 0, &s0, 64), 0, "write L0 ok");
+    assert_eq(load8(&scratch + 0), 0x11, "L0 at offset 0");
+    assert_eq(load8(&scratch + 63), 0x11, "L0 last byte");
+    var s1[16]; memset(&s1, 0x22, 16);     # level 1: 2x2 = 16 B -> offset 256
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 1, &s1, 16), 0, "write L1 ok");
+    assert_eq(load8(&scratch + 256), 0x22, "L1 at offset 256");
+    assert_eq(load8(&scratch + 255), 0xEE, "gap before L1 untouched");
+    var s2[4]; memset(&s2, 0x33, 4);       # level 2: 1x1 = 4 B -> offset 512
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 2, &s2, 4), 0, "write L2 ok");
+    assert_eq(load8(&scratch + 512), 0x33, "L2 at offset 512");
+
+    # Validation rejects.
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 3, &s0, 64),
+    GPU_ERR_TEXTURE, "level >= mip_count -> TEXTURE");
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 0, &s0, 63),
+    GPU_ERR_BUFFER, "wrong per-level size -> BUFFER");
+    assert_eq(_backend_native_texture_write_level(0, &tex, 0, &s0, 64),
+    GPU_ERR_OTHER, "null ctx -> OTHER");
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 0, 0, 64),
+    GPU_ERR_BUFFER, "null src -> BUFFER");
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 0, &s0, 0),
+    GPU_ERR_BUFFER, "n<=0 -> BUFFER");
+
+    # Tiled surface: per-level (level>0) upload fails loud (AL.3 work).
+    store32(&tex + NATIVE_TEX_FIELD_SW_MODE, GFX9_SW_MODE_64KB_S);
+    assert_eq(_backend_native_texture_write_level(&ctxbuf, &tex, 1, &s1, 16),
+    GPU_ERR_NOT_IMPLEMENTED, "tiled level>0 fails loud");  #skip-lint
+    return 0;
+}
+
 fn test_native_texture_va_range_distinct() {
     # The texture VA base must not collide with the canonical-high
     # VAs already used by gpu_context_new_native + the consumer
@@ -3728,6 +3788,8 @@ fn main() {
     test_native_texture_size_2d_rgba8_formula();
     test_native_texture_struct_field_offsets();
     test_native_tex_sampleable_accessors();
+    test_native_tex_level_offset_math();
+    test_native_texture_write_level();
     test_native_texture_va_range_distinct();
     test_native_texture_va_allocator();
     test_native_texture_struct_round_trip();

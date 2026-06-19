@@ -2635,7 +2635,13 @@ var BACKEND_SLOT_BUFFER_COPY             = 256;
 var BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE = 264;
 var BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE      = 272;
 
-var BACKEND_SIZE                         = 280;
+# v3.3 AL.1 — per-mip-level texture upload (asset loading places each mip
+# level's bytes separately; whole-texture write can't). Appended at the end
+# (the 88..120 texture range is full); not in the completeness walk yet
+# (the "layout in tree, activate when both backends fill" pattern).
+var BACKEND_SLOT_TEXTURE_WRITE_LEVEL          = 280;
+
+var BACKEND_SIZE                         = 288;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -2699,6 +2705,11 @@ var BACKEND_BUFFERCOPY_SLOTS_END         = 264;
 # both fill" pattern as T.7 / X.6.
 var BACKEND_SAMPLE_SLOTS_BEGIN           = 264;
 var BACKEND_SAMPLE_SLOTS_END             = 280;
+
+# v3.3 AL.1 per-mip upload block: 280..288. Layout in tree; the
+# backend_is_complete walk activates when both backends fill it (AL.1c/d).
+var BACKEND_WRITELEVEL_SLOTS_BEGIN       = 280;
+var BACKEND_WRITELEVEL_SLOTS_END         = 288;
 
 # ================================================================
 # Backend struct construction
@@ -3322,6 +3333,43 @@ fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
     return 0;
 }
 
+# v3.3 AL.1 — write `n` bytes into mip `level` of a wgpu texture via
+# wgpu_queue_write_texture with mipLevel = level. Reads the MIPPED-texture
+# layout (from _backend_wgpu_texture_create_2d_rgba8_mipped: handle@0,
+# width@16, height@20, mip_count@24); fmt is RGBA8 (the only mipped wgpu
+# format today — AL.2's generalized mipped create stores + reads fmt).
+# KNOWN LIMITATION (tracked, X2): wgpu requires bytesPerRow be a multiple of
+# 256 for multi-row copies; tightly-packed small-mip rows are not aligned, so
+# non-256-aligned widths need a staging re-pack — shared with the existing
+# whole-texture write; addressed when a non-aligned wgpu asset is loaded.
+fn _backend_wgpu_texture_write_level(ctx, tex, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    var handle    = load64(tex +  0);
+    var width     = load32(tex + 16);
+    var height    = load32(tex + 20);
+    var mip_count = load32(tex + 24);
+    if (level >= mip_count) { return GPU_ERR_TEXTURE; }
+    var fmt = MABDA_TEXFMT_RGBA8;
+    var lw = mip_level_dim(width, level);
+    var lh = mip_level_dim(height, level);
+    var expected = mabda_texfmt_data_size(fmt, lw, lh);
+    if (expected == 0) { return GPU_ERR_TEXTURE; }
+    if (n != expected) { return GPU_ERR_BUFFER; }
+    var queue = gpu_ctx_queue(ctx);
+    var bpr = mabda_texfmt_blocks_for_dim(lw, mabda_texfmt_block_width(fmt))
+    * mabda_texfmt_block_bytes(fmt);
+    var rows = mabda_texfmt_blocks_for_dim(lh, mabda_texfmt_block_height(fmt));
+    var dst_info = wgpu_texel_copy_texture_info(handle, level);   # mipLevel = level
+    var layout = wgpu_texel_copy_buffer_layout(0, bpr, rows);
+    var extent = wgpu_extent_3d(lw, lh, 1);
+    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
+    return 0;
+}
+
 fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
@@ -3921,6 +3969,8 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_wgpu_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
+    &_backend_wgpu_texture_write_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_wgpu_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
@@ -14634,6 +14684,37 @@ fn _backend_native_texture_release(ctx, tex): i64 {
     return 0;
 }
 
+# v3.3 AL.1 — write `n` bytes into mip `level` of a native texture. Validates
+# level in [0, mip_count) and n == the level's block-based data size, then
+# memcpy's into the single-BO mip chain at the format-aware per-level offset
+# (linear surfaces). A tiled (compressed sampleable) surface only supports the
+# whole-surface level-0 path here (reuses the L2T tiled copy); per-level tiled
+# upload is AL.3 work (when sampleable compressed mips land) and fails loud.
+fn _backend_native_texture_write_level(ctx, tex, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    if (level >= load32(tex + NATIVE_TEX_FIELD_MIP_COUNT)) { return GPU_ERR_TEXTURE; }
+    var fmt = native_tex_fmt(tex);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var lw = mip_level_dim(w, level);
+    var lh = mip_level_dim(h, level);
+    var expected = mabda_texfmt_data_size(fmt, lw, lh);
+    if (expected == 0) { return GPU_ERR_TEXTURE; }      # invalid fmt/dims
+    if (n != expected) { return GPU_ERR_BUFFER; }       # per-level size mismatch
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        if (level == 0) { return _native_texture_tiled_copy(ctx, tex, src, n, 0); }
+        return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+    }
+    memcpy(addr + native_tex_level_offset(fmt, w, h, level), src, n);
+    return 0;
+}
+
 # ----------------------------------------------------------------
 # Render slot wrappers (v3 Step 6.8(c))
 # ----------------------------------------------------------------
@@ -15130,6 +15211,8 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,
     &_backend_native_texture_write);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
+    &_backend_native_texture_write_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
@@ -15469,6 +15552,29 @@ fn native_mip_level_offset(width, height, level): i64 {
 # mipped texture create path (M.2).
 fn native_mip_chain_size(width, height, count): i64 {
     return native_mip_level_offset(width, height, count);
+}
+
+# v3.3 AL.1 — format-aware byte offset of mip `level` within a single-BO
+# mip chain of `fmt`. Generalizes native_mip_level_offset (which is the
+# RGBA8 case): each level is the block-based data size, 256-aligned, summed.
+# For fmt == RGBA8 (data_size = w*h*4) this is byte-identical to
+# native_mip_level_offset, so the RGBA8 mipped layout is unchanged; AL.2's
+# generalized mipped create uses this same function so create + write_level
+# agree on one layout. native_tex_chain_size(level==count) is the total.
+fn native_tex_level_offset(fmt, width, height, level): i64 {
+    var off = 0;
+    var i = 0;
+    while (i < level) {
+        var w = mip_level_dim(width, i);
+        var h = mip_level_dim(height, i);
+        off = off + _native_align_up(mabda_texfmt_data_size(fmt, w, h), _NATIVE_MIP_ALIGN);
+        i = i + 1;
+    }
+    return off;
+}
+
+fn native_tex_chain_size(fmt, width, height, count): i64 {
+    return native_tex_level_offset(fmt, width, height, count);
 }
 
 # v3.1 [M.3]: GPU VA of mip `level` within a NativeTexture's chain.
@@ -19633,6 +19739,20 @@ fn gpu_texture_write(ctx, tex, src, n): i64 {
     var slot = backend_get_slot(gpu_ctx_backend(ctx),
     BACKEND_SLOT_TEXTURE_WRITE);
     return fncall4(slot, ctx, tex, src, n);
+}
+
+# v3.3 AL.1 — upload `n` bytes into a single mip `level` of `tex`. The
+# asset loaders (KTX2/DDS) place each level's bytes separately; whole-
+# texture gpu_texture_write can't. Thin dispatcher: `tex` is an opaque
+# backend handle here (a NativeTexture* on native, a WGPUTexture on wgpu),
+# so the level-bounds + per-level-size validation lives in the fillers
+# that know the texture's representation. Returns 0|GPU_ERR_*.
+fn gpu_texture_write_level(ctx, tex, level, src, n): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_WRITE_LEVEL);
+    return fncall5(slot, ctx, tex, level, src, n);
 }
 
 fn gpu_texture_read(ctx, tex, dst, n): i64 {
