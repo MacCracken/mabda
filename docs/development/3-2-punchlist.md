@@ -945,9 +945,11 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   handles pairs; the load-bearing change is regalloc pair allocation (F.7c).
   - [x] **F.7a** *(2026-06-18)* — front-end f64 type: `MIR_T_F64` + `_mir_lower_type` accepts
     `OpTypeFloat 64` (scalar + vec); `compiler_lower.tcyr` f64 assertions flipped from UNSUPPORTED.
-  - [ ] **F.7b** — `V_*_F64` GFX9 encoders (llvm-mc-verified: V_ADD/SUB/MUL/MIN/MAX/SQRT_F64,
-    CVT_F64_F32/F32_F64, etc.; V_FMA_F64=0x1CC + DWORDX2 already in `gfx9_encode.cyr`) + `GISEL_V_*_F64`
-    + GISEL→GFX9 dispatch; byte-oracle in `compiler_encode.tcyr`.
+  - [x] **F.7b** *(2026-06-18)* — `V_*_F64` GFX9 encoders, llvm-mc gfx900-verified + byte-oracle'd
+    (`compiler_encode.tcyr` `test_gfx9_enc_f64_alu`, +11): VOP3 V_ADD_F64=0x280 / V_MUL_F64=0x281 /
+    V_MIN_F64=0x282 / V_MAX_F64=0x283 + VOP1 CVT_F64_F32=0x10 / CVT_F32_F64=0x0F / CVT_{F64_I32,
+    I32_F64,F64_U32,U32_F64} (V_FMA_F64=0x1CC + DWORDX2 from F.4). No V_SUB_F64/V_ABS_F64 (src-mods);
+    FDiv/FSqrt macros deferred to breadth. GISEL_V_*_F64 enum + GISEL→GFX9 dispatch land with isel (F.7d).
   - [ ] **F.7c** — regalloc **even-aligned 64-bit pairs** (`_ra_claim` width param; `hw += 2`); the
     central mechanism. (ABI RSRC1 formula already pair-correct.)
   - [ ] **F.7d** — isel f64 op routing (`_gisel_float_op(mop, type)`) + DWORDX2 f64 load/store + waitcnt.

@@ -24,8 +24,14 @@ shader-create entry, so the partial back end landing across F.7a–F.7d is unrea
 dispatch — only the `compiler_*.tcyr` tests exercise it).
 - **F.7a** — front-end f64 type: `MIR_T_F64` (`src/mir.cyr`) + `_mir_lower_type` accepts
   `OpTypeFloat 64` (scalar → `MIR_T_F64`, vec2/3/4 f64 → `MIR_T_F64 | (count<<8)`); two
-  `compiler_lower.tcyr` assertions flipped from UNSUPPORTED. (F.7b–F.7e: encoders, regalloc pairs,
-  isel + DWORDX2, then the compiled FMA e2e — pending.)
+  `compiler_lower.tcyr` assertions flipped from UNSUPPORTED.
+- **F.7b** — f64 GFX9 encoders (`src/gfx9_encode.cyr`), all llvm-mc gfx900-verified + byte-oracle'd
+  (`compiler_encode.tcyr` `test_gfx9_enc_f64_alu`, +11 asserts): VOP3 `V_ADD_F64`=0x280 /
+  `V_MUL_F64`=0x281 / `V_MIN_F64`=0x282 / `V_MAX_F64`=0x283, VOP1 conversions `V_CVT_F64_F32`=0x10 /
+  `V_CVT_F32_F64`=0x0F / `V_CVT_{F64_I32,I32_F64,F64_U32,U32_F64}`. (`V_FMA_F64`=0x1CC + DWORDX2
+  load/store already landed in F.4.) GFX9 has no `V_SUB_F64`/`V_ABS_F64` (negate/abs src-mods) and
+  FDiv/FSqrt are multi-instruction macros — deferred to the F.7 breadth bites with their isel logic.
+  (F.7c regalloc pairs, F.7d isel + DWORDX2 routing, F.7e the compiled FMA e2e — pending.)
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**
