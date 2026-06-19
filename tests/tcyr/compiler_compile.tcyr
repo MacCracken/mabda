@@ -368,6 +368,17 @@ fn _isa_has_vfma_f64(isa, len): i64 {
     return 0;
 }
 
+# 1 if the ISA contains a VOP3 dword with opcode `op` (bits 25:16; VOP3 prefix 0x34 in 31:26).
+fn _isa_has_vop3(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 26) == 0x34) { if (((d >> 16) & 0x3FF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
 fn test_gfx9_compile_f64_fma() {
     var buf[800];
     var n = _spv_build_f64_fma(&buf);
@@ -410,9 +421,56 @@ fn test_gfx9_compile_f64_fma() {
     return 0;
 }
 
+# v3.2 F.7f — the f64 arith breadth kernel (out=max(min(a*b+c,b),a)) compiles end-to-end and the
+# ISA contains all four already-wired f64 VOP3 ops: V_MUL_F64 0x281, V_ADD_F64 0x280, V_MIN_F64
+# 0x282, V_MAX_F64 0x283. (HW value-exact: programs/native_spirv_f64_arith_e2e.cyr.)
+fn test_gfx9_compile_f64_arith() {
+    var buf[900];
+    var n = _spv_build_f64_arith(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 33, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 36);   # >= id-bound 33
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 arith compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 4, "4 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x281), 1, "ISA has v_mul_f64 (0x281)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x280), 1, "ISA has v_add_f64 (0x280)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x282), 1, "ISA has v_min_f64 (0x282)");
+    assert_eq(_isa_has_vop3(&isa, len, 0x283), 1, "ISA has v_max_f64 (0x283)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_abi_rsrc();
     test_gfx9_compile_f64_fma();
+    test_gfx9_compile_f64_arith();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_gfx9_compile_uniform_if();

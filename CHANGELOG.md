@@ -68,6 +68,14 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
     `i*esize`. Latent (no kernel uses `array<vecN-f64>` yet — F.7e is scalar f64), but reachable
     since F.7a accepts vec-f64 types; the comprehensive `array<vec-f64>` HW test lands with the
     vec-f64 breadth bite (F.7f+). i32/f32 vec path byte-identical (non-regression).
+- **F.7f.1** — op breadth, the already-wired f64 ops HW-verified: `out=max(min(a*b+c,b),a)` (FADD +
+  FMUL + GLSL FMin + FMax) compiles via `gfx9_compile` and runs on Cezanne **all 8 lanes bit-exact**
+  vs an in-process f64 reference (no offline want[] — each op rounds once, min/max exact, so
+  `f64_add`/`f64_mul` + `f64_lt`/`f64_gt` reproduce it). No `src/` change (the ops were wired in
+  F.7b/d) — `native_spirv_f64_arith_e2e.cyr` + `_spv_build_f64_arith` + a `gfx9_compile` CPU test
+  (v_add/mul/min/max_f64 in the ISA). Lane 6 = `…5C2` (UNFUSED) vs F.7e's `…5C3` (fused) — proof the
+  compiler rounds separate OpFMul+OpFAdd twice. Remaining breadth (CVT, FSub/FAbs, FDiv, FSqrt,
+  compares, inline f64 consts, vec-f64 arrays) is F.7f.2+.
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

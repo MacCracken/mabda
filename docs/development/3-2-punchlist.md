@@ -966,11 +966,16 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     access-chain stride (esize 8) in `_spirv_lower_access_chain` + `_spirv_std430_stride_ok`.
     `native_spirv_f64_fma_e2e.cyr` + `_spv_build_f64_fma` + a `gfx9_compile` CPU test (4 bindings,
     8 user-SGPRs, v_fma_f64 in the ISA). Proves F.7a–d compose end-to-end.
-  - [ ] **F.7f+** — op breadth (HW each): FAdd/FSub/FMul, **FDiv** (f64 reciprocal macro — complex),
-    GLSL sqrt/min/max/abs/clamp, f32↔f64 conversions, f64 compares, inline f64 constants (materialize
-    via two i32 moves — `MIR_VK_CONST` payload is already i64). Also **`array<vecN-f64>` load/store**:
-    the per-component offset fix (`i*esize`) landed in F.7e (review), but needs a dedicated HW e2e
-    (no kernel exercises vec-f64 arrays yet) — verify here with the rest of vec-f64.
+  - [x] **F.7f.1** *(2026-06-18)* — FADD + FMUL + GLSL FMin + FMax (already wired by F.7b/d) HW-verified:
+    `out=max(min(a*b+c,b),a)` compiled + dispatched on Cezanne, all 8 lanes bit-exact vs an in-process
+    f64 reference (f64_add/mul + f64_lt/gt min/max). `native_spirv_f64_arith_e2e.cyr` + `_spv_build_f64_arith`
+    + a `gfx9_compile` CPU test (v_add/mul/min/max_f64 in the ISA). Lane 6 shows UNFUSED (...5C2) vs the
+    F.7e FUSED (...5C3) — separate OpFMul+OpFAdd round twice. (Min/max NaN/±0 conformance: breadth.)
+  - [ ] **F.7f.2+** — remaining op breadth (HW each, each adds src logic): **f32↔f64 CVT** (lower OpFConvert +
+    isel/dispatch the F.7b CVT encoders); **FSub** (V_ADD_F64 + negate src-mod) + **FAbs** (sign-bit clear on
+    the high dword); **FDiv** (f64 reciprocal macro — complex); **FSqrt**; **f64 compares** (V_CMP_*_F64);
+    **inline f64 constants** (materialize via two i32 moves — `MIR_VK_CONST` payload is already i64);
+    **`array<vecN-f64>` load/store** (the `i*esize` offset fix landed F.7e — needs a dedicated HW e2e).
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
     attn11 uses, end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,

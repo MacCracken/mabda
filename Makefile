@@ -320,6 +320,16 @@ build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr
 test-native-spirv-f64-fma-e2e: build/native_spirv_f64_fma_e2e
 	./build/native_spirv_f64_fma_e2e
 
+# v3.2 F.7f — compiled f64 arith breadth (FADD/FMUL/FMIN/FMAX) on Cezanne, bit-exact vs an
+# in-process f64 reference.
+build/native_spirv_f64_arith_e2e: programs/native_spirv_f64_arith_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_arith_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-arith-e2e
+test-native-spirv-f64-arith-e2e: build/native_spirv_f64_arith_e2e
+	./build/native_spirv_f64_arith_e2e
+
 # N.5g: a 2x2 box-filter downsample compiled in-tree + dispatched on the GPU,
 # pixel-matched against a CPU box-filter (the named MVP-exit image kernel; 2
 # bindings src/dst, power-of-2 dims so index math is shifts/masks).
