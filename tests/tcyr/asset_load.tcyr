@@ -345,6 +345,129 @@ fn test_ktx2_load_orchestration() {
     store64(&buf2 + 88, 32);
     store64(&buf2 + 96, 32);
     assert_eq(gpu_texture_load_ktx2(&ctx, &buf2, 168), 0, "ETC2 on native (BC-only) -> 0 (caps gate)");
+    # SECURITY (audit 2026-06-19, CRITICAL): a huge byteOffset must NOT overflow
+    # the bounds check (boff + blen wraps negative for boff near i64_max and
+    # silently passes -> OOB read in write_level). Must reject, never reach write.
+    _dds_wl_count = 0;
+    var buf3[168];
+    _mk_ktx2_hdr(&buf3, 145, 8, 8, 1, 0, 0, 1);    # BC7 8x8, expected level = 64
+    store64(&buf3 + 80, 0x7FFFFFFFFFFFFFFF);        # boff = i64_max (overflow bait)
+    store64(&buf3 + 88, 64);                         # blen = the correct level size
+    store64(&buf3 + 96, 64);                         # ulen = blen
+    assert_eq(gpu_texture_load_ktx2(&ctx, &buf3, 168), 0, "huge byteOffset rejected (no overflow OOB)");
+    assert_eq(_dds_wl_count, 0, "write_level never reached for OOB byteOffset");
+    return 0;
+}
+
+# --- AL.5: PNG load via the chitra dep (real decode + upload routing) ---
+
+# A valid 76-byte 2x2 RGBA8 PNG (colortype 6, depth 8): row0 red,green;
+# row1 blue,white(a=128). Generated offline (zlib + PNG chunks), embedded so
+# chitra actually decodes it. buf must be >= 80 bytes.
+fn _mk_png_2x2(buf) {
+    store64(buf + 0, 0x0A1A0A0D474E5089);
+    store64(buf + 8, 0x524448490D000000);
+    store64(buf + 16, 0x0200000002000000);
+    store64(buf + 24, 0x0DB6720000000608);
+    store64(buf + 32, 0x4144491300000024);
+    store64(buf + 40, 0xF0C0CFF863DA7854);
+    store64(buf + 48, 0x0000340834810C1F);
+    store64(buf + 56, 0x9217519C78094949);
+    store64(buf + 64, 0x444E454900000000);
+    store8(buf + 72, 0xAE);
+    store8(buf + 73, 0x42);
+    store8(buf + 74, 0x60);
+    store8(buf + 75, 0x82);
+    return 0;
+}
+
+var _png_cr_count = 0;
+var _png_cr_w = 0;
+var _png_cr_h = 0;
+var _png_cr_fmt = 0;
+var _png_wr_count = 0;
+var _png_wr_n = 0;
+fn _png_cr_cap(ctx, w, h, fmt) {
+    _png_cr_count = _png_cr_count + 1;
+    _png_cr_w = w;
+    _png_cr_h = h;
+    _png_cr_fmt = fmt;
+    return 0x7E;
+}
+fn _png_wr_cap(ctx, tex, src, n) {
+    _png_wr_count = _png_wr_count + 1;
+    _png_wr_n = n;
+    return 0;
+}
+
+fn test_gpu_texture_load_png_orchestration() {
+    _png_cr_count = 0;
+    _png_wr_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_png_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    var buf[80];
+    _mk_png_2x2(&buf);
+    var tex = gpu_texture_load_png(&ctx, &buf, 76);
+    assert_eq(tex, 0x7E, "load_png returns the created tex");
+    assert_eq(_png_cr_count, 1, "create called once");
+    assert_eq(_png_cr_w, 2, "chitra decoded width 2");
+    assert_eq(_png_cr_h, 2, "chitra decoded height 2");
+    assert_eq(_png_cr_fmt, MABDA_TEXFMT_RGBA8, "create RGBA8");
+    assert_eq(_png_wr_count, 1, "write called once");
+    assert_eq(_png_wr_n, 16, "upload 2*2*4 = 16 RGBA8 bytes");
+    # Garbage bytes -> chitra decode fails -> IMAGE_DECODE -> 0.
+    var bad[16];
+    memset(&bad, 0, 16);
+    assert_eq(gpu_texture_load_png(&ctx, &bad, 16), 0, "garbage PNG -> 0 (decode fail)");
+    assert_eq(gpu_texture_load_png(0, &buf, 76), 0, "null ctx -> 0");
+    return 0;
+}
+
+# AL.6: the magic-byte sniffer routes each container to the right loader.
+fn test_gpu_texture_load_sniffer() {
+    _png_cr_count = 0;
+    _dds_cr_count = 0;
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_png_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    # PNG magic -> load_png (CREATE_2D_FMT, RGBA8).
+    var png[80];
+    _mk_png_2x2(&png);
+    assert_eq(gpu_texture_load(&ctx, &png, 76), 0x7E, "PNG magic loads");
+    assert_eq(_png_cr_count, 1, "PNG routed to load_png");
+    assert_eq(_png_cr_fmt, MABDA_TEXFMT_RGBA8, "PNG -> RGBA8 path");
+    # DDS magic -> load_dds (CREATE_2D_FMT_MIPPED, BC1).
+    var dds[160];
+    _mk_dds_fourcc(&dds, 8, 8, 1, _DDS_FOURCC_DXT1);
+    gpu_texture_load(&ctx, &dds, 160);
+    assert_eq(_dds_cr_count, 1, "DDS routed to load_dds");
+    assert_eq(_dds_cr_fmt, MABDA_TEXFMT_BC1, "DDS -> BC1 path");
+    # KTX2 magic -> load_ktx2 (CREATE_2D_FMT_MIPPED, BC7).
+    var ktx[168];
+    _mk_ktx2_hdr(&ktx, 145, 8, 8, 1, 0, 0, 1);
+    store64(&ktx + 80, 104);
+    store64(&ktx + 88, 64);
+    store64(&ktx + 96, 64);
+    gpu_texture_load(&ctx, &ktx, 168);
+    assert_eq(_dds_cr_count, 2, "KTX2 routed to load_ktx2");
+    assert_eq(_dds_cr_fmt, MABDA_TEXFMT_BC7, "KTX2 -> BC7 path");
+    # Unknown magic / too short -> fail loud.
+    var junk[16];
+    memset(&junk, 0, 16);
+    store32(&junk, 0x12345678);
+    assert_eq(gpu_texture_load(&ctx, &junk, 16), 0, "unknown magic -> 0");
+    assert_eq(gpu_texture_load(&ctx, &junk, 2), 0, "len<4 -> 0");
+    assert_eq(gpu_texture_load(0, &png, 76), 0, "null ctx -> 0");
     return 0;
 }
 
@@ -364,6 +487,8 @@ fn main() {
     test_ktx2_parse();
     test_ktx2_parse_rejects();
     test_ktx2_load_orchestration();
+    test_gpu_texture_load_png_orchestration();
+    test_gpu_texture_load_sniffer();
     assert_summary();
     return 0;
 }

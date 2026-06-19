@@ -211,28 +211,65 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.5 — PNG integration (3.3.6) [M]
 
-- [ ] **AL.5a** — `cyrius.cyml`: `[deps.chitra] git=… tag="0.1.0"
-  modules=["dist/chitra.cyr"]`; `cyrius deps` resolves `lib/chitra.cyr`. Smoke.
-- [ ] **AL.5b** — `src/lib.cyr`: `include "lib/chitra.cyr"`. Include-order link.
-- [ ] **AL.5c** — `asset_load.cyr`: `gpu_texture_load_png(ctx, bytes, len)` →
-  `chitra_png_decode` → `create_2d(RGBA8)` + `write` (w*h*4) → `chitra_image_
-  free`; decode-fail → `GPU_ERR_IMAGE_DECODE = 22`. Mock-backend byte-count test.
-- [ ] **AL.5d** — `gpu_texture_load_png_mipped` → mipped RGBA8 create + write
-  level 0 + `generate_mipmaps`; **surface wgpu's `GPU_ERR_NOT_IMPLEMENTED`
-  honestly** (no silent single-level fallback). Tests.
-- [ ] **AL.5e** — `_result` variants. Ok/Err discrimination test.
+- [x] **AL.5 (2026-06-19)** — PNG integration via the chitra dep, complete.
+  - **AL.5a/b** — `[deps.chitra] git=… tag="0.1.0" modules=["dist/chitra.cyr"]`
+    (resolves via HTTPS — `cyrius deps` fetched `lib/chitra.cyr`, you'd pushed
+    0.1.0). **Transitive deps:** chitra's bundle excludes its stdlib deps, so
+    mabda added `thread` + `sankoch` to `[deps].stdlib` and `include`s them
+    before `lib/chitra.cyr` (else chitra's `crc32`/`zlib_decompress` are
+    undefined). 35 deps locked; smoke clean (cyrius `include` is idempotent — no
+    double-mmap from thread self-including it).
+  - **AL.5c** — `gpu_texture_load_png`/`_result`: `chitra_png_decode_rgba8` →
+    `create_2d(RGBA8)` + `write(w*h*4)`; decode-fail → `GPU_ERR_IMAGE_DECODE`
+    (**reused the existing id 10**, not a new 22 — the punchlist's 22 was stale).
+    No `chitra_image_free` needed — the rgba8 convenience returns a raw
+    bump-allocated pixel ptr (no ChitraImage handle to free).
+  - **AL.5d** — `gpu_texture_load_png_mipped`/`_result`: mipped RGBA8 create +
+    `write_level 0` + `generate_mipmaps`; **wgpu's not-implemented is surfaced
+    via Err** (no silent single-level fallback); native generates.
+  - **Test**: a real 76-byte 2×2 RGBA8 PNG embedded + decoded through chitra for
+    real (w/h/byte-count verified) via a mock backend; garbage → IMAGE_DECODE;
+    null ctx → 0. asset_load 119→128 (+9). Suite 4255→4264; distlib idempotent.
+  - **CONSUMER NOTE (for AL.6c/ship):** mabda's dist now references chitra (+
+    sankoch/thread) fns — like the samvada pattern, **consumers must add
+    `[deps.chitra]` + `thread`/`sankoch`** to their builds. Document in the
+    consumer-integration step.
 
 ## Phase AL.6 — Sniffer + e2e + closeout (3.3.7) [M]
 
-- [ ] **AL.6a** — `gpu_texture_load(ctx, bytes, len)` magic-byte dispatch
-  (`89 50 4E 47`→png, `0xAB KTX`→ktx2, `DDS `→dds; else `CONTAINER_PARSE`). Tests.
-- [ ] **AL.6b** — HW-gated programs (Cezanne): `native_load_png_e2e` (PNG →
-  native RGBA8 → sample → pixel-verify), `load_ktx2_e2e` (BC7), `load_dds_e2e`.
-  Flagged HW-gated, shipped.
-- [ ] **AL.6c** — Closeout: `make test` (new `tests/tcyr/asset_load.tcyr`
-  asserts; count via `scripts/count-test-assertions.sh` — the texture.tcyr NUL
-  trap), distlib diff-clean (mabda + the chitra dep), version-check, CHANGELOG,
-  roadmap, audit index. Cut 3.3.7.
+- [x] **AL.6a (2026-06-19)** — `gpu_texture_load`/`_result` magic-byte sniffer:
+  first u32 routes PNG (`0x474E5089`) / KTX2 (`_KTX2_ID0`) / DDS (`_DDS_MAGIC`)
+  to the matching loader; unknown magic / `len < 4` → `GPU_ERR_CONTAINER_PARSE`
+  (each loader re-validates its own full signature). Test routes all three (BC1/
+  BC7/RGBA8 create-path captured per loader) + unknown/short/null rejects.
+  asset_load 128→138; suite 4264→4274.
+- [x] **AL.6b (2026-06-19) — `native_load_png_e2e` HW-VERIFIED on Cezanne.**
+  `programs/native_load_png_e2e.cyr` + `tests/assets/load_test_64.png` (a 64×64
+  RGBA8 PNG, pixel (x,y)=(x,y,0xC0,0xFF)) + `make test-native-load-png-e2e`:
+  reads the real `.png`, `gpu_texture_load_png` (chitra decode → upload), samples
+  via the public render path, **`RT[x,y] == decoded PNG[x,y]` pixel-exact**. The
+  whole file→decode→upload→sample chain runs correctly on real silicon.
+  - **DESIGN ITEM RESOLVED:** `gpu_texture_load_png` now uses
+    `gpu_texture_create_2d_sampleable` (the TS.5-verified RGBA8 sample path —
+    `gpu_texture_write` populates it), NOT plain `create_2d` (LINEAR, not
+    sampleable on native). HW-confirmed.
+  - **e2e-harness gotcha found:** a 32-wide RGBA8 RT has a **padded row pitch**
+    (GFX9 color align → 256B), so the first attempt's `(py*W+px)*4` readback
+    read padding for py≥1 (row 0 matched, proving the sample was already
+    correct). Fixed by using 64×64 (pitch == W*4 == 256, no padding — TS.5's
+    proven geometry). A mabda-side bug-free finding; the loader was right.
+  - **`load_ktx2_e2e` / `load_dds_e2e` (compressed) — GATED + tracked:** the
+    DDS/KTX2 loaders build mipped textures via `create_2d_fmt_mipped` (LINEAR);
+    native *sampling* of compressed mips needs the tiled compressed-mipped path
+    (AL.2 ships linear storage — deferred, tracked). CPU parse + load
+    orchestration are unit-verified; wgpu samples all three. The native
+    compressed-sample e2e lands when the tiled path does.
+- [ ] **AL.6c** — Closeout: `make test` (count via
+  `scripts/count-test-assertions.sh` — the texture.tcyr NUL trap), distlib
+  idempotent (mabda src; the chitra dep is external like samvada — **consumers
+  must add `[deps.chitra]` + `thread`/`sankoch`**), version-check, CHANGELOG,
+  roadmap, audit index. **Cut 3.3.0** (the v3.3 asset-loading release; AL.0–AL.6
+  land as one cut, mirroring how 3.2.12 shipped a whole phase).
 
 ---
 

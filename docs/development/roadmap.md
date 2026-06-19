@@ -62,8 +62,8 @@ cross-vendor default.
                         native sampling + SPIR-V + native SPIR-V→GFX9
                         compiler + f64 + render-graph multi-queue
                         (3.2.0–3.2.14) — arc done
-  v3.3   [ACTIVE]  ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
-                        new chitra package); arrays/cubes + JPEG → v3.4+
+  v3.3   [SHIPPED] ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
+                        new chitra package), 3.3.0; arrays/cubes + JPEG → v3.4+
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
                         retires (AMD consumers run on AMD native only)
@@ -115,6 +115,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.3.0](../../CHANGELOG.md#330--2026-06-19) | Asset loading (Phase AL) — DDS + KTX2 loaders (in mabda) + PNG via the chitra package + magic-byte sniffer; native PNG path HW-verified, 1 CRITICAL parser bug found+fixed pre-cut |
 | [3.2.14](../../CHANGELOG.md#3214--2026-06-19) | Render-graph multi-queue executor (Phase R) — native nodes on distinct rings, HW-verified; **closes the v3.2.x arc** |
 | [3.2.13](../../CHANGELOG.md#3213--2026-06-19) | Render-graph multi-queue foundations (Phase R) — node queue affinity + scheduler + native render-timeline dispatch |
 | [3.2.12](../../CHANGELOG.md#3212--2026-06-19) | Native f64 compute (Phase F) — SPIR-V→GFX9 emits `V_*_F64`, bit-exact on Cezanne |
@@ -163,13 +164,18 @@ consumer request arrives. Listed so they don't get lost.
 
 ---
 
-## v3.3 — Asset Loading (ACTIVE)
+## v3.3 — Asset Loading (SHIPPED — 3.3.0, 2026-06-19)
 
-mabda can create + sample textures but cannot yet **load** one from a
-file / byte buffer. v3.3 closes that with three loaders behind one split —
+mabda could create + sample textures but could not **load** one from a
+file / byte buffer. v3.3 closed that with three loaders behind one split —
 **decode is CPU (in a package); container-parse + GPU upload is in mabda.**
-Planned 2026-06-19 (`33x` branch, toolchain 6.2.23); see the **punchlist** +
-two **proposals**:
+Shipped 2026-06-19 (`33x` branch, toolchain 6.2.23) as a single **3.3.0** cut
+(AL.0–AL.6); native PNG path **HW-verified on Cezanne**
+(`native_load_png_e2e`: file → chitra decode → upload → sample → pixel-exact).
+A pre-cut adversarial security review of the untrusted-input parsers found +
+fixed **1 CRITICAL** (KTX2 `byteOffset` signed-overflow OOB) — see
+[`docs/audit/2026-06-19-asset-loading-audit.md`](../audit/2026-06-19-asset-loading-audit.md).
+See the **punchlist** + two **proposals**:
 
 - Punchlist: [`3-3-punchlist.md`](3-3-punchlist.md)
 - Asset loading (mabda): [`v3.3-asset-loading.md`](../proposals/v3.3-asset-loading.md)
