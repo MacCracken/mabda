@@ -937,9 +937,27 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   (55 spirv-as words). `programs/f64_compute_e2e.cyr` (HW: ShaderF64 on, f64 module creates via
   naga, passthrough skipped-unsupported, caps 0) + `backend.tcyr` +2 tests. Folds in the former F.8c.
   See [[project_wgpu_f64_via_shaderf64_not_passthrough]].
-- [ ] **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V
-  through the Phase N emitter (`V_*_F64`); per-op f64 conformance. Flip `MABDA_NATIVE_F64`→1
-  ONLY when f64 runs end-to-end for every op attn11 uses — a partial emitter keeps it 0 (review F.2 #2).
+- **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V through the SPIR-V→GFX9
+  compiler (`V_*_F64`). Central new concept: **64-bit register pairs** (even-aligned) as `MIR_T_F64`
+  threaded MIR→isel→regalloc→encode. Milestone-first, then breadth; flip `MABDA_NATIVE_F64`→1 ONLY
+  when f64 runs end-to-end for every op attn11 uses — partial back end stays 0 (review F.2 #2). The
+  9-module understand map (2026-06-18) confirmed the ABI/RSRC1 `ceil(vgpr_hw/4)-1` formula already
+  handles pairs; the load-bearing change is regalloc pair allocation (F.7c).
+  - [x] **F.7a** *(2026-06-18)* — front-end f64 type: `MIR_T_F64` + `_mir_lower_type` accepts
+    `OpTypeFloat 64` (scalar + vec); `compiler_lower.tcyr` f64 assertions flipped from UNSUPPORTED.
+  - [ ] **F.7b** — `V_*_F64` GFX9 encoders (llvm-mc-verified: V_ADD/SUB/MUL/MIN/MAX/SQRT_F64,
+    CVT_F64_F32/F32_F64, etc.; V_FMA_F64=0x1CC + DWORDX2 already in `gfx9_encode.cyr`) + `GISEL_V_*_F64`
+    + GISEL→GFX9 dispatch; byte-oracle in `compiler_encode.tcyr`.
+  - [ ] **F.7c** — regalloc **even-aligned 64-bit pairs** (`_ra_claim` width param; `hw += 2`); the
+    central mechanism. (ABI RSRC1 formula already pair-correct.)
+  - [ ] **F.7d** — isel f64 op routing (`_gisel_float_op(mop, type)`) + DWORDX2 f64 load/store + waitcnt.
+  - [ ] **F.7e** — *(HW)* compile + dispatch an f64 FMA SPIR-V kernel on Cezanne, value-exact vs CPU —
+    **first compiled f64 on silicon** (proves F.7a–d compose).
+  - [ ] **F.7f+** — op breadth (HW each): FAdd/FSub/FMul, **FDiv** (f64 reciprocal macro — complex),
+    GLSL sqrt/min/max/abs/clamp, f32↔f64 conversions, f64 compares, inline f64 constants (materialize
+    via two i32 moves — `MIR_VK_CONST` payload is already i64).
+  - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
+    attn11 uses, end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,
   bit-faithful vs the CPU f64 oracle). Acceptance proof.
 - [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow

@@ -15,6 +15,18 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
+### Added — Phase F.7 (general native f64 via the SPIR-V→GFX9 compiler — IN PROGRESS)
+The big native-f64 lift: teach the in-tree compiler to emit `V_*_F64`. The central new concept
+is **64-bit register pairs** (even-aligned `v[2:3]`) threaded as `MIR_T_F64` through MIR → isel →
+regalloc → encode. Milestone-first (compiled f64 FMA on Cezanne), then op breadth; production stays
+gated by `MABDA_NATIVE_F64 = 0` until f64 runs end-to-end for every op attn11 uses (the gate is the
+shader-create entry, so the partial back end landing across F.7a–F.7d is unreachable by any real
+dispatch — only the `compiler_*.tcyr` tests exercise it).
+- **F.7a** — front-end f64 type: `MIR_T_F64` (`src/mir.cyr`) + `_mir_lower_type` accepts
+  `OpTypeFloat 64` (scalar → `MIR_T_F64`, vec2/3/4 f64 → `MIR_T_F64 | (count<<8)`); two
+  `compiler_lower.tcyr` assertions flipped from UNSUPPORTED. (F.7b–F.7e: encoders, regalloc pairs,
+  isel + DWORDX2, then the compiled FMA e2e — pending.)
+
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**
   HW investigation on Cezanne found wgpu-native exposes a real `WGPUNativeFeature_ShaderF64`
