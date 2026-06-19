@@ -1099,10 +1099,17 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     (the encoder + MIR op + emit already existed from F.7f.7a/c). `out=ldexp(a,3)=a·8` bit-exact on all
     8 lanes — `native_spirv_f64_ldexp_e2e.cyr` + a compile test. Consumers get 2^k for hand-rolled exp.
     (f32 Ldexp unwired — no native consumer; wgpu covers f32.)
-  - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the conformant op set attn11's hand-rolled f64
-    kernels need is HW-verified: {add,sub,mul,div,sqrt,fma,cmp,cvt(i32↔f64 + f32↔f64),const,ldexp}.
-- [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,
-  bit-faithful vs the CPU f64 oracle). Acceptance proof.
+  - [x] **F.7-flip** *(2026-06-19)* — **`MABDA_NATIVE_F64 = 1`**. The conformant op set attn11's
+    hand-rolled f64 kernels need is HW-verified on Cezanne: {add,sub,mul,div,sqrt,fma,cmp,select,
+    cvt(i32↔f64 + f32↔f64),const,ldexp}. The `_backend_native_shader_module_create` f64 gate now opens
+    and `gpu_caps_native_shader_f64()` honestly returns 1. (Tests at `core.tcyr` updated to the post-
+    flip state.) Consumers hand-roll exp/ln/tanh/pow from the toolkit (GLSL transcendentals are f32-only).
+- [x] **F.9** *(2026-06-19)* — **attn11 consumer smoke via the PUBLIC API, HW-verified on Cezanne**:
+  `out[i] = (x[i] - mean[i]) / sqrt(var[i] + 1e-5)` (a real layernorm-normalize step — FSub + FAdd +
+  f64 OpConstant + OpExtInst Sqrt + OpFDiv) compiled + dispatched entirely through
+  `gpu_shader_module_create_spirv` → `gpu_compute_dispatch` (not internal gfx9_compile), **bit-exact**
+  on all 8 lanes vs the step-by-step in-process f64 reference — `native_spirv_f64_layernorm_e2e.cyr`.
+  Proves the f64 toolkit works end-to-end through the public surface as a consumer uses it.
 - [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow
   correcting the `SHADER_F64` framing**; cut.
 
