@@ -26,14 +26,17 @@
 #
 # Struct layouts:
 #
-# RenderGraph (40 bytes):
+# RenderGraph (48 bytes — grew 40→48 at v3.2.13 R.3, append-only):
 #   +0:  nodes         (vec ptr, 8)   — vec of Node*
 #   +8:  transients    (vec ptr, 8)   — vec of TransientResource*
 #   +16: built_flag    (i64)          — 0 before rg_build, 1 after
 #   +24: aliasing_flag (i64)          — 0 off (default), 1 on
 #   +32: label         (cstr, 8)
+#   +40: schedule      (ptr, 8)       — Schedule* (per-queue batches +
+#                                       cross-queue fence edges), 0 before
+#                                       rg_schedule. See the scheduler block.
 #
-# Node (72 bytes):
+# Node (80 bytes — grew 72→80 at v3.2.13 R.1, append-only):
 #   +0:  kind            (i64 — NODE_* enum)
 #   +8:  payload         (ptr, 8 — per-kind struct)
 #   +16: reads           (vec ptr, 8 — i64 res_ids)
@@ -41,7 +44,13 @@
 #   +32: label           (cstr, 8)
 #   +40: in_degree       (i64 — toposort scratch)
 #   +48: sort_idx        (i64 — index after rg_build; -1 if unsorted)
-#   +56: reserved (16)
+#   +56: queue_kind      (i64 — QUEUE_KIND_* affinity; reuses 8 of the
+#                         old reserved-16 tail. Default per node kind:
+#                         compute→QUEUE_KIND_COMPUTE, render/copy→
+#                         QUEUE_KIND_GRAPHICS — the v3.0 "default queue
+#                         per op kind" rule. rg_node_queue overrides it.)
+#   +64: batch_idx       (i64 — scheduler scratch: which per-queue batch
+#                         this node lands in; -1 before rg_schedule. R.3.)
 #
 # ComputePayload (32 bytes):
 #   +0:  pipeline    (WGPUComputePipeline struct ptr from compute.cyr)
@@ -106,8 +115,8 @@ var RES_TEXTURE = 2;
 # ================================================================
 
 fn rg_new(): i64 {
-    var g = alloc(40);
-    memset(g, 0, 40);
+    var g = alloc(48);
+    memset(g, 0, 48);
     store64(g + 0,  vec_new());
     store64(g + 8,  vec_new());
     return g;
@@ -192,6 +201,31 @@ fn rg_node_writes(g, node_id, res_id): i64 {
     var node = vec_get(load64(g + 0), node_id);
     vec_push(load64(node + 24), res_id);
     return 0;
+}
+
+# Declare the queue a node runs on (v3.2.13 R.1). `kind` is a
+# QUEUE_KIND_* value (GRAPHICS / COMPUTE / TRANSFER). Omitting this call
+# keeps the per-kind default (compute→COMPUTE, render/copy→GRAPHICS),
+# which reproduces v2.5 ordering. Must be called before rg_build. On the
+# wgpu backend affinity is informational (one device queue); on native
+# it routes the node to the matching HW ring (consumed by the R.2/R.3
+# scheduler). Returns 0 on success, 1 on a bad node_id or kind.
+fn rg_node_queue(g, node_id, kind): i64 {
+    if (node_id < 0) { return 1; }
+    if (node_id >= rg_node_count(g)) { return 1; }
+    if (kind < 0) { return 1; }
+    if (kind >= QUEUE_KIND_COUNT) { return 1; }
+    var node = vec_get(load64(g + 0), node_id);
+    store64(node + 56, kind);
+    return 0;
+}
+
+# Accessor: the queue affinity assigned to a node (QUEUE_KIND_*).
+# Returns -1 on a bad node_id.
+fn rg_node_queue_get(g, node_id): i64 {
+    if (node_id < 0) { return 0 - 1; }
+    if (node_id >= rg_node_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 0), node_id) + 56);
 }
 
 # Transient resources — the graph owns them between rg_build and
@@ -660,6 +694,274 @@ fn rg_transient_last_use(g, res_id): i64 {
 }
 
 # ================================================================
+# Scheduler — v3.2.13 Phase R (R.2 + R.3): the pass between rg_build
+# and the multi-queue executor.
+# ================================================================
+# rg_schedule walks the (already topo-sorted) nodes and produces a
+# Schedule: the per-queue node batches (R.3) and the cross-queue fence
+# edges (R.2). It is pure graph math over the in-memory model — no FFI,
+# no HW — so every step is CPU-assertable.
+#
+# Submission-order note (important for the R.4 native executor): the
+# executor submits nodes in GLOBAL sort_idx order (the nodes vec order
+# after rg_build), NOT batch-by-batch. Walking global sort_idx order is
+# the toposort guarantee that every producer is submitted before its
+# consumer — which the per-batch "ascending min-sort_idx" order in the
+# proposal does NOT guarantee (an independent early node sharing a queue
+# with a late consumer would submit the consumer's batch before a
+# producer on another queue). The batches here exist for per-queue
+# grouping (which queues to gpu_queue_get / gpu_queue_wait_idle) and the
+# R.3 "submit batching" deliverable; the fence edges carry the real
+# cross-queue ordering. (Deviation from the proposal's step 3, recorded
+# in docs/development/3-2-punchlist.md Phase R.)
+#
+# Schedule (24 bytes):
+#   +0:  batches    (vec ptr) — vec of Batch*, in ascending min-sort_idx
+#                               order (= first-seen order, since nodes are
+#                               walked in sort_idx order).
+#   +8:  fences     (vec ptr) — vec of FenceEdge* (cross-queue edges).
+#   +16: node_count (i64)     — total nodes scheduled (sanity / tests).
+var SCHED_OFF_BATCHES   = 0;
+var SCHED_OFF_FENCES    = 8;
+var SCHED_OFF_NODECOUNT = 16;
+var SCHED_SIZE          = 24;
+
+# Batch (24 bytes):
+#   +0:  queue_kind (i64 — QUEUE_KIND_*)
+#   +8:  nodes      (vec ptr — Node*, in sort_idx order within the queue)
+#   +16: min_sort   (i64 — smallest sort_idx in the batch; submit-order key)
+var BATCH_OFF_QUEUE   = 0;
+var BATCH_OFF_NODES   = 8;
+var BATCH_OFF_MINSORT = 16;
+var BATCH_SIZE        = 24;
+
+# FenceEdge (32 bytes) — a writer→reader dependency whose endpoints sit
+# on different queues. The R.4 executor turns each into a
+# gpu_queue_barrier(producer_queue → consumer_queue) recorded before the
+# consumer node's submit.
+#   +0:  producer_queue (i64 — QUEUE_KIND_*)
+#   +8:  producer_node  (i64 — producer sort_idx)
+#   +16: consumer_queue (i64 — QUEUE_KIND_*)
+#   +24: consumer_node  (i64 — consumer sort_idx)
+var FENCE_OFF_PQ = 0;
+var FENCE_OFF_PN = 8;
+var FENCE_OFF_CQ = 16;
+var FENCE_OFF_CN = 24;
+var FENCE_SIZE   = 32;
+
+var RG_OFF_SCHEDULE = 40;
+
+# Find the index of the batch for `qk` in `batches`, or -1 if none.
+fn _rg_batch_index_for(batches, qk): i64 {
+    var k = 0;
+    while (k < vec_len(batches)) {
+        if (load64(vec_get(batches, k) + BATCH_OFF_QUEUE) == qk) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+# Does any resource in `writes` also appear in `reads`? (a writer→reader
+# dependency between two nodes). 1 = yes, 0 = no.
+fn _rg_nodes_share_dep(writes, reads): i64 {
+    var wc = vec_len(writes);
+    var rc = vec_len(reads);
+    var wi = 0;
+    while (wi < wc) {
+        var res = vec_get(writes, wi);
+        var ri = 0;
+        while (ri < rc) {
+            if (vec_get(reads, ri) == res) { return 1; }
+            ri = ri + 1;
+        }
+        wi = wi + 1;
+    }
+    return 0;
+}
+
+# Has a fence edge for this (producer_node, consumer_node) pair already
+# been recorded? (dedup — two shared resources between the same pair are
+# one cross-queue dependency). 1 = exists, 0 = new.
+fn _rg_fence_exists(fences, pn, cn): i64 {
+    var k = 0;
+    while (k < vec_len(fences)) {
+        var fe = vec_get(fences, k);
+        if (load64(fe + FENCE_OFF_PN) == pn) {
+            if (load64(fe + FENCE_OFF_CN) == cn) { return 1; }
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Build the Schedule. Requires rg_build first (returns 1 if unbuilt).
+# Idempotent: a second call short-circuits to success. # @public
+fn rg_schedule(g): i64 {
+    if (rg_is_built(g) == 0) { return 1; }
+    if (load64(g + RG_OFF_SCHEDULE) != 0) { return 0; }
+
+    var nodes = load64(g + 0);
+    var n = vec_len(nodes);
+
+    var sched = alloc(SCHED_SIZE);
+    memset(sched, 0, SCHED_SIZE);
+    var batches = vec_new();
+    var fences  = vec_new();
+    store64(sched + SCHED_OFF_BATCHES, batches);
+    store64(sched + SCHED_OFF_FENCES, fences);
+    store64(sched + SCHED_OFF_NODECOUNT, n);
+
+    # --- R.3: per-queue batch assignment. Nodes are in sort_idx order in
+    #     the vec after rg_build, so first-seen order of each queue kind is
+    #     its minimum sort_idx → batches come out in ascending min-sort.
+    var i = 0;
+    while (i < n) {
+        var node = vec_get(nodes, i);
+        var qk = load64(node + 56);
+        var bidx = _rg_batch_index_for(batches, qk);
+        if (bidx == 0 - 1) {
+            var b = alloc(BATCH_SIZE);
+            memset(b, 0, BATCH_SIZE);
+            store64(b + BATCH_OFF_QUEUE, qk);
+            store64(b + BATCH_OFF_NODES, vec_new());
+            store64(b + BATCH_OFF_MINSORT, load64(node + 48));
+            bidx = vec_len(batches);
+            vec_push(batches, b);
+        }
+        var batch = vec_get(batches, bidx);
+        vec_push(load64(batch + BATCH_OFF_NODES), node);
+        store64(node + 64, bidx);
+        i = i + 1;
+    }
+
+    # --- R.2: cross-queue edge classification. Re-scan writer→reader
+    #     dependencies (same inference rg_build uses). A reader always
+    #     follows its writer in sort_idx order, so we only look forward.
+    #     Same-queue edges are satisfied by submit order; cross-queue
+    #     edges become fence edges (deduped per producer/consumer pair).
+    var writer_i = 0;
+    while (writer_i < n) {
+        var writer = vec_get(nodes, writer_i);
+        var wq = load64(writer + 56);
+        var writes = load64(writer + 24);
+        var reader_i = writer_i + 1;
+        while (reader_i < n) {
+            var reader = vec_get(nodes, reader_i);
+            var rq = load64(reader + 56);
+            if (wq != rq) {
+                if (_rg_nodes_share_dep(writes, load64(reader + 16)) == 1) {
+                    if (_rg_fence_exists(fences, writer_i, reader_i) == 0) {
+                        var fe = alloc(FENCE_SIZE);
+                        store64(fe + FENCE_OFF_PQ, wq);
+                        store64(fe + FENCE_OFF_PN, writer_i);
+                        store64(fe + FENCE_OFF_CQ, rq);
+                        store64(fe + FENCE_OFF_CN, reader_i);
+                        vec_push(fences, fe);
+                    }
+                }
+            }
+            reader_i = reader_i + 1;
+        }
+        writer_i = writer_i + 1;
+    }
+
+    store64(g + RG_OFF_SCHEDULE, sched);
+    return 0;
+}
+
+# 1 if rg_schedule has run on this graph, else 0.
+fn rg_is_scheduled(g): i64 {
+    if (load64(g + RG_OFF_SCHEDULE) == 0) { return 0; }
+    return 1;
+}
+
+# --- Schedule accessors (post-rg_schedule). All return 0 / -1 on a bad
+#     index or an unscheduled graph rather than dereferencing null. ---
+
+fn _rg_sched(g): i64 { return load64(g + RG_OFF_SCHEDULE); }
+
+# Number of per-queue batches (distinct queues used by the graph).
+fn rg_schedule_batch_count(g): i64 {
+    var s = _rg_sched(g);
+    if (s == 0) { return 0; }
+    return vec_len(load64(s + SCHED_OFF_BATCHES));
+}
+
+fn _rg_batch_at(g, bi): i64 {
+    var s = _rg_sched(g);
+    if (s == 0) { return 0; }
+    var batches = load64(s + SCHED_OFF_BATCHES);
+    if (bi < 0) { return 0; }
+    if (bi >= vec_len(batches)) { return 0; }
+    return vec_get(batches, bi);
+}
+
+# Queue kind of batch `bi` (-1 on bad index / unscheduled).
+fn rg_schedule_batch_queue(g, bi): i64 {
+    var b = _rg_batch_at(g, bi);
+    if (b == 0) { return 0 - 1; }
+    return load64(b + BATCH_OFF_QUEUE);
+}
+
+# Node count in batch `bi` (0 on bad index).
+fn rg_schedule_batch_node_count(g, bi): i64 {
+    var b = _rg_batch_at(g, bi);
+    if (b == 0) { return 0; }
+    return vec_len(load64(b + BATCH_OFF_NODES));
+}
+
+# Minimum sort_idx in batch `bi` — the submit-order key (-1 on bad index).
+fn rg_schedule_batch_min_sort(g, bi): i64 {
+    var b = _rg_batch_at(g, bi);
+    if (b == 0) { return 0 - 1; }
+    return load64(b + BATCH_OFF_MINSORT);
+}
+
+# Number of cross-queue fence edges.
+fn rg_schedule_fence_count(g): i64 {
+    var s = _rg_sched(g);
+    if (s == 0) { return 0; }
+    return vec_len(load64(s + SCHED_OFF_FENCES));
+}
+
+fn _rg_fence_at(g, fi): i64 {
+    var s = _rg_sched(g);
+    if (s == 0) { return 0; }
+    var fences = load64(s + SCHED_OFF_FENCES);
+    if (fi < 0) { return 0; }
+    if (fi >= vec_len(fences)) { return 0; }
+    return vec_get(fences, fi);
+}
+
+fn rg_schedule_fence_producer_queue(g, fi): i64 {
+    var f = _rg_fence_at(g, fi);
+    if (f == 0) { return 0 - 1; }
+    return load64(f + FENCE_OFF_PQ);
+}
+fn rg_schedule_fence_producer_node(g, fi): i64 {
+    var f = _rg_fence_at(g, fi);
+    if (f == 0) { return 0 - 1; }
+    return load64(f + FENCE_OFF_PN);
+}
+fn rg_schedule_fence_consumer_queue(g, fi): i64 {
+    var f = _rg_fence_at(g, fi);
+    if (f == 0) { return 0 - 1; }
+    return load64(f + FENCE_OFF_CQ);
+}
+fn rg_schedule_fence_consumer_node(g, fi): i64 {
+    var f = _rg_fence_at(g, fi);
+    if (f == 0) { return 0 - 1; }
+    return load64(f + FENCE_OFF_CN);
+}
+
+# The batch index a node landed in (-1 before rg_schedule or bad id).
+fn rg_node_batch_idx(g, node_id): i64 {
+    if (node_id < 0) { return 0 - 1; }
+    if (node_id >= rg_node_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 0), node_id) + 64);
+}
+
+# ================================================================
 # Execute — encode every node into one command encoder, submit once.
 # ================================================================
 
@@ -711,6 +1013,142 @@ fn rg_execute(g, device, queue): i64 {
 }
 
 # ================================================================
+# Execute (multi-queue aware) — v3.2.13–14 Phase R.
+# ================================================================
+# rg_execute_mq(g, ctx) is the ctx-taking, queue-aware executor. It runs
+# rg_schedule (R.2/R.3) then routes by backend: native AMD takes the real
+# multi-queue executor (_rg_execute_native_mq — per-ring timeline submits +
+# cross-ring fence edges, R.4–R.6); wgpu (one device queue) stays on the v2.5
+# single-encoder/single-submit path, serialized-equivalent with the identical
+# command stream (affinity honored as ordering only). Returns 0 on success,
+# non-zero on error (GPU_ERR_* on native, 1 on wgpu). # @public
+#
+# Dispatch one node natively, reinterpreting its byte-polymorphic payload as
+# native objects — the same backend-boundary polymorphism gpu_shader_module_create
+# uses (wgpu reads WGSL bytes, native reads GFX9 ISA). The node's queue is
+# already stashed as current, so each backend dispatch slot routes through its
+# timeline (async) path onto that ring. Returns 0|GPU_ERR_*.
+fn _rg_native_dispatch_node(ctx, node): i64 {
+    var kind = load64(node + 0);
+    var pl = load64(node + 8);
+    if (kind == NODE_COMPUTE) {
+        # ComputePayload natively: +0 shader module, +8 buffer-pair, +16/20/24 dims.
+        return gpu_compute_dispatch(ctx, load64(pl + 0),
+        load32(pl + 16), load32(pl + 20), load32(pl + 24), load64(pl + 8));
+    }
+    if (kind == NODE_RENDER) {
+        # RenderPayload natively: +0 NativePass, +8 NativeRenderPipeline, +16
+        # draw_verts. The render_pass_draw slot is queue-aware (R.6), so with a
+        # current queue stashed it routes through native_render_dispatch_timeline.
+        var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_PASS_DRAW);
+        if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+        return fncall5(slot, ctx, load64(pl + 0), load64(pl + 8), load64(pl + 16), 1);
+    }
+    if (kind == NODE_COPY_BUF_BUF) {
+        # CopyBufBufPayload natively: +0 src NativeBuf, +16 dst NativeBuf, +32
+        # size. The native whole-buffer copy slot has no offset args, so a
+        # non-zero src/dst offset fails loud rather than silently mis-copying.
+        # The copy node must be TRANSFER-affined (the SDMA ring); a GFX/COMPUTE
+        # queue is rejected inside the buffer_copy slot (GPU_ERR_TRANSFER).
+        if (load64(pl + 8) != 0)  { return GPU_ERR_BUFFER; }
+        if (load64(pl + 24) != 0) { return GPU_ERR_BUFFER; }
+        return gpu_queue_transfer_copy(ctx, gpu_ctx_current_queue(ctx),
+        load64(pl + 0), load64(pl + 16), load64(pl + 32));
+    }
+    # NODE_COPY_TEX_BUF has no native MQ-graph path yet — fail loud (tracked in
+    # docs/development/3-2-punchlist.md Phase R), never silent-wrong.
+    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+}
+
+# v3.2.14 R.6 — native multi-queue executor. Consumes the Schedule (R.2/R.3):
+# acquires the logical queue per used kind, walks nodes in GLOBAL sort_idx
+# order (the toposort guarantee that every producer submits before its
+# consumer — see the rg_schedule submission-order note), inserts a
+# gpu_queue_barrier for each incoming cross-queue fence edge before the
+# consumer's dispatch (in-CS timeline wait, no CPU stall), stashes the node's
+# queue as current so the native dispatch slots take their timeline paths,
+# advances the IB staging slice per node (R.5; no shared-IB clobber), and
+# finally gpu_queue_wait_idle's every used queue so results are readable on
+# return (the v2.5 completion contract). Returns 0|GPU_ERR_*.
+fn _rg_execute_native_mq(g, ctx): i64 {
+    var nodes = load64(g + 0);
+    var n = vec_len(nodes);
+    if (n == 0) { return 0; }
+    rg_schedule(g);                  # idempotent; safe if called directly
+    native_ctx_ib_reset_slots(ctx);  # deterministic per-execution start
+
+    var sched = _rg_sched(g);
+    var batches = load64(sched + SCHED_OFF_BATCHES);
+    var nb = vec_len(batches);
+    var fences = load64(sched + SCHED_OFF_FENCES);
+    var nf = vec_len(fences);
+
+    # Acquire (idempotently) the logical queue for every batch's kind.
+    var bi = 0;
+    while (bi < nb) {
+        if (gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)) == 0) {
+            return GPU_ERR_OTHER;
+        }
+        bi = bi + 1;
+    }
+
+    var rc = 0;
+    var i = 0;
+    while (i < n) {
+        var node = vec_get(nodes, i);   # vec is in sort_idx order, so i == sort_idx
+        var q = gpu_queue_get(ctx, load64(node + 56));
+
+        # Cross-queue barriers for every fence edge feeding this consumer node.
+        var fi = 0;
+        while (fi < nf) {
+            var fe = vec_get(fences, fi);
+            if (load64(fe + FENCE_OFF_CN) == i) {
+                gpu_queue_barrier(ctx, gpu_queue_get(ctx, load64(fe + FENCE_OFF_PQ)), q);
+            }
+            fi = fi + 1;
+        }
+
+        gpu_ctx_set_current_queue(ctx, q);
+        var dr = _rg_native_dispatch_node(ctx, node);
+        if (dr != 0) { rc = dr; }
+        native_ctx_ib_advance(ctx);     # next node stages into a fresh IB slice
+        i = i + 1;
+    }
+
+    # Clear the stash and retire every used queue before returning.
+    gpu_ctx_set_current_queue(ctx, 0);
+    bi = 0;
+    while (bi < nb) {
+        var wr = gpu_queue_wait_idle(ctx,
+        gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)));
+        if (wr != 0) { rc = wr; }
+        bi = bi + 1;
+    }
+    return rc;
+}
+
+fn rg_execute_mq(g, ctx): i64 {
+    if (ctx == 0) { return 1; }
+    if (rg_is_built(g) == 0) { return 1; }
+    # Run the scheduler pass (R.2/R.3) — idempotent; produces the per-queue
+    # batches + cross-queue fence edges both executors read.
+    rg_schedule(g);
+    # Native AMD gets the real multi-queue executor (per-ring timeline submits
+    # + cross-ring fence edges, R.6). wgpu has one device queue, so it stays on
+    # the v2.5 single-encoder/single-submit path — serialized-equivalent, the
+    # identical command stream (the affinity is honored as ordering only). A
+    # null backend ptr (or any non-AMD kind) falls through to the wgpu path
+    # rather than dereferencing it.
+    var b = gpu_ctx_backend(ctx);
+    if (b != 0) {
+        if (backend_kind(b) == BACKEND_KIND_AMD) {
+            return _rg_execute_native_mq(g, ctx);
+        }
+    }
+    return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
+}
+
+# ================================================================
 # Teardown
 # ================================================================
 
@@ -741,13 +1179,19 @@ fn rg_release(g): i64 {
 # ================================================================
 
 fn _rg_node_new(kind, label): i64 {
-    var node = alloc(72);
-    memset(node, 0, 72);
+    var node = alloc(80);
+    memset(node, 0, 80);
     store64(node + 0,  kind);
     store64(node + 16, vec_new());
     store64(node + 24, vec_new());
     store64(node + 32, label);
     store64(node + 48, 0 - 1);
+    # Default queue affinity per node kind (R.1): compute runs on the
+    # COMPUTE ring, render/copy on GRAPHICS. rg_node_queue overrides this.
+    var qk = QUEUE_KIND_GRAPHICS;
+    if (kind == NODE_COMPUTE) { qk = QUEUE_KIND_COMPUTE; }
+    store64(node + 56, qk);
+    store64(node + 64, 0 - 1);
     return node;
 }
 

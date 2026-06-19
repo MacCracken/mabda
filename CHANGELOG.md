@@ -13,6 +13,76 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.2.14] — 2026-06-19
+
+**Render-graph multi-queue scheduling — Phase R, HW-verified on Cezanne; closes the v3.2.x arc.**
+The v2.5 render graph executed single-submit (one wgpu encoder, one queue submit) — correct, but it
+left the native backend's independent GFX/COMPUTE/DMA rings idle. Phase R makes the render graph
+**multi-queue aware on native and serialized-equivalent on wgpu**: a node declares a queue affinity,
+the scheduler buckets nodes into per-queue batches and classifies each cross-queue writer→reader
+dependency as a fence edge, and the native executor submits each node on its ring through the
+timeline (async) path with the cross-queue edges lowered to in-CS `gpu_queue_barrier` waits — genuine
+GFX/COMPUTE overlap, no CPU stall between rings. The public builder API is unchanged; one additive
+call (`rg_node_queue`) declares affinity, and omitting it reproduces v2.5 ordering exactly. wgpu (one
+device queue) stays on the v2.5 single-encoder path, the identical command stream. **HW-verified
+end-to-end on Cezanne** (`programs/native_render_graph_mq_e2e.cyr`, 5/5 stable): a compute→render
+graph runs the compute node on the COMPUTE ring and the render node on the GFX ring (distinct HW
+rings), cross-queue ordered by an in-CS timeline wait, with both results CPU-verified
+(`buf_a == 0xDEADBEEF` and `RT pixel(0,0)` red). **This is the last feature work in the v3.2.x arc
+(3.2.0 → 3.2.14); nothing deferred to v3.3/v4.**
+
+### Added — Phase R.5–R.7 (native MQ executor + per-node IB staging + HW e2e)
+- **R.5 — per-node IB staging.** The cached IB BO grows from one 4 KiB region to `_NATIVE_IB_SLOTS`
+  (16) contiguous 4 KiB slices (64 KiB, safely inside the 4 MiB IB→FENCE VA gap). A round-robin
+  cursor (`GpuContext +160`, struct 160→168 append-only) selects the active slice
+  (`native_ctx_ib_active_va/addr`); `native_ctx_ib_advance` / `_reset_slots` manage it. The four
+  timeline dispatch fns (compute / compute-N / transfer / render) stage into the active slice;
+  single-shot/synchronous paths stay on slice 0 (unchanged). The MQ executor advances the slice per
+  node so concurrently-in-flight cross-ring submits never clobber a sibling's PM4 — explicit, never
+  a silent serialization. +12 asserts incl. a staging-isolation test.
+- **R.6 — native MQ executor `_rg_execute_native_mq`.** Walks nodes in global sort_idx order
+  (producer-before-consumer by construction), acquires each used queue, inserts a `gpu_queue_barrier`
+  for every incoming cross-queue fence edge before the consumer's dispatch, stashes the node's queue
+  as current, dispatches each node (`_rg_native_dispatch_node` reinterprets the byte-polymorphic node
+  payload as native objects — compute → `gpu_compute_dispatch`, render → the queue-aware
+  `render_pass_draw` slot, copy → `gpu_queue_transfer_copy`; non-zero copy offsets + COPY_TEX_BUF
+  fail loud), advances the IB slice, then `gpu_queue_wait_idle`s every used queue.
+  `_backend_native_render_pass_draw` made queue-aware (routes through `native_render_dispatch_timeline`
+  when a current queue is stashed). `rg_execute_mq` routes AMD → native executor, else the wgpu
+  serialized path (null-backend-guarded). +14 asserts (capture-mock pins the
+  compute→barrier→render→wait order + barrier endpoints).
+- **R.7 — HW e2e.** `programs/native_render_graph_mq_e2e.cyr` + `test-native-render-graph-mq-e2e`;
+  5/5 stable on Cezanne (2 batches + 1 cross-queue fence edge, rings compute=1 / graphics=0, both
+  legs verified).
+
+### Changed
+- `GpuContext` 160 → 168 bytes (append-only IB-slot cursor at +160); the size-pin test + all test
+  stack `ctx[160]` buffers bumped to 168.
+
+## [3.2.13] — 2026-06-19
+
+**Render-graph multi-queue — Phase R foundations (node affinity, scheduler, native render-timeline
+dispatch).** The data model + pure-CPU scheduler + the missing native render dispatch primitive that
+3.2.14's executor composes. No public-API break; multi-queue is opt-in.
+
+### Added — Phase R.1–R.4
+- **R.1 — per-node queue affinity.** `Node` struct 72 → 80 (append-only): `queue_kind` at +56
+  (default per kind — compute→COMPUTE, render/copy→GRAPHICS), `batch_idx` at +64. Public
+  `rg_node_queue(g, node_id, kind)` + `rg_node_queue_get`; `rg_execute_mq(g, ctx)` entry. `queue.cyr`
+  moved ahead of `render_graph.cyr` in the include chain + manifest.
+- **R.2 + R.3 — `rg_schedule`.** The pass between `rg_build` and the executor: buckets nodes into
+  per-queue Batches (in ascending min-sort order) and classifies each cross-queue writer→reader
+  dependency as a deduped `FenceEdge` (same-queue edges are satisfied by submit order). `RenderGraph`
+  40 → 48 (schedule ptr at +40). Full accessor set + `rg_is_scheduled`. The executor submits in
+  **global sort_idx order** (the toposort guarantee), not batch-by-batch min-sort (which is
+  insufficient when an independent early node shares a queue with a late consumer) — the fence edges
+  carry the real cross-queue ordering.
+- **R.4 — `native_render_dispatch_timeline`.** The GFX-ring timeline analog of
+  `native_compute_dispatch_cached_timeline`: stages the render PM4, consumes any pending
+  cross-ring barrier as an in-CS `TIMELINE_WAIT`, bumps the queue's persistent timeline, submits
+  without blocking. GFX-ring-only + IB-bound guards.
+- +60 CPU asserts across R.1–R.4 (render 122→182, native 1354→1364).
+
 ## [3.2.12] — 2026-06-19
 
 **General native f64 (double-precision) compute via the SPIR-V→GFX9 compiler — Phase F, HW-verified

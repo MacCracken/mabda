@@ -11,7 +11,7 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.22+ (`cyrius.cyml: cyrius = "6.2.22"`)
-- **Version**: 3.2.12 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Version**: 3.2.14 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -157,8 +157,22 @@ detection.
   uninvocable). The F.9 layernorm smoke runs through the public API (`gpu_shader_module_create_spirv`
   → `gpu_compute_dispatch`). Every bite adversarially reviewed (Workflow); five reviews caught real
   silent-wrong bugs (forced-DIVERGENT, 64-bit MIR-operand truncation, vec/store const, OpSelect mask)
-  — each fixed + pinned. Toolchain 6.2.21→6.2.22. **3.2.13+** opens Phase R (render-graph multi-queue);
-  multi-dim grid + `id_bound`≤128 still to be raised.
+  — each fixed + pinned. Toolchain 6.2.21→6.2.22.
+  **3.2.13 + 3.2.14** → **render-graph multi-queue scheduling (Phase R)**, HW-verified on Cezanne,
+  closing the v3.2.x arc. The v2.5 render graph was single-submit (one wgpu encoder, one queue
+  submit); Phase R makes it multi-queue aware on native and serialized-equivalent on wgpu. **3.2.13
+  (R.1–R.4):** per-node queue affinity (`rg_node_queue`; `Node` 72→80 — `queue_kind`/`batch_idx`),
+  the pure-CPU scheduler `rg_schedule` (per-queue Batches + cross-queue writer→reader `FenceEdge`
+  classification; `RenderGraph` 40→48), and `native_render_dispatch_timeline` (the GFX-ring timeline
+  analog of the compute path). **3.2.14 (R.5–R.7):** per-node IB staging (the cached IB BO →
+  `_NATIVE_IB_SLOTS`=16 slices + a `GpuContext +160` cursor, ctx 160→168, so concurrent in-flight
+  submits don't clobber a shared IB), the native MQ executor `_rg_execute_native_mq` (global-sort
+  walk + cross-queue `gpu_queue_barrier` insertion + per-ring timeline dispatch + `wait_idle`;
+  `_backend_native_render_pass_draw` made queue-aware; byte-polymorphic node payloads), and the HW
+  e2e `native_render_graph_mq_e2e.cyr` (compute on the COMPUTE ring → render on the GFX ring, cross-
+  queue ordered, distinct rings, both results CPU-verified, 5/5 stable). The executor submits in
+  global sort_idx order (the toposort guarantee), not batch-by-batch min-sort. wgpu stays on the v2.5
+  single-encoder path. multi-dim grid + `id_bound`≤128 still to be raised.
   The v3.1.2-deferred TRANSFER/buffer-copy + render-graph multi-queue were
   pulled INTO the v3.2.x arc (Phases X / R) per maintainer decision — with the
   N.10/N.11 (vectors + per-ext-set) insert shifting Phase F/R down, the
@@ -189,9 +203,9 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.2.12, 2026-06-19)
+## Current State (post 3.2.14, 2026-06-19)
 
-- **Source**: 49 domain modules under `src/*.cyr`, ~20,900 lines
+- **Source**: 49 domain modules under `src/*.cyr`, ~21,100 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
   former 137-KiB `backend_native.cyr` was split into four files at
   rc.2 — `_amdgpu.cyr` / `_shaders.cyr` / `_pm4.cyr` / `.cyr` —
@@ -200,26 +214,37 @@ doesn't change between paths.
   `spirv_parse` (3.2.5) then `mir` / `spirv_lower` / `gfx9_isel` /
   `gfx9_regalloc` / `gfx9_waitcnt` / `gfx9_abi` / `gfx9_compile` (3.2.6);
   3.2.12 Phase F extended `gfx9_encode` / `mir` / `spirv_lower` / `gfx9_isel` /
-  `gfx9_compile` in place with the f64 `V_*_F64` path — no new module).
-- **Tests**: **3983 CPU-only assertions** across **16 functionality-named
+  `gfx9_compile` in place with the f64 `V_*_F64` path — no new module; 3.2.13–3.2.14
+  Phase R extended `render_graph.cyr` (scheduler + native MQ executor), `queue.cyr`
+  ordering, `context.cyr` (IB-slot cursor, ctx 160→168), and `backend_native.cyr`
+  (`native_render_dispatch_timeline` + IB staging + queue-aware render draw) in place
+  — no new module).
+- **Tests**: **4079 CPU-only assertions** across **16 functionality-named
   domain files** under `tests/tcyr/` (reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
-  mirroring the `src/` domains; `make test` globs them all:
+  mirroring the `src/` domains; `make test` globs them all.
+  **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
+  `make test | grep` (or `awk`) treats it as binary and **silently drops
+  texture's 207** — the naive total reads **3872**, not the true **4079**. Use
+  `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
+  accurate count; the trap has fooled humans and review agents alike.
+  Domain breakdown:
   - `core` 160 (error/color/capabilities/profiler/resource/debug/obs +
     `int_ratio_to_f32` / `f64_to_f32` f32 conversions — native `f32_from`/`f32_to`
     builtins since the 6.2.18 fold-in; the former x86 SSE2 shims were retired +
     F.1–F.3/F.7-flip `shader_f64` caps: native = 1 post-flip)
   - `buffer` 53 · `compute` 26 · `texture` 207 (incl. v3.2 compressed
     format table / block math / caps gating / create dispatch) · `graphics` 61
-  - `render` 122 · `backend` 432 (abstraction + wgpu FFI + dispatch mocks
+  - `render` 196 (incl. Phase R: node queue affinity + `rg_schedule` batches/
+    fence-edges + the native MQ executor capture-mock) · `backend` 432 (abstraction + wgpu FFI + dispatch mocks
     + v3.2 block-aware texture write/read + X buffer-copy + TS sampleable
     slots / sampler / bind-group + wgpu-sampler descriptor builders + S SPIRV
     descriptor/validate + kind-routed shader-create slot)
   - `caches` 42 · `surface` 73 · `kms` 335 · `queue` 102 (v3.1.1
     multi-queue: layout + wgpu/native fillers + barrier + dispatch; `caches`
     adds S kind-folded `_shader_hash_n` + SPIR-V cache peers)
-  - `native` 1354 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
+  - `native` 1376 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
     timeline syncobjs / SDMA copy / queue fillers + v3.2 fmt create +
     X real buffers / transfer-copy / SDMA chaining + TS T#/S#/IMG-format
     builders / TS.6 COPY_TILED + TS.7 BC tiled create/write-read/params +
@@ -227,7 +252,8 @@ doesn't change between paths.
     sampleable + caps `native_texfmt_sampleable` + N.5d the generic +
     rsrc-parameterized compute composers + N.6r the magic-tagged compiled
     shmod struct / kind gate / compiled-dispatch binding guards / tag-checked
-    release / LIFO texture-VA reclaim)
+    release / LIFO texture-VA reclaim + R.4 `native_render_dispatch_timeline`
+    guard ladder + R.5 IB-slot staging cursor/isolation)
   - `compiler` 1016, **split across 4 files** (2026-06-18) sharing the `compiler_common.cyr`
     `_spv_build_*` fixtures: `compiler_encode` 259 (N.0 oracle + N.1 parse + F.7 f64 encoders)
     · `compiler_lower` 394 (N.2 MIR + lowering + F.7 f64 lower/select) · `compiler_backend` 255
@@ -270,8 +296,10 @@ doesn't change between paths.
   `native_f64_fma_e2e` (F.4–F.6 hand-authored), `native_spirv_f64_{fma,arith,cvt,subabs,
   vec,div,sqrt,i32_cvt,const,ldexp,select}_e2e` (the compiled toolkit), and
   `native_spirv_f64_layernorm_e2e` (F.9 public-API smoke) — all bit-exact on Cezanne —
-  plus the wgpu `f64_compute_e2e` (F.8b ShaderF64); plus
-  `native_kms_summary`, `native_kms_modeset_smoke`, `native_present_e2e`
+  plus the wgpu `f64_compute_e2e` (F.8b ShaderF64); the v3.2.14 Phase R
+  `native_render_graph_mq_e2e` (R.7 — a compute→render cross-queue graph on distinct
+  COMPUTE/GFX rings, in-CS-timeline-ordered, both legs verified, HW-verified on Cezanne);
+  plus `native_kms_summary`, `native_kms_modeset_smoke`, `native_present_e2e`
   for Phase D.
 - **Benchmarks**: `tests/bcyr/mabda.bcyr` — 9 CPU benches. GPU
   benches via `make bench-gpu` (13 benches, Rust v1 parity set on
@@ -369,7 +397,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 3983 CPU assertions across 16 domain files
+make test                                            # 4079 CPU assertions across 16 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -459,7 +487,7 @@ mabda/
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
 │   ├── tcyr/                        — 16 functionality-named domain suites
-│   │   │                              (3983 asserts total; `make test` globs
+│   │   │                              (4079 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -510,6 +538,7 @@ mabda/
 │   ├── native_queue_barrier_e2e.cyr — v3.1.1: cross-ring barrier (COMPUTE→GFX in-CS wait)
 │   ├── native_sdma_copy_e2e.cyr     — v3.1.1: SDMA COPY_LINEAR on the DMA ring
 │   ├── native_multiqueue_e2e.cyr    — v3.1.1: 3-ring compute→barrier→graphics + SDMA consume
+│   ├── native_render_graph_mq_e2e.cyr — v3.2.14 R.7: compute→render cross-queue graph, distinct rings (HW)
 │   ├── native_kms_summary.cyr       — KMS topology probe (Phase D, no-master)
 │   ├── native_kms_modeset_smoke.cyr — native modeset visual smoke (red screen)
 │   └── native_present_e2e.cyr       — 7.7 e2e: 120-frame animated gradient
@@ -584,7 +613,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 3983 CPU assertions across 16 domain test
+- **Tests are the way** — 4079 CPU assertions across 16 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -634,7 +663,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 3983+ assertions pass across all 16 domain test files,
+2. Test sweep: 4079+ assertions pass across all 16 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -707,7 +736,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 16 `tests/tcyr/*.tcyr` domain suites); 3983+
+   (all 16 `tests/tcyr/*.tcyr` domain suites); 4079+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with

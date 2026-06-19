@@ -749,6 +749,14 @@ build/native_render_e2e: programs/native_render_e2e.cyr src/*.cyr
 test-native-render-e2e: build/native_render_e2e
 	./build/native_render_e2e
 
+build/native_render_graph_mq_e2e: programs/native_render_graph_mq_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_render_graph_mq_e2e.cyr $@
+
+.PHONY: test-native-render-graph-mq-e2e
+test-native-render-graph-mq-e2e: build/native_render_graph_mq_e2e
+	./build/native_render_graph_mq_e2e
+
 # v3 Step 7.1(c) — DRM/KMS topology diagnostic. Needs a DRM master
 # fd (/dev/dri/card0); typically requires a desktop session or
 # root. Run via `make test-native-kms-summary`.

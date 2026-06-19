@@ -1,0 +1,215 @@
+# programs/native_render_graph_mq_e2e.cyr — v3.2.14 Phase R.7 HW e2e
+#
+# The headline multi-queue render-graph demo: a compute node and a render
+# node, on DISTINCT native HW rings, ordered by a cross-queue fence edge the
+# scheduler inferred from a declared writer→reader dependency — driven entirely
+# through the public render-graph API (rg_add_compute / rg_add_render /
+# rg_node_writes / rg_node_reads / rg_build / rg_execute_mq).
+#
+#   Node C (COMPUTE ring): gpu_compute_dispatch writes 0xDEADBEEF to buf_a,
+#                          signalling the COMPUTE queue's timeline.
+#   Node R (GFX ring):     a clear-triangle render draws solid red into a
+#                          64x64 RT, signalling the GRAPHICS queue's timeline.
+#   Edge C→R:              C writes resource 7, R reads resource 7. rg_schedule
+#                          classifies this as a CROSS-queue edge (C on COMPUTE,
+#                          R on GRAPHICS) → a fence edge. _rg_execute_native_mq
+#                          emits gpu_queue_barrier(COMPUTE→GRAPHICS) before R's
+#                          submit, so R's GFX CS carries an in-CS TIMELINE_WAIT
+#                          on C's compute point — the GFX ring runs ordered
+#                          after compute, NO CPU stall between the rings.
+#
+# The R.5 per-node IB staging means C stages into IB slice 0 and R into slice 1,
+# so the two in-flight submits never clobber each other's PM4. The executor
+# wait_idle's both queues at the end (completion contract), then we CPU-verify
+# both results: buf_a == 0xDEADBEEF (compute ran) and RT pixel(0,0) == red
+# (render ran). Distinct rings (COMPUTE=1, GFX=0), timeline-ordered.
+#
+# NOTE on "consumes": the dependency is DECLARED (C writes / R reads resource
+# 7) and HW-enforced by the in-CS timeline wait — the ordering guarantee is the
+# property under test. R draws solid red rather than literally sampling buf_a
+# (a literal sample is the TS.5 textured-FS path, already HW-verified
+# separately); this e2e isolates the R.6 cross-queue EXECUTOR.
+#
+# Exit codes:
+#   0  — both results verified; cross-queue render graph ran on distinct rings
+#   1  — gpu_context_new_native failed
+#   2  — compute shader / buf_a setup failed
+#   3  — render object (VS/FS/RT/pipeline/pass) setup failed
+#   4  — rg_build failed
+#   5  — schedule structure wrong (expected 2 batches + 1 cross-queue fence)
+#   6  — rg_execute_mq returned non-zero
+#   7  — buf_a readback != 0xDEADBEEF (compute leg)
+#   8  — RT pixel(0,0) not red (render leg)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native RENDER-GRAPH MULTI-QUEUE e2e (v3.2.14 R.7)\n");
+    print_cstr("------------------------------------------------------\n");
+
+    # ---- 1. Native context ----
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    # ---- 2. Compute: deadbeef-store shader + output buffer buf_a ----
+    var cs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &cs_bo) != 0) {
+        print_cstr("FAIL: compute shader bo\n"); gpu_context_release(ctx); return 2; }
+    var cs_handle = load64(&cs_bo + 0);
+    var cs_map    = load64(&cs_bo + 8);
+    memset(cs_map, 0, 4096);
+    native_gfx9_shader_store_deadbeef(cs_map, 0);
+    var cs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, cs_handle, cs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: compute shader va\n"); gpu_context_release(ctx); return 2; }
+    var shmod[16];
+    native_buf_pair_write(&shmod, cs_handle, cs_va);
+
+    var ba_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &ba_bo) != 0) {
+        print_cstr("FAIL: buf_a bo\n"); gpu_context_release(ctx); return 2; }
+    var ba_handle = load64(&ba_bo + 0);
+    var ba_map    = load64(&ba_bo + 8);
+    var si = 0;
+    while (si < 1024) { store32(ba_map + si * 4, 0xBAADF00D); si = si + 1; }
+    var ba_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, ba_handle, ba_va, 4096, _NATIVE_PERM_DATA) != 0) {
+        print_cstr("FAIL: buf_a va\n"); gpu_context_release(ctx); return 2; }
+    var bp_a[16];
+    native_buf_pair_write(&bp_a, ba_handle, ba_va);
+
+    # ---- 3. Render: VS + FS shaders, RT, pipeline, pass ----
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) {
+        print_cstr("FAIL: vs bo\n"); gpu_context_release(ctx); return 3; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100002000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n"); gpu_context_release(ctx); return 3; }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) {
+        print_cstr("FAIL: fs bo\n"); gpu_context_release(ctx); return 3; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    memset(fs_addr, 0, 4096);
+    native_gfx9_shader_solid_red(fs_addr, 0);
+    var fs_va = 0xFFFF800100003000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n"); gpu_context_release(ctx); return 3; }
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+
+    var W = 64;
+    var H = 64;
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { print_cstr("FAIL: rt\n"); gpu_context_release(ctx); return 3; }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, W * H * 4);   # sentinel: distinct from any expected pixel
+
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); gpu_context_release(ctx); return 3; }
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { print_cstr("FAIL: pass\n"); gpu_context_release(ctx); return 3; }
+
+    # ---- 4. Build the graph: compute(C) -> render(R) cross-queue ----
+    var g = rg_new();
+    var dims[12];
+    store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var c = rg_add_compute(g, &shmod, &bp_a, &dims, "compute");   # default COMPUTE
+    var r = rg_add_render(g, pass, pipe, 3, "render");            # default GRAPHICS
+    rg_node_writes(g, c, 7);    # C writes resource 7
+    rg_node_reads(g, r, 7);     # R reads resource 7 -> cross-queue edge
+    if (rg_build(g, 0) != 0) { print_cstr("FAIL: rg_build\n"); gpu_context_release(ctx); return 4; }
+
+    # ---- 5. Schedule structure (CPU): 2 batches + 1 cross-queue fence edge ----
+    rg_schedule(g);
+    print_cstr("schedule: batches="); print_i64(rg_schedule_batch_count(g));
+    print_cstr(" fences="); print_i64(rg_schedule_fence_count(g)); print_cstr("\n");
+    if (rg_schedule_batch_count(g) != 2) {
+        print_cstr("FAIL: expected 2 batches\n"); gpu_context_release(ctx); return 5; }
+    if (rg_schedule_fence_count(g) != 1) {
+        print_cstr("FAIL: expected 1 cross-queue fence edge\n"); gpu_context_release(ctx); return 5; }
+    if (rg_schedule_fence_producer_queue(g, 0) != QUEUE_KIND_COMPUTE) {
+        print_cstr("FAIL: fence producer != COMPUTE\n"); gpu_context_release(ctx); return 5; }
+    if (rg_schedule_fence_consumer_queue(g, 0) != QUEUE_KIND_GRAPHICS) {
+        print_cstr("FAIL: fence consumer != GRAPHICS\n"); gpu_context_release(ctx); return 5; }
+    print_cstr("PASS: C(COMPUTE) -> R(GRAPHICS) cross-queue fence edge\n");
+
+    # ---- 6. Execute the multi-queue graph ----
+    var rc = rg_execute_mq(g, ctx);
+    if (rc != 0) {
+        print_cstr("FAIL: rg_execute_mq rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 6; }
+    var qc = gpu_queue_get(ctx, QUEUE_KIND_COMPUTE);
+    var qg = gpu_queue_get(ctx, QUEUE_KIND_GRAPHICS);
+    print_cstr("rings: compute="); print_i64(queue_ring(qc));
+    print_cstr(" (point "); print_i64(queue_point(qc)); print_cstr(")");
+    print_cstr(" graphics="); print_i64(queue_ring(qg));
+    print_cstr(" (point "); print_i64(queue_point(qg)); print_cstr(")\n");
+
+    # ---- 7. Verify the compute leg ----
+    var va = load32(ba_map + 0);
+    print_cstr("buf_a = "); print_hex32(va); print_cstr("\n");
+    if (va != 0xDEADBEEF) {
+        print_cstr("FAIL: compute leg (buf_a != 0xDEADBEEF)\n");
+        gpu_context_release(ctx); return 7; }
+
+    # ---- 8. Verify the render leg: pixel(0,0) == red ----
+    var pr = load8(rt_addr + 0);
+    var pg = load8(rt_addr + 1);
+    var pb = load8(rt_addr + 2);
+    var pa = load8(rt_addr + 3);
+    print_cstr("pixel(0,0) = (");
+    print_hex32(pr); print_cstr(", "); print_hex32(pg); print_cstr(", ");
+    print_hex32(pb); print_cstr(", "); print_hex32(pa); print_cstr(")\n");
+    if (pr != 0xFF) { print_cstr("FAIL: render leg (red != 0xFF)\n");
+        gpu_context_release(ctx); return 8; }
+    if (pg != 0x00) { print_cstr("FAIL: render leg (green != 0)\n");
+        gpu_context_release(ctx); return 8; }
+    if (pb != 0x00) { print_cstr("FAIL: render leg (blue != 0)\n");
+        gpu_context_release(ctx); return 8; }
+    if (pa != 0xFF) { print_cstr("FAIL: render leg (alpha != 0xFF)\n");
+        gpu_context_release(ctx); return 8; }
+
+    gpu_render_pass_end(ctx, pass);
+    gpu_context_release(ctx);
+    print_cstr("OK - compute(COMPUTE ring) -> render(GFX ring), cross-queue ordered, both verified\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
