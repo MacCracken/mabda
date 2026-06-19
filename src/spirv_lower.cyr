@@ -652,6 +652,33 @@ fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
     return 0;
 }
 
+# GLSL.std.450 Sqrt (f64) → the LLVM Newton-Goldschmidt expansion (F.7f.7b). GFX9 has no f64
+# sqrt and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so: a v_rsq_f64 seed, then
+# the simultaneous sqrt/rsqrt Newton refinement (h≈√x, g≈0.5/√x) — two correction rounds give a
+# correctly-rounded result for NORMAL inputs. A v_cmp_class_f64 (mask 0x260 = +0/-0/+inf) then
+# passes those special classes through unchanged (the Newton path would yield 0·inf=NaN); NaN and
+# negatives take the Newton path → NaN (correct). SUBNORMAL inputs are approximate here — the LLVM
+# ldexp scale-up/down wrapper that makes them correctly-rounded is F.7f.7c (it needs the f64-const
+# materialization shared with F.7f.9). See docs/development/3-2-punchlist.md.
+fn _spirv_lower_fsqrt_f64(m, x, result): i64 {
+    var t = MIR_T_F64;
+    var rsq = _udiv_op(m, MIR_OP_F64_RSQ, t, x, 0, 0, 0);          if (rsq < 0) { return rsq; }
+    var h = _udiv_op(m, MIR_OP_FMUL, t, x, rsq, 0, 0);            if (h < 0) { return h; }
+    var g = _udiv_op(m, MIR_OP_F64_MUL_HALF, t, rsq, 0, 0, 0);    if (g < 0) { return g; }
+    var r = _udiv_op(m, MIR_OP_F64_FMA_N0_HALF, t, g, h, 0, 0);   if (r < 0) { return r; }  # 0.5 - g*h
+    var h2 = _udiv_op(m, MIR_OP_FMA, t, h, r, h, 0);              if (h2 < 0) { return h2; } # h + h*r
+    var g2 = _udiv_op(m, MIR_OP_FMA, t, g, r, g, 0);             if (g2 < 0) { return g2; } # g + g*r
+    var d = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h2, h2, x, 0);     if (d < 0) { return d; }   # x - h*h
+    var h3 = _udiv_op(m, MIR_OP_FMA, t, d, g2, h2, 0);           if (h3 < 0) { return h3; } # h + d*g
+    var d2 = _udiv_op(m, MIR_OP_F64_FMA_N0, t, h3, h3, x, 0);    if (d2 < 0) { return d2; } # x - h*h
+    var core = _udiv_op(m, MIR_OP_FMA, t, d2, g2, h3, 0);        if (core < 0) { return core; } # h + d*g
+    var mask = _udiv_op(m, MIR_OP_VMOV, MIR_T_U32, 0x260, 0, 0, MIR_FLAG_A_IMM); if (mask < 0) { return mask; }
+    var ecc = mir_emit(m, MIR_OP_F64_CMP_CLASS, 0, MIR_T_U32, x, mask, 0, 0);    if (ecc < 0) { return ecc; }
+    var ecm = mir_emit(m, MIR_OP_F64_CNDMASK, result, t, core, x, 0, 0);  # VCC ? x : core
+    if (ecm < 0) { return ecm; }
+    return 0;
+}
+
 # Signed-division prep: sign masks (ASHR 31 → 0 or 0xFFFFFFFF) + magnitudes via the
 # branchless abs (x^sign)-sign. Writes [signA, signB, absA, absB] into out (N.9d).
 fn _signed_prep(m, a, b, out): i64 {
@@ -926,8 +953,13 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         var glsl = spirv_word(ptr, off + 4);
         var rid = spirv_word(ptr, off + 2);
         var x0 = spirv_word(ptr, off + 5);
-        # Unary: Sqrt, Floor.
+        # Unary: Sqrt, Floor. f64 Sqrt expands to the Newton-Goldschmidt macro (F.7f.7b — GFX9
+        # v_sqrt_f64 is only an approximation); f32 keeps the single v_sqrt_f32.
         if (glsl == GLSL_STD450_SQRT) {
+            if (mir_type_base(ety) == MIR_T_F64) {
+                if (mir_type_count(ety) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                return _spirv_lower_fsqrt_f64(m, x0, rid);
+            }
             var es = mir_emit(m, MIR_OP_FSQRT, rid, ety, x0, 0, 0, 0);
             if (es < 0) { return es; }
             return 0;

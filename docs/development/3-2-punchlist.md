@@ -1026,10 +1026,18 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     - [x] **F.7f.7a** *(2026-06-19)* — encoder foundation: `V_RSQ_F64` (VOP1 0x26), `V_LDEXP_F64`
       (VOP3 0x284, f64,i32), `V_CMP_GT_F64`/`V_CMP_CLASS_F64` (VOPC 0x64/0x12) opcodes — all reuse the
       existing vop1/vop3a/vopc encoders — + the `test_gfx9_enc_f64_sqrt` byte-oracle (llvm-mc-matched).
-    - [ ] **F.7f.7b** — the macro lowering: the Newton-Goldschmidt chain + an f64-pair cndmask helper
-      (2× v_cndmask_b32 on the halves) + i32/f64 constant materialization (scale exponents, the
-      subnormal threshold, the class mask) + HW e2e `out=sqrt(a)` value-exact (vs Python `math.sqrt`
-      offline want[], incl. 0 / subnormal / large-exponent / a perfect square / a negative→NaN lane).
+    - [x] **F.7f.7b** *(2026-06-19)* — **HW-verified on Cezanne**: OpExtInst Sqrt (f64) → the
+      Newton-Goldschmidt macro (`_spirv_lower_fsqrt_f64`) → 5 new MIR/GISEL ops (RSQ / CMP_CLASS /
+      CNDMASK / FMA_N0_HALF / MUL_HALF) + 4 emit helpers (the inline-0.5 FMA/MUL, the VCC-writing
+      cmp_class, the f64-pair cndmask = 2× v_cndmask_b32). `out=sqrt(a)` correct on all 8 lanes —
+      bit-exact vs offline `math.sqrt` for the irrational sqrts (2/3/1e-5) + exact squares (4/1e10/
+      0.25), `sqrt(0)=0` via the +0 cmp_class passthrough, `sqrt(-1)=NaN` via the Newton path —
+      `native_spirv_f64_sqrt_e2e.cyr`. The new ops are in the forced-DIVERGENT guard (51→56).
+    - [ ] **F.7f.7c (subnormal scaling)** — the LLVM `cmp_gt`/`ldexp` scale-up + rescale-down wrapper
+      that makes SUBNORMAL inputs correctly-rounded (the 7b core is approximate for them; normal/0/inf/
+      NaN are exact). Needs `V_LDEXP_F64`/`V_CMP_GT_F64` (encoders done in 7a) + an f64-const
+      materialization op (the 2^-767 threshold) — shared with **F.7f.9** (inline f64 consts), so 7c
+      lands with/after that. attn11 never feeds subnormals to sqrt, so this is non-blocking for it.
   - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing).
   - [ ] **F.7f.9 (inline f64 consts)** — const-table words-3+4 split + two-i32-mov pair materialization.
   - [ ] **F.7f.10 (exp f64)** — range reduction (k=round(x/ln2), r=x-k·ln2) + Horner polynomial +

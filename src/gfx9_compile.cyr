@@ -384,6 +384,53 @@ fn _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_1_0) | 0x20000000);
 }
 
+# v3.2 F.7f.7b — f64 fma(-a, b, 0.5): the FSqrt Newton-Goldschmidt residual r = 0.5 - g*h. NEGATE
+# src0 + the inline-0.5 src2 (GFX9_INLINE_F32_0_5 = 240; the same code denotes f64 0.5).
+fn _emit_fma_n0_half_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_0_5) | 0x20000000);
+}
+
+# v3.2 F.7f.7b — f64 mul(a, 0.5): g = 0.5 * rsq. The inline-0.5 rides in src1 (a 2-src VOP3).
+fn _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_MUL_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, GFX9_INLINE_F32_0_5, 0));
+}
+
+# v3.2 F.7f.7b — f64 v_cmp_class_f64: classify x (src0, an f64 pair) against the bitmask in vsrc1
+# (a VGPR), result → the implicit VCC (no register dst). The FSqrt special-case gate (+0/-0/+inf).
+fn _emit_cmp_class_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var vsrc1 = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
+    if (vsrc1 < 0) { return vsrc1; }
+    return gfx9_emit32(buf, pos, gfx9_enc_vopc(GFX9_VOPC_V_CMP_CLASS_F64, src0, vsrc1));
+}
+
+# v3.2 F.7f.7b — f64-pair cndmask: dst = VCC ? b(true) : a(false), realized as TWO v_cndmask_b32
+# (the lo and hi 32-bit halves of each pair). VCC is implicit; both value operands are VGPR pairs.
+fn _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fa = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+    if (fa < 0) { return fa; }
+    var tb = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
+    if (tb < 0) { return tb; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, gfx9_vgpr(fa), tb));
+    return gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst + 1, gfx9_vgpr(fa + 1), tb + 1));
+}
+
 # 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
 fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     if (is_imm != 0) {
@@ -661,6 +708,13 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_V_FMA_F64_N0) { return _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_FMA_F64_N0_ONE) { return _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.7b f64 sqrt macro. RSQ reuses _emit_vop1; the rest are dedicated (the inline-0.5 FMA/MUL,
+    # the VCC-writing cmp_class, the f64-pair cndmask).
+    if (op == GISEL_V_RSQ_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RSQ_F64); }
+    if (op == GISEL_V_FMA_F64_N0_HALF) { return _emit_fma_n0_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_MUL_F64_HALF) { return _emit_mul_half_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CMP_CLASS_F64) { return _emit_cmp_class_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_CNDMASK_F64) { return _emit_cndmask_f64(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }

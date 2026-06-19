@@ -338,6 +338,14 @@ build/native_spirv_f64_div_e2e: programs/native_spirv_f64_div_e2e.cyr src/*.cyr
 test-native-spirv-f64-div-e2e: build/native_spirv_f64_div_e2e
 	./build/native_spirv_f64_div_e2e
 
+build/native_spirv_f64_sqrt_e2e: programs/native_spirv_f64_sqrt_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_sqrt_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-sqrt-e2e
+test-native-spirv-f64-sqrt-e2e: build/native_spirv_f64_sqrt_e2e
+	./build/native_spirv_f64_sqrt_e2e
+
 # v3.2 F.7f.2 — compiled f32<->f64 CVT round-trip on Cezanne, bit-exact vs an in-process reference.
 build/native_spirv_f64_cvt_e2e: programs/native_spirv_f64_cvt_e2e.cyr src/*.cyr
 	@mkdir -p build

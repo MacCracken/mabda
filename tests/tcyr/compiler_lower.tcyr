@@ -413,6 +413,29 @@ fn test_spirv_lower_fdiv_f32_rejects() {
     return 0;
 }
 
+# F.7f.7b — OpExtInst Sqrt (f64) lowers to the 13-op Newton-Goldschmidt macro: rsq seed → h=x*rsq
+# → g=0.5*rsq → r=0.5-g*h → 2 refinement rounds → result_core, then a VMOV class mask + cmp_class →
+# VCC + an f64-pair cndmask (VCC ? x : core) for the +0/-0/+inf passthrough.
+fn test_spirv_lower_fsqrt() {
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    assert_eq(_spirv_lower_fsqrt_f64(&m, 3, 5), 0, "fsqrt f64 lowers");   # x=id 3, result=id 5
+    assert_eq(mir_n_instrs(&m), 13, "fsqrt = 13 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_RSQ, "0: rsq seed");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_FMUL, "1: h = x*rsq");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_F64_MUL_HALF, "2: g = 0.5*rsq");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_F64_FMA_N0_HALF, "3: r = 0.5 - g*h");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_F64_FMA_N0, "6: d = x - h*h");
+    assert_eq(mir_instr_op(&m, 10), MIR_OP_VMOV, "10: class-mask materialize");
+    assert_eq(mir_instr_op(&m, 11), MIR_OP_F64_CMP_CLASS, "11: cmp_class -> VCC");
+    assert_eq(mir_instr_op(&m, 12), MIR_OP_F64_CNDMASK, "12: select VCC ? x : core");
+    return 0;
+}
+
 # N.10a — OpCompositeConstruct packs N scalar component <id>s into a MIR_VK_VECTOR (no
 # instructions); OpCompositeExtract pulls a component out via a single VMOV. A 5-word SPIR-V
 # header (id_bound at word 3) precedes both instructions at off 5 / off 11.
@@ -1302,6 +1325,7 @@ fn main(): i64 {
     test_spirv_lower_smod();
     test_spirv_lower_fdiv();
     test_spirv_lower_fdiv_f32_rejects();
+    test_spirv_lower_fsqrt();
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();
     test_spirv_vec_robustness();

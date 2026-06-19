@@ -1,0 +1,365 @@
+# programs/native_spirv_f64_sqrt_e2e.cyr — v3.2 Phase F.7f.7b: compiled f64 SQRT on Cezanne.
+#
+# An f64 SPIR-V kernel — out[lid.x] = sqrt(a[lid.x]) (OpExtInst GLSL.std.450 Sqrt) over two f64
+# StorageBuffers — compiled in-tree (gfx9_compile) and dispatched (8 threads). GFX9 has no f64 sqrt
+# and v_sqrt_f64 is only an ~f32-precision approximation (F.7f.5), so Sqrt lowers to the LLVM
+# Newton-Goldschmidt macro: a v_rsq_f64 seed + the simultaneous sqrt/rsqrt refinement (correctly
+# rounded for NORMAL inputs) + a v_cmp_class_f64 (+0/-0/+inf) passthrough. The GPU result must
+# BIT-MATCH the offline math.sqrt reference for the finite lanes; the negative lane must be NaN.
+# (Subnormal inputs are approximate pending F.7f.7c — none are tested here.)
+#
+# Linked native (renderD128) via `make test-native-spirv-f64-sqrt-e2e`.
+# Exit: 0 = pass; 2 = compile; 3 = ctx; 5 = BO setup; 9 = dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[18];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 16) {
+        var nib = (v >> ((15 - i) * 4)) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nib));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 18);
+    return 0;
+}
+
+fn mono_ns(): i64 {
+    var ts[16];
+    syscall(228, 1, &ts);
+    return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+var N_LANES = 8;
+
+# 8 f64 inputs as raw IEEE-754 bit patterns: normals (incl. irrational-sqrt 2/3/1e-5), perfect
+# squares (4/1e10/0.25), +0 (passthrough), and a negative (-> NaN).
+fn fill_inputs(a): i64 {
+    store64(a + 0 , 0x4000000000000000);   # 2
+    store64(a + 8 , 0x4010000000000000);   # 4
+    store64(a + 16, 0x0000000000000000);   # 0  (special: +0 passthrough)
+    store64(a + 24, 0x3EE4F8B588E368F1);   # 1e-5  (attn11 layernorm-ish)
+    store64(a + 32, 0x4008000000000000);   # 3
+    store64(a + 40, 0x4202A05F20000000);   # 1e10
+    store64(a + 48, 0x3FD0000000000000);   # 0.25
+    store64(a + 56, 0xBFF0000000000000);   # -1  (special: negative -> NaN)
+    return 0;
+}
+
+# Offline math.sqrt references (Cyrius has no f64 sqrt builtin). The compiled macro is
+# correctly-rounded for these normal/zero inputs, so the GPU must match bit-for-bit. Lane 7 is the
+# negative input; its want is a sentinel and the result is checked for NaN-ness instead.
+fn fill_wants(want): i64 {
+    store64(want + 0 , 0x3FF6A09E667F3BCD);   # sqrt(2)
+    store64(want + 8 , 0x4000000000000000);   # sqrt(4) = 2
+    store64(want + 16, 0x0000000000000000);   # sqrt(0) = 0
+    store64(want + 24, 0x3F69E7C6E43390B7);   # sqrt(1e-5)
+    store64(want + 32, 0x3FFBB67AE8584CAA);   # sqrt(3)
+    store64(want + 40, 0x40F86A0000000000);   # sqrt(1e10) = 100000
+    store64(want + 48, 0x3FE0000000000000);   # sqrt(0.25) = 0.5
+    store64(want + 56, 0x0000000000000000);   # lane 7 = NaN sentinel (checked by class)
+    return 0;
+}
+
+# 1 if v is an IEEE-754 NaN (exponent all ones, mantissa nonzero). (Cyrius >> is logical.)
+fn is_nan(v): i64 {
+    var exp = (v >> 52) & 0x7FF;
+    var mant = v & 0xFFFFFFFFFFFFF;
+    if (exp == 0x7FF) { if (mant != 0) { return 1; } }
+    return 0;
+}
+
+# The f64 sqrt SPIR-V (spirv-as spv1.3, spirv-val-clean; 143 words / 572 bytes, id-bound 24).
+# out[lid.x] = sqrt(a[lid.x]); 2 StorageBuffer bindings (0=a, 1=out).
+fn build_f64_sqrt_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x00000018);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x00020011);
+    store32(buf + 32, 0x0000000A);
+    store32(buf + 36, 0x0006000B);
+    store32(buf + 40, 0x00000001);
+    store32(buf + 44, 0x4C534C47);
+    store32(buf + 48, 0x6474732E);
+    store32(buf + 52, 0x3035342E);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x0003000E);
+    store32(buf + 64, 0x00000000);
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x0006000F);
+    store32(buf + 76, 0x00000005);
+    store32(buf + 80, 0x00000002);
+    store32(buf + 84, 0x6E69616D);
+    store32(buf + 88, 0x00000000);
+    store32(buf + 92, 0x00000003);
+    store32(buf + 96, 0x00060010);
+    store32(buf + 100, 0x00000002);
+    store32(buf + 104, 0x00000011);
+    store32(buf + 108, 0x00000008);
+    store32(buf + 112, 0x00000001);
+    store32(buf + 116, 0x00000001);
+    store32(buf + 120, 0x00040047);
+    store32(buf + 124, 0x00000003);
+    store32(buf + 128, 0x0000000B);
+    store32(buf + 132, 0x0000001B);
+    store32(buf + 136, 0x00040047);
+    store32(buf + 140, 0x00000004);
+    store32(buf + 144, 0x00000021);
+    store32(buf + 148, 0x00000000);
+    store32(buf + 152, 0x00040047);
+    store32(buf + 156, 0x00000004);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047);
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000001);
+    store32(buf + 184, 0x00040047);
+    store32(buf + 188, 0x00000005);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00020013);
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00030021);
+    store32(buf + 212, 0x00000007);
+    store32(buf + 216, 0x00000006);
+    store32(buf + 220, 0x00040015);
+    store32(buf + 224, 0x00000008);
+    store32(buf + 228, 0x00000020);
+    store32(buf + 232, 0x00000000);
+    store32(buf + 236, 0x00040017);
+    store32(buf + 240, 0x00000009);
+    store32(buf + 244, 0x00000008);
+    store32(buf + 248, 0x00000003);
+    store32(buf + 252, 0x00040020);
+    store32(buf + 256, 0x0000000A);
+    store32(buf + 260, 0x00000001);
+    store32(buf + 264, 0x00000009);
+    store32(buf + 268, 0x00030016);
+    store32(buf + 272, 0x0000000B);
+    store32(buf + 276, 0x00000040);
+    store32(buf + 280, 0x0003001D);
+    store32(buf + 284, 0x0000000C);
+    store32(buf + 288, 0x0000000B);
+    store32(buf + 292, 0x0003001E);
+    store32(buf + 296, 0x0000000D);
+    store32(buf + 300, 0x0000000C);
+    store32(buf + 304, 0x00040020);
+    store32(buf + 308, 0x0000000E);
+    store32(buf + 312, 0x0000000C);
+    store32(buf + 316, 0x0000000D);
+    store32(buf + 320, 0x00040020);
+    store32(buf + 324, 0x0000000F);
+    store32(buf + 328, 0x0000000C);
+    store32(buf + 332, 0x0000000B);
+    store32(buf + 336, 0x0004002B);
+    store32(buf + 340, 0x00000008);
+    store32(buf + 344, 0x00000010);
+    store32(buf + 348, 0x00000000);
+    store32(buf + 352, 0x0004003B);
+    store32(buf + 356, 0x0000000A);
+    store32(buf + 360, 0x00000003);
+    store32(buf + 364, 0x00000001);
+    store32(buf + 368, 0x0004003B);
+    store32(buf + 372, 0x0000000E);
+    store32(buf + 376, 0x00000004);
+    store32(buf + 380, 0x0000000C);
+    store32(buf + 384, 0x0004003B);
+    store32(buf + 388, 0x0000000E);
+    store32(buf + 392, 0x00000005);
+    store32(buf + 396, 0x0000000C);
+    store32(buf + 400, 0x00050036);
+    store32(buf + 404, 0x00000006);
+    store32(buf + 408, 0x00000002);
+    store32(buf + 412, 0x00000000);
+    store32(buf + 416, 0x00000007);
+    store32(buf + 420, 0x000200F8);
+    store32(buf + 424, 0x00000011);
+    store32(buf + 428, 0x0004003D);
+    store32(buf + 432, 0x00000009);
+    store32(buf + 436, 0x00000012);
+    store32(buf + 440, 0x00000003);
+    store32(buf + 444, 0x00050051);
+    store32(buf + 448, 0x00000008);
+    store32(buf + 452, 0x00000013);
+    store32(buf + 456, 0x00000012);
+    store32(buf + 460, 0x00000000);
+    store32(buf + 464, 0x00060041);
+    store32(buf + 468, 0x0000000F);
+    store32(buf + 472, 0x00000014);
+    store32(buf + 476, 0x00000004);
+    store32(buf + 480, 0x00000010);
+    store32(buf + 484, 0x00000013);
+    store32(buf + 488, 0x0004003D);
+    store32(buf + 492, 0x0000000B);
+    store32(buf + 496, 0x00000015);
+    store32(buf + 500, 0x00000014);
+    store32(buf + 504, 0x0006000C);
+    store32(buf + 508, 0x0000000B);
+    store32(buf + 512, 0x00000016);
+    store32(buf + 516, 0x00000001);
+    store32(buf + 520, 0x0000001F);
+    store32(buf + 524, 0x00000015);
+    store32(buf + 528, 0x00060041);
+    store32(buf + 532, 0x0000000F);
+    store32(buf + 536, 0x00000017);
+    store32(buf + 540, 0x00000005);
+    store32(buf + 544, 0x00000010);
+    store32(buf + 548, 0x00000013);
+    store32(buf + 552, 0x0003003E);
+    store32(buf + 556, 0x00000017);
+    store32(buf + 560, 0x00000016);
+    store32(buf + 564, 0x000100FD);
+    store32(buf + 568, 0x00010038);
+    return 572;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native COMPILED f64 sqrt e2e (v3.2 F.7f.7b) — OpExtInst Sqrt macro on Cezanne\n");
+    print_cstr("----------------------------------------------------------------------------\n");
+    print_cstr("kernel: out[i] = sqrt(a[i])  (f64 SPIR-V -> gfx9_compile -> Newton-Goldschmidt)\n\n");
+
+    var spv[800];
+    var n = build_f64_sqrt_kernel(&spv);
+
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var outbi[512];
+    var m[80];
+    # The sqrt macro adds ~12 synth ids (cap_ids=64); size the id-indexed buffers generously.
+    var vals[2560];
+    var instrs[1536];
+    var ptrs[384];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 24, 64);
+    var isel[2048];
+    var isel2[2048];
+    var alloc[1024];
+    var hw[16];
+    var abi[64];
+    var cc[88];
+    store64(&cc + CC_TYPES, &types);
+    store64(&cc + CC_CONSTS, &consts);
+    store64(&cc + CC_DECO, &deco);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_OUTBI, &outbi);
+    store64(&cc + CC_ISEL, &isel);
+    store64(&cc + CC_ISEL2, &isel2);
+    store64(&cc + CC_ALLOC, &alloc);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    store64(&cc + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    var crc = gfx9_compile(&cc, &spv, n, &isa, &desc);
+    if (crc != 0) { print_cstr("FAIL: gfx9_compile rc="); print_i64(crc); print_cstr("\n"); return 2; }
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var rsrc1 = load64(&desc + DESC_RSRC1);
+    var rsrc2 = load64(&desc + DESC_RSRC2);
+    print_cstr("compiled: isa_len="); print_i64(isa_len);
+    print_cstr(" bindings="); print_i64(load64(&desc + DESC_NUM_BINDINGS)); print_cstr("\n\n");
+
+    var av[64];
+    var wv[64];
+    fill_inputs(&av);
+    fill_wants(&wv);
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: gpu_context_new_native\n"); return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shader_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &shader_bo) != 0) { return 5; }
+    var shader_handle = load64(&shader_bo + 0);
+    var shader_map    = load64(&shader_bo + 8);
+    memset(shader_map, 0, 4096);
+    var w = 0;
+    while (w < isa_len) { store32(shader_map + w, load32(&isa + w)); w = w + 4; }
+    var shader_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, shader_handle, shader_va, 4096, _NATIVE_PERM_SHADER) != 0) { return 5; }
+
+    var abo[16]; var obo[16];
+    if (native_bo_create_gtt(fd, 4096, &abo) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &obo) != 0) { return 5; }
+    var a_handle = load64(&abo + 0); var a_map = load64(&abo + 8);
+    var o_handle = load64(&obo + 0); var o_map = load64(&obo + 8);
+    var i = 0;
+    while (i < N_LANES) {
+        store64(a_map + i * 8, load64(&av + i * 8));
+        store64(o_map + i * 8, 0xBAADF00DBAADF00D);
+        i = i + 1;
+    }
+    var a_va = 0xFFFF800100400000;
+    var o_va = 0xFFFF800100402000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    var bind_vas[32];
+    store64(&bind_vas + 0,  a_va);
+    store64(&bind_vas + 8,  o_va);
+    var bind_handles[32];
+    store64(&bind_handles + 0,  a_handle);
+    store64(&bind_handles + 8,  o_handle);
+
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    if (pm4 == 0) { return 7; }
+    memset(pm4, 0, 256);
+    var pm4_bytes = native_pm4_build_compute_dispatch(pm4, shader_va, rsrc1, rsrc2,
+    &bind_vas, 2, N_LANES, 1, 1, 1, 1, 1);
+
+    var deadline = mono_ns() + 15000000000;
+    var rc = native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
+    &bind_handles, 2, deadline);
+    if (rc != 0) { print_cstr("FAIL: dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    print_cstr("  lane :        out (got, hex)    |   want = sqrt(a) (hex)\n");
+    var ok = 1;
+    i = 0;
+    while (i < N_LANES) {
+        var got = load64(o_map + i * 8);
+        print_cstr("  ["); print_i64(i); print_cstr("]  : ");
+        print_hex64(got); print_cstr("  |  ");
+        if (i == 7) {
+            print_cstr("       (NaN expected)");
+            if (is_nan(got) == 0) { print_cstr("   <-- MISMATCH (not NaN)"); ok = 0; }
+        } else {
+            var ref = load64(&wv + i * 8);
+            print_hex64(ref);
+            if (got != ref) { print_cstr("   <-- MISMATCH"); ok = 0; }
+        }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_gem_va_unmap(fd, shader_handle, shader_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    native_bo_release_gtt(fd, shader_handle, shader_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("\nFAIL: compiled f64 sqrt not bit-exact vs the math.sqrt reference\n"); return 11; }
+    print_cstr("\nOK — all 8 lanes correct: compiled f64 OpExtInst Sqrt (Newton-Goldschmidt) on Cezanne (F.7f.7b)\n");
+    return 0;
+}
