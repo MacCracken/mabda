@@ -1200,6 +1200,133 @@ fn gpu_caps_supports_format(caps, fmt): i64 {
     return 0;
 }
 
+# --- asset_format.cyr ---
+
+# @public - asset container format mapping (v3.3 Phase AL.0)
+# asset_format.cyr - maps external container format ids to mabda's
+# backend-agnostic MABDA_TEXFMT_* ids. Pure Cyrius: no FFI, no syscalls.
+#
+# KTX2 carries a Vulkan `VkFormat` (u32); DDS carries either a D3D
+# `DXGI_FORMAT` (the DX10 path) or a legacy FourCC (handled in the DDS
+# loader, AL.3). This module owns the numeric -> MABDA_TEXFMT_* lookups
+# the loaders (AL.3 DDS, AL.4 KTX2) call after parsing a header.
+#
+# Number provenance (pinned, NOT inferred - a wrong number is a silent-
+# wrong load; same discipline as the gfx9.json register pinning):
+#   VkFormat    - KhronosGroup/Vulkan-Headers vulkan_core.h (verified
+#                 2026-06-19 by curl+grep against the canonical enum).
+#   DXGI_FORMAT - the D3D `DXGI_FORMAT` enum (verified 2026-06-19 against
+#                 the system dxgiformat.h: BC1=0x47, BC2=0x4A, BC3=0x4D,
+#                 BC4=0x50, BC5=0x53, BC6H_UF16=0x5F, BC7=0x62).
+#
+# Mapping policy:
+#   - An unmapped / unrepresentable format returns 0. Note 0 is also
+#     MABDA_TEXFMT_RGBA8, so callers MUST disambiguate: a 0 result is
+#     "RGBA8" only when the input was the known RGBA8 source value, else
+#     it is "unsupported -> fail loud". The loaders check the input first.
+#   - sRGB-encoded variants COLLAPSE to the matching UNORM mabda id (mabda
+#     has no distinct _SRGB ids yet). This is loadable but the sRGB->linear
+#     decode is lost unless the consumer compensates, so sRGB-ness is made
+#     queryable via mabda_vk_format_is_srgb / mabda_dxgi_format_is_srgb -
+#     it is a DOCUMENTED, DETECTABLE limitation, never a silent collapse.
+#     Adding real MABDA_TEXFMT_*_SRGB ids is tracked (3-3 punchlist AL.0).
+#   - SNORM / SFLOAT variants (BC4_SNORM, BC5_SNORM, BC6H_SFLOAT) have NO
+#     correct mabda representation (mabda BC4/BC5 are UNORM, BC6H is
+#     UFLOAT) and return 0 (fail loud) rather than mis-interpret signed
+#     data. BC2 and ETC2 R8G8B8A1 have no mabda id and return 0.
+
+# ----------------------------------------------------------------
+# VkFormat -> MABDA_TEXFMT_* (KTX2). Returns 0 if unmapped.
+# ----------------------------------------------------------------
+fn mabda_texfmt_from_vk_format(vk): i64 {
+    # RGBA8 (UNORM 37, SRGB 43)
+    if (vk == 37)  { return MABDA_TEXFMT_RGBA8; }
+    if (vk == 43)  { return MABDA_TEXFMT_RGBA8; }       # sRGB -> RGBA8
+    # BC1 (RGB UNORM 131 / RGB SRGB 132 / RGBA UNORM 133 / RGBA SRGB 134)
+    if (vk == 131) { return MABDA_TEXFMT_BC1; }
+    if (vk == 132) { return MABDA_TEXFMT_BC1; }         # sRGB
+    if (vk == 133) { return MABDA_TEXFMT_BC1; }
+    if (vk == 134) { return MABDA_TEXFMT_BC1; }         # sRGB
+    # BC2 (135/136) - no mabda id -> fail loud (0)
+    # BC3 (UNORM 137 / SRGB 138)
+    if (vk == 137) { return MABDA_TEXFMT_BC3; }
+    if (vk == 138) { return MABDA_TEXFMT_BC3; }         # sRGB
+    # BC4 (UNORM 139; SNORM 140 -> 0)
+    if (vk == 139) { return MABDA_TEXFMT_BC4; }
+    # BC5 (UNORM 141; SNORM 142 -> 0)
+    if (vk == 141) { return MABDA_TEXFMT_BC5; }
+    # BC6H (UFLOAT 143; SFLOAT 144 -> 0)
+    if (vk == 143) { return MABDA_TEXFMT_BC6H; }
+    # BC7 (UNORM 145 / SRGB 146)
+    if (vk == 145) { return MABDA_TEXFMT_BC7; }
+    if (vk == 146) { return MABDA_TEXFMT_BC7; }         # sRGB
+    # ETC2 RGB8 (UNORM 147 / SRGB 148); R8G8B8A1 (149/150) has no id -> 0
+    if (vk == 147) { return MABDA_TEXFMT_ETC2_RGB8; }
+    if (vk == 148) { return MABDA_TEXFMT_ETC2_RGB8; }   # sRGB
+    # ETC2 RGBA8 (UNORM 151 / SRGB 152)
+    if (vk == 151) { return MABDA_TEXFMT_ETC2_RGBA8; }
+    if (vk == 152) { return MABDA_TEXFMT_ETC2_RGBA8; }  # sRGB
+    # ASTC 4x4 (157/158), 6x6 (165/166), 8x8 (171/172)
+    if (vk == 157) { return MABDA_TEXFMT_ASTC_4X4; }
+    if (vk == 158) { return MABDA_TEXFMT_ASTC_4X4; }    # sRGB
+    if (vk == 165) { return MABDA_TEXFMT_ASTC_6X6; }
+    if (vk == 166) { return MABDA_TEXFMT_ASTC_6X6; }    # sRGB
+    if (vk == 171) { return MABDA_TEXFMT_ASTC_8X8; }
+    if (vk == 172) { return MABDA_TEXFMT_ASTC_8X8; }    # sRGB
+    return 0;
+}
+
+# 1 if `vk` is an sRGB-encoded VkFormat this module maps (so the caller
+# knows the UNORM-id result lost the sRGB encoding), else 0.
+fn mabda_vk_format_is_srgb(vk): i64 {
+    if (vk == 43)  { return 1; }   # RGBA8 sRGB
+    if (vk == 132) { return 1; }   # BC1 RGB sRGB
+    if (vk == 134) { return 1; }   # BC1 RGBA sRGB
+    if (vk == 138) { return 1; }   # BC3 sRGB
+    if (vk == 146) { return 1; }   # BC7 sRGB
+    if (vk == 148) { return 1; }   # ETC2 RGB8 sRGB
+    if (vk == 152) { return 1; }   # ETC2 RGBA8 sRGB
+    if (vk == 158) { return 1; }   # ASTC 4x4 sRGB
+    if (vk == 166) { return 1; }   # ASTC 6x6 sRGB
+    if (vk == 172) { return 1; }   # ASTC 8x8 sRGB
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# DXGI_FORMAT -> MABDA_TEXFMT_* (DDS DX10 path). Returns 0 if unmapped.
+# ----------------------------------------------------------------
+fn mabda_texfmt_from_dxgi_format(dxgi): i64 {
+    # RGBA8 (UNORM 0x1C=28 / SRGB 0x1D=29)
+    if (dxgi == 28) { return MABDA_TEXFMT_RGBA8; }
+    if (dxgi == 29) { return MABDA_TEXFMT_RGBA8; }      # sRGB
+    # BC1 (UNORM 0x47=71 / SRGB 0x48=72)
+    if (dxgi == 71) { return MABDA_TEXFMT_BC1; }
+    if (dxgi == 72) { return MABDA_TEXFMT_BC1; }        # sRGB
+    # BC2 (0x4A=74) - no mabda id -> 0
+    # BC3 (UNORM 0x4D=77 / SRGB 0x4E=78)
+    if (dxgi == 77) { return MABDA_TEXFMT_BC3; }
+    if (dxgi == 78) { return MABDA_TEXFMT_BC3; }        # sRGB
+    # BC4 (UNORM 0x50=80; SNORM 0x51=81 -> 0)
+    if (dxgi == 80) { return MABDA_TEXFMT_BC4; }
+    # BC5 (UNORM 0x53=83; SNORM 0x54=84 -> 0)
+    if (dxgi == 83) { return MABDA_TEXFMT_BC5; }
+    # BC6H (UF16 0x5F=95; SF16 0x60=96 -> 0)
+    if (dxgi == 95) { return MABDA_TEXFMT_BC6H; }
+    # BC7 (UNORM 0x62=98 / SRGB 0x63=99)
+    if (dxgi == 98) { return MABDA_TEXFMT_BC7; }
+    if (dxgi == 99) { return MABDA_TEXFMT_BC7; }        # sRGB
+    return 0;
+}
+
+# 1 if `dxgi` is an sRGB-encoded DXGI_FORMAT this module maps, else 0.
+fn mabda_dxgi_format_is_srgb(dxgi): i64 {
+    if (dxgi == 29) { return 1; }  # RGBA8 sRGB
+    if (dxgi == 72) { return 1; }  # BC1 sRGB
+    if (dxgi == 78) { return 1; }  # BC3 sRGB
+    if (dxgi == 99) { return 1; }  # BC7 sRGB
+    return 0;
+}
+
 # --- wgpu_descriptors.cyr ---
 
 # @internal — FFI / toolchain scaffolding, replaced in v3.0

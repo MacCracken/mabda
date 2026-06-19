@@ -61,24 +61,31 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.0 — Format tables + caps access (3.3.0) [M]
 
-- [ ] **AL.0a** — `src/asset_format.cyr` scaffold (pure, sibling of
-  `texture_format.cyr`); add to `src/lib.cyr` after `texture_format.cyr` **and**
-  to `cyrius.cyml [lib].modules` (the distlib-manifest gotcha). Smoke links.
-- [ ] **AL.0b** — `mabda_texfmt_from_vk_format(vk)` — **pin every VkFormat
-  number against the canonical Vulkan `VkFormat` enum** at impl (cite in the
-  header, gfx9.json-style discipline). N:1 collapse is real (BC1_RGB 131 /
-  BC1_RGBA 133 / their sRGB peers → one `MABDA_TEXFMT_BC1`); see the **sRGB
-  policy** decision below. Unmapped → 0. Test each + unknown.
-- [ ] **AL.0c** — `mabda_texfmt_from_dxgi_format(dxgi)` — pin against the D3D
-  `DXGI_FORMAT` enum. Unmapped → 0. Test each + unknown.
-- [ ] **AL.0d** — **sRGB policy** (the #1 silent-wrong risk): mabda has no
-  `_SRGB` format ids. Decide per impl: (a) map sRGB sources to the UNORM id +
-  record an `is_srgb` flag the loader surfaces, or (b) add `MABDA_TEXFMT_*_SRGB`
-  ids. Do NOT silently load sRGB data as UNORM. Test the chosen policy.
-- [ ] **AL.0e** — caps-on-ctx: stash the `GpuCapabilities` on `GpuContext` at
-  create (or add `gpu_ctx_supports_format(ctx, fmt)` resolving caps internally),
-  so the loaders can run the ETC2/ASTC/BC6H gate. **Prerequisite for AL.3/AL.4.**
-  Test the accessor + a format-supported query.
+- [x] **AL.0a (2026-06-19)** — `src/asset_format.cyr` (pure, sibling of
+  `texture_format.cyr`); added to `src/lib.cyr` (after `texture_format.cyr`) +
+  `cyrius.cyml [lib].modules`. Smoke links.
+- [x] **AL.0b (2026-06-19)** — `mabda_texfmt_from_vk_format(vk)` + the N:1 sRGB
+  collapse. **Every VkFormat number pinned by `curl`+`grep` against
+  KhronosGroup/Vulkan-Headers `vulkan_core.h`** (cited in the header). This
+  caught the design's wrong ASTC numbers (6x6 is **165** not 163; 8x8 is **171**
+  not 173). BC2 (135/136), ETC2_R8G8B8A1 (149/150), and SNORM/SFLOAT variants
+  (BC4_SNORM 140 / BC5_SNORM 142 / BC6H_SFLOAT 144) → 0 (no correct mabda id).
+- [x] **AL.0c (2026-06-19)** — `mabda_texfmt_from_dxgi_format(dxgi)` — pinned
+  against the system `dxgiformat.h`. Caught the plan's **wrong `DXGI 74→BC3`**:
+  74 (`0x4A`) is **BC2** (no mabda id → 0); BC3 is **77** (`0x4D`).
+- [x] **AL.0d (2026-06-19)** — **sRGB policy chosen: map sRGB → the UNORM mabda
+  id + a queryable `mabda_{vk,dxgi}_format_is_srgb` flag** (option a). sRGB is
+  thus loadable but DETECTABLE (documented, never silent). Adding distinct
+  `MABDA_TEXFMT_*_SRGB` ids (option b — the proper fix, touches texture_format +
+  wgpu_types + native) is **tracked here** as a follow-up if a consumer needs
+  correct sRGB sampling. +58 CPU asserts (`tests/tcyr/asset_load.tcyr`; suite
+  4079→4137 across 17 files). Smoke/lint/fmt/distlib green.
+- [ ] **AL.0e → folded into AL.3.** Caps-on-ctx (`gpu_ctx_supports_format`) is
+  backend-divergent (wgpu detects via the adapter over FFI; native is the pure
+  `gpu_caps_native_texture_compression`) and `ctx` stores no caps today — so the
+  gate belongs **with its first consumer, the DDS loader (AL.3g)**, not in this
+  pure-CPU bite. Moved (not dropped) so AL.0 stays a clean pure-CPU foundation;
+  the `gpu_caps_supports_format(caps, fmt)` primitive it needs already exists.
 
 ## Phase AL.1 — Per-mip-level upload (3.3.1) [M]
 
