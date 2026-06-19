@@ -39,6 +39,7 @@ var SPIRV_OP_IMUL             = 132;
 var SPIRV_OP_FMUL             = 133;
 var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
 var SPIRV_OP_SDIV             = 135;   # N.9d — sign-magnitude over the udiv core
+var SPIRV_OP_FDIV             = 136;   # F.7f.6b — f64 reciprocal Newton macro (f32 fail-loud)
 var SPIRV_OP_UMOD             = 137;   # N.9c — udiv core, remainder select
 var SPIRV_OP_SREM             = 138;   # N.9d — signed remainder (dividend sign)
 var SPIRV_OP_SMOD             = 139;   # N.9d — floored modulo (divisor sign)
@@ -616,6 +617,41 @@ fn _spirv_lower_umod(ptr, off, wc, m): i64 {
     return 0;
 }
 
+# OpFDiv(result, N, D) → the LLVM gfx900 correctly-rounded f64 division: a scaled-reciprocal
+# Newton macro. GFX9 has no f64 divide and v_rcp_f64 is only an ~f32-precision seed (the F.7f.5
+# finding), so the quotient is refined to full f64 precision: two DIV_SCALE ops normalise the
+# operands (the second writes the scale flag to VCC), v_rcp_f64 seeds 1/D, three FMA Newton
+# steps lift it to ~full precision, then DIV_FMAS (which reads VCC for the 2^±64 fixup) and
+# DIV_FIXUP produce the correctly-rounded result. The chain is emitted contiguously so VCC
+# from the 2nd DIV_SCALE survives to DIV_FMAS (the FMA/MUL between never write VCC).
+# f64-only — f32 FDiv is a parallel (simpler) macro with no consumer yet (wgpu/naga covers
+# the f32 portable path); it fails loud here (tracked: punchlist F.7f, native-f32-div note).
+fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+    if (mir_type_base(rty) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    if (mir_type_count(rty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var result = spirv_word(ptr, off + 2);
+    var a = spirv_word(ptr, off + 3);   # N — dividend (numerator)
+    var b = spirv_word(ptr, off + 4);   # D — divisor (denominator)
+    var t = MIR_T_F64;
+    # s0 = div_scale(D, D, N) — scaled denominator; its VCC flag is dead (overwritten below).
+    var s0 = _udiv_op(m, MIR_OP_F64_DIV_SCALE, t, b, b, a, 0);       if (s0 < 0) { return s0; }
+    var rcp = _udiv_op(m, MIR_OP_F64_RCP, t, s0, 0, 0, 0);          if (rcp < 0) { return rcp; }
+    var e1 = _udiv_op(m, MIR_OP_F64_FMA_N0_ONE, t, s0, rcp, 0, 0);  if (e1 < 0) { return e1; }
+    var rcp2 = _udiv_op(m, MIR_OP_FMA, t, rcp, e1, rcp, 0);         if (rcp2 < 0) { return rcp2; }
+    # s1 = div_scale(N, D, N) — scaled numerator; its VCC flag is LIVE → DIV_FMAS reads it.
+    var s1 = _udiv_op(m, MIR_OP_F64_DIV_SCALE, t, a, b, a, 0);      if (s1 < 0) { return s1; }
+    var e2 = _udiv_op(m, MIR_OP_F64_FMA_N0_ONE, t, s0, rcp2, 0, 0); if (e2 < 0) { return e2; }
+    var rcp3 = _udiv_op(m, MIR_OP_FMA, t, rcp2, e2, rcp2, 0);       if (rcp3 < 0) { return rcp3; }
+    var q = _udiv_op(m, MIR_OP_FMUL, t, s1, rcp3, 0, 0);            if (q < 0) { return q; }
+    var r = _udiv_op(m, MIR_OP_F64_FMA_N0, t, s0, q, s1, 0);        if (r < 0) { return r; }
+    var qf = _udiv_op(m, MIR_OP_F64_DIV_FMAS, t, r, rcp3, q, 0);    if (qf < 0) { return qf; }
+    var er = mir_emit(m, MIR_OP_F64_DIV_FIXUP, result, t, qf, b, a, 0);
+    if (er < 0) { return er; }
+    return 0;
+}
+
 # Signed-division prep: sign masks (ASHR 31 → 0 or 0xFFFFFFFF) + magnitudes via the
 # branchless abs (x^sign)-sign. Writes [signA, signB, absA, absB] into out (N.9d).
 fn _signed_prep(m, a, b, out): i64 {
@@ -845,6 +881,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # OpUDiv / OpUMod / OpSDiv / OpSRem expand to the float-reciprocal macro (no GFX9
     # integer divide); signed ops wrap it in a sign-magnitude shell. N.9b/c/d.
     if (op == SPIRV_OP_UDIV) { return _spirv_lower_udiv(ptr, off, wc, m); }
+    if (op == SPIRV_OP_FDIV) { return _spirv_lower_fdiv(ptr, off, wc, types, m); }
     if (op == SPIRV_OP_UMOD) { return _spirv_lower_umod(ptr, off, wc, m); }
     if (op == SPIRV_OP_SDIV) { return _spirv_lower_sdiv(ptr, off, wc, m); }
     if (op == SPIRV_OP_SREM) { return _spirv_lower_srem(ptr, off, wc, m); }

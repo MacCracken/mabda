@@ -107,6 +107,15 @@ var GISEL_V_CVT_F32_F64        = 58;   # narrow (f32)f64
 # emits the right opcode + modifier bits (encoded in gfx9_compile, reusing the F.7b opcodes).
 var GISEL_V_SUB_F64            = 59;   # a - b  (v_add_f64 a, -b)
 var GISEL_V_ABS_F64            = 60;   # |x|    (v_max_f64 |x|, |x|)
+# v3.2 F.7f.6b — f64 division macro ops. All VALU/VOP3 over 64-bit pairs. DIV_SCALE is VOP3B
+# (writes the scale flag to the implicit VCC); DIV_FMAS reads VCC; the FMA_N0 forms ride a
+# NEGATE-src0 modifier (N0_ONE adds an inline-1.0 src2). Emit detail in gfx9_compile.cyr.
+var GISEL_V_RCP_F64           = 61;   # v_rcp_f64 reciprocal seed
+var GISEL_V_DIV_SCALE_F64     = 62;   # v_div_scale_f64 (3-src; flag → VCC)
+var GISEL_V_DIV_FMAS_F64      = 63;   # v_div_fmas_f64 (3-src; reads VCC)
+var GISEL_V_DIV_FIXUP_F64     = 64;   # v_div_fixup_f64 (3-src)
+var GISEL_V_FMA_F64_N0        = 65;   # v_fma_f64(-a, b, c)
+var GISEL_V_FMA_F64_N0_ONE    = 66;   # v_fma_f64(-a, b, 1.0)
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -204,8 +213,9 @@ fn _gisel_float_op(mop, tbase): i64 {
     if (mop == MIR_OP_FABS) { if (f64 == 1) { return GISEL_V_ABS_F64; } return GISEL_V_ABS_F32; }
     # f64 SQRT/FLOOR/CLAMP have no correct single-instruction form → fail loud (return 0). GFX9
     # v_sqrt_f64 is only an ~f32-precision approximation (HW-proven, the F.7f.5 finding), so a correct
-    # f64 sqrt/div needs a v_rsq_f64/v_rcp_f64 + Newton-refinement macro — tracked in
-    # docs/development/3-2-punchlist.md (F.7f.6 FSqrt macro / F.7f.7 FDiv macro).
+    # f64 sqrt needs a v_rsq_f64 + Newton-refinement macro. f64 DIV is now lowered as a macro in
+    # spirv_lower.cyr (OpFDiv, F.7f.6b) — NOT routed here. FSqrt is tracked in
+    # docs/development/3-2-punchlist.md (F.7f.7); FFLOOR/FCLAMP f64 are later breadth bites.
     if (f64 == 1) { return 0; }
     if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
     if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
@@ -344,6 +354,14 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RCP_IFLAG) { return _gisel_emit(out, k, GISEL_V_RCP_IFLAG_F32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_MUL_HI) { return _gisel_emit(out, k, GISEL_V_MUL_HI_U32, dst, a, b, 0, flags); }
     if (op == MIR_OP_CNDMASK) { return _gisel_emit(out, k, GISEL_V_CNDMASK, dst, a, b, 0, flags); }
+    # F.7f.6b f64 division macro: all VALU/f64 (dst type is f64 → regalloc claims a pair). The
+    # 3-src forms carry a/b/c; RCP is unary; FMA_N0_ONE drops c (the inline 1.0 is in the emit).
+    if (op == MIR_OP_F64_RCP) { return _gisel_emit(out, k, GISEL_V_RCP_F64, dst, a, 0, 0, flags); }
+    if (op == MIR_OP_F64_DIV_SCALE) { return _gisel_emit(out, k, GISEL_V_DIV_SCALE_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_DIV_FMAS) { return _gisel_emit(out, k, GISEL_V_DIV_FMAS_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_DIV_FIXUP) { return _gisel_emit(out, k, GISEL_V_DIV_FIXUP_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_FMA_N0) { return _gisel_emit(out, k, GISEL_V_FMA_F64_N0, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_FMA_N0_ONE) { return _gisel_emit(out, k, GISEL_V_FMA_F64_N0_ONE, dst, a, b, 0, flags); }
     if (op == MIR_OP_EXTRACT) {
         # The EXTRACT result's register file is decided from its uniformity
         # (gisel_result_is_vgpr), so a result-less or UNKNOWN-uniformity extract

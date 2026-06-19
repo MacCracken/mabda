@@ -348,6 +348,71 @@ fn test_spirv_lower_smod() {
     return 0;
 }
 
+# F.7f.6b — OpFDiv (f64) lowers to the 11-op reciprocal-Newton macro. A minimal module header (so
+# spirv_hdr_id_bound reads a real bound) + a single OpFDiv; types[2] = f64. The chain: DIV_SCALE
+# (D,D,N) → RCP → FMA_N0_ONE → FMA → DIV_SCALE (N,D,N, flag→VCC) → FMA_N0_ONE → FMA → FMUL →
+# FMA_N0 → DIV_FMAS (reads VCC) → DIV_FIXUP. The 2nd DIV_SCALE (i4) must precede DIV_FMAS (i9)
+# with only FMA/MUL between (no VCC writer) — the contiguity the VCC liveness depends on.
+fn test_spirv_lower_fdiv() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 4, 0x00010300); store32(&buf + 8, 0);
+    store32(&buf + 12, 16);   # id bound
+    store32(&buf + 16, 0);
+    store32(&buf + 20, (5 << 16) | 136);   # OpFDiv
+    store32(&buf + 24, 2);                  # result type id (-> f64)
+    store32(&buf + 28, 5);                  # result id
+    store32(&buf + 32, 3);                  # operand a (dividend N)
+    store32(&buf + 36, 4);                  # operand b (divisor D)
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);   # result type = f64
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m), 0, "fdiv f64 lowers");
+    assert_eq(mir_n_instrs(&m), 11, "fdiv = 11 MIR instrs");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_DIV_SCALE, "0: div_scale(D,D,N)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_F64_RCP, "1: rcp seed");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_F64_FMA_N0_ONE, "2: fma(-s0,rcp,1)");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_FMA, "3: fma(rcp,e1,rcp)");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_F64_DIV_SCALE, "4: div_scale(N,D,N) -> VCC");
+    assert_eq(mir_instr_op(&m, 7), MIR_OP_FMUL, "7: q = s1*rcp3");
+    assert_eq(mir_instr_op(&m, 8), MIR_OP_F64_FMA_N0, "8: r = fma(-s0,q,s1)");
+    assert_eq(mir_instr_op(&m, 9), MIR_OP_F64_DIV_FMAS, "9: div_fmas (reads VCC)");
+    assert_eq(mir_instr_op(&m, 10), MIR_OP_F64_DIV_FIXUP, "10: div_fixup (rounding)");
+    return 0;
+}
+
+# F.7f.6b — OpFDiv on f32 has no native macro yet (wgpu/naga covers the f32 path) → FAIL LOUD
+# rather than silently lowering with f64 ops. Same module, types[2] = f32.
+fn test_spirv_lower_fdiv_f32_rejects() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 4, 0x00010300); store32(&buf + 8, 0);
+    store32(&buf + 12, 16);
+    store32(&buf + 16, 0);
+    store32(&buf + 20, (5 << 16) | 136);   # OpFDiv
+    store32(&buf + 24, 2);                  # result type id (-> f32)
+    store32(&buf + 28, 5);
+    store32(&buf + 32, 3);
+    store32(&buf + 36, 4);
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 32, 0, 16);   # result type = f32
+    var m[80];
+    var vals[2560];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m),
+    0 - MIR_ERR_UNSUPPORTED_TYPE, "fdiv f32 fails loud");
+    assert_eq(mir_n_instrs(&m), 0, "f32 fdiv emits no MIR");
+    return 0;
+}
+
 # N.10a — OpCompositeConstruct packs N scalar component <id>s into a MIR_VK_VECTOR (no
 # instructions); OpCompositeExtract pulls a component out via a single VMOV. A 5-word SPIR-V
 # header (id_bound at word 3) precedes both instructions at off 5 / off 11.
@@ -832,9 +897,10 @@ fn test_spirv_lower_negatives() {
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
     0 - LOWER_ERR_CONTROL_FLOW, "PHI still rejected");
-    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP
+    # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP (OpFDiv (136) is now lowered as the
+    # F.7f.6b macro, so use OpFRem (140) — still unmapped — for the generic-unsupported path).
     _spv_build_gid_kernel(&buf);
-    store32(&buf + 324, (5 << 16) | 136);   # OpShiftLeftLogical -> OpFDiv (unmapped)
+    store32(&buf + 324, (5 << 16) | 140);   # OpShiftLeftLogical -> OpFRem (unmapped)
     spirv_build_type_table(&buf, n, 16, 16, &types);
     spirv_build_const_table(&buf, n, 16, 16, &consts);
     spirv_build_decoration_table(&buf, n, 16, 16, &deco);
@@ -1234,6 +1300,8 @@ fn main(): i64 {
     test_spirv_lower_gid_kernel();
     test_spirv_const_fold();
     test_spirv_lower_smod();
+    test_spirv_lower_fdiv();
+    test_spirv_lower_fdiv_f32_rejects();
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();
     test_spirv_vec_robustness();

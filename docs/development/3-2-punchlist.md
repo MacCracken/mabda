@@ -1001,8 +1001,22 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     - [x] **F.7f.6a** *(2026-06-18)* — encoder foundation: `V_RCP_F64`/`V_DIV_SCALE_F64`/
       `V_DIV_FMAS_F64`/`V_DIV_FIXUP_F64` opcodes + the `gfx9_enc_vop3b_lo` VOP3B form (SDST in
       lo[14:8]) + the `test_gfx9_enc_f64_div` byte-oracle (llvm-mc gfx900-matched). No lowering yet.
-    - [ ] **F.7f.6b** — macro lowering in gfx9_compile.cyr: VCC reservation + the SGPR-pair scale
-      output + the 11-instr sequence + regalloc temporaries; HW e2e `out=a/b` value-exact on Cezanne.
+    - [x] **F.7f.6b** *(2026-06-18)* — **HW-verified on Cezanne**: OpFDiv → the 11-op reciprocal-Newton
+      MIR macro (`_spirv_lower_fdiv`) → 6 new MIR/GISEL ops (RCP/DIV_SCALE/DIV_FMAS/DIV_FIXUP +
+      the NEG-src0 FMA_N0/FMA_N0_ONE) → 3 new emit helpers (div_scale VOP3B→VCC, the two NEG-src0
+      FMAs); regalloc claims the f64 pairs op-agnostically, waitcnt passes them through, VCC threads
+      2nd-DIV_SCALE→DIV_FMAS by emission contiguity. `out=a/b` **BIT-EXACT vs CPU f64_div** on all 8
+      lanes incl. the repeating-fraction cases (1/3, 22/7, 355/113, 1e10/3, 1/1e6) —
+      `native_spirv_f64_div_e2e.cyr`. f32 FDiv fails loud (see the native-f32-div note below).
+      Adversarially reviewed (Workflow, 4 dims / 11 agents; 5 findings refuted): the one confirmed
+      finding — the new f64 div macro primitives weren't in `_mir_instr_unif`'s forced-DIVERGENT
+      guard (latent: masked today by regalloc forcing VGPR for V_* ops, but a foot-gun) — was fixed
+      (guard extended to ops 46–51, pinned by `test_mir_unif_f64_div_ops_forced_divergent`).
+    - [ ] **native-f32-div** *(deferred, no consumer)* — `_spirv_lower_fdiv` rejects f32 (returns
+      UNSUPPORTED_TYPE; pinned by `test_spirv_lower_fdiv_f32_rejects`). The f32 parallel macro
+      (v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32) is straightforward but
+      unneeded: attn11's f32 portable path runs on wgpu (naga lowers f32 div). Add when a native
+      f32-div consumer appears.
   - [ ] **F.7f.7 (FSqrt macro)** — correctly-rounded f64 sqrt: `v_rsq_f64` seed + Newton iterations +
     the `v_ldexp_f64`/`v_cmp_class_f64` range-reduction guard (the ~15-instr LLVM expansion).
   - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing).

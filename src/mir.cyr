@@ -122,6 +122,18 @@ var MIR_OP_ASHR        = 44;
 # v3.2 F.7f.2 — f32<->f64 conversion (OpFConvert). isel picks the direction from the RESULT type:
 # f64 result → widen (V_CVT_F64_F32), f32 result → narrow (V_CVT_F32_F64).
 var MIR_OP_FCONVERT    = 45;
+# v3.2 F.7f.6b — f64 division macro primitives (OpFDiv → the LLVM gfx900 reciprocal Newton
+# expansion). All VALU/f64 (64-bit VGPR pairs). DIV_SCALE writes the per-lane scale flag to
+# the implicit VCC (consumed by DIV_FMAS); the chain is emitted contiguously so that VCC
+# survives (only the two DIV_SCALEs write it; the intervening FMA/MUL never touch it — same
+# adjacency-by-construction the udiv CNDMASK relies on). FMA_N0 = fma(-a,b,c); FMA_N0_ONE =
+# fma(-a,b,1.0) (the Newton refinement step, inline-1.0 src2).
+var MIR_OP_F64_RCP        = 46;   # v_rcp_f64 reciprocal seed (unary; refine via Newton)
+var MIR_OP_F64_DIV_SCALE  = 47;   # v_div_scale_f64 (3-src; scaled value → dst, flag → VCC)
+var MIR_OP_F64_DIV_FMAS   = 48;   # v_div_fmas_f64 (3-src; reads VCC for the 2^±64 post-scale)
+var MIR_OP_F64_DIV_FIXUP  = 49;   # v_div_fixup_f64 (3-src; correctly-rounding fixup)
+var MIR_OP_F64_FMA_N0     = 50;   # v_fma_f64(-a, b, c) — NEGATE src0
+var MIR_OP_F64_FMA_N0_ONE = 51;   # v_fma_f64(-a, b, 1.0) — NEGATE src0 + inline-1.0 src2
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -441,6 +453,13 @@ fn _mir_instr_unif(m, i): i64 {
     # the udiv macro fully vector even for uniform operands (each lane computes the same).
     if (op >= MIR_OP_VMOV) {
         if (op <= MIR_OP_CNDMASK) { return MIR_DIVERGENT; }
+    }
+    # v3.2 F.7f.6b — the f64 division macro primitives (RCP / DIV_SCALE / DIV_FMAS / DIV_FIXUP /
+    # FMA_N0 / FMA_N0_ONE) are the same class: VOP1/VOP3-only with implicit per-lane VCC, no scalar
+    # form. Force DIVERGENT too (a uniform-operand FDiv must not classify them UNIFORM and become an
+    # SGPR-coalescing candidate — they have no SALU form). (F.7f.6b adversarial review.)
+    if (op >= MIR_OP_F64_RCP) {
+        if (op <= MIR_OP_F64_FMA_N0_ONE) { return MIR_DIVERGENT; }
     }
     var flags = mir_instr_flags(m, i);
     var b = mir_instr_b(m, i);

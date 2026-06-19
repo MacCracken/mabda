@@ -369,6 +369,37 @@ fn test_gfx9_regalloc_valu_uniform() {
     return 0;
 }
 
+# F.7f.6b review — the f64 division macro primitives are vector-only (VOP1/VOP3 with implicit VCC,
+# no scalar form) and must classify DIVERGENT even when every operand is UNIFORM, exactly like the
+# udiv primitives. Each op here takes only uniform f64 constants; the forced-DIVERGENT guard in
+# _mir_instr_unif must override the would-be-UNIFORM meet (else a future SGPR-coalescing pass could
+# pick them — no SALU form exists). Without the guard each result classifies UNIFORM (the bug).
+fn test_mir_unif_f64_div_ops_forced_divergent() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_set_const(&m, 1, MIR_T_F64, 0);
+    mir_set_const(&m, 2, MIR_T_F64, 0);
+    mir_emit(&m, MIR_OP_F64_RCP, 3, MIR_T_F64, 1, 0, 0, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_SCALE, 4, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_FMA_N0_ONE, 5, MIR_T_F64, 1, 2, 0, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_FMAS, 6, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_DIV_FIXUP, 7, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F64_FMA_N0, 8, MIR_T_F64, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 3), MIR_DIVERGENT, "F64_RCP forced divergent");
+    assert_eq(mir_val_unif(&m, 4), MIR_DIVERGENT, "F64_DIV_SCALE forced divergent");
+    assert_eq(mir_val_unif(&m, 5), MIR_DIVERGENT, "F64_FMA_N0_ONE forced divergent");
+    assert_eq(mir_val_unif(&m, 6), MIR_DIVERGENT, "F64_DIV_FMAS forced divergent");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "F64_DIV_FIXUP forced divergent");
+    assert_eq(mir_val_unif(&m, 8), MIR_DIVERGENT, "F64_FMA_N0 forced divergent");
+    return 0;
+}
+
 # SAXPY: two loads then a use of each. The use of x[i] (instr 5) gets vmcnt(0)
 # before it; that single wait covers BOTH loads, so the use of y[i] (instr 6)
 # needs none. A final vmcnt(0) lgkmcnt(0) drains the store before s_endpgm. This
@@ -1336,6 +1367,7 @@ fn main(): i64 {
     test_gfx9_regalloc_saxpy();
     test_gfx9_regalloc_errors();
     test_gfx9_regalloc_valu_uniform();
+    test_mir_unif_f64_div_ops_forced_divergent();
     test_ra_claim_pair();
     test_gfx9_regalloc_f64_pairs();
     test_gfx9_isel_f64();

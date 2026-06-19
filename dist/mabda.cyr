@@ -5276,6 +5276,10 @@ var GFX9_VOP1_V_CVT_F64_I32 = 0x04;   # (f64)i32
 var GFX9_VOP1_V_CVT_I32_F64 = 0x03;   # (i32)f64
 var GFX9_VOP1_V_CVT_F64_U32 = 0x16;   # (f64)u32
 var GFX9_VOP1_V_CVT_U32_F64 = 0x15;   # (u32)f64
+# v3.2 F.7f.6 — f64 reciprocal seed (VOP1). Raw v_rcp_f64 is an ~f32-precision
+# APPROXIMATION (HW-proven F.7f.5) — usable ONLY as the seed of the FDiv
+# Newton-refinement macro, never as a standalone op. llvm-mc gfx900-verified.
+var GFX9_VOP1_V_RCP_F64     = 0x25;   # 1/x approx (f64 seed; refine with v_fma_f64)
 
 # VOP2 (single-dword) — bits 30-25 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_VOP2_V_CNDMASK_B32 = 0x00;   # d = vcc ? vsrc1 : src0 (VCC implicit) — N.9 udiv
@@ -5326,6 +5330,14 @@ var GFX9_VOP3_V_ADD_F64     = 0x280;   # f64 a + b
 var GFX9_VOP3_V_MUL_F64     = 0x281;   # f64 a * b
 var GFX9_VOP3_V_MIN_F64     = 0x282;   # GLSL.std.450 FMin (f64)
 var GFX9_VOP3_V_MAX_F64     = 0x283;   # GLSL.std.450 FMax (f64)
+# v3.2 F.7f.6 — f64 correctly-rounded division macro ops (the LLVM gfx900 fdiv
+# expansion). V_DIV_SCALE_F64 is VOP3B: it writes a second SGPR-pair output
+# (the divide-scale flag VCC) in lo[14:8], so it needs gfx9_enc_vop3b_lo.
+# V_DIV_FMAS_F64 reads VCC implicitly; V_DIV_FIXUP_F64 is the rounding fixup.
+# All llvm-mc gfx900-verified. Macro lowering lives in gfx9_compile.cyr (F.7f.6b).
+var GFX9_VOP3_V_DIV_SCALE_F64 = 0x1E1; # VOP3B: scale operand, sets VCC scale-flag
+var GFX9_VOP3_V_DIV_FMAS_F64  = 0x1E3; # fma + scale (reads VCC)
+var GFX9_VOP3_V_DIV_FIXUP_F64 = 0x1DF; # correctly-rounding division fixup
 
 # SOP2 (single-dword) — bits 29-23 opcode. (llvm-mc gfx900-verified, N.5a.)
 var GFX9_SOP2_S_ADD_U32     = 0x00;
@@ -5431,6 +5443,12 @@ fn gfx9_enc_vop3a_lo(op, vdst): i64 {
 
 fn gfx9_enc_vop3a_hi(src0, src1, src2): i64 {
     return ((src2 & 0x1FF) << 18) | ((src1 & 0x1FF) << 9) | (src0 & 0x1FF);
+}
+# VOP3B lo dword — same as VOP3A but carries a second (scalar) destination in
+# bits[14:8]: the SGPR-pair / VCC output that v_div_scale_f64 writes. The hi
+# dword reuses gfx9_enc_vop3a_hi (src0/src1/src2 + modifiers). F.7f.6.
+fn gfx9_enc_vop3b_lo(op, sdst, vdst): i64 {
+    return 0xD0000000 | ((op & 0x3FF) << 16) | ((sdst & 0x7F) << 8) | (vdst & 0xFF);
 }
 
 # ================================================================
@@ -6056,6 +6074,18 @@ var MIR_OP_ASHR        = 44;
 # v3.2 F.7f.2 — f32<->f64 conversion (OpFConvert). isel picks the direction from the RESULT type:
 # f64 result → widen (V_CVT_F64_F32), f32 result → narrow (V_CVT_F32_F64).
 var MIR_OP_FCONVERT    = 45;
+# v3.2 F.7f.6b — f64 division macro primitives (OpFDiv → the LLVM gfx900 reciprocal Newton
+# expansion). All VALU/f64 (64-bit VGPR pairs). DIV_SCALE writes the per-lane scale flag to
+# the implicit VCC (consumed by DIV_FMAS); the chain is emitted contiguously so that VCC
+# survives (only the two DIV_SCALEs write it; the intervening FMA/MUL never touch it — same
+# adjacency-by-construction the udiv CNDMASK relies on). FMA_N0 = fma(-a,b,c); FMA_N0_ONE =
+# fma(-a,b,1.0) (the Newton refinement step, inline-1.0 src2).
+var MIR_OP_F64_RCP        = 46;   # v_rcp_f64 reciprocal seed (unary; refine via Newton)
+var MIR_OP_F64_DIV_SCALE  = 47;   # v_div_scale_f64 (3-src; scaled value → dst, flag → VCC)
+var MIR_OP_F64_DIV_FMAS   = 48;   # v_div_fmas_f64 (3-src; reads VCC for the 2^±64 post-scale)
+var MIR_OP_F64_DIV_FIXUP  = 49;   # v_div_fixup_f64 (3-src; correctly-rounding fixup)
+var MIR_OP_F64_FMA_N0     = 50;   # v_fma_f64(-a, b, c) — NEGATE src0
+var MIR_OP_F64_FMA_N0_ONE = 51;   # v_fma_f64(-a, b, 1.0) — NEGATE src0 + inline-1.0 src2
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6376,6 +6406,13 @@ fn _mir_instr_unif(m, i): i64 {
     if (op >= MIR_OP_VMOV) {
         if (op <= MIR_OP_CNDMASK) { return MIR_DIVERGENT; }
     }
+    # v3.2 F.7f.6b — the f64 division macro primitives (RCP / DIV_SCALE / DIV_FMAS / DIV_FIXUP /
+    # FMA_N0 / FMA_N0_ONE) are the same class: VOP1/VOP3-only with implicit per-lane VCC, no scalar
+    # form. Force DIVERGENT too (a uniform-operand FDiv must not classify them UNIFORM and become an
+    # SGPR-coalescing candidate — they have no SALU form). (F.7f.6b adversarial review.)
+    if (op >= MIR_OP_F64_RCP) {
+        if (op <= MIR_OP_F64_FMA_N0_ONE) { return MIR_DIVERGENT; }
+    }
     var flags = mir_instr_flags(m, i);
     var b = mir_instr_b(m, i);
     var c = mir_instr_c(m, i);
@@ -6450,6 +6487,7 @@ var SPIRV_OP_IMUL             = 132;
 var SPIRV_OP_FMUL             = 133;
 var SPIRV_OP_UDIV             = 134;   # N.9 — float-reciprocal macro
 var SPIRV_OP_SDIV             = 135;   # N.9d — sign-magnitude over the udiv core
+var SPIRV_OP_FDIV             = 136;   # F.7f.6b — f64 reciprocal Newton macro (f32 fail-loud)
 var SPIRV_OP_UMOD             = 137;   # N.9c — udiv core, remainder select
 var SPIRV_OP_SREM             = 138;   # N.9d — signed remainder (dividend sign)
 var SPIRV_OP_SMOD             = 139;   # N.9d — floored modulo (divisor sign)
@@ -7027,6 +7065,41 @@ fn _spirv_lower_umod(ptr, off, wc, m): i64 {
     return 0;
 }
 
+# OpFDiv(result, N, D) → the LLVM gfx900 correctly-rounded f64 division: a scaled-reciprocal
+# Newton macro. GFX9 has no f64 divide and v_rcp_f64 is only an ~f32-precision seed (the F.7f.5
+# finding), so the quotient is refined to full f64 precision: two DIV_SCALE ops normalise the
+# operands (the second writes the scale flag to VCC), v_rcp_f64 seeds 1/D, three FMA Newton
+# steps lift it to ~full precision, then DIV_FMAS (which reads VCC for the 2^±64 fixup) and
+# DIV_FIXUP produce the correctly-rounded result. The chain is emitted contiguously so VCC
+# from the 2nd DIV_SCALE survives to DIV_FMAS (the FMA/MUL between never write VCC).
+# f64-only — f32 FDiv is a parallel (simpler) macro with no consumer yet (wgpu/naga covers
+# the f32 portable path); it fails loud here (tracked: punchlist F.7f, native-f32-div note).
+fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
+    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+    if (mir_type_base(rty) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    if (mir_type_count(rty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var result = spirv_word(ptr, off + 2);
+    var a = spirv_word(ptr, off + 3);   # N — dividend (numerator)
+    var b = spirv_word(ptr, off + 4);   # D — divisor (denominator)
+    var t = MIR_T_F64;
+    # s0 = div_scale(D, D, N) — scaled denominator; its VCC flag is dead (overwritten below).
+    var s0 = _udiv_op(m, MIR_OP_F64_DIV_SCALE, t, b, b, a, 0);       if (s0 < 0) { return s0; }
+    var rcp = _udiv_op(m, MIR_OP_F64_RCP, t, s0, 0, 0, 0);          if (rcp < 0) { return rcp; }
+    var e1 = _udiv_op(m, MIR_OP_F64_FMA_N0_ONE, t, s0, rcp, 0, 0);  if (e1 < 0) { return e1; }
+    var rcp2 = _udiv_op(m, MIR_OP_FMA, t, rcp, e1, rcp, 0);         if (rcp2 < 0) { return rcp2; }
+    # s1 = div_scale(N, D, N) — scaled numerator; its VCC flag is LIVE → DIV_FMAS reads it.
+    var s1 = _udiv_op(m, MIR_OP_F64_DIV_SCALE, t, a, b, a, 0);      if (s1 < 0) { return s1; }
+    var e2 = _udiv_op(m, MIR_OP_F64_FMA_N0_ONE, t, s0, rcp2, 0, 0); if (e2 < 0) { return e2; }
+    var rcp3 = _udiv_op(m, MIR_OP_FMA, t, rcp2, e2, rcp2, 0);       if (rcp3 < 0) { return rcp3; }
+    var q = _udiv_op(m, MIR_OP_FMUL, t, s1, rcp3, 0, 0);            if (q < 0) { return q; }
+    var r = _udiv_op(m, MIR_OP_F64_FMA_N0, t, s0, q, s1, 0);        if (r < 0) { return r; }
+    var qf = _udiv_op(m, MIR_OP_F64_DIV_FMAS, t, r, rcp3, q, 0);    if (qf < 0) { return qf; }
+    var er = mir_emit(m, MIR_OP_F64_DIV_FIXUP, result, t, qf, b, a, 0);
+    if (er < 0) { return er; }
+    return 0;
+}
+
 # Signed-division prep: sign masks (ASHR 31 → 0 or 0xFFFFFFFF) + magnitudes via the
 # branchless abs (x^sign)-sign. Writes [signA, signB, absA, absB] into out (N.9d).
 fn _signed_prep(m, a, b, out): i64 {
@@ -7256,6 +7329,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # OpUDiv / OpUMod / OpSDiv / OpSRem expand to the float-reciprocal macro (no GFX9
     # integer divide); signed ops wrap it in a sign-magnitude shell. N.9b/c/d.
     if (op == SPIRV_OP_UDIV) { return _spirv_lower_udiv(ptr, off, wc, m); }
+    if (op == SPIRV_OP_FDIV) { return _spirv_lower_fdiv(ptr, off, wc, types, m); }
     if (op == SPIRV_OP_UMOD) { return _spirv_lower_umod(ptr, off, wc, m); }
     if (op == SPIRV_OP_SDIV) { return _spirv_lower_sdiv(ptr, off, wc, m); }
     if (op == SPIRV_OP_SREM) { return _spirv_lower_srem(ptr, off, wc, m); }
@@ -7672,6 +7746,15 @@ var GISEL_V_CVT_F32_F64        = 58;   # narrow (f32)f64
 # emits the right opcode + modifier bits (encoded in gfx9_compile, reusing the F.7b opcodes).
 var GISEL_V_SUB_F64            = 59;   # a - b  (v_add_f64 a, -b)
 var GISEL_V_ABS_F64            = 60;   # |x|    (v_max_f64 |x|, |x|)
+# v3.2 F.7f.6b — f64 division macro ops. All VALU/VOP3 over 64-bit pairs. DIV_SCALE is VOP3B
+# (writes the scale flag to the implicit VCC); DIV_FMAS reads VCC; the FMA_N0 forms ride a
+# NEGATE-src0 modifier (N0_ONE adds an inline-1.0 src2). Emit detail in gfx9_compile.cyr.
+var GISEL_V_RCP_F64           = 61;   # v_rcp_f64 reciprocal seed
+var GISEL_V_DIV_SCALE_F64     = 62;   # v_div_scale_f64 (3-src; flag → VCC)
+var GISEL_V_DIV_FMAS_F64      = 63;   # v_div_fmas_f64 (3-src; reads VCC)
+var GISEL_V_DIV_FIXUP_F64     = 64;   # v_div_fixup_f64 (3-src)
+var GISEL_V_FMA_F64_N0        = 65;   # v_fma_f64(-a, b, c)
+var GISEL_V_FMA_F64_N0_ONE    = 66;   # v_fma_f64(-a, b, 1.0)
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -7767,7 +7850,11 @@ fn _gisel_float_op(mop, tbase): i64 {
     # f64 SUB/ABS via source modifiers (F.7f.3); f32 has its own (V_SUB_F32 / V_AND_B32 mask).
     if (mop == MIR_OP_FSUB) { if (f64 == 1) { return GISEL_V_SUB_F64; } return GISEL_V_SUB_F32; }
     if (mop == MIR_OP_FABS) { if (f64 == 1) { return GISEL_V_ABS_F64; } return GISEL_V_ABS_F32; }
-    # f64 has no single SQRT/FLOOR/CLAMP opcode yet → fail loud (return 0) until breadth.
+    # f64 SQRT/FLOOR/CLAMP have no correct single-instruction form → fail loud (return 0). GFX9
+    # v_sqrt_f64 is only an ~f32-precision approximation (HW-proven, the F.7f.5 finding), so a correct
+    # f64 sqrt needs a v_rsq_f64 + Newton-refinement macro. f64 DIV is now lowered as a macro in
+    # spirv_lower.cyr (OpFDiv, F.7f.6b) — NOT routed here. FSqrt is tracked in
+    # docs/development/3-2-punchlist.md (F.7f.7); FFLOOR/FCLAMP f64 are later breadth bites.
     if (f64 == 1) { return 0; }
     if (mop == MIR_OP_FSQRT) { return GISEL_V_SQRT_F32; }
     if (mop == MIR_OP_FFLOOR) { return GISEL_V_FLOOR_F32; }
@@ -7906,6 +7993,14 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RCP_IFLAG) { return _gisel_emit(out, k, GISEL_V_RCP_IFLAG_F32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_MUL_HI) { return _gisel_emit(out, k, GISEL_V_MUL_HI_U32, dst, a, b, 0, flags); }
     if (op == MIR_OP_CNDMASK) { return _gisel_emit(out, k, GISEL_V_CNDMASK, dst, a, b, 0, flags); }
+    # F.7f.6b f64 division macro: all VALU/f64 (dst type is f64 → regalloc claims a pair). The
+    # 3-src forms carry a/b/c; RCP is unary; FMA_N0_ONE drops c (the inline 1.0 is in the emit).
+    if (op == MIR_OP_F64_RCP) { return _gisel_emit(out, k, GISEL_V_RCP_F64, dst, a, 0, 0, flags); }
+    if (op == MIR_OP_F64_DIV_SCALE) { return _gisel_emit(out, k, GISEL_V_DIV_SCALE_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_DIV_FMAS) { return _gisel_emit(out, k, GISEL_V_DIV_FMAS_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_DIV_FIXUP) { return _gisel_emit(out, k, GISEL_V_DIV_FIXUP_F64, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_FMA_N0) { return _gisel_emit(out, k, GISEL_V_FMA_F64_N0, dst, a, b, c, flags); }
+    if (op == MIR_OP_F64_FMA_N0_ONE) { return _gisel_emit(out, k, GISEL_V_FMA_F64_N0_ONE, dst, a, b, 0, flags); }
     if (op == MIR_OP_EXTRACT) {
         # The EXTRACT result's register file is decided from its uniformity
         # (gisel_result_is_vgpr), so a result-less or UNKNOWN-uniformity extract
@@ -8803,6 +8898,56 @@ fn _emit_fabs_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(x, x, 0));
 }
 
+# v3.2 F.7f.6b — f64 div_scale: VOP3B writing the per-lane scale flag to VCC (consumed by the
+# later div_fmas). 3 VGPR-pair operands; the scaled value → vdst. (The two scale operands are
+# the operand being scaled + the other; the macro in spirv_lower wires D,D,N / N,D,N.)
+fn _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3b_lo(GFX9_VOP3_V_DIV_SCALE_F64, GFX9_REG_VCC_LO, vdst));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
+}
+
+# v3.2 F.7f.6b — f64 fma(-a, b, c): the Newton residual/correction FMAs with a NEGATE-src0
+# source modifier (hi bit 29 = 0x20000000). All three operands are computed VGPR pairs.
+fn _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    var src2 = _cmp_resolve(m, alloc, isvgpr, gisel_c(isel, i), fl & MIR_FLAG_C_IMM);
+    if (src2 < 0) { return src2; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2) | 0x20000000);
+}
+
+# v3.2 F.7f.6b — f64 fma(-a, b, 1.0): the Newton refinement step. NEGATE src0 (0x20000000) +
+# the inline-1.0 constant in src2 (GFX9_INLINE_F32_1_0 = 242; the same code denotes f64 1.0).
+fn _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    var src1 = _cmp_resolve(m, alloc, isvgpr, gisel_b(isel, i), fl & MIR_FLAG_B_IMM);
+    if (src1 < 0) { return src1; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_1_0) | 0x20000000);
+}
+
 # 1 if an operand resolves to a non-inline 32-bit literal (the VOP3-materialization case).
 fn _cmp_operand_is_literal(m, field, is_imm): i64 {
     if (is_imm != 0) {
@@ -9068,6 +9213,18 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_V_SUB_F64) { return _emit_fsub_f64(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_ABS_F64) { return _emit_fabs_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    # F.7f.6b f64 division macro. RCP reuses _emit_vop1; DIV_FMAS/DIV_FIXUP reuse _emit_vop3_3src
+    # (VCC is implicit for DIV_FMAS — no extra encoding); div_scale + the NEG-src0 FMAs are dedicated.
+    if (op == GISEL_V_RCP_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RCP_F64); }
+    if (op == GISEL_V_DIV_SCALE_F64) { return _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_DIV_FMAS_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FMAS_F64);
+    }
+    if (op == GISEL_V_DIV_FIXUP_F64) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FIXUP_F64);
+    }
+    if (op == GISEL_V_FMA_F64_N0) { return _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_FMA_F64_N0_ONE) { return _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
