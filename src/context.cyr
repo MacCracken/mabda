@@ -2,10 +2,11 @@
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (120 bytes — grew 48 → 96 at v3 Step
+# GpuContext struct layout (168 bytes — grew 48 → 96 at v3 Step
 # 4f.iv, 96 → 112 at v3 Step 7.7 for the surface API consumer-
 # stash slots, 112 → 120 at v3 rc.2 audit MED-7 to cache the per-
-# dispatch PM4 scratch buffer):
+# dispatch PM4 scratch buffer, → 128 (tex VA cursor, v3.1 M.1), →
+# 160 (queue table, v3.1 Q.1), → 168 (IB-slot cursor, v3.2.14 R.5)):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
@@ -57,6 +58,13 @@
 #                                  ring. The queue table is deliberately
 #                                  OUTSIDE the +0..+24 dual-interpretation
 #                                  region — it is backend-agnostic state.
+#   +160: ib_slot_cursor (8)    — native: round-robin index of the active
+#                                  IB staging slice (v3.2.14 R.5). Zero-
+#                                  initialized by the ctx memset; the MQ
+#                                  render-graph executor advances it per
+#                                  node so concurrently-in-flight submits
+#                                  stage into distinct IB slices. Zero on
+#                                  wgpu / single-shot native paths.
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
@@ -70,7 +78,7 @@
 # carry them directly (see docs/proposals/v3-surface-api-design.md
 # § "Why 'stash on ctx' rather than passing through every slot").
 
-var GPU_CONTEXT_SIZE = 160;
+var GPU_CONTEXT_SIZE = 168;
 var _NATIVE_PM4_SCRATCH_BYTES = 2048;   # v3.2 TS.5: 1024->2048 (the textured
 # render draw appends ~15 override dwords past the 256-dword/1024-B minimum
 # pad, reaching ~261 dwords; 2048 keeps comfortable headroom).
@@ -153,6 +161,15 @@ var _NATIVE_STUB_SIZE = 4096;
 # dispatch (alloc/va_map/munmap/va_unmap/close × 2 BOs + syncobj).
 var _NATIVE_IB_VA     = 0xFFFF800100200000;
 var _NATIVE_IB_SIZE   = 4096;
+# v3.2.14 R.5 — per-node IB staging. The cached IB BO is partitioned into
+# _NATIVE_IB_SLOTS contiguous 4 KiB slices (one per concurrently-in-flight
+# queue-targeted submit) so genuine cross-ring overlap can't clobber a
+# sibling's PM4 mid-flight. The whole BO is _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS
+# bytes mapped at _NATIVE_IB_VA; slice i lives at base + i*_NATIVE_IB_SIZE.
+# 16 slices = 64 KiB, well inside the 4 MiB IB→FENCE VA gap (no collision).
+# The cursor (ctx +160) selects the active slice; the MQ executor (R.6)
+# advances it per node. Single-shot / synchronous paths stay on slice 0.
+var _NATIVE_IB_SLOTS  = 16;
 var _NATIVE_FENCE_VA  = 0xFFFF800100600000;
 var _NATIVE_FENCE_SIZE = 4096;
 
@@ -195,8 +212,10 @@ fn gpu_context_new_native(): i64 {
 
     # Step 4f.iv: allocate the per-context IB + fence BOs once
     # (cached for reuse across dispatches).
+    # R.5: the IB BO spans _NATIVE_IB_SLOTS contiguous 4 KiB slices.
+    var ib_total = _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS;
     var ib_bo[16];
-    rc = native_bo_create_gtt(fd, _NATIVE_IB_SIZE, &ib_bo);
+    rc = native_bo_create_gtt(fd, ib_total, &ib_bo);
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
@@ -207,10 +226,10 @@ fn gpu_context_new_native(): i64 {
     var ib_handle = load64(&ib_bo + 0);
     var ib_map    = load64(&ib_bo + 8);
     rc = native_gem_va_map(fd, ib_handle, _NATIVE_IB_VA,
-    _NATIVE_IB_SIZE, _NATIVE_PERM_IB);
+    ib_total, _NATIVE_PERM_IB);
     if (rc != 0) {
         var rc_save = rc;
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
@@ -221,8 +240,8 @@ fn gpu_context_new_native(): i64 {
     rc = native_bo_create_gtt(fd, _NATIVE_FENCE_SIZE, &fence_bo);
     if (rc != 0) {
         var rc_save = rc;
-        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
@@ -236,8 +255,8 @@ fn gpu_context_new_native(): i64 {
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, fence_handle, fence_map, _NATIVE_FENCE_SIZE);
-        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);

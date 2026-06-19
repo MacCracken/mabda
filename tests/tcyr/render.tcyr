@@ -484,6 +484,110 @@ fn test_rg_schedule_accessor_guards() {
     return 0;
 }
 
+# --- R.6 (v3.2.14): native MQ executor. A capture-mock backend records the
+#     dispatch/barrier/wait ORDER so the executor's scheduling logic is
+#     CPU-verifiable without HW. Event codes: 1=compute, 2=render, 3=barrier,
+#     4=wait_idle. Per-kind queue sentinels distinguish the barrier endpoints.
+
+var _mq_log     = 0;
+var _mq_bar_src = 0;
+var _mq_bar_dst = 0;
+
+fn _mq_qget(ctx, kind): i64 {
+    if (kind == QUEUE_KIND_GRAPHICS) { return 0x6000; }
+    if (kind == QUEUE_KIND_COMPUTE)  { return 0x6001; }
+    if (kind == QUEUE_KIND_TRANSFER) { return 0x6002; }
+    return 0;
+}
+fn _mq_barrier(ctx, src, dst): i64 {
+    vec_push(_mq_log, 3);
+    _mq_bar_src = src;
+    _mq_bar_dst = dst;
+    return 0;
+}
+fn _mq_wait(ctx, q): i64 { vec_push(_mq_log, 4); return 0; }
+fn _mq_compute(ctx, shmod, x, y, z, bp): i64 { vec_push(_mq_log, 1); return 0; }
+fn _mq_render(ctx, pass, pipe, vc, ic): i64 { vec_push(_mq_log, 2); return 0; }
+
+fn _mq_make_backend(): i64 {
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_GET,        &_mq_qget);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_BARRIER,    &_mq_barrier);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_WAIT_IDLE,  &_mq_wait);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_mq_compute);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW, &_mq_render);
+    return b;
+}
+
+fn test_rg_execute_native_mq_orders_and_barriers() {
+    # compute A (default COMPUTE) writes r0; render B (default GRAPHICS) reads
+    # r0. The executor must: dispatch the producer first (global sort order),
+    # insert a COMPUTE→GRAPHICS barrier before the consumer, then wait both
+    # queues at graph end.
+    _mq_log = vec_new();
+    _mq_bar_src = 0;
+    _mq_bar_dst = 0;
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0x111, 0x222, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_render(g, 0x333, 0x444, 3, "B");
+    rg_node_reads(g, b, r0);
+    rg_build(g, 0);
+
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, _mq_make_backend());
+
+    var rc = _rg_execute_native_mq(g, &ctx);
+    assert_eq(rc, 0, "native MQ executor returns 0 (all mocks ok)");
+    assert_eq(vec_len(_mq_log), 5, "5 events: compute, barrier, render, 2 waits");
+    assert_eq(vec_get(_mq_log, 0), 1, "compute dispatched first (sort 0)");
+    assert_eq(vec_get(_mq_log, 1), 3, "barrier inserted before the render consumer");
+    assert_eq(vec_get(_mq_log, 2), 2, "render dispatched after the barrier");
+    assert_eq(vec_get(_mq_log, 3), 4, "wait_idle (first used queue)");
+    assert_eq(vec_get(_mq_log, 4), 4, "wait_idle (second used queue)");
+    assert_eq(_mq_bar_src, 0x6001, "barrier src = COMPUTE queue (producer)");
+    assert_eq(_mq_bar_dst, 0x6000, "barrier dst = GRAPHICS queue (consumer)");
+    return 0;
+}
+
+fn test_rg_execute_mq_routes_native_backend() {
+    # rg_execute_mq must route an AMD-kind backend to _rg_execute_native_mq.
+    _mq_log = vec_new();
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0x111, 0x222, &dims, "A");
+    rg_build(g, 0);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, _mq_make_backend());
+    var rc = rg_execute_mq(g, &ctx);
+    assert_eq(rc, 0, "rg_execute_mq routes to native executor (returns 0)");
+    assert_eq(vec_len(_mq_log), 2, "single compute dispatch + one wait_idle");
+    assert_eq(vec_get(_mq_log, 0), 1, "compute dispatched via native path");
+    assert_eq(vec_get(_mq_log, 1), 4, "queue waited at graph end");
+    return 0;
+}
+
+fn test_rg_native_dispatch_copy_offset_fails_loud() {
+    # The native whole-buffer copy slot has no offset args, so a copy node with
+    # a non-zero src/dst offset must fail loud (GPU_ERR_BUFFER), never silently
+    # copy from the wrong place.
+    var g = rg_new();
+    rg_add_copy_buf_buf(g, 0x10, 64, 0x20, 0, 128);   # src_off = 64
+    rg_build(g, 0);
+    var node = vec_get(load64(g + 0), 0);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, _mq_make_backend());
+    assert_eq(_rg_native_dispatch_node(&ctx, node), GPU_ERR_BUFFER,
+    "copy with non-zero src offset -> GPU_ERR_BUFFER");
+    return 0;
+}
+
 fn test_rg_transient_handle_before_build_is_label_ptr() {
     # Before rg_build, the handle slot holds the label pointer (the
     # struct layout doubles the slot up as a staging area). This is
@@ -781,6 +885,9 @@ fn main() {
     test_rg_schedule_fence_dedup();
     test_rg_schedule_batches_ascending_min_sort();
     test_rg_schedule_accessor_guards();
+    test_rg_execute_native_mq_orders_and_barriers();
+    test_rg_execute_mq_routes_native_backend();
+    test_rg_native_dispatch_copy_offset_fails_loud();
     test_rg_transient_handle_before_build_is_label_ptr();
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();

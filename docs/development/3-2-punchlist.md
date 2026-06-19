@@ -1172,10 +1172,39 @@ ordering exactly. wgpu serialized-equivalent.
   submit fails); +10 asserts (native 1354→1364; suite 4043→4053). The real
   GFX-ring timeline submit is exercised by the R.7 HW e2e on Cezanne.
   Smoke/lint/fmt/vet/distlib green.
-- [ ] **R.5** *(3.2.14)* — Per-node IB staging (fixes the shared-cached-IB
-  clobber under genuine overlap; explicit, never a silent serialization).
-- [ ] **R.6** *(3.2.14)* — Scheduler (per-queue toposort + cross-queue
-  barrier insertion + batch submit); pure-CPU graph-math tests.
+- [x] **R.5 (2026-06-19)** *(3.2.14)* — Per-node IB staging. The cached IB BO
+  grows from one 4 KiB region to `_NATIVE_IB_SLOTS`(=16) contiguous 4 KiB
+  slices (64 KiB, safely inside the 4 MiB IB→FENCE VA gap; `gpu_context_new_native`
+  + ctx-release sizes updated). A round-robin cursor (ctx +160, GPU_CONTEXT_SIZE
+  160→168 append-only) selects the active slice via `native_ctx_ib_active_va/addr`;
+  `native_ctx_ib_advance` rotates, `native_ctx_ib_reset_slots` zeroes it. The four
+  **timeline** dispatch fns (compute / compute-N / transfer / render) stage into
+  the active slice; single-shot/synchronous paths stay on slice 0 (cursor 0 ⇒
+  base ⇒ unchanged behaviour). The R.6 executor advances the cursor per node so
+  concurrently-in-flight cross-ring submits never clobber a sibling's PM4 —
+  explicit, never a silent serialization. Test stack ctx buffers bumped
+  160→168 (would have overrun + read a garbage cursor); the size-pin test
+  updated to 168. +12 asserts incl. a staging-isolation integration test
+  (a slice-1 dispatch leaves slice 0's poison intact); native 1364→1376,
+  suite 4053→4065. Smoke/lint/fmt/vet/distlib green.
+- [x] **R.6 (2026-06-19)** *(3.2.14)* — Native MQ executor `_rg_execute_native_mq`
+  (the per-queue batch submit; the toposort + barrier classification already
+  landed in R.2/R.3). Walks nodes in **global sort_idx order** (producer-before-
+  consumer by construction), acquires each used queue, inserts a `gpu_queue_barrier`
+  for every incoming cross-queue fence edge before the consumer's dispatch,
+  stashes the node's queue as current, dispatches each node, advances the IB
+  staging slice (R.5), then `gpu_queue_wait_idle`s every used queue (completion
+  contract). `_rg_native_dispatch_node` reinterprets the byte-polymorphic node
+  payload as native objects (compute→`gpu_compute_dispatch`, render→the queue-aware
+  `render_pass_draw` slot, copy→`gpu_queue_transfer_copy`; non-zero copy offsets +
+  COPY_TEX_BUF fail loud). `_backend_native_render_pass_draw` made queue-aware
+  (routes through `native_render_dispatch_timeline` when a current queue is
+  stashed — the render analog of the compute slot's check). `rg_execute_mq` routes
+  AMD→native executor, else the wgpu serialized path (null-backend-guarded — a
+  latent null-deref the R.1 forwards-v2.5 test caught). +14 CPU asserts incl. a
+  capture-mock executor test pinning the compute→barrier→render→wait order +
+  barrier endpoints (render 182→196; suite 4065→4079). Smoke/lint/fmt/vet/distlib
+  green. **HW e2e is R.7.**
 - [ ] **R.7** *(3.2.14)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
   compute→cross-queue-edge→render, distinct rings, no CPU stall; wgpu
   parity vs `render_graph_e2e.cyr`); cut.

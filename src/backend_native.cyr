@@ -205,8 +205,8 @@ shader_handle, out_handle, queue, ip_type): i64 {
     var cid = native_ctx_id(ctx);
     var stub_handle  = native_ctx_stub_handle(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
 
     # Stage PM4 into the cached IB BO.
@@ -259,8 +259,8 @@ binds, n_binds, queue, ip_type): i64 {
     var cid = native_ctx_id(ctx);
     var stub_handle  = native_ctx_stub_handle(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
     memset(ib_addr, 0, 4096);
     memcpy(ib_addr, pm4, pm4_bytes);
@@ -336,8 +336,8 @@ dst_handle, dst_va, bytes, queue): i64 {
     var fd  = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
 
     # Stage the SDMA copy into the cached IB BO — chained into as many
@@ -591,8 +591,8 @@ render_handles_ptr, queue): i64 {
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
     var fence_addr   = native_ctx_fence_addr(ctx);
 
@@ -681,6 +681,36 @@ fn native_ctx_ib_addr(ctx): i64 { return load64(ctx +  64); }
 fn native_ctx_fence_handle(ctx): i64 { return load64(ctx +  72); }
 fn native_ctx_fence_va(ctx): i64 { return load64(ctx +  80); }
 fn native_ctx_fence_addr(ctx): i64 { return load64(ctx +  88); }
+# v3.2.14 R.5 — per-node IB staging. The cached IB BO is partitioned into
+# _NATIVE_IB_SLOTS contiguous 4 KiB slices; the cursor (ctx +160) selects
+# the active one. native_ctx_ib_active_{va,addr} return the active slice's
+# GPU VA / CPU pointer (base + cursor*_NATIVE_IB_SIZE); the slice handle is
+# the one BO (native_ctx_ib_handle). The MQ executor calls
+# native_ctx_ib_advance per node to rotate; single-shot / synchronous paths
+# leave the cursor at 0 (slice 0 == base, so their behaviour is unchanged).
+fn native_ctx_ib_slot_cursor(ctx): i64 { return load64(ctx + 160); }
+fn native_ctx_ib_active_va(ctx): i64 {
+    return native_ctx_ib_va(ctx) + native_ctx_ib_slot_cursor(ctx) * _NATIVE_IB_SIZE;
+}
+fn native_ctx_ib_active_addr(ctx): i64 {
+    return native_ctx_ib_addr(ctx) + native_ctx_ib_slot_cursor(ctx) * _NATIVE_IB_SIZE;
+}
+# Advance the cursor to the next slice (round-robin over _NATIVE_IB_SLOTS).
+# Returns the new cursor. Wrapping past the last slice reuses slice 0 — the
+# executor must have retired (wait_idle) any submit still using it; the ring
+# depth bounds the safe in-flight count.
+fn native_ctx_ib_advance(ctx): i64 {
+    var c = native_ctx_ib_slot_cursor(ctx) + 1;
+    if (c >= _NATIVE_IB_SLOTS) { c = 0; }
+    store64(ctx + 160, c);
+    return c;
+}
+# Reset the staging cursor to slice 0 (the MQ executor calls this at graph
+# start so each execution begins from a deterministic slice).
+fn native_ctx_ib_reset_slots(ctx): i64 {
+    store64(ctx + 160, 0);
+    return 0;
+}
 # Audit MED-7: per-context PM4 build scratch (1024 bytes), allocated
 # once at gpu_context_new_native, shared between compute + render slots.
 fn native_ctx_pm4_scratch(ctx): i64 { return load64(ctx + 112); }
@@ -733,8 +763,10 @@ fn _backend_native_ctx_release(ctx): i64 {
         native_bo_release_gtt(fd, fence_handle, fence_addr, 4096);
     }
     if (ib_handle != 0) {
-        native_gem_va_unmap(fd, ib_handle, ib_va, 4096);
-        native_bo_release_gtt(fd, ib_handle, ib_addr, 4096);
+        # R.5: the IB BO spans _NATIVE_IB_SLOTS slices.
+        var ib_total = _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS;
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_addr, ib_total);
     }
     # v3.1 Q.3b: destroy the per-queue persistent timeline syncobjs.
     # The Queue structs themselves are bump-allocated (native no-reclaim
@@ -1981,6 +2013,19 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
 
     var triple[32];
     native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle, tex_handle);
+
+    # v3.2.14 R.6: when the MQ render-graph executor stashes a current queue
+    # (gpu_ctx_set_current_queue), route this draw through the GFX-ring TIMELINE
+    # path (async, no CPU stall) so render nodes join cross-ring overlap — the
+    # exact analog of the compute slot's current-queue check. A non-GFX current
+    # queue is rejected inside native_render_dispatch_timeline. Zero stash = the
+    # v3.0 synchronous single-shot path below, unchanged.
+    var cq = gpu_ctx_current_queue(ctx);
+    if (cq != 0) {
+        var tl_rc = native_render_dispatch_timeline(ctx, pm4, pos, &triple, cq);
+        store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, 0);
+        return tl_rc;
+    }
 
     var t_now[16];
     memset(&t_now, 0, 16);

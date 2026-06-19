@@ -1013,28 +1013,138 @@ fn rg_execute(g, device, queue): i64 {
 }
 
 # ================================================================
-# Execute (multi-queue aware) — v3.2.13 Phase R entry point.
+# Execute (multi-queue aware) — v3.2.13–14 Phase R.
 # ================================================================
-# rg_execute_mq is the ctx-taking, queue-aware executor. The public
-# signature is fixed across the arc; the BODY is staged:
-#   R.1 (now): forwards to the v2.5 single-submit wgpu path, so the
-#              output command stream is byte-identical to rg_execute and
-#              the "default reproduces v2.5" contract holds. Node queue
-#              affinity is recorded (R.1); the scheduler that consumes it
-#              lands in R.2/R.3 (see docs/development/3-2-punchlist.md
-#              Phase R).
-#   R.2/R.3:   inserts rg_schedule (per-queue batches + cross-queue
-#              fence-edge classification) ahead of the executor.
-#   R.4+:      routes native nodes to per-ring timeline submits with
-#              cross-ring barriers; wgpu stays serialized-equivalent.
-# Takes the ctx (for the device/queue today, the queue table + barrier
-# path later). Returns 0|1, matching rg_execute. # @public
+# rg_execute_mq(g, ctx) is the ctx-taking, queue-aware executor. It runs
+# rg_schedule (R.2/R.3) then routes by backend: native AMD takes the real
+# multi-queue executor (_rg_execute_native_mq — per-ring timeline submits +
+# cross-ring fence edges, R.4–R.6); wgpu (one device queue) stays on the v2.5
+# single-encoder/single-submit path, serialized-equivalent with the identical
+# command stream (affinity honored as ordering only). Returns 0 on success,
+# non-zero on error (GPU_ERR_* on native, 1 on wgpu). # @public
+#
+# Dispatch one node natively, reinterpreting its byte-polymorphic payload as
+# native objects — the same backend-boundary polymorphism gpu_shader_module_create
+# uses (wgpu reads WGSL bytes, native reads GFX9 ISA). The node's queue is
+# already stashed as current, so each backend dispatch slot routes through its
+# timeline (async) path onto that ring. Returns 0|GPU_ERR_*.
+fn _rg_native_dispatch_node(ctx, node): i64 {
+    var kind = load64(node + 0);
+    var pl = load64(node + 8);
+    if (kind == NODE_COMPUTE) {
+        # ComputePayload natively: +0 shader module, +8 buffer-pair, +16/20/24 dims.
+        return gpu_compute_dispatch(ctx, load64(pl + 0),
+        load32(pl + 16), load32(pl + 20), load32(pl + 24), load64(pl + 8));
+    }
+    if (kind == NODE_RENDER) {
+        # RenderPayload natively: +0 NativePass, +8 NativeRenderPipeline, +16
+        # draw_verts. The render_pass_draw slot is queue-aware (R.6), so with a
+        # current queue stashed it routes through native_render_dispatch_timeline.
+        var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_PASS_DRAW);
+        if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+        return fncall5(slot, ctx, load64(pl + 0), load64(pl + 8), load64(pl + 16), 1);
+    }
+    if (kind == NODE_COPY_BUF_BUF) {
+        # CopyBufBufPayload natively: +0 src NativeBuf, +16 dst NativeBuf, +32
+        # size. The native whole-buffer copy slot has no offset args, so a
+        # non-zero src/dst offset fails loud rather than silently mis-copying.
+        # The copy node must be TRANSFER-affined (the SDMA ring); a GFX/COMPUTE
+        # queue is rejected inside the buffer_copy slot (GPU_ERR_TRANSFER).
+        if (load64(pl + 8) != 0)  { return GPU_ERR_BUFFER; }
+        if (load64(pl + 24) != 0) { return GPU_ERR_BUFFER; }
+        return gpu_queue_transfer_copy(ctx, gpu_ctx_current_queue(ctx),
+        load64(pl + 0), load64(pl + 16), load64(pl + 32));
+    }
+    # NODE_COPY_TEX_BUF has no native MQ-graph path yet — fail loud (tracked in
+    # docs/development/3-2-punchlist.md Phase R), never silent-wrong.
+    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+}
+
+# v3.2.14 R.6 — native multi-queue executor. Consumes the Schedule (R.2/R.3):
+# acquires the logical queue per used kind, walks nodes in GLOBAL sort_idx
+# order (the toposort guarantee that every producer submits before its
+# consumer — see the rg_schedule submission-order note), inserts a
+# gpu_queue_barrier for each incoming cross-queue fence edge before the
+# consumer's dispatch (in-CS timeline wait, no CPU stall), stashes the node's
+# queue as current so the native dispatch slots take their timeline paths,
+# advances the IB staging slice per node (R.5; no shared-IB clobber), and
+# finally gpu_queue_wait_idle's every used queue so results are readable on
+# return (the v2.5 completion contract). Returns 0|GPU_ERR_*.
+fn _rg_execute_native_mq(g, ctx): i64 {
+    var nodes = load64(g + 0);
+    var n = vec_len(nodes);
+    if (n == 0) { return 0; }
+    rg_schedule(g);                  # idempotent; safe if called directly
+    native_ctx_ib_reset_slots(ctx);  # deterministic per-execution start
+
+    var sched = _rg_sched(g);
+    var batches = load64(sched + SCHED_OFF_BATCHES);
+    var nb = vec_len(batches);
+    var fences = load64(sched + SCHED_OFF_FENCES);
+    var nf = vec_len(fences);
+
+    # Acquire (idempotently) the logical queue for every batch's kind.
+    var bi = 0;
+    while (bi < nb) {
+        if (gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)) == 0) {
+            return GPU_ERR_OTHER;
+        }
+        bi = bi + 1;
+    }
+
+    var rc = 0;
+    var i = 0;
+    while (i < n) {
+        var node = vec_get(nodes, i);   # vec is in sort_idx order, so i == sort_idx
+        var q = gpu_queue_get(ctx, load64(node + 56));
+
+        # Cross-queue barriers for every fence edge feeding this consumer node.
+        var fi = 0;
+        while (fi < nf) {
+            var fe = vec_get(fences, fi);
+            if (load64(fe + FENCE_OFF_CN) == i) {
+                gpu_queue_barrier(ctx, gpu_queue_get(ctx, load64(fe + FENCE_OFF_PQ)), q);
+            }
+            fi = fi + 1;
+        }
+
+        gpu_ctx_set_current_queue(ctx, q);
+        var dr = _rg_native_dispatch_node(ctx, node);
+        if (dr != 0) { rc = dr; }
+        native_ctx_ib_advance(ctx);     # next node stages into a fresh IB slice
+        i = i + 1;
+    }
+
+    # Clear the stash and retire every used queue before returning.
+    gpu_ctx_set_current_queue(ctx, 0);
+    bi = 0;
+    while (bi < nb) {
+        var wr = gpu_queue_wait_idle(ctx,
+        gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)));
+        if (wr != 0) { rc = wr; }
+        bi = bi + 1;
+    }
+    return rc;
+}
+
 fn rg_execute_mq(g, ctx): i64 {
     if (ctx == 0) { return 1; }
-    # Run the scheduler pass (R.2/R.3) — idempotent, and a no-op on the
-    # wgpu serialized path. R.4 wires the native executor to consume the
-    # Schedule's per-queue batches + cross-queue fence edges.
+    if (rg_is_built(g) == 0) { return 1; }
+    # Run the scheduler pass (R.2/R.3) — idempotent; produces the per-queue
+    # batches + cross-queue fence edges both executors read.
     rg_schedule(g);
+    # Native AMD gets the real multi-queue executor (per-ring timeline submits
+    # + cross-ring fence edges, R.6). wgpu has one device queue, so it stays on
+    # the v2.5 single-encoder/single-submit path — serialized-equivalent, the
+    # identical command stream (the affinity is honored as ordering only). A
+    # null backend ptr (or any non-AMD kind) falls through to the wgpu path
+    # rather than dereferencing it.
+    var b = gpu_ctx_backend(ctx);
+    if (b != 0) {
+        if (backend_kind(b) == BACKEND_KIND_AMD) {
+            return _rg_execute_native_mq(g, ctx);
+        }
+    }
     return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
 }
 

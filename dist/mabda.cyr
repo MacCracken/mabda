@@ -3853,10 +3853,11 @@ fn backend_wgpu_new(): i64 {
 # context.cyr — GPU device lifecycle
 # Ported from mabda/src/context.rs
 #
-# GpuContext struct layout (120 bytes — grew 48 → 96 at v3 Step
+# GpuContext struct layout (168 bytes — grew 48 → 96 at v3 Step
 # 4f.iv, 96 → 112 at v3 Step 7.7 for the surface API consumer-
 # stash slots, 112 → 120 at v3 rc.2 audit MED-7 to cache the per-
-# dispatch PM4 scratch buffer):
+# dispatch PM4 scratch buffer, → 128 (tex VA cursor, v3.1 M.1), →
+# 160 (queue table, v3.1 Q.1), → 168 (IB-slot cursor, v3.2.14 R.5)):
 #   +0:  instance / fd          (wgpu: WGPUInstance | native: DRM fd)
 #   +8:  adapter  / ctx_id      (wgpu: WGPUAdapter  | native: amdgpu ctx id)
 #   +16: device   / stub_handle (wgpu: WGPUDevice   | native: stub BO handle)
@@ -3908,6 +3909,13 @@ fn backend_wgpu_new(): i64 {
 #                                  ring. The queue table is deliberately
 #                                  OUTSIDE the +0..+24 dual-interpretation
 #                                  region — it is backend-agnostic state.
+#   +160: ib_slot_cursor (8)    — native: round-robin index of the active
+#                                  IB staging slice (v3.2.14 R.5). Zero-
+#                                  initialized by the ctx memset; the MQ
+#                                  render-graph executor advances it per
+#                                  node so concurrently-in-flight submits
+#                                  stage into distinct IB slices. Zero on
+#                                  wgpu / single-shot native paths.
 #
 # The dual interpretation of +0..+24 is documented in
 # src/backend_native.cyr; backend_kind(gpu_ctx_backend(ctx)) tells
@@ -3921,7 +3929,7 @@ fn backend_wgpu_new(): i64 {
 # carry them directly (see docs/proposals/v3-surface-api-design.md
 # § "Why 'stash on ctx' rather than passing through every slot").
 
-var GPU_CONTEXT_SIZE = 160;
+var GPU_CONTEXT_SIZE = 168;
 var _NATIVE_PM4_SCRATCH_BYTES = 2048;   # v3.2 TS.5: 1024->2048 (the textured
 # render draw appends ~15 override dwords past the 256-dword/1024-B minimum
 # pad, reaching ~261 dwords; 2048 keeps comfortable headroom).
@@ -4004,6 +4012,15 @@ var _NATIVE_STUB_SIZE = 4096;
 # dispatch (alloc/va_map/munmap/va_unmap/close × 2 BOs + syncobj).
 var _NATIVE_IB_VA     = 0xFFFF800100200000;
 var _NATIVE_IB_SIZE   = 4096;
+# v3.2.14 R.5 — per-node IB staging. The cached IB BO is partitioned into
+# _NATIVE_IB_SLOTS contiguous 4 KiB slices (one per concurrently-in-flight
+# queue-targeted submit) so genuine cross-ring overlap can't clobber a
+# sibling's PM4 mid-flight. The whole BO is _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS
+# bytes mapped at _NATIVE_IB_VA; slice i lives at base + i*_NATIVE_IB_SIZE.
+# 16 slices = 64 KiB, well inside the 4 MiB IB→FENCE VA gap (no collision).
+# The cursor (ctx +160) selects the active slice; the MQ executor (R.6)
+# advances it per node. Single-shot / synchronous paths stay on slice 0.
+var _NATIVE_IB_SLOTS  = 16;
 var _NATIVE_FENCE_VA  = 0xFFFF800100600000;
 var _NATIVE_FENCE_SIZE = 4096;
 
@@ -4046,8 +4063,10 @@ fn gpu_context_new_native(): i64 {
 
     # Step 4f.iv: allocate the per-context IB + fence BOs once
     # (cached for reuse across dispatches).
+    # R.5: the IB BO spans _NATIVE_IB_SLOTS contiguous 4 KiB slices.
+    var ib_total = _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS;
     var ib_bo[16];
-    rc = native_bo_create_gtt(fd, _NATIVE_IB_SIZE, &ib_bo);
+    rc = native_bo_create_gtt(fd, ib_total, &ib_bo);
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
@@ -4058,10 +4077,10 @@ fn gpu_context_new_native(): i64 {
     var ib_handle = load64(&ib_bo + 0);
     var ib_map    = load64(&ib_bo + 8);
     rc = native_gem_va_map(fd, ib_handle, _NATIVE_IB_VA,
-    _NATIVE_IB_SIZE, _NATIVE_PERM_IB);
+    ib_total, _NATIVE_PERM_IB);
     if (rc != 0) {
         var rc_save = rc;
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
@@ -4072,8 +4091,8 @@ fn gpu_context_new_native(): i64 {
     rc = native_bo_create_gtt(fd, _NATIVE_FENCE_SIZE, &fence_bo);
     if (rc != 0) {
         var rc_save = rc;
-        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
@@ -4087,8 +4106,8 @@ fn gpu_context_new_native(): i64 {
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, fence_handle, fence_map, _NATIVE_FENCE_SIZE);
-        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, _NATIVE_IB_SIZE);
-        native_bo_release_gtt(fd, ib_handle, ib_map, _NATIVE_IB_SIZE);
+        native_gem_va_unmap(fd, ib_handle, _NATIVE_IB_VA, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_map, ib_total);
         native_bo_release_gtt(fd, stub_handle, stub_map, _NATIVE_STUB_SIZE);
         native_ctx_free(fd, ctx_id);
         sys_close(fd);
@@ -12885,8 +12904,8 @@ shader_handle, out_handle, queue, ip_type): i64 {
     var cid = native_ctx_id(ctx);
     var stub_handle  = native_ctx_stub_handle(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
 
     # Stage PM4 into the cached IB BO.
@@ -12939,8 +12958,8 @@ binds, n_binds, queue, ip_type): i64 {
     var cid = native_ctx_id(ctx);
     var stub_handle  = native_ctx_stub_handle(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
     memset(ib_addr, 0, 4096);
     memcpy(ib_addr, pm4, pm4_bytes);
@@ -13016,8 +13035,8 @@ dst_handle, dst_va, bytes, queue): i64 {
     var fd  = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
 
     # Stage the SDMA copy into the cached IB BO — chained into as many
@@ -13271,8 +13290,8 @@ render_handles_ptr, queue): i64 {
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle    = native_ctx_ib_handle(ctx);
-    var ib_va        = native_ctx_ib_va(ctx);
-    var ib_addr      = native_ctx_ib_addr(ctx);
+    var ib_va        = native_ctx_ib_active_va(ctx);
+    var ib_addr      = native_ctx_ib_active_addr(ctx);
     var fence_handle = native_ctx_fence_handle(ctx);
     var fence_addr   = native_ctx_fence_addr(ctx);
 
@@ -13361,6 +13380,36 @@ fn native_ctx_ib_addr(ctx): i64 { return load64(ctx +  64); }
 fn native_ctx_fence_handle(ctx): i64 { return load64(ctx +  72); }
 fn native_ctx_fence_va(ctx): i64 { return load64(ctx +  80); }
 fn native_ctx_fence_addr(ctx): i64 { return load64(ctx +  88); }
+# v3.2.14 R.5 — per-node IB staging. The cached IB BO is partitioned into
+# _NATIVE_IB_SLOTS contiguous 4 KiB slices; the cursor (ctx +160) selects
+# the active one. native_ctx_ib_active_{va,addr} return the active slice's
+# GPU VA / CPU pointer (base + cursor*_NATIVE_IB_SIZE); the slice handle is
+# the one BO (native_ctx_ib_handle). The MQ executor calls
+# native_ctx_ib_advance per node to rotate; single-shot / synchronous paths
+# leave the cursor at 0 (slice 0 == base, so their behaviour is unchanged).
+fn native_ctx_ib_slot_cursor(ctx): i64 { return load64(ctx + 160); }
+fn native_ctx_ib_active_va(ctx): i64 {
+    return native_ctx_ib_va(ctx) + native_ctx_ib_slot_cursor(ctx) * _NATIVE_IB_SIZE;
+}
+fn native_ctx_ib_active_addr(ctx): i64 {
+    return native_ctx_ib_addr(ctx) + native_ctx_ib_slot_cursor(ctx) * _NATIVE_IB_SIZE;
+}
+# Advance the cursor to the next slice (round-robin over _NATIVE_IB_SLOTS).
+# Returns the new cursor. Wrapping past the last slice reuses slice 0 — the
+# executor must have retired (wait_idle) any submit still using it; the ring
+# depth bounds the safe in-flight count.
+fn native_ctx_ib_advance(ctx): i64 {
+    var c = native_ctx_ib_slot_cursor(ctx) + 1;
+    if (c >= _NATIVE_IB_SLOTS) { c = 0; }
+    store64(ctx + 160, c);
+    return c;
+}
+# Reset the staging cursor to slice 0 (the MQ executor calls this at graph
+# start so each execution begins from a deterministic slice).
+fn native_ctx_ib_reset_slots(ctx): i64 {
+    store64(ctx + 160, 0);
+    return 0;
+}
 # Audit MED-7: per-context PM4 build scratch (1024 bytes), allocated
 # once at gpu_context_new_native, shared between compute + render slots.
 fn native_ctx_pm4_scratch(ctx): i64 { return load64(ctx + 112); }
@@ -13413,8 +13462,10 @@ fn _backend_native_ctx_release(ctx): i64 {
         native_bo_release_gtt(fd, fence_handle, fence_addr, 4096);
     }
     if (ib_handle != 0) {
-        native_gem_va_unmap(fd, ib_handle, ib_va, 4096);
-        native_bo_release_gtt(fd, ib_handle, ib_addr, 4096);
+        # R.5: the IB BO spans _NATIVE_IB_SLOTS slices.
+        var ib_total = _NATIVE_IB_SIZE * _NATIVE_IB_SLOTS;
+        native_gem_va_unmap(fd, ib_handle, ib_va, ib_total);
+        native_bo_release_gtt(fd, ib_handle, ib_addr, ib_total);
     }
     # v3.1 Q.3b: destroy the per-queue persistent timeline syncobjs.
     # The Queue structs themselves are bump-allocated (native no-reclaim
@@ -14661,6 +14712,19 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
 
     var triple[32];
     native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle, tex_handle);
+
+    # v3.2.14 R.6: when the MQ render-graph executor stashes a current queue
+    # (gpu_ctx_set_current_queue), route this draw through the GFX-ring TIMELINE
+    # path (async, no CPU stall) so render nodes join cross-ring overlap — the
+    # exact analog of the compute slot's current-queue check. A non-GFX current
+    # queue is rejected inside native_render_dispatch_timeline. Zero stash = the
+    # v3.0 synchronous single-shot path below, unchanged.
+    var cq = gpu_ctx_current_queue(ctx);
+    if (cq != 0) {
+        var tl_rc = native_render_dispatch_timeline(ctx, pm4, pos, &triple, cq);
+        store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, 0);
+        return tl_rc;
+    }
 
     var t_now[16];
     memset(&t_now, 0, 16);
@@ -21421,28 +21485,138 @@ fn rg_execute(g, device, queue): i64 {
 }
 
 # ================================================================
-# Execute (multi-queue aware) — v3.2.13 Phase R entry point.
+# Execute (multi-queue aware) — v3.2.13–14 Phase R.
 # ================================================================
-# rg_execute_mq is the ctx-taking, queue-aware executor. The public
-# signature is fixed across the arc; the BODY is staged:
-#   R.1 (now): forwards to the v2.5 single-submit wgpu path, so the
-#              output command stream is byte-identical to rg_execute and
-#              the "default reproduces v2.5" contract holds. Node queue
-#              affinity is recorded (R.1); the scheduler that consumes it
-#              lands in R.2/R.3 (see docs/development/3-2-punchlist.md
-#              Phase R).
-#   R.2/R.3:   inserts rg_schedule (per-queue batches + cross-queue
-#              fence-edge classification) ahead of the executor.
-#   R.4+:      routes native nodes to per-ring timeline submits with
-#              cross-ring barriers; wgpu stays serialized-equivalent.
-# Takes the ctx (for the device/queue today, the queue table + barrier
-# path later). Returns 0|1, matching rg_execute. # @public
+# rg_execute_mq(g, ctx) is the ctx-taking, queue-aware executor. It runs
+# rg_schedule (R.2/R.3) then routes by backend: native AMD takes the real
+# multi-queue executor (_rg_execute_native_mq — per-ring timeline submits +
+# cross-ring fence edges, R.4–R.6); wgpu (one device queue) stays on the v2.5
+# single-encoder/single-submit path, serialized-equivalent with the identical
+# command stream (affinity honored as ordering only). Returns 0 on success,
+# non-zero on error (GPU_ERR_* on native, 1 on wgpu). # @public
+#
+# Dispatch one node natively, reinterpreting its byte-polymorphic payload as
+# native objects — the same backend-boundary polymorphism gpu_shader_module_create
+# uses (wgpu reads WGSL bytes, native reads GFX9 ISA). The node's queue is
+# already stashed as current, so each backend dispatch slot routes through its
+# timeline (async) path onto that ring. Returns 0|GPU_ERR_*.
+fn _rg_native_dispatch_node(ctx, node): i64 {
+    var kind = load64(node + 0);
+    var pl = load64(node + 8);
+    if (kind == NODE_COMPUTE) {
+        # ComputePayload natively: +0 shader module, +8 buffer-pair, +16/20/24 dims.
+        return gpu_compute_dispatch(ctx, load64(pl + 0),
+        load32(pl + 16), load32(pl + 20), load32(pl + 24), load64(pl + 8));
+    }
+    if (kind == NODE_RENDER) {
+        # RenderPayload natively: +0 NativePass, +8 NativeRenderPipeline, +16
+        # draw_verts. The render_pass_draw slot is queue-aware (R.6), so with a
+        # current queue stashed it routes through native_render_dispatch_timeline.
+        var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_PASS_DRAW);
+        if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+        return fncall5(slot, ctx, load64(pl + 0), load64(pl + 8), load64(pl + 16), 1);
+    }
+    if (kind == NODE_COPY_BUF_BUF) {
+        # CopyBufBufPayload natively: +0 src NativeBuf, +16 dst NativeBuf, +32
+        # size. The native whole-buffer copy slot has no offset args, so a
+        # non-zero src/dst offset fails loud rather than silently mis-copying.
+        # The copy node must be TRANSFER-affined (the SDMA ring); a GFX/COMPUTE
+        # queue is rejected inside the buffer_copy slot (GPU_ERR_TRANSFER).
+        if (load64(pl + 8) != 0)  { return GPU_ERR_BUFFER; }
+        if (load64(pl + 24) != 0) { return GPU_ERR_BUFFER; }
+        return gpu_queue_transfer_copy(ctx, gpu_ctx_current_queue(ctx),
+        load64(pl + 0), load64(pl + 16), load64(pl + 32));
+    }
+    # NODE_COPY_TEX_BUF has no native MQ-graph path yet — fail loud (tracked in
+    # docs/development/3-2-punchlist.md Phase R), never silent-wrong.
+    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+}
+
+# v3.2.14 R.6 — native multi-queue executor. Consumes the Schedule (R.2/R.3):
+# acquires the logical queue per used kind, walks nodes in GLOBAL sort_idx
+# order (the toposort guarantee that every producer submits before its
+# consumer — see the rg_schedule submission-order note), inserts a
+# gpu_queue_barrier for each incoming cross-queue fence edge before the
+# consumer's dispatch (in-CS timeline wait, no CPU stall), stashes the node's
+# queue as current so the native dispatch slots take their timeline paths,
+# advances the IB staging slice per node (R.5; no shared-IB clobber), and
+# finally gpu_queue_wait_idle's every used queue so results are readable on
+# return (the v2.5 completion contract). Returns 0|GPU_ERR_*.
+fn _rg_execute_native_mq(g, ctx): i64 {
+    var nodes = load64(g + 0);
+    var n = vec_len(nodes);
+    if (n == 0) { return 0; }
+    rg_schedule(g);                  # idempotent; safe if called directly
+    native_ctx_ib_reset_slots(ctx);  # deterministic per-execution start
+
+    var sched = _rg_sched(g);
+    var batches = load64(sched + SCHED_OFF_BATCHES);
+    var nb = vec_len(batches);
+    var fences = load64(sched + SCHED_OFF_FENCES);
+    var nf = vec_len(fences);
+
+    # Acquire (idempotently) the logical queue for every batch's kind.
+    var bi = 0;
+    while (bi < nb) {
+        if (gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)) == 0) {
+            return GPU_ERR_OTHER;
+        }
+        bi = bi + 1;
+    }
+
+    var rc = 0;
+    var i = 0;
+    while (i < n) {
+        var node = vec_get(nodes, i);   # vec is in sort_idx order, so i == sort_idx
+        var q = gpu_queue_get(ctx, load64(node + 56));
+
+        # Cross-queue barriers for every fence edge feeding this consumer node.
+        var fi = 0;
+        while (fi < nf) {
+            var fe = vec_get(fences, fi);
+            if (load64(fe + FENCE_OFF_CN) == i) {
+                gpu_queue_barrier(ctx, gpu_queue_get(ctx, load64(fe + FENCE_OFF_PQ)), q);
+            }
+            fi = fi + 1;
+        }
+
+        gpu_ctx_set_current_queue(ctx, q);
+        var dr = _rg_native_dispatch_node(ctx, node);
+        if (dr != 0) { rc = dr; }
+        native_ctx_ib_advance(ctx);     # next node stages into a fresh IB slice
+        i = i + 1;
+    }
+
+    # Clear the stash and retire every used queue before returning.
+    gpu_ctx_set_current_queue(ctx, 0);
+    bi = 0;
+    while (bi < nb) {
+        var wr = gpu_queue_wait_idle(ctx,
+        gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE)));
+        if (wr != 0) { rc = wr; }
+        bi = bi + 1;
+    }
+    return rc;
+}
+
 fn rg_execute_mq(g, ctx): i64 {
     if (ctx == 0) { return 1; }
-    # Run the scheduler pass (R.2/R.3) — idempotent, and a no-op on the
-    # wgpu serialized path. R.4 wires the native executor to consume the
-    # Schedule's per-queue batches + cross-queue fence edges.
+    if (rg_is_built(g) == 0) { return 1; }
+    # Run the scheduler pass (R.2/R.3) — idempotent; produces the per-queue
+    # batches + cross-queue fence edges both executors read.
     rg_schedule(g);
+    # Native AMD gets the real multi-queue executor (per-ring timeline submits
+    # + cross-ring fence edges, R.6). wgpu has one device queue, so it stays on
+    # the v2.5 single-encoder/single-submit path — serialized-equivalent, the
+    # identical command stream (the affinity is honored as ordering only). A
+    # null backend ptr (or any non-AMD kind) falls through to the wgpu path
+    # rather than dereferencing it.
+    var b = gpu_ctx_backend(ctx);
+    if (b != 0) {
+        if (backend_kind(b) == BACKEND_KIND_AMD) {
+            return _rg_execute_native_mq(g, ctx);
+        }
+    }
     return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
 }
 
