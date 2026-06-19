@@ -1,0 +1,255 @@
+# programs/native_spirv_f64_ldexp_e2e.cyr — v3.2 Phase F.7f.10: f64 Ldexp on Cezanne.
+#
+# out[lid.x] = ldexp(a[lid.x], 3) = a * 2^3 = a*8  (OpExtInst GLSL.std.450 Ldexp, f64-valid). Exercises
+# the OpExtInst Ldexp wiring (-> MIR_OP_F64_LDEXP / v_ldexp_f64). The 2^k primitive a consumer needs to
+# reconstruct a hand-rolled exp. Result is BIT-EXACT (ldexp is exact: just an exponent add).
+# Linked native via `make test-native-spirv-f64-ldexp-e2e`. Exit: 0 pass; 2 compile; 9 dispatch; 11 mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 { var b[32]; memset(&b, 0, 32); var l = fmt_int_buf(n, &b); syscall(1, 1, &b, l); return 0; }
+fn print_hex64(v): i64 {
+    var digits = "0123456789ABCDEF"; var b[18]; store8(&b + 0, 48); store8(&b + 1, 120);
+    var i = 0; while (i < 16) { store8(&b + 2 + i, load8(digits + ((v >> ((15 - i) * 4)) & 0xF))); i = i + 1; }
+    syscall(1, 1, &b, 18); return 0;
+}
+fn mono_ns(): i64 { var ts[16]; syscall(228, 1, &ts); return load64(&ts + 0) * 1000000000 + load64(&ts + 8); }
+
+var N_LANES = 8;
+
+fn fill_inputs(a): i64 {
+    store64(a + 0 , 0x3FF0000000000000);   # 1 -> ldexp(.,3)=8
+    store64(a + 8 , 0x4008000000000000);   # 3 -> ldexp(.,3)=24
+    store64(a + 16, 0xC004000000000000);   # -2.5 -> ldexp(.,3)=-20
+    store64(a + 24, 0x3FE0000000000000);   # 0.5 -> ldexp(.,3)=4
+    store64(a + 32, 0x3FF4000000000000);   # 1.25 -> ldexp(.,3)=10
+    store64(a + 40, 0xC01C000000000000);   # -7 -> ldexp(.,3)=-56
+    store64(a + 48, 0x3FB999999999999A);   # 0.1 -> ldexp(.,3)=0.8
+    store64(a + 56, 0x4059000000000000);   # 100 -> ldexp(.,3)=800
+    return 0;
+}
+fn fill_wants(want): i64 {
+    store64(want + 0 , 0x4020000000000000);   # ldexp(1,3) = 8
+    store64(want + 8 , 0x4038000000000000);   # ldexp(3,3) = 24
+    store64(want + 16, 0xC034000000000000);   # ldexp(-2.5,3) = -20
+    store64(want + 24, 0x4010000000000000);   # ldexp(0.5,3) = 4
+    store64(want + 32, 0x4024000000000000);   # ldexp(1.25,3) = 10
+    store64(want + 40, 0xC04C000000000000);   # ldexp(-7,3) = -56
+    store64(want + 48, 0x3FE999999999999A);   # ldexp(0.1,3) = 0.8
+    store64(want + 56, 0x4089000000000000);   # ldexp(100,3) = 800
+    return 0;
+}
+
+fn build_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x0000001A);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x00020011);
+    store32(buf + 32, 0x0000000A);
+    store32(buf + 36, 0x0006000B);
+    store32(buf + 40, 0x00000001);
+    store32(buf + 44, 0x4C534C47);
+    store32(buf + 48, 0x6474732E);
+    store32(buf + 52, 0x3035342E);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x0003000E);
+    store32(buf + 64, 0x00000000);
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x0006000F);
+    store32(buf + 76, 0x00000005);
+    store32(buf + 80, 0x00000002);
+    store32(buf + 84, 0x6E69616D);
+    store32(buf + 88, 0x00000000);
+    store32(buf + 92, 0x00000003);
+    store32(buf + 96, 0x00060010);
+    store32(buf + 100, 0x00000002);
+    store32(buf + 104, 0x00000011);
+    store32(buf + 108, 0x00000008);
+    store32(buf + 112, 0x00000001);
+    store32(buf + 116, 0x00000001);
+    store32(buf + 120, 0x00040047);
+    store32(buf + 124, 0x00000003);
+    store32(buf + 128, 0x0000000B);
+    store32(buf + 132, 0x0000001B);
+    store32(buf + 136, 0x00040047);
+    store32(buf + 140, 0x00000004);
+    store32(buf + 144, 0x00000021);
+    store32(buf + 148, 0x00000000);
+    store32(buf + 152, 0x00040047);
+    store32(buf + 156, 0x00000004);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047);
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000001);
+    store32(buf + 184, 0x00040047);
+    store32(buf + 188, 0x00000005);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00020013);
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00030021);
+    store32(buf + 212, 0x00000007);
+    store32(buf + 216, 0x00000006);
+    store32(buf + 220, 0x00040015);
+    store32(buf + 224, 0x00000008);
+    store32(buf + 228, 0x00000020);
+    store32(buf + 232, 0x00000000);
+    store32(buf + 236, 0x00040015);
+    store32(buf + 240, 0x00000009);
+    store32(buf + 244, 0x00000020);
+    store32(buf + 248, 0x00000001);
+    store32(buf + 252, 0x00040017);
+    store32(buf + 256, 0x0000000A);
+    store32(buf + 260, 0x00000008);
+    store32(buf + 264, 0x00000003);
+    store32(buf + 268, 0x00040020);
+    store32(buf + 272, 0x0000000B);
+    store32(buf + 276, 0x00000001);
+    store32(buf + 280, 0x0000000A);
+    store32(buf + 284, 0x00030016);
+    store32(buf + 288, 0x0000000C);
+    store32(buf + 292, 0x00000040);
+    store32(buf + 296, 0x0003001D);
+    store32(buf + 300, 0x0000000D);
+    store32(buf + 304, 0x0000000C);
+    store32(buf + 308, 0x0003001E);
+    store32(buf + 312, 0x0000000E);
+    store32(buf + 316, 0x0000000D);
+    store32(buf + 320, 0x00040020);
+    store32(buf + 324, 0x0000000F);
+    store32(buf + 328, 0x0000000C);
+    store32(buf + 332, 0x0000000E);
+    store32(buf + 336, 0x00040020);
+    store32(buf + 340, 0x00000010);
+    store32(buf + 344, 0x0000000C);
+    store32(buf + 348, 0x0000000C);
+    store32(buf + 352, 0x0004002B);
+    store32(buf + 356, 0x00000008);
+    store32(buf + 360, 0x00000011);
+    store32(buf + 364, 0x00000000);
+    store32(buf + 368, 0x0004002B);
+    store32(buf + 372, 0x00000009);
+    store32(buf + 376, 0x00000012);
+    store32(buf + 380, 0x00000003);
+    store32(buf + 384, 0x0004003B);
+    store32(buf + 388, 0x0000000B);
+    store32(buf + 392, 0x00000003);
+    store32(buf + 396, 0x00000001);
+    store32(buf + 400, 0x0004003B);
+    store32(buf + 404, 0x0000000F);
+    store32(buf + 408, 0x00000004);
+    store32(buf + 412, 0x0000000C);
+    store32(buf + 416, 0x0004003B);
+    store32(buf + 420, 0x0000000F);
+    store32(buf + 424, 0x00000005);
+    store32(buf + 428, 0x0000000C);
+    store32(buf + 432, 0x00050036);
+    store32(buf + 436, 0x00000006);
+    store32(buf + 440, 0x00000002);
+    store32(buf + 444, 0x00000000);
+    store32(buf + 448, 0x00000007);
+    store32(buf + 452, 0x000200F8);
+    store32(buf + 456, 0x00000013);
+    store32(buf + 460, 0x0004003D);
+    store32(buf + 464, 0x0000000A);
+    store32(buf + 468, 0x00000014);
+    store32(buf + 472, 0x00000003);
+    store32(buf + 476, 0x00050051);
+    store32(buf + 480, 0x00000008);
+    store32(buf + 484, 0x00000015);
+    store32(buf + 488, 0x00000014);
+    store32(buf + 492, 0x00000000);
+    store32(buf + 496, 0x00060041);
+    store32(buf + 500, 0x00000010);
+    store32(buf + 504, 0x00000016);
+    store32(buf + 508, 0x00000004);
+    store32(buf + 512, 0x00000011);
+    store32(buf + 516, 0x00000015);
+    store32(buf + 520, 0x0004003D);
+    store32(buf + 524, 0x0000000C);
+    store32(buf + 528, 0x00000017);
+    store32(buf + 532, 0x00000016);
+    store32(buf + 536, 0x0007000C);
+    store32(buf + 540, 0x0000000C);
+    store32(buf + 544, 0x00000018);
+    store32(buf + 548, 0x00000001);
+    store32(buf + 552, 0x00000035);
+    store32(buf + 556, 0x00000017);
+    store32(buf + 560, 0x00000012);
+    store32(buf + 564, 0x00060041);
+    store32(buf + 568, 0x00000010);
+    store32(buf + 572, 0x00000019);
+    store32(buf + 576, 0x00000005);
+    store32(buf + 580, 0x00000011);
+    store32(buf + 584, 0x00000015);
+    store32(buf + 588, 0x0003003E);
+    store32(buf + 592, 0x00000019);
+    store32(buf + 596, 0x00000018);
+    store32(buf + 600, 0x000100FD);
+    store32(buf + 604, 0x00010038);
+    return 608;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native f64 Ldexp e2e (F.7f.10) — OpExtInst Ldexp on Cezanne\n");
+    print_cstr("kernel: out[i] = ldexp(a[i], 3) = a*8\n\n");
+    var spv[800]; var n = build_kernel(&spv);
+    var types[1024]; var consts[768]; var deco[768]; var outbi[384]; var m[80];
+    var vals[2048]; var instrs[1280]; var ptrs[256]; var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 28, 48);
+    var isel[1024]; var isel2[1024]; var alloc[768]; var hw[16]; var abi[64]; var cc[88];
+    store64(&cc + CC_TYPES, &types); store64(&cc + CC_CONSTS, &consts); store64(&cc + CC_DECO, &deco);
+    store64(&cc + CC_M, &m); store64(&cc + CC_OUTBI, &outbi); store64(&cc + CC_ISEL, &isel);
+    store64(&cc + CC_ISEL2, &isel2); store64(&cc + CC_ALLOC, &alloc); store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi); store64(&cc + CC_CAP_IDS, 32);
+    var isa[1024]; memset(&isa, 0, 1024); var desc[64];
+    var crc = gfx9_compile(&cc, &spv, n, &isa, &desc);
+    if (crc != 0) { print_cstr("FAIL: gfx9_compile rc="); print_i64(crc); print_cstr("\n"); return 2; }
+    var isa_len = load64(&desc + DESC_ISA_LEN);
+    var rsrc1 = load64(&desc + DESC_RSRC1); var rsrc2 = load64(&desc + DESC_RSRC2);
+    print_cstr("compiled: isa_len="); print_i64(isa_len); print_cstr("\n\n");
+    var av[64]; var wv[64]; fill_inputs(&av); fill_wants(&wv);
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 3; }
+    var ctx = payload(ctx_res); var fd = native_ctx_fd(ctx);
+    var sbo[16]; if (native_bo_create_gtt(fd, 4096, &sbo) != 0) { return 5; }
+    var sh = load64(&sbo + 0); var sm = load64(&sbo + 8); memset(sm, 0, 4096);
+    var w = 0; while (w < isa_len) { store32(sm + w, load32(&isa + w)); w = w + 4; }
+    var sva = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, sh, sva, 4096, _NATIVE_PERM_SHADER) != 0) { return 5; }
+    var abo[16]; var obo[16];
+    if (native_bo_create_gtt(fd, 4096, &abo) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &obo) != 0) { return 5; }
+    var ah = load64(&abo + 0); var am = load64(&abo + 8); var oh = load64(&obo + 0); var om = load64(&obo + 8);
+    var i = 0; while (i < N_LANES) { store64(am + i*8, load64(&av + i*8)); store64(om + i*8, 0); i = i + 1; }
+    var ava = 0xFFFF800100400000; var ova = 0xFFFF800100402000;
+    if (native_gem_va_map(fd, ah, ava, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, oh, ova, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    var bv[32]; store64(&bv + 0, ava); store64(&bv + 8, ova);
+    var bh[32]; store64(&bh + 0, ah); store64(&bh + 8, oh);
+    var pm4 = native_ctx_pm4_scratch(ctx); if (pm4 == 0) { return 7; }
+    memset(pm4, 0, 256);
+    var pb = native_pm4_build_compute_dispatch(pm4, sva, rsrc1, rsrc2, &bv, 2, N_LANES, 1, 1, 1, 1, 1);
+    var rc = native_compute_dispatch_cached_n(ctx, pm4, pb, sh, &bh, 2, mono_ns() + 15000000000);
+    if (rc != 0) { print_cstr("FAIL: dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+    print_cstr("  lane :      got (hex)        |  want = a*8 (hex)\n");
+    var ok = 1; i = 0;
+    while (i < N_LANES) {
+        var got = load64(om + i*8); var ref = load64(&wv + i*8);
+        print_cstr("  ["); print_i64(i); print_cstr("]  : "); print_hex64(got); print_cstr("  |  "); print_hex64(ref);
+        if (got != ref) { print_cstr("   <-- MISMATCH"); ok = 0; }
+        print_cstr("\n"); i = i + 1;
+    }
+    gpu_context_release(ctx);
+    if (ok == 0) { print_cstr("\nFAIL: ldexp not bit-exact\n"); return 11; }
+    print_cstr("\nOK — f64 Ldexp correct on Cezanne (F.7f.10)\n");
+    return 0;
+}

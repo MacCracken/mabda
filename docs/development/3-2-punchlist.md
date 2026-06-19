@@ -1080,9 +1080,11 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     sites; (c) type-gated the wc≥5 hi-word pack (only f64; a malformed f64 wc<5 fails loud) + reverted
     the redundant untyped pack in `spirv_build_const_table` (it serves only i32 access-chain indices).
     Pinned by `test_spirv_f64_arg` + a store-const compile test.
-  - [ ] **F.7f.Ldexp** — if GLSL.std.450 Ldexp is f64-valid (likely — it's general-float like Sqrt),
-    wire `OpExtInst Ldexp` (f64) → `MIR_OP_F64_LDEXP` (encoder + MIR op exist from F.7f.7a/c) so consumers
-    get 2^k for their hand-rolled exp without bit tricks.
+  - [x] **F.7f.Ldexp** *(2026-06-19)* — **HW-verified on Cezanne**: GLSL.std.450 Ldexp IS f64-valid
+    (general-float, like Sqrt — spirv-val confirms). Wired `OpExtInst Ldexp` (f64) → `MIR_OP_F64_LDEXP`
+    (the encoder + MIR op + emit already existed from F.7f.7a/c). `out=ldexp(a,3)=a·8` bit-exact on all
+    8 lanes — `native_spirv_f64_ldexp_e2e.cyr` + a compile test. Consumers get 2^k for hand-rolled exp.
+    (f32 Ldexp unwired — no native consumer; wgpu covers f32.)
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the conformant op set attn11's hand-rolled f64
     kernels need is HW-verified: {add,sub,mul,div,sqrt,fma,cmp,cvt(i32↔f64 + f32↔f64),const,ldexp}.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,

@@ -892,3 +892,11 @@ build/native_spirv_f64_const_e2e: programs/native_spirv_f64_const_e2e.cyr src/*.
 .PHONY: test-native-spirv-f64-const-e2e
 test-native-spirv-f64-const-e2e: build/native_spirv_f64_const_e2e
 	./build/native_spirv_f64_const_e2e
+
+build/native_spirv_f64_ldexp_e2e: programs/native_spirv_f64_ldexp_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f64_ldexp_e2e.cyr $@
+
+.PHONY: test-native-spirv-f64-ldexp-e2e
+test-native-spirv-f64-ldexp-e2e: build/native_spirv_f64_ldexp_e2e
+	./build/native_spirv_f64_ldexp_e2e
