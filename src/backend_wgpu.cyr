@@ -363,6 +363,52 @@ fn _backend_wgpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): 
     return t;
 }
 
+# v3.3 AL.2 — mipped create for ANY MABDA_TEXFMT_*. Same 32-byte WgpuMipped-
+# Texture layout as the RGBA8 path (handle@0, view@8, width@16, height@20,
+# mip_count@24) PLUS fmt@28 so write_level knows the format (the RGBA8 mipped
+# path leaves @28 == 0 == MABDA_TEXFMT_RGBA8, so it stays consistent). No
+# STORAGE_BINDING (compressed can't be storage-bound; mipmap-generate is the
+# RGBA8-only path). Caps-gated for compressed families like the fmt create.
+fn _backend_wgpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    if (mip_count < 1) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var wfmt = mabda_texfmt_to_wgpu(fmt);
+    if (wfmt == 0) { return 0; }            # unknown / Undefined
+    var fam = mabda_texfmt_compression_family(fmt);
+    if (fam != 0) {
+        var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
+        if ((mask & fam) == 0) { return 0; }
+    }
+    var device = gpu_ctx_device(ctx);
+    var usage = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_COPY_DST
+    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var desc = wgpu_texture_descriptor_mipped(0, usage,
+    WGPU_TEXTURE_DIMENSION_2D, width, height, wfmt, mip_count);
+    var handle = wgpu_device_create_texture(device, desc);
+    if (handle == 0) { return 0; }
+    var vd = wgpu_texture_view_descriptor(0, wfmt, WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    store32(vd + 36, mip_count);   # mipLevelCount = full chain
+    var view = wgpu_texture_create_view(handle, vd);
+    if (view == 0) {
+        wgpu_texture_release(handle);
+        return 0;
+    }
+    var t = alloc(32);
+    memset(t, 0, 32);
+    store64(t +  0, handle);
+    store64(t +  8, view);
+    store32(t + 16, width);
+    store32(t + 20, height);
+    store32(t + 24, mip_count);
+    store32(t + 28, fmt);          # AL.2: fmt for write_level (RGBA8 path = 0)
+    return t;
+}
+
 # v3.1 [M.6b]: wgpu mipmap generation needs a real compute pipeline
 # (shader module + storage-texture bind groups + per-level dispatch), but
 # the wgpu COMPUTE path itself is still a v3.0 stub
@@ -484,8 +530,8 @@ fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
 # v3.3 AL.1 — write `n` bytes into mip `level` of a wgpu texture via
 # wgpu_queue_write_texture with mipLevel = level. Reads the MIPPED-texture
 # layout (from _backend_wgpu_texture_create_2d_rgba8_mipped: handle@0,
-# width@16, height@20, mip_count@24); fmt is RGBA8 (the only mipped wgpu
-# format today — AL.2's generalized mipped create stores + reads fmt).
+# width@16, height@20, mip_count@24, fmt@28). fmt@28 is the MABDA_TEXFMT_*
+# (the RGBA8 mipped-create path leaves it 0 == RGBA8, so both paths agree).
 # KNOWN LIMITATION (tracked, X2): wgpu requires bytesPerRow be a multiple of
 # 256 for multi-row copies; tightly-packed small-mip rows are not aligned, so
 # non-256-aligned widths need a staging re-pack — shared with the existing
@@ -501,7 +547,7 @@ fn _backend_wgpu_texture_write_level(ctx, tex, level, src, n): i64 {
     var height    = load32(tex + 20);
     var mip_count = load32(tex + 24);
     if (level >= mip_count) { return GPU_ERR_TEXTURE; }
-    var fmt = MABDA_TEXFMT_RGBA8;
+    var fmt = load32(tex + 28);   # AL.2: real fmt (RGBA8 mipped path stores 0)
     var lw = mip_level_dim(width, level);
     var lh = mip_level_dim(height, level);
     var expected = mabda_texfmt_data_size(fmt, lw, lh);
@@ -1113,6 +1159,8 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_texture_create_2d_fmt);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8_MIPPED,
     &_backend_wgpu_texture_create_2d_rgba8_mipped);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED,
+    &_backend_wgpu_texture_create_2d_fmt_mipped);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_GENERATE_MIPMAPS,
     &_backend_wgpu_texture_generate_mipmaps);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE,

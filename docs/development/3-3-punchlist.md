@@ -120,16 +120,28 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.2 — Generalized mipped create (3.3.2) [M]
 
-- [ ] **AL.2a** — `backend.cyr`: `BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED =
-  288`, `BACKEND_SIZE = 296` (a fixed-arity fnptr slot can't grow an arg — it's
-  a **new** slot, not an extension of `CREATE_2D_FMT`). Completeness test.
-- [ ] **AL.2b** — `texture.cyr`: `gpu_texture_create_2d_fmt_mipped(ctx, w, h,
-  fmt, mip_count)` — validate mip_count (0 → full chain; > full chain → reject);
-  validate fmt. Tests: validation + full-chain computation.
-- [ ] **AL.2c** — native: compressed mip-chain BO sizing (per-level block-
-  rounded + 256-aligned). Test total BO size (e.g. BC1 256×256 chain).
-- [ ] **AL.2d** — wgpu: `mipLevelCount` on the compressed-fmt texture
-  descriptor. Descriptor-shape test.
+- [x] **AL.2a (2026-06-19)** — `backend.cyr`: `BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED
+  = 288`, `BACKEND_SIZE 288→296`, `BACKEND_FMTMIPPED_SLOTS_BEGIN/END` range (a
+  fixed-arity fnptr slot can't grow an arg, so a new slot — confirms the critic's
+  "two new slots" call). Slot-offset + size-pin tests (backend.tcyr 447→464).
+- [x] **AL.2b (2026-06-19)** — `texture.cyr`: `gpu_texture_create_2d_fmt_mipped(ctx,
+  w, h, fmt, mip_count)` — validates fmt (`block_bytes != 0`), dims, mip_count
+  (0 → full chain via `mip_level_count`; > full → reject); fncall5 the slot.
+  Dispatch + full-chain-resolution + guard tests.
+- [x] **AL.2c (2026-06-19)** — native: `native_texture_create_mipped_2d_fmt` +
+  `_backend_native_texture_create_2d_fmt_mipped`; LINEAR mipped storage of any
+  fmt, BO sized via `native_tex_chain_size` (format-aware, RGBA8 byte-identical
+  to `native_mip_chain_size`; AL.1's `write_level` fills each level at the same
+  `native_tex_level_offset`). +6 asserts (chain-size consistency + BC1 512 + the
+  filler guard ladder; the BO-create success path is HW). **Native SAMPLING of
+  compressed mips needs the tiled TS.7 path — this is the linear storage/upload
+  foundation; sampling-compressed-mips on native is tracked for when AL.3 needs it.**
+- [x] **AL.2d (2026-06-19)** — wgpu: `_backend_wgpu_texture_create_2d_fmt_mipped`
+  (`mipLevelCount` descriptor, caps-gated for compressed families). Reconciled
+  the wgpu mipped-tex layout: `fmt@28` added to the 32-B struct (RGBA8 mipped
+  leaves it 0 = RGBA8), and AL.1's wgpu `write_level` now reads `fmt@28` instead
+  of hardcoding RGBA8 — so both create paths + write_level agree. Suite
+  4171→4194; smoke/lint/fmt/vet/distlib green.
 
 ## Phase AL.3 — DDS loader (3.3.3) [M]
 
