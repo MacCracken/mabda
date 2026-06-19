@@ -29,13 +29,15 @@ fn test_vk_format_mapping() {
 
 # Unrepresentable / unmapped VkFormats must return 0 (fail-loud at loader).
 fn test_vk_format_unmapped() {
-    assert_eq(mabda_texfmt_from_vk_format(135), 0, "VK 135 BC2 has no mabda id -> 0");
-    assert_eq(mabda_texfmt_from_vk_format(140), 0, "VK 140 BC4_SNORM -> 0 (no signed id)");
-    assert_eq(mabda_texfmt_from_vk_format(142), 0, "VK 142 BC5_SNORM -> 0");
-    assert_eq(mabda_texfmt_from_vk_format(144), 0, "VK 144 BC6H_SFLOAT -> 0");
-    assert_eq(mabda_texfmt_from_vk_format(149), 0, "VK 149 ETC2_R8G8B8A1 -> 0 (no id)");
-    assert_eq(mabda_texfmt_from_vk_format(0), 0, "VK 0 UNDEFINED -> 0");
-    assert_eq(mabda_texfmt_from_vk_format(9999), 0, "VK 9999 unknown -> 0");
+    assert_eq(mabda_texfmt_from_vk_format(135), 0 - 1, "VK 135 BC2 no mabda id -> -1");
+    assert_eq(mabda_texfmt_from_vk_format(140), 0 - 1, "VK 140 BC4_SNORM -> -1 (no signed id)");
+    assert_eq(mabda_texfmt_from_vk_format(142), 0 - 1, "VK 142 BC5_SNORM -> -1");
+    assert_eq(mabda_texfmt_from_vk_format(144), 0 - 1, "VK 144 BC6H_SFLOAT -> -1");
+    assert_eq(mabda_texfmt_from_vk_format(149), 0 - 1, "VK 149 ETC2_R8G8B8A1 -> -1 (no id)");
+    assert_eq(mabda_texfmt_from_vk_format(0), 0 - 1, "VK 0 UNDEFINED -> -1");
+    assert_eq(mabda_texfmt_from_vk_format(9999), 0 - 1, "VK 9999 unknown -> -1");
+    # RGBA8 (id 0) is a VALID result, distinct from unmapped (-1).
+    assert_eq(mabda_texfmt_from_vk_format(37), MABDA_TEXFMT_RGBA8, "VK 37 -> RGBA8 (0), not unmapped");
     return 0;
 }
 
@@ -68,12 +70,14 @@ fn test_dxgi_format_mapping() {
 
 # The plan mis-mapped DXGI 74 -> BC3; 74 (0x4A) is BC2 (no mabda id) -> 0.
 fn test_dxgi_format_unmapped() {
-    assert_eq(mabda_texfmt_from_dxgi_format(74), 0, "DXGI 74 BC2 has no mabda id -> 0");
-    assert_eq(mabda_texfmt_from_dxgi_format(81), 0, "DXGI 81 BC4_SNORM -> 0");
-    assert_eq(mabda_texfmt_from_dxgi_format(84), 0, "DXGI 84 BC5_SNORM -> 0");
-    assert_eq(mabda_texfmt_from_dxgi_format(96), 0, "DXGI 96 BC6H_SF16 -> 0");
-    assert_eq(mabda_texfmt_from_dxgi_format(0), 0, "DXGI 0 UNKNOWN -> 0");
-    assert_eq(mabda_texfmt_from_dxgi_format(9999), 0, "DXGI 9999 unknown -> 0");
+    assert_eq(mabda_texfmt_from_dxgi_format(74), 0 - 1, "DXGI 74 BC2 no mabda id -> -1");
+    assert_eq(mabda_texfmt_from_dxgi_format(81), 0 - 1, "DXGI 81 BC4_SNORM -> -1");
+    assert_eq(mabda_texfmt_from_dxgi_format(84), 0 - 1, "DXGI 84 BC5_SNORM -> -1");
+    assert_eq(mabda_texfmt_from_dxgi_format(96), 0 - 1, "DXGI 96 BC6H_SF16 -> -1");
+    assert_eq(mabda_texfmt_from_dxgi_format(0), 0 - 1, "DXGI 0 UNKNOWN -> -1");
+    assert_eq(mabda_texfmt_from_dxgi_format(9999), 0 - 1, "DXGI 9999 unknown -> -1");
+    # RGBA8 (id 0) is a VALID result, distinct from unmapped (-1).
+    assert_eq(mabda_texfmt_from_dxgi_format(28), MABDA_TEXFMT_RGBA8, "DXGI 28 -> RGBA8 (0), not unmapped");
     return 0;
 }
 
@@ -159,6 +163,10 @@ fn test_dds_parse_dx10() {
     _dds_parse(&buf, 148, &out);
     assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "DXGI 99 -> BC7");
     assert_eq(load64(&out + 40), 1, "DXGI 99 srgb flag set");
+    # RGBA8 via DX10 (DXGI 28 -> id 0): MUST parse, not be mistaken for unmapped.
+    _mk_dds_dx10(&buf, 4, 4, 1, 28, 0, 1);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DX10 RGBA8 parses (0 id != unmapped)");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_RGBA8, "DXGI 28 -> RGBA8");
     return 0;
 }
 
@@ -253,6 +261,93 @@ fn test_gpu_texture_load_dds_orchestration() {
     return 0;
 }
 
+# --- AL.4: KTX2 header parse + load orchestration ---
+
+# Build a KTX2 header (>= 80-byte buf): 12-byte identifier + header fields.
+# The level index (offset 80+) is left to the caller for load tests.
+fn _mk_ktx2_hdr(buf, vk, w, h, levels, scheme, layers, faces) {
+    memset(buf, 0, 80);
+    store32(buf + 0, _KTX2_ID0);
+    store32(buf + 4, _KTX2_ID1);
+    store32(buf + 8, _KTX2_ID2);
+    store32(buf + 12, vk);
+    store32(buf + 20, w);
+    store32(buf + 24, h);
+    store32(buf + 32, layers);
+    store32(buf + 36, faces);
+    store32(buf + 40, levels);
+    store32(buf + 44, scheme);
+    return 0;
+}
+
+fn test_ktx2_parse() {
+    var buf[148];
+    var out[48];
+    _mk_ktx2_hdr(&buf, 145, 64, 32, 1, 0, 0, 1);   # vk 145 = BC7_UNORM
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "KTX2 BC7 parses");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "vk 145 -> BC7");
+    assert_eq(load64(&out + 8), 64, "width 64");
+    assert_eq(load64(&out + 16), 32, "height 32");
+    assert_eq(load64(&out + 24), 1, "1 level");
+    _mk_ktx2_hdr(&buf, 37, 8, 8, 1, 0, 1, 1);       # vk 37 = RGBA8 (id 0)
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "KTX2 RGBA8 parses");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_RGBA8, "vk 37 -> RGBA8 (0), valid not unmapped");
+    return 0;
+}
+
+fn test_ktx2_parse_rejects() {
+    var buf[148];
+    var out[48];
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 1);
+    store32(&buf + 0, 0x12345678);
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "bad identifier");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 1);
+    assert_eq(_ktx2_parse(&buf, 40, &out), GPU_ERR_CONTAINER_PARSE, "truncated (<80)");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 2, 0, 1);    # scheme 2 = Zstd
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "supercompression gated");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 6);    # faces 6 = cubemap
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "cubemap rejected");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 2, 1);    # layers 2 = array
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "array rejected");
+    _mk_ktx2_hdr(&buf, 9999, 64, 64, 1, 0, 0, 1);   # unmapped vk
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "unmapped vk rejected");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 4, 0, 0, 1);    # 4 levels need 80+96=176 bytes
+    assert_eq(_ktx2_parse(&buf, 100, &out), GPU_ERR_CONTAINER_PARSE, "level index doesn't fit len");
+    return 0;
+}
+
+fn test_ktx2_load_orchestration() {
+    _dds_cr_count = 0;
+    _dds_wl_count = 0;
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    # KTX2 BC7 8x8 1-level: header+index = 104; data @104, BC7 8x8 = 64 B; buf 168.
+    var buf[168];
+    _mk_ktx2_hdr(&buf, 145, 8, 8, 1, 0, 0, 1);
+    store64(&buf + 80, 104);          # level 0 byteOffset
+    store64(&buf + 88, 64);           # byteLength
+    store64(&buf + 96, 64);           # uncompressedByteLength
+    var tex = gpu_texture_load_ktx2(&ctx, &buf, 168);
+    assert_eq(tex, 0x7E, "returns the created tex handle");
+    assert_eq(_dds_cr_count, 1, "create called once");
+    assert_eq(_dds_cr_fmt, MABDA_TEXFMT_BC7, "create fmt BC7");
+    assert_eq(_dds_wl_count, 1, "write_level once");
+    assert_eq(_dds_wl_n, 64, "level 0 = BC7 8x8 = 64 B");
+    # ETC2 KTX2 on native (BC-only caps) -> caps gate fails loud before create.
+    var buf2[168];
+    _mk_ktx2_hdr(&buf2, 147, 8, 8, 1, 0, 0, 1);   # vk 147 = ETC2_RGB8
+    store64(&buf2 + 80, 104);
+    store64(&buf2 + 88, 32);
+    store64(&buf2 + 96, 32);
+    assert_eq(gpu_texture_load_ktx2(&ctx, &buf2, 168), 0, "ETC2 on native (BC-only) -> 0 (caps gate)");
+    return 0;
+}
+
 fn main() {
     test_vk_format_mapping();
     test_vk_format_unmapped();
@@ -266,6 +361,9 @@ fn main() {
     test_dds_parse_rejects();
     test_gpu_ctx_supports_format_native();
     test_gpu_texture_load_dds_orchestration();
+    test_ktx2_parse();
+    test_ktx2_parse_rejects();
+    test_ktx2_load_orchestration();
     assert_summary();
     return 0;
 }

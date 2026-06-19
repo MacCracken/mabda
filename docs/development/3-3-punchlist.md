@@ -165,16 +165,25 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.4 — KTX2-uncompressed loader (3.3.4) [M]
 
-- [ ] **AL.4a** — `_ktx2_parse_header` — 12-B identifier + header fields, bounds-
-  checked. Tests: blob → fields; truncated/bad-magic reject.
-- [ ] **AL.4b** — `supercompressionScheme != 0` → **fail-loud** `FORMAT_
-  UNSUPPORTED` with detail (the BasisLZ/Zstd/ZLIB decoder gate). Test scheme=2.
-- [ ] **AL.4c** — `faceCount != 1` / `layerCount > 1` → reject (v3.4). Tests.
-- [ ] **AL.4d** — level-index parse (levelCount × 24-B); scheme==0 ⇒ compressed
-  len == uncompressed len. Tests: parse + mismatch reject.
-- [ ] **AL.4e** — `mabda_texfmt_from_vk_format` + caps gate + `create_2d_fmt_
-  mipped` + `write_level` loop. Tests: vkFormat→fmt; upload routing; unmapped reject.
-- [ ] **AL.4f** — `gpu_texture_load_ktx2` + `_result`. Full mock parse→upload test.
+- [x] **AL.4 (2026-06-19)** — KTX2-uncompressed loader, complete. `_ktx2_parse`
+  (12-byte identifier read as three **masked** u32s — one byte has the high bit
+  set; bounds-checked header), `supercompressionScheme != 0` → FORMAT_UNSUPPORTED
+  (the BasisLZ/Zstd/ZLIB decoder gate, tracked), `faceCount != 1` / `layerCount
+  > 1` → FORMAT_UNSUPPORTED (cube/array → v3.4), the `vkFormat → MABDA_TEXFMT`
+  map + caps gate, and `gpu_texture_load_ktx2`/`_result` walking the **level
+  index** (levelCount × 24-B `byteOffset/byteLength/uncompressedByteLength`;
+  scheme-0 invariant `byteLength == uncompressed == per-level size`; every span
+  bounds-checked, data-overlaps-index rejected). **+24 asserts** (asset_load
+  95→119): parse fixtures (BC7/RGBA8) + 7 reject paths + mock-backend load +
+  the ETC2-on-native-caps reject. Suite 4231→4255.
+- [x] **AL.4 fix — RGBA8/-1 disambiguation (caught here, fixed at the AL.0
+  source).** `MABDA_TEXFMT_RGBA8 == 0` and the AL.0 format-map fns returned `0`
+  for *both* RGBA8 and unmapped — so the loaders' `fmt == 0 → reject` logic
+  wrongly rejected RGBA8 (DDS DX10 dxgi 28, KTX2 vk 37/43). Changed
+  `mabda_texfmt_from_{vk,dxgi}_format` to return **-1** for unmapped (RGBA8=0
+  stays valid); loaders now reject on `fmt < 0`. AL.0 tests updated (unmapped →
+  -1) + RGBA8-valid + DX10-RGBA8 + KTX2-RGBA8 cases added to lock it. (A latent
+  silent-reject the DDS-only AL.3 tests had missed.)
 
 ## Phase AL.P0 — chitra 0.1.0 (3.3.5) [C — new repo]
 
