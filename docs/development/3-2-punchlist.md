@@ -984,12 +984,39 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     access-chain stride (std430 dvec2=16) + the i*8 per-component offset. No src change (N.10 + F.7a-e
     wiring). `native_spirv_f64_vec_e2e.cyr`. Found the buffer-sizing trap (vec kernels need ~2× cap_ids
     buffers or the memsets corrupt — [[reference_compiler_test_buffer_sizing]]).
-  - [ ] **F.7f.5+** — remaining op breadth (HW each): **FSqrt** (V_SQRT_F64 = 0x28 single VOP1, exists —
-    but verify GFX9 rounding vs a correctly-rounded ref); **FDiv** (f64 reciprocal macro via V_RCP_F64
-    0x25 — complex); **f64 compares** (no float-compare path exists yet — from-scratch VOPC + the
-    SCC/VCC routing); **inline f64 constants** (const-table words-3+4 split + two-i32-mov pair materialize).
+  - **F.7f.5 finding** *(2026-06-18)* — **GFX9 `v_sqrt_f64` is an ~f32-precision APPROXIMATION**, not
+    correctly-rounded (HW-proven: every lane ~2^26 ULP off, even sqrt(4)). The single-op attempt was
+    reverted to fail-loud. f64 **FSqrt** AND **FDiv** therefore need the LLVM-style Newton-refinement
+    macro (`v_rsq_f64`/`v_rcp_f64` seed + `v_fma_f64` iterations + `v_div_fixup_f64`) — the hardest f64
+    ops, same class as the N.9 int udiv. See [[project_gfx9_f64_transcendentals_approximate]].
+  - **F.7f libm arc** *(maintainer decision 2026-06-18, after the attn11 scope)* — attn11's f64 GPU
+    path is M18/M19 (deferred, no consumer yet), but its blocking f64 op set is {sqrt, exp, ln, tanh,
+    div} — all transcendentals. Decision: **build the full GFX9 f64 transcendental libm now** rather
+    than stop at the algebraic MVP. Dependency order: **FDiv → FSqrt → exp → ln → tanh → pow** (div's
+    reciprocal pattern seeds sqrt; tanh is built on exp; pow = exp(e·ln(b))). Each op is the LLVM
+    gfx900 expansion, byte-oracle'd then HW-verified value-exact vs a CPU f64 reference.
+  - **F.7f.6 (FDiv macro)** — correctly-rounded f64 div, the LLVM 11-instr reciprocal Newton macro
+    (`v_div_scale_f64` VOP3B + `v_rcp_f64` seed + `v_fma_f64` iterations + `v_div_fmas_f64` + the
+    `v_div_fixup_f64` rounding fixup, with VCC threaded scale→fmas).
+    - [x] **F.7f.6a** *(2026-06-18)* — encoder foundation: `V_RCP_F64`/`V_DIV_SCALE_F64`/
+      `V_DIV_FMAS_F64`/`V_DIV_FIXUP_F64` opcodes + the `gfx9_enc_vop3b_lo` VOP3B form (SDST in
+      lo[14:8]) + the `test_gfx9_enc_f64_div` byte-oracle (llvm-mc gfx900-matched). No lowering yet.
+    - [ ] **F.7f.6b** — macro lowering in gfx9_compile.cyr: VCC reservation + the SGPR-pair scale
+      output + the 11-instr sequence + regalloc temporaries; HW e2e `out=a/b` value-exact on Cezanne.
+  - [ ] **F.7f.7 (FSqrt macro)** — correctly-rounded f64 sqrt: `v_rsq_f64` seed + Newton iterations +
+    the `v_ldexp_f64`/`v_cmp_class_f64` range-reduction guard (the ~15-instr LLVM expansion).
+  - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing).
+  - [ ] **F.7f.9 (inline f64 consts)** — const-table words-3+4 split + two-i32-mov pair materialization.
+  - [ ] **F.7f.10 (exp f64)** — range reduction (k=round(x/ln2), r=x-k·ln2) + Horner polynomial +
+    `v_ldexp_f64` scale-by-2^k; value-exact vs CPU `exp`. attn11 softmax/SSM blocker.
+  - [ ] **F.7f.11 (ln f64)** — `v_frexp_f64` mantissa/exp split + polynomial on the reduced mantissa +
+    `+exp·ln2`; value-exact vs CPU `log`. attn11 cross-entropy/softplus blocker.
+  - [ ] **F.7f.12 (tanh f64)** — built on F.7f.10 exp: `tanh(x)=(e^2x-1)/(e^2x+1)` with the large-|x|
+    saturation guard; value-exact vs CPU `tanh`. attn11 GELU blocker.
+  - [ ] **F.7f.13 (pow f64)** — `pow(b,e)=exp(e·ln(b))` reusing F.7f.10/F.7f.11 + the b≤0/edge guards;
+    value-exact vs CPU `pow`. attn11 RoPE/Adam blocker.
   - [ ] **F.7-flip** — set `MABDA_NATIVE_F64 = 1` once the per-op conformance suite covers every op
-    attn11 uses, end-to-end on Cezanne.
+    attn11 uses (the full {add,sub,mul,div,sqrt,fma,exp,ln,tanh,pow,cmp,cvt} set), end-to-end on Cezanne.
 - [ ] **F.9** *(3.2.13)* — attn11 consumer smoke (one real f64 kernel,
   bit-faithful vs the CPU f64 oracle). Acceptance proof.
 - [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow
