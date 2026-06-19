@@ -6053,6 +6053,9 @@ var MIR_OP_CNDMASK     = 43;   # a = vcc ? b(true) : a(false); reads the implici
 # Arithmetic shift right (N.9d signed div sign masks). Uniformity is generic (it has both
 # a SALU and a VALU form, unlike the vector-only div primitives above).
 var MIR_OP_ASHR        = 44;
+# v3.2 F.7f.2 — f32<->f64 conversion (OpFConvert). isel picks the direction from the RESULT type:
+# f64 result → widen (V_CVT_F64_F32), f32 result → narrow (V_CVT_F32_F64).
+var MIR_OP_FCONVERT    = 45;
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -6438,6 +6441,7 @@ var SPIRV_OP_COMPOSITE_EXTRACT = 81;
 var SPIRV_OP_CONVERT_F_TO_S    = 110;
 var SPIRV_OP_CONVERT_S_TO_F    = 111;
 var SPIRV_OP_CONVERT_U_TO_F    = 112;
+var SPIRV_OP_FCONVERT          = 115;   # f32<->f64 (v3.2 F.7f.2)
 var SPIRV_OP_IADD              = 128;
 var SPIRV_OP_FADD              = 129;
 var SPIRV_OP_ISUB             = 130;
@@ -7344,6 +7348,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_CONVERT_S_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_F_TO_S) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m); }
+    if (op == SPIRV_OP_FCONVERT) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_FCONVERT, types, m); }
     if (op == SPIRV_OP_COMPOSITE_CONSTRUCT) { return _spirv_lower_composite_construct(ptr, off, wc, types, m); }
     if (op == SPIRV_OP_COMPOSITE_EXTRACT) {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
@@ -7658,6 +7663,10 @@ var GISEL_V_MAX_F64          = 54;
 # 64-bit (f64) global load/store — DWORDX2 variants of GLOBAL_LOAD/STORE (same operands).
 var GISEL_GLOBAL_LOAD_DWORDX2  = 55;
 var GISEL_GLOBAL_STORE_DWORDX2 = 56;
+# f32<->f64 conversion (F.7f.2): widen reads an f32 single + writes an f64 pair; narrow the reverse.
+# Both are VOP1 (single source); _emit_vop1 + regalloc's per-type width handle the reg encoding.
+var GISEL_V_CVT_F64_F32        = 57;   # widen (f64)f32
+var GISEL_V_CVT_F32_F64        = 58;   # narrow (f32)f64
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -7864,6 +7873,13 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     }
     if (op == MIR_OP_CVT_F32) { return _gisel_emit(out, k, GISEL_V_CVT_F32_I32, dst, a, 0, 0, flags); }
     if (op == MIR_OP_CVT_I32) { return _gisel_emit(out, k, GISEL_V_CVT_I32_F32, dst, a, 0, 0, flags); }
+    # f32<->f64 (F.7f.2): the RESULT type picks the direction — f64 result = widen, f32 = narrow.
+    if (op == MIR_OP_FCONVERT) {
+        if (mir_type_base(mir_val_type(m, dst)) == MIR_T_F64) {
+            return _gisel_emit(out, k, GISEL_V_CVT_F64_F32, dst, a, 0, 0, flags);
+        }
+        return _gisel_emit(out, k, GISEL_V_CVT_F32_F64, dst, a, 0, 0, flags);
+    }
     # N.9 integer-division primitives. The unary forms (VMOV/CVT_F32_U/CVT_U_F32/RCP) carry
     # the source in `a`; MUL_HI is binary (a,b); CNDMASK is binary (a=false src0, b=true
     # vsrc1) reading the implicit VCC. All VALU.
@@ -9000,6 +9016,12 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     if (op == GISEL_V_FMA_F64) {
         return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F64);
+    }
+    if (op == GISEL_V_CVT_F64_F32) {
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F64_F32);
+    }
+    if (op == GISEL_V_CVT_F32_F64) {
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_F64);
     }
     if (op == GISEL_S_WAITCNT) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, gisel_a(isel, i))); }
     if (op == GISEL_S_ENDPGM) { return gfx9_emit32(buf, pos, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0)); }

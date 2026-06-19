@@ -76,6 +76,14 @@ dispatch — only the `compiler_*.tcyr` tests exercise it).
   (v_add/mul/min/max_f64 in the ISA). Lane 6 = `…5C2` (UNFUSED) vs F.7e's `…5C3` (fused) — proof the
   compiler rounds separate OpFMul+OpFAdd twice. Remaining breadth (CVT, FSub/FAbs, FDiv, FSqrt,
   compares, inline f64 consts, vec-f64 arrays) is F.7f.2+.
+- **F.7f.2** — f32↔f64 conversions (`OpFConvert`). New `MIR_OP_FCONVERT` (`mir.cyr`) + the lowering
+  (`spirv_lower.cyr`, `SPIRV_OP_FCONVERT=115` → `_spirv_lower_unary`); isel picks the direction from
+  the RESULT type — f64 → `GISEL_V_CVT_F64_F32` (widen), f32 → `GISEL_V_CVT_F32_F64` (narrow); the
+  dispatch routes both through the existing `_emit_vop1` + the F.7b VOP1 encoders (regalloc's
+  per-type width gives the f32 single / f64 pair). HW-verified on Cezanne: a round-trip
+  `out=double(float(a))` is **bit-exact** vs in-process `f32_to_f64(f64_to_f32(a))` — narrowed
+  lanes (0.1, π) lose precision, exact-in-f32 (2.0, −3.5) pass through. `native_spirv_f64_cvt_e2e.cyr`
+  + `_spv_build_f64_cvt` + a `gfx9_compile` CPU test (v_cvt_f32_f64 0x0F + v_cvt_f64_f32 0x10 in the ISA).
 
 ### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
 - **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**

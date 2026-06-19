@@ -379,6 +379,17 @@ fn _isa_has_vop3(isa, len, op): i64 {
     return 0;
 }
 
+# 1 if the ISA contains a VOP1 dword with opcode `op` (bits 16:9; VOP1 prefix 0x3F in 31:25).
+fn _isa_has_vop1(isa, len, op): i64 {
+    var p = 0;
+    while (p < len) {
+        var d = load32(isa + p);
+        if ((d >> 25) == 0x3F) { if (((d >> 9) & 0xFF) == op) { return 1; } }
+        p = p + 4;
+    }
+    return 0;
+}
+
 fn test_gfx9_compile_f64_fma() {
     var buf[800];
     var n = _spv_build_f64_fma(&buf);
@@ -467,10 +478,55 @@ fn test_gfx9_compile_f64_arith() {
     return 0;
 }
 
+# v3.2 F.7f.2 — the f32<->f64 CVT round-trip (out=double(float(a))) compiles end-to-end and the
+# ISA contains BOTH VOP1 conversions: V_CVT_F32_F64 0x0F (narrow) + V_CVT_F64_F32 0x10 (widen).
+# (HW value-exact: programs/native_spirv_f64_cvt_e2e.cyr.)
+fn test_gfx9_compile_f64_cvt() {
+    var buf[640];
+    var n = _spv_build_f64_cvt(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[1600];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 40, 16, 25, 40);
+    var outbi[320];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[640];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 28);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64 CVT compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x0F), 1, "ISA has v_cvt_f32_f64 (0x0F, narrow)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x10), 1, "ISA has v_cvt_f64_f32 (0x10, widen)");
+    return 0;
+}
+
 fn main(): i64 {
     test_gfx9_abi_rsrc();
     test_gfx9_compile_f64_fma();
     test_gfx9_compile_f64_arith();
+    test_gfx9_compile_f64_cvt();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();
     test_gfx9_compile_uniform_if();
