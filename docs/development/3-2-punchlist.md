@@ -1017,8 +1017,19 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
       (v_div_scale_f32 / v_rcp_f32 / v_div_fmas_f32 / v_div_fixup_f32) is straightforward but
       unneeded: attn11's f32 portable path runs on wgpu (naga lowers f32 div). Add when a native
       f32-div consumer appears.
-  - [ ] **F.7f.7 (FSqrt macro)** — correctly-rounded f64 sqrt: `v_rsq_f64` seed + Newton iterations +
-    the `v_ldexp_f64`/`v_cmp_class_f64` range-reduction guard (the ~15-instr LLVM expansion).
+  - **F.7f.7 (FSqrt macro)** — correctly-rounded f64 sqrt, the ~22-instr LLVM gfx900 expansion:
+    a `v_rsq_f64` seed + the Newton-Goldschmidt refinement (mul + 7×fma with NEG-src0/inline-0.5),
+    wrapped by subnormal scaling (`v_cmp_gt_f64` gate → cndmask the 2^256 scale exponent →
+    `v_ldexp_f64` up, then `v_ldexp_f64` down by 2^-128) and a special-case passthrough
+    (`v_cmp_class_f64` mask 0x260 = +0/-0/+inf → cndmask the input through, so sqrt(0)=0 / sqrt(inf)=inf
+    instead of the Newton 0·inf=NaN). +normal computes; negative/NaN take the Newton path → NaN.
+    - [x] **F.7f.7a** *(2026-06-19)* — encoder foundation: `V_RSQ_F64` (VOP1 0x26), `V_LDEXP_F64`
+      (VOP3 0x284, f64,i32), `V_CMP_GT_F64`/`V_CMP_CLASS_F64` (VOPC 0x64/0x12) opcodes — all reuse the
+      existing vop1/vop3a/vopc encoders — + the `test_gfx9_enc_f64_sqrt` byte-oracle (llvm-mc-matched).
+    - [ ] **F.7f.7b** — the macro lowering: the Newton-Goldschmidt chain + an f64-pair cndmask helper
+      (2× v_cndmask_b32 on the halves) + i32/f64 constant materialization (scale exponents, the
+      subnormal threshold, the class mask) + HW e2e `out=sqrt(a)` value-exact (vs Python `math.sqrt`
+      offline want[], incl. 0 / subnormal / large-exponent / a perfect square / a negative→NaN lane).
   - [ ] **F.7f.8 (f64 compares)** — from-scratch float-compare path (V_CMP_*_F64 VOPC + SCC/VCC routing).
   - [ ] **F.7f.9 (inline f64 consts)** — const-table words-3+4 split + two-i32-mov pair materialization.
   - [ ] **F.7f.10 (exp f64)** — range reduction (k=round(x/ln2), r=x-k·ln2) + Horner polynomial +
