@@ -145,22 +145,23 @@ run in parallel; they converge only at AL.5. The one hard cross-repo edge:
 
 ## Phase AL.3 — DDS loader (3.3.3) [M]
 
-- [ ] **AL.3a** — `error.cyr`: `GPU_ERR_CONTAINER_PARSE = 21` (+ string). Round-trip test.
-- [ ] **AL.3b** — `src/asset_load.cyr` scaffold + lib.cyr + manifest. Smoke link.
-- [ ] **AL.3c** — `_dds_parse_header` — magic `0x20534444`, 124-B header, 32-B
-  pixelformat; **bounds-check every read vs `len`**. Tests: hand-built blob →
-  w/h/mips; truncated → reject; bad magic → reject.
-- [ ] **AL.3d** — FourCC path: DXT1→BC1, DXT5→BC3; **DXT3/BC2 → fail-loud** (no
-  mabda id). Test each + DXT3 reject.
-- [ ] **AL.3e** — DX10 path: 20-B DXT10 header iff FourCC=='DX10' → DXGI map;
-  read `arraySize` + cubemap misc bit → **reject array>1 / cube** (`FORMAT_
-  UNSUPPORTED`). Tests: DX10 BC7 ok; array=2 reject; cube reject.
-- [ ] **AL.3f** — legacy `dwCaps2 & DDSCAPS2_CUBEMAP` → reject. Test.
-- [ ] **AL.3g** — per-level walk via `mabda_texfmt_data_size`; **caps gate
-  before create** (AL.0e); `create_2d_fmt_mipped` + `write_level` loop. Tests:
-  offset math; ASTC-on-BC-only-caps → `FORMAT_UNSUPPORTED`.
-- [ ] **AL.3h** — `gpu_texture_load_dds` + `_result` (0/Err wrappers). Full
-  mock-backend parse→upload-routing test.
+- [x] **AL.3 (2026-06-19)** — DDS loader, complete. `GPU_ERR_CONTAINER_PARSE = 21`
+  (+ string); `src/asset_load.cyr` (lib.cyr + manifest). `_dds_parse` — magic
+  `0x20534444`, dwSize sanity, **every read bounds-checked vs `len`**; FourCC path
+  (DXT1→BC1, DXT5→BC3, **DXT3/BC2 → FORMAT_UNSUPPORTED**) + DX10/DXGI path (via
+  `mabda_texfmt_from_dxgi_format`, sRGB flag captured); **arrays/cubemaps
+  parsed-and-rejected-loud** (legacy `dwCaps2` cubemap, DX10 `arraySize>1`,
+  DX10 cube miscFlag → FORMAT_UNSUPPORTED, tracked → v3.4). **Caps gate**
+  `gpu_ctx_supports_format(ctx, fmt)` (AL.0e folded in — backend-routed: native
+  BC-only cap vs wgpu adapter-detect) runs **before create**. `gpu_texture_load_dds`
+  / `_result` walk levels via `create_2d_fmt_mipped` + `write_level`, every level
+  span bounds-checked. Legacy uncompressed (bitmask) DDS is out of v3.3 scope
+  (byte-order interpretation — tracked here). **+37 asserts** (asset_load 58→95):
+  parse fixtures (DXT1/DXT5/DX10-BC7/sRGB) + 9 reject paths + the caps gate +
+  mock-backend load orchestration (create+write_level args, truncation reject).
+  Suite 4194→4231; lint/fmt/vet green; **distlib idempotent + in-sync** (the real
+  CI dist gate — `cyrius fmt` on the 1 MiB bundle is NOT a CI gate, see the
+  cyrlint-byte-length memory).
 
 ## Phase AL.4 — KTX2-uncompressed loader (3.3.4) [M]
 

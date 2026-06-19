@@ -99,6 +99,160 @@ fn test_mapping_targets_are_valid_ids() {
     return 0;
 }
 
+# --- AL.3: DDS header parse + caps gate + load orchestration ---
+
+# Build a legacy-FourCC DDS header (>= 128-byte buf). Offsets per asset_load.cyr.
+fn _mk_dds_fourcc(buf, w, h, mipc, fourcc) {
+    memset(buf, 0, 128);
+    store32(buf + 0, _DDS_MAGIC);
+    store32(buf + 4, 124);            # dwSize
+    store32(buf + 12, h);
+    store32(buf + 16, w);
+    store32(buf + 28, mipc);
+    store32(buf + 80, _DDPF_FOURCC);  # ddpf.dwFlags
+    store32(buf + 84, fourcc);
+    return 0;
+}
+
+# Build a DX10 DDS header (>= 148-byte buf): FourCC 'DX10' + the 20-byte DXT10.
+fn _mk_dds_dx10(buf, w, h, mipc, dxgi, misc, arraysize) {
+    memset(buf, 0, 148);
+    store32(buf + 0, _DDS_MAGIC);
+    store32(buf + 4, 124);
+    store32(buf + 12, h);
+    store32(buf + 16, w);
+    store32(buf + 28, mipc);
+    store32(buf + 80, _DDPF_FOURCC);
+    store32(buf + 84, _DDS_FOURCC_DX10);
+    store32(buf + 128, dxgi);
+    store32(buf + 136, misc);
+    store32(buf + 140, arraysize);
+    return 0;
+}
+
+fn test_dds_parse_fourcc() {
+    var buf[148];
+    var out[48];
+    _mk_dds_fourcc(&buf, 64, 32, 1, _DDS_FOURCC_DXT1);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DXT1 parses");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC1, "DXT1 -> BC1");
+    assert_eq(load64(&out + 8), 64, "width 64");
+    assert_eq(load64(&out + 16), 32, "height 32");
+    assert_eq(load64(&out + 24), 1, "mip 1");
+    assert_eq(load64(&out + 32), 128, "data offset 128 (legacy FourCC)");
+    _mk_dds_fourcc(&buf, 16, 16, 3, _DDS_FOURCC_DXT5);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DXT5 parses");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC3, "DXT5 -> BC3");
+    assert_eq(load64(&out + 24), 3, "mip 3");
+    return 0;
+}
+
+fn test_dds_parse_dx10() {
+    var buf[148];
+    var out[48];
+    _mk_dds_dx10(&buf, 8, 8, 1, 98, 0, 1);   # DXGI 98 = BC7
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DX10 BC7 parses");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "DXGI 98 -> BC7");
+    assert_eq(load64(&out + 32), 148, "data offset 148 (DX10)");
+    assert_eq(load64(&out + 40), 0, "BC7 UNORM not sRGB");
+    _mk_dds_dx10(&buf, 8, 8, 1, 99, 0, 1);   # DXGI 99 = BC7 sRGB
+    _dds_parse(&buf, 148, &out);
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "DXGI 99 -> BC7");
+    assert_eq(load64(&out + 40), 1, "DXGI 99 srgb flag set");
+    return 0;
+}
+
+fn test_dds_parse_rejects() {
+    var buf[148];
+    var out[48];
+    _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
+    store32(&buf + 0, 0x12345678);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "bad magic");
+    _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
+    assert_eq(_dds_parse(&buf, 64, &out), GPU_ERR_CONTAINER_PARSE, "truncated (<128)");
+    _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT3);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DXT3/BC2 no mabda id");
+    _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
+    store32(&buf + 112, _DDSCAPS2_CUBEMAP);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "legacy cubemap rejected");
+    _mk_dds_dx10(&buf, 8, 8, 1, 98, 0, 6);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 arraySize>1 rejected");
+    _mk_dds_dx10(&buf, 8, 8, 1, 98, _DDS_MISC_CUBE, 1);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 cube rejected");
+    _mk_dds_fourcc(&buf, 8, 8, 1, _DDS_FOURCC_DX10);
+    assert_eq(_dds_parse(&buf, 128, &out), GPU_ERR_CONTAINER_PARSE, "DX10 w/o DXT10 header");
+    _mk_dds_dx10(&buf, 8, 8, 1, 999, 0, 1);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "unmapped DXGI");
+    _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
+    store32(&buf + 80, 0);            # clear DDPF_FOURCC
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "non-FourCC legacy unsupported");
+    return 0;
+}
+
+fn test_gpu_ctx_supports_format_native() {
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_RGBA8), 1, "RGBA8 always supported");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_BC1), 1, "native BC supported");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_ETC2_RGB8), 0, "native ETC2 unsupported (Cezanne)");
+    assert_eq(gpu_ctx_supports_format(&ctx, 99), 0, "invalid fmt -> 0");
+    assert_eq(gpu_ctx_supports_format(0, MABDA_TEXFMT_RGBA8), 0, "null ctx -> 0");
+    return 0;
+}
+
+# Mock backend captures for the load orchestration (create + write_level).
+var _dds_cr_count = 0;
+var _dds_cr_w = 0;
+var _dds_cr_h = 0;
+var _dds_cr_fmt = 0;
+var _dds_cr_mc = 0;
+var _dds_wl_count = 0;
+var _dds_wl_n = 0;
+fn _dds_cr_cap(ctx, w, h, fmt, mc) {
+    _dds_cr_count = _dds_cr_count + 1;
+    _dds_cr_w = w;
+    _dds_cr_h = h;
+    _dds_cr_fmt = fmt;
+    _dds_cr_mc = mc;
+    return 0x7E;
+}
+fn _dds_wl_cap(ctx, tex, level, src, n) {
+    _dds_wl_count = _dds_wl_count + 1;
+    _dds_wl_n = n;
+    return 0;
+}
+
+fn test_gpu_texture_load_dds_orchestration() {
+    _dds_cr_count = 0;
+    _dds_wl_count = 0;
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    # DXT1 8x8 1-level: 128-byte header + BC1 8x8 (32 B) = 160-byte buffer.
+    var buf[160];
+    _mk_dds_fourcc(&buf, 8, 8, 1, _DDS_FOURCC_DXT1);
+    var tex = gpu_texture_load_dds(&ctx, &buf, 160);
+    assert_eq(tex, 0x7E, "returns the created tex handle");
+    assert_eq(_dds_cr_count, 1, "create called once");
+    assert_eq(_dds_cr_w, 8, "create width 8");
+    assert_eq(_dds_cr_fmt, MABDA_TEXFMT_BC1, "create fmt BC1");
+    assert_eq(_dds_cr_mc, 1, "create mip_count 1");
+    assert_eq(_dds_wl_count, 1, "write_level once (1 level)");
+    assert_eq(_dds_wl_n, 32, "level 0 = BC1 8x8 = 32 B");
+    # Truncated level data: header says 32 B at offset 128 but buffer is 140.
+    var buf2[140];
+    _mk_dds_fourcc(&buf2, 8, 8, 1, _DDS_FOURCC_DXT1);
+    assert_eq(gpu_texture_load_dds(&ctx, &buf2, 140), 0, "truncated level data -> 0");
+    return 0;
+}
+
 fn main() {
     test_vk_format_mapping();
     test_vk_format_unmapped();
@@ -107,6 +261,11 @@ fn main() {
     test_dxgi_format_unmapped();
     test_dxgi_format_srgb_flag();
     test_mapping_targets_are_valid_ids();
+    test_dds_parse_fourcc();
+    test_dds_parse_dx10();
+    test_dds_parse_rejects();
+    test_gpu_ctx_supports_format_native();
+    test_gpu_texture_load_dds_orchestration();
     assert_summary();
     return 0;
 }
