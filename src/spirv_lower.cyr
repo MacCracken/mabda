@@ -198,7 +198,16 @@ fn _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi): i64 {
             if (wc >= 4) {
                 var cty = _mir_lower_type(types, spirv_word(ptr, off + 1), idb);
                 if (cty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
-                var cr = mir_set_const(m, spirv_word(ptr, off + 2), cty, spirv_word(ptr, off + 3));
+                # An f64 OpConstant's value spans words 3+4 (so wc>=5); keep the full 64-bit value (the
+                # MIR const payload is 64-bit) so it doesn't truncate (F.7f.9). The hi word is read ONLY
+                # for an f64 type (type-gated, not by wc alone — a malformed 32-bit const with wc>=5
+                # must not read word 4; a malformed f64 const with wc<5 fails loud). 32-bit: word 3.
+                var cval = spirv_word(ptr, off + 3);
+                if (mir_type_base(cty) == MIR_T_F64) {
+                    if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                    cval = cval | (spirv_word(ptr, off + 4) << 32);
+                }
+                var cr = mir_set_const(m, spirv_word(ptr, off + 2), cty, cval);
                 if (cr < 0) { return cr; }
             }
         }
@@ -251,7 +260,26 @@ fn _spirv_both_const(m, a, b): i64 {
     if (b >= cap) { return 0; }
     if (mir_val_kind(m, a) != MIR_VK_CONST) { return 0; }
     if (mir_val_kind(m, b) != MIR_VK_CONST) { return 0; }
+    # f64 const-fold isn't supported (the 32-bit _spirv_const_fold would mangle the 64-bit value);
+    # f64 const operands take the materialize-via-F64_CONST path instead (F.7f.9).
+    if (mir_type_base(mir_val_type(m, a)) == MIR_T_F64) { return 0; }
+    if (mir_type_base(mir_val_type(m, b)) == MIR_T_F64) { return 0; }
     return 1;
+}
+
+# If `opid` is an f64 compile-time constant, materialize it into a VGPR pair via MIR_OP_F64_CONST
+# (its 64-bit payload split lo/hi) and return the new value id; else return opid unchanged. VOP3
+# cannot encode a 64-bit literal operand, so an f64 const operand of an arith op must first be in a
+# register pair — unlike f32, whose const operand the emit can inline/literal-materialize (F.7f.9).
+fn _spirv_f64_arg(m, opid): i64 {
+    if (opid == 0) { return opid; }
+    var cap = load64(m + 64);
+    if (opid >= cap) { return opid; }
+    if (mir_val_kind(m, opid) != MIR_VK_CONST) { return opid; }
+    if (mir_type_base(mir_val_type(m, opid)) != MIR_T_F64) { return opid; }
+    var v = mir_val_payload(m, opid);
+    return _udiv_op(m, MIR_OP_F64_CONST, MIR_T_F64, v & 0xFFFFFFFF, (v >> 32) & 0xFFFFFFFF, 0,
+    MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
 }
 
 # Fold a binary ALU op over two constant operands → the 32-bit result value. Integer ops
@@ -358,7 +386,9 @@ fn _spirv_lower_vec_store(m, elem, count, off_id, pidx, value): i64 {
             var ea = mir_emit(m, MIR_OP_IADD, coff, MIR_T_U32, off_id, i * esize, 0, MIR_FLAG_B_IMM);
             if (ea < 0) { return ea; }
         }
-        var e = mir_emit(m, MIR_OP_STORE, 0, MIR_T_VOID, coff, pidx, mir_vec_comp(m, value, i), MIR_FLAG_B_IMM);
+        var cv = mir_vec_comp(m, value, i);
+        cv = _spirv_f64_arg(m, cv);  if (cv < 0) { return cv; }   # f64-const component → VGPR pair (F.7f.9)
+        var e = mir_emit(m, MIR_OP_STORE, 0, MIR_T_VOID, coff, pidx, cv, MIR_FLAG_B_IMM);
         if (e < 0) { return e; }
         i = i + 1;
     }
@@ -407,6 +437,7 @@ fn _spirv_lower_store(ptr, off, wc, m): i64 {
     var elem = mir_ptr_elem_type(m, pidx);
     var ecount = mir_type_count(elem);
     if (ecount > 1) { return _spirv_lower_vec_store(m, elem, ecount, mir_ptr_off_id(m, pidx), pidx, value); }
+    value = _spirv_f64_arg(m, value);  if (value < 0) { return value; }   # f64-const store value → VGPR pair (F.7f.9)
     var e = mir_emit(m, MIR_OP_STORE, 0, MIR_T_VOID, mir_ptr_off_id(m, pidx), pidx, value, MIR_FLAG_B_IMM);
     if (e < 0) { return e; }
     return 0;
@@ -634,6 +665,8 @@ fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
     var result = spirv_word(ptr, off + 2);
     var a = spirv_word(ptr, off + 3);   # N — dividend (numerator)
     var b = spirv_word(ptr, off + 4);   # D — divisor (denominator)
+    a = _spirv_f64_arg(m, a);  if (a < 0) { return a; }   # f64-const operand → VGPR pair (F.7f.9)
+    b = _spirv_f64_arg(m, b);  if (b < 0) { return b; }
     var t = MIR_T_F64;
     # s0 = div_scale(D, D, N) — scaled denominator; its VCC flag is dead (overwritten below).
     var s0 = _udiv_op(m, MIR_OP_F64_DIV_SCALE, t, b, b, a, 0);       if (s0 < 0) { return s0; }
@@ -880,7 +913,11 @@ fn _spirv_lower_vec_binop(m, mop, rty, rid, aop, bop): i64 {
             var ec = mir_set_const(m, base + i, base_ty, _spirv_const_fold(m, mop, ai, bi));
             if (ec < 0) { return ec; }
         } else {
-            var e = mir_emit(m, mop, base + i, base_ty, ai, bi, 0, 0);
+            # f64-const components (incl. a broadcast scalar f64 const) → materialize to a VGPR pair;
+            # VOP3 has no 64-bit literal (else the emit silently truncates to 0.0). (F.7f.9 review)
+            var mai = _spirv_f64_arg(m, ai);  if (mai < 0) { return mai; }
+            var mbi = _spirv_f64_arg(m, bi);  if (mbi < 0) { return mbi; }
+            var e = mir_emit(m, mop, base + i, base_ty, mai, mbi, 0, 0);
             if (e < 0) { return e; }
         }
         packed = packed | ((base + i) << (i * 16));
@@ -958,7 +995,11 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
             if (ec < 0) { return ec; }
             return 0;
         }
-        var e = mir_emit(m, mop, rid, rty, aop, bop, 0, 0);
+        # f64 const operands → materialize into a VGPR pair first (VOP3 has no 64-bit literal). f32
+        # const operands are left for the emit to inline/literal-materialize. (F.7f.9)
+        var na = _spirv_f64_arg(m, aop);  if (na < 0) { return na; }
+        var nb = _spirv_f64_arg(m, bop);  if (nb < 0) { return nb; }
+        var e = mir_emit(m, mop, rid, rty, na, nb, 0, 0);
         if (e < 0) { return e; }
         return 0;
     }
@@ -972,6 +1013,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         var glsl = spirv_word(ptr, off + 4);
         var rid = spirv_word(ptr, off + 2);
         var x0 = spirv_word(ptr, off + 5);
+        x0 = _spirv_f64_arg(m, x0);  if (x0 < 0) { return x0; }   # f64-const operand → VGPR pair (F.7f.9)
         # Unary: Sqrt, Floor. f64 Sqrt expands to the Newton-Goldschmidt macro (F.7f.7b — GFX9
         # v_sqrt_f64 is only an approximation); f32 keeps the single v_sqrt_f32.
         if (glsl == GLSL_STD450_SQRT) {
@@ -996,6 +1038,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         # Binary: FMin, FMax.
         if (wc < 7) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var x1 = spirv_word(ptr, off + 6);
+        x1 = _spirv_f64_arg(m, x1);  if (x1 < 0) { return x1; }   # f64-const operand → VGPR pair (F.7f.9)
         if (glsl == GLSL_STD450_FMIN) {
             var en = mir_emit(m, MIR_OP_FMIN, rid, ety, x0, x1, 0, 0);
             if (en < 0) { return en; }
@@ -1009,6 +1052,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
         # Ternary: Fma (a*b + c).
         if (wc < 8) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var x2 = spirv_word(ptr, off + 7);
+        x2 = _spirv_f64_arg(m, x2);  if (x2 < 0) { return x2; }   # f64-const operand → VGPR pair (F.7f.9)
         if (glsl == GLSL_STD450_FMA) {
             var em = mir_emit(m, MIR_OP_FMA, rid, ety, x0, x1, x2, 0);
             if (em < 0) { return em; }

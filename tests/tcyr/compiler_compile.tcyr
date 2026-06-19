@@ -720,6 +720,93 @@ fn test_gfx9_compile_f64_sqrt() {
     return 0;
 }
 
+# v3.2 F.7f.9 review — store of an f64 OpConstant (out[i] = 2.5) compiles: the store VALUE is
+# materialized via F64_CONST (a DWORDX2 store of a VGPR pair). Before the fix this silently truncated
+# to the low dword (0.0); now the emit backstop would fail-loud if unmaterialized, so a clean compile
+# proves the store-const path materializes. Catches a regression of that gap.
+fn test_gfx9_compile_f64_store_const() {
+    var buf[600];
+    var n = _spv_build_f64_store_const(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 22, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64-const store compiles (materialized, not truncated)");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 1, "1 storage binding");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop1(&isa, len, 0x01), 1, "ISA has v_mov_b32 (F64_CONST value materialize)");
+    return 0;
+}
+
+# v3.2 F.7f.9 — f64 OpConstant operands (the Horner-polynomial path consumers use for transcendentals)
+# compile end-to-end: 3 f64 consts (0.5/1.5/2.5) materialize via F64_CONST (v_mov_b32 pairs) + 2 FMAs.
+fn test_gfx9_compile_f64_const() {
+    var buf[800];
+    var n = _spv_build_f64_const(&buf);
+    var types[1024];
+    var consts[768];
+    var deco[768];
+    var m[80];
+    var vals[2048];
+    var instrs[1280];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
+    var outbi[384];
+    var isel[1024];
+    var isel2[1024];
+    var alloc[768];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 32);
+    var isa[1024];
+    memset(&isa, 0, 1024);
+    var desc[64];
+    assert_eq(gfx9_compile(&ctx, &buf, n, &isa, &desc), 0, "f64-const poly compiles end-to-end");
+    assert_eq(load64(&desc + DESC_NUM_BINDINGS), 2, "2 storage bindings");
+    var len = load64(&desc + DESC_ISA_LEN);
+    assert_eq(_isa_has_vop3(&isa, len, 0x1CC), 1, "ISA has v_fma_f64 (0x1CC)");
+    assert_eq(_isa_has_vop1(&isa, len, 0x01), 1, "ISA has v_mov_b32 (0x01; F64_CONST coeff materialize)");
+    return 0;
+}
+
 # v3.2 F.7f.10 — i32<->f64 conversions (OpConvertFToS/SToF) compile end-to-end. The conformant
 # part of the (dropped) transcendental work — consumers hand-roll exp/ln using these + the arith.
 fn test_gfx9_compile_f64_i32_cvt() {
@@ -771,6 +858,8 @@ fn main(): i64 {
     test_gfx9_compile_f64_vec();
     test_gfx9_compile_f64_div();
     test_gfx9_compile_f64_sqrt();
+    test_gfx9_compile_f64_const();
+    test_gfx9_compile_f64_store_const();
     test_gfx9_compile_f64_i32_cvt();
     test_gfx9_compile_saxpy_lid();
     test_gfx9_compile_saxpy_gid();

@@ -1064,11 +1064,22 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
     OpFOrdLessThan/etc. → bool/branch (attn11 max/argmax/masking; also the consumer-rolled transcendental
     special cases). The internal VCC-only compares (CMP_GT/CMP_CLASS) exist from FSqrt; this is the
     bool-producing path.
-  - [ ] **F.7f.9 (SPIR-V f64 OpConstant)** — `MIR_OP_F64_CONST` (the primitive) shipped with F.7f.7c.
-    The SPIR-V path remains: `spirv_build_const_table` stores only word-3 today (f64 OpConstant is 64-bit,
-    words 3+4 — TRUNCATED), so consumer f64 literals (attn11 epsilon 1e-5, hand-rolled exp coeffs) need
-    the table to keep both words + the binop operand-resolution to pre-materialize an f64-const operand.
-    REQUIRED for consumers to hand-roll transcendentals (the coefficients are SPIR-V literals).
+  - [x] **F.7f.9 (SPIR-V f64 OpConstant)** *(2026-06-19)* — **HW-verified on Cezanne**: f64 literals
+    flow end-to-end. The const table (`spirv_build_const_table`) + `mir_set_const` now keep the full
+    64-bit value (word-count wc>=5 discriminator; the MIR payload is already 64-bit); `_spirv_f64_arg`
+    pre-materializes an f64-const OPERAND into a VGPR pair via `MIR_OP_F64_CONST` (VOP3 has no 64-bit
+    literal), applied at the scalar binop (FADD/FSUB/FMUL), OpExtInst x0/x1/x2 (FMA/min/max/sqrt/abs/
+    floor), and OpFDiv (a/b); the 32-bit const-fold is skipped for f64 (`_spirv_both_const` returns 0).
+    `out=0.5a²+1.5a+2.5` via two FMAs with f64 const coeffs **bit-exact** vs the fused reference —
+    `native_spirv_f64_const_e2e.cyr` + the `_spirv_f64_arg` materialization unit test. The hand-rolled-
+    polynomial enabler. Adversarially reviewed (Workflow, 2 dims / 10 agents): **7 confirmed** — and
+    the vec-binop/store/vec-store gaps were SILENT-WRONG (not fail-loud as first assumed: the emit
+    truncated an f64 literal to its low dword → 0.0 for 0.5/1.0/1.5/…). Fixed: (a) a fail-loud BACKSTOP
+    in `_cmp_resolve` (an f64-const operand reaching the emit unmaterialized now errors, never
+    truncates); (b) `_spirv_f64_arg` applied at the vec binop, OpStore, vec store, and OpFDiv operand
+    sites; (c) type-gated the wc≥5 hi-word pack (only f64; a malformed f64 wc<5 fails loud) + reverted
+    the redundant untyped pack in `spirv_build_const_table` (it serves only i32 access-chain indices).
+    Pinned by `test_spirv_f64_arg` + a store-const compile test.
   - [ ] **F.7f.Ldexp** — if GLSL.std.450 Ldexp is f64-valid (likely — it's general-float like Sqrt),
     wire `OpExtInst Ldexp` (f64) → `MIR_OP_F64_LDEXP` (encoder + MIR op exist from F.7f.7a/c) so consumers
     get 2^k for their hand-rolled exp without bit tricks.
