@@ -918,22 +918,25 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   single-rounding `v_fma_f64` matches `math.fma` (not the unfused `mul`+`add`, which differs by 1 ULP
   on lanes like `0.1*0.1+0.1`); Cyrius has no fused builtin so the reference is embedded + math.fma-
   validated. +4 asserts; no regression (smod/vector_const still pass on Cezanne). Decoupled from Phase N.
-- [x] **F.8a** *(3.2.12)* (2026-06-18) — wgpu f64 **plumbing**: the launcher now requests
-  `SpirvShaderPassthrough` (0x00030017) in the device `requiredFeatures` (gated by
-  `wgpuAdapterHasFeature`, `feats[3]`→`[4]`), and a new C shim
-  `wgpu_shim_create_shader_module_spirv(device, words, word_count)` wraps
-  `wgpuDeviceCreateShaderModuleSpirV` (the naga-bypass path — naga has no f64) → `fn_table[66]`
-  (`FN_COUNT` 66→67) → the Cyrius wrapper `wgpu_device_create_shader_module_spirv_passthrough`
-  (`src/wgpu_ffi.cyr`, `_fp(66)`). Closes review F.2 #3. **Launcher regression: `spirv_e2e`
-  all-PASS + exit 0 on Cezanne** (the added device feature + table entry don't break the
-  standard SPIR-V / WGSL path). Plumbing only — nothing calls the wrapper yet (F.8b does).
-- [ ] **F.8b** *(3.2.12)* — wgpu f64 **probe + caps**: a minimal f64 SPIR-V probe module
-  (`OpCapability Float64` + `OpTypeFloat 64` + a 1-elem `OpFMul`) created via the F.8a passthrough
-  wrapper; `gpu_caps_shader_f64` (wgpu) = `gpu_wgpu_spirv_passthrough_supported` AND the probe
-  returns a non-null module → the honest wgpu `gpu_caps_shader_f64` populate in
-  `gpu_caps_from_context`. (CPU-test the probe-module byte builder; HW-verify the probe call.)
-- [ ] **F.8c** *(3.2.12)* — `programs/f64_compute_e2e.cyr` (wgpu): probe + f64 module-create proven
-  on Cezanne; dispatch gated on real wgpu compute → M.6b fail-loud `GPU_ERR_NOT_IMPLEMENTED` posture.
+- [x] **F.8a** *(3.2.12)* (2026-06-18) — wgpu **raw-SPIR-V passthrough escape hatch** (FFI
+  plumbing): a new C shim `wgpu_shim_create_shader_module_spirv(device, words, word_count)` wraps
+  `wgpuDeviceCreateShaderModuleSpirV` (naga-bypass) → `fn_table[66]` (`FN_COUNT` 66→67) → the
+  Cyrius wrapper `wgpu_device_create_shader_module_spirv_passthrough` (`src/wgpu_ffi.cyr`,
+  `_fp(66)`); the launcher requests `SpirvShaderPassthrough` gated by `wgpuAdapterHasFeature`.
+  **Launcher regression: `spirv_e2e` all-PASS + exit 0 on Cezanne.** NOTE (F.8b): this is **not**
+  the f64 route — f64 uses `ShaderF64` + the standard naga path; passthrough is a general escape
+  hatch for SPIR-V naga can't carry, kept + exercised by the e2e where the adapter supports it
+  (unsupported on RADV/Cezanne).
+- [x] **F.8b** *(3.2.12)* (2026-06-18) — wgpu f64 via **`WGPUNativeFeature_ShaderF64`**, HW-verified
+  on Cezanne. **Corrected the F.2/proposal premise** ("passthrough is the only f64 route" — wrong):
+  wgpu-native has a real `ShaderF64` (0x0003001D) and naga's SPIR-V frontend accepts f64 once it is
+  enabled, so f64 rides the ordinary `gpu_shader_module_create_spirv` path. Launcher requests
+  `ShaderF64` (gated); `gpu_wgpu_shader_f64_supported(device)` is the authoritative bit;
+  `gpu_caps_wgpu_shader_f64` = that bit gated by `MABDA_WGPU_COMPUTE` (0 today — wgpu compute
+  dispatch is a v3.0 stub → honest 0, no silent f32 fallback, M.6b). `_wgpu_f64_probe_spirv`
+  (55 spirv-as words). `programs/f64_compute_e2e.cyr` (HW: ShaderF64 on, f64 module creates via
+  naga, passthrough skipped-unsupported, caps 0) + `backend.tcyr` +2 tests. Folds in the former F.8c.
+  See [[project_wgpu_f64_via_shaderf64_not_passthrough]].
 - [ ] **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V
   through the Phase N emitter (`V_*_F64`); per-op f64 conformance. Flip `MABDA_NATIVE_F64`→1
   ONLY when f64 runs end-to-end for every op attn11 uses — a partial emitter keeps it 0 (review F.2 #2).

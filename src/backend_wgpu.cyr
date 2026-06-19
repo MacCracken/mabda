@@ -906,21 +906,119 @@ fn _backend_wgpu_queue_wait_idle(ctx, queue): i64 {
 var WGPU_FEATURE_TEXTURE_COMPRESSION_BC   = 0x4;
 var WGPU_FEATURE_TEXTURE_COMPRESSION_ETC2 = 0x6;
 var WGPU_FEATURE_TEXTURE_COMPRESSION_ASTC = 0x7;
-# wgpu-native vendor feature (wgpu.h) — the ONLY route to f64 on wgpu (there is no
-# WGPUFeatureName_ShaderF64; WGSL has no f64). An f64 SPIR-V binary rides this. v3.2 F.2.
+# wgpu-native vendor features (wgpu.h). v3.2 F.8 corrected the F.2 premise: f64 does NOT
+# require SpirvShaderPassthrough. wgpu-native exposes a real WGPUNativeFeature_ShaderF64
+# (0x0003001D) and naga's SPIR-V frontend accepts f64 once it is enabled — HW-verified on
+# Cezanne (see programs/f64_compute_e2e.cyr). So f64 SPIR-V rides the ordinary
+# gpu_shader_module_create_spirv path; passthrough is a SEPARATE general raw-SPIR-V escape
+# hatch (naga-bypass), kept for shaders naga cannot carry, and is unsupported on RADV/Cezanne.
 var WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH = 0x00030017;
+var WGPU_NATIVE_FEATURE_SHADER_F64               = 0x0003001D;
 
-# v3.2 F.2 — the NECESSARY (not sufficient) gate for wgpu f64: f64 SPIR-V reaches the device
-# only via SpirvShaderPassthrough. This is deliberately NOT named *_shader_f64 — passthrough
-# being available does NOT mean the device's Vulkan shaderFloat64 is true. The honest wgpu f64
-# answer is `passthrough_supported AND a real f64 SPIR-V module compiles`; that probe (and the
-# launcher's passthrough requiredFeatures request, without which this returns 0) is F.8. Until
-# F.8 composes those, NOTHING populates the wgpu caps shader_f64 field — a consumer must not read
-# this as "f64 works". Device, not adapter (the gpu_timestamps_supported precedent: the feature
-# must be requested at device creation).
+# v3.2 F.8a — is the raw-SPIR-V passthrough escape hatch available on this device? (Enabled at
+# device creation, gated by the adapter; the launcher requests it where supported.) This is the
+# gate for wgpu_device_create_shader_module_spirv_passthrough — NOT the f64 gate (see
+# gpu_wgpu_shader_f64_supported). Device, not adapter (the gpu_timestamps_supported precedent).
 fn gpu_wgpu_spirv_passthrough_supported(device): i64 {
     if (device == 0) { return 0; }
     return wgpu_device_has_feature(device, WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH);
+}
+
+# v3.2 F.8b — the AUTHORITATIVE wgpu f64 device signal: WGPUNativeFeature_ShaderF64 enabled
+# (requested at device creation, gated by the adapter's Vulkan shaderFloat64). This is the
+# real feature bit the F.2 design wrongly assumed did not exist — no SPIR-V probe needed.
+fn gpu_wgpu_shader_f64_supported(device): i64 {
+    if (device == 0) { return 0; }
+    return wgpu_device_has_feature(device, WGPU_NATIVE_FEATURE_SHADER_F64);
+}
+
+# v3.2 F.8b — wgpu compute dispatch is a v3.0 stub (`_backend_wgpu_compute_dispatch`
+# returns GPU_ERR_OTHER). f64 (like any compute) cannot run END-TO-END on wgpu until that
+# lands, so `gpu_caps_wgpu_shader_f64` reports 0 regardless of the (real, HW-proven) f64
+# module-create half. Flip to 1 only when wgpu compute dispatch is implemented.
+var MABDA_WGPU_COMPUTE = 0;
+
+# v3.2 F.8b — a minimal f64 compute SPIR-V module (`OpCapability Float64` + `OpTypeFloat 64`
+# + an f64 `OpFMul`). programs/f64_compute_e2e.cyr feeds it to the ordinary
+# gpu_shader_module_create_spirv path to HW-prove naga accepts f64 once ShaderF64 is enabled.
+# Hand-authored in SPIR-V assembly, `spirv-as --target-env spv1.0`, `spirv-val`-clean — 55
+# words (the provenance oracle, the wgpu sibling of the GFX9 llvm-mc oracle). Disassembly:
+#   OpCapability Shader / OpCapability Float64 / OpMemoryModel Logical GLSL450
+#   OpEntryPoint GLCompute %1 "main" / OpExecutionMode %1 LocalSize 1 1 1
+#   %2=OpTypeVoid %3=OpTypeFunction %2 %4=OpTypeFloat 64 %5=OpConstant %4 2 %6=OpConstant %4 3
+#   %1=OpFunction / %7=OpLabel / %8=OpFMul %4 %5 %6 / OpReturn / OpFunctionEnd
+# Writes 220 bytes (55 u32 words) at `buf`; returns the byte length.
+fn _wgpu_f64_probe_spirv(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010000);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x00000009);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x00020011);
+    store32(buf + 32, 0x0000000A);
+    store32(buf + 36, 0x0003000E);
+    store32(buf + 40, 0x00000000);
+    store32(buf + 44, 0x00000001);
+    store32(buf + 48, 0x0005000F);
+    store32(buf + 52, 0x00000005);
+    store32(buf + 56, 0x00000001);
+    store32(buf + 60, 0x6E69616D);
+    store32(buf + 64, 0x00000000);
+    store32(buf + 68, 0x00060010);
+    store32(buf + 72, 0x00000001);
+    store32(buf + 76, 0x00000011);
+    store32(buf + 80, 0x00000001);
+    store32(buf + 84, 0x00000001);
+    store32(buf + 88, 0x00000001);
+    store32(buf + 92, 0x00020013);
+    store32(buf + 96, 0x00000002);
+    store32(buf + 100, 0x00030021);
+    store32(buf + 104, 0x00000003);
+    store32(buf + 108, 0x00000002);
+    store32(buf + 112, 0x00030016);
+    store32(buf + 116, 0x00000004);
+    store32(buf + 120, 0x00000040);
+    store32(buf + 124, 0x0005002B);
+    store32(buf + 128, 0x00000004);
+    store32(buf + 132, 0x00000005);
+    store32(buf + 136, 0x00000000);
+    store32(buf + 140, 0x40000000);
+    store32(buf + 144, 0x0005002B);
+    store32(buf + 148, 0x00000004);
+    store32(buf + 152, 0x00000006);
+    store32(buf + 156, 0x00000000);
+    store32(buf + 160, 0x40080000);
+    store32(buf + 164, 0x00050036);
+    store32(buf + 168, 0x00000002);
+    store32(buf + 172, 0x00000001);
+    store32(buf + 176, 0x00000000);
+    store32(buf + 180, 0x00000003);
+    store32(buf + 184, 0x000200F8);
+    store32(buf + 188, 0x00000007);
+    store32(buf + 192, 0x00050085);
+    store32(buf + 196, 0x00000004);
+    store32(buf + 200, 0x00000008);
+    store32(buf + 204, 0x00000005);
+    store32(buf + 208, 0x00000006);
+    store32(buf + 212, 0x000100FD);
+    store32(buf + 216, 0x00010038);
+    return 220;
+}
+
+# v3.2 F.8b — the honest wgpu f64 capability (the consumer's end-to-end gate). wgpu f64 needs
+# BOTH halves: (1) the device's f64 support — WGPUNativeFeature_ShaderF64 enabled, with which an
+# f64 SPIR-V module creates through the ordinary gpu_shader_module_create_spirv path; REAL and
+# HW-proven on Cezanne by programs/f64_compute_e2e.cyr. (2) wgpu compute *dispatch* to actually
+# run the kernel — a v3.0 stub (`_backend_wgpu_compute_dispatch` → GPU_ERR_OTHER). Per the
+# Phase F contract (never report 1 on a path that can't run f64 end-to-end — no silent f32
+# fallback; the M.6b mipmap-generate posture), this returns 0 while MABDA_WGPU_COMPUTE == 0.
+# Flipping MABDA_WGPU_COMPUTE when dispatch lands makes the gate the ShaderF64 device bit.
+fn gpu_caps_wgpu_shader_f64(device): i64 {
+    if (device == 0) { return 0; }
+    if (MABDA_WGPU_COMPUTE == 0) { return 0; }
+    return gpu_wgpu_shader_f64_supported(device);
 }
 
 fn gpu_caps_detect_texture_compression(adapter): i64 {

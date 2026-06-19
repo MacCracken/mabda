@@ -15,10 +15,34 @@ for the immediate forward pointer.
 
 ## [Unreleased]
 
-### Added — Phase F.8a (wgpu f64 plumbing — SPIR-V passthrough FFI)
-- **The FFI path that lets f64 SPIR-V reach a wgpu device.** The standard `WGPUShaderSourceSPIRV`
-  path (Phase S, 3.2.4) runs through naga, which has no f64; f64 needs the *passthrough* path
-  (`wgpuDeviceCreateShaderModuleSpirV`, doc: "shader code isn't parsed or interpreted in any way").
+### Added — Phase F.8b (wgpu f64 — `WGPUNativeFeature_ShaderF64`, HW-verified on Cezanne)
+- **Corrects the F.2/proposal premise that "passthrough is the only route to f64" — it is not.**
+  HW investigation on Cezanne found wgpu-native exposes a real `WGPUNativeFeature_ShaderF64`
+  (`0x0003001D`), and naga's SPIR-V frontend *accepts* f64 once it is enabled — so f64 SPIR-V
+  rides the ordinary `gpu_shader_module_create_spirv` path (Phase S), **no passthrough**.
+  (`SpirvShaderPassthrough` is in fact unsupported on this RADV adapter.)
+- `deps/wgpu_main.c`: `wgpu_shim_request_device` now also requests `WGPUNativeFeature_ShaderF64`
+  (gated by `wgpuAdapterHasFeature` — the device's Vulkan shaderFloat64); `feats[]` grown to `[8]`.
+- `src/backend_wgpu.cyr`: `WGPU_NATIVE_FEATURE_SHADER_F64`; `gpu_wgpu_shader_f64_supported(device)`
+  (the authoritative f64 device bit — the feature bit the F.2 design wrongly assumed didn't exist);
+  `gpu_caps_wgpu_shader_f64(device)` = that bit gated by `MABDA_WGPU_COMPUTE`; the f64 SPIR-V probe
+  module builder `_wgpu_f64_probe_spirv` (55 spirv-as words, `spirv-val`-clean).
+- **Honest caps:** `gpu_caps_wgpu_shader_f64` reports **0** today — wgpu compute *dispatch* is a
+  v3.0 stub (`_backend_wgpu_compute_dispatch` → `GPU_ERR_OTHER`), so f64 can't run end-to-end on
+  wgpu (no silent f32 fallback; the M.6b mipmap-generate posture). `MABDA_WGPU_COMPUTE = 0` gates it;
+  flip when wgpu compute lands.
+- `programs/f64_compute_e2e.cyr` + `make test-f64-compute-e2e`: **HW-verified on Cezanne** —
+  ShaderF64 enabled, f64 SPIR-V module creates via the standard naga path, passthrough escape
+  hatch reported unsupported (skipped), caps honestly 0. `backend.tcyr` +2 tests.
+- Note: F.8a's passthrough plumbing is **kept** as a general raw-SPIR-V escape hatch (naga-bypass,
+  for shaders naga can't carry / adapters that support it), exercised by the e2e where available —
+  it is orthogonal to f64 (the F.8a entry below is corrected accordingly).
+
+### Added — Phase F.8a (wgpu raw-SPIR-V passthrough escape hatch — FFI plumbing)
+- **A naga-bypass FFI path for raw SPIR-V** via `wgpuDeviceCreateShaderModuleSpirV`
+  (doc: "shader code isn't parsed or interpreted in any way"). NOTE: F.8b found this is **not**
+  the f64 route (f64 uses `ShaderF64` + the standard naga path); passthrough is a general escape
+  hatch for SPIR-V naga cannot carry, and is unsupported on this RADV adapter.
 - `deps/wgpu_main.c`: `wgpu_shim_request_device` now also requests `SpirvShaderPassthrough`
   (`0x00030017`) in the device `requiredFeatures`, gated by `wgpuAdapterHasFeature` (so a launcher
   on an adapter without it still creates a device); `feats[3]`→`feats[4]`. New C shim

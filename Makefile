@@ -162,6 +162,14 @@ build/spirv_e2e: build/spirv_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/spirv_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+# v3.2 F.8 — wgpu f64 via SPIR-V passthrough: proves an f64 SPIR-V compute module
+# CREATES via the passthrough path (naga cannot carry f64) on a shaderFloat64 device,
+# and that gpu_caps_wgpu_shader_f64 is honestly 0 (wgpu compute dispatch is a v3.0
+# stub — M.6b). Requires wgpu-native + the SpirvShaderPassthrough device feature (F.8a).
+build/f64_compute_e2e: build/f64_compute_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/f64_compute_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 # v3.2 T.8 — wgpu compressed (BC1) create+upload, verified by byte-exact
 # copy-back round-trip. Requires wgpu-native + a BC-capable adapter.
 build/compressed_texture_e2e: build/compressed_texture_e2e.o deps/wgpu_main.o
@@ -208,6 +216,10 @@ test-render-e2e: build/render_e2e
 .PHONY: test-spirv-e2e
 test-spirv-e2e: build/spirv_e2e
 	./build/spirv_e2e
+
+.PHONY: test-f64-compute-e2e
+test-f64-compute-e2e: build/f64_compute_e2e
+	./build/f64_compute_e2e
 
 .PHONY: test-render-graph-e2e
 test-render-graph-e2e: build/render_graph_e2e

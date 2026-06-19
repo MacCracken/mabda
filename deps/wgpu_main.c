@@ -50,13 +50,17 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     // (wgpuDeviceCreateTexture aborts on a format whose feature is not
     // enabled at device creation). Requesting a feature the adapter lacks
     // fails device creation, so filter by wgpuAdapterHasFeature first.
-    // v3.2 (F.8): also enable SpirvShaderPassthrough when the adapter supports
-    // it, so f64 (and any naga-unrepresentable) SPIR-V reaches the device via
-    // wgpuDeviceCreateShaderModuleSpirV. The standard WGPUShaderSourceSPIRV path
-    // runs through naga, which has no f64 — passthrough hands raw words to the
-    // backend. Gated by wgpuAdapterHasFeature (requesting a missing feature fails
-    // device creation); a launcher without this edit simply has no wgpu f64.
-    WGPUFeatureName feats[4];
+    // v3.2 (F.8b): enable ShaderF64 — the f64 ROUTE on wgpu. HW-verified on
+    // Cezanne: wgpu-native's WGPUNativeFeature_ShaderF64 (0x0003001D) is what makes
+    // f64 SPIR-V usable, and naga's SPIR-V frontend ACCEPTS f64 once it is enabled —
+    // so f64 rides the ordinary gpu_shader_module_create_spirv path, NOT passthrough.
+    // v3.2 (F.8a): SpirvShaderPassthrough is a SEPARATE, general raw-SPIR-V escape
+    // hatch (naga-bypass via wgpuDeviceCreateShaderModuleSpirV) — kept for shaders
+    // naga cannot carry / adapters that prefer it; it is NOT the f64 path and is
+    // unsupported on this RADV adapter (wgpuAdapterHasFeature returns 0 there).
+    // All gated by wgpuAdapterHasFeature (requesting a feature the adapter lacks
+    // fails device creation); a launcher without these edits simply has no wgpu f64.
+    WGPUFeatureName feats[8];
     size_t nfeat = 0;
     if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionBC))
         feats[nfeat++] = WGPUFeatureName_TextureCompressionBC;
@@ -64,6 +68,9 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
         feats[nfeat++] = WGPUFeatureName_TextureCompressionETC2;
     if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionASTC))
         feats[nfeat++] = WGPUFeatureName_TextureCompressionASTC;
+    if (wgpuAdapterHasFeature(adapter,
+            (WGPUFeatureName)WGPUNativeFeature_ShaderF64))
+        feats[nfeat++] = (WGPUFeatureName)WGPUNativeFeature_ShaderF64;
     if (wgpuAdapterHasFeature(adapter,
             (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough))
         feats[nfeat++] = (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough;
@@ -294,14 +301,13 @@ long wgpu_shim_get_timestamp_period_bits(WGPUQueue queue) {
     return (long)bits;
 }
 
-// v3.2 Phase F.8: create a shader module from pre-compiled SPIR-V words via the
-// passthrough path (wgpuDeviceCreateShaderModuleSpirV). Unlike the standard
-// WGPUShaderSourceSPIRV path (naga-validated — naga has no f64), passthrough hands
-// the raw words straight to the backend, so an f64 SPIR-V binary reaches a
-// shaderFloat64 device. Requires the SpirvShaderPassthrough device feature
-// (requested in wgpu_shim_request_device above). word_count is the number of
-// 32-bit words. Returns NULL if the feature is absent or the module is rejected;
-// the Cyrius wrapper surfaces that as a 0 handle (fail-loud).
+// v3.2 Phase F.8a: create a shader module from pre-compiled SPIR-V words via the
+// passthrough ESCAPE HATCH (wgpuDeviceCreateShaderModuleSpirV) — raw words bypass
+// naga, for SPIR-V naga cannot carry. NOTE (F.8b): this is NOT the f64 path — f64
+// rides ShaderF64 + the ordinary naga SPIR-V path. Requires the SpirvShaderPassthrough
+// device feature (requested in wgpu_shim_request_device above; unsupported on RADV).
+// word_count is the number of 32-bit words. Returns NULL if the feature is absent or
+// the module is rejected; the Cyrius wrapper surfaces that as a 0 handle (fail-loud).
 WGPUShaderModule wgpu_shim_create_shader_module_spirv(WGPUDevice device,
                                                       const uint32_t* words,
                                                       long word_count) {
@@ -399,7 +405,7 @@ static void build_fn_table(void) {
     // v3.2 TS.5 — wgpu sample render path: the textured draw fetches the
     // pipeline's auto-generated BGL to build the (texture, sampler) bind group.
     fn_table[i++] = (void*)wgpuRenderPipelineGetBindGroupLayout;          // 65
-    fn_table[i++] = (void*)wgpu_shim_create_shader_module_spirv;          // 66 (shim: SPIR-V passthrough, f64)
+    fn_table[i++] = (void*)wgpu_shim_create_shader_module_spirv;          // 66 (shim: raw-SPIR-V passthrough)
 }
 
 // Pre-initialize GPU context in C (before Cyrius code runs)

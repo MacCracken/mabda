@@ -383,18 +383,20 @@ hand-authored shaders stay as oracle + fallback.
 
 ### 3.2.10–3.2.11 — f64 (double-precision) compute (Phase F)
 
-Consumer: **attn11**. f64 hard-gates on SPIR-V on both backends — there is
-**no** `WGPUFeatureName_ShaderF64` and WGSL has no f64 (gpuweb #2805); the
-only routes are wgpu `SpirvShaderPassthrough` + Vulkan `shaderFloat64`, and
-the Phase N native emitter. The wgpu path + a native hand-authored f64
-reference kernel (`V_FMA_F64`, HW-proven on Cezanne, decoupled from Phase N)
-land at 3.2.10; **general native f64 routes consumer SPIR-V through Phase N
-and is a committed 3.2.11 minor** (Phase N is also in-arc). Correctness,
-not speed, is the deliverable: f64 is ~1:16–1:32 on Cezanne; full-rate
-`V_MFMA_F64` needs CDNA (no dev-box silicon → code ships, HW-verification
-flagged in the punchlist). naga may not validate f64 → raw SPIR-V
-passthrough. (The earlier "`SHADER_F64` feature" framing was wrong for
-wgpu-native v29 — corrected here.)
+Consumer: **attn11**. f64 hard-gates on SPIR-V on both backends. **wgpu f64
+route (HW-verified on Cezanne, F.8b 2026-06-18):** request the native
+`WGPUNativeFeature_ShaderF64` (0x0003001D) at device creation and feed f64
+SPIR-V through the ordinary `gpu_shader_module_create_spirv` path — naga's
+SPIR-V frontend accepts f64 once ShaderF64 is on. (The base `WGPUFeatureName`
+enum + WGSL still have no f64, gpuweb #2805 — but the *native* ShaderF64 bit
+exists; the earlier "no ShaderF64 / only `SpirvShaderPassthrough`" framing was
+wrong, and passthrough is in fact unsupported on RADV/Cezanne — it's kept only
+as a general raw-SPIR-V escape hatch.) The native route is the Phase N emitter.
+The wgpu path + a native hand-authored f64 reference kernel (`V_FMA_F64`,
+HW-proven on Cezanne, decoupled from Phase N) land at 3.2.12; **general native
+f64 routes consumer SPIR-V through Phase N at 3.2.13**. Correctness, not speed,
+is the deliverable: f64 is ~1:16–1:32 on Cezanne; full-rate `V_MFMA_F64` needs
+CDNA (no dev-box silicon → code ships, HW-verification flagged in the punchlist).
 
 ### 3.2.12–3.2.13 — Render-graph multi-queue scheduling (Phase R)
 
