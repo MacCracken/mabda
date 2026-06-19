@@ -1128,8 +1128,16 @@ single-submit; this adds per-node queue affinity + cross-queue fence edges
 Backend slots). Multi-queue is opt-in; omitting affinity reproduces v2.5
 ordering exactly. wgpu serialized-equivalent.
 
-- [ ] **R.1** *(3.2.13)* — `rg_node_queue` affinity (Node 72→80,
-  append-only) + `rg_execute_mq` entry; default reproduces v2.5.
+- [x] **R.1 (2026-06-19)** *(3.2.13)* — `rg_node_queue` affinity + `rg_execute_mq`
+  entry. Node struct grown 72→80 append-only (`queue_kind` at +56 reusing the old
+  reserved-16 tail; `batch_idx` at +64 as scheduler scratch, -1 before R.3);
+  `_rg_node_new` defaults affinity per kind (compute→COMPUTE, render/copy→GRAPHICS).
+  Public `rg_node_queue(g, node_id, kind)` (bad node_id/kind → 1) + `rg_node_queue_get`
+  accessor. `rg_execute_mq(g, ctx)` entry forwards to the v2.5 single-submit path for now
+  (byte-identical command stream; the scheduler that consumes affinity lands R.2/R.3).
+  `queue.cyr` moved ahead of `render_graph.cyr` in `lib.cyr` + the manifest module list
+  (QUEUE_KIND_* now in scope; LSP-clean). +15 CPU asserts (render 122→137; suite
+  3983→3998). Smoke/lint/fmt/vet/distlib green.
 - [ ] **R.2** *(3.2.13)* — Cross-queue edge classification (same-queue =
   order; cross-queue = fence edge); build-time cycle check covers it.
 - [ ] **R.3** *(3.2.13)* — Per-queue submit batching (group a queue's

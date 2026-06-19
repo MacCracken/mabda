@@ -20053,6 +20053,265 @@ fn gpu_render_pass_bind_texture(ctx, pass, tex, sampler): i64 {
     return fncall4(slot, ctx, pass, tex, sampler);
 }
 
+# --- queue.cyr ---
+
+# @public — multi-queue coordination (v3.1 Phase Q)
+# queue.cyr — logical GPU queue abstraction dispatched through the
+# ctx->backend queue slots.
+#
+# A "logical queue" is a handle the caller asks for by kind
+# (GRAPHICS / COMPUTE / TRANSFER) and then targets work onto. The two
+# backends realize the abstraction very differently:
+#
+#   native (AMD): each kind maps to a real hardware ring —
+#       GRAPHICS -> GFX ring, COMPUTE -> COMPUTE ring. TRANSFER shares
+#       the COMPUTE ring in 3.1.1; the SDMA COPY_LINEAR path is HW-proven
+#       (Q.5, programs/native_sdma_copy_e2e.cyr) but the TRANSFER->SDMA
+#       flip lands with the public buffer-copy op in 3.1.2. Each logical
+#       Queue carries a *persistent* timeline
+#       syncobj so cross-ring ordering (gpu_queue_barrier, Q.4) is a
+#       WAIT-in / SIGNAL-out on the queue's monotonic timeline point,
+#       and genuine GFX/COMPUTE overlap is possible.
+#
+#   wgpu: WebGPU exposes a single device queue. All three logical
+#       queues alias that one WGPUQueue (Q.2); there is NO real
+#       overlap. gpu_queue_barrier degrades to a submit-ordering pin
+#       and gpu_queue_wait_idle to a device poll. This is the
+#       documented wgpu limitation, mirroring how wgpu compute is a
+#       stub today — consumers that need true multi-queue use the
+#       native backend.
+#
+# Q.1 lands the layout only: the Queue struct, the kind constants, the
+# ctx-side queue table, and the public dispatchers (null-slot-guarded
+# so they are safe to call before the fillers exist). The wgpu fillers
+# + the backend_is_complete() walk over the queue range land in Q.2;
+# the native fillers + timeline accounting in Q.3.
+#
+# Proposal: docs/proposals/v3.1-multiqueue.md.
+
+# ================================================================
+# Queue-kind constants
+# ================================================================
+# Stable ABI — callers pass these to gpu_queue_get(). Values are the
+# native ring-preference order (GFX first). QUEUE_KIND_COUNT bounds
+# the ctx-side queue table and validates caller input.
+var QUEUE_KIND_GRAPHICS = 0;
+var QUEUE_KIND_COMPUTE  = 1;
+var QUEUE_KIND_TRANSFER = 2;
+var QUEUE_KIND_COUNT    = 3;
+
+# ================================================================
+# Queue struct layout (32 bytes)
+# ================================================================
+#   +0:  kind             QUEUE_KIND_* (invariant per queue)
+#   +8:  ring_handle      native: AMDGPU_HW_IP_* ring id for the kind.
+#                         wgpu  : the aliased WGPUQueue handle.
+#   +16: timeline_syncobj native: persistent timeline syncobj handle
+#                         (created once in Q.3, replaces the ephemeral
+#                         per-dispatch syncobj on the queue-targeted
+#                         path). wgpu: 0 (ordering is submit-order).
+#   +24: timeline_point   monotonic u64 — last point signalled on this
+#                         queue's timeline. Bumped per queue-targeted
+#                         submit (Q.3); read by gpu_queue_barrier (Q.4).
+#   +32: pending_wait_syncobj  Q.4 — a cross-ring dependency recorded by
+#                         gpu_queue_barrier on the CONSUMER queue. The
+#                         consumer's NEXT queue-targeted submit adds an
+#                         in-CS TIMELINE_WAIT on (this syncobj, point),
+#                         then clears both. 0 = no pending dependency.
+#   +40: pending_wait_point    Q.4 — the producer timeline point this
+#                         queue's next submit must wait for.
+var QUEUE_OFF_KIND         = 0;
+var QUEUE_OFF_RING         = 8;
+var QUEUE_OFF_SYNCOBJ      = 16;
+var QUEUE_OFF_POINT        = 24;
+var QUEUE_OFF_PEND_SYNCOBJ = 32;
+var QUEUE_OFF_PEND_POINT   = 40;
+var QUEUE_STRUCT_SIZE      = 48;
+
+# Allocate a zero-initialized Queue of the given kind. ring_handle,
+# timeline_syncobj, and timeline_point stay zero until the backend
+# filler binds them (Q.2 / Q.3).
+fn queue_new(kind): i64 {
+    var q = alloc(QUEUE_STRUCT_SIZE);
+    memset(q, 0, QUEUE_STRUCT_SIZE);
+    store64(q + QUEUE_OFF_KIND, kind);
+    return q;
+}
+
+fn queue_kind(q): i64 {
+    if (q == 0) { return -1; }
+    return load64(q + QUEUE_OFF_KIND);
+}
+fn queue_ring(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_RING);
+}
+fn queue_syncobj(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_SYNCOBJ);
+}
+fn queue_point(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_POINT);
+}
+
+fn queue_set_ring(q, ring): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_RING, ring);
+    return 0;
+}
+fn queue_set_syncobj(q, syncobj): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_SYNCOBJ, syncobj);
+    return 0;
+}
+fn queue_set_point(q, point): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_POINT, point);
+    return 0;
+}
+# Increment and return the queue's timeline point. The native submit
+# path (Q.3) calls this to get the next SIGNAL value for a dispatch.
+fn queue_bump_point(q): i64 {
+    if (q == 0) { return -1; }
+    var p = load64(q + QUEUE_OFF_POINT) + 1;
+    store64(q + QUEUE_OFF_POINT, p);
+    return p;
+}
+
+# Pending cross-ring wait dependency (Q.4). gpu_queue_barrier records
+# (producer syncobj, producer point) on the CONSUMER queue; the
+# consumer's next queue-targeted submit reads these, adds an in-CS
+# TIMELINE_WAIT, and clears them. syncobj == 0 means "no pending wait".
+fn queue_pending_wait_syncobj(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_PEND_SYNCOBJ);
+}
+fn queue_pending_wait_point(q): i64 {
+    if (q == 0) { return 0; }
+    return load64(q + QUEUE_OFF_PEND_POINT);
+}
+fn queue_set_pending_wait(q, syncobj, point): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_PEND_SYNCOBJ, syncobj);
+    store64(q + QUEUE_OFF_PEND_POINT, point);
+    return 0;
+}
+fn queue_clear_pending_wait(q): i64 {
+    if (q == 0) { return -1; }
+    store64(q + QUEUE_OFF_PEND_SYNCOBJ, 0);
+    store64(q + QUEUE_OFF_PEND_POINT, 0);
+    return 0;
+}
+
+# ================================================================
+# ctx-side queue table
+# ================================================================
+# One Queue* per kind plus a "current queue" stash, living OUTSIDE the
+# +0..+24 dual-interpretation region (context.cyr documents the byte
+# layout). The table is backend-agnostic: both backends populate it
+# lazily through the queue_get slot, then read it back for dispatch
+# routing (Q.3) and barriers (Q.4).
+var CTX_OFF_QUEUE_GRAPHICS = 128;
+var CTX_OFF_QUEUE_COMPUTE  = 136;
+var CTX_OFF_QUEUE_TRANSFER = 144;
+var CTX_OFF_QUEUE_CURRENT  = 152;
+
+# Map a queue kind to its ctx table byte offset; -1 on bad kind.
+fn _ctx_queue_table_off(kind): i64 {
+    if (kind == QUEUE_KIND_GRAPHICS) { return CTX_OFF_QUEUE_GRAPHICS; }
+    if (kind == QUEUE_KIND_COMPUTE)  { return CTX_OFF_QUEUE_COMPUTE; }
+    if (kind == QUEUE_KIND_TRANSFER) { return CTX_OFF_QUEUE_TRANSFER; }
+    return -1;
+}
+
+# Read the cached Queue* for a kind (0 if not yet created or bad kind).  #skip-lint
+fn gpu_ctx_queue_slot(ctx, kind): i64 {
+    if (ctx == 0) { return 0; }
+    var off = _ctx_queue_table_off(kind);
+    if (off < 0) { return 0; }
+    return load64(ctx + off);
+}
+# Cache a Queue* for a kind on the ctx. Used by the queue_get fillers.
+fn gpu_ctx_set_queue_slot(ctx, kind, q): i64 {
+    if (ctx == 0) { return -1; }
+    var off = _ctx_queue_table_off(kind);
+    if (off < 0) { return -1; }
+    store64(ctx + off, q);
+    return 0;
+}
+# The "current queue" stash — which logical queue the next
+# queue-targeted dispatch submits onto. Zero means "backend default
+# ring" (the legacy single-ring path, preserving v3.0 behaviour).
+fn gpu_ctx_current_queue(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    return load64(ctx + CTX_OFF_QUEUE_CURRENT);
+}
+fn gpu_ctx_set_current_queue(ctx, q): i64 {
+    if (ctx == 0) { return -1; }
+    store64(ctx + CTX_OFF_QUEUE_CURRENT, q);
+    return 0;
+}
+
+# ================================================================
+# Public queue API — dispatch through ctx->backend queue slots
+# ================================================================
+# The slots are filled in Q.2 (wgpu) / Q.3 (native). Until then — and
+# as defense-in-depth afterward — every dispatcher null-guards the slot
+# and returns a fail-loud value rather than fncall'ing a zero pointer.
+
+# Acquire the logical queue for `kind`. Returns a Queue* (opaque to
+# the caller), or 0 on invalid input / unfilled backend. Idempotent:
+# the backend caches one Queue per kind on the ctx and returns it.
+fn gpu_queue_get(ctx, kind): i64 {
+    if (ctx == 0) { return 0; }
+    if (kind < 0) { return 0; }
+    if (kind >= QUEUE_KIND_COUNT) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_GET);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, kind);
+}
+
+# Order work on dst_queue after work already submitted on src_queue.
+# native: cross-ring timeline WAIT-in / SIGNAL-out (Q.4). wgpu: submit
+# ordering pin (no real overlap). Returns 0|GPU_ERR_*.
+fn gpu_queue_barrier(ctx, src_queue, dst_queue): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (src_queue == 0) { return GPU_ERR_OTHER; }
+    if (dst_queue == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_BARRIER);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
+    return fncall3(slot, ctx, src_queue, dst_queue);
+}
+
+# Block until all work submitted on `queue` has retired. native:
+# syncobj wait on the queue's current timeline point. wgpu: device
+# poll. Returns 0|GPU_ERR_*.
+fn gpu_queue_wait_idle(ctx, queue): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_WAIT_IDLE);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
+    return fncall2(slot, ctx, queue);
+}
+
+# v3.2 X.5 — copy `bytes` from src_buf to dst_buf on an explicit
+# logical queue (caller chooses the ring; native requires a TRANSFER/
+# DMA queue — the ring check lives in the native driver). Synchronous.
+# Routes through the buffer_copy backend slot. Returns 0|GPU_ERR_*
+# (GPU_ERR_NOT_IMPLEMENTED if the active backend has no filler wired).  #skip-lint
+# gpu_buffer_copy is the implicit-queue convenience wrapper over this.
+fn gpu_queue_transfer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (queue == 0) { return GPU_ERR_OTHER; }
+    # 4-byte-multiple size — same uniform contract as gpu_buffer_copy
+    # (audit 2026-06-15 HIGH-1: wgpu requires it, native is byte-granular).
+    if ((bytes & 3) != 0) { return GPU_ERR_BUFFER; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_BUFFER_COPY);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
+    return fncall5(slot, ctx, queue, src_buf, dst_buf, bytes);
+}
+
 # --- render_graph.cyr ---
 
 # @public — stable API surface (survives the v3.0 backend swap)
@@ -20090,7 +20349,7 @@ fn gpu_render_pass_bind_texture(ctx, pass, tex, sampler): i64 {
 #   +24: aliasing_flag (i64)          — 0 off (default), 1 on
 #   +32: label         (cstr, 8)
 #
-# Node (72 bytes):
+# Node (80 bytes — grew 72→80 at v3.2.13 R.1, append-only):
 #   +0:  kind            (i64 — NODE_* enum)
 #   +8:  payload         (ptr, 8 — per-kind struct)
 #   +16: reads           (vec ptr, 8 — i64 res_ids)
@@ -20098,7 +20357,13 @@ fn gpu_render_pass_bind_texture(ctx, pass, tex, sampler): i64 {
 #   +32: label           (cstr, 8)
 #   +40: in_degree       (i64 — toposort scratch)
 #   +48: sort_idx        (i64 — index after rg_build; -1 if unsorted)
-#   +56: reserved (16)
+#   +56: queue_kind      (i64 — QUEUE_KIND_* affinity; reuses 8 of the
+#                         old reserved-16 tail. Default per node kind:
+#                         compute→QUEUE_KIND_COMPUTE, render/copy→
+#                         QUEUE_KIND_GRAPHICS — the v3.0 "default queue
+#                         per op kind" rule. rg_node_queue overrides it.)
+#   +64: batch_idx       (i64 — scheduler scratch: which per-queue batch
+#                         this node lands in; -1 before rg_schedule. R.3.)
 #
 # ComputePayload (32 bytes):
 #   +0:  pipeline    (WGPUComputePipeline struct ptr from compute.cyr)
@@ -20249,6 +20514,31 @@ fn rg_node_writes(g, node_id, res_id): i64 {
     var node = vec_get(load64(g + 0), node_id);
     vec_push(load64(node + 24), res_id);
     return 0;
+}
+
+# Declare the queue a node runs on (v3.2.13 R.1). `kind` is a
+# QUEUE_KIND_* value (GRAPHICS / COMPUTE / TRANSFER). Omitting this call
+# keeps the per-kind default (compute→COMPUTE, render/copy→GRAPHICS),
+# which reproduces v2.5 ordering. Must be called before rg_build. On the
+# wgpu backend affinity is informational (one device queue); on native
+# it routes the node to the matching HW ring (consumed by the R.2/R.3
+# scheduler). Returns 0 on success, 1 on a bad node_id or kind.
+fn rg_node_queue(g, node_id, kind): i64 {
+    if (node_id < 0) { return 1; }
+    if (node_id >= rg_node_count(g)) { return 1; }
+    if (kind < 0) { return 1; }
+    if (kind >= QUEUE_KIND_COUNT) { return 1; }
+    var node = vec_get(load64(g + 0), node_id);
+    store64(node + 56, kind);
+    return 0;
+}
+
+# Accessor: the queue affinity assigned to a node (QUEUE_KIND_*).
+# Returns -1 on a bad node_id.
+fn rg_node_queue_get(g, node_id): i64 {
+    if (node_id < 0) { return 0 - 1; }
+    if (node_id >= rg_node_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 0), node_id) + 56);
 }
 
 # Transient resources — the graph owns them between rg_build and
@@ -20768,6 +21058,28 @@ fn rg_execute(g, device, queue): i64 {
 }
 
 # ================================================================
+# Execute (multi-queue aware) — v3.2.13 Phase R entry point.
+# ================================================================
+# rg_execute_mq is the ctx-taking, queue-aware executor. The public
+# signature is fixed across the arc; the BODY is staged:
+#   R.1 (now): forwards to the v2.5 single-submit wgpu path, so the
+#              output command stream is byte-identical to rg_execute and
+#              the "default reproduces v2.5" contract holds. Node queue
+#              affinity is recorded (R.1); the scheduler that consumes it
+#              lands in R.2/R.3 (see docs/development/3-2-punchlist.md
+#              Phase R).
+#   R.2/R.3:   inserts rg_schedule (per-queue batches + cross-queue
+#              fence-edge classification) ahead of the executor.
+#   R.4+:      routes native nodes to per-ring timeline submits with
+#              cross-ring barriers; wgpu stays serialized-equivalent.
+# Takes the ctx (for the device/queue today, the queue table + barrier
+# path later). Returns 0|1, matching rg_execute. # @public
+fn rg_execute_mq(g, ctx): i64 {
+    if (ctx == 0) { return 1; }
+    return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
+}
+
+# ================================================================
 # Teardown
 # ================================================================
 
@@ -20798,13 +21110,19 @@ fn rg_release(g): i64 {
 # ================================================================
 
 fn _rg_node_new(kind, label): i64 {
-    var node = alloc(72);
-    memset(node, 0, 72);
+    var node = alloc(80);
+    memset(node, 0, 80);
     store64(node + 0,  kind);
     store64(node + 16, vec_new());
     store64(node + 24, vec_new());
     store64(node + 32, label);
     store64(node + 48, 0 - 1);
+    # Default queue affinity per node kind (R.1): compute runs on the
+    # COMPUTE ring, render/copy on GRAPHICS. rg_node_queue overrides this.
+    var qk = QUEUE_KIND_GRAPHICS;
+    if (kind == NODE_COMPUTE) { qk = QUEUE_KIND_COMPUTE; }
+    store64(node + 56, qk);
+    store64(node + 64, 0 - 1);
     return node;
 }
 
@@ -21270,265 +21588,6 @@ fn gpu_surface_release(ctx, surface): i64 {
     gpu_ctx_set_wgpu_surface_handle(ctx, 0);
     gpu_ctx_set_native_card_fd(ctx, 0);
     return rc;
-}
-
-# --- queue.cyr ---
-
-# @public — multi-queue coordination (v3.1 Phase Q)
-# queue.cyr — logical GPU queue abstraction dispatched through the
-# ctx->backend queue slots.
-#
-# A "logical queue" is a handle the caller asks for by kind
-# (GRAPHICS / COMPUTE / TRANSFER) and then targets work onto. The two
-# backends realize the abstraction very differently:
-#
-#   native (AMD): each kind maps to a real hardware ring —
-#       GRAPHICS -> GFX ring, COMPUTE -> COMPUTE ring. TRANSFER shares
-#       the COMPUTE ring in 3.1.1; the SDMA COPY_LINEAR path is HW-proven
-#       (Q.5, programs/native_sdma_copy_e2e.cyr) but the TRANSFER->SDMA
-#       flip lands with the public buffer-copy op in 3.1.2. Each logical
-#       Queue carries a *persistent* timeline
-#       syncobj so cross-ring ordering (gpu_queue_barrier, Q.4) is a
-#       WAIT-in / SIGNAL-out on the queue's monotonic timeline point,
-#       and genuine GFX/COMPUTE overlap is possible.
-#
-#   wgpu: WebGPU exposes a single device queue. All three logical
-#       queues alias that one WGPUQueue (Q.2); there is NO real
-#       overlap. gpu_queue_barrier degrades to a submit-ordering pin
-#       and gpu_queue_wait_idle to a device poll. This is the
-#       documented wgpu limitation, mirroring how wgpu compute is a
-#       stub today — consumers that need true multi-queue use the
-#       native backend.
-#
-# Q.1 lands the layout only: the Queue struct, the kind constants, the
-# ctx-side queue table, and the public dispatchers (null-slot-guarded
-# so they are safe to call before the fillers exist). The wgpu fillers
-# + the backend_is_complete() walk over the queue range land in Q.2;
-# the native fillers + timeline accounting in Q.3.
-#
-# Proposal: docs/proposals/v3.1-multiqueue.md.
-
-# ================================================================
-# Queue-kind constants
-# ================================================================
-# Stable ABI — callers pass these to gpu_queue_get(). Values are the
-# native ring-preference order (GFX first). QUEUE_KIND_COUNT bounds
-# the ctx-side queue table and validates caller input.
-var QUEUE_KIND_GRAPHICS = 0;
-var QUEUE_KIND_COMPUTE  = 1;
-var QUEUE_KIND_TRANSFER = 2;
-var QUEUE_KIND_COUNT    = 3;
-
-# ================================================================
-# Queue struct layout (32 bytes)
-# ================================================================
-#   +0:  kind             QUEUE_KIND_* (invariant per queue)
-#   +8:  ring_handle      native: AMDGPU_HW_IP_* ring id for the kind.
-#                         wgpu  : the aliased WGPUQueue handle.
-#   +16: timeline_syncobj native: persistent timeline syncobj handle
-#                         (created once in Q.3, replaces the ephemeral
-#                         per-dispatch syncobj on the queue-targeted
-#                         path). wgpu: 0 (ordering is submit-order).
-#   +24: timeline_point   monotonic u64 — last point signalled on this
-#                         queue's timeline. Bumped per queue-targeted
-#                         submit (Q.3); read by gpu_queue_barrier (Q.4).
-#   +32: pending_wait_syncobj  Q.4 — a cross-ring dependency recorded by
-#                         gpu_queue_barrier on the CONSUMER queue. The
-#                         consumer's NEXT queue-targeted submit adds an
-#                         in-CS TIMELINE_WAIT on (this syncobj, point),
-#                         then clears both. 0 = no pending dependency.
-#   +40: pending_wait_point    Q.4 — the producer timeline point this
-#                         queue's next submit must wait for.
-var QUEUE_OFF_KIND         = 0;
-var QUEUE_OFF_RING         = 8;
-var QUEUE_OFF_SYNCOBJ      = 16;
-var QUEUE_OFF_POINT        = 24;
-var QUEUE_OFF_PEND_SYNCOBJ = 32;
-var QUEUE_OFF_PEND_POINT   = 40;
-var QUEUE_STRUCT_SIZE      = 48;
-
-# Allocate a zero-initialized Queue of the given kind. ring_handle,
-# timeline_syncobj, and timeline_point stay zero until the backend
-# filler binds them (Q.2 / Q.3).
-fn queue_new(kind): i64 {
-    var q = alloc(QUEUE_STRUCT_SIZE);
-    memset(q, 0, QUEUE_STRUCT_SIZE);
-    store64(q + QUEUE_OFF_KIND, kind);
-    return q;
-}
-
-fn queue_kind(q): i64 {
-    if (q == 0) { return -1; }
-    return load64(q + QUEUE_OFF_KIND);
-}
-fn queue_ring(q): i64 {
-    if (q == 0) { return 0; }
-    return load64(q + QUEUE_OFF_RING);
-}
-fn queue_syncobj(q): i64 {
-    if (q == 0) { return 0; }
-    return load64(q + QUEUE_OFF_SYNCOBJ);
-}
-fn queue_point(q): i64 {
-    if (q == 0) { return 0; }
-    return load64(q + QUEUE_OFF_POINT);
-}
-
-fn queue_set_ring(q, ring): i64 {
-    if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_RING, ring);
-    return 0;
-}
-fn queue_set_syncobj(q, syncobj): i64 {
-    if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_SYNCOBJ, syncobj);
-    return 0;
-}
-fn queue_set_point(q, point): i64 {
-    if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_POINT, point);
-    return 0;
-}
-# Increment and return the queue's timeline point. The native submit
-# path (Q.3) calls this to get the next SIGNAL value for a dispatch.
-fn queue_bump_point(q): i64 {
-    if (q == 0) { return -1; }
-    var p = load64(q + QUEUE_OFF_POINT) + 1;
-    store64(q + QUEUE_OFF_POINT, p);
-    return p;
-}
-
-# Pending cross-ring wait dependency (Q.4). gpu_queue_barrier records
-# (producer syncobj, producer point) on the CONSUMER queue; the
-# consumer's next queue-targeted submit reads these, adds an in-CS
-# TIMELINE_WAIT, and clears them. syncobj == 0 means "no pending wait".
-fn queue_pending_wait_syncobj(q): i64 {
-    if (q == 0) { return 0; }
-    return load64(q + QUEUE_OFF_PEND_SYNCOBJ);
-}
-fn queue_pending_wait_point(q): i64 {
-    if (q == 0) { return 0; }
-    return load64(q + QUEUE_OFF_PEND_POINT);
-}
-fn queue_set_pending_wait(q, syncobj, point): i64 {
-    if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, syncobj);
-    store64(q + QUEUE_OFF_PEND_POINT, point);
-    return 0;
-}
-fn queue_clear_pending_wait(q): i64 {
-    if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, 0);
-    store64(q + QUEUE_OFF_PEND_POINT, 0);
-    return 0;
-}
-
-# ================================================================
-# ctx-side queue table
-# ================================================================
-# One Queue* per kind plus a "current queue" stash, living OUTSIDE the
-# +0..+24 dual-interpretation region (context.cyr documents the byte
-# layout). The table is backend-agnostic: both backends populate it
-# lazily through the queue_get slot, then read it back for dispatch
-# routing (Q.3) and barriers (Q.4).
-var CTX_OFF_QUEUE_GRAPHICS = 128;
-var CTX_OFF_QUEUE_COMPUTE  = 136;
-var CTX_OFF_QUEUE_TRANSFER = 144;
-var CTX_OFF_QUEUE_CURRENT  = 152;
-
-# Map a queue kind to its ctx table byte offset; -1 on bad kind.
-fn _ctx_queue_table_off(kind): i64 {
-    if (kind == QUEUE_KIND_GRAPHICS) { return CTX_OFF_QUEUE_GRAPHICS; }
-    if (kind == QUEUE_KIND_COMPUTE)  { return CTX_OFF_QUEUE_COMPUTE; }
-    if (kind == QUEUE_KIND_TRANSFER) { return CTX_OFF_QUEUE_TRANSFER; }
-    return -1;
-}
-
-# Read the cached Queue* for a kind (0 if not yet created or bad kind).  #skip-lint
-fn gpu_ctx_queue_slot(ctx, kind): i64 {
-    if (ctx == 0) { return 0; }
-    var off = _ctx_queue_table_off(kind);
-    if (off < 0) { return 0; }
-    return load64(ctx + off);
-}
-# Cache a Queue* for a kind on the ctx. Used by the queue_get fillers.
-fn gpu_ctx_set_queue_slot(ctx, kind, q): i64 {
-    if (ctx == 0) { return -1; }
-    var off = _ctx_queue_table_off(kind);
-    if (off < 0) { return -1; }
-    store64(ctx + off, q);
-    return 0;
-}
-# The "current queue" stash — which logical queue the next
-# queue-targeted dispatch submits onto. Zero means "backend default
-# ring" (the legacy single-ring path, preserving v3.0 behaviour).
-fn gpu_ctx_current_queue(ctx): i64 {
-    if (ctx == 0) { return 0; }
-    return load64(ctx + CTX_OFF_QUEUE_CURRENT);
-}
-fn gpu_ctx_set_current_queue(ctx, q): i64 {
-    if (ctx == 0) { return -1; }
-    store64(ctx + CTX_OFF_QUEUE_CURRENT, q);
-    return 0;
-}
-
-# ================================================================
-# Public queue API — dispatch through ctx->backend queue slots
-# ================================================================
-# The slots are filled in Q.2 (wgpu) / Q.3 (native). Until then — and
-# as defense-in-depth afterward — every dispatcher null-guards the slot
-# and returns a fail-loud value rather than fncall'ing a zero pointer.
-
-# Acquire the logical queue for `kind`. Returns a Queue* (opaque to
-# the caller), or 0 on invalid input / unfilled backend. Idempotent:
-# the backend caches one Queue per kind on the ctx and returns it.
-fn gpu_queue_get(ctx, kind): i64 {
-    if (ctx == 0) { return 0; }
-    if (kind < 0) { return 0; }
-    if (kind >= QUEUE_KIND_COUNT) { return 0; }
-    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_GET);
-    if (slot == 0) { return 0; }
-    return fncall2(slot, ctx, kind);
-}
-
-# Order work on dst_queue after work already submitted on src_queue.
-# native: cross-ring timeline WAIT-in / SIGNAL-out (Q.4). wgpu: submit
-# ordering pin (no real overlap). Returns 0|GPU_ERR_*.
-fn gpu_queue_barrier(ctx, src_queue, dst_queue): i64 {
-    if (ctx == 0) { return GPU_ERR_OTHER; }
-    if (src_queue == 0) { return GPU_ERR_OTHER; }
-    if (dst_queue == 0) { return GPU_ERR_OTHER; }
-    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_BARRIER);
-    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
-    return fncall3(slot, ctx, src_queue, dst_queue);
-}
-
-# Block until all work submitted on `queue` has retired. native:
-# syncobj wait on the queue's current timeline point. wgpu: device
-# poll. Returns 0|GPU_ERR_*.
-fn gpu_queue_wait_idle(ctx, queue): i64 {
-    if (ctx == 0) { return GPU_ERR_OTHER; }
-    if (queue == 0) { return GPU_ERR_OTHER; }
-    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_QUEUE_WAIT_IDLE);
-    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
-    return fncall2(slot, ctx, queue);
-}
-
-# v3.2 X.5 — copy `bytes` from src_buf to dst_buf on an explicit
-# logical queue (caller chooses the ring; native requires a TRANSFER/
-# DMA queue — the ring check lives in the native driver). Synchronous.
-# Routes through the buffer_copy backend slot. Returns 0|GPU_ERR_*
-# (GPU_ERR_NOT_IMPLEMENTED if the active backend has no filler wired).  #skip-lint
-# gpu_buffer_copy is the implicit-queue convenience wrapper over this.
-fn gpu_queue_transfer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
-    if (ctx == 0)   { return GPU_ERR_OTHER; }
-    if (queue == 0) { return GPU_ERR_OTHER; }
-    # 4-byte-multiple size — same uniform contract as gpu_buffer_copy
-    # (audit 2026-06-15 HIGH-1: wgpu requires it, native is byte-granular).
-    if ((bytes & 3) != 0) { return GPU_ERR_BUFFER; }
-    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_BUFFER_COPY);
-    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
-    return fncall5(slot, ctx, queue, src_buf, dst_buf, bytes);
 }
 
 # --- instancing.cyr ---

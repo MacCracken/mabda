@@ -33,7 +33,7 @@
 #   +24: aliasing_flag (i64)          — 0 off (default), 1 on
 #   +32: label         (cstr, 8)
 #
-# Node (72 bytes):
+# Node (80 bytes — grew 72→80 at v3.2.13 R.1, append-only):
 #   +0:  kind            (i64 — NODE_* enum)
 #   +8:  payload         (ptr, 8 — per-kind struct)
 #   +16: reads           (vec ptr, 8 — i64 res_ids)
@@ -41,7 +41,13 @@
 #   +32: label           (cstr, 8)
 #   +40: in_degree       (i64 — toposort scratch)
 #   +48: sort_idx        (i64 — index after rg_build; -1 if unsorted)
-#   +56: reserved (16)
+#   +56: queue_kind      (i64 — QUEUE_KIND_* affinity; reuses 8 of the
+#                         old reserved-16 tail. Default per node kind:
+#                         compute→QUEUE_KIND_COMPUTE, render/copy→
+#                         QUEUE_KIND_GRAPHICS — the v3.0 "default queue
+#                         per op kind" rule. rg_node_queue overrides it.)
+#   +64: batch_idx       (i64 — scheduler scratch: which per-queue batch
+#                         this node lands in; -1 before rg_schedule. R.3.)
 #
 # ComputePayload (32 bytes):
 #   +0:  pipeline    (WGPUComputePipeline struct ptr from compute.cyr)
@@ -192,6 +198,31 @@ fn rg_node_writes(g, node_id, res_id): i64 {
     var node = vec_get(load64(g + 0), node_id);
     vec_push(load64(node + 24), res_id);
     return 0;
+}
+
+# Declare the queue a node runs on (v3.2.13 R.1). `kind` is a
+# QUEUE_KIND_* value (GRAPHICS / COMPUTE / TRANSFER). Omitting this call
+# keeps the per-kind default (compute→COMPUTE, render/copy→GRAPHICS),
+# which reproduces v2.5 ordering. Must be called before rg_build. On the
+# wgpu backend affinity is informational (one device queue); on native
+# it routes the node to the matching HW ring (consumed by the R.2/R.3
+# scheduler). Returns 0 on success, 1 on a bad node_id or kind.
+fn rg_node_queue(g, node_id, kind): i64 {
+    if (node_id < 0) { return 1; }
+    if (node_id >= rg_node_count(g)) { return 1; }
+    if (kind < 0) { return 1; }
+    if (kind >= QUEUE_KIND_COUNT) { return 1; }
+    var node = vec_get(load64(g + 0), node_id);
+    store64(node + 56, kind);
+    return 0;
+}
+
+# Accessor: the queue affinity assigned to a node (QUEUE_KIND_*).
+# Returns -1 on a bad node_id.
+fn rg_node_queue_get(g, node_id): i64 {
+    if (node_id < 0) { return 0 - 1; }
+    if (node_id >= rg_node_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 0), node_id) + 56);
 }
 
 # Transient resources — the graph owns them between rg_build and
@@ -711,6 +742,28 @@ fn rg_execute(g, device, queue): i64 {
 }
 
 # ================================================================
+# Execute (multi-queue aware) — v3.2.13 Phase R entry point.
+# ================================================================
+# rg_execute_mq is the ctx-taking, queue-aware executor. The public
+# signature is fixed across the arc; the BODY is staged:
+#   R.1 (now): forwards to the v2.5 single-submit wgpu path, so the
+#              output command stream is byte-identical to rg_execute and
+#              the "default reproduces v2.5" contract holds. Node queue
+#              affinity is recorded (R.1); the scheduler that consumes it
+#              lands in R.2/R.3 (see docs/development/3-2-punchlist.md
+#              Phase R).
+#   R.2/R.3:   inserts rg_schedule (per-queue batches + cross-queue
+#              fence-edge classification) ahead of the executor.
+#   R.4+:      routes native nodes to per-ring timeline submits with
+#              cross-ring barriers; wgpu stays serialized-equivalent.
+# Takes the ctx (for the device/queue today, the queue table + barrier
+# path later). Returns 0|1, matching rg_execute. # @public
+fn rg_execute_mq(g, ctx): i64 {
+    if (ctx == 0) { return 1; }
+    return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
+}
+
+# ================================================================
 # Teardown
 # ================================================================
 
@@ -741,13 +794,19 @@ fn rg_release(g): i64 {
 # ================================================================
 
 fn _rg_node_new(kind, label): i64 {
-    var node = alloc(72);
-    memset(node, 0, 72);
+    var node = alloc(80);
+    memset(node, 0, 80);
     store64(node + 0,  kind);
     store64(node + 16, vec_new());
     store64(node + 24, vec_new());
     store64(node + 32, label);
     store64(node + 48, 0 - 1);
+    # Default queue affinity per node kind (R.1): compute runs on the
+    # COMPUTE ring, render/copy on GRAPHICS. rg_node_queue overrides this.
+    var qk = QUEUE_KIND_GRAPHICS;
+    if (kind == NODE_COMPUTE) { qk = QUEUE_KIND_COMPUTE; }
+    store64(node + 56, qk);
+    store64(node + 64, 0 - 1);
     return node;
 }
 

@@ -238,6 +238,87 @@ fn test_rg_execute_null_device_fails_fast() {
     return 0;
 }
 
+# --- R.1 (v3.2.13): per-node queue affinity + rg_execute_mq entry ---
+
+fn test_rg_node_queue_defaults() {
+    # Default affinity per node kind: compute→COMPUTE, render/copy→GRAPHICS.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var c = rg_add_compute(g, 0, 0, &dims, "cmp");
+    var r = rg_add_render(g, 0, 0, 0, "render");
+    var cp = rg_add_copy_buf_buf(g, 0, 0, 0, 0, 64);
+    assert_eq(rg_node_queue_get(g, c), QUEUE_KIND_COMPUTE,
+    "compute node defaults to COMPUTE queue");
+    assert_eq(rg_node_queue_get(g, r), QUEUE_KIND_GRAPHICS,
+    "render node defaults to GRAPHICS queue");
+    assert_eq(rg_node_queue_get(g, cp), QUEUE_KIND_GRAPHICS,
+    "copy node defaults to GRAPHICS queue");
+    return 0;
+}
+
+fn test_rg_node_queue_override() {
+    # rg_node_queue overrides the default; the accessor reflects it.
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var c = rg_add_compute(g, 0, 0, &dims, "cmp");
+    assert_eq(rg_node_queue(g, c, QUEUE_KIND_TRANSFER), 0,
+    "rg_node_queue accepts a valid kind");
+    assert_eq(rg_node_queue_get(g, c), QUEUE_KIND_TRANSFER,
+    "override routes the compute node to TRANSFER");
+    # Re-target to GRAPHICS to prove it is not write-once.
+    rg_node_queue(g, c, QUEUE_KIND_GRAPHICS);
+    assert_eq(rg_node_queue_get(g, c), QUEUE_KIND_GRAPHICS,
+    "override is re-assignable");
+    return 0;
+}
+
+fn test_rg_node_queue_guards() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "cmp");
+    assert_eq(rg_node_queue(g, 0 - 1, QUEUE_KIND_COMPUTE), 1,
+    "rg_node_queue(-1) returns 1");
+    assert_eq(rg_node_queue(g, 99, QUEUE_KIND_COMPUTE), 1,
+    "rg_node_queue(out-of-range) returns 1");
+    assert_eq(rg_node_queue(g, 0, 0 - 1), 1,
+    "rg_node_queue(bad kind <0) returns 1");
+    assert_eq(rg_node_queue(g, 0, QUEUE_KIND_COUNT), 1,
+    "rg_node_queue(kind >= COUNT) returns 1");
+    # A rejected call leaves the default affinity untouched.
+    assert_eq(rg_node_queue_get(g, 0), QUEUE_KIND_COMPUTE,
+    "rejected override leaves default in place");
+    assert_eq(rg_node_queue_get(g, 0 - 1), 0 - 1,
+    "rg_node_queue_get(-1) = -1");
+    assert_eq(rg_node_queue_get(g, 99), 0 - 1,
+    "rg_node_queue_get(out-of-range) = -1");
+    return 0;
+}
+
+fn test_rg_execute_mq_null_ctx_fails() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    rg_build(g, 0);
+    assert_eq(rg_execute_mq(g, 0), 1,
+    "rg_execute_mq with null ctx returns 1");
+    return 0;
+}
+
+fn test_rg_execute_mq_forwards_v25() {
+    # R.1: rg_execute_mq forwards to the v2.5 single-submit path. With a
+    # ctx whose device/queue are null, the inner rg_execute hits the
+    # null-device guard and returns 1 — proving the forward (and that the
+    # entry reads device/queue off the ctx at +16/+24).
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "n");
+    rg_build(g, 0);
+    var fakectx[40]; memset(&fakectx, 0, 40);
+    assert_eq(rg_execute_mq(g, &fakectx), 1,
+    "rg_execute_mq forwards to v2.5 path (null device → 1)");
+    return 0;
+}
+
 fn test_rg_transient_handle_before_build_is_label_ptr() {
     # Before rg_build, the handle slot holds the label pointer (the
     # struct layout doubles the slot up as a staging area). This is
@@ -522,6 +603,11 @@ fn main() {
     test_rg_build_diamond_shape();
     test_rg_execute_unbuilt_fails_fast();
     test_rg_execute_null_device_fails_fast();
+    test_rg_node_queue_defaults();
+    test_rg_node_queue_override();
+    test_rg_node_queue_guards();
+    test_rg_execute_mq_null_ctx_fails();
+    test_rg_execute_mq_forwards_v25();
     test_rg_transient_handle_before_build_is_label_ptr();
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();
