@@ -21,7 +21,7 @@ they land.
 > backends**) **and absorbs every item that was previously going to be
 > deferred** — native compressed *sampling*, the v3.1.2 TRANSFER/buffer-copy
 > work, and render-graph multi-queue. **Nothing in this plan defers to
-> v3.3 or v4.** The arc grows to fit (3.2.0 → 3.2.13). Where work is
+> v3.3 or v4.** The arc grows to fit (3.2.0 → 3.2.14). Where work is
 > blocked *only* by hardware absent from the dev box, the code still ships
 > in-arc and the **HW-verification gap is flagged for the maintainer**
 > (see the Hardware-verification gaps section) — never silently dropped.
@@ -42,10 +42,9 @@ they land.
 | 3.2.9   | **N** (5) | Int div/mod (N.9): no HW integer divide → float-reciprocal macro. OpUDiv/UMod/SDiv/SRem/SMod, all HW-verified on Cezanne. | — |
 | 3.2.10  | **N** (6) | Vectors (N.10): component-wise vec2/3/4 ops. | — |
 | 3.2.11  | **N** (7) | Per-ext-set tracking (N.11): verify `OpExtInst` set is GLSL.std.450. | — |
-| 3.2.12  | **F** (1) | f64 caps surface + native hand-authored f64 proof + wgpu f64 module (F.1–6, F.8). | — |
-| 3.2.13  | **F** (2) | General native f64 via the Phase N emitter + attn11 acceptance (F.7, F.9–10). f64 **complete**. | — |
-| 3.2.14  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
-| 3.2.15  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
+| 3.2.12  | **F** (1) | f64 (double-precision) compute, **HW-verified on Cezanne**: caps surface + native hand-authored proof + wgpu ShaderF64 module + the general native SPIR-V→GFX9 f64 **arithmetic** toolkit (add/sub/mul/div/sqrt/fma, cvt, const, ldexp, compares, select) + attn11 acceptance (F.1–F.10). Transcendentals arithmetic-only (consumers hand-roll). f64 **complete**. | — |
+| 3.2.13  | **R** (1) | Render-graph multi-queue: node queue affinity, cross-queue edges→barriers, native render timeline dispatch (R.1–4). | — |
+| 3.2.14  | **R** (2) | Per-node IB staging, scheduler, e2e (R.5–7). Render-graph multi-queue **complete**. | — |
 
 `BACKEND_SIZE` / slot offsets are append-after-KIND in **landing order**;
 the absolute `+N` in each proposal is nominal and finalized per the order
@@ -891,8 +890,8 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
 - [x] **F.1** *(3.2.12)* (2026-06-18) — `GpuCapabilities` `shader_f64` field at **+128**,
   struct **128→136** (T.4's texture-compression bitset already took +120, so the proposal's
   "+120→128" was stale) + `gpu_caps_shader_f64` accessor / `gpu_caps_set_shader_f64` setter +
-  `gpu_caps_new` sized up. +3 core asserts. (F.2–F.10 still annotated 3.2.10/3.2.11 — reflow to
-  3.2.12/3.2.13 lands with F.10.)
+  `gpu_caps_new` sized up. +3 core asserts. (F.10 reflowed the whole Phase F to the single
+  **3.2.12** cut; Phase R moved to 3.2.13–3.2.14.)
 - [x] **F.2** *(3.2.12)* (2026-06-18) — per-backend f64 detection. native
   `gpu_caps_native_shader_f64()` → `MABDA_NATIVE_F64` (the f64 ANSWER, 0 until F.7) + the wgpu
   NECESSARY-gate `gpu_wgpu_spirv_passthrough_supported(device)` → `has_feature(SpirvShaderPassthrough
@@ -937,7 +936,7 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   (55 spirv-as words). `programs/f64_compute_e2e.cyr` (HW: ShaderF64 on, f64 module creates via
   naga, passthrough skipped-unsupported, caps 0) + `backend.tcyr` +2 tests. Folds in the former F.8c.
   See [[project_wgpu_f64_via_shaderf64_not_passthrough]].
-- **F.7** *(3.2.13)* — General native f64: route consumer f64 SPIR-V through the SPIR-V→GFX9
+- [x] **F.7** *(3.2.12)* — General native f64: route consumer f64 SPIR-V through the SPIR-V→GFX9
   compiler (`V_*_F64`). Central new concept: **64-bit register pairs** (even-aligned) as `MIR_T_F64`
   threaded MIR→isel→regalloc→encode. Milestone-first, then breadth; flip `MABDA_NATIVE_F64`→1 ONLY
   when f64 runs end-to-end for every op attn11 uses — partial back end stays 0 (review F.2 #2). The
@@ -1110,12 +1109,17 @@ committed 3.2.x minor (3.2.11), gated on Phase N which is also in-arc.**
   `gpu_shader_module_create_spirv` → `gpu_compute_dispatch` (not internal gfx9_compile), **bit-exact**
   on all 8 lanes vs the step-by-step in-process f64 reference — `native_spirv_f64_layernorm_e2e.cyr`.
   Proves the f64 toolkit works end-to-end through the public surface as a consumer uses it.
-- [ ] **F.10** *(3.2.13)* — Docs (throughput caveats) + **roadmap reflow
-  correcting the `SHADER_F64` framing**; cut.
+- [x] **F.10** *(3.2.12, 2026-06-19)* — Docs reflow + version cut. Corrected the
+  stale `SHADER_F64`/"passthrough is the only f64 route" framing in `roadmap.md` +
+  the proposal banner (wgpu f64 = ShaderF64 + naga standard path; native f64 = the
+  SPIR-V→GFX9 compiler), documented the **arithmetic-only** transcendental story +
+  the FP64-throughput caveat (Cezanne ~1:16–1:32 — correctness, not speed), reflowed
+  the version annotations (Phase F → 3.2.12, Phase R → 3.2.13–3.2.14). VERSION 3.2.12,
+  CHANGELOG `[3.2.12]`, CLAUDE.md Current State (asserts 3776→**3983**), README. cut.
 
 ---
 
-## Phase R — Render-graph multi-queue scheduling → 3.2.12–3.2.13
+## Phase R — Render-graph multi-queue scheduling → 3.2.13–3.2.14
 
 Proposal: [`v3.2-render-graph-multiqueue.md`](../proposals/v3.2-render-graph-multiqueue.md).
 Absorbs the v3.1.2 carryover (was "Phase Q.7"). The v2.5 render graph is
@@ -1124,20 +1128,20 @@ single-submit; this adds per-node queue affinity + cross-queue fence edges
 Backend slots). Multi-queue is opt-in; omitting affinity reproduces v2.5
 ordering exactly. wgpu serialized-equivalent.
 
-- [ ] **R.1** *(3.2.12)* — `rg_node_queue` affinity (Node 72→80,
+- [ ] **R.1** *(3.2.13)* — `rg_node_queue` affinity (Node 72→80,
   append-only) + `rg_execute_mq` entry; default reproduces v2.5.
-- [ ] **R.2** *(3.2.12)* — Cross-queue edge classification (same-queue =
+- [ ] **R.2** *(3.2.13)* — Cross-queue edge classification (same-queue =
   order; cross-queue = fence edge); build-time cycle check covers it.
-- [ ] **R.3** *(3.2.12)* — Per-queue submit batching (group a queue's
+- [ ] **R.3** *(3.2.13)* — Per-queue submit batching (group a queue's
   nodes; `RenderGraph` 40→48 schedule ptr).
-- [ ] **R.4** *(3.2.12)* — `native_render_dispatch_timeline` (GFX-ring
+- [ ] **R.4** *(3.2.13)* — `native_render_dispatch_timeline` (GFX-ring
   timeline variant of the render submit; the missing piece for render
   nodes to join cross-ring overlap).
-- [ ] **R.5** *(3.2.13)* — Per-node IB staging (fixes the shared-cached-IB
+- [ ] **R.5** *(3.2.14)* — Per-node IB staging (fixes the shared-cached-IB
   clobber under genuine overlap; explicit, never a silent serialization).
-- [ ] **R.6** *(3.2.13)* — Scheduler (per-queue toposort + cross-queue
+- [ ] **R.6** *(3.2.14)* — Scheduler (per-queue toposort + cross-queue
   barrier insertion + batch submit); pure-CPU graph-math tests.
-- [ ] **R.7** *(3.2.13)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
+- [ ] **R.7** *(3.2.14)* — HW e2e (`native_render_graph_mq_e2e.cyr`:
   compute→cross-queue-edge→render, distinct rings, no CPU stall; wgpu
   parity vs `render_graph_e2e.cyr`); cut.
 
