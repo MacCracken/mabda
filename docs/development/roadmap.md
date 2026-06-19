@@ -64,6 +64,8 @@ cross-vendor default.
                         (3.2.0–3.2.14) — arc done
   v3.3   [SHIPPED] ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
                         new chitra package), 3.3.0; arrays/cubes + JPEG → v3.4+
+  v3.4   [ACTIVE]  ─▶  array textures + cubemaps (Phase AA / AL-ARRAY) —
+                        create/upload/sample on both backends + DDS/KTX2 load
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
                         retires (AMD consumers run on AMD native only)
@@ -202,6 +204,41 @@ one cross-repo edge).
 **array layers / cubemaps** (parsed-and-rejected-loud in 3.3.x → real support
 in v3.4, Phase AL-ARRAY); ETC2/ASTC sampling stays HW-blocked on Cezanne (caps
 gate catches it). sRGB policy decided in AL.0.
+
+---
+
+## v3.4 — Array Textures + Cubemaps (ACTIVE)
+
+The v3.3 DDS/KTX2 loaders already **parse** `arraySize`/`faceCount`/`layerCount`
+and fail loud. v3.4 (**Phase AA / AL-ARRAY**) makes them real: **2D array
+textures** + **cubemaps** — create, per-layer upload, and sampling — on both
+backends, with the loaders flipped from reject to load. All **additive** (no
+consumer call signature changes). Branch `34x`, toolchain 6.2.26; planned
+2026-06-19 via the `v34-al-array-plan` design workflow. See the **punchlist**:
+
+- Punchlist: [`3-4-punchlist.md`](3-4-punchlist.md)
+- Design: [`v3.4-array-cube-textures.md`](../proposals/v3.4-array-cube-textures.md)
+
+The native delta is small + `gfx9.json`-isolated (T# `TYPE` 2D→2D_ARRAY/CUBE,
+`DEPTH` = slice−1; a per-draw `layer` in the descriptor tail; the sampling FS
+gains `DA=1` + a slice VADDR). An N-slice array is **one BO** (slice k at
+`base + k·slice_pitch`); a cube is a 6-slice array (faces +X,−X,+Y,−Y,+Z,−Z).
+wgpu is pure descriptor/view parameterization + new WGSL FS, zero new FFI.
+
+**Sequence (smallest-risk-first):** AA.0 API/slots → AA.1 native 2D-array
+storage → AA.2 native 2D-array sample → AA.3 wgpu 2D-array → AA.4 native
+compressed (tiled) array → AA.5 cube (native + wgpu) → AA.6 DDS/KTX2 load → AA.7
+HW e2e + cut. One **3.4.0** cut (3.3.0 precedent).
+
+**Gated / risk-flagged (nothing silently dropped):** cube sampling is the
+biggest Cezanne HW risk (new direction→face/u/v FS — gated to cube-storage-only
+if filtering proves unreliable); KTX2/DDS per-layer offset math carries the
+3.3.0 overflow-safety audit forward (divisor + multiplier now untrusted);
+data-ordering (DDS +X..−Z / KTX2 layer→face→z) needs HW verification; tiled-array
+slice stride is an addrlib gate; **layered *render* (rendering INTO layers/faces)
+is OUT OF SCOPE** (sample-one-layer-per-draw only); cube-array gated behind a
+reject until HW-tested; ETC2/ASTC arrays stay HW-blocked; wgpu HW-verify is
+box-dependent (dev box is native Cezanne).
 
 ---
 
