@@ -215,12 +215,15 @@ implementation, not just planning.
 
 ## Phase AA.6 — DDS/KTX2 array + cube loader integration [M]
 
-- [ ] **AA.6a** — **overflow-safe per-layer offset math** (re-apply the 3.3.0
-  KTX2 byteOffset CRITICAL): `per_image = blen / total_images` with
-  `total_images != 0` guard + `blen % total_images != 0` reject; `sub_off = boff
-  + image_idx·per_image` with the `sub_off > len - per_image` no-overflow check
-  re-applied **per layer** (both divisor and multiplier are now untrusted header
-  fields). Regression asserts for div-by-zero + overflow.
+- [x] **AA.6a (2026-06-19)** — `_asset_per_image_size(blen, total_images)`: the
+  overflow-safe per-image split (carries the 3.3.0 KTX2-byteOffset audit forward —
+  `total_images <= 0` div-by-zero guard + `blen % total_images != 0` reject + a
+  negative-blen guard). The KEY insight (documented): once the caller bounds the
+  LEVEL span (`boff + blen <= len`, already overflow-safe from 3.3.0), each
+  image's `boff + idx·per_image` (idx < total_images) lies within
+  `[boff, boff+blen) ⊆ [0, len)` — so no per-image add can overflow or read OOB.
+  +10 asserts (asset_load 138→148: even splits, div-by-zero, non-divisible,
+  negative). Suite 4462→4470; all exit 0; distlib idempotent.
 - [ ] **AA.6b** — KTX2 array + cube load: remove the faceCount/layerCount
   rejects; surface `layer_count` + `face_count`; **mip-outer, layer-inner**
   loop; `blen == per_image · layers · faces`; route to create_2d_array /
