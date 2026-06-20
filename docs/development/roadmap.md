@@ -181,9 +181,9 @@ fixed **1 CRITICAL** (KTX2 `byteOffset` signed-overflow OOB) — see
 [`docs/audit/2026-06-19-asset-loading-audit.md`](../audit/2026-06-19-asset-loading-audit.md).
 See the **punchlist** + two **proposals**:
 
-- Punchlist: [`3-3-punchlist.md`](3-3-punchlist.md)
-- Asset loading (mabda): [`v3.3-asset-loading.md`](../proposals/v3.3-asset-loading.md)
-- chitra PNG decoder package: [`v3.3-chitra-png-decoder-package.md`](../proposals/v3.3-chitra-png-decoder-package.md)
+- Punchlist: [`3-3-punchlist.md`](../archive/punchlists/3-3-punchlist.md)
+- Asset loading (mabda): [`v3.3-asset-loading.md`](../archive/proposals/v3.3-asset-loading.md)
+- chitra PNG decoder package: [`v3.3-chitra-png-decoder-package.md`](../archive/proposals/v3.3-chitra-png-decoder-package.md)
 
 **The original "dependency-gated, no decoder exists" framing was wrong.** The
 stdlib `sankoch` already ships zlib/DEFLATE inflate, and `kii` already has a
@@ -218,8 +218,8 @@ backends, with the loaders flipped from reject to load. All **additive** (no
 consumer call signature changes). Branch `34x`, toolchain 6.2.26; planned
 2026-06-19 via the `v34-al-array-plan` design workflow. See the **punchlist**:
 
-- Punchlist: [`3-4-punchlist.md`](3-4-punchlist.md)
-- Design: [`v3.4-array-cube-textures.md`](../proposals/v3.4-array-cube-textures.md)
+- Punchlist: [`3-4-punchlist.md`](../archive/punchlists/3-4-punchlist.md)
+- Design: [`v3.4-array-cube-textures.md`](../archive/proposals/v3.4-array-cube-textures.md)
 
 The native delta is small + `gfx9.json`-isolated (T# `TYPE` 2D→2D_ARRAY/CUBE,
 `DEPTH` = slice−1; a per-draw `layer` in the descriptor tail; the sampling FS

@@ -28,7 +28,7 @@ attn11's GPU integration.
   (defs + init + all usages); `dist/mabda.cyr` now exports zero standalone `F64_HALF`/`F64_TWO`, so
   a consumer of both `math` and `lib/mabda.cyr` no longer collides. The other `F64_*`
   (`F64_0`/`F64_1`/`F64_255`/`F64_LUM_*`/`F64_CB_*`) don't shadow `math` and are unchanged. Filing:
-  `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`.
+  `docs/development/issues/archived/2026-06-19-f64-half-two-collide-with-math-stdlib.md`.
 
 ### Added
 - **AA.3c — wgpu draw-time layer selection (HW-verified on Cezanne via wgpu/Vulkan).**
@@ -64,7 +64,7 @@ split now has both divisor and multiplier from untrusted headers). **HW-verified
 array sample (`RT[x,y]==array[layer,x,y]`), native cube sample (`RT==face[faceid]`), wgpu array +
 cube sample, and the data-ordering capstone (`native_array_cube_load_e2e`: real KTX2 array+cube
 files load with file image k landing in backend slice k). Nothing silently dropped — see
-`docs/development/3-4-punchlist.md`.
+`docs/archive/punchlists/3-4-punchlist.md`.
 
 ### Added — Phase AA (array textures + cubemaps)
 - **AA.0 — API + slots.** `gpu_texture_create_2d_array(ctx,w,h,fmt,layers)` /
@@ -101,7 +101,7 @@ files load with file image k landing in backend slice k). Nothing silently dropp
 ### Deferred to 3.4.1 (tracked, not dropped)
 - **AA.4** native compressed/tiled arrays (BC-only, addrlib-gated); **AA.3c** wgpu draw-time layer
   selection; and the **`F64_HALF`/`F64_TWO` ↔ `math` stdlib collision** (the attn11 block — namespace
-  to `MABDA_F64_*`, filing `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`).
+  to `MABDA_F64_*`, filing `docs/development/issues/archived/2026-06-19-f64-half-two-collide-with-math-stdlib.md`).
 
 ## [3.3.0] — 2026-06-19
 
@@ -120,7 +120,7 @@ texture, sampled through the public render path, and pixel-verified `RT[x,y] == 
 Arrays/cubemaps are parsed-and-rejected-loud (real support is v3.4 / Phase AL-ARRAY); KTX2
 supercompression (BasisLZ/Zstd/ZLIB) fails loud (no decoder); native *sampling* of compressed mips
 awaits the tiled compressed-mipped path (linear storage/upload ships now). Nothing silently dropped —
-see `docs/development/3-3-punchlist.md`.
+see `docs/archive/punchlists/3-3-punchlist.md`.
 
 ### Added — Phase AL (asset loading)
 - **AL.0 — format mapping** (`src/asset_format.cyr`): `mabda_texfmt_from_vk_format` (KTX2 VkFormat)

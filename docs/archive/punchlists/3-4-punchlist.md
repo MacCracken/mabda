@@ -295,7 +295,7 @@ without them):
    dist bundle now exports zero standalone `F64_HALF`/`F64_TWO`, so a consumer of
    both `math` + `lib/mabda.cyr` no longer collides. (The other `F64_*` don't
    shadow `math`; the benign `color_rgb` duplicate is separate.) Filing marked
-   RESOLVED: [`…/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
+   RESOLVED: [`…/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](../../development/issues/archived/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
    attn11 unblocks once it deps mabda 3.4.1.
 
 ---

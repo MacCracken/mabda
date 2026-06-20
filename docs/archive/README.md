@@ -22,6 +22,9 @@ analysis, kept for post-mortem context. Newest arc first.
 
 | Arc / Date | Title                                                                                       | Shipped in |
 |------------|--------------------------------------------------------------------------------------------|------------|
+| v3.4 (2026-06-19) | [Array textures + cubemaps](proposals/v3.4-array-cube-textures.md)                   | v3.4.0–v3.4.1 (Phase AA) |
+| v3.3 (2026-06-19) | [Asset loading](proposals/v3.3-asset-loading.md)                                     | v3.3.0 (Phase AL) |
+| v3.3 (2026-06-19) | [chitra PNG decoder package](proposals/v3.3-chitra-png-decoder-package.md)            | v3.3.0 (chitra 0.1.0) |
 | v3.2 (2026-06-15) | [Render-graph multi-queue](proposals/v3.2-render-graph-multiqueue.md)                | v3.2.13–v3.2.14 (Phase R) |
 | v3.2 (2026-06-15) | [f64 compute](proposals/v3.2-f64-compute.md)                                         | v3.2.12 (Phase F) |
 | v3.2 (2026-06-15) | [SPIR-V → GFX9 native compiler](proposals/v3.2-spirv-gfx9-native-lowering.md)        | v3.2.5–v3.2.11 (Phase N) |
@@ -53,6 +56,8 @@ record of what shipped is `CHANGELOG.md`.
 | v3.0  | [`3-0-rc-4-punchlist.md`](punchlists/3-0-rc-4-punchlist.md)    | 3.0.0-rc.4 (24 h soak) |
 | v3.1  | [`3-1-punchlist.md`](punchlists/3-1-punchlist.md)             | 3.1.0 (mipmaps) + 3.1.1 (multi-queue), 2026-06-15 |
 | v3.2  | [`3-2-punchlist.md`](punchlists/3-2-punchlist.md)             | 3.2.0 → 3.2.14 (texture & shader breadth: compressed textures, native sampling, SPIR-V + native SPIR-V→GFX9 compiler, f64, render-graph multi-queue), 2026-06-15 → 2026-06-19 |
+| v3.3  | [`3-3-punchlist.md`](punchlists/3-3-punchlist.md)             | 3.3.0 (asset loading — DDS/KTX2 in-tree + PNG via chitra + sniffer), 2026-06-19 |
+| v3.4  | [`3-4-punchlist.md`](punchlists/3-4-punchlist.md)             | 3.4.0 (array textures + cubemaps) + 3.4.1 (BC tiled arrays, wgpu draw-time layer, MABDA_F64_* fix), 2026-06-19 |
 
 > v3.1's punchlist deferred items to **3.1.2** (TRANSFER→SDMA ring flip +
 > public buffer-copy API; render-graph multi-queue scheduling) — these all

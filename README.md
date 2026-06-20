@@ -2,8 +2,8 @@
 
 **Mabda** (Arabic: مبدأ — origin, principle, starting point) is the GPU
 foundation layer for the [AGNOS](https://github.com/MacCracken) ecosystem.
-It wraps the wgpu-native C API and provides shared GPU infrastructure
-that all AGNOS GPU consumers build upon.
+It provides shared GPU infrastructure — over a dual backend (wgpu-native
+plus a pure-Cyrius native AMD path) — that all AGNOS GPU consumers build upon.
 
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
@@ -43,7 +43,13 @@ hand-rolled by consumers — GLSL.std.450 Exp/Log/Pow are f32-only). 3.2.13–3.
 (per-queue batches + cross-queue fence-edge classification) + a native executor that runs
 nodes on distinct HW rings (GFX/COMPUTE) ordered by in-CS timeline waits, with per-node IB
 staging; HW-verified on Cezanne (a compute→render cross-queue graph, distinct rings, no CPU
-stall). wgpu stays serialized-equivalent. This closes the v3.2.x arc. See the CHANGELOG.)
+stall). wgpu stays serialized-equivalent — this closed the v3.2.x arc. 3.3.0 adds **asset
+loading** — KTX2/DDS parsers in-tree + PNG via the new pure-Cyrius `chitra` package + a
+magic-byte sniffer (native PNG path HW-verified; 1 CRITICAL parser bug found + fixed pre-cut).
+3.4.0 adds **array textures + cubemaps** (Phase AA) — create / upload-per-layer-or-face /
+sample on both backends + DDS/KTX2 array+cube load, HW-verified end-to-end on Cezanne; 3.4.1
+clears the v3.4.1 backlog — native **BC (compressed) tiled arrays** + **wgpu draw-time layer
+selection** (both HW-verified) + a `MABDA_F64_*` stdlib symbol-collision fix. See the CHANGELOG.)
 
 ## Features
 
@@ -133,7 +139,7 @@ Consumer (soorat, bijli, ...)
     ↓
   mabda (GPU abstraction)
     ↓
-  wgpu-native C API (via function table + C launcher)        ← shipping today (v2.5.x)
+  wgpu-native C API (via function table + C launcher)        ← the wgpu path (still the v3.x default)
     ↓
   Vulkan / Metal / DX12
 ```
@@ -166,7 +172,7 @@ roadmap is in [docs/development/roadmap.md](docs/development/roadmap.md).
 | Backend           | Vendors                  | Status                             |
 |-------------------|--------------------------|------------------------------------|
 | `wgpu`            | AMD, NVIDIA, Intel (anything wgpu-native + Vulkan/Metal/DX12 supports) | **Default. Shipping.** All v2.x consumers run here. Retires per-chipset as each vendor's native path matures. |
-| `native` (AMD)    | AMD                      | **In development (v3.0, branch `v3`).** Compute dispatch verified end-to-end on AMD Cezanne (gfx90c, GFX9). Other GFX families (GFX10/11/12, RDNA*) not yet exercised — same amdgpu / PM4 / DRM ioctl path, but each generation needs its own bring-up. |
+| `native` (AMD)    | AMD                      | **Shipping (v3.0 GA + the v3.1–v3.4 arcs).** Compute, textures (incl. BC-compressed + arrays/cubes), render, multi-queue, a SPIR-V→GFX9 f64 compiler, and KMS present all verified end-to-end on AMD Cezanne (gfx90c, GFX9). Other GFX families (GFX10/11/12, RDNA*) not yet exercised — same amdgpu / PM4 / DRM ioctl path, but each generation needs its own bring-up. |
 | `native` (NVIDIA) | NVIDIA                   | **Scoped to v4.0.** Different submission path entirely (nouveau / nvgpu, no PM4, different ISA). NVIDIA consumers stay on `wgpu` until v4.0 ships. |
 | `native` (Intel)  | Intel                    | **Tentative for v5.0.** Different submission path (i915 / Xe, no PM4, Gen ISA). Intel consumers stay on `wgpu` until v5.0 ships. |
 
@@ -199,7 +205,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.23+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.29+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -210,7 +216,7 @@ cyrius deps
 # Full gate sweep (lint, fmt, vet, version-check, distlib-sync, tests, bench)
 make test-all
 
-# CPU-only unit suite (4079 assertions across 16 domain files)
+# CPU-only unit suite (4522 assertions across 17 domain files)
 make test            # globs tests/tcyr/*.tcyr (count via scripts/count-test-assertions.sh)
 
 # CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
@@ -232,11 +238,11 @@ mabda/
 ├── src/                 49 modules (30 @public + 19 @internal FFI/backend)
 │                        (src/lib.cyr is the single include chain)
 ├── tests/
-│   ├── tcyr/                     16 functionality-named domain suites — core,
+│   ├── tcyr/                     17 functionality-named domain suites — core,
 │   │                            buffer, compute, texture, graphics, render,
 │   │                            backend, caches, surface, native, kms, queue,
-│   │                            compiler_{encode,lower,backend,compile}
-│   │                            (4079 asserts; `make test` globs them all)
+│   │                            asset_load, compiler_{encode,lower,backend,compile}
+│   │                            (4522 asserts; `make test` globs them all)
 │   └── bcyr/mabda.bcyr           CPU-only benchmark harness (9 benches)
 ├── programs/            GPU integration programs (wgpu + native) + dev spikes + `benchmarks.cyr`
 │   ├── smoke.cyr                Link-check — `cyrius build` entry point
@@ -261,7 +267,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              3.2.14
+├── VERSION              3.4.1
 └── CHANGELOG.md
 ```
 
