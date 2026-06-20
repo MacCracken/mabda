@@ -10,8 +10,8 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 6.2.28+ (`cyrius.cyml: cyrius = "6.2.28"`)
-- **Version**: 3.4.0 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Language**: Cyrius 6.2.29+ (`cyrius.cyml: cyrius = "6.2.29"`)
+- **Version**: 3.4.1 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -213,6 +213,20 @@ detection.
   file image k → slice k). Adversarially reviewed pre-cut (0 critical). **Deferred to 3.4.1:** AA.4
   native compressed/tiled arrays, AA.3c wgpu draw-time layer, and the `F64_HALF`/`F64_TWO`↔`math`
   collision (the attn11 block → namespace `MABDA_F64_*`). Toolchain 6.2.23→6.2.28.
+  **3.4.1** → clears the v3.4.1 backlog (the three items 3.4.0 deferred), all landed.
+  **(1)** the **attn11 `F64_HALF`/`F64_TWO` ↔ `math` stdlib collision** (the first consumer
+  that also deps `math`): `color.cyr`'s two runtime-init constants shadowed the stdlib's
+  compile-time ones — "last wins" silently zeroed a consumer's f64 math — renamed to
+  `MABDA_F64_HALF`/`MABDA_F64_TWO` (the dist now exports zero standalone `F64_HALF`/`F64_TWO`;
+  the other `F64_*` don't shadow `math`). **(2)** **AA.3c wgpu draw-time layer selection**
+  (HW-verified): `gpu_render_pass_bind_texture_layer` now works on BOTH backends — the wgpu draw
+  stages a layer uniform + a 3-entry bind group (tex@0/sampler@1/layer@2) the array/cube WGSL reads
+  as the sample array_index. **(3)** **AA.4 native compressed (BC) tiled arrays** (HW-verified): an
+  AA.4a research workflow found `SW_64KB_S` is a **2D** swizzle, so each slice is an independent
+  64KiB-aligned 2D tiling — slice k at `base + k*tiled_size`, no addrlib port; extends the
+  single-slice TS.7 tiled path (create branches compressed→tiled, the SDMA copy/packet take a
+  `slice` param, `write_layer_level` routes tiled→per-slice L2T); `native_bc_array_e2e` (BC1
+  2-slice). Suite 4494→4522. Toolchain 6.2.28→6.2.29. Nothing from the v3.4 arc remains deferred.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -238,7 +252,7 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.4.0, 2026-06-19)
+## Current State (post 3.4.1, 2026-06-19)
 
 - **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
@@ -256,7 +270,7 @@ doesn't change between paths.
   — no new module; 3.3.0 Phase AL added two modules — `asset_format.cyr` (format-id
   mapping) + `asset_load.cyr` (DDS/KTX2 parsers + the PNG/sniffer load API) — and
   the `chitra` dep at `lib/chitra.cyr`).
-- **Tests**: **4494 CPU-only assertions** across **17 functionality-named
+- **Tests**: **4522 CPU-only assertions** across **17 functionality-named
   domain files** under `tests/tcyr/` (3.3.0 added `asset_load.tcyr`, the 17th;
   3.4.0 Phase AA grew backend/native/asset_load in place — no new file;
   reorganized 2026-06-15 from the old
@@ -265,7 +279,7 @@ doesn't change between paths.
   mirroring the `src/` domains; `make test` globs them all.
   **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
   `make test | grep` (or `awk`) treats it as binary and **silently drops
-  texture's 207** — the naive total reads **4287**, not the true **4494**. Use
+  texture's 207** — the naive total reads **4315**, not the true **4522**. Use
   `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
   accurate count; the trap has fooled humans and review agents alike.
   Domain breakdown:
@@ -801,7 +815,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.2.28"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.29"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts

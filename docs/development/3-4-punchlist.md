@@ -267,24 +267,36 @@ implementation, not just planning.
 Three items roll to **3.4.1** (the core array/cube capability ships in 3.4.0
 without them):
 
-1. **AA.4 — native 2D-array compressed (tiled) storage + sample.** BC-only,
-   addrlib-gated (the SW_64KB_S slice-stride / `ARRAY_PITCH` / `COPY_TILED
-   copy_d` open question, AA.4a). Niche vs RGBA8 arrays + cubes; high-risk. The
-   array/cube primitives + loaders ship RGBA8/uncompressed in 3.4.0.
-2. **AA.3c — wgpu draw-time layer selection.** `gpu_render_pass_bind_texture_layer`
-   is native-only (the +56 descriptor tail); wgpu returns NOT_IMPLEMENTED. Needs
-   a layer uniform the `texture_2d_array` FS reads + the wgpu `bind_for_sample_layer`
-   filler. (Native is symmetric; wgpu consumers can still sample a fixed layer via
-   their own WGSL `array_index`, as `wgpu_array_sample_e2e` does.)
-3. **`F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the **attn11** block —
-   first consumer that also deps `math`). `src/color.cyr` defines runtime-init
-   `F64_HALF`/`F64_TWO` (= 0 until its init runs) that shadow the `math` stdlib's
-   compile-time constants; "last definition wins" silently zeroes a consumer's f64
-   math (NaN on the non-GPU path). **Fix #1 (preferred): namespace them
-   `MABDA_F64_HALF` / `MABDA_F64_TWO`** (+ the sibling `color_rgb` duplicate →
-   `mabda_color_rgb`). Full filing:
-   [`docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
-   attn11 has a consumer-side workaround (mabda in a separate TU) until this lands.
+1. **[DONE 3.4.1] AA.4 — native 2D-array compressed (tiled) storage + sample.**
+   HW-verified on Cezanne (`native_bc_array_e2e`: BC1 2-slice tiled array, both
+   slices sample correctly). **AA.4a investigation** (research workflow) resolved
+   the open question: `GFX9_SW_MODE_64KB_S = 9` is a **2D** swizzle, so each slice
+   is an independent 64KiB-aligned 2D tiling — slice k sits at the computed byte
+   stride `base + k*tiled_size` (the single-slice footprint), no addrlib port, not
+   HW-blocked. `ARRAY_PITCH (W5[13:16]) = 0` confirmed correct (non-mipped). Three
+   code changes: `_native_create_layered_sampleable` branches compressed → tiled
+   (`surf_size = tiled_size*slices`, SW_64KB_S 2D_ARRAY/CUBE T#); the tiled copy +
+   packet builder take a `slice` param (`tiled_va + slice*tiled_size`);
+   `write_layer_level` unblocks tiled → per-slice L2T. Slice-offset math CPU-guard
+   (`test_native_bc_array_tiled_copy_slice_offset`); +8 asserts (suite 4514→4522).
+   BC array `.dds`/`.ktx2` flow through the 3.4.0 loaders (per-image
+   `write_layer_level`) with no parser change.
+2. **[DONE 3.4.1] AA.3c — wgpu draw-time layer selection.** HW-verified on
+   Cezanne (wgpu/Vulkan). `_backend_wgpu_texture_bind_for_sample_layer` stashes the
+   layer on the pass (+40, sentinel −1 = none); the draw stages a 16-B uniform
+   buffer + builds a 3-entry bind group (tex@0, sampler@1, layer-uniform@2) via the
+   new `wgpu_texture_layer_bind_group_descriptor`; the consumer's array/cube WGSL
+   reads `@binding(2)` as the `textureSample` array_index. wgpu slot wired (was
+   null). `wgpu_array_layer_select_e2e`: `bind_texture_layer(K)` picks the slice per
+   draw (K=1,3 verified). +20 CPU asserts (backend 532→552; suite 4494→4514).
+3. **[DONE 3.4.1] `F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the
+   **attn11** block). Fix #1 applied: `color.cyr`'s two shadowing constants
+   renamed to `MABDA_F64_HALF` / `MABDA_F64_TWO` (defs + init + all usages); the
+   dist bundle now exports zero standalone `F64_HALF`/`F64_TWO`, so a consumer of
+   both `math` + `lib/mabda.cyr` no longer collides. (The other `F64_*` don't
+   shadow `math`; the benign `color_rgb` duplicate is separate.) Filing marked
+   RESOLVED: [`…/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
+   attn11 unblocks once it deps mabda 3.4.1.
 
 ---
 

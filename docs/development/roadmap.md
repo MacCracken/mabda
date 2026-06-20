@@ -117,6 +117,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.4.1](../../CHANGELOG.md#341--2026-06-19) | v3.4.1 backlog cleared — native BC tiled arrays + wgpu draw-time layer (both HW-verified on Cezanne) + the attn11 `F64_*`↔`math` stdlib collision fix (namespace `MABDA_F64_*`) |
 | [3.4.0](../../CHANGELOG.md#340--2026-06-19) | Array textures + cubemaps (Phase AA) — create/upload/sample on both backends + DDS/KTX2 array+cube load; HW-verified end-to-end on Cezanne (incl. the data-ordering capstone) |
 | [3.3.0](../../CHANGELOG.md#330--2026-06-19) | Asset loading (Phase AL) — DDS + KTX2 loaders (in mabda) + PNG via the chitra package + magic-byte sniffer; native PNG path HW-verified, 1 CRITICAL parser bug found+fixed pre-cut |
 | [3.2.14](../../CHANGELOG.md#3214--2026-06-19) | Render-graph multi-queue executor (Phase R) — native nodes on distinct rings, HW-verified; **closes the v3.2.x arc** |
@@ -238,12 +239,12 @@ a direction), the DDS/KTX2 array+cube loaders, and the data-ordering capstone
 (file image k → backend slice k). Layered *render* (rendering INTO layers/faces)
 stayed OUT OF SCOPE (sample-one-layer-per-draw); ETC2/ASTC arrays stay HW-blocked.
 
-**Deferred to 3.4.1 (tracked, not dropped — see the punchlist):** **AA.4** native
-compressed/tiled arrays (BC-only, addrlib slice-stride gate); **AA.3c** wgpu
-draw-time layer selection (native-only today via the +56 tail); and the
-**`F64_HALF`/`F64_TWO` ↔ `math` stdlib collision** surfaced by the first consumer
-(attn11) that also deps `math` — namespace mabda's f64 constants to `MABDA_F64_*`
-(filing `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`).
+**Shipped in 3.4.1 (the v3.4.1 backlog, all landed):** **AA.4** native compressed/
+tiled arrays (BC, HW-verified — 64KB_S is a 2D swizzle so slice k is at
+`base + k*tiled_size`, no addrlib port); **AA.3c** wgpu draw-time layer selection
+(HW-verified, a layer uniform the array/cube WGSL reads); and the **`F64_HALF`/
+`F64_TWO` ↔ `math` stdlib collision** (the attn11 block) — namespaced to
+`MABDA_F64_*`, attn11 unblocked. Nothing from the v3.4 arc remains deferred.
 
 ---
 

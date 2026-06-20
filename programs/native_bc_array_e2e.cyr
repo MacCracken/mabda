@@ -1,0 +1,184 @@
+# programs/native_bc_array_e2e.cyr — v3.4.1 AA.4 (native compressed/tiled arrays)
+#
+# The AA.4 capstone: a BLOCK-COMPRESSED (BC1) 2D ARRAY, tiled per-slice on GFX9,
+# sampled per slice on Cezanne. Proves the whole AA.4 chain end-to-end:
+#   - create_2d_array(BC1, 2 slices) -> SW_64KB_S tiled, slice k at base+k*tiled_size
+#     (64KB_S is a 2D swizzle, so each slice is an independent 2D tiling — no
+#     addrlib depth interleave; the slice stride is the single-slice footprint).
+#   - write_layer_level(layer=k) -> the new per-slice L2T copy (tiled_va + k*tiled_size).
+#   - image_sample DA=1 with (0,0,k) -> the 2D_ARRAY T# (DEPTH=slices-1) reads slice k.
+# If the per-slice L2T placement OR the array T# slice stride were wrong, slice 1
+# would sample garbage — so a correct slice-1 color is the stride proof. Each slice
+# is a solid BC1 endpoint color (index 0 -> endpoint0 verbatim, the TS.7 trick), so
+# the CPU 565->RGBA8 expansion is the exact HW oracle.
+#
+# slice 0 = red (565 0xF800), slice 1 = blue (565 0x001F). Reuses the cube
+# image_sample FS (DA=1, 3 coords) — for a 2D_ARRAY T# the 3rd coord is the slice.
+#
+# Exit codes: 0 pass; 1 ctx; 2 vs/fs bo; 3 create; 4 write; 5 sampler; 6 fs/pipe;
+#   8 draw; 9 mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_hex32(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = (v / (1 << ((7 - i) * 4))) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+# RGB565 -> RGBA8 with the TA's high-bit-replicate (the exact HW expansion).
+fn expand565(c): i64 {
+    var r5 = (c >> 11) & 0x1F;
+    var g6 = (c >> 5) & 0x3F;
+    var b5 = c & 0x1F;
+    var r = (r5 << 3) | (r5 >> 2);
+    var g = (g6 << 2) | (g6 >> 4);
+    var b = (b5 << 3) | (b5 >> 2);
+    return (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (0xFF << 24);
+}
+
+# Fill `blocks` (BX*BY BC1 blocks) so every texel decodes to c565: endpoint0 = c565,
+# c1 = 0 (c0 > c1 -> 4-color mode), all 16 index bytes 0 -> every texel = endpoint0.
+fn _fill_bc1_solid(blocks, BX, BY, c565): i64 {
+    var n = BX * BY;
+    var i = 0;
+    while (i < n) {
+        var blk = blocks + i * 8;
+        store8(blk + 0, c565 & 0xFF);          # c0 lo
+        store8(blk + 1, (c565 >> 8) & 0xFF);   # c0 hi
+        store8(blk + 2, 0);                     # c1 lo
+        store8(blk + 3, 0);                     # c1 hi
+        store8(blk + 4, 0);                     # index bytes (all 0 -> endpoint0)
+        store8(blk + 5, 0);
+        store8(blk + 6, 0);
+        store8(blk + 7, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Sample array slice `slice` (inline-float src_z) + verify the RT is `want`.
+fn _sample_slice(ctx, vs_mod, fs_handle, fs_addr, fs_va, tex, samp, src_z, want): i64 {
+    var W = 64;
+    var H = 64;
+    memset(fs_addr, 0, 4096);
+    # cube image_sample FS (DA=1); (s,t,slice) = (0,0,src_z). For a 2D_ARRAY T#
+    # the 3rd coord is the array slice; s=t=0 reads texel (0,0) (solid slice).
+    native_gfx9_shader_cube_sample_fs(fs_addr, 0,
+    GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_0_0, src_z);
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+    var pipe = gpu_render_pipeline_create(ctx, vs_mod, &fs_mod, 0);
+    if (pipe == 0) { return 6; }
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { return 6; }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, W * H * 4);
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return 6; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) {
+        gpu_render_pass_end(ctx, pass); return 5;
+    }
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return 8; }
+    var got = load32(rt_addr + (20 * W + 30) * 4);
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    if (got != want) {
+        print_cstr("MISMATCH got="); print_hex32(got);
+        print_cstr(" want="); print_hex32(want); print_cstr("\n");
+        return 9;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native BC1 array sample e2e (v3.4.1 AA.4)\n");
+    print_cstr("----------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { print_cstr("FAIL: vs bo\n"); return 2; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr   = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n"); return 2; }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { print_cstr("FAIL: fs bo\n"); return 2; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr   = load64(&fs_bo + 8);
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n"); return 2; }
+    print_cstr("PASS: VS + array image_sample FS BOs\n");
+
+    # BC1 16x16 (4x4 blocks, 8 B each = 128 B/slice), 2 slices.
+    var DIM = 16;
+    var BX = 4;
+    var BY = 4;
+    var per_slice = BX * BY * 8;
+    var tex = gpu_texture_create_2d_array(ctx, DIM, DIM, MABDA_TEXFMT_BC1, 2);
+    if (tex == 0) { print_cstr("FAIL: create_2d_array BC1\n"); return 3; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_64KB_S) {
+        print_cstr("FAIL: BC array not tiled\n"); return 3; }
+
+    var slice0 = alloc(per_slice);
+    var slice1 = alloc(per_slice);
+    var c0_565 = 0xF800;   # red
+    var c1_565 = 0x001F;   # blue
+    _fill_bc1_solid(slice0, BX, BY, c0_565);
+    _fill_bc1_solid(slice1, BX, BY, c1_565);
+    if (gpu_texture_write_layer_level(ctx, tex, 0, 0, slice0, per_slice) != 0) {
+        print_cstr("FAIL: write slice 0\n"); return 4; }
+    if (gpu_texture_write_layer_level(ctx, tex, 1, 0, slice1, per_slice) != 0) {
+        print_cstr("FAIL: write slice 1\n"); return 4; }
+    print_cstr("PASS: BC1 2-slice tiled array uploaded (per-slice L2T)\n");
+
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { print_cstr("FAIL: sampler\n"); return 5; }
+
+    # slice 1 FIRST (the stride risk: if base+1*tiled_size is wrong, this samples garbage).
+    var r1 = _sample_slice(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex, samp,
+    GFX9_INLINE_F32_1_0, expand565(c1_565));
+    if (r1 != 0) { print_cstr("FAIL: slice 1 sample\n"); return r1; }
+    var r0 = _sample_slice(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex, samp,
+    GFX9_INLINE_F32_0_0, expand565(c0_565));
+    if (r0 != 0) { print_cstr("FAIL: slice 0 sample\n"); return r0; }
+    print_cstr("PASS: RT == decoded BC1 color for slice 1 (blue) and slice 0 (red)\n");
+
+    gpu_texture_release(ctx, tex);
+    native_gem_va_unmap(fd, fs_handle, fs_va, 4096);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, 4096);
+    native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
+    gpu_context_release(ctx);
+    print_cstr("OK — native BC compressed tiled arrays live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

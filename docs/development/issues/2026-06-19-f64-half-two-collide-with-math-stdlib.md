@@ -1,5 +1,19 @@
 # Issue: `color.cyr` `F64_HALF` / `F64_TWO` collide with the Cyrius `math` stdlib (silent NaN on consumers' non-GPU path)
 
+**RESOLVED — mabda 3.4.1 (2026-06-19).** Fix #1 applied: `color.cyr`'s
+`F64_HALF` / `F64_TWO` (the two that shadow the `math` stdlib) renamed to
+**`MABDA_F64_HALF` / `MABDA_F64_TWO`** — defs, init, and all usages (core.tcyr,
+graphics.tcyr, mabda.bcyr, benchmarks.cyr). `dist/mabda.cyr` now exports **zero**
+standalone `F64_HALF`/`F64_TWO`, so a consumer including both `lib/math.cyr` and
+`lib/mabda.cyr` no longer gets the conflicting-value redefinition. (mabda's other
+`F64_*` — `F64_0`/`F64_1`/`F64_255`/`F64_LUM_*`/`F64_CB_*` — do NOT shadow any
+`math` symbol, so they were left as-is. The unrelated benign `color_rgb` duplicate
+is tracked separately if it ever bites.) attn11 can drop its separate-TU
+workaround once it deps mabda 3.4.1.
+
+---
+
+
 **Discovered:** 2026-06-19 (wiring mabda 3.3.0's native-AMD SPIR-V f64 compute path into **attn11** — first consumer that also depends on the `math` stdlib)
 **Component:** `src/color.cyr` — globals `F64_HALF` (L22) / `F64_TWO` (L23), runtime-initialised in its init fn (L44–45); amalgamated into `dist/mabda.cyr` (L222–223, 244–245).
 **Severity:** High for any consumer that also uses the Cyrius `math` stdlib. Unlike the benign `duplicate fn 'color_rgb' (last definition wins)` warning, here the two definitions **conflict in value**, so "last wins" silently corrupts the consumer's f64 math.

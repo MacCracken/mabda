@@ -211,6 +211,16 @@ build/wgpu_array_sample_e2e: build/wgpu_array_sample_e2e.o deps/wgpu_main.o
 test-wgpu-array-sample-e2e: build/wgpu_array_sample_e2e
 	./build/wgpu_array_sample_e2e
 
+# v3.4.1 AA.3c — wgpu draw-time layer selection: a FIXED array WGSL reads a
+# @binding(2) uniform; gpu_render_pass_bind_texture_layer picks the slice per draw.
+build/wgpu_array_layer_select_e2e: build/wgpu_array_layer_select_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_array_layer_select_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-array-layer-select-e2e
+test-wgpu-array-layer-select-e2e: build/wgpu_array_layer_select_e2e
+	./build/wgpu_array_layer_select_e2e
+
 # v3.4 AA.5c — wgpu cubemap sample: create a cube, upload 6 faces, sample a face
 # by direction via a texture_cube WGSL FS, verify the RT.
 build/wgpu_cube_sample_e2e: build/wgpu_cube_sample_e2e.o deps/wgpu_main.o
@@ -721,6 +731,15 @@ build/native_array_cube_load_e2e: programs/native_array_cube_load_e2e.cyr src/*.
 .PHONY: test-native-array-cube-load-e2e
 test-native-array-cube-load-e2e: build/native_array_cube_load_e2e
 	./build/native_array_cube_load_e2e
+
+# v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
+build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_bc_array_e2e.cyr $@
+
+.PHONY: test-native-bc-array-e2e
+test-native-bc-array-e2e: build/native_bc_array_e2e
+	./build/native_bc_array_e2e
 
 # v3.2 TS.6 — SDMA tiling probe: L2T->T2L round-trip proves the SW_64KB_S
 # COPY_TILED_SUB_WINDOW path works on Cezanne. HW-gated.

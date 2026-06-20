@@ -13,6 +13,42 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.1] — 2026-06-19
+
+**v3.4.1 backlog — the three items deferred from 3.4.0, all landed.** Native compressed
+(BC) tiled arrays, wgpu draw-time layer selection, and the first-consumer (attn11)
+`F64_*`↔`math` stdlib symbol collision. Two are HW-verified on Cezanne; the third unblocks
+attn11's GPU integration.
+
+### Fixed
+- **`F64_HALF` / `F64_TWO` collided with the Cyrius `math` stdlib** (the **attn11** block —
+  first consumer that also deps `math`). `src/color.cyr`'s two runtime-init constants shadowed
+  the stdlib's compile-time `F64_HALF`/`F64_TWO`; "last definition wins" silently zeroed a
+  consumer's f64 math (NaN on the non-GPU path). Renamed to **`MABDA_F64_HALF` / `MABDA_F64_TWO`**
+  (defs + init + all usages); `dist/mabda.cyr` now exports zero standalone `F64_HALF`/`F64_TWO`, so
+  a consumer of both `math` and `lib/mabda.cyr` no longer collides. The other `F64_*`
+  (`F64_0`/`F64_1`/`F64_255`/`F64_LUM_*`/`F64_CB_*`) don't shadow `math` and are unchanged. Filing:
+  `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`.
+
+### Added
+- **AA.3c — wgpu draw-time layer selection (HW-verified on Cezanne via wgpu/Vulkan).**
+  `gpu_render_pass_bind_texture_layer` now works on **both** backends. The wgpu draw stages a
+  16-byte uniform buffer + builds a 3-entry bind group (texture@0, sampler@1, layer-uniform@2) via
+  the new `wgpu_texture_layer_bind_group_descriptor`; the consumer's array/cube WGSL reads
+  `@binding(2)` as the `textureSample` array_index. wgpu `bind_for_sample_layer` slot wired (was
+  NOT_IMPLEMENTED). `wgpu_array_layer_select_e2e`.
+- **AA.4 — native compressed (BC) tiled arrays (HW-verified on Cezanne).** BC1/3/4/5/7 2D array
+  textures: tiled per-slice (SW_64KB_S), uploaded + sampled per slice. An AA.4a research workflow
+  established that 64KB_S is a **2D** swizzle, so each slice is an independent 64KiB-aligned 2D
+  tiling — slice k at `base + k*tiled_size` (no addrlib port). Extends the single-slice TS.7 tiled
+  path: `_native_create_layered_sampleable` branches compressed → tiled; the SDMA tiled copy +
+  packet builder take a `slice` param; `write_layer_level` routes tiled uploads to a per-slice L2T.
+  BC array `.dds`/`.ktx2` flow through the 3.4.0 loaders unchanged. `native_bc_array_e2e`
+  (BC1 2-slice array, both slices pixel-correct). Suite 4494 → 4522.
+
+### Changed
+- Toolchain pin 6.2.28 → **6.2.29**.
+
 ## [3.4.0] — 2026-06-19
 
 **Array textures + cubemaps — Phase AA (AL-ARRAY), HW-verified end-to-end on Cezanne.**
