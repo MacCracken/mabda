@@ -13,6 +13,60 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.0] — 2026-06-19
+
+**Array textures + cubemaps — Phase AA (AL-ARRAY), HW-verified end-to-end on Cezanne.**
+The v3.3 DDS/KTX2 loaders parsed `arraySize`/`faceCount`/`layerCount` and failed loud; v3.4
+makes them real. **2D array textures** and **cubemaps** now create, upload per layer/face, sample,
+and load from `.dds`/`.ktx2` — on **both** backends (native AMD + wgpu) — all additively (no
+existing consumer call signature changes). Native arrays sample via an `image_load DA=1` + slice
+VADDR; native cubes via `image_sample DA=1` with an `(s, t, FACEID)` VADDR (the HW finding: GFX9
+takes a face *index*, not a raw direction — the consumer derives it via `v_cube*`); wgpu uses
+2DArray/Cube views + `texture_2d_array`/`texture_cube` WGSL. The loaders flip their array/cube
+rejects to per-image uploads with the 3.3.0 overflow-safety audit carried forward (the per-image
+split now has both divisor and multiplier from untrusted headers). **HW-verified on Cezanne**: native
+array sample (`RT[x,y]==array[layer,x,y]`), native cube sample (`RT==face[faceid]`), wgpu array +
+cube sample, and the data-ordering capstone (`native_array_cube_load_e2e`: real KTX2 array+cube
+files load with file image k landing in backend slice k). Nothing silently dropped — see
+`docs/development/3-4-punchlist.md`.
+
+### Added — Phase AA (array textures + cubemaps)
+- **AA.0 — API + slots.** `gpu_texture_create_2d_array(ctx,w,h,fmt,layers)` /
+  `gpu_texture_create_cube(ctx,size,fmt,mip_count)` / `gpu_texture_write_layer_level(ctx,tex,layer,
+  level,src,n)` / `gpu_render_pass_bind_texture_layer(...,layer)` + `gpu_caps_native_texture_array`
+  / `_cube`. 4 new Backend slots (`BACKEND_SIZE` 296→328); `MABDA_MAX_TEXTURE_ARRAY_LAYERS = 256`;
+  a `slice_count` field on the NativeTexture (`+60` pad, is-cube flag in bit 31).
+- **AA.1/AA.2 — native 2D arrays.** `native_gfx9_image_descriptor_typed` (T# `TYPE` 2D→2D_ARRAY/CUBE,
+  `DEPTH`=slice−1; the plain 2D builder is now a byte-identical wrapper); LINEAR per-slice create +
+  upload; the array `image_load` FS (`DA`, 3rd VADDR = layer from the descriptor tail). HW-verified.
+- **AA.3 — wgpu 2D arrays.** `depthOrArrayLayers` + 2DArray view + writeTexture `origin.z`; a
+  `texture_2d_array` WGSL FS. HW-verified (wgpu via Vulkan, same Cezanne silicon).
+- **AA.5 — cubemaps (both backends).** Native cube = a 6-slice array (TYPE=CUBE); the cube
+  `image_sample` FS (`(s,t,faceid)`); a cube-aware bind auto-selects `unnorm=0`. wgpu cube
+  (Cube view + `texture_cube` WGSL, direction-sampled). HW-verified.
+- **AA.6 — DDS/KTX2 array+cube loaders.** `_asset_per_image_size` (overflow-safe per-image split);
+  KTX2 (mip-outer/image-inner) + DDS (surface-major) flip their array/cube rejects to per-image
+  `write_layer_level`; cube-array, array>MAX, mipped-multi-image, partial-cube all rejected loud.
+- **AA.7a — data-ordering HW capstone.** `programs/native_array_cube_load_e2e.cyr` +
+  `tests/assets/load_array4_32.ktx2` / `load_cube_32.ktx2`.
+- **Tests**: array/cube create+dispatch+guards, the typed-descriptor + FS byte oracles
+  (llvm-mc-verified), the per-image-size + loader-orchestration suites — asset_load 138→172,
+  native + backend grown; total CPU asserts **4276 → ~4500**.
+
+### Changed
+- `gpu_caps_native_texture_array` / `_cube` → **1** (HW-verified). Toolchain pin 6.2.23 → **6.2.28**.
+
+### Security
+- The array/cube loaders extend the untrusted-input parsers; the new per-image offset math carries
+  the 3.3.0 overflow-safety audit forward (div-by-zero + divisibility guards; the level span is
+  bounds-checked overflow-safely, so each per-image offset is in-bounds by construction).
+  Adversarially reviewed before the cut — see `docs/audit/2026-06-19-asset-loading-audit.md`.
+
+### Deferred to 3.4.1 (tracked, not dropped)
+- **AA.4** native compressed/tiled arrays (BC-only, addrlib-gated); **AA.3c** wgpu draw-time layer
+  selection; and the **`F64_HALF`/`F64_TWO` ↔ `math` stdlib collision** (the attn11 block — namespace
+  to `MABDA_F64_*`, filing `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`).
+
 ## [3.3.0] — 2026-06-19
 
 **Asset loading — Phase AL, opens the v3.3 arc; native PNG path HW-verified on Cezanne.**

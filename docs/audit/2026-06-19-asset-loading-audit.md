@@ -86,3 +86,41 @@ guard already requires `boff >= 80 + levels*24`, which also rejects negative
   (> 8192) dimensions, which every caller rejects before using it as a size.
 
 No divide/modulo on an attacker-zeroable value was found in the audited paths.
+
+---
+
+## v3.4 addendum (Phase AA — array/cube loaders), 2026-06-19
+
+**Scope:** the v3.4 additions that extend the untrusted-input parsers — the
+per-image split (`_asset_per_image_size`), the array/cube header parsing in
+`_ktx2_parse` / `_dds_parse` (layerCount/faceCount/arraySize/dwCaps2 + the widened
+56/64-byte `out`), the layered loaders (`_ktx2_load_layered` /
+`_dds_load_layered`), and the is-cube flag packed in `slice_count` bit 31
+(`backend_native.cyr`).
+
+**Method:** one read-only adversarial review (Explore agent) over the v3.4 diff,
+same threat model as the 3.3.0 pass (attacker controls bytes + len) — hunting OOB
+reads, integer overflow defeating a bounds check, div-by-zero, the widened-`out`
+stack sizing, the bit-31 mask, and zero/negative face/layer counts reaching
+create/upload.
+
+**Result: 0 CRITICAL, 0 HIGH — the v3.4 array/cube additions are sound.** Verified:
+
+- **`_asset_per_image_size`** guards `total_images <= 0` (div-by-zero), `blen < 0`,
+  and non-divisibility before the divide.
+- **Per-image offset loops** never form `total*per_image` before the check — they
+  use the overflow-safe `total > (len - data_off) / per_image` (DDS) and the
+  level span `boff > len - blen` (KTX2, the 3.3.0 fix reused). Given those, each
+  `boff + img*per_image` (img < total) is in `[boff, boff+blen) ⊆ [0, len)` by
+  construction — no per-image add overflows or reads OOB.
+- **layers/faces** are normalized (`< 1 → 1`), bounded (`> MAX_TEXTURE_ARRAY_LAYERS
+  → reject`), whitelist-gated (faces ∈ {1,6}); `layers*faces ≤ 256*6 = 1536` (no
+  overflow); cube-array + mipped-multi-image + partial-cube all fail loud.
+- **Widened `out`**: every caller's stack `out` matches (DDS 64 B writes ≤ 64,
+  KTX2 56 B writes ≤ 56).
+- **is-cube bit 31**: legitimate slice counts ≤ 256 never set bit 31; the
+  `& 0x7FFFFFFF` mask + `& 0x80000000` test round-trip correctly.
+- **Upload size** is computed from `fmt`+dims (`mabda_texfmt_data_size`), not read
+  from the file, and the backend `write_layer_level` re-checks `n == per_slice`.
+
+No fixes required for the 3.4.0 cut.

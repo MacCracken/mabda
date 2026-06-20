@@ -1,0 +1,95 @@
+# programs/native_array_store_e2e.cyr — v3.4 AA.1b (native 2D-array storage)
+#
+# First HW exercise of the native 2D-ARRAY create + per-slice upload on Cezanne:
+#   1. native ctx.
+#   2. gpu_texture_create_2d_array(64x64, RGBA8, 4 layers) — one real GEM BO of
+#      4 contiguous slices + the 2D_ARRAY T#/S# tail, VA-mapped on the GPU.
+#   3. gpu_texture_write_layer_level fills each layer with a distinct solid color.
+#   4. Read each slice back from the GPU-resident (GTT-mapped) BO and CPU-verify
+#      it landed at base + layer*per_slice, distinct per layer.
+# This proves the create ioctls (BO alloc + VA map) + the per-slice layout on real
+# silicon; SAMPLING the array through the TA (the array image_sample FS) is AA.2.
+#
+# Exit codes: 0 pass; 1 ctx; 2 create; 3 write; 4 verify mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Solid color for layer k: distinct per layer, R in byte 0.
+fn _layer_color(k): i64 {
+    return 0x10203040 + k;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native 2D-array storage e2e (v3.4 AA.1b)\n");
+    print_cstr("----------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+
+    var W = 64;
+    var H = 64;
+    var LAYERS = 4;
+    var per_slice = W * H * 4;
+    var tex = gpu_texture_create_2d_array(ctx, W, H, MABDA_TEXFMT_RGBA8, LAYERS);
+    if (tex == 0) { print_cstr("FAIL: create_2d_array\n"); return 2; }
+    print_cstr("PASS: 4-layer 64x64 RGBA8 array created on GPU\n");
+
+    # Fill each layer with its solid color via write_layer_level.
+    var src = alloc(per_slice);
+    var k = 0;
+    while (k < LAYERS) {
+        var c = _layer_color(k);
+        var i = 0;
+        while (i < W * H) {
+            store32(src + i * 4, c);
+            i = i + 1;
+        }
+        var rc = gpu_texture_write_layer_level(ctx, tex, k, 0, src, per_slice);
+        if (rc != 0) {
+            print_cstr("FAIL: write layer "); print_i64(k);
+            print_cstr(" rc="); print_i64(rc); print_cstr("\n");
+            return 3;
+        }
+        k = k + 1;
+    }
+    print_cstr("PASS: wrote 4 distinct-color layers\n");
+
+    # Read each slice back from the GPU-resident BO at base + layer*per_slice.
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var bad = 0;
+    k = 0;
+    while (k < LAYERS) {
+        var want = _layer_color(k);
+        var slice = addr + k * per_slice;
+        # probe first, middle, last pixel of the slice.
+        var p0 = load32(slice + 0);
+        var pm = load32(slice + (W * H / 2) * 4);
+        var pl = load32(slice + (W * H - 1) * 4);
+        if (p0 != want) { bad = 1; }
+        if (pm != want) { bad = 1; }
+        if (pl != want) { bad = 1; }
+        k = k + 1;
+    }
+    if (bad != 0) { print_cstr("FAIL: slice readback mismatch\n"); return 4; }
+    print_cstr("PASS: each layer reads back distinct + correct at its slice offset\n");
+
+    gpu_texture_release(ctx, tex);
+    gpu_context_release(ctx);
+    print_cstr("OK — native 2D-array storage live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

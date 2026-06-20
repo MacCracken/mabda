@@ -136,7 +136,7 @@ fn _mk_dds_dx10(buf, w, h, mipc, dxgi, misc, arraysize) {
 
 fn test_dds_parse_fourcc() {
     var buf[148];
-    var out[48];
+    var out[64];
     _mk_dds_fourcc(&buf, 64, 32, 1, _DDS_FOURCC_DXT1);
     assert_eq(_dds_parse(&buf, 148, &out), 0, "DXT1 parses");
     assert_eq(load64(&out + 0), MABDA_TEXFMT_BC1, "DXT1 -> BC1");
@@ -153,7 +153,7 @@ fn test_dds_parse_fourcc() {
 
 fn test_dds_parse_dx10() {
     var buf[148];
-    var out[48];
+    var out[64];
     _mk_dds_dx10(&buf, 8, 8, 1, 98, 0, 1);   # DXGI 98 = BC7
     assert_eq(_dds_parse(&buf, 148, &out), 0, "DX10 BC7 parses");
     assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "DXGI 98 -> BC7");
@@ -172,7 +172,7 @@ fn test_dds_parse_dx10() {
 
 fn test_dds_parse_rejects() {
     var buf[148];
-    var out[48];
+    var out[64];
     _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
     store32(&buf + 0, 0x12345678);
     assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "bad magic");
@@ -180,13 +180,20 @@ fn test_dds_parse_rejects() {
     assert_eq(_dds_parse(&buf, 64, &out), GPU_ERR_CONTAINER_PARSE, "truncated (<128)");
     _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT3);
     assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DXT3/BC2 no mabda id");
+    # v3.4 AA.6c — genuine array/cube rejects (full cubes/arrays now LOAD; see
+    # test_dds_parse_array_cube). Partial legacy cube (CUBEMAP bit, not all 6 faces).
     _mk_dds_fourcc(&buf, 64, 64, 1, _DDS_FOURCC_DXT1);
     store32(&buf + 112, _DDSCAPS2_CUBEMAP);
-    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "legacy cubemap rejected");
-    _mk_dds_dx10(&buf, 8, 8, 1, 98, 0, 6);
-    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 arraySize>1 rejected");
-    _mk_dds_dx10(&buf, 8, 8, 1, 98, _DDS_MISC_CUBE, 1);
-    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 cube rejected");
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "partial legacy cube rejected");
+    # DX10 cube-array (cube + arraySize>1) gated.
+    _mk_dds_dx10(&buf, 8, 8, 1, 98, _DDS_MISC_CUBE, 2);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 cube-array gated");
+    # DX10 array beyond MAX layers.
+    _mk_dds_dx10(&buf, 8, 8, 1, 98, 0, 300);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "DX10 array > MAX rejected");
+    # Mipped array (mipc>1 + arraySize>1) — single-level only in v3.4.
+    _mk_dds_dx10(&buf, 8, 8, 4, 98, 0, 4);
+    assert_eq(_dds_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "mipped DDS array rejected");
     _mk_dds_fourcc(&buf, 8, 8, 1, _DDS_FOURCC_DX10);
     assert_eq(_dds_parse(&buf, 128, &out), GPU_ERR_CONTAINER_PARSE, "DX10 w/o DXT10 header");
     _mk_dds_dx10(&buf, 8, 8, 1, 999, 0, 1);
@@ -282,7 +289,7 @@ fn _mk_ktx2_hdr(buf, vk, w, h, levels, scheme, layers, faces) {
 
 fn test_ktx2_parse() {
     var buf[148];
-    var out[48];
+    var out[64];
     _mk_ktx2_hdr(&buf, 145, 64, 32, 1, 0, 0, 1);   # vk 145 = BC7_UNORM
     assert_eq(_ktx2_parse(&buf, 148, &out), 0, "KTX2 BC7 parses");
     assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "vk 145 -> BC7");
@@ -297,7 +304,7 @@ fn test_ktx2_parse() {
 
 fn test_ktx2_parse_rejects() {
     var buf[148];
-    var out[48];
+    var out[64];
     _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 1);
     store32(&buf + 0, 0x12345678);
     assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "bad identifier");
@@ -305,10 +312,16 @@ fn test_ktx2_parse_rejects() {
     assert_eq(_ktx2_parse(&buf, 40, &out), GPU_ERR_CONTAINER_PARSE, "truncated (<80)");
     _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 2, 0, 1);    # scheme 2 = Zstd
     assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "supercompression gated");
-    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 6);    # faces 6 = cubemap
-    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "cubemap rejected");
-    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 2, 1);    # layers 2 = array
-    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "array rejected");
+    # v3.4 AA.6b — genuine array/cube rejects (single cubes/arrays now LOAD; see
+    # test_ktx2_parse_array_cube). Cube-array (layers>1 AND faces==6) gated.
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 2, 6);    # layers 2 + faces 6 = cube-array
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "cube-array gated");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 999, 1);  # layers > MAX
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "array > MAX layers rejected");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 3, 0, 4, 1);    # mipped array (levels 3 + layers 4)
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "mipped KTX2 array rejected");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 3);    # faceCount 3 (not 1 or 6)
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "faceCount 3 rejected");
     _mk_ktx2_hdr(&buf, 9999, 64, 64, 1, 0, 0, 1);   # unmapped vk
     assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "unmapped vk rejected");
     _mk_ktx2_hdr(&buf, 145, 64, 64, 4, 0, 0, 1);    # 4 levels need 80+96=176 bytes
@@ -356,6 +369,21 @@ fn test_ktx2_load_orchestration() {
     store64(&buf3 + 96, 64);                         # ulen = blen
     assert_eq(gpu_texture_load_ktx2(&ctx, &buf3, 168), 0, "huge byteOffset rejected (no overflow OOB)");
     assert_eq(_dds_wl_count, 0, "write_level never reached for OOB byteOffset");
+    return 0;
+}
+
+# --- AA.6a: per-image (array layer / cube face) sizing + overflow-safety ---
+fn test_asset_per_image_size() {
+    # Valid even splits.
+    assert_eq(_asset_per_image_size(64, 1), 64, "1 image -> blen");
+    assert_eq(_asset_per_image_size(384, 6), 64, "6 faces of 64 -> 64");
+    assert_eq(_asset_per_image_size(2048, 8), 256, "8 layers of 256 -> 256");
+    # Unsafe / hostile.
+    assert_eq(_asset_per_image_size(64, 0), 0 - 1, "div-by-zero (0 images) -> -1");
+    assert_eq(_asset_per_image_size(64, 0 - 3), 0 - 1, "negative image count -> -1");
+    assert_eq(_asset_per_image_size(100, 6), 0 - 1, "not evenly divisible -> -1");
+    assert_eq(_asset_per_image_size(0 - 8, 4), 0 - 1, "negative blen -> -1");
+    assert_eq(_asset_per_image_size(0, 6), 0, "0 bytes / 6 -> 0 (degenerate but even)");
     return 0;
 }
 
@@ -471,6 +499,108 @@ fn test_gpu_texture_load_sniffer() {
     return 0;
 }
 
+# --- AA.6b/c: array + cube parse-success + load orchestration ---
+
+fn test_dds_parse_array_cube() {
+    var buf[148];
+    var out[64];
+    # Full legacy cube (CUBEMAP + all 6 face bits) -> faces 6, layers 1.
+    _mk_dds_fourcc(&buf, 16, 16, 1, _DDS_FOURCC_DXT1);
+    store32(&buf + 112, _DDSCAPS2_CUBEMAP | _DDSCAPS2_CUBE_ALLFACES);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "full legacy cube parses");
+    assert_eq(load64(&out + _DDS_OUT_FACES), 6, "legacy cube faces 6");
+    assert_eq(load64(&out + _DDS_OUT_LAYERS), 1, "legacy cube layers 1");
+    # DX10 single cube.
+    _mk_dds_dx10(&buf, 16, 16, 1, 98, _DDS_MISC_CUBE, 1);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DX10 cube parses");
+    assert_eq(load64(&out + _DDS_OUT_FACES), 6, "DX10 cube faces 6");
+    # DX10 array (6 layers, non-cube).
+    _mk_dds_dx10(&buf, 16, 16, 1, 98, 0, 6);
+    assert_eq(_dds_parse(&buf, 148, &out), 0, "DX10 array parses");
+    assert_eq(load64(&out + _DDS_OUT_LAYERS), 6, "DX10 array layers 6");
+    assert_eq(load64(&out + _DDS_OUT_FACES), 1, "DX10 array faces 1");
+    return 0;
+}
+
+fn test_ktx2_parse_array_cube() {
+    var buf[148];
+    var out[64];
+    # Cube (faceCount 6, layerCount 0 -> 1) -> faces 6.
+    _mk_ktx2_hdr(&buf, 145, 16, 16, 1, 0, 0, 6);
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "KTX2 cube parses");
+    assert_eq(load64(&out + 40), 6, "KTX2 cube faces 6");
+    assert_eq(load64(&out + 32), 1, "KTX2 cube layers 1");
+    # Array (layerCount 4, faceCount 1) -> layers 4.
+    _mk_ktx2_hdr(&buf, 145, 16, 16, 1, 0, 4, 1);
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "KTX2 array parses");
+    assert_eq(load64(&out + 32), 4, "KTX2 array layers 4");
+    assert_eq(load64(&out + 40), 1, "KTX2 array faces 1");
+    return 0;
+}
+
+# Mock backend captures for the array/cube load orchestration.
+var _ac_arr_count = 0;
+var _ac_arr_layers = 0;
+var _ac_cube_count = 0;
+var _ac_wll_count = 0;
+fn _ac_arr_cap(ctx, w, h, fmt, layers) {
+    _ac_arr_count = _ac_arr_count + 1;
+    _ac_arr_layers = layers;
+    return 0xA5;
+}
+fn _ac_cube_cap(ctx, size, fmt, mc) {
+    _ac_cube_count = _ac_cube_count + 1;
+    return 0xCB;
+}
+fn _ac_wll_cap(ctx, tex, layer, level, src, n) {
+    _ac_wll_count = _ac_wll_count + 1;
+    return 0;
+}
+
+fn test_dds_load_array_orchestration() {
+    _ac_arr_count = 0;
+    _ac_wll_count = 0;
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY, &_ac_arr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL, &_ac_wll_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    # DX10 RGBA8 array, 16x16, 6 layers: per_image = 1024; data @148; len 148+6144.
+    var buf[6400];
+    _mk_dds_dx10(&buf, 16, 16, 1, 28, 0, 6);   # dxgi 28 = RGBA8, non-cube, 6 layers
+    var tex = gpu_texture_load_dds(&ctx, &buf, 148 + 6 * 1024);
+    assert_eq(tex, 0xA5, "DDS array routed to create_2d_array");
+    assert_eq(_ac_arr_count, 1, "create_2d_array once");
+    assert_eq(_ac_arr_layers, 6, "create_2d_array layers 6");
+    assert_eq(_ac_wll_count, 6, "write_layer_level once per layer (6)");
+    return 0;
+}
+
+fn test_ktx2_load_cube_orchestration() {
+    _ac_cube_count = 0;
+    _ac_wll_count = 0;
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_CUBE, &_ac_cube_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL, &_ac_wll_cap);
+    var ctx[168];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    # KTX2 RGBA8 cube, 16x16, 6 faces: per_face 1024; level blen = 6144 @104.
+    var buf[6400];
+    _mk_ktx2_hdr(&buf, 37, 16, 16, 1, 0, 0, 6);   # vk 37 = RGBA8, faceCount 6
+    store64(&buf + 80, 104);          # level 0 byteOffset (past the 1-entry index)
+    store64(&buf + 88, 6 * 1024);     # byteLength = 6 faces * 1024
+    store64(&buf + 96, 6 * 1024);     # uncompressedByteLength
+    var tex = gpu_texture_load_ktx2(&ctx, &buf, 104 + 6 * 1024);
+    assert_eq(tex, 0xCB, "KTX2 cube routed to create_cube");
+    assert_eq(_ac_cube_count, 1, "create_cube once");
+    assert_eq(_ac_wll_count, 6, "write_layer_level once per face (6)");
+    return 0;
+}
+
 fn main() {
     test_vk_format_mapping();
     test_vk_format_unmapped();
@@ -489,6 +619,11 @@ fn main() {
     test_ktx2_load_orchestration();
     test_gpu_texture_load_png_orchestration();
     test_gpu_texture_load_sniffer();
+    test_asset_per_image_size();
+    test_dds_parse_array_cube();
+    test_ktx2_parse_array_cube();
+    test_dds_load_array_orchestration();
+    test_ktx2_load_cube_orchestration();
     assert_summary();
     return 0;
 }

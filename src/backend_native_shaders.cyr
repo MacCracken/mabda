@@ -520,6 +520,100 @@ fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
 
 var GFX9_FS_TEXTURED_LOAD_SIZE = 124;
 
+# ================================================================
+# v3.4 AA.2b — 2D-ARRAY textured fragment shader (image_load, DA=1 + slice)
+# ================================================================
+# The array variant of native_gfx9_shader_textured_load_fs: each fragment loads
+# the texel at (screen_x, screen_y, LAYER) of a 2D_ARRAY texture and exports it,
+# so a fullscreen quad over a W×H RT sampling array layer K reproduces that layer
+# (RT[x,y] = array_tex[K, x, y]) — the same screen-pos oracle, now with the slice.
+#
+# Two deltas vs the 2D image_load FS:
+#   1. the scale s_load grows DWORDX2->DWORDX4 (s[12:15]): s12=scale_x@+48,
+#      s13=scale_y@+52, s14=LAYER@+56 (the int slice bind_for_sample_layer wrote).
+#   2. a v_mov v6, s14 supplies the 3rd VADDR, and the image_load sets DA
+#      (w0 0xF0001F00 -> 0xF0005F00 = bit 14) so the TA reads v[4:6] = (x,y,slice).
+# image_load coords are integers, so the slice is the raw int layer (no cvt).
+#
+# ABI identical to the 2D load FS (s[0:1]=descriptor VA, pos in v2/v3) except the
+# high-water grows to VGPRs v0..v6 (7) + SGPRs s0..s15 (16) — both still fit
+# RSRC1_PS MIN|1 (8 VGPR / 16 SGPR), so the render_pass_draw textured override is
+# reused UNCHANGED.
+#
+# image_load DA encoding confirmed via llvm-mc -mcpu=gfx900:
+#   image_load v[0:3], v[4:6], s[0:7] dmask:0xf unorm da
+#     -> [0x00,0x5f,0x00,0xf0, 0x04,0x00,0x00,0x00]  (w0=0xF0005F00, w1=0x04)
+# Returns pos + 128 (64 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_textured_load_array_fs(buf, pos): i64 {
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    # scale_x@+48 -> s12, scale_y@+52 -> s13, layer@+56 -> s14 (s15 = +60, unused).
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 12, 0, 0));
+    p = gfx9_emit32(buf, p, 0x00000030);   # offset 0x30 (descriptor+48)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 2, gfx9_sgpr(12), 2));   # pos_x *= scale_x
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 3, gfx9_sgpr(13), 3));   # pos_y *= scale_y
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 4, gfx9_vgpr(2)));   # POS_X -> tx
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 5, gfx9_vgpr(3)));   # POS_Y -> ty
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 6, gfx9_sgpr(14)));      # v6 = slice (int layer)
+    # image_load + exp are graphics/texture ops — out of the N.0 compute-encoder
+    # scope, so their dwords stay raw literals (llvm-mc-verified above).
+    p = gfx9_emit32(buf, p, 0xF0005F00);   # image_load v[0:3], v[4:6], s[0:7] dmask:0xf unorm DA (w0)
+    p = gfx9_emit32(buf, p, 0x00000004);   # (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
+}
+
+var GFX9_FS_TEXTURED_LOAD_ARRAY_SIZE = 128;
+
+# ================================================================
+# v3.4 AA.5b — CUBEMAP fragment shader (image_sample, DA=1, direction)
+# ================================================================
+# Samples a cubemap: a CUBE T# (TYPE=11) + image_sample DA=1 takes v[4:6] =
+# (s, t, FACE_ID) — on GFX9 the 3rd component is the FACE INDEX (0..5 =
+# +X,-X,+Y,-Y,+Z,-Z), NOT a raw direction. A consumer computes (face,s,t) from a
+# direction with the v_cube* ALU (v_cubeid/sc/tc/ma); this FS takes them directly
+# as three inline-float `v_mov`s (src_x=s, src_y=t, src_z=faceid — GFX9 inline
+# codes, e.g. GFX9_INLINE_F32_0_0 / _4_0). So a draw samples one face across the
+# whole quad. AA.5b oracle: a solid-color face means s/t don't matter, so
+# RT == face[faceid]'s color proves the CUBE T# face addressing on HW. (HW-found:
+# passing a raw direction (0,0,1) sampled face 1 — the 3rd component is faceid.)
+#
+# ABI: s[0:1] = T#/S# descriptor VA (T#@+0, S#@+32 — the bind rebuilds the S#).
+# High-water VGPRs v0..v6 (7), SGPRs s0..s11 (12) — fit RSRC1_PS MIN|1, so the
+# render_pass_draw textured override is reused unchanged.
+#
+# image_sample DA encoding confirmed via llvm-mc -mcpu=gfx900:
+#   image_sample v[0:3], v[4:6], s[0:7], s[8:11] dmask:0xf da
+#     -> [0x00,0x4f,0x80,0xf0, 0x04,0x00,0x40,0x00]  (w0=0xF0804F00, w1=0x00400004)
+# Returns pos + 120 (56 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_cube_sample_fs(buf, pos, src_x, src_y, src_z): i64 {
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 8, 0, 0));   # S# s[8:11]
+    p = gfx9_emit32(buf, p, 0x00000020);   # offset 0x20 (descriptor+32)
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 4, src_x));   # dir.s
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 5, src_y));   # dir.t
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 6, src_z));   # dir.r
+    # image_sample (cube, DA) + exp are graphics/texture ops — raw literals
+    # (llvm-mc-verified above).
+    p = gfx9_emit32(buf, p, 0xF0804F00);   # image_sample v[0:3], v[4:6], s[0:7], s[8:11] dmask:0xf DA (w0)
+    p = gfx9_emit32(buf, p, 0x00400004);   # (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
+}
+
+var GFX9_FS_CUBE_SAMPLE_SIZE = 120;
+
 # SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
 # gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
 # POS_Y_FLOAT_ENA[9]. (1<<1)|(1<<8)|(1<<9) = 0x302. Shared by both textured FS.
@@ -1353,6 +1447,11 @@ var GFX9_SQ_SEL_Y       = 5;
 var GFX9_SQ_SEL_Z       = 6;
 var GFX9_SQ_SEL_W       = 7;
 var GFX9_SQ_RSRC_IMG_2D = 9;
+# v3.4 AA.1 — SQ_RSRC_IMG_TYPE (gfx9.json enum SQ_RSRC_IMG_TYPE): a 2D array is
+# TYPE 13, a cubemap TYPE 11 (a cube is a 6-slice array on GFX9). Only the W3
+# TYPE[28:31] field + W4 DEPTH[0:12] (slice_count-1) differ from a plain 2D.
+var GFX9_SQ_RSRC_IMG_2D_ARRAY = 13;
+var GFX9_SQ_RSRC_IMG_CUBE     = 11;
 var GFX9_SW_MODE_LINEAR = 0;
 # ADDR_SW_64KB_S — the 64 KiB standard-swizzle tiled mode used for compressed
 # sampling (TS.7c). Value 9 matches the swizzle_mode the SDMA COPY_TILED packet
@@ -1371,8 +1470,9 @@ var GFX9_SW_MODE_64KB_S = 9;
 #   W2: WIDTH[0:13]=w-1   HEIGHT[14:27]=h-1
 #   W3: DST_SEL_X[0:2] Y[3:5] Z[6:8] W[9:11] (identity RGBA = X/Y/Z/W)
 #       BASE_LEVEL[12:15]=0  LAST_LEVEL[16:19]=mips-1  SW_MODE[20:24]
-#       TYPE[28:31]=SQ_RSRC_IMG_2D
-#   W4: DEPTH[0:12]=0  PITCH[13:28]=epitch   BC_SWIZZLE[29:31]=0
+#       TYPE[28:31]=img_type (2D / 2D_ARRAY / CUBE — v3.4 AA.1)
+#   W4: DEPTH[0:12]=slice_count-1 (0 for plain 2D — v3.4 AA.1)
+#       PITCH[13:28]=epitch   BC_SWIZZLE[29:31]=0
 #       (epitch = w-1 for LINEAR; for a SW_64KB_S tiled compressed surface it
 #        is the tile-aligned block pitch - 1 = awb-1, matching the SDMA
 #        COPY_TILED epitch the surface was tiled with — TS.7c)
@@ -1381,8 +1481,8 @@ var GFX9_SW_MODE_64KB_S = 9;
 # rejects). NOTE: bit POSITIONS are gfx9.json-authoritative; field VALUE
 # semantics (PITCH alignment, MIN_LOD/MAX_MIP) are HW-cross-checked at the
 # TS.5 (linear) / TS.7c (tiled) sampling e2e on Cezanne. @internal
-fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
-fmt, sw_mode, mip_count, epitch): i64 {
+fn native_gfx9_image_descriptor_typed(buf, pos, base_va, width, height,
+fmt, sw_mode, mip_count, epitch, img_type, slice_count): i64 {
     if (width <= 0)  { return 0 - 1; }
     if (height <= 0) { return 0 - 1; }
     var packed = native_gfx9_texfmt_to_img_format(fmt);
@@ -1392,6 +1492,8 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var levels = mip_count;
     if (levels < 1) { levels = 1; }
     var last_level = levels - 1;
+    var slices = slice_count;
+    if (slices < 1) { slices = 1; }   # 0/1 == a single 2D layer (DEPTH 0)
 
     # W0: low 32 of (va >> 8). `>>` is logical (no sign-extend); mask to 32.
     var w0 = (base_va >> 8) & 0xFFFFFFFF;
@@ -1425,9 +1527,10 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var w3 = (sel_x & 0x7) | ((sel_y & 0x7) << 3);
     w3 = w3 | ((sel_z & 0x7) << 6) | ((sel_w & 0x7) << 9);
     w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
-    w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
-    # W4: PITCH[13:28] = epitch (caller supplies: w-1 for LINEAR, awb-1 tiled).
-    var w4 = (epitch & 0xFFFF) << 13;
+    w3 = w3 | ((img_type & 0xF) << 28);
+    # W4: DEPTH[0:12] = slice_count-1 (0 for plain 2D); PITCH[13:28] = epitch
+    # (caller supplies: w-1 for LINEAR, awb-1 tiled).
+    var w4 = ((slices - 1) & 0x1FFF) | ((epitch & 0xFFFF) << 13);
     # W5: MAX_MIP[28:31].
     var w5 = (last_level & 0xF) << 28;
     store32(buf + pos +  0, w0);
@@ -1439,5 +1542,15 @@ fmt, sw_mode, mip_count, epitch): i64 {
     store32(buf + pos + 24, 0);
     store32(buf + pos + 28, 0);
     return pos + 32;
+}
+
+# Plain single-layer 2D T# — the pre-v3.4 entry point, now a thin wrapper over
+# _typed with (img_type=2D, slice_count=1). DEPTH=0 + TYPE=2D makes the bytes
+# identical to the old hardcoded builder (the AA.1 round-trip invariant — every
+# existing 2D caller + oracle is unchanged). @internal
+fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
+fmt, sw_mode, mip_count, epitch): i64 {
+    return native_gfx9_image_descriptor_typed(buf, pos, base_va, width, height,
+    fmt, sw_mode, mip_count, epitch, GFX9_SQ_RSRC_IMG_2D, 1);
 }
 

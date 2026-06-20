@@ -668,6 +668,174 @@ fn test_native_gfx9_image_descriptor() {
     return 0;
 }
 
+# v3.4 AA.1a — the _typed builder: TYPE (W3[28:31]) + DEPTH (W4[0:12]) for
+# 2D_ARRAY / CUBE. Everything else stays as the 2D oracle above (the wrapper
+# proves the 2D round-trip; this proves the array/cube deltas).
+fn test_native_gfx9_image_descriptor_typed_array_cube() {
+    var buf[32];
+    # 2D_ARRAY, 8 slices: TYPE=13, DEPTH=7. epitch w-1 still in PITCH.
+    memset(&buf, 0, 32);
+    var end = native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 255, GFX9_SQ_RSRC_IMG_2D_ARRAY, 8);
+    assert_eq(end, 32, "returns pos + 32");
+    var w3 = load32(&buf + 12);
+    var w4 = load32(&buf + 16);
+    assert_eq((w3 >> 28) & 0xF, 13, "array W3 TYPE = 2D_ARRAY(13)");
+    assert_eq(w4 & 0x1FFF, 7, "array W4 DEPTH = slice_count-1 (7)");
+    assert_eq((w4 >> 13) & 0xFFFF, 255, "array W4 PITCH = epitch (255) unchanged");
+    # CUBE: TYPE=11, DEPTH=5 (6 faces - 1).
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 63, GFX9_SQ_RSRC_IMG_CUBE, 6);
+    var cw3 = load32(&buf + 12);
+    var cw4 = load32(&buf + 16);
+    assert_eq((cw3 >> 28) & 0xF, 11, "cube W3 TYPE = CUBE(11)");
+    assert_eq(cw4 & 0x1FFF, 5, "cube W4 DEPTH = 6 faces - 1 (5)");
+    # slice_count 0/1 both clamp to a single layer (DEPTH 0) — back-compat.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 255, GFX9_SQ_RSRC_IMG_2D, 0);
+    assert_eq(load32(&buf + 16) & 0x1FFF, 0, "slice_count 0 -> DEPTH 0 (clamped)");
+    assert_eq((load32(&buf + 12) >> 28) & 0xF, 9, "2D TYPE(9) via _typed");
+    # The wrapper == _typed(2D, 1) byte-for-byte (the round-trip invariant).
+    var wbuf[32];
+    var tbuf[32];
+    memset(&wbuf, 0, 32);
+    memset(&tbuf, 0, 32);
+    native_gfx9_image_descriptor(&wbuf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_64KB_S, 4, 127);
+    native_gfx9_image_descriptor_typed(&tbuf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_64KB_S, 4, 127, GFX9_SQ_RSRC_IMG_2D, 1);
+    var i = 0;
+    var same = 1;
+    while (i < 32) {
+        if (load8(&wbuf + i) != load8(&tbuf + i)) { same = 0; }
+        i = i + 1;
+    }
+    assert_eq(same, 1, "wrapper bytes == _typed(2D,1) bytes (round-trip invariant)");
+    return 0;
+}
+
+# v3.4 AA.1b — write_layer_level memcpy slice math (CPU: pure memcpy + guards;
+# the create filler's BO alloc is the HW e2e). A fake array tex points ADDR at a
+# stack surface; each layer is written + verified at addr + layer*per_slice.
+fn test_native_texture_write_layer_level() {
+    var surface[64];   # 4 slices * 16 B (2x2 RGBA8)
+    memset(&surface, 0, 64);
+    var tex[64];
+    memset(&tex, 0, 64);
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, &surface);
+    store64(&tex + NATIVE_TEX_FIELD_SIZE, 16);       # per-slice bytes
+    store32(&tex + NATIVE_TEX_FIELD_WIDTH, 2);
+    store32(&tex + NATIVE_TEX_FIELD_HEIGHT, 2);
+    store32(&tex + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_RGBA8);
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_LINEAR);
+    native_tex_set_slice_count(&tex, 4);
+    var src[16];
+    var ctxf[8];
+    store64(&ctxf, 1);   # non-null fake ctx (write_layer_level never derefs it past the guard)
+    var k = 0;
+    while (k < 4) {
+        memset(&src, 0xA0 + k, 16);
+        assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, k, 0, &src, 16),
+        0, "write layer ok");
+        k = k + 1;
+    }
+    k = 0;
+    var bad = 0;
+    while (k < 4) {
+        var b = load8((&surface) + k * 16 + 7);   # a mid-slice byte
+        if (b != (0xA0 + k)) { bad = 1; }
+        k = k + 1;
+    }
+    assert_eq(bad, 0, "each layer landed at addr + layer*per_slice");
+    # Guards.
+    assert_eq(_backend_native_texture_write_layer_level(0, &tex, 0, 0, &src, 16),
+    GPU_ERR_OTHER, "null ctx -> OTHER");
+    assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 4, 0, &src, 16),
+    GPU_ERR_TEXTURE, "layer >= slice_count -> TEXTURE");
+    assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0 - 1, 0, &src, 16),
+    GPU_ERR_TEXTURE, "neg layer -> TEXTURE");
+    assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0, 1, &src, 16),
+    GPU_ERR_NOT_IMPLEMENTED, "level != 0 -> not-impl (mipped array later)");  #skip-lint
+    assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0, 0, &src, 8),
+    GPU_ERR_BUFFER, "n != per_slice -> BUFFER");
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_64KB_S);
+    assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0, 0, &src, 16),
+    GPU_ERR_NOT_IMPLEMENTED, "tiled array upload fails loud (AA.4)");  #skip-lint
+    return 0;
+}
+
+# v3.4 AA.2a — bind_for_sample_layer records the array slice at descriptor+56
+# (the draw preserves +56); the plain bind resets it to layer 0. A fake tex's
+# desc_cpu_addr is aimed at a stack descriptor tail (t_va == va -> desc = ADDR).
+fn test_native_texture_bind_for_sample_layer() {
+    var descbuf[64];
+    memset(&descbuf, 0, 64);
+    var tex[64];
+    memset(&tex, 0, 64);
+    store64(&tex + NATIVE_TEX_FIELD_VA, 0x1000);
+    store64(&tex + NATIVE_TEX_FIELD_ADDR, &descbuf);
+    native_tex_set_t_va(&tex, 0x1000);   # t_va==va -> desc_cpu = ADDR = &descbuf
+    var pass[40];
+    memset(&pass, 0, 40);
+    var ctxf[8];
+    store64(&ctxf, 1);
+    assert_eq(_backend_native_texture_bind_for_sample_layer(&ctxf, &pass, &tex, 0, 3),
+    0, "bind layer ok");
+    assert_eq(load32((&descbuf) + 56), 3, "layer 3 at descriptor+56");
+    assert_eq(load64((&pass) + NATIVE_PASS_FIELD_BOUND_TEX), &tex, "bound_tex stashed");
+    assert_eq(_backend_native_texture_bind_for_sample(&ctxf, &pass, &tex, 0), 0, "plain bind ok");
+    assert_eq(load32((&descbuf) + 56), 0, "plain bind resets layer to 0");
+    assert_eq(_backend_native_texture_bind_for_sample_layer(0, &pass, &tex, 0, 0),
+    GPU_ERR_OTHER, "null ctx -> OTHER");
+    assert_eq(_backend_native_texture_bind_for_sample_layer(&ctxf, 0, &tex, 0, 0),
+    GPU_ERR_OTHER, "null pass -> OTHER");
+    assert_eq(_backend_native_texture_bind_for_sample_layer(&ctxf, &pass, 0, 0, 0),
+    GPU_ERR_TEXTURE, "null tex -> TEXTURE");
+    var tex0[64];
+    memset(&tex0, 0, 64);
+    assert_eq(_backend_native_texture_bind_for_sample_layer(&ctxf, &pass, &tex0, 0, 0),
+    GPU_ERR_TEXTURE, "not sampleable -> TEXTURE");
+    return 0;
+}
+
+# v3.4 AA.1b — create_2d_array_sampleable guard ladder (rejects before any HW BO).
+fn test_native_texture_create_2d_array_guards() {
+    var ctxf[8];
+    store64(&ctxf, 1);
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(0, 64, 64, MABDA_TEXFMT_RGBA8, 4),
+    0, "null ctx -> 0");
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(&ctxf, 0, 64, MABDA_TEXFMT_RGBA8, 4),
+    0, "w<=0 -> 0");
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(&ctxf, 64, 64, MABDA_TEXFMT_RGBA8, 0),
+    0, "layers<1 -> 0");
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(&ctxf, 64, 64, MABDA_TEXFMT_RGBA8, 257),
+    0, "layers>MAX -> 0");
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(&ctxf, 64, 64, 99, 4),
+    0, "bad fmt -> 0");
+    assert_eq(_backend_native_texture_create_2d_array_sampleable(&ctxf, 64, 64, MABDA_TEXFMT_BC1, 4),
+    0, "compressed array -> 0 (AA.4)");
+    return 0;
+}
+
+# v3.4 AA.5a — create_cube guard ladder (rejects before any HW BO).
+fn test_native_texture_create_cube_guards() {
+    var ctxf[8];
+    store64(&ctxf, 1);
+    assert_eq(_backend_native_texture_create_cube(0, 64, MABDA_TEXFMT_RGBA8, 1),
+    0, "null ctx -> 0");
+    assert_eq(_backend_native_texture_create_cube(&ctxf, 0, MABDA_TEXFMT_RGBA8, 1),
+    0, "size<=0 -> 0");
+    assert_eq(_backend_native_texture_create_cube(&ctxf, 64, MABDA_TEXFMT_RGBA8, 2),
+    0, "mipped cube -> 0 (AA.5a single-level)");
+    assert_eq(_backend_native_texture_create_cube(&ctxf, 64, 99, 1),
+    0, "bad fmt -> 0");
+    assert_eq(_backend_native_texture_create_cube(&ctxf, 64, MABDA_TEXFMT_BC1, 1),
+    0, "compressed cube -> 0 (AA.4)");
+    return 0;
+}
+
 # v3.2 TS.2 — format->IMG-format table: every row pinned against the
 # gfx9.json IMG_DATA_FORMAT / IMG_NUM_FORMAT enum values.
 fn test_native_gfx9_texfmt_to_img_format() {
@@ -1647,9 +1815,38 @@ fn test_native_texture_struct_field_offsets() {
     # v3.2 TS.3: sampleable fields appended; offsets 0..44 unchanged.
     assert_eq(NATIVE_TEX_FIELD_SW_MODE,   48, "sw_mode at +48 (v3.2 TS.3)");
     assert_eq(NATIVE_TEX_FIELD_T_VA,      52, "t_va at +52 (v3.2 TS.3)");
-    assert_eq(NATIVE_TEX_STRUCT_SIZE,     64, "total = 64");
-    assert(NATIVE_TEX_FIELD_T_VA + 8 <= NATIVE_TEX_STRUCT_SIZE,
-    "t_va fits within the struct");
+    # v3.4 AA.0: slice_count reuses the +60 pad (t_va u64 ends at +60); struct stays 64.
+    assert_eq(NATIVE_TEX_FIELD_SLICE_COUNT, 60, "slice_count at +60 (v3.4 AA.0)");
+    assert_eq(NATIVE_TEX_FIELD_T_VA + 8, NATIVE_TEX_FIELD_SLICE_COUNT,
+    "slice_count sits right after t_va (no overlap)");
+    assert_eq(NATIVE_TEX_STRUCT_SIZE,     64, "total = 64 (pad reused, no growth)");
+    assert(NATIVE_TEX_FIELD_SLICE_COUNT + 4 <= NATIVE_TEX_STRUCT_SIZE,
+    "slice_count fits within the struct");
+    return 0;
+}
+
+# v3.4 AA.0 — slice_count accessor round-trip + back-compat (memset = 0 = single layer).
+fn test_native_tex_slice_count_accessor() {
+    var tex[64];
+    memset(&tex, 0, 64);
+    assert_eq(native_tex_slice_count(&tex), 0, "zeroed tex -> slice_count 0 (single 2D, back-compat)");
+    native_tex_set_slice_count(&tex, 6);
+    assert_eq(native_tex_slice_count(&tex), 6, "set/get slice_count 6 (cube)");
+    native_tex_set_slice_count(&tex, 256);
+    assert_eq(native_tex_slice_count(&tex), 256, "set/get slice_count 256 (array)");
+    # slice_count must not disturb the adjacent t_va.
+    native_tex_set_t_va(&tex, 0xFFFF800180010000);
+    native_tex_set_slice_count(&tex, 12);
+    assert_eq(native_tex_t_va(&tex), 0xFFFF800180010000, "t_va intact after slice_count write");
+    assert_eq(native_tex_slice_count(&tex), 12, "slice_count intact after t_va write");
+    # v3.4 AA.5d — is-cube flag packed in bit 31; slice_count masks it off.
+    assert_eq(native_tex_is_cube(&tex), 0, "not a cube by default");
+    native_tex_set_cube(&tex);
+    assert_eq(native_tex_is_cube(&tex), 1, "set_cube -> is_cube 1");
+    assert_eq(native_tex_slice_count(&tex), 12, "slice_count still 12 (flag masked off)");
+    native_tex_set_slice_count(&tex, 6);   # set_slice_count clears the flag
+    assert_eq(native_tex_is_cube(&tex), 0, "set_slice_count clears the cube flag");
+    assert_eq(native_tex_slice_count(&tex), 6, "slice_count 6 after reset");
     return 0;
 }
 
@@ -2585,6 +2782,75 @@ fn test_gfx9_fs_textured_load_byte_pattern() {
     }
     assert_eq(GFX9_SPI_PS_INPUT_TEXTURED, 0x302,
     "SPI_PS_INPUT = PERSP_CENTER|POS_X|POS_Y");
+    return 0;
+}
+
+# v3.4 AA.2b — the 2D-ARRAY image_load FS. Byte-pinned (the new dwords —
+# dwordx4 scale+layer load, v_mov v6,s14, image_load DA — confirmed via
+# llvm-mc -mcpu=gfx900). HW exercise is the array sample e2e.
+fn test_gfx9_fs_textured_load_array_byte_pattern() {
+    var buf[128];
+    memset(&buf, 0xCC, 128);
+    var pos = native_gfx9_shader_textured_load_array_fs(&buf, 0);
+    assert_eq(pos, GFX9_FS_TEXTURED_LOAD_ARRAY_SIZE, "array FS writes 128 bytes");
+    assert_eq(GFX9_FS_TEXTURED_LOAD_ARRAY_SIZE, 128, "array FS size constant");
+    assert_eq(load32(&buf +  0), 0xC00E0000, "s_load_dwordx8 T# w0");
+    assert_eq(load32(&buf +  4), 0x00000000, "s_load_dwordx8 w1");
+    # The scale load grows to dwordx4 s[12:15] (s14 = layer@+56).
+    assert_eq(load32(&buf +  8), 0xC00A0300, "s_load_dwordx4 s[12:15] w0");
+    assert_eq(load32(&buf + 12), 0x00000030, "s_load_dwordx4 offset 0x30 (+48)");
+    assert_eq(load32(&buf + 16), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    assert_eq(load32(&buf + 20), 0x0A04040C, "v_mul_f32 v2, s12, v2");
+    assert_eq(load32(&buf + 24), 0x0A06060D, "v_mul_f32 v3, s13, v3");
+    assert_eq(load32(&buf + 28), 0x7E081102, "v_cvt_i32_f32 v4, v2");
+    assert_eq(load32(&buf + 32), 0x7E0A1103, "v_cvt_i32_f32 v5, v3");
+    # the new 3rd VADDR: v6 = s14 (int slice).
+    assert_eq(load32(&buf + 36), 0x7E0C020E, "v_mov_b32 v6, s14 (slice)");
+    # image_load with DA set (bit 14): 0xF0001F00 -> 0xF0005F00, v[4:6].
+    assert_eq(load32(&buf + 40), 0xF0005F00, "image_load DA (2D_ARRAY) w0");
+    assert_eq(load32(&buf + 44), 0x00000004, "image_load w1 (vaddr v4, srsrc s[0:7])");
+    assert_eq(load32(&buf + 48), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 52), 0xC400180F, "exp mrt0 done vm w0");
+    assert_eq(load32(&buf + 56), 0x03020100, "exp vsrc0..3 = v0..v3");
+    assert_eq(load32(&buf + 60), 0xBF810000, "s_endpgm");
+    var i = 0;
+    while (i < 16) {
+        assert_eq(load32(&buf + 64 + i * 4), 0xBF800000, "s_nop padding");
+        i = i + 1;
+    }
+    return 0;
+}
+
+# v3.4 AA.5b — the CUBE image_sample FS (DA=1, (s,t,faceid) VADDR). Built here
+# with (0.0, 0.0, 1.0) = faceid 1; all bytes llvm-mc-verified.
+fn test_gfx9_fs_cube_sample_byte_pattern() {
+    var buf[120];
+    memset(&buf, 0xCC, 120);
+    var pos = native_gfx9_shader_cube_sample_fs(&buf, 0,
+    GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_1_0);
+    assert_eq(pos, GFX9_FS_CUBE_SAMPLE_SIZE, "cube FS writes 120 bytes");
+    assert_eq(GFX9_FS_CUBE_SAMPLE_SIZE, 120, "cube FS size constant");
+    assert_eq(load32(&buf +  0), 0xC00A0200, "s_load_dwordx4 S# s[8:11] w0");
+    assert_eq(load32(&buf +  4), 0x00000020, "S# offset 0x20 (+32)");
+    assert_eq(load32(&buf +  8), 0xC00E0000, "s_load_dwordx8 T# s[0:7] w0");
+    assert_eq(load32(&buf + 12), 0x00000000, "T# offset 0");
+    assert_eq(load32(&buf + 16), 0xBF8CC07F, "s_waitcnt lgkmcnt(0)");
+    # (s, t, faceid) VADDR = (0, 0, 1) here (faceid 1).
+    assert_eq(load32(&buf + 20), 0x7E080280, "v_mov v4, 0.0 (s)");
+    assert_eq(load32(&buf + 24), 0x7E0A0280, "v_mov v5, 0.0 (t)");
+    assert_eq(load32(&buf + 28), 0x7E0C02F2, "v_mov v6, 1.0 (faceid)");
+    # image_sample with DA (cube): 0xF0800F00 -> 0xF0804F00.
+    assert_eq(load32(&buf + 32), 0xF0804F00, "image_sample DA (cube) w0");
+    assert_eq(load32(&buf + 36), 0x00400004, "image_sample w1 (SSAMP s[8:11])");
+    assert_eq(load32(&buf + 40), 0xBF8C0F70, "s_waitcnt vmcnt(0)");
+    assert_eq(load32(&buf + 44), 0xC400180F, "exp mrt0 done vm w0");
+    assert_eq(load32(&buf + 48), 0x03020100, "exp vsrc0..3");
+    assert_eq(load32(&buf + 52), 0xBF810000, "s_endpgm");
+    var ci = 0;
+    while (ci < 16) {
+        assert_eq(load32(&buf + 56 + ci * 4), 0xBF800000, "s_nop padding");
+        ci = ci + 1;
+    }
     return 0;
 }
 
@@ -3769,6 +4035,11 @@ fn main() {
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
     test_native_gfx9_image_descriptor();
+    test_native_gfx9_image_descriptor_typed_array_cube();
+    test_native_texture_write_layer_level();
+    test_native_texture_create_2d_array_guards();
+    test_native_texture_create_cube_guards();
+    test_native_texture_bind_for_sample_layer();
     test_native_gfx9_texfmt_to_img_format();
     test_native_gfx9_sampler_descriptor();
     test_native_sdma_build_copy_tiled();
@@ -3808,6 +4079,7 @@ fn main() {
     test_native_ctx_layout_isolation_step4iv();
     test_native_texture_size_2d_rgba8_formula();
     test_native_texture_struct_field_offsets();
+    test_native_tex_slice_count_accessor();
     test_native_tex_sampleable_accessors();
     test_native_tex_level_offset_math();
     test_native_texture_write_level();
@@ -3853,6 +4125,8 @@ fn main() {
     test_gfx9_fullscreen_triangle_vertex_count();
     test_gfx9_fs_solid_red_byte_pattern();
     test_gfx9_fs_textured_load_byte_pattern();
+    test_gfx9_fs_textured_load_array_byte_pattern();
+    test_gfx9_fs_cube_sample_byte_pattern();
     test_gfx9_fs_textured_sample_byte_pattern();
     test_gfx9_fs_solid_red_alignment();
     test_gfx9_vs_fullscreen_triangle_byte_pattern();

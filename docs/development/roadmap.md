@@ -64,6 +64,8 @@ cross-vendor default.
                         (3.2.0–3.2.14) — arc done
   v3.3   [SHIPPED] ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
                         new chitra package), 3.3.0; arrays/cubes + JPEG → v3.4+
+  v3.4   [SHIPPED] ─▶  array textures + cubemaps (Phase AA / AL-ARRAY) —
+                        create/upload/sample on both backends + DDS/KTX2 load
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
                         retires (AMD consumers run on AMD native only)
@@ -115,6 +117,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.4.0](../../CHANGELOG.md#340--2026-06-19) | Array textures + cubemaps (Phase AA) — create/upload/sample on both backends + DDS/KTX2 array+cube load; HW-verified end-to-end on Cezanne (incl. the data-ordering capstone) |
 | [3.3.0](../../CHANGELOG.md#330--2026-06-19) | Asset loading (Phase AL) — DDS + KTX2 loaders (in mabda) + PNG via the chitra package + magic-byte sniffer; native PNG path HW-verified, 1 CRITICAL parser bug found+fixed pre-cut |
 | [3.2.14](../../CHANGELOG.md#3214--2026-06-19) | Render-graph multi-queue executor (Phase R) — native nodes on distinct rings, HW-verified; **closes the v3.2.x arc** |
 | [3.2.13](../../CHANGELOG.md#3213--2026-06-19) | Render-graph multi-queue foundations (Phase R) — node queue affinity + scheduler + native render-timeline dispatch |
@@ -202,6 +205,45 @@ one cross-repo edge).
 **array layers / cubemaps** (parsed-and-rejected-loud in 3.3.x → real support
 in v3.4, Phase AL-ARRAY); ETC2/ASTC sampling stays HW-blocked on Cezanne (caps
 gate catches it). sRGB policy decided in AL.0.
+
+---
+
+## v3.4 — Array Textures + Cubemaps (SHIPPED — 3.4.0, 2026-06-19)
+
+The v3.3 DDS/KTX2 loaders already **parse** `arraySize`/`faceCount`/`layerCount`
+and fail loud. v3.4 (**Phase AA / AL-ARRAY**) made them real: **2D array
+textures** + **cubemaps** — create, per-layer upload, and sampling — on both
+backends, with the loaders flipped from reject to load. All **additive** (no
+consumer call signature changes). Branch `34x`, toolchain 6.2.26; planned
+2026-06-19 via the `v34-al-array-plan` design workflow. See the **punchlist**:
+
+- Punchlist: [`3-4-punchlist.md`](3-4-punchlist.md)
+- Design: [`v3.4-array-cube-textures.md`](../proposals/v3.4-array-cube-textures.md)
+
+The native delta is small + `gfx9.json`-isolated (T# `TYPE` 2D→2D_ARRAY/CUBE,
+`DEPTH` = slice−1; a per-draw `layer` in the descriptor tail; the sampling FS
+gains `DA=1` + a slice VADDR). An N-slice array is **one BO** (slice k at
+`base + k·slice_pitch`); a cube is a 6-slice array (faces +X,−X,+Y,−Y,+Z,−Z).
+wgpu is pure descriptor/view parameterization + new WGSL FS, zero new FFI.
+
+**Sequence (smallest-risk-first):** AA.0 API/slots → AA.1 native 2D-array
+storage → AA.2 native 2D-array sample → AA.3 wgpu 2D-array → AA.4 native
+compressed (tiled) array → AA.5 cube (native + wgpu) → AA.6 DDS/KTX2 load → AA.7
+HW e2e + cut. One **3.4.0** cut (3.3.0 precedent).
+
+**Shipped (HW-verified on Cezanne):** native + wgpu 2D arrays (create/upload/
+sample), native + wgpu cubes (the GFX9 cube `image_sample` takes a face *index*,
+not a raw direction — the v_cube* projection is consumer-side; wgpu/naga projects
+a direction), the DDS/KTX2 array+cube loaders, and the data-ordering capstone
+(file image k → backend slice k). Layered *render* (rendering INTO layers/faces)
+stayed OUT OF SCOPE (sample-one-layer-per-draw); ETC2/ASTC arrays stay HW-blocked.
+
+**Deferred to 3.4.1 (tracked, not dropped — see the punchlist):** **AA.4** native
+compressed/tiled arrays (BC-only, addrlib slice-stride gate); **AA.3c** wgpu
+draw-time layer selection (native-only today via the +56 tail); and the
+**`F64_HALF`/`F64_TWO` ↔ `math` stdlib collision** surfaced by the first consumer
+(attn11) that also deps `math` — namespace mabda's f64 constants to `MABDA_F64_*`
+(filing `docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`).
 
 ---
 

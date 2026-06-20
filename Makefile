@@ -201,6 +201,26 @@ build/wgpu_texture_sample_e2e: build/wgpu_texture_sample_e2e.o deps/wgpu_main.o
 test-wgpu-texture-sample-e2e: build/wgpu_texture_sample_e2e
 	./build/wgpu_texture_sample_e2e
 
+# v3.4 AA.3b — wgpu 2D-array sample: create an array, upload distinct layers,
+# sample a chosen layer via a texture_2d_array WGSL FS, verify the RT.
+build/wgpu_array_sample_e2e: build/wgpu_array_sample_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_array_sample_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-array-sample-e2e
+test-wgpu-array-sample-e2e: build/wgpu_array_sample_e2e
+	./build/wgpu_array_sample_e2e
+
+# v3.4 AA.5c — wgpu cubemap sample: create a cube, upload 6 faces, sample a face
+# by direction via a texture_cube WGSL FS, verify the RT.
+build/wgpu_cube_sample_e2e: build/wgpu_cube_sample_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_cube_sample_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-cube-sample-e2e
+test-wgpu-cube-sample-e2e: build/wgpu_cube_sample_e2e
+	./build/wgpu_cube_sample_e2e
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
@@ -661,6 +681,46 @@ build/native_load_png_e2e: programs/native_load_png_e2e.cyr src/*.cyr
 .PHONY: test-native-load-png-e2e
 test-native-load-png-e2e: build/native_load_png_e2e
 	./build/native_load_png_e2e
+
+build/native_array_store_e2e: programs/native_array_store_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_array_store_e2e.cyr $@
+
+.PHONY: test-native-array-store-e2e
+test-native-array-store-e2e: build/native_array_store_e2e
+	./build/native_array_store_e2e
+
+build/native_array_sample_e2e: programs/native_array_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_array_sample_e2e.cyr $@
+
+.PHONY: test-native-array-sample-e2e
+test-native-array-sample-e2e: build/native_array_sample_e2e
+	./build/native_array_sample_e2e
+
+build/native_cube_store_e2e: programs/native_cube_store_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_cube_store_e2e.cyr $@
+
+.PHONY: test-native-cube-store-e2e
+test-native-cube-store-e2e: build/native_cube_store_e2e
+	./build/native_cube_store_e2e
+
+build/native_cube_sample_e2e: programs/native_cube_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_cube_sample_e2e.cyr $@
+
+.PHONY: test-native-cube-sample-e2e
+test-native-cube-sample-e2e: build/native_cube_sample_e2e
+	./build/native_cube_sample_e2e
+
+build/native_array_cube_load_e2e: programs/native_array_cube_load_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_array_cube_load_e2e.cyr $@
+
+.PHONY: test-native-array-cube-load-e2e
+test-native-array-cube-load-e2e: build/native_array_cube_load_e2e
+	./build/native_array_cube_load_e2e
 
 # v3.2 TS.6 — SDMA tiling probe: L2T->T2L round-trip proves the SW_64KB_S
 # COPY_TILED_SUB_WINDOW path works on Cezanne. HW-gated.

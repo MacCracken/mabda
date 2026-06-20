@@ -1434,6 +1434,16 @@ fn gpu_caps_native_texture_compression(): i64 {
     return NATIVE_TEXCOMP_SUPPORTED;
 }
 
+# v3.4 AA.0 — does the native AMD path support 2D ARRAY textures / CUBEMAPS
+# (create + sample)? array = 1 since AA.2 (create+sample HW-verified on Cezanne,
+# native_array_sample_e2e); cube = 1 since AA.5b (sampling HW-verified,
+# native_cube_sample_e2e) + AA.5d (the cube-aware bind auto-selects unnorm=0, so
+# a consumer binds a cube with a normal sampler). (3-4 punchlist.)
+var NATIVE_TEXTURE_ARRAY_SUPPORTED = 1;
+var NATIVE_TEXTURE_CUBE_SUPPORTED  = 1;
+fn gpu_caps_native_texture_array(): i64 { return NATIVE_TEXTURE_ARRAY_SUPPORTED; }
+fn gpu_caps_native_texture_cube(): i64 { return NATIVE_TEXTURE_CUBE_SUPPORTED; }
+
 # v3.2 F.2 — the native f64 ANSWER (unlike the wgpu side, native needs no probe — there is
 # ground truth): does the native AMD path support f64 compute? The HW does, but mabda can only
 # EMIT f64 once the Phase N SPIR-V→GFX9 f64 emitter lands (F.7), so this returns MABDA_NATIVE_F64
@@ -1548,34 +1558,137 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     return tex;
 }
 
+# v3.4 AA.1b — create a sampleable 2D ARRAY texture (LINEAR / uncompressed).
+# One BO holds [layers contiguous slices | pad-256 | T#(32)+S#(16)]; the T# is a
+# 2D_ARRAY descriptor (TYPE=13, DEPTH=layers-1) so the TA reads slice k at
+# base + k*slice_pitch, slice_pitch = per-slice surface (LINEAR, tightly packed:
+# depth_pitch = width*height elements). Per-slice data lands via write_layer_level.
+# NATIVE_TEX_FIELD_SIZE holds the PER-SLICE logical bytes (the write_layer bound);
+# slice_count holds the layer count. Compressed (tiled) arrays are AA.4 (the tiled
+# slice stride is an addrlib question) and fail loud here. Returns tex_ptr | 0.
+# v3.4 AA.1b/AA.5a — shared sampleable LINEAR layered-create: `slices` contiguous
+# slices of (w x h) `fmt` + the T#/S# tail, T# TYPE = `img_type` (2D_ARRAY or
+# CUBE). One BO holds [slices | pad-256 | T#(32)+S#(16)]; slice k at base +
+# k*per_slice (LINEAR depth_pitch = w*h elements). SIZE = per-slice bytes,
+# slice_count = slices. Compressed (tiled) layered create is AA.4 (fail loud).
+fn _native_create_layered_sampleable(ctx, width, height, fmt, slices, img_type, unnorm): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (slices < 1)  { return 0; }
+    if (slices > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
+    var per_slice = mabda_texfmt_data_size(fmt, width, height);
+    if (per_slice == 0) { return 0; }
+    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }   # LINEAR only (compressed = AA.4)
+    var fd = native_ctx_fd(ctx);
+    var surf_size = per_slice * slices;   # slices,dims dispatcher-bounded -> no i64 overflow
+    var desc_off = _native_align_up(surf_size, 256);
+    var bo_size = _native_align_up(desc_off + 64, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) { return 0; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return 0;
+    }
+    var daddr = addr + desc_off;
+    memset(daddr, 0, 64);
+    native_gfx9_image_descriptor_typed(daddr, 0, va, width, height, fmt,
+    GFX9_SW_MODE_LINEAR, 1, width - 1, img_type, slices);
+    # unnorm = 1 for 2D-array (image_load uses integer texel coords); 0 for a
+    # CUBE (image_sample projects a direction -> normalized face u/v — unnorm
+    # breaks the cube face-derivation, HW-confirmed).
+    native_gfx9_sampler_descriptor(daddr, 32,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, unnorm);
+    store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
+    store32(daddr + 52, 0x3F800000);   # scale_y = 1.0f
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(tex + NATIVE_TEX_FIELD_VA,     va);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   per_slice);   # PER-SLICE bytes (write_layer bound)
+    store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
+    native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
+    native_tex_set_t_va(tex, va + desc_off);
+    native_tex_set_slice_count(tex, slices);
+    # Mark a cube so bind_for_sample picks unnorm=0 (the create baked it already;
+    # this lets a re-bind with a real sampler keep the cube S# correct).
+    if (img_type == GFX9_SQ_RSRC_IMG_CUBE) { native_tex_set_cube(tex); }
+    return tex;
+}
+
+# v3.4 AA.1b — native 2D ARRAY (TYPE = 2D_ARRAY).
+fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers): i64 {
+    return _native_create_layered_sampleable(ctx, width, height, fmt, layers,
+    GFX9_SQ_RSRC_IMG_2D_ARRAY, 1);
+}
+
+fn _backend_native_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
+    return _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers);
+}
+
+# v3.4 AA.5a — native CUBEMAP: a 6-face square LINEAR cube (TYPE = CUBE, a
+# 6-slice array on GFX9). Faces are +X,-X,+Y,-Y,+Z,-Z (write_layer_level face k).
+# Single-level for AA.5a — a mipped cube is later, so mip_count != 1 fails loud.
+fn _backend_native_texture_create_cube(ctx, size, fmt, mip_count): i64 {
+    if (size <= 0) { return 0; }
+    if (mip_count != 1) { return 0; }   # mipped cube is later (AA.5a single-level)
+    return _native_create_layered_sampleable(ctx, size, size, fmt, 6, GFX9_SQ_RSRC_IMG_CUBE, 0);
+}
+
 # v3.2 TS.5 — bind a sampleable texture into a render pass (native). Stashes
 # the texture's T#/S# descriptor VA on the pass; the next render_pass_draw
 # emits the PS USER_DATA SET_SH_REG from it (the textured-FS PM4 path, next
 # sub-bite). `sampler` is accepted for API stability but unused on the
 # image_load MVP path (the FS reads no S#); rebuilding the S# from an explicit
 # sampler is TS.7 (image_sample). Returns 0|GPU_ERR_*.
-fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+# v3.4 AA.2 — array-aware bind: also records the array slice / cube face `layer`
+# the next draw samples, in the descriptor tail at +56 (the draw writes
+# scale@+48/+52 but leaves +56, so it survives). The plain bind_for_sample below
+# is this with layer 0 (so a re-bind after a layered bind resets to layer 0).
+fn _backend_native_texture_bind_for_sample_layer(ctx, pass, tex, sampler, layer): i64 {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (tex == 0)  { return GPU_ERR_TEXTURE; }
     if (native_tex_t_va(tex) == 0) { return GPU_ERR_TEXTURE; }   # not sampleable
-    # v3.2 TS.8b — rebuild the S# (descriptor +32) from the bound sampler's
-    # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes effect.
-    # unnorm stays 1 (the FS feeds texel-space coords). A POINT/CLAMP sampler
-    # rebuilds byte-identically to the create-baked default, so the existing
-    # (POINT) sample e2es are unaffected; only fires for a valid sampler.
-    if (gpu_sampler_is_valid(sampler) != 0) {
-        var dcpu = native_tex_desc_cpu_addr(tex);
-        if (dcpu != 0) {
+    var dcpu = native_tex_desc_cpu_addr(tex);
+    if (dcpu != 0) {
+        # v3.2 TS.8b — rebuild the S# (descriptor +32) from the bound sampler's
+        # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes
+        # effect. unnorm stays 1. POINT/CLAMP rebuilds byte-identically to the
+        # create default (existing sample e2es unaffected); only for a valid sampler.
+        # unnorm = 0 for a CUBE (normalized face u/v), 1 otherwise (2D/array
+        # texel-space coords). Auto-selected from the texture so a consumer binds
+        # a cube with a normal sampler + gets correct cube sampling (AA.5d).
+        var unnorm = 1;
+        if (native_tex_is_cube(tex) != 0) { unnorm = 0; }
+        if (gpu_sampler_is_valid(sampler) != 0) {
             native_gfx9_sampler_descriptor(dcpu, 32,
-            gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), 1);
+            gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), unnorm);
         }
+        # v3.4 AA.2 — the array slice (int) the array image_sample/load FS s-loads
+        # as its 3rd VADDR. Written every bind so layer 0 is the explicit default.
+        store32(dcpu + 56, layer);
     }
-    # Stash the tex pointer: the draw derives the descriptor VA
-    # (native_tex_t_va, for the PS USER_DATA) + the surface BO handle (for
-    # residency) from it.
+    # Stash the tex pointer: the draw derives the descriptor VA (for the PS
+    # USER_DATA) + the surface BO handle (for residency) from it.
     store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, tex);
     return 0;
+}
+
+fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+    return _backend_native_texture_bind_for_sample_layer(ctx, pass, tex, sampler, 0);
 }
 
 # v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
@@ -1858,6 +1971,34 @@ fn _backend_native_texture_write_level(ctx, tex, level, src, n): i64 {
         return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
     }
     memcpy(addr + native_tex_level_offset(fmt, w, h, level), src, n);
+    return 0;
+}
+
+# v3.4 AA.1b — upload one array layer / cube face at one mip level (LINEAR).
+# dest = addr + layer*per_slice (+ level offset). Validates layer in
+# [0, slice_count), n == the per-slice logical size, LINEAR surface. AA.1b is
+# single-level (level 0); mipped arrays + tiled (compressed) array upload land
+# with AA.4/AA.6 and fail loud here. A non-array texture (slice_count 0) accepts
+# layer 0 (per_slice == the whole surface), so the loaders' single-image path
+# can route through here uniformly. Returns 0 | GPU_ERR_*.
+fn _backend_native_texture_write_layer_level(ctx, tex, layer, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
+    var slices = native_tex_slice_count(tex);
+    if (slices < 1) { slices = 1; }              # 0 == a single-layer texture
+    if (layer >= slices) { return GPU_ERR_TEXTURE; }
+    if (level != 0) { return GPU_ERR_NOT_IMPLEMENTED; }   # mipped arrays: AA.4/AA.6 #skip-lint
+    var per_slice = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    if (n != per_slice) { return GPU_ERR_BUFFER; }        # per-slice size mismatch
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return GPU_ERR_NOT_IMPLEMENTED;   # tiled (compressed) array upload is AA.4 #skip-lint
+    }
+    memcpy(addr + layer * per_slice, src, n);
     return 0;
 }
 
@@ -2361,6 +2502,13 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
     &_backend_native_texture_write_level);
+    # v3.4 AA.1b — 2D array create + per-layer upload (cube create is AA.5).
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY,
+    &_backend_native_texture_create_2d_array);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_CUBE,
+    &_backend_native_texture_create_cube);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL,
+    &_backend_native_texture_write_layer_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
@@ -2409,6 +2557,8 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_create_2d_sampleable);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
     &_backend_native_texture_bind_for_sample);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER,
+    &_backend_native_texture_bind_for_sample_layer);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
@@ -2520,12 +2670,29 @@ var NATIVE_TEX_FIELD_MIP_COUNT = 40;
 var NATIVE_TEX_FIELD_FMT       = 44;   # v3.2 T.7 — MABDA_TEXFMT_* (0 = RGBA8); was pad
 var NATIVE_TEX_FIELD_SW_MODE   = 48;   # v3.2 TS.3 — GFX9 SW_MODE (0 = LINEAR)
 var NATIVE_TEX_FIELD_T_VA      = 52;   # v3.2 TS.3 — VA of the T#+S# descriptor BO (0 = none)
-var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable)
+var NATIVE_TEX_FIELD_SLICE_COUNT = 60; # v3.4 AA.0 — array layers / cube faces (0 or 1 = single 2D); was pad
+var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable); +60 pad reused by AA.0, still 64
 
 # v3.2 TS.3 — NativeTexture sampleable-field accessors.
 fn native_tex_fmt(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_FMT); }
 fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE); }
 fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
+# v3.4 AA.0/AA.5d — slice count (array layers / cube faces) in the low 31 bits of
+# +60; bit 31 is the IS-CUBE flag (count needs only 12 bits — GFX9 DEPTH[0:12]).
+# 0 or 1 == a single 2D layer (back-compat: every existing create leaves +60
+# zeroed via memset, so slice_count 0 / not-cube). The cube flag lets
+# bind_for_sample pick the cube S# (unnorm=0) — a cube needs normalized face u/v.
+fn native_tex_slice_count(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) & 0x7FFFFFFF; }
+fn native_tex_set_slice_count(tex, n): i64 { store32(tex + NATIVE_TEX_FIELD_SLICE_COUNT, n); return 0; }
+fn native_tex_is_cube(tex): i64 {
+    if ((load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) & 0x80000000) != 0) { return 1; }
+    return 0;
+}
+fn native_tex_set_cube(tex): i64 {
+    store32(tex + NATIVE_TEX_FIELD_SLICE_COUNT,
+    load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) | 0x80000000);
+    return 0;
+}
 fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
 fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
 # v3.2 TS.8 — CPU (mmap'd) address of the descriptor tail (T#/S#/scale BO), for
@@ -2533,6 +2700,11 @@ fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va);
 # as t_va is past va, so addr + (t_va - va) is its CPU address. 0 if not sampleable.
 fn native_tex_desc_cpu_addr(tex): i64 {
     if (native_tex_t_va(tex) == 0) { return 0; }
+    # No CPU mapping (ADDR == 0) -> no CPU-accessible descriptor. A real
+    # sampleable tex always has ADDR (the mmap'd base); returning 0 here keeps
+    # the "non-zero desc_cpu == a valid CPU write target" invariant the AA.2
+    # layered-bind +56 write relies on (a fake-VA test tex has ADDR 0).
+    if (load64(tex + NATIVE_TEX_FIELD_ADDR) == 0) { return 0; }
     return load64(tex + NATIVE_TEX_FIELD_ADDR)
     + (native_tex_t_va(tex) - load64(tex + NATIVE_TEX_FIELD_VA));
 }
