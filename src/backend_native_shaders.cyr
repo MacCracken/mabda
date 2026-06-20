@@ -570,6 +570,50 @@ fn native_gfx9_shader_textured_load_array_fs(buf, pos): i64 {
 
 var GFX9_FS_TEXTURED_LOAD_ARRAY_SIZE = 128;
 
+# ================================================================
+# v3.4 AA.5b — CUBEMAP fragment shader (image_sample, DA=1, direction)
+# ================================================================
+# Samples a cubemap: a CUBE T# (TYPE=11) + image_sample DA=1 takes v[4:6] =
+# (s, t, FACE_ID) — on GFX9 the 3rd component is the FACE INDEX (0..5 =
+# +X,-X,+Y,-Y,+Z,-Z), NOT a raw direction. A consumer computes (face,s,t) from a
+# direction with the v_cube* ALU (v_cubeid/sc/tc/ma); this FS takes them directly
+# as three inline-float `v_mov`s (src_x=s, src_y=t, src_z=faceid — GFX9 inline
+# codes, e.g. GFX9_INLINE_F32_0_0 / _4_0). So a draw samples one face across the
+# whole quad. AA.5b oracle: a solid-color face means s/t don't matter, so
+# RT == face[faceid]'s color proves the CUBE T# face addressing on HW. (HW-found:
+# passing a raw direction (0,0,1) sampled face 1 — the 3rd component is faceid.)
+#
+# ABI: s[0:1] = T#/S# descriptor VA (T#@+0, S#@+32 — the bind rebuilds the S#).
+# High-water VGPRs v0..v6 (7), SGPRs s0..s11 (12) — fit RSRC1_PS MIN|1, so the
+# render_pass_draw textured override is reused unchanged.
+#
+# image_sample DA encoding confirmed via llvm-mc -mcpu=gfx900:
+#   image_sample v[0:3], v[4:6], s[0:7], s[8:11] dmask:0xf da
+#     -> [0x00,0x4f,0x80,0xf0, 0x04,0x00,0x40,0x00]  (w0=0xF0804F00, w1=0x00400004)
+# Returns pos + 120 (56 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_cube_sample_fs(buf, pos, src_x, src_y, src_z): i64 {
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 8, 0, 0));   # S# s[8:11]
+    p = gfx9_emit32(buf, p, 0x00000020);   # offset 0x20 (descriptor+32)
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 4, src_x));   # dir.s
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 5, src_y));   # dir.t
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 6, src_z));   # dir.r
+    # image_sample (cube, DA) + exp are graphics/texture ops — raw literals
+    # (llvm-mc-verified above).
+    p = gfx9_emit32(buf, p, 0xF0804F00);   # image_sample v[0:3], v[4:6], s[0:7], s[8:11] dmask:0xf DA (w0)
+    p = gfx9_emit32(buf, p, 0x00400004);   # (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
+}
+
+var GFX9_FS_CUBE_SAMPLE_SIZE = 120;
+
 # SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
 # gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
 # POS_Y_FLOAT_ENA[9]. (1<<1)|(1<<8)|(1<<9) = 0x302. Shared by both textured FS.

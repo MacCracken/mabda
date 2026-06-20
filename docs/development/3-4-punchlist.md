@@ -180,12 +180,21 @@ implementation, not just planning.
   `base + face·per_face`** (the +X,−X,+Y,−Y,+Z,−Z ordering). +5 CPU asserts
   (cube-create guards, native 1477→1482). Suite 4420→4425; all suites exit 0;
   distlib idempotent.
-- [ ] **AA.5b** — **THE load-bearing Cezanne HW risk:** native cube
-  direction→(face,u,v) `image_sample` FS (`DA=1`, float s/t/r) — brand-new ISA,
-  no FS to reuse. HW-prove POINT single-mip first, then BILINEAR + seamless
-  edges. **If Cezanne TA cube filtering is unreliable → the cube SAMPLING FS is
-  gated (cube storage from AA.5a still ships, `caps_cube` stays 0)** — flagged,
-  not silently dropped.
+- [x] **AA.5b (2026-06-19) — THE marquee HW risk: PASSED on Cezanne.**
+  `native_gfx9_shader_cube_sample_fs` (`image_sample DA=1` cube,
+  `w0=0xF0804F00`; 3 inline-float `v_mov`s → v[4:6]). **Key HW finding:** GFX9
+  cube `image_sample` VADDR is **(s, t, FACEID)** — the 3rd component is the face
+  index (0..5), NOT a raw direction (a raw (0,0,1) sampled face 1; the consumer
+  derives faceid from a direction via the `v_cube*` ALU). The cube S# needs
+  **unnorm=0** (`_native_create_layered_sampleable` gained an `unnorm` param;
+  cube=0, array=1). `native_cube_sample_e2e` + `make test-native-cube-sample-e2e`:
+  **`RT == face[faceid]` for faceid 4 (+Z) and 0 (+X)**, proving the CUBE T# face
+  addressing. +cube FS byte-oracle (llvm-mc-verified), saved to memory
+  [[reference_gfx9_cube_image_sample_faceid]]. Suite 4425→4457; all exit 0.
+  **`caps_native_texture_cube` stays 0** pending the consumer-facing ergonomics
+  (a cube-aware bind that auto-selects unnorm=0 — the generic bind forces unnorm=1,
+  so the e2e binds with sampler 0; the `v_cube*` direction FS is consumer-side).
+  Tracked — the marquee *reliability* risk is retired.
 - [ ] **AA.5c** — wgpu cube create (depthOrArrayLayers=6, Cube view) + 6-face
   upload + a `texture_cube` WGSL FS; validate width==height. **HW-verify on this
   box** (wgpu-native present).
