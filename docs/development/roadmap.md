@@ -1,23 +1,24 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 49 domain modules, ~22,280 lines, 4079 CPU assertions across 16
+> 51 domain modules, ~23,900 lines, 4540 CPU assertions across 17
 > functionality-named domain test files + GPU integration programs +
 > 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle
-> ~22,290 lines.
+> ~23,900 lines.
 >
-> _Header stats current as of v3.2.14 (2026-06-19): v3.0 (dual backend),
-> v3.1.0–3.1.1 (mipmaps + multi-queue), and the full v3.2.x arc (compressed
+> _Header stats current as of v3.4.2 (2026-06-19): v3.0 (dual backend),
+> v3.1.0–3.1.1 (mipmaps + multi-queue), the full v3.2.x arc (compressed
 > textures → SPIR-V → native SPIR-V→GFX9 compiler → f64 → render-graph
-> multi-queue, 3.2.0–3.2.14) all shipped, native HW-verified on Cezanne.
-> Nothing in the v3.2.x arc deferred to v3.3/v4._
+> multi-queue, 3.2.0–3.2.14), v3.3 (asset loading) and v3.4 (array textures +
+> cubemaps, 3.4.0–3.4.2) all shipped, native HW-verified on Cezanne. The v3.x
+> feature arc is complete; next scheduled work is v4.0 (NVIDIA native)._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
 source of truth for completed work. Shipped-section details are
 pruned from this file as each arc closes so it stays useful for
 planning instead of bloating with history (v2.x pruned 2026-04-21;
-v3.0 / v3.1 / v3.2 pruned 2026-06-19 once the v3.2.x arc shipped).
+v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19 once those arcs shipped).
 
 ## The Long Arc
 
@@ -63,9 +64,10 @@ cross-vendor default.
                         compiler + f64 + render-graph multi-queue
                         (3.2.0–3.2.14) — arc done
   v3.3   [SHIPPED] ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
-                        new chitra package), 3.3.0; arrays/cubes + JPEG → v3.4+
+                        new chitra package), 3.3.0 (JPEG → chitra v0.2+)
   v3.4   [SHIPPED] ─▶  array textures + cubemaps (Phase AA / AL-ARRAY) —
-                        create/upload/sample on both backends + DDS/KTX2 load
+                        both backends + DDS/KTX2 load (3.4.0); 3.4.1 backlog +
+                        3.4.2 RT-allocator fixes cleared — arc done
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
                         retires (AMD consumers run on AMD native only)
@@ -117,6 +119,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.4.2](../../CHANGELOG.md#342--2026-06-19) | RT-allocator fixes (puka integration) — native render-target 64 KiB `va_map` alignment + per-context RT VA bump allocator (both HW-verified on Cezanne); `color_rgb` warning diagnosed consumer-side, `cyim` issue resolved |
 | [3.4.1](../../CHANGELOG.md#341--2026-06-19) | v3.4.1 backlog cleared — native BC tiled arrays + wgpu draw-time layer (both HW-verified on Cezanne) + the attn11 `F64_*`↔`math` stdlib collision fix (namespace `MABDA_F64_*`) |
 | [3.4.0](../../CHANGELOG.md#340--2026-06-19) | Array textures + cubemaps (Phase AA) — create/upload/sample on both backends + DDS/KTX2 array+cube load; HW-verified end-to-end on Cezanne (incl. the data-ordering capstone) |
 | [3.3.0](../../CHANGELOG.md#330--2026-06-19) | Asset loading (Phase AL) — DDS + KTX2 loaders (in mabda) + PNG via the chitra package + magic-byte sniffer; native PNG path HW-verified, 1 CRITICAL parser bug found+fixed pre-cut |
@@ -165,86 +168,6 @@ consumer request arrives. Listed so they don't get lost.
   (RenderDoc, PIX, RGP) show the graph structure.
 - **Graph visualizer.** Export a DOT file or similar from the
   toposorted node/edge list. Consumer-requested; not core.
-
----
-
-## v3.3 — Asset Loading (SHIPPED — 3.3.0, 2026-06-19)
-
-mabda could create + sample textures but could not **load** one from a
-file / byte buffer. v3.3 closed that with three loaders behind one split —
-**decode is CPU (in a package); container-parse + GPU upload is in mabda.**
-Shipped 2026-06-19 (`33x` branch, toolchain 6.2.23) as a single **3.3.0** cut
-(AL.0–AL.6); native PNG path **HW-verified on Cezanne**
-(`native_load_png_e2e`: file → chitra decode → upload → sample → pixel-exact).
-A pre-cut adversarial security review of the untrusted-input parsers found +
-fixed **1 CRITICAL** (KTX2 `byteOffset` signed-overflow OOB) — see
-[`docs/audit/2026-06-19-asset-loading-audit.md`](../audit/2026-06-19-asset-loading-audit.md).
-See the **punchlist** + two **proposals**:
-
-- Punchlist: [`3-3-punchlist.md`](../archive/punchlists/3-3-punchlist.md)
-- Asset loading (mabda): [`v3.3-asset-loading.md`](../archive/proposals/v3.3-asset-loading.md)
-- chitra PNG decoder package: [`v3.3-chitra-png-decoder-package.md`](../archive/proposals/v3.3-chitra-png-decoder-package.md)
-
-**The original "dependency-gated, no decoder exists" framing was wrong.** The
-stdlib `sankoch` already ships zlib/DEFLATE inflate, and `kii` already has a
-fuzz-hardened PNG decoder. So v3.3:
-
-- **KTX2 + DDS** — parsed in mabda; GPU-ready blocks (mips, BC/compressed)
-  placed per level. **Ungated** — rides the 3.2.x compressed-texture stack.
-- **PNG** — decoded to RGBA8 by a **new pure-Cyrius sibling package, `chitra`**
-  (a fork+adaptation of kii's PNG core over `sankoch`), which mabda deps; mabda
-  uploads the RGBA8.
-
-Adds to mabda: a VkFormat/DXGI→`MABDA_TEXFMT_*` map, per-mip-level upload +
-generalized mipped create (two new Backend slots, `BACKEND_SIZE` 280→296), a
-caps-on-ctx gate, and the `gpu_texture_load_{ktx2,dds,png}` + sniffer API.
-Arc spans **3.3.0 → 3.3.7** (smallest-risk-first; the chitra package cut is the
-one cross-repo edge).
-
-**Still gated / deferred (tracked, not dropped):** KTX2 supercompression
-(BasisLZ/Zstd/ZLIB — needs a Zstd/Basis decoder); **JPEG** (chitra v0.2+);
-**array layers / cubemaps** (parsed-and-rejected-loud in 3.3.x → real support
-in v3.4, Phase AL-ARRAY); ETC2/ASTC sampling stays HW-blocked on Cezanne (caps
-gate catches it). sRGB policy decided in AL.0.
-
----
-
-## v3.4 — Array Textures + Cubemaps (SHIPPED — 3.4.0, 2026-06-19)
-
-The v3.3 DDS/KTX2 loaders already **parse** `arraySize`/`faceCount`/`layerCount`
-and fail loud. v3.4 (**Phase AA / AL-ARRAY**) made them real: **2D array
-textures** + **cubemaps** — create, per-layer upload, and sampling — on both
-backends, with the loaders flipped from reject to load. All **additive** (no
-consumer call signature changes). Branch `34x`, toolchain 6.2.26; planned
-2026-06-19 via the `v34-al-array-plan` design workflow. See the **punchlist**:
-
-- Punchlist: [`3-4-punchlist.md`](../archive/punchlists/3-4-punchlist.md)
-- Design: [`v3.4-array-cube-textures.md`](../archive/proposals/v3.4-array-cube-textures.md)
-
-The native delta is small + `gfx9.json`-isolated (T# `TYPE` 2D→2D_ARRAY/CUBE,
-`DEPTH` = slice−1; a per-draw `layer` in the descriptor tail; the sampling FS
-gains `DA=1` + a slice VADDR). An N-slice array is **one BO** (slice k at
-`base + k·slice_pitch`); a cube is a 6-slice array (faces +X,−X,+Y,−Y,+Z,−Z).
-wgpu is pure descriptor/view parameterization + new WGSL FS, zero new FFI.
-
-**Sequence (smallest-risk-first):** AA.0 API/slots → AA.1 native 2D-array
-storage → AA.2 native 2D-array sample → AA.3 wgpu 2D-array → AA.4 native
-compressed (tiled) array → AA.5 cube (native + wgpu) → AA.6 DDS/KTX2 load → AA.7
-HW e2e + cut. One **3.4.0** cut (3.3.0 precedent).
-
-**Shipped (HW-verified on Cezanne):** native + wgpu 2D arrays (create/upload/
-sample), native + wgpu cubes (the GFX9 cube `image_sample` takes a face *index*,
-not a raw direction — the v_cube* projection is consumer-side; wgpu/naga projects
-a direction), the DDS/KTX2 array+cube loaders, and the data-ordering capstone
-(file image k → backend slice k). Layered *render* (rendering INTO layers/faces)
-stayed OUT OF SCOPE (sample-one-layer-per-draw); ETC2/ASTC arrays stay HW-blocked.
-
-**Shipped in 3.4.1 (the v3.4.1 backlog, all landed):** **AA.4** native compressed/
-tiled arrays (BC, HW-verified — 64KB_S is a 2D swizzle so slice k is at
-`base + k*tiled_size`, no addrlib port); **AA.3c** wgpu draw-time layer selection
-(HW-verified, a layer uniform the array/cube WGSL reads); and the **`F64_HALF`/
-`F64_TWO` ↔ `math` stdlib collision** (the attn11 block) — namespaced to
-`MABDA_F64_*`, attn11 unblocked. Nothing from the v3.4 arc remains deferred.
 
 ---
 
