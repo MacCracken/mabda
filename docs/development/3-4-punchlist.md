@@ -85,12 +85,18 @@ implementation, not just planning.
   `_CUBE=11` consts. +9 asserts (native 1408→1417: TYPE 13/11 + DEPTH 7/5 + the
   slice-count-0 clamp + a byte-for-byte wrapper==_typed(2D,1) round-trip check).
   Suite 4327→4336; distlib idempotent.
-- [ ] **AA.1b** — native 2D-array RGBA8 **LINEAR** storage +
-  `write_layer_level`: `_backend_native_texture_create_2d_array_sampleable`
-  (slice_count · per-slice surface contiguous + the T#/S# tail, array T# via
-  AA.1a); native write adds `layer·slice_pitch`. **HW-verify on Cezanne:** write
-  distinct-color slices, SDMA-read each back, CPU-verify per-slice bytes (no
-  sampling yet).
+- [x] **AA.1b (2026-06-19) — HW-VERIFIED on Cezanne.**
+  `_backend_native_texture_create_2d_array_sampleable` (one BO of `layers·per_slice`
+  contiguous slices + the T#/S# tail, array T# via the AA.1a `_typed` builder;
+  `NATIVE_TEX_FIELD_SIZE` = per-slice bytes, `slice_count` = layers) +
+  `_backend_native_texture_write_layer_level` (LINEAR: dest `+= layer·per_slice`;
+  level>0 / tiled fail loud → AA.4). Slots wired in `backend_native_new`.
+  `programs/native_array_store_e2e.cyr` + `make test-native-array-store-e2e`:
+  4-layer 64×64 RGBA8 array created on the GPU (real BO + VA map), distinct color
+  per layer written, **each reads back correct at `base + layer·per_slice`**.
+  +17 CPU asserts (native 1417→1434: write_layer slice-math + both fillers' guard
+  ladders). LINEAR/uncompressed only (compressed array = AA.4). Suite 4336→4353;
+  smoke/lint/fmt/distlib green.
 
 ## Phase AA.2 — Native 2D-array sampling FS (DA=1 + slice VADDR) [M]
 

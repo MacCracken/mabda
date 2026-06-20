@@ -1557,6 +1557,72 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     return tex;
 }
 
+# v3.4 AA.1b — create a sampleable 2D ARRAY texture (LINEAR / uncompressed).
+# One BO holds [layers contiguous slices | pad-256 | T#(32)+S#(16)]; the T# is a
+# 2D_ARRAY descriptor (TYPE=13, DEPTH=layers-1) so the TA reads slice k at
+# base + k*slice_pitch, slice_pitch = per-slice surface (LINEAR, tightly packed:
+# depth_pitch = width*height elements). Per-slice data lands via write_layer_level.
+# NATIVE_TEX_FIELD_SIZE holds the PER-SLICE logical bytes (the write_layer bound);
+# slice_count holds the layer count. Compressed (tiled) arrays are AA.4 (the tiled
+# slice stride is an addrlib question) and fail loud here. Returns tex_ptr | 0.
+fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (layers < 1)  { return 0; }
+    if (layers > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
+    var per_slice = mabda_texfmt_data_size(fmt, width, height);
+    if (per_slice == 0) { return 0; }
+    # AA.1b is LINEAR only; compressed (tiled) arrays need the slice stride
+    # resolved against addrlib (AA.4) — fail loud rather than mis-tile.
+    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }
+    var fd = native_ctx_fd(ctx);
+    var surf_size = per_slice * layers;   # layers,dims dispatcher-bounded -> no i64 overflow
+    var desc_off = _native_align_up(surf_size, 256);
+    var bo_size = _native_align_up(desc_off + 64, 4096);
+    var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    if (va == 0) { return 0; }
+    var bo[16];
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) { return 0; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA) != 0) {
+        native_bo_release_gtt(fd, handle, addr, bo_size);
+        return 0;
+    }
+    var daddr = addr + desc_off;
+    memset(daddr, 0, 64);
+    native_gfx9_image_descriptor_typed(daddr, 0, va, width, height, fmt,
+    GFX9_SW_MODE_LINEAR, 1, width - 1, GFX9_SQ_RSRC_IMG_2D_ARRAY, layers);
+    native_gfx9_sampler_descriptor(daddr, 32,
+    NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);
+    store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
+    store32(daddr + 52, 0x3F800000);   # scale_y = 1.0f
+    var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(tex + NATIVE_TEX_FIELD_VA,     va);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   per_slice);   # PER-SLICE bytes (write_layer bound)
+    store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
+    native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
+    native_tex_set_t_va(tex, va + desc_off);
+    native_tex_set_slice_count(tex, layers);
+    return tex;
+}
+
+# v3.4 AA.1b — native filler for gpu_texture_create_2d_array (slot wrapper).
+fn _backend_native_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
+    return _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers);
+}
+
 # v3.2 TS.5 — bind a sampleable texture into a render pass (native). Stashes
 # the texture's T#/S# descriptor VA on the pass; the next render_pass_draw
 # emits the PS USER_DATA SET_SH_REG from it (the textured-FS PM4 path, next
@@ -1867,6 +1933,34 @@ fn _backend_native_texture_write_level(ctx, tex, level, src, n): i64 {
         return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
     }
     memcpy(addr + native_tex_level_offset(fmt, w, h, level), src, n);
+    return 0;
+}
+
+# v3.4 AA.1b — upload one array layer / cube face at one mip level (LINEAR).
+# dest = addr + layer*per_slice (+ level offset). Validates layer in
+# [0, slice_count), n == the per-slice logical size, LINEAR surface. AA.1b is
+# single-level (level 0); mipped arrays + tiled (compressed) array upload land
+# with AA.4/AA.6 and fail loud here. A non-array texture (slice_count 0) accepts
+# layer 0 (per_slice == the whole surface), so the loaders' single-image path
+# can route through here uniformly. Returns 0 | GPU_ERR_*.
+fn _backend_native_texture_write_layer_level(ctx, tex, layer, level, src, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
+    var slices = native_tex_slice_count(tex);
+    if (slices < 1) { slices = 1; }              # 0 == a single-layer texture
+    if (layer >= slices) { return GPU_ERR_TEXTURE; }
+    if (level != 0) { return GPU_ERR_NOT_IMPLEMENTED; }   # mipped arrays: AA.4/AA.6 #skip-lint
+    var per_slice = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    if (n != per_slice) { return GPU_ERR_BUFFER; }        # per-slice size mismatch
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (native_tex_sw_mode(tex) != GFX9_SW_MODE_LINEAR) {
+        return GPU_ERR_NOT_IMPLEMENTED;   # tiled (compressed) array upload is AA.4 #skip-lint
+    }
+    memcpy(addr + layer * per_slice, src, n);
     return 0;
 }
 
@@ -2370,6 +2464,11 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_write);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL,
     &_backend_native_texture_write_level);
+    # v3.4 AA.1b — 2D array create + per-layer upload (cube create is AA.5).
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY,
+    &_backend_native_texture_create_2d_array);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL,
+    &_backend_native_texture_write_layer_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,
     &_backend_native_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
