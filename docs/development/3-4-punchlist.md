@@ -130,10 +130,14 @@ implementation, not just planning.
 
 ## Phase AA.3 — wgpu 2D-array create + upload + sample [M]
 
-- [ ] **AA.3a** — wgpu view-dim consts (`2D_ARRAY=3` / `CUBE=4` / `CUBE_ARRAY=5`,
-  webgpu.h values) + `wgpu_texture_descriptor_layered` (depthOrArrayLayers) +
-  layered view builder (dimension@+28, arrayLayerCount@+44, baseArrayLayer@+40).
-  Descriptor byte-offset asserts.
+- [x] **AA.3a (2026-06-19)** — wgpu view-dim consts (`2D_ARRAY=3`/`CUBE=4`/
+  `CUBE_ARRAY=5`, **pinned against `deps/wgpu-native/include/webgpu/webgpu.h`**) +
+  `wgpu_texture_descriptor_layered` (depthOrArrayLayers@+44 = layers; tex
+  dimension stays 2D) + `wgpu_texture_view_descriptor_array` (dimension@+28 =
+  2DArray, arrayLayerCount@+44 = layers, baseArrayLayer@+40 = 0). +11 asserts
+  (backend 521→532, descriptor byte-offsets). **Confirmed the wgpu path still
+  links/runs on 6.2.28** (`make test-phase0` green — context/buffers/textures/
+  samplers), so AA.3b is HW-verifiable here. Suite 4409→4420; distlib idempotent.
 - [ ] **AA.3b** — wgpu `create_2d_array` (2DArray view) + `write_layer_level`
   (writeTexture origin.z) + a `texture_2d_array` WGSL FS; grow the 32-B wgpu tex
   wrapper with layer count + view dim. **HW-verify on this box** (wgpu-native +
