@@ -100,10 +100,20 @@ implementation, not just planning.
 
 ## Phase AA.2 — Native 2D-array sampling FS (DA=1 + slice VADDR) [M]
 
-- [ ] **AA.2a** — per-draw `layer@+56` descriptor tail: write in
-  `_backend_native_render_pass_draw` beside the scale writes; FS s-loads it.
-  Fixes one layer per draw (sufficient for the AA.6 loader path; **layered
-  *render* is out of scope, flagged**). Tail-offset + draw-write tests.
+- [x] **AA.2a (2026-06-19)** — layer plumbing. The array slice is recorded in the
+  descriptor tail at **+56** at BIND time (the draw writes scale@+48/+52 but
+  leaves +56, so it survives — no pass-field/draw change needed).
+  `gpu_render_pass_bind_texture_layer(ctx,pass,tex,sampler,layer)` (new slot
+  `BIND_FOR_SAMPLE_LAYER`=320, `BACKEND_SIZE` 320→328) → native
+  `_backend_native_texture_bind_for_sample_layer` writes `dcpu+56=layer`; the
+  plain bind = this with layer 0 (a re-bind resets the layer). **Fix:**
+  `native_tex_desc_cpu_addr` now returns 0 when `ADDR==0` — the refactor's
+  unconditional +56 write would otherwise hit a fake-VA test tex's unmapped
+  address (caught a real **segfault**; the grep-for-`failed` suite check missed
+  it — now gate on exit code, see [[feedback_verify_test_suites_by_exit_code]]).
+  +22 asserts (backend 508→521 dispatch/guards/size-pin; native 1434→1443
+  +56-write + reset + guards). Suite 4353→4375; all suites exit 0; distlib idempotent.
+  (One sampled layer per draw; layered *render* is a later arc.)
 - [ ] **AA.2b** — 2D-array `image_sample` FS (`DA=1` w0 |= 1<<14, 3rd VADDR v6 =
   slice) + bind (S#-from-sampler reused; dimension baked in the T#). **HW-verify
   on Cezanne:** `RT[x,y] == array_tex[layer,x,y]` pixel-exact, POINT then

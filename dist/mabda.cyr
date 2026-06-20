@@ -2660,7 +2660,12 @@ var BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY      = 296;
 var BACKEND_SLOT_TEXTURE_CREATE_CUBE          = 304;
 var BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL    = 312;
 
-var BACKEND_SIZE                         = 320;
+# v3.4 AA.2 — array-aware bind: select which array layer / cube face a draw
+# samples (the plain bind_for_sample at 272 fixes layer 0). Separate slot — the
+# layer arg can't fold into the fncall4 bind slot.
+var BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER = 320;
+
+var BACKEND_SIZE                         = 328;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -2737,6 +2742,10 @@ var BACKEND_FMTMIPPED_SLOTS_END          = 296;
 # v3.4 AA.0 array/cube + write-layer block: 296..320. Layout in tree.
 var BACKEND_ARRAYCUBE_SLOTS_BEGIN        = 296;
 var BACKEND_ARRAYCUBE_SLOTS_END          = 320;
+
+# v3.4 AA.2 array-aware bind block: 320..328. Layout in tree.
+var BACKEND_BINDLAYER_SLOTS_BEGIN        = 320;
+var BACKEND_BINDLAYER_SLOTS_END          = 328;
 
 # ================================================================
 # Backend struct construction
@@ -14599,28 +14608,37 @@ fn _backend_native_texture_create_2d_array(ctx, width, height, fmt, layers): i64
 # sub-bite). `sampler` is accepted for API stability but unused on the
 # image_load MVP path (the FS reads no S#); rebuilding the S# from an explicit
 # sampler is TS.7 (image_sample). Returns 0|GPU_ERR_*.
-fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+# v3.4 AA.2 — array-aware bind: also records the array slice / cube face `layer`
+# the next draw samples, in the descriptor tail at +56 (the draw writes
+# scale@+48/+52 but leaves +56, so it survives). The plain bind_for_sample below
+# is this with layer 0 (so a re-bind after a layered bind resets to layer 0).
+fn _backend_native_texture_bind_for_sample_layer(ctx, pass, tex, sampler, layer): i64 {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
     if (tex == 0)  { return GPU_ERR_TEXTURE; }
     if (native_tex_t_va(tex) == 0) { return GPU_ERR_TEXTURE; }   # not sampleable
-    # v3.2 TS.8b — rebuild the S# (descriptor +32) from the bound sampler's
-    # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes effect.
-    # unnorm stays 1 (the FS feeds texel-space coords). A POINT/CLAMP sampler
-    # rebuilds byte-identically to the create-baked default, so the existing
-    # (POINT) sample e2es are unaffected; only fires for a valid sampler.
-    if (gpu_sampler_is_valid(sampler) != 0) {
-        var dcpu = native_tex_desc_cpu_addr(tex);
-        if (dcpu != 0) {
+    var dcpu = native_tex_desc_cpu_addr(tex);
+    if (dcpu != 0) {
+        # v3.2 TS.8b — rebuild the S# (descriptor +32) from the bound sampler's
+        # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes
+        # effect. unnorm stays 1. POINT/CLAMP rebuilds byte-identically to the
+        # create default (existing sample e2es unaffected); only for a valid sampler.
+        if (gpu_sampler_is_valid(sampler) != 0) {
             native_gfx9_sampler_descriptor(dcpu, 32,
             gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), 1);
         }
+        # v3.4 AA.2 — the array slice (int) the array image_sample/load FS s-loads
+        # as its 3rd VADDR. Written every bind so layer 0 is the explicit default.
+        store32(dcpu + 56, layer);
     }
-    # Stash the tex pointer: the draw derives the descriptor VA
-    # (native_tex_t_va, for the PS USER_DATA) + the surface BO handle (for
-    # residency) from it.
+    # Stash the tex pointer: the draw derives the descriptor VA (for the PS
+    # USER_DATA) + the surface BO handle (for residency) from it.
     store64(pass + NATIVE_PASS_FIELD_BOUND_TEX, tex);
     return 0;
+}
+
+fn _backend_native_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
+    return _backend_native_texture_bind_for_sample_layer(ctx, pass, tex, sampler, 0);
 }
 
 # v3.1 [M.6]: native mipped-texture create slot. One chain BO sized to the
@@ -15487,6 +15505,8 @@ fn backend_native_new(): i64 {
     &_backend_native_texture_create_2d_sampleable);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
     &_backend_native_texture_bind_for_sample);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER,
+    &_backend_native_texture_bind_for_sample_layer);
     backend_set_kind(b, BACKEND_KIND_AMD);
     return b;
 }
@@ -15616,6 +15636,11 @@ fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va);
 # as t_va is past va, so addr + (t_va - va) is its CPU address. 0 if not sampleable.
 fn native_tex_desc_cpu_addr(tex): i64 {
     if (native_tex_t_va(tex) == 0) { return 0; }
+    # No CPU mapping (ADDR == 0) -> no CPU-accessible descriptor. A real
+    # sampleable tex always has ADDR (the mmap'd base); returning 0 here keeps
+    # the "non-zero desc_cpu == a valid CPU write target" invariant the AA.2
+    # layered-bind +56 write relies on (a fake-VA test tex has ADDR 0).
+    if (load64(tex + NATIVE_TEX_FIELD_ADDR) == 0) { return 0; }
     return load64(tex + NATIVE_TEX_FIELD_ADDR)
     + (native_tex_t_va(tex) - load64(tex + NATIVE_TEX_FIELD_VA));
 }
@@ -21148,6 +21173,23 @@ fn gpu_render_pass_bind_texture(ctx, pass, tex, sampler): i64 {
     var slot = backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE);
     if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
     return fncall4(slot, ctx, pass, tex, sampler);
+}
+
+# v3.4 AA.2 — bind an array/cube texture selecting which `layer` (array slice /
+# cube face) the next draw samples. The plain gpu_render_pass_bind_texture fixes
+# layer 0; this routes the layer through the bind-layer slot (native records it
+# in the descriptor tail the sampling FS reads). One sampled layer per draw
+# (layered render is a later arc — 3-4 punchlist). Returns 0|GPU_ERR_*. # @public
+fn gpu_render_pass_bind_texture_layer(ctx, pass, tex, sampler, layer): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (pass == 0)  { return GPU_ERR_OTHER; }
+    if (tex == 0)   { return GPU_ERR_TEXTURE; }
+    if (layer < 0)  { return GPU_ERR_TEXTURE; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0)     { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }  #skip-lint
+    return fncall5(slot, ctx, pass, tex, sampler, layer);
 }
 
 # --- queue.cyr ---

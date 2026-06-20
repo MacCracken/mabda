@@ -541,7 +541,13 @@ fn test_backend_struct_layout() {
     assert_eq(BACKEND_ARRAYCUBE_SLOTS_END,            320, "arraycube range ends 320");
     assert_eq(BACKEND_ARRAYCUBE_SLOTS_BEGIN, BACKEND_FMTMIPPED_SLOTS_END,
     "arraycube range starts where fmtmipped range ends (no gap/overlap)");
-    assert_eq(BACKEND_SIZE,                               320, "total = 320");
+    # v3.4 AA.2: array-aware bind slot appended at 320..328.
+    assert_eq(BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER, 320, "bind_for_sample_layer at 320");
+    assert_eq(BACKEND_BINDLAYER_SLOTS_BEGIN, 320, "bindlayer range begins 320");
+    assert_eq(BACKEND_BINDLAYER_SLOTS_END,   328, "bindlayer range ends 328");
+    assert_eq(BACKEND_BINDLAYER_SLOTS_BEGIN, BACKEND_ARRAYCUBE_SLOTS_END,
+    "bindlayer range starts where arraycube range ends (no gap/overlap)");
+    assert_eq(BACKEND_SIZE,                               328, "total = 328");
     return 0;
 }
 
@@ -2005,6 +2011,37 @@ fn test_gpu_caps_native_texture_array_cube() {
     return 0;
 }
 
+# v3.4 AA.2a — bind_texture_layer dispatch + guards + null-slot.
+var _bl_count = 0;
+var _bl_layer = 0;
+fn _bl_cap(ctx, pass, tex, sampler, layer) {
+    _bl_count = _bl_count + 1;
+    _bl_layer = layer;
+    return 0;
+}
+fn test_gpu_render_pass_bind_texture_layer_dispatch() {
+    _bl_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER, &_bl_cap);
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 32, b);
+    assert_eq(gpu_render_pass_bind_texture_layer(ctx, 0x111, 0x222, 0x333, 5), 0, "dispatched");
+    assert_eq(_bl_count, 1, "dispatched once");
+    assert_eq(_bl_layer, 5, "layer arg propagated (fncall5)");
+    assert_eq(gpu_render_pass_bind_texture_layer(0, 0x111, 0x222, 0, 0), GPU_ERR_OTHER, "null ctx -> OTHER");
+    assert_eq(gpu_render_pass_bind_texture_layer(ctx, 0, 0x222, 0, 0), GPU_ERR_OTHER, "null pass -> OTHER");
+    assert_eq(gpu_render_pass_bind_texture_layer(ctx, 0x111, 0, 0, 0), GPU_ERR_TEXTURE, "null tex -> TEXTURE");
+    assert_eq(gpu_render_pass_bind_texture_layer(ctx, 0x111, 0x222, 0, 0 - 1), GPU_ERR_TEXTURE, "neg layer -> TEXTURE");
+    var b2 = backend_new();
+    var ctx2 = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx2, 0, GPU_CONTEXT_SIZE);
+    store64(ctx2 + 32, b2);
+    assert_eq(gpu_render_pass_bind_texture_layer(ctx2, 0x111, 0x222, 0, 0),
+    GPU_ERR_NOT_IMPLEMENTED, "unfilled slot -> not-impl");  #skip-lint
+    return 0;
+}
+
 fn test_gpu_render_pass_bind_texture_dispatch() {
     _ts3_bind_count = 0;
     var b = backend_new();
@@ -2166,6 +2203,7 @@ fn main() {
     test_gpu_texture_create_cube_dispatch();
     test_gpu_texture_write_layer_level_dispatch();
     test_gpu_caps_native_texture_array_cube();
+    test_gpu_render_pass_bind_texture_layer_dispatch();
     test_gpu_render_pass_bind_texture_dispatch();
     test_wgpu_texture_bind_group_descriptor();
     test_wgpu_sampler_descriptor_from_intent();
