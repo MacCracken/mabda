@@ -224,15 +224,22 @@ implementation, not just planning.
   `[boff, boff+blen) ⊆ [0, len)` — so no per-image add can overflow or read OOB.
   +10 asserts (asset_load 138→148: even splits, div-by-zero, non-divisible,
   negative). Suite 4462→4470; all exit 0; distlib idempotent.
-- [ ] **AA.6b** — KTX2 array + cube load: remove the faceCount/layerCount
-  rejects; surface `layer_count` + `face_count`; **mip-outer, layer-inner**
-  loop; `blen == per_image · layers · faces`; route to create_2d_array /
-  create_cube + write_layer_level. Existing reject asserts **flip** to
-  successful-parse + correct-count asserts.
-- [ ] **AA.6c** — DDS array (DX10 arraySize) + cube (legacy dwCaps2 + DX10
-  miscFlag) load: remove the rejects; `face_count` (legacy: require all 6 face
-  bits; DX10: arraySize·(cube?6:1)); **surface-major, mip-inner** outer loop;
-  reuse AA.6a math. Reject asserts flip.
+- [x] **AA.6b (2026-06-19)** — KTX2 array + cube load. `_ktx2_parse` surfaces
+  `layers`/`faces` (out widened 48→56 B; faceCount 1/6, cube-array gated, array >
+  MAX_LAYERS rejected, **multi-image ⇒ single-level** else reject).
+  `_ktx2_load_layered` (single level, blen = total·per_image via
+  `_asset_per_image_size`, overflow-safe span check, per-image `write_layer_level`
+  image_idx = slice). Routes cube→`create_cube` / array→`create_2d_array`; single
+  2D stays the mipped path. Reject asserts flipped (cube-array / >MAX / mipped /
+  faceCount-3); +parse-success + mock-backend load (create_cube + 6 write_layer).
+- [x] **AA.6c (2026-06-19)** — DDS array + cube load. `_dds_parse` (out 48→64 B):
+  DX10 `arraySize`·(cube?6:1) via miscFlag (cube-array gated, array > MAX
+  rejected); legacy cube via `dwCaps2` requiring **all 6 face bits**
+  (`_DDSCAPS2_CUBE_ALLFACES`; partial cube rejected); multi-image ⇒ single-level.
+  `_dds_load_layered` (surface-major: total surfaces from data_off, overflow-safe
+  total·per_image check, per-image `write_layer_level`). Reject asserts flipped;
+  +parse-success + mock-backend load (create_2d_array + 6 write_layer). asset_load
+  148→172; suite 4470→4494; all exit 0; distlib idempotent.
 
 ## Phase AA.7 — HW e2e + arc cut [M]
 

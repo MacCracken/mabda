@@ -66,6 +66,10 @@ var _DDS_FOURCC_DXT5    = 0x35545844;   # 'DXT5' -> BC3
 var _DDS_FOURCC_DX10    = 0x30315844;   # 'DX10' -> DXGI path
 var _DDPF_FOURCC        = 0x4;
 var _DDSCAPS2_CUBEMAP   = 0x200;
+# v3.4 AA.6c — the 6 legacy cube-face-present bits (POSITIVEX..NEGATIVEZ,
+# 0x400..0x8000); a full cube has all six. Order +X,-X,+Y,-Y,+Z,-Z = the slice
+# order the backend expects.
+var _DDSCAPS2_CUBE_ALLFACES = 0xFC00;
 var _DDS_MISC_CUBE      = 0x4;          # DXT10 miscFlag DDS_RESOURCE_MISC_TEXTURECUBE
 
 # DdsParse `out` (48 bytes): fmt@0, width@8, height@16, mip_count@24,
@@ -77,6 +81,8 @@ var _DDS_OUT_HEIGHT     = 16;
 var _DDS_OUT_MIPCOUNT   = 24;
 var _DDS_OUT_DATAOFF    = 32;
 var _DDS_OUT_SRGB       = 40;
+var _DDS_OUT_FACES      = 48;   # v3.4 AA.6c — cube faces (1 or 6)
+var _DDS_OUT_LAYERS     = 56;   # v3.4 AA.6c — array layers (out widened to 64 B)
 
 # Parse a DDS header into `out` (48 B). Returns 0 on success, or a GPU_ERR_*:
 # GPU_ERR_CONTAINER_PARSE (bad magic / truncated / unsupported FourCC or layout)
@@ -94,13 +100,12 @@ fn _dds_parse(bytes, len, out): i64 {
     var mipc = load32(bytes + 28);
     if (mipc < 1) { mipc = 1; }                            # 0 means single level
 
-    # Legacy cubemap (dwCaps2) - arrays/cubes are v3.4 (Phase AL-ARRAY).
-    if ((load32(bytes + 112) & _DDSCAPS2_CUBEMAP) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
-
     var ddpf_flags = load32(bytes + 80);
     var fmt = 0 - 1;   # unmapped until a FourCC/DXGI branch sets it (0 = RGBA8 is valid)
     var srgb = 0;
     var data_off = 128;
+    var faces = 1;     # v3.4 AA.6c
+    var layers = 1;
     if ((ddpf_flags & _DDPF_FOURCC) == 0) {
         # Legacy uncompressed (bitmask) DDS is out of v3.3 scope - the
         # byte-order/mask interpretation is tracked in the 3-3 punchlist (AL.3).
@@ -114,30 +119,76 @@ fn _dds_parse(bytes, len, out): i64 {
     if (fourcc == _DDS_FOURCC_DX10) {
         if (len < 148) { return GPU_ERR_CONTAINER_PARSE; }  # + 20-byte DXT10 header
         var dxgi = load32(bytes + 128);
-        if ((load32(bytes + 136) & _DDS_MISC_CUBE) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
-        if (load32(bytes + 140) > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # arraySize
+        # v3.4 AA.6c — DX10 array/cube from miscFlag + arraySize.
+        var arraysize = load32(bytes + 140);
+        if (arraysize < 1) { arraysize = 1; }
+        if (arraysize > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+        if ((load32(bytes + 136) & _DDS_MISC_CUBE) != 0) {
+            if (arraysize > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # cube-array gated
+            faces = 6;
+        } else {
+            layers = arraysize;
+        }
         fmt = mabda_texfmt_from_dxgi_format(dxgi);
         srgb = mabda_dxgi_format_is_srgb(dxgi);
         data_off = 148;
+    } else {
+        # v3.4 AA.6c — legacy (non-DX10) cubemap via dwCaps2: all 6 faces required.
+        var caps2 = load32(bytes + 112);
+        if ((caps2 & _DDSCAPS2_CUBEMAP) != 0) {
+            if ((caps2 & _DDSCAPS2_CUBE_ALLFACES) != _DDSCAPS2_CUBE_ALLFACES) {
+                return GPU_ERR_FORMAT_UNSUPPORTED;   # partial cube
+            }
+            faces = 6;
+        }
     }
     # fmt < 0 = unknown FourCC or unmapped DXGI (0 = RGBA8 via DX10 is valid).
     if (fmt < 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+    # Multi-image (array/cube) is single-level in v3.4 (a mipped array/cube is later).
+    if (layers * faces > 1) { if (mipc > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; } }
     store64(out + _DDS_OUT_FMT,      fmt);
     store64(out + _DDS_OUT_WIDTH,    width);
     store64(out + _DDS_OUT_HEIGHT,   height);
     store64(out + _DDS_OUT_MIPCOUNT, mipc);
     store64(out + _DDS_OUT_DATAOFF,  data_off);
     store64(out + _DDS_OUT_SRGB,     srgb);
+    store64(out + _DDS_OUT_FACES,    faces);
+    store64(out + _DDS_OUT_LAYERS,   layers);
     return 0;
+}
+
+# v3.4 AA.6c — load a single-level DDS array/cube (surface-major: `total` =
+# layers*faces surfaces packed contiguously from data_off, each per_image bytes;
+# surface idx is the slice the write_layer_level targets). Returns Ok(tex)|Err.
+fn _dds_load_layered(ctx, bytes, len, fmt, width, height, data_off, layers, faces): i64 {
+    var total = layers * faces;
+    var tex = 0;
+    if (faces == 6) { tex = gpu_texture_create_cube(ctx, width, fmt, 1); }
+    if (faces != 6) { tex = gpu_texture_create_2d_array(ctx, width, height, fmt, layers); }
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var per_image = mabda_texfmt_data_size(fmt, width, height);
+    if (per_image <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (data_off < 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    # Whole array/cube span must fit, overflow-safe (no total*per_image product
+    # before the check): total <= (len - data_off) / per_image.
+    if (total > (len - data_off) / per_image) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    var img = 0;
+    while (img < total) {
+        var sub = data_off + img * per_image;
+        var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, bytes + sub, per_image);
+        if (wrc != 0) { return gpu_err_result(wrc); }
+        img = img + 1;
+    }
+    return gpu_ok(tex);
 }
 
 # Load a DDS texture from a byte buffer. Returns Ok(texture handle) | Err.
 # Parses the header, gates the format against the active backend's caps, creates
-# a mipped texture, and uploads each level via gpu_texture_write_level walking
-# the contiguous level data (every level's byte span bounds-checked vs `len`).
+# the texture, and uploads each level/image (every byte span bounds-checked vs
+# `len`). Arrays/cubes (multi-image) route to _dds_load_layered (single-level).
 fn gpu_texture_load_dds_result(ctx, bytes, len): i64 {
     if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
-    var out[48];
+    var out[64];
     var prc = _dds_parse(bytes, len, &out);
     if (prc != 0) { return gpu_err_result(prc); }
     var fmt    = load64(&out + _DDS_OUT_FMT);
@@ -145,11 +196,17 @@ fn gpu_texture_load_dds_result(ctx, bytes, len): i64 {
     var height = load64(&out + _DDS_OUT_HEIGHT);
     var mipc   = load64(&out + _DDS_OUT_MIPCOUNT);
     var off    = load64(&out + _DDS_OUT_DATAOFF);
-    # A mip_count larger than the natural chain is a malformed container.
-    if (mipc > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    var faces  = load64(&out + _DDS_OUT_FACES);
+    var layers = load64(&out + _DDS_OUT_LAYERS);
     # Caps gate BEFORE create - an ETC2/ASTC DDS on native (BC-only) fails loud
     # here instead of creating an unsampleable texture.
     if (gpu_ctx_supports_format(ctx, fmt) == 0) { return gpu_err_result(GPU_ERR_FORMAT_UNSUPPORTED); }
+    # v3.4 AA.6c — array / cube: single-level (parse enforced mipc==1 for total>1).
+    if (layers * faces > 1) {
+        return _dds_load_layered(ctx, bytes, len, fmt, width, height, off, layers, faces);
+    }
+    # A mip_count larger than the natural chain is a malformed container.
+    if (mipc > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
     var tex = gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mipc);
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var level = 0;
@@ -210,12 +267,20 @@ fn _ktx2_parse(bytes, len, out): i64 {
     # supercompressionScheme != 0 (BasisLZ/Zstd/ZLIB) needs a decompressor mabda
     # does not have - the decoder gate, fail loud (tracked, post-v3.3).
     if (load32(bytes + 44) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
-    # faceCount 6 (cubemap) / layerCount > 1 (array) are v3.4 (Phase AL-ARRAY).
-    if (load32(bytes + 36) != 1) { return GPU_ERR_FORMAT_UNSUPPORTED; }   # faceCount
-    if (load32(bytes + 32) > 1)  { return GPU_ERR_FORMAT_UNSUPPORTED; }   # layerCount (0 or 1 ok)
+    # v3.4 AA.6b — faceCount 1 (2D/array) or 6 (cube); layerCount (0 = 1).
+    var faces = load32(bytes + 36);
+    if (faces != 1) { if (faces != 6) { return GPU_ERR_FORMAT_UNSUPPORTED; } }
+    var layers = load32(bytes + 32);
+    if (layers < 1) { layers = 1; }    # layerCount 0 == not-array == 1
+    if (layers > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+    # Cube-array (layers > 1 AND faces == 6) is gated (v3.4 = single cubes only).
+    if (faces == 6) { if (layers > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; } }
 
     var levels = load32(bytes + 40);
     if (levels < 1) { levels = 1; }    # levelCount 0 = single base level present
+    # Multi-image (array/cube) is single-level in v3.4 — a mipped array/cube is later.
+    var total = layers * faces;
+    if (total > 1) { if (levels > 1) { return GPU_ERR_FORMAT_UNSUPPORTED; } }
     # The level index must fit within the buffer.
     if (len < _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ) { return GPU_ERR_CONTAINER_PARSE; }
 
@@ -226,25 +291,69 @@ fn _ktx2_parse(bytes, len, out): i64 {
     store64(out + 8,  width);
     store64(out + 16, height);
     store64(out + 24, levels);
-    store64(out + 40, mabda_vk_format_is_srgb(vk));
+    store64(out + 32, layers);     # v3.4 AA.6b — array layers
+    store64(out + 40, faces);      # v3.4 AA.6b — cube faces (1 or 6)
+    store64(out + 48, mabda_vk_format_is_srgb(vk));   # out widened to 56 B
     return 0;
+}
+
+# v3.4 AA.6b — load a single-level KTX2 array/cube. Level 0's blen holds `total`
+# = layers*faces equal images; image_idx (0..total-1) is the slice the
+# write_layer_level targets (KTX2 within-level order layer->face matches the
+# backend slice index for a pure array or a pure cube). Returns Ok(tex) | Err.
+fn _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces): i64 {
+    var total = layers * faces;
+    var tex = 0;
+    if (faces == 6) { tex = gpu_texture_create_cube(ctx, width, fmt, 1); }
+    if (faces != 6) { tex = gpu_texture_create_2d_array(ctx, width, height, fmt, layers); }
+    if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
+    var boff = load64(bytes + _KTX2_LEVELIDX_OFF + 0);
+    var blen = load64(bytes + _KTX2_LEVELIDX_OFF + 8);
+    var ulen = load64(bytes + _KTX2_LEVELIDX_OFF + 16);
+    var per_image = mabda_texfmt_data_size(fmt, width, height);
+    if (per_image <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (_asset_per_image_size(blen, total) != per_image) {
+        return gpu_err_result(GPU_ERR_CONTAINER_PARSE);   # blen != total*per_image (div-by-0/non-div/wrong)
+    }
+    if (ulen != blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
+    # whole level span past the 1-entry index (ends at +104) + fits, overflow-safe.
+    if (boff < _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (boff > len - blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    var img = 0;
+    while (img < total) {
+        # in bounds: img < total, per_image*total == blen, boff+blen <= len.
+        var sub = boff + img * per_image;
+        var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, bytes + sub, per_image);
+        if (wrc != 0) { return gpu_err_result(wrc); }
+        img = img + 1;
+    }
+    return gpu_ok(tex);
 }
 
 # Load a KTX2 texture from a byte buffer (uncompressed subset). Returns
 # Ok(texture handle) | Err. Each mip level's data is located via its level-index
 # byteOffset; for scheme==0 byteLength == uncompressedByteLength == the format's
-# per-level size. Every span is bounds-checked vs `len`.
+# per-level size. Every span is bounds-checked vs `len`. Arrays/cubes (multi-
+# image) route to _ktx2_load_layered (single-level); single 2D is mipped here.
 fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
     if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
-    var out[48];
+    var out[56];
     var prc = _ktx2_parse(bytes, len, &out);
     if (prc != 0) { return gpu_err_result(prc); }
     var fmt    = load64(&out + 0);
     var width  = load64(&out + 8);
     var height = load64(&out + 16);
     var levels = load64(&out + 24);
-    if (levels > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    var layers = load64(&out + 32);
+    var faces  = load64(&out + 40);
     if (gpu_ctx_supports_format(ctx, fmt) == 0) { return gpu_err_result(GPU_ERR_FORMAT_UNSUPPORTED); }
+    # v3.4 AA.6b — array / cube: single-level (parse enforced levels==1), one
+    # level's blen covers all `total` images (KTX2 is mip-outer, image-inner).
+    var total = layers * faces;
+    if (total > 1) {
+        return _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces);
+    }
+    if (levels > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
     var tex = gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, levels);
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var level = 0;
