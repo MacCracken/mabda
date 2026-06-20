@@ -276,15 +276,14 @@ without them):
    a layer uniform the `texture_2d_array` FS reads + the wgpu `bind_for_sample_layer`
    filler. (Native is symmetric; wgpu consumers can still sample a fixed layer via
    their own WGSL `array_index`, as `wgpu_array_sample_e2e` does.)
-3. **`F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the **attn11** block —
-   first consumer that also deps `math`). `src/color.cyr` defines runtime-init
-   `F64_HALF`/`F64_TWO` (= 0 until its init runs) that shadow the `math` stdlib's
-   compile-time constants; "last definition wins" silently zeroes a consumer's f64
-   math (NaN on the non-GPU path). **Fix #1 (preferred): namespace them
-   `MABDA_F64_HALF` / `MABDA_F64_TWO`** (+ the sibling `color_rgb` duplicate →
-   `mabda_color_rgb`). Full filing:
-   [`docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
-   attn11 has a consumer-side workaround (mabda in a separate TU) until this lands.
+3. **[DONE 3.4.1] `F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the
+   **attn11** block). Fix #1 applied: `color.cyr`'s two shadowing constants
+   renamed to `MABDA_F64_HALF` / `MABDA_F64_TWO` (defs + init + all usages); the
+   dist bundle now exports zero standalone `F64_HALF`/`F64_TWO`, so a consumer of
+   both `math` + `lib/mabda.cyr` no longer collides. (The other `F64_*` don't
+   shadow `math`; the benign `color_rgb` duplicate is separate.) Filing marked
+   RESOLVED: [`…/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
+   attn11 unblocks once it deps mabda 3.4.1.
 
 ---
 
