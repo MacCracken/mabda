@@ -13,6 +13,73 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.2] — 2026-06-19
+
+**Render-target allocator fixes surfaced by the `puka` Wayland-terminal integration**
+(first consumer to allocate a *window-sized* render target), both HW-verified on Cezanne,
+plus the resolution of two tracked issues. The in-tree render e2e only ever allocated a
+256×256 RT, so both bugs were latent until a real window size hit them.
+
+### Fixed
+- **Native render-target `va_map` EINVAL for non-64 KiB-aligned sizes.**
+  `gpu_render_target_create_2d_rgba8` handed the raw `width*height*4` BO size straight to
+  `DRM_IOCTL_AMDGPU_GEM_VA`, which rejects (`EINVAL -22`, squashed to `GPU_ERR_OTHER`) any
+  span that is not 64 KiB-aligned — i.e. most real window sizes (e.g. **1260×682**, 3360 KiB,
+  rem 29408 B). "Nice" sizes (256², 1024², 2048²) happened to be aligned and masked it.
+  `native_rt_create_2d_rgba8` now rounds the BO + VA-map span up to 64 KiB (`_native_align_up(
+  …, _NATIVE_RT_VA_ALIGN)`); the same rounded value threads through create, map, the
+  failure-path release, AND `NATIVE_RT_FIELD_SIZE` so release unmaps the exact span. The PM4
+  extent/scissor/epitch registers use logical width/height (never the BO size), so the padding
+  does not change the rendered extent. Filing:
+  `docs/development/issues/archived/2026-06-19-native-rt-vamap-64kib-align-einval.md`.
+- **Second live render target collided on a single fixed VA.** The RT VA was hardcoded at
+  `_NATIVE_RT_VA_BASE`, so creating a 2nd render target before releasing the 1st mapped the
+  *same* VA → `GEM_VA EINVAL`. Added a **per-context RT VA bump cursor** at `ctx+168`
+  (`GPU_CONTEXT_SIZE` 168 → 176), mirroring the texture VA allocator: `native_ctx_alloc_rt_va`
+  hands out distinct 64 KiB-aligned VAs from a widened **256 MiB** RT region (was a single fixed
+  VA; the next region up — the staging VA — sits ~752 MiB above, so the bump cannot reach it),
+  with `native_ctx_free_rt_va` LIFO rollback on a create error. The bump never reclaims on
+  steady-state release (mabda's bump-leak model, same as textures).
+
+### Added
+- **`native_rt_alloc_e2e` (HW-verified on Cezanne).** Creates a 1260×682 RT (exercises the
+  64 KiB rounding) plus a 2nd live RT (exercises the per-context VA bump), asserts distinct VAs
+  at the expected bump offset, the 64 KiB-rounded stored size, and a GTT sentinel write/read
+  across the full span. `make test-native-rt-alloc-e2e`.
+- CPU regressions in `native.tcyr` (`test_native_rt_bo_size_64k_rounding`,
+  `test_native_rt_va_bump_distinct`) + a `+168 rt_va_next` offset pin in `backend.tcyr`
+  (`test_gpu_context_size_extended_to_176`).
+
+### Changed
+- `GpuContext` 168 → **176 B** (`+168 rt_va_next` RT VA cursor; native-only, zero on wgpu).
+  In-tree stack `var ctx[168]` test buffers grown to `[176]` across queue/render/texture/
+  asset_load/backend/native suites.
+
+### Investigated — no code change
+- **`duplicate fn 'color_rgb'` build warning** (flagged in the same `puka` filing) is **not a
+  mabda bug**. mabda defines `color_rgb` exactly once (no Cyrius-stdlib `color_rgb` exists); the
+  warning is a *consumer-side* name collision — `puka` defines its own `fn color_rgb` (a terminal
+  truecolor packer) alongside `dist/mabda.cyr`, so the v5.7.9+ parser warns "last definition
+  wins". mabda's `color_rgb` is documented `@public` API, so renaming it would be a breaking
+  change in the wrong direction; the squatting consumer should rename its helper (the patra
+  `json_build → patra_json_build` precedent). Left as-is.
+- **`cyim 1.1.4` regex-pattern issue** (`docs/development/issues/archived/2026-04-28-cyim-regex-
+  pattern-error.md`) no longer reproduces — the tool advanced to **1.7.3** (the upstream repo shows
+  explicit regex-engine fixes) and the original `--grep`/`--replace` repro commands now run
+  clean. Marked resolved; nothing to file.
+
+### Metrics
+- CPU suite **4522 → 4540** assertions (the two RT regressions + the +168 offset pin); **17**
+  domain test files (unchanged). 51 `src/` modules (unchanged — the fixes edit `context.cyr` +
+  `backend_native.cyr` in place). One new HW program (`native_rt_alloc_e2e`).
+- Toolchain pin **6.2.29** (unchanged from 3.4.1).
+
+### Next
+- v3.4 arc remains fully landed. The `native_*_create` texture/staging va_map paths pass today
+  only because their sizes happen to be 64 KiB-aligned; a consistency sweep to round them like
+  the RT path is a tracked low-priority follow-up. multi-dim grid + `id_bound`≤128 compiler
+  limits still to be raised.
+
 ## [3.4.1] — 2026-06-19
 
 **v3.4.1 backlog — the three items deferred from 3.4.0, all landed.** Native compressed

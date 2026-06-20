@@ -8,7 +8,7 @@ plus a pure-Cyrius native AMD path) — that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.4.1 (dual backend — wgpu + native AMD; see
+Version: 3.4.2 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -49,7 +49,9 @@ magic-byte sniffer (native PNG path HW-verified; 1 CRITICAL parser bug found + f
 3.4.0 adds **array textures + cubemaps** (Phase AA) — create / upload-per-layer-or-face /
 sample on both backends + DDS/KTX2 array+cube load, HW-verified end-to-end on Cezanne; 3.4.1
 clears the v3.4.1 backlog — native **BC (compressed) tiled arrays** + **wgpu draw-time layer
-selection** (both HW-verified) + a `MABDA_F64_*` stdlib symbol-collision fix. See the CHANGELOG.)
+selection** (both HW-verified) + a `MABDA_F64_*` stdlib symbol-collision fix; 3.4.2 fixes the
+native **render-target 64 KiB va_map alignment** + a **per-context RT VA allocator** (both
+HW-verified, found integrating into the `puka` terminal). See the CHANGELOG.)
 
 ## Features
 
@@ -267,7 +269,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              3.4.1
+├── VERSION              3.4.2
 └── CHANGELOG.md
 ```
 

@@ -1,5 +1,21 @@
 # Issue: native render target `va_map` fails with EINVAL unless the BO size is 64 KiB-aligned
 
+> **RESOLVED in 3.4.2 (2026-06-19), HW-verified on Cezanne.** Both the 64 KiB
+> alignment and the fixed-VA-base limit are fixed:
+> - `native_rt_create_2d_rgba8` rounds the BO + VA-map span up to 64 KiB
+>   (`_native_align_up(…, _NATIVE_RT_VA_ALIGN)`), threading the same rounded size
+>   through create / map / release / the stored `NATIVE_RT_FIELD_SIZE`.
+> - The RT VA is no longer fixed: a per-context bump cursor at `ctx+168`
+>   (`native_ctx_alloc_rt_va`, `GPU_CONTEXT_SIZE` 168→176) hands out distinct
+>   64 KiB-aligned VAs from a 256 MiB region, so multiple live RTs no longer
+>   collide. `native_ctx_free_rt_va` rolls back on a create error.
+>
+> Verified by `programs/native_rt_alloc_e2e.cyr` (a 1260×682 RT + a 2nd live RT,
+> distinct VAs, full-span GTT sentinel) and the `native.tcyr` CPU regressions
+> `test_native_rt_bo_size_64k_rounding` / `test_native_rt_va_bump_distinct`. The
+> `duplicate fn 'color_rgb'` note below was investigated and is a *consumer-side*
+> collision, not a mabda bug — see the corrected Secondary section.
+
 **Discovered:** 2026-06-19 (integrating mabda 3.2.11 into the `puka` Wayland terminal — first consumer to allocate a *window-sized* render target)
 **Component:** `src/backend_native_amdgpu.cyr` `native_gem_va_map` / `src/backend_native.cyr` `native_rt_create_2d_rgba8`
 **Severity:** High for real consumers (any render target whose byte size isn't a multiple of 64 KiB fails; that's most real window sizes). Latent because every in-tree test uses 256×256.
@@ -101,23 +117,37 @@ Worth auditing the same 64 KiB constraint on the other `native_*_create` paths
 that `va_map` (textures, staging) — they may pass today only because their sizes
 happen to be 64 KiB-aligned.
 
-## Also worth a consumer-facing note
+## Also worth a consumer-facing note — FIXED in 3.4.2
 
-`_NATIVE_RT_VA_BASE` is a **fixed** VA — a consumer that creates a second render
-target without releasing the first gets EINVAL on the second `va_map` (VA in
-use), which also surfaces as `GPU_ERR_OTHER`. Either document "one live RT at the
-RT VA base" or bump the base per allocation like the texture VA region does.
+`_NATIVE_RT_VA_BASE` *was* a **fixed** VA — a consumer that created a second render
+target without releasing the first got EINVAL on the second `va_map` (VA in use),
+also surfacing as `GPU_ERR_OTHER`. 3.4.2 took the recommended path: it bumps the
+base per allocation like the texture VA region does (`native_ctx_alloc_rt_va`, a
+per-context cursor at `ctx+168` over a 256 MiB region). Multiple live RTs now get
+distinct VAs.
 
-## Secondary: benign `duplicate fn 'color_rgb'` build warning
+## Secondary: `duplicate fn 'color_rgb'` build warning — consumer-side, not a mabda bug (corrected)
 
-Compiling any consumer that `include`s `dist/mabda.cyr` emits:
+Compiling a consumer that `include`s `dist/mabda.cyr` *and also defines its own*
+`color_rgb` emits:
 
 ```
 warning: duplicate fn 'color_rgb' (last definition wins)
 ```
 
-Builds and runs fine (last-def-wins), so it's cosmetic. From the consumer side
-only one `fn color_rgb` is visible (in the amalgam itself), so the second
-definition is either an internal `cyrius distlib` duplication or an overlap with
-a toolchain stdlib module not present in the consumer's resolved `lib/`. Flagging
-in case the amalgam generator is emitting `color_rgb` twice.
+**Corrected diagnosis (3.4.2 investigation).** The original "amalgam may be
+emitting `color_rgb` twice" hypothesis is **disproven**. mabda defines
+`color_rgb` exactly once — `src/color.cyr` and the single amalgamated copy in
+`dist/mabda.cyr` (`grep -c '^fn color_rgb' dist/mabda.cyr` == 1) — and there is
+**no `color_rgb` anywhere in the Cyrius stdlib** (`math`, `sakshi`, etc.) or any
+sibling AGNOS package. The duplicate is entirely *consumer-side*: `puka` defines
+its own `fn color_rgb` (`puka/src/terminal.cyr` — a terminal-truecolor packer)
+alongside `dist/mabda.cyr`, so the Cyrius v5.7.9+ parser sees two definitions and
+warns "last definition wins". A consumer that does not define `color_rgb` sees no
+warning.
+
+This is **not** the 3.4.1 `F64_HALF`/`F64_TWO`-vs-`math` case (that was a real
+collision against a *shared stdlib* symbol). mabda's `color_rgb` is documented
+`@public` API; renaming it would be a breaking change in the wrong direction. The
+established fix is consumer-side: the squatting package renames its helper (the
+patra `json_build → patra_json_build` precedent). **No mabda code change.**

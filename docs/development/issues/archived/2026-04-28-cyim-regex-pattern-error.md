@@ -1,5 +1,12 @@
 # Issue: `cyim 1.1.4` regex-based commands fail mid-session with "invalid regex pattern"
 
+> **RESOLVED — no longer reproduces (verified 2026-06-19).** `cyim` advanced
+> `1.1.4 → 1.7.3`; the upstream repo (`/home/macro/Repos/cyim`) shows explicit
+> regex-engine work (`fixing grepfiles, context=N, and base regex`; `adding regex
+> engines`). The original repro — `cyim --grep <ident>` / `cyim --replace <a> <b>`
+> on trivial ASCII patterns — now runs clean at 1.7.3. Nothing to file upstream;
+> the mid-session state corruption is gone. Kept for history.
+
 **Discovered:** 2026-04-28 (mabda v3 Step 3a, after several hours of use)
 **Component:** `cyim` 1.1.4 (`/home/macro/.local/bin/cyim`)
 **Severity:** Medium (stops `--grep` / `--replace` workflow; `--batch` and `--write` still work)

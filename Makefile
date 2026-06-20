@@ -836,6 +836,17 @@ build/native_render_e2e: programs/native_render_e2e.cyr src/*.cyr
 test-native-render-e2e: build/native_render_e2e
 	./build/native_render_e2e
 
+# v3.4.2 RT allocator regression — odd-window (1260x682) RT exercises the
+# 64 KiB va_map rounding, a 2nd live RT exercises the per-context VA bump.
+# HW-gated (needs the amdgpu render node; not master-gated).
+build/native_rt_alloc_e2e: programs/native_rt_alloc_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_rt_alloc_e2e.cyr $@
+
+.PHONY: test-native-rt-alloc-e2e
+test-native-rt-alloc-e2e: build/native_rt_alloc_e2e
+	./build/native_rt_alloc_e2e
+
 build/native_render_graph_mq_e2e: programs/native_render_graph_mq_e2e.cyr src/*.cyr
 	@mkdir -p build
 	$(CYRIUS) build programs/native_render_graph_mq_e2e.cyr $@

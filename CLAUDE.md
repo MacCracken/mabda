@@ -11,7 +11,7 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.29+ (`cyrius.cyml: cyrius = "6.2.29"`)
-- **Version**: 3.4.1 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Version**: 3.4.2 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -227,6 +227,19 @@ detection.
   single-slice TS.7 tiled path (create branches compressed→tiled, the SDMA copy/packet take a
   `slice` param, `write_layer_level` routes tiled→per-slice L2T); `native_bc_array_e2e` (BC1
   2-slice). Suite 4494→4522. Toolchain 6.2.28→6.2.29. Nothing from the v3.4 arc remains deferred.
+  **3.4.2** → two **native render-target allocator** fixes surfaced by the `puka` Wayland-terminal
+  integration (first consumer to allocate a *window-sized* RT), both HW-verified on Cezanne; the
+  in-tree render e2e only ever used 256×256 so both were latent. **(1)** the RT `va_map` EINVAL for
+  non-64KiB-aligned sizes — `native_rt_create_2d_rgba8` rounded the raw `w*h*4` BO size to 4 KiB but
+  GEM_VA needs a 64 KiB-aligned span on GFX9, so ordinary windows (1260×682) got `EINVAL`→`GPU_ERR_OTHER`;
+  now rounds the BO+map+stored span to 64 KiB (PM4 extent uses logical w/h, so the pad is invisible).
+  **(2)** the fixed single RT VA — a 2nd live RT collided on `_NATIVE_RT_VA_BASE`; now a per-context
+  bump cursor at `ctx+168` (`native_ctx_alloc_rt_va`/`_free_rt_va`, `GPU_CONTEXT_SIZE` 168→176, RT
+  region widened 16 MiB→256 MiB) hands out distinct 64 KiB-aligned VAs. `native_rt_alloc_e2e` (1260×682
+  RT + 2nd live RT + full-span GTT sentinel) + 2 CPU regressions + a `+168` offset pin. Suite 4522→4540.
+  The `duplicate fn 'color_rgb'` warning in the same filing was investigated and is **consumer-side**
+  (puka defines its own `color_rgb`; mabda's is `@public` and stays) — no code change. The 2026-04-28
+  `cyim` regex issue no longer reproduces (1.1.4→1.7.3) — both issue files archived. Toolchain 6.2.29.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -252,7 +265,7 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.4.1, 2026-06-19)
+## Current State (post 3.4.2, 2026-06-19)
 
 - **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
@@ -269,8 +282,10 @@ doesn't change between paths.
   (`native_render_dispatch_timeline` + IB staging + queue-aware render draw) in place
   — no new module; 3.3.0 Phase AL added two modules — `asset_format.cyr` (format-id
   mapping) + `asset_load.cyr` (DDS/KTX2 parsers + the PNG/sniffer load API) — and
-  the `chitra` dep at `lib/chitra.cyr`).
-- **Tests**: **4522 CPU-only assertions** across **17 functionality-named
+  the `chitra` dep at `lib/chitra.cyr`; 3.4.2 edited `context.cyr` (ctx 168→176, the
+  `+168` RT VA cursor) + `backend_native.cyr` (the RT 64 KiB rounding + `native_ctx_alloc_rt_va`)
+  in place — no new module).
+- **Tests**: **4540 CPU-only assertions** across **17 functionality-named
   domain files** under `tests/tcyr/` (3.3.0 added `asset_load.tcyr`, the 17th;
   3.4.0 Phase AA grew backend/native/asset_load in place — no new file;
   reorganized 2026-06-15 from the old
@@ -279,7 +294,7 @@ doesn't change between paths.
   mirroring the `src/` domains; `make test` globs them all.
   **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
   `make test | grep` (or `awk`) treats it as binary and **silently drops
-  texture's 207** — the naive total reads **4315**, not the true **4522**. Use
+  texture's 207** — the naive total reads **4333**, not the true **4540**. Use
   `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
   accurate count; the trap has fooled humans and review agents alike.
   Domain breakdown:
