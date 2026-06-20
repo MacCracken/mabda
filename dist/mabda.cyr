@@ -10630,6 +10630,56 @@ fn native_gfx9_shader_textured_load_fs(buf, pos): i64 {
 
 var GFX9_FS_TEXTURED_LOAD_SIZE = 124;
 
+# ================================================================
+# v3.4 AA.2b — 2D-ARRAY textured fragment shader (image_load, DA=1 + slice)
+# ================================================================
+# The array variant of native_gfx9_shader_textured_load_fs: each fragment loads
+# the texel at (screen_x, screen_y, LAYER) of a 2D_ARRAY texture and exports it,
+# so a fullscreen quad over a W×H RT sampling array layer K reproduces that layer
+# (RT[x,y] = array_tex[K, x, y]) — the same screen-pos oracle, now with the slice.
+#
+# Two deltas vs the 2D image_load FS:
+#   1. the scale s_load grows DWORDX2->DWORDX4 (s[12:15]): s12=scale_x@+48,
+#      s13=scale_y@+52, s14=LAYER@+56 (the int slice bind_for_sample_layer wrote).
+#   2. a v_mov v6, s14 supplies the 3rd VADDR, and the image_load sets DA
+#      (w0 0xF0001F00 -> 0xF0005F00 = bit 14) so the TA reads v[4:6] = (x,y,slice).
+# image_load coords are integers, so the slice is the raw int layer (no cvt).
+#
+# ABI identical to the 2D load FS (s[0:1]=descriptor VA, pos in v2/v3) except the
+# high-water grows to VGPRs v0..v6 (7) + SGPRs s0..s15 (16) — both still fit
+# RSRC1_PS MIN|1 (8 VGPR / 16 SGPR), so the render_pass_draw textured override is
+# reused UNCHANGED.
+#
+# image_load DA encoding confirmed via llvm-mc -mcpu=gfx900:
+#   image_load v[0:3], v[4:6], s[0:7] dmask:0xf unorm da
+#     -> [0x00,0x5f,0x00,0xf0, 0x04,0x00,0x00,0x00]  (w0=0xF0005F00, w1=0x04)
+# Returns pos + 128 (64 B code + 16 × s_nop 0 prefetch pad). @internal
+fn native_gfx9_shader_textured_load_array_fs(buf, pos): i64 {
+    var p = pos;
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX8, 0, 0, 0));   # T# s[0:7]
+    p = gfx9_emit32(buf, p, 0x00000000);   # offset 0x0
+    # scale_x@+48 -> s12, scale_y@+52 -> s13, layer@+56 -> s14 (s15 = +60, unused).
+    p = gfx9_emit32(buf, p, gfx9_enc_smem_lo(GFX9_SMEM_S_LOAD_DWORDX4, 12, 0, 0));
+    p = gfx9_emit32(buf, p, 0x00000030);   # offset 0x30 (descriptor+48)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0xC07F));   # lgkmcnt(0)
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 2, gfx9_sgpr(12), 2));   # pos_x *= scale_x
+    p = gfx9_emit32(buf, p, gfx9_enc_vop2(GFX9_VOP2_V_MUL_F32, 3, gfx9_sgpr(13), 3));   # pos_y *= scale_y
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 4, gfx9_vgpr(2)));   # POS_X -> tx
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_CVT_I32_F32, 5, gfx9_vgpr(3)));   # POS_Y -> ty
+    p = gfx9_emit32(buf, p, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, 6, gfx9_sgpr(14)));      # v6 = slice (int layer)
+    # image_load + exp are graphics/texture ops — out of the N.0 compute-encoder
+    # scope, so their dwords stay raw literals (llvm-mc-verified above).
+    p = gfx9_emit32(buf, p, 0xF0005F00);   # image_load v[0:3], v[4:6], s[0:7] dmask:0xf unorm DA (w0)
+    p = gfx9_emit32(buf, p, 0x00000004);   # (w1: vaddr=v4, vdata=v0, srsrc=s[0:7])
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_WAITCNT, 0x0F70));   # vmcnt(0)
+    p = gfx9_emit32(buf, p, 0xC400180F);   # exp mrt0 v0,v1,v2,v3 done vm (w0)
+    p = gfx9_emit32(buf, p, 0x03020100);   # exp (w1)
+    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_ENDPGM, 0));   # s_endpgm
+    return gfx9_emit_prefetch_pad(buf, p);
+}
+
+var GFX9_FS_TEXTURED_LOAD_ARRAY_SIZE = 128;
+
 # SPI_PS_INPUT_ENA/_ADDR for the textured FS — see the ABI note above.
 # gfx9.json SPI_PS_INPUT_ENA: PERSP_CENTER_ENA[1], POS_X_FLOAT_ENA[8],
 # POS_Y_FLOAT_ENA[9]. (1<<1)|(1<<8)|(1<<9) = 0x302. Shared by both textured FS.
@@ -14414,10 +14464,10 @@ fn gpu_caps_native_texture_compression(): i64 {
 }
 
 # v3.4 AA.0 — does the native AMD path support 2D ARRAY textures / CUBEMAPS
-# (create + sample)? Returns 0 here; array support flips at AA.1/AA.2
-# (create+sample HW-verified), cube at AA.5b (gated on Cezanne cube-filter
-# reliability); AA.7b flips both at the cut (3-4 punchlist). Scaffold default = 0.
-var NATIVE_TEXTURE_ARRAY_SUPPORTED = 0;
+# (create + sample)? array = 1 since AA.2 (LINEAR RGBA8 create+sample HW-verified
+# on Cezanne — native_array_sample_e2e); cube stays 0 until AA.5b (gated on
+# Cezanne cube-filter reliability). (3-4 punchlist.)
+var NATIVE_TEXTURE_ARRAY_SUPPORTED = 1;
 var NATIVE_TEXTURE_CUBE_SUPPORTED  = 0;
 fn gpu_caps_native_texture_array(): i64 { return NATIVE_TEXTURE_ARRAY_SUPPORTED; }
 fn gpu_caps_native_texture_cube(): i64 { return NATIVE_TEXTURE_CUBE_SUPPORTED; }

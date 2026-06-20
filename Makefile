@@ -670,6 +670,14 @@ build/native_array_store_e2e: programs/native_array_store_e2e.cyr src/*.cyr
 test-native-array-store-e2e: build/native_array_store_e2e
 	./build/native_array_store_e2e
 
+build/native_array_sample_e2e: programs/native_array_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_array_sample_e2e.cyr $@
+
+.PHONY: test-native-array-sample-e2e
+test-native-array-sample-e2e: build/native_array_sample_e2e
+	./build/native_array_sample_e2e
+
 # v3.2 TS.6 — SDMA tiling probe: L2T->T2L round-trip proves the SW_64KB_S
 # COPY_TILED_SUB_WINDOW path works on Cezanne. HW-gated.
 build/native_sdma_tiled_roundtrip: programs/native_sdma_tiled_roundtrip.cyr src/*.cyr

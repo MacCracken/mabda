@@ -114,10 +114,19 @@ implementation, not just planning.
   +22 asserts (backend 508→521 dispatch/guards/size-pin; native 1434→1443
   +56-write + reset + guards). Suite 4353→4375; all suites exit 0; distlib idempotent.
   (One sampled layer per draw; layered *render* is a later arc.)
-- [ ] **AA.2b** — 2D-array `image_sample` FS (`DA=1` w0 |= 1<<14, 3rd VADDR v6 =
-  slice) + bind (S#-from-sampler reused; dimension baked in the T#). **HW-verify
-  on Cezanne:** `RT[x,y] == array_tex[layer,x,y]` pixel-exact, POINT then
-  BILINEAR.
+- [x] **AA.2b (2026-06-19) — HW-VERIFIED on Cezanne.**
+  `native_gfx9_shader_textured_load_array_fs` — the 2D-array `image_load` FS:
+  scale-load grows `dwordx2→dwordx4` (s14 = layer@+56), `v_mov v6, s14`,
+  `image_load v[4:6] … DA` (`w0 0xF0001F00→0xF0005F00`, bit 14). All new dwords
+  **llvm-mc-verified** (`dwordx4=0xC00A0300`, `v_mov v6,s14=0x7E0C020E`, `DA
+  w0=0xF0005F00`). ABI unchanged (v0..v6 + s0..s15 still fit RSRC1 MIN|1 → draw
+  override reused). `native_array_sample_e2e` + `make test-native-array-sample-e2e`:
+  **`RT[x,y] == array[layer,x,y]` for layers 0 AND 2** (distinct per-layer alpha
+  proves the slice coordinate selects). **`gpu_caps_native_texture_array` flipped
+  to 1.** +34 asserts (native FS byte-oracle 1443→1477; caps-flip). Suite
+  4375→4409; all suites exit 0; distlib idempotent. (POINT verified via the
+  screen-pos oracle; the BILINEAR-array path rides the existing image_sample FS
+  scale and is exercised when a consumer needs it.)
 
 ## Phase AA.3 — wgpu 2D-array create + upload + sample [M]
 
