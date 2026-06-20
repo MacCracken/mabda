@@ -50,7 +50,7 @@ fn _face_color(k): i64 {
 # Build the cube FS for direction (sx,sy,sz) (inline-float src codes), make a
 # pipeline, render + read back, verify RT == face[expected_face]'s color.
 # Returns 0 ok, 6 fs/pipe, 8 draw, 9 mismatch.
-fn _cube_test_dir(ctx, vs_mod, fs_handle, fs_addr, fs_va, tex, sx, sy, sz, expected_face): i64 {
+fn _cube_test_dir(ctx, vs_mod, fs_handle, fs_addr, fs_va, tex, samp, sx, sy, sz, expected_face): i64 {
     var W = 64;
     var H = 64;
     memset(fs_addr, 0, 4096);
@@ -66,10 +66,9 @@ fn _cube_test_dir(ctx, vs_mod, fs_handle, fs_addr, fs_va, tex, sx, sy, sz, expec
     var clear = color_new(F64_0, F64_0, F64_0, F64_1);
     var pass = gpu_render_pass_begin(ctx, rt, clear);
     if (pass == 0) { return 6; }
-    # Bind with sampler 0 so the bind keeps the cube's create-baked S# (unnorm=0);
-    # a valid sampler would rebuild it unnorm=1 and break the cube projection.
-    # (Consumer-facing cube bind that auto-selects unnorm=0 is tracked, AA.5b.)
-    if (gpu_render_pass_bind_texture(ctx, pass, tex, 0) != 0) {
+    # AA.5d: bind with a real sampler — the cube-aware bind auto-selects unnorm=0
+    # (native_tex_is_cube), so cube sampling is correct without the sampler-0 hack.
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) {
         gpu_render_pass_end(ctx, pass); return 7;
     }
     var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
@@ -138,12 +137,14 @@ fn main(): i64 {
     }
     print_cstr("PASS: 6-face cube uploaded (distinct R per face)\n");
 
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { print_cstr("FAIL: sampler\n"); return 5; }
     # (s, t, faceid) = (0, 0, 4) -> face 4 (+Z). s/t any (solid face); faceid selects.
-    var r4 = _cube_test_dir(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex,
+    var r4 = _cube_test_dir(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex, samp,
     GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_4_0, 4);
     if (r4 != 0) { print_cstr("FAIL: face 4 sample\n"); return r4; }
     # (s, t, faceid) = (0, 0, 0) -> face 0 (+X).
-    var r0 = _cube_test_dir(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex,
+    var r0 = _cube_test_dir(ctx, &vs_mod, fs_handle, fs_addr, fs_va, tex, samp,
     GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_0_0, GFX9_INLINE_F32_0_0, 0);
     if (r0 != 0) { print_cstr("FAIL: face 0 sample\n"); return r0; }
     print_cstr("PASS: RT == face color for faceid 4 (+Z) and faceid 0 (+X)\n");

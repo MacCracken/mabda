@@ -14672,11 +14672,12 @@ fn gpu_caps_native_texture_compression(): i64 {
 }
 
 # v3.4 AA.0 — does the native AMD path support 2D ARRAY textures / CUBEMAPS
-# (create + sample)? array = 1 since AA.2 (LINEAR RGBA8 create+sample HW-verified
-# on Cezanne — native_array_sample_e2e); cube stays 0 until AA.5b (gated on
-# Cezanne cube-filter reliability). (3-4 punchlist.)
+# (create + sample)? array = 1 since AA.2 (create+sample HW-verified on Cezanne,
+# native_array_sample_e2e); cube = 1 since AA.5b (sampling HW-verified,
+# native_cube_sample_e2e) + AA.5d (the cube-aware bind auto-selects unnorm=0, so
+# a consumer binds a cube with a normal sampler). (3-4 punchlist.)
 var NATIVE_TEXTURE_ARRAY_SUPPORTED = 1;
-var NATIVE_TEXTURE_CUBE_SUPPORTED  = 0;
+var NATIVE_TEXTURE_CUBE_SUPPORTED  = 1;
 fn gpu_caps_native_texture_array(): i64 { return NATIVE_TEXTURE_ARRAY_SUPPORTED; }
 fn gpu_caps_native_texture_cube(): i64 { return NATIVE_TEXTURE_CUBE_SUPPORTED; }
 
@@ -14858,6 +14859,9 @@ fn _native_create_layered_sampleable(ctx, width, height, fmt, slices, img_type, 
     native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
     native_tex_set_t_va(tex, va + desc_off);
     native_tex_set_slice_count(tex, slices);
+    # Mark a cube so bind_for_sample picks unnorm=0 (the create baked it already;
+    # this lets a re-bind with a real sampler keep the cube S# correct).
+    if (img_type == GFX9_SQ_RSRC_IMG_CUBE) { native_tex_set_cube(tex); }
     return tex;
 }
 
@@ -14901,9 +14905,14 @@ fn _backend_native_texture_bind_for_sample_layer(ctx, pass, tex, sampler, layer)
         # filter+addr so gpu_sampler_create(POINT/BILINEAR, CLAMP/WRAP) takes
         # effect. unnorm stays 1. POINT/CLAMP rebuilds byte-identically to the
         # create default (existing sample e2es unaffected); only for a valid sampler.
+        # unnorm = 0 for a CUBE (normalized face u/v), 1 otherwise (2D/array
+        # texel-space coords). Auto-selected from the texture so a consumer binds
+        # a cube with a normal sampler + gets correct cube sampling (AA.5d).
+        var unnorm = 1;
+        if (native_tex_is_cube(tex) != 0) { unnorm = 0; }
         if (gpu_sampler_is_valid(sampler) != 0) {
             native_gfx9_sampler_descriptor(dcpu, 32,
-            gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), 1);
+            gpu_sampler_filter(sampler), gpu_sampler_addr(sampler), unnorm);
         }
         # v3.4 AA.2 — the array slice (int) the array image_sample/load FS s-loads
         # as its 3rd VADDR. Written every bind so layer 0 is the explicit default.
@@ -15905,10 +15914,22 @@ var NATIVE_TEX_STRUCT_SIZE     = 64;   # v3.2 TS.3 — 48 -> 64 (sampleable); +6
 fn native_tex_fmt(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_FMT); }
 fn native_tex_sw_mode(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SW_MODE); }
 fn native_tex_t_va(tex): i64 { return load64(tex + NATIVE_TEX_FIELD_T_VA); }
-# v3.4 AA.0 — slice count (array layers / cube faces). 0 or 1 == a single 2D
-# layer (back-compat: every existing create leaves +60 zeroed via memset).
-fn native_tex_slice_count(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT); }
+# v3.4 AA.0/AA.5d — slice count (array layers / cube faces) in the low 31 bits of
+# +60; bit 31 is the IS-CUBE flag (count needs only 12 bits — GFX9 DEPTH[0:12]).
+# 0 or 1 == a single 2D layer (back-compat: every existing create leaves +60
+# zeroed via memset, so slice_count 0 / not-cube). The cube flag lets
+# bind_for_sample pick the cube S# (unnorm=0) — a cube needs normalized face u/v.
+fn native_tex_slice_count(tex): i64 { return load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) & 0x7FFFFFFF; }
 fn native_tex_set_slice_count(tex, n): i64 { store32(tex + NATIVE_TEX_FIELD_SLICE_COUNT, n); return 0; }
+fn native_tex_is_cube(tex): i64 {
+    if ((load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) & 0x80000000) != 0) { return 1; }
+    return 0;
+}
+fn native_tex_set_cube(tex): i64 {
+    store32(tex + NATIVE_TEX_FIELD_SLICE_COUNT,
+    load32(tex + NATIVE_TEX_FIELD_SLICE_COUNT) | 0x80000000);
+    return 0;
+}
 fn native_tex_set_sw_mode(tex, m): i64 { store32(tex + NATIVE_TEX_FIELD_SW_MODE, m); return 0; }
 fn native_tex_set_t_va(tex, va): i64 { store64(tex + NATIVE_TEX_FIELD_T_VA, va); return 0; }
 # v3.2 TS.8 — CPU (mmap'd) address of the descriptor tail (T#/S#/scale BO), for

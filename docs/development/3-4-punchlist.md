@@ -203,11 +203,15 @@ implementation, not just planning.
   naga does the projection, unlike native's faceid), **RT == face color for
   +Z (face 4) and +X (face 0)**. All suites exit 0; distlib idempotent. wgpu cubes
   are fully consumer-usable (a normal sampler — wgpu has no GFX9 unnorm wart).
-- [ ] **AA.5d — native cube-aware bind + cap flip** (the native ergonomic wart):
-  a cube needs unnorm=0, but the generic `bind_for_sample` forces unnorm=1 (so
-  AA.5b's e2e binds with sampler 0). Store an is-cube flag on the NativeTexture
-  (e.g. slice_count bit 31) so `bind_for_sample_layer` auto-selects unnorm; then
-  flip `gpu_caps_native_texture_cube` to 1. Small native refinement — tracked.
+- [x] **AA.5d (2026-06-19)** — native cube-aware bind + cap flip. An **is-cube
+  flag packed in `slice_count` bit 31** (`native_tex_is_cube` / `_set_cube`;
+  `slice_count` masks it off — count needs ≤12 bits); the cube create sets it,
+  and `bind_for_sample_layer` auto-selects `unnorm = is_cube ? 0 : 1`. So a
+  consumer now binds a cube with a **normal sampler** (the sampler-0 hack is
+  gone — `native_cube_sample_e2e` re-verified binding with a real sampler).
+  **`gpu_caps_native_texture_cube` flipped to 1.** +5 CPU asserts (is-cube flag
+  round-trip + slice_count masking) + the caps test (cube→1). Suite 4457→4462;
+  all exit 0; distlib idempotent. **Native cubes are now fully consumer-usable.**
 
 ## Phase AA.6 — DDS/KTX2 array + cube loader integration [M]
 
