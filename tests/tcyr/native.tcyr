@@ -668,6 +668,54 @@ fn test_native_gfx9_image_descriptor() {
     return 0;
 }
 
+# v3.4 AA.1a — the _typed builder: TYPE (W3[28:31]) + DEPTH (W4[0:12]) for
+# 2D_ARRAY / CUBE. Everything else stays as the 2D oracle above (the wrapper
+# proves the 2D round-trip; this proves the array/cube deltas).
+fn test_native_gfx9_image_descriptor_typed_array_cube() {
+    var buf[32];
+    # 2D_ARRAY, 8 slices: TYPE=13, DEPTH=7. epitch w-1 still in PITCH.
+    memset(&buf, 0, 32);
+    var end = native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 255, GFX9_SQ_RSRC_IMG_2D_ARRAY, 8);
+    assert_eq(end, 32, "returns pos + 32");
+    var w3 = load32(&buf + 12);
+    var w4 = load32(&buf + 16);
+    assert_eq((w3 >> 28) & 0xF, 13, "array W3 TYPE = 2D_ARRAY(13)");
+    assert_eq(w4 & 0x1FFF, 7, "array W4 DEPTH = slice_count-1 (7)");
+    assert_eq((w4 >> 13) & 0xFFFF, 255, "array W4 PITCH = epitch (255) unchanged");
+    # CUBE: TYPE=11, DEPTH=5 (6 faces - 1).
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    64, 64, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 63, GFX9_SQ_RSRC_IMG_CUBE, 6);
+    var cw3 = load32(&buf + 12);
+    var cw4 = load32(&buf + 16);
+    assert_eq((cw3 >> 28) & 0xF, 11, "cube W3 TYPE = CUBE(11)");
+    assert_eq(cw4 & 0x1FFF, 5, "cube W4 DEPTH = 6 faces - 1 (5)");
+    # slice_count 0/1 both clamp to a single layer (DEPTH 0) — back-compat.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor_typed(&buf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_RGBA8, GFX9_SW_MODE_LINEAR, 1, 255, GFX9_SQ_RSRC_IMG_2D, 0);
+    assert_eq(load32(&buf + 16) & 0x1FFF, 0, "slice_count 0 -> DEPTH 0 (clamped)");
+    assert_eq((load32(&buf + 12) >> 28) & 0xF, 9, "2D TYPE(9) via _typed");
+    # The wrapper == _typed(2D, 1) byte-for-byte (the round-trip invariant).
+    var wbuf[32];
+    var tbuf[32];
+    memset(&wbuf, 0, 32);
+    memset(&tbuf, 0, 32);
+    native_gfx9_image_descriptor(&wbuf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_64KB_S, 4, 127);
+    native_gfx9_image_descriptor_typed(&tbuf, 0, 0xFFFF800180000000,
+    256, 256, MABDA_TEXFMT_BC1, GFX9_SW_MODE_64KB_S, 4, 127, GFX9_SQ_RSRC_IMG_2D, 1);
+    var i = 0;
+    var same = 1;
+    while (i < 32) {
+        if (load8(&wbuf + i) != load8(&tbuf + i)) { same = 0; }
+        i = i + 1;
+    }
+    assert_eq(same, 1, "wrapper bytes == _typed(2D,1) bytes (round-trip invariant)");
+    return 0;
+}
+
 # v3.2 TS.2 — format->IMG-format table: every row pinned against the
 # gfx9.json IMG_DATA_FORMAT / IMG_NUM_FORMAT enum values.
 fn test_native_gfx9_texfmt_to_img_format() {
@@ -3790,6 +3838,7 @@ fn main() {
     test_native_queue_kind_to_ring();
     test_native_compute_dispatch_on_dma_queue_rejected();
     test_native_gfx9_image_descriptor();
+    test_native_gfx9_image_descriptor_typed_array_cube();
     test_native_gfx9_texfmt_to_img_format();
     test_native_gfx9_sampler_descriptor();
     test_native_sdma_build_copy_tiled();

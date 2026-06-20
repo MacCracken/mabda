@@ -77,11 +77,14 @@ implementation, not just planning.
 
 ## Phase AA.1 — Native 2D-array create + per-slice upload (storage) [M]
 
-- [ ] **AA.1a** — `native_gfx9_image_descriptor` gains `(img_type, slice_count)`:
-  `W3 TYPE = img_type` (`GFX9_SQ_RSRC_IMG_2D_ARRAY=13` / `_CUBE=11`),
-  `W4 |= ((slice_count-1) & 0x1FFF)`. **Existing 2D callers pass
-  `(2D, 1)` byte-identical** (the round-trip invariant). CPU oracle for the new
-  TYPE/DEPTH bit fields vs gfx9.json.
+- [x] **AA.1a (2026-06-19)** — `native_gfx9_image_descriptor_typed(…, img_type,
+  slice_count)` does the work (`W3 TYPE = img_type`, `W4 DEPTH[0:12] =
+  slice_count-1`); the old `native_gfx9_image_descriptor` is now a thin wrapper
+  delegating with `(2D, 1)` — **byte-identical**, so the 1 prod + 8 test callers
+  + the oracle are untouched (no churn). `GFX9_SQ_RSRC_IMG_2D_ARRAY=13` /
+  `_CUBE=11` consts. +9 asserts (native 1408→1417: TYPE 13/11 + DEPTH 7/5 + the
+  slice-count-0 clamp + a byte-for-byte wrapper==_typed(2D,1) round-trip check).
+  Suite 4327→4336; distlib idempotent.
 - [ ] **AA.1b** — native 2D-array RGBA8 **LINEAR** storage +
   `write_layer_level`: `_backend_native_texture_create_2d_array_sampleable`
   (slice_count · per-slice surface contiguous + the T#/S# tail, array T# via

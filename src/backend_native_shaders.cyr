@@ -1353,6 +1353,11 @@ var GFX9_SQ_SEL_Y       = 5;
 var GFX9_SQ_SEL_Z       = 6;
 var GFX9_SQ_SEL_W       = 7;
 var GFX9_SQ_RSRC_IMG_2D = 9;
+# v3.4 AA.1 — SQ_RSRC_IMG_TYPE (gfx9.json enum SQ_RSRC_IMG_TYPE): a 2D array is
+# TYPE 13, a cubemap TYPE 11 (a cube is a 6-slice array on GFX9). Only the W3
+# TYPE[28:31] field + W4 DEPTH[0:12] (slice_count-1) differ from a plain 2D.
+var GFX9_SQ_RSRC_IMG_2D_ARRAY = 13;
+var GFX9_SQ_RSRC_IMG_CUBE     = 11;
 var GFX9_SW_MODE_LINEAR = 0;
 # ADDR_SW_64KB_S — the 64 KiB standard-swizzle tiled mode used for compressed
 # sampling (TS.7c). Value 9 matches the swizzle_mode the SDMA COPY_TILED packet
@@ -1371,8 +1376,9 @@ var GFX9_SW_MODE_64KB_S = 9;
 #   W2: WIDTH[0:13]=w-1   HEIGHT[14:27]=h-1
 #   W3: DST_SEL_X[0:2] Y[3:5] Z[6:8] W[9:11] (identity RGBA = X/Y/Z/W)
 #       BASE_LEVEL[12:15]=0  LAST_LEVEL[16:19]=mips-1  SW_MODE[20:24]
-#       TYPE[28:31]=SQ_RSRC_IMG_2D
-#   W4: DEPTH[0:12]=0  PITCH[13:28]=epitch   BC_SWIZZLE[29:31]=0
+#       TYPE[28:31]=img_type (2D / 2D_ARRAY / CUBE — v3.4 AA.1)
+#   W4: DEPTH[0:12]=slice_count-1 (0 for plain 2D — v3.4 AA.1)
+#       PITCH[13:28]=epitch   BC_SWIZZLE[29:31]=0
 #       (epitch = w-1 for LINEAR; for a SW_64KB_S tiled compressed surface it
 #        is the tile-aligned block pitch - 1 = awb-1, matching the SDMA
 #        COPY_TILED epitch the surface was tiled with — TS.7c)
@@ -1381,8 +1387,8 @@ var GFX9_SW_MODE_64KB_S = 9;
 # rejects). NOTE: bit POSITIONS are gfx9.json-authoritative; field VALUE
 # semantics (PITCH alignment, MIN_LOD/MAX_MIP) are HW-cross-checked at the
 # TS.5 (linear) / TS.7c (tiled) sampling e2e on Cezanne. @internal
-fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
-fmt, sw_mode, mip_count, epitch): i64 {
+fn native_gfx9_image_descriptor_typed(buf, pos, base_va, width, height,
+fmt, sw_mode, mip_count, epitch, img_type, slice_count): i64 {
     if (width <= 0)  { return 0 - 1; }
     if (height <= 0) { return 0 - 1; }
     var packed = native_gfx9_texfmt_to_img_format(fmt);
@@ -1392,6 +1398,8 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var levels = mip_count;
     if (levels < 1) { levels = 1; }
     var last_level = levels - 1;
+    var slices = slice_count;
+    if (slices < 1) { slices = 1; }   # 0/1 == a single 2D layer (DEPTH 0)
 
     # W0: low 32 of (va >> 8). `>>` is logical (no sign-extend); mask to 32.
     var w0 = (base_va >> 8) & 0xFFFFFFFF;
@@ -1425,9 +1433,10 @@ fmt, sw_mode, mip_count, epitch): i64 {
     var w3 = (sel_x & 0x7) | ((sel_y & 0x7) << 3);
     w3 = w3 | ((sel_z & 0x7) << 6) | ((sel_w & 0x7) << 9);
     w3 = w3 | ((last_level & 0xF) << 16) | ((sw_mode & 0x1F) << 20);
-    w3 = w3 | ((GFX9_SQ_RSRC_IMG_2D & 0xF) << 28);
-    # W4: PITCH[13:28] = epitch (caller supplies: w-1 for LINEAR, awb-1 tiled).
-    var w4 = (epitch & 0xFFFF) << 13;
+    w3 = w3 | ((img_type & 0xF) << 28);
+    # W4: DEPTH[0:12] = slice_count-1 (0 for plain 2D); PITCH[13:28] = epitch
+    # (caller supplies: w-1 for LINEAR, awb-1 tiled).
+    var w4 = ((slices - 1) & 0x1FFF) | ((epitch & 0xFFFF) << 13);
     # W5: MAX_MIP[28:31].
     var w5 = (last_level & 0xF) << 28;
     store32(buf + pos +  0, w0);
@@ -1439,5 +1448,15 @@ fmt, sw_mode, mip_count, epitch): i64 {
     store32(buf + pos + 24, 0);
     store32(buf + pos + 28, 0);
     return pos + 32;
+}
+
+# Plain single-layer 2D T# — the pre-v3.4 entry point, now a thin wrapper over
+# _typed with (img_type=2D, slice_count=1). DEPTH=0 + TYPE=2D makes the bytes
+# identical to the old hardcoded builder (the AA.1 round-trip invariant — every
+# existing 2D caller + oracle is unchanged). @internal
+fn native_gfx9_image_descriptor(buf, pos, base_va, width, height,
+fmt, sw_mode, mip_count, epitch): i64 {
+    return native_gfx9_image_descriptor_typed(buf, pos, base_va, width, height,
+    fmt, sw_mode, mip_count, epitch, GFX9_SQ_RSRC_IMG_2D, 1);
 }
 
