@@ -851,9 +851,95 @@ fn test_gpu_render_dispatchers_null_ctx_safe() {
     return 0;
 }
 
+# --- v3.4.3: DOT (graphviz) export ---
+# Substring scan: 1 if `needle` (cstr) occurs in buf[0..len], else 0.
+fn _buf_find(buf, len, needle): i64 {
+    var nl = strlen(needle);
+    if (nl == 0) { return 1; }
+    var i = 0;
+    while (i + nl <= len) {
+        var j = 0;
+        var ok = 1;
+        while (j < nl) {
+            if (load8(buf + i + j) != load8(needle + j)) { ok = 0; j = nl; }
+            if (ok == 1) { j = j + 1; }
+        }
+        if (ok == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_rg_to_dot_basic() {
+    var g = rg_new();
+    rg_label(g, "mygraph");
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    var buf[1024];
+    memset(&buf, 0, 1024);
+    var len = rg_to_dot(g, &buf, 1024);
+    assert(len > 0, "rg_to_dot returns bytes written");
+    assert(len < 1024, "output fits the buffer");
+    assert_eq(_buf_find(&buf, len, "digraph \"mygraph\""), 1, "digraph header carries the label");
+    assert_eq(_buf_find(&buf, len, "A [compute/COMPUTE]"), 1, "node A labeled with kind/queue");
+    assert_eq(_buf_find(&buf, len, "B [compute/COMPUTE]"), 1, "node B labeled with kind/queue");
+    assert_eq(_buf_find(&buf, len, "n0 -> n1"), 1, "write r0 -> read r0 makes edge A->B");
+    assert_eq(_buf_find(&buf, len, "}"), 1, "digraph is closed");
+    # No cross-queue edge here (both COMPUTE) -> the edge is solid, not dashed.
+    assert_eq(_buf_find(&buf, len, "style=dashed"), 0, "intra-queue edge is not dashed");
+    return 0;
+}
+
+fn test_rg_to_dot_cross_queue_dashed() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var a = rg_add_compute(g, 0, 0, &dims, "C");   # default QUEUE_KIND_COMPUTE
+    rg_node_writes(g, a, r0);
+    var b = rg_add_compute(g, 0, 0, &dims, "G");
+    rg_node_queue(g, b, QUEUE_KIND_GRAPHICS);      # force the reader onto GFX
+    rg_node_reads(g, b, r0);
+    var buf[1024];
+    memset(&buf, 0, 1024);
+    var len = rg_to_dot(g, &buf, 1024);
+    assert(len > 0, "cross-queue graph emits");
+    assert_eq(_buf_find(&buf, len, "n0 -> n1 [style=dashed]"), 1, "cross-queue edge is dashed");
+    return 0;
+}
+
+fn test_rg_to_dot_guards() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    rg_add_compute(g, 0, 0, &dims, "A");
+    var tiny[8];
+    assert_eq(rg_to_dot(g, &tiny, 8), 0 - 1, "buffer too small -> -1 (no overflow write)");
+    assert_eq(rg_to_dot(0, &tiny, 8), 0 - 1, "null graph -> -1");
+    assert_eq(rg_to_dot(g, 0, 64), 0 - 1, "null out_buf -> -1");
+    return 0;
+}
+
+fn test_rg_to_dot_empty_graph() {
+    var g = rg_new();
+    var buf[256];
+    memset(&buf, 0, 256);
+    var len = rg_to_dot(g, &buf, 256);
+    assert(len > 0, "empty graph still emits a valid digraph");
+    assert_eq(_buf_find(&buf, len, "digraph"), 1, "has the digraph keyword");
+    assert_eq(_buf_find(&buf, len, "->"), 0, "no edges in an empty graph");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_rg_to_dot_basic();
+    test_rg_to_dot_cross_queue_dashed();
+    test_rg_to_dot_guards();
+    test_rg_to_dot_empty_graph();
     test_audit_rpb_label_fits();
     test_audit_strnlen_short_string();
     test_audit_rpb_pass_color_offsets();

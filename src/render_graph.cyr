@@ -962,6 +962,115 @@ fn rg_node_batch_idx(g, node_id): i64 {
 }
 
 # ================================================================
+# Graph visualizer — DOT (graphviz) export (v3.4.3, v2.5.x follow-up)
+# ================================================================
+# Pure-CPU dump of the graph's nodes + dependency edges to a graphviz
+# `digraph`, so a consumer can `dot -Tpng` a render graph for debugging.
+# No GPU; safe to call any time after rg_new (edges need only reads/writes,
+# not rg_build). Cross-queue edges are dashed (they become fence barriers).
+
+# Map a QUEUE_KIND_* to a short name (for node labels).
+fn _rg_queue_name(qk): i64 {
+    if (qk == QUEUE_KIND_COMPUTE)  { return "COMPUTE"; }
+    if (qk == QUEUE_KIND_TRANSFER) { return "TRANSFER"; }
+    return "GRAPHICS";
+}
+
+# Map a NODE_* kind to a short name.
+fn _rg_node_kind_name(k): i64 {
+    if (k == NODE_COMPUTE)      { return "compute"; }
+    if (k == NODE_RENDER)       { return "render"; }
+    if (k == NODE_COPY_BUF_BUF) { return "copy_bb"; }
+    if (k == NODE_COPY_TEX_BUF) { return "copy_tb"; }
+    return "node";
+}
+
+# Append cstr `s` to `buf` at `pos`. Returns the new pos, or -1 if it would
+# exceed `cap`. A negative `pos` propagates (short-circuits the whole build).
+fn _dot_put(buf, cap, pos, s): i64 {
+    if (pos < 0) { return 0 - 1; }
+    var len = strlen(s);
+    if (pos + len > cap) { return 0 - 1; }
+    memcpy(buf + pos, s, len);
+    return pos + len;
+}
+
+# Append the decimal of `n` to `buf` at `pos`. Same overflow contract.
+fn _dot_put_int(buf, cap, pos, n): i64 {
+    if (pos < 0) { return 0 - 1; }
+    var tmp[24];
+    var len = fmt_int_buf(n, &tmp);
+    if (pos + len > cap) { return 0 - 1; }
+    memcpy(buf + pos, &tmp, len);
+    return pos + len;
+}
+
+# Write a graphviz `digraph` for `g` into the caller-owned `out_buf` (cap
+# bytes). Returns the number of bytes written (excluding the NUL terminator,
+# which is added when there is room), or -1 if the buffer is too small or
+# `g`/`out_buf` is null. Nodes are `n<idx> [label="<name> [kind/queue]"]`;
+# edges are writer→reader (a write of resource R, then a read of R); a
+# cross-queue edge is dashed (it becomes a gpu_queue_barrier at execute).
+fn rg_to_dot(g, out_buf, out_cap): i64 {
+    if (g == 0)        { return 0 - 1; }
+    if (out_buf == 0)  { return 0 - 1; }
+    if (out_cap <= 0)  { return 0 - 1; }
+    var nodes = load64(g + 0);
+    var n = vec_len(nodes);
+    var pos = 0;
+    pos = _dot_put(out_buf, out_cap, pos, "digraph \"");
+    var glabel = load64(g + 32);
+    if (glabel != 0) { pos = _dot_put(out_buf, out_cap, pos, glabel); }
+    if (glabel == 0) { pos = _dot_put(out_buf, out_cap, pos, "render_graph"); }
+    pos = _dot_put(out_buf, out_cap, pos, "\" {\n  rankdir=LR;\n");
+    # node declarations
+    var i = 0;
+    while (i < n) {
+        var node = vec_get(nodes, i);
+        pos = _dot_put(out_buf, out_cap, pos, "  n");
+        pos = _dot_put_int(out_buf, out_cap, pos, i);
+        pos = _dot_put(out_buf, out_cap, pos, " [label=\"");
+        var nl = load64(node + 32);
+        if (nl != 0) { pos = _dot_put(out_buf, out_cap, pos, nl); }
+        if (nl == 0) { pos = _dot_put(out_buf, out_cap, pos, "node"); }
+        pos = _dot_put(out_buf, out_cap, pos, " [");
+        pos = _dot_put(out_buf, out_cap, pos, _rg_node_kind_name(load64(node + 0)));
+        pos = _dot_put(out_buf, out_cap, pos, "/");
+        pos = _dot_put(out_buf, out_cap, pos, _rg_queue_name(load64(node + 56)));
+        pos = _dot_put(out_buf, out_cap, pos, "]\"];\n");
+        i = i + 1;
+    }
+    # dependency edges: node i writes a resource node j reads -> i -> j
+    i = 0;
+    while (i < n) {
+        var ni = vec_get(nodes, i);
+        var iwrites = load64(ni + 24);
+        var j = 0;
+        while (j < n) {
+            if (j != i) {
+                var nj = vec_get(nodes, j);
+                if (_rg_nodes_share_dep(iwrites, load64(nj + 16)) == 1) {
+                    pos = _dot_put(out_buf, out_cap, pos, "  n");
+                    pos = _dot_put_int(out_buf, out_cap, pos, i);
+                    pos = _dot_put(out_buf, out_cap, pos, " -> n");
+                    pos = _dot_put_int(out_buf, out_cap, pos, j);
+                    if (load64(ni + 56) != load64(nj + 56)) {
+                        pos = _dot_put(out_buf, out_cap, pos, " [style=dashed]");
+                    }
+                    pos = _dot_put(out_buf, out_cap, pos, ";\n");
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    pos = _dot_put(out_buf, out_cap, pos, "}\n");
+    if (pos < 0) { return 0 - 1; }           # buffer too small
+    if (pos < out_cap) { store8(out_buf + pos, 0); }   # NUL if room (uncounted)
+    return pos;
+}
+
+# ================================================================
 # Execute — encode every node into one command encoder, submit once.
 # ================================================================
 
@@ -986,6 +1095,13 @@ fn rg_execute(g, device, queue): i64 {
     while (i < n) {
         var node = vec_get(nodes, i);
         var kind = load64(node + 0);
+        # v3.4.3: wrap each node's encoding in a debug group named after the node
+        # so GPU profilers (RenderDoc / RGP / PIX) show the graph structure. The
+        # debug_* fns are no-ops until the encoder debug-group FFI lands (see
+        # src/debug.cyr); the wrapping is in place + harmless until then.
+        var dbg_label = load64(node + 32);
+        if (dbg_label == 0) { dbg_label = "rg_node"; }
+        debug_push(encoder, dbg_label);
         if (kind == NODE_COMPUTE) {
             _rg_encode_compute(encoder, node);
         } else {
@@ -1001,6 +1117,7 @@ fn rg_execute(g, device, queue): i64 {
                 }
             }
         }
+        debug_pop(encoder);
         i = i + 1;
     }
 
