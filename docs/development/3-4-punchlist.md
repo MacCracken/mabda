@@ -138,10 +138,24 @@ implementation, not just planning.
   (backend 521→532, descriptor byte-offsets). **Confirmed the wgpu path still
   links/runs on 6.2.28** (`make test-phase0` green — context/buffers/textures/
   samplers), so AA.3b is HW-verifiable here. Suite 4409→4420; distlib idempotent.
-- [ ] **AA.3b** — wgpu `create_2d_array` (2DArray view) + `write_layer_level`
-  (writeTexture origin.z) + a `texture_2d_array` WGSL FS; grow the 32-B wgpu tex
-  wrapper with layer count + view dim. **HW-verify on this box** (wgpu-native +
-  Vulkan/RADV present).
+- [x] **AA.3b (2026-06-19) — HW-VERIFIED on Cezanne (wgpu via Vulkan).**
+  `_backend_wgpu_texture_create_2d_array` (layered descriptor `depthOrArrayLayers`
+  + 2DArray view; 32-B wrapper handle@0/view@8/w@16/h@20/LAYERS@24/fmt@28,
+  caps-gated) + `_backend_wgpu_texture_write_layer_level` (writeTexture origin.z =
+  layer via `wgpu_texel_copy_texture_info_layer`; mipLevel+origin.z, so
+  mipped-array-ready). Slots wired. `programs/wgpu_array_sample_e2e.cyr` +
+  `make test-wgpu-array-sample-e2e`: 4-layer array created+uploaded, a
+  `texture_2d_array` WGSL FS samples it, **RT == layer color for layers 0 AND 2**
+  (distinct R proves the `array_index` selects). All suites exit 0; distlib
+  idempotent. (Found+fixed: `str_builder_add` takes a `Str`, not (ptr,len) — the
+  WGSL layer digit must go via `str_builder_add_cstr` on a NUL-terminated buf.)
+- [ ] **AA.3c** — wgpu DRAW-TIME layer selection (`gpu_render_pass_bind_texture_layer`
+  on wgpu, currently native-only → wgpu returns NOT_IMPLEMENTED). Needs a layer
+  uniform the `texture_2d_array` FS reads + the wgpu `bind_for_sample_layer` filler
+  building the bind group with it (AA.3b's e2e hardcodes the layer in WGSL, which
+  isolates the array-view+sample path but isn't consumer-selectable). The native
+  path already supports it (the +56 descriptor tail). **Tracked asymmetry, not
+  dropped** — flag for this arc's remainder or a follow-on.
 
 ## Phase AA.4 — Native 2D-array compressed (tiled) [M]
 

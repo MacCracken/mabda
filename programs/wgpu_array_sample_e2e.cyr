@@ -1,0 +1,155 @@
+# programs/wgpu_array_sample_e2e.cyr — v3.4 AA.3b (wgpu 2D-array sample path)
+#
+# The wgpu counterpart of native AA.2: create a 2D ARRAY texture, upload distinct
+# colors per layer, then SAMPLE a chosen layer through a texture_2d_array WGSL FS
+# and verify the RT is that layer's color.
+#
+#   gpu_texture_create_2d_array(RGBA8, 4 layers) + gpu_texture_write_layer_level
+#     (layer k = solid (0x40 + k*0x20, 0x80, 0xC0, 0xFF))
+#   -> a texture_2d_array WGSL FS: textureSample(t, s, uv, K) for a fixed K
+#   -> render fullscreen + copy RT -> MAP_READ -> verify RT == layer K's color.
+#
+# Tested for layers 0 and 2: distinct R per layer proves the array_index argument
+# genuinely selects the slice (not always layer 0). The per-fragment/uniform
+# layer-selection API (gpu_render_pass_bind_texture_layer on wgpu) is AA.3c; here
+# the layer is a WGSL literal, which isolates the array-view + sample path.
+#
+# Linked with deps/wgpu_main.c. Skips cleanly if no GPU.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+# WGSL sampling array layer `k` (a literal in the FS).
+fn _array_wgsl(k): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var t: texture_2d_array<f32>; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(1) var s: sampler; ");
+    str_builder_add_cstr(sb, "struct VOut { @builtin(position) pos: vec4<f32>, ");
+    str_builder_add_cstr(sb, "@location(0) uv: vec2<f32> }; ");
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> VOut { ");
+    str_builder_add_cstr(sb, "var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), ");
+    str_builder_add_cstr(sb, "vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); ");
+    str_builder_add_cstr(sb, "var o: VOut; o.pos = vec4<f32>(p[vid], 0.0, 1.0); ");
+    str_builder_add_cstr(sb, "o.uv = (p[vid] + vec2<f32>(1.0, 1.0)) * 0.5; return o; } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main(inp: VOut) -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return textureSample(t, s, inp.uv, ");
+    var nb[16];
+    memset(&nb, 0, 16);
+    fmt_int_buf(k, &nb);   # digits + a trailing NUL (nb was zeroed) -> a cstr
+    str_builder_add_cstr(sb, &nb);
+    str_builder_add_cstr(sb, "); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+# Render array layer K + verify the RT is layer K's solid color. 0 ok, else fail.
+fn _sample_layer(ctx, tex, samp, k): i64 {
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var W = 64;
+    var H = 64;
+    var wgsl = _array_wgsl(k);
+    var shmod = gpu_shader_module_create(ctx, wgsl, strlen(wgsl));
+    if (shmod == 0) { return 1; }
+    var pipe = gpu_render_pipeline_create(ctx, shmod, shmod, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (pipe == 0) { return 1; }
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { return 1; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return 1; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) { return 1; }
+    if (gpu_render_pass_draw(ctx, pass, pipe, 3, 1) != 0) { return 1; }
+    gpu_render_pass_end(ctx, pass);
+    # copy RT -> MAP_READ.
+    var rt_handle = load64(rt + 0);
+    var BPR = 256;
+    var BUF_SIZE = 16384;
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("arr-readback", read_usage, BUF_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return 1; }
+    var enc = wgpu_device_create_command_encoder(device, "arr-enc");
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  rt_handle);
+    store32(cargs + 24, 0);
+    store64(cargs + 32, read_buf);
+    store32(cargs + 48, BPR);
+    store32(cargs + 52, H);
+    store32(cargs + 56, W);
+    store32(cargs + 60, H);
+    store32(cargs + 64, 1);
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "arr-cmd");
+    wgpu_queue_submit_one(queue, cmd);
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return 1; }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
+    if (mapped == 0) { return 1; }
+    # Probe pixel(0,0) + center — must be layer K's color (R = 0x40 + k*0x20).
+    var want_r = 0x40 + k * 0x20;
+    var bad = 0;
+    var offc = (H / 2) * BPR + (W / 2) * 4;
+    if (load8(mapped + 0) != want_r) { bad = 1; }
+    if (load8(mapped + 1) != 0x80)   { bad = 1; }
+    if (load8(mapped + offc + 0) != want_r) { bad = 1; }
+    wgpu_buffer_unmap(read_buf);
+    return bad;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    var W = 64;
+    var H = 64;
+    var N = W * H * 4;
+    var LAYERS = 4;
+
+    var tex = gpu_texture_create_2d_array(_gpu_ctx, W, H, MABDA_TEXFMT_RGBA8, LAYERS);
+    if (tex == 0) { return _fail("FAIL: create_2d_array\n", 22); }
+    var src = alloc(N);
+    var k = 0;
+    while (k < LAYERS) {
+        var i = 0;
+        while (i < W * H) {
+            store8(src + i * 4 + 0, 0x40 + k * 0x20);
+            store8(src + i * 4 + 1, 0x80);
+            store8(src + i * 4 + 2, 0xC0);
+            store8(src + i * 4 + 3, 0xFF);
+            i = i + 1;
+        }
+        if (gpu_texture_write_layer_level(_gpu_ctx, tex, k, 0, src, N) != 0) {
+            return _fail("FAIL: write_layer_level\n", 24);
+        }
+        k = k + 1;
+    }
+    syscall(1, 1, "PASS: 4-layer array created + uploaded (distinct R)\n", 51);
+
+    var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { return _fail("FAIL: sampler\n", 14); }
+
+    if (_sample_layer(_gpu_ctx, tex, samp, 0) != 0) {
+        return _fail("FAIL: layer 0 sample mismatch\n", 30);
+    }
+    if (_sample_layer(_gpu_ctx, tex, samp, 2) != 0) {
+        return _fail("FAIL: layer 2 sample mismatch\n", 30);
+    }
+    syscall(1, 1, "PASS: RT = array layer color for layers 0 and 2\n", 48);
+
+    syscall(1, 1, "\n3 passed, 0 failed\n", 20);
+    return 0;
+}
