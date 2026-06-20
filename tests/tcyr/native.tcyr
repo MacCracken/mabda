@@ -2533,6 +2533,32 @@ fn test_native_rt_bo_size_64k_rounding() {
     return 0;
 }
 
+# v3.4.3: the va_map 64 KiB sweep — native buffer/texture/mipped/sampleable
+# create paths round their BO + GEM_VA span to 64 KiB (_NATIVE_TEXTURE_VA_ALIGN),
+# the same GFX9 fragment alignment the 3.4.2 RT fix used, so arbitrary
+# (non-64-KiB-aligned) window/texture/buffer sizes no longer EINVAL. Pure-math
+# regression for the rounding invariant the create paths now apply.
+fn test_native_va_map_64k_sweep_rounding() {
+    var k = _NATIVE_TEXTURE_VA_ALIGN;
+    assert_eq(k, 0x10000, "texture VA align is 64 KiB");
+    # Buffer: an arbitrary non-64-KiB size rounds up to a 64 KiB multiple.
+    assert_eq(_native_align_up(100000, k), 131072, "buffer 100000 -> 2*64KiB");
+    assert_eq(_native_align_up(100000, k) & 0xFFFF, 0, "buffer span 64 KiB-aligned");
+    # 2D RGBA8 1260x682 (the reported window) -> 53*64KiB (matches the RT case).
+    assert_eq(_native_align_up(native_texture_size_2d_rgba8(1260, 682), k), 3473408,
+    "1260x682 RGBA8 -> 64KiB-rounded");
+    # Compressed (BC1) + mip chain spans also round to 64 KiB multiples.
+    var bc = mabda_texfmt_data_size(MABDA_TEXFMT_BC1, 1264, 684);
+    assert(bc > 0, "BC1 size computed");
+    assert_eq(_native_align_up(bc, k) & 0xFFFF, 0, "BC1 1264x684 span 64 KiB-aligned");
+    assert_eq(_native_align_up(native_mip_chain_size(1260, 682, 4), k) & 0xFFFF, 0,
+    "mip chain 64 KiB-aligned");
+    # An already-64-KiB-aligned size is unchanged (idempotent — the release
+    # rounds the same way, so it unmaps the exact mapped span).
+    assert_eq(_native_align_up(262144, k), 262144, "already-aligned unchanged");
+    return 0;
+}
+
 # v3.4.2: render targets now bump a per-context VA cursor (ctx+168) so multiple
 # live RTs get distinct VAs instead of colliding on one fixed _NATIVE_RT_VA_BASE
 # (the 2nd-live-RT EINVAL). Mirrors native_ctx_alloc_texture_va.
@@ -4205,6 +4231,7 @@ fn main() {
     test_native_rt_struct_round_trip();
     test_native_rt_release_safe_zero();
     test_native_rt_bo_size_64k_rounding();
+    test_native_va_map_64k_sweep_rounding();
     test_native_rt_va_bump_distinct();
     test_native_pm4_opcodes_extended();
     test_native_context_reg_offset_encoding();

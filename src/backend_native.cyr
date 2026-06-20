@@ -830,7 +830,11 @@ fn _backend_native_buffer_create(ctx, size, usage): i64 {
     # it (the allocator also returns 0 on exhaustion).
     if (size > _NATIVE_TEXTURE_VA_REGION) { return 0; }
     var fd = native_ctx_fd(ctx);
-    var bo_size = _native_align_up(size, 4096);
+    # v3.4.3: round the BO + VA-map span to 64 KiB (the GFX9 GEM_VA fragment
+    # alignment) — a 4 KiB-but-not-64-KiB span EINVALs, same as the 3.4.2 RT
+    # bug. SIZE stays logical (consumers query it; write/read bound against it);
+    # _backend_native_buffer_release rounds it back the same way to unmap.
+    var bo_size = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
@@ -897,7 +901,7 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
     var handle = load64(buf + NATIVE_BUF_FIELD_HANDLE);
     var va     = load64(buf + NATIVE_BUF_FIELD_VA);
     var addr   = load64(buf + NATIVE_BUF_FIELD_ADDR);
-    var bo_size = _native_align_up(load64(buf + NATIVE_BUF_FIELD_SIZE), 4096);
+    var bo_size = _native_align_up(load64(buf + NATIVE_BUF_FIELD_SIZE), _NATIVE_TEXTURE_VA_ALIGN);
     if (handle != 0) {
         native_gem_va_unmap(fd, handle, va, bo_size);
         native_bo_release_gtt(fd, handle, addr, bo_size);
@@ -1019,7 +1023,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
 
     # --- stage the ISA in a GTT BO at a context-allocated VA ---
     var fd = native_ctx_fd(ctx);
-    var bo_size = _native_align_up(isa_len, 4096);
+    var bo_size = _native_align_up(isa_len, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
@@ -1360,7 +1364,7 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
     var fd = native_ctx_fd(ctx);
     # v3.1 M.1(c): allocate a unique VA range for this texture from the
     # per-context region (0 = region exhausted -> create fails).
-    var size = native_texture_size_2d_rgba8(width, height);
+    var size = _native_align_up(native_texture_size_2d_rgba8(width, height), _NATIVE_TEXTURE_VA_ALIGN);
     var va = native_ctx_alloc_texture_va(ctx, size);
     if (va == 0) { return 0; }
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
@@ -1388,7 +1392,7 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     var logical = mabda_texfmt_data_size(fmt, width, height);
     if (logical == 0) { return 0; }                    # unknown format id
     var fd = native_ctx_fd(ctx);
-    var bo_size = _native_align_up(logical, 4096);
+    var bo_size = _native_align_up(logical, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
@@ -1530,7 +1534,7 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     # covers both for CS residency (the descriptor BO handle would otherwise be
     # untracked), and t_va points at the descriptor inside the same BO.
     var desc_off = _native_align_up(surf_size, 256);
-    var bo_size = _native_align_up(desc_off + 64, 4096);
+    var bo_size = _native_align_up(desc_off + 64, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
@@ -1615,7 +1619,7 @@ fn _native_create_layered_sampleable(ctx, width, height, fmt, slices, img_type, 
     var fd = native_ctx_fd(ctx);
     var surf_size = alloc_stride * slices;   # slices,dims dispatcher-bounded -> no i64 overflow
     var desc_off = _native_align_up(surf_size, 256);
-    var bo_size = _native_align_up(desc_off + 64, 4096);
+    var bo_size = _native_align_up(desc_off + 64, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
@@ -1752,7 +1756,7 @@ fn _backend_native_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_cou
         return 0;
     }
     var fd = native_ctx_fd(ctx);
-    var size = _native_align_up(native_tex_chain_size(fmt, width, height, mip_count), 4096);
+    var size = _native_align_up(native_tex_chain_size(fmt, width, height, mip_count), _NATIVE_TEXTURE_VA_ALIGN);
     var va = native_ctx_alloc_texture_va(ctx, size);
     if (va == 0) { return 0; }
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
@@ -1894,7 +1898,7 @@ fn _native_texture_tiled_copy(ctx, tex, host, n, detile, slice): i64 {
     var fd = native_ctx_fd(ctx);
     # Transient linear staging BO mapped at the DEDICATED, re-used staging VA
     # (page-aligned size; the fixed slot avoids leaking the texture VA region).
-    var stage_size = _native_align_up(n, 4096);
+    var stage_size = _native_align_up(n, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     if (stage_size > _NATIVE_STAGING_VA_REGION) { return GPU_ERR_BUFFER; }
     var stage_va = _NATIVE_STAGING_VA;
     var sbo[16];
@@ -2972,7 +2976,13 @@ fn native_texture_level_va(tex, level): i64 {
 # layout; on success the function fills handle/va/addr/size. On
 # failure returns a GPU_ERR_* code, leaves out untouched.
 fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
-    var size = native_texture_size_2d_rgba8(width, height);
+    # v3.4.3: SIZE stores the LOGICAL byte count (the texture-write contract is
+    # n == SIZE, so a consumer writes exactly width*height*4); the BO + VA-map
+    # span is rounded up to 64 KiB (the GFX9 GEM_VA fragment alignment) so an
+    # arbitrary window size no longer EINVALs. native_texture_release_2d_rgba8
+    # rounds SIZE the same way to unmap the exact mapped span.
+    var logical = native_texture_size_2d_rgba8(width, height);
+    var size = _native_align_up(logical, _NATIVE_TEXTURE_VA_ALIGN);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
@@ -2991,7 +3001,7 @@ fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
     store64(out + NATIVE_TEX_FIELD_HANDLE, handle);
     store64(out + NATIVE_TEX_FIELD_VA,     va);
     store64(out + NATIVE_TEX_FIELD_ADDR,   addr);
-    store64(out + NATIVE_TEX_FIELD_SIZE,   size);
+    store64(out + NATIVE_TEX_FIELD_SIZE,   logical);
     # v3.1 M.1(b): single-level texture carries mip_count = 1. The mipped
     # create path (M.2) fills width/height/mip_count for a real chain.
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
@@ -3010,7 +3020,7 @@ fn native_texture_create_2d_rgba8(fd, va_base, width, height, out): i64 {
 fn native_texture_create_2d_fmt(fd, va_base, width, height, fmt, out): i64 {
     var logical = mabda_texfmt_data_size(fmt, width, height);
     if (logical == 0) { return GPU_ERR_TEXTURE; }      # invalid fmt / dims
-    var bo_size = _native_align_up(logical, 4096);
+    var bo_size = _native_align_up(logical, _NATIVE_TEXTURE_VA_ALIGN);   # v3.4.3: 64 KiB GEM_VA span
     var bo[16];
     var rc = native_bo_create_gtt(fd, bo_size, &bo);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
@@ -3042,7 +3052,10 @@ fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, 
     # size (the single-level path only ever used page-aligned sizes). The
     # per-level offsets are still 256-aligned for the V#/shader addressing;
     # only the whole-BO size is rounded up to a page here.
-    var size = _native_align_up(native_mip_chain_size(width, height, mip_count), 4096);
+    # v3.4.3: SIZE = logical chain bytes (whole-texture write contract); BO + map
+    # rounded to 64 KiB (GEM_VA fragment alignment). Release rounds SIZE the same.
+    var logical = native_mip_chain_size(width, height, mip_count);
+    var size = _native_align_up(logical, _NATIVE_TEXTURE_VA_ALIGN);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
@@ -3057,7 +3070,7 @@ fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, 
     store64(out + NATIVE_TEX_FIELD_HANDLE,    handle);
     store64(out + NATIVE_TEX_FIELD_VA,        va_base);
     store64(out + NATIVE_TEX_FIELD_ADDR,      addr);
-    store64(out + NATIVE_TEX_FIELD_SIZE,      size);
+    store64(out + NATIVE_TEX_FIELD_SIZE,      logical);
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
@@ -3072,7 +3085,10 @@ fn native_texture_create_mipped_2d_rgba8(fd, va_base, width, height, mip_count, 
 # (Native SAMPLING of compressed mips needs the tiled TS.7 path — this is the
 # linear storage/upload foundation; sampling-compressed-mips is tracked.)
 fn native_texture_create_mipped_2d_fmt(fd, va_base, width, height, mip_count, fmt, out): i64 {
-    var size = _native_align_up(native_tex_chain_size(fmt, width, height, mip_count), 4096);
+    # v3.4.3: SIZE = logical chain bytes; BO + map rounded to 64 KiB. See the
+    # RGBA8 mipped peer above. Release rounds SIZE the same way.
+    var logical = native_tex_chain_size(fmt, width, height, mip_count);
+    var size = _native_align_up(logical, _NATIVE_TEXTURE_VA_ALIGN);
     var bo[16];
     var rc = native_bo_create_gtt(fd, size, &bo);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
@@ -3087,7 +3103,7 @@ fn native_texture_create_mipped_2d_fmt(fd, va_base, width, height, mip_count, fm
     store64(out + NATIVE_TEX_FIELD_HANDLE,    handle);
     store64(out + NATIVE_TEX_FIELD_VA,        va_base);
     store64(out + NATIVE_TEX_FIELD_ADDR,      addr);
-    store64(out + NATIVE_TEX_FIELD_SIZE,      size);
+    store64(out + NATIVE_TEX_FIELD_SIZE,      logical);
     store32(out + NATIVE_TEX_FIELD_WIDTH,     width);
     store32(out + NATIVE_TEX_FIELD_HEIGHT,    height);
     store32(out + NATIVE_TEX_FIELD_MIP_COUNT, mip_count);
@@ -3109,12 +3125,16 @@ fn native_texture_release_2d_rgba8(fd, tex): i64 {
     # v3.2 TS.5 (audit MED): a sampleable tex (t_va != 0) is a single BO mapped
     # at the descriptor-tail-padded bo_size, NOT `size` (= the logical surface
     # bytes kept for write/read bounds). Unmap/release the real mapped size or
-    # a CPU-mmap page + the GPU-VA reservation leak per release. Storage/mipped
-    # textures (t_va == 0) keep the existing `size` path unchanged.
+    # a CPU-mmap page + the GPU-VA reservation leak per release.
+    # v3.4.3: storage/mipped textures (t_va == 0) are mapped at a 64 KiB-rounded
+    # span (the GEM_VA fragment alignment); round `size` the same way to unmap the
+    # exact mapped span. align_up is idempotent for paths that already store the
+    # rounded size, and yields the mapped span for 2d_fmt (which keeps `size`
+    # logical for compressed-block write bounds) — so it never over-unmaps.
     var t_va = native_tex_t_va(tex);
-    var unmap_size = size;
+    var unmap_size = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
     if (t_va != 0) {
-        unmap_size = _native_align_up((t_va - va) + 64, 4096);
+        unmap_size = _native_align_up((t_va - va) + 64, _NATIVE_TEXTURE_VA_ALIGN);
     }
     native_gem_va_unmap(fd, handle, va, unmap_size);
     native_bo_release_gtt(fd, handle, addr, unmap_size);

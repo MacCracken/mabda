@@ -847,6 +847,17 @@ build/native_rt_alloc_e2e: programs/native_rt_alloc_e2e.cyr src/*.cyr
 test-native-rt-alloc-e2e: build/native_rt_alloc_e2e
 	./build/native_rt_alloc_e2e
 
+# v3.4.3 va_map 64 KiB sweep — odd-window (1260x682) texture + non-64KiB buffer +
+# mipped chain over the public API; pre-fix these EINVAL'd. HW-gated (amdgpu
+# render node; not master-gated).
+build/native_texture_alloc_e2e: programs/native_texture_alloc_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_texture_alloc_e2e.cyr $@
+
+.PHONY: test-native-texture-alloc-e2e
+test-native-texture-alloc-e2e: build/native_texture_alloc_e2e
+	./build/native_texture_alloc_e2e
+
 build/native_render_graph_mq_e2e: programs/native_render_graph_mq_e2e.cyr src/*.cyr
 	@mkdir -p build
 	$(CYRIUS) build programs/native_render_graph_mq_e2e.cyr $@
