@@ -1,0 +1,153 @@
+# programs/wgpu_cube_sample_e2e.cyr — v3.4 AA.5c (wgpu cubemap sample path)
+#
+# The wgpu counterpart of native AA.5b: create a cubemap, upload distinct colors
+# per face, then sample a chosen face by DIRECTION through a texture_cube WGSL FS.
+# Unlike native (which takes a faceid + v_cube* ALU), wgpu/naga's
+# textureSample(cube, s, dir) takes a 3D direction and does the face projection.
+#
+#   gpu_texture_create_cube(RGBA8, 1) + gpu_texture_write_layer_level
+#     (face k = solid (0x40 + k*0x18, 0x80, 0xC0, 0xFF); faces 0..5 = +X,-X,+Y,-Y,+Z,-Z)
+#   -> texture_cube WGSL FS: textureSample(t, s, vec3(dx,dy,dz))
+#   -> render fullscreen + readback -> verify RT == face[major_axis(dir)]'s color.
+#
+# dir (0,0,1) -> +Z = face 4 (R 0xA0); dir (1,0,0) -> +X = face 0 (R 0x40). Two
+# directions -> two faces proves the cube projection + face order on wgpu HW.
+#
+# Linked with deps/wgpu_main.c. Skips cleanly if no GPU.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+# WGSL sampling a cubemap in direction (dx,dy,dz) (cstr float literals).
+fn _cube_wgsl(dx, dy, dz): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var t: texture_cube<f32>; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(1) var s: sampler; ");
+    str_builder_add_cstr(sb, "struct VOut { @builtin(position) pos: vec4<f32>, ");
+    str_builder_add_cstr(sb, "@location(0) uv: vec2<f32> }; ");
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> VOut { ");
+    str_builder_add_cstr(sb, "var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), ");
+    str_builder_add_cstr(sb, "vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); ");
+    str_builder_add_cstr(sb, "var o: VOut; o.pos = vec4<f32>(p[vid], 0.0, 1.0); ");
+    str_builder_add_cstr(sb, "o.uv = (p[vid] + vec2<f32>(1.0, 1.0)) * 0.5; return o; } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main(inp: VOut) -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return textureSample(t, s, vec3<f32>(");
+    str_builder_add_cstr(sb, dx);
+    str_builder_add_cstr(sb, ", ");
+    str_builder_add_cstr(sb, dy);
+    str_builder_add_cstr(sb, ", ");
+    str_builder_add_cstr(sb, dz);
+    str_builder_add_cstr(sb, ")); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+# Render cube in direction (dx,dy,dz), verify RT == face[expected_face]'s color.
+fn _sample_cube(ctx, tex, samp, dx, dy, dz, expected_face): i64 {
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var W = 64;
+    var H = 64;
+    var wgsl = _cube_wgsl(dx, dy, dz);
+    var shmod = gpu_shader_module_create(ctx, wgsl, strlen(wgsl));
+    if (shmod == 0) { return 1; }
+    var pipe = gpu_render_pipeline_create(ctx, shmod, shmod, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (pipe == 0) { return 1; }
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { return 1; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return 1; }
+    if (gpu_render_pass_bind_texture(ctx, pass, tex, samp) != 0) { return 1; }
+    if (gpu_render_pass_draw(ctx, pass, pipe, 3, 1) != 0) { return 1; }
+    gpu_render_pass_end(ctx, pass);
+    var rt_handle = load64(rt + 0);
+    var BPR = 256;
+    var BUF_SIZE = 16384;
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("cube-readback", read_usage, BUF_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return 1; }
+    var enc = wgpu_device_create_command_encoder(device, "cube-enc");
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  rt_handle);
+    store32(cargs + 24, 0);
+    store64(cargs + 32, read_buf);
+    store32(cargs + 48, BPR);
+    store32(cargs + 52, H);
+    store32(cargs + 56, W);
+    store32(cargs + 60, H);
+    store32(cargs + 64, 1);
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "cube-cmd");
+    wgpu_queue_submit_one(queue, cmd);
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return 1; }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
+    if (mapped == 0) { return 1; }
+    var want_r = 0x40 + expected_face * 0x18;
+    var bad = 0;
+    var offc = (H / 2) * BPR + (W / 2) * 4;
+    if (load8(mapped + 0) != want_r) { bad = 1; }
+    if (load8(mapped + offc + 0) != want_r) { bad = 1; }
+    if (load8(mapped + 1) != 0x80) { bad = 1; }
+    wgpu_buffer_unmap(read_buf);
+    return bad;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    var S = 64;
+    var N = S * S * 4;
+    var FACES = 6;
+    var tex = gpu_texture_create_cube(_gpu_ctx, S, MABDA_TEXFMT_RGBA8, 1);
+    if (tex == 0) { return _fail("FAIL: create_cube\n", 18); }
+    var src = alloc(N);
+    var k = 0;
+    while (k < FACES) {
+        var i = 0;
+        while (i < S * S) {
+            store8(src + i * 4 + 0, 0x40 + k * 0x18);
+            store8(src + i * 4 + 1, 0x80);
+            store8(src + i * 4 + 2, 0xC0);
+            store8(src + i * 4 + 3, 0xFF);
+            i = i + 1;
+        }
+        if (gpu_texture_write_layer_level(_gpu_ctx, tex, k, 0, src, N) != 0) {
+            return _fail("FAIL: write_layer_level\n", 24);
+        }
+        k = k + 1;
+    }
+    syscall(1, 1, "PASS: 6-face cube created + uploaded (distinct R)\n", 49);
+
+    var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { return _fail("FAIL: sampler\n", 14); }
+
+    # dir (0,0,1) -> +Z = face 4.
+    if (_sample_cube(_gpu_ctx, tex, samp, "0.0", "0.0", "1.0", 4) != 0) {
+        return _fail("FAIL: +Z (face 4) mismatch\n", 27);
+    }
+    # dir (1,0,0) -> +X = face 0.
+    if (_sample_cube(_gpu_ctx, tex, samp, "1.0", "0.0", "0.0", 0) != 0) {
+        return _fail("FAIL: +X (face 0) mismatch\n", 27);
+    }
+    syscall(1, 1, "PASS: RT = cube face color for +Z (face 4) and +X (face 0)\n", 58);
+
+    syscall(1, 1, "\n3 passed, 0 failed\n", 20);
+    return 0;
+}

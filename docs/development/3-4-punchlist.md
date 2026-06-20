@@ -195,9 +195,19 @@ implementation, not just planning.
   (a cube-aware bind that auto-selects unnorm=0 — the generic bind forces unnorm=1,
   so the e2e binds with sampler 0; the `v_cube*` direction FS is consumer-side).
   Tracked — the marquee *reliability* risk is retired.
-- [ ] **AA.5c** — wgpu cube create (depthOrArrayLayers=6, Cube view) + 6-face
-  upload + a `texture_cube` WGSL FS; validate width==height. **HW-verify on this
-  box** (wgpu-native present).
+- [x] **AA.5c (2026-06-19) — HW-VERIFIED on Cezanne (wgpu via Vulkan).**
+  `_backend_wgpu_texture_create_cube` (depthOrArrayLayers=6, **Cube** view,
+  square, single-level; per-face upload reuses `write_layer_level`). Slot wired.
+  `programs/wgpu_cube_sample_e2e.cyr` + `make test-wgpu-cube-sample-e2e`: a
+  `texture_cube` WGSL FS samples by DIRECTION (`textureSample(t, s, vec3(dir))` —
+  naga does the projection, unlike native's faceid), **RT == face color for
+  +Z (face 4) and +X (face 0)**. All suites exit 0; distlib idempotent. wgpu cubes
+  are fully consumer-usable (a normal sampler — wgpu has no GFX9 unnorm wart).
+- [ ] **AA.5d — native cube-aware bind + cap flip** (the native ergonomic wart):
+  a cube needs unnorm=0, but the generic `bind_for_sample` forces unnorm=1 (so
+  AA.5b's e2e binds with sampler 0). Store an is-cube flag on the NativeTexture
+  (e.g. slice_count bit 31) so `bind_for_sample_layer` auto-selects unnorm; then
+  flip `gpu_caps_native_texture_cube` to 1. Small native refinement — tracked.
 
 ## Phase AA.6 — DDS/KTX2 array + cube loader integration [M]
 

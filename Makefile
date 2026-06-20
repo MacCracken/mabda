@@ -211,6 +211,16 @@ build/wgpu_array_sample_e2e: build/wgpu_array_sample_e2e.o deps/wgpu_main.o
 test-wgpu-array-sample-e2e: build/wgpu_array_sample_e2e
 	./build/wgpu_array_sample_e2e
 
+# v3.4 AA.5c — wgpu cubemap sample: create a cube, upload 6 faces, sample a face
+# by direction via a texture_cube WGSL FS, verify the RT.
+build/wgpu_cube_sample_e2e: build/wgpu_cube_sample_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_cube_sample_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-cube-sample-e2e
+test-wgpu-cube-sample-e2e: build/wgpu_cube_sample_e2e
+	./build/wgpu_cube_sample_e2e
+
 .PHONY: test-phase0
 test-phase0: build/phase0
 	./build/phase0
