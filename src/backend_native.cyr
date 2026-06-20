@@ -191,11 +191,12 @@ binds, n_binds, timeout_ns): i64 {
 # completion via gpu_queue_wait_idle / gpu_queue_barrier. This is what
 # makes genuine cross-ring overlap possible.
 #
-# MVP caveat: the cached IB BO is shared, so an async submit followed by
-# a second dispatch before wait_idle would overwrite the IB mid-flight.
-# The Q.3c contract is one in-flight queue-targeted dispatch per queue
-# before a wait/barrier; multi-in-flight needs per-submit IB ring
-# buffers (a later 3.1.x concern). Returns 0|GPU_ERR_*.
+# IB staging (R.5, v3.2.14): the cached IB BO is partitioned into
+# _NATIVE_IB_SLOTS slices; this dispatch stages into the ACTIVE slice
+# (native_ctx_ib_active_va), so concurrent in-flight submits that advance
+# the slot cursor (native_ctx_ib_advance) between them do not clobber a
+# shared IB. The MQ executor advances per node; single-shot / synchronous
+# callers stay on slice 0. Returns 0|GPU_ERR_*.
 fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
 shader_handle, out_handle, queue, ip_type): i64 {
     var syncobj = queue_syncobj(queue);
@@ -573,10 +574,11 @@ render_handles_ptr, timeout_ns): i64 {
 # guard. The pm4_bytes > IB-size guard stops a malformed stream from
 # overrunning the cached IB BO (R.4 audit: IB-staging bound check).
 #
-# MVP caveat (same as the compute timeline path): the cached IB BO is
-# shared per context, so the contract is one in-flight queue-targeted
-# render dispatch per queue before a wait/barrier. R.5 lifts this with
-# per-node IB staging. Returns 0|GPU_ERR_*.
+# IB staging (R.5, v3.2.14, same as the compute timeline path): this
+# dispatch stages into the ACTIVE IB slice (native_ctx_ib_active_va) of the
+# _NATIVE_IB_SLOTS-way partitioned cached IB, so concurrent in-flight submits
+# that advance the slot cursor between them do not clobber a shared IB. The MQ
+# executor advances per node; single-shot callers use slice 0. Returns 0|GPU_ERR_*.
 fn native_render_dispatch_timeline(ctx, pm4, pm4_bytes,
 render_handles_ptr, queue): i64 {
     if (ctx == 0)   { return GPU_ERR_OTHER; }

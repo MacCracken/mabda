@@ -11,7 +11,7 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.29+ (`cyrius.cyml: cyrius = "6.2.29"`)
-- **Version**: 3.4.3 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Version**: 3.4.4 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -253,6 +253,16 @@ detection.
   post-build; the graph doesn't own binding so offsets are a consumer-applied plan (fully-transparent backing
   reuse needs a native transient subsystem — tracked). No struct-size change. Suite 4540→4578. Toolchain
   6.2.29→6.2.30. Adversarially reviewed. 3.4.4 is the P(-1) hardening pass.
+  **3.4.4** → the **P(-1) scaffold-hardening pass** over the v3.4.x code: a security audit (regression
+  + 4 dimension finders + adversarial verify) that came back **clean** (0 real findings — five
+  candidates all verified false-positive against source: DDS off-accumulation, `layers*faces`
+  overflow [capped 256×6], SPIR-V `id_bound*rec` memset [cap-check precedes memset], KTX2 per-image
+  modulo, PNG `w*h*4` [dims validated ≤8192 before the multiply]); a refactor/optimization review
+  (codebase lean — **0 dead code**; the dispatch/create duplication left explicit by design, the
+  toposort O(n²) fine for the documented graph sizes); and an amdgpu/wgpu CVE sweep (kernel-side only
+  — notably CVE-2026-43237 GEM_VA stale-fence — so the **deployment needs a patched amdgpu**, no mabda
+  code change). One code fix: stale "R.5 lifts this" IB-staging comments corrected (R.5 shipped in
+  3.2.14). `docs/audit/2026-06-20-audit.md`. Suite 4578 (unchanged). Toolchain 6.2.30→6.2.31.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -278,7 +288,7 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.4.3, 2026-06-20)
+## Current State (post 3.4.4, 2026-06-20)
 
 - **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
