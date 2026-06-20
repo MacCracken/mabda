@@ -6,13 +6,14 @@
 > 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle
 > ~23,900 lines.
 >
-> _Header stats current as of v3.4.3 (2026-06-20): v3.0 (dual backend),
+> _Header stats current as of v3.4.4 (2026-06-20): v3.0 (dual backend),
 > v3.1.0–3.1.1 (mipmaps + multi-queue), the full v3.2.x arc (compressed
 > textures → SPIR-V → native SPIR-V→GFX9 compiler → f64 → render-graph
 > multi-queue, 3.2.0–3.2.14), v3.3 (asset loading), v3.4 (array textures +
-> cubemaps, 3.4.0–3.4.2) and the 3.4.3 render-graph v2.5.x-follow-up + va_map
-> sweep — all shipped, native HW-verified on Cezanne. The v3.x feature arc is
-> complete; next scheduled work is the 3.4.4 P(-1) hardening pass, then v4.0._
+> cubemaps, 3.4.0–3.4.2), the 3.4.3 render-graph v2.5.x-follow-up + va_map sweep,
+> and the 3.4.4 P(-1) hardening pass (audit clean) — all shipped, native
+> HW-verified on Cezanne. The v3.x feature arc is complete; next is v4.0
+> (NVIDIA native backend + AMD wgpu retirement)._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
@@ -120,6 +121,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.4.4](../../CHANGELOG.md#344--2026-06-20) | P(-1) scaffold-hardening — security audit (clean: 0 real findings, all candidates verified false-positive), refactor/optimization review (codebase lean, 0 dead code), amdgpu/wgpu CVE sweep (kernel-side only, deployment advisory); stale IB-comment fix; toolchain 6.2.31 |
 | [3.4.3](../../CHANGELOG.md#343--2026-06-20) | Render-graph v2.5.x follow-ups (out-of-order toposort, aliasing-planner activation, per-node debug scopes, DOT export) + the native `va_map` 64 KiB sweep across all create paths (HW-verified on Cezanne); toolchain 6.2.30 |
 | [3.4.2](../../CHANGELOG.md#342--2026-06-19) | RT-allocator fixes (puka integration) — native render-target 64 KiB `va_map` alignment + per-context RT VA bump allocator (both HW-verified on Cezanne); `color_rgb` warning diagnosed consumer-side, `cyim` issue resolved |
 | [3.4.1](../../CHANGELOG.md#341--2026-06-19) | v3.4.1 backlog cleared — native BC tiled arrays + wgpu draw-time layer (both HW-verified on Cezanne) + the attn11 `F64_*`↔`math` stdlib collision fix (namespace `MABDA_F64_*`) |

@@ -8,7 +8,7 @@ plus a pure-Cyrius native AMD path) — that all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 3.4.3 (dual backend — wgpu + native AMD; see
+Version: 3.4.4 (dual backend — wgpu + native AMD; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -269,7 +269,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              3.4.3
+├── VERSION              3.4.4
 └── CHANGELOG.md
 ```
 

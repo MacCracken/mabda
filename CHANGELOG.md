@@ -13,6 +13,52 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.4] — 2026-06-20
+
+**P(-1) scaffold-hardening pass — security audit (clean), refactor/optimization review, CVE
+sweep.** A pre-feature-arc hardening pass over the v3.4.x code (3.4.0 arrays/cubes, 3.4.1 BC tiled
+arrays, 3.4.2 RT allocator, 3.4.3 `va_map` sweep + render-graph changes). The security audit found
+**0 real defects** (every dimension-finder candidate verified false-positive against source); the
+refactor/optimization review found the codebase lean (0 dead code). The one code change is a
+docs-correctness fix; the one external item is a kernel-CVE deployment advisory.
+
+### Security
+- **Audit clean: 0 CRITICAL / 0 HIGH / 0 real-MEDIUM** on the v3.4.x code. Five dimension-finder
+  candidates (DDS mip-offset accumulation, DDS/KTX2 `layers*faces` overflow, SPIR-V `id_bound*rec`
+  memset, KTX2 per-image modulo, PNG `w*h*4`) were each **verified false-positive** — the finders
+  mis-read check ordering or cap values (e.g. `arraysize ≤ 256` so `layers*faces ≤ 1536`; the
+  SPIR-V `id_bound > cap` check precedes the memset; the PNG path validates dims ≤ 8192 before the
+  multiply). Prior ship-blockers (the 2026-06-19 KTX2 `byteOffset` overflow CRITICAL, the
+  2026-06-14 HIGH-1/2/4 + MED-1) regression-confirmed still fixed. Full writeup:
+  `docs/audit/2026-06-20-audit.md`.
+- **CVE sweep (2026-04-30 → window).** wgpu/WebGPU: clean (wgpu-native v29, Vulkan-forced; the
+  in-window Dawn/PowerVR WebGPU CVEs are separate stacks). amdgpu/DRM: several in-window kernel CVEs
+  touch ioctls mabda drives (notably **CVE-2026-43237**, GEM_VA stale-fence, CVSS 7.8) — **all
+  kernel-side**; mabda submits well-formed payloads and cannot fix them in-tree. **Deployment
+  advisory:** run mabda's native AMD path on a patched amdgpu kernel. The one userspace code-pattern
+  flagged (`CVE-2026-46006`-class 32-bit `offset`/`pitch` overflow) was swept — mabda uses 64-bit
+  VA/size arithmetic and the KMS 32-bit FB fields are bounded by the 16384 dim cap (`bo_size ≤
+  1 GiB`); no wrap found.
+
+### Fixed
+- **Stale/misleading IB-staging comments** in `backend_native.cyr`. `native_compute_dispatch_cached_
+  timeline` and `native_render_dispatch_timeline` carried an "MVP caveat … R.5 lifts this" comment
+  describing the shared-IB single-in-flight limitation as still-future — but R.5 (per-node IB
+  staging) shipped in 3.2.14 and both functions already stage into the active IB slice
+  (`native_ctx_ib_active_va`). Comments corrected to describe the live slot-partitioned behavior +
+  the slot-advance contract (found by the refactor review).
+
+### Changed
+- Toolchain pin **6.2.30 → 6.2.31**.
+
+### Notes
+- The refactor/optimization review found the codebase lean: 0 dead code, perf adequate for the
+  documented scales (the render-graph O(n²) toposort is fine for dozens-of-nodes graphs; Cyrius has
+  no hash tables). The duplication candidates (bo_list/validation/VA-lifecycle sequences across the
+  native dispatch + create paths) were **deliberately not extracted** — those are HW-verified paths
+  and the codebase favors explicit, auditable code over abstraction; deduping them would trade
+  clarity + regression risk for modest line savings. No struct-size or API change; suite stays 4578.
+
 ## [3.4.3] — 2026-06-20
 
 **Render-graph v2.5.x follow-ups + the tracked 3.4.2 `va_map` consistency sweep.** Clears the
