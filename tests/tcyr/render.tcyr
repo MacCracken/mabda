@@ -215,6 +215,68 @@ fn test_rg_build_diamond_shape() {
     return 0;
 }
 
+# v3.4.3: out-of-order toposort (MVRT). A reader inserted BEFORE its writer
+# (cross-inserted dependency) — the v2.5 insertion-order toposort silently
+# mis-ordered this; now the writer must sort first.
+fn test_rg_build_out_of_order_raw() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var rd = rg_add_compute(g, 0, 0, &dims, "reader");   # insertion idx 0
+    rg_node_reads(g, rd, r0);
+    var wr = rg_add_compute(g, 0, 0, &dims, "writer");   # insertion idx 1
+    rg_node_writes(g, wr, r0);
+    var nodes = load64(g + 0);
+    var rnode = vec_get(nodes, 0);   # reader (captured pre-build; struct identity is stable)
+    var wnode = vec_get(nodes, 1);   # writer
+    assert_eq(rg_build(g, 0), 0, "out-of-order graph builds (no false cycle)");
+    assert_eq(load64(wnode + 48), 0, "writer sorts first despite later insertion");
+    assert_eq(load64(rnode + 48), 1, "reader sorts after its writer");
+    return 0;
+}
+
+# A 3-node chain inserted in fully REVERSED order: C reads r1 (idx0), B reads
+# r0 / writes r1 (idx1), A writes r0 (idx2). Data order is A -> B -> C.
+fn test_rg_build_out_of_order_chain() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 64, 0x08, "r1");
+    var c = rg_add_compute(g, 0, 0, &dims, "C");   # idx0
+    rg_node_reads(g, c, r1);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");   # idx1
+    rg_node_reads(g, b, r0);
+    rg_node_writes(g, b, r1);
+    var a = rg_add_compute(g, 0, 0, &dims, "A");   # idx2
+    rg_node_writes(g, a, r0);
+    var nodes = load64(g + 0);
+    var cnode = vec_get(nodes, 0);
+    var bnode = vec_get(nodes, 1);
+    var anode = vec_get(nodes, 2);
+    assert_eq(rg_build(g, 0), 0, "reversed chain builds");
+    assert_eq(load64(anode + 48), 0, "A (root writer) sorts first");
+    assert_eq(load64(bnode + 48), 1, "B (middle) sorts second");
+    assert_eq(load64(cnode + 48), 2, "C (leaf reader) sorts last");
+    return 0;
+}
+
+# A real cycle must still be rejected (return 1), independent of insertion
+# order: A reads r0 / writes r1, B reads r1 / writes r0.
+fn test_rg_build_cycle_still_detected() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 64, 0x08, "r0");
+    var r1 = rg_add_transient_buffer(g, 64, 0x08, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_reads(g, a, r0);
+    rg_node_writes(g, a, r1);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r1);
+    rg_node_writes(g, b, r0);
+    assert_eq(rg_build(g, 0), 1, "a true cycle is still rejected");
+    return 0;
+}
+
 fn test_rg_execute_unbuilt_fails_fast() {
     # rg_execute must refuse a graph that hasn't been built yet.
     var g = rg_new();
@@ -745,6 +807,54 @@ fn test_rg_plan_disjoint_buffers_share_offset() {
     return 0;
 }
 
+# v3.4.3: rg_aliasing(g,1) makes rg_build auto-run the planner, so the reuse
+# offsets are queryable right after build (no manual rg_plan_aliasing_stats).
+# buf0 [0,1] and buf1 [2,3] are disjoint -> share a slot (both offset 0).
+fn test_rg_build_aliasing_flag_auto_plans() {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 256, 0, "buf0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "scratch");
+    var r2 = rg_add_transient_buffer(g, 256, 0, "buf1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    var c = rg_add_compute(g, 0, 0, &dims, "C");
+    var d = rg_add_compute(g, 0, 0, &dims, "D");
+    rg_node_writes(g, a, r0);
+    rg_node_reads(g, b, r0);
+    rg_node_writes(g, b, r1);
+    rg_node_reads(g, c, r1);
+    rg_node_writes(g, c, r2);
+    rg_node_reads(g, d, r2);
+    assert_eq(rg_build(g, 0), 0, "aliasing graph builds");
+    # No manual planner call — the offsets are already set by rg_build.
+    assert_eq(rg_transient_offset(g, r0), 0,   "buf0 offset 0 (auto-planned)");
+    assert_eq(rg_transient_offset(g, r1), 256, "scratch offset 256");
+    assert_eq(rg_transient_offset(g, r2), 0,   "buf1 reuses buf0's slot (auto)");
+    return 0;
+}
+
+# Without the flag, rg_build does NOT auto-plan: two OVERLAPPING-lifetime
+# transients (both live [0,1]) keep the default offset 0 — if the planner had
+# run, the second would be 256. Proves the auto-plan is flag-gated.
+fn test_rg_build_no_aliasing_no_autoplan() {
+    var g = rg_new();
+    var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var r0 = rg_add_transient_buffer(g, 256, 0, "r0");
+    var r1 = rg_add_transient_buffer(g, 256, 0, "r1");
+    var a = rg_add_compute(g, 0, 0, &dims, "A");
+    rg_node_writes(g, a, r0);
+    rg_node_writes(g, a, r1);
+    var b = rg_add_compute(g, 0, 0, &dims, "B");
+    rg_node_reads(g, b, r0);
+    rg_node_reads(g, b, r1);
+    assert_eq(rg_build(g, 0), 0, "non-aliasing graph builds");
+    assert_eq(rg_transient_offset(g, r1), 0,
+    "no auto-plan without the flag (overlapping r1 stays offset 0)");
+    return 0;
+}
+
 fn test_rg_plan_buffers_and_textures_separate() {
     var g = rg_new();
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
@@ -956,6 +1066,9 @@ fn main() {
     test_rg_build_is_idempotent();
     test_rg_build_linear_chain_preserves_order();
     test_rg_build_diamond_shape();
+    test_rg_build_out_of_order_raw();
+    test_rg_build_out_of_order_chain();
+    test_rg_build_cycle_still_detected();
     test_rg_execute_unbuilt_fails_fast();
     test_rg_execute_null_device_fails_fast();
     test_rg_node_queue_defaults();
@@ -988,6 +1101,8 @@ fn main() {
     test_rg_plan_alignment_256();
     test_rg_first_use_last_use_across_multiple_reads();
     test_rg_plan_reclaim_ratio_chain();
+    test_rg_build_aliasing_flag_auto_plans();
+    test_rg_build_no_aliasing_no_autoplan();
     test_gpu_render_dispatchers_null_ctx_safe();
     return assert_summary();
 }
