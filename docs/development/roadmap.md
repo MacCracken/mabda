@@ -1,17 +1,18 @@
 # Mabda — Development Roadmap
 
 > GPU foundation layer for AGNOS. Written in Cyrius.
-> 51 domain modules, ~23,900 lines, 4540 CPU assertions across 17
+> 51 domain modules, ~23,900 lines, 4578 CPU assertions across 17
 > functionality-named domain test files + GPU integration programs +
 > 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle
 > ~23,900 lines.
 >
-> _Header stats current as of v3.4.2 (2026-06-19): v3.0 (dual backend),
+> _Header stats current as of v3.4.3 (2026-06-20): v3.0 (dual backend),
 > v3.1.0–3.1.1 (mipmaps + multi-queue), the full v3.2.x arc (compressed
 > textures → SPIR-V → native SPIR-V→GFX9 compiler → f64 → render-graph
-> multi-queue, 3.2.0–3.2.14), v3.3 (asset loading) and v3.4 (array textures +
-> cubemaps, 3.4.0–3.4.2) all shipped, native HW-verified on Cezanne. The v3.x
-> feature arc is complete; next scheduled work is v4.0 (NVIDIA native)._
+> multi-queue, 3.2.0–3.2.14), v3.3 (asset loading), v3.4 (array textures +
+> cubemaps, 3.4.0–3.4.2) and the 3.4.3 render-graph v2.5.x-follow-up + va_map
+> sweep — all shipped, native HW-verified on Cezanne. The v3.x feature arc is
+> complete; next scheduled work is the 3.4.4 P(-1) hardening pass, then v4.0._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
@@ -119,6 +120,7 @@ detail; this table is a jump list.
 
 | Release | Theme |
 |---------|-------|
+| [3.4.3](../../CHANGELOG.md#343--2026-06-20) | Render-graph v2.5.x follow-ups (out-of-order toposort, aliasing-planner activation, per-node debug scopes, DOT export) + the native `va_map` 64 KiB sweep across all create paths (HW-verified on Cezanne); toolchain 6.2.30 |
 | [3.4.2](../../CHANGELOG.md#342--2026-06-19) | RT-allocator fixes (puka integration) — native render-target 64 KiB `va_map` alignment + per-context RT VA bump allocator (both HW-verified on Cezanne); `color_rgb` warning diagnosed consumer-side, `cyim` issue resolved |
 | [3.4.1](../../CHANGELOG.md#341--2026-06-19) | v3.4.1 backlog cleared — native BC tiled arrays + wgpu draw-time layer (both HW-verified on Cezanne) + the attn11 `F64_*`↔`math` stdlib collision fix (namespace `MABDA_F64_*`) |
 | [3.4.0](../../CHANGELOG.md#340--2026-06-19) | Array textures + cubemaps (Phase AA) — create/upload/sample on both backends + DDS/KTX2 array+cube load; HW-verified end-to-end on Cezanne (incl. the data-ordering capstone) |
@@ -147,27 +149,36 @@ detail; this table is a jump list.
 
 ---
 
-## v2.5.x — Render graph follow-ups (not yet scheduled)
+## v2.5.x — Render graph follow-ups (cleared in 3.4.3)
 
-Everything below is in the out-of-scope list in `docs/guides/render-graph.md`.
-None of it is blocking a consumer today; each item ships when a specific
-consumer request arrives. Listed so they don't get lost.
+The four parked follow-ups all shipped in **3.4.3** (see the CHANGELOG):
 
-- **Full out-of-order toposort.** Today's Kahn implementation only
-  counts edges in insertion-order direction; that validates users
-  who build graphs in a correct linear order. Programmatic consumers
-  that build graphs with cross-inserted dependencies need multi-
-  version read/write tracking.
-- **Resource aliasing pass.** The `rg_aliasing(g, 1)` flag and the
-  `first_use` field on `TransientResource` are already scaffolded.
-  Ship the alias analysis that walks transients and reuses backing
-  storage between disjoint lifetimes — relevant for consumers with
-  dozens of transient buffers per frame.
-- **Per-node debug scopes.** Wrap each node's encoding in
-  `debug_push(node.label)` / `debug_pop` so GPU profilers
-  (RenderDoc, PIX, RGP) show the graph structure.
-- **Graph visualizer.** Export a DOT file or similar from the
-  toposorted node/edge list. Consumer-requested; not core.
+- **Full out-of-order toposort** ✅ — `rg_build` now derives an edge for any
+  (writer writes R, reader reads R) pair independent of insertion order, so a
+  reader inserted before its writer toposorts correctly. In-order graphs are a
+  strict subset (identical result).
+- **Resource aliasing pass** ✅ (planner activation) — `rg_aliasing(g, 1)` makes
+  `rg_build` auto-run the interval-coloring planner; the per-transient reuse
+  offsets are queryable via `rg_transient_offset` after build. The graph does
+  not own resource binding, so the offsets are the reuse **plan** a consumer
+  applies to its own backing store.
+- **Per-node debug scopes** ✅ (wrapping) — each node's encoding is wrapped in
+  `debug_push(node.label)` / `debug_pop` in `rg_execute`.
+- **Graph visualizer** ✅ — `rg_to_dot(g, out_buf, out_cap)` exports a graphviz
+  `digraph` (nodes + dependency edges, cross-queue edges dashed). Pure CPU.
+
+**Tracked remainders** (not blocking a consumer; ship when one asks):
+
+- **Encoder debug-group FFI.** The `debug_*` fns are no-op stubs until
+  `wgpuCommandEncoderPushDebugGroup` / `…Pop` land in the fn table — a
+  coordinated `deps/wgpu_main.c` launcher change (adding slots forces every
+  consumer to rebuild). Once wired, the 3.4.3 wrapping makes per-node scopes
+  visible in profilers with no further change.
+- **Fully-transparent aliasing backing reuse.** Actually sharing one GPU
+  allocation across disjoint-lifetime transients (rather than the consumer
+  applying the planner's offsets) needs a native transient-allocation
+  subsystem — wgpu's safe API has no placed/aliased resources, and the native
+  path has no rg-transient backing today. Its own future arc.
 
 ---
 

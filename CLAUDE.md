@@ -11,7 +11,7 @@ detection.
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius 6.2.29+ (`cyrius.cyml: cyrius = "6.2.29"`)
-- **Version**: 3.4.2 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Version**: 3.4.3 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -240,6 +240,19 @@ detection.
   The `duplicate fn 'color_rgb'` warning in the same filing was investigated and is **consumer-side**
   (puka defines its own `color_rgb`; mabda's is `@public` and stays) — no code change. The 2026-04-28
   `cyim` regex issue no longer reproduces (1.1.4→1.7.3) — both issue files archived. Toolchain 6.2.29.
+  **3.4.3** → clears the four parked **v2.5.x render-graph follow-ups** + extends the 3.4.2 `va_map`
+  fix. **(1)** the **`va_map` 64 KiB sweep** (HW-verified on Cezanne, `native_texture_alloc_e2e`): every
+  native `gem_va_map` create path (buffers/textures/mipped/sampleable/shader/staging) rounds BO+map+release
+  to 64 KiB (`_NATIVE_TEXTURE_VA_ALIGN`), SIZE stays **logical** (texture-write contract is `n==SIZE`),
+  release rounds the same (no over-unmap) — arbitrary window/texture/buffer sizes no longer EINVAL like the
+  3.4.2 RT bug. **(2)** **out-of-order toposort**: `rg_build` derives an edge for any (write R, read R) pair
+  regardless of insertion order (in-order graphs unchanged). **(3)** **`rg_to_dot`** graphviz export. **(4)**
+  **per-node debug scopes** wrapping in `rg_execute` (the `debug_*` fns stay no-op stubs until the encoder
+  debug-group FFI lands in a coordinated launcher change — tracked). **(5)** **aliasing-planner activation**:
+  `rg_aliasing(g,1)` makes `rg_build` auto-run the interval-coloring planner so reuse offsets are queryable
+  post-build; the graph doesn't own binding so offsets are a consumer-applied plan (fully-transparent backing
+  reuse needs a native transient subsystem — tracked). No struct-size change. Suite 4540→4578. Toolchain
+  6.2.29→6.2.30. Adversarially reviewed. 3.4.4 is the P(-1) hardening pass.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -265,7 +278,7 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.4.2, 2026-06-19)
+## Current State (post 3.4.3, 2026-06-20)
 
 - **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
@@ -285,7 +298,7 @@ doesn't change between paths.
   the `chitra` dep at `lib/chitra.cyr`; 3.4.2 edited `context.cyr` (ctx 168→176, the
   `+168` RT VA cursor) + `backend_native.cyr` (the RT 64 KiB rounding + `native_ctx_alloc_rt_va`)
   in place — no new module).
-- **Tests**: **4540 CPU-only assertions** across **17 functionality-named
+- **Tests**: **4578 CPU-only assertions** across **17 functionality-named
   domain files** under `tests/tcyr/` (3.3.0 added `asset_load.tcyr`, the 17th;
   3.4.0 Phase AA grew backend/native/asset_load in place — no new file;
   reorganized 2026-06-15 from the old
@@ -294,7 +307,7 @@ doesn't change between paths.
   mirroring the `src/` domains; `make test` globs them all.
   **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
   `make test | grep` (or `awk`) treats it as binary and **silently drops
-  texture's 207** — the naive total reads **4333**, not the true **4540**. Use
+  texture's 207** — the naive total reads **4371**, not the true **4578**. Use
   `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
   accurate count; the trap has fooled humans and review agents alike.
   Domain breakdown:

@@ -13,6 +13,71 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.3] — 2026-06-20
+
+**Render-graph v2.5.x follow-ups + the tracked 3.4.2 `va_map` consistency sweep.** Clears the
+four long-parked v2.5.x render-graph follow-ups (out-of-order toposort, resource-aliasing planner
+activation, per-node debug scopes, DOT visualizer) and extends the 3.4.2 render-target 64 KiB
+`va_map` fix across every native allocation path. Smallest-risk-first, each bite verified before
+the next; the va_map sweep is HW-verified on Cezanne.
+
+### Fixed
+- **Native `va_map` EINVAL on arbitrary texture/buffer sizes (the tracked 3.4.2 follow-up).** 3.4.2
+  rounded only the *render-target* BO + `GEM_VA` span to 64 KiB; every other native `gem_va_map`
+  create path (buffers, 2D / fmt / mipped / sampleable / layered textures, shader ISA, tiled
+  staging) still rounded to 4 KiB (or passed a raw size), so an arbitrary non-64-KiB-aligned
+  texture/buffer hit the same `EINVAL (-22)` the RT bug did — latent because the in-tree tests use
+  64-KiB-aligned sizes. All paths now round the BO + map + release span to 64 KiB
+  (`_NATIVE_TEXTURE_VA_ALIGN`); the stored SIZE field stays **logical** (the native texture-write
+  contract is `n == SIZE`, and buffers expose their size to consumers), and each release rounds the
+  logical SIZE the same way to unmap the exact mapped span (`align_up` is the mapped span for
+  logical SIZE and idempotent for the few paths that store a rounded size — never over-unmaps). HW-
+  verified on Cezanne (`native_texture_alloc_e2e`: a 1260×682 texture + a 100000-byte buffer with a
+  logical-bound write at offset 99000 + a mipped chain, all previously EINVAL).
+- **Render-graph toposort silently mis-ordered cross-inserted dependencies.** The v2.5 Kahn build
+  only counted an edge when the writer was *inserted before* the reader, so a programmatic consumer
+  that built a graph with a reader inserted before its writer got a wrong (or falsely cyclic) order.
+  `rg_build` now derives an edge for **any** (writer writes R, reader reads R) pair independent of
+  insertion order — both the in-degree count and the Kahn drain scan all nodes — so any insertion
+  order toposorts correctly. In-order graphs are a strict subset (identical edge set, identical
+  result); true cycles are still rejected.
+
+### Added
+- **`rg_to_dot(g, out_buf, out_cap)` — graphviz DOT export** (v2.5.x follow-up). Pure-CPU dump of
+  the graph's nodes (labelled with kind + queue affinity) and writer→reader dependency edges
+  (cross-queue edges dashed, since they become `gpu_queue_barrier`s); bounds-checked into a
+  caller-owned buffer, returns bytes written or `-1` on overflow/null. No GPU.
+- **Per-node debug scopes in `rg_execute`** (v2.5.x follow-up). Each node's encoding is wrapped in
+  `debug_push(node.label)` / `debug_pop` so GPU profilers (RenderDoc / RGP / PIX) show the graph
+  structure. The `debug_*` fns stay no-op stubs until the encoder debug-group FFI lands in a
+  coordinated launcher change (adding fn-table slots would force every consumer to rebuild
+  `deps/wgpu_main.c`); the wrapping is in place and harmless until then. Tracked in the roadmap.
+- **Resource-aliasing planner activation** (v2.5.x follow-up). With `rg_aliasing(g, 1)` set,
+  `rg_build` now auto-runs the interval-coloring planner so each transient's reuse offset is
+  computed + stored + queryable via `rg_transient_offset` immediately after build (no separate
+  `rg_plan_aliasing_stats` call). The render graph does **not** own resource binding (consumers
+  build their own bind groups), so it cannot transparently share a backing allocation — the offsets
+  are the reuse **plan** a consumer applies to its own backing store (sub-allocating disjoint-
+  lifetime transients into one allocation of `aliased_bytes`). Fully-transparent backing reuse needs
+  a native transient subsystem — tracked as its own future arc.
+- HW + CPU coverage: `native_texture_alloc_e2e` (HW), `test_native_va_map_64k_sweep_rounding`,
+  `test_rg_to_dot_*` (4), `test_rg_build_out_of_order_*` + `test_rg_build_cycle_still_detected` (3),
+  `test_rg_build_aliasing_flag_auto_plans` + `test_rg_build_no_aliasing_no_autoplan`.
+
+### Changed
+- Toolchain pin **6.2.29 → 6.2.30**.
+
+### Metrics
+- CPU suite **4540 → 4578** assertions; **17** domain test files, **51** `src/` modules (unchanged —
+  the changes edit `backend_native.cyr` + `render_graph.cyr` in place; no struct-size growth, so no
+  test ctx-buffer churn). One new HW program (`native_texture_alloc_e2e`).
+
+### Next
+- The render-graph v2.5.x follow-up list is cleared. Tracked future work: the encoder debug-group
+  FFI (makes the per-node debug scopes visible in profilers, needs a coordinated launcher change),
+  and fully-transparent aliasing backing reuse (a native transient subsystem). 3.4.4 is the P(-1)
+  scaffold-hardening pass.
+
 ## [3.4.2] — 2026-06-19
 
 **Render-target allocator fixes surfaced by the `puka` Wayland-terminal integration**
