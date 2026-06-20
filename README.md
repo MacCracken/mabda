@@ -218,7 +218,7 @@ cyrius deps
 # Full gate sweep (lint, fmt, vet, version-check, distlib-sync, tests, bench)
 make test-all
 
-# CPU-only unit suite (4522 assertions across 17 domain files)
+# CPU-only unit suite (4578 assertions across 17 domain files)
 make test            # globs tests/tcyr/*.tcyr (count via scripts/count-test-assertions.sh)
 
 # CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
@@ -237,14 +237,14 @@ make bench-gpu                                # 13 GPU benches
 
 ```
 mabda/
-├── src/                 49 modules (30 @public + 19 @internal FFI/backend)
+├── src/                 50 modules (31 @public + 19 @internal FFI/backend)
 │                        (src/lib.cyr is the single include chain)
 ├── tests/
 │   ├── tcyr/                     17 functionality-named domain suites — core,
 │   │                            buffer, compute, texture, graphics, render,
 │   │                            backend, caches, surface, native, kms, queue,
 │   │                            asset_load, compiler_{encode,lower,backend,compile}
-│   │                            (4522 asserts; `make test` globs them all)
+│   │                            (4578 asserts; `make test` globs them all)
 │   └── bcyr/mabda.bcyr           CPU-only benchmark harness (9 benches)
 ├── programs/            GPU integration programs (wgpu + native) + dev spikes + `benchmarks.cyr`
 │   ├── smoke.cyr                Link-check — `cyrius build` entry point

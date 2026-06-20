@@ -335,7 +335,7 @@ doesn't change between paths.
   - `caches` 42 · `surface` 73 · `kms` 335 · `queue` 102 (v3.1.1
     multi-queue: layout + wgpu/native fillers + barrier + dispatch; `caches`
     adds S kind-folded `_shader_hash_n` + SPIR-V cache peers)
-  - `native` 1376 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
+  - `native` 1551 (amdgpu/PM4/GFX9 ISA/native textures+render + v3.1.1
     timeline syncobjs / SDMA copy / queue fillers + v3.2 fmt create +
     X real buffers / transfer-copy / SDMA chaining + TS T#/S#/IMG-format
     builders / TS.6 COPY_TILED + TS.7 BC tiled create/write-read/params +
@@ -397,7 +397,7 @@ doesn't change between paths.
   the wgpu path). Reference Rust numbers in
   `docs/benchmarks-rust-v-cyrius.md`. Native-on-AMD bench cell
   is Tier 3 work pending a consumer flip.
-- **Dist bundle**: `dist/mabda.cyr` — ~22,300 lines.
+- **Dist bundle**: `dist/mabda.cyr` — ~24,000 lines.
   `cyrius distlib` regenerates it.
 - **Integration**: consumed by soorat, rasa, ranga, bijli, aethersafta,
   kiran (via soorat). Six-consumer regression sweep is Tier 2 ship
@@ -495,7 +495,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ```bash
 cyrius deps                                          # resolve stdlib + samvada into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
-make test                                            # 4276 CPU assertions across 17 domain files
+make test                                            # 4578 CPU assertions across 17 domain files
 cyrius bench tests/bcyr/mabda.bcyr                   # 9 CPU benchmarks
 cyrius distlib                                       # → dist/mabda.cyr
 make test-gpu                                        # wgpu integration programs (needs wgpu-native)
@@ -518,7 +518,7 @@ bump allocator exhaustion in tests. Cross-references the deeper
 
 ```
 mabda/
-├── src/                 49 GPU library modules — flat, zero transitive includes
+├── src/                 51 GPU library modules — flat, zero transitive includes
 │   ├── lib.cyr                      — single include chain (stdlib + domain modules + samvada)
 │   ├── error.cyr                    — GpuErr codes + Result helpers
 │   ├── color.cyr                    — f64-backed RGBA colour type
@@ -584,8 +584,8 @@ mabda/
 │   ├── instancing.cyr               — instance buffer + identity helpers
 │   └── debug.cyr                    — push/pop debug markers
 ├── tests/
-│   ├── tcyr/                        — 16 functionality-named domain suites
-│   │   │                              (4276 asserts total; `make test` globs
+│   ├── tcyr/                        — 17 functionality-named domain suites
+│   │   │                              (4578 asserts total; `make test` globs
 │   │   │                              `tests/tcyr/*.tcyr`). Each standalone
 │   │   │                              (own main + assert_summary), self-
 │   │   │                              contained (needed mocks inlined).
@@ -610,6 +610,8 @@ mabda/
 │   ├── native_texture_e2e.cyr       — native texture round-trip
 │   ├── native_render_e2e.cyr        — native render: clear-triangle + pixel verify
 │   ├── native_mipmap_e2e.cyr        — native mip-chain generate vs CPU box-filter
+│   ├── native_rt_alloc_e2e.cyr      — v3.4.2: odd-window RT (1260×682) + 2nd live RT, distinct VAs (HW)
+│   ├── native_texture_alloc_e2e.cyr — v3.4.3: va_map 64KiB sweep — odd texture + non-64KiB buffer + mipped (HW)
 │   ├── native_spirv_compute_e2e.cyr — N.5d: compile SPIR-V → GFX9 → dispatch on GPU (HW-verified)
 │   ├── native_spirv_saxpy_e2e.cyr    — N.6: novel 2-binding SAXPY compiled + dispatched (HW)
 │   ├── native_spirv_downsample_e2e.cyr — N.5g: 2×2 box-filter downsample, pixel-match (HW)
@@ -711,7 +713,7 @@ live in the `programs/native_*.cyr` programs.
 
 ## Key Constraints
 
-- **Tests are the way** — 4276 CPU assertions across 17 domain test
+- **Tests are the way** — 4578 CPU assertions across 17 domain test
   files + a dozen GPU/HW programs. Every new code path adds an
   assertion. Stack-local `var ctx[112]` for test-scoped buffers
   (heap-allocated tests exhaust the bump allocator — see
@@ -761,7 +763,7 @@ live in the `programs/native_*.cyr` programs.
    form was removed in 5.7.x — see
    `feedback_cyrius_lint_fmt_per_file` memory),
    `cyrius vet programs/smoke.cyr` clean
-2. Test sweep: 4276+ assertions pass across all 17 domain test files,
+2. Test sweep: 4578+ assertions pass across all 17 domain test files,
    `cyrius distlib` diff-clean
 3. Benchmark baseline: `cyrius bench tests/bcyr/mabda.bcyr`, save CSV
 4. Internal deep review — gaps, optimizations, correctness, docs
@@ -834,7 +836,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 ### Closeout Pass (before every minor/major bump)
 
 1. Full CPU suite — `make test` runs all three files
-   (all 17 `tests/tcyr/*.tcyr` domain suites); 4276+
+   (all 17 `tests/tcyr/*.tcyr` domain suites); 4578+
    asserts pass.
 2. Bench baseline — `cyrius bench tests/bcyr/mabda.bcyr`
 3. GPU integration (wgpu) — `make test-phase0` passes on a box with
