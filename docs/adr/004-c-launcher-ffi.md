@@ -2,6 +2,12 @@
 
 ## Status: Accepted
 
+> **Updated 2026-06-20.** Body text below predates ADR-006's per-chipset
+> reframing — references to "v4.0 retires ADR 004" should read as the
+> per-chipset schedule from ADR-006: **AMD wgpu at v4.0.1**, NVIDIA at
+> v5.0, full removal (Intel + scaffolding) at v5.1. The C launcher
+> survives in-tree until v5.1.
+
 ## Context
 
 Cyrius compiles to standalone ELF binaries or `.o` relocatable objects. It cannot call C functions directly (no extern declarations, no dynamic linker integration). wgpu-native is a Rust-compiled C library that requires libc, pthreads, and dlopen for Vulkan driver loading.

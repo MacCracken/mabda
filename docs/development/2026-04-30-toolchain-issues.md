@@ -263,9 +263,10 @@ unconditionally, NOT silent on no-drift
   steps to local dev. Bumping the toolchain buffers is small + high
   leverage.
 - Class B (fncall ABI bugs) is partially mitigated by the wgpu C-
-  shim layer, which retires at v4.0 alongside the
-  wgpu-native dep. The fncall ABI bugs themselves stay relevant
-  until then for any other C-FFI mabda might add.
+  shim layer, which retires per-vendor (AMD at v4.0.1, NVIDIA at
+  v5.0, Intel/full at v5.1 — see roadmap). The fncall ABI bugs
+  themselves stay relevant until full removal for any other C-FFI
+  mabda might add.
 - Class C is the "this is just how Cyrius is" bucket — these are
   language design decisions or intentional sharp edges. The doc
   serves as onboarding material rather than as a bug list.

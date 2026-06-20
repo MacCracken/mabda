@@ -2,8 +2,9 @@
 
 **Status:** Accepted
 **Date:** 2026-04-12
+**Updated:** 2026-06-20 — body references "v4.0 retires wgpu" predate ADR-006's per-chipset reframing. Per ADR-006: **AMD wgpu retires at v4.0.1**, NVIDIA at v5.0, Intel/full removal at v5.1. The `@public`/`@internal` boundary is unchanged by the schedule slip.
 **Supersedes:** n/a
-**Related:** ADR 004 (C launcher FFI — v3.x-era backend, retires v4.0), planned ADR 006 (native Cyrius GPU backend added alongside)
+**Related:** ADR 004 (C launcher FFI — v3.x-era backend, retires per-chipset; AMD leg v4.0.1, full v5.1), planned ADR 006 (native Cyrius GPU backend added alongside)
 
 ## Context
 

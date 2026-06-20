@@ -13,7 +13,8 @@
 > cubemaps, 3.4.0–3.4.2), the 3.4.3 render-graph v2.5.x-follow-up + va_map sweep,
 > and the 3.4.4 P(-1) hardening pass (audit clean) — all shipped, native
 > HW-verified on Cezanne. The v3.x feature arc is complete; next is v4.0
-> (NVIDIA native backend + AMD wgpu retirement)._
+> (NVIDIA native backend added — AMD wgpu retirement slipped to 4.0.1
+> to give AMD consumers a coexistence window)._
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
@@ -71,8 +72,10 @@ cross-vendor default.
                         both backends + DDS/KTX2 load (3.4.0); 3.4.1 backlog +
                         3.4.2 RT-allocator fixes cleared — arc done
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
-  v4.0             ─▶  NVIDIA native backend added; AMD wgpu path
-                        retires (AMD consumers run on AMD native only)
+  v4.0             ─▶  NVIDIA native backend added (AMD wgpu still
+                        supported through 4.0.x)
+  v4.0.1           ─▶  AMD wgpu path retires (AMD consumers run on AMD
+                        native only); NVIDIA + Intel still on wgpu
   v5.0             ─▶  Intel native backend added (tentative); NVIDIA
                         wgpu path retires (NVIDIA → NVIDIA native only)
   v5.1             ─▶  Full wgpu retirement once Intel native is in
@@ -91,7 +94,9 @@ migration smooth: nobody on a wgpu-only chipset is forced to move
 before their native backend is real.
 
 The concrete cutovers:
-- **v4.0** — AMD wgpu retires. AMD consumers now run on AMD native
+- **v4.0** — NVIDIA native ships. AMD wgpu **still supported** (one
+  release window of coexistence on AMD before the retirement).
+- **v4.0.1** — AMD wgpu retires. AMD consumers now run on AMD native
   only. NVIDIA + Intel still on wgpu.
 - **v5.0** — NVIDIA wgpu retires. NVIDIA consumers now on NVIDIA
   native. Intel still on wgpu.
@@ -192,13 +197,15 @@ The four parked follow-ups all shipped in **3.4.3** (see the CHANGELOG):
 
 ---
 
-## v4.0 — NVIDIA Native Backend; AMD wgpu Retires
+## v4.0 — NVIDIA Native Backend (AMD wgpu Retirement Deferred to 4.0.1)
 
-v4.0 does two things: adds NVIDIA hardware to the native path **and**
-retires the wgpu path for AMD. After v4.0, AMD consumers run on the
-AMD native backend only; NVIDIA and Intel consumers continue on
-wgpu. The wgpu binding code itself stays in-tree to serve those
-remaining vendors.
+v4.0 adds NVIDIA hardware to the native path. The AMD wgpu retirement
+that was originally bundled into v4.0 is **deferred to v4.0.1** to give
+AMD consumers a coexistence release window on the v4.x line (mirroring
+the per-vendor coexistence pattern the rest of the retirement schedule
+already follows). Through 4.0.x, AMD consumers can run on either AMD
+native or wgpu; NVIDIA + Intel consumers continue on wgpu. The wgpu
+binding code stays in-tree.
 
 Until v4.0 ships, NVIDIA consumers stay on the wgpu backend and AMD
 consumers can run on either backend.
@@ -247,24 +254,24 @@ the `Backend` interface:
 - soorat (smoke-test consumer) builds and runs under
   `BACKEND_KIND_NVIDIA` in CI on NVIDIA hardware.
 - The NVIDIA work doesn't regress AMD or wgpu paths.
-- **AMD wgpu retirement**: every AMD-using consumer has been on the
-  AMD native backend in production across a full v3.x release cycle.
-  At v4.0 ship, the AMD code paths in `src/wgpu_*.cyr` /
+- **AMD wgpu retirement** (slipped to **v4.0.1**): every AMD-using
+  consumer has been on the AMD native backend in production across
+  a full v3.x release cycle, with v4.0 providing one more coexistence
+  window. At v4.0.1 ship, the AMD code paths in `src/wgpu_*.cyr` /
   `src/backend_wgpu.cyr` either get a `BACKEND_KIND_AMD` guard that
-  errors out, or the AMD-specific wgpu wiring is removed
-  (the wgpu *binding* stays for NVIDIA + Intel; AMD consumers no
-  longer have a wgpu route).
-- **`samvada` C-shim retirement.** The `samvada` package's
-  v3.x C shim around `libsystemd`'s `sd_bus_*` (mirroring
-  mabda's `wgpu_main.c` pattern) gets replaced by a pure-Cyrius
-  dbus marshaller, OR removed entirely if the v4.0 logind story
-  evolves (e.g., kernel-level master delegation lands in a way
-  that obviates dbus). Treated as a peer of the wgpu-native
-  retirement: both C-shim deps for v3.x feature surfaces drop
-  together at v4.0. If the pure-Cyrius dbus implementation
-  isn't ready, the C shim can survive into v4.x — but the
-  commitment is "both C-shim deps go at v4.0 if we ship them
-  in v3.x."
+  errors out, or the AMD-specific wgpu wiring is removed (the wgpu
+  *binding* stays for NVIDIA + Intel; AMD consumers no longer have
+  a wgpu route).
+- **`samvada` C-shim retirement** (paired with the AMD wgpu retirement
+  on the **v4.0.1** beat). The `samvada` package's v3.x C shim around
+  `libsystemd`'s `sd_bus_*` (mirroring mabda's `wgpu_main.c` pattern)
+  gets replaced by a pure-Cyrius dbus marshaller, OR removed entirely
+  if the v4.0.x logind story evolves (e.g., kernel-level master
+  delegation lands in a way that obviates dbus). Treated as a peer of
+  the AMD wgpu retirement: both C-shim deps for v3.x feature surfaces
+  drop together at v4.0.1. If the pure-Cyrius dbus implementation
+  isn't ready, the C shim can survive into v4.x — but the commitment
+  is "both C-shim deps go at v4.0.1 if we ship them in v3.x."
 
 ---
 
@@ -361,4 +368,4 @@ there's consumer demand plus a clear scope.
 | [003](../adr/003-fixed-vertex-types.md) | Fixed vertex types, manual layout, no codegen |
 | [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI — permanent, coexists with native backend from v3.0 onward |
 | [005](../adr/005-public-api-surface-marking.md) | Public API surface marking (`# @public` / `# @internal`) — the stability boundary that holds across backends |
-| [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — adds a second backend alongside ADR 004 during v3.x; wgpu path retires at v4.0 (shipped in v3.0, 2026-06-02) |
+| [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — adds a second backend alongside ADR 004 during v3.x; wgpu path retires per-chipset (AMD at v4.0.1, NVIDIA at v5.0, Intel/full at v5.1) (shipped in v3.0, 2026-06-02) |
