@@ -1,0 +1,80 @@
+# programs/native_array_cube_load_e2e.cyr — v3.4 AA.7a (array+cube load ordering)
+#
+# The data-ordering HW capstone: load a REAL KTX2 array file + a REAL KTX2 cube
+# file through the PUBLIC API on Cezanne, then read each slice back from the
+# GPU-resident BO and verify file image k landed in backend slice k. This closes
+# the spec-vs-HW ordering question (KTX2 within-level layer->face order must map
+# 1:1 to the slice the sampler reads). Slice -> sampler is already HW-proven
+# (native_array_sample_e2e / native_cube_sample_e2e), so file->slice (here) +
+# slice->sampler = the full file->display chain on real silicon.
+#
+# Both files: each image k = solid (0x40 + k*0x18, 0x80, 0xC0, 0xFF) RGBA8 32x32.
+# Exit codes: 0 pass; 1 ctx; 2 array read; 3 array load; 4 array verify;
+#   5 cube read; 6 cube load; 7 cube verify.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn _img_color(k): i64 {
+    return ((0x40 + k * 0x18) & 0xFF) | (0x80 << 8) | (0xC0 << 16) | (0xFF << 24);
+}
+
+# Load `path` via gpu_texture_load_ktx2, verify each of `count` slices reads back
+# its file color from the BO. Returns 0 ok, or a nonzero step code.
+fn _load_verify(ctx, path, count, read_code, load_code, verify_code): i64 {
+    var buf = alloc(32768);
+    var n = file_read_all(path, buf, 32768);
+    if (n <= 0) { return read_code; }
+    var tex = gpu_texture_load_ktx2(ctx, buf, n);
+    if (tex == 0) { return load_code; }
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var per_slice = load64(tex + NATIVE_TEX_FIELD_SIZE);
+    if (native_tex_slice_count(tex) != count) { return verify_code; }
+    var k = 0;
+    while (k < count) {
+        var want = _img_color(k);
+        var slice = addr + k * per_slice;
+        if (load32(slice + 0) != want) { return verify_code; }
+        if (load32(slice + (per_slice / 2)) != want) { return verify_code; }
+        if (load32(slice + per_slice - 4) != want) { return verify_code; }
+        k = k + 1;
+    }
+    gpu_texture_release(ctx, tex);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native array+cube load-ordering e2e (v3.4 AA.7a)\n");
+    print_cstr("------------------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+
+    # KTX2 array (4 layers).
+    var ra = _load_verify(ctx, "tests/assets/load_array4_32.ktx2", 4, 2, 3, 4);
+    if (ra != 0) { print_cstr("FAIL: array (step "); print_i64(ra); print_cstr(")\n"); return ra; }
+    print_cstr("PASS: KTX2 4-layer array loaded; slice k == file layer k\n");
+
+    # KTX2 cube (6 faces).
+    var rc = _load_verify(ctx, "tests/assets/load_cube_32.ktx2", 6, 5, 6, 7);
+    if (rc != 0) { print_cstr("FAIL: cube (step "); print_i64(rc); print_cstr(")\n"); return rc; }
+    print_cstr("PASS: KTX2 6-face cube loaded; slice k == file face k\n");
+
+    gpu_context_release(ctx);
+    print_cstr("OK — KTX2 array+cube load data-ordering verified on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -243,15 +243,45 @@ implementation, not just planning.
 
 ## Phase AA.7 — HW e2e + arc cut [M]
 
-- [ ] **AA.7a** — `native_array_cube_load_e2e` on Cezanne: load a real KTX2/DDS
-  array + cube through the public API, create+upload+sample, CPU-verify
-  per-layer/per-face distinct colors — **the data-ordering HW verify** (DDS
-  +X..−Z and KTX2 layer→face→z must map 1:1 to the backend layer index the
-  sampler expects). Closes the spec-vs-HW ordering open Q.
-- [ ] **AA.7b** — closeout: flip `caps_native_texture_array` / `_cube` to 1 (cube
-  gated on AA.5b), distlib idempotent, version-check, re-run the per-layer-stride
+- [x] **AA.7a (2026-06-19) — HW-VERIFIED on Cezanne.** `native_array_cube_load_e2e`
+  + `tests/assets/load_array4_32.ktx2` (4-layer) + `load_cube_32.ktx2` (6-face):
+  loads REAL KTX2 array + cube files through the public API
+  (`gpu_texture_load_ktx2`) and verifies **file image k landed in backend slice k**
+  (read back from the GPU-resident BO). Closes the spec-vs-HW data-ordering Q
+  (KTX2 within-level layer→face maps 1:1 to the slice). Slice→sampler is proven
+  by AA.2/AA.5b, so file→slice (here) + slice→sampler = the full file→display
+  chain on real silicon. (DDS rides the same `write_layer_level(image_idx)` slice
+  mapping — CPU-tested in AA.6c.) All suites exit 0; distlib idempotent.
+- [ ] **AA.7b** — closeout: flip `caps_native_texture_array` / `_cube` to 1 (done
+  at AA.2/AA.5d), distlib idempotent, version-check, re-run the per-layer-stride
   audit checklist against the diff, audit doc, CHANGELOG + roadmap + CLAUDE.md.
-  **Cut 3.4.0.**
+  **Cut 3.4.0** with the v3.4.1 backlog below tracked.
+
+---
+
+## v3.4.1 backlog (deferred from 3.4.0, tracked — not dropped)
+
+Three items roll to **3.4.1** (the core array/cube capability ships in 3.4.0
+without them):
+
+1. **AA.4 — native 2D-array compressed (tiled) storage + sample.** BC-only,
+   addrlib-gated (the SW_64KB_S slice-stride / `ARRAY_PITCH` / `COPY_TILED
+   copy_d` open question, AA.4a). Niche vs RGBA8 arrays + cubes; high-risk. The
+   array/cube primitives + loaders ship RGBA8/uncompressed in 3.4.0.
+2. **AA.3c — wgpu draw-time layer selection.** `gpu_render_pass_bind_texture_layer`
+   is native-only (the +56 descriptor tail); wgpu returns NOT_IMPLEMENTED. Needs
+   a layer uniform the `texture_2d_array` FS reads + the wgpu `bind_for_sample_layer`
+   filler. (Native is symmetric; wgpu consumers can still sample a fixed layer via
+   their own WGSL `array_index`, as `wgpu_array_sample_e2e` does.)
+3. **`F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the **attn11** block —
+   first consumer that also deps `math`). `src/color.cyr` defines runtime-init
+   `F64_HALF`/`F64_TWO` (= 0 until its init runs) that shadow the `math` stdlib's
+   compile-time constants; "last definition wins" silently zeroes a consumer's f64
+   math (NaN on the non-GPU path). **Fix #1 (preferred): namespace them
+   `MABDA_F64_HALF` / `MABDA_F64_TWO`** (+ the sibling `color_rgb` duplicate →
+   `mabda_color_rgb`). Full filing:
+   [`docs/development/issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md`](issues/2026-06-19-f64-half-two-collide-with-math-stdlib.md).
+   attn11 has a consumer-side workaround (mabda in a separate TU) until this lands.
 
 ---
 
