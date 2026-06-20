@@ -620,6 +620,23 @@ fn _backend_wgpu_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
     if (tex == 0)  { return GPU_ERR_TEXTURE; }
     store64(pass + 24, tex);
     store64(pass + 32, sampler);
+    store64(pass + 40, 0 - 1);   # no layer -> 2-entry bind group (re-bind resets)
+    return 0;
+}
+
+# v3.4.1 AA.3c — bind an array/cube texture selecting which `layer` (array slice /
+# cube face) the next draw samples. Stashes the layer on the pass (+40); the draw
+# builds a 3-entry bind group with a uniform buffer carrying the layer, which the
+# consumer's `texture_2d_array`/`texture_cube` WGSL reads as the sample
+# array_index. (The native path uses the +56 descriptor tail instead.)
+fn _backend_wgpu_texture_bind_for_sample_layer(ctx, pass, tex, sampler, layer): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0)  { return GPU_ERR_TEXTURE; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
+    store64(pass + 24, tex);
+    store64(pass + 32, sampler);
+    store64(pass + 40, layer);
     return 0;
 }
 
@@ -931,13 +948,15 @@ fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
         return 0;
     }
 
-    # 40 bytes (grew 32 → 40 at v3.2 TS.5): +24 bound_tex / +32 bound_sampler
-    # for bind_for_sample; both default 0 (no texture bound).
-    var p = alloc(40);
-    memset(p, 0, 40);
+    # 48 bytes (40 → 48 at v3.4.1 AA.3c): +24 bound_tex / +32 bound_sampler for
+    # bind_for_sample; +40 sample LAYER (-1 = none/2-entry group; >=0 = a draw-time
+    # array layer / cube face, 3-entry group with a layer uniform). Default -1.
+    var p = alloc(48);
+    memset(p, 0, 48);
     store64(p +  0, encoder);
     store64(p +  8, pass);
     store64(p + 16, rt);
+    store64(p + 40, 0 - 1);   # sample layer: none
     return p;
 }
 
@@ -966,9 +985,32 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
         if (sampler == 0) { return GPU_ERR_OTHER; }
         var bgl = wgpu_render_pipeline_get_bind_group_layout(pipe_handle, 0);
         if (bgl == 0) { wgpu_sampler_release(sampler); return GPU_ERR_OTHER; }
-        var bgdesc = wgpu_texture_bind_group_descriptor(bgl, view, sampler);
+        # v3.4.1 AA.3c — if a draw-time layer was bound (+40 >= 0), stage a 16-byte
+        # uniform buffer holding it + build a 3-entry group (tex@0,sampler@1,layer@2);
+        # the consumer's array/cube WGSL reads the uniform as the sample array_index.
+        var layer = load64(pass + 40);
+        var ubuf = 0;
+        var bgdesc = 0;
+        if (layer >= 0) {
+            var udesc = wgpu_buffer_descriptor("mabda-layer",
+            WGPU_BUFFER_USAGE_UNIFORM | WGPU_BUFFER_USAGE_COPY_DST, 16, 0);
+            ubuf = wgpu_device_create_buffer(device, udesc);
+            if (ubuf == 0) {
+                wgpu_bind_group_layout_release(bgl);
+                wgpu_sampler_release(sampler);
+                return GPU_ERR_OTHER;
+            }
+            var ldata[16];
+            memset(&ldata, 0, 16);
+            store32(&ldata, layer);
+            wgpu_queue_write_buffer(gpu_ctx_queue(ctx), ubuf, 0, &ldata, 16);
+            bgdesc = wgpu_texture_layer_bind_group_descriptor(bgl, view, sampler, ubuf, 16);
+        } else {
+            bgdesc = wgpu_texture_bind_group_descriptor(bgl, view, sampler);
+        }
         var bg = wgpu_device_create_bind_group(device, bgdesc);
         if (bg == 0) {
+            if (ubuf != 0) { wgpu_buffer_release(ubuf); }
             wgpu_bind_group_layout_release(bgl);
             wgpu_sampler_release(sampler);
             return GPU_ERR_OTHER;
@@ -976,10 +1018,12 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
         wgpu_render_pass_encoder_set_bind_group(pass_enc, 0, bg, 0, 0);
         # Audit 2026-06-15 HIGH — release our refs now: wgpu-native retains its
         # own refs to the recorded bind group (and the group AddRef'd the
-        # view + sampler), so dropping ours here avoids a per-draw handle leak.
+        # view + sampler + uniform buffer), so dropping ours here avoids a per-draw
+        # handle leak. The bind group keeps the layer buffer alive until submit.
         wgpu_bind_group_release(bg);
         wgpu_bind_group_layout_release(bgl);
         wgpu_sampler_release(sampler);
+        if (ubuf != 0) { wgpu_buffer_release(ubuf); }
     }
     wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
     return 0;
@@ -1347,6 +1391,8 @@ fn backend_wgpu_new(): i64 {
     &_backend_wgpu_texture_create_2d_sampleable);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE,
     &_backend_wgpu_texture_bind_for_sample);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER,
+    &_backend_wgpu_texture_bind_for_sample_layer);   # v3.4.1 AA.3c
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }

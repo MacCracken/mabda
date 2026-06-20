@@ -1,0 +1,148 @@
+# programs/wgpu_array_layer_select_e2e.cyr — v3.4.1 AA.3c (wgpu draw-time layer)
+#
+# AA.3b sampled a 2D-array layer chosen by a WGSL *literal*. AA.3c selects the
+# layer at DRAW TIME through the public API: gpu_render_pass_bind_texture_layer
+# stashes the layer, and the wgpu draw stages a uniform buffer the array WGSL
+# reads as the textureSample array_index. Same 4-layer array; the FS is FIXED
+# (no per-layer recompile) — only the bind call changes the sampled slice.
+#
+#   create_2d_array(RGBA8, 4 layers, layer k = solid (0x40 + k*0x20, .80, .C0, FF))
+#   -> texture_2d_array WGSL + @binding(2) var<uniform> lu: LU (a u32 layer)
+#   -> bind_texture_layer(K) + draw -> RT == layer K's color (tested K=1 and K=3).
+#
+# Proves the uniform-driven draw-time selection genuinely picks the slice (the
+# wgpu counterpart of native's +56 descriptor tail). Linked with deps/wgpu_main.c.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+
+# The FIXED array WGSL — the layer comes from the @binding(2) uniform, not a literal.
+fn _layer_select_wgsl(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var t: texture_2d_array<f32>; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(1) var s: sampler; ");
+    str_builder_add_cstr(sb, "struct LU { layer: u32 }; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(2) var<uniform> lu: LU; ");
+    str_builder_add_cstr(sb, "struct VOut { @builtin(position) pos: vec4<f32>, ");
+    str_builder_add_cstr(sb, "@location(0) uv: vec2<f32> }; ");
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> VOut { ");
+    str_builder_add_cstr(sb, "var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), ");
+    str_builder_add_cstr(sb, "vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); ");
+    str_builder_add_cstr(sb, "var o: VOut; o.pos = vec4<f32>(p[vid], 0.0, 1.0); ");
+    str_builder_add_cstr(sb, "o.uv = (p[vid] + vec2<f32>(1.0, 1.0)) * 0.5; return o; } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main(inp: VOut) -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return textureSample(t, s, inp.uv, i32(lu.layer)); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+# Render with bind_texture_layer(k) + verify the RT is layer k's color. 0 ok.
+fn _select_layer(ctx, tex, samp, k): i64 {
+    var device = gpu_ctx_device(ctx);
+    var queue  = gpu_ctx_queue(ctx);
+    var W = 64;
+    var H = 64;
+    var wgsl = _layer_select_wgsl();
+    var shmod = gpu_shader_module_create(ctx, wgsl, strlen(wgsl));
+    if (shmod == 0) { return 1; }
+    var pipe = gpu_render_pipeline_create(ctx, shmod, shmod, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (pipe == 0) { return 1; }
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { return 1; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return 1; }
+    # the AA.3c call under test — draw-time layer selection.
+    if (gpu_render_pass_bind_texture_layer(ctx, pass, tex, samp, k) != 0) { return 1; }
+    if (gpu_render_pass_draw(ctx, pass, pipe, 3, 1) != 0) { return 1; }
+    gpu_render_pass_end(ctx, pass);
+    var rt_handle = load64(rt + 0);
+    var BPR = 256;
+    var BUF_SIZE = 16384;
+    var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var read_desc = wgpu_buffer_descriptor("sel-readback", read_usage, BUF_SIZE, 0);
+    var read_buf = wgpu_device_create_buffer(device, read_desc);
+    if (read_buf == 0) { return 1; }
+    var enc = wgpu_device_create_command_encoder(device, "sel-enc");
+    var cargs = alloc(72);
+    memset(cargs, 0, 72);
+    store64(cargs + 0,  rt_handle);
+    store32(cargs + 24, 0);
+    store64(cargs + 32, read_buf);
+    store32(cargs + 48, BPR);
+    store32(cargs + 52, H);
+    store32(cargs + 56, W);
+    store32(cargs + 60, H);
+    store32(cargs + 64, 1);
+    wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "sel-cmd");
+    wgpu_queue_submit_one(queue, cmd);
+    var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
+    if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return 1; }
+    var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
+    if (mapped == 0) { return 1; }
+    var want_r = 0x40 + k * 0x20;
+    var bad = 0;
+    var offc = (H / 2) * BPR + (W / 2) * 4;
+    if (load8(mapped + 0) != want_r) { bad = 1; }
+    if (load8(mapped + 1) != 0x80)   { bad = 1; }
+    if (load8(mapped + offc + 0) != want_r) { bad = 1; }
+    wgpu_buffer_unmap(read_buf);
+    return bad;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+
+    var res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res) == 1) {
+        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        return 0;
+    }
+    _gpu_ctx = payload(res);
+    syscall(1, 1, "PASS: GPU context created\n", 26);
+
+    var W = 64;
+    var H = 64;
+    var N = W * H * 4;
+    var LAYERS = 4;
+
+    var tex = gpu_texture_create_2d_array(_gpu_ctx, W, H, MABDA_TEXFMT_RGBA8, LAYERS);
+    if (tex == 0) { return _fail("FAIL: create_2d_array\n", 22); }
+    var src = alloc(N);
+    var k = 0;
+    while (k < LAYERS) {
+        var i = 0;
+        while (i < W * H) {
+            store8(src + i * 4 + 0, 0x40 + k * 0x20);
+            store8(src + i * 4 + 1, 0x80);
+            store8(src + i * 4 + 2, 0xC0);
+            store8(src + i * 4 + 3, 0xFF);
+            i = i + 1;
+        }
+        if (gpu_texture_write_layer_level(_gpu_ctx, tex, k, 0, src, N) != 0) {
+            return _fail("FAIL: write_layer_level\n", 24);
+        }
+        k = k + 1;
+    }
+    syscall(1, 1, "PASS: 4-layer array created + uploaded (distinct R)\n", 51);
+
+    var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (samp == 0) { return _fail("FAIL: sampler\n", 14); }
+
+    if (_select_layer(_gpu_ctx, tex, samp, 1) != 0) {
+        return _fail("FAIL: draw-time layer 1 mismatch\n", 33);
+    }
+    if (_select_layer(_gpu_ctx, tex, samp, 3) != 0) {
+        return _fail("FAIL: draw-time layer 3 mismatch\n", 33);
+    }
+    syscall(1, 1, "PASS: RT = uniform-selected layer for layers 1 and 3\n", 53);
+
+    syscall(1, 1, "\n3 passed, 0 failed\n", 20);
+    return 0;
+}

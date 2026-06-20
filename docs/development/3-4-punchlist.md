@@ -271,11 +271,14 @@ without them):
    addrlib-gated (the SW_64KB_S slice-stride / `ARRAY_PITCH` / `COPY_TILED
    copy_d` open question, AA.4a). Niche vs RGBA8 arrays + cubes; high-risk. The
    array/cube primitives + loaders ship RGBA8/uncompressed in 3.4.0.
-2. **AA.3c — wgpu draw-time layer selection.** `gpu_render_pass_bind_texture_layer`
-   is native-only (the +56 descriptor tail); wgpu returns NOT_IMPLEMENTED. Needs
-   a layer uniform the `texture_2d_array` FS reads + the wgpu `bind_for_sample_layer`
-   filler. (Native is symmetric; wgpu consumers can still sample a fixed layer via
-   their own WGSL `array_index`, as `wgpu_array_sample_e2e` does.)
+2. **[DONE 3.4.1] AA.3c — wgpu draw-time layer selection.** HW-verified on
+   Cezanne (wgpu/Vulkan). `_backend_wgpu_texture_bind_for_sample_layer` stashes the
+   layer on the pass (+40, sentinel −1 = none); the draw stages a 16-B uniform
+   buffer + builds a 3-entry bind group (tex@0, sampler@1, layer-uniform@2) via the
+   new `wgpu_texture_layer_bind_group_descriptor`; the consumer's array/cube WGSL
+   reads `@binding(2)` as the `textureSample` array_index. wgpu slot wired (was
+   null). `wgpu_array_layer_select_e2e`: `bind_texture_layer(K)` picks the slice per
+   draw (K=1,3 verified). +20 CPU asserts (backend 532→552; suite 4494→4514).
 3. **[DONE 3.4.1] `F64_HALF`/`F64_TWO` collide with the `math` stdlib** (the
    **attn11** block). Fix #1 applied: `color.cyr`'s two shadowing constants
    renamed to `MABDA_F64_HALF` / `MABDA_F64_TWO` (defs + init + all usages); the

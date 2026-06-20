@@ -825,6 +825,10 @@ fn test_backend_wgpu_slot_identities() {
     assert_eq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE),
     &_backend_wgpu_texture_bind_for_sample,
     "slot 272 = bind_for_sample");
+    # v3.4.1 AA.3c — wgpu draw-time layer-select slot now wired (was null).
+    assert_eq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER),
+    &_backend_wgpu_texture_bind_for_sample_layer,
+    "slot 320 = wgpu bind_for_sample_layer");
     assert_eq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE),
     &_backend_wgpu_shader_module_create,
     "slot 48 = shader_module_create");
@@ -2152,9 +2156,56 @@ fn test_gpu_caps_wgpu_shader_f64_gated() {
     return 0;
 }
 
+# v3.4.1 AA.3c — wgpu draw-time layer-select: the bind filler stashes the layer
+# on the pass (+40), and the plain bind resets it to -1 (2-entry group).
+fn test_backend_wgpu_bind_for_sample_layer() {
+    var pass[48];
+    memset(&pass, 0, 48);
+    store64((&pass) + 40, 0 - 1);   # begin's default: no layer
+    # bind a layer -> stash tex/sampler/layer.
+    assert_eq(_backend_wgpu_texture_bind_for_sample_layer(1, &pass, 0xABCD, 0xBEEF, 3),
+    0, "wgpu bind_for_sample_layer ok");
+    assert_eq(load64((&pass) + 24), 0xABCD, "layer-bind stashes tex @+24");
+    assert_eq(load64((&pass) + 32), 0xBEEF, "layer-bind stashes sampler @+32");
+    assert_eq(load64((&pass) + 40), 3,      "layer-bind stashes layer @+40");
+    # the plain bind resets the layer to -1 (so a re-bind drops to 2-entry).
+    assert_eq(_backend_wgpu_texture_bind_for_sample(1, &pass, 0x1111, 0x2222),
+    0, "wgpu bind_for_sample ok");
+    assert_eq(load64((&pass) + 40), 0 - 1, "plain bind resets layer to -1");
+    # negative layer rejected.
+    assert_eq(_backend_wgpu_texture_bind_for_sample_layer(1, &pass, 0xAA, 0xBB, 0 - 1),
+    GPU_ERR_TEXTURE, "negative layer rejected");
+    # null pass / tex rejected.
+    assert_eq(_backend_wgpu_texture_bind_for_sample_layer(1, 0, 0xAA, 0xBB, 0),
+    GPU_ERR_OTHER, "null pass rejected");
+    assert_eq(_backend_wgpu_texture_bind_for_sample_layer(1, &pass, 0, 0xBB, 0),
+    GPU_ERR_TEXTURE, "null tex rejected");
+    return 0;
+}
+
+# v3.4.1 AA.3c — the 3-entry layered-sample bind-group descriptor (tex@0,
+# sampler@1, layer uniform@2). Pins the WGPUBindGroupEntry (56 B) field offsets.
+fn test_wgpu_texture_layer_bind_group_descriptor() {
+    var desc = wgpu_texture_layer_bind_group_descriptor(0xB61, 0xC0DE, 0x5A11, 0xB00F, 16);
+    assert_eq(load64(desc + 24), 0xB61, "desc layout = bgl");
+    assert_eq(load64(desc + 32), 3,     "desc entryCount = 3");
+    var e = load64(desc + 40);
+    assert_eq(load32(e + 8),  0,      "entry0 binding 0");
+    assert_eq(load64(e + 48), 0xC0DE, "entry0 textureView @+48");
+    assert_eq(load32(e + 56 + 8),  1,      "entry1 binding 1");
+    assert_eq(load64(e + 56 + 40), 0x5A11, "entry1 sampler @+40");
+    assert_eq(load32(e + 112 + 8),  2,     "entry2 binding 2");
+    assert_eq(load64(e + 112 + 16), 0xB00F, "entry2 buffer @+16");
+    assert_eq(load64(e + 112 + 24), 0,     "entry2 offset 0");
+    assert_eq(load64(e + 112 + 32), 16,    "entry2 size 16");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_backend_wgpu_bind_for_sample_layer();
+    test_wgpu_texture_layer_bind_group_descriptor();
     test_wgpu_f64_probe_spirv_structure();
     test_gpu_caps_wgpu_shader_f64_gated();
     test_audit_strnlen_caps_at_max();
