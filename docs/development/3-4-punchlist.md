@@ -170,10 +170,16 @@ implementation, not just planning.
 
 ## Phase AA.5 — Cube native + wgpu (the Cezanne HW-risk phase) [M]
 
-- [ ] **AA.5a** — native cube T# + 6-slice storage + per-face upload (cube = a
-  6-slice 2D-array; `TYPE=11`, `DEPTH=5`). HW-verify storage+readback —
-  distinct per-face colors via SDMA, confirming the **+X,−X,+Y,−Y,+Z,−Z**
-  face→layer ordering (no sampling yet).
+- [x] **AA.5a (2026-06-19) — HW-VERIFIED on Cezanne.** Refactored the AA.1 array
+  create into a shared `_native_create_layered_sampleable(…, slices, img_type)`;
+  `_backend_native_texture_create_cube(ctx, size, fmt, mip_count)` = it with
+  `slices=6, img_type=CUBE` (TYPE=11, DEPTH=5; square; single-level — mipped cube
+  fails loud). Slot wired; `write_layer_level` reused for per-face upload.
+  `native_cube_store_e2e` + `make test-native-cube-store-e2e`: 6-face 64×64 cube
+  created on the GPU, 6 distinct faces written, **each reads back at
+  `base + face·per_face`** (the +X,−X,+Y,−Y,+Z,−Z ordering). +5 CPU asserts
+  (cube-create guards, native 1477→1482). Suite 4420→4425; all suites exit 0;
+  distlib idempotent.
 - [ ] **AA.5b** — **THE load-bearing Cezanne HW risk:** native cube
   direction→(face,u,v) `image_sample` FS (`DA=1`, float s/t/r) — brand-new ISA,
   no FS to reuse. HW-prove POINT single-mip first, then BILINEAR + seamless

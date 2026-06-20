@@ -1565,23 +1565,26 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
 # NATIVE_TEX_FIELD_SIZE holds the PER-SLICE logical bytes (the write_layer bound);
 # slice_count holds the layer count. Compressed (tiled) arrays are AA.4 (the tiled
 # slice stride is an addrlib question) and fail loud here. Returns tex_ptr | 0.
-fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers): i64 {
+# v3.4 AA.1b/AA.5a — shared sampleable LINEAR layered-create: `slices` contiguous
+# slices of (w x h) `fmt` + the T#/S# tail, T# TYPE = `img_type` (2D_ARRAY or
+# CUBE). One BO holds [slices | pad-256 | T#(32)+S#(16)]; slice k at base +
+# k*per_slice (LINEAR depth_pitch = w*h elements). SIZE = per-slice bytes,
+# slice_count = slices. Compressed (tiled) layered create is AA.4 (fail loud).
+fn _native_create_layered_sampleable(ctx, width, height, fmt, slices, img_type): i64 {
     if (ctx == 0) { return 0; }
     if (width <= 0)  { return 0; }
     if (height <= 0) { return 0; }
-    if (layers < 1)  { return 0; }
-    if (layers > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }
+    if (slices < 1)  { return 0; }
+    if (slices > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }
     if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
         return 0;
     }
     if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0; }   # unsupported fmt
     var per_slice = mabda_texfmt_data_size(fmt, width, height);
     if (per_slice == 0) { return 0; }
-    # AA.1b is LINEAR only; compressed (tiled) arrays need the slice stride
-    # resolved against addrlib (AA.4) — fail loud rather than mis-tile.
-    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }
+    if (mabda_texfmt_compression_family(fmt) != 0) { return 0; }   # LINEAR only (compressed = AA.4)
     var fd = native_ctx_fd(ctx);
-    var surf_size = per_slice * layers;   # layers,dims dispatcher-bounded -> no i64 overflow
+    var surf_size = per_slice * slices;   # slices,dims dispatcher-bounded -> no i64 overflow
     var desc_off = _native_align_up(surf_size, 256);
     var bo_size = _native_align_up(desc_off + 64, 4096);
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
@@ -1597,7 +1600,7 @@ fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, l
     var daddr = addr + desc_off;
     memset(daddr, 0, 64);
     native_gfx9_image_descriptor_typed(daddr, 0, va, width, height, fmt,
-    GFX9_SW_MODE_LINEAR, 1, width - 1, GFX9_SQ_RSRC_IMG_2D_ARRAY, layers);
+    GFX9_SW_MODE_LINEAR, 1, width - 1, img_type, slices);
     native_gfx9_sampler_descriptor(daddr, 32,
     NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);
     store32(daddr + 48, 0x3F800000);   # scale_x = 1.0f
@@ -1614,13 +1617,26 @@ fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, l
     store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
     native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
     native_tex_set_t_va(tex, va + desc_off);
-    native_tex_set_slice_count(tex, layers);
+    native_tex_set_slice_count(tex, slices);
     return tex;
 }
 
-# v3.4 AA.1b — native filler for gpu_texture_create_2d_array (slot wrapper).
+# v3.4 AA.1b — native 2D ARRAY (TYPE = 2D_ARRAY).
+fn _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers): i64 {
+    return _native_create_layered_sampleable(ctx, width, height, fmt, layers, GFX9_SQ_RSRC_IMG_2D_ARRAY);
+}
+
 fn _backend_native_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
     return _backend_native_texture_create_2d_array_sampleable(ctx, width, height, fmt, layers);
+}
+
+# v3.4 AA.5a — native CUBEMAP: a 6-face square LINEAR cube (TYPE = CUBE, a
+# 6-slice array on GFX9). Faces are +X,-X,+Y,-Y,+Z,-Z (write_layer_level face k).
+# Single-level for AA.5a — a mipped cube is later, so mip_count != 1 fails loud.
+fn _backend_native_texture_create_cube(ctx, size, fmt, mip_count): i64 {
+    if (size <= 0) { return 0; }
+    if (mip_count != 1) { return 0; }   # mipped cube is later (AA.5a single-level)
+    return _native_create_layered_sampleable(ctx, size, size, fmt, 6, GFX9_SQ_RSRC_IMG_CUBE);
 }
 
 # v3.2 TS.5 — bind a sampleable texture into a render pass (native). Stashes
@@ -2476,6 +2492,8 @@ fn backend_native_new(): i64 {
     # v3.4 AA.1b — 2D array create + per-layer upload (cube create is AA.5).
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY,
     &_backend_native_texture_create_2d_array);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_CUBE,
+    &_backend_native_texture_create_cube);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL,
     &_backend_native_texture_write_layer_level);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_READ,

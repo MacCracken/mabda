@@ -1,0 +1,86 @@
+# programs/native_cube_store_e2e.cyr — v3.4 AA.5a (native cubemap storage)
+#
+# First HW exercise of native CUBEMAP create + per-face upload on Cezanne:
+#   1. native ctx.
+#   2. gpu_texture_create_cube(64, RGBA8, 1) — one real GEM BO of 6 contiguous
+#      face slices (+X,-X,+Y,-Y,+Z,-Z) + the CUBE T#/S# tail (TYPE=11, DEPTH=5),
+#      VA-mapped on the GPU.
+#   3. gpu_texture_write_layer_level fills each face with a distinct solid color.
+#   4. Read each face back from the GPU-resident BO and verify it landed at
+#      base + face*per_face, distinct per face.
+# Proves the cube create ioctls + the 6-face layout on real silicon; SAMPLING a
+# cube via the direction->face FS is AA.5b (the load-bearing Cezanne HW risk).
+#
+# Exit codes: 0 pass; 1 ctx; 2 create; 3 write; 4 verify mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn _face_color(k): i64 { return 0x10203040 + k; }
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda native cubemap storage e2e (v3.4 AA.5a)\n");
+    print_cstr("---------------------------------------------\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = payload(ctx_res);
+
+    var S = 64;
+    var FACES = 6;
+    var per_face = S * S * 4;
+    var tex = gpu_texture_create_cube(ctx, S, MABDA_TEXFMT_RGBA8, 1);
+    if (tex == 0) { print_cstr("FAIL: create_cube\n"); return 2; }
+    print_cstr("PASS: 6-face 64x64 RGBA8 cube created on GPU\n");
+
+    var src = alloc(per_face);
+    var k = 0;
+    while (k < FACES) {
+        var c = _face_color(k);
+        var i = 0;
+        while (i < S * S) {
+            store32(src + i * 4, c);
+            i = i + 1;
+        }
+        var rc = gpu_texture_write_layer_level(ctx, tex, k, 0, src, per_face);
+        if (rc != 0) {
+            print_cstr("FAIL: write face "); print_i64(k);
+            print_cstr(" rc="); print_i64(rc); print_cstr("\n");
+            return 3;
+        }
+        k = k + 1;
+    }
+    print_cstr("PASS: wrote 6 distinct-color faces (+X,-X,+Y,-Y,+Z,-Z)\n");
+
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var bad = 0;
+    k = 0;
+    while (k < FACES) {
+        var want = _face_color(k);
+        var face = addr + k * per_face;
+        if (load32(face + 0) != want) { bad = 1; }
+        if (load32(face + (S * S / 2) * 4) != want) { bad = 1; }
+        if (load32(face + (S * S - 1) * 4) != want) { bad = 1; }
+        k = k + 1;
+    }
+    if (bad != 0) { print_cstr("FAIL: face readback mismatch\n"); return 4; }
+    print_cstr("PASS: each face reads back distinct + correct at its slice offset\n");
+
+    gpu_texture_release(ctx, tex);
+    gpu_context_release(ctx);
+    print_cstr("OK — native cubemap storage live on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
