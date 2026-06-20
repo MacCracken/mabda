@@ -252,10 +252,13 @@ implementation, not just planning.
   by AA.2/AA.5b, so file→slice (here) + slice→sampler = the full file→display
   chain on real silicon. (DDS rides the same `write_layer_level(image_idx)` slice
   mapping — CPU-tested in AA.6c.) All suites exit 0; distlib idempotent.
-- [ ] **AA.7b** — closeout: flip `caps_native_texture_array` / `_cube` to 1 (done
-  at AA.2/AA.5d), distlib idempotent, version-check, re-run the per-layer-stride
-  audit checklist against the diff, audit doc, CHANGELOG + roadmap + CLAUDE.md.
-  **Cut 3.4.0** with the v3.4.1 backlog below tracked.
+- [x] **AA.7b (2026-06-19) — cut 3.4.0.** Caps already flipped (AA.2/AA.5d).
+  Adversarial security review of the v3.4 untrusted-input loader diff → **0
+  critical/high** (addendum in `docs/audit/2026-06-19-asset-loading-audit.md`).
+  VERSION 3.3.0→3.4.0, README, toolchain pin 6.2.23→**6.2.28** (cycc caught up
+  mid-arc), distlib idempotent, version-check OK, CHANGELOG + roadmap (SHIPPED +
+  history + 3.4.1 backlog) + CLAUDE.md updated. Suite **4494**, lint/fmt/vet clean.
+  v3.4.1 backlog tracked above.
 
 ---
 

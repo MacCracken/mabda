@@ -10,8 +10,8 @@ detection.
 - **Type**: Cyrius library (include-chain) + dist bundle + dual-backend
   (wgpu C-launcher path + native AMD DRM-ioctl path)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius 6.2.26+ (`cyrius.cyml: cyrius = "6.2.26"`)
-- **Version**: 3.3.0 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
+- **Language**: Cyrius 6.2.28+ (`cyrius.cyml: cyrius = "6.2.28"`)
+- **Version**: 3.4.0 in tree. 3.0.0 GA shipped 2026-06-02. 3.0.x tracked
   the toolchain + AGNOS deps; 3.0.4 → P(-1) security-hardening patch.
   **3.1.0** → on-device mipmap generation (native AMD HW-verified; wgpu
   `generate` deferred). **3.1.1** → multi-queue coordination (logical
@@ -195,6 +195,24 @@ detection.
   (`docs/audit/2026-06-19-asset-loading-audit.md`). Arrays/cubemaps parsed-and-rejected-loud
   (v3.4); KTX2 supercompression fails loud; native compressed-mip *sampling* awaits the tiled
   path (linear storage/upload ships). Toolchain 6.2.23.
+  **3.4.0** → **array textures + cubemaps (Phase AA / AL-ARRAY)**, HW-verified end-to-end on
+  Cezanne, closing the parse-and-reject gap the v3.3 loaders left. **2D array textures** + **cubemaps**
+  now create + upload-per-layer/face + sample + load-from-`.dds`/`.ktx2` on BOTH backends, additively
+  (no consumer call-signature change). Native arrays sample via `image_load DA=1` + a slice VADDR;
+  native cubes via `image_sample DA=1` with an **`(s,t,FACEID)`** VADDR (the GFX9 finding: a face
+  *index*, not a raw direction — the consumer derives it via `v_cube*`); a cube-aware bind
+  auto-selects `unnorm=0`. wgpu uses 2DArray/Cube views + `texture_2d_array`/`texture_cube` WGSL
+  (naga projects a direction). The DDS/KTX2 loaders flip their array/cube rejects to per-image
+  `write_layer_level` (overflow-safe per-image split carrying the 3.3.0 audit forward; cube-array /
+  array>256 / mipped-multi-image / partial-cube rejected loud). New API:
+  `gpu_texture_create_2d_array` / `_cube` / `gpu_texture_write_layer_level` /
+  `gpu_render_pass_bind_texture_layer` + `gpu_caps_native_texture_array`/`_cube` (both → 1); 4 new
+  Backend slots (`BACKEND_SIZE` 296→328); `MABDA_MAX_TEXTURE_ARRAY_LAYERS=256`; the NativeTexture
+  `slice_count` (+60, is-cube in bit 31). HW-verified: native+wgpu array sample, native+wgpu cube
+  sample, and the data-ordering capstone (`native_array_cube_load_e2e` — real KTX2 array+cube files,
+  file image k → slice k). Adversarially reviewed pre-cut (0 critical). **Deferred to 3.4.1:** AA.4
+  native compressed/tiled arrays, AA.3c wgpu draw-time layer, and the `F64_HALF`/`F64_TWO`↔`math`
+  collision (the attn11 block → namespace `MABDA_F64_*`). Toolchain 6.2.23→6.2.28.
   v3.0 ships dual backend (wgpu +
   native AMD); native is `Backend`-slot-abstracted alongside wgpu, AMD
   only in v3.0; NVIDIA/Intel native scoped to v4.0/v5.0.
@@ -220,7 +238,7 @@ retires the wgpu path for AMD. Backend abstraction is the
 load-bearing v3.0 architectural choice — the public API surface
 doesn't change between paths.
 
-## Current State (post 3.3.0, 2026-06-19)
+## Current State (post 3.4.0, 2026-06-19)
 
 - **Source**: 51 domain modules under `src/*.cyr`, ~22,600 lines
   (`queue.cyr` added at v3.1.1 for the logical queue abstraction; the
@@ -238,15 +256,16 @@ doesn't change between paths.
   — no new module; 3.3.0 Phase AL added two modules — `asset_format.cyr` (format-id
   mapping) + `asset_load.cyr` (DDS/KTX2 parsers + the PNG/sniffer load API) — and
   the `chitra` dep at `lib/chitra.cyr`).
-- **Tests**: **4276 CPU-only assertions** across **17 functionality-named
+- **Tests**: **4494 CPU-only assertions** across **17 functionality-named
   domain files** under `tests/tcyr/` (3.3.0 added `asset_load.tcyr`, the 17th;
+  3.4.0 Phase AA grew backend/native/asset_load in place — no new file;
   reorganized 2026-06-15 from the old
   version-named mabda/mabda_v3/mabda_v3_phase_d trio — see the v3.1 test
   reorg). Each file is a standalone suite (own `main()` + `assert_summary`)
   mirroring the `src/` domains; `make test` globs them all.
   **Counting gotcha:** `texture.tcyr`'s summary line has a leading NUL byte, so
   `make test | grep` (or `awk`) treats it as binary and **silently drops
-  texture's 207** — the naive total reads **4069**, not the true **4276**. Use
+  texture's 207** — the naive total reads **4287**, not the true **4494**. Use
   `./scripts/count-test-assertions.sh` (it strips NULs + runs per-file) for an
   accurate count; the trap has fooled humans and review agents alike.
   Domain breakdown:
@@ -782,7 +801,7 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.2.26"` in `cyrius.cyml`. CI + release
+- **Toolchain pin**: `cyrius = "6.2.28"` in `cyrius.cyml`. CI + release
   both read from the manifest — no hardcoded versions in YAML.
 - **Tag filter**: release workflow triggers on `v[0-9]+.[0-9]+.[0-9]+`
   and `[0-9]+.[0-9]+.[0-9]+`. Version-verify step asserts
