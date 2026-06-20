@@ -267,10 +267,20 @@ implementation, not just planning.
 Three items roll to **3.4.1** (the core array/cube capability ships in 3.4.0
 without them):
 
-1. **AA.4 — native 2D-array compressed (tiled) storage + sample.** BC-only,
-   addrlib-gated (the SW_64KB_S slice-stride / `ARRAY_PITCH` / `COPY_TILED
-   copy_d` open question, AA.4a). Niche vs RGBA8 arrays + cubes; high-risk. The
-   array/cube primitives + loaders ship RGBA8/uncompressed in 3.4.0.
+1. **[DONE 3.4.1] AA.4 — native 2D-array compressed (tiled) storage + sample.**
+   HW-verified on Cezanne (`native_bc_array_e2e`: BC1 2-slice tiled array, both
+   slices sample correctly). **AA.4a investigation** (research workflow) resolved
+   the open question: `GFX9_SW_MODE_64KB_S = 9` is a **2D** swizzle, so each slice
+   is an independent 64KiB-aligned 2D tiling — slice k sits at the computed byte
+   stride `base + k*tiled_size` (the single-slice footprint), no addrlib port, not
+   HW-blocked. `ARRAY_PITCH (W5[13:16]) = 0` confirmed correct (non-mipped). Three
+   code changes: `_native_create_layered_sampleable` branches compressed → tiled
+   (`surf_size = tiled_size*slices`, SW_64KB_S 2D_ARRAY/CUBE T#); the tiled copy +
+   packet builder take a `slice` param (`tiled_va + slice*tiled_size`);
+   `write_layer_level` unblocks tiled → per-slice L2T. Slice-offset math CPU-guard
+   (`test_native_bc_array_tiled_copy_slice_offset`); +8 asserts (suite 4514→4522).
+   BC array `.dds`/`.ktx2` flow through the 3.4.0 loaders (per-image
+   `write_layer_level`) with no parser change.
 2. **[DONE 3.4.1] AA.3c — wgpu draw-time layer selection.** HW-verified on
    Cezanne (wgpu/Vulkan). `_backend_wgpu_texture_bind_for_sample_layer` stashes the
    layer on the pass (+40, sentinel −1 = none); the draw stages a 16-B uniform

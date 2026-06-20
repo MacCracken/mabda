@@ -732,6 +732,15 @@ build/native_array_cube_load_e2e: programs/native_array_cube_load_e2e.cyr src/*.
 test-native-array-cube-load-e2e: build/native_array_cube_load_e2e
 	./build/native_array_cube_load_e2e
 
+# v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
+build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_bc_array_e2e.cyr $@
+
+.PHONY: test-native-bc-array-e2e
+test-native-bc-array-e2e: build/native_bc_array_e2e
+	./build/native_bc_array_e2e
+
 # v3.2 TS.6 — SDMA tiling probe: L2T->T2L round-trip proves the SW_64KB_S
 # COPY_TILED_SUB_WINDOW path works on Cezanne. HW-gated.
 build/native_sdma_tiled_roundtrip: programs/native_sdma_tiled_roundtrip.cyr src/*.cyr

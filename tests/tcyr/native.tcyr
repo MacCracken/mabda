@@ -760,9 +760,15 @@ fn test_native_texture_write_layer_level() {
     GPU_ERR_NOT_IMPLEMENTED, "level != 0 -> not-impl (mipped array later)");  #skip-lint
     assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0, 0, &src, 8),
     GPU_ERR_BUFFER, "n != per_slice -> BUFFER");
+    # v3.4.1 AA.4 — tiled array upload now routes to the per-slice L2T copy (it
+    # was a fail-loud reject pre-AA.4). This fake tex is RGBA8 (uncompressed) forced
+    # to a tiled sw_mode — an invalid combo: the tiled copy has no tiled params for a
+    # non-compressed format, so it rejects with TEXTURE (never silently wrong). The
+    # real BC1 tiled-array upload + sample is HW-verified (native_bc_array_e2e) and
+    # the slice-offset math is test_native_bc_array_tiled_copy_slice_offset.
     native_tex_set_sw_mode(&tex, GFX9_SW_MODE_64KB_S);
     assert_eq(_backend_native_texture_write_layer_level(&ctxf, &tex, 0, 0, &src, 16),
-    GPU_ERR_NOT_IMPLEMENTED, "tiled array upload fails loud (AA.4)");  #skip-lint
+    GPU_ERR_TEXTURE, "tiled upload of a non-compressed tex rejected");
     return 0;
 }
 
@@ -3985,9 +3991,38 @@ fn test_native_rt_create_rejects_nonpositive_dims() {
     return 0;
 }
 
+# v3.4.1 AA.4 — tiled compressed array per-slice copy: the SDMA packet targets
+# slice k at tiled_va = base + k*tiled_size (the 64KB_S 2D-swizzle slice stride).
+# A fake BC1 tex; the packet's tiled VA is at DW1/2 (buf+4 lo, buf+8 hi).
+fn test_native_bc_array_tiled_copy_slice_offset() {
+    var tex[64];
+    memset(&tex, 0, 64);
+    store64((&tex) + NATIVE_TEX_FIELD_VA, 0x100000);
+    store32((&tex) + NATIVE_TEX_FIELD_FMT, MABDA_TEXFMT_BC1);
+    store32((&tex) + NATIVE_TEX_FIELD_WIDTH, 16);
+    store32((&tex) + NATIVE_TEX_FIELD_HEIGHT, 16);
+    native_tex_set_sw_mode(&tex, GFX9_SW_MODE_64KB_S);
+    var tp[56];
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC1, 16, 16, &tp), 0, "BC1 tiled params");
+    var tiled_size = load64((&tp) + 32);
+    assert_eq(tiled_size > 0, 1, "tiled_size (slice stride) > 0");
+    var buf0[56];
+    var buf1[56];
+    memset(&buf0, 0, 56);
+    memset(&buf1, 0, 56);
+    assert_eq(native_tex_build_tiled_copy_packet(&buf0, &tex, 0x200000, 0, 0), 56, "packet slice 0");
+    assert_eq(native_tex_build_tiled_copy_packet(&buf1, &tex, 0x200000, 0, 1), 56, "packet slice 1");
+    assert_eq(load32((&buf0) + 4), 0x100000, "slice 0 tiled VA lo = base");
+    assert_eq(load32((&buf0) + 8), 0, "slice 0 tiled VA hi = 0");
+    assert_eq(load32((&buf1) + 4), 0x100000 + tiled_size, "slice 1 tiled VA = base + tiled_size");
+    assert_eq(load32((&buf1) + 8), 0, "slice 1 tiled VA hi = 0");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_native_bc_array_tiled_copy_slice_offset();
     test_native_ioc_encode_directions();
     test_native_ioc_encode_size_in_bits_16_to_29();
     test_native_ioc_encode_type_and_nr();
