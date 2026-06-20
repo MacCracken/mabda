@@ -63,13 +63,17 @@ implementation, not just planning.
   back-compat). +16 asserts (backend 464→473 slot/size pins; native 1401→1408
   field-offset + accessor round-trip + t_va-no-overlap). Suite 4276→4292;
   smoke/lint/fmt/distlib green.
-- [ ] **AA.0b** — `texture.cyr`: `gpu_texture_create_2d_array(ctx,w,h,fmt,layers)`
-  / `gpu_texture_create_cube(ctx,size,fmt,mip_count)` (faces=6 implicit) /
-  `gpu_texture_write_layer_level(ctx,tex,layer,level,src,n)` thin dispatchers
-  (fncallN through the new slots). `gpu_caps_native_texture_array` / `_cube`
-  (default 0 until fillers land). **`MABDA_MAX_TEXTURE_ARRAY_LAYERS` gate (256)**
-  before any layers·faces multiply. Null slots → `GPU_ERR_NOT_IMPLEMENTED`.
-  Dispatch + validation + caps tests.
+- [x] **AA.0b (2026-06-19)** — `texture.cyr`: `gpu_texture_create_2d_array` /
+  `gpu_texture_create_cube` (faces=6 implicit) / `gpu_texture_write_layer_level`
+  dispatchers — the two creates fncall5, write_layer_level **fncall6**
+  (Cyrius-to-Cyrius, like `gpu_compute_dispatch` — the fncall6-into-extern-C wgpu
+  hazard doesn't apply to a Cyrius filler). `MABDA_MAX_TEXTURE_ARRAY_LAYERS = 256`
+  (texture_format.cyr) bounds layers before any multiply. **Null-slot guards**
+  (slot == 0 → 0 for create, `GPU_ERR_NOT_IMPLEMENTED` for write) so the unfilled
+  AA.0 slots don't fncall on null. `gpu_caps_native_texture_array` / `_cube`
+  (backend_native.cyr, default 0; flip at AA.1/AA.2/AA.5/AA.7b). +35 asserts
+  (backend 473→508: dispatch + guards + null-slot + caps). Suite 4292→4327;
+  smoke/lint/fmt/vet/distlib green.
 
 ## Phase AA.1 — Native 2D-array create + per-slice upload (storage) [M]
 
@@ -104,8 +108,8 @@ implementation, not just planning.
   Descriptor byte-offset asserts.
 - [ ] **AA.3b** — wgpu `create_2d_array` (2DArray view) + `write_layer_level`
   (writeTexture origin.z) + a `texture_2d_array` WGSL FS; grow the 32-B wgpu tex
-  wrapper with layer count + view dim. HW-verify on a wgpu box **or defer-gate
-  (flagged — dev box is native Cezanne, not wgpu)**.
+  wrapper with layer count + view dim. **HW-verify on this box** (wgpu-native +
+  Vulkan/RADV present).
 
 ## Phase AA.4 — Native 2D-array compressed (tiled) [M]
 
@@ -131,8 +135,8 @@ implementation, not just planning.
   gated (cube storage from AA.5a still ships, `caps_cube` stays 0)** — flagged,
   not silently dropped.
 - [ ] **AA.5c** — wgpu cube create (depthOrArrayLayers=6, Cube view) + 6-face
-  upload + a `texture_cube` WGSL FS; validate width==height. HW-verify on a wgpu
-  box **or defer-gate (flagged)**.
+  upload + a `texture_cube` WGSL FS; validate width==height. **HW-verify on this
+  box** (wgpu-native present).
 
 ## Phase AA.6 — DDS/KTX2 array + cube loader integration [M]
 
@@ -189,8 +193,11 @@ implementation, not just planning.
    a kind the backend can't sample.
 7. **ETC2/ASTC array/cube stay HW-blocked on AMD** — native compressed-array
    (AA.4) is BC-only, matching the existing 2D cap.
-8. **wgpu HW-verify is box-dependent** — the dev box is the Cezanne native GPU;
-   AA.3b/AA.5c ship CPU-asserted (descriptor/view byte shapes) with the wgpu HW
-   e2e gated + flagged, never claimed verified without a wgpu box.
+8. **wgpu HW-verify runs on this box.** `deps/wgpu-native/lib/libwgpu_native.so`
+   + the `wgpu_main.c` launcher + Vulkan/RADV (RENOIR = Cezanne) are all present,
+   so the wgpu path runs here via `make test-phase0` / `test-gpu` — AA.3b/AA.5c
+   get real HW verification (same silicon as native, through Vulkan vs DRM).
+   (The `.so` predates the 6.2.26 bump; a `test-phase0` smoke at AA.3 confirms it
+   still links — only if that drifts do the wgpu bites fall back to CPU-asserted.)
 9. **`MABDA_MAX_TEXTURE_ARRAY_LAYERS` gate** (AA.0b, 256) bounds layers·faces
    before it scales any offset (GFX9 DEPTH[0:12] max 4095 slices).

@@ -1125,6 +1125,12 @@ fn mabda_texfmt_to_wgpu(fmt): i64 {
 # validate_dimensions share one bound.
 var MABDA_MAX_TEXTURE_DIM_2D = 8192;
 
+# v3.4 AA.0 — max array layers (and per-cube faces ride the same bound). WebGPU
+# requires maxTextureArrayLayers >= 256; GFX9 T# DEPTH is [0:12] (max 4095
+# slices). 256 is the safe portable floor; the loaders + create gate layers
+# against this BEFORE any layers*faces multiply (untrusted-header overflow guard).
+var MABDA_MAX_TEXTURE_ARRAY_LAYERS = 256;
+
 # Number of blocks spanning `dim` texels for a block edge of `b`:
 # ceil(dim / b) = (dim + b - 1) / b. Returns 0 for a non-positive dim or
 # block edge (invalid input).
@@ -14379,6 +14385,15 @@ fn gpu_caps_native_texture_compression(): i64 {
     return NATIVE_TEXCOMP_SUPPORTED;
 }
 
+# v3.4 AA.0 — does the native AMD path support 2D ARRAY textures / CUBEMAPS
+# (create + sample)? Returns 0 here; array support flips at AA.1/AA.2
+# (create+sample HW-verified), cube at AA.5b (gated on Cezanne cube-filter
+# reliability); AA.7b flips both at the cut (3-4 punchlist). Scaffold default = 0.
+var NATIVE_TEXTURE_ARRAY_SUPPORTED = 0;
+var NATIVE_TEXTURE_CUBE_SUPPORTED  = 0;
+fn gpu_caps_native_texture_array(): i64 { return NATIVE_TEXTURE_ARRAY_SUPPORTED; }
+fn gpu_caps_native_texture_cube(): i64 { return NATIVE_TEXTURE_CUBE_SUPPORTED; }
+
 # v3.2 F.2 — the native f64 ANSWER (unlike the wgpu side, native needs no probe — there is
 # ground truth): does the native AMD path support f64 compute? The HW does, but mabda can only
 # EMIT f64 once the Phase N SPIR-V→GFX9 f64 emitter lands (F.7), so this returns MABDA_NATIVE_F64
@@ -19873,6 +19888,62 @@ fn gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_count): i64 {
     var slot = backend_get_slot(gpu_ctx_backend(ctx),
     BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED);
     return fncall5(slot, ctx, width, height, fmt, mc);
+}
+
+# v3.4 AA.0 — create a 2D ARRAY texture: `layers` slices of (width x height) in
+# `fmt`, single-level (mipped arrays ride write_layer_level per level later).
+# Returns a texture handle or 0 (invalid args, or the backend slot unfilled —
+# the create primitive lands in AA.1 native / AA.3 wgpu). # @public
+fn gpu_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (layers < 1)  { return 0; }
+    if (layers > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }   # untrusted-layer bound
+    if (mabda_texfmt_block_bytes(fmt) == 0) { return 0; }       # unknown format id
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY);
+    if (slot == 0) { return 0; }   # filler wired in AA.1/AA.3 (3-4 punchlist)
+    return fncall5(slot, ctx, width, height, fmt, layers);
+}
+
+# v3.4 AA.0 — create a CUBEMAP texture: 6 faces of (size x size) in `fmt`,
+# mip_count levels (0 = full chain). Faces are +X,-X,+Y,-Y,+Z,-Z. Returns a
+# handle or 0 (invalid args / slot unfilled — cube create lands in AA.5). # @public
+fn gpu_texture_create_cube(ctx, size, fmt, mip_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (size <= 0) { return 0; }
+    if (mabda_texfmt_block_bytes(fmt) == 0) { return 0; }
+    if (validate_dimensions(size, size, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var full = mip_level_count(size, size);
+    var mc = mip_count;
+    if (mc == 0) { mc = full; }
+    if (mc < 1) { return 0; }
+    if (mc > full) { return 0; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_CREATE_CUBE);
+    if (slot == 0) { return 0; }   # filler wired in AA.5 (3-4 punchlist)
+    return fncall5(slot, ctx, size, fmt, mc);
+}
+
+# v3.4 AA.0 — upload one array layer / cube face at one mip level. `layer` is the
+# slice index (0..layers-1, or the 0..5 face for a cube); `level` the mip. The
+# slot dispatch is fncall6 (Cyrius-to-Cyrius, like gpu_compute_dispatch — safe;
+# the fncall6-into-extern-C wgpu hazard does not apply to a Cyrius backend filler).
+# Returns 0 on success, else a GPU_ERR_* (the not-impl error if the slot is unfilled). # @public
+fn gpu_texture_write_layer_level(ctx, tex, layer, level, src, n): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx),
+    BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    return fncall6(slot, ctx, tex, layer, level, src, n);
 }
 
 # v3.1 [M.6b]: fill mip levels 1..N-1 of `tex` (from gpu_texture_create_2d_rgba8_mipped)
