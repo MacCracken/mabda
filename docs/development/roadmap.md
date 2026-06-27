@@ -248,9 +248,10 @@ the `Backend` interface:
   nouveau-vs-nvidia.ko decision and the SASS/PTX choice.
 
 **Exit criteria**
-- All v3.0 exit programs pass under `native` on NVIDIA hardware
-  (specific generation TBD during v4.0 scoping; likely Ampere or
-  Lovelace as the bring-up class).
+- All v3.0 exit programs pass under `native` on NVIDIA hardware. The
+  bring-up hardware ladder — Turing first (GTX 1660 Super), then
+  Ampere (RTX 3060 12 GB), one card per generation — is tracked in
+  [nvidia-bringup-hardware.md](nvidia-bringup-hardware.md).
 - soorat (smoke-test consumer) builds and runs under
   `BACKEND_KIND_NVIDIA` in CI on NVIDIA hardware.
 - The NVIDIA work doesn't regress AMD or wgpu paths.
