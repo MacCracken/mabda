@@ -1,0 +1,78 @@
+# programs/nvidia_texture_e2e.cyr — v4.0 Phase N6 — NVIDIA native texture
+# create/write/read roundtrip through the PUBLIC mabda API.
+#
+# Proves the v1 Backend texture slots (88..120) on the NVIDIA backend: create
+# a 2D RGBA8 host-visible linear texture, write a known pixel pattern, read it
+# back, verify byte-identical. (GPU sampling via Turing TIC/TSC descriptors is
+# a later N6 bite; this is the CPU-side image lifecycle.)
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-texture-e2e`.
+#
+# Exit codes:
+#   0 success   1 context   2 texture_create   3 write   4 read   5 mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var b[32];
+    memset(&b, 0, 32);
+    var len = fmt_int_buf(n, &b);
+    syscall(1, 1, &b, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA texture roundtrip via PUBLIC API (v4.0 Phase N6)\n");
+    print_cstr("------------------------------------------------------------\n");
+
+    var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+    if (ctx == 0) { print_cstr("FAIL: context\n"); return 1; }
+    print_cstr("context created\n");
+
+    # 16x16 RGBA8 = 1024 bytes.
+    var w = 16;
+    var h = 16;
+    var nbytes = w * h * 4;
+    var tex = gpu_texture_create_2d_rgba8(ctx, w, h);
+    if (tex == 0) { print_cstr("FAIL: texture_create\n"); gpu_context_release(ctx); return 2; }
+    print_cstr("texture created (16x16 RGBA8)\n");
+
+    # Deterministic pixel pattern.
+    var src[1024];
+    var i = 0;
+    while (i < nbytes) {
+        store8(&src + i, (i * 7 + 13) & 0xFF);
+        i = i + 1;
+    }
+    if (gpu_texture_write(ctx, tex, &src, nbytes) != 0) {
+        print_cstr("FAIL: texture_write\n"); gpu_context_release(ctx); return 3;
+    }
+    print_cstr("pattern written\n");
+
+    var dst[1024];
+    memset(&dst, 0, 1024);
+    if (gpu_texture_read(ctx, tex, &dst, nbytes) != 0) {
+        print_cstr("FAIL: texture_read\n"); gpu_context_release(ctx); return 4;
+    }
+
+    # Verify byte-identical.
+    var j = 0;
+    while (j < nbytes) {
+        if (load8(&dst + j) != load8(&src + j)) {
+            print_cstr("FAIL: mismatch at byte "); print_i64(j); print_cstr("\n");
+            gpu_context_release(ctx); return 5;
+        }
+        j = j + 1;
+    }
+    print_cstr("readback byte-identical ("); print_i64(nbytes); print_cstr(" bytes)\n");
+
+    gpu_texture_release(ctx, tex);
+    gpu_context_release(ctx);
+    print_cstr("OK: NVIDIA texture create/write/read roundtrip via the public API\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -328,6 +328,17 @@ build/nvidia_compute_api: programs/nvidia_compute_api.cyr src/*.cyr
 test-nvidia-compute-api: build/nvidia_compute_api
 	./build/nvidia_compute_api
 
+# v4.0 Phase N6 — NVIDIA texture create/write/read roundtrip through the
+# PUBLIC mabda API (gpu_texture_*). Host-visible linear RGBA8; CPU roundtrip
+# (GPU sampling is a later N6 bite). Requires nouveau hardware; not in CI.
+build/nvidia_texture_e2e: programs/nvidia_texture_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_texture_e2e.cyr $@
+
+.PHONY: test-nvidia-texture-e2e
+test-nvidia-texture-e2e: build/nvidia_texture_e2e
+	./build/nvidia_texture_e2e
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

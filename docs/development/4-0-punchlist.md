@@ -1,8 +1,9 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 + N4.7 done and HW-proven on the TU116 —
-the N4 compute arc gate is GREEN and the NVIDIA backend is wired into the
-public API (2026-06-28). Next front: N6 textures.**
+**Status:** In progress. **N0–N5.3 + N4.7 + N6 v1-texture-slots done and
+HW-proven on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA
+backend is in the public API, and texture create/write/read roundtrips
+(2026-06-28). Next front: N6.2 (TIC/TSC + GPU sampling), then N7 render.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -20,16 +21,16 @@ public API (2026-06-28). Next front: N6 textures.**
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N6** — textures (`native_nv_texture_*`,
-> Turing TIC/TSC descriptors, fill v1 texture slots 88..120 on the NVIDIA
-> backend, `nvidia_texture_e2e.cyr`). The v0 compute path is done end-to-end
-> (raw gate + public API).
+> **Resume here (next session):** **N6.2** — Turing TIC/TSC descriptor
+> builders + a GPU-sampling dispatch (the sampled-texel half of N6.4), then
+> **N7** render. The v0 compute path (raw gate + public API) and the v1
+> texture create/write/read roundtrip are done end-to-end.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
 > compute store (`-compute-store`)**, **N4.7 public-API compute
-> (`-compute-api`)**. CPU suite: `tests/tcyr/nvidia.tcyr` (145 asserts).
-> ADR 007 **Accepted**.
+> (`-compute-api`)**, **N6 texture roundtrip (`-texture-e2e`)**. CPU suite:
+> `tests/tcyr/nvidia.tcyr` (160 asserts). ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -521,19 +522,28 @@ an afternoon to a few days.
 
 ### N6 — Textures
 
-- [ ] **N6.1** — `native_nv_texture_create_2d_rgba8` — a linear (or
-  block-linear) image BO; reuse the N2 allocator + a texture VA range.
-  **CPU assert:** size formula, struct layout, VA-range isolation.
+- [x] **N6.1** — `_backend_nvidia_texture_create_2d_rgba8` landed
+  (`backend_nvidia.cyr`) — a host-visible **linear** RGBA8 image BO (row
+  pitch = width*4, no tiling) VM_BIND'd at a fresh VA via the bump
+  allocator; dims capped (`validate_dimensions`) so width*height*4 can't
+  overflow; v0 surfaces fit one 64 KiB BO (<=128x128). **CPU assert:**
+  NV_TEX field map + struct size + RGBA8 tag (`nvidia.tcyr`).
 - [ ] **N6.2** — Turing TIC (Texture Image Control) + TSC (Texture
   Sampler Control) descriptor builders in a pool BO; `texfmt`→TIC format
   map (the GFX9 T#/S# analogue). **CPU assert:** TIC/TSC layout + format
-  mapping.
-- [ ] **N6.3** — Fill v1 texture slots (88..120) on the NVIDIA backend
-  (create/write/read/release) — write/read are bounds-checked memcpy on
-  the mapping for host-visible images.
-- [ ] **N6.4** — `programs/nvidia_texture_e2e.cyr` (mirrors
-  `native_texture_e2e.cyr`). **EXIT:** a sampled texel reads back correct.
-  HW-gated.
+  mapping. **(Next N6 bite — gates GPU sampling.)**
+- [x] **N6.3** — v1 texture slots (88..120) filled on the NVIDIA backend
+  (create_2d_rgba8 / write / read / release) — write/read are bounds-checked
+  memcpy on the coherent host mapping. Wired in `backend_nvidia_new`; the
+  texture-range `backend_is_complete` walk passes for NVIDIA (render range
+  still zero, so the backend stays honestly incomplete). **CPU asserts** in
+  `nvidia.tcyr` (slots non-zero + field map).
+- [~] **N6.4** — `programs/nvidia_texture_e2e.cyr` + `make
+  test-nvidia-texture-e2e` landed and **passing on HW**: create a 16x16
+  RGBA8 texture, write a pattern, read it back **byte-identical**, through
+  the PUBLIC `gpu_texture_*` API. The **GPU-sampled-texel** variant (a
+  compute/render dispatch sampling via TIC/TSC) is deferred with N6.2 — the
+  CPU create/write/read roundtrip is the v1-slot proof.
 
 ### N7 — Render pipeline + render pass
 
@@ -600,6 +610,21 @@ an afternoon to a few days.
 
 ## Tier 2 — Ship work
 
+- [ ] **Bundle the NVIDIA modules into the dist (`[lib].modules`) + enable
+  compile-time routing.** The v4.0 NVIDIA modules
+  (`backend_nvidia_nouveau` / `_sass` / `_push` / `_qmd` / `backend_nvidia`)
+  are deliberately **source-only** today — in `src/lib.cyr`'s include chain
+  (so programs + CPU tests build) but **NOT** in `cyrius.cyml` `[lib].modules`
+  (so `dist/mabda.cyr` still ships v3.4.4 without them). At the v4.0 cut, add
+  them to `[lib].modules` in dependency order (after `backend_native_amdgpu`
+  for `native_syncobj_*` / `native_open_render_node`; the integration module
+  last) AND re-enable the deferred `MABDA_BACKEND_KIND==NVIDIA` branch in
+  `gpu_context_from_preinit` (`src/context.cyr` — currently a comment). These
+  two flips are a **pair**: a bundled `gpu_context_from_preinit` can't call
+  `gpu_context_new_native_nvidia()` until that fn is in the bundle. Then
+  `cyrius distlib` regen + verify the bundle compiles clean for a consumer
+  (no unresolved NVIDIA symbol). Mirrors how the AMD modules joined the
+  bundle at v3.0.
 - [ ] **Bench harness — 4-axis matrix.** Widen `bench-history.csv` /
   `make bench-gpu` to vendor × {wgpu, native} × {pre-/post-5.6.x} ×
   bench; add NVIDIA rows; AMD's table is unaffected. **Perf-credibility
