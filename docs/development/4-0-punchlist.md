@@ -1,12 +1,12 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
 **Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1
-(render target) + N7.2a (NVK draw capture/decode) done on the TU116 — the N4
-compute arc gate is GREEN, the NVIDIA backend is in the public API, the GPU
-samples textures, render targets allocate, and the full TURING_A (0xC597) draw
-method stream is decoded + adversarially verified into a mabda render design
-(2026-06-28). Next front: N7.2 — the clc597 method encoders (a
-`native_nv_push_draw`), then N7.3 SPH+SASS, N7.4 the HW draw e2e.**
+(render target) + N7.2a (NVK draw capture/decode) + N7.2 (clc597 draw encoder)
+done on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA backend is in
+the public API, the GPU samples textures, render targets allocate, and
+`native_nv_push_draw` builds the full verified TURING_A draw pushbuffer
+(CPU-asserted, 2026-06-28). Next front: N7.3 — the SM75 VS/FS as SPH+SASS
+blobs, then N7.4 the HW draw e2e.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -24,19 +24,20 @@ method stream is decoded + adversarially verified into a mabda render design
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N7.2 — the clc597 method encoders.** N7.1
-> (render-target lifecycle, slots 120/128) + N7.2a (NVK draw capture + 4-group
-> adversarial decode) are done. The full TURING_A (0xC597) draw method stream
-> is decoded + verified into a complete mabda render design in
-> [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). N7.2 writes
-> `native_nv_push_draw` in `backend_nvidia_push.cyr` from that verified
-> sequence (framebuffer → viewport/scissor → raster/cull → shader bind →
-> topology → fused `SET_DRAW_CONTROL` + `DRAW_VERTEX_ARRAY_BEGIN_END`),
-> NVIF-creates the `0xC597` class alongside compute, and CPU-asserts every
-> method dword. Then N7.3 (SPH+SASS VS/FS) and N7.4 (HW draw e2e — resolve the
-> L2-flush + vertex-distributor risks). Done: v0 compute (raw + public API), v1
-> texture roundtrip, N6.2 GPU sampling, N7.1 render-target, **N7.2a NVK draw
-> capture/decode**.
+> **Resume here (next session):** **N7.3 — the SM75 VS/FS as SPH+SASS blobs.**
+> N7.2 (`native_nv_push_draw`, the full clc597 draw encoder) is done +
+> CPU-asserted. N7.3 builds the two graphics programs in
+> `backend_nvidia_sass.cyr`: a fullscreen-triangle VS (positions from
+> `gl_VertexID`) and a solid-color FS, each as a **128-byte SPH + SM75 SASS**
+> blob (program address points at the SPH, SASS at +0x80; regcount 24). Capture
+> via ptxas/NAK — the SPH trailing imap/omap must come from a real compile (the
+> public spec only covers the 80-byte classic header). Include the
+> inactive-attribute markers for the vertex-less VS. Then N7.4 wires the v2
+> render slots (136..168) + `programs/nvidia_render_e2e.cyr` (HW: 3D class +
+> linear RT + VS/FS + the draw + L2 flush + CPU-read → solid color). Design +
+> open risks: [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). Done:
+> v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
+> draw capture/decode, **N7.2 clc597 draw encoder**.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -623,12 +624,16 @@ an afternoon to a few days.
   **128-byte SPH** before the SASS (`PROGRAM_ADDRESS` points at it, SASS at
   +0x80). Two open HW risks flagged for N7.4: an **L2/ROP→memory flush** before
   the CPU read, and the **vertex-distributor** inactive-attribute markers.
-- [ ] **N7.2** — `TURING_A` 3D class (0xC597) method encoders + draw in
-  `backend_nvidia_push.cyr` (a `native_nv_push_draw`, the render analogue of
-  `native_nv_push_dispatch`). Build the exact verified sequence from the N7
-  notes (framebuffer → viewport/scissor → raster/cull → shader bind → topology
-  → fused draw). Also NVIF-create the `0xC597` class alongside compute. **CPU
-  assert:** every method offset + state value pinned (the N7 notes give them).
+- [x] **N7.2** — **DONE (CPU).** `native_nv_push_draw` (`backend_nvidia_push.cyr`)
+  builds the full clc597 (TURING_A `0xC597`) draw pushbuffer from the verified
+  N7.2a design — SET_OBJECT(0xC597) on subc0 → surface clip + **LINEAR** color
+  target (byte pitch, MEMORY=LAYOUT_PITCH) + CT select/write → viewport/scissor
+  (scale = w/2,h/2 via `native_int_to_f32_bits`) → raster gate + cull + disables
+  → VS/FS bind (programs point at the SPH) → must-emit topology-control →
+  fused `SET_DRAW_CONTROL_A/B` + `DRAW_VERTEX_ARRAY_BEGIN_END_A/B`. Takes a
+  56-byte `NV_DRAW_PARAMS` struct; 288-byte / 72-dword stream. **CPU asserts**
+  pin every load-bearing method/arg (`nvidia.tcyr` `test_nv_push_draw`, 257
+  total). The `0xC597` NVIF-create wires into the context at N7.4 (HW).
 - [ ] **N7.3** — SM75 VS + FS as **SPH(128B)+SASS** blobs in
   `backend_nvidia_sass.cyr` (fullscreen-triangle VS from `gl_VertexID`,
   solid-color FS), via ptxas/NAK; SPH trailing region from a real compile,

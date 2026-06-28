@@ -556,6 +556,81 @@ fn test_nv_push_dispatch_sample() {
     return 0;
 }
 
+# N7.2 — the clc597 (TURING_A 0xC597) draw pushbuffer. Pins every load-bearing
+# method/arg of native_nv_push_draw against the N7.2a verified design
+# (docs/development/nvidia-n7-capture-notes.md): the linear color target
+# (pitch/MEMORY=LAYOUT_PITCH), the RGBA write mask + raster gate, the VS/FS
+# program binds, the must-emit topology-control, and the fused Turing draw.
+# Headers are re-derived via the method-encoding primitives (checks
+# method+op+imm); INCR args are pinned literally. (qmd-free; bare 3D draw.)
+fn test_nv_push_draw() {
+    var dp[56];
+    memset(&dp, 0, 56);
+    store64(&dp + NV_DRAW_RT_VA,       0x130000);
+    store64(&dp + NV_DRAW_RT_WIDTH,    64);
+    store64(&dp + NV_DRAW_RT_HEIGHT,   64);
+    store64(&dp + NV_DRAW_VS_VA,       0x140000);
+    store64(&dp + NV_DRAW_FS_VA,       0x150000);
+    store64(&dp + NV_DRAW_VS_REGCOUNT, 24);
+    store64(&dp + NV_DRAW_FS_REGCOUNT, 24);
+
+    var buf[512];
+    memset(&buf, 0, 512);
+    var len = native_nv_push_draw(&buf, &dp);
+    assert_eq(len, 288, "draw push = 288 bytes (72 dwords)");
+
+    # SET_OBJECT = 3D class (0xC597) on the graphics subchannel (0).
+    assert_eq(load32(&buf + 0) & 0xFFFFFFFF,
+    native_nv_method_header(NV_OP_INCR, NV_GRAPHICS_SUBC, NVC5C0_SET_OBJECT, 1), "SET_OBJECT header subc0");
+    assert_eq(load32(&buf + 4), 0xC597, "SET_OBJECT arg = TURING_A");
+    assert_eq(TURING_A, 0xC597, "TURING_A class const");
+
+    # Linear color target (the key N7 result): byte pitch + LAYOUT_PITCH.
+    assert_eq(load32(&buf + 12) & 0xFFFFFFFF, 0x00400000, "SURFACE_CLIP_H = width<<16 (64)");
+    assert_eq(load32(&buf + 28), 0x130000, "COLOR_TARGET ADDRESS_LOWER = rt_va");
+    assert_eq(load32(&buf + 32), 0x100, "COLOR_TARGET WIDTH = byte pitch (256)");
+    assert_eq(load32(&buf + 40), 0xD5, "COLOR_TARGET FORMAT = A8B8G8R8");
+    assert_eq(load32(&buf + 44) & 0xFFFFFFFF, 0x1000, "COLOR_TARGET MEMORY = LAYOUT_PITCH");
+    assert_eq(load32(&buf + 48), 1, "COLOR_TARGET THIRD_DIMENSION = 1");
+    assert_eq(load32(&buf + 52), 0, "COLOR_TARGET ARRAY_PITCH = 0 (linear)");
+
+    # The two silent-blank gates: RGBA write mask + raster enable.
+    assert_eq(load32(&buf + 68) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_CT_WRITE, 0x1111), "CT_WRITE = RGBA mask 0x1111");
+    assert_eq(load32(&buf + 148) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_RASTER_ENABLE, 1), "RASTER_ENABLE = 1 (the gate)");
+
+    # Viewport scale = width/2, height/2, 1.0 as f32 (NDC -> [0,64]).
+    assert_eq(load32(&buf + 80) & 0xFFFFFFFF, 0x42000000, "VIEWPORT_SCALE_X = 32.0 (width/2)");
+    assert_eq(load32(&buf + 88) & 0xFFFFFFFF, 0x3F800000, "VIEWPORT_SCALE_Z = 1.0");
+
+    # VS (stage 1) + FS (stage 5) bind; program addr lower = the SPH VA.
+    assert_eq(load32(&buf + 184) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, 0x2040, 0x11), "SET_PIPELINE_SHADER(1) = enable|VERTEX");
+    assert_eq(load32(&buf + 196), 0x140000, "VS PROGRAM_ADDRESS_B = vs_va");
+    assert_eq(load32(&buf + 204), 24, "VS REGISTER_COUNT = 24");
+    assert_eq(load32(&buf + 224) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, 0x2140, 0x51), "SET_PIPELINE_SHADER(5) = enable|PIXEL");
+    assert_eq(load32(&buf + 236), 0x150000, "FS PROGRAM_ADDRESS_B = fs_va");
+    assert_eq(load32(&buf + 244), 24, "FS REGISTER_COUNT = 24");
+    assert_eq(load32(&buf + 248), 4, "FS BINDING group = FRAGMENT(4)");
+
+    # Topology (must-emit control) + the fused Turing draw.
+    assert_eq(load32(&buf + 252) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_PRIMITIVE_TOPOLOGY_CONTROL, 1),
+    "PRIMITIVE_TOPOLOGY_CONTROL = SEPARATE (must-emit, not in capture)");
+    assert_eq(load32(&buf + 256) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_PRIMITIVE_TOPOLOGY, 4), "PRIMITIVE_TOPOLOGY = TRIANGLELIST");
+    assert_eq(load32(&buf + 268) & 0xFFFFFFFF, 0x200, "DRAW_CONTROL_A = INSTANCE_ITERATE_ENABLE");
+    assert_eq(load32(&buf + 272), 1, "DRAW_CONTROL_B = instance_count 1");
+    assert_eq(load32(&buf + 276) & 0xFFFFFFFF,
+    native_nv_method_header(NV_OP_INCR, NV_GRAPHICS_SUBC, NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_A, 2),
+    "DRAW_VERTEX_ARRAY_BEGIN_END_A header");
+    assert_eq(load32(&buf + 280), 0, "BEGIN_END_A = first_vertex 0");
+    assert_eq(load32(&buf + 284), 3, "BEGIN_END_B = vertex_count 3 (fires the draw)");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -591,5 +666,6 @@ fn main() {
     test_nv_tic_build_uint();
     test_nv_sass_sample_tex();
     test_nv_push_dispatch_sample();
+    test_nv_push_draw();
     return assert_summary();
 }

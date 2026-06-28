@@ -202,3 +202,208 @@ fn native_nv_push_dispatch_sample(dst, qmd_va, tic_pool_va, tsc_pool_va): i64 {
     n = n + 4;
     return n;
 }
+
+# ================================================================
+# N7.2 — clc597 (TURING_A 3D) draw-pushbuffer builder
+# ================================================================
+# The render analogue of native_nv_push_dispatch: builds the full Turing 3D
+# method stream for a solid-color triangle into a LINEAR RGBA8 color target.
+# Every offset/value is the verified design from the N7.2a capture decode —
+# see docs/development/nvidia-n7-capture-notes.md (4-group adversarially
+# verified vs clc597.h / NVK / nvc0 gallium / envytools). NVK issues the draw
+# + clear through on-GPU MME macros mabda cannot use; this builder emits their
+# DIRECT clc597 method equivalents.
+#
+# The 3D class binds on subchannel 0 (the NVK capture; compute is subc 1).
+var TURING_A         = 0xC597;
+var NV_GRAPHICS_SUBC = 0;
+
+# clc597 method byte-offsets (mthd>>2 fits the 13-bit header field; all < 0x8000).
+var NVC597_SET_SURFACE_CLIP_HORIZONTAL     = 0x0FF4;   # INCR2: H(X|W<<16), V(Y|H<<16)
+var NVC597_SET_COLOR_TARGET_A              = 0x0800;   # INCR9 block (slot 0)
+var NVC597_SET_COLOR_COMPRESSION           = 0x19E0;   # slot0 (IMMD)
+var NVC597_SET_CT_SELECT                   = 0x121C;
+var NVC597_SET_CT_WRITE                    = 0x1A00;   # slot0 RGBA write mask
+var NVC597_SET_ZT_SELECT                   = 0x1538;
+var NVC597_SET_VIEWPORT_SCALE_X            = 0x0A00;   # INCR6: scale xyz, offset xyz
+var NVC597_SET_VIEWPORT_COORDINATE_SWIZZLE = 0x0A18;
+var NVC597_SET_VIEWPORT_CLIP_HORIZONTAL    = 0x0C00;   # INCR4: H, V, MIN_Z, MAX_Z
+var NVC597_SET_SCISSOR_ENABLE              = 0x0E00;   # INCR3: enable, H, V
+var NVC597_SET_RASTER_ENABLE               = 0x037C;
+var NVC597_OGL_SET_CULL                    = 0x1918;
+var NVC597_OGL_SET_FRONT_FACE              = 0x191C;
+var NVC597_SET_DEPTH_TEST                  = 0x12CC;
+var NVC597_SET_DEPTH_WRITE                 = 0x12E8;
+var NVC597_SET_STENCIL_TEST                = 0x1380;
+var NVC597_SET_BLEND                       = 0x1360;   # slot0
+var NVC597_SET_ANTI_ALIAS                  = 0x15D0;
+var NVC597_SET_PIPELINE_SHADER             = 0x2000;   # +stage*0x40 (IMMD enable|type<<4)
+var NVC597_SET_PIPELINE_REGISTER_COUNT     = 0x200C;   # +stage*0x40 (INCR2: count, binding)
+var NVC597_SET_PIPELINE_PROGRAM_ADDRESS_A  = 0x2014;   # +stage*0x40 (INCR2: upper, lower)
+var NVC597_SET_PRIMITIVE_TOPOLOGY_CONTROL  = 0x1948;
+var NVC597_SET_PRIMITIVE_TOPOLOGY          = 0x1970;
+var NVC597_SET_DA_PRIMITIVE_RESTART        = 0x1644;
+var NVC597_SET_DRAW_CONTROL_A              = 0x0260;   # INCR2 with _B (instance_count)
+var NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_A   = 0x0270;   # INCR2 with _B (count) -> fires draw
+
+# Field values.
+var NVC597_PIPELINE_STAGE_STRIDE     = 0x40;
+var NVC597_STAGE_VERTEX              = 1;   # SET_PIPELINE_SHADER index/type for VS
+var NVC597_STAGE_PIXEL              = 5;    # ... and FS
+var NVC597_SHADER_ENABLE            = 1;    # bit0
+var NVC597_FORMAT_A8B8G8R8          = 0xD5; # RGBA8 (R at byte0)
+var NVC597_COLOR_TARGET_MEMORY_PITCH = 0x1000;  # MEMORY LAYOUT_PITCH (bit12) — linear
+var NVC597_TOPOLOGY_TRIANGLELIST    = 4;
+var NVC597_TOPOLOGY_USE_SEPARATE    = 1;   # SET_PRIMITIVE_TOPOLOGY_CONTROL.OVERRIDE
+var NVC597_CT_WRITE_RGBA            = 0x1111;   # R|G|B|A enable (bits 0/4/8/12)
+var NVC597_DRAW_CONTROL_A_DEFAULT   = 0x200;    # INSTANCE_ITERATE_ENABLE (bit9)
+var NVC597_FRONT_FACE_CCW           = 0x901;
+
+# NVIDIA draw-params struct (56 bytes) the builder reads. rt_va is the color
+# target GPU VA; width/height are pixels (the byte row pitch is derived as
+# align(width*4, 128)); vs_va/fs_va point AT the 128-byte SPH of each program;
+# vs/fs regcount = the SASS num_gprs.
+var NV_DRAW_RT_VA       = 0;
+var NV_DRAW_RT_WIDTH    = 8;
+var NV_DRAW_RT_HEIGHT   = 16;
+var NV_DRAW_VS_VA       = 24;
+var NV_DRAW_FS_VA       = 32;
+var NV_DRAW_VS_REGCOUNT = 40;
+var NV_DRAW_FS_REGCOUNT = 48;
+var NV_DRAW_PARAMS_SIZE = 56;
+
+# Emit helpers (return the advanced byte offset) — keep the long draw builder
+# readable. All on the 3D subchannel.
+fn _nv_g_incr(dst, n, mthd, count): i64 {
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_GRAPHICS_SUBC, mthd, count));
+    return n + 4;
+}
+fn _nv_g_imm(dst, n, mthd, imm): i64 {
+    store32(dst + n, native_nv_method_inline(NV_GRAPHICS_SUBC, mthd, imm));
+    return n + 4;
+}
+fn _nv_g_arg(dst, n, val): i64 {
+    store32(dst + n, val);
+    return n + 4;
+}
+
+# Stage-relative pipeline method offset (SHADER / REGISTER_COUNT / PROGRAM_ADDRESS
+# blocks all stride 0x40 per stage).
+fn _nv_pipe_mthd(base, stage): i64 {
+    return base + stage * NVC597_PIPELINE_STAGE_STRIDE;
+}
+
+# Build the full draw pushbuffer into `dst` (caller-owned, >= ~300 bytes) from
+# the draw-params struct `dp`. Returns the byte length (the EXEC push va_len).
+# Sequence: SET_OBJECT(0xC597) -> framebuffer (surface clip + linear color
+# target + CT select/write) -> viewport/scissor -> raster/cull + disables ->
+# VS/FS bind -> topology -> the fused Turing draw. No clear (a fullscreen
+# triangle covers every pixel); completion is the nouveau EXEC syncobj.
+fn native_nv_push_draw(dst, dp): i64 {
+    var rt_va  = load64(dp + NV_DRAW_RT_VA);
+    var width  = load64(dp + NV_DRAW_RT_WIDTH);
+    var height = load64(dp + NV_DRAW_RT_HEIGHT);
+    var vs_va  = load64(dp + NV_DRAW_VS_VA);
+    var fs_va  = load64(dp + NV_DRAW_FS_VA);
+    var vs_rc  = load64(dp + NV_DRAW_VS_REGCOUNT);
+    var fs_rc  = load64(dp + NV_DRAW_FS_REGCOUNT);
+
+    var pitch    = (width * 4 + 127) / 128 * 128;   # row pitch in bytes (128-aligned)
+    var clip_h   = width * 0x10000;                 # X=0 | WIDTH<<16
+    var clip_v   = height * 0x10000;                # Y=0 | HEIGHT<<16
+    var scale_x  = native_int_to_f32_bits(width / 2);
+    var scale_y  = native_int_to_f32_bits(height / 2);
+    var one_f32  = native_int_to_f32_bits(1);       # 1.0f (scale_z, max_z)
+
+    var n = 0;
+    # SET_OBJECT = 3D class on subc 0.
+    n = _nv_g_incr(dst, n, NVC5C0_SET_OBJECT, 1);
+    n = _nv_g_arg(dst, n, TURING_A);
+
+    # --- framebuffer: surface clip + LINEAR color target + select/write ---
+    n = _nv_g_incr(dst, n, NVC597_SET_SURFACE_CLIP_HORIZONTAL, 2);
+    n = _nv_g_arg(dst, n, clip_h);
+    n = _nv_g_arg(dst, n, clip_v);
+    n = _nv_g_incr(dst, n, NVC597_SET_COLOR_TARGET_A, 9);
+    n = _nv_g_arg(dst, n, (rt_va / 0x100000000) & 0xFF);     # ADDRESS_UPPER (VA 39:32)
+    n = _nv_g_arg(dst, n, rt_va);                            # ADDRESS_LOWER (VA 31:0)
+    n = _nv_g_arg(dst, n, pitch);                            # WIDTH = byte pitch (LAYOUT_PITCH)
+    n = _nv_g_arg(dst, n, height);                           # HEIGHT = rows
+    n = _nv_g_arg(dst, n, NVC597_FORMAT_A8B8G8R8);           # FORMAT
+    n = _nv_g_arg(dst, n, NVC597_COLOR_TARGET_MEMORY_PITCH); # MEMORY = LAYOUT_PITCH
+    n = _nv_g_arg(dst, n, 1);                                # THIRD_DIMENSION
+    n = _nv_g_arg(dst, n, 0);                                # ARRAY_PITCH (0 for linear)
+    n = _nv_g_arg(dst, n, 0);                                # LAYER
+    n = _nv_g_imm(dst, n, NVC597_SET_COLOR_COMPRESSION, 0);  # off (required for linear)
+    n = _nv_g_imm(dst, n, NVC597_SET_CT_SELECT, 1);          # 1 active RT, slot0
+    n = _nv_g_imm(dst, n, NVC597_SET_CT_WRITE, NVC597_CT_WRITE_RGBA);  # RGBA write mask
+    n = _nv_g_imm(dst, n, NVC597_SET_ZT_SELECT, 0);          # no depth target
+
+    # --- viewport + scissor ---
+    n = _nv_g_incr(dst, n, NVC597_SET_VIEWPORT_SCALE_X, 6);
+    n = _nv_g_arg(dst, n, scale_x);   # SCALE_X = width/2
+    n = _nv_g_arg(dst, n, scale_y);   # SCALE_Y = height/2
+    n = _nv_g_arg(dst, n, one_f32);   # SCALE_Z = 1.0
+    n = _nv_g_arg(dst, n, scale_x);   # OFFSET_X = width/2
+    n = _nv_g_arg(dst, n, scale_y);   # OFFSET_Y = height/2
+    n = _nv_g_arg(dst, n, 0);         # OFFSET_Z = 0
+    n = _nv_g_incr(dst, n, NVC597_SET_VIEWPORT_COORDINATE_SWIZZLE, 1);
+    n = _nv_g_arg(dst, n, 0x6420);    # identity swizzle (X,Y,Z,W)
+    n = _nv_g_incr(dst, n, NVC597_SET_VIEWPORT_CLIP_HORIZONTAL, 4);
+    n = _nv_g_arg(dst, n, clip_h);    # H = X|W<<16
+    n = _nv_g_arg(dst, n, clip_v);    # V = Y|H<<16
+    n = _nv_g_arg(dst, n, 0);         # MIN_Z = 0.0
+    n = _nv_g_arg(dst, n, one_f32);   # MAX_Z = 1.0
+    n = _nv_g_incr(dst, n, NVC597_SET_SCISSOR_ENABLE, 3);
+    n = _nv_g_arg(dst, n, 1);         # enable
+    n = _nv_g_arg(dst, n, clip_h);    # H = XMIN|XMAX<<16
+    n = _nv_g_arg(dst, n, clip_v);    # V = YMIN|YMAX<<16
+
+    # --- raster gate + cull + state disables (insurance on a bare channel) ---
+    n = _nv_g_imm(dst, n, NVC597_SET_RASTER_ENABLE, 1);      # THE fragment gate
+    n = _nv_g_imm(dst, n, NVC597_OGL_SET_CULL, 0);           # no back-face cull
+    n = _nv_g_incr(dst, n, NVC597_OGL_SET_FRONT_FACE, 1);
+    n = _nv_g_arg(dst, n, NVC597_FRONT_FACE_CCW);
+    n = _nv_g_imm(dst, n, NVC597_SET_DEPTH_TEST, 0);
+    n = _nv_g_imm(dst, n, NVC597_SET_DEPTH_WRITE, 0);
+    n = _nv_g_imm(dst, n, NVC597_SET_STENCIL_TEST, 0);
+    n = _nv_g_imm(dst, n, NVC597_SET_BLEND, 0);
+    n = _nv_g_imm(dst, n, NVC597_SET_ANTI_ALIAS, 0);
+
+    # --- VS (stage 1) + FS (stage 5) bind; program addr points AT the SPH ---
+    n = _nv_g_imm(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_SHADER, NVC597_STAGE_VERTEX),
+    NVC597_SHADER_ENABLE | NVC597_STAGE_VERTEX * 0x10);
+    n = _nv_g_incr(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_PROGRAM_ADDRESS_A, NVC597_STAGE_VERTEX), 2);
+    n = _nv_g_arg(dst, n, (vs_va / 0x100000000) & 0xFF);
+    n = _nv_g_arg(dst, n, vs_va);
+    n = _nv_g_incr(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_REGISTER_COUNT, NVC597_STAGE_VERTEX), 2);
+    n = _nv_g_arg(dst, n, vs_rc);
+    n = _nv_g_arg(dst, n, 0);         # BINDING group = VERTEX(0)
+    # disable the in-between stages (TCS/TES/GS) for a reused channel.
+    n = _nv_g_imm(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_SHADER, 2), 2 * 0x10);
+    n = _nv_g_imm(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_SHADER, 3), 3 * 0x10);
+    n = _nv_g_imm(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_SHADER, 4), 4 * 0x10);
+    n = _nv_g_imm(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_SHADER, NVC597_STAGE_PIXEL),
+    NVC597_SHADER_ENABLE | NVC597_STAGE_PIXEL * 0x10);
+    n = _nv_g_incr(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_PROGRAM_ADDRESS_A, NVC597_STAGE_PIXEL), 2);
+    n = _nv_g_arg(dst, n, (fs_va / 0x100000000) & 0xFF);
+    n = _nv_g_arg(dst, n, fs_va);
+    n = _nv_g_incr(dst, n, _nv_pipe_mthd(NVC597_SET_PIPELINE_REGISTER_COUNT, NVC597_STAGE_PIXEL), 2);
+    n = _nv_g_arg(dst, n, fs_rc);
+    n = _nv_g_arg(dst, n, 4);         # BINDING group = FRAGMENT(4)
+
+    # --- topology + the fused Turing draw (replaces NVK's MME draw macro) ---
+    # SET_PRIMITIVE_TOPOLOGY_CONTROL=SEPARATE is MUST-EMIT: NVK pins it at
+    # channel init, it is NOT in the capture, and the fresh-context default is
+    # undefined — without it 0x1970 is ignored and topology falls back to POINTS.
+    n = _nv_g_imm(dst, n, NVC597_SET_PRIMITIVE_TOPOLOGY_CONTROL, NVC597_TOPOLOGY_USE_SEPARATE);
+    n = _nv_g_imm(dst, n, NVC597_SET_PRIMITIVE_TOPOLOGY, NVC597_TOPOLOGY_TRIANGLELIST);
+    n = _nv_g_imm(dst, n, NVC597_SET_DA_PRIMITIVE_RESTART, 0);
+    n = _nv_g_incr(dst, n, NVC597_SET_DRAW_CONTROL_A, 2);
+    n = _nv_g_arg(dst, n, NVC597_DRAW_CONTROL_A_DEFAULT);   # DRAW_CONTROL_A
+    n = _nv_g_arg(dst, n, 1);                               # DRAW_CONTROL_B = instance_count
+    n = _nv_g_incr(dst, n, NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_A, 2);
+    n = _nv_g_arg(dst, n, 0);                               # BEGIN_END_A = first_vertex
+    n = _nv_g_arg(dst, n, 3);                               # BEGIN_END_B = vertex_count -> fires the draw
+    return n;
+}
