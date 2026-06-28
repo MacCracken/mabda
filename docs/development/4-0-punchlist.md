@@ -21,14 +21,14 @@ backend is in the public API, and texture create/write/read roundtrips
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N6.2c** — a bound-texture sampling SASS
-> (TIC0/TSC0, `nvdisasm`-verified) + a sampling dispatch (alloc TIC/TSC pool
-> BOs, write descriptors via the N6.2b builders, emit
-> `SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + `SEND_PCAS`) →
-> `programs/nvidia_texture_sample_e2e.cyr` reads a GPU-sampled texel. Then
-> **N7** render. The v0 compute path (raw gate + public API), the v1 texture
-> roundtrip, the NVK-sampling capture/decode (N6.2a), and the TIC/TSC builders
-> (N6.2b) are done.
+> **Resume here (next session):** **N6.2c-ii** — the sampling **dispatch** +
+> `programs/nvidia_texture_sample_e2e.cyr` (HW): alloc TIC/TSC pool BOs, write
+> the N6.2b descriptors at TIC index 0 / TSC index 0x58, a sampling pushbuffer
+> (`SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + invalidates + `SEND_PCAS`),
+> QMD (program = `native_nv_sass_sample_tex`, regcount 10, out @ +0x168) →
+> read a GPU-sampled texel. Then **N7** render. Done: v0 compute (raw + public
+> API), v1 texture roundtrip, N6.2a sampling capture, N6.2b TIC/TSC builders,
+> N6.2c-i sampling SASS.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -550,12 +550,20 @@ an afternoon to a few days.
   C). **Key correction:** mabda emits `HEADER_VERSION=PITCH(2)`, NOT the
   golden's BLOCKLINEAR — linear data would gob-swizzle otherwise. **CPU
   asserts** pin every dword (`nvidia.tcyr` 176; full decode in the N6 notes).
-- [ ] **N6.2c** — a bound-texture sampling SASS (`backend_nvidia_sass.cyr`,
-  TIC0/TSC0) verified via the N5.2 `nvdisasm` oracle + a sampling dispatch
-  (alloc TIC/TSC pool BOs, write descriptors, emit
-  `SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + `SEND_PCAS`).
-  `programs/nvidia_texture_sample_e2e.cyr` — **EXIT: a GPU-sampled texel is
-  correct.** HW-gated. (Closes the sampled-texel half of N6.4.)
+- [x] **N6.2c-i** — **bound-texture sampling SASS — DONE.**
+  `native_nv_sass_sample_tex` (`backend_nvidia_sass.cyr`): ptxas capture of
+  `store_tex.cu` (`tex2D` → pack → store), 256 B / 16 instrs. Bound TEX
+  (TIC 0 / TSC 0x58 immediates), output ptr @ `c[0x0][0x168]`, REG:10; the
+  captured `STG.E.SYS` patched to `.STRONG.GPU` (`.SYS` hangs on GART — the
+  store-kernel finding), `nvdisasm`-verified. **CPU asserts** pin the bytes +
+  ABI (`nvidia.tcyr` 186).
+- [ ] **N6.2c-ii** — the sampling **dispatch** + `nvidia_texture_sample_e2e.cyr`
+  (HW). Alloc TIC/TSC pool BOs, write the N6.2b descriptors at TIC index 0 /
+  TSC index 0x58, a sampling pushbuffer (`SET_TEX_HEADER_POOL`/
+  `SET_TEX_SAMPLER_POOL` + invalidates + `SEND_PCAS`), QMD (program = sample
+  SASS, regcount 10, out @ +0x168), EXEC + wait → **a GPU-sampled texel reads
+  back correct.** Byte-diff the pools + pushbuffer vs the N6.2a golden. Closes
+  N6.4. Full plan in [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md).
 - [x] **N6.3** — v1 texture slots (88..120) filled on the NVIDIA backend
   (create_2d_rgba8 / write / read / release) — write/read are bounds-checked
   memcpy on the coherent host mapping. Wired in `backend_nvidia_new`; the

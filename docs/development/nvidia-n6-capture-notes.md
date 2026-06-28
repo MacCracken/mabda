@@ -156,3 +156,41 @@ program address (a TEX shader) and regcount differ.
 
 This closes the sampled-texel half of N6.4. The N6.1/N6.3 v1 texture slots
 (CPU create/write/read/release) are already done + HW-proven.
+
+## N6.2c-i — the mabda sampling SASS (DONE)
+
+`native_nv_sass_sample_tex` (`src/backend_nvidia_sass.cyr`) is the ptxas
+capture of `tools/nvidia-capture/store_tex.cu` (`tex2D<uchar4>` → pack →
+store), 256 B / 16 instrs, CPU-asserted (`nvidia.tcyr`). Key facts the
+sampling dispatch (N6.2c-ii) must honor:
+
+- **BOUND TEX**: `TEX.SCR.LL R4, R2, R6, R2, 0x0, 0x58, 2D` — TIC index **0**,
+  TSC index **0x58** as immediates. The dispatch writes mabda's TIC at TIC-pool
+  index 0 and TSC at TSC-pool index 0x58 (byte offset 0x58*32 = 0xB00).
+- **Output ptr** at `c[0x0][0x168]` (ptxas param ABI; note +0x168, not the
+  store kernel's +0x160 — the unused `cudaTextureObject_t` param sits at +0x160).
+- **REGISTER_COUNT = 10** (the QMD's REGISTER_COUNT_V).
+- **GPU-scope store**: the captured `STG.E.SYS` control word `0x..c10e904`
+  was patched to `.STRONG.GPU` `0x..c114904` — `.SYS` hangs on a GART output
+  BO (the proven store-kernel finding); round-trips through `nvdisasm`.
+- **Coord** is a clamp-friendly constant (`R2 = -32.0f`) → texel (0,0) on a
+  **1×1** NEAREST/CLAMP texture. Use a 1×1 texture for the proof; arbitrary
+  coords/sizes are a follow-up.
+
+## N6.2c-ii — the sampling dispatch (REMAINING, HW)
+
+Build a sampling dispatch + `programs/nvidia_texture_sample_e2e.cyr`:
+1. Alloc a TIC pool BO + a TSC pool BO (host, VM_BIND'd); write
+   `native_nv_tic_build_2d_rgba8` at TIC index 0 (pointing at a 1×1 texture
+   BO holding a known texel) and `native_nv_tsc_build_nearest_clamp` at TSC
+   index 0x58.
+2. A sampling pushbuffer variant of `native_nv_push_dispatch` that also emits
+   `SET_TEX_HEADER_POOL`(0x1574, A/B/C = pool_hi, pool_lo, max_index) +
+   `SET_TEX_SAMPLER_POOL`(0x155c) + the texture-header/sampler cache
+   invalidates (0x0244 / 0x1424) before `SEND_PCAS`.
+3. QMD: program = `native_nv_sass_sample_tex`, regcount = 10, cbuf0 = a param
+   bank with the output VA at +0x168.
+4. EXEC + wait (absolute deadline). Read back the packed RGBA8 texel; expect
+   the value written into the texture. **Byte-diff the TIC/TSC pools + the
+   dispatch pushbuffer against the N6.2a golden capture before trusting it**
+   (the PM4/QMD protocol — a wrong bit silently hangs).

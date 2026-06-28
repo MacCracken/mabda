@@ -21,6 +21,7 @@ regenerates it, is preserved.
 | `vk_compute_tex.c` | **N6.2** headless NVK Vulkan compute **sampling** app: uploads a 1×1 RGBA8 texel, samples it (NEAREST/clamp), packs + stores. Captures the golden TIC/TSC descriptors + the sampling SASS (bound-texture model). Decoded in [`../../docs/development/nvidia-n6-capture-notes.md`](../../docs/development/nvidia-n6-capture-notes.md). |
 | `probe_tex.comp` | The GLSL sampling shader (`v[0] = packUnorm4x8(texture(tex, vec2(0.5)))`). |
 | `store_deadbeef.cu` | The CUDA kernel for the **ptxas SASS capture** (N5.1) + the `libdevice` non-contamination hygiene check (ADR 007). |
+| `store_tex.cu` | **N6.2c** CUDA `tex2D` kernel — the ptxas **sampling SASS** capture source (bound TEX, TIC 0 / TSC 0x58, out ptr @ `c[0x0][0x168]`). Embedded (STG patched to GPU scope) as `native_nv_sass_sample_tex` in `src/backend_nvidia_sass.cyr`. |
 | `run_capture.sh` | Builds everything and runs the dispatch under the interposer → `./nvcap/`. |
 | `cuda-hygiene-check.sh` | ADR 007 build-hygiene: compiles `store_deadbeef.cu` for `sm_75`, dumps SASS, verifies no `libdevice`/Attachment-A contamination, prints the EULA sections. |
 
