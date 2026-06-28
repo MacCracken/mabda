@@ -390,6 +390,18 @@ build/nvidia_render_api: programs/nvidia_render_api.cyr src/*.cyr
 test-nvidia-render-api: build/nvidia_render_api
 	./build/nvidia_render_api
 
+# v4.0 Phase N8.1 — NVIDIA KMS topology probe. Confirms nouveau exposes
+# standard DRM atomic KMS on its card node and walks the display topology
+# (connectors / encoders / CRTCs / preferred modes). GETRESOURCES/GETCONNECTOR
+# work in any session (no DRM master); needs read perm on /dev/dri/cardN.
+build/nvidia_kms_summary: programs/nvidia_kms_summary.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_summary.cyr $@
+
+.PHONY: test-nvidia-kms-summary
+test-nvidia-kms-summary: build/nvidia_kms_summary
+	./build/nvidia_kms_summary
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.
