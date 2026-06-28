@@ -2,11 +2,12 @@
 
 Decoded reference for building mabda's native compute dispatch (N4), from
 a **known-good NVK compute dispatch captured on the TU116** (2026-06-27).
-The raw capture + harness live in the session scratch dir (per the
-punchlist, capture bytes do **not** go in the repo); this file records the
-**decoded understanding** N4 builds against. Re-capture anytime with the
-harness (`nouveau_capture.c` LD_PRELOAD interposer + `vk_compute.c`
-headless NVK dispatch + `run_capture.sh`).
+The capture **harness** is preserved at **`tools/nvidia-capture/`**
+(`nouveau_capture.c` LD_PRELOAD interposer + `vk_compute.c` headless NVK
+dispatch + `run_capture.sh`); the raw capture **bytes** it produces do
+**not** go in the repo (per the punchlist) — this file records the
+**decoded understanding** N4 builds against. Re-capture anytime with
+`tools/nvidia-capture/run_capture.sh` (needs `cuda` + `vulkan-headers`).
 
 Capture is **headless over SSH** — Vulkan/NVK compute needs only the render
 node, no display/DRM-master.

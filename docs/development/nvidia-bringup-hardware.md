@@ -28,7 +28,7 @@ this document, never machine-local state.
 
 | # | GPU | Generation | Status |
 |---|-----|-----------|--------|
-| 1 | GTX 1660 Super | Turing | **current target** — wgpu/Vulkan path validated on hardware (full wgpu E2E suite passes); **host now swapped to nouveau (N0.6 done, see below)**; NVIDIA native backend at N0.7/N1 |
+| 1 | GTX 1660 Super | Turing | **current target** — on **nouveau** (host swap done, see below). Native backend **N0–N3 + N5.1/5.2 done & HW-proven**; **N4 compute arc gate in progress (not yet green)** — see [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) |
 | 2 | RTX 3060 12 GB | Ampere | queued — begins after the 1660 native bring-up lands |
 
 **Deliberately skipped**

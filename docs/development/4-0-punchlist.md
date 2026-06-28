@@ -1,8 +1,26 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** Working document — not started. Tick items off as they land.
+**Status:** In progress (2026-06-27). **N0–N3 + N5.1/5.2 done and
+HW-proven on the TU116; N4 (compute arc gate) is the active front.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
+
+> **Resume here (next session):** the arc gate
+> `programs/nvidia_compute_store.cyr` is **not yet green**. The full
+> pure-Cyrius pipeline builds + runs through `EXEC` and the SASS shader
+> executes on HW, but a generic **global-store completion hangs** (syncobj
+> ETIME, no fault). Five causes were eliminated on HW (windows, VA height,
+> BO domain, page-kind, store scope); the remaining cause is **insufficient
+> channel/dispatch init** (NVK's fuller multi-class sequence /
+> replayable-fault setup). Full diagnosis, elimination log, and the
+> concrete next step are in
+> [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) § N4
+> implementation status. The NVK-capture harness (to re-capture the
+> known-good stream) is preserved at `tools/nvidia-capture/`.
+>
+> **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
+> (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`). CPU
+> suite: `tests/tcyr/nvidia.tcyr` (121 asserts). ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
