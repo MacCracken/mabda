@@ -1,0 +1,82 @@
+# @internal — native NVIDIA backend, Turing TIC/TSC descriptor builders
+# backend_nvidia_tex.cyr — the GFX9 T#/S#-builder analogue for the v4.0
+# NVIDIA arc (Phase N6.2b). Builds the two 32-byte Turing texture descriptors
+# the TEX unit reads when sampling in the BOUND model (the TEX instruction
+# names the TIC/TSC pool index as an immediate — see the N6.2a capture
+# findings in docs/development/nvidia-n6-capture-notes.md):
+#
+#   TIC — Texture Image Control ("texture header"): format, swizzle, address,
+#         layout (PITCH vs BLOCKLINEAR), dimensions.
+#   TSC — Texture Sampler Control: wrap modes + min/mag/mip filters.
+#
+# Field layout: envytools rnndb gm200_texture.xml (TIC v2, Maxwell2→Turing) +
+# g80_texture.xml (TSC) + g80_defs.xml (enums); every field byte-diffed
+# against the NVK golden descriptors captured on the TU116 (N6.2a). All shifts
+# are written as mul/div (the toolchain-safe idiom; see native_ioc_encode).
+#
+# **PITCH, not BLOCKLINEAR.** The N6.2a golden TIC was BLOCKLINEAR (NVK gave
+# its OPTIMAL-tiled image a gob-tiled layout). mabda's v0 textures are LINEAR
+# (row-major host BOs written by memcpy), so these builders emit
+# HEADER_VERSION = PITCH(2) with a real row pitch — a BLOCKLINEAR TIC would
+# make the TEX unit gob-swizzle the fetch and read garbage from linear data.
+# (A 1x1 image is byte-identical in both layouts, which is why the golden
+# 1x1 sampled correctly; the divergence shows from ~16x8 up.)
+
+# --- TIC (8 dwords / 32 bytes) constants ---
+# dw0: COMPONENTS_SIZES=A8B8G8R8(0x08) | R/G/B/A_DATA_TYPE=UNORM(2) each |
+#      X/Y/Z/W_SOURCE = R(2)/G(3)/B(4)/A(5). Constant for any RGBA8_UNORM.
+var NV_TIC_FORMAT_RGBA8_UNORM = 0x58D24908;
+# dw2 bits[23:21] HEADER_VERSION: PITCH=2 (linear), BLOCKLINEAR=3.
+var NV_TIC_HEADER_PITCH = 2;
+# dw3 bits[18:16] LOD_ISO/ANISO quality (NVK sets all three) + MAX_MIP_LEVEL=0.
+var NV_TIC_DW3_QUALITY = 0x00070000;
+# dw4 bits[26:23] TEXTURE_TYPE: TWO_D=1; bits[31:29] BORDER_SIZE=SAMPLER_COLOR(7).
+var NV_TIC_TYPE_2D = 1;
+var NV_TIC_BORDER_SAMPLER_COLOR = 7;
+# dw5 bit[31] NORMALIZED_COORDS (texture()/normalized [0,1] sampling).
+var NV_TIC_NORMALIZED_COORDS = 0x80000000;
+# dw6: ANISO_FINE/COARSE_SPREAD_FUNC NVK constants (irrelevant to NEAREST).
+var NV_TIC_DW6_DEFAULT = 0x03000000;
+
+# Build a PITCH-layout TIC for a linear RGBA8 2D image into `dst` (>=32 bytes).
+#   va     = image data GPU VA (32-byte aligned; mabda's 64 KiB-aligned VAs are)
+#   width  = texels across (>=1), height = rows (>=1)
+# Row pitch = round_up(width*4, 32) bytes (the PITCH field is bits[20:5], so a
+# 32-byte multiple). For tightly-packed linear data this matches the stored
+# stride when width*4 is a 32-byte multiple (width % 8 == 0); a 1x1 texel
+# (single row) samples correctly regardless. Returns 32.
+fn native_nv_tic_build_2d_rgba8(dst, va, width, height): i64 {
+    memset(dst, 0, 32);
+    var pitch = (width * 4 + 31) / 32 * 32;   # round_up(width*4, 32)
+    store32(dst + 0,  NV_TIC_FORMAT_RGBA8_UNORM);
+    store32(dst + 4,  va & 0xFFFFFFE0);                       # ADDRESS_BITS_31_5
+    store32(dst + 8,  ((va / 0x100000000) & 0xFFFF)           # ADDRESS_BITS_47_32
+    | (NV_TIC_HEADER_PITCH * 0x200000));                      # HEADER_VERSION<<21
+    store32(dst + 12, (pitch / 32) | NV_TIC_DW3_QUALITY);     # PITCH_BITS_20_5 | quality
+    store32(dst + 16, (width - 1)                             # WIDTH_MINUS_ONE
+    | (NV_TIC_TYPE_2D * 0x800000)                             # TEXTURE_TYPE<<23
+    | (NV_TIC_BORDER_SAMPLER_COLOR * 0x20000000));            # BORDER_SIZE<<29
+    store32(dst + 20, (height - 1) | NV_TIC_NORMALIZED_COORDS); # HEIGHT_MINUS_ONE | norm
+    store32(dst + 24, NV_TIC_DW6_DEFAULT);
+    # dst+28 (dw7) stays 0 (RES_VIEW mip range / MSAA / MIN_LOD_CLAMP all 0).
+    return 32;
+}
+
+# --- TSC (8 dwords / 32 bytes) ---
+# dw0: ADDRESS_U/V/W = CLAMP_TO_EDGE(2) at bits[2:0]/[5:3]/[8:6] | SRGB_CONVERSION
+#      (NVK default, no-op for UNORM) | FONT_FILTER_W/H=1 (NVK defaults) = 0x26092.
+# dw1: MAG_FILTER=NEAREST(1) bits[1:0] | MIN_FILTER=NEAREST(1) bits[5:4] |
+#      MIP_FILTER=NEAREST(2) bits[7:6] | CUBEMAP_INTERFACE_FILTERING (NVK) = 0x291.
+# Reproduces the N6.2a golden TSC byte-for-byte. dw2..dw7 = 0 (LOD clamps 0 ->
+# base level; border color unused under CLAMP_TO_EDGE).
+var NV_TSC_NEAREST_CLAMP_DW0 = 0x00026092;
+var NV_TSC_NEAREST_CLAMP_DW1 = 0x00000291;
+
+# Build a NEAREST-filter, CLAMP_TO_EDGE-wrap TSC into `dst` (>=32 bytes).
+# Returns 32.
+fn native_nv_tsc_build_nearest_clamp(dst): i64 {
+    memset(dst, 0, 32);
+    store32(dst + 0, NV_TSC_NEAREST_CLAMP_DW0);
+    store32(dst + 4, NV_TSC_NEAREST_CLAMP_DW1);
+    return 32;
+}

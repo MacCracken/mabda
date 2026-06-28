@@ -89,11 +89,43 @@ dw1 = 0x00000291
 dw2..dw7 = 0
 ```
 
-(Per-field bit decode of the TIC/TSC — sourced from Mesa NVK `nil/tic.c` /
-`nvk_sampler.c` + envytools `tic.xml`/`tsc.xml` — is the N6.2b reference; a
-research pass is fetching it. The build protocol is the PM4/QMD one:
-**byte-diff mabda's TIC/TSC builder against these golden dwords** before
-trusting it.)
+### Authoritative TIC/TSC field decode (N6.2b — built + CPU-asserted)
+
+Layout = envytools rnndb `gm200_texture.xml` (TIC v2, Maxwell2→Turing) +
+`g80_texture.xml`/`g80_defs.xml` (TSC + enums). Every field byte-diffed
+against the golden above. Implemented in `src/backend_nvidia_tex.cyr`
+(`native_nv_tic_build_2d_rgba8`, `native_nv_tsc_build_nearest_clamp`); CPU
+asserts in `tests/tcyr/nvidia.tcyr::test_nv_tic_tsc_build`. The empirical
+multi-size capture (`vk_compute_tex W H`) confirmed the dimension fields:
+8×4 → dw4 low=7, dw5 low=3; 64×1 → dw4 low=0x3f.
+
+**CRITICAL — the golden is BLOCKLINEAR, mabda must emit PITCH.** TIC dw2
+bits[23:21] = `HEADER_VERSION`; golden = 3 (`BLOCKLINEAR`). NVK gave its
+OPTIMAL-tiled image a gob-tiled layout. mabda's textures are row-major
+linear, so the builder emits `HEADER_VERSION = 2 (PITCH)` with a real pitch
+in dw3 — a BLOCKLINEAR TIC would gob-swizzle the fetch and read garbage from
+linear data (a 1×1 image is byte-identical in both, which is why the golden
+1×1 sampled OK; divergence shows from ~16×8 up).
+
+TIC fields (PITCH build, image @ VA `A`, width `W`, height `H`):
+- dw0 = `0x58D24908` — `A8B8G8R8` + UNORM×4 + swizzle X=R,Y=G,Z=B,W=A (const for RGBA8)
+- dw1 = `A & 0xFFFFFFE0` — `ADDRESS_BITS_31_5` (32 B aligned)
+- dw2 = `((A>>32)&0xFFFF) | (2<<21)` — addr hi | `HEADER_VERSION=PITCH`
+- dw3 = `(round_up(W*4,32)>>5) | 0x00070000` — `PITCH_BITS_20_5` | NVK LOD-quality
+- dw4 = `(W-1) | (1<<23) | (7<<29)` — `WIDTH_MINUS_ONE` | `TEXTURE_TYPE=2D` | `BORDER_SIZE=SAMPLER_COLOR`
+- dw5 = `(H-1) | (1<<31)` — `HEIGHT_MINUS_ONE` | `NORMALIZED_COORDS`
+- dw6 = `0x03000000` (aniso-spread NVK consts) · dw7 = 0
+
+TSC fields (NEAREST / CLAMP_TO_EDGE — reproduces the golden exactly):
+- dw0 = `0x00026092` — `ADDRESS_U/V/W = CLAMP_TO_EDGE(2)` | NVK sRGB/font defaults
+- dw1 = `0x00000291` — `MAG/MIN = NEAREST(1)`, `MIP = NEAREST(2)`, cubemap-filter default
+- dw2..dw7 = 0 (LOD clamps 0 → base level; border color unused under CLAMP)
+
+**Pitch caveat for N6.2c:** the PITCH field is a 32-byte multiple, so for
+tightly-packed linear data the row stride matches only when `W*4 % 32 == 0`
+(`W % 8 == 0`). A 1×1 sample (single row) is unaffected — use a 1×1 or
+8-aligned-width texture for the sampling proof; arbitrary-width linear
+sampling needs the texture written at the padded stride (a v0+ follow-up).
 
 ### Sampling QMD (256 B) — same shape as the N4 store QMD
 

@@ -409,6 +409,45 @@ fn test_nv_backend_v1_texture_slots() {
     return 0;
 }
 
+# N6.2b — Turing TIC/TSC descriptor builders, byte-diffed against the N6.2a
+# NVK golden (docs/development/nvidia-n6-capture-notes.md) + the empirical
+# multi-size capture. mabda emits PITCH (linear) TICs, not the golden's
+# BLOCKLINEAR — so dw0/dw1/dw4/dw5/dw6 match the golden (shared, ground-truth
+# validated) while dw2/dw3 carry the PITCH header + row pitch. (High-bit
+# dwords masked & 0xFFFFFFFF against load32 sign-extension.)
+fn test_nv_tic_tsc_build() {
+    var tic[32];
+    native_nv_tic_build_2d_rgba8(&tic, 0x3ffdf9c000, 1, 1);
+    assert_eq(load32(&tic +  0) & 0xFFFFFFFF, 0x58D24908, "TIC dw0 format = golden");
+    assert_eq(load32(&tic +  4) & 0xFFFFFFFF, 0xFDF9C000, "TIC dw1 addr_lo = golden");
+    assert_eq(load32(&tic +  8) & 0xFFFFFFFF, 0x0040003F, "TIC dw2 PITCH header (golden=0x60.. blocklinear)");
+    assert_eq(load32(&tic + 12) & 0xFFFFFFFF, 0x00070001, "TIC dw3 pitch=32 (golden gob=0x..00)");
+    assert_eq(load32(&tic + 16) & 0xFFFFFFFF, 0xE0800000, "TIC dw4 (W-1|2D|border) = golden");
+    assert_eq(load32(&tic + 20) & 0xFFFFFFFF, 0x80000000, "TIC dw5 (H-1|norm) = golden");
+    assert_eq(load32(&tic + 24) & 0xFFFFFFFF, 0x03000000, "TIC dw6 = golden");
+    assert_eq(load32(&tic + 28) & 0xFFFFFFFF, 0, "TIC dw7 = 0");
+
+    # Dimension + pitch parameterize correctly (cross-checked vs the empirical
+    # 8x4 / 16x16 captures: dw4 low = W-1, dw5 low = H-1, pitch = round_up(W*4,32)/32).
+    var tic2[32];
+    native_nv_tic_build_2d_rgba8(&tic2, 0x3ffdf9c000, 8, 4);
+    assert_eq(load32(&tic2 + 16) & 0xFFFF, 7, "TIC 8x4 WIDTH_MINUS_ONE = 7");
+    assert_eq(load32(&tic2 + 20) & 0xFFFF, 3, "TIC 8x4 HEIGHT_MINUS_ONE = 3");
+    assert_eq(load32(&tic2 + 12) & 0xFFFFFFFF, 0x00070001, "TIC 8x4 pitch = 32/32 = 1");
+    var tic3[32];
+    native_nv_tic_build_2d_rgba8(&tic3, 0x3ffdf9c000, 16, 16);
+    assert_eq(load32(&tic3 + 16) & 0xFFFF, 15, "TIC 16x16 WIDTH_MINUS_ONE = 15");
+    assert_eq(load32(&tic3 + 12) & 0xFFFFFFFF, 0x00070002, "TIC 16x16 pitch = 64/32 = 2");
+
+    # TSC reproduces the golden NEAREST / CLAMP_TO_EDGE descriptor exactly.
+    var tsc[32];
+    native_nv_tsc_build_nearest_clamp(&tsc);
+    assert_eq(load32(&tsc + 0) & 0xFFFFFFFF, 0x00026092, "TSC dw0 = golden (CLAMP_TO_EDGE)");
+    assert_eq(load32(&tsc + 4) & 0xFFFFFFFF, 0x00000291, "TSC dw1 = golden (NEAREST)");
+    assert_eq(load32(&tsc + 8) & 0xFFFFFFFF, 0, "TSC dw2 = 0 (LOD clamps to base)");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -439,5 +478,6 @@ fn main() {
     test_nv_backend_kind_reserved();
     test_nv_backend_v0_slots();
     test_nv_backend_v1_texture_slots();
+    test_nv_tic_tsc_build();
     return assert_summary();
 }

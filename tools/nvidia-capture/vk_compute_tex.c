@@ -30,6 +30,12 @@ static uint32_t mem_type(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFla
 
 int main(int argc, char** argv){
     const char* spv_path = argc>1 ? argv[1] : "probe_tex.spv";
+    // Optional W H (default 1x1) — used to triangulate the TIC width/height/
+    // pitch fields by diffing TICs across sizes (mabda N6.2b decode).
+    uint32_t TW = argc>2 ? (uint32_t)atoi(argv[2]) : 1;
+    uint32_t TH = argc>3 ? (uint32_t)atoi(argv[3]) : 1;
+    if(!TW)TW=1; if(!TH)TH=1;
+    fprintf(stderr,"texture %ux%u RGBA8\n",TW,TH);
 
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName="mabda-captex",.apiVersion=VK_API_VERSION_1_1};
@@ -52,7 +58,7 @@ int main(int argc, char** argv){
 
     // --- 1x1 RGBA8 sampled image (OPTIMAL tiling) ---
     VkImageCreateInfo ici2={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,
-        .format=VK_FORMAT_R8G8B8A8_UNORM,.extent={1,1,1},.mipLevels=1,.arrayLayers=1,
+        .format=VK_FORMAT_R8G8B8A8_UNORM,.extent={TW,TH,1},.mipLevels=1,.arrayLayers=1,
         .samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
         .usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
@@ -62,15 +68,18 @@ int main(int argc, char** argv){
         .memoryTypeIndex=mem_type(pd,imr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     VkDeviceMemory imem; CK(vkAllocateMemory(dev,&imai,0,&imem)); CK(vkBindImageMemory(dev,img,imem,0));
 
-    // staging buffer with the known texel RGBA = (0x11,0x22,0x33,0x44).
-    VkBufferCreateInfo sbci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4,
+    // staging buffer; texel (0,0) = RGBA (0x11,0x22,0x33,0x44), rest a ramp.
+    uint32_t TXN = TW*TH*4;
+    VkBufferCreateInfo sbci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=TXN,
         .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
     VkBuffer sbuf; CK(vkCreateBuffer(dev,&sbci,0,&sbuf));
     VkMemoryRequirements smr; vkGetBufferMemoryRequirements(dev,sbuf,&smr);
     VkMemoryAllocateInfo smai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=smr.size,
         .memoryTypeIndex=mem_type(pd,smr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
     VkDeviceMemory smem; CK(vkAllocateMemory(dev,&smai,0,&smem)); CK(vkBindBufferMemory(dev,sbuf,smem,0));
-    uint8_t* sp; CK(vkMapMemory(dev,smem,0,4,0,(void**)&sp)); sp[0]=0x11;sp[1]=0x22;sp[2]=0x33;sp[3]=0x44;
+    uint8_t* sp; CK(vkMapMemory(dev,smem,0,TXN,0,(void**)&sp));
+    for(uint32_t i=0;i<TXN;i++) sp[i]=(uint8_t)i;
+    sp[0]=0x11;sp[1]=0x22;sp[2]=0x33;sp[3]=0x44;
 
     // output storage buffer (host-visible, 4 bytes).
     VkBufferCreateInfo obci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4,
@@ -96,7 +105,7 @@ int main(int argc, char** argv){
         .oldLayout=VK_IMAGE_LAYOUT_UNDEFINED,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .image=img,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT};
     vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,0,0,0,1,&b1);
-    VkBufferImageCopy bic={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={1,1,1}};
+    VkBufferImageCopy bic={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={TW,TH,1}};
     vkCmdCopyBufferToImage(cb,sbuf,img,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bic);
     VkImageMemoryBarrier b2={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

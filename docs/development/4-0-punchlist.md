@@ -21,12 +21,14 @@ backend is in the public API, and texture create/write/read roundtrips
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N6.2b** — Turing TIC/TSC descriptor
-> builders (byte-diff vs the N6.2a golden in
-> [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md)), then **N6.2c**
-> the sampling SASS + dispatch (HW sampled-texel), then **N7** render. The v0
-> compute path (raw gate + public API), the v1 texture roundtrip, and the
-> NVK-sampling capture/decode (N6.2a) are done.
+> **Resume here (next session):** **N6.2c** — a bound-texture sampling SASS
+> (TIC0/TSC0, `nvdisasm`-verified) + a sampling dispatch (alloc TIC/TSC pool
+> BOs, write descriptors via the N6.2b builders, emit
+> `SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + `SEND_PCAS`) →
+> `programs/nvidia_texture_sample_e2e.cyr` reads a GPU-sampled texel. Then
+> **N7** render. The v0 compute path (raw gate + public API), the v1 texture
+> roundtrip, the NVK-sampling capture/decode (N6.2a), and the TIC/TSC builders
+> (N6.2b) are done.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -540,10 +542,14 @@ an afternoon to a few days.
   *bound* model, not bindless) and the dispatch is byte-shape-identical to the
   N4 store dispatch — so sampling needs only populated+bound TIC/TSC pools + a
   TEX shader, no new dispatch methods.
-- [ ] **N6.2b** — Turing TIC + TSC descriptor builders (32 B each: linear
-  RGBA8 2D image / NEAREST-clamp sampler), **byte-diffed against the N6.2a
-  golden**. **CPU assert:** every dword pinned. (Field layout from Mesa NVK
-  `nil/tic.c` / `nvk_sampler.c` — a research pass is fetching it.)
+- [x] **N6.2b** — **DONE.** `src/backend_nvidia_tex.cyr`:
+  `native_nv_tic_build_2d_rgba8` (PITCH-layout linear RGBA8 2D, arbitrary
+  W/H/VA) + `native_nv_tsc_build_nearest_clamp`, **byte-diffed against the
+  N6.2a golden** + the empirical multi-size capture. Field layout from
+  envytools `gm200_texture.xml`/`g80_texture.xml` (Mesa NIL is now Rust, not
+  C). **Key correction:** mabda emits `HEADER_VERSION=PITCH(2)`, NOT the
+  golden's BLOCKLINEAR — linear data would gob-swizzle otherwise. **CPU
+  asserts** pin every dword (`nvidia.tcyr` 176; full decode in the N6 notes).
 - [ ] **N6.2c** — a bound-texture sampling SASS (`backend_nvidia_sass.cyr`,
   TIC0/TSC0) verified via the N5.2 `nvdisasm` oracle + a sampling dispatch
   (alloc TIC/TSC pool BOs, write descriptors, emit
