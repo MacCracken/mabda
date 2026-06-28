@@ -265,4 +265,11 @@ All on subc0=3D. Op `INCRn` = n consecutive 4-byte methods from the offset;
   (the VertexID-only VS draws fine without them on a fresh channel). No param
   bank (self-contained shaders), no SET_SPA_VERSION, no shader-cache invalidate
   needed. So the minimal `native_nv_push_draw` sequence is sufficient on HW.
-  The v2 render-slot public-API wiring (136..168) is the remaining N7.5 piece.
+- **N7.5** — _DONE — N7 (render) COMPLETE._ The v2 render slots 136..168
+  (`render_pipeline_create/release`, `render_pass_begin/draw/end`) are wired on
+  the NVIDIA backend, so the render path is reachable through the PUBLIC
+  `gpu_render_*` API. `gpu_context_new_native_nvidia` NVIF-creates `0xC597`
+  alongside `0xC5C0`; `pass_draw` routes through `native_nv_push_draw` (now
+  `vertex_count`-parameterized) + EXEC. `make test-nvidia-render-api` reads back
+  `0xFF996633`. All 7 NVIDIA HW gates green (the `0xC597` context-create change
+  is regression-clean).

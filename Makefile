@@ -378,6 +378,18 @@ build/nvidia_render_e2e: programs/nvidia_render_e2e.cyr src/*.cyr
 test-nvidia-render-e2e: build/nvidia_render_e2e
 	./build/nvidia_render_e2e
 
+# v4.0 Phase N7.5 — NVIDIA native render through the PUBLIC gpu_render_* API
+# (v2 render slots 136..168). Same triangle as the N7.4 gate, but driven via
+# gpu_render_pipeline_* / gpu_render_pass_* — the backend-agnostic consumer
+# surface. Requires nouveau hardware; not in CI.
+build/nvidia_render_api: programs/nvidia_render_api.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_api.cyr $@
+
+.PHONY: test-nvidia-render-api
+test-nvidia-render-api: build/nvidia_render_api
+	./build/nvidia_render_api
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

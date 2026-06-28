@@ -182,6 +182,17 @@ fn gpu_context_new_native_nvidia(): i64 {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
+    # v2 render (N7.5): also create the Turing 3D class (TURING_A 0xC597) on the
+    # same channel so render_pass_draw's SET_OBJECT(0xC597) resolves. Distinct
+    # NVIF handle from compute (handle low byte = oclass&0xff: 0xC0 vs 0x97);
+    # channel_free reaps both at release, so no separate handle is stored.
+    var nvif_3d = native_nv_object_handle(chid, TURING_A);
+    rc = native_nv_object_new(fd, chid, nvif_3d, TURING_A);
+    if (rc != 0) {
+        var rc_save = rc; native_nv_channel_free(fd, chid); sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
     var ctx = alloc(GPU_CONTEXT_SIZE);
     memset(ctx, 0, GPU_CONTEXT_SIZE);
     store64(ctx + NV_CTX_FD, fd);
@@ -548,6 +559,126 @@ fn _backend_nvidia_render_target_release(ctx, rt): i64 {
 }
 
 # ================================================================
+# v2 render slots (136..168) — N7.5: pipeline / pass / draw
+# ================================================================
+# The public-API path to the HW-proven render mechanism (N7.4). Routes the
+# gpu_render_pipeline_* / gpu_render_pass_* calls through native_nv_push_draw.
+
+# NVIDIA render-pipeline struct (32 bytes): the VS/FS program VAs (each points
+# at its 128-byte SPH) + regcounts, pulled from the shader modules.
+var NV_PIPE_VS_VA       = 0;
+var NV_PIPE_FS_VA       = 8;
+var NV_PIPE_VS_REGCOUNT = 16;
+var NV_PIPE_FS_REGCOUNT = 24;
+var NV_PIPE_STRUCT_SIZE = 32;
+
+# NVIDIA render-pass struct (24 bytes): ctx + the bound RT + the clear color
+# (stored for ABI parity; v2 skips the clear — a fullscreen triangle covers
+# every pixel — so clear_color is advisory).
+var NV_PASS_CTX         = 0;
+var NV_PASS_RT          = 8;
+var NV_PASS_CLEAR_COLOR = 16;
+var NV_PASS_STRUCT_SIZE = 24;
+
+# Create a render pipeline from a VS + FS shader module (the shmod convention:
+# program VA @ +8 points at the SPH, regcount @ +24). color_fmt is accepted for
+# slot ABI parity but ignored (v2 = RGBA8 linear). Returns an NV_PIPE ptr or 0.
+fn _backend_nvidia_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt): i64 {
+    if (ctx == 0)    { return 0; }
+    if (vs_mod == 0) { return 0; }
+    if (fs_mod == 0) { return 0; }
+    var pipe = alloc(NV_PIPE_STRUCT_SIZE);
+    memset(pipe, 0, NV_PIPE_STRUCT_SIZE);
+    store64(pipe + NV_PIPE_VS_VA,       load64(vs_mod + NV_SHMOD_VA));
+    store64(pipe + NV_PIPE_FS_VA,       load64(fs_mod + NV_SHMOD_VA));
+    store64(pipe + NV_PIPE_VS_REGCOUNT, load64(vs_mod + NV_SHMOD_REGCOUNT));
+    store64(pipe + NV_PIPE_FS_REGCOUNT, load64(fs_mod + NV_SHMOD_REGCOUNT));
+    return pipe;
+}
+
+# Release a render pipeline: zero the struct. Null-safe.
+fn _backend_nvidia_render_pipeline_release(ctx, pipe): i64 {
+    if (ctx == 0)  { return 0; }
+    if (pipe == 0) { return 0; }
+    memset(pipe, 0, NV_PIPE_STRUCT_SIZE);
+    return 0;
+}
+
+# Begin a render pass on `rt` with a clear color. Returns an NV_PASS ptr or 0.
+fn _backend_nvidia_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
+    if (ctx == 0) { return 0; }
+    if (rt == 0)  { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var p = alloc(NV_PASS_STRUCT_SIZE);
+    memset(p, 0, NV_PASS_STRUCT_SIZE);
+    store64(p + NV_PASS_CTX,         ctx);
+    store64(p + NV_PASS_RT,          rt);
+    store64(p + NV_PASS_CLEAR_COLOR, clear_color_ptr);
+    return p;
+}
+
+# Draw `vc` vertices (instance count must be 1) of `pipe`'s VS/FS into the
+# pass's RT: assemble the draw params, build the clc597 draw pushbuffer into the
+# context's persistent push BO, EXEC on the channel, and wait on an absolute
+# syncobj deadline (mirrors compute_dispatch). v2: single draw per pass, no
+# clear (the fullscreen triangle covers the RT). Returns 0|GPU_ERR_*.
+fn _backend_nvidia_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
+    if (ctx == 0)  { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_OTHER; }
+    if (vc <= 0)   { return GPU_ERR_OTHER; }
+    if (ic != 1)   { return GPU_ERR_OTHER; }   # v2: single-instance only
+    var rt = load64(pass + NV_PASS_RT);
+    if (rt == 0) { return GPU_ERR_OTHER; }
+    var rt_va  = load64(rt + NV_RT_VA);
+    var width  = load32(rt + NV_RT_WIDTH);
+    var height = load32(rt + NV_RT_HEIGHT);
+    if (rt_va == 0)  { return GPU_ERR_OTHER; }
+    if (width <= 0)  { return GPU_ERR_OTHER; }
+    if (height <= 0) { return GPU_ERR_OTHER; }
+    var vs_va = load64(pipe + NV_PIPE_VS_VA);
+    var fs_va = load64(pipe + NV_PIPE_FS_VA);
+    if (vs_va == 0) { return GPU_ERR_OTHER; }
+    if (fs_va == 0) { return GPU_ERR_OTHER; }
+
+    var fd   = nv_ctx_fd(ctx);
+    var chid = nv_ctx_chid(ctx);
+    var push_addr = load64(ctx + NV_CTX_PUSH_ADDR);
+    var push_va   = load64(ctx + NV_CTX_PUSH_VA);
+
+    var dp[56];
+    memset(&dp, 0, 56);
+    store64(&dp + NV_DRAW_RT_VA,       rt_va);
+    store64(&dp + NV_DRAW_RT_WIDTH,    width);
+    store64(&dp + NV_DRAW_RT_HEIGHT,   height);
+    store64(&dp + NV_DRAW_VS_VA,       vs_va);
+    store64(&dp + NV_DRAW_FS_VA,       fs_va);
+    store64(&dp + NV_DRAW_VS_REGCOUNT, load64(pipe + NV_PIPE_VS_REGCOUNT));
+    store64(&dp + NV_DRAW_FS_REGCOUNT, load64(pipe + NV_PIPE_FS_REGCOUNT));
+    var push_len = native_nv_push_draw(push_addr, &dp, vc);
+
+    var so[8];
+    memset(&so, 0, 8);
+    if (native_syncobj_create(fd, &so) != 0) { return GPU_ERR_OTHER; }
+    var sh = load32(&so);
+    var deadline = _time_now_ns() + 1000000000;
+    var rc = native_nv_exec_submit(fd, chid, push_va, push_len, sh);
+    if (rc != 0) { native_syncobj_destroy(fd, sh); return GPU_ERR_OTHER; }
+    rc = native_syncobj_wait(fd, sh, deadline);
+    native_syncobj_destroy(fd, sh);
+    if (rc != 0) { return GPU_ERR_OTHER; }
+    return 0;
+}
+
+# End a render pass: zero the struct. Null-safe.
+fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
+    if (ctx == 0)  { return 0; }
+    if (pass == 0) { return 0; }
+    memset(pass, 0, NV_PASS_STRUCT_SIZE);
+    return 0;
+}
+
+# ================================================================
 # Backend construction — v0 slot block + kind
 # ================================================================
 # Fills offsets 0..80 + kind. Higher ranges (texture/render/surface) are
@@ -592,6 +723,19 @@ fn backend_nvidia_new(): i64 {
     &_backend_nvidia_render_target_create_2d_rgba8);
     backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
     &_backend_nvidia_render_target_release);
+    # v2 render pipeline / pass / draw (136..168) — N7.5: the public-API path
+    # to the HW-proven render mechanism. This completes the v2 render range, so
+    # backend_is_complete now reports the NVIDIA backend complete through v2.
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE,
+    &_backend_nvidia_render_pipeline_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_RELEASE,
+    &_backend_nvidia_render_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN,
+    &_backend_nvidia_render_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW,
+    &_backend_nvidia_render_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
+    &_backend_nvidia_render_pass_end);
     backend_set_kind(b, BACKEND_KIND_NVIDIA);
     return b;
 }

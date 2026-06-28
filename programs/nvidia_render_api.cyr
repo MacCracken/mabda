@@ -1,0 +1,95 @@
+# programs/nvidia_render_api.cyr — v4.0 Phase N7.5 — NVIDIA native render
+# through the PUBLIC mabda API (gpu_render_pipeline_* / gpu_render_pass_*).
+#
+# The public-API counterpart to the raw N7.4 render gate: the same triangle
+# (VS from VertexID + solid-color FS) rasterized into a linear RGBA8 render
+# target, but driven entirely through the backend-agnostic v2 render slots —
+# gpu_render_target_create / gpu_shader_module_create / gpu_render_pipeline_create
+# / gpu_render_pass_begin / gpu_render_pass_draw / gpu_render_pass_end — exactly
+# the surface a consumer (soorat, etc.) uses. The 0xC597 3D class is created by
+# gpu_context_new_native_nvidia. Reads back the rendered pixel = 0xFF996633.
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-render-api`.
+#
+# Exit codes:
+#   0 success   1 context   2 RT   3 VS module   4 FS module   5 pipeline
+#   6 pass   7 draw   8 readback != 0xFF996633
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var b[32];
+    memset(&b, 0, 32);
+    var len = fmt_int_buf(n, &b);
+    syscall(1, 1, &b, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA render via PUBLIC API (v4.0 Phase N7.5)\n");
+    print_cstr("---------------------------------------------------\n");
+
+    var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+    if (ctx == 0) { print_cstr("FAIL: context\n"); return 1; }
+    print_cstr("context created (0xC5C0 compute + 0xC597 3D)\n");
+
+    # Linear RGBA8 64x64 render target (pitch 256).
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt == 0) { print_cstr("FAIL: render target\n"); gpu_context_release(ctx); return 2; }
+
+    # VS + FS shader modules from the SPH+SASS blobs (program VA points at the
+    # 128-byte SPH). The create slot defaults regcount to the compute
+    # proof-of-life value; the render shaders declare 24 (the N7.4-proven
+    # count), so set it explicitly until the shader-module API carries
+    # per-shader regcount.
+    var vs_bytes[352];
+    native_nv_sass_render_vs(&vs_bytes);
+    var vs_mod = gpu_shader_module_create(ctx, &vs_bytes, NV_SASS_RENDER_VS_BYTES);
+    if (vs_mod == 0) { print_cstr("FAIL: VS module\n"); gpu_context_release(ctx); return 3; }
+    store64(vs_mod + NV_SHMOD_REGCOUNT, NV_SASS_RENDER_VS_REGCOUNT);
+
+    var fs_bytes[272];
+    native_nv_sass_render_fs(&fs_bytes);
+    var fs_mod = gpu_shader_module_create(ctx, &fs_bytes, NV_SASS_RENDER_FS_BYTES);
+    if (fs_mod == 0) { print_cstr("FAIL: FS module\n"); gpu_context_release(ctx); return 4; }
+    store64(fs_mod + NV_SHMOD_REGCOUNT, NV_SASS_RENDER_FS_REGCOUNT);
+
+    var pipe = gpu_render_pipeline_create(ctx, vs_mod, fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); gpu_context_release(ctx); return 5; }
+    print_cstr("pipeline + VS/FS modules created\n");
+
+    # Clear the RT via its CPU mapping so a non-rendered pixel reads 0.
+    var rt_addr = load64(rt + NV_RT_ADDR);
+    memset(rt_addr, 0, 64 * 256);
+
+    # Clear color = 4 f64 RGBA (advisory; v2 skips the clear — the fullscreen
+    # triangle covers every pixel).
+    var clear[32];
+    memset(&clear, 0, 32);
+    var pass = gpu_render_pass_begin(ctx, rt, &clear);
+    if (pass == 0) { print_cstr("FAIL: pass begin\n"); gpu_context_release(ctx); return 6; }
+
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    print_cstr("draw rc="); print_i64(rc); print_cstr("\n");
+    if (rc != 0) { print_cstr("FAIL: pass draw\n"); gpu_context_release(ctx); return 7; }
+    gpu_render_pass_end(ctx, pass);
+
+    # Center pixel (32,32) at row pitch 256: 32*256 + 32*4 = 8320.
+    var got = load32(rt_addr + 8320);
+    print_cstr("rendered pixel = "); print_i64(got);
+    if (got == 0xFF996633) { print_cstr("  (0xFF996633 OK)\n"); }
+    else { print_cstr("  FAIL (expected 4288243251 = 0xFF996633)\n"); gpu_context_release(ctx); return 8; }
+
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_shader_module_release(ctx, vs_mod);
+    gpu_shader_module_release(ctx, fs_mod);
+    gpu_render_target_release(ctx, rt);
+    gpu_context_release(ctx);
+    print_cstr("OK: NVIDIA triangle rendered through the public gpu_render_* API\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
