@@ -255,9 +255,14 @@ All on subc0=3D. Op `INCRn` = n consecutive 4-byte methods from the offset;
   (`a[0x2fc]`, hardware-supplied), so the render path needs zero constant-buffer
   setup. FS = solid `vec4(0.2,0.4,0.6,1.0)`; VS = fullscreen triangle from
   VertexID writing `a[0x70]` (gl_Position). regcount 24 each.
-- **N7.4** — `programs/nvidia_render_e2e.cyr` (HW): create the 3D class +
-  a linear RT (N7.1) + VS/FS programs, build the draw pushbuffer, EXEC, flush
-  L2, CPU-read the rendered solid color. Fills the v2 render slots
-  pipeline/pass/draw (136..168). **EXIT: the rendered triangle's color reads
-  back.** The two HW risks to resolve here: the **L2 flush** before CPU read,
-  and the **vertex-distributor** inactive-attribute markers.
+- **N7.4** — _DONE — THE RENDER GATE IS GREEN._ `programs/nvidia_render_e2e.cyr`
+  + `make test-nvidia-render-e2e`: creates the `0xC597` 3D class, binds a linear
+  RT, uploads the VS/FS SPH+SASS, builds the draw via `native_nv_push_draw`,
+  EXEC + syncobj, and CPU-reads back the rendered `0xFF996633`. **First-try
+  green — both flagged risks were non-issues on mabda's path:** NO explicit L2
+  flush (the EXEC syncobj + a HOST-coherent BO gives CPU coherency, same as the
+  N4 compute STG to GART), and NO vertex-distributor inactive-attribute markers
+  (the VertexID-only VS draws fine without them on a fresh channel). No param
+  bank (self-contained shaders), no SET_SPA_VERSION, no shader-cache invalidate
+  needed. So the minimal `native_nv_push_draw` sequence is sufficient on HW.
+  The v2 render-slot public-API wiring (136..168) is the remaining N7.5 piece.

@@ -365,6 +365,19 @@ build/nvidia_render_target: programs/nvidia_render_target.cyr src/*.cyr
 test-nvidia-render-target: build/nvidia_render_target
 	./build/nvidia_render_target
 
+# v4.0 Phase N7.4 — THE NVIDIA RENDER GATE. Creates the Turing 3D class
+# (0xC597), binds a linear RGBA8 color target, runs a vertex-less
+# fullscreen-triangle draw (VS from VertexID + solid-color FS, SM75 SPH+SASS),
+# and reads the rendered pixel back. Pure-Cyrius clc597 draw, no libdrm/GFX.
+# Requires nouveau hardware; not in CI.
+build/nvidia_render_e2e: programs/nvidia_render_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_e2e.cyr $@
+
+.PHONY: test-nvidia-render-e2e
+test-nvidia-render-e2e: build/nvidia_render_e2e
+	./build/nvidia_render_e2e
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

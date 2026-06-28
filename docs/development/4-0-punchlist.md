@@ -1,12 +1,12 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1–N7.3
-done on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA backend is in
-the public API, the GPU samples textures, render targets allocate,
-`native_nv_push_draw` builds the full verified TURING_A draw pushbuffer, and the
-VS/FS graphics programs (SPH+SASS, self-contained) are embedded + nvdisasm-
-verified (CPU-asserted, 2026-06-28). Next front: N7.4 — wire the v2 render slots
-+ the HW draw e2e (the only remaining N7 piece).**
+**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1–N7.4
+done on the TU116 — BOTH arc gates GREEN: the N4 compute gate AND the N7.4
+RENDER gate (the GPU rasterizes a triangle to a linear RGBA8 target via a
+pure-Cyrius clc597 draw, reads back `0xFF996633`). All 6 NVIDIA HW gates pass
+(compute store/api, texture roundtrip/sample, render-target, render-e2e). Only
+remaining N7 piece: N7.5 — wire the v2 render slots to the public `gpu_render_*`
+API (the gate is a raw program). Then N8 (KMS/present). (2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -24,30 +24,31 @@ verified (CPU-asserted, 2026-06-28). Next front: N7.4 — wire the v2 render slo
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N7.4 — the HW render e2e (the last N7
-> piece).** All the building blocks are done + CPU-asserted: the linear RT
-> (N7.1), the draw encoder `native_nv_push_draw` (N7.2), and the VS/FS SPH+SASS
-> blobs `native_nv_sass_render_{vs,fs}` (N7.3, self-contained — no cbuf).
-> N7.4 wires it on HW + fills the v2 render slots (136..168):
-> `programs/nvidia_render_e2e.cyr` — NVIF-create the `0xC597` 3D class on the
-> channel, alloc a linear RGBA8 RT + upload the two SPH+SASS programs, build the
-> draw pushbuffer, EXEC, **flush L2/ROP→memory**, CPU-read the rendered solid
-> color. The two open HW risks to resolve here (from the N7.2a decode): the
-> **L2 flush** before the CPU read, and the **vertex-distributor**
-> inactive-attribute markers (`SET_VERTEX_ATTRIBUTE_A 0x1160` ×32 = `0x38200040`)
-> the VertexID-only VS may need — add to `native_nv_push_draw` if the draw
-> faults. Design + the full method sequence:
-> [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). Done: v0 compute,
-> v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a draw
-> capture/decode, N7.2 clc597 draw encoder, **N7.3 VS/FS SPH+SASS**.
+> **Resume here (next session):** **N7.5 — wire the v2 render slots to the
+> public API.** The N7.4 RENDER GATE is GREEN: `make test-nvidia-render-e2e`
+> rasterizes a triangle to a linear RGBA8 target via a pure-Cyrius clc597 draw
+> and reads back `0xFF996633`. The render mechanism is fully proven as a raw
+> program; N7.5 exposes it through the PUBLIC `gpu_render_*` API by filling the
+> v2 Backend slots (136..168): `render_pipeline_create/release` (a pipeline
+> struct holding the VS/FS program VAs + regcounts),
+> `render_pass_begin/draw/end` (a pass struct holding the RT + clear), routing
+> the draw through `native_nv_push_draw`. Also NVIF-create `0xC597` in
+> `gpu_context_new_native_nvidia` (re-run the existing HW gates after — it adds
+> a class-create to every NVIDIA context). CPU-assert the slots + struct field
+> maps; a public-API render program proves it. Then **N8** (KMS/present). The
+> two N7.2a-flagged HW risks (L2 flush, vertex-distributor markers) did NOT
+> materialize on mabda's HOST-coherent-BO + VertexID path — see N7.4. Done:
+> v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
+> draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS,
+> **N7.4 the render gate**.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
 > compute store (`-compute-store`)**, **N4.7 public-API compute
 > (`-compute-api`)**, **N6 texture roundtrip (`-texture-e2e`)**, **N6.2 GPU
 > texture sampling (`-texture-sample-e2e`)**, **N7.1 render target
-> (`-render-target`)**. CPU suite: `tests/tcyr/nvidia.tcyr` (228 asserts).
-> ADR 007 **Accepted**.
+> (`-render-target`)**, **N7.4 RENDER GATE (`-render-e2e`)**. CPU suite:
+> `tests/tcyr/nvidia.tcyr` (271 asserts). ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -648,11 +649,24 @@ an afternoon to a few days.
   **CPU asserts** pin the SPH headers + key SASS instrs (`nvidia.tcyr`
   `test_nv_sass_render`, 271 total). The inactive-attribute markers are a draw
   concern handled at N7.4 (the VertexID sysval needs no vertex-buffer fetch).
-- [ ] **N7.4** — Fill the v2 render slots pipeline/pass/draw (136..168) on the
-  NVIDIA backend; `programs/nvidia_render_e2e.cyr` (HW): 3D class + linear RT
-  (N7.1) + VS/FS + draw pushbuffer + EXEC + **L2 flush** + CPU-read.
-  **EXIT:** the rendered triangle's solid color reads back. Resolve the
-  L2-flush + vertex-distributor risks here. HW-gated.
+- [x] **N7.4** — **THE RENDER GATE — GREEN (HW-proven).**
+  `programs/nvidia_render_e2e.cyr` + `make test-nvidia-render-e2e`: creates the
+  Turing 3D class (`0xC597`), binds a **linear** RGBA8 color target, runs a
+  vertex-less fullscreen-triangle draw (N7.3 VS/FS SPH+SASS via N7.2
+  `native_nv_push_draw`), EXEC + syncobj, and the CPU reads back the rendered
+  solid color **`0xFF996633`** — the render analogue of the N4 compute gate, a
+  pure-Cyrius clc597 draw, no libdrm/GFX/CUDA. **Both flagged HW risks turned
+  out NOT to apply to mabda's path** (first-try green): no explicit L2 flush
+  (the syncobj + a HOST-coherent BO suffices, exactly like the N4 compute STG),
+  and no vertex-distributor inactive-attribute markers (the VertexID-only VS
+  draws fine without them on a fresh channel). No param bank either (the shaders
+  are self-contained). All 6 NVIDIA HW gates green.
+- [ ] **N7.5** — Wire the **v2 render slots** (136..168) on the NVIDIA backend
+  (`render_pipeline_create/release`, `render_pass_begin/draw/end`) so the render
+  path is reachable through the PUBLIC `gpu_render_*` API (the gate above is a
+  raw program). Needs: NVIF-create `0xC597` in `gpu_context_new_native_nvidia`,
+  pipeline/pass structs holding the VS/FS program VAs + the RT, and a
+  public-API render program. **CPU asserts:** slots wired + struct field maps.
 
 ### N8 — KMS surface / present
 
