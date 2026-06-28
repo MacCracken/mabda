@@ -352,6 +352,19 @@ build/nvidia_texture_sample_e2e: programs/nvidia_texture_sample_e2e.cyr src/*.cy
 test-nvidia-texture-sample-e2e: build/nvidia_texture_sample_e2e
 	./build/nvidia_texture_sample_e2e
 
+# v4.0 Phase N7.1 — NVIDIA native render-target create/release through the
+# PUBLIC mabda API (v2 render slots 120/128). Allocates two live RTs (distinct
+# VAs), checks geometry, proves the BO mapping backs memory. The GPU
+# draw-into-it (TURING_A 3D pipeline) is N7.2-N7.4. Requires nouveau hardware;
+# not in CI.
+build/nvidia_render_target: programs/nvidia_render_target.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_target.cyr $@
+
+.PHONY: test-nvidia-render-target
+test-nvidia-render-target: build/nvidia_render_target
+	./build/nvidia_render_target
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

@@ -81,6 +81,19 @@ var NV_TEX_HEIGHT = 36;
 var NV_TEX_FMT    = 40;   # MABDA_TEXFMT_* (0 = RGBA8)
 var NV_TEX_STRUCT_SIZE = 48;
 
+# NVIDIA render-target struct (40 bytes — the AMD NATIVE_RT shape): a v0 RT is
+# a host-visible LINEAR RGBA8 color surface, structurally the NV_TEX minus the
+# fmt tag (an RT is always RGBA8 in v0). The 3D engine draws into it (the draw
+# dispatch is N7.4); this v0 bite lands the CPU-side surface lifecycle (alloc +
+# VM_BIND + map + release), the render analogue of the texture create slot.
+var NV_RT_HANDLE = 0;
+var NV_RT_VA     = 8;
+var NV_RT_ADDR   = 16;
+var NV_RT_SIZE   = 24;   # logical linear bytes = width*height*4
+var NV_RT_WIDTH  = 32;
+var NV_RT_HEIGHT = 36;
+var NV_RT_STRUCT_SIZE = 40;
+
 # Every nouveau BO this backend allocates is one 64 KiB host BO VM_BIND'd
 # with a 64 KiB range at a 64 KiB-aligned VA — the exact config the N4 gate
 # HW-proved (big-page mapping; QMD's 256-byte alignment is implied by 64 KiB).
@@ -486,6 +499,55 @@ fn _backend_nvidia_texture_release(ctx, tex): i64 {
 }
 
 # ================================================================
+# v2 render slots (120..176) — N7.1: render-target lifecycle
+# ================================================================
+
+# Create a 2D RGBA8 render target (a host BO of width*height*4 bytes, VM_BIND'd
+# at a fresh VA via the per-context bump allocator, so multiple live RTs get
+# distinct VAs). Dimensions are capped (validate_dimensions) so width*height*4
+# cannot overflow. v0: the surface must fit one 64 KiB BO (<=128x128 RGBA8) —
+# the same single-BO constraint as the texture slot; larger color targets need
+# multi-BO/bigger-BO allocation, a follow-up. Returns an NV_RT struct ptr or 0
+# on bad input / ioctl failure.
+fn _backend_nvidia_render_target_create_2d_rgba8(ctx, width, height): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        return 0;
+    }
+    var logical = width * height * 4;
+    if (logical > NV_BO_SIZE) { return 0; }   # v0: single-BO color targets
+    var bo[24];
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    var rt = alloc(NV_RT_STRUCT_SIZE);
+    memset(rt, 0, NV_RT_STRUCT_SIZE);
+    store64(rt + NV_RT_HANDLE, load64(&bo + 0));
+    store64(rt + NV_RT_VA,     load64(&bo + 8));
+    store64(rt + NV_RT_ADDR,   load64(&bo + 16));
+    store64(rt + NV_RT_SIZE,   logical);
+    store32(rt + NV_RT_WIDTH,  width);
+    store32(rt + NV_RT_HEIGHT, height);
+    return rt;
+}
+
+# Release a render target: VM_UNBIND + BO release, zero the struct. Null-safe.
+fn _backend_nvidia_render_target_release(ctx, rt): i64 {
+    if (ctx == 0) { return 0; }
+    if (rt == 0)  { return 0; }
+    var fd = nv_ctx_fd(ctx);
+    var handle = load64(rt + NV_RT_HANDLE);
+    var va     = load64(rt + NV_RT_VA);
+    var addr   = load64(rt + NV_RT_ADDR);
+    if (handle != 0) {
+        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
+        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+    }
+    memset(rt, 0, NV_RT_STRUCT_SIZE);
+    return 0;
+}
+
+# ================================================================
 # Backend construction — v0 slot block + kind
 # ================================================================
 # Fills offsets 0..80 + kind. Higher ranges (texture/render/surface) are
@@ -522,6 +584,14 @@ fn backend_nvidia_new(): i64 {
     &_backend_nvidia_texture_read);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE,
     &_backend_nvidia_texture_release);
+    # v2 render slots (120..176) — N7.1: render-target create/release (the
+    # CPU-side color-surface lifecycle). The pipeline/pass/draw slots
+    # (136..168) land in N7.2/N7.3/N7.4; backend_is_complete stays honestly
+    # incomplete past the RT slots until then.
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8,
+    &_backend_nvidia_render_target_create_2d_rgba8);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_RELEASE,
+    &_backend_nvidia_render_target_release);
     backend_set_kind(b, BACKEND_KIND_NVIDIA);
     return b;
 }

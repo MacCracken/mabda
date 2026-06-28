@@ -1,10 +1,11 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) done and
-HW-proven on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA
-backend is in the public API, texture create/write/read roundtrips, AND the
-GPU samples textures (TIC/TSC pools + bound TEX dispatch reads back two
-distinct texels, 2026-06-28). Next front: N7 render.**
+**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1
+(render target) done and HW-proven on the TU116 — the N4 compute arc gate is
+GREEN, the NVIDIA backend is in the public API, texture create/write/read
+roundtrips, the GPU samples textures (TIC/TSC pools + bound TEX dispatch), and
+render targets allocate through the public API (2026-06-28). Next front: N7.2a
+— capture an NVK triangle draw to decode the TURING_A 3D method stream.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -22,21 +23,25 @@ distinct texels, 2026-06-28). Next front: N7 render.**
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N7 — render pipeline.** N6 (textures) is
-> complete and HW-proven, including GPU sampling. N7.1 starts the render arc:
-> `native_nv_rt_create_2d_rgba8` + release (an RGBA8 color-target BO, reusing
-> the N2/N6 allocator), then N7.2 the `TURING_A` 3D class (0xC597) method
-> encoders, N7.3 SM75 VS/FS bytes, N7.4 the v2 render slots (120..176). Done:
-> v0 compute (raw + public API), v1 texture roundtrip, **N6.2 GPU sampling
-> (raw HW)** — TIC/TSC pool binds + a bound-texture TEX dispatch reads back two
-> distinct 1x1 texels (`make test-nvidia-texture-sample-e2e`).
+> **Resume here (next session):** **N7.2a — capture an NVK triangle draw.**
+> N7.1 (the render-target lifecycle, slots 120/128) is done + HW-proven. The
+> render arc now needs its golden reference, exactly like N6.2a did for
+> sampling: a Vulkan triangle-draw app (`tools/nvidia-capture/vk_render.c`) run
+> under the `nouveau_capture.c` interposer to capture+decode NVK's `TURING_A`
+> (0xC597) 3D method stream — the NVIF class create, `SET_COLOR_TARGET_*`, the
+> SET_PIPELINE VS/FS stages, viewport/scissor, and the draw call. Then N7.2 the
+> 0xC597 method encoders, N7.3 SM75 VS/FS bytes, N7.4 the draw dispatch +
+> pipeline/pass/draw slots (136..168). Done: v0 compute (raw + public API), v1
+> texture roundtrip, N6.2 GPU sampling, **N7.1 render-target
+> (`make test-nvidia-render-target`)**.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
 > compute store (`-compute-store`)**, **N4.7 public-API compute
 > (`-compute-api`)**, **N6 texture roundtrip (`-texture-e2e`)**, **N6.2 GPU
-> texture sampling (`-texture-sample-e2e`)**. CPU suite:
-> `tests/tcyr/nvidia.tcyr` (216 asserts). ADR 007 **Accepted**.
+> texture sampling (`-texture-sample-e2e`)**, **N7.1 render target
+> (`-render-target`)**. CPU suite: `tests/tcyr/nvidia.tcyr` (228 asserts).
+> ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -589,8 +594,17 @@ an afternoon to a few days.
 
 ### N7 — Render pipeline + render pass
 
-- [ ] **N7.1** — `native_nv_rt_create_2d_rgba8` + release (reuse N2/N6
-  BO allocator + RT VA range). **CPU assert:** struct layout + dims.
+- [x] **N7.1** — **DONE + HW-proven.** `_backend_nvidia_render_target_create_2d_rgba8`
+  / `_release` (`backend_nvidia.cyr`) fill the v2 render slots 120/128: a
+  host-visible LINEAR RGBA8 color surface (one 64 KiB BO, VM_BIND'd at a fresh
+  bump VA, ≤128x128), the `NV_RT` struct (40 B — the AMD `NATIVE_RT` shape).
+  `programs/nvidia_render_target.cyr` + `make test-nvidia-render-target`
+  allocates **two live RTs** (distinct VAs, RT#2 = RT#1 + 0x10000), checks
+  geometry, and proves the mapping backs memory (CPU sentinel write/read across
+  the span) — all through the PUBLIC `gpu_render_target_*` API. **CPU asserts**
+  (`nvidia.tcyr` `test_nv_backend_v2_render_slots`, 228 total): slots 120/128
+  wired, 136..168 honestly still zero, RT field map. The GPU draw-into-it is
+  N7.2-N7.4.
 - [ ] **N7.2** — `TURING_A` 3D class (0xC597) method encoders (pipeline
   state + draw) in `backend_nvidia_push.cyr` (the render-PM4-composer
   analogue). **CPU assert:** method offsets + state values pinned against
