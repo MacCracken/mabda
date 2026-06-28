@@ -136,14 +136,34 @@ preamble methods (captured) are `SET_SHADER_SHARED_MEMORY_WINDOW` (mthd 0x02a0,
 so mabda set the windows to 0, which made low VAs collide with the local
 aperture (the fault above). Now set to the captured `0xfe000000`/`0xff000000`.
 
-**Remaining blocker (the open nut):** with correct windows, a generic GLOBAL
-`STG.E` store no longer faults but **silently hangs** (syncobj ETIME, no Xid,
-readback stays 0) — at low VAs, high VAs (255 GiB), moderate VAs (256 MB), and
-with 4 KiB or 64 KiB big-page BOs. So the store path isn't completing.
+**Remaining blocker (the open nut):** a generic GLOBAL store **silently hangs**
+(syncobj ETIME, no Xid, readback stays 0). A store whose target lands in the
+local-memory aperture instead *faults* immediately (Xid 13) — that's how we
+know the dispatch *runs* and the shader executes; only the global-store
+*completion* is stuck.
 
-**Leading hypothesis (next step):** mabda's dispatch pushbuffer is too
-minimal. NVK's actual dispatch (capture `082`) issues, in addition to
-`SET_OBJECT`/windows/`SEND_PCAS`, several more methods right before the launch:
+**Eliminated on hardware (each tested, none fixed it):**
+1. **Window classification** — found+fixed the windows=0 bug (→
+   `0xfe000000`/`0xff000000`); changed local-collision faults to global, but
+   the global store still hangs.
+2. **VA height** — low (1–5 MB), moderate (256 MB), high (255 GiB) all hang.
+3. **BO domain** — `GART|MAPPABLE|COHERENT` (0x1C) vs pure `GART` (0x4, NVK's):
+   both hang. (Capture confirms NVK uses `tile_mode=0`, `tile_flags=0`,
+   `bind_flags=0` — identical to mabda.)
+4. **Page kind / VM_BIND flags** — identical to NVK (all 0).
+5. **Store scope** — switched the SASS from `STG.E.SYS` (system) to
+   `STG.E.STRONG.GPU` (GPU, via `nvcc st.global.cg`; one control-word dword:
+   `…c10e904`→`…c114904`). NVK's NAK shader is also GPU-scope (opcode `7386` vs
+   our `7986` — a register-vs-uniform-address delta, not scope). Still hangs.
+   **(The GPU-scope store is kept — it's correct and matches NVK.)**
+
+**Leading hypothesis (the remaining one): the channel/dispatch init is
+insufficient.** A global write that neither faults nor completes is a
+*replayable fault that never resolves* — which points at missing per-channel
+setup (e.g. the fault buffer / the fuller compute init NVK does in its 14532-
+byte queue-init `067` and the multi-class dispatch `082`). NVK's actual
+dispatch (capture `082`) issues, in addition to `SET_OBJECT`/windows/`SEND_PCAS`,
+several more methods right before the launch:
 - compute subchannel (0xC5C0): `0x0298`=0, `0x1424`=0, `0x0244`=0 (likely a
   cache-invalidate / barrier / exceptions trio)
 - 3D subchannel (0xC597, subc0): `0x0100`=0, `0x1424`=`[0,0]`,
