@@ -1,8 +1,8 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 done and HW-proven on the TU116 — the
-N4 compute arc gate is GREEN (2026-06-28). Next front: N4.7 backend
-integration, then N6 textures.**
+**Status:** In progress. **N0–N5.3 + N4.7 done and HW-proven on the TU116 —
+the N4 compute arc gate is GREEN and the NVIDIA backend is wired into the
+public API (2026-06-28). Next front: N6 textures.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -20,15 +20,16 @@ integration, then N6 textures.**
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N4.7** — wire
-> `gpu_context_new_native_nvidia()` + `backend_nvidia_new()` v0 slot-filler
-> (the integration layer; the gate proves the raw path works). Then **N6**
-> textures.
+> **Resume here (next session):** **N6** — textures (`native_nv_texture_*`,
+> Turing TIC/TSC descriptors, fill v1 texture slots 88..120 on the NVIDIA
+> backend, `nvidia_texture_e2e.cyr`). The v0 compute path is done end-to-end
+> (raw gate + public API).
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
-> compute store (`-compute-store`)**. CPU suite: `tests/tcyr/nvidia.tcyr`
-> (121 asserts). ADR 007 **Accepted**.
+> compute store (`-compute-store`)**, **N4.7 public-API compute
+> (`-compute-api`)**. CPU suite: `tests/tcyr/nvidia.tcyr` (145 asserts).
+> ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -468,14 +469,22 @@ an afternoon to a few days.
   (2026-06-27) and the relative-vs-absolute `native_syncobj_wait` deadline
   bug (2026-06-28, the true blocker). Full diagnosis in
   [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) § GATE GREEN.
-- [ ] **N4.7** — Wire `gpu_context_new_native_nvidia()` (the
-  `gpu_context_new_native` analogue) + `backend_nvidia_new()` slot-filler
-  for the **v0 block only** (offsets 0..80: ctx_create/release,
+- [x] **N4.7** — **DONE + HW-proven via the public API.** `src/backend_nvidia.cyr`
+  landed: `gpu_context_new_native_nvidia()` (persistent channel + NVIF 0xC5C0 +
+  QMD/pushbuf/param BOs + a bump VA allocator) + `backend_nvidia_new()` filling
+  the **v0 block** (0..80: ctx_create_from_preinit[stub]/release,
   buffer_create/write/read/release, shader_module_create/release,
-  compute_dispatch, device_wait_idle) + kind `+80`. Add the
-  `BACKEND_KIND_NVIDIA` branch to `gpu_context_from_preinit` routing.
-  **CPU assert:** the v0 slots store non-zero fnptrs; `backend_is_complete`
-  remains honest (v0-only until later phases fill 88..280).
+  compute_dispatch, device_wait_idle) + kind `+80`. Added `SHADER_SRC_SASS=3`
+  + the NVIDIA shader-kind branch in `gpu_shader_module_create`.
+  `programs/nvidia_compute_api.cyr` + `make test-nvidia-compute-api` reads back
+  `0xDEADBEEF` through the **public** gpu_buffer/shader/compute API (not raw
+  ioctls). **CPU asserts** (`nvidia.tcyr`, now 145): v0 slots non-zero, kind ==
+  NVIDIA, `backend_is_complete` honest (incomplete past v0 by design), field-map
+  offsets pinned. **DEFERRED to the v4.0 cut** (paired with adding the NVIDIA
+  modules to `[lib].modules`): the compile-time `MABDA_BACKEND_KIND==NVIDIA`
+  branch in `gpu_context_from_preinit` — a *bundled* `gpu_context_from_preinit`
+  can't call `gpu_context_new_native_nvidia()` until that fn is in the dist
+  bundle. Until the cut, opt in via the explicit entry point (the AMD pattern).
 
 ### N5 — Shader story (hand / precompiled SM75 SASS)
 

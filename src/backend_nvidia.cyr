@@ -1,0 +1,426 @@
+# @internal — native NVIDIA backend, Backend-slot integration (Phase N4.7)
+# backend_nvidia.cyr — the backend_native.cyr analogue for the v4.0 NVIDIA
+# arc. Fills the @internal `Backend` v0 slot block (offsets 0..80) so the
+# pure-Cyrius nouveau compute path the N4 arc gate proved
+# (programs/nvidia_compute_store.cyr) is reachable through the SAME public
+# API (gpu_context_* / gpu_buffer_* / gpu_shader_module_* / gpu_compute_*)
+# the wgpu + AMD-native backends use. Public surface does not change.
+#
+# v0 only (this phase): ctx_create_from_preinit (stub), ctx_release,
+# buffer_create/write/read/release, shader_module_create/release,
+# compute_dispatch, device_wait_idle, kind=+80. Texture / render / surface
+# slots (88..328) land in N6 / N7 / N8. backend_is_complete stays honest:
+# it walks 0..80 + the activated higher ranges; this backend fills only v0,
+# so it reports incomplete past v0 until those phases — by design.
+#
+# DRIVES the HW-proven N4 path: a persistent channel + NVIF 0xC5C0 object +
+# persistent QMD / pushbuffer / param-bank BOs allocated once at context
+# create, reused per dispatch (the AMD cached-IB pattern). compute_dispatch
+# writes the bound output buffer's VA into the param bank (c[0x0]+0x160,
+# ptxas ABI), builds the QMD + dispatch pushbuffer, EXECs, and waits on an
+# ABSOLUTE syncobj deadline (the N4 blocker was a relative deadline — see
+# programs/nvidia_compute_store.cyr).
+#
+# NVIDIA GpuContext field map (reuses the 176-byte GpuContext blob; the only
+# cross-backend-fixed field is the Backend* at +32, read by gpu_ctx_backend):
+#   +0   fd            (renderD128 render node)
+#   +8   chid          (CHANNEL_ALLOC hardware channel id)
+#   +16  nvif_handle   (NVIF 0xC5C0 class-object handle)
+#   +24  va_cursor     (bump VA allocator: next free 64 KiB-aligned UMD VA)
+#   +32  backend       (Backend* — REQUIRED canonical slot)
+#   +40  qmd_handle    +48 qmd_va    +56 qmd_addr     (persistent QMD BO)
+#   +64  push_handle   +72 push_va   +80 push_addr    (persistent pushbuf BO)
+#   +88  param_handle  +96 param_va  +104 param_addr  (persistent c[0x0] bank)
+
+var NV_CTX_FD           = 0;
+var NV_CTX_CHID         = 8;
+var NV_CTX_NVIF_HANDLE  = 16;
+var NV_CTX_VA_CURSOR    = 24;
+var NV_CTX_BACKEND      = 32;
+var NV_CTX_QMD_HANDLE   = 40;
+var NV_CTX_QMD_VA       = 48;
+var NV_CTX_QMD_ADDR     = 56;
+var NV_CTX_PUSH_HANDLE  = 64;
+var NV_CTX_PUSH_VA      = 72;
+var NV_CTX_PUSH_ADDR    = 80;
+var NV_CTX_PARAM_HANDLE = 88;
+var NV_CTX_PARAM_VA     = 96;
+var NV_CTX_PARAM_ADDR   = 104;
+
+# NVIDIA buffer struct (32 bytes, the NativeBuf shape): handle, va, addr,
+# size. The BO's mmap addr IS the data (CPU-coherent host BO), so write/read
+# collapse to bounds-checked memcpy. `bp` (the dispatch bind pointer) points
+# at one of these; the dispatch reads its VA at +8.
+var NV_BUF_HANDLE = 0;
+var NV_BUF_VA     = 8;
+var NV_BUF_ADDR   = 16;
+var NV_BUF_SIZE   = 24;
+var NV_BUF_STRUCT_SIZE = 32;
+
+# NVIDIA shader-module struct (40 bytes): handle, va (program GPU VA), addr
+# (CPU mmap, for release), regcount, size. The QMD's PROGRAM_ADDRESS = va;
+# REGISTER_COUNT_V = regcount.
+var NV_SHMOD_HANDLE   = 0;
+var NV_SHMOD_VA       = 8;
+var NV_SHMOD_ADDR     = 16;
+var NV_SHMOD_REGCOUNT = 24;
+var NV_SHMOD_SIZE     = 32;
+var NV_SHMOD_STRUCT_SIZE = 40;
+
+# Every nouveau BO this backend allocates is one 64 KiB host BO VM_BIND'd
+# with a 64 KiB range at a 64 KiB-aligned VA — the exact config the N4 gate
+# HW-proved (big-page mapping; QMD's 256-byte alignment is implied by 64 KiB).
+var NV_BO_SIZE = 0x10000;
+
+# UMD VA allocator base: low, 64 KiB-aligned, well below the kernel-managed
+# split (1<<39). The bump cursor starts here; persistent + per-buffer BOs all
+# draw distinct 64 KiB VAs from it (the native no-reclaim model — VAs are not
+# returned to the cursor on release; a context is process-lifetime).
+var NV_VA_BASE = 0x100000;
+
+# Round `n` up to a 64 KiB multiple (BO + VM_BIND span granularity).
+fn _nv_align64k(n): i64 {
+    return (n + 0xFFFF) / 0x10000 * 0x10000;
+}
+
+# Bump-allocate a distinct, 64 KiB-aligned UMD VA range of >= `size` bytes.
+# Returns the VA; advances the cursor. Never returns 0 for a valid request.
+fn _nv_ctx_alloc_va(ctx, size): i64 {
+    var va = load64(ctx + NV_CTX_VA_CURSOR);
+    store64(ctx + NV_CTX_VA_CURSOR, va + _nv_align64k(size));
+    return va;
+}
+
+# Accessors (read the NVIDIA GpuContext field map above).
+fn nv_ctx_fd(ctx): i64   { return load64(ctx + NV_CTX_FD); }
+fn nv_ctx_chid(ctx): i64 { return load64(ctx + NV_CTX_CHID); }
+
+# Allocate one 64 KiB host BO, VM_BIND it at a fresh UMD VA, and return its
+# pieces via `out` (24 bytes: +0 handle, +8 va, +16 cpu_addr). Returns 0 on
+# success or a negative errno. On bind failure the BO is released so nothing
+# leaks. `dom` is a NOUVEAU_GEM_DOMAIN_* set.
+fn _nv_ctx_bo_alloc_bind(ctx, dom, out): i64 {
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+    store64(out + 16, 0);
+    var fd = nv_ctx_fd(ctx);
+    var bo[16];
+    var rc = native_nv_bo_create_dom(fd, NV_BO_SIZE, dom, &bo);
+    if (rc != 0) { return rc; }
+    var handle = load64(&bo + 0);
+    var addr   = load64(&bo + 8);
+    var va = _nv_ctx_alloc_va(ctx, NV_BO_SIZE);
+    rc = native_nv_vm_bind_map(fd, handle, va, NV_BO_SIZE);
+    if (rc != 0) {
+        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        return rc;
+    }
+    store64(out + 0, handle);
+    store64(out + 8, va);
+    store64(out + 16, addr);
+    return 0;
+}
+
+# ================================================================
+# Context bring-up (the gpu_context_new_native analogue, NVIDIA)
+# ================================================================
+# Opens renderD128, VM_INIT, CHANNEL_ALLOC a GR (compute) channel, creates
+# the TURING_COMPUTE_A 0xC5C0 class object via NVIF, allocates the three
+# persistent BOs (QMD / pushbuffer / param bank), and attaches a
+# backend_nvidia_new() at +32. Returns Result<ctx>. Mirrors the N4 gate's
+# setup but with the persistent-BO + VA-allocator shape of a real context.
+fn gpu_context_new_native_nvidia(): i64 {
+    var fd = native_open_render_node();
+    if (fd < 0) { return gpu_err_result(_native_neg_rc_to_gpu_err(fd)); }
+
+    var rc = native_nv_vm_init(fd, NOUVEAU_VM_KERNEL_RESERVATION_START,
+    NOUVEAU_VM_KERNEL_RESERVATION_SIZE);
+    if (rc != 0) {
+        var rc_save = rc; sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var chan[88];
+    rc = native_nv_channel_alloc(fd, &chan);
+    if (rc != 0) {
+        var rc_save = rc; sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+    var chid = native_nv_channel_id(&chan);
+
+    var nvif_handle = native_nv_object_handle(chid, TURING_COMPUTE_A);
+    rc = native_nv_object_new(fd, chid, nvif_handle, TURING_COMPUTE_A);
+    if (rc != 0) {
+        var rc_save = rc; native_nv_channel_free(fd, chid); sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
+    }
+
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + NV_CTX_FD, fd);
+    store64(ctx + NV_CTX_CHID, chid);
+    store64(ctx + NV_CTX_NVIF_HANDLE, nvif_handle);
+    store64(ctx + NV_CTX_VA_CURSOR, NV_VA_BASE);
+
+    # Three persistent host BOs, VM_BIND'd once: QMD, pushbuffer, param bank.
+    var bo[24];
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    if (rc != 0) {
+        native_nv_channel_free(fd, chid); sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
+    }
+    store64(ctx + NV_CTX_QMD_HANDLE, load64(&bo + 0));
+    store64(ctx + NV_CTX_QMD_VA,     load64(&bo + 8));
+    store64(ctx + NV_CTX_QMD_ADDR,   load64(&bo + 16));
+
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    if (rc != 0) {
+        native_nv_channel_free(fd, chid); sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
+    }
+    store64(ctx + NV_CTX_PUSH_HANDLE, load64(&bo + 0));
+    store64(ctx + NV_CTX_PUSH_VA,     load64(&bo + 8));
+    store64(ctx + NV_CTX_PUSH_ADDR,   load64(&bo + 16));
+
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    if (rc != 0) {
+        native_nv_channel_free(fd, chid); sys_close(fd);
+        return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
+    }
+    store64(ctx + NV_CTX_PARAM_HANDLE, load64(&bo + 0));
+    store64(ctx + NV_CTX_PARAM_VA,     load64(&bo + 8));
+    store64(ctx + NV_CTX_PARAM_ADDR,   load64(&bo + 16));
+
+    store64(ctx + NV_CTX_BACKEND, backend_nvidia_new());
+    _sk_info_cstr("mabda: gpu context created (native nvidia)");
+    return gpu_ok(ctx);
+}
+
+# ================================================================
+# v0 slot implementations
+# ================================================================
+
+# Native NVIDIA contexts are built via gpu_context_new_native_nvidia(), not
+# from a wgpu-shaped preinit struct — stub, matching the AMD slot.
+fn _backend_nvidia_ctx_create_from_preinit(preinit_ptr): i64 {
+    return 0;
+}
+
+# Release: free the NVIF object's channel, close the fd (which auto-releases
+# all BOs the channel owns). Null-safe.
+fn _backend_nvidia_ctx_release(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    var fd = nv_ctx_fd(ctx);
+    var chid = nv_ctx_chid(ctx);
+    if (fd > 0) {
+        native_nv_channel_free(fd, chid);
+        sys_close(fd);
+    }
+    return 0;
+}
+
+# Create a host-visible buffer of `size` bytes (a 64 KiB host BO VM_BIND'd at
+# a fresh VA). `usage` is ignored (a host BO is general-purpose). Returns an
+# NV_BUF struct ptr or 0 on bad input / ioctl failure.
+fn _backend_nvidia_buffer_create(ctx, size, usage): i64 {
+    if (ctx == 0) { return 0; }
+    if (size <= 0) { return 0; }
+    if (size > NV_BO_SIZE) { return 0; }   # v0: single-BO buffers (<=64 KiB)
+    var bo[24];
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    var buf = alloc(NV_BUF_STRUCT_SIZE);
+    memset(buf, 0, NV_BUF_STRUCT_SIZE);
+    store64(buf + NV_BUF_HANDLE, load64(&bo + 0));
+    store64(buf + NV_BUF_VA,     load64(&bo + 8));
+    store64(buf + NV_BUF_ADDR,   load64(&bo + 16));
+    store64(buf + NV_BUF_SIZE,   size);   # logical
+    return buf;
+}
+
+# Bounds-checked memcpy into the buffer's coherent mmap. Overflow-safe (off
+# checked > size before computing size-off). Returns 0|GPU_ERR_*.
+fn _backend_nvidia_buffer_write(ctx, buf, off, ptr, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (buf == 0) { return GPU_ERR_OTHER; }
+    if (ptr == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (off < 0)  { return GPU_ERR_BUFFER; }
+    var size = load64(buf + NV_BUF_SIZE);
+    var addr = load64(buf + NV_BUF_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (off > size) { return GPU_ERR_BUFFER; }
+    if (n > size - off) { return GPU_ERR_BUFFER; }
+    memcpy(addr + off, ptr, n);
+    return 0;
+}
+
+# Symmetric bounds-checked memcpy out of the buffer. Returns 0|GPU_ERR_*.
+fn _backend_nvidia_buffer_read(ctx, buf, off, ptr, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (buf == 0) { return GPU_ERR_OTHER; }
+    if (ptr == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (off < 0)  { return GPU_ERR_BUFFER; }
+    var size = load64(buf + NV_BUF_SIZE);
+    var addr = load64(buf + NV_BUF_ADDR);
+    if (addr == 0) { return GPU_ERR_BUFFER; }
+    if (off > size) { return GPU_ERR_BUFFER; }
+    if (n > size - off) { return GPU_ERR_BUFFER; }
+    memcpy(ptr, addr + off, n);
+    return 0;
+}
+
+# Release a buffer: VM_UNBIND + BO release, then zero the struct. The fd
+# close at ctx_release would also reap it, but explicit release lets a
+# program churn buffers without leaking VAs’ BOs. Null-safe.
+fn _backend_nvidia_buffer_release(ctx, buf): i64 {
+    if (ctx == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    var fd = nv_ctx_fd(ctx);
+    var handle = load64(buf + NV_BUF_HANDLE);
+    var va     = load64(buf + NV_BUF_VA);
+    var addr   = load64(buf + NV_BUF_ADDR);
+    if (handle != 0) {
+        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
+        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+    }
+    memset(buf, 0, NV_BUF_STRUCT_SIZE);
+    return 0;
+}
+
+# Create a shader module from pre-compiled SM75 SASS bytes. `kind` should be
+# SHADER_SRC_SASS (the NVIDIA tag); v0 accepts the bytes verbatim into a host
+# BO VM_BIND'd at a fresh VA (the QMD's PROGRAM_ADDRESS). REGISTER_COUNT is
+# the proof-of-life default (the captured store_deadbeef kernel = 4 GPRs);
+# real per-shader regcount metadata arrives with the N9 SPIR-V->SASS compiler.
+# Returns an NV_SHMOD struct ptr or 0 on failure.
+fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
+    if (ctx == 0) { return 0; }
+    if (bytes_ptr == 0) { return 0; }
+    if (n <= 0) { return 0; }
+    if (n > NV_BO_SIZE) { return 0; }
+    var bo[24];
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    var addr = load64(&bo + 16);
+    memcpy(addr, bytes_ptr, n);   # SASS program bytes -> the program BO
+    var shmod = alloc(NV_SHMOD_STRUCT_SIZE);
+    memset(shmod, 0, NV_SHMOD_STRUCT_SIZE);
+    store64(shmod + NV_SHMOD_HANDLE,   load64(&bo + 0));
+    store64(shmod + NV_SHMOD_VA,       load64(&bo + 8));
+    store64(shmod + NV_SHMOD_ADDR,     addr);
+    store64(shmod + NV_SHMOD_REGCOUNT, NV_SASS_STORE_DEADBEEF_REGCOUNT);
+    store64(shmod + NV_SHMOD_SIZE,     n);
+    return shmod;
+}
+
+# Release a shader module: VM_UNBIND + BO release, zero the struct. Null-safe.
+fn _backend_nvidia_shader_module_release(ctx, shmod): i64 {
+    if (ctx == 0) { return 0; }
+    if (shmod == 0) { return 0; }
+    var fd = nv_ctx_fd(ctx);
+    var handle = load64(shmod + NV_SHMOD_HANDLE);
+    var va     = load64(shmod + NV_SHMOD_VA);
+    var addr   = load64(shmod + NV_SHMOD_ADDR);
+    if (handle != 0) {
+        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
+        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+    }
+    memset(shmod, 0, NV_SHMOD_STRUCT_SIZE);
+    return 0;
+}
+
+# Dispatch a compute grid (x,y,z workgroups) of `shmod` with the buffer at
+# `bp` bound as c[0x0]+0x160 (the ptxas kernel-param output pointer). Builds
+# the QMD + dispatch pushbuffer into the persistent context BOs, EXECs on the
+# channel, and waits on an ABSOLUTE syncobj deadline (the N4 blocker fix).
+# Returns 0|GPU_ERR_*.
+fn _backend_nvidia_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
+    if (ctx == 0)   { return GPU_ERR_OTHER; }
+    if (shmod == 0) { return GPU_ERR_OTHER; }
+    if (bp == 0)    { return GPU_ERR_OTHER; }
+    if (x <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (y <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (z <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (validate_dispatch(x, y, z, MABDA_MAX_DISPATCH_DIM) != 0) {
+        return GPU_ERR_WORKGROUP_LIMIT;
+    }
+
+    var fd   = nv_ctx_fd(ctx);
+    var chid = nv_ctx_chid(ctx);
+    var prog_va  = load64(shmod + NV_SHMOD_VA);
+    var regcount = load64(shmod + NV_SHMOD_REGCOUNT);
+    var out_va   = load64(bp + NV_BUF_VA);
+    var qmd_addr   = load64(ctx + NV_CTX_QMD_ADDR);
+    var qmd_va     = load64(ctx + NV_CTX_QMD_VA);
+    var push_addr  = load64(ctx + NV_CTX_PUSH_ADDR);
+    var push_va    = load64(ctx + NV_CTX_PUSH_VA);
+    var param_addr = load64(ctx + NV_CTX_PARAM_ADDR);
+    var param_va   = load64(ctx + NV_CTX_PARAM_VA);
+
+    # Param bank: output pointer at c[0x0]+0x160 (ptxas sm_70+ kernel-param ABI).
+    store64(param_addr + 0x160, out_va);
+    # QMD: program / regcount / const0 = the param bank (size 0x200).
+    native_nv_qmd_build(qmd_addr, prog_va, regcount, param_va, 0x200);
+    # Honor the requested grid (the builder defaults to 1,1,1):
+    # CTA_RASTER_WIDTH/HEIGHT/DEPTH at QMD +0x30/+0x34/+0x38.
+    store32(qmd_addr + 0x30, x);
+    store32(qmd_addr + 0x34, y);
+    store32(qmd_addr + 0x38, z);
+    # Dispatch pushbuffer: SET_OBJECT + memory windows + SEND_PCAS.
+    var push_len = native_nv_push_dispatch(push_addr, qmd_va);
+
+    var so[8];
+    memset(&so, 0, 8);
+    if (native_syncobj_create(fd, &so) != 0) { return GPU_ERR_OTHER; }
+    var sh = load32(&so);
+    # ABSOLUTE CLOCK_MONOTONIC deadline (now+1s) — native_syncobj_wait does
+    # NOT take a relative timeout. A bare 1e9 (=1s after boot) returns ETIME
+    # instantly, before nouveau's async EXEC fence signals. This was THE N4
+    # gate blocker.
+    var deadline = _time_now_ns() + 1000000000;
+
+    var rc = native_nv_exec_submit(fd, chid, push_va, push_len, sh);
+    if (rc != 0) { native_syncobj_destroy(fd, sh); return GPU_ERR_OTHER; }
+    rc = native_syncobj_wait(fd, sh, deadline);
+    native_syncobj_destroy(fd, sh);
+    if (rc != 0) { return GPU_ERR_OTHER; }
+    return 0;
+}
+
+# Native dispatch is synchronous (waits on the syncobj before returning), so
+# device_wait_idle is a no-op — matches the AMD slot.
+fn _backend_nvidia_device_wait_idle(ctx): i64 {
+    return 0;
+}
+
+# ================================================================
+# Backend construction — v0 slot block + kind
+# ================================================================
+# Fills offsets 0..80 + kind. Higher ranges (texture/render/surface) are
+# left zero until N6/N7/N8; backend_is_complete reports incomplete past v0
+# for this backend by design (the slots are genuinely not implemented yet).
+fn backend_nvidia_new(): i64 {
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_CREATE_FROM_PREINIT,
+    &_backend_nvidia_ctx_create_from_preinit);
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE,
+    &_backend_nvidia_ctx_release);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE,
+    &_backend_nvidia_buffer_create);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_WRITE,
+    &_backend_nvidia_buffer_write);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_READ,
+    &_backend_nvidia_buffer_read);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE,
+    &_backend_nvidia_buffer_release);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE,
+    &_backend_nvidia_shader_module_create);
+    backend_set_slot(b, BACKEND_SLOT_SHADER_MODULE_RELEASE,
+    &_backend_nvidia_shader_module_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH,
+    &_backend_nvidia_compute_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_DEVICE_WAIT_IDLE,
+    &_backend_nvidia_device_wait_idle);
+    backend_set_kind(b, BACKEND_KIND_NVIDIA);
+    return b;
+}

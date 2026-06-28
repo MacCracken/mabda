@@ -316,6 +316,18 @@ build/nvidia_compute_store: programs/nvidia_compute_store.cyr src/*.cyr
 test-nvidia-compute-store: build/nvidia_compute_store
 	./build/nvidia_compute_store
 
+# v4.0 Phase N4.7 — the same 0xDEADBEEF compute dispatch, but driven through
+# the PUBLIC mabda API (gpu_context_new_native_nvidia + gpu_buffer_* +
+# gpu_shader_module_* + gpu_compute_dispatch), proving the v0 Backend slots
+# are functionally wired. Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_compute_api: programs/nvidia_compute_api.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_compute_api.cyr $@
+
+.PHONY: test-nvidia-compute-api
+test-nvidia-compute-api: build/nvidia_compute_api
+	./build/nvidia_compute_api
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

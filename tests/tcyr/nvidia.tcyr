@@ -340,6 +340,46 @@ fn test_nv_backend_kind_reserved() {
     return 0;
 }
 
+# N4.7 — backend_nvidia_new() fills the v0 slot block (0..80) + kind, and the
+# NVIDIA GpuContext / buffer / shmod field maps are pinned. backend_is_complete
+# stays honest: v0-filled but texture range (88..) still zero -> reports
+# incomplete (by design until N6/N7/N8). No HW — pure slot-table + layout.
+fn test_nv_backend_v0_slots() {
+    # SASS shader-source tag (Phase N5), distinct from GFX9.
+    assert_eq(SHADER_SRC_SASS, 3, "SHADER_SRC_SASS == 3");
+
+    var b = backend_nvidia_new();
+    # Every v0 fnptr slot (0..80, step 8) must be non-zero.
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v0 slot filled");
+        off = off + 8;
+    }
+    # kind at +80.
+    assert_eq(backend_kind(b), BACKEND_KIND_NVIDIA, "nvidia_new kind == NVIDIA");
+    # Honest completeness: v0 filled, texture+ ranges still zero -> incomplete.
+    assert_eq(backend_is_complete(b), 0, "nvidia backend incomplete past v0 (honest)");
+    # Specific load-bearing slots resolve to the NVIDIA impls.
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH), 0, "dispatch slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE), 0, "buffer_create slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE), 0, "shader_create slot set");
+
+    # NVIDIA GpuContext field map: the Backend* MUST live at +32 (the only
+    # cross-backend-fixed field, read by gpu_ctx_backend).
+    assert_eq(NV_CTX_BACKEND, 32, "nvidia ctx backend at +32 (canonical)");
+    assert_eq(NV_CTX_FD, 0, "nvidia ctx fd at +0");
+    assert_eq(NV_CTX_CHID, 8, "nvidia ctx chid at +8");
+    # The whole NVIDIA ctx field map fits the 176-byte GpuContext blob.
+    assert_eq(NV_CTX_PARAM_ADDR < GPU_CONTEXT_SIZE, 1, "nvidia ctx fields fit GpuContext");
+
+    # Buffer / shmod struct shapes — bp's VA is read at +8 by the dispatch.
+    assert_eq(NV_BUF_VA, 8, "nvidia buf VA at +8 (bp output ptr)");
+    assert_eq(NV_BUF_STRUCT_SIZE, 32, "nvidia buf struct = 32 bytes");
+    assert_eq(NV_SHMOD_VA, 8, "nvidia shmod program VA at +8");
+    assert_eq(NV_SHMOD_REGCOUNT, 24, "nvidia shmod regcount at +24");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -368,5 +408,6 @@ fn main() {
     test_nv_exec_nvif_ioctl_encoding();
     test_nv_qmd_build();
     test_nv_backend_kind_reserved();
+    test_nv_backend_v0_slots();
     return assert_summary();
 }
