@@ -114,13 +114,72 @@ queue-init stream (in scratch) — but most of it is NVK's 3D+compute combined
 init; mabda needs only the compute-class subset (shader local/shared mem
 sizing, exceptions, cache invalidate) before the first dispatch.
 
-## N4 implementation status — 2026-06-27 (gate NOT yet green; precise state)
+## N4 implementation status — GATE GREEN (2026-06-28)
 
-Everything is built and CPU-locked (nvidia.tcyr 120 asserts; QMD byte-matches
-the golden on all fixed fields; method headers byte-match the capture):
+**THE ARC GATE IS GREEN.** `make test-nvidia-compute-store` reads back
+`0xDEADBEEF` twice on the same channel via a pure-Cyrius nouveau dispatch
+(exit 0, stable across repeated runs). N4 (N4.3/N4.5/N4.6) is complete and
+HW-proven on the TU116.
+
+### Root cause of the "global-store hang" — it was the syncobj wait, not the dispatch
+
+The store **was never the problem**. The entire 2026-06-27 "global store
+silently hangs" symptom (syncobj ETIME, readback 0) was a **relative-vs-absolute
+timeout bug** in how `programs/nvidia_compute_store.cyr` called
+`native_syncobj_wait`:
+
+- `native_syncobj_wait(fd, handle, timeout_ns)` takes an **absolute
+  CLOCK_MONOTONIC** deadline (`DRM_IOCTL_SYNCOBJ_WAIT.timeout_nsec` is
+  absolute; see `backend_native_amdgpu.cyr:531`).
+- The gate passed a bare `1000000000` (1e9) as that argument — interpreted as
+  "1 second **after boot**", a deadline long in the past. The DRM wait
+  therefore returned `ETIME` (-62) **immediately**, before nouveau's
+  **asynchronous** EXEC fence had a chance to signal. The dispatch had already
+  completed and the store had already landed; the wait just gave up first.
+- The AMD native path never hit this because an amdgpu CS fence is typically
+  already signaled by the time the wait ioctl runs (the kernel's
+  signaled-check precedes the timeout-check), so a past absolute deadline
+  still returns 0. nouveau's EXEC fence signals a few microseconds *later*,
+  which exposed the latent caller bug.
+
+**Fix:** compute an absolute deadline at the call site, matching the
+established AMD idiom (`backend_native.cyr:1870`):
+`var deadline = _time_now_ns() + 1000000000;` then
+`native_syncobj_wait(fd, sh, deadline)`.
+
+**How it was isolated:** a throwaway `nvidia_fence_probe` submitted a
+**state-only** pushbuffer (SET_OBJECT + the two memory windows, *no*
+SEND_PCAS) and waited. It *also* ETIMEd with the relative timeout, and
+*signaled* (rc=0) with an absolute one — proving the EXEC-sync path was the
+fault, not the compute dispatch / QMD / SASS. The probe was removed once the
+gate went green; re-derive it from this paragraph if a future EXEC-sync
+regression needs isolating.
+
+**The 2026-06-27 "five eliminated causes" (window classification, VA height,
+BO domain, page kind, store scope) were red herrings** chasing a
+non-existent dispatch bug — except the memory-windows fix (below), which was a
+*real* latent bug that would have bitten once the timeout was corrected.
+**The QMD / SASS / method stream were correct all along.** A field-by-field
+byte-diff of mabda's generated QMD vs the NVK golden (with identical VAs)
+confirms only intended deltas: mabda's shader-specific `REGISTER_COUNT_V=4`
+(golden=24 is NVK's *different* shader), NVK's extra driver constant-buffer
+`CONSTANT_BUFFER[1]` (mabda's trivial kernel reads only `c[0x0][0x160]`), and
+the `CONSTANT_BUFFER[0]` size. `SM_GLOBAL_CACHING_ENABLE`, the version stamp,
+grid/block dims, and `CONSTANT_BUFFER[0]` addr all match.
+
+### Build inventory (all CPU-locked, nvidia.tcyr 121 asserts)
+
 `backend_nvidia_qmd.cyr`, `backend_nvidia_push.cyr`, `native_nv_object_new`
 (NVIF 0xC5C0, byte-matched), `native_nv_exec_submit`, and
 `programs/nvidia_compute_store.cyr`.
+
+---
+
+### Historical investigation record (2026-06-27, pre-root-cause)
+
+The notes below are preserved as the investigation trail; read them knowing
+the **actual** blocker was the syncobj-timeout bug above, not a dispatch-init
+gap.
 
 **HW-proven so far:** the gate runs `VM_INIT → CHANNEL_ALLOC → NVIF 0xC5C0 →
 GEM_NEW + VM_BIND (×5) → EXEC` with no error, and **the SASS shader executes

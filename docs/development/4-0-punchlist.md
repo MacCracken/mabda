@@ -1,26 +1,34 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress (2026-06-27). **N0–N3 + N5.1/5.2 done and
-HW-proven on the TU116; N4 (compute arc gate) is the active front.**
+**Status:** In progress. **N0–N5.3 done and HW-proven on the TU116 — the
+N4 compute arc gate is GREEN (2026-06-28). Next front: N4.7 backend
+integration, then N6 textures.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
-> **Resume here (next session):** the arc gate
-> `programs/nvidia_compute_store.cyr` is **not yet green**. The full
-> pure-Cyrius pipeline builds + runs through `EXEC` and the SASS shader
-> executes on HW, but a generic **global-store completion hangs** (syncobj
-> ETIME, no fault). Five causes were eliminated on HW (windows, VA height,
-> BO domain, page-kind, store scope); the remaining cause is **insufficient
-> channel/dispatch init** (NVK's fuller multi-class sequence /
-> replayable-fault setup). Full diagnosis, elimination log, and the
-> concrete next step are in
-> [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) § N4
-> implementation status. The NVK-capture harness (to re-capture the
-> known-good stream) is preserved at `tools/nvidia-capture/`.
+> **THE ARC GATE IS GREEN (2026-06-28):** `make test-nvidia-compute-store`
+> reads back `0xDEADBEEF` twice on the same channel via a pure-Cyrius
+> nouveau dispatch (exit 0, stable across runs). **Root cause of the
+> 2026-06-27 "global-store hang" was a relative-vs-absolute syncobj-timeout
+> bug**, not a dispatch-init gap: the gate passed a bare `1e9` to
+> `native_syncobj_wait` (which takes an **absolute** CLOCK_MONOTONIC
+> deadline), so the DRM wait returned ETIME instantly — long before
+> nouveau's async EXEC fence signaled. The dispatch had always completed.
+> The QMD/SASS/method stream were correct all along; the "five eliminated
+> causes" were red herrings (except the real memory-windows fix). Full
+> writeup in [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md)
+> § N4 implementation status — GATE GREEN. The NVK-capture harness is
+> preserved at `tools/nvidia-capture/`.
+>
+> **Resume here (next session):** **N4.7** — wire
+> `gpu_context_new_native_nvidia()` + `backend_nvidia_new()` v0 slot-filler
+> (the integration layer; the gate proves the raw path works). Then **N6**
+> textures.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
-> (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`). CPU
-> suite: `tests/tcyr/nvidia.tcyr` (121 asserts). ADR 007 **Accepted**.
+> (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
+> compute store (`-compute-store`)**. CPU suite: `tests/tcyr/nvidia.tcyr`
+> (121 asserts). ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -434,34 +442,32 @@ an afternoon to a few days.
   `MW(hi:lo)` bit range. **CPU assert:** QMD size == 256; each field's bit
   offset; **byte-diff against the N0.7 captured known-good QMD** (the PM4
   protocol — do not claim correct until the HW-capture diff matches).
-- [~] **N4.3** — Dispatch staging lives in `native_nv_push_dispatch`
-  (`backend_nvidia_push.cyr`) + `native_nv_object_new` (NVIF 0xC5C0) in the
-  nouveau module. Current stream: `SET_OBJECT(0xC5C0)` → shared/local memory
-  windows → `SEND_PCAS_A` → `SEND_SIGNALING_PCAS_B`. **Insufficient for the
-  gate** — NVK's real dispatch (capture `082`) also issues extra
-  compute-subchannel methods (`0x0298`/`0x1424`/`0x0244`) **and** 3D-class
-  (0xC597) housekeeping on a fuller multi-class channel. Fuller init is the
-  open work (see [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md)
-  § N4 implementation status). A dedicated `backend_nvidia.cyr` + the
-  ≤6-arg slot wrapper still to come.
+- [x] **N4.3** — Dispatch staging in `native_nv_push_dispatch`
+  (`backend_nvidia_push.cyr`) + `native_nv_object_new` (NVIF 0xC5C0). Stream:
+  `SET_OBJECT(0xC5C0)` → shared/local memory windows → `SEND_PCAS_A` →
+  `SEND_SIGNALING_PCAS_B`. **This minimal stream is SUFFICIENT** — HW-proven
+  by the green gate. The 2026-06-27 belief that it needed NVK's fuller
+  multi-class init (the `0x0298`/`0x1424`/`0x0244` invalidates + 0xC597
+  housekeeping) was wrong: those NVK methods are texture-pool binds + cache
+  hygiene irrelevant to a texture-free global-store kernel, and the actual
+  blocker was the syncobj-timeout bug (§ N4 notes). A dedicated
+  `backend_nvidia.cyr` + ≤6-arg slot wrapper lands with N4.7.
 - [x] **N4.4** — `native_nv_exec_submit` (`EXEC` 0x12) landed: one
   `exec_push{va,va_len}` + a sig `drm_nouveau_sync` syncobj; waits via the
   reused `native_syncobj_wait`. **HW-runs** (EXEC returns 0; channel
   accepts the submit). **CPU asserts** pin the exec/exec_push layout.
-- [~] **N4.5** — The captured SASS uses **`STG.E.SYS`** (system-scope store)
+- [x] **N4.5** — The captured SASS uses **`STG.E.SYS`** (system-scope store)
   — the coherency encoding the gate needs (CPU-asserted). The
-  release-after-dispatch ordering that guarantees CPU visibility is part of
-  the open store-completion nut (N4.6).
-- [~] **N4.6** — `programs/nvidia_compute_store.cyr` + `make
-  test-nvidia-compute-store` landed. **THE ARC GATE — not yet green.**
-  HW status: runs `VM_INIT → CHANNEL_ALLOC → NVIF 0xC5C0 → GEM_NEW/VM_BIND
-  → EXEC` and **the SASS shader executes** (HW-proven: it reached
-  `STG.E.SYS` and faulted at the store target when the memory windows were
-  mis-set). A real bug (memory windows = 0) was found + fixed. Remaining
-  blocker: the generic GLOBAL store silently hangs (syncobj ETIME, no Xid,
-  readback 0) — the minimal dispatch stream needs NVK's fuller multi-class
-  init (N4.3). Full diagnosis + next step in
-  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md).
+  nouveau EXEC out-syncobj fence provides the release/visibility ordering;
+  HW-proven (readback correct after the fence signals).
+- [x] **N4.6** — `programs/nvidia_compute_store.cyr` + `make
+  test-nvidia-compute-store` — **THE ARC GATE — GREEN (2026-06-28).** Runs
+  `VM_INIT → CHANNEL_ALLOC → NVIF 0xC5C0 → GEM_NEW/VM_BIND → EXEC → fence
+  wait → readback`, reading `0xDEADBEEF` twice on the same channel (exit 0,
+  stable). Two real bugs fixed end-to-end: the memory-windows extraction bug
+  (2026-06-27) and the relative-vs-absolute `native_syncobj_wait` deadline
+  bug (2026-06-28, the true blocker). Full diagnosis in
+  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) § GATE GREEN.
 - [ ] **N4.7** — Wire `gpu_context_new_native_nvidia()` (the
   `gpu_context_new_native` analogue) + `backend_nvidia_new()` slot-filler
   for the **v0 block only** (offsets 0..80: ctx_create/release,
