@@ -357,30 +357,35 @@ an afternoon to a few days.
 
 ### N3 — Channel + GPFIFO + VM + submit setup
 
-- [ ] **N3.1** — `native_nv_vm_init` (`DRM_NOUVEAU_VM_INIT`, **0x10**) —
-  **must run first**, before any channel/BO bind. Sets up the
-  userspace-managed GPU VA space (kernel_managed region bookkeeping).
-  **CPU assert:** `drm_nouveau_vm_init` struct shape; ioctl number.
-- [ ] **N3.2** — `native_nv_channel_alloc` (`DRM_NOUVEAU_CHANNEL_ALLOC`,
-  **0x02**, legacy abi16) — engine/class pick + USERD/notifier; returns
-  the channel handle `drm_nouveau_exec.channel` references. The AMD `CTX`
-  analogue. **CPU assert:** channel-alloc param struct byte layout; pin
-  against NVK's `nouveau_ws_context`.
-- [ ] **N3.3** — `native_nv_vm_bind` (`DRM_NOUVEAU_VM_BIND`, **0x11**,
-  op `MAP`/`UNMAP`) — the `GEM_VA` analogue; reuse the per-ctx VA
-  bump-cursor allocator pattern. Honor NVIDIA 64 KiB / big-page alignment
-  rules. **CPU assert:** `drm_nouveau_vm_bind` / `vm_bind_op` offsets;
-  VA-range isolation; alignment guard.
-- [ ] **N3.4** — DRM syncobj create/destroy/wait — **reuse the generic
-  DRM wrappers from `backend_native_amdgpu.cyr` verbatim** (driver-agnostic
-  `DRM_IOCTL_SYNCOBJ_*`); `drm_nouveau_sync` carries them on `EXEC`.
-  **CPU assert:** `drm_nouveau_sync` struct shape (`flags`/`handle`/
-  `timeline_value`).
-- [ ] **N3.5** — `programs/nvidia_channel_setup.cyr` (mirrors
-  `native_submit_setup.cyr`): `VM_INIT` → `CHANNEL_ALLOC` → `GEM_NEW`
-  every prerequisite BO (SASS program, QMD, const-buffer, output,
-  pushbuffer, semaphore) → `VM_BIND` each → tear down clean. **EXIT:** all
-  allocate/bind without error. HW-gated.
+- [x] **N3.1** — `native_nv_vm_init` (`VM_INIT` 0x10) — landed in N1 (the
+  masterless probe), CPU-asserted, and re-exercised first in the N3 setup.
+  Must be the **first ioctl on the fd** (kernel `-ENOSYS` otherwise).
+  HW-proven (rc=0).
+- [x] **N3.2** — `native_nv_channel_alloc` (`CHANNEL_ALLOC` 0x02) +
+  `native_nv_channel_id` + `native_nv_channel_free`. Fields pinned from
+  NVK: `fb_ctxdma_handle=~0`, `tt_ctxdma_handle=GR(0x01)` (compute runs on
+  GR). **HW-proven** (chid=9 on the TU116). Kernel auto-allocates the
+  GPFIFO/USERD/notifier and binds the channel to the uvmm — the UMD never
+  touches USERD/doorbell (EXEC uAPI). **SCOPE FINDING:** the compute
+  **class object `TURING_COMPUTE_A 0xC5C0`** is NOT created by
+  CHANNEL_ALLOC; it needs a separate `NVIF` (0x07) or deprecated
+  `GROBJ_ALLOC` (0x04) step before EXEC — **deferred to N4 + a DECISION
+  (NVIF vs GROBJ).** Not needed for the N3.5 setup milestone. **CPU
+  assert:** ioctl number + 88-byte layout + chid accessor.
+- [x] **N3.3** — `native_nv_vm_bind_map` / `native_nv_vm_unbind`
+  (`VM_BIND` 0x11). Synchronous (flags=0, sync counts 0 — kernel EINVALs
+  otherwise); op_ptr → stack vm_bind_op. Safe VA base `0x10000` (64 KiB,
+  below the 1<<39 kernel split). **HW-proven** (MAP+UNMAP @ va 0x10000).
+  **CPU assert:** ioctl number + vm_bind_op offsets + alignment constants.
+- [x] **N3.4** — `native_nv_sync_build` (drm_nouveau_sync, 16B); syncobj
+  create/destroy/wait **reused verbatim** from `backend_native_amdgpu.cyr`
+  (`native_syncobj_*`, driver-agnostic). HW-proven (create/destroy).
+  **CPU assert:** sync struct shape (flags/handle/timeline_value).
+- [x] **N3.5** — `programs/nvidia_channel_setup.cyr` +
+  `make test-nvidia-channel-setup`, **passing on HW**: `VM_INIT` →
+  `CHANNEL_ALLOC` → `GEM_NEW` → `VM_BIND` MAP/UNMAP → syncobj → clean
+  teardown, exit 0. Mapped failure-class exit codes (1–7). (Multi-BO
+  alloc/bind of the full prerequisite set lands with N4's dispatch.)
 
 ### N4 — Compute dispatch proof-of-life (0xDEADBEEF readback) — THE ARC GATE
 
@@ -442,19 +447,25 @@ an afternoon to a few days.
 > Mutually gating with N4 — proof-of-life needs a valid QMD **and** valid
 > SASS together. Sequence N4 + N5 as one push.
 
-- [ ] **N5.1** — Per the N0.5 doctrine call, produce the store-0xDEADBEEF
-  SM75 SASS. If capture: `nvcc -arch=sm_75 -cubin` → `cuobjdump
-  --dump-sass` / `nvdisasm -hex`, embed dwords in
-  `src/backend_nvidia_sass.cyr` (the `backend_native_shaders.cyr`
-  analogue). **CPU assert:** SASS byte count + every dword pinned.
-- [ ] **N5.2** — `scripts/disasm-sass.sh` — one-directional verify
-  oracle (encode → `nvdisasm` → diff), the SASS analog of
-  `scripts/disasm-shaders.sh`. Hand-encoded bytes with no verify are a
-  silent-corruption trap.
-- [ ] **N5.3** — Extract launch-ABI metadata from the cubin ELF
-  (register count, shared-mem size, constant-bank `c[0x0]` param layout)
-  and feed it into the N4.2 QMD — they must agree exactly or the SASS
-  reads garbage.
+- [x] **N5.1** — `src/backend_nvidia_sass.cyr` landed via ptxas-capture
+  (CUDA 13.3 `nvcc -arch=sm_75 -cubin`; `.text.store_deadbeef` = 128 bytes
+  / 8 instructions extracted). `native_nv_sass_store_deadbeef(dst)` writes
+  the program byte-identical to the cubin section. SASS:
+  `MOV R0,0xdeadbeef` / `ULDC.64 UR4,c[0x0][0x160]` / `STG.E.SYS [UR4],R0`
+  / `EXIT`. Wired into `src/lib.cyr` (SASS slot, after the nouveau ioctl
+  module). **CPU asserts:** byte/dword counts + key dwords pinned. lint/
+  fmt clean.
+- [x] **N5.2** — `scripts/disasm-sass.sh` — one-directional oracle
+  (`nvdisasm -b SM75`, the SASS analog of `disasm-shaders.sh`). The
+  embedded dwords round-trip to the exact expected SASS (verified
+  2026-06-27). Dwords kept in sync with the module (same hand-maintained
+  list pattern as the AMD oracle).
+- [~] **N5.3** — Launch-ABI metadata extracted (`cuobjdump
+  --dump-resource-usage`): **`REG:4, SHARED:0`, kernel param (output ptr)
+  at `c[0x0][0x160]`, size 8**. Pinned as `NV_SASS_STORE_DEADBEEF_*`
+  constants in the module. **Feeds the N4.2 QMD** (REGISTER_COUNT=4,
+  SHARED_MEMORY_SIZE=0) and the constant-bank/param reflection — closes
+  when the QMD consumes them at N4.
 - [ ] **N5.4** — In parallel (sovereignty confidence-builder): hand-encode
   a 2–3 instruction `MOV` / `STG.E.SYS` / `EXIT`, with the correct stall
   count + write-barrier before `EXIT`, verified against `nvdisasm`. Proves

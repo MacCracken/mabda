@@ -158,6 +158,100 @@ fn test_nv_gem_info_struct_layout() {
     return 0;
 }
 
+fn test_nv_channel_alloc_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_CHANNEL_ALLOC_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x02);
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, expected, "CHANNEL_ALLOC ioctl = 0xC0586442");
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, 0xC0586442, "CHANNEL_ALLOC precomputed");
+    assert_eq(DRM_NOUVEAU_CHANNEL_ALLOC_SIZE, 88, "channel_alloc struct = 88 bytes");
+    return 0;
+}
+
+fn test_nv_vm_bind_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_VM_BIND_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x11);
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_BIND, expected, "VM_BIND ioctl = 0xC0286451");
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_BIND, 0xC0286451, "VM_BIND precomputed");
+    assert_eq(DRM_NOUVEAU_VM_BIND_SIZE, 40, "vm_bind struct = 40 bytes");
+    return 0;
+}
+
+fn test_nv_channel_free_ioctl_encoding() {
+    # _IOW('d', base + 0x03, drm_nouveau_channel_free[4]).
+    var expected = native_ioc_encode(1, 4, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x03);
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_FREE, expected, "CHANNEL_FREE ioctl = 0x40046443");
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_FREE, 0x40046443, "CHANNEL_FREE precomputed");
+    return 0;
+}
+
+fn test_nv_channel_engine_constants() {
+    assert_eq(NOUVEAU_FIFO_ENGINE_GR, 0x01, "GR engine = 0x01 (compute)");
+    assert_eq(NOUVEAU_FIFO_ENGINE_CE, 0x30, "CE engine = 0x30 (copy)");
+    assert_eq(DRM_NOUVEAU_VM_BIND_OP_MAP, 0x0, "VM_BIND MAP = 0");
+    assert_eq(DRM_NOUVEAU_VM_BIND_OP_UNMAP, 0x1, "VM_BIND UNMAP = 1");
+    # Safe UMD VA: 64 KiB-aligned, non-null, below the 1<<39 kernel split.
+    assert_eq(NOUVEAU_UMD_VA_BASE, 0x10000, "UMD VA base = 64 KiB");
+    assert_eq(NOUVEAU_UMD_VA_BASE & 0xFFFF, 0, "UMD VA base is 64 KiB-aligned");
+    return 0;
+}
+
+fn test_nv_channel_id_accessor() {
+    # channel (chid) reads back from offset +8 of the alloc struct.
+    var req[88];
+    memset(&req, 0, 88);
+    store32(&req + 8, 0x2A);   # simulate kernel-returned chid
+    assert_eq(native_nv_channel_id(&req), 0x2A, "chid accessor reads +8");
+    return 0;
+}
+
+fn test_nv_vm_bind_op_layout() {
+    # Mirror native_nv_vm_bind_map's op packing; assert byte offsets.
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);
+    store32(&op + 8, 0x55);          # handle
+    store64(&op + 16, NOUVEAU_UMD_VA_BASE);
+    store64(&op + 32, 0x1000);       # range
+    assert_eq(load32(&op + 0), 0, "op = MAP at +0");
+    assert_eq(load32(&op + 8), 0x55, "handle at +8");
+    assert_eq(load64(&op + 16), 0x10000, "addr at +16");
+    assert_eq(load64(&op + 32), 0x1000, "range at +32");
+    return 0;
+}
+
+fn test_nv_sync_build() {
+    var buf[16];
+    memset(&buf, 0, 16);
+    native_nv_sync_build(&buf, 0x9);
+    assert_eq(load32(&buf + 0), DRM_NOUVEAU_SYNC_SYNCOBJ, "sync flags = SYNCOBJ at +0");
+    assert_eq(load32(&buf + 4), 0x9, "sync handle at +4");
+    assert_eq(load64(&buf + 8), 0, "timeline_value at +8");
+    assert_eq(DRM_NOUVEAU_SYNC_SIZE, 16, "drm_nouveau_sync = 16 bytes");
+    return 0;
+}
+
+fn test_nv_sass_store_deadbeef() {
+    # Embedded SM75 SASS (captured + nvdisasm-verified): counts, launch
+    # ABI for the N4.2 QMD, and byte-exact key dwords.
+    assert_eq(NV_SASS_STORE_DEADBEEF_BYTES, 128, "SASS = 128 bytes");
+    assert_eq(NV_SASS_STORE_DEADBEEF_DWORDS, 16, "SASS = 16 u64 dwords");
+    assert_eq(NV_SASS_STORE_DEADBEEF_REGCOUNT, 4, "regcount = 4 (N4.2 QMD)");
+    assert_eq(NV_SASS_STORE_DEADBEEF_SHMEM, 0, "shared mem = 0");
+    assert_eq(NV_SASS_STORE_DEADBEEF_PARAM_OFF, 0x160, "output ptr at c[0x0][0x160]");
+    assert_eq(NV_SASS_STORE_DEADBEEF_PARAM_SIZE, 8, "param = one u64 ptr");
+
+    # Materialize the program; check byte-exact at key offsets.
+    var prog[128];
+    memset(&prog, 0, 128);
+    var n = native_nv_sass_store_deadbeef(&prog);
+    assert_eq(n, 128, "writes 128 bytes");
+    assert_eq(load64(&prog + 0), 0x00000a0000017a02, "first instr: MOV R1, c[0x0][0x28]");
+    assert_eq(load64(&prog + 16), 0xdeadbeef00007802, "MOV R0, 0xdeadbeef dword");
+    assert_eq(load64(&prog + 48), 0x00000000ff007986, "STG.E.SYS [UR4], R0 dword");
+    assert_eq(load64(&prog + 64), 0x000000000000794d, "EXIT dword");
+    return 0;
+}
+
 fn test_nv_backend_kind_reserved() {
     # Punchlist N0.8: NVIDIA kind reserved up front, no struct change.
     assert_eq(BACKEND_KIND_NVIDIA, 3, "BACKEND_KIND_NVIDIA == 3");
@@ -183,6 +277,14 @@ fn main() {
     test_nv_gem_domain_flags();
     test_nv_gem_new_struct_layout();
     test_nv_gem_info_struct_layout();
+    test_nv_channel_alloc_ioctl_encoding();
+    test_nv_vm_bind_ioctl_encoding();
+    test_nv_channel_free_ioctl_encoding();
+    test_nv_channel_engine_constants();
+    test_nv_channel_id_accessor();
+    test_nv_vm_bind_op_layout();
+    test_nv_sync_build();
+    test_nv_sass_store_deadbeef();
     test_nv_backend_kind_reserved();
     return assert_summary();
 }

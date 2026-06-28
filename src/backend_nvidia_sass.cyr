@@ -1,0 +1,64 @@
+# @internal — native NVIDIA backend, pre-compiled SM75 SASS programs
+# backend_nvidia_sass.cyr — the backend_native_shaders.cyr analogue for
+# the v4.0 NVIDIA arc (Phase N5). Holds captured/verified Turing (SM75)
+# machine code, embedded as raw dwords, plus the launch-ABI metadata the
+# N4.2 QMD must mirror.
+#
+# Provenance (ADR 007, Fork 3 — ptxas-capture doctrine): compiled offline
+# with CUDA 13.3 `nvcc -arch=sm_75 -cubin store_deadbeef.cu`, the
+# .text.store_deadbeef section extracted (128 bytes, 8 instructions), and
+# verified to round-trip via `nvdisasm -b SM75` (scripts/disasm-sass.sh).
+# libdevice non-contamination confirmed (ADR 007 hygiene, 2026-06-27):
+# exactly one function, zero __nv_/Attachment-A device code — GPL-3.0 clean.
+#
+# CUDA tooling is BUILD-TIME ONLY; these are inert dwords loaded into a
+# program BO and launched via raw ioctl — the runtime stays pure-Cyrius.
+#
+# Turing instruction layout: each instruction is 128 bits = two
+# little-endian u64 in memory order [opcode_word, control_word]. The
+# control word carries the mandatory software-scoreboard fields (stall /
+# yield / read+write barrier indices / wait mask) that ptxas already
+# computed — the hard part, baked in by capture.
+#
+# store_deadbeef SASS (kernel: out[0] = 0xDEADBEEF):
+#   MOV     R1, c[0x0][0x28]        ; stack pointer
+#   MOV     R0, 0xdeadbeef          ; the constant
+#   ULDC.64 UR4, c[0x0][0x160]      ; output ptr from constant bank (param @0x160)
+#   STG.E.SYS [UR4], R0             ; system-scope store (N4.5 coherency — CPU-visible)
+#   EXIT
+#   BRA     0x50                    ; self-branch trap
+#   NOP ; NOP                       ; pad to 128 bytes
+
+var NV_SASS_STORE_DEADBEEF_BYTES  = 128;   # 8 instructions x 16 bytes
+var NV_SASS_STORE_DEADBEEF_DWORDS = 16;    # 8 instructions x 2 u64
+
+# Launch ABI (cuobjdump --dump-resource-usage) — the N4.2 QMD must reflect
+# these exactly or the SASS reads garbage:
+var NV_SASS_STORE_DEADBEEF_REGCOUNT   = 4;      # REGISTER_COUNT
+var NV_SASS_STORE_DEADBEEF_SHMEM      = 0;      # SHARED_MEMORY_SIZE
+var NV_SASS_STORE_DEADBEEF_PARAM_OFF  = 0x160;  # output ptr at c[0x0][0x160]
+var NV_SASS_STORE_DEADBEEF_PARAM_SIZE = 8;      # one u64 pointer
+
+# Write the store_deadbeef SM75 program into `dst` (caller-owned, must be
+# >= NV_SASS_STORE_DEADBEEF_BYTES). Dwords are stored little-endian in
+# memory order — byte-identical to the cubin .text.store_deadbeef section.
+# Returns the byte count written (128).
+fn native_nv_sass_store_deadbeef(dst): i64 {
+    # MOV R1, c[0x0][0x28]
+    store64(dst + 0,   0x00000a0000017a02);  store64(dst + 8,   0x000fe40000000f00);
+    # MOV R0, 0xdeadbeef
+    store64(dst + 16,  0xdeadbeef00007802);  store64(dst + 24,  0x000fe20000000f00);
+    # ULDC.64 UR4, c[0x0][0x160]
+    store64(dst + 32,  0x0000580000047ab9);  store64(dst + 40,  0x000fce0000000a00);
+    # STG.E.SYS [UR4], R0
+    store64(dst + 48,  0x00000000ff007986);  store64(dst + 56,  0x000fe2000c10e904);
+    # EXIT
+    store64(dst + 64,  0x000000000000794d);  store64(dst + 72,  0x000fea0003800000);
+    # BRA 0x50
+    store64(dst + 80,  0xfffffff000007947);  store64(dst + 88,  0x000fc0000383ffff);
+    # NOP
+    store64(dst + 96,  0x0000000000007918);  store64(dst + 104, 0x000fc00000000000);
+    # NOP
+    store64(dst + 112, 0x0000000000007918);  store64(dst + 120, 0x000fc00000000000);
+    return NV_SASS_STORE_DEADBEEF_BYTES;
+}

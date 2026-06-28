@@ -1,0 +1,159 @@
+# programs/nvidia_channel_setup.cyr — v4.0 Phase N3 hardware integration
+#
+# Pure-Cyrius exercise of the nouveau submission prerequisites, masterless
+# on /dev/dri/renderD128 — no libdrm, no Mesa, no CUDA. Proves the
+# VM_INIT -> CHANNEL_ALLOC -> GEM_NEW -> VM_BIND -> (syncobj) setup chain
+# works end-to-end before any GPU work is submitted (EXEC + the compute
+# class object are N4). Required order: VM_INIT MUST be the first ioctl on
+# the fd (else -ENOSYS), then CHANNEL_ALLOC (binds the channel to the
+# uvmm), then BO alloc + VM_BIND.
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-channel-setup`.
+#
+# Exit codes:
+#   0 — full setup + teardown clean
+#   1 — open failed
+#   2 — VM_INIT failed
+#   3 — CHANNEL_ALLOC failed
+#   4 — GEM_NEW (BO create) failed
+#   5 — VM_BIND MAP failed
+#   6 — VM_BIND UNMAP failed
+#   7 — syncobj create/destroy failed
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    print_cstr("mabda NVIDIA channel setup (v4.0 Phase N3, nouveau)\n");
+    print_cstr("---------------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) {
+        print_cstr("FAIL: open ");
+        print_cstr(DRM_RENDER_NODE_PATH);
+        print_cstr(" (errno ");
+        print_i64(0 - fd);
+        print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened fd=");
+    print_i64(fd);
+    print_cstr("\n");
+
+    # 1. VM_INIT — must be the first uAPI call on this fd.
+    var rc = native_nv_vm_init(fd, NOUVEAU_VM_KERNEL_RESERVATION_START,
+    NOUVEAU_VM_KERNEL_RESERVATION_SIZE);
+    if (rc != 0) {
+        print_cstr("FAIL: VM_INIT (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        sys_close(fd);
+        return 2;
+    }
+    print_cstr("VM_INIT ok (UMD VA below 0x");
+    print_i64(NOUVEAU_VM_KERNEL_RESERVATION_START);
+    print_cstr(")\n");
+
+    # 2. CHANNEL_ALLOC — GR (compute) channel; binds to the uvmm.
+    var chan[88];
+    rc = native_nv_channel_alloc(fd, &chan);
+    if (rc != 0) {
+        print_cstr("FAIL: CHANNEL_ALLOC (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        sys_close(fd);
+        return 3;
+    }
+    var chid = native_nv_channel_id(&chan);
+    print_cstr("CHANNEL_ALLOC ok, chid=");
+    print_i64(chid);
+    print_cstr("\n");
+
+    # 3. GEM_NEW a host BO (also mmaps it — N4 will read results this way).
+    var bo[16];
+    rc = native_nv_bo_create_host(fd, 4096, &bo);
+    if (rc != 0) {
+        print_cstr("FAIL: GEM_NEW (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        native_nv_channel_free(fd, chid);
+        sys_close(fd);
+        return 4;
+    }
+    var handle = load64(&bo + 0);
+    var mapped = load64(&bo + 8);
+    print_cstr("GEM_NEW ok, handle=");
+    print_i64(handle);
+    print_cstr("\n");
+
+    # 4. VM_BIND MAP the BO at the safe UMD VA base.
+    rc = native_nv_vm_bind_map(fd, handle, NOUVEAU_UMD_VA_BASE, 4096);
+    if (rc != 0) {
+        print_cstr("FAIL: VM_BIND MAP (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        native_nv_bo_release_host(fd, handle, mapped, 4096);
+        native_nv_channel_free(fd, chid);
+        sys_close(fd);
+        return 5;
+    }
+    print_cstr("VM_BIND MAP ok @ va=0x");
+    print_i64(NOUVEAU_UMD_VA_BASE);
+    print_cstr("\n");
+
+    # 5. VM_BIND UNMAP.
+    rc = native_nv_vm_unbind(fd, NOUVEAU_UMD_VA_BASE, 4096);
+    if (rc != 0) {
+        print_cstr("FAIL: VM_BIND UNMAP (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        native_nv_bo_release_host(fd, handle, mapped, 4096);
+        native_nv_channel_free(fd, chid);
+        sys_close(fd);
+        return 6;
+    }
+    print_cstr("VM_BIND UNMAP ok\n");
+
+    # 6. syncobj create + destroy (reused AMD wrappers; carried on EXEC at N4).
+    var syncobj[8];
+    memset(&syncobj, 0, 8);
+    rc = native_syncobj_create(fd, &syncobj);
+    if (rc != 0) {
+        print_cstr("FAIL: syncobj_create (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        native_nv_bo_release_host(fd, handle, mapped, 4096);
+        native_nv_channel_free(fd, chid);
+        sys_close(fd);
+        return 7;
+    }
+    var sh = load32(&syncobj);
+    print_cstr("syncobj ok, handle=");
+    print_i64(sh);
+    print_cstr("\n");
+    native_syncobj_destroy(fd, sh);
+
+    # 7. Teardown clean.
+    native_nv_bo_release_host(fd, handle, mapped, 4096);
+    native_nv_channel_free(fd, chid);
+    sys_close(fd);
+    print_cstr("OK\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

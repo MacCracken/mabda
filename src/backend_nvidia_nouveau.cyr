@@ -40,8 +40,9 @@
 # GEM_CREATE + GEM_VA + CS path. KMS (SETCRTC/PAGE_FLIP/ADDFB2) stays
 # DRM_MASTER on /dev/dri/cardN (same compute-vs-KMS split as AMD).
 # Defined below: N1 (GETPARAM, VM_INIT) + N2 (GEM_NEW, GEM_INFO;
-# GEM_CLOSE reused from the AMD module). CHANNEL_ALLOC/VM_BIND/EXEC
-# land in N3/N4.
+# GEM_CLOSE reused from the AMD module) + N3 (CHANNEL_ALLOC, VM_BIND,
+# CHANNEL_FREE, drm_nouveau_sync builder; syncobj reused from AMD). EXEC
+# + the compute class object (0xC5C0 via NVIF/GROBJ) land in N4.
 # ----------------------------------------------------------------
 
 # drm_nouveau_getparam (16 bytes):
@@ -241,5 +242,124 @@ fn native_nv_bo_create_host(fd, size, out): i64 {
 fn native_nv_bo_release_host(fd, handle, addr, size): i64 {
     if (addr != 0) { cyr_munmap(addr, size); }
     if (handle != 0) { native_gem_close(fd, handle); }
+    return 0;
+}
+
+# ================================================================
+# v4.0 Phase N3 — channel + VM_BIND + sync (submission setup)
+# ================================================================
+# The native AMDGPU CTX/GEM_VA analogue, pinned against mainline nouveau
+# (nouveau_abi16.c / nouveau_uvmm.c) + Mesa NVK winsys (n3-channel-vmbind
+# -verify pass, 2026-06-27). Required order on a fresh fd:
+#   VM_INIT (first!) -> CHANNEL_ALLOC -> [compute class obj: N4] ->
+#   GEM_NEW -> VM_BIND(MAP) -> EXEC.
+# CHANNEL_ALLOC auto-allocates the GPFIFO/USERD/notifier and binds the
+# channel to the VM_INIT'd uvmm — the UMD never touches USERD/doorbell
+# (that is the EXEC uAPI's whole point). syncobj create/destroy/wait reuse
+# the AMD module's native_syncobj_* (driver-agnostic DRM_IOCTL_SYNCOBJ_*).
+
+# drm_nouveau_channel_alloc (88 bytes):
+#   fb_ctxdma_handle +0  u32 (in: ~0 = Kepler+ engine-select gate)
+#   tt_ctxdma_handle +4  u32 (in: NOUVEAU_FIFO_ENGINE_* when fb==~0)
+#   channel          +8  s32 (out: hardware chid — pass to EXEC/NVIF)
+#   pushbuf_domains  +12 u32 (out)
+#   notifier_handle  +16 u32 (out; unused by EXEC)
+#   subchan[8]       +20 {u32 handle,u32 grclass} (out; empty on Turing)
+#   nr_subchan       +84 u32 (out; 0 on Turing)
+var DRM_NOUVEAU_CHANNEL_ALLOC_NR    = 0x42;  # DRM_COMMAND_BASE 0x40 + 0x02
+var DRM_NOUVEAU_CHANNEL_ALLOC_SIZE  = 88;
+var DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC = 0xC0586442;
+
+# drm_nouveau_channel_free (4 bytes): { s32 channel }. _IOW('d',0x43,4).
+var DRM_IOCTL_NOUVEAU_CHANNEL_FREE  = 0x40046443;
+
+# drm_nouveau_vm_bind (40) + drm_nouveau_vm_bind_op (40):
+#   bind: op_count +0, flags +4, wait_count +8, sig_count +12,
+#         wait_ptr +16, sig_ptr +24, op_ptr +32
+#   op:   op +0, flags +4, handle +8, pad +12, addr +16, bo_offset +24, range +32
+var DRM_NOUVEAU_VM_BIND_NR    = 0x51;  # DRM_COMMAND_BASE 0x40 + 0x11
+var DRM_NOUVEAU_VM_BIND_SIZE  = 40;
+var DRM_IOCTL_NOUVEAU_VM_BIND = 0xC0286451;
+
+# FIFO engine selector for tt_ctxdma_handle (Kepler+; requires fb==~0).
+# Compute runs on GR; CE is copy-only.
+var NOUVEAU_FIFO_ENGINE_GR = 0x01;
+var NOUVEAU_FIFO_ENGINE_CE = 0x30;
+
+# vm_bind_op.op values.
+var DRM_NOUVEAU_VM_BIND_OP_MAP   = 0x0;
+var DRM_NOUVEAU_VM_BIND_OP_UNMAP = 0x1;
+
+# drm_nouveau_sync (16): flags +0, handle +4, timeline_value +8.
+var DRM_NOUVEAU_SYNC_SYNCOBJ = 0x0;
+var DRM_NOUVEAU_SYNC_SIZE    = 16;
+
+# Safe UMD VA base for small BOs: 64 KiB-aligned, non-null, well below the
+# kernel-managed split (1<<39) — rides big pages for VRAM, valid for GTT.
+var NOUVEAU_UMD_VA_BASE = 0x10000;
+
+# CHANNEL_ALLOC a GR (compute-capable) channel. `req` is caller-owned
+# 88 bytes. Must run AFTER VM_INIT (else the channel binds the legacy
+# per-client vmm, not the uvmm). Read the chid back with
+# native_nv_channel_id. Returns 0 or -errno.
+fn native_nv_channel_alloc(fd, req): i64 {
+    memset(req, 0, DRM_NOUVEAU_CHANNEL_ALLOC_SIZE);
+    store32(req + 0, 0xFFFFFFFF);              # fb_ctxdma_handle = ~0
+    store32(req + 4, NOUVEAU_FIFO_ENGINE_GR);  # tt_ctxdma_handle = GR
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, req);
+}
+fn native_nv_channel_id(req): i64 { return load32(req + 8); }
+
+# Free a channel by chid. (fd close also frees it; this is for clean
+# teardown.) Returns 0 or -errno.
+fn native_nv_channel_free(fd, chid): i64 {
+    var req[4];
+    store32(&req + 0, chid);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_CHANNEL_FREE, &req);
+}
+
+# VM_BIND: synchronously MAP a GEM BO at GPU VA `addr` for `range` bytes.
+# addr/range/bo_offset must be 4 KiB-aligned; addr must sit below the
+# kernel-managed split. Synchronous (flags=0) — all sync counts/ptrs stay
+# 0 (the kernel EINVALs a non-zero sync count when flags=0). Returns 0 or
+# -errno. The op struct is stack-local; op_ptr references it for the call.
+fn native_nv_vm_bind_map(fd, handle, addr, range): i64 {
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);  # op = MAP
+    store32(&op + 8, handle);                      # handle
+    store64(&op + 16, addr);                       # addr
+    store64(&op + 32, range);                      # range
+
+    var bind[40];
+    memset(&bind, 0, 40);
+    store32(&bind + 0, 1);       # op_count = 1
+    store64(&bind + 32, &op);    # op_ptr -> op
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_VM_BIND, &bind);
+}
+
+# VM_BIND: UNMAP the mapping at GPU VA `addr` for `range` bytes. Returns
+# 0 or -errno.
+fn native_nv_vm_unbind(fd, addr, range): i64 {
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_UNMAP);
+    store64(&op + 16, addr);
+    store64(&op + 32, range);
+
+    var bind[40];
+    memset(&bind, 0, 40);
+    store32(&bind + 0, 1);
+    store64(&bind + 32, &op);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_VM_BIND, &bind);
+}
+
+# Build a drm_nouveau_sync (16B) into `buf` referencing a binary syncobj.
+# Carried on EXEC (N4) as a signal/wait fence. syncobj create/destroy/wait
+# reuse the AMD module's native_syncobj_* wrappers. Returns 0.
+fn native_nv_sync_build(buf, syncobj_handle): i64 {
+    store32(buf + 0, DRM_NOUVEAU_SYNC_SYNCOBJ);  # flags
+    store32(buf + 4, syncobj_handle);            # handle
+    store64(buf + 8, 0);                          # timeline_value
     return 0;
 }

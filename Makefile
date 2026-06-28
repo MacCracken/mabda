@@ -292,6 +292,18 @@ build/nvidia_mem_roundtrip: programs/nvidia_mem_roundtrip.cyr src/*.cyr
 test-nvidia-mem-roundtrip: build/nvidia_mem_roundtrip
 	./build/nvidia_mem_roundtrip
 
+# v4.0 Phase N3 — NVIDIA/nouveau submission setup. Exercises
+# VM_INIT -> CHANNEL_ALLOC -> GEM_NEW -> VM_BIND(MAP/UNMAP) -> syncobj
+# masterless, then tears down. No GPU work submitted (EXEC is N4).
+# Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_channel_setup: programs/nvidia_channel_setup.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_channel_setup.cyr $@
+
+.PHONY: test-nvidia-channel-setup
+test-nvidia-channel-setup: build/nvidia_channel_setup
+	./build/nvidia_channel_setup
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.
