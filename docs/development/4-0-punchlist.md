@@ -1,11 +1,12 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
 **Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1
-(render target) done and HW-proven on the TU116 — the N4 compute arc gate is
-GREEN, the NVIDIA backend is in the public API, texture create/write/read
-roundtrips, the GPU samples textures (TIC/TSC pools + bound TEX dispatch), and
-render targets allocate through the public API (2026-06-28). Next front: N7.2a
-— capture an NVK triangle draw to decode the TURING_A 3D method stream.**
+(render target) + N7.2a (NVK draw capture/decode) done on the TU116 — the N4
+compute arc gate is GREEN, the NVIDIA backend is in the public API, the GPU
+samples textures, render targets allocate, and the full TURING_A (0xC597) draw
+method stream is decoded + adversarially verified into a mabda render design
+(2026-06-28). Next front: N7.2 — the clc597 method encoders (a
+`native_nv_push_draw`), then N7.3 SPH+SASS, N7.4 the HW draw e2e.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -23,17 +24,19 @@ render targets allocate through the public API (2026-06-28). Next front: N7.2a
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N7.2a — capture an NVK triangle draw.**
-> N7.1 (the render-target lifecycle, slots 120/128) is done + HW-proven. The
-> render arc now needs its golden reference, exactly like N6.2a did for
-> sampling: a Vulkan triangle-draw app (`tools/nvidia-capture/vk_render.c`) run
-> under the `nouveau_capture.c` interposer to capture+decode NVK's `TURING_A`
-> (0xC597) 3D method stream — the NVIF class create, `SET_COLOR_TARGET_*`, the
-> SET_PIPELINE VS/FS stages, viewport/scissor, and the draw call. Then N7.2 the
-> 0xC597 method encoders, N7.3 SM75 VS/FS bytes, N7.4 the draw dispatch +
-> pipeline/pass/draw slots (136..168). Done: v0 compute (raw + public API), v1
-> texture roundtrip, N6.2 GPU sampling, **N7.1 render-target
-> (`make test-nvidia-render-target`)**.
+> **Resume here (next session):** **N7.2 — the clc597 method encoders.** N7.1
+> (render-target lifecycle, slots 120/128) + N7.2a (NVK draw capture + 4-group
+> adversarial decode) are done. The full TURING_A (0xC597) draw method stream
+> is decoded + verified into a complete mabda render design in
+> [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). N7.2 writes
+> `native_nv_push_draw` in `backend_nvidia_push.cyr` from that verified
+> sequence (framebuffer → viewport/scissor → raster/cull → shader bind →
+> topology → fused `SET_DRAW_CONTROL` + `DRAW_VERTEX_ARRAY_BEGIN_END`),
+> NVIF-creates the `0xC597` class alongside compute, and CPU-asserts every
+> method dword. Then N7.3 (SPH+SASS VS/FS) and N7.4 (HW draw e2e — resolve the
+> L2-flush + vertex-distributor risks). Done: v0 compute (raw + public API), v1
+> texture roundtrip, N6.2 GPU sampling, N7.1 render-target, **N7.2a NVK draw
+> capture/decode**.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -605,15 +608,36 @@ an afternoon to a few days.
   (`nvidia.tcyr` `test_nv_backend_v2_render_slots`, 228 total): slots 120/128
   wired, 136..168 honestly still zero, RT field map. The GPU draw-into-it is
   N7.2-N7.4.
-- [ ] **N7.2** — `TURING_A` 3D class (0xC597) method encoders (pipeline
-  state + draw) in `backend_nvidia_push.cyr` (the render-PM4-composer
-  analogue). **CPU assert:** method offsets + state values pinned against
-  `clc597.h`.
-- [ ] **N7.3** — SM75 VS + FS bytes (fullscreen-triangle VS, solid-color
-  FS) in `backend_nvidia_sass.cyr`, verified via the N5.2 oracle.
-- [ ] **N7.4** — Fill v2 render slots (120..176) on the NVIDIA backend;
-  `programs/nvidia_render_e2e.cyr` (mirrors `native_render_e2e.cyr`).
-  **EXIT:** rendered pixels correct on an RT BO. HW-gated.
+- [x] **N7.2a** — **Capture + decode an NVK triangle draw — DONE.** Harness
+  `tools/nvidia-capture/{vk_render.c, probe_render.vert, probe_render.frag}`
+  captured a known-good NVK `0xC597` (TURING_A) draw on the TU116 (center
+  pixel `0xFF996633`, PASS); the 141-method draw stream was decoded + **4-group
+  adversarially verified** (clc597.h / NVK / nvc0 gallium / envytools / NAK)
+  into a complete mabda render design in
+  [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). KEY: NVK draws via
+  MME macros mabda can't use → the **direct** draw is `SET_DRAW_CONTROL_A/B`
+  (0x0260/64) + `DRAW_VERTEX_ARRAY_BEGIN_END_A/B` (0x0270/74) with a **must-emit**
+  `SET_PRIMITIVE_TOPOLOGY_CONTROL=1` (0x1948); mabda renders to a **LINEAR**
+  color target (`SET_COLOR_TARGET_MEMORY=LAYOUT_PITCH 0x1000`, WIDTH=byte-pitch,
+  128B-aligned) and CPU-reads it with **no CE blit**; graphics shaders need a
+  **128-byte SPH** before the SASS (`PROGRAM_ADDRESS` points at it, SASS at
+  +0x80). Two open HW risks flagged for N7.4: an **L2/ROP→memory flush** before
+  the CPU read, and the **vertex-distributor** inactive-attribute markers.
+- [ ] **N7.2** — `TURING_A` 3D class (0xC597) method encoders + draw in
+  `backend_nvidia_push.cyr` (a `native_nv_push_draw`, the render analogue of
+  `native_nv_push_dispatch`). Build the exact verified sequence from the N7
+  notes (framebuffer → viewport/scissor → raster/cull → shader bind → topology
+  → fused draw). Also NVIF-create the `0xC597` class alongside compute. **CPU
+  assert:** every method offset + state value pinned (the N7 notes give them).
+- [ ] **N7.3** — SM75 VS + FS as **SPH(128B)+SASS** blobs in
+  `backend_nvidia_sass.cyr` (fullscreen-triangle VS from `gl_VertexID`,
+  solid-color FS), via ptxas/NAK; SPH trailing region from a real compile,
+  `nvdisasm`-verified. Include the inactive-attribute markers.
+- [ ] **N7.4** — Fill the v2 render slots pipeline/pass/draw (136..168) on the
+  NVIDIA backend; `programs/nvidia_render_e2e.cyr` (HW): 3D class + linear RT
+  (N7.1) + VS/FS + draw pushbuffer + EXEC + **L2 flush** + CPU-read.
+  **EXIT:** the rendered triangle's solid color reads back. Resolve the
+  L2-flush + vertex-distributor risks here. HW-gated.
 
 ### N8 — KMS surface / present
 
