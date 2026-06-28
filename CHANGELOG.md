@@ -13,6 +13,36 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [3.4.5] — 2026-06-28
+
+**Gate the optional external integrations (samvada/logind, chitra/PNG) behind compile
+flags so a build WITHOUT those deps has no undefined-fn reference.** Cyrius v6.3.2 makes a
+reachable undefined-fn call a hard error by default; a fold/consumer that includes mabda
+but does not pull `[deps.samvada]` / `[deps.chitra]` previously got reachable undefs to
+`samvada_session_*` / `chitra_png_decode_rgba8`. These integrations were already designed
+as best-effort ("logind when the dep is present"), so they are now compiled in only under
+their opt-in flag — matching the existing graceful-degradation contract.
+
+### Changed
+- **`src/surface_v3.cyr`** — `gpu_surface_configure_native_logind` body is guarded
+  `#ifdef MABDA_LOGIND`; without the flag it returns 0 ("no card available" — the exact
+  pre-existing `fd < 0` degrade path), so `surface.tcyr`'s `_uninit_samvada` assertions
+  (expect 0) are unchanged.
+- **`src/backend_native.cyr`** — the `samvada_session_release_device` cleanup is guarded
+  `#ifdef MABDA_LOGIND` (the enclosing `master_owned != 0` block is only ever entered on the
+  logind path, so it is dead at runtime when the flag is off).
+- **`src/asset_load.cyr`** — the two `chitra_png_decode_rgba8` calls
+  (`gpu_texture_load_png_result` + `_mipped`) are guarded `#ifdef MABDA_PNG`; without the
+  flag the load reports a normal `GPU_ERR_IMAGE_DECODE` (the existing decode-failure path).
+- **`tests/tcyr/asset_load.tcyr`** — opts in with `#define MABDA_PNG` (AL.5 decodes a real
+  PNG via the resolved `[deps.chitra]`).
+
+### Notes
+- Default build behavior: logind/PNG are **opt-in** — enable with `-D MABDA_LOGIND` /
+  `-D MABDA_PNG` plus the corresponding `[deps]`. Manifest deps remain required for mabda's
+  own build/tests (which exercise both paths). The full suite stays green (259/226/73/17, 0
+  failed). No public-API change.
+
 ## [3.4.4] — 2026-06-20
 
 **P(-1) scaffold-hardening pass — security audit (clean), refactor/optimization review, CVE
