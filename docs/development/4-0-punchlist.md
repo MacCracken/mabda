@@ -287,10 +287,16 @@ an afternoon to a few days.
   (`VM_INIT rc: 0 → VA space initialized masterless`). Confirms the
   source finding that the whole `VM_INIT`→`CHANNEL_ALLOC`→`VM_BIND`→`EXEC`
   chain is `DRM_RENDER_ALLOW` (mainline `nouveau_ioctls[]`); full AMD
-  compute-vs-KMS master parity. (c) **still TODO** — capture an NVK
-  compute dispatch for a **known-good QMD + pushbuffer** to byte-diff
-  against in N4 (scratch dir, not the repo). Net: only (c)-capture
-  remains open in N0.7; resolve it together with the N4/N5 gate.
+  compute-vs-KMS master parity. (c) **DONE — NVK compute dispatch
+  captured** (headless over SSH) via an LD_PRELOAD ioctl interposer +
+  minimal NVK compute app (harness in scratch; `run_capture.sh`
+  reproducible). Yielded the **golden 256-byte QMD**, the dispatch
+  pushbuffer, the NVIF `0xC5C0` class-create payloads, and the full
+  masterless ioctl sequence. Decoded findings (QMD field offsets, the
+  `SEND_PCAS_A`(0x02b4)/`SEND_SIGNALING_PCAS_B`(0x02bc) launch, the
+  `CHANNEL_ALLOC fb=0/tt=0` correction, chid roles) recorded in
+  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md). **N0.7
+  fully closed.**
 - [x] **N0.8** — Confirmed in `src/backend.cyr`: `BACKEND_KIND_NVIDIA=3`
   (`backend.cyr:80`), `kind` value at slot offset `+80` (`backend.cyr:31`),
   `BACKEND_SIZE=328` (`backend.cyr:277`) — no struct change. The
