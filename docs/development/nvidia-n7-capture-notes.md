@@ -247,10 +247,14 @@ All on subc0=3D. Op `INCRn` = n consecutive 4-byte methods from the offset;
   sequence above, with CPU asserts pinning every method header/arg (like the
   compute dispatch test). Needs the 3D class (`0xC597`) created via NVIF
   alongside the existing compute class.
-- **N7.3** — SM75 VS + FS as **SPH(128B)+SASS** blobs in
-  `backend_nvidia_sass.cyr` (fullscreen-triangle VS from `gl_VertexID`,
-  solid-color FS), captured via ptxas/NAK + the inactive-attribute markers,
-  `nvdisasm`-verified. The SPH trailing region must come from a real compile.
+- **N7.3** — _DONE._ SM75 VS + FS as **SPH(128B)+SASS** blobs in
+  `backend_nvidia_sass.cyr` (`native_nv_sass_render_{vs,fs}`), sliced verbatim
+  from this capture's shader-heap BO (NVK's compile of `probe_render.{vert,frag}`)
+  and re-emitted from the raw bytes, `nvdisasm`-verified. **Both self-contained**
+  — no cbuf/UBO/descriptor reads; the VS's only input is the VertexID sysval
+  (`a[0x2fc]`, hardware-supplied), so the render path needs zero constant-buffer
+  setup. FS = solid `vec4(0.2,0.4,0.6,1.0)`; VS = fullscreen triangle from
+  VertexID writing `a[0x70]` (gl_Position). regcount 24 each.
 - **N7.4** — `programs/nvidia_render_e2e.cyr` (HW): create the 3D class +
   a linear RT (N7.1) + VS/FS programs, build the draw pushbuffer, EXEC, flush
   L2, CPU-read the rendered solid color. Fills the v2 render slots

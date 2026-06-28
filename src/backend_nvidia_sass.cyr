@@ -126,3 +126,89 @@ fn native_nv_sass_sample_tex(dst): i64 {
     store64(dst + 240, 0x0000000000007918);  store64(dst + 248, 0x000fc00000000000);
     return NV_SASS_SAMPLE_TEX_BYTES;
 }
+
+# ================================================================
+# N7.3 — graphics (3D) shader programs: 128-byte SPH (v4) + SM75 SASS
+# ================================================================
+# Unlike the compute kernels above (raw SASS, no header), a Turing GRAPHICS
+# program carries a Shader Program Header (SPH) — 128 bytes on Turing (v4) —
+# describing the shader's stage + input/output (imap/omap) routing. The 3D
+# pipeline's SET_PIPELINE_PROGRAM_ADDRESS points AT the SPH; the first SASS
+# instruction is at SPH+0x80.
+#
+# Provenance: captured verbatim from NVK (Mesa nouveau) compiling
+# tools/nvidia-capture/probe_render.{vert,frag} on the TU116 (N7.2a capture);
+# sliced from the shader-heap BO at the program VAs and re-emitted from the raw
+# bytes (no hand transcription). Both are SELF-CONTAINED — neither reads any
+# constant bank c[][], UBO, SSBO, or descriptor (verified by nvdisasm SM75).
+# The VS's only external input is the VertexID system value a[0x2fc], which the
+# input assembler auto-supplies for an N-vertex draw — NOT a constant buffer. So
+# the native render path needs ZERO cbuf setup. SPH imap/omap are baked into the
+# captured headers (the v4 trailing layout is not publicly specified; embedding
+# the real compile is the only correct path). REGISTER_COUNT 24 (the pushbuffer
+# value; both shaders actually use 4 GPRs).
+
+var NV_SASS_RENDER_FS_BYTES    = 272;   # 128 SPH + 144 SASS (9 instrs)
+var NV_SASS_RENDER_FS_REGCOUNT = 24;
+var NV_SASS_RENDER_VS_BYTES    = 352;   # 128 SPH + 224 SASS (14 instrs)
+var NV_SASS_RENDER_VS_REGCOUNT = 24;
+
+# Fragment shader: solid color out = vec4(0.2,0.4,0.6,1.0). SASS UMOVs the four
+# f32 color immediates into UR0-3, MOVs to R0-3 (the RT0 output regs), EXIT.
+# SPH: SphType=PS(2), Version=4, ShaderType=PIXEL(5), MrtEnable=1, omap_targets
+# RT0 RGBA = 0xf (SPH dw9). Returns 272.
+fn native_nv_sass_render_fs(dst): i64 {
+    store64(dst +   0, 0x0000000000025482);  store64(dst +   8, 0x0000000000000000);  # SPH
+    store64(dst +  16, 0x8000000000000000);  store64(dst +  24, 0x0000000000000000);  # SPH
+    store64(dst +  32, 0x0000000000000000);  store64(dst +  40, 0x0000000000000000);  # SPH
+    store64(dst +  48, 0x0000000000000000);  store64(dst +  56, 0x0000000000000000);  # SPH
+    store64(dst +  64, 0x0000000000000000);  store64(dst +  72, 0x000000000000000f);  # SPH omap_targets RT0 RGBA
+    store64(dst +  80, 0x0000000000000000);  store64(dst +  88, 0x0000000000000000);  # SPH
+    store64(dst +  96, 0x0000000000000000);  store64(dst + 104, 0x0000000000000000);  # SPH
+    store64(dst + 112, 0x0000000000000000);  store64(dst + 120, 0x0000000000000000);  # SPH
+    # SASS @ +0x80: UMOV UR3,1.0 ; UMOV UR2,0.6 ; MOV R3,UR3 ; MOV R2,UR2 ;
+    #               UMOV UR1,0.4 ; UMOV UR0,0.2 ; MOV R1,UR1 ; MOV R0,UR0 ; EXIT
+    store64(dst + 128, 0x3f80000000037882);  store64(dst + 136, 0x000fc20000000000);  # UMOV UR3, 1.0
+    store64(dst + 144, 0x3f19999a00027882);  store64(dst + 152, 0x000fc20000000000);  # UMOV UR2, 0.6
+    store64(dst + 160, 0x0000000300037c02);  store64(dst + 168, 0x000fc20008000f00);  # MOV R3, UR3
+    store64(dst + 176, 0x0000000200027c02);  store64(dst + 184, 0x000fc20008000f00);  # MOV R2, UR2
+    store64(dst + 192, 0x3ecccccd00017882);  store64(dst + 200, 0x000fc20000000000);  # UMOV UR1, 0.4
+    store64(dst + 208, 0x3e4ccccd00007882);  store64(dst + 216, 0x000fc20000000000);  # UMOV UR0, 0.2
+    store64(dst + 224, 0x0000000100017c02);  store64(dst + 232, 0x000fc20008000f00);  # MOV R1, UR1
+    store64(dst + 240, 0x0000000000007c02);  store64(dst + 248, 0x000fc20008000f00);  # MOV R0, UR0
+    store64(dst + 256, 0x000000000000794d);  store64(dst + 264, 0x000fc20003800000);  # EXIT
+    return NV_SASS_RENDER_FS_BYTES;
+}
+
+# Vertex shader: vertex-less fullscreen triangle. SASS reads VertexID from
+# a[0x2fc], computes the NDC position (idx 0->(-1,-1), 1->(3,-1), 2->(-1,3)),
+# stores gl_Position to a[0x70], EXIT. SPH: SphType=VTG(1), Version=4,
+# ShaderType=VERTEX(1), with the captured imap (VertexID) / omap (position).
+# Returns 352.
+fn native_nv_sass_render_vs(dst): i64 {
+    store64(dst +   0, 0x0000000002020481);  store64(dst +   8, 0x0000000000000000);  # SPH
+    store64(dst +  16, 0x000000001f01c000);  store64(dst +  24, 0x0000000000000000);  # SPH imap
+    store64(dst +  32, 0x0000000000000000);  store64(dst +  40, 0x0000000080000000);  # SPH
+    store64(dst +  48, 0x0000f00000000000);  store64(dst +  56, 0x0000000000000000);  # SPH omap (position)
+    store64(dst +  64, 0x0000000000000000);  store64(dst +  72, 0x0000000000000000);  # SPH
+    store64(dst +  80, 0x0000000000000000);  store64(dst +  88, 0x0000000000000000);  # SPH
+    store64(dst +  96, 0x0000000000000000);  store64(dst + 104, 0x0000000000000000);  # SPH
+    store64(dst + 112, 0x0000000000000000);  store64(dst + 120, 0x0000000000000000);  # SPH
+    # SASS @ +0x80: ALD R1,a[0x2fc] (VertexID) ; compute fullscreen pos ;
+    #               AST.128 a[0x70],R0 (gl_Position) ; EXIT
+    store64(dst + 128, 0x0002fcffff017321);  store64(dst + 136, 0x000e040000000000);  # ALD R1, a[0x2fc] (VertexID)
+    store64(dst + 144, 0x0000000101027819);  store64(dst + 152, 0x001fc80000000cff);  # SHF.L.W R2, R1, 1
+    store64(dst + 160, 0x0000000202027812);  store64(dst + 168, 0x000fcc00078ec0ff);  # LOP3 R2, R2, 2
+    store64(dst + 176, 0x0000000200027306);  store64(dst + 184, 0x000e020000201400);  # I2F R2, R2
+    store64(dst + 192, 0x0000000201017812);  store64(dst + 200, 0x000fcc00078ec0ff);  # LOP3 R1, R1, 2
+    store64(dst + 208, 0x0000000100017306);  store64(dst + 216, 0x000e420000201400);  # I2F R1, R1
+    store64(dst + 224, 0xbf80000000007802);  store64(dst + 232, 0x000fca0000000f00);  # MOV R0, -1.0
+    store64(dst + 240, 0x4000000002007823);  store64(dst + 248, 0x001fc20000010000);  # FFMA R0, R2, 2, R0  (x)
+    store64(dst + 256, 0xbf80000000027802);  store64(dst + 264, 0x000fca0000000f00);  # MOV R2, -1.0
+    store64(dst + 272, 0x4000000001017823);  store64(dst + 280, 0x002fc20000010002);  # FFMA R1, R1, 2, R2  (y)
+    store64(dst + 288, 0x000000ff00027202);  store64(dst + 296, 0x000fc20000000f00);  # MOV R2, RZ          (z=0)
+    store64(dst + 304, 0x3f80000000037802);  store64(dst + 312, 0x000fcc0000000f00);  # MOV R3, 1.0         (w)
+    store64(dst + 320, 0x00007000ff007322);  store64(dst + 328, 0x0001c40000000cff);  # AST.128 a[0x70] (gl_Position)
+    store64(dst + 336, 0x000000000000794d);  store64(dst + 344, 0x001fc20003800000);  # EXIT
+    return NV_SASS_RENDER_VS_BYTES;
+}

@@ -1,12 +1,12 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1
-(render target) + N7.2a (NVK draw capture/decode) + N7.2 (clc597 draw encoder)
+**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) + N7.1–N7.3
 done on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA backend is in
-the public API, the GPU samples textures, render targets allocate, and
-`native_nv_push_draw` builds the full verified TURING_A draw pushbuffer
-(CPU-asserted, 2026-06-28). Next front: N7.3 — the SM75 VS/FS as SPH+SASS
-blobs, then N7.4 the HW draw e2e.**
+the public API, the GPU samples textures, render targets allocate,
+`native_nv_push_draw` builds the full verified TURING_A draw pushbuffer, and the
+VS/FS graphics programs (SPH+SASS, self-contained) are embedded + nvdisasm-
+verified (CPU-asserted, 2026-06-28). Next front: N7.4 — wire the v2 render slots
++ the HW draw e2e (the only remaining N7 piece).**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -24,20 +24,22 @@ blobs, then N7.4 the HW draw e2e.**
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N7.3 — the SM75 VS/FS as SPH+SASS blobs.**
-> N7.2 (`native_nv_push_draw`, the full clc597 draw encoder) is done +
-> CPU-asserted. N7.3 builds the two graphics programs in
-> `backend_nvidia_sass.cyr`: a fullscreen-triangle VS (positions from
-> `gl_VertexID`) and a solid-color FS, each as a **128-byte SPH + SM75 SASS**
-> blob (program address points at the SPH, SASS at +0x80; regcount 24). Capture
-> via ptxas/NAK — the SPH trailing imap/omap must come from a real compile (the
-> public spec only covers the 80-byte classic header). Include the
-> inactive-attribute markers for the vertex-less VS. Then N7.4 wires the v2
-> render slots (136..168) + `programs/nvidia_render_e2e.cyr` (HW: 3D class +
-> linear RT + VS/FS + the draw + L2 flush + CPU-read → solid color). Design +
-> open risks: [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). Done:
-> v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
-> draw capture/decode, **N7.2 clc597 draw encoder**.
+> **Resume here (next session):** **N7.4 — the HW render e2e (the last N7
+> piece).** All the building blocks are done + CPU-asserted: the linear RT
+> (N7.1), the draw encoder `native_nv_push_draw` (N7.2), and the VS/FS SPH+SASS
+> blobs `native_nv_sass_render_{vs,fs}` (N7.3, self-contained — no cbuf).
+> N7.4 wires it on HW + fills the v2 render slots (136..168):
+> `programs/nvidia_render_e2e.cyr` — NVIF-create the `0xC597` 3D class on the
+> channel, alloc a linear RGBA8 RT + upload the two SPH+SASS programs, build the
+> draw pushbuffer, EXEC, **flush L2/ROP→memory**, CPU-read the rendered solid
+> color. The two open HW risks to resolve here (from the N7.2a decode): the
+> **L2 flush** before the CPU read, and the **vertex-distributor**
+> inactive-attribute markers (`SET_VERTEX_ATTRIBUTE_A 0x1160` ×32 = `0x38200040`)
+> the VertexID-only VS may need — add to `native_nv_push_draw` if the draw
+> faults. Design + the full method sequence:
+> [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). Done: v0 compute,
+> v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a draw
+> capture/decode, N7.2 clc597 draw encoder, **N7.3 VS/FS SPH+SASS**.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -634,10 +636,18 @@ an afternoon to a few days.
   56-byte `NV_DRAW_PARAMS` struct; 288-byte / 72-dword stream. **CPU asserts**
   pin every load-bearing method/arg (`nvidia.tcyr` `test_nv_push_draw`, 257
   total). The `0xC597` NVIF-create wires into the context at N7.4 (HW).
-- [ ] **N7.3** — SM75 VS + FS as **SPH(128B)+SASS** blobs in
-  `backend_nvidia_sass.cyr` (fullscreen-triangle VS from `gl_VertexID`,
-  solid-color FS), via ptxas/NAK; SPH trailing region from a real compile,
-  `nvdisasm`-verified. Include the inactive-attribute markers.
+- [x] **N7.3** — **DONE.** `native_nv_sass_render_vs` / `native_nv_sass_render_fs`
+  (`backend_nvidia_sass.cyr`): the two graphics programs as **128-byte SPH (v4)
+  + SM75 SASS**, sliced verbatim from the N7.2a capture (NVK compiling
+  `probe_render.{vert,frag}`) and re-emitted from the raw bytes. FS (272 B) =
+  UMOV 4 color constants → MOV R0-3 → EXIT (`vec4(0.2,0.4,0.6,1.0)`); VS (352 B)
+  = ALD `a[0x2fc]` (VertexID) → fullscreen-triangle pos → AST.128 `a[0x70]`
+  (gl_Position) → EXIT. **Both SELF-CONTAINED** (no cbuf/UBO/descriptor reads —
+  the VS's only input is the hardware-supplied VertexID), so the native render
+  path needs zero constant-buffer setup. `nvdisasm`-verified (round-trip);
+  **CPU asserts** pin the SPH headers + key SASS instrs (`nvidia.tcyr`
+  `test_nv_sass_render`, 271 total). The inactive-attribute markers are a draw
+  concern handled at N7.4 (the VertexID sysval needs no vertex-buffer fetch).
 - [ ] **N7.4** — Fill the v2 render slots pipeline/pass/draw (136..168) on the
   NVIDIA backend; `programs/nvidia_render_e2e.cyr` (HW): 3D class + linear RT
   (N7.1) + VS/FS + draw pushbuffer + EXEC + **L2 flush** + CPU-read.
