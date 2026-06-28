@@ -267,6 +267,31 @@ build/native_device_enum: programs/native_device_enum.cyr src/*.cyr
 test-native-enum: build/native_device_enum
 	./build/native_device_enum
 
+# v4.0 Phase N1 — NVIDIA/nouveau device enum + masterless probe. Opens
+# /dev/dri/renderD128, expects driver "nouveau", reads chipset + PCI ids
+# via GETPARAM, and probes that VM_INIT is DRM_RENDER_ALLOW (no master).
+# Requires nouveau-bound NVIDIA hardware; not in CI. Pure Cyrius.
+build/nvidia_device_enum: programs/nvidia_device_enum.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_device_enum.cyr $@
+
+.PHONY: test-nvidia-enum
+test-nvidia-enum: build/nvidia_device_enum
+	./build/nvidia_device_enum
+
+# v4.0 Phase N2 — NVIDIA/nouveau GEM BO round-trip. Allocates a
+# host-visible (GART|MAPPABLE|COHERENT) BO via GEM_NEW, mmaps the
+# returned map_handle, writes a pattern, reads it back byte-identical.
+# Masterless; no VM_INIT/VM_BIND (pure CPU path). Requires nouveau
+# hardware; not in CI. Pure Cyrius.
+build/nvidia_mem_roundtrip: programs/nvidia_mem_roundtrip.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_mem_roundtrip.cyr $@
+
+.PHONY: test-nvidia-mem-roundtrip
+test-nvidia-mem-roundtrip: build/nvidia_mem_roundtrip
+	./build/nvidia_mem_roundtrip
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

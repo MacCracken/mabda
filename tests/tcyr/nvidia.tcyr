@@ -1,0 +1,188 @@
+# tests/tcyr/nvidia.tcyr — native NVIDIA/nouveau backend (v4.0 Phase N1)
+#
+# CPU asserts for the nouveau enum probe: ioctl-number re-derivation via
+# native_ioc_encode, struct sizes, GETPARAM param ids, the TU116
+# chipset/PCI identity constants, the NVK VM_INIT split, the nouveau
+# driver-name check, the masterless-rc verdict, and the
+# BACKEND_KIND_NVIDIA reservation (punchlist N0.8). No GPU/master/dbus —
+# the device-touching paths live in programs/nvidia_device_enum.cyr.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn test_nv_getparam_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0x00, struct drm_nouveau_getparam[16]).
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GETPARAM_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x00);
+    assert_eq(DRM_IOCTL_NOUVEAU_GETPARAM, expected, "GETPARAM ioctl = 0xC0106440");
+    assert_eq(DRM_IOCTL_NOUVEAU_GETPARAM, 0xC0106440, "GETPARAM precomputed constant");
+    assert_eq(DRM_NOUVEAU_GETPARAM_NR, DRM_COMMAND_BASE + 0x00, "GETPARAM nr = base + 0x00");
+    assert_eq(DRM_NOUVEAU_GETPARAM_SIZE, 16, "getparam struct = 16 bytes");
+    return 0;
+}
+
+fn test_nv_vm_init_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0x10, struct drm_nouveau_vm_init[16]).
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_VM_INIT_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x10);
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_INIT, expected, "VM_INIT ioctl = 0xC0106450");
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_INIT, 0xC0106450, "VM_INIT precomputed constant");
+    assert_eq(DRM_NOUVEAU_VM_INIT_NR, DRM_COMMAND_BASE + 0x10, "VM_INIT nr = base + 0x10");
+    assert_eq(DRM_NOUVEAU_VM_INIT_SIZE, 16, "vm_init struct = 16 bytes");
+    return 0;
+}
+
+fn test_nv_getparam_param_ids() {
+    assert_eq(NOUVEAU_GETPARAM_PCI_VENDOR, 3, "PCI_VENDOR param = 3");
+    assert_eq(NOUVEAU_GETPARAM_PCI_DEVICE, 4, "PCI_DEVICE param = 4");
+    assert_eq(NOUVEAU_GETPARAM_CHIPSET_ID, 11, "CHIPSET_ID param = 11");
+    return 0;
+}
+
+fn test_nv_tu116_identity() {
+    # TU116 chipset is 0x168 (NV168), NOT 0x162 (which is TU102).
+    assert_eq(NV_CHIPSET_TU116, 0x168, "TU116 chipset = NV168 (0x168)");
+    assert_eq(NV_PCI_VENDOR_NVIDIA, 0x10DE, "NVIDIA PCI vendor = 0x10DE");
+    assert_eq(NV_PCI_DEVICE_GTX1660S, 0x21C4, "GTX 1660 SUPER device id = 0x21C4");
+    # boot0 0x168000a1 decodes: chipset = (boot0 >> 20) & 0x1ff.
+    # Division by 0x100000 (= 1<<20) is the toolchain-safe right-shift idiom.
+    var boot0 = 0x168000A1;
+    assert_eq((boot0 / 0x100000) & 0x1FF, NV_CHIPSET_TU116, "boot0 decodes to chipset 0x168");
+    return 0;
+}
+
+fn test_nv_vm_init_kernel_split() {
+    # NVK's verbatim Turing split: kernel manages [512 GiB, 1 TiB).
+    assert_eq(NOUVEAU_VM_KERNEL_RESERVATION_START, 0x8000000000, "kernel VA start = 1<<39 (512 GiB)");
+    assert_eq(NOUVEAU_VM_KERNEL_RESERVATION_SIZE, 0x8000000000, "kernel VA size = 512 GiB");
+    var kernel_end = NOUVEAU_VM_KERNEL_RESERVATION_START + NOUVEAU_VM_KERNEL_RESERVATION_SIZE;
+    assert_eq(kernel_end, 0x10000000000, "kernel end = 1 TiB (1<<40)");
+    # kernel_end must sit inside nouveau's 47-bit VA space (1<<47); the
+    # margin is positive, so the kernel vm_init bound check passes.
+    assert_eq(0x800000000000 - kernel_end, 0x7F0000000000, "1 TiB well under 128 TiB VA ceiling");
+    return 0;
+}
+
+fn test_nv_driver_name_check() {
+    # Hand-build a drm_version struct (name_len at +16, name_ptr at +24).
+    var ver[64];
+    memset(&ver, 0, 64);
+    var name = "nouveau";
+    store64(&ver + 16, strlen(name));
+    store64(&ver + 24, name);
+    assert_eq(native_nv_is_nouveau(&ver), 1, "recognizes nouveau driver");
+
+    # A different driver name must not match.
+    var ver2[64];
+    memset(&ver2, 0, 64);
+    var other = "amdgpu";
+    store64(&ver2 + 16, strlen(other));
+    store64(&ver2 + 24, other);
+    assert_eq(native_nv_is_nouveau(&ver2), 0, "rejects non-nouveau driver");
+
+    # Null name_ptr is safe (returns 0, no deref).
+    var ver3[64];
+    memset(&ver3, 0, 64);
+    assert_eq(native_nv_is_nouveau(&ver3), 0, "null name_ptr is safe");
+    return 0;
+}
+
+fn test_nv_masterless_verdict() {
+    # render-allow set: only EACCES/EPERM mean "master required".
+    assert_eq(native_nv_rc_is_masterless(0), 1, "success = masterless");
+    assert_eq(native_nv_rc_is_masterless(0 - 22), 1, "EINVAL = masterless (bad args, not perm)");
+    assert_eq(native_nv_rc_is_masterless(0 - 38), 1, "ENOSYS = masterless (uAPI reachable)");
+    assert_eq(native_nv_rc_is_masterless(0 - 13), 0, "EACCES = master required");
+    assert_eq(native_nv_rc_is_masterless(0 - 1), 0, "EPERM = master required");
+    return 0;
+}
+
+fn test_nv_gem_new_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GEM_NEW_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x40);
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_NEW, expected, "GEM_NEW ioctl = 0xC0306480");
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_NEW, 0xC0306480, "GEM_NEW precomputed constant");
+    assert_eq(DRM_NOUVEAU_GEM_NEW_SIZE, 48, "gem_new struct = 48 bytes");
+    return 0;
+}
+
+fn test_nv_gem_info_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GEM_INFO_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x44);
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_INFO, expected, "GEM_INFO ioctl = 0xC0286484");
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_INFO, 0xC0286484, "GEM_INFO precomputed constant");
+    assert_eq(DRM_NOUVEAU_GEM_INFO_SIZE, 40, "gem_info struct = 40 bytes");
+    return 0;
+}
+
+fn test_nv_gem_domain_flags() {
+    # Single-bit, disjoint, matches nouveau_drm.h.
+    assert_eq(NOUVEAU_GEM_DOMAIN_CPU, 0x1, "CPU = 1<<0");
+    assert_eq(NOUVEAU_GEM_DOMAIN_VRAM, 0x2, "VRAM = 1<<1");
+    assert_eq(NOUVEAU_GEM_DOMAIN_GART, 0x4, "GART = 1<<2");
+    assert_eq(NOUVEAU_GEM_DOMAIN_MAPPABLE, 0x8, "MAPPABLE = 1<<3");
+    assert_eq(NOUVEAU_GEM_DOMAIN_COHERENT, 0x10, "COHERENT = 1<<4");
+    assert_eq(NOUVEAU_GEM_DOMAIN_NO_SHARE, 0x20, "NO_SHARE = 1<<5");
+    # Host-visible composite = GART | MAPPABLE | COHERENT.
+    assert_eq(NOUVEAU_GEM_DOMAIN_HOST,
+    NOUVEAU_GEM_DOMAIN_GART | NOUVEAU_GEM_DOMAIN_MAPPABLE | NOUVEAU_GEM_DOMAIN_COHERENT,
+    "HOST = GART|MAPPABLE|COHERENT (0x1C)");
+    assert_eq(NOUVEAU_GEM_DOMAIN_GART & NOUVEAU_GEM_DOMAIN_VRAM, 0, "GART/VRAM disjoint");
+    return 0;
+}
+
+fn test_nv_gem_new_struct_layout() {
+    # drm_nouveau_gem_new = embedded gem_info(40) + channel_hint(4) + align(4).
+    # Build a req as the kernel would leave it and verify every accessor offset.
+    var req[48];
+    memset(&req, 0, 48);
+    store32(&req + 0, 0x1234);                    # info.handle (out)
+    store32(&req + 4, NOUVEAU_GEM_DOMAIN_HOST);   # info.domain
+    store64(&req + 8, 0x2000);                    # info.size
+    store64(&req + 24, 0xCAFE0000);               # info.map_handle (out)
+    store32(&req + 44, 4096);                     # align
+    assert_eq(native_nv_gem_new_handle(&req), 0x1234, "handle accessor reads +0");
+    assert_eq(native_nv_gem_new_size(&req), 0x2000, "size accessor reads +8");
+    assert_eq(native_nv_gem_new_map_handle(&req), 0xCAFE0000, "map_handle accessor reads +24");
+    assert_eq(load32(&req + 4), NOUVEAU_GEM_DOMAIN_HOST, "domain at +4");
+    assert_eq(load32(&req + 44), 4096, "align at +44");
+    return 0;
+}
+
+fn test_nv_gem_info_struct_layout() {
+    # drm_nouveau_gem_info: handle in at +0, map_handle out at +24.
+    var req[40];
+    memset(&req, 0, 40);
+    store32(&req + 0, 0x77);            # handle (in)
+    store64(&req + 24, 0xBEEF0000);     # map_handle (out)
+    assert_eq(native_nv_gem_info_map_handle(&req), 0xBEEF0000, "gem_info map_handle reads +24");
+    return 0;
+}
+
+fn test_nv_backend_kind_reserved() {
+    # Punchlist N0.8: NVIDIA kind reserved up front, no struct change.
+    assert_eq(BACKEND_KIND_NVIDIA, 3, "BACKEND_KIND_NVIDIA == 3");
+    # kind is a u64 value (not a fnptr) at slot offset +80.
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_NVIDIA);
+    assert_eq(load64(b + 80), BACKEND_KIND_NVIDIA, "kind stored at slot +80");
+    assert_eq(backend_kind(b), BACKEND_KIND_NVIDIA, "backend_kind() reads +80");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_nv_getparam_ioctl_encoding();
+    test_nv_vm_init_ioctl_encoding();
+    test_nv_getparam_param_ids();
+    test_nv_tu116_identity();
+    test_nv_vm_init_kernel_split();
+    test_nv_driver_name_check();
+    test_nv_masterless_verdict();
+    test_nv_gem_new_ioctl_encoding();
+    test_nv_gem_info_ioctl_encoding();
+    test_nv_gem_domain_flags();
+    test_nv_gem_new_struct_layout();
+    test_nv_gem_info_struct_layout();
+    test_nv_backend_kind_reserved();
+    return assert_summary();
+}
