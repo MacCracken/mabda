@@ -21,10 +21,12 @@ backend is in the public API, and texture create/write/read roundtrips
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N6.2** — Turing TIC/TSC descriptor
-> builders + a GPU-sampling dispatch (the sampled-texel half of N6.4), then
-> **N7** render. The v0 compute path (raw gate + public API) and the v1
-> texture create/write/read roundtrip are done end-to-end.
+> **Resume here (next session):** **N6.2b** — Turing TIC/TSC descriptor
+> builders (byte-diff vs the N6.2a golden in
+> [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md)), then **N6.2c**
+> the sampling SASS + dispatch (HW sampled-texel), then **N7** render. The v0
+> compute path (raw gate + public API), the v1 texture roundtrip, and the
+> NVK-sampling capture/decode (N6.2a) are done.
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
@@ -528,10 +530,26 @@ an afternoon to a few days.
   allocator; dims capped (`validate_dimensions`) so width*height*4 can't
   overflow; v0 surfaces fit one 64 KiB BO (<=128x128). **CPU assert:**
   NV_TEX field map + struct size + RGBA8 tag (`nvidia.tcyr`).
-- [ ] **N6.2** — Turing TIC (Texture Image Control) + TSC (Texture
-  Sampler Control) descriptor builders in a pool BO; `texfmt`→TIC format
-  map (the GFX9 T#/S# analogue). **CPU assert:** TIC/TSC layout + format
-  mapping. **(Next N6 bite — gates GPU sampling.)**
+- [x] **N6.2a** — **Capture + decode an NVK texture-sampling dispatch —
+  DONE.** Harness landed (`tools/nvidia-capture/probe_tex.comp` +
+  `vk_compute_tex.c`; NVK reads back the sampled texel, PASS). Golden TIC +
+  TSC descriptors, the sampling QMD (same shape as the store QMD), and the
+  sampling SASS all decoded in
+  [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md). **Key finding:**
+  the `TEX` instruction encodes the **TIC/TSC index as immediates** (the
+  *bound* model, not bindless) and the dispatch is byte-shape-identical to the
+  N4 store dispatch — so sampling needs only populated+bound TIC/TSC pools + a
+  TEX shader, no new dispatch methods.
+- [ ] **N6.2b** — Turing TIC + TSC descriptor builders (32 B each: linear
+  RGBA8 2D image / NEAREST-clamp sampler), **byte-diffed against the N6.2a
+  golden**. **CPU assert:** every dword pinned. (Field layout from Mesa NVK
+  `nil/tic.c` / `nvk_sampler.c` — a research pass is fetching it.)
+- [ ] **N6.2c** — a bound-texture sampling SASS (`backend_nvidia_sass.cyr`,
+  TIC0/TSC0) verified via the N5.2 `nvdisasm` oracle + a sampling dispatch
+  (alloc TIC/TSC pool BOs, write descriptors, emit
+  `SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + `SEND_PCAS`).
+  `programs/nvidia_texture_sample_e2e.cyr` — **EXIT: a GPU-sampled texel is
+  correct.** HW-gated. (Closes the sampled-texel half of N6.4.)
 - [x] **N6.3** — v1 texture slots (88..120) filled on the NVIDIA backend
   (create_2d_rgba8 / write / read / release) — write/read are bounds-checked
   memcpy on the coherent host mapping. Wired in `backend_nvidia_new`; the
