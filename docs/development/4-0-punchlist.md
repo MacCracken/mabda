@@ -1,9 +1,10 @@
 # Mabda v4.0 — NVIDIA Native Backend Punch List
 
-**Status:** In progress. **N0–N5.3 + N4.7 + N6 v1-texture-slots done and
+**Status:** In progress. **N0–N5.3 + N4.7 + all of N6 (textures) done and
 HW-proven on the TU116 — the N4 compute arc gate is GREEN, the NVIDIA
-backend is in the public API, and texture create/write/read roundtrips
-(2026-06-28). Next front: N6.2 (TIC/TSC + GPU sampling), then N7 render.**
+backend is in the public API, texture create/write/read roundtrips, AND the
+GPU samples textures (TIC/TSC pools + bound TEX dispatch reads back two
+distinct texels, 2026-06-28). Next front: N7 render.**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -21,20 +22,21 @@ backend is in the public API, and texture create/write/read roundtrips
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N6.2c-ii** — the sampling **dispatch** +
-> `programs/nvidia_texture_sample_e2e.cyr` (HW): alloc TIC/TSC pool BOs, write
-> the N6.2b descriptors at TIC index 0 / TSC index 0x58, a sampling pushbuffer
-> (`SET_TEX_HEADER_POOL`/`SET_TEX_SAMPLER_POOL` + invalidates + `SEND_PCAS`),
-> QMD (program = `native_nv_sass_sample_tex`, regcount 10, out @ +0x168) →
-> read a GPU-sampled texel. Then **N7** render. Done: v0 compute (raw + public
-> API), v1 texture roundtrip, N6.2a sampling capture, N6.2b TIC/TSC builders,
-> N6.2c-i sampling SASS.
+> **Resume here (next session):** **N7 — render pipeline.** N6 (textures) is
+> complete and HW-proven, including GPU sampling. N7.1 starts the render arc:
+> `native_nv_rt_create_2d_rgba8` + release (an RGBA8 color-target BO, reusing
+> the N2/N6 allocator), then N7.2 the `TURING_A` 3D class (0xC597) method
+> encoders, N7.3 SM75 VS/FS bytes, N7.4 the v2 render slots (120..176). Done:
+> v0 compute (raw + public API), v1 texture roundtrip, **N6.2 GPU sampling
+> (raw HW)** — TIC/TSC pool binds + a bound-texture TEX dispatch reads back two
+> distinct 1x1 texels (`make test-nvidia-texture-sample-e2e`).
 >
 > **Done + HW-proven:** N1 enum (`make test-nvidia-enum`), N2 GEM roundtrip
 > (`-mem-roundtrip`), N3 channel/VM/sync setup (`-channel-setup`), **N4
 > compute store (`-compute-store`)**, **N4.7 public-API compute
-> (`-compute-api`)**, **N6 texture roundtrip (`-texture-e2e`)**. CPU suite:
-> `tests/tcyr/nvidia.tcyr` (160 asserts). ADR 007 **Accepted**.
+> (`-compute-api`)**, **N6 texture roundtrip (`-texture-e2e`)**, **N6.2 GPU
+> texture sampling (`-texture-sample-e2e`)**. CPU suite:
+> `tests/tcyr/nvidia.tcyr` (216 asserts). ADR 007 **Accepted**.
 **Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
 **Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
 
@@ -557,25 +559,33 @@ an afternoon to a few days.
   captured `STG.E.SYS` patched to `.STRONG.GPU` (`.SYS` hangs on GART — the
   store-kernel finding), `nvdisasm`-verified. **CPU asserts** pin the bytes +
   ABI (`nvidia.tcyr` 186).
-- [ ] **N6.2c-ii** — the sampling **dispatch** + `nvidia_texture_sample_e2e.cyr`
-  (HW). Alloc TIC/TSC pool BOs, write the N6.2b descriptors at TIC index 0 /
-  TSC index 0x58, a sampling pushbuffer (`SET_TEX_HEADER_POOL`/
-  `SET_TEX_SAMPLER_POOL` + invalidates + `SEND_PCAS`), QMD (program = sample
-  SASS, regcount 10, out @ +0x168), EXEC + wait → **a GPU-sampled texel reads
-  back correct.** Byte-diff the pools + pushbuffer vs the N6.2a golden. Closes
-  N6.4. Full plan in [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md).
+- [x] **N6.2c-ii** — the sampling **dispatch** + `nvidia_texture_sample_e2e.cyr`
+  — **DONE + HW-proven.** `native_nv_push_dispatch_sample`
+  (`backend_nvidia_push.cyr`) binds the TIC/TSC pools
+  (`SET_TEX_HEADER_POOL` 0x1574 / `SET_TEX_SAMPLER_POOL` 0x155C, A/B/C =
+  upper/lower/MAXIMUM_INDEX) + the `NO_WFI` texture-header (0x0244) / sampler
+  (0x1424) / SKED (0x0298) cache invalidates before `SEND_PCAS`; offsets
+  verified vs clc5c0.h + NVK. **A UINT TIC** (`native_nv_tic_build_2d_rgba8_uint`,
+  dw0 `0x58D49208`) — the sampling SASS reads raw integer texels (TEX → PRMT,
+  no denormalize), so a UNORM header would pack float garbage. `make
+  test-nvidia-texture-sample-e2e` reads back **two distinct 1x1 texels**
+  (0x44332211, then 0x8899AABB from a repointed TIC) — the result provably
+  tracks the bound texture. **CPU asserts** pin the UINT dw0 + every pushbuffer
+  method (`nvidia.tcyr` 216). Closes N6.4. Decode in
+  [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md).
 - [x] **N6.3** — v1 texture slots (88..120) filled on the NVIDIA backend
   (create_2d_rgba8 / write / read / release) — write/read are bounds-checked
   memcpy on the coherent host mapping. Wired in `backend_nvidia_new`; the
   texture-range `backend_is_complete` walk passes for NVIDIA (render range
   still zero, so the backend stays honestly incomplete). **CPU asserts** in
   `nvidia.tcyr` (slots non-zero + field map).
-- [~] **N6.4** — `programs/nvidia_texture_e2e.cyr` + `make
-  test-nvidia-texture-e2e` landed and **passing on HW**: create a 16x16
-  RGBA8 texture, write a pattern, read it back **byte-identical**, through
-  the PUBLIC `gpu_texture_*` API. The **GPU-sampled-texel** variant (a
-  compute/render dispatch sampling via TIC/TSC) is deferred with N6.2 — the
-  CPU create/write/read roundtrip is the v1-slot proof.
+- [x] **N6.4** — **DONE + HW-proven, both halves.** (a) CPU lifecycle:
+  `programs/nvidia_texture_e2e.cyr` + `make test-nvidia-texture-e2e` create a
+  16x16 RGBA8 texture, write a pattern, read it back **byte-identical**,
+  through the PUBLIC `gpu_texture_*` API. (b) GPU-sampled-texel:
+  `programs/nvidia_texture_sample_e2e.cyr` + `make test-nvidia-texture-sample-e2e`
+  (N6.2c-ii) — a bound-texture TEX compute dispatch samples a texel via
+  TIC/TSC pools and reads it back. **N6 (textures) is complete.**
 
 ### N7 — Render pipeline + render pass
 

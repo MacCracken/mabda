@@ -48,6 +48,31 @@ var NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW  = 0x07B0;   # [0, 0xff000000]
 var NV_SHARED_MEMORY_WINDOW = 0xFE000000;
 var NV_LOCAL_MEMORY_WINDOW  = 0xFF000000;
 
+# Texture/sampler descriptor-pool binding (N6.2c sampling). Each is a
+# 3-dword INCR run on the compute subchannel: A=ADDRESS_UPPER (pool VA bits
+# 47:32), B=ADDRESS_LOWER (bits 31:0), C=MAXIMUM_INDEX (highest valid pool
+# index; each entry is 32 bytes). The TEX instruction names the TIC/TSC pool
+# index as an immediate (bound-texture model — N6.2a), so the pools must be
+# bound before SEND_PCAS for a sampling dispatch. Offsets verified against
+# the clc5c0 method map + the NVK queue-init capture (N6.2a).
+var NVC5C0_SET_TEX_HEADER_POOL_A  = 0x1574;   # +0x1578 B (lower), +0x157C C (max)
+var NVC5C0_SET_TEX_SAMPLER_POOL_A = 0x155C;   # +0x1560 B (lower), +0x1564 C (max)
+# Pool max index = (64 KiB BO / 32-byte entry) - 1 = 2047. Covers TIC index 0
+# and TSC index 0x58 (the SASS's TEX immediates); the SM only reads the named
+# indices, so a whole-BO bound is harmless. Fits both the TIC MAXIMUM_INDEX
+# field (22 bits) and the narrower TSC one (20 bits). MAXIMUM_INDEX = count-1.
+var NV_TEX_POOL_MAX_INDEX = 0x7FF;
+
+# Cache-invalidate methods (NO_WFI, INLINE imm 0 = LINES_ALL). NVK emits the
+# texture-header / sampler invalidates right after binding each pool, and the
+# SKED (compute-scheduler) invalidate at every compute cmdbuf begin. On a cold
+# channel they are not strictly required, but they cannot hang and a warm
+# cache line would otherwise yield a silent STALE texel — so the sampling
+# dispatch emits all three (clc5c0; verified vs nvk_queue.c / nvk_cmd_dispatch.c).
+var NVC5C0_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI = 0x0244;
+var NVC5C0_INVALIDATE_SAMPLER_CACHE_NO_WFI        = 0x1424;
+var NVC5C0_INVALIDATE_SKED_CACHES                 = 0x0298;
+
 # Build a method header for an incrementing/non-incrementing/incr-once
 # method run carrying `count` dword args. `mthd` is the method byte offset.
 fn native_nv_method_header(op, subc, mthd, count): i64 {
@@ -98,6 +123,80 @@ fn native_nv_push_dispatch(dst, qmd_va): i64 {
     store32(dst + n, qmd_va / 0x100);
     n = n + 4;
     # SEND_SIGNALING_PCAS_B = INVALIDATE | SCHEDULE (INLINE immediate)
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_SEND_SIGNALING_PCAS_B,
+    NVC5C0_PCAS_INVALIDATE | NVC5C0_PCAS_SCHEDULE));
+    n = n + 4;
+    return n;
+}
+
+# Stage a texture-SAMPLING compute-dispatch pushbuffer into `dst`
+# (caller-owned). Identical to native_nv_push_dispatch but binds the TIC/TSC
+# descriptor pools (and invalidates their caches) before SEND_PCAS, so a
+# bound-texture TEX shader can fetch from them. Emit order mirrors NVK
+# (bind pool -> invalidate that cache; SKED invalidate before dispatch):
+#   SET_OBJECT(0xC5C0)
+#   SET_SHADER_SHARED/LOCAL_MEMORY_WINDOW            (generic addressing)
+#   SET_TEX_HEADER_POOL  A/B/C (tic_pool_va, max)    -> INVALIDATE_TEX_HEADER
+#   SET_TEX_SAMPLER_POOL A/B/C (tsc_pool_va, max)    -> INVALIDATE_SAMPLER
+#   INVALIDATE_SKED_CACHES
+#   SEND_PCAS_A(qmd_va >> 8) ; SEND_SIGNALING_PCAS_B(INVALIDATE|SCHEDULE)
+# Pool VAs are written UNSHIFTED (A = va>>32, B = va low-32 via store32
+# truncation). Returns the byte count written (the EXEC push va_len).
+fn native_nv_push_dispatch_sample(dst, qmd_va, tic_pool_va, tsc_pool_va): i64 {
+    var n = 0;
+    # SET_OBJECT = compute class.
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_OBJECT, 1));
+    n = n + 4;
+    store32(dst + n, TURING_COMPUTE_A);
+    n = n + 4;
+    # Generic-addressing windows (captured from NVK init) — required non-zero
+    # bases or global STG.E faults "Invalid Address Space".
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW, 2));
+    n = n + 4;
+    store32(dst + n, 0);
+    n = n + 4;
+    store32(dst + n, NV_SHARED_MEMORY_WINDOW);
+    n = n + 4;
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW, 2));
+    n = n + 4;
+    store32(dst + n, 0);
+    n = n + 4;
+    store32(dst + n, NV_LOCAL_MEMORY_WINDOW);
+    n = n + 4;
+    # SET_TEX_HEADER_POOL A/B/C: pool VA (upper, lower) + MAXIMUM_INDEX.
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_TEX_HEADER_POOL_A, 3));
+    n = n + 4;
+    store32(dst + n, (tic_pool_va / 0x100000000) & 0x1FFFF);   # A = ADDRESS_UPPER (47:32)
+    n = n + 4;
+    store32(dst + n, tic_pool_va);                             # B = ADDRESS_LOWER (31:0)
+    n = n + 4;
+    store32(dst + n, NV_TEX_POOL_MAX_INDEX);                   # C = MAXIMUM_INDEX
+    n = n + 4;
+    # Invalidate the texture-header cache (NO_WFI, LINES_ALL).
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI, 0));
+    n = n + 4;
+    # SET_TEX_SAMPLER_POOL A/B/C.
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_TEX_SAMPLER_POOL_A, 3));
+    n = n + 4;
+    store32(dst + n, (tsc_pool_va / 0x100000000) & 0x1FFFF);
+    n = n + 4;
+    store32(dst + n, tsc_pool_va);
+    n = n + 4;
+    store32(dst + n, NV_TEX_POOL_MAX_INDEX);
+    n = n + 4;
+    # Invalidate the sampler cache (NO_WFI, LINES_ALL).
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_INVALIDATE_SAMPLER_CACHE_NO_WFI, 0));
+    n = n + 4;
+    # Invalidate the SKED (compute-scheduler) caches — NVK does this at every
+    # compute cmdbuf begin (Maxwell-B+; Turing qualifies).
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_INVALIDATE_SKED_CACHES, 0));
+    n = n + 4;
+    # SEND_PCAS_A = qmd_va >> 8 (QMD is 256-byte aligned).
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SEND_PCAS_A, 1));
+    n = n + 4;
+    store32(dst + n, qmd_va / 0x100);
+    n = n + 4;
+    # SEND_SIGNALING_PCAS_B = INVALIDATE | SCHEDULE (INLINE immediate).
     store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_SEND_SIGNALING_PCAS_B,
     NVC5C0_PCAS_INVALIDATE | NVC5C0_PCAS_SCHEDULE));
     n = n + 4;

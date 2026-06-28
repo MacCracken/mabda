@@ -339,6 +339,19 @@ build/nvidia_texture_e2e: programs/nvidia_texture_e2e.cyr src/*.cyr
 test-nvidia-texture-e2e: build/nvidia_texture_e2e
 	./build/nvidia_texture_e2e
 
+# v4.0 Phase N6.2c — NVIDIA native GPU texture SAMPLING end-to-end. Binds a
+# TIC/TSC descriptor pool, runs a Turing TEX (bound-texture) compute dispatch
+# that samples a 1x1 RGBA8 texel and stores the packed result, reads it back.
+# Proves the native sampling path (TIC/TSC pools + SET_TEX_*_POOL + TEX SASS).
+# Requires nouveau hardware; not in CI.
+build/nvidia_texture_sample_e2e: programs/nvidia_texture_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_texture_sample_e2e.cyr $@
+
+.PHONY: test-nvidia-texture-sample-e2e
+test-nvidia-texture-sample-e2e: build/nvidia_texture_sample_e2e
+	./build/nvidia_texture_sample_e2e
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

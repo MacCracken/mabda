@@ -469,6 +469,65 @@ fn test_nv_sass_sample_tex() {
     return 0;
 }
 
+# N6.2c-ii — the UINT TIC variant the sampling dispatch binds. The sampling
+# SASS reads raw integer texels (TEX -> PRMT, no denormalize), so the header
+# must be RGBA8_UINT, not the UNORM the NVK normalized-float probe used. UINT
+# differs from UNORM in dw0 ONLY: the four DATA_TYPE fields 2->4 (XOR 6 each =
+# 0x6DB00); every other dword is type-agnostic and identical.
+fn test_nv_tic_build_uint() {
+    var u[32];
+    var s[32];
+    native_nv_tic_build_2d_rgba8_uint(&u, 0x3ffdf9c000, 1, 1);
+    native_nv_tic_build_2d_rgba8(&s, 0x3ffdf9c000, 1, 1);
+    assert_eq(load32(&u + 0) & 0xFFFFFFFF, 0x58D49208, "UINT TIC dw0 = RGBA8_UINT");
+    assert_eq(NV_TIC_FORMAT_RGBA8_UINT, 0x58D49208, "RGBA8_UINT format const");
+    assert_eq((load32(&u + 0) ^ load32(&s + 0)) & 0xFFFFFFFF, 0x0006DB00,
+    "UINT^UNORM dw0 = the four DATA_TYPE fields (2->4) only");
+    assert_eq(load32(&u + 4) & 0xFFFFFFFF, load32(&s + 4) & 0xFFFFFFFF, "UINT dw1 == UNORM dw1");
+    assert_eq(load32(&u + 8) & 0xFFFFFFFF, load32(&s + 8) & 0xFFFFFFFF, "UINT dw2 == UNORM dw2");
+    assert_eq(load32(&u + 12) & 0xFFFFFFFF, load32(&s + 12) & 0xFFFFFFFF, "UINT dw3 == UNORM dw3");
+    assert_eq(load32(&u + 16) & 0xFFFFFFFF, load32(&s + 16) & 0xFFFFFFFF, "UINT dw4 == UNORM dw4");
+    assert_eq(load32(&u + 20) & 0xFFFFFFFF, load32(&s + 20) & 0xFFFFFFFF, "UINT dw5 == UNORM dw5");
+    assert_eq(load32(&u + 24) & 0xFFFFFFFF, load32(&s + 24) & 0xFFFFFFFF, "UINT dw6 == UNORM dw6");
+    return 0;
+}
+
+# N6.2c-ii — the sampling-dispatch pushbuffer: the N4 store dispatch (SET_OBJECT
+# + memory windows + SEND_PCAS) plus the TIC/TSC pool binds and their cache
+# invalidates. Every method offset / header verified against clc5c0.h + NVK
+# (nvk_queue.c / nvk_cmd_dispatch.c). These are the silent-hang-prone bytes, so
+# pin them all. (qmd_va 0x200000, TIC pool 0x700000, TSC pool 0x800000.)
+fn test_nv_push_dispatch_sample() {
+    var buf[96];
+    memset(&buf, 0, 96);
+    var n = native_nv_push_dispatch_sample(&buf, 0x200000, 0x700000, 0x800000);
+    assert_eq(n, 88, "sample dispatch push = 88 bytes (22 dwords)");
+    assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
+    assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
+    assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header");
+    assert_eq(load32(&buf + 16) & 0xFFFFFFFF, 0xFE000000, "shared window base");
+    assert_eq(load32(&buf + 20), 0x200221EC, "LOCAL_MEMORY_WINDOW header");
+    assert_eq(load32(&buf + 28) & 0xFFFFFFFF, 0xFF000000, "local window base");
+    assert_eq(load32(&buf + 32), 0x2003255D, "SET_TEX_HEADER_POOL_A header (0x1574 cnt3)");
+    assert_eq(load32(&buf + 36), 0, "TIC pool addr upper");
+    assert_eq(load32(&buf + 40), 0x700000, "TIC pool addr lower");
+    assert_eq(load32(&buf + 44), 0x7FF, "TIC pool MAXIMUM_INDEX");
+    assert_eq(load32(&buf + 48) & 0xFFFFFFFF, 0x80002091,
+    "INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI (0x0244 immd)");
+    assert_eq(load32(&buf + 52), 0x20032557, "SET_TEX_SAMPLER_POOL_A header (0x155C cnt3)");
+    assert_eq(load32(&buf + 56), 0, "TSC pool addr upper");
+    assert_eq(load32(&buf + 60), 0x800000, "TSC pool addr lower");
+    assert_eq(load32(&buf + 64), 0x7FF, "TSC pool MAXIMUM_INDEX");
+    assert_eq(load32(&buf + 68) & 0xFFFFFFFF, 0x80002509,
+    "INVALIDATE_SAMPLER_CACHE_NO_WFI (0x1424 immd)");
+    assert_eq(load32(&buf + 72) & 0xFFFFFFFF, 0x800020A6,
+    "INVALIDATE_SKED_CACHES (0x0298 immd)");
+    assert_eq(load32(&buf + 76), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 80), 0x2000, "qmd_va >> 8 (0x200000 >> 8)");
+    assert_eq(load32(&buf + 84) & 0xFFFFFFFF, 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -500,6 +559,8 @@ fn main() {
     test_nv_backend_v0_slots();
     test_nv_backend_v1_texture_slots();
     test_nv_tic_tsc_build();
+    test_nv_tic_build_uint();
     test_nv_sass_sample_tex();
+    test_nv_push_dispatch_sample();
     return assert_summary();
 }

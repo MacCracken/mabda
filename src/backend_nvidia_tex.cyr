@@ -26,6 +26,15 @@
 # dw0: COMPONENTS_SIZES=A8B8G8R8(0x08) | R/G/B/A_DATA_TYPE=UNORM(2) each |
 #      X/Y/Z/W_SOURCE = R(2)/G(3)/B(4)/A(5). Constant for any RGBA8_UNORM.
 var NV_TIC_FORMAT_RGBA8_UNORM = 0x58D24908;
+# Same word with the four DATA_TYPE fields UNORM(2)->UINT(4) — the only diff
+# (G80_TIC_TYPE: UNORM=2, UINT=4; envytools g80_defs.xml). A UINT TIC makes
+# the TEX unit deliver the RAW integer texel; UNORM makes it normalize to
+# float [0,1]. mabda's sampling SASS (native_nv_sass_sample_tex, from a
+# `tex2D<uchar4>` element-read kernel) does TEX -> PRMT with NO float
+# denormalize, so it REQUIRES a UINT header — a UNORM TIC would byte-permute
+# IEEE-754 floats into garbage. (UINT textures are point-sampled only, which
+# the NEAREST TSC already is.)
+var NV_TIC_FORMAT_RGBA8_UINT = 0x58D49208;
 # dw2 bits[23:21] HEADER_VERSION: PITCH=2 (linear), BLOCKLINEAR=3.
 var NV_TIC_HEADER_PITCH = 2;
 # dw3 bits[18:16] LOD_ISO/ANISO quality (NVK sets all three) + MAX_MIP_LEVEL=0.
@@ -38,17 +47,19 @@ var NV_TIC_NORMALIZED_COORDS = 0x80000000;
 # dw6: ANISO_FINE/COARSE_SPREAD_FUNC NVK constants (irrelevant to NEAREST).
 var NV_TIC_DW6_DEFAULT = 0x03000000;
 
-# Build a PITCH-layout TIC for a linear RGBA8 2D image into `dst` (>=32 bytes).
+# Shared body: build a PITCH-layout TIC for a linear RGBA8 2D image into `dst`
+# (>=32 bytes) with the given dw0 format word (UNORM vs UINT differ ONLY in
+# dw0's four data-type fields; every other dword is type-agnostic).
 #   va     = image data GPU VA (32-byte aligned; mabda's 64 KiB-aligned VAs are)
 #   width  = texels across (>=1), height = rows (>=1)
 # Row pitch = round_up(width*4, 32) bytes (the PITCH field is bits[20:5], so a
 # 32-byte multiple). For tightly-packed linear data this matches the stored
 # stride when width*4 is a 32-byte multiple (width % 8 == 0); a 1x1 texel
 # (single row) samples correctly regardless. Returns 32.
-fn native_nv_tic_build_2d_rgba8(dst, va, width, height): i64 {
+fn _native_nv_tic_build_2d_pitch(dst, va, width, height, fmt_dw0): i64 {
     memset(dst, 0, 32);
     var pitch = (width * 4 + 31) / 32 * 32;   # round_up(width*4, 32)
-    store32(dst + 0,  NV_TIC_FORMAT_RGBA8_UNORM);
+    store32(dst + 0,  fmt_dw0);
     store32(dst + 4,  va & 0xFFFFFFE0);                       # ADDRESS_BITS_31_5
     store32(dst + 8,  ((va / 0x100000000) & 0xFFFF)           # ADDRESS_BITS_47_32
     | (NV_TIC_HEADER_PITCH * 0x200000));                      # HEADER_VERSION<<21
@@ -60,6 +71,19 @@ fn native_nv_tic_build_2d_rgba8(dst, va, width, height): i64 {
     store32(dst + 24, NV_TIC_DW6_DEFAULT);
     # dst+28 (dw7) stays 0 (RES_VIEW mip range / MSAA / MIN_LOD_CLAMP all 0).
     return 32;
+}
+
+# UNORM RGBA8 TIC (TEX returns normalized float [0,1]) — byte-matches the
+# N6.2a NVK golden; pairs with a shader that denormalizes.
+fn native_nv_tic_build_2d_rgba8(dst, va, width, height): i64 {
+    return _native_nv_tic_build_2d_pitch(dst, va, width, height, NV_TIC_FORMAT_RGBA8_UNORM);
+}
+
+# UINT RGBA8 TIC (TEX returns the raw integer texel) — pairs with mabda's
+# sampling SASS (native_nv_sass_sample_tex: TEX -> PRMT, no denormalize).
+# This is the variant the N6.2c sampling dispatch binds.
+fn native_nv_tic_build_2d_rgba8_uint(dst, va, width, height): i64 {
+    return _native_nv_tic_build_2d_pitch(dst, va, width, height, NV_TIC_FORMAT_RGBA8_UINT);
 }
 
 # --- TSC (8 dwords / 32 bytes) ---

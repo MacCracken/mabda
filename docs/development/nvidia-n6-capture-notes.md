@@ -177,20 +177,51 @@ sampling dispatch (N6.2c-ii) must honor:
   **1×1** NEAREST/CLAMP texture. Use a 1×1 texture for the proof; arbitrary
   coords/sizes are a follow-up.
 
-## N6.2c-ii — the sampling dispatch (REMAINING, HW)
+## N6.2c-ii — the sampling dispatch (DONE + HW-proven)
 
-Build a sampling dispatch + `programs/nvidia_texture_sample_e2e.cyr`:
-1. Alloc a TIC pool BO + a TSC pool BO (host, VM_BIND'd); write
-   `native_nv_tic_build_2d_rgba8` at TIC index 0 (pointing at a 1×1 texture
-   BO holding a known texel) and `native_nv_tsc_build_nearest_clamp` at TSC
-   index 0x58.
-2. A sampling pushbuffer variant of `native_nv_push_dispatch` that also emits
-   `SET_TEX_HEADER_POOL`(0x1574, A/B/C = pool_hi, pool_lo, max_index) +
-   `SET_TEX_SAMPLER_POOL`(0x155c) + the texture-header/sampler cache
-   invalidates (0x0244 / 0x1424) before `SEND_PCAS`.
-3. QMD: program = `native_nv_sass_sample_tex`, regcount = 10, cbuf0 = a param
-   bank with the output VA at +0x168.
-4. EXEC + wait (absolute deadline). Read back the packed RGBA8 texel; expect
-   the value written into the texture. **Byte-diff the TIC/TSC pools + the
-   dispatch pushbuffer against the N6.2a golden capture before trusting it**
-   (the PM4/QMD protocol — a wrong bit silently hangs).
+`programs/nvidia_texture_sample_e2e.cyr` (`make test-nvidia-texture-sample-e2e`)
+binds a TIC/TSC pool and runs a bound-texture TEX compute dispatch that samples
+a 1×1 RGBA8 texel and stores the packed result — read back on the CPU. It
+samples **two distinct texels** (0x44332211, then 0x8899AABB from a TIC
+repointed at a second texture VA) so the readback provably *tracks* the bound
+texture rather than echoing a constant.
+
+### The UINT-vs-UNORM correctness catch (load-bearing)
+
+The N6.2b TIC builder emits **UNORM** (`0x58D24908`) — correct for the NVK
+normalized-float probe, whose SASS denormalizes (`FMUL 255`/`F2I`). But mabda's
+sampling SASS (`native_nv_sass_sample_tex`, from a `tex2D<uchar4>` element-read
+kernel) does **TEX → PRMT with NO float conversion** — it expects the TEX unit
+to deliver the *raw integer texel*. On Turing the TEX unit normalizes iff the
+TIC's `*_DATA_TYPE` fields say UNORM; for raw integers they must say **UINT**.
+So the sampling path needs a UINT header: `native_nv_tic_build_2d_rgba8_uint`,
+dw0 = `0x58D49208` (the four data-type fields UNORM(2)→UINT(4), `^0x6DB00`;
+`G80_TIC_TYPE` from envytools g80_defs.xml). A UNORM TIC here would PRMT the low
+bytes of IEEE-754 floats → garbage. (A 1×1 sample on UNORM would have *looked*
+plausible only by accident; the two-texel HW check + the type fix make it real.
+UINT textures are point-sampled only — the NEAREST TSC already is.)
+
+### clc5c0 pool-bind + invalidate methods (verified vs clc5c0.h + NVK)
+
+`native_nv_push_dispatch_sample` = the N4 store dispatch (SET_OBJECT + memory
+windows + SEND_PCAS) plus, before SEND_PCAS:
+
+```
+SET_TEX_HEADER_POOL  A/B/C  0x1574/78/7C  INCR×3  (A=VA[48:32] 17b, B=VA[31:0], C=MAXIMUM_INDEX 22b = entries-1)
+INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI  0x0244  IMMD imm 0 (LINES_ALL)
+SET_TEX_SAMPLER_POOL A/B/C  0x155C/60/64  INCR×3  (C is 20b)
+INVALIDATE_SAMPLER_CACHE_NO_WFI         0x1424  IMMD imm 0
+INVALIDATE_SKED_CACHES                  0x0298  IMMD imm 0  (compute-scheduler flush; NVK does this at every compute cmdbuf begin)
+```
+
+Pool VAs are written **unshifted** (A = va>>32, B = va low-32). mabda uses a
+64 KiB pool BO with `MAXIMUM_INDEX = 0x7FF` (2048 32-byte entries — covers TIC
+index 0 and TSC index 0x58). The cache invalidates aren't strictly required on
+a truly-cold channel but cannot hang and guard against a warm line serving a
+stale texel, so all three are emitted (matching NVK). Every pushbuffer dword +
+the UINT dw0 are CPU-asserted (`nvidia.tcyr` `test_nv_push_dispatch_sample` /
+`test_nv_tic_build_uint`, 216 total).
+
+QMD is unchanged from the store path: program = `native_nv_sass_sample_tex`,
+regcount = 10, cbuf0 = param bank with the output VA at **+0x168**. EXEC + wait
+on an absolute deadline. **This closes N6.4 — N6 (textures) is complete.**
