@@ -252,6 +252,82 @@ fn test_nv_sass_store_deadbeef() {
     return 0;
 }
 
+fn test_nv_method_header_golden() {
+    # Golden vectors read directly from the NVK dispatch pushbuffer (N0.7c).
+    assert_eq(native_nv_method_header(NV_OP_INCR, 1, NVC5C0_SEND_PCAS_A, 1), 0x200120AD,
+    "SEND_PCAS_A header == capture [12]");
+    assert_eq(native_nv_method_inline(1, NVC5C0_SEND_SIGNALING_PCAS_B, 3), 0x800320AF,
+    "SEND_SIGNALING_PCAS_B inline == capture [14]");
+    assert_eq(native_nv_method_header(NV_OP_INCR, 1, NVC5C0_SET_OBJECT, 1), 0x20012000,
+    "SET_OBJECT header");
+    return 0;
+}
+
+fn test_nv_push_dispatch() {
+    var buf[64];
+    memset(&buf, 0, 64);
+    var n = native_nv_push_dispatch(&buf, 0x3ffdf5c800);   # the capture's qmd_va
+    assert_eq(n, 44, "dispatch push = 44 bytes (11 dwords)");
+    assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
+    assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
+    assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header (0x02a0 cnt2)");
+    assert_eq(load32(&buf + 12), 0, "shared window arg0");
+    assert_eq(load32(&buf + 16), 0xFE000000, "shared window base (== capture)");
+    assert_eq(load32(&buf + 20), 0x200221EC, "LOCAL_MEMORY_WINDOW header (0x07b0 cnt2)");
+    assert_eq(load32(&buf + 24), 0, "local window arg0");
+    assert_eq(load32(&buf + 28), 0xFF000000, "local window base (== capture)");
+    assert_eq(load32(&buf + 32), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 36), 0x3ffdf5c8, "qmd_va>>8 (== capture arg)");
+    assert_eq(load32(&buf + 40), 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    return 0;
+}
+
+fn test_nv_object_handle() {
+    # NVK idiom (0xbeef+chid)<<16 | (oclass&0xff); capture chid9 -> 0xbef800c0.
+    assert_eq(native_nv_object_handle(9, TURING_COMPUTE_A), 0xbef800c0, "NVIF handle chid9/0xc5c0");
+    return 0;
+}
+
+fn test_nv_exec_nvif_ioctl_encoding() {
+    var ex = native_ioc_encode(3, DRM_NOUVEAU_EXEC_SIZE, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x12);
+    assert_eq(DRM_IOCTL_NOUVEAU_EXEC, ex, "EXEC ioctl = 0xC0286452");
+    assert_eq(DRM_IOCTL_NOUVEAU_EXEC, 0xC0286452, "EXEC precomputed constant");
+    assert_eq(DRM_NOUVEAU_EXEC_SIZE, 40, "exec struct = 40 bytes");
+    # NVIF is size-dependent; a 56-byte NEW payload.
+    var nvif56 = native_ioc_encode(3, 56, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x07);
+    assert_eq(nvif56, 0xC0386447, "NVIF(56) ioctl = 0xC0386447");
+    return 0;
+}
+
+fn test_nv_qmd_build() {
+    # Build with the golden's VAs so the fixed fields are directly comparable
+    # to the captured QMD; per-kernel fields use our ptxas regcount=4.
+    var qmd[256];
+    native_nv_qmd_build(&qmd, 0x3ffdf9c780, 4, 0x3ffdf5c000, 0x200);
+    assert_eq(NV_QMD_SIZE, 256, "QMD = 256 bytes");
+    # Golden-verified fixed config fields.
+    assert_eq(load32(&qmd + 0x10), 0x40, "SM_GLOBAL_CACHING (== golden)");
+    assert_eq(load32(&qmd + 0x2c), 0x04000000, "API_VISIBLE_CALL_LIMIT (== golden)");
+    assert_eq(load32(&qmd + 0x30), 1, "grid X");
+    assert_eq(load32(&qmd + 0x34), 1, "grid Y");
+    assert_eq(load32(&qmd + 0x38), 1, "grid Z");
+    assert_eq(load32(&qmd + 0x44), 0x22240000, "shared-mem config (== golden)");
+    assert_eq(load32(&qmd + 0x48), 0x00010022, "ver 2.2 + blockX (== golden)");
+    assert_eq(load32(&qmd + 0x4c), 0x00010001, "blockY/Z (== golden)");
+    # dw20: VALID[0]=1 | REGISTER_COUNT_V=4 | TARGET_SM_CONFIG=9.
+    assert_eq(load32(&qmd + 0x50), 0x00120401, "valid0|regcount_v=4|target=9");
+    # CONSTANT_BUFFER[0]: addr lo/hi + SIZE_SHIFTED4 (0x200/16 = 0x20).
+    assert_eq(load32(&qmd + 0x80), 0xfdf5c000, "cbuf0 addr lo");
+    assert_eq(load32(&qmd + 0x84), 0x0100003f, "cbuf0 addr hi + size_sh4=0x20");
+    # PROGRAM_ADDRESS unshifted lo/hi.
+    assert_eq(load32(&qmd + 0xc0), 0xfdf9c780, "program addr lo");
+    assert_eq(load32(&qmd + 0xc4), 0x3f, "program addr hi");
+    # SASS_VERSION / legacy REGISTER_COUNT / local mem stay 0.
+    assert_eq(load32(&qmd + 0x78), 0, "legacy REGISTER_COUNT + local-mem-high = 0");
+    assert_eq(load32(&qmd + 0x7c), 0, "SASS_VERSION + prefetch = 0");
+    return 0;
+}
+
 fn test_nv_backend_kind_reserved() {
     # Punchlist N0.8: NVIDIA kind reserved up front, no struct change.
     assert_eq(BACKEND_KIND_NVIDIA, 3, "BACKEND_KIND_NVIDIA == 3");
@@ -285,6 +361,11 @@ fn main() {
     test_nv_vm_bind_op_layout();
     test_nv_sync_build();
     test_nv_sass_store_deadbeef();
+    test_nv_method_header_golden();
+    test_nv_push_dispatch();
+    test_nv_object_handle();
+    test_nv_exec_nvif_ioctl_encoding();
+    test_nv_qmd_build();
     test_nv_backend_kind_reserved();
     return assert_summary();
 }

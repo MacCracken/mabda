@@ -304,6 +304,18 @@ build/nvidia_channel_setup: programs/nvidia_channel_setup.cyr src/*.cyr
 test-nvidia-channel-setup: build/nvidia_channel_setup
 	./build/nvidia_channel_setup
 
+# v4.0 Phase N4 — THE ARC GATE. Pure-Cyrius NVIDIA compute dispatch:
+# VM_INIT -> CHANNEL_ALLOC -> NVIF(0xC5C0) -> GEM_NEW/VM_BIND -> build QMD
+# + pushbuffer -> EXEC -> verify the GPU wrote 0xDEADBEEF (twice on one
+# channel). Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_compute_store: programs/nvidia_compute_store.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_compute_store.cyr $@
+
+.PHONY: test-nvidia-compute-store
+test-nvidia-compute-store: build/nvidia_compute_store
+	./build/nvidia_compute_store
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

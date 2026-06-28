@@ -395,13 +395,19 @@ an afternoon to a few days.
 
 ### N4 — Compute dispatch proof-of-life (0xDEADBEEF readback) — THE ARC GATE
 
-- [ ] **N4.1** — `src/backend_nvidia_push.cyr` (new; the
-  `backend_native_pm4.cyr` analogue): `native_nv_method_header(opcode,
-  subc, mthd, count)` = `(opcode<<29)|(count<<16)|(subc<<13)|(mthd>>2)`;
-  INLINE form packs a 12-bit immediate in bits 28:16. **CPU assert:**
-  header bit-packing against envytools dma-pusher; all bring-up methods
-  `< 0x1700` so `(mthd>>2)` fits 12 bits.
-- [ ] **N4.2** — `src/backend_nvidia_qmd.cyr` (new; **no AMD analog**):
+- [x] **N4.1** — `src/backend_nvidia_push.cyr` landed: `native_nv_method_header`
+  / `native_nv_method_inline` + `native_nv_push_dispatch`. Headers
+  **byte-match the NVK capture** (`SEND_PCAS_A`→`0x200120AD`,
+  `SEND_SIGNALING_PCAS_B`→`0x800320AF`). Includes the captured
+  shared/local-memory-window methods (`0x02a0`=`0xfe000000`,
+  `0x07b0`=`0xff000000`). **CPU asserts** pin every dword.
+- [x] **N4.2** — `src/backend_nvidia_qmd.cyr` landed (QMDV02_**02** —
+  Turing 0xC5C0 uses NVK's Volta branch; version stamp 2.2). `REGISTER_COUNT_V`
+  (not legacy), `SASS_VERSION`=0, the SM-config/window fields all pinned via
+  the qmd-bitfield-verify pass. **Byte-diffed against `GOLDEN_QMD.bin`:** every
+  fixed field matches; only program addr / regcount / cbuf VA differ as
+  intended. **CPU asserts** pin all fields.
+  <!-- original N4.2 spec, retained for reference -->
   256-byte QMDV02_03 bit-pack builder — `PROGRAM_ADDRESS_LOWER/UPPER`,
   `CTA_THREAD_DIMENSION0..2`, `CTA_RASTER_WIDTH/HEIGHT/DEPTH`,
   `REGISTER_COUNT`, `SHARED_MEMORY_SIZE`, `SASS_VERSION` (SM75 numeric —
@@ -410,35 +416,34 @@ an afternoon to a few days.
   `MW(hi:lo)` bit range. **CPU assert:** QMD size == 256; each field's bit
   offset; **byte-diff against the N0.7 captured known-good QMD** (the PM4
   protocol — do not claim correct until the HW-capture diff matches).
-- [ ] **N4.3** — `src/backend_nvidia.cyr` (new; the `backend_native.cyr`
-  analogue) `native_nv_compute_dispatch`: stage pushbuffer —
-  `SET_OBJECT(0xC5C0)` on the compute subchannel; preamble
-  (`SET_SHADER_LOCAL_MEMORY_A`, `SET_SHADER_SHARED_MEMORY_WINDOW_A`,
-  `SET_SHADER_EXCEPTIONS`, `INVALIDATE_SHADER_CACHES_NO_WFI`);
-  `SEND_PCAS_A(qmd_va>>8)`; `SEND_SIGNALING_PCAS_B(INVALIDATE|SCHEDULE)`;
-  host `SEM_EXECUTE` release (`RELEASE`, `RELEASE_WFI`) to the semaphore
-  VA. **CPU assert:** the staged pushbuffer dwords match a golden vector
-  (every method header + arg pinned). Keep dispatch state behind a struct
-  ptr so the slot signature stays ≤ 6 args.
-- [ ] **N4.4** — `native_nv_exec_submit` (`DRM_NOUVEAU_EXEC`, **0x12**):
-  one `drm_nouveau_exec_push{va=pushbuf_va, va_len=bytes}` + a sig
-  `drm_nouveau_sync` syncobj; wait via the reused syncobj-wait wrapper.
-  **CPU assert:** `drm_nouveau_exec` / `exec_push` byte layout; push-count
-  / sig-count plumbing.
-- [ ] **N4.5** — **Cache coherency (the hardest non-structural bug).**
-  Ensure the GPU's write is CPU-visible after the syncobj fires: the SASS
-  uses `STG.E.SYS` (+ membar as needed), and the QMD's L2-flush /
-  `RELEASE0` (or host `SEM` release) ordering guarantees the CPU sees
-  `0xDEADBEEF`, not stale data. Mirror AMD's glc/slc + `s_waitcnt`
-  discipline. **CPU assert:** the SASS carries the system-scope store
-  encoding; release-after-dispatch ordering is asserted in the staged
-  stream.
-- [ ] **N4.6** — `programs/nvidia_compute_store.cyr` — **THE ARC GATE**
-  (mirrors `native_compute_store.cyr`): build the SASS BO, build QMD +
-  pushbuffer, `EXEC`, wait, verify the output BO holds `0xDEADBEEF`, then
-  prove a **2nd dispatch on the same channel**. **EXIT:** GPU wrote
-  `0xDEADBEEF` and CPU read it back via a pure-Cyrius dispatch. Map exit
-  codes to failure classes for unattended runs. HW-gated.
+- [~] **N4.3** — Dispatch staging lives in `native_nv_push_dispatch`
+  (`backend_nvidia_push.cyr`) + `native_nv_object_new` (NVIF 0xC5C0) in the
+  nouveau module. Current stream: `SET_OBJECT(0xC5C0)` → shared/local memory
+  windows → `SEND_PCAS_A` → `SEND_SIGNALING_PCAS_B`. **Insufficient for the
+  gate** — NVK's real dispatch (capture `082`) also issues extra
+  compute-subchannel methods (`0x0298`/`0x1424`/`0x0244`) **and** 3D-class
+  (0xC597) housekeeping on a fuller multi-class channel. Fuller init is the
+  open work (see [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md)
+  § N4 implementation status). A dedicated `backend_nvidia.cyr` + the
+  ≤6-arg slot wrapper still to come.
+- [x] **N4.4** — `native_nv_exec_submit` (`EXEC` 0x12) landed: one
+  `exec_push{va,va_len}` + a sig `drm_nouveau_sync` syncobj; waits via the
+  reused `native_syncobj_wait`. **HW-runs** (EXEC returns 0; channel
+  accepts the submit). **CPU asserts** pin the exec/exec_push layout.
+- [~] **N4.5** — The captured SASS uses **`STG.E.SYS`** (system-scope store)
+  — the coherency encoding the gate needs (CPU-asserted). The
+  release-after-dispatch ordering that guarantees CPU visibility is part of
+  the open store-completion nut (N4.6).
+- [~] **N4.6** — `programs/nvidia_compute_store.cyr` + `make
+  test-nvidia-compute-store` landed. **THE ARC GATE — not yet green.**
+  HW status: runs `VM_INIT → CHANNEL_ALLOC → NVIF 0xC5C0 → GEM_NEW/VM_BIND
+  → EXEC` and **the SASS shader executes** (HW-proven: it reached
+  `STG.E.SYS` and faulted at the store target when the memory windows were
+  mis-set). A real bug (memory windows = 0) was found + fixed. Remaining
+  blocker: the generic GLOBAL store silently hangs (syncobj ETIME, no Xid,
+  readback 0) — the minimal dispatch stream needs NVK's fuller multi-class
+  init (N4.3). Full diagnosis + next step in
+  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md).
 - [ ] **N4.7** — Wire `gpu_context_new_native_nvidia()` (the
   `gpu_context_new_native` analogue) + `backend_nvidia_new()` slot-filler
   for the **v0 block only** (offsets 0..80: ctx_create/release,

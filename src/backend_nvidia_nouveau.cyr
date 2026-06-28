@@ -41,8 +41,10 @@
 # DRM_MASTER on /dev/dri/cardN (same compute-vs-KMS split as AMD).
 # Defined below: N1 (GETPARAM, VM_INIT) + N2 (GEM_NEW, GEM_INFO;
 # GEM_CLOSE reused from the AMD module) + N3 (CHANNEL_ALLOC, VM_BIND,
-# CHANNEL_FREE, drm_nouveau_sync builder; syncobj reused from AMD). EXEC
-# + the compute class object (0xC5C0 via NVIF/GROBJ) land in N4.
+# CHANNEL_FREE, drm_nouveau_sync builder; syncobj reused from AMD) + N4
+# (NVIF class-object create, EXEC). The QMD builder lives in
+# backend_nvidia_qmd.cyr; the pushbuffer/method builders in
+# backend_nvidia_push.cyr.
 # ----------------------------------------------------------------
 
 # drm_nouveau_getparam (16 bytes):
@@ -362,4 +364,79 @@ fn native_nv_sync_build(buf, syncobj_handle): i64 {
     store32(buf + 4, syncobj_handle);            # handle
     store64(buf + 8, 0);                          # timeline_value
     return 0;
+}
+
+# ================================================================
+# v4.0 Phase N4 — compute submission (NVIF class object + EXEC)
+# ================================================================
+# EXEC references an abi16 channel by chid and runs a pushbuffer of
+# methods. The compute class object (TURING_COMPUTE_A 0xC5C0) is created
+# on the channel via DRM_NOUVEAU_NVIF (0x07) NEW — NOT CHANNEL_ALLOC
+# (which leaves the channel engine-agnostic). Payload byte-matched to the
+# NVK capture (N0.7c). Numbers verified against nouveau_drm.h.
+
+var DRM_NOUVEAU_EXEC_NR    = 0x52;  # DRM_COMMAND_BASE 0x40 + 0x12
+var DRM_NOUVEAU_EXEC_SIZE  = 40;
+var DRM_IOCTL_NOUVEAU_EXEC = 0xC0286452;
+
+# DRM_NOUVEAU_NVIF (0x07) — the ioctl size field is the actual payload
+# size (drmCommandWriteRead encodes sizeof at call time), so the request
+# number is computed per call rather than precomputed.
+var DRM_NOUVEAU_NVIF_NR = 0x47;  # DRM_COMMAND_BASE 0x40 + 0x07
+
+# NVIF ioctl types + routes (nvif/ioctl.h).
+var NVIF_IOCTL_V0_NEW        = 0x02;
+var NVIF_IOCTL_V0_ROUTE_HIDDEN = 0xFF;  # outer: route to the abi16 channel
+var NVIF_IOCTL_V0_ROUTE_NVIF   = 0x00;  # inner
+
+# Create a class object (e.g. TURING_COMPUTE_A 0xC5C0) as a child of the
+# channel `chid`, via DRM_NOUVEAU_NVIF NEW. `handle` is a channel-unique
+# id (NVK uses (0xbeef+chid)<<16 | low-class-byte). Payload (56 bytes):
+#   outer nvif_ioctl_v0 (24): version0, type=NEW@1, route=0xff@7, token=chid@8, object@16
+#   inner nvif_ioctl_new_v0 (32 @ +24): route=0x00@+7, token@+8, object@+16, handle@+24, oclass@+28
+# token/object are user-side object cookies (NVK passes a pointer); a
+# stable non-zero cookie (the handle) suffices for create-and-use.
+# Returns 0 or -errno.
+fn native_nv_object_new(fd, chid, handle, oclass): i64 {
+    var args[56];
+    memset(&args, 0, 56);
+    store8(&args + 1, NVIF_IOCTL_V0_NEW);          # outer.type
+    store8(&args + 7, NVIF_IOCTL_V0_ROUTE_HIDDEN); # outer.route
+    store64(&args + 8, chid);                       # outer.token = chid
+    store8(&args + 31, NVIF_IOCTL_V0_ROUTE_NVIF);  # inner.route
+    store64(&args + 32, handle);                     # inner.token (cookie)
+    store64(&args + 40, handle);                     # inner.object (cookie)
+    store32(&args + 48, handle);                     # inner.handle
+    store32(&args + 52, oclass);                     # inner.oclass
+    var ioc = native_ioc_encode(_IOC_RW, 56, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x07);
+    return syscall(SYS_IOCTL, fd, ioc, &args);
+}
+
+# Compute a channel-unique NVIF handle for an engine class (NVK idiom:
+# (0xbeef + chid) << 16 | (oclass & 0xff)).
+fn native_nv_object_handle(chid, oclass): i64 {
+    return ((0xbeef + chid) * 0x10000) | (oclass & 0xFF);
+}
+
+# EXEC: submit one pushbuffer (at GPU VA `push_va`, `push_len` bytes) on
+# channel `chid`, signalling `sig_syncobj` on completion. Wait for it via
+# the reused native_syncobj_wait. Returns 0 or -errno. The exec_push and
+# sync structs are stack-local; the exec struct references them by ptr.
+fn native_nv_exec_submit(fd, chid, push_va, push_len, sig_syncobj): i64 {
+    var push[16];
+    memset(&push, 0, 16);
+    store64(&push + 0, push_va);     # exec_push.va
+    store32(&push + 8, push_len);    # exec_push.va_len
+
+    var sig[16];
+    native_nv_sync_build(&sig, sig_syncobj);
+
+    var ex[40];
+    memset(&ex, 0, 40);
+    store32(&ex + 0, chid);          # channel
+    store32(&ex + 4, 1);             # push_count
+    store32(&ex + 12, 1);            # sig_count
+    store64(&ex + 24, &sig);         # sig_ptr
+    store64(&ex + 32, &push);        # push_ptr
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_EXEC, &ex);
 }

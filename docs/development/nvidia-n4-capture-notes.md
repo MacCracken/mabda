@@ -112,3 +112,47 @@ The minimal preamble (N4.3) can be distilled from the 14532-byte NVK
 queue-init stream (in scratch) — but most of it is NVK's 3D+compute combined
 init; mabda needs only the compute-class subset (shader local/shared mem
 sizing, exceptions, cache invalidate) before the first dispatch.
+
+## N4 implementation status — 2026-06-27 (gate NOT yet green; precise state)
+
+Everything is built and CPU-locked (nvidia.tcyr 120 asserts; QMD byte-matches
+the golden on all fixed fields; method headers byte-match the capture):
+`backend_nvidia_qmd.cyr`, `backend_nvidia_push.cyr`, `native_nv_object_new`
+(NVIF 0xC5C0, byte-matched), `native_nv_exec_submit`, and
+`programs/nvidia_compute_store.cyr`.
+
+**HW-proven so far:** the gate runs `VM_INIT → CHANNEL_ALLOC → NVIF 0xC5C0 →
+GEM_NEW + VM_BIND (×5) → EXEC` with no error, and **the SASS shader executes
+end-to-end** — proven because, with the memory windows mis-set to 0, the
+dispatch reached `STG.E.SYS` and faulted at the exact store target
+(`fault_addr=0x400000=va_out`, Xid 13 "Invalid Address Space"). So program
+fetch, QMD read, const-bank read (it returned the param pointer), and the
+shader body all work.
+
+**Bug found + fixed:** the generic-addressing memory windows. The compute
+preamble methods (captured) are `SET_SHADER_SHARED_MEMORY_WINDOW` (mthd 0x02a0,
+`[0, 0xfe000000]`) and `SET_SHADER_LOCAL_MEMORY_WINDOW` (mthd 0x07b0,
+`[0, 0xff000000]`) — an earlier extraction bug had read the second dword as 0,
+so mabda set the windows to 0, which made low VAs collide with the local
+aperture (the fault above). Now set to the captured `0xfe000000`/`0xff000000`.
+
+**Remaining blocker (the open nut):** with correct windows, a generic GLOBAL
+`STG.E` store no longer faults but **silently hangs** (syncobj ETIME, no Xid,
+readback stays 0) — at low VAs, high VAs (255 GiB), moderate VAs (256 MB), and
+with 4 KiB or 64 KiB big-page BOs. So the store path isn't completing.
+
+**Leading hypothesis (next step):** mabda's dispatch pushbuffer is too
+minimal. NVK's actual dispatch (capture `082`) issues, in addition to
+`SET_OBJECT`/windows/`SEND_PCAS`, several more methods right before the launch:
+- compute subchannel (0xC5C0): `0x0298`=0, `0x1424`=0, `0x0244`=0 (likely a
+  cache-invalidate / barrier / exceptions trio)
+- 3D subchannel (0xC597, subc0): `0x0100`=0, `0x1424`=`[0,0]`,
+  `0x0da4`=0x1000, `0x3890`=`[0,1]` (graphics-class housekeeping/barrier)
+
+The 3D-class methods imply NVK's compute channel also has `TURING_A (0xC597)`
+SET_OBJECT'd. So N4.3 likely needs: SET_OBJECT the 3D class too, replay the
+extra compute methods, and the per-dispatch barrier — i.e. a fuller channel
+init than the current minimal stream. Recommended next move: replay NVK's
+`082` dispatch sequence verbatim (adapting only the QMD VA), then trim to the
+minimal working subset. Raw `082`/`067` dumps + the decode are in the session
+scratch (`run_capture.sh` re-captures).

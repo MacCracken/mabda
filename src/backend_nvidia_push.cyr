@@ -1,0 +1,105 @@
+# @internal — native NVIDIA backend, pushbuffer / method-stream builders
+# backend_nvidia_push.cyr — the backend_native_pm4.cyr analogue for the
+# v4.0 NVIDIA arc (Phase N4.1). Builds the Turing method/pushbuffer stream
+# that EXEC submits: method headers + the compute dispatch (SET_OBJECT →
+# SEND_PCAS).
+#
+# Turing dma-pusher method header (GF100+ form, verified against the NVK
+# capture, N0.7c):
+#   header = (op<<29) | (count<<16) | (subc<<13) | (mthd>>2)
+#     op:    bits 31:29  (1=INCR, 3=NON_INCR, 4=INLINE/IMMD, 5=INCR_ONCE)
+#     count: bits 28:16  (dword arg count; for INLINE this slot holds a
+#                         12-bit immediate instead)
+#     subc:  bits 15:13  (subchannel; NVK binds compute on subc 1)
+#     mthd:  bits 12:0    (method byte-offset >> 2)
+# Shifts are written as mul/div (the toolchain-safe idiom; see
+# native_ioc_encode). All bring-up methods are < 0x1700 so mthd>>2 fits.
+
+var NV_OP_INCR      = 1;
+var NV_OP_NONINCR   = 3;
+var NV_OP_INLINE    = 4;
+var NV_OP_INCR_ONCE = 5;
+
+# Compute class + the subchannel NVK binds it on (capture: subc 1).
+var TURING_COMPUTE_A = 0xC5C0;
+var NV_COMPUTE_SUBC  = 1;
+
+# clc5c0 (TURING_COMPUTE_A) method byte-offsets. SET_OBJECT is the
+# universal method 0; the SEND_PCAS pair was read directly from the NVK
+# dispatch pushbuffer (N0.7c) and is the QMD-by-address launch (Open Q5:
+# SEND_PCAS model, not inline-QMD).
+var NVC5C0_SET_OBJECT            = 0x0000;
+var NVC5C0_SEND_PCAS_A           = 0x02B4;   # arg = qmd_va >> 8
+var NVC5C0_SEND_SIGNALING_PCAS_B = 0x02BC;   # INLINE imm = INVALIDATE|SCHEDULE
+var NVC5C0_PCAS_INVALIDATE       = 0x1;
+var NVC5C0_PCAS_SCHEDULE         = 0x2;
+
+# Compute preamble: the shared/local-memory WINDOW bases for generic
+# (STG.E) addressing, captured verbatim from NVK's channel init (the 0xC5C0
+# subchannel ran exactly SET_OBJECT + these two before any dispatch). Each
+# is a 2-dword method [0, base]. The window bases (0xfe000000 shared,
+# 0xff000000 local) carve the generic address space: a generic address in
+# [base, base+size) resolves to shared/local, everything else to GLOBAL.
+# **These MUST be the captured non-zero bases** — setting them to 0 makes
+# low global VAs collide with the local/shared apertures and STG.E faults
+# "Invalid Address Space" (Xid 13), the bug that blocked the N4 gate.
+var NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW = 0x02A0;   # [0, 0xfe000000]
+var NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW  = 0x07B0;   # [0, 0xff000000]
+var NV_SHARED_MEMORY_WINDOW = 0xFE000000;
+var NV_LOCAL_MEMORY_WINDOW  = 0xFF000000;
+
+# Build a method header for an incrementing/non-incrementing/incr-once
+# method run carrying `count` dword args. `mthd` is the method byte offset.
+fn native_nv_method_header(op, subc, mthd, count): i64 {
+    return (op * 0x20000000) | ((count & 0x1FFF) * 0x10000)
+    | ((subc & 7) * 0x2000) | ((mthd / 4) & 0x1FFF);
+}
+
+# Build an INLINE (IMMD) method header: a single 12-bit immediate packed
+# into the count slot (bits 28:16) — no separate arg dword follows.
+fn native_nv_method_inline(subc, mthd, imm): i64 {
+    return (NV_OP_INLINE * 0x20000000) | ((imm & 0x1FFF) * 0x10000)
+    | ((subc & 7) * 0x2000) | ((mthd / 4) & 0x1FFF);
+}
+
+# Stage the minimal compute-dispatch pushbuffer into `dst` (caller-owned).
+# Sequence (matches the NVK capture shape; the per-channel shader-memory
+# preamble that N4.3 distills from the captured init stream is prepended
+# by the integration layer when required):
+#   SET_OBJECT(0xC5C0)            on the compute subchannel
+#   SEND_PCAS_A(qmd_va >> 8)
+#   SEND_SIGNALING_PCAS_B(INVALIDATE|SCHEDULE)
+# Returns the byte count written (the EXEC push va_len).
+fn native_nv_push_dispatch(dst, qmd_va): i64 {
+    var n = 0;
+    # SET_OBJECT = compute class
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_OBJECT, 1));
+    n = n + 4;
+    store32(dst + n, TURING_COMPUTE_A);
+    n = n + 4;
+    # Generic-addressing windows (captured from NVK init): shared then local
+    # memory window bases. Required, and MUST be the captured non-zero values
+    # or global STG.E stores fault "Invalid Address Space".
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW, 2));
+    n = n + 4;
+    store32(dst + n, 0);
+    n = n + 4;
+    store32(dst + n, NV_SHARED_MEMORY_WINDOW);
+    n = n + 4;
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW, 2));
+    n = n + 4;
+    store32(dst + n, 0);
+    n = n + 4;
+    store32(dst + n, NV_LOCAL_MEMORY_WINDOW);
+    n = n + 4;
+    # SEND_PCAS_A = qmd_va >> 8 (QMD is 256-byte aligned)
+    store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SEND_PCAS_A, 1));
+    n = n + 4;
+    store32(dst + n, qmd_va / 0x100);
+    n = n + 4;
+    # SEND_SIGNALING_PCAS_B = INVALIDATE | SCHEDULE (INLINE immediate)
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_SEND_SIGNALING_PCAS_B,
+    NVC5C0_PCAS_INVALIDATE | NVC5C0_PCAS_SCHEDULE));
+    n = n + 4;
+    return n;
+}
