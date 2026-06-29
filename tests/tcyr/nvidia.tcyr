@@ -427,8 +427,9 @@ fn test_nv_backend_v2_render_slots() {
     assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN), 0, "pass_begin @152");
     assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW), 0, "pass_draw @160");
     assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END), 0, "pass_end @168");
-    # Still incomplete: NVIDIA fills v0+v1+v2 but not the v3 surface/mipmap ranges.
-    assert_eq(backend_is_complete(b), 0, "nvidia incomplete past v2 (no surface/mipmap)");
+    # Still incomplete: NVIDIA fills v0+v1+v2 (and, since N8.5, v3 surface) but
+    # not the mipmap / queue / texfmt / copy / sampleable ranges past v3 surface.
+    assert_eq(backend_is_complete(b), 0, "nvidia incomplete past v3 surface (no mipmap+)");
 
     # NV_RT field map (the AMD NATIVE_RT shape — handle/va/addr/size/w/h, no fmt).
     assert_eq(NV_RT_VA, 8, "nvidia RT VA at +8");
@@ -694,6 +695,51 @@ fn test_nv_kms_topology_constants() {
     return 0;
 }
 
+# N8.5 — backend_nvidia_new() fills the v3 surface range (176..208): the
+# nouveau double-buffered KMS present slots reachable through the public
+# gpu_surface_* API. backend_is_complete stays 0 (mipmap+ ranges unfilled). No
+# HW — slot-table presence + NvSurface / NV_SFB field maps + the ctx-overlay
+# relocation that keeps the param block clear of the +96/+104 surface stashes.
+fn test_nv_backend_v3_surface_slots() {
+    var b = backend_nvidia_new();
+    # Every v3 surface fnptr slot (176..208, step 8) must now be non-zero.
+    var off = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off < BACKEND_SURFACE_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v3 surface slot filled");
+        off = off + 8;
+    }
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE), 0, "surface_configure @176");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE), 0, "surface_acquire @184");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_PRESENT), 0, "surface_present @192");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_RELEASE), 0, "surface_release @200");
+    # Honest: still incomplete (mipmap / queue / texfmt / copy / sampleable zero).
+    assert_eq(backend_is_complete(b), 0, "nvidia still incomplete after v3 surface");
+
+    # NvSurface field map (232 bytes): the two scanout FBs + saved-CRTC blob.
+    assert_eq(NV_SURFACE_CARD_FD, 0, "NvSurface card_fd at +0");
+    assert_eq(NV_SURFACE_RENDER_FD, 4, "NvSurface render_fd at +4");
+    assert_eq(NV_SURFACE_STATE, 8, "NvSurface state at +8");
+    assert_eq(NV_SURFACE_FRONT, 24, "NvSurface front at +24");
+    assert_eq(NV_SURFACE_FB0, 48, "NvSurface fb0 at +48");
+    assert_eq(NV_SURFACE_FB1, 88, "NvSurface fb1 at +88 (fb0 + 40)");
+    assert_eq(NV_SURFACE_SAVED, 128, "NvSurface saved CRTC at +128 (fb1 + 40)");
+    assert_eq(NV_SURFACE_STRUCT_SIZE, 232, "NvSurface = 232 bytes (128 + 104 saved)");
+    # FB sub-struct (40 bytes): mapped addr is the consumer's CPU write target.
+    assert_eq(NV_SFB_FB_ID, 16, "NV_SFB fb_id at +16");
+    assert_eq(NV_SFB_MAPPED, 24, "NV_SFB mapped at +24 (acquire hands this to the consumer)");
+    assert_eq(NV_SFB_STRUCT_SIZE, 40, "NV_SFB = 40 bytes");
+
+    # Ctx-overlay relocation (N8.5): the param block must clear the v3 surface
+    # consumer-stash slots (+96 wgpu_surface_handle, +104 native_card_fd) so a
+    # present-surface configure can't clobber the compute param-bank pointer.
+    assert_neq(NV_CTX_PARAM_VA, 96, "NV_CTX_PARAM_VA off the +96 stash");
+    assert_neq(NV_CTX_PARAM_ADDR, 104, "NV_CTX_PARAM_ADDR off the +104 stash");
+    assert_eq(NV_CTX_PARAM_VA, 112, "NV_CTX_PARAM_VA relocated to +112");
+    assert_eq(NV_CTX_PARAM_ADDR, 120, "NV_CTX_PARAM_ADDR relocated to +120");
+    assert_eq(NV_CTX_PARAM_ADDR < GPU_CONTEXT_SIZE, 1, "param block still fits GpuContext");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -732,5 +778,6 @@ fn main() {
     test_nv_push_draw();
     test_nv_sass_render();
     test_nv_kms_topology_constants();
+    test_nv_backend_v3_surface_slots();
     return assert_summary();
 }

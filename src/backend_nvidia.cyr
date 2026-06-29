@@ -21,8 +21,13 @@
 # ABSOLUTE syncobj deadline (the N4 blocker was a relative deadline — see
 # programs/nvidia_compute_store.cyr).
 #
-# NVIDIA GpuContext field map (reuses the 176-byte GpuContext blob; the only
-# cross-backend-fixed field is the Backend* at +32, read by gpu_ctx_backend):
+# NVIDIA GpuContext field map (reuses the 176-byte GpuContext blob). The
+# cross-backend-fixed fields it MUST honor are the Backend* at +32 (read by
+# gpu_ctx_backend) and the v3 surface consumer-stash slots at +96
+# (wgpu_surface_handle — unused on native) and +104 (native_card_fd — written
+# by gpu_surface_configure_native_kiosk BEFORE the configure slot runs). The
+# param block was relocated past +104 (N8.5) so configuring a present surface
+# can't clobber the persistent c[0x0] bank pointer the compute path reads:
 #   +0   fd            (renderD128 render node)
 #   +8   chid          (CHANNEL_ALLOC hardware channel id)
 #   +16  nvif_handle   (NVIF 0xC5C0 class-object handle)
@@ -30,7 +35,8 @@
 #   +32  backend       (Backend* — REQUIRED canonical slot)
 #   +40  qmd_handle    +48 qmd_va    +56 qmd_addr     (persistent QMD BO)
 #   +64  push_handle   +72 push_va   +80 push_addr    (persistent pushbuf BO)
-#   +88  param_handle  +96 param_va  +104 param_addr  (persistent c[0x0] bank)
+#   +88  param_handle  +112 param_va +120 param_addr  (persistent c[0x0] bank;
+#        +96 / +104 deliberately skipped — reserved v3 surface-stash slots)
 
 var NV_CTX_FD           = 0;
 var NV_CTX_CHID         = 8;
@@ -44,8 +50,8 @@ var NV_CTX_PUSH_HANDLE  = 64;
 var NV_CTX_PUSH_VA      = 72;
 var NV_CTX_PUSH_ADDR    = 80;
 var NV_CTX_PARAM_HANDLE = 88;
-var NV_CTX_PARAM_VA     = 96;
-var NV_CTX_PARAM_ADDR   = 104;
+var NV_CTX_PARAM_VA     = 112;
+var NV_CTX_PARAM_ADDR   = 120;
 
 # NVIDIA buffer struct (32 bytes, the NativeBuf shape): handle, va, addr,
 # size. The BO's mmap addr IS the data (CPU-coherent host BO), so write/read
@@ -679,6 +685,272 @@ fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
 }
 
 # ================================================================
+# v3 surface slots (176..208) — nouveau double-buffered KMS present
+# ================================================================
+# The nouveau analogue of backend_native.cyr's NativeSurface. The consumer
+# pre-opens /dev/dri/cardN + SET_MASTER and passes it through
+# gpu_surface_configure_native_kiosk, which stashes it at gpu_ctx +104;
+# configure reads it back, runs KMS discovery on the first CONNECTED connector,
+# saves the console CRTC (GETCRTC) for a clean restore, allocates two VRAM
+# scanout FBs (BO -> PRIME -> ADDFB2), and SETCRTCs FB0. acquire returns the
+# back FB (the one NOT scanning out); the consumer CPU-fills its mapped bytes.
+# present PAGE_FLIPs the back FB, blocks on the flip-complete vblank, and
+# toggles. release restores the console CRTC (or disables it), frees both FBs,
+# and releases the KMS state. Only the scanout BO (native_nv_bo_create_dom,
+# VRAM) is nouveau-specific — discovery / PRIME / ADDFB2 / SETCRTC / PAGE_FLIP
+# are the driver-agnostic backend_native_kms.cyr helpers (the same ones the AMD
+# slots call; only the BO allocator differs, which is why these slots don't
+# reuse native_kms_modeset_first_connected / native_kms_alloc_fb — those bake
+# in the AMDGPU native_bo_create_gtt allocator).
+#
+# NvSurface (232 bytes):
+#   +0   card_fd      i32   consumer-owned DRM master card node (kiosk)
+#   +4   render_fd    i32   render node (copied from nv_ctx_fd at configure)
+#   +8   state        u64   KmsState* (native_kms_init)
+#   +16  conn_id      u32   the connected connector
+#   +20  crtc_id      u32   the CRTC driving it
+#   +24  front        u32   which FB is on-screen (0 -> fb0, 1 -> fb1)
+#   +28  have_saved   u32   1 if saved[] holds a restorable console CRTC config
+#   +32  width        u32   actual mode width
+#   +36  height       u32   actual mode height
+#   +40  pitch        u32   256-aligned bytes per row
+#   +44  (pad)        u32
+#   +48  fb0          40B   scanout FB 0 (NV_SFB_* shape)
+#   +88  fb1          40B   scanout FB 1
+#   +128 saved        104B  DRM_MODE_CRTC blob (GETCRTC) -> restore on release
+var NV_SURFACE_CARD_FD     = 0;
+var NV_SURFACE_RENDER_FD   = 4;
+var NV_SURFACE_STATE       = 8;
+var NV_SURFACE_CONN_ID     = 16;
+var NV_SURFACE_CRTC_ID     = 20;
+var NV_SURFACE_FRONT       = 24;
+var NV_SURFACE_HAVE_SAVED  = 28;
+var NV_SURFACE_WIDTH       = 32;
+var NV_SURFACE_HEIGHT      = 36;
+var NV_SURFACE_PITCH       = 40;
+var NV_SURFACE_FB0         = 48;
+var NV_SURFACE_FB1         = 88;
+var NV_SURFACE_SAVED       = 128;
+var NV_SURFACE_STRUCT_SIZE = 232;
+
+# FB sub-struct (40 bytes), one per scanout buffer. acquire hands the consumer
+# a pointer to one of these; the CPU write target is NV_SFB_MAPPED.
+var NV_SFB_RENDER_HANDLE = 0;
+var NV_SFB_CARD_HANDLE   = 8;
+var NV_SFB_FB_ID         = 16;
+var NV_SFB_MAPPED        = 24;
+var NV_SFB_BO_SIZE       = 32;
+var NV_SFB_STRUCT_SIZE   = 40;
+
+# Allocate one nouveau VRAM scanout FB: VRAM BO (render node) -> PRIME import to
+# the card node -> ADDFB2. Fills `out` (NV_SFB_* shape). Returns 0 on success,
+# or a negative stage code (-1 BO, -2 PRIME, -3 ADDFB2); each failure unwinds
+# the prior stage so nothing leaks.
+fn _nv_surface_alloc_fb(card_fd, render_fd, bo_size, width, height, pitch, out): i64 {
+    memset(out, 0, NV_SFB_STRUCT_SIZE);
+    var bo[24];
+    if (native_nv_bo_create_dom(render_fd, bo_size, NOUVEAU_GEM_DOMAIN_VRAM, &bo) != 0) {
+        return 0 - 1;
+    }
+    var render_handle = load64(&bo + 0);
+    var mapped        = load64(&bo + 8);
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        return 0 - 2;
+    }
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle, width, height, pitch);
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        return 0 - 3;
+    }
+    store64(out + NV_SFB_RENDER_HANDLE, render_handle);
+    store64(out + NV_SFB_CARD_HANDLE,   card_handle);
+    store64(out + NV_SFB_FB_ID,         fb_id);
+    store64(out + NV_SFB_MAPPED,        mapped);
+    store64(out + NV_SFB_BO_SIZE,       bo_size);
+    return 0;
+}
+
+# Tear down one scanout FB: RMFB -> GEM close (card handle) -> BO release (render
+# handle + unmap). Null-safe per field (a partially-built FB releases cleanly).
+fn _nv_surface_free_fb(card_fd, render_fd, fb): i64 {
+    var fb_id = load64(fb + NV_SFB_FB_ID);
+    if (fb_id != 0) { native_kms_rm_fb(card_fd, fb_id); }
+    var card_handle = load64(fb + NV_SFB_CARD_HANDLE);
+    if (card_handle != 0) { native_gem_close(card_fd, card_handle); }
+    var render_handle = load64(fb + NV_SFB_RENDER_HANDLE);
+    if (render_handle != 0) {
+        native_nv_bo_release_host(render_fd, render_handle,
+        load64(fb + NV_SFB_MAPPED), load64(fb + NV_SFB_BO_SIZE));
+    }
+    return 0;
+}
+
+# BACKEND_SLOT_SURFACE_CONFIGURE (176): (ctx, width, height) -> NvSurface* | 0.
+# width/height are hints; the actual surface adopts the connector's preferred
+# mode. Needs DRM master (the consumer acquired it before stashing card_fd).
+fn _backend_nvidia_surface_configure(ctx, width, height): i64 {
+    if (ctx == 0) { return 0; }
+    var card_fd = gpu_ctx_native_card_fd(ctx);
+    if (card_fd <= 0) { return 0; }
+    var render_fd = nv_ctx_fd(ctx);
+    if (render_fd <= 0) { return 0; }
+
+    var state = native_kms_init(card_fd);
+    if (state == 0) { return 0; }
+
+    # discovery: first CONNECTED connector -> encoder -> CRTC -> preferred mode
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var crtc_count = kms_state_count_crtcs(state);
+    var crtc_ids   = kms_state_crtc_ids(state);
+    var conn_id    = 0;
+    var encoder_id = 0;
+    var meta[80];
+    var i = 0;
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(card_fd, &meta) == 0) {
+            if (load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION) == DRM_MODE_CONNECTED) {
+                conn_id = cid;
+                encoder_id = load32(&meta + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+                i = conn_count;
+            }
+        }
+        i = i + 1;
+    }
+    if (conn_id == 0) { native_kms_release(state); return 0; }
+
+    # encoder_id == 0 when the connector is currently UNBOUND (e.g. after a prior
+    # teardown disabled the CRTC with no compositor to re-bind). Default to the
+    # first CRTC: SETCRTC re-binds an encoder, and every encoder on this GPU
+    # accepts any CRTC (possible_crtcs = 0x0F). Mirrors the N8.3 modeset fallback.
+    var crtc_idx = 0;
+    if (encoder_id != 0) {
+        var enc[20];
+        memset(&enc, 0, DRM_MODE_GET_ENCODER_SIZE);
+        store32(&enc + DRM_MODE_GET_ENCODER_ID, encoder_id);
+        if (native_drm_mode_get_encoder(card_fd, &enc) != 0) {
+            native_kms_release(state); return 0;
+        }
+        crtc_idx = native_kms_lowest_set_bit(load32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS));
+    }
+    if (crtc_idx < 0) { native_kms_release(state); return 0; }
+    if (crtc_idx >= crtc_count) { native_kms_release(state); return 0; }
+    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+
+    var mc[4];
+    store32(&mc, 0);
+    var modes = native_kms_get_connector_modes(card_fd, conn_id, &mc);
+    var n_modes = load32(&mc);
+    if (modes == 0) { native_kms_release(state); return 0; }
+    if (n_modes == 0) { native_kms_release(state); return 0; }
+    var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
+    var fb_w = native_kms_mode_hdisplay(modes, mode_idx);
+    var fb_h = native_kms_mode_vdisplay(modes, mode_idx);
+    var pitch = (fb_w * 4 + 255) / 256 * 256;
+    var bo_size = pitch * fb_h;
+
+    var ns = alloc(NV_SURFACE_STRUCT_SIZE);
+    memset(ns, 0, NV_SURFACE_STRUCT_SIZE);
+    store32(ns + NV_SURFACE_CARD_FD,   card_fd);
+    store32(ns + NV_SURFACE_RENDER_FD, render_fd);
+    store64(ns + NV_SURFACE_STATE,     state);
+    store32(ns + NV_SURFACE_CONN_ID,   conn_id);
+    store32(ns + NV_SURFACE_CRTC_ID,   crtc_id);
+    store32(ns + NV_SURFACE_FRONT,     0);
+    store32(ns + NV_SURFACE_WIDTH,     fb_w);
+    store32(ns + NV_SURFACE_HEIGHT,    fb_h);
+    store32(ns + NV_SURFACE_PITCH,     pitch);
+
+    # save the console CRTC config so release can restore it (no black screen)
+    if (native_kms_get_crtc(card_fd, crtc_id, ns + NV_SURFACE_SAVED) == 0) {
+        if (load32(ns + NV_SURFACE_SAVED + DRM_MODE_CRTC_FB_ID) != 0) {
+            store32(ns + NV_SURFACE_HAVE_SAVED, 1);
+        }
+    }
+
+    # two VRAM scanout FBs (front + back); on failure unwind everything built
+    if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB0) != 0) {
+        native_kms_release(state); return 0;
+    }
+    if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB1) != 0) {
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+        native_kms_release(state); return 0;
+    }
+
+    # initial modeset on FB0 (needs DRM master)
+    var conn_list[4];
+    store32(&conn_list, conn_id);
+    var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    var fb0_id = load64(ns + NV_SURFACE_FB0 + NV_SFB_FB_ID);
+    if (native_kms_set_crtc(card_fd, crtc_id, fb0_id, &conn_list, 1, mode_ptr) != 0) {
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB1);
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+        native_kms_release(state); return 0;
+    }
+    return ns;
+}
+
+# BACKEND_SLOT_SURFACE_ACQUIRE (184): (ctx, surface) -> back-FB ptr | 0. The
+# consumer reads NV_SFB_MAPPED off the returned FB and CPU-fills the pixels.
+fn _backend_nvidia_surface_acquire(ctx, surface): i64 {
+    if (surface == 0) { return 0; }
+    # return the FB that is NOT currently scanning out
+    if (load32(surface + NV_SURFACE_FRONT) == 0) { return surface + NV_SURFACE_FB1; }
+    return surface + NV_SURFACE_FB0;
+}
+
+# BACKEND_SLOT_SURFACE_PRESENT (192): (ctx, surface) -> 0 | GPU_ERR_*. PAGE_FLIP
+# the back FB, block on the flip-complete vblank, then toggle which FB is front.
+fn _backend_nvidia_surface_present(ctx, surface): i64 {
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    var card_fd = load32(surface + NV_SURFACE_CARD_FD);
+    var crtc_id = load32(surface + NV_SURFACE_CRTC_ID);
+    var front   = load32(surface + NV_SURFACE_FRONT);
+    var back_fb = 0;
+    if (front == 0) { back_fb = load64(surface + NV_SURFACE_FB1 + NV_SFB_FB_ID); }
+    if (front == 1) { back_fb = load64(surface + NV_SURFACE_FB0 + NV_SFB_FB_ID); }
+    var rc = native_kms_page_flip(card_fd, crtc_id, back_fb, DRM_MODE_PAGE_FLIP_EVENT, 0);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var ev[64];
+    native_drm_read_event(card_fd, &ev, 64);
+    store32(surface + NV_SURFACE_FRONT, 1 - front);
+    return 0;
+}
+
+# BACKEND_SLOT_SURFACE_RELEASE (200): (ctx, surface) -> 0. Restore the saved
+# console CRTC (re-bind original FB + mode) BEFORE freeing our FBs, then free
+# both FBs + the KMS state. Kiosk path: the consumer owns card_fd, so we don't
+# close it (the logind variant, which does, is future work).
+fn _backend_nvidia_surface_release(ctx, surface): i64 {
+    if (surface == 0) { return 0; }
+    var card_fd   = load32(surface + NV_SURFACE_CARD_FD);
+    var render_fd = load32(surface + NV_SURFACE_RENDER_FD);
+    var crtc_id   = load32(surface + NV_SURFACE_CRTC_ID);
+    var state     = load64(surface + NV_SURFACE_STATE);
+    if (load32(surface + NV_SURFACE_HAVE_SAVED) == 1) {
+        var conn_list[4];
+        store32(&conn_list, load32(surface + NV_SURFACE_CONN_ID));
+        native_kms_set_crtc(card_fd, crtc_id,
+        load32(surface + NV_SURFACE_SAVED + DRM_MODE_CRTC_FB_ID),
+        &conn_list, 1, surface + NV_SURFACE_SAVED + DRM_MODE_CRTC_MODE);
+    }
+    if (load32(surface + NV_SURFACE_HAVE_SAVED) == 0) {
+        native_kms_disable_crtc(card_fd, crtc_id);
+    }
+    _nv_surface_free_fb(card_fd, render_fd, surface + NV_SURFACE_FB1);
+    _nv_surface_free_fb(card_fd, render_fd, surface + NV_SURFACE_FB0);
+    if (state != 0) { native_kms_release(state); }
+    memset(surface, 0, NV_SURFACE_STRUCT_SIZE);
+    return 0;
+}
+
+# ================================================================
 # Backend construction — v0 slot block + kind
 # ================================================================
 # Fills offsets 0..80 + kind. Higher ranges (texture/render/surface) are
@@ -736,6 +1008,20 @@ fn backend_nvidia_new(): i64 {
     &_backend_nvidia_render_pass_draw);
     backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_END,
     &_backend_nvidia_render_pass_end);
+    # v3 surface slots (176..208) — N8.5: nouveau double-buffered KMS present
+    # via the public gpu_surface_* API (configure/acquire/present/release). The
+    # kiosk public fn stashes the consumer's DRM-master card_fd at gpu_ctx +104.
+    # This fills the v3 surface range; backend_is_complete stays honestly 0
+    # because the mipmap / queue / texfmt / copy / sampleable ranges past v3
+    # surface are still unfilled on this backend.
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE,
+    &_backend_nvidia_surface_configure);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE,
+    &_backend_nvidia_surface_acquire);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_PRESENT,
+    &_backend_nvidia_surface_present);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
+    &_backend_nvidia_surface_release);
     backend_set_kind(b, BACKEND_KIND_NVIDIA);
     return b;
 }

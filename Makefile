@@ -438,6 +438,19 @@ build/nvidia_present_e2e: programs/nvidia_present_e2e.cyr src/*.cyr
 test-nvidia-present-e2e: build/nvidia_present_e2e
 	./build/nvidia_present_e2e
 
+# v4.0 Phase N8.5 — nouveau ANIMATED PRESENT through the PUBLIC surface API.
+# Same on-screen result as N8.4 (scrolling blue->red gradient, ~2s, console
+# restored) but driven through gpu_surface_configure_native_kiosk / acquire /
+# present / release — the backend-agnostic v3 surface slots a compositor uses.
+# **Run from a tty** (needs DRM master). Requires nouveau hardware.
+build/nvidia_surface_present_e2e: programs/nvidia_surface_present_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_surface_present_e2e.cyr $@
+
+.PHONY: test-nvidia-surface-present-e2e
+test-nvidia-surface-present-e2e: build/nvidia_surface_present_e2e
+	./build/nvidia_surface_present_e2e
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

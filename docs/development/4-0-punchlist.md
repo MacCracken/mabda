@@ -5,15 +5,18 @@
 render), and the render path is now reachable through the PUBLIC `gpu_render_*`
 API (N7.5). All 7 NVIDIA HW gates pass (compute store/api, texture
 roundtrip/sample, render-target, render-e2e, render-api). The NVIDIA backend
-fills v0+v1+v2 (compute + textures + render). **N8 (present) started: N8.1
-N8.1 KMS probe + N8.2 scanout FB + N8.3 LIVE MODESET + N8.4 ANIMATED PRESENT all
-DONE + HW-proven — a pure-Cyrius nouveau stack drove a real monitor: solid RED
-(modeset), then a scrolling blue→red gradient (~2s, vsync'd double-buffered
-PAGE_FLIP), restoring the console cleanly each time. The generic AMD KMS helpers
-walk + drive nouveau; only the card-node opener is nouveau-specific — no separate
-backend_nvidia_kms.cyr.** Last N8 piece: wire present to the public gpu_surface_*
-API (v3 surface slots 176..208). Toolchain on cyrius 6.3.1; main merged
-(garbage-free). (2026-06-28)**
+fills v0+v1+v2 (compute + textures + render). **N8 (present): N8.1 KMS probe +
+N8.2 scanout FB + N8.3 LIVE MODESET + N8.4 ANIMATED PRESENT all DONE + HW-proven
+— a pure-Cyrius nouveau stack drove a real monitor: solid RED (modeset), then a
+scrolling blue→red gradient (~2s, vsync'd double-buffered PAGE_FLIP), restoring
+the console cleanly each time. The generic AMD KMS helpers walk + drive nouveau;
+only the card-node opener is nouveau-specific — no separate
+backend_nvidia_kms.cyr. N8.5 — wiring present to the PUBLIC `gpu_surface_*` API —
+is CODE-COMPLETE + CPU-verified (builds clean, nvidia.tcyr 314 pass, dist
+diff-clean): the NVIDIA backend now fills the v3 surface slots (176..208) and a
+public-API e2e program (`nvidia_surface_present_e2e.cyr`) drives them; the
+on-screen HW run is the last user-gated step (needs a tty + DRM master).**
+Toolchain on cyrius 6.3.1; main merged (garbage-free). (2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -31,18 +34,25 @@ API (v3 surface slots 176..208). Toolchain on cyrius 6.3.1; main merged
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N8.5 — wire present to the public
-> `gpu_surface_*` API (the last N8 piece).** N8.1–N8.4 are all DONE + HW-proven —
-> a pure-Cyrius nouveau stack drove a real monitor (red modeset N8.3, then a
-> vsync'd scrolling-gradient animated present N8.4). The raw present path works
-> end-to-end. N8.5 fills the v3 surface slots (176..208) on the NVIDIA backend
-> (`gpu_surface_configure_native_kiosk` / `gpu_surface_acquire` / `_present` /
-> `_release`) so present is reachable through the public API — the nouveau
-> analogue of the AMD native-surface slots (see `programs/native_present_e2e.cyr`
-> which uses them). Mostly plumbing (like N7.5 was for render): a surface struct
-> holding the 2 FBs + crtc/mode + front index, reusing the N8.4 alloc/flip/restore
-> internals. Then the v4.0 NVIDIA arc (compute→textures→render→present) is
-> essentially complete; **N9** (SPIR-V→SASS in-tree compiler) is its own sub-arc.
+> **Resume here (next session):** **N8.5 is CODE-COMPLETE + CPU-verified — the
+> last step is the user-gated on-screen HW run.** The NVIDIA backend now fills
+> the v3 surface slots (176..208): `_backend_nvidia_surface_configure` /
+> `_acquire` / `_present` / `_release` in `src/backend_nvidia.cyr` (NvSurface
+> struct, 232 B; two VRAM scanout FBs; GETCRTC save/restore), registered in
+> `backend_nvidia_new()`. A public-API e2e program
+> `programs/nvidia_surface_present_e2e.cyr` drives them through
+> `gpu_surface_configure_native_kiosk` / `gpu_surface_acquire` /
+> `gpu_surface_present` / `gpu_surface_release` — the nouveau analogue of the AMD
+> `programs/native_present_e2e.cyr` flow. Builds clean, nvidia.tcyr 314 pass
+> (added the v3-surface slot/field-map test), dist diff-clean. **One ctx-layout
+> fix shipped with it:** the NVIDIA compute ctx had `NV_CTX_PARAM_VA`/`ADDR` on
+> the reserved surface-stash offsets +96/+104, so configuring a present surface
+> would clobber the compute param-bank pointer — relocated to +112/+120.
+> **To finish N8.5: run `make test-nvidia-surface-present-e2e` from a tty**
+> (Ctrl-Alt-F2, DRM master) — expect the same ~2s scrolling blue→red gradient as
+> N8.4, then console restore. After that the v4.0 NVIDIA arc
+> (compute→textures→render→present) is essentially complete; **N9** (SPIR-V→SASS
+> in-tree compiler) is its own sub-arc.
 > Done: v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
 > draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS, N7.4 the
 > render gate, **N7.5 the public render API**.
@@ -735,9 +745,34 @@ an afternoon to a few days.
   blue→red gradient on HDMI-A-1, then the console restored** (the N8.3 GETCRTC
   save/restore). 120 frames, tear-free, paced to the panel's refresh. Generic-DRM
   PAGE_FLIP/read_event; nouveau-specific only the scanout BO + card-node open.
-  Needs DRM master → run from a tty. _Remaining N8 piece: wire present to the
-  public `gpu_surface_*` API (v3 surface slots 176..208) — plumbing, like N7.5
-  was for render._
+  Needs DRM master → run from a tty.
+- [x] **N8.5** — **CODE-COMPLETE + CPU-verified; on-screen HW run is the last
+  user-gated step.** Wires present to the PUBLIC `gpu_surface_*` API. The NVIDIA
+  backend now fills the v3 surface slots (176..208) in `src/backend_nvidia.cyr`:
+  `_backend_nvidia_surface_configure` (KMS discovery → GETCRTC save → two VRAM
+  scanout FBs via `_nv_surface_alloc_fb` BO→PRIME→ADDFB2 → SETCRTC FB0),
+  `_acquire` (returns the back FB; consumer reads `NV_SFB_MAPPED`), `_present`
+  (PAGE_FLIP back FB + vblank block + toggle), `_release` (restore saved CRTC →
+  free FBs → release state), registered in `backend_nvidia_new()`. NvSurface is
+  232 B (two 40-B FB sub-structs + a 104-B saved-CRTC blob). These slots **don't
+  reuse** `native_kms_modeset_first_connected` / `native_kms_alloc_fb` — those
+  bake in the AMDGPU `native_bo_create_gtt` allocator; the nouveau path needs
+  `native_nv_bo_create_dom` (VRAM), so configure hand-rolls the modeset from the
+  generic discovery/PRIME/ADDFB2/SETCRTC helpers (same split N8.4 used).
+  `programs/nvidia_surface_present_e2e.cyr` + `make
+  test-nvidia-surface-present-e2e` drive it through
+  `gpu_surface_configure_native_kiosk` / `_acquire` / `_present` / `_release`
+  (the nouveau analogue of `programs/native_present_e2e.cyr`). **Ctx-layout fix
+  shipped with it:** the NVIDIA compute ctx had `NV_CTX_PARAM_VA`/`ADDR` sitting
+  on the reserved v3 surface-stash offsets +96/+104 (`wgpu_surface_handle` /
+  `native_card_fd`), so the kiosk configure dispatcher's `card_fd` write would
+  clobber the compute param-bank pointer — relocated to +112/+120. Builds clean,
+  `nvidia.tcyr` 314 pass (added `test_nv_backend_v3_surface_slots` covering slot
+  presence + NvSurface/NV_SFB field maps + the ctx relocation), full CPU sweep
+  green, dist diff-clean. **To finish: `make test-nvidia-surface-present-e2e`
+  from a tty** (DRM master) — expect the same ~2s scrolling blue→red gradient as
+  N8.4, then console restore. After that the v4.0 NVIDIA arc
+  (compute→textures→render→present) is essentially complete.
 
 ### N9 — SPIR-V → SASS in-tree compiler (its own v4.x sub-arc)
 
