@@ -414,6 +414,18 @@ build/nvidia_kms_scanout: programs/nvidia_kms_scanout.cyr src/*.cyr
 test-nvidia-kms-scanout: build/nvidia_kms_scanout
 	./build/nvidia_kms_scanout
 
+# v4.0 Phase N8.3 — nouveau LIVE MODESET. SETCRTC a red scanout FB onto the
+# first connected connector — the screen turns red for 3s, then restores.
+# **Run from a tty** (Ctrl-Alt-F2): SETCRTC needs DRM master, which the
+# compositor holds in a desktop session. Requires nouveau hardware.
+build/nvidia_kms_modeset: programs/nvidia_kms_modeset.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_modeset.cyr $@
+
+.PHONY: test-nvidia-kms-modeset
+test-nvidia-kms-modeset: build/nvidia_kms_modeset
+	./build/nvidia_kms_modeset
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

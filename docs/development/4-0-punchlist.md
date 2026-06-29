@@ -699,20 +699,20 @@ an afternoon to a few days.
   asserts** (`nvidia.tcyr` `test_nv_kms_topology_constants`, 288). The topology
   print needs card-node read perm (`root:video` + logind ACL; no DRM master) —
   the agent context lacks it (clean EACCES verdict), the user ran it.
-- [~] **N8.2** — **CODE-COMPLETE; nouveau VRAM BO create agent-verified,
-  PRIME+ADDFB2 pending a card-perm run.** `programs/nvidia_kms_scanout.cyr` +
+- [x] **N8.2** — **DONE + HW-PROVEN.** `programs/nvidia_kms_scanout.cyr` +
   `make test-nvidia-kms-scanout`: allocates a **linear VRAM** XRGB8888 256x256
   BO on the render node (masterless `GEM_NEW`, no VM_INIT), PRIME-bridges it onto
   the KMS card fd (`native_kms_import_bo`), and `ADDFB2`s a scanout FB
-  (`native_kms_add_fb_xrgb8888`) — all generic-DRM but the card-node open. The
-  VRAM BO alloc **ran clean in the agent context** (handle allocated); the
-  PRIME-import + ADDFB2 need the card-node open (no DRM master) — run from a
-  desktop session / `video` group / `sudo`. Refactor: the one nouveau-specific
-  KMS primitive `native_nv_open_card_node` (driver-verified card0..9 scan) now
-  lives in `backend_nvidia_nouveau.cyr` (shared by N8.1/N8.2). **CPU asserts**
-  (`nvidia.tcyr`, 289): the scanout VRAM domain + the card-node driver gate;
-  ADDFB2/format plumbing is the generic `kms.tcyr` coverage. v0 forces linear
-  (block-linear modifiers are a later bite).
+  (`native_kms_add_fb_xrgb8888`). **Ran clean on the TU116**: VRAM bo handle 1 →
+  PRIME card handle 1 → `ADDFB2 fb_id=124 PASS` (VRAM BO alloc verified even in
+  the masterless agent context; the card-side PRIME+ADDFB2 from a desktop
+  session, no DRM master). Confirms the **render→card PRIME bridge is in-driver
+  on nouveau** (no foreign-buffer issue) and **linear VRAM is scanout-capable**.
+  All generic-DRM but the card-node open. Refactor: the one nouveau-specific KMS
+  primitive `native_nv_open_card_node` (driver-verified card0..9 scan) now lives
+  in `backend_nvidia_nouveau.cyr` (shared by N8.1/N8.2). **CPU asserts**
+  (`nvidia.tcyr`, 289): the scanout VRAM domain + the card-node driver gate.
+  v0 forces linear (block-linear modifiers are a later bite).
 - [ ] **N8.3** — DRM master via the existing direct-`SET_MASTER` (tty) or
   samvada/logind delegation — **unchanged**. Do **NOT** attempt a
   GPU-buffer present on nvidia-drm (foreign-buffer scanout blocked).
