@@ -6,13 +6,14 @@ render), and the render path is now reachable through the PUBLIC `gpu_render_*`
 API (N7.5). All 7 NVIDIA HW gates pass (compute store/api, texture
 roundtrip/sample, render-target, render-e2e, render-api). The NVIDIA backend
 fills v0+v1+v2 (compute + textures + render). **N8 (present) started: N8.1
-N8.1 KMS probe + N8.2 scanout FB + N8.3 LIVE MODESET all DONE + HW-proven — a
-pure-Cyrius nouveau modeset turned a real monitor (HDMI-A-1, 2560x1440) solid RED
-and restored the console cleanly. The generic AMD KMS helpers walk + drive
-nouveau; only the card-node opener is nouveau-specific (native_nv_open_card_node)
-— no separate backend_nvidia_kms.cyr.** Next: N8.4 — animated present (PAGE_FLIP)
-+ v3 surface slots. Toolchain on cyrius 6.3.1; main merged in (garbage-free).
-(2026-06-28)**
+N8.1 KMS probe + N8.2 scanout FB + N8.3 LIVE MODESET + N8.4 ANIMATED PRESENT all
+DONE + HW-proven — a pure-Cyrius nouveau stack drove a real monitor: solid RED
+(modeset), then a scrolling blue→red gradient (~2s, vsync'd double-buffered
+PAGE_FLIP), restoring the console cleanly each time. The generic AMD KMS helpers
+walk + drive nouveau; only the card-node opener is nouveau-specific — no separate
+backend_nvidia_kms.cyr.** Last N8 piece: wire present to the public gpu_surface_*
+API (v3 surface slots 176..208). Toolchain on cyrius 6.3.1; main merged
+(garbage-free). (2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -30,18 +31,18 @@ nouveau; only the card-node opener is nouveau-specific (native_nv_open_card_node
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N8.4 — animated present (PAGE_FLIP).** N8.1
-> (topology probe), N8.2 (scanout FB), and N8.3 (LIVE MODESET — a pure-Cyrius
-> nouveau modeset turned the HDMI panel red on the TU116 and restored the console
-> cleanly via the new GETCRTC save/restore) are all DONE + HW-proven. N8.4 adds
-> double-buffered animation: alloc 2 scanout FBs, `PAGE_FLIP` between them
-> (`native_kms_page_flip` + `native_drm_read_event` for the flip-complete vblank
-> event, both generic-DRM), and fill v3 surface slots (176..208) on the NVIDIA
-> backend so present is reachable through the public API.
-> `programs/nvidia_present_e2e.cyr` (mirrors `native_present_e2e.cyr`) — an
-> animated sequence scans out to the real display. Needs DRM master → run from a
-> **tty**; reuse the N8.3 console save/restore so teardown leaves the screen as
-> found. The render→card PRIME bridge + linear-VRAM scanout are proven (N8.2/N8.3).
+> **Resume here (next session):** **N8.5 — wire present to the public
+> `gpu_surface_*` API (the last N8 piece).** N8.1–N8.4 are all DONE + HW-proven —
+> a pure-Cyrius nouveau stack drove a real monitor (red modeset N8.3, then a
+> vsync'd scrolling-gradient animated present N8.4). The raw present path works
+> end-to-end. N8.5 fills the v3 surface slots (176..208) on the NVIDIA backend
+> (`gpu_surface_configure_native_kiosk` / `gpu_surface_acquire` / `_present` /
+> `_release`) so present is reachable through the public API — the nouveau
+> analogue of the AMD native-surface slots (see `programs/native_present_e2e.cyr`
+> which uses them). Mostly plumbing (like N7.5 was for render): a surface struct
+> holding the 2 FBs + crtc/mode + front index, reusing the N8.4 alloc/flip/restore
+> internals. Then the v4.0 NVIDIA arc (compute→textures→render→present) is
+> essentially complete; **N9** (SPIR-V→SASS in-tree compiler) is its own sub-arc.
 > Done: v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
 > draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS, N7.4 the
 > render gate, **N7.5 the public render API**.
@@ -724,10 +725,19 @@ an afternoon to a few days.
   CRTC config before the modeset and RE-BINDS it on teardown (re-SETCRTC the
   original FB+mode) instead of disabling, so the screen returns exactly as found
   (no black console on a bare tty). Needs DRM master → run from a tty.
-- [ ] **N8.4** — Fill v3 surface slots (176..208) on the NVIDIA backend;
-  `programs/nvidia_present_e2e.cyr` (mirrors `native_present_e2e.cyr`).
-  **EXIT:** an animated frame sequence scans out to a real display.
-  HW + master-gated.
+- [x] **N8.4** — **DONE + HW-PROVEN — an animated present scanned out to a real
+  monitor.** `programs/nvidia_present_e2e.cyr` + `make test-nvidia-present-e2e`:
+  two nouveau VRAM scanout FBs (`_alloc_scanout_fb`: BO→PRIME→ADDFB2, mmap'd),
+  modeset FB0, then a **double-buffered, vsync-locked PAGE_FLIP loop** — fill the
+  back FB with a scrolling blue→red gradient, `native_kms_page_flip(...
+  DRM_MODE_PAGE_FLIP_EVENT ...)`, block on the flip-complete vblank via
+  `native_drm_read_event`, swap. **Ran on the TU116: ~2s of a scrolling
+  blue→red gradient on HDMI-A-1, then the console restored** (the N8.3 GETCRTC
+  save/restore). 120 frames, tear-free, paced to the panel's refresh. Generic-DRM
+  PAGE_FLIP/read_event; nouveau-specific only the scanout BO + card-node open.
+  Needs DRM master → run from a tty. _Remaining N8 piece: wire present to the
+  public `gpu_surface_*` API (v3 surface slots 176..208) — plumbing, like N7.5
+  was for render._
 
 ### N9 — SPIR-V → SASS in-tree compiler (its own v4.x sub-arc)
 
