@@ -1,0 +1,233 @@
+# programs/nvidia_present_e2e.cyr — v4.0 Phase N8.4 — nouveau animated present
+#
+# Double-buffered, vsync'd animated present on nouveau: the screen shows a
+# vertically-scrolling blue->red gradient for ~2 seconds (120 frames @ ~60 Hz),
+# then the console is restored exactly as found. Extends the N8.3 live modeset
+# with a second scanout FB + a PAGE_FLIP loop (DRM_MODE_PAGE_FLIP_EVENT, blocking
+# on the flip-complete vblank event each frame). Every ioctl is generic-DRM
+# (PAGE_FLIP / read_event from backend_native_kms.cyr) except the nouveau scanout
+# BO (native_nv_bo_create_dom) and the card-node open (native_nv_open_card_node).
+#
+# **RUN FROM A TTY.** PAGE_FLIP/SETCRTC need DRM master (the compositor holds it
+# in a desktop session). Switch to an unused vt (Ctrl-Alt-F2). The teardown
+# SAVES + RESTORES the console's CRTC config (GETCRTC), so the screen returns as
+# found — no black console (the N8.3 fix).
+#
+# Exit codes:
+#   0 ok, 120 frames presented, console restored   1 no card / permission
+#   2 render node open   3 native_kms_init   4 discovery   5 scanout FB alloc
+#   6 SETCRTC (not master?)   7 PAGE_FLIP failed mid-loop
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Vertically-scrolling blue->red gradient. XRGB8888 LE memory = [B,G,R,X];
+# pack 0x00RRGGBB. Row color depends on (y + frame_offset) mod height.
+fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
+    var y = 0;
+    while (y < h) {
+        var virt_y = (y + frame_offset) % h;
+        var r = virt_y * 255 / h;
+        var pixel = (r * 0x10000) | (255 - r);   # R<<16 | B; G=0
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, pixel);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Allocate one nouveau scanout FB: VRAM BO (mmap'd for the CPU fill) -> PRIME ->
+# ADDFB2. `out` (40 bytes): render_handle@0, card_handle@8, fb_id@16, mapped@24,
+# bo_size@32. Returns 0 or negative.
+fn _alloc_scanout_fb(card_fd, render_fd, sz, w, h, pitch, out): i64 {
+    memset(out, 0, 40);
+    var bo[16];
+    if (native_nv_bo_create_dom(render_fd, sz, NOUVEAU_GEM_DOMAIN_VRAM, &bo) != 0) { return -1; }
+    var rh     = load64(&bo + 0);
+    var mapped = load64(&bo + 8);
+    var ch = native_kms_import_bo(card_fd, render_fd, rh);
+    if (ch == 0) { native_nv_bo_release_host(render_fd, rh, mapped, sz); return -2; }
+    var fb = native_kms_add_fb_xrgb8888(card_fd, ch, w, h, pitch);
+    if (fb == 0) { native_gem_close(card_fd, ch); native_nv_bo_release_host(render_fd, rh, mapped, sz); return -3; }
+    store64(out + 0,  rh);
+    store64(out + 8,  ch);
+    store32(out + 16, fb);
+    store64(out + 24, mapped);
+    store64(out + 32, sz);
+    return 0;
+}
+
+fn _free_scanout_fb(card_fd, render_fd, fb): i64 {
+    var fb_id = load32(fb + 16);
+    if (fb_id != 0) { native_kms_rm_fb(card_fd, fb_id); }
+    var ch = load64(fb + 8);
+    if (ch != 0) { native_gem_close(card_fd, ch); }
+    var rh = load64(fb + 0);
+    if (rh != 0) { native_nv_bo_release_host(render_fd, rh, load64(fb + 24), load64(fb + 32)); }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA animated present (v4.0 Phase N8.4)\n");
+    print_cstr("----------------------------------------------\n");
+    print_cstr("expect: ~2s of a scrolling blue->red gradient, then console restores\n\n");
+
+    var which[4];
+    memset(&which, 0, 4);
+    var card_fd = native_nv_open_card_node(&which);
+    if (card_fd < 0) {
+        if (card_fd == 0 - _NATIVE_ERRNO_EACCES) { print_cstr("FAIL: card PERMISSION DENIED — run from a tty.\n"); return 1; }
+        print_cstr("FAIL: no nouveau card (errno="); print_i64(0 - card_fd); print_cstr(")\n"); return 1;
+    }
+
+    var master_rc = native_drm_set_master(card_fd);
+    if (master_rc != 0) {
+        print_cstr("SET_MASTER rc="); print_i64(master_rc);
+        print_cstr(" — a compositor holds master; run from an unused tty. Continuing.\n");
+    }
+
+    var render_fd = native_open_render_node();
+    if (render_fd < 0) { print_cstr("FAIL: render node\n"); sys_close(card_fd); return 2; }
+
+    var state = native_kms_init(card_fd);
+    if (state == 0) { print_cstr("FAIL: native_kms_init\n"); sys_close(render_fd); sys_close(card_fd); return 3; }
+
+    # ---- discovery: first CONNECTED connector -> CRTC -> preferred mode ----
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var crtc_count = kms_state_count_crtcs(state);
+    var crtc_ids   = kms_state_crtc_ids(state);
+    var conn_id    = 0;
+    var encoder_id = 0;
+    var meta[80];
+    var i = 0;
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(card_fd, &meta) == 0) {
+            if (load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION) == DRM_MODE_CONNECTED) {
+                conn_id = cid;
+                encoder_id = load32(&meta + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+                i = conn_count;
+            }
+        }
+        i = i + 1;
+    }
+    if (conn_id == 0) { print_cstr("FAIL: no connected connector\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+
+    var crtc_idx = 0;
+    if (encoder_id != 0) {
+        var enc[20];
+        memset(&enc, 0, DRM_MODE_GET_ENCODER_SIZE);
+        store32(&enc + DRM_MODE_GET_ENCODER_ID, encoder_id);
+        if (native_drm_mode_get_encoder(card_fd, &enc) != 0) { print_cstr("FAIL: encoder\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+        crtc_idx = native_kms_lowest_set_bit(load32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS));
+    }
+    if (crtc_idx < 0)          { print_cstr("FAIL: no CRTC\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    if (crtc_idx >= crtc_count) { print_cstr("FAIL: CRTC range\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+
+    var mc[4];
+    store32(&mc, 0);
+    var modes = native_kms_get_connector_modes(card_fd, conn_id, &mc);
+    var n_modes = load32(&mc);
+    if (modes == 0) { print_cstr("FAIL: no modes\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    if (n_modes == 0) { print_cstr("FAIL: zero modes\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
+    var w = native_kms_mode_hdisplay(modes, mode_idx);
+    var h = native_kms_mode_vdisplay(modes, mode_idx);
+    var pitch = (w * 4 + 255) / 256 * 256;
+    var bo_size = pitch * h;
+    print_cstr("target: conn "); print_i64(conn_id); print_cstr(" crtc "); print_i64(crtc_id);
+    print_cstr(" mode "); print_i64(w); print_cstr("x"); print_i64(h); print_cstr("\n");
+
+    # Save the console's CRTC config for a clean restore.
+    var saved[104];
+    var have_saved = 0;
+    if (native_kms_get_crtc(card_fd, crtc_id, &saved) == 0) {
+        if (load32(&saved + DRM_MODE_CRTC_FB_ID) != 0) { have_saved = 1; }
+    }
+
+    # ---- two scanout FBs ----
+    var fb0[40];
+    var fb1[40];
+    if (_alloc_scanout_fb(card_fd, render_fd, bo_size, w, h, pitch, &fb0) != 0) {
+        print_cstr("FAIL: scanout FB 0\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 5;
+    }
+    if (_alloc_scanout_fb(card_fd, render_fd, bo_size, w, h, pitch, &fb1) != 0) {
+        print_cstr("FAIL: scanout FB 1\n"); _free_scanout_fb(card_fd, render_fd, &fb0); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 5;
+    }
+
+    # Initial frame into FB0, then modeset it.
+    _fill_gradient(load64(&fb0 + 24), w, h, pitch, 0);
+    var conn_list[4];
+    store32(&conn_list, conn_id);
+    var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    var rc = native_kms_set_crtc(card_fd, crtc_id, load32(&fb0 + 16), &conn_list, 1, mode_ptr);
+    if (rc != 0) {
+        print_cstr("FAIL: SETCRTC rc="); print_i64(rc); print_cstr(" (EACCES = not master — run from a tty)\n");
+        _free_scanout_fb(card_fd, render_fd, &fb1); _free_scanout_fb(card_fd, render_fd, &fb0);
+        native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 6;
+    }
+    print_cstr("PASS: modeset — animating 120 frames ...\n");
+
+    # ---- double-buffered PAGE_FLIP animation loop ----
+    var front = 0;        # FB0 is currently displayed
+    var frame = 1;
+    var ev[64];
+    while (frame < 120) {
+        var back_addr = 0;
+        var back_fb   = 0;
+        if (front == 0) { back_addr = load64(&fb1 + 24); back_fb = load32(&fb1 + 16); }
+        if (front == 1) { back_addr = load64(&fb0 + 24); back_fb = load32(&fb0 + 16); }
+        _fill_gradient(back_addr, w, h, pitch, frame * 4);
+        var fr = native_kms_page_flip(card_fd, crtc_id, back_fb, DRM_MODE_PAGE_FLIP_EVENT, 0);
+        if (fr != 0) {
+            print_cstr("FAIL: PAGE_FLIP rc="); print_i64(fr); print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+            if (have_saved == 1) { native_kms_set_crtc(card_fd, crtc_id, load32(&saved + DRM_MODE_CRTC_FB_ID), &conn_list, 1, &saved + DRM_MODE_CRTC_MODE); }
+            _free_scanout_fb(card_fd, render_fd, &fb1); _free_scanout_fb(card_fd, render_fd, &fb0);
+            if (master_rc == 0) { native_drm_drop_master(card_fd); }
+            native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 7;
+        }
+        # Block until the flip completes (vsync) — drains the flip-complete event.
+        native_drm_read_event(card_fd, &ev, 64);
+        front = 1 - front;
+        frame = frame + 1;
+    }
+    print_cstr("PASS: 120 frames presented\n");
+
+    # ---- restore the console + free ----
+    if (have_saved == 1) {
+        native_kms_set_crtc(card_fd, crtc_id, load32(&saved + DRM_MODE_CRTC_FB_ID), &conn_list, 1, &saved + DRM_MODE_CRTC_MODE);
+        print_cstr("restored the original CRTC config (console back)\n");
+    }
+    if (have_saved == 0) {
+        native_kms_disable_crtc(card_fd, crtc_id);
+        print_cstr("note: no saved CRTC config — press Ctrl-Alt-F2 to restore\n");
+    }
+    _free_scanout_fb(card_fd, render_fd, &fb1);
+    _free_scanout_fb(card_fd, render_fd, &fb0);
+    if (master_rc == 0) { native_drm_drop_master(card_fd); }
+    native_kms_release(state);
+    sys_close(render_fd);
+    sys_close(card_fd);
+    print_cstr("OK: nouveau double-buffered animated present (120 frames, vsync'd PAGE_FLIP)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
