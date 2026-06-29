@@ -136,6 +136,51 @@ fn native_nv_is_nouveau(ver): i64 {
     return memeq(name_ptr, NV_DRIVER_NAME, name_len);
 }
 
+# v4.0 Phase N8 — open the nouveau KMS *card* node. Scans /dev/dri/card0..9 and
+# opens the first whose DRM driver name is "nouveau" (verified via
+# DRM_IOCTL_VERSION, not hardcoded — nouveau holds card0 on a single-GPU box but
+# the index moves with load order / simpledrm). Returns the card fd, or a
+# negative verdict: -EACCES if any card-open was permission-denied (the card
+# node is root:video + a logind ACL — KMS topology/FB ioctls need the open but
+# NO DRM master), else -ENOENT. Writes the matched card index to *which_out.
+#
+# This is the ONLY nouveau-specific KMS primitive: the topology / AddFB2 /
+# modeset / page-flip ioctls are all generic-DRM (reused from
+# backend_native_kms.cyr). The render node (renderD128) is opened separately via
+# native_open_render_node for the scanout BO + PRIME bridge.
+fn native_nv_open_card_node(which_out): i64 {
+    var path[16];
+    memset(&path, 0, 16);
+    # "/dev/dri/card" = 13 chars (indices 0..12); the digit lands at +13, NUL +14.
+    store8(&path + 0,  47);  store8(&path + 1,  100); store8(&path + 2,  101);
+    store8(&path + 3,  118); store8(&path + 4,  47);  store8(&path + 5,  100);
+    store8(&path + 6,  114); store8(&path + 7,  105); store8(&path + 8,  47);
+    store8(&path + 9,  99);  store8(&path + 10, 97);  store8(&path + 11, 114);
+    store8(&path + 12, 100);
+    var i = 0;
+    var perm_err = 0;
+    while (i < 10) {
+        store8(&path + 13, 48 + i);
+        var fd = sys_open(&path, O_RDWR, 0);
+        if (fd >= 0) {
+            var ver[64];
+            memset(&ver, 0, 64);
+            if (native_drm_version(fd, &ver) == 0) {
+                if (native_nv_is_nouveau(&ver) == 1) {
+                    store32(which_out, i);
+                    return fd;
+                }
+            }
+            sys_close(fd);   # opened but not nouveau — try the next node
+        }
+        if (fd == 0 - _NATIVE_ERRNO_EACCES) { perm_err = 1; }
+        if (fd == 0 - _NATIVE_ERRNO_EPERM)  { perm_err = 1; }
+        i = i + 1;
+    }
+    if (perm_err != 0) { return 0 - _NATIVE_ERRNO_EACCES; }
+    return 0 - 2;   # ENOENT — no nouveau card node present
+}
+
 # Interpret a nouveau-uAPI ioctl rc as a masterless-permission verdict
 # for the N0.7(b) probe. Every ioctl mabda's compute path needs is
 # DRM_RENDER_ALLOW in mainline nouveau, so the ONLY signals that a master

@@ -402,6 +402,18 @@ build/nvidia_kms_summary: programs/nvidia_kms_summary.cyr src/*.cyr
 test-nvidia-kms-summary: build/nvidia_kms_summary
 	./build/nvidia_kms_summary
 
+# v4.0 Phase N8.2 — nouveau scanout FB. Allocates a linear VRAM BO on the
+# render node, PRIME-bridges it onto the KMS card fd, and ADDFB2's an XRGB8888
+# scanout framebuffer over it. ADDFB2 needs the card-node open but no DRM
+# master. Requires nouveau hardware + card-node read perm; not in CI.
+build/nvidia_kms_scanout: programs/nvidia_kms_scanout.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_scanout.cyr $@
+
+.PHONY: test-nvidia-kms-scanout
+test-nvidia-kms-scanout: build/nvidia_kms_scanout
+	./build/nvidia_kms_scanout
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.

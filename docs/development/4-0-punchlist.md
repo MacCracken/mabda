@@ -6,10 +6,12 @@ render), and the render path is now reachable through the PUBLIC `gpu_render_*`
 API (N7.5). All 7 NVIDIA HW gates pass (compute store/api, texture
 roundtrip/sample, render-target, render-e2e, render-api). The NVIDIA backend
 fills v0+v1+v2 (compute + textures + render). **N8 (present) started: N8.1
-nouveau KMS topology probe DONE + HW-proven — the generic AMD KMS helpers walk
-nouveau cleanly (HDMI-A-1 connected @2560x1440, CRTC 67), so no
-backend_nvidia_kms.cyr is needed.** Next: N8.2 scanout FB. Toolchain on cyrius
-6.3.1; main merged in (garbage-free). (2026-06-28)**
+nouveau KMS topology probe DONE + HW-proven; N8.2 scanout FB code-complete
+(VRAM BO agent-verified, PRIME+ADDFB2 pending a card-perm run). The generic AMD
+KMS helpers walk nouveau cleanly (HDMI-A-1 @2560x1440, CRTC 67); only the
+card-node opener is nouveau-specific (native_nv_open_card_node) — no separate
+backend_nvidia_kms.cyr.** Next: finish N8.2 (user card-run) → N8.3 modeset.
+Toolchain on cyrius 6.3.1; main merged in (garbage-free). (2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -27,18 +29,21 @@ backend_nvidia_kms.cyr is needed.** Next: N8.2 scanout FB. Toolchain on cyrius
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **N8 — KMS surface / present.** N8.1 (the
-> nouveau KMS topology probe, `programs/nvidia_kms_summary.cyr`) is code-complete
-> + CPU-verified — it confirms card0 is nouveau with display heads and reuses the
-> generic-DRM KMS helpers from `backend_native_kms.cyr` (KMS is driver-agnostic;
-> no `backend_nvidia_kms.cyr` needed). **Its HW topology print is pending a
-> permitted run** (`make test-nvidia-kms-summary` from an active desktop session
-> / the `video` group / `sudo` — the agent context lacks card0 access). Next is
-> **N8.2** — scanout FB from a nouveau GEM/PRIME BO (force a **linear** scanout
-> BO for v0, like the render RT), then N8.3 the master-gated modeset
-> (discovery → mode-pick → encoder → CRTC → AddFB2 → SETCRTC), N8.4 PAGE_FLIP
-> present — reusing the AMD `backend_native_kms.cyr` sequencing + the PRIME
-> render→card bridge. Modeset needs DRM master (the `samvada`/logind story).
+> **Resume here (next session):** **finish N8.2, then N8.3 modeset.** N8.1
+> (nouveau KMS topology probe) is DONE + HW-proven. N8.2
+> (`programs/nvidia_kms_scanout.cyr`) is code-complete — the nouveau VRAM
+> scanout-BO `GEM_NEW` ran clean in the agent context; the PRIME-import + ADDFB2
+> just need a **card-perm run** (`make test-nvidia-kms-scanout` from an active
+> desktop session / `video` group / `sudo` — no DRM master, just the card-node
+> open). The one nouveau-specific KMS primitive (`native_nv_open_card_node`) is
+> in `backend_nvidia_nouveau.cyr`; everything else is generic
+> `backend_native_kms.cyr`. Then **N8.3** — the master-gated modeset (mode-pick
+> from the N8.1 topology: HDMI-A-1/conn 49, CRTC 67, 2560x1440; SETCRTC the
+> scanout FB) — needs DRM master, so run from a **tty/kiosk** or the
+> `samvada`/logind delegation (it takes over the live screen). N8.4 = PAGE_FLIP
+> present + v3 surface slots. **Caveat (punchlist N8.3): on nvidia-drm,
+> foreign-buffer scanout is blocked — but we're on nouveau (single driver,
+> card0 + renderD128 same GPU), so the render→card PRIME bridge is in-driver.**
 > Done: v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
 > draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS, N7.4 the
 > render gate, **N7.5 the public render API**.
@@ -694,9 +699,20 @@ an afternoon to a few days.
   asserts** (`nvidia.tcyr` `test_nv_kms_topology_constants`, 288). The topology
   print needs card-node read perm (`root:video` + logind ACL; no DRM master) —
   the agent context lacks it (clean EACCES verdict), the user ran it.
-- [ ] **N8.2** — Scanout FB from a nouveau GEM/PRIME BO; handle
-  block-linear format modifiers or force a **linear** scanout BO for v0.
-  **CPU assert:** FB format/modifier plumbing.
+- [~] **N8.2** — **CODE-COMPLETE; nouveau VRAM BO create agent-verified,
+  PRIME+ADDFB2 pending a card-perm run.** `programs/nvidia_kms_scanout.cyr` +
+  `make test-nvidia-kms-scanout`: allocates a **linear VRAM** XRGB8888 256x256
+  BO on the render node (masterless `GEM_NEW`, no VM_INIT), PRIME-bridges it onto
+  the KMS card fd (`native_kms_import_bo`), and `ADDFB2`s a scanout FB
+  (`native_kms_add_fb_xrgb8888`) — all generic-DRM but the card-node open. The
+  VRAM BO alloc **ran clean in the agent context** (handle allocated); the
+  PRIME-import + ADDFB2 need the card-node open (no DRM master) — run from a
+  desktop session / `video` group / `sudo`. Refactor: the one nouveau-specific
+  KMS primitive `native_nv_open_card_node` (driver-verified card0..9 scan) now
+  lives in `backend_nvidia_nouveau.cyr` (shared by N8.1/N8.2). **CPU asserts**
+  (`nvidia.tcyr`, 289): the scanout VRAM domain + the card-node driver gate;
+  ADDFB2/format plumbing is the generic `kms.tcyr` coverage. v0 forces linear
+  (block-linear modifiers are a later bite).
 - [ ] **N8.3** — DRM master via the existing direct-`SET_MASTER` (tty) or
   samvada/logind delegation — **unchanged**. Do **NOT** attempt a
   GPU-buffer present on nvidia-drm (foreign-buffer scanout blocked).

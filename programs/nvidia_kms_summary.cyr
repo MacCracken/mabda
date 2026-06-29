@@ -36,53 +36,15 @@ fn print_i64(n): i64 {
     return 0;
 }
 
-# Scan /dev/dri/card0..9; return the fd of the first card whose DRM driver name
-# is "nouveau" (verified via DRM_IOCTL_VERSION), or a negative errno. Writes the
-# matched card index to *which_out. Non-nouveau cards are closed and skipped.
-# On failure, prefers the actionable EACCES/EPERM verdict over the trailing
-# ENOENT from the empty card slots (the card node is root:video + a logind ACL).
-fn _open_nouveau_card(path_buf, which_out): i64 {
-    var i = 0;
-    var perm_err = 0;    # set if any card-open hit a permission denial
-    while (i < 10) {
-        store8(path_buf + 13, 48 + i);   # '0' + i at index 13 ("/dev/dri/card?")
-        var fd = syscall(2, path_buf, 0x2, 0);   # open(2), O_RDWR
-        if (fd >= 0) {
-            var ver[64];
-            memset(&ver, 0, 64);
-            if (native_drm_version(fd, &ver) == 0) {
-                if (native_nv_is_nouveau(&ver) == 1) {
-                    store32(which_out, i);
-                    return fd;
-                }
-            }
-            sys_close(fd);   # opened, but not nouveau — try the next node
-        }
-        if (fd == 0 - _NATIVE_ERRNO_EACCES) { perm_err = 1; }
-        if (fd == 0 - _NATIVE_ERRNO_EPERM)  { perm_err = 1; }
-        i = i + 1;
-    }
-    if (perm_err != 0) { return 0 - _NATIVE_ERRNO_EACCES; }
-    return 0 - 2;   # ENOENT — no nouveau card node present
-}
-
 fn main(): i64 {
     alloc_init();
     print_cstr("mabda NVIDIA KMS topology probe (v4.0 Phase N8.1)\n");
     print_cstr("------------------------------------------------\n");
 
-    # Build "/dev/dri/card?" — the digit at +13 is filled by the scanner.
-    var path[16];
-    memset(&path, 0, 16);
-    store8(&path + 0,  47);  store8(&path + 1,  100); store8(&path + 2,  101);
-    store8(&path + 3,  118); store8(&path + 4,  47);  store8(&path + 5,  100);
-    store8(&path + 6,  114); store8(&path + 7,  105); store8(&path + 8,  47);
-    store8(&path + 9,  99);  store8(&path + 10, 97);  store8(&path + 11, 114);
-    store8(&path + 12, 100);
-
+    # Find + open the nouveau card node (driver-verified scan of card0..9).
     var which[4];
     memset(&which, 0, 4);
-    var fd = _open_nouveau_card(&path, &which);
+    var fd = native_nv_open_card_node(&which);
     if (fd < 0) {
         if (fd == 0 - _NATIVE_ERRNO_EACCES) {
             print_cstr("FAIL: nouveau card node present but PERMISSION DENIED (EACCES).\n");
