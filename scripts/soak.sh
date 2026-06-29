@@ -12,19 +12,28 @@
 # observation window).
 #
 # Workloads (singletons):
-#   compute   programs/native_compute_store      AMD render-node, no master
-#   render    programs/native_render_e2e         AMD render-node, no master
-#   texture   programs/native_texture_e2e        AMD render-node, no master
-#   wgpu      programs/render_graph_e2e          wgpu (Vulkan), no master
-#   present   programs/native_present_e2e        AMD card-fd, NEEDS DRM master
+#   compute        programs/native_compute_store        AMD render-node, no master
+#   render         programs/native_render_e2e           AMD render-node, no master
+#   texture        programs/native_texture_e2e          AMD render-node, no master
+#   wgpu           programs/render_graph_e2e            wgpu (Vulkan), no master
+#   present        programs/native_present_e2e          AMD card-fd, NEEDS DRM master
+#   nvidia-compute programs/nvidia_compute_store        nouveau render-node, no master
+#   nvidia-render  programs/nvidia_render_e2e           nouveau render-node, no master
+#   nvidia-texture programs/nvidia_texture_e2e          nouveau render-node, no master
+#   nvidia-present programs/nvidia_surface_present_e2e  nouveau card-fd, NEEDS DRM master
 #
 # Workloads (bundles, run in parallel):
-#   both      compute + wgpu                     legacy alias (pre-rc.3)
-#   native    compute + render + texture         all AMD paths sans master
-#   all       compute + wgpu + render            rc.3/rc.4 primary post-bug-squash
+#   both          compute + wgpu                        legacy alias (pre-rc.3)
+#   native        compute + render + texture            all AMD paths sans master
+#   all           compute + wgpu + render               rc.3/rc.4 primary post-bug-squash
+#   nvidia-native nvidia-compute + nvidia-render + nvidia-texture  all nouveau paths sans master (v4.0)
 #
 # Default workload: compute — AMD-only but needs no DRM master,
 # runs cleanly from any desktop terminal.
+#
+# Driver-aware dmesg watch: AMD workloads watch `amdgpu|drm`; nvidia-*
+# workloads watch `nouveau|drm|Xid|GSP` (a GSP-RM Xid fault is the
+# nouveau analogue of an amdgpu ring TDR — the primary failure signal).
 #
 # The `present` workload requires DRM master, which on a logind-
 # managed session is held by the active compositor and not freely
@@ -34,7 +43,9 @@
 #
 # Failure policy: stop immediately on non-zero exit (each program
 # self-asserts its readback / pixel / frame-count invariants and
-# returns non-zero on mismatch), or a new amdgpu/drm dmesg line.
+# returns non-zero on mismatch), or a new driver dmesg line (the
+# watched driver is workload-aware: amdgpu/drm for AMD, nouveau/drm/Xid/GSP
+# for nvidia-* — see "Driver-aware dmesg watch" below).
 # Captures the last iteration's stdout/stderr + a dmesg tail
 # for triage.
 #
@@ -44,6 +55,8 @@
 #   scripts/soak.sh --workload=all        # compute + wgpu + render in parallel
 #   scripts/soak.sh --workload=native     # all AMD paths (compute+render+texture)
 #   scripts/soak.sh --workload=present    # master-gated; tty/kiosk only
+#   scripts/soak.sh --workload=nvidia-native   # all nouveau paths (compute+render+texture)
+#   scripts/soak.sh --workload=nvidia-present  # nouveau present; master-gated; tty/kiosk only
 #   scripts/soak.sh --stop=24h            # rc.4 GA gate
 #   scripts/soak.sh --stop=72h            # 3-day observation
 #   scripts/soak.sh --stop=5m             # smoke the runner itself
@@ -174,6 +187,10 @@ add_workload() {
         texture) bin="build/native_texture_e2e" ;;
         wgpu)    bin="build/render_graph_e2e" ;;
         present) bin="build/native_present_e2e" ;;
+        nvidia-compute) bin="build/nvidia_compute_store" ;;
+        nvidia-render)  bin="build/nvidia_render_e2e" ;;
+        nvidia-texture) bin="build/nvidia_texture_e2e" ;;
+        nvidia-present) bin="build/nvidia_surface_present_e2e" ;;
         *) echo "internal: unknown singleton '$name'" >&2; exit 2 ;;
     esac
     BINS_TO_BUILD+=("$bin")
@@ -181,9 +198,21 @@ add_workload() {
     PROGS+=("$REPO/$bin")
 }
 
+# Driver-aware dmesg watch. AMD workloads watch amdgpu ring/TDR lines;
+# nvidia-* workloads watch nouveau + GSP-RM Xid faults (the nouveau
+# analogue of an amdgpu TDR). Default to AMD; the nvidia branches below
+# flip it. `drm` is in both so generic DRM core failures surface either way.
+DMESG_RE='amdgpu|drm'
+DRIVER_LABEL='amdgpu/drm'
+
 case "$WORKLOAD" in
     compute|render|texture|wgpu|present)
         add_workload "$WORKLOAD"
+        ;;
+    nvidia-compute|nvidia-render|nvidia-texture|nvidia-present)
+        add_workload "$WORKLOAD"
+        DMESG_RE='nouveau|drm|Xid|GSP'
+        DRIVER_LABEL='nouveau/drm/Xid'
         ;;
     both)
         # Legacy alias from pre-rc.3 — kept for any external invokers
@@ -205,7 +234,18 @@ case "$WORKLOAD" in
         add_workload wgpu
         add_workload render
         ;;
-    *) echo "unknown --workload: $WORKLOAD (compute|render|texture|wgpu|present|both|native|all)" >&2; exit 2 ;;
+    nvidia-native)
+        # v4.0 primary parallel set for the NVIDIA backend — all three
+        # masterless nouveau paths (renderD128). Excludes nvidia-present
+        # (master-gated); pass --workload=nvidia-present separately on a
+        # tty/kiosk box. Mirrors the AMD `native` bundle.
+        add_workload nvidia-compute
+        add_workload nvidia-render
+        add_workload nvidia-texture
+        DMESG_RE='nouveau|drm|Xid|GSP'
+        DRIVER_LABEL='nouveau/drm/Xid'
+        ;;
+    *) echo "unknown --workload: $WORKLOAD (compute|render|texture|wgpu|present|both|native|all|nvidia-compute|nvidia-render|nvidia-texture|nvidia-present|nvidia-native)" >&2; exit 2 ;;
 esac
 
 # -- CSV header (dynamic columns from NAMES) --------------------------
@@ -213,7 +253,7 @@ esac
 {
     printf "elapsed_s,milestone"
     for n in "${NAMES[@]}"; do printf ",iters_%s" "$n"; done
-    printf ",rss_kb,dmesg_amdgpu_delta,status\n"
+    printf ",rss_kb,dmesg_drm_delta,status\n"
 } > "$SOAK_CSV"
 
 # -- build prerequisites ----------------------------------------------
@@ -238,17 +278,20 @@ done
 # *new* lines added during the soak. dmesg without -k may need
 # CAP_SYSLOG on some kernels; fall back to journalctl if available.
 
+# Filter to the active driver's lines ($DMESG_RE, set per-workload). For
+# nvidia-* this is `nouveau|drm|Xid|GSP` so a GSP-RM Xid fault trips the
+# regression detector the same way an amdgpu ring TDR does for AMD.
 snapshot_dmesg() {
     if dmesg -t 2>/dev/null > "$1.raw"; then :
     elif command -v journalctl >/dev/null && journalctl -k -o cat --no-pager > "$1.raw" 2>/dev/null; then :
     else echo "" > "$1.raw"; fi
-    grep -iE 'amdgpu|drm' "$1.raw" > "$1" || true
+    grep -iE "$DMESG_RE" "$1.raw" > "$1" || true
     rm -f "$1.raw"
 }
 
 snapshot_dmesg "$DMESG_BASELINE"
 BASELINE_COUNT=$(wc -l < "$DMESG_BASELINE" | tr -d ' ')
-log "dmesg amdgpu/drm baseline lines: $BASELINE_COUNT"
+log "dmesg $DRIVER_LABEL baseline lines: $BASELINE_COUNT"
 
 # -- per-program loop runner ------------------------------------------
 #
@@ -328,7 +371,7 @@ sum_rss_kb() {
     echo "$total"
 }
 
-dmesg_amdgpu_delta() {
+dmesg_drm_delta() {
     snapshot_dmesg "$DMESG_FINAL"
     local current
     current=$(wc -l < "$DMESG_FINAL" | tr -d ' ')
@@ -391,7 +434,7 @@ for ms in "${SCHEDULE[@]}"; do
     now=$(date +%s)
     elapsed=$((now - START_T))
     rss=$(sum_rss_kb)
-    dmesg_d=$(dmesg_amdgpu_delta)
+    dmesg_d=$(dmesg_drm_delta)
 
     # gather per-loop iter counts (parallel to NAMES order)
     iter_values=()
@@ -407,7 +450,7 @@ for ms in "${SCHEDULE[@]}"; do
         if [ "$s" != "ok" ]; then status="FAIL"; fail_reason="${NAMES[$i]}: $s"; break; fi
     done
     if [ "$dmesg_d" -gt 0 ]; then
-        status="FAIL"; fail_reason="new amdgpu/drm dmesg lines: $dmesg_d"
+        status="FAIL"; fail_reason="new $DRIVER_LABEL dmesg lines: $dmesg_d"
     fi
 
     # human-readable iter chunk: "compute=123 render=456 wgpu=789"

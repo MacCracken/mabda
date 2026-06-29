@@ -44,13 +44,20 @@ main merged (garbage-free). (2026-06-28)**
 > TU116 through `gpu_surface_configure_native_kiosk` / acquire / present /
 > release, then restored the console.
 > **Two fronts remain for the v4.0 cut, neither blocking the arc:**
-> (1) **v4.0 ship work** — bundle the NVIDIA modules into the dist `[lib].modules`
-> (today the whole NVIDIA backend is source-only, absent from the v3.4.5 dist),
-> wire the compile-time `MABDA_BACKEND_KIND==NVIDIA` branch in
-> `gpu_context_from_preinit`, bump `VERSION` → 4.0.0, CHANGELOG, six-consumer
-> regression sweep, audit. (2) **N9** (SPIR-V→SASS in-tree compiler) — the v4.x
-> endgame so consumers ship one shader form; its own sub-arc, deferrable to
-> v4.1. Pick either; the present arc no longer gates anything.
+> (1) **v4.0 ship work** — **soak burn-in** (the NVIDIA analogue of the AMD
+> rc.3/rc.4 gates, now wired into `scripts/soak.sh`: `--workload=nvidia-native`
+> loops compute+render+texture masterless on renderD128, `--workload=nvidia-present`
+> loops the public-API present on a tty; the dmesg watch is driver-aware —
+> `nouveau|drm|Xid|GSP`, so a GSP-RM Xid fault trips the detector like an amdgpu
+> TDR. A 5s masterless smoke ran ~561 dispatches, 0 fail, flat RSS, dmesg Δ=0 —
+> the real gate is a 6h/24h run with `sudo` for dmesg capture); bundle the NVIDIA
+> modules into the dist `[lib].modules` (today the whole NVIDIA backend is
+> source-only, absent from the v3.4.5 dist); wire the compile-time
+> `MABDA_BACKEND_KIND==NVIDIA` branch in `gpu_context_from_preinit`; bump
+> `VERSION` → 4.0.0; CHANGELOG; six-consumer regression sweep; audit. (2) **N9**
+> (SPIR-V→SASS in-tree compiler) — the v4.x endgame so consumers ship one shader
+> form; its own sub-arc, deferrable to v4.1. Pick either; the present arc no
+> longer gates anything.
 > Done: v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
 > draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS, N7.4 the
 > render gate, **N7.5 the public render API**.
