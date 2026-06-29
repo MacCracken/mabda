@@ -6,9 +6,10 @@ render), and the render path is now reachable through the PUBLIC `gpu_render_*`
 API (N7.5). All 7 NVIDIA HW gates pass (compute store/api, texture
 roundtrip/sample, render-target, render-e2e, render-api). The NVIDIA backend
 fills v0+v1+v2 (compute + textures + render). **N8 (present) started: N8.1
-nouveau KMS topology probe is code-complete + CPU-verified (HW print gated on
-card-node permission).** Next: N8.2 scanout FB. Toolchain on cyrius 6.3.1; main
-merged in (garbage-free). (2026-06-28)**
+nouveau KMS topology probe DONE + HW-proven — the generic AMD KMS helpers walk
+nouveau cleanly (HDMI-A-1 connected @2560x1440, CRTC 67), so no
+backend_nvidia_kms.cyr is needed.** Next: N8.2 scanout FB. Toolchain on cyrius
+6.3.1; main merged in (garbage-free). (2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -678,22 +679,21 @@ an afternoon to a few days.
 
 ### N8 — KMS surface / present
 
-- [~] **N8.1** — **CODE-COMPLETE + CPU-VERIFIED; HW topology print pending a
-  permitted run.** `programs/nvidia_kms_summary.cyr` + `make
-  test-nvidia-kms-summary`: scans `/dev/dri/card0..9` for the **nouveau** card
-  (driver-name verified via `DRM_IOCTL_VERSION` + `native_nv_is_nouveau`, not
-  hardcoded), then **reuses the generic-DRM KMS helpers** from
-  `backend_native_kms.cyr` (`native_kms_init` / `native_kms_summary` /
-  `native_drm_mode_get_connector` / mode enumeration) to print the topology
-  (connectors / encoders / CRTCs / preferred modes) — confirming nouveau exposes
-  standard KMS. Probed HW: card0 IS nouveau with display heads (DP-1/2/3,
-  HDMI-A-1). **CPU asserts** (`nvidia.tcyr` `test_nv_kms_topology_constants`,
-  288): the generic KMS connector/mode constants + the nouveau card-node driver
-  gate. **The topology print itself needs read perm on the card node** (it's
-  `root:video` + a logind ACL) — GETRESOURCES/GETCONNECTOR need no DRM master,
-  only the open; run from an active desktop session, the `video` group, or
-  `sudo`. The agent context (not in `video`, no ACL) gets a clean EACCES verdict.
-  No `backend_nvidia_kms.cyr` needed yet — the generic helpers are driver-agnostic.
+- [x] **N8.1** — **DONE + HW-PROVEN.** `programs/nvidia_kms_summary.cyr` +
+  `make test-nvidia-kms-summary` scans `/dev/dri/card0..9` for the **nouveau**
+  card (driver-name verified via `DRM_IOCTL_VERSION` + `native_nv_is_nouveau`,
+  not hardcoded) and **reuses the generic-DRM KMS helpers** from
+  `backend_native_kms.cyr` (`native_kms_init`/`native_kms_summary`/
+  `native_drm_mode_get_connector`/mode enum) to walk the topology. **Ran clean
+  on the TU116 from a desktop session — the AMD generic helpers walked nouveau
+  with ZERO driver-specific chokes**, confirming the present path needs **no
+  `backend_nvidia_kms.cyr`** (KMS is driver-agnostic). Topology: 4 connectors /
+  11 encoders / 4 CRTCs; **HDMI-A-1 (conn 49) connected → encoder 50 → CRTC 67,
+  preferred mode 2560x1440@59Hz** (41 modes); the 3 DP connectors disconnected;
+  all encoders possible-CRTC mask 0x0F; framebuffer_extent ..16384x16384. **CPU
+  asserts** (`nvidia.tcyr` `test_nv_kms_topology_constants`, 288). The topology
+  print needs card-node read perm (`root:video` + logind ACL; no DRM master) —
+  the agent context lacks it (clean EACCES verdict), the user ran it.
 - [ ] **N8.2** — Scanout FB from a nouveau GEM/PRIME BO; handle
   block-linear format modifiers or force a **linear** scanout BO for v0.
   **CPU assert:** FB format/modifier plumbing.
