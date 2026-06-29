@@ -6,12 +6,13 @@ render), and the render path is now reachable through the PUBLIC `gpu_render_*`
 API (N7.5). All 7 NVIDIA HW gates pass (compute store/api, texture
 roundtrip/sample, render-target, render-e2e, render-api). The NVIDIA backend
 fills v0+v1+v2 (compute + textures + render). **N8 (present) started: N8.1
-nouveau KMS topology probe DONE + HW-proven; N8.2 scanout FB code-complete
-(VRAM BO agent-verified, PRIME+ADDFB2 pending a card-perm run). The generic AMD
-KMS helpers walk nouveau cleanly (HDMI-A-1 @2560x1440, CRTC 67); only the
-card-node opener is nouveau-specific (native_nv_open_card_node) — no separate
-backend_nvidia_kms.cyr.** Next: finish N8.2 (user card-run) → N8.3 modeset.
-Toolchain on cyrius 6.3.1; main merged in (garbage-free). (2026-06-28)**
+N8.1 KMS probe + N8.2 scanout FB + N8.3 LIVE MODESET all DONE + HW-proven — a
+pure-Cyrius nouveau modeset turned a real monitor (HDMI-A-1, 2560x1440) solid RED
+and restored the console cleanly. The generic AMD KMS helpers walk + drive
+nouveau; only the card-node opener is nouveau-specific (native_nv_open_card_node)
+— no separate backend_nvidia_kms.cyr.** Next: N8.4 — animated present (PAGE_FLIP)
++ v3 surface slots. Toolchain on cyrius 6.3.1; main merged in (garbage-free).
+(2026-06-28)**
 **Date opened:** 2026-06-27
 **Branch:** `4.0-work`
 
@@ -29,21 +30,18 @@ Toolchain on cyrius 6.3.1; main merged in (garbage-free). (2026-06-28)**
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
-> **Resume here (next session):** **finish N8.2, then N8.3 modeset.** N8.1
-> (nouveau KMS topology probe) is DONE + HW-proven. N8.2
-> (`programs/nvidia_kms_scanout.cyr`) is code-complete — the nouveau VRAM
-> scanout-BO `GEM_NEW` ran clean in the agent context; the PRIME-import + ADDFB2
-> just need a **card-perm run** (`make test-nvidia-kms-scanout` from an active
-> desktop session / `video` group / `sudo` — no DRM master, just the card-node
-> open). The one nouveau-specific KMS primitive (`native_nv_open_card_node`) is
-> in `backend_nvidia_nouveau.cyr`; everything else is generic
-> `backend_native_kms.cyr`. Then **N8.3** — the master-gated modeset (mode-pick
-> from the N8.1 topology: HDMI-A-1/conn 49, CRTC 67, 2560x1440; SETCRTC the
-> scanout FB) — needs DRM master, so run from a **tty/kiosk** or the
-> `samvada`/logind delegation (it takes over the live screen). N8.4 = PAGE_FLIP
-> present + v3 surface slots. **Caveat (punchlist N8.3): on nvidia-drm,
-> foreign-buffer scanout is blocked — but we're on nouveau (single driver,
-> card0 + renderD128 same GPU), so the render→card PRIME bridge is in-driver.**
+> **Resume here (next session):** **N8.4 — animated present (PAGE_FLIP).** N8.1
+> (topology probe), N8.2 (scanout FB), and N8.3 (LIVE MODESET — a pure-Cyrius
+> nouveau modeset turned the HDMI panel red on the TU116 and restored the console
+> cleanly via the new GETCRTC save/restore) are all DONE + HW-proven. N8.4 adds
+> double-buffered animation: alloc 2 scanout FBs, `PAGE_FLIP` between them
+> (`native_kms_page_flip` + `native_drm_read_event` for the flip-complete vblank
+> event, both generic-DRM), and fill v3 surface slots (176..208) on the NVIDIA
+> backend so present is reachable through the public API.
+> `programs/nvidia_present_e2e.cyr` (mirrors `native_present_e2e.cyr`) — an
+> animated sequence scans out to the real display. Needs DRM master → run from a
+> **tty**; reuse the N8.3 console save/restore so teardown leaves the screen as
+> found. The render→card PRIME bridge + linear-VRAM scanout are proven (N8.2/N8.3).
 > Done: v0 compute, v1 texture roundtrip, N6.2 sampling, N7.1 render-target, N7.2a
 > draw capture/decode, N7.2 clc597 draw encoder, N7.3 VS/FS SPH+SASS, N7.4 the
 > render gate, **N7.5 the public render API**.
@@ -713,9 +711,19 @@ an afternoon to a few days.
   in `backend_nvidia_nouveau.cyr` (shared by N8.1/N8.2). **CPU asserts**
   (`nvidia.tcyr`, 289): the scanout VRAM domain + the card-node driver gate.
   v0 forces linear (block-linear modifiers are a later bite).
-- [ ] **N8.3** — DRM master via the existing direct-`SET_MASTER` (tty) or
-  samvada/logind delegation — **unchanged**. Do **NOT** attempt a
-  GPU-buffer present on nvidia-drm (foreign-buffer scanout blocked).
+- [x] **N8.3** — **DONE + HW-PROVEN — a pure-Cyrius nouveau modeset lit up a
+  real monitor.** `programs/nvidia_kms_modeset.cyr` + `make
+  test-nvidia-kms-modeset`: `SET_MASTER` (from a tty) → discovery (first
+  connected connector → encoder/CRTC, with an `encoder_id == 0` fallback to the
+  first CRTC for an unbound connector) → nouveau VRAM scanout BO filled red →
+  PRIME → `ADDFB2` → `SETCRTC`. **Ran on the TU116: HDMI-A-1 / conn 49 / CRTC 67
+  / 2560x1440 turned solid RED for 3s.** The foreign-buffer-scanout caveat is a
+  proprietary-nvidia-drm issue; on nouveau (single driver, card0 + renderD128
+  same GPU) the render→card PRIME bridge is in-driver. **Clean restore:** added
+  `native_kms_get_crtc` (generic-DRM GETCRTC) — the program SAVES the console's
+  CRTC config before the modeset and RE-BINDS it on teardown (re-SETCRTC the
+  original FB+mode) instead of disabling, so the screen returns exactly as found
+  (no black console on a bare tty). Needs DRM master → run from a tty.
 - [ ] **N8.4** — Fill v3 surface slots (176..208) on the NVIDIA backend;
   `programs/nvidia_present_e2e.cyr` (mirrors `native_present_e2e.cyr`).
   **EXIT:** an animated frame sequence scans out to a real display.
