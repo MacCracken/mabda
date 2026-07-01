@@ -1,0 +1,130 @@
+# programs/nvidia_mem_roundtrip.cyr — v4.0 Phase N2 hardware integration
+#
+# Pure-Cyrius round-trip through a nouveau GEM buffer object. No libdrm,
+# no libvulkan, no Mesa, no CUDA. Sequence:
+#
+#   open(/dev/dri/renderD128)
+#   DRM_IOCTL_NOUVEAU_GEM_NEW  — allocate a host-visible (GART|MAPPABLE|
+#                                COHERENT) BO; returns handle + map_handle
+#   mmap(..., fd, map_handle)  — project the BO into our address space
+#   CPU write                  — deterministic byte pattern
+#   CPU read                   — verify byte-identical
+#   munmap / gem_close / close
+#
+# No VM_INIT/VM_BIND needed — this is a pure CPU data path; GPU VA is N3.
+# Masterless (GEM_NEW/GEM_INFO/GEM_CLOSE are all DRM_RENDER_ALLOW).
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-mem-roundtrip`.
+#
+# Exit codes:
+#   0 — success (pattern round-tripped byte-identical)
+#   1 — open failed
+#   2 — gem_new failed
+#   3 — mmap failed
+#   4 — readback mismatch
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    print_cstr("mabda NVIDIA mem round-trip (v4.0 Phase N2, nouveau)\n");
+    print_cstr("---------------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) {
+        print_cstr("FAIL: open ");
+        print_cstr(DRM_RENDER_NODE_PATH);
+        print_cstr(" (errno ");
+        print_i64(0 - fd);
+        print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened fd=");
+    print_i64(fd);
+    print_cstr("\n");
+
+    var size = 4096;
+
+    # Create + mmap a host-visible BO.
+    var bo[16];
+    var rc = native_nv_bo_create_host(fd, size, &bo);
+    if (rc != 0) {
+        var stage = "gem_new";
+        var code = 2;
+        if (load64(&bo + 0) != 0) {
+            stage = "mmap";
+            code = 3;
+        }
+        print_cstr("FAIL: ");
+        print_cstr(stage);
+        print_cstr(" (errno ");
+        print_i64(0 - rc);
+        print_cstr(")\n");
+        if (load64(&bo + 0) != 0) {
+            native_gem_close(fd, load64(&bo + 0));
+        }
+        sys_close(fd);
+        return code;
+    }
+    var handle = load64(&bo + 0);
+    var mapped = load64(&bo + 8);
+    print_cstr("gem_new handle=");
+    print_i64(handle);
+    print_cstr(" mmap addr=");
+    print_i64(mapped);
+    print_cstr("\n");
+
+    # Deterministic pattern: 512 i64 slots, slot i = i * mixer.
+    var i = 0;
+    while (i < size / 8) {
+        store64(mapped + i * 8, i * 0x1000003);
+        i = i + 1;
+    }
+
+    # Read back, verify every slot.
+    var mismatches = 0;
+    i = 0;
+    while (i < size / 8) {
+        if (load64(mapped + i * 8) != i * 0x1000003) {
+            mismatches = mismatches + 1;
+        }
+        i = i + 1;
+    }
+
+    if (mismatches != 0) {
+        print_cstr("FAIL: ");
+        print_i64(mismatches);
+        print_cstr(" mismatched slots of ");
+        print_i64(size / 8);
+        print_cstr("\n");
+        native_nv_bo_release_host(fd, handle, mapped, size);
+        sys_close(fd);
+        return 4;
+    }
+
+    print_cstr("round-trip ok: ");
+    print_i64(size);
+    print_cstr(" bytes byte-identical\n");
+
+    native_nv_bo_release_host(fd, handle, mapped, size);
+    sys_close(fd);
+    print_cstr("OK\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

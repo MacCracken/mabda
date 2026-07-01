@@ -3,6 +3,7 @@
 **Status:** Proposed (v3.0 design phase, branch `v3`)
 **Date:** 2026-04-21
 **Updated:** 2026-04-28 — vendor scope clarified after Phase B.4 verified; wgpu retirement reframed per-chipset (v4.0 AMD, v5.0 NVIDIA, v5.1 Intel) instead of a single v4.0 event. See [development/roadmap.md](../development/roadmap.md).
+**Updated:** 2026-06-20 — AMD wgpu retirement slipped from v4.0 to **v4.0.1** to give AMD consumers a v4.x coexistence window. v4.0 now ships NVIDIA native only; the AMD wgpu drop (and the paired `samvada` C-shim retirement) lands at v4.0.1.
 **Supersedes:** n/a
 **Related:** ADR 004 (C launcher FFI — stays in-tree until per-chipset retirement; full removal at v5.1), ADR 005 (public API surface marking)
 
@@ -102,9 +103,12 @@ v3.x–v5.x line:
      into `BACKEND_KIND_AMD` (native). NVIDIA + Intel + macOS +
      Windows consumers stay on `wgpu`.
    - v3.x: AMD consumers test `native` in their CI matrix when ready.
-   - v4.0: NVIDIA native (`BACKEND_KIND_NVIDIA`) lands; **AMD wgpu
-     retires**. AMD consumers run on AMD native only. NVIDIA + Intel
-     still on wgpu. The wgpu binding stays in-tree to serve them.
+   - v4.0: NVIDIA native (`BACKEND_KIND_NVIDIA`) lands. AMD wgpu is
+     **still supported** (one v4.x coexistence window for AMD
+     consumers). NVIDIA + Intel still on wgpu. The wgpu binding
+     stays in-tree to serve them.
+   - v4.0.1: **AMD wgpu retires.** AMD consumers run on AMD native
+     only. NVIDIA + Intel still on wgpu.
    - v5.0: Intel native (`BACKEND_KIND_INTEL`) lands (tentative);
      **NVIDIA wgpu retires**. Intel may still be on wgpu if v5.0
      ships only the NVIDIA-side retirement.

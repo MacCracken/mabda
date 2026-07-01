@@ -1,0 +1,62 @@
+# @internal — native NVIDIA backend, Turing compute QMD builder
+# backend_nvidia_qmd.cyr — the dispatch descriptor (Phase N4.2). NO AMD
+# analog: a fixed 256-byte bit-packed struct the compute engine reads to
+# launch a kernel (program address, grid/block, register count, constant
+# banks). Launched by address via SEND_PCAS (backend_nvidia_push.cyr).
+#
+# Layout: QMDV02_02 (Turing 0xC5C0 uses NVK's Volta Qmd2_2 branch — the
+# version stamp is 2.2, NOT 2.3, even though the bit-layout macros are
+# named QMDV02_03). Field byte-offsets + bit-ranges verified against
+# clc5c0qmd.h + NAK qmd.rs and byte-diffed against the NVK golden QMD
+# (mabda qmd-bitfield-verify pass, N0.7c). MW(msb:lsb) is an absolute bit
+# over the 256-byte struct; dword = MW/32, bit-in-dword = MW%32. None of
+# the fields below cross a dword, so each is a shift+mask into one u32
+# (shifts written as mul/div per the toolchain idiom).
+#
+# Golden-verified fixed dwords (kernel-independent config for a Turing
+# compute launch with shared_mem=0):
+#   +0x10 = 0x40        SM_GLOBAL_CACHING_ENABLE (dw04 bit6)
+#   +0x2c = 0x04000000  API_VISIBLE_CALL_LIMIT = NO_CHECK (dw11 bit26)
+#   +0x44 = 0x22240000  SHARED_MEMORY_SIZE=0, MIN_SM_CFG=9, MAX_SM_CFG=17
+#   +0x48 low byte 0x22 QMD_VERSION=2, QMD_MAJOR_VERSION=2  (mandatory stamp)
+# Per-kernel fields: grid/block dims, REGISTER_COUNT_V, CONSTANT_BUFFER[0],
+# PROGRAM_ADDRESS.
+
+var NV_QMD_SIZE = 256;
+
+# Build a 256-byte compute QMD into `dst` (caller-owned, >= 256 bytes) for
+# a grid(1,1,1) block(1,1,1) proof-of-life dispatch.
+#   program_va  = SASS program BO GPU VA (byte VA, unshifted; >=128-aligned)
+#   regcount    = compiled GPR count (ptxas store_deadbeef = 4)
+#   const0_va   = c[0x0] param bank BO GPU VA (must hold the output ptr at
+#                 +0x160 — the ptxas/CUDA sm_70+ kernel-param ABI)
+#   const0_size = param bank byte size (>= 0x168; SIZE_SHIFTED4 = size/16)
+# Returns 256.
+fn native_nv_qmd_build(dst, program_va, regcount, const0_va, const0_size): i64 {
+    memset(dst, 0, NV_QMD_SIZE);
+
+    store32(dst + 0x10, 0x40);            # SM_GLOBAL_CACHING_ENABLE
+    store32(dst + 0x2C, 0x04000000);      # API_VISIBLE_CALL_LIMIT = NO_CHECK
+    store32(dst + 0x30, 1);               # CTA_RASTER_WIDTH  (grid X)
+    store32(dst + 0x34, 1);               # CTA_RASTER_HEIGHT (grid Y)
+    store32(dst + 0x38, 1);               # CTA_RASTER_DEPTH  (grid Z)
+    store32(dst + 0x44, 0x22240000);      # SHARED_MEMORY_SIZE=0 / MIN=9 / MAX=17
+    store32(dst + 0x48, 0x22 | 0x10000);  # ver 2.2 (low byte) + CTA_THREAD_DIM0=1
+    store32(dst + 0x4C, 1 | 0x10000);     # CTA_THREAD_DIM1=1, CTA_THREAD_DIM2=1
+
+    # dw20 (+0x50): CONSTANT_BUFFER_VALID[0]=1 (bit0), REGISTER_COUNT_V
+    # (bits 8-16), TARGET_SM_CONFIG_SHARED_MEM_SIZE=9 (bits 17-23).
+    store32(dst + 0x50, 1 | ((regcount & 0x1FF) * 0x100) | (9 * 0x20000));
+
+    # CONSTANT_BUFFER[0] (dw32/33): ADDR_LOWER (lo32), ADDR_UPPER (hi17),
+    # SIZE_SHIFTED4 (bits 19-31). store32 truncates to the low 32 bits.
+    store32(dst + 0x80, const0_va);
+    var size_sh4 = (const0_size + 15) / 16;
+    store32(dst + 0x84, ((const0_va / 0x100000000) & 0x1FFFF) | ((size_sh4 & 0x1FFF) * 0x80000));
+
+    # PROGRAM_ADDRESS (dw48/49): unshifted byte VA — LOWER (lo32), UPPER (hi17).
+    store32(dst + 0xC0, program_va);
+    store32(dst + 0xC4, (program_va / 0x100000000) & 0x1FFFF);
+
+    return NV_QMD_SIZE;
+}

@@ -1,0 +1,80 @@
+# programs/nvidia_compute_api.cyr — v4.0 Phase N4.7 — NVIDIA native compute
+# through the PUBLIC mabda API.
+#
+# The N4 arc gate (nvidia_compute_store.cyr) drove the raw nouveau ioctl path
+# directly. This program proves the SAME 0xDEADBEEF dispatch works through the
+# backend-abstracted public surface — gpu_context_new_native_nvidia() +
+# gpu_buffer_* + gpu_shader_module_* + gpu_compute_dispatch — exactly the API
+# the wgpu + AMD-native backends expose. It is the N4.7 integration proof:
+# the v0 Backend slots are not just wired (CPU-asserted in nvidia.tcyr) but
+# functionally correct on hardware.
+#
+# Flow: create context -> create a 4-byte output buffer -> create a shader
+# module from the captured SM75 SASS -> dispatch grid(1,1,1) with the buffer
+# bound as c[0x0]+0x160 -> read the buffer back -> expect 0xDEADBEEF.
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-compute-api`.
+#
+# Exit codes:
+#   0 success   1 context   2 buffer_create   3 shader_create
+#   4 dispatch   5 readback != 0xDEADBEEF
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA compute via PUBLIC API (v4.0 Phase N4.7)\n");
+    print_cstr("----------------------------------------------------\n");
+
+    # Bring up a native NVIDIA context (channel + NVIF 0xC5C0 + persistent BOs).
+    var res = gpu_context_new_native_nvidia();
+    var ctx = gpu_result_unwrap(res);   # prints + exits(1) on Err
+    if (ctx == 0) { print_cstr("FAIL: context\n"); return 1; }
+    print_cstr("context created\n");
+
+    # Output buffer (4 bytes — the kernel stores 0xDEADBEEF here).
+    var buf = gpu_buffer_create(ctx, 4, 0);
+    if (buf == 0) { print_cstr("FAIL: buffer_create\n"); gpu_context_release(ctx); return 2; }
+    print_cstr("buffer created\n");
+
+    # Shader module from the captured SM75 SASS (store_deadbeef).
+    var sass[128];
+    native_nv_sass_store_deadbeef(&sass);
+    var shmod = gpu_shader_module_create(ctx, &sass, NV_SASS_STORE_DEADBEEF_BYTES);
+    if (shmod == 0) { print_cstr("FAIL: shader_module_create\n"); gpu_context_release(ctx); return 3; }
+    print_cstr("shader module created\n");
+
+    # Dispatch grid(1,1,1) with buf bound as the output (bp = buf).
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, buf);
+    if (rc != 0) {
+        print_cstr("FAIL: compute_dispatch rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 4;
+    }
+    print_cstr("dispatch submitted + waited\n");
+
+    # Read the result back through the public API.
+    var out = 0;
+    gpu_buffer_read(ctx, buf, 0, &out, 4);
+    var got = load32(&out);
+    print_cstr("readback = "); print_i64(got);
+    if (got == 0xDEADBEEF) { print_cstr("  (0xDEADBEEF OK)\n"); }
+    else { print_cstr("  FAIL (expected 3735928559)\n"); gpu_context_release(ctx); return 5; }
+
+    gpu_shader_module_release(ctx, shmod);
+    gpu_buffer_release(ctx, buf);
+    gpu_context_release(ctx);
+    print_cstr("OK: 0xDEADBEEF via the public mabda API on NVIDIA native\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

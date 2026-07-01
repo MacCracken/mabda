@@ -3936,6 +3936,40 @@ fn test_native_free_texture_va_lifo() {
     return 0;
 }
 
+# audit 2026-07-01 M2/M3: the native buffer + texture create slots must reclaim
+# the just-reserved texture VA when the BO-create / va-map ioctl fails, or a
+# transient failure permanently advances the forward-only cursor (2 GiB region
+# exhaustion). We provoke the failure with fd=0 (stdin): GEM_CREATE ioctl fails
+# (ENOTTY) reaching the post-VA-alloc error path. After the failed create the
+# cursor must be back at the region base — proven by a fresh alloc reusing it.
+# Without the reclaim the slot would leave the cursor advanced by one 64 KiB step.
+fn test_native_create_va_reclaim_on_fail() {
+    # M2 — buffer create
+    var ctx[176];
+    memset(&ctx, 0, 176);
+    var buf = _backend_native_buffer_create(&ctx, 4096, 0);
+    assert_eq(buf, 0, "buffer_create fails on invalid fd (fd=0)");
+    assert_eq(native_ctx_alloc_texture_va(&ctx, 4096), _NATIVE_TEXTURE_VA_BASE,
+    "M2: buffer_create reclaimed VA on BO-create failure (cursor at base)");
+
+    # M3 — plain 2D RGBA8 texture create
+    var ctx2[176];
+    memset(&ctx2, 0, 176);
+    assert_eq(_backend_native_texture_create_2d_rgba8(&ctx2, 64, 64), 0,
+    "texture_create_2d_rgba8 fails on invalid fd");
+    assert_eq(native_ctx_alloc_texture_va(&ctx2, 4096), _NATIVE_TEXTURE_VA_BASE,
+    "M3: texture_create_2d_rgba8 reclaimed VA on failure (cursor at base)");
+
+    # M3 — sampleable texture create (inline BO-create/va-map path)
+    var ctx3[176];
+    memset(&ctx3, 0, 176);
+    assert_eq(_backend_native_texture_create_2d_sampleable(&ctx3, 64, 64, MABDA_TEXFMT_RGBA8), 0,
+    "texture_create_2d_sampleable fails on invalid fd");
+    assert_eq(native_ctx_alloc_texture_va(&ctx3, 4096), _NATIVE_TEXTURE_VA_BASE,
+    "M3: texture_create_2d_sampleable reclaimed VA on failure (cursor at base)");
+    return 0;
+}
+
 # N.6r — the compute-dispatch slot routes a magic-tagged shmod to the compiled
 # path, whose binding-array guards fire BEFORE any ioctl: a bp count that disagrees
 # with the kernel's binding count, or an out-of-range binding count, is rejected.
@@ -4289,6 +4323,7 @@ fn main() {
     test_native_shmod_struct_layout();
     test_native_shader_module_create_kind_gate();
     test_native_free_texture_va_lifo();
+    test_native_create_va_reclaim_on_fail();
     test_native_dispatch_compiled_binding_guards();
     test_native_shader_module_release_tag_check();
     test_native_ctx_pm4_scratch_is_stable();

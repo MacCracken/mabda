@@ -1,0 +1,149 @@
+# programs/nvidia_surface_present_e2e.cyr — v4.0 Phase N8.5 — NVIDIA native
+# animated present through the PUBLIC mabda surface API.
+#
+# The public-API counterpart to the raw N8.4 present gate
+# (nvidia_present_e2e.cyr, which drove the native_kms_* helpers directly): the
+# SAME double-buffered vsync-locked scrolling gradient, but driven entirely
+# through the backend-agnostic v3 surface slots — gpu_surface_configure_native_kiosk
+# / gpu_surface_acquire / gpu_surface_present / gpu_surface_release — exactly the
+# surface a compositor (aethersafta) consumes. The nouveau backend fills those
+# slots (backend_nvidia.cyr, N8.5); the only nouveau-specific call here is
+# native_nv_open_card_node, to find the card node + take DRM master (the kiosk
+# precondition the public configure fn assumes the consumer has satisfied). This
+# is the NVIDIA analogue of the AMD native_present_e2e.cyr flow.
+#
+# At 60 Hz the screen shows ~2 seconds of a vertically-scrolling blue->red
+# gradient, then the console is restored (the surface_release slot re-binds the
+# saved CRTC via the N8.3 GETCRTC save/restore).
+#
+# **RUN FROM A TTY.** SETCRTC + PAGE_FLIP need DRM master — switch to an unused
+# vt (Ctrl-Alt-F2) so logind hands master to this session. From inside a desktop
+# session SET_MASTER fails and the program stops at exit code 2.
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-surface-present-e2e`.
+#
+# Exit codes:
+#   0 success (120 frames presented, console restored)
+#   1 no nouveau card / permission   2 SET_MASTER (a compositor holds master)
+#   3 gpu_context_new_native_nvidia   4 gpu_surface_configure_native_kiosk
+#   5 gpu_surface_acquire returned 0   6 gpu_surface_present returned non-zero
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var b[32];
+    memset(&b, 0, 32);
+    var len = fmt_int_buf(n, &b);
+    syscall(1, 1, &b, len);
+    return 0;
+}
+
+# Fill XRGB8888 with a vertically-scrolling blue->red gradient. Row color =
+# (virt_y * 255 / h) where virt_y = (y + frame_offset) wrapped; pixel = R<<16 | B,
+# G = 0. Copied verbatim from nvidia_present_e2e.cyr so the on-screen result
+# matches the N8.4 gate exactly — only the present PATH changed (public surface
+# API vs the raw native_kms_* helpers).
+fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
+    var y = 0;
+    while (y < h) {
+        var virt_y = (y + frame_offset) % h;
+        var r = virt_y * 255 / h;
+        var pixel = (r * 0x10000) | (255 - r);   # R<<16 | B; G=0
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, pixel);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA animated present via PUBLIC surface API (v4.0 N8.5)\n");
+    print_cstr("---------------------------------------------------------------\n");
+    print_cstr("expect: ~2s of a scrolling blue->red gradient, then console restore\n\n");
+
+    # nouveau-specific: find the card node + take DRM master (the kiosk
+    # precondition). Everything below SET_MASTER is the backend-agnostic API.
+    var which[4];
+    memset(&which, 0, 4);
+    var card_fd = native_nv_open_card_node(&which);
+    if (card_fd < 0) {
+        print_cstr("FAIL: no nouveau /dev/dri/cardN (run from a tty; errno=");
+        print_i64(0 - card_fd); print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened /dev/dri/card"); print_i64(load32(&which)); print_cstr("\n");
+
+    var master_rc = native_drm_set_master(card_fd);
+    if (master_rc != 0) {
+        print_cstr("FAIL: SET_MASTER rc="); print_i64(master_rc);
+        print_cstr(" — a compositor holds master. Run from an unused tty (Ctrl-Alt-F2).\n");
+        sys_close(card_fd);
+        return 2;
+    }
+    print_cstr("SET_MASTER: acquired (kiosk)\n");
+
+    # ---- PUBLIC API from here down — identical shape to native_present_e2e ----
+    var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+    if (ctx == 0) {
+        print_cstr("FAIL: context\n");
+        native_drm_drop_master(card_fd); sys_close(card_fd); return 3;
+    }
+    print_cstr("context created (native nvidia)\n");
+
+    var surface = gpu_surface_configure_native_kiosk(ctx, card_fd, 1920, 1080);
+    if (surface == 0) {
+        print_cstr("FAIL: surface configure (no connected connector / not master?)\n");
+        gpu_context_release(ctx);
+        native_drm_drop_master(card_fd); sys_close(card_fd); return 4;
+    }
+    var w = load32(surface + NV_SURFACE_WIDTH);
+    var h = load32(surface + NV_SURFACE_HEIGHT);
+    var pitch = load32(surface + NV_SURFACE_PITCH);
+    print_cstr("surface configured: "); print_i64(w); print_cstr("x"); print_i64(h);
+    print_cstr(" pitch "); print_i64(pitch); print_cstr("\n");
+
+    print_cstr("presenting 120 frames ...\n");
+    var frame = 0;
+    var rc = 0;
+    while (frame < 120) {
+        var fb = gpu_surface_acquire(ctx, surface);
+        if (fb == 0) {
+            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame); print_cstr("\n");
+            rc = 5;
+            frame = 120;
+        }
+        if (fb != 0) {
+            # the consumer CPU-fills the back FB's mapped bytes, then presents
+            _fill_gradient(load64(fb + NV_SFB_MAPPED), w, h, pitch, frame * 4);
+            var pr = gpu_surface_present(ctx, surface);
+            if (pr != 0) {
+                print_cstr("FAIL: present rc="); print_i64(pr);
+                print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+                rc = 6;
+                frame = 120;
+            }
+            frame = frame + 1;
+        }
+    }
+
+    # teardown: release the surface (restores the console CRTC), then the
+    # context, then drop master + close the card fd (kiosk: the consumer owns it).
+    gpu_surface_release(ctx, surface);
+    gpu_context_release(ctx);
+    native_drm_drop_master(card_fd);
+    sys_close(card_fd);
+
+    if (rc == 0) {
+        print_cstr("OK: 120 frames presented via the public surface API; console restored\n");
+    }
+    return rc;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

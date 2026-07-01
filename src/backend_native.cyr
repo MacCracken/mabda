@@ -420,19 +420,20 @@ fn _backend_native_buffer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
 #     invalidate; we don't need the kernel's TC writeback hook that
 #     0x08 (TC_WB_NOT_INVALIDATE) toggles for compute.
 # Render-handle pair convention (the analog of compute's `bp`
-# (handle, va) pair): a 24-byte (vs_h, fs_h, rt_h) triple, packed via
-# native_render_handles_write below. Caller-managed BOs; the cached
+# (handle, va) pair): a 32-byte (vs_h, fs_h, rt_h, tex_h) quad, packed
+# via native_render_handles_write below. Caller-managed BOs; the cached
 # IB+fence come from the GpuContext.
 #
 # Verification: structural unit tests in mabda_v3.tcyr pin the
-# residency priority list and the 24-byte triple layout. The full
+# residency priority list and the 32-byte quad layout. The full
 # submit + wait path exercises real syscalls, so the e2e gate is
 # 6.9(b)'s programs/native_render_e2e.cyr (HW required).
 
-# Pack a (vs_handle, fs_handle, rt_handle) triple into a 24-byte
-# block. Mirror of native_buf_pair_write for the render dispatch
-# slot. Caller allocates 24 bytes for `dst` (typically a stack-local
-# `var triple[24]`); this helper writes the three u64 fields.
+# Pack a (vs_handle, fs_handle, rt_handle, tex_handle) quad into a
+# 32-byte block. Mirror of native_buf_pair_write for the render
+# dispatch slot. Caller allocates 32 bytes for `dst` (typically a
+# stack-local `var triple[32]`); this helper writes the four u64
+# fields (the +24 tex_h was added at v3.2 TS.5).
 fn native_render_handles_write(dst, vs_h, fs_h, rt_h, tex_h): i64 {
     store64(dst +  0, vs_h);
     store64(dst +  8, fs_h);
@@ -477,7 +478,7 @@ fn native_render_bo_list_pack6(entries48, fence_h, vs_h, fs_h, rt_h, tex_h, ib_h
 # Submit a pre-built render PM4 stream on the GFX ring. The PM4 must
 # be the output of native_pm4_build_render_clear_triangle (or a
 # future render composer that follows the same per-dispatch self-
-# contained shape). `render_handles_ptr` points to a 24-byte triple
+# contained shape). `render_handles_ptr` points to a 32-byte quad
 # packed by native_render_handles_write.
 #
 # Returns 0 on success (syncobj signaled within timeout) or a
@@ -840,13 +841,20 @@ fn _backend_native_buffer_create(ctx, size, usage): i64 {
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
+    # Every post-VA-alloc error path reclaims the just-reserved VA (LIFO, no
+    # intervening alloc) so a transient failure does not permanently consume the
+    # 2 GiB region — mirroring _native_shader_compile_spirv (audit 2026-07-01 M2).
     var rc = native_bo_create_gtt(fd, bo_size, &bo);
-    if (rc != 0) { return 0; }
+    if (rc != 0) {
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
     var handle = load64(&bo + 0);
     var addr   = load64(&bo + 8);
     rc = native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA);
     if (rc != 0) {
         native_bo_release_gtt(fd, handle, addr, bo_size);
+        native_ctx_free_texture_va(ctx, bo_size);
         return 0;
     }
     var buf = alloc(NATIVE_BUF_STRUCT_SIZE);
@@ -1375,7 +1383,7 @@ fn _backend_native_texture_create_2d_rgba8(ctx, width, height): i64 {
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
     var rc = native_texture_create_2d_rgba8(fd, va, width, height, tex);
-    if (rc != 0) { return 0; }
+    if (rc != 0) { native_ctx_free_texture_va(ctx, size); return 0; }   # audit 2026-07-01 M3
     return tex;
 }
 
@@ -1403,7 +1411,7 @@ fn _backend_native_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
     var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
     memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
     var rc = native_texture_create_2d_fmt(fd, va, width, height, fmt, tex);
-    if (rc != 0) { return 0; }
+    if (rc != 0) { native_ctx_free_texture_va(ctx, bo_size); return 0; }   # audit 2026-07-01 M3
     return tex;
 }
 
@@ -1543,11 +1551,16 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
-    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) { return 0; }
+    # Post-VA-alloc error paths reclaim the just-reserved VA (LIFO) — audit 2026-07-01 M3.
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) {
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
     var handle = load64(&bo + 0);
     var addr   = load64(&bo + 8);
     if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA) != 0) {
         native_bo_release_gtt(fd, handle, addr, bo_size);
+        native_ctx_free_texture_va(ctx, bo_size);
         return 0;
     }
     # Build the T# (+0) + a default point/clamp unnormalized S# (+32) in the tail.
@@ -1628,11 +1641,16 @@ fn _native_create_layered_sampleable(ctx, width, height, fmt, slices, img_type, 
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
     if (va == 0) { return 0; }
     var bo[16];
-    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) { return 0; }
+    # Post-VA-alloc error paths reclaim the just-reserved VA (LIFO) — audit 2026-07-01 M3.
+    if (native_bo_create_gtt(fd, bo_size, &bo) != 0) {
+        native_ctx_free_texture_va(ctx, bo_size);
+        return 0;
+    }
     var handle = load64(&bo + 0);
     var addr   = load64(&bo + 8);
     if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_DATA) != 0) {
         native_bo_release_gtt(fd, handle, addr, bo_size);
+        native_ctx_free_texture_va(ctx, bo_size);
         return 0;
     }
     var daddr = addr + desc_off;

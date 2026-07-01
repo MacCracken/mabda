@@ -1,0 +1,492 @@
+# @internal — native GPU backend, NVIDIA/nouveau DRM ioctl wrappers
+# backend_nvidia_nouveau.cyr — pure-Cyrius nouveau DRM foundational layer
+# (the backend_native_amdgpu.cyr analogue for the v4.0 NVIDIA arc).
+#
+# Phase N1 scope: device enum + the N0.7(b) masterless permission probe.
+# Later phases extend this file (N2 GEM_NEW/GEM_INFO, N3 CHANNEL_ALLOC/
+# VM_BIND, N4 EXEC) and add backend_nvidia_{push,qmd,sass}.cyr +
+# backend_nvidia.cyr — mirroring amdgpu -> shaders -> pm4 -> backend_native.
+#
+# REUSES verbatim from backend_native_amdgpu.cyr (do NOT redefine):
+#   native_ioc_encode, native_open_render_node, native_drm_version,
+#   native_probe_device, DRM_RENDER_NODE_PATH, DRM_IOCTL_TYPE (0x64),
+#   DRM_COMMAND_BASE (0x40), DRM_IOCTL_GEM_CLOSE (0x40086409),
+#   DRM_IOCTL_VERSION (0xC0406400), _NATIVE_ERRNO_EPERM/_EACCES.
+# The DRM _IOC encoding, render-node open, and two-pass VERSION probe are
+# driver-independent; nouveau just fills a different ioctl/struct table.
+#
+# UAPI reference: /usr/include/drm/nouveau_drm.h (Linux
+# include/uapi/drm/nouveau_drm.h). Every ioctl number + struct size below
+# was independently re-derived from _IOC(dir,type,nr,size) and
+# cross-checked against that header (mabda nouveau-uapi-verify pass,
+# 2026-06-27 — ioctl arithmetic + struct packing + render-allow set all
+# confirmed against mainline nouveau_ioctls[]). No libdrm — direct
+# syscall(SYS_IOCTL) only.
+#
+# ----------------------------------------------------------------
+# Verified nouveau ioctl table (DRM type 'd'=0x64, base 0x40):
+#   absolute nr = DRM_COMMAND_BASE(0x40) + DRM_NOUVEAU_<op>
+#     GETPARAM       +0x00 -> nr 0x40  RW size 16  -> 0xC0106440   [N1]
+#     CHANNEL_ALLOC  +0x02 -> nr 0x42  RW size 88  -> 0xC0586442   [N3]
+#     VM_INIT        +0x10 -> nr 0x50  RW size 16  -> 0xC0106450   [N1/N3]
+#     VM_BIND        +0x11 -> nr 0x51  RW size 40  -> 0xC0286451   [N3]
+#     EXEC           +0x12 -> nr 0x52  RW size 40  -> 0xC0286452   [N4]
+#     GEM_NEW        +0x40 -> nr 0x80  RW size 48  -> 0xC0306480   [N2]
+#     GEM_INFO       +0x44 -> nr 0x84  RW size 40  -> 0xC0286484   [N2]
+# Masterless: ALL of the above are DRM_RENDER_ALLOW in mainline
+# drivers/gpu/drm/nouveau/nouveau_drm.c::nouveau_ioctls[] — a headless
+# compute client runs VM_INIT -> CHANNEL_ALLOC -> VM_BIND -> EXEC on
+# /dev/dri/renderD128 with no DRM master, exactly like the AMD
+# GEM_CREATE + GEM_VA + CS path. KMS (SETCRTC/PAGE_FLIP/ADDFB2) stays
+# DRM_MASTER on /dev/dri/cardN (same compute-vs-KMS split as AMD).
+# Defined below: N1 (GETPARAM, VM_INIT) + N2 (GEM_NEW, GEM_INFO;
+# GEM_CLOSE reused from the AMD module) + N3 (CHANNEL_ALLOC, VM_BIND,
+# CHANNEL_FREE, drm_nouveau_sync builder; syncobj reused from AMD) + N4
+# (NVIF class-object create, EXEC). The QMD builder lives in
+# backend_nvidia_qmd.cyr; the pushbuffer/method builders in
+# backend_nvidia_push.cyr.
+# ----------------------------------------------------------------
+
+# drm_nouveau_getparam (16 bytes):
+#   +0: param (u64, in)
+#   +8: value (u64, out)
+var DRM_NOUVEAU_GETPARAM_NR    = 0x40;   # DRM_COMMAND_BASE 0x40 + 0x00
+var DRM_NOUVEAU_GETPARAM_SIZE  = 16;
+var DRM_IOCTL_NOUVEAU_GETPARAM = 0xC0106440;
+
+# drm_nouveau_vm_init (16 bytes):
+#   +0: kernel_managed_addr (u64)
+#   +8: kernel_managed_size (u64)
+# Must be issued before any BO/channel create, else the kernel returns
+# -ENOSYS (per the uapi comment). Sets up the per-file UMD-managed VA.
+var DRM_NOUVEAU_VM_INIT_NR     = 0x50;   # DRM_COMMAND_BASE 0x40 + 0x10
+var DRM_NOUVEAU_VM_INIT_SIZE   = 16;
+var DRM_IOCTL_NOUVEAU_VM_INIT  = 0xC0106450;
+
+# GETPARAM param ids (nouveau_drm.h).
+var NOUVEAU_GETPARAM_PCI_VENDOR = 3;
+var NOUVEAU_GETPARAM_PCI_DEVICE = 4;
+var NOUVEAU_GETPARAM_CHIPSET_ID = 11;
+
+# Identity of the v4.0 bring-up card (GTX 1660 SUPER, TU116).
+# GETPARAM(CHIPSET_ID) returns device->info.chipset — the nouveau
+# internal chipset number, 0x168 for TU116 (nvkm nv168_chipset
+# .name="TU116"). NOT 0x162 (that is TU102, a different Turing die).
+# Decoded from boot0 0x168000a1 as (boot0 >> 20) & 0x1ff = 0x168, with
+# the low 0xa1 = A1 stepping. Distinct from PCI device id 0x21C4.
+var NV_CHIPSET_TU116       = 0x168;
+var NV_PCI_VENDOR_NVIDIA   = 0x10DE;
+var NV_PCI_DEVICE_GTX1660S = 0x21C4;
+
+# NVK's conformance-tested Turing VM_INIT split: the kernel manages the
+# high half [512 GiB, 1 TiB); the UMD manages [0, 512 GiB) via VM_BIND.
+# (Mesa src/nouveau/winsys/nouveau_device.c: KERN = 1<<39, TOP = 1<<40,
+# vminit = { KERN, TOP - KERN }.) Kernel only checks add-overflow and
+# (addr+size) <= NOUVEAU_VA_SPACE_END (1<<47); VM_INIT itself imposes no
+# alignment. mabda's UMD VA allocator must stay in [0, START), 64 KiB
+# aligned, to ride NVIDIA big pages at VM_BIND time.
+var NOUVEAU_VM_KERNEL_RESERVATION_START = 0x8000000000;  # 1<<39 = 512 GiB
+var NOUVEAU_VM_KERNEL_RESERVATION_SIZE  = 0x8000000000;  # (1<<40)-(1<<39)
+
+# Driver name nouveau reports through DRM_IOCTL_VERSION.
+var NV_DRIVER_NAME = "nouveau";
+
+# ================================================================
+# v4.0 Phase N1 — device enum + masterless probe primitives
+# ================================================================
+
+# GETPARAM: query one nouveau device parameter. `out_value` is a
+# caller-owned 8-byte region that receives the u64 result. Returns 0 on
+# success or negative errno. DRM_RENDER_ALLOW — works masterless on the
+# render node.
+fn native_nv_getparam(fd, param, out_value): i64 {
+    var req[16];
+    memset(&req, 0, 16);
+    store64(&req + 0, param);
+    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_GETPARAM, &req);
+    if (rc != 0) { return rc; }
+    store64(out_value, load64(&req + 8));
+    return 0;
+}
+
+# VM_INIT: initialize the GPU VA space, handing the kernel the
+# [kernel_managed_addr, +size) region and reserving the rest for UMD
+# VM_BIND. Must precede any BO/channel create. Returns 0 or negative
+# errno. In N1 this doubles as the N0.7(b) masterless probe: because
+# VM_INIT is DRM_RENDER_ALLOW, a render-node fd must NOT get -EACCES/
+# -EPERM back (see native_nv_rc_is_masterless).
+fn native_nv_vm_init(fd, kernel_managed_addr, kernel_managed_size): i64 {
+    var req[16];
+    memset(&req, 0, 16);
+    store64(&req + 0, kernel_managed_addr);
+    store64(&req + 8, kernel_managed_size);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_VM_INIT, &req);
+}
+
+# Does a DRM_IOCTL_VERSION result name the nouveau driver? `ver` is a
+# 64-byte drm_version struct already filled by native_drm_version
+# (name_len at +16, name_ptr at +24). Returns 1 for nouveau, else 0 —
+# lets a probe confirm it opened the right driver before issuing
+# nouveau-specific ioctls. Null-safe; CPU-testable on a hand-built struct.
+fn native_nv_is_nouveau(ver): i64 {
+    var name_ptr = load64(ver + 24);
+    if (name_ptr == 0) { return 0; }
+    var name_len = load64(ver + 16);
+    if (name_len != strlen(NV_DRIVER_NAME)) { return 0; }
+    return memeq(name_ptr, NV_DRIVER_NAME, name_len);
+}
+
+# v4.0 Phase N8 — open the nouveau KMS *card* node. Scans /dev/dri/card0..9 and
+# opens the first whose DRM driver name is "nouveau" (verified via
+# DRM_IOCTL_VERSION, not hardcoded — nouveau holds card0 on a single-GPU box but
+# the index moves with load order / simpledrm). Returns the card fd, or a
+# negative verdict: -EACCES if any card-open was permission-denied (the card
+# node is root:video + a logind ACL — KMS topology/FB ioctls need the open but
+# NO DRM master), else -ENOENT. Writes the matched card index to *which_out.
+#
+# This is the ONLY nouveau-specific KMS primitive: the topology / AddFB2 /
+# modeset / page-flip ioctls are all generic-DRM (reused from
+# backend_native_kms.cyr). The render node (renderD128) is opened separately via
+# native_open_render_node for the scanout BO + PRIME bridge.
+fn native_nv_open_card_node(which_out): i64 {
+    var path[16];
+    memset(&path, 0, 16);
+    # "/dev/dri/card" = 13 chars (indices 0..12); the digit lands at +13, NUL +14.
+    store8(&path + 0,  47);  store8(&path + 1,  100); store8(&path + 2,  101);
+    store8(&path + 3,  118); store8(&path + 4,  47);  store8(&path + 5,  100);
+    store8(&path + 6,  114); store8(&path + 7,  105); store8(&path + 8,  47);
+    store8(&path + 9,  99);  store8(&path + 10, 97);  store8(&path + 11, 114);
+    store8(&path + 12, 100);
+    var i = 0;
+    var perm_err = 0;
+    while (i < 10) {
+        store8(&path + 13, 48 + i);
+        var fd = sys_open(&path, O_RDWR, 0);
+        if (fd >= 0) {
+            var ver[64];
+            memset(&ver, 0, 64);
+            if (native_drm_version(fd, &ver) == 0) {
+                if (native_nv_is_nouveau(&ver) == 1) {
+                    store32(which_out, i);
+                    return fd;
+                }
+            }
+            sys_close(fd);   # opened but not nouveau — try the next node
+        }
+        if (fd == 0 - _NATIVE_ERRNO_EACCES) { perm_err = 1; }
+        if (fd == 0 - _NATIVE_ERRNO_EPERM)  { perm_err = 1; }
+        i = i + 1;
+    }
+    if (perm_err != 0) { return 0 - _NATIVE_ERRNO_EACCES; }
+    return 0 - 2;   # ENOENT — no nouveau card node present
+}
+
+# Interpret a nouveau-uAPI ioctl rc as a masterless-permission verdict
+# for the N0.7(b) probe. Every ioctl mabda's compute path needs is
+# DRM_RENDER_ALLOW in mainline nouveau, so the ONLY signals that a master
+# is required are -EACCES / -EPERM. Any other result (success, or
+# -EINVAL/-ENOSYS from args or state) means the render node accepted the
+# call without a master. Returns 1 if masterless access is confirmed, 0
+# if the rc indicates a permission denial.
+fn native_nv_rc_is_masterless(rc): i64 {
+    if (rc == 0 - _NATIVE_ERRNO_EACCES) { return 0; }
+    if (rc == 0 - _NATIVE_ERRNO_EPERM)  { return 0; }
+    return 1;
+}
+
+# ================================================================
+# v4.0 Phase N2 — GEM buffer object lifecycle (host-visible)
+# ================================================================
+# The native_bo_create_gtt analogue for nouveau. A pure CPU roundtrip
+# (alloc + mmap + readback) needs NO VM_INIT/VM_BIND — that is GPU VA
+# (N3). GEM_NEW returns a map_handle (the mmap offset) directly, so the
+# data path is: GEM_NEW -> cyr_mmap(map_handle) -> CPU r/w -> GEM_CLOSE.
+# GEM_CLOSE is the generic DRM ioctl — reuse native_gem_close from the
+# AMD module verbatim (driver-agnostic). Numbers verified against
+# /usr/include/drm/nouveau_drm.h (nouveau-uapi-verify, 2026-06-27).
+
+# drm_nouveau_gem_new (48 bytes) — embeds drm_nouveau_gem_info (40):
+#   info.handle      +0   u32 (out)
+#   info.domain      +4   u32 (in: NOUVEAU_GEM_DOMAIN_*; out: actual)
+#   info.size        +8   u64 (in: requested; out: actual, page-rounded)
+#   info.offset      +16  u64 (out; legacy GPU VA — unused under VM_BIND)
+#   info.map_handle  +24  u64 (out: the mmap(2) offset)
+#   info.tile_mode   +32  u32
+#   info.tile_flags  +36  u32
+#   channel_hint     +40  u32 (in)
+#   align            +44  u32 (in)
+var DRM_NOUVEAU_GEM_NEW_NR    = 0x80;   # DRM_COMMAND_BASE 0x40 + 0x40
+var DRM_NOUVEAU_GEM_NEW_SIZE  = 48;
+var DRM_IOCTL_NOUVEAU_GEM_NEW = 0xC0306480;
+
+# drm_nouveau_gem_info (40 bytes) — same layout as the embedded info.
+var DRM_NOUVEAU_GEM_INFO_NR    = 0x84;  # DRM_COMMAND_BASE 0x40 + 0x44
+var DRM_NOUVEAU_GEM_INFO_SIZE  = 40;
+var DRM_IOCTL_NOUVEAU_GEM_INFO = 0xC0286484;
+
+# Memory domain flags (nouveau_drm.h). Single-bit, OR-combinable.
+var NOUVEAU_GEM_DOMAIN_CPU      = 0x1;   # 1<<0
+var NOUVEAU_GEM_DOMAIN_VRAM     = 0x2;   # 1<<1
+var NOUVEAU_GEM_DOMAIN_GART     = 0x4;   # 1<<2
+var NOUVEAU_GEM_DOMAIN_MAPPABLE = 0x8;   # 1<<3
+var NOUVEAU_GEM_DOMAIN_COHERENT = 0x10;  # 1<<4
+var NOUVEAU_GEM_DOMAIN_NO_SHARE = 0x20;  # 1<<5
+
+# GEM_NEW: allocate a BO. `req` is a caller-owned 48-byte region (zeroed
+# here). `domains` is a NOUVEAU_GEM_DOMAIN_* bitmask; `align` is byte
+# alignment (page-multiple). On success the kernel fills the embedded
+# info — read it back via the accessors below. Returns 0 or -errno.
+fn native_nv_gem_new(fd, size, align, domains, req): i64 {
+    memset(req, 0, DRM_NOUVEAU_GEM_NEW_SIZE);
+    store32(req + 4, domains);   # info.domain
+    store64(req + 8, size);      # info.size
+    store32(req + 44, align);    # align
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_GEM_NEW, req);
+}
+
+fn native_nv_gem_new_handle(req): i64 { return load32(req + 0); }
+fn native_nv_gem_new_map_handle(req): i64 { return load64(req + 24); }
+fn native_nv_gem_new_size(req): i64 { return load64(req + 8); }
+
+# GEM_INFO: re-query a BO's info by handle. `req` is the 40-byte
+# gem_info struct; handle goes at +0, map_handle reads back at +24.
+# Returns 0 or -errno.
+fn native_nv_gem_info(fd, handle, req): i64 {
+    memset(req, 0, DRM_NOUVEAU_GEM_INFO_SIZE);
+    store32(req + 0, handle);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_GEM_INFO, req);
+}
+fn native_nv_gem_info_map_handle(req): i64 { return load64(req + 24); }
+
+# Default host-visible domain set: GART (sysmem) + MAPPABLE (guarantee a
+# CPU map_handle) + COHERENT (CPU-coherent). Tunable; the N2 roundtrip
+# program verifies it works on real hardware.
+var NOUVEAU_GEM_DOMAIN_HOST = 0x1C;  # GART | MAPPABLE | COHERENT
+
+# Create a BO in the given domain(s) and mmap it. Populates `out` (16
+# bytes): +0 handle, +8 mapped addr. Returns 0 or -errno; on a mid-create
+# failure the handle is closed and out+0 cleared so a non-zero return
+# leaks nothing (mirrors native_bo_create_gtt).
+fn native_nv_bo_create_dom(fd, size, domains, out): i64 {
+    store64(out + 0, 0);
+    store64(out + 8, 0);
+
+    var req[48];
+    var rc = native_nv_gem_new(fd, size, 4096, domains, &req);
+    if (rc != 0) { return rc; }
+    var handle = native_nv_gem_new_handle(&req);
+    store64(out + 0, handle);
+    var map_handle = native_nv_gem_new_map_handle(&req);
+
+    var addr = cyr_mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, map_handle);
+    if (addr < 0) { native_gem_close(fd, handle); store64(out + 0, 0); return addr; }
+    store64(out + 8, addr);
+    return 0;
+}
+
+# Convenience: host-visible BO (GART|MAPPABLE|COHERENT) + mmap.
+fn native_nv_bo_create_host(fd, size, out): i64 {
+    return native_nv_bo_create_dom(fd, size, NOUVEAU_GEM_DOMAIN_HOST, out);
+}
+
+# Release a host BO created via native_nv_bo_create_host: munmap then
+# gem_close (generic DRM ioctl, reused from the AMD module). Returns 0.
+fn native_nv_bo_release_host(fd, handle, addr, size): i64 {
+    if (addr != 0) { cyr_munmap(addr, size); }
+    if (handle != 0) { native_gem_close(fd, handle); }
+    return 0;
+}
+
+# ================================================================
+# v4.0 Phase N3 — channel + VM_BIND + sync (submission setup)
+# ================================================================
+# The native AMDGPU CTX/GEM_VA analogue, pinned against mainline nouveau
+# (nouveau_abi16.c / nouveau_uvmm.c) + Mesa NVK winsys (n3-channel-vmbind
+# -verify pass, 2026-06-27). Required order on a fresh fd:
+#   VM_INIT (first!) -> CHANNEL_ALLOC -> [compute class obj: N4] ->
+#   GEM_NEW -> VM_BIND(MAP) -> EXEC.
+# CHANNEL_ALLOC auto-allocates the GPFIFO/USERD/notifier and binds the
+# channel to the VM_INIT'd uvmm — the UMD never touches USERD/doorbell
+# (that is the EXEC uAPI's whole point). syncobj create/destroy/wait reuse
+# the AMD module's native_syncobj_* (driver-agnostic DRM_IOCTL_SYNCOBJ_*).
+
+# drm_nouveau_channel_alloc (88 bytes):
+#   fb_ctxdma_handle +0  u32 (in: ~0 = Kepler+ engine-select gate)
+#   tt_ctxdma_handle +4  u32 (in: NOUVEAU_FIFO_ENGINE_* when fb==~0)
+#   channel          +8  s32 (out: hardware chid — pass to EXEC/NVIF)
+#   pushbuf_domains  +12 u32 (out)
+#   notifier_handle  +16 u32 (out; unused by EXEC)
+#   subchan[8]       +20 {u32 handle,u32 grclass} (out; empty on Turing)
+#   nr_subchan       +84 u32 (out; 0 on Turing)
+var DRM_NOUVEAU_CHANNEL_ALLOC_NR    = 0x42;  # DRM_COMMAND_BASE 0x40 + 0x02
+var DRM_NOUVEAU_CHANNEL_ALLOC_SIZE  = 88;
+var DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC = 0xC0586442;
+
+# drm_nouveau_channel_free (4 bytes): { s32 channel }. _IOW('d',0x43,4).
+var DRM_IOCTL_NOUVEAU_CHANNEL_FREE  = 0x40046443;
+
+# drm_nouveau_vm_bind (40) + drm_nouveau_vm_bind_op (40):
+#   bind: op_count +0, flags +4, wait_count +8, sig_count +12,
+#         wait_ptr +16, sig_ptr +24, op_ptr +32
+#   op:   op +0, flags +4, handle +8, pad +12, addr +16, bo_offset +24, range +32
+var DRM_NOUVEAU_VM_BIND_NR    = 0x51;  # DRM_COMMAND_BASE 0x40 + 0x11
+var DRM_NOUVEAU_VM_BIND_SIZE  = 40;
+var DRM_IOCTL_NOUVEAU_VM_BIND = 0xC0286451;
+
+# FIFO engine selector for tt_ctxdma_handle (Kepler+; requires fb==~0).
+# Compute runs on GR; CE is copy-only.
+var NOUVEAU_FIFO_ENGINE_GR = 0x01;
+var NOUVEAU_FIFO_ENGINE_CE = 0x30;
+
+# vm_bind_op.op values.
+var DRM_NOUVEAU_VM_BIND_OP_MAP   = 0x0;
+var DRM_NOUVEAU_VM_BIND_OP_UNMAP = 0x1;
+
+# drm_nouveau_sync (16): flags +0, handle +4, timeline_value +8.
+var DRM_NOUVEAU_SYNC_SYNCOBJ = 0x0;
+var DRM_NOUVEAU_SYNC_SIZE    = 16;
+
+# Safe UMD VA base for small BOs: 64 KiB-aligned, non-null, well below the
+# kernel-managed split (1<<39) — rides big pages for VRAM, valid for GTT.
+var NOUVEAU_UMD_VA_BASE = 0x10000;
+
+# CHANNEL_ALLOC a GR (compute-capable) channel. `req` is caller-owned
+# 88 bytes. Must run AFTER VM_INIT (else the channel binds the legacy
+# per-client vmm, not the uvmm). Read the chid back with
+# native_nv_channel_id. Returns 0 or -errno.
+fn native_nv_channel_alloc(fd, req): i64 {
+    memset(req, 0, DRM_NOUVEAU_CHANNEL_ALLOC_SIZE);
+    store32(req + 0, 0xFFFFFFFF);              # fb_ctxdma_handle = ~0
+    store32(req + 4, NOUVEAU_FIFO_ENGINE_GR);  # tt_ctxdma_handle = GR
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, req);
+}
+fn native_nv_channel_id(req): i64 { return load32(req + 8); }
+
+# Free a channel by chid. (fd close also frees it; this is for clean
+# teardown.) Returns 0 or -errno.
+fn native_nv_channel_free(fd, chid): i64 {
+    var req[4];
+    store32(&req + 0, chid);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_CHANNEL_FREE, &req);
+}
+
+# VM_BIND: synchronously MAP a GEM BO at GPU VA `addr` for `range` bytes.
+# addr/range/bo_offset must be 4 KiB-aligned; addr must sit below the
+# kernel-managed split. Synchronous (flags=0) — all sync counts/ptrs stay
+# 0 (the kernel EINVALs a non-zero sync count when flags=0). Returns 0 or
+# -errno. The op struct is stack-local; op_ptr references it for the call.
+fn native_nv_vm_bind_map(fd, handle, addr, range): i64 {
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);  # op = MAP
+    store32(&op + 8, handle);                      # handle
+    store64(&op + 16, addr);                       # addr
+    store64(&op + 32, range);                      # range
+
+    var bind[40];
+    memset(&bind, 0, 40);
+    store32(&bind + 0, 1);       # op_count = 1
+    store64(&bind + 32, &op);    # op_ptr -> op
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_VM_BIND, &bind);
+}
+
+# VM_BIND: UNMAP the mapping at GPU VA `addr` for `range` bytes. Returns
+# 0 or -errno.
+fn native_nv_vm_unbind(fd, addr, range): i64 {
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_UNMAP);
+    store64(&op + 16, addr);
+    store64(&op + 32, range);
+
+    var bind[40];
+    memset(&bind, 0, 40);
+    store32(&bind + 0, 1);
+    store64(&bind + 32, &op);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_VM_BIND, &bind);
+}
+
+# Build a drm_nouveau_sync (16B) into `buf` referencing a binary syncobj.
+# Carried on EXEC (N4) as a signal/wait fence. syncobj create/destroy/wait
+# reuse the AMD module's native_syncobj_* wrappers. Returns 0.
+fn native_nv_sync_build(buf, syncobj_handle): i64 {
+    store32(buf + 0, DRM_NOUVEAU_SYNC_SYNCOBJ);  # flags
+    store32(buf + 4, syncobj_handle);            # handle
+    store64(buf + 8, 0);                          # timeline_value
+    return 0;
+}
+
+# ================================================================
+# v4.0 Phase N4 — compute submission (NVIF class object + EXEC)
+# ================================================================
+# EXEC references an abi16 channel by chid and runs a pushbuffer of
+# methods. The compute class object (TURING_COMPUTE_A 0xC5C0) is created
+# on the channel via DRM_NOUVEAU_NVIF (0x07) NEW — NOT CHANNEL_ALLOC
+# (which leaves the channel engine-agnostic). Payload byte-matched to the
+# NVK capture (N0.7c). Numbers verified against nouveau_drm.h.
+
+var DRM_NOUVEAU_EXEC_NR    = 0x52;  # DRM_COMMAND_BASE 0x40 + 0x12
+var DRM_NOUVEAU_EXEC_SIZE  = 40;
+var DRM_IOCTL_NOUVEAU_EXEC = 0xC0286452;
+
+# DRM_NOUVEAU_NVIF (0x07) — the ioctl size field is the actual payload
+# size (drmCommandWriteRead encodes sizeof at call time), so the request
+# number is computed per call rather than precomputed.
+var DRM_NOUVEAU_NVIF_NR = 0x47;  # DRM_COMMAND_BASE 0x40 + 0x07
+
+# NVIF ioctl types + routes (nvif/ioctl.h).
+var NVIF_IOCTL_V0_NEW        = 0x02;
+var NVIF_IOCTL_V0_ROUTE_HIDDEN = 0xFF;  # outer: route to the abi16 channel
+var NVIF_IOCTL_V0_ROUTE_NVIF   = 0x00;  # inner
+
+# Create a class object (e.g. TURING_COMPUTE_A 0xC5C0) as a child of the
+# channel `chid`, via DRM_NOUVEAU_NVIF NEW. `handle` is a channel-unique
+# id (NVK uses (0xbeef+chid)<<16 | low-class-byte). Payload (56 bytes):
+#   outer nvif_ioctl_v0 (24): version0, type=NEW@1, route=0xff@7, token=chid@8, object@16
+#   inner nvif_ioctl_new_v0 (32 @ +24): route=0x00@+7, token@+8, object@+16, handle@+24, oclass@+28
+# token/object are user-side object cookies (NVK passes a pointer); a
+# stable non-zero cookie (the handle) suffices for create-and-use.
+# Returns 0 or -errno.
+fn native_nv_object_new(fd, chid, handle, oclass): i64 {
+    var args[56];
+    memset(&args, 0, 56);
+    store8(&args + 1, NVIF_IOCTL_V0_NEW);          # outer.type
+    store8(&args + 7, NVIF_IOCTL_V0_ROUTE_HIDDEN); # outer.route
+    store64(&args + 8, chid);                       # outer.token = chid
+    store8(&args + 31, NVIF_IOCTL_V0_ROUTE_NVIF);  # inner.route
+    store64(&args + 32, handle);                     # inner.token (cookie)
+    store64(&args + 40, handle);                     # inner.object (cookie)
+    store32(&args + 48, handle);                     # inner.handle
+    store32(&args + 52, oclass);                     # inner.oclass
+    var ioc = native_ioc_encode(_IOC_RW, 56, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x07);
+    return syscall(SYS_IOCTL, fd, ioc, &args);
+}
+
+# Compute a channel-unique NVIF handle for an engine class (NVK idiom:
+# (0xbeef + chid) << 16 | (oclass & 0xff)).
+fn native_nv_object_handle(chid, oclass): i64 {
+    return ((0xbeef + chid) * 0x10000) | (oclass & 0xFF);
+}
+
+# EXEC: submit one pushbuffer (at GPU VA `push_va`, `push_len` bytes) on
+# channel `chid`, signalling `sig_syncobj` on completion. Wait for it via
+# the reused native_syncobj_wait. Returns 0 or -errno. The exec_push and
+# sync structs are stack-local; the exec struct references them by ptr.
+fn native_nv_exec_submit(fd, chid, push_va, push_len, sig_syncobj): i64 {
+    var push[16];
+    memset(&push, 0, 16);
+    store64(&push + 0, push_va);     # exec_push.va
+    store32(&push + 8, push_len);    # exec_push.va_len
+
+    var sig[16];
+    native_nv_sync_build(&sig, sig_syncobj);
+
+    var ex[40];
+    memset(&ex, 0, 40);
+    store32(&ex + 0, chid);          # channel
+    store32(&ex + 4, 1);             # push_count
+    store32(&ex + 12, 1);            # sig_count
+    store64(&ex + 24, &sig);         # sig_ptr
+    store64(&ex + 32, &push);        # push_ptr
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_NOUVEAU_EXEC, &ex);
+}

@@ -17,8 +17,9 @@ detection.
 
 One Cyrius library that answers "set up a GPU device, move bytes on and
 off it, and draw / compute / present with them" for every AGNOS
-downstream. v3.0 ships dual backend (wgpu and native AMD); v4.0 retires
-the wgpu path for AMD. Backend abstraction is the load-bearing v3.0
+downstream. v3.0 ships dual backend (wgpu and native AMD); the AMD wgpu
+path retires at v4.0.1 (v4.0 adds NVIDIA native and keeps AMD wgpu as
+a coexistence window). Backend abstraction is the load-bearing v3.0
 architectural choice — the public API surface doesn't change between
 paths.
 
@@ -66,7 +67,7 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep. Drops
   at v4.0.
 - **libsystemd** — needed by samvada's C shim. Consumer-provided link,
-  not a mabda direct dep. Drops at v4.0 alongside wgpu-native.
+  not a mabda direct dep. Drops at v4.0.1 alongside the AMD wgpu path.
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
@@ -189,7 +190,7 @@ struct-shape tests at the Cyrius layer. HW gates live in the
 - **Own the stack** — every external dep is either an AGNOS package
   (samvada, sakshi, patra, sigil, chitra) or a consumer-provided C
   library (wgpu-native, libsystemd-via-samvada). wgpu-native and
-  libsystemd both retire at v4.0.
+  libsystemd both retire at v4.0.1.
 - **No magic** — every operation measurable, auditable, traceable.
 - **Manual memory** — `alloc / store64 / load64`. Every struct has a
   header comment block with field offsets.

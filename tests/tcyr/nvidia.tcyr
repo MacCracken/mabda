@@ -1,0 +1,783 @@
+# tests/tcyr/nvidia.tcyr — native NVIDIA/nouveau backend (v4.0 Phase N1)
+#
+# CPU asserts for the nouveau enum probe: ioctl-number re-derivation via
+# native_ioc_encode, struct sizes, GETPARAM param ids, the TU116
+# chipset/PCI identity constants, the NVK VM_INIT split, the nouveau
+# driver-name check, the masterless-rc verdict, and the
+# BACKEND_KIND_NVIDIA reservation (punchlist N0.8). No GPU/master/dbus —
+# the device-touching paths live in programs/nvidia_device_enum.cyr.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn test_nv_getparam_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0x00, struct drm_nouveau_getparam[16]).
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GETPARAM_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x00);
+    assert_eq(DRM_IOCTL_NOUVEAU_GETPARAM, expected, "GETPARAM ioctl = 0xC0106440");
+    assert_eq(DRM_IOCTL_NOUVEAU_GETPARAM, 0xC0106440, "GETPARAM precomputed constant");
+    assert_eq(DRM_NOUVEAU_GETPARAM_NR, DRM_COMMAND_BASE + 0x00, "GETPARAM nr = base + 0x00");
+    assert_eq(DRM_NOUVEAU_GETPARAM_SIZE, 16, "getparam struct = 16 bytes");
+    return 0;
+}
+
+fn test_nv_vm_init_ioctl_encoding() {
+    # _IOWR('d', DRM_COMMAND_BASE + 0x10, struct drm_nouveau_vm_init[16]).
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_VM_INIT_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x10);
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_INIT, expected, "VM_INIT ioctl = 0xC0106450");
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_INIT, 0xC0106450, "VM_INIT precomputed constant");
+    assert_eq(DRM_NOUVEAU_VM_INIT_NR, DRM_COMMAND_BASE + 0x10, "VM_INIT nr = base + 0x10");
+    assert_eq(DRM_NOUVEAU_VM_INIT_SIZE, 16, "vm_init struct = 16 bytes");
+    return 0;
+}
+
+fn test_nv_getparam_param_ids() {
+    assert_eq(NOUVEAU_GETPARAM_PCI_VENDOR, 3, "PCI_VENDOR param = 3");
+    assert_eq(NOUVEAU_GETPARAM_PCI_DEVICE, 4, "PCI_DEVICE param = 4");
+    assert_eq(NOUVEAU_GETPARAM_CHIPSET_ID, 11, "CHIPSET_ID param = 11");
+    return 0;
+}
+
+fn test_nv_tu116_identity() {
+    # TU116 chipset is 0x168 (NV168), NOT 0x162 (which is TU102).
+    assert_eq(NV_CHIPSET_TU116, 0x168, "TU116 chipset = NV168 (0x168)");
+    assert_eq(NV_PCI_VENDOR_NVIDIA, 0x10DE, "NVIDIA PCI vendor = 0x10DE");
+    assert_eq(NV_PCI_DEVICE_GTX1660S, 0x21C4, "GTX 1660 SUPER device id = 0x21C4");
+    # boot0 0x168000a1 decodes: chipset = (boot0 >> 20) & 0x1ff.
+    # Division by 0x100000 (= 1<<20) is the toolchain-safe right-shift idiom.
+    var boot0 = 0x168000A1;
+    assert_eq((boot0 / 0x100000) & 0x1FF, NV_CHIPSET_TU116, "boot0 decodes to chipset 0x168");
+    return 0;
+}
+
+fn test_nv_vm_init_kernel_split() {
+    # NVK's verbatim Turing split: kernel manages [512 GiB, 1 TiB).
+    assert_eq(NOUVEAU_VM_KERNEL_RESERVATION_START, 0x8000000000, "kernel VA start = 1<<39 (512 GiB)");
+    assert_eq(NOUVEAU_VM_KERNEL_RESERVATION_SIZE, 0x8000000000, "kernel VA size = 512 GiB");
+    var kernel_end = NOUVEAU_VM_KERNEL_RESERVATION_START + NOUVEAU_VM_KERNEL_RESERVATION_SIZE;
+    assert_eq(kernel_end, 0x10000000000, "kernel end = 1 TiB (1<<40)");
+    # kernel_end must sit inside nouveau's 47-bit VA space (1<<47); the
+    # margin is positive, so the kernel vm_init bound check passes.
+    assert_eq(0x800000000000 - kernel_end, 0x7F0000000000, "1 TiB well under 128 TiB VA ceiling");
+    return 0;
+}
+
+fn test_nv_driver_name_check() {
+    # Hand-build a drm_version struct (name_len at +16, name_ptr at +24).
+    var ver[64];
+    memset(&ver, 0, 64);
+    var name = "nouveau";
+    store64(&ver + 16, strlen(name));
+    store64(&ver + 24, name);
+    assert_eq(native_nv_is_nouveau(&ver), 1, "recognizes nouveau driver");
+
+    # A different driver name must not match.
+    var ver2[64];
+    memset(&ver2, 0, 64);
+    var other = "amdgpu";
+    store64(&ver2 + 16, strlen(other));
+    store64(&ver2 + 24, other);
+    assert_eq(native_nv_is_nouveau(&ver2), 0, "rejects non-nouveau driver");
+
+    # Null name_ptr is safe (returns 0, no deref).
+    var ver3[64];
+    memset(&ver3, 0, 64);
+    assert_eq(native_nv_is_nouveau(&ver3), 0, "null name_ptr is safe");
+    return 0;
+}
+
+fn test_nv_masterless_verdict() {
+    # render-allow set: only EACCES/EPERM mean "master required".
+    assert_eq(native_nv_rc_is_masterless(0), 1, "success = masterless");
+    assert_eq(native_nv_rc_is_masterless(0 - 22), 1, "EINVAL = masterless (bad args, not perm)");
+    assert_eq(native_nv_rc_is_masterless(0 - 38), 1, "ENOSYS = masterless (uAPI reachable)");
+    assert_eq(native_nv_rc_is_masterless(0 - 13), 0, "EACCES = master required");
+    assert_eq(native_nv_rc_is_masterless(0 - 1), 0, "EPERM = master required");
+    return 0;
+}
+
+fn test_nv_gem_new_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GEM_NEW_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x40);
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_NEW, expected, "GEM_NEW ioctl = 0xC0306480");
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_NEW, 0xC0306480, "GEM_NEW precomputed constant");
+    assert_eq(DRM_NOUVEAU_GEM_NEW_SIZE, 48, "gem_new struct = 48 bytes");
+    return 0;
+}
+
+fn test_nv_gem_info_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_GEM_INFO_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x44);
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_INFO, expected, "GEM_INFO ioctl = 0xC0286484");
+    assert_eq(DRM_IOCTL_NOUVEAU_GEM_INFO, 0xC0286484, "GEM_INFO precomputed constant");
+    assert_eq(DRM_NOUVEAU_GEM_INFO_SIZE, 40, "gem_info struct = 40 bytes");
+    return 0;
+}
+
+fn test_nv_gem_domain_flags() {
+    # Single-bit, disjoint, matches nouveau_drm.h.
+    assert_eq(NOUVEAU_GEM_DOMAIN_CPU, 0x1, "CPU = 1<<0");
+    assert_eq(NOUVEAU_GEM_DOMAIN_VRAM, 0x2, "VRAM = 1<<1");
+    assert_eq(NOUVEAU_GEM_DOMAIN_GART, 0x4, "GART = 1<<2");
+    assert_eq(NOUVEAU_GEM_DOMAIN_MAPPABLE, 0x8, "MAPPABLE = 1<<3");
+    assert_eq(NOUVEAU_GEM_DOMAIN_COHERENT, 0x10, "COHERENT = 1<<4");
+    assert_eq(NOUVEAU_GEM_DOMAIN_NO_SHARE, 0x20, "NO_SHARE = 1<<5");
+    # Host-visible composite = GART | MAPPABLE | COHERENT.
+    assert_eq(NOUVEAU_GEM_DOMAIN_HOST,
+    NOUVEAU_GEM_DOMAIN_GART | NOUVEAU_GEM_DOMAIN_MAPPABLE | NOUVEAU_GEM_DOMAIN_COHERENT,
+    "HOST = GART|MAPPABLE|COHERENT (0x1C)");
+    assert_eq(NOUVEAU_GEM_DOMAIN_GART & NOUVEAU_GEM_DOMAIN_VRAM, 0, "GART/VRAM disjoint");
+    return 0;
+}
+
+fn test_nv_gem_new_struct_layout() {
+    # drm_nouveau_gem_new = embedded gem_info(40) + channel_hint(4) + align(4).
+    # Build a req as the kernel would leave it and verify every accessor offset.
+    var req[48];
+    memset(&req, 0, 48);
+    store32(&req + 0, 0x1234);                    # info.handle (out)
+    store32(&req + 4, NOUVEAU_GEM_DOMAIN_HOST);   # info.domain
+    store64(&req + 8, 0x2000);                    # info.size
+    store64(&req + 24, 0xCAFE0000);               # info.map_handle (out)
+    store32(&req + 44, 4096);                     # align
+    assert_eq(native_nv_gem_new_handle(&req), 0x1234, "handle accessor reads +0");
+    assert_eq(native_nv_gem_new_size(&req), 0x2000, "size accessor reads +8");
+    assert_eq(native_nv_gem_new_map_handle(&req), 0xCAFE0000, "map_handle accessor reads +24");
+    assert_eq(load32(&req + 4), NOUVEAU_GEM_DOMAIN_HOST, "domain at +4");
+    assert_eq(load32(&req + 44), 4096, "align at +44");
+    return 0;
+}
+
+fn test_nv_gem_info_struct_layout() {
+    # drm_nouveau_gem_info: handle in at +0, map_handle out at +24.
+    var req[40];
+    memset(&req, 0, 40);
+    store32(&req + 0, 0x77);            # handle (in)
+    store64(&req + 24, 0xBEEF0000);     # map_handle (out)
+    assert_eq(native_nv_gem_info_map_handle(&req), 0xBEEF0000, "gem_info map_handle reads +24");
+    return 0;
+}
+
+fn test_nv_channel_alloc_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_CHANNEL_ALLOC_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x02);
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, expected, "CHANNEL_ALLOC ioctl = 0xC0586442");
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, 0xC0586442, "CHANNEL_ALLOC precomputed");
+    assert_eq(DRM_NOUVEAU_CHANNEL_ALLOC_SIZE, 88, "channel_alloc struct = 88 bytes");
+    return 0;
+}
+
+fn test_nv_vm_bind_ioctl_encoding() {
+    var expected = native_ioc_encode(3, DRM_NOUVEAU_VM_BIND_SIZE, DRM_IOCTL_TYPE,
+    DRM_COMMAND_BASE + 0x11);
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_BIND, expected, "VM_BIND ioctl = 0xC0286451");
+    assert_eq(DRM_IOCTL_NOUVEAU_VM_BIND, 0xC0286451, "VM_BIND precomputed");
+    assert_eq(DRM_NOUVEAU_VM_BIND_SIZE, 40, "vm_bind struct = 40 bytes");
+    return 0;
+}
+
+fn test_nv_channel_free_ioctl_encoding() {
+    # _IOW('d', base + 0x03, drm_nouveau_channel_free[4]).
+    var expected = native_ioc_encode(1, 4, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x03);
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_FREE, expected, "CHANNEL_FREE ioctl = 0x40046443");
+    assert_eq(DRM_IOCTL_NOUVEAU_CHANNEL_FREE, 0x40046443, "CHANNEL_FREE precomputed");
+    return 0;
+}
+
+fn test_nv_channel_engine_constants() {
+    assert_eq(NOUVEAU_FIFO_ENGINE_GR, 0x01, "GR engine = 0x01 (compute)");
+    assert_eq(NOUVEAU_FIFO_ENGINE_CE, 0x30, "CE engine = 0x30 (copy)");
+    assert_eq(DRM_NOUVEAU_VM_BIND_OP_MAP, 0x0, "VM_BIND MAP = 0");
+    assert_eq(DRM_NOUVEAU_VM_BIND_OP_UNMAP, 0x1, "VM_BIND UNMAP = 1");
+    # Safe UMD VA: 64 KiB-aligned, non-null, below the 1<<39 kernel split.
+    assert_eq(NOUVEAU_UMD_VA_BASE, 0x10000, "UMD VA base = 64 KiB");
+    assert_eq(NOUVEAU_UMD_VA_BASE & 0xFFFF, 0, "UMD VA base is 64 KiB-aligned");
+    return 0;
+}
+
+fn test_nv_channel_id_accessor() {
+    # channel (chid) reads back from offset +8 of the alloc struct.
+    var req[88];
+    memset(&req, 0, 88);
+    store32(&req + 8, 0x2A);   # simulate kernel-returned chid
+    assert_eq(native_nv_channel_id(&req), 0x2A, "chid accessor reads +8");
+    return 0;
+}
+
+fn test_nv_vm_bind_op_layout() {
+    # Mirror native_nv_vm_bind_map's op packing; assert byte offsets.
+    var op[40];
+    memset(&op, 0, 40);
+    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);
+    store32(&op + 8, 0x55);          # handle
+    store64(&op + 16, NOUVEAU_UMD_VA_BASE);
+    store64(&op + 32, 0x1000);       # range
+    assert_eq(load32(&op + 0), 0, "op = MAP at +0");
+    assert_eq(load32(&op + 8), 0x55, "handle at +8");
+    assert_eq(load64(&op + 16), 0x10000, "addr at +16");
+    assert_eq(load64(&op + 32), 0x1000, "range at +32");
+    return 0;
+}
+
+fn test_nv_sync_build() {
+    var buf[16];
+    memset(&buf, 0, 16);
+    native_nv_sync_build(&buf, 0x9);
+    assert_eq(load32(&buf + 0), DRM_NOUVEAU_SYNC_SYNCOBJ, "sync flags = SYNCOBJ at +0");
+    assert_eq(load32(&buf + 4), 0x9, "sync handle at +4");
+    assert_eq(load64(&buf + 8), 0, "timeline_value at +8");
+    assert_eq(DRM_NOUVEAU_SYNC_SIZE, 16, "drm_nouveau_sync = 16 bytes");
+    return 0;
+}
+
+fn test_nv_sass_store_deadbeef() {
+    # Embedded SM75 SASS (captured + nvdisasm-verified): counts, launch
+    # ABI for the N4.2 QMD, and byte-exact key dwords.
+    assert_eq(NV_SASS_STORE_DEADBEEF_BYTES, 128, "SASS = 128 bytes");
+    assert_eq(NV_SASS_STORE_DEADBEEF_DWORDS, 16, "SASS = 16 u64 dwords");
+    assert_eq(NV_SASS_STORE_DEADBEEF_REGCOUNT, 4, "regcount = 4 (N4.2 QMD)");
+    assert_eq(NV_SASS_STORE_DEADBEEF_SHMEM, 0, "shared mem = 0");
+    assert_eq(NV_SASS_STORE_DEADBEEF_PARAM_OFF, 0x160, "output ptr at c[0x0][0x160]");
+    assert_eq(NV_SASS_STORE_DEADBEEF_PARAM_SIZE, 8, "param = one u64 ptr");
+
+    # Materialize the program; check byte-exact at key offsets.
+    var prog[128];
+    memset(&prog, 0, 128);
+    var n = native_nv_sass_store_deadbeef(&prog);
+    assert_eq(n, 128, "writes 128 bytes");
+    assert_eq(load64(&prog + 0), 0x00000a0000017a02, "first instr: MOV R1, c[0x0][0x28]");
+    assert_eq(load64(&prog + 16), 0xdeadbeef00007802, "MOV R0, 0xdeadbeef dword");
+    assert_eq(load64(&prog + 48), 0x00000000ff007986, "STG.E [UR4], R0 opcode dword");
+    assert_eq(load64(&prog + 56), 0x000fe2000c114904, "STG control word = GPU scope (.STRONG.GPU, not .SYS)");
+    assert_eq(load64(&prog + 64), 0x000000000000794d, "EXIT dword");
+    return 0;
+}
+
+fn test_nv_method_header_golden() {
+    # Golden vectors read directly from the NVK dispatch pushbuffer (N0.7c).
+    assert_eq(native_nv_method_header(NV_OP_INCR, 1, NVC5C0_SEND_PCAS_A, 1), 0x200120AD,
+    "SEND_PCAS_A header == capture [12]");
+    assert_eq(native_nv_method_inline(1, NVC5C0_SEND_SIGNALING_PCAS_B, 3), 0x800320AF,
+    "SEND_SIGNALING_PCAS_B inline == capture [14]");
+    assert_eq(native_nv_method_header(NV_OP_INCR, 1, NVC5C0_SET_OBJECT, 1), 0x20012000,
+    "SET_OBJECT header");
+    return 0;
+}
+
+fn test_nv_push_dispatch() {
+    var buf[64];
+    memset(&buf, 0, 64);
+    var n = native_nv_push_dispatch(&buf, 0x3ffdf5c800);   # the capture's qmd_va
+    assert_eq(n, 44, "dispatch push = 44 bytes (11 dwords)");
+    assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
+    assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
+    assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header (0x02a0 cnt2)");
+    assert_eq(load32(&buf + 12), 0, "shared window arg0");
+    assert_eq(load32(&buf + 16), 0xFE000000, "shared window base (== capture)");
+    assert_eq(load32(&buf + 20), 0x200221EC, "LOCAL_MEMORY_WINDOW header (0x07b0 cnt2)");
+    assert_eq(load32(&buf + 24), 0, "local window arg0");
+    assert_eq(load32(&buf + 28), 0xFF000000, "local window base (== capture)");
+    assert_eq(load32(&buf + 32), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 36), 0x3ffdf5c8, "qmd_va>>8 (== capture arg)");
+    assert_eq(load32(&buf + 40), 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    return 0;
+}
+
+fn test_nv_object_handle() {
+    # NVK idiom (0xbeef+chid)<<16 | (oclass&0xff); capture chid9 -> 0xbef800c0.
+    assert_eq(native_nv_object_handle(9, TURING_COMPUTE_A), 0xbef800c0, "NVIF handle chid9/0xc5c0");
+    return 0;
+}
+
+fn test_nv_exec_nvif_ioctl_encoding() {
+    var ex = native_ioc_encode(3, DRM_NOUVEAU_EXEC_SIZE, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x12);
+    assert_eq(DRM_IOCTL_NOUVEAU_EXEC, ex, "EXEC ioctl = 0xC0286452");
+    assert_eq(DRM_IOCTL_NOUVEAU_EXEC, 0xC0286452, "EXEC precomputed constant");
+    assert_eq(DRM_NOUVEAU_EXEC_SIZE, 40, "exec struct = 40 bytes");
+    # NVIF is size-dependent; a 56-byte NEW payload.
+    var nvif56 = native_ioc_encode(3, 56, DRM_IOCTL_TYPE, DRM_COMMAND_BASE + 0x07);
+    assert_eq(nvif56, 0xC0386447, "NVIF(56) ioctl = 0xC0386447");
+    return 0;
+}
+
+fn test_nv_qmd_build() {
+    # Build with the golden's VAs so the fixed fields are directly comparable
+    # to the captured QMD; per-kernel fields use our ptxas regcount=4.
+    var qmd[256];
+    native_nv_qmd_build(&qmd, 0x3ffdf9c780, 4, 0x3ffdf5c000, 0x200);
+    assert_eq(NV_QMD_SIZE, 256, "QMD = 256 bytes");
+    # Golden-verified fixed config fields.
+    assert_eq(load32(&qmd + 0x10), 0x40, "SM_GLOBAL_CACHING (== golden)");
+    assert_eq(load32(&qmd + 0x2c), 0x04000000, "API_VISIBLE_CALL_LIMIT (== golden)");
+    assert_eq(load32(&qmd + 0x30), 1, "grid X");
+    assert_eq(load32(&qmd + 0x34), 1, "grid Y");
+    assert_eq(load32(&qmd + 0x38), 1, "grid Z");
+    assert_eq(load32(&qmd + 0x44), 0x22240000, "shared-mem config (== golden)");
+    assert_eq(load32(&qmd + 0x48), 0x00010022, "ver 2.2 + blockX (== golden)");
+    assert_eq(load32(&qmd + 0x4c), 0x00010001, "blockY/Z (== golden)");
+    # dw20: VALID[0]=1 | REGISTER_COUNT_V=4 | TARGET_SM_CONFIG=9.
+    assert_eq(load32(&qmd + 0x50), 0x00120401, "valid0|regcount_v=4|target=9");
+    # CONSTANT_BUFFER[0]: addr lo/hi + SIZE_SHIFTED4 (0x200/16 = 0x20).
+    assert_eq(load32(&qmd + 0x80), 0xfdf5c000, "cbuf0 addr lo");
+    assert_eq(load32(&qmd + 0x84), 0x0100003f, "cbuf0 addr hi + size_sh4=0x20");
+    # PROGRAM_ADDRESS unshifted lo/hi.
+    assert_eq(load32(&qmd + 0xc0), 0xfdf9c780, "program addr lo");
+    assert_eq(load32(&qmd + 0xc4), 0x3f, "program addr hi");
+    # SASS_VERSION / legacy REGISTER_COUNT / local mem stay 0.
+    assert_eq(load32(&qmd + 0x78), 0, "legacy REGISTER_COUNT + local-mem-high = 0");
+    assert_eq(load32(&qmd + 0x7c), 0, "SASS_VERSION + prefetch = 0");
+    return 0;
+}
+
+fn test_nv_backend_kind_reserved() {
+    # Punchlist N0.8: NVIDIA kind reserved up front, no struct change.
+    assert_eq(BACKEND_KIND_NVIDIA, 3, "BACKEND_KIND_NVIDIA == 3");
+    # kind is a u64 value (not a fnptr) at slot offset +80.
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_NVIDIA);
+    assert_eq(load64(b + 80), BACKEND_KIND_NVIDIA, "kind stored at slot +80");
+    assert_eq(backend_kind(b), BACKEND_KIND_NVIDIA, "backend_kind() reads +80");
+    return 0;
+}
+
+# N4.7 — backend_nvidia_new() fills the v0 slot block (0..80) + kind, and the
+# NVIDIA GpuContext / buffer / shmod field maps are pinned. backend_is_complete
+# stays honest: v0-filled but texture range (88..) still zero -> reports
+# incomplete (by design until N6/N7/N8). No HW — pure slot-table + layout.
+fn test_nv_backend_v0_slots() {
+    # SASS shader-source tag (Phase N5), distinct from GFX9.
+    assert_eq(SHADER_SRC_SASS, 3, "SHADER_SRC_SASS == 3");
+
+    var b = backend_nvidia_new();
+    # Every v0 fnptr slot (0..80, step 8) must be non-zero.
+    var off = 0;
+    while (off < BACKEND_FNPTR_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v0 slot filled");
+        off = off + 8;
+    }
+    # kind at +80.
+    assert_eq(backend_kind(b), BACKEND_KIND_NVIDIA, "nvidia_new kind == NVIDIA");
+    # Honest completeness: v0 filled, texture+ ranges still zero -> incomplete.
+    assert_eq(backend_is_complete(b), 0, "nvidia backend incomplete past v0 (honest)");
+    # Specific load-bearing slots resolve to the NVIDIA impls.
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH), 0, "dispatch slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_BUFFER_CREATE), 0, "buffer_create slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SHADER_MODULE_CREATE), 0, "shader_create slot set");
+
+    # NVIDIA GpuContext field map: the Backend* MUST live at +32 (the only
+    # cross-backend-fixed field, read by gpu_ctx_backend).
+    assert_eq(NV_CTX_BACKEND, 32, "nvidia ctx backend at +32 (canonical)");
+    assert_eq(NV_CTX_FD, 0, "nvidia ctx fd at +0");
+    assert_eq(NV_CTX_CHID, 8, "nvidia ctx chid at +8");
+    # The whole NVIDIA ctx field map fits the 176-byte GpuContext blob.
+    assert_eq(NV_CTX_PARAM_ADDR < GPU_CONTEXT_SIZE, 1, "nvidia ctx fields fit GpuContext");
+
+    # Buffer / shmod struct shapes — bp's VA is read at +8 by the dispatch.
+    assert_eq(NV_BUF_VA, 8, "nvidia buf VA at +8 (bp output ptr)");
+    assert_eq(NV_BUF_STRUCT_SIZE, 32, "nvidia buf struct = 32 bytes");
+    assert_eq(NV_SHMOD_VA, 8, "nvidia shmod program VA at +8");
+    assert_eq(NV_SHMOD_REGCOUNT, 24, "nvidia shmod regcount at +24");
+    return 0;
+}
+
+# N6 — backend_nvidia_new() also fills the v1 texture slot block (88..120):
+# host-visible linear RGBA8 create/write/read/release. backend_is_complete
+# stays honest: v0 + texture filled but render range (120..) still zero ->
+# reports incomplete. No HW — slot-table + texture field map.
+fn test_nv_backend_v1_texture_slots() {
+    var b = backend_nvidia_new();
+    # Every v1 texture fnptr slot (88..120, step 8) must be non-zero.
+    var off = BACKEND_TEXTURE_SLOTS_BEGIN;
+    while (off < BACKEND_TEXTURE_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v1 texture slot filled");
+        off = off + 8;
+    }
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_RGBA8), 0, "tex create slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_WRITE), 0, "tex write slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_READ), 0, "tex read slot set");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_TEXTURE_RELEASE), 0, "tex release slot set");
+    # Honest: render range (120..176) still zero -> incomplete past textures.
+    assert_eq(backend_is_complete(b), 0, "nvidia incomplete past textures (honest)");
+
+    # NV_TEX field map (the NativeTexture shape).
+    assert_eq(NV_TEX_VA, 8, "nvidia tex VA at +8");
+    assert_eq(NV_TEX_SIZE, 24, "nvidia tex logical size at +24");
+    assert_eq(NV_TEX_WIDTH, 32, "nvidia tex width at +32");
+    assert_eq(NV_TEX_HEIGHT, 36, "nvidia tex height at +36");
+    assert_eq(NV_TEX_STRUCT_SIZE, 48, "nvidia tex struct = 48 bytes");
+    assert_eq(MABDA_TEXFMT_RGBA8, 0, "RGBA8 fmt tag == 0");
+    return 0;
+}
+
+# N7.1 + N7.5 — backend_nvidia_new() fills the ENTIRE v2 render range
+# (120..176): render_target create/release (N7.1) + pipeline create/release +
+# pass begin/draw/end (N7.5). backend_is_complete still reports 0 because the
+# NVIDIA backend does not fill the v3 surface / mipmap / later ranges — honest.
+# No HW — slot-table + RT/PIPE/PASS field maps.
+fn test_nv_backend_v2_render_slots() {
+    var b = backend_nvidia_new();
+    # Every v2 render fnptr slot (120..176, step 8) must now be non-zero.
+    var off = BACKEND_RENDER_SLOTS_BEGIN;
+    while (off < BACKEND_RENDER_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v2 render slot filled");
+        off = off + 8;
+    }
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8), 0, "RT create @120");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE), 0, "pipeline_create @136");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN), 0, "pass_begin @152");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_DRAW), 0, "pass_draw @160");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_RENDER_PASS_END), 0, "pass_end @168");
+    # Still incomplete: NVIDIA fills v0+v1+v2 (and, since N8.5, v3 surface) but
+    # not the mipmap / queue / texfmt / copy / sampleable ranges past v3 surface.
+    assert_eq(backend_is_complete(b), 0, "nvidia incomplete past v3 surface (no mipmap+)");
+
+    # NV_RT field map (the AMD NATIVE_RT shape — handle/va/addr/size/w/h, no fmt).
+    assert_eq(NV_RT_VA, 8, "nvidia RT VA at +8");
+    assert_eq(NV_RT_STRUCT_SIZE, 40, "nvidia RT struct = 40 bytes");
+    # NV_PIPE field map: VS/FS program VAs + regcounts.
+    assert_eq(NV_PIPE_VS_VA, 0, "nvidia pipe VS VA at +0");
+    assert_eq(NV_PIPE_FS_VA, 8, "nvidia pipe FS VA at +8");
+    assert_eq(NV_PIPE_VS_REGCOUNT, 16, "nvidia pipe VS regcount at +16");
+    assert_eq(NV_PIPE_FS_REGCOUNT, 24, "nvidia pipe FS regcount at +24");
+    assert_eq(NV_PIPE_STRUCT_SIZE, 32, "nvidia pipe struct = 32 bytes");
+    # NV_PASS field map: ctx + RT + clear color.
+    assert_eq(NV_PASS_CTX, 0, "nvidia pass ctx at +0");
+    assert_eq(NV_PASS_RT, 8, "nvidia pass RT at +8");
+    assert_eq(NV_PASS_CLEAR_COLOR, 16, "nvidia pass clear color at +16");
+    assert_eq(NV_PASS_STRUCT_SIZE, 24, "nvidia pass struct = 24 bytes");
+    return 0;
+}
+
+# N6.2b — Turing TIC/TSC descriptor builders, byte-diffed against the N6.2a
+# NVK golden (docs/development/nvidia-n6-capture-notes.md) + the empirical
+# multi-size capture. mabda emits PITCH (linear) TICs, not the golden's
+# BLOCKLINEAR — so dw0/dw1/dw4/dw5/dw6 match the golden (shared, ground-truth
+# validated) while dw2/dw3 carry the PITCH header + row pitch. (High-bit
+# dwords masked & 0xFFFFFFFF against load32 sign-extension.)
+fn test_nv_tic_tsc_build() {
+    var tic[32];
+    native_nv_tic_build_2d_rgba8(&tic, 0x3ffdf9c000, 1, 1);
+    assert_eq(load32(&tic +  0) & 0xFFFFFFFF, 0x58D24908, "TIC dw0 format = golden");
+    assert_eq(load32(&tic +  4) & 0xFFFFFFFF, 0xFDF9C000, "TIC dw1 addr_lo = golden");
+    assert_eq(load32(&tic +  8) & 0xFFFFFFFF, 0x0040003F, "TIC dw2 PITCH header (golden=0x60.. blocklinear)");
+    assert_eq(load32(&tic + 12) & 0xFFFFFFFF, 0x00070001, "TIC dw3 pitch=32 (golden gob=0x..00)");
+    assert_eq(load32(&tic + 16) & 0xFFFFFFFF, 0xE0800000, "TIC dw4 (W-1|2D|border) = golden");
+    assert_eq(load32(&tic + 20) & 0xFFFFFFFF, 0x80000000, "TIC dw5 (H-1|norm) = golden");
+    assert_eq(load32(&tic + 24) & 0xFFFFFFFF, 0x03000000, "TIC dw6 = golden");
+    assert_eq(load32(&tic + 28) & 0xFFFFFFFF, 0, "TIC dw7 = 0");
+
+    # Dimension + pitch parameterize correctly (cross-checked vs the empirical
+    # 8x4 / 16x16 captures: dw4 low = W-1, dw5 low = H-1, pitch = round_up(W*4,32)/32).
+    var tic2[32];
+    native_nv_tic_build_2d_rgba8(&tic2, 0x3ffdf9c000, 8, 4);
+    assert_eq(load32(&tic2 + 16) & 0xFFFF, 7, "TIC 8x4 WIDTH_MINUS_ONE = 7");
+    assert_eq(load32(&tic2 + 20) & 0xFFFF, 3, "TIC 8x4 HEIGHT_MINUS_ONE = 3");
+    assert_eq(load32(&tic2 + 12) & 0xFFFFFFFF, 0x00070001, "TIC 8x4 pitch = 32/32 = 1");
+    var tic3[32];
+    native_nv_tic_build_2d_rgba8(&tic3, 0x3ffdf9c000, 16, 16);
+    assert_eq(load32(&tic3 + 16) & 0xFFFF, 15, "TIC 16x16 WIDTH_MINUS_ONE = 15");
+    assert_eq(load32(&tic3 + 12) & 0xFFFFFFFF, 0x00070002, "TIC 16x16 pitch = 64/32 = 2");
+
+    # TSC reproduces the golden NEAREST / CLAMP_TO_EDGE descriptor exactly.
+    var tsc[32];
+    native_nv_tsc_build_nearest_clamp(&tsc);
+    assert_eq(load32(&tsc + 0) & 0xFFFFFFFF, 0x00026092, "TSC dw0 = golden (CLAMP_TO_EDGE)");
+    assert_eq(load32(&tsc + 4) & 0xFFFFFFFF, 0x00000291, "TSC dw1 = golden (NEAREST)");
+    assert_eq(load32(&tsc + 8) & 0xFFFFFFFF, 0, "TSC dw2 = 0 (LOD clamps to base)");
+    return 0;
+}
+
+# N6.2c-i — the bound-texture sampling SASS (ptxas-captured, STG patched to
+# GPU scope). Pins the byte count, the launch ABI, and key instructions: the
+# bound TEX (TIC 0 / TSC 0x58 immediates), the ULDC of the output ptr at
+# c[0x0]+0x168, and the GPU-scope STG (control word patched from .SYS — .SYS
+# hangs on a GART output BO, the proven store-kernel finding).
+fn test_nv_sass_sample_tex() {
+    var sass[256];
+    var n = native_nv_sass_sample_tex(&sass);
+    assert_eq(n, 256, "sample_tex SASS = 256 bytes");
+    assert_eq(NV_SASS_SAMPLE_TEX_BYTES, 256, "sample_tex bytes const");
+    assert_eq(NV_SASS_SAMPLE_TEX_REGCOUNT, 10, "sample_tex regcount = 10");
+    assert_eq(NV_SASS_SAMPLE_TEX_PARAM_OFF, 0x168, "sample_tex out param @ 0x168");
+    assert_eq(NV_SASS_SAMPLE_TEX_TIC_INDEX, 0, "sample_tex TIC index = 0");
+    assert_eq(NV_SASS_SAMPLE_TEX_TSC_INDEX, 0x58, "sample_tex TSC index = 0x58");
+    assert_eq(load64(&sass + 48),  0x3000580206027b60, "sample_tex TEX op (bound TIC0/TSC0x58)");
+    assert_eq(load64(&sass + 64),  0x00005a0000047ab9, "sample_tex ULDC out ptr @0x168");
+    assert_eq(load64(&sass + 128), 0x00000004ff007986, "sample_tex STG opcode");
+    assert_eq(load64(&sass + 136), 0x000fe2000c114904, "sample_tex STG ctl = GPU scope (patched from .SYS)");
+    return 0;
+}
+
+# N6.2c-ii — the UINT TIC variant the sampling dispatch binds. The sampling
+# SASS reads raw integer texels (TEX -> PRMT, no denormalize), so the header
+# must be RGBA8_UINT, not the UNORM the NVK normalized-float probe used. UINT
+# differs from UNORM in dw0 ONLY: the four DATA_TYPE fields 2->4 (XOR 6 each =
+# 0x6DB00); every other dword is type-agnostic and identical.
+fn test_nv_tic_build_uint() {
+    var u[32];
+    var s[32];
+    native_nv_tic_build_2d_rgba8_uint(&u, 0x3ffdf9c000, 1, 1);
+    native_nv_tic_build_2d_rgba8(&s, 0x3ffdf9c000, 1, 1);
+    assert_eq(load32(&u + 0) & 0xFFFFFFFF, 0x58D49208, "UINT TIC dw0 = RGBA8_UINT");
+    assert_eq(NV_TIC_FORMAT_RGBA8_UINT, 0x58D49208, "RGBA8_UINT format const");
+    assert_eq((load32(&u + 0) ^ load32(&s + 0)) & 0xFFFFFFFF, 0x0006DB00,
+    "UINT^UNORM dw0 = the four DATA_TYPE fields (2->4) only");
+    assert_eq(load32(&u + 4) & 0xFFFFFFFF, load32(&s + 4) & 0xFFFFFFFF, "UINT dw1 == UNORM dw1");
+    assert_eq(load32(&u + 8) & 0xFFFFFFFF, load32(&s + 8) & 0xFFFFFFFF, "UINT dw2 == UNORM dw2");
+    assert_eq(load32(&u + 12) & 0xFFFFFFFF, load32(&s + 12) & 0xFFFFFFFF, "UINT dw3 == UNORM dw3");
+    assert_eq(load32(&u + 16) & 0xFFFFFFFF, load32(&s + 16) & 0xFFFFFFFF, "UINT dw4 == UNORM dw4");
+    assert_eq(load32(&u + 20) & 0xFFFFFFFF, load32(&s + 20) & 0xFFFFFFFF, "UINT dw5 == UNORM dw5");
+    assert_eq(load32(&u + 24) & 0xFFFFFFFF, load32(&s + 24) & 0xFFFFFFFF, "UINT dw6 == UNORM dw6");
+    return 0;
+}
+
+# N6.2c-ii — the sampling-dispatch pushbuffer: the N4 store dispatch (SET_OBJECT
+# + memory windows + SEND_PCAS) plus the TIC/TSC pool binds and their cache
+# invalidates. Every method offset / header verified against clc5c0.h + NVK
+# (nvk_queue.c / nvk_cmd_dispatch.c). These are the silent-hang-prone bytes, so
+# pin them all. (qmd_va 0x200000, TIC pool 0x700000, TSC pool 0x800000.)
+fn test_nv_push_dispatch_sample() {
+    var buf[96];
+    memset(&buf, 0, 96);
+    var n = native_nv_push_dispatch_sample(&buf, 0x200000, 0x700000, 0x800000);
+    assert_eq(n, 88, "sample dispatch push = 88 bytes (22 dwords)");
+    assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
+    assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
+    assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header");
+    assert_eq(load32(&buf + 16) & 0xFFFFFFFF, 0xFE000000, "shared window base");
+    assert_eq(load32(&buf + 20), 0x200221EC, "LOCAL_MEMORY_WINDOW header");
+    assert_eq(load32(&buf + 28) & 0xFFFFFFFF, 0xFF000000, "local window base");
+    assert_eq(load32(&buf + 32), 0x2003255D, "SET_TEX_HEADER_POOL_A header (0x1574 cnt3)");
+    assert_eq(load32(&buf + 36), 0, "TIC pool addr upper");
+    assert_eq(load32(&buf + 40), 0x700000, "TIC pool addr lower");
+    assert_eq(load32(&buf + 44), 0x7FF, "TIC pool MAXIMUM_INDEX");
+    assert_eq(load32(&buf + 48) & 0xFFFFFFFF, 0x80002091,
+    "INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI (0x0244 immd)");
+    assert_eq(load32(&buf + 52), 0x20032557, "SET_TEX_SAMPLER_POOL_A header (0x155C cnt3)");
+    assert_eq(load32(&buf + 56), 0, "TSC pool addr upper");
+    assert_eq(load32(&buf + 60), 0x800000, "TSC pool addr lower");
+    assert_eq(load32(&buf + 64), 0x7FF, "TSC pool MAXIMUM_INDEX");
+    assert_eq(load32(&buf + 68) & 0xFFFFFFFF, 0x80002509,
+    "INVALIDATE_SAMPLER_CACHE_NO_WFI (0x1424 immd)");
+    assert_eq(load32(&buf + 72) & 0xFFFFFFFF, 0x800020A6,
+    "INVALIDATE_SKED_CACHES (0x0298 immd)");
+    assert_eq(load32(&buf + 76), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 80), 0x2000, "qmd_va >> 8 (0x200000 >> 8)");
+    assert_eq(load32(&buf + 84) & 0xFFFFFFFF, 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    return 0;
+}
+
+# N7.2 — the clc597 (TURING_A 0xC597) draw pushbuffer. Pins every load-bearing
+# method/arg of native_nv_push_draw against the N7.2a verified design
+# (docs/development/nvidia-n7-capture-notes.md): the linear color target
+# (pitch/MEMORY=LAYOUT_PITCH), the RGBA write mask + raster gate, the VS/FS
+# program binds, the must-emit topology-control, and the fused Turing draw.
+# Headers are re-derived via the method-encoding primitives (checks
+# method+op+imm); INCR args are pinned literally. (qmd-free; bare 3D draw.)
+fn test_nv_push_draw() {
+    var dp[56];
+    memset(&dp, 0, 56);
+    store64(&dp + NV_DRAW_RT_VA,       0x130000);
+    store64(&dp + NV_DRAW_RT_WIDTH,    64);
+    store64(&dp + NV_DRAW_RT_HEIGHT,   64);
+    store64(&dp + NV_DRAW_VS_VA,       0x140000);
+    store64(&dp + NV_DRAW_FS_VA,       0x150000);
+    store64(&dp + NV_DRAW_VS_REGCOUNT, 24);
+    store64(&dp + NV_DRAW_FS_REGCOUNT, 24);
+
+    var buf[512];
+    memset(&buf, 0, 512);
+    var len = native_nv_push_draw(&buf, &dp, 3);
+    assert_eq(len, 288, "draw push = 288 bytes (72 dwords)");
+
+    # SET_OBJECT = 3D class (0xC597) on the graphics subchannel (0).
+    assert_eq(load32(&buf + 0) & 0xFFFFFFFF,
+    native_nv_method_header(NV_OP_INCR, NV_GRAPHICS_SUBC, NVC5C0_SET_OBJECT, 1), "SET_OBJECT header subc0");
+    assert_eq(load32(&buf + 4), 0xC597, "SET_OBJECT arg = TURING_A");
+    assert_eq(TURING_A, 0xC597, "TURING_A class const");
+
+    # Linear color target (the key N7 result): byte pitch + LAYOUT_PITCH.
+    assert_eq(load32(&buf + 12) & 0xFFFFFFFF, 0x00400000, "SURFACE_CLIP_H = width<<16 (64)");
+    assert_eq(load32(&buf + 28), 0x130000, "COLOR_TARGET ADDRESS_LOWER = rt_va");
+    assert_eq(load32(&buf + 32), 0x100, "COLOR_TARGET WIDTH = byte pitch (256)");
+    assert_eq(load32(&buf + 40), 0xD5, "COLOR_TARGET FORMAT = A8B8G8R8");
+    assert_eq(load32(&buf + 44) & 0xFFFFFFFF, 0x1000, "COLOR_TARGET MEMORY = LAYOUT_PITCH");
+    assert_eq(load32(&buf + 48), 1, "COLOR_TARGET THIRD_DIMENSION = 1");
+    assert_eq(load32(&buf + 52), 0, "COLOR_TARGET ARRAY_PITCH = 0 (linear)");
+
+    # The two silent-blank gates: RGBA write mask + raster enable.
+    assert_eq(load32(&buf + 68) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_CT_WRITE, 0x1111), "CT_WRITE = RGBA mask 0x1111");
+    assert_eq(load32(&buf + 148) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_RASTER_ENABLE, 1), "RASTER_ENABLE = 1 (the gate)");
+
+    # Viewport scale = width/2, height/2, 1.0 as f32 (NDC -> [0,64]).
+    assert_eq(load32(&buf + 80) & 0xFFFFFFFF, 0x42000000, "VIEWPORT_SCALE_X = 32.0 (width/2)");
+    assert_eq(load32(&buf + 88) & 0xFFFFFFFF, 0x3F800000, "VIEWPORT_SCALE_Z = 1.0");
+
+    # VS (stage 1) + FS (stage 5) bind; program addr lower = the SPH VA.
+    assert_eq(load32(&buf + 184) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, 0x2040, 0x11), "SET_PIPELINE_SHADER(1) = enable|VERTEX");
+    assert_eq(load32(&buf + 196), 0x140000, "VS PROGRAM_ADDRESS_B = vs_va");
+    assert_eq(load32(&buf + 204), 24, "VS REGISTER_COUNT = 24");
+    assert_eq(load32(&buf + 224) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, 0x2140, 0x51), "SET_PIPELINE_SHADER(5) = enable|PIXEL");
+    assert_eq(load32(&buf + 236), 0x150000, "FS PROGRAM_ADDRESS_B = fs_va");
+    assert_eq(load32(&buf + 244), 24, "FS REGISTER_COUNT = 24");
+    assert_eq(load32(&buf + 248), 4, "FS BINDING group = FRAGMENT(4)");
+
+    # Topology (must-emit control) + the fused Turing draw.
+    assert_eq(load32(&buf + 252) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_PRIMITIVE_TOPOLOGY_CONTROL, 1),
+    "PRIMITIVE_TOPOLOGY_CONTROL = SEPARATE (must-emit, not in capture)");
+    assert_eq(load32(&buf + 256) & 0xFFFFFFFF,
+    native_nv_method_inline(NV_GRAPHICS_SUBC, NVC597_SET_PRIMITIVE_TOPOLOGY, 4), "PRIMITIVE_TOPOLOGY = TRIANGLELIST");
+    assert_eq(load32(&buf + 268) & 0xFFFFFFFF, 0x200, "DRAW_CONTROL_A = INSTANCE_ITERATE_ENABLE");
+    assert_eq(load32(&buf + 272), 1, "DRAW_CONTROL_B = instance_count 1");
+    assert_eq(load32(&buf + 276) & 0xFFFFFFFF,
+    native_nv_method_header(NV_OP_INCR, NV_GRAPHICS_SUBC, NVC597_DRAW_VERTEX_ARRAY_BEGIN_END_A, 2),
+    "DRAW_VERTEX_ARRAY_BEGIN_END_A header");
+    assert_eq(load32(&buf + 280), 0, "BEGIN_END_A = first_vertex 0");
+    assert_eq(load32(&buf + 284), 3, "BEGIN_END_B = vertex_count 3 (fires the draw)");
+    return 0;
+}
+
+# N7.3 — the graphics VS/FS programs (128-byte SPH + SM75 SASS), captured from
+# NVK compiling probe_render.{vert,frag}. Pins the byte counts, the SPH headers
+# (SphType/ShaderType + the FS omap_targets / VS imap), and the load-bearing
+# SASS instructions (the FS 1.0-alpha constant, the VS VertexID load + position
+# store, the EXITs). Both are self-contained (no cbuf).
+fn test_nv_sass_render() {
+    var buf[512];
+
+    # --- fragment shader (solid color) ---
+    memset(&buf, 0, 512);
+    var flen = native_nv_sass_render_fs(&buf);
+    assert_eq(flen, 272, "render FS = 272 bytes (128 SPH + 144 SASS)");
+    assert_eq(NV_SASS_RENDER_FS_BYTES, 272, "FS bytes const");
+    assert_eq(NV_SASS_RENDER_FS_REGCOUNT, 24, "FS regcount const");
+    assert_eq(load64(&buf + 0), 0x25482, "FS SPH CommonWord0 (SphType=PS, ShaderType=PIXEL, Version=4)");
+    assert_eq(load64(&buf + 72), 0xF, "FS SPH omap_targets = RT0 RGBA");
+    assert_eq(load64(&buf + 128), 0x3f80000000037882, "FS SASS[0] = UMOV UR3, 1.0 (alpha)");
+    assert_eq(load64(&buf + 256), 0x000000000000794d, "FS SASS ends at EXIT");
+
+    # --- vertex shader (fullscreen triangle from VertexID) ---
+    memset(&buf, 0, 512);
+    var vn = native_nv_sass_render_vs(&buf);
+    assert_eq(vn, 352, "render VS = 352 bytes (128 SPH + 224 SASS)");
+    assert_eq(NV_SASS_RENDER_VS_BYTES, 352, "VS bytes const");
+    assert_eq(NV_SASS_RENDER_VS_REGCOUNT, 24, "VS regcount const");
+    assert_eq(load64(&buf + 0), 0x02020481, "VS SPH CommonWord0 (SphType=VTG, ShaderType=VERTEX, Version=4)");
+    assert_eq(load64(&buf + 128), 0x0002fcffff017321, "VS SASS[0] = ALD R1, a[0x2fc] (VertexID)");
+    assert_eq(load64(&buf + 320), 0x00007000ff007322, "VS SASS = AST.128 a[0x70], R0 (gl_Position)");
+    assert_eq(load64(&buf + 336), 0x000000000000794d, "VS SASS ends at EXIT");
+    return 0;
+}
+
+# N8.1 — the nouveau KMS topology probe reuses the GENERIC (driver-agnostic)
+# DRM KMS ABI: the same connector/mode constants the AMD path uses hold on the
+# nouveau card fd. (native_nv_is_nouveau — the card-node driver gate — is also
+# covered by test_nv_driver_name_check; the full KMS struct shapes by kms.tcyr.
+# This pins the specific constants the N8.1 probe reads + the driver gate.)
+fn test_nv_kms_topology_constants() {
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONN_ID, 48, "connector struct conn_id @48");
+    assert_eq(DRM_MODE_GET_CONNECTOR_CONNECTION, 60, "connector struct connection @60");
+    assert_eq(DRM_MODE_CONNECTED, 1, "DRM_MODE_CONNECTED = 1");
+    assert_eq(DRM_MODE_TYPE_PREFERRED, 0x08, "DRM_MODE_TYPE_PREFERRED = 0x08");
+    # N8.2 — the scanout BO domain (a linear VRAM BO is the scanout source).
+    assert_eq(NOUVEAU_GEM_DOMAIN_VRAM, 0x2, "scanout BO domain = VRAM");
+    # The driver gate the probe uses to pick the nouveau card node from card0..9.
+    var ver[64];
+    memset(&ver, 0, 64);
+    store64(&ver + 16, strlen("nouveau"));
+    store64(&ver + 24, "nouveau");
+    assert_eq(native_nv_is_nouveau(&ver), 1, "probe picks the nouveau card via driver name");
+    return 0;
+}
+
+# N8.5 — backend_nvidia_new() fills the v3 surface range (176..208): the
+# nouveau double-buffered KMS present slots reachable through the public
+# gpu_surface_* API. backend_is_complete stays 0 (mipmap+ ranges unfilled). No
+# HW — slot-table presence + NvSurface / NV_SFB field maps + the ctx-overlay
+# relocation that keeps the param block clear of the +96/+104 surface stashes.
+fn test_nv_backend_v3_surface_slots() {
+    var b = backend_nvidia_new();
+    # Every v3 surface fnptr slot (176..208, step 8) must now be non-zero.
+    var off = BACKEND_SURFACE_SLOTS_BEGIN;
+    while (off < BACKEND_SURFACE_SLOTS_END) {
+        assert_neq(backend_get_slot(b, off), 0, "nvidia v3 surface slot filled");
+        off = off + 8;
+    }
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE), 0, "surface_configure @176");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE), 0, "surface_acquire @184");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_PRESENT), 0, "surface_present @192");
+    assert_neq(backend_get_slot(b, BACKEND_SLOT_SURFACE_RELEASE), 0, "surface_release @200");
+    # Honest: still incomplete (mipmap / queue / texfmt / copy / sampleable zero).
+    assert_eq(backend_is_complete(b), 0, "nvidia still incomplete after v3 surface");
+
+    # NvSurface field map (232 bytes): the two scanout FBs + saved-CRTC blob.
+    assert_eq(NV_SURFACE_CARD_FD, 0, "NvSurface card_fd at +0");
+    assert_eq(NV_SURFACE_RENDER_FD, 4, "NvSurface render_fd at +4");
+    assert_eq(NV_SURFACE_STATE, 8, "NvSurface state at +8");
+    assert_eq(NV_SURFACE_FRONT, 24, "NvSurface front at +24");
+    assert_eq(NV_SURFACE_FB0, 48, "NvSurface fb0 at +48");
+    assert_eq(NV_SURFACE_FB1, 88, "NvSurface fb1 at +88 (fb0 + 40)");
+    assert_eq(NV_SURFACE_SAVED, 128, "NvSurface saved CRTC at +128 (fb1 + 40)");
+    assert_eq(NV_SURFACE_STRUCT_SIZE, 232, "NvSurface = 232 bytes (128 + 104 saved)");
+    # FB sub-struct (40 bytes): mapped addr is the consumer's CPU write target.
+    assert_eq(NV_SFB_FB_ID, 16, "NV_SFB fb_id at +16");
+    assert_eq(NV_SFB_MAPPED, 24, "NV_SFB mapped at +24 (acquire hands this to the consumer)");
+    assert_eq(NV_SFB_STRUCT_SIZE, 40, "NV_SFB = 40 bytes");
+
+    # Ctx-overlay relocation (N8.5): the param block must clear the v3 surface
+    # consumer-stash slots (+96 wgpu_surface_handle, +104 native_card_fd) so a
+    # present-surface configure can't clobber the compute param-bank pointer.
+    assert_neq(NV_CTX_PARAM_VA, 96, "NV_CTX_PARAM_VA off the +96 stash");
+    assert_neq(NV_CTX_PARAM_ADDR, 104, "NV_CTX_PARAM_ADDR off the +104 stash");
+    assert_eq(NV_CTX_PARAM_VA, 112, "NV_CTX_PARAM_VA relocated to +112");
+    assert_eq(NV_CTX_PARAM_ADDR, 120, "NV_CTX_PARAM_ADDR relocated to +120");
+    assert_eq(NV_CTX_PARAM_ADDR < GPU_CONTEXT_SIZE, 1, "param block still fits GpuContext");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_nv_getparam_ioctl_encoding();
+    test_nv_vm_init_ioctl_encoding();
+    test_nv_getparam_param_ids();
+    test_nv_tu116_identity();
+    test_nv_vm_init_kernel_split();
+    test_nv_driver_name_check();
+    test_nv_masterless_verdict();
+    test_nv_gem_new_ioctl_encoding();
+    test_nv_gem_info_ioctl_encoding();
+    test_nv_gem_domain_flags();
+    test_nv_gem_new_struct_layout();
+    test_nv_gem_info_struct_layout();
+    test_nv_channel_alloc_ioctl_encoding();
+    test_nv_vm_bind_ioctl_encoding();
+    test_nv_channel_free_ioctl_encoding();
+    test_nv_channel_engine_constants();
+    test_nv_channel_id_accessor();
+    test_nv_vm_bind_op_layout();
+    test_nv_sync_build();
+    test_nv_sass_store_deadbeef();
+    test_nv_method_header_golden();
+    test_nv_push_dispatch();
+    test_nv_object_handle();
+    test_nv_exec_nvif_ioctl_encoding();
+    test_nv_qmd_build();
+    test_nv_backend_kind_reserved();
+    test_nv_backend_v0_slots();
+    test_nv_backend_v1_texture_slots();
+    test_nv_backend_v2_render_slots();
+    test_nv_tic_tsc_build();
+    test_nv_tic_build_uint();
+    test_nv_sass_sample_tex();
+    test_nv_push_dispatch_sample();
+    test_nv_push_draw();
+    test_nv_sass_render();
+    test_nv_kms_topology_constants();
+    test_nv_backend_v3_surface_slots();
+    return assert_summary();
+}

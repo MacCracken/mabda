@@ -112,8 +112,10 @@ gcc -c samvada/deps/samvada_main.c -o samvada_main.o
 
 samvada itself is a sister AGNOS package (`[deps.samvada]
 tag = "0.4.1"` in your `cyrius.cyml`). It currently uses
-libsystemd via its C-shim; the v4.0 retirement plan drops both
-wgpu-native and libsystemd in favour of pure-Cyrius.
+libsystemd via its C-shim; the v4.0.1 retirement plan drops both
+the AMD wgpu path and libsystemd in favour of pure-Cyrius. (v4.0
+itself ships NVIDIA native; AMD wgpu stays through 4.0.x as a
+coexistence window.)
 
 If you don't need the logind path (kiosk / development / no
 compositor in your session), skip samvada entirely — `_native_kiosk`

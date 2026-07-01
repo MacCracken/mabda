@@ -1,0 +1,181 @@
+# programs/nvidia_compute_store.cyr — v4.0 Phase N4 THE ARC GATE
+#
+# STATUS (2026-06-27): NOT YET GREEN. This is the current best-known
+# attempt. It builds, and on HW runs the full chain VM_INIT ->
+# CHANNEL_ALLOC -> NVIF 0xC5C0 -> GEM_NEW/VM_BIND -> EXEC, and the SASS
+# shader EXECUTES (proven: a local-window store target faults at the exact
+# address). The open blocker: a generic GLOBAL store silently hangs
+# (syncobj ETIME, no fault, readback 0). Diagnosis + the five eliminated
+# causes + the next step (replicate NVK's fuller multi-class dispatch /
+# fault-buffer init) are in docs/development/nvidia-n4-capture-notes.md.
+# Re-capture the NVK reference with tools/nvidia-capture/.
+#
+# Pure-Cyrius NVIDIA compute dispatch on nouveau: a GFX-free, libdrm-free,
+# CUDA-free path that makes the GPU run a captured SM75 SASS kernel which
+# writes 0xDEADBEEF to a buffer, read back by the CPU. Masterless on
+# /dev/dri/renderD128. Mirrors programs/native_compute_store.cyr (AMD).
+#
+# Sequence:
+#   VM_INIT -> CHANNEL_ALLOC -> NVIF NEW(TURING_COMPUTE_A 0xC5C0)
+#   -> GEM_NEW + VM_BIND: program(SASS), QMD, param(c[0x0]), output, pushbuf
+#   -> param[0x160] = output VA   (ptxas kernel-param ABI)
+#   -> build QMD (program/regcount/cbuf0) + dispatch pushbuffer (SEND_PCAS)
+#   -> EXEC + syncobj wait -> verify output == 0xDEADBEEF
+#   -> 2nd dispatch on the same channel (prove reuse)
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-compute-store`.
+#
+# Exit codes:
+#   0 success    1 open    2 VM_INIT    3 CHANNEL_ALLOC    4 NVIF create
+#   5 BO create/bind    6 syncobj    7 EXEC    8 wait/timeout
+#   9 first readback != 0xDEADBEEF    10 second readback != 0xDEADBEEF
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Create a 64 KiB host-visible BO and VM_BIND it at `va` with a 64 KiB
+# range (big-page mapping — NVK's BOs are 64 KiB; SM generic global stores
+# appear to need big pages). Returns the GEM handle; writes the CPU mapping
+# to *cpu_out. Exits(5) on failure.
+fn mk_bo(fd, va, dom, cpu_out): i64 {
+    var bo[16];
+    var rc = native_nv_bo_create_dom(fd, 0x10000, dom, &bo);
+    if (rc != 0) {
+        print_cstr("FAIL: GEM_NEW (errno "); print_i64(0 - rc); print_cstr(")\n");
+        syscall(60, 5);
+    }
+    var handle = load64(&bo + 0);
+    store64(cpu_out, load64(&bo + 8));
+    rc = native_nv_vm_bind_map(fd, handle, va, 0x10000);
+    if (rc != 0) {
+        print_cstr("FAIL: VM_BIND (errno "); print_i64(0 - rc); print_cstr(")\n");
+        syscall(60, 5);
+    }
+    return handle;
+}
+
+# One dispatch on an already-built channel/QMD/pushbuf: zero output, EXEC,
+# wait, return the readback word. Exits(7/8) on EXEC/wait failure.
+fn dispatch_once(fd, chid, va_push, push_len, out_cpu): i64 {
+    store32(out_cpu, 0);   # clear the output slot
+
+    var so[8];
+    memset(&so, 0, 8);
+    if (native_syncobj_create(fd, &so) != 0) {
+        print_cstr("FAIL: syncobj_create\n"); syscall(60, 6);
+    }
+    var sh = load32(&so);
+
+    # native_syncobj_wait takes an ABSOLUTE CLOCK_MONOTONIC deadline (now+1s),
+    # NOT a relative timeout. Passing a bare 1e9 means "1s after boot" — long
+    # past — so the DRM wait returns ETIME instantly, before nouveau's async
+    # EXEC fence signals. THIS was the N4 "global store hangs" blocker: the
+    # dispatch always completed; the wait just gave up before the fence.
+    var deadline = _time_now_ns() + 1000000000;
+
+    var rc = native_nv_exec_submit(fd, chid, va_push, push_len, sh);
+    if (rc != 0) {
+        print_cstr("FAIL: EXEC (errno "); print_i64(0 - rc); print_cstr(")\n");
+        native_syncobj_destroy(fd, sh); syscall(60, 7);
+    }
+    rc = native_syncobj_wait(fd, sh, deadline);   # absolute deadline (now+1s)
+    native_syncobj_destroy(fd, sh);
+    # Diagnostic: read the output regardless of wait outcome, so a working
+    # dispatch with a broken fence (readback set, rc=ETIME) is distinguished
+    # from a faulted dispatch (readback still 0).
+    var got = load32(out_cpu);
+    print_cstr("  wait rc="); print_i64(rc);
+    print_cstr(" readback="); print_i64(got); print_cstr("\n");
+    return got;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA compute store (v4.0 Phase N4, THE ARC GATE)\n");
+    print_cstr("-------------------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+
+    if (native_nv_vm_init(fd, NOUVEAU_VM_KERNEL_RESERVATION_START,
+    NOUVEAU_VM_KERNEL_RESERVATION_SIZE) != 0) {
+        print_cstr("FAIL: VM_INIT\n"); sys_close(fd); return 2;
+    }
+
+    var chan[88];
+    if (native_nv_channel_alloc(fd, &chan) != 0) { print_cstr("FAIL: CHANNEL_ALLOC\n"); sys_close(fd); return 3; }
+    var chid = native_nv_channel_id(&chan);
+    print_cstr("chid="); print_i64(chid); print_cstr("\n");
+
+    # Create the compute class object (0xC5C0) on the channel via NVIF.
+    var obj_handle = native_nv_object_handle(chid, TURING_COMPUTE_A);
+    var rc = native_nv_object_new(fd, chid, obj_handle, TURING_COMPUTE_A);
+    if (rc != 0) {
+        print_cstr("FAIL: NVIF create 0xC5C0 (errno "); print_i64(0 - rc); print_cstr(")\n");
+        sys_close(fd); return 4;
+    }
+    print_cstr("NVIF compute object 0xC5C0 created\n");
+
+    # GPU VAs — all low and well below the shared/local memory windows
+    # (0xfe000000 / 0xff000000, set in the dispatch preamble), so the
+    # generic STG.E store to va_out resolves to GLOBAL. 64 KiB-aligned,
+    # distinct, QMD 256-aligned.
+    var va_prog  = 0x100000;
+    var va_qmd   = 0x200000;
+    var va_param = 0x300000;
+    var va_out   = 0x400000;
+    var va_push  = 0x500000;
+
+    var prog_cpu  = 0;
+    var qmd_cpu   = 0;
+    var param_cpu = 0;
+    var out_cpu   = 0;
+    var push_cpu  = 0;
+    mk_bo(fd, va_prog,  NOUVEAU_GEM_DOMAIN_HOST, &prog_cpu);
+    mk_bo(fd, va_qmd,   NOUVEAU_GEM_DOMAIN_HOST, &qmd_cpu);
+    mk_bo(fd, va_param, NOUVEAU_GEM_DOMAIN_HOST, &param_cpu);
+    # Output BO: pure GART (0x4), matching NVK's writable storage buffer
+    # (NVK uses GART, not GART|MAPPABLE|COHERENT, for SM-written buffers).
+    mk_bo(fd, va_out,   NOUVEAU_GEM_DOMAIN_GART, &out_cpu);
+    mk_bo(fd, va_push,  NOUVEAU_GEM_DOMAIN_HOST, &push_cpu);
+    print_cstr("5 BOs created + VM_BIND'd\n");
+
+    # Program BO <- captured SM75 SASS.
+    native_nv_sass_store_deadbeef(prog_cpu);
+    # Param bank: output pointer at c[0x0]+0x160 (ptxas kernel-param ABI).
+    store64(param_cpu + 0x160, va_out);
+    # QMD: program addr, ptxas regcount=4, cbuf0 = param bank (size 0x200).
+    native_nv_qmd_build(qmd_cpu, va_prog, NV_SASS_STORE_DEADBEEF_REGCOUNT, va_param, 0x200);
+    # Pushbuffer: SET_OBJECT(0xC5C0) + SEND_PCAS(qmd_va).
+    var push_len = native_nv_push_dispatch(push_cpu, va_qmd);
+
+    # Dispatch #1.
+    var v1 = dispatch_once(fd, chid, va_push, push_len, out_cpu);
+    print_cstr("dispatch #1 readback = ");
+    print_i64(v1);
+    if (v1 == 0xDEADBEEF) { print_cstr("  (0xDEADBEEF OK)\n"); }
+    else { print_cstr("  FAIL (expected 3735928559)\n"); sys_close(fd); return 9; }
+
+    # Dispatch #2 on the same channel (prove reuse).
+    var v2 = dispatch_once(fd, chid, va_push, push_len, out_cpu);
+    print_cstr("dispatch #2 readback = ");
+    print_i64(v2);
+    if (v2 == 0xDEADBEEF) { print_cstr("  (0xDEADBEEF OK)\n"); }
+    else { print_cstr("  FAIL (expected 3735928559)\n"); sys_close(fd); return 10; }
+
+    native_nv_channel_free(fd, chid);
+    sys_close(fd);
+    print_cstr("OK: GPU wrote 0xDEADBEEF twice via a pure-Cyrius dispatch\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

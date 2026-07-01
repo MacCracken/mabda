@@ -1,0 +1,137 @@
+# programs/nvidia_kms_summary.cyr — v4.0 Phase N8.1 — NVIDIA KMS topology probe
+#
+# Confirms nouveau exposes standard DRM atomic KMS on its card node, and walks
+# the display topology: connectors (id/type/status/encoder), encoders, CRTCs,
+# and each connected connector's preferred mode. The foundation for the N8
+# present path (modeset + scanout), which reuses the generic-DRM KMS ioctls
+# (MODE_GETRESOURCES / GETCONNECTOR / GETENCODER / ADDFB2 / SETCRTC / PAGE_FLIP)
+# from `backend_native_kms.cyr` — these are driver-agnostic, so the only
+# NVIDIA-specific part here is finding the nouveau card.
+#
+# Card discovery: scans /dev/dri/card0..card9 and uses the first whose
+# DRM_IOCTL_VERSION names the **nouveau** driver (re-probed, not hardcoded —
+# nouveau holds card0 on a single-GPU box but the index moves with load order).
+#
+# GETRESOURCES / GETCONNECTOR are informational and work **in any session** (no
+# DRM master needed); only the N8.3+ modeset/page-flip needs master. Opening
+# the card node needs permission (logind ACL in a desktop session, or root) —
+# failure surfaces with the errno.
+#
+# Run via `make test-nvidia-kms-summary`.
+#
+# Exit codes:
+#   0   — topology printed
+#   1   — no nouveau card opened in card0..card9
+#   2   — native_kms_init failed (kernel rejected MODE_GETRESOURCES)
+#   3   — native_kms_summary failed mid-walk (partial output above)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA KMS topology probe (v4.0 Phase N8.1)\n");
+    print_cstr("------------------------------------------------\n");
+
+    # Find + open the nouveau card node (driver-verified scan of card0..9).
+    var which[4];
+    memset(&which, 0, 4);
+    var fd = native_nv_open_card_node(&which);
+    if (fd < 0) {
+        if (fd == 0 - _NATIVE_ERRNO_EACCES) {
+            print_cstr("FAIL: nouveau card node present but PERMISSION DENIED (EACCES).\n");
+            print_cstr("      /dev/dri/cardN is root:video + a logind ACL — run from your\n");
+            print_cstr("      active desktop session, add your user to the 'video' group,\n");
+            print_cstr("      or run via sudo. (KMS topology needs no DRM master, only the\n");
+            print_cstr("      card-node open permission.)\n");
+            return 1;
+        }
+        print_cstr("FAIL: no nouveau /dev/dri/cardN found (errno=");
+        print_i64(0 - fd);
+        print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened /dev/dri/card");
+    print_i64(load32(&which));
+    print_cstr(" (nouveau) fd=");
+    print_i64(fd);
+    print_cstr("\n");
+
+    var state = native_kms_init(fd);
+    if (state == 0) {
+        print_cstr("FAIL: native_kms_init (MODE_GETRESOURCES rejected)\n");
+        sys_close(fd);
+        return 2;
+    }
+    print_cstr("connectors=");  print_i64(kms_state_count_conn(state));
+    print_cstr(" encoders=");   print_i64(kms_state_count_enc(state));
+    print_cstr(" crtcs=");      print_i64(kms_state_count_crtcs(state));
+    print_cstr(" fbs=");        print_i64(kms_state_count_fbs(state));
+    print_cstr(" framebuffer_extent=");
+    print_i64(kms_state_min_width(state));  print_cstr("x");
+    print_i64(kms_state_min_height(state)); print_cstr(" .. ");
+    print_i64(kms_state_max_width(state));  print_cstr("x");
+    print_i64(kms_state_max_height(state)); print_cstr("\n");
+
+    var rc = native_kms_summary(state);
+    if (rc != 0) {
+        print_cstr("FAIL: native_kms_summary rc="); print_i64(rc); print_cstr("\n");
+        native_kms_release(state);
+        sys_close(fd);
+        return 3;
+    }
+
+    # For each CONNECTED connector, print its preferred (or first) mode — the
+    # N8.3 modeset will pick the connector + mode the same way.
+    print_cstr("preferred modes:\n");
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var i = 0;
+    while (i < conn_count) {
+        var conn_id = load32(conn_ids + i * 4);
+        var meta[80];
+        memset(&meta, 0, 80);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, conn_id);
+        if (native_drm_mode_get_connector(fd, &meta) == 0) {
+            if (load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION) == DRM_MODE_CONNECTED) {
+                var count_out[4];
+                store32(&count_out, 0);
+                var modes = native_kms_get_connector_modes(fd, conn_id, &count_out);
+                var n = load32(&count_out);
+                if (modes != 0) {
+                    if (n > 0) {
+                        var idx = native_kms_pick_preferred_mode(modes, n);
+                        print_cstr("  conn "); print_i64(conn_id); print_cstr(": ");
+                        print_i64(native_kms_mode_hdisplay(modes, idx)); print_cstr("x");
+                        print_i64(native_kms_mode_vdisplay(modes, idx)); print_cstr("@");
+                        print_i64(native_kms_mode_refresh_hz(modes, idx));
+                        if ((native_kms_mode_type(modes, idx) & DRM_MODE_TYPE_PREFERRED) != 0) {
+                            print_cstr("Hz preferred");
+                        }
+                        if ((native_kms_mode_type(modes, idx) & DRM_MODE_TYPE_PREFERRED) == 0) {
+                            print_cstr("Hz fallback");
+                        }
+                        print_cstr(" ("); print_i64(n); print_cstr(" modes)\n");
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    native_kms_release(state);
+    sys_close(fd);
+    print_cstr("OK: nouveau exposes standard DRM KMS (topology probed)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -1,0 +1,225 @@
+# programs/nvidia_kms_modeset.cyr — v4.0 Phase N8.3 — nouveau live modeset
+#
+# End-to-end modeset on the first connected connector: the screen turns solid
+# RED for 3 seconds, then restores. Composes N8.1 discovery + mode-pick + the
+# N8.2 nouveau scanout FB (VRAM BO -> PRIME -> ADDFB2) + SETCRTC. Mirrors the
+# HW-proven AMD `native_kms_modeset_smoke.cyr` flow; the ONLY nouveau-specific
+# swap is the scanout BO (native_nv_bo_create_dom instead of native_bo_create_gtt)
+# — everything else (SET_MASTER, connector/encoder/CRTC walk, PRIME, ADDFB2,
+# SETCRTC) is generic-DRM from backend_native_kms.cyr.
+#
+# **RUN FROM A TTY.** SETCRTC needs DRM master, which the running compositor
+# holds while it's the active vt. Switch to an unused vt (Ctrl-Alt-F2) and run
+# from there — logind hands master to whoever's on the active vt. From inside a
+# desktop session SET_MASTER returns -EBUSY/-EACCES and SETCRTC fails predictably.
+#
+# Exit codes:
+#   0 modeset succeeded, screen flashed red, clean teardown
+#   1 no nouveau card / permission   2 render node open   3 native_kms_init
+#   4 discovery (no connected connector / encoder / crtc / mode)
+#   5 scanout BO create   6 PRIME import   7 ADDFB2   8 SETCRTC (not master?)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Fill XRGB8888 with solid red: LE word 0x00FF0000 = B=0,G=0,R=0xFF,X=0.
+fn _fill_red(addr, w, h, pitch): i64 {
+    var y = 0;
+    while (y < h) {
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, 0x00FF0000);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Sleep n seconds via clock_nanosleep(2) (syscall 230; CLOCK_MONOTONIC=1, rel).
+fn _sleep_seconds(n): i64 {
+    var ts[16];
+    store64(&ts + 0, n);
+    store64(&ts + 8, 0);
+    syscall(230, 1, 0, &ts, 0);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA KMS modeset (v4.0 Phase N8.3)\n");
+    print_cstr("-----------------------------------------\n");
+    print_cstr("expect: the screen turns solid RED for 3 seconds, then restores\n\n");
+
+    var which[4];
+    memset(&which, 0, 4);
+    var card_fd = native_nv_open_card_node(&which);
+    if (card_fd < 0) {
+        if (card_fd == 0 - _NATIVE_ERRNO_EACCES) {
+            print_cstr("FAIL: nouveau card present but PERMISSION DENIED — run from a tty.\n");
+            return 1;
+        }
+        print_cstr("FAIL: no nouveau /dev/dri/cardN (errno="); print_i64(0 - card_fd); print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened /dev/dri/card"); print_i64(load32(&which)); print_cstr("\n");
+
+    # DRM master (succeeds on a clean tty; fails if a compositor holds it).
+    var master_rc = native_drm_set_master(card_fd);
+    if (master_rc == 0) { print_cstr("SET_MASTER: acquired\n"); }
+    if (master_rc != 0) {
+        print_cstr("SET_MASTER: rc="); print_i64(master_rc);
+        print_cstr(" — another client holds master (a compositor is running).\n");
+        print_cstr("  Run from an unused tty (Ctrl-Alt-F2). Continuing; SETCRTC will fail.\n");
+    }
+
+    var render_fd = native_open_render_node();
+    if (render_fd < 0) {
+        print_cstr("FAIL: render node open (errno="); print_i64(0 - render_fd); print_cstr(")\n");
+        sys_close(card_fd); return 2;
+    }
+
+    var state = native_kms_init(card_fd);
+    if (state == 0) {
+        print_cstr("FAIL: native_kms_init\n");
+        sys_close(render_fd); sys_close(card_fd); return 3;
+    }
+
+    # ---- discovery: first CONNECTED connector -> encoder -> CRTC -> preferred mode ----
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids   = kms_state_conn_ids(state);
+    var crtc_count = kms_state_count_crtcs(state);
+    var crtc_ids   = kms_state_crtc_ids(state);
+    var conn_id    = 0;
+    var encoder_id = 0;
+    var meta[80];
+    var i = 0;
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(card_fd, &meta) == 0) {
+            if (load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION) == DRM_MODE_CONNECTED) {
+                conn_id = cid;
+                encoder_id = load32(&meta + DRM_MODE_GET_CONNECTOR_ENCODER_ID);
+                i = conn_count;
+            }
+        }
+        i = i + 1;
+    }
+    if (conn_id == 0) { print_cstr("FAIL: no connected connector\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+
+    # encoder_id is 0 when the connector is currently UNBOUND (e.g. after a prior
+    # modeset's teardown disabled the CRTC, with no compositor to re-bind it).
+    # Then default to the first CRTC: SETCRTC re-binds an encoder automatically,
+    # and every encoder on this GPU accepts any CRTC (possible_crtcs = 0x0F).
+    var crtc_idx = 0;
+    if (encoder_id != 0) {
+        var enc[20];
+        memset(&enc, 0, DRM_MODE_GET_ENCODER_SIZE);
+        store32(&enc + DRM_MODE_GET_ENCODER_ID, encoder_id);
+        if (native_drm_mode_get_encoder(card_fd, &enc) != 0) { print_cstr("FAIL: encoder ioctl\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+        crtc_idx = native_kms_lowest_set_bit(load32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS));
+    }
+    if (crtc_idx < 0)           { print_cstr("FAIL: no usable CRTC\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    if (crtc_idx >= crtc_count) { print_cstr("FAIL: CRTC idx out of range\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+
+    var mc[4];
+    store32(&mc, 0);
+    var modes = native_kms_get_connector_modes(card_fd, conn_id, &mc);
+    var n_modes = load32(&mc);
+    if (modes == 0) { print_cstr("FAIL: no modes\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    if (n_modes == 0) { print_cstr("FAIL: zero modes\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 4; }
+    var mode_idx = native_kms_pick_preferred_mode(modes, n_modes);
+    var w = native_kms_mode_hdisplay(modes, mode_idx);
+    var h = native_kms_mode_vdisplay(modes, mode_idx);
+    print_cstr("target: conn "); print_i64(conn_id); print_cstr(" crtc "); print_i64(crtc_id);
+    print_cstr(" mode "); print_i64(w); print_cstr("x"); print_i64(h); print_cstr("\n");
+
+    # SAVE the CRTC's current (console) scanout config so teardown can RESTORE it
+    # instead of disabling the CRTC — which on a bare tty leaves a black console.
+    var saved[104];
+    var have_saved = 0;
+    if (native_kms_get_crtc(card_fd, crtc_id, &saved) == 0) {
+        if (load32(&saved + DRM_MODE_CRTC_FB_ID) != 0) { have_saved = 1; }
+    }
+
+    # ---- nouveau scanout BO (VRAM, mmap'd for the CPU fill); 256-aligned pitch ----
+    var pitch = (w * 4 + 255) / 256 * 256;
+    var bo_size = pitch * h;
+    var bo[16];
+    if (native_nv_bo_create_dom(render_fd, bo_size, NOUVEAU_GEM_DOMAIN_VRAM, &bo) != 0) {
+        print_cstr("FAIL: scanout BO create\n"); native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 5;
+    }
+    var render_handle = load64(&bo + 0);
+    var mapped        = load64(&bo + 8);
+    _fill_red(mapped, w, h, pitch);
+
+    # ---- PRIME -> ADDFB2 ----
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        print_cstr("FAIL: PRIME import\n");
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 6;
+    }
+    var fb_id = native_kms_add_fb_xrgb8888(card_fd, card_handle, w, h, pitch);
+    if (fb_id == 0) {
+        print_cstr("FAIL: ADDFB2\n");
+        native_gem_close(card_fd, card_handle);
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 7;
+    }
+
+    # ---- SETCRTC (the live modeset) ----
+    var conn_list[4];
+    store32(&conn_list, conn_id);
+    var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    var rc = native_kms_set_crtc(card_fd, crtc_id, fb_id, &conn_list, 1, mode_ptr);
+    if (rc != 0) {
+        print_cstr("FAIL: SETCRTC rc="); print_i64(rc);
+        print_cstr(" (EACCES = not DRM master — run from a tty)\n");
+        native_kms_rm_fb(card_fd, fb_id);
+        native_gem_close(card_fd, card_handle);
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        native_kms_release(state); sys_close(render_fd); sys_close(card_fd); return 8;
+    }
+
+    print_cstr("PASS: modeset live — RED for 3s ...\n");
+    _sleep_seconds(3);
+
+    # ---- teardown: RESTORE the original CRTC config (re-bind the console's FB +
+    # mode) BEFORE freeing our red FB, so the screen returns exactly as found. If
+    # there was no saved config (CRTC already off when we started), fall back to
+    # disable + tell the user to VT-switch. ----
+    if (have_saved == 1) {
+        native_kms_set_crtc(card_fd, crtc_id, load32(&saved + DRM_MODE_CRTC_FB_ID),
+        &conn_list, 1, &saved + DRM_MODE_CRTC_MODE);
+        print_cstr("restored the original CRTC config (console back)\n");
+    }
+    if (have_saved == 0) {
+        native_kms_disable_crtc(card_fd, crtc_id);
+        print_cstr("note: no saved CRTC config — screen may be blank; press Ctrl-Alt-F2 to restore\n");
+    }
+    native_kms_rm_fb(card_fd, fb_id);
+    native_gem_close(card_fd, card_handle);
+    native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+    if (master_rc == 0) { native_drm_drop_master(card_fd); }
+    native_kms_release(state);
+    sys_close(render_fd);
+    sys_close(card_fd);
+    print_cstr("OK: nouveau live modeset (red screen) via generic-DRM KMS + nouveau scanout BO\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

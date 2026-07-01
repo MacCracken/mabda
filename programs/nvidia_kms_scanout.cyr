@@ -1,0 +1,109 @@
+# programs/nvidia_kms_scanout.cyr — v4.0 Phase N8.2 — nouveau scanout FB
+#
+# Proves the BO -> scanout-framebuffer path on nouveau: allocate a LINEAR VRAM
+# BO on the render node (renderD128, masterless GEM_NEW — no VM_INIT), bridge it
+# onto the KMS card fd via PRIME (export dmabuf from render, import to card),
+# and create an XRGB8888 scanout framebuffer over it with ADDFB2. The N8.3
+# modeset will SETCRTC such an FB onto a connector; N8.4 PAGE_FLIPs between two.
+#
+# All of this is generic-DRM (PRIME handle<->fd + ADDFB2 are driver-agnostic,
+# reused from backend_native_kms.cyr) except finding the nouveau card node
+# (native_nv_open_card_node). ADDFB2 needs the card-node open but **no DRM
+# master** (only the N8.3 modeset does), so this runs in any session with card
+# read perm — same as the N8.1 probe.
+#
+# v0 forces a LINEAR scanout BO (no block-linear tiling modifier); tiled
+# scanout + format modifiers are a later bite.
+#
+# Run via `make test-nvidia-kms-scanout`.
+#
+# Exit codes:
+#   0 success   1 no nouveau card / permission   2 render node open
+#   3 BO create (GEM_NEW)   4 PRIME import to card   5 ADDFB2
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA KMS scanout FB (v4.0 Phase N8.2)\n");
+    print_cstr("---------------------------------------------\n");
+
+    # Render node + the scanout BO FIRST (masterless — works in any session), so
+    # the nouveau-specific VRAM GEM_NEW is exercised before the card-node open
+    # (which needs card read perm). pitch = width*4.
+    var rfd = native_open_render_node();
+    if (rfd < 0) {
+        print_cstr("FAIL: render node open (errno="); print_i64(0 - rfd); print_cstr(")\n");
+        return 2;
+    }
+    var w = 256;
+    var h = 256;
+    var req[48];
+    var rc = native_nv_gem_new(rfd, w * h * 4, 4096, NOUVEAU_GEM_DOMAIN_VRAM, &req);
+    if (rc != 0) {
+        print_cstr("FAIL: GEM_NEW VRAM (errno="); print_i64(0 - rc); print_cstr(")\n");
+        sys_close(rfd); return 3;
+    }
+    var bo_handle = native_nv_gem_new_handle(&req);
+    print_cstr("render VRAM bo handle="); print_i64(bo_handle);
+    print_cstr(" (256x256 XRGB8888 linear)\n");
+
+    # KMS card node (nouveau, driver-verified) — needs the card-node open.
+    var which[4];
+    memset(&which, 0, 4);
+    var fd = native_nv_open_card_node(&which);
+    if (fd < 0) {
+        native_gem_close(rfd, bo_handle);
+        sys_close(rfd);
+        if (fd == 0 - _NATIVE_ERRNO_EACCES) {
+            print_cstr("FAIL: nouveau card node present but PERMISSION DENIED (EACCES).\n");
+            print_cstr("      (The VRAM BO above allocated fine.) ADDFB2 needs the card-node\n");
+            print_cstr("      open (no DRM master) — run from an active desktop session, the\n");
+            print_cstr("      'video' group, or sudo.\n");
+            return 1;
+        }
+        print_cstr("FAIL: no nouveau /dev/dri/cardN found (errno=");
+        print_i64(0 - fd); print_cstr(")\n");
+        return 1;
+    }
+    print_cstr("opened /dev/dri/card"); print_i64(load32(&which));
+    print_cstr(" (nouveau) fd="); print_i64(fd); print_cstr("\n");
+
+    # PRIME bridge: export the render BO as a dmabuf, import onto the card fd.
+    var card_handle = native_kms_import_bo(fd, rfd, bo_handle);
+    if (card_handle == 0) {
+        print_cstr("FAIL: PRIME import to card\n");
+        native_gem_close(rfd, bo_handle); sys_close(rfd); sys_close(fd); return 4;
+    }
+    print_cstr("PRIME -> card handle="); print_i64(card_handle); print_cstr("\n");
+
+    # ADDFB2 — create the XRGB8888 scanout framebuffer over the imported BO.
+    var fb_id = native_kms_add_fb_xrgb8888(fd, card_handle, w, h, w * 4);
+    if (fb_id == 0) {
+        print_cstr("FAIL: ADDFB2 (XRGB8888 256x256 linear)\n");
+        native_gem_close(fd, card_handle);
+        native_gem_close(rfd, bo_handle); sys_close(rfd); sys_close(fd); return 5;
+    }
+    print_cstr("ADDFB2 fb_id="); print_i64(fb_id); print_cstr("  PASS\n");
+
+    # Teardown (the N8.3 modeset will instead SETCRTC this FB before removing it).
+    native_kms_rm_fb(fd, fb_id);
+    native_gem_close(fd, card_handle);
+    native_gem_close(rfd, bo_handle);
+    sys_close(rfd);
+    sys_close(fd);
+    print_cstr("OK: nouveau VRAM BO -> PRIME -> scanout FB (ADDFB2) via generic-DRM KMS\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

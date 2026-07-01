@@ -1,0 +1,111 @@
+# programs/nvidia_render_target.cyr — v4.0 Phase N7.1 — NVIDIA native
+# render-target create/release through the PUBLIC mabda API.
+#
+# Proves the first two v2 Backend render slots (render_target_create_2d_rgba8
+# @120 / render_target_release @128) on the NVIDIA backend: allocate two live
+# RTs (distinct VAs, no collision — the per-context bump allocator), check the
+# stored geometry, and prove the BO mapping backs real memory via a CPU
+# sentinel write/read across the surface span. (The GPU draw-into-it — the
+# TURING_A 3D pipeline — is N7.2/N7.3/N7.4; this lands the color-surface
+# lifecycle, the render analogue of the texture create slot.)
+#
+# Each NVIDIA v0 surface is one 64 KiB BO, so RTs are capped at 128x128 RGBA8
+# and the VA bump step is a fixed 64 KiB (0x10000).
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-render-target`.
+#
+# Exit codes:
+#   0 success   1 context   2 RT #1 create   3 RT #2 create (2nd live RT)
+#   4 VAs not distinct / not at the +0x10000 bump   5 size/addr wrong
+#   6 sentinel write/read mismatch (mapping not backing memory)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA render-target e2e via PUBLIC API (v4.0 Phase N7.1)\n");
+    print_cstr("--------------------------------------------------------------\n");
+
+    var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+    if (ctx == 0) { print_cstr("FAIL: context\n"); return 1; }
+    print_cstr("context created\n");
+
+    # RT #1 — 64x64 (logical 16384). One 64 KiB BO.
+    var rt1 = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt1 == 0) { print_cstr("FAIL: RT #1 create\n"); gpu_context_release(ctx); return 2; }
+    var va1   = load64(rt1 + NV_RT_VA);
+    var addr1 = load64(rt1 + NV_RT_ADDR);
+    var size1 = load64(rt1 + NV_RT_SIZE);
+    print_cstr("RT #1 64x64 (va="); print_i64(va1);
+    print_cstr(" size="); print_i64(size1); print_cstr(")\n");
+
+    # RT #2 — 128x128 (logical 65536) WITHOUT releasing #1: a 2nd live RT must
+    # land at a distinct VA (the bump allocator), not collide on #1's VA.
+    var rt2 = gpu_render_target_create_2d_rgba8(ctx, 128, 128);
+    if (rt2 == 0) {
+        print_cstr("FAIL: RT #2 create (2nd live RT)\n");
+        gpu_render_target_release(ctx, rt1); gpu_context_release(ctx); return 3;
+    }
+    var va2 = load64(rt2 + NV_RT_VA);
+    print_cstr("RT #2 128x128 live alongside #1 (va="); print_i64(va2); print_cstr(")\n");
+
+    # Distinct VAs, RT #2 exactly one 64 KiB BO past RT #1.
+    if (va1 == va2) {
+        print_cstr("FAIL: RT #1 and #2 share a VA\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 4;
+    }
+    if (va2 != va1 + 0x10000) {
+        print_cstr("FAIL: RT #2 VA != #1 + 0x10000 (delta="); print_i64(va2 - va1); print_cstr(")\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 4;
+    }
+    print_cstr("distinct VAs, RT #2 = RT #1 + 0x10000\n");
+
+    # Geometry + mapping sanity for RT #1.
+    if (size1 != 64 * 64 * 4) {
+        print_cstr("FAIL: RT #1 logical size != 16384 (got "); print_i64(size1); print_cstr(")\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 5;
+    }
+    if (addr1 == 0) {
+        print_cstr("FAIL: RT #1 BO addr null (not mapped)\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 5;
+    }
+    print_cstr("RT #1 size 16384 + BO mapped\n");
+
+    # Prove the mapping backs real memory: sentinels at the first and last
+    # texel of the logical span.
+    store32(addr1, 0xCAFEF00D);
+    store32(addr1 + (size1 - 4), 0xBADC0DE5);
+    if (load32(addr1) != 0xCAFEF00D) {
+        print_cstr("FAIL: sentinel lo mismatch\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 6;
+    }
+    if (load32(addr1 + (size1 - 4)) != 0xBADC0DE5) {
+        print_cstr("FAIL: sentinel hi mismatch (map short)\n");
+        gpu_render_target_release(ctx, rt2); gpu_render_target_release(ctx, rt1);
+        gpu_context_release(ctx); return 6;
+    }
+    print_cstr("sentinel write/read across the surface span\n");
+
+    gpu_render_target_release(ctx, rt2);
+    gpu_render_target_release(ctx, rt1);
+    gpu_context_release(ctx);
+    print_cstr("OK: NVIDIA render-target create/release (2 live RTs) via the public API\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

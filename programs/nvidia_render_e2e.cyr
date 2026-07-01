@@ -1,0 +1,154 @@
+# programs/nvidia_render_e2e.cyr — v4.0 Phase N7.4 — THE NVIDIA RENDER GATE
+#
+# Pure-Cyrius NVIDIA native GPU *render* on nouveau: create the Turing 3D class
+# (TURING_A 0xC597), bind a LINEAR RGBA8 color target, run a vertex-less
+# fullscreen-triangle draw (VS from VertexID + solid-color FS, both SM75
+# SPH+SASS), and read the rendered pixel back on the CPU. The render analogue
+# of the N4 compute gate — proves the GPU rasterizes a triangle via a hand-built
+# clc597 pushbuffer, no libdrm/GFX/CUDA. Masterless on /dev/dri/renderD128.
+#
+# Ties together the N7 building blocks: native_nv_sass_render_vs/_fs (N7.3),
+# native_nv_push_draw (N7.2), and a linear color target (N7.1 shape). The
+# shaders are SELF-CONTAINED (no constant buffer), so there is no param bank.
+#
+# Sequence:
+#   VM_INIT -> CHANNEL_ALLOC -> NVIF NEW(TURING_A 0xC597)
+#   -> GEM_NEW + VM_BIND: rt(linear), vs(SPH+SASS), fs(SPH+SASS), pushbuf
+#   -> upload VS/FS programs ; fill NV_DRAW_PARAMS ; build draw pushbuffer
+#   -> EXEC + syncobj wait -> read back the center pixel -> expect 0xFF996633
+#
+# The FS emits vec4(0.2,0.4,0.6,1.0) -> RGBA8 (R=0x33,G=0x66,B=0x99,A=0xFF) ->
+# A8B8G8R8 memory bytes 0x33,0x66,0x99,0xFF -> u32 LE 0xFF996633 (matches the
+# NVK probe readback). The fullscreen triangle covers every pixel.
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-render-e2e`.
+#
+# Exit codes:
+#   0 success    1 open    2 VM_INIT    3 CHANNEL_ALLOC    4 NVIF create
+#   5 BO create/bind    6 syncobj    7 EXEC    8 wait/timeout
+#   9 readback != 0xFF996633 (the rendered solid color)
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Create a 64 KiB BO in `dom`, VM_BIND it at `va` (64 KiB range). Returns the
+# GEM handle; writes the CPU mapping to *cpu_out. Exits(5) on failure.
+fn mk_bo(fd, va, dom, cpu_out): i64 {
+    var bo[16];
+    var rc = native_nv_bo_create_dom(fd, 0x10000, dom, &bo);
+    if (rc != 0) {
+        print_cstr("FAIL: GEM_NEW (errno "); print_i64(0 - rc); print_cstr(")\n");
+        syscall(60, 5);
+    }
+    var handle = load64(&bo + 0);
+    store64(cpu_out, load64(&bo + 8));
+    rc = native_nv_vm_bind_map(fd, handle, va, 0x10000);
+    if (rc != 0) {
+        print_cstr("FAIL: VM_BIND (errno "); print_i64(0 - rc); print_cstr(")\n");
+        syscall(60, 5);
+    }
+    return handle;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA render e2e (v4.0 Phase N7.4, THE RENDER GATE)\n");
+    print_cstr("---------------------------------------------------------\n");
+
+    var fd = native_open_render_node();
+    if (fd < 0) { print_cstr("FAIL: open\n"); return 1; }
+
+    if (native_nv_vm_init(fd, NOUVEAU_VM_KERNEL_RESERVATION_START,
+    NOUVEAU_VM_KERNEL_RESERVATION_SIZE) != 0) {
+        print_cstr("FAIL: VM_INIT\n"); sys_close(fd); return 2;
+    }
+
+    var chan[88];
+    if (native_nv_channel_alloc(fd, &chan) != 0) { print_cstr("FAIL: CHANNEL_ALLOC\n"); sys_close(fd); return 3; }
+    var chid = native_nv_channel_id(&chan);
+    print_cstr("chid="); print_i64(chid); print_cstr("\n");
+
+    # Create the Turing 3D class object (0xC597) on the channel via NVIF.
+    var obj_handle = native_nv_object_handle(chid, TURING_A);
+    var rc = native_nv_object_new(fd, chid, obj_handle, TURING_A);
+    if (rc != 0) {
+        print_cstr("FAIL: NVIF create 0xC597 (errno "); print_i64(0 - rc); print_cstr(")\n");
+        sys_close(fd); return 4;
+    }
+    print_cstr("NVIF 3D object 0xC597 created\n");
+
+    # GPU VAs — low, 64 KiB-aligned (so 128-aligned for the linear color target).
+    var va_rt   = 0x100000;   # linear RGBA8 64x64 color target (pitch 256)
+    var va_vs   = 0x200000;   # VS program (SPH @ base, SASS @ +0x80)
+    var va_fs   = 0x300000;   # FS program
+    var va_push = 0x400000;
+
+    var rt_cpu   = 0;
+    var vs_cpu   = 0;
+    var fs_cpu   = 0;
+    var push_cpu = 0;
+    mk_bo(fd, va_rt,   NOUVEAU_GEM_DOMAIN_HOST, &rt_cpu);
+    mk_bo(fd, va_vs,   NOUVEAU_GEM_DOMAIN_HOST, &vs_cpu);
+    mk_bo(fd, va_fs,   NOUVEAU_GEM_DOMAIN_HOST, &fs_cpu);
+    mk_bo(fd, va_push, NOUVEAU_GEM_DOMAIN_HOST, &push_cpu);
+    print_cstr("4 BOs created + VM_BIND'd\n");
+
+    # Upload the VS/FS programs (each = 128-byte SPH + SM75 SASS).
+    native_nv_sass_render_vs(vs_cpu);
+    native_nv_sass_render_fs(fs_cpu);
+
+    # Clear the RT so a non-rendered pixel reads 0 (not stale garbage).
+    memset(rt_cpu, 0, 64 * 256);
+
+    # Draw params: 64x64 linear RT, the two programs, regcount 24.
+    var dp[56];
+    memset(&dp, 0, 56);
+    store64(&dp + NV_DRAW_RT_VA,       va_rt);
+    store64(&dp + NV_DRAW_RT_WIDTH,    64);
+    store64(&dp + NV_DRAW_RT_HEIGHT,   64);
+    store64(&dp + NV_DRAW_VS_VA,       va_vs);
+    store64(&dp + NV_DRAW_FS_VA,       va_fs);
+    store64(&dp + NV_DRAW_VS_REGCOUNT, NV_SASS_RENDER_VS_REGCOUNT);
+    store64(&dp + NV_DRAW_FS_REGCOUNT, NV_SASS_RENDER_FS_REGCOUNT);
+    var push_len = native_nv_push_draw(push_cpu, &dp, 3);
+
+    var so[8];
+    memset(&so, 0, 8);
+    if (native_syncobj_create(fd, &so) != 0) { print_cstr("FAIL: syncobj_create\n"); sys_close(fd); return 6; }
+    var sh = load32(&so);
+    var deadline = _time_now_ns() + 1000000000;
+
+    rc = native_nv_exec_submit(fd, chid, va_push, push_len, sh);
+    if (rc != 0) {
+        print_cstr("FAIL: EXEC (errno "); print_i64(0 - rc); print_cstr(")\n");
+        native_syncobj_destroy(fd, sh); sys_close(fd); return 7;
+    }
+    rc = native_syncobj_wait(fd, sh, deadline);
+    native_syncobj_destroy(fd, sh);
+
+    # Center pixel (32,32) at row pitch 256: 32*256 + 32*4 = 8320.
+    var got = load32(rt_cpu + 8320);
+    print_cstr("  wait rc="); print_i64(rc);
+    print_cstr(" center pixel="); print_i64(got); print_cstr("\n");
+    if (rc != 0) { print_cstr("FAIL: wait/timeout\n"); sys_close(fd); return 8; }
+
+    print_cstr("rendered pixel = "); print_i64(got);
+    if (got == 0xFF996633) { print_cstr("  (0xFF996633 OK)\n"); }
+    else { print_cstr("  FAIL (expected 4288243251 = 0xFF996633)\n"); sys_close(fd); return 9; }
+
+    native_nv_channel_free(fd, chid);
+    sys_close(fd);
+    print_cstr("OK: GPU rendered a triangle to a linear RGBA8 target via a pure-Cyrius draw\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

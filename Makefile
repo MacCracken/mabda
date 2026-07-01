@@ -267,6 +267,190 @@ build/native_device_enum: programs/native_device_enum.cyr src/*.cyr
 test-native-enum: build/native_device_enum
 	./build/native_device_enum
 
+# v4.0 Phase N1 — NVIDIA/nouveau device enum + masterless probe. Opens
+# /dev/dri/renderD128, expects driver "nouveau", reads chipset + PCI ids
+# via GETPARAM, and probes that VM_INIT is DRM_RENDER_ALLOW (no master).
+# Requires nouveau-bound NVIDIA hardware; not in CI. Pure Cyrius.
+build/nvidia_device_enum: programs/nvidia_device_enum.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_device_enum.cyr $@
+
+.PHONY: test-nvidia-enum
+test-nvidia-enum: build/nvidia_device_enum
+	./build/nvidia_device_enum
+
+# v4.0 Phase N2 — NVIDIA/nouveau GEM BO round-trip. Allocates a
+# host-visible (GART|MAPPABLE|COHERENT) BO via GEM_NEW, mmaps the
+# returned map_handle, writes a pattern, reads it back byte-identical.
+# Masterless; no VM_INIT/VM_BIND (pure CPU path). Requires nouveau
+# hardware; not in CI. Pure Cyrius.
+build/nvidia_mem_roundtrip: programs/nvidia_mem_roundtrip.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_mem_roundtrip.cyr $@
+
+.PHONY: test-nvidia-mem-roundtrip
+test-nvidia-mem-roundtrip: build/nvidia_mem_roundtrip
+	./build/nvidia_mem_roundtrip
+
+# v4.0 Phase N3 — NVIDIA/nouveau submission setup. Exercises
+# VM_INIT -> CHANNEL_ALLOC -> GEM_NEW -> VM_BIND(MAP/UNMAP) -> syncobj
+# masterless, then tears down. No GPU work submitted (EXEC is N4).
+# Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_channel_setup: programs/nvidia_channel_setup.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_channel_setup.cyr $@
+
+.PHONY: test-nvidia-channel-setup
+test-nvidia-channel-setup: build/nvidia_channel_setup
+	./build/nvidia_channel_setup
+
+# v4.0 Phase N4 — THE ARC GATE. Pure-Cyrius NVIDIA compute dispatch:
+# VM_INIT -> CHANNEL_ALLOC -> NVIF(0xC5C0) -> GEM_NEW/VM_BIND -> build QMD
+# + pushbuffer -> EXEC -> verify the GPU wrote 0xDEADBEEF (twice on one
+# channel). Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_compute_store: programs/nvidia_compute_store.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_compute_store.cyr $@
+
+.PHONY: test-nvidia-compute-store
+test-nvidia-compute-store: build/nvidia_compute_store
+	./build/nvidia_compute_store
+
+# v4.0 Phase N4.7 — the same 0xDEADBEEF compute dispatch, but driven through
+# the PUBLIC mabda API (gpu_context_new_native_nvidia + gpu_buffer_* +
+# gpu_shader_module_* + gpu_compute_dispatch), proving the v0 Backend slots
+# are functionally wired. Requires nouveau hardware; not in CI. Pure Cyrius.
+build/nvidia_compute_api: programs/nvidia_compute_api.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_compute_api.cyr $@
+
+.PHONY: test-nvidia-compute-api
+test-nvidia-compute-api: build/nvidia_compute_api
+	./build/nvidia_compute_api
+
+# v4.0 Phase N6 — NVIDIA texture create/write/read roundtrip through the
+# PUBLIC mabda API (gpu_texture_*). Host-visible linear RGBA8; CPU roundtrip
+# (GPU sampling is a later N6 bite). Requires nouveau hardware; not in CI.
+build/nvidia_texture_e2e: programs/nvidia_texture_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_texture_e2e.cyr $@
+
+.PHONY: test-nvidia-texture-e2e
+test-nvidia-texture-e2e: build/nvidia_texture_e2e
+	./build/nvidia_texture_e2e
+
+# v4.0 Phase N6.2c — NVIDIA native GPU texture SAMPLING end-to-end. Binds a
+# TIC/TSC descriptor pool, runs a Turing TEX (bound-texture) compute dispatch
+# that samples a 1x1 RGBA8 texel and stores the packed result, reads it back.
+# Proves the native sampling path (TIC/TSC pools + SET_TEX_*_POOL + TEX SASS).
+# Requires nouveau hardware; not in CI.
+build/nvidia_texture_sample_e2e: programs/nvidia_texture_sample_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_texture_sample_e2e.cyr $@
+
+.PHONY: test-nvidia-texture-sample-e2e
+test-nvidia-texture-sample-e2e: build/nvidia_texture_sample_e2e
+	./build/nvidia_texture_sample_e2e
+
+# v4.0 Phase N7.1 — NVIDIA native render-target create/release through the
+# PUBLIC mabda API (v2 render slots 120/128). Allocates two live RTs (distinct
+# VAs), checks geometry, proves the BO mapping backs memory. The GPU
+# draw-into-it (TURING_A 3D pipeline) is N7.2-N7.4. Requires nouveau hardware;
+# not in CI.
+build/nvidia_render_target: programs/nvidia_render_target.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_target.cyr $@
+
+.PHONY: test-nvidia-render-target
+test-nvidia-render-target: build/nvidia_render_target
+	./build/nvidia_render_target
+
+# v4.0 Phase N7.4 — THE NVIDIA RENDER GATE. Creates the Turing 3D class
+# (0xC597), binds a linear RGBA8 color target, runs a vertex-less
+# fullscreen-triangle draw (VS from VertexID + solid-color FS, SM75 SPH+SASS),
+# and reads the rendered pixel back. Pure-Cyrius clc597 draw, no libdrm/GFX.
+# Requires nouveau hardware; not in CI.
+build/nvidia_render_e2e: programs/nvidia_render_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_e2e.cyr $@
+
+.PHONY: test-nvidia-render-e2e
+test-nvidia-render-e2e: build/nvidia_render_e2e
+	./build/nvidia_render_e2e
+
+# v4.0 Phase N7.5 — NVIDIA native render through the PUBLIC gpu_render_* API
+# (v2 render slots 136..168). Same triangle as the N7.4 gate, but driven via
+# gpu_render_pipeline_* / gpu_render_pass_* — the backend-agnostic consumer
+# surface. Requires nouveau hardware; not in CI.
+build/nvidia_render_api: programs/nvidia_render_api.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_api.cyr $@
+
+.PHONY: test-nvidia-render-api
+test-nvidia-render-api: build/nvidia_render_api
+	./build/nvidia_render_api
+
+# v4.0 Phase N8.1 — NVIDIA KMS topology probe. Confirms nouveau exposes
+# standard DRM atomic KMS on its card node and walks the display topology
+# (connectors / encoders / CRTCs / preferred modes). GETRESOURCES/GETCONNECTOR
+# work in any session (no DRM master); needs read perm on /dev/dri/cardN.
+build/nvidia_kms_summary: programs/nvidia_kms_summary.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_summary.cyr $@
+
+.PHONY: test-nvidia-kms-summary
+test-nvidia-kms-summary: build/nvidia_kms_summary
+	./build/nvidia_kms_summary
+
+# v4.0 Phase N8.2 — nouveau scanout FB. Allocates a linear VRAM BO on the
+# render node, PRIME-bridges it onto the KMS card fd, and ADDFB2's an XRGB8888
+# scanout framebuffer over it. ADDFB2 needs the card-node open but no DRM
+# master. Requires nouveau hardware + card-node read perm; not in CI.
+build/nvidia_kms_scanout: programs/nvidia_kms_scanout.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_scanout.cyr $@
+
+.PHONY: test-nvidia-kms-scanout
+test-nvidia-kms-scanout: build/nvidia_kms_scanout
+	./build/nvidia_kms_scanout
+
+# v4.0 Phase N8.3 — nouveau LIVE MODESET. SETCRTC a red scanout FB onto the
+# first connected connector — the screen turns red for 3s, then restores.
+# **Run from a tty** (Ctrl-Alt-F2): SETCRTC needs DRM master, which the
+# compositor holds in a desktop session. Requires nouveau hardware.
+build/nvidia_kms_modeset: programs/nvidia_kms_modeset.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_kms_modeset.cyr $@
+
+.PHONY: test-nvidia-kms-modeset
+test-nvidia-kms-modeset: build/nvidia_kms_modeset
+	./build/nvidia_kms_modeset
+
+# v4.0 Phase N8.4 — nouveau ANIMATED PRESENT. Double-buffered, vsync'd
+# PAGE_FLIP loop: the screen shows ~2s of a scrolling blue->red gradient, then
+# the console is restored (GETCRTC save/restore). **Run from a tty** (needs DRM
+# master). Requires nouveau hardware.
+build/nvidia_present_e2e: programs/nvidia_present_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_present_e2e.cyr $@
+
+.PHONY: test-nvidia-present-e2e
+test-nvidia-present-e2e: build/nvidia_present_e2e
+	./build/nvidia_present_e2e
+
+# v4.0 Phase N8.5 — nouveau ANIMATED PRESENT through the PUBLIC surface API.
+# Same on-screen result as N8.4 (scrolling blue->red gradient, ~2s, console
+# restored) but driven through gpu_surface_configure_native_kiosk / acquire /
+# present / release — the backend-agnostic v3 surface slots a compositor uses.
+# **Run from a tty** (needs DRM master). Requires nouveau hardware.
+build/nvidia_surface_present_e2e: programs/nvidia_surface_present_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_surface_present_e2e.cyr $@
+
+.PHONY: test-nvidia-surface-present-e2e
+test-nvidia-surface-present-e2e: build/nvidia_surface_present_e2e
+	./build/nvidia_surface_present_e2e
+
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
 # releases. Requires DRM hardware; not in CI.
