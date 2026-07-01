@@ -395,7 +395,7 @@ fmt_elapsed() {
     if   [ "$s" -lt 60 ]; then printf "%ds" "$s"
     elif [ "$s" -lt 3600 ]; then printf "%dm" "$((s / 60))"
     elif [ "$s" -lt 86400 ]; then printf "%dh" "$((s / 3600))"
-    else printf "%dd%dh" "$((s / 86400)) $((s % 86400 / 3600))"
+    else printf "%dd%dh" "$((s / 86400))" "$((s % 86400 / 3600))"
     fi
 }
 

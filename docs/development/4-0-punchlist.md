@@ -50,7 +50,17 @@ main merged (garbage-free). (2026-06-28)**
 > loops the public-API present on a tty; the dmesg watch is driver-aware —
 > `nouveau|drm|Xid|GSP`, so a GSP-RM Xid fault trips the detector like an amdgpu
 > TDR. A 5s masterless smoke ran ~561 dispatches, 0 fail, flat RSS, dmesg Δ=0 —
-> the real gate is a 6h/24h run with `sudo` for dmesg capture); bundle the NVIDIA
+> the real gate is a 6h/24h run with `sudo` for dmesg capture. **SOAK BURN-IN
+> GATE MET (2026-07-01):** three sequential `nvidia-native` runs on the TU116 —
+> 1h, 6h, and ~23h45m (~30¾h cumulative, ~8.69M dispatches on the long run) —
+> all PASS with **RSS dead-flat** (single distinct value per run) and **dmesg
+> Δ=0** throughout (no GSP-RM Xid). The 24h run's GPU workload was flawless; it
+> aborted at the *label-formatting* step of its final checkpoint only — a
+> `fmt_elapsed` quoting bug in the ≥1-day branch (`printf "%dd%dh" "$((..)) $((..))"`
+> passed one arg `"1 0"`; fixed to two args) that would also have crashed every
+> 72h-window checkpoint. dmesg capture ran without `sudo` here: `dmesg_restrict=1`,
+> but the script's `journalctl -k` fallback reads the kernel log as the user, so
+> the regression detector stayed live. Logs: `docs/handoff/soak-20260630T141203Z`.); bundle the NVIDIA
 > modules into the dist `[lib].modules` (today the whole NVIDIA backend is
 > source-only, absent from the v3.4.5 dist); wire the compile-time
 > `MABDA_BACKEND_KIND==NVIDIA` branch in `gpu_context_from_preinit`; bump

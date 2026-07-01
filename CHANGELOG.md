@@ -13,6 +13,93 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.0] — 2026-07-01
+
+**Third backend: a pure-Cyrius native NVIDIA path (nouveau DRM, Turing/SM75) — compute,
+textures, render, and present, all reachable through the backend-agnostic public API and
+HW-proven on a GeForce GTX 1660 SUPER (TU116).** v4.0 closes the NVIDIA arc: the NVIDIA
+backend fills every public slot the AMD/wgpu backends do (v0 compute → v1 textures → v2
+render → v3 surface/present) with **no public-API change** — the load-bearing v3.0
+backend-abstraction bet holds across a second native driver, no libdrm, no C shim (ioctls go
+straight through `syscall(SYS_IOCTL)`; KMS reuses the generic `backend_native_kms.cyr`, only
+the card-node opener is nouveau-specific). The whole compute→textures→render→present chain
+ran on real silicon, then burned in **~30¾h across three `nvidia-native` soak runs** (1h + 6h
++ ~23h45m, ~8.69M dispatches on the long run) with **RSS dead-flat and dmesg Δ=0** (no GSP-RM
+Xid). The wgpu path stays as a coexistence window; the AMD wgpu path + libsystemd retire at
+4.0.1.
+
+### Added
+- **Native NVIDIA backend (nouveau DRM, pure Cyrius)** — six modules now shipped:
+  `backend_nvidia_nouveau.cyr` (nouveau ioctl foundation, reuses the AMD render-node openers),
+  `backend_nvidia_sass.cyr` (SM75 SASS VS/FS + SPH), `backend_nvidia_push.cyr` (pushbuffer /
+  clc597 draw encoder from the NVK-capture decode), `backend_nvidia_qmd.cyr` (compute QMD),
+  `backend_nvidia_tex.cyr` (TIC/TSC textures + GPU sampling), and `backend_nvidia.cyr` (slot
+  fillers, `gpu_context_new_native_nvidia`, and the v3 surface slots 176..208 for
+  configure/acquire/present/release).
+- **`gpu_render_*` and `gpu_surface_*` on NVIDIA** — the public render + present APIs route to
+  the nouveau path with the same signatures as AMD/wgpu (`gpu_surface_configure_native_kiosk`
+  / acquire / present / release drove a real HDMI monitor: live modeset + a vsync-locked
+  double-buffered `PAGE_FLIP` animation, clean console restore).
+- **`--workload=nvidia-native` / `--workload=nvidia-present` soak** (`scripts/soak.sh`) — the
+  NVIDIA analogue of the AMD rc.3/rc.4 gates, with a driver-aware dmesg watch
+  (`nouveau|drm|Xid|GSP`) so a GSP-RM Xid fault trips the detector like an amdgpu ring TDR.
+
+### Changed
+- **`cyrius.cyml` `[lib].modules`** — the six `backend_nvidia*.cyr` modules are inserted after
+  `backend_native_kms.cyr` (matching the `src/lib.cyr` include order), so `cyrius distlib` now
+  bundles the NVIDIA backend into `dist/mabda.cyr` (previously source-only — consumers building
+  against the dist could not reach the nouveau path).
+- **`src/context.cyr` `gpu_context_from_preinit`** — adds the compile-time
+  `MABDA_BACKEND_KIND == BACKEND_KIND_NVIDIA` routing branch (→ `gpu_context_new_native_nvidia()`,
+  `preinit_ptr` ignored), mirroring the existing AMD branch. This branch and the dist bundling
+  landed together so the bundled `gpu_context_from_preinit` resolves the nouveau constructor.
+- **`dist/mabda.cyr`** regenerated at v4.0.0 (now ~26.4k lines) — includes the NVIDIA backend.
+
+### Fixed
+- **`scripts/soak.sh`** — `fmt_elapsed`'s ≥1-day branch passed both arithmetic expansions in a
+  single quoted string (`printf "%dd%dh" "$((..)) $((..))"` → one arg `"1 0"`), so `printf`
+  failed (`invalid number`) and, under `set -euo pipefail`, aborted the run at its final
+  checkpoint. This crashed the 24h soak's close-out (the GPU workload itself was flawless for
+  the full 23h45m) and would have crashed every 72h-window checkpoint. Fixed to two quoted args.
+- **`src/texture.cyr`** (audit M1) — `texture_upload_rgba8` now caps `width`/`height` at
+  `MABDA_MAX_TEXTURE_DIM_2D` (8192, the same ceiling the create paths use) instead of
+  `0x7FFFFFFF`, so `width*height*4` can no longer overflow i64 and `width*4` can no longer
+  overflow the u32 `bytes_per_row`. Restores the cross-backend dimension contract.
+- **`src/backend_native.cyr`** (audit M2/M3) — the native buffer-create and all four
+  texture-create slots now reclaim the just-reserved texture VA (`native_ctx_free_texture_va`,
+  LIFO) on BO-create / va-map failure, mirroring `_native_shader_compile_spirv`. Without this a
+  transient ioctl failure permanently advanced the forward-only 2 GiB VA cursor.
+- **`src/context.cyr` + `src/backend_native.cyr`** (audit L1/L2) — corrected stale struct-size
+  comments: the `GpuContext` header now says 176 bytes (matching `GPU_CONTEXT_SIZE`, was 168),
+  and `native_render_handles_write` documents its 32-byte quad (was "24-byte triple" — the
+  helper has written four u64 fields since the v3.2 TS.5 `tex_h` addition).
+
+### Security
+- **v4.0 audit** (`docs/audit/2026-07-01-audit.md`): **0 CRITICAL / 0 HIGH.** The newly-bundled
+  NVIDIA backend surface — the release's headline new-to-dist code — audited **clean (zero
+  confirmed findings)**. All 5 prior ship-blockers + 10 deferrals regression-confirmed still
+  FIXED. Adversarial verification confirmed 9 / dropped 9 candidate findings; the 3 confirmed
+  MEDIUM (texture upload overflow; VA leak on native buffer/texture create failure) + 2 doc-LOW
+  were all **pre-existing (AMD/wgpu/core, not v4.0-introduced) and are fixed in this release**
+  with CPU regression assertions (see Fixed). CVE sweep: nouveau `CVE-2026-46006` NOT_APPLICABLE
+  (modern explicit-VA push); the two APPLICABLE amdgpu CVEs (`CVE-2026-46220`, `CVE-2026-43237`)
+  are kernel-side and mabda is already defensive — deployment advisory: run the native AMD path
+  on a patched amdgpu kernel.
+
+### Metrics
+- **CPU assertions: 4901** across 18 domain suites (0 failed), of which **314** are the NVIDIA
+  suite (`tests/tcyr/nvidia.tcyr`); +9 this release are the M1/M2/M3 audit-fix regression tests.
+  Full sweep + smoke build + `cyrius distlib` diff-clean.
+- **src modules: 57** (6 NVIDIA). Dist bundle ~26.4k lines.
+
+### Next
+- **4.0.1** — retire the AMD wgpu path + libsystemd (samvada's C shim); NVIDIA + AMD native
+  become the shipping backends.
+- **N9** — in-tree SPIR-V→SASS compiler (the NVIDIA analogue of the GFX9 compiler), so
+  consumers ship one shader form; deferrable to v4.1.
+- **Six-consumer regression sweep** (soorat, rasa, ranga, bijli, aethersafta, kiran) against
+  the new bundle — Tier 2 ship work.
+
 ## [3.4.5] — 2026-06-28
 
 **Gate the optional external integrations (samvada/logind, chitra/PNG) behind compile
