@@ -9,76 +9,41 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.0.1 (triple backend — wgpu + native AMD + native NVIDIA; see
-*Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
-mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
-HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
-block-compressed textures (BC / ETC2 / ASTC): wgpu creates + uploads +
-samples; native AMD stores + reads back. 3.2.1 adds buffer-to-buffer copy on
-both backends (native SDMA on a real DMA ring with >4 MiB chaining; wgpu
-copy_buffer_to_buffer). 3.2.2 adds native RGBA8 texture *sampling* (GFX9 T#/S#
-+ a textured FS). 3.2.3 completes native sampling: **block-compressed (BC1/BC3/
-BC4/BC5/BC7) sampling** via SDMA SW_64KB_S tiling + the image_sample FS, and
-**bilinear / scaled** filtering — all HW-verified pixel-exact on Cezanne
-(ETC2/ASTC are HW-blocked on AMD). 3.2.4 adds **SPIR-V shader ingestion** on
-wgpu — a SPIR-V binary is a peer frontend to WGSL (kind-tagged shader-create +
-SPIR-V validation + source-kind-aware cache), HW-verified byte-identical to WGSL.
-3.2.5 opens the **native SPIR-V → GFX9 compiler** (Phases N.0 + N.1, pure CPU):
-operand-parameterized GFX9 instruction encoders proven byte-identical against the
-hand-authored shaders (which now emit through them), plus the SPIR-V parser — a
-validate/rejection gate over untrusted input + type/constant/decoration lookup
-tables. 3.2.6 reaches the compiler MVP — a SPIR-V compute kernel lowered all the
-way to GFX9 ISA + a dispatch descriptor, HW-verified on Cezanne; 3.2.7 lands it on
-the public API; 3.2.8 adds structured control flow + scalar f32/i32 op breadth;
-3.2.9 completes integer division & remainder (UDiv / UMod / SDiv / SRem / SMod via
-GFX9's float-reciprocal macro, all HW-verified); 3.2.10 adds vectors — component-wise
-vec2/3/4 arithmetic, `OpCompositeConstruct`/`Extract`, `array<vecN>` load/store (std430
-stride), and `OpConstantComposite` constants, all HW-verified on Cezanne; 3.2.11 adds
-per-ext-set tracking (every `OpExtInst` must reference the actual GLSL.std.450 import),
-completing the v3.2.x compiler-breadth arc; 3.2.12 adds general native **f64**
-(double-precision) compute — the SPIR-V→GFX9 compiler emits `V_*_F64` for the conformant
-arithmetic set (add/sub/mul/div/sqrt/fma, i32↔f64 + f32↔f64 convert, OpConstant, Ldexp,
-ordered compares, OpSelect), HW-verified bit-exact on Cezanne (transcendentals are
-hand-rolled by consumers — GLSL.std.450 Exp/Log/Pow are f32-only). 3.2.13–3.2.14 add
-**render-graph multi-queue scheduling** (Phase R) — per-node queue affinity + a scheduler
-(per-queue batches + cross-queue fence-edge classification) + a native executor that runs
-nodes on distinct HW rings (GFX/COMPUTE) ordered by in-CS timeline waits, with per-node IB
-staging; HW-verified on Cezanne (a compute→render cross-queue graph, distinct rings, no CPU
-stall). wgpu stays serialized-equivalent — this closed the v3.2.x arc. 3.3.0 adds **asset
-loading** — KTX2/DDS parsers in-tree + PNG via the new pure-Cyrius `chitra` package + a
-magic-byte sniffer (native PNG path HW-verified; 1 CRITICAL parser bug found + fixed pre-cut).
-3.4.0 adds **array textures + cubemaps** (Phase AA) — create / upload-per-layer-or-face /
-sample on both backends + DDS/KTX2 array+cube load, HW-verified end-to-end on Cezanne; 3.4.1
-clears the v3.4.1 backlog — native **BC (compressed) tiled arrays** + **wgpu draw-time layer
-selection** (both HW-verified) + a `MABDA_F64_*` stdlib symbol-collision fix; 3.4.2 fixes the
-native **render-target 64 KiB va_map alignment** + a **per-context RT VA allocator** (both
-HW-verified, found integrating into the `puka` terminal). **4.0.0 adds a third backend — a
-pure-Cyrius native NVIDIA path (nouveau DRM) for Turing (SM75)** — compute, textures, render,
-and present, all reachable through the same backend-agnostic public API and HW-proven on a
-GTX 1660 SUPER (TU116), then burned in ~30¾h across three soak runs (RSS-flat, dmesg Δ=0).
-The wgpu path stays for NVIDIA + Intel; **4.0.1 deprecates the AMD wgpu route** — AMD adapters get
-a one-shot deprecation warning but still work (escape hatch open); `-D MABDA_AMD_WGPU_STRICT`
-enforces native-only, and full AMD-wgpu retirement is deferred to a later release. See the CHANGELOG.)
+Version: 4.0.1 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
+**native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
+block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
+compiler, asset loading, and KMS present, all HW-verified on AMD Cezanne.
+**v4.0 added a pure-Cyrius native NVIDIA path** (nouveau DRM, Turing/SM75) —
+compute, textures, render, and present, HW-proven on a GTX 1660 SUPER (TU116)
+and burned in ~30¾h of soak (RSS-flat, dmesg Δ=0). **v4.0.1 deprecates
+AMD-on-wgpu** (one-shot warning, still works; `-D MABDA_AMD_WGPU_STRICT` enforces
+native-only; retirement deferred). See [CHANGELOG.md](CHANGELOG.md) for the full
+release history and *Hardware support* below.
 
 ## Features
 
+- **Three backends, one API** — wgpu-native (cross-vendor default), pure-Cyrius **native AMD** (amdgpu DRM / GFX9 / PM4), pure-Cyrius **native NVIDIA** (nouveau DRM / SM75). Backend chosen at build time via `MABDA_BACKEND_KIND`; the `@public` API is byte-identical across all three.
 - **Device lifecycle** — GpuContext creation with adapter/device/queue management
-- **Buffer management** — storage, uniform, vertex, index, staging, indirect buffers; synchronous readback; GrowableBuffer with generation tracking
+- **Buffer management** — storage, uniform, vertex, index, staging, indirect buffers; synchronous readback; buffer-to-buffer copy; GrowableBuffer with generation tracking
 - **Compute pipelines** — shader compilation, bind group layout, dispatch, PingPongBuffer
 - **Render pipelines** — `render_pipeline_create_simple` for full-screen effects, legacy `rpb_*` builder for back-compat
-- **Textures** — RGBA creation, TextureCache, mip levels, dimension validation
+- **Textures** — RGBA + block-compressed (BC1/3/4/5/7) + array/cubemap; creation, TextureCache, mip levels, GPU sampling, dimension validation
+- **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
 - **Render targets** — offscreen framebuffers with optional MSAA and depth
+- **Asset loading** — KTX2 / DDS parsers in-tree + PNG via the `chitra` package (opt-in, `-D MABDA_PNG`)
+- **Native SPIR-V → GFX9 compiler** — in-tree compute-shader lowering (structured control flow, int div/mod, vectors, f64), HW-verified on Cezanne
+- **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
 - **Profiling** — FrameProfiler with EMA smoothing, frame history, explicit scope timing
 - **Caching** — ShaderCache, PipelineCache, BindGroupCache for GPU resource deduplication
 - **Capabilities** — GPU feature/limit detection, WebGPU compatibility constants
 
 ## Quick Start
 
-mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~515 KB it would
-blow the stdlib preprocess cap). Its stdlib deps that aren't in the cyrius
-auto-prepend union must be `include`d **explicitly, in this order, before
-`mabda`** (the base stdlib — `string`/`alloc`/`str`/`fmt`/`vec`/`io`/… — is
-auto-prepended by `cyrius`, so only these three are manual):
+mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~1.2 MB it would
+blow the stdlib preprocess cap). The base stdlib (`string`/`alloc`/`str`/`fmt`/
+`vec`/`io`/…) is auto-prepended by `cyrius`; a minimal consumer includes only
+these three manually, in this order, before `mabda`:
 
 ```cyrius
 include "lib/mmap.cyr"     # mmap flags (MAP_SHARED, …) — GPU buffer mapping
@@ -114,18 +79,32 @@ fn mabda_main(fn_table_ptr, preinit_ptr) {
 
 `_cyrius_init()` and `alloc_init()` are called by the C launcher before
 `mabda_main` runs — see [docs/stdlib-integration.md](docs/stdlib-integration.md)
-for the full wiring.
+for the full wiring. (The C launcher + `wgpu_ffi_init_table` shown above are the
+**wgpu path**; native backends select via `MABDA_BACKEND_KIND` +
+`gpu_context_new_native()` / `gpu_context_new_native_nvidia()` and don't use the
+launcher.)
+
+Two features need extra deps, opt-in via compile flags: **PNG asset loading**
+(`-D MABDA_PNG`) pulls `[deps.chitra]` (tag 0.1.0) + stdlib `thread`/`sankoch`
+(include their `lib/*.cyr` before `mabda`); **logind master delegation**
+(`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 0.4.1). A minimal consumer needs
+neither — the dist compiles those paths out without the flags.
 
 ## Modules
 
 | Layer | Modules |
 |-------|---------|
 | **Core** | error, color, capabilities, context, profiler, resource, debug |
-| **Buffers** | buffer, typed_buffer, compute (workgroup math, dispatch, PingPongBuffer), gpu_timestamps |
-| **Graphics** | vertex, blend, sampler, depth, texture, bind_group, instancing |
-| **Render** | render_target, render_pipeline, render_pass, surface |
-| **Caching** | cache_key, shader_cache, pipeline_cache, bind_group_cache |
-| **FFI** (`@internal`) | wgpu_types, wgpu_descriptors, wgpu_ffi |
+| **Buffers / compute** | buffer, typed_buffer, compute (workgroup math, dispatch, PingPongBuffer), gpu_timestamps |
+| **Graphics** | vertex, blend, sampler, depth, texture, texture_format, bind_group, instancing |
+| **Render** | render_target, render_pipeline, render_pass, render_graph, queue, surface, surface_v3 |
+| **Assets** | asset_format, asset_load (KTX2 / DDS / PNG-via-chitra) |
+| **Caching** | shader_cache, pipeline_cache, bind_group_cache |
+| **Backend abstraction** (`@internal`) | backend, backend_wgpu |
+| **Native AMD** (`@internal`) | backend_native, backend_native_amdgpu, backend_native_pm4, backend_native_shaders, backend_native_kms |
+| **SPIR-V → GFX9 compiler** (`@internal`) | spirv_parse, spirv_lower, mir, gfx9_encode, gfx9_isel, gfx9_regalloc, gfx9_waitcnt, gfx9_abi, gfx9_compile |
+| **Native NVIDIA** (`@internal`) | backend_nvidia, backend_nvidia_nouveau, backend_nvidia_push, backend_nvidia_qmd, backend_nvidia_sass, backend_nvidia_tex |
+| **wgpu FFI** (`@internal`) | wgpu_types, wgpu_descriptors, wgpu_ffi |
 
 ## Consumers
 
@@ -137,39 +116,34 @@ for the full wiring.
 | **bijli** | EM simulation (FDTD compute) |
 | **aethersafta** | Desktop compositor (GPU compositing) |
 | **kiran** | Game engine (via soorat) |
+| **puka** | Terminal emulator (GPU text rendering) |
 
 ## Architecture
 
-Mabda owns the wgpu-native FFI boundary. Consumers depend on mabda, not
-on wgpu directly.
+Mabda owns the GPU boundary. Consumers depend on mabda, not on wgpu or the
+kernel driver directly. The `@public` API is identical across all backends; the
+backend is a compile-time choice (`MABDA_BACKEND_KIND`), routed through an
+`@internal` `Backend` slot table.
 
 ```
 Consumer (soorat, bijli, ...)
     ↓
-  mabda (GPU abstraction)
-    ↓
-  wgpu-native C API (via function table + C launcher)        ← the wgpu path (still the v3.x default)
-    ↓
-  Vulkan / Metal / DX12
+  mabda (GPU abstraction — same @public API on every backend)
+    ↓  @internal Backend slot table
+  ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
+  │ wgpu (cross-vendor    │ │ native AMD (v3.0)    │ │ native NVIDIA (v4.0)  │
+  │ default)              │ │ amdgpu DRM ioctls +  │ │ nouveau DRM +         │
+  │ wgpu-native + C       │ │ GFX9 PM4 + SPIR-V→   │ │ clc597 push + SM75    │
+  │ launcher → Vulkan /   │ │ GFX9 compiler + KMS  │ │ SASS + KMS present    │
+  │ Metal / DX12          │ │ (GFX9 verified)      │ │ (Turing/SM75 verified)│
+  └──────────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
-In v3.0 a second backend lands alongside the wgpu path. It is selected
-per-consumer; both coexist. Today the native backend is AMD-only:
-
-```
-Consumer (soorat, bijli, ...)
-    ↓
-  mabda (GPU abstraction — same @public API on both backends)
-    ↓
-  ┌──────────────────────────────┐  ┌──────────────────────────────┐
-  │ wgpu backend (default)       │  │ native backend (v3.0, opt-in)│
-  │   wgpu-native + C launcher   │  │   pure Cyrius, AMD/amdgpu    │
-  │   Vulkan / Metal / DX12      │  │   DRM ioctls + GFX9 ISA + PM4│
-  │   AMD / NVIDIA / Intel       │  │   AMD only (GFX9 verified;   │
-  │   on Linux/macOS/Windows     │  │   NVIDIA + Intel = future    │
-  │                              │  │   work, see roadmap)         │
-  └──────────────────────────────┘  └──────────────────────────────┘
-```
+The wgpu path is the cross-vendor default; **AMD-on-wgpu is deprecated at
+v4.0.1** (native-only, warn+allow; `-D MABDA_AMD_WGPU_STRICT` enforces). NVIDIA
++ Intel keep their wgpu route until their native backends are in production
+(NVIDIA native shipped v4.0; Intel is tentatively v5.0). See
+[ADR 006](docs/adr/006-native-cyrius-gpu-backend.md).
 
 ## Hardware support
 
@@ -180,9 +154,9 @@ roadmap is in [docs/development/roadmap.md](docs/development/roadmap.md).
 
 | Backend           | Vendors                  | Status                             |
 |-------------------|--------------------------|------------------------------------|
-| `wgpu`            | AMD, NVIDIA, Intel (anything wgpu-native + Vulkan/Metal/DX12 supports) | **Default. Shipping.** All v2.x consumers run here. Retires per-chipset as each vendor's native path matures. |
+| `wgpu`            | NVIDIA, Intel (+ AMD, **deprecated** at v4.0.1)                        | **Cross-vendor default. Shipping.** AMD-on-wgpu is deprecated at v4.0.1 (warn+allow; `-D MABDA_AMD_WGPU_STRICT` enforces native-only). Retires per-chipset as each vendor's native path matures. |
 | `native` (AMD)    | AMD                      | **Shipping (v3.0 GA + the v3.1–v3.4 arcs).** Compute, textures (incl. BC-compressed + arrays/cubes), render, multi-queue, a SPIR-V→GFX9 f64 compiler, and KMS present all verified end-to-end on AMD Cezanne (gfx90c, GFX9). Other GFX families (GFX10/11/12, RDNA*) not yet exercised — same amdgpu / PM4 / DRM ioctl path, but each generation needs its own bring-up. |
-| `native` (NVIDIA) | NVIDIA                   | **Scoped to v4.0.** Different submission path entirely (nouveau / nvgpu, no PM4, different ISA). NVIDIA consumers stay on `wgpu` until v4.0 ships. |
+| `native` (NVIDIA) | NVIDIA                   | **Shipping (v4.0).** Compute, textures (incl. GPU sampling), render, and KMS present HW-verified on Turing / SM75 (GTX 1660 SUPER / TU116); ~30¾h soak (RSS-flat, dmesg Δ=0). nouveau DRM + clc597 push + SM75 SASS, no PM4. Other SM families not yet exercised — each needs its own bring-up. |
 | `native` (Intel)  | Intel                    | **Tentative for v5.0.** Different submission path (i915 / Xe, no PM4, Gen ISA). Intel consumers stay on `wgpu` until v5.0 ships. |
 
 **Per-chipset retirement.** When a vendor's native backend has been
@@ -215,7 +189,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.2.29+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.3.23+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -226,7 +200,7 @@ cyrius deps
 # Full gate sweep (lint, fmt, vet, version-check, distlib-sync, tests, bench)
 make test-all
 
-# CPU-only unit suite (4578 assertions across 17 domain files)
+# CPU-only unit suite (4917 assertions across 18 domain files)
 make test            # globs tests/tcyr/*.tcyr (count via scripts/count-test-assertions.sh)
 
 # CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
@@ -245,14 +219,14 @@ make bench-gpu                                # 13 GPU benches
 
 ```
 mabda/
-├── src/                 50 modules (31 @public + 19 @internal FFI/backend)
+├── src/                 57 modules (32 @public + 25 @internal FFI/backend)
 │                        (src/lib.cyr is the single include chain)
 ├── tests/
-│   ├── tcyr/                     17 functionality-named domain suites — core,
+│   ├── tcyr/                     18 functionality-named domain suites — core,
 │   │                            buffer, compute, texture, graphics, render,
-│   │                            backend, caches, surface, native, kms, queue,
-│   │                            asset_load, compiler_{encode,lower,backend,compile}
-│   │                            (4578 asserts; `make test` globs them all)
+│   │                            backend, caches, surface, native, nvidia, kms,
+│   │                            queue, asset_load, compiler_{lower,backend,compile}
+│   │                            (4917 asserts; `make test` globs them all)
 │   └── bcyr/mabda.bcyr           CPU-only benchmark harness (9 benches)
 ├── programs/            GPU integration programs (wgpu + native) + dev spikes + `benchmarks.cyr`
 │   ├── smoke.cyr                Link-check — `cyrius build` entry point
@@ -277,13 +251,14 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.0.0
+├── VERSION              4.0.1
 └── CHANGELOG.md
 ```
 
 The `@public` / `@internal` markers on line 1 of every `src/*.cyr` file
-are load-bearing: `@public` = stable API surface that survives the v3.0
-backend swap; `@internal` = FFI scaffolding that gets replaced. See
+are load-bearing: `@public` = stable API surface that is byte-identical across
+backends (wgpu / native AMD / native NVIDIA); `@internal` = FFI/backend
+scaffolding. See
 [docs/adr/005-public-api-surface-marking.md](docs/adr/005-public-api-surface-marking.md)
 and [docs/stdlib-integration.md](docs/stdlib-integration.md).
 
@@ -293,9 +268,9 @@ at [docs/rust-v1-bench-history.csv](docs/rust-v1-bench-history.csv).
 
 ## Security
 
-Mabda 2.3.0 shipped as the last audit-gated release before first-party
-trusted status. Full findings + remediation in
-[docs/audit/2026-04-19-audit.md](docs/audit/2026-04-19-audit.md).
+Mabda ships as a first-party trusted AGNOS package with a per-arc security
+audit. The audit history lives in [docs/audit/](docs/audit/) (latest:
+`2026-07-02-audit.md`, v4.0.1).
 Report vulnerabilities via the repository's
 [Security tab](../../security/advisories). See [SECURITY.md](SECURITY.md)
 for the policy.

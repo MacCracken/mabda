@@ -1,9 +1,10 @@
 # ADR 006: Native Cyrius GPU backend (DRM/KMS), added alongside ADR 004
 
-**Status:** Proposed (v3.0 design phase, branch `v3`)
+**Status:** Accepted — shipped v3.0 (native AMD, GA 2026-06-02) + v4.0 (native NVIDIA)
 **Date:** 2026-04-21
 **Updated:** 2026-04-28 — vendor scope clarified after Phase B.4 verified; wgpu retirement reframed per-chipset (v4.0 AMD, v5.0 NVIDIA, v5.1 Intel) instead of a single v4.0 event. See [development/roadmap.md](../development/roadmap.md).
 **Updated:** 2026-06-20 — AMD wgpu retirement slipped from v4.0 to **v4.0.1** to give AMD consumers a v4.x coexistence window. v4.0 now ships NVIDIA native only; the AMD wgpu drop (and the paired `samvada` C-shim retirement) lands at v4.0.1.
+**Updated:** 2026-07-02 — v4.0.1 shipped, but AMD-on-wgpu was made a **DEPRECATION, not a retirement**: a runtime adapter-vendorID guard warns and still allows AMD-on-wgpu by default (`-D MABDA_AMD_WGPU_STRICT` hard-rejects with `GPU_ERR_AMD_WGPU_DEPRECATED`); full retirement is deferred to a later release. The paired `samvada`/libsystemd C-shim retirement is likewise deferred under the roadmap escape hatch. Retirement is per-chipset deprecate-then-remove — body references below to AMD wgpu "retires at v4.0.1" should read "**deprecates** at v4.0.1." See [development/roadmap.md](../development/roadmap.md).
 **Supersedes:** n/a
 **Related:** ADR 004 (C launcher FFI — stays in-tree until per-chipset retirement; full removal at v5.1), ADR 005 (public API surface marking)
 
@@ -55,7 +56,7 @@ v3.x–v5.x line:
   stable.
 - **Selection:** per-consumer build-time. Compile-time constant
   `MABDA_BACKEND_KIND` in `src/lib.cyr` (per
-  [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md));
+  [`docs/proposals/v3-backend-interface.md`](../archive/proposals/v3-backend-interface.md));
   promotable to a `cyrius.cyml` flag in v3.1+ if consumer CI
   matrices need it.
 - **Default for v3.0:** `wgpu`. Consumers opt into `native`
@@ -183,7 +184,7 @@ Resolved during v3.0 design spike (some by Phase B.4 verification on
   lowering paths are per-vendor v4.0 / v5.0 design items.
 - **Selector ergonomics.** Resolved: compile-time constant
   `MABDA_BACKEND_KIND` in `src/lib.cyr`, per
-  [`docs/proposals/v3-backend-interface.md`](../proposals/v3-backend-interface.md).
+  [`docs/proposals/v3-backend-interface.md`](../archive/proposals/v3-backend-interface.md).
   Promotable to a `cyrius.cyml` flag in v3.1+ if needed.
 
 Still open at the time of this update:

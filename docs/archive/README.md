@@ -2,7 +2,7 @@
 
 Historical record. Nothing here is actionable; the fixes and features
 documented below all shipped. Kept for post-mortem value, not as
-a live workqueue. Live items live under `docs/issues/` and
+a live workqueue. Live items live under `docs/development/issues/` and
 `docs/proposals/` at the same level as this directory.
 
 ## Index
@@ -13,6 +13,9 @@ a live workqueue. Live items live under `docs/issues/` and
 |------------|------------------------------------------------------------------------------------------|-------------|
 | 2026-04-19 | [`fncall6` + wgpu crash — resolution](issues/2026-04-19-fncall6-wgpu-crash-resolution.md) | reclassified in v2.4.2 (SysV / AAPCS64 struct-by-value handshake, not a cyrius bug) |
 | 2026-04-19 | [phase0 build broken](issues/2026-04-19-phase0-build-broken.md)                          | cyrius 5.4.9 (upstream `_cyrius_init` fix) + mabda v2.4.0 (missing `lib/str.cyr` include) |
+| 2026-04-21 | [GFX9 store blocker (native AMD B.4)](issues/2026-04-21-gfx9-store-blocker.md)            | v3.0 native AMD bring-up — compute store proven (session25 B.4), 3.0.0 GA 2026-06-02 |
+| 2026-05-13 | [Native render Cezanne TDR](issues/2026-05-13-native-render-cezanne-tdr.md)              | Resolved 2026-05-13 (native render PM4 cache-flush sequencing) |
+| 2026-06-01 | [Soak stale-binary](issues/2026-06-01-soak-stale-binary.md)                              | Resolved — `soak.sh` rebuilds on staleness + monitor-death guard |
 
 ### Shipped proposals
 
@@ -58,6 +61,7 @@ record of what shipped is `CHANGELOG.md`.
 | v3.2  | [`3-2-punchlist.md`](punchlists/3-2-punchlist.md)             | 3.2.0 → 3.2.14 (texture & shader breadth: compressed textures, native sampling, SPIR-V + native SPIR-V→GFX9 compiler, f64, render-graph multi-queue), 2026-06-15 → 2026-06-19 |
 | v3.3  | [`3-3-punchlist.md`](punchlists/3-3-punchlist.md)             | 3.3.0 (asset loading — DDS/KTX2 in-tree + PNG via chitra + sniffer), 2026-06-19 |
 | v3.4  | [`3-4-punchlist.md`](punchlists/3-4-punchlist.md)             | 3.4.0 (array textures + cubemaps) + 3.4.1 (BC tiled arrays, wgpu draw-time layer, MABDA_F64_* fix), 2026-06-19 |
+| v4.0  | [`4-0-punchlist.md`](punchlists/4-0-punchlist.md)             | 4.0.0 (NVIDIA native backend — nouveau, Turing/SM75) + 4.0.1 (AMD wgpu deprecation), 2026-06-28 → 2026-07-02 |
 
 > v3.1's punchlist deferred items to **3.1.2** (TRANSFER→SDMA ring flip +
 > public buffer-copy API; render-graph multi-queue scheduling) — these all
@@ -68,3 +72,20 @@ record of what shipped is `CHANGELOG.md`.
 Cross-reference the `CHANGELOG.md` entries for the release each item
 shipped in; this directory is just the original analysis / scoping
 document, preserved for context.
+
+### Session handoffs & bring-up notes
+
+Per-session debugging handoffs and vendor bring-up capture-notes from
+completed arcs, kept for post-mortem value. `CHANGELOG.md` and the ADRs are
+the authoritative record.
+
+- `handoff/2026-04-*.md` — the v3.0 native-AMD GFX9 bring-up saga
+  (session9 → session26: the GEM/PM4/CS/CPC-fault investigation ending in the
+  B.4 compute-store proof and 3.0.0 GA).
+- `handoff/soak-2026-05*/`, `handoff/soak-2026-06-0[13]*/` — the v3.x AMD
+  soak-burn-in runs (compute/render/wgpu). The v4.0 NVIDIA soaks live in the
+  live `docs/handoff/` alongside the current GA evidence.
+- `handoff/2026-06-19-handoff.md` — stale v3.4-era "start here" pointer.
+- `development/nvidia-n4/n6/n7-capture-notes.md` — decoded NVK Vulkan captures
+  (compute / texture-sampling / triangle-draw) that seeded the v4.0 NVIDIA
+  backend; `development/nvidia-bringup-hardware.md` — the TU116 HW ladder.

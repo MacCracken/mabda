@@ -1,82 +1,48 @@
 # Mabda — Development Roadmap
 
-> GPU foundation layer for AGNOS. Written in Cyrius.
-> 51 domain modules, ~23,900 lines, 4578 CPU assertions across 17
-> functionality-named domain test files + GPU integration programs +
-> 9 CPU benches + 13 GPU benchmarks. `dist/mabda.cyr` bundle
-> ~23,900 lines.
->
-> _Header stats current as of v3.4.4 (2026-06-20): v3.0 (dual backend),
-> v3.1.0–3.1.1 (mipmaps + multi-queue), the full v3.2.x arc (compressed
-> textures → SPIR-V → native SPIR-V→GFX9 compiler → f64 → render-graph
-> multi-queue, 3.2.0–3.2.14), v3.3 (asset loading), v3.4 (array textures +
-> cubemaps, 3.4.0–3.4.2), the 3.4.3 render-graph v2.5.x-follow-up + va_map sweep,
-> and the 3.4.4 P(-1) hardening pass (audit clean) — all shipped, native
-> HW-verified on Cezanne. The v3.x feature arc is complete; next is v4.0
-> (NVIDIA native backend added — AMD wgpu retirement slipped to 4.0.1
-> to give AMD consumers a coexistence window)._
+> GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
+> public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
+> GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
+> **v4.0.1** (2026-07-02). Module/assertion/bundle counts live in the
+> filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
 release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
 source of truth for completed work. Shipped-section details are
 pruned from this file as each arc closes so it stays useful for
 planning instead of bloating with history (v2.x pruned 2026-04-21;
-v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19 once those arcs shipped).
+v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19; v4.0 / v4.0.1 pruned
+2026-07-02 — NVIDIA native backend + AMD-wgpu deprecation, arcs closed).
 
 ## The Long Arc
 
-Mabda is the **public GPU API** for the Cyrius ecosystem. It ships
-now via a C shim over wgpu-native so real projects (soorat, rasa,
-ranga, bijli, aethersafta, kiran) can depend on a stable,
-sovereign-owned surface immediately. In v3.0 a **pure Cyrius DRM/KMS
-backend is added alongside** the C launcher path — both coexist,
-selectable per consumer, so the same bench suite exercises both. This
-gives us a clean A/B across two axes: **(C hooks vs native Cyrius) ×
-(pre-5.6.x vs post-5.6.x compiler optimizations)**. The public API
-does not change when the native backend lands; consumer code stays
-byte-identical.
+Mabda is the **public GPU API** for the Cyrius ecosystem. It shipped
+first via a C shim over wgpu-native so real projects (soorat, rasa,
+ranga, bijli, aethersafta, kiran) could depend on a stable,
+sovereign-owned surface immediately. At v3.0 a **pure-Cyrius DRM/KMS
+backend landed alongside** the C launcher path (AMD / amdgpu / GFX9);
+at v4.0 a **second native backend** landed (NVIDIA / nouveau / SM75).
+All coexist, selectable per consumer, so the same bench suite exercises
+each. This gives a clean A/B across two axes: **(C hooks vs native
+Cyrius) × (pre-5.6.x vs post-5.6.x compiler optimizations)**. The public
+API does not change across backends; consumer code stays byte-identical.
 
-**Vendor scope of the native backend.** v3.0's native backend is
-**AMD-only** at first ship: it talks to the Linux `amdgpu` kernel
-driver via direct DRM ioctls, builds GFX9 PM4 packet streams, and
-ships pre-compiled GFX9 ISA. Phase B.4 verified the path end-to-end
-on AMD Cezanne (gfx90c). Other AMD generations (GFX10/11/12, RDNA*)
-share the path but need per-generation bring-up. **NVIDIA support is
-scoped to v4.0** (nouveau / nvgpu — different submission path
-entirely, no PM4) and **Intel support is tentatively v5.0** (i915 /
-Xe — different ISA and command streamer). NVIDIA and Intel hardware
-continues to run on the wgpu backend through v3.x, which remains the
-cross-vendor default.
+**Vendor scope of the native path.** AMD shipped native at **v3.0**
+(verified on Cezanne / gfx90c; other AMD generations — GFX10/11/12,
+RDNA\* — share the path but need per-generation bring-up). NVIDIA
+shipped native at **v4.0** (Turing / SM75, HW-verified on a GTX 1660
+SUPER / TU116; other SM families need bring-up). **Intel is tentatively
+v5.0** (i915 / Xe — different ISA and command streamer). Intel hardware
+continues on the wgpu backend, which remains the cross-vendor default;
+AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
+below).
 
 ```
-  v2.0.0 → v2.3.0  ─▶  Cyrius port + Rust-v1 parity + P(-1) audit      (shipped)
-  v2.4.0 → v2.4.5  ─▶  v1.0 parity completion + FFI validation +
-                        benchmark parity + cache hot-path unblock      (shipped)
-  v2.5.0           ─▶  render graph (DAG pass orchestration)           (shipped)
-       │
-       │                   kernel GPU driver work (parallel, AGNOS scope)
-       ▼
-  v2.5.x           ─▶  render graph follow-ups (out-of-order toposort,
-                        aliasing pass) — driven by consumer demand
-  v3.0   [SHIPPED] ─▶  dual-backend — native Cyrius (AMD/amdgpu/GFX9)
-                        added alongside wgpu+C; API unchanged; A/B
-                        bench matrix
-  v3.1   [SHIPPED] ─▶  mipmaps (3.1.0) + multi-queue (3.1.1) — arc done
-  v3.2   [SHIPPED] ─▶  texture & shader breadth — compressed textures +
-                        native sampling + SPIR-V + native SPIR-V→GFX9
-                        compiler + f64 + render-graph multi-queue
-                        (3.2.0–3.2.14) — arc done
-  v3.3   [SHIPPED] ─▶  asset loading — KTX2/DDS (in mabda) + PNG (via the
-                        new chitra package), 3.3.0 (JPEG → chitra v0.2+)
-  v3.4   [SHIPPED] ─▶  array textures + cubemaps (Phase AA / AL-ARRAY) —
-                        both backends + DDS/KTX2 load (3.4.0); 3.4.1 backlog +
-                        3.4.2 RT-allocator fixes cleared — arc done
+  v2.0.0 → v4.0.1  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+                        backend → texture/shader breadth → asset loading →
+                        array/cube textures → NVIDIA native → AMD-wgpu
+                        deprecation)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
-  v4.0             ─▶  NVIDIA native backend added (AMD wgpu still
-                        supported through 4.0.x)
-  v4.0.1           ─▶  AMD wgpu path DEPRECATED (warns + still works;
-                        -D MABDA_AMD_WGPU_STRICT enforces native-only;
-                        retirement deferred); NVIDIA + Intel on wgpu
   v5.0             ─▶  Intel native backend added (tentative); NVIDIA
                         wgpu path retires (NVIDIA → NVIDIA native only)
   v5.1             ─▶  Full wgpu retirement once Intel native is in
@@ -97,8 +63,8 @@ migration smooth: nobody on a wgpu-only chipset is forced to move
 before their native backend is real.
 
 The concrete cutovers:
-- **v4.0** — NVIDIA native ships. AMD wgpu **still supported** (one
-  release window of coexistence on AMD before the retirement).
+- **v4.0** — NVIDIA native shipped. AMD wgpu **still supported** (one
+  release window of coexistence on AMD before deprecation).
 - **v4.0.1** — AMD wgpu **deprecated** (one-shot warning; still works by
   default — escape hatch open; `-D MABDA_AMD_WGPU_STRICT` enforces
   native-only). Full AMD-wgpu retirement is deferred to a later release.
@@ -124,186 +90,11 @@ consumer accidentally couples to it.
 
 ---
 
-## Shipped — one-line history
-
-Source of truth: [`CHANGELOG.md`](../../CHANGELOG.md). Use that for
-detail; this table is a jump list.
-
-| Release | Theme |
-|---------|-------|
-| [3.4.4](../../CHANGELOG.md#344--2026-06-20) | P(-1) scaffold-hardening — security audit (clean: 0 real findings, all candidates verified false-positive), refactor/optimization review (codebase lean, 0 dead code), amdgpu/wgpu CVE sweep (kernel-side only, deployment advisory); stale IB-comment fix; toolchain 6.2.31 |
-| [3.4.3](../../CHANGELOG.md#343--2026-06-20) | Render-graph v2.5.x follow-ups (out-of-order toposort, aliasing-planner activation, per-node debug scopes, DOT export) + the native `va_map` 64 KiB sweep across all create paths (HW-verified on Cezanne); toolchain 6.2.30 |
-| [3.4.2](../../CHANGELOG.md#342--2026-06-19) | RT-allocator fixes (puka integration) — native render-target 64 KiB `va_map` alignment + per-context RT VA bump allocator (both HW-verified on Cezanne); `color_rgb` warning diagnosed consumer-side, `cyim` issue resolved |
-| [3.4.1](../../CHANGELOG.md#341--2026-06-19) | v3.4.1 backlog cleared — native BC tiled arrays + wgpu draw-time layer (both HW-verified on Cezanne) + the attn11 `F64_*`↔`math` stdlib collision fix (namespace `MABDA_F64_*`) |
-| [3.4.0](../../CHANGELOG.md#340--2026-06-19) | Array textures + cubemaps (Phase AA) — create/upload/sample on both backends + DDS/KTX2 array+cube load; HW-verified end-to-end on Cezanne (incl. the data-ordering capstone) |
-| [3.3.0](../../CHANGELOG.md#330--2026-06-19) | Asset loading (Phase AL) — DDS + KTX2 loaders (in mabda) + PNG via the chitra package + magic-byte sniffer; native PNG path HW-verified, 1 CRITICAL parser bug found+fixed pre-cut |
-| [3.2.14](../../CHANGELOG.md#3214--2026-06-19) | Render-graph multi-queue executor (Phase R) — native nodes on distinct rings, HW-verified; **closes the v3.2.x arc** |
-| [3.2.13](../../CHANGELOG.md#3213--2026-06-19) | Render-graph multi-queue foundations (Phase R) — node queue affinity + scheduler + native render-timeline dispatch |
-| [3.2.12](../../CHANGELOG.md#3212--2026-06-19) | Native f64 compute (Phase F) — SPIR-V→GFX9 emits `V_*_F64`, bit-exact on Cezanne |
-| [3.2.0–3.2.11](../../CHANGELOG.md) | Texture & shader breadth — compressed textures (T) + buffer-copy (X) + native sampling (TS) + SPIR-V ingestion (S) + native SPIR-V→GFX9 compiler (N: control flow, int div/mod, vectors, per-ext-set) |
-| [3.1.1](../../CHANGELOG.md#311--2026-06-15) | Multi-queue coordination — logical queues + native timeline rings, HW-verified |
-| [3.1.0](../../CHANGELOG.md#310--2026-06-15) | On-device mipmap generation — native (HW-verified) + wgpu |
-| [3.0.0](../../CHANGELOG.md#300--2026-06-02) | Dual-backend GA — pure-Cyrius native AMD (DRM / GFX9 / PM4) alongside wgpu; public API unchanged |
-| [2.5.0](../../CHANGELOG.md#250--2026-04-21) | Render graph — DAG pass orchestration, single encoder + single submit, 44 new regression assertions |
-| [2.4.5](../../CHANGELOG.md#245--2026-04-21) | Cache hot-path unblock — u64-keyed hashmap migration (cyrius v5.5.20); `bind_group_cache_hit` reaches Rust parity |
-| [2.4.4](../../CHANGELOG.md#244--2026-04-21) | Benchmark parity — 13 GPU benches ported, `depth_texture_new` / `rtb_build` latent stubs fixed |
-| [2.4.3](../../CHANGELOG.md#243--2026-04-20) | Render-pass FFI + render E2E (closes v1.0 checklist) |
-| [2.4.2](../../CHANGELOG.md#242--2026-04-20) | GPU runtime validation — FFI offset / enum sweep; compute E2E actually runs on GPU |
-| [2.4.1](../../CHANGELOG.md#241--2026-04-19) | Sakshi observability — opt-in structured logging and spans |
-| [2.4.0](../../CHANGELOG.md#240--2026-04-19) | v1.0 parity (partial) — compute E2E program, LOW audit sweep |
-| [2.3.0](../../CHANGELOG.md#230--2026-04-19) | P(-1) security audit — 0 CRITICAL / 2 HIGH / 6 MED / 6 LOW across 29 modules |
-| [2.2.0](../../CHANGELOG.md#220--2026-04-19) | Scaffolding refresh — flat layout, `cyrius.cyml`, `cyrius distlib` |
-| [2.1.2](../../CHANGELOG.md#212--2026-04-12) | Rust-source removal hygiene release |
-| [2.1.1](../../CHANGELOG.md#211--2026-04-12) | Stdlib inclusion — `dist/mabda.cyr` single-file bundle |
-| [2.1.0](../../CHANGELOG.md#210--2026-04-12) | Feature catch-up — `typed_buffer`, GPU timestamps, texture / render pipeline FFI |
-| [2.0.0](../../CHANGELOG.md#200--2026-04-11) | Cyrius port — complete Rust → Cyrius port of every module |
-| [1.0.0](../../CHANGELOG.md#100--2026-04-09) | Last Rust release, frozen as the Cyrius-port reference |
-
----
-
-## v2.5.x — Render graph follow-ups (cleared in 3.4.3)
-
-The four parked follow-ups all shipped in **3.4.3** (see the CHANGELOG):
-
-- **Full out-of-order toposort** ✅ — `rg_build` now derives an edge for any
-  (writer writes R, reader reads R) pair independent of insertion order, so a
-  reader inserted before its writer toposorts correctly. In-order graphs are a
-  strict subset (identical result).
-- **Resource aliasing pass** ✅ (planner activation) — `rg_aliasing(g, 1)` makes
-  `rg_build` auto-run the interval-coloring planner; the per-transient reuse
-  offsets are queryable via `rg_transient_offset` after build. The graph does
-  not own resource binding, so the offsets are the reuse **plan** a consumer
-  applies to its own backing store.
-- **Per-node debug scopes** ✅ (wrapping) — each node's encoding is wrapped in
-  `debug_push(node.label)` / `debug_pop` in `rg_execute`.
-- **Graph visualizer** ✅ — `rg_to_dot(g, out_buf, out_cap)` exports a graphviz
-  `digraph` (nodes + dependency edges, cross-queue edges dashed). Pure CPU.
-
-**Tracked remainders** (not blocking a consumer; ship when one asks):
-
-- **Encoder debug-group FFI.** The `debug_*` fns are no-op stubs until
-  `wgpuCommandEncoderPushDebugGroup` / `…Pop` land in the fn table — a
-  coordinated `deps/wgpu_main.c` launcher change (adding slots forces every
-  consumer to rebuild). Once wired, the 3.4.3 wrapping makes per-node scopes
-  visible in profilers with no further change.
-- **Fully-transparent aliasing backing reuse.** Actually sharing one GPU
-  allocation across disjoint-lifetime transients (rather than the consumer
-  applying the planner's offsets) needs a native transient-allocation
-  subsystem — wgpu's safe API has no placed/aliased resources, and the native
-  path has no rg-transient backing today. Its own future arc.
-
----
-
 ## v3.x+ — Web Target (Blocked)
 
 - **WebGPU / WASM target** — blocked on the Cyrius WASM backend
   landing in the compiler. No version commitment until that
   prerequisite exists. Tracked here so it doesn't get forgotten.
-
----
-
-## v4.0 — NVIDIA Native Backend (AMD wgpu Retirement Deferred to 4.0.1)
-
-v4.0 adds NVIDIA hardware to the native path. The AMD wgpu retirement
-that was originally bundled into v4.0 is **deferred to v4.0.1** to give
-AMD consumers a coexistence release window on the v4.x line (mirroring
-the per-vendor coexistence pattern the rest of the retirement schedule
-already follows). Through 4.0.x, AMD consumers can run on either AMD
-native or wgpu; NVIDIA + Intel consumers continue on wgpu. The wgpu
-binding code stays in-tree.
-
-Until v4.0 ships, NVIDIA consumers stay on the wgpu backend and AMD
-consumers can run on either backend.
-
-**What's different from v3.0's AMD work.** Almost everything below
-the `Backend` interface:
-
-- **Submission path.** No PM4. NVIDIA's command streamer takes a
-  different packet format (Maxwell+ class methods over channels);
-  the kernel-side abstraction is also different — either nouveau
-  via DRM, or nvidia.ko via `/dev/nvidia*` character devices.
-  Choice between nouveau (open-source, integrates with the existing
-  DRM ioctl pattern) and nvidia.ko (proprietary, performant, but a
-  C library / non-Cyrius dependency we'd be re-importing) is a
-  v4.0 design-spike question.
-- **Shader ISA.** No GFX9. NVIDIA shaders ship as PTX (a portable
-  IR — needs JIT) or as SASS (per-SM-class assembly). The WGSL → ISA
-  lowering path from v3.0 informs the architecture but the back end
-  is fully replaced.
-- **Memory model.** NVIDIA's BAR / staging behavior diverges from
-  AMD's (ReBAR semantics, CUDA-style unified memory). The
-  `gpu_memory_pooling` allocator decisions from v3 may need a
-  vendor-specific tuning pass.
-
-**Scope (refined closer to the work)**
-- **`src/backend_nvidia.cyr`** — fills the same `Backend` slots that
-  `src/backend_native.cyr` (AMD) does. The interface from v3.0 is
-  the contract; if a slot is too AMD-shaped, that's an interface
-  bug to revise, not a work-around.
-- **NVIDIA `programs/nvidia_compute_store.cyr` analogue** — same
-  proof-of-life flow that gated v3.0 B.4: dispatch → CPU readback
-  of `0xDEADBEEF`. Different driver path; same proof.
-- **`MABDA_BACKEND_KIND` gains `BACKEND_KIND_NVIDIA`.** Backend
-  selection is still compile-time; `cyrius.cyml` flag remains an
-  option if consumer CI matrices need runtime-ish selection.
-- **Dual-backend bench harness** widens to a 4-axis matrix: vendor
-  × {wgpu, native} × {pre-/post-5.6.x} × bench. AMD's table doubles;
-  NVIDIA gets its own.
-- **ADR 007** — proposed during v4.0 design. Documents the
-  nouveau-vs-nvidia.ko decision and the SASS/PTX choice.
-
-**Exit criteria**
-- All v3.0 exit programs pass under `native` on NVIDIA hardware. The
-  bring-up hardware ladder — Turing first (GTX 1660 Super), then
-  Ampere (RTX 3060 12 GB), one card per generation — is tracked in
-  [nvidia-bringup-hardware.md](nvidia-bringup-hardware.md).
-- soorat (smoke-test consumer) builds and runs under
-  `BACKEND_KIND_NVIDIA` in CI on NVIDIA hardware.
-- The NVIDIA work doesn't regress AMD or wgpu paths.
-- **AMD wgpu retirement** (slipped to **v4.0.1**): every AMD-using
-  consumer has been on the AMD native backend in production across
-  a full v3.x release cycle, with v4.0 providing one more coexistence
-  window. At v4.0.1 ship, the AMD code paths in `src/wgpu_*.cyr` /
-  `src/backend_wgpu.cyr` either get a `BACKEND_KIND_AMD` guard that
-  errors out, or the AMD-specific wgpu wiring is removed (the wgpu
-  *binding* stays for NVIDIA + Intel; AMD consumers no longer have
-  a wgpu route).
-- **`samvada` C-shim retirement** (paired with the AMD wgpu retirement
-  on the **v4.0.1** beat). The `samvada` package's v3.x C shim around
-  `libsystemd`'s `sd_bus_*` (mirroring mabda's `wgpu_main.c` pattern)
-  gets replaced by a pure-Cyrius dbus marshaller, OR removed entirely
-  if the v4.0.x logind story evolves (e.g., kernel-level master
-  delegation lands in a way that obviates dbus). Treated as a peer of
-  the AMD wgpu retirement: both C-shim deps for v3.x feature surfaces
-  drop together at v4.0.1. If the pure-Cyrius dbus implementation
-  isn't ready, the C shim can survive into v4.x — but the commitment
-  is "both C-shim deps go at v4.0.1 if we ship them in v3.x."
-
-**v4.0.1 status (shipped).**
-- **AMD wgpu — DEPRECATED at v4.0.1 (not retired; escape hatch open).** Policy
-  refined during the cut: wgpu is *deprecated* per-chipset, not hard-retired —
-  each vendor gets a deprecation window with an escape hatch before actual
-  removal. Mechanism is a **runtime adapter-vendorID guard** in
-  `gpu_context_from_preinit`: on the wgpu fallthrough it reads
-  `WGPUAdapterInfo.vendorID` (offset-verified) and, for AMD (`0x1002`), by
-  DEFAULT prints a one-shot deprecation notice and **still creates the context**
-  (escape hatch). `-D MABDA_AMD_WGPU_STRICT` turns it into a hard reject
-  (`GPU_ERR_AMD_WGPU_DEPRECATED`) for consumers ready to enforce. NVIDIA/Intel
-  are untouched; the wgpu binding stays to v5.1. Full AMD-wgpu retirement is
-  deferred to a later release (the "guard that errors out" the roadmap
-  originally sketched is now the opt-in strict mode). Neither literal roadmap
-  option was functional as written: a compile-time `BACKEND_KIND_AMD` guard
-  inside the wgpu files is dead code (an AMD build routes to native, never
-  enters wgpu), and there is zero AMD-specific wgpu wiring to remove (adapter
-  selection is power-preference-only, delegated to wgpu-native).
-- **`samvada` C-shim retirement — DEFERRED (escape hatch exercised).** The
-  pure-Cyrius replacement is a full native dbus client (SASL EXTERNAL +
-  SCM_RIGHTS master-fd passing) that lives upstream in samvada and isn't
-  ready (samvada still `0.4.1`/`LIBSYSTEMD`). mabda's coupling is already
-  dormant (`#ifdef MABDA_LOGIND`, off by default), so no v4.0.1 code change.
-  **Forward plan:** evolve the samvada dbus project into the native
-  pure-Cyrius dbus for AGNOS; when it ships 1.0, mabda swaps via a one-line
-  `[deps.samvada]` tag bump. Do not mark this retirement Shipped.
 
 ---
 
@@ -386,8 +177,27 @@ vendor-driven, not calendar-driven.
 
 ## Backlog (not yet scheduled)
 
-Empty. New items land here first and graduate to a version once
+Unscheduled forward work — lands here first, graduates to a version once
 there's consumer demand plus a clear scope.
+
+- **samvada C-shim → pure-Cyrius dbus.** The samvada `libsystemd` C-shim
+  retirement (paired with the AMD-wgpu step) was **deferred at v4.0.1** under
+  the roadmap escape hatch. Forward plan: evolve the samvada dbus project into
+  a pure-Cyrius native dbus client (AF_UNIX system bus + SASL EXTERNAL +
+  SCM_RIGHTS master-fd passing); when samvada ships pure-Cyrius 1.0, mabda
+  swaps via a one-line `[deps.samvada]` tag bump + `cyrius deps`, then drops
+  libsystemd. mabda's coupling is dormant today (`#ifdef MABDA_LOGIND`, off by
+  default) — call signatures are impl-agnostic.
+- **Encoder debug-group FFI.** The `debug_*` fns are no-op stubs until
+  `wgpuCommandEncoderPushDebugGroup` / `…Pop` land in the fn table — a
+  coordinated `deps/wgpu_main.c` launcher change (adding slots forces every
+  consumer to rebuild). The 3.4.3 per-node scope wrapping makes them visible in
+  profilers once wired.
+- **Fully-transparent aliasing backing reuse.** Actually sharing one GPU
+  allocation across disjoint-lifetime render-graph transients (rather than the
+  consumer applying the planner's offsets) needs a native transient-allocation
+  subsystem — wgpu's safe API has no placed/aliased resources, and the native
+  path has no rg-transient backing today. Its own future arc.
 
 ---
 
@@ -398,6 +208,7 @@ there's consumer demand plus a clear scope.
 | [001](../adr/001-gpucontext-public-fields.md) | GpuContext uses accessor functions (`load64` at fixed offsets) |
 | [002](../adr/002-runtime-alignment-validation.md) | Runtime alignment check for uniform buffers (bitwise AND) |
 | [003](../adr/003-fixed-vertex-types.md) | Fixed vertex types, manual layout, no codegen |
-| [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI — permanent, coexists with native backend from v3.0 onward |
+| [004](../adr/004-c-launcher-ffi.md) | C launcher with function table for wgpu-native FFI — coexists with the native backends; leaves the tree at v5.1 |
 | [005](../adr/005-public-api-surface-marking.md) | Public API surface marking (`# @public` / `# @internal`) — the stability boundary that holds across backends |
-| [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — adds a second backend alongside ADR 004 during v3.x; wgpu path retires per-chipset (AMD at v4.0.1, NVIDIA at v5.0, Intel/full at v5.1) (shipped in v3.0, 2026-06-02) |
+| [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — a second backend alongside ADR 004 (AMD v3.0, NVIDIA v4.0); wgpu deprecates/retires per-chipset (AMD **deprecated** at v4.0.1, NVIDIA retires at v5.0, Intel/full at v5.1) |
+| [007](../adr/007-nvidia-native-kernel-path.md) | NVIDIA native kernel path (nouveau DRM, SM75 SASS) — the per-vendor expansion of ADR 006 (shipped in v4.0) |

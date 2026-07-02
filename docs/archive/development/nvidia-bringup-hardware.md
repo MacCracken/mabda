@@ -2,7 +2,7 @@
 
 Tracks the physical GPUs used to bring up mabda's v4.0 NVIDIA native
 backend, in order, and why the ladder is shaped this way. Referenced
-from the v4.0 section of [roadmap.md](roadmap.md).
+from the v4.0 section of [roadmap.md](../../development/roadmap.md).
 
 ## Why a ladder
 

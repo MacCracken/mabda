@@ -1,6 +1,7 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0 / Cyrius 5.11.28. Pairs with
+> Written against mabda 3.0.0; still applicable through 4.0.1 (see the
+> v4.0.1 update below for what changed). Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
 > wgpu-OR-native consumer that swaps backends without changing
@@ -16,47 +17,60 @@
 > not yet cover every wgpu feature — notably instancing (`ic > 1`) and
 > odd-dimension render targets are rejected — so confirm before flipping.
 
-## Why two backends
+## Why three backends
 
-mabda v3.0 ships two GPU paths against the same public API:
+mabda ships three GPU paths against the same public API (as of v4.0.1):
 
 | Backend | Stack | Where it shines |
 |---|---|---|
-| `BACKEND_KIND_WGPU` (v2 default) | wgpu-native v29 → Vulkan/Metal/DX12 | Cross-platform, every desktop GPU works, mature drivers |
-| `BACKEND_KIND_AMD` (v3 new) | direct AMDGPU DRM ioctls (no libdrm) | Own-the-stack, no wgpu-native runtime, AMD-only |
+| `BACKEND_KIND_WGPU` (cross-vendor default) | wgpu-native v29 → Vulkan/Metal/DX12 | Cross-platform, every desktop GPU works, mature drivers. Per-vendor-deprecating — AMD-on-wgpu is deprecated at v4.0.1 (warn+allow; `-D MABDA_AMD_WGPU_STRICT` hard-rejects) |
+| `BACKEND_KIND_AMD` (native, v3.0) | direct AMDGPU DRM ioctls (no libdrm), GFX9 | Own-the-stack, no wgpu-native runtime, AMD-only |
+| `BACKEND_KIND_NVIDIA` (native, v4.0) | direct nouveau DRM ioctls (no libdrm), SM75/Turing | Own-the-stack, no wgpu-native runtime, NVIDIA-only |
 
 The public surface — `gpu_buffer_*`, `gpu_compute_dispatch`,
-`gpu_texture_*`, `gpu_render_*`, `gpu_surface_*` — is the same on
-both. The choice is a single `gpu_context_new_*` selector at init.
+`gpu_texture_*`, `gpu_render_*`, `gpu_surface_*` — is the same on all
+three. The choice is a single compile-time `MABDA_BACKEND_KIND`
+selector plus the matching `gpu_context_*` entry at init.
 
 ## Pick the backend
 
 ```cyrius
-# wgpu — exactly as v2.x. No code changes.
-var ctx = gpu_context_new(fn_table_ptr, preinit_ptr);
+# wgpu — exactly as v2.x. No code changes. Takes the C-built preinit ptr.
+var ctx = gpu_context_from_preinit(preinit_ptr);
 
-# native — AMD only, requires /dev/dri/renderD128 readable
+# native AMD — requires /dev/dri/renderD128 readable
 var ctx = gpu_context_new_native();
+
+# native NVIDIA (v4.0) — nouveau, requires /dev/dri/renderD128 readable
+var ctx = gpu_context_new_native_nvidia();
 ```
 
-Both return a `GpuContext*` with the same shape (112 bytes in v3.0;
-the new +96 / +104 slots are surface-stash that backend-agnostic
-code never reads).
+All three return a `GpuContext*` with the same shape
+(`GPU_CONTEXT_SIZE` = 176 bytes; see `src/context.cyr`). The extra
+slots past the wgpu handles are native surface-stash / RT-VA state
+that backend-agnostic code never reads.
 
 ## Shaders are byte-polymorphic
 
 `gpu_shader_module_create(ctx, bytes_ptr, n)` is byte-polymorphic at
-the backend boundary:
+the backend boundary. The source-kind tags live in `src/backend.cyr`
+(`SHADER_SRC_WGSL` = 0, `SHADER_SRC_SPIRV` = 1, `SHADER_SRC_GFX9` = 2,
+`SHADER_SRC_SASS` = 3):
 
-| Backend | Interpretation |
+| Backend | Accepted forms |
 |---|---|
-| wgpu | bytes are WGSL UTF-8 source |
-| native | bytes are pre-compiled GFX9 ISA |
+| wgpu | WGSL UTF-8 source (`SHADER_SRC_WGSL`) or SPIR-V binary (`SHADER_SRC_SPIRV`) |
+| native AMD | pre-compiled GFX9 ISA (`SHADER_SRC_GFX9`) |
+| native NVIDIA | pre-compiled SM75 SASS (`SHADER_SRC_SASS`) |
 
-Consumer ships **two-form bundles** in v3.0 — one WGSL string and one
-GFX9 binary per shader. The build picks which one flows based on the
-backend selection. In-mabda WGSL → GFX9 lowering is deferred to v3.x
-(see [`docs/proposals/v3-wgsl-frontend-choice.md`](../proposals/v3-wgsl-frontend-choice.md)).
+Consumer ships **multi-form bundles** — a WGSL/SPIR-V blob plus the
+per-native binary for whichever native backend it targets. The build
+picks which one flows based on the backend selection. Note that mabda
+grew an in-tree **SPIR-V → GFX9 compiler** across v3.2.5–v3.2.12
+(`_native_shader_compile_spirv` in `src/backend_native.cyr`), so on the
+native AMD path you can feed SPIR-V and let mabda lower it rather than
+hand-shipping GFX9 ISA. The NVIDIA SPIR-V → SASS front-end is the v4.x
+endgame (N9); until it lands, the NVIDIA path takes pre-compiled SASS.
 
 For the GFX9 form, two paths:
 
@@ -155,29 +169,40 @@ mismatch.
 
 ## Render target dimension constraints (native)
 
-Native render targets created via `gpu_render_target_*` must have
-**even** width and height. The v2-native fixed shader's viewport
-math uses `rt_width / 2` (integer divide) and odd dimensions lose
-the half-pixel. The allocator returns `GPU_ERR_TEXTURE_DIMENSION`
-on odd dims.
+Native render targets created via `gpu_render_target_*` must still
+have **even** width and height — the fixed native shader's viewport
+math uses an integer `rt_width / 2` divide and odd dimensions lose the
+half-pixel, so `native_rt_create_2d_rgba8` (`src/backend_native.cyr`)
+rejects odd dims with `GPU_ERR_TEXTURE_DIMENSION`. It also caps the
+dimension via the shared `validate_dimensions(w, h,
+MABDA_MAX_TEXTURE_DIM_2D)` guard before the size math. This constraint
+is unchanged; dropping it (f64 viewport math) is still deferred.
 
-This is a v3.0 limitation — v3.x will switch to f64-based viewport
-math and drop the constraint.
+What **did** change is RT VA allocation. v3.4.2 replaced the old
+single fixed RT VA with a **per-context RT VA sub-allocator**
+(`native_ctx_alloc_rt_va`, cursor at ctx +168, 256 MiB bump region at
+`_NATIVE_RT_VA_BASE`), so multiple live render targets no longer
+collide on one VA; v3.4.3 raised the GEM_VA span alignment to 64 KiB
+to avoid an `EINVAL` on 4-KiB-but-not-64-KiB spans.
 
-## Compute / draw caveats (native v3.0)
+## Compute / draw caveats (native)
 
-- Single-shader-pair-per-pipeline. v2-native's render path uses a
+- Single-shader-pair-per-pipeline. The native render path uses a
   fixed FS+VS pair set up at pipeline create time.
-- `vc` / `ic` (vertex / instance counts) on `render_pass_draw` are
-  accepted for ABI parity but the dispatch is fixed at 3-vertex /
-  1-instance (i.e. fullscreen-triangle). v3.x extends to honour
-  caller-supplied counts.
-- `gpu_buffer_create` / `_write` / `_read` slots return
-  `GPU_ERR_OTHER` (stub) on the native backend in v3.0. Use the
-  in-tree `native_buf_pair_*` private API for compute store/load
-  smoke shapes; consumer-facing buffer abstractions are v3.x scope.
-- `gpu_shader_module_create` accepts pre-compiled GFX9 ISA bytes;
-  see "Shaders are byte-polymorphic" above.
+- `vc` (vertex count) on `render_pass_draw` is now **honoured** —
+  `_backend_native_render_pass_draw` rejects `vc <= 0` and draws the
+  caller-supplied count. Instancing is still single-shot: `ic != 1`
+  returns `GPU_ERR_NOT_IMPLEMENTED` (multi-instance is future work).
+- `gpu_buffer_create` / `_write` / `_read` are **real** on the native
+  backend as of v3.2 (Phase X) — see
+  `_backend_native_buffer_create` / `_write` / `_read` in
+  `src/backend_native.cyr`. Create allocates a 64 KiB-aligned GTT BO
+  and VA-maps it; write/read are bounds-checked coherent memcpys into
+  the mmap. This unblocks the public transfer-copy API
+  (`gpu_buffer_copy`) and portable buffer code across backends.
+- `gpu_shader_module_create` accepts pre-compiled GFX9 ISA (AMD) or
+  SM75 SASS (NVIDIA), and SPIR-V on the AMD path via the in-tree
+  compiler; see "Shaders are byte-polymorphic" above.
 
 ## Test matrix the consumer should run
 
@@ -204,28 +229,29 @@ the wgpu path.
 
 ## When to flip
 
-- **Stay on wgpu** if cross-platform matters, or if NVIDIA/Intel are
-  in scope. Native is AMD-only in v3.0.
-- **Consider native** if your consumer is AGNOS-targeted (AMD only),
-  or if the wgpu-native runtime cost / dependency is a problem you
-  want to drop. The native path has ~2x lower CPU overhead for the
-  smoke shapes (no FFI marshalling, direct ioctl) but a much smaller
-  feature surface in v3.0.
-- **Ship both** by writing your code against the public API and
-  selecting the backend at consumer-init time. That's the v3.0
-  architectural sell — same code, two backends, swap at startup.
+- **Stay on wgpu** if cross-platform matters, or if Intel is in scope
+  (Intel has no native backend). Native now covers both AMD (v3.0) and
+  NVIDIA (v4.0); Intel-native is not planned.
+- **Consider native** if your consumer is AGNOS-targeted, or if the
+  wgpu-native runtime cost / dependency is a problem you want to drop.
+  The native path has ~2x lower CPU overhead for the smoke shapes (no
+  FFI marshalling, direct ioctl) but a smaller feature surface than
+  wgpu.
+- **Ship all three** by writing your code against the public API and
+  selecting `MABDA_BACKEND_KIND` at consumer-build time. That's the
+  architectural sell — same code, three backends, swap at startup.
 
-## Known v3.0 limitations (deferred to v3.x)
+## Known native limitations
 
-From the [2026-04-30 audit](../audit/2026-04-30-audit.md), the
-following items file as v3.x backlog:
+From the [2026-04-30 audit](../audit/2026-04-30-audit.md), these items
+remain open backlog (the native `gpu_buffer_*` slot impls (LOW-3) and
+`vc` honouring (part of LOW-4) have since shipped — see the caveats
+above):
 
-- Caller-supplied dimension overflow guards (MED-2)
 - Two-pass DRM discovery TOCTOU clamping (MED-4)
 - `set_master` `-EINVAL` ambiguity (MED-5)
 - Bump-allocator leaks in long-running compositors (MED-7, LOW-5)
-- `vc` / `ic` honoured in native render (LOW-4)
-- Native `gpu_buffer_*` / `gpu_shader_module_*` slot impls (LOW-3)
+- Multi-instance draws (`ic > 1`) in native render (remainder of LOW-4)
 - Defense-in-depth nits (LOW-1, LOW-2)
 
 None of these block normal consumer integration today; all surface
@@ -235,6 +261,6 @@ long-running production-shape workloads (compositor / game engine).
 ## Questions / report back
 
 If your consumer hits a wall the audit didn't predict, file under
-`docs/issues/` with the `native-backend` tag. Phase B/C/D coverage
+`docs/development/issues/` with the `native-backend` tag. Phase B/C/D coverage
 is bounded by the in-tree test matrix — your real workload is the
 real test.

@@ -32,7 +32,7 @@ main merged (garbage-free). (2026-06-28)**
 > nouveau's async EXEC fence signaled. The dispatch had always completed.
 > The QMD/SASS/method stream were correct all along; the "five eliminated
 > causes" were red herrings (except the real memory-windows fix). Full
-> writeup in [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md)
+> writeup in [`nvidia-n4-capture-notes.md`](../development/nvidia-n4-capture-notes.md)
 > § N4 implementation status — GATE GREEN. The NVK-capture harness is
 > preserved at `tools/nvidia-capture/`.
 >
@@ -80,8 +80,8 @@ main merged (garbage-free). (2026-06-28)**
 > (`-render-target`)**, **N7.4 RENDER GATE (`-render-e2e`)**, **N7.5 public
 > render API (`-render-api`)**. CPU suite: `tests/tcyr/nvidia.tcyr` (283
 > asserts). ADR 007 **Accepted**.
-**Roadmap reference:** [`roadmap.md` § v4.0](roadmap.md#v40--nvidia-native-backend-amd-wgpu-retirement-deferred-to-401)
-**Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md).
+**Roadmap reference:** [`roadmap.md` § v4.0](../../development/roadmap.md)
+**Bring-up hardware:** Turing first — GTX 1660 Super (TU116, SM75, 6 GB GDDR6) — then Ampere (RTX 3060). Tracked in [`nvidia-bringup-hardware.md`](../development/nvidia-bringup-hardware.md).
 
 > This arc adds a **pure-ioctl native NVIDIA path** that fills the same
 > `@internal` `Backend` slot table (`src/backend.cyr`,
@@ -327,7 +327,7 @@ an afternoon to a few days.
   Clone Linux `include/uapi/drm/nouveau_drm.h` for the nouveau path. Read
   only — no code yet.
 - [x] **N0.3 (Fork 1) — DECIDED: nouveau.** ADR 007 landed
-  ([`docs/adr/007-nvidia-native-kernel-path.md`](../adr/007-nvidia-native-kernel-path.md)),
+  ([`docs/adr/007-nvidia-native-kernel-path.md`](../../adr/007-nvidia-native-kernel-path.md)),
   capturing nouveau-primary / nvidia.ko-fallback + caveats A–C. The call
   is now also HW-proven (N1 probe: masterless `VM_INIT` on the TU116).
   ADR 007 **Accepted** 2026-06-27.
@@ -350,7 +350,7 @@ an afternoon to a few days.
   bound to `renderD128` **and `card0`** (not `card1` — nvidia.ko was the
   card1-era node); nvidia.ko unloaded. dmesg shows GSP-RM **570.144
   active** and `Initialized nouveau 1.4.2`. Full evidence table in
-  [`nvidia-bringup-hardware.md`](nvidia-bringup-hardware.md) § Current
+  [`nvidia-bringup-hardware.md`](../development/nvidia-bringup-hardware.md) § Current
   host state. The final `DRM_IOCTL_NOUVEAU_GETPARAM`-reports-nouveau
   verification rolls into the N1.2/N1.3 enum probe.
 - [ ] **N0.7** — **Live spike — the riskiest unknowns, before committing
@@ -372,7 +372,7 @@ an afternoon to a few days.
   masterless ioctl sequence. Decoded findings (QMD field offsets, the
   `SEND_PCAS_A`(0x02b4)/`SEND_SIGNALING_PCAS_B`(0x02bc) launch, the
   `CHANNEL_ALLOC fb=0/tt=0` correction, chid roles) recorded in
-  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md). **N0.7
+  [`nvidia-n4-capture-notes.md`](../development/nvidia-n4-capture-notes.md). **N0.7
   fully closed.**
 - [x] **N0.8** — Confirmed in `src/backend.cyr`: `BACKEND_KIND_NVIDIA=3`
   (`backend.cyr:80`), `kind` value at slot offset `+80` (`backend.cyr:31`),
@@ -518,7 +518,7 @@ an afternoon to a few days.
   stable). Two real bugs fixed end-to-end: the memory-windows extraction bug
   (2026-06-27) and the relative-vs-absolute `native_syncobj_wait` deadline
   bug (2026-06-28, the true blocker). Full diagnosis in
-  [`nvidia-n4-capture-notes.md`](nvidia-n4-capture-notes.md) § GATE GREEN.
+  [`nvidia-n4-capture-notes.md`](../development/nvidia-n4-capture-notes.md) § GATE GREEN.
 - [x] **N4.7** — **DONE + HW-proven via the public API.** `src/backend_nvidia.cyr`
   landed: `gpu_context_new_native_nvidia()` (persistent channel + NVIF 0xC5C0 +
   QMD/pushbuf/param BOs + a bump VA allocator) + `backend_nvidia_new()` filling
@@ -582,7 +582,7 @@ an afternoon to a few days.
   `vk_compute_tex.c`; NVK reads back the sampled texel, PASS). Golden TIC +
   TSC descriptors, the sampling QMD (same shape as the store QMD), and the
   sampling SASS all decoded in
-  [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md). **Key finding:**
+  [`nvidia-n6-capture-notes.md`](../development/nvidia-n6-capture-notes.md). **Key finding:**
   the `TEX` instruction encodes the **TIC/TSC index as immediates** (the
   *bound* model, not bindless) and the dispatch is byte-shape-identical to the
   N4 store dispatch — so sampling needs only populated+bound TIC/TSC pools + a
@@ -615,7 +615,7 @@ an afternoon to a few days.
   (0x44332211, then 0x8899AABB from a repointed TIC) — the result provably
   tracks the bound texture. **CPU asserts** pin the UINT dw0 + every pushbuffer
   method (`nvidia.tcyr` 216). Closes N6.4. Decode in
-  [`nvidia-n6-capture-notes.md`](nvidia-n6-capture-notes.md).
+  [`nvidia-n6-capture-notes.md`](../development/nvidia-n6-capture-notes.md).
 - [x] **N6.3** — v1 texture slots (88..120) filled on the NVIDIA backend
   (create_2d_rgba8 / write / read / release) — write/read are bounds-checked
   memcpy on the coherent host mapping. Wired in `backend_nvidia_new`; the
@@ -649,7 +649,7 @@ an afternoon to a few days.
   pixel `0xFF996633`, PASS); the 141-method draw stream was decoded + **4-group
   adversarially verified** (clc597.h / NVK / nvc0 gallium / envytools / NAK)
   into a complete mabda render design in
-  [`nvidia-n7-capture-notes.md`](nvidia-n7-capture-notes.md). KEY: NVK draws via
+  [`nvidia-n7-capture-notes.md`](../development/nvidia-n7-capture-notes.md). KEY: NVK draws via
   MME macros mabda can't use → the **direct** draw is `SET_DRAW_CONTROL_A/B`
   (0x0260/64) + `DRAW_VERTEX_ARRAY_BEGIN_END_A/B` (0x0270/74) with a **must-emit**
   `SET_PRIMITIVE_TOPOLOGY_CONTROL=1` (0x1948); mabda renders to a **LINEAR**
@@ -870,7 +870,7 @@ an afternoon to a few days.
 ## Open questions / DECISIONS NEEDED
 
 > **Status (2026-06-27):** items **1–4 are DECIDED** and recorded in
-> [ADR 007](../adr/007-nvidia-native-kernel-path.md) — driver path
+> [ADR 007](../../adr/007-nvidia-native-kernel-path.md) — driver path
 > (nouveau, HW-proven masterless), capture methodology, SASS doctrine
 > (ptxas-primary + hand-encode insurance; GPL licensing resolved), and
 > GSP policy (amdgpu-microcode class). Items **5–6 remain open**

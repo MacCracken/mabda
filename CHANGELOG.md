@@ -2771,7 +2771,7 @@ on it. No public API change.
   later `git checkout` / merge on the untracked working-tree copies
   (the 3.0.0 GA-merge papercut). It now `chown`s `$LOGDIR` back to the
   invoking user. See
-  [`docs/issues/2026-06-01-soak-stale-binary.md`](docs/issues/2026-06-01-soak-stale-binary.md).
+  [`docs/archive/issues/2026-06-01-soak-stale-binary.md`](docs/archive/issues/2026-06-01-soak-stale-binary.md).
 
 ### Soak
 
@@ -2830,7 +2830,7 @@ samvada `0.2.2`.
   `build/` artifact (older than its `src/*.cyr` deps, or built on a
   superseded toolchain) silently soaked the wrong bundle. Now invokes
   `make` unconditionally and lets mtime deps resolve staleness. See
-  [`docs/issues/2026-06-01-soak-stale-binary.md`](docs/issues/2026-06-01-soak-stale-binary.md).
+  [`docs/archive/issues/2026-06-01-soak-stale-binary.md`](docs/archive/issues/2026-06-01-soak-stale-binary.md).
 - **`scripts/soak.sh` monitor-death robustness.** `nohup sudo soak.sh`
   shielded only the outer `sudo`; a SIGHUP on session teardown (or
   SIGPIPE on the checkpoint `tee`) could kill the monitor process
@@ -2855,10 +2855,10 @@ samvada `0.2.2`.
 **6-hour soak gate cleared.** Two GFX9-ISA root causes that were
 masking as PM4 issues for the entire rc.2 → rc.3 window are fixed in
 tree (EXP opcode byte + SPI_SHADER_COL_FORMAT field values; see
-[`docs/issues/2026-05-13-native-render-cezanne-tdr.md`](docs/issues/2026-05-13-native-render-cezanne-tdr.md)).
+[`docs/archive/issues/2026-05-13-native-render-cezanne-tdr.md`](docs/archive/issues/2026-05-13-native-render-cezanne-tdr.md)).
 17 supporting register-correctness improvements landed alongside.
 The rc.3 6 h soak (`--workload=all` = compute + wgpu + render in
-parallel, per `docs/development/3-0-rc-3-punchlist.md`) ran clean
+parallel, per `docs/archive/punchlists/3-0-rc-3-punchlist.md`) ran clean
 end-to-end: **33 / 33 checkpoints PASS, 21.6 M total iterations, RSS
 12 760 KB flat, dmesg Δ = 0**. Toolchain pin advanced
 `5.7.48 → 5.11.64` (samvada already on 0.2.2). Official `3.0.0` is
@@ -2945,7 +2945,7 @@ mabda_v3 assert rebalance landed alongside the TDR fix) /
     `dmesg.diff` artifact written — that's FAIL-only)
 - **rc.4 24 h GA gate** is the next soak. Same `--workload=all`,
   `--stop=24h`, same logdir shape. Reference recipe:
-  `docs/development/3-0-rc-4-punchlist.md`.
+  `docs/archive/punchlists/3-0-rc-4-punchlist.md`.
 
 ### Next
 
@@ -3155,13 +3155,13 @@ byte-diff harness — CI-safe, no GPU needed).
   - **rc.3** — ≤6h soak proof on the dev box. The dirty-fast gate:
     if anything regresses inside 6h, we cut rc.3 and iterate before
     sinking the 24h+ runs. Punchlist:
-    [`docs/development/3-0-rc-3-punchlist.md`](docs/development/3-0-rc-3-punchlist.md).
+    [`docs/archive/punchlists/3-0-rc-3-punchlist.md`](docs/archive/punchlists/3-0-rc-3-punchlist.md).
   - **rc.4** — extended soak from 24h → up to 3 days. **1-day
     clean = earliest cut for 3.0.0 GA.** The 3-day window is the
     focus of the first few 3.0.x patches (anything that surfaces
     between 24h and 72h becomes a 3.0.1+ tracked item, not a GA
     blocker). Punchlist:
-    [`docs/development/3-0-rc-4-punchlist.md`](docs/development/3-0-rc-4-punchlist.md).
+    [`docs/archive/punchlists/3-0-rc-4-punchlist.md`](docs/archive/punchlists/3-0-rc-4-punchlist.md).
 - VERSION 3.0.0-rc.2 → 3.0.0-rc.3 → 3.0.0-rc.4 → 3.0.0 + tag once
   the rc.4 24h-clean gate passes.
 
@@ -4339,7 +4339,7 @@ Once those are decided, 7.7 ships:
 Worth a sober design spike before the next major bite.
 
 Full handoff (Step 6.5 close-out + 6.6 sequencing):
-[`docs/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/handoff/2026-04-30-session26-render-pm4-composer.md).
+[`docs/archive/handoff/2026-04-30-session26-render-pm4-composer.md`](docs/archive/handoff/2026-04-30-session26-render-pm4-composer.md).
 
 ### Verified — 2026-04-27/28 (B.4 store shader live-verified on Cezanne)
 

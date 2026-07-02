@@ -4,7 +4,7 @@
 **Date:** 2026-06-27
 **Accepted:** 2026-06-27 — maintainer ratified all four forks + the GSP policy. The two CUDA build-hygiene items (below) are follow-ups, not gates.
 **Supersedes:** n/a
-**Related:** ADR 006 (native Cyrius GPU backend — this ADR is the per-vendor NVIDIA expansion it anticipated), ADR 004 (C launcher FFI — unaffected; wgpu/AMD coexistence unchanged). Punch list: [`docs/development/4-0-punchlist.md`](../development/4-0-punchlist.md). Hardware ladder: [`docs/development/nvidia-bringup-hardware.md`](../development/nvidia-bringup-hardware.md).
+**Related:** ADR 006 (native Cyrius GPU backend — this ADR is the per-vendor NVIDIA expansion it anticipated), ADR 004 (C launcher FFI — unaffected; wgpu/AMD coexistence unchanged). Punch list: [`docs/archive/punchlists/4-0-punchlist.md`](../archive/punchlists/4-0-punchlist.md). Hardware ladder: [`docs/archive/development/nvidia-bringup-hardware.md`](../archive/development/nvidia-bringup-hardware.md).
 
 ## Context
 

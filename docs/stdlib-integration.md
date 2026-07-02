@@ -24,20 +24,59 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "6.2.22"
+cyrius = "6.3.23"
 
 [build]
 entry = "src/main.cyr"
 output = "build/my-app"
 
 [deps]
-stdlib = ["alloc", "string", "fmt", "syscalls", "tagged", "fnptr"]
+stdlib = [
+    "string", "fmt", "alloc", "vec", "str", "io", "args",
+    "hashmap", "syscalls", "tagged", "fnptr", "mmap", "dynlib", "sakshi",
+]
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "3.2.14"
+tag = "4.0.1"
 modules = ["dist/mabda.cyr"]
 ```
+
+`mmap`, `dynlib`, and `sakshi` must be present before `mabda` in the
+resolved `lib/` tree — mabda's include chain (`src/lib.cyr`) pulls them
+in that order, so declaring the full stdlib set above is required, not
+optional. `examples/stdlib-consumer/cyrius.cyml` carries the canonical
+list.
+
+### Opt-in feature deps
+
+Two mabda features pull additional deps. Declare them **only** if you
+build with the matching `-D` flag — otherwise they are compiled out and
+you don't need the dep:
+
+- **PNG asset loading** (`gpu_texture_load_png` in `src/asset_load.cyr`,
+  gated on `#ifdef MABDA_PNG`) — build with `-D MABDA_PNG`, add the
+  `chitra` decoder, and add its two stdlib deps (`thread`, `sankoch`)
+  to the `stdlib` list above (chitra's bundle excludes its own stdlib
+  deps, so the consumer supplies them):
+
+  ```cyml
+  [deps.chitra]
+  git = "https://github.com/MacCracken/chitra.git"
+  tag = "0.1.0"
+  modules = ["dist/chitra.cyr"]
+  ```
+
+- **logind surface delegation** (`gpu_surface_configure_native_logind`,
+  gated on `#ifdef MABDA_LOGIND`) — build with `-D MABDA_LOGIND` and add
+  the `samvada` dbus client:
+
+  ```cyml
+  [deps.samvada]
+  git = "https://github.com/MacCracken/samvada.git"
+  tag = "0.4.1"
+  modules = ["dist/samvada.cyr"]
+  ```
 
 Then `cyrius deps` pulls the bundle and creates `lib/mabda.cyr` as a
 symlink into `$HOME/.cyrius/cache/mabda/dist/mabda.cyr`.
@@ -47,7 +86,8 @@ symlink into `$HOME/.cyrius/cache/mabda/dist/mabda.cyr`.
 Use only the `@public` API. Every non-FFI file in mabda's `src/` has
 a `# @public` or `# @internal` marker on line 1:
 
-- **`# @public`** — stable API, survives the v3.0 backend swap. Safe.
+- **`# @public`** — stable API, backend-agnostic across wgpu / native
+  AMD / native NVIDIA. Same signatures on every backend. Safe.
 - **`# @internal`** — FFI scaffolding (`wgpu_types`,
   `wgpu_descriptors`, `wgpu_ffi`). Will be replaced. Do not
   reference these from consumer code.
@@ -128,35 +168,60 @@ build/my-app: build/my-app.o deps/wgpu_main.o
 See `examples/stdlib-consumer/` in the mabda repo for a complete
 runnable project.
 
-## 5. What disappears in v3.0
+## 5. When the wgpu path retires (and what stays)
 
-When the native Cyrius GPU backend lands:
+The native Cyrius backends did **not** replace the wgpu path — v3.0
+added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
+v4.0.1 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
+in the tree and still the cross-vendor default. Retirement happens
+**per vendor**, and only once that vendor's native backend is in
+production:
 
-- `deps/wgpu_main.c` — gone
-- `deps/wgpu-native/` — gone
-- The `wgpu_ffi_init_table(fn_table_ptr)` line — gone
-- The `make -C deps` step — gone
-- Your dependency on libC — gone; the consumer becomes pure Cyrius
+- **AMD-on-wgpu — deprecated at v4.0.1.** Still works: a context that
+  resolves to an AMD adapter under `MABDA_BACKEND_KIND == WGPU` warns
+  and continues. Build with `-D MABDA_AMD_WGPU_STRICT` to turn the
+  warning into a hard reject once you've moved to the native AMD
+  backend (`gpu_context_new_native`). Actual retirement is deferred.
+- **NVIDIA-on-wgpu — slated to deprecate at v5.0**, in favor of the
+  native NVIDIA backend (`gpu_context_new_native_nvidia`, shipped
+  v4.0).
+- **The C launcher / wgpu binding itself — leaves the tree at v5.1**,
+  after both native paths are in production. That is when
+  `deps/wgpu_main.c`, `deps/wgpu-native/`, the
+  `wgpu_ffi_init_table(fn_table_ptr)` line, the `make -C deps` step,
+  and the libC dependency finally go away and a wgpu-free consumer
+  becomes pure Cyrius.
 
-**What stays:**
+To move off the wgpu launcher today (native AMD or NVIDIA), you skip
+the C launcher entirely and call the native entry points directly —
+`gpu_context_new_native()` (AMD, amdgpu DRM/GFX9) or
+`gpu_context_new_native_nvidia()` (NVIDIA, nouveau DRM/SM75) — instead
+of the launcher's `gpu_context_from_preinit(preinit_ptr)`. Backend is
+selected at compile time via `MABDA_BACKEND_KIND`.
+
+**What stays, on every backend:**
 
 - Your `src/main.cyr` source, unchanged
-- The `gpu_context_from_preinit`, `texture_from_rgba`,
-  `compute_dispatch`, `render_pipeline_create_simple` API —
-  identical signatures
-- The `mabda_main` entry point, now called by a pure-Cyrius
-  bootstrap instead of a C launcher
+- The `texture_from_rgba(device, queue, rgba_ptr, width, height,
+  label)`, `compute_dispatch(device, queue, cp, bind_group, dims_xyz)`,
+  `render_pipeline_create_simple(device, module, color_format)` API —
+  identical signatures across wgpu / native AMD / native NVIDIA
+- The `mabda_main` entry point when using the wgpu launcher
 
-The `examples/stdlib-consumer/` project is the regression test: if
-it still compiles against the v3.0 mabda tag, the contract held.
+The `examples/stdlib-consumer/` project is the regression test: if it
+still compiles against the current mabda tag, the contract held.
 
 ## Known transitional warnings
 
 When compiling the bundled `dist/mabda.cyr`, cc5 emits
 `undefined function` warnings for the 65 wgpu function-table slots.
 These are **expected and benign** — the slots are globals populated
-by the C launcher at runtime. In v3.0 these warnings disappear
-because the functions become real Cyrius definitions.
+by the C launcher at runtime. They did **not** become real Cyrius
+definitions in v3.0/v4.0: the native AMD and NVIDIA backends are
+separate code paths, not reimplementations of these slots. The
+warnings persist for as long as the wgpu path is in the tree, and go
+away only when the wgpu binding itself is removed at v5.1.
 
 If you see any warning that is **not** a wgpu function-table slot,
 that's a bug; please file it at
@@ -183,8 +248,12 @@ that's a bug; please file it at
 
 ## Security
 
-Mabda 2.3.0 shipped the last audit-gated stdlib-candidate pass.
-Findings + remediation in
-[`docs/audit/2026-04-19-audit.md`](audit/2026-04-19-audit.md). Every
-HIGH / MED finding landed with a regression assertion in the relevant
-`tests/tcyr/*.tcyr` domain suite. See `SECURITY.md` for the policy.
+Mabda runs a security audit each P(-1) / release pass; the dated
+findings + remediation records live in
+[`docs/audit/`](audit/), running through
+[`2026-07-02-audit.md`](audit/2026-07-02-audit.md) as of the v4.0.1
+baseline (the `2026-04-19-audit.md` pass referenced above is the older
+2.3.0 stdlib-candidate record, retained for history). Every HIGH / MED
+finding lands with a regression assertion in the relevant
+`tests/tcyr/*.tcyr` domain suite. See
+[`SECURITY.md`](../SECURITY.md) for the reporting policy.
