@@ -74,8 +74,9 @@ cross-vendor default.
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v4.0             ─▶  NVIDIA native backend added (AMD wgpu still
                         supported through 4.0.x)
-  v4.0.1           ─▶  AMD wgpu path retires (AMD consumers run on AMD
-                        native only); NVIDIA + Intel still on wgpu
+  v4.0.1           ─▶  AMD wgpu path DEPRECATED (warns + still works;
+                        -D MABDA_AMD_WGPU_STRICT enforces native-only;
+                        retirement deferred); NVIDIA + Intel on wgpu
   v5.0             ─▶  Intel native backend added (tentative); NVIDIA
                         wgpu path retires (NVIDIA → NVIDIA native only)
   v5.1             ─▶  Full wgpu retirement once Intel native is in
@@ -87,8 +88,10 @@ Wgpu retirement is **per-chipset, not all-at-once**. Each major
 vendor gets a release window where wgpu and native coexist for that
 vendor (so existing consumers can flip on their schedule). Once a
 vendor's native backend has been in production for a release cycle
-**on that vendor's hardware**, the wgpu path is dropped for that
-vendor — but the wgpu binding stays in-tree to serve the vendors
+**on that vendor's hardware**, the wgpu path is first *deprecated* for
+that vendor (a one-shot warning, but it still works — an escape hatch,
+with an opt-in strict flag to enforce), then dropped in a later release
+— but the wgpu binding stays in-tree to serve the vendors
 whose native backends haven't shipped yet. This keeps the consumer
 migration smooth: nobody on a wgpu-only chipset is forced to move
 before their native backend is real.
@@ -96,8 +99,10 @@ before their native backend is real.
 The concrete cutovers:
 - **v4.0** — NVIDIA native ships. AMD wgpu **still supported** (one
   release window of coexistence on AMD before the retirement).
-- **v4.0.1** — AMD wgpu retires. AMD consumers now run on AMD native
-  only. NVIDIA + Intel still on wgpu.
+- **v4.0.1** — AMD wgpu **deprecated** (one-shot warning; still works by
+  default — escape hatch open; `-D MABDA_AMD_WGPU_STRICT` enforces
+  native-only). Full AMD-wgpu retirement is deferred to a later release.
+  NVIDIA + Intel still on wgpu.
 - **v5.0** — NVIDIA wgpu retires. NVIDIA consumers now on NVIDIA
   native. Intel still on wgpu.
 - **v5.1** — Intel wgpu retires; wgpu+C path leaves the tree
@@ -275,16 +280,22 @@ the `Backend` interface:
   is "both C-shim deps go at v4.0.1 if we ship them in v3.x."
 
 **v4.0.1 status (shipped).**
-- **AMD wgpu retirement — DONE.** Realized as the roadmap's "guard that
-  errors out", but the only *functional* form: neither literal option works
-  as written (a compile-time `BACKEND_KIND_AMD` guard inside the wgpu files
-  is dead code — an AMD build routes to native and never enters wgpu; and
-  there is zero AMD-specific wgpu wiring to remove — adapter selection is
-  power-preference-only, delegated to wgpu-native). So the enforcement is a
-  **runtime adapter-vendorID guard** in `gpu_context_from_preinit`: on the
-  wgpu fallthrough it reads `WGPUAdapterInfo.vendorID` (offset-verified) and
-  rejects AMD (`0x1002`) with `GPU_ERR_AMD_WGPU_RETIRED`. NVIDIA/Intel pass.
-  The wgpu binding is untouched (stays to v5.1).
+- **AMD wgpu — DEPRECATED at v4.0.1 (not retired; escape hatch open).** Policy
+  refined during the cut: wgpu is *deprecated* per-chipset, not hard-retired —
+  each vendor gets a deprecation window with an escape hatch before actual
+  removal. Mechanism is a **runtime adapter-vendorID guard** in
+  `gpu_context_from_preinit`: on the wgpu fallthrough it reads
+  `WGPUAdapterInfo.vendorID` (offset-verified) and, for AMD (`0x1002`), by
+  DEFAULT prints a one-shot deprecation notice and **still creates the context**
+  (escape hatch). `-D MABDA_AMD_WGPU_STRICT` turns it into a hard reject
+  (`GPU_ERR_AMD_WGPU_DEPRECATED`) for consumers ready to enforce. NVIDIA/Intel
+  are untouched; the wgpu binding stays to v5.1. Full AMD-wgpu retirement is
+  deferred to a later release (the "guard that errors out" the roadmap
+  originally sketched is now the opt-in strict mode). Neither literal roadmap
+  option was functional as written: a compile-time `BACKEND_KIND_AMD` guard
+  inside the wgpu files is dead code (an AMD build routes to native, never
+  enters wgpu), and there is zero AMD-specific wgpu wiring to remove (adapter
+  selection is power-preference-only, delegated to wgpu-native).
 - **`samvada` C-shim retirement — DEFERRED (escape hatch exercised).** The
   pure-Cyrius replacement is a full native dbus client (SASL EXTERNAL +
   SCM_RIGHTS master-fd passing) that lives upstream in samvada and isn't

@@ -56,8 +56,9 @@ HW-verified, found integrating into the `puka` terminal). **4.0.0 adds a third b
 pure-Cyrius native NVIDIA path (nouveau DRM) for Turing (SM75)** — compute, textures, render,
 and present, all reachable through the same backend-agnostic public API and HW-proven on a
 GTX 1660 SUPER (TU116), then burned in ~30¾h across three soak runs (RSS-flat, dmesg Δ=0).
-The wgpu path stays for NVIDIA + Intel; **4.0.1 retires the AMD wgpu route** — AMD adapters
-are rejected on the wgpu path (`GPU_ERR_AMD_WGPU_RETIRED`) and run native only. See the CHANGELOG.)
+The wgpu path stays for NVIDIA + Intel; **4.0.1 deprecates the AMD wgpu route** — AMD adapters get
+a one-shot deprecation warning but still work (escape hatch open); `-D MABDA_AMD_WGPU_STRICT`
+enforces native-only, and full AMD-wgpu retirement is deferred to a later release. See the CHANGELOG.)
 
 ## Features
 
@@ -190,8 +191,8 @@ the wgpu path is retired *for that vendor* — the wgpu binding stays
 in-tree to serve the vendors whose native backends haven't shipped
 yet. The cutovers (per the roadmap):
 
-- **v4.0.1** — AMD wgpu retires (AMD adapters rejected on the wgpu path).
-  AMD consumers run on AMD native only.
+- **v4.0.1** — AMD wgpu **deprecated** (one-shot warning; still works — escape hatch open).
+  `-D MABDA_AMD_WGPU_STRICT` enforces native-only; full AMD-wgpu retirement is deferred.
   NVIDIA + Intel still on wgpu.
 - **v5.0** — NVIDIA wgpu retires. NVIDIA consumers run on NVIDIA
   native only. Intel still on wgpu.

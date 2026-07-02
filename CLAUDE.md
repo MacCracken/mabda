@@ -18,8 +18,9 @@ detection.
 One Cyrius library that answers "set up a GPU device, move bytes on and
 off it, and draw / compute / present with them" for every AGNOS
 downstream. v3.0 ships dual backend (wgpu and native AMD); the AMD wgpu
-path retires at v4.0.1 (v4.0 adds NVIDIA native and keeps AMD wgpu as
-a coexistence window). Backend abstraction is the load-bearing v3.0
+path is deprecated at v4.0.1 (warns + still works by default,
+`-D MABDA_AMD_WGPU_STRICT` enforces native-only; retirement deferred).
+v4.0 added NVIDIA native. Backend abstraction is the load-bearing v3.0
 architectural choice — the public API surface doesn't change between
 paths.
 
@@ -65,10 +66,10 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   reads from.
 - **wgpu-native v29** — external C library, downloaded by consumers
   alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep. The AMD
-  *route* through it retires at v4.0.1 (AMD adapters are rejected on the
-  wgpu path — `gpu_context_from_preinit` vendorID guard); the binding
-  itself stays for NVIDIA + Intel until the wgpu+C path leaves the tree
-  at v5.1.
+  *route* through it is deprecated at v4.0.1 (a `gpu_context_from_preinit`
+  vendorID guard warns but still allows AMD-on-wgpu; `-D MABDA_AMD_WGPU_STRICT`
+  hard-rejects). The binding stays for NVIDIA + Intel until the wgpu+C
+  path leaves the tree at v5.1; full AMD retirement is deferred.
 - **libsystemd** — needed by samvada's C shim. Consumer-provided link,
   not a mabda direct dep. Its v4.0.1 drop was **deferred under the
   roadmap escape hatch**: the samvada C shim survives into v4.x until a
@@ -196,7 +197,8 @@ struct-shape tests at the Cyrius layer. HW gates live in the
 - **Own the stack** — every external dep is either an AGNOS package
   (samvada, sakshi, patra, sigil, chitra) or a consumer-provided C
   library (wgpu-native, libsystemd-via-samvada). The AMD wgpu *route*
-  retires at v4.0.1 (binding stays to v5.1); libsystemd's drop is
+  is deprecated at v4.0.1 (warn+allow; strict flag enforces; binding
+  stays to v5.1); libsystemd's drop is
   deferred under the roadmap escape hatch (samvada C shim survives into
   v4.x pending a pure-Cyrius dbus 1.0).
 - **No magic** — every operation measurable, auditable, traceable.

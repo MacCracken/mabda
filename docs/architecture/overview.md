@@ -8,9 +8,10 @@ Mabda is a GPU foundation library written in Cyrius. As of v4.0 it owns
 (direct `amdgpu` ioctls, GFX9 PM4, and — as of the v3.2.x arc — an in-tree
 SPIR-V→GFX9 compute compiler), and a pure-Cyrius **native NVIDIA** backend
 (nouveau DRM, clc597 push, SM75 SASS — added at v4.0). As of **v4.0.1** the
-AMD route through wgpu is retired — AMD adapters are rejected on the wgpu path
-(`gpu_context_from_preinit` vendorID guard) and run native only; the wgpu
-binding stays for NVIDIA + Intel. It provides shared GPU infrastructure so
+AMD route through wgpu is **deprecated** — an AMD adapter still works but gets a
+one-shot deprecation warning (`gpu_context_from_preinit` vendorID guard), and
+`-D MABDA_AMD_WGPU_STRICT` enforces native-only; the wgpu binding stays for
+NVIDIA + Intel and full retirement is deferred. It provides shared GPU infrastructure so
 every AGNOS consumer builds on one consistent base instead of duplicating
 device management, buffer creation, and pipeline setup; the backend choice
 is invisible to consumer code (the `@public` API is byte-identical across
@@ -56,8 +57,9 @@ all three, routed through an `@internal` `Backend` slot table).
 > The diagram shows the **wgpu-vs-native** split. The native column now has
 > **two** backends: **AMD** (amdgpu DRM, shown) and **NVIDIA** (nouveau DRM /
 > clc597 push / SM75 SASS — added at v4.0), for three backends total. As of
-> **v4.0.1** an AMD adapter is rejected on the wgpu column and runs native
-> only (`GPU_ERR_AMD_WGPU_RETIRED`); wgpu still serves NVIDIA + Intel.
+> **v4.0.1** an AMD adapter on the wgpu column is **deprecated** — it still works
+> with a one-shot warning (`-D MABDA_AMD_WGPU_STRICT` →
+> `GPU_ERR_AMD_WGPU_DEPRECATED` to enforce); wgpu still serves NVIDIA + Intel.
 
 ## Flat Layout
 

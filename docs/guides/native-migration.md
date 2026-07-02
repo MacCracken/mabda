@@ -6,14 +6,15 @@
 > wgpu-OR-native consumer that swaps backends without changing
 > rendering code."
 >
-> **v4.0.1 update — this migration is now mandatory on AMD.** The AMD wgpu
-> route is retired: an AMD adapter is rejected on the wgpu path
-> (`gpu_context_from_preinit` returns `GPU_ERR_AMD_WGPU_RETIRED`). On AMD you
-> MUST select `BACKEND_KIND_AMD` native and ship precompiled GFX9 ISA shaders.
-> NVIDIA + Intel keep their wgpu route (per-chipset retirement). Note the
-> native-AMD path does not yet cover every wgpu feature — notably instancing
-> (`ic > 1`) and odd-dimension render targets are rejected — so confirm your
-> consumer doesn't rely on those before flipping.
+> **v4.0.1 update — AMD-on-wgpu is deprecated; this migration is recommended.**
+> An AMD adapter on the wgpu path still works but gets a one-shot deprecation
+> warning; `gpu_context_from_preinit` only hard-rejects
+> (`GPU_ERR_AMD_WGPU_DEPRECATED`) under `-D MABDA_AMD_WGPU_STRICT`. The escape
+> hatch stays open during the deprecation window (full retirement is deferred),
+> but you should move to `BACKEND_KIND_AMD` native + precompiled GFX9 ISA
+> shaders. NVIDIA + Intel keep their wgpu route. Note the native-AMD path does
+> not yet cover every wgpu feature — notably instancing (`ic > 1`) and
+> odd-dimension render targets are rejected — so confirm before flipping.
 
 ## Why two backends
 
@@ -121,9 +122,9 @@ gcc -c samvada/deps/samvada_main.c -o samvada_main.o
 
 samvada itself is a sister AGNOS package (`[deps.samvada]
 tag = "0.4.1"` in your `cyrius.cyml`). It currently uses
-libsystemd via its C-shim. **v4.0.1 retires the AMD wgpu route**
-(AMD adapters are rejected on the wgpu path — this migration is
-now mandatory on AMD), but the paired **libsystemd/samvada C-shim
+libsystemd via its C-shim. **v4.0.1 deprecates the AMD wgpu route**
+(AMD-on-wgpu still works with a one-shot warning; `-D MABDA_AMD_WGPU_STRICT`
+enforces native-only), and the paired **libsystemd/samvada C-shim
 retirement is deferred** under the roadmap escape hatch: the
 pure-Cyrius dbus replacement is upstream samvada work that isn't
 ready, so `[deps.samvada]` stays `0.4.1` and `MABDA_LOGIND` stays

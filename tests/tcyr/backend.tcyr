@@ -2208,16 +2208,16 @@ fn test_wgpu_texture_layer_bind_group_descriptor() {
     return 0;
 }
 
-# v4.0.1 — AMD wgpu retirement guard. The LIVE vendorID reject in
-# gpu_context_from_preinit needs a real adapter, so it is a GPU-integration
-# gate (HW-only). Here we pin the WGPUAdapterInfo decode + constants the guard
-# relies on, plus the dedicated error code — a regression here would silently
-# break the reject (wrong offset -> reject NVIDIA/Intel, or miss AMD).
-fn test_amd_wgpu_retirement_guard_v401() {
+# v4.0.1 — AMD wgpu DEPRECATION guard. Pins the WGPUAdapterInfo decode +
+# constants the guard relies on, the deprecation error code (returned only under
+# -D MABDA_AMD_WGPU_STRICT), and the decision predicate. The LIVE default
+# behavior (warn + allow) is covered by the e2e test below; the STRICT hard-
+# reject is a compile-flag build, exercised on HW, not in this default suite.
+fn test_amd_wgpu_deprecation_v401() {
     assert_eq(WGPU_ADAPTER_INFO_SIZE, 96, "WGPUAdapterInfo = 96 bytes (v29)");
     assert_eq(WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET, 80, "vendorID @ +80 (offsetof-verified)");
     assert_eq(PCI_VENDOR_AMD, 0x1002, "AMD PCI vendor id");
-    assert_eq(GPU_ERR_AMD_WGPU_RETIRED, 22, "retirement error code");
+    assert_eq(GPU_ERR_AMD_WGPU_DEPRECATED, 22, "deprecation error code (strict mode)");
     # accessor null-guard -> 0 (guard treats null info as not-AMD)
     assert_eq(wgpu_adapter_info_vendor_id(0), 0, "null info -> 0");
     # decode the u32 at +80 out of a crafted WGPUAdapterInfo scratch struct
@@ -2225,20 +2225,18 @@ fn test_amd_wgpu_retirement_guard_v401() {
     memset(&info, 0, WGPU_ADAPTER_INFO_SIZE);
     store32(&info + WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET, PCI_VENDOR_AMD);
     assert_eq(wgpu_adapter_info_vendor_id(&info), PCI_VENDOR_AMD, "decodes AMD vendorID");
-    assert_eq(wgpu_adapter_info_vendor_id(&info) == PCI_VENDOR_AMD, 1, "guard would reject AMD");
-    # NVIDIA (0x10DE) decodes distinctly and is NOT rejected by the guard
+    # NVIDIA (0x10DE) decodes distinctly
     store32(&info + WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET, 0x10DE);
     assert_eq(wgpu_adapter_info_vendor_id(&info), 0x10DE, "decodes NVIDIA vendorID");
-    assert_eq(wgpu_adapter_info_vendor_id(&info) == PCI_VENDOR_AMD, 0, "NVIDIA passes the guard");
     # the error code has a dedicated (not "unknown") name entry
-    assert_eq(gpu_err_name(GPU_ERR_AMD_WGPU_RETIRED) == gpu_err_name(0 - 1), 0,
-    "AMD_WGPU_RETIRED has its own name string");
-    # the guard's DECISION predicate — this is the EXACT fn gpu_context_from_preinit
-    # calls, so inverting it (or adding a vendor) fails here, not just a re-derivation.
-    assert_eq(_wgpu_vendor_retired(PCI_VENDOR_AMD), 1, "AMD retired on wgpu");
-    assert_eq(_wgpu_vendor_retired(0x10DE), 0, "NVIDIA not retired (v5.0)");
-    assert_eq(_wgpu_vendor_retired(0x8086), 0, "Intel not retired (v5.1)");
-    assert_eq(_wgpu_vendor_retired(0), 0, "zero/absent vendor not retired");
+    assert_eq(gpu_err_name(GPU_ERR_AMD_WGPU_DEPRECATED) == gpu_err_name(0 - 1), 0,
+    "AMD_WGPU_DEPRECATED has its own name string");
+    # the guard's DECISION predicate — the EXACT fn gpu_context_from_preinit calls,
+    # so inverting it (or adding a vendor) fails here, not just a re-derivation.
+    assert_eq(_wgpu_vendor_wgpu_deprecated(PCI_VENDOR_AMD), 1, "AMD wgpu deprecated");
+    assert_eq(_wgpu_vendor_wgpu_deprecated(0x10DE), 0, "NVIDIA wgpu not deprecated");
+    assert_eq(_wgpu_vendor_wgpu_deprecated(0x8086), 0, "Intel wgpu not deprecated");
+    assert_eq(_wgpu_vendor_wgpu_deprecated(0), 0, "zero/absent vendor not deprecated");
     return 0;
 }
 
@@ -2254,11 +2252,13 @@ fn _mock_wgpu_get_info_nvidia(adapter, info): i64 {
     return 0;
 }
 
-# End-to-end: exercise the REAL guard in gpu_context_from_preinit via a mock wgpu
-# fn table (slot 36 = wgpuAdapterGetInfo). Unlike the decode-only asserts above,
-# this fails if the guard is DELETED, INVERTED, MISPLACED, or returns the wrong
-# code. MABDA_BACKEND_KIND defaults to WGPU, so preinit takes the wgpu fallthrough.
-fn test_amd_wgpu_guard_mechanism_e2e() {
+# End-to-end: drive the REAL gpu_context_from_preinit guard via a mock wgpu fn
+# table (slot 36 = wgpuAdapterGetInfo). DEFAULT build (no MABDA_AMD_WGPU_STRICT):
+# an AMD adapter is DEPRECATED but ALLOWED — the context is created and the
+# one-shot deprecation notice fires; NVIDIA is untouched. Fails if the guard is
+# deleted, if AMD is wrongly hard-rejected, or if NVIDIA gets warned/blocked.
+# MABDA_BACKEND_KIND defaults to WGPU, so preinit takes the wgpu fallthrough.
+fn test_amd_wgpu_deprecation_e2e() {
     var faketable[512];                       # 64 slots; slot 36 @ +288 < 512
     memset(&faketable, 0, 512);
     store64(&faketable + 36 * 8, &_mock_wgpu_get_info_amd);
@@ -2268,15 +2268,17 @@ fn test_amd_wgpu_guard_mechanism_e2e() {
     store64(&preinit + 8,  1);                # adapter  (non-zero -> guard runs)
     store64(&preinit + 16, 1);                # device   (non-zero)
     store64(&preinit + 24, 1);                # queue
-    # AMD adapter -> the guard rejects before ctx creation
+    # AMD adapter -> deprecated but ALLOWED (escape hatch): context created + warned.
+    _amd_wgpu_dep_warned = 0;
     var res_amd = gpu_context_from_preinit(&preinit);
-    assert_eq(is_ok(res_amd), 0, "AMD adapter -> Err on the wgpu path");
-    assert_eq(gpu_err_code(payload(res_amd)), GPU_ERR_AMD_WGPU_RETIRED,
-    "AMD reject carries GPU_ERR_AMD_WGPU_RETIRED");
-    # NVIDIA adapter -> passes the guard, context is created (Ok)
+    assert_eq(is_ok(res_amd), 1, "AMD adapter -> Ok (deprecated but allowed)");
+    assert_eq(_amd_wgpu_dep_warned, 1, "AMD wgpu emitted the one-shot deprecation notice");
+    # NVIDIA adapter -> not deprecated, context created, no notice
     store64(&faketable + 36 * 8, &_mock_wgpu_get_info_nvidia);
+    _amd_wgpu_dep_warned = 0;
     var res_nv = gpu_context_from_preinit(&preinit);
-    assert_eq(is_ok(res_nv), 1, "NVIDIA adapter -> Ok (passes the guard)");
+    assert_eq(is_ok(res_nv), 1, "NVIDIA adapter -> Ok (not deprecated)");
+    assert_eq(_amd_wgpu_dep_warned, 0, "NVIDIA wgpu does NOT emit the deprecation notice");
     wgpu_ffi_init_table(0);                    # reset the global for later tests
     return 0;
 }
@@ -2362,7 +2364,7 @@ fn main() {
     test_gpu_render_pass_bind_texture_dispatch();
     test_wgpu_texture_bind_group_descriptor();
     test_wgpu_sampler_descriptor_from_intent();
-    test_amd_wgpu_retirement_guard_v401();
-    test_amd_wgpu_guard_mechanism_e2e();
+    test_amd_wgpu_deprecation_v401();
+    test_amd_wgpu_deprecation_e2e();
     return assert_summary();
 }

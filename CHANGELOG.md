@@ -15,43 +15,50 @@ for the immediate forward pointer.
 
 ## [4.0.1] — 2026-07-02
 
-**AMD wgpu retirement — AMD adapters are now rejected on the wgpu path; AMD runs native only.**
-Per the per-chipset retirement schedule (ADR-006 / roadmap), the AMD route through wgpu retires
-at v4.0.1 while the wgpu binding itself stays for NVIDIA + Intel (until v5.0 / v5.1). The paired
-samvada/libsystemd C-shim retirement is **deferred under the roadmap escape hatch** (the
-pure-Cyrius dbus replacement is upstream samvada work that isn't ready). No public-API signature
-change; the only behavior change is an AMD-on-wgpu context now failing loud instead of succeeding.
+**AMD wgpu DEPRECATION — AMD-on-wgpu is deprecated (not retired). It still works by default with
+a one-shot warning; consumers migrate to native AMD at their own pace.** Per the per-chipset
+schedule (ADR-006 / roadmap), the AMD route through wgpu is the first to deprecate; the wgpu
+binding stays for NVIDIA + Intel. The escape hatch (warn + allow) stays open during the deprecation
+window — actual retirement is deferred to a future release. Consumers who want to enforce the
+migration now build with `-D MABDA_AMD_WGPU_STRICT`. The paired samvada/libsystemd C-shim
+retirement is also **deferred under the roadmap escape hatch**. **No public-API signature change
+and no default breakage** (an AMD-on-wgpu context still succeeds).
 
-### Breaking
-- **AMD adapters are rejected on the wgpu path.** `gpu_context_from_preinit` now returns
-  `Err(GPU_ERR_AMD_WGPU_RETIRED)` when the live adapter's PCI vendor is AMD (`0x1002`) and
-  `MABDA_BACKEND_KIND == BACKEND_KIND_WGPU`. **Migration:** AMD consumers select
-  `BACKEND_KIND_AMD` (native amdgpu) and ship precompiled GFX9 ISA shaders instead of WGSL.
-  NVIDIA (`0x10DE`) and Intel (`0x8086`) wgpu contexts are unaffected. Note the native-AMD path
-  does not yet cover every wgpu feature (instancing `ic>1` and odd-dimension render targets are
-  rejected) — confirm before flipping. See `docs/guides/native-migration.md`.
+### Deprecated
+- **AMD on the wgpu path is deprecated.** When the live adapter's PCI vendor is AMD (`0x1002`) and
+  `MABDA_BACKEND_KIND == BACKEND_KIND_WGPU`, `gpu_context_from_preinit` prints a one-shot
+  deprecation notice to stderr and **still creates the context** (the escape hatch stays open).
+  Build with `-D MABDA_AMD_WGPU_STRICT` to instead hard-reject with
+  `Err(GPU_ERR_AMD_WGPU_DEPRECATED)`. **Recommended migration:** select `BACKEND_KIND_AMD` (native
+  amdgpu) and ship precompiled GFX9 ISA shaders instead of WGSL. NVIDIA (`0x10DE`) / Intel
+  (`0x8086`) are unaffected. Note the native-AMD path does not yet cover every wgpu feature
+  (instancing `ic>1`, odd-dimension render targets are rejected) — confirm before flipping. See
+  `docs/guides/native-migration.md`.
 
 ### Added
 - **`src/wgpu_descriptors.cyr`** — `WGPUAdapterInfo` layout (96 B, v29) with
-  `WGPU_ADAPTER_INFO_SIZE` / `WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET` (80) constants + the
-  `wgpu_adapter_info_vendor_id` accessor and `PCI_VENDOR_AMD`. Offset **offsetof-verified**
-  against the vendored `deps/wgpu-native/include/webgpu/webgpu.h`.
+  `WGPU_ADAPTER_INFO_SIZE` / `WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET` (80) constants, the
+  `wgpu_adapter_info_vendor_id` accessor, `PCI_VENDOR_AMD`, and the `_wgpu_vendor_wgpu_deprecated`
+  decision predicate. Offset **offsetof-verified** against the vendored v29 `webgpu.h`.
 - **`src/wgpu_ffi.cyr`** — `wgpu_adapter_vendor_id(adapter)` helper (stack scratch +
   `wgpu_adapter_get_info`), the guard's single call site.
-- **`src/error.cyr`** — `GPU_ERR_AMD_WGPU_RETIRED = 22` + its `gpu_err_name` entry (an actionable
-  "use BACKEND_KIND_AMD native" diagnostic rather than a misleading "adapter not found").
-- **`tests/tcyr/backend.tcyr`** — `test_amd_wgpu_retirement_guard_v401` pins the constants, the
-  vendorID decode, and the AMD-vs-NVIDIA reject logic (the live reject is HW-gated — no adapter
-  in the CPU suite).
+- **`src/error.cyr`** — `GPU_ERR_AMD_WGPU_DEPRECATED = 22` + its `gpu_err_name` entry (returned
+  only under `MABDA_AMD_WGPU_STRICT`).
+- **`-D MABDA_AMD_WGPU_STRICT`** — opt-in compile flag that turns the AMD-on-wgpu deprecation into
+  a hard error, for consumers / CI ready to enforce the eventual retirement early.
+- **`tests/tcyr/backend.tcyr`** — `test_amd_wgpu_deprecation_v401` pins the constants / decode /
+  predicate; `test_amd_wgpu_deprecation_e2e` drives the real `gpu_context_from_preinit` via a mock
+  fn-table (AMD → Ok + one-shot notice; NVIDIA → Ok, no notice). The strict hard-reject is a
+  compile-flag build (HW/flag-gated, not in the default CPU suite).
 
 ### Changed
-- **`gpu_context_from_preinit`** (`src/context.cyr`) — adds the AMD-vendorID guard on the wgpu
-  fallthrough, after the adapter null-check.
-- **Docs** — corrected the version-slip stragglers that predated this cut (README, CLAUDE.md,
-  `docs/stdlib-integration.md`, `docs/adr/004-c-launcher-ffi.md`, `docs/architecture/overview.md`,
-  `docs/guides/native-migration.md`): the AMD *route* retires at v4.0.1, the wgpu *binding* stays
-  to v5.1, and libsystemd's drop is deferred. `docs/architecture/overview.md` now says three
-  backends (NVIDIA native landed at v4.0).
+- **`gpu_context_from_preinit`** (`src/context.cyr`) — adds the AMD-vendorID deprecation guard on
+  the wgpu fallthrough (after the adapter null-check): warn + allow by default, hard-reject under
+  `-D MABDA_AMD_WGPU_STRICT`.
+- **Docs** — corrected version-slip stragglers (README, CLAUDE.md, `docs/stdlib-integration.md`,
+  `docs/adr/004-c-launcher-ffi.md`, `docs/architecture/overview.md`, `docs/guides/native-migration.md`):
+  the AMD *route* deprecates at v4.0.1 (retirement deferred), the wgpu *binding* stays to v5.1.
+  `docs/architecture/overview.md` now says three backends (NVIDIA native landed at v4.0).
 
 ### Deferred
 - **samvada / libsystemd C-shim retirement** — deferred under the roadmap escape hatch. Zero mabda

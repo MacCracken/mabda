@@ -125,6 +125,21 @@ fn gpu_ctx_set_native_card_fd(ctx, fd): i64 {
 # (the C launcher's preinit struct is wgpu-shaped). Programs that
 # want to opt into the native path explicitly without touching the
 # global default can call gpu_context_new_native() directly.
+
+# v4.0.1 — one-shot deprecation notice for AMD-on-wgpu. Written to stderr (fd 2)
+# ONCE per process, independent of the sakshi observability gate, so a consumer
+# actually sees the migration prompt. NVIDIA / Intel are never warned.
+var _amd_wgpu_dep_warned = 0;
+fn _wgpu_warn_amd_deprecated(): i64 {
+    if (_amd_wgpu_dep_warned == 1) { return 0; }
+    _amd_wgpu_dep_warned = 1;
+    var m1 = "mabda: DEPRECATION - AMD-on-wgpu is deprecated (v4.0.1); use BACKEND_KIND_AMD native.\n";
+    var m2 = "  The AMD wgpu route retires in a future release; build -D MABDA_AMD_WGPU_STRICT to enforce now.\n";
+    syscall(1, 2, m1, strlen(m1));
+    syscall(1, 2, m2, strlen(m2));
+    return 0;
+}
+
 fn gpu_context_from_preinit(preinit_ptr): i64 {
     if (MABDA_BACKEND_KIND == BACKEND_KIND_AMD) {
         return gpu_context_new_native();
@@ -145,14 +160,20 @@ fn gpu_context_from_preinit(preinit_ptr): i64 {
     var queue    = load64(preinit_ptr + 24);
     if (instance == 0) { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
     if (adapter == 0)  { return gpu_err_result(GPU_ERR_ADAPTER_NOT_FOUND); }
-    # v4.0.1: the AMD wgpu route is retired. An AMD adapter (PCI vendor 0x1002)
-    # reaches here only under MABDA_BACKEND_KIND == WGPU (the compile-time AMD
-    # branch above routes to native). Reject it fail-loud so AMD consumers move
-    # to the BACKEND_KIND_AMD native backend. NVIDIA (0x10DE) / Intel (0x8086)
-    # pass through unchanged — retirement is per-chipset (NVIDIA wgpu to v5.0,
-    # the wgpu binding itself to v5.1). Guarded by adapter != 0 above.
-    if (_wgpu_vendor_retired(wgpu_adapter_vendor_id(adapter)) == 1) {
-        return gpu_err_result(GPU_ERR_AMD_WGPU_RETIRED);
+    # v4.0.1: AMD on the wgpu path is DEPRECATED (not retired). An AMD adapter
+    # (PCI 0x1002) reaches here only under MABDA_BACKEND_KIND == WGPU (the
+    # compile-time AMD branch above routes to native). DEFAULT: warn once and
+    # ALLOW — the escape hatch stays open during the deprecation window so AMD
+    # consumers keep working while they migrate to BACKEND_KIND_AMD native.
+    # -D MABDA_AMD_WGPU_STRICT turns it into a hard reject for consumers ready
+    # to enforce now. NVIDIA (0x10DE) / Intel (0x8086) are unaffected either way.
+    # Guarded by adapter != 0 above.
+    if (_wgpu_vendor_wgpu_deprecated(wgpu_adapter_vendor_id(adapter)) == 1) {
+        #ifdef MABDA_AMD_WGPU_STRICT
+        return gpu_err_result(GPU_ERR_AMD_WGPU_DEPRECATED);
+        #else
+        _wgpu_warn_amd_deprecated();
+        #endif
     }
     if (device == 0)   { return gpu_err_result(GPU_ERR_DEVICE_REQUEST); }
     var ctx = alloc(GPU_CONTEXT_SIZE);
