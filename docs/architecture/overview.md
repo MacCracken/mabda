@@ -2,15 +2,19 @@
 
 ## What Mabda Is
 
-Mabda is a GPU foundation library written in Cyrius. As of v3.0 it owns
-**two GPU backends behind one public API**: the wgpu-native FFI boundary
-(the cross-vendor default) and a pure-Cyrius DRM/KMS **native AMD** backend
+Mabda is a GPU foundation library written in Cyrius. As of v4.0 it owns
+**three GPU backends behind one public API**: the wgpu-native FFI boundary
+(the cross-vendor default), a pure-Cyrius DRM/KMS **native AMD** backend
 (direct `amdgpu` ioctls, GFX9 PM4, and — as of the v3.2.x arc — an in-tree
-SPIR-V→GFX9 compute compiler). It provides shared GPU infrastructure so
+SPIR-V→GFX9 compute compiler), and a pure-Cyrius **native NVIDIA** backend
+(nouveau DRM, clc597 push, SM75 SASS — added at v4.0). As of **v4.0.1** the
+AMD route through wgpu is retired — AMD adapters are rejected on the wgpu path
+(`gpu_context_from_preinit` vendorID guard) and run native only; the wgpu
+binding stays for NVIDIA + Intel. It provides shared GPU infrastructure so
 every AGNOS consumer builds on one consistent base instead of duplicating
 device management, buffer creation, and pipeline setup; the backend choice
 is invisible to consumer code (the `@public` API is byte-identical across
-both, routed through an `@internal` `Backend` slot table).
+all three, routed through an `@internal` `Backend` slot table).
 
 ## Module Map
 
@@ -32,9 +36,9 @@ both, routed through an `@internal` `Backend` slot table).
 │             render_graph, surface, surface_v3, queue       │
 │                                                          │
 │  @internal Backend slot table → routes every @public call │
-│  to ONE of the two backends below (same call-site shape): │
+│  to ONE backend below (native = AMD or NVIDIA; same shape):│
 └──────────┬──────────────────────────────────┬───────────┘
-           │ wgpu fillers                      │ native AMD fillers
+           │ wgpu fillers                      │ native AMD/NVIDIA fillers
 ┌──────────▼─────────────────────┐ ┌──────────▼───────────────────────┐
 │ wgpu-native C API (v29) via a   │ │ direct amdgpu DRM ioctls (no      │
 │ 65-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
@@ -48,6 +52,12 @@ both, routed through an `@internal` `Backend` slot table).
 │ Vulkan / Metal / DX12 driver    │ │ Linux amdgpu kernel driver (AMD)  │
 └─────────────────────────────────┘ └───────────────────────────────────┘
 ```
+
+> The diagram shows the **wgpu-vs-native** split. The native column now has
+> **two** backends: **AMD** (amdgpu DRM, shown) and **NVIDIA** (nouveau DRM /
+> clc597 push / SM75 SASS — added at v4.0), for three backends total. As of
+> **v4.0.1** an AMD adapter is rejected on the wgpu column and runs native
+> only (`GPU_ERR_AMD_WGPU_RETIRED`); wgpu still serves NVIDIA + Intel.
 
 ## Flat Layout
 

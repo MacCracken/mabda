@@ -5,6 +5,15 @@
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
 > wgpu-OR-native consumer that swaps backends without changing
 > rendering code."
+>
+> **v4.0.1 update — this migration is now mandatory on AMD.** The AMD wgpu
+> route is retired: an AMD adapter is rejected on the wgpu path
+> (`gpu_context_from_preinit` returns `GPU_ERR_AMD_WGPU_RETIRED`). On AMD you
+> MUST select `BACKEND_KIND_AMD` native and ship precompiled GFX9 ISA shaders.
+> NVIDIA + Intel keep their wgpu route (per-chipset retirement). Note the
+> native-AMD path does not yet cover every wgpu feature — notably instancing
+> (`ic > 1`) and odd-dimension render targets are rejected — so confirm your
+> consumer doesn't rely on those before flipping.
 
 ## Why two backends
 
@@ -112,10 +121,14 @@ gcc -c samvada/deps/samvada_main.c -o samvada_main.o
 
 samvada itself is a sister AGNOS package (`[deps.samvada]
 tag = "0.4.1"` in your `cyrius.cyml`). It currently uses
-libsystemd via its C-shim; the v4.0.1 retirement plan drops both
-the AMD wgpu path and libsystemd in favour of pure-Cyrius. (v4.0
-itself ships NVIDIA native; AMD wgpu stays through 4.0.x as a
-coexistence window.)
+libsystemd via its C-shim. **v4.0.1 retires the AMD wgpu route**
+(AMD adapters are rejected on the wgpu path — this migration is
+now mandatory on AMD), but the paired **libsystemd/samvada C-shim
+retirement is deferred** under the roadmap escape hatch: the
+pure-Cyrius dbus replacement is upstream samvada work that isn't
+ready, so `[deps.samvada]` stays `0.4.1` and `MABDA_LOGIND` stays
+opt-in. When samvada ships pure-Cyrius 1.0, mabda swaps via a
+one-line tag bump. (v4.0 itself shipped NVIDIA native.)
 
 If you don't need the logind path (kiosk / development / no
 compositor in your session), skip samvada entirely — `_native_kiosk`

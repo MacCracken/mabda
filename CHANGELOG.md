@@ -13,6 +13,59 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.1] — 2026-07-02
+
+**AMD wgpu retirement — AMD adapters are now rejected on the wgpu path; AMD runs native only.**
+Per the per-chipset retirement schedule (ADR-006 / roadmap), the AMD route through wgpu retires
+at v4.0.1 while the wgpu binding itself stays for NVIDIA + Intel (until v5.0 / v5.1). The paired
+samvada/libsystemd C-shim retirement is **deferred under the roadmap escape hatch** (the
+pure-Cyrius dbus replacement is upstream samvada work that isn't ready). No public-API signature
+change; the only behavior change is an AMD-on-wgpu context now failing loud instead of succeeding.
+
+### Breaking
+- **AMD adapters are rejected on the wgpu path.** `gpu_context_from_preinit` now returns
+  `Err(GPU_ERR_AMD_WGPU_RETIRED)` when the live adapter's PCI vendor is AMD (`0x1002`) and
+  `MABDA_BACKEND_KIND == BACKEND_KIND_WGPU`. **Migration:** AMD consumers select
+  `BACKEND_KIND_AMD` (native amdgpu) and ship precompiled GFX9 ISA shaders instead of WGSL.
+  NVIDIA (`0x10DE`) and Intel (`0x8086`) wgpu contexts are unaffected. Note the native-AMD path
+  does not yet cover every wgpu feature (instancing `ic>1` and odd-dimension render targets are
+  rejected) — confirm before flipping. See `docs/guides/native-migration.md`.
+
+### Added
+- **`src/wgpu_descriptors.cyr`** — `WGPUAdapterInfo` layout (96 B, v29) with
+  `WGPU_ADAPTER_INFO_SIZE` / `WGPU_ADAPTER_INFO_VENDOR_ID_OFFSET` (80) constants + the
+  `wgpu_adapter_info_vendor_id` accessor and `PCI_VENDOR_AMD`. Offset **offsetof-verified**
+  against the vendored `deps/wgpu-native/include/webgpu/webgpu.h`.
+- **`src/wgpu_ffi.cyr`** — `wgpu_adapter_vendor_id(adapter)` helper (stack scratch +
+  `wgpu_adapter_get_info`), the guard's single call site.
+- **`src/error.cyr`** — `GPU_ERR_AMD_WGPU_RETIRED = 22` + its `gpu_err_name` entry (an actionable
+  "use BACKEND_KIND_AMD native" diagnostic rather than a misleading "adapter not found").
+- **`tests/tcyr/backend.tcyr`** — `test_amd_wgpu_retirement_guard_v401` pins the constants, the
+  vendorID decode, and the AMD-vs-NVIDIA reject logic (the live reject is HW-gated — no adapter
+  in the CPU suite).
+
+### Changed
+- **`gpu_context_from_preinit`** (`src/context.cyr`) — adds the AMD-vendorID guard on the wgpu
+  fallthrough, after the adapter null-check.
+- **Docs** — corrected the version-slip stragglers that predated this cut (README, CLAUDE.md,
+  `docs/stdlib-integration.md`, `docs/adr/004-c-launcher-ffi.md`, `docs/architecture/overview.md`,
+  `docs/guides/native-migration.md`): the AMD *route* retires at v4.0.1, the wgpu *binding* stays
+  to v5.1, and libsystemd's drop is deferred. `docs/architecture/overview.md` now says three
+  backends (NVIDIA native landed at v4.0).
+
+### Deferred
+- **samvada / libsystemd C-shim retirement** — deferred under the roadmap escape hatch. Zero mabda
+  source edits; `[deps.samvada]` stays `0.4.1`, `MABDA_LOGIND` stays opt-in/off (coupling dormant).
+  Forward plan: evolve the samvada dbus project into a pure-Cyrius native dbus client (SASL
+  EXTERNAL + SCM_RIGHTS); mabda then swaps via a one-line tag bump. See
+  `docs/audit/2026-07-02-audit.md` and the roadmap v4.0.1 status.
+
+### Security
+- **v4.0.1 audit** (`docs/audit/2026-07-02-audit.md`): FFI-offset review of the new `WGPUAdapterInfo`
+  decode (the only new FFI surface) — offset 80 / size 96 confirmed by an `offsetof()` probe against
+  v29 `webgpu.h`, not assumed. No new CVE surface (no new external calls; `wgpu_adapter_get_info` was
+  already bound). 0 CRITICAL / 0 HIGH.
+
 ## [4.0.0] — 2026-07-01
 
 **Third backend: a pure-Cyrius native NVIDIA path (nouveau DRM, Turing/SM75) — compute,

@@ -72,10 +72,11 @@ reasons:
    vendor/driver/OS-specific behaviour during v3.x so the native
    DRM/KMS backend matures against a stable reference.
 
-**v4.0 retires ADR 004.** Once every consumer has been running native
-in production across a full release cycle, the C launcher +
-`deps/wgpu-native/` are removed. v4.0 is the native-only release.
-The retirement criterion is consumer-driven, not calendar-driven.
+**The wgpu+C path retires per-chipset (ADR-006 schedule), not all at
+once.** The AMD *route* retires at v4.0.1 (AMD adapters rejected on the
+wgpu path); NVIDIA's wgpu route retires at v5.0; the C launcher +
+`deps/wgpu-native/` leave the tree only at v5.1, once Intel native lands.
+Each retirement is consumer-driven, not calendar-driven.
 
 Drift noted: the function table is 65 entries as of v2.4.x, not the
 40 recorded above. Not worth a rewrite of the original Decision

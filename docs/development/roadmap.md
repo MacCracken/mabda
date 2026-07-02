@@ -274,6 +274,26 @@ the `Backend` interface:
   isn't ready, the C shim can survive into v4.x — but the commitment
   is "both C-shim deps go at v4.0.1 if we ship them in v3.x."
 
+**v4.0.1 status (shipped).**
+- **AMD wgpu retirement — DONE.** Realized as the roadmap's "guard that
+  errors out", but the only *functional* form: neither literal option works
+  as written (a compile-time `BACKEND_KIND_AMD` guard inside the wgpu files
+  is dead code — an AMD build routes to native and never enters wgpu; and
+  there is zero AMD-specific wgpu wiring to remove — adapter selection is
+  power-preference-only, delegated to wgpu-native). So the enforcement is a
+  **runtime adapter-vendorID guard** in `gpu_context_from_preinit`: on the
+  wgpu fallthrough it reads `WGPUAdapterInfo.vendorID` (offset-verified) and
+  rejects AMD (`0x1002`) with `GPU_ERR_AMD_WGPU_RETIRED`. NVIDIA/Intel pass.
+  The wgpu binding is untouched (stays to v5.1).
+- **`samvada` C-shim retirement — DEFERRED (escape hatch exercised).** The
+  pure-Cyrius replacement is a full native dbus client (SASL EXTERNAL +
+  SCM_RIGHTS master-fd passing) that lives upstream in samvada and isn't
+  ready (samvada still `0.4.1`/`LIBSYSTEMD`). mabda's coupling is already
+  dormant (`#ifdef MABDA_LOGIND`, off by default), so no v4.0.1 code change.
+  **Forward plan:** evolve the samvada dbus project into the native
+  pure-Cyrius dbus for AGNOS; when it ships 1.0, mabda swaps via a one-line
+  `[deps.samvada]` tag bump. Do not mark this retirement Shipped.
+
 ---
 
 ## v5.0 — Intel Native Backend (Tentative); NVIDIA wgpu Retires

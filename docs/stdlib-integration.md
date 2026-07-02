@@ -4,9 +4,11 @@
 > + wgpu-native), which is the cross-vendor default and remains load-bearing
 > across the entire v3.x line. v3.0 (2026-06-02) added a pure-Cyrius **native
 > AMD** backend *alongside* wgpu — not replacing it — so the C launcher does
-> NOT disappear at v3.0; per the roadmap the wgpu+C path retires per-vendor
-> (AMD at v4.0, then NVIDIA, then Intel) only once each vendor's native
-> backend is in production. Either way your `src/main.cyr` does not change —
+> NOT disappear at v3.0; per the roadmap the wgpu+C path retires per-vendor:
+> the **AMD route at v4.0.1** (AMD adapters rejected on the wgpu path), NVIDIA
+> at v5.0, and the launcher/binding itself only at v5.1 — each once that
+> vendor's native backend is in production. Either way your `src/main.cyr`
+> does not change —
 > the `@public` API is identical across backends.
 
 Mabda is a Cyrius stdlib-trusted dep starting with v2.3.0. This guide

@@ -2,13 +2,14 @@
 
 **Mabda** (Arabic: مبدأ — origin, principle, starting point) is the GPU
 foundation layer for the [AGNOS](https://github.com/MacCracken) ecosystem.
-It provides shared GPU infrastructure — over a dual backend (wgpu-native
-plus a pure-Cyrius native AMD path) — that all AGNOS GPU consumers build upon.
+It provides shared GPU infrastructure — over a triple backend (wgpu-native,
+a pure-Cyrius native AMD path, and a pure-Cyrius native NVIDIA path) — that
+all AGNOS GPU consumers build upon.
 
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.0.0 (triple backend — wgpu + native AMD + native NVIDIA; see
+Version: 4.0.1 (triple backend — wgpu + native AMD + native NVIDIA; see
 *Hardware support* below. GA (3.0.0) cut 2026-06-02. 3.1.0 added on-device
 mipmap generation; 3.1.1 added multi-queue coordination (both native AMD
 HW-verified). 3.2.0 opens the "texture & shader breadth" arc with
@@ -55,7 +56,8 @@ HW-verified, found integrating into the `puka` terminal). **4.0.0 adds a third b
 pure-Cyrius native NVIDIA path (nouveau DRM) for Turing (SM75)** — compute, textures, render,
 and present, all reachable through the same backend-agnostic public API and HW-proven on a
 GTX 1660 SUPER (TU116), then burned in ~30¾h across three soak runs (RSS-flat, dmesg Δ=0).
-The wgpu path stays as a coexistence window (AMD wgpu retires at 4.0.1). See the CHANGELOG.)
+The wgpu path stays for NVIDIA + Intel; **4.0.1 retires the AMD wgpu route** — AMD adapters
+are rejected on the wgpu path (`GPU_ERR_AMD_WGPU_RETIRED`) and run native only. See the CHANGELOG.)
 
 ## Features
 
@@ -170,8 +172,8 @@ Consumer (soorat, bijli, ...)
 
 ## Hardware support
 
-Mabda's two backends have different hardware reach. The native
-backend lands one vendor at a time, and **wgpu retires per-chipset**
+Mabda's wgpu and native paths have different hardware reach. The native
+backend lands one vendor at a time (AMD, then NVIDIA), and **wgpu retires per-chipset**
 as each vendor's native path matures — not all-at-once. The full
 roadmap is in [docs/development/roadmap.md](docs/development/roadmap.md).
 
@@ -188,7 +190,8 @@ the wgpu path is retired *for that vendor* — the wgpu binding stays
 in-tree to serve the vendors whose native backends haven't shipped
 yet. The cutovers (per the roadmap):
 
-- **v4.0** — AMD wgpu retires. AMD consumers run on AMD native only.
+- **v4.0.1** — AMD wgpu retires (AMD adapters rejected on the wgpu path).
+  AMD consumers run on AMD native only.
   NVIDIA + Intel still on wgpu.
 - **v5.0** — NVIDIA wgpu retires. NVIDIA consumers run on NVIDIA
   native only. Intel still on wgpu.

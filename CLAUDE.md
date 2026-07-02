@@ -64,10 +64,16 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   to populate the static fn-table that mabda's `_native_logind` slot
   reads from.
 - **wgpu-native v29** — external C library, downloaded by consumers
-  alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep. Drops
-  at v4.0.
+  alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep. The AMD
+  *route* through it retires at v4.0.1 (AMD adapters are rejected on the
+  wgpu path — `gpu_context_from_preinit` vendorID guard); the binding
+  itself stays for NVIDIA + Intel until the wgpu+C path leaves the tree
+  at v5.1.
 - **libsystemd** — needed by samvada's C shim. Consumer-provided link,
-  not a mabda direct dep. Drops at v4.0.1 alongside the AMD wgpu path.
+  not a mabda direct dep. Its v4.0.1 drop was **deferred under the
+  roadmap escape hatch**: the samvada C shim survives into v4.x until a
+  pure-Cyrius dbus replacement ships (samvada 1.0), then mabda swaps via
+  a one-line `[deps.samvada]` tag bump.
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
@@ -189,8 +195,10 @@ struct-shape tests at the Cyrius layer. HW gates live in the
   `bump_allocator_exhaustion_in_tests` vidya entry).
 - **Own the stack** — every external dep is either an AGNOS package
   (samvada, sakshi, patra, sigil, chitra) or a consumer-provided C
-  library (wgpu-native, libsystemd-via-samvada). wgpu-native and
-  libsystemd both retire at v4.0.1.
+  library (wgpu-native, libsystemd-via-samvada). The AMD wgpu *route*
+  retires at v4.0.1 (binding stays to v5.1); libsystemd's drop is
+  deferred under the roadmap escape hatch (samvada C shim survives into
+  v4.x pending a pure-Cyrius dbus 1.0).
 - **No magic** — every operation measurable, auditable, traceable.
 - **Manual memory** — `alloc / store64 / load64`. Every struct has a
   header comment block with field offsets.
