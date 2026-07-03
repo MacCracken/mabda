@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.0.1** (2026-07-02). Module/assertion/bundle counts live in the
+> **v4.0.2** (2026-07-02). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -11,8 +11,9 @@ release, see [`CHANGELOG.md`](../../CHANGELOG.md) — that is the
 source of truth for completed work. Shipped-section details are
 pruned from this file as each arc closes so it stays useful for
 planning instead of bloating with history (v2.x pruned 2026-04-21;
-v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19; v4.0 / v4.0.1 pruned
-2026-07-02 — NVIDIA native backend + AMD-wgpu deprecation, arcs closed).
+v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19; v4.0 / v4.0.1 / v4.0.2
+pruned 2026-07-02 — NVIDIA native backend, AMD-wgpu deprecation, and the
+fncall6 struct-pack retirement + cyrius 6.3.35 bump, arcs closed).
 
 ## The Long Arc
 
@@ -180,32 +181,6 @@ vendor-driven, not calendar-driven.
 Unscheduled forward work — lands here first, graduates to a version once
 there's consumer demand plus a clear scope.
 
-- **(P1) Retire the `fncall6`→struct-pack workarounds + declare foreign TLS.**
-  cyrius **6.3.26** proved the long-held "`fncall6` into extern-C wgpu is
-  unreliable" belief was a **misdiagnosis** — `fncall4/5/6/7` arg-passing and
-  16-byte stack alignment are correct; the real failure was TLS/`%fs`: any
-  glibc-compiled C fn with an array local carries `-fstack-protector` and reads
-  its canary from `%fs:0x28`, so it faults **regardless of arg count** if `%fs`
-  isn't a glibc thread block. The C launcher (ADR-004) already supplies glibc's
-  `%fs`, so the wgpu C-hook path is sound. Two follow-ups, now unblocked:
-  1. **Drop the struct-packing.** The `pack args into a struct, call `fncall2`
-     instead of `fncall6`` wrappers in `src/wgpu_ffi.cyr`
-     (`wgpu_encoder_resolve_query_set`, `wgpu_command_encoder_copy_buffer_to_buffer`,
-     `wgpu_queue_write_texture`, `wgpu_buffer_map_sync`) can call the natural
-     6-arg wgpu C signatures directly via `fncall6`. Retire the
-     `Wgpu*Args`/`_shim_*` scaffolding + the "fncall6 hazard" comments in
-     `wgpu_ffi.cyr` / `compute.cyr` / `texture.cyr` / `typed_buffer.cyr`.
-  2. **Declare foreign TLS if any cyrius thread-local user is linked.** If a
-     wgpu-launched build links a cyrius lib that uses thread-locals (sigil
-     crypto banking, patra), call cyrius's new **`thread_local_use_foreign_tls()`**
-     ONCE at startup in `deps/wgpu_main.c` (before `mabda_main`), so cyrius does
-     NOT `arch_prctl(ARCH_SET_FS)`-clobber the launcher's glibc `%fs` (which
-     would wipe the C stack canary and break every stack-protected wgpu callee).
-  Requires **cyrius ≥ 6.3.26**. Pure cleanup/robustness — the current
-  struct-packed path works, so not hard-blocking; do it while the NVIDIA wgpu
-  route is still live (through v5.0). See cyrius
-  `docs/development/issues/2026-07-02-fncall6-extern-c-tls-not-abi.md` +
-  `docs/ffi/fncall-abi.md`.
 - **samvada C-shim → pure-Cyrius dbus.** The samvada `libsystemd` C-shim
   retirement (paired with the AMD-wgpu step) was **deferred at v4.0.1** under
   the roadmap escape hatch. Forward plan: evolve the samvada dbus project into

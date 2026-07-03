@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.0.1 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.0.2 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute

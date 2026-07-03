@@ -121,16 +121,18 @@ your project's `deps/` directory). It does exactly four things:
    `wgpuInstanceRequestAdapter` → `wgpuAdapterRequestDevice` →
    `wgpuDeviceGetQueue`. Packages the four handles into a
    `WgpuPreinit` struct.
-3. **Build the 65-slot function table.** Populates function pointers
-   for every wgpu entry mabda uses, including struct-packing shims
-   that route around Cyrius's `fncall6`-plus-wgpu crash bug:
-   - `wgpu_shim_copy_buffer_to_buffer` — 6-arg wgpu call packed into
-     `WgpuCopyArgs`
-   - `wgpu_shim_buffer_map` — 6-arg wgpu call packed into `WgpuMapArgs`
-   - `wgpu_shim_queue_write_texture` — 6-arg wgpu call packed into
-     `WgpuWriteTextureArgs`
-   - `wgpu_shim_resolve_query_set` — 6-arg wgpu call packed into
-     `WgpuResolveArgs`
+3. **Build the function table.** Populates function pointers for every
+   wgpu entry mabda uses. Slots 28/42/48
+   (`wgpuCommandEncoderCopyBufferToBuffer` / `...ResolveQuerySet` /
+   `wgpuQueueWriteTexture`) are the raw all-scalar wgpu functions, called
+   directly via `fncall6` (the old "`fncall6`-plus-wgpu crash" was a
+   `%fs`/TLS misdiagnosis resolved in cyrius 6.3.26; struct-packing
+   retired at v4.0.2). The shims that remain:
+   - `wgpu_shim_buffer_map` — natural 6-arg async→sync bridge
+     (`wgpuBufferMapAsync` + `wgpuDevicePoll`); called via `fncall6`
+   - `wgpu_shim_command_encoder_begin_render_pass` /
+     `..._copy_texture_to_buffer` — genuine struct-by-value descriptors,
+     packed into `WgpuBeginPassArgs` / `WgpuCopyTexToBufArgs`
    - `wgpu_shim_queue_submit_one` — 1-command submit convenience
    - `wgpu_shim_create_command_encoder` / `..._finish` — label-taking
      wrappers (wgpu v29 is sensitive to descriptor padding)

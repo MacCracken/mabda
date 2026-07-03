@@ -63,39 +63,35 @@ unconditionally, NOT silent on no-drift
 
 ## Class B — FFI / fncall constraints
 
-### B1. `fncall6` against wgpu-native ABI-crashes deterministically
+### B1. `fncall6` into extern-C wgpu — RESOLVED (misdiagnosis, cyrius 6.3.26)
 
-- **Symptom**: any wgpu-native call taking 6+ i64 args via
-  `fncall6` segfaults at the call site. Backtrace lands inside
-  the wgpu function but the actual cause is the Cyrius calling
-  convention disagreeing with C's at the 6-arg boundary.
-- **Workaround**: route 6+ arg wgpu calls through a struct-packing
-  shim in `deps/wgpu_main.c`. Canonical examples:
-  `wgpu_command_encoder_copy_buffer_to_buffer` (7 args, struct
-  shim) and `wgpu_buffer_map_sync` (6 args, struct shim).
-- **Memory note**: `feedback_fncall6_wgpu`.
-- **Hard rule** in CLAUDE.md.
-- **Upstream**: ABI bug in Cyrius's `fncall6` against System V
-  AMD64 calling convention. Pure-Cyrius code with 6+ args works
-  fine; the bug only surfaces at the C-FFI boundary. May be a
-  caller-saved-register vs callee-saved-register mismatch.
+- **Status**: NOT an ABI bug. cyrius 6.3.26 proved `fncall4/5/6/7`
+  arg-passing and 16-byte stack alignment are correct against System V
+  AMD64. The historical "wgpu `fncall6` segfaults" symptom was a
+  TLS/`%fs` init problem: a glibc-compiled C callee with an array local
+  carries `-fstack-protector` and reads its canary from `%fs:0x28`, so
+  it faults **regardless of arg count** if `%fs` isn't a glibc thread
+  block. It merely correlated with the 6-arg wgpu entry points (which
+  have local buffers). The wgpu C launcher (ADR-004) supplies glibc's
+  `%fs`, so the direct path is sound.
+- **Now**: scalar-arg wgpu entry points call directly via `fncall6`. The
+  `wgpu_command_encoder_copy_buffer_to_buffer` / `wgpu_queue_write_texture`
+  / `wgpu_encoder_resolve_query_set` / `wgpu_buffer_map_sync` struct-packing
+  shims were retired in mabda v4.0.2 (HW-verified byte-exact on Cezanne).
+  A shim is still required for genuine struct-by-value descriptors
+  (begin_render_pass slot 58, copy_texture_to_buffer slot 64), `float` /
+  `double`, and variadic callees.
+- **Canonical ref**: cyrius `docs/ffi/fncall-abi.md` ("Extern-C
+  prerequisite: a glibc-compatible `%fs`").
 
-### B2. 6-parameter ceiling for Cyrius fns that fncall into wgpu
+### B2. 7+-param ceiling into wgpu — RESOLVED (same `%fs` misdiagnosis)
 
-- **Symptom**: a Cyrius function declared with 7+ parameters that
-  internally `fncall*`s into wgpu-native segfaults reliably, even
-  when the Cyrius signature itself doesn't pass an arg array
-  larger than fncall5 can handle. Pure Cyrius can take 12+ args
-  without issue; the moment one such fn touches wgpu-native, the
-  ceiling kicks in.
-- **Workaround**: fold extra args into a struct pointer, or split
-  the function into two layers (outer one with ≤6 args that
-  unpacks a struct + calls inner, which does the fncall).
-- **Memory note**: `feedback_cyrius_param_ceiling`.
-- **Hard rule** in CLAUDE.md.
-- **Upstream**: related to B1 but distinct. The Cyrius prologue
-  for a 7+-arg fn may corrupt a register that fncall* relies on
-  — needs disasm walk to pinpoint.
+- **Status**: also not real. `fncallN` supports N ≤ 8 since cyrius
+  v5.4.13, and a 7+-param cyrius fn that fncalls into a stack-protected
+  extern-C callee works given the glibc launcher's `%fs`. The "ceiling"
+  was the same canary fault as B1.
+- **Now**: keep signatures small for readability, not for ABI safety.
+- **Canonical ref**: cyrius `docs/ffi/fncall-abi.md`.
 
 ---
 

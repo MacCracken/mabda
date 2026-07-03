@@ -13,6 +13,66 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.2] — 2026-07-02
+
+**Toolchain bump to cyrius 6.3.35 + retirement of the wgpu `fncall6`→struct-pack workarounds
+(roadmap P1).** cyrius **6.3.26** proved the long-held "`fncall6` into extern-C wgpu is unreliable"
+belief was a **misdiagnosis** — the arg-passing + 16-byte stack alignment were always correct; the
+real failure was a TLS/`%fs` init problem (`-fstack-protector` C callees read their canary from
+`%fs:0x28`, which faults if `%fs` isn't a glibc thread block — regardless of arg count). The wgpu
+C launcher (ADR-004) already supplies glibc's `%fs`, so the direct 6-arg path is sound. **No mabda
+public-API signature change**; HW-verified byte-exact on Cezanne (phase0, transfer-copy,
+texture-sample, compute-e2e).
+
+### Changed
+- **Toolchain pin `cyrius = "6.3.23"` → `"6.3.35"`** in `cyrius.cyml` (latest upstream). Re-resolved
+  with `cyrius deps`.
+- **Four wgpu wrappers now call the natural 6-arg C signatures directly via `fncall6`** instead of
+  packing args into a struct and calling `fncall2` (`src/wgpu_ffi.cyr`):
+  `wgpu_command_encoder_copy_buffer_to_buffer` (slot 28), `wgpu_encoder_resolve_query_set` (slot 42),
+  `wgpu_queue_write_texture` (slot 48), and `wgpu_buffer_map_sync` (slot 10). All four take only
+  integer/pointer-class args — no struct-by-value, no float — so `fncall6` marshals them correctly.
+  The now-disproven "fncall6 hazard" rationale comments in `wgpu_ffi.cyr` / `compute.cyr` /
+  `texture.cyr` / `typed_buffer.cyr` were corrected to reference the `%fs`/TLS resolution.
+- **Launcher fn-table (`deps/wgpu_main.c`)** — slots 28/42/48 now point directly at
+  `wgpuCommandEncoderCopyBufferToBuffer` / `wgpuCommandEncoderResolveQuerySet` / `wgpuQueueWriteTexture`;
+  slot 10's `wgpu_shim_buffer_map` async→sync bridge changed from a struct-packed arg to a natural
+  6-arg signature. **fn-table slot COUNT is unchanged (67).**
+
+### Added
+- **Foreign-TLS declaration in the wgpu launcher** (roadmap P1 follow-up #2, forward-looking
+  robustness). `deps/wgpu_main.c` calls cyrius `thread_local_use_foreign_tls()` once at startup
+  (after `_cyrius_init` / `alloc_init`, before `mabda_main`) so any linked cyrius thread-local user
+  (sigil crypto banking, patra) keeps its slots in a process-global fallback array instead of
+  `arch_prctl(ARCH_SET_FS)`-clobbering the launcher's glibc `%fs` — which would wipe the stack canary
+  every stack-protected wgpu callee reads. `src/lib.cyr` now includes `lib/thread_local.cyr` so the
+  symbol links (the Linux `thread.cyr` path does not pull it in transitively). Idempotent no-op when
+  no thread-local user is linked.
+
+### Removed
+- **`deps/wgpu_main.c` struct-packing scaffolding** — the shims `wgpu_shim_copy_buffer_to_buffer`,
+  `wgpu_shim_queue_write_texture`, `wgpu_shim_resolve_query_set` and the arg-structs `WgpuCopyArgs`,
+  `WgpuWriteTextureArgs`, `WgpuResolveArgs`, `WgpuMapArgs`. Slots 58 (begin_render_pass) and 64
+  (copy_texture_to_buffer) **keep** their shims — those genuinely marshal struct-by-value
+  descriptors, which `fncallN` cannot do.
+
+### Fixed
+- **`src/texture.cyr` cube-create dispatch arity** — `gpu_texture_create_cube` dispatched to its
+  4-arg backend filler via `fncall5` (which passes `fp` + 5 args). The absent 5th arg was zero-filled
+  and ignored by the 4-arg callee on ≤6.3.23, but 6.3.35's new arg-count checker flags it. Corrected
+  to `fncall4`. Latent and harmless before; restores a warning-clean build.
+
+### Migration
+- **Consumers who vendor `deps/wgpu_main.c` must adopt the new launcher and rebuild.** The fn-table
+  binary layout (67 pointers) is unchanged, but slots 10/28/42/48 changed target/signature — an old
+  launcher paired with this mabda would mismatch at those slots (and vice-versa). Launcher and lib
+  move together. Copy the updated `deps/wgpu_main.c`, recompile it, relink. Non-wgpu (native AMD /
+  NVIDIA) consumers are unaffected.
+
+### Metrics
+- CPU assertions: 4917 (unchanged; the FFI change is exercised through the existing mock-fnptr
+  dispatch tests + HW e2e). `dist/mabda.cyr`: −32 net lines (struct-packing removed).
+
 ## [4.0.1] — 2026-07-02
 
 **AMD wgpu DEPRECATION — AMD-on-wgpu is deprecated (not retired). It still works by default with

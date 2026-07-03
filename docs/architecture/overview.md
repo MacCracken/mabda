@@ -101,12 +101,13 @@ Instead:
    pass / render pipeline / surface / timestamp query / copy
    operations.
 3. **Cyrius code** receives the table pointer and calls functions
-   via `fncall1` / `fncall2` / ... / `fncall5` (never `fncall6`
-   with a struct-by-value arg — see next section).
+   via `fncall1` .. `fncall6` for scalar-arg entry points (never
+   `fncall6` with a struct-by-value / float arg — see next section).
 4. **Struct-packing shims** handle wgpu calls where the C callee
-   takes a struct-by-value or 6+ i64 arguments. Cyrius allocates a
-   packed-args struct and calls the shim via `fncall2(shim_fp,
-   subject_handle, args_ptr)`; the shim unpacks in C.
+   takes a struct-by-value / float / variadic argument (NOT by arg
+   count). Cyrius allocates a packed-args struct and calls the shim
+   via `fncall2(shim_fp, subject_handle, args_ptr)`; the shim unpacks
+   in C.
 5. **Callback wrappers** handle wgpu functions that pass callback
    descriptors by value (request-adapter / request-device /
    buffer-map-async).
@@ -151,47 +152,43 @@ everything; no object mode, no C linker.
 
 ## Struct-Packing Shim Pattern
 
-The historical framing of this was "fncall6 + wgpu crashes". The
-v2.4.2 investigation confirmed the root cause is **SysV / AAPCS64
-struct-by-value aggregate classification** (§3.2.3 / §B.4): wgpu
-entry points that accept a struct-by-value (most descriptor-taking
-functions) require the callee to read some fields from the stack,
-which Cyrius's register-only `fncallN` doesn't set up. Cyrius
-`fncall0..fncall8` themselves are correct for all-scalar args —
-fncall regressions tests in the cyrius repo prove this.
+The historical framing of this was "fncall6 + wgpu crashes"; cyrius
+6.3.26 settled it. Two things were conflated:
 
-The fix is a C shim that accepts `(subject_handle, struct_ptr)` and
-unpacks the struct on the C side. Cyrius then invokes the shim via
-`fncall2`. The 7 shims currently in `deps/wgpu_main.c`:
+- **Real, permanent**: wgpu entry points that accept a **struct-by-value**
+  (most descriptor-taking functions), a `float`/`double`, or are variadic
+  require the callee to read fields from places Cyrius's register-only
+  `fncallN` doesn't set up (SysV §3.2.3 / AAPCS64 §B.4 aggregate rules;
+  xmm/v regs for floats). Those need a C shim.
+- **Misdiagnosis, now retired**: "6+ i64 args" / "7+ params" were never
+  the problem. cyrius `fncall0..fncall8` are correct for all-scalar args;
+  the apparent crashes were a TLS/`%fs` init fault (a stack-protected C
+  callee reads its canary from `%fs:0x28`) the glibc C launcher already
+  prevents. The all-scalar wrappers `copy_buffer_to_buffer` /
+  `queue_write_texture` / `resolve_query_set` / `buffer_map_sync` were
+  un-shimmed at v4.0.2 and now call the raw wgpu functions directly via
+  `fncall6`.
 
-- `wgpu_shim_buffer_map(device, WgpuMapArgs*)` — wraps
-  `wgpuBufferMapAsync` + `wgpuDevicePoll`.
-- `wgpu_shim_copy_buffer_to_buffer(encoder, WgpuCopyArgs*)` — wraps
-  `wgpuCommandEncoderCopyBufferToBuffer` (6 args).
-- `wgpu_shim_queue_write_texture(queue, WgpuWriteTextureArgs*)` —
-  wraps `wgpuQueueWriteTexture` (6 args).
-- `wgpu_shim_resolve_query_set(encoder, WgpuResolveArgs*)` — wraps
-  `wgpuCommandEncoderResolveQuerySet` (6 args).
-- `wgpu_shim_create_command_encoder(device, label)` — builds a
-  `WGPUCommandEncoderDescriptor` from C for ABI certainty.
-- `wgpu_shim_command_encoder_finish(encoder, label)` — same reason.
+The shim accepts `(subject_handle, struct_ptr)` and unpacks in C; Cyrius
+invokes it via `fncall2`. The remaining **struct-packing** shims in
+`deps/wgpu_main.c`:
+
 - `wgpu_shim_command_encoder_begin_render_pass(encoder, WgpuBeginPassArgs*)`
   — v2.4.3; packs the render-pass descriptor + color-attachment array.
 - `wgpu_shim_command_encoder_copy_texture_to_buffer(encoder, WgpuCopyTexToBufArgs*)`
   — v2.4.3; packs src `WGPUTexelCopyTextureInfo` + dst
   `WGPUTexelCopyBufferInfo` + `WGPUExtent3D`.
 
-Any future wgpu entry that takes a struct-by-value (most descriptor
-parameters) should follow the same pattern regardless of arg count —
-the ABI handshake is what matters, not the arg count alone.
+(The launcher also carries non-struct-packing shims: callback bridges for
+request-adapter / request-device / buffer-map-async, label-descriptor
+builders for create/finish command encoder, single-buffer queue-submit,
+the timestamp-period reinterpret, and the raw-SPIR-V passthrough. And
+`wgpu_shim_buffer_map` is now a natural 6-arg async→sync bridge, not a
+struct-packer.)
 
-Related: the **6-parameter ceiling for Cyrius functions that fncall
-into wgpu** — pure Cyrius functions can take 12+ args without issue,
-but the moment one internally `fncall*`s into wgpu-native, any
-signature with 7+ params reliably segfaults. Fold into a struct
-pointer or split into helpers. Re-verified at cyrius 5.5.11 in
-v2.4.2 against `compute_dispatch` — see `feedback_cyrius_param_ceiling.md`
-for the fix pattern.
+Any future wgpu entry that takes a struct-by-value (most descriptor
+parameters), a float, or is variadic should follow the same pattern —
+the ABI handshake is what matters, not the arg count.
 
 ## Data Flow: Compute
 

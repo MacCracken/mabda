@@ -30,7 +30,8 @@ paths.
 - **Architecture overview + file layout** — `docs/architecture/overview.md`
 - **Roadmap** — `docs/development/roadmap.md`
 - **Toolchain quirks cheat-sheet** — `docs/development/2026-04-30-toolchain-issues.md`
-  (cyrius lint/fmt 128 KiB cap, `fncall6` ABI bug, `var X;` rejection,
+  (cyrius lint/fmt 128 KiB cap, the `fncall6`-into-extern-C `%fs`/TLS
+  gotcha — a misdiagnosis resolved in 6.3.26, `var X;` rejection,
   global init order, logical right shift, bump allocator exhaustion in
   tests — read before tripping a toolchain wire)
 - **Security audits** — `docs/audit/YYYY-MM-DD-audit.md`
@@ -146,8 +147,10 @@ fn-table-via-C-shim pattern.
    struct-packing shims)
 4. C calls `mabda_main(fn_table_ptr, preinit_ptr)` which the consumer
    defines
-5. Cyrius calls wgpu via `fncall1`/`fncall2`/`fncall5` and struct-packed
-   shims — **never** `fncall6` with a struct-by-value arg
+5. Cyrius calls wgpu via `fncall1`..`fncall6` for scalar-arg entry
+   points and struct-packing shims for struct-by-value descriptors —
+   **never** `fncall6` with a struct-by-value / float arg (the shim
+   marshals those)
 
 ### Native AMD path (no C shim)
 
@@ -211,16 +214,21 @@ struct-shape tests at the Cyrius layer. HW gates live in the
   `f32_from` builtin since 6.2.18; `src/` carries zero inline asm).
 - **Prefix private helpers with `_`** — public API uses descriptive
   names.
-- **Struct-pack wgpu args with 6+ parameters.** Cyrius `fncall6` +
-  wgpu-native segfaults. Wrap via a C shim in `deps/wgpu_main.c` that
-  takes `(handle, struct_ptr)` and call via `fncall2` — see
-  `wgpu_command_encoder_copy_buffer_to_buffer` and
-  `wgpu_buffer_map_sync` for the canonical pattern.
-- **6-parameter ceiling for Cyrius fns that fncall into wgpu.** Pure
-  Cyrius functions can take 12+ args without issue, but the moment one
-  internally `fncall*`s into wgpu-native, any signature with 7+ params
-  reliably segfaults. Fold into a struct pointer or split. See
-  `fncall6_ceiling_into_extern_c` vidya entry.
+- **Struct-pack wgpu args only for struct-by-value / float / variadic
+  callees — NOT by arg count.** The old "Cyrius `fncall6` + wgpu-native
+  segfaults" rule was a **misdiagnosis** (cyrius 6.3.26): the fault was a
+  TLS/`%fs` init problem, not arg count — the glibc C launcher (ADR-004)
+  supplies `%fs`, so scalar-arg wgpu entry points call **directly via
+  `fncall6`** (`wgpu_command_encoder_copy_buffer_to_buffer`,
+  `wgpu_queue_write_texture`, `wgpu_encoder_resolve_query_set`,
+  `wgpu_buffer_map_sync`; retired in v4.0.2). A C shim is still required
+  for struct-by-value descriptors (begin_render_pass slot 58,
+  copy_texture_to_buffer slot 64), `float`/`double`, or variadic callees.
+  See cyrius `docs/ffi/fncall-abi.md`.
+- **No arg-count ceiling into extern-C; `fncallN` supports N ≤ 8
+  (cyrius v5.4.13).** The old "7+ params into wgpu segfaults" belief was
+  the same `%fs` misdiagnosis. Keep signatures small for readability, not
+  for ABI safety.
 - **`var X = expr;` initialization required.** Cyrius rejects bare
   `var X;` declarations — every var needs an initializer. Use
   `var X = 0;` for "to-be-set-later" pattern.
@@ -294,10 +302,12 @@ struct-shape tests at the Cyrius layer. HW gates live in the
 7. **FFI descriptor offset review** — every edit to
    `wgpu_descriptors.cyr` cross-referenced against the v29 `webgpu.h`
    layout; field offsets noted in the module header comment block
-8. **`fncall6` avoidance** — any wgpu-native call taking 6+ i64
-   arguments goes through a struct-packing shim in `deps/wgpu_main.c`;
-   direct `fncall6` reliably crashes against wgpu-native (see
-   `feedback_fncall6_wgpu` memory)
+8. **Shim struct-by-value / float / variadic wgpu callees** — route
+   those through a struct-packing shim in `deps/wgpu_main.c`. Scalar-arg
+   entry points call directly via `fncallN` (N ≤ 8); the "direct
+   `fncall6` crashes wgpu-native" claim was a `%fs`/TLS misdiagnosis the
+   glibc C launcher already satisfies (cyrius 6.3.26; see
+   `docs/ffi/fncall-abi.md`)
 9. **Known CVE check** — review against current wgpu-native / WebGPU /
    GPU-driver CVEs since the prior audit
 10. **File findings** — `docs/audit/YYYY-MM-DD-audit.md` with severity,
@@ -367,8 +377,11 @@ Severity levels: **CRITICAL** (exploitable immediately) / **HIGH**
   consumer-provided)
 - Do not skip `cyrius test` before claiming changes work
 - Do not commit `build/`, `deps/wgpu-native/`, or `deps/*.o`
-- Do not call wgpu-native functions with 6+ i64 args via `fncall6` —
-  always go through a struct-packing shim in `deps/wgpu_main.c`
+- Do not pass struct-by-value / `float` / variadic wgpu-native args via
+  `fncallN` — those go through a struct-packing shim in
+  `deps/wgpu_main.c`. Scalar-arg (handle/u32/u64) callees are fine via
+  `fncall6` directly (the 6+-i64-args crash was a `%fs`/TLS misdiagnosis;
+  cyrius 6.3.26)
 - Do not add Cyrius stdlib includes in individual `src/*.cyr` files —
   `src/lib.cyr` owns the whole include chain
 - Do not hardcode Cyrius toolchain versions in CI YAML — read

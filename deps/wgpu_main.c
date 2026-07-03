@@ -85,24 +85,19 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     return *result_ptr;
 }
 
-// Buffer map sync — struct-packed form. fncall6 from Cyrius has shown
-// subtle misbehavior when the 6 stack slots include pointer + u64 + u64,
-// so we accept a struct pointer instead and unpack in C.
-typedef struct {
-    WGPUBuffer buffer;
-    uint32_t mode;
-    size_t offset;
-    size_t size;
-    long* status_ptr;
-} WgpuMapArgs;
-
-void wgpu_shim_buffer_map(WGPUDevice device, WgpuMapArgs* args) {
+// Buffer map sync — bridges async wgpuBufferMapAsync + wgpuDevicePoll into one
+// blocking call. Natural 6-arg C signature, called from Cyrius via fncall6: the
+// old "fncall6 into extern-C misbehaves" belief was a %fs/TLS misdiagnosis, put
+// to rest in cyrius 6.3.26 (this glibc C launcher owns %fs, so every fncallN
+// into wgpu is sound). See cyrius docs/ffi/fncall-abi.md.
+void wgpu_shim_buffer_map(WGPUDevice device, WGPUBuffer buffer, uint32_t mode,
+                          size_t offset, size_t size, long* status_ptr) {
     WGPUBufferMapCallbackInfo cb = {
         .mode = WGPUCallbackMode_AllowSpontaneous,
         .callback = c_on_buffer_mapped,
-        .userdata1 = args->status_ptr,
+        .userdata1 = status_ptr,
     };
-    wgpuBufferMapAsync(args->buffer, (WGPUMapMode)args->mode, args->offset, args->size, cb);
+    wgpuBufferMapAsync(buffer, (WGPUMapMode)mode, offset, size, cb);
     wgpuDevicePoll(device, true, NULL);
 }
 
@@ -139,55 +134,15 @@ void wgpu_shim_queue_submit_one(WGPUQueue queue, WGPUCommandBuffer cmd) {
     wgpuQueueSubmit(queue, 1, &cmd);
 }
 
-// Copy from src to dst — struct-based so Cyrius only has to fncall2 into the
-// shim with (encoder, &args). Avoids any fncall6 ABI subtlety.
-typedef struct {
-    WGPUBuffer src;
-    uint64_t src_off;
-    WGPUBuffer dst;
-    uint64_t dst_off;
-    uint64_t size;
-} WgpuCopyArgs;
-
-void wgpu_shim_copy_buffer_to_buffer(WGPUCommandEncoder encoder, WgpuCopyArgs* args) {
-    wgpuCommandEncoderCopyBufferToBuffer(encoder, args->src, args->src_off,
-                                         args->dst, args->dst_off, args->size);
-}
-
-// QueueWriteTexture takes 6 args; wrap via the same struct-packing pattern.
-// The shim takes (queue, args_ptr) where args_ptr points at 5 pointers:
-//   +0:  destination (WGPUTexelCopyTextureInfo*)
-//   +8:  data
-//   +16: data_size
-//   +24: dataLayout (WGPUTexelCopyBufferLayout*)
-//   +32: writeSize (WGPUExtent3D*)
-typedef struct {
-    const WGPUTexelCopyTextureInfo* destination;
-    const void* data;
-    size_t data_size;
-    const WGPUTexelCopyBufferLayout* data_layout;
-    const WGPUExtent3D* write_size;
-} WgpuWriteTextureArgs;
-
-void wgpu_shim_queue_write_texture(WGPUQueue queue, WgpuWriteTextureArgs* args) {
-    wgpuQueueWriteTexture(queue, args->destination, args->data, args->data_size,
-                          args->data_layout, args->write_size);
-}
-
-// ResolveQuerySet takes 6 args; wrap via the same struct-packing pattern.
-typedef struct {
-    WGPUQuerySet query_set;
-    uint32_t first_query;
-    uint32_t query_count;
-    WGPUBuffer destination;
-    uint64_t destination_offset;
-} WgpuResolveArgs;
-
-void wgpu_shim_resolve_query_set(WGPUCommandEncoder encoder, WgpuResolveArgs* args) {
-    wgpuCommandEncoderResolveQuerySet(encoder, args->query_set, args->first_query,
-                                      args->query_count, args->destination,
-                                      args->destination_offset);
-}
+// wgpuCommandEncoderCopyBufferToBuffer, wgpuQueueWriteTexture, and
+// wgpuCommandEncoderResolveQuerySet are all 6-arg all-scalar (handle/u32/u64)
+// C entry points — no struct-by-value, no float — so Cyrius calls them
+// DIRECTLY via fncall6 (slots 28/48/42). The former wgpu_shim_* struct-packing
+// wrappers were removed once cyrius 6.3.26 disproved the "fncall6 into extern-C
+// wgpu is unreliable" folklore (it was a %fs/TLS init problem the C launcher
+// already satisfies; see cyrius docs/ffi/fncall-abi.md). begin_render_pass
+// (slot 58) and copy_texture_to_buffer (slot 64) below KEEP their shims — those
+// genuinely pass struct-by-value descriptors, which fncallN cannot marshal.
 
 // BeginRenderPass takes a WGPURenderPassDescriptor by pointer — the descriptor
 // itself is built from a mabda-provided packed args struct so the Cyrius side
@@ -337,7 +292,7 @@ static void build_fn_table(void) {
     // Buffer (8-15)
     fn_table[i++] = (void*)wgpuDeviceCreateBuffer;                    // 8
     fn_table[i++] = (void*)wgpuQueueWriteBuffer;                      // 9
-    fn_table[i++] = (void*)wgpu_shim_buffer_map;                      // 10 (simplified)
+    fn_table[i++] = (void*)wgpu_shim_buffer_map;                      // 10 (6-arg async->sync bridge)
     fn_table[i++] = (void*)wgpuBufferGetConstMappedRange;             // 11
     fn_table[i++] = (void*)wgpuBufferUnmap;                           // 12
     fn_table[i++] = (void*)wgpuBufferGetSize;                         // 13
@@ -357,7 +312,7 @@ static void build_fn_table(void) {
     // Command (26-34)
     fn_table[i++] = (void*)wgpu_shim_create_command_encoder;          // 26 (shim: takes device, label)
     fn_table[i++] = (void*)wgpuCommandEncoderBeginComputePass;        // 27
-    fn_table[i++] = (void*)wgpu_shim_copy_buffer_to_buffer;           // 28 (shim wrapper)
+    fn_table[i++] = (void*)wgpuCommandEncoderCopyBufferToBuffer;      // 28 (direct 6-arg via fncall6)
     fn_table[i++] = (void*)wgpu_shim_command_encoder_finish;          // 29 (shim: takes encoder, label)
     fn_table[i++] = (void*)wgpuComputePassEncoderSetPipeline;         // 30
     fn_table[i++] = (void*)wgpuComputePassEncoderSetBindGroup;        // 31
@@ -375,14 +330,14 @@ static void build_fn_table(void) {
     // Query sets (40-44) — GPU timestamp profiling
     fn_table[i++] = (void*)wgpuDeviceCreateQuerySet;                  // 40
     fn_table[i++] = (void*)wgpuQuerySetRelease;                       // 41
-    fn_table[i++] = (void*)wgpu_shim_resolve_query_set;               // 42 (struct-packed)
+    fn_table[i++] = (void*)wgpuCommandEncoderResolveQuerySet;         // 42 (direct 6-arg via fncall6)
     fn_table[i++] = (void*)wgpu_shim_get_timestamp_period_bits;       // 43
     fn_table[i++] = (void*)wgpuDeviceHasFeature;                      // 44
     // Texture (45-51)
     fn_table[i++] = (void*)wgpuDeviceCreateTexture;                   // 45
     fn_table[i++] = (void*)wgpuTextureCreateView;                     // 46
     fn_table[i++] = (void*)wgpuDeviceCreateSampler;                   // 47
-    fn_table[i++] = (void*)wgpu_shim_queue_write_texture;             // 48 (struct-packed)
+    fn_table[i++] = (void*)wgpuQueueWriteTexture;                     // 48 (direct 6-arg via fncall6)
     fn_table[i++] = (void*)wgpuTextureRelease;                        // 49
     fn_table[i++] = (void*)wgpuTextureViewRelease;                    // 50
     fn_table[i++] = (void*)wgpuSamplerRelease;                        // 51
@@ -464,12 +419,23 @@ static int preinit_gpu(void) {
 extern long mabda_main(long fn_table_ptr, long preinit_ptr);
 extern void _cyrius_init(void);
 extern void alloc_init(void);
+extern long thread_local_use_foreign_tls(void);
 
 int main(void) {
     // Initialize Cyrius globals (enums, global vars), then heap
     // Order matters: _cyrius_init resets global vars, alloc_init must come after
     _cyrius_init();
     alloc_init();
+
+    // v6.3.26: this glibc-hosted launcher owns %fs (glibc's TCB self-pointer +
+    // the stack canary at %fs:0x28). Declare foreign TLS so any linked cyrius
+    // thread-local user (sigil crypto banking, patra) keeps its slots in a
+    // process-global fallback array instead of arch_prctl(ARCH_SET_FS)-clobbering
+    // glibc's %fs — which would wipe the canary every stack-protected wgpu callee
+    // reads. Must run AFTER _cyrius_init (it resets cyrius globals, including this
+    // flag) and before any cyrius thread-local touch. Idempotent no-op when no
+    // thread-local user is linked. See cyrius docs/ffi/fncall-abi.md.
+    thread_local_use_foreign_tls();
 
     // Pre-init GPU in C
     int gpu_ok = preinit_gpu();

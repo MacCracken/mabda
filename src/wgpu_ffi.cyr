@@ -16,7 +16,7 @@
 #   [7]  wgpuDeviceRelease
 #   [8]  wgpuDeviceCreateBuffer
 #   [9]  wgpuQueueWriteBuffer
-#   [10] wgpu_shim_buffer_map_async (by-pointer callbackInfo)
+#   [10] wgpu_shim_buffer_map (6-arg async->sync bridge, via fncall6)
 #   [11] wgpuBufferGetConstMappedRange
 #   [12] wgpuBufferUnmap
 #   [13] wgpuBufferGetSize
@@ -48,13 +48,13 @@
 #   [39] wgpu_shim_device_poll
 #   [40] wgpuDeviceCreateQuerySet
 #   [41] wgpuQuerySetRelease
-#   [42] wgpu_shim_resolve_query_set (struct-packed args)
+#   [42] wgpuCommandEncoderResolveQuerySet (direct 6-arg via fncall6)
 #   [43] wgpu_shim_get_timestamp_period_bits (returns f32 as i64 bit-pattern)
 #   [44] wgpuDeviceHasFeature
 #   [45] wgpuDeviceCreateTexture
 #   [46] wgpuTextureCreateView
 #   [47] wgpuDeviceCreateSampler
-#   [48] wgpu_shim_queue_write_texture (struct-packed args)
+#   [48] wgpuQueueWriteTexture (direct 6-arg via fncall6)
 #   [49] wgpuTextureRelease
 #   [50] wgpuTextureViewRelease
 #   [51] wgpuSamplerRelease
@@ -141,24 +141,15 @@ fn wgpu_buffer_get_const_mapped_range(buf, offset, size): i64 {
     return fncall3(_fp(11), buf, offset, size);
 }
 
-# Buffer map sync: simplified shim handles callback + poll in C. The args
-# are packed into a struct so Cyrius calls via fncall2 instead of fncall6.
-# WgpuMapArgs layout (32 bytes):
-#   +0:  buffer (8)
-#   +8:  mode (4) + padding (4)
-#   +16: offset (8)
-#   +24: size (8)
-#   +32: status_ptr (8) — total 40 bytes
+# Buffer map sync: the slot-10 C shim bridges async wgpuBufferMapAsync +
+# wgpuDevicePoll into a blocking call. Natural 6-arg signature — Cyrius passes
+# (device, buffer, mode, offset, size, status_ptr) straight through via fncall6
+# (all scalars; the C launcher's glibc %fs makes fncall6-into-extern-C sound —
+# see cyrius docs/ffi/fncall-abi.md). status_ptr receives the map status.
 fn wgpu_buffer_map_sync(device, buffer, mode, offset, size): i64 {
     var status_ptr = alloc(8);
     store64(status_ptr, 0);
-    var args = alloc(40);
-    store64(args + 0,  buffer);
-    store32(args + 8,  mode);
-    store64(args + 16, offset);
-    store64(args + 24, size);
-    store64(args + 32, status_ptr);
-    fncall2(_fp(10), device, args);
+    fncall6(_fp(10), device, buffer, mode, offset, size, status_ptr);
     return load64(status_ptr);
 }
 
@@ -195,15 +186,11 @@ fn wgpu_pipeline_layout_release(pl): i64 { fncall1(_fp(25), pl); return 0; }
 # is interpreted as a null-terminated label pointer. Pass 0 for no label.
 fn wgpu_device_create_command_encoder(device, label): i64 { return fncall2(_fp(26), device, label); }
 fn wgpu_command_encoder_begin_compute_pass(enc, desc): i64 { return fncall2(_fp(27), enc, desc); }
+# Direct call into wgpuCommandEncoderCopyBufferToBuffer (slot 28): 6 scalar args
+# (encoder + 2 buffer handles + 3 u64 offset/size), no struct-by-value, so
+# fncall6 is correct — the C-side packing shim is gone.
 fn wgpu_command_encoder_copy_buffer_to_buffer(enc, src, soff, dst, doff, sz): i64 {
-    # Pack args into WgpuCopyArgs struct (40 bytes: src, soff, dst, doff, size)
-    var args = alloc(40);
-    store64(args + 0,  src);
-    store64(args + 8,  soff);
-    store64(args + 16, dst);
-    store64(args + 24, doff);
-    store64(args + 32, sz);
-    fncall2(_fp(28), enc, args);
+    fncall6(_fp(28), enc, src, soff, dst, doff, sz);
     return 0;
 }
 # NOTE: slot 29 is a C shim that takes (encoder, label_cstr). Pass 0 for no label.
@@ -261,24 +248,11 @@ fn wgpu_device_has_feature(device, feature): i64 { return fncall2(_fp(44), devic
 fn wgpu_device_create_query_set(device, desc): i64 { return fncall2(_fp(40), device, desc); }
 fn wgpu_query_set_release(qs): i64 { fncall1(_fp(41), qs); return 0; }
 
-# ResolveQuerySet takes 6 args. Keep encoder on the left and pack the rest
-# into a struct pointer — see feedback_fncall6_wgpu and the existing
-# copy_buffer_to_buffer wrapper for the rationale.
-#
-# WgpuResolveArgs layout (40 bytes):
-#   +0:  querySet     (8)
-#   +8:  firstQuery   (u32)
-#   +12: queryCount   (u32)
-#   +16: destBuffer   (8)
-#   +24: destOffset   (8)
+# Direct call into wgpuCommandEncoderResolveQuerySet (slot 42): 6 scalar args
+# (encoder, querySet, firstQuery u32, queryCount u32, destBuffer, destOffset u64)
+# — all integer-class, so fncall6 marshals them correctly. No struct-pack shim.
 fn wgpu_encoder_resolve_query_set(encoder, qs, first, count, dest_buf, dest_off): i64 {
-    var args = alloc(40);
-    store64(args + 0,  qs);
-    store32(args + 8,  first);
-    store32(args + 12, count);
-    store64(args + 16, dest_buf);
-    store64(args + 24, dest_off);
-    fncall2(_fp(42), encoder, args);
+    fncall6(_fp(42), encoder, qs, first, count, dest_buf, dest_off);
     return 0;
 }
 
@@ -297,21 +271,12 @@ fn wgpu_texture_release(texture): i64 { fncall1(_fp(49), texture); return 0; }
 fn wgpu_texture_view_release(view): i64 { fncall1(_fp(50), view); return 0; }
 fn wgpu_sampler_release(sampler): i64 { fncall1(_fp(51), sampler); return 0; }
 
-# QueueWriteTexture takes 6 args; Cyrius uses struct-packing via fncall2.
-# WgpuWriteTextureArgs layout (40 bytes):
-#   +0:  destination (WGPUTexelCopyTextureInfo ptr)
-#   +8:  data (void*)
-#   +16: data_size (size_t)
-#   +24: data_layout (WGPUTexelCopyBufferLayout ptr)
-#   +32: write_size (WGPUExtent3D ptr)
+# Direct call into wgpuQueueWriteTexture (slot 48): 6 args, all pointer/size_t
+# scalars — destination, data, data_layout, and write_size are already passed by
+# pointer (the by-value structs live behind those pointers), so fncall6 is
+# correct. No struct-pack shim.
 fn wgpu_queue_write_texture(queue, destination, data, data_size, data_layout, write_size): i64 {
-    var args = alloc(40);
-    store64(args + 0,  destination);
-    store64(args + 8,  data);
-    store64(args + 16, data_size);
-    store64(args + 24, data_layout);
-    store64(args + 32, write_size);
-    fncall2(_fp(48), queue, args);
+    fncall6(_fp(48), queue, destination, data, data_size, data_layout, write_size);
     return 0;
 }
 
