@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.0.4** (2026-07-13). Module/assertion/bundle counts live in the
+> **v4.0.5** (2026-07-13). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -16,7 +16,8 @@ pruned 2026-07-02 — NVIDIA native backend, AMD-wgpu deprecation, and the
 fncall6 struct-pack retirement + cyrius 6.3.35 bump, arcs closed. v4.0.3
 (2026-07-13) is a maintenance cut — cyrius 6.4.62 pin + chitra 0.3.0 dep
 refresh, no source change; v4.0.4 (2026-07-13) wired chitra's baseline JPEG
-loader (`-D MABDA_JPEG`) + a provenance-stamp refresh).
+loader (`-D MABDA_JPEG`) + a provenance-stamp refresh; v4.0.5 (2026-07-13)
+tracked the NVIDIA single-BO deferrals against the multi-BO backlog item below).
 
 ## The Long Arc
 
@@ -42,7 +43,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.0.4  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.0.5  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -202,6 +203,18 @@ there's consumer demand plus a clear scope.
   consumer applying the planner's offsets) needs a native transient-allocation
   subsystem — wgpu's safe API has no placed/aliased resources, and the native
   path has no rg-transient backing today. Its own future arc.
+- **NVIDIA multi-BO / bigger-BO surfaces.** The nouveau backend caps every
+  buffer / texture / render-target at one `NV_BO_SIZE` (64 KiB) BO — a v0
+  single-BO constraint (≤128×128 RGBA8) in `src/backend_nvidia.cyr`
+  (`_backend_nvidia_texture_create_2d_rgba8`,
+  `_backend_nvidia_render_target_create_2d_rgba8`, and the buffer slots).
+  Lifting it means parameterizing `_nv_ctx_bo_alloc_bind` on a surface-derived,
+  64 KiB-aligned size (mirroring the AMD `_NATIVE_*_VA_ALIGN` path) and threading
+  a per-object size through every VM_UNBIND / BO-release site (all of which pass
+  a fixed `NV_BO_SIZE` today). **HW-blocked** — only verifiable on a nouveau /
+  NVIDIA GPU, absent from the current dev box (AMD Cezanne); bring-up runs on
+  NVIDIA hardware. The AMD path's 64 KiB GEM_VA-alignment gotcha (3.4.2/3.4.3)
+  shows this allocator-change class needs HW to prove, not blind implementation.
 
 ---
 

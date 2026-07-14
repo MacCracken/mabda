@@ -13,6 +13,33 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.5] — 2026-07-13
+
+**Deferral hygiene: the two NVIDIA single-BO `follow-up` comments are now tracked against a
+scheduled roadmap item.** No code and no public-API change — this cut clears the last
+`cyrius lint` untracked-deferral state in the tree and records the multi-BO NVIDIA surface
+work as real, HW-blocked forward scope (it is implemented and verified on nouveau hardware,
+which the current dev box lacks — AMD Cezanne only).
+
+### Changed
+- **`src/backend_nvidia.cyr` — the two v0 single-BO `follow-up` notes** on
+  `_backend_nvidia_texture_create_2d_rgba8` and `_backend_nvidia_render_target_create_2d_rgba8`
+  (surfaces capped at one 64 KiB `NV_BO_SIZE` BO, ≤128×128 RGBA8) now cross-reference the
+  roadmap backlog (`see docs/development/roadmap.md`), so `cyrius lint` counts them as tracked
+  rather than untracked. Comment-only; the single-BO behavior is unchanged.
+
+### Added
+- **Roadmap backlog entry "NVIDIA multi-BO / bigger-BO surfaces"** — parameterize
+  `_nv_ctx_bo_alloc_bind` on a surface-derived, 64 KiB-aligned size (mirroring the AMD
+  `_NATIVE_*_VA_ALIGN` path) and thread a per-object size through every VM_UNBIND / BO-release
+  site. Flagged **HW-blocked**: verifiable only on a nouveau/NVIDIA GPU — the AMD path's
+  64 KiB GEM_VA-alignment gotcha (3.4.2/3.4.3) is the precedent that this allocator-change
+  class must be proven on hardware, not implemented blind. Bring-up runs on an NVIDIA box.
+
+### Metrics
+- CPU assertions: 4929 (unchanged — a comment/roadmap-only cut). `dist/mabda.cyr` differs
+  from 4.0.4 by the `# Version:` header and the two `backend_nvidia` deferral comments.
+
 ## [4.0.4] — 2026-07-13
 
 **JPEG asset loading (chitra 0.3.0's baseline decoder, now wired) + a provenance-stamp
