@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.0.3 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.0.4 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -31,7 +31,7 @@ release history and *Hardware support* below.
 - **Textures** — RGBA + block-compressed (BC1/3/4/5/7) + array/cubemap; creation, TextureCache, mip levels, GPU sampling, dimension validation
 - **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
 - **Render targets** — offscreen framebuffers with optional MSAA and depth
-- **Asset loading** — KTX2 / DDS parsers in-tree + PNG via the `chitra` package (opt-in, `-D MABDA_PNG`)
+- **Asset loading** — KTX2 / DDS parsers in-tree + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
 - **Native SPIR-V → GFX9 compiler** — in-tree compute-shader lowering (structured control flow, int div/mod, vectors, f64), HW-verified on Cezanne
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
 - **Profiling** — FrameProfiler with EMA smoothing, frame history, explicit scope timing
@@ -84,11 +84,11 @@ for the full wiring. (The C launcher + `wgpu_ffi_init_table` shown above are the
 `gpu_context_new_native()` / `gpu_context_new_native_nvidia()` and don't use the
 launcher.)
 
-Two features need extra deps, opt-in via compile flags: **PNG asset loading**
-(`-D MABDA_PNG`) pulls `[deps.chitra]` (tag 0.3.0) + stdlib `thread`/`sankoch`
-(include their `lib/*.cyr` before `mabda`); **logind master delegation**
-(`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 0.4.1). A minimal consumer needs
-neither — the dist compiles those paths out without the flags.
+Extra deps opt in via compile flags: **PNG / JPEG asset loading**
+(`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 0.3.0) + stdlib
+`thread`/`sankoch` (include their `lib/*.cyr` before `mabda`); **logind master
+delegation** (`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 0.4.1). A minimal
+consumer needs none — the dist compiles those paths out without the flags.
 
 ## Modules
 
@@ -98,7 +98,7 @@ neither — the dist compiles those paths out without the flags.
 | **Buffers / compute** | buffer, typed_buffer, compute (workgroup math, dispatch, PingPongBuffer), gpu_timestamps |
 | **Graphics** | vertex, blend, sampler, depth, texture, texture_format, bind_group, instancing |
 | **Render** | render_target, render_pipeline, render_pass, render_graph, queue, surface, surface_v3 |
-| **Assets** | asset_format, asset_load (KTX2 / DDS / PNG-via-chitra) |
+| **Assets** | asset_format, asset_load (KTX2 / DDS / PNG+JPEG-via-chitra) |
 | **Caching** | shader_cache, pipeline_cache, bind_group_cache |
 | **Backend abstraction** (`@internal`) | backend, backend_wgpu |
 | **Native AMD** (`@internal`) | backend_native, backend_native_amdgpu, backend_native_pm4, backend_native_shaders, backend_native_kms |
@@ -189,7 +189,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.3.23+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.4.62+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -251,7 +251,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.0.1
+├── VERSION              4.0.4
 └── CHANGELOG.md
 ```
 

@@ -13,6 +13,49 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.4] — 2026-07-13
+
+**JPEG asset loading (chitra 0.3.0's baseline decoder, now wired) + a provenance-stamp
+refresh.** The 4.0.3 dep bump made chitra's JFIF baseline JPEG decoder available; 4.0.4
+wires it into mabda's asset path as a sibling to the PNG loader, behind a new `-D MABDA_JPEG`
+flag (same single `[deps.chitra]` dep — one package decodes both formats). No public-API
+break: the PNG / KTX2 / DDS paths are untouched; JPEG is purely additive.
+
+### Added
+- **`gpu_texture_load_jpeg` / `gpu_texture_load_jpeg_result` and the mipped pair
+  `gpu_texture_load_jpeg_mipped{,_result}`** (`src/asset_load.cyr`, `# @public`) — decode a
+  baseline JFIF JPEG to canonical RGBA8 via chitra 0.3.0's `chitra_jpeg_decode_rgba8`
+  (grayscale + YCbCr, 4:4:4 / 4:2:2 / 4:2:0, restart markers) and upload through the same
+  HW-verified sampleable RGBA8 path the PNG loader uses. Gated on `#ifdef MABDA_JPEG` (a
+  sibling to `MABDA_PNG`); without the flag the chitra call is not compiled and the loader
+  reports `GPU_ERR_IMAGE_DECODE`, exactly mirroring the PNG opt-in contract.
+- **JPEG in the magic-byte sniffer** — `gpu_texture_load` / `gpu_texture_load_result` now
+  detect the JPEG SOI+marker prefix (`0xFF 0xD8 0xFF`, matched on the low 3 bytes since the
+  4th APPn/marker byte varies) and route to the JPEG loader. No collision with PNG / KTX2 /
+  DDS (none start `0xFF 0xD8 0xFF`).
+- **`tests/tcyr/asset_load.tcyr`: +12 assertions** — a real 293-byte 8×8 baseline JFIF JPEG
+  (ImageMagick-encoded, 4:4:4 red→blue gradient) is embedded and decoded through the mock
+  backend: create-sampleable-RGBA8 at 8×8, upload 256 bytes, sniffer routing on the JPEG
+  magic, garbage → `GPU_ERR_IMAGE_DECODE`, and null-ctx → 0. The suite `#define`s
+  `MABDA_JPEG` alongside `MABDA_PNG`.
+
+### Changed
+- **Provenance-stamp refresh to the current release.** The "Written against mabda X /
+  Cyrius Y" headers on the integration / usage / render-graph / native-migration guides, the
+  `[deps.mabda]` tag and `cyrius` pin in the consumer example (`examples/stdlib-consumer/`)
+  and the `stdlib-integration.md` snippet, and the README VERSION-tree line + Cyrius-minimum
+  now read **mabda 4.0.4 / Cyrius 6.4.62** (they had lagged at 4.0.1 / 6.3.23 since before
+  4.0.2). Historical statements ("AMD-on-wgpu deprecated **at v4.0.1**", the v4.0.1 audit
+  citations, roadmap prune notes) are deliberately **left** at their shipped version — those
+  record when something happened, not the current baseline.
+- **Sniffer error code for a JPEG buffer without `-D MABDA_JPEG`** shifts from
+  `GPU_ERR_CONTAINER_PARSE` (previously: unknown magic) to `GPU_ERR_IMAGE_DECODE` (now:
+  recognized container, decoder compiled out). Both are `Err`; not a breaking change.
+
+### Metrics
+- CPU assertions: 4917 → 4929 (+12, the JPEG loader + sniffer coverage). `dist/mabda.cyr`
+  grows by the four JPEG loader functions; no change to any existing bundled line.
+
 ## [4.0.3] — 2026-07-13
 
 **Maintenance cut: toolchain pin cyrius 6.3.35 → 6.4.62 and dependency refresh (chitra

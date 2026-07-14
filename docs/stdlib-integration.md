@@ -24,7 +24,7 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "6.3.23"
+cyrius = "6.4.62"
 
 [build]
 entry = "src/main.cyr"
@@ -38,7 +38,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.0.1"
+tag = "4.0.4"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -54,11 +54,12 @@ Two mabda features pull additional deps. Declare them **only** if you
 build with the matching `-D` flag — otherwise they are compiled out and
 you don't need the dep:
 
-- **PNG asset loading** (`gpu_texture_load_png` in `src/asset_load.cyr`,
-  gated on `#ifdef MABDA_PNG`) — build with `-D MABDA_PNG`, add the
-  `chitra` decoder, and add its two stdlib deps (`thread`, `sankoch`)
-  to the `stdlib` list above (chitra's bundle excludes its own stdlib
-  deps, so the consumer supplies them):
+- **PNG / baseline-JPEG asset loading** (`gpu_texture_load_png` /
+  `gpu_texture_load_jpeg` in `src/asset_load.cyr`, gated on `#ifdef MABDA_PNG` /
+  `#ifdef MABDA_JPEG`) — build with `-D MABDA_PNG` and/or `-D MABDA_JPEG`, add the
+  `chitra` decoder (one dep serves both formats), and add its two stdlib deps
+  (`thread`, `sankoch`) to the `stdlib` list above (chitra's bundle excludes its
+  own stdlib deps, so the consumer supplies them):
 
   ```cyml
   [deps.chitra]
@@ -174,7 +175,7 @@ runnable project.
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.0.1 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.0.4 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

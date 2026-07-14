@@ -3,6 +3,7 @@
 # sRGB-detection queries (src/asset_format.cyr). Loader tests (AL.3+)
 # append here. Self-contained suite (own main + assert_summary).
 #define MABDA_PNG   # v6.3.2: AL.5 decodes a real PNG, so opt into the chitra path (gated off by default since v6.3.2)
+#define MABDA_JPEG  # v4.0.4: AL.7 decodes a real baseline JPEG through the same chitra dep
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -456,6 +457,84 @@ fn test_gpu_texture_load_png_orchestration() {
     return 0;
 }
 
+# --- AL.7 (v4.0.4): JPEG load via the chitra dep (real baseline decode) ---
+
+# A real 293-byte 8x8 baseline JFIF JPEG (ImageMagick-encoded, 4:4:4, red->blue
+# vertical gradient), embedded so chitra actually decodes it. buf must be >= 293.
+# Regenerate: `magick -size 8x8 gradient:red-blue -interlace none \
+#   -sampling-factor 4:4:4 -quality 80 out.jpg` then dump 8-byte LE store64 chunks.
+fn _mk_jpeg_8x8(buf) {
+    store64(buf + 0, 0x464A1000E0FFD8FF);
+    store64(buf + 8, 0x0100000101004649);
+    store64(buf + 16, 0x4300DBFF00000100);
+    store64(buf + 24, 0x0604050605040600);
+    store64(buf + 32, 0x0A08060707060506);
+    store64(buf + 40, 0x0E140A09090A0A10);
+    store64(buf + 48, 0x1718181417100C0F);
+    store64(buf + 56, 0x1A1F251D1A161614);
+    store64(buf + 64, 0x202C2016161C231B);
+    store64(buf + 72, 0x1F19292A29272623);
+    store64(buf + 80, 0x29282530282D302D);
+    store64(buf + 88, 0x0707014300DBFF28);
+    store64(buf + 96, 0x130A0A130A080A07);
+    store64(buf + 104, 0x282828281A161A28);
+    store64(buf + 112, 0x2828282828282828);
+    store64(buf + 120, 0x2828282828282828);
+    store64(buf + 128, 0x2828282828282828);
+    store64(buf + 136, 0x2828282828282828);
+    store64(buf + 144, 0x2828282828282828);
+    store64(buf + 152, 0xC0FF282828282828);
+    store64(buf + 160, 0x0308000800081100);
+    store64(buf + 168, 0x1103011102001101);
+    store64(buf + 176, 0x0001001400C4FF01);
+    store64(buf + 184, 0x0000000000000000);
+    store64(buf + 192, 0xFF07000000000000);
+    store64(buf + 200, 0x00000300101600C4);
+    store64(buf + 208, 0x0000000000000000);
+    store64(buf + 216, 0xFF62150000000000);
+    store64(buf + 224, 0x00000001011400C4);
+    store64(buf + 232, 0x0000000000000000);
+    store64(buf + 240, 0x00C4FF0600000000);
+    store64(buf + 248, 0x0000000003001116);
+    store64(buf + 256, 0x0000000000000000);
+    store64(buf + 264, 0x00DAFF6216000000);
+    store64(buf + 272, 0x110311020001030C);
+    store64(buf + 280, 0x090443731B003F00);
+    store8(buf + 288, 0x1E);
+    store8(buf + 289, 0xBB);
+    store8(buf + 290, 0xD1);
+    store8(buf + 291, 0xFF);
+    store8(buf + 292, 0xD9);
+    return 0;
+}
+
+fn test_gpu_texture_load_jpeg_orchestration() {
+    _png_cr_count = 0;
+    _png_wr_count = 0;
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_png_cr_cap);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
+    var ctx[176];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64((&ctx) + 32, b);
+    var buf[296];
+    _mk_jpeg_8x8(&buf);
+    var tex = gpu_texture_load_jpeg(&ctx, &buf, 293);
+    assert_eq(tex, 0x7E, "load_jpeg returns the created tex");
+    assert_eq(_png_cr_count, 1, "create called once");
+    assert_eq(_png_cr_w, 8, "chitra decoded width 8");
+    assert_eq(_png_cr_h, 8, "chitra decoded height 8");
+    assert_eq(_png_cr_fmt, MABDA_TEXFMT_RGBA8, "create RGBA8 (sampleable)");
+    assert_eq(_png_wr_count, 1, "write called once");
+    assert_eq(_png_wr_n, 256, "upload 8*8*4 = 256 RGBA8 bytes");
+    # Garbage bytes -> chitra decode fails -> IMAGE_DECODE -> 0.
+    var bad[16];
+    memset(&bad, 0, 16);
+    assert_eq(gpu_texture_load_jpeg(&ctx, &bad, 16), 0, "garbage JPEG -> 0 (decode fail)");
+    assert_eq(gpu_texture_load_jpeg(0, &buf, 293), 0, "null ctx -> 0");
+    return 0;
+}
+
 # AL.6: the magic-byte sniffer routes each container to the right loader.
 fn test_gpu_texture_load_sniffer() {
     _png_cr_count = 0;
@@ -475,6 +554,13 @@ fn test_gpu_texture_load_sniffer() {
     assert_eq(gpu_texture_load(&ctx, &png, 76), 0x7E, "PNG magic loads");
     assert_eq(_png_cr_count, 1, "PNG routed to load_png");
     assert_eq(_png_cr_fmt, MABDA_TEXFMT_RGBA8, "PNG -> RGBA8 path");
+    # JPEG magic (0xFF 0xD8 0xFF) -> load_jpeg (CREATE_2D_SAMPLEABLE, RGBA8).
+    _png_cr_count = 0;
+    var jpg[296];
+    _mk_jpeg_8x8(&jpg);
+    assert_eq(gpu_texture_load(&ctx, &jpg, 293), 0x7E, "JPEG magic loads");
+    assert_eq(_png_cr_count, 1, "JPEG routed to load_jpeg");
+    assert_eq(_png_cr_w, 8, "JPEG decoded width 8 (sniffer path)");
     # DDS magic -> load_dds (CREATE_2D_FMT_MIPPED, BC1).
     var dds[160];
     _mk_dds_fourcc(&dds, 8, 8, 1, _DDS_FOURCC_DXT1);
@@ -619,6 +705,7 @@ fn main() {
     test_ktx2_parse_rejects();
     test_ktx2_load_orchestration();
     test_gpu_texture_load_png_orchestration();
+    test_gpu_texture_load_jpeg_orchestration();
     test_gpu_texture_load_sniffer();
     test_asset_per_image_size();
     test_dds_parse_array_cube();

@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.0.3** (2026-07-13). Module/assertion/bundle counts live in the
+> **v4.0.4** (2026-07-13). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -15,7 +15,8 @@ v3.0 / v3.1 / v3.2 / v3.3 / v3.4 pruned 2026-06-19; v4.0 / v4.0.1 / v4.0.2
 pruned 2026-07-02 — NVIDIA native backend, AMD-wgpu deprecation, and the
 fncall6 struct-pack retirement + cyrius 6.3.35 bump, arcs closed. v4.0.3
 (2026-07-13) is a maintenance cut — cyrius 6.4.62 pin + chitra 0.3.0 dep
-refresh, no source change).
+refresh, no source change; v4.0.4 (2026-07-13) wired chitra's baseline JPEG
+loader (`-D MABDA_JPEG`) + a provenance-stamp refresh).
 
 ## The Long Arc
 
@@ -41,7 +42,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.0.3  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.0.4  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
