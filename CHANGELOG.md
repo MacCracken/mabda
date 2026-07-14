@@ -13,6 +13,54 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.3] — 2026-07-13
+
+**Maintenance cut: toolchain pin cyrius 6.3.35 → 6.4.62 and dependency refresh (chitra
+0.1.0 → 0.3.0).** No functional source change and no public-API change — the whole
+build / lint / fmt / vet / test / distlib gauntlet is clean under 6.4.62 with the
+refreshed deps. The only source edits are comment-level `[deps.chitra]` tag
+corrections (0.1.0 → 0.3.0) in `src/lib.cyr` and `src/asset_load.cyr`. CPU
+assertions unchanged at 4917.
+
+### Changed
+- **Toolchain pin `cyrius = "6.3.35"` → `"6.4.62"`** in `cyrius.cyml` (latest upstream).
+  Re-resolved with `cyrius deps`. The 27-patch jump is source-transparent for mabda:
+  smoke build links warning-clean, all 57 `src/*.cyr` lint clean (0 warnings; the two
+  pre-existing NVIDIA multi-BO follow-up notes in `backend_nvidia.cyr` are unchanged and
+  do not gate CI), `cyrius fmt --check` reports no drift, `cyrius vet` clean, and the full
+  `tests/tcyr/*.tcyr` suite passes.
+- **Dependency bump `[deps.chitra]` tag `0.1.0` → `0.3.0`.** chitra grew across three cuts
+  since 0.1.0: 0.2.0 added 16-bit-depth PNG decode + `seen_iend`/`source_color_type`
+  accessors (`ChitraImage` widened 32B → 48B, **ABI-additive** — width/height/pixels/channels
+  keep their 0.1.x offsets), 0.2.1 completed the bit-depth matrix (sub-byte depths 1/2/4 +
+  Adam7 interlace), and 0.3.0 added a JFIF **baseline JPEG decoder** (grayscale + YCbCr,
+  4:4:4 / 4:2:2 / 4:2:0, restart markers) plus a signature-sniffing `chitra_image_decode`
+  router. mabda's PNG path is **unaffected and byte-identical**: `gpu_texture_load_png*`
+  still calls `chitra_png_decode_rgba8` with out-params (`&w`, `&h`), so the additive struct
+  growth never crosses the mabda boundary. chitra stays a **consumer-provided** dep (not
+  bundled into `dist/mabda.cyr`); its `thread` + `sankoch` stdlib transitive requirement is
+  unchanged and already supplied by mabda's `[deps].stdlib`.
+
+### Unchanged (verified)
+- **`[deps.samvada]` stays at `0.4.1`** — already the latest upstream tag; the pure-Cyrius
+  dbus 1.0 that would retire the libsystemd C shim is still not cut, so the `MABDA_LOGIND`
+  escape hatch (CLAUDE.md / roadmap) remains in force verbatim.
+- **AMD-wgpu deprecation posture** (v4.0.1) and the retired `fncall6`→struct-pack shims
+  (v4.0.2) carry forward untouched.
+
+### Available (not wired this cut)
+- chitra 0.3.0 can now decode baseline **JPEG** to the same canonical RGBA8 surface PNG
+  produces. mabda does **not** add a `gpu_texture_load_jpeg` in 4.0.3 — the scope of this cut
+  is the dependency refresh, and the PNG loader is the only asset path wired. Wiring a JPEG
+  loader (dispatch on the SOI/PNG signature, upload the RGBA8 identically) is a self-contained
+  follow-up now unblocked by this dep bump.
+
+### Metrics
+- CPU assertions: 4917 (unchanged — a pin/dep refresh adds no new code path).
+  `dist/mabda.cyr`: no code delta from 4.0.2 — the regenerated bundle differs only in
+  its `# Version:` header line and the one `[deps.chitra]` tag comment carried in from
+  `src/asset_load.cyr`.
+
 ## [4.0.2] — 2026-07-02
 
 **Toolchain bump to cyrius 6.3.35 + retirement of the wgpu `fncall6`→struct-pack workarounds

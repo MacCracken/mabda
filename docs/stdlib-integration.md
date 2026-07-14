@@ -63,7 +63,7 @@ you don't need the dep:
   ```cyml
   [deps.chitra]
   git = "https://github.com/MacCracken/chitra.git"
-  tag = "0.1.0"
+  tag = "0.3.0"
   modules = ["dist/chitra.cyr"]
   ```
 

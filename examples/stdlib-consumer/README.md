@@ -45,7 +45,7 @@ This minimal example uses neither, but if you build mabda with a
 feature flag you must add the matching dep (both commented out in
 `cyrius.cyml`):
 
-- **`-D MABDA_PNG`** (PNG decode) → add `[deps.chitra]` (tag `0.1.0`)
+- **`-D MABDA_PNG`** (PNG decode) → add `[deps.chitra]` (tag `0.3.0`)
   plus `thread` + `sankoch` to `[deps].stdlib`.
 - **`-D MABDA_LOGIND`** (logind master delegation) → add
   `[deps.samvada]` (tag `0.4.1`) and link `samvada/deps/samvada_main.c`
