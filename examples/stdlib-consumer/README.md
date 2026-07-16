@@ -35,7 +35,7 @@ cyrius build                                # compile the consumer
 ```
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`4.0.6`), and creates `lib/mabda.cyr` as a symlink into
+there (`4.0.7`), and creates `lib/mabda.cyr` as a symlink into
 `$HOME/.cyrius/cache/mabda/dist/mabda.cyr`. The consumer then
 includes it with `include "lib/mabda.cyr"`.
 
@@ -57,7 +57,7 @@ feature flag you must add the matching dep (both commented out in
 This example is the **`@public`-API-stability regression test across
 the wgpu → native transition**. The pure-Cyrius native backends have
 now landed (AMD in v3.0, NVIDIA in v4.0), and `src/main.cyr` still
-compiles without edits against the v4.0.6 mabda tag. If it ever
+compiles without edits against the v4.0.7 mabda tag. If it ever
 doesn't, the public API contract was broken.
 
 ## What the launcher does

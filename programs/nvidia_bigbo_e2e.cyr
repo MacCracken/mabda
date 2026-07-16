@@ -1,0 +1,288 @@
+# programs/nvidia_bigbo_e2e.cyr — 4.0.7 — NVIDIA multi-size BO allocator
+# HW gate (the roadmap "multi-BO / bigger-BO surfaces" item).
+#
+# The v0 backend capped every buffer / texture / render target at one 64 KiB
+# BO (<=128x128 RGBA8). This gate proves the lifted allocator end-to-end on
+# real nouveau hardware, at sizes the old path rejected:
+#
+#   1. 1 MiB buffer — chunked write/read roundtrip across the whole span
+#      (a wrong VM_BIND range shows up as a fault or corrupt readback past
+#      the first 64 KiB).
+#   2. GPU STG deep into the BO — dispatch store_deadbeef with the output
+#      pointer at buffer VA + 512 KiB. THE key adversarial probe: the CPU
+#      roundtrip runs on the mmap, but this proves the GPU-side VM_BIND
+#      span really covers the tail of a multi-64KiB BO.
+#   3. 512x512 RGBA8 texture (1 MiB) — public-API write/read byte-identical.
+#   4. 512x512 RGBA8 render target (1 MiB) — public-API triangle draw, then
+#      probe the center AND all four corners (the (511,511) texel sits
+#      ~1 MiB into the surface — full-span rasterization).
+#   4b. 100x256 render target — width % 32 != 0, so the draw engine's
+#      128-aligned row pitch (512) exceeds the packed width*4 (400): proves
+#      the RT BO is sized from pitch*height (the 4.0.7 review find) and the
+#      raster strides at pitch (pad bytes stay untouched).
+#   5. Churn — 8x create/release of 1 MiB buffers + 256x256 textures at
+#      alternating sizes: a release that unbinds the wrong span EINVALs or
+#      leaks, and surfaces here or in dmesg.
+#
+# Known coverage gaps (review-flagged, low-risk — VM_BIND PTEs are
+# read/write symmetric): no GPU-side READ past a span's first 64 KiB (the
+# only GPU reads here are small program/QMD/push/param BOs; TIC sampling
+# runs at 1x1 in its own gate), no >64 KiB shader module (largest SASS in
+# tree is 352 B), and the VA-exhaustion -ENOMEM unwind needs 512 GiB of
+# spans to reach on HW (CPU-tested at the _nv_ctx_alloc_va layer instead).
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-bigbo-e2e`.
+#
+# Exit codes:
+#   0 success       1 context      2 buffer_create   3 buffer_write
+#   4 buffer_read   5 mismatch     6 shader module   7 dispatch@0
+#   8 readback@0    9 dispatch@512K  10 readback@512K  11 tex create
+#   12 tex write    13 tex read    14 tex mismatch   15 rt/pipe/pass
+#   16 draw         17 pixel probe 18 churn          19 unaligned RT setup
+#   20 unaligned draw  21 unaligned probe / pad written
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var b[32];
+    memset(&b, 0, 32);
+    var len = fmt_int_buf(n, &b);
+    syscall(1, 1, &b, len);
+    return 0;
+}
+
+var BIG = 0x100000;   # 1 MiB — 16x the old single-BO cap
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda NVIDIA multi-size BO allocator gate (4.0.7)\n");
+    print_cstr("--------------------------------------------------\n");
+
+    var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+    if (ctx == 0) { print_cstr("FAIL: context\n"); return 1; }
+    print_cstr("context created\n");
+
+    # ---- 1. 1 MiB buffer roundtrip ------------------------------------
+    var buf = gpu_buffer_create(ctx, BIG, 0);
+    if (buf == 0) { print_cstr("FAIL: 1 MiB buffer_create\n"); gpu_context_release(ctx); return 2; }
+    print_cstr("1 MiB buffer created (16x the old 64 KiB cap)\n");
+
+    var src = alloc(BIG);
+    var dst = alloc(BIG);
+    var i = 0;
+    while (i < BIG) {
+        store8(src + i, (i * 7 + (i / 65536) * 31 + 13) & 0xFF);
+        i = i + 1;
+    }
+    if (gpu_buffer_write(ctx, buf, 0, src, BIG) != 0) {
+        print_cstr("FAIL: 1 MiB buffer_write\n"); gpu_context_release(ctx); return 3;
+    }
+    memset(dst, 0, BIG);
+    if (gpu_buffer_read(ctx, buf, 0, dst, BIG) != 0) {
+        print_cstr("FAIL: 1 MiB buffer_read\n"); gpu_context_release(ctx); return 4;
+    }
+    var j = 0;
+    while (j < BIG) {
+        if (load8(dst + j) != load8(src + j)) {
+            print_cstr("FAIL: buffer mismatch at byte "); print_i64(j); print_cstr("\n");
+            gpu_context_release(ctx); return 5;
+        }
+        j = j + 1;
+    }
+    print_cstr("1 MiB CPU roundtrip byte-identical\n");
+
+    # ---- 2. GPU STG at offset 0 and 512 KiB deep -----------------------
+    var sass[128];
+    native_nv_sass_store_deadbeef(&sass);
+    var shmod = gpu_shader_module_create(ctx, &sass, NV_SASS_STORE_DEADBEEF_BYTES);
+    if (shmod == 0) { print_cstr("FAIL: shader module\n"); gpu_context_release(ctx); return 6; }
+
+    if (gpu_compute_dispatch(ctx, shmod, 1, 1, 1, buf) != 0) {
+        print_cstr("FAIL: dispatch @0\n"); gpu_context_release(ctx); return 7;
+    }
+    var out = 0;
+    gpu_buffer_read(ctx, buf, 0, &out, 4);
+    if ((out & 0xFFFFFFFF) != 0xDEADBEEF) {
+        print_cstr("FAIL: readback @0 = "); print_i64(out); print_cstr("\n");
+        gpu_context_release(ctx); return 8;
+    }
+    print_cstr("GPU STG @ offset 0 = 0xDEADBEEF\n");
+
+    # Deep probe: an NV_BUF-shaped bind whose VA points 512 KiB into the BO.
+    # The dispatch only reads bp+8 (the VA) — if the VM_BIND span were still
+    # 64 KiB this STG would land in unmapped VA space and fault the channel.
+    var deep = 0x80000;
+    var bp2[32];
+    memset(&bp2, 0, 32);
+    store64(&bp2 + NV_BUF_VA, load64(buf + NV_BUF_VA) + deep);
+    if (gpu_compute_dispatch(ctx, shmod, 1, 1, 1, &bp2) != 0) {
+        print_cstr("FAIL: dispatch @512K\n"); gpu_context_release(ctx); return 9;
+    }
+    out = 0;
+    gpu_buffer_read(ctx, buf, deep, &out, 4);
+    if ((out & 0xFFFFFFFF) != 0xDEADBEEF) {
+        print_cstr("FAIL: readback @512K = "); print_i64(out); print_cstr("\n");
+        gpu_context_release(ctx); return 10;
+    }
+    print_cstr("GPU STG @ offset 512 KiB = 0xDEADBEEF (span proven GPU-side)\n");
+    gpu_shader_module_release(ctx, shmod);
+    gpu_buffer_release(ctx, buf);
+
+    # ---- 3. 512x512 RGBA8 texture roundtrip (1 MiB) --------------------
+    var tw = 512;
+    var th = 512;
+    var tbytes = tw * th * 4;
+    var tex = gpu_texture_create_2d_rgba8(ctx, tw, th);
+    if (tex == 0) { print_cstr("FAIL: 512x512 texture_create\n"); gpu_context_release(ctx); return 11; }
+    if (gpu_texture_write(ctx, tex, src, tbytes) != 0) {
+        print_cstr("FAIL: texture_write\n"); gpu_context_release(ctx); return 12;
+    }
+    memset(dst, 0, tbytes);
+    if (gpu_texture_read(ctx, tex, dst, tbytes) != 0) {
+        print_cstr("FAIL: texture_read\n"); gpu_context_release(ctx); return 13;
+    }
+    j = 0;
+    while (j < tbytes) {
+        if (load8(dst + j) != load8(src + j)) {
+            print_cstr("FAIL: texture mismatch at byte "); print_i64(j); print_cstr("\n");
+            gpu_context_release(ctx); return 14;
+        }
+        j = j + 1;
+    }
+    gpu_texture_release(ctx, tex);
+    print_cstr("512x512 texture roundtrip byte-identical (1 MiB)\n");
+
+    # ---- 4. 512x512 render target, full-span triangle -------------------
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 512, 512);
+    if (rt == 0) { print_cstr("FAIL: 512x512 RT\n"); gpu_context_release(ctx); return 15; }
+    var vs_bytes[352];
+    native_nv_sass_render_vs(&vs_bytes);
+    var vs_mod = gpu_shader_module_create(ctx, &vs_bytes, NV_SASS_RENDER_VS_BYTES);
+    if (vs_mod == 0) { print_cstr("FAIL: VS module\n"); gpu_context_release(ctx); return 15; }
+    store64(vs_mod + NV_SHMOD_REGCOUNT, NV_SASS_RENDER_VS_REGCOUNT);
+    var fs_bytes[272];
+    native_nv_sass_render_fs(&fs_bytes);
+    var fs_mod = gpu_shader_module_create(ctx, &fs_bytes, NV_SASS_RENDER_FS_BYTES);
+    if (fs_mod == 0) { print_cstr("FAIL: FS module\n"); gpu_context_release(ctx); return 15; }
+    store64(fs_mod + NV_SHMOD_REGCOUNT, NV_SASS_RENDER_FS_REGCOUNT);
+    var pipe = gpu_render_pipeline_create(ctx, vs_mod, fs_mod, 0);
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); gpu_context_release(ctx); return 15; }
+
+    var rt_addr = load64(rt + NV_RT_ADDR);
+    memset(rt_addr, 0, 512 * 512 * 4);
+    var clear[32];
+    memset(&clear, 0, 32);
+    var pass = gpu_render_pass_begin(ctx, rt, &clear);
+    if (pass == 0) { print_cstr("FAIL: pass begin\n"); gpu_context_release(ctx); return 15; }
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    if (rc != 0) {
+        print_cstr("FAIL: draw rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 16;
+    }
+    gpu_render_pass_end(ctx, pass);
+
+    # Probe center + all four corners. Pitch = 512*4 = 2048 bytes (512 is
+    # 32-aligned so pitch == packed); the (511,511) probe reads ~1 MiB into
+    # the surface. probes[] holds five 8-byte offsets = 40 BYTES (Cyrius
+    # var X[N] is N bytes — a probes[5] here aliased adjacent frame slots).
+    var pitch = 512 * 4;
+    var probes[40];
+    store64(&probes + 0,  256 * pitch + 256 * 4);          # center
+    var k = 0;
+    store64(&probes + 8,  0);                              # (0,0)
+    store64(&probes + 16, 511 * 4);                        # (511,0)
+    store64(&probes + 24, 511 * pitch);                    # (0,511)
+    store64(&probes + 32, 511 * pitch + 511 * 4);          # (511,511)
+    while (k < 5) {
+        var off = load64(&probes + k * 8);
+        var px = load32(rt_addr + off);
+        if (px != 0xFF996633) {
+            print_cstr("FAIL: pixel at offset "); print_i64(off);
+            print_cstr(" = "); print_i64(px); print_cstr("\n");
+            gpu_context_release(ctx); return 17;
+        }
+        k = k + 1;
+    }
+    print_cstr("512x512 render: center + 4 corners = 0xFF996633 (full span)\n");
+    gpu_render_target_release(ctx, rt);
+
+    # ---- 4b. 100x256 RT — width % 32 != 0, the pitch-sizing probe -------
+    # The draw engine strides rows at the 128-aligned pitch (100*4=400 ->
+    # 512), so the BO must hold pitch*height = 128 KiB (two spans), not the
+    # packed 100 KiB. Sizing from packed bytes rastered past the VM_BIND
+    # span (MMU fault / silent corruption) — the 4.0.7 review find this
+    # stage HW-proves fixed. Probes row-address at PITCH, and a pad byte
+    # past width*4 must stay 0 (the raster strides, it doesn't pack).
+    var rtu = gpu_render_target_create_2d_rgba8(ctx, 100, 256);
+    if (rtu == 0) { print_cstr("FAIL: 100x256 RT\n"); gpu_context_release(ctx); return 19; }
+    var upitch = native_nv_rt_pitch_bytes(100);
+    if (upitch != 512) { print_cstr("FAIL: pitch(100) != 512\n"); gpu_context_release(ctx); return 19; }
+    if (load64(rtu + NV_RT_SIZE) != upitch * 256) {
+        print_cstr("FAIL: RT size != pitch*height\n"); gpu_context_release(ctx); return 19;
+    }
+    var rtu_addr = load64(rtu + NV_RT_ADDR);
+    memset(rtu_addr, 0, upitch * 256);
+    var pass2 = gpu_render_pass_begin(ctx, rtu, &clear);
+    if (pass2 == 0) { print_cstr("FAIL: pass2 begin\n"); gpu_context_release(ctx); return 19; }
+    rc = gpu_render_pass_draw(ctx, pass2, pipe, 3, 1);
+    if (rc != 0) {
+        print_cstr("FAIL: unaligned-width draw rc="); print_i64(rc); print_cstr("\n");
+        gpu_context_release(ctx); return 20;
+    }
+    gpu_render_pass_end(ctx, pass2);
+    # Corners at PITCH stride — (99,255) sits at 130956, past the 1st span.
+    var uprobes[32];
+    store64(&uprobes + 0,  0);                             # (0,0)
+    store64(&uprobes + 8,  99 * 4);                        # (99,0)
+    store64(&uprobes + 16, 255 * upitch);                  # (0,255)
+    store64(&uprobes + 24, 255 * upitch + 99 * 4);         # (99,255)
+    k = 0;
+    while (k < 4) {
+        var uoff = load64(&uprobes + k * 8);
+        var upx = load32(rtu_addr + uoff);
+        if (upx != 0xFF996633) {
+            print_cstr("FAIL: unaligned-RT pixel at offset "); print_i64(uoff);
+            print_cstr(" = "); print_i64(upx); print_cstr("\n");
+            gpu_context_release(ctx); return 21;
+        }
+        k = k + 1;
+    }
+    # Pad region (row 0, bytes 400..511) must be untouched — proves the
+    # raster wrote at pitch stride, not packed width*4.
+    if (load32(rtu_addr + 100 * 4) != 0) {
+        print_cstr("FAIL: pad byte written — raster packed, not strided\n");
+        gpu_context_release(ctx); return 21;
+    }
+    print_cstr("100x256 render (pitch 512): 4 corners drawn, pad untouched\n");
+    gpu_render_target_release(ctx, rtu);
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_shader_module_release(ctx, vs_mod);
+    gpu_shader_module_release(ctx, fs_mod);
+
+    # ---- 5. Churn: create/release at alternating sizes ------------------
+    var n = 0;
+    while (n < 8) {
+        var sz = BIG;
+        if ((n & 1) == 1) { sz = 0x30000; }   # alternate 1 MiB / 192 KiB
+        var b2 = gpu_buffer_create(ctx, sz, 0);
+        var t2 = gpu_texture_create_2d_rgba8(ctx, 256, 256);
+        if (b2 == 0) { print_cstr("FAIL: churn buffer\n"); gpu_context_release(ctx); return 18; }
+        if (t2 == 0) { print_cstr("FAIL: churn texture\n"); gpu_context_release(ctx); return 18; }
+        # Touch the tail of each span (a bad bind corrupts or faults here).
+        if (gpu_buffer_write(ctx, b2, sz - 8, &n, 8) != 0) {
+            print_cstr("FAIL: churn tail write\n"); gpu_context_release(ctx); return 18;
+        }
+        gpu_buffer_release(ctx, b2);
+        gpu_texture_release(ctx, t2);
+        n = n + 1;
+    }
+    print_cstr("churn: 8x create/release at mixed sizes clean\n");
+
+    gpu_context_release(ctx);
+    print_cstr("OK: multi-size BOs proven — CPU + GPU paths, 16x the old cap\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

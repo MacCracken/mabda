@@ -13,6 +13,77 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.7] — 2026-07-16
+
+**NVIDIA multi-size BO allocator (the "multi-BO / bigger-BO surfaces" backlog item,
+graduated) + a real dispatch-path bug its HW gate caught and fixed.** The nouveau backend's
+v0 single-64 KiB-BO cap (buffers/shaders ≤64 KiB, textures/render targets ≤128×128 RGBA8)
+is lifted: every object now gets a BO + VM_BIND span sized to its own 64 KiB-aligned
+logical size — the AMD v3.4.3 `_native_align_up` idiom. HW-proven on the TU116
+(GTX 1660 SUPER, nouveau): the new `make test-nvidia-bigbo-e2e` gate plus all 8 prior
+masterless NVIDIA gates green.
+
+### Added
+- **Multi-size BO allocation** (`src/backend_nvidia.cyr`) — `_nv_ctx_bo_alloc_bind` takes
+  a `size` param (span = `_nv_align64k(size)`; input-guarded −EINVAL before any ioctl);
+  buffer / shader-module / texture / render-target creates pass their logical size; all
+  four release sites re-derive the span from the stored logical size (create/release
+  symmetric by construction). The three persistent context BOs (QMD / pushbuffer / param
+  bank) stay at the fixed 64 KiB `NV_BO_SIZE`.
+- **`NV_BO_MAX_SIZE` (2 GiB)** — per-object ceiling (the AMD `_NATIVE_TEXTURE_VA_REGION`
+  analogue) on buffer/shader creates; texture/RT sizing stays bounded by the 8192-per-axis
+  dimension gate (max 256 MiB logical). `_nv_ctx_alloc_va` gains the exhaustion backstop:
+  returns 0 (cursor unmoved) if a span would reach the kernel VA reservation at 1<<39,
+  and `_nv_ctx_bo_alloc_bind` unwinds the BO on that path (−ENOMEM).
+- **`programs/nvidia_bigbo_e2e.cyr` + `make test-nvidia-bigbo-e2e`** — the HW gate: 1 MiB
+  buffer CPU roundtrip, **GPU STG 512 KiB deep into one BO** (a crafted bind struct aims
+  `store_deadbeef` at buffer VA + 0x80000 — proves the VM_BIND span GPU-side, not just the
+  mmap), 512×512 texture roundtrip + 512×512 render (center + all four corners, the
+  (511,511) probe ~1 MiB into the surface) through the public API, and an 8× mixed-size
+  create/release churn. **All green on the TU116.**
+- **`tests/tcyr/nvidia.tcyr`: `test_nv_bigbo_allocator` (+22 assertions)** — span math
+  (incl. the 512×512→1 MiB case and align-at-cap identity), VA-cursor advance/exhaustion
+  on a stack ctx blob, before-ioctl input guards, create-slot caps, dimension-gate
+  regression.
+
+### Fixed
+- **Stale SM constant cache between dispatches** (`src/backend_nvidia_push.cyr`) — the
+  bigbo gate's deep-STG probe caught a **pre-existing** silent-wrong-answer bug: mabda
+  rewrites the c[0x0] param bank (output pointer at +0x160) through the CPU mapping before
+  every dispatch, but the dispatch pushbuffer never invalidated the SM constant cache, so
+  a second dispatch with a **different** output pointer stored through the **previous**
+  pointer (no fault; every earlier gate happened to reuse the same pointer, which is why
+  ~30¾h of soak never saw it). Both dispatch builders now emit
+  `INVALIDATE_SHADER_CACHES_NO_WFI(CONSTANT)` (method 0x1698, imm 0x1000 — the cla0c0.h
+  lineage / envytools `FLUSH.UCACHE` / NVK `{ .constant = TRUE }` encoding, emitted where
+  NVK emits it) before `SEND_PCAS`. Push-stream goldens updated (44→48 / 88→92 bytes; new
+  dword `0x900025A6`). HW-verified: deep-STG lands correctly, all prior gates unregressed.
+- **Render-target BO sized from the draw engine's pitch, not packed pixels**
+  (`src/backend_nvidia.cyr` + `native_nv_rt_pitch_bytes` in `backend_nvidia_push.cyr`) —
+  the adversarial review caught that RT BOs were sized `width*height*4` while
+  `native_nv_push_draw` programs the color target at the **128-aligned byte pitch**: any
+  `width % 32 != 0` target rastered past its VM_BIND span (unmapped-VA MMU fault or silent
+  neighbor corruption). Also **pre-existing** — a 1×8192 RT (32 KiB packed, legal under
+  the old 64 KiB cap) already strode ~1 MiB past its single BO. RT creates now allocate
+  `pitch * height` from the shared single-source-of-truth pitch helper both sides read;
+  `NV_RT_SIZE` holds the padded size (readers row-address at pitch). HW-proven by the
+  gate's new 100×256 stage: unaligned-width draw lands all four corners at pitch stride
+  with pad bytes untouched.
+- **`programs/nvidia_bigbo_e2e.cyr` probe array OOB** (review find, empirically
+  reproduced): `var probes[5]` reserves 5 **bytes** in Cyrius, not five slots — the probe
+  loop read one garbage offset and passed only because the fullscreen triangle fills the
+  whole surface. Now 40 bytes, plus a comment warning off the N-elements misread.
+- **Stale comments contradicted by working code** — the IMMD immediate is 13-bit
+  (bits 28:16, mask 0x1FFF), not "12-bit" as two `backend_nvidia_push.cyr` comments
+  claimed (pre-existing: `CT_WRITE_RGBA = 0x1111` already used bit 12);
+  `nvidia_render_target.cyr`'s header no longer asserts the lifted 128×128 cap; the
+  `NV_VA_BASE` comment now says size-derived spans.
+
+### Metrics
+- CPU assertions: **4958** across 18 suites, 0 failed (was 4929; nvidia.tcyr 314→343).
+  NVIDIA HW gates: **9** masterless, all green on the TU116 under cyrius 6.4.64 — incl.
+  the new bigbo gate's six stages. `dist/mabda.cyr` +144/−63 lines vs 4.0.6.
+
 ## [4.0.6] — 2026-07-16
 
 **Toolchain maintenance: cyrius pin 6.4.62 → 6.4.64.** No source change — `src/` is

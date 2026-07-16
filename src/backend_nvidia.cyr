@@ -92,23 +92,37 @@ var NV_TEX_STRUCT_SIZE = 48;
 # fmt tag (an RT is always RGBA8 in v0). The 3D engine draws into it (the draw
 # dispatch is N7.4); this v0 bite lands the CPU-side surface lifecycle (alloc +
 # VM_BIND + map + release), the render analogue of the texture create slot.
+# NV_RT_SIZE holds the ALLOCATED bytes = 128-aligned row pitch * height —
+# the draw engine's stride (== width*height*4 only when width % 32 == 0).
+# Readers must row-address at native_nv_rt_pitch_bytes(width), not width*4.
 var NV_RT_HANDLE = 0;
 var NV_RT_VA     = 8;
 var NV_RT_ADDR   = 16;
-var NV_RT_SIZE   = 24;   # logical linear bytes = width*height*4
+var NV_RT_SIZE   = 24;   # allocated bytes (pitch * height, see above)
 var NV_RT_WIDTH  = 32;
 var NV_RT_HEIGHT = 36;
 var NV_RT_STRUCT_SIZE = 40;
 
-# Every nouveau BO this backend allocates is one 64 KiB host BO VM_BIND'd
-# with a 64 KiB range at a 64 KiB-aligned VA — the exact config the N4 gate
-# HW-proved (big-page mapping; QMD's 256-byte alignment is implied by 64 KiB).
+# Every nouveau BO this backend allocates is VM_BIND'd at a 64 KiB-aligned
+# VA with a 64 KiB-multiple span (big-page mapping; QMD's 256-byte alignment
+# is implied by 64 KiB). The N4 gate HW-proved the config at exactly 64 KiB;
+# the 4.0.7 multi-size path keeps the alignment and sizes the BO + span to
+# the object (_nv_align64k of the logical size — the AMD v3.4.3
+# `_native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN)` idiom). NV_BO_SIZE is
+# the span granularity + the fixed size of the persistent context BOs
+# (QMD / pushbuffer / param bank).
 var NV_BO_SIZE = 0x10000;
 
+# Per-object BO ceiling (the AMD _NATIVE_TEXTURE_VA_REGION analogue): bounds
+# consumer-supplied sizes before use so _nv_align64k cannot overflow and one
+# object cannot swallow the UMD VA range. 2 GiB.
+var NV_BO_MAX_SIZE = 0x80000000;
+
 # UMD VA allocator base: low, 64 KiB-aligned, well below the kernel-managed
-# split (1<<39). The bump cursor starts here; persistent + per-buffer BOs all
-# draw distinct 64 KiB VAs from it (the native no-reclaim model — VAs are not
-# returned to the cursor on release; a context is process-lifetime).
+# split (1<<39). The bump cursor starts here; persistent + per-object BOs all
+# draw distinct 64 KiB-aligned, size-derived VA spans from it (the native
+# no-reclaim model — VAs are not returned to the cursor on release; a context
+# is process-lifetime).
 var NV_VA_BASE = 0x100000;
 
 # Round `n` up to a 64 KiB multiple (BO + VM_BIND span granularity).
@@ -117,10 +131,15 @@ fn _nv_align64k(n): i64 {
 }
 
 # Bump-allocate a distinct, 64 KiB-aligned UMD VA range of >= `size` bytes.
-# Returns the VA; advances the cursor. Never returns 0 for a valid request.
+# Returns the VA and advances the cursor, or 0 if the span would reach the
+# kernel-managed reservation at 1<<39 — the exhaustion backstop for the
+# native no-reclaim model (VAs are not returned to the cursor on release; a
+# context is process-lifetime).
 fn _nv_ctx_alloc_va(ctx, size): i64 {
     var va = load64(ctx + NV_CTX_VA_CURSOR);
-    store64(ctx + NV_CTX_VA_CURSOR, va + _nv_align64k(size));
+    var span = _nv_align64k(size);
+    if (va + span > NOUVEAU_VM_KERNEL_RESERVATION_START) { return 0; }
+    store64(ctx + NV_CTX_VA_CURSOR, va + span);
     return va;
 }
 
@@ -128,24 +147,34 @@ fn _nv_ctx_alloc_va(ctx, size): i64 {
 fn nv_ctx_fd(ctx): i64   { return load64(ctx + NV_CTX_FD); }
 fn nv_ctx_chid(ctx): i64 { return load64(ctx + NV_CTX_CHID); }
 
-# Allocate one 64 KiB host BO, VM_BIND it at a fresh UMD VA, and return its
-# pieces via `out` (24 bytes: +0 handle, +8 va, +16 cpu_addr). Returns 0 on
-# success or a negative errno. On bind failure the BO is released so nothing
-# leaks. `dom` is a NOUVEAU_GEM_DOMAIN_* set.
-fn _nv_ctx_bo_alloc_bind(ctx, dom, out): i64 {
+# Allocate one host BO of >= `size` bytes (rounded up to the 64 KiB span
+# granularity), VM_BIND it at a fresh UMD VA, and return its pieces via
+# `out` (24 bytes: +0 handle, +8 va, +16 cpu_addr). Returns 0 on success or
+# a negative errno; on VA exhaustion or bind failure the BO is released so
+# nothing leaks. `dom` is a NOUVEAU_GEM_DOMAIN_* set. The create slots cap
+# `size` (NV_BO_MAX_SIZE) with a friendly 0-return before calling; the
+# guards here are the defense-in-depth backstop.
+fn _nv_ctx_bo_alloc_bind(ctx, dom, size, out): i64 {
     store64(out + 0, 0);
     store64(out + 8, 0);
     store64(out + 16, 0);
+    if (size <= 0)             { return 0 - 22; }   # -EINVAL
+    if (size > NV_BO_MAX_SIZE) { return 0 - 22; }   # -EINVAL
+    var span = _nv_align64k(size);
     var fd = nv_ctx_fd(ctx);
     var bo[16];
-    var rc = native_nv_bo_create_dom(fd, NV_BO_SIZE, dom, &bo);
+    var rc = native_nv_bo_create_dom(fd, span, dom, &bo);
     if (rc != 0) { return rc; }
     var handle = load64(&bo + 0);
     var addr   = load64(&bo + 8);
-    var va = _nv_ctx_alloc_va(ctx, NV_BO_SIZE);
-    rc = native_nv_vm_bind_map(fd, handle, va, NV_BO_SIZE);
+    var va = _nv_ctx_alloc_va(ctx, span);
+    if (va == 0) {
+        native_nv_bo_release_host(fd, handle, addr, span);
+        return 0 - 12;   # -ENOMEM: UMD VA range exhausted
+    }
+    rc = native_nv_vm_bind_map(fd, handle, va, span);
     if (rc != 0) {
-        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        native_nv_bo_release_host(fd, handle, addr, span);
         return rc;
     }
     store64(out + 0, handle);
@@ -208,7 +237,7 @@ fn gpu_context_new_native_nvidia(): i64 {
 
     # Three persistent host BOs, VM_BIND'd once: QMD, pushbuffer, param bank.
     var bo[24];
-    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, NV_BO_SIZE, &bo);
     if (rc != 0) {
         native_nv_channel_free(fd, chid); sys_close(fd);
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
@@ -217,7 +246,7 @@ fn gpu_context_new_native_nvidia(): i64 {
     store64(ctx + NV_CTX_QMD_VA,     load64(&bo + 8));
     store64(ctx + NV_CTX_QMD_ADDR,   load64(&bo + 16));
 
-    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, NV_BO_SIZE, &bo);
     if (rc != 0) {
         native_nv_channel_free(fd, chid); sys_close(fd);
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
@@ -226,7 +255,7 @@ fn gpu_context_new_native_nvidia(): i64 {
     store64(ctx + NV_CTX_PUSH_VA,     load64(&bo + 8));
     store64(ctx + NV_CTX_PUSH_ADDR,   load64(&bo + 16));
 
-    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo);
+    rc = _nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, NV_BO_SIZE, &bo);
     if (rc != 0) {
         native_nv_channel_free(fd, chid); sys_close(fd);
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc));
@@ -263,15 +292,17 @@ fn _backend_nvidia_ctx_release(ctx): i64 {
     return 0;
 }
 
-# Create a host-visible buffer of `size` bytes (a 64 KiB host BO VM_BIND'd at
-# a fresh VA). `usage` is ignored (a host BO is general-purpose). Returns an
-# NV_BUF struct ptr or 0 on bad input / ioctl failure.
+# Create a host-visible buffer of `size` bytes (a host BO of the 64 KiB-
+# aligned span VM_BIND'd at a fresh VA; SIZE stays logical — consumers query
+# it and write/read bound against it, release re-derives the span). `usage`
+# is ignored (a host BO is general-purpose). Returns an NV_BUF struct ptr or
+# 0 on bad input / ioctl failure.
 fn _backend_nvidia_buffer_create(ctx, size, usage): i64 {
     if (ctx == 0) { return 0; }
     if (size <= 0) { return 0; }
-    if (size > NV_BO_SIZE) { return 0; }   # v0: single-BO buffers (<=64 KiB)
+    if (size > NV_BO_MAX_SIZE) { return 0; }   # bound before align (2 GiB)
     var bo[24];
-    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, size, &bo) != 0) { return 0; }
     var buf = alloc(NV_BUF_STRUCT_SIZE);
     memset(buf, 0, NV_BUF_STRUCT_SIZE);
     store64(buf + NV_BUF_HANDLE, load64(&bo + 0));
@@ -324,9 +355,12 @@ fn _backend_nvidia_buffer_release(ctx, buf): i64 {
     var handle = load64(buf + NV_BUF_HANDLE);
     var va     = load64(buf + NV_BUF_VA);
     var addr   = load64(buf + NV_BUF_ADDR);
+    # Re-derive the bind span from the stored logical size, exactly as the
+    # create slot sized it (the AMD release idiom).
+    var span   = _nv_align64k(load64(buf + NV_BUF_SIZE));
     if (handle != 0) {
-        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
-        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        native_nv_vm_unbind(fd, va, span);
+        native_nv_bo_release_host(fd, handle, addr, span);
     }
     memset(buf, 0, NV_BUF_STRUCT_SIZE);
     return 0;
@@ -342,9 +376,9 @@ fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     if (ctx == 0) { return 0; }
     if (bytes_ptr == 0) { return 0; }
     if (n <= 0) { return 0; }
-    if (n > NV_BO_SIZE) { return 0; }
+    if (n > NV_BO_MAX_SIZE) { return 0; }
     var bo[24];
-    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, n, &bo) != 0) { return 0; }
     var addr = load64(&bo + 16);
     memcpy(addr, bytes_ptr, n);   # SASS program bytes -> the program BO
     var shmod = alloc(NV_SHMOD_STRUCT_SIZE);
@@ -365,9 +399,10 @@ fn _backend_nvidia_shader_module_release(ctx, shmod): i64 {
     var handle = load64(shmod + NV_SHMOD_HANDLE);
     var va     = load64(shmod + NV_SHMOD_VA);
     var addr   = load64(shmod + NV_SHMOD_ADDR);
+    var span   = _nv_align64k(load64(shmod + NV_SHMOD_SIZE));
     if (handle != 0) {
-        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
-        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        native_nv_vm_unbind(fd, va, span);
+        native_nv_bo_release_host(fd, handle, addr, span);
     }
     memset(shmod, 0, NV_SHMOD_STRUCT_SIZE);
     return 0;
@@ -441,12 +476,12 @@ fn _backend_nvidia_device_wait_idle(ctx): i64 {
 # v1 texture slots (88..120) — host-visible linear RGBA8
 # ================================================================
 
-# Create a 2D RGBA8 linear texture (a host BO of width*height*4 bytes,
-# VM_BIND'd at a fresh VA). Dimensions are capped (validate_dimensions) so
-# width*height*4 cannot overflow. v0: the surface must fit one 64 KiB BO
-# (<=128x128 RGBA8) — larger surfaces need multi-BO/bigger-BO allocation,
-# deferred to the NVIDIA-surfaces backlog (see docs/development/roadmap.md).
-# Returns an NV_TEX struct ptr or 0 on bad input / ioctl failure.
+# Create a 2D RGBA8 linear texture (a host BO of the 64 KiB-aligned
+# width*height*4 span, VM_BIND'd at a fresh VA). Dimensions are capped
+# (validate_dimensions, <=8192 per axis) so width*height*4 cannot overflow
+# and stays under NV_BO_MAX_SIZE (8192^2*4 = 256 MiB). SIZE stays logical;
+# release re-derives the span. Returns an NV_TEX struct ptr or 0 on bad
+# input / ioctl failure.
 fn _backend_nvidia_texture_create_2d_rgba8(ctx, width, height): i64 {
     if (ctx == 0) { return 0; }
     if (width <= 0)  { return 0; }
@@ -455,9 +490,8 @@ fn _backend_nvidia_texture_create_2d_rgba8(ctx, width, height): i64 {
         return 0;
     }
     var logical = width * height * 4;
-    if (logical > NV_BO_SIZE) { return 0; }   # v0: single-BO surfaces
     var bo[24];
-    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, logical, &bo) != 0) { return 0; }
     var tex = alloc(NV_TEX_STRUCT_SIZE);
     memset(tex, 0, NV_TEX_STRUCT_SIZE);
     store64(tex + NV_TEX_HANDLE, load64(&bo + 0));
@@ -508,9 +542,10 @@ fn _backend_nvidia_texture_release(ctx, tex): i64 {
     var handle = load64(tex + NV_TEX_HANDLE);
     var va     = load64(tex + NV_TEX_VA);
     var addr   = load64(tex + NV_TEX_ADDR);
+    var span   = _nv_align64k(load64(tex + NV_TEX_SIZE));
     if (handle != 0) {
-        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
-        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        native_nv_vm_unbind(fd, va, span);
+        native_nv_bo_release_host(fd, handle, addr, span);
     }
     memset(tex, 0, NV_TEX_STRUCT_SIZE);
     return 0;
@@ -520,13 +555,18 @@ fn _backend_nvidia_texture_release(ctx, tex): i64 {
 # v2 render slots (120..176) — N7.1: render-target lifecycle
 # ================================================================
 
-# Create a 2D RGBA8 render target (a host BO of width*height*4 bytes, VM_BIND'd
-# at a fresh VA via the per-context bump allocator, so multiple live RTs get
-# distinct VAs). Dimensions are capped (validate_dimensions) so width*height*4
-# cannot overflow. v0: the surface must fit one 64 KiB BO (<=128x128 RGBA8) —
-# the same single-BO constraint as the texture slot; larger color targets need
-# multi-BO/bigger-BO allocation, deferred (see docs/development/roadmap.md).
-# Returns an NV_RT struct ptr or 0 on bad input / ioctl failure.
+# Create a 2D RGBA8 render target (a host BO VM_BIND'd at a fresh VA via
+# the per-context bump allocator, so multiple live RTs get distinct VAs).
+# SIZED FROM THE DRAW ENGINE'S STRIDE, not the packed pixels: the 3D engine
+# stores rows at the 128-aligned byte pitch (native_nv_rt_pitch_bytes — the
+# LAYOUT_PITCH contract native_nv_push_draw programs), so the BO must hold
+# pitch * height bytes or a width % 32 != 0 target rasters past the VM_BIND
+# span (unmapped-VA MMU fault / silent neighbor corruption — 4.0.7 review
+# find; the class predates the multi-size allocator). Dimensions are capped
+# (validate_dimensions, <=8192 per axis) so pitch * height cannot overflow
+# and stays under NV_BO_MAX_SIZE (32768 * 8192 = 256 MiB). NV_RT_SIZE holds
+# the padded size; release re-derives the span from it. Returns an NV_RT
+# struct ptr or 0 on bad input / ioctl failure.
 fn _backend_nvidia_render_target_create_2d_rgba8(ctx, width, height): i64 {
     if (ctx == 0) { return 0; }
     if (width <= 0)  { return 0; }
@@ -534,16 +574,15 @@ fn _backend_nvidia_render_target_create_2d_rgba8(ctx, width, height): i64 {
     if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
         return 0;
     }
-    var logical = width * height * 4;
-    if (logical > NV_BO_SIZE) { return 0; }   # v0: single-BO color targets
+    var padded = native_nv_rt_pitch_bytes(width) * height;
     var bo[24];
-    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, &bo) != 0) { return 0; }
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, padded, &bo) != 0) { return 0; }
     var rt = alloc(NV_RT_STRUCT_SIZE);
     memset(rt, 0, NV_RT_STRUCT_SIZE);
     store64(rt + NV_RT_HANDLE, load64(&bo + 0));
     store64(rt + NV_RT_VA,     load64(&bo + 8));
     store64(rt + NV_RT_ADDR,   load64(&bo + 16));
-    store64(rt + NV_RT_SIZE,   logical);
+    store64(rt + NV_RT_SIZE,   padded);
     store32(rt + NV_RT_WIDTH,  width);
     store32(rt + NV_RT_HEIGHT, height);
     return rt;
@@ -557,9 +596,10 @@ fn _backend_nvidia_render_target_release(ctx, rt): i64 {
     var handle = load64(rt + NV_RT_HANDLE);
     var va     = load64(rt + NV_RT_VA);
     var addr   = load64(rt + NV_RT_ADDR);
+    var span   = _nv_align64k(load64(rt + NV_RT_SIZE));
     if (handle != 0) {
-        native_nv_vm_unbind(fd, va, NV_BO_SIZE);
-        native_nv_bo_release_host(fd, handle, addr, NV_BO_SIZE);
+        native_nv_vm_unbind(fd, va, span);
+        native_nv_bo_release_host(fd, handle, addr, span);
     }
     memset(rt, 0, NV_RT_STRUCT_SIZE);
     return 0;

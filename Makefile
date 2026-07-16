@@ -390,6 +390,18 @@ build/nvidia_render_api: programs/nvidia_render_api.cyr src/*.cyr
 test-nvidia-render-api: build/nvidia_render_api
 	./build/nvidia_render_api
 
+# 4.0.7 — NVIDIA multi-size BO allocator gate (the "multi-BO / bigger-BO
+# surfaces" roadmap item): 1 MiB buffer roundtrip, GPU STG 512 KiB deep into
+# one BO, 512x512 texture + render target through the public API, and a
+# mixed-size create/release churn. Requires nouveau hardware; not in CI.
+build/nvidia_bigbo_e2e: programs/nvidia_bigbo_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_bigbo_e2e.cyr $@
+
+.PHONY: test-nvidia-bigbo-e2e
+test-nvidia-bigbo-e2e: build/nvidia_bigbo_e2e
+	./build/nvidia_bigbo_e2e
+
 # v4.0 Phase N8.1 — NVIDIA KMS topology probe. Confirms nouveau exposes
 # standard DRM atomic KMS on its card node and walks the display topology
 # (connectors / encoders / CRTCs / preferred modes). GETRESOURCES/GETCONNECTOR

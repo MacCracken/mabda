@@ -9,7 +9,7 @@
 #   header = (op<<29) | (count<<16) | (subc<<13) | (mthd>>2)
 #     op:    bits 31:29  (1=INCR, 3=NON_INCR, 4=INLINE/IMMD, 5=INCR_ONCE)
 #     count: bits 28:16  (dword arg count; for INLINE this slot holds a
-#                         12-bit immediate instead)
+#                         13-bit immediate instead)
 #     subc:  bits 15:13  (subchannel; NVK binds compute on subc 1)
 #     mthd:  bits 12:0    (method byte-offset >> 2)
 # Shifts are written as mul/div (the toolchain-safe idiom; see
@@ -73,6 +73,19 @@ var NVC5C0_INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI = 0x0244;
 var NVC5C0_INVALIDATE_SAMPLER_CACHE_NO_WFI        = 0x1424;
 var NVC5C0_INVALIDATE_SKED_CACHES                 = 0x0298;
 
+# Shader-cache invalidate (NO_WFI, INLINE imm = a cache-select BITFIELD, not
+# LINES_ALL): bit 0 = instruction, bit 4 = global data, bit 12 = CONSTANT.
+# NVK emits { .constant = TRUE } whenever cbuf contents change under a live
+# channel (nvk_cmd_dispatch.c); the cla0c0.h lineage and envytools' FLUSH
+# @0x1698 (UCACHE=0x1000) agree on the encoding. mabda rewrites the c[0x0]
+# param bank (the output pointer at +0x160) through the CPU mapping before
+# EVERY dispatch, so without this the SM's constant cache can serve the
+# PREVIOUS dispatch's output pointer — the 4.0.7 bigbo gate caught exactly
+# that: a second dispatch with a new output VA silently stored through the
+# stale pointer (no fault, wrong buffer). HW-proven fix on the TU116.
+var NVC5C0_INVALIDATE_SHADER_CACHES_NO_WFI = 0x1698;
+var NVC5C0_ISC_NO_WFI_CONSTANT             = 0x1000;
+
 # Build a method header for an incrementing/non-incrementing/incr-once
 # method run carrying `count` dword args. `mthd` is the method byte offset.
 fn native_nv_method_header(op, subc, mthd, count): i64 {
@@ -80,8 +93,10 @@ fn native_nv_method_header(op, subc, mthd, count): i64 {
     | ((subc & 7) * 0x2000) | ((mthd / 4) & 0x1FFF);
 }
 
-# Build an INLINE (IMMD) method header: a single 12-bit immediate packed
-# into the count slot (bits 28:16) — no separate arg dword follows.
+# Build an INLINE (IMMD) method header: a single 13-bit immediate packed
+# into the count slot (bits 28:16) — no separate arg dword follows. (Bit 12
+# is load-bearing: CT_WRITE_RGBA = 0x1111 and the constant-cache invalidate
+# select 0x1000 both use it.)
 fn native_nv_method_inline(subc, mthd, imm): i64 {
     return (NV_OP_INLINE * 0x20000000) | ((imm & 0x1FFF) * 0x10000)
     | ((subc & 7) * 0x2000) | ((mthd / 4) & 0x1FFF);
@@ -92,6 +107,7 @@ fn native_nv_method_inline(subc, mthd, imm): i64 {
 # preamble that N4.3 distills from the captured init stream is prepended
 # by the integration layer when required):
 #   SET_OBJECT(0xC5C0)            on the compute subchannel
+#   INVALIDATE_SHADER_CACHES_NO_WFI(CONSTANT)   (cbuf rewritten per dispatch)
 #   SEND_PCAS_A(qmd_va >> 8)
 #   SEND_SIGNALING_PCAS_B(INVALIDATE|SCHEDULE)
 # Returns the byte count written (the EXEC push va_len).
@@ -116,6 +132,13 @@ fn native_nv_push_dispatch(dst, qmd_va): i64 {
     store32(dst + n, 0);
     n = n + 4;
     store32(dst + n, NV_LOCAL_MEMORY_WINDOW);
+    n = n + 4;
+    # Constant-cache invalidate: the c[0x0] param bank is rewritten through
+    # the CPU mapping before every dispatch; a warm SM constant cache would
+    # otherwise serve the previous dispatch's output pointer (silent store
+    # through a stale VA — caught by the 4.0.7 bigbo deep-STG probe).
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC,
+    NVC5C0_INVALIDATE_SHADER_CACHES_NO_WFI, NVC5C0_ISC_NO_WFI_CONSTANT));
     n = n + 4;
     # SEND_PCAS_A = qmd_va >> 8 (QMD is 256-byte aligned)
     store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SEND_PCAS_A, 1));
@@ -191,6 +214,11 @@ fn native_nv_push_dispatch_sample(dst, qmd_va, tic_pool_va, tsc_pool_va): i64 {
     # compute cmdbuf begin (Maxwell-B+; Turing qualifies).
     store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC, NVC5C0_INVALIDATE_SKED_CACHES, 0));
     n = n + 4;
+    # Constant-cache invalidate — same rationale as native_nv_push_dispatch
+    # (the sampling param bank is CPU-rewritten per dispatch too).
+    store32(dst + n, native_nv_method_inline(NV_COMPUTE_SUBC,
+    NVC5C0_INVALIDATE_SHADER_CACHES_NO_WFI, NVC5C0_ISC_NO_WFI_CONSTANT));
+    n = n + 4;
     # SEND_PCAS_A = qmd_va >> 8 (QMD is 256-byte aligned).
     store32(dst + n, native_nv_method_header(NV_OP_INCR, NV_COMPUTE_SUBC, NVC5C0_SEND_PCAS_A, 1));
     n = n + 4;
@@ -259,10 +287,23 @@ var NVC597_CT_WRITE_RGBA            = 0x1111;   # R|G|B|A enable (bits 0/4/8/12)
 var NVC597_DRAW_CONTROL_A_DEFAULT   = 0x200;    # INSTANCE_ITERATE_ENABLE (bit9)
 var NVC597_FRONT_FACE_CCW           = 0x901;
 
+# 128-aligned byte row pitch of a LAYOUT_PITCH RGBA8 color target `width`
+# pixels wide — THE row stride the 3D engine stores at (SET_COLOR_TARGET
+# WIDTH under LAYOUT_PITCH takes the byte pitch, which must be 128-aligned).
+# Single source of truth: the RT create slot sizes the BO/VM_BIND span from
+# this same value (pitch * height), so the raster can never store past the
+# bound span — sizing from packed width*height*4 under-allocated every RT
+# whose width % 32 != 0 (caught by the 4.0.7 adversarial review; the class
+# predates 4.0.7 — a 1x8192 RT overran its 64 KiB BO by ~1 MiB of stride).
+fn native_nv_rt_pitch_bytes(width): i64 {
+    return (width * 4 + 127) / 128 * 128;
+}
+
 # NVIDIA draw-params struct (56 bytes) the builder reads. rt_va is the color
-# target GPU VA; width/height are pixels (the byte row pitch is derived as
-# align(width*4, 128)); vs_va/fs_va point AT the 128-byte SPH of each program;
-# vs/fs regcount = the SASS num_gprs.
+# target GPU VA; width/height are pixels (the byte row pitch is
+# native_nv_rt_pitch_bytes — the same value the RT create slot sized the BO
+# from); vs_va/fs_va point AT the 128-byte SPH of each program; vs/fs
+# regcount = the SASS num_gprs.
 var NV_DRAW_RT_VA       = 0;
 var NV_DRAW_RT_WIDTH    = 8;
 var NV_DRAW_RT_HEIGHT   = 16;
@@ -309,7 +350,7 @@ fn native_nv_push_draw(dst, dp, vertex_count): i64 {
     var vs_rc  = load64(dp + NV_DRAW_VS_REGCOUNT);
     var fs_rc  = load64(dp + NV_DRAW_FS_REGCOUNT);
 
-    var pitch    = (width * 4 + 127) / 128 * 128;   # row pitch in bytes (128-aligned)
+    var pitch    = native_nv_rt_pitch_bytes(width);   # row pitch in bytes (128-aligned)
     var clip_h   = width * 0x10000;                 # X=0 | WIDTH<<16
     var clip_v   = height * 0x10000;                # Y=0 | HEIGHT<<16
     var scale_x  = native_int_to_f32_bits(width / 2);

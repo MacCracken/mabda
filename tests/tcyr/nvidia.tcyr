@@ -268,7 +268,7 @@ fn test_nv_push_dispatch() {
     var buf[64];
     memset(&buf, 0, 64);
     var n = native_nv_push_dispatch(&buf, 0x3ffdf5c800);   # the capture's qmd_va
-    assert_eq(n, 44, "dispatch push = 44 bytes (11 dwords)");
+    assert_eq(n, 48, "dispatch push = 48 bytes (12 dwords)");
     assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
     assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
     assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header (0x02a0 cnt2)");
@@ -277,9 +277,14 @@ fn test_nv_push_dispatch() {
     assert_eq(load32(&buf + 20), 0x200221EC, "LOCAL_MEMORY_WINDOW header (0x07b0 cnt2)");
     assert_eq(load32(&buf + 24), 0, "local window arg0");
     assert_eq(load32(&buf + 28), 0xFF000000, "local window base (== capture)");
-    assert_eq(load32(&buf + 32), 0x200120AD, "SEND_PCAS_A header");
-    assert_eq(load32(&buf + 36), 0x3ffdf5c8, "qmd_va>>8 (== capture arg)");
-    assert_eq(load32(&buf + 40), 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    # 4.0.7: constant-cache invalidate (INLINE, imm = CONSTANT bit 0x1000) —
+    # the c[0x0] bank is CPU-rewritten per dispatch; without this the SM's
+    # constant cache serves the PREVIOUS dispatch's output pointer (the
+    # bigbo deep-STG probe caught the silent stale store on HW).
+    assert_eq(load32(&buf + 32), 0x900025A6, "INVALIDATE_SHADER_CACHES_NO_WFI(CONSTANT)");
+    assert_eq(load32(&buf + 36), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 40), 0x3ffdf5c8, "qmd_va>>8 (== capture arg)");
+    assert_eq(load32(&buf + 44), 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
     return 0;
 }
 
@@ -540,7 +545,7 @@ fn test_nv_push_dispatch_sample() {
     var buf[96];
     memset(&buf, 0, 96);
     var n = native_nv_push_dispatch_sample(&buf, 0x200000, 0x700000, 0x800000);
-    assert_eq(n, 88, "sample dispatch push = 88 bytes (22 dwords)");
+    assert_eq(n, 92, "sample dispatch push = 92 bytes (23 dwords)");
     assert_eq(load32(&buf + 0), 0x20012000, "SET_OBJECT header");
     assert_eq(load32(&buf + 4), 0xC5C0, "compute class arg");
     assert_eq(load32(&buf + 8), 0x200220A8, "SHARED_MEMORY_WINDOW header");
@@ -561,9 +566,11 @@ fn test_nv_push_dispatch_sample() {
     "INVALIDATE_SAMPLER_CACHE_NO_WFI (0x1424 immd)");
     assert_eq(load32(&buf + 72) & 0xFFFFFFFF, 0x800020A6,
     "INVALIDATE_SKED_CACHES (0x0298 immd)");
-    assert_eq(load32(&buf + 76), 0x200120AD, "SEND_PCAS_A header");
-    assert_eq(load32(&buf + 80), 0x2000, "qmd_va >> 8 (0x200000 >> 8)");
-    assert_eq(load32(&buf + 84) & 0xFFFFFFFF, 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
+    assert_eq(load32(&buf + 76) & 0xFFFFFFFF, 0x900025A6,
+    "INVALIDATE_SHADER_CACHES_NO_WFI(CONSTANT) (0x1698 immd 0x1000)");
+    assert_eq(load32(&buf + 80), 0x200120AD, "SEND_PCAS_A header");
+    assert_eq(load32(&buf + 84), 0x2000, "qmd_va >> 8 (0x200000 >> 8)");
+    assert_eq(load32(&buf + 88) & 0xFFFFFFFF, 0x800320AF, "SEND_SIGNALING_PCAS_B inline");
     return 0;
 }
 
@@ -740,6 +747,86 @@ fn test_nv_backend_v3_surface_slots() {
     return 0;
 }
 
+# 4.0.7 — multi-size BO allocator (the roadmap "multi-BO / bigger-BO
+# surfaces" item): _nv_ctx_bo_alloc_bind is parameterized on a
+# surface-derived size, spans are 64 KiB-aligned per object, the VA bump
+# allocator guards the kernel reservation, and the create slots cap at
+# NV_BO_MAX_SIZE. No HW — span math, VA-cursor behavior on a stack ctx
+# blob, and the before-ioctl input guards.
+fn test_nv_bigbo_allocator() {
+    # Span granularity math (BO size + VM_BIND range + VA stride).
+    assert_eq(_nv_align64k(1), 0x10000, "align64k(1) = 64 KiB");
+    assert_eq(_nv_align64k(0x10000), 0x10000, "align64k(64K) = 64 KiB");
+    assert_eq(_nv_align64k(0x10001), 0x20000, "align64k(64K+1) = 128 KiB");
+    assert_eq(_nv_align64k(0x100000), 0x100000, "align64k(1M) = 1 MiB exact");
+    assert_eq(_nv_align64k(512 * 512 * 4), 0x100000, "512x512 RGBA8 spans 1 MiB");
+    # The ceiling is 64 KiB-aligned, so align64k at the cap is the identity
+    # (no overflow headroom needed above it — creates reject > cap first).
+    assert_eq(NV_BO_MAX_SIZE, 0x80000000, "BO ceiling = 2 GiB (AMD region parity)");
+    assert_eq(_nv_align64k(NV_BO_MAX_SIZE), NV_BO_MAX_SIZE, "align64k(cap) = cap");
+
+    # VA bump allocator on a stack ctx blob: distinct 64 KiB-aligned VAs,
+    # cursor advances by the aligned span, exhaustion returns 0 and does
+    # NOT advance the cursor.
+    var ctx[176];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64(&ctx + NV_CTX_VA_CURSOR, NV_VA_BASE);
+    assert_eq(_nv_ctx_alloc_va(&ctx, 1), NV_VA_BASE, "first VA = base");
+    assert_eq(load64(&ctx + NV_CTX_VA_CURSOR), NV_VA_BASE + 0x10000,
+    "cursor advanced one 64 KiB span");
+    assert_eq(_nv_ctx_alloc_va(&ctx, 0x10001), NV_VA_BASE + 0x10000,
+    "second VA = prior cursor");
+    assert_eq(load64(&ctx + NV_CTX_VA_CURSOR), NV_VA_BASE + 0x30000,
+    "cursor advanced 128 KiB (aligned span)");
+    # Exhaustion backstop: a span that would reach the kernel reservation.
+    store64(&ctx + NV_CTX_VA_CURSOR, NOUVEAU_VM_KERNEL_RESERVATION_START - 0x10000);
+    assert_eq(_nv_ctx_alloc_va(&ctx, 0x20000), 0, "reservation-crossing VA = 0");
+    assert_eq(load64(&ctx + NV_CTX_VA_CURSOR),
+    NOUVEAU_VM_KERNEL_RESERVATION_START - 0x10000,
+    "cursor unchanged on exhaustion");
+    assert_eq(_nv_ctx_alloc_va(&ctx, 0x10000),
+    NOUVEAU_VM_KERNEL_RESERVATION_START - 0x10000,
+    "last span before the reservation still allocates");
+
+    # _nv_ctx_bo_alloc_bind input guards fire before any ioctl (-EINVAL).
+    var bo[24];
+    assert_eq(_nv_ctx_bo_alloc_bind(&ctx, NOUVEAU_GEM_DOMAIN_HOST, 0, &bo),
+    0 - 22, "alloc_bind(0) = -EINVAL");
+    assert_eq(_nv_ctx_bo_alloc_bind(&ctx, NOUVEAU_GEM_DOMAIN_HOST, 0 - 1, &bo),
+    0 - 22, "alloc_bind(-1) = -EINVAL");
+    assert_eq(_nv_ctx_bo_alloc_bind(&ctx, NOUVEAU_GEM_DOMAIN_HOST,
+    NV_BO_MAX_SIZE + 1, &bo), 0 - 22, "alloc_bind(cap+1) = -EINVAL");
+    assert_eq(load64(&bo + 0), 0, "guard-rejected out.handle zeroed");
+
+    # Create-slot caps return the friendly 0 before touching the fd.
+    assert_eq(_backend_nvidia_buffer_create(&ctx, NV_BO_MAX_SIZE + 1, 0), 0,
+    "buffer_create(cap+1) = 0");
+    var byte = 0;
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &byte,
+    NV_BO_MAX_SIZE + 1, SHADER_SRC_SASS), 0, "shmod_create(cap+1) = 0");
+    # Texture/RT sizing is bounded by the dimension gate (<=8192 per axis,
+    # so logical <= 256 MiB < cap) — the former 64 KiB single-BO rejection
+    # class (e.g. 256x256) is create-side legal now; those sizes are proven
+    # end-to-end on HW by programs/nvidia_bigbo_e2e.cyr.
+    assert_eq(_backend_nvidia_texture_create_2d_rgba8(&ctx, 8193, 16), 0,
+    "texture dim gate still rejects >8192");
+    assert_eq(_backend_nvidia_render_target_create_2d_rgba8(&ctx, 16, 8193), 0,
+    "RT dim gate still rejects >8192");
+
+    # RT pitch contract (the review find): the RT BO is sized from the
+    # 128-aligned row pitch the draw engine stores at — NOT packed
+    # width*height*4 — so a width % 32 != 0 target can't raster past its
+    # VM_BIND span. Both sides (create sizing + push_draw stride) read
+    # native_nv_rt_pitch_bytes, so pinning it pins the contract.
+    assert_eq(native_nv_rt_pitch_bytes(512), 2048, "pitch(512) = width*4 (aligned)");
+    assert_eq(native_nv_rt_pitch_bytes(100), 512, "pitch(100) = 512 (128-aligned up)");
+    assert_eq(native_nv_rt_pitch_bytes(1), 128, "pitch(1) = 128 (minimum stride)");
+    assert_eq(native_nv_rt_pitch_bytes(8192), 32768, "pitch(8192) = 32 KiB (max, aligned)");
+    assert_eq(_nv_align64k(native_nv_rt_pitch_bytes(100) * 256), 0x20000,
+    "100x256 RT spans two 64 KiB units (pitch-sized, packed would be one+)");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -779,5 +866,6 @@ fn main() {
     test_nv_sass_render();
     test_nv_kms_topology_constants();
     test_nv_backend_v3_surface_slots();
+    test_nv_bigbo_allocator();
     return assert_summary();
 }
