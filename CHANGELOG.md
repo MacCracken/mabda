@@ -13,6 +13,34 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.6] — 2026-07-16
+
+**Toolchain maintenance: cyrius pin 6.4.62 → 6.4.64.** No source change — `src/` is
+byte-identical to 4.0.5. The full verification sweep re-ran green on the new toolchain.
+
+### Changed
+- **`cyrius = "6.4.64"` in `cyrius.cyml`** (was 6.4.62). `lib/` re-resolved from scratch
+  (`rm -rf lib && mkdir lib && cyrius deps` — 2 deps resolved, 38 locked). Smoke build,
+  per-file `cyrius lint` (0 warnings × 57 files), per-file `cyrius fmt --check` (clean ×
+  57 — note 6.4.64's CLI takes the file *before* the flag, `cyrius fmt <file> --check`;
+  the Makefile `fmt-check` target and CI already use that form), `cyrius vet` (clean),
+  and the CPU bench baseline all pass on 6.4.64.
+- **Provenance-stamp refresh to the current release** — the "Written against mabda X /
+  Cyrius Y" guide headers (`usage` / `integration` / `render-graph`), the
+  native-migration "applicable through" line, the `[deps.mabda]` tag + `cyrius` pin in
+  `docs/stdlib-integration.md`, the guides' `[deps.mabda]` snippets, the consumer example
+  (`examples/stdlib-consumer/`), and the README version line + Cyrius-minimum now read
+  **mabda 4.0.6 / Cyrius 6.4.64**. Historical statements (v4.0.1 deprecation dates, audit
+  citations) are deliberately left at their shipped versions.
+- **Toolchain cheat-sheet gains A3** (`docs/development/2026-04-30-toolchain-issues.md`) —
+  the 6.4.x `cyrius fmt` arg-order trap (`--check <file>` prints usage and exits 1 for
+  every file, reading as universal drift; the working form is `fmt <file> --check`),
+  plus a supersession note on A2 (6.x `--check` reports via exit code, no stdout).
+
+### Metrics
+- CPU assertions: 4929 across 18 suites, 0 failed (unchanged — no source change).
+  `dist/mabda.cyr` differs from 4.0.5 only by the `# Version:` header.
+
 ## [4.0.5] — 2026-07-13
 
 **Deferral hygiene: the two NVIDIA single-BO `follow-up` comments are now tracked against a

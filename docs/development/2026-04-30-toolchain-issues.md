@@ -58,6 +58,24 @@ unconditionally, NOT silent on no-drift
   silent on no-drift OR exit non-zero on drift. Both Rust and Go
   use the latter (`gofmt -l` lists files needing fmt; `cargo fmt
   --check` exits non-zero on drift). Filing as a polish bug.
+- **Superseded in cyrius 6.x**: `--check` now reports via exit code
+  (0 = clean, non-zero = drift) with no stdout — the Makefile
+  `fmt-check` target and CI both key off the exit code.
+
+### A3. `cyrius fmt` requires the file argument BEFORE `--check` (6.4.x)
+
+- **Symptom**: `cyrius fmt --check <file>` prints
+  `Usage: cyrfmt --check <file.cyr>` and exits 1 — for **every**
+  file, which reads as "all 57 files drift" if you loop it.
+  (Observed on 6.4.64; the usage string itself shows the flag-first
+  form, which is exactly the form that fails.)
+- **Correct form**: `cyrius fmt <file> --check` — file first, flag
+  after. Exit 0 = clean, exit 1 = drift (verified against a
+  deliberately misformatted probe file).
+- **In tree**: the Makefile `fmt-check` target and CI already use
+  the file-first form; only ad-hoc invocations trip this.
+- **Upstream**: arg parser treats argv[1] as the file
+  unconditionally; the usage string is misleading. Polish bug.
 
 ---
 

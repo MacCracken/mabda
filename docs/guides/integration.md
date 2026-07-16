@@ -1,6 +1,6 @@
 # Consumer Integration Guide
 
-> Written against mabda 4.0.4 / Cyrius 6.4.62. Full launcher-wiring
+> Written against mabda 4.0.6 / Cyrius 6.4.64. Full launcher-wiring
 > walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
 >
 > mabda ships **three backends** behind one public API: wgpu-native
@@ -17,7 +17,7 @@ Declare mabda in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.0.4"
+tag = "4.0.6"
 modules = ["dist/mabda.cyr"]
 ```
 
