@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.0.7** (2026-07-16). Module/assertion/bundle counts live in the
+> **v4.0.8** (2026-07-30). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -20,7 +20,9 @@ loader (`-D MABDA_JPEG`) + a provenance-stamp refresh; v4.0.5 (2026-07-13)
 tracked the NVIDIA single-BO deferrals against the multi-BO backlog item below;
 v4.0.6 (2026-07-16) is a maintenance cut — cyrius 6.4.64 pin, no source change;
 v4.0.7 (2026-07-16) lifted the NVIDIA single-BO cap — multi-size BO allocator +
-the constant-cache dispatch fix, HW-proven on the TU116).
+the constant-cache dispatch fix, HW-proven on the TU116; v4.0.8 (2026-07-30) is a
+maintenance cut — cyrius 6.4.64 → 6.5.3 pin, no `src/` change, plus two latent
+call-arity bugs in the test/bench suites that 6.5.1's arity gate exposed).
 
 ## The Long Arc
 
@@ -46,7 +48,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.0.7  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.0.8  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -188,6 +190,10 @@ vendor-driven, not calendar-driven.
 Unscheduled forward work — lands here first, graduates to a version once
 there's consumer demand plus a clear scope.
 
+> **Probe before scheduling.** The dev box's GPU is swapped between vendors —
+> verify with `lspci` before calling anything HW-blocked. (Standing rule,
+> kept after the v4.0.7 NVIDIA multi-BO item graduated out of this list.)
+
 - **samvada C-shim → pure-Cyrius dbus.** The samvada `libsystemd` C-shim
   retirement (paired with the AMD-wgpu step) was **deferred at v4.0.1** under
   the roadmap escape hatch. Forward plan: evolve the samvada dbus project into
@@ -206,13 +212,6 @@ there's consumer demand plus a clear scope.
   consumer applying the planner's offsets) needs a native transient-allocation
   subsystem — wgpu's safe API has no placed/aliased resources, and the native
   path has no rg-transient backing today. Its own future arc.
-- ~~**NVIDIA multi-BO / bigger-BO surfaces.**~~ **Shipped at v4.0.7** — the
-  multi-size BO allocator (surface-derived 64 KiB-aligned spans, the AMD
-  `_native_align_up` idiom) plus the constant-cache-invalidate dispatch fix its
-  HW gate surfaced. HW-proven on the TU116 (`make test-nvidia-bigbo-e2e`); see
-  `CHANGELOG.md` [4.0.7]. Kept here one cycle as the graduation record — the
-  probe-before-scheduling rule stands (the dev box's GPU is swapped between
-  vendors; verify with `lspci` before calling anything HW-blocked).
 
 ---
 

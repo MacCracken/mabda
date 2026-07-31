@@ -62,7 +62,7 @@ unconditionally, NOT silent on no-drift
   (0 = clean, non-zero = drift) with no stdout — the Makefile
   `fmt-check` target and CI both key off the exit code.
 
-### A3. `cyrius fmt` requires the file argument BEFORE `--check` (6.4.x)
+### A3. `cyrius fmt` requires the file argument BEFORE `--check` (6.4.x, 6.5.x)
 
 - **Symptom**: `cyrius fmt --check <file>` prints
   `Usage: cyrfmt --check <file.cyr>` and exits 1 — for **every**
@@ -74,6 +74,9 @@ unconditionally, NOT silent on no-drift
   deliberately misformatted probe file).
 - **In tree**: the Makefile `fmt-check` target and CI already use
   the file-first form; only ad-hoc invocations trip this.
+- **Still current on 6.5.3** (re-checked at the v4.0.8 pin move):
+  `cyrius fmt src/error.cyr --check` exits 0, the flag-first form
+  still prints the usage string. Unchanged, not superseded.
 - **Upstream**: arg parser treats argv[1] as the file
   unconditionally; the usage string is misleading. Polish bug.
 
@@ -196,6 +199,36 @@ unconditionally, NOT silent on no-drift
   simpler `grep -E` for the few cases mabda needed.
 - **Upstream**: cyim's regex engine is using a subset of PCRE
   that excludes some lookahead syntax.
+
+### C7. Call arity is a HARD ERROR since 6.5.1 (it was silent before)
+
+- **Symptom**: code that compiled for months suddenly fails with
+  `error:<source>:N: 'fn_name' expects K arguments, got J`. Nothing
+  in the file changed — the toolchain pin moved.
+- **Why it matters**: before 6.5.1 a call with too few args compiled
+  and the missing parameters read whatever happened to be in the
+  register/slot. It is not a new restriction; it is a **latent-bug
+  detector**, and the errors it emits are real defects that were
+  silently wrong at runtime. The 6.4.64 → 6.5.3 bump (v4.0.8) surfaced
+  two in mabda: five `tests/tcyr/native.tcyr` call sites that predated
+  `_native_texture_tiled_copy`'s / `native_tex_build_tiled_copy_packet`'s
+  `slice` parameter, and `tests/bcyr/mabda.bcyr`'s
+  `profiler_frame_cycle` bench passing the profiler handle to
+  `profile_begin()` (0 params) and `profile_end(start_ns)` — so the
+  benchmark never measured the round-trip it was named for.
+- **Workaround**: none, and none wanted. Read each error as "this call
+  was already wrong"; check what the extra parameter *means* before
+  padding with `0`, because the right value is often not zero.
+- **Note**: the gate is arity-only. Same-arity misdispatch is a
+  separate class that 6.5.2's `_int`-overload fix narrowed.
+- **Line numbers in `cyrius test` output are offset — grep instead.**
+  The error names `<source>:N`, not the `.tcyr` path, and N is short of
+  the real line by the file's pre-`fn` preamble (comment header +
+  `include` lines + blank). Measured on `native.tcyr`: real 2158
+  reported as 2151, a constant −7 across all five sites, reproduced by
+  re-breaking one call. Find the site by grepping the function name the
+  error quotes; do not seek to the printed line.
+- **Upstream**: intentional, landed 6.5.1.
 
 ---
 

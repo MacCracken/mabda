@@ -13,6 +13,129 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.8] — 2026-07-30
+
+**Toolchain maintenance: cyrius pin 6.4.64 → 6.5.3 — a 26-release span that crosses a
+minor boundary.** `src/` is byte-identical to 4.0.7 (`dist/mabda.cyr` differs only by
+its `# Version:` header). The cut is not a no-op, though: **6.5.1 promoted a wrong
+argument count from a warning to a hard compile error**, and that gate caught two
+latent defects in mabda's own test and bench suites — both silently wrong at the
+6.4.64 pin, both fixed here.
+
+### Changed
+- **`cyrius = "6.5.3"` in `cyrius.cyml`** (was 6.4.64). `lib/` re-resolved from scratch
+  (`rm -rf lib && mkdir lib && cyrius deps` — 2 deps resolved, 38 locked; `cyrius.lock`
+  digests move because the stdlib moved, and the re-resolve is stable across repeat
+  runs). Smoke build (0 warnings), per-file `cyrius lint` (0 warnings, 0 untracked
+  deferrals × 57 files, graded by **exit code** as well as stdout — the Makefile/CI gate
+  greps stdout only), per-file `cyrius fmt <file> --check` (clean; the 6.4.x file-arg-
+  before-flag order still holds on 6.5.3), `cyrius vet` (clean), all 18 CPU suites,
+  3 fuzz harnesses, every `programs/*.cyr`, and `cyrius distlib` idempotency all pass.
+- **Dep tags unchanged — both are already current upstream**: `samvada` 0.4.1,
+  `chitra` 0.3.0. No newer tag exists for either.
+- **Provenance-stamp refresh to the current release** — the "Written against mabda X /
+  Cyrius Y" guide headers (`usage` / `integration` / `render-graph`), the
+  native-migration "applicable through" line, the `[deps.mabda]` tag + `cyrius` pin in
+  `docs/stdlib-integration.md`, the guides' `[deps.mabda]` snippets, the consumer
+  example, and the README version line + Cyrius-minimum now read **mabda 4.0.8 /
+  Cyrius 6.5.3**. Historical statements (v4.0.1 deprecation dates, the v4.0.7 NVIDIA
+  multi-BO credits, audit citations, "observed on 6.4.64" quirk records) are
+  deliberately left at their shipped versions.
+- **Three provenance refs that had been missed by the 4.0.6 and 4.0.7 refreshes**, found
+  by sweeping the bare version strings rather than filtering by dep name:
+  `examples/stdlib-consumer/src/main.cyr` ("requires Cyrius 6.3.23+"),
+  `CONTRIBUTING.md` ("Cyrius 5.5.20+"), and `SECURITY.md`'s supported-versions table,
+  which still named **2.5.x** as the current release (now 4.0.x current / 3.4.x
+  back-port / < 3.4 unsupported).
+- **Toolchain cheat-sheet gains C7** (`docs/development/2026-04-30-toolchain-issues.md`)
+  — the 6.5.1 arity gate as a *latent-bug detector* rather than a new restriction, with
+  the warning against padding a missing argument with `0` before checking what the
+  parameter means, and the measured `cyrius test` diagnostic line offset (below).
+- **Roadmap** — the NVIDIA multi-BO backlog entry graduated out per its own "kept one
+  cycle as the graduation record" instruction; its standing probe-before-scheduling rule
+  is preserved at the head of the Backlog section.
+
+### Fixed
+- **Five `tests/tcyr/native.tcyr` call sites predating the `slice` parameter** —
+  `_native_texture_tiled_copy` takes 6 args and `native_tex_build_tiled_copy_packet`
+  takes 5 (the trailing `slice`, added with array-texture support); the tiled-copy
+  validation and COPY_TILED-packet tests still called the pre-`slice` 5- and 4-arg
+  forms. Under 6.4.64 the missing argument bound to whatever occupied the register, so
+  the packet-builder assertions on epitch and tiled VA were validating a surface offset
+  by an *arbitrary* slice index that happened to read 0. All five now pass an explicit
+  `slice` of 0, which `backend_native.cyr:2930` documents as byte-identical to the
+  single-slice path — restoring the tests' original intent rather than changing it.
+- **`tests/bcyr/mabda.bcyr`'s `profiler_frame_cycle` benchmark never measured a
+  begin/end round-trip** — it called `profile_begin(p)` (the fn takes **no** arguments)
+  and `profile_end(p)` (which takes a *start timestamp*), passing a `profiler_new()`
+  handle to both. `profile_end` was therefore computing `_ns_to_ms(now - <heap
+  pointer>)`, a garbage duration, against a start value that was never captured. Now
+  `var start = profile_begin(); profile_end(start);`, and the vestigial `profiler_new()`
+  is gone (`profile_begin`/`profile_end` never touched the profiler struct). The work
+  per iteration is unchanged — two `_time_now_ns()` calls and one `_ns_to_ms` — so the
+  number stays comparable to history; it is now the number the benchmark's name claims.
+
+### Toolchain notes (why the pin moved)
+- **6.5.1 — wrong argument count is a hard error** (`_CHECK_ARITY` sets `_had_error`;
+  no binary is emitted). The two fixes above are its first catch in this tree. 6.5.1
+  also fixed `PARSE_RETURN`'s tail-call path skipping overload dispatch, so
+  `return X(...)` and `var r = X(...)` finally resolve the same callee — mabda has no
+  `_str`/`_int`/`_cstr` sibling reachable in return position, so its codegen is
+  unaffected (confirmed by the byte-identical `dist/`).
+- **6.4.80 — a CRITICAL const-fold miscompile**: `1 - 2 + 3` evaluated to 5, because the
+  PEXPR-tier `_cfo` rewind discarded the left operand of a constant `+ - & | ^` chain.
+  mabda's negative-error idiom (`0 - N`) is the left half of the trigger — 121 sites in
+  `src/`, 243 across `src` + `tests` + `programs` + `fuzz`. A comment-stripped sweep of
+  every Cyrius source in the tree found **zero** full-trigger shapes (`0 - N` followed by
+  another constant `+ - & | ^`), so no mabda output was ever wrong — but the shape was
+  one edit away at the old pin.
+- **6.5.3 / 6.5.0 — compiler diagnostics now report the correct line when an `include`
+  is present.** mabda is maximally exposed here: `src/lib.cyr` has 75 includes and every
+  `programs/*.cyr` and `tests/tcyr/*.tcyr` opens by including it, so an error at line N
+  in the chain used to be reported as N − (includes before it). Build-error line numbers
+  in the include chain are trustworthy again. **Note the remaining offset in `cyrius
+  test` output**: it names `<source>:N`, short of the real `.tcyr` line by the file's
+  pre-`fn` preamble — measured at a constant −7 on `native.tcyr` (real 2158 → reported
+  2151) and reproduced by re-breaking a call site. Grep the function name the error
+  quotes; do not seek to the printed line.
+- **6.4.81 — CVE-32 through CVE-36**: 23 fixed `/tmp` literals in `cbt/` moved to a
+  per-invocation `/tmp/cyrius-<pid>` (mode 0700) that fails closed, and include-path /
+  `READFILE` copies bounded. Concurrent-invocation collisions are gone, which retires a
+  real race in mabda's per-file `cyrius test` loop and `scripts/soak.sh`.
+- **6.5.0 — `public` / `private` file-scoped visibility keywords.** Inert today (mabda
+  declares none; zero identifier collisions across `src/`, `programs/`, `tests/`,
+  `dist/` and the resolved `lib/`), but noted because ADR-005 defines mabda's
+  `@public` / `@internal` boundary as a *comment* convention and this is the first
+  release where it could be compiler-enforced. **Adoption hazard if we ever do:**
+  `private` is file-scoped and `cyrius distlib` collapses all 56 `[lib].modules` into
+  one `dist/mabda.cyr`, so a cross-module reference would hard-error in the
+  include-chain build yet be silently legal in the bundle consumers compile.
+- **6.4.65 folded mabda 4.0.5 → 4.0.7 into the cyrius stdlib.** 4.0.8 is not visible to
+  stdlib-sourced consumers until it is re-folded upstream.
+
+### Metrics
+- CPU assertions: **4958** across 18 suites, 0 failed (unchanged — the arity fixes
+  corrected existing calls rather than adding assertions). Counted with
+  `scripts/count-test-assertions.sh`; `make test | grep` undercounts by texture's 210
+  because `texture.tcyr`'s summary line begins with a NUL byte.
+- `dist/mabda.cyr` differs from 4.0.7 only by the `# Version:` header — a 1-line diff,
+  0 code lines changed. (`cyrius distlib` prints its own "26513 lines" metric; that is
+  not `wc -l`, which reads 26682. Quote the delta, not either number.)
+- CPU bench, same source A/B'd on both toolchains with matching resolved stdlib
+  (min ns): the pin move is **performance-neutral** — `color_lerp` 64 → 63,
+  `color_from_hex` 35 → 35, `color_luminance` 12 → 12, `workgroups_1d` 3 → 3,
+  `workgroups_2d` 7 → 7, `profiler_frame_cycle` 2650 → 2669, `capabilities_report`
+  36 → 31, `rg_plan_aliasing_stats_5` 1326 → 1372, `rg_plan_aliasing_stats_30`
+  7381 → 7415. Every delta is inside this suite's run-to-run spread. (The large gains
+  against the 2026-06-20 audit baseline — `color_lerp` 100 → 63, `color_from_hex`
+  70 → 35, `rg_plan_aliasing_stats_5` 2034 → 1372 — landed earlier in the 6.4.x series,
+  not in this jump.)
+
+### Next
+- GPU integration gates (wgpu `make test-phase0`, AMD `make test-native-*`, NVIDIA
+  `make test-nvidia-*`) have **not** been re-run on 6.5.3 — they are developer gates
+  needing hardware, and this cut verified the CPU/CI surface only.
+
 ## [4.0.7] — 2026-07-16
 
 **NVIDIA multi-size BO allocator (the "multi-BO / bigger-BO surfaces" backlog item,
