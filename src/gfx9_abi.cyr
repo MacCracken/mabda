@@ -23,6 +23,13 @@
 # COMPUTE_PGM_RSRC1: the fixed FLOAT_MODE(0xC0)+DX10_CLAMP flags with the VGPRS
 # (bits 0-5) and SGPRS (bits 6-9) fields ZEROED — the per-shader register counts
 # OR in. (= GFX9_COMPUTE_PGM_RSRC1_MIN 0x2C0040 with its SGPRS=1 field cleared.)
+# ⚠ BIT 23 (ENABLE_IEEE_MODE) IS HARDCODED CLEAR, and that is a deliberate choice with a
+# consequence, not an oversight. Verified by perturbation with llvm-mc 22.1.8 — a minimal
+# gfx90c .amdhsa_kernel with `.amdhsa_ieee_mode 0` emits 0x002C0040 and with `1` emits
+# 0x00AC0040; byte 48, bit 23, and nothing else moves. Every mabda shader is ieee_mode 0,
+# so this is correct today. ⛔ It also means gfx9_rsrc1 can NEVER emit an IEEE_MODE=1
+# descriptor. A consumer that needs one cannot get it from this function; that requires
+# new API and therefore a minor, not a patch.
 var GFX9_RSRC1_FLAGS = 0x2C0000;
 
 # Error codes (disjoint from the compile module's CMP_ERR_* 70-79).
@@ -51,10 +58,34 @@ var ABI_VGPR_BASE    = 56;   # first allocatable VGPR (above the LID v0..)
 # (+2 reserves VCC), floored at 1 (16 SGPRs — SGPRS=0 gives only 8, too few once
 # VCC is live; matches the hand-authored RSRC1_MIN rationale). FAIL LOUD (negative
 # error) if either field would overflow its width rather than silently masking to
-# a too-small allocation (N.5b-1 review): the SGPRS field is only 4 bits (≤128
-# SGPRs) so sgpr_hw > 120 must be rejected, not wrapped. (A correctly-bounded
-# regalloc keeps both inside range; this guards a future driver passing the wrong
-# file cap — see the regalloc SGPR-cap note in the punchlist.)
+# a too-small allocation (N.5b-1 review). (A correctly-bounded regalloc keeps both
+# inside range; this guards a future driver passing the wrong file cap.)
+#
+# ⚠ THE OLD COMMENT HERE SAID "sgpr_hw > 120 must be rejected". MEASURED: the first
+# rejected value is **127**, not 121 — `gfx9_rsrc1(4, 126)` still returns 0x2C03C0
+# (SGPRS field 15). Off by six, and it contradicted the suite's own
+# `compiler_compile.tcyr:25`, which pins 120 as ACCEPTED. Corrected 4.0.9.
+#
+# ⭐⭐ THE RESERVATION BUDGET IS A POLICY, NOT AN ERROR — READ THIS BEFORE "FIXING" IT.
+# The `+2` implements **VCC only**: the `xnack-`, no-flat-scratch configuration. LLVM's
+# default for a bare `gfx90c` target id is `+6`, so an assembler listing and this
+# function will legitimately disagree by one 8-SGPR granule. Measured with llvm-mc
+# 22.1.8, solving E in `granted = roundup8(next_free_sgpr + E)` uniquely over
+# next_free_sgpr = 1..39 on gfx90c:
+#     bare gfx90c, all defaults ....................... E = 6
+#     .amdhsa_reserve_xnack_mask 0 alone .............. E = 6   <- UNCHANGED
+#     .amdhsa_reserve_flat_scratch 0 alone ............ E = 4
+#     both waived ..................................... E = 2   <- what this function emits
+# ⚠ XNACK contributes 2, NOT 4, and is invisible while flat scratch is reserved (they
+# overlap at the top of the register file). So the term that actually separates this
+# function from LLVM's default is FLAT_SCRATCH, not XNACK.
+# ⛔ A DOWNSTREAM PROJECT READ THIS DISAGREEMENT AS A BUG IN 2026-08 and nearly filed a
+# PR against it, because the policy was implemented here and documented nowhere. It is
+# not a bug: mabda emits no flat-scratch instruction and sets no COMPUTE_TMPRING_SIZE,
+# so reserving for scratch it never uses would cost occupancy for nothing.
+# ⚠ WHAT THIS FUNCTION CANNOT EXPRESS, stated so the next reader does not rediscover it
+# as a defect: the reservation budget and IEEE_MODE are both hardcoded. Parameterising
+# them is new API (`gfx9_rsrc1_ex`) and therefore a MINOR, not this patch.
 fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
     var vgprs = (vgpr_hw + 3) / 4;
     if (vgprs > 0) { vgprs = vgprs - 1; }

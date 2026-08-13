@@ -13,6 +13,100 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.9] — 2026-08-13
+
+**A latent register-aliasing hazard in the GFX9 regalloc ceiling, plus a toolchain pin bump
+that is itself a repair.** No encoder output changes and no test expectation moves: 4958
+assertions across 18 CPU suites, byte-for-byte the same tally as 4.0.8. Four hardware e2e
+tests re-run on real Cezanne silicon (`04:00.0 AMD Cezanne`, `/dev/dri/renderD128`).
+
+⭐ **Also documents, for the first time, that `gfx9_rsrc1`'s SGPR reservation is a POLICY** —
+a downstream project read the resulting disagreement with llvm-mc as a bug in mabda and came
+close to filing a PR against correct code. See *Fixed → documentation* below.
+
+### Fixed
+- ⛔ **`GFX9_SGPR_CAP` was 104, permitting the allocator to emit `s102`/`s103` — which are
+  `FLAT_SCRATCH_LO/HI`.** The cap is **exclusive** (`gfx9_regalloc.cyr:59`, `while (r < cap)`),
+  and `gfx9_sgpr(n)` is `return n & 0xFF` with **no range check**, so those indices would encode
+  as operand codes 102/103 and silently alias the reserved pair: wrong ISA that assembles
+  cleanly, with no diagnostic and no fault. The value contradicted two comments in its own file
+  (`gfx9_compile.cyr:80-81` — *"s102+ are reserved for FLAT_SCRATCH / XNACK / VCC on GFX9"* —
+  and `:89`, *"SGPR 0-101"*). Now **102**, so an over-pressure kernel returns
+  `-RA_ERR_SGPR_OVERFLOW` instead of aliasing. Wrong-and-silent → fail-loud.
+  - Confirmed against the reference assembler: **llvm-mc 22.1.8 accepts `.amdhsa_next_free_sgpr
+    102` on gfx90c and refuses 103 and 104** with `error: value out of range`.
+  - ⚠ **Latent, not observable.** No shipped kernel approaches 100 SGPRs (the divergent-CF path
+    measures `hw_sgpr=5`), and the divergent ceiling was already `GFX9_EXEC_SAVE_SGPR = 100`.
+    This closes a hazard; it does not change any current output. Referenced by **zero** tests and
+    **zero** programs.
+- **`gfx9_abi.cyr` claimed "`sgpr_hw > 120` must be rejected". Measured: the first rejected value
+  is 127.** `gfx9_rsrc1(4, 126)` still returns `0x2C03C0`. Off by six — and it contradicted the
+  suite's own `compiler_compile.tcyr:25`, which pins 120 as *accepted*.
+- **Documentation: `gfx9_rsrc1`'s `+2` is a reservation POLICY, and nothing said so.** It
+  implements `xnack-` with no flat scratch. LLVM's default for a bare `gfx90c` target id is `+6`,
+  so an assembler listing and this function legitimately disagree by one 8-SGPR granule. Measured
+  with llvm-mc 22.1.8, solving `E` in `granted = roundup8(next_free_sgpr + E)` **uniquely** over
+  `next_free_sgpr = 1..39`:
+
+  | configuration | E |
+  |---|---|
+  | bare `gfx90c`, all defaults | 6 |
+  | `.amdhsa_reserve_xnack_mask 0` alone | **6 — unchanged** |
+  | `.amdhsa_reserve_flat_scratch 0` alone | 4 |
+  | both waived — what this function emits | **2** |
+
+  ⚠ XNACK contributes **2, not 4**, and is invisible while flat scratch is reserved (they overlap
+  at the top of the register file), so the term that separates mabda from LLVM's default is
+  **FLAT_SCRATCH**. mabda emits no flat-scratch instruction and sets no `COMPUTE_TMPRING_SIZE`, so
+  reserving for scratch it never uses would cost occupancy for nothing. The policy is correct and
+  is now written down where the next reader will find it.
+- **Documentation: `GFX9_RSRC1_FLAGS` hardcodes bit 23 (`ENABLE_IEEE_MODE`) clear.** Verified by
+  perturbation — `.amdhsa_ieee_mode 0` → `0x002C0040`, `1` → `0x00AC0040`; byte 48, bit 23, and
+  nothing else moves. Correct for every mabda shader, but it means `gfx9_rsrc1` can never emit an
+  IEEE_MODE=1 descriptor. Recorded as a named limit rather than left implicit.
+
+### Changed
+- **`cyrius = "6.5.20"` in `cyrius.cyml`** (was 6.5.3). ⛔ **This is a repair, not hygiene**, for
+  two measured reasons:
+  1. **This box cannot build at 6.5.3 at all.** The `cyrius` driver does not resolve `cycc`
+     through `PATH`; `~/.cyrius/bin/cycc` *is* `versions/6.5.20/bin/cycc`, and
+     `versions/6.5.3/bin/cycc` is unreachable through the driver. Every build at the old pin
+     emitted `toolchain drift` and was in fact 6.5.20 driving a 6.5.3-era `lib/`. The declared
+     floor described a build nobody was running.
+  2. **The local 6.5.3 stdlib is contaminated and silently dirtied a tracked file.** Local
+     `versions/6.5.3/lib/vec.cyr` hashes `e46a3592…` — byte-identical to 6.5.20's — while the real
+     6.5.3 file is `19bcb006…`, which is what `cyrius.lock` records. A plain `make test` at the
+     old pin therefore rewrote **tracked** `cyrius.lock` to a digest CI would never produce.
+     Observed directly. ⚠ **Nothing diffs `cyrius.lock`** — not CI, not the Makefile — so that
+     corruption had no gate. Post-bump the lock is stable across repeat runs (`f95fd4a0…`).
+  - `lib/` re-resolved from scratch (`rm -rf lib && mkdir lib && cyrius deps`): **38 → 39 files**
+    (`lib/thread_macos.cyr` is new), `cyrius.lock` 25 insertions / 24 deletions, **both
+    `commit`-pinned dep lines unchanged**.
+  - ⚠ The 6.5.4→6.5.20 span's two semantic changes — the regalloc NOP-compactor corrupting
+    `switch`/`match` jump tables, and `break` gaining C semantics in `switch`/`match` — **cannot
+    reach mabda**: it contains no Cyrius `switch`/`match` and no `#derive` anywhere in `src/`,
+    `programs/`, `tests/` or `fuzz/`.
+- **Dep tags unchanged — both are already current upstream**: `samvada` **0.4.1**
+  (`35beb1b3…`), `chitra` **0.3.0** (`f8410258…`), each verified a real tag whose SHA is
+  byte-equal to its `cyrius.lock` line. ⚠ mabda declares **no `path =` dep entries at all**, so
+  the path-wins-over-tag hazard that bites sibling repos does not apply here.
+
+### Metrics
+- CPU suites **4958 passed / 0 failed / 18 suites** — identical to the 4.0.8 tally.
+- Fuzz **3/3 PASS** · bench **1 passed, 0 failed** · lint **0 warnings** · fmt **0 drift**.
+- Hardware, real Cezanne: `native-spirv-compute-e2e`, `native-spirv-divergent-if-e2e`,
+  `native-mipmap-e2e`, `native-spirv-f64-div-e2e` — **4/4 rc=0**.
+- `cyrius distlib` idempotent; `dist/mabda.deps` byte-identical (17 leaves).
+
+### Not in this release
+- ⚠ **`deps/fetch-wgpu.sh:6` pins wgpu-native `v29.0.0.0`; upstream latest is `v29.0.1.1`.** Left
+  deliberately. It is outside the Cyrius manifest graph, its artifacts are gitignored, and the
+  wgpu backend is **not exercised by CI at all** — bumping an untested FFI dependency inside a
+  patch whose thesis is "no output changes" is the wrong trade. Track it as its own change.
+- **`gfx9_rsrc1_ex(vgpr_hw, sgpr_hw, extra_sgpr, ieee_mode)`** — parameterising the reservation
+  budget and IEEE_MODE is new public API and therefore a **minor (4.1.0)**, not this patch. No
+  consumer needs it today.
+
 ## [4.0.8] — 2026-07-30
 
 **Toolchain maintenance: cyrius pin 6.4.64 → 6.5.3 — a 26-release span that crosses a
