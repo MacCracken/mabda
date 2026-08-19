@@ -30,7 +30,10 @@ paths.
 - **Architecture overview + file layout** — `docs/architecture/overview.md`
 - **Roadmap** — `docs/development/roadmap.md`
 - **Toolchain quirks cheat-sheet** — `docs/development/2026-04-30-toolchain-issues.md`
-  (cyrius lint/fmt 128 KiB cap, the `fncall6`-into-extern-C `%fs`/TLS
+  (Class A 128 KiB lint/fmt cap — RESOLVED at cyrius 6.2.20; ⚠ since 6.5.28
+  `cyrius fmt <file>` REWRITES IN PLACE and `--dry`/`--check` print a
+  diagnostic rather than source, so `cyrius fmt f > f` now DESTROYS f; the
+  `fncall6`-into-extern-C `%fs`/TLS
   gotcha — a misdiagnosis resolved in 6.3.26, `var X;` rejection,
   global init order, logical right shift, bump allocator exhaustion in
   tests — read before tripping a toolchain wire)

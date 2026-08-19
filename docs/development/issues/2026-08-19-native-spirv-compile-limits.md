@@ -4,7 +4,7 @@
 **Placement:** `src/spirv_lower.cyr` / `src/gfx9_isel.cyr` / register allocation.
 **Discovered:** 2026-08-19, ranga M6 (11 of 14 kernels landed; the rest blocked on this)
 **Severity:** **Medium-High** — every failure mode below is a silent `return 0`. No code, no message, no log.
-**Affects:** mabda 4.0.9, native AMD (amdgpu/GFX9), HW: Cezanne (gfx90c)
+**Affects:** mabda 4.0.9–4.0.10, native AMD (amdgpu/GFX9), HW: Cezanne (gfx90c)
 
 ## Summary
 

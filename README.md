@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.0.9 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.0.10 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -85,7 +85,7 @@ for the full wiring. (The C launcher + `wgpu_ffi_init_table` shown above are the
 launcher.)
 
 Extra deps opt in via compile flags: **PNG / JPEG asset loading**
-(`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 0.3.0) + stdlib
+(`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 0.3.1) + stdlib
 `thread`/`sankoch` (include their `lib/*.cyr` before `mabda`); **logind master
 delegation** (`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 0.4.1). A minimal
 consumer needs none — the dist compiles those paths out without the flags.
@@ -189,7 +189,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.5.20+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.5.29+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -251,7 +251,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.0.9
+├── VERSION              4.0.10
 └── CHANGELOG.md
 ```
 

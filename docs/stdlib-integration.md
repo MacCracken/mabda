@@ -24,7 +24,7 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "6.5.20"
+cyrius = "6.5.29"
 
 [build]
 entry = "src/main.cyr"
@@ -38,7 +38,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.0.9"
+tag = "4.0.10"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -64,7 +64,7 @@ you don't need the dep:
   ```cyml
   [deps.chitra]
   git = "https://github.com/MacCracken/chitra.git"
-  tag = "0.3.0"
+  tag = "0.3.1"
   modules = ["dist/chitra.cyr"]
   ```
 
@@ -175,7 +175,7 @@ runnable project.
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.0.9 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.0.10 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

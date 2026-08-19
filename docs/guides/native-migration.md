@@ -1,6 +1,6 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0; still applicable through 4.0.9 (see the
+> Written against mabda 3.0.0; still applicable through 4.0.10 (see the
 > v4.0.1 update below for what changed). Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a

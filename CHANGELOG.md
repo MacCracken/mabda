@@ -13,6 +13,304 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.0.10] — 2026-08-19
+
+**A currency cut: toolchain pin 6.5.20 → 6.5.29, chitra 0.3.0 → 0.3.1, and a 73-file
+`cyrfmt` reflow that the pin move made mandatory.** No behaviour change — **4958 assertions
+across 18 CPU suites**, byte-for-byte the same tally as 4.0.9, every suite gated on its own
+exit code rather than a grep for `failed`. `dist/mabda.cyr` moves 353 lines, of which
+**349 are whitespace**: `git diff --ignore-all-space` over the bundle reduces to exactly
+four — the version banner and three `[deps.chitra] tag=` comments in the bundled
+`asset_load.cyr`.
+
+### Changed — `cyrius = "6.5.29"` in `cyrius.cyml` (was 6.5.20)
+
+⛔ **The old pin described a build nobody ran — the same failure mode 4.0.9 fixed, recurred.**
+`~/.cyrius/bin` is a symlink to `versions/<current>/bin` and the `cyrius` driver does not
+re-resolve `cycc` per manifest pin, so with 6.5.29 installed every `cyrius build` at pin
+6.5.20 printed `toolchain drift` and was in fact **cycc 6.5.29 driving a 6.5.20-era `lib/`**.
+Upstream cyrius's own 6.5.29 CHANGELOG flags mabda's 6.5.20 pin as rot and names it a
+closeout sweep; this is that sweep.
+
+- **Blast radius measured from `cyrius.lock`, not assumed.** The lock hashes every file
+  `cyrius deps` lays down, so it is the only honest oracle here. Six resolved files changed
+  content and three appeared; **39 → 42 locked**.
+  ⚠ **Two bumps land in the same lockfile, and crediting the wrong one is easy** — an
+  earlier draft of this entry did exactly that. Split by actual cause:
+  - **Toolchain (6.5.21..6.5.29):** `dynlib`, `sankoch`, and three `syscalls_*` peers riding
+    along with the `syscalls` dispatcher — `aarch64_linux`, `macos`, `windows`. Of the 16
+    modules named in `[deps].stdlib`, only `dynlib` and `sankoch` moved.
+    ⭐ `syscalls_x86_64_linux.cyr` — the peer this repo's only build target actually
+    resolves — is **byte-identical**, which is why a 9-patch toolchain jump moves zero
+    assertions. (And note `aarch64_linux` *is* a Linux peer; the distinction that matters
+    is x86_64 vs not, not Linux vs not.)
+  - **chitra (0.3.0 → 0.3.1):** `chitra.cyr`, plus all three new entries —
+    `assert`, `bench`, `flags`. Those are **not** new to the toolchain; they are present in
+    the 6.5.20 snapshot too. They entered the lock because **chitra 0.3.1 ships a `.deps`
+    sidecar and 0.3.0 shipped none** (its `dist/` held only `chitra.cyr`), and that sidecar
+    declares them as leaves.
+- ⚠ **`cyrius.lock` is tracked but gated by nothing** — not CI, not the Makefile — so a bad
+  resolve rewrites it silently. That warning was carried in the 4.0.9 manifest comment this
+  cut rewrote; it is restored verbatim in intent, because the hazard was never fixed, only
+  survived.
+- ⚠ **6.5.28 made `cyrius fmt` REWRITE IN PLACE** (it was stdout-only) and redefined
+  `--dry` as a *report*, not a formatted dump. The long-standing workaround of piping
+  `cyrius fmt f.cyr` into the file is now actively wrong — plain `fmt` already writes it,
+  and `--dry` would overwrite the file with a four-line diagnostic. mabda's Makefile and CI
+  use `fmt --check` only, which is unaffected; the manifest comment says so, so nobody
+  re-introduces it.
+- ⚠ **6.5.24 + 6.5.29 together made the `assigning non-pointer to typed pointer` warning
+  reachable for the first time** — `.24` fixed its sign (it had been testing `lt > 0` where
+  the pointer case is stored negative, so it fired on width/float locals and never on a real
+  typed pointer) and `.29` stopped it firing on the `&x` idiom. Build re-verified **0
+  warnings** at the new pin; the drift note is likewise gone.
+- ⚠ The 6.5.4→6.5.20 span's semantic changes (regalloc NOP-compactor corrupting
+  switch/match jump tables; `break` gaining C semantics) still cannot reach mabda — it
+  contains no Cyrius `switch`/`match` and no `#derive` in `src/`, `programs/`, `tests/` or
+  `fuzz/`. Re-checked, not carried forward on faith.
+
+### Changed — 73 files reformatted by 6.5.28's paren-aware `cyrfmt`
+
+6.5.28 fixed a defect in cyrfmt itself — *"cyrfmt never tracked parentheses, so its own
+output failed its own `--check`"* — so it now enforces a continuation indent of 2 spaces per
+open paren (4 also accepted). **73 of 183 `.cyr`/`.tcyr`/`.bcyr`/`.fcyr` sources drifted**
+against it: 24 in `src/`, 33 in `programs/`, 16 in `tests/`.
+
+⚠ **This is not cosmetic bookkeeping — it is a CI gate.** The fmt gate installs the *pinned*
+toolchain, so moving the pin without the reflow would have shipped a red CI on the very
+commit that bumps it. The two are one change.
+
+⭐ **Proven whitespace-only, which is the whole safety argument.** `cyrius fmt` now edits
+files in place, and two of the 73 (`tests/tcyr/native.tcyr` at 216,256 B and
+`src/backend_native.cyr` at 169,742 B) sit **above the 128 KiB ceiling** at which older
+cyrius `lint`/`fmt` silently truncated — a trap this repo has been bitten by before.
+Immediately after the sweep, `git diff --ignore-all-space` over `src/ programs/ tests/
+fuzz/` was **empty** and **no file's line count changed**, so no content was dropped and the
+cap is confirmed gone. An eyeballed diff could not have established either.
+
+⚠ **That proof is scoped to the reflow, not to the release.** The final tree does show two
+`--ignore-all-space` hits under `src/` — `asset_load.cyr` and `lib.cyr` — because the
+chitra tag-string edits below landed *after* the reflow. Re-running the check now and
+finding it non-empty is expected; the sequence, not the end state, is what establishes the
+formatting change touched no content.
+
+### Changed — `[deps.chitra]` tag `0.3.0` → `0.3.1`
+
+Upstream cut is a documentation/language-pin pass over the same decoders — the PNG surface
+`asset_load.cyr` consumes (color types 0/2/3/4/6 @ depth 8, tRNS, Adam7) and the baseline
+JFIF JPEG surface behind `-D MABDA_JPEG` are unchanged, so both loaders keep their existing
+assertions (`asset_load` 184, unmoved). `[deps.samvada]` stays at **0.4.1** — verified
+against the GitHub tag list as still the newest, not assumed.
+
+⚠ The tag string is duplicated in **bundled source comments** (`src/asset_load.cyr`) as well
+as the manifest, so this bump does change `dist/mabda.cyr`. `src/lib.cyr` carries it too but
+is the include root and is *not* bundled.
+
+### Changed — provenance-stamp refresh
+
+`README.md` (`Version:`, the `Requires Cyrius` floor, the file-tree `VERSION` line, the
+chitra tag), `CONTRIBUTING.md`'s Cyrius floor, `docs/stdlib-integration.md`, the three
+`docs/guides/{usage,integration,render-graph}.md` "Written against" headers plus their
+`[deps.mabda]` snippets, `docs/guides/native-migration.md`'s applicability range,
+`examples/stdlib-consumer/{cyrius.cyml,README.md,src/main.cyr}`, and the roadmap's baseline
+banner + prune record.
+
+⚠ Swept by grepping the **bare** version strings across every file type including `*.cyr`,
+because dep-tag lines (`tag = "0.3.0"`) do not contain the dep's name and live refs hide in
+`.cyr` header comments that feed `dist/`. Historical refs were deliberately left alone —
+`src/gfx9_abi.cyr`'s "Corrected 4.0.9" credit, the roadmap's v4.0.3 prune record naming
+chitra 0.3.0, and every CHANGELOG entry.
+
+### Fixed — the toolchain cheat-sheet's formatting advice, stale in both directions
+
+`docs/development/2026-04-30-toolchain-issues.md` **A1** told contributors to fix
+formatting with `cyrius fmt $f > $f.fmt && [ line counts match ] && mv $f.fmt $f`, and
+`CLAUDE.md` pointed at it as the cheat-sheet. Both are corrected, and A1 now carries a
+**measured behaviour table** — every row actually run against 6.5.29 rather than reasoned
+from the upstream changelog.
+
+That distinction earned its keep, because the obvious reading of "6.5.28 made `fmt` rewrite
+in place" is **wrong**:
+
+| Command | Measured effect on 6.5.29 |
+| --- | --- |
+| `cyrius fmt f.cyr` | rewrites `f.cyr` in place, formatted; prints nothing; `rc=0` |
+| `cyrius fmt f.cyr > f.new` | `f.cyr` correctly formatted in place, `f.new` **0 bytes** — the line-count guard can never pass, so the `mv` never runs. **Litter, not damage.** |
+| `cyrius fmt f.cyr > f.cyr` | ⛔ **destroys `f.cyr`** — the shell truncates it before cyrfmt opens it, and `cyrfmt: cannot read file` becomes the file's entire contents |
+| `cyrius fmt f.cyr --dry` / `--check` | diagnostic only; file untouched |
+
+⭐ **So A1's original warning — "never run `cyrius fmt $f > $f` blindly" — was right, and is
+now *more* dangerous than when written**, since the self-redirect leaves plausible-looking
+text where source used to be. The `$f.fmt`-plus-guard half is merely obsolete: it cannot
+damage anything, it just no longer does what it was written to do. An earlier draft of this
+entry asserted the guard idiom was destructive; running it proved otherwise, and the
+corrected form is above.
+
+A1 is also marked **resolved upstream at cyrius 6.2.20** — verified by reading
+`cyrius/programs/cyrfmt.cyr`, not inferred: `_MAX_FILE` is **1,052,672** bytes in both
+cyrfmt and cyrlint, and a ceiling-hitting read now **fails loud** instead of format-checking
+a truncated buffer. The stale "split `backend_native.cyr` to unblock the fmt gate" punchlist
+item retires with it; that split is now a readability question, not a toolchain one.
+
+⚠ CI and the Makefile were already correct (exit-code `fmt --check`, no size guard) — the
+defect was documentation-only, which is exactly why nothing caught it.
+
+### Added — the ranga M6 native-SPIR-V filing is tracked, not merely filed
+
+`docs/development/issues/2026-08-19-native-spirv-compile-limits.md` now has a **roadmap
+backlog entry scheduled to v4.0.11**, and its `Affects:` line reads `4.0.9–4.0.10` rather
+than `4.0.9` — this cut does not fix it, and a stale affects-range would read as if it did.
+
+⚠ **Explicitly NOT addressed in 4.0.10.** `gpu_shader_module_create_spirv` still returns a
+bare 0 for `OpFDiv`, `OpSelect` and nested selections, and still compiles an early
+`OpReturn` inside a selection into a shader that dispatches rc=0 and writes nothing; the
+allocator still gives up on register pressure at ~201 ids against a 256-id cap.
+
+### Added — a second issue filed from this cut's hardware sweep
+
+Running the native HW gates for the closeout turned up a **red gate nobody had been
+running**: `make test-native-spirv-saxpy-e2e` fails at compile with
+`gfx9_compile rc=-25` (`MIR_ERR_ID_OOR`) on Cezanne. Filed as
+`docs/development/issues/2026-08-19-native-saxpy-e2e-mir-id-oor.md` and scheduled to
+**v4.0.11** alongside the ranga M6 filing.
+
+⛔ **Not introduced here, and proven so rather than asserted.** Reproduced with the
+identical `rc=-25` from clean detached worktrees at **4.0.5, 4.0.7, 4.0.8 and HEAD** — so
+it predates the 6.5.29 pin, the 6.5.20 pin, and the `cyrfmt` reflow alike.
+
+⛔ **Not the known undersized-test-buffer trap either.** A scratch probe with *every*
+capacity raised ~4× at once (`CC_CAP_IDS` 26→100, mir `cap_ids` 40→160, `cap_instrs`
+32→128, and the `vals`/`instrs`/`types`/`consts`/`deco`/`outbi`/`isel`/`alloc`/`ptrs`/`isa`
+buffers scaled to match) fails byte-identically, which points at the lowering rather than
+the test's stack budget.
+
+⚠ **The reason it survived four releases is the more general finding.**
+`test-native-spirv-saxpy-e2e` is a standalone Makefile target belonging to no aggregate —
+not `test-all`, not `test-gpu`, and not either of the two native gates CLAUDE.md's closeout
+names. The 71 `test-native-*` targets have **no roll-up**, so "the native HW suite passes"
+is not a statement anyone can make in one command. A tallying roll-up target is part of the
+v4.0.11 scope.
+
+⭐ Everything else on the box is green at this commit: `test-native-compute-store`,
+`test-native-spirv-compute-e2e`, `test-native-spirv-downsample-e2e` (**also two bindings**,
+pixel-matching CPU), `test-native-spirv-f64-arith-e2e` (8 lanes bit-exact),
+`test-native-render-e2e`, and `test-native-kms-summary` (render → PRIME → master AddFB2).
+So this is narrowly scoped, and multi-binding alone is not the trigger.
+
+### Fixed — `SECURITY.md`'s audit index listed 1 of 13 audits
+
+Closeout item 8 is "audit index up to date"; it was not. The table carried only the
+**2026-04-19 (2.3.0)** row while `docs/audit/` holds **thirteen** reports through
+2026-07-02 (v4.0.1) — including the **1 CRITICAL** asset-loading parser finding at 3.3.0,
+which is precisely the row a reader consulting a SECURITY file most needs to see. The
+prose under it was stale in the same direction, still saying "from 2.4.0 through 2.5.x"
+and "the next full audit pass will land alongside the v3.0 backend swap" — a swap that
+shipped four minors ago — and still pointing at `tests/tcyr/mabda.tcyr`, a file that no
+longer exists since the suites were split by domain.
+
+All thirteen rows are now listed with date, release, and findings, each read out of the
+report rather than reconstructed from memory. The prose says what is actually true: no new
+full audit since 4.0.1 because the 4.0.x line has been maintenance and consumer work with
+no new untrusted-input surface, and the next one is **due with v4.0.11**, which does touch
+a parser consuming consumer-supplied SPIR-V.
+
+### Not in this release — wgpu-native stays at `v29.0.0.0`, now for a measured reason
+
+4.0.9 deferred the `v29.0.1.1` bump as "an untested FFI dependency". This cut is a currency
+cut, so the deferral was re-examined rather than repeated — and the risk turns out to be
+worse than untested. Filed as
+`docs/development/issues/2026-08-19-wgpu-native-29011-breaking.md` and **scheduled v4.1.0**.
+
+⛔ **The version number lies: `29.0.0.0 → 29.0.1.1` is not a patch.** Both headers were
+diffed. `webgpu.h` is **purely additive with zero removals**, so no `wgpu_descriptors.cyr`
+offset moves. But `wgpu.h` — the native-extensions header — **renumbers the entire
+`WGPUSType_*` block** (`PipelineLayoutExtras` deleted; everything after shifts down one, so
+`InstanceExtras` goes `0x00030006` → `0x00030004`), **deletes
+`WGPUNativeFeature_SpirvShaderPassthrough`** at `0x00030017` with `ClearTexture` reusing the
+slot, drops the `WGPUPipelineLayoutExtras` struct, reshapes `WGPUNativeLimits`, and moves
+the 16-bit-norm texture formats into the core namespace.
+
+Against mabda that is two concrete breaks: `deps/wgpu_main.c:75-76` names
+`WGPUNativeFeature_SpirvShaderPassthrough` and so **would not compile**, and
+`src/backend_wgpu.cyr:1166` hardcodes `0x00030017` as a **bare numeric literal** and so
+would silently request `ClearTexture` instead — no error, no diagnostic.
+
+⭐ **The transferable lesson is the asymmetry between those two.** Every site that spells
+the constant as a **name** survives an upstream renumber; the single site that hardcodes the
+**number** silently does the wrong thing. Cyrius cannot include `wgpu.h`, so a literal is
+unavoidable there — which makes a version-pinned comment on it a v4.1.0 work item, along
+with grepping `src/` for other bare `0x0003xxxx` values.
+
+⚠ The evaluation was run entirely in a scratch directory. `deps/wgpu-native/` is
+**gitignored**, so unpacking a new release over it would leave no diff to notice and nothing
+to `git checkout` back — verified afterwards that the in-repo tree is byte-identical to its
+backup, and `make test-phase0` still passes **12/12**.
+
+### Fixed — three gate/doc gaps an adversarial review pass surfaced
+
+The release diff was run through a multi-agent review before hand-off. Most filings were
+refuted on verification; these survived and are fixed here.
+
+- **`fuzz/*.fcyr` was in no lint or fmt gate.** The CI and Makefile globs covered
+  `src/`, `programs/`, `tests/tcyr/` and `tests/bcyr/` but never `fuzz/`, so its three
+  harnesses could drift indefinitely. ⭐ Not hypothetical: this very release reformatted
+  **73** files after a cyrfmt fix, and nothing would have told us if a fuzz harness were
+  among them. All three verified lint- and fmt-clean *before* being added, so the gate
+  goes in green rather than red.
+- **`scripts/version-check.sh` claimed a comparison it does not make.** It printed
+  `consistent across VERSION, cyrius.cyml, CHANGELOG.md` unconditionally — but the
+  manifest is only diffed when it inlines a literal version, and mabda's uses the
+  templated `version = "${file:VERSION}"` form, so cyrius.cyml is *never* compared. It
+  also silently omitted `README.md`, which it genuinely does check. The line now names
+  exactly what ran: `VERSION, CHANGELOG.md, README.md`.
+- **Three source comments justified a structural split by a constraint that expired.**
+  `src/lib.cyr`, `src/backend_native_amdgpu.cyr` and `tests/tcyr/backend.tcyr` each
+  explained a file split as "to keep each under cyrius lint/fmt's 128 KiB read-buffer
+  cap" — a cap raised to 1028 KiB at cyrius 6.2.20. ⭐ The rationale had in fact stopped
+  holding even earlier: `src/backend_native.cyr` is **169 KiB** today, so the split never
+  achieved the stated goal. All three now say the split stands on module cohesion, and
+  warn against citing the cap as a reason to split further. `backend.tcyr`'s note also
+  pointed at `tests/tcyr/mabda_v3_phase_d.tcyr`, **a file that no longer exists** — those
+  tests live in `kms.tcyr`.
+
+### Metrics
+
+- **Assertions: 4958** across 18 CPU suites (4.0.9: 4958) — unchanged, counted with
+  `scripts/count-test-assertions.sh`, which strips the leading NUL on `texture.tcyr`'s
+  summary that makes a naive `make test | grep` undercount by 210.
+- **`dist/mabda.cyr`: 26,725 lines / 1,260,887 bytes** (`wc`), `dist/mabda.deps`: 17 stdlib
+  leaf requirements. ⚠ `cyrius distlib` prints **26,556** for this same file — that is its
+  own internal metric, **not** a line count, and quoting it as one is a recurring error.
+  ⚠ The bundle is also past cyrfmt's 1028 KiB `_MAX_FILE`, so
+  `cyrius fmt dist/mabda.cyr --check` **fails loud** with `file too large to
+  format-check`. That is correct and not a gate failure: `dist/` is deliberately excluded
+  from the fmt gate in both CI and the Makefile, and is gated on `cyrius distlib`
+  **idempotency** instead.
+- **`cyrius.lock`: 42 deps locked**, 2 commit-pinned (was 39).
+- **Bench (CPU, settled box):** `color_lerp` 52 ns · `color_from_hex` 24 ns ·
+  `color_luminance` 11 ns · `workgroups_1d` 3 ns · `workgroups_2d` 6 ns ·
+  `profiler_frame_cycle` 2.643 µs · `capabilities_report` 35 ns ·
+  `rg_plan_aliasing_stats_5` 814 ns · `rg_plan_aliasing_stats_30` 6.703 µs.
+- **Gates:** smoke build 0 warnings · `cyrius lint` 0 warnings / 0 untracked deferrals
+  across all 57 `src/*.cyr` · `cyrius fmt --check` clean on all 183 sources ·
+  `cyrius vet` 1 dep / 0 untrusted / 0 missing · 18/18 suites `rc=0` ·
+  `cyrius distlib` regenerates diff-clean · `scripts/version-check.sh` passes.
+
+### Next
+
+**v4.1.0 — the wgpu-native `v29.0.1.1` bump** (see the roadmap's new v4.1.0 section), which
+is a minor because `deps/wgpu_main.c` is consumer-copied and any change to it forces every
+consumer to rebuild their launcher. `gfx9_rsrc1_ex` rides along as the other new-public-API
+item a patch could not carry.
+
+**v4.0.11 — the two native SPIR-V→GFX9 filings, worked together.** Diagnostic first (a
+reason code, so a rejected module stops costing a hardware bisect) — which also makes the
+saxpy `-25` self-describing — then rejecting the early-return no-op outright, then
+`OpFDiv`, then a documented liveness budget or spilling. Plus the two gaps this cut's
+sweep exposed: a CPU assertion covering the saxpy kernel so the fix is defended without
+hardware, and a roll-up `test-native-*` target with a tally so a red HW gate cannot hide
+for four releases again.
+
 ## [4.0.9] — 2026-08-13
 
 **A latent register-aliasing hazard in the GFX9 regalloc ceiling, plus a toolchain pin bump

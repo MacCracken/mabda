@@ -2,6 +2,7 @@
 
 **Date filed:** 2026-04-30 (v3.0.0-rc.1 cut)
 **Toolchain at filing:** `cyrius 5.7.48` (mabda's pin at filing; bumped to `5.11.28` 2026-05-12 ahead of rc.3 soak)
+**Last re-checked against:** `cyrius 6.5.29` (mabda 4.0.10, 2026-08-19) — Class A now resolved upstream; see A1.
 **Audience:** mabda contributors + the cyrius toolchain team. Each
 entry is the smallest reproducible footprint we hit; cross-referenced
 to the deeper bug reports in `docs/development/issues/` and the
@@ -17,31 +18,57 @@ toolchain quirks you'll hit" cheat sheet.
 
 ## Class A — Silent truncation of large files
 
-### A1. `cyrius lint` and `cyrius fmt` cap reads at 128 KiB
+### A1. `cyrius lint` and `cyrius fmt` cap reads at 128 KiB — ✅ **RESOLVED upstream (6.2.20)**
 
-- **Symptom**: lint reports bogus "unclosed braces at end of file"
-  warnings near the end of files >131,072 bytes; fmt drops the
-  end-of-file content (its stdout is shorter than the input by
-  the bytes-past-131072), so any redirect-back-to-file destroys
-  data.
-- **Affected today**: `src/backend_native.cyr` (137 KiB).
-- **Workaround in tree**: CI fmt-check skips files >128 KiB
-  (`.github/workflows/ci.yml`). Splitting `backend_native.cyr` into
-  smaller modules to drop the workaround is in the rc.2 punchlist.
-- **Workaround for local dev**: never run `cyrius fmt $f > $f`
-  blindly. Use the line-count guard pattern:
-  ```sh
-  cyrius fmt $f > $f.fmt && \
-    [ $(wc -l < $f) = $(wc -l < $f.fmt) ] && \
-    mv $f.fmt $f || { echo "REJECT truncation"; rm -f $f.fmt; }
-  ```
-- **Memory note**: `feedback_cyrlint_128k_buffer_cap.md` — covers
-  both lint and fmt since they share the buffer-cap bug class.
-- **Upstream**: distlib has the same bug class; it was fixed in
-  cyrius 5.7.36 (`cbt/commands.cyr` raised 64K → 256K). lint and
-  fmt need the same treatment. Real fix: bump the buffer to
-  ≥524288 (matching distlib's 256K precedent — actually 4× because
-  fmt produces output that may be larger than the input).
+> ⚠ **This entry is history, and the workaround it used to recommend is
+> now dead code** — but be precise about *why*, because the obvious
+> reading is wrong. Re-verified against 6.5.29 during the mabda 4.0.10
+> cut (2026-08-19); see the measured behaviour table below.
+
+- **Original symptom** (cyrius ≤ ~5.7.48): lint reported bogus
+  "unclosed braces at end of file" warnings near the end of files
+  >131,072 bytes; fmt dropped the end-of-file content, so any
+  redirect-back-to-file destroyed data. On 2026-04-30 a fmt sweep
+  turned `src/backend_native.cyr` (3,088 lines) into 2,947 lines,
+  silently losing `NATIVE_RT_STRUCT_SIZE` and the `native_rt_*` fns.
+- **Fix upstream**: cyrius **6.2.20** raised `_MAX_FILE` in *both*
+  `programs/cyrfmt.cyr` and `programs/cyrlint.cyr` to **1,052,672**
+  bytes (1028 KiB) *and* made a ceiling-hitting read **fail loud**
+  (`cyrfmt: file too large to format-check (>1028KB) — raise _MAX_FILE`)
+  rather than format-check a truncated buffer. Both halves of the bug
+  are gone: 8× headroom, and no silent path.
+- **Verified in tree**: the 4.0.10 reflow ran in-place `cyrius fmt`
+  over 73 files including `tests/tcyr/native.tcyr` (216,256 B) and
+  `src/backend_native.cyr` (169,742 B) — both far past the old line.
+  `git diff --ignore-all-space` over `src/ programs/ tests/ fuzz/`
+  came back **empty** with zero line-count change anywhere.
+- **Consequently retired**: the CI size guard (already gone from
+  `.github/workflows/ci.yml`), and the "split `backend_native.cyr` to
+  unblock the fmt gate" punchlist item — that split is now a
+  readability question, not a toolchain one.
+- **Measured behaviour on 6.5.29** (each row actually run, not inferred):
+
+  | Command | Effect |
+  | --- | --- |
+  | `cyrius fmt f.cyr` | rewrites `f.cyr` in place, formatted. Prints **nothing**. `rc=0`. **This is the apply path.** |
+  | `cyrius fmt f.cyr --check` | diagnostic naming the first differing line; file untouched. Drift by **exit code** — and it can exit non-zero printing nothing. |
+  | `cyrius fmt f.cyr --dry` | same diagnostic plus `WOULD reformat`; file untouched. **Not** a source dump. |
+  | `cyrius fmt f.cyr > f.new` | `f.cyr` gets correctly formatted in place; `f.new` is **0 bytes**. The old line-count guard can therefore never pass, so the `mv` never runs. **Litter, not damage.** |
+  | `cyrius fmt f.cyr > f.cyr` | ⛔ **DESTROYS `f.cyr`.** The shell truncates it to 0 before cyrfmt opens it; cyrfmt then fails and the 25-byte string `cyrfmt: cannot read file` becomes the file's entire contents. `rc=1`. |
+
+  ⭐ **So A1's original warning — "never run `cyrius fmt $f > $f` blindly" — was
+  right, and is now *more* dangerous than when it was written**, since the
+  redirect-onto-self case leaves plausible-looking text rather than a short file.
+  The `$f.fmt`-plus-guard half of the advice, by contrast, is merely obsolete: it
+  cannot damage anything, it just no longer does what it was written to do.
+- **Current correct practice**: `cyrius fmt <file> --check` to detect,
+  `cyrius fmt <file>` to apply. Guard a bulk in-place sweep with
+  `git diff --ignore-all-space` being **empty** — not with a line count,
+  which the 4.0.10 sweep would have passed vacuously (73 files reformatted,
+  zero line-count change).
+- **Memory note**: `feedback_cyrlint_128k_buffer_cap.md` (marked
+  obsolete) and `feedback_cyrfmt_check_exit_code_not_stdout.md` (the
+  live one).
 
 ### A2. `cyrius fmt --check` writes formatted output to stdout
 unconditionally, NOT silent on no-drift
@@ -305,10 +332,14 @@ unconditionally, NOT silent on no-drift
 
 ## Forward outlook
 
-- The two Class A items (lint / fmt 128 KiB cap) are the most
-  immediate friction; they tax CI today and add manual workaround
-  steps to local dev. Bumping the toolchain buffers is small + high
-  leverage.
+- The two Class A items (lint / fmt 128 KiB cap) are **resolved
+  upstream at cyrius 6.2.20** — buffers raised to 1028 KiB and
+  truncation made fail-loud. They no longer tax CI and the local-dev
+  workarounds are retired; the entries are kept only so old logs and
+  old advice can be recognised as stale. ⚠ The single live hazard in
+  that area now points the other way: since 6.5.28 `cyrius fmt <file>`
+  REWRITES IN PLACE and `--dry`/`--check` emit a diagnostic rather than
+  source, so `cyrius fmt f > f` destroys `f` outright.
 - Class B (fncall ABI bugs) is partially mitigated by the wgpu C-
   shim layer, which retires per-vendor (AMD at v4.0.1, NVIDIA at
   v5.0, Intel/full at v5.1 — see roadmap). The fncall ABI bugs

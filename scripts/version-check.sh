@@ -39,7 +39,13 @@ if [ -f README.md ] && grep -q "^Version:" README.md; then
 fi
 
 if [ $fail -eq 0 ]; then
-    echo "  OK: version $FILE_VERSION consistent across VERSION, cyrius.cyml, CHANGELOG.md"
+    # Name only what was actually compared. The manifest is checked ONLY when it
+    # inlines a literal version; with the templated `version = "${file:VERSION}"`
+    # form there is nothing to diff, and claiming otherwise overstates the gate.
+    checked="VERSION, CHANGELOG.md"
+    grep -qE '^version = "[0-9]' cyrius.cyml && checked="$checked, cyrius.cyml"
+    [ -f README.md ] && grep -q "^Version:" README.md && checked="$checked, README.md"
+    echo "  OK: version $FILE_VERSION consistent across $checked"
 fi
 
 exit $fail

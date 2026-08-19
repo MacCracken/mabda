@@ -81,7 +81,7 @@ fuzz:
 .PHONY: lint
 lint:
 	@fail=0; \
-	for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do \
+	for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr; do \
 		out=$$($(CYRIUS) lint $$f 2>&1); echo "$$out"; \
 		echo "$$out" | grep -qE '^\s*warn ' && fail=1; \
 	done; \
@@ -94,7 +94,7 @@ fmt-check:
 	@# formatted file to stdout the way 5.x did, so the old diff-against-stdout
 	@# gate false-failed every file. Mirror CI (.github/workflows/ci.yml).
 	@fail=0; \
-	for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr; do \
+	for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr; do \
 		if ! $(CYRIUS) fmt $$f --check > /dev/null 2>&1; then \
 			echo "needs fmt: $$f"; fail=1; \
 		fi; \
