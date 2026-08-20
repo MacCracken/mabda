@@ -1,6 +1,7 @@
 # `native_spirv_saxpy_e2e` has been red since at least 4.0.5 — `gfx9_compile` returns `MIR_ERR_ID_OOR`
 
-**Status:** 🟡 **OPEN** — found running the HW gates during the 4.0.10 closeout sweep.
+**Status:** ✅ **FIXED in v4.0.11** — root-caused, repaired, HW-verified, and defended by
+both a runtime self-check and a static CI gate. See "Resolution" at the end.
 **Placement:** `src/mir.cyr` / `src/spirv_lower.cyr` / `src/gfx9_isel.cyr` — the same
 subsystem as [`2026-08-19-native-spirv-compile-limits.md`](2026-08-19-native-spirv-compile-limits.md),
 and plausibly the same root cause. Schedule the two together.
@@ -41,7 +42,27 @@ produced an unresolved (0) id", which would be a genuine defect rather than a
 provisioning problem. Instrumenting the three sites to print which one fired is the
 cheapest possible first step and should be step 1 of the fix.
 
-## It is NOT the known under-provisioned-test-buffer trap
+## ⛔ CORRECTION — it IS the under-provisioned-test-buffer trap
+
+**The section below was WRONG, and the way it was wrong is the most useful thing in this
+file.** It claimed measurement had ruled out the known undersized-buffer failure mode. It
+had not: the probe scaled the buffers **and the capacities together**, by the same ~4×
+factor. `vals[1440] / cap_ids 40` (deficit 160 B) became `vals[5760] / cap_ids 160`
+(deficit 640 B) — the deficit did not close, it **grew**. The probe reproduced the bug and
+was read as exonerating it.
+
+⭐ **A scaling probe cannot falsify a proportional invariant.** The requirement here is
+`vals >= cap_ids * MIR_VAL_REC`; multiplying both sides by 4 preserves the violation
+exactly. The probe needed to raise the buffer *alone*, holding `cap_ids` fixed — which is
+what finally settled it: `vals[1440] -> vals[1600]` with everything else untouched, and
+the kernel compiled and ran correctly on Cezanne first try.
+
+The original (incorrect) reasoning is preserved below, unedited, because "I measured it"
+is exactly the kind of claim that stops further questioning.
+
+---
+
+## ~~It is NOT the known under-provisioned-test-buffer trap~~ (superseded — see above)
 
 This repo has a documented failure mode where undersized `vals`/`instrs`/`alloc`
 buffers let `mir_mod_init`/regalloc `memset` past them and produce a bogus late error.
@@ -63,9 +84,9 @@ A scratch copy of the program was built outside the repo with **every** capacity
 | `ptrs[]` | 256 | 1024 |
 | `isa[]` | 512 | 2048 |
 
-**Result: byte-identical failure, `rc=-25`.** So either the id is `<= 0` (site 1), or
-something is producing an id ≥ 160 for a kernel whose SPIR-V id bound is 25 — and both
-readings point at the lowering, not at the test's stack budget.
+**Result: byte-identical failure, `rc=-25`.** ⚠ Read at the time as exonerating the
+buffers. It did the opposite — see the correction above: `vals[5760]` against `cap_ids
+160` still needs 6400 B, so the probe carried the same defect forward.
 
 To rebuild the probe: copy `programs/native_spirv_saxpy_e2e.cyr` to a scratch directory,
 apply the right-hand column above, and `cyrius build <scratch>/saxpy_probe.cyr` from the
@@ -157,3 +178,59 @@ self-describing, which is why they should be worked together.
   disjoint-range comment at `src/gfx9_compile.cyr:26` is the map for decoding any other
   code seen here (mir 20-25, lower 26-27, regalloc 50-52, waitcnt 60-61, gisel 100-101,
   cmp 70-87).
+
+---
+
+## Resolution (v4.0.11)
+
+**Root cause.** `mir_mod_init` ends with `memset(vals, 0, cap_ids * MIR_VAL_REC)` — it
+writes the caller's full declared capacity into a buffer whose size it receives only as a
+bare pointer and therefore cannot check. This program declared `vals[1440]` while passing
+`cap_ids = 40`, needing `40 * 40 = 1600`. The 160-byte overrun landed on the `MirMod`
+header declared immediately after it on the stack and **zeroed `m + 64` — the `cap_ids`
+field itself**. Every subsequent id then failed `id >= cap_ids` against a cap of `0`, and
+the compile reported `MIR_ERR_ID_OOR`: "your ids are out of range", when the ids were fine
+and the buffer was too small.
+
+⭐ **The misleading error is why this took four releases, not the bug.** `-25` sent the
+investigation into `spirv_lower`/`isel` — and even with the trap documented in project
+memory, the first probe (above) appeared to rule it out.
+
+**Fix — one line, four defences.**
+
+1. `programs/native_spirv_saxpy_e2e.cyr`: `vals[1440]` -> `vals[1600]`. HW-verified on
+   Cezanne: `isa_len=132 bindings=2`, all 8 lanes `y[i] = 3*i + 100`.
+2. **`MIR_ERR_MOD_UNINIT` (30)** — `_mir_set_val` and `mir_emit` now distinguish a
+   zeroed/uninitialized header (`cap_ids <= 0`, structurally impossible for a module
+   `mir_mod_init` accepted) from a genuine out-of-range id. ⚠ In `mir_emit` the guard had
+   to be moved **ahead of** the `n >= cap_instrs` test: a zeroed header has `cap_instrs ==
+   0` too, so checking that first reports `MIR_ERR_CAP_EXCEEDED` ("your program is too
+   long") — the same misdirection one layer over.
+3. **`MIR_ERR_VALS_OVERRUN` (31)** — `mir_mod_init` writes the header, memsets `vals`, then
+   **reads the header back**. A mismatch means the memset just erased it. Two loads, and it
+   names the real fault at the call that caused it.
+4. **`MIR_ERR_BAD_INIT` (32)** — `mir_mod_init` now validates null buffers, non-positive
+   capacities, `id_bound > cap_ids`, and `cap_ids > MIR_MAX_CAP_IDS`. ⚠ `id_bound ==
+   cap_ids` is **legal** (no synth headroom, which is what every hand-built-MIR test uses);
+   a first cut rejected it and broke three suites.
+5. **`scripts/check-compiler-buffer-sizing.py`** — a static gate over all 113 call sites,
+   wired into `make test-all` and CI. Both numbers are compile-time literals a few lines
+   apart, so this is checkable without running anything.
+
+**Mutation-proven, both directions.** Restoring `vals[1440]` makes the static gate exit 1
+naming the exact deficit, and makes `mir_mod_init` return `-31` with the compile returning
+`-30` instead of `-25`.
+
+**The sweep found more.** The gate flagged **134 further deficits** across 17 files —
+`instrs`, `ptrs`, `isel`, `isel2` — all grown to match their declared caps. Those are
+*latent* rather than active: unlike `vals` they are written on demand, so they only overrun
+once a kernel emits that many records. `vals` was the sole eager (unconditional) case in
+the tree, which is why it was the only one failing.
+
+⚠ **Still true and NOT fixed here:** `mir_mod_init`, `gfx9_regalloc`,
+`_spirv_resolve_builtins` and the three `spirv_build_*_table` builders all still memset a
+caller-supplied extent into a buffer they cannot measure. The runtime self-check covers only
+the layout where the header sits directly after `vals`; the static gate covers the general
+case but only for literal sizes it can parse. Passing explicit buffer lengths would make the
+invalid state unrepresentable — that is an `@internal` signature change across ~113 call
+sites, and it is filed for v4.1.0 rather than smuggled into a patch.

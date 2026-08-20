@@ -101,6 +101,15 @@ fmt-check:
 	done; \
 	[ $$fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
 
+# Static gate for the SPIR-V->GFX9 compiler's caller-provided scratch buffers.
+# Several pipeline stages memset a full caller-declared CAPACITY into a buffer
+# whose size they cannot see, so an undersized buffer silently overruns the
+# caller's stack. `native_spirv_saxpy_e2e` shipped that way for four releases
+# (4.0.5 -> 4.0.10). Both numbers are compile-time literals, hence a static gate.
+.PHONY: check-buffer-sizing
+check-buffer-sizing:
+	@./scripts/check-compiler-buffer-sizing.py
+
 .PHONY: vet
 vet:
 	$(CYRIUS) vet programs/smoke.cyr
@@ -114,7 +123,7 @@ version-check:
 	@./scripts/version-check.sh
 
 .PHONY: test-all
-test-all: version-check dist test fuzz
+test-all: version-check check-buffer-sizing dist test fuzz
 
 # ---------------------------------------------------------------------------
 # GPU integration tests (require wgpu-native + deps/wgpu_main.c shim)
@@ -556,6 +565,22 @@ build/native_spirv_f64_arith_e2e: programs/native_spirv_f64_arith_e2e.cyr src/*.
 test-native-spirv-f64-arith-e2e: build/native_spirv_f64_arith_e2e
 	./build/native_spirv_f64_arith_e2e
 
+build/native_spirv_loop_e2e: programs/native_spirv_loop_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_loop_e2e.cyr $@
+
+.PHONY: test-native-spirv-loop-e2e
+test-native-spirv-loop-e2e: build/native_spirv_loop_e2e
+	./build/native_spirv_loop_e2e
+
+build/native_spirv_f32_div_e2e: programs/native_spirv_f32_div_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_f32_div_e2e.cyr $@
+
+.PHONY: test-native-spirv-f32-div-e2e
+test-native-spirv-f32-div-e2e: build/native_spirv_f32_div_e2e
+	./build/native_spirv_f32_div_e2e
+
 build/native_spirv_f64_div_e2e: programs/native_spirv_f64_div_e2e.cyr src/*.cyr
 	@mkdir -p build
 	$(CYRIUS) build programs/native_spirv_f64_div_e2e.cyr $@
@@ -880,9 +905,14 @@ build/native_texture_sample_e2e: programs/native_texture_sample_e2e.cyr src/*.cy
 test-native-texture-sample-e2e: build/native_texture_sample_e2e
 	./build/native_texture_sample_e2e
 
+# ⚠ -D MABDA_PNG is REQUIRED: gpu_texture_load_png is opt-in (it pulls
+# [deps.chitra] + thread/sankoch), so without the flag it compiles out and this
+# gate fails with a bare "FAIL: load_png" that looks like a decoder bug. The flag
+# was missing from this recipe from the target's introduction until v4.0.11, when
+# `make test-native-all` surfaced the gate as red — it had simply never been run.
 build/native_load_png_e2e: programs/native_load_png_e2e.cyr src/*.cyr
 	@mkdir -p build
-	$(CYRIUS) build programs/native_load_png_e2e.cyr $@
+	$(CYRIUS) build -D MABDA_PNG programs/native_load_png_e2e.cyr $@
 
 .PHONY: test-native-load-png-e2e
 test-native-load-png-e2e: build/native_load_png_e2e
@@ -1148,6 +1178,61 @@ bench-gpu: build/benchmarks
 # Developer gate: run every GPU integration program in sequence.
 .PHONY: test-gpu
 test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e
+
+# ---------------------------------------------------------------------------
+# test-native-all — run every `test-native-*` gate and report a TALLY.
+#
+# ⛔ WHY THIS EXISTS: `test-native-spirv-saxpy-e2e` was RED from 4.0.5 through
+# 4.0.10 and nobody noticed, because it is a standalone target belonging to no
+# aggregate. There are 71 `test-native-*` targets and, before this, no way to ask
+# "does the native HW suite pass?" in one command — so the honest answer was
+# always "whichever ones I happened to run".
+#
+# Keeps going after a failure (that is the point — one red gate must not hide the
+# state of the other 70) and exits non-zero if any failed, naming each.
+#
+# Requires AMD hardware (/dev/dri/renderD128). CI cannot run this; it is a
+# developer gate, which is exactly why it needs to be one command.
+.PHONY: test-native-all
+test-native-all:
+	@targets=$$(grep -oE '^test-native[a-z0-9-]*:' $(MAKEFILE_LIST) | sed 's/://' | sort -u | grep -v '^test-native-all$$'); \
+	total=0; pass=0; failed=""; skipped=""; known=""; \
+	for t in $$targets; do \
+		total=$$((total+1)); \
+		printf '%-46s ' "$$t"; \
+		case " $(NATIVE_NEEDS_MASTER) " in *" $$t "*) \
+			printf 'SKIP  (needs DRM master)\n'; skipped="$$skipped $$t"; continue;; esac; \
+		case " $(NATIVE_KNOWN_FAIL) " in *" $$t "*) \
+			printf 'KNOWN-FAIL (filed - see docs/development/issues/)\n'; known="$$known $$t"; continue;; esac; \
+		if $(MAKE) --no-print-directory $$t > $(NATIVE_ALL_LOG) 2>&1; then \
+			printf 'PASS\n'; pass=$$((pass+1)); \
+		else \
+			printf 'FAIL\n'; failed="$$failed $$t"; \
+			tail -1 $(NATIVE_ALL_LOG) | sed 's/^/      /'; \
+		fi; \
+		rm -f $(NATIVE_ALL_LOG); \
+	done; \
+	echo; \
+	echo "native HW gates: $$pass passed, $$(echo $$failed | wc -w) failed, \
+$$(echo $$skipped | wc -w) skipped, $$(echo $$known | wc -w) known-fail  (of $$total)"; \
+	if [ -n "$$skipped" ]; then echo "SKIPPED (run from a tty/kiosk session, or wire samvada+logind):$$skipped"; fi; \
+	if [ -n "$$known" ]; then echo "KNOWN-FAIL:$$known"; fi; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi
+
+# Gates that cannot pass in an ordinary desktop session because the compositor
+# holds DRM master. NOT hidden — the roll-up prints them as SKIP with the reason,
+# because a test you deleted is worse than a skip you can read.
+NATIVE_NEEDS_MASTER = test-native-kms-modeset test-native-present-e2e
+
+# Gates failing for a filed, understood reason. Every entry MUST have an issue
+# file; this list is not a place to park inconvenient red.
+#   test-native-compute-spike — the v3 Phase B.3.d exploration spike, bit-rotted.
+#     Superseded by test-native-compute-store, which passes and does strictly more
+#     (same CP-side WRITE_DATA proof PLUS a real shader write and a second cached
+#     dispatch). See docs/development/issues/2026-08-19-native-compute-spike-stale.md
+NATIVE_KNOWN_FAIL = test-native-compute-spike
+
+NATIVE_ALL_LOG = $(shell mktemp -t mabda-native-XXXXXX.log)
 
 # CI gate: syntax + semantic check every programs/*.cyr without needing
 # wgpu-native on the runner. Fails on any cyrius warning/error coming from

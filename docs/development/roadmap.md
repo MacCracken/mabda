@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.0.10** (2026-08-19). Module/assertion/bundle counts live in the
+> **v4.1.0** (2026-08-19). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -25,7 +25,11 @@ maintenance cut — cyrius 6.4.64 → 6.5.3 pin, no `src/` change, plus two late
 call-arity bugs in the test/bench suites that 6.5.1's arity gate exposed; v4.0.9
 (2026-08-13) fixed a latent register-aliasing hazard in the GFX9 regalloc ceiling and
 repaired the 6.5.3 pin, which named a toolchain the driver could not reach; v4.0.10 (2026-08-19) is a maintenance cut — cyrius 6.5.29 pin + chitra 0.3.1
-dep refresh + a 73-file `cyrfmt` reflow, no behaviour change).
+dep refresh + a 73-file `cyrfmt` reflow, no behaviour change; v4.1.0 (2026-08-19) closed
+both native SPIR-V filings — compile-failure reason codes, the saxpy scratch-buffer
+overrun + a static sizing gate, f32 OpFDiv, OpSelect on integer conditions, structured
+loops with OpPhi, `gfx9_rsrc1_ex`, the wgpu-native v29.0.1.1 bump, and `make
+test-native-all`).
 
 ## The Long Arc
 
@@ -51,7 +55,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.0.10 ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.1.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -103,94 +107,35 @@ consumer accidentally couples to it.
 
 ---
 
-## v4.0.11 — the two native SPIR-V→GFX9 filings
+## v4.1.x / v4.2 — what the v4.1.0 findings left open
 
-The next **patch**. Both items are compiler-side repairs with no public-API change, which
-is what keeps them out of v4.1.0. Work them together: the first item of the first filing —
-returning a *reason* instead of a null handle — is also what makes the second filing's
-error self-describing, so doing them separately means doing the diagnostic work twice.
+Everything below is a **named** limit now rather than a silent one: each has an error code
+a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it.
 
-- **Native SPIR-V→GFX9 compile limits.** Filed 2026-08-19 from
-  ranga M6 —
-  [`issues/2026-08-19-native-spirv-compile-limits.md`](issues/2026-08-19-native-spirv-compile-limits.md).
-  `gpu_shader_module_create_spirv` returns a bare 0 for `OpFDiv`, `OpSelect` and nested
-  selections, and — worse — *compiles* an early `OpReturn` inside a selection into a
-  silent no-op that dispatches rc=0 and writes nothing. Separately it gives up on
-  register pressure well under the 256-id cap (a 4-tap bilinear filter fails at 201
-  ids). Highest-value fix is the diagnostic, not any one opcode: every case above cost
-  a full HW compile-bisect because a null handle is the only signal the API emits.
-  ⚠ Not addressed in v4.0.10 — that cut is toolchain/dep currency only.
-- **`native_spirv_saxpy_e2e` red since ≥4.0.5.** Filed 2026-08-19
-  from the 4.0.10 closeout HW sweep —
-  [`issues/2026-08-19-native-saxpy-e2e-mir-id-oor.md`](issues/2026-08-19-native-saxpy-e2e-mir-id-oor.md).
-  `gfx9_compile` returns `-25` (`MIR_ERR_ID_OOR`) on the two-binding SAXPY kernel; the
-  program never reaches dispatch. **Not** the known undersized-test-buffer trap — a probe
-  with every capacity raised ~4× fails identically. Reproduced unchanged at 4.0.5 / 4.0.7 /
-  4.0.8 / HEAD, so it predates both the 6.5.20 and 6.5.29 pins. Pair it with the native
-  SPIR-V filing above: both are id/liveness-shaped failures in `spirv_lower`/`isel`, and
-  that filing's "return a reason" item would make this one self-describing.
-  ⚠ It survived four releases because `test-native-spirv-saxpy-e2e` is a **standalone**
-  Makefile target in no aggregate — the 71 `test-native-*` targets have no roll-up, so
-  "the native HW suite passes" is not a claim anyone can make in one command. A tallying
-  roll-up target is part of the fix.
-
-⚠ **A full security audit is due with this cut.** `SECURITY.md`'s index records none since
-4.0.1 because the 4.0.x line has been maintenance work with no new untrusted-input surface.
-That stops being true here: these repairs touch a parser consuming consumer-supplied
-SPIR-V, which is exactly the threat model the 3.3.0 asset-loading audit's 1 CRITICAL came
-from.
-
----
-
-## v4.1.0 — wgpu-native v29.0.1.1, and the API additions a patch can't carry
-
-The next **minor**. It exists because two pieces of work are correctly-sized for a minor
-and were each deferred out of a patch for the same reason: they change something a
-consumer can see.
-
-### wgpu-native `v29.0.0.0` → `v29.0.1.1`
-
-Filed with the full measured diff in
-[`issues/2026-08-19-wgpu-native-29011-breaking.md`](issues/2026-08-19-wgpu-native-29011-breaking.md).
-
-⛔ **The version number lies.** `29.0.0.0 → 29.0.1.1` reads as a patch, but `wgpu.h` — the
-native-extensions header — **renumbers the whole `WGPUSType_*` block** (`PipelineLayoutExtras`
-deleted, everything after it shifted down one, so `InstanceExtras` moves `0x00030006` →
-`0x00030004`), **deletes `WGPUNativeFeature_SpirvShaderPassthrough`** (`0x00030017`, a slot
-now reused by `ClearTexture`), removes the `WGPUPipelineLayoutExtras` struct, reshapes
-`WGPUNativeLimits`, and moves the 16-bit-norm texture formats into the core namespace.
-`webgpu.h` itself is **purely additive with zero removals**, so no `wgpu_descriptors.cyr`
-offset moves — the breakage is entirely in the extensions header.
-
-Work items, in order:
-
-1. **`src/backend_wgpu.cyr:1166`** hardcodes `0x00030017` as a bare numeric literal.
-   ⭐ Every other site spells its constant as a **name** and therefore survives the
-   renumber; this one silently becomes a request for `ClearTexture`. Give it a
-   version-pinned comment naming the wgpu-native release the number was read from, and
-   grep `src/` for any other bare `0x0003xxxx` before bumping.
-2. **Decide what replaces `SpirvShaderPassthrough`** — it is *deleted* upstream, not
-   renamed. Establish whether raw-SPIR-V passthrough exists in v29.0.1.1 at all rather than
-   assuming a rename. (Prior HW work found passthrough already unsupported on RADV/Cezanne
-   and mabda's f64 path goes through `ShaderF64` + naga, so the real blast radius may be
-   smaller than the code surface suggests.)
-3. **Audit `deps/wgpu_main.c`** against the new header — it references
-   `WGPUNativeFeature_SpirvShaderPassthrough` by name and so **will not compile** as-is.
-   ⚠ This file is consumer-copied, so any change forces every consumer to rebuild their
-   launcher. That coordination cost is the real reason this is a minor and not a patch.
-4. **Re-run `make test-phase0` + the wgpu e2e set.** There is no CI coverage for any of
-   this — the wgpu path is a developer gate only.
-5. Bump `deps/fetch-wgpu.sh:6` last.
-
-⚠ **Weigh this against the retirement horizon before doing it.** AMD-on-wgpu is deprecated
-at v4.0.1, NVIDIA-on-wgpu retires at v5.0, and the whole wgpu path leaves the tree at v5.1.
-Staying on `v29.0.0.0` until then is a defensible answer — but it must be *stated* each
-release, not re-deferred silently.
-
-### `gfx9_rsrc1_ex(vgpr_hw, sgpr_hw, extra_sgpr, ieee_mode)`
-
-Parameterising the reservation budget and `IEEE_MODE` is **new public API**, which is why
-4.0.9 pushed it out of a patch. No consumer needs it today; it lands here when one does.
+- **Nested divergent ifs** (`GISEL_ERR_NESTED_SELECTION`). Rejected, not miscompiled;
+  consumers flatten into two sequential ifs. Supporting them needs a region stack in
+  `gfx9_isel` and a second saved-EXEC pair, which trades against the SGPR budget.
+- **`OpSelect` with a non-adjacent integer compare** (`LOWER_ERR_SELECT_NOT_ADJACENT`) and
+  **with a uniform condition** (`LOWER_ERR_SELECT_UNIFORM_COND`). The first needs the
+  compare materialized into a 0/-1 mask at its own site (which needs a pre-pass to know a
+  select consumes it); the second needs `s_cselect_b32`.
+- ⭐ **The scratch-buffer contract.** `mir_mod_init`, `gfx9_regalloc`,
+  `_spirv_resolve_builtins` and the three `spirv_build_*_table` builders each memset a
+  caller-supplied extent into a buffer whose size they cannot see. v4.1.0 added a runtime
+  self-check for the layout that bit us and a static gate over all 123 call sites; passing
+  explicit **lengths** would make the invalid state unrepresentable. `@internal`, so no
+  public break — but it touches every call site, hence its own cut.
+- **The four flaky render/sampler gates.** `array-sample`, `bc-array`, `bilinear-sample` and
+  `compressed-sample` failed together on the first `make test-native-all` run and passed on
+  a re-run and individually. Four at once looks like contention, not four bugs — but it is
+  unexplained. See `issues/2026-08-19-native-compute-spike-stale.md`.
+- **`native_compute_spike`** — retire or repair; it is a bit-rotted 2026-04 exploration
+  artifact subsumed by `test-native-compute-store`. ⚠ Should not survive two more releases
+  parked in `NATIVE_KNOWN_FAIL`.
+- **A security audit is due.** `SECURITY.md` records none since 4.0.1 because the 4.0.x line
+  had no new untrusted-input surface. v4.1.0 changes that: it extends a parser consuming
+  consumer-supplied SPIR-V (loops, phi, f32 division, integer-condition selects), which is
+  the threat model the 3.3.0 asset-loading audit's 1 CRITICAL came from.
 
 ---
 

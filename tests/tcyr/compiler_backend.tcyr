@@ -45,7 +45,7 @@ fn test_gfx9_isel_f64() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -70,7 +70,7 @@ fn test_gfx9_isel_fconvert_rejects_same_width() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -122,7 +122,7 @@ fn test_gfx9_isel_gid_salu_valu() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
     spirv_build_type_table(&buf, n, 16, 16, &types);
@@ -184,7 +184,7 @@ fn test_gfx9_regalloc_gid() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
     spirv_build_type_table(&buf, n, 16, 16, &types);
@@ -270,7 +270,7 @@ fn test_gfx9_regalloc_errors() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     var isel[256];
     var alloc[256];
@@ -316,7 +316,7 @@ fn test_gfx9_regalloc_f64_pairs() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -349,7 +349,7 @@ fn test_gfx9_regalloc_valu_uniform() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_const(&m, 1, MIR_T_I32, 5);
@@ -378,7 +378,7 @@ fn test_mir_unif_f64_div_ops_forced_divergent() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_const(&m, 1, MIR_T_F64, 0);
@@ -444,7 +444,7 @@ fn test_gfx9_waitcnt_none() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
     spirv_build_type_table(&buf, n, 16, 16, &types);
@@ -1132,7 +1132,7 @@ fn test_gfx9_isel_extract_unknown_unif() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -1299,6 +1299,227 @@ fn test_gfx9_isel_signed_compare() {
 # N.7c-2b — a DIVERGENT if lowers to the EXEC-mask trio: save+mask EXEC, skip the then
 # when no lane is active, restore EXEC at the merge. The merge LABEL precedes its
 # S_OR_EXEC so a skip or a fall-through both land on the restore.
+# v4.0.11 — the ranga M6 filing's worst case, now a loud rejection.
+#
+# `if idx >= count { return; }` — the way WGSL writes a bounds guard — puts an
+# OpReturn INSIDE the divergent if. A divergent if runs its then-block under a
+# masked EXEC, so that return lowers to s_endpgm and ends the ENTIRE WAVE (every
+# lane, active or not) before the code after the merge runs. It compiled to a
+# non-zero handle, dispatched with rc=0, and wrote nothing at all — discoverable
+# only by noticing an unchanged output buffer.
+#
+# ⚠ This is the one case in the filing that was NOT already a rejection. Nesting
+# and unclosed regions were rejected all along; they were merely unnamed.
+# v4.1.0 — LOOP LIVENESS. The lowerer's "loops remain unsupported" note names
+# "a back-edge breaks the forward linear-scan liveness" as the blocker. This is
+# that blocker, fixed and asserted.
+#
+# Shape: v1 is defined BEFORE the loop and read at the TOP of the body. A forward
+# scan puts v1's last use inside the loop, frees its register there, and lets a
+# value defined later in the same body claim it — so on iteration 2 the read of v1
+# returns the other value. The fix extends any interval whose last use falls inside
+# a loop to the loop's end.
+# v4.1.0 — gfx9_rsrc1_ex, the parameterized RSRC1 deferred out of 4.0.9 as new
+# public API. The two policies gfx9_rsrc1 hardcodes (reservation budget, IEEE_MODE)
+# become arguments; the plain form must remain byte-identical to what it emitted
+# before, since every existing shader descriptor depends on it.
+fn test_gfx9_rsrc1_ex() {
+    # ⭐ The compatibility assertion: gfx9_rsrc1 now delegates, and delegation must
+    # not change a single emitted descriptor.
+    assert_eq(gfx9_rsrc1_ex(8, 10, GFX9_SGPR_RESERVE_VCC_ONLY, 0), gfx9_rsrc1(8, 10),
+      "gfx9_rsrc1 == _ex with (VCC_ONLY, ieee 0)");
+    assert_eq(gfx9_rsrc1_ex(4, 6, GFX9_SGPR_RESERVE_VCC_ONLY, 0), gfx9_rsrc1(4, 6),
+      "delegation holds at another point");
+    assert_eq(gfx9_rsrc1_ex(64, 32, GFX9_SGPR_RESERVE_VCC_ONLY, 0), gfx9_rsrc1(64, 32),
+      "delegation holds at a large point");
+
+    # IEEE_MODE sets bit 23 and NOTHING else — the llvm-mc 22.1.8 perturbation
+    # result (0x002C0040 vs 0x00AC0040) the module comment records.
+    var plain = gfx9_rsrc1_ex(8, 10, GFX9_SGPR_RESERVE_VCC_ONLY, 0);
+    var ieee = gfx9_rsrc1_ex(8, 10, GFX9_SGPR_RESERVE_VCC_ONLY, 1);
+    assert_eq(ieee, plain | GFX9_RSRC1_IEEE_MODE, "ieee_mode sets exactly bit 23");
+    assert_eq(GFX9_RSRC1_IEEE_MODE, 0x800000, "IEEE_MODE is bit 23");
+    assert_neq(ieee, plain, "ieee_mode 1 differs from 0");
+
+    # A larger reservation budget rounds the granted SGPR count up. sgpr_hw 10 with
+    # E=2 gives roundup8(12)=16 -> field 1; with E=6 gives roundup8(16)=16 -> field
+    # 1 as well, so pick a point where the granule actually crosses: 14 + 2 = 16
+    # (field 1) vs 14 + 6 = 20 -> 24 (field 2).
+    var e2 = gfx9_rsrc1_ex(8, 14, GFX9_SGPR_RESERVE_VCC_ONLY, 0);
+    var e6 = gfx9_rsrc1_ex(8, 14, GFX9_SGPR_RESERVE_LLVM_DEFAULT, 0);
+    assert_neq(e2, e6, "a larger reservation budget changes the descriptor");
+    assert_eq((e6 >> 6) & 0xF, ((e2 >> 6) & 0xF) + 1, "LLVM default costs one more 8-SGPR granule");
+    assert_eq(GFX9_SGPR_RESERVE_VCC_ONLY, 2, "VCC_ONLY budget is 2");
+    assert_eq(GFX9_SGPR_RESERVE_FLAT_SCRATCH, 4, "FLAT_SCRATCH budget is 4");
+    assert_eq(GFX9_SGPR_RESERVE_LLVM_DEFAULT, 6, "LLVM default budget is 6");
+
+    # Negative inputs are rejected rather than producing a nonsense descriptor.
+    assert_eq(gfx9_rsrc1_ex(0 - 1, 10, 2, 0), 0 - ABI_ERR_VGPR_OVERFLOW, "negative vgpr_hw rejected");
+    assert_eq(gfx9_rsrc1_ex(8, 0 - 1, 2, 0), 0 - ABI_ERR_SGPR_OVERFLOW, "negative sgpr_hw rejected");
+    assert_eq(gfx9_rsrc1_ex(8, 10, 0 - 1, 0), 0 - ABI_ERR_SGPR_OVERFLOW, "negative budget rejected");
+    # And the field ceilings still fire.
+    assert_eq(gfx9_rsrc1_ex(4096, 10, 2, 0), 0 - ABI_ERR_VGPR_OVERFLOW, "VGPRS field overflow");
+    assert_eq(gfx9_rsrc1_ex(8, 4096, 2, 0), 0 - ABI_ERR_SGPR_OVERFLOW, "SGPRS field overflow");
+    return 0;
+}
+
+fn test_gfx9_regalloc_loop_liveness() {
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 24, 32);
+    mir_set_builtin(&m, 1, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_set_const(&m, 2, MIR_T_U32, 7);
+    mir_emit(&m, MIR_OP_IADD, 3, MIR_T_U32, 1, 2, 0, 0);    # v3 defined BEFORE the loop
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 20, 0, 0, MIR_FLAG_A_IMM);   # loop top
+    mir_emit(&m, MIR_OP_IADD, 4, MIR_T_U32, 3, 2, 0, 0);    # v4 = v3 + 7   (LAST textual use of v3)
+    mir_emit(&m, MIR_OP_IADD, 5, MIR_T_U32, 4, 2, 0, 0);    # v5 defined after v3's last use
+    mir_emit(&m, MIR_OP_IADD, 6, MIR_T_U32, 5, 2, 0, 0);    # v6 likewise
+    mir_emit(&m, MIR_OP_BRANCH, 0, MIR_T_VOID, 20, 0, 0, MIR_FLAG_A_IMM);  # BACK-EDGE
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[2048];
+    var ni = gfx9_isel(&m, &isel, 32);
+    assert_eq(ni > 0, 1, "loop MIR selects");
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var alloc[512];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi),
+        104, 256, &alloc, &hw), 0, "regalloc over a back-edge succeeds");
+    var r3 = load64(&alloc + 3 * RA_REC + 0);
+    var r5 = load64(&alloc + 5 * RA_REC + 0);
+    var r6 = load64(&alloc + 6 * RA_REC + 0);
+    # ⭐ The load-bearing assertion: v3 is read every iteration, so nothing defined
+    # later in the body may share its register. Without the extension v5 (defined
+    # right after v3's last textual use) reclaims it and the loop corrupts silently.
+    assert_neq(r3, r5, "v3 (live across the back-edge) does not share v5's register");
+    assert_neq(r3, r6, "v3 does not share v6's register");
+    # v3's interval must reach the back-edge, not stop at its textual last use.
+    assert_eq(load64(&alloc + 3 * RA_REC + 8) >= ni - 2, 1,
+      "v3's last_use extended to the end of the loop");
+    return 0;
+}
+
+# v4.1.0 — ALLOCATE ONCE. A loop-carried value is assigned on the entry edge AND
+# again on the back-edge (that is what eliminating an OpPhi produces), and both
+# must land in the SAME register. Straight-line SSA never has two defs, so nothing
+# before this exercised the case.
+fn test_gfx9_regalloc_allocates_each_value_once() {
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[128];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 24, 32);
+    mir_set_builtin(&m, 1, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_set_const(&m, 2, MIR_T_U32, 7);
+    mir_emit(&m, MIR_OP_IADD, 3, MIR_T_U32, 1, 2, 0, 0);    # first def of v3
+    mir_emit(&m, MIR_OP_IADD, 4, MIR_T_U32, 3, 2, 0, 0);
+    mir_emit(&m, MIR_OP_IADD, 3, MIR_T_U32, 4, 2, 0, 0);    # SECOND def of v3 (the phi shape)
+    # ⚠ A use of v3 AFTER its redefinition is what makes this test non-vacuous. It
+    # keeps v3's own register busy at the second def, so an allocator without the
+    # allocate-once guard cannot coincidentally re-claim the same register - it is
+    # forced to take a fresh one, and the high-water mark rises. An earlier draft of
+    # this test omitted this use, the re-claim happened to return the same register,
+    # and the test passed against the mutated allocator.
+    mir_emit(&m, MIR_OP_IADD, 5, MIR_T_U32, 3, 2, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[2048];
+    var ni = gfx9_isel(&m, &isel, 32);
+    var abi[64];
+    gfx9_abi_assign(&m, &abi);
+    var alloc[512];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi),
+        104, 256, &alloc, &hw), 0, "regalloc with a redefined value succeeds");
+    var r3 = load64(&alloc + 3 * RA_REC + 0);
+    var r4 = load64(&alloc + 4 * RA_REC + 0);
+    var r5 = load64(&alloc + 5 * RA_REC + 0);
+    assert_neq(r3, 0 - 1, "the twice-defined value got a register");
+    assert_neq(r3, r4, "distinct values still get distinct registers");
+    assert_neq(r3, r5, "v3 and v5 are distinct");
+    # ⭐ The load-bearing assertion, and the number is measured rather than assumed:
+    # v4 dies at v3's redefinition so v5 REUSES v4's register, giving 2 registers
+    # above vgpr_base for three values. Allocating v3 twice consumes a third and
+    # pushes the high-water up - exactly the wrong answer for a loop-carried value,
+    # where both defs must land in the same register.
+    var vb = gfx9_abi_vgpr_base(&abi);
+    assert_eq(gfx9_hw_vgpr(&hw), vb + 2, "2 registers claimed - v3 allocated once, not twice");
+    return 0;
+}
+
+fn test_gfx9_isel_rejects_return_in_selection() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);     # divergent cond
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 5, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);       # then
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);         # <- early return, INSIDE the if
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, 0);       # merge
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[512];
+    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_RETURN_IN_SELECTION,
+      "OpReturn inside a divergent if is rejected, not miscompiled");
+    return 0;
+}
+
+# A divergent if opened inside another. Already rejected before v4.0.11 — but as
+# the generic GISEL_ERR_UNSUPPORTED_OP, which told a consumer nothing about which
+# construct to change. Now it names itself.
+fn test_gfx9_isel_rejects_nested_selection() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);
+    # second divergent if, opened before the first reached its merge
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 5, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[512];
+    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_NESTED_SELECTION,
+      "a nested divergent if names itself");
+    return 0;
+}
+
+# A divergent if whose merge label never arrives. Also pre-existing, also unnamed.
+fn test_gfx9_isel_rejects_unclosed_selection() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 5, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);       # then, no merge %5 ever
+    mir_run_uniformity(&m);
+    var isel[512];
+    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_UNCLOSED_SELECTION,
+      "an unclosed divergent if names itself");
+    return 0;
+}
+
 fn test_gfx9_isel_divergent_if() {
     var m[80];
     var vals[640];
@@ -1394,6 +1615,12 @@ fn main(): i64 {
     test_gfx9_isel_uniform_if();
     test_gfx9_isel_divergent_compare();
     test_gfx9_isel_signed_compare();
+    test_gfx9_rsrc1_ex();
+    test_gfx9_regalloc_loop_liveness();
+    test_gfx9_regalloc_allocates_each_value_once();
+    test_gfx9_isel_rejects_return_in_selection();
+    test_gfx9_isel_rejects_nested_selection();
+    test_gfx9_isel_rejects_unclosed_selection();
     test_gfx9_isel_divergent_if();
     test_gfx9_isel_divergent_if_nesting_rejected();
     return assert_summary();

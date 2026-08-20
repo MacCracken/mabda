@@ -67,6 +67,111 @@ fn test_mir_value_builders() {
     return 0;
 }
 
+# v4.0.11 — the scratch-buffer contract. These are the assertions that would have
+# caught the `native_spirv_saxpy_e2e` failure the day it appeared instead of four
+# releases later: that gate declared vals[1440] while passing cap_ids=40 (needing
+# 1600), the 160-byte memset overrun zeroed the MirMod header sitting just past
+# it, and every id then failed `id >= cap_ids` with cap_ids reading 0 — reported
+# as MIR_ERR_ID_OOR, which blames the ids rather than the buffer.
+fn test_mir_mod_init_contract() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[32];
+
+    # A well-formed init still succeeds, and reports so.
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16), 0,
+      "well-formed mir_mod_init returns 0");
+
+    # id_bound == cap_ids is LEGAL — it means "no synth headroom", which is what
+    # every hand-built-MIR test in this suite uses. Asserted explicitly because a
+    # first cut of the v4.0.11 guard rejected it and broke three suites.
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16), 0,
+      "id_bound == cap_ids is accepted");
+    # ... while id_bound > cap_ids is incoherent and rejected.
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 17, 16),
+      0 - MIR_ERR_BAD_INIT, "id_bound > cap_ids rejected");
+
+    # Null buffers.
+    assert_eq(mir_mod_init(0, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "null m rejected");
+    assert_eq(mir_mod_init(&m, 0, &instrs, &ptrs, &blocks, 16, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "null vals rejected");
+    assert_eq(mir_mod_init(&m, &vals, 0, &ptrs, &blocks, 16, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "null instrs rejected");
+    assert_eq(mir_mod_init(&m, &vals, &instrs, 0, &blocks, 16, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "null ptrs rejected");
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, 0, 16, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "null blocks rejected");
+
+    # Non-positive capacities.
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 0),
+      0 - MIR_ERR_BAD_INIT, "cap_ids 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 0, 4, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "cap_instrs 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 0, 16, 16),
+      0 - MIR_ERR_BAD_INIT, "cap_ptrs 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 0 - 1, 16),
+      0 - MIR_ERR_BAD_INIT, "negative id_bound rejected");
+
+    # cap_ids past the architectural ceiling every later stage is sized for.
+    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16,
+        MIR_MAX_CAP_IDS + 1), 0 - MIR_ERR_BAD_INIT, "cap_ids > MIR_MAX_CAP_IDS rejected");
+    assert_eq(MIR_MAX_CAP_IDS, 256, "MIR_MAX_CAP_IDS mirrors RA_MAX_REGS");
+    return 0;
+}
+
+# A module whose header has been zeroed (the vals[] overrun signature) must report
+# MIR_ERR_MOD_UNINIT, NOT MIR_ERR_ID_OOR. The distinction is the entire fix: one
+# says "your scratch buffer is too small", the other says "your ids are wrong",
+# and the wrong one cost four releases of bisecting a compiler that was fine.
+fn test_mir_uninit_module_is_distinguishable() {
+    var m[80];
+    memset(&m, 0, 80);
+    # cap_ids (m + 64) reads 0 — exactly what the saxpy overrun produced.
+    assert_eq(_mir_set_val(&m, 10, MIR_VK_CONST, MIR_T_U32, MIR_UNIFORM, 0 - 1, 0),
+      0 - MIR_ERR_MOD_UNINIT, "zeroed header -> MOD_UNINIT, not ID_OOR");
+    assert_eq(mir_set_const(&m, 10, MIR_T_U32, 42), 0 - MIR_ERR_MOD_UNINIT,
+      "mir_set_const on zeroed header -> MOD_UNINIT");
+    assert_eq(mir_emit(&m, MIR_OP_IADD, 5, MIR_T_U32, 1, 2, 0, 0),
+      0 - MIR_ERR_MOD_UNINIT, "mir_emit on zeroed header -> MOD_UNINIT");
+
+    # ... and a PROPERLY initialized module still reports ID_OOR for a genuinely
+    # out-of-range id. Without this the test would pass if MOD_UNINIT simply
+    # replaced ID_OOR everywhere, which would lose the distinction it exists for.
+    var vals[640];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    assert_eq(mir_set_const(&m, 99, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR,
+      "id past cap on a live module is still ID_OOR");
+    assert_eq(mir_set_const(&m, 0, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR,
+      "id 0 on a live module is still ID_OOR");
+    assert_eq(MIR_ERR_MOD_UNINIT, 30, "MOD_UNINIT code is 30");
+    assert_eq(MIR_ERR_VALS_OVERRUN, 31, "VALS_OVERRUN code is 31");
+    assert_eq(MIR_ERR_BAD_INIT, 32, "BAD_INIT code is 32");
+    return 0;
+}
+
+# The record sizes scripts/check-compiler-buffer-sizing.py mirrors. That gate
+# hardcodes these numbers to compute each buffer's requirement; if src/ changes a
+# REC without the gate following, the gate silently computes the wrong requirement
+# and stops catching anything. This assertion is the tripwire for that drift.
+fn test_compiler_buffer_sizing_recs() {
+    assert_eq(MIR_VAL_REC, 40, "MIR_VAL_REC 40 (gate mirrors this)");
+    assert_eq(MIR_INSTR_REC, 32, "MIR_INSTR_REC 32 (gate mirrors this)");
+    assert_eq(MIR_PTR_REC, 32, "MIR_PTR_REC 32 (gate mirrors this)");
+    assert_eq(RA_REC, 16, "RA_REC 16 (gate mirrors this)");
+    assert_eq(SPIRV_TYPE_REC, 24, "SPIRV_TYPE_REC 24 (gate mirrors this)");
+    assert_eq(SPIRV_CONST_REC, 16, "SPIRV_CONST_REC 16 (gate mirrors this)");
+    assert_eq(SPIRV_DECO_REC, 16, "SPIRV_DECO_REC 16 (gate mirrors this)");
+    assert_eq(GISEL_REC, 48, "GISEL_REC 48 (gate mirrors this)");
+    assert_eq(CMP_ISEL_CAP, 256, "CMP_ISEL_CAP 256 (gate mirrors this)");
+    return 0;
+}
+
 fn test_mir_emit_and_accessors() {
     var m[80];
     var vals[640];
@@ -238,7 +343,7 @@ fn test_spirv_lower_gid_kernel() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
@@ -368,7 +473,7 @@ fn test_spirv_lower_fdiv() {
     _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);   # result type = f64
     var m[80];
     var vals[2560];
-    var instrs[1024];
+    var instrs[2048];
     var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
@@ -388,7 +493,16 @@ fn test_spirv_lower_fdiv() {
 
 # F.7f.6b — OpFDiv on f32 has no native macro yet (wgpu/naga covers the f32 path) → FAIL LOUD
 # rather than silently lowering with f64 ops. Same module, types[2] = f32.
-fn test_spirv_lower_fdiv_f32_rejects() {
+# v4.1.0 — f32 OpFDiv now LOWERS. This test previously asserted the opposite
+# (`fdiv f32 fails loud` / `emits no MIR`); that limitation shipped at F.7f.6b
+# because wgpu/naga covered f32 and nothing native needed it. ranga M6 needed it,
+# and the filing lists OpFDiv as "the most commonly needed missing op".
+#
+# The chain is the exact structural mirror of the f64 macro: 11 MIR instructions,
+# same order, f32 opcodes. ⚠ The ORDER is asserted, not just the count, because
+# VCC adjacency is load-bearing — the second DIV_SCALE's flag must still be live
+# when DIV_FMAS reads it, and only FMA/MUL (which never touch VCC) sit between.
+fn test_spirv_lower_fdiv_f32() {
     var buf[64];
     store32(&buf + 0, 0x07230203); store32(&buf + 4, 0x00010300); store32(&buf + 8, 0);
     store32(&buf + 12, 16);
@@ -403,13 +517,59 @@ fn test_spirv_lower_fdiv_f32_rejects() {
     _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 32, 0, 16);   # result type = f32
     var m[80];
     var vals[2560];
-    var instrs[1024];
+    var instrs[2048];
     var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
-    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m),
-      0 - MIR_ERR_UNSUPPORTED_TYPE, "fdiv f32 fails loud");
-    assert_eq(mir_n_instrs(&m), 0, "f32 fdiv emits no MIR");
+    assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m), 0, "fdiv f32 lowers");
+    assert_eq(mir_n_instrs(&m), 11, "f32 fdiv = 11 MIR instrs (same shape as f64)");
+    assert_eq(mir_instr_op(&m, 0), MIR_OP_F32_DIV_SCALE, "0: div_scale(D,D,N)");
+    assert_eq(mir_instr_op(&m, 1), MIR_OP_F32_RCP, "1: rcp seed");
+    assert_eq(mir_instr_op(&m, 2), MIR_OP_F32_FMA_N0_ONE, "2: fma(-s0,rcp,1)");
+    assert_eq(mir_instr_op(&m, 3), MIR_OP_FMA, "3: fma(rcp,e1,rcp)");
+    assert_eq(mir_instr_op(&m, 4), MIR_OP_F32_DIV_SCALE, "4: div_scale(N,D,N) -> VCC (LIVE)");
+    assert_eq(mir_instr_op(&m, 5), MIR_OP_F32_FMA_N0_ONE, "5: fma(-s0,rcp2,1)");
+    assert_eq(mir_instr_op(&m, 6), MIR_OP_FMA, "6: fma(rcp2,e2,rcp2)");
+    assert_eq(mir_instr_op(&m, 7), MIR_OP_FMUL, "7: q = s1*rcp3");
+    assert_eq(mir_instr_op(&m, 8), MIR_OP_F32_FMA_N0, "8: r = fma(-s0,q,s1)");
+    assert_eq(mir_instr_op(&m, 9), MIR_OP_F32_DIV_FMAS, "9: div_fmas (reads VCC)");
+    assert_eq(mir_instr_op(&m, 10), MIR_OP_F32_DIV_FIXUP, "10: div_fixup (rounding)");
+    # ⚠ Nothing between instr 4 (the VCC writer) and instr 9 (the VCC reader) may
+    # write VCC. Asserted structurally so a future reorder cannot pass silently.
+    assert_eq(mir_instr_op(&m, 5) == MIR_OP_F32_DIV_SCALE, 0, "5 does not rewrite VCC");
+    assert_eq(mir_instr_op(&m, 6) == MIR_OP_F32_DIV_SCALE, 0, "6 does not rewrite VCC");
+    assert_eq(mir_instr_op(&m, 7) == MIR_OP_F32_DIV_SCALE, 0, "7 does not rewrite VCC");
+    assert_eq(mir_instr_op(&m, 8) == MIR_OP_F32_DIV_SCALE, 0, "8 does not rewrite VCC");
+    return 0;
+}
+
+# The f32 division primitives are VOP1/VOP3-only with an implicit per-lane VCC, so
+# they MUST classify DIVERGENT even when every operand is uniform. Missing this is
+# a known foot-gun: _mir_instr_unif's forced-DIVERGENT guard is a numeric RANGE
+# check, so a new op added outside the range silently mis-classifies, gets an SGPR,
+# and encodes an instruction that cannot take one.
+fn test_mir_f32_div_ops_force_divergent() {
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_set_const(&m, 1, MIR_T_F32, 0);     # UNIFORM operands throughout
+    mir_set_const(&m, 2, MIR_T_F32, 0);
+    mir_emit(&m, MIR_OP_F32_DIV_SCALE, 3, MIR_T_F32, 1, 2, 1, 0);
+    mir_emit(&m, MIR_OP_F32_RCP, 4, MIR_T_F32, 3, 0, 0, 0);
+    mir_emit(&m, MIR_OP_F32_FMA_N0_ONE, 5, MIR_T_F32, 3, 4, 0, 0);
+    mir_emit(&m, MIR_OP_F32_FMA_N0, 6, MIR_T_F32, 3, 4, 5, 0);
+    mir_emit(&m, MIR_OP_F32_DIV_FMAS, 7, MIR_T_F32, 6, 4, 5, 0);
+    mir_emit(&m, MIR_OP_F32_DIV_FIXUP, 8, MIR_T_F32, 7, 2, 1, 0);
+    mir_run_uniformity(&m);
+    assert_eq(mir_val_unif(&m, 3), MIR_DIVERGENT, "F32_DIV_SCALE forced DIVERGENT");
+    assert_eq(mir_val_unif(&m, 4), MIR_DIVERGENT, "F32_RCP forced DIVERGENT");
+    assert_eq(mir_val_unif(&m, 5), MIR_DIVERGENT, "F32_FMA_N0_ONE forced DIVERGENT");
+    assert_eq(mir_val_unif(&m, 6), MIR_DIVERGENT, "F32_FMA_N0 forced DIVERGENT");
+    assert_eq(mir_val_unif(&m, 7), MIR_DIVERGENT, "F32_DIV_FMAS forced DIVERGENT");
+    assert_eq(mir_val_unif(&m, 8), MIR_DIVERGENT, "F32_DIV_FIXUP forced DIVERGENT");
     return 0;
 }
 
@@ -421,7 +581,7 @@ fn test_spirv_lower_fdiv_f32_rejects() {
 fn test_spirv_lower_fsqrt() {
     var m[80];
     var vals[2560];
-    var instrs[1024];
+    var instrs[2048];
     var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
@@ -447,6 +607,118 @@ fn test_spirv_lower_fsqrt() {
 # F.7f.8 review — OpSelect must FAIL LOUD unless its cond is a 0/-1 select mask (an OpFOrd* result:
 # SSA + MIR_T_BOOL). A non-mask cond (an integer-compare bool = U32, or a bool CONSTANT) would
 # silently corrupt the v_bfi_b32 blend, so it is rejected (the silent-wrong bug the review found).
+# v4.1.0 — OpSelect on an INTEGER-compare condition (ranga M6 item 5).
+#
+# A float compare leaves a 0/-1 mask that v_bfi_b32 blends; an integer compare
+# leaves its result in VCC with no mask register, which is why this was rejected
+# and why ranga hand-rolls `d = (b1-1-v1) | (b2-1-v2); d < 0x80000000` instead.
+# VCC is exactly what v_cndmask_b32 reads, so an adjacent compare makes the select
+# a SINGLE instruction.
+fn test_spirv_lower_select_int_cond() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (6 << 16) | 169);   # OpSelect
+    store32(&buf + 24, 2);                   # result type (-> u32)
+    store32(&buf + 28, 9);                   # result id
+    store32(&buf + 32, 6);                   # cond id
+    store32(&buf + 36, 7);                   # obj1 (true)
+    store32(&buf + 40, 8);                   # obj2 (false)
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_INT, 32, 0, 16);
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # divergent
+    mir_set_const(&m, 4, MIR_T_U32, 8);
+    mir_set_const(&m, 7, MIR_T_U32, 111);
+    mir_set_const(&m, 8, MIR_T_U32, 222);
+    # the compare IS the last emitted instruction -> VCC is live
+    mir_emit(&m, MIR_OP_ICMP_ULT, 6, MIR_T_U32, 3, 4, 0, 0);
+    mir_run_uniformity(&m);
+    var before = mir_n_instrs(&m);
+    # mir_emit returns the INSTRUCTION INDEX (>= 0), not 0 — the same convention the
+    # f64 bfi path uses; callers test `< 0` for errors.
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m) >= 0, 1,
+      "OpSelect with an adjacent divergent int compare lowers");
+    assert_eq(mir_n_instrs(&m), before + 1, "int-cond select is ONE instruction (no mask needed)");
+    assert_eq(mir_instr_op(&m, before), MIR_OP_CNDMASK, "lowers to CNDMASK (reads VCC)");
+    # ⚠ operand order: CNDMASK is `dst = VCC ? b : a`, so the FALSE value (obj2=8)
+    # must be in `a` and the TRUE value (obj1=7) in `b`. Reversing these inverts
+    # every select in the program and still compiles, so it is asserted directly.
+    assert_eq(mir_instr_a(&m, before), 8, "a = obj2 (the FALSE value)");
+    assert_eq(mir_instr_b(&m, before), 7, "b = obj1 (the TRUE value)");
+    return 0;
+}
+
+# ⚠ VCC is one physical register. If anything is emitted between the compare and
+# the select, VCC may already have been overwritten and the select would read a
+# stale flag — silently choosing the wrong operand. That case must fail loud.
+fn test_spirv_lower_select_int_cond_not_adjacent() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (6 << 16) | 169);
+    store32(&buf + 24, 2);
+    store32(&buf + 28, 9);
+    store32(&buf + 32, 6);
+    store32(&buf + 36, 7);
+    store32(&buf + 40, 8);
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_INT, 32, 0, 16);
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_set_const(&m, 4, MIR_T_U32, 8);
+    mir_set_const(&m, 7, MIR_T_U32, 111);
+    mir_set_const(&m, 8, MIR_T_U32, 222);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 6, MIR_T_U32, 3, 4, 0, 0);
+    mir_emit(&m, MIR_OP_IADD, 10, MIR_T_U32, 3, 4, 0, 0);   # <- intervening instruction
+    mir_run_uniformity(&m);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+      0 - LOWER_ERR_SELECT_NOT_ADJACENT, "non-adjacent int compare fails loud");
+    return 0;
+}
+
+# A UNIFORM integer compare writes SCC, not VCC — v_cndmask_b32 would read a VCC
+# nobody wrote. Named separately from the adjacency case because the consumer fix
+# is different (restructure vs. make the condition per-lane).
+fn test_spirv_lower_select_int_cond_uniform() {
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (6 << 16) | 169);
+    store32(&buf + 24, 2);
+    store32(&buf + 28, 9);
+    store32(&buf + 32, 6);
+    store32(&buf + 36, 7);
+    store32(&buf + 40, 8);
+    var types[512];
+    memset(&types, 0, 512);
+    _spirv_set_type(&types, 2, SPIRV_TYK_INT, 32, 0, 16);
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[256];
+    var blocks[64];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_set_const(&m, 3, MIR_T_U32, 4);      # both operands uniform
+    mir_set_const(&m, 4, MIR_T_U32, 8);
+    mir_set_const(&m, 7, MIR_T_U32, 111);
+    mir_set_const(&m, 8, MIR_T_U32, 222);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 6, MIR_T_U32, 3, 4, 0, 0);
+    mir_run_uniformity(&m);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
+      0 - LOWER_ERR_SELECT_UNIFORM_COND, "uniform int compare fails loud (SCC, not VCC)");
+    return 0;
+}
+
 fn test_spirv_lower_select_rejects_nonmask() {
     var buf[64];
     store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
@@ -461,14 +733,17 @@ fn test_spirv_lower_select_rejects_nonmask() {
     _spirv_set_type(&types, 2, SPIRV_TYK_FLOAT, 64, 0, 16);
     var m[80];
     var vals[2560];
-    var instrs[512];
+    var instrs[2048];
     var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
     # cond = a U32 SSA (an integer-compare bool, NOT a 0/-1 mask) -> reject
     _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    # v4.1.0: a U32 SSA is no longer rejected outright — it is accepted when it is
+    # DEFINED BY AN ADJACENT INTEGER COMPARE (see test_spirv_lower_select_int_cond).
+    # This value's `def` points at no compare, so it is still rejected.
     assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
-      0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a U32 (int-compare) cond");
+      0 - MIR_ERR_UNSUPPORTED_OP, "OpSelect rejects a U32 cond with no defining compare");
     # cond = a bool CONSTANT -> reject (not SSA; would mis-encode in bfi)
     mir_set_const(&m, 6, MIR_T_BOOL, 1);
     assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
@@ -483,7 +758,7 @@ fn test_spirv_lower_select_rejects_nonmask() {
 fn test_spirv_f64_arg() {
     var m[80];
     var vals[2560];
-    var instrs[512];
+    var instrs[2048];
     var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
@@ -636,7 +911,7 @@ fn test_spirv_lower_vec_binop() {
     _spirv_set_type(&types, 6, SPIRV_TYK_VECTOR, 5, 3, 64);   # vec3<f32>
     var m[80];
     var vals[2560];
-    var instrs[512];
+    var instrs[1024];
     var ptrs[128];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
@@ -686,7 +961,7 @@ fn test_spirv_lower_vec_binop() {
 fn test_spirv_lower_vec_binop_fold() {
     var m[80];
     var vals[2560];
-    var instrs[512];
+    var instrs[1024];
     var ptrs[128];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
@@ -713,8 +988,8 @@ fn test_spirv_lower_vec_binop_fold() {
 fn test_spirv_lower_vec_load_store() {
     var m[80];
     var vals[2560];
-    var instrs[512];
-    var ptrs[128];
+    var instrs[1024];
+    var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
     mir_set_const(&m, 5, MIR_T_U32, 64);   # stand-in off_id (a non-vector value id)
@@ -784,8 +1059,8 @@ fn test_spirv_lower_vec_access_chain() {
     store64(&deco + 30 * 16 + 0, 0);   # %30 binding 0
     var m[80];
     var vals[2560];
-    var instrs[512];
-    var ptrs[128];
+    var instrs[1024];
+    var ptrs[256];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
     mir_set_bufvar(&m, 30, 0);
@@ -842,7 +1117,7 @@ fn test_spirv_lower_constant_composite() {
     store32(&buf + 96, 10); store32(&buf + 100, 11); store32(&buf + 104, 12); store32(&buf + 108, 13);
     var m[80];
     var vals[1600];
-    var instrs[256];
+    var instrs[512];
     var ptrs[64];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 32, 40);
@@ -963,7 +1238,7 @@ fn test_spirv_lower_negatives() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     # no GLCompute entry point -> LOWER_ERR_NO_ENTRY
     var n = _spv_build_gid_kernel(&buf);
@@ -974,16 +1249,20 @@ fn test_spirv_lower_negatives() {
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
       0 - LOWER_ERR_NO_ENTRY, "no entry rejected");
-    # N.7: BRANCH/SELECTION_MERGE now lower; LOOP_MERGE + PHI still fail loud
-    # (loops break the forward linear-scan; the MVP forbids merge-consumed values).
+    # v4.1.0: BRANCH/SELECTION_MERGE lower, and LOOP_MERGE + PHI now lower too.
+    # This assertion previously read "PHI still rejected" — loops were blocked on
+    # the forward linear-scan liveness (fixed in gfx9_regalloc) and on phi copies
+    # needing edge placement (fixed in _spirv_emit_phi_moves).
+    # An OpPhi whose result type resolves is ACCEPTED and emits no instruction of
+    # its own; the copies live on the predecessors' branches.
     _spv_build_gid_kernel(&buf);
-    store32(&buf + 324, (5 << 16) | 245);   # OpShiftLeftLogical -> OpPhi (still rejected)
+    store32(&buf + 324, (5 << 16) | 245);   # OpShiftLeftLogical -> OpPhi
     spirv_build_type_table(&buf, n, 16, 16, &types);
     spirv_build_const_table(&buf, n, 16, 16, &consts);
     spirv_build_decoration_table(&buf, n, 16, 16, &deco);
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
     assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
-      0 - LOWER_ERR_CONTROL_FLOW, "PHI still rejected");
+      SPIRV_LOWER_OK, "OpPhi now lowers (v4.1.0)");
     # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP (OpFDiv (136) is now lowered as the
     # F.7f.6b macro, so use OpFRem (140) — still unmapped — for the generic-unsupported path).
     _spv_build_gid_kernel(&buf);
@@ -1010,7 +1289,7 @@ fn test_spirv_lower_n2b1_review() {
     var m[80];
     var vals[640];
     var instrs[512];
-    var ptrs[64];
+    var ptrs[128];
     var blocks[32];
     # #1 untrusted ALU operand id -> bounded in mir_emit (was an OOB read in the
     # uniformity sweep). IADD operand a is at buf+296.
@@ -1383,14 +1662,21 @@ fn main(): i64 {
     test_mir_uniformity();
     test_mir_blocks_and_synth();
     test_mir_review_n2a();
+    test_mir_mod_init_contract();
+    test_mir_uninit_module_is_distinguishable();
+    test_compiler_buffer_sizing_recs();
     test_mir_emit_errors();
     test_spirv_lower_gid_kernel();
     test_spirv_const_fold();
     test_spirv_lower_smod();
     test_spirv_lower_fdiv();
-    test_spirv_lower_fdiv_f32_rejects();
+    test_spirv_lower_fdiv_f32();
+    test_mir_f32_div_ops_force_divergent();
     test_spirv_lower_fsqrt();
     test_spirv_f64_arg();
+    test_spirv_lower_select_int_cond();
+    test_spirv_lower_select_int_cond_not_adjacent();
+    test_spirv_lower_select_int_cond_uniform();
     test_spirv_lower_select_rejects_nonmask();
     test_spirv_lower_vec_construct_extract();
     test_spirv_lower_vec_construct_guards();

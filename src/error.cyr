@@ -154,6 +154,56 @@ fn gpu_err_is_recoverable(code): i64 {
 }
 
 # ================================================================
+# v4.0.11 — last shader-compile error (the "return a reason" fix)
+# ================================================================
+# `gpu_shader_module_create_spirv` returns a bare 0 on ANY failure, per its
+# fail-loud-null slot contract. That contract is right — a handle is a handle —
+# but on the native path it made a whole class of failure undiagnosable:
+# consumers could not tell "unsupported opcode" from "id bound exceeded" from
+# "register allocation failed" from "the BO allocation failed", and every case
+# cost a full hardware compile-bisect to identify. It is the single most
+# expensive item in the ranga M6 filing
+# (`docs/development/issues/2026-08-19-native-spirv-compile-limits.md`).
+#
+# The fix keeps the null return and records the REASON alongside it. The stored
+# value is the compiler's own negative code — NOT a lossy GPU_ERR_* mapping —
+# because the whole point is to distinguish faults that would collapse into
+# GPU_ERR_SHADER. `gpu_shader_error_name` (compute.cyr) renders it; it lives
+# there because the code NAMES (MIR_ERR_*, CMP_ERR_*, ...) are defined in the
+# compiler modules, which are included after this one.
+#
+# ⚠ Single-slot and NOT thread-safe, deliberately: shader creation is a setup-path
+# call, and a per-context slot would have to live in the ctx struct, changing its
+# layout. Read it immediately after a failed create, before any other GPU call.
+var _gpu_last_shader_err = 0;
+
+# Record a shader-compile failure reason. Takes the compiler's NEGATIVE code (or
+# a positive staging code); stored verbatim.
+fn _gpu_set_last_shader_err(code): i64 { _gpu_last_shader_err = code; return 0; }
+
+# @public — the reason the most recent shader-module creation failed, or 0 if the
+# last one succeeded. Negative values are compiler-stage codes; see
+# `gpu_shader_error_name`. Cleared on every successful create, so a stale reason
+# never reads as a fresh failure.
+fn gpu_last_shader_error(): i64 { return _gpu_last_shader_err; }
+
+# Staging-stage failures — the non-compile paths in _native_shader_compile_spirv.
+# Band 110-119, disjoint from every compiler band (mir 20-32, lower 26-29,
+# regalloc 50-52, waitcnt 60-61, cmp 70-87, gisel 100-101). Stored NEGATED like
+# the compiler codes so one accessor covers both.
+var SHMOD_ERR_NULL_CTX    = 110;   # ctx was 0
+var SHMOD_ERR_NULL_WORDS  = 111;   # words_ptr was 0
+var SHMOD_ERR_TOO_SHORT   = 112;   # byte_len < 20 (shorter than a SPIR-V header)
+var SHMOD_ERR_ISA_EMPTY   = 113;   # compile produced 0 bytes of ISA
+var SHMOD_ERR_ISA_TOO_BIG = 114;   # compiled ISA exceeds the staging buffer
+var SHMOD_ERR_VA_ALLOC    = 115;   # context VA reservation failed
+var SHMOD_ERR_BO_CREATE   = 116;   # GTT BO creation failed
+var SHMOD_ERR_VA_MAP      = 117;   # GEM_VA map failed
+var SHMOD_ERR_OOM         = 118;   # shmod struct allocation failed
+var SHMOD_ERR_F64_GATE    = 119;   # module uses f64 and MABDA_NATIVE_F64 is off
+var SHMOD_ERR_SRC_KIND    = 120;   # source kind not accepted natively (WGSL / raw GFX9)
+
+# ================================================================
 # Error name lookup
 # ================================================================
 

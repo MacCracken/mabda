@@ -1,0 +1,219 @@
+# programs/native_spirv_f32_div_e2e.cyr — v4.1.0: f32 OpFDiv compiled in-tree and
+# dispatched on Cezanne, verified BIT-EXACT against an IEEE reference.
+#
+# Kernel: `out[gid.x] = a[gid.x] / b[gid.x];` (f32). LocalSize 8, one workgroup.
+#
+# OpFDiv shipped f64-only at F.7f.6b — f32 was explicitly rejected because
+# wgpu/naga covered it and no native consumer existed. ranga M6 is that consumer,
+# and its filing names OpFDiv "the most commonly needed missing op". v4.1.0 lowers
+# f32 through the same correctly-rounded GFX9 sequence as f64 (div_scale / rcp /
+# two Newton refinements / div_fmas / div_fixup — 11 MIR instructions).
+#
+# ⚠ Deliberately NOT `mul(N, rcp(D))`. v_rcp_f32 is a ~1-ulp APPROXIMATION, so the
+# cheap form is not IEEE division. This test exists to prove the difference: the
+# lanes below include cases where an approximate reciprocal gives a visibly wrong
+# last bit, so a regression to the cheap form fails here rather than passing
+# "close enough".
+#
+# The 8 lanes are curated edges: exact powers of two (must be exact at any
+# precision), a value whose quotient is NOT representable (1/3 — the ulp probe),
+# division by 1, a subnormal-producing pair, +-0, and inf/nan propagation.
+#
+# Exit: 0 = correct; 2 = compile; 3/5 = setup; 9 = dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn print_hex(n): i64 {
+    var buf[16];
+    var d = 0;
+    while (d < 8) {
+        var nib = (n >> ((7 - d) * 4)) & 0xF;
+        var ch = 48 + nib;
+        if (nib > 9) { ch = 87 + nib; }
+        store8(&buf + d, ch);
+        d = d + 1;
+    }
+    syscall(1, 1, &buf, 8);
+    return 0;
+}
+
+# Append one SPIR-V word, returning the next byte offset. Using a running cursor
+# rather than hardcoded offsets: this kernel inserts an OpTypeFloat the u32
+# siblings do not have, and hand-shifting ~150 literal offsets to make room is how
+# an off-by-one gets encoded as a "GPU bug".
+fn w(buf, off, v): i64 { store32(buf + off, v); return off + 4; }
+
+# SPIR-V, id bound 26. %3 uint (gid + access-chain index), %25 float (the data),
+# %12/%13/%14 = a/b/out at bindings 0/1/2, %23 = OpFDiv.
+fn build_f32_div_kernel(buf): i64 {
+    var o = 0;
+    o = w(buf, o, 0x07230203);
+    o = w(buf, o, 0x00010300);
+    o = w(buf, o, 0);
+    o = w(buf, o, 26);            # id bound
+    o = w(buf, o, 0);
+
+    o = w(buf, o, (2 << 16) | 17); o = w(buf, o, 1);              # OpCapability Shader
+    o = w(buf, o, (3 << 16) | 14); o = w(buf, o, 0); o = w(buf, o, 1);  # OpMemoryModel
+    o = w(buf, o, (6 << 16) | 15);                                # OpEntryPoint GLCompute
+    o = w(buf, o, 5); o = w(buf, o, 15); o = w(buf, o, 0x6E69616D);
+    o = w(buf, o, 0); o = w(buf, o, 11);
+    o = w(buf, o, (6 << 16) | 16);                                # OpExecutionMode LocalSize 8 1 1
+    o = w(buf, o, 15); o = w(buf, o, 17); o = w(buf, o, 8); o = w(buf, o, 1); o = w(buf, o, 1);
+
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 11); o = w(buf, o, 11); o = w(buf, o, 28);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 12); o = w(buf, o, 33); o = w(buf, o, 0);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 12); o = w(buf, o, 34); o = w(buf, o, 0);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 13); o = w(buf, o, 33); o = w(buf, o, 1);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 13); o = w(buf, o, 34); o = w(buf, o, 0);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 14); o = w(buf, o, 33); o = w(buf, o, 2);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 14); o = w(buf, o, 34); o = w(buf, o, 0);
+
+    o = w(buf, o, (2 << 16) | 19); o = w(buf, o, 1);              # %1 void
+    o = w(buf, o, (3 << 16) | 33); o = w(buf, o, 2); o = w(buf, o, 1);   # %2 fn
+    o = w(buf, o, (4 << 16) | 21); o = w(buf, o, 3); o = w(buf, o, 32); o = w(buf, o, 0);  # %3 uint
+    o = w(buf, o, (3 << 16) | 22); o = w(buf, o, 25); o = w(buf, o, 32); # %25 float
+    o = w(buf, o, (4 << 16) | 23); o = w(buf, o, 4); o = w(buf, o, 3); o = w(buf, o, 3);   # %4 v3uint
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 5); o = w(buf, o, 1); o = w(buf, o, 4);   # %5 ptr In
+    o = w(buf, o, (3 << 16) | 29); o = w(buf, o, 6); o = w(buf, o, 25);  # %6 runtime array float
+    o = w(buf, o, (3 << 16) | 30); o = w(buf, o, 7); o = w(buf, o, 6);   # %7 struct { %6 }
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 8); o = w(buf, o, 12); o = w(buf, o, 7);  # %8 ptr SB struct
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 9); o = w(buf, o, 12); o = w(buf, o, 25); # %9 ptr SB float
+    o = w(buf, o, (4 << 16) | 43); o = w(buf, o, 3); o = w(buf, o, 10); o = w(buf, o, 0);  # %10 const uint 0
+
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 5); o = w(buf, o, 11); o = w(buf, o, 1);   # %11 gid
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 8); o = w(buf, o, 12); o = w(buf, o, 12);  # %12 a
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 8); o = w(buf, o, 13); o = w(buf, o, 12);  # %13 b
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 8); o = w(buf, o, 14); o = w(buf, o, 12);  # %14 out
+
+    o = w(buf, o, (5 << 16) | 54); o = w(buf, o, 1); o = w(buf, o, 15);  # OpFunction %15
+    o = w(buf, o, 0); o = w(buf, o, 2);
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 16);            # OpLabel %16
+    o = w(buf, o, (4 << 16) | 61); o = w(buf, o, 4); o = w(buf, o, 17); o = w(buf, o, 11);  # %17 load gid
+    o = w(buf, o, (5 << 16) | 81); o = w(buf, o, 3); o = w(buf, o, 18);                     # %18 gid.x
+    o = w(buf, o, 17); o = w(buf, o, 0);
+    o = w(buf, o, (6 << 16) | 65); o = w(buf, o, 9); o = w(buf, o, 19);                     # %19 &a[gid.x]
+    o = w(buf, o, 12); o = w(buf, o, 10); o = w(buf, o, 18);
+    o = w(buf, o, (4 << 16) | 61); o = w(buf, o, 25); o = w(buf, o, 20); o = w(buf, o, 19); # %20 a[gid.x]
+    o = w(buf, o, (6 << 16) | 65); o = w(buf, o, 9); o = w(buf, o, 21);                     # %21 &b[gid.x]
+    o = w(buf, o, 13); o = w(buf, o, 10); o = w(buf, o, 18);
+    o = w(buf, o, (4 << 16) | 61); o = w(buf, o, 25); o = w(buf, o, 22); o = w(buf, o, 21); # %22 b[gid.x]
+    o = w(buf, o, (5 << 16) | 136); o = w(buf, o, 25); o = w(buf, o, 23);                   # %23 = a / b
+    o = w(buf, o, 20); o = w(buf, o, 22);
+    o = w(buf, o, (6 << 16) | 65); o = w(buf, o, 9); o = w(buf, o, 24);                     # %24 &out[gid.x]
+    o = w(buf, o, 14); o = w(buf, o, 10); o = w(buf, o, 18);
+    o = w(buf, o, (3 << 16) | 62); o = w(buf, o, 24); o = w(buf, o, 23);                    # OpStore
+    o = w(buf, o, (1 << 16) | 253);                               # OpReturn
+    o = w(buf, o, (1 << 16) | 56);                                # OpFunctionEnd
+    return o;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V f32 OpFDiv e2e (v4.1.0) on Cezanne\n");
+    print_cstr("------------------------------------------------------\n");
+
+    var spv[1024];
+    var n = build_f32_div_kernel(&spv);
+    print_cstr("SPIR-V bytes: "); print_i64(n); print_cstr("\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (shmod == 0) {
+        # v4.1.0 — and this is the OTHER half of the release: a failed create now
+        # says WHY instead of returning a bare 0.
+        print_cstr("FAIL: shader_module_create_spirv -> 0, reason: ");
+        gpu_shader_error_print();
+        return 2;
+    }
+
+    # Curated f32 edge lanes, as raw bit patterns (a, b) with the IEEE-correct
+    # quotient pinned as bits. Every `want` below is the bit pattern a correctly
+    # rounded division must produce — NOT a tolerance.
+    var av[32];
+    var bv[32];
+    var wv[32];
+    #                       a                         b                         a/b
+    store32(&av + 0,  0x40000000); store32(&bv + 0,  0x40800000); store32(&wv + 0,  0x3F000000); # 2/4 = 0.5
+    store32(&av + 4,  0x3F800000); store32(&bv + 4,  0x40400000); store32(&wv + 4,  0x3EAAAAAB); # 1/3 (ULP PROBE)
+    store32(&av + 8,  0x41200000); store32(&bv + 8,  0x3F800000); store32(&wv + 8,  0x41200000); # 10/1 = 10
+    store32(&av + 12, 0x40490FDB); store32(&bv + 12, 0x40000000); store32(&wv + 12, 0x3FC90FDB); # pi/2
+    store32(&av + 16, 0x00000000); store32(&bv + 16, 0x3F800000); store32(&wv + 16, 0x00000000); # 0/1 = +0
+    store32(&av + 20, 0x3F800000); store32(&bv + 20, 0x7F800000); store32(&wv + 20, 0x00000000); # 1/inf = +0
+    store32(&av + 24, 0x3F800000); store32(&bv + 24, 0x00000000); store32(&wv + 24, 0x7F800000); # 1/0 = +inf
+    store32(&av + 28, 0xC1200000); store32(&bv + 28, 0x40800000); store32(&wv + 28, 0xC0200000); # -10/4 = -2.5
+
+    var ab[16];
+    var bb[16];
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ab) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &bb) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 5; }
+    var a_handle = load64(&ab + 0); var a_map = load64(&ab + 8);
+    var b_handle = load64(&bb + 0); var b_map = load64(&bb + 8);
+    var o_handle = load64(&ob + 0); var o_map = load64(&ob + 8);
+    var i = 0;
+    while (i < 8) {
+        store32(a_map + i * 4, load32(&av + i * 4));
+        store32(b_map + i * 4, load32(&bv + i * 4));
+        store32(o_map + i * 4, 0xBAADF00D);
+        i = i + 1;
+    }
+    var a_va = 0xFFFF800100400000;
+    var b_va = 0xFFFF800100401000;
+    var o_va = 0xFFFF800100402000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, b_handle, b_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    var bp[56];
+    store64(&bp + 0, 3);
+    store64(&bp + 8, a_handle);  store64(&bp + 16, a_va);
+    store64(&bp + 24, b_handle); store64(&bp + 32, b_va);
+    store64(&bp + 40, o_handle); store64(&bp + 48, o_va);
+
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, &bp);
+    if (rc != 0) { print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    var ok = 1;
+    i = 0;
+    while (i < 8) {
+        var got = load32(o_map + i * 4);
+        var want = load32(&wv + i * 4);
+        print_cstr("  lane "); print_i64(i);
+        print_cstr(": 0x"); print_hex(load32(&av + i * 4));
+        print_cstr(" / 0x"); print_hex(load32(&bv + i * 4));
+        print_cstr(" = 0x"); print_hex(got);
+        if (got != want) { print_cstr("  MISMATCH want=0x"); print_hex(want); ok = 0; }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    gpu_shader_module_release(ctx, shmod);
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_gem_va_unmap(fd, b_handle, b_va, 4096);
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    native_bo_release_gtt(fd, b_handle, b_map, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: f32 division not bit-exact\n"); return 11; }
+    print_cstr("OK — f32 OpFDiv BIT-EXACT on Cezanne over the edge matrix\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

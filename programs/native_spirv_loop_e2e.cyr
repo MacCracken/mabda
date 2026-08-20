@@ -1,0 +1,208 @@
+# programs/native_spirv_loop_e2e.cyr — v4.1.0: a structured counted LOOP with an
+# OpPhi, compiled in-tree and dispatched on Cezanne.
+#
+# Kernel: `var acc = 0u; for (i = 0; i < 4; i++) { acc += a[gid.x]; } out[gid.x] = acc;`
+# i.e. out[gid.x] == 4 * a[gid.x]. LocalSize 8, one workgroup.
+#
+# ⭐ WHY THIS IS THE INTERESTING TEST: loops were rejected outright before v4.1.0
+# (`LOWER_ERR_CONTROL_FLOW`) for two independent reasons, and this kernel exercises
+# BOTH at once:
+#
+#  1. A BACK-EDGE breaks forward linear-scan liveness. `a[gid.x]` is loaded before
+#     the loop and read inside it, so a forward scan frees its register at the
+#     textual last use and lets a later value in the body reuse it — giving the
+#     wrong answer from iteration 2 onward. gfx9_regalloc now extends any interval
+#     whose last use lands inside a loop to the loop's end.
+#  2. TWO OpPhis (the counter and the accumulator) carry values across the
+#     back-edge. Their copies cannot go where OpPhi is written (the loop header —
+#     they would re-run every iteration and reset both), so they are emitted on the
+#     incoming EDGES, and the allocator now assigns each value ONE register across
+#     both of its definitions.
+#
+# ⚠ The multiplier is 4, not 1: a loop that executes exactly once would pass even
+# with the back-edge miscompiled, and an accumulator that never accumulates would
+# match a single iteration. 4 * a distinguishes "the loop ran 4 times, carrying
+# both phis correctly" from every partial failure.
+#
+# Exit: 0 = correct; 2 = compile; 3/5 = setup; 9 = dispatch; 11 = mismatch.
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn w(buf, off, v): i64 { store32(buf + off, v); return off + 4; }
+
+# SPIR-V, id bound 40. Structured loop:
+#   %16 entry:   %20 = a[gid.x];  OpBranch %30
+#   %30 header:  %31 = phi(0 from %16, %36 from %34)      ; i
+#                %32 = phi(0 from %16, %35 from %34)      ; acc
+#                OpLoopMerge %39 %34; OpBranchConditional (%31 < 4) %33 %39
+#   %33 body:    OpBranch %34
+#   %34 continue:%35 = %32 + %20;  %36 = %31 + 1;  OpBranch %30   ; BACK-EDGE
+#   %39 merge:   out[gid.x] = %32;  OpReturn
+fn build_loop_kernel(buf): i64 {
+    var o = 0;
+    o = w(buf, o, 0x07230203);
+    o = w(buf, o, 0x00010300);
+    o = w(buf, o, 0);
+    o = w(buf, o, 40);
+    o = w(buf, o, 0);
+
+    o = w(buf, o, (2 << 16) | 17); o = w(buf, o, 1);
+    o = w(buf, o, (3 << 16) | 14); o = w(buf, o, 0); o = w(buf, o, 1);
+    o = w(buf, o, (6 << 16) | 15);
+    o = w(buf, o, 5); o = w(buf, o, 15); o = w(buf, o, 0x6E69616D);
+    o = w(buf, o, 0); o = w(buf, o, 11);
+    o = w(buf, o, (6 << 16) | 16);
+    o = w(buf, o, 15); o = w(buf, o, 17); o = w(buf, o, 8); o = w(buf, o, 1); o = w(buf, o, 1);
+
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 11); o = w(buf, o, 11); o = w(buf, o, 28);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 12); o = w(buf, o, 33); o = w(buf, o, 0);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 12); o = w(buf, o, 34); o = w(buf, o, 0);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 14); o = w(buf, o, 33); o = w(buf, o, 1);
+    o = w(buf, o, (4 << 16) | 71); o = w(buf, o, 14); o = w(buf, o, 34); o = w(buf, o, 0);
+
+    o = w(buf, o, (2 << 16) | 19); o = w(buf, o, 1);                                       # %1 void
+    o = w(buf, o, (3 << 16) | 33); o = w(buf, o, 2); o = w(buf, o, 1);                     # %2 fn
+    o = w(buf, o, (4 << 16) | 21); o = w(buf, o, 3); o = w(buf, o, 32); o = w(buf, o, 0);  # %3 uint
+    o = w(buf, o, (2 << 16) | 20); o = w(buf, o, 26);                                      # %26 bool
+    o = w(buf, o, (4 << 16) | 23); o = w(buf, o, 4); o = w(buf, o, 3); o = w(buf, o, 3);   # %4 v3uint
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 5); o = w(buf, o, 1); o = w(buf, o, 4);   # %5 ptr In
+    o = w(buf, o, (3 << 16) | 29); o = w(buf, o, 6); o = w(buf, o, 3);                     # %6 rt array
+    o = w(buf, o, (3 << 16) | 30); o = w(buf, o, 7); o = w(buf, o, 6);                     # %7 struct
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 8); o = w(buf, o, 12); o = w(buf, o, 7);  # %8 ptr SB st
+    o = w(buf, o, (4 << 16) | 32); o = w(buf, o, 9); o = w(buf, o, 12); o = w(buf, o, 3);  # %9 ptr SB uint
+    o = w(buf, o, (4 << 16) | 43); o = w(buf, o, 3); o = w(buf, o, 10); o = w(buf, o, 0);  # %10 const 0
+    o = w(buf, o, (4 << 16) | 43); o = w(buf, o, 3); o = w(buf, o, 27); o = w(buf, o, 4);  # %27 const 4
+    o = w(buf, o, (4 << 16) | 43); o = w(buf, o, 3); o = w(buf, o, 28); o = w(buf, o, 1);  # %28 const 1
+
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 5); o = w(buf, o, 11); o = w(buf, o, 1);   # %11 gid
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 8); o = w(buf, o, 12); o = w(buf, o, 12);  # %12 a
+    o = w(buf, o, (4 << 16) | 59); o = w(buf, o, 8); o = w(buf, o, 14); o = w(buf, o, 12);  # %14 out
+
+    o = w(buf, o, (5 << 16) | 54); o = w(buf, o, 1); o = w(buf, o, 15);
+    o = w(buf, o, 0); o = w(buf, o, 2);
+
+    # --- entry block %16 ---
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 16);
+    o = w(buf, o, (4 << 16) | 61); o = w(buf, o, 4); o = w(buf, o, 17); o = w(buf, o, 11);  # %17 = gid
+    o = w(buf, o, (5 << 16) | 81); o = w(buf, o, 3); o = w(buf, o, 18);                     # %18 = gid.x
+    o = w(buf, o, 17); o = w(buf, o, 0);
+    o = w(buf, o, (6 << 16) | 65); o = w(buf, o, 9); o = w(buf, o, 19);                     # %19 = &a[gid.x]
+    o = w(buf, o, 12); o = w(buf, o, 10); o = w(buf, o, 18);
+    o = w(buf, o, (4 << 16) | 61); o = w(buf, o, 3); o = w(buf, o, 20); o = w(buf, o, 19);  # %20 = a[gid.x]
+    o = w(buf, o, (2 << 16) | 249); o = w(buf, o, 30);                                      # OpBranch %30
+
+    # --- loop header %30 ---
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 30);
+    o = w(buf, o, (7 << 16) | 245); o = w(buf, o, 3); o = w(buf, o, 31);                    # %31 = phi i
+    o = w(buf, o, 10); o = w(buf, o, 16); o = w(buf, o, 36); o = w(buf, o, 34);
+    o = w(buf, o, (7 << 16) | 245); o = w(buf, o, 3); o = w(buf, o, 32);                    # %32 = phi acc
+    o = w(buf, o, 10); o = w(buf, o, 16); o = w(buf, o, 35); o = w(buf, o, 34);
+    o = w(buf, o, (4 << 16) | 246); o = w(buf, o, 39); o = w(buf, o, 34); o = w(buf, o, 0); # OpLoopMerge
+    o = w(buf, o, (5 << 16) | 176); o = w(buf, o, 26); o = w(buf, o, 37);                   # %37 = %31 < 4
+    o = w(buf, o, 31); o = w(buf, o, 27);
+    o = w(buf, o, (4 << 16) | 250); o = w(buf, o, 37); o = w(buf, o, 33); o = w(buf, o, 39); # OpBranchConditional
+
+    # --- body %33 ---
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 33);
+    o = w(buf, o, (2 << 16) | 249); o = w(buf, o, 34);
+
+    # --- continue %34 (the back-edge) ---
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 34);
+    o = w(buf, o, (5 << 16) | 128); o = w(buf, o, 3); o = w(buf, o, 35);                    # %35 = acc + a
+    o = w(buf, o, 32); o = w(buf, o, 20);
+    o = w(buf, o, (5 << 16) | 128); o = w(buf, o, 3); o = w(buf, o, 36);                    # %36 = i + 1
+    o = w(buf, o, 31); o = w(buf, o, 28);
+    o = w(buf, o, (2 << 16) | 249); o = w(buf, o, 30);                                      # BACK-EDGE
+
+    # --- merge %39 ---
+    o = w(buf, o, (2 << 16) | 248); o = w(buf, o, 39);
+    o = w(buf, o, (6 << 16) | 65); o = w(buf, o, 9); o = w(buf, o, 38);                     # %38 = &out[gid.x]
+    o = w(buf, o, 14); o = w(buf, o, 10); o = w(buf, o, 18);
+    o = w(buf, o, (3 << 16) | 62); o = w(buf, o, 38); o = w(buf, o, 32);                    # out = acc
+    o = w(buf, o, (1 << 16) | 253);
+    o = w(buf, o, (1 << 16) | 56);
+    return o;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V structured LOOP + OpPhi e2e (v4.1.0) on Cezanne\n");
+    print_cstr("------------------------------------------------------------------\n");
+
+    var spv[2048];
+    var n = build_loop_kernel(&spv);
+    print_cstr("SPIR-V bytes: "); print_i64(n); print_cstr("\n");
+
+    var ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res) == 1) { return 3; }
+    var ctx = payload(ctx_res);
+    var fd = native_ctx_fd(ctx);
+
+    var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (shmod == 0) {
+        print_cstr("FAIL: shader_module_create_spirv -> 0, reason: ");
+        gpu_shader_error_print();
+        return 2;
+    }
+
+    var ab[16];
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ab) != 0) { return 5; }
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 5; }
+    var a_handle = load64(&ab + 0); var a_map = load64(&ab + 8);
+    var o_handle = load64(&ob + 0); var o_map = load64(&ob + 8);
+    var i = 0;
+    while (i < 8) {
+        store32(a_map + i * 4, i + 1);        # a[i] = i+1  ->  out[i] must be 4*(i+1)
+        store32(o_map + i * 4, 0xBAADF00D);
+        i = i + 1;
+    }
+    var a_va = 0xFFFF800100400000;
+    var o_va = 0xFFFF800100402000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+
+    var bp[40];
+    store64(&bp + 0, 2);
+    store64(&bp + 8, a_handle);  store64(&bp + 16, a_va);
+    store64(&bp + 24, o_handle); store64(&bp + 32, o_va);
+
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, &bp);
+    if (rc != 0) { print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n"); return 9; }
+
+    var ok = 1;
+    i = 0;
+    while (i < 8) {
+        var got = load32(o_map + i * 4);
+        var want = 4 * (i + 1);
+        print_cstr("  lane "); print_i64(i);
+        print_cstr(": 4 * "); print_i64(i + 1);
+        print_cstr(" = "); print_i64(got);
+        if (got != want) { print_cstr("  MISMATCH want="); print_i64(want); ok = 0; }
+        print_cstr("\n");
+        i = i + 1;
+    }
+
+    gpu_shader_module_release(ctx, shmod);
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    gpu_context_release(ctx);
+
+    if (ok == 0) { print_cstr("FAIL: loop result mismatch\n"); return 11; }
+    print_cstr("OK - structured loop + OpPhi correct on Cezanne (4 iterations, 2 carried values)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

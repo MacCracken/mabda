@@ -40,12 +40,12 @@ fn test_gfx9_compile_saxpy_lid() {
     var m[80];
     var vals[1216];
     var instrs[1024];
-    var ptrs[128];
+    var ptrs[256];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 30);
     var outbi[256];
-    var isel[768];
-    var isel2[768];
+    var isel[12288];
+    var isel2[12288];
     var alloc[512];
     var hw[16];
     var abi[64];
@@ -100,8 +100,8 @@ fn test_gfx9_compile_saxpy_gid() {
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
     var outbi[256];
-    var isel[960];
-    var isel2[960];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -148,8 +148,8 @@ fn test_gfx9_compile_uniform_if() {
     var ptrs[256];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
-    var isel[1536];
-    var isel2[1536];
+    var isel[12288];
+    var isel2[12288];
     var alloc[512];
     var hw[16];
     var abi[64];
@@ -250,8 +250,8 @@ fn test_gfx9_compile_rejects_over_capacity() {
     var ptrs[256];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 4, 8);
-    var isel[640];
-    var isel2[640];
+    var isel[12288];
+    var isel2[12288];
     var alloc[256];
     var hw[16];
     var abi[64];
@@ -296,6 +296,141 @@ fn test_gfx9_abi_too_many_bindings() {
 # The canonical ABI assignment: 2 buffer bindings + a 1-D GlobalInvocationId (which
 # the lowering expands to wgid.x + lid.x EXTRACTs). The ABI derives the TGID/LID
 # enables from the MAX component each builtin is extracted with (N.6).
+# v4.0.11 — the ranga M6 filing's item 1: a failed shader-module create must
+# report WHY. Before this, `gpu_shader_module_create_spirv` returned a bare 0 for
+# every distinct fault — unsupported opcode, id-bound overflow, regalloc failure,
+# BO allocation failure — and each cost a full hardware compile-bisect to tell
+# apart. These assert the reason survives the trip and renders.
+fn test_shader_error_reason_roundtrip() {
+    # The slot round-trips verbatim: the compiler's own negative code, NOT a lossy
+    # mapping onto GPU_ERR_SHADER (which would erase the distinction the fix
+    # exists to create).
+    _gpu_set_last_shader_err(0 - CMP_ERR_VALIDATE);
+    assert_eq(gpu_last_shader_error(), 0 - CMP_ERR_VALIDATE, "reason round-trips verbatim");
+    _gpu_set_last_shader_err(0);
+    assert_eq(gpu_last_shader_error(), 0, "cleared reason reads 0");
+
+    # A REAL compile failure produces a code that names its own stage.
+    var bad[24];
+    store32(&bad + 0, 0x07230203);
+    store32(&bad + 4, 0x00010500);
+    store32(&bad + 8, 0);
+    store32(&bad + 12, 4);
+    store32(&bad + 16, 0);
+    var types[960];
+    var consts[640];
+    var deco[640];
+    var m[80];
+    var vals[1600];
+    var instrs[1024];
+    var ptrs[256];
+    var blocks[32];
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 4, 40);
+    var outbi[320];
+    var isel[12288];
+    var isel2[12288];
+    var alloc[640];
+    var hw[16];
+    var abi[64];
+    var ctx[88];
+    store64(&ctx + CC_TYPES, &types);
+    store64(&ctx + CC_CONSTS, &consts);
+    store64(&ctx + CC_DECO, &deco);
+    store64(&ctx + CC_M, &m);
+    store64(&ctx + CC_OUTBI, &outbi);
+    store64(&ctx + CC_ISEL, &isel);
+    store64(&ctx + CC_ISEL2, &isel2);
+    store64(&ctx + CC_ALLOC, &alloc);
+    store64(&ctx + CC_HW, &hw);
+    store64(&ctx + CC_ABI, &abi);
+    store64(&ctx + CC_CAP_IDS, 40);
+    var isa[640];
+    var desc[72];
+    var rc = gfx9_compile(&ctx, &bad, 20, &isa, &desc);
+    # A header-only module is structurally VALID (good magic, good version, no
+    # instructions), so it clears spirv_validate_stream and fails one stage later
+    # at lowering, with no OpEntryPoint to find. That is the more useful case for
+    # this test than a malformed one: it proves the reason survives from a stage
+    # DEEPER than the front gate, which is where every case in the ranga filing
+    # actually failed.
+    assert_eq(rc, 0 - LOWER_ERR_NO_ENTRY, "header-only module -> LOWER_ERR_NO_ENTRY");
+    # ... and that code renders as something a consumer can act on, rather than
+    # falling through to the unrecognized-code tail.
+    assert_neq(gpu_shader_error_name(rc), gpu_shader_error_name(0 - 9999),
+      "a real code does not render as the unrecognized fallback");
+    return 0;
+}
+
+# Every code the compiler can actually return must RENDER. A name lookup that
+# silently falls through to "unrecognized" for a live code is the same defect one
+# level up — the consumer still cannot tell the failures apart.
+fn test_shader_error_names_cover_every_band() {
+    var unk = gpu_shader_error_name(0 - 9999);
+    assert_eq(gpu_shader_error_name(0), "no error", "0 renders as no error");
+    # MIR band, incl. the three v4.0.11 additions.
+    assert_neq(gpu_shader_error_name(0 - MIR_ERR_UNSUPPORTED_OP), unk, "MIR_ERR_UNSUPPORTED_OP named");
+    assert_neq(gpu_shader_error_name(0 - MIR_ERR_ID_OOR), unk, "MIR_ERR_ID_OOR named");
+    assert_neq(gpu_shader_error_name(0 - MIR_ERR_MOD_UNINIT), unk, "MIR_ERR_MOD_UNINIT named");
+    assert_neq(gpu_shader_error_name(0 - MIR_ERR_VALS_OVERRUN), unk, "MIR_ERR_VALS_OVERRUN named");
+    assert_neq(gpu_shader_error_name(0 - MIR_ERR_BAD_INIT), unk, "MIR_ERR_BAD_INIT named");
+    # Lowering.
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_CONTROL_FLOW), unk, "LOWER_ERR_CONTROL_FLOW named");
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_NO_ENTRY), unk, "LOWER_ERR_NO_ENTRY named");
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_ARRAY_STRIDE), unk, "LOWER_ERR_ARRAY_STRIDE named");
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_EXT_SET), unk, "LOWER_ERR_EXT_SET named");
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_SELECT_NOT_ADJACENT), unk,
+      "LOWER_ERR_SELECT_NOT_ADJACENT named");
+    assert_neq(gpu_shader_error_name(0 - LOWER_ERR_SELECT_UNIFORM_COND), unk,
+      "LOWER_ERR_SELECT_UNIFORM_COND named");
+    # Regalloc — the band the filing's capacity complaint lands in.
+    assert_neq(gpu_shader_error_name(0 - RA_ERR_SGPR_OVERFLOW), unk, "RA_ERR_SGPR_OVERFLOW named");
+    assert_neq(gpu_shader_error_name(0 - RA_ERR_VGPR_OVERFLOW), unk, "RA_ERR_VGPR_OVERFLOW named");
+    assert_neq(gpu_shader_error_name(0 - RA_ERR_CAP_TOO_LARGE), unk, "RA_ERR_CAP_TOO_LARGE named");
+    # waitcnt.
+    assert_neq(gpu_shader_error_name(0 - WC_ERR_CAP), unk, "WC_ERR_CAP named");
+    assert_neq(gpu_shader_error_name(0 - WC_ERR_TOO_MANY_IDS), unk, "WC_ERR_TOO_MANY_IDS named");
+    # Encode / validate / tables.
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_UNSUPPORTED_OP), unk, "CMP_ERR_UNSUPPORTED_OP named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_VALIDATE), unk, "CMP_ERR_VALIDATE named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_TABLE), unk, "CMP_ERR_TABLE named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_TOO_MANY_IDS), unk, "CMP_ERR_TOO_MANY_IDS named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_UNRESOLVED_LABEL), unk, "CMP_ERR_UNRESOLVED_LABEL named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_TOO_MANY_BRANCHES), unk, "CMP_ERR_TOO_MANY_BRANCHES named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_VOP3_LITERAL), unk, "CMP_ERR_VOP3_LITERAL named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_BINDING_RANGE), unk, "CMP_ERR_BINDING_RANGE named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_UNSUPPORTED_BUILTIN), unk, "CMP_ERR_UNSUPPORTED_BUILTIN named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_FLAT_CONST_OFFSET), unk, "CMP_ERR_FLAT_CONST_OFFSET named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_FLAT_NONVGPR), unk, "CMP_ERR_FLAT_NONVGPR named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_NO_VGPR_OPERAND), unk, "CMP_ERR_NO_VGPR_OPERAND named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_BAD_SALU_OPERAND), unk, "CMP_ERR_BAD_SALU_OPERAND named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_TWO_LITERALS), unk, "CMP_ERR_TWO_LITERALS named");
+    assert_neq(gpu_shader_error_name(0 - CMP_ERR_UNSUPPORTED_OPERAND), unk, "CMP_ERR_UNSUPPORTED_OPERAND named");
+    # Instruction selection.
+    assert_neq(gpu_shader_error_name(0 - GISEL_ERR_UNSUPPORTED_OP), unk, "GISEL_ERR_UNSUPPORTED_OP named");
+    assert_neq(gpu_shader_error_name(0 - GISEL_ERR_CAP_EXCEEDED), unk, "GISEL_ERR_CAP_EXCEEDED named");
+    assert_neq(gpu_shader_error_name(0 - GISEL_ERR_NESTED_SELECTION), unk, "GISEL_ERR_NESTED_SELECTION named");
+    assert_neq(gpu_shader_error_name(0 - GISEL_ERR_RETURN_IN_SELECTION), unk,
+      "GISEL_ERR_RETURN_IN_SELECTION named");
+    assert_neq(gpu_shader_error_name(0 - GISEL_ERR_UNCLOSED_SELECTION), unk,
+      "GISEL_ERR_UNCLOSED_SELECTION named");
+    # Staging — the non-compile half, which returned 0 just as silently.
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_NULL_CTX), unk, "SHMOD_ERR_NULL_CTX named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_NULL_WORDS), unk, "SHMOD_ERR_NULL_WORDS named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_TOO_SHORT), unk, "SHMOD_ERR_TOO_SHORT named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_ISA_EMPTY), unk, "SHMOD_ERR_ISA_EMPTY named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_ISA_TOO_BIG), unk, "SHMOD_ERR_ISA_TOO_BIG named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_VA_ALLOC), unk, "SHMOD_ERR_VA_ALLOC named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_BO_CREATE), unk, "SHMOD_ERR_BO_CREATE named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_VA_MAP), unk, "SHMOD_ERR_VA_MAP named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_OOM), unk, "SHMOD_ERR_OOM named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_F64_GATE), unk, "SHMOD_ERR_F64_GATE named");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_SRC_KIND), unk, "SHMOD_ERR_SRC_KIND named");
+    # Anti-vacuous: an unassigned code MUST still fall through, or every
+    # assert_neq above would pass against a lookup that returns a constant.
+    assert_eq(gpu_shader_error_name(0 - 9998), unk, "an unassigned code renders as unrecognized");
+    return 0;
+}
+
 fn test_gfx9_abi_assign() {
     var m[80];
     var vals[1280];
@@ -409,13 +544,13 @@ fn test_gfx9_compile_f64_fma() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -454,13 +589,13 @@ fn test_gfx9_compile_f64_arith() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 33, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -500,13 +635,13 @@ fn test_gfx9_compile_f64_cvt() {
     var deco[768];
     var m[80];
     var vals[1600];
-    var instrs[1024];
-    var ptrs[256];
+    var instrs[1280];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 40, 16, 25, 40);
     var outbi[320];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[640];
     var hw[16];
     var abi[64];
@@ -544,13 +679,13 @@ fn test_gfx9_compile_f64_subabs() {
     var deco[768];
     var m[80];
     var vals[1792];
-    var instrs[1152];
-    var ptrs[256];
+    var instrs[1408];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 44, 16, 28, 44);
     var outbi[352];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[704];
     var hw[16];
     var abi[64];
@@ -609,13 +744,13 @@ fn test_gfx9_compile_f64_vec() {
     # id-indexed buffers for cap_ids=64: vals 64*40, alloc 64*16, instrs 64*24 (undersizing them
     # makes mir_mod_init / regalloc memset past the buffer and corrupt the stack -> garbage error).
     var vals[2560];
-    var instrs[1536];
-    var ptrs[384];
+    var instrs[2048];
+    var ptrs[768];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 27, 64);
     var outbi[512];
-    var isel[2048];
-    var isel2[2048];
+    var isel[12288];
+    var isel2[12288];
     var alloc[1024];
     var hw[16];
     var abi[64];
@@ -650,13 +785,13 @@ fn test_gfx9_compile_f64_div() {
     var deco[768];
     var m[80];
     var vals[2560];
-    var instrs[1536];
-    var ptrs[384];
+    var instrs[2048];
+    var ptrs[768];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 27, 64);
     var outbi[512];
-    var isel[2048];
-    var isel2[2048];
+    var isel[12288];
+    var isel2[12288];
     var alloc[1024];
     var hw[16];
     var abi[64];
@@ -696,13 +831,13 @@ fn test_gfx9_compile_f64_sqrt() {
     var deco[768];
     var m[80];
     var vals[2560];
-    var instrs[1536];
-    var ptrs[384];
+    var instrs[2048];
+    var ptrs[768];
     var blocks[64];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 24, 24, 64);
     var outbi[512];
-    var isel[2048];
-    var isel2[2048];
+    var isel[12288];
+    var isel2[12288];
     var alloc[1024];
     var hw[16];
     var abi[64];
@@ -741,13 +876,13 @@ fn test_gfx9_compile_f64_select() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 32, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -784,13 +919,13 @@ fn test_gfx9_compile_f64_ldexp() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 28, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -827,13 +962,13 @@ fn test_gfx9_compile_f64_store_const() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 22, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -869,13 +1004,13 @@ fn test_gfx9_compile_f64_const() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 30, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -912,13 +1047,13 @@ fn test_gfx9_compile_f64_i32_cvt() {
     var deco[768];
     var m[80];
     var vals[2048];
-    var instrs[1280];
-    var ptrs[256];
+    var instrs[1536];
+    var ptrs[512];
     var blocks[32];
     mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 48, 16, 28, 48);
     var outbi[384];
-    var isel[1024];
-    var isel2[1024];
+    var isel[12288];
+    var isel2[12288];
     var alloc[768];
     var hw[16];
     var abi[64];
@@ -965,6 +1100,8 @@ fn main(): i64 {
     test_spirv_table_builders_reject_oversized_id_bound();
     test_gfx9_compile_rejects_over_capacity();
     test_gfx9_abi_too_many_bindings();
+    test_shader_error_reason_roundtrip();
+    test_shader_error_names_cover_every_band();
     test_gfx9_abi_assign();
     test_gfx9_abi_assign_2d();
     return assert_summary();

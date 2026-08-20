@@ -111,6 +111,11 @@ var LOWER_ERR_CONTROL_FLOW  = 26;
 var LOWER_ERR_NO_ENTRY      = 27;
 var LOWER_ERR_ARRAY_STRIDE  = 28;   # an array ArrayStride disagrees with the assumed std430
 var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450 ext set
+# v4.1.0 — OpSelect on an integer-compare condition (ranga M6). Split out of the
+# generic MIR_ERR_UNSUPPORTED_OP so the two distinct reasons a select can be
+# rejected are distinguishable by a consumer reading gpu_shader_error_name.
+var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # int-compare cond, but VCC no longer live at the select
+var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # int-compare cond is UNIFORM (SCC, not VCC)
 
 var SPIRV_DECO_ARRAY_STRIDE = 6;    # OpDecorate %arrayType ArrayStride <n>
 
@@ -375,7 +380,42 @@ fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
     if (cond == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     if (cond >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
     if (mir_val_kind(m, cond) != MIR_VK_SSA) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-    if (mir_type_base(mir_val_type(m, cond)) != MIR_T_BOOL) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+    # v4.1.0 — INTEGER-compare condition (ranga M6). An OpFOrd* compare leaves a
+    # 0/-1 MASK (MIR_T_BOOL) that v_bfi_b32 blends; an INTEGER compare leaves its
+    # result in VCC with no mask register, which is why this was rejected outright
+    # and why ranga hand-rolls `d = (b1-1-v1) | (b2-1-v2); d < 0x80000000` instead.
+    #
+    # ⭐ But VCC is exactly what v_cndmask_b32 reads, so when the compare is still
+    # the most recent instruction the select is ONE instruction — no mask needed at
+    # all: `result = VCC ? obj1 : obj2`.
+    #
+    # ⚠ ADJACENCY IS THE WHOLE CORRECTNESS ARGUMENT. VCC is a single physical
+    # register; anything emitted between the compare and the select may overwrite
+    # it, and a stale VCC selects silently and wrongly. So this path is taken ONLY
+    # when the compare is literally the last MIR instruction emitted, and any other
+    # arrangement fails loud with a named reason rather than guessing.
+    if (mir_type_base(mir_val_type(m, cond)) != MIR_T_BOOL) {
+        var cdef = mir_val_def(m, cond);
+        if (cdef < 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        # ⚠ Bound `cdef` before dereferencing it. A value can carry a def index that
+        # is not (yet) a live instruction — a hand-built module, or an id seeded
+        # without emitting — and mir_mod_init memsets only vals[], NOT instrs[], so
+        # reading past n_instrs returns STACK GARBAGE. That garbage landed inside the
+        # ICMP opcode range during this test's first run and took the adjacent-compare
+        # path on a module with zero instructions.
+        if (cdef >= mir_n_instrs(m)) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (mir_op_is_icmp(mir_instr_op(m, cdef)) == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        # A UNIFORM compare writes SCC, not VCC; v_cndmask_b32 would read a VCC
+        # nobody wrote. Uniform selects need s_cselect_b32, which is separate work.
+        if (mir_val_unif(m, cond) != MIR_DIVERGENT) { return 0 - LOWER_ERR_SELECT_UNIFORM_COND; }
+        if (cdef != mir_n_instrs(m) - 1) { return 0 - LOWER_ERR_SELECT_NOT_ADJACENT; }
+        var tx = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (tx < 0) { return tx; }
+        var ty = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (ty < 0) { return ty; }
+        # MIR_OP_CNDMASK is `dst = VCC ? b : a` — a is the FALSE value, b the TRUE
+        # one, so obj2 goes in `a` and obj1 in `b`. Getting this backwards inverts
+        # every select and still compiles.
+        return mir_emit(m, MIR_OP_CNDMASK, result, rty, ty, tx, 0, 0);
+    }
     var x = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (x < 0) { return x; }   # obj1 (true)
     var y = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (y < 0) { return y; }   # obj2 (false)
     return mir_emit(m, MIR_OP_SELECT, result, rty, cond, x, y, 0);
@@ -719,14 +759,64 @@ fn _spirv_lower_umod(ptr, off, wc, m): i64 {
 # from the 2nd DIV_SCALE survives to DIV_FMAS (the FMA/MUL between never write VCC).
 # f64-only — f32 FDiv is a parallel (simpler) macro with no consumer yet (wgpu/naga covers
 # the f32 portable path); it fails loud here (tracked: punchlist F.7f, native-f32-div note).
+# v4.1.0 — OpFDiv on f32: the correctly-rounded GFX9 sequence, the exact structural
+# mirror of the f64 macro below (same 11 steps, f32 opcodes). N = dividend, D = divisor.
+#
+#   s0  = div_scale(D, D, N)      scaled denominator; its VCC flag is DEAD (overwritten)
+#   rcp = v_rcp_f32(s0)           ~1-ulp seed
+#   e1  = fma(-s0, rcp, 1.0)      Newton residual
+#   r2  = fma(rcp, e1, rcp)       refined reciprocal
+#   s1  = div_scale(N, D, N)      scaled numerator; its VCC flag is LIVE -> DIV_FMAS reads it
+#   e2  = fma(-s0, r2, 1.0)
+#   r3  = fma(r2, e2, r2)
+#   q   = s1 * r3
+#   r   = fma(-s0, q, s1)         residual
+#   qf  = div_fmas(r, r3, q)      applies the 2^+-N post-scale from VCC
+#   res = div_fixup(qf, D, N)     rounding + inf/nan/zero special cases
+#
+# ⚠ VCC ADJACENCY IS LOAD-BEARING, exactly as in the f64 macro. Only the two
+# DIV_SCALEs write VCC, and the second one's flag must still be live when DIV_FMAS
+# reads it — every instruction between them (FMA/MUL) leaves VCC alone. Reordering
+# this chain, or inserting anything that touches VCC, silently produces wrong
+# results for the subnormal/overflow cases the scale exists to handle.
+fn _spirv_lower_fdiv_f32(m, a, b, result): i64 {
+    var t = MIR_T_F32;
+    var s0 = _udiv_op(m, MIR_OP_F32_DIV_SCALE, t, b, b, a, 0);       if (s0 < 0) { return s0; }
+    var rcp = _udiv_op(m, MIR_OP_F32_RCP, t, s0, 0, 0, 0);           if (rcp < 0) { return rcp; }
+    var e1 = _udiv_op(m, MIR_OP_F32_FMA_N0_ONE, t, s0, rcp, 0, 0);   if (e1 < 0) { return e1; }
+    var rcp2 = _udiv_op(m, MIR_OP_FMA, t, rcp, e1, rcp, 0);          if (rcp2 < 0) { return rcp2; }
+    var s1 = _udiv_op(m, MIR_OP_F32_DIV_SCALE, t, a, b, a, 0);       if (s1 < 0) { return s1; }
+    var e2 = _udiv_op(m, MIR_OP_F32_FMA_N0_ONE, t, s0, rcp2, 0, 0);  if (e2 < 0) { return e2; }
+    var rcp3 = _udiv_op(m, MIR_OP_FMA, t, rcp2, e2, rcp2, 0);        if (rcp3 < 0) { return rcp3; }
+    var q = _udiv_op(m, MIR_OP_FMUL, t, s1, rcp3, 0, 0);             if (q < 0) { return q; }
+    var r = _udiv_op(m, MIR_OP_F32_FMA_N0, t, s0, q, s1, 0);         if (r < 0) { return r; }
+    var qf = _udiv_op(m, MIR_OP_F32_DIV_FMAS, t, r, rcp3, q, 0);     if (qf < 0) { return qf; }
+    var er = mir_emit(m, MIR_OP_F32_DIV_FIXUP, result, t, qf, b, a, 0);
+    if (er < 0) { return er; }
+    return 0;
+}
+
 fn _spirv_lower_fdiv(ptr, off, wc, types, m): i64 {
     if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
-    if (mir_type_base(rty) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    var base = mir_type_base(rty);
     if (mir_type_count(rty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    # v4.1.0 — f32 joins f64 here. The two share ONE macro: GFX9's division family is
+    # structurally identical at both widths (div_scale / rcp / Newton FMAs / div_fmas /
+    # div_fixup), so only the opcode set changes. f32 shipped unsupported at F.7f.6b
+    # for want of a consumer; ranga M6 is that consumer.
+    # ⚠ NOT lowered to mul(N, rcp(D)). v_rcp_f32 is a ~1-ulp APPROXIMATION, so the
+    # cheap form is not IEEE division — the same trap F.7f.5 fell into with the
+    # single-op f64 sqrt and had to revert. Correctly-rounded or fail loud.
+    if (base != MIR_T_F64) {
+        if (base != MIR_T_F32) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+    }
+    var f32 = 0;
+    if (base == MIR_T_F32) { f32 = 1; }
     var result = spirv_word(ptr, off + 2);
     var a = spirv_word(ptr, off + 3);   # N — dividend (numerator)
     var b = spirv_word(ptr, off + 4);   # D — divisor (denominator)
+    if (f32 == 1) { return _spirv_lower_fdiv_f32(m, a, b, result); }
     a = _spirv_f64_arg(m, a);  if (a < 0) { return a; }   # f64-const operand → VGPR pair (F.7f.9)
     b = _spirv_f64_arg(m, b);  if (b < 0) { return b; }
     var t = MIR_T_F64;
@@ -988,11 +1078,105 @@ fn _spirv_lower_vec_binop(m, mop, rty, rid, aop, bop): i64 {
     return mir_set_vector(m, rid, rty, packed);
 }
 
+# ================================================================
+# v4.1.0 — structured loops: OpLoopMerge + OpPhi
+# ================================================================
+# The current basic block's label <id>, so an OpBranch knows which edge it is.
+# A module-scope global rather than a threaded parameter because
+# _spirv_lower_one_instr is called from one place, single-threaded per compile, and
+# threading a block cursor through every lowering fn would touch ~40 signatures for
+# one value. RESET at the top of every module (see spirv_lower_module) so a stale
+# label from a previous compile can never leak into the next.
+var _lower_cur_label = 0;
+# The module's byte length, so the phi-edge scan can bound its walk.
+# _spirv_lower_one_instr does not receive it and adding a parameter would touch
+# every lowering call site; set once per module alongside _lower_cur_label.
+var _lower_byte_len = 0;
+
+# Byte offset of the OpLabel whose result is `label_id`, or -1.
+fn _spirv_find_label(ptr, byte_len, label_id): i64 {
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - 1; }
+        if (spirv_op(w0) == SPIRV_OP_LABEL) {
+            if (wc >= 2) {
+                if (spirv_word(ptr, off + 1) == label_id) { return off; }
+            }
+        }
+        off = off + wc;
+    }
+    return 0 - 1;
+}
+
+# Emit the phi copies required on the edge `from_label` -> `to_label`.
+#
+# ⭐ THIS IS WHY PHI NEEDS EDGE-AWARE PLACEMENT, and why it was rejected outright
+# before v4.1.0. SPIR-V writes OpPhi at the TOP of the merge block, but the copy it
+# implies has to happen at the END of each PREDECESSOR — a loop header's phi copy
+# placed at the header would re-run every iteration and reset the counter. So the
+# copies are emitted here, on the branch, not where the OpPhi is written.
+#
+# No pre-pass table: the target block's phis are found by scanning the stream. That
+# is O(instructions) per branch, paid once at compile time, and it avoids adding
+# another caller-provided scratch buffer to the CC struct (and to all 113 call
+# sites) for a handful of copies.
+#
+# SPIR-V guarantees OpPhi instructions come FIRST in their block, so the scan stops
+# at the first non-phi.
+fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
+    var lb = _spirv_find_label(ptr, byte_len, to_label);
+    if (lb < 0) { return 0; }
+    var total = byte_len / 4;
+    var off = lb + spirv_op_wordcount(spirv_word(ptr, lb));
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (spirv_op(w0) != SPIRV_OP_PHI) { return 0; }
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var result = spirv_word(ptr, off + 2);
+        # (value, parent) pairs start at word 3 and run to the end of the instruction.
+        var k = 3;
+        while (k + 1 < wc) {
+            if (spirv_word(ptr, off + k + 1) == from_label) {
+                var src = spirv_word(ptr, off + k);
+                var e = mir_emit(m, MIR_OP_VMOV, result, mir_val_type(m, result), src, 0, 0, 0);
+                if (e < 0) { return e; }
+                k = wc;
+            }
+            k = k + 2;
+        }
+        off = off + wc;
+    }
+    return 0;
+}
+
 fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
-    # Loops + phi remain unsupported: a back-edge breaks the forward linear-scan
-    # liveness, and the MVP if/merge carries no merge-consumed (phi) values.
-    if (op == SPIRV_OP_LOOP_MERGE) { return 0 - LOWER_ERR_CONTROL_FLOW; }
-    if (op == SPIRV_OP_PHI) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    # v4.1.0 — structured loops. OpLoopMerge is a structured HINT naming the merge
+    # and continue blocks; the back-end derives layout from the LABELs and the
+    # encoder already emits a signed PC-relative simm16, so a backward branch needs
+    # nothing special. The two things that DID block loops are fixed elsewhere:
+    # the regalloc now extends live intervals across a back-edge and allocates each
+    # value once (gfx9_regalloc.cyr), and phi copies are placed on the incoming
+    # EDGES (_spirv_emit_phi_moves above) rather than where OpPhi is written.
+    if (op == SPIRV_OP_LOOP_MERGE) { return 0; }
+    # OpPhi itself emits NOTHING here. Its value is seeded so later uses resolve;
+    # the actual copies were emitted on each predecessor's branch.
+    if (op == SPIRV_OP_PHI) {
+        if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var pty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
+        if (pty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        if (mir_type_count(pty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        # A loop-carried value is per-lane in every kernel that indexes by
+        # invocation id, and classifying it UNIFORM would file it into an SGPR that
+        # the body's VALU writes cannot target. DIVERGENT is the safe direction: it
+        # costs a VGPR, never correctness.
+        return _mir_set_val(m, spirv_word(ptr, off + 2), MIR_VK_SSA, pty,
+          MIR_DIVERGENT, 0 - 1, 0);
+    }
     # SelectionMerge is a structured hint (the merge block id); the back-end derives
     # layout from the LABELs, so it is a no-op here.
     if (op == SPIRV_OP_SELECTION_MERGE) { return 0; }
@@ -1002,13 +1186,20 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # forward if, so emitting it would shift every straight-line kernel's MIR.
     if (op == SPIRV_OP_LABEL) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        _lower_cur_label = spirv_word(ptr, off + 1);
         if (mir_n_instrs(m) == 0) { return 0; }
         return mir_emit(m, MIR_OP_LABEL, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
     }
-    # OpBranch %target → unconditional branch (a = target label).
+    # OpBranch %target → unconditional branch (a = target label). Any phi copies the
+    # target block needs on THIS edge are emitted BEFORE the branch — placing them
+    # after would put them in the target block, where they would run on every
+    # incoming edge instead of just this one.
     if (op == SPIRV_OP_BRANCH) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
+        var tgt = spirv_word(ptr, off + 1);
+        var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tgt, m);
+        if (pm < 0) { return pm; }
+        return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, tgt, 0, 0, MIR_FLAG_A_IMM);
     }
     # OpBranchConditional %cond %true %false → a = cond value, b = true (the
     # fall-through then), c = false (the merge); b/c are labels (immediate tags).
@@ -1362,6 +1553,10 @@ fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
     if (as_chk < 0) { return as_chk; }
     var es_chk = _spirv_check_ext_sets(ptr, byte_len);
     if (es_chk < 0) { return es_chk; }
+    # Reset the per-module lowering cursors BEFORE any lowering runs, so a stale
+    # block label or length from a previous compile cannot leak into this one.
+    _lower_cur_label = 0;
+    _lower_byte_len = byte_len;
     _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
     var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
     if (sr < 0) { return sr; }

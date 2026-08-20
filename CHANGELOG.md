@@ -13,6 +13,259 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.0] — 2026-08-19
+
+**Both native SPIR-V filings closed, structured loops added, and the wgpu-native bump that
+4.0.9 and 4.0.10 each deferred.** A minor rather than a patch because it adds public API —
+`gpu_last_shader_error` / `gpu_shader_error_name` / `gpu_shader_error_print` and
+`gfx9_rsrc1_ex` — and the repo's own precedent is explicit that new public API is a minor
+(4.0.9 deferred `gfx9_rsrc1_ex` on exactly that ground).
+
+**5083 assertions across 18 CPU suites** (4.0.10: 4958), each suite gated on its own exit
+code. **70 of 73 native HW gates pass on Cezanne, 0 failures** (2 skipped for DRM master, 1
+filed known-fail). The full wgpu suite passes on the new wgpu-native.
+
+### Fixed — `native_spirv_saxpy_e2e`, red since 4.0.5, and the trap that hid it
+
+⛔ **Root cause: a 160-byte stack overrun that erased the error it would have reported.**
+`mir_mod_init` ends with `memset(vals, 0, cap_ids * MIR_VAL_REC)` — it writes the caller's
+full declared capacity into a buffer whose size it receives only as a bare pointer. That
+program declared `vals[1440]` while passing `cap_ids = 40`, needing 1600. The overrun landed
+on the `MirMod` header declared next to it and **zeroed `cap_ids` itself**, so every
+subsequent id failed `id >= cap_ids` against a cap of 0 — reported as `MIR_ERR_ID_OOR`,
+"your ids are out of range", when the ids were fine and the buffer was too small.
+
+⭐ **The misleading error is why this took four releases, not the bug.** The one-line fix is
+`vals[1600]`; the kernel then compiled and ran correctly on Cezanne first try, all 8 lanes.
+
+⚠ **My first probe "ruled out" the buffer trap and was wrong**, in a way worth recording:
+it scaled the buffers **and the capacities together**, ~4× each. The requirement is
+`vals >= cap_ids * MIR_VAL_REC`, so multiplying both sides preserved the violation exactly —
+the deficit did not close, it grew from 160 to 640 bytes. A scaling probe cannot falsify a
+proportional invariant. The filing carries the incorrect reasoning, unedited, above its
+correction.
+
+Four defences, so this cannot recur silently:
+
+- **`MIR_ERR_MOD_UNINIT` (30)** — `cap_ids <= 0` is structurally impossible for a module
+  `mir_mod_init` accepted, so reading one means the header was overwritten, not that this id
+  is out of range. ⚠ In `mir_emit` the guard had to move **ahead of** the `n >= cap_instrs`
+  test: a zeroed header has `cap_instrs == 0` too, so checking that first reports
+  `MIR_ERR_CAP_EXCEEDED` — the same misdirection one layer over.
+- **`MIR_ERR_VALS_OVERRUN` (31)** — `mir_mod_init` writes the header, memsets `vals`, then
+  **reads the header back**. Two loads, and the overrun names itself at the call that caused
+  it.
+- **`MIR_ERR_BAD_INIT` (32)** — null buffers, non-positive capacities, `id_bound > cap_ids`,
+  `cap_ids > MIR_MAX_CAP_IDS`. ⚠ `id_bound == cap_ids` is **legal** (no synth headroom,
+  which every hand-built-MIR test relies on); a first cut rejected it and broke three suites.
+- **`scripts/check-compiler-buffer-sizing.py`** — a static gate over all 123 `mir_mod_init`
+  call sites, in `make test-all` and CI. Both numbers are compile-time literals a few lines
+  apart, so this needs nothing running.
+
+Mutation-proven both ways: restoring `vals[1440]` makes the gate exit 1 naming the exact
+deficit, and makes `mir_mod_init` return `-31` with the compile returning `-30` instead of
+`-25`.
+
+⭐ **The sweep found 134 more deficits** across 17 files (`instrs`, `ptrs`, `isel`,
+`isel2`), all corrected. Those are *latent* rather than active: unlike `vals` they are
+written on demand, so they only overrun once a kernel emits that many records. `vals` was
+the only eager case in the tree, which is why it was the only one failing.
+
+⚠ Still true and **not** fixed here: `mir_mod_init`, `gfx9_regalloc`,
+`_spirv_resolve_builtins` and the three `spirv_build_*_table` builders all still memset a
+caller-supplied extent into a buffer they cannot measure. Passing explicit lengths would
+make the invalid state unrepresentable — an `@internal` signature change across 123 call
+sites, filed rather than smuggled in here.
+
+### Added — a failed shader-module create now says WHY
+
+The ranga M6 filing's item 1, and the most expensive thing in it.
+`gpu_shader_module_create_spirv` returns a bare 0 on any failure — correct as a handle
+contract, but it made a whole class of failure undiagnosable: consumers could not separate
+"unsupported opcode" from "id bound exceeded" from "register allocation failed" from "the BO
+allocation failed", and each case cost a full hardware compile-bisect.
+
+`gpu_last_shader_error()` returns the compiler's own code, `gpu_shader_error_name()` renders
+it, `gpu_shader_error_print()` writes it to stderr. The stored value is the **stage code**,
+not a fold onto `GPU_ERR_SHADER` — collapsing them would erase the distinction the fix
+exists to create. Cleared on every successful create, so a stale reason never reads as a
+fresh failure.
+
+⭐ **One comparison caused all of it:** `if (gfx9_compile(...) != 0) { return 0; }` computed
+the specific code and threw it away. The non-compile paths (BO create, VA map, OOM, the f64
+gate, source-kind mismatch) were equally silent and now carry codes 110-120.
+
+### Fixed — the shader that compiled, dispatched, and did nothing
+
+`GISEL_ERR_RETURN_IN_SELECTION`. An `OpReturn` inside a divergent if — which is how WGSL
+writes `if idx >= count { return; }` — produced a **non-zero handle**, dispatched `rc=0`,
+and wrote nothing: a divergent if runs its then-block under a masked EXEC, so `s_endpgm`
+there ends the **entire wave** before the code after the merge runs. A consumer could
+discover it only by noticing an unchanged output buffer.
+
+⚠ This was the only construct in the filing that was not already a rejection. Nesting
+(`GISEL_ERR_NESTED_SELECTION`) and unclosed regions (`GISEL_ERR_UNCLOSED_SELECTION`) were
+rejected all along — they were merely unnamed, and the discarded reason is what made them
+look like the same bug. Mutation-proven: disabling the guard makes the kernel select
+successfully again.
+
+### Added — f32 `OpFDiv`, bit-exact
+
+⚠ **The filing's diagnosis was wrong in a useful way.** `_spirv_lower_fdiv` existed, so the
+filing inferred "selection, not lowering". Neither: it was **f64-only and explicitly
+rejected f32**, because wgpu/naga covered f32 and no native consumer existed. ranga is that
+consumer.
+
+f32 now lowers through the same correctly-rounded 11-instruction GFX9 sequence as f64
+(`div_scale` / `rcp` / two Newton refinements / `div_fmas` / `div_fixup`). All four opcodes
+were read off `llvm-mc -mcpu=gfx900 -show-encoding` and cross-checked by decoding the f64
+rows in the same run against the constants already in the tree.
+
+⚠ Deliberately **not** `mul(N, rcp(D))`: `v_rcp_f32` is a ~1-ulp approximation, so the cheap
+form is not IEEE division — the same trap F.7f.5 fell into with a single-op f64 sqrt and had
+to revert. `programs/native_spirv_f32_div_e2e.cyr` pins bit patterns including a 1/3 ULP
+probe the cheap form fails: **8/8 lanes bit-exact on Cezanne**.
+
+⚠ The new ops had to be added to `_mir_instr_unif`'s forced-DIVERGENT guard by hand — it is
+a numeric **range** check, so a vector-only op added outside the range silently classifies
+UNIFORM, gets an SGPR, and encodes an instruction that cannot take one. Asserted directly.
+
+### Added — `OpSelect` on an integer-compare condition
+
+A float compare leaves a 0/-1 mask that `v_bfi_b32` blends; an integer compare leaves its
+result in VCC with no mask register, which is why this was rejected and why ranga hand-rolls
+`d = (b1-1-v1) | (b2-1-v2); d < 0x80000000` instead.
+
+⭐ VCC is exactly what `v_cndmask_b32` reads, so an adjacent compare makes the select a
+**single instruction** — no mask materialization at all. ⚠ Adjacency is the entire
+correctness argument: VCC is one physical register, so a non-adjacent compare fails loud
+(`LOWER_ERR_SELECT_NOT_ADJACENT`) rather than reading a stale flag, and a uniform compare
+(SCC, not VCC) fails as `LOWER_ERR_SELECT_UNIFORM_COND`.
+
+⚠ Writing this surfaced a bug in itself: the first cut read `mir_instr_op` at a value's
+`def` index **without bounding it against `n_instrs`**. `mir_mod_init` memsets only `vals`,
+so that read returned stack garbage — which landed inside the ICMP opcode range and took the
+adjacent-compare path on a module with zero instructions. Caught by the test, not by review.
+
+### Added — structured loops: `OpLoopMerge` + `OpPhi`
+
+Both were rejected outright (`LOWER_ERR_CONTROL_FLOW`) for two independent reasons, and both
+are now fixed:
+
+- **Back-edge liveness.** A forward linear scan frees a value at its textual last use, so a
+  value defined before a loop and read at the top of its body could have its register reused
+  later in that same body — correct on iteration 1, silently corrupt from iteration 2, and
+  invisible to any forward scan because textually the last use really is at the top.
+  Intervals whose last use falls inside a loop now extend to the loop's end, iterated to a
+  **fixed point** so nested loops converge (one pass leaves the enclosing loop wrong).
+- **Phi placement.** SPIR-V writes `OpPhi` at the top of the merge block, but the copy it
+  implies must happen at the **end of each predecessor** — placed at a loop header it would
+  re-run every iteration and reset the counter. Copies are emitted on the incoming edges,
+  found by scanning the stream rather than by adding another caller scratch buffer to the CC
+  struct and its 123 call sites. The allocator now assigns each value **one** register across
+  both of its definitions, which is what makes a loop-carried value work at all.
+
+⭐ Backward branches needed nothing: the encoder already emits a signed PC-relative simm16
+and records label offsets before patching. Verified rather than assumed.
+
+`programs/native_spirv_loop_e2e.cyr`: a 4-iteration counted loop carrying **two** phis
+(counter and accumulator), `out[i] == 4 * a[i]`, **8/8 lanes correct on Cezanne**. ⚠ The
+multiplier is 4 deliberately — a loop that ran once, or an accumulator that never
+accumulated, would both pass against 1. Both allocator changes are mutation-proven.
+
+### Changed — wgpu-native `v29.0.0.0` → `v29.0.1.1`
+
+Deferred by 4.0.9 as "an untested FFI dependency" and by 4.0.10 with the measurement that
+made it concrete. Taken here, with the two breakages the filing predicted:
+
+⛔ **The version number lies.** `wgpu.h` renumbers the entire `WGPUSType_*` block
+(`PipelineLayoutExtras` deleted, everything after it shifts down one) and **deletes**
+`WGPUNativeFeature_SpirvShaderPassthrough` — not renamed: its slot `0x00030017` is now
+`ClearTexture`, and the intended successor ships **commented out** behind a TODO.
+`webgpu.h` itself is purely additive with zero removals, so no `wgpu_descriptors.cyr` offset
+moves.
+
+**Nothing of mabda's was lost.** Passthrough is the naga-*bypass* escape hatch and already
+returned 0 from `wgpuAdapterHasFeature` on RADV/Cezanne. `WGPUNativeFeature_ShaderF64` — the
+constant mabda's f64 path actually depends on — is **still `0x0003001D`**, verified
+identical in both headers.
+
+⭐ **The asymmetry held exactly as predicted.** Every site spelling a constant as a
+**symbol** recompiled through the renumber untouched (`WGPUSType_InstanceExtras` silently
+moved and the launcher did not care). The single site that hardcoded the **number** is the
+one that needed attention, and it now carries the wgpu-native version it was read from.
+
+### Added — `gfx9_rsrc1_ex(vgpr_hw, sgpr_hw, extra_sgpr, ieee_mode)`
+
+The parameterized RSRC1 that 4.0.9 deferred as "new public API and therefore a MINOR". The
+two policies `gfx9_rsrc1` hardcodes become arguments: the SGPR reservation budget (named
+constants for the VCC-only, flat-scratch, and LLVM-default measurements) and IEEE_MODE.
+`gfx9_rsrc1` now delegates and is asserted byte-identical at three points, since every
+shader descriptor in the tree depends on it.
+
+### Added — `make test-native-all`, and what it immediately found
+
+⛔ **`native_spirv_saxpy_e2e` hid for four releases because nothing ran it.** It is a
+standalone target in no aggregate, and there are **73** `test-native-*` targets with no
+roll-up — so "the native HW suite passes" was not a claim anyone could make in one command.
+
+The roll-up reports a tally and keeps going after a failure, with `SKIP` for the two gates
+needing DRM master and a named `KNOWN-FAIL` list (entries require a filed issue). On its
+first run it found **two more** problems nobody knew about:
+
+- `test-native-load-png-e2e` was red because its recipe omits `-D MABDA_PNG`, so the loader
+  compiled out and failed with a bare "FAIL: load_png" that reads like a decoder bug. Fixed;
+  it passes, which incidentally confirms chitra 0.3.1's PNG path end-to-end.
+- `test-native-compute-spike` is bit-rotted — a 2026-04 exploration artifact superseded by
+  `test-native-compute-store`, which passes and does strictly more. Filed as a known-fail.
+
+⚠ It also surfaced **flakiness**: four render/sampler gates failed together on the first run
+and all passed on a re-run and individually. Four going red at once looks like contention
+rather than four bugs, but it is unexplained and recorded in the filing rather than lost.
+
+### Documented — the liveness budget
+
+The filing asked for "spilling, or a documented liveness budget". `src/gfx9_regalloc.cyr`
+now carries the real numbers: **no spilling** (linear scan; overflow is an error), VGPRs
+~253-255 usable of 256, SGPRs ~90 of 102 for a typical 2-binding kernel — **dropping to 100
+the moment a kernel contains a divergent if**, since s[100:101] holds the saved EXEC — two
+SGPRs per binding consumed before any value is allocated, and f64 taking even-aligned pairs.
+
+⭐ The filing's core insight, now written where it will be found: the id cap and the register
+budget are **independent** limits, and hitting the register one first at 201 of 256 ids is
+normal. The fix is to shorten live ranges, not to reduce value count — which is exactly why
+the "pack the texels, extract later" restructuring it tried did not help.
+
+### Fixed — one claim in the filing that was never a mabda defect
+
+⚠ **`ULessThan` is not absent from the binop map.** `_spirv_cmp_to_mir` has mapped
+`SPIRV_OP_ULESSTHAN -> MIR_OP_ICMP_ULT` since the map was written, so the documented
+workaround (swap operands, use `UGreaterThan`) was unnecessary. Whatever was hit there was
+something else — most likely the bare 0 from an unrelated failure in the same kernel, which
+is precisely the confusion the diagnostic work exists to end.
+
+### Metrics
+
+- **Assertions: 5083** across 18 CPU suites (4.0.10: 4958), counted with
+  `scripts/count-test-assertions.sh`.
+- **Native HW: 70/73 pass, 0 fail** (2 skip on DRM master, 1 known-fail) via
+  `make test-native-all`.
+- **wgpu on v29.0.1.1:** phase0 12/12, compute 7/7, render 8/8, render-graph 5/5.
+- **`dist/mabda.cyr`: 27,447 lines / 1,304,858 bytes** (`wc -l`). ⚠ `cyrius distlib`
+  prints **27,278** for the same file — its own internal metric, not a line count.
+- **Gates:** smoke build 0 warnings · lint 0 warnings / 0 untracked deferrals ·
+  `fmt --check` clean across all sources incl. `fuzz/` · vet clean · buffer-sizing gate 0
+  problems over 123 call sites · fuzz 3/3 · `cyrius distlib` idempotent ·
+  `scripts/version-check.sh` passes.
+
+### Next
+
+The remaining native-compiler limits are named rather than silent now: nested divergent ifs
+still need flattening into two sequential ifs, `OpSelect` still needs its integer compare
+adjacent, and uniform-condition selects need `s_cselect_b32`. The scratch-buffer contract
+(explicit lengths instead of a cap the callee cannot check) is the one structural item left
+from this cut's findings.
+
 ## [4.0.10] — 2026-08-19
 
 **A currency cut: toolchain pin 6.5.20 → 6.5.29, chitra 0.3.0 → 0.3.1, and a 73-file

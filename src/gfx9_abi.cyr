@@ -32,6 +32,13 @@
 # new API and therefore a minor, not a patch.
 var GFX9_RSRC1_FLAGS = 0x2C0000;
 
+# v4.1.0 — the two hardcoded policies above, named so gfx9_rsrc1_ex can vary them.
+var GFX9_RSRC1_IEEE_MODE = 0x800000;   # bit 23 (ENABLE_IEEE_MODE)
+# Reservation budgets, from the llvm-mc 22.1.8 measurement table above.
+var GFX9_SGPR_RESERVE_VCC_ONLY      = 2;   # xnack-, no flat scratch (mabda's shaders)
+var GFX9_SGPR_RESERVE_FLAT_SCRATCH  = 4;   # flat scratch reserved, xnack waived
+var GFX9_SGPR_RESERVE_LLVM_DEFAULT  = 6;   # a bare gfx90c target id, all defaults
+
 # Error codes (disjoint from the compile module's CMP_ERR_* 70-79).
 var ABI_ERR_VGPR_OVERFLOW     = 80;   # VGPRS field (6-bit) would overflow
 var ABI_ERR_SGPR_OVERFLOW     = 81;   # SGPRS field (4-bit) would overflow
@@ -87,14 +94,42 @@ var ABI_VGPR_BASE    = 56;   # first allocatable VGPR (above the LID v0..)
 # as a defect: the reservation budget and IEEE_MODE are both hardcoded. Parameterising
 # them is new API (`gfx9_rsrc1_ex`) and therefore a MINOR, not this patch.
 fn gfx9_rsrc1(vgpr_hw, sgpr_hw): i64 {
+    return gfx9_rsrc1_ex(vgpr_hw, sgpr_hw, GFX9_SGPR_RESERVE_VCC_ONLY, 0);
+}
+
+# @public — v4.1.0. The parameterized form the comment above says gfx9_rsrc1 can
+# never express. Deferred out of 4.0.9 as new public API ("a MINOR, not this
+# patch"); this is that minor.
+#
+#   extra_sgpr — the reservation budget E in `granted = roundup8(next_free + E)`.
+#                Use GFX9_SGPR_RESERVE_VCC_ONLY (2) for mabda's own shaders
+#                (xnack-, no flat scratch); GFX9_SGPR_RESERVE_LLVM_DEFAULT (6) to
+#                match a bare-gfx90c LLVM listing; 4 for flat-scratch-reserved-only.
+#                ⚠ See the measurement table above the flags constant before
+#                choosing — XNACK contributes 2, not 4, and is invisible while flat
+#                scratch is reserved, so the term that actually separates mabda from
+#                LLVM's default is FLAT_SCRATCH.
+#   ieee_mode  — 0 (mabda's shaders, and what gfx9_rsrc1 hardcodes) or 1, which
+#                sets bit 23. Verified by perturbation with llvm-mc 22.1.8: byte 48,
+#                bit 23, and nothing else moves.
+#
+# ⚠ A LARGER reservation is not free: it rounds the granted SGPR count up and can
+# cost occupancy. Raising it to silence a disagreement with an assembler listing
+# trades real performance for cosmetic agreement.
+fn gfx9_rsrc1_ex(vgpr_hw, sgpr_hw, extra_sgpr, ieee_mode): i64 {
+    if (vgpr_hw < 0)    { return 0 - ABI_ERR_VGPR_OVERFLOW; }
+    if (sgpr_hw < 0)    { return 0 - ABI_ERR_SGPR_OVERFLOW; }
+    if (extra_sgpr < 0) { return 0 - ABI_ERR_SGPR_OVERFLOW; }
     var vgprs = (vgpr_hw + 3) / 4;
     if (vgprs > 0) { vgprs = vgprs - 1; }
-    var sgprs = (sgpr_hw + 2 + 7) / 8;
+    var sgprs = (sgpr_hw + extra_sgpr + 7) / 8;
     if (sgprs > 0) { sgprs = sgprs - 1; }
     if (sgprs < 1) { sgprs = 1; }
     if (vgprs > 0x3F) { return 0 - ABI_ERR_VGPR_OVERFLOW; }
     if (sgprs > 0xF) { return 0 - ABI_ERR_SGPR_OVERFLOW; }
-    return GFX9_RSRC1_FLAGS | vgprs | (sgprs << 6);
+    var r = GFX9_RSRC1_FLAGS | vgprs | (sgprs << 6);
+    if (ieee_mode != 0) { r = r | GFX9_RSRC1_IEEE_MODE; }
+    return r;
 }
 
 # COMPUTE_PGM_RSRC2: USER_SGPR count (bits 1-5), TRAP_PRESENT (bit 6), TGID_X_EN

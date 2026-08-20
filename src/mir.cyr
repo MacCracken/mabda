@@ -164,6 +164,28 @@ var MIR_OP_F64_CMP        = 62;   # v_cmp_*_f64 (a, b) → VCC; opcode in flags 
 # Branchless via v_bfi_b32 (mask ? b : c) per 32-bit lane — 1 for i32/f32, 2 for an f64 pair. No VCC,
 # so it's order-independent (the mask is a normal VGPR value). Result type picks the lane count.
 var MIR_OP_SELECT         = 63;   # mask ? b : c  (v_bfi_b32 blend)
+# v4.1.0 — f32 division macro primitives, the exact structural mirror of the f64
+# family at 46-51. OpFDiv shipped f64-only at F.7f.6b because wgpu/naga covered f32
+# and there was no native consumer; ranga M6 is that consumer.
+# ⚠ MIR_OP_FMA is already type-dispatched (isel picks V_FMA_F32 vs V_FMA_F64 off the
+# result type), so the plain FMAs in the chain need nothing new — only the four
+# division-specific opcodes and the two NEGATE-src0 forms, which carry a source
+# modifier the generic FMA path does not emit.
+var MIR_OP_F32_RCP        = 64;   # v_rcp_f32 reciprocal seed (unary; refine via Newton)
+var MIR_OP_F32_DIV_SCALE  = 65;   # v_div_scale_f32 (3-src; scaled value -> dst, flag -> VCC)
+var MIR_OP_F32_DIV_FMAS   = 66;   # v_div_fmas_f32 (3-src; reads VCC for the post-scale)
+var MIR_OP_F32_DIV_FIXUP  = 67;   # v_div_fixup_f32 (3-src; correctly-rounding fixup)
+var MIR_OP_F32_FMA_N0     = 68;   # v_fma_f32(-a, b, c) - NEGATE src0
+var MIR_OP_F32_FMA_N0_ONE = 69;   # v_fma_f32(-a, b, 1.0) - NEGATE src0 + inline-1.0 src2
+
+# Is `op` an integer compare? The ICMP opcodes are split across two ranges
+# (22-27 unsigned/equality, 32-35 signed), so a single range test would silently
+# miss the signed half.
+fn mir_op_is_icmp(op): i64 {
+    if (op >= MIR_OP_ICMP_EQ) { if (op <= MIR_OP_ICMP_UGE) { return 1; } }
+    if (op >= MIR_OP_ICMP_SLT) { if (op <= MIR_OP_ICMP_SGE) { return 1; } }
+    return 0;
+}
 
 # Error codes (shared with spirv_lower.cyr; disjoint from spirv_parse's 1-11).
 # Index-returning builders return these NEGATED; status fns return them positive.
@@ -173,6 +195,20 @@ var MIR_ERR_CAP_EXCEEDED     = 22;
 var MIR_ERR_BAD_ACCESS_CHAIN = 23;
 var MIR_ERR_OVERFLOW         = 24;
 var MIR_ERR_ID_OOR           = 25;
+# 30-31: the scratch-buffer contract. Deliberately DISTINCT from ID_OOR (25), and
+# that distinction is the whole point — see the header note on mir_mod_init. A
+# caller who undersizes vals[] gets a code naming the real fault instead of
+# `MIR_ERR_ID_OOR`, which blames the ids and sent a four-release investigation
+# (`native_spirv_saxpy_e2e`, red 4.0.5 -> 4.0.10) in the wrong direction.
+var MIR_ERR_MOD_UNINIT       = 30;   # MirMod header reads uninitialized/corrupt (cap_ids <= 0)
+var MIR_ERR_VALS_OVERRUN     = 31;   # mir_mod_init's vals[] memset overran and clobbered the header
+var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null buf / bad cap / id_bound)
+
+# Ceiling on cap_ids. Mirrors gfx9_regalloc's RA_MAX_REGS: the regalloc free-at
+# scratch and the gfx9_compile/gfx9_waitcnt per-id file-maps are all sized for
+# 256 ids, so a larger cap is rejected downstream regardless. Named here so
+# mir_mod_init can reject it at the stage that was actually handed the number.
+var MIR_MAX_CAP_IDS          = 256;
 
 # Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
 # fields (uniformity especially). The instr/ptr records pack two <id>/flag
@@ -201,7 +237,33 @@ var MIR_FLAG_C_IMM = 8;
 # hands out fresh ids >= id_bound for synthesized terms (e.g. the
 # GlobalInvocationId expansion). Caller MUST size vals[] as cap_ids * MIR_VAL_REC.
 # `next_synth` starts at id_bound so synth ids occupy [id_bound, cap_ids).
+# Returns 0, or a NEGATIVE error. ⚠ The return was ignorable before v4.0.11 (this
+# fn could not fail); it can now, and callers SHOULD check it — a rejected init
+# leaves the module unusable and every later stage reports a downstream symptom
+# instead of this cause.
 fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, cap_ids): i64 {
+    if (m == 0)      { return 0 - MIR_ERR_BAD_INIT; }
+    if (vals == 0)   { return 0 - MIR_ERR_BAD_INIT; }
+    if (instrs == 0) { return 0 - MIR_ERR_BAD_INIT; }
+    if (ptrs == 0)   { return 0 - MIR_ERR_BAD_INIT; }
+    if (blocks == 0) { return 0 - MIR_ERR_BAD_INIT; }
+    if (cap_ids <= 0)    { return 0 - MIR_ERR_BAD_INIT; }
+    if (cap_instrs <= 0) { return 0 - MIR_ERR_BAD_INIT; }
+    if (cap_ptrs <= 0)   { return 0 - MIR_ERR_BAD_INIT; }
+    if (id_bound < 0)    { return 0 - MIR_ERR_BAD_INIT; }
+    # id_bound > cap_ids is incoherent — the SPIR-V ids alone would not fit the
+    # vals[] the caller sized for cap_ids. Rejecting here beats failing six stages
+    # later on the first id that lands past the end.
+    # ⚠ id_bound == cap_ids is LEGAL, not a near-miss: next_synth starts at
+    # id_bound, so equality means "no synth headroom", which is exactly right for
+    # the hand-built MIR the compiler_* suites use (they never call
+    # mir_alloc_synth_id). Rejecting equality broke 3 suites; the failure a module
+    # that DOES synth gets is MIR_ERR_ID_OOR from mir_alloc_synth_id, at the point
+    # of the actual request.
+    if (id_bound > cap_ids) { return 0 - MIR_ERR_BAD_INIT; }
+    # cap_ids above RA_MAX_REGS is rejected by gfx9_emit_program anyway
+    # (CMP_ERR_TOO_MANY_IDS); saying so at init names the stage that set it.
+    if (cap_ids > MIR_MAX_CAP_IDS) { return 0 - MIR_ERR_BAD_INIT; }
     store64(m + 0, vals);
     store64(m + 8, instrs);
     store64(m + 16, ptrs);
@@ -217,6 +279,19 @@ fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, c
     store64(blocks + 8, 0);
     store64(blocks + 16, 0);
     store64(blocks + 24, MIR_TERM_RETURN);
+    # ⭐ SELF-CHECK — cheap, and it catches the exact defect that hid for four
+    # releases. The memset above writes cap_ids * MIR_VAL_REC bytes into a buffer
+    # whose size this fn CANNOT know (it gets a bare pointer). When a caller
+    # undersizes vals[] and the MirMod header happens to sit just past its end —
+    # the ordinary stack layout, since both are locals declared adjacently — that
+    # memset has just zeroed the header written above. Reading it back costs two
+    # loads and turns silent corruption into a named error.
+    # ⚠ NOT a complete bound: if the overrun lands on something OTHER than the
+    # header this check passes and the corruption is still silent. The static gate
+    # `scripts/check-compiler-buffer-sizing.py` is what covers the general case;
+    # this is the runtime backstop for the layout that actually bit us.
+    if (load64(m + 64) != cap_ids)  { return 0 - MIR_ERR_VALS_OVERRUN; }
+    if (load64(m + 72) != id_bound) { return 0 - MIR_ERR_VALS_OVERRUN; }
     return 0;
 }
 
@@ -241,8 +316,14 @@ fn mir_alloc_synth_id(m): i64 {
 # never write outside the vals[] buffer on an untrusted/synth id. Returns 0 or
 # a NEGATIVE error.
 fn _mir_set_val(m, id, kind, type, unif, def, payload): i64 {
-    if (id <= 0) { return 0 - MIR_ERR_ID_OOR; }
-    if (id >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+    var cap = load64(m + 64);
+    # cap_ids <= 0 is structurally impossible for a module mir_mod_init accepted,
+    # so reading one means the header was never written or has been overwritten —
+    # NOT that this particular id is out of range. Reporting ID_OOR here is what
+    # made the saxpy failure unreadable: every id "failed" against a cap of 0.
+    if (cap <= 0) { return 0 - MIR_ERR_MOD_UNINIT; }
+    if (id <= 0)  { return 0 - MIR_ERR_ID_OOR; }
+    if (id >= cap) { return 0 - MIR_ERR_ID_OOR; }
     var b = load64(m + 0) + id * MIR_VAL_REC;
     store64(b + 0, kind);
     store64(b + 8, type);
@@ -301,9 +382,15 @@ fn _mir_set_val_unif(m, id, unif): i64 {
 # (kind SSA, type, unif UNKNOWN until mir_run_uniformity, def = this index).
 # Returns the instruction index (>= 0), or a NEGATIVE error.
 fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
+    # ⚠ The uninit check MUST come before every other field read. A zeroed header
+    # has cap_instrs == 0 too, so an n >= cap_instrs test placed first reports
+    # MIR_ERR_CAP_EXCEEDED ("your program is too long") for a module that was
+    # never initialized — the same category of misdirection MOD_UNINIT exists to
+    # end. Ordering is the whole value here, not the check itself.
+    var cap = load64(m + 64);
+    if (cap <= 0) { return 0 - MIR_ERR_MOD_UNINIT; }
     var n = load64(m + 32);
     if (n >= load64(m + 40)) { return 0 - MIR_ERR_CAP_EXCEEDED; }
-    var cap = load64(m + 64);
     if (result != 0) {
         if (result >= cap) { return 0 - MIR_ERR_ID_OOR; }
     }
@@ -489,6 +576,15 @@ fn _mir_instr_unif(m, i): i64 {
     # only with implicit per-lane VCC, no scalar form (F64_CONST is a 2× v_mov_b32 into a VGPR pair).
     # Force DIVERGENT (a uniform-operand FDiv/FSqrt must not classify them UNIFORM and become an
     # SGPR-coalescing candidate — they have no SALU form). (F.7f.6b adversarial review.)
+    # ⚠ v4.1.0 — the f32 division family is the SAME class and must be forced
+    # DIVERGENT too. These are VOP1/VOP3-only with an implicit per-lane VCC and no
+    # scalar form, so a uniform-operand f32 FDiv would otherwise classify UNIFORM,
+    # be allocated an SGPR, and encode an instruction that cannot take one. This
+    # guard is a numeric RANGE check, which means every new vector-only op has to be
+    # added by hand — the known foot-gun; adding an op here is not optional.
+    if (op >= MIR_OP_F32_RCP) {
+        if (op <= MIR_OP_F32_FMA_N0_ONE) { return MIR_DIVERGENT; }
+    }
     if (op >= MIR_OP_F64_RCP) {
         if (op <= MIR_OP_F64_CMP_GT) { return MIR_DIVERGENT; }
     }

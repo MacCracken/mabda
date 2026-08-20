@@ -71,9 +71,20 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     if (wgpuAdapterHasFeature(adapter,
             (WGPUFeatureName)WGPUNativeFeature_ShaderF64))
         feats[nfeat++] = (WGPUFeatureName)WGPUNativeFeature_ShaderF64;
-    if (wgpuAdapterHasFeature(adapter,
-            (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough))
-        feats[nfeat++] = (WGPUFeatureName)WGPUNativeFeature_SpirvShaderPassthrough;
+    // v4.1.0 / wgpu-native v29.0.1.1: WGPUNativeFeature_SpirvShaderPassthrough is
+    // GONE from wgpu.h. It was not renamed — its slot 0x00030017 is now
+    // ClearTexture, and the intended replacement
+    // (WGPUNativeFeature_PassthroughShaders = 0x00030036) ships COMMENTED OUT with
+    // a "requires wgpu.h api change" TODO. So raw SPIR-V passthrough does not exist
+    // upstream at this version, at any spelling.
+    //
+    // Nothing of mabda's is lost: passthrough was the naga-BYPASS escape hatch, and
+    // it already returned 0 from wgpuAdapterHasFeature on RADV/Cezanne. The paths
+    // that matter are untouched — WGPUInstanceFeatureName_ShaderSourceSPIRV (the
+    // ordinary naga SPIR-V route) and WGPUNativeFeature_ShaderF64, which is still
+    // 0x0003001D, byte-identical to v29.0.0.0.
+    //
+    // Re-add a request here if upstream un-comments PassthroughShaders.
     desc.requiredFeatures = feats;
     desc.requiredFeatureCount = nfeat;
     WGPURequestDeviceCallbackInfo cb = {

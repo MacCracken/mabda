@@ -30,6 +30,50 @@ var RA_MAX_REGS = 256;  # free-at scratch size (the full GFX9 VGPR file)
 
 var RA_ERR_SGPR_OVERFLOW = 50;
 var RA_ERR_VGPR_OVERFLOW = 51;
+
+# ================================================================
+# THE LIVENESS BUDGET — read this before blaming the id cap
+# ================================================================
+# ⛔ THERE IS NO SPILLING. This is a linear-scan allocator over a forward
+# instruction list; when a file runs out it returns an overflow error rather than
+# spilling to scratch memory. A kernel that needs more simultaneously-live values
+# than fit CANNOT be compiled, however few SPIR-V ids it uses.
+#
+# ⚠ That distinction is the one consumers get wrong, and the ranga M6 filing is
+# the worked example: a four-tap bilinear resize failed at 201 ids against a
+# 256-id cap and was reported as a capacity bug in the id budget. It was not. The
+# id cap and the register budget are INDEPENDENT limits, and it is normal to hit
+# the register one first — ids are cheap and registers are not.
+#
+# The budget, concretely (v4.0.11 — mabda 4.0.11 / GFX9, gfx90c):
+#
+#   VGPRs (per-lane / DIVERGENT values)
+#     ceiling      GFX9_VGPR_CAP = 256
+#     reserved     vgpr_base = number of LocalInvocationId components (1..3)
+#     usable       ~253-255 single-width values
+#     an f64 value takes a PAIR (2 VGPRs), and pairs must be even-aligned
+#
+#   SGPRs (uniform / scalar values)
+#     ceiling      GFX9_SGPR_CAP = 102  (s0..s101; EXCLUSIVE)
+#     reserved     sgpr_base = user_sgpr (buffer descriptors, 2 per binding)
+#                  + the TGID count (1..3)
+#     ⚠ a kernel containing a DIVERGENT if drops the ceiling to
+#       GFX9_EXEC_SAVE_SGPR = 100, because s[100:101] holds the saved EXEC
+#     usable       ~90 single-width values for a typical 2-binding kernel
+#
+# Each storage binding costs TWO SGPRs of `sgpr_base` before the allocator sees a
+# single value, so binding count trades directly against uniform liveness.
+#
+# ⭐ HOW TO FIT: shorten live ranges rather than reducing value count. A value is
+# live from its definition to its LAST use, so computing all four texel addresses
+# up front and consuming them at the end holds four addresses live across the
+# whole body; computing-and-consuming one at a time holds one. Restructuring that
+# keeps peak liveness identical (packing values, extracting later) does not help,
+# and the filing records exactly that attempt failing.
+#
+# If you hit RA_ERR_VGPR_OVERFLOW / RA_ERR_SGPR_OVERFLOW, `gpu_shader_error_name`
+# now names which file overflowed — that is the signal to restructure, not to
+# raise a cap.
 var RA_ERR_CAP_TOO_LARGE = 52;
 
 # ================================================================
@@ -122,6 +166,74 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
         if ((fl & MIR_FLAG_C_IMM) == 0) { _ra_use(m, alloc, gisel_c(isel, i), i); }
         i = i + 1;
     }
+    # v4.1.0 — LOOP LIVENESS EXTENSION. This is the blocker the lowerer's
+    # "loops remain unsupported" comment names: "a back-edge breaks the forward
+    # linear-scan liveness".
+    #
+    # Pass 1 sets each value's last_use to its highest TEXTUAL use. Across a
+    # back-edge that is wrong. Consider a value defined before the loop and read at
+    # the top of the body:
+    #
+    #     v defined here          (before the loop)
+    #   loop_start:  ... = v      <- last_use lands HERE
+    #                w = ...      <- w may claim v's register, freed at last_use+1
+    #                branch loop_start
+    #
+    # On iteration 2 the read of v executes again, but v's register now holds w.
+    # Silent corruption, and no forward scan can see it because textually the last
+    # use really is at the top.
+    #
+    # The standard fix: a value whose last use falls INSIDE a loop stays live to the
+    # END of that loop. Extending (never shortening) is conservative — it can only
+    # cost registers, never correctness.
+    #
+    # ⚠ Runs to a FIXED POINT over nested loops. Extending an interval to an inner
+    # loop's end can push it inside an enclosing loop, which must then extend it
+    # again; a single pass would leave the outer case wrong. Bounded by n_isel
+    # iterations because every round strictly increases at least one last_use.
+    var rounds = 0;
+    while (rounds < n_isel) {
+        var changed = 0;
+        var bi = 0;
+        while (bi < n_isel) {
+            var bop = gisel_op(isel, bi);
+            var is_br = 0;
+            if (bop == GISEL_S_BRANCH) { is_br = 1; }
+            if (bop == GISEL_S_CBRANCH) { is_br = 1; }
+            if (is_br == 1) {
+                # Resolve the branch target to its LABEL index. A target earlier in
+                # the list is a back-edge, and [tgt, bi] is the loop body.
+                var tgt = gisel_a(isel, bi);
+                if (bop == GISEL_S_CBRANCH) { tgt = gisel_c(isel, bi); }
+                var li = 0;
+                var tgt_idx = 0 - 1;
+                while (li < n_isel) {
+                    if (gisel_op(isel, li) == GISEL_LABEL) {
+                        if (gisel_a(isel, li) == tgt) { tgt_idx = li; li = n_isel; }
+                    }
+                    li = li + 1;
+                }
+                if (tgt_idx >= 0) {
+                    if (tgt_idx < bi) {
+                        var vi = 1;
+                        while (vi < cap_ids) {
+                            var lu = load64(alloc + vi * RA_REC + 8);
+                            if (lu >= tgt_idx) {
+                                if (lu < bi) {
+                                    store64(alloc + vi * RA_REC + 8, bi);
+                                    changed = 1;
+                                }
+                            }
+                            vi = vi + 1;
+                        }
+                    }
+                }
+            }
+            bi = bi + 1;
+        }
+        if (changed == 0) { rounds = n_isel; }
+        rounds = rounds + 1;
+    }
     # Pass 2 — allocate each SSA result in its file, reusing freed registers.
     var sgpr_hw = sgpr_base;
     var vgpr_hw = vgpr_base;
@@ -130,6 +242,18 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
         var d2 = gisel_dst(isel, i);
         if (d2 != 0) {
             if (mir_val_kind(m, d2) == MIR_VK_SSA) {
+                # v4.1.0 — ALLOCATE ONCE per value. The table is memset to 0xFF, so a
+                # reg field that is no longer -1 means this value already has a
+                # register and this is a SECOND definition of it.
+                #
+                # Straight-line SSA never produces one. A loop-carried value does:
+                # eliminating an OpPhi means the phi result is assigned on the entry
+                # edge AND again on the back-edge, and both must land in the SAME
+                # register or the loop reads its counter from the wrong place. Without
+                # this guard the second def claims a fresh register and the loop
+                # silently computes with two different variables.
+                var prev = load64(alloc + d2 * RA_REC + 0);
+                if (prev != 0 - 1) { i = i + 1; continue; }
                 var freeat_new = load64(alloc + d2 * RA_REC + 8) + 1;
                 # v3.2 F.7c — register WIDTH: an f64 value occupies an even-aligned
                 # 64-bit PAIR (2 regs), everything else a single reg. The high-water

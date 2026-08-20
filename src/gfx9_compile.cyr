@@ -351,7 +351,11 @@ fn _emit_fabs_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
 # v3.2 F.7f.6b — f64 div_scale: VOP3B writing the per-lane scale flag to VCC (consumed by the
 # later div_fmas). 3 VGPR-pair operands; the scaled value → vdst. (The two scale operands are
 # the operand being scaled + the other; the macro in spirv_lower wires D,D,N / N,D,N.)
-fn _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+# v4.1.0 — parameterized by the VOP3 opcode so the f32 and f64 halves of the
+# division family share one emitter. Duplicating it would have been ~12 lines x 3
+# and the two copies would drift the first time a source-modifier or literal rule
+# changed on one side only.
+fn _emit_div_scale(m, isel, i, alloc, isvgpr, buf, pos, vop3op): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
@@ -363,13 +367,13 @@ fn _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     var vdst = gfx9_reg(alloc, gisel_dst(isel, i));
-    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3b_lo(GFX9_VOP3_V_DIV_SCALE_F64, GFX9_REG_VCC_LO, vdst));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3b_lo(vop3op, GFX9_REG_VCC_LO, vdst));
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2));
 }
 
 # v3.2 F.7f.6b — f64 fma(-a, b, c): the Newton residual/correction FMAs with a NEGATE-src0
 # source modifier (hi bit 29 = 0x20000000). All three operands are computed VGPR pairs.
-fn _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+fn _emit_fma_n0(m, isel, i, alloc, isvgpr, buf, pos, vop3op): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
@@ -380,13 +384,13 @@ fn _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     if (src2 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
-    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(vop3op, gfx9_reg(alloc, gisel_dst(isel, i))));
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, src2) | 0x20000000);
 }
 
 # v3.2 F.7f.6b — f64 fma(-a, b, 1.0): the Newton refinement step. NEGATE src0 (0x20000000) +
 # the inline-1.0 constant in src2 (GFX9_INLINE_F32_1_0 = 242; the same code denotes f64 1.0).
-fn _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+fn _emit_fma_n0_one(m, isel, i, alloc, isvgpr, buf, pos, vop3op): i64 {
     var fl = gisel_flags(isel, i);
     var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
     if (src0 < 0) { return src0; }
@@ -394,7 +398,7 @@ fn _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos): i64 {
     if (src1 < 0) { return src1; }
     if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
     if (src1 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_VOP3_LITERAL; }
-    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(GFX9_VOP3_V_FMA_F64, gfx9_reg(alloc, gisel_dst(isel, i))));
+    var p = gfx9_emit32(buf, pos, gfx9_enc_vop3a_lo(vop3op, gfx9_reg(alloc, gisel_dst(isel, i))));
     return gfx9_emit32(buf, p, gfx9_enc_vop3a_hi(src0, src1, GFX9_INLINE_F32_1_0) | 0x20000000);
 }
 
@@ -750,15 +754,38 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     # F.7f.6b f64 division macro. RCP reuses _emit_vop1; DIV_FMAS/DIV_FIXUP reuse _emit_vop3_3src
     # (VCC is implicit for DIV_FMAS — no extra encoding); div_scale + the NEG-src0 FMAs are dedicated.
     if (op == GISEL_V_RCP_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RCP_F64); }
-    if (op == GISEL_V_DIV_SCALE_F64) { return _emit_div_scale_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_DIV_SCALE_F64) {
+        return _emit_div_scale(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_SCALE_F64);
+    }
+    # v4.1.0 — f32 division family (ranga M6).
+    if (op == GISEL_V_RCP_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RCP_F32); }
+    if (op == GISEL_V_DIV_SCALE_F32) {
+        return _emit_div_scale(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_SCALE_F32);
+    }
+    if (op == GISEL_V_DIV_FMAS_F32) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FMAS_F32);
+    }
+    if (op == GISEL_V_DIV_FIXUP_F32) {
+        return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FIXUP_F32);
+    }
+    if (op == GISEL_V_FMA_F32_N0) {
+        return _emit_fma_n0(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32);
+    }
+    if (op == GISEL_V_FMA_F32_N0_ONE) {
+        return _emit_fma_n0_one(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F32);
+    }
     if (op == GISEL_V_DIV_FMAS_F64) {
         return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FMAS_F64);
     }
     if (op == GISEL_V_DIV_FIXUP_F64) {
         return _emit_vop3_3src(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_DIV_FIXUP_F64);
     }
-    if (op == GISEL_V_FMA_F64_N0) { return _emit_fma_n0_f64(m, isel, i, alloc, isvgpr, buf, pos); }
-    if (op == GISEL_V_FMA_F64_N0_ONE) { return _emit_fma_n0_one_f64(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_V_FMA_F64_N0) {
+        return _emit_fma_n0(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F64);
+    }
+    if (op == GISEL_V_FMA_F64_N0_ONE) {
+        return _emit_fma_n0_one(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP3_V_FMA_F64);
+    }
     # F.7f.7b f64 sqrt macro. RSQ reuses _emit_vop1; the rest are dedicated (the inline-0.5 FMA/MUL,
     # the VCC-writing cmp_class, the f64-pair cndmask).
     if (op == GISEL_V_RSQ_F64) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_RSQ_F64); }

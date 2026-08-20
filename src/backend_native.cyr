@@ -839,6 +839,7 @@ fn _backend_native_buffer_create(ctx, size, usage): i64 {
     # _backend_native_buffer_release rounds it back the same way to unmap.
     var bo_size = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
     var va = native_ctx_alloc_texture_va(ctx, bo_size);
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_VA_ALLOC);
     if (va == 0) { return 0; }
     var bo[16];
     # Every post-VA-alloc error path reclaims the just-reserved VA (LIFO, no
@@ -966,12 +967,18 @@ var NATIVE_SHADER_CAP_IDS = 256;
 # stack-transient (freed on return); only the 72-B shmod is alloc'd (it must
 # outlive the call), and the ISA BO is a GPU resource freed by _release.
 fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
+    # v4.0.11 — every `return 0` below now records WHY first. The null return is
+    # the slot contract and does not change; what changes is that a consumer can
+    # ask. See gpu_last_shader_error / gpu_shader_error_name.
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_CTX);
     if (ctx == 0)       { return 0; }
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_WORDS);
     if (words_ptr == 0) { return 0; }
     # The SPIR-V header is 5 words (20 B); reject anything shorter BEFORE reading
     # spirv_hdr_id_bound (word 3, offset 12) below — gfx9_compile's validate gate
     # runs only later, so without this a 1..19-byte buffer is an OOB header read
     # (N.6r review, HIGH). 20 is the floor; full structural validation is the gate's.
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_TOO_SHORT);
     if (byte_len < 20) { return 0; }
 
     # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
@@ -1012,9 +1019,16 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     var isa[8192];
     memset(&isa, 0, 8192);
     var desc[72];
-    if (gfx9_compile(&cc, words_ptr, byte_len, &isa, &desc) != 0) { return 0; }
+    # ⭐ The load-bearing line of the whole fix: gfx9_compile's return is the
+    # specific stage code (mir / lower / regalloc / waitcnt / isel / emit) and was
+    # previously discarded here. Every case in the ranga M6 filing arrived as a
+    # bare 0 because of this one comparison.
+    var crc = gfx9_compile(&cc, words_ptr, byte_len, &isa, &desc);
+    if (crc != 0) { _gpu_set_last_shader_err(crc); return 0; }
     var isa_len = load64(&desc + DESC_ISA_LEN);
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_EMPTY);
     if (isa_len <= 0)    { return 0; }
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_TOO_BIG);
     if (isa_len > 8192)  { return 0; }
 
     # --- LocalSize x/y/z (drive PM4 NUM_THREAD_X/Y/Z; the kernel was compiled for them) ---
@@ -1042,6 +1056,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # 2 GiB region (N.6r review, HIGH).
     if (native_bo_create_gtt(fd, bo_size, &bo) != 0) {
         native_ctx_free_texture_va(ctx, bo_size);
+        _gpu_set_last_shader_err(0 - SHMOD_ERR_BO_CREATE);
         return 0;
     }
     var handle = load64(&bo + 0);
@@ -1051,6 +1066,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     if (native_gem_va_map(fd, handle, va, bo_size, _NATIVE_PERM_SHADER) != 0) {
         native_bo_release_gtt(fd, handle, addr, bo_size);
         native_ctx_free_texture_va(ctx, bo_size);
+        _gpu_set_last_shader_err(0 - SHMOD_ERR_VA_MAP);
         return 0;
     }
 
@@ -1060,6 +1076,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
         native_gem_va_unmap(fd, handle, va, bo_size);
         native_bo_release_gtt(fd, handle, addr, bo_size);
         native_ctx_free_texture_va(ctx, bo_size);
+        _gpu_set_last_shader_err(0 - SHMOD_ERR_OOM);
         return 0;
     }
     store64(sh + NATIVE_SHMOD_MAGIC, NATIVE_SHMOD_MAGIC_VAL);
@@ -1073,6 +1090,9 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     store64(sh + NATIVE_SHMOD_ISALEN, isa_len);
     store64(sh + NATIVE_SHMOD_LOCALY, local_y);
     store64(sh + NATIVE_SHMOD_LOCALZ, local_z);
+    # Clear on success so a stale reason from an earlier failed create can never
+    # be read as this one's.
+    _gpu_set_last_shader_err(0);
     return sh;
 }
 
@@ -1081,6 +1101,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
 # WGSL needs an in-mabda frontend (v3.x), and raw GFX9 ISA carries no RSRC /
 # binding metadata for the dispatch to wire — both return 0 (fail-loud).
 fn _backend_native_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_CTX);
     if (ctx == 0) { return 0; }
     if (kind == SHADER_SRC_SPIRV) {
         # v3.2 F.3 — explicit f64 gate. The Phase N emitter has no `V_*_F64` lowering yet
@@ -1088,10 +1109,17 @@ fn _backend_native_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
         # decision rather than letting gfx9_compile fail deeper on the 64-bit float type. F.7
         # flips MABDA_NATIVE_F64 and this gate opens.
         if (spirv_uses_f64(bytes_ptr, n) == 1) {
-            if (MABDA_NATIVE_F64 == 0) { return 0; }
+            if (MABDA_NATIVE_F64 == 0) {
+                _gpu_set_last_shader_err(0 - SHMOD_ERR_F64_GATE);
+                return 0;
+            }
         }
         return _native_shader_compile_spirv(ctx, bytes_ptr, n);
     }
+    # WGSL / raw GFX9 reaching the native create is a source-kind mismatch, not a
+    # compile failure — say which, so a consumer passing the wrong `kind` is not
+    # left reading the compiler's error bands for an answer that is not there.
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_SRC_KIND);
     return 0;
 }
 

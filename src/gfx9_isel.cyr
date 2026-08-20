@@ -116,6 +116,14 @@ var GISEL_V_DIV_FMAS_F64      = 63;   # v_div_fmas_f64 (3-src; reads VCC)
 var GISEL_V_DIV_FIXUP_F64     = 64;   # v_div_fixup_f64 (3-src)
 var GISEL_V_FMA_F64_N0        = 65;   # v_fma_f64(-a, b, c)
 var GISEL_V_FMA_F64_N0_ONE    = 66;   # v_fma_f64(-a, b, 1.0)
+
+# v4.1.0 — f32 division family (ranga M6). Structural mirror of the f64 ops above.
+var GISEL_V_RCP_F32           = 105;   # v_rcp_f32 reciprocal seed
+var GISEL_V_DIV_SCALE_F32     = 106;   # v_div_scale_f32 (3-src; flag -> VCC)
+var GISEL_V_DIV_FMAS_F32      = 107;   # v_div_fmas_f32 (3-src; reads VCC)
+var GISEL_V_DIV_FIXUP_F32     = 108;   # v_div_fixup_f32 (3-src)
+var GISEL_V_FMA_F32_N0        = 109;   # v_fma_f32(-a, b, c)
+var GISEL_V_FMA_F32_N0_ONE    = 110;   # v_fma_f32(-a, b, 1.0)
 # v3.2 F.7f.7b — f64 sqrt macro ops. RSQ is VOP1; CMP_CLASS is VOPC (→ VCC, dst=0); CNDMASK_F64
 # emits 2× v_cndmask_b32 (the pair halves); FMA_N0_HALF/MUL_HALF carry an inline-0.5 operand.
 var GISEL_V_RSQ_F64           = 67;   # v_rsq_f64 seed
@@ -141,6 +149,13 @@ var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 # is a needless smell. Disjoint from mir 20-25, lower 26-27, and CMP 70-87.
 var GISEL_ERR_UNSUPPORTED_OP = 100;
 var GISEL_ERR_CAP_EXCEEDED   = 101;
+# v4.0.11 — structured-control-flow rejections, split out of GISEL_ERR_UNSUPPORTED_OP.
+# All three were ALREADY rejected (or, for RETURN_IN_SELECTION, silently miscompiled);
+# what was missing is a code that says which. See the ranga M6 filing
+# `docs/development/issues/2026-08-19-native-spirv-compile-limits.md`.
+var GISEL_ERR_NESTED_SELECTION    = 102;  # a divergent if opened inside another
+var GISEL_ERR_RETURN_IN_SELECTION = 103;  # OpReturn inside a divergent if -> would end the WAVE
+var GISEL_ERR_UNCLOSED_SELECTION  = 104;  # a divergent if whose merge label never arrived
 
 # ================================================================
 # Selected-instruction emit + accessors
@@ -373,6 +388,12 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_CNDMASK) { return _gisel_emit(out, k, GISEL_V_CNDMASK, dst, a, b, 0, flags); }
     # F.7f.6b f64 division macro: all VALU/f64 (dst type is f64 → regalloc claims a pair). The
     # 3-src forms carry a/b/c; RCP is unary; FMA_N0_ONE drops c (the inline 1.0 is in the emit).
+    if (op == MIR_OP_F32_RCP) { return _gisel_emit(out, k, GISEL_V_RCP_F32, dst, a, 0, 0, flags); }
+    if (op == MIR_OP_F32_DIV_SCALE) { return _gisel_emit(out, k, GISEL_V_DIV_SCALE_F32, dst, a, b, c, flags); }
+    if (op == MIR_OP_F32_DIV_FMAS) { return _gisel_emit(out, k, GISEL_V_DIV_FMAS_F32, dst, a, b, c, flags); }
+    if (op == MIR_OP_F32_DIV_FIXUP) { return _gisel_emit(out, k, GISEL_V_DIV_FIXUP_F32, dst, a, b, c, flags); }
+    if (op == MIR_OP_F32_FMA_N0) { return _gisel_emit(out, k, GISEL_V_FMA_F32_N0, dst, a, b, c, flags); }
+    if (op == MIR_OP_F32_FMA_N0_ONE) { return _gisel_emit(out, k, GISEL_V_FMA_F32_N0_ONE, dst, a, b, 0, flags); }
     if (op == MIR_OP_F64_RCP) { return _gisel_emit(out, k, GISEL_V_RCP_F64, dst, a, 0, 0, flags); }
     if (op == MIR_OP_F64_DIV_SCALE) { return _gisel_emit(out, k, GISEL_V_DIV_SCALE_F64, dst, a, b, c, flags); }
     if (op == MIR_OP_F64_DIV_FMAS) { return _gisel_emit(out, k, GISEL_V_DIV_FMAS_F64, dst, a, b, c, flags); }
@@ -449,7 +470,7 @@ fn gfx9_isel(m, out, cap): i64 {
         # the then-block entirely when no lane is active. The restore is emitted at merge.
         if (op == MIR_OP_COND_BRANCH) {
             if (mir_val_unif(m, a) == MIR_DIVERGENT) {
-                if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+                if (pending_merge != 0) { return 0 - GISEL_ERR_NESTED_SELECTION; }
                 if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
                 _gisel_emit(out, k, GISEL_S_SAVEEXEC, 0, 0, 0, 0, 0);
                 _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, c, 0);
@@ -475,6 +496,26 @@ fn gfx9_isel(m, out, cap): i64 {
                 }
             }
         }
+        # ⛔ OpReturn inside an open divergent if. This is the ranga M6 filing's worst
+        # case, and the only one that was not already a rejection: it COMPILED, then
+        # did nothing. A divergent if runs its then-block under a masked EXEC, so a
+        # RET there lowers to s_endpgm and ends the ENTIRE WAVE — every lane, active
+        # or not — before the code after the merge ever runs. The kernel dispatches
+        # with rc=0 and writes nothing, which a consumer can only discover by noticing
+        # an unchanged output buffer.
+        #
+        # The idiomatic WGSL guard `if idx >= count { return; }` lowers to exactly
+        # this shape. The form that works puts the body in the then-block and leaves
+        # the function's only OpReturn in the merge block (see
+        # programs/native_spirv_divergent_if_e2e.cyr), or inverts the guard:
+        # `if (count > idx) { body } return`.
+        #
+        # A loud failure is strictly better than a shader that runs and does nothing.
+        if (handled == 0) {
+            if (op == MIR_OP_RET) {
+                if (pending_merge != 0) { return 0 - GISEL_ERR_RETURN_IN_SELECTION; }
+            }
+        }
         if (handled == 0) {
             var rc = _gisel_one(m, out, k, op, mir_instr_result(m, i),
               a, mir_instr_b(m, i), c, mir_instr_flags(m, i));
@@ -483,6 +524,6 @@ fn gfx9_isel(m, out, cap): i64 {
         }
         i = i + 1;
     }
-    if (pending_merge != 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }   # unclosed divergent if
+    if (pending_merge != 0) { return 0 - GISEL_ERR_UNCLOSED_SELECTION; }
     return k;
 }

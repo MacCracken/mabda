@@ -1,7 +1,7 @@
 # wgpu-native `v29.0.1.1` is a BREAKING change despite the patch-level version — do not bump blind
 
-**Status:** 🟡 **OPEN** — evaluated and deliberately not taken in 4.0.10; **scheduled v4.1.0**
-(see [`../roadmap.md`](../roadmap.md) § v4.1.0).
+**Status:** ✅ **RESOLVED in v4.1.0** — bumped, with the two breakages handled. See
+"Resolution" at the end.
 **Placement:** `deps/fetch-wgpu.sh:6`, `deps/wgpu_main.c`, `src/backend_wgpu.cyr`.
 **Discovered:** 2026-08-19, mabda 4.0.10 currency sweep.
 **Severity:** **Medium** — currently dormant (we are pinned to `v29.0.0.0`, which works).
@@ -119,3 +119,35 @@ so an in-place overwrite leaves no diff to notice and no way to `git checkout` b
 - `deps/wgpu-native/` and `deps/*.o` are gitignored build artifacts; only the `VERSION` line
   in `deps/fetch-wgpu.sh` is tracked, so the eventual bump is a one-line diff plus whatever
   source changes items 1-3 require.
+
+---
+
+## Resolution (v4.1.0)
+
+Bumped to `v29.0.1.1`. The full wgpu suite passes on it: `test-phase0` **12/12**,
+`test-compute-e2e` **7/7**, `test-render-e2e` **8/8**, `test-render-graph-e2e` **5/5**.
+
+**What had to change — both of the sites this filing identified, and nothing else:**
+
+1. `deps/wgpu_main.c` no longer requests `WGPUNativeFeature_SpirvShaderPassthrough`.
+   ⛔ The feature is **gone upstream at any spelling**: its slot `0x00030017` is now
+   `ClearTexture`, and the intended successor
+   (`WGPUNativeFeature_PassthroughShaders = 0x00030036`) ships **commented out** behind a
+   "requires wgpu.h api change" TODO. It was not renamed — it does not exist.
+2. `src/backend_wgpu.cyr`'s bare `0x00030017` literal is retired in place, with the
+   wgpu-native version it was read from recorded next to it.
+
+**Nothing of mabda's was lost.** Passthrough is the naga-*bypass* escape hatch and already
+returned 0 from `wgpuAdapterHasFeature` on RADV/Cezanne. The paths that carry real work are
+untouched and were verified byte-for-byte against both headers:
+`WGPUInstanceFeatureName_ShaderSourceSPIRV` (the ordinary naga SPIR-V route) is present,
+and `WGPUNativeFeature_ShaderF64` is **still `0x0003001D`**, identical in v29.0.0.0 and
+v29.0.1.1 — which is the constant mabda's f64 path actually depends on.
+
+⭐ **The asymmetry this filing predicted held exactly.** Every site spelling a constant as a
+**symbol** recompiled correctly through the `WGPUSType_*` renumber without a single edit —
+`WGPUSType_InstanceExtras` silently moved `0x00030006` -> `0x00030004` and the launcher did
+not care. The one site that hardcoded the **number** is the one that needed human attention.
+Cyrius cannot include `wgpu.h`, so that literal is unavoidable; pinning it to a named
+version is the mitigation.
+

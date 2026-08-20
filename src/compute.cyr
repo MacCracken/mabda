@@ -218,6 +218,110 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
         BACKEND_SLOT_SHADER_MODULE_CREATE), ctx, words_ptr, byte_len, SHADER_SRC_SPIRV);
 }
 
+# @public — render `gpu_last_shader_error()` as a human-readable reason.
+#
+# v4.0.11, the ranga M6 filing's item 1. A failed `gpu_shader_module_create_spirv`
+# returns a bare 0; this says WHY. Lives in compute.cyr rather than error.cyr
+# because the code names below are defined across the compiler modules, which
+# `src/lib.cyr` includes after error.cyr.
+#
+# The codes are the compiler's own, stored NEGATED. The band tells you the stage,
+# which is usually enough to know where to look:
+#   20-32   MIR construction / the scratch-buffer contract   (src/mir.cyr)
+#   26-29   SPIR-V -> MIR lowering                           (src/spirv_lower.cyr)
+#   50-52   register allocation                              (src/gfx9_regalloc.cyr)
+#   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
+#   70-87   encoding / validation / table build              (src/gfx9_compile.cyr)
+#   100-101 instruction selection                            (src/gfx9_isel.cyr)
+#   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
+fn gpu_shader_error_name(code): i64 {
+    if (code == 0) { return "no error"; }
+    var c = 0 - code;
+    if (c < 0) { c = code; }
+    # --- MIR construction + the scratch-buffer contract ---
+    if (c == MIR_ERR_UNSUPPORTED_OP)   { return "MIR: unsupported opcode"; }
+    if (c == MIR_ERR_UNSUPPORTED_TYPE) { return "MIR: unsupported type"; }
+    if (c == MIR_ERR_CAP_EXCEEDED)     { return "MIR: instruction capacity exceeded"; }
+    if (c == MIR_ERR_BAD_ACCESS_CHAIN) { return "MIR: malformed access chain"; }
+    if (c == MIR_ERR_OVERFLOW)         { return "MIR: integer overflow in index math"; }
+    if (c == MIR_ERR_ID_OOR)           { return "MIR: value id outside cap_ids"; }
+    if (c == MIR_ERR_MOD_UNINIT) {
+        return "MIR: module header uninitialized or overwritten - check vals[] is cap_ids*40 bytes";
+    }
+    if (c == MIR_ERR_VALS_OVERRUN) {
+        return "MIR: vals[] too small - its memset overran and clobbered the module header";
+    }
+    if (c == MIR_ERR_BAD_INIT)         { return "MIR: mir_mod_init rejected its arguments"; }
+    # --- SPIR-V -> MIR lowering ---
+    if (c == LOWER_ERR_CONTROL_FLOW)   { return "lower: unsupported control flow"; }
+    if (c == LOWER_ERR_NO_ENTRY)       { return "lower: no OpEntryPoint found"; }
+    if (c == LOWER_ERR_ARRAY_STRIDE)   { return "lower: ArrayStride disagrees with std430"; }
+    if (c == LOWER_ERR_EXT_SET)        { return "lower: non-GLSL.std.450 extended instruction set"; }
+    if (c == LOWER_ERR_SELECT_NOT_ADJACENT) {
+        return "lower: OpSelect's integer compare is not adjacent - VCC no longer live";
+    }
+    if (c == LOWER_ERR_SELECT_UNIFORM_COND) {
+        return "lower: OpSelect's integer compare is uniform (SCC) - needs a divergent condition";
+    }
+    # --- register allocation ---
+    if (c == RA_ERR_SGPR_OVERFLOW)     { return "regalloc: out of SGPRs (too many live scalar values)"; }
+    if (c == RA_ERR_VGPR_OVERFLOW)     { return "regalloc: out of VGPRs (too many live vector values)"; }
+    if (c == RA_ERR_CAP_TOO_LARGE)     { return "regalloc: register cap above RA_MAX_REGS"; }
+    # --- waitcnt ---
+    if (c == WC_ERR_CAP)               { return "waitcnt: output capacity exceeded"; }
+    if (c == WC_ERR_TOO_MANY_IDS)      { return "waitcnt: cap_ids above the file-map bound"; }
+    # --- encode / validate / tables ---
+    if (c == CMP_ERR_UNSUPPORTED_OP)       { return "encode: opcode not encodable on GFX9"; }
+    if (c == CMP_ERR_UNSUPPORTED_OPERAND)  { return "encode: unsupported operand kind"; }
+    if (c == CMP_ERR_NO_VGPR_OPERAND)      { return "encode: VALU op with no VGPR operand"; }
+    if (c == CMP_ERR_BAD_SALU_OPERAND)     { return "encode: SALU op handed a VGPR operand"; }
+    if (c == CMP_ERR_TWO_LITERALS)         { return "encode: more than one literal in an instruction"; }
+    if (c == CMP_ERR_TOO_MANY_IDS)         { return "encode: id bound exceeds the file-map scratch"; }
+    if (c == CMP_ERR_VOP3_LITERAL)         { return "encode: 32-bit literal in a VOP3 (no literal form)"; }
+    if (c == CMP_ERR_FLAT_CONST_OFFSET)    { return "encode: const-offset access chain unsupported"; }
+    if (c == CMP_ERR_FLAT_NONVGPR)         { return "encode: FLAT offset/data operand not in a VGPR"; }
+    if (c == CMP_ERR_BINDING_RANGE)        { return "encode: binding outside the loaded USER_DATA region"; }
+    if (c == CMP_ERR_UNSUPPORTED_BUILTIN)  { return "encode: unresolved builtin in an OpCompositeExtract"; }
+    if (c == CMP_ERR_VALIDATE)             { return "validate: spirv_validate_stream rejected the module"; }
+    if (c == CMP_ERR_TABLE)                { return "tables: malformed module, or id_bound above cap_ids"; }
+    if (c == CMP_ERR_UNRESOLVED_LABEL)     { return "encode: branch to a label not in the program"; }
+    if (c == CMP_ERR_TOO_MANY_BRANCHES)    { return "encode: branch count exceeds the patch list"; }
+    # --- instruction selection ---
+    if (c == GISEL_ERR_UNSUPPORTED_OP)     { return "isel: MIR op not selectable on GFX9"; }
+    if (c == GISEL_ERR_CAP_EXCEEDED)       { return "isel: selected-instruction capacity exceeded"; }
+    if (c == GISEL_ERR_NESTED_SELECTION) {
+        return "isel: a divergent if inside another - flatten to two sequential ifs";
+    }
+    if (c == GISEL_ERR_RETURN_IN_SELECTION) {
+        return "isel: OpReturn inside a divergent if would end the whole wave - invert the guard";
+    }
+    if (c == GISEL_ERR_UNCLOSED_SELECTION) { return "isel: divergent if never reached its merge label"; }
+    # --- module staging ---
+    if (c == SHMOD_ERR_NULL_CTX)     { return "staging: null context"; }
+    if (c == SHMOD_ERR_NULL_WORDS)   { return "staging: null SPIR-V pointer"; }
+    if (c == SHMOD_ERR_TOO_SHORT)    { return "staging: buffer shorter than a SPIR-V header (20 bytes)"; }
+    if (c == SHMOD_ERR_ISA_EMPTY)    { return "staging: compile produced no ISA"; }
+    if (c == SHMOD_ERR_ISA_TOO_BIG)  { return "staging: compiled ISA exceeds the 8192-byte buffer"; }
+    if (c == SHMOD_ERR_VA_ALLOC)     { return "staging: context VA reservation failed"; }
+    if (c == SHMOD_ERR_BO_CREATE)    { return "staging: GTT BO creation failed"; }
+    if (c == SHMOD_ERR_VA_MAP)       { return "staging: GEM_VA map failed"; }
+    if (c == SHMOD_ERR_OOM)          { return "staging: shmod allocation failed"; }
+    if (c == SHMOD_ERR_F64_GATE)     { return "staging: module uses f64 and MABDA_NATIVE_F64 is off"; }
+    if (c == SHMOD_ERR_SRC_KIND)     { return "staging: source kind not accepted by the native backend"; }
+    return "unrecognized shader compile error";
+}
+
+# @public — print the last shader error to stderr, one line, newline-terminated.
+# The convenience form: a consumer that just wants to know why its create
+# returned 0 should not have to wire up its own formatting.
+fn gpu_shader_error_print(): i64 {
+    var code = gpu_last_shader_error();
+    var name = gpu_shader_error_name(code);
+    syscall(1, 2, name, strlen(name));
+    syscall(1, 2, "\n", 1);
+    return 0;
+}
+
 fn gpu_shader_module_release(ctx, shmod): i64 {
     if (ctx == 0) { return 0; }
     var slot = backend_get_slot(gpu_ctx_backend(ctx),
