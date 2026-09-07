@@ -68,12 +68,12 @@ On the wgpu path, the C launcher pre-initializes the GPU and passes
 handles to Cyrius via `gpu_context_from_preinit`:
 
 ```cyrius
-var res = gpu_context_from_preinit(preinit_ptr);
-if (is_err_result(res) == 1) {
+var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+if (is_err_result(res_tag) == 1) {
     # No GPU available
     return 1;
 }
-var ctx = payload(res);
+var ctx = res;
 var device = gpu_ctx_device(ctx);
 var queue = gpu_ctx_queue(ctx);
 ```
@@ -200,19 +200,26 @@ var worst = profiler_worst_frame_ms(prof);
 
 ## Error Handling
 
-Mabda uses tagged unions (Ok/Err) from tagged.cyr:
+Mabda uses the stdlib `Result` (Ok/Err) from `result.cyr`.
+
+Since cyrius **6.6.0** a `Result` is a `: stack` enum: it returns a
+**register pair** — the tag and the payload — and allocates nothing. Bind
+both halves; `payload()` no longer exists, because the payload is already a
+plain variable.
 
 ```cyrius
-var res = gpu_context_from_preinit(ptr);
-if (is_err_result(res) == 1) {
-    var err = payload(res);
+var res_tag, res = gpu_context_from_preinit(ptr);
+if (is_err_result(res_tag) == 1) {
+    var err = res;                  # Err payload: the GpuErr pointer
     var code = gpu_err_code(err);
     var name = gpu_err_name(code);
     # Handle error...
     return 1;
 }
-var ctx = payload(res);  # success value
+var ctx = res;                      # Ok payload: the context handle
 ```
+
+`gpu_result_unwrap` takes both halves too — `gpu_result_unwrap(res_tag, res)`.
 
 Recoverable errors (retry or reconfigure):
 

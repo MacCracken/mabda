@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.1.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.1.1 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -55,9 +55,11 @@ fn mabda_main(fn_table_ptr, preinit_ptr) {
     color_init();
     wgpu_ffi_init_table(fn_table_ptr);
 
-    # Create GPU context (via C launcher pre-init)
-    var res = gpu_context_from_preinit(preinit_ptr);
-    var ctx = payload(res);
+    # Create GPU context (via C launcher pre-init).
+    # A Result is a (tag, payload) register pair since cyrius 6.6.0 —
+    # bind BOTH halves; the payload is the context handle.
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    var ctx = res;
     var device = gpu_ctx_device(ctx);
     var queue = gpu_ctx_queue(ctx);
 
@@ -189,7 +191,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.5.29+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.0+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -251,7 +253,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.1.0
+├── VERSION              4.1.1
 └── CHANGELOG.md
 ```
 

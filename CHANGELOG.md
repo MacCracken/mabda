@@ -13,6 +13,121 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.1] — 2026-09-06
+
+**Cyrius 6.6.0's `Result` value form, migrated at source.** The toolchain pin moves
+6.5.29 → 6.6.0, where `Result<T, E>` / `Option` / `Either` are declared `: stack`: a
+payload variant now returns a **register pair** (tag in rax, payload in rdx) and allocates
+**zero bytes**. The 16-byte heap box is gone, and with it the `tag at +0 / payload at +8`
+layout that mabda's guides published as a user-facing contract. **One public-API signature
+changes** — `gpu_result_unwrap` — so this is a Breaking patch, not a currency sweep.
+
+**5099 assertions across 18 CPU suites, 0 failures**, each gated on its own exit code;
+3/3 fuzz harnesses pass; `cyrius lint` reports **0 warnings** across `src/` + `programs/` +
+`tests/` + `fuzz/`, `fmt --check` is clean, `cyaudit vet` OK, and the buffer-sizing gate
+reports 123 `mir_mod_init` call sites / 0 problems. ⚠ The assertion tally moves 5083 → 5099
+**and this migration did not add an assertion**: the static `assert`/`assert_eq` call count
+across `tests/tcyr/` is **4580 before and 4580 after**, byte-for-byte. The +16 arrives with
+the toolchain, and is UNATTRIBUTED — isolating it would need the 6.5.29 `lib/` snapshot the
+re-vendor overwrote.
+
+### Breaking — `gpu_result_unwrap(res)` → `gpu_result_unwrap(t, v)`
+
+`rdx` does not reach a parameter, so a `Result` can no longer be *received* in one argument.
+Every helper that took a whole Result had to grow a second parameter, and mabda has exactly
+one: `gpu_result_unwrap`. Callers change from
+
+```cyrius
+var ctx = gpu_result_unwrap(gpu_context_new_native_nvidia());
+```
+
+to
+
+```cyrius
+var ctx_res_tag, ctx_res = gpu_context_new_native_nvidia();
+var ctx = gpu_result_unwrap(ctx_res_tag, ctx_res);
+```
+
+The **producers** are unaffected: `gpu_ok`, `gpu_err_result` and `gpu_err_result_msg` keep
+their signatures and simply return the pair, exactly as the stdlib's own `ok_via`/`err_via`
+do. Consumers that only ever bound and tested a Result need the bind form, not a rename.
+
+### Changed — 113 pair-bind conversions across 94 files
+
+The mechanical rule, applied per function scope: a variable passed to `is_ok` /
+`is_err_result` / `payload` / `result_unwrap` holds a Result, so
+
+```cyrius
+var r = f();      ->  var r_tag, r = f();     # r keeps the PAYLOAD
+is_err_result(r)  ->  is_err_result(r_tag)
+payload(r)        ->  r
+```
+
+Keeping the original name on the payload is deliberate — every downstream use of the value
+stays untouched, so the diff stays confined to the declaration and the tag-reading calls.
+
+- **`src/` — 8 binds in 2 files, plus the one signature.** `asset_load.cyr` (7: the
+  `gpu_texture_load_*` handle-or-0 wrappers) and `backend_wgpu.cyr` (1:
+  `_backend_wgpu_surface_acquire`). `error.cyr` carries the `gpu_result_unwrap` change.
+- **`programs/` — 92 binds in 86 files**, overwhelmingly `gpu_context_new_native()` (67) and
+  `gpu_context_from_preinit()` (14), plus `uniform_buffer_new`, `storage_buffer_write` and
+  `gpu_timestamps_new` in `phase0.cyr`. Six `gpu_result_unwrap` call sites in the `nvidia_*`
+  programs were hand-fixed; five of them nested the producing call **inside** the unwrap, a
+  shape no textual rule can rewrite.
+- **`tests/` — 12 binds in 3 files** (`buffer.tcyr`, `core.tcyr`, `backend.tcyr`).
+- **`examples/stdlib-consumer/` — 1 bind**, and its own pin moves to 6.6.0.
+
+⭐ **The compiler is the migration tool, and it is loud where it can be.** `var r = f();`,
+`r = f();` and `store64(&slot, f());` are now NAMED errors at the offending line —
+*"a `: stack` enum returns two values — bind both: `var tag, val = f();`"*. Every stale site
+in mabda failed at its own line. Nothing miscompiled, and nothing needed a design decision.
+
+⚠ **The dangerous shape is the one the compiler CANNOT see** — a hand-rolled `load64(r)` for
+the tag and `load64(r + 8)` for the payload. A register pair dereferenced as a pointer is a
+plausible-looking address, so it fails silently. Grepped explicitly at this cut: **mabda has
+none.** Every `load64(x + 8)` in `src/` is one of mabda's own structs — `WGPUSurfaceTexture`
++8 (`surface.cyr`), the uniform-buffer record +8 (`typed_buffer.cyr`), the render-graph
+resource record +8 (`render_graph.cyr`), and peers. `mir_val_payload` is likewise mabda's own
+MIR accessor and unrelated to the deleted `payload` builtin. That grep is not
+compiler-enforced; re-run it on any future Result work.
+
+⚠ **A textual migration rule is scoped to the FILE, not the function, and that overreaches.**
+The upstream helper script derives its "this variable holds a Result" set per file, then
+rewrites every `var X = <call>;` for those names. In `tests/tcyr/core.tcyr` the name `r` is a
+Result in `test_gpu_ok_tag` and an ordinary colour value in `test_color_rgb_constants` twenty
+lines later — so `var r = COLOR_RED();` was rewritten to a pair bind that `COLOR_RED` never
+produces. Caught by reviewing every generated bind against its right-hand side before
+compiling, not by the compiler (which would have accepted it and dropped a value). **Audit
+the RHS of every machine-generated pair bind.** 113 binds, one false positive, reverted.
+
+### Changed — `cyrius = "6.6.0"` in `cyrius.cyml` (was 6.5.29)
+
+Blast radius measured from `cyrius.lock`, the only honest oracle here — it hashes every file
+`cyrius deps` actually lays down. **18 resolved files changed content and one appeared
+(`lib/hashseed.cyr`); 42 → 43 locked.** `lib/result.cyr` and `lib/tagged.cyr` are the
+semantic movers — `Result` gains `: stack`, `payload()` and `tagged_new()` are deleted
+outright, and `unwrap`/`unwrap_or`/`err_code_of`/`result_print` all grow the payload
+parameter. The other 16 are the 6.5.30..6.6.0 span riding along.
+⭐ `lib/syscalls_x86_64_linux.cyr` — the peer this repo's only build target resolves — is
+**byte-identical** again, as it was across the 6.5.20 → 6.5.29 jump.
+⚠ `cyrius.lock` is still tracked and gated by nothing — not CI, not the Makefile. Re-checked
+by hand here; the hazard from 4.0.9/4.0.10 has not been fixed, only survived.
+
+### Changed — `dist/mabda.cyr` regenerated (27290 lines, v4.1.1)
+
+Verified, not assumed: **0 bare `payload(` calls and 0 one-argument `result_unwrap(` calls**
+in the bundle. The 16 surviving `payload(` matches are all `mir_val_payload(`, mabda's own
+MIR accessor. The bundle was additionally compiled AND RUN against the 17 stdlib leaves named
+in `dist/mabda.deps`, round-tripping `gpu_ok` / `gpu_err_result` through the value form —
+exit 0.
+
+### Changed — the guides now teach the value form
+
+`README.md`, `docs/guides/usage.md` and `docs/guides/integration.md` each showed
+`var ctx = payload(res);` against an API that no longer exists. Rewritten to the two-half
+bind, with the reason stated once (`payload()` has no one-argument replacement because the
+payload is already a plain variable). `README.md`'s toolchain floor moves to 6.6.0+.
+
 ## [4.1.0] — 2026-08-19
 
 **Both native SPIR-V filings closed, structured loops added, and the wgpu-native bump that

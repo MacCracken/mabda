@@ -130,12 +130,14 @@ fn render_frame(ctx, scene) {
 
 ## Error Handling
 
-All GPU operations return tagged Results. Check before using:
+All GPU operations return a `Result`. Since cyrius **6.6.0** that is a
+`: stack` enum — a (tag, payload) register pair — so bind both halves and
+test the tag:
 
 ```cyrius
-var res = gpu_context_from_preinit(ptr);
-if (is_err_result(res) == 1) {
-    var code = gpu_err_code(payload(res));
+var res_tag, res = gpu_context_from_preinit(ptr);
+if (is_err_result(res_tag) == 1) {
+    var code = gpu_err_code(res);
     if (gpu_err_is_recoverable(code) == 1) {
         # Retry (surface timeout, outdated)
     } else {
