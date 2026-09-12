@@ -6885,3 +6885,14 @@ Rust v1.0.0 release. Full GPU foundation library with 25 modules, 278 tests,
 [2.0.0]: https://github.com/MacCracken/mabda/compare/1.0.0...2.0.0
 [1.0.0]: https://github.com/MacCracken/mabda/compare/0.1.0...1.0.0
 [0.1.0]: https://github.com/MacCracken/mabda/releases/tag/0.1.0
+
+## [Unreleased]
+
+## [4.1.2] - 2026-09-12
+
+### Changed
+
+- **Toolchain `6.6.0` → `6.6.2`.** No source change: this repo was already on the
+  value form, so the flip cost it nothing. Re-verified on every surface it ships —
+  build, tests, and any bench/fuzz/distlib target, including every
+  `[lib.<profile>]` bundle.
