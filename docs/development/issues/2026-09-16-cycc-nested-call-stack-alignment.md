@@ -1,16 +1,14 @@
 # cycc makes a call with rsp 8 bytes off 16-byte alignment when the call is nested in an expression
 
-**Status:** open upstream (cyrius). To file in the cyrius repo; this is mabda's record with a
-minimal repro. mabda works around it and gates the workaround
-(`scripts/check-ffi-call-alignment.py`).
+**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-cycc-nested-call-stack-misalignment.md`.
 **Discovered:** 2026-09-16, mabda 4.1.3 verification. `programs/benchmarks.cyr` crashed inside
 NVK's `create_buffer` during the wgpu-programs fix. The shape was then characterized and traced
 to the codegen in the round-2 alignment sweep.
 **Toolchain:** `cyrius 6.6.4` (`cycc`, x86_64 SysV). The code below is unchanged at cyrius
 `HEAD` `4f3731e8`.
 **Component:** compiler (`src/frontend/parse_expr.cyr`, `parse_fn.cyr`; `src/backend/x86/emit.cyr`)
-**Severity:** **High.** This is a silent ABI violation. Nothing fails at compile time, and pure
-Cyrius code never notices. A C callee that uses aligned SSE on its stack faults with #GP
+**Severity:** **Low.** It only matters for C interop, which is legacy (in mabda, the wgpu C
+launcher path). Nothing fails at compile time, and pure Cyrius code never notices. A C callee that uses aligned SSE on its stack faults with #GP
 (SIGSEGV), and gcc emits that for ordinary code. Whether a call faults depends on the driver
 and the code path, so the failure looks intermittent and vendor-specific.
 
@@ -218,5 +216,4 @@ C boundary, then runs `ping_pong_new` on chew (GTX 1660 SUPER, NVK / mesa `vulka
 
 ## Upstream status
 
-Not yet filed in the cyrius repo (no matching issue under its `docs/development/issues/` as of
-`4f3731e8`). To file.
+Filed 2026-09-16 as `cyrius/docs/development/issues/2026-09-16-mabda-cycc-nested-call-stack-misalignment.md`.

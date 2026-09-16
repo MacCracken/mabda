@@ -1,7 +1,6 @@
 # `cyrius lint` cannot pass `--strict-deferrals` to cyrlint: usage error or silently ignored
 
-**Status:** open upstream (cyrius). Not filed in the cyrius repo from here; this is
-mabda's record with a minimal repro.
+**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-lint-wrapper-drops-strict-deferrals.md`.
 **Discovered:** 2026-09-16, mabda 4.1.3 verification sweep (untracked-deferral audit)
 **Toolchain:** `cyrius 6.6.4`. The code is unchanged at cyrius `HEAD` (`4f3731e8`, `6.6.4-1`).
 **Component:** cli (`cyrius lint` dispatcher, `cbt/cyrius.cyr` + `cbt/commands.cyr`)
@@ -86,5 +85,4 @@ as the file. A gate should assert the exit code of all four spellings above.
 
 ## Upstream status
 
-Unknown. Not yet reported in the cyrius repo (no matching filing under its
-`docs/development/issues/` as of cyrius `4f3731e8`).
+Filed 2026-09-16 as `cyrius/docs/development/issues/2026-09-16-mabda-lint-wrapper-drops-strict-deferrals.md`.

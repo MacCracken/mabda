@@ -157,9 +157,9 @@ a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it
   catches a future bench-side leak. `deps/wgpu_main.c` also still has six `-Wextra`
   unused-parameter warnings (`-Wall` is clean and gated).
 - **Upstream cyrius filings to send** (mabda-side records and workarounds are in place):
-  `issues/2026-09-16-cycc-nested-call-stack-alignment.md` (**High**: a call nested in an argument
-  list runs with rsp 8 bytes off, which faults SSE C callees; affects every Cyrius project calling
-  C; mabda hoists and gates with `scripts/check-ffi-call-alignment.py`),
+  `issues/2026-09-16-cycc-nested-call-stack-alignment.md` (Low: a call nested in an argument
+  list runs with rsp 8 bytes off, which faults SSE C callees; only matters for C interop, i.e.
+  mabda's wgpu launcher path; mabda hoists and gates with `scripts/check-ffi-call-alignment.py`),
   `issues/2026-09-16-stdlib-bench-min-minus-mean-floor.md`,
   `issues/2026-09-16-cyrius-deps-tamper-check-stale-index.md`,
   `issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md`.

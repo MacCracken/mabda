@@ -129,7 +129,7 @@ were not run.
   (0 after). 6 render tests use a handle ledger to catch it.
 - **cycc misaligns the stack for a call nested in an argument list** (8 bytes off 16-byte SysV
   alignment), which faults C callees using aligned SSE; `bench-gpu` crashed inside NVK. It is a
-  compiler bug (issue filed for cyrius, High). mabda hoisted every FFI-reaching nested call
+  compiler bug (written up for cyrius, Low: C interop only). mabda hoisted every FFI-reaching nested call
   (`ping_pong_new`, the render-graph queue helpers) and gates the shape.
 - **Stack-array overruns in tests and programs**: `var be[256]`/`be[248]` filled with 328 bytes in
   `texture.tcyr`/`queue.tcyr` (the root cause of the old leading-NUL test summary), undersized fake
