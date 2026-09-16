@@ -13,6 +13,15 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.2] - 2026-09-12
+
+### Changed
+
+- **Toolchain `6.6.0` → `6.6.2`.** No source change: this repo was already on the
+  value form, so the flip cost it nothing. Re-verified on every surface it ships —
+  build, tests, and any bench/fuzz/distlib target, including every
+  `[lib.<profile>]` bundle.
+
 ## [4.1.1] — 2026-09-06
 
 **Cyrius 6.6.0's `Result` value form, migrated at source.** The toolchain pin moves
@@ -6887,12 +6896,3 @@ Rust v1.0.0 release. Full GPU foundation library with 25 modules, 278 tests,
 [0.1.0]: https://github.com/MacCracken/mabda/releases/tag/0.1.0
 
 ## [Unreleased]
-
-## [4.1.2] - 2026-09-12
-
-### Changed
-
-- **Toolchain `6.6.0` → `6.6.2`.** No source change: this repo was already on the
-  value form, so the flip cost it nothing. Re-verified on every surface it ships —
-  build, tests, and any bench/fuzz/distlib target, including every
-  `[lib.<profile>]` bundle.
