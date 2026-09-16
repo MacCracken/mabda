@@ -11,18 +11,24 @@
 
 static void c_on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
     WGPUStringView message, void* ud1, void* ud2) {
+    (void)message;
+    (void)ud2;
     if (status == WGPURequestAdapterStatus_Success && ud1)
         *(long*)ud1 = (long)adapter;
 }
 
 static void c_on_device(WGPURequestDeviceStatus status, WGPUDevice device,
     WGPUStringView message, void* ud1, void* ud2) {
+    (void)message;
+    (void)ud2;
     if (status == WGPURequestDeviceStatus_Success && ud1)
         *(long*)ud1 = (long)device;
 }
 
 static void c_on_buffer_mapped(WGPUMapAsyncStatus status,
     WGPUStringView message, void* ud1, void* ud2) {
+    (void)message;
+    (void)ud2;
     if (ud1) *(long*)ud1 = (long)status;
 }
 

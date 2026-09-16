@@ -768,7 +768,7 @@ fn test_nv_bigbo_allocator() {
     # VA bump allocator on a stack ctx blob: distinct 64 KiB-aligned VAs,
     # cursor advances by the aligned span, exhaustion returns 0 and does
     # NOT advance the cursor.
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64(&ctx + NV_CTX_VA_CURSOR, NV_VA_BASE);
     assert_eq(_nv_ctx_alloc_va(&ctx, 1), NV_VA_BASE, "first VA = base");
@@ -827,6 +827,30 @@ fn test_nv_bigbo_allocator() {
     return 0;
 }
 
+# 4.1.4: an NVIDIA job the driver finished with an error (killed channel) is reported as
+# device-lost via its sync_file status, not as success.
+fn test_nv_fence_status_check() {
+    assert_eq(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, native_ioc_encode(3, 24, 0x64, 0xC1),
+      "SYNCOBJ_HANDLE_TO_FD = DRM_IOWR(0xC1, 24-byte drm_syncobj_handle)");
+    assert_eq(SYNC_IOC_FILE_INFO, native_ioc_encode(3, 56, 0x3E, 4),
+      "SYNC_IOC_FILE_INFO = _IOWR('>', 4, 56-byte sync_file_info)");
+    assert_eq(DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE, 1, "EXPORT_SYNC_FILE flag");
+    assert_eq(native_fence_status_ok(0, 1), 1, "signaled without error: ok");
+    assert_eq(native_fence_status_ok(0, 0 - 19), 0, "-ENODEV (killed channel): not ok");
+    assert_eq(native_fence_status_ok(0, 0), 0, "unsignaled after a wait: not ok");
+    assert_eq(native_fence_status_ok(0 - 9, 1), 0, "query failed: not ok (fail closed)");
+    var st[8];
+    assert_eq(native_syncobj_fence_status(0 - 1, 1, &st) < 0, 1, "bad fd: query fails");
+    assert_eq(load64(&st), 0, "no status written on a failed query");
+    assert_eq(native_syncobj_wait_fence_checked(0 - 1, 1, 0) < 0, 1, "bad fd: wait fails");
+    assert_eq(native_syncobj_wait_fence_checked(0 - 1, 1, 0) == 0 - 125, 0,
+      "a failed wait is not reported as a job error");
+    assert_eq(_nv_wait_rc_to_gpu_err(0), 0, "0 -> 0");
+    assert_eq(_nv_wait_rc_to_gpu_err(0 - 125), GPU_ERR_DEVICE_LOST, "job error -> DEVICE_LOST");
+    assert_eq(_nv_wait_rc_to_gpu_err(0 - 62), GPU_ERR_OTHER, "wait timeout -> OTHER");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     test_nv_getparam_ioctl_encoding();
@@ -867,5 +891,6 @@ fn main() {
     test_nv_kms_topology_constants();
     test_nv_backend_v3_surface_slots();
     test_nv_bigbo_allocator();
+    test_nv_fence_status_check();
     return assert_summary();
 }

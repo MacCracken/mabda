@@ -37,7 +37,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.3"
+tag = "4.1.4"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -248,7 +248,7 @@ project. mabda's `make example-link` compiles and links it this way
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.1.3 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.1.4 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in
@@ -328,7 +328,7 @@ please file it at
 Mabda runs a security audit each P(-1) / release pass; the dated
 findings + remediation records live in
 [`docs/audit/`](audit/), running through
-[`2026-07-02-audit.md`](audit/2026-07-02-audit.md) as of the v4.0.1
+[`2026-09-16-audit.md`](audit/2026-09-16-audit.md) as of the v4.1.3
 baseline (the `2026-04-19-audit.md` pass referenced above is the older
 2.3.0 stdlib-candidate record, retained for history). Every HIGH / MED
 finding lands with a regression assertion in the relevant

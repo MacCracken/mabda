@@ -65,6 +65,7 @@ adjacent GPU / wgpu surfaces. Findings are filed as
 | 2026-06-20 | 3.4.3   | 0 CRITICAL — render-graph aliasing planner | [`2026-06-20-audit.md`](docs/audit/2026-06-20-audit.md) |
 | 2026-07-01 | 4.0.0   | 0 CRITICAL / 0 HIGH — NVIDIA native backend | [`2026-07-01-audit.md`](docs/audit/2026-07-01-audit.md) |
 | 2026-07-02 | 4.0.1   | 0 CRITICAL / 0 HIGH / 0 MED — AMD-wgpu deprecation diff | [`2026-07-02-audit.md`](docs/audit/2026-07-02-audit.md) |
+| 2026-09-16 | 4.1.3   | 0 CRITICAL / 0 HIGH / 1 MED + 2 LOW → fixed in 4.1.4 — full P(-1): SPIR-V compiler, chitra/samvada moves | [`2026-09-16-audit.md`](docs/audit/2026-09-16-audit.md) |
 
 2.3.0 was the last audit-gated *stdlib-candidate* release; from 2.4.0
 onward the `CLAUDE.md` Security Hardening checklist is the rolling
@@ -73,18 +74,13 @@ close rather than at every patch. Every patch that fixes a latent bug
 lands with a CPU regression assertion in the matching
 `tests/tcyr/<domain>.tcyr` suite so the bug can't re-enter.
 
-**Since 4.0.1 (2026-07-02)** no new full audit has been filed. The 4.0.x
-line was maintenance and consumer-facing work — NVIDIA multi-BO (4.0.7),
-toolchain/dep currency (4.0.3, 4.0.6, 4.0.8, 4.0.9, 4.0.10) — with no new
-untrusted-input surface. The 4.1.x line changes that: 4.1.0 extended the
-native SPIR-V→GFX9 compiler, which parses consumer-supplied SPIR-V (see
-[`docs/development/issues/`](docs/development/issues/)). 4.1.1–4.1.3 are
-toolchain cuts (the cyrius 6.6.0 `Result` value form, then the 6.6.2 and
-6.6.4 pins), but 4.1.2 also moved two dependencies: chitra 0.3.1 → 1.0.3,
-the PNG/JPEG decoder untrusted image bytes flow through, and samvada
-0.4.1 → 1.0.1, the native dbus client (including SCM_RIGHTS fd passing).
-The next audit is due and should cover the compiler and both dependency
-moves.
+**4.1.3 (2026-09-16)** ran the full P(-1) pass that the 4.1.x line needed. It covered
+the 4.1.0 native SPIR-V→GFX9 compiler extensions, which parse consumer-supplied SPIR-V,
+the chitra 0.3.1 → 1.0.3 and samvada 0.4.1 → 1.0.1 moves, and the 4.1.3 changes. It found one
+MEDIUM (an untrusted SPIR-V `<id>` read before its bound check, crash-only) and two LOW (compute
+dispatch primitives trusting their lengths; a texture handle leaked on a failed load). All three
+are fixed with regression tests in 4.1.4. See
+[`docs/audit/2026-09-16-audit.md`](docs/audit/2026-09-16-audit.md).
 
 ## Design Principles
 

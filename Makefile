@@ -293,8 +293,8 @@ LOCALIZE_FLAGS = $(foreach s,$(LOCALIZE_SYMS),-L $(s))
 
 # The launcher is built warning-free and must stay that way: until 4.1.3 a -Wall
 # warning (a const cast on WGPUInstanceDescriptor.nextInChain) sat in every build log
-# unnoticed. -Wextra is not on: it still reports unused parameters in deps/wgpu_main.c.
-LAUNCHER_WARNINGS = -Wall -Werror
+# unnoticed. -Wextra is on since 4.1.4 (the unused callback parameters are voided).
+LAUNCHER_WARNINGS = -Wall -Wextra -Werror
 
 deps/wgpu_main.o: deps/wgpu_main.c
 	$(GCC) -c $< -I$(WGPU_DIR)/include $(LAUNCHER_WARNINGS) -o $@

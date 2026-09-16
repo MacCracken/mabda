@@ -1,6 +1,6 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0; still applicable through 4.1.3 (see the
+> Written against mabda 3.0.0; still applicable through 4.1.4 (see the
 > v4.0.1 update below for what changed). Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
@@ -46,7 +46,7 @@ var ctx_tag, ctx = gpu_context_new_native_nvidia();
 ```
 
 All three return a `Result` whose payload is a `GpuContext*` with the
-same shape (`GPU_CONTEXT_SIZE` = 176 bytes; see `src/context.cyr`) —
+same shape (`GPU_CONTEXT_SIZE` = 184 bytes; see `src/context.cyr`) —
 test `is_err_result(ctx_tag)` before using `ctx`. The extra
 slots past the wgpu handles are native surface-stash / RT-VA state
 that backend-agnostic code never reads.

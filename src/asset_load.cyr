@@ -157,6 +157,13 @@ fn _dds_parse(bytes, len, out): i64 {
     return 0;
 }
 
+# 4.1.4 (audit 2026-09-16 LOW-2): a load that fails after its texture was created releases
+# that texture before returning the error, instead of leaking the handle.
+fn _asset_release_fail(ctx, tex, code): i64 {
+    if (tex != 0) { gpu_texture_release(ctx, tex); }
+    return gpu_err_result(code);
+}
+
 # v3.4 AA.6c — load a single-level DDS array/cube (surface-major: `total` =
 # layers*faces surfaces packed contiguously from data_off, each per_image bytes;
 # surface idx is the slice the write_layer_level targets). Returns Ok(tex)|Err.
@@ -167,16 +174,16 @@ fn _dds_load_layered(ctx, bytes, len, fmt, width, height, data_off, layers, face
     if (faces != 6) { tex = gpu_texture_create_2d_array(ctx, width, height, fmt, layers); }
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var per_image = mabda_texfmt_data_size(fmt, width, height);
-    if (per_image <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
-    if (data_off < 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (per_image <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
+    if (data_off < 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
     # Whole array/cube span must fit, overflow-safe (no total*per_image product
     # before the check): total <= (len - data_off) / per_image.
-    if (total > (len - data_off) / per_image) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (total > (len - data_off) / per_image) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
     var img = 0;
     while (img < total) {
         var sub = data_off + img * per_image;
         var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, bytes + sub, per_image);
-        if (wrc != 0) { return gpu_err_result(wrc); }
+        if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
         img = img + 1;
     }
     return gpu_ok(tex);
@@ -214,10 +221,10 @@ fn gpu_texture_load_dds_result(ctx, bytes, len): i64 {
         var lw = mip_level_dim(width, level);
         var lh = mip_level_dim(height, level);
         var n = mabda_texfmt_data_size(fmt, lw, lh);
-        if (n <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
-        if (off + n > len) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }  # truncated
+        if (n <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
+        if (off + n > len) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }  # truncated
         var wrc = gpu_texture_write_level(ctx, tex, level, bytes + off, n);
-        if (wrc != 0) { return gpu_err_result(wrc); }
+        if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
         off = off + n;
         level = level + 1;
     }
@@ -311,20 +318,23 @@ fn _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces): i64 {
     var blen = load64(bytes + _KTX2_LEVELIDX_OFF + 8);
     var ulen = load64(bytes + _KTX2_LEVELIDX_OFF + 16);
     var per_image = mabda_texfmt_data_size(fmt, width, height);
-    if (per_image <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (per_image <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
+    # blen != total*per_image (div-by-0 / non-divisible / wrong size)
     if (_asset_per_image_size(blen, total) != per_image) {
-        return gpu_err_result(GPU_ERR_CONTAINER_PARSE);   # blen != total*per_image (div-by-0/non-div/wrong)
+        return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
     }
-    if (ulen != blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
+    if (ulen != blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
     # whole level span past the 1-entry index (ends at +104) + fits, overflow-safe.
-    if (boff < _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
-    if (boff > len - blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
+    if (boff < _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ) {
+        return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
+    }
+    if (boff > len - blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
     var img = 0;
     while (img < total) {
         # in bounds: img < total, per_image*total == blen, boff+blen <= len.
         var sub = boff + img * per_image;
         var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, bytes + sub, per_image);
-        if (wrc != 0) { return gpu_err_result(wrc); }
+        if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
         img = img + 1;
     }
     return gpu_ok(tex);
@@ -363,20 +373,21 @@ fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
         var blen = load64(bytes + idx + 8);
         var ulen = load64(bytes + idx + 16);
         var expected = mabda_texfmt_data_size(fmt, mip_level_dim(width, level), mip_level_dim(height, level));
-        if (expected <= 0) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
-        if (blen != expected) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # wrong level size
-        if (ulen != blen)     { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
+        if (expected <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
+        if (blen != expected) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # wrong level size
+        if (ulen != blen)     { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
+        # overlaps index/header (also rejects boff < 0)
         if (boff < _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ) {
-            return gpu_err_result(GPU_ERR_CONTAINER_PARSE);   # overlaps index/header (also rejects boff < 0)
+            return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
         }
         # SECURITY: boff is an untrusted i64 - check WITHOUT computing boff+blen.
         # `boff + blen > len` overflows for boff near i64_max (wraps negative, the
         # comparison silently passes) -> OOB read. blen here is already == expected
         # (> 0, dim-bounded), so `len - blen` is a safe subtraction; if blen > len
         # it goes negative and any in-range boff (>= 104 above) is rejected.
-        if (boff > len - blen) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }  # truncated / OOB
+        if (boff > len - blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }  # truncated / OOB
         var wrc = gpu_texture_write_level(ctx, tex, level, bytes + boff, blen);
-        if (wrc != 0) { return gpu_err_result(wrc); }
+        if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
         level = level + 1;
     }
     return gpu_ok(tex);
@@ -420,7 +431,7 @@ fn gpu_texture_load_png_result(ctx, bytes, len): i64 {
     var tex = gpu_texture_create_2d_sampleable(ctx, w, h, MABDA_TEXFMT_RGBA8);
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var wrc = gpu_texture_write(ctx, tex, pixels, w * h * 4);
-    if (wrc != 0) { return gpu_err_result(wrc); }
+    if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
     return gpu_ok(tex);
 }
 
@@ -454,9 +465,9 @@ fn gpu_texture_load_png_mipped_result(ctx, bytes, len): i64 {
     var tex = gpu_texture_create_2d_rgba8_mipped(ctx, w, h, 0);   # 0 = full chain
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var wrc = gpu_texture_write_level(ctx, tex, 0, pixels, w * h * 4);
-    if (wrc != 0) { return gpu_err_result(wrc); }
+    if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
     var grc = gpu_texture_generate_mipmaps(ctx, tex);
-    if (grc != 0) { return gpu_err_result(grc); }
+    if (grc != 0) { return _asset_release_fail(ctx, tex, grc); }
     return gpu_ok(tex);
 }
 
@@ -495,7 +506,7 @@ fn gpu_texture_load_jpeg_result(ctx, bytes, len): i64 {
     var tex = gpu_texture_create_2d_sampleable(ctx, w, h, MABDA_TEXFMT_RGBA8);
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var wrc = gpu_texture_write(ctx, tex, pixels, w * h * 4);
-    if (wrc != 0) { return gpu_err_result(wrc); }
+    if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
     return gpu_ok(tex);
 }
 
@@ -527,9 +538,9 @@ fn gpu_texture_load_jpeg_mipped_result(ctx, bytes, len): i64 {
     var tex = gpu_texture_create_2d_rgba8_mipped(ctx, w, h, 0);   # 0 = full chain
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var wrc = gpu_texture_write_level(ctx, tex, 0, pixels, w * h * 4);
-    if (wrc != 0) { return gpu_err_result(wrc); }
+    if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
     var grc = gpu_texture_generate_mipmaps(ctx, tex);
-    if (grc != 0) { return gpu_err_result(grc); }
+    if (grc != 0) { return _asset_release_fail(ctx, tex, grc); }
     return gpu_ok(tex);
 }
 

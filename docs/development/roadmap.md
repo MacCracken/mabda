@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.1.3** (2026-09-16). Module/assertion/bundle counts live in the
+> **v4.1.4** (2026-09-16). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -36,7 +36,9 @@ samvada 1.0.1 / chitra 1.0.3 dep refresh, no `src/` change; v4.1.3 (2026-09-16) 
 maintenance cut — cyrius 6.6.4 pin, `cyrius.cyml` comment cleanup, a doc currency sweep for
 the samvada 1.0.1 / chitra 1.0.3 moves, a `test-native-all` FAIL-reason fix, per-harness
 `make fuzz` logs, the `native_compute_spike` repair, and the native draw `PA_CL_VTE_CNTL`
-fix behind the flaky render/sampler gates).
+fix behind the flaky render/sampler gates; v4.1.4 (2026-09-16) closed the items that cut and its
+P(-1) audit left open — native AMD VA reclaim, NVIDIA job-error detection, the loader texture
+leak, shader-cache / depth-texture release, and the bench and launcher leftovers).
 
 ## The Long Arc
 
@@ -62,7 +64,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.1.3  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.1.4  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -132,45 +134,19 @@ a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it
   self-check for the layout that bit us and a static gate over all 123 call sites; passing
   explicit **lengths** would make the invalid state unrepresentable. `@internal`, so no
   public break — but it touches every call site, hence its own cut.
-- ⭐ **4.1.3 closeout: a clean-boot native HW run.** Several 4.1.3 fixes were HW-proven only on a
+- ⭐ **Clean-boot native HW closeout (4.1.3 / 4.1.4).** Several fixes were HW-proven only on a
   Cezanne that had already taken MODE2 resets that day (the resets make context-register state
   persist, which hid the render bug; the state-poison harness in `programs/diagnostics/state_poison/`
   was used to test around that). After a fresh boot, with no GPU reset first: `make test-native-all`
-  must pass with `NATIVE_KNOWN_FAIL` empty (covers the `native_compute_spike` repair, the render
-  owned-state fix, the library reset check and `native_compute_store` exits 17/18), plus one run
-  of the linked example consumer. The same suite already passed 71/0 on 2026-09-16 with the
-  fresh-boot register state injected before every draw gate. See `issues/2026-08-19-native-compute-spike-stale.md`.
-- **NVIDIA parity for reset detection.** 4.1.3 made the native AMD completion paths fail closed
-  (`GPU_ERR_DEVICE_LOST`) when `AMDGPU_CTX_OP_QUERY_STATE2` reports a reset. The nouveau wait paths
-  in `src/backend_nvidia.cyr` have no equivalent check yet; a hung NVIDIA job that the driver
-  recovers is not reported.
-- **Native AMD VA regions are never reclaimed.** Render-target release does not return its range
-  to the 256 MiB RT region, so the 33rd 1920x1080 RT create in one context returns 0 (confirmed on
-  CPU in 4.1.3 verification). The 2 GiB texture region uses the same no-reclaim model. Needs a
-  free list fed from the release paths, with a churn test.
-- **Release APIs that don't exist.** `ShaderCache` has no release (cached modules can never be
-  freed); `depth_texture_new` doesn't check for a 0 view and has no `depth_texture_release`; the
-  wgpu RT create slot has no `MABDA_MAX_TEXTURE_DIM_2D` cap.
-- **bench-gpu leftovers.** A create row whose op returns a 0 handle is still reported as a valid
-  row; `_rel_depth` releases without null checks; the compute row leaks its pipeline/buffer on the
-  setup-failure returns; the MSAA device-memory proof used an uncommitted Vulkan layer, so no gate
-  catches a future bench-side leak. `deps/wgpu_main.c` also still has six `-Wextra`
-  unused-parameter warnings (`-Wall` is clean and gated).
-- **Upstream cyrius filings to send** (mabda-side records and workarounds are in place):
-  `issues/2026-09-16-cycc-nested-call-stack-alignment.md` (Low: a call nested in an argument
-  list runs with rsp 8 bytes off, which faults SSE C callees; only matters for C interop, i.e.
-  mabda's wgpu launcher path; mabda hoists and gates with `scripts/check-ffi-call-alignment.py`),
-  `issues/2026-09-16-stdlib-bench-min-minus-mean-floor.md`,
-  `issues/2026-09-16-cyrius-deps-tamper-check-stale-index.md`,
-  `issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md`.
-- **A security audit is due.** `SECURITY.md` records none since 4.0.1 because the 4.0.x line
-  had no new untrusted-input surface. v4.1.0 changes that: it extends a parser consuming
-  consumer-supplied SPIR-V (loops, phi, f32 division, integer-condition selects), which is
-  the threat model the 3.3.0 asset-loading audit's 1 CRITICAL came from. v4.1.2 adds two
-  dependency moves the audit should also cover: chitra 0.3.1 → 1.0.3 (the PNG/JPEG decoder
-  untrusted image bytes flow through) and samvada 0.4.1 → 1.0.1 (native dbus, including
-  SCM_RIGHTS fd passing).
-
+  must pass with `NATIVE_KNOWN_FAIL` empty, plus one run of the linked example consumer. On chew,
+  the five card-node / DRM-master NVIDIA gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
+  surface-present-e2e) need a console session. See `issues/2026-08-19-native-compute-spike-stale.md`.
+- **Upstream cyrius issues** (filed 2026-09-16 in `cyrius/docs/development/issues/`; mabda keeps
+  its records and workarounds): the cycc nested-call stack misalignment (Low, C interop only;
+  mabda hoists and gates with `scripts/check-ffi-call-alignment.py`), `lib/bench.cyr`'s
+  min-minus-mean timer floor, the `cyrius deps` tamper check on a stale index, `cyrius lint`
+  dropping `--strict-deferrals`, and cyrlint missing deferrals split across two lines. When a fix
+  ships, drop the matching mabda workaround.
 ---
 
 ## v3.x+ — Web Target (Blocked)

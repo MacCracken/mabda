@@ -27,7 +27,11 @@
 #      stored size is 64 KiB-rounded (3473408), and both BOs are GTT-mapped.
 #   5. Prove the RT #1 mapping is live: CPU write+read a sentinel through the
 #      GTT-visible BO addr (the map actually backs memory, not just a struct).
-#   6. Teardown both RTs + ctx.
+#   6. Teardown both RTs.
+#   7. 4.1.4 VA reclaim: create/release a 1920x1080 RT 64 times (the bump-only RT region
+#      failed on the 33rd) and a 1920x1080 sampleable texture 300 times (the 2 GiB texture
+#      region held ~258). Every create must succeed, and the released range must be reused
+#      (the same VA comes back), proving GEM_VA accepts a map at a VA that was just unmapped.
 #
 # Exit codes:
 #   0 — both fixes verified on HW
@@ -37,6 +41,8 @@
 #   4 — RT VAs not distinct / not at the expected bump offset
 #   5 — RT #1 stored size not 64 KiB-rounded, or BO addr null
 #   6 — GTT sentinel write/read mismatch (mapping not backing memory)
+#   7 — RT churn: a create failed or a released RT range was not reused
+#   8 — texture churn: a create failed or a released texture range was not reused
 #
 # Linked via the Makefile target `test-native-rt-alloc-e2e`. No C launcher
 # (no wgpu-native dependency on the native path). Runs on this box (Cezanne
@@ -146,12 +152,52 @@ fn main(): i64 {
     }
     print_cstr("PASS: GTT sentinel write/read across the full span\n");
 
-    # ---- 7. Teardown ----
     gpu_render_target_release(ctx, rt2);
     gpu_render_target_release(ctx, rt1);
+
+    # ---- 7. VA reclaim churn (4.1.4) ----
+    var i = 0;
+    var first_va = 0;
+    while (i < 64) {
+        var rt = gpu_render_target_create_2d_rgba8(ctx, 1920, 1080);
+        if (rt == 0) {
+            print_cstr("FAIL: RT churn create #"); print_i64(i); print_cstr(" returned 0\n");
+            gpu_context_release(ctx); return 7;
+        }
+        var va = load64(rt + NATIVE_RT_FIELD_VA);
+        if (i == 0) { first_va = va; }
+        if (va != first_va) {
+            print_cstr("FAIL: RT churn #"); print_i64(i); print_cstr(" did not reuse the released range\n");
+            gpu_render_target_release(ctx, rt);
+            gpu_context_release(ctx); return 7;
+        }
+        gpu_render_target_release(ctx, rt);
+        i = i + 1;
+    }
+    print_cstr("PASS: 64 x 1920x1080 RT create/release, one reused VA\n");
+    i = 0;
+    var first_tex_va = 0;
+    while (i < 300) {
+        var tex = gpu_texture_create_2d_sampleable(ctx, 1920, 1080, MABDA_TEXFMT_RGBA8);
+        if (tex == 0) {
+            print_cstr("FAIL: texture churn create #"); print_i64(i); print_cstr(" returned 0\n");
+            gpu_context_release(ctx); return 8;
+        }
+        var tva = load64(tex + NATIVE_TEX_FIELD_VA);
+        if (i == 0) { first_tex_va = tva; }
+        if (tva != first_tex_va) {
+            print_cstr("FAIL: texture churn #"); print_i64(i); print_cstr(" did not reuse the released range\n");
+            gpu_texture_release(ctx, tex);
+            gpu_context_release(ctx); return 8;
+        }
+        gpu_texture_release(ctx, tex);
+        i = i + 1;
+    }
+    print_cstr("PASS: 300 x 1920x1080 sampleable texture create/release, one reused VA\n");
+
     gpu_context_release(ctx);
     print_cstr("--------------------------------------\n");
-    print_cstr("ALL PASS: v3.4.2 RT allocator fixes verified on HW\n");
+    print_cstr("ALL PASS: RT allocator fixes + VA reclaim verified on HW\n");
     return 0;
 }
 

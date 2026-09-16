@@ -13,6 +13,69 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.4] — 2026-09-16
+
+**The 4.1.3 P(-1) audit's findings, plus every item 4.1.3 left on the roadmap.** No toolchain or
+dependency change (cyrius 6.6.4, samvada 1.0.1, chitra 1.0.3).
+
+**Verified:** 18 CPU suites, **5689 assertions**, 0 failed; lint/fmt/strict-deferrals 0 on
+every source file; every gate script clean; `dist/` idempotent. **AMD** (Cezanne):
+`test-native-all` 71 passed / 0 failed / 0 known-fail (fresh-boot register state injected before
+every draw gate), 12/12 wgpu gates, `bench-gpu` 13/13 rows, `make example-link` OK, no kernel GPU
+messages. **NVIDIA** (GTX 1660 SUPER, nouveau + NVK): 11/11 native masterless gates with the new
+job-status check, 12/12 wgpu gates, and `vk_memtrack/check_bench_memory.sh` 13/13 rows with zero
+device-memory growth.
+
+### Security
+
+- **P(-1) audit, `docs/audit/2026-09-16-audit.md`** (run on the 4.1.3 tree): 0 CRITICAL / 0 HIGH /
+  1 MEDIUM / 2 LOW, all fixed here. It covered the 4.1.0 SPIR-V compiler work, chitra 1.0.3,
+  samvada 1.0.1, the 4.0.7 NVIDIA allocator and the 4.1.3 changes, plus a CVE sweep: no
+  wgpu/naga CVEs, and the 2026 amdgpu and nouveau CVEs are kernel-side or in uAPIs mabda doesn't use.
+- **MED-1:** an untrusted SPIR-V `<id>` indexed the MIR value table before its bound check, at
+  three sites (a forward-branch `OpPhi` result, the f64 compare operand, `OpConvertFToS`). A
+  crafted module crashed the host process. Now bounded first; a test SIGSEGVs on the old code.
+- **LOW-1:** `native_compute_dispatch_cached*` (bundled, unprefixed) reject a stream larger than
+  one IB slice and more bindings than their 32-entry BO list holds, before any staging.
+- **LOW-2:** the image loaders (PNG/JPEG, KTX2, DDS; single, mipped and layered) released nothing
+  when a load failed after its texture was created. All 25 of those returns now release it.
+
+### Added
+
+- **Native AMD VA reclaim.** Released texture, buffer, shader-module and render-target
+  ranges go on a per-context free list, and a create of the same span in the same region reuses
+  one before bumping the cursor. Before this the regions were bump-only: the 33rd 1920x1080 render
+  target created in one context failed, and a churning consumer exhausted the 2 GiB texture region.
+  `GpuContext` grows 176 → 184 bytes (`va_free` at +176). The error-path rollbacks know whether the
+  last range came off the list, so they never rewind the cursor over a live range. A range only
+  returns to the list after a successful unmap; a full list (128 entries) drops and counts.
+  `native_rt_alloc_e2e` now churns 64 × 1920x1080 render targets and 300 × 1920x1080 sampleable
+  textures and requires every create to succeed on the reused range: it passes on Cezanne, and
+  against the 4.1.3 library it fails on the second render target.
+- **NVIDIA job-error detection.** After a syncobj wait, the NVIDIA dispatch and draw paths export
+  the syncobj as a sync_file and read its status. A job the driver finished with an error (nouveau
+  sets `-ENODEV` on every pending fence of a killed channel) now returns `GPU_ERR_DEVICE_LOST`,
+  matching the AMD reset check from 4.1.3.
+- **`shader_cache_release(cache)`** releases every cached module and empties the cache.
+- **`depth_texture_release(dt)`**; `depth_texture_new` now releases its texture when the view
+  create fails, and rejects dimensions past 8192.
+- **`programs/diagnostics/vk_memtrack/`**: the Vulkan layer that measured the 4.1.3 MSAA leak,
+  with `check_bench_memory.sh`, which fails when a `bench-gpu` row grows device-local memory.
+
+### Fixed
+
+- **`gpu_texture_generate_mipmaps` leaked its downsample shader BO and VA on every call** (and on
+  every error path). It is released now.
+- **wgpu render-target create** applies the 8192 dimension cap the native paths use.
+- **`gpu_texture_release`** returns 0 for a backend without a release slot instead of calling a
+  null function pointer.
+- **`bench-gpu`:** a create row that timed a 0-handle op now fails the run; the depth row releases
+  through `depth_texture_release`; the compute row releases its pipeline and buffer when setup fails.
+- **Launcher:** `deps/wgpu_main.c` is now `-Wextra` clean, and the Makefile builds it with
+  `-Wall -Wextra -Werror`.
+- **Tests:** every fake `GpuContext` buffer in the CPU suites moved to the new 184-byte size (the
+  stack-array sizing gate flagged all 96 sites).
+
 ## [4.1.3] — 2026-09-16
 
 **cyrius 6.6.4, a `cyrius.cyml` that is configuration again, and the defects that

@@ -209,7 +209,7 @@ fn test_dds_parse_rejects() {
 fn test_gpu_ctx_supports_format_native() {
     var b = backend_new();
     backend_set_kind(b, BACKEND_KIND_AMD);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_RGBA8), 1, "RGBA8 always supported");
@@ -236,6 +236,13 @@ fn _dds_cr_cap(ctx, w, h, fmt, mc) {
     _dds_cr_mc = mc;
     return 0x7E;
 }
+var _al_rel_count = 0;
+var _al_rel_tex = 0;
+fn _al_rel_cap(ctx, tex) {
+    _al_rel_count = _al_rel_count + 1;
+    _al_rel_tex = tex;
+    return 0;
+}
 fn _dds_wl_cap(ctx, tex, level, src, n) {
     _dds_wl_count = _dds_wl_count + 1;
     _dds_wl_n = n;
@@ -249,7 +256,9 @@ fn test_gpu_texture_load_dds_orchestration() {
     backend_set_kind(b, BACKEND_KIND_AMD);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
-    var ctx[176];
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_al_rel_cap);
+    _al_rel_count = 0;
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     # DXT1 8x8 1-level: 128-byte header + BC1 8x8 (32 B) = 160-byte buffer.
@@ -266,7 +275,10 @@ fn test_gpu_texture_load_dds_orchestration() {
     # Truncated level data: header says 32 B at offset 128 but buffer is 140.
     var buf2[140];
     _mk_dds_fourcc(&buf2, 8, 8, 1, _DDS_FOURCC_DXT1);
+    assert_eq(_al_rel_count, 0, "a successful load releases nothing");
     assert_eq(gpu_texture_load_dds(&ctx, &buf2, 140), 0, "truncated level data -> 0");
+    assert_eq(_al_rel_count, 1, "the failed load releases the texture it created (audit LOW-2)");
+    assert_eq(_al_rel_tex, 0x7E, "and it is that texture");
     return 0;
 }
 
@@ -338,7 +350,9 @@ fn test_ktx2_load_orchestration() {
     backend_set_kind(b, BACKEND_KIND_AMD);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
-    var ctx[176];
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_al_rel_cap);
+    _al_rel_count = 0;
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     # KTX2 BC7 8x8 1-level: header+index = 104; data @104, BC7 8x8 = 64 B; buf 168.
@@ -371,6 +385,7 @@ fn test_ktx2_load_orchestration() {
     store64(&buf3 + 96, 64);                         # ulen = blen
     assert_eq(gpu_texture_load_ktx2(&ctx, &buf3, 168), 0, "huge byteOffset rejected (no overflow OOB)");
     assert_eq(_dds_wl_count, 0, "write_level never reached for OOB byteOffset");
+    assert_eq(_al_rel_count, 1, "the rejected load releases its texture (the ETC2 load never created one)");
     return 0;
 }
 
@@ -436,7 +451,7 @@ fn test_gpu_texture_load_png_orchestration() {
     var b = backend_new();
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_png_cr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     var buf[80];
@@ -514,7 +529,7 @@ fn test_gpu_texture_load_jpeg_orchestration() {
     var b = backend_new();
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_SAMPLEABLE, &_png_cr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     var buf[296];
@@ -545,7 +560,7 @@ fn test_gpu_texture_load_sniffer() {
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE, &_png_wr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_dds_cr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_dds_wl_cap);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     # PNG magic -> load_png (CREATE_2D_FMT, RGBA8).
@@ -651,7 +666,7 @@ fn test_dds_load_array_orchestration() {
     backend_set_kind(b, BACKEND_KIND_AMD);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY, &_ac_arr_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL, &_ac_wll_cap);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     # DX10 RGBA8 array, 16x16, 6 layers: per_image = 1024; data @148; len 148+6144.
@@ -662,6 +677,12 @@ fn test_dds_load_array_orchestration() {
     assert_eq(_ac_arr_count, 1, "create_2d_array once");
     assert_eq(_ac_arr_layers, 6, "create_2d_array layers 6");
     assert_eq(_ac_wll_count, 6, "write_layer_level once per layer (6)");
+    # Too short for 6 layers: the load fails after create_2d_array and releases that texture.
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_al_rel_cap);
+    _al_rel_count = 0;
+    assert_eq(gpu_texture_load_dds(&ctx, &buf, 148 + 5 * 1024), 0, "truncated array -> 0");
+    assert_eq(_al_rel_count, 1, "the failed array load releases its texture");
+    assert_eq(_al_rel_tex, 0xA5, "and it is the created array");
     return 0;
 }
 
@@ -672,7 +693,7 @@ fn test_ktx2_load_cube_orchestration() {
     backend_set_kind(b, BACKEND_KIND_AMD);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_CUBE, &_ac_cube_cap);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL, &_ac_wll_cap);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, b);
     # KTX2 RGBA8 cube, 16x16, 6 faces: per_face 1024; level blen = 6144 @104.

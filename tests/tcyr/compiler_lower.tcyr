@@ -1651,6 +1651,51 @@ fn test_spirv_lower_uniform_if() {
     return 0;
 }
 
+# 2026-09-16 audit MED-1: an untrusted operand / OpPhi result <id> far past cap_ids must be
+# rejected BEFORE it indexes vals[]. Each case read vals + id*40 unbounded (a SIGSEGV on the
+# pre-fix code) before mir_emit's own bound check could run.
+fn test_spirv_lower_untrusted_ids_bounded() {
+    var m[80];
+    var vals[1600];
+    var instrs[512];
+    var ptrs[128];
+    var blocks[64];
+    var types[960];
+    memset(&types, 0, 960);
+    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    var lsz[24];
+    store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
+    var buf[64];
+    memset(&buf, 0, 64);
+    # OpFOrdLessThan %3 %20 %0x7FFFFFF0 %1 (wc 5) at off 0
+    store32(&buf + 0, (5 << 16) | SPIRV_OP_FORD_LESSTHAN);
+    store32(&buf + 4, 3);  store32(&buf + 8, 20);
+    store32(&buf + 12, 0x7FFFFFF0); store32(&buf + 16, 1);
+    assert_eq(_spirv_lower_one_instr(&buf, 0, 5, SPIRV_OP_FORD_LESSTHAN, &types, 0, 0, &m, &lsz) < 0, 1,
+      "FOrd compare with an out-of-range operand fails loud");
+    # OpConvertFToS %3 %21 %0x7FFFFFF0 (wc 4) at off 0
+    store32(&buf + 0, (4 << 16) | SPIRV_OP_CONVERT_F_TO_S);
+    store32(&buf + 4, 3);  store32(&buf + 8, 21);
+    store32(&buf + 12, 0x7FFFFFF0);
+    assert_eq(_spirv_lower_one_instr(&buf, 0, 4, SPIRV_OP_CONVERT_F_TO_S, &types, 0, 0, &m, &lsz) < 0, 1,
+      "ConvertFToS with an out-of-range operand fails loud");
+    assert_eq(mir_n_instrs(&m), 0, "neither emitted an instruction");
+    # Header (5 words) | OpLabel %9 | OpPhi %3 %0x7FFFFFF0 %1 %7: a branch from %7 to %9.
+    var ph[48];
+    memset(&ph, 0, 48);
+    store32(&ph + 20, (2 << 16) | SPIRV_OP_LABEL); store32(&ph + 24, 9);
+    store32(&ph + 28, (5 << 16) | SPIRV_OP_PHI);
+    store32(&ph + 32, 3); store32(&ph + 36, 0x7FFFFFF0);
+    store32(&ph + 40, 1); store32(&ph + 44, 7);
+    assert_eq(_spirv_emit_phi_moves(&ph, 48, 7, 9, &m), 0 - MIR_ERR_ID_OOR,
+      "phi move into a forward block with an out-of-range result fails loud");
+    assert_eq(_spirv_val_type(&m, 0), MIR_T_VOID, "id 0 -> VOID");
+    assert_eq(_spirv_val_type(&m, 40), MIR_T_VOID, "id == cap_ids -> VOID");
+    mir_set_const(&m, 5, MIR_T_F32, 0);
+    assert_eq(_spirv_val_type(&m, 5), MIR_T_F32, "in-range id reads its type");
+    return 0;
+}
+
 fn main(): i64 {
     test_mir_type_distill();
     test_mir_type_helpers();
@@ -1697,5 +1742,6 @@ fn main(): i64 {
     test_spirv_lower_gid_expansion();
     test_spirv_lower_synth_exhaustion();
     test_spirv_lower_uniform_if();
+    test_spirv_lower_untrusted_ids_bounded();
     return assert_summary();
 }

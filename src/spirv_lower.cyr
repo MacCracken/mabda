@@ -264,6 +264,15 @@ fn _spirv_alu_to_mir(op): i64 {
     return 0;
 }
 
+# The MIR type of value `id`, or MIR_T_VOID when `id` is 0 or outside cap_ids. Operand <id>s
+# are untrusted words: bound one before it indexes vals[]. mir_emit rejects an out-of-range
+# id, but a type read ahead of that call runs with the raw id. (2026-09-16 audit, MED-1.)
+fn _spirv_val_type(m, id): i64 {
+    if (id <= 0) { return MIR_T_VOID; }
+    if (id >= load64(m + 64)) { return MIR_T_VOID; }
+    return mir_val_type(m, id);
+}
+
 # 1 if both `a` and `b` are compile-time constants (so a binary op over them folds).
 # Bounds-guarded against the untrusted id range (cap_ids = m+64), like the table builders.
 fn _spirv_both_const(m, a, b): i64 {
@@ -1138,6 +1147,10 @@ fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
         if (spirv_op(w0) != SPIRV_OP_PHI) { return 0; }
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var result = spirv_word(ptr, off + 2);
+        # The target block's OpPhi may not be lowered yet (a forward branch), so its result
+        # <id> is still unchecked here. Bound it before it indexes vals[]. (audit MED-1)
+        if (result == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (result >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
         # (value, parent) pairs start at word 3 and run to the end of the instruction.
         var k = 3;
         while (k + 1 < wc) {
@@ -1236,7 +1249,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (fvopc != 0) {
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var fa = spirv_word(ptr, off + 3);
-        if (mir_type_base(mir_val_type(m, fa)) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+        if (mir_type_base(_spirv_val_type(m, fa)) != MIR_T_F64) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
         return _spirv_lower_fcmp(m, fvopc, fa, spirv_word(ptr, off + 4), spirv_word(ptr, off + 2));
     }
     if (op == SPIRV_OP_SELECT) { return _spirv_lower_select(ptr, off, wc, types, m); }
@@ -1352,7 +1365,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_CONVERT_U_TO_F) { return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_F32, types, m); }
     if (op == SPIRV_OP_CONVERT_F_TO_S) {
         if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        if (mir_type_base(mir_val_type(m, spirv_word(ptr, off + 3))) == MIR_T_F64) {
+        if (mir_type_base(_spirv_val_type(m, spirv_word(ptr, off + 3))) == MIR_T_F64) {
             return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32_F64, types, m);
         }
         return _spirv_lower_unary(ptr, off, wc, MIR_OP_CVT_I32, types, m);

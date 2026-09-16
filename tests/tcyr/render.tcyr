@@ -668,7 +668,7 @@ fn test_rg_execute_mq_forwards_v25() {
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
     rg_add_compute(g, 0, 0, &dims, "n");
     rg_build(g, 0);
-    var fakectx[176]; memset(&fakectx, 0, 176);   # GPU_CONTEXT_SIZE
+    var fakectx[184]; memset(&fakectx, 0, 184);   # GPU_CONTEXT_SIZE
     assert_eq(rg_execute_mq(g, &fakectx), 1,
       "rg_execute_mq forwards to v2.5 path (null device → 1)");
     return 0;
@@ -892,7 +892,7 @@ fn test_rg_execute_native_mq_orders_and_barriers() {
     rg_node_reads(g, b, r0);
     rg_build(g, 0);
 
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, _mq_make_backend());
 
@@ -916,7 +916,7 @@ fn test_rg_execute_mq_routes_native_backend() {
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
     rg_add_compute(g, 0x111, 0x222, &dims, "A");
     rg_build(g, 0);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, _mq_make_backend());
     var rc = rg_execute_mq(g, &ctx);
@@ -935,7 +935,7 @@ fn test_rg_native_dispatch_copy_offset_fails_loud() {
     rg_add_copy_buf_buf(g, 0x10, 64, 0x20, 0, 128);   # src_off = 64
     rg_build(g, 0);
     var node = vec_get(load64(g + 0), 0);
-    var ctx[176];
+    var ctx[184];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64((&ctx) + 32, _mq_make_backend());
     assert_eq(_rg_native_dispatch_node(&ctx, node), GPU_ERR_BUFFER,
@@ -1336,6 +1336,73 @@ fn test_rg_to_dot_empty_graph() {
     return 0;
 }
 
+# 4.1.4: depth textures and cached shader modules can be released, a failed depth view no
+# longer leaks its texture, and the wgpu RT slot applies the 8192 dimension cap.
+var _rtm_shader_rel = 0;
+fn _rtm_shader_release(m): i64 {
+    _rtm_shader_rel = _rtm_shader_rel + 1;
+    return 0;
+}
+
+fn test_depth_texture_release_and_guards() {
+    var table[536];
+    _rtm_install(&table);
+    var dt = depth_texture_new(1, 64, 64, DEPTH_DEFAULT_FORMAT);
+    assert_eq(dt != 0, 1, "depth texture created");
+    assert_eq(_rtm_tex_live, 1, "one texture live");
+    assert_eq(_rtm_view_live, 1, "one view live");
+    depth_texture_release(dt);
+    assert_eq(_rtm_tex_live, 0, "release frees the texture");
+    assert_eq(_rtm_view_live, 0, "release frees the view");
+    assert_eq(depth_texture_handle(dt), 0, "struct zeroed");
+    var calls = _rtm_tex_rel_calls + _rtm_view_rel_calls;
+    depth_texture_release(dt);
+    assert_eq(_rtm_tex_rel_calls + _rtm_view_rel_calls, calls, "second release makes no call");
+    assert_eq(depth_texture_release(0), 0, "null-safe");
+    _rtm_fail_view_at = _rtm_view_calls;
+    assert_eq(depth_texture_new(1, 64, 64, DEPTH_DEFAULT_FORMAT), 0, "a failed view fails the create");
+    assert_eq(_rtm_tex_live, 0, "and releases the texture it made");
+    var before = _rtm_tex_calls;
+    assert_eq(depth_texture_new(1, 8193, 64, DEPTH_DEFAULT_FORMAT), 0, "width past 8192 rejected");
+    assert_eq(depth_texture_new(1, 64, 8193, DEPTH_DEFAULT_FORMAT), 0, "height past 8192 rejected");
+    assert_eq(_rtm_tex_calls, before, "rejected before any create call");
+    assert_eq(_rtm_bad_release, 0, "no bad releases");
+    _rtm_uninstall();
+    return 0;
+}
+
+fn test_shader_cache_release() {
+    var table[536];
+    _rtm_install(&table);
+    store64(&table + 21 * 8, &_rtm_shader_release);
+    _rtm_shader_rel = 0;
+    var cache = shader_cache_new();
+    shader_cache_set(cache, "fn a() {}", 0x901);
+    shader_cache_set(cache, "fn b() {}", 0x902);
+    shader_cache_set(cache, "fn c() {}", 0x903);
+    map_u64_delete(cache, _shader_hash("fn c() {}"));   # leaves a tombstone slot
+    assert_eq(shader_cache_release(cache), 2, "releases the two live modules");
+    assert_eq(_rtm_shader_rel, 2, "two release calls, none for the tombstone");
+    assert_eq(map_u64_size(cache), 0, "cache emptied");
+    assert_eq(shader_cache_get(cache, "fn a() {}"), 0, "released module no longer returned");
+    assert_eq(shader_cache_release(cache), 0, "releasing an empty cache is a no-op");
+    assert_eq(shader_cache_release(0), 0, "null-safe");
+    _rtm_uninstall();
+    return 0;
+}
+
+fn test_wgpu_rt_slot_dim_cap() {
+    var table[536];
+    _rtm_install(&table);
+    var ctx[184];
+    memset(&ctx, 0, 184);
+    assert_eq(_backend_wgpu_render_target_create_2d_rgba8(&ctx, 8193, 64), 0, "width past 8192 rejected");
+    assert_eq(_backend_wgpu_render_target_create_2d_rgba8(&ctx, 64, 8193), 0, "height past 8192 rejected");
+    assert_eq(_rtm_tex_calls, 0, "rejected before any create call");
+    _rtm_uninstall();
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -1403,5 +1470,8 @@ fn main() {
     test_rg_build_aliasing_flag_auto_plans();
     test_rg_build_no_aliasing_no_autoplan();
     test_gpu_render_dispatchers_null_ctx_safe();
+    test_depth_texture_release_and_guards();
+    test_shader_cache_release();
+    test_wgpu_rt_slot_dim_cap();
     return assert_summary();
 }

@@ -25,6 +25,10 @@
 # Depends on all three split files above; the include chain in
 # src/lib.cyr orders them as: amdgpu → shaders → pm4 → backend_native.
 
+# The N-binding dispatch BO_HANDLES list is a fixed 256-byte (32-entry) stack array holding
+# fence + stub + shader + ib + one entry per binding, so at most 28 bindings fit.
+var _NATIVE_DISPATCH_MAX_BINDS = 28;
+
 # ================================================================
 # v3 Step 4b — composed dispatch (PM4 + IB + fence + submit + wait)
 # ================================================================
@@ -62,6 +66,10 @@
 # they're user-provided resources).
 fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
   shader_handle, out_handle, timeout_ns): i64 {
+    # 2026-09-16 audit LOW-1: bound the caller's stream to one IB slice and the binding count
+    # to the fixed BO_HANDLES array before any staging (these fns are in the dist bundle).
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var stub_handle = native_ctx_stub_handle(ctx);
@@ -126,6 +134,12 @@ fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
 # shader + ib. Synchronous (creates/waits/destroys an ephemeral syncobj).
 fn native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
   binds, n_binds, timeout_ns): i64 {
+    # 2026-09-16 audit LOW-1: bound the caller's stream to one IB slice and the binding count
+    # to the fixed BO_HANDLES array before any staging (these fns are in the dist bundle).
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
+    if (n_binds < 0) { return GPU_ERR_OTHER; }
+    if (n_binds > _NATIVE_DISPATCH_MAX_BINDS) { return GPU_ERR_OTHER; }
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var stub_handle = native_ctx_stub_handle(ctx);
@@ -199,6 +213,10 @@ fn native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
 # callers stay on slice 0. Returns 0|GPU_ERR_*.
 fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
   shader_handle, out_handle, queue, ip_type): i64 {
+    # 2026-09-16 audit LOW-1: bound the caller's stream to one IB slice and the binding count
+    # to the fixed BO_HANDLES array before any staging (these fns are in the dist bundle).
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
     var syncobj = queue_syncobj(queue);
     if (syncobj == 0) { return GPU_ERR_OTHER; }
 
@@ -254,6 +272,12 @@ fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
 # waits via gpu_queue_wait_idle / orders with gpu_queue_barrier.
 fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
   binds, n_binds, queue, ip_type): i64 {
+    # 2026-09-16 audit LOW-1: bound the caller's stream to one IB slice and the binding count
+    # to the fixed BO_HANDLES array before any staging (these fns are in the dist bundle).
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
+    if (n_binds < 0) { return GPU_ERR_OTHER; }
+    if (n_binds > _NATIVE_DISPATCH_MAX_BINDS) { return GPU_ERR_OTHER; }
     var syncobj = queue_syncobj(queue);
     if (syncobj == 0) { return GPU_ERR_OTHER; }
     var fd  = native_ctx_fd(ctx);
@@ -743,6 +767,12 @@ fn native_ctx_set_rt_va_next(ctx, va): i64 {
     store64(ctx + 168, va);
     return 0;
 }
+fn native_ctx_va_free(ctx): i64 { return load64(ctx + 176); }
+fn native_ctx_set_va_free(ctx, fl): i64 {
+    if (ctx == 0) { return 0 - 1; }
+    store64(ctx + 176, fl);
+    return 0;
+}
 
 # Pack (handle, va) into the private 16-byte buffer-pair shape.
 # Caller allocates 16 bytes for `dst` (typically a stack-local
@@ -920,8 +950,9 @@ fn _backend_native_buffer_release(ctx, buf): i64 {
     var addr   = load64(buf + NATIVE_BUF_FIELD_ADDR);
     var bo_size = _native_align_up(load64(buf + NATIVE_BUF_FIELD_SIZE), _NATIVE_TEXTURE_VA_ALIGN);
     if (handle != 0) {
-        native_gem_va_unmap(fd, handle, va, bo_size);
+        var urc = native_gem_va_unmap(fd, handle, va, bo_size);
         native_bo_release_gtt(fd, handle, addr, bo_size);
+        if (urc == 0) { native_ctx_release_texture_va(ctx, va, bo_size); }
     }
     memset(buf, 0, NATIVE_BUF_STRUCT_SIZE);
     return 0;
@@ -1150,8 +1181,9 @@ fn _backend_native_shader_module_release(ctx, shmod): i64 {
     # would under-unmap and leak ~60 KiB of the texture VA region per release.
     var bo_size = _native_align_up(load64(shmod + NATIVE_SHMOD_ISALEN), _NATIVE_TEXTURE_VA_ALIGN);
     if (handle != 0) {
-        native_gem_va_unmap(fd, handle, va, bo_size);
+        var urc = native_gem_va_unmap(fd, handle, va, bo_size);
         native_bo_release_gtt(fd, handle, addr, bo_size);
+        if (urc == 0) { native_ctx_release_texture_va(ctx, va, bo_size); }
     }
     memset(shmod, 0, NATIVE_SHMOD_SIZE);
     return 0;
@@ -1859,7 +1891,10 @@ fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
     if (sh_va == 0) { return GPU_ERR_OTHER; }
     var sh_bo[16];
     var rc = native_bo_create_gtt(fd, sh_size, &sh_bo);
-    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    if (rc != 0) {
+        native_ctx_free_texture_va(ctx, sh_size);
+        return _native_neg_rc_to_gpu_err(rc);
+    }
     var sh_handle = load64(&sh_bo + 0);
     var sh_addr   = load64(&sh_bo + 8);
     native_gfx9_shader_downsample_2x2(sh_addr, 0);
@@ -1867,12 +1902,16 @@ fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
     if (rc != 0) {
         var rc_save = rc;
         native_bo_release_gtt(fd, sh_handle, sh_addr, sh_size);
+        native_ctx_free_texture_va(ctx, sh_size);
         return _native_neg_rc_to_gpu_err(rc_save);
     }
-    # Dispatch one downsample per level.
+    # Dispatch one downsample per level. Every exit from here goes through the shader-BO
+    # release below (4.1.4: the BO and its VA used to leak on every call).
+    var result = 0;
     var pm4 = native_ctx_pm4_scratch(ctx);
-    if (pm4 == 0) { return GPU_ERR_OTHER; }
+    if (pm4 == 0) { result = GPU_ERR_OTHER; }
     var level = 1;
+    if (result != 0) { level = mip_count; }
     while (level < mip_count) {
         var src_va = native_texture_level_va(tex, level - 1);
         var dst_va = native_texture_level_va(tex, level);
@@ -1887,15 +1926,26 @@ fn _backend_native_texture_generate_mipmaps(ctx, tex): i64 {
         var t_now[16];
         memset(&t_now, 0, 16);
         var trc = syscall(228, 1, &t_now);
-        if (trc != 0) { return GPU_ERR_OTHER; }
-        var deadline = load64(&t_now + 0) * 1000000000
-        + load64(&t_now + 8) + 15000000000;
-        rc = native_compute_dispatch_cached(ctx, pm4, n, sh_handle,
-          tex_handle, deadline);
-        if (rc != 0) { return rc; }
-        level = level + 1;
+        if (trc != 0) {
+            result = GPU_ERR_OTHER;
+            level = mip_count;
+        } else {
+            var deadline = load64(&t_now + 0) * 1000000000
+            + load64(&t_now + 8) + 15000000000;
+            rc = native_compute_dispatch_cached(ctx, pm4, n, sh_handle,
+              tex_handle, deadline);
+            if (rc != 0) {
+                result = rc;
+                level = mip_count;
+            } else {
+                level = level + 1;
+            }
+        }
     }
-    return 0;
+    var urc = native_gem_va_unmap(fd, sh_handle, sh_va, sh_size);
+    native_bo_release_gtt(fd, sh_handle, sh_addr, sh_size);
+    if (urc == 0) { native_ctx_release_texture_va(ctx, sh_va, sh_size); }
+    return result;
 }
 
 # v3.2 TS.7c-3 — one-shot SDMA submit on the DMA ring: a 4-entry BO_HANDLES
@@ -2034,7 +2084,13 @@ fn _backend_native_texture_release(ctx, tex): i64 {
     if (ctx == 0) { return 0; }
     if (tex == 0) { return 0; }
     var fd = native_ctx_fd(ctx);
-    native_texture_release_2d_rgba8(fd, tex);
+    var handle = load64(tex + NATIVE_TEX_FIELD_HANDLE);
+    var va = load64(tex + NATIVE_TEX_FIELD_VA);
+    var span = native_texture_va_span(tex);
+    var urc = _native_texture_release_unmap_rc(fd, tex);
+    if (handle != 0) {
+        if (urc == 0) { native_ctx_release_texture_va(ctx, va, span); }
+    }
     return 0;
 }
 
@@ -2152,7 +2208,13 @@ fn _backend_native_render_target_release(ctx, rt): i64 {
     if (ctx == 0) { return 0; }
     if (rt == 0)  { return 0; }
     var fd = native_ctx_fd(ctx);
-    native_rt_release_2d_rgba8(fd, rt);
+    var handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
+    var va = load64(rt + NATIVE_RT_FIELD_VA);
+    var size = load64(rt + NATIVE_RT_FIELD_SIZE);
+    var urc = _native_rt_release_unmap_rc(fd, rt);
+    if (handle != 0) {
+        if (urc == 0) { native_ctx_release_rt_va(ctx, va, size); }
+    }
     return 0;
 }
 
@@ -2802,9 +2864,10 @@ fn backend_native_new(): i64 {
 #   0x180000000   textures — 2 GiB bump region [base, base + 0x80000000),
 #                 64 KiB-aligned per allocation (v3.1 M.1(c))
 #
-# The bump cursor never reclaims (mabda's native-allocator model — the
-# create-once texture pattern). A free-list is a later concern if a
-# consumer churns textures.
+# Allocation bumps a cursor. Since 4.1.4 a released range goes on a per-context
+# free list and the next allocation of the same span in the same region reuses it,
+# so a consumer that churns textures, buffers or render targets no longer exhausts
+# the region.
 
 var _NATIVE_TEXTURE_VA_BASE   = 0xFFFF800180000000;
 var _NATIVE_TEXTURE_VA_REGION = 0x80000000;   # 2 GiB
@@ -2826,17 +2889,120 @@ var _NATIVE_STAGING_VA_REGION = 0x10000000;   # 256 MiB
 # per-context region. Returns the base VA, or 0 on region exhaustion
 # (caller treats 0 as a create failure). Lazy-inits the cursor to
 # _NATIVE_TEXTURE_VA_BASE (the ctx memset leaves +120 zero).
-fn native_ctx_alloc_texture_va(ctx, size): i64 {
+# 4.1.4 — per-context VA free list, shared by the texture and RT regions. A released
+# range is pushed with its exact span; an allocation of that span in the same region
+# takes it before bumping the cursor, so reuse never overlaps or fragments. The list
+# also records the LAST allocation, so the size-only error-path rollbacks below can
+# hand a reused range back to the list instead of rewinding the cursor over a live one.
+# Layout (allocated once per context on first use; never freed):
+#   +0 count  +8 last_va  +16 last_span  +24 last_from_list  +32 dropped
+#   +40 entries: _NATIVE_VA_FREE_CAP x (va u64, span u64)
+var _NATIVE_VA_FREE_CAP   = 128;
+var _NATIVE_VA_FREE_HDR   = 40;
+var _NATIVE_VA_FREE_BYTES = 2088;   # _NATIVE_VA_FREE_HDR + _NATIVE_VA_FREE_CAP * 16
+
+fn _native_va_free_list(ctx): i64 {
+    var fl = native_ctx_va_free(ctx);
+    if (fl != 0) { return fl; }
+    fl = alloc(_NATIVE_VA_FREE_BYTES);
+    if (fl == 0) { return 0; }
+    memset(fl, 0, _NATIVE_VA_FREE_BYTES);
+    native_ctx_set_va_free(ctx, fl);
+    return fl;
+}
+
+fn _native_va_note_last(fl, va, span, from_list): i64 {
+    store64(fl + 8, va);
+    store64(fl + 16, span);
+    store64(fl + 24, from_list);
+    return 0;
+}
+
+# Take a free range of exactly `span` inside [lo, hi). Returns its VA, or 0.
+fn _native_va_take(fl, lo, hi, span): i64 {
+    var n = load64(fl + 0);
+    var i = 0;
+    while (i < n) {
+        var e = fl + _NATIVE_VA_FREE_HDR + i * 16;
+        var va = load64(e + 0);
+        var fits = 0;
+        if (load64(e + 8) == span) {
+            if (va >= lo) {
+                if (va < hi) { fits = 1; }
+            }
+        }
+        if (fits == 1) {
+            var last = fl + _NATIVE_VA_FREE_HDR + (n - 1) * 16;
+            store64(e + 0, load64(last + 0));
+            store64(e + 8, load64(last + 8));
+            store64(fl + 0, n - 1);
+            return va;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Return a released range to the free list. A zero or out-of-region range is ignored.
+# A full list drops the range and counts it (the range stays unused, as before 4.1.4).
+fn _native_va_give(ctx, va, span, lo, hi): i64 {
     if (ctx == 0) { return 0; }
-    var cur = native_ctx_tex_va_next(ctx);
-    if (cur == 0) { cur = _NATIVE_TEXTURE_VA_BASE; }
-    var step = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
-    var next = cur + step;
-    if (next > _NATIVE_TEXTURE_VA_BASE + _NATIVE_TEXTURE_VA_REGION) {
+    if (va == 0) { return 0; }
+    if (span <= 0) { return 0; }
+    if (va < lo) { return 0; }
+    if (va >= hi) { return 0; }
+    var fl = _native_va_free_list(ctx);
+    if (fl == 0) { return 0; }
+    var n = load64(fl + 0);
+    if (n >= _NATIVE_VA_FREE_CAP) {
+        store64(fl + 32, load64(fl + 32) + 1);
         return 0;
     }
+    var e = fl + _NATIVE_VA_FREE_HDR + n * 16;
+    store64(e + 0, va);
+    store64(e + 8, span);
+    store64(fl + 0, n + 1);
+    return 0;
+}
+
+fn native_ctx_va_free_count(ctx): i64 {
+    var fl = native_ctx_va_free(ctx);
+    if (fl == 0) { return 0; }
+    return load64(fl + 0);
+}
+
+fn native_ctx_va_free_dropped(ctx): i64 {
+    var fl = native_ctx_va_free(ctx);
+    if (fl == 0) { return 0; }
+    return load64(fl + 32);
+}
+
+fn native_ctx_alloc_texture_va(ctx, size): i64 {
+    if (ctx == 0) { return 0; }
+    var step = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
+    var fl = _native_va_free_list(ctx);
+    if (fl == 0) { return 0; }
+    var top = _NATIVE_TEXTURE_VA_BASE + _NATIVE_TEXTURE_VA_REGION;
+    var reused = _native_va_take(fl, _NATIVE_TEXTURE_VA_BASE, top, step);
+    if (reused != 0) {
+        _native_va_note_last(fl, reused, step, 1);
+        return reused;
+    }
+    var cur = native_ctx_tex_va_next(ctx);
+    if (cur == 0) { cur = _NATIVE_TEXTURE_VA_BASE; }
+    var next = cur + step;
+    if (next > top) { return 0; }
     native_ctx_set_tex_va_next(ctx, next);
+    _native_va_note_last(fl, cur, step, 0);
     return cur;
+}
+
+# Give a released texture-region range back for reuse. `size` is the mapped span (it is
+# rounded the same way the allocation was). Call only after the range was unmapped.
+fn native_ctx_release_texture_va(ctx, va, size): i64 {
+    var span = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
+    return _native_va_give(ctx, va, span, _NATIVE_TEXTURE_VA_BASE,
+      _NATIVE_TEXTURE_VA_BASE + _NATIVE_TEXTURE_VA_REGION);
 }
 
 # Roll back the LAST native_ctx_alloc_texture_va of `size` (LIFO). The forward-only
@@ -2848,6 +3014,15 @@ fn native_ctx_alloc_texture_va(ctx, size): i64 {
 fn native_ctx_free_texture_va(ctx, size): i64 {
     if (ctx == 0) { return 0 - 1; }
     var step = _native_align_up(size, _NATIVE_TEXTURE_VA_ALIGN);
+    var fl = native_ctx_va_free(ctx);
+    if (fl != 0) {
+        var from_list = load64(fl + 24);
+        var last_va = load64(fl + 8);
+        _native_va_note_last(fl, 0, 0, 0);
+        # 4.1.4: a range that came off the free list goes back on it; rewinding the
+        # cursor here would hand out a range another live object still holds.
+        if (from_list == 1) { return native_ctx_release_texture_va(ctx, last_va, step); }
+    }
     var cur = native_ctx_tex_va_next(ctx);
     if (cur == 0) { return 0; }
     native_ctx_set_tex_va_next(ctx, cur - step);
@@ -3257,6 +3432,23 @@ fn native_texture_create_mipped_2d_fmt(fd, va_base, width, height, mip_count, fm
 # fail at zero rather than at a recycled BO. Tex with handle == 0
 # is a no-op (caller may release an uninitialised struct safely).
 fn native_texture_release_2d_rgba8(fd, tex): i64 {
+    _native_texture_release_unmap_rc(fd, tex);
+    return 0;
+}
+
+# The mapped VA span of a native texture: the descriptor-tail-padded BO for a
+# sampleable tex (t_va != 0), else the 64 KiB-rounded surface size.
+fn native_texture_va_span(tex): i64 {
+    var t_va = native_tex_t_va(tex);
+    if (t_va != 0) {
+        return _native_align_up((t_va - load64(tex + NATIVE_TEX_FIELD_VA)) + 64, _NATIVE_TEXTURE_VA_ALIGN);
+    }
+    return _native_align_up(load64(tex + NATIVE_TEX_FIELD_SIZE), _NATIVE_TEXTURE_VA_ALIGN);
+}
+
+# Release core: returns the VA-unmap rc (0 when there was nothing to release), so the
+# ctx-level release knows whether the range is safe to reuse.
+fn _native_texture_release_unmap_rc(fd, tex): i64 {
     if (tex == 0) { return 0; }
     var handle = load64(tex + NATIVE_TEX_FIELD_HANDLE);
     if (handle == 0) { return 0; }
@@ -3277,14 +3469,14 @@ fn native_texture_release_2d_rgba8(fd, tex): i64 {
     if (t_va != 0) {
         unmap_size = _native_align_up((t_va - va) + 64, _NATIVE_TEXTURE_VA_ALIGN);
     }
-    native_gem_va_unmap(fd, handle, va, unmap_size);
+    var urc = native_gem_va_unmap(fd, handle, va, unmap_size);
     native_bo_release_gtt(fd, handle, addr, unmap_size);
     store64(tex + NATIVE_TEX_FIELD_HANDLE, 0);
     store64(tex + NATIVE_TEX_FIELD_VA,     0);
     store64(tex + NATIVE_TEX_FIELD_ADDR,   0);
     store64(tex + NATIVE_TEX_FIELD_SIZE,   0);
     native_tex_set_t_va(tex, 0);   # so a released sampleable tex no longer binds
-    return 0;
+    return urc;
 }
 
 # ================================================================
@@ -3318,10 +3510,9 @@ fn native_texture_release_2d_rgba8(fd, tex): i64 {
 # (v3.4.2 — was a single fixed VA, which collided when a 2nd RT was
 # created before the 1st released -> GEM_VA EINVAL). The next region up
 # is the tiled-copy staging VA at 0xFFFF800140000000, ~752 MiB above the
-# top of this region, so the bump cannot reach it. Like the texture
-# region the cursor never reclaims on steady-state release (bump-leak
-# model); a churn-heavy consumer that recreates RTs without bound is a
-# free-list concern for a later minor.
+# top of this region, so the bump cannot reach it. Released RT ranges go on
+# the per-context VA free list (4.1.4) and same-span creates reuse them; before
+# that the 33rd 1920x1080 RT create in one context failed.
 
 var _NATIVE_RT_VA_BASE   = 0xFFFF800101000000;
 var _NATIVE_RT_VA_REGION = 0x10000000;   # 256 MiB
@@ -3334,15 +3525,28 @@ var _NATIVE_RT_VA_ALIGN  = 0x10000;      # 64 KiB per allocation (GEM_VA fragmen
 # native_ctx_alloc_texture_va.
 fn native_ctx_alloc_rt_va(ctx, size): i64 {
     if (ctx == 0) { return 0; }
+    var step = _native_align_up(size, _NATIVE_RT_VA_ALIGN);
+    var fl = _native_va_free_list(ctx);
+    if (fl == 0) { return 0; }
+    var top = _NATIVE_RT_VA_BASE + _NATIVE_RT_VA_REGION;
+    var reused = _native_va_take(fl, _NATIVE_RT_VA_BASE, top, step);
+    if (reused != 0) {
+        _native_va_note_last(fl, reused, step, 1);
+        return reused;
+    }
     var cur = native_ctx_rt_va_next(ctx);
     if (cur == 0) { cur = _NATIVE_RT_VA_BASE; }
-    var step = _native_align_up(size, _NATIVE_RT_VA_ALIGN);
     var next = cur + step;
-    if (next > _NATIVE_RT_VA_BASE + _NATIVE_RT_VA_REGION) {
-        return 0;
-    }
+    if (next > top) { return 0; }
     native_ctx_set_rt_va_next(ctx, next);
+    _native_va_note_last(fl, cur, step, 0);
     return cur;
+}
+
+# Give a released RT-region range back for reuse (after it was unmapped).
+fn native_ctx_release_rt_va(ctx, va, size): i64 {
+    var span = _native_align_up(size, _NATIVE_RT_VA_ALIGN);
+    return _native_va_give(ctx, va, span, _NATIVE_RT_VA_BASE, _NATIVE_RT_VA_BASE + _NATIVE_RT_VA_REGION);
 }
 
 # Roll back the LAST native_ctx_alloc_rt_va of `size` (LIFO). Only valid
@@ -3354,6 +3558,13 @@ fn native_ctx_alloc_rt_va(ctx, size): i64 {
 fn native_ctx_free_rt_va(ctx, size): i64 {
     if (ctx == 0) { return 0 - 1; }
     var step = _native_align_up(size, _NATIVE_RT_VA_ALIGN);
+    var fl = native_ctx_va_free(ctx);
+    if (fl != 0) {
+        var from_list = load64(fl + 24);
+        var last_va = load64(fl + 8);
+        _native_va_note_last(fl, 0, 0, 0);
+        if (from_list == 1) { return native_ctx_release_rt_va(ctx, last_va, step); }
+    }
     var cur = native_ctx_rt_va_next(ctx);
     if (cur == 0) { return 0; }
     native_ctx_set_rt_va_next(ctx, cur - step);
@@ -3428,13 +3639,19 @@ fn native_rt_create_2d_rgba8(fd, width, height, va, out): i64 {
 
 # Release a NativeRenderTarget. Pair with native_rt_create_2d_rgba8.
 fn native_rt_release_2d_rgba8(fd, rt): i64 {
+    _native_rt_release_unmap_rc(fd, rt);
+    return 0;
+}
+
+# Release core: returns the VA-unmap rc (0 when there was nothing to release).
+fn _native_rt_release_unmap_rc(fd, rt): i64 {
     if (rt == 0) { return 0; }
     var handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
     if (handle == 0) { return 0; }
     var va   = load64(rt + NATIVE_RT_FIELD_VA);
     var addr = load64(rt + NATIVE_RT_FIELD_ADDR);
     var size = load64(rt + NATIVE_RT_FIELD_SIZE);
-    native_gem_va_unmap(fd, handle, va, size);
+    var urc = native_gem_va_unmap(fd, handle, va, size);
     native_bo_release_gtt(fd, handle, addr, size);
     store64(rt + NATIVE_RT_FIELD_HANDLE, 0);
     store64(rt + NATIVE_RT_FIELD_VA,     0);
@@ -3442,7 +3659,7 @@ fn native_rt_release_2d_rgba8(fd, rt): i64 {
     store64(rt + NATIVE_RT_FIELD_SIZE,   0);
     store32(rt + NATIVE_RT_FIELD_WIDTH,  0);
     store32(rt + NATIVE_RT_FIELD_HEIGHT, 0);
-    return 0;
+    return urc;
 }
 
 # ================================================================

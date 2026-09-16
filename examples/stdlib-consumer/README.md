@@ -91,7 +91,7 @@ Notes on the steps:
   `no GPU available` to stderr and exits 1.
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`4.1.3`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.3/`,
+there (`4.1.4`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.4/`,
 and copies its `dist/mabda.cyr` bundle into `lib/mabda.cyr` (a real
 file, not a symlink). The consumer then includes it with
 `include "lib/mabda.cyr"`.
@@ -118,7 +118,7 @@ explicitly:
 This example is the **`@public`-API-stability regression test across
 the wgpu → native transition**. The pure-Cyrius native backends have
 now landed (AMD in v3.0, NVIDIA in v4.0), and `src/main.cyr` still
-compiles against the v4.1.3 mabda tag. None of its code changes has
+compiles against the v4.1.4 mabda tag. None of its code changes has
 been a mabda API change:
 
 - **v4.1.1** moved to the cyrius 6.6.0 `Result` pair-bind

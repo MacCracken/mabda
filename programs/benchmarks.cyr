@@ -13,7 +13,8 @@
 # Exit status: 0 when all 13 rows ran and are valid. 1 when ANY row is invalid:
 #   - it measured 0 ns (the timed window held no measurable work),
 #   - its op ran out of prebuilt inputs (shader_cache_miss),
-#   - its untimed queue flush could not create an encoder (uniform_buffer_write), or
+#   - its untimed queue flush could not create an encoder (uniform_buffer_write),
+#   - a create op returned a 0 handle, so the window timed a failed create, or
 #   - its setup handle came back 0, so it never ran (a `FAIL:` line stands in for its CSV line).
 # A measured-but-invalid row still prints its CSV line, then a `FAIL:` line on stdout; the run
 # ends with a FAIL summary on stderr. With no GPU it prints `SKIP: no GPU available` to stderr
@@ -145,6 +146,7 @@ var _bw_n      = 0;   # running op index for rows that consume a unique input pe
 var _bw_count  = 0;   # inputs available to such a row
 var _bw_starved = 0;  # ops of such a row that found no input left (the row is then invalid)
 var _bw_flush_failed = 0;   # untimed flushes that could not create their encoder
+var _bw_null_ops = 0;       # create ops (rows with a release fn) that returned a 0 handle
 
 # floor - fastest of 16384 empty windows (never negative): how far below the subtracted floor a
 # single window's clock cost reaches right now.
@@ -204,6 +206,7 @@ fn _time_window(b, op_fp, rel_fp, flush_fp, handles, k): i64 {
         while (i < k) {
             var hr = load64(handles + i * 8);
             if (hr != 0) { fncall1(rel_fp, hr); }
+            if (hr == 0) { _bw_null_ops = _bw_null_ops + 1; }
             i = i + 1;
         }
     }
@@ -215,6 +218,7 @@ fn _time_window(b, op_fp, rel_fp, flush_fp, handles, k): i64 {
 # `base` is the single-op iteration count the row always used: kept exactly when K == 1,
 # otherwise ceil(base / K) windows, but never fewer than min(base, 50) windows for the min.
 fn _bench_row(name, op_fp, rel_fp, flush_fp, base, cap): i64 {
+    _bw_null_ops = 0;
     var handles = alloc(cap * 8);
     var pk = cap;
     if (pk > 16) { pk = 16; }
@@ -237,6 +241,14 @@ fn _bench_row(name, op_fp, rel_fp, flush_fp, base, cap): i64 {
         w = w + 1;
     }
     _report(b, k, jit);
+    if (_bw_null_ops > 0) {
+        _bench_invalid = _bench_invalid + 1;
+        _out("  FAIL: ");
+        _out(name);
+        _out(" timed ");
+        fmt_int(_bw_null_ops);
+        _out(" create op(s) that returned 0\n");
+    }
     return 0;
 }
 
@@ -478,9 +490,7 @@ fn _op_depth_1080p(): i64 {
 }
 
 fn _rel_depth(dt): i64 {
-    wgpu_texture_view_release(depth_texture_view(dt));
-    wgpu_texture_release(depth_texture_handle(dt));
-    return 0;
+    return depth_texture_release(dt);
 }
 
 fn bench_depth_texture_1080p(device): i64 {
@@ -581,14 +591,21 @@ fn bench_compute_dispatch_1024(device, queue): i64 {
     | WGPU_BUFFER_USAGE_COPY_SRC;
     var storage_desc = wgpu_buffer_descriptor("bench-storage", storage_usage, SIZE, 0);
     var sbuf = wgpu_device_create_buffer(device, storage_desc);
-    if (sbuf == 0) { return _setup_fail("compute_dispatch_1024", "the storage buffer"); }
+    if (sbuf == 0) {
+        compute_pipeline_release(cp);
+        return _setup_fail("compute_dispatch_1024", "the storage buffer");
+    }
     wgpu_queue_write_buffer(queue, sbuf, 0, data, SIZE);
 
     var bge = alloc(56);
     wgpu_bind_group_entry_buffer(bge, 0, sbuf, 0, SIZE);
     var bg_desc = wgpu_bind_group_descriptor("bench-bg", compute_pipeline_bgl(cp), bge, 1);
     var bg = wgpu_device_create_bind_group(device, bg_desc);
-    if (bg == 0) { return _setup_fail("compute_dispatch_1024", "the bind group"); }
+    if (bg == 0) {
+        wgpu_buffer_release(sbuf);
+        compute_pipeline_release(cp);
+        return _setup_fail("compute_dispatch_1024", "the bind group");
+    }
 
     # Dispatch: 16 workgroups × 64 lanes = 1024 elements
     var dims = alloc(12);

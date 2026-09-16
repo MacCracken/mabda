@@ -1,6 +1,6 @@
 # Usage Guide
 
-> Written against mabda 4.1.3 / Cyrius 6.6.4. See
+> Written against mabda 4.1.4 / Cyrius 6.6.4. See
 > [`docs/stdlib-integration.md`](../stdlib-integration.md) for
 > consumer-project setup (manifest, deps, launcher build rule), and
 > [`render-graph.md`](render-graph.md) if you want to orchestrate
@@ -14,7 +14,7 @@ Pull mabda in as a dep in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.3"
+tag = "4.1.4"
 modules = ["dist/mabda.cyr"]
 ```
 
