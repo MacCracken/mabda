@@ -44,8 +44,13 @@ the thing this repo's audit checklist item 7 exists to protect, and it is fine.
    | `SurfaceSourceSwapChainPanel` | `0x0003000B` | `0x00030009` |
    | `PrimitiveStateExtras` | `0x0003000C` | `0x0003000A` |
 
-2. ⛔ **`WGPUNativeFeature_SpirvShaderPassthrough` (`0x00030017`) is GONE.** That numeric
-   slot is now `WGPUNativeFeature_ClearTexture`.
+2. ⛔ **`WGPUNativeFeature_SpirvShaderPassthrough` (`0x00030017`) is GONE.** It was deleted,
+   not renamed or renumbered. In v29.0.1.1 `0x00030017` is an **unassigned** slot between
+   `ClearTexture` (`0x00030016`, commented out in v29.0.0.0 and live in v29.0.1.1) and
+   `Multiview` (`0x00030018`).
+   *Corrected 2026-09-16 (4.1.3 verification): this item first said the slot was now
+   `ClearTexture`. It is not. Checked against both upstream headers and on NVK, where a
+   device with `ClearTexture` enabled reports `0x00030016` = 1 and `0x00030017` = 0.*
 3. **`WGPUPipelineLayoutExtras` — the whole struct — is removed** (`immediateDataSize`
    moved onto `WGPUPipelineLayout` as `immediateSize`).
 4. **`WGPUNativeLimits` changes shape**: `maxImmediateSize` removed, and
@@ -62,7 +67,7 @@ them, but a consumer's launcher might.
 | Site | What happens on v29.0.1.1 |
 | --- | --- |
 | `deps/wgpu_main.c:75-76` | References `WGPUNativeFeature_SpirvShaderPassthrough` **by name**. The symbol no longer exists → **the C launcher does not compile.** A loud failure, which is the good case. |
-| `src/backend_wgpu.cyr:1166` | `var WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH = 0x00030017;` is a **hardcoded numeric literal** on the Cyrius side. `0x00030017` is now `ClearTexture`. Nothing errors — mabda would **request a different feature entirely** and the passthrough path would misbehave with no diagnostic. ⛔ **This is the dangerous one.** |
+| `src/backend_wgpu.cyr:1166` | `var WGPU_NATIVE_FEATURE_SPIRV_SHADER_PASSTHROUGH = 0x00030017;` is a **hardcoded numeric literal** on the Cyrius side, and `gpu_wgpu_spirv_passthrough_supported` probed it. `0x00030017` is **unassigned** in v29.0.1.1. Nothing errors: the probe reads 0 today, and once upstream assigns the slot it answers for whatever feature lands there, routing callers into the passthrough creator with no diagnostic. ⛔ **This is the dangerous one.** *(Corrected 2026-09-16: this row first said `0x00030017` was now `ClearTexture`.)* |
 | `deps/wgpu_main.c:383` | Uses `WGPUSType_InstanceExtras` **by symbol**, so it recompiles to the new `0x00030004` correctly. Safe *because* it is a symbol and not a literal. |
 
 ⭐ **The asymmetry in that table is the transferable lesson.** Every site that spells the
@@ -130,12 +135,18 @@ Bumped to `v29.0.1.1`. The full wgpu suite passes on it: `test-phase0` **12/12**
 **What had to change — both of the sites this filing identified, and nothing else:**
 
 1. `deps/wgpu_main.c` no longer requests `WGPUNativeFeature_SpirvShaderPassthrough`.
-   ⛔ The feature is **gone upstream at any spelling**: its slot `0x00030017` is now
-   `ClearTexture`, and the intended successor
+   ⛔ The feature is **gone upstream at any spelling**: its slot `0x00030017` is unassigned
+   (`ClearTexture` is `0x00030016`), and the intended successor
    (`WGPUNativeFeature_PassthroughShaders = 0x00030036`) ships **commented out** behind a
    "requires wgpu.h api change" TODO. It was not renamed — it does not exist.
 2. `src/backend_wgpu.cyr`'s bare `0x00030017` literal is retired in place, with the
    wgpu-native version it was read from recorded next to it.
+   ⚠ *Correction (4.1.3 verification, 2026-09-16):* retiring the constant did not retire
+   the probe. `gpu_wgpu_spirv_passthrough_supported` still returned
+   `wgpu_device_has_feature(device, 0x00030017)` in 4.1.0, 4.1.1 and 4.1.2. 4.1.3 makes it
+   return 0 without calling `wgpu_device_has_feature`. `tests/tcyr/backend.tcyr`
+   `test_wgpu_spirv_passthrough_gate_never_probes_retired_id` drives it through a mock device
+   that reports every feature, and fails (3 assertions) against the 4.1.2 gate.
 
 **Nothing of mabda's was lost.** Passthrough is the naga-*bypass* escape hatch and already
 returned 0 from `wgpuAdapterHasFeature` on RADV/Cezanne. The paths that carry real work are

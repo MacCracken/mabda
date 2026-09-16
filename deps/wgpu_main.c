@@ -72,11 +72,13 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
             (WGPUFeatureName)WGPUNativeFeature_ShaderF64))
         feats[nfeat++] = (WGPUFeatureName)WGPUNativeFeature_ShaderF64;
     // v4.1.0 / wgpu-native v29.0.1.1: WGPUNativeFeature_SpirvShaderPassthrough is
-    // GONE from wgpu.h. It was not renamed — its slot 0x00030017 is now
-    // ClearTexture, and the intended replacement
-    // (WGPUNativeFeature_PassthroughShaders = 0x00030036) ships COMMENTED OUT with
-    // a "requires wgpu.h api change" TODO. So raw SPIR-V passthrough does not exist
-    // upstream at this version, at any spelling.
+    // GONE from wgpu.h. It was not renamed — its old slot 0x00030017 is left
+    // UNASSIGNED (ClearTexture, commented out at 0x00030016 in v29.0.0.0, is now
+    // live at 0x00030016; Multiview follows at 0x00030018), and the intended
+    // replacement (WGPUNativeFeature_PassthroughShaders = 0x00030036) ships
+    // COMMENTED OUT ("requires wgpu.h api change"). So raw SPIR-V passthrough does not
+    // exist upstream at this version, at any spelling, and the Cyrius-side gate
+    // (gpu_wgpu_spirv_passthrough_supported) answers 0 without probing the old number.
     //
     // Nothing of mabda's is lost: passthrough was the naga-BYPASS escape hatch, and
     // it already returned 0 from wgpuAdapterHasFeature on RADV/Cezanne. The paths
@@ -406,7 +408,13 @@ static int preinit_gpu(void) {
     };
 
     WGPUInstanceDescriptor desc = {0};
-    desc.nextInChain = (const WGPUChainedStruct*)&extras;
+    // v29 webgpu.h declares WGPUInstanceDescriptor.nextInChain as a NON-const
+    // `WGPUChainedStruct *` (the input-struct const was dropped upstream). The old
+    // `(const WGPUChainedStruct*)&extras` cast re-added a const the field cannot hold,
+    // so gcc warned (-Wdiscarded-qualifiers) on every build. Point at the embedded
+    // header by name instead: `extras` is a mutable local, `extras.chain` is its first
+    // member, and wgpuCreateInstance only reads the chain — no cast, no const to lose.
+    desc.nextInChain = &extras.chain;
     desc.requiredFeatureCount = 1;
     desc.requiredFeatures = k_required_features;
 

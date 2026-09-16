@@ -21,7 +21,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 # WGSL sampling array layer `k` (a literal in the FS).
 fn _array_wgsl(k): i64 {
@@ -37,9 +67,9 @@ fn _array_wgsl(k): i64 {
     str_builder_add_cstr(sb, "o.uv = (p[vid] + vec2<f32>(1.0, 1.0)) * 0.5; return o; } ");
     str_builder_add_cstr(sb, "@fragment fn fs_main(inp: VOut) -> @location(0) vec4<f32> { ");
     str_builder_add_cstr(sb, "return textureSample(t, s, inp.uv, ");
-    var nb[16];
-    memset(&nb, 0, 16);
-    fmt_int_buf(k, &nb);   # digits + a trailing NUL (nb was zeroed) -> a cstr
+    var nb[24];            # fmt_int_buf formats in a 24-byte scratch (writes up to buf+23)
+    memset(&nb, 0, 24);
+    fmt_int_buf(k, &nb);   # digits + a trailing NUL -> a cstr
     str_builder_add_cstr(sb, &nb);
     str_builder_add_cstr(sb, "); }");
     return str_cstr(str_builder_build(sb));
@@ -108,11 +138,11 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     var W = 64;
     var H = 64;
@@ -120,7 +150,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var LAYERS = 4;
 
     var tex = gpu_texture_create_2d_array(_gpu_ctx, W, H, MABDA_TEXFMT_RGBA8, LAYERS);
-    if (tex == 0) { return _fail("FAIL: create_2d_array\n", 22); }
+    if (tex == 0) { return _fail("create_2d_array"); }
     var src = alloc(N);
     var k = 0;
     while (k < LAYERS) {
@@ -133,23 +163,23 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
             i = i + 1;
         }
         if (gpu_texture_write_layer_level(_gpu_ctx, tex, k, 0, src, N) != 0) {
-            return _fail("FAIL: write_layer_level\n", 24);
+            return _fail("write_layer_level");
         }
         k = k + 1;
     }
-    syscall(1, 1, "PASS: 4-layer array created + uploaded (distinct R)\n", 51);
+    _pass("4-layer array created + uploaded (distinct R)");
 
     var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
-    if (samp == 0) { return _fail("FAIL: sampler\n", 14); }
+    if (samp == 0) { return _fail("sampler"); }
 
     if (_sample_layer(_gpu_ctx, tex, samp, 0) != 0) {
-        return _fail("FAIL: layer 0 sample mismatch\n", 30);
+        return _fail("layer 0 sample mismatch");
     }
     if (_sample_layer(_gpu_ctx, tex, samp, 2) != 0) {
-        return _fail("FAIL: layer 2 sample mismatch\n", 30);
+        return _fail("layer 2 sample mismatch");
     }
-    syscall(1, 1, "PASS: RT = array layer color for layers 0 and 2\n", 48);
+    _pass("RT = array layer color for layers 0 and 2");
 
-    syscall(1, 1, "\n3 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

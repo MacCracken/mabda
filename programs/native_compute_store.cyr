@@ -7,14 +7,24 @@
 # pre-loaded in s[0:1], with GLC+SLC cache bypass + s_waitcnt so the
 # store is CPU-visible by the time the sync-obj fires.
 #
-# PM4 stream is byte-identical to `programs/native_compute_spike.cyr`
-# (the working B.3.d baseline) except for:
-#   - USER_DATA_0/1 carry the real output VA (spike used Mesa's
-#     scratch-V# stub bytes there).
-#   - USER_DATA_2/3 keep Mesa's scratch-V# stub values (the shader
-#     doesn't read s2/s3, but the HW may implicitly reference them
-#     during dispatch setup).
-#   - BO list has 4 entries (shader + stub + output + IB).
+# The PM4 stream is built by the library (native_pm4_build_compute_store_deadbeef in
+# src/backend_native_pm4.cyr, reached through gpu_compute_dispatch). It follows the same
+# Mesa-order compute preamble as `programs/native_compute_spike.cyr`, but is not
+# byte-identical to it:
+#   - USER_DATA_0/1 carry the output VA; USER_DATA_2/3 carry the canonical-high stub VA
+#     from gpu_context_new_native (the spike points USER_DATA_0 and USER_DATA_2/3 at a
+#     user-low stub BO at 0x200000).
+#   - TA_CS_BC_BASE_ADDR = 0 (the spike points it at the shader VA).
+#   - Its CP-side WRITE_DATA marker (0xC0FFEE12 at stub+4) comes AFTER DISPATCH_DIRECT;
+#     the spike's 0xCAFEBABE marker comes before it.
+#   - 64 DW submitted with the 4-chunk FENCE shape (the spike: 256 DW, 3 chunks).
+#
+# How a hung dispatch shows up: the kernel's compute ring timeout completes it, and the
+# syncobj then signals WITHOUT an error. The post-dispatch marker still lands (the CP has
+# already moved past DISPATCH_DIRECT), so neither the wait nor the marker catches it. On
+# kernel 7.1/7.2 that timeout is ~2 s (2012-2206 ms observed, 2026-08-19 and 2026-09-16);
+# a clean dispatch here signals in 0-1 ms. The reset check after each dispatch
+# (AMDGPU_CTX_OP_QUERY_STATE2) is the gate for it: flags = 0x1 after a hung dispatch.
 #
 # Exit codes:
 #   0   — output buffer contains 0xDEADBEEF at [0]; sentinel intact at [1]
@@ -30,6 +40,12 @@
 #   10  — syncobj wait failed (timeout or error)
 #   11  — readback mismatch at out[0]
 #   12  — sentinel corrupted at out[1]
+#   13  — re-seeding the output buffer before dispatch #2 failed
+#   14  — dispatch #2 failed
+#   15  — dispatch #2 post-dispatch marker stale (CP never ran past DISPATCH_DIRECT)
+#   16  — dispatch #2 readback mismatch at out[0]
+#   17  — dispatch #1: context state query failed, or it reported a reset
+#   18  — dispatch #2: context state query failed, or it reported a reset
 
 include "src/lib.cyr"
 
@@ -60,6 +76,47 @@ fn mono_ns(): i64 {
     var ts[16];
     syscall(228, 1, &ts);
     return load64(&ts + 0) * 1000000000 + load64(&ts + 8);
+}
+
+# Signal-latency hint. A clean dispatch signals in 0-1 ms; a hung one is completed by
+# the ~2 s compute ring timeout (see the header). The hint is informational only: the
+# reset check below decides pass/fail.
+fn print_hang_hint(elapsed_ms): i64 {
+    if (elapsed_ms >= 1500) {
+        print_cstr(" (>= 1.5 s: the ~2 s compute ring-timeout signature - see the reset check)");
+    }
+    return 0;
+}
+
+# Returns 1 when AMDGPU_CTX_OP_QUERY_STATE2 on this context fails or reports a lost-work flag
+# (native_ctx_state_lost: RESET/VRAMLOST/GUILTY/RESET_IN_PROGRESS), else 0.
+# drm_amdgpu_ctx is a 16-byte union: in = {op u32, flags u32, ctx_id u32, priority i32};
+# out.state = {flags u64, hangs u32, reset_status u32}. out.state.flags:
+# RESET (bit 0), VRAMLOST (1), GUILTY (2), RAS_CE (3), RAS_UE (4), RESET_IN_PROGRESS (5).
+# Hardware-checked 2026-09-16 (kernel 7.2.3): flags = 0x1 after a dispatch that hung and
+# was ring-reset, 0x0 after a clean one. The job signal and the reset bookkeeping both
+# happen in the kernel's timeout path, in an order this program does not rely on, so it
+# settles 100 ms before asking (same as programs/native_compute_spike.cyr).
+fn ctx_reset_seen(fd, ctx_id): i64 {
+    var settle_ts[16];
+    store64(&settle_ts + 0, 0);
+    store64(&settle_ts + 8, 100000000);
+    var slept = syscall(35, &settle_ts, 0);      # nanosleep
+    if (slept != 0) { print_cstr("(settle nanosleep rc="); print_i64(slept); print_cstr(")\n"); }
+    var state_req[16];
+    var state_rc = native_ctx_query_state(fd, ctx_id, &state_req);
+    print_cstr("ctx QUERY_STATE2: rc="); print_i64(state_rc);
+    # On a failed ioctl the union still holds the request (op = 4 reads as the GUILTY
+    # bit), so the flags are only read and printed after a successful call.
+    var state_flags = 0;
+    if (state_rc == 0) {
+        state_flags = load64(&state_req + 0);
+        print_cstr(" flags=0x"); fmt_hex(state_flags);
+    }
+    var seen = native_ctx_state_lost(state_rc, state_flags);
+    if (seen == 0) { print_cstr("  OK (no reset during the dispatch)\n"); }
+    if (seen != 0) { print_cstr("  FAIL (want rc=0 flags=0x0: the dispatch hung or a reset hit it)\n"); }
+    return seen;
 }
 
 fn main(): i64 {
@@ -159,20 +216,23 @@ fn main(): i64 {
     rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
     var elapsed_ms = (mono_ns() - t_submit_start) / 1000000;
     print_cstr("submit-to-syncobj-signal: "); print_i64(elapsed_ms); print_cstr(" ms");
-    if (elapsed_ms >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
+    print_hang_hint(elapsed_ms);
     print_cstr("\n");
     if (rc != 0) {
         print_cstr("FAIL: gpu_compute_dispatch rc="); print_i64(rc); print_cstr("\n");
         gpu_context_release(ctx);
         return 9;
     }
+    var reset1 = ctx_reset_seen(fd, native_ctx_id(ctx));
 
     # ---- Verify output ----
-    # Session 25b: read post-dispatch CP marker first — proves CP returned
-    # from DISPATCH_DIRECT and ran further IB packets after the dispatch.
+    # Session 25b: the post-dispatch CP marker shows the CP ran past DISPATCH_DIRECT and
+    # executed the packets after it. It does NOT show the wave finished: on 2026-09-16 a
+    # dispatch that hung (~2 s ring timeout, ring reset) still left 0xC0FFEE12 here. The
+    # output readback and the reset check are what show the dispatch completed.
     var marker_post = load32(native_ctx_stub_addr(ctx) + 4);
     print_cstr("post-dispatch marker = "); print_hex32(marker_post);
-    if (marker_post == 0xC0FFEE12) { print_cstr(" OK (CP cleared dispatch)\n"); }
+    if (marker_post == 0xC0FFEE12) { print_cstr(" OK (CP ran past DISPATCH_DIRECT)\n"); }
     if (marker_post != 0xC0FFEE12) { print_cstr(" STALE (CP did not return from dispatch)\n"); }
     var v0 = load32(out_map + 0);
     print_cstr("output[0] = "); print_hex32(v0); print_cstr(" (want 0xDEADBEEF)\n");
@@ -187,6 +247,11 @@ fn main(): i64 {
         return 12;
     }
     print_cstr("sentinel intact at [1]\n");
+    if (reset1 != 0) {
+        print_cstr("FAIL: dispatch #1 output looks right, but the context reports a reset\n");
+        gpu_context_release(ctx);
+        return 17;
+    }
 
     # ---- Dispatch #2 (Step 5a: multi-dispatch validation) ----
     # Re-seed the output BO and dispatch the same shader through
@@ -210,13 +275,14 @@ fn main(): i64 {
     rc = gpu_compute_dispatch(ctx, &shmod_pair, 1, 1, 1, &bp_pair);
     var elapsed2 = (mono_ns() - t2) / 1000000;
     print_cstr("dispatch #2 signal: "); print_i64(elapsed2); print_cstr(" ms");
-    if (elapsed2 >= 9000) { print_cstr(" (likely TDR — IB hung, kernel reset)"); }
+    print_hang_hint(elapsed2);
     print_cstr("\n");
     if (rc != 0) {
         print_cstr("FAIL: dispatch #2 rc="); print_i64(rc); print_cstr("\n");
         gpu_context_release(ctx);
         return 14;
     }
+    var reset2 = ctx_reset_seen(fd, native_ctx_id(ctx));
     var marker2 = load32(native_ctx_stub_addr(ctx) + 4);
     print_cstr("dispatch #2 marker = "); print_hex32(marker2);
     if (marker2 == 0xC0FFEE12) { print_cstr(" OK\n"); }
@@ -231,6 +297,11 @@ fn main(): i64 {
         print_cstr(" FAIL: second dispatch did not write 0xDEADBEEF\n");
         gpu_context_release(ctx);
         return 16;
+    }
+    if (reset2 != 0) {
+        print_cstr(" (value OK)\nFAIL: dispatch #2 output looks right, but the context reports a reset\n");
+        gpu_context_release(ctx);
+        return 18;
     }
     print_cstr(" OK — multi-dispatch on cached IB+fence path works\n");
 

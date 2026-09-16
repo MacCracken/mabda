@@ -86,6 +86,7 @@ var _NATIVE_ERRNO_EACCES    =  13;
 var _NATIVE_ERRNO_EBUSY     =  16;
 var _NATIVE_ERRNO_ETIME     =  62;
 var _NATIVE_ERRNO_ETIMEDOUT = 110;
+var _NATIVE_ERRNO_ECANCELED = 125;
 
 # Map a positive errno to a GPU_ERR_* code. Caller passes the
 # absolute value (i.e. converted from negative-rc convention by
@@ -98,6 +99,7 @@ fn _native_errno_to_gpu_err(errno): i64 {
     if (errno == _NATIVE_ERRNO_EBUSY)     { return GPU_ERR_DEVICE_REQUEST; }
     if (errno == _NATIVE_ERRNO_ETIMEDOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
     if (errno == _NATIVE_ERRNO_ETIME)     { return GPU_ERR_SURFACE_TIMEOUT; }
+    if (errno == _NATIVE_ERRNO_ECANCELED) { return GPU_ERR_DEVICE_LOST; }
     return GPU_ERR_OTHER;
 }
 
@@ -434,6 +436,89 @@ fn native_ctx_free(fd, ctx_id): i64 {
     store32(&req + 8,  ctx_id);
     store32(&req + 12, 0);
     return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &req);
+}
+
+# v4.1.3 — context reset state (AMDGPU_CTX_OP_QUERY_STATE2). A job that hangs is finished by
+# the kernel's ring or GPU reset: its syncobj signals and the wait returns 0, so only this
+# query tells a hang from a clean completion. HW-checked 2026-09-16 (kernel 7.2.3, Cezanne):
+# flags = 0x1 after a ring-reset hang, 0x0 after a clean dispatch.
+# drm_amdgpu_ctx (16 B): in = {op u32, flags u32, ctx_id u32, priority i32};
+# out.state = {flags u64, hangs u32, reset_status u32}. Flag bits per amdgpu_drm.h.
+var AMDGPU_CTX_OP_QUERY_STATE2                = 4;
+var AMDGPU_CTX_QUERY2_FLAGS_RESET             = 1;
+var AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST          = 2;
+var AMDGPU_CTX_QUERY2_FLAGS_GUILTY            = 4;
+var AMDGPU_CTX_QUERY2_FLAGS_RAS_CE            = 8;
+var AMDGPU_CTX_QUERY2_FLAGS_RAS_UE            = 16;
+var AMDGPU_CTX_QUERY2_FLAGS_RESET_IN_PROGRESS = 32;
+# Flags meaning this context's work did not complete: RESET | VRAMLOST | GUILTY |
+# RESET_IN_PROGRESS. RAS_CE / RAS_UE count device-wide memory errors and are not a verdict
+# on a job, so they do not fail a dispatch. Like radv, any reset (guilty or innocent) is
+# reported as device lost, and it stays set for the life of the context.
+var AMDGPU_CTX_QUERY2_FLAGS_LOST = 0x27;
+# The time after which a completion may have been a ring timeout (compute ring ~2 s here).
+var _NATIVE_SLOW_WAIT_NS = 1000000000;
+
+fn native_ctx_query_state(fd, ctx_id, req): i64 {
+    memset(req, 0, DRM_AMDGPU_CTX_SIZE);
+    store32(req + 0, AMDGPU_CTX_OP_QUERY_STATE2);
+    store32(req + 8, ctx_id);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
+}
+
+# Pure verdict: 1 when the query failed or reported a lost-work flag, else 0. A failed query
+# fails closed; its flags are not read (the union still holds the request, op 4 = GUILTY).
+fn native_ctx_state_lost(query_rc, flags): i64 {
+    if (query_rc != 0) { return 1; }
+    if ((flags & AMDGPU_CTX_QUERY2_FLAGS_LOST) != 0) { return 1; }
+    return 0;
+}
+
+fn _native_ctx_lost_now(fd, ctx_id): i64 {
+    var req[16];
+    var rc = native_ctx_query_state(fd, ctx_id, &req);
+    var flags = 0;
+    if (rc == 0) { flags = load64(&req + 0); }
+    return native_ctx_state_lost(rc, flags);
+}
+
+# After a successful wait: 0, or -ECANCELED (maps to GPU_ERR_DEVICE_LOST) when a reset hit the
+# context. `waited_ns` is how long the wait blocked. The kernel can signal a timed-out job
+# before it records the reset, so a slow completion settles 100 ms and asks again.
+fn native_ctx_check_reset(fd, ctx_id, waited_ns): i64 {
+    if (_native_ctx_lost_now(fd, ctx_id) != 0) { return 0 - _NATIVE_ERRNO_ECANCELED; }
+    if (waited_ns < _NATIVE_SLOW_WAIT_NS) { return 0; }
+    var ts[16];
+    var rem[16];
+    store64(&ts + 0, 0);
+    store64(&ts + 8, 100000000);
+    var slept = syscall(35, &ts, &rem);          # nanosleep
+    while (slept == 0 - 4) {                     # EINTR: finish the remaining settle
+        memcpy(&ts, &rem, 16);
+        slept = syscall(35, &ts, &rem);
+    }
+    if (_native_ctx_lost_now(fd, ctx_id) != 0) { return 0 - _NATIVE_ERRNO_ECANCELED; }
+    return 0;
+}
+
+# CLOCK_MONOTONIC in ns, or -1 if the clock read fails.
+fn _native_mono_ns(): i64 {
+    var t[16];
+    memset(&t, 0, 16);
+    if (syscall(228, 1, &t) != 0) { return 0 - 1; }
+    return load64(&t + 0) * 1000000000 + load64(&t + 8);
+}
+
+# Wait for `handle` to signal, then check `ctx_id` for a reset. Returns 0 or a negative errno
+# (-ECANCELED = the work was lost to a reset). A clock failure counts as a slow wait.
+fn native_syncobj_wait_checked(fd, ctx_id, handle, timeout_ns): i64 {
+    var t0 = _native_mono_ns();
+    var rc = native_syncobj_wait(fd, handle, timeout_ns);
+    if (rc != 0) { return rc; }
+    var t1 = _native_mono_ns();
+    var waited = _NATIVE_SLOW_WAIT_NS;
+    if (t0 >= 0) { if (t1 >= t0) { waited = t1 - t0; } }
+    return native_ctx_check_reset(fd, ctx_id, waited);
 }
 
 # BO list lifecycle. `entries` points to an array of
@@ -821,10 +906,24 @@ fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_t
 # Submit a CS using the full 4-chunk Mesa-rusticl shape:
 # BO_HANDLES + SYNCOBJ_OUT + FENCE + IB, with caller-provided IB flags.
 # This is the byte-shape that the working session-25b C spike uses
-# (deps/libdrm_store_spike_v3.c). The 3-chunk variant
-# native_cs_submit_inline_bos (without FENCE) accepts the submit ioctl
-# but never queues the IB to MEC for compute on this kernel — TDR fires
-# after 10s and the syncobj signals as if the IB completed.
+# (deps/libdrm_store_spike_v3.c), and the shape the production dispatch
+# paths submit; it matches Mesa, and the kernel writes the completion
+# seqno to the caller's fence BO.
+#
+# What is and is not established about the FENCE chunk: Session 24
+# (2026-04-27, kernel 6.18.24-lts) adopted this shape by changing four
+# things at once (FENCE chunk, 0xFFFFFFFF BO_HANDLES sentinels, IB flag
+# 0x08, BO priorities), so FENCE alone was never isolated. On kernel
+# 7.2.3 (2026-09-16, Cezanne) the 3-chunk native_cs_submit_inline_bos
+# (no FENCE, IB flags 0) DOES queue and complete compute IBs on MEC. A
+# compute-store-shaped PM4 stream (s_endpgm shader) submitted through it,
+# and programs/native_compute_spike.cyr, both finished in ~0 ms with no
+# ring timeout and their CP-side WRITE_DATA markers landing (the ablation
+# stream's marker after DISPATCH_DIRECT too); the spike also reads
+# AMDGPU_CTX_OP_QUERY_STATE2 flags = 0. The spike's earlier 3-chunk
+# failures came from its READABLE-only IB mapping and its signed `/`
+# PGM_LO/HI split, not from the missing chunk — see
+# docs/development/issues/2026-08-19-native-compute-spike-stale.md.
 #
 # Caller pre-builds bo_list_in (24 bytes) per native_cs_submit_inline_bos.
 # fence_kh = KMS handle of a BO mapped into the GPU VA space. The kernel
@@ -892,10 +991,9 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 }
 
 # v3.1 Q.3 — timeline-syncobj CS submit (queue-targeted path). Same
-# Mesa 4-chunk shape as native_cs_submit_4chunk (BO_HANDLES + FENCE + IB
-# — the FENCE chunk is what actually queues a compute IB to MEC on this
-# kernel; dropping it lets the syncobj signal on TDR instead of real
-# completion), but SYNCOBJ_OUT is swapped for a TIMELINE_SIGNAL chunk
+# Mesa 4-chunk shape as native_cs_submit_4chunk (BO_HANDLES + FENCE + IB;
+# its header records what is and is not established about the FENCE
+# chunk), but SYNCOBJ_OUT is swapped for a TIMELINE_SIGNAL chunk
 # and an optional TIMELINE_WAIT chunk is prepended for cross-ring
 # barriers (Q.4). Chunk order:
 #   BO_HANDLES, [TIMELINE_WAIT], TIMELINE_SIGNAL, FENCE, IB

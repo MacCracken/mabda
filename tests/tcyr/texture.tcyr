@@ -436,18 +436,39 @@ fn _t5_fmt_create_stub(ctx, w, h, fmt) {
     return 0xFA7;
 }
 
-fn _t5_wire(ctxbuf, bebuf) {
+# Byte size of the stack Backend each T.5 test wires: a local `var be[N]` is N BYTES,
+# and _t5_wire memsets BACKEND_SIZE (src/backend.cyr) into it. The declarations say
+# `var be[328]` literally because cyrius cannot size an array from BACKEND_SIZE (a
+# `var`), nor from an enum declared after src/lib.cyr's first 1024 globals. So:
+# _t5_wire refuses a buffer smaller than BACKEND_SIZE,
+# test_t5_backend_buffer_holds_backend_size fails if BACKEND_SIZE outgrows
+# _T5_BE_BYTES, and scripts/check-stack-array-sizing.py fails if a declaration
+# drifts from what is written into it. Until 4.1.3 both tests declared `var be[256]`
+# against BACKEND_SIZE = 328; that 72 B overrun was this suite's "leading NUL byte"
+# (docs/development/issues/2026-09-16-test-stack-array-overruns.md).
+var _T5_BE_BYTES = 328;
+
+fn _t5_wire(ctxbuf, bebuf, be_cap) {
     memset(ctxbuf, 0, GPU_CONTEXT_SIZE);
+    if (BACKEND_SIZE > be_cap) { return 0 - 1; }   # never write past the caller's buffer
     memset(bebuf, 0, BACKEND_SIZE);
     backend_set_slot(bebuf, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT, &_t5_fmt_create_stub);
     store64(ctxbuf + 32, bebuf);
     return 0;
 }
 
+fn test_t5_backend_buffer_holds_backend_size() {
+    assert(BACKEND_SIZE <= _T5_BE_BYTES, "_T5_BE_BYTES holds BACKEND_SIZE (grow it and be[] together)");
+    var ctx[176];
+    var small[8];
+    assert_eq(_t5_wire(&ctx, &small, 8), 0 - 1, "_t5_wire refuses a buffer below BACKEND_SIZE");
+    return 0;
+}
+
 fn test_gpu_texture_create_2d_dispatch() {
     var ctx[176];
-    var be[256];
-    _t5_wire(&ctx, &be);
+    var be[328];   # _T5_BE_BYTES
+    assert_eq(_t5_wire(&ctx, &be, _T5_BE_BYTES), 0, "wired a BACKEND_SIZE backend");
     _t5_fmt_count = 0;
     var got = gpu_texture_create_2d(&ctx, 64, 32, MABDA_TEXFMT_BC1);
     assert_eq(_t5_fmt_count, 1, "slot called once");
@@ -464,8 +485,8 @@ fn test_gpu_texture_create_2d_dispatch() {
 
 fn test_gpu_texture_create_2d_guards() {
     var ctx[176];
-    var be[256];
-    _t5_wire(&ctx, &be);
+    var be[328];   # _T5_BE_BYTES
+    assert_eq(_t5_wire(&ctx, &be, _T5_BE_BYTES), 0, "wired a BACKEND_SIZE backend");
     _t5_fmt_count = 0;
     assert_eq(gpu_texture_create_2d(0, 8, 8, MABDA_TEXFMT_RGBA8), 0, "null ctx -> 0");
     assert_eq(gpu_texture_create_2d(&ctx, 0, 8, MABDA_TEXFMT_RGBA8), 0, "zero w -> 0");
@@ -492,6 +513,7 @@ fn main() {
     test_caps_compression_bitset_round_trip();
     test_caps_supports_format();
     test_format_unsupported_error();
+    test_t5_backend_buffer_holds_backend_size();
     test_gpu_texture_create_2d_dispatch();
     test_gpu_texture_create_2d_guards();
     test_vertex_blend_opaque();

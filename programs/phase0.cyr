@@ -5,14 +5,44 @@
 # wgpu-native C API → device → buffer write → copy → map → verify,
 # plus texture/sampler/render-pipeline creation and (optional) timestamps.
 #
-# Selective includes (not `src/lib.cyr`) keep the object-mode build small
-# and avoid pulling in modules unrelated to this smoke test.
 # Full library via src/lib.cyr (canonical chain; the former selective
 # include list rotted as native deps grew — v3.2 T.8).
 include "src/lib.cyr"
 
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
+
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     # _cyrius_init() + alloc_init() already called from C main
@@ -23,11 +53,11 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     # Test 1: Create GPU context from pre-initialized handles
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     # Test 2: Create and release a storage buffer
     var device = gpu_ctx_device(_gpu_ctx);
@@ -36,46 +66,41 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var desc = wgpu_buffer_descriptor("test-buf", usage, 64, 0);
     var buf = wgpu_device_create_buffer(device, desc);
     if (buf == 0) {
-        syscall(1, 2, "FAIL: buffer creation\n", 22);
-        return 1;
+        return _fail("buffer creation");
     }
     wgpu_buffer_release(buf);
-    syscall(1, 1, "PASS: GPU buffer create+release\n", 32);
+    _pass("GPU buffer create+release");
 
     # Test 3: Write data to buffer
     var write_usage = WGPU_BUFFER_USAGE_STORAGE | WGPU_BUFFER_USAGE_COPY_DST | WGPU_BUFFER_USAGE_COPY_SRC;
     var write_desc = wgpu_buffer_descriptor("write-buf", write_usage, 32, 0);
     var write_buf = wgpu_device_create_buffer(device, write_desc);
     if (write_buf == 0) {
-        syscall(1, 2, "FAIL: write_buf is null\n", 24);
-        return 1;
+        return _fail("write_buf is null");
     }
     var data[32];
     store64(&data, 42);
     store64(&data + 8, 99);
     wgpu_queue_write_buffer(queue, write_buf, 0, &data, 16);
-    syscall(1, 1, "PASS: GPU buffer write\n", 23);
+    _pass("GPU buffer write");
 
     # Test 4: Round-trip — write → copy → map → verify (v1.0 criterion)
     var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
     var read_desc = wgpu_buffer_descriptor("read-buf", read_usage, 32, 0);
     var read_buf = wgpu_device_create_buffer(device, read_desc);
     if (read_buf == 0) {
-        syscall(1, 2, "FAIL: readback buffer create\n", 29);
-        return 1;
+        return _fail("readback buffer create");
     }
 
     # Encode a copy command: write_buf[0..16] → read_buf[0..16]
     var encoder = wgpu_device_create_command_encoder(device, "copy-enc");
     if (encoder == 0) {
-        syscall(1, 2, "FAIL: command encoder\n", 22);
-        return 1;
+        return _fail("command encoder");
     }
     wgpu_command_encoder_copy_buffer_to_buffer(encoder, write_buf, 0, read_buf, 0, 16);
     var cmd_buf = wgpu_command_encoder_finish(encoder, "copy-cmd");
     if (cmd_buf == 0) {
-        syscall(1, 2, "FAIL: command buffer finish\n", 28);
-        return 1;
+        return _fail("command buffer finish");
     }
 
     # Submit the copy command (C shim takes a single handle)
@@ -84,27 +109,23 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     # Map readback buffer synchronously, read, verify, unmap
     var map_status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, 16);
     if (map_status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
-        syscall(1, 2, "FAIL: buffer map\n", 17);
-        return 1;
+        return _fail("buffer map");
     }
     var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, 16);
     if (mapped == 0) {
-        syscall(1, 2, "FAIL: get mapped range\n", 23);
-        return 1;
+        return _fail("get mapped range");
     }
     var v0 = load64(mapped);
     var v1 = load64(mapped + 8);
     wgpu_buffer_unmap(read_buf);
 
     if (v0 != 42) {
-        syscall(1, 2, "FAIL: round-trip v0 mismatch\n", 29);
-        return 1;
+        return _fail("round-trip v0 mismatch");
     }
     if (v1 != 99) {
-        syscall(1, 2, "FAIL: round-trip v1 mismatch\n", 29);
-        return 1;
+        return _fail("round-trip v1 mismatch");
     }
-    syscall(1, 1, "PASS: GPU buffer round-trip (write+copy+map+verify)\n", 52);
+    _pass("GPU buffer round-trip (write+copy+map+verify)");
 
     # Cleanup
     wgpu_command_encoder_release(encoder);
@@ -118,27 +139,23 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     store64(&udata + 8, 0);
     var ub_bad_tag, ub_bad = uniform_buffer_new(device, queue, &udata, 12, "bad-ub");
     if (is_err_result(ub_bad_tag) == 0) {
-        syscall(1, 2, "FAIL: uniform_buffer_new(12) should be Err\n", 44);
-        return 1;
+        return _fail("uniform_buffer_new(12) should be Err");
     }
 
     # 5b: uniform_buffer_new accepts aligned size, allocates handle
     var ub_tag, ub = uniform_buffer_new(device, queue, &udata, 16, "good-ub");
     if (is_ok(ub_tag) == 0) {
-        syscall(1, 2, "FAIL: uniform_buffer_new(16) should be Ok\n", 43);
-        return 1;
+        return _fail("uniform_buffer_new(16) should be Ok");
     }
     var ub_ptr = ub;
     if (uniform_buffer_handle(ub_ptr) == 0) {
-        syscall(1, 2, "FAIL: uniform buffer handle is null\n", 36);
-        return 1;
+        return _fail("uniform buffer handle is null");
     }
     if (uniform_buffer_size(ub_ptr) != 16) {
-        syscall(1, 2, "FAIL: uniform buffer size mismatch\n", 35);
-        return 1;
+        return _fail("uniform buffer size mismatch");
     }
     uniform_buffer_release(ub_ptr);
-    syscall(1, 1, "PASS: typed uniform buffer (reject unaligned, accept aligned)\n", 62);
+    _pass("typed uniform buffer (reject unaligned, accept aligned)");
 
     # 5c: storage_buffer_new + metadata accessors
     var sdata[64];
@@ -152,24 +169,21 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var sb_bytes = storage_buffer_new(device, queue, &sdata, 64, "sb-new", 0);
     var sb = storage_buffer_wrap(storage_buffer_handle(sb_bytes), 64, 8, 8);
     if (storage_buffer_handle(sb) == 0) {
-        syscall(1, 2, "FAIL: storage buffer handle null\n", 33);
-        return 1;
+        return _fail("storage buffer handle null");
     }
     if (storage_buffer_count(sb) != 8) {
-        syscall(1, 2, "FAIL: storage buffer count\n", 27);
-        return 1;
+        return _fail("storage buffer count");
     }
     if (storage_buffer_capacity(sb) != 64) {
-        syscall(1, 2, "FAIL: storage buffer capacity\n", 30);
-        return 1;
+        return _fail("storage buffer capacity");
     }
 
-    # 5d: storage_buffer_write rejects write exceeding count
-    var too_big[16];
+    # 5d: storage_buffer_write rejects write exceeding count. 16 elements x 8 bytes = 128 bytes,
+    # sized so a regressed capacity guard reads its own buffer, not the adjacent stack.
+    var too_big[128];
     var over_tag, over = storage_buffer_write(queue, sb, &too_big, 16);
     if (is_err_result(over_tag) == 0) {
-        syscall(1, 2, "FAIL: storage_buffer_write over capacity should be Err\n", 55);
-        return 1;
+        return _fail("storage_buffer_write over capacity should be Err");
     }
 
     # 5e: storage_buffer_write accepts partial write within capacity
@@ -177,58 +191,49 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     store64(&partial, 99);
     var ok_tag, ok = storage_buffer_write(queue, sb, &partial, 2);
     if (is_ok(ok_tag) == 0) {
-        syscall(1, 2, "FAIL: storage_buffer_write partial should be Ok\n", 48);
-        return 1;
+        return _fail("storage_buffer_write partial should be Ok");
     }
     storage_buffer_release(sb);
-    syscall(1, 1, "PASS: typed storage buffer (metadata, capacity guard, partial write)\n", 69);
+    _pass("typed storage buffer (metadata, capacity guard, partial write)");
 
     # Test 6: GPU timestamps — feature detection + creation (if supported)
     if (gpu_timestamps_supported(device) == 1) {
         var ts_res_tag, ts_res = gpu_timestamps_new(device, queue, 4);
         if (is_ok(ts_res_tag) == 0) {
-            syscall(1, 2, "FAIL: gpu_timestamps_new returned Err despite feature\n", 54);
-            return 1;
+            return _fail("gpu_timestamps_new returned Err despite feature");
         }
         var ts = ts_res;
         if (gpu_timestamps_max_passes(ts) != 4) {
-            syscall(1, 2, "FAIL: gpu_timestamps max_passes\n", 32);
-            return 1;
+            return _fail("gpu_timestamps max_passes");
         }
         if (gpu_timestamps_query_set(ts) == 0) {
-            syscall(1, 2, "FAIL: gpu_timestamps query_set null\n", 36);
-            return 1;
+            return _fail("gpu_timestamps query_set null");
         }
         if (gpu_timestamps_resolve_buffer(ts) == 0) {
-            syscall(1, 2, "FAIL: gpu_timestamps resolve_buffer null\n", 41);
-            return 1;
+            return _fail("gpu_timestamps resolve_buffer null");
         }
         if (gpu_timestamps_read_buffer(ts) == 0) {
-            syscall(1, 2, "FAIL: gpu_timestamps read_buffer null\n", 38);
-            return 1;
+            return _fail("gpu_timestamps read_buffer null");
         }
         gpu_timestamps_release(ts);
-        syscall(1, 1, "PASS: GPU timestamps (feature check, create, release)\n", 54);
+        _pass("GPU timestamps (feature check, create, release)");
     } else {
         # Device doesn't have TIMESTAMP_QUERY enabled — verify the error path.
         var ts_res_tag, ts_res = gpu_timestamps_new(device, queue, 4);
         if (is_err_result(ts_res_tag) == 0) {
-            syscall(1, 2, "FAIL: expected Err when feature unsupported\n", 44);
-            return 1;
+            return _fail("expected Err when feature unsupported");
         }
-        syscall(1, 1, "SKIP: TIMESTAMP_QUERY not supported (error path verified)\n", 58);
+        _e2e_line(1, "SKIP: ", "TIMESTAMP_QUERY not supported (error path verified)");
     }
 
     # Test 7: Texture creation + view + upload (full round-trip)
     var tex = texture_create_rgba8(device, 4, 4, "test-tex-raw");
     if (tex == 0) {
-        syscall(1, 2, "FAIL: texture_create_rgba8 returned null\n", 41);
-        return 1;
+        return _fail("texture_create_rgba8 returned null");
     }
     var view = texture_view_create_rgba8(tex, "test-tex-view");
     if (view == 0) {
-        syscall(1, 2, "FAIL: texture_view_create_rgba8 returned null\n", 46);
-        return 1;
+        return _fail("texture_view_create_rgba8 returned null");
     }
     # Upload a solid-red 4×4 pattern (64 bytes = 4 × 4 × 4)
     var pixels[64];
@@ -243,42 +248,36 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     texture_upload_rgba8(queue, tex, &pixels, 4, 4);
     wgpu_texture_view_release(view);
     wgpu_texture_release(tex);
-    syscall(1, 1, "PASS: texture create + view + upload + release\n", 47);
+    _pass("texture create + view + upload + release");
 
     # Test 7b: texture_from_rgba convenience wrapper
     var t = texture_from_rgba(device, queue, &pixels, 4, 4, "conv-tex");
     if (t == 0) {
-        syscall(1, 2, "FAIL: texture_from_rgba returned null\n", 38);
-        return 1;
+        return _fail("texture_from_rgba returned null");
     }
     if (texture_handle(t) == 0) {
-        syscall(1, 2, "FAIL: convenience texture handle is null\n", 41);
-        return 1;
+        return _fail("convenience texture handle is null");
     }
     if (texture_view(t) == 0) {
-        syscall(1, 2, "FAIL: convenience texture view is null\n", 39);
-        return 1;
+        return _fail("convenience texture view is null");
     }
     if (texture_width(t) != 4) {
-        syscall(1, 2, "FAIL: texture_width stored incorrectly\n", 39);
-        return 1;
+        return _fail("texture_width stored incorrectly");
     }
     if (texture_height(t) != 4) {
-        syscall(1, 2, "FAIL: texture_height stored incorrectly\n", 40);
-        return 1;
+        return _fail("texture_height stored incorrectly");
     }
     texture_release(t);
-    syscall(1, 1, "PASS: texture_from_rgba convenience wrapper\n", 44);
+    _pass("texture_from_rgba convenience wrapper");
 
     # Test 7c: Sampler creation
     var samp_desc = sampler_descriptor(SAMPLER_LINEAR);
     var sampler = wgpu_device_create_sampler(device, samp_desc);
     if (sampler == 0) {
-        syscall(1, 2, "FAIL: wgpu_device_create_sampler returned null\n", 47);
-        return 1;
+        return _fail("wgpu_device_create_sampler returned null");
     }
     wgpu_sampler_release(sampler);
-    syscall(1, 1, "PASS: sampler create + release\n", 31);
+    _pass("sampler create + release");
 
     # Test 8: Render pipeline creation (full-screen triangle shader).
     # The full WGSL exceeds the 120-column line limit as a single literal,
@@ -294,22 +293,19 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var shader_desc = wgpu_shader_module_descriptor("triangle", shader_src);
     var shader_module = wgpu_device_create_shader_module(device, shader_desc);
     if (shader_module == 0) {
-        syscall(1, 2, "FAIL: shader module creation\n", 29);
-        return 1;
+        return _fail("shader module creation");
     }
     var rp = render_pipeline_create_simple(device, shader_module,
       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
     if (rp == 0) {
-        syscall(1, 2, "FAIL: render_pipeline_create_simple returned 0\n", 47);
-        return 1;
+        return _fail("render_pipeline_create_simple returned 0");
     }
     if (render_pipeline_handle(rp) == 0) {
-        syscall(1, 2, "FAIL: render pipeline handle is null\n", 37);
-        return 1;
+        return _fail("render pipeline handle is null");
     }
     render_pipeline_release(rp);
     wgpu_shader_module_release(shader_module);
-    syscall(1, 1, "PASS: render pipeline create + release\n", 39);
+    _pass("render pipeline create + release");
 
     # Test 11: v3 ctx-aware buffer dispatchers (Steps 3c/3d) against
     # real wgpu — validates the inlined staging-buffer + map-sync
@@ -317,8 +313,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var bb_usage = WGPU_BUFFER_USAGE_COPY_SRC | WGPU_BUFFER_USAGE_COPY_DST;
     var bb = gpu_buffer_create(_gpu_ctx, 64, bb_usage);
     if (bb == 0) {
-        syscall(1, 2, "FAIL: gpu_buffer_create returned 0\n", 36);
-        return 1;
+        return _fail("gpu_buffer_create returned 0");
     }
     var bb_in[64];
     var bi = 0;
@@ -328,22 +323,19 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     }
     var rc_w = gpu_buffer_write(_gpu_ctx, bb, 0, &bb_in, 64);
     if (rc_w != 0) {
-        syscall(1, 2, "FAIL: gpu_buffer_write rc != 0\n", 32);
-        return 1;
+        return _fail("gpu_buffer_write rc != 0");
     }
     var bb_out[64];
     memset(&bb_out, 0, 64);
     var rc_r = gpu_buffer_read(_gpu_ctx, bb, 0, &bb_out, 64);
     if (rc_r != 0) {
-        syscall(1, 2, "FAIL: gpu_buffer_read rc != 0\n", 31);
-        return 1;
+        return _fail("gpu_buffer_read rc != 0");
     }
     if (memeq(&bb_in, &bb_out, 64) == 0) {
-        syscall(1, 2, "FAIL: gpu_buffer_read data mismatch\n", 37);
-        return 1;
+        return _fail("gpu_buffer_read data mismatch");
     }
     gpu_buffer_release(_gpu_ctx, bb);
-    syscall(1, 1, "PASS: v3 gpu_buffer_create/write/read/release through ctx->backend\n", 68);
+    _pass("v3 gpu_buffer_create/write/read/release through ctx->backend");
 
     # Test 12: v3 ctx-aware texture dispatchers (Steps 5.7+5.5) against
     # real wgpu — mirrors Step 5.8's native_texture_e2e validation
@@ -354,8 +346,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var TN = TW * TH * 4;
     var gtex = gpu_texture_create_2d_rgba8(_gpu_ctx, TW, TH);
     if (gtex == 0) {
-        syscall(1, 2, "FAIL: gpu_texture_create_2d_rgba8 returned 0\n", 46);
-        return 1;
+        return _fail("gpu_texture_create_2d_rgba8 returned 0");
     }
     var tsrc = alloc(TN);
     var tdst = alloc(TN);
@@ -366,22 +357,19 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     }
     var trc_w = gpu_texture_write(_gpu_ctx, gtex, tsrc, TN);
     if (trc_w != 0) {
-        syscall(1, 2, "FAIL: gpu_texture_write rc != 0\n", 33);
-        return 1;
+        return _fail("gpu_texture_write rc != 0");
     }
     memset(tdst, 0, TN);
     var trc_r = gpu_texture_read(_gpu_ctx, gtex, tdst, TN);
     if (trc_r != 0) {
-        syscall(1, 2, "FAIL: gpu_texture_read rc != 0\n", 32);
-        return 1;
+        return _fail("gpu_texture_read rc != 0");
     }
     if (memeq(tsrc, tdst, TN) == 0) {
-        syscall(1, 2, "FAIL: gpu_texture_read bytes mismatch\n", 39);
-        return 1;
+        return _fail("gpu_texture_read bytes mismatch");
     }
     gpu_texture_release(_gpu_ctx, gtex);
-    syscall(1, 1, "PASS: v3 gpu_texture_create/write/read/release through ctx->backend\n", 70);
+    _pass("v3 gpu_texture_create/write/read/release through ctx->backend");
 
-    syscall(1, 1, "\n12 passed, 0 failed\n", 22);
+    _e2e_summary();
     return 0;
 }

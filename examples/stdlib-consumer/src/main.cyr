@@ -13,17 +13,16 @@
 # remains the default cross-vendor route. This source compiles unchanged
 # regardless of which backend the bundle is built for.
 #
-# Build (requires Cyrius 6.5.29+ and the wgpu-native binaries in deps/).
-# This example ships no deps/ dir — copy the launcher pieces from the
-# mabda repo root:
-#   cyrius deps                     # pulls mabda dist/mabda.cyr via cyrius.cyml
-#   cp <mabda>/deps/wgpu_main.c \
-#      <mabda>/deps/fetch-wgpu.sh deps/   # copy the reference launcher + fetcher
-#   sh deps/fetch-wgpu.sh           # one-time — pulls wgpu-native binaries
-#   # build the launcher object with the repo-root Makefile's
-#   # `deps/wgpu_main.o` target (gcc -c deps/wgpu_main.c -I<wgpu>/include)
-#   cyrius build                    # compiles this file to build/hello_gpu
-#   ./build/hello_gpu               # runs against a real GPU
+# Build (requires Cyrius 6.6.4+). This file has NO top-level entry: it is
+# compiled as an OBJECT and linked with the C launcher, whose main() runs
+# _cyrius_init + alloc_init and then calls mabda_main below. A plain
+# `cyrius build` makes a standalone ELF that never calls mabda_main — it
+# exits 0 and prints nothing. The exact recipe (the same object-mode + gcc
+# link the mabda Makefile uses for its wgpu programs) is in README.md:
+#   printf 'object;\n' | cat - src/main.cyr | cycc > build/hello_gpu.o
+#   objcopy -L memcpy -L memset ... build/hello_gpu.o   # full -L list in README
+#   gcc deps/wgpu_main.o build/hello_gpu.o \
+#       deps/wgpu-native/lib/libwgpu_native.a -lpthread -ldl -lm -o build/hello_gpu
 
 include "lib/string.cyr"
 include "lib/fmt.cyr"
@@ -39,13 +38,19 @@ include "lib/fnptr.cyr"
 include "lib/mmap.cyr"
 include "lib/sakshi.cyr"
 include "lib/dynlib.cyr"
+# thread_local.cyr defines thread_local_use_foreign_tls(), which the C launcher's
+# main() calls before mabda_main (deps/wgpu_main.c). Nothing on the Cyrius side
+# references it, so without this include the object still compiles clean and the
+# gcc link fails with an undefined reference. It arrives in lib/ through
+# dist/mabda.deps; mabda's own src/lib.cyr includes it for the same reason.
+include "lib/thread_local.cyr"
 
-# `cyrius deps` resolves [deps.mabda] from cyrius.cyml and symlinks
+# `cyrius deps` resolves [deps.mabda] from cyrius.cyml and copies
 # dist/mabda.cyr into lib/mabda.cyr for us.
 include "lib/mabda.cyr"
 
-# Entry point called by the C launcher AFTER _cyrius_init + alloc_init +
-# wgpu_ffi_init_table.
+# Entry point called by the C launcher AFTER _cyrius_init + alloc_init (+ foreign-TLS setup);
+# it wires the fn table itself via wgpu_ffi_init_table.
 fn mabda_main(fn_table_ptr, preinit_ptr) {
     color_init();
     wgpu_ffi_init_table(fn_table_ptr);
@@ -78,8 +83,16 @@ fn mabda_main(fn_table_ptr, preinit_ptr) {
     }
     syscall(1, 1, "hello_gpu: texture uploaded\n", 28);
 
-    # 3. Build a minimal render pipeline
-    var wgsl = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> { let x = f32(i32(i) - 1); let y = f32(i32(i & 1u) * 2 - 1); return vec4<f32>(x, y, 0.0, 1.0); } @fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }";
+    # 3. Build a minimal render pipeline. Cyrius has no adjacent-literal
+    # concatenation, so the WGSL is assembled in pieces to stay inside the
+    # 120-byte line limit (the same pattern programs/phase0.cyr uses).
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> ");
+    str_builder_add_cstr(sb, "@builtin(position) vec4<f32> { let x = f32(i32(i) - 1); ");
+    str_builder_add_cstr(sb, "let y = f32(i32(i & 1u) * 2 - 1); return vec4<f32>(x, y, 0.0, 1.0); } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main() -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return vec4<f32>(1.0, 0.0, 0.0, 1.0); }");
+    var wgsl = str_cstr(str_builder_build(sb));
     var src = wgpu_shader_source_wgsl(wgsl);
     var desc = wgpu_shader_module_descriptor("hello", src);
     var module = wgpu_device_create_shader_module(device, desc);

@@ -1,6 +1,6 @@
 # `native_spirv_saxpy_e2e` has been red since at least 4.0.5 — `gfx9_compile` returns `MIR_ERR_ID_OOR`
 
-**Status:** ✅ **FIXED in v4.0.11** — root-caused, repaired, HW-verified, and defended by
+**Status:** ✅ **FIXED in v4.1.0** — root-caused, repaired, HW-verified, and defended by
 both a runtime self-check and a static CI gate. See "Resolution" at the end.
 **Placement:** `src/mir.cyr` / `src/spirv_lower.cyr` / `src/gfx9_isel.cyr` — the same
 subsystem as [`2026-08-19-native-spirv-compile-limits.md`](2026-08-19-native-spirv-compile-limits.md),
@@ -181,7 +181,7 @@ self-describing, which is why they should be worked together.
 
 ---
 
-## Resolution (v4.0.11)
+## Resolution (v4.1.0)
 
 **Root cause.** `mir_mod_init` ends with `memset(vals, 0, cap_ids * MIR_VAL_REC)` — it
 writes the caller's full declared capacity into a buffer whose size it receives only as a
@@ -233,4 +233,4 @@ caller-supplied extent into a buffer they cannot measure. The runtime self-check
 the layout where the header sits directly after `vals`; the static gate covers the general
 case but only for literal sizes it can parse. Passing explicit buffer lengths would make the
 invalid state unrepresentable — that is an `@internal` signature change across ~113 call
-sites, and it is filed for v4.1.0 rather than smuggled into a patch.
+sites, and it is filed as its own cut rather than smuggled into this one.

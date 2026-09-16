@@ -1,0 +1,252 @@
+# programs/diagnostics/state_poison/state_poison.cyr — inherited-render-state
+# poisoning harness (diagnostic, NOT a gate; see README.md in this directory).
+#
+# Submits ONE register-only GFX IB on the native amdgpu path: a SET_CONTEXT_REG /
+# SET_UCONFIG_REG packet per register of a NAMED spec, then NOP padding to 256
+# dwords. No draw, no shader, no memory reference (three 4 KiB dummy GTT BOs fill
+# the render BO-list slots; nothing is mapped into or read by the IB).
+#
+# When the GPU carries context/UConfig register values from one submission to the
+# next (it does on the 4.1.3 Cezanne; verify with `coverage_scan canary` first),
+# the NEXT process's draw inherits these values — emulating fresh-boot clear
+# state (`clear`) or a hostile prior context (`wrong`). A render stream that
+# owns a register is immune; one that inherits it breaks.
+#
+# GPU safety: register/value pairs are compiled in, never taken from argv. Every
+# value below is either the kernel clear state (linux clearstate_gfx9.h), the
+# value radv writes on this GPU, or a value already negative-controlled on the
+# Cezanne without a ring timeout (4.1.3 audit). Registers whose wrong values can
+# fault or hang the GPU (CB_COLORn_INFO, stream-out, DFSM, TMPRING, RSRC3) are
+# only ever written with their clear value. Add a spec only with that evidence.
+#
+# usage: state_poison <spec>     (state_poison --list prints the specs)
+# exit:  0 submitted; 2 usage / unknown spec; 1 ctx; 3 BO; 4 submit rc != 0
+#
+# Addresses are real MMIO (gfx9.json register_mappings[].map.at, decimal in the
+# comments); context registers are emitted at map.at - 0x1E000 (the 0xA-shorthand
+# native_pm4_set_context_reg_one expects).
+
+include "src/lib.cyr"
+
+fn _sp_print(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn _sp_hex(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = ((v & 0xFFFFFFFF) >> ((7 - i) * 4)) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+var _SP_MAX = 64;
+
+# Append (mmio, value) to the spec arrays; returns the new count.
+fn _sp_add(regs, vals, n, mmio, val): i64 {
+    if (n >= _SP_MAX) { return n; }
+    store64(regs + n * 8, mmio);
+    store64(vals + n * 8, val);
+    return n + 1;
+}
+
+# SX_MRT0..7_BLEND_OPT (map.at 165728..165756) all set to `val`.
+fn _sp_sx_mrt(regs, vals, n, val): i64 {
+    var m = 0;
+    while (m < 8) {
+        n = _sp_add(regs, vals, n, 0x028760 + m * 4, val);
+        m = m + 1;
+    }
+    return n;
+}
+
+# Owned context registers whose clear value is also their only poison value
+# (fault/hang potential for any other value, or no known-safe alternative).
+fn _sp_clear_only(regs, vals, n): i64 {
+    n = _sp_add(regs, vals, n, 0x028804, 0);             # DB_EQAA              165892
+    n = _sp_add(regs, vals, n, 0x028C4C, 0);             # PA_SC_CONSERVATIVE_  166988
+    n = _sp_add(regs, vals, n, 0x028B94, 0);             # VGT_STRMOUT_CONFIG   166804
+    n = _sp_add(regs, vals, n, 0x028B98, 0);             # VGT_STRMOUT_BUFFER_  166808
+    var cb = 0;
+    while (cb < 7) {                                      # CB_COLOR1..7_INFO 167084 + 60k
+        n = _sp_add(regs, vals, n, 0x028CAC + cb * 0x3C, 0);
+        cb = cb + 1;
+    }
+    n = _sp_add(regs, vals, n, 0x028060, 0);             # DB_DFSM_CONTROL      163936
+    n = _sp_add(regs, vals, n, 0x0286E8, 0);             # SPI_TMPRING_SIZE     165608
+    n = _sp_add(regs, vals, n, 0x028A10, 0);             # VGT_OUTPUT_PATH_CNTL 166416
+    n = _sp_add(regs, vals, n, 0x028A14, 0);             # VGT_HOS_CNTL         166420
+    n = _sp_add(regs, vals, n, 0x028A50, 0);             # VGT_ENHANCE          166480
+    n = _sp_add(regs, vals, n, 0x028A70, 0);             # IA_ENHANCE           166512
+    n = _sp_add(regs, vals, n, 0x028A80, 0);             # WD_ENHANCE           166528
+    n = _sp_add(regs, vals, n, 0x028AB8, 0);             # VGT_VTX_CNT_EN       166584
+    n = _sp_add(regs, vals, n, 0x028A98, 0);             # VGT_DRAW_PAYLOAD_CNT 166552
+    n = _sp_add(regs, vals, n, 0x028840, 0);             # PA_STEREO_CNTL       165952
+    n = _sp_add(regs, vals, n, 0x02883C, 0);             # PA_SU_OVER_RASTERIZ  165948
+    n = _sp_add(regs, vals, n, 0x028820, 0);             # PA_CL_NANINF_CNTL    165920
+    n = _sp_add(regs, vals, n, 0x028358, 0);             # PA_SC_SCREEN_EXTENT_ 164696
+    n = _sp_add(regs, vals, n, 0x02835C, 0);             # PA_SC_TILE_STEERING_ 164700
+    return n;
+}
+
+# Fill the named spec. Returns the entry count, or -1 for an unknown name.
+fn sp_fill(name, regs, vals): i64 {
+    var n = 0;
+    if (streq(name, "vte0") == 1) {
+        return _sp_add(regs, vals, 0, 0x028818, 0);     # PA_CL_VTE_CNTL 165912
+    }
+    if (streq(name, "vte43f") == 1) {
+        return _sp_add(regs, vals, 0, 0x028818, 0x43F);
+    }
+    if (streq(name, "clear") == 1) {
+        # Kernel clear state (clearstate_gfx9.h) for every owned context register.
+        n = _sp_add(regs, vals, n, 0x028818, 0);
+        n = _sp_sx_mrt(regs, vals, n, 0);
+        n = _sp_add(regs, vals, n, 0x028B70, 0);         # DB_ALPHA_TO_MASK     166768
+        n = _sp_add(regs, vals, n, 0x028230, 0xAA99AAAA); # PA_SC_EDGERULE      164400
+        n = _sp_add(regs, vals, n, 0x028C5C, 0x20);      # VGT_OUT_DEALLOC_CNTL 167004
+        n = _sp_add(regs, vals, n, 0x028830, 0);         # PA_SU_SMALL_PRIM_FIL 165936
+        return _sp_clear_only(regs, vals, n);
+    }
+    if (streq(name, "wrong") == 1) {
+        # Benign wrong values, each negative-controlled on the Cezanne (4.1.3):
+        # VTE off, SX "src has no effect" hints 0x01100110, alpha-to-coverage on, edge rule 0,
+        # vertex-id clamp MAX=0 / MIN=1 / OFFSET=1, the pre-4.1.3 mabda dealloc
+        # distance 16, radv's small-prim filter enable.
+        n = _sp_add(regs, vals, n, 0x028818, 0);
+        n = _sp_sx_mrt(regs, vals, n, 0x01100110);
+        n = _sp_add(regs, vals, n, 0x028B70, 1);
+        n = _sp_add(regs, vals, n, 0x028230, 0);
+        n = _sp_add(regs, vals, n, 0x028C5C, 16);
+        n = _sp_add(regs, vals, n, 0x028830, 1);
+        n = _sp_clear_only(regs, vals, n);
+        n = _sp_add(regs, vals, n, 0x030920, 0);         # VGT_MAX_VTX_INDX     198944
+        n = _sp_add(regs, vals, n, 0x030924, 1);         # VGT_MIN_VTX_INDX     198948
+        return _sp_add(regs, vals, n, 0x030928, 1);      # VGT_INDX_OFFSET      198952
+    }
+    if (streq(name, "good") == 1) {
+        # The state radv leaves on this GPU (restore after an experiment).
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        n = _sp_sx_mrt(regs, vals, n, 0x06000600);
+        n = _sp_add(regs, vals, n, 0x028B70, 0);
+        n = _sp_add(regs, vals, n, 0x028230, 0xAA99AAAA);
+        n = _sp_add(regs, vals, n, 0x028C5C, 0x20);
+        n = _sp_add(regs, vals, n, 0x028830, 1);
+        n = _sp_add(regs, vals, n, 0x030920, 0xFFFFFFFF);
+        n = _sp_add(regs, vals, n, 0x030924, 0);
+        return _sp_add(regs, vals, n, 0x030928, 0);
+    }
+    # Single-register negative controls (VTE held at 0x43F so it is not the
+    # variable) and their restores.
+    if (streq(name, "n1-indxoff") == 1 || streq(name, "n1-restore") == 1) {
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        if (streq(name, "n1-indxoff") == 1) { return _sp_add(regs, vals, n, 0x030928, 1); }
+        return _sp_add(regs, vals, n, 0x030928, 0);
+    }
+    if (streq(name, "n2-maxindx") == 1 || streq(name, "n2-restore") == 1) {
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        if (streq(name, "n2-maxindx") == 1) { return _sp_add(regs, vals, n, 0x030920, 0); }
+        return _sp_add(regs, vals, n, 0x030920, 0xFFFFFFFF);
+    }
+    if (streq(name, "n2b-minindx") == 1 || streq(name, "n2b-restore") == 1) {
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        if (streq(name, "n2b-minindx") == 1) { return _sp_add(regs, vals, n, 0x030924, 1); }
+        return _sp_add(regs, vals, n, 0x030924, 0);
+    }
+    if (streq(name, "n3-sxopt") == 1 || streq(name, "n3-restore") == 1) {
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        if (streq(name, "n3-sxopt") == 1) { return _sp_add(regs, vals, n, 0x028760, 0x01100110); }
+        return _sp_add(regs, vals, n, 0x028760, 0x06000600);
+    }
+    if (streq(name, "n4-a2m") == 1 || streq(name, "n4-restore") == 1) {
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        if (streq(name, "n4-a2m") == 1) { return _sp_add(regs, vals, n, 0x028B70, 1); }
+        return _sp_add(regs, vals, n, 0x028B70, 0);
+    }
+    if (streq(name, "n5-sloc") == 1 || streq(name, "n5-restore") == 1) {
+        # PA_SC_AA_SAMPLE_LOCS_PIXEL_{X0Y0,X1Y0,X0Y1,X1Y1}_0 166904/166920/166936/166952
+        var loc = 0;
+        if (streq(name, "n5-sloc") == 1) { loc = 0x88888888; }
+        n = _sp_add(regs, vals, n, 0x028818, 0x43F);
+        n = _sp_add(regs, vals, n, 0x028BF8, loc);
+        n = _sp_add(regs, vals, n, 0x028C08, loc);
+        n = _sp_add(regs, vals, n, 0x028C18, loc);
+        return _sp_add(regs, vals, n, 0x028C28, loc);
+    }
+    return 0 - 1;
+}
+
+fn _sp_list(): i64 {
+    _sp_print("specs: vte0 vte43f clear wrong good n1-indxoff n1-restore n2-maxindx n2-restore\n");
+    _sp_print("       n2b-minindx n2b-restore n3-sxopt n3-restore n4-a2m n4-restore n5-sloc n5-restore\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    args_init();
+    if (argc() != 2) { _sp_print("usage: state_poison <spec> | --list\n"); return 2; }
+    var name = argv(1);
+    if (streq(name, "--list") == 1) { return _sp_list(); }
+    var regs = alloc(_SP_MAX * 8);
+    var vals = alloc(_SP_MAX * 8);
+    var count = sp_fill(name, regs, vals);
+    if (count <= 0) { _sp_print("unknown spec\n"); _sp_list(); return 2; }
+
+    var ctx_tag, ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_tag) == 1) { _sp_print("FAIL: native ctx\n"); return 1; }
+    var ctx = ctx_res;
+    var fd = native_ctx_fd(ctx);
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    memset(pm4, 0, _NATIVE_PM4_SCRATCH_BYTES);
+    var pos = 0;
+    var k = 0;
+    while (k < count) {
+        var reg = load64(regs + k * 8);
+        var val = load64(vals + k * 8);
+        if (reg >= 0x028000 && reg < 0x029000) {
+            pos = native_pm4_set_context_reg_one(pm4, pos, reg - 0x1E000, val);
+            _sp_print("  CTX  ");
+        } else {
+            pos = native_pm4_set_uconfig_reg_one(pm4, pos, reg, val);
+            _sp_print("  UCFG ");
+        }
+        _sp_hex(reg);
+        _sp_print(" <- ");
+        _sp_hex(val);
+        _sp_print("\n");
+        k = k + 1;
+    }
+    var cur = pos / 4;
+    if (cur < 256) { pos = native_pm4_nop(pm4, pos, 256 - cur); }
+
+    var b0[16];
+    var b1[16];
+    var b2[16];
+    if (native_bo_create_gtt(fd, 4096, &b0) != 0) { return 3; }
+    if (native_bo_create_gtt(fd, 4096, &b1) != 0) { return 3; }
+    if (native_bo_create_gtt(fd, 4096, &b2) != 0) { return 3; }
+    var handles[32];
+    native_render_handles_write(&handles, load64(&b0), load64(&b1), load64(&b2), 0);
+    var ts[16];
+    memset(&ts, 0, 16);
+    if (syscall(228, 1, &ts) != 0) { return 4; }
+    var deadline = load64(&ts) * 1000000000 + load64(&ts + 8) + 15000000000;
+    var rc = native_render_dispatch_simple(ctx, pm4, pos, &handles, deadline);
+    _sp_print("poison IB submitted rc=");
+    _sp_hex(rc);
+    _sp_print("\n");
+    native_bo_release_gtt(fd, load64(&b0), load64(&b0 + 8), 4096);
+    native_bo_release_gtt(fd, load64(&b1), load64(&b1 + 8), 4096);
+    native_bo_release_gtt(fd, load64(&b2), load64(&b2 + 8), 4096);
+    gpu_context_release(ctx);
+    if (rc != 0) { return 4; }
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

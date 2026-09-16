@@ -24,9 +24,9 @@ harden the wrapper, document the workaround, or both.
 
 | Version | Supported                                                |
 |---------|----------------------------------------------------------|
-| 4.0.x   | **Yes** — current release, receives security fixes       |
-| 3.4.x   | Yes — receives security fixes via back-ports on request  |
-| < 3.4   | No                                                       |
+| 4.1.x   | **Yes** — current release, receives security fixes       |
+| 4.0.x   | Yes — receives security fixes via back-ports on request  |
+| < 4.0   | No                                                       |
 
 ## Response Timeline
 
@@ -73,36 +73,51 @@ close rather than at every patch. Every patch that fixes a latent bug
 lands with a CPU regression assertion in the matching
 `tests/tcyr/<domain>.tcyr` suite so the bug can't re-enter.
 
-**Since 4.0.1 (2026-07-02)** the 4.0.x line has been maintenance and
-consumer-facing work — NVIDIA multi-BO (4.0.7), toolchain/dep currency
-(4.0.3, 4.0.6, 4.0.8, 4.0.9, 4.0.10) — with no new untrusted-input
-surface, so no new full audit has been filed. The next one is due with
-the v4.0.11 native SPIR-V→GFX9 repairs, which do touch a parser
-consuming consumer-supplied SPIR-V (see
-[`docs/development/issues/`](docs/development/issues/)).
+**Since 4.0.1 (2026-07-02)** no new full audit has been filed. The 4.0.x
+line was maintenance and consumer-facing work — NVIDIA multi-BO (4.0.7),
+toolchain/dep currency (4.0.3, 4.0.6, 4.0.8, 4.0.9, 4.0.10) — with no new
+untrusted-input surface. The 4.1.x line changes that: 4.1.0 extended the
+native SPIR-V→GFX9 compiler, which parses consumer-supplied SPIR-V (see
+[`docs/development/issues/`](docs/development/issues/)). 4.1.1–4.1.3 are
+toolchain cuts (the cyrius 6.6.0 `Result` value form, then the 6.6.2 and
+6.6.4 pins), but 4.1.2 also moved two dependencies: chitra 0.3.1 → 1.0.3,
+the PNG/JPEG decoder untrusted image bytes flow through, and samvada
+0.4.1 → 1.0.1, the native dbus client (including SCM_RIGHTS fd passing).
+The next audit is due and should cover the compiler and both dependency
+moves.
 
 ## Design Principles
 
 - **No memory-unsafe primitives** — Cyrius has no raw pointer
   arithmetic in user code; struct access is `load64`/`store64` with
   named offset constants documented per module
-- **No libc** — all syscalls go through the Cyrius stdlib or the C
-  launcher; mabda's own source has one direct syscall
-  (`clock_gettime` in the profiler, return-value-guarded since 2.3.0)
-- **No I/O** — mabda does not touch the filesystem or network
+- **No libc in mabda's own code** — syscalls go through the Cyrius
+  stdlib or are made directly: the native AMD/NVIDIA backends issue
+  DRM ioctls, DRM event reads and `clock_gettime` with no libdrm, and
+  diagnostics are written straight to stdout/stderr; libc enters only
+  through consumer-linked C such as the wgpu launcher
+- **No I/O beyond the GPU device nodes** — the native backends open
+  `/dev/dri/renderD*` / `/dev/dri/card*`; mabda does no other filesystem
+  or network I/O, and the image loaders take caller-supplied byte
+  buffers
 - **Input validation at consumer boundaries** — every function
   accepting consumer-supplied dimensions, sizes, or descriptor
   fields validates bounds before use; `a * b` on sizes is
   overflow-guarded; `/` on divisors is zero-guarded
-- **`fncall6` avoidance** — wgpu-native calls with 6+ i64 args go
-  through C struct-packing shims to avoid the Cyrius `fncall6` +
-  wgpu-native ABI crash
+- **Struct-packing shims only where the ABI needs them** — wgpu-native
+  callees taking a struct-by-value, a `float`/`double`, or variadic
+  args go through C shims in `deps/wgpu_main.c`; scalar-arg entry
+  points are called directly via `fncallN` (N ≤ 8), including the
+  6-arg ones un-shimmed at 4.0.2 (the old "6+ i64 args crash" was a
+  `%fs`/TLS misdiagnosis)
 - **Audit-driven regressions** — every fix from an audit pass lands
-  with an assertion in `tests/tcyr/mabda.tcyr` that would have caught
-  the original bug
-- **No vendored dependencies** — mabda tracks the installed Cyrius
-  toolchain via a `lib/` symlink; wgpu-native is consumer-provided
-  at the edge
+  with an assertion in the matching `tests/tcyr/<domain>.tcyr` suite
+  that would have caught the original bug
+- **No vendored dependencies** — the Cyrius toolchain is pinned in
+  `cyrius.cyml`; `cyrius deps` resolves the stdlib + git deps into a
+  real (gitignored) `lib/` directory, with deps pinned by tag and
+  hash-locked in `cyrius.lock`; wgpu-native is consumer-provided at
+  the edge
 
 ## Disclosure
 

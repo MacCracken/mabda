@@ -1,6 +1,6 @@
 # Usage Guide
 
-> Written against mabda 4.1.0 / Cyrius 6.5.29. See
+> Written against mabda 4.1.3 / Cyrius 6.6.4. See
 > [`docs/stdlib-integration.md`](../stdlib-integration.md) for
 > consumer-project setup (manifest, deps, launcher build rule), and
 > [`render-graph.md`](render-graph.md) if you want to orchestrate
@@ -14,7 +14,7 @@ Pull mabda in as a dep in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.0"
+tag = "4.1.3"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -130,9 +130,7 @@ var wgsl = "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@c
 
 var cp = compute_pipeline_new(device, wgsl, "main", 1);
 # Create bind group, then dispatch. compute_dispatch takes a pointer to
-# 12 bytes holding three packed u32 workgroup counts (x@+0, y@+4, z@+8) —
-# a 5-parameter signature; a 7-param form that fncalls into wgpu segfaults
-# (see the note in src/compute.cyr).
+# 12 bytes holding three packed u32 workgroup counts (x@+0, y@+4, z@+8).
 var dims[12];
 store32(&dims, workgroups_1d(count, 64));   # x
 store32(&dims + 4, 1);                       # y

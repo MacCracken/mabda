@@ -57,28 +57,28 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
 
 - **Cyrius stdlib** — declared in `cyrius.cyml`, resolved into `lib/` by
   `cyrius deps`
-- **`chitra` (AGNOS dep)** — pure-Cyrius PNG decoder. Pinned via
-  `[deps.chitra]` in `cyrius.cyml`; `asset_load.cyr` decodes through it
-  to RGBA8. Its bundle excludes its own stdlib deps, so mabda provides
+- **`chitra` (AGNOS dep)** — pure-Cyrius image decoder (mabda uses its
+  PNG and baseline-JPEG paths). Pinned via `[deps.chitra]` in
+  `cyrius.cyml`; `asset_load.cyr` decodes through it to RGBA8. Its bundle excludes its own stdlib deps, so mabda provides
   `thread` + `sankoch`. **Consumers of mabda's dist must likewise add
   `[deps.chitra]` + `thread`/`sankoch`** (the samvada-style pattern).
 - **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
-  delegation. Pinned via `[deps.samvada]` in `cyrius.cyml`. mabda
-  doesn't link libsystemd directly — consumer programs link
-  `samvada/deps/samvada_main.c` which calls into `samvada_main(table)`
-  to populate the static fn-table that mabda's `_native_logind` slot
-  reads from.
+  delegation. Pinned via `[deps.samvada]` in `cyrius.cyml`. Since
+  samvada 1.0 it speaks dbus natively in Cyrius: the consumer calls
+  `samvada_native_init()` to populate the fn-table that
+  `gpu_surface_configure_native_logind` reads through (only compiled
+  under `-D MABDA_LOGIND`). mabda never initializes samvada itself.
 - **wgpu-native v29** — external C library, downloaded by consumers
   alongside their `deps/wgpu_main.c` launcher. Not a Cyrius dep. The AMD
   *route* through it is deprecated at v4.0.1 (a `gpu_context_from_preinit`
   vendorID guard warns but still allows AMD-on-wgpu; `-D MABDA_AMD_WGPU_STRICT`
   hard-rejects). The binding stays for NVIDIA + Intel until the wgpu+C
   path leaves the tree at v5.1; full AMD retirement is deferred.
-- **libsystemd** — needed by samvada's C shim. Consumer-provided link,
-  not a mabda direct dep. Its v4.0.1 drop was **deferred under the
-  roadmap escape hatch**: the samvada C shim survives into v4.x until a
-  pure-Cyrius dbus replacement ships (samvada 1.0), then mabda swaps via
-  a one-line `[deps.samvada]` tag bump.
+- **libsystemd** — no longer required. samvada 1.0.x keeps its
+  libsystemd C shim only as an opt-in fallback and plans to delete it at
+  samvada 1.1.0. That deletion waits on a mabda live-bus end-to-end run
+  of the logind path from a seated session, which has not been done
+  (roadmap backlog).
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
@@ -87,8 +87,8 @@ them against the installed toolchain.
 
 `lib/` is a **real directory** populated by `cyrius deps` — it contains
 per-module copies of the stdlib files declared in `[deps].stdlib`, plus
-symlinks into `~/.cyrius/deps/<pkg>/<ver>/dist/` for bundled deps
-(`mabda.cyr`, `patra.cyr`, `sakshi.cyr`, `sigil.cyr`, etc.). It is
+copies of the git-dep bundles cached under `~/.cyrius/deps/<pkg>/<ver>/`
+(`samvada.cyr`, `chitra.cyr`). It contains no symlinks. It is
 gitignored (`/lib/` in `.gitignore`) — a build artifact, not source.
 
 **NEVER** replace `lib/` with a symlink to a cyrius checkout (e.g.
@@ -115,7 +115,7 @@ the `cyrius` repo, cut a release, bump `cyrius = "x.y.z"` in
 ## Quick Start
 
 ```bash
-cyrius deps                                          # resolve stdlib + samvada into lib/
+cyrius deps                                          # resolve stdlib + samvada + chitra into lib/
 cyrius build programs/smoke.cyr build/mabda_smoke    # link-check
 make test                                            # globs all tests/tcyr/*.tcyr
 cyrius bench tests/bcyr/mabda.bcyr                   # CPU benchmarks
@@ -129,16 +129,21 @@ make test-native-present-e2e                         # 120-frame animated presen
 make bench-gpu                                       # GPU benchmarks (wgpu only today)
 ```
 
-**Test counting gotcha:** `texture.tcyr`'s summary line has a leading
-NUL byte, so `make test | grep` (or `awk`) treats it as binary and
-silently drops texture's assertions. Use
-`./scripts/count-test-assertions.sh` (strips NULs + runs per-file) for
-an accurate total; the trap has fooled humans and review agents alike.
+**Test counting:** use `./scripts/count-test-assertions.sh`. It runs
+each suite on its own, gates on its exit code, and counts only
+well-formed `N passed, 0 failed` summaries, so a crashing suite is
+named instead of silently undercounted. `make test | grep` can't do
+that. History: `texture.tcyr`'s summary used to start with a NUL byte
+that made grep drop it. The NUL came from a stack-array overrun
+(`var be[256]` filled with 328 bytes). It disappeared when cyrius
+6.3.15 moved array locals onto the stack; the overrun was fixed in 4.1.3
+(`docs/development/issues/2026-09-16-test-stack-array-overruns.md`).
 
 ## FFI Architecture
 
-mabda has two GPU paths and one auxiliary dbus path; each uses the
-fn-table-via-C-shim pattern.
+mabda has a wgpu path, native AMD and NVIDIA paths, and one auxiliary
+dbus path. Only the wgpu path goes through a C shim; the native paths
+issue ioctls directly, and samvada fills its fn-table in Cyrius.
 
 ### wgpu path (`deps/wgpu_main.c`)
 
@@ -171,19 +176,20 @@ Compute / render / surface ioctls go directly through
 - **PRIME bridge** between the two fds for the surface FB story (see
   `phase_d_prime_cross_fd_handle_bridge` vidya entry).
 
-### samvada path (`samvada/deps/samvada_main.c`)
+### samvada path (`-D MABDA_LOGIND`)
 
-Consumer programs that use `gpu_surface_configure_native_logind` link
-`samvada/deps/samvada_main.c` alongside their wgpu launcher. Same
-fn-table pattern:
+Consumer programs that use `gpu_surface_configure_native_logind` must
+initialize samvada first. Same fn-table pattern, no C:
 
-1. C `main()` builds the samvada sd_bus_* table and calls
-   `samvada_main(table)` to populate samvada's static reference.
-2. Cyrius calls `samvada_session_take_device(major, minor)` etc. via
-   fncall through the table.
-3. mabda's `_backend_native_surface_configure_logind` slot reads the
-   master fd back from samvada and stashes on
-   `gpu_ctx_native_card_fd` for the slot dispatch.
+1. The consumer calls `samvada_native_init()` (samvada >= 1.0). This
+   populates samvada's fn-table with its pure-Cyrius dbus backend. The
+   libsystemd C shim (`samvada_shim_init()`) is an opt-in fallback.
+2. `gpu_surface_configure_native_logind` (`src/surface_v3.cyr`) calls
+   `samvada_session_take_device(major, minor)` through that table. If
+   samvada was never initialized it gets -22 and returns 0, so the
+   consumer can fall back to the kiosk path.
+3. With the master fd in hand it dispatches
+   `BACKEND_SLOT_SURFACE_CONFIGURE`, and releases the device on failure.
 
 ### CPU testing (no GPU, no master, no dbus)
 
@@ -202,11 +208,10 @@ struct-shape tests at the Cyrius layer. HW gates live in the
   `bump_allocator_exhaustion_in_tests` vidya entry).
 - **Own the stack** — every external dep is either an AGNOS package
   (samvada, sakshi, patra, sigil, chitra) or a consumer-provided C
-  library (wgpu-native, libsystemd-via-samvada). The AMD wgpu *route*
-  is deprecated at v4.0.1 (warn+allow; strict flag enforces; binding
-  stays to v5.1); libsystemd's drop is
-  deferred under the roadmap escape hatch (samvada C shim survives into
-  v4.x pending a pure-Cyrius dbus 1.0).
+  library (wgpu-native). The AMD wgpu *route* is deprecated at v4.0.1
+  (warn+allow; strict flag enforces; binding stays to v5.1). libsystemd
+  left the required set with samvada 1.0's native dbus (pinned since
+  4.1.2).
 - **No magic** — every operation measurable, auditable, traceable.
 - **Manual memory** — `alloc / store64 / load64`. Every struct has a
   header comment block with field offsets.

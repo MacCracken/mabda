@@ -45,13 +45,18 @@
 #  10. CPU-read pixel(0,0) via `load64(rt + NATIVE_RT_FIELD_ADDR)` —
 #      native RT BO is GTT-mapped, so pixel data is directly
 #      CPU-visible. Verify (0xFF, 0x00, 0x00, 0xFF) — exact RGBA8_UNORM
-#      round-trip of the FS's (1.0, 0.0, 0.0, 1.0) export.
+#      round-trip of the FS's (1.0, 0.0, 0.0, 1.0) export. Then scan
+#      EVERY pixel of the RT: the fullscreen triangle must cover all
+#      W*H pixels (four corners + center + interior are printed). A
+#      pixel(0,0)-only check false-passed when PA_CL_VTE_CNTL was never
+#      written: with the viewport transform off the triangle rasterized
+#      in raw pixel space and ONLY pixel (0,0) was red (4.1.3 finding).
 #  11. Teardown: gpu_render_pipeline_release, gpu_render_target_release,
 #      manual va_unmap + bo_release for the caller-owned shader BOs,
 #      gpu_context_release.
 #
 # Exit codes:
-#   0   — pixel(0,0) verified red; native render path live
+#   0   — every RT pixel verified red; native render path live
 #   1   — gpu_context_new_native failed
 #   2   — VS shader BO setup failed
 #   3   — FS shader BO setup failed
@@ -64,6 +69,9 @@
 #   9   — pixel(0,0) green byte non-zero
 #   10  — pixel(0,0) blue byte non-zero
 #   11  — pixel(0,0) alpha byte mismatch
+#   12  — pixel(0,0) correct but full-RT coverage failed: at least one
+#         of the W*H pixels is not (0xFF, 0x00, 0x00, 0xFF) (viewport /
+#         rasterizer state — e.g. PA_CL_VTE_CNTL not programmed)
 #
 # What can fail on HW (most likely first):
 #
@@ -110,6 +118,59 @@ fn print_hex32(v): i64 {
     }
     syscall(1, 1, &buf, 10);
     return 0;
+}
+
+# Full-RT coverage scan. Every pixel of the W*H RGBA8 RT must equal `want`
+# (little-endian u32 of the 4 bytes). Prints the four corners, the center and
+# an interior probe, the first few mismatches, the mismatch count and the
+# bounding box of matching pixels. Returns the mismatch count.
+fn rt_scan_solid(rt_addr, W, H, want): i64 {
+    var probes[48];   # 6 (x, y) pairs as u32: 4 corners + center + interior
+    store32(&probes + 0, 0);       store32(&probes + 4, 0);
+    store32(&probes + 8, W - 1);   store32(&probes + 12, 0);
+    store32(&probes + 16, 0);      store32(&probes + 20, H - 1);
+    store32(&probes + 24, W - 1);  store32(&probes + 28, H - 1);
+    store32(&probes + 32, W / 2);  store32(&probes + 36, H / 2);
+    store32(&probes + 40, W / 3);  store32(&probes + 44, (H * 2) / 3);
+    var pi = 0;
+    while (pi < 6) {
+        var qx = load32(&probes + pi * 8);
+        var qy = load32(&probes + pi * 8 + 4);
+        print_cstr("  probe ("); print_i64(qx); print_cstr(","); print_i64(qy);
+        print_cstr(") = "); print_hex32(load32(rt_addr + (qy * W + qx) * 4));
+        print_cstr("\n");
+        pi = pi + 1;
+    }
+    var bad = 0;
+    var minx = W;
+    var miny = H;
+    var maxx = -1;
+    var maxy = -1;
+    var y = 0;
+    while (y < H) {
+        var x = 0;
+        while (x < W) {
+            var got = load32(rt_addr + (y * W + x) * 4);
+            if (got == want) {
+                if (x < minx) { minx = x; }
+                if (y < miny) { miny = y; }
+                if (x > maxx) { maxx = x; }
+                if (y > maxy) { maxy = y; }
+            } else {
+                if (bad < 4) {
+                    print_cstr("  MISMATCH ("); print_i64(x); print_cstr(","); print_i64(y);
+                    print_cstr(") got="); print_hex32(got); print_cstr("\n");
+                }
+                bad = bad + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    print_cstr("coverage: "); print_i64(W * H - bad); print_cstr("/"); print_i64(W * H);
+    print_cstr(" px expected, bbox=("); print_i64(minx); print_cstr(","); print_i64(miny);
+    print_cstr(")-("); print_i64(maxx); print_cstr(","); print_i64(maxy); print_cstr(")\n");
+    return bad;
 }
 
 fn mono_ns(): i64 {
@@ -263,7 +324,7 @@ fn main(): i64 {
 
     var exit_rc = 0;
     if (r != 0xFF) {
-        print_cstr("FAIL: red != 0xFF (got 0x"); print_hex32(r);
+        print_cstr("FAIL: red != 0xFF (got "); print_hex32(r);
         print_cstr(") — suspect post-draw cache flush or pipeline state\n");
         exit_rc = 8;
     }
@@ -281,6 +342,15 @@ fn main(): i64 {
     }
     if (exit_rc == 0) {
         print_cstr("PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)\n");
+        # Full-RT coverage: the fullscreen triangle must write every pixel.
+        var n_bad = rt_scan_solid(rt_addr, W, H, 0xFF0000FF);
+        if (n_bad != 0) {
+            print_cstr("FAIL: "); print_i64(n_bad);
+            print_cstr(" pixels not red — fullscreen triangle did not cover the RT\n");
+            exit_rc = 12;
+        } else {
+            print_cstr("PASS: all W*H pixels = (0xFF, 0x00, 0x00, 0xFF)\n");
+        }
     }
 
     # ---- 11. Teardown ----

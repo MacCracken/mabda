@@ -7,28 +7,35 @@
 # the IB via a CP-side WRITE_DATA proof-of-execution packet.
 #
 # The shader does nothing (s_endpgm is a single-instruction no-op
-# that just terminates the wave). The dispatch reaching s_endpgm is
-# not directly observable, but the CP-side WRITE_DATA at PM4 offset 0
-# IS — if it lands in stub[0] post-submit, the CP processed our IB.
-# That distinguishes real completion from AMDGPU TDR (the kernel
-# resetting our ring after 10s and signalling the syncobj as if
-# completed).
+# that just terminates the wave). Two proofs make the PASS honest:
+#   1. The CP-side WRITE_DATA at PM4 offset 0 lands 0xCAFEBABE in
+#      stub[0] — the CP fetched and executed our IB.
+#   2. The context's AMDGPU_CTX_OP_QUERY_STATE2 flags are 0 after the
+#      wait — the syncobj was not signalled by a kernel ring reset.
+# Proof 1 alone is NOT enough: the marker runs before DISPATCH_DIRECT,
+# so a dispatch that hangs still leaves it in place. On kernel 7.2 the
+# compute job times out after ~2 s, the ring reset succeeds and the
+# syncobj signals with no error — a hung dispatch looked like a PASS
+# with a 2 s latency. Only the reset flag (proof 2) catches that.
 #
 # Submission uses the BO_HANDLES chunk path (Mesa rusticl pattern),
 # not the BO_LIST_OP_CREATE ioctl. Session 9 (2026-04-23) showed the
 # BO_LIST path returns success at every layer but the CP never sees
-# the IB; switching to BO_HANDLES is the runbook fix.
+# the IB; switching to BO_HANDLES is the runbook fix. This program is
+# the only hardware caller of native_cs_submit_inline_bos (3 chunks,
+# no FENCE); the production path uses native_cs_submit_4chunk.
 #
 # Exit codes:
-#   0  — dispatch completed AND WRITE_DATA landed (CP ran the IB)
+#   0  — dispatch completed, WRITE_DATA landed, and no reset was reported
 #   1  — open fd failed
 #   2  — shader BO setup failed
 #   3  — IB BO setup failed
 #   4  — context alloc failed
 #   6  — syncobj create failed
-#   7  — CS ioctl failed
+#   7  — CS ioctl failed (COMPUTE ring; there is no fallback ring)
 #   8  — syncobj wait failed (including timeout)
-#   9  — syncobj signalled but stub[0] != 0xCAFEBABE (TDR false positive)
+#   9  — syncobj signalled but stub[0] != 0xCAFEBABE (CP never ran the IB)
+#   10 — context state query failed, or reported a reset during the dispatch
 
 include "src/lib.cyr"
 
@@ -75,8 +82,7 @@ fn main(): i64 {
     native_gfx9_shader_endpgm(shader_map, 0);
     # GFX9 shader VA lives in the canonical-high-VA "shader aperture"
     # starting at 0xFFFF_8001_0000_0000 (verified via Mesa strace).
-    # PGM_HI=0x80 implies bits 47:40 of VA; bits 39:32 are an implicit
-    # 0x01 in this aperture.
+    # PGM_LO/PGM_HI carry VA bits 39:8 / 47:40 — see the PM4 block below.
     var shader_va = 0xFFFF800100000000;
     rc = native_gem_va_map(fd, shader_handle, shader_va, shader_size,
       AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
@@ -89,7 +95,7 @@ fn main(): i64 {
     print_cstr(" va=0x"); print_i64(shader_va); print_cstr("\n");
 
     # ---- Stub data BO at VA 0x200000 ----
-    # Per gpu-coredump analysis (docs/issues/2026-04-21-gfx9-store-blocker.md
+    # Per gpu-coredump analysis (docs/archive/issues/2026-04-21-gfx9-store-blocker.md
     # Session 5): the HW dereferences s[0:3] as a scratch V# during
     # dispatch setup. With zero-valued USER_DATA → zero V# base → VA 0
     # fault. Mesa satisfies this by pointing USER_DATA_0 at a valid low
@@ -144,34 +150,38 @@ fn main(): i64 {
     #   12. COMPUTE_RESOURCE_LIMITS
     #   13. COMPUTE_NUM_THREAD_X + Y + Z
     #   14. DISPATCH_DIRECT
-    # PM4 buffer sized for the gfx9 minimum IB alignment of 256 DW (1 KiB).
-    # Both gfx_v9_0_ring_funcs_gfx and _compute set align_mask = 0xff in the
-    # kernel — userspace IBs whose length-in-DW isn't a multiple of 256 are
-    # silently rejected at CP fetch (no dmesg, fence still signals after
-    # the 10s lockup_timeout). Allocating exactly 1 KiB and padding the
-    # tail with NOPs keeps everyone happy.
+    # PM4 buffer is 1 KiB and the stream is NOP-padded to 256 DW. The pad is
+    # a fixed layout choice, not a kernel requirement: the production
+    # composers submit 64-DW IBs, and on 2026-09-16 (kernel 7.2.3) a 66-DW
+    # IB and a 256-DW IB behaved identically on this path.
     var pm4 = alloc(1024);
     memset(pm4, 0, 1024);
     var pos = 0;
     # 0. WRITE_DATA proof-of-execution. PKT3 IT_WRITE_DATA writes a constant
     # to a CPU-readable BO from the CP itself, before any compute state is
     # touched. If the post-submit readback shows the sentinel, the CP did
-    # process the IB. If it stays at zero, the bug is in CS submission, not
-    # PM4 / shader / dispatch. See Session 9 handoff (2026-04-23) and the
-    # `feedback_verify_gpu_actually_ran` memory.
+    # process the IB. If it stays at zero, the CP never executed the IB —
+    # look at CS submission and the IB mapping (see the IB perms below), not
+    # the shader or the dispatch. See the Session 9 handoff (2026-04-23).
     # Header: type=3, count=3 (3+1=4 payload dwords), opcode=IT_WRITE_DATA(0x37).
     # Control: DST_SEL=MEM_ASYNC(5)<<8 | WR_ONE_ADDR(1<<16) | WR_CONFIRM(1<<20).
     store32(pm4 + pos +  0, 0xC0033700);
     store32(pm4 + pos +  4, 0x00110500);
     store32(pm4 + pos +  8, stub_va & 0xFFFFFFFF);
-    store32(pm4 + pos + 12, (stub_va / 0x100000000) & 0xFFFFFFFF);
+    store32(pm4 + pos + 12, (stub_va >> 32) & 0xFFFFFFFF);
     store32(pm4 + pos + 16, 0xCAFEBABE);
     pos = pos + 20;
-    # GFX9 encoding (Mesa-verified): PGM_LO = VA[31:0], PGM_HI = VA[47:40].
-    # Bits 39:32 are an implicit 0x01 via the GFX9 shader aperture — not
-    # encoded in PGM_LO/HI. For VA 0xFFFF_8001_0000_0000: PGM_LO=0, PGM_HI=0x80.
-    var pgm_lo = shader_va & 0xFFFFFFFF;
-    var pgm_hi = (shader_va / 0x10000000000) & 0xFF;
+    # GFX9 encoding: PGM_LO = VA[39:8], PGM_HI = VA[47:40]; the HW fetches
+    # the shader from (PGM_HI << 40) | (PGM_LO << 8). For VA
+    # 0xFFFF_8001_0000_0000: PGM_LO = 0x01000000, PGM_HI = 0x80. Use `>>`,
+    # never `/`: Cyrius `/` is signed, and this canonical-high VA is negative
+    # as an i64, so `va / 2^40` truncates toward zero and gives PGM_HI = 0x81.
+    # This program shipped with `va & 0xFFFFFFFF` / `va / 2^40` (PGM_LO = 0,
+    # PGM_HI = 0x81) — a wave launched at an unmapped address. On 2026-09-16
+    # that hung the dispatch: ~2 s compute ring timeout, ring reset, context
+    # reset flag set (same fix as native_compute_store, Session 25b).
+    var pgm_lo = (shader_va >> 8) & 0xFFFFFFFF;
+    var pgm_hi = (shader_va >> 40) & 0xFF;
     # 1. PGM_HI (early — before preamble in Mesa's dump).
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_HI, pgm_hi);
     # 2. STATIC_THREAD_MGMT_SE0/SE1 — Mesa sets SE0 = 0xFFFFFFFF to
@@ -189,11 +199,13 @@ fn main(): i64 {
     pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_CP_COHER_START_DELAY, 0);
     # 5. TA_CS_BC_BASE_ADDR + _HI — border-color base pointer. Mesa
     # points this at its preamble scratch area; any valid shader-space
-    # VA is fine since SCRATCH_EN=0 means the HW never reads it.
+    # VA is fine since SCRATCH_EN=0 means the HW never reads it. Same >> 8 /
+    # >> 40 split as PGM_LO/HI (the old signed `/` gave _HI = 0x81; the HW
+    # tolerated that value, but it was not the VA this comment promises).
     var bc_va = shader_va;
     var bc_pair[8];
-    store32(&bc_pair + 0, (bc_va / 256) & 0xFFFFFFFF);
-    store32(&bc_pair + 4, (bc_va / 0x10000000000) & 0xFF);
+    store32(&bc_pair + 0, (bc_va >> 8) & 0xFFFFFFFF);
+    store32(&bc_pair + 4, (bc_va >> 40) & 0xFF);
     pos = native_pm4_set_uconfig_reg_pair(pm4, pos, R_TA_CS_BC_BASE_ADDR, &bc_pair);
     # 6. PGM_LO.
     pos = native_pm4_set_sh_reg_one(pm4, pos, R_COMPUTE_PGM_LO, pgm_lo);
@@ -229,9 +241,9 @@ fn main(): i64 {
     pos = native_pm4_set_sh_reg(pm4, pos, R_COMPUTE_NUM_THREAD_X, 3, &nt);
     # 14. DISPATCH_DIRECT. Header now carries shader_type=2.
     pos = native_pm4_dispatch_direct(pm4, pos, 1, 1, 1, GFX9_DISPATCH_INITIATOR);
-    # GFX9 IB alignment: ring align_mask = 0xff means length must be a
-    # multiple of 256 DW (1 KiB). Pad with a single NOP packet that
-    # covers the remaining dwords.
+    # Pad to the fixed 256-DW layout described above with a single NOP
+    # packet covering the remaining dwords. This is a layout choice, not a
+    # kernel alignment rule (a 66-DW IB behaves the same on this path).
     var cur_dwords = pos / 4;
     var target_dwords = 256;
     if (cur_dwords < target_dwords) {
@@ -255,9 +267,13 @@ fn main(): i64 {
     memset(ib_map, 0, ib_size);
     memcpy(ib_map, pm4, pm4_bytes);
     # IB in the same canonical-high aperture as the shader (Mesa pattern).
+    # The IB needs READABLE | EXECUTABLE (_NATIVE_PERM_IB): on Cezanne the CP
+    # fetch of the IB is gated by the execute bit (Step 4f.ii). This program
+    # mapped it READABLE-only, so the CP never ran it: on 2026-09-16 (kernel
+    # 7.2.3) that gave "Illegal opcode in command stream", a failed ring reset
+    # and a MODE2 GPU reset within ~200 ms, with stub[0] still 0.
     var ib_va = 0xFFFF800100200000;
-    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size,
-      AMDGPU_VM_PAGE_READABLE);
+    rc = native_gem_va_map(fd, ib_handle, ib_va, ib_size, _NATIVE_PERM_IB);
     if (rc != 0) {
         print_cstr("FAIL: ib va_map errno="); print_i64(0 - rc); print_cstr("\n");
         native_bo_release_gtt(fd, ib_handle, ib_map, ib_size);
@@ -340,22 +356,17 @@ fn main(): i64 {
     # signals the syncobj via TDR after 10s without ever executing the
     # IB. Switch to BO_HANDLES path here.
     var t_submit_start = mono_ns();
+    # COMPUTE ring only. There is deliberately no GFX-ring retry: a compute
+    # canary that quietly passes on another ring hides a compute-submit
+    # regression, and a DISPATCH_DIRECT stream on the GFX ring can hang the
+    # ring that drives the display.
     rc = native_cs_submit_inline_bos(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
       AMDGPU_HW_IP_COMPUTE, syncobj_handle);
-    if (rc == 0) {
-        print_cstr("submitted to COMPUTE ring\n");
-    }
     if (rc != 0) {
-        print_cstr("COMPUTE ring errno="); print_i64(0 - rc);
-        print_cstr(", retrying on GFX ring\n");
-        rc = native_cs_submit_inline_bos(fd, ctx_id, &bo_list_in, ib_va, pm4_bytes,
-          AMDGPU_HW_IP_GFX, syncobj_handle);
-        if (rc == 0) { print_cstr("submitted to GFX ring\n"); }
-    }
-    if (rc != 0) {
-        print_cstr("FAIL: cs submit errno="); print_i64(0 - rc); print_cstr("\n");
+        print_cstr("FAIL: cs submit (COMPUTE ring) errno="); print_i64(0 - rc); print_cstr("\n");
         return 7;
     }
+    print_cstr("submitted to COMPUTE ring\n");
 
     # ---- Wait for completion, 15-second timeout ----
     var deadline = mono_ns() + 15000000000;
@@ -370,10 +381,45 @@ fn main(): i64 {
     print_i64(elapsed_ms);
     print_cstr(" ms\n");
 
-    # ---- Proof-of-execution readback ----
+    # ---- Reset check (proof 2) ----
+    # AMDGPU_CTX_OP_QUERY_STATE2 (op 4) reports out.state.flags at +0:
+    # RESET (bit 0), VRAMLOST (1), GUILTY (2), RAS_CE (3), RAS_UE (4),
+    # RESET_IN_PROGRESS (5). Any non-zero flag fails the gate. A dispatch that
+    # hangs is completed by the kernel's ring reset, which signals the syncobj
+    # WITHOUT an error and leaves stub[0] = 0xCAFEBABE (the marker runs before
+    # DISPATCH_DIRECT), so this flag is the only signal that tells a hung
+    # dispatch from a finished one. Hardware-checked 2026-09-16: flags = 0x1
+    # after a hung dispatch, 0x0 after a clean one. The job signal and the
+    # reset bookkeeping both happen in the kernel's timeout path, in an order
+    # this program does not rely on: settle 100 ms before asking.
+    var settle_ts[16];
+    store64(&settle_ts + 0, 0);
+    store64(&settle_ts + 8, 100000000);
+    syscall(35, &settle_ts, 0);
+    var state_req[16];
+    memset(&state_req, 0, 16);
+    store32(&state_req + 0, 4);         # AMDGPU_CTX_OP_QUERY_STATE2
+    store32(&state_req + 8, ctx_id);
+    var state_rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &state_req);
+    print_cstr("ctx QUERY_STATE2: rc="); print_i64(state_rc);
+    # On a failed ioctl the union still holds the request (op = 4 reads as the GUILTY
+    # bit), so the flags are only read and printed after a successful call.
+    var state_flags = 0;
+    if (state_rc == 0) {
+        state_flags = load64(&state_req + 0);
+        print_cstr(" flags=0x"); fmt_hex(state_flags);
+    }
+    var reset_seen = 0;
+    if (state_rc != 0) { reset_seen = 1; }
+    if (state_flags != 0) { reset_seen = 1; }
+    if (reset_seen == 0) { print_cstr("  (PASS — no reset during the dispatch)\n"); }
+    if (reset_seen != 0) { print_cstr("  (FAIL — want rc=0 flags=0x0)\n"); }
+
+    # ---- Proof-of-execution readback (proof 1) ----
     # WRITE_DATA at PM4 offset 0 should have written 0xCAFEBABE into stub[0]
-    # if the CP processed the IB. If it stays 0, the CP never ran the IB —
-    # the syncobj signal is a TDR recovery, not real completion.
+    # if the CP processed the IB. If it stays 0, the CP never ran the IB and
+    # the syncobj was signalled by the kernel's error recovery, not by a
+    # completed dispatch.
     var stub_word = load32(stub_map + 0);
     print_cstr("stub[0] = 0x");
     fmt_hex(stub_word);
@@ -393,6 +439,7 @@ fn main(): i64 {
     native_bo_release_gtt(fd, shader_handle, shader_map, shader_size);
     sys_close(fd);
     if (stub_word != 0xCAFEBABE) { return 9; }
+    if (reset_seen != 0) { return 10; }
     print_cstr("OK\n");
     return 0;
 }

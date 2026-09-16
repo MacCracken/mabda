@@ -111,7 +111,7 @@ fn native_compute_dispatch_cached(ctx, pm4, pm4_bytes,
         return _native_neg_rc_to_gpu_err(rc_save);
     }
 
-    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    var wait_rc = native_syncobj_wait_checked(fd, cid, syncobj_handle, timeout_ns);
     native_syncobj_destroy(fd, syncobj_handle);
     return _native_neg_rc_to_gpu_err(wait_rc);
 }
@@ -176,7 +176,7 @@ fn native_compute_dispatch_cached_n(ctx, pm4, pm4_bytes, shader_handle,
         native_syncobj_destroy(fd, syncobj_handle);
         return _native_neg_rc_to_gpu_err(rc_save);
     }
-    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    var wait_rc = native_syncobj_wait_checked(fd, cid, syncobj_handle, timeout_ns);
     native_syncobj_destroy(fd, syncobj_handle);
     return _native_neg_rc_to_gpu_err(wait_rc);
 }
@@ -486,6 +486,11 @@ fn native_render_bo_list_pack6(entries48, fence_h, vs_h, fs_h, rt_h, tex_h, ib_h
 # 6.9(b) e2e program's job.
 fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
   render_handles_ptr, timeout_ns): i64 {
+    # 4.1.3: bound the stream to the cached IB before any staging — the
+    # timeline variant already did; this path memcpy'd pm4_bytes unchecked
+    # into the _NATIVE_IB_SIZE IB slice (the render stream grew at 4.1.3).
+    if (pm4_bytes <= 0) { return GPU_ERR_OTHER; }
+    if (pm4_bytes > _NATIVE_IB_SIZE) { return GPU_ERR_OTHER; }
     var fd = native_ctx_fd(ctx);
     var cid = native_ctx_id(ctx);
     var ib_handle   = native_ctx_ib_handle(ctx);
@@ -545,7 +550,7 @@ fn native_render_dispatch_simple(ctx, pm4, pm4_bytes,
         return _native_neg_rc_to_gpu_err(rc_save);
     }
 
-    var wait_rc = native_syncobj_wait(fd, syncobj_handle, timeout_ns);
+    var wait_rc = native_syncobj_wait_checked(fd, cid, syncobj_handle, timeout_ns);
     native_syncobj_destroy(fd, syncobj_handle);
     return _native_neg_rc_to_gpu_err(wait_rc);
 }
@@ -714,8 +719,9 @@ fn native_ctx_ib_reset_slots(ctx): i64 {
     store64(ctx + 160, 0);
     return 0;
 }
-# Audit MED-7: per-context PM4 build scratch (1024 bytes), allocated
-# once at gpu_context_new_native, shared between compute + render slots.
+# Audit MED-7: per-context PM4 build scratch (_NATIVE_PM4_SCRATCH_BYTES =
+# 2048 bytes since v3.2 TS.5), allocated once at gpu_context_new_native,
+# shared between compute + render slots.
 fn native_ctx_pm4_scratch(ctx): i64 { return load64(ctx + 112); }
 
 # v3.1 M.1(c): per-context texture VA bump cursor at +120. Zero on a
@@ -1364,8 +1370,14 @@ fn _backend_native_queue_wait_idle(ctx, queue): i64 {
     var trc = syscall(228, 1, &t_now);
     if (trc != 0) { return GPU_ERR_OTHER; }
     var deadline = load64(&t_now + 0) * 1000000000 + load64(&t_now + 8) + 15000000000;
+    var t_start = _native_mono_ns();
     var rc = native_syncobj_timeline_wait(fd, syncobj, point, deadline);
-    return _native_neg_rc_to_gpu_err(rc);
+    if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
+    var t_end = _native_mono_ns();
+    var waited = _NATIVE_SLOW_WAIT_NS;
+    if (t_start >= 0) { if (t_end >= t_start) { waited = t_end - t_start; } }
+    var reset_rc = native_ctx_check_reset(fd, native_ctx_id(ctx), waited);
+    return _native_neg_rc_to_gpu_err(reset_rc);
 }
 
 # Order work on dst_queue after work submitted on src_queue (Q.4).
@@ -1921,7 +1933,7 @@ fn _native_dma_submit_oneshot(ctx, h_lin, h_tiled, sdma_bytes): i64 {
       native_ctx_ib_va(ctx), sdma_bytes, AMDGPU_HW_IP_DMA, so,
       native_ctx_fence_handle(ctx), 32, 0);
     if (rc != 0) { native_syncobj_destroy(fd, so); return rc; }
-    var wrc = native_syncobj_wait(fd, so, deadline);
+    var wrc = native_syncobj_wait_checked(fd, native_ctx_id(ctx), so, deadline);
     native_syncobj_destroy(fd, so);
     return wrc;
 }
@@ -2155,9 +2167,16 @@ fn _backend_native_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt): i64 {
     var vs_va     = load64(vs_mod + 8);
     var fs_handle = load64(fs_mod + 0);
     var fs_va     = load64(fs_mod + 8);
+    # 4.1.3 round 2: the VS compute-unit mask + late-alloc limit come from the
+    # kernel's CU topology (Mesa ac_compute_late_alloc), not the Cezanne capture.
+    # A failed device query fails the pipeline closed.
+    var dev_info[128];
+    if (native_amdgpu_query_dev_info(native_ctx_fd(ctx), &dev_info, 128) != 0) { return 0; }
+    var vs_cu = native_gfx9_vs_late_alloc_derive(&dev_info);
+    if (vs_cu < 0) { return 0; }
     var pipe = alloc(NATIVE_PIPE_STRUCT_SIZE);
     var rc = native_render_pipeline_pack(pipe, vs_handle, vs_va,
-      fs_handle, fs_va);
+      fs_handle, fs_va, vs_cu);
     if (rc != 0) { return 0; }
     return pipe;
 }
@@ -2179,6 +2198,128 @@ fn _backend_native_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
     store64(p + NATIVE_PASS_FIELD_RT,          rt);
     store64(p + NATIVE_PASS_FIELD_CLEAR_COLOR, clear_color_ptr);
     return p;
+}
+
+# Bytes of the pass_draw stream around the cached pipeline blocks: ACQUIRE_MEM
+# (28) + PIPELINESTAT_START (8) + NUM_INSTANCES (8) + 3 pre-draw flush events
+# (24) + PFP_SYNC_ME (8) + DRAW_INDEX_AUTO (12) + CACHE_FLUSH_AND_INV (8) = 96,
+# plus the draw-state and pass-target blocks. The textured TS.5 override adds
+# 3 SET_SH_REG + 2 SET_CONTEXT_REG singles = 60 bytes.
+var _NATIVE_PASS_STREAM_PACKET_BYTES     = 96;
+var _NATIVE_PASS_TEXTURED_OVERRIDE_BYTES = 60;
+
+# Exact byte length native_render_pass_pm4_compose writes (every packet is
+# fixed-size, and the stream has no padding): 1388 untextured, 1448 textured.
+fn native_render_pass_pm4_bytes(textured): i64 {
+    var n = _NATIVE_PASS_STREAM_PACKET_BYTES + NATIVE_RENDER_DRAW_STATE_BYTES
+    + NATIVE_PIPE_SH_BLOCK_SIZE + NATIVE_PIPE_CTX_BLOCK_SIZE + NATIVE_RENDER_PASS_TARGET_BYTES;
+    if (textured != 0) { n = n + _NATIVE_PASS_TEXTURED_OVERRIDE_BYTES; }
+    return n;
+}
+
+# Exact byte length of native_pm4_build_render_clear_triangle: PFP_SYNC_ME (8) +
+# ACQUIRE_MEM (28) + PIPELINESTAT_START (8) + NUM_INSTANCES (8) + DRAW_INDEX_AUTO
+# (12) + CACHE_FLUSH_AND_INV (8) = 72 around the four blocks. 1364 bytes.
+fn native_pm4_render_clear_triangle_bytes(): i64 {
+    return 72 + NATIVE_RENDER_DRAW_STATE_BYTES + NATIVE_PIPE_SH_BLOCK_SIZE
+    + NATIVE_PIPE_CTX_BLOCK_SIZE + NATIVE_RENDER_PASS_TARGET_BYTES;
+}
+
+# 4.1.3 — the pass_draw PM4 stream as a pure byte composer, so the stream the
+# GPU actually receives is CPU-testable (test_native_render_stream_owns_
+# inherited_state walks it packet by packet). No syscalls, no allocation:
+# writes exactly native_render_pass_pm4_bytes(textured) bytes into `pm4` and
+# returns that length.
+#   pm4 / cap  destination and its capacity in bytes. 4.1.3 round 2: checked
+#              BEFORE the first write — cap < the stream size returns -1 with
+#              `pm4` untouched (was: pass_draw compared the length only after
+#              the composer had already written into the scratch).
+#   pipe       NativeRenderPipeline (cached sh + ctx blocks)
+#   rt_va / rt_width / rt_height   the bound color target
+#   textured   1 = a sampleable texture is bound (TS.5 override); desc_va is
+#              its T#/S# descriptor VA for the PS USER_DATA
+#   vc         DRAW_INDEX_AUTO vertex count
+# Returns the byte length, -1 (null pm4/pipe or cap too small, nothing written)
+# or -2 (composed length != native_render_pass_pm4_bytes — a size-table drift
+# that test_native_render_pass_pm4_compose_fits_scratch pins on the CPU).
+# Layout: ACQUIRE_MEM, PIPELINESTAT_START, draw state (UConfig input assembly),
+# NUM_INSTANCES, pipeline sh + ctx blocks, pass_target, [textured override],
+# CB/DB meta + PS partial flushes, PFP_SYNC_ME, DRAW_INDEX_AUTO,
+# CACHE_FLUSH_AND_INV. No NOP padding (see native_pm4_build_render_clear_triangle).
+fn native_render_pass_pm4_compose(pm4, cap, pipe, rt_va, rt_width, rt_height,
+  textured, desc_va, vc): i64 {
+    if (pm4 == 0)  { return 0 - 1; }
+    if (pipe == 0) { return 0 - 1; }
+    var need = native_render_pass_pm4_bytes(textured);
+    if (cap < need) { return 0 - 1; }
+    var pos = 0;
+    pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(pm4, pos);
+    # PIPELINESTAT_START — unblocks the GPU stat-counter pipeline.
+    # radv emits this in every preamble; without it Cezanne's
+    # pipeline can wait on stat-counter readiness that never fires.
+    pos = native_pm4_event_write(pm4, pos,
+      GFX9_EVENT_TYPE_PIPELINESTAT_START, GFX9_EVENT_INDEX_OTHER);
+    # UConfig input-assembly state (primitive type, IA_MULTI_VGT_PARAM, vertex
+    # id clamp / offset / restart). 4.1.3: only VGT_PRIMITIVE_TYPE was written
+    # here — the vid clamp/offset and IA grouping were inherited (global state).
+    pos = native_pm4_build_render_draw_state(pm4, pos);
+    # Use dedicated PKT3_NUM_INSTANCES (opcode 0x2F) — radv's choice
+    # for per-draw instance count; Cezanne VGT picks this up more
+    # reliably than the generic SET_UCONFIG_REG path.
+    pos = native_pm4_num_instances(pm4, pos, 1);
+    # Splice the pre-built sh + ctx blocks (Step 6.5(b) composers
+    # already ran at pipeline_create — this is the cached-block path).
+    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_SH_BLOCK,
+      NATIVE_PIPE_SH_BLOCK_SIZE);
+    pos = pos + NATIVE_PIPE_SH_BLOCK_SIZE;
+    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_CTX_BLOCK,
+      NATIVE_PIPE_CTX_BLOCK_SIZE);
+    pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
+    pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
+      rt_width, rt_height);
+    # v3.2 TS.5 — textured sample override. If a sampleable texture is bound
+    # (bind_for_sample stashed the tex ptr), re-emit the PS state the textured
+    # FS (image_load) needs AFTER the pipeline's sh/ctx blocks (last-write
+    # wins): SPI_PS_INPUT_ENA/_ADDR = 0x302 (screen pos arrives in v2/v3),
+    # RSRC1_PS VGPRS 0->1 (4->8 VGPRs for the FS's v0..v5; MIN's 16 SGPRs
+    # already cover s[0:7]), and the PS USER_DATA = the T#/S# descriptor VA
+    # (the FS s_load_dwordx8's the T# from it). The surface BO joins residency.
+    if (textured != 0) {
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
+          GFX9_GFX_PGM_RSRC1_MIN | 1);
+        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
+          GFX9_SPI_PS_INPUT_TEXTURED);
+        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ADDR,
+          GFX9_SPI_PS_INPUT_TEXTURED);
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_0,
+          desc_va & 0xFFFFFFFF);
+        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_1,
+          (desc_va >> 32) & 0xFFFFFFFF);
+    }
+    # Pre-draw pixel-pipeline drain — captured byte-exact from radv's
+    # main IB. Without these, in-flight pixel waves from prior
+    # contexts (e.g. the compositor) keep the pixel pipeline busy past
+    # our dispatch's start → GFX ring TDR. The 3-event sequence (CB
+    # meta flush + DB meta flush + PS partial flush) forces the
+    # pipeline to a clean state before our triangle reaches the
+    # rasterizer.
+    pos = native_pm4_event_write(pm4, pos,
+      GFX9_EVENT_TYPE_FLUSH_AND_INV_CB_META, GFX9_EVENT_INDEX_OTHER);
+    pos = native_pm4_event_write(pm4, pos,
+      GFX9_EVENT_TYPE_FLUSH_AND_INV_DB_META, GFX9_EVENT_INDEX_OTHER);
+    pos = native_pm4_event_write(pm4, pos,
+      GFX9_EVENT_TYPE_PS_PARTIAL_FLUSH, GFX9_EVENT_INDEX_PARTIAL_FLUSH);
+    # PFP_SYNC_ME — force PFP to wait for ME to drain before draw.
+    # Without this PFP can read context state the ME hasn't committed.
+    pos = native_pm4_pfp_sync_me(pm4, pos);
+    pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
+    # Post-draw cache flush — same rationale as the standalone
+    # composer above. CB writes need to land in memory before the
+    # syncobj signals so the consumer reads / page-flips see the
+    # rendered pixels.
+    pos = native_pm4_event_write_cache_flush_and_inv(pm4, pos);
+    if (pos != need) { return 0 - 2; }
+    return pos;
 }
 
 # Compose the full render PM4 stream and dispatch on the GFX ring.
@@ -2215,46 +2356,19 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
 
     # Build the IB stream into the per-context cached PM4 scratch
     # (audit MED-7) — replaces a per-draw alloc that bumped the allocator
-    # forward on every frame. The scratch is _NATIVE_PM4_SCRATCH_BYTES (2048
-    # at v3.2 TS.5): the clear-triangle stream pads to the 256-dword/1024-B
-    # minimum, and the textured-sample override appends ~15 more dwords.
+    # forward on every frame. The scratch is _NATIVE_PM4_SCRATCH_BYTES (2048);
+    # the composed stream is 1388 bytes untextured / 1448 textured
+    # (native_render_pass_pm4_bytes, CPU-asserted by
+    # test_native_render_pass_pm4_compose_fits_scratch), and the composer
+    # rejects a too-small capacity before writing.
     var pm4 = native_ctx_pm4_scratch(ctx);
     if (pm4 == 0) { return GPU_ERR_OTHER; }
     memset(pm4, 0, _NATIVE_PM4_SCRATCH_BYTES);
-    var pos = 0;
-    pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(pm4, pos);
-    # PIPELINESTAT_START — unblocks the GPU stat-counter pipeline.
-    # radv emits this in every preamble; without it Cezanne's
-    # pipeline can wait on stat-counter readiness that never fires.
-    pos = native_pm4_event_write(pm4, pos,
-      GFX9_EVENT_TYPE_PIPELINESTAT_START, GFX9_EVENT_INDEX_OTHER);
-    pos = native_pm4_set_uconfig_reg_one(pm4, pos, R_VGT_PRIMITIVE_TYPE,
-      GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    # Use dedicated PKT3_NUM_INSTANCES (opcode 0x2F) — radv's choice
-    # for per-draw instance count; Cezanne VGT picks this up more
-    # reliably than the generic SET_UCONFIG_REG path.
-    pos = native_pm4_num_instances(pm4, pos, 1);
-    # Splice the pre-built sh + ctx blocks (Step 6.5(b) composers
-    # already ran at pipeline_create — this is the cached-block path).
-    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_SH_BLOCK,
-      NATIVE_PIPE_SH_BLOCK_SIZE);
-    pos = pos + NATIVE_PIPE_SH_BLOCK_SIZE;
-    memcpy(pm4 + pos, pipe + NATIVE_PIPE_FIELD_CTX_BLOCK,
-      NATIVE_PIPE_CTX_BLOCK_SIZE);
-    pos = pos + NATIVE_PIPE_CTX_BLOCK_SIZE;
-    pos = native_pm4_build_render_pass_target(pm4, pos, rt_va,
-      rt_width, rt_height);
-    # v3.2 TS.5 — textured sample override. If a sampleable texture is bound
-    # (bind_for_sample stashed the tex ptr), re-emit the PS state the textured
-    # FS (image_load) needs AFTER the pipeline's sh/ctx blocks (last-write
-    # wins): SPI_PS_INPUT_ENA/_ADDR = 0x302 (screen pos arrives in v2/v3),
-    # RSRC1_PS VGPRS 0->1 (4->8 VGPRs for the FS's v0..v5; MIN's 16 SGPRs
-    # already cover s[0:7]), and the PS USER_DATA = the T#/S# descriptor VA
-    # (the FS s_load_dwordx8's the T# from it). The surface BO joins residency.
     var bound_tex = load64(pass + NATIVE_PASS_FIELD_BOUND_TEX);
     var tex_handle = 0;
+    var desc_va = 0;
     if (bound_tex != 0) {
-        var desc_va = native_tex_t_va(bound_tex);
+        desc_va = native_tex_t_va(bound_tex);
         tex_handle = load64(bound_tex + NATIVE_TEX_FIELD_HANDLE);
         # v3.2 TS.8 — write the per-draw scale (f32) into the descriptor tail the
         # FS s_loads (+48/+52): scale = tex_dim / rt_dim, so a W×H texture maps
@@ -2270,43 +2384,12 @@ fn _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
             store32(dcpu + 48, int_ratio_to_f32(tw, rt_width));   # scale_x
             store32(dcpu + 52, int_ratio_to_f32(th, rt_height));  # scale_y
         }
-        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_PGM_RSRC1_PS,
-          GFX9_GFX_PGM_RSRC1_MIN | 1);
-        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ENA,
-          GFX9_SPI_PS_INPUT_TEXTURED);
-        pos = native_pm4_set_context_reg_one(pm4, pos, R_SPI_PS_INPUT_ADDR,
-          GFX9_SPI_PS_INPUT_TEXTURED);
-        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_0,
-          desc_va & 0xFFFFFFFF);
-        pos = native_pm4_set_sh_reg_one(pm4, pos, R_SPI_SHADER_USER_DATA_PS_1,
-          (desc_va >> 32) & 0xFFFFFFFF);
     }
-    # Pre-draw pixel-pipeline drain — captured byte-exact from radv's
-    # main IB. Without these, in-flight pixel waves from prior
-    # contexts (e.g. the compositor) keep the pixel pipeline busy past
-    # our dispatch's start → GFX ring TDR. The 3-event sequence (CB
-    # meta flush + DB meta flush + PS partial flush) forces the
-    # pipeline to a clean state before our triangle reaches the
-    # rasterizer.
-    pos = native_pm4_event_write(pm4, pos,
-      GFX9_EVENT_TYPE_FLUSH_AND_INV_CB_META, GFX9_EVENT_INDEX_OTHER);
-    pos = native_pm4_event_write(pm4, pos,
-      GFX9_EVENT_TYPE_FLUSH_AND_INV_DB_META, GFX9_EVENT_INDEX_OTHER);
-    pos = native_pm4_event_write(pm4, pos,
-      GFX9_EVENT_TYPE_PS_PARTIAL_FLUSH, GFX9_EVENT_INDEX_PARTIAL_FLUSH);
-    # PFP_SYNC_ME — force PFP to wait for ME to drain before draw.
-    # Without this PFP can read context state the ME hasn't committed.
-    pos = native_pm4_pfp_sync_me(pm4, pos);
-    pos = native_pm4_build_render_draw_tail(pm4, pos, vc);
-    # Post-draw cache flush — same rationale as the standalone
-    # composer above. CB writes need to land in memory before the
-    # syncobj signals so the consumer reads / page-flips see the
-    # rendered pixels.
-    pos = native_pm4_event_write_cache_flush_and_inv(pm4, pos);
-    var cur_dwords = pos / 4;
-    if (cur_dwords < 256) {
-        pos = native_pm4_nop(pm4, pos, 256 - cur_dwords);
-    }
+    var textured = 0;
+    if (bound_tex != 0) { textured = 1; }
+    var pos = native_render_pass_pm4_compose(pm4, _NATIVE_PM4_SCRATCH_BYTES, pipe,
+      rt_va, rt_width, rt_height, textured, desc_va, vc);
+    if (pos <= 0) { return GPU_ERR_OTHER; }
 
     var triple[32];
     native_render_handles_write(&triple, vs_handle, fs_handle, rt_handle, tex_handle);
@@ -2364,10 +2447,12 @@ fn _backend_native_render_pass_end(ctx, pass): i64 {
 #   page-flip    (7.4(b), native_kms_present) — on each frame
 #   teardown     (7.4(b) + 7.2(d), release_fb + release_scanout)
 #
-# Caveat: surface_configure ONLY works on the kiosk path in v3.0.
-# The logind path (gpu_surface_configure_native_logind) is gated
-# on the v3.x samvada package; for now its public dispatcher (see docs/development/roadmap.md)
-# returns GPU_ERR_NOT_IMPLEMENTED before reaching this slot.   #skip-lint
+# Logind: gpu_surface_configure_native_logind reaches this slot only
+# when mabda is built with `-D MABDA_LOGIND`; without the flag it
+# returns 0 and never dispatches here. With the flag, once
+# samvada_session_take_device returns a master fd, it stashes that fd
+# via gpu_ctx_set_native_card_fd and dispatches this slot exactly as
+# the kiosk entry does.
 
 # NativeSurface layout (120 bytes):
 #   +0:   card_fd        (i32)
@@ -3379,26 +3464,111 @@ fn native_rt_release_2d_rgba8(fd, rt): i64 {
 # draw_tail every time (no caching) — that's the single-draw-per-
 # pass simplification noted in v2.1 "What v2 still defers".
 
-# NativeRenderPipeline struct layout (644 bytes):
+# ---- 4.1.3 round 2: VS compute-unit mask + late alloc from the kernel ----
+# DRM_IOCTL_AMDGPU_INFO = DRM_IOW(DRM_COMMAND_BASE 0x40 + DRM_AMDGPU_INFO 0x05,
+# struct drm_amdgpu_info) = _IOW('d', 0x45, 32 bytes) = 0x40206445
+# (include/uapi/drm/amdgpu_drm.h at v7.2.3). struct drm_amdgpu_info (32 bytes):
+#   +0 return_pointer (u64)  +8 return_size (u32)  +12 query (u32)  +16 union (16)
+# AMDGPU_INFO_DEV_INFO = 0x16 fills struct drm_amdgpu_info_device; the prefix
+# read here: +20 num_shader_engines (u32), +24 num_shader_arrays_per_engine
+# (u32), +56 cu_bitmap[4][4] (16 x u32, [se][sa]). The kernel copies
+# min(return_size, sizeof) bytes, so a 128-byte buffer is enough.
+var DRM_IOCTL_AMDGPU_INFO = 0x40206445;
+var AMDGPU_INFO_DEV_INFO  = 0x16;
+
+# Query AMDGPU_INFO_DEV_INFO into `out` (`size` bytes, zeroed first). Returns
+# the ioctl result (0 = ok, negative errno). Read-only; Mesa issues the same
+# query at every device open.
+fn native_amdgpu_query_dev_info(fd, out, size): i64 {
+    if (out == 0) { return 0 - 1; }
+    if (size < 128) { return 0 - 1; }
+    memset(out, 0, size);
+    var req[32];
+    memset(&req, 0, 32);
+    store64(&req + 0, out);
+    store32(&req + 8, size);
+    store32(&req + 12, AMDGPU_INFO_DEV_INFO);
+    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_INFO, &req);
+}
+
+# Derive SPI_SHADER_PGM_RSRC3_VS + SPI_SHADER_LATE_ALLOC_VS from a DEV_INFO
+# buffer, transcribing Mesa 26.2.2 for GFX9 (non-NGG VS, no VS scratch):
+#   ac_gpu_info.c:   num_cu = popcount(cu_bitmap[se][sa]) over se < num_se,
+#                    sa < num_sa; min_good_cu_per_sa = num_cu / (num_se * num_sa)
+#   ac_shader_util.c ac_compute_late_alloc (gfx_level < GFX10 branch):
+#     min_good <= 2 -> late 0, mask 0xFFFF (CU masking can hang)
+#     min_good <= 4 -> late 2; else late (min_good - 2) * 4
+#     late > 2      -> mask 0xFFFE (1 CU disabled)
+#     late clamped to LATE_ALLOC_VS.LIMIT[0:5] (63)
+#   RSRC3_VS = mask | WAVE_LIMIT 0x3F << 16 (CU_EN[0:15] WAVE_LIMIT[16:21],
+#   gfx9.json map.at 45336); ac_apply_cu_en's spi_cu_en is ~0 (no AMD_CU_MASK).
+# Returns rsrc3_vs | (late_alloc << 32), or -1 for a topology outside the
+# kernel struct (num_se / num_sa not in 1..4) or with no compute units.
+# This Cezanne (1 SE x 1 SA, cu_bitmap[0][0] = 0xFF) -> 0x003FFFFE / 24,
+# identical to the radv capture.
+fn native_gfx9_vs_late_alloc_derive(dev_info): i64 {
+    if (dev_info == 0) { return 0 - 1; }
+    var num_se = load32(dev_info + 20);
+    var num_sa = load32(dev_info + 24);
+    if (num_se < 1 || num_se > 4) { return 0 - 1; }
+    if (num_sa < 1 || num_sa > 4) { return 0 - 1; }
+    var num_cu = 0;
+    var se = 0;
+    while (se < num_se) {
+        var sa = 0;
+        while (sa < num_sa) {
+            var bits = load32(dev_info + 56 + (se * 4 + sa) * 4);
+            while (bits != 0) {
+                num_cu = num_cu + (bits & 1);
+                bits = bits >> 1;
+            }
+            sa = sa + 1;
+        }
+        se = se + 1;
+    }
+    if (num_cu == 0) { return 0 - 1; }
+    var min_good = num_cu / (num_se * num_sa);
+    var late = 0;
+    var mask = 0xFFFF;
+    if (min_good > 2) {
+        late = 2;
+        if (min_good > 4) { late = (min_good - 2) * 4; }
+        if (late > 2) { mask = 0xFFFE; }
+    }
+    if (late > 63) { late = 63; }
+    return (mask | (0x3F << 16)) | (late << 32);
+}
+
+# The radv-capture pair for this Cezanne, packed like the derive result.
+fn native_gfx9_vs_cu_cezanne(): i64 {
+    return GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL | (GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE << 32);
+}
+fn native_gfx9_vs_cu_rsrc3(vs_cu): i64 { return vs_cu & 0xFFFFFFFF; }
+fn native_gfx9_vs_cu_late_alloc(vs_cu): i64 { return (vs_cu >> 32) & 0x3F; }
+
+# NativeRenderPipeline struct layout (1000 bytes):
 #   +0:   vs_handle (u64, KMS handle for VS shader BO)
 #   +8:   vs_va     (u64, canonical-high GPU VA of VS bytes)
 #   +16:  fs_handle (u64, KMS handle for FS shader BO)
 #   +24:  fs_va     (u64, canonical-high GPU VA of FS bytes)
-#   +32:  pipeline_sh_block  (56 bytes — output of
-#                              native_pm4_build_render_pipeline_sh)
-#   +88:  pipeline_ctx_block (556 bytes — output of
+#   +32:  pipeline_sh_block  (68 bytes — output of
+#                              native_pm4_build_render_pipeline_sh_cu;
+#                              56 → 68 at 4.1.3 for SPI_SHADER_PGM_RSRC3_PS)
+#   +100: pipeline_ctx_block (900 bytes — output of
 #                              native_pm4_build_render_pipeline_ctx;
 #                              grew 240 → 292 → 556 across the 2026-05-13
 #                              GFX9 preamble fixes that splice the guard-
 #                              band adjusts, BINNER_CNTL_0, and VGT reuse
 #                              regs to keep the GFX ring from TDR'ing
-#                              on Cezanne APUs)
+#                              on Cezanne APUs; 556 → 768 at 4.1.3 for
+#                              PA_CL_VTE_CNTL + the owned-state audit set;
+#                              768 → 900 in 4.1.3 round 2)
 #
-# Audit 2026-06-14 [LOW-1]: this header now matches the load-bearing
-# constants below (SH_BLOCK 56 @ +32, CTX_BLOCK 556 @ +88, total 644).
-# The two block sizes (56 / 556) are pinned by the 6.5(b) composers and
-# CPU-asserted in mabda_v3.tcyr — if those drift, this struct's inline
-# layout breaks and tests catch it before runtime.
+# Audit 2026-06-14 [LOW-1]: this header matches the load-bearing
+# constants below (SH_BLOCK 68 @ +32, CTX_BLOCK 900 @ +100, total 1000).
+# The two block sizes (68 / 900) are pinned by the 6.5(b) composers and
+# CPU-asserted in tests/tcyr/native.tcyr — if those drift, this struct's
+# inline layout breaks and tests catch it before runtime.
 
 var NATIVE_PIPE_FIELD_VS_HANDLE = 0;
 var NATIVE_PIPE_FIELD_VS_VA     = 8;
@@ -3407,29 +3577,43 @@ var NATIVE_PIPE_FIELD_FS_VA     = 24;
 var NATIVE_PIPE_FIELD_SH_BLOCK  = 32;
 # SH_BLOCK grew from 48 → 56: VS SET_SH_REG now covers RSRC3_VS +
 # LATE_ALLOC_VS + PGM_LO/HI + RSRC1/2 (6 regs, 8 dwords). PS unchanged
-# at 4 regs / 6 dwords.
-var NATIVE_PIPE_FIELD_CTX_BLOCK = 88;
-var NATIVE_PIPE_SH_BLOCK_SIZE   = 56;
+# at 4 regs / 6 dwords. 56 → 68 at 4.1.3: + SET_SH_REG RSRC3_PS (3 dwords).
+var NATIVE_PIPE_FIELD_CTX_BLOCK = 100;
+var NATIVE_PIPE_SH_BLOCK_SIZE   = 68;
 # CTX_BLOCK grew from 424 → 556: added PA_CL_VS_OUT_CNTL +
 # SPI_BARYC_CNTL + PA_SC_SHADER_CONTROL + VGT_GS_MODE + VGT_PRIMITIVEID_EN
 # + DB_Z_INFO + DB_STENCIL_INFO + 2× PA_SC_AA_MASK + PA_SC_MODE_CNTL_0
 # + VGT_GS_OUT_PRIM_TYPE (11 × 12 = 132 bytes added).
-var NATIVE_PIPE_CTX_BLOCK_SIZE  = 556;
-var NATIVE_PIPE_STRUCT_SIZE     = 644;
+# 556 → 768 at 4.1.3 (212 bytes): PA_CL_VTE_CNTL (12) + SX_MRT0..7_BLEND_OPT
+# (40) + DB_ALPHA_TO_MASK / DB_EQAA / PA_SC_EDGERULE /
+# PA_SC_CONSERVATIVE_RASTERIZATION_CNTL (4 × 12) + VGT_STRMOUT_CONFIG pair (16)
+# + CB_COLOR1..7_INFO (7 × 12) + DB_DFSM_CONTROL (12).
+# 768 → 900 at 4.1.3 round 2 (132 bytes): VGT_OUTPUT_PATH_CNTL/VGT_HOS_CNTL pair
+# (16) + VGT_ENHANCE / IA_ENHANCE / WD_ENHANCE / VGT_VTX_CNT_EN /
+# VGT_DRAW_PAYLOAD_CNTL / PA_CL_NANINF_CNTL / PA_SU_SMALL_PRIM_FILTER_CNTL
+# (7 × 12) + PA_SU_OVER_RASTERIZATION_CNTL/
+# PA_STEREO_CNTL pair (16) + PA_SC_SCREEN_EXTENT_CONTROL/
+# PA_SC_TILE_STEERING_OVERRIDE pair (16).
+var NATIVE_PIPE_CTX_BLOCK_SIZE  = 900;
+var NATIVE_PIPE_STRUCT_SIZE     = 1000;
 
 # Build a NativeRenderPipeline in-place. Caller allocates
 # NATIVE_PIPE_STRUCT_SIZE bytes for `out`. Pre-builds both pipeline
 # blocks; failure (composer returning a wrong-sized block) returns
-# negative.
-fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va): i64 {
+# negative. `vs_cu` is the packed VS compute-unit config from
+# native_gfx9_vs_late_alloc_derive (native_gfx9_vs_cu_cezanne() for the
+# capture defaults); a negative `vs_cu` returns -4.
+fn native_render_pipeline_pack(out, vs_handle, vs_va, fs_handle, fs_va, vs_cu): i64 {
     if (out == 0) { return -1; }
+    if (vs_cu < 0) { return -4; }
     memset(out, 0, NATIVE_PIPE_STRUCT_SIZE);
     store64(out + NATIVE_PIPE_FIELD_VS_HANDLE, vs_handle);
     store64(out + NATIVE_PIPE_FIELD_VS_VA,     vs_va);
     store64(out + NATIVE_PIPE_FIELD_FS_HANDLE, fs_handle);
     store64(out + NATIVE_PIPE_FIELD_FS_VA,     fs_va);
-    var sh_end = native_pm4_build_render_pipeline_sh(
-      out + NATIVE_PIPE_FIELD_SH_BLOCK, 0, vs_va, fs_va);
+    var sh_end = native_pm4_build_render_pipeline_sh_cu(
+      out + NATIVE_PIPE_FIELD_SH_BLOCK, 0, vs_va, fs_va,
+      native_gfx9_vs_cu_rsrc3(vs_cu), native_gfx9_vs_cu_late_alloc(vs_cu));
     if (sh_end != NATIVE_PIPE_SH_BLOCK_SIZE) { return -2; }
     var ctx_end = native_pm4_build_render_pipeline_ctx(
       out + NATIVE_PIPE_FIELD_CTX_BLOCK, 0);

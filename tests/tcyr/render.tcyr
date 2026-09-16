@@ -71,6 +71,299 @@ fn test_audit_render_target_rgba8_rejects_invalid() {
 }
 
 # ================================================================
+# 4.1.3 — RenderTarget owns its MSAA texture (rtb_build / render_target_release)
+# ================================================================
+# rtb_build used to keep only the MSAA *view*: the N-sample texture handle was dropped, so no
+# release path could free it and every MSAA RenderTarget leaked one texture (~31.6 MiB at 4x
+# 1920x1080; the bench's msaa4 row made ~102 of them). These tests drive the REAL rtb_build and
+# render_target_release through a mock wgpu fn table: create_texture (slot 45) / create_view
+# (slot 46) hand out handles that encode their call index, and texture_release (slot 49) /
+# view_release (slot 50) mark each handle released. The ledger then proves every handle the
+# build created is released exactly once, with no GPU.
+
+var _RTM_MAX = 512;              # ledger entries per kind (handles beyond this count as bad)
+var _RTM_TEX_BASE  = 0x710000;   # texture handle = base + create-call index
+var _RTM_VIEW_BASE = 0x720000;   # view handle    = base + create-call index
+var _rtm_tex_state  = 0;         # byte per call: 0 never made, 1 live, 2 released
+var _rtm_view_state = 0;
+var _rtm_tex_samples = 0;        # u64 per call: descriptor sampleCount (+56)
+var _rtm_tex_usage   = 0;        # u64 per call: descriptor usage (+24)
+var _rtm_view_parent = 0;        # u64 per call: the texture handle the view was made on
+var _rtm_tex_calls  = 0;
+var _rtm_view_calls = 0;
+var _rtm_tex_live   = 0;
+var _rtm_view_live  = 0;
+var _rtm_tex_rel_calls  = 0;
+var _rtm_view_rel_calls = 0;
+var _rtm_bad_release    = 0;     # NULL, unknown or already-released handle
+var _rtm_fail_tex_at  = 0 - 1;   # create_texture call index that returns 0 (-1 = none)
+var _rtm_fail_view_at = 0 - 1;   # create_view call index that returns 0 (-1 = none)
+
+fn _rtm_create_texture(device, desc): i64 {
+    var i = _rtm_tex_calls;
+    _rtm_tex_calls = i + 1;
+    if (i >= _RTM_MAX) { return 0; }
+    store64(_rtm_tex_samples + i * 8, load32(desc + 56));
+    store64(_rtm_tex_usage + i * 8, load64(desc + 24));
+    if (i == _rtm_fail_tex_at) { return 0; }
+    store8(_rtm_tex_state + i, 1);
+    _rtm_tex_live = _rtm_tex_live + 1;
+    return _RTM_TEX_BASE + i;
+}
+
+fn _rtm_create_view(texture, desc): i64 {
+    var i = _rtm_view_calls;
+    _rtm_view_calls = i + 1;
+    if (i >= _RTM_MAX) { return 0; }
+    store64(_rtm_view_parent + i * 8, texture);
+    if (i == _rtm_fail_view_at) { return 0; }
+    store8(_rtm_view_state + i, 1);
+    _rtm_view_live = _rtm_view_live + 1;
+    return _RTM_VIEW_BASE + i;
+}
+
+fn _rtm_texture_release(texture): i64 {
+    _rtm_tex_rel_calls = _rtm_tex_rel_calls + 1;
+    var i = texture - _RTM_TEX_BASE;
+    if (i < 0) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    if (i >= _RTM_MAX) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    if (load8(_rtm_tex_state + i) != 1) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    store8(_rtm_tex_state + i, 2);
+    _rtm_tex_live = _rtm_tex_live - 1;
+    return 0;
+}
+
+fn _rtm_view_release(view): i64 {
+    _rtm_view_rel_calls = _rtm_view_rel_calls + 1;
+    var i = view - _RTM_VIEW_BASE;
+    if (i < 0) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    if (i >= _RTM_MAX) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    if (load8(_rtm_view_state + i) != 1) { _rtm_bad_release = _rtm_bad_release + 1; return 0; }
+    store8(_rtm_view_state + i, 2);
+    _rtm_view_live = _rtm_view_live - 1;
+    return 0;
+}
+
+# Zero the ledger and point the global wgpu fn table at `table` (>= 67 slots, caller-owned).
+fn _rtm_install(table): i64 {
+    if (_rtm_tex_state == 0) {
+        _rtm_tex_state   = alloc(_RTM_MAX);
+        _rtm_view_state  = alloc(_RTM_MAX);
+        _rtm_tex_samples = alloc(_RTM_MAX * 8);
+        _rtm_tex_usage   = alloc(_RTM_MAX * 8);
+        _rtm_view_parent = alloc(_RTM_MAX * 8);
+    }
+    memset(_rtm_tex_state, 0, _RTM_MAX);
+    memset(_rtm_view_state, 0, _RTM_MAX);
+    memset(_rtm_tex_samples, 0, _RTM_MAX * 8);
+    memset(_rtm_tex_usage, 0, _RTM_MAX * 8);
+    memset(_rtm_view_parent, 0, _RTM_MAX * 8);
+    _rtm_tex_calls = 0;
+    _rtm_view_calls = 0;
+    _rtm_tex_live = 0;
+    _rtm_view_live = 0;
+    _rtm_tex_rel_calls = 0;
+    _rtm_view_rel_calls = 0;
+    _rtm_bad_release = 0;
+    _rtm_fail_tex_at = 0 - 1;
+    _rtm_fail_view_at = 0 - 1;
+    memset(table, 0, 67 * 8);
+    store64(table + 45 * 8, &_rtm_create_texture);
+    store64(table + 46 * 8, &_rtm_create_view);
+    store64(table + 49 * 8, &_rtm_texture_release);
+    store64(table + 50 * 8, &_rtm_view_release);
+    wgpu_ffi_init_table(table);
+    return 0;
+}
+
+fn _rtm_uninstall(): i64 {
+    wgpu_ffi_init_table(0);    # reset the global for the tests that follow
+    return 0;
+}
+
+# The struct header comment and RENDER_TARGET_SIZE agree, and every accessor reads its own field.
+fn test_render_target_struct_layout_msaa_texture() {
+    assert_eq(RENDER_TARGET_SIZE, 72, "RenderTarget is 72 bytes (+64 msaa_texture)");
+    var rt[72];
+    memset(&rt, 0, 72);
+    store64(&rt + 0, 0xA0);
+    store64(&rt + 8, 0xA8);
+    store32(&rt + 16, 0x17);
+    store64(&rt + 24, 1920);
+    store64(&rt + 32, 1080);
+    store64(&rt + 40, 4);
+    store64(&rt + 48, 0xB0);
+    store64(&rt + 56, 0xB8);
+    store64(&rt + 64, 0xC0);
+    assert_eq(render_target_texture(&rt), 0xA0, "texture @ +0");
+    assert_eq(render_target_view(&rt), 0xA8, "view @ +8");
+    assert_eq(render_target_format(&rt), 0x17, "format @ +16 (u32)");
+    assert_eq(render_target_width(&rt), 1920, "width @ +24");
+    assert_eq(render_target_height(&rt), 1080, "height @ +32");
+    assert_eq(render_target_sample_count(&rt), 4, "sample_count @ +40");
+    assert_eq(render_target_msaa_view(&rt), 0xB0, "msaa_view @ +48");
+    assert_eq(render_target_depth(&rt), 0xB8, "depth @ +56");
+    assert_eq(render_target_msaa_texture(&rt), 0xC0, "msaa_texture @ +64");
+    return 0;
+}
+
+# 4x MSAA + depth: the build stores the N-sample texture at +64, and one release frees all six
+# handles (3 textures, 3 views) exactly once. A repeat release frees nothing.
+fn test_rtb_build_msaa_release_frees_msaa_texture() {
+    var table[536];
+    _rtm_install(&table);
+    var b = rtb_depth(rtb_msaa(rtb_new(1920, 1080), 4), DEPTH_FORMAT_DEPTH32_FLOAT);
+    var rt = rtb_build(b, 0xDE51CE);
+    assert_neq(rt, 0, "msaa4+depth build succeeds");
+    assert_eq(_rtm_tex_calls, 3, "3 textures created (main, msaa, depth)");
+    assert_eq(_rtm_view_calls, 3, "3 views created");
+    assert_eq(load64(_rtm_tex_samples + 0), 1, "main texture sampleCount 1");
+    assert_eq(load64(_rtm_tex_samples + 8), 4, "msaa texture sampleCount 4");
+    assert_eq(load64(_rtm_tex_usage + 8), WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+      "msaa texture usage is RENDER_ATTACHMENT only");
+    assert_eq(render_target_texture(rt), _RTM_TEX_BASE + 0, "main texture stored @ +0");
+    assert_eq(render_target_msaa_texture(rt), _RTM_TEX_BASE + 1, "msaa texture stored @ +64");
+    assert_eq(load64(_rtm_view_parent + 8), render_target_msaa_texture(rt),
+      "msaa view is a view of the stored msaa texture");
+    assert_eq(render_target_render_view(rt), render_target_msaa_view(rt), "draw into the msaa view");
+    assert_eq(render_target_resolve(rt), render_target_view(rt), "resolve into the 1-sample view");
+    assert_eq(_rtm_tex_live, 3, "3 textures live before release");
+
+    assert_eq(render_target_release(rt), 0, "render_target_release returns 0");
+    assert_eq(_rtm_tex_live, 0, "no texture left live after release");
+    assert_eq(_rtm_view_live, 0, "no view left live");
+    assert_eq(load8(_rtm_tex_state + 1), 2, "the msaa texture handle itself was released");
+    assert_eq(_rtm_tex_rel_calls, 3, "exactly 3 texture releases");
+    assert_eq(_rtm_view_rel_calls, 3, "exactly 3 view releases");
+    assert_eq(_rtm_bad_release, 0, "no NULL / unknown / double release");
+    assert_eq(render_target_msaa_texture(rt), 0, "msaa_texture zeroed");
+    assert_eq(render_target_msaa_view(rt), 0, "msaa_view zeroed");
+    assert_eq(render_target_texture(rt), 0, "texture zeroed");
+    assert_eq(render_target_view(rt), 0, "view zeroed");
+    assert_eq(render_target_depth(rt), 0, "depth zeroed");
+    assert_eq(render_target_width(rt), 1920, "metadata kept: width");
+    assert_eq(render_target_sample_count(rt), 4, "metadata kept: sample_count");
+
+    render_target_release(rt);
+    assert_eq(_rtm_tex_rel_calls + _rtm_view_rel_calls, 6, "repeat release makes no FFI call");
+    assert_eq(_rtm_bad_release, 0, "repeat release: no double release");
+    assert_eq(render_target_release(0), 0, "release(0) is null-safe");
+    assert_eq(_rtm_tex_rel_calls + _rtm_view_rel_calls, 6, "release(0) makes no FFI call");
+    _rtm_uninstall();
+    return 0;
+}
+
+# The bench's msaa4 row shape: 102 create/release cycles of a 4x 1080p target leave nothing live.
+fn test_rtb_build_msaa_churn_leaves_nothing_live() {
+    var table[536];
+    _rtm_install(&table);
+    var b = rtb_msaa(rtb_new(1920, 1080), 4);
+    var n = 0;
+    var built = 0;
+    while (n < 102) {
+        var rt = rtb_build(b, 0xDE51CE);
+        if (rt != 0) { built = built + 1; }
+        render_target_release(rt);
+        n = n + 1;
+    }
+    assert_eq(built, 102, "102 msaa4 builds succeed");
+    assert_eq(_rtm_tex_calls, 204, "204 textures created (main + msaa per build)");
+    assert_eq(_rtm_tex_live, 0, "0 textures live after 102 cycles (was 102 msaa leaks)");
+    assert_eq(_rtm_view_live, 0, "0 views live after 102 cycles");
+    assert_eq(_rtm_bad_release, 0, "churn: no bad release");
+    _rtm_uninstall();
+    return 0;
+}
+
+fn test_rtb_build_single_sample_release() {
+    var table[536];
+    _rtm_install(&table);
+    var rt = rtb_build(rtb_new(64, 64), 0xDE51CE);
+    assert_neq(rt, 0, "1-sample build succeeds");
+    assert_eq(_rtm_tex_calls, 1, "1-sample: one texture");
+    assert_eq(_rtm_view_calls, 1, "1-sample: one view");
+    assert_eq(render_target_msaa_texture(rt), 0, "1-sample: no msaa texture");
+    assert_eq(render_target_msaa_view(rt), 0, "1-sample: no msaa view");
+    assert_eq(render_target_resolve(rt), 0, "1-sample: no resolve target");
+    render_target_release(rt);
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "1-sample release frees texture + view");
+    assert_eq(_rtm_bad_release, 0, "1-sample: no NULL release");
+    _rtm_uninstall();
+    return 0;
+}
+
+# All or nothing: a 0 from any create call releases what the build already made and returns 0.
+fn _rtm_build_fail(table, fail_tex, fail_view, sample_count, depth_format): i64 {
+    _rtm_install(table);
+    _rtm_fail_tex_at = fail_tex;
+    _rtm_fail_view_at = fail_view;
+    var b = rtb_depth(rtb_msaa(rtb_new(256, 256), sample_count), depth_format);
+    return rtb_build(b, 0xDE51CE);
+}
+
+fn test_rtb_build_partial_failure_releases_everything() {
+    var table[536];
+    var d = DEPTH_FORMAT_DEPTH32_FLOAT;
+    assert_eq(_rtm_build_fail(&table, 0, 0 - 1, 4, d), 0, "main texture 0 -> build 0");
+    assert_eq(_rtm_view_calls + _rtm_tex_rel_calls, 0, "main texture 0: nothing made, nothing freed");
+
+    assert_eq(_rtm_build_fail(&table, 0 - 1, 0, 4, d), 0, "main view 0 -> build 0");
+    assert_eq(_rtm_tex_calls, 1, "main view 0: stops before msaa");
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "main view 0: main texture released");
+
+    assert_eq(_rtm_build_fail(&table, 1, 0 - 1, 4, d), 0, "msaa texture 0 -> build 0 (no silent 1x)");
+    assert_eq(_rtm_tex_calls, 2, "msaa texture 0: stops before depth");
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "msaa texture 0: main texture + view released");
+
+    assert_eq(_rtm_build_fail(&table, 0 - 1, 1, 4, d), 0, "msaa view 0 -> build 0");
+    assert_eq(load8(_rtm_tex_state + 1), 2, "msaa view 0: the msaa texture is released");
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "msaa view 0: nothing left live");
+
+    assert_eq(_rtm_build_fail(&table, 2, 0 - 1, 4, d), 0, "depth texture 0 -> build 0");
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "depth texture 0: main + msaa released");
+
+    assert_eq(_rtm_build_fail(&table, 0 - 1, 2, 4, d), 0, "depth view 0 -> build 0");
+    assert_eq(load8(_rtm_tex_state + 2), 2, "depth view 0: the depth texture is released");
+    assert_eq(_rtm_tex_live + _rtm_view_live, 0, "depth view 0: nothing left live");
+    assert_eq(_rtm_bad_release, 0, "failure paths: no NULL / double release");
+    _rtm_uninstall();
+    return 0;
+}
+
+# Bad dimensions / sample counts are refused before any wgpu call; wgpu-valid counts build.
+fn _rtm_rejects(table, w, h, sc): i64 {
+    _rtm_install(table);
+    var rt = rtb_build(rtb_msaa(rtb_new(w, h), sc), 0xDE51CE);
+    if (rt != 0) { return 1; }
+    if (_rtm_tex_calls != 0) { return 2; }
+    return 0;
+}
+
+fn test_rtb_build_rejects_invalid_before_ffi() {
+    var table[536];
+    assert_eq(_rtm_rejects(&table, 0, 64, 1), 0, "width 0 rejected, no FFI");
+    assert_eq(_rtm_rejects(&table, 64, 0, 1), 0, "height 0 rejected, no FFI");
+    assert_eq(_rtm_rejects(&table, 0 - 1, 64, 1), 0, "negative width rejected, no FFI");
+    assert_eq(_rtm_rejects(&table, 8193, 64, 1), 0, "width > MABDA_MAX_TEXTURE_DIM_2D rejected");
+    assert_eq(_rtm_rejects(&table, 64, 8193, 1), 0, "height > MABDA_MAX_TEXTURE_DIM_2D rejected");
+    assert_eq(_rtm_rejects(&table, 0x100000040, 64, 1), 0, "u32-truncating width rejected");
+    assert_eq(_rtm_rejects(&table, 64, 64, 0), 0, "sample_count 0 rejected, no FFI");
+    assert_eq(_rtm_rejects(&table, 64, 64, 3), 0, "sample_count 3 rejected, no FFI");
+    assert_eq(_rtm_rejects(&table, 64, 64, 32), 0, "sample_count 32 rejected, no FFI");
+    var sc = 1;
+    while (sc <= 16) {
+        _rtm_install(&table);
+        var rt = rtb_build(rtb_msaa(rtb_new(8192, 8192), sc), 0xDE51CE);
+        assert_neq(rt, 0, "wgpu-valid sample count (1/2/4/8/16) at the 8192 cap builds");
+        render_target_release(rt);
+        assert_eq(_rtm_tex_live + _rtm_view_live, 0, "valid sample count: release frees all");
+        sc = sc * 2;
+    }
+    _rtm_uninstall();
+    return 0;
+}
+
+# ================================================================
 # v2.5.0 — render graph
 # ================================================================
 
@@ -230,7 +523,7 @@ fn test_rg_build_out_of_order_raw() {
     var rnode = vec_get(nodes, 0);   # reader (captured pre-build; struct identity is stable)
     var wnode = vec_get(nodes, 1);   # writer
     assert_eq(rg_build(g, 0), 0, "out-of-order graph builds (no false cycle)");
-    assert_eq(load64(wnode + 48), 0, "writer sorts first despite later insertion");
+    assert_eq(load64(wnode + 48), 0, "writer sorts first despite being inserted after the reader");
     assert_eq(load64(rnode + 48), 1, "reader sorts after its writer");
     return 0;
 }
@@ -375,7 +668,7 @@ fn test_rg_execute_mq_forwards_v25() {
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
     rg_add_compute(g, 0, 0, &dims, "n");
     rg_build(g, 0);
-    var fakectx[40]; memset(&fakectx, 0, 40);
+    var fakectx[176]; memset(&fakectx, 0, 176);   # GPU_CONTEXT_SIZE
     assert_eq(rg_execute_mq(g, &fakectx), 1,
       "rg_execute_mq forwards to v2.5 path (null device → 1)");
     return 0;
@@ -1055,6 +1348,12 @@ fn main() {
     test_audit_rpb_pass_color_offsets();
     test_audit_rpb_pass_begin_empty_short_circuits();
     test_audit_render_target_rgba8_rejects_invalid();
+    test_render_target_struct_layout_msaa_texture();
+    test_rtb_build_msaa_release_frees_msaa_texture();
+    test_rtb_build_msaa_churn_leaves_nothing_live();
+    test_rtb_build_single_sample_release();
+    test_rtb_build_partial_failure_releases_everything();
+    test_rtb_build_rejects_invalid_before_ffi();
     test_rg_new_initial_state();
     test_rg_add_compute_returns_incrementing_ids();
     test_rg_add_render_and_copy_nodes();

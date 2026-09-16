@@ -2,19 +2,24 @@
 # render_target.cyr — offscreen render target with optional MSAA and depth
 # Ported from mabda/src/render_target.rs
 #
-# RenderTarget struct layout (64 bytes):
-#   +0:  texture      (WGPUTexture, 8)
+# RenderTarget struct layout (72 bytes):
+#   +0:  texture      (WGPUTexture, 8) — 1-sample color texture (the resolve target on MSAA)
 #   +8:  view         (WGPUTextureView, 8)
-#   +16: format       (u32 WGPUTextureFormat)
+#   +16: format       (u32 WGPUTextureFormat; +20..+23 padding)
 #   +24: width        (i64)
 #   +32: height       (i64)
 #   +40: sample_count (i64)
 #   +48: msaa_view    (WGPUTextureView or 0, 8)
 #   +56: depth        (DepthTexture ptr or 0, 8)
-# Audit 2026-06-14 [LOW-2]: total is 64 bytes (RENDER_TARGET_SIZE below),
-# not 48 — the +48 msaa_view and +56 depth fields extend through byte 63.
+#   +64: msaa_texture (WGPUTexture or 0, 8) — the N-sample texture behind msaa_view
+# Total 72 bytes (RENDER_TARGET_SIZE below; +64 msaa_texture extends through byte 71).
+# 4.1.3: +64 is new. Until then rtb_build kept only the MSAA *view*, so the N-sample texture
+# handle was unreachable and never released — every MSAA RenderTarget leaked one texture
+# (~31.6 MiB at 4x 1920x1080 RGBA8). The field is appended so +0..+56 keep their offsets.
+# Release every handle with render_target_release.
+# Audit 2026-06-14 [LOW-2]: the total must track RENDER_TARGET_SIZE (was stale at 48 vs 64).
 
-var RENDER_TARGET_SIZE = 64;
+var RENDER_TARGET_SIZE = 72;
 
 # Accessors
 fn render_target_texture(rt): i64 { return load64(rt); }
@@ -25,6 +30,7 @@ fn render_target_height(rt): i64 { return load64(rt + 32); }
 fn render_target_sample_count(rt): i64 { return load64(rt + 40); }
 fn render_target_msaa_view(rt): i64 { return load64(rt + 48); }
 fn render_target_depth(rt): i64 { return load64(rt + 56); }
+fn render_target_msaa_texture(rt): i64 { return load64(rt + 64); }
 
 # Get the view to render into (MSAA view if multisampled, else main view)
 fn render_target_render_view(rt): i64 {
@@ -45,6 +51,40 @@ fn render_target_depth_view(rt): i64 {
     var depth = render_target_depth(rt);
     if (depth == 0) { return 0; }
     return depth_texture_view(depth);
+}
+
+# Release every GPU handle rtb_build created, then zero it: the MSAA view and the MSAA texture
+# behind it (+48, +64), the 1-sample view and texture (+8, +0), and the depth attachment's view
+# and texture (DepthTexture +8 / +0, see src/depth.cyr) before clearing +56. Views go before the
+# texture they view. wgpu-native's release entry points reject a NULL handle, so each is
+# null-checked, and a repeat call on the same RenderTarget releases nothing. The RenderTarget and
+# DepthTexture structs are bump-allocated and stay allocated; format/width/height/sample_count
+# are left as they were. Null-safe. Returns 0.
+fn render_target_release(rt): i64 {
+    if (rt == 0) { return 0; }
+    var msaa_view = load64(rt + 48);
+    var msaa_tex  = load64(rt + 64);
+    if (msaa_view != 0) { wgpu_texture_view_release(msaa_view); }
+    if (msaa_tex != 0)  { wgpu_texture_release(msaa_tex); }
+    store64(rt + 48, 0);
+    store64(rt + 64, 0);
+    var view = load64(rt + 8);
+    var tex  = load64(rt + 0);
+    if (view != 0) { wgpu_texture_view_release(view); }
+    if (tex != 0)  { wgpu_texture_release(tex); }
+    store64(rt + 0, 0);
+    store64(rt + 8, 0);
+    var depth = load64(rt + 56);
+    if (depth != 0) {
+        var dview = depth_texture_view(depth);
+        var dtex  = depth_texture_handle(depth);
+        if (dview != 0) { wgpu_texture_view_release(dview); }
+        if (dtex != 0)  { wgpu_texture_release(dtex); }
+        store64(depth + 0, 0);
+        store64(depth + 8, 0);
+    }
+    store64(rt + 56, 0);
+    return 0;
 }
 
 # ================================================================
@@ -83,23 +123,47 @@ fn rtb_depth(b, depth_format): i64 {
     return b;
 }
 
+# wgpu texture sampleCount values rtb_build accepts: 1 (no MSAA) or 2, 4, 8, 16 — the counts
+# wgpu-core's per-format multisample flags can grant (WebGPU core guarantees 1 and 4; the rest
+# are adapter-specific and wgpu validates them). Anything else, 0 included, is a caller error.
+fn _render_target_sample_count_ok(n): i64 {
+    if (n == 1)  { return 1; }
+    if (n == 2)  { return 1; }
+    if (n == 4)  { return 1; }
+    if (n == 8)  { return 1; }
+    if (n == 16) { return 1; }
+    return 0;
+}
+
 # Build — creates the real GPU texture + view(s) + optional depth attachment.
 # Returns a RenderTarget ptr (GPU resources allocated) or 0 on failure.
 #
 # Single-sampled build: one texture (usage = RENDER_ATTACHMENT | TEXTURE_BINDING
 # | COPY_SRC) + default view.
-# MSAA build: a resolve-sided 1-sample texture (same usage, stored at `view`)
-# PLUS an N-sample MSAA texture (RENDER_ATTACHMENT only — multisampled
-# textures cannot carry TEXTURE_BINDING, wgpu rejects that combo) stored at
-# `msaa_view`. The render-pass builder points `view` at the render target and
-# `resolve_target` at the MSAA view to drive hardware resolve at pass end.
+# MSAA build: a resolve-side 1-sample texture (same usage, stored at +0 / view at +8)
+# PLUS an N-sample MSAA texture (RENDER_ATTACHMENT only — multisampled textures cannot carry
+# TEXTURE_BINDING, wgpu rejects that combo) stored at +64 with its view at +48. A render pass
+# draws into the MSAA view (render_target_render_view) and resolves into the 1-sample view
+# (render_target_resolve) at pass end — rpb_pass_color_msaa(b, render_view, resolve_view, ...).
 # With depth_format != 0, a matching depth_texture_new is attached at +56.
+#
+# Rejected before any allocation or FFI call: width or height outside 1..MABDA_MAX_TEXTURE_DIM_2D
+# (the cap every other texture create path uses; it also keeps the u32 descriptor extents exact)
+# and a sample count outside _render_target_sample_count_ok. All or nothing: if any texture or
+# view it asks for comes back 0, everything already created is released (render_target_release)
+# and the build returns 0 — it never hands back a target with a missing MSAA or depth attachment
+# while sample_count / depth_format say it has one. Release a built target with
+# render_target_release.
 fn rtb_build(b, device): i64 {
     var width        = load64(b + 0);
     var height       = load64(b + 8);
     var format       = load32(b + 16);
     var sample_count = load32(b + 20);
     var depth_format = load32(b + 24);
+    if (width <= 0)  { return 0; }
+    if (height <= 0) { return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return 0; }
+    if (_render_target_sample_count_ok(sample_count) == 0) { return 0; }
 
     var rt = alloc(RENDER_TARGET_SIZE);
     memset(rt, 0, RENDER_TARGET_SIZE);
@@ -116,10 +180,14 @@ fn rtb_build(b, device): i64 {
       WGPU_TEXTURE_DIMENSION_2D, width, height, format);
     var main_tex = wgpu_device_create_texture(device, main_desc);
     if (main_tex == 0) { return 0; }
+    store64(rt + 0, main_tex);
     var main_view_desc = wgpu_texture_view_descriptor(0, format,
       WGPU_TEXTURE_VIEW_DIMENSION_2D);
     var main_view = wgpu_texture_create_view(main_tex, main_view_desc);
-    store64(rt + 0, main_tex);
+    if (main_view == 0) {
+        render_target_release(rt);
+        return 0;
+    }
     store64(rt + 8, main_view);
 
     # --- Optional MSAA texture (N samples, RENDER_ATTACHMENT only) ---
@@ -130,16 +198,33 @@ fn rtb_build(b, device): i64 {
         # Override sampleCount @ +56 (wgpu_texture_descriptor bakes in 1).
         store32(msaa_desc + 56, sample_count);
         var msaa_tex = wgpu_device_create_texture(device, msaa_desc);
-        if (msaa_tex != 0) {
-            var msaa_view = wgpu_texture_create_view(msaa_tex, main_view_desc);
-            store64(rt + 48, msaa_view);
+        if (msaa_tex == 0) {
+            render_target_release(rt);
+            return 0;
         }
+        # Store the texture BEFORE its view so every exit below can release it.
+        store64(rt + 64, msaa_tex);
+        var msaa_view = wgpu_texture_create_view(msaa_tex, main_view_desc);
+        if (msaa_view == 0) {
+            render_target_release(rt);
+            return 0;
+        }
+        store64(rt + 48, msaa_view);
     }
 
     # --- Optional depth attachment ---
     if (depth_format != 0) {
         var depth = depth_texture_new(device, width, height, depth_format);
+        if (depth == 0) {
+            render_target_release(rt);
+            return 0;
+        }
         store64(rt + 56, depth);
+        # depth_texture_new keeps a 0 view without failing; release its texture too.
+        if (depth_texture_view(depth) == 0) {
+            render_target_release(rt);
+            return 0;
+        }
     }
     return rt;
 }
@@ -151,8 +236,11 @@ fn rtb_build(b, device): i64 {
 # coexist with the v2.x rtb_* / render_target_* helpers above; v2.x
 # wgpu programs that build their own RenderTarget directly continue
 # to work, and new programs can use the dispatcher for backend-
-# agnostic code. Returned rt_ptr is opaque (32-byte struct on both
-# backends — see docs/archive/proposals/v3-backend-interface.md v2.1).
+# agnostic code. Returned rt_ptr is opaque and backend-shaped: 32 bytes on
+# wgpu, 40 on native AMD (NATIVE_RT_STRUCT_SIZE) and NVIDIA (NV_RT_STRUCT_SIZE)
+# — see docs/archive/proposals/v3-backend-interface.md v2.1. These slot RTs
+# are single-sample RGBA8 on every backend (no MSAA texture to own); release
+# them with gpu_render_target_release, never render_target_release.
 
 fn gpu_render_target_create_2d_rgba8(ctx, width, height): i64 {
     if (ctx == 0) { return 0; }

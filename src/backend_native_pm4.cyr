@@ -177,6 +177,23 @@ fn native_pm4_set_uconfig_reg_pair(buf, pos, byte_offset, values): i64 {
     return pos + 16;
 }
 
+# Emit a SET_UCONFIG_REG packet for `n` contiguous registers starting at
+# `byte_offset` (real MMIO address, 0x30000 base). `values` points to n u32s.
+# Packet: header + reg_offset + n values = n + 2 dwords. Returns new pos.
+fn native_pm4_set_uconfig_reg(buf, pos, byte_offset, n, values): i64 {
+    store32(buf + pos, native_pm4_pkt3_header(IT_SET_UCONFIG_REG, n + 1, 0));
+    pos = pos + 4;
+    store32(buf + pos, (byte_offset - PM4_UCONFIG_REG_BASE) / 4);
+    pos = pos + 4;
+    var i = 0;
+    while (i < n) {
+        store32(buf + pos, load32(values + i * 4));
+        pos = pos + 4;
+        i = i + 1;
+    }
+    return pos;
+}
+
 # ================================================================
 # v3 Step 6.4 — context-register + draw PM4 builders (Phase C)
 # ================================================================
@@ -875,10 +892,23 @@ fn native_f32_neg_bits(f32_bits): i64 {
 
 # --- Block 1: pipeline_sh ---
 #
-# Two SET_SH_REG packets, each writing 4 contiguous regs starting at
-# the PGM_LO of each stage. VS at 0xB120, PS at 0xB020. Total: 12
-# dwords (48 bytes). Returns new pos.
+# SET_SH_REG VS (RSRC3_VS, LATE_ALLOC_VS, PGM_LO/HI, RSRC1/2: 8 dwords), SET_SH_REG
+# PS (PGM_LO/HI, RSRC1/2: 6 dwords), SET_SH_REG RSRC3_PS (3 dwords) = 68 bytes
+# (NATIVE_PIPE_SH_BLOCK_SIZE). Returns new pos.
+#
+# This form uses the Cezanne capture's VS compute-unit mask + late-alloc limit
+# (GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL / GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE)
+# — the clear-triangle diagnostic composer and CPU tests use it. The draw path
+# (native_render_pipeline_pack) passes the device-derived pair to
+# native_pm4_build_render_pipeline_sh_cu instead.
 fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va): i64 {
+    return native_pm4_build_render_pipeline_sh_cu(buf, pos, vs_va, fs_va,
+      GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL, GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE);
+}
+
+# pipeline_sh with an explicit SPI_SHADER_PGM_RSRC3_VS value and
+# SPI_SHADER_LATE_ALLOC_VS limit (native_gfx9_vs_late_alloc_derive).
+fn native_pm4_build_render_pipeline_sh_cu(buf, pos, vs_va, fs_va, rsrc3_vs, late_alloc_vs): i64 {
     # PGM_HI mask = 0xFF: the HW register is 32-bit but only the low 8
     # bits hold meaningful VA bits [47:40]; matches compute pattern at
     # line ~809 (R_COMPUTE_PGM_HI). PGM_LO carries bits [39:8].
@@ -893,8 +923,8 @@ fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va): i64 {
     # control wave allocation; if absent or zero the VS can't launch on
     # any CU → 2-second GFX TDR even with otherwise-correct shader code.
     var vs_regs[24];
-    store32(&vs_regs +  0, GFX9_SPI_SHADER_PGM_RSRC3_VS_CU_EN_ALL);
-    store32(&vs_regs +  4, GFX9_SPI_SHADER_LATE_ALLOC_VS_CEZANNE);
+    store32(&vs_regs +  0, rsrc3_vs);
+    store32(&vs_regs +  4, late_alloc_vs);
     store32(&vs_regs +  8, vs_pgm_lo);
     store32(&vs_regs + 12, vs_pgm_hi);
     store32(&vs_regs + 16, GFX9_GFX_PGM_RSRC1_MIN);
@@ -907,6 +937,11 @@ fn native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va): i64 {
     store32(&ps_regs +  8, GFX9_GFX_PGM_RSRC1_MIN);
     store32(&ps_regs + 12, GFX9_PS_PGM_RSRC2_MIN);
     pos = native_pm4_set_sh_reg(buf, pos, R_SPI_SHADER_PGM_LO_PS, 4, &ps_regs);
+
+    # 4.1.3: RSRC3_PS (PS compute-unit enable + wave limit) was never written
+    # — the PS ran on the CU mask the prior UMD left. Own it like RSRC3_VS.
+    pos = native_pm4_set_sh_reg_one(buf, pos, R_SPI_SHADER_PGM_RSRC3_PS,
+      GFX9_SPI_SHADER_PGM_RSRC3_PS_CU_EN_ALL);
 
     return pos;
 }
@@ -947,6 +982,13 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # distances, no viewport-array index, no misc-vec). Must be set
     # explicitly to clear whatever value the prior context left here.
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_VS_OUT_CNTL, 0);
+    # PA_CL_VTE_CNTL = 0x43F: W-divide + viewport scale/offset ON. 4.1.3 root
+    # cause: never written, so the stream ran on the clear-state 0 on a fresh
+    # boot / after idle power-gating / a context switch — viewport transform
+    # OFF, the fullscreen triangle covered only pixel (0,0). Emitted in EVERY
+    # render stream (this block is spliced into each draw), never "once".
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_VTE_CNTL,
+      GFX9_PA_CL_VTE_CNTL_W_DIVIDE_VIEWPORT);
 
     # SPI inputs/outputs — FS gets the hang-quirk minimum, VS exports
     # only pos0 (no params).
@@ -975,15 +1017,17 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # Per gfx9.json + radv ac_cmdbuf.c preamble, the following must
     # be set before any DRAW_INDEX_AUTO on GFX9:
     #
-    #   - Guard-band adjusts (PA_CL_GB_*_ADJ = 1.0f) — without these,
-    #     the rasterizer's clip-to-guard-band step can hang on small
-    #     primitives.
-    #   - VGT vertex reuse / output dealloc — VGT deadlocks if these
-    #     are zero (CLEAR_STATE doesn't reliably clear them on
-    #     Bonaire / Cezanne / etc.).
-    #   - PA_SC_BINNER_CNTL_0 = 0 — disable primitive binning. APUs
-    #     ship with binning enabled by default; without an explicit
-    #     BINNER_CNTL_1 batch configuration the DPB pipeline hangs.
+    #   - Guard-band adjusts (PA_CL_GB_*_CLIP_ADJ ≈ 254.99f, _DISC_ADJ =
+    #     1.0f) — a 1.0 clip adjust sent the fullscreen triangle down the
+    #     slow-path clipper, which hung the ring (see GFX9_PA_CL_GB_CLIP_ADJ_F32).
+    #   - VGT vertex reuse / output dealloc — written at the kernel clear
+    #     pair 30 / 32 that radv and radeonsi run with on this GPU (Mesa's
+    #     "CLEAR_STATE doesn't clear these correctly" 14 / 16 write applies
+    #     only to GFX7- or !has_clear_state; see GFX9_VGT_OUT_DEALLOC).
+    #   - PA_SC_BINNER_CNTL_0 = DISABLE_BINNING_USE_LEGACY_SC (0 would be
+    #     BINNING_ALLOWED) + BINNER_CNTL_1 batch limits. APUs ship with
+    #     binning enabled by default; the "DPB pipeline hangs" without them
+    #     is an unverified hang claim (not re-tested).
 
     # Four contiguous guard-band adjusts in one SET_CONTEXT_REG packet.
     # CLIP_ADJ ≈ 254.992f (NOT 1.0f); DISC_ADJ = 1.0f. See the constant
@@ -1015,22 +1059,24 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     # in src/backend_native_shaders.cyr for the per-register rationale.
     pos = native_pm4_set_context_reg_one(buf, pos, R_DB_DEPTH_CONTROL, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_DB_RENDER_CONTROL, 0);
-    # PA_SU_VTX_CNTL: PIX_CENTER=1 (bit 0), ROUND_MODE=2 (bits 1:2 → 0b10 = trunc).
-    # Value = 1 | (2 << 1) = 0x5.
+    # PA_SU_VTX_CNTL: PIX_CENTER=1 (bit 0), ROUND_MODE=2 (bits 1:2 →
+    # X_ROUND_TO_EVEN per gfx9.json). Value = 1 | (2 << 1) = 0x5.
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_VTX_CNTL, 0x5);
     # PA_SC_MODE_CNTL_1 = 0x760201BC — scan-converter walk-order +
     # FORCE_EOV bits captured byte-for-byte from radv triangle reference.
-    # Decoded bits include WALK_FENCE_ENABLE, WALK_FENCE_SIZE=3,
-    # SUPERTILE_WALK_ORDER_ENABLE, FORCE_EOV_CNTDWN_ENABLE,
-    # FORCE_EOV_REZ_ENABLE, MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE.
-    # With value 0 the SC's walk-order is unconfigured → can stall on
-    # tile traversal.
+    # gfx9.json decode: WALK_ALIGN8_PRIM_FITS_ST, WALK_FENCE_ENABLE,
+    # WALK_FENCE_SIZE=3, SUPERTILE_WALK_ORDER_ENABLE, TILE_WALK_ORDER_ENABLE,
+    # MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE, FORCE_EOV_CNTDWN_ENABLE,
+    # FORCE_EOV_REZ_ENABLE, OUT_OF_ORDER_WATER_MARK=7. The "value 0 can stall
+    # on tile traversal" note is an unverified hang claim (not re-tested).
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_1, 0x760201BC);
     pos = native_pm4_set_context_reg_one(buf, pos, R_SPI_TMPRING_SIZE, 0);
+    # PA_SC_CLIPRECT_RULE = 0xFFFF (clear state): every clip-rect combination
+    # passes. 4.1.3 round 2 HW re-test: a rule of 0 drew no pixel in any gate.
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_CLIPRECT_RULE, 0xFFFF);
-    # PA_SU_PRIM_FILTER_CNTL = 0xC0000000 — bits 30+31 set. Captured
-    # from radv triangle reference. Likely XMAX_RIGHT_EXCLUSION +
-    # YMAX_BOTTOM_EXCLUSION (D3D vs OpenGL pixel-rule selection).
+    # PA_SU_PRIM_FILTER_CNTL = 0xC0000000 — captured from radv triangle
+    # reference; gfx9.json decode: XMAX_RIGHT_EXCLUSION[30] +
+    # YMAX_BOTTOM_EXCLUSION[31] (exclusive right / bottom primitive edges).
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_PRIM_FILTER_CNTL, 0xC0000000);
 
     # PA_SC_VPORT_SCISSOR_0_TL/BR — per-viewport scissor (separate
@@ -1070,25 +1116,94 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
     pos = native_pm4_set_context_reg_one(buf, pos, R_DB_Z_INFO, 0);
     pos = native_pm4_set_context_reg_one(buf, pos, R_DB_STENCIL_INFO, 0);
     # PA_SC_AA_MASK_X0Y0_X1Y0 / X0Y1_X1Y1 — sample coverage mask for
-    # the rasterizer. Default 0 = no samples covered = no pixels written.
-    # 0xFFFFFFFF = all samples covered (every pixel passes coverage).
+    # the rasterizer. 0xFFFFFFFF = all samples covered (also the kernel clear
+    # state); a prior context's 0 covers no sample and writes no pixel
+    # (4.1.3 round 2 HW re-test: every gate reads back only the sentinel).
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y0_X1Y0, 0xFFFFFFFF);
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_AA_MASK_X0Y1_X1Y1, 0xFFFFFFFF);
 
-    # PA_SC_MODE_CNTL_0 = 0x22 — bits 1+5 set. Captured from radv
-    # triangle test. Without it the SC's mode is unconfigured.
+    # PA_SC_MODE_CNTL_0 = 0x22 — captured from radv triangle test; gfx9.json
+    # decode: VPORT_SCISSOR_ENABLE[1] + ALTERNATE_RBS_PER_TILE[5] (this
+    # Cezanne reports 2 render backends); MSAA_ENABLE[0] = 0.
     pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_MODE_CNTL_0, 0x22);
     # VGT_GS_OUT_PRIM_TYPE = 2 (TRIANGLE_STRIP). Even when VGT_SHADER_STAGES_EN
     # has GS_EN=0, VGT consults this for prim-output sizing. Default 0
     # (POINTLIST) makes VGT allocate wrong-sized prim buffers.
     pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_GS_OUT_PRIM_TYPE, 2);
 
-    # SX_MRT0..7_BLEND_OPT removed — radv's value 0x06000600 may encode
-    # BLEND_OPT_PRESERVE_NONE which makes the SX think the FS output
-    # is don't-care, causing the CB to write zeros instead of the FS's
-    # exported color. With these regs left unset (default 0), the FS's
-    # FP32 export reaches the CB intact. Re-add only if a regression
-    # surfaces on a path that actually uses blend optimization.
+    # ---- 4.1.3: state the stream must own, never inherit ----
+    # Audited against radv's FULL submission on this Cezanne (the nested
+    # gfx_init IB, which opens with CLEAR_STATE, plus the main IB) and the
+    # kernel clear state. Each register below changes mabda's pixels when a
+    # prior context leaves a non-default value; see the constant comments in
+    # backend_native_shaders.cyr for field breakdowns and evidence.
+
+    # SX_MRT0..7_BLEND_OPT = OPT_COMB_BLEND_DISABLED (8 contiguous). The RB+
+    # blend optimizer is enabled (SX_BLEND_OPT_CONTROL = 0) and discards
+    # pixels per these hints — a prior "src has no effect" hint (0x01100110)
+    # dropped every pixel of the solid-red, textured and 2D-array draws on
+    # Cezanne.
+    var sx_mrt_opt[32];
+    var mi = 0;
+    while (mi < 8) {
+        store32(&sx_mrt_opt + mi * 4, GFX9_SX_MRT_BLEND_OPT_DEFAULT);
+        mi = mi + 1;
+    }
+    pos = native_pm4_set_context_reg(buf, pos, R_SX_MRT0_BLEND_OPT, 8, &sx_mrt_opt);
+
+    # Coverage rules: alpha-to-coverage off, no EQAA over-rasterization, the
+    # clear-state top-left edge rule, standard (non-conservative) raster.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_ALPHA_TO_MASK, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_EQAA, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SC_EDGERULE,
+      GFX9_PA_SC_EDGERULE_CLEAR);
+    pos = native_pm4_set_context_reg_one(buf, pos,
+      R_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, 0);
+
+    # Stream-out off, stream 0 rasterized (VGT_STRMOUT_CONFIG + _BUFFER_CONFIG).
+    var strmout[8];
+    store32(&strmout + 0, 0);
+    store32(&strmout + 4, 0);
+    pos = native_pm4_set_context_reg(buf, pos, R_VGT_STRMOUT_CONFIG, 2, &strmout);
+
+    # MRT1..7 unbound: CB_COLORn_INFO FORMAT = COLOR_INVALID.
+    var cbn = 0;
+    while (cbn < 7) {
+        pos = native_pm4_set_context_reg_one(buf, pos,
+          R_CB_COLOR1_INFO + cbn * GFX9_CB_COLOR_MRT_STRIDE, 0);
+        cbn = cbn + 1;
+    }
+
+    # DFSM punch-out off, paired with the binning disable above.
+    pos = native_pm4_set_context_reg_one(buf, pos, R_DB_DFSM_CONTROL,
+      GFX9_DB_DFSM_PUNCHOUT_FORCE_OFF);
+
+    # ---- 4.1.3 round 2: rest of the never-reset / clear-state class ----
+    # Clear-state values (constant comments in backend_native_shaders.cyr carry
+    # the gfx9.json fields and the Mesa no-CLEAR_STATE references). 132 bytes.
+    # VGT output path = vertex-reuse path, legacy tessellation off.
+    var vgt_path[8];
+    store32(&vgt_path + 0, 0);   # VGT_OUTPUT_PATH_CNTL.PATH_SELECT
+    store32(&vgt_path + 4, 0);   # VGT_HOS_CNTL.TESS_MODE
+    pos = native_pm4_set_context_reg(buf, pos, R_VGT_OUTPUT_PATH_CNTL, 2, &vgt_path);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_ENHANCE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_IA_ENHANCE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_WD_ENHANCE, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_VTX_CNT_EN, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_VGT_DRAW_PAYLOAD_CNTL, 0);
+    # Clip / setup: no NaN/Inf discard modes, no small-primitive culling, no
+    # zero-area discard, stereo off (the one register here CLEAR_STATE omits).
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_CL_NANINF_CNTL, 0);
+    pos = native_pm4_set_context_reg_one(buf, pos, R_PA_SU_SMALL_PRIM_FILTER_CNTL, 0);
+    var su_stereo[8];
+    store32(&su_stereo + 0, 0);  # PA_SU_OVER_RASTERIZATION_CNTL
+    store32(&su_stereo + 4, 0);  # PA_STEREO_CNTL
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SU_OVER_RASTERIZATION_CNTL, 2, &su_stereo);
+    # Scan converter: no screen slicing, no tile steering override.
+    var sc_steer[8];
+    store32(&sc_steer + 0, 0);   # PA_SC_SCREEN_EXTENT_CONTROL
+    store32(&sc_steer + 4, 0);   # PA_SC_TILE_STEERING_OVERRIDE
+    pos = native_pm4_set_context_reg(buf, pos, R_PA_SC_SCREEN_EXTENT_CONTROL, 2, &sc_steer);
 
     return pos;
 }
@@ -1099,6 +1214,9 @@ fn native_pm4_build_render_pipeline_ctx(buf, pos): i64 {
 # (NDC → pixel mapping with y-flip), and CB_COLOR0_* binding.
 # `rt_va` must be 8-byte aligned. `rt_width` and `rt_height` are
 # pixel counts (must be even for the /2 viewport math to be exact).
+# Always NATIVE_RENDER_PASS_TARGET_BYTES (264): 3 scissor pairs (48), the
+# 6-register viewport (32), Z min/max (16), 14 CB_COLOR0 / EPITCH singles (168).
+var NATIVE_RENDER_PASS_TARGET_BYTES = 264;
 fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height): i64 {
     # Scissors. Format: low 16 bits = X, high 16 bits = Y.
     var scissor_tl = 0;
@@ -1189,6 +1307,40 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height): i6
     return pos;
 }
 
+# --- Draw state (UConfig, global — not per-context) ---
+#
+# The UConfig input-assembly state every auto-index draw depends on. UConfig
+# registers are chip-global and NOT reset by CLEAR_STATE, so whatever the
+# last UMD left applies unless the stream writes it:
+#   VGT_PRIMITIVE_TYPE  = TRIANGLELIST
+#   IA_MULTI_VGT_PARAM  = 0x0070007F (radv capture; PRIMGROUP_SIZE=0x7F,
+#                         WD_SWITCH_ON_EOP, EN_INST_OPT_BASIC/ADV)
+#   VGT_MAX_VTX_INDX / VGT_MIN_VTX_INDX / VGT_INDX_OFFSET /
+#   VGT_MULTI_PRIM_IB_RESET_EN = 0xFFFFFFFF / 0 / 0 / 0 (4 contiguous) —
+#     the vertex-id clamp, bias and primitive restart the fullscreen VS's
+#     vid-derived positions pass through (4.1.3; negative-controlled on
+#     Cezanne: a stale MAX=0, MIN=1 or OFFSET=1 drew nothing).
+#   VGT_INSTANCE_BASE_ID = 0 (4.1.3 round 2; radv writes 0 in every GFX9
+#     gfx_init).
+# NATIVE_RENDER_DRAW_STATE_BYTES (60). Shared by
+# native_pm4_build_render_clear_triangle and the pass_draw composer
+# (native_render_pass_pm4_compose). Returns new pos.
+var NATIVE_RENDER_DRAW_STATE_BYTES = 60;
+fn native_pm4_build_render_draw_state(buf, pos): i64 {
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
+      GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_IA_MULTI_VGT_PARAM,
+      GFX9_IA_MULTI_VGT_PARAM_TRILIST);
+    var vtx_indx[16];
+    store32(&vtx_indx +  0, 0xFFFFFFFF);   # VGT_MAX_VTX_INDX
+    store32(&vtx_indx +  4, 0);            # VGT_MIN_VTX_INDX
+    store32(&vtx_indx +  8, 0);            # VGT_INDX_OFFSET
+    store32(&vtx_indx + 12, 0);            # VGT_MULTI_PRIM_IB_RESET_EN
+    pos = native_pm4_set_uconfig_reg(buf, pos, R_VGT_MAX_VTX_INDX, 4, &vtx_indx);
+    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_INSTANCE_BASE_ID, 0);
+    return pos;
+}
+
 # --- Block 4: draw_tail ---
 #
 # Single DRAW_INDEX_AUTO with caller-supplied `vertex_count` and
@@ -1198,8 +1350,8 @@ fn native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height): i6
 # (= 3) in v3.0-rc.1; consumers couldn't draw anything but the
 # fullscreen triangle through this builder. The fullscreen-tri
 # composer (native_pm4_build_render_clear_triangle) still passes
-# GFX9_FULLSCREEN_TRI_VCOUNT explicitly to preserve its byte-for-
-# byte equivalence with the v3.0-rc.1 PM4 stream.
+# GFX9_FULLSCREEN_TRI_VCOUNT explicitly (its draw packet is unchanged
+# since v3.0-rc.1).
 fn native_pm4_build_render_draw_tail(buf, pos, vertex_count): i64 {
     return native_pm4_draw_index_auto(buf, pos,
       vertex_count,
@@ -1207,26 +1359,31 @@ fn native_pm4_build_render_draw_tail(buf, pos, vertex_count): i64 {
 }
 
 # Top-level composer: emits the full PM4 stream for a single
-# clear-triangle dispatch into `buf`. Returns total bytes written
-# (= position after the NOP padding tail).
+# clear-triangle dispatch into `buf`. Returns total bytes written — always
+# native_pm4_render_clear_triangle_bytes() (every packet is fixed-size).
 #
 # Layout:
-#   1. ACQUIRE_MEM full invalidate
-#   2. UConfig graphics: VGT_PRIMITIVE_TYPE + VGT_NUM_INSTANCES
+#   1. PFP_SYNC_ME + ACQUIRE_MEM full invalidate + PIPELINESTAT_START
+#   2. draw state (UConfig): VGT_PRIMITIVE_TYPE, IA_MULTI_VGT_PARAM,
+#      VGT_MAX/MIN_VTX_INDX, VGT_INDX_OFFSET, VGT_MULTI_PRIM_IB_RESET_EN,
+#      VGT_INSTANCE_BASE_ID
 #   3. Block 1 — pipeline_sh
 #   4. Block 2 — pipeline_ctx
 #   5. Block 3 — pass_target
-#   6. Block 4 — draw_tail
-#   7. NOP padding to 256-dword (1024-byte) alignment
+#   6. NUM_INSTANCES + Block 4 — draw_tail + CACHE_FLUSH_AND_INV
+# No NOP padding. 4.1.3 round 2 removed the "pad to 256 dwords" step: the
+# owned-state additions had already grown every render stream past 256 dwords
+# (so the branch could not run), and the kernel imposes no minimum — radv's
+# gfx_init IB on this Cezanne is 104 dwords.
 #
-# `buf` must be at least 1024 bytes.  `vs_va` and `fs_va` are GPU
-# VAs of the VS+FS BOs (256-byte aligned). `rt_va` is the GPU VA of
-# the color target (8-byte aligned). `rt_width`/`rt_height` are RT
-# dimensions in pixels (must be even).
+# `buf` must be at least native_pm4_render_clear_triangle_bytes() long.
+# `vs_va` and `fs_va` are GPU VAs of the VS+FS BOs (256-byte aligned).
+# `rt_va` is the GPU VA of the color target (8-byte aligned).
+# `rt_width`/`rt_height` are RT dimensions in pixels (must be even).
 #
 # Verification: every emitted dword is structurally tested by
-# `test_native_pm4_render_clear_triangle_*` in mabda_v3.tcyr.
-# Layer-2 byte-exact diff against radv is gated on Hyprland.
+# `test_native_pm4_render_clear_triangle_*` in tests/tcyr/native.tcyr, and the
+# owned-state registers by test_native_render_stream_owns_inherited_state.
 fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
   rt_va, rt_width, rt_height): i64 {
     var pos = 0;
@@ -1247,13 +1404,7 @@ fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
     pos = native_pm4_pfp_sync_me(buf, pos);
     pos = native_pm4_acquire_mem_full_invalidate_for_gfx_ring(buf, pos);
     pos = native_pm4_event_write_pipelinestat_start(buf, pos);
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_VGT_PRIMITIVE_TYPE,
-      GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST);
-    # IA_MULTI_VGT_PARAM = 0x0070007f — input-assembler multi-VGT config.
-    # Captured from radv on Cezanne. Without it the IA stage can't issue
-    # primitives correctly to the VGT (default = unconfigured). Bits:
-    # PRIMGROUP_SIZE=127, PARTIAL_VS_WAVE_ON=1, SWITCH_ON_EOI=1.
-    pos = native_pm4_set_uconfig_reg_one(buf, pos, R_IA_MULTI_VGT_PARAM, 0x0070007F);
+    pos = native_pm4_build_render_draw_state(buf, pos);
     pos = native_pm4_build_render_pipeline_sh(buf, pos, vs_va, fs_va);
     pos = native_pm4_build_render_pipeline_ctx(buf, pos);
     pos = native_pm4_build_render_pass_target(buf, pos, rt_va, rt_width, rt_height);
@@ -1272,12 +1423,6 @@ fn native_pm4_build_render_clear_triangle(buf, vs_va, fs_va,
     # phase_d_cache_flush_and_inv_post_draw entry for the
     # ACQUIRE_MEM-vs-flush semantics.
     pos = native_pm4_event_write_cache_flush_and_inv(buf, pos);
-
-    var cur_dwords = pos / 4;
-    var target_dwords = 256;
-    if (cur_dwords < target_dwords) {
-        pos = native_pm4_nop(buf, pos, target_dwords - cur_dwords);
-    }
     return pos;
 }
 

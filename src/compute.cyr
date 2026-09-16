@@ -97,11 +97,10 @@ var MABDA_MAX_DISPATCH_DIM = 65535;
 
 # Dispatch a compute pipeline with one bind group.
 # `dims_xyz` must point to 12 bytes holding three packed u32 workgroup counts
-# (x at +0, y at +4, z at +8). Using a pointer keeps this function at 5
-# parameters — a 7-parameter signature that internally fncalls into wgpu
-# reliably segfaults per `feedback_cyrius_param_ceiling`. See the inline
-# `compute_dispatch_xyz` helper below for the scalar form (which splits its
-# work through this function).
+# (x at +0, y at +4, z at +8). The pointer keeps this function at 5 parameters.
+# The reason once given here, that a 7-parameter signature fncalling into wgpu
+# segfaults, was the %fs/TLS misdiagnosis cyrius 6.3.26 resolved; there is no
+# parameter ceiling (docs/development/2026-04-30-toolchain-issues.md, B2).
 # Returns 0 on submit; returns 0 silently (no submit) if any dimension
 # is <= 0 or exceeds MABDA_MAX_DISPATCH_DIM. See audit LOW-3.
 fn compute_dispatch(device, queue, cp, bind_group, dims_xyz): i64 {
@@ -142,8 +141,13 @@ fn ping_pong_new(device, size): i64 {
     var desc_a = wgpu_buffer_descriptor("ping", usage, size, 0);
     var desc_b = wgpu_buffer_descriptor("pong", usage, size, 0);
     var pp = alloc(24);
-    store64(pp, wgpu_device_create_buffer(device, desc_a));
-    store64(pp + 8, wgpu_device_create_buffer(device, desc_b));
+    # Each create is its own statement. As store64's 2nd argument it ran with rsp 8 bytes
+    # off 16-byte alignment, which faults C that uses aligned SSE (cycc codegen; see
+    # docs/development/issues/2026-09-16-cycc-nested-call-stack-alignment.md).
+    var buf_a = wgpu_device_create_buffer(device, desc_a);
+    var buf_b = wgpu_device_create_buffer(device, desc_b);
+    store64(pp, buf_a);
+    store64(pp + 8, buf_b);
     store64(pp + 16, 0);
     return pp;
 }
@@ -341,11 +345,12 @@ fn gpu_shader_module_release(ctx, shmod): i64 {
 # the wgpu path now calls fncall6 directly and this Cyrius-to-Cyrius
 # dispatch was always sound.)
 #
-# bindings_ptr is a raw byte buffer of (slot, kind, handle)
-# triples per the bindless-resources non-negotiable in
-# docs/archive/proposals/v3-native-api-principles.md. The format is not
-# yet finalized; consumers and slot wrappers can ignore it for
-# now (Step 2 wgpu wrapper returns GPU_ERR_OTHER unconditionally).
+# bindings_ptr is read by the backend slot. The (slot, kind, handle) triples sketched in
+# docs/archive/proposals/v3-backend-interface.md were never adopted. The native slot reads
+# one (handle, va) pair for the v3.0 single-output shader, or, for a compiled SPIR-V shmod,
+# a count-prefixed array: bp+0 = count, then count x (handle, va) 16-byte pairs (N.6,
+# CHANGELOG [3.2.7]; _native_dispatch_compiled in src/backend_native.cyr). The wgpu slot
+# returns GPU_ERR_OTHER unconditionally: wgpu compute dispatch is unimplemented (roadmap.md).
 
 fn gpu_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }

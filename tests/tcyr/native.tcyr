@@ -732,7 +732,8 @@ fn test_native_texture_write_layer_level() {
     native_tex_set_sw_mode(&tex, GFX9_SW_MODE_LINEAR);
     native_tex_set_slice_count(&tex, 4);
     var src[16];
-    var ctxf[8];
+    var ctxf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxf, 0, 176);
     store64(&ctxf, 1);   # non-null fake ctx (write_layer_level never derefs it past the guard)
     var k = 0;
     while (k < 4) {
@@ -785,7 +786,8 @@ fn test_native_texture_bind_for_sample_layer() {
     native_tex_set_t_va(&tex, 0x1000);   # t_va==va -> desc_cpu = ADDR = &descbuf
     var pass[40];
     memset(&pass, 0, 40);
-    var ctxf[8];
+    var ctxf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxf, 0, 176);
     store64(&ctxf, 1);
     assert_eq(_backend_native_texture_bind_for_sample_layer(&ctxf, &pass, &tex, 0, 3),
       0, "bind layer ok");
@@ -808,7 +810,8 @@ fn test_native_texture_bind_for_sample_layer() {
 
 # v3.4 AA.1b — create_2d_array_sampleable guard ladder (rejects before any HW BO).
 fn test_native_texture_create_2d_array_guards() {
-    var ctxf[8];
+    var ctxf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxf, 0, 176);
     store64(&ctxf, 1);
     assert_eq(_backend_native_texture_create_2d_array_sampleable(0, 64, 64, MABDA_TEXFMT_RGBA8, 4),
       0, "null ctx -> 0");
@@ -827,7 +830,8 @@ fn test_native_texture_create_2d_array_guards() {
 
 # v3.4 AA.5a — create_cube guard ladder (rejects before any HW BO).
 fn test_native_texture_create_cube_guards() {
-    var ctxf[8];
+    var ctxf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxf, 0, 176);
     store64(&ctxf, 1);
     assert_eq(_backend_native_texture_create_cube(0, 64, MABDA_TEXFMT_RGBA8, 1),
       0, "null ctx -> 0");
@@ -1886,7 +1890,8 @@ fn test_native_tex_level_offset_math() {
 
 # v3.3 AL.1 — native per-mip-level upload: validation + linear memcpy at offset.
 fn test_native_texture_write_level() {
-    var ctxbuf[8];
+    var ctxbuf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxbuf, 0, 176);
     store64(&ctxbuf, 1);             # non-null dummy ctx (linear path never derefs it)
     var scratch[1024];
     memset(&scratch, 0xEE, 1024);    # sentinel
@@ -1937,7 +1942,8 @@ fn test_native_tex_chain_size_and_fmt_mipped_guards() {
     # BC1 8x8 2-level: L0 = ceil(8/4)^2*8 = 32 -> 256-aligned; L1 = 8 -> 256; total 512.
     assert_eq(native_tex_chain_size(MABDA_TEXFMT_BC1, 8, 8, 2), 512, "BC1 8x8 2-level chain = 512");
     # Filler guards return 0 BEFORE any HW BO create (none reach native_ctx_fd).
-    var ctxbuf[8];
+    var ctxbuf[176];   # GPU_CONTEXT_SIZE: guards reject first, but never undersize a ctx
+    memset(&ctxbuf, 0, 176);
     store64(&ctxbuf, 1);
     assert_eq(_backend_native_texture_create_2d_fmt_mipped(0, 64, 64, MABDA_TEXFMT_RGBA8, 1),
       0, "null ctx -> 0");
@@ -2030,8 +2036,8 @@ fn test_native_texture_release_zero_handle_safe() {
     # circuit before va_unmap / bo_release_gtt (those would syscall
     # with handle=0 and produce -EINVAL). Caller may release an
     # uninitialised tex struct without panic.
-    var tex[32];
-    memset(&tex, 0, 32);
+    var tex[64];   # NATIVE_TEX_STRUCT_SIZE
+    memset(&tex, 0, 64);
     var rc = native_texture_release_2d_rgba8(7, &tex);
     assert_eq(rc, 0, "zero-handle tex returns 0");
     # All fields remain zero (no spurious writes).
@@ -3168,8 +3174,8 @@ fn test_native_pm4_render_pipeline_sh_layout() {
     #          = 0x02000000.
     # VS PGM_HI = (vs_va >> 40) & 0xFFFFFFFF
     #          = 0xFFFF8002 & 0xFFFFFFFF = 0xFFFF8002.
-    var buf[64];
-    memset(&buf, 0xCC, 64);
+    var buf[96];
+    memset(&buf, 0xCC, 96);
     var pos = native_pm4_build_render_pipeline_sh(&buf, 0,
       0xFFFF800200000000,
       0xFFFF800200001000);
@@ -3178,7 +3184,8 @@ fn test_native_pm4_render_pipeline_sh_layout() {
     # (PGM_LO, PGM_HI, RSRC1, RSRC2) = 6 dwords (24 bytes). Total 56 bytes.
     # Grew 48 → 56 at 2026-05-13 when RSRC3_VS + LATE_ALLOC_VS were added
     # to fix the Cezanne VS-allocation TDR (CUs disabled by default).
-    assert_eq(pos, 56, "pipeline_sh size = 56 bytes");
+    # 56 → 68 at 4.1.3: + a 3-dword SET_SH_REG for SPI_SHADER_PGM_RSRC3_PS.
+    assert_eq(pos, 68, "pipeline_sh size = 68 bytes");
 
     # First packet header — SET_SH_REG opcode 0x76, count = n+1 = 7,
     # count_minus_1 = 6. Header: 0xC0067600.
@@ -3206,6 +3213,12 @@ fn test_native_pm4_render_pipeline_sh_layout() {
     assert_eq(load32(&buf + 44), 0x80,       "PS PGM_HI = (fs_va>>40) byte");
     assert_eq(load32(&buf + 48), GFX9_GFX_PGM_RSRC1_MIN, "PS PGM_RSRC1");
     assert_eq(load32(&buf + 52), GFX9_PS_PGM_RSRC2_MIN, "PS PGM_RSRC2");
+
+    # Third packet (4.1.3) — RSRC3_PS at +56: header 0xC0017600 (count_minus_1
+    # = 1), wire offset (0xB01C - 0xB000)/4 = 0x07, CU_EN=0xFFFF WAVE_LIMIT=0x3F.
+    assert_eq(load32(&buf + 56), 0xC0017600, "RSRC3_PS SET_SH_REG header");
+    assert_eq(load32(&buf + 60), 0x07, "RSRC3_PS wire offset (0xB01C → 0x07)");
+    assert_eq(load32(&buf + 64), 0x003FFFFF, "RSRC3_PS = CU_EN 0xFFFF | WAVE_LIMIT 0x3F");
     return 0;
 }
 
@@ -3215,10 +3228,14 @@ fn test_native_pm4_render_pipeline_ctx_size_and_anchors() {
     # explicit-zero handshake regs (SPI_BARYC_CNTL, VGT_GS_MODE, etc.)
     # plus the 8-reg SX_MRT0..7_BLEND_OPT block. Pre-2026-05-13 size
     # was 292; pre-rc.2 was 240.
-    var buf[768];
-    memset(&buf, 0xCC, 768);
+    # 4.1.3: 556 → 768 (PA_CL_VTE_CNTL + the owned-state audit set; the
+    # per-register content is asserted by test_native_render_stream_owns_
+    # inherited_state). 768 → 900 in 4.1.3 round 2 (never-reset class).
+    var buf[1024];
+    memset(&buf, 0xCC, 1024);
     var pos = native_pm4_build_render_pipeline_ctx(&buf, 0);
-    assert_eq(pos, 556, "pipeline_ctx size = 556 bytes");
+    assert_eq(pos, 900, "pipeline_ctx size = 900 bytes");
+    assert_eq(pos, NATIVE_PIPE_CTX_BLOCK_SIZE, "pipeline_ctx size = NATIVE_PIPE_CTX_BLOCK_SIZE");
 
     # First packet = SPI shader formats, 3 values starting at POS_FORMAT.
     # Header: PKT3(SET_CONTEXT_REG, count_minus_1=3, 0) = 0xC0036900.
@@ -3365,16 +3382,18 @@ fn test_native_pm4_render_draw_tail_honours_vertex_count() {
 }
 
 fn test_native_pm4_render_clear_triangle_top_level() {
-    # End-to-end composer. Buffer needs ≥ 1024 bytes (256-dword pad target).
-    var buf[1024];
-    memset(&buf, 0xCC, 1024);
+    # End-to-end composer. 4.1.3 round 2: the stream is exactly
+    # native_pm4_render_clear_triangle_bytes() = 1364 bytes, never NOP-padded.
+    var buf[2048];
+    memset(&buf, 0xCC, 2048);
     var pos = native_pm4_build_render_clear_triangle(&buf,
       0xFFFF800200000000,   # vs_va
       0xFFFF800200001000,   # fs_va
       0xFFFF800101000000,   # rt_va
       256, 256);            # rt extent
-    # Padded to 256 dwords = 1024 bytes.
-    assert_eq(pos, 1024, "composer pads to 1024 bytes");
+    assert_eq(pos, 1364, "composer stream = 1364 bytes");
+    assert_eq(pos, native_pm4_render_clear_triangle_bytes(), "composer stream = the size table");
+    assert_eq(load8(&buf + pos), 0xCC, "nothing written past the stream end");
 
     # 2026-05-13 layout (RADV-Cezanne IB diff):
     # +0   PFP_SYNC_ME (8 bytes)
@@ -3382,13 +3401,16 @@ fn test_native_pm4_render_clear_triangle_top_level() {
     # +36  EVENT_WRITE PIPELINESTAT_START (8 bytes)
     # +44  SET_UCONFIG VGT_PRIMITIVE_TYPE (12 bytes)
     # +56  SET_UCONFIG IA_MULTI_VGT_PARAM (12 bytes) [new — replaces +40 num_instances]
-    # +68  pipeline_sh (56 bytes)
-    # +124 pipeline_ctx (556 bytes)
-    # +680 pass_target (264 bytes)
-    # +944 PKT3 NUM_INSTANCES (8 bytes) [moved from preamble; opcode 0x2F]
-    # +952 draw_tail (12 bytes)
-    # +964 EVENT_WRITE CACHE_FLUSH_AND_INV (8 bytes)
-    # +972 NOP pad to 1024
+    # +68  SET_UCONFIG VGT_MAX/MIN_VTX_INDX, INDX_OFFSET, MULTI_PRIM_IB_RESET_EN
+    #      (24 bytes) [4.1.3]
+    # +92  SET_UCONFIG VGT_INSTANCE_BASE_ID (12 bytes) [4.1.3 round 2 — the
+    #      draw-state block ends at +104]
+    # +104 pipeline_sh (68 bytes)
+    # +172 pipeline_ctx (900 bytes)
+    # +1072 pass_target (264 bytes)
+    # +1336 PKT3 NUM_INSTANCES (8 bytes) [moved from preamble; opcode 0x2F]
+    # +1344 draw_tail (12 bytes)
+    # +1356 EVENT_WRITE CACHE_FLUSH_AND_INV (8 bytes) — ends at 1364, no pad
     # ACQUIRE_MEM at offset 8: header 0xC0055800 (gfx-ring shader_type=0).
     assert_eq(load32(&buf + 8), 0xC0055800, "ACQUIRE_MEM header");
 
@@ -3408,18 +3430,33 @@ fn test_native_pm4_render_clear_triangle_top_level() {
     assert_eq(load32(&buf + 60), 0x258, "VGT_NUM_INSTANCES wire offset");
     assert_eq(load32(&buf + 64), 0x0070007F, "num instances 1");
 
-    # Pipeline_sh starts at offset 68 (VS SET_SH_REG opcode 0x76, 6 regs).
+    # 4.1.3 vertex-id state at +68: SET_UCONFIG_REG of 4 contiguous regs,
+    # header 0xC0047900, wire offset (0x30920 - 0x30000)/4 = 0x248.
+    assert_eq(load32(&buf + 68), 0xC0047900, "VGT_MAX_VTX_INDX run header (4 regs)");
+    assert_eq(load32(&buf + 72), 0x248, "VGT_MAX_VTX_INDX wire offset");
+    assert_eq(load32(&buf + 76), 0xFFFFFFFF, "VGT_MAX_VTX_INDX = ~0");
+    assert_eq(load32(&buf + 80), 0, "VGT_MIN_VTX_INDX = 0");
+    assert_eq(load32(&buf + 84), 0, "VGT_INDX_OFFSET = 0");
+    assert_eq(load32(&buf + 88), 0, "VGT_MULTI_PRIM_IB_RESET_EN = 0");
+    # 4.1.3 round 2: VGT_INSTANCE_BASE_ID single at +92, wire offset
+    # (0x30968 - 0x30000)/4 = 0x25A.
+    assert_eq(load32(&buf + 92), 0xC0017900, "VGT_INSTANCE_BASE_ID UConfig header");
+    assert_eq(load32(&buf + 96), 0x25A, "VGT_INSTANCE_BASE_ID wire offset");
+    assert_eq(load32(&buf + 100), 0, "VGT_INSTANCE_BASE_ID = 0");
+
+    # Pipeline_sh starts at offset 104 (VS SET_SH_REG opcode 0x76, 6 regs).
     # Header: 0xC0067600 (count_minus_1 = 6 since the VS packet now spans
     # RSRC3_VS through RSRC2_VS — 6 contiguous regs at 0xB118..0xB12C).
-    assert_eq(load32(&buf + 68), 0xC0067600, "pipeline_sh begins (VS SET_SH_REG)");
+    assert_eq(load32(&buf + 104), 0xC0067600, "pipeline_sh begins (VS SET_SH_REG)");
 
     # CACHE_FLUSH_AND_INV EVENT_WRITE spliced after draw_tail (Step 6.10
     # wired post-pivot). 2026-05-13 layout: composer offsets shifted
     # again with RADV-Cezanne IB diff additions; flush packet now lands
-    # at +964..+972 with header 0xC0004600 and body 0x00000016.
-    assert_eq(load32(&buf + 964), 0xC0004600,
+    # at +1356..+1364 (4.1.3 round 2 layout) with header 0xC0004600 and body
+    # 0x16 — the LAST packet (no trailing NOP).
+    assert_eq(load32(&buf + 1356), 0xC0004600,
       "EVENT_WRITE header after draw_tail");
-    assert_eq(load32(&buf + 968), 0x00000016,
+    assert_eq(load32(&buf + 1360), 0x00000016,
       "CACHE_FLUSH_AND_INV body");
     return 0;
 }
@@ -3428,9 +3465,11 @@ fn test_native_pm4_render_clear_triangle_block_sizes() {
     # 2026-05-13 block sizes (RADV-Cezanne IB diff round):
     #   ACQUIRE_MEM (28) + 2 UConfig (24) + sh (56) + ctx (556) +
     #   pass_target (264) + draw_tail (12) = 940 bytes pre-pad.
+    # 4.1.3: sh 56 → 68, ctx 556 → 768 → 1164 bytes; round 2 ctx 768 → 900,
+    # draw_state 48 → 60 (VGT_INSTANCE_BASE_ID).
     # Comments on each assert retain old "expected = X" continuity.
-    var buf[1024];
-    memset(&buf, 0xCC, 1024);
+    var buf[2048];
+    memset(&buf, 0xCC, 2048);
 
     var p = 0;
     p = native_pm4_acquire_mem_full_invalidate(&buf, p);
@@ -3444,14 +3483,16 @@ fn test_native_pm4_render_clear_triangle_block_sizes() {
     p = native_pm4_build_render_pipeline_sh(&buf, p,
       0xFFFF800200000000,
       0xFFFF800200001000);
-    assert_eq(p, 108, "+pipeline_sh = 56");
+    assert_eq(p, 120, "+pipeline_sh = 68");
     p = native_pm4_build_render_pipeline_ctx(&buf, p);
-    assert_eq(p, 664, "+pipeline_ctx = 556");
+    assert_eq(p, 1020, "+pipeline_ctx = 900");
     p = native_pm4_build_render_pass_target(&buf, p,
       0xFFFF800101000000, 256, 256);
-    assert_eq(p, 928, "+pass_target = 264");
+    assert_eq(p, 1284, "+pass_target = 264");
     p = native_pm4_build_render_draw_tail(&buf, p, GFX9_FULLSCREEN_TRI_VCOUNT);
-    assert_eq(p, 940, "+draw_tail = 12");
+    assert_eq(p, 1296, "+draw_tail = 12");
+    p = native_pm4_build_render_draw_state(&buf, p);
+    assert_eq(p, 1356, "+draw_state = 60 (4.1.3 round 2)");
     return 0;
 }
 
@@ -3672,10 +3713,13 @@ fn test_native_render_pipeline_struct_field_offsets() {
     assert_eq(NATIVE_PIPE_FIELD_FS_HANDLE,  16,  "fs_handle at +16");
     assert_eq(NATIVE_PIPE_FIELD_FS_VA,      24,  "fs_va at +24");
     assert_eq(NATIVE_PIPE_FIELD_SH_BLOCK,   32,  "sh_block at +32");
-    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  88,  "ctx_block at +88");
-    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    56,  "sh_block size = 56");
-    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   556, "ctx_block size = 556");
-    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      644, "total = 644");
+    # 4.1.3: sh_block 56 → 68 (RSRC3_PS), ctx_block 556 → 768 (VTE_CNTL +
+    # owned-state set), ctx_block offset 88 → 100, total 644 → 868.
+    # 4.1.3 round 2: ctx_block 768 → 900, total 868 → 1000.
+    assert_eq(NATIVE_PIPE_FIELD_CTX_BLOCK,  100, "ctx_block at +100");
+    assert_eq(NATIVE_PIPE_SH_BLOCK_SIZE,    68,  "sh_block size = 68");
+    assert_eq(NATIVE_PIPE_CTX_BLOCK_SIZE,   900, "ctx_block size = 900");
+    assert_eq(NATIVE_PIPE_STRUCT_SIZE,      1000, "total = 1000");
     # The two block sizes must match the composers' actual outputs;
     # the SH_BLOCK starts where the header ends, and the CTX_BLOCK
     # starts where the SH_BLOCK ends.
@@ -3697,9 +3741,10 @@ fn test_native_render_pipeline_pack_matches_composer() {
     var vs_va = 0xFFFF800200000000;
     var fs_va = 0xFFFF800200001000;
 
-    var pipe[644];
-    memset(&pipe, 0xCC, 644);
-    var rc = native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va);
+    var pipe[1000];
+    memset(&pipe, 0xCC, 1000);
+    var rc = native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va,
+      native_gfx9_vs_cu_cezanne());
     assert_eq(rc, 0, "pack returns 0 on success");
 
     # Header round-trips.
@@ -3710,25 +3755,25 @@ fn test_native_render_pipeline_pack_matches_composer() {
 
     # Re-build the blocks via the composers into a parallel buffer
     # and compare dword-by-dword. Sizes per 2026-05-13 layout.
-    var ref_sh[56];
-    memset(&ref_sh, 0xDD, 56);
+    var ref_sh[68];
+    memset(&ref_sh, 0xDD, 68);
     var sh_end = native_pm4_build_render_pipeline_sh(&ref_sh, 0, vs_va, fs_va);
-    assert_eq(sh_end, 56, "ref sh_block ends at 56");
+    assert_eq(sh_end, 68, "ref sh_block ends at 68");
 
-    var ref_ctx[556];
-    memset(&ref_ctx, 0xDD, 556);
+    var ref_ctx[900];
+    memset(&ref_ctx, 0xDD, 900);
     var ctx_end = native_pm4_build_render_pipeline_ctx(&ref_ctx, 0);
-    assert_eq(ctx_end, 556, "ref ctx_block ends at 556");
+    assert_eq(ctx_end, 900, "ref ctx_block ends at 900");
 
     var i = 0;
-    while (i < 56) {
+    while (i < 68) {
         assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + i),
           load32(&ref_sh + i),
           "sh_block dword matches composer");
         i = i + 4;
     }
     var j = 0;
-    while (j < 556) {
+    while (j < 900) {
         assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_CTX_BLOCK + j),
           load32(&ref_ctx + j),
           "ctx_block dword matches composer");
@@ -3737,8 +3782,459 @@ fn test_native_render_pipeline_pack_matches_composer() {
     return 0;
 }
 
+# ================================================================
+# 4.1.3 — render streams own their state (never inherit it)
+# ================================================================
+# Root cause of the 4.1.3 fresh-boot failure of every native texture-sample
+# gate: the render stream never wrote PA_CL_VTE_CNTL, so on a fresh boot / after
+# idle power-gating / a context switch it ran on the clear-state 0 (viewport
+# transform off -> the fullscreen triangle covered only pixel (0,0)). The audit
+# against radv's full submission added the rest of the owned set. These tests
+# walk the ACTUAL composed streams packet by packet, so a register dropped from
+# any block (or a block dropped from a composer) fails here on the CPU.
+
+# Walk a PM4 stream (type-3 packets) and return the LAST value written to the
+# register at MMIO address `mmio` before the first DRAW_INDEX_AUTO, or -1 if
+# the stream never writes it. Handles multi-register SET_*_REG runs.
+# SET_CONTEXT_REG base 0x28000, SET_SH_REG 0xB000, SET_UCONFIG_REG 0x30000.
+fn _rs_reg_before_draw(buf, len, mmio): i64 {
+    var found = -1;
+    var i = 0;
+    while (i + 4 <= len) {
+        var h = load32(buf + i);
+        if (((h >> 30) & 3) != 3) { return -2; }   # not a type-3 packet: malformed
+        var cnt = ((h >> 16) & 0x3FFF) + 1;
+        var op = (h >> 8) & 0xFF;
+        if (op == IT_DRAW_INDEX_AUTO) { return found; }
+        var base = -1;
+        if (op == IT_SET_CONTEXT_REG) { base = 0x28000; }
+        if (op == IT_SET_SH_REG) { base = 0xB000; }
+        if (op == IT_SET_UCONFIG_REG) { base = 0x30000; }
+        if (base >= 0) {
+            var first = base + (load32(buf + i + 4) & 0xFFFF) * 4;
+            var k = 0;
+            while (k < cnt - 1) {
+                if (first + k * 4 == mmio) { found = load32(buf + i + 8 + k * 4); }
+                k = k + 1;
+            }
+        }
+        i = i + 4 + cnt * 4;
+    }
+    return found;
+}
+
+# Count DRAW_INDEX_AUTO packets in a stream (the walker above must have a draw
+# to anchor on — a stream with no draw would vacuously "own" nothing).
+fn _rs_draw_count(buf, len): i64 {
+    var n = 0;
+    var i = 0;
+    while (i + 4 <= len) {
+        var h = load32(buf + i);
+        if (((h >> 30) & 3) != 3) { return -1; }
+        if (((h >> 8) & 0xFF) == IT_DRAW_INDEX_AUTO) { n = n + 1; }
+        i = i + 4 + (((h >> 16) & 0x3FFF) + 1) * 4;
+    }
+    return n;
+}
+
+# Count type-3 NOP packets (IT_NOP) in a stream. 4.1.3 round 2: render streams
+# carry no NOP padding, so every byte of the stream is state or a command.
+fn _rs_nop_count(buf, len): i64 {
+    var n = 0;
+    var i = 0;
+    while (i + 4 <= len) {
+        var h = load32(buf + i);
+        if (((h >> 30) & 3) != 3) { return -1; }
+        if (((h >> 8) & 0xFF) == IT_NOP) { n = n + 1; }
+        i = i + 4 + (((h >> 16) & 0x3FFF) + 1) * 4;
+    }
+    return n;
+}
+
+# Assert every owned register in one composed stream. `label` prefixes nothing
+# (assert messages are static); the caller runs this per stream.
+fn _rs_assert_owned_state(buf, len): i64 {
+    assert_eq(_rs_draw_count(buf, len), 1, "stream has exactly one DRAW_INDEX_AUTO");
+    assert_eq(_rs_nop_count(buf, len), 0, "stream has no NOP padding (round 2)");
+    assert_eq(load32(buf + len - 8), 0xC0004600, "last packet = EVENT_WRITE (no trailing pad)");
+    assert_eq(load32(buf + len - 4), GFX9_EVENT_TYPE_CACHE_FLUSH_AND_INV,
+      "last packet = CACHE_FLUSH_AND_INV");
+    # The 4.1.3 root cause.
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28818), 0x43F,
+      "PA_CL_VTE_CNTL = 0x43F (W0 divide + 6 viewport enables) before the draw");
+    # Owned-state audit set — context registers.
+    var mrt = 0;
+    while (mrt < 8) {
+        assert_eq(_rs_reg_before_draw(buf, len, 0x28760 + mrt * 4), 0x06000600,
+          "SX_MRTn_BLEND_OPT = OPT_COMB_BLEND_DISABLED");
+        mrt = mrt + 1;
+    }
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28B70), 0, "DB_ALPHA_TO_MASK = 0 (a2c off)");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28804), 0, "DB_EQAA = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28230), 0xAA99AAAA,
+      "PA_SC_EDGERULE = clear-state 0xAA99AAAA");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28C4C), 0,
+      "PA_SC_CONSERVATIVE_RASTERIZATION_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28B94), 0, "VGT_STRMOUT_CONFIG = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28B98), 0, "VGT_STRMOUT_BUFFER_CONFIG = 0");
+    var cbn = 1;
+    while (cbn < 8) {
+        assert_eq(_rs_reg_before_draw(buf, len, 0x28C70 + cbn * 0x3C), 0,
+          "CB_COLOR1..7_INFO = 0 (MRT unbound)");
+        cbn = cbn + 1;
+    }
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28060), 2, "DB_DFSM_CONTROL = PUNCHOUT FORCE_OFF");
+    # SPI_TMPRING_SIZE at its real address (gfx9.json 0x0286E8); the pre-4.1.3
+    # constant wrote the unmapped 0x028AE8 instead.
+    assert_eq(_rs_reg_before_draw(buf, len, 0x286E8), 0, "SPI_TMPRING_SIZE (0x0286E8) = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28AE8), -1,
+      "no write to the unmapped 0x028AE8 (old SPI_TMPRING_SIZE typo)");
+    # SH.
+    assert_eq(_rs_reg_before_draw(buf, len, 0xB01C), 0x003FFFFF,
+      "SPI_SHADER_PGM_RSRC3_PS = 0x003FFFFF");
+    # UConfig input assembly.
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30908), GFX9_VGT_PRIMITIVE_TYPE_TRIANGLELIST,
+      "VGT_PRIMITIVE_TYPE = TRIANGLELIST");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30960), 0x0070007F, "IA_MULTI_VGT_PARAM = 0x0070007F");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30920), 0xFFFFFFFF, "VGT_MAX_VTX_INDX = ~0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30924), 0, "VGT_MIN_VTX_INDX = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30928), 0, "VGT_INDX_OFFSET = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x3092C), 0, "VGT_MULTI_PRIM_IB_RESET_EN = 0");
+    # Pre-existing viewport values stay intact (the transform VTE enables).
+    assert_neq(_rs_reg_before_draw(buf, len, 0x2843C), -1, "PA_CL_VPORT_XSCALE written");
+    # 4.1.3 round 2 — the rest of the never-reset / clear-state class.
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28C58), 0x1E, "VGT_VERTEX_REUSE_BLOCK_CNTL = 30 (clear)");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28C5C), 0x20,
+      "VGT_OUT_DEALLOC_CNTL = 32 (clear pair; was 16)");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A10), 0, "VGT_OUTPUT_PATH_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A14), 0, "VGT_HOS_CNTL = 0 (legacy tess off)");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A50), 0, "VGT_ENHANCE = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A70), 0, "IA_ENHANCE = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A80), 0, "WD_ENHANCE = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28AB8), 0, "VGT_VTX_CNT_EN = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28A98), 0, "VGT_DRAW_PAYLOAD_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28820), 0, "PA_CL_NANINF_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28830), 0, "PA_SU_SMALL_PRIM_FILTER_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x2883C), 0, "PA_SU_OVER_RASTERIZATION_CNTL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28840), 0, "PA_STEREO_CNTL = 0 (stereo off)");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x28358), 0, "PA_SC_SCREEN_EXTENT_CONTROL = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x2835C), 0, "PA_SC_TILE_STEERING_OVERRIDE = 0");
+    assert_eq(_rs_reg_before_draw(buf, len, 0x30968), 0, "VGT_INSTANCE_BASE_ID = 0");
+    # VS compute units (the Cezanne-derived pair every CPU stream is built with).
+    assert_eq(_rs_reg_before_draw(buf, len, 0xB118), 0x003FFFFE, "SPI_SHADER_PGM_RSRC3_VS = 0x003FFFFE");
+    assert_eq(_rs_reg_before_draw(buf, len, 0xB11C), 24, "SPI_SHADER_LATE_ALLOC_VS = 24");
+    return 0;
+}
+
+fn test_native_render_stream_owns_inherited_state() {
+    var vs_va = 0xFFFF800200000000;
+    var fs_va = 0xFFFF800200001000;
+    var rt_va = 0xFFFF800101000000;
+
+    # (1) The standalone clear-triangle composer.
+    var buf[2048];
+    memset(&buf, 0, 2048);
+    var n = native_pm4_build_render_clear_triangle(&buf, vs_va, fs_va, rt_va, 256, 256);
+    assert_eq(n, native_pm4_render_clear_triangle_bytes(), "clear-triangle stream = size table");
+    _rs_assert_owned_state(&buf, n);
+
+    # (2) + (3) The pass_draw stream the GPU receives (native_render_pass_pm4_compose,
+    # spliced from a packed NativeRenderPipeline), untextured and textured.
+    var pipe[1000];
+    memset(&pipe, 0, 1000);
+    assert_eq(native_render_pipeline_pack(&pipe, 0xAA, vs_va, 0xBB, fs_va,
+        native_gfx9_vs_cu_cezanne()), 0, "pipe pack ok");
+    var pm4[2048];
+    memset(&pm4, 0, 2048);
+    var n2 = native_render_pass_pm4_compose(&pm4, 2048, &pipe, rt_va, 64, 64, 0, 0, 3);
+    _rs_assert_owned_state(&pm4, n2);
+    memset(&pm4, 0, 2048);
+    var desc_va = 0xFFFF800100404000;
+    var n3 = native_render_pass_pm4_compose(&pm4, 2048, &pipe, rt_va, 64, 64, 1, desc_va, 3);
+    _rs_assert_owned_state(&pm4, n3);
+    # The textured override still lands (last write wins after the ctx block).
+    assert_eq(_rs_reg_before_draw(&pm4, n3, 0x286CC), GFX9_SPI_PS_INPUT_TEXTURED,
+      "textured SPI_PS_INPUT_ENA override");
+    assert_eq(_rs_reg_before_draw(&pm4, n3, 0xB030), 0x00404000, "PS USER_DATA_0 = desc_va low");
+    assert_eq(_rs_reg_before_draw(&pm4, n3, 0xB034), 0xFFFF8001, "PS USER_DATA_1 = desc_va high");
+    return 0;
+}
+
+# The composed pass_draw stream must fit the per-context PM4 scratch it is built
+# in AND the IB slice it is staged into — the 4.1.3 additions grew it.
+fn test_native_render_pass_pm4_compose_fits_scratch() {
+    var pipe[1000];
+    memset(&pipe, 0, 1000);
+    native_render_pipeline_pack(&pipe, 0xAA, 0xFFFF800200000000, 0xBB, 0xFFFF800200001000,
+      native_gfx9_vs_cu_cezanne());
+    var pm4[2048];
+    memset(&pm4, 0, 2048);
+    var n_plain = native_render_pass_pm4_compose(&pm4, 2048, &pipe, 0xFFFF800101000000, 256, 256,
+      0, 0, 3);
+    memset(&pm4, 0, 2048);
+    var n_tex = native_render_pass_pm4_compose(&pm4, 2048, &pipe, 0xFFFF800101000000, 256, 256,
+      1, 0xFFFF800100404000, 3);
+    assert_eq(n_plain, 1388, "untextured pass_draw stream = 1388 bytes");
+    assert_eq(n_tex, 1448, "textured pass_draw stream = 1448 bytes (+60 override)");
+    assert_eq(n_plain, native_render_pass_pm4_bytes(0), "untextured = size table");
+    assert_eq(n_tex, native_render_pass_pm4_bytes(1), "textured = size table");
+    assert(n_tex <= _NATIVE_PM4_SCRATCH_BYTES, "textured stream fits the PM4 scratch");
+    assert(n_tex <= _NATIVE_IB_SIZE, "textured stream fits one IB slice");
+    assert_eq(n_plain % 4, 0, "stream is whole dwords");
+    return 0;
+}
+
+# 4.1.3 round 2: native_render_pass_pm4_compose checks its capacity BEFORE the
+# first write. Pre-fix, pass_draw compared the returned length against the
+# scratch only after the composer had already written the whole stream.
+fn test_native_render_pass_pm4_compose_rejects_small_capacity() {
+    var pipe[1000];
+    memset(&pipe, 0, 1000);
+    native_render_pipeline_pack(&pipe, 0xAA, 0xFFFF800200000000, 0xBB, 0xFFFF800200001000,
+      native_gfx9_vs_cu_cezanne());
+    var pm4[2048];
+    var need = native_render_pass_pm4_bytes(0);
+    var need_tex = native_render_pass_pm4_bytes(1);
+    assert_eq(need, 1388, "untextured size table = 1388");
+    assert_eq(need_tex, 1448, "textured size table = 1448");
+    memset(&pm4, 0xA5, 2048);
+    assert_eq(native_render_pass_pm4_compose(&pm4, need - 4, &pipe, 0xFFFF800101000000, 64, 64,
+        0, 0, 3), -1, "cap = need - 4 -> -1");
+    var i = 0;
+    var clean = 1;
+    while (i < 2048) {
+        if (load8(&pm4 + i) != 0xA5) { clean = 0; }
+        i = i + 1;
+    }
+    assert_eq(clean, 1, "rejected compose wrote nothing (untextured)");
+    # The textured stream needs 60 more bytes than the untextured one: a capacity
+    # that fits untextured but not textured must reject textured, still unwritten.
+    assert_eq(native_render_pass_pm4_compose(&pm4, need, &pipe, 0xFFFF800101000000, 64, 64,
+        1, 0xFFFF800100404000, 3), -1, "cap fits untextured only -> textured -1");
+    assert_eq(load32(&pm4), 0xA5A5A5A5, "rejected textured compose wrote nothing");
+    assert_eq(native_render_pass_pm4_compose(&pm4, 2048, 0, 0xFFFF800101000000, 64, 64,
+        0, 0, 3), -1, "null pipe -> -1");
+    assert_eq(native_render_pass_pm4_compose(0, 2048, &pipe, 0xFFFF800101000000, 64, 64,
+        0, 0, 3), -1, "null pm4 -> -1");
+    # Exact capacity is accepted and fills exactly that many bytes.
+    assert_eq(native_render_pass_pm4_compose(&pm4, need, &pipe, 0xFFFF800101000000, 64, 64,
+        0, 0, 3), need, "cap = need -> need bytes");
+    assert_eq(load8(&pm4 + need), 0xA5, "exact-cap compose stops at need");
+    return 0;
+}
+
+# Every fixed block the size tables sum must match its composer's output.
+fn test_native_render_block_size_tables() {
+    var buf[2048];
+    memset(&buf, 0, 2048);
+    assert_eq(native_pm4_build_render_draw_state(&buf, 0), NATIVE_RENDER_DRAW_STATE_BYTES,
+      "draw_state = NATIVE_RENDER_DRAW_STATE_BYTES (60)");
+    assert_eq(native_pm4_build_render_pass_target(&buf, 0, 0xFFFF800101000000, 64, 64),
+      NATIVE_RENDER_PASS_TARGET_BYTES, "pass_target 64x64 = 264");
+    assert_eq(native_pm4_build_render_pass_target(&buf, 0, 0xFFFF800101000000, 1920, 1080),
+      NATIVE_RENDER_PASS_TARGET_BYTES, "pass_target 1920x1080 = 264");
+    assert_eq(native_pm4_build_render_pipeline_sh(&buf, 0, 0xFFFF800200000000, 0xFFFF800200001000),
+      NATIVE_PIPE_SH_BLOCK_SIZE, "pipeline_sh = NATIVE_PIPE_SH_BLOCK_SIZE");
+    assert_eq(native_pm4_build_render_pipeline_ctx(&buf, 0), NATIVE_PIPE_CTX_BLOCK_SIZE,
+      "pipeline_ctx = NATIVE_PIPE_CTX_BLOCK_SIZE");
+    assert(native_render_pass_pm4_bytes(1) <= _NATIVE_PM4_SCRATCH_BYTES, "textured fits the scratch");
+    assert(native_render_pass_pm4_bytes(1) <= _NATIVE_IB_SIZE, "textured fits one IB slice");
+    return 0;
+}
+
+# 4.1.3 round 2: SPI_SHADER_PGM_RSRC3_VS + SPI_SHADER_LATE_ALLOC_VS derived from
+# the kernel CU topology (Mesa 26.2.2 ac_compute_late_alloc, GFX9 branch).
+fn _rs_dev_info(buf, num_se, num_sa, bitmap): i64 {
+    memset(buf, 0, 128);
+    store32(buf + 20, num_se);
+    store32(buf + 24, num_sa);
+    var se = 0;
+    while (se < num_se && se < 4) {
+        var sa = 0;
+        while (sa < num_sa && sa < 4) {
+            store32(buf + 56 + (se * 4 + sa) * 4, bitmap);
+            sa = sa + 1;
+        }
+        se = se + 1;
+    }
+    return 0;
+}
+
+fn test_native_gfx9_vs_late_alloc_derive() {
+    var di[128];
+    # This Cezanne (DRM_AMDGPU_INFO probe: 1 SE x 1 SA, cu_bitmap[0][0] = 0xFF).
+    _rs_dev_info(&di, 1, 1, 0xFF);
+    var cz = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(cz, native_gfx9_vs_cu_cezanne(), "Cezanne topology -> the radv capture pair");
+    assert_eq(native_gfx9_vs_cu_rsrc3(cz), 0x003FFFFE, "Cezanne RSRC3_VS = 0x003FFFFE");
+    assert_eq(native_gfx9_vs_cu_late_alloc(cz), 24, "Cezanne LATE_ALLOC_VS = (8 - 2) * 4");
+    # 4 CUs per SA -> late 2, all CUs (Mesa: <= 4 keeps every CU).
+    _rs_dev_info(&di, 1, 1, 0x0F);
+    var four = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(native_gfx9_vs_cu_rsrc3(four), 0x003FFFFF, "4 CUs: RSRC3_VS keeps CU0");
+    assert_eq(native_gfx9_vs_cu_late_alloc(four), 2, "4 CUs: LATE_ALLOC_VS = 2");
+    # 2 CUs per SA -> no late alloc, no CU masking (Mesa: can hang).
+    _rs_dev_info(&di, 1, 1, 0x03);
+    var two = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(two, 0x003FFFFF, "2 CUs: RSRC3_VS 0x003FFFFF, LATE_ALLOC_VS 0");
+    # Boundaries of Mesa's <= 2 / <= 4 steps: 3 CUs -> late 2, all CUs; 5 CUs -> 12, CU0 masked.
+    _rs_dev_info(&di, 1, 1, 0x07);
+    var three = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(three, 0x003FFFFF | (2 << 32), "3 CUs: RSRC3_VS 0x003FFFFF, LATE_ALLOC_VS 2");
+    _rs_dev_info(&di, 1, 1, 0x1F);
+    var five = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(five, 0x003FFFFE | (12 << 32), "5 CUs: RSRC3_VS 0x003FFFFE, LATE_ALLOC_VS 12");
+    # 6 CUs -> (6 - 2) * 4 = 16, CU0 masked.
+    _rs_dev_info(&di, 1, 1, 0x3F);
+    var six = native_gfx9_vs_late_alloc_derive(&di);
+    assert_eq(native_gfx9_vs_cu_rsrc3(six), 0x003FFFFE, "6 CUs: CU0 masked");
+    assert_eq(native_gfx9_vs_cu_late_alloc(six), 16, "6 CUs: LATE_ALLOC_VS = 16");
+    # 2 SE x 2 SA x 16 CUs -> 64 / 4 = 16 per SA -> 56; 20 per SA -> 72 clamps to 63.
+    _rs_dev_info(&di, 2, 2, 0xFFFF);
+    assert_eq(native_gfx9_vs_cu_late_alloc(native_gfx9_vs_late_alloc_derive(&di)), 56,
+      "2x2 SE/SA, 16 CUs each: LATE_ALLOC_VS = 56");
+    _rs_dev_info(&di, 1, 1, 0xFFFFF);
+    assert_eq(native_gfx9_vs_cu_late_alloc(native_gfx9_vs_late_alloc_derive(&di)), 63,
+      "20 CUs: LATE_ALLOC_VS clamps to LIMIT's 63");
+    # Uneven CU counts floor per SA (Mesa min_good_cu_per_sa): 8 + 1 over 2 SAs = 4.
+    memset(&di, 0, 128);
+    store32(&di + 20, 1);
+    store32(&di + 24, 2);
+    store32(&di + 56, 0xFF);
+    store32(&di + 60, 0x01);
+    assert_eq(native_gfx9_vs_cu_late_alloc(native_gfx9_vs_late_alloc_derive(&di)), 2,
+      "9 CUs over 2 SAs: min_good 4 -> LATE_ALLOC_VS = 2");
+    # Topologies outside the kernel struct or without CUs fail closed.
+    _rs_dev_info(&di, 0, 1, 0xFF);
+    assert_eq(native_gfx9_vs_late_alloc_derive(&di), -1, "0 SEs -> -1 (no divide by zero)");
+    _rs_dev_info(&di, 1, 0, 0xFF);
+    assert_eq(native_gfx9_vs_late_alloc_derive(&di), -1, "0 SAs -> -1");
+    _rs_dev_info(&di, 5, 1, 0xFF);
+    assert_eq(native_gfx9_vs_late_alloc_derive(&di), -1, "5 SEs -> -1 (cu_bitmap is 4x4)");
+    _rs_dev_info(&di, 1, 1, 0);
+    assert_eq(native_gfx9_vs_late_alloc_derive(&di), -1, "no CUs -> -1");
+    assert_eq(native_gfx9_vs_late_alloc_derive(0), -1, "null dev_info -> -1");
+    # Guards before the ioctl: null / short buffers never reach the kernel.
+    assert_eq(native_amdgpu_query_dev_info(-1, 0, 128), -1, "dev_info query: null out -> -1");
+    assert_eq(native_amdgpu_query_dev_info(-1, &di, 64), -1, "dev_info query: short buf -> -1");
+    assert_eq(DRM_IOCTL_AMDGPU_INFO, 0x40206445, "_IOW('d', 0x45, 32-byte drm_amdgpu_info)");
+    assert_eq(AMDGPU_INFO_DEV_INFO, 0x16, "AMDGPU_INFO_DEV_INFO");
+    # A derived pair lands in the packed pipeline's SH block.
+    var pipe[1000];
+    memset(&pipe, 0, 1000);
+    assert_eq(native_render_pipeline_pack(&pipe, 0xAA, 0xFFFF800200000000, 0xBB,
+        0xFFFF800200001000, four), 0, "pack with the 4-CU pair");
+    assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + 8), 0x003FFFFF, "packed RSRC3_VS = derived");
+    assert_eq(load32(&pipe + NATIVE_PIPE_FIELD_SH_BLOCK + 12), 2, "packed LATE_ALLOC_VS = derived");
+    return 0;
+}
+
+# native_render_dispatch_simple bounds pm4_bytes before touching ctx / the IB
+# (the zeroed fake ctx would fault if the guard were not first).
+# v4.1.3 — a dispatch that hung and was finished by a ring reset signals its syncobj like a
+# clean one; the native wait paths now check AMDGPU_CTX_OP_QUERY_STATE2 and fail closed.
+fn test_native_ctx_reset_state_check() {
+    assert_eq(AMDGPU_CTX_OP_QUERY_STATE2, 4, "QUERY_STATE2 op (amdgpu_drm.h)");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_RESET, 1, "RESET bit 0");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST, 2, "VRAMLOST bit 1");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_GUILTY, 4, "GUILTY bit 2");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_RAS_CE, 8, "RAS_CE bit 3");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_RAS_UE, 16, "RAS_UE bit 4");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_RESET_IN_PROGRESS, 32, "RESET_IN_PROGRESS bit 5");
+    assert_eq(AMDGPU_CTX_QUERY2_FLAGS_LOST, 0x27, "lost mask = RESET|VRAMLOST|GUILTY|IN_PROGRESS");
+    assert_eq(native_ctx_state_lost(0, 0), 0, "clean query: not lost");
+    assert_eq(native_ctx_state_lost(0, 1), 1, "RESET (the observed ring-reset hang, 0x1): lost");
+    assert_eq(native_ctx_state_lost(0, 2), 1, "VRAMLOST: lost");
+    assert_eq(native_ctx_state_lost(0, 4), 1, "GUILTY: lost");
+    assert_eq(native_ctx_state_lost(0, 32), 1, "RESET_IN_PROGRESS: lost");
+    assert_eq(native_ctx_state_lost(0, 8), 0, "RAS_CE alone: not a job verdict");
+    assert_eq(native_ctx_state_lost(0, 16), 0, "RAS_UE alone: not a job verdict");
+    assert_eq(native_ctx_state_lost(0, 9), 1, "RESET with RAS_CE: lost");
+    assert_eq(native_ctx_state_lost(0 - 22, 0), 1, "failed query fails closed");
+    # A query on a bad fd must fail closed, on both the fast and the slow path.
+    assert_eq(_native_ctx_lost_now(0 - 1, 1), 1, "bad fd: lost (fail closed)");
+    assert_eq(native_ctx_check_reset(0 - 1, 1, 0), 0 - 125, "fast path: -ECANCELED");
+    assert_eq(native_ctx_check_reset(0 - 1, 1, 5000000000), 0 - 125, "slow path: -ECANCELED");
+    assert_eq(_native_neg_rc_to_gpu_err(0 - 125), GPU_ERR_DEVICE_LOST, "ECANCELED -> DEVICE_LOST");
+    assert_eq(GPU_ERR_DEVICE_LOST, 23, "DEVICE_LOST code");
+    assert_eq(gpu_err_name(GPU_ERR_DEVICE_LOST) == gpu_err_name(0 - 1), 0,
+      "DEVICE_LOST has its own name");
+    # A failed wait is returned as-is, without a reset query.
+    assert_eq(native_syncobj_wait_checked(0 - 1, 1, 1, 0) < 0, 1, "bad fd wait: negative errno");
+    assert_eq(native_syncobj_wait_checked(0 - 1, 1, 1, 0) == 0 - 125, 0,
+      "failed wait is not reported as a reset");
+}
+
+fn test_native_render_dispatch_simple_rejects_bad_size() {
+    var ctx[176];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    var pm4[64];
+    memset(&pm4, 0, 64);
+    var triple[32];
+    native_render_handles_write(&triple, 0x11, 0x22, 0x33, 0);
+    assert_eq(native_render_dispatch_simple(&ctx, &pm4, 0, &triple, 0), GPU_ERR_OTHER,
+      "dispatch_simple: zero pm4_bytes -> GPU_ERR_OTHER");
+    assert_eq(native_render_dispatch_simple(&ctx, &pm4, _NATIVE_IB_SIZE + 4, &triple, 0),
+      GPU_ERR_OTHER, "dispatch_simple: pm4_bytes > IB size -> GPU_ERR_OTHER");
+    return 0;
+}
+
+# gfx9.json register_mappings[].map.at for every 4.1.3 register constant
+# (context regs in the 0xA-shorthand = map.at - 0x1E000).
+fn test_gfx9_owned_state_register_addresses() {
+    assert_eq(R_PA_CL_VTE_CNTL + 0x1E000, 165912, "PA_CL_VTE_CNTL map.at");
+    assert_eq(GFX9_PA_CL_VTE_CNTL_W_DIVIDE_VIEWPORT, 0x43F, "VTE = 6 VPORT enables + VTX_W0_FMT");
+    assert_eq(R_SPI_TMPRING_SIZE + 0x1E000, 165608, "SPI_TMPRING_SIZE map.at (was 0x028AE8)");
+    assert_eq(R_SPI_SHADER_PGM_RSRC3_PS, 45084, "SPI_SHADER_PGM_RSRC3_PS map.at");
+    assert_eq(R_VGT_MAX_VTX_INDX, 198944, "VGT_MAX_VTX_INDX map.at");
+    assert_eq(R_VGT_MIN_VTX_INDX, 198948, "VGT_MIN_VTX_INDX map.at");
+    assert_eq(R_VGT_INDX_OFFSET, 198952, "VGT_INDX_OFFSET map.at");
+    assert_eq(R_VGT_MULTI_PRIM_IB_RESET_EN, 198956, "VGT_MULTI_PRIM_IB_RESET_EN map.at");
+    assert_eq(R_IA_MULTI_VGT_PARAM, 199008, "IA_MULTI_VGT_PARAM map.at");
+    assert_eq(R_SX_MRT0_BLEND_OPT + 0x1E000, 165728, "SX_MRT0_BLEND_OPT map.at");
+    assert_eq(R_DB_ALPHA_TO_MASK + 0x1E000, 166768, "DB_ALPHA_TO_MASK map.at");
+    assert_eq(R_DB_EQAA + 0x1E000, 165892, "DB_EQAA map.at");
+    assert_eq(R_PA_SC_EDGERULE + 0x1E000, 164400, "PA_SC_EDGERULE map.at");
+    assert_eq(R_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL + 0x1E000, 166988,
+      "PA_SC_CONSERVATIVE_RASTERIZATION_CNTL map.at");
+    assert_eq(R_VGT_STRMOUT_CONFIG + 0x1E000, 166804, "VGT_STRMOUT_CONFIG map.at");
+    assert_eq(R_VGT_STRMOUT_BUFFER_CONFIG + 0x1E000, 166808, "VGT_STRMOUT_BUFFER_CONFIG map.at");
+    assert_eq(R_CB_COLOR1_INFO + 0x1E000, 167084, "CB_COLOR1_INFO map.at");
+    assert_eq(R_CB_COLOR1_INFO + 6 * GFX9_CB_COLOR_MRT_STRIDE + 0x1E000, 167444,
+      "CB_COLOR7_INFO map.at (0x3C stride)");
+    assert_eq(R_DB_DFSM_CONTROL + 0x1E000, 163936, "DB_DFSM_CONTROL map.at");
+    # 4.1.3 round 2.
+    assert_eq(R_VGT_VERTEX_REUSE_BLOCK_CNTL + 0x1E000, 167000, "VGT_VERTEX_REUSE_BLOCK_CNTL map.at");
+    assert_eq(R_VGT_OUT_DEALLOC_CNTL + 0x1E000, 167004, "VGT_OUT_DEALLOC_CNTL map.at");
+    assert_eq(R_VGT_OUTPUT_PATH_CNTL + 0x1E000, 166416, "VGT_OUTPUT_PATH_CNTL map.at");
+    assert_eq(R_VGT_HOS_CNTL + 0x1E000, 166420, "VGT_HOS_CNTL map.at");
+    assert_eq(R_VGT_ENHANCE + 0x1E000, 166480, "VGT_ENHANCE map.at");
+    assert_eq(R_IA_ENHANCE + 0x1E000, 166512, "IA_ENHANCE map.at");
+    assert_eq(R_WD_ENHANCE + 0x1E000, 166528, "WD_ENHANCE map.at");
+    assert_eq(R_VGT_VTX_CNT_EN + 0x1E000, 166584, "VGT_VTX_CNT_EN map.at");
+    assert_eq(R_VGT_DRAW_PAYLOAD_CNTL + 0x1E000, 166552, "VGT_DRAW_PAYLOAD_CNTL map.at");
+    assert_eq(R_PA_CL_NANINF_CNTL + 0x1E000, 165920, "PA_CL_NANINF_CNTL map.at");
+    assert_eq(R_PA_SU_SMALL_PRIM_FILTER_CNTL + 0x1E000, 165936, "PA_SU_SMALL_PRIM_FILTER_CNTL map.at");
+    assert_eq(R_PA_SU_OVER_RASTERIZATION_CNTL + 0x1E000, 165948, "PA_SU_OVER_RASTERIZATION_CNTL map.at");
+    assert_eq(R_PA_STEREO_CNTL + 0x1E000, 165952, "PA_STEREO_CNTL map.at");
+    assert_eq(R_PA_SC_SCREEN_EXTENT_CONTROL + 0x1E000, 164696, "PA_SC_SCREEN_EXTENT_CONTROL map.at");
+    assert_eq(R_PA_SC_TILE_STEERING_OVERRIDE + 0x1E000, 164700, "PA_SC_TILE_STEERING_OVERRIDE map.at");
+    assert_eq(R_VGT_INSTANCE_BASE_ID, 199016, "VGT_INSTANCE_BASE_ID map.at");
+    assert_eq(R_SPI_SHADER_PGM_RSRC3_VS, 45336, "SPI_SHADER_PGM_RSRC3_VS map.at");
+    assert_eq(R_SPI_SHADER_LATE_ALLOC_VS, 45340, "SPI_SHADER_LATE_ALLOC_VS map.at");
+    assert_eq(GFX9_VGT_OUT_DEALLOC, 32, "dealloc distance = clear-state 32");
+    assert_eq(GFX9_VGT_VERTEX_REUSE_BLOCK, 30, "reuse depth = clear-state 30");
+    return 0;
+}
+
 fn test_native_render_pipeline_pack_null_out() {
-    assert_eq(native_render_pipeline_pack(0, 1, 2, 3, 4), -1, "null out → -1");
+    assert_eq(native_render_pipeline_pack(0, 1, 2, 3, 4, native_gfx9_vs_cu_cezanne()), -1,
+      "null out → -1");
+    # 4.1.3 round 2: a failed CU derivation (-1) fails the pack closed.
+    var pipe[1000];
+    memset(&pipe, 0xCC, 1000);
+    assert_eq(native_render_pipeline_pack(&pipe, 1, 2, 3, 4, 0 - 1), -4, "vs_cu < 0 → -4");
+    assert_eq(load8(&pipe), 0xCC, "vs_cu < 0 → nothing packed");
     return 0;
 }
 
@@ -4312,6 +4808,14 @@ fn main() {
     test_native_render_pipeline_struct_field_offsets();
     test_native_render_pipeline_pack_matches_composer();
     test_native_render_pipeline_pack_null_out();
+    test_native_render_stream_owns_inherited_state();
+    test_native_render_pass_pm4_compose_fits_scratch();
+    test_native_render_pass_pm4_compose_rejects_small_capacity();
+    test_native_render_block_size_tables();
+    test_native_gfx9_vs_late_alloc_derive();
+    test_native_render_dispatch_simple_rejects_bad_size();
+    test_native_ctx_reset_state_check();
+    test_gfx9_owned_state_register_addresses();
     test_native_render_pass_struct_field_offsets();
     test_gfx9_event_type_constants();
     test_native_pm4_event_write_layout();

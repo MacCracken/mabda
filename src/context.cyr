@@ -26,7 +26,8 @@
 #   +104: native_card_fd (8)    — native: DRM master card fd; set by
 #                                  gpu_surface_configure_native_kiosk.
 #                                  Zero on wgpu.
-#   +112: pm4_scratch (8)       — native: 1024-byte PM4 build buffer,
+#   +112: pm4_scratch (8)       — native: _NATIVE_PM4_SCRATCH_BYTES
+#                                  (2048-byte) PM4 build buffer,
 #                                  allocated once at gpu_context_new_native,
 #                                  reused (memset on each entry) by
 #                                  _backend_native_compute_dispatch and
@@ -88,8 +89,10 @@
 
 var GPU_CONTEXT_SIZE = 176;
 var _NATIVE_PM4_SCRATCH_BYTES = 2048;   # v3.2 TS.5: 1024->2048 (the textured
-# render draw appends ~15 override dwords past the 256-dword/1024-B minimum
-# pad, reaching ~261 dwords; 2048 keeps comfortable headroom).
+# render draw then needed ~261 dwords). 4.1.3 owned render state grew the
+# pass_draw stream to 1388 bytes untextured / 1448 textured (347 / 362 dwords,
+# native_render_pass_pm4_bytes); the composer rejects a smaller capacity before
+# writing, and the stream is no longer NOP-padded.
 
 fn gpu_ctx_instance(ctx): i64 { return load64(ctx); }
 fn gpu_ctx_adapter(ctx): i64 { return load64(ctx + 8); }
@@ -310,12 +313,12 @@ fn gpu_context_new_native(): i64 {
         return gpu_err_result(_native_neg_rc_to_gpu_err(rc_save));
     }
 
-    # Audit MED-7: per-context cached PM4 scratch buffer. 1024 bytes
-    # is the worst-case render-stream size (`_backend_native_render_pass_draw`
-    # builds up to a 256-dword pad target = 1024 B); compute dispatch
-    # uses the first 256 bytes. Allocated once here, reused on every
-    # dispatch — replaces the per-dispatch alloc(256)/alloc(1024)
-    # that previously leaked through the bump allocator.
+    # Audit MED-7: per-context cached PM4 scratch buffer of
+    # _NATIVE_PM4_SCRATCH_BYTES (2048). The textured render draw builds 1448
+    # bytes here (native_render_pass_pm4_bytes); compute dispatch streams are
+    # NOP-padded to at least 64 dwords (256 bytes). Allocated once
+    # here, reused on every dispatch — replaces the per-dispatch
+    # alloc(256)/alloc(1024) that previously leaked through the bump allocator.
     var pm4_scratch = alloc(_NATIVE_PM4_SCRATCH_BYTES);
     memset(pm4_scratch, 0, _NATIVE_PM4_SCRATCH_BYTES);
 

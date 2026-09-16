@@ -29,7 +29,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     color_init();
@@ -38,22 +68,22 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
     var device = gpu_ctx_device(_gpu_ctx);
     var queue = gpu_ctx_queue(_gpu_ctx);
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     # --- 1. Render target (RGBA8_UNORM, 256x256) ---
     var W = 256;
     var H = 256;
     var target = texture_create_render_target_rgba8(device, W, H, "render-target");
-    if (target == 0) { return _fail("FAIL: render target create\n", 27); }
+    if (target == 0) { return _fail("render target create"); }
     var view = texture_view_create_rgba8(target, "render-target-view");
-    if (view == 0) { return _fail("FAIL: render target view\n", 25); }
-    syscall(1, 1, "PASS: render target + view\n", 27);
+    if (view == 0) { return _fail("render target view"); }
+    _pass("render target + view");
 
     # --- 2. RenderPassBuilder with a single CLEAR color attachment ---
     # clearColor = opaque red (1.0, 0.0, 0.0, 1.0) — round-trips cleanly
@@ -62,16 +92,16 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var rpb = rpb_pass_new();
     rpb_pass_label(rpb, "render-e2e-pass");
     rpb_pass_color(rpb, view, clear);
-    syscall(1, 1, "PASS: render pass builder populated\n", 36);
+    _pass("render pass builder populated");
 
     # --- 3. Encoder, open pass, end pass (clear-only, no draws) ---
     var enc = wgpu_device_create_command_encoder(device, "render-e2e-enc");
-    if (enc == 0) { return _fail("FAIL: encoder\n", 14); }
+    if (enc == 0) { return _fail("encoder"); }
     var pass = rpb_pass_begin(enc, rpb);
-    if (pass == 0) { return _fail("FAIL: rpb_pass_begin\n", 21); }
+    if (pass == 0) { return _fail("rpb_pass_begin"); }
     wgpu_render_pass_encoder_end(pass);
     wgpu_render_pass_encoder_release(pass);
-    syscall(1, 1, "PASS: render pass clear encoded\n", 32);
+    _pass("render pass clear encoded");
 
     # --- 4. Copy texture → MAP_READ buffer ---
     # bytesPerRow = 256 * 4 = 1024 (already a multiple of wgpu's 256-byte
@@ -81,7 +111,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
     var read_desc = wgpu_buffer_descriptor("render-readback", read_usage, BUF_SIZE, 0);
     var read_buf = wgpu_device_create_buffer(device, read_desc);
-    if (read_buf == 0) { return _fail("FAIL: readback buffer\n", 22); }
+    if (read_buf == 0) { return _fail("readback buffer"); }
 
     # Pack CopyTexToBufArgs (72 bytes — matches WgpuCopyTexToBufArgs in
     # deps/wgpu_main.c). See the shim header for the layout.
@@ -101,32 +131,32 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     store32(cargs + 60, H);                # copy_h
     store32(cargs + 64, 1);                # copy_depth
     wgpu_command_encoder_copy_texture_to_buffer(enc, cargs);
-    syscall(1, 1, "PASS: copy texture->buffer encoded\n", 35);
+    _pass("copy texture->buffer encoded");
 
     # --- 5. Finish + submit ---
     var cmd = wgpu_command_encoder_finish(enc, "render-e2e-cmd");
-    if (cmd == 0) { return _fail("FAIL: cmd finish\n", 17); }
+    if (cmd == 0) { return _fail("cmd finish"); }
     wgpu_queue_submit_one(queue, cmd);
 
     # --- 6. Map and verify pixel(0,0) ---
     var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
     if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
-        return _fail("FAIL: map readback\n", 19);
+        return _fail("map readback");
     }
     var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
-    if (mapped == 0) { return _fail("FAIL: get mapped range\n", 23); }
+    if (mapped == 0) { return _fail("get mapped range"); }
 
     var r = load8(mapped + 0);
     var g = load8(mapped + 1);
     var b = load8(mapped + 2);
     var a = load8(mapped + 3);
-    if (r != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: red != 0xFF\n", 18); }
-    if (g != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: green != 0x00\n", 20); }
-    if (b != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: blue != 0x00\n", 19); }
-    if (a != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: alpha != 0xFF\n", 20); }
+    if (r != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("red != 0xFF"); }
+    if (g != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("green != 0x00"); }
+    if (b != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("blue != 0x00"); }
+    if (a != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("alpha != 0xFF"); }
     wgpu_buffer_unmap(read_buf);
-    syscall(1, 1, "PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)\n", 44);
+    _pass("pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)");
 
-    syscall(1, 1, "\n8 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

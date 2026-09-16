@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.1.0** (2026-08-19). Module/assertion/bundle counts live in the
+> **v4.1.3** (2026-09-16). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -29,7 +29,14 @@ dep refresh + a 73-file `cyrfmt` reflow, no behaviour change; v4.1.0 (2026-08-19
 both native SPIR-V filings — compile-failure reason codes, the saxpy scratch-buffer
 overrun + a static sizing gate, f32 OpFDiv, OpSelect on integer conditions, structured
 loops with OpPhi, `gfx9_rsrc1_ex`, the wgpu-native v29.0.1.1 bump, and `make
-test-native-all`).
+test-native-all`; v4.1.1 (2026-09-06) migrated to cyrius 6.6.0's `Result` value form —
+113 pair-bind conversions and one Breaking signature, `gpu_result_unwrap(res)` →
+`gpu_result_unwrap(t, v)`; v4.1.2 (2026-09-12) is a maintenance cut — cyrius 6.6.2 pin +
+samvada 1.0.1 / chitra 1.0.3 dep refresh, no `src/` change; v4.1.3 (2026-09-16) is a
+maintenance cut — cyrius 6.6.4 pin, `cyrius.cyml` comment cleanup, a doc currency sweep for
+the samvada 1.0.1 / chitra 1.0.3 moves, a `test-native-all` FAIL-reason fix, per-harness
+`make fuzz` logs, the `native_compute_spike` repair, and the native draw `PA_CL_VTE_CNTL`
+fix behind the flaky render/sampler gates).
 
 ## The Long Arc
 
@@ -55,7 +62,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.1.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.1.3  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -125,17 +132,44 @@ a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it
   self-check for the layout that bit us and a static gate over all 123 call sites; passing
   explicit **lengths** would make the invalid state unrepresentable. `@internal`, so no
   public break — but it touches every call site, hence its own cut.
-- **The four flaky render/sampler gates.** `array-sample`, `bc-array`, `bilinear-sample` and
-  `compressed-sample` failed together on the first `make test-native-all` run and passed on
-  a re-run and individually. Four at once looks like contention, not four bugs — but it is
-  unexplained. See `issues/2026-08-19-native-compute-spike-stale.md`.
-- **`native_compute_spike`** — retire or repair; it is a bit-rotted 2026-04 exploration
-  artifact subsumed by `test-native-compute-store`. ⚠ Should not survive two more releases
-  parked in `NATIVE_KNOWN_FAIL`.
+- ⭐ **4.1.3 closeout: a clean-boot native HW run.** Several 4.1.3 fixes were HW-proven only on a
+  Cezanne that had already taken MODE2 resets that day (the resets make context-register state
+  persist, which hid the render bug; the state-poison harness in `programs/diagnostics/state_poison/`
+  was used to test around that). After a fresh boot, with no GPU reset first: `make test-native-all`
+  must pass with `NATIVE_KNOWN_FAIL` empty (covers the `native_compute_spike` repair, the render
+  owned-state fix, the library reset check and `native_compute_store` exits 17/18), plus one run
+  of the linked example consumer. The same suite already passed 71/0 on 2026-09-16 with the
+  fresh-boot register state injected before every draw gate. See `issues/2026-08-19-native-compute-spike-stale.md`.
+- **NVIDIA parity for reset detection.** 4.1.3 made the native AMD completion paths fail closed
+  (`GPU_ERR_DEVICE_LOST`) when `AMDGPU_CTX_OP_QUERY_STATE2` reports a reset. The nouveau wait paths
+  in `src/backend_nvidia.cyr` have no equivalent check yet; a hung NVIDIA job that the driver
+  recovers is not reported.
+- **Native AMD VA regions are never reclaimed.** Render-target release does not return its range
+  to the 256 MiB RT region, so the 33rd 1920x1080 RT create in one context returns 0 (confirmed on
+  CPU in 4.1.3 verification). The 2 GiB texture region uses the same no-reclaim model. Needs a
+  free list fed from the release paths, with a churn test.
+- **Release APIs that don't exist.** `ShaderCache` has no release (cached modules can never be
+  freed); `depth_texture_new` doesn't check for a 0 view and has no `depth_texture_release`; the
+  wgpu RT create slot has no `MABDA_MAX_TEXTURE_DIM_2D` cap.
+- **bench-gpu leftovers.** A create row whose op returns a 0 handle is still reported as a valid
+  row; `_rel_depth` releases without null checks; the compute row leaks its pipeline/buffer on the
+  setup-failure returns; the MSAA device-memory proof used an uncommitted Vulkan layer, so no gate
+  catches a future bench-side leak. `deps/wgpu_main.c` also still has six `-Wextra`
+  unused-parameter warnings (`-Wall` is clean and gated).
+- **Upstream cyrius filings to send** (mabda-side records and workarounds are in place):
+  `issues/2026-09-16-cycc-nested-call-stack-alignment.md` (**High**: a call nested in an argument
+  list runs with rsp 8 bytes off, which faults SSE C callees; affects every Cyrius project calling
+  C; mabda hoists and gates with `scripts/check-ffi-call-alignment.py`),
+  `issues/2026-09-16-stdlib-bench-min-minus-mean-floor.md`,
+  `issues/2026-09-16-cyrius-deps-tamper-check-stale-index.md`,
+  `issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md`.
 - **A security audit is due.** `SECURITY.md` records none since 4.0.1 because the 4.0.x line
   had no new untrusted-input surface. v4.1.0 changes that: it extends a parser consuming
   consumer-supplied SPIR-V (loops, phi, f32 division, integer-condition selects), which is
-  the threat model the 3.3.0 asset-loading audit's 1 CRITICAL came from.
+  the threat model the 3.3.0 asset-loading audit's 1 CRITICAL came from. v4.1.2 adds two
+  dependency moves the audit should also cover: chitra 0.3.1 → 1.0.3 (the PNG/JPEG decoder
+  untrusted image bytes flow through) and samvada 0.4.1 → 1.0.1 (native dbus, including
+  SCM_RIGHTS fd passing).
 
 ---
 
@@ -194,7 +228,7 @@ native-Cyrius across every supported vendor.
   hardware. If v5.0 didn't actually ship Intel native, v5.1 doesn't
   ship either — the version is a placeholder for that completion.
 - **Remove `src/wgpu_*.cyr`, `src/backend_wgpu.cyr`,
-  `deps/wgpu_main.c`, `deps/wgpu-native/`.** The 65-slot wgpu fn
+  `deps/wgpu_main.c`, `deps/wgpu-native/`.** The 67-slot wgpu fn
   table and its struct-packing shims go away.
 - **Remove the `Backend` indirection**, optionally. If only one
   backend kind remains per vendor, the `ctx->backend` slot is
@@ -233,14 +267,21 @@ there's consumer demand plus a clear scope.
 > verify with `lspci` before calling anything HW-blocked. (Standing rule,
 > kept after the v4.0.7 NVIDIA multi-BO item graduated out of this list.)
 
-- **samvada C-shim → pure-Cyrius dbus.** The samvada `libsystemd` C-shim
-  retirement (paired with the AMD-wgpu step) was **deferred at v4.0.1** under
-  the roadmap escape hatch. Forward plan: evolve the samvada dbus project into
-  a pure-Cyrius native dbus client (AF_UNIX system bus + SASL EXTERNAL +
-  SCM_RIGHTS master-fd passing); when samvada ships pure-Cyrius 1.0, mabda
-  swaps via a one-line `[deps.samvada]` tag bump + `cyrius deps`, then drops
-  libsystemd. mabda's coupling is dormant today (`#ifdef MABDA_LOGIND`, off by
-  default) — call signatures are impl-agnostic.
+- **NVIDIA block-linear (tiled) scanout + ADDFB2 format modifiers.** `programs/nvidia_kms_scanout.cyr`
+  and the shipped nouveau present slots (`_nv_surface_alloc_fb`) force a LINEAR VRAM scanout BO with
+  modifier 0 (ADR 007 Fork 4). Scanning out a block-linear BO needs ADDFB2 with
+  `DRM_MODE_FB_MODIFIERS` and an NVIDIA block-linear `DRM_FORMAT_MOD`; it matters if render targets
+  or scanout buffers move to NVK's block-linear layout. Moved here from a note in
+  `nvidia_kms_scanout.cyr` (4.1.3).
+- **samvada pure-Cyrius dbus — mabda live-bus validation.** The upstream half is
+  done: samvada 1.0 shipped a pure-Cyrius dbus client (`samvada_native_init()` —
+  no C shim, no `libsystemd`), and mabda has pinned samvada 1.0.1 since v4.1.2
+  (the planned one-line `[deps.samvada]` tag swap). **Remaining mabda-side work:**
+  a live-bus end-to-end run of `gpu_surface_configure_native_logind` with
+  `samvada_native_init()` from a seated session. No mabda gate builds
+  `-D MABDA_LOGIND` today (off by default; the consumer, not mabda, initializes
+  samvada). samvada's deletion of its `libsystemd` C shim at samvada 1.1.0 waits
+  on that run.
 - **Encoder debug-group FFI.** The `debug_*` fns are no-op stubs until
   `wgpuCommandEncoderPushDebugGroup` / `…Pop` land in the fn table — a
   coordinated `deps/wgpu_main.c` launcher change (adding slots forces every

@@ -13,14 +13,166 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [4.1.2] - 2026-09-12
+## [4.1.3] — 2026-09-16
+
+**cyrius 6.6.4, a `cyrius.cyml` that is configuration again, and the defects that
+re-verifying on AMD and NVIDIA hardware turned up.** The toolchain move itself needed no source
+change. Running every hardware gate on both cards (the first HW run on any 6.6.x toolchain)
+found a native AMD render bug that had been hidden since 4.1.0, a compute test that had never
+worked, an MSAA texture leak, a hung-dispatch-reports-success gap, a cycc stack-alignment bug,
+and a set of test and doc defects. All are fixed here, each with a test or gate that catches it.
+
+**Verified:** 18 CPU suites, **5612 assertions**, 0 failed; every CI step, fuzz and the new gate
+scripts clean. **NVIDIA** (GTX 1660 SUPER, nouveau + NVK): 11/11 native masterless gates,
+12/12 wgpu gates (first NVK run), `bench-gpu` 13/13 rows. **AMD** (Cezanne): `test-native-all`
+71 passed / 0 failed / 0 known-fail, run with fresh-boot register state injected before every
+draw gate (the box had taken GPU resets that day); 12/12 wgpu gates; `bench-gpu` 13/13 rows;
+no kernel GPU messages. A clean-boot rerun is the roadmap closeout item. The 5 NVIDIA and 2 AMD KMS/present gates need a console session with DRM master and
+were not run.
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.4`.** The move itself needed no source change, and that was measured:
+  given the same `lib/`, the 6.6.2 and 6.6.4 `cycc` produce byte-identical output for all
+  127 compile units (18 test suites, the bench, 3 fuzz harnesses, every program). The
+  6.6.3 nested-`continue` fix cannot reach mabda: its one `continue`
+  (`src/gfx9_regalloc.cyr`) sits in a single `while`. mabda uses no `#derive`, `#inline`,
+  `public`/`private`, `impl` or method calls, no string literal over 269 B, and builds only
+  x86_64, so the 6.6.4 visibility, 64 KB literal, cx and aarch64 fixes don't apply either.
+- **`lib/` re-resolved** (`rm -rf lib && mkdir lib && cyrius deps`): 43 → 43 locked files,
+  10 changed content: `dynlib`, `hashseed`, `io`, `sakshi`, `sankoch` and the five
+  `syscalls_*` peers. For x86_64 Linux that is new constants only (`SYS_FLOCK`,
+  `O_DIRECT` / `O_LARGEFILE` / `O_DIRECTORY` / `O_NOFOLLOW`, none clashing with mabda
+  names), agnos/aarch64-only branches, version-comment refolds (sakshi 2.5.2,
+  sankoch 2.7.15), and `_hm_seed_get`'s getrandom-failure fallback reading
+  `clock_gettime` instead of `time` (same seed on x86_64). The lock body is now sorted
+  (6.6.3) and ends with a `cyrius\t6.6.4` line (6.6.4), which lets the resolver refuse a
+  stdlib snapshot that drifts under an unchanged pin. The committed 4.1.2 lock matches the
+  real 6.6.2 tag for all 41 stdlib files, so it was not affected by the contaminated 6.6.2
+  install slot that cyrius 6.6.4 documents.
+- **Deps are all at their latest release**: samvada 1.0.1 and chitra 1.0.3 (lock commits
+  match the GitHub tags; `lib/` bundles are byte-identical to each tag's `dist/`),
+  wgpu-native v29.0.1.1.
+- **`cyrius.cyml` is configuration, not a ledger.** The 6.6.0 migration notes, the samvada
+  escape-hatch history and the re-verification notes are gone; each section keeps a
+  one-line purpose comment, and the pin moved into `[package]`. The two hazards that were
+  recorded only there moved to `docs/development/2026-04-30-toolchain-issues.md`:
+  **C8** (a hand-rolled `load64` on a `Result` register pair fails silently) and **E2**
+  (`cyrius.lock` is tracked but nothing in mabda diffs it; updated for the 6.6.4 guard).
+- **samvada and chitra docs caught up with 4.1.2.** Several docs and comments still
+  described samvada 0.4.1 with its libsystemd C shim, and chitra 0.3.1 as a PNG-only
+  decoder. samvada 1.0 speaks dbus natively: a consumer calls `samvada_native_init()` and
+  links no C and no libsystemd. Updated: `CLAUDE.md`, README, the guides,
+  `docs/stdlib-integration.md`, the example consumer, SECURITY.md, and the comments in
+  `src/lib.cyr`, `src/asset_load.cyr`, `src/surface_v3.cyr` and `src/backend_native.cyr`
+  (the last three are bundled, so `dist/mabda.cyr` changes by comments only). The logind
+  path (`-D MABDA_LOGIND`) has still never run end to end from a seated session; that is
+  now the roadmap backlog item, and samvada's plan to delete its C shim at 1.1.0 waits on it.
+- **Provenance refresh**, including several cuts' worth of stamps 4.1.1 and 4.1.2 skipped:
+  "Written against mabda 4.1.3 / Cyrius 6.6.4" guide headers and `[deps.mabda]` snippets;
+  the example consumer (cyrius 6.6.4, mabda tag 4.1.3, which it needs for the 6.6.0
+  pair bind); README "Requires Cyrius 6.6.4+" and the assertion count; CONTRIBUTING's
+  toolchain floor, counts and test paths; SECURITY.md's supported-versions table (4.1.x
+  current, 4.0.x back-ports) and design notes (the retired `fncall6` belief, the `lib/`
+  symlink, the syscall and device-node surface); the roadmap baseline, prune record and
+  shipped range; `docs/architecture/overview.md` counts and its missing asset and NVIDIA
+  modules; and `src/wgpu_types.cyr`'s header, restamped to webgpu.h v29.0.1.1 after all 60
+  constants were checked against that header.
+
+### Added
+
+- **`GPU_ERR_DEVICE_LOST` (23)** and fail-closed reset detection on every native AMD completion
+  path. A dispatch that hangs is finished by the kernel's ring reset and its syncobj signals
+  like a clean one, so `gpu_compute_dispatch` used to return success with stale output
+  (HW-checked). `native_compute_dispatch_cached`, `_cached_n`, `native_render_dispatch_simple`,
+  the timeline `queue_wait_idle` and the SDMA one-shot now query `AMDGPU_CTX_OP_QUERY_STATE2`
+  after the wait (`native_syncobj_wait_checked` / `native_ctx_check_reset`) and return
+  `GPU_ERR_DEVICE_LOST` on RESET / VRAMLOST / GUILTY / RESET_IN_PROGRESS, as radv does. RAS
+  counters don't fail a job. A completion slower than 1 s settles 100 ms and asks again,
+  because the kernel can signal a timed-out job before it records the reset. 25 assertions.
+- **`render_target_release(rt)` and `render_target_msaa_texture(rt)`.** `RenderTarget` is now
+  72 bytes, with `msaa_texture` at +64 (existing offsets unchanged). `rtb_build` rejects
+  width/height outside 1..8192 and sample counts other than 1/2/4/8/16, and on any create
+  failure releases what it built and returns 0 instead of a silently 1-sample target.
+- **Regression gates, wired into `make test-all` and CI:** `scripts/check-stack-array-sizing.py`,
+  `check-program-write-lengths.py`, `check-ffi-call-alignment.py`, `check-split-deferrals.py`,
+  `check-make-recursion-guards.sh`, `make check-fuzz-logs` / `check-make-dry-run` /
+  `example-link`, `count-test-assertions.sh --self-test`, a `cyrlint --strict-deferrals` loop
+  over every source file, and `-Werror` on the wgpu launcher.
+- **`programs/diagnostics/state_poison/`** (poison a context register before a gate, to prove a
+  draw doesn't depend on inherited GPU state) and `radv_capture_triangle`'s IB snoop + decoded
+  radv preamble + `owned-state-audit.md`.
+
+### Fixed
+
+- ⛔ **Native AMD draws only wrote pixel (0,0) on a normal boot.** The render stream never set
+  `PA_CL_VTE_CNTL` (gfx9.json 0x28818). The GPU clears it on idle and on context switch, so the
+  viewport transform was off and the fullscreen triangle rasterized in raw pixel space. 7
+  texture-sampling gates failed every run. It stayed hidden because a MODE2 GPU reset makes
+  register state persist (which is what `native_compute_spike` kept causing), and because
+  `native_render_e2e` / `native_render_graph_mq_e2e` only checked pixel (0,0). This is the real
+  cause of 4.1.0's "four flaky render/sampler gates". The stream now owns that register (0x43F,
+  radv's value) and the rest of the state a radv capture + kernel clear-state audit showed it
+  was inheriting: VGT index clamp/offset, `SX_MRT0..7_BLEND_OPT`, `DB_ALPHA_TO_MASK`, `DB_EQAA`,
+  `PA_SC_EDGERULE`, conservative raster, stream-out, `CB_COLOR1..7_INFO`, `DB_DFSM_CONTROL`,
+  `IA_MULTI_VGT_PARAM`, `SPI_SHADER_PGM_RSRC3_PS`, `VGT_OUT_DEALLOC_CNTL`,
+  `VGT_OUTPUT_PATH_CNTL`. `R_SPI_TMPRING_SIZE` was a wrong address (0xAAE8 → 0xA6E8). The render
+  gates now scan the whole target (new exits: render 12, mq 9); a CPU test walks all three
+  streams and asserts every owned register (92 of its assertions fail on the old code).
+- **`native_compute_spike` never worked, and it caused GPU resets.** Its IB was mapped READABLE
+  without EXECUTE ("Illegal opcode", MODE2 reset), and `COMPUTE_PGM_HI` was split with signed `/`
+  (dispatch hang, ~2 s ring reset). Its WRITE_DATA marker survives a hung dispatch, so it now
+  also requires a clean reset state. Removed from `NATIVE_KNOWN_FAIL`, which is empty.
+  `native_compute_store` checks the reset state too (exits 17/18) and documents every exit code.
+- **MSAA render targets leaked their N-sample texture** (~31.6 MiB per 4x 1080p target).
+  `rtb_build` kept only the view; `bench-gpu`'s msaa4 row grew device memory by 3840 MiB on NVK
+  (0 after). 6 render tests use a handle ledger to catch it.
+- **cycc misaligns the stack for a call nested in an argument list** (8 bytes off 16-byte SysV
+  alignment), which faults C callees using aligned SSE; `bench-gpu` crashed inside NVK. It is a
+  compiler bug (issue filed for cyrius, High). mabda hoisted every FFI-reaching nested call
+  (`ping_pong_new`, the render-graph queue helpers) and gates the shape.
+- **Stack-array overruns in tests and programs**: `var be[256]`/`be[248]` filled with 328 bytes in
+  `texture.tcyr`/`queue.tcyr` (the root cause of the old leading-NUL test summary), undersized fake
+  contexts in `native.tcyr`/`render.tcyr`/`backend.tcyr`, `px/py[20]` in
+  `native_array_sample_e2e`, `probes[3]`/`nb[16]` in the wgpu sample programs.
+- **wgpu test programs**: 21 hand-counted write lengths (NUL bytes in output, missing newlines),
+  hard-coded "N passed" summaries that didn't match what ran, "live on Cezanne" printed on any
+  adapter. `bench-gpu` read 0 ns on a jittery clock; it now batches sub-floor rows and fails on an
+  invalid row instead of dropping it with exit 0.
+- **`gpu_wgpu_spirv_passthrough_supported` probed a retired feature id** (0x00030017). It now
+  returns 0 without probing. Correction to earlier entries and docs: in wgpu-native v29.0.1.1
+  0x00030017 is unassigned; ClearTexture is 0x00030016.
+- **The example consumer never linked**: `main.cyr` lacked `lib/thread_local.cyr` (needed by the
+  launcher since 4.0.2), and the README recipe built a standalone ELF that never ran `mabda_main`.
+  Both it and `docs/stdlib-integration.md` now give the object-mode + launcher recipe.
+- **Makefile**: `make -n/-t/-q test-native-all` printed PASS for gates that never ran; `make fuzz`
+  kept only the last harness log and its cleanup could delete other `*.log` files.
+- **Untracked deferrals** that cyrlint couldn't see (split across lines, or never gated in CI) are
+  resolved or tracked in the roadmap.
+- **`make test-native-all` never showed why a gate failed.** `NATIVE_ALL_LOG =
+  $(shell mktemp …)` was a recursive variable, so each of its three uses in the recipe
+  created a new temp file: output went to one, `tail` read an empty second, and `rm`
+  deleted a third. Every FAIL row had a blank reason, and two logs leaked per run. The
+  recipe now makes one log per run, and a FAIL row shows its last three lines.
+- **Doc snippets that stopped compiling at cyrius 6.6.0.** 4.1.1 missed four
+  single-variable `Result` binds: `gpu_context_from_preinit` in
+  `docs/stdlib-integration.md`, and the three constructors in
+  `docs/guides/native-migration.md`. All are pair binds now.
+- **Stale statements found during the sweep**: the "`cc5` warns on the 65 wgpu slots"
+  section of `docs/stdlib-integration.md` (the compiler is `cycc`, the table has 67 slots,
+  and an undefined fn has been a hard error since cyrius 6.3.2), the "7-param fn into
+  wgpu segfaults" notes in the guides, "Intel native is not planned" (it is tentatively
+  v5.0), and the saxpy filing's "fixed in v4.0.11" (shipped as 4.1.0).
+- **The [4.1.2] entry below** didn't record the dep bumps its release commit made; it does now.
+
+## [4.1.2] — 2026-09-12
 
 ### Changed
 
 - **Toolchain `6.6.0` → `6.6.2`.** No source change: this repo was already on the
-  value form, so the flip cost it nothing. Re-verified on every surface it ships —
-  build, tests, and any bench/fuzz/distlib target, including every
-  `[lib.<profile>]` bundle.
+  value form, so the flip cost it nothing.
+- **Deps `samvada` 0.4.1 → 1.0.1 and `chitra` 0.3.1 → 1.0.3** (in `cyrius.cyml` and
+  `cyrius.lock`). *Recorded at 4.1.3; this entry originally omitted them.*
 
 ## [4.1.1] — 2026-09-06
 

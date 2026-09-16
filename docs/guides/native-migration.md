@@ -1,6 +1,6 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0; still applicable through 4.1.0 (see the
+> Written against mabda 3.0.0; still applicable through 4.1.3 (see the
 > v4.0.1 update below for what changed). Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
@@ -36,17 +36,18 @@ selector plus the matching `gpu_context_*` entry at init.
 
 ```cyrius
 # wgpu — exactly as v2.x. No code changes. Takes the C-built preinit ptr.
-var ctx = gpu_context_from_preinit(preinit_ptr);
+var ctx_tag, ctx = gpu_context_from_preinit(preinit_ptr);
 
 # native AMD — requires /dev/dri/renderD128 readable
-var ctx = gpu_context_new_native();
+var ctx_tag, ctx = gpu_context_new_native();
 
 # native NVIDIA (v4.0) — nouveau, requires /dev/dri/renderD128 readable
-var ctx = gpu_context_new_native_nvidia();
+var ctx_tag, ctx = gpu_context_new_native_nvidia();
 ```
 
-All three return a `GpuContext*` with the same shape
-(`GPU_CONTEXT_SIZE` = 176 bytes; see `src/context.cyr`). The extra
+All three return a `Result` whose payload is a `GpuContext*` with the
+same shape (`GPU_CONTEXT_SIZE` = 176 bytes; see `src/context.cyr`) —
+test `is_err_result(ctx_tag)` before using `ctx`. The extra
 slots past the wgpu handles are native surface-stash / RT-VA state
 that backend-agnostic code never reads.
 
@@ -115,35 +116,52 @@ gpu_surface_release(ctx, surface);             # at shutdown
 |---|---|---|
 | `_wgpu` | wgpu backend | Caller already created a `WGPUSurface` from the windowing library |
 | `_native_kiosk` | native, dev/no-compositor | Caller has opened `/dev/dri/cardN` and called `SET_MASTER` themselves |
-| `_native_logind` | native, in-session (compositor running) | `samvada` C-shim linked + initialized; logind delegates DRM master via `TakeDevice()` |
+| `_native_logind` | native, in-session (compositor running) | Built with `-D MABDA_LOGIND`; consumer called `samvada_native_init()`; logind delegates DRM master via `TakeDevice()` |
 
-`_native_logind` is the production path for desktop apps. `_native_kiosk`
+`_native_logind` is the intended production path for desktop apps. `_native_kiosk`
 is the bring-up / kiosk path. `_wgpu` continues to work unchanged.
 
 ## samvada wiring (logind path only)
 
-If you ship `_native_logind`, your consumer needs to link
-`samvada/deps/samvada_main.c` alongside mabda's `deps/wgpu_main.c`.
-The C side calls `samvada_main(table)` once during init to populate
-samvada's static fn-table reference; mabda then routes through
-samvada to ask logind for the master fd.
+If you ship `_native_logind`, build with `-D MABDA_LOGIND` (off by
+default; without the flag the entry returns 0) and add the `samvada`
+dbus client, a sister AGNOS package, to your `cyrius.cyml`:
 
-```sh
-# in your consumer's build
-gcc -c samvada/deps/samvada_main.c -o samvada_main.o
-# ... link both samvada_main.o and wgpu_main.o into your binary
+```cyml
+[deps.samvada]
+git = "https://github.com/MacCracken/samvada.git"
+tag = "1.0.1"
+modules = ["dist/samvada.cyr"]
 ```
 
-samvada itself is a sister AGNOS package (`[deps.samvada]
-tag = "0.4.1"` in your `cyrius.cyml`). It currently uses
-libsystemd via its C-shim. **v4.0.1 deprecates the AMD wgpu route**
-(AMD-on-wgpu still works with a one-shot warning; `-D MABDA_AMD_WGPU_STRICT`
-enforces native-only), and the paired **libsystemd/samvada C-shim
-retirement is deferred** under the roadmap escape hatch: the
-pure-Cyrius dbus replacement is upstream samvada work that isn't
-ready, so `[deps.samvada]` stays `0.4.1` and `MABDA_LOGIND` stays
-opt-in. When samvada ships pure-Cyrius 1.0, mabda swaps via a
-one-line tag bump. (v4.0 itself shipped NVIDIA native.)
+samvada 1.0.1's native backend (`samvada_native_init()`) is pure-Cyrius
+dbus — no C shim, no libsystemd. Your consumer initializes it once,
+before configuring the surface; mabda never initializes samvada itself:
+
+```cyrius
+var s3 = 0;
+if (samvada_native_init() == 0) {           # 0, or a negative errno
+    s3 = gpu_surface_configure_native_logind(ctx, w, h);
+}
+if (s3 == 0) {
+    # logind path unavailable — fall back to _native_kiosk
+}
+```
+
+mabda then routes through samvada (`samvada_session_take_device`) to ask
+logind for the master fd. If samvada was never initialized, take_device
+returns `-EINVAL` and `gpu_surface_configure_native_logind` returns 0, so
+the consumer can fall back to `_native_kiosk`. Don't pin samvada below
+1.0.1 (earlier versions could return the wrong fd or fail `TakeDevice`).
+
+samvada labels its native backend not yet consumer-validated. Its
+libsystemd C shim still exists as an opt-in fallback (C entry
+`samvada_shim_init()`), and samvada plans to remove it at 1.1.0 — a
+removal waiting on a mabda live-bus end-to-end run of the logind path
+from a seated session, which has not been done yet. **v4.0.1 deprecates the
+AMD wgpu route** (AMD-on-wgpu still works with a one-shot warning;
+`-D MABDA_AMD_WGPU_STRICT` enforces native-only). (v4.0 itself shipped
+NVIDIA native.)
 
 If you don't need the logind path (kiosk / development / no
 compositor in your session), skip samvada entirely — `_native_kiosk`
@@ -230,8 +248,9 @@ the wgpu path.
 ## When to flip
 
 - **Stay on wgpu** if cross-platform matters, or if Intel is in scope
-  (Intel has no native backend). Native now covers both AMD (v3.0) and
-  NVIDIA (v4.0); Intel-native is not planned.
+  (Intel has no native backend yet). Native now covers both AMD (v3.0)
+  and NVIDIA (v4.0); Intel native is tentatively v5.0 (see the roadmap),
+  so Intel consumers stay on wgpu until then.
 - **Consider native** if your consumer is AGNOS-targeted, or if the
   wgpu-native runtime cost / dependency is a problem you want to drop.
   The native path has ~2x lower CPU overhead for the smoke shapes (no

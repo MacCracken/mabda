@@ -1264,8 +1264,8 @@ fn test_backend_wgpu_texture_read_compressed_fail_loud() {
     store64(&tex + 16, MABDA_TEXFMT_BC1);   # compressed fmt at +16
     store32(&tex + 24, 8);
     store32(&tex + 28, 8);
-    var dst[64];
-    memset(&dst, 0, 64);
+    var dst[1024];   # >= the 999-byte request below, so no path can write past it
+    memset(&dst, 0, 1024);
     assert_eq(_backend_wgpu_texture_read(ctx, &tex, &dst, 32),
       GPU_ERR_NOT_IMPLEMENTED, "wgpu compressed read -> NOT_IMPLEMENTED (fail-loud)");   #skip-lint
     # An uncompressed (RGBA8, fmt 0) tex still takes the normal path: a
@@ -2165,6 +2165,45 @@ fn test_gpu_caps_wgpu_shader_f64_gated() {
     return 0;
 }
 
+# Mock wgpuDeviceHasFeature (fn-table slot 44): a device that claims EVERY feature id —
+# including the retired SpirvShaderPassthrough number 0x00030017 — and records what was asked.
+var _mock_has_feature_calls = 0;
+var _mock_has_feature_last  = 0;
+var _mock_has_feature_saw_retired = 0;
+fn _mock_wgpu_device_has_feature_all(device, feature): i64 {
+    _mock_has_feature_calls = _mock_has_feature_calls + 1;
+    _mock_has_feature_last  = feature;
+    if (feature == 0x00030017) { _mock_has_feature_saw_retired = 1; }
+    return 1;
+}
+
+# 4.1.3 verification — gpu_wgpu_spirv_passthrough_supported used to return
+# wgpu_device_has_feature(device, 0x00030017). SpirvShaderPassthrough does not exist in the pinned
+# wgpu-native v29.0.1.1 (0x00030017 is an unassigned slot there), so any device answering "yes"
+# for that number would have routed callers into the passthrough creator. Drive the REAL gate
+# through a mock fn table whose device reports every feature: the gate must still say 0 and must
+# never ask about the retired id. Control: ShaderF64 (a real v29.0.1.1 id) reads through the
+# same mock, so the 0 is not a dead table.
+fn test_wgpu_spirv_passthrough_gate_never_probes_retired_id() {
+    var faketable[512];                       # 64 slots; slot 44 @ +352 < 512
+    memset(&faketable, 0, 512);
+    store64(&faketable + 44 * 8, &_mock_wgpu_device_has_feature_all);
+    wgpu_ffi_init_table(&faketable);
+    _mock_has_feature_calls = 0;
+    _mock_has_feature_saw_retired = 0;
+    assert_eq(gpu_wgpu_shader_f64_supported(0x1234), 1, "control: mock device reports ShaderF64");
+    assert_eq(_mock_has_feature_last, 0x0003001D, "control: ShaderF64 probed as 0x0003001D");
+    assert_eq(_mock_has_feature_calls, 1, "control: mock has_feature reached once");
+    _mock_has_feature_calls = 0;
+    assert_eq(gpu_wgpu_spirv_passthrough_supported(0x1234), 0,
+      "passthrough gate = 0 even when the device reports feature 0x00030017");
+    assert_eq(_mock_has_feature_saw_retired, 0, "passthrough gate never probes retired 0x00030017");
+    assert_eq(_mock_has_feature_calls, 0, "passthrough gate makes no has_feature call");
+    assert_eq(gpu_wgpu_spirv_passthrough_supported(0), 0, "passthrough gate on null device = 0");
+    wgpu_ffi_init_table(0);                    # reset the global for later tests
+    return 0;
+}
+
 # v3.4.1 AA.3c — wgpu draw-time layer-select: the bind filler stashes the layer
 # on the pass (+40), and the plain bind resets it to -1 (2-entry group).
 fn test_backend_wgpu_bind_for_sample_layer() {
@@ -2292,6 +2331,7 @@ fn main() {
     test_wgpu_texture_layer_bind_group_descriptor();
     test_wgpu_f64_probe_spirv_structure();
     test_gpu_caps_wgpu_shader_f64_gated();
+    test_wgpu_spirv_passthrough_gate_never_probes_retired_id();
     test_audit_strnlen_caps_at_max();
     test_audit_bgl_entry_buffer_offsets();
     test_backend_struct_layout();

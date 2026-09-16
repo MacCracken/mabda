@@ -21,8 +21,11 @@
 # The R.5 per-node IB staging means C stages into IB slice 0 and R into slice 1,
 # so the two in-flight submits never clobber each other's PM4. The executor
 # wait_idle's both queues at the end (completion contract), then we CPU-verify
-# both results: buf_a == 0xDEADBEEF (compute ran) and RT pixel(0,0) == red
-# (render ran). Distinct rings (COMPUTE=1, GFX=0), timeline-ordered.
+# both results: buf_a == 0xDEADBEEF (compute ran) and EVERY RT pixel == red
+# (render ran with the viewport transform applied — a pixel(0,0)-only check
+# false-passed when PA_CL_VTE_CNTL was never written and the triangle covered
+# only pixel (0,0); 4.1.3 finding). Distinct rings (COMPUTE=1, GFX=0),
+# timeline-ordered.
 #
 # NOTE on "consumes": the dependency is DECLARED (C writes / R reads resource
 # 7) and HW-enforced by the in-CS timeline wait — the ordering guarantee is the
@@ -31,7 +34,8 @@
 # separately); this e2e isolates the R.6 cross-queue EXECUTOR.
 #
 # Exit codes:
-#   0  — both results verified; cross-queue render graph ran on distinct rings
+#   0  — both results verified (buf_a + every RT pixel); cross-queue render graph
+#        ran on distinct rings
 #   1  — gpu_context_new_native failed
 #   2  — compute shader / buf_a setup failed
 #   3  — render object (VS/FS/RT/pipeline/pass) setup failed
@@ -40,6 +44,8 @@
 #   6  — rg_execute_mq returned non-zero
 #   7  — buf_a readback != 0xDEADBEEF (compute leg)
 #   8  — RT pixel(0,0) not red (render leg)
+#   9  — RT pixel(0,0) red but full-RT coverage failed: at least one of the W*H
+#        pixels is not red (render leg viewport / rasterizer state)
 
 include "src/lib.cyr"
 
@@ -64,6 +70,58 @@ fn print_hex32(v): i64 {
     }
     syscall(1, 1, &buf, 10);
     return 0;
+}
+
+# Full-RT coverage scan: count pixels != `want` (little-endian u32 of RGBA8)
+# over the W*H RT; print the four corners, center, an interior probe, the
+# first few mismatches and the matching-pixel bounding box. Returns the count.
+fn rt_scan_solid(rt_addr, W, H, want): i64 {
+    var probes[48];   # 6 (x, y) pairs as u32: 4 corners + center + interior
+    store32(&probes + 0, 0);       store32(&probes + 4, 0);
+    store32(&probes + 8, W - 1);   store32(&probes + 12, 0);
+    store32(&probes + 16, 0);      store32(&probes + 20, H - 1);
+    store32(&probes + 24, W - 1);  store32(&probes + 28, H - 1);
+    store32(&probes + 32, W / 2);  store32(&probes + 36, H / 2);
+    store32(&probes + 40, W / 3);  store32(&probes + 44, (H * 2) / 3);
+    var pi = 0;
+    while (pi < 6) {
+        var qx = load32(&probes + pi * 8);
+        var qy = load32(&probes + pi * 8 + 4);
+        print_cstr("  probe ("); print_i64(qx); print_cstr(","); print_i64(qy);
+        print_cstr(") = "); print_hex32(load32(rt_addr + (qy * W + qx) * 4));
+        print_cstr("\n");
+        pi = pi + 1;
+    }
+    var bad = 0;
+    var minx = W;
+    var miny = H;
+    var maxx = -1;
+    var maxy = -1;
+    var y = 0;
+    while (y < H) {
+        var x = 0;
+        while (x < W) {
+            var got = load32(rt_addr + (y * W + x) * 4);
+            if (got == want) {
+                if (x < minx) { minx = x; }
+                if (y < miny) { miny = y; }
+                if (x > maxx) { maxx = x; }
+                if (y > maxy) { maxy = y; }
+            } else {
+                if (bad < 4) {
+                    print_cstr("  MISMATCH ("); print_i64(x); print_cstr(","); print_i64(y);
+                    print_cstr(") got="); print_hex32(got); print_cstr("\n");
+                }
+                bad = bad + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    print_cstr("coverage: "); print_i64(W * H - bad); print_cstr("/"); print_i64(W * H);
+    print_cstr(" px expected, bbox=("); print_i64(minx); print_cstr(","); print_i64(miny);
+    print_cstr(")-("); print_i64(maxx); print_cstr(","); print_i64(maxy); print_cstr(")\n");
+    return bad;
 }
 
 fn main(): i64 {
@@ -188,7 +246,7 @@ fn main(): i64 {
         print_cstr("FAIL: compute leg (buf_a != 0xDEADBEEF)\n");
         gpu_context_release(ctx); return 7; }
 
-    # ---- 8. Verify the render leg: pixel(0,0) == red ----
+    # ---- 8. Verify the render leg: pixel(0,0) == red (then full RT, step 9) ----
     var pr = load8(rt_addr + 0);
     var pg = load8(rt_addr + 1);
     var pb = load8(rt_addr + 2);
@@ -204,6 +262,14 @@ fn main(): i64 {
         gpu_context_release(ctx); return 8; }
     if (pa != 0xFF) { print_cstr("FAIL: render leg (alpha != 0xFF)\n");
         gpu_context_release(ctx); return 8; }
+
+    # ---- 9. Verify the render leg covered the whole RT ----
+    var n_bad = rt_scan_solid(rt_addr, W, H, 0xFF0000FF);
+    if (n_bad != 0) {
+        print_cstr("FAIL: render leg coverage ("); print_i64(n_bad);
+        print_cstr(" pixels not red)\n");
+        gpu_context_release(ctx); return 9; }
+    print_cstr("PASS: all W*H RT pixels red\n");
 
     gpu_render_pass_end(ctx, pass);
     gpu_context_release(ctx);

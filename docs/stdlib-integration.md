@@ -24,11 +24,10 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "6.5.29"
+cyrius = "6.6.4"
 
-[build]
-entry = "src/main.cyr"
-output = "build/my-app"
+# No [build] section: see "4. Build it". A wgpu-path consumer has no entry point
+# of its own, so `cyrius build` cannot produce the program.
 
 [deps]
 stdlib = [
@@ -38,7 +37,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.0"
+tag = "4.1.3"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -46,7 +45,9 @@ modules = ["dist/mabda.cyr"]
 resolved `lib/` tree — mabda's include chain (`src/lib.cyr`) pulls them
 in that order, so declaring the full stdlib set above is required, not
 optional. `examples/stdlib-consumer/cyrius.cyml` carries the canonical
-list.
+list. `cyrius deps` also brings in the stdlib leaves listed in mabda's
+`dist/mabda.deps` (`thread`, `thread_local`, `sankoch`), so they need no
+entry here; section 2 includes one of them.
 
 ### Opt-in feature deps
 
@@ -64,23 +65,25 @@ you don't need the dep:
   ```cyml
   [deps.chitra]
   git = "https://github.com/MacCracken/chitra.git"
-  tag = "0.3.1"
+  tag = "1.0.3"
   modules = ["dist/chitra.cyr"]
   ```
 
 - **logind surface delegation** (`gpu_surface_configure_native_logind`,
-  gated on `#ifdef MABDA_LOGIND`) — build with `-D MABDA_LOGIND` and add
-  the `samvada` dbus client:
+  gated on `#ifdef MABDA_LOGIND`) — build with `-D MABDA_LOGIND`, add
+  the `samvada` dbus client, and call `samvada_native_init()` once before
+  `gpu_surface_configure_native_logind` (pure-Cyrius dbus — no C shim, no
+  libsystemd; mabda never initializes samvada itself):
 
   ```cyml
   [deps.samvada]
   git = "https://github.com/MacCracken/samvada.git"
-  tag = "0.4.1"
+  tag = "1.0.1"
   modules = ["dist/samvada.cyr"]
   ```
 
-Then `cyrius deps` pulls the bundle and creates `lib/mabda.cyr` as a
-symlink into `$HOME/.cyrius/cache/mabda/dist/mabda.cyr`.
+Then `cyrius deps` fetches the tag into the dep cache under
+`~/.cyrius/deps/mabda/<tag>/` and copies the bundle into `lib/mabda.cyr`.
 
 ## 2. Write your consumer code
 
@@ -93,36 +96,65 @@ a `# @public` or `# @internal` marker on line 1:
   `wgpu_descriptors`, `wgpu_ffi`). Will be replaced. Do not
   reference these from consumer code.
 
-Consumer entry points look like this:
+Consumer entry points look like this (the include list is
+`examples/stdlib-consumer/src/main.cyr`'s):
 
 ```cyrius
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/args.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/tagged.cyr"
+include "lib/fnptr.cyr"
+include "lib/mmap.cyr"
+include "lib/sakshi.cyr"
+include "lib/dynlib.cyr"
+include "lib/thread_local.cyr"   # the C launcher calls thread_local_use_foreign_tls()
 include "lib/mabda.cyr"
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
     color_init();
     wgpu_ffi_init_table(fn_table_ptr);       # [transitional]
-    var res = gpu_context_from_preinit(preinit_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
     # ... use gpu_ctx_device, texture_from_rgba, compute_dispatch, etc.
     return 0;
 }
 ```
 
 The `mabda_main` name is required — the C launcher calls it by symbol.
-`_cyrius_init()` and `alloc_init()` run inside the launcher before
-`mabda_main` fires.
+`_cyrius_init()`, `alloc_init()` and `thread_local_use_foreign_tls()` run
+inside the launcher before `mabda_main` fires.
+
+⚠ **Keep `include "lib/thread_local.cyr"`.** Nothing on the Cyrius side
+calls `thread_local_use_foreign_tls`, so without the include the object
+still compiles cleanly, and the link then fails with
+`undefined reference to 'thread_local_use_foreign_tls'`. The launcher has
+called it since mabda 4.0.2; the example and this guide gained the
+include in 4.1.3.
 
 ## 3. The C launcher [transitional]
 
 Mabda ships a reference launcher at `deps/wgpu_main.c` (copy it into
-your project's `deps/` directory). It does exactly four things:
+your project's `deps/` directory). Its `main()` does exactly five things:
 
 1. **Bring up Cyrius globals.** `_cyrius_init()` then `alloc_init()`.
    Order matters — init resets globals, alloc must come after.
-2. **Pre-initialize the GPU.** `wgpuCreateInstance` →
+2. **Declare foreign TLS.** `thread_local_use_foreign_tls()` (cyrius
+   6.3.26): the glibc-hosted launcher owns `%fs`, so Cyrius thread-locals
+   must not `arch_prctl` over it (that would wipe the stack canary every
+   stack-protected wgpu callee reads). It runs after `_cyrius_init`, which
+   resets the flag. Defined in `lib/thread_local.cyr` — hence the include
+   in section 2.
+3. **Pre-initialize the GPU.** `wgpuCreateInstance` →
    `wgpuInstanceRequestAdapter` → `wgpuAdapterRequestDevice` →
    `wgpuDeviceGetQueue`. Packages the four handles into a
    `WgpuPreinit` struct.
-3. **Build the function table.** Populates function pointers for every
+4. **Build the function table** (67 slots). Populates function pointers for every
    wgpu entry mabda uses. Slots 28/42/48
    (`wgpuCommandEncoderCopyBufferToBuffer` / `...ResolveQuerySet` /
    `wgpuQueueWriteTexture`) are the raw all-scalar wgpu functions, called
@@ -138,29 +170,69 @@ your project's `deps/` directory). It does exactly four things:
    - `wgpu_shim_create_command_encoder` / `..._finish` — label-taking
      wrappers (wgpu v29 is sensitive to descriptor padding)
    - `wgpu_shim_get_timestamp_period_bits` — f32→i64 bit reinterpret
-4. **Call `mabda_main(fn_table_ptr, preinit_ptr)`.**
+   - `wgpu_shim_request_adapter` / `wgpu_shim_request_device` (slots 1/2)
+     and `wgpu_shim_device_poll` (slot 39) — callback-struct simplifiers
+   - `wgpu_shim_create_shader_module_spirv` (slot 66) — the raw-SPIR-V
+     passthrough creator. wgpu-native v29.0.1.1 has no passthrough device
+     feature, so `gpu_wgpu_spirv_passthrough_supported` always answers 0
+     and nothing should reach this slot.
+5. **Call `mabda_main(fn_table_ptr, preinit_ptr)`**, passing a null
+   preinit pointer when step 3 failed.
 
 ## 4. Build it
 
+The consumer has no entry point of its own, so it is compiled as an
+**object** and linked with the launcher and wgpu-native. `cyrius build`
+is not the build: `cyrius build src/main.cyr <out>` makes a standalone ELF
+that never links the launcher and never calls `mabda_main`, so it exits 0
+and prints nothing. `cyrius check src/main.cyr` is fine as a compile-only
+check.
+
+From the project root:
+
 ```sh
 # First time only:
-cyrius deps                                   # resolve [deps.mabda]
-sh deps/fetch-wgpu.sh                         # download wgpu-native binaries
+cyrius deps                                   # resolve [deps.mabda] into lib/
+mkdir -p deps build
+cp <mabda>/deps/wgpu_main.c <mabda>/deps/fetch-wgpu.sh deps/
+sh deps/fetch-wgpu.sh                         # wgpu-native into deps/wgpu-native/
+gcc -c deps/wgpu_main.c -Ideps/wgpu-native/include -o deps/wgpu_main.o
 
 # Every build:
-make -C deps                                  # compile wgpu_main.c [transitional]
-cyrius build                                  # compile your .cyr source
-./build/my-app                                # run
+printf 'object;\n' | cat - src/main.cyr | cycc > build/my-app.o
+objcopy -L memcpy -L memset -L memchr -L strlen -L strchr -L strstr \
+        -L memeq -L atoi -L print_num -L println build/my-app.o
+gcc deps/wgpu_main.o build/my-app.o deps/wgpu-native/lib/libwgpu_native.a \
+    -lpthread -ldl -lm -o build/my-app
+./build/my-app                                # needs a GPU with a Vulkan driver
 ```
 
-The Makefile rule for the launcher is roughly:
+- **`fetch-wgpu.sh` unpacks next to itself** (into `deps/wgpu-native/`),
+  whatever the working directory. `wgpu_main.c` includes
+  `wgpu-native/include/webgpu/*.h` relative to itself.
+- **`printf 'object;\n' | … | cycc`** is the object-mode compile. Run it
+  from the project root: `lib/` resolves relative to the working directory.
+- **The `objcopy -L …` step is required, even though the link succeeds
+  without it.** The Cyrius stdlib defines its own GLOBAL `memcpy`, `strlen`,
+  `strstr`, …, and those interpose glibc's for the whole process.
+  wgpu-native and the Vulkan driver then call the Cyrius versions, which
+  crashed Mesa's adapter enumeration when `strstr` was missed (CHANGELOG
+  2.4.2). The list is mabda's Makefile `LOCALIZE_FLAGS` plus `print_num` /
+  `println`, as its `build/%.o` rule applies.
+
+The same recipe as Makefile rules (recipe lines start with a tab):
 
 ```make
+LOCALIZE = -L memcpy -L memset -L memchr -L strlen -L strchr -L strstr \
+           -L memeq -L atoi -L print_num -L println
+
 deps/wgpu_main.o: deps/wgpu_main.c
-	gcc -c -Ideps/wgpu-native/include deps/wgpu_main.c -o $@
+	gcc -c $< -Ideps/wgpu-native/include -o $@
 
 build/my-app.o: src/main.cyr
-	printf 'object;\n' | cat - src/main.cyr | cc5 > $@
+	@mkdir -p build
+	printf 'object;\n' | cat - $< | cycc > $@
+	objcopy $(LOCALIZE) $@
 
 build/my-app: build/my-app.o deps/wgpu_main.o
 	gcc deps/wgpu_main.o build/my-app.o \
@@ -169,13 +241,14 @@ build/my-app: build/my-app.o deps/wgpu_main.o
 ```
 
 See `examples/stdlib-consumer/` in the mabda repo for a complete
-runnable project.
+project. mabda's `make example-link` compiles and links it this way
+(without running it) as part of `make test-all`.
 
 ## 5. When the wgpu path retires (and what stays)
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.1.0 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.1.3 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in
@@ -192,9 +265,9 @@ production:
 - **The C launcher / wgpu binding itself — leaves the tree at v5.1**,
   after both native paths are in production. That is when
   `deps/wgpu_main.c`, `deps/wgpu-native/`, the
-  `wgpu_ffi_init_table(fn_table_ptr)` line, the `make -C deps` step,
-  and the libC dependency finally go away and a wgpu-free consumer
-  becomes pure Cyrius.
+  `wgpu_ffi_init_table(fn_table_ptr)` line, the launcher compile, object
+  build and `gcc` link steps, and the libC dependency finally go away
+  and a wgpu-free consumer becomes pure Cyrius.
 
 To move off the wgpu launcher today (native AMD or NVIDIA), you skip
 the C launcher entirely and call the native entry points directly —
@@ -215,27 +288,28 @@ selected at compile time via `MABDA_BACKEND_KIND`.
 The `examples/stdlib-consumer/` project is the regression test: if it
 still compiles against the current mabda tag, the contract held.
 
-## Known transitional warnings
+## Compiler diagnostics
 
-When compiling the bundled `dist/mabda.cyr`, cc5 emits
-`undefined function` warnings for the 65 wgpu function-table slots.
-These are **expected and benign** — the slots are globals populated
-by the C launcher at runtime. They did **not** become real Cyrius
-definitions in v3.0/v4.0: the native AMD and NVIDIA backends are
-separate code paths, not reimplementations of these slots. The
-warnings persist for as long as the wgpu path is in the tree, and go
-away only when the wgpu binding itself is removed at v5.1.
-
-If you see any warning that is **not** a wgpu function-table slot,
-that's a bug; please file it at
+Compiling the bundled `dist/mabda.cyr` with `cycc` (or `cyrius build`)
+emits no `undefined function` diagnostics. The wgpu function-table
+slots are globals populated by the C launcher at runtime and called
+through `fncallN` — they are not undefined fn references. A reachable
+undefined function has been a hard compile error since cyrius 6.3.2,
+so any `undefined function` diagnostic against the bundle is a bug;
+please file it at
 [github.com/MacCracken/mabda/issues](https://github.com/MacCracken/mabda/issues).
 
 ## Debugging tips
 
-- If `mabda_main` is never called, the launcher's GPU pre-init likely
-  failed (no wgpu adapter). Run the launcher with
-  `WGPU_BACKENDS=vulkan` or `WGPU_BACKENDS=gl` to force a specific
-  backend.
+- If `gpu_context_from_preinit` returns an error, the launcher's GPU
+  pre-init failed: `main()` still calls `mabda_main`, with a null preinit
+  pointer, when instance creation, the adapter request or the device
+  request fails. The reference launcher asks for the Vulkan backend only
+  (`extras.backends = WGPUInstanceBackend_Vulkan` in `preinit_gpu`), so a
+  host with no Vulkan driver gets no adapter. `WGPU_BACKENDS=...` does not
+  change that (the pinned `libwgpu_native.a` has no `WGPU_BACKEND*`
+  environment lookup); edit `extras.backends` in your copy of the launcher
+  instead.
 - If you get a `Shader not provided` panic from wgpu-native, check
   that `WGPU_STYPE_SHADER_SOURCE_WGSL` is `0x02` in your FFI
   constants — mabda's v2.0 tree shipped with the wrong value and was

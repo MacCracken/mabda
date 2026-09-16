@@ -46,7 +46,9 @@ jobs:
       - name: Lint
         run: |
           fail=0
-          for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr; do
+          for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr \
+                   examples/stdlib-consumer/src/main.cyr; do
+            [ -e "$f" ] || continue
             out=$(cyrius lint "$f" 2>&1)
             echo "$out"
             if echo "$out" | grep -qE '^\s*warn '; then
@@ -54,6 +56,31 @@ jobs:
             fi
           done
           [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
+
+      - name: Untracked deferrals (cyrlint --strict-deferrals)
+        # `cyrius lint` cannot forward --strict-deferrals (first: usage + exit 1; last:
+        # silently ignored, exit 0 — docs/development/issues/
+        # 2026-09-16-cyrius-lint-drops-strict-deferrals.md), so call the pinned toolchain's
+        # cyrlint binary directly. install.sh puts it at ~/.cyrius/versions/<pin>/bin/.
+        # A missing binary fails the step; it never skips. Mirrors `make lint-deferrals`.
+        run: |
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          CYRLINT="$HOME/.cyrius/versions/$CYRIUS_VERSION/bin/cyrlint"
+          [ -x "$CYRLINT" ] || { echo "no executable $CYRLINT for pinned cyrius $CYRIUS_VERSION"; exit 1; }
+          fail=0
+          n=0
+          for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr \
+                   examples/stdlib-consumer/src/main.cyr; do
+            [ -e "$f" ] || continue
+            n=$((n + 1))
+            if ! out=$("$CYRLINT" --strict-deferrals "$f" 2>&1); then
+              echo "$out"
+              echo "untracked deferral(s): $f"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "strict-deferrals: untracked deferrals present"; exit 1; }
+          echo "strict-deferrals: $n file(s) clean"
 
       - name: Format check
         run: |
@@ -66,7 +93,9 @@ jobs:
           # e.g. native.tcyr at ~113 KiB checks clean), so the size guard
           # is retired with it.
           fail=0
-          for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr; do
+          for f in src/*.cyr programs/*.cyr tests/tcyr/*.cyr tests/tcyr/*.tcyr tests/bcyr/*.bcyr fuzz/*.fcyr \
+                   examples/stdlib-consumer/src/main.cyr; do
+            [ -e "$f" ] || continue
             if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"
               fail=1
@@ -85,6 +114,24 @@ jobs:
       - name: Compiler scratch-buffer sizing
         run: ./scripts/check-compiler-buffer-sizing.py
 
+      # No write may land past a `var buf[N]` (N BYTES for a local). texture.tcyr and
+      # queue.tcyr memset 328 B into 256/248 B stack arrays until 4.1.3 (texture.tcyr's old
+      # "leading NUL"). Reads lib/, so it runs after `cyrius deps`; the target runs the
+      # script's --self-test first.
+      - name: Stack-array sizing
+        run: make check-stack-array-sizing
+
+      # programs/ never write a literal with a hand-counted length or print a hand-typed
+      # "N passed" tally (21 wrong lengths and 10 stale tallies until 4.1.3).
+      - name: Program write lengths
+        run: make check-program-write-lengths
+
+      # Self-tests of the Makefile's own gates and of the assertion counter, plus the fuzz
+      # harnesses. All CPU-only: check-fuzz-logs and the count self-test use stub
+      # compilers, check-make-dry-run a stub make; `make fuzz` runs the real harnesses.
+      - name: Recipe self-tests + fuzz
+        run: make check-count-script check-fuzz-logs check-make-dry-run fuzz
+
       - name: Verify dist bundle is in sync with src/
         run: |
           cyrius distlib
@@ -94,6 +141,14 @@ jobs:
             exit 1
           fi
           echo "dist/mabda.cyr matches src/"
+
+      # Builds examples/stdlib-consumer the way its README says: object-mode compile against
+      # the committed dist/mabda.cyr, objcopy -L, and a check that the object defines every
+      # function deps/wgpu_main.c declares extern (the missing thread_local include went
+      # unseen from 4.0.2 to 4.1.3). The runner has no wgpu-native, so the final gcc link is
+      # reported as skipped; `make example-link` links it wherever deps/wgpu-native exists.
+      - name: Example consumer build
+        run: make example-link
 
       - name: Build (link-check, DCE on)
         run: |

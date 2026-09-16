@@ -1,0 +1,302 @@
+# programs/diagnostics/state_poison/coverage_scan.cyr — full-coverage render
+# scanner for the inherited-state proof (diagnostic, NOT a gate; see README.md).
+#
+#   coverage_scan all [dumpdir]   A: solid red 64x64, B: textured image_load
+#                                 64x64, C: solid red 1920x1080 (every render
+#                                 backend / tile). Scans EVERY pixel of each RT
+#                                 against its oracle. With dumpdir, writes the
+#                                 PM4 stream each draw submitted (modeA.bin ...).
+#   coverage_scan canary          Harness liveness check: draws the solid-red
+#                                 64x64 with the stream's own PA_CL_VTE_CNTL
+#                                 write replaced by a same-length NOP, so the
+#                                 draw INHERITS the viewport-transform enable.
+#                                 After `state_poison vte0` it must cover exactly
+#                                 pixel (0,0) (exit 30); after `state_poison
+#                                 vte43f` every pixel (exit 0). Anything else
+#                                 means the GPU is not carrying register state
+#                                 between submissions and a poison matrix run on
+#                                 this box proves nothing.
+#
+# exit: 0 all modes pass (canary: full coverage); 1 ctx; 2-6 setup; 20/21/22
+#       mode A/B/C coverage; 30 canary covered only pixel (0,0); 31 canary
+#       partial / other; 32 canary could not find the VTE write.
+
+include "src/lib.cyr"
+
+fn _cs_print(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn _cs_int(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+fn _cs_hex(v): i64 {
+    var digits = "0123456789ABCDEF";
+    var buf[10];
+    store8(&buf + 0, 48);
+    store8(&buf + 1, 120);
+    var i = 0;
+    while (i < 8) {
+        var nibble = ((v & 0xFFFFFFFF) >> ((7 - i) * 4)) & 0xF;
+        store8(&buf + 2 + i, load8(digits + nibble));
+        i = i + 1;
+    }
+    syscall(1, 1, &buf, 10);
+    return 0;
+}
+
+fn _cs_texel(x, y): i64 {
+    return (x & 0xFF) | ((y & 0xFF) << 8) | (0xC0 << 16) | (0xFF << 24);
+}
+
+# Write `len` bytes of the ctx PM4 scratch to <dir>/<name>. No-op without dir.
+fn _cs_dump(ctx, dir, name, len): i64 {
+    if (dir == 0) { return 0; }
+    var path[512];
+    memset(&path, 0, 512);
+    var dl = strlen(dir);
+    var nl = strlen(name);
+    if (dl + nl + 2 > 512) { return 0; }
+    memcpy(&path, dir, dl);
+    store8(&path + dl, 47);
+    memcpy(&path + dl + 1, name, nl);
+    var fd = syscall(2, &path, 577, 420);
+    if (fd < 0) { _cs_print("  dump open failed\n"); return 0; }
+    syscall(1, fd, native_ctx_pm4_scratch(ctx), len);
+    syscall(3, fd);
+    return 0;
+}
+
+# Scan every pixel. mode 0 = solid red (0xFF0000FF LE), 1 = _cs_texel. Returns
+# the count of exactly-expected pixels; prints sentinel/other counts + bbox.
+fn _cs_scan(rt_addr, w, h, mode): i64 {
+    var sent = 0;
+    var good = 0;
+    var other = 0;
+    var minx = 1 << 30;
+    var miny = 1 << 30;
+    var maxx = 0 - 1;
+    var maxy = 0 - 1;
+    var shown = 0;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var got = load32(rt_addr + (y * w + x) * 4);
+            var want = 0xFF0000FF;
+            if (mode == 1) { want = _cs_texel(x, y); }
+            if (got == 0x55555555) {
+                sent = sent + 1;
+            } else {
+                if (x < minx) { minx = x; }
+                if (y < miny) { miny = y; }
+                if (x > maxx) { maxx = x; }
+                if (y > maxy) { maxy = y; }
+                if (got == want) {
+                    good = good + 1;
+                } else {
+                    other = other + 1;
+                    if (shown < 4) {
+                        _cs_print("  other px=");
+                        _cs_int(x);
+                        _cs_print(",");
+                        _cs_int(y);
+                        _cs_print(" got=");
+                        _cs_hex(got);
+                        _cs_print(" want=");
+                        _cs_hex(want);
+                        _cs_print("\n");
+                        shown = shown + 1;
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    _cs_print("  coverage=");
+    _cs_int(good);
+    _cs_print("/");
+    _cs_int(w * h);
+    _cs_print(" sentinel=");
+    _cs_int(sent);
+    _cs_print(" other=");
+    _cs_int(other);
+    _cs_print(" bbox=(");
+    _cs_int(minx);
+    _cs_print(",");
+    _cs_int(miny);
+    _cs_print(")-(");
+    _cs_int(maxx);
+    _cs_print(",");
+    _cs_int(maxy);
+    _cs_print(")\n");
+    return good;
+}
+
+# Shader BO at `va` built by `which` (0 = fullscreen VS, 1 = solid red FS,
+# 2 = textured image_load FS); `mod` receives the (handle, va) pair.
+fn _cs_shader(fd, va, which, m): i64 {
+    var bo[16];
+    if (native_bo_create_gtt(fd, 4096, &bo) != 0) { return 0 - 1; }
+    var addr = load64(&bo + 8);
+    memset(addr, 0, 4096);
+    if (which == 0) { native_gfx9_shader_fullscreen_triangle_vs(addr, 0); }
+    if (which == 1) { native_gfx9_shader_solid_red(addr, 0); }
+    if (which == 2) { native_gfx9_shader_textured_load_fs(addr, 0); }
+    if (native_gem_va_map(fd, load64(&bo), va, 4096, _NATIVE_PERM_SHADER) != 0) { return 0 - 1; }
+    native_buf_pair_write(m, load64(&bo), va);
+    return 0;
+}
+
+fn _cs_red_pass(ctx, vs_mod, red_mod, w, h, dir, name): i64 {
+    var rt = gpu_render_target_create_2d_rgba8(ctx, w, h);
+    if (rt == 0) { return 0 - 1; }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, w * h * 4);
+    var pipe = gpu_render_pipeline_create(ctx, vs_mod, red_mod, 0);
+    if (pipe == 0) { return 0 - 1; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    var rc = gpu_render_pass_draw(ctx, pass, pipe, 3, 1);
+    _cs_dump(ctx, dir, name, native_render_pass_pm4_bytes(0));
+    gpu_render_pass_end(ctx, pass);
+    _cs_print("  draw rc=");
+    _cs_int(rc);
+    _cs_print("\n");
+    if (rc != 0) { return 0 - 1; }
+    var good = _cs_scan(rt_addr, w, h, 0);
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    return good;
+}
+
+fn _cs_canary(ctx, fd, vs_mod, red_mod): i64 {
+    var w = 64;
+    var h = 64;
+    var rt = gpu_render_target_create_2d_rgba8(ctx, w, h);
+    if (rt == 0) { return 6; }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, w * h * 4);
+    var pipe = gpu_render_pipeline_create(ctx, vs_mod, red_mod, 0);
+    if (pipe == 0) { return 6; }
+    var pm4 = native_ctx_pm4_scratch(ctx);
+    memset(pm4, 0, _NATIVE_PM4_SCRATCH_BYTES);
+    var pos = native_render_pass_pm4_compose(pm4, _NATIVE_PM4_SCRATCH_BYTES, pipe,
+      load64(rt + NATIVE_RT_FIELD_VA), w, h, 0, 0, 3);
+    if (pos <= 0) { return 6; }
+    # Replace the single SET_CONTEXT_REG PA_CL_VTE_CNTL (header 0xC0016900,
+    # wire offset (0x028818 - 0x028000) / 4 = 0x206) with a 3-dword NOP.
+    var found = 0;
+    var i = 0;
+    while (i + 12 <= pos) {
+        if (load32(pm4 + i) == 0xC0016900 && load32(pm4 + i + 4) == 0x206) {
+            store32(pm4 + i, native_pm4_pkt3_header(IT_NOP, 2, 0));
+            store32(pm4 + i + 4, 0);
+            store32(pm4 + i + 8, 0);
+            found = found + 1;
+        }
+        i = i + 4;
+    }
+    if (found != 1) { _cs_print("FAIL: canary found "); _cs_int(found); _cs_print(" VTE writes\n"); return 32; }
+    var triple[32];
+    native_render_handles_write(&triple, load64(vs_mod), load64(red_mod),
+      load64(rt + NATIVE_RT_FIELD_HANDLE), 0);
+    var ts[16];
+    memset(&ts, 0, 16);
+    if (syscall(228, 1, &ts) != 0) { return 6; }
+    var deadline = load64(&ts) * 1000000000 + load64(&ts + 8) + 15000000000;
+    var rc = native_render_dispatch_simple(ctx, pm4, pos, &triple, deadline);
+    _cs_print("canary (PA_CL_VTE_CNTL inherited) draw rc=");
+    _cs_int(rc);
+    _cs_print("\n");
+    if (rc != 0) { return 6; }
+    var good = _cs_scan(rt_addr, w, h, 0);
+    if (good == w * h) { _cs_print("canary: full coverage (inherited VTE enabled)\n"); return 0; }
+    if (good == 1 && load32(rt_addr) == 0xFF0000FF) {
+        _cs_print("canary: pixel (0,0) only (inherited VTE = 0)\n");
+        return 30;
+    }
+    _cs_print("canary: unexpected coverage\n");
+    return 31;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    args_init();
+    var mode = "all";
+    if (argc() >= 2) { mode = argv(1); }
+    var dir = 0;
+    if (argc() >= 3) { dir = argv(2); }
+
+    var ctx_tag, ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_tag) == 1) { _cs_print("FAIL: native ctx\n"); return 1; }
+    var ctx = ctx_res;
+    var fd = native_ctx_fd(ctx);
+    var vs_mod[16];
+    var red_mod[16];
+    var tex_fs_mod[16];
+    if (_cs_shader(fd, 0xFFFF800100000000, 0, &vs_mod) != 0) { return 2; }
+    if (_cs_shader(fd, 0xFFFF800100001000, 1, &red_mod) != 0) { return 3; }
+
+    if (streq(mode, "canary") == 1) {
+        var crc = _cs_canary(ctx, fd, &vs_mod, &red_mod);
+        gpu_context_release(ctx);
+        return crc;
+    }
+    if (streq(mode, "all") != 1) { _cs_print("usage: coverage_scan all [dumpdir] | canary\n"); return 2; }
+    if (_cs_shader(fd, 0xFFFF800100002000, 2, &tex_fs_mod) != 0) { return 3; }
+
+    _cs_print("Mode A: solid red 64x64\n");
+    var good_a = _cs_red_pass(ctx, &vs_mod, &red_mod, 64, 64, dir, "modeA.bin");
+
+    _cs_print("Mode B: textured image_load 64x64\n");
+    var w = 64;
+    var h = 64;
+    var tex = gpu_texture_create_2d_sampleable(ctx, w, h, MABDA_TEXFMT_RGBA8);
+    if (tex == 0) { return 4; }
+    var src = alloc(w * h * 4);
+    var yy = 0;
+    while (yy < h) {
+        var xx = 0;
+        while (xx < w) {
+            store32(src + (yy * w + xx) * 4, _cs_texel(xx, yy));
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    if (gpu_texture_write(ctx, tex, src, w * h * 4) != 0) { return 5; }
+    var rt_b = gpu_render_target_create_2d_rgba8(ctx, w, h);
+    if (rt_b == 0) { return 6; }
+    var rt_b_addr = load64(rt_b + NATIVE_RT_FIELD_ADDR);
+    memset(rt_b_addr, 0x55, w * h * 4);
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    var pipe_b = gpu_render_pipeline_create(ctx, &vs_mod, &tex_fs_mod, 0);
+    if (samp == 0 || pipe_b == 0) { return 6; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass_b = gpu_render_pass_begin(ctx, rt_b, clear);
+    gpu_render_pass_bind_texture(ctx, pass_b, tex, samp);
+    var rc_b = gpu_render_pass_draw(ctx, pass_b, pipe_b, 3, 1);
+    _cs_dump(ctx, dir, "modeB.bin", native_render_pass_pm4_bytes(1));
+    gpu_render_pass_end(ctx, pass_b);
+    _cs_print("  draw rc=");
+    _cs_int(rc_b);
+    _cs_print("\n");
+    var good_b = 0;
+    if (rc_b == 0) { good_b = _cs_scan(rt_b_addr, w, h, 1); }
+
+    _cs_print("Mode C: solid red 1920x1080\n");
+    var good_c = _cs_red_pass(ctx, &vs_mod, &red_mod, 1920, 1080, dir, "modeC.bin");
+
+    gpu_context_release(ctx);
+    if (good_a != 64 * 64) { _cs_print("FAIL: mode A coverage\n"); return 20; }
+    if (good_b != 64 * 64) { _cs_print("FAIL: mode B coverage\n"); return 21; }
+    if (good_c != 1920 * 1080) { _cs_print("FAIL: mode C coverage\n"); return 22; }
+    _cs_print("PASS: A 4096/4096, B 4096/4096, C 2073600/2073600 exact\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

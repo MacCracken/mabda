@@ -4,11 +4,20 @@
 # f113c93) into a single Cyrius program that drives a real wgpu-native
 # device. Pairs with the 7 CPU-only benchmarks in tests/bcyr/mabda.bcyr.
 #
-# Each benchmark records a min-per-op time across N iterations (fairest
+# Each benchmark records a min-per-op time across its timed windows (fairest
 # comparison to Criterion's `estimate`). Output is human-readable to
 # stdout plus one `CSV:name,ns` line per benchmark that scripts can grep
 # into bench-history.csv (matches the schema of
 # docs/rust-v1-bench-history.csv).
+#
+# Exit status: 0 when all 13 rows ran and are valid. 1 when ANY row is invalid:
+#   - it measured 0 ns (the timed window held no measurable work),
+#   - its op ran out of prebuilt inputs (shader_cache_miss),
+#   - its untimed queue flush could not create an encoder (uniform_buffer_write), or
+#   - its setup handle came back 0, so it never ran (a `FAIL:` line stands in for its CSV line).
+# A measured-but-invalid row still prints its CSV line, then a `FAIL:` line on stdout; the run
+# ends with a FAIL summary on stderr. With no GPU it prints `SKIP: no GPU available` to stderr
+# and exits 0.
 #
 # Reference numbers (Rust v1.0, RADV RENOIR equivalent):
 #   create_storage_buffer_4k       4.02 µs
@@ -34,87 +43,282 @@ var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
 # ================================================================
-# CSV-friendly report — one line per benchmark, easy to grep
+# Output — every byte count from strlen, never a hand-counted literal
 # ================================================================
-fn _csv_row(name, ns): i64 {
-    syscall(1, 1, "CSV:", 4);
-    syscall(1, 1, name, strlen(name));
-    syscall(1, 1, ",", 1);
-    fmt_int(ns);
-    syscall(1, 1, "\n", 1);
+fn _out(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+fn _err(s): i64 {
+    syscall(1, 2, s, strlen(s));
     return 0;
 }
 
-fn _report(b): i64 {
+# CSV-friendly report — one line per benchmark, easy to grep
+fn _csv_row(name, ns): i64 {
+    _out("CSV:");
+    _out(name);
+    _out(",");
+    fmt_int(ns);
+    _out("\n");
+    return 0;
+}
+
+# Rows whose measurement is not a measurement (see the exit-status notes in the header).
+var _bench_invalid = 0;
+
+# A row whose setup failed never runs: count it invalid and say so where its CSV line would be.
+fn _setup_fail(row, what): i64 {
+    _bench_invalid = _bench_invalid + 1;
+    _out("  FAIL: ");
+    _out(row);
+    _out(" not run: ");
+    _out(what);
+    _out(" came back 0\n");
+    return 0;
+}
+
+# The report line, then the row's clock error bound, then the CSV row. The bound line has no
+# ": ... avg", so bench-history-style `*": "*" avg"*` matchers skip it. `jit` (see
+# _clock_jitter_ns) is how far a single window can under-read; with k ops per window the
+# recorded per-op min can under-read by at most jit / k.
+fn _report(b, k, jit): i64 {
     bench_report(b);
-    _csv_row(load64(b), bench_min_ns(b));
+    var mn = bench_min_ns(b);
+    var bound = jit / k;
+    _out("  [");
+    fmt_int(k);
+    _out(" op(s) per timed window; clock jitter ");
+    fmt_int(jit);
+    _out(" ns -> per-op min may under-read by <= ");
+    fmt_int(bound);
+    _out(" ns");
+    if (mn > 0) {
+        _out(" (");
+        fmt_int((bound * 100) / mn);
+        _out(" % of min)");
+    }
+    _out("]\n");
+    _csv_row(load64(b), mn);
+    if (mn <= 0) {
+        _bench_invalid = _bench_invalid + 1;
+        _out("  FAIL: ");
+        _out(load64(b));
+        _out(" measured 0 ns: the timed window held no measurable work\n");
+    }
+    return 0;
+}
+
+# ================================================================
+# Timed windows sized from the MEASURED clock (4.1.3 verification)
+# ================================================================
+# uniform_buffer_write reported min=0 ns on the Cezanne box. bench_batch_stop subtracts
+# bench_clock_overhead_ns() — the calibrated MEAN cost of one clock read — from every window,
+# which is right for a mean. A row's recorded number, though, is the MIN over windows, and a
+# single window's clock cost can sit far below that mean, so min(op + clock) - floor is biased
+# low by (floor - fastest window) and clamps to 0 once the op is smaller than that gap. Two
+# measured ways to get a large gap (CPU-only probes, no GPU):
+#   - hpet clocksource (Cezanne): floor 1.21 us, empty windows as fast as 489 ns (~45 % under the
+#     floor). A ~270 ns getpid timed one-op-per-window read min=0; with 128 ops per window, 269 ns.
+#   - an inflated calibration (chew, tsc): a process that calibrates on a cold CPU got a 3.86 us
+#     floor while its subsequent empty windows ran 727 ns — every sub-3 us single-op window clamped.
+#     On a warm tsc run the gap is ~6 ns and single-op windows are exact (getpid 712 ns single,
+#     713 ns batched).
+# So measure the gap itself, per row, right before the row: jitter = floor - the fastest of 16384
+# EMPTY windows, and print the resulting bound on every row. mabda_main also warms the CPU
+# before the floor is first calibrated.
+#
+# uniform_buffer_write (the row that read 0) leaves nothing live behind, so it puts K ops in one
+# clock window, K the smallest count that makes jitter <= 1 % of the window (sized from a pilot,
+# cap 256); where the clock is tight K == 1. The resource-creating rows stay at ONE op per window
+# (cap 1) on every host: holding K results live changes the op being measured. Forcing K to the
+# cap on NVK moved create_storage_buffer_4k 4.4 -> 6.1 us, texture_1x1_solid 23 -> 32 us,
+# depth_texture_1080p 71 -> 568 us and compute_dispatch_1024 18 -> 63 us per op. Their residual
+# clock bias is bounded and printed instead, and a row that reads 0 fails the run.
+
+var _bw_device = 0;
+var _bw_queue  = 0;
+var _bw_a      = 0;
+var _bw_b      = 0;
+var _bw_c      = 0;
+var _bw_n      = 0;   # running op index for rows that consume a unique input per op
+var _bw_count  = 0;   # inputs available to such a row
+var _bw_starved = 0;  # ops of such a row that found no input left (the row is then invalid)
+var _bw_flush_failed = 0;   # untimed flushes that could not create their encoder
+
+# floor - fastest of 16384 empty windows (never negative): how far below the subtracted floor a
+# single window's clock cost reaches right now.
+fn _clock_jitter_ns(): i64 {
+    var fl = bench_clock_overhead_ns();
+    var fastest = 0x7FFFFFFFFFFFFFFF;
+    var i = 0;
+    while (i < 16384) {
+        var t = now_ns();
+        var e = now_ns() - t;
+        if (e < fastest) { fastest = e; }
+        i = i + 1;
+    }
+    var jit = fl - fastest;
+    if (jit < 0) { jit = 0; }
+    return jit;
+}
+
+# Untimed: spin the clock so the CPU leaves its idle state, then calibrate the floor.
+fn _bench_clock_warm(): i64 {
+    var i = 0;
+    while (i < 65536) {
+        now_ns();
+        i = i + 1;
+    }
+    return bench_clock_overhead_ns();
+}
+
+# Smallest K with K * per_op >= 100 * jit, clamped to [1, cap]. A pilot that clamped to 0
+# (per_op <= 0) is exactly the sub-jitter case, so it gets the cap.
+fn _ops_per_window(per_op, cap, jit): i64 {
+    var k = cap;
+    if (per_op > 0) { k = (jit * 100 + per_op - 1) / per_op; }
+    if (k < 1) { k = 1; }
+    if (k > cap) { k = cap; }
+    return k;
+}
+
+# One timed window of k ops: handles are kept inside the window and released after it, so the
+# window times the op alone. flush_fp (untimed) runs after the releases.
+#
+# ⚠ The op call is its own statement, NOT an argument: cycc evaluates a call in a non-first
+# argument slot with the earlier argument still pushed, so the callee runs on an rsp 8 bytes off
+# 16-byte alignment. Cyrius code does not care; the driver does. `store64(slot, fncall0(op))`
+# faulted on NVK (movdqa on a misaligned frame inside libvulkan_nouveau create_buffer).
+fn _time_window(b, op_fp, rel_fp, flush_fp, handles, k): i64 {
+    bench_batch_start(b);
+    var i = 0;
+    while (i < k) {
+        var h = fncall0(op_fp);
+        store64(handles + i * 8, h);
+        i = i + 1;
+    }
+    bench_batch_stop(b, k);
+    if (rel_fp != 0) {
+        i = 0;
+        while (i < k) {
+            var hr = load64(handles + i * 8);
+            if (hr != 0) { fncall1(rel_fp, hr); }
+            i = i + 1;
+        }
+    }
+    if (flush_fp != 0) { fncall0(flush_fp); }
+    return 0;
+}
+
+# Pilot two windows (also the warm-up; discarded), size K, then run the measured windows.
+# `base` is the single-op iteration count the row always used: kept exactly when K == 1,
+# otherwise ceil(base / K) windows, but never fewer than min(base, 50) windows for the min.
+fn _bench_row(name, op_fp, rel_fp, flush_fp, base, cap): i64 {
+    var handles = alloc(cap * 8);
+    var pk = cap;
+    if (pk > 16) { pk = 16; }
+    var pilot = bench_new("pilot");
+    _time_window(pilot, op_fp, rel_fp, flush_fp, handles, pk);
+    _time_window(pilot, op_fp, rel_fp, flush_fp, handles, pk);
+    var jit = _clock_jitter_ns();
+    var k = _ops_per_window(bench_min_ns(pilot), cap, jit);
+    var windows = base;
+    if (k > 1) {
+        windows = (base + k - 1) / k;
+        var min_windows = 50;
+        if (base < min_windows) { min_windows = base; }
+        if (windows < min_windows) { windows = min_windows; }
+    }
+    var b = bench_new(name);
+    var w = 0;
+    while (w < windows) {
+        _time_window(b, op_fp, rel_fp, flush_fp, handles, k);
+        w = w + 1;
+    }
+    _report(b, k, jit);
+    return 0;
+}
+
+# Untimed, after a window: once 256+ queued writes have accumulated, submit an empty command buffer
+# so they flush, then wait. Bounds the staging backlog without a submit after every single write.
+fn _flush_queue_writes(): i64 {
+    if (_bw_n < 256) { return 0; }
+    _bw_n = 0;
+    var enc = wgpu_device_create_command_encoder(_bw_device, "bench-flush-enc");
+    if (enc == 0) {
+        _bw_flush_failed = _bw_flush_failed + 1;
+        return 0;
+    }
+    var cmd = wgpu_command_encoder_finish(enc, "bench-flush-cmd");
+    if (cmd != 0) { wgpu_queue_submit_one(_bw_queue, cmd); }
+    wgpu_command_encoder_release(enc);
+    wgpu_device_poll(_bw_device, 1);
     return 0;
 }
 
 # ================================================================
 # 1. create_storage_buffer_4k — Rust baseline 4.02 µs
 # ================================================================
-fn bench_create_storage_buffer_4k(device, queue): i64 {
-    var b = bench_new("create_storage_buffer_4k");
-    # Pre-fill 4 KiB of source data once; benchmark the create+write.
-    var data[4096];
-    memset(&data, 0xAB, 4096);
-    # Warm-up
-    var warm = create_storage_buffer(device, queue, &data, 4096, "warmup");
-    if (warm != 0) { wgpu_buffer_release(warm); }
+fn _op_storage_4k(): i64 {
+    return create_storage_buffer(_bw_device, _bw_queue, _bw_a, 4096, "bench");
+}
 
-    var ri = 0;
-    while (ri < 200) {
-        bench_batch_start(b);
-        var buf = create_storage_buffer(device, queue, &data, 4096, "bench");
-        bench_batch_stop(b, 1);
-        if (buf != 0) { wgpu_buffer_release(buf); }
-        ri = ri + 1;
-    }
-    _report(b);
+fn bench_create_storage_buffer_4k(device, queue): i64 {
+    # Pre-fill 4 KiB of source data once; benchmark the create+write.
+    var data = alloc(4096);
+    memset(data, 0xAB, 4096);
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = data;
+    _bench_row("create_storage_buffer_4k", &_op_storage_4k, &wgpu_buffer_release, 0, 200, 1);
     return 0;
 }
 
 # ================================================================
 # 2. create_uniform_buffer_64 — Rust baseline 2.81 µs
 # ================================================================
-fn bench_create_uniform_buffer_64(device, queue): i64 {
-    var b = bench_new("create_uniform_buffer_64");
-    var data[64];
-    memset(&data, 0x33, 64);
-    var warm = create_uniform_buffer(device, queue, &data, 64, "warmup");
-    if (warm != 0) { wgpu_buffer_release(warm); }
+fn _op_uniform_64(): i64 {
+    return create_uniform_buffer(_bw_device, _bw_queue, _bw_a, 64, "bench");
+}
 
-    var ri = 0;
-    while (ri < 500) {
-        bench_batch_start(b);
-        var buf = create_uniform_buffer(device, queue, &data, 64, "bench");
-        bench_batch_stop(b, 1);
-        if (buf != 0) { wgpu_buffer_release(buf); }
-        ri = ri + 1;
-    }
-    _report(b);
+fn bench_create_uniform_buffer_64(device, queue): i64 {
+    var data = alloc(64);
+    memset(data, 0x33, 64);
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = data;
+    _bench_row("create_uniform_buffer_64", &_op_uniform_64, &wgpu_buffer_release, 0, 500, 1);
     return 0;
 }
 
 # ================================================================
 # 3. uniform_buffer_write — Rust baseline 929.87 ns
+# The row that read min=0: an op inside the clock's jitter band, so it is batched (see above).
+# Queued writes are flushed (untimed) every 256 writes so they never pile up unsubmitted.
 # ================================================================
-fn bench_uniform_buffer_write(device, queue): i64 {
-    var b = bench_new("uniform_buffer_write");
-    var data[64];
-    memset(&data, 0x77, 64);
-    var ub = create_uniform_buffer(device, queue, &data, 64, "write-target");
-    if (ub == 0) { return 0; }
+fn _op_uniform_write(): i64 {
+    wgpu_queue_write_buffer(_bw_queue, _bw_b, 0, _bw_a, 64);
+    _bw_n = _bw_n + 1;
+    return 0;
+}
 
-    var ri = 0;
-    while (ri < 1000) {
-        bench_batch_start(b);
-        wgpu_queue_write_buffer(queue, ub, 0, &data, 64);
-        bench_batch_stop(b, 1);
-        ri = ri + 1;
+fn bench_uniform_buffer_write(device, queue): i64 {
+    var data = alloc(64);
+    memset(data, 0x77, 64);
+    var ub = create_uniform_buffer(device, queue, data, 64, "write-target");
+    if (ub == 0) { return _setup_fail("uniform_buffer_write", "the target uniform buffer"); }
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = data;
+    _bw_b = ub;
+    _bw_n = 0;
+    _bw_flush_failed = 0;
+    _bench_row("uniform_buffer_write", &_op_uniform_write, 0, &_flush_queue_writes, 1000, 256);
+    if (_bw_flush_failed != 0) {
+        _bench_invalid = _bench_invalid + 1;
+        _out("  FAIL: uniform_buffer_write could not flush its queued writes (encoder came back 0)\n");
     }
-    _report(b);
     wgpu_buffer_release(ub);
     return 0;
 }
@@ -124,15 +328,18 @@ fn bench_uniform_buffer_write(device, queue): i64 {
 # v2.4.5: the cache now backs on the u64-keyed hashmap added in cyrius
 # v5.5.20, so hits are pure int-hash + slot-compare with zero per-lookup
 # allocation. Iteration counts restored to a comparable range with Rust's
-# Criterion default.
+# Criterion default. Already 10000 ops per timed window.
 # ================================================================
 fn bench_shader_cache_hit(device): i64 {
     var b = bench_new("shader_cache_hit");
     var cache = shader_cache_new();
     # Prime the cache
     var src = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4(0.0); }";
-    shader_cache_get_or_compile(cache, device, src, "prime");
+    var primed = shader_cache_get_or_compile(cache, device, src, "prime");
+    if (primed == 0) { return _setup_fail("shader_cache_hit", "the primed shader module"); }
 
+    # Jitter right before the row's timed loop, as _bench_row does (see the timed-window notes).
+    var jit = _clock_jitter_ns();
     var ri = 0;
     while (ri < 100) {
         bench_batch_start(b);
@@ -144,23 +351,38 @@ fn bench_shader_cache_hit(device): i64 {
         bench_batch_stop(b, 10000);
         ri = ri + 1;
     }
-    _report(b);
+    _report(b, 10000, jit);
+    # The cache is private to this row and dropped here; release the one module it holds.
+    wgpu_shader_module_release(primed);
     return 0;
 }
 
 # ================================================================
 # 5. shader_cache_miss — Rust baseline 3.65 µs
-# Each iteration uses a unique source string so the cache always misses
+# Each op uses a unique source string so the cache always misses
 # (forces a real wgpu shader module create). We vary the body text so
 # the FNV hash is different and forces a real compile each time.
 #
-# Kept small (30 shaders) because every miss leaks a shader module on
-# the wgpu device — creating thousands exhausts the driver.
+# Kept small (30 shaders + 2 warm-up). ShaderCache has no release API, so the op hands each new
+# module back to _time_window, which releases it after the window (untimed). That leaves a stale
+# entry in the row's private cache, which is safe here: every source is unique, so no entry is
+# ever looked up again, and the cache is dropped after the row. Unreleased, each miss would hold
+# a shader module on the wgpu device for the rest of the run.
 # ================================================================
+fn _op_shader_miss(): i64 {
+    if (_bw_n >= _bw_count) {
+        _bw_starved = _bw_starved + 1;
+        return 0;
+    }
+    var src = load64(_bw_a + _bw_n * 8);
+    _bw_n = _bw_n + 1;
+    return shader_cache_get_or_compile(_bw_b, _bw_device, src, "miss");
+}
+
 fn bench_shader_cache_miss(device): i64 {
-    var b = bench_new("shader_cache_miss");
-    var cache = shader_cache_new();
-    var count = 30;
+    var cap = 1;
+    var base = 30;
+    var count = (2 + base) * cap;
     var sources = alloc(count * 8);
     var gi = 0;
     while (gi < count) {
@@ -172,28 +394,34 @@ fn bench_shader_cache_miss(device): i64 {
         store64(sources + gi * 8, str_cstr(str_builder_build(sb)));
         gi = gi + 1;
     }
-
-    var ri = 0;
-    while (ri < count) {
-        var src = load64(sources + ri * 8);
-        bench_batch_start(b);
-        shader_cache_get_or_compile(cache, device, src, "miss");
-        bench_batch_stop(b, 1);
-        ri = ri + 1;
+    _bw_device = device;
+    _bw_a = sources;
+    _bw_b = shader_cache_new();
+    _bw_n = 0;
+    _bw_count = count;
+    _bw_starved = 0;
+    _bench_row("shader_cache_miss", &_op_shader_miss, &wgpu_shader_module_release, 0, base, cap);
+    if (_bw_starved != 0) {
+        _bench_invalid = _bench_invalid + 1;
+        _out("  FAIL: shader_cache_miss ran out of prebuilt inputs (");
+        fmt_int(_bw_starved);
+        _out(" op(s) timed no compile)\n");
     }
-    _report(b);
     return 0;
 }
 
 # ================================================================
 # 6. bind_group_cache_hit — Rust baseline 13.20 ns
 # v2.4.5: zero-alloc hit path via u64-keyed hashmap (cyrius v5.5.20).
+# Already 10000 ops per timed window.
 # ================================================================
 fn bench_bind_group_cache_hit(): i64 {
     var b = bench_new("bind_group_cache_hit");
     var cache = bind_group_cache_new();
     bind_group_cache_set(cache, 0xBEEFCAFE, 0x12345678);
 
+    # Jitter right before the row's timed loop, as _bench_row does (see the timed-window notes).
+    var jit = _clock_jitter_ns();
     var ri = 0;
     while (ri < 100) {
         bench_batch_start(b);
@@ -205,133 +433,91 @@ fn bench_bind_group_cache_hit(): i64 {
         bench_batch_stop(b, 10000);
         ri = ri + 1;
     }
-    _report(b);
+    _report(b, 10000, jit);
     return 0;
 }
 
 # ================================================================
 # 7. texture_1x1_solid — Rust baseline 6.92 µs
 # ================================================================
-fn bench_texture_1x1_solid(device, queue): i64 {
-    var b = bench_new("texture_1x1_solid");
-    var c = color_new(F64_1, MABDA_F64_HALF, F64_0, F64_1);
-    # Warm up
-    var warm = texture_from_color(device, queue, c);
-    if (warm != 0) { texture_release(warm); }
+fn _op_texture_1x1(): i64 {
+    return texture_from_color(_bw_device, _bw_queue, _bw_a);
+}
 
-    var ri = 0;
-    while (ri < 200) {
-        bench_batch_start(b);
-        var t = texture_from_color(device, queue, c);
-        bench_batch_stop(b, 1);
-        if (t != 0) { texture_release(t); }
-        ri = ri + 1;
-    }
-    _report(b);
+fn bench_texture_1x1_solid(device, queue): i64 {
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = color_new(F64_1, MABDA_F64_HALF, F64_0, F64_1);
+    _bench_row("texture_1x1_solid", &_op_texture_1x1, &texture_release, 0, 200, 1);
     return 0;
 }
 
 # ================================================================
 # 8. texture_256x256_rgba — Rust baseline 1.06 ms
 # ================================================================
+fn _op_texture_256(): i64 {
+    return texture_from_rgba(_bw_device, _bw_queue, _bw_a, 256, 256, "bench");
+}
+
 fn bench_texture_256x256_rgba(device, queue): i64 {
-    var b = bench_new("texture_256x256_rgba");
     var SIZE = 262144;  # 256 * 256 * 4
     var data = alloc(SIZE);
     memset(data, 0x55, SIZE);
-    var warm = texture_from_rgba(device, queue, data, 256, 256, "warmup");
-    if (warm != 0) { texture_release(warm); }
-
-    var ri = 0;
-    while (ri < 30) {
-        bench_batch_start(b);
-        var t = texture_from_rgba(device, queue, data, 256, 256, "bench");
-        bench_batch_stop(b, 1);
-        if (t != 0) { texture_release(t); }
-        ri = ri + 1;
-    }
-    _report(b);
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = data;
+    _bench_row("texture_256x256_rgba", &_op_texture_256, &texture_release, 0, 30, 1);
     return 0;
 }
 
 # ================================================================
 # 9. depth_texture_1080p — Rust baseline 2.23 µs
 # ================================================================
-fn bench_depth_texture_1080p(device): i64 {
-    var b = bench_new("depth_texture_1080p");
-    var warm = depth_texture_new_default(device, 1920, 1080);
-    if (warm != 0) {
-        wgpu_texture_view_release(depth_texture_view(warm));
-        wgpu_texture_release(depth_texture_handle(warm));
-    }
+fn _op_depth_1080p(): i64 {
+    return depth_texture_new_default(_bw_device, 1920, 1080);
+}
 
-    var ri = 0;
-    while (ri < 200) {
-        bench_batch_start(b);
-        var dt = depth_texture_new_default(device, 1920, 1080);
-        bench_batch_stop(b, 1);
-        if (dt != 0) {
-            wgpu_texture_view_release(depth_texture_view(dt));
-            wgpu_texture_release(depth_texture_handle(dt));
-        }
-        ri = ri + 1;
-    }
-    _report(b);
+fn _rel_depth(dt): i64 {
+    wgpu_texture_view_release(depth_texture_view(dt));
+    wgpu_texture_release(depth_texture_handle(dt));
+    return 0;
+}
+
+fn bench_depth_texture_1080p(device): i64 {
+    _bw_device = device;
+    _bench_row("depth_texture_1080p", &_op_depth_1080p, &_rel_depth, 0, 200, 1);
     return 0;
 }
 
 # ================================================================
 # 10. render_target_1080p — Rust baseline 3.84 µs
 # ================================================================
-fn bench_render_target_1080p(device): i64 {
-    var b = bench_new("render_target_1080p");
-    var warm_b = rtb_new(1920, 1080);
-    var warm = rtb_build(warm_b, device);
-    # Intentionally not releasing — rtb_build's ownership story is the
-    # "returned struct owns all handles" pattern and the bench loop
-    # releases them inline below.
-    if (warm != 0) {
-        wgpu_texture_view_release(render_target_view(warm));
-        wgpu_texture_release(render_target_texture(warm));
-    }
+# rtb_build only READS its builder, so one prebuilt builder serves every op (the old loop
+# allocated a fresh builder per iteration outside the timer — same op, no per-iteration alloc).
+fn _op_render_target(): i64 {
+    return rtb_build(_bw_a, _bw_device);
+}
 
-    var ri = 0;
-    while (ri < 200) {
-        var rb = rtb_new(1920, 1080);
-        bench_batch_start(b);
-        var rt = rtb_build(rb, device);
-        bench_batch_stop(b, 1);
-        if (rt != 0) {
-            wgpu_texture_view_release(render_target_view(rt));
-            wgpu_texture_release(render_target_texture(rt));
-        }
-        ri = ri + 1;
-    }
-    _report(b);
+# Both render-target rows release through render_target_release (untimed, after the window): it
+# frees every handle rtb_build made, MSAA texture included (tests/tcyr/render.tcyr drives it).
+fn bench_render_target_1080p(device): i64 {
+    _bw_device = device;
+    _bw_a = rtb_new(1920, 1080);
+    _bench_row("render_target_1080p", &_op_render_target, &render_target_release, 0, 200, 1);
     return 0;
 }
 
 # ================================================================
 # 11. render_target_msaa4_1080p — Rust baseline 16.32 µs
 # ================================================================
+# Until 4.1.3 this row's release freed only the views and the 1-sample texture: RenderTarget kept
+# no MSAA texture handle, so each op leaked one ~31.6 MiB 4x texture (~102 per run, ~3.2 GiB).
+# The handle now lives at RenderTarget +64 and render_target_release frees it.
 fn bench_render_target_msaa4_1080p(device): i64 {
-    var b = bench_new("render_target_msaa4_1080p");
-    var ri = 0;
-    while (ri < 100) {
-        var rb = rtb_new(1920, 1080);
-        rtb_msaa(rb, 4);
-        bench_batch_start(b);
-        var rt = rtb_build(rb, device);
-        bench_batch_stop(b, 1);
-        if (rt != 0) {
-            wgpu_texture_view_release(render_target_view(rt));
-            var msaa = render_target_msaa_view(rt);
-            if (msaa != 0) { wgpu_texture_view_release(msaa); }
-            wgpu_texture_release(render_target_texture(rt));
-        }
-        ri = ri + 1;
-    }
-    _report(b);
+    _bw_device = device;
+    _bw_a = rtb_msaa(rtb_new(1920, 1080), 4);
+    _bench_row("render_target_msaa4_1080p", &_op_render_target, &render_target_release,
+      0, 100, 1);
     return 0;
 }
 
@@ -346,27 +532,19 @@ fn _trivial_shader(): i64 {
     return str_cstr(str_builder_build(sb));
 }
 
+fn _op_render_pipeline(): i64 {
+    return render_pipeline_create_simple(_bw_device, _bw_a, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+}
+
 fn bench_render_pipeline_build(device): i64 {
-    var b = bench_new("render_pipeline_build");
     var wgsl = _trivial_shader();
     var src = wgpu_shader_source_wgsl(wgsl);
     var sm_desc = wgpu_shader_module_descriptor("bench_shader", src);
     var shader = wgpu_device_create_shader_module(device, sm_desc);
-    if (shader == 0) { return 0; }
-
-    # Warm up
-    var warm = render_pipeline_create_simple(device, shader, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
-    if (warm != 0) { render_pipeline_release(warm); }
-
-    var ri = 0;
-    while (ri < 50) {
-        bench_batch_start(b);
-        var rp = render_pipeline_create_simple(device, shader, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
-        bench_batch_stop(b, 1);
-        if (rp != 0) { render_pipeline_release(rp); }
-        ri = ri + 1;
-    }
-    _report(b);
+    if (shader == 0) { return _setup_fail("render_pipeline_build", "the shader module"); }
+    _bw_device = device;
+    _bw_a = shader;
+    _bench_row("render_pipeline_build", &_op_render_pipeline, &render_pipeline_release, 0, 50, 1);
     wgpu_shader_module_release(shader);
     return 0;
 }
@@ -384,44 +562,49 @@ fn _doubler_shader(): i64 {
     return str_cstr(str_builder_build(sb));
 }
 
+fn _op_compute_dispatch(): i64 {
+    compute_dispatch(_bw_device, _bw_queue, _bw_a, _bw_b, _bw_c);
+    return 0;
+}
+
 fn bench_compute_dispatch_1024(device, queue): i64 {
-    var b = bench_new("compute_dispatch_1024");
     var wgsl = _doubler_shader();
     var cp = compute_pipeline_new(device, wgsl, "main", 1);
-    if (cp == 0) { return 0; }
+    if (cp == 0) { return _setup_fail("compute_dispatch_1024", "the compute pipeline"); }
 
     # 1024 × u32 storage buffer
     var SIZE = 4096;
-    var data[4096];
-    memset(&data, 0, 4096);
+    var data = alloc(SIZE);
+    memset(data, 0, SIZE);
     var storage_usage = WGPU_BUFFER_USAGE_STORAGE
     | WGPU_BUFFER_USAGE_COPY_DST
     | WGPU_BUFFER_USAGE_COPY_SRC;
     var storage_desc = wgpu_buffer_descriptor("bench-storage", storage_usage, SIZE, 0);
     var sbuf = wgpu_device_create_buffer(device, storage_desc);
-    if (sbuf == 0) { return 0; }
-    wgpu_queue_write_buffer(queue, sbuf, 0, &data, SIZE);
+    if (sbuf == 0) { return _setup_fail("compute_dispatch_1024", "the storage buffer"); }
+    wgpu_queue_write_buffer(queue, sbuf, 0, data, SIZE);
 
-    var bge[56];
-    wgpu_bind_group_entry_buffer(&bge, 0, sbuf, 0, SIZE);
-    var bg_desc = wgpu_bind_group_descriptor("bench-bg", compute_pipeline_bgl(cp), &bge, 1);
+    var bge = alloc(56);
+    wgpu_bind_group_entry_buffer(bge, 0, sbuf, 0, SIZE);
+    var bg_desc = wgpu_bind_group_descriptor("bench-bg", compute_pipeline_bgl(cp), bge, 1);
     var bg = wgpu_device_create_bind_group(device, bg_desc);
-    if (bg == 0) { return 0; }
+    if (bg == 0) { return _setup_fail("compute_dispatch_1024", "the bind group"); }
 
     # Dispatch: 16 workgroups × 64 lanes = 1024 elements
-    var dims[12];
-    store32(&dims, 16);
-    store32(&dims + 4, 1);
-    store32(&dims + 8, 1);
+    var dims = alloc(12);
+    store32(dims, 16);
+    store32(dims + 4, 1);
+    store32(dims + 8, 1);
 
-    var ri = 0;
-    while (ri < 100) {
-        bench_batch_start(b);
-        compute_dispatch(device, queue, cp, bg, &dims);
-        bench_batch_stop(b, 1);
-        ri = ri + 1;
-    }
-    _report(b);
+    _bw_device = device;
+    _bw_queue = queue;
+    _bw_a = cp;
+    _bw_b = bg;
+    _bw_c = dims;
+    _bench_row("compute_dispatch_1024", &_op_compute_dispatch, 0, 0, 100, 1);
+    wgpu_bind_group_release(bg);
+    wgpu_buffer_release(sbuf);
+    compute_pipeline_release(cp);
     return 0;
 }
 
@@ -432,14 +615,15 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _err("SKIP: no GPU available\n");
         return 0;
     }
     _gpu_ctx = res;
     var device = gpu_ctx_device(_gpu_ctx);
     var queue = gpu_ctx_queue(_gpu_ctx);
 
-    syscall(1, 1, "=== mabda GPU benchmarks ===\n", 29);
+    _out("=== mabda GPU benchmarks ===\n");
+    _bench_clock_warm();
 
     bench_create_storage_buffer_4k(device, queue);
     bench_create_uniform_buffer_64(device, queue);
@@ -455,5 +639,9 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     bench_render_pipeline_build(device);
     bench_compute_dispatch_1024(device, queue);
 
+    if (_bench_invalid != 0) {
+        _err("FAIL: invalid benchmark row(s): see the FAIL: lines on stdout (exit-status notes in the header)\n");
+        return 1;
+    }
     return 0;
 }

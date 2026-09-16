@@ -1,6 +1,6 @@
 # Consumer Integration Guide
 
-> Written against mabda 4.1.0 / Cyrius 6.5.29. Full launcher-wiring
+> Written against mabda 4.1.3 / Cyrius 6.6.4. Full launcher-wiring
 > walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
 >
 > mabda ships **three backends** behind one public API: wgpu-native
@@ -17,14 +17,14 @@ Declare mabda in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.0"
+tag = "4.1.3"
 modules = ["dist/mabda.cyr"]
 ```
 
-`chitra` (PNG decode, opt-in under `-D MABDA_PNG`) and `samvada`
-(logind master delegation, opt-in under `-D MABDA_LOGIND`) are
-**not** unconditional deps — add them only when you enable the
-corresponding flag. [`docs/stdlib-integration.md`](../stdlib-integration.md)
+`chitra` (PNG + baseline JPEG decode, opt-in under `-D MABDA_PNG` /
+`-D MABDA_JPEG`) and `samvada` (logind master delegation, opt-in under
+`-D MABDA_LOGIND`) are **not** unconditional deps — add them only when
+you enable the corresponding flag. [`docs/stdlib-integration.md`](../stdlib-integration.md)
 is the authoritative manifest for the full `cyrius.cyml` block
 (stdlib modules, pinned tags, and per-flag opt-ins).
 
@@ -43,7 +43,7 @@ backend. Your project needs:
    reference implementation in `deps/wgpu_main.c` of the mabda repo
 2. wgpu-native library (`libwgpu_native.a`, v29) — downloaded via
    `sh deps/fetch-wgpu.sh`
-3. Compilation: `cc5` (object mode, prepend `object;`) + `gcc`
+3. Compilation: `cycc` (object mode, prepend `object;`) + `gcc`
    (linking)
 
 The two **native** backends (AMD amdgpu/GFX9, NVIDIA nouveau/SM75)
@@ -90,9 +90,7 @@ fn run_simulation(ctx, input_data, size) {
     var cp = compute_pipeline_new(device, wgsl_source, "main", 1);
 
     # Dispatch — compute_dispatch takes a pointer to 12 bytes holding
-    # three packed u32 workgroup counts (x@+0, y@+4, z@+8). The pointer
-    # form keeps the fn at 5 params; a 7-param fn that fncalls into
-    # wgpu segfaults (feedback_cyrius_param_ceiling).
+    # three packed u32 workgroup counts (x@+0, y@+4, z@+8).
     var dims[12];
     store32(&dims, workgroups_1d(size / 4, 64));  # x
     store32(&dims + 4, 1);                          # y

@@ -29,7 +29,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 fn _doubler_shader(): i64 {
     var sb = str_builder_new();
@@ -49,13 +79,13 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
     var device = gpu_ctx_device(_gpu_ctx);
     var queue = gpu_ctx_queue(_gpu_ctx);
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     # --- Pre-allocate resources the graph will use ---
     # Storage buffer for compute (mabda creates; graph references as a
@@ -72,25 +102,25 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var storage_desc = wgpu_buffer_descriptor("rg-storage",
       storage_usage, 32, 0);
     var storage_buf = wgpu_device_create_buffer(device, storage_desc);
-    if (storage_buf == 0) { return _fail("FAIL: storage buffer\n", 21); }
+    if (storage_buf == 0) { return _fail("storage buffer"); }
     wgpu_queue_write_buffer(queue, storage_buf, 0, &input, 32);
 
     # Compute pipeline + bind group.
     var wgsl = _doubler_shader();
     var cp = compute_pipeline_new(device, wgsl, "main", 1);
-    if (cp == 0) { return _fail("FAIL: compute pipeline\n", 23); }
+    if (cp == 0) { return _fail("compute pipeline"); }
     var bge[56];
     wgpu_bind_group_entry_buffer(&bge, 0, storage_buf, 0, 32);
     var bg_desc = wgpu_bind_group_descriptor("rg-bg",
       compute_pipeline_bgl(cp), &bge, 1);
     var bg = wgpu_device_create_bind_group(device, bg_desc);
-    if (bg == 0) { return _fail("FAIL: bind group\n", 17); }
+    if (bg == 0) { return _fail("bind group"); }
 
     # Render target + view (graph transient).
     var W = 256;
     var H = 256;
     var rt = texture_create_render_target_rgba8(device, W, H, "rg-rt");
-    if (rt == 0) { return _fail("FAIL: render target\n", 20); }
+    if (rt == 0) { return _fail("render target"); }
     var rt_view = texture_view_create_rgba8(rt, "rg-rt-view");
 
     # Render pass builder — clear-only, red.
@@ -106,9 +136,9 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var read_desc = wgpu_buffer_descriptor("rg-readback",
       read_usage, READ_SIZE, 0);
     var read_buf = wgpu_device_create_buffer(device, read_desc);
-    if (read_buf == 0) { return _fail("FAIL: readback\n", 15); }
+    if (read_buf == 0) { return _fail("readback"); }
 
-    syscall(1, 1, "PASS: resources ready\n", 22);
+    _pass("resources ready");
 
     # --- Build the graph ---
     var g = rg_new();
@@ -139,14 +169,14 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     rg_add_copy_tex_buf(g, &cargs);
 
     if (rg_build(g, device) != 0) {
-        return _fail("FAIL: rg_build\n", 15);
+        return _fail("rg_build");
     }
-    syscall(1, 1, "PASS: graph built (3 nodes)\n", 28);
+    _pass("graph built (3 nodes)");
 
     if (rg_execute(g, device, queue) != 0) {
-        return _fail("FAIL: rg_execute\n", 17);
+        return _fail("rg_execute");
     }
-    syscall(1, 1, "PASS: graph executed\n", 21);
+    _pass("graph executed");
 
     # --- Verify compute output ---
     var tmp_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
@@ -159,43 +189,43 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var cstatus = wgpu_buffer_map_sync(device, tmp_buf, WGPU_MAP_MODE_READ, 0, 32);
     if (cstatus != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
-        return _fail("FAIL: map compute output\n", 25);
+        return _fail("map compute output");
     }
     var cmapped = wgpu_buffer_get_const_mapped_range(tmp_buf, 0, 32);
-    if (cmapped == 0) { return _fail("FAIL: compute mapped range\n", 27); }
+    if (cmapped == 0) { return _fail("compute mapped range"); }
     var j = 0;
     while (j < 8) {
         var got = load32(cmapped + j * 4);
         var expected = (j + 1) * 2;
         if (got != expected) {
             wgpu_buffer_unmap(tmp_buf);
-            return _fail("FAIL: compute element mismatch\n", 31);
+            return _fail("compute element mismatch");
         }
         j = j + 1;
     }
     wgpu_buffer_unmap(tmp_buf);
-    syscall(1, 1, "PASS: compute doubled 8/8 elements\n", 35);
+    _pass("compute doubled 8/8 elements");
 
     # --- Verify render pass cleared to red ---
     var rstatus = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, READ_SIZE);
     if (rstatus != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
-        return _fail("FAIL: map readback\n", 19);
+        return _fail("map readback");
     }
     var rmapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, READ_SIZE);
-    if (rmapped == 0) { return _fail("FAIL: readback mapped range\n", 28); }
+    if (rmapped == 0) { return _fail("readback mapped range"); }
 
     var r = load8(rmapped + 0);
     var gr = load8(rmapped + 1);
     var b = load8(rmapped + 2);
     var a = load8(rmapped + 3);
-    if (r != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: red\n", 10); }
-    if (gr != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: green\n", 12); }
-    if (b != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: blue\n", 11); }
-    if (a != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("FAIL: alpha\n", 12); }
+    if (r != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("red"); }
+    if (gr != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("green"); }
+    if (b != 0x00) { wgpu_buffer_unmap(read_buf); return _fail("blue"); }
+    if (a != 0xFF) { wgpu_buffer_unmap(read_buf); return _fail("alpha"); }
     wgpu_buffer_unmap(read_buf);
-    syscall(1, 1, "PASS: pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)\n", 44);
+    _pass("pixel(0,0) = (0xFF, 0x00, 0x00, 0xFF)");
 
     rg_release(g);
-    syscall(1, 1, "\n5 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

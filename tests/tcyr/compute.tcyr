@@ -164,6 +164,59 @@ fn test_gpu_compute_dispatch_rejects_bad_dims() {
     return 0;
 }
 
+# 4.1.3 verification: cycc runs a call that is a 2nd-or-later argument with rsp 8 bytes off
+# 16-byte alignment. ping_pong_new passed wgpu_device_create_buffer(...) as store64's 2nd
+# argument, so the C create_buffer was entered misaligned, and aligned SSE there faults
+# (NVK did). A Cyrius mock in fn-table slot 8 sees the same shift: the address of its stack
+# array moves by 8 against a statement-level baseline call.
+# See docs/development/issues/2026-09-16-cycc-nested-call-stack-alignment.md
+var _pp_align_calls = 0;
+var _pp_align_first = 0 - 1;
+var _pp_align_second = 0 - 1;
+
+fn _pp_frame_mod16(): i64 {
+    var probe[16];
+    return (&probe) & 15;
+}
+
+fn _mock_create_buffer_align(device, desc): i64 {
+    var probe[16];
+    var a = (&probe) & 15;
+    if (_pp_align_calls == 0) { _pp_align_first = a; }
+    if (_pp_align_calls == 1) { _pp_align_second = a; }
+    _pp_align_calls = _pp_align_calls + 1;
+    return 0xB000 + _pp_align_calls;
+}
+
+fn test_ping_pong_new_ffi_calls_stack_aligned() {
+    # Probe sanity, pure Cyrius: a nested call shifts the frame by 8 (cycc 6.6.4) or, once
+    # cycc is fixed, by 0. Either way the baseline comparisons below are meaningful.
+    var slot[8];
+    var direct = _pp_frame_mod16();
+    store64(&slot, _pp_frame_mod16());
+    var shift = (load64(&slot) - direct) & 15;
+    assert_eq(shift & 7, 0, "probe: a frame shift is a multiple of 8");
+    var faketable[512];                       # 64 slots; slot 8 @ +64 < 512
+    memset(&faketable, 0, 512);
+    store64(&faketable + 8 * 8, &_mock_create_buffer_align);
+    wgpu_ffi_init_table(&faketable);
+    _pp_align_calls = 0;
+    var h0 = wgpu_device_create_buffer(0x1234, 0);
+    var base = _pp_align_first;
+    assert_eq(h0, 0xB001, "control: create_buffer reaches the slot-8 mock");
+    assert_eq(base & 7, 0, "control: baseline frame offset recorded");
+    _pp_align_calls = 0;
+    _pp_align_first = 0 - 1;
+    var pp = ping_pong_new(0x1234, 64);
+    assert_eq(_pp_align_calls, 2, "ping_pong_new creates two buffers through slot 8");
+    assert_eq(_pp_align_first, base, "ping_pong_new: buffer A create entered at statement-level alignment");
+    assert_eq(_pp_align_second, base, "ping_pong_new: buffer B create entered at statement-level alignment");
+    assert_eq(ping_pong_source(pp), 0xB001, "ping_pong_new stores buffer A at +0");
+    assert_eq(ping_pong_dest(pp), 0xB002, "ping_pong_new stores buffer B at +8");
+    wgpu_ffi_init_table(0);                   # reset the global for later tests
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -176,5 +229,6 @@ fn main() {
     test_gpu_shader_module_dispatchers_null_ctx_safe();
     test_gpu_compute_dispatch_null_ctx_returns_err();
     test_gpu_compute_dispatch_rejects_bad_dims();
+    test_ping_pong_new_ffi_calls_stack_aligned();
     return assert_summary();
 }

@@ -107,6 +107,21 @@ unconditionally, NOT silent on no-drift
 - **Upstream**: arg parser treats argv[1] as the file
   unconditionally; the usage string is misleading. Polish bug.
 
+### A4. `cyrius lint` cannot pass `--strict-deferrals` (6.6.4)
+
+- **Issue file**: `docs/development/issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md`
+- **Symptom**: `cyrius lint --strict-deferrals <file>` prints cyrlint's usage and exits 1
+  for every file. `cyrius lint <file> --strict-deferrals` is worse: it **silently drops the
+  flag** and exits 0 over untracked deferrals. The `lint` dispatcher knows only `--strict`,
+  so it takes the first other argument as the file and ignores the rest (same family as A3).
+  mabda's CI `Lint` step greps only `warn ` lines, so deferrals never gated CI. Three
+  untracked ones shipped in 4.1.0–4.1.2 until a hand run of cyrlint found them in 4.1.3.
+- **Workaround**: call cyrlint directly, per file:
+  `cyrlint --strict-deferrals "$f"` (exit 2 on an untracked deferral; flag before or after
+  the path both work). Pin the binary as `$HOME/.cyrius/versions/<pin>/bin/cyrlint` when the
+  active toolchain may differ from the pin.
+- **Upstream**: open (Low). Forward the flag through `cmd_lint` and reject unknown flags.
+
 ---
 
 ## Class B — FFI / fncall constraints
@@ -131,6 +146,11 @@ unconditionally, NOT silent on no-drift
   `double`, and variadic callees.
 - **Canonical ref**: cyrius `docs/ffi/fncall-abi.md` ("Extern-C
   prerequisite: a glibc-compatible `%fs`").
+- ⚠ **Scope of the 6.3.26 proof (added 2026-09-16):** it covered calls made
+  with no value pending on the stack. Its gate calls `fncall4..7` at top level,
+  in statement or left-operand position. A call nested as a later argument or
+  a right operand runs **8 bytes off** alignment. See B3, which is a real
+  codegen bug and a separate one from this `%fs` misdiagnosis.
 
 ### B2. 7+-param ceiling into wgpu — RESOLVED (same `%fs` misdiagnosis)
 
@@ -140,6 +160,31 @@ unconditionally, NOT silent on no-drift
   was the same canary fault as B1.
 - **Now**: keep signatures small for readability, not for ABI safety.
 - **Canonical ref**: cyrius `docs/ffi/fncall-abi.md`.
+
+### B3. A call nested in an expression runs with rsp 8 bytes off 16-byte alignment (6.6.4)
+
+- **Issue file**: `docs/development/issues/2026-09-16-cycc-nested-call-stack-alignment.md`
+- **Symptom**: SIGSEGV (#GP) inside a C library, often only on one driver. On NVK it was
+  `movdqa -0x30(%rbp),%xmm0` in `libvulkan_nouveau.so`, reached from
+  `store64(pp, wgpu_device_create_buffer(...))` in `ping_pong_new`. Pure Cyrius code never
+  shows it, and nothing warns at compile time.
+- **Cause**: cycc pushes each evaluated argument (and the left operand of an arithmetic, shift,
+  bitwise or comparison operator) and pads nothing for those pending pushes when it emits a
+  nested call. With an odd number pending, the callee is entered 8 bytes off. The shift is
+  inherited by everything that callee calls, so a Cyrius helper that reaches C is as exposed
+  as the C call itself. Statement-level calls (`var h = f();`, `f();`, `return f();`) are
+  aligned. So are the first argument and the left operand of a statement-level call or
+  operator, and `&&` / `||` operands.
+- ⚠ `fncallN(fp, x())` has **opposite** alignment as a bare statement (an ordinary call into
+  `lib/fnptr.cyr`, callee pushed) and in expression position (lowered, callee in a frame slot).
+  Do not reason about it from the source text.
+- **Workaround**: bind every call that can reach C (a wgpu/samvada fn-table call, or anything
+  that eventually makes one) to a local first, then pass the local. Gate:
+  `scripts/check-ffi-call-alignment.py`. It reads the compiled objects, checks itself against
+  a C leaf at run time, and found 4 sites in `src/` for 4.1.3. Regression test:
+  `tests/tcyr/compute.tcyr` `test_ping_pong_new_ffi_calls_stack_aligned`.
+- **Upstream**: to file in cyrius (High). aarch64 is unaffected (16-byte pushes). The PE
+  backend already force-aligns indirect calls (`ECALLPTR_PE`, v6.0.71) for the same reason.
 
 ---
 
@@ -257,6 +302,26 @@ unconditionally, NOT silent on no-drift
   error quotes; do not seek to the printed line.
 - **Upstream**: intentional, landed 6.5.1.
 
+### C8. A `Result` is a register pair since 6.6.0 — hand-rolled `load64` on it fails SILENTLY
+
+- **Symptom**: none at compile time, wrong values at runtime. Since
+  6.6.0 `Result` / `Option` / `Either` are `: stack` enums: a payload
+  variant returns the tag in rax and the payload in rdx, with no heap
+  box. Code that still treats a Result as a pointer — `load64(r)` for
+  the tag, `load64(r + 8)` for the payload — dereferences a register
+  value as an address. That address often looks plausible, so the read
+  succeeds and returns garbage.
+- **What the compiler does catch**: `var r = f();`, `r = f();` and
+  `store64(&slot, f());` on a `: stack` return are named errors at the
+  offending line ("bind both"). Only the hand-rolled deref gets through.
+- **Workaround**: always bind both halves (`var t, v = f();`), test the
+  tag with `is_ok(t)` / `is_err_result(t)`, and read the payload as the
+  plain variable `v`. On any future Result work, grep for `load64(... + 8)`
+  and confirm every hit is one of mabda's own structs. Checked at 4.1.1:
+  none of them read a Result. The full migration record is in CHANGELOG
+  [4.1.1].
+- **Upstream**: intentional (6.6.0 value form).
+
 ---
 
 ## Class D — Runtime / allocator constraints
@@ -292,6 +357,26 @@ unconditionally, NOT silent on no-drift
   preventive.
 - **Upstream**: speculative / hard to repro. No issue file yet.
 
+### D3. `lib/bench.cyr` minima read low or 0; the floor is calibrated once (6.6.4)
+
+- **Issue file**: `docs/development/issues/2026-09-16-stdlib-bench-min-minus-mean-floor.md`
+- **Symptom**: a bench row prints `min=0ns` (and `CSV:<row>,0`) while its average is hundreds of
+  ns. That happened to `uniform_buffer_write` in `make bench-gpu` on the hpet dev box. Less
+  often, every row of one run reads low, because that process calibrated its floor at a slow
+  moment (once, 3,861 ns against a real ~730 ns; trigger not reproduced).
+- **Cause**: the floor subtracted from every window is a mean single-read cost, while
+  `bench_report` / `bench_min_ns` report the minimum over windows. Window-to-window clock
+  jitter (489 to about 1,200 ns on hpet) therefore biases minima low, down to 0 for single-op
+  windows. The floor is calibrated lazily once per process and never checked against the run.
+  Per-op results are also whole nanoseconds.
+- **Workaround**: never time a sub-µs op one per window. Batch it so the jitter is ≤ 1 % of
+  the window (`bench_run` does that; `programs/benchmarks.cyr` sizes K per row and prints the
+  under-read bound). Warm up before the first `bench_clock_overhead_ns()`. Treat a `0` row as
+  invalid, never as fast. `tests/bcyr/mabda.bcyr` batches 100-10,000 ops per window, so its
+  rows are good to a few percent: measured ≤ 3.4 % on `rg_plan_aliasing_stats_5` even with the
+  inflated floor forced.
+- **Upstream**: to file in cyrius (Medium, benchmark consumers only).
+
 ---
 
 ## Class E — Bundle / distlib gotchas
@@ -306,6 +391,46 @@ unconditionally, NOT silent on no-drift
   above.
 - **Upstream**: fixed in 5.7.36. cited above as the precedent
   for the lint + fmt fix in Class A1.
+
+### E2. `cyrius.lock` is tracked but nothing in mabda diffs it
+
+- **Symptom**: a resolve that pulls different stdlib bytes rewrites
+  `cyrius.lock` and `lib/`, and neither CI nor the Makefile notices.
+  mabda's own lock only ever showed the change in `git diff`.
+- **Toolchain status**: before 6.6.4, `cyrius build` / `cyrius deps`
+  would silently re-lock a stdlib file whose bytes changed even when the
+  pin had not. Since 6.6.4 the lock ends with a `cyrius\t<pin>` line.
+  Under an unchanged pin, a snapshot/lock disagreement is refused by name
+  and no binary is built; `cyrius deps --relock` is the explicit accept.
+  A lock written before 6.6.4 has no pin line, so it is accepted once and
+  then gets the line. A **pin bump still re-locks silently**, because
+  that is a real dependency change.
+- **Workaround**: on every pin or dep bump, snapshot `lib/` hashes
+  before `rm -rf lib && mkdir lib && cyrius deps`, then diff the new lock
+  by hand (sort both files first, since pre-6.6.3 locks were written in
+  readdir order). Record the file count and which files changed in the
+  CHANGELOG entry. For 4.1.3 (6.6.2 → 6.6.4): 43 → 43 files, 10 changed.
+- **Upstream**: 6.6.4 guards the unchanged-pin case. The pin-bump
+  case needs a human by design.
+
+### E3. `cyrius deps` calls an untouched dep cache "tampered" after a metadata-only change (6.6.4)
+
+- **Issue file**: `docs/development/issues/2026-09-16-cyrius-deps-tamper-check-stale-index.md`
+- **Symptom**: `error: cached checkout for dep '<name>' has local modifications ... refusing
+  tampered cache`, while the files are byte-identical to HEAD. The CVE-21 tamper check
+  (`_git_worktree_clean`, cyrius `cbt/deps.cyr:2828`) runs `git diff-index --quiet HEAD`
+  without refreshing git's stat cache, so a `touch`, a `cp -a` of the cache, or git run
+  under `unshare -rn` (the index gets rewritten with namespace uids) fails the check. The
+  cache under `~/.cyrius/deps/` is shared, so every project on the machine that resolves
+  that dep fails until the index is refreshed. It looks intermittent: any `git status` or
+  `git diff` in the cache refreshes the index and hides it.
+- **Workaround**: `git -C ~/.cyrius/deps/<name>/<tag> update-index -q --refresh`. That
+  re-hashes changed-stat files and cannot hide a real edit. Don't run dep resolution under
+  a uid-mapped namespace against the shared `~/.cyrius`; for an offline resolve use
+  `GIT_ALLOW_PROTOCOL=file` with a populated cache. Deleting the clone, which the error
+  message suggests, needs the network.
+- **Upstream**: open (Low). Refresh before comparing (`update-index -q --refresh`, or
+  `git diff --quiet HEAD`); both still refuse a real content edit.
 
 ---
 
@@ -344,7 +469,10 @@ unconditionally, NOT silent on no-drift
   shim layer, which retires per-vendor (AMD at v4.0.1, NVIDIA at
   v5.0, Intel/full at v5.1 — see roadmap). The fncall ABI bugs
   themselves stay relevant until full removal for any other C-FFI
-  mabda might add.
+  mabda might add. B3 (nested-call stack alignment) is a live
+  codegen bug that affects every C callee, including the samvada
+  dbus table, until cycc is fixed. Keep `scripts/check-ffi-call-alignment.py`
+  green.
 - Class C is the "this is just how Cyrius is" bucket — these are
   language design decisions or intentional sharp edges. The doc
   serves as onboarding material rather than as a bug list.

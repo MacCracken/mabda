@@ -5,65 +5,16 @@ description = "mabda — GPU foundation layer for AGNOS (device lifecycle, buffe
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/mabda"
 language = "cyrius"
-# 6.6.0 (4.1.1) — a HARD API BREAK, not a currency sweep. Cyrius 6.6.0 declares
-#   `Result` / `Option` / `Either` as `: stack` enums: a payload variant returns a REGISTER
-#   PAIR (tag in rax, payload in rdx) and allocates ZERO bytes. The 16-byte heap box is gone,
-#   and with it the `tag at +0 / payload at +8` layout that was a published, user-facing
-#   contract.
-#   (a) THE ARITY OF EVERY RESULT CHANGED, so this pin CANNOT be moved without migrating
-#       source in the same commit. rdx does not reach a parameter, so a Result can no longer
-#       be received in one argument:
-#         var t, v = f();          # bind BOTH halves — the only correct receive
-#         is_ok(t) / is_err_result(t)          # 1 arg, the TAG
-#         result_unwrap(t, v) / err_code_of(t, v) / result_print(t, v)   # 2 args
-#         result_unwrap_or(t, v, fallback)                               # 3 args
-#       ⛔ `payload(r)` is DELETED with NO 1-argument replacement — under the value form the
-#       payload IS a plain variable, so `payload(r)` becomes `r`. `tagged_new(tag, value)` is
-#       deleted too. mabda's own `gpu_result_unwrap(res)` had to become
-#       `gpu_result_unwrap(t, v)` for exactly the same reason.
-#   (b) THE COMPILER IS THE MIGRATION TOOL, and it is loud where it can be. `var r = f();`,
-#       `r = f();` and `store64(&slot, f());` are now NAMED errors at the offending line
-#       ("a `: stack` enum returns two values — bind both"). Every stale site in mabda failed
-#       at its own line; none miscompiled.
-#       ⚠ The DANGEROUS shape is the one the compiler cannot see: a hand-rolled `load64(r)`
-#       for the tag / `load64(r + 8)` for the payload. A register pair dereferenced as a
-#       pointer is a plausible-looking address, so it fails SILENTLY. Grepped at 4.1.1 —
-#       mabda has none; every `load64(x + 8)` in src/ is one of mabda's OWN structs
-#       (WGPUSurfaceTexture +8, uniform-buffer +8, render-graph resource record +8).
-#       Re-run that grep on any future Result work; it is not compiler-enforced.
-#   (c) BLAST RADIUS MEASURED FROM `cyrius.lock`, NOT ASSUMED — same oracle as 4.0.10.
-#       18 resolved files changed content and ONE appeared (`lib/hashseed.cyr`), 42 -> 43
-#       locked. `lib/result.cyr` and `lib/tagged.cyr` are the semantic movers; the rest is
-#       the 6.5.30..6.6.0 span riding along. ⭐ `lib/syscalls_x86_64_linux.cyr` — the peer
-#       this repo's only build target resolves — is BYTE-IDENTICAL again.
-# ⚠ NOTHING DIFFS `cyrius.lock` — not CI, not the Makefile. It is tracked but ungated, so a
-# bad resolve rewrites it silently. Re-check it by hand on every pin or dep bump. (Carried
-# forward unchanged from 4.0.10/4.0.9; the hazard has not been fixed, only survived.)
-# ⚠ 6.5.28 made `cyrius fmt` REWRITE IN PLACE (was stdout-only), and `--dry`/`--check` emit a
-# DIAGNOSTIC, never source. `cyrius fmt f > f` DESTROYS f, because the shell truncates it
-# before cyrfmt reads it, leaving `cyrfmt: cannot read file` as the file's entire contents.
-# To apply, just `cyrius fmt <file>`. mabda's Makefile + CI use `fmt --check` only.
-# ⚠ The `assigning non-pointer to typed pointer` warning (reachable since 6.5.24/6.5.29) is
-# re-verified 0-warning at this pin, across src/ + programs/ + tests/ + fuzz/.
-# ⚠ mabda still contains no Cyrius `switch`/`match` and no `#derive` anywhere in src/,
-# programs/, tests/ or fuzz/ — re-checked at 4.1.1, not carried forward on faith.
-cyrius = "6.6.2"
+cyrius = "6.6.4"
 
-# mabda is a library — no CLI binary. `cyrius build` targets a smoke
-# program that links the full include chain to prove lib.cyr parses clean.
-# Real consumers pull `dist/mabda.cyr` from the Cyrius stdlib (since 3.4.19)
-# or via a `[deps.mabda]` entry pointing at a git tag.
+# mabda is a library with no CLI binary. The smoke program links the full
+# include chain to prove src/lib.cyr builds clean.
 [build]
 entry = "programs/smoke.cyr"
 output = "build/mabda_smoke"
 
-# `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
-# (declared in src/lib.cyr), then domain modules in dependency order.
-# Forward references between cache modules were handled by `cache_key.cyr`
-# until v2.4.5 — now the u64-keyed stdlib hashmap (cyrius v5.5.20) makes
-# that helper unnecessary, so the caches depend only on their own module
-# order. Don't reorder without re-running `cyrius distlib` and verifying
-# the concatenated bundle still compiles clean.
+# `cyrius distlib` concatenates these into dist/mabda.cyr in this order, which
+# must match the include order in src/lib.cyr. A new src module goes in BOTH.
 [lib]
 modules = [
     "src/error.cyr",
@@ -124,6 +75,7 @@ modules = [
     "src/debug.cyr",
 ]
 
+# thread + sankoch are chitra's stdlib deps; its bundle does not carry them.
 [deps]
 stdlib = [
     "string",
@@ -144,27 +96,14 @@ stdlib = [
     "sankoch",
 ]
 
-# samvada — Cyrius dbus client (Step 7.7 logind path). 0.4.1
-# carries the libsystemd C shim + logind subset
-# (TakeDevice / ReleaseDevice / pump_signals). mabda wires the
-# stub `_backend_native_surface_configure_logind` to call into
-# samvada when this dep is present. Consumer (mabda's build)
-# links libsystemd; mabda itself doesn't link it directly.
-#
-# v4.0.1 escape hatch: the samvada C-shim retirement (roadmap-paired with
-# the AMD wgpu retirement) is DEFERRED. The pure-Cyrius replacement (a
-# native dbus client: SASL EXTERNAL + SCM_RIGHTS master-fd passing) is
-# upstream samvada work that isn't ready — samvada is still 0.4.1 /
-# kind=LIBSYSTEMD. All mabda samvada calls sit behind `#ifdef MABDA_LOGIND`
-# (off by default), so the coupling is dormant. When samvada ships the
-# pure-Cyrius 1.0, the only mabda change is bumping this tag + `cyrius deps`
-# (call signatures are impl-agnostic). Forward plan: evolve the samvada
-# dbus project into the native pure-Cyrius dbus for AGNOS.
+# logind DRM-master delegation for gpu_surface_configure_native_logind.
+# Only called under -D MABDA_LOGIND (off by default).
 [deps.samvada]
 git = "https://github.com/MacCracken/samvada.git"
 tag = "1.0.1"
 modules = ["dist/samvada.cyr"]
 
+# PNG / baseline-JPEG decode for src/asset_load.cyr (decoded to RGBA8).
 [deps.chitra]
 git = "https://github.com/MacCracken/chitra.git"
 tag = "1.0.3"

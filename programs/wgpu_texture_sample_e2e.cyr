@@ -27,7 +27,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 fn _textured_wgsl(): i64 {
     var sb = str_builder_new();
@@ -52,13 +82,13 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
     var device = gpu_ctx_device(_gpu_ctx);
     var queue  = gpu_ctx_queue(_gpu_ctx);
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     var W = 64;
     var H = 64;
@@ -66,7 +96,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     # --- 1. Sampleable RGBA8 texture, filled with a solid distinctive color ---
     var tex = gpu_texture_create_2d_sampleable(_gpu_ctx, W, H, MABDA_TEXFMT_RGBA8);
-    if (tex == 0) { return _fail("FAIL: create_sampleable\n", 24); }
+    if (tex == 0) { return _fail("create_sampleable"); }
     var src = alloc(N);
     var i = 0;
     while (i < W * H) {
@@ -77,35 +107,35 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
         i = i + 1;
     }
     if (gpu_texture_write(_gpu_ctx, tex, src, N) != 0) {
-        return _fail("FAIL: texture upload\n", 21);
+        return _fail("texture upload");
     }
-    syscall(1, 1, "PASS: sampleable texture created + uploaded\n", 44);
+    _pass("sampleable texture created + uploaded");
 
     # --- 2. Sampler + textured pipeline (one module, vs_main + fs_main) ---
     var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
-    if (samp == 0) { return _fail("FAIL: sampler create\n", 21); }
+    if (samp == 0) { return _fail("sampler create"); }
     var wgsl = _textured_wgsl();
     var shmod = gpu_shader_module_create(_gpu_ctx, wgsl, strlen(wgsl));
-    if (shmod == 0) { return _fail("FAIL: shader module\n", 20); }
+    if (shmod == 0) { return _fail("shader module"); }
     var pipe = gpu_render_pipeline_create(_gpu_ctx, shmod, shmod,
       WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
-    if (pipe == 0) { return _fail("FAIL: render pipeline\n", 22); }
-    syscall(1, 1, "PASS: sampler + textured pipeline\n", 34);
+    if (pipe == 0) { return _fail("render pipeline"); }
+    _pass("sampler + textured pipeline");
 
     # --- 3. Render target + a pass that binds the texture and draws ---
     var rt = gpu_render_target_create_2d_rgba8(_gpu_ctx, W, H);
-    if (rt == 0) { return _fail("FAIL: render target\n", 20); }
+    if (rt == 0) { return _fail("render target"); }
     var clear = color_new(F64_0, F64_0, F64_0, F64_1);   # black
     var pass = gpu_render_pass_begin(_gpu_ctx, rt, clear);
-    if (pass == 0) { return _fail("FAIL: pass begin\n", 17); }
+    if (pass == 0) { return _fail("pass begin"); }
     if (gpu_render_pass_bind_texture(_gpu_ctx, pass, tex, samp) != 0) {
-        return _fail("FAIL: bind_texture\n", 19);
+        return _fail("bind_texture");
     }
     if (gpu_render_pass_draw(_gpu_ctx, pass, pipe, 3, 1) != 0) {
-        return _fail("FAIL: draw\n", 11);
+        return _fail("draw");
     }
     gpu_render_pass_end(_gpu_ctx, pass);
-    syscall(1, 1, "PASS: bound texture + drew fullscreen sample\n", 45);
+    _pass("bound texture + drew fullscreen sample");
 
     # --- 4. Copy RT -> MAP_READ buffer (64*4 = 256 = bytesPerRow, no pad) ---
     var rt_handle = load64(rt + 0);
@@ -114,7 +144,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     var read_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
     var read_desc = wgpu_buffer_descriptor("sample-readback", read_usage, BUF_SIZE, 0);
     var read_buf = wgpu_device_create_buffer(device, read_desc);
-    if (read_buf == 0) { return _fail("FAIL: readback buffer\n", 22); }
+    if (read_buf == 0) { return _fail("readback buffer"); }
     var enc = wgpu_device_create_command_encoder(device, "sample-readback-enc");
     var cargs = alloc(72);
     memset(cargs, 0, 72);
@@ -133,17 +163,17 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     # --- 5. Map + verify: every probed pixel is the sampled texture color ---
     var status = wgpu_buffer_map_sync(device, read_buf, WGPU_MAP_MODE_READ, 0, BUF_SIZE);
     if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
-        return _fail("FAIL: map readback\n", 19);
+        return _fail("map readback");
     }
     var mapped = wgpu_buffer_get_const_mapped_range(read_buf, 0, BUF_SIZE);
-    if (mapped == 0) { return _fail("FAIL: get mapped range\n", 23); }
+    if (mapped == 0) { return _fail("get mapped range"); }
     # Probe pixel(0,0), pixel(W-1, 0), and the center — all must be the
     # texture color (proves the whole quad sampled, not the clear color).
     var bad = 0;
     var off0 = 0;
     var off1 = (W - 1) * 4;
     var offc = (H / 2) * BPR + (W / 2) * 4;
-    var probes[3];
+    var probes[24];   # 3 offsets x 8 bytes (a stack array's size is in BYTES)
     store64(&probes + 0, off0);
     store64(&probes + 8, off1);
     store64(&probes + 16, offc);
@@ -158,10 +188,10 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     }
     wgpu_buffer_unmap(read_buf);
     if (bad != 0) {
-        return _fail("FAIL: RT is not the sampled texture color\n", 42);
+        return _fail("RT is not the sampled texture color");
     }
-    syscall(1, 1, "PASS: RT = sampled texture color (0x40,0x80,0xC0,0xFF)\n", 54);
+    _pass("RT = sampled texture color (0x40,0x80,0xC0,0xFF)");
 
-    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

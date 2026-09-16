@@ -22,7 +22,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     color_init();
@@ -31,35 +61,35 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     var N = 4096;
     var usage = WGPU_BUFFER_USAGE_STORAGE;   # COPY_SRC/DST added by the backend
 
     var src = gpu_buffer_create(_gpu_ctx, N, usage);
-    if (src == 0) { return _fail("FAIL: src create\n", 17); }
+    if (src == 0) { return _fail("src create"); }
     var dst = gpu_buffer_create(_gpu_ctx, N, usage);
-    if (dst == 0) { return _fail("FAIL: dst create\n", 17); }
-    syscall(1, 1, "PASS: buffers created\n", 22);
+    if (dst == 0) { return _fail("dst create"); }
+    _pass("buffers created");
 
     var pat = alloc(N);
     var i = 0;
     while (i < N / 4) { store32(pat + i * 4, 0xA5A50000 + i); i = i + 1; }
     if (gpu_buffer_write(_gpu_ctx, src, 0, pat, N) != 0) {
-        return _fail("FAIL: src write\n", 16); }
+        return _fail("src write"); }
 
     if (gpu_buffer_copy(_gpu_ctx, src, dst, N) != 0) {
-        return _fail("FAIL: gpu_buffer_copy\n", 22); }
-    syscall(1, 1, "PASS: gpu_buffer_copy submitted\n", 32);
+        return _fail("gpu_buffer_copy"); }
+    _pass("gpu_buffer_copy submitted");
 
     var out = alloc(N);
     memset(out, 0, N);
     if (gpu_buffer_read(_gpu_ctx, dst, 0, out, N) != 0) {
-        return _fail("FAIL: dst read\n", 15); }
+        return _fail("dst read"); }
 
     var bad = 0;
     var j = 0;
@@ -67,16 +97,16 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
         if (load32(out + j * 4) != 0xA5A50000 + j) { bad = 1; }
         j = j + 1;
     }
-    if (bad != 0) { return _fail("FAIL: copy did not round-trip\n", 30); }
-    syscall(1, 1, "PASS: 4096B copy round-trips byte-exact\n", 40);
+    if (bad != 0) { return _fail("copy did not round-trip"); }
+    _pass("4096B copy round-trips byte-exact");
 
     # Alignment guard: a non-4-byte-multiple size must be rejected.
     if (gpu_buffer_copy(_gpu_ctx, src, dst, 67) == 0) {
-        return _fail("FAIL: 67-byte copy was NOT rejected\n", 36); }
-    syscall(1, 1, "PASS: 67-byte copy rejected (alignment guard)\n", 46);
+        return _fail("67-byte copy was NOT rejected"); }
+    _pass("67-byte copy rejected (alignment guard)");
 
     gpu_buffer_release(_gpu_ctx, src);
     gpu_buffer_release(_gpu_ctx, dst);
-    syscall(1, 1, "\n4 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

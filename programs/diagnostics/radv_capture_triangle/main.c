@@ -1,7 +1,9 @@
 /* radv_capture_triangle — Vulkan headless graphics reference for
  * mabda's `native_pm4_build_render_clear_triangle`. Draws a solid-red
  * fullscreen triangle into a 256x256 RGBA8_UNORM RT, waits for
- * completion, reads back pixel(0,0), asserts red.
+ * completion, reads back EVERY pixel and asserts all 65536 are red
+ * (4.1.3 round 2: was pixel(0,0) only, which a viewport-transform-off
+ * draw also passes — see mabda's PA_CL_VTE_CNTL root cause).
  *
  * Purpose: provide a byte-exact radv IB capture for the SAME workload
  * mabda emits, so the two can be diffed packet-by-packet. The existing
@@ -349,10 +351,41 @@ int main(void) {
     uint8_t *base = (uint8_t *)mapped + layout.offset;
     uint8_t r = base[0], g = base[1], b = base[2], a = base[3];
     printf("pixel(0,0) = (0x%02X, 0x%02X, 0x%02X, 0x%02X)\n", r, g, b, a);
+    if (layout.rowPitch < (VkDeviceSize)RT_WIDTH * 4 ||
+        layout.size < layout.rowPitch * (RT_HEIGHT - 1) + (VkDeviceSize)RT_WIDTH * 4) {
+        fprintf(stderr, "FAIL: RT layout too small (rowPitch %llu size %llu)\n",
+                (unsigned long long)layout.rowPitch, (unsigned long long)layout.size);
+        vkUnmapMemory(device, rt_mem);
+        return 1;
+    }
+    /* Scan every pixel against the solid-red oracle. */
+    uint32_t covered = 0, shown = 0;
+    uint32_t minx = RT_WIDTH, miny = RT_HEIGHT, maxx = 0, maxy = 0;
+    for (uint32_t y = 0; y < RT_HEIGHT; y++) {
+        for (uint32_t x = 0; x < RT_WIDTH; x++) {
+            const uint8_t *px = base + y * layout.rowPitch + (VkDeviceSize)x * 4;
+            if (px[0] == 0xFF && px[1] == 0x00 && px[2] == 0x00 && px[3] == 0xFF) {
+                covered++;
+                if (x < minx) minx = x;
+                if (y < miny) miny = y;
+                if (x > maxx) maxx = x;
+                if (y > maxy) maxy = y;
+            } else if (shown < 4) {
+                printf("  mismatch px=%u,%u (0x%02X, 0x%02X, 0x%02X, 0x%02X)\n",
+                       x, y, px[0], px[1], px[2], px[3]);
+                shown++;
+            }
+        }
+    }
     vkUnmapMemory(device, rt_mem);
+    if (covered > 0)
+        printf("coverage: %u/%u px (0xFF, 0x00, 0x00, 0xFF), bbox=(%u,%u)-(%u,%u)\n",
+               covered, RT_WIDTH * RT_HEIGHT, minx, miny, maxx, maxy);
+    else
+        printf("coverage: 0/%u px (0xFF, 0x00, 0x00, 0xFF)\n", RT_WIDTH * RT_HEIGHT);
 
-    int ok = (r == 0xFF && g == 0x00 && b == 0x00 && a == 0xFF);
-    printf("%s — solid red triangle round-trip\n", ok ? "PASS" : "FAIL");
+    int ok = (covered == (uint32_t)(RT_WIDTH * RT_HEIGHT));
+    printf("%s — solid red triangle round-trip (every pixel)\n", ok ? "PASS" : "FAIL");
 
     /* ----- Cleanup (lightweight; exit will reap) ----- */
     vkDestroyFence(device, fence, NULL);

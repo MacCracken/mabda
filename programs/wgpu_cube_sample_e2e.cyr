@@ -20,7 +20,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 # WGSL sampling a cubemap in direction (dx,dy,dz) (cstr float literals).
 fn _cube_wgsl(dx, dy, dz): i64 {
@@ -106,17 +136,17 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
 
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
     if (is_err_result(res_tag) == 1) {
-        syscall(1, 2, "SKIP: no GPU available\n", 23);
+        _e2e_line(2, "SKIP: ", "no GPU available");
         return 0;
     }
     _gpu_ctx = res;
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     var S = 64;
     var N = S * S * 4;
     var FACES = 6;
     var tex = gpu_texture_create_cube(_gpu_ctx, S, MABDA_TEXFMT_RGBA8, 1);
-    if (tex == 0) { return _fail("FAIL: create_cube\n", 18); }
+    if (tex == 0) { return _fail("create_cube"); }
     var src = alloc(N);
     var k = 0;
     while (k < FACES) {
@@ -129,25 +159,25 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
             i = i + 1;
         }
         if (gpu_texture_write_layer_level(_gpu_ctx, tex, k, 0, src, N) != 0) {
-            return _fail("FAIL: write_layer_level\n", 24);
+            return _fail("write_layer_level");
         }
         k = k + 1;
     }
-    syscall(1, 1, "PASS: 6-face cube created + uploaded (distinct R)\n", 49);
+    _pass("6-face cube created + uploaded (distinct R)");
 
     var samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
-    if (samp == 0) { return _fail("FAIL: sampler\n", 14); }
+    if (samp == 0) { return _fail("sampler"); }
 
     # dir (0,0,1) -> +Z = face 4.
     if (_sample_cube(_gpu_ctx, tex, samp, "0.0", "0.0", "1.0", 4) != 0) {
-        return _fail("FAIL: +Z (face 4) mismatch\n", 27);
+        return _fail("+Z (face 4) mismatch");
     }
     # dir (1,0,0) -> +X = face 0.
     if (_sample_cube(_gpu_ctx, tex, samp, "1.0", "0.0", "0.0", 0) != 0) {
-        return _fail("FAIL: +X (face 0) mismatch\n", 27);
+        return _fail("+X (face 0) mismatch");
     }
-    syscall(1, 1, "PASS: RT = cube face color for +Z (face 4) and +X (face 0)\n", 58);
+    _pass("RT = cube face color for +Z (face 4) and +X (face 0)");
 
-    syscall(1, 1, "\n3 passed, 0 failed\n", 20);
+    _e2e_summary();
     return 0;
 }

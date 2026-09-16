@@ -21,7 +21,37 @@ include "src/lib.cyr"
 var _gpu_preinit = 0;
 var _gpu_ctx = 0;
 
-fn _fail(msg, len): i64 { syscall(1, 2, msg, len); return 1; }
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
 
 # The vs_main + fs_main SPIR-V module (fullscreen triangle + red FS), 339 words.
 fn _spirv_blob(buf): i64 {
@@ -410,11 +440,11 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     wgpu_ffi_init_table(fn_table_ptr);
     _gpu_preinit = preinit_ptr;
     var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
-    if (is_err_result(res_tag) == 1) { syscall(1, 2, "SKIP: no GPU available\n", 23); return 0; }
+    if (is_err_result(res_tag) == 1) { _e2e_line(2, "SKIP: ", "no GPU available"); return 0; }
     _gpu_ctx = res;
     var device = gpu_ctx_device(_gpu_ctx);
     var queue = gpu_ctx_queue(_gpu_ctx);
-    syscall(1, 1, "PASS: GPU context created\n", 26);
+    _pass("GPU context created");
 
     # WGSL twin (fullscreen triangle + red FS) — exercises the widened slot's
     # WGSL branch. Built via str_builder to stay under the 120-char line cap.
@@ -428,34 +458,34 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     str_builder_add_cstr(_sb, "return vec4<f32>(1.0, 0.0, 0.0, 1.0); }");
     var wgsl = str_cstr(str_builder_build(_sb));
     var wmod = gpu_shader_module_create(_gpu_ctx, wgsl, strlen(wgsl));
-    if (wmod == 0) { return _fail("FAIL: WGSL module create\n", 25); }
-    syscall(1, 1, "PASS: WGSL shader module\n", 25);
+    if (wmod == 0) { return _fail("WGSL module create"); }
+    _pass("WGSL shader module");
 
     # SPIR-V module (gpu_shader_module_create_spirv, S.2; needs the S.4 feature).
     var sbuf = alloc(1356);
     _spirv_blob(sbuf);
     var smod = gpu_shader_module_create_spirv(_gpu_ctx, sbuf, 1356);
-    if (smod == 0) { return _fail("FAIL: SPIR-V module create (instance feature / validation?)\n", 60); }
-    syscall(1, 1, "PASS: SPIR-V shader module\n", 27);
+    if (smod == 0) { return _fail("SPIR-V module create (instance feature / validation?)"); }
+    _pass("SPIR-V shader module");
 
     var BUF = 262144;
     var usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
     var rb_w = wgpu_device_create_buffer(device, wgpu_buffer_descriptor("rb-w", usage, BUF, 0));
     var rb_s = wgpu_device_create_buffer(device, wgpu_buffer_descriptor("rb-s", usage, BUF, 0));
-    if (rb_w == 0) { return _fail("FAIL: readback buffer (wgsl)\n", 29); }
-    if (rb_s == 0) { return _fail("FAIL: readback buffer (spirv)\n", 30); }
-    if (_render(device, queue, wmod, rb_w) != 0) { return _fail("FAIL: WGSL render\n", 18); }
-    if (_render(device, queue, smod, rb_s) != 0) { return _fail("FAIL: SPIR-V render\n", 20); }
-    syscall(1, 1, "PASS: rendered WGSL + SPIR-V passes\n", 35);
+    if (rb_w == 0) { return _fail("readback buffer (wgsl)"); }
+    if (rb_s == 0) { return _fail("readback buffer (spirv)"); }
+    if (_render(device, queue, wmod, rb_w) != 0) { return _fail("WGSL render"); }
+    if (_render(device, queue, smod, rb_s) != 0) { return _fail("SPIR-V render"); }
+    _pass("rendered WGSL + SPIR-V passes");
 
     var mst_w = wgpu_buffer_map_sync(device, rb_w, WGPU_MAP_MODE_READ, 0, BUF);
-    if (mst_w != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("FAIL: map wgsl\n", 15); }
+    if (mst_w != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("map wgsl"); }
     var mst_s = wgpu_buffer_map_sync(device, rb_s, WGPU_MAP_MODE_READ, 0, BUF);
-    if (mst_s != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("FAIL: map spirv\n", 16); }
+    if (mst_s != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return _fail("map spirv"); }
     var mw = wgpu_buffer_get_const_mapped_range(rb_w, 0, BUF);
     var ms = wgpu_buffer_get_const_mapped_range(rb_s, 0, BUF);
-    if (mw == 0) { return _fail("FAIL: mapped range wgsl\n", 24); }
-    if (ms == 0) { return _fail("FAIL: mapped range spirv\n", 25); }
+    if (mw == 0) { return _fail("mapped range wgsl"); }
+    if (ms == 0) { return _fail("mapped range spirv"); }
 
     # Center pixel must be red (the triangle filled the RT).
     var ctr = (128 * 256 + 128) * 4;
@@ -473,9 +503,10 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     wgpu_buffer_unmap(rb_w);
     wgpu_buffer_unmap(rb_s);
 
-    if (red_ok == 0) { return _fail("FAIL: center pixel not red (shader did not fill)\n", 49); }
-    if (diff != 0)   { return _fail("FAIL: SPIR-V output != WGSL output\n", 35); }
-    syscall(1, 1, "PASS: SPIR-V render == WGSL render (cross-source identity)\n", 58);
-    syscall(1, 1, "\nOK - wgpu SPIR-V shader ingestion live\n", 40);
+    if (red_ok == 0) { return _fail("center pixel not red (shader did not fill)"); }
+    if (diff != 0)   { return _fail("SPIR-V output != WGSL output"); }
+    _pass("SPIR-V render == WGSL render (cross-source identity)");
+    _e2e_summary();
+    _e2e_line(1, "OK - ", "wgpu SPIR-V shader ingestion live");
     return 0;
 }

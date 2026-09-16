@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Mabda.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 6.5.29+ (ships `cc5`,
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.6.4+ (ships `cycc`,
   `cyrius` CLI, and the stdlib mabda depends on)
 - gcc (for GPU integration test only — links Cyrius `.o` with wgpu-native)
 - Vulkan drivers (for the GPU integration test)
@@ -15,7 +15,7 @@ the `cyrius` CLI. See `CLAUDE.md` for the full development process.
 ## Development Workflow
 
 1. Fork and clone the repository
-2. Resolve stdlib deps: `cyrius deps` (creates `lib/` symlinks)
+2. Resolve stdlib deps: `cyrius deps` (populates `lib/` — a real directory)
 3. For GPU work: `sh deps/fetch-wgpu.sh` (one-time, downloads
    wgpu-native v29 binaries into `deps/wgpu-native/`)
 4. Make changes under `src/`, `tests/tcyr/`, `tests/bcyr/`, or
@@ -27,9 +27,9 @@ the `cyrius` CLI. See `CLAUDE.md` for the full development process.
 ## Project Structure
 
 ```
-src/                30 domain modules — flat, zero transitive includes
+src/                56 domain modules — flat, zero transitive includes
 src/lib.cyr         The single include chain (stdlib + domain modules)
-tests/tcyr/         Consolidated CPU-only suite — `cyrius test`
+tests/tcyr/         CPU-only domain suites — `make test`
 tests/bcyr/         CPU-only benchmarks — `cyrius bench`
 programs/           smoke.cyr (link-check), phase0 / compute_e2e /
                     render_e2e / render_graph_e2e (GPU integration),
@@ -43,10 +43,10 @@ Makefile            Thin wrapper over `cyrius` CLI + GPU path
 ## Running Tests
 
 ```sh
-# CPU-only unit suite (387 assertions)
-cyrius test tests/tcyr/mabda.tcyr
+# CPU-only unit suites (tests/tcyr/*.tcyr)
+make test
 
-# CPU-only benchmark harness (7 benches; GPU benches via `make bench-gpu`)
+# CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
 cyrius bench tests/bcyr/mabda.bcyr
 
 # GPU integration (requires Vulkan + wgpu-native)
@@ -65,8 +65,8 @@ make test-all
    order
 3. Add `"src/mymodule.cyr"` to the `[lib] modules = [...]` list in
    `cyrius.cyml`
-4. Add tests in `tests/tcyr/mabda.tcyr` (append to the consolidated
-   file; give the fn a `test_` prefix)
+4. Add tests in the matching `tests/tcyr/<domain>.tcyr` suite (give
+   the fn a `test_` prefix)
 5. Regenerate the bundle: `cyrius distlib` (CI diff-checks this)
 6. Update CHANGELOG.md
 

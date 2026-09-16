@@ -25,14 +25,15 @@ all three, routed through an `@internal` `Backend` slot table).
 └─────────────────┬───────────────────────────────────────┘
                   │
 ┌─────────────────▼───────────────────────────────────────┐
-│ mabda (30 @public + 19 @internal; 49 domain modules)     │
+│ mabda (31 @public + 25 @internal; 56 domain modules)     │
 │                                                          │
 │  Core:      error, color, capabilities, context,         │
 │             profiler, resource, debug                     │
 │  Buffers:   buffer, typed_buffer, compute, gpu_timestamps,│
 │             shader_cache, pipeline_cache, bind_group_cache│
 │  Graphics:  vertex, blend, sampler, depth, texture,       │
-│             texture_format, bind_group, instancing        │
+│             texture_format, bind_group, instancing,       │
+│             asset_format, asset_load                      │
 │  Render:    render_target, render_pipeline, render_pass,  │
 │             render_graph, surface, surface_v3, queue       │
 │                                                          │
@@ -42,8 +43,8 @@ all three, routed through an `@internal` `Backend` slot table).
            │ wgpu fillers                      │ native AMD/NVIDIA fillers
 ┌──────────▼─────────────────────┐ ┌──────────▼───────────────────────┐
 │ wgpu-native C API (v29) via a   │ │ direct amdgpu DRM ioctls (no      │
-│ 65-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
-│ (deps/wgpu_main.c) — 7 struct-  │ │ + KMS; SPIR-V→GFX9 compute compiler│
+│ 67-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
+│ (deps/wgpu_main.c) — 2 struct-  │ │ + KMS; SPIR-V→GFX9 compute compiler│
 │ packing shims                   │ │ (gfx9_encode/spirv_parse/mir/      │
 │                                 │ │ spirv_lower/gfx9_isel/regalloc/    │
 │                                 │ │ waitcnt/abi/compile)               │
@@ -64,7 +65,7 @@ all three, routed through an `@internal` `Backend` slot table).
 ## Flat Layout
 
 ```
-src/   (49 modules — see CLAUDE.md "Architecture" for the annotated tree)
+src/   (56 domain modules + lib.cyr — annotated below; the filesystem is authoritative)
 ├── lib.cyr              — single include chain (stdlib + domain modules)
 ├── error.cyr, color.cyr, capabilities.cyr, profiler.cyr, resource.cyr, debug.cyr
 ├── context.cyr          — GpuContext (wgpu instance/adapter/device/queue OR
@@ -73,11 +74,21 @@ src/   (49 modules — see CLAUDE.md "Architecture" for the annotated tree)
 ├── shader_cache.cyr, pipeline_cache.cyr, bind_group_cache.cyr
 ├── vertex.cyr, blend.cyr, sampler.cyr, depth.cyr, bind_group.cyr
 ├── texture.cyr, texture_format.cyr, render_target.cyr, render_pipeline.cyr
+├── asset_format.cyr     — container format ids (VkFormat / DXGI) → MABDA_TEXFMT_*
+├── asset_load.cyr       — DDS / KTX2 container loaders; PNG / JPEG via chitra
+│                          (`-D MABDA_PNG` / `-D MABDA_JPEG`; untrusted input)
 ├── render_pass.cyr, render_graph.cyr, queue.cyr, surface.cyr, surface_v3.cyr, instancing.cyr
 ├── @internal wgpu FFI:  wgpu_types.cyr, wgpu_descriptors.cyr, wgpu_ffi.cyr
 ├── @internal backend:   backend.cyr, backend_wgpu.cyr, backend_native.cyr,
 │                        backend_native_amdgpu.cyr, backend_native_pm4.cyr,
 │                        backend_native_shaders.cyr, backend_native_kms.cyr
+├── @internal NVIDIA native (v4.0):
+│                        backend_nvidia.cyr         — Backend-slot integration
+│                        backend_nvidia_nouveau.cyr — nouveau DRM ioctl wrappers
+│                        backend_nvidia_push.cyr    — pushbuffer / method-stream builders
+│                        backend_nvidia_qmd.cyr     — Turing compute QMD builder
+│                        backend_nvidia_sass.cyr    — pre-compiled SM75 SASS programs
+│                        backend_nvidia_tex.cyr     — Turing TIC/TSC descriptor builders
 └── @internal SPIR-V→GFX9 compiler (v3.2.x): gfx9_encode.cyr, spirv_parse.cyr,
                          mir.cyr, spirv_lower.cyr, gfx9_isel.cyr,
                          gfx9_regalloc.cyr, gfx9_waitcnt.cyr, gfx9_abi.cyr, gfx9_compile.cyr
@@ -96,10 +107,10 @@ Instead:
    Vulkan backend via `WGPUInstanceExtras { backends = Vulkan }`
    (the default `All` crashes on headless boxes — see v2.4.2), and
    creates the GPU context pre-Cyrius.
-2. **Function table** — C populates an array of 65 wgpu function
-   pointers covering buffer / shader / pipeline / texture / render
-   pass / render pipeline / surface / timestamp query / copy
-   operations.
+2. **Function table** — C populates an array of 67 function pointers
+   (wgpu entry points plus launcher shims) covering buffer / shader /
+   pipeline / texture / render pass / render pipeline / surface /
+   timestamp query / copy operations.
 3. **Cyrius code** receives the table pointer and calls functions
    via `fncall1` .. `fncall6` for scalar-arg entry points (never
    `fncall6` with a struct-by-value / float arg — see next section).
@@ -131,7 +142,7 @@ this path; the rest of the library runs through `cyrius test` /
 `cyrius bench` / `cyrius build` directly.
 
 ```
-programs/render_graph_e2e.cyr → printf 'object;\n' | cc5 → build/render_graph_e2e.o
+programs/render_graph_e2e.cyr → printf 'object;\n' | cycc → build/render_graph_e2e.o
 build/render_graph_e2e.o + deps/wgpu_main.o + libwgpu_native.a → gcc → build/render_graph_e2e
 ```
 
@@ -147,7 +158,7 @@ Key requirements (all validated in v2.4.x runtime sweep):
   strstr and crashing Mesa's driver-string probing.
 
 For non-GPU modules, `cyrius build programs/smoke.cyr` or
-`make test` (globs `tests/tcyr/*.tcyr`, 16 domain suites) drives
+`make test` (globs `tests/tcyr/*.tcyr`, 18 domain suites) drives
 everything; no object mode, no C linker.
 
 ## Struct-Packing Shim Pattern
