@@ -3264,8 +3264,10 @@ fn test_native_pm4_render_pipeline_ctx_size_and_anchors() {
 fn test_native_pm4_render_pass_target_layout_256x256() {
     # RT VA 0xFFFF800101000000 (matches src/backend_native.cyr's RT pool VA).
     # 256x256 RT — viewport scale = 128, offset = 128.
-    var buf[256];
-    memset(&buf, 0xCC, 256);
+    # 320 bytes: the builder writes 264 (asserted below). This was 256 until 4.1.5,
+    # an 8-byte overrun that x86 absorbed and that crashed native.tcyr on aarch64.
+    var buf[320];
+    memset(&buf, 0xCC, 320);
     var pos = native_pm4_build_render_pass_target(&buf, 0,
       0xFFFF800101000000,
       256, 256);
@@ -3314,8 +3316,10 @@ fn test_native_pm4_render_pass_target_rt_bind() {
     # & 0xFFFFFFFF → 0x01010000 (low 32 bits hold the BO offset >> 8).
     # (rt_va >> 40) & 0xFF: bits 40-47 of rt_va. The byte at that
     # position in 0xFFFF800101000000 is 0x80.
-    var buf[256];
-    memset(&buf, 0xCC, 256);
+    # 320 bytes: the builder writes 264 (asserted below). This was 256 until 4.1.5,
+    # an 8-byte overrun that x86 absorbed and that crashed native.tcyr on aarch64.
+    var buf[320];
+    memset(&buf, 0xCC, 320);
     var pos = native_pm4_build_render_pass_target(&buf, 0,
       0xFFFF800101000000,
       256, 256);
@@ -4275,7 +4279,7 @@ fn test_native_render_pass_struct_field_offsets() {
 # ================================================================
 # v3 Step 6.10 prep — EVENT_WRITE / CACHE_FLUSH_AND_INV PM4 builder
 # ================================================================
-# Stand-alone PM4 packet primitive. Not yet wired into the render
+# Stand-alone PM4 packet primitive. Not yet wired (CHANGELOG, Step 6.10 prep) into the render
 # composer — the splice into `native_pm4_build_render_clear_triangle`
 # happens after HW confirms the e2e program's pixel readback fails
 # from the missing post-draw flush. Tests pin the binary form of the
@@ -4724,9 +4728,28 @@ fn test_native_bc_array_tiled_copy_slice_offset() {
     return 0;
 }
 
+# 4.1.5: every library ioctl goes through _mabda_ioctl. On a Linux target it must
+# issue the REAL ioctl (fd -1 -> -EBADF, not a stubbed -ENOSYS), both directly and
+# through a caller (native_drm_version); on agnos it fails closed with -ENOSYS.
+fn test_native_ioctl_bridge() {
+    # Zeroed: qemu-user decodes DRM_IOCTL_VERSION's pointer fields before the kernel
+    # sees the fd, so garbage stack bytes read back as -EFAULT instead of -EBADF.
+    var ver[64];
+    memset(&ver, 0, 64);
+    #ifdef CYRIUS_TARGET_AGNOS
+    assert_eq(_mabda_ioctl(0 - 1, DRM_IOCTL_VERSION, &ver), 0 - 38, "agnos ioctl -> -ENOSYS");
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    assert_eq(_mabda_ioctl(0 - 1, DRM_IOCTL_VERSION, &ver), 0 - 9, "ioctl on fd -1 -> -EBADF");
+    assert_eq(native_drm_version(0 - 1, &ver), 0 - 9, "native_drm_version via bridge -> -EBADF");
+    #endif
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_native_ioctl_bridge();
     test_native_bc_array_tiled_copy_slice_offset();
     test_native_ioc_encode_directions();
     test_native_ioc_encode_size_in_bits_16_to_29();

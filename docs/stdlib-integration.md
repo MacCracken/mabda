@@ -24,7 +24,7 @@ In your `cyrius.cyml`:
 [package]
 name = "my-app"
 version = "0.1.0"
-cyrius = "6.6.4"
+cyrius = "6.6.6"
 
 # No [build] section: see "4. Build it". A wgpu-path consumer has no entry point
 # of its own, so `cyrius build` cannot produce the program.
@@ -37,7 +37,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.4"
+tag = "4.1.5"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -46,8 +46,8 @@ resolved `lib/` tree — mabda's include chain (`src/lib.cyr`) pulls them
 in that order, so declaring the full stdlib set above is required, not
 optional. `examples/stdlib-consumer/cyrius.cyml` carries the canonical
 list. `cyrius deps` also brings in the stdlib leaves listed in mabda's
-`dist/mabda.deps` (`thread`, `thread_local`, `sankoch`), so they need no
-entry here; section 2 includes one of them.
+`dist/mabda.deps` (`chrono`, `thread`, `thread_local`, `sankoch`), so they need no
+entry here; section 2 includes two of them (`chrono` since 4.1.5, `thread_local`).
 
 ### Opt-in feature deps
 
@@ -109,6 +109,7 @@ include "lib/io.cyr"
 include "lib/args.cyr"
 include "lib/hashmap.cyr"
 include "lib/syscalls.cyr"
+include "lib/chrono.cyr"
 include "lib/tagged.cyr"
 include "lib/fnptr.cyr"
 include "lib/mmap.cyr"
@@ -248,7 +249,7 @@ project. mabda's `make example-link` compiles and links it this way
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.1.4 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.1.5 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

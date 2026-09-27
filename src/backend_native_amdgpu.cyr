@@ -20,7 +20,7 @@
 #
 # All data types are i64 / u64 unless noted. drm_version struct layout
 # mirrors include/uapi/drm/drm.h on x86_64 Linux. No libdrm — direct
-# syscall(SYS_IOCTL) only.
+# ioctl through _mabda_ioctl (below) only.
 
 # ================================================================
 # Constants
@@ -56,6 +56,26 @@ var DRM_IOCTL_VERSION = 0xC0406400;
 # Render node path. renderD128 is the first unprivileged render-only
 # node; renderD129+ exist on multi-GPU systems.
 var DRM_RENDER_NODE_PATH = "/dev/dri/renderD128";
+
+# ================================================================
+# ioctl bridge — the one place mabda's library issues an ioctl
+# ================================================================
+# Every DRM / KMS / nouveau / sync_file ioctl in src/ goes through here.
+# agnos has no ioctl syscall and its peer (lib/syscalls_x86_64_agnos.cyr)
+# defines no SYS_IOCTL, so the agnos arm fails CLOSED with -ENOSYS (38);
+# every caller already treats a negative rc as failure. Through 4.1.4 the
+# agnos build compiled only when yukti <= 2.3.11 was in scope, whose fake
+# `SYS_IOCTL = 9001` would have issued agnos syscall 9001. Every other
+# target keeps its peer's native SYS_IOCTL (x86_64 16, aarch64 29, Mach-O
+# 29; PE declines it with -38). CHANGELOG [4.1.5].
+fn _mabda_ioctl(fd, request, argp): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return 0 - 38;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return syscall(SYS_IOCTL, fd, request, argp);
+    #endif
+}
 
 # ================================================================
 # Errno → GpuErr mapping (v3 Step 4f.i)
@@ -155,7 +175,7 @@ fn native_drm_version(fd, ver): i64 {
 
     # Pass 1: lengths only. All _ptr fields stay 0 so kernel skips
     # string writes but still reports required lengths.
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    var rc = _mabda_ioctl(fd, DRM_IOCTL_VERSION, ver);
     if (rc != 0) { return rc; }
 
     var name_len = load64(ver + 16);
@@ -168,7 +188,7 @@ fn native_drm_version(fd, ver): i64 {
     store64(ver + 16, name_len);  # capacity
     store64(ver + 24, name_buf);
 
-    rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_VERSION, ver);
+    rc = _mabda_ioctl(fd, DRM_IOCTL_VERSION, ver);
     if (rc != 0) { return rc; }
     return 0;
 }
@@ -235,7 +255,7 @@ fn native_gem_create(fd, size, alignment, domains, domain_flags, req): i64 {
     store64(req + 8,  alignment);
     store64(req + 16, domains);
     store64(req + 24, domain_flags);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_CREATE, req);
 }
 
 # Read the handle out of a req buffer that native_gem_create populated.
@@ -248,7 +268,7 @@ fn native_gem_create_handle(req): i64 { return load32(req + 0); }
 fn native_gem_mmap_offset(fd, handle, req): i64 {
     memset(req, 0, DRM_AMDGPU_GEM_MMAP_SIZE);
     store32(req + 0, handle);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_MMAP, req);
 }
 
 fn native_gem_mmap_offset_value(req): i64 { return load64(req + 0); }
@@ -259,7 +279,7 @@ fn native_gem_close(fd, handle): i64 {
     var req[8];
     store32(&req + 0, handle);
     store32(&req + 4, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_GEM_CLOSE, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &req);
 }
 
 # Convenience: create a CPU-visible GTT BO and mmap it. Populates
@@ -423,7 +443,7 @@ fn native_ctx_alloc(fd, req): i64 {
     store32(req + 4,  0);
     store32(req + 8,  0);
     store32(req + 12, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CTX, req);
 }
 
 fn native_ctx_alloc_id(req): i64 { return load32(req + 0); }
@@ -435,7 +455,7 @@ fn native_ctx_free(fd, ctx_id): i64 {
     store32(&req + 4,  0);
     store32(&req + 8,  ctx_id);
     store32(&req + 12, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &req);
 }
 
 # v4.1.3 — context reset state (AMDGPU_CTX_OP_QUERY_STATE2). A job that hangs is finished by
@@ -463,7 +483,7 @@ fn native_ctx_query_state(fd, ctx_id, req): i64 {
     memset(req, 0, DRM_AMDGPU_CTX_SIZE);
     store32(req + 0, AMDGPU_CTX_OP_QUERY_STATE2);
     store32(req + 8, ctx_id);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CTX, req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CTX, req);
 }
 
 # Pure verdict: 1 when the query failed or reported a lost-work flag, else 0. A failed query
@@ -532,7 +552,7 @@ fn native_bo_list_create(fd, entries, count, req): i64 {
     store32(req + 8,  count);
     store32(req + 12, DRM_AMDGPU_BO_LIST_ENTRY_SIZE);
     store64(req + 16, entries);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_BO_LIST, req);
 }
 
 fn native_bo_list_create_handle(req): i64 { return load32(req + 0); }
@@ -545,7 +565,7 @@ fn native_bo_list_destroy(fd, list_handle): i64 {
     store32(&req + 8, 0);
     store32(&req + 12, 0);
     store64(&req + 16, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_BO_LIST, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_BO_LIST, &req);
 }
 
 # VA map / unmap. `va_address` and `size` must be page-aligned
@@ -561,7 +581,7 @@ fn native_gem_va_map(fd, handle, va_address, size, flags): i64 {
     store64(&req + 24, 0);       # offset_in_bo
     store64(&req + 32, size);
     # vm_timeline_point / syncobjs stay zero; unused by legacy CS path.
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
 }
 
 fn native_gem_va_unmap(fd, handle, va_address, size): i64 {
@@ -574,7 +594,7 @@ fn native_gem_va_unmap(fd, handle, va_address, size): i64 {
     store64(&req + 16, va_address);
     store64(&req + 24, 0);
     store64(&req + 32, size);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_VA, &req);
 }
 
 # ================================================================
@@ -603,7 +623,7 @@ fn native_syncobj_create(fd, out_handle_ptr): i64 {
     var req[8];
     store32(&req + 0, 0);
     store32(&req + 4, 0);
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_CREATE, &req);
+    var rc = _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &req);
     if (rc != 0) { return rc; }
     store64(out_handle_ptr, load32(&req + 0));
     return 0;
@@ -613,7 +633,7 @@ fn native_syncobj_destroy(fd, handle): i64 {
     var req[8];
     store32(&req + 0, handle);
     store32(&req + 4, 0);
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_DESTROY, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &req);
 }
 
 # Wait for the syncobj to become signaled. `timeout_ns` is absolute
@@ -631,7 +651,7 @@ fn native_syncobj_wait(fd, handle, timeout_ns): i64 {
     store32(&req + 24, 0);              # first_signaled (out)
     store32(&req + 28, 0);              # pad
     store64(&req + 32, 0);              # deadline_nsec
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_WAIT, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &req);
 }
 
 # 4.1.4 — a job's completion status via its sync_file. A syncobj wait returns 0 for a job
@@ -654,12 +674,12 @@ fn native_syncobj_fence_status(fd, handle, out_status): i64 {
     store32(&hreq + 0, handle);
     store32(&hreq + 4, DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE);
     store32(&hreq + 8, 0xFFFFFFFF);
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &hreq);
+    var rc = _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &hreq);
     if (rc != 0) { return rc; }
     var sfd = load32(&hreq + 8);
     var info[56];
     memset(&info, 0, _NATIVE_SYNC_FILE_INFO_SIZE);
-    var irc = syscall(SYS_IOCTL, sfd, SYNC_IOC_FILE_INFO, &info);
+    var irc = _mabda_ioctl(sfd, SYNC_IOC_FILE_INFO, &info);
     syscall(3, sfd);                             # close
     if (irc != 0) { return irc; }
     var st = load32(&info + 32);
@@ -757,7 +777,7 @@ fn native_syncobj_timeline_wait(fd, handle, point, timeout_ns): i64 {
     store32(&req + 32, 0);              # first_signaled (out)
     store32(&req + 36, 0);              # pad
     store64(&req + 40, 0);              # deadline_nsec
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &req);
 }
 
 # Read back `handle`'s last-signaled timeline point into
@@ -774,7 +794,7 @@ fn native_syncobj_timeline_query(fd, handle, out_point_ptr): i64 {
     store64(&req + 8,  &points);        # points ptr (out)
     store32(&req + 16, 1);              # count_handles
     store32(&req + 20, 0);              # flags
-    var rc = syscall(SYS_IOCTL, fd, DRM_IOCTL_SYNCOBJ_QUERY, &req);
+    var rc = _mabda_ioctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &req);
     if (rc != 0) { return rc; }
     store64(out_point_ptr, load64(&points + 0));
     return 0;
@@ -875,7 +895,7 @@ fn native_cs_submit(fd, ctx_id, bo_list_handle, ib_va, ib_bytes, ip_type, syncob
     store32(&req + 12, 0);                # flags
     store64(&req + 16, &chunk_ptrs);
 
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CS, &req);
 }
 
 # Submit a CS using the BO_HANDLES chunk path (Mesa rusticl pattern) instead
@@ -953,7 +973,7 @@ fn native_cs_submit_inline_bos(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_t
     store32(&req + 12, 0);
     store64(&req + 16, &chunk_ptrs);
 
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CS, &req);
 }
 
 # Submit a CS using the full 4-chunk Mesa-rusticl shape:
@@ -1040,7 +1060,7 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
     store32(&req_4 + 12, 0);
     store64(&req_4 + 16, &chunk_ptrs_4);
 
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req_4);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CS, &req_4);
 }
 
 # v3.1 Q.3 — timeline-syncobj CS submit (queue-targeted path). Same
@@ -1160,6 +1180,6 @@ fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_typ
     store32(&req + 12, 0);
     store64(&req + 16, &chunk_ptrs);
 
-    return syscall(SYS_IOCTL, fd, DRM_IOCTL_AMDGPU_CS, &req);
+    return _mabda_ioctl(fd, DRM_IOCTL_AMDGPU_CS, &req);
 }
 

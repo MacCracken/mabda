@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.1.4 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.1.5 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -192,7 +192,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.4+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -203,7 +203,7 @@ cyrius deps
 # Full gate sweep (lint, fmt, vet, version-check, distlib-sync, tests, bench)
 make test-all
 
-# CPU-only unit suite (5689 assertions across 18 domain files)
+# CPU-only unit suite (5695 assertions across 18 domain files)
 make test            # globs tests/tcyr/*.tcyr (count via scripts/count-test-assertions.sh)
 
 # CPU-only benchmark harness (9 benches; GPU benches via `make bench-gpu`)
@@ -230,7 +230,7 @@ mabda/
 │   │                            backend, caches, surface, native, nvidia, kms,
 │   │                            queue, asset_load,
 │   │                            compiler_{lower,backend,compile,encode}
-│   │                            (5689 asserts; `make test` globs them all)
+│   │                            (5695 asserts; `make test` globs them all)
 │   └── bcyr/mabda.bcyr           CPU-only benchmark harness (9 benches)
 ├── programs/            GPU integration programs (wgpu + native) + dev spikes + `benchmarks.cyr`
 │   ├── smoke.cyr                Link-check — `cyrius build` entry point
@@ -255,7 +255,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.1.4
+├── VERSION              4.1.5
 └── CHANGELOG.md
 ```
 

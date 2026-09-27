@@ -13,6 +13,87 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.5] — 2026-09-27
+
+**cyrius 6.6.6, and mabda builds for agnos on its own.** Through 4.1.4 the bundle issued
+`syscall(SYS_IOCTL, …)` at 46 sites, and agnos defines no `SYS_IOCTL`. The agnos build compiled
+only when yukti ≤ 2.3.11 was also in scope, because yukti declared a fake `SYS_IOCTL = 9001`. On
+agnos, every mabda ioctl would therefore have issued agnos syscall 9001. yukti 2.3.12 drops that
+constant, so cyrius 6.6.7 cannot fold it until mabda stops depending on it. The profiler's clock
+also moves off a raw x86 syscall number.
+
+**Verified:** 18 CPU suites, **5695 assertions**, 0 failed on x86_64. All 18 suites also pass on
+aarch64 under qemu-aarch64 (`cyrius test --aarch64`); the first such run found the test overrun
+under Fixed. CI's lint, strict-deferrals, fmt, vet, sizing gates, fuzz and `make example-link` are
+clean on the 6.6.6 toolchain. `dist/mabda.cyr` regenerates byte-identically. The bundle compiles
+with only its `dist/mabda.deps` leaves in scope (no yukti, no samvada) for x86_64 Linux, agnos,
+aarch64 Linux, PE, x86_64 Mach-O and arm64 Mach-O. Under 4.1.4, the same agnos probe fails with
+46 `undefined variable 'SYS_IOCTL'` errors. In the probe, `_mabda_ioctl(-1, …)` returns -EBADF on
+x86_64 and on aarch64 (qemu), and -ENOSYS on PE (wine). `profiler_frame_cycle` benches the same as
+4.1.4 on the same toolchain (2.80 µs vs 2.79 µs min). Not run: the GPU hardware gates. The
+hardware paths are unchanged on Linux: `_mabda_ioctl` issues the same `syscall(SYS_IOCTL, …)`.
+
+### Fixed
+
+- **agnos: every ioctl goes through one private fail-closed bridge.** `_mabda_ioctl(fd, request,
+  argp)` in `src/backend_native_amdgpu.cyr` returns -ENOSYS (-38) under `CYRIUS_TARGET_AGNOS`.
+  On every other target it issues the peer's native `SYS_IOCTL`: x86_64 16, aarch64 29, Mach-O
+  29, and PE, which declines it with -38. The 46 call sites in `backend_native_amdgpu`,
+  `backend_native`, `backend_native_kms` and `backend_nvidia_nouveau` all use it, and no
+  `SYS_IOCTL` reference is left in `src/` outside the bridge. Callers already treat a negative
+  rc as failure, so an agnos native-backend call now fails as "no device" instead of issuing an
+  unrelated syscall. This follows yukti's `_yk_ioctl`. It needs no yukti and no new cyrius
+  surface, so it builds on the released 6.6.6.
+- **Profiler clock: `clock_now_ns()` instead of a raw `syscall(228, 1, …)`.** The raw number is
+  `clock_gettime` only on x86_64 Linux. aarch64 depends on the compiler translating it, arm64
+  Mach-O wants Darwin clock id 4 and returns the value, PE has no such syscall, and agnos has no
+  228. lib/chrono.cyr's monotonic clock handles each target: the agnos uptime counter, Darwin
+  id 4, and QueryPerformanceCounter on Windows. `_time_now_ns` is also the NVIDIA dispatch
+  deadline clock, so that deadline uses the same source. The old helper zeroed its timespec so a
+  failed call read 0 (audit MED-6). The stdlib's Linux arm does not zero it, but
+  `CLOCK_MONOTONIC` with a valid buffer cannot fail on Linux.
+- **`tests/tcyr/native.tcyr` crashed on aarch64 (SIGSEGV, pre-existing).** Two render-pass tests
+  passed a 256-byte stack buffer to `native_pm4_build_render_pass_target`. That builder writes
+  264 bytes, which the same tests assert. x86 absorbed the 8-byte overrun; on aarch64 it
+  clobbered the saved frame. Both buffers are now 320 bytes. The crash reproduces on the 4.1.4
+  tree under both cyrius 6.6.4 and 6.6.6. The stack-array sizing gate cannot see it, because the
+  write happens inside the callee.
+
+### Changed
+
+- **Toolchain `6.6.4` → `6.6.6`** (`cyrius.cyml`, the example consumer, `docs/stdlib-integration.md`,
+  README/CONTRIBUTING floors, guide headers). `cyrius.lock` re-resolved: the stdlib hashes move
+  to 6.6.6, `lib/chrono.cyr` is new, and the trailer reads `cyrius\t6.6.6`. samvada 1.0.1 and
+  chitra 1.0.3 are unchanged.
+- **New stdlib dependency: `chrono`.** It is in `[deps] stdlib`, in `src/lib.cyr`, and in
+  `dist/mabda.deps`, which cyrius regenerates (18 leaves, was 17). A consumer that builds through
+  `cyrius build` gets it automatically; this was checked against a README-quick-start consumer
+  that declares no `chrono`. A consumer that compiles the bundle directly with `cycc`, like
+  `examples/stdlib-consumer`'s object-mode recipe, must add `include "lib/chrono.cyr"`. The
+  example, its README and `docs/stdlib-integration.md` now do. There is no public-API change.
+- **CI's strict-deferrals step is green under the 6.6.6 `cyrlint`.** Since 6.6.5, `cyrlint`
+  ignores case and reads a whole comment paragraph, so six existing notes were flagged: `debug.cyr`,
+  `gfx9_abi.cyr`, `vertex.cyr`, `wgpu_ffi.cyr`, `programs/nvidia_compute_store.cyr` and
+  `tests/tcyr/native.tcyr`. Each now has a tracking pointer on the flagged line, and no note was
+  reworded to hide it. `nvidia_compute_store.cyr` also pointed at a capture-notes path that had
+  moved to `docs/archive/development/`; both references are corrected.
+
+### Next
+
+- **Vertex attribute records vs wgpu-native v29 (unverified on HW, not changed here).**
+  `_vertex_attr` writes 24-byte `WGPUVertexAttribute` records {format +0, offset +8,
+  shaderLocation +16}. The pinned v29 `webgpu.h` (`deps/wgpu-native/include/webgpu/webgpu.h`)
+  declares the struct with a leading `nextInChain`: {nextInChain +0, format +8, offset +16,
+  shaderLocation +24}, 32 bytes. `WGPUVertexBufferLayout` also leads with `nextInChain`.
+  `vertex2d_attributes`, `vertex3d_attributes` and the instancing attributes are public, so this
+  needs a wgpu hardware run before any layout change. `src/vertex.cyr:121` points here.
+- The native backend still reads `CLOCK_MONOTONIC` through a raw `syscall(228, 1, …)` for its
+  syncobj deadlines, at 7 sites in `backend_native` and `backend_native_amdgpu`. They were left
+  as they are because those deadlines are absolute times the kernel compares against its own
+  `CLOCK_MONOTONIC`, so the source must stay exactly that clock. All seven are in native-backend
+  paths that work on a DRM context (`_native_mono_ns` and six dispatch/wait/submit functions).
+  Moving them onto `clock_now_ns` for the non-Linux targets is a separate change.
+
 ## [4.1.4] — 2026-09-16
 
 **The 4.1.3 P(-1) audit's findings, plus every item 4.1.3 left on the roadmap.** No toolchain or

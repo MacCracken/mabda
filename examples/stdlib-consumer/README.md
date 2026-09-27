@@ -91,7 +91,7 @@ Notes on the steps:
   `no GPU available` to stderr and exits 1.
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`4.1.4`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.4/`,
+there (`4.1.5`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.5/`,
 and copies its `dist/mabda.cyr` bundle into `lib/mabda.cyr` (a real
 file, not a symlink). The consumer then includes it with
 `include "lib/mabda.cyr"`.
@@ -118,7 +118,7 @@ explicitly:
 This example is the **`@public`-API-stability regression test across
 the wgpu → native transition**. The pure-Cyrius native backends have
 now landed (AMD in v3.0, NVIDIA in v4.0), and `src/main.cyr` still
-compiles against the v4.1.4 mabda tag. None of its code changes has
+compiles against the v4.1.5 mabda tag. None of its code changes has
 been a mabda API change:
 
 - **v4.1.1** moved to the cyrius 6.6.0 `Result` pair-bind
@@ -129,6 +129,11 @@ been a mabda API change:
   that include this example stopped linking from 4.0.2 on. Nobody saw it
   because the old recipe here never linked the launcher. It was a
   launcher-contract change, not a public-API one.
+- **v4.1.5** added `include "lib/chrono.cyr"`: the profiler reads the
+  stdlib monotonic clock instead of a raw syscall, so the bundle now
+  references it. `dist/mabda.deps` lists `chrono`, so `cyrius deps`
+  vendors it; the include is the consumer's line to add. A dependency
+  change, not a public-API one.
 - **v4.1.3** also assembled the 269-byte WGSL source in pieces so no
   line exceeds the linter's 120-byte limit. The shader bytes are
   unchanged.

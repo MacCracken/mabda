@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Mabda.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 6.6.4+ (ships `cycc`,
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.6.6+ (ships `cycc`,
   `cyrius` CLI, and the stdlib mabda depends on)
 - gcc (for GPU integration test only — links Cyrius `.o` with wgpu-native)
 - Vulkan drivers (for the GPU integration test)
