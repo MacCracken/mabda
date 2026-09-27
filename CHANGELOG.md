@@ -88,11 +88,16 @@ hardware paths are unchanged on Linux: `_mabda_ioctl` issues the same `syscall(S
   `vertex2d_attributes`, `vertex3d_attributes` and the instancing attributes are public, so this
   needs a wgpu hardware run before any layout change. `src/vertex.cyr:121` points here.
 - The native backend still reads `CLOCK_MONOTONIC` through a raw `syscall(228, 1, …)` for its
-  syncobj deadlines, at 7 sites in `backend_native` and `backend_native_amdgpu`. They were left
-  as they are because those deadlines are absolute times the kernel compares against its own
-  `CLOCK_MONOTONIC`, so the source must stay exactly that clock. All seven are in native-backend
-  paths that work on a DRM context (`_native_mono_ns` and six dispatch/wait/submit functions).
-  Moving them onto `clock_now_ns` for the non-Linux targets is a separate change.
+  syncobj deadlines, at 7 sites in `backend_native` and `backend_native_amdgpu`. The clock is
+  not the reason they stay raw. On Linux `clock_now_ns` reads the same `CLOCK_MONOTONIC`
+  (lib/chrono.cyr's Linux arm is `syscall(228, CLOCK_MONOTONIC, &ts)`), and this release already
+  moved the NVIDIA dispatch deadline onto it. The reason is that each of the seven checks the
+  clock read for failure and returns an error (`_native_mono_ns` returns -1; one submit path also
+  destroys its syncobj first), and `clock_now_ns` cannot report a failure. All seven are in
+  native-backend paths that work on a DRM context (`_native_mono_ns` and six
+  dispatch/wait/submit functions). Moving them needs a stdlib clock that reports failure, or a
+  decision to drop the check; that is a separate change. The raw `nanosleep` (`syscall(35)`) in
+  `backend_native_amdgpu` is also still a raw x86_64 number.
 
 ## [4.1.4] — 2026-09-16
 
