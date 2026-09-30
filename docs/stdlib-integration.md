@@ -37,7 +37,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.1.5"
+tag = "4.1.6"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -249,7 +249,7 @@ project. mabda's `make example-link` compiles and links it this way
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.1.5 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.1.6 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

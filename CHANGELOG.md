@@ -13,6 +13,49 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.1.6] — 2026-09-30
+
+**Two global-namespace collisions with other cyrius folds.** Cyrius has one global namespace,
+and cyrius folds mabda, vani and yukti into its stdlib, so a consumer can have all three in
+scope. Two of mabda's names were also defined by those libraries, and in both cases the last
+definition silently won program-wide. Both are renamed to mabda-scoped names.
+
+**Verified:** 18 CPU suites, **5695 assertions**, 0 failed on x86_64 (cyrius 6.6.6). With cyrius
+6.6.12's folds of yukti 2.3.14, this mabda and vani 1.2.8 compiled together, `cycc` reports no
+duplicate-fn or conflicting-symbol warning; with 4.1.5 it reported both collisions below.
+`dist/mabda.cyr` regenerates byte-identically.
+
+### Fixed
+
+- **`PCI_VENDOR_AMD` renamed `WGPU_VENDOR_ID_AMD` (0x1002).** yukti's `PciVendor` enum defines
+  `PCI_VENDOR_AMD = 0x1022`, the PCI-SIG AMD id, while mabda's var held 0x1002, the AMD/ATI GPU
+  id that `WGPUAdapterInfo.vendorID` reports. With both in scope cycc warned `duplicate symbol
+  'PCI_VENDOR_AMD' redefined with conflicting value (last definition wins)` and whichever library
+  was included first compared against the other's value: with yukti last, mabda's AMD-wgpu
+  deprecation guard (`_wgpu_vendor_wgpu_deprecated`) no longer recognised an AMD adapter; with
+  mabda last, yukti's PCI vendor match failed for AMD devices. The new name follows the
+  `NV_PCI_VENDOR_NVIDIA` precedent in `src/backend_nvidia_nouveau.cyr`. yukti keeps its name and
+  value.
+  **Migration:** a consumer that referenced mabda's `PCI_VENDOR_AMD` by name uses
+  `WGPU_VENDOR_ID_AMD`. A survey of `~/Repos` found no such consumer (ai-hwaccel defines its own
+  0x1002 constant).
+- **`_sk_emit_err` renamed `_mabda_sk_emit_err`.** vani defines a helper of the same name, so
+  with both folds in scope `cycc` warned `duplicate fn '_sk_emit_err' (last definition wins)`
+  and one library's errors went through the other's helper: mabda's GPU errors named through
+  `vani_err_name` and gated on vani's observability flag, or vani's through mabda's. vani 1.2.8
+  renames its side to `_vani_sk_emit_err`. The helper is internal; no public API changes.
+
+### Changed
+
+- `tests/tcyr/backend.tcyr`: the AMD-wgpu deprecation rows use `WGPU_VENDOR_ID_AMD`; the
+  `wgpu_ffi.cyr` comment names it. Doc tag references move to 4.1.6. Toolchain pin unchanged
+  (`6.6.6`).
+
+### Next
+
+- cyrius re-folds `lib/mabda.cyr` from this release's `dist/mabda.cyr`. Tag 4.1.6 before the
+  cyrius release that carries the fold.
+
 ## [4.1.5] — 2026-09-27
 
 **cyrius 6.6.6, and mabda builds for agnos on its own.** Through 4.1.4 the bundle issued
