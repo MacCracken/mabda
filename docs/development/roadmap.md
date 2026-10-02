@@ -284,6 +284,10 @@ vendor-driven, not calendar-driven.
 
 ## Backlog (not yet scheduled)
 
+- **`_sk_info_cstr` lives in sakshi's `_sk_` namespace** (recorded by cyrius 6.6.12, 2026-10-02). No
+  collision today, but a sakshi helper of that name would silently replace mabda's (last definition wins);
+  rename it into mabda's own prefix.
+
 Unscheduled forward work — lands here first, graduates to a version once
 there's consumer demand plus a clear scope.
 
