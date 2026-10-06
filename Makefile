@@ -64,8 +64,19 @@ build: check-lib-wiring
 # Functionality-grouped CPU suites (v3.1 test reorg 2026-06-15): one
 # file per domain under tests/tcyr/. Globbed so new domain files are
 # picked up automatically; each is a standalone suite with its own main().
-test: check-lib-wiring
+test: check-lib-wiring test-raw-include
 	@for f in tests/tcyr/*.tcyr; do $(CYRIUS) test "$$f" || exit 1; done
+
+# tests/tcyr/mabda_raw_include.tcyr includes ONLY dist/mabda.cyr + lib/assert.cyr. `cyrius
+# test` prepends every [deps].stdlib leaf of cyrius.cyml, so under the loop above it passes
+# whether or not the bundle can stand alone. Built --no-deps (no auto-prepend), only the
+# bundle's own compile-verified "# Requires" block puts the stdlib in scope: the 4.1.6
+# bundle, which had none, fails here on 29 undefined names. CHANGELOG [4.1.7].
+.PHONY: test-raw-include
+test-raw-include: check-lib-wiring
+	@mkdir -p build
+	$(CYRIUS) build --no-deps tests/tcyr/mabda_raw_include.tcyr build/mabda_raw_include
+	./build/mabda_raw_include
 
 .PHONY: bench
 bench: check-lib-wiring

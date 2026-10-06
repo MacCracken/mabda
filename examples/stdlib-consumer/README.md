@@ -91,7 +91,7 @@ Notes on the steps:
   `no GPU available` to stderr and exits 1.
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`4.1.6`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.6/`,
+there (`4.1.7`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.7/`,
 and copies its `dist/mabda.cyr` bundle into `lib/mabda.cyr` (a real
 file, not a symlink). The consumer then includes it with
 `include "lib/mabda.cyr"`.
@@ -99,11 +99,12 @@ file, not a symlink). The consumer then includes it with
 ### Optional feature opt-ins
 
 This minimal example uses neither. `cyrius deps` already pulls chitra
-and samvada in transitively through mabda's own `cyrius.cyml`, and
-their `thread` + `sankoch` stdlib leaves through `dist/mabda.deps`, so
-a feature-flag build needs no extra deps. Declaring the matching dep
-yourself (both commented out in `cyrius.cyml`) pins its version
-explicitly:
+and samvada in transitively through mabda's own `cyrius.cyml`. chitra's
+`thread` + `sankoch` stdlib leaves do not come with them: since 4.1.7
+`dist/mabda.deps` lists only the leaves the default (flag-off) bundle
+needs, so a PNG/JPEG build declares them in `[deps].stdlib`. Declaring
+the matching dep yourself (both commented out in `cyrius.cyml`) pins
+its version explicitly:
 
 - **`-D MABDA_PNG`** / **`-D MABDA_JPEG`** (PNG / baseline-JPEG decode) →
   `[deps.chitra]` (tag `1.0.3`), plus `thread` + `sankoch` in `[deps].stdlib`
@@ -118,7 +119,7 @@ explicitly:
 This example is the **`@public`-API-stability regression test across
 the wgpu → native transition**. The pure-Cyrius native backends have
 now landed (AMD in v3.0, NVIDIA in v4.0), and `src/main.cyr` still
-compiles against the v4.1.6 mabda tag. None of its code changes has
+compiles against the v4.1.7 mabda tag. None of its code changes has
 been a mabda API change:
 
 - **v4.1.1** moved to the cyrius 6.6.0 `Result` pair-bind
@@ -134,6 +135,12 @@ been a mabda API change:
   references it. `dist/mabda.deps` lists `chrono`, so `cyrius deps`
   vendors it; the include is the consumer's line to add. A dependency
   change, not a public-API one.
+- **v4.1.7** added `"thread_local"` to this example's `[deps].stdlib`.
+  The cyrius 6.6.18 `distlib` writes `dist/mabda.deps` as exactly the
+  leaves the bundle needs to compile, and the bundle never calls
+  `thread_local` (only the C launcher does), so it left the sidecar and
+  `cyrius deps` stopped vendoring it for consumers. A manifest change,
+  not a public-API one.
 - **v4.1.3** also assembled the 269-byte WGSL source in pieces so no
   line exceeds the linter's 120-byte limit. The shader bytes are
   unchanged.
