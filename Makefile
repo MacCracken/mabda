@@ -13,7 +13,7 @@
 #   make check-stack-array-sizing — static gate: no write past a `var buf[N]` (+ its self-test)
 #   make check-program-write-lengths — static gate: no hand-counted write lengths / pass tallies
 #   make check-count-script — self-test of scripts/count-test-assertions.sh
-#   make lint-deferrals — the pinned cyrlint --strict-deferrals over every linted file
+#   make lint-deferrals — cyrius lint --strict-deferrals over every linted file
 #   make example-link   — build examples/stdlib-consumer, never run it (link step needs wgpu-native)
 #   make build          — link-check the library (programs/smoke.cyr)
 #   make dist           — regenerate dist/mabda.cyr via `cyrius distlib`
@@ -202,28 +202,23 @@ lint:
 	done; \
 	[ $$fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
 
-# Untracked-deferral gate. `cyrius lint` cannot forward --strict-deferrals (as the first
-# argument it prints usage and exits 1; as the last it is silently ignored and exits 0 —
-# docs/development/issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md), so this calls
-# the pinned toolchain's cyrlint binary directly. It exits non-zero on an untracked
-# deferral; a missing binary is a failure, never a skip.
-CYRIUS_PIN = $(shell sed -n 's/^cyrius = "\(.*\)"/\1/p' cyrius.cyml | head -1)
-CYRLINT   ?= $(HOME)/.cyrius/versions/$(CYRIUS_PIN)/bin/cyrlint
-
+# Untracked-deferral gate: `cyrius lint --strict-deferrals` over every linted file. It exits
+# non-zero on an untracked deferral. Until 4.2.0 this called the pinned toolchain's cyrlint
+# binary directly, because the `cyrius lint` wrapper could not forward the flag (cyrius 6.6.4;
+# fixed in 6.6.5 — issues/archived/2026-09-16-cyrius-lint-drops-strict-deferrals.md). The
+# wrapper resolves the toolchain from cyrius.cyml's pin.
 .PHONY: lint-deferrals
 lint-deferrals:
-	@lint="$(CYRLINT)"; \
-	[ -x "$$lint" ] || { echo "lint-deferrals: no executable $$lint (cyrius $(CYRIUS_PIN) not installed)"; exit 1; }; \
-	fail=0; n=0; \
+	@fail=0; n=0; \
 	for f in $(LINT_FILES); do \
 		[ -e "$$f" ] || continue; \
 		n=$$((n + 1)); \
-		if ! out=$$("$$lint" --strict-deferrals "$$f" 2>&1); then \
+		if ! out=$$($(CYRIUS) lint --strict-deferrals "$$f" 2>&1); then \
 			echo "$$out"; echo "untracked deferral(s): $$f"; fail=1; \
 		fi; \
 	done; \
 	[ $$fail -eq 0 ] || { echo "lint-deferrals: untracked deferrals present"; exit 1; }; \
-	echo "lint-deferrals: $$n file(s) clean under $$lint --strict-deferrals"
+	echo "lint-deferrals: $$n file(s) clean under $(CYRIUS) lint --strict-deferrals"
 
 .PHONY: fmt-check
 fmt-check:
