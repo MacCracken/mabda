@@ -13,6 +13,104 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.2.0] — 2026-10-08
+
+**cyrius 6.7.5, and the eleven `F64_*` colour constants are f64 `const`s.** Until now they
+were `var`s that read 0 until `color_init()` set them at run time, and nothing in `src/`
+calls `color_init()`. A consumer that skipped it got zeros wherever mabda read them: an
+all-zero identity instance matrix, a white of (0, 0, 0, 0), a clamped colour scaled by 0.
+Constants have no init order, so that cannot happen now. The kind of eleven public names
+changes, hence a minor. This is the cyrius W2 stdlib wave: cyrius 6.7.6 re-folds
+`lib/mabda.cyr` from this release's `dist/mabda.cyr`.
+
+**Verified:** 21 CPU suites, **5726 assertions**, 0 failed on x86_64 (cyrius 6.7.5).
+`cyrius distlib` regenerates the bundle, and `make lint-deferrals` reports 189 files clean.
+`make example-link` and the raw-include test pass. The full CI ran in an isolated clean
+copy. Not run: the GPU hardware gates.
+
+### Breaking
+
+- **`F64_0`, `F64_1`, `F64_255`, `MABDA_F64_HALF`, `MABDA_F64_TWO`, `F64_LUM_R/G/B` and
+  `F64_CB_R/G/B` are f64 `const`s** (`src/color.cyr`), not `var`s. Each value is bit-identical
+  to what `color_init()` computed. A const cannot be assigned or have its address taken, and
+  a `const` beside a same-name `var` is a compile error.
+  **Migration:** none for a consumer that only reads them. A consumer that assigned one,
+  took `&F64_x`, or declares its own `var` of one of these names must stop. A survey of
+  `~/Repos` found no mabda consumer that does: shravan, phylax and tarang declare their own
+  `var F64_255`, but none of them depends on mabda. Comparing an integer with one of them
+  (`color_r(c) == F64_1`) now warns `comparison mixes f64 and integer operands`; use
+  `f64_eq`. **`color_init()` stays and does nothing.** Calling it is optional, so existing
+  callers compile.
+
+### Fixed
+
+- **The colour constants held 0 without `color_init()`** (S1, above). The readers were
+  `texture_from_color` (`_clamp_unit`, `F64_255`), `profiler_with_alpha_and_history` (the
+  alpha clamp), `profiler_end_frame` and `instance_data_identity`.
+  `tests/tcyr/color_const.tcyr` never calls `color_init()`. It checks each constant against
+  the bits `color_init()` used to compute, and checks those readers. Against the 4.1.7
+  `color.cyr`, 19 of its 24 rows fail.
+- **`_sk_info_cstr` renamed `_mabda_sk_info_cstr`** (M9). It sat in sakshi's `_sk_` prefix.
+  Folded together, a sakshi helper of that name would have replaced mabda's, or mabda's
+  sakshi's: "duplicate fn, last definition wins". This is the same fix 4.1.6 made for
+  `_sk_emit_err`. `tests/tcyr/fold_namespace.tcyr` defines a `_sk_info_cstr` stand-in and
+  checks that `gpu_context_release` still logs through mabda's helper. Against 4.1.7, cycc
+  warns `duplicate fn '_sk_info_cstr'` and 2 of the 3 rows fail. Internal; no API change.
+
+### Changed
+
+- **Toolchain `6.6.18` → `6.7.5`.** This covers `cyrius.cyml`, the example consumer,
+  `docs/stdlib-integration.md`, the README / CONTRIBUTING floors, the guide headers, and the
+  example and doc `tag =` lines. `cyrius.lock` was relocked: 46 → 46 stdlib files, 21 changed,
+  and two fresh resolves write the same lock. The bundle uses `const`, so it now needs
+  cyrius ≥ 6.7.2.
+- **`WGPU_COMPARE_LESS` is declared once**, in `src/sampler.cyr` with the rest of
+  `WGPUCompareFunction` (M8). `src/depth.cyr` declared a second `var WGPU_COMPARE_LESS = 2`.
+  cyrius warns only on conflicting values, so nothing reported it, but the duplicate would
+  have blocked any const sweep. `graphics.tcyr`'s depth-stencil row also checks the literal
+  webgpu.h value (2) now.
+- **CI and `make lint-deferrals` call `cyrius lint --strict-deferrals`** (M4). They no
+  longer locate the pinned `cyrlint` binary by path. The wrapper forwards the flag in either
+  position since cyrius 6.6.5. On 6.7.5 it exits 2 on an untracked deferral, and the make
+  target fails with a "For now" probe in `LINT_FILES`.
+- **Docs:** the `usage.md` / README / `stdlib-integration.md` snippets drop the
+  `color_init()` call. `usage.md`'s colour example used `F64_HALF`, a name mabda dropped in
+  3.4.1; it now uses `MABDA_F64_HALF`. The toolchain cheat sheet is re-checked against 6.7.5
+  (M7): A3, A4, B3, D3 and E3 are resolved upstream in 6.6.5; C4 and E2 are updated; C2
+  notes that a const has no init order. The roadmap drops the 6.6.5 and 6.6.6 pin-move lists,
+  every item of which is done (M2), and the "upstream cyrius issues" bullet (M3).
+
+### Removed
+
+- **`scripts/check-ffi-call-alignment.py` and `scripts/check-split-deferrals.py`** (M5).
+  Both guarded cyrius 6.6.4 defects that 6.6.5 fixed, and neither was wired into CI or the
+  Makefile. On 6.7.5 the alignment script's own self-test reported "no fixture row is
+  misaligned". cyrlint now flags a deferral phrase split across two comment lines.
+  `compute.tcyr`'s `test_ping_pong_new_ffi_calls_stack_aligned` stays.
+- **Nine resolved issue files moved to `docs/development/issues/archived/`** (M1), each with
+  a "— RESOLVED" title, a status line and an index row. Five were fixed in mabda (4.1.0,
+  4.1.3). Four mirrored cyrius 6.6.4 defects, each fixed in 6.6.5 and re-checked on 6.7.5:
+  the nested-call alignment, the dep-cache tamper check (the filed reproduction now passes),
+  the lint wrapper, and the bench mean floor. Every path that named the old location points
+  at `archived/`. The open issue directory is empty.
+
+### Metrics
+
+- CPU assertions: 5698 → **5726** (+24 `color_const.tcyr`, +3 `fold_namespace.tcyr`,
+  +1 `graphics.tcyr`). 19 → 21 suites.
+- `dist/mabda.cyr`: 28,655 → 28,643 lines, 1,370,476 → 1,370,812 bytes. `dist/mabda.deps`
+  is unchanged (12 leaves).
+- `distlib` still warns `sys_recvmsg (x86_64-windows)` from samvada's bundle, as at 4.1.7.
+
+### Next
+
+- cyrius 6.7.6 re-folds `lib/mabda.cyr` from this release's `dist/mabda.cyr`. Tag 4.2.0
+  before the cyrius release that carries the fold.
+- Roadmapped, each its own minor: S2 (about 1,570 integer constants as `const`), S3 (`bool`
+  predicates), S4 (if-expressions) and S7 (a `trait Backend` after cyrius's checked `dyn`).
+  Also roadmapped: M6 (retire `programs/benchmarks.cyr`'s clock windowing), M10 (samvada
+  `sys_recvmsg`) and M11 (cyrfmt's 1028 KB cap). See the roadmap backlog.
+
 ## [4.1.7] — 2026-10-06
 
 **cyrius 6.6.18, and `dist/` regenerated by its `distlib`.** The 6.6.18 `distlib` writes
@@ -1280,7 +1378,8 @@ latent defects in mabda's own test and bench suites — both silently wrong at t
   pre-`fn` preamble — measured at a constant −7 on `native.tcyr` (real 2158 → reported
   2151) and reproduced by re-breaking a call site. Grep the function name the error
   quotes; do not seek to the printed line.
-- **6.4.81 — CVE-32 through CVE-36**: 23 fixed `/tmp` literals in `cbt/` moved to a
+- **6.4.81 — CYRIUS-2026-0005 and CYRIUS-2026-0006** (cyrius's security ledger; the release's
+  three other ids were withdrawn as bugs): 23 fixed `/tmp` literals in `cbt/` moved to a
   per-invocation `/tmp/cyrius-<pid>` (mode 0700) that fails closed, and include-path /
   `READFILE` copies bounded. Concurrent-invocation collisions are gone, which retires a
   real race in mabda's per-file `cyrius test` loop and `scripts/soak.sh`.

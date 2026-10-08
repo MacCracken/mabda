@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.1.4** (2026-09-16). Module/assertion/bundle counts live in the
+> **v4.2.0** (2026-10-08). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -38,7 +38,12 @@ the samvada 1.0.1 / chitra 1.0.3 moves, a `test-native-all` FAIL-reason fix, per
 `make fuzz` logs, the `native_compute_spike` repair, and the native draw `PA_CL_VTE_CNTL`
 fix behind the flaky render/sampler gates; v4.1.4 (2026-09-16) closed the items that cut and its
 P(-1) audit left open — native AMD VA reclaim, NVIDIA job-error detection, the loader texture
-leak, shader-cache / depth-texture release, and the bench and launcher leftovers).
+leak, shader-cache / depth-texture release, and the bench and launcher leftovers; v4.1.5
+(2026-09-27) moved to cyrius 6.6.6 and made the bundle build for agnos; v4.1.6 (2026-09-30)
+renamed two names that collided with other cyrius folds; v4.1.7 (2026-10-06) moved to cyrius
+6.6.18 and its compile-verified `dist/mabda.deps`; v4.2.0 (2026-10-08) moved to cyrius 6.7.5,
+made the eleven `F64_*` colour constants f64 `const`s, and closed the 6.6.5 / 6.6.6 pin-move
+lists below, which it pruned).
 
 ## The Long Arc
 
@@ -64,7 +69,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.1.4  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.2.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
                         deprecation)
@@ -116,55 +121,7 @@ consumer accidentally couples to it.
 
 ---
 
-## Moving the cyrius pin to 6.6.5
-
-⛔ Before bumping the pin to 6.6.5: cross-reference the six deferral comments that turn the
-*Untracked deferrals* CI step red. 6.6.5's cyrlint folds case and reads a whole comment paragraph,
-so `--strict-deferrals` now sees prose the 6.6.4 cyrlint never matched.
-
-cyrius 6.6.5 is not tagged yet. Nothing below can land against the pin until it is, except items
-marked **(can land now)**. The pin is 6.6.4 today, and this section lists only what 6.6.5 itself
-changes.
-
-- [ ] ⛔ The *Untracked deferrals (cyrlint --strict-deferrals)* step (`.github/workflows/ci.yml:60`)
-      fails on six notes. Put a tracking pointer (CHANGELOG / issue / roadmap / `docs/` path / a
-      version such as `v4.2`) on a line the phrase itself touches, or mark prose that is not a
-      deferral `#skip-lint`. **(can land now)** — a same-line pointer or `#skip-lint` does not
-      depend on the toolchain.
-  - `src/debug.cyr:14` — "For now, provide no-op stubs".
-  - `src/gfx9_abi.cyr:101` — "Deferred out of 4.0.9" (history: the deferred API shipped in 4.1.0).
-  - `src/vertex.cyr:121` — "For now, provide attribute arrays".
-  - `src/wgpu_ffi.cyr:228` — "Deferred to the next launcher fn-table revision". Its
-    `docs/audit/2026-07-02-audit.md` pointer is on `:229`, which does not track `:228`.
-  - `programs/nvidia_compute_store.cyr:3` — "NOT YET GREEN".
-  - `tests/tcyr/native.tcyr:4278` — "Not yet wired into the render composer".
-
-  See the cyrius CHANGELOG [6.6.5] entry "cyrlint read every rule ONE PHYSICAL LINE at a time".
-- [ ] The same step can call `cyrius lint --strict-deferrals "$f"` instead of the pinned `cyrlint`
-      binary (`ci.yml:61-76`): the wrapper now forwards a flag in any position. See the CHANGELOG
-      [6.6.5] entry "The whole CLI took flags as file names, dropped flags written after the
-      operand, and dropped extra operands".
-- [ ] Cheat-sheet entries A3 (`:92`), A4 (`:110`), B3 (`:164`), C4 (`:240`), D3 (`:360`) and E3
-      (`:416`) in `docs/development/2026-04-30-toolchain-issues.md` go stale. Each is fixed in 6.6.5.
-- [ ] Retire the workarounds that 6.6.5 makes redundant. Neither script is wired into CI.
-  - The measured-clock windowing in `programs/benchmarks.cyr:113-138` (`_clock_jitter_ns`, `:153`):
-    `lib/bench.cyr` no longer subtracts a mean floor from a minimum (entry "`lib/bench.cyr`
-    subtracted a MEAN clock floor").
-  - `scripts/check-ffi-call-alignment.py` and the hoist-C-calls discipline: nested calls are
-    16-byte aligned (entry "rsp was 8 bytes off 16-byte alignment at every call emitted inside an
-    expression").
-  - `scripts/check-split-deferrals.py`: cyrlint joins a wrapped phrase itself (the cyrlint entry
-    above).
-- [ ] Close the four mirror issues in `docs/development/issues/` (bench floor, nested-call
-      alignment, deps tamper, lint wrapper), and the *Upstream cyrius issues* bullet under v4.1.x /
-      v4.2. The deps fix is the entry "`cyrius deps` refused an untouched dep cache as
-      "tampered"".
-- [ ] At the bump, re-run `cyrius deps` — the aarch64 syscall peer moved SYS_UNLINKAT 35 → 263, so
-      an un-re-vendored peer's sys_unlink would run nanosleep.
-
----
-
-## v4.1.x / v4.2 — what the v4.1.0 findings left open
+## v4.2.x / v4.3 — what the v4.1.0 findings left open
 
 Everything below is a **named** limit now rather than a silent one: each has an error code
 a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it.
@@ -189,12 +146,7 @@ a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it
   must pass with `NATIVE_KNOWN_FAIL` empty, plus one run of the linked example consumer. On chew,
   the five card-node / DRM-master NVIDIA gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
   surface-present-e2e) need a console session. See `issues/archived/2026-08-19-native-compute-spike-stale.md`.
-- **Upstream cyrius issues** (filed 2026-09-16 in `cyrius/docs/development/issues/`; mabda keeps
-  its records and workarounds): the cycc nested-call stack misalignment (Low, C interop only;
-  mabda hoists and gates with `scripts/check-ffi-call-alignment.py`), `lib/bench.cyr`'s
-  min-minus-mean timer floor, the `cyrius deps` tamper check on a stale index, `cyrius lint`
-  dropping `--strict-deferrals`, and cyrlint missing deferrals split across two lines. When a fix
-  ships, drop the matching mabda workaround.
+
 ---
 
 ## v3.x+ — Web Target (Blocked)
@@ -284,10 +236,6 @@ vendor-driven, not calendar-driven.
 
 ## Backlog (not yet scheduled)
 
-- **`_sk_info_cstr` lives in sakshi's `_sk_` namespace** (recorded by cyrius 6.6.12, 2026-10-02). No
-  collision today, but a sakshi helper of that name would silently replace mabda's (last definition wins);
-  rename it into mabda's own prefix.
-
 Unscheduled forward work — lands here first, graduates to a version once
 there's consumer demand plus a clear scope.
 
@@ -321,6 +269,34 @@ there's consumer demand plus a clear scope.
   subsystem — wgpu's safe API has no placed/aliased resources, and the native
   path has no rg-transient backing today. Its own future arc.
 
+### Recorded by the W2 stdlib wave (4.2.0, 2026-10-08)
+
+The cyrius 6.7.x features each change a public name's kind or type, so each is
+its own minor, not a patch. 4.2.0 took only the eleven colour constants (S1).
+
+- **S2: integer constants as `const`.** About 1,570 top-level `var NAME = <literal>`
+  constants (WebGPU / AMDGPU / NVIDIA enums, ioctl numbers, offsets) could be
+  `const`: folded like a literal, no storage, no init order. It needs a per-name
+  collision survey first: a `const` beside a same-name `var` is a compile error,
+  and cyrius folds mabda next to its own `lib/` and the other folded stdlibs.
+- **S3: `bool` predicates.** The `*_is_*` / `*_has_*` returns become `: bool`
+  (cyrius 6.7.3).
+- **S4: if-expressions where they read better** (cyrius 6.7.4). The W2 survey
+  flagged about 77 `var x = a; if (c) { x = b; }` and `if/else` assignment sites,
+  e.g. `src/asset_load.cyr`'s mip / layer / face-count clamps.
+- **S7: a `trait Backend`** for the hand-rolled `backend_get_slot` /
+  `BACKEND_SLOT_*` dispatch, once cyrius ships checked `dyn`.
+- **M6: retire the measured-clock windowing** in `programs/benchmarks.cyr`
+  (`_clock_jitter_ns`). It worked around `lib/bench.cyr`'s mean-floor minimum,
+  which cyrius 6.6.5 fixed. Needs a `make bench-gpu` run before and after.
+- **M10: samvada `sys_recvmsg` on Windows.** `cyrius distlib` warns that
+  `sys_recvmsg (x86_64-windows)` is still undefined. It comes from samvada's
+  bundle, which mabda calls only under `-D MABDA_LOGIND` (a Linux logind path).
+  To be filed in samvada once samvada's tree is clean (it was not at the survey).
+- **M11: `cyrius fmt --check dist/mabda.cyr` refuses the file** (>1028 KB,
+  cyrfmt's `_MAX_FILE`; the bundle is 1,370,812 B at 4.2.0). It is cyrius's cap to
+  raise, not a reason to split the bundle. CI fmt-checks the sources only.
+
 ---
 
 ## Architectural Decisions
@@ -334,57 +310,3 @@ there's consumer demand plus a clear scope.
 | [005](../adr/005-public-api-surface-marking.md) | Public API surface marking (`# @public` / `# @internal`) — the stability boundary that holds across backends |
 | [006](../adr/006-native-cyrius-gpu-backend.md) | Native Cyrius GPU backend via DRM/KMS — a second backend alongside ADR 004 (AMD v3.0, NVIDIA v4.0); wgpu deprecates/retires per-chipset (AMD **deprecated** at v4.0.1, NVIDIA retires at v5.0, Intel/full at v5.1) |
 | [007](../adr/007-nvidia-native-kernel-path.md) | NVIDIA native kernel path (nouveau DRM, SM75 SASS) — the per-vendor expansion of ADR 006 (shipped in v4.0) |
-
-## Moving the cyrius pin to 6.6.6
-
-**Current pin: `cyrius = "6.6.4"` (cyrius.cyml:8).** Nothing in mabda's own
-source has to change first — bump the pin.
-
-**Windows is a non-event here, checked not assumed.** README:187 says "Linux is
-the only OS the native backend targets"; a grep for `O_APPEND` / `O_TRUNC`
-across `src/`, `programs/` and `tests/` (excluding vendored `lib/`) returns
-nothing, so 6.6.6's PE append/truncate data-corruption fix does not reach any
-mabda code path.
-
-**What 6.6.6 actually touches in this repo:**
-
-- **`WGPU_COMPARE_LESS` is declared twice** — `src/sampler.cyr:35` and
-  `src/depth.cyr:76`, both `= 2`, and both are co-linked (`src/lib.cyr:157-158`,
-  `cyrius.cyml:62-63`). 6.6.6 makes "last definition wins" true from program
-  start and makes a same-name/**different type or size** redeclaration a compile
-  error. Both of these are plain i64 scalars with the identical value, so
-  **neither rule fires** — verified with a probe against 6.6.2/6.6.5/6.6.6, and
-  `cyrius build` under 6.6.6 emits no diagnostic for it. Still a real duplicate;
-  collapse it whenever `depth.cyr` is next touched.
-- **Everything else in the 6.6.6 tightening list is absent.** mabda declares one
-  struct (`vamap`) and uses it pointer-style; there are zero `: <StructName>`
-  parameter/variable annotations, zero struct-to-struct copies, zero `async`
-  fns, zero `operator` fns, zero top-level `{ }` blocks, and zero
-  `: cstring` parameters. The new compile errors have nothing to bite.
-- **`lib/regression.cyr` is not vendored here** and nothing calls a
-  `regression_*` helper, so the new exec deadline (`CYRIUS_CHECK_TIMEOUT`) is
-  irrelevant.
-- **`[deps] stdlib` already declares `vec`** and mabda defines no `vec_*` of its
-  own, so assert.cyr's new transitive `include "lib/vec.cyr"` cannot collide.
-
-**One thing that is NOT mabda's to fix.** `cyrius fmt --check dist/mabda.cyr`
-exits 1 — but not for formatting:
-
-```
-cyrfmt: file too large to format-check (>1028KB) — raise _MAX_FILE
-```
-
-`dist/mabda.cyr` is 1,368,705 B. Every one of mabda's own `src/*.cyr` passes
-`cyrius fmt --check` under 6.6.6; regenerating or reformatting the dist cannot
-clear this, because the cap is in cyrfmt. It is the only dist in the sibling
-slice over the cap. Per CLAUDE.md's "when a gate blocks a legitimate feature,
-fix the gate" — this belongs upstream in cyrius (`_MAX_FILE`), not here. Do not
-split `dist/mabda.cyr` to appease it.
-
-**Verify after bumping:** re-run `cyrius deps` so vendored `lib/` picks up
-6.6.6's `lib/io.cyr` (now self-sufficient — it includes `fmt`/`string` itself,
-which removes five `warning: undefined function` lines for any consumer that
-included it alone) and `lib/syscalls_windows.cyr`. Then `cyrius build`,
-`cyrius test`, `cyrius fmt --check` over `src/` only, and `cyrius distlib`.
-Measured here: `cyrius build` under 6.6.4 and under 6.6.6 both exit 0 with an
-identical (empty) warning set and a 1,288,696-byte smoke binary.

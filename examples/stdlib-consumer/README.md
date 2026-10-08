@@ -91,7 +91,7 @@ Notes on the steps:
   `no GPU available` to stderr and exits 1.
 
 `cyrius deps` reads `cyrius.cyml`, clones mabda at the tag pinned
-there (`4.1.7`) into the dep cache `$HOME/.cyrius/deps/mabda/4.1.7/`,
+there (`4.2.0`) into the dep cache `$HOME/.cyrius/deps/mabda/4.2.0/`,
 and copies its `dist/mabda.cyr` bundle into `lib/mabda.cyr` (a real
 file, not a symlink). The consumer then includes it with
 `include "lib/mabda.cyr"`.
@@ -119,7 +119,7 @@ its version explicitly:
 This example is the **`@public`-API-stability regression test across
 the wgpu → native transition**. The pure-Cyrius native backends have
 now landed (AMD in v3.0, NVIDIA in v4.0), and `src/main.cyr` still
-compiles against the v4.1.7 mabda tag. None of its code changes has
+compiles against the v4.2.0 mabda tag. None of its code changes has
 been a mabda API change:
 
 - **v4.1.1** moved to the cyrius 6.6.0 `Result` pair-bind
@@ -141,6 +141,10 @@ been a mabda API change:
   `thread_local` (only the C launcher does), so it left the sidecar and
   `cyrius deps` stopped vendoring it for consumers. A manifest change,
   not a public-API one.
+- **v4.2.0** made the eleven `F64_*` colour constants f64 `const`s and
+  `color_init()` a no-op. That is a public-API change in kind (a const
+  cannot be assigned or `&`-taken), but this example only reads them and
+  still calls `color_init()`, so `src/main.cyr` compiles unchanged.
 - **v4.1.3** also assembled the 269-byte WGSL source in pieces so no
   line exceeds the linter's 120-byte limit. The shader bytes are
   unchanged.
