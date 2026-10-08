@@ -2,7 +2,8 @@
 
 **Date filed:** 2026-04-30 (v3.0.0-rc.1 cut)
 **Toolchain at filing:** `cyrius 5.7.48` (mabda's pin at filing; bumped to `5.11.28` 2026-05-12 ahead of rc.3 soak)
-**Last re-checked against:** `cyrius 6.5.29` (mabda 4.0.10, 2026-08-19) — Class A now resolved upstream; see A1.
+**Last re-checked against:** `cyrius 6.7.5` (mabda 4.2.0, 2026-10-08) — A3, A4, B3, D3 and E3 were fixed upstream in
+cyrius 6.6.5 and re-checked on 6.7.5; C4 is relaxed. (Before: `cyrius 6.5.29`, mabda 4.0.10 — Class A resolved upstream; see A1.)
 **Audience:** mabda contributors + the cyrius toolchain team. Each
 entry is the smallest reproducible footprint we hit; cross-referenced
 to the deeper bug reports in `docs/development/issues/` and the
@@ -89,7 +90,11 @@ unconditionally, NOT silent on no-drift
   (0 = clean, non-zero = drift) with no stdout — the Makefile
   `fmt-check` target and CI both key off the exit code.
 
-### A3. `cyrius fmt` requires the file argument BEFORE `--check` (6.4.x, 6.5.x)
+### A3. `cyrius fmt` requires the file argument BEFORE `--check` (6.4.x, 6.5.x) — ✅ **RESOLVED upstream (6.6.5)**
+
+- **Resolved**: since cyrius 6.6.5 the CLI takes a flag in any position. On 6.7.5
+  `cyrius fmt --check <file>` and `cyrius fmt <file> --check` both exit 0 on a clean file
+  and 1 on a misformatted one (re-checked at mabda 4.2.0). The history below is kept.
 
 - **Symptom**: `cyrius fmt --check <file>` prints
   `Usage: cyrfmt --check <file.cyr>` and exits 1 — for **every**
@@ -107,7 +112,11 @@ unconditionally, NOT silent on no-drift
 - **Upstream**: arg parser treats argv[1] as the file
   unconditionally; the usage string is misleading. Polish bug.
 
-### A4. `cyrius lint` cannot pass `--strict-deferrals` (6.6.4)
+### A4. `cyrius lint` cannot pass `--strict-deferrals` (6.6.4) — ✅ **RESOLVED upstream (6.6.5)**
+
+- **Resolved**: on 6.7.5 `cyrius lint --strict-deferrals <f>` and `cyrius lint <f> --strict-deferrals`
+  both exit 2 on an untracked deferral. Since mabda 4.2.0 CI and `make lint-deferrals` call the
+  wrapper; the direct-cyrlint workaround below is retired.
 
 - **Issue file**: `docs/development/issues/archived/2026-09-16-cyrius-lint-drops-strict-deferrals.md`
 - **Symptom**: `cyrius lint --strict-deferrals <file>` prints cyrlint's usage and exits 1
@@ -120,7 +129,8 @@ unconditionally, NOT silent on no-drift
   `cyrlint --strict-deferrals "$f"` (exit 2 on an untracked deferral; flag before or after
   the path both work). Pin the binary as `$HOME/.cyrius/versions/<pin>/bin/cyrlint` when the
   active toolchain may differ from the pin.
-- **Upstream**: open (Low). Forward the flag through `cmd_lint` and reject unknown flags.
+- **Upstream**: fixed in 6.6.5 (CHANGELOG entry "The whole CLI took flags as file names, dropped
+  flags written after the operand, and dropped extra operands").
 
 ---
 
@@ -161,7 +171,11 @@ unconditionally, NOT silent on no-drift
 - **Now**: keep signatures small for readability, not for ABI safety.
 - **Canonical ref**: cyrius `docs/ffi/fncall-abi.md`.
 
-### B3. A call nested in an expression runs with rsp 8 bytes off 16-byte alignment (6.6.4)
+### B3. A call nested in an expression runs with rsp 8 bytes off 16-byte alignment (6.6.4) — ✅ **RESOLVED upstream (6.6.5)**
+
+- **Resolved**: cyrius 6.6.5 aligns every call emitted inside an expression. On 6.7.5 the alignment
+  script's own self-test found no misaligned fixture row, and mabda 4.2.0 deleted the script. The
+  hoisted call sites stay (harmless); the regression test in `compute.tcyr` stays.
 
 - **Issue file**: `docs/development/issues/archived/2026-09-16-cycc-nested-call-stack-alignment.md`
 - **Symptom**: SIGSEGV (#GP) inside a C library, often only on one driver. On NVK it was
@@ -183,8 +197,8 @@ unconditionally, NOT silent on no-drift
   `scripts/check-ffi-call-alignment.py`. It reads the compiled objects, checks itself against
   a C leaf at run time, and found 4 sites in `src/` for 4.1.3. Regression test:
   `tests/tcyr/compute.tcyr` `test_ping_pong_new_ffi_calls_stack_aligned`.
-- **Upstream**: to file in cyrius (High). aarch64 is unaffected (16-byte pushes). The PE
-  backend already force-aligns indirect calls (`ECALLPTR_PE`, v6.0.71) for the same reason.
+- **Upstream**: fixed in 6.6.5 (CHANGELOG entry "rsp was 8 bytes off 16-byte alignment at every
+  call emitted inside an expression"). aarch64 was never affected (16-byte pushes).
 
 ---
 
@@ -216,6 +230,10 @@ unconditionally, NOT silent on no-drift
   (full repro + bench).
 - **Upstream status**: slotted for `cyrius 5.7.32` per the
   language-agent review queue (2026-04-28).
+- **Since cyrius 6.7.2**: a top-level `const` has no storage and is found by a
+  pre-scan, so it has no init order at all. mabda's eleven f64 colour constants
+  became consts in 4.2.0 for the related reason that they were set at run time by
+  a `color_init()` nothing called.
 
 ### C3. `>>` on i64 is logical right shift, not arithmetic
 
@@ -247,6 +265,9 @@ unconditionally, NOT silent on no-drift
 - **Memory note**: `feedback_cyrius_lint_fmt_per_file`.
 - **Upstream**: deliberate split for the per-file cache work in
   5.7.x. Not a bug per se; just a workflow change worth knowing.
+- **Since 6.6.5** one call takes several files (`cyrius lint a.cyr b.cyr`,
+  `cyrius fmt a.cyr b.cyr --check`); a bare call with no file is still a usage
+  error (re-checked on 6.7.5).
 
 ### C5. `cyrlint` flags multi-line asserts as warnings
 
@@ -357,7 +378,11 @@ unconditionally, NOT silent on no-drift
   preventive.
 - **Upstream**: speculative / hard to repro. No issue file yet.
 
-### D3. `lib/bench.cyr` minima read low or 0; the floor is calibrated once (6.6.4)
+### D3. `lib/bench.cyr` minima read low or 0; the floor is calibrated once (6.6.4) — ✅ **RESOLVED upstream (6.6.5)**
+
+- **Resolved**: cyrius 6.6.5 rewrote the floor handling (CHANGELOG entry "`lib/bench.cyr` subtracted
+  a MEAN clock floor"). mabda's own workaround, the measured-clock windowing in
+  `programs/benchmarks.cyr`, is still in place; retiring it needs a GPU bench run (roadmap backlog).
 
 - **Issue file**: `docs/development/issues/archived/2026-09-16-stdlib-bench-min-minus-mean-floor.md`
 - **Symptom**: a bench row prints `min=0ns` (and `CSV:<row>,0`) while its average is hundreds of
@@ -375,7 +400,7 @@ unconditionally, NOT silent on no-drift
   invalid, never as fast. `tests/bcyr/mabda.bcyr` batches 100-10,000 ops per window, so its
   rows are good to a few percent: measured ≤ 3.4 % on `rg_plan_aliasing_stats_5` even with the
   inflated floor forced.
-- **Upstream**: to file in cyrius (Medium, benchmark consumers only).
+- **Upstream**: fixed in 6.6.5.
 
 ---
 
@@ -409,15 +434,20 @@ unconditionally, NOT silent on no-drift
   before `rm -rf lib && mkdir lib && cyrius deps`, then diff the new lock
   by hand (sort both files first, since pre-6.6.3 locks were written in
   readdir order). Record the file count and which files changed in the
-  CHANGELOG entry. For 4.1.3 (6.6.2 → 6.6.4): 43 → 43 files, 10 changed.
+  CHANGELOG entry. For 4.1.3 (6.6.2 → 6.6.4): 43 → 43 files, 10 changed. For
+  4.2.0 (6.6.18 → 6.7.5): 46 → 46 files, 21 changed.
 - **Upstream**: 6.6.4 guards the unchanged-pin case. The pin-bump
   case needs a human by design.
 
-### E3. `cyrius deps` calls an untouched dep cache "tampered" after a metadata-only change (6.6.4)
+### E3. `cyrius deps` calls an untouched dep cache "tampered" after a metadata-only change (6.6.4) — ✅ **RESOLVED upstream (6.6.5)**
+
+- **Resolved**: on 6.7.5 the filed reproduction passes: after a `touch` and after a `cp -a` of the
+  checkout `cyrius deps` exits 0, and a real content edit is still refused (re-checked at mabda 4.2.0).
 
 - **Issue file**: `docs/development/issues/archived/2026-09-16-cyrius-deps-tamper-check-stale-index.md`
 - **Symptom**: `error: cached checkout for dep '<name>' has local modifications ... refusing
-  tampered cache`, while the files are byte-identical to HEAD. The CVE-21 tamper check
+  tampered cache`, while the files are byte-identical to HEAD. The tamper check (added for the
+  release-integrity hardening item in cyrius's security ledger)
   (`_git_worktree_clean`, cyrius `cbt/deps.cyr:2828`) runs `git diff-index --quiet HEAD`
   without refreshing git's stat cache, so a `touch`, a `cp -a` of the cache, or git run
   under `unshare -rn` (the index gets rewritten with namespace uids) fails the check. The
@@ -429,8 +459,8 @@ unconditionally, NOT silent on no-drift
   a uid-mapped namespace against the shared `~/.cyrius`; for an offline resolve use
   `GIT_ALLOW_PROTOCOL=file` with a populated cache. Deleting the clone, which the error
   message suggests, needs the network.
-- **Upstream**: open (Low). Refresh before comparing (`update-index -q --refresh`, or
-  `git diff --quiet HEAD`); both still refuse a real content edit.
+- **Upstream**: fixed in 6.6.5 (CHANGELOG entry "`cyrius deps` refused an untouched dep cache as
+  "tampered"").
 
 ---
 
@@ -469,10 +499,8 @@ unconditionally, NOT silent on no-drift
   shim layer, which retires per-vendor (AMD at v4.0.1, NVIDIA at
   v5.0, Intel/full at v5.1 — see roadmap). The fncall ABI bugs
   themselves stay relevant until full removal for any other C-FFI
-  mabda might add. B3 (nested-call stack alignment) is a live
-  codegen bug that affects every C callee, including the samvada
-  dbus table, until cycc is fixed. Keep `scripts/check-ffi-call-alignment.py`
-  green.
+  mabda might add. B3 (nested-call stack alignment) was fixed in
+  cyrius 6.6.5; mabda 4.2.0 deleted its alignment script.
 - Class C is the "this is just how Cyrius is" bucket — these are
   language design decisions or intentional sharp edges. The doc
   serves as onboarding material rather than as a bug list.
