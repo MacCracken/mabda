@@ -1,4 +1,4 @@
-# Undersized stack arrays in CPU tests and a HW program: the old texture.tcyr "leading NUL" was one
+# Undersized stack arrays in CPU tests and a HW program: the old texture.tcyr "leading NUL" was one — RESOLVED
 
 **Status:** ✅ **RESOLVED in 4.1.3** (2026-09-16). All four sites are resized, and
 `scripts/check-stack-array-sizing.py` is a static gate for the class (`make

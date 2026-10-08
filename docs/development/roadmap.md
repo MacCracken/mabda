@@ -188,7 +188,7 @@ a consumer sees from `gpu_shader_error_name`, so nobody has to bisect to find it
   was used to test around that). After a fresh boot, with no GPU reset first: `make test-native-all`
   must pass with `NATIVE_KNOWN_FAIL` empty, plus one run of the linked example consumer. On chew,
   the five card-node / DRM-master NVIDIA gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
-  surface-present-e2e) need a console session. See `issues/2026-08-19-native-compute-spike-stale.md`.
+  surface-present-e2e) need a console session. See `issues/archived/2026-08-19-native-compute-spike-stale.md`.
 - **Upstream cyrius issues** (filed 2026-09-16 in `cyrius/docs/development/issues/`; mabda keeps
   its records and workarounds): the cycc nested-call stack misalignment (Low, C interop only;
   mabda hoists and gates with `scripts/check-ffi-call-alignment.py`), `lib/bench.cyr`'s

@@ -1,4 +1,4 @@
-# wgpu-native `v29.0.1.1` is a BREAKING change despite the patch-level version — do not bump blind
+# wgpu-native `v29.0.1.1` is a BREAKING change despite the patch-level version — do not bump blind — RESOLVED
 
 **Status:** ✅ **RESOLVED in v4.1.0** — bumped, with the two breakages handled. See
 "Resolution" at the end.

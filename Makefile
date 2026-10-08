@@ -1458,7 +1458,7 @@ NATIVE_NEEDS_MASTER = test-native-kms-modeset test-native-present-e2e
 # file; this list is not a place to park inconvenient red. It is empty when no
 # gate is in that state — keep the variable defined (the roll-up reads it).
 #   (test-native-compute-spike was listed here until 4.1.3; repaired, see
-#    docs/development/issues/2026-08-19-native-compute-spike-stale.md)
+#    docs/development/issues/archived/2026-08-19-native-compute-spike-stale.md)
 NATIVE_KNOWN_FAIL =
 
 # CI gate: syntax + semantic check every programs/*.cyr without needing

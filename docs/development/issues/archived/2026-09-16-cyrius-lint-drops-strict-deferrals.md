@@ -1,6 +1,6 @@
-# `cyrius lint` cannot pass `--strict-deferrals` to cyrlint: usage error or silently ignored
+# `cyrius lint` cannot pass `--strict-deferrals` to cyrlint: usage error or silently ignored — RESOLVED
 
-**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-lint-wrapper-drops-strict-deferrals.md`.
+**Status:** ✅ **RESOLVED upstream in cyrius 6.6.5** (2026-09-19, CHANGELOG entry "The whole CLI took flags as file names, dropped flags written after the operand, and dropped extra operands"). Re-checked on cyrius 6.7.5 at mabda 4.2.0: `cyrius lint --strict-deferrals <f>` and `cyrius lint <f> --strict-deferrals` both exit 2 on an untracked deferral and 0 on a clean file. 4.2.0's CI step and `make lint-deferrals` call the wrapper and no longer locate the cyrlint binary by path. Was: open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-lint-wrapper-drops-strict-deferrals.md`.
 **Discovered:** 2026-09-16, mabda 4.1.3 verification sweep (untracked-deferral audit)
 **Toolchain:** `cyrius 6.6.4`. The code is unchanged at cyrius `HEAD` (`4f3731e8`, `6.6.4-1`).
 **Component:** cli (`cyrius lint` dispatcher, `cbt/cyrius.cyr` + `cbt/commands.cyr`)

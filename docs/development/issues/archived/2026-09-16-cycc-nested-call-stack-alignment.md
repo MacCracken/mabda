@@ -1,6 +1,6 @@
-# cycc makes a call with rsp 8 bytes off 16-byte alignment when the call is nested in an expression
+# cycc makes a call with rsp 8 bytes off 16-byte alignment when the call is nested in an expression — RESOLVED
 
-**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-cycc-nested-call-stack-misalignment.md`.
+**Status:** ✅ **RESOLVED upstream in cyrius 6.6.5** (2026-09-19, CHANGELOG entry "rsp was 8 bytes off 16-byte alignment at every call emitted inside an expression"). Re-checked on cyrius 6.7.5 at mabda 4.2.0: `scripts/check-ffi-call-alignment.py`'s own self-test reported "no fixture row is misaligned; cycc may have fixed the bug upstream", and 4.2.0 deleted the script. The regression test `compute.tcyr` `test_ping_pong_new_ffi_calls_stack_aligned` stays. Was: open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-cycc-nested-call-stack-misalignment.md`.
 **Discovered:** 2026-09-16, mabda 4.1.3 verification. `programs/benchmarks.cyr` crashed inside
 NVK's `create_buffer` during the wgpu-programs fix. The shape was then characterized and traced
 to the codegen in the round-2 alignment sweep.

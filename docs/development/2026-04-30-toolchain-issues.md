@@ -109,7 +109,7 @@ unconditionally, NOT silent on no-drift
 
 ### A4. `cyrius lint` cannot pass `--strict-deferrals` (6.6.4)
 
-- **Issue file**: `docs/development/issues/2026-09-16-cyrius-lint-drops-strict-deferrals.md`
+- **Issue file**: `docs/development/issues/archived/2026-09-16-cyrius-lint-drops-strict-deferrals.md`
 - **Symptom**: `cyrius lint --strict-deferrals <file>` prints cyrlint's usage and exits 1
   for every file. `cyrius lint <file> --strict-deferrals` is worse: it **silently drops the
   flag** and exits 0 over untracked deferrals. The `lint` dispatcher knows only `--strict`,
@@ -163,7 +163,7 @@ unconditionally, NOT silent on no-drift
 
 ### B3. A call nested in an expression runs with rsp 8 bytes off 16-byte alignment (6.6.4)
 
-- **Issue file**: `docs/development/issues/2026-09-16-cycc-nested-call-stack-alignment.md`
+- **Issue file**: `docs/development/issues/archived/2026-09-16-cycc-nested-call-stack-alignment.md`
 - **Symptom**: SIGSEGV (#GP) inside a C library, often only on one driver. On NVK it was
   `movdqa -0x30(%rbp),%xmm0` in `libvulkan_nouveau.so`, reached from
   `store64(pp, wgpu_device_create_buffer(...))` in `ping_pong_new`. Pure Cyrius code never
@@ -359,7 +359,7 @@ unconditionally, NOT silent on no-drift
 
 ### D3. `lib/bench.cyr` minima read low or 0; the floor is calibrated once (6.6.4)
 
-- **Issue file**: `docs/development/issues/2026-09-16-stdlib-bench-min-minus-mean-floor.md`
+- **Issue file**: `docs/development/issues/archived/2026-09-16-stdlib-bench-min-minus-mean-floor.md`
 - **Symptom**: a bench row prints `min=0ns` (and `CSV:<row>,0`) while its average is hundreds of
   ns. That happened to `uniform_buffer_write` in `make bench-gpu` on the hpet dev box. Less
   often, every row of one run reads low, because that process calibrated its floor at a slow
@@ -415,7 +415,7 @@ unconditionally, NOT silent on no-drift
 
 ### E3. `cyrius deps` calls an untouched dep cache "tampered" after a metadata-only change (6.6.4)
 
-- **Issue file**: `docs/development/issues/2026-09-16-cyrius-deps-tamper-check-stale-index.md`
+- **Issue file**: `docs/development/issues/archived/2026-09-16-cyrius-deps-tamper-check-stale-index.md`
 - **Symptom**: `error: cached checkout for dep '<name>' has local modifications ... refusing
   tampered cache`, while the files are byte-identical to HEAD. The CVE-21 tamper check
   (`_git_worktree_clean`, cyrius `cbt/deps.cyr:2828`) runs `git diff-index --quiet HEAD`

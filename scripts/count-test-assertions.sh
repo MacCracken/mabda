@@ -23,7 +23,7 @@
 # array locals per-thread stack slots (cyrius CHANGELOG [6.3.15]), so the symptom
 # vanished: 0 NUL bytes on 6.6.0-6.6.4, and CYRIUS_STACK_ARRAYS=0 on 6.6.4 brings it
 # back. The overrun itself is still there (now a silent stack write) — see
-# docs/development/issues/2026-09-16-test-stack-array-overruns.md. The tr -d '\0'
+# docs/development/issues/archived/2026-09-16-test-stack-array-overruns.md. The tr -d '\0'
 # strip below stays as a defence.
 set -euo pipefail
 

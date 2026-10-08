@@ -1,6 +1,6 @@
-# `cyrius deps` refuses an untouched dep cache as "tampered" after a metadata-only change
+# `cyrius deps` refuses an untouched dep cache as "tampered" after a metadata-only change — RESOLVED
 
-**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-deps-tamper-check-stale-index.md`.
+**Status:** ✅ **RESOLVED upstream in cyrius 6.6.5** (2026-09-19, CHANGELOG entry "`cyrius deps` refused an untouched dep cache as "tampered""). Re-checked on cyrius 6.7.5 at mabda 4.2.0 with the reproduction below: after the `touch` and after a `cp -a` of the checkout `cyrius deps` exits 0, and a real content edit is still refused (exit 1). Was: open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-deps-tamper-check-stale-index.md`.
 **Discovered:** 2026-09-16, mabda 4.1.3 hardware-verification sweep (example-consumer build)
 **Toolchain:** `cyrius 6.6.4`. The code is unchanged at cyrius `HEAD` (`4f3731e8`, `6.6.4-1`).
 **Component:** cli (`cyrius deps`, `cbt/deps.cyr`)
@@ -11,7 +11,7 @@ that resolves the same dep + tag.
 ## Summary
 
 For a tagged git dep, `cyrius deps` checks the cached checkout in
-`$CYRIUS_HOME/deps/<name>/<tag>/` against HEAD (the CVE-21 pin, cyrius v6.2.30). One of its
+`$CYRIUS_HOME/deps/<name>/<tag>/` against HEAD (the commit pin from cyrius v6.2.30, added for the release-integrity hardening item). One of its
 three checks is `_git_worktree_clean` (`cbt/deps.cyr:2828`, called at `:2017`). It runs:
 
 ```

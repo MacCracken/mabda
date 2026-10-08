@@ -5,7 +5,7 @@
 # renumbers the whole WGPUSType_* block (PipelineLayoutExtras deleted, everything
 # after it shifts down one) and DELETES WGPUNativeFeature_SpirvShaderPassthrough.
 # webgpu.h itself is purely additive, so no wgpu_descriptors.cyr offset moves.
-# See docs/development/issues/2026-08-19-wgpu-native-29011-breaking.md before any
+# See docs/development/issues/archived/2026-08-19-wgpu-native-29011-breaking.md before any
 # future bump — and diff BOTH headers, not just webgpu.h.
 #
 # Unpacks into wgpu-native/ NEXT TO THIS SCRIPT, whatever the caller's working

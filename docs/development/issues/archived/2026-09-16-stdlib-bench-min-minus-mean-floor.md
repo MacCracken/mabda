@@ -1,6 +1,6 @@
-# `lib/bench.cyr` subtracts a mean timer floor from every window, reports the minimum, and calibrates the floor only once
+# `lib/bench.cyr` subtracts a mean timer floor from every window, reports the minimum, and calibrates the floor only once — RESOLVED
 
-**Status:** open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-lib-bench-min-minus-mean-floor.md`. mabda works around it in `programs/benchmarks.cyr` (4.1.3). `tests/bcyr/mabda.bcyr` is only
+**Status:** ✅ **RESOLVED upstream in cyrius 6.6.5** (2026-09-19, CHANGELOG entry "`lib/bench.cyr` subtracted a MEAN clock floor"). Archived at mabda 4.2.0. mabda's own workaround, the measured-clock windowing in `programs/benchmarks.cyr`, is still in place; retiring it needs a GPU bench run and is on the roadmap backlog. Was: open upstream. Filed in the cyrius repo as `cyrius/docs/development/issues/2026-09-16-mabda-lib-bench-min-minus-mean-floor.md`. mabda works around it in `programs/benchmarks.cyr` (4.1.3). `tests/bcyr/mabda.bcyr` is only
 marginally affected; see "Impact on mabda".
 **Discovered:** 2026-09-16, mabda 4.1.3 verification. `make bench-gpu` on the Cezanne dev box
 (hpet clocksource, floor 1.274 µs) printed `uniform_buffer_write: 2.825us avg (min=0ns ...)`

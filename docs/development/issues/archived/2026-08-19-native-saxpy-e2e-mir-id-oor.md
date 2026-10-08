@@ -1,4 +1,4 @@
-# `native_spirv_saxpy_e2e` has been red since at least 4.0.5 — `gfx9_compile` returns `MIR_ERR_ID_OOR`
+# `native_spirv_saxpy_e2e` has been red since at least 4.0.5 — `gfx9_compile` returns `MIR_ERR_ID_OOR` — RESOLVED
 
 **Status:** ✅ **FIXED in v4.1.0** — root-caused, repaired, HW-verified, and defended by
 both a runtime self-check and a static CI gate. See "Resolution" at the end.

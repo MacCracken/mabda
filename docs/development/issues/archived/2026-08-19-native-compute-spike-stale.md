@@ -1,10 +1,10 @@
-# `native_compute_spike`: two defects since its first commit, and a marker that could not see a hang
+# `native_compute_spike`: two defects since its first commit, and a marker that could not see a hang — RESOLVED
 
 *Filed as: "`native_compute_spike` is bit-rotted and superseded — retire it or repair it".
 That title was the filing's hypothesis, and it was wrong. See
 [What the filing got wrong](#what-the-filing-got-wrong).*
 
-**Status:** ✅ **RESOLVED in 4.1.3** (2026-09-16). The spike is repaired and is no longer in
+**Status:** ✅ **RESOLVED in 4.1.3** (2026-09-16). Archived at 4.2.0; the clean-boot confirmation run described below stays open on the roadmap ("Clean-boot native HW closeout"). The spike is repaired and is no longer in
 the Makefile's `NATIVE_KNOWN_FAIL`, so `make test-native-all` runs it like any other gate.
 ⚠ **Caveat:** every run of the repaired spike happened *after* that day's two MODE2 GPU
 resets (12:26:32 and 12:32:19, both caused by reproducing defect 1 below). Those resets

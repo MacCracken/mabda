@@ -9,7 +9,7 @@ after it. Nothing fails at compile time, the tests usually still pass, and the
 damage depends on the stack layout of the toolchain in use.
 
 ⛔ Not hypothetical. mabda shipped four of these
-(docs/development/issues/2026-09-16-test-stack-array-overruns.md):
+(docs/development/issues/archived/2026-09-16-test-stack-array-overruns.md):
 
     tests/tcyr/texture.tcyr               var be[256]   <- memset(BACKEND_SIZE = 328) via _t5_wire
     tests/tcyr/queue.tcyr (9 tests)       var be[248]   <- memset(BACKEND_SIZE = 328)

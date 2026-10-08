@@ -137,7 +137,7 @@ that. History: `texture.tcyr`'s summary used to start with a NUL byte
 that made grep drop it. The NUL came from a stack-array overrun
 (`var be[256]` filled with 328 bytes). It disappeared when cyrius
 6.3.15 moved array locals onto the stack; the overrun was fixed in 4.1.3
-(`docs/development/issues/2026-09-16-test-stack-array-overruns.md`).
+(`docs/development/issues/archived/2026-09-16-test-stack-array-overruns.md`).
 
 ## FFI Architecture
 

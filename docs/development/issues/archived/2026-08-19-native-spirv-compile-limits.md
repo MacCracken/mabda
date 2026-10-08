@@ -1,4 +1,4 @@
-# Native SPIR-V→GFX9 rejects several constructs silently, and gives up well under its own id cap
+# Native SPIR-V→GFX9 rejects several constructs silently, and gives up well under its own id cap — RESOLVED
 
 **Status:** ✅ **RESOLVED in v4.1.0** — every item below is fixed and HW-verified on
 Cezanne. See "Resolution" at the end for what shipped, what the filing got wrong, and the
