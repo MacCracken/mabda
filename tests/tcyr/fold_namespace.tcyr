@@ -1,0 +1,59 @@
+# tests/tcyr/fold_namespace.tcyr — mabda's private helpers stay out of sakshi's
+# `_sk_` namespace (4.2.0).
+#
+# cyrius has one global namespace, and it folds mabda and sakshi into the same
+# stdlib, so both can be in scope. A function defined twice compiles with a
+# "duplicate fn (last definition wins)" warning, and every caller then reaches
+# the last definition. Until 4.2.0 mabda's gated log helper was `_sk_info_cstr`,
+# a name in sakshi's prefix: a sakshi helper of that name would have taken over
+# mabda's context logs (or mabda's would have taken over sakshi's). 4.1.6 renamed
+# `_sk_emit_err` for the same reason (vani); 4.2.0 renames the info helper
+# `_mabda_sk_info_cstr`.
+#
+# The stand-in below plays that sakshi-side helper. Against 4.1.7 it replaces
+# mabda's: gpu_context_release then logs through the stand-in, sakshi records
+# nothing, and both value rows fail.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+var _standin_calls = 0;
+
+# A `_sk_`-prefixed helper as sakshi might one day define it. It must never be
+# what mabda calls.
+fn _sk_info_cstr(msg): i64 {
+    _standin_calls = _standin_calls + 1;
+    return 0;
+}
+
+var _release_calls = 0;
+fn _count_release(ctx): i64 {
+    _release_calls = _release_calls + 1;
+    return 0;
+}
+
+fn test_context_log_goes_through_mabdas_helper() {
+    sakshi_output_buffer();
+    sakshi_set_level(SK_TRACE);
+    sakshi_ring_clear();
+    mabda_observability_enable();
+
+    var b = backend_new();
+    backend_set_slot(b, BACKEND_SLOT_CTX_RELEASE, &_count_release);
+    var ctx = alloc(112);
+    memset(ctx, 0, 112);
+    store64(ctx + 32, b);
+
+    var before = sakshi_ring_event_count();
+    gpu_context_release(ctx);
+    assert_eq(_release_calls, 1, "the release slot ran");
+    assert_eq(sakshi_ring_event_count(), before + 1, "mabda's 'context released' line reached sakshi");
+    assert_eq(_standin_calls, 0, "a same-name _sk_ helper is never called by mabda");
+    mabda_observability_disable();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_context_log_goes_through_mabdas_helper();
+    return assert_summary();
+}
