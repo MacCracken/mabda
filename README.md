@@ -52,7 +52,6 @@ include "lib/sakshi.cyr"   # structured logging
 include "lib/mabda.cyr"    # mabda itself — MUST come last
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
-    color_init();
     wgpu_ffi_init_table(fn_table_ptr);
 
     # Create GPU context (via C launcher pre-init).

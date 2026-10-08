@@ -123,7 +123,6 @@ include "lib/thread_local.cyr"   # the C launcher calls thread_local_use_foreign
 include "lib/mabda.cyr"
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
-    color_init();
     wgpu_ffi_init_table(fn_table_ptr);       # [transitional]
     var res_tag, res = gpu_context_from_preinit(preinit_ptr);
     # ... use gpu_ctx_device, texture_from_rgba, compute_dispatch, etc.

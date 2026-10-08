@@ -55,7 +55,6 @@ include "lib/mabda.cyr"
 
 fn mabda_main(fn_table_ptr, preinit_ptr) {
     # _cyrius_init() + alloc_init() already ran inside the launcher
-    color_init();
     wgpu_ffi_init_table(fn_table_ptr);   # wgpu path only — wires the fn-table
     # ... your GPU code ...
     return 0;
@@ -157,11 +156,13 @@ var attrs = vertex2d_attributes();
 ## Colors
 
 ```cyrius
-color_init();  # Must call once before using color functions
+# F64_0 / F64_1 / F64_255 / MABDA_F64_HALF / MABDA_F64_TWO and the luminance and
+# cornflower components are f64 consts (4.2.0): no init call is needed.
+# color_init() still exists and does nothing.
 
 var red = COLOR_RED();
-var custom = color_new(F64_HALF, F64_0, F64_1, F64_1);
-var blended = color_lerp(COLOR_BLACK(), COLOR_WHITE(), F64_HALF);
+var custom = color_new(MABDA_F64_HALF, F64_0, F64_1, F64_1);
+var blended = color_lerp(COLOR_BLACK(), COLOR_WHITE(), MABDA_F64_HALF);
 var lum = color_luminance(custom);
 
 # Write as f32 for GPU buffers (16 bytes)

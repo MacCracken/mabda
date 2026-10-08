@@ -1,0 +1,73 @@
+# tests/tcyr/color_const.tcyr — the eleven f64 colour constants hold their values
+# with NO color_init() call (4.2.0).
+#
+# Until 4.2.0 F64_0 / F64_1 / F64_255 / MABDA_F64_HALF / MABDA_F64_TWO and the
+# luminance and cornflower-blue components were `var`s that read 0 until
+# color_init() set them at run time. Nothing in src/ calls color_init(), yet
+# texture_from_color, the profiler and instance_data_identity read them, so a
+# consumer that skipped the call got zeros: an identity instance matrix of all
+# zeros, a white of (0, 0, 0, 0). 4.2.0 makes them f64 `const`s.
+#
+# This file must NEVER call color_init() (except in the one row that checks it is
+# now a no-op, which runs last). Against the 4.1.7 color.cyr every value row fails.
+# Each constant is checked against the exact bits color_init() used to compute,
+# so the literals in color.cyr cannot drift from the old values by an ulp.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn test_constant_bits() {
+    assert_eq(F64_0, 0, "F64_0 = +0.0");
+    assert_eq(F64_1, 0x3FF0000000000000, "F64_1 = 1.0");
+    assert_eq(F64_1, f64_from(1), "F64_1 = f64_from(1)");
+    assert_eq(F64_255, f64_from(255), "F64_255 = f64_from(255)");
+    assert_eq(MABDA_F64_HALF, f64_div(f64_from(1), f64_from(2)), "MABDA_F64_HALF = 1/2");
+    assert_eq(MABDA_F64_TWO, f64_from(2), "MABDA_F64_TWO = f64_from(2)");
+    assert_eq(F64_LUM_R, f64_div(f64_from(2126), f64_from(10000)), "F64_LUM_R = 2126/10000");
+    assert_eq(F64_LUM_G, f64_div(f64_from(7152), f64_from(10000)), "F64_LUM_G = 7152/10000");
+    assert_eq(F64_LUM_B, f64_div(f64_from(722), f64_from(10000)), "F64_LUM_B = 722/10000");
+    assert_eq(F64_CB_R, f64_div(f64_from(392), f64_from(1000)), "F64_CB_R = 392/1000");
+    assert_eq(F64_CB_G, f64_div(f64_from(584), f64_from(1000)), "F64_CB_G = 584/1000");
+    assert_eq(F64_CB_B, f64_div(f64_from(929), f64_from(1000)), "F64_CB_B = 929/1000");
+    return 0;
+}
+
+# The src/ readers the zeros reached.
+fn test_readers_without_init() {
+    # instancing.cyr: the identity matrix's diagonal and the white tint are f32 1.0.
+    var inst[80];
+    instance_data_identity(&inst);
+    assert_eq(load32(&inst), 0x3F800000, "instance model[0] = 1.0f");
+    assert_eq(load32(&inst + 60), 0x3F800000, "instance model[15] = 1.0f");
+    assert_eq(load32(&inst + 76), 0x3F800000, "instance tint a = 1.0f");
+
+    # color.cyr: COLOR_WHITE is (1, 1, 1, 1).
+    var w = COLOR_WHITE();
+    assert_eq(color_r(w), 0x3FF0000000000000, "white r = 1.0");
+    assert_eq(color_a(w), 0x3FF0000000000000, "white a = 1.0");
+
+    # texture.cyr: texture_from_color clamps to [0, 1] and scales by F64_255.
+    assert_eq(_clamp_unit(f64_from(2)), 0x3FF0000000000000, "_clamp_unit(2.0) = 1.0");
+    assert_eq(f64_to(f64_mul(_clamp_unit(f64_from(2)), F64_255)), 255, "clamped 2.0 scales to 255");
+
+    # profiler.cyr: an alpha over 1.0 clamps to F64_1.
+    var p = profiler_with_alpha_and_history(f64_from(5), 4);
+    assert_eq(load64(p + 48), 0x3FF0000000000000, "profiler alpha 5.0 clamps to 1.0");
+    return 0;
+}
+
+# color_init() is kept so existing callers compile; it no longer changes anything.
+fn test_color_init_is_a_no_op() {
+    assert_eq(color_init(), 0, "color_init returns 0");
+    assert_eq(color_init(), 0, "and again");
+    assert_eq(F64_1, 0x3FF0000000000000, "F64_1 unchanged after color_init");
+    assert_eq(F64_LUM_R, f64_div(f64_from(2126), f64_from(10000)), "F64_LUM_R unchanged");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_constant_bits();
+    test_readers_without_init();
+    test_color_init_is_a_no_op();
+    return assert_summary();
+}
