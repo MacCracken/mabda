@@ -263,6 +263,11 @@ there's consumer demand plus a clear scope.
   coordinated `deps/wgpu_main.c` launcher change (adding slots forces every
   consumer to rebuild). The 3.4.3 per-node scope wrapping makes them visible in
   profilers once wired.
+- **GPU texture compression — BC1–BC7 / ASTC encode** (filed 2026-10-13 from sankoch; the user placed
+  it in mabda, not sankoch). A CPU reference block encoder for the first format a consumer names,
+  validated against an independent decoder and mabda's own upload-and-sample path, with a PSNR bar.
+  sankoch's zstd / zlib already unlock KTX2 supercompression schemes 2 and 3 in `_ktx2_parse`.
+  Details: `docs/development/issues/2026-10-13-gpu-texture-compression-encoder.md`.
 - **Fully-transparent aliasing backing reuse.** Actually sharing one GPU
   allocation across disjoint-lifetime render-graph transients (rather than the
   consumer applying the planner's offsets) needs a native transient-allocation
