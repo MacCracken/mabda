@@ -1,0 +1,414 @@
+# @public — what a renderer draws into (v4.3.1, the render tier's MB2 + MB3)
+# gpu_target.cyr — render targets of any render format (depth, sRGB, BGRA,
+# RGBA16F; multisampled), the render pass descriptor (several colour targets, a
+# depth attachment, load / clear / store, resolve), texture views (one cube face
+# or mip level as an attachment), texture-to-texture copies and readback.
+#
+#   var hdr   = gpu_render_target_create(ctx, w, h, MABDA_TEXFMT_RGBA16F, 4);
+#   var depth = gpu_render_target_create(ctx, w, h, MABDA_TEXFMT_DEPTH32F, 4);
+#   var pd = gpu_pass_desc_new();                     # once; reused every frame
+#   gpu_pass_desc_color(pd, hdr, GPU_LOAD_CLEAR, &clear);
+#   gpu_pass_desc_depth(pd, depth, GPU_LOAD_CLEAR, F64_1);
+#   var pass = gpu_render_pass_begin_desc(ctx, pd);
+#   ... the draw-time calls of src/gpu_draw.cyr ...
+#   gpu_render_pass_end(ctx, pass);                   # resolves hdr's samples
+#
+# A shadow pass is a descriptor with a depth attachment and no colour one; a
+# depth target binds afterwards as a texture_depth_2d (gpu_bg_texture) for a
+# comparison sampler. A target, a texture and a view are all "texture objects":
+# each can be bound in a bind group, attached (a target or a view), copied and
+# read back.
+#
+# Each call returns 0 / a handle, or a GPU_ERR_* / 0 with the reason in
+# gpu_last_error_message(). What only the GPU API can check (attachments of
+# different sizes, a view range past the texture) fails at the create or, for a
+# pass, when it ends: gpu_render_pass_end returns GPU_ERR_VALIDATION and the frame
+# is dropped.
+#
+# Backends: wgpu serves all of it. The native AMD and NVIDIA backends serve what
+# their render path draws: a single-sample RGBA8 target, a descriptor with that
+# one colour attachment cleared and no depth, and its readback. Anything else
+# there is GPU_ERR_NOT_IMPLEMENTED with the reason (roadmap: the native render  #skip-lint
+# tier, soorat's ledger L7).
+
+# ================================================================
+# Load / store operations (WebGPU's numbers)
+# ================================================================
+var GPU_LOAD_LOAD     = 1;   # keep what the attachment holds
+var GPU_LOAD_CLEAR    = 2;   # clear it to the descriptor's value first
+var GPU_STORE_STORE   = 1;   # keep what the pass rendered
+var GPU_STORE_DISCARD = 2;   # drop it (a multisampled target after its resolve)
+
+# Colour attachments per pass (WebGPU's maxColorAttachments default).
+var GPU_PASS_MAX_COLORS = 8;
+
+# ================================================================
+# Render targets
+# ================================================================
+
+fn _gpu_target_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+fn _gpu_target_slot(ctx, off): i64 {
+    if (ctx == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    return backend_get_slot(b, off);
+}
+
+# A `width` x `height` render target of `fmt` with `samples` samples (1, or 4 for
+# MSAA). `fmt` is a colour format (MABDA_TEXFMT_RGBA8, _RGBA8_SRGB, _BGRA8,
+# _BGRA8_SRGB, _RGBA16F) or MABDA_TEXFMT_DEPTH32F. A multisampled colour target
+# resolves at the end of every pass that renders into it; binding, copying or
+# reading it uses the resolved image. Release with gpu_render_target_release.
+# Returns the target, or 0 (reason in gpu_last_error_message()).
+fn gpu_render_target_create(ctx, width, height, fmt, samples): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "render target: width must be positive"); return 0; }
+    if (height <= 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "render target: height must be positive"); return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        _gpu_target_fail(GPU_ERR_TEXTURE, "render target: a dimension is past 8192");
+        return 0;
+    }
+    if (mabda_texfmt_is_depth(fmt) == 0) {
+        if (mabda_texfmt_is_color_target(fmt) == 0) {
+            _gpu_target_fail(GPU_ERR_FORMAT_UNSUPPORTED, "render target: not a colour or depth render format");
+            return 0;
+        }
+    }
+    if (samples != 1) {
+        if (samples != 4) {
+            _gpu_target_fail(GPU_ERR_TEXTURE, "render target: samples must be 1 or 4");
+            return 0;
+        }
+    }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_RENDER_TARGET_CREATE);
+    if (slot == 0) {
+        _gpu_target_fail(GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+          "render target: this backend has no render target create");
+        return 0;
+    }
+    return fncall5(slot, ctx, width, height, fmt, samples);
+}
+
+# Read a single-sample (or a resolved multisampled colour) target back: `n` is
+# width x height x bytes per texel (4; 8 for RGBA16F; a depth target reads f32
+# depths). Waits for the GPU. Returns 0 or a GPU_ERR_*.
+fn gpu_render_target_read(ctx, rt, dst, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (rt == 0) { return GPU_ERR_TEXTURE; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0) { return GPU_ERR_BUFFER; }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_RENDER_TARGET_READ);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    return fncall4(slot, ctx, rt, dst, n);
+}
+
+# ================================================================
+# Render pass descriptor
+# ================================================================
+# GPU_PASS_DESC_SIZE (576) bytes, built on the CPU and reusable across frames:
+#   +0:  colour attachment count     +8:  depth target (0 = none)
+#   +16: depth load op               +24: depth store op
+#   +32: depth clear value (f64)     +40: depth read-only (0 / 1)
+#   +48: label (cstr or 0)           +56: reserved
+#   +64: 8 x colour attachment, GPU_PASS_COLOR_SIZE (64) bytes each:
+#        +0 target   +8 load op   +16 store op   +24 resolve target (0 = the
+#        target's own, for a multisampled target)   +32 clear r, g, b, a (f64)
+var GPU_PASS_OFF_COLORS = 64;
+var GPU_PASS_COLOR_SIZE = 64;
+var GPU_PASS_DESC_SIZE  = 576;
+
+fn _gpu_pass_fail(msg): i64 {
+    _gpu_err_record(GPU_ERR_OTHER, msg, 1);
+    return GPU_ERR_OTHER;
+}
+
+fn _gpu_pass_load_ok(op): i64 {
+    if (op == GPU_LOAD_LOAD) { return 1; }
+    if (op == GPU_LOAD_CLEAR) { return 1; }
+    return 0;
+}
+
+fn _gpu_pass_store_ok(op): i64 {
+    if (op == GPU_STORE_STORE) { return 1; }
+    if (op == GPU_STORE_DISCARD) { return 1; }
+    return 0;
+}
+
+# An empty descriptor. 0 on allocation failure.
+fn gpu_pass_desc_new(): i64 {
+    var pd = alloc(GPU_PASS_DESC_SIZE);
+    if (pd == 0) { return 0; }
+    memset(pd, 0, GPU_PASS_DESC_SIZE);
+    return pd;
+}
+
+# Remove every attachment and the label (to rebuild a descriptor in place). Only
+# the 64-byte header is cleared: an attachment is written whole when it is added,
+# and nothing reads one past the count.
+fn gpu_pass_desc_reset(pd): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    for (var i = 0; i < 8; i = i + 1) { store64(pd + i * 8, 0); }
+    return 0;
+}
+
+fn gpu_pass_desc_color_count(pd): i64 {
+    if (pd == 0) { return 0; }
+    return load64(pd);
+}
+
+fn _gpu_pass_color(pd, index): i64 {
+    return pd + GPU_PASS_OFF_COLORS + index * GPU_PASS_COLOR_SIZE;
+}
+
+fn _gpu_pass_color_index_ok(pd, index): i64 {
+    if (pd == 0) { return 0; }
+    if (index < 0) { return 0; }
+    if (index >= load64(pd)) { return 0; }
+    return 1;
+}
+
+# Add colour attachment `target` (a render target or a view): attachments are
+# numbered 0, 1, ... in the order added, the @location(n) the fragment shader
+# writes. `load_op` GPU_LOAD_CLEAR clears it to `clear` (a mabda Color, copied
+# now) first; GPU_LOAD_LOAD keeps it (`clear` may be 0). Stored by default.
+fn gpu_pass_desc_color(pd, target, load_op, clear): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    if (target == 0) { return _gpu_pass_fail("pass desc: null colour target"); }
+    if (_gpu_pass_load_ok(load_op) == 0) {
+        return _gpu_pass_fail("pass desc: load op must be GPU_LOAD_LOAD or GPU_LOAD_CLEAR");
+    }
+    if (load_op == GPU_LOAD_CLEAR) {
+        if (clear == 0) { return _gpu_pass_fail("pass desc: GPU_LOAD_CLEAR needs a clear colour"); }
+    }
+    var n = load64(pd);
+    if (n >= GPU_PASS_MAX_COLORS) { return _gpu_pass_fail("pass desc: more than 8 colour attachments"); }
+    var c = _gpu_pass_color(pd, n);
+    store64(c, target);
+    store64(c + 8, load_op);
+    store64(c + 16, GPU_STORE_STORE);
+    store64(c + 24, 0);
+    if (clear != 0) {
+        store64(c + 32, load64(clear));
+        store64(c + 40, load64(clear + 8));
+        store64(c + 48, load64(clear + 16));
+        store64(c + 56, load64(clear + 24));
+    } else {
+        store64(c + 32, 0);
+        store64(c + 40, 0);
+        store64(c + 48, 0);
+        store64(c + 56, 0);
+    }
+    store64(pd, n + 1);
+    return 0;
+}
+
+# Change attachment `index`'s clear colour (per frame, without rebuilding).
+fn gpu_pass_desc_color_clear(pd, index, clear): i64 {
+    if (_gpu_pass_color_index_ok(pd, index) == 0) { return _gpu_pass_fail("pass desc: no such colour attachment"); }
+    if (clear == 0) { return _gpu_pass_fail("pass desc: null clear colour"); }
+    var c = _gpu_pass_color(pd, index);
+    store64(c + 32, load64(clear));
+    store64(c + 40, load64(clear + 8));
+    store64(c + 48, load64(clear + 16));
+    store64(c + 56, load64(clear + 24));
+    return 0;
+}
+
+# GPU_STORE_STORE (the default) or GPU_STORE_DISCARD for attachment `index`.
+fn gpu_pass_desc_color_store(pd, index, store_op): i64 {
+    if (_gpu_pass_color_index_ok(pd, index) == 0) { return _gpu_pass_fail("pass desc: no such colour attachment"); }
+    if (_gpu_pass_store_ok(store_op) == 0) {
+        return _gpu_pass_fail("pass desc: store op must be GPU_STORE_STORE or GPU_STORE_DISCARD");
+    }
+    store64(_gpu_pass_color(pd, index) + 16, store_op);
+    return 0;
+}
+
+# Resolve multisampled attachment `index` into `target` (a single-sample target
+# or view of the same format and size: a surface frame, say) instead of the
+# attachment's own resolve texture.
+fn gpu_pass_desc_color_resolve(pd, index, target): i64 {
+    if (_gpu_pass_color_index_ok(pd, index) == 0) { return _gpu_pass_fail("pass desc: no such colour attachment"); }
+    if (target == 0) { return _gpu_pass_fail("pass desc: null resolve target"); }
+    store64(_gpu_pass_color(pd, index) + 24, target);
+    return 0;
+}
+
+# The depth attachment: `target` is a MABDA_TEXFMT_DEPTH32F target (or a view of
+# a depth texture). GPU_LOAD_CLEAR clears to `clear_depth` (an f64 in [0, 1];
+# 1.0 for a GPU_COMPARE_LESS test); GPU_LOAD_LOAD keeps it. Stored by default.
+fn gpu_pass_desc_depth(pd, target, load_op, clear_depth): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    if (target == 0) { return _gpu_pass_fail("pass desc: null depth target"); }
+    if (_gpu_pass_load_ok(load_op) == 0) {
+        return _gpu_pass_fail("pass desc: load op must be GPU_LOAD_LOAD or GPU_LOAD_CLEAR");
+    }
+    if (f64_lt(clear_depth, F64_0) == 1) { return _gpu_pass_fail("pass desc: clear depth below 0"); }
+    if (f64_gt(clear_depth, F64_1) == 1) { return _gpu_pass_fail("pass desc: clear depth above 1"); }
+    store64(pd + 8, target);
+    store64(pd + 16, load_op);
+    store64(pd + 24, GPU_STORE_STORE);
+    store64(pd + 32, clear_depth);
+    store64(pd + 40, 0);
+    return 0;
+}
+
+fn gpu_pass_desc_depth_store(pd, store_op): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    if (load64(pd + 8) == 0) { return _gpu_pass_fail("pass desc: no depth attachment"); }
+    if (_gpu_pass_store_ok(store_op) == 0) {
+        return _gpu_pass_fail("pass desc: store op must be GPU_STORE_STORE or GPU_STORE_DISCARD");
+    }
+    store64(pd + 24, store_op);
+    return 0;
+}
+
+# 1: the pass tests against the depth attachment but writes nothing to it (the
+# depth is neither loaded, cleared nor stored; a pipeline that writes depth is
+# refused at draw). The attachment can be bound for sampling in the same pass.
+fn gpu_pass_desc_depth_read_only(pd, read_only): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    if (load64(pd + 8) == 0) { return _gpu_pass_fail("pass desc: no depth attachment"); }
+    if (read_only != 0) {
+        if (read_only != 1) { return _gpu_pass_fail("pass desc: read-only is 0 or 1"); }
+    }
+    store64(pd + 40, read_only);
+    return 0;
+}
+
+fn gpu_pass_desc_label(pd, label): i64 {
+    if (pd == 0) { return _gpu_pass_fail("pass desc: null"); }
+    store64(pd + 48, label);
+    return 0;
+}
+
+# Begin a render pass from descriptor `pd` (at least one colour attachment or a
+# depth attachment). The pass takes the draw-time calls of src/gpu_draw.cyr and
+# ends with gpu_render_pass_end. Returns the pass, or 0 with the reason recorded.
+fn gpu_render_pass_begin_desc(ctx, pd): i64 {
+    if (ctx == 0) { return 0; }
+    if (pd == 0) { _gpu_pass_fail("pass desc: null"); return 0; }
+    var n = load64(pd);
+    if (n < 0) { _gpu_pass_fail("pass desc: corrupt colour count"); return 0; }
+    if (n > GPU_PASS_MAX_COLORS) { _gpu_pass_fail("pass desc: corrupt colour count"); return 0; }
+    if (n == 0) {
+        if (load64(pd + 8) == 0) { _gpu_pass_fail("pass desc: no attachment"); return 0; }
+    }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_RENDER_PASS_BEGIN_DESC);
+    if (slot == 0) {
+        _gpu_target_fail(GPU_ERR_NOT_IMPLEMENTED, "render pass: this backend has no descriptor pass");   #skip-lint
+        return 0;
+    }
+    return fncall2(slot, ctx, pd);
+}
+
+# ================================================================
+# Texture views
+# ================================================================
+# A view of part of a texture or target: levels [base_mip, base_mip + mip_count)
+# and layers [base_layer, base_layer + layer_count) seen as `dim` (GPU_VIEW_2D,
+# _2D_ARRAY, _CUBE, _CUBE_ARRAY). 0 for a count means "to the last". A view is a
+# texture object of its own: bind it (a texture_2d of one cube face, a mip),
+# attach it (a single-level, single-layer 2D view: render into a face or level),
+# read it back (its first level and layer) or copy from / to it. It does not own
+# its texture: release the view (gpu_texture_view_release) before the texture.
+fn gpu_texture_view_create(ctx, tex, dim, base_mip, mip_count, base_layer, layer_count): i64 {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: null texture"); return 0; }
+    var dim_ok = 0;
+    if (dim == GPU_VIEW_2D) { dim_ok = 1; }
+    if (dim == GPU_VIEW_2D_ARRAY) { dim_ok = 1; }
+    if (dim == GPU_VIEW_CUBE) { dim_ok = 1; }
+    if (dim == GPU_VIEW_CUBE_ARRAY) { dim_ok = 1; }
+    if (dim_ok == 0) {
+        _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: dim must be GPU_VIEW_2D, _2D_ARRAY, _CUBE or _CUBE_ARRAY");
+        return 0;
+    }
+    if (base_mip < 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: negative base level"); return 0; }
+    if (mip_count < 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: negative level count"); return 0; }
+    if (base_layer < 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: negative base layer"); return 0; }
+    if (layer_count < 0) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: negative layer count"); return 0; }
+    if (base_mip > 32) { _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: base level past the chain"); return 0; }
+    if (base_layer > MABDA_MAX_TEXTURE_ARRAY_LAYERS) {
+        _gpu_target_fail(GPU_ERR_TEXTURE, "texture view: base layer past the array");
+        return 0;
+    }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_TEXTURE_VIEW_CREATE);
+    if (slot == 0) {
+        _gpu_target_fail(GPU_ERR_NOT_IMPLEMENTED, "texture view: this backend has no views");   #skip-lint
+        return 0;
+    }
+    # View request (40 B): dim +0, base_mip +8, mip_count +16, base_layer +24,
+    # layer_count +32.
+    var vr[40];
+    store64(&vr, dim);
+    store64(&vr + 8, base_mip);
+    store64(&vr + 16, mip_count);
+    store64(&vr + 24, base_layer);
+    store64(&vr + 32, layer_count);
+    return fncall3(slot, ctx, tex, &vr);
+}
+
+# The view a pass attaches to render into one `layer` (array slice / cube face)
+# at one mip `level`.
+fn gpu_texture_view_attachment(ctx, tex, layer, level): i64 {
+    return gpu_texture_view_create(ctx, tex, GPU_VIEW_2D, level, 1, layer, 1);
+}
+
+fn gpu_texture_view_release(ctx, view): i64 {
+    if (ctx == 0) { return 0; }
+    if (view == 0) { return 0; }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_TEXTURE_VIEW_RELEASE);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, view);
+}
+
+# ================================================================
+# Texture-to-texture copies
+# ================================================================
+# Copy a `w` x `h` rectangle from (sx, sy) of `src` to (dx, dy) of `dst`. Each is
+# a texture, a target or a view (a view addresses its first level and layer).
+# Same format (or its sRGB twin) and sample count; the rectangle inside both.
+# w = h = 0 copies the source's whole size. Recorded and submitted now, in order
+# with passes already ended. Returns 0 or a GPU_ERR_*.
+fn gpu_texture_copy_rect(ctx, src, sx, sy, dst, dx, dy, w, h): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (src == 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: null source"); }
+    if (dst == 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: null destination"); }
+    if (src == dst) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: source and destination are one object"); }
+    if (sx < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative origin"); }
+    if (sy < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative origin"); }
+    if (dx < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative origin"); }
+    if (dy < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative origin"); }
+    if (w < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative size"); }
+    if (h < 0) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: negative size"); }
+    if (sx > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: origin past 8192"); }
+    if (sy > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: origin past 8192"); }
+    if (dx > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: origin past 8192"); }
+    if (dy > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: origin past 8192"); }
+    if (w > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: size past 8192"); }
+    if (h > MABDA_MAX_TEXTURE_DIM_2D) { return _gpu_target_fail(GPU_ERR_TEXTURE, "texture copy: size past 8192"); }
+    var slot = _gpu_target_slot(ctx, BACKEND_SLOT_TEXTURE_COPY);
+    if (slot == 0) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    # Copy request (64 B): src +0, sx +8, sy +16, dst +24, dx +32, dy +40,
+    # w +48, h +56.
+    var cr[64];
+    store64(&cr, src);
+    store64(&cr + 8, sx);
+    store64(&cr + 16, sy);
+    store64(&cr + 24, dst);
+    store64(&cr + 32, dx);
+    store64(&cr + 40, dy);
+    store64(&cr + 48, w);
+    store64(&cr + 56, h);
+    return fncall2(slot, ctx, &cr);
+}
+
+# Copy all of `src` (its first level and layer, or a view's) into `dst` at (0, 0).
+fn gpu_texture_copy(ctx, src, dst): i64 {
+    return gpu_texture_copy_rect(ctx, src, 0, 0, dst, 0, 0, 0, 0);
+}

@@ -19,12 +19,19 @@
 #   - An unmapped / unrepresentable format returns -1 (NOT 0 - 0 is the valid
 #     MABDA_TEXFMT_RGBA8 id, so a 0 return must stay meaningful). Callers reject
 #     on `fmt < 0`; `fmt >= 0` is a real id (0 = RGBA8, 1+ = compressed).
-#   - sRGB-encoded variants COLLAPSE to the matching UNORM mabda id (mabda
-#     has no distinct _SRGB ids yet). This is loadable but the sRGB->linear
-#     decode is lost unless the consumer compensates, so sRGB-ness is made
-#     queryable via mabda_vk_format_is_srgb / mabda_dxgi_format_is_srgb -
-#     it is a DOCUMENTED, DETECTABLE limitation, never a silent collapse.
-#     Adding real MABDA_TEXFMT_*_SRGB ids is tracked (3-3 punchlist AL.0).
+#   - 4.3.1 (the render tier's MB3, closing punchlist AL.0 for uncompressed
+#     formats): RGBA8 sRGB, BGRA8, BGRA8 sRGB and RGBA16F containers map to
+#     their own ids (MABDA_TEXFMT_RGBA8_SRGB / _BGRA8 / _BGRA8_SRGB / _RGBA16F),
+#     so wgpu samples an sRGB texture with the sRGB decode. Numbers pinned
+#     2026-11-16 the same way: vulkan_core.h (R8G8B8A8_SRGB 43, B8G8R8A8_UNORM
+#     44, B8G8R8A8_SRGB 50, R16G16B16A16_SFLOAT 97) and dxgiformat.h
+#     (R16G16B16A16_FLOAT 0x0A, R8G8B8A8_UNORM_SRGB 0x1D, B8G8R8A8_UNORM 0x57,
+#     B8G8R8A8_UNORM_SRGB 0x5B).
+#   - The compressed sRGB variants still COLLAPSE to the UNORM mabda id
+#     (there are no compressed _SRGB ids): loadable, but the sRGB->linear
+#     decode is lost unless the consumer compensates, so sRGB-ness stays
+#     queryable via mabda_vk_format_is_srgb / mabda_dxgi_format_is_srgb - a
+#     DOCUMENTED, DETECTABLE limitation, never a silent collapse.
 #   - SNORM / SFLOAT variants (BC4_SNORM, BC5_SNORM, BC6H_SFLOAT) have NO
 #     correct mabda representation (mabda BC4/BC5 are UNORM, BC6H is
 #     UFLOAT) and return -1 (fail loud) rather than mis-interpret signed
@@ -34,9 +41,12 @@
 # VkFormat -> MABDA_TEXFMT_* (KTX2). Returns -1 if unmapped (0 = RGBA8).
 # ----------------------------------------------------------------
 fn mabda_texfmt_from_vk_format(vk): i64 {
-    # RGBA8 (UNORM 37, SRGB 43)
+    # RGBA8 (UNORM 37, SRGB 43); BGRA8 (UNORM 44, SRGB 50); RGBA16 float (97)
     if (vk == 37)  { return MABDA_TEXFMT_RGBA8; }
-    if (vk == 43)  { return MABDA_TEXFMT_RGBA8; }       # sRGB -> RGBA8
+    if (vk == 43)  { return MABDA_TEXFMT_RGBA8_SRGB; }  # 4.3.1: was collapsed to RGBA8
+    if (vk == 44)  { return MABDA_TEXFMT_BGRA8; }
+    if (vk == 50)  { return MABDA_TEXFMT_BGRA8_SRGB; }
+    if (vk == 97)  { return MABDA_TEXFMT_RGBA16F; }
     # BC1 (RGB UNORM 131 / RGB SRGB 132 / RGBA UNORM 133 / RGBA SRGB 134)
     if (vk == 131) { return MABDA_TEXFMT_BC1; }
     if (vk == 132) { return MABDA_TEXFMT_BC1; }         # sRGB
@@ -71,10 +81,12 @@ fn mabda_texfmt_from_vk_format(vk): i64 {
     return 0 - 1;   # unmapped (NOT 0 - that is RGBA8)
 }
 
-# 1 if `vk` is an sRGB-encoded VkFormat this module maps (so the caller
-# knows the UNORM-id result lost the sRGB encoding), else 0.
+# 1 if `vk` is an sRGB-encoded VkFormat this module maps, else 0. For RGBA8 and
+# BGRA8 the mapped id keeps the encoding (4.3.1); for a compressed family the id
+# is the UNORM one, and this says the encoding was lost.
 fn mabda_vk_format_is_srgb(vk): i64 {
     if (vk == 43)  { return 1; }   # RGBA8 sRGB
+    if (vk == 50)  { return 1; }   # BGRA8 sRGB
     if (vk == 132) { return 1; }   # BC1 RGB sRGB
     if (vk == 134) { return 1; }   # BC1 RGBA sRGB
     if (vk == 138) { return 1; }   # BC3 sRGB
@@ -91,9 +103,13 @@ fn mabda_vk_format_is_srgb(vk): i64 {
 # DXGI_FORMAT -> MABDA_TEXFMT_* (DDS DX10 path). Returns -1 if unmapped.
 # ----------------------------------------------------------------
 fn mabda_texfmt_from_dxgi_format(dxgi): i64 {
-    # RGBA8 (UNORM 0x1C=28 / SRGB 0x1D=29)
+    # RGBA8 (UNORM 0x1C=28 / SRGB 0x1D=29); BGRA8 (UNORM 0x57=87 / SRGB 0x5B=91);
+    # RGBA16 float (0x0A=10)
     if (dxgi == 28) { return MABDA_TEXFMT_RGBA8; }
-    if (dxgi == 29) { return MABDA_TEXFMT_RGBA8; }      # sRGB
+    if (dxgi == 29) { return MABDA_TEXFMT_RGBA8_SRGB; } # 4.3.1: was collapsed to RGBA8
+    if (dxgi == 87) { return MABDA_TEXFMT_BGRA8; }
+    if (dxgi == 91) { return MABDA_TEXFMT_BGRA8_SRGB; }
+    if (dxgi == 10) { return MABDA_TEXFMT_RGBA16F; }
     # BC1 (UNORM 0x47=71 / SRGB 0x48=72)
     if (dxgi == 71) { return MABDA_TEXFMT_BC1; }
     if (dxgi == 72) { return MABDA_TEXFMT_BC1; }        # sRGB
@@ -116,6 +132,7 @@ fn mabda_texfmt_from_dxgi_format(dxgi): i64 {
 # 1 if `dxgi` is an sRGB-encoded DXGI_FORMAT this module maps, else 0.
 fn mabda_dxgi_format_is_srgb(dxgi): i64 {
     if (dxgi == 29) { return 1; }  # RGBA8 sRGB
+    if (dxgi == 91) { return 1; }  # BGRA8 sRGB
     if (dxgi == 72) { return 1; }  # BC1 sRGB
     if (dxgi == 78) { return 1; }  # BC3 sRGB
     if (dxgi == 99) { return 1; }  # BC7 sRGB

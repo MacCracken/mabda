@@ -43,7 +43,7 @@ all three, routed through an `@internal` `Backend` slot table).
            │ wgpu fillers                      │ native AMD/NVIDIA fillers
 ┌──────────▼─────────────────────┐ ┌──────────▼───────────────────────┐
 │ wgpu-native C API (v29) via a   │ │ direct amdgpu DRM ioctls (no      │
-│ 81-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
+│ 83-slot fn table; C launcher    │ │ libdrm): GFX9 PM4 + GEM/syncobj/CS │
 │ (deps/wgpu_main.c) — 2 struct-  │ │ + KMS; SPIR-V→GFX9 compute compiler│
 │ packing shims                   │ │ (gfx9_encode/spirv_parse/mir/      │
 │                                 │ │ spirv_lower/gfx9_isel/regalloc/    │
@@ -65,17 +65,25 @@ all three, routed through an `@internal` `Backend` slot table).
 ## Flat Layout
 
 ```
-src/   (63 domain modules + lib.cyr — annotated below; the filesystem is authoritative)
+src/   (68 domain modules + lib.cyr — annotated below; the filesystem is authoritative)
 ├── lib.cyr              — single include chain (stdlib + domain modules)
 ├── error.cyr, color.cyr, capabilities.cyr, profiler.cyr, resource.cyr, debug.cyr
-├── the render tier (v4.3.0, MB1) — what a geometry renderer draws through:
+├── the render tier (v4.3.0 MB1; v4.3.1 MB2-MB5) — what a geometry renderer draws through:
 │   gpu_types.cyr        — public names for the constants gpu_* calls take (WebGPU v29 values)
 │   error_scope.cyr      — error scopes + uncaptured-error takes (the error channel)
 │   gpu_bind.cyr         — bind group layouts, bind groups, sampler objects
 │   gpu_pipeline.cyr     — the render pipeline descriptor
 │   gpu_draw.cyr         — draw-time calls (buffers, bind groups, indexed draws, viewport, scissor)
+│   gpu_target.cyr       — render targets (depth, sRGB, BGRA, RGBA16F; MSAA), the pass descriptor,
+│                          texture views, texture copies, render-target readback (4.3.1)
+│   gpu_compute_tier.cyr — compute pipelines from a descriptor, compute passes (4.3.1)
+│   surface_v3.cyr       — + Wayland window surfaces: capabilities, configure, frames, resize (4.3.1)
 │   @internal backend_wgpu_rtier.cyr — the wgpu slots, descriptors built in a per-context scratch block
-│   @internal backend_native_rtier.cyr — the native backends' subset (vertex-less, unbound draws)
+│   @internal backend_wgpu_target.cyr — wgpu targets, descriptor passes, views, copies, mip blits (4.3.1)
+│   @internal backend_wgpu_ctier.cyr — wgpu compute tier + gpu_compute_dispatch (4.3.1)
+│   @internal backend_wgpu_surface.cyr — wgpu Wayland surfaces (4.3.1)
+│   @internal backend_native_rtier.cyr — the native backends' subset (vertex-less, unbound draws;
+│                          one RGBA8 target, a cleared descriptor pass, readback)
 ├── context.cyr          — GpuContext (wgpu instance/adapter/device/queue OR
 │                          native fd/ctx_id/BO handles, dual-interpreted)
 ├── buffer.cyr, typed_buffer.cyr, gpu_timestamps.cyr, compute.cyr
@@ -115,7 +123,7 @@ Instead:
    Vulkan backend via `WGPUInstanceExtras { backends = Vulkan }`
    (the default `All` crashes on headless boxes — see v2.4.2), and
    creates the GPU context pre-Cyrius.
-2. **Function table** — C populates an array of 81 function pointers
+2. **Function table** — C populates an array of 83 function pointers
    (wgpu entry points plus launcher shims) covering buffer / shader /
    pipeline / texture / render pass / render pipeline / surface /
    timestamp query / copy operations.

@@ -1,0 +1,1037 @@
+# tests/tcyr/target_tier.tcyr — the render tier's MB2-MB5 (v4.3.1)
+#
+# The public builders and their refusals (src/gpu_target.cyr,
+# src/gpu_compute_tier.cyr, src/surface_v3.cyr), the unified wgpu texture record
+# (src/backend_wgpu.cyr), and the bytes the wgpu backend hands wgpu
+# (src/backend_wgpu_target.cyr, _ctier.cyr, _surface.cyr), checked against
+# webgpu.h v29 offsets taken with offsetof. The mock wgpu table copies each
+# descriptor during the call (they live on the caller's stack). The native subset
+# fillers (src/backend_native_rtier.cyr) are checked at the end.
+# HW: programs/target_tier_e2e.cyr, compute_tier_e2e.cyr, surface_wayland_e2e.cyr.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ---------------------------------------------------------------------------
+# mock wgpu
+# ---------------------------------------------------------------------------
+var _mt_wrong = 0;
+var _mt_tex_n = 0;
+var _mt_tex_desc = 0;      # 4 x 80 B captured texture descriptors
+var _mt_view_n = 0;
+var _mt_view_desc = 0;     # 8 x 64 B captured view descriptors
+var _mt_view_tex = 0;      # the texture of the last view create
+var _mt_begin_args = 0;    # 40 B WgpuBeginPassArgs
+var _mt_atts = 0;          # 8 x 72 B colour attachments
+var _mt_datt = 0;          # 48 B depth attachment
+var _mt_has_datt = 0;
+var _mt_finish_ret = 0xCB;
+var _mt_tex_release = 0;
+var _mt_view_release = 0;
+var _mt_copy = 0;          # src 32 + dst 32 + extent 16
+var _mt_copy_n = 0;
+var _mt_write = 0;         # info 32 + layout 16 + extent 16
+var _mt_write_n = 0;
+var _mt_b2b = 0;           # src off, size of copy_buffer_to_buffer
+var _mt_cpipe = 0;         # 80 B compute pipeline descriptor
+var _mt_cpipe_n = 0;
+var _mt_cpass_release = 0;
+var _mt_dispatch = 0;
+var _mt_cfg = 0;           # 64 B surface configuration
+var _mt_cfg_n = 0;
+var _mt_caps = 0;          # 168 B the mock surface's capabilities
+var _mt_cur_status = 1;
+var _mt_present = 0;
+var _mt_bg_n = 0;
+var _mt_bgl_get = 0;
+
+fn _mt_trap(a, b, c, d, e, f): i64 { _mt_wrong = _mt_wrong + 1; return 0; }
+fn _mt_noop1(a): i64 { return 0; }
+fn _mt_noop2(a, b): i64 { return 0; }
+fn _mt_encoder(device, label): i64 { return 0xEC; }
+fn _mt_begin(enc, args): i64 {
+    memcpy(_mt_begin_args, args, 40);
+    var n = load64(args + 8);
+    if (n > 0) { memcpy(_mt_atts, load64(args), n * 72); }
+    _mt_has_datt = 0;
+    if (load64(args + 16) != 0) { memcpy(_mt_datt, load64(args + 16), 48); _mt_has_datt = 1; }
+    return 0xBE;
+}
+fn _mt_finish(enc, label): i64 { return _mt_finish_ret; }
+fn _mt_create_texture(device, desc): i64 {
+    if (_mt_tex_n < 4) { memcpy(_mt_tex_desc + _mt_tex_n * 80, desc, 80); }
+    _mt_tex_n = _mt_tex_n + 1;
+    return 0x7E00 + _mt_tex_n;
+}
+fn _mt_create_view(tex, desc): i64 {
+    if (_mt_view_n < 8) { memcpy(_mt_view_desc + _mt_view_n * 64, desc, 64); }
+    _mt_view_n = _mt_view_n + 1;
+    _mt_view_tex = tex;
+    return 0x7700 + _mt_view_n;
+}
+fn _mt_tex_rel(t): i64 { _mt_tex_release = _mt_tex_release + 1; return 0; }
+fn _mt_view_rel(v): i64 { _mt_view_release = _mt_view_release + 1; return 0; }
+fn _mt_push(device, filter): i64 { return 0; }
+fn _mt_pop(device, buf, cap): i64 { if (buf != 0) { store8(buf, 0); } return 1; }
+fn _mt_take(buf, cap, cnt): i64 { if (cnt != 0) { store64(cnt, 0); } return 1; }
+fn _mt_t2t(enc, src, dst, ext): i64 {
+    memcpy(_mt_copy, src, 32);
+    memcpy(_mt_copy + 32, dst, 32);
+    memcpy(_mt_copy + 64, ext, 12);
+    _mt_copy_n = _mt_copy_n + 1;
+    return 0;
+}
+fn _mt_write_tex(queue, info, data, size, layout, ext): i64 {
+    memcpy(_mt_write, info, 32);
+    memcpy(_mt_write + 32, layout, 16);
+    memcpy(_mt_write + 48, ext, 12);
+    _mt_write_n = _mt_write_n + 1;
+    return 0;
+}
+fn _mt_create_buffer(device, desc): i64 { return 0xB0; }
+fn _mt_buf_size(b): i64 { return 30; }
+fn _mt_b2b_copy(enc, src, soff, dst, doff, sz): i64 {
+    store64(_mt_b2b, soff);
+    store64(_mt_b2b + 8, sz);
+    return 0;
+}
+fn _mt_create_cpipe(device, desc): i64 {
+    memcpy(_mt_cpipe, desc, 80);
+    _mt_cpipe_n = _mt_cpipe_n + 1;
+    return 0xC9;
+}
+fn _mt_create_layout(device, desc): i64 { return 0x91; }
+fn _mt_begin_cpass(enc, desc): i64 { return 0xCE; }
+fn _mt_cpass_rel(p): i64 { _mt_cpass_release = _mt_cpass_release + 1; return 0; }
+fn _mt_cdispatch(p, x, y, z): i64 { _mt_dispatch = _mt_dispatch + 1; return 0; }
+fn _mt_get_bgl(p, i): i64 { _mt_bgl_get = _mt_bgl_get + 1; return 0xB6; }
+fn _mt_create_bg(device, desc): i64 { _mt_bg_n = _mt_bg_n + 1; return 0xBB; }
+fn _mt_set_bg(p, g, bg, n, o): i64 { return 0; }
+fn _mt_configure(surface, cfg): i64 { memcpy(_mt_cfg, cfg, 64); _mt_cfg_n = _mt_cfg_n + 1; return 0; }
+fn _mt_current(surface, out): i64 {
+    store64(out + 8, 0x5A);
+    store32(out + 16, _mt_cur_status);
+    return 0;
+}
+fn _mt_present_fn(surface): i64 { _mt_present = _mt_present + 1; return 0; }
+var _mt_surface_release = 0;
+fn _mt_surf_rel(surface): i64 { _mt_surface_release = _mt_surface_release + 1; return 0; }
+fn _mt_wayland(inst, d, s): i64 { return 0x5F; }
+fn _mt_caps_fn(surface, adapter, out): i64 { memcpy(out, _mt_caps, 168); return 1; }
+
+fn _mt_install(table): i64 {
+    if (_mt_tex_desc == 0) {
+        _mt_tex_desc = alloc(320);
+        _mt_view_desc = alloc(512);
+        _mt_begin_args = alloc(40);
+        _mt_atts = alloc(576);
+        _mt_datt = alloc(48);
+        _mt_copy = alloc(80);
+        _mt_write = alloc(64);
+        _mt_b2b = alloc(16);
+        _mt_cpipe = alloc(80);
+        _mt_cfg = alloc(64);
+        _mt_caps = alloc(168);
+    }
+    for (var i = 0; i < WGPU_FN_COUNT; i = i + 1) { store64(table + i * 8, &_mt_trap); }
+    store64(table + 8 * 8, &_mt_create_buffer);
+    store64(table + 13 * 8, &_mt_buf_size);
+    store64(table + 15 * 8, &_mt_noop1);
+    store64(table + 17 * 8, &_mt_create_cpipe);
+    store64(table + 19 * 8, &_mt_create_layout);
+    store64(table + 20 * 8, &_mt_create_bg);
+    store64(table + 22 * 8, &_mt_noop1);
+    store64(table + 23 * 8, &_mt_noop1);
+    store64(table + 24 * 8, &_mt_noop1);
+    store64(table + 25 * 8, &_mt_noop1);
+    store64(table + 26 * 8, &_mt_encoder);
+    store64(table + 27 * 8, &_mt_begin_cpass);
+    store64(table + 28 * 8, &_mt_b2b_copy);
+    store64(table + 29 * 8, &_mt_finish);
+    store64(table + 30 * 8, &_mt_noop2);
+    store64(table + 31 * 8, &_mt_set_bg);
+    store64(table + 32 * 8, &_mt_cdispatch);
+    store64(table + 33 * 8, &_mt_noop1);
+    store64(table + 34 * 8, &_mt_noop1);
+    store64(table + 35 * 8, &_mt_noop2);
+    store64(table + 45 * 8, &_mt_create_texture);
+    store64(table + 46 * 8, &_mt_create_view);
+    store64(table + 48 * 8, &_mt_write_tex);
+    store64(table + 49 * 8, &_mt_tex_rel);
+    store64(table + 50 * 8, &_mt_view_rel);
+    store64(table + 54 * 8, &_mt_configure);
+    store64(table + 55 * 8, &_mt_current);
+    store64(table + 56 * 8, &_mt_present_fn);
+    store64(table + 57 * 8, &_mt_surf_rel);
+    store64(table + 58 * 8, &_mt_begin);
+    store64(table + 62 * 8, &_mt_noop1);
+    store64(table + 63 * 8, &_mt_noop1);
+    store64(table + 73 * 8, &_mt_push);
+    store64(table + 74 * 8, &_mt_pop);
+    store64(table + 75 * 8, &_mt_take);
+    store64(table + 76 * 8, &_mt_noop1);
+    store64(table + 77 * 8, &_mt_t2t);
+    store64(table + 78 * 8, &_mt_wayland);
+    store64(table + 79 * 8, &_mt_caps_fn);
+    store64(table + 81 * 8, &_mt_cpass_rel);
+    store64(table + 82 * 8, &_mt_get_bgl);
+    _mt_wrong = 0;
+    _mt_tex_n = 0;
+    _mt_view_n = 0;
+    _mt_finish_ret = 0xCB;
+    _mt_tex_release = 0;
+    _mt_view_release = 0;
+    _mt_copy_n = 0;
+    _mt_write_n = 0;
+    _mt_cpipe_n = 0;
+    _mt_cpass_release = 0;
+    _mt_dispatch = 0;
+    _mt_cfg_n = 0;
+    _mt_cur_status = 1;
+    _mt_present = 0;
+    _mt_surface_release = 0;
+    _mt_bg_n = 0;
+    _mt_bgl_get = 0;
+    wgpu_ffi_init_table(table);
+    mabda_wgpu_launcher_slots(WGPU_FN_COUNT);
+    gpu_error_clear();
+    return 0;
+}
+
+fn _mt_uninstall(): i64 {
+    wgpu_ffi_init_table(0);
+    mabda_wgpu_launcher_slots(0);
+    gpu_error_clear();
+    return 0;
+}
+
+# A stack ctx whose backend is the full wgpu backend's slot set.
+fn _mt_ctx(ctx, be): i64 {
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 8, 0xAD);
+    store64(ctx + 16, 0xD0);
+    store64(ctx + 24, 0xD1);
+    memset(be, 0, BACKEND_SIZE);
+    _backend_wgpu_fill_rtier(be);
+    _backend_wgpu_fill_target(be);
+    _backend_wgpu_fill_ctier(be);
+    _backend_wgpu_fill_surface(be);
+    backend_set_slot(be, BACKEND_SLOT_SURFACE_PRESENT, &_backend_wgpu_surface_present);
+    backend_set_slot(be, BACKEND_SLOT_SURFACE_RELEASE, &_backend_wgpu_surface_release);
+    backend_set_kind(be, BACKEND_KIND_WGPU);
+    store64(ctx + 32, be);
+    return 0;
+}
+
+# A texture record by hand (the backend's layout).
+fn _mt_tex(t, fmt, w, h, mips, layers, samples, kind, usage): i64 {
+    memset(t, 0, WGPU_TEX_SIZE);
+    store64(t, 0x7D);
+    store64(t + 8, 0x7F);
+    store64(t + 16, fmt);
+    store32(t + 24, w);
+    store32(t + 28, h);
+    store32(t + 32, mips);
+    store32(t + 36, layers);
+    store32(t + 40, samples);
+    store32(t + 44, kind);
+    store32(t + 72, usage);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# constants and layouts
+# ---------------------------------------------------------------------------
+fn test_constants() {
+    assert_eq(GPU_LOAD_LOAD, 1, "GPU_LOAD_LOAD = WGPULoadOp_Load");
+    assert_eq(GPU_LOAD_CLEAR, 2, "GPU_LOAD_CLEAR = WGPULoadOp_Clear");
+    assert_eq(GPU_STORE_STORE, 1, "GPU_STORE_STORE = WGPUStoreOp_Store");
+    assert_eq(GPU_STORE_DISCARD, 2, "GPU_STORE_DISCARD = WGPUStoreOp_Discard");
+    assert_eq(GPU_PRESENT_FIFO, 1, "FIFO = WGPUPresentMode_Fifo");
+    assert_eq(GPU_PRESENT_FIFO_RELAXED, 2, "FifoRelaxed = 2");
+    assert_eq(GPU_PRESENT_IMMEDIATE, 3, "Immediate = 3");
+    assert_eq(GPU_PRESENT_MAILBOX, 4, "Mailbox = 4");
+    assert_eq(GPU_PASS_DESC_SIZE, GPU_PASS_OFF_COLORS + GPU_PASS_MAX_COLORS * GPU_PASS_COLOR_SIZE,
+      "pass desc size covers 8 attachments");
+    assert_eq(WGPU_TEX_SIZE, 80, "texture record 80 B");
+    assert_eq(WGPU_SURFACE_STATE_SIZE, 80, "surface record 80 B");
+    assert(_WGPU_RS_MODULES + 8 <= _WGPU_RS_SIZE, "render state holds the dispatch cache pointer");
+    assert(_WGPU_RS_COLOR_ATTS + 8 * 72 <= _WGPU_RS_BEGIN_ARGS, "8 colour attachments fit before the begin args");
+    assert(_WGPU_RS_DEPTH_ATT + 48 <= _WGPU_RS_BLIT, "depth attachment fits");
+    assert(_WGPU_RS_BLIT + 48 <= _WGPU_RS_CPIPE_DESC, "blit cache (module + 5 pipelines) fits");
+    assert(_WGPU_RS_CPIPE_DESC + 80 <= _WGPU_RS_CPASS, "compute pipeline descriptor fits");
+    assert(_WGPU_RS_CPASS + 32 <= _WGPU_RS_MODULES, "compute pass record fits");
+    assert_eq(mabda_texfmt_from_wgpu(0x1B), MABDA_TEXFMT_BGRA8, "wgpu BGRA8Unorm -> BGRA8");
+    assert_eq(mabda_texfmt_from_wgpu(0x1C), MABDA_TEXFMT_BGRA8_SRGB, "wgpu BGRA8UnormSrgb -> BGRA8_SRGB");
+    assert_eq(mabda_texfmt_from_wgpu(0x16), MABDA_TEXFMT_RGBA8, "wgpu RGBA8Unorm -> RGBA8");
+    assert_eq(mabda_texfmt_from_wgpu(0x24), 0 - 1, "a format mabda has no id for -> -1");
+    assert_eq(mabda_texfmt_from_wgpu(0), 0 - 1, "Undefined -> -1");
+    return 0;
+}
+
+fn test_texture_usage_policy() {
+    var u8 = _wgpu_tex_usage(MABDA_TEXFMT_RGBA8);
+    assert_eq(u8, 0x17, "colour: COPY_SRC | COPY_DST | TEXTURE_BINDING | RENDER_ATTACHMENT");
+    assert_eq(_wgpu_tex_usage(MABDA_TEXFMT_RGBA16F), 0x17, "RGBA16F likewise");
+    assert_eq(_wgpu_tex_usage(MABDA_TEXFMT_DEPTH32F), 0x15, "depth: no COPY_DST (WebGPU forbids it)");
+    assert_eq(_wgpu_tex_usage(MABDA_TEXFMT_BC1), 0x07, "compressed: sampled and copied only");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# public builders (gpu_target.cyr)
+# ---------------------------------------------------------------------------
+fn test_pass_desc_builder() {
+    var pd = gpu_pass_desc_new();
+    assert_nonnull(pd, "pass desc allocated");
+    assert_eq(gpu_pass_desc_color_count(pd), 0, "empty");
+    var c = color_new(F64_1, F64_0, F64_0, F64_1);
+    assert_eq(gpu_pass_desc_color(pd, 0x100, GPU_LOAD_CLEAR, c), 0, "colour 0 added");
+    var a0 = pd + GPU_PASS_OFF_COLORS;
+    assert_eq(load64(a0), 0x100, "target stored");
+    assert_eq(load64(a0 + 8), GPU_LOAD_CLEAR, "load op stored");
+    assert_eq(load64(a0 + 16), GPU_STORE_STORE, "stored by default");
+    assert_eq(load64(a0 + 32), F64_1, "clear red copied");
+    assert_eq(load64(a0 + 56), F64_1, "clear alpha copied");
+    assert_neq(gpu_pass_desc_color(pd, 0x101, GPU_LOAD_CLEAR, 0), 0, "CLEAR without a colour refused");
+    assert_neq(gpu_pass_desc_color(pd, 0x101, 7, c), 0, "a bad load op refused");
+    assert_neq(gpu_pass_desc_color(pd, 0, GPU_LOAD_LOAD, 0), 0, "a null target refused");
+    assert_eq(gpu_pass_desc_color(pd, 0x101, GPU_LOAD_LOAD, 0), 0, "LOAD needs no colour");
+    for (var i = 2; i < 8; i = i + 1) { gpu_pass_desc_color(pd, 0x100 + i, GPU_LOAD_LOAD, 0); }
+    assert_eq(gpu_pass_desc_color_count(pd), 8, "8 attachments");
+    assert_neq(gpu_pass_desc_color(pd, 0x200, GPU_LOAD_LOAD, 0), 0, "a 9th refused");
+    assert_eq(gpu_pass_desc_color_count(pd), 8, "still 8");
+    assert_eq(gpu_pass_desc_color_store(pd, 1, GPU_STORE_DISCARD), 0, "discard set");
+    assert_eq(load64(pd + GPU_PASS_OFF_COLORS + GPU_PASS_COLOR_SIZE + 16), GPU_STORE_DISCARD, "discard stored");
+    assert_neq(gpu_pass_desc_color_store(pd, 8, GPU_STORE_DISCARD), 0, "no attachment 8");
+    assert_neq(gpu_pass_desc_color_store(pd, 0, 9), 0, "a bad store op refused");
+    assert_eq(gpu_pass_desc_color_resolve(pd, 0, 0x300), 0, "resolve target set");
+    assert_eq(load64(a0 + 24), 0x300, "resolve stored");
+    var g = color_new(F64_0, F64_1, F64_0, F64_1);
+    assert_eq(gpu_pass_desc_color_clear(pd, 0, g), 0, "clear changed");
+    assert_eq(load64(a0 + 40), F64_1, "new clear green");
+    assert_neq(gpu_pass_desc_depth_store(pd, GPU_STORE_DISCARD), 0, "depth store without depth refused");
+    assert_neq(gpu_pass_desc_depth_read_only(pd, 1), 0, "read-only without depth refused");
+    assert_neq(gpu_pass_desc_depth(pd, 0x400, GPU_LOAD_CLEAR, f64_from(2)), 0, "clear depth above 1 refused");
+    assert_neq(gpu_pass_desc_depth(pd, 0x400, GPU_LOAD_CLEAR, f64_sub(F64_0, F64_1)), 0, "clear depth below 0 refused");
+    assert_eq(gpu_pass_desc_depth(pd, 0x400, GPU_LOAD_CLEAR, F64_1), 0, "depth set");
+    assert_eq(load64(pd + 8), 0x400, "depth target stored");
+    assert_eq(load64(pd + 32), F64_1, "clear depth stored as f64");
+    assert_eq(gpu_pass_desc_depth_read_only(pd, 1), 0, "read-only set");
+    assert_neq(gpu_pass_desc_depth_read_only(pd, 2), 0, "read-only is 0 or 1");
+    assert_eq(gpu_pass_desc_label(pd, "p"), 0, "label set");
+    assert_eq(gpu_pass_desc_reset(pd), 0, "reset");
+    assert_eq(gpu_pass_desc_color_count(pd), 0, "reset empties");
+    assert_eq(load64(pd + 8), 0, "reset drops depth");
+    return 0;
+}
+
+var _ms_calls = 0;
+var _ms_a = 0;
+var _ms_b = 0;
+var _ms_c = 0;
+var _ms_d = 0;
+fn _ms_rt(ctx, w, h, fmt, samples): i64 {
+    _ms_calls = _ms_calls + 1;
+    _ms_a = w; _ms_b = h; _ms_c = fmt; _ms_d = samples;
+    return 0xAB;
+}
+fn _ms_begin(ctx, pd): i64 { _ms_calls = _ms_calls + 1; _ms_a = pd; return 0xAC; }
+fn _ms_view(ctx, tex, vr): i64 {
+    _ms_calls = _ms_calls + 1;
+    _ms_a = load64(vr); _ms_b = load64(vr + 8); _ms_c = load64(vr + 16); _ms_d = load64(vr + 24);
+    return 0xAD;
+}
+fn _ms_copy(ctx, cr): i64 {
+    _ms_calls = _ms_calls + 1;
+    _ms_a = load64(cr + 8); _ms_b = load64(cr + 32); _ms_c = load64(cr + 48); _ms_d = load64(cr + 56);
+    return 0;
+}
+
+fn test_target_dispatchers() {
+    var ctx[208];
+    var be[1024];
+    memset(&ctx, 0, 208);
+    memset(&be, 0, BACKEND_SIZE);
+    store64(&ctx + 32, &be);
+    gpu_error_clear();
+    assert_eq(gpu_render_target_create(&ctx, 8, 8, MABDA_TEXFMT_RGBA8, 1), 0, "no slot -> 0");
+    assert_eq(gpu_last_error(), GPU_ERR_NOT_IMPLEMENTED, "the missing slot recorded");   #skip-lint
+    backend_set_slot(&be, BACKEND_SLOT_RENDER_TARGET_CREATE, &_ms_rt);
+    backend_set_slot(&be, BACKEND_SLOT_RENDER_PASS_BEGIN_DESC, &_ms_begin);
+    backend_set_slot(&be, BACKEND_SLOT_TEXTURE_VIEW_CREATE, &_ms_view);
+    backend_set_slot(&be, BACKEND_SLOT_TEXTURE_COPY, &_ms_copy);
+    _ms_calls = 0;
+    assert_eq(gpu_render_target_create(&ctx, 0, 8, MABDA_TEXFMT_RGBA8, 1), 0, "zero width refused");
+    assert_eq(gpu_render_target_create(&ctx, 8, 8193, MABDA_TEXFMT_RGBA8, 1), 0, "past 8192 refused");
+    assert_eq(gpu_render_target_create(&ctx, 8, 8, MABDA_TEXFMT_BC1, 1), 0, "a compressed format refused");
+    assert_eq(gpu_render_target_create(&ctx, 8, 8, MABDA_TEXFMT_RGBA8, 2), 0, "2 samples refused (1 or 4)");
+    assert_eq(_ms_calls, 0, "no slot call on bad input");
+    assert_eq(gpu_render_target_create(&ctx, 8, 6, MABDA_TEXFMT_DEPTH32F, 4), 0xAB, "depth 4x reaches the slot");
+    assert_eq(_ms_c, MABDA_TEXFMT_DEPTH32F, "fmt threaded");
+    assert_eq(_ms_d, 4, "samples threaded");
+    var pd = gpu_pass_desc_new();
+    assert_eq(gpu_render_pass_begin_desc(&ctx, pd), 0, "a descriptor with no attachment refused");
+    gpu_pass_desc_depth(pd, 0x400, GPU_LOAD_CLEAR, F64_1);
+    assert_eq(gpu_render_pass_begin_desc(&ctx, pd), 0xAC, "a depth-only descriptor reaches the slot");
+    store64(pd, 9);
+    assert_eq(gpu_render_pass_begin_desc(&ctx, pd), 0, "a corrupt colour count refused");
+    _ms_calls = 0;
+    assert_eq(gpu_texture_view_create(&ctx, 0x10, 9, 0, 1, 0, 1), 0, "a bad view dim refused");
+    assert_eq(gpu_texture_view_create(&ctx, 0x10, GPU_VIEW_2D, 0 - 1, 1, 0, 1), 0, "negative base level refused");
+    assert_eq(gpu_texture_view_create(&ctx, 0x10, GPU_VIEW_2D, 0, 0 - 1, 0, 1), 0, "negative count refused");
+    assert_eq(gpu_texture_view_create(&ctx, 0, GPU_VIEW_2D, 0, 1, 0, 1), 0, "null texture refused");
+    assert_eq(_ms_calls, 0, "no slot call on a bad view");
+    assert_eq(gpu_texture_view_attachment(&ctx, 0x10, 3, 2), 0xAD, "attachment view reaches the slot");
+    assert_eq(_ms_a, GPU_VIEW_2D, "attachment: a 2D view");
+    assert_eq(_ms_b, 2, "attachment: base level = level");
+    assert_eq(_ms_c, 1, "attachment: one level");
+    assert_eq(_ms_d, 3, "attachment: base layer = layer");
+    _ms_calls = 0;
+    assert_neq(gpu_texture_copy_rect(&ctx, 0x10, 0 - 1, 0, 0x20, 0, 0, 4, 4), 0, "negative origin refused");
+    assert_neq(gpu_texture_copy_rect(&ctx, 0x10, 0, 0, 0x10, 0, 0, 4, 4), 0, "same object refused");
+    assert_neq(gpu_texture_copy_rect(&ctx, 0x10, 0, 0, 0x20, 0, 0, 9000, 4), 0, "size past 8192 refused");
+    assert_eq(_ms_calls, 0, "no slot call on a bad copy");
+    assert_eq(gpu_texture_copy_rect(&ctx, 0x10, 5, 0, 0x20, 7, 0, 3, 2), 0, "a copy reaches the slot");
+    assert_eq(_ms_a, 5, "sx packed");
+    assert_eq(_ms_b, 7, "dx packed");
+    assert_eq(_ms_c, 3, "w packed");
+    assert_eq(_ms_d, 2, "h packed");
+    assert_eq(gpu_render_target_read(&ctx, 0x10, 0x20, 64), GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+      "no read slot: the not-implemented code");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# wgpu: render targets and their texture descriptors
+# ---------------------------------------------------------------------------
+fn test_wgpu_render_target_bytes() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    var rt = _backend_wgpu_render_target_create(&ctx, 64, 32, MABDA_TEXFMT_RGBA16F, 1);
+    assert_nonnull(rt, "RGBA16F target");
+    assert_eq(_mt_tex_n, 1, "one texture");
+    var d = _mt_tex_desc;
+    assert_eq(load64(d + 24), 0x17, "usage RA | TB | CS | CD");
+    assert_eq(load32(d + 36), 64, "width @+36");
+    assert_eq(load32(d + 40), 32, "height @+40");
+    assert_eq(load32(d + 44), 1, "one layer");
+    assert_eq(load32(d + 48), 0x28, "format RGBA16Float @+48");
+    assert_eq(load32(d + 52), 1, "one level");
+    assert_eq(load32(d + 56), 1, "one sample @+56");
+    assert_eq(load32(_mt_view_desc + 24), 0x28, "view format");
+    assert_eq(load32(_mt_view_desc + 48), WGPU_TEXTURE_ASPECT_ALL, "view aspect All");
+    assert_eq(load64(rt + 16), MABDA_TEXFMT_RGBA16F, "record fmt");
+    assert_eq(load32(rt + 44), WGPU_TEX_KIND_TARGET, "record kind TARGET");
+    assert_eq(load64(rt + 48), 0, "no msaa texture");
+    _mt_tex_n = 0;
+    _mt_view_n = 0;
+    var ms = _backend_wgpu_render_target_create(&ctx, 16, 16, MABDA_TEXFMT_BGRA8_SRGB, 4);
+    assert_nonnull(ms, "4x BGRA8 sRGB target");
+    assert_eq(_mt_tex_n, 2, "MSAA colour: two textures");
+    assert_eq(load32(_mt_tex_desc + 56), 4, "first: 4 samples");
+    assert_eq(load64(_mt_tex_desc + 24), WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT, "first: render attachment only");
+    assert_eq(load32(_mt_tex_desc + 80 + 56), 1, "second (resolve): 1 sample");
+    assert_eq(load32(_mt_tex_desc + 48), 0x1C, "format BGRA8UnormSrgb");
+    assert_eq(load64(ms + 48), 0x7E01, "msaa texture at +48");
+    assert_eq(load64(ms), 0x7E02, "resolve texture at +0");
+    assert_eq(load32(ms + 40), 4, "record samples 4");
+    _mt_tex_n = 0;
+    var md = _backend_wgpu_render_target_create(&ctx, 16, 16, MABDA_TEXFMT_DEPTH32F, 4);
+    assert_eq(_mt_tex_n, 1, "MSAA depth: one texture");
+    assert_eq(load32(_mt_tex_desc + 56), 4, "4 samples");
+    assert_eq(load32(_mt_tex_desc + 48), 0x30, "Depth32Float");
+    assert_eq(load64(md + 48), 0, "no resolve pair for depth");
+    assert_eq(_backend_wgpu_render_target_create(&ctx, 16, 16, MABDA_TEXFMT_BC1, 1), 0, "compressed refused");
+    assert_eq(_backend_wgpu_render_target_create(&ctx, 16, 16, MABDA_TEXFMT_RGBA8, 8), 0, "8 samples refused");
+    _mt_tex_release = 0;
+    _mt_view_release = 0;
+    _backend_wgpu_render_target_release(&ctx, ms);
+    assert_eq(_mt_tex_release, 2, "release: both textures");
+    assert_eq(_mt_view_release, 2, "release: both views");
+    assert_eq(load64(ms), 0, "handles zeroed");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# wgpu: the descriptor pass
+# ---------------------------------------------------------------------------
+fn test_wgpu_pass_desc_bytes() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var c0[80];
+    var c1[80];
+    var ms[80];
+    var dt[80];
+    var res[80];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    var ra = _wgpu_tex_usage(MABDA_TEXFMT_RGBA8);
+    _mt_tex(&c0, MABDA_TEXFMT_RGBA8, 32, 32, 1, 1, 1, WGPU_TEX_KIND_TARGET, ra);
+    _mt_tex(&c1, MABDA_TEXFMT_RGBA16F, 32, 32, 1, 1, 1, WGPU_TEX_KIND_TARGET, ra);
+    store64(&c1 + 8, 0x71);
+    _mt_tex(&ms, MABDA_TEXFMT_RGBA8, 32, 32, 1, 1, 4, WGPU_TEX_KIND_TARGET, ra);
+    store64(&ms + 8, 0x72);          # resolve view
+    store64(&ms + 48, 0x7A);
+    store64(&ms + 56, 0x73);         # msaa view
+    _mt_tex(&dt, MABDA_TEXFMT_DEPTH32F, 32, 32, 1, 1, 1, WGPU_TEX_KIND_TARGET, _wgpu_tex_usage(MABDA_TEXFMT_DEPTH32F));
+    store64(&dt + 8, 0x74);
+    var pd = gpu_pass_desc_new();
+    var red = color_new(F64_1, F64_0, F64_0, F64_1);
+    gpu_pass_desc_color(pd, &c0, GPU_LOAD_CLEAR, red);
+    gpu_pass_desc_color(pd, &c1, GPU_LOAD_LOAD, 0);
+    gpu_pass_desc_color(pd, &ms, GPU_LOAD_CLEAR, red);
+    gpu_pass_desc_color_store(pd, 2, GPU_STORE_DISCARD);
+    gpu_pass_desc_depth(pd, &dt, GPU_LOAD_CLEAR, MABDA_F64_HALF);
+    gpu_pass_desc_label(pd, "lbl");
+    var p = _backend_wgpu_render_pass_begin_desc(&ctx, pd);
+    assert_nonnull(p, "pass begun");
+    assert_eq(load64(_mt_begin_args + 8), 3, "args: 3 colour attachments");
+    assert_neq(load64(_mt_begin_args + 16), 0, "args: a depth attachment");
+    assert_eq(load64(_mt_begin_args + 32), load64(pd + 48), "args: the label");
+    assert_eq(load64(_mt_atts + 8), 0x7F, "att 0 view");
+    assert_eq(load32(_mt_atts + 16), 0xFFFFFFFF, "att 0 depthSlice undefined");
+    assert_eq(load64(_mt_atts + 24), 0, "att 0 no resolve");
+    assert_eq(load32(_mt_atts + 32), WGPU_LOAD_OP_CLEAR, "att 0 clears");
+    assert_eq(load32(_mt_atts + 36), WGPU_STORE_OP_STORE, "att 0 stores");
+    assert_eq(load64(_mt_atts + 40), F64_1, "att 0 clear r");
+    assert_eq(load64(_mt_atts + 72 + 8), 0x71, "att 1 view");
+    assert_eq(load32(_mt_atts + 72 + 32), 1, "att 1 loads");
+    assert_eq(load64(_mt_atts + 144 + 8), 0x73, "att 2 renders into the msaa view");
+    assert_eq(load64(_mt_atts + 144 + 24), 0x72, "att 2 resolves into the target's view");
+    assert_eq(load32(_mt_atts + 144 + 36), 2, "att 2 discards");
+    assert_eq(load64(_mt_datt + 8), 0x74, "depth view @+8");
+    assert_eq(load32(_mt_datt + 16), WGPU_LOAD_OP_CLEAR, "depth load @+16");
+    assert_eq(load32(_mt_datt + 20), WGPU_STORE_OP_STORE, "depth store @+20");
+    assert_eq(load32(_mt_datt + 24), f64_to_f32(MABDA_F64_HALF), "depth clear f32 @+24");
+    assert_eq(load32(_mt_datt + 28), 0, "not read-only");
+    assert_eq(load32(_mt_datt + 32), 0, "stencil load undefined (Depth32F has none)");
+    _backend_wgpu_render_pass_end(&ctx, p);
+    gpu_pass_desc_depth_read_only(pd, 1);
+    p = _backend_wgpu_render_pass_begin_desc(&ctx, pd);
+    assert_eq(load32(_mt_datt + 28), 1, "read-only @+28");
+    assert_eq(load32(_mt_datt + 16), 0, "read-only: load undefined");
+    assert_eq(load32(_mt_datt + 20), 0, "read-only: store undefined");
+    _backend_wgpu_render_pass_end(&ctx, p);
+    # Explicit resolve into a single-sample target.
+    _mt_tex(&res, MABDA_TEXFMT_RGBA8, 32, 32, 1, 1, 1, WGPU_TEX_KIND_SURFACE, WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT);
+    store64(&res + 8, 0x75);
+    var pd2 = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd2, &ms, GPU_LOAD_CLEAR, red);
+    gpu_pass_desc_color_resolve(pd2, 0, &res);
+    p = _backend_wgpu_render_pass_begin_desc(&ctx, pd2);
+    assert_eq(load64(_mt_atts + 24), 0x75, "the descriptor's resolve target");
+    _backend_wgpu_render_pass_end(&ctx, p);
+    # Refusals, before wgpu.
+    var bad = gpu_pass_desc_new();
+    gpu_pass_desc_color(bad, &c0, GPU_LOAD_CLEAR, red);
+    gpu_pass_desc_color_resolve(bad, 0, &res);
+    gpu_error_clear();
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, bad), 0, "resolve on a single-sample attachment refused");
+    assert_eq(gpu_last_error(), GPU_ERR_TEXTURE, "recorded");
+    var b2 = gpu_pass_desc_new();
+    gpu_pass_desc_color(b2, &dt, GPU_LOAD_CLEAR, red);
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, b2), 0, "depth in a colour slot refused");
+    var b3 = gpu_pass_desc_new();
+    gpu_pass_desc_depth(b3, &c0, GPU_LOAD_CLEAR, F64_1);
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, b3), 0, "colour as the depth attachment refused");
+    var small[80];
+    _mt_tex(&small, MABDA_TEXFMT_DEPTH32F, 16, 32, 1, 1, 1, WGPU_TEX_KIND_TARGET, 0x15);
+    var b4 = gpu_pass_desc_new();
+    gpu_pass_desc_color(b4, &c0, GPU_LOAD_CLEAR, red);
+    gpu_pass_desc_depth(b4, &small, GPU_LOAD_CLEAR, F64_1);
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, b4), 0, "attachments of two sizes refused");
+    var nora[80];
+    _mt_tex(&nora, MABDA_TEXFMT_RGBA8, 32, 32, 1, 1, 1, WGPU_TEX_KIND_TEXTURE, 0x07);
+    var b5 = gpu_pass_desc_new();
+    gpu_pass_desc_color(b5, &nora, GPU_LOAD_CLEAR, red);
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, b5), 0, "a texture that is not a render attachment refused");
+    var mip[80];
+    _mt_tex(&mip, MABDA_TEXFMT_RGBA8, 32, 32, 3, 1, 1, WGPU_TEX_KIND_TEXTURE, ra);
+    var b6 = gpu_pass_desc_new();
+    gpu_pass_desc_color(b6, &mip, GPU_LOAD_CLEAR, red);
+    assert_eq(_backend_wgpu_render_pass_begin_desc(&ctx, b6), 0,
+      "a 3-level texture as an attachment refused (needs a view)");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# wgpu: views, copies, writes, reads
+# ---------------------------------------------------------------------------
+fn test_wgpu_views() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var cube[80];
+    var vr[40];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _mt_tex(&cube, MABDA_TEXFMT_RGBA8, 64, 64, 4, 6, 1, WGPU_TEX_KIND_TEXTURE, 0x17);
+    store64(&vr, GPU_VIEW_2D);
+    store64(&vr + 8, 2);
+    store64(&vr + 16, 1);
+    store64(&vr + 24, 3);
+    store64(&vr + 32, 1);
+    var v = _backend_wgpu_texture_view_create(&ctx, &cube, &vr);
+    assert_nonnull(v, "face 3 level 2 view");
+    assert_eq(_mt_view_tex, 0x7D, "made on the cube's texture");
+    assert_eq(load32(_mt_view_desc + 28), GPU_VIEW_2D, "dimension 2D");
+    assert_eq(load32(_mt_view_desc + 32), 2, "baseMipLevel 2");
+    assert_eq(load32(_mt_view_desc + 36), 1, "one level");
+    assert_eq(load32(_mt_view_desc + 40), 3, "baseArrayLayer 3");
+    assert_eq(load32(_mt_view_desc + 44), 1, "one layer");
+    assert_eq(load32(v + 24), 16, "view width = level 2 of 64");
+    assert_eq(load32(v + 44), WGPU_TEX_KIND_VIEW, "kind VIEW");
+    assert_eq(load32(v + 64), 2, "absolute base level");
+    assert_eq(load32(v + 68), 3, "absolute base layer");
+    # A view of the view: offsets add up.
+    store64(&vr + 8, 0);
+    store64(&vr + 24, 0);
+    var vv = _backend_wgpu_texture_view_create(&ctx, v, &vr);
+    assert_eq(load32(_mt_view_desc + 64 + 32), 2, "view of a view: base level 2 + 0");
+    assert_eq(load32(_mt_view_desc + 64 + 40), 3, "view of a view: base layer 3 + 0");
+    store64(&vr, GPU_VIEW_CUBE);
+    store64(&vr + 8, 0);
+    store64(&vr + 16, 0);
+    store64(&vr + 24, 0);
+    store64(&vr + 32, 0);
+    var whole = _backend_wgpu_texture_view_create(&ctx, &cube, &vr);
+    assert_nonnull(whole, "whole cube (0 = to the last)");
+    assert_eq(load32(_mt_view_desc + 128 + 36), 4, "all 4 levels");
+    assert_eq(load32(_mt_view_desc + 128 + 44), 6, "all 6 layers");
+    store64(&vr + 24, 1);
+    store64(&vr + 32, 6);
+    assert_eq(_backend_wgpu_texture_view_create(&ctx, &cube, &vr), 0, "a cube view past the layers refused");
+    store64(&vr, GPU_VIEW_2D);
+    store64(&vr + 24, 0);
+    store64(&vr + 32, 2);
+    assert_eq(_backend_wgpu_texture_view_create(&ctx, &cube, &vr), 0, "a 2-layer 2D view refused");
+    store64(&vr, GPU_VIEW_CUBE);
+    store64(&vr + 32, 5);
+    assert_eq(_backend_wgpu_texture_view_create(&ctx, &cube, &vr), 0, "a 5-layer cube view refused");
+    store64(&vr, GPU_VIEW_2D);
+    store64(&vr + 8, 4);
+    store64(&vr + 32, 1);
+    assert_eq(_backend_wgpu_texture_view_create(&ctx, &cube, &vr), 0, "a base level past the chain refused");
+    _mt_tex_release = 0;
+    _mt_view_release = 0;
+    assert_eq(_backend_wgpu_texture_view_release(&ctx, v), 0, "view released");
+    assert_eq(_mt_view_release, 1, "its view released");
+    assert_eq(_mt_tex_release, 0, "not the cube's texture");
+    assert_neq(_backend_wgpu_texture_view_release(&ctx, &cube), 0, "releasing a texture as a view refused");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+fn test_wgpu_copies() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var a[80];
+    var b[80];
+    var cr[64];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _mt_tex(&a, MABDA_TEXFMT_RGBA8, 16, 16, 1, 1, 1, WGPU_TEX_KIND_TEXTURE, 0x17);
+    _mt_tex(&b, MABDA_TEXFMT_RGBA8_SRGB, 8, 8, 2, 6, 1, WGPU_TEX_KIND_VIEW, 0x17);
+    store64(&b, 0x7B);
+    store32(&b + 64, 1);
+    store32(&b + 68, 4);
+    memset(&cr, 0, 64);
+    store64(&cr, &a);
+    store64(&cr + 8, 2);
+    store64(&cr + 16, 3);
+    store64(&cr + 24, &b);
+    store64(&cr + 32, 1);
+    store64(&cr + 40, 1);
+    store64(&cr + 48, 4);
+    store64(&cr + 56, 5);
+    assert_eq(_backend_wgpu_texture_copy(&ctx, &cr), 0, "RGBA8 -> its sRGB twin copied");
+    assert_eq(load64(_mt_copy), 0x7D, "src texture @+0");
+    assert_eq(load32(_mt_copy + 12), 2, "src origin x @+12");
+    assert_eq(load32(_mt_copy + 16), 3, "src origin y @+16");
+    assert_eq(load32(_mt_copy + 24), WGPU_TEXTURE_ASPECT_ALL, "aspect All @+24");
+    assert_eq(load64(_mt_copy + 32), 0x7B, "dst texture");
+    assert_eq(load32(_mt_copy + 32 + 8), 1, "dst mip = the view's base level");
+    assert_eq(load32(_mt_copy + 32 + 20), 4, "dst origin z = the view's base layer");
+    assert_eq(load32(_mt_copy + 64), 4, "extent w");
+    assert_eq(load32(_mt_copy + 68), 5, "extent h");
+    assert_eq(load32(_mt_copy + 72), 1, "extent depth 1");
+    store64(&cr + 48, 0);
+    store64(&cr + 56, 0);
+    store64(&cr + 8, 0);
+    store64(&cr + 16, 0);
+    store64(&cr + 32, 0);
+    store64(&cr + 40, 0);
+    assert_neq(_backend_wgpu_texture_copy(&ctx, &cr), 0, "w = h = 0 copies the 16 x 16 source: too big for 8 x 8");
+    store64(&cr, &b);
+    store64(&cr + 24, &a);
+    assert_eq(_backend_wgpu_texture_copy(&ctx, &cr), 0, "w = h = 0: the 8 x 8 source's size");
+    assert_eq(load32(_mt_copy + 64), 8, "extent = source width");
+    store32(&b + 16, MABDA_TEXFMT_RGBA16F);
+    store64(&b + 16, MABDA_TEXFMT_RGBA16F);
+    assert_neq(_backend_wgpu_texture_copy(&ctx, &cr), 0, "RGBA16F -> RGBA8 refused");
+    store64(&b + 16, MABDA_TEXFMT_RGBA8);
+    store32(&a + 72, 0x15);
+    assert_neq(_backend_wgpu_texture_copy(&ctx, &cr), 0, "a destination without COPY_DST refused");
+    _mt_finish_ret = 0;
+    store32(&a + 72, 0x17);
+    assert_eq(_backend_wgpu_texture_copy(&ctx, &cr), GPU_ERR_VALIDATION,
+      "a refused command buffer -> GPU_ERR_VALIDATION");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+fn test_wgpu_write_read_sub() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var t[80];
+    var src[256];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _mt_tex(&t, MABDA_TEXFMT_RGBA16F, 8, 8, 3, 6, 1, WGPU_TEX_KIND_VIEW, 0x17);
+    store32(&t + 64, 1);
+    store32(&t + 68, 2);
+    # level 1 of an 8 x 8 RGBA16F = 4 x 4 x 8 = 128 bytes.
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 3, 1, &src, 128), 0, "layer 3 level 1 written");
+    assert_eq(load32(_mt_write + 8), 2, "mipLevel = base 1 + 1");
+    assert_eq(load32(_mt_write + 20), 5, "origin.z = base 2 + 3");
+    assert_eq(load32(_mt_write + 32 + 8), 32, "bytesPerRow 4 x 8");
+    assert_eq(load32(_mt_write + 32 + 12), 4, "rowsPerImage 4");
+    assert_eq(load32(_mt_write + 48), 4, "extent w");
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 0, 1, &src, 127), GPU_ERR_BUFFER, "a size mismatch refused");
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 6, 0, &src, 512), GPU_ERR_TEXTURE, "layer past the view refused");
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 0, 3, &src, 8), GPU_ERR_TEXTURE, "level past the view refused");
+    store64(&t + 16, MABDA_TEXFMT_DEPTH32F);
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 0, 0, &src, 256), GPU_ERR_TEXTURE, "a depth upload refused");
+    store64(&t + 16, MABDA_TEXFMT_RGBA8);
+    store32(&t + 72, WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT);
+    assert_eq(_wgpu_tex_write_sub(&ctx, &t, 0, 0, &src, 256), GPU_ERR_TEXTURE, "no COPY_DST refused");
+    var m[80];
+    _mt_tex(&m, MABDA_TEXFMT_DEPTH32F, 8, 8, 1, 1, 4, WGPU_TEX_KIND_TARGET, 0x14);
+    assert_eq(_wgpu_tex_read_sub(&ctx, &m, 0, 0, &src, 256), GPU_ERR_TEXTURE, "a multisampled depth read refused");
+    var h[80];
+    _mt_tex(&h, MABDA_TEXFMT_RGBA16F, 8, 8, 1, 1, 1, WGPU_TEX_KIND_TARGET, 0x17);
+    assert_eq(_wgpu_tex_read_sub(&ctx, &h, 0, 0, &src, 256), GPU_ERR_BUFFER, "RGBA16F reads 8 B / texel: 256 is wrong");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+fn test_wgpu_buffer_read_window() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var dst[16];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _mt_finish_ret = 0;      # stop after the copy: the window is what is checked
+    assert_neq(_backend_wgpu_buffer_read(&ctx, 0xB1, 2, &dst, 5), 0, "a refused copy is an error, not stale zeros");
+    assert_eq(load64(_mt_b2b), 0, "copy starts at the word below offset 2");
+    assert_eq(load64(_mt_b2b + 8), 8, "copy spans to the word above 2 + 5");
+    assert_eq(_backend_wgpu_buffer_read(&ctx, 0xB1, 26, &dst, 4), GPU_ERR_BUFFER,
+      "a window past a 30-byte buffer's last word refused");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+fn test_wgpu_mip_refusals() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    var t[80];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _mt_tex(&t, MABDA_TEXFMT_DEPTH32F, 8, 8, 4, 1, 1, WGPU_TEX_KIND_TEXTURE, 0x15);
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(&ctx, &t), GPU_ERR_FORMAT_UNSUPPORTED, "depth chain refused");
+    store64(&t + 16, MABDA_TEXFMT_BC7);
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(&ctx, &t), GPU_ERR_FORMAT_UNSUPPORTED, "compressed chain refused");
+    store64(&t + 16, MABDA_TEXFMT_RGBA8);
+    store32(&t + 44, WGPU_TEX_KIND_VIEW);
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(&ctx, &t), GPU_ERR_TEXTURE, "a view refused");
+    store32(&t + 44, WGPU_TEX_KIND_TEXTURE);
+    store32(&t + 72, 0x07);
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(&ctx, &t), GPU_ERR_TEXTURE, "not a render attachment refused");
+    store32(&t + 72, 0x17);
+    store32(&t + 32, 1);
+    assert_eq(_backend_wgpu_texture_generate_mipmaps(&ctx, &t), 0, "one level: nothing to do");
+    assert_eq(_wgpu_blit_index(MABDA_TEXFMT_RGBA8), 0, "blit: RGBA8");
+    assert_eq(_wgpu_blit_index(MABDA_TEXFMT_RGBA16F), 4, "blit: RGBA16F");
+    assert_eq(_wgpu_blit_index(MABDA_TEXFMT_DEPTH32F), 0 - 1, "blit: no depth");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# compute tier
+# ---------------------------------------------------------------------------
+fn test_compute_desc_builder() {
+    var cd = gpu_compute_desc_new(0x50, "cs");
+    assert_nonnull(cd, "compute desc");
+    assert_eq(load64(cd), 0x50, "module");
+    assert_neq(gpu_compute_desc_bind_group_layout(cd, 4, 0x60), 0, "group 4 refused");
+    assert_neq(gpu_compute_desc_bind_group_layout(cd, 0, 0), 0, "null layout refused");
+    assert_eq(gpu_compute_desc_bind_group_layout(cd, 1, 0x61), 0, "group 1 set");
+    assert_eq(load64(cd + 24), 2, "count 2");
+    var ctx[208];
+    var be[1024];
+    memset(&ctx, 0, 208);
+    memset(&be, 0, BACKEND_SIZE);
+    store64(&ctx + 32, &be);
+    gpu_error_clear();
+    assert_eq(gpu_compute_pipeline_create_desc(&ctx, cd), 0, "group 0 unset: refused");
+    gpu_compute_desc_bind_group_layout(cd, 0, 0x60);
+    assert_eq(gpu_compute_pipeline_create_desc(&ctx, cd), 0, "no slot -> 0");
+    assert_eq(gpu_last_error(), GPU_ERR_NOT_IMPLEMENTED, "missing slot recorded");   #skip-lint
+    assert_eq(gpu_compute_pass_begin(&ctx), 0, "no slot: no pass");
+    assert_eq(gpu_compute_pass_dispatch(&ctx, 0x1, 0, 1, 1), GPU_ERR_WORKGROUP_LIMIT, "x = 0 refused");
+    assert_eq(gpu_compute_pass_dispatch(&ctx, 0x1, 70000, 1, 1), GPU_ERR_WORKGROUP_LIMIT, "x past the limit refused");
+    var offs[8];
+    store32(&offs, 100);
+    assert_eq(gpu_compute_pass_set_bind_group(&ctx, 0x1, 0, 0x2, 1, &offs), GPU_ERR_BUFFER,
+      "unaligned dynamic offset refused");
+    assert_eq(gpu_compute_pass_set_bind_group(&ctx, 0x1, 4, 0x2, 0, 0), GPU_ERR_PIPELINE, "group 4 refused");
+    return 0;
+}
+
+fn test_wgpu_compute_bytes() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    var cd = gpu_compute_desc_new(0x50, "cs_update");
+    gpu_compute_desc_bind_group_layout(cd, 0, 0x60);
+    gpu_compute_desc_label(cd, "lbl");
+    var p = gpu_compute_pipeline_create_desc(&ctx, cd);
+    assert_nonnull(p, "compute pipeline");
+    assert_eq(load64(p), 0xC9, "pipeline handle");
+    assert_eq(load64(p + 8), 0x91, "its explicit layout kept for release");
+    assert_eq(load64(_mt_cpipe + 24), 0x91, "desc layout @+24");
+    assert_eq(load64(_mt_cpipe + 40), 0x50, "compute.module @+40");
+    assert_eq(load64(_mt_cpipe + 56), 9, "compute.entryPoint length (cs_update)");
+    assert_eq(load64(_mt_cpipe + 16), 3, "label length");
+    var cp = gpu_compute_pass_begin(&ctx);
+    assert_nonnull(cp, "compute pass");
+    assert_eq(gpu_compute_pass_set_pipeline(&ctx, cp, p), 0, "set pipeline");
+    assert_eq(gpu_compute_pass_dispatch(&ctx, cp, 2, 1, 1), 0, "dispatch");
+    assert_eq(gpu_compute_pass_end(&ctx, cp), 0, "end submits");
+    assert_eq(_mt_cpass_release, 1, "the pass encoder released (slot 81)");
+    _mt_finish_ret = 0;
+    cp = gpu_compute_pass_begin(&ctx);
+    assert_eq(gpu_compute_pass_end(&ctx, cp), GPU_ERR_VALIDATION, "a refused command buffer -> GPU_ERR_VALIDATION");
+    _mt_finish_ret = 0xCB;
+    mabda_wgpu_launcher_slots(81);
+    gpu_error_clear();
+    assert_eq(gpu_compute_pass_begin(&ctx), 0, "a 4.3.0 launcher: no pass");
+    assert_eq(gpu_last_error(), GPU_ERR_FFI_SYMBOL, "recorded as GPU_ERR_FFI_SYMBOL");
+    mabda_wgpu_launcher_slots(WGPU_FN_COUNT);
+    # gpu_compute_dispatch on wgpu: auto layout, binding array, per-module cache.
+    var bp[40];
+    store64(&bp, 2);
+    store64(&bp + 8, 0xB1);
+    store64(&bp + 24, 0xB2);
+    _mt_cpipe_n = 0;
+    assert_eq(_backend_wgpu_compute_dispatch(&ctx, 0x55, 1, 1, 1, &bp), 0, "dispatch 1");
+    assert_eq(_backend_wgpu_compute_dispatch(&ctx, 0x55, 1, 1, 1, &bp), 0, "dispatch 2");
+    assert_eq(_mt_cpipe_n, 1, "one pipeline for the module (cached)");
+    assert_eq(load64(_mt_cpipe + 24), 0, "auto layout (null)");
+    assert_eq(load64(_mt_cpipe + 48), 0, "entry point: null data");
+    assert_eq(load64(_mt_cpipe + 56), 0 - 1, "entry point: WGPU_STRLEN (the module's one)");
+    assert_eq(_mt_bgl_get, 1, "group 0 layout fetched once (slot 82)");
+    assert_eq(_mt_bg_n, 2, "a bind group per dispatch");
+    _wgpu_dispatch_forget(&ctx, 0x55);
+    assert_eq(_backend_wgpu_compute_dispatch(&ctx, 0x55, 1, 1, 1, &bp), 0, "after forget");
+    assert_eq(_mt_cpipe_n, 2, "a released module's pipeline is not reused");
+    store64(&bp, 17);
+    assert_eq(_backend_wgpu_compute_dispatch(&ctx, 0x55, 1, 1, 1, &bp), GPU_ERR_BUFFER, "17 bindings refused");
+    store64(&bp, 2);
+    store64(&bp + 24, 0);
+    assert_eq(_backend_wgpu_compute_dispatch(&ctx, 0x55, 1, 1, 1, &bp), GPU_ERR_BUFFER, "a null buffer refused");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# surfaces
+# ---------------------------------------------------------------------------
+fn _caps_fill(c, nfmt, f0, f1, nmodes, m0, m1, m2, usages): i64 {
+    memset(c, 0, 168);
+    store64(c, 1);
+    store64(c + 8, usages);
+    store64(c + 16, nfmt);
+    store32(c + 24, f0);
+    store32(c + 28, f1);
+    store64(c + 88, nmodes);
+    store32(c + 96, m0);
+    store32(c + 100, m1);
+    store32(c + 104, m2);
+    return 0;
+}
+
+fn test_surface_caps() {
+    var c = gpu_surface_caps_new();
+    _caps_fill(c, 2, 0x1B, 0x1C, 2, GPU_PRESENT_FIFO, GPU_PRESENT_MAILBOX, 0, 0x11);
+    assert_eq(gpu_surface_caps_format_count(c), 2, "2 formats");
+    assert_eq(gpu_surface_caps_format(c, 0), MABDA_TEXFMT_BGRA8, "format 0 BGRA8");
+    assert_eq(gpu_surface_caps_format(c, 1), MABDA_TEXFMT_BGRA8_SRGB, "format 1 BGRA8 sRGB");
+    assert_eq(gpu_surface_caps_format(c, 2), 0 - 1, "past the count");
+    assert_eq(gpu_surface_caps_has_format(c, MABDA_TEXFMT_RGBA8), 0, "RGBA8 not listed");
+    assert_eq(gpu_surface_resolve_present_mode(c, GPU_PRESENT_AUTO_VSYNC), GPU_PRESENT_FIFO,
+      "AUTO_VSYNC without FifoRelaxed -> Fifo");
+    assert_eq(gpu_surface_resolve_present_mode(c, GPU_PRESENT_AUTO_NO_VSYNC), GPU_PRESENT_MAILBOX,
+      "AUTO_NO_VSYNC without Immediate -> Mailbox");
+    assert_eq(gpu_surface_resolve_present_mode(c, GPU_PRESENT_IMMEDIATE), 0 - 1,
+      "an explicit mode the surface lacks -> -1");
+    assert_eq(gpu_surface_resolve_present_mode(c, 9), 0 - 1, "an unknown mode -> -1");
+    _caps_fill(c, 1, 0x1B, 0, 3, GPU_PRESENT_FIFO, GPU_PRESENT_FIFO_RELAXED, GPU_PRESENT_IMMEDIATE, 0x11);
+    assert_eq(gpu_surface_resolve_present_mode(c, GPU_PRESENT_AUTO_VSYNC), GPU_PRESENT_FIFO_RELAXED,
+      "AUTO_VSYNC -> FifoRelaxed");
+    assert_eq(gpu_surface_resolve_present_mode(c, GPU_PRESENT_AUTO_NO_VSYNC), GPU_PRESENT_IMMEDIATE,
+      "AUTO_NO_VSYNC -> Immediate");
+    store64(c + 16, 99);
+    assert_eq(gpu_surface_caps_format_count(c), 16, "a true count past 16 clamps to what was copied");
+    return 0;
+}
+
+fn test_wgpu_surface_bytes() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    _caps_fill(_mt_caps, 2, 0x1B, 0x1C, 2, GPU_PRESENT_FIFO, GPU_PRESENT_MAILBOX, 0, 0x11);
+    gpu_error_clear();
+    assert_eq(gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_BGRA8, GPU_PRESENT_FIFO), 0, "no surface yet -> 0");
+    assert_eq(gpu_surface_create_wayland(&ctx, 0, 0x2), GPU_ERR_SURFACE_CONFIG, "null wl_display refused");
+    assert_eq(gpu_surface_create_wayland(&ctx, 0x1, 0x2), 0, "wayland surface made");
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0x5F, "stashed on the context");
+    assert_eq(gpu_surface_create_wayland(&ctx, 0x1, 0x2), GPU_ERR_SURFACE_CONFIG, "a second one refused");
+    var caps = gpu_surface_caps_new();
+    assert_eq(gpu_surface_capabilities(&ctx, caps), 0, "capabilities read");
+    assert_eq(gpu_surface_caps_format(caps, 1), MABDA_TEXFMT_BGRA8_SRGB, "through the slot");
+    assert_eq(gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_RGBA16F, GPU_PRESENT_FIFO), 0,
+      "an unlisted format refused");
+    assert_eq(gpu_last_error(), GPU_ERR_FORMAT_UNSUPPORTED, "recorded");
+    assert_eq(gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_BGRA8, GPU_PRESENT_IMMEDIATE), 0,
+      "an unlisted mode refused");
+    var s = gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_BGRA8_SRGB, GPU_PRESENT_AUTO_NO_VSYNC);
+    assert_nonnull(s, "configured");
+    assert_eq(load64(_mt_cfg + 8), 0xD0, "config device @+8");
+    assert_eq(load32(_mt_cfg + 16), 0x1C, "config format @+16");
+    assert_eq(load64(_mt_cfg + 24), 0x11, "usage RA | COPY_SRC (the surface allows it) @+24");
+    assert_eq(load32(_mt_cfg + 32), 64, "width @+32");
+    assert_eq(load32(_mt_cfg + 36), 32, "height @+36");
+    assert_eq(load32(_mt_cfg + 60), GPU_PRESENT_MAILBOX, "AUTO_NO_VSYNC resolved to Mailbox @+60");
+    var f = gpu_surface_acquire_target(&ctx, s);
+    assert_nonnull(f, "frame");
+    assert_eq(load64(f), 0x5A, "frame texture");
+    assert_neq(load64(f + 8), 0, "frame view");
+    assert_eq(load32(f + 44), WGPU_TEX_KIND_SURFACE, "kind SURFACE");
+    assert_eq(load32(f + 24), 64, "frame width");
+    assert_eq(gpu_surface_acquire_target(&ctx, s), f, "same frame until presented");
+    _mt_view_release = 0;
+    _mt_tex_release = 0;
+    assert_eq(gpu_surface_present(&ctx, s), 0, "presented");
+    assert_eq(_mt_present, 1, "wgpuSurfacePresent called");
+    assert_eq(_mt_view_release, 1, "frame view released");
+    assert_eq(_mt_tex_release, 1, "frame texture released");
+    assert_neq(gpu_surface_present(&ctx, s), 0, "present without a frame refused");
+    _mt_cur_status = 4;
+    gpu_error_clear();
+    assert_eq(gpu_surface_acquire_target(&ctx, s), 0, "outdated: no frame");
+    assert_eq(gpu_last_error(), GPU_ERR_SURFACE_OUTDATED, "GPU_ERR_SURFACE_OUTDATED");
+    _mt_cur_status = 3;
+    gpu_surface_acquire_target(&ctx, s);
+    assert_eq(gpu_last_error(), GPU_ERR_SURFACE_TIMEOUT, "GPU_ERR_SURFACE_TIMEOUT");
+    _mt_cur_status = 1;
+    gpu_surface_acquire_target(&ctx, s);
+    _mt_cfg_n = 0;
+    assert_eq(gpu_surface_resize(&ctx, s, 32, 16), 0, "resized");
+    assert_eq(_mt_cfg_n, 1, "reconfigured once");
+    assert_eq(load32(_mt_cfg + 32), 32, "new width");
+    assert_eq(load32(_mt_cfg + 60), GPU_PRESENT_MAILBOX, "same present mode");
+    assert_eq(load64(load64(s + 64) + 8), 0, "the unpresented frame dropped");
+    assert_eq(gpu_surface_resize(&ctx, s, 0, 16), GPU_ERR_SURFACE_CONFIG, "zero width refused");
+    var s2 = gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_BGRA8, GPU_PRESENT_FIFO);
+    assert_nonnull(s2, "a reconfigure: a second record on the same surface");
+    gpu_surface_release(&ctx, s);
+    assert_eq(gpu_ctx_wgpu_surface_handle(&ctx), 0, "release clears the context's surface");
+    assert_eq(_mt_surface_release, 1, "the WGPUSurface released once");
+    gpu_surface_release(&ctx, s2);
+    assert_eq(_mt_surface_release, 1, "the second record does not release it again");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# native subset fillers
+# ---------------------------------------------------------------------------
+var _nb_rt = 0;
+var _nb_clear = 0;
+fn _nb_create(ctx, w, h): i64 { return 0x4E; }
+fn _nb_begin(ctx, rt, clear): i64 { _nb_rt = rt; _nb_clear = clear; return 0x4F; }
+
+fn test_native_target_subset() {
+    var ctx[208];
+    var be[1024];
+    memset(&ctx, 0, 208);
+    memset(&be, 0, BACKEND_SIZE);
+    store64(&ctx + 32, &be);
+    backend_set_slot(&be, BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8, &_nb_create);
+    backend_set_slot(&be, BACKEND_SLOT_RENDER_PASS_BEGIN, &_nb_begin);
+    gpu_error_clear();
+    assert_eq(_backend_native_rtier_target_create(&ctx, 8, 8, MABDA_TEXFMT_RGBA8, 1), 0x4E,
+      "RGBA8 x1 -> the native RT");
+    assert_eq(_backend_native_rtier_target_create(&ctx, 8, 8, MABDA_TEXFMT_DEPTH32F, 1), 0, "depth refused natively");
+    assert_eq(gpu_last_error(), GPU_ERR_NOT_IMPLEMENTED, "with the reason");   #skip-lint
+    assert_eq(_backend_native_rtier_target_create(&ctx, 8, 8, MABDA_TEXFMT_RGBA8, 4), 0, "MSAA refused natively");
+    var pd = gpu_pass_desc_new();
+    var c = color_new(F64_1, F64_0, F64_0, F64_1);
+    gpu_pass_desc_color(pd, 0x4E, GPU_LOAD_CLEAR, c);
+    assert_eq(_backend_native_rtier_pass_begin_desc(&ctx, pd), 0x4F,
+      "one cleared RGBA8 attachment -> the native begin");
+    assert_eq(_nb_rt, 0x4E, "the target");
+    assert_eq(load64(_nb_clear), F64_1, "the clear colour (a Color at +32)");
+    gpu_pass_desc_depth(pd, 0x50, GPU_LOAD_CLEAR, F64_1);
+    assert_eq(_backend_native_rtier_pass_begin_desc(&ctx, pd), 0, "a depth attachment refused natively");
+    gpu_pass_desc_reset(pd);
+    gpu_pass_desc_color(pd, 0x4E, GPU_LOAD_LOAD, 0);
+    assert_eq(_backend_native_rtier_pass_begin_desc(&ctx, pd), 0, "LOAD refused natively (the path clears)");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_constants();
+    test_texture_usage_policy();
+    test_pass_desc_builder();
+    test_target_dispatchers();
+    test_wgpu_render_target_bytes();
+    test_wgpu_pass_desc_bytes();
+    test_wgpu_views();
+    test_wgpu_copies();
+    test_wgpu_write_read_sub();
+    test_wgpu_buffer_read_window();
+    test_wgpu_mip_refusals();
+    test_compute_desc_builder();
+    test_wgpu_compute_bytes();
+    test_surface_caps();
+    test_wgpu_surface_bytes();
+    test_native_target_subset();
+    return assert_summary();
+}

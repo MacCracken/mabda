@@ -93,3 +93,94 @@ fn _backend_nvidia_pass_draw(ctx, pass, vc, ic, fv, fi): i64 {
     if (pipe == 0) { return GPU_ERR_PIPELINE; }
     return _backend_nvidia_render_pass_draw(ctx, pass, pipe, vc, ic);
 }
+
+# ================================================================
+# 4.3.1 — the target block (src/gpu_target.cyr) on the native backends
+# ================================================================
+# The native render path draws into a single-sample RGBA8 target that it clears
+# at pass begin. render_target_create serves exactly that target; the descriptor
+# pass serves one such colour attachment, cleared and stored, with no depth and
+# no resolve; readback copies the target's linear rows (pitched on NVIDIA).
+# Views, copies, the other formats, MSAA and depth need the native render tier
+# (roadmap, soorat's ledger L7): their slots stay empty and the public tier
+# reports GPU_ERR_NOT_IMPLEMENTED.  #skip-lint
+
+fn _native_rtier_refuse(msg): i64 {
+    _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED, msg, 1);   #skip-lint
+    return 0;
+}
+
+# BACKEND_SLOT_RENDER_TARGET_CREATE, both native backends.
+fn _backend_native_rtier_target_create(ctx, w, h, fmt, samples): i64 {
+    if (ctx == 0) { return 0; }
+    if (fmt != MABDA_TEXFMT_RGBA8) { return _native_rtier_refuse("native render tier: render targets are RGBA8"); }
+    if (samples != 1) { return _native_rtier_refuse("native render tier: render targets are single-sample"); }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_TARGET_CREATE_2D_RGBA8);
+    if (slot == 0) { return 0; }
+    return fncall3(slot, ctx, w, h);
+}
+
+# BACKEND_SLOT_RENDER_PASS_BEGIN_DESC, both native backends: the descriptor's one
+# colour attachment maps onto the backend's render_pass_begin (ctx, rt, clear).
+# The attachment's clear colour (four f64 at +32) is a mabda Color.
+fn _backend_native_rtier_pass_begin_desc(ctx, pd): i64 {
+    if (ctx == 0) { return 0; }
+    if (pd == 0) { return 0; }
+    if (load64(pd) != 1) {
+        return _native_rtier_refuse("native render tier: a pass has exactly one colour attachment");
+    }
+    if (load64(pd + 8) != 0) { return _native_rtier_refuse("native render tier: depth attachments are not served"); }
+    var c = pd + GPU_PASS_OFF_COLORS;
+    if (load64(c + 8) != GPU_LOAD_CLEAR) {
+        return _native_rtier_refuse("native render tier: the attachment is cleared at begin (GPU_LOAD_CLEAR)");
+    }
+    if (load64(c + 16) != GPU_STORE_STORE) {
+        return _native_rtier_refuse("native render tier: the attachment is stored");
+    }
+    if (load64(c + 24) != 0) { return _native_rtier_refuse("native render tier: resolve targets are not served"); }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_PASS_BEGIN);
+    if (slot == 0) { return 0; }
+    return fncall3(slot, ctx, load64(c), c + 32);
+}
+
+# Wait for the GPU before reading a target the CPU maps.
+fn _native_rtier_wait(ctx): i64 {
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_DEVICE_WAIT_IDLE);
+    if (slot == 0) { return 0; }
+    return fncall1(slot, ctx);
+}
+
+# BACKEND_SLOT_RENDER_TARGET_READ, AMD: the target is linear, tight rows.
+fn _backend_native_rtier_target_read(ctx, rt, dst, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (rt == 0) { return GPU_ERR_TEXTURE; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    var w = load32(rt + NATIVE_RT_FIELD_WIDTH);
+    var h = load32(rt + NATIVE_RT_FIELD_HEIGHT);
+    var addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    if (addr == 0) { return GPU_ERR_TEXTURE; }
+    if (n != w * h * 4) { return GPU_ERR_BUFFER; }
+    _native_rtier_wait(ctx);
+    gpu_copy_bytes(dst, addr, n);
+    return 0;
+}
+
+# BACKEND_SLOT_RENDER_TARGET_READ, NVIDIA: rows are pitched to 128 bytes
+# (native_nv_rt_pitch_bytes); copied out tight.
+fn _backend_nvidia_rtier_target_read(ctx, rt, dst, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (rt == 0) { return GPU_ERR_TEXTURE; }
+    if (dst == 0) { return GPU_ERR_BUFFER; }
+    var w = load32(rt + NV_RT_WIDTH);
+    var h = load32(rt + NV_RT_HEIGHT);
+    var addr = load64(rt + NV_RT_ADDR);
+    if (addr == 0) { return GPU_ERR_TEXTURE; }
+    var row = w * 4;
+    if (n != row * h) { return GPU_ERR_BUFFER; }
+    var pitch = native_nv_rt_pitch_bytes(w);
+    _native_rtier_wait(ctx);
+    for (var y = 0; y < h; y = y + 1) {
+        gpu_copy_bytes(dst + y * row, addr + y * pitch, row);
+    }
+    return 0;
+}

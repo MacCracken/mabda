@@ -1,0 +1,657 @@
+# programs/target_tier_e2e.cyr — the render tier's MB2 + MB3 on real hardware (v4.3.1)
+#
+#   A (MB2, depth and shadows) — a colour + Depth32F pass with depth test LESS:
+#     a near quad drawn before a far one hides it; the depth target reads back
+#     the quads' depths and the clear; a second pass LOADs colour and depth; a
+#     third binds the depth target as a texture_depth_2d with a LessEqual
+#     comparison sampler (the shadow lookup); a depth-only pass (no colour
+#     attachment, a pipeline without a fragment stage) writes a shadow map; a
+#     read-only depth pass tests against it without writing.
+#   B (MB3, formats / MSAA / views / mips / copies / readback) — RGBA16F, sRGB
+#     and BGRA8 targets clear to the expected bytes; a 4x MSAA target resolves
+#     antialiased edge pixels; two colour targets in one pass; rendering into
+#     each cube face and into a mip level through attachment views; mip chains
+#     generated for RGBA8, sRGB, RGBA16F and a cube; texture-to-texture copies;
+#     the errors (attachments of two sizes, a depth upload, view ranges, copy
+#     formats); 1000 descriptor frames allocate 0 bytes of Cyrius heap.
+#
+# Linked with deps/wgpu_main.c via `make test-target-tier-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 {
+    _e2e_line(2, "FAIL: ", msg);
+    if (gpu_last_error() != 0) { _e2e_line(2, "      ", gpu_last_error_message()); }
+    return 1;
+}
+fn _info(msg): i64 { _e2e_line(1, "    ", msg); return 0; }
+fn _info_int(label, v): i64 {
+    var nb[64];
+    memset(&nb, 0, 64);
+    fmt_int_buf(v, &nb);
+    _e2e_line(1, label, &nb);
+    return 0;
+}
+
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+const _Z_NEAR = 0.2;
+const _Z_MID  = 0.5;
+const _Z_FAR  = 0.8;
+const _REF    = 0.4;
+const _THIRD  = 0.33;
+const _HALF   = 0.5;
+
+var FRAG = 2;
+var W = 64;
+
+fn _f(p, v): i64 { store32(p, f64_to_f32(v)); return 0; }
+
+# Six vertices (two triangles) of a quad at depth z, colour (r, g, b): the LINE
+# vertex layout (28 B: position f32x3, colour f32x4) at vertex `base`.
+fn _quad(vb, base, x0, y0, x1, y1, z, r, g, b): i64 {
+    var xs[48];
+    var ys[48];
+    store64(&xs, x0); store64(&ys, y0);
+    store64(&xs + 8, x1); store64(&ys + 8, y0);
+    store64(&xs + 16, x1); store64(&ys + 16, y1);
+    store64(&xs + 24, x0); store64(&ys + 24, y0);
+    store64(&xs + 32, x1); store64(&ys + 32, y1);
+    store64(&xs + 40, x0); store64(&ys + 40, y1);
+    for (var i = 0; i < 6; i = i + 1) {
+        var p = vb + (base + i) * 28;
+        _f(p, load64(&xs + i * 8));
+        _f(p + 4, load64(&ys + i * 8));
+        _f(p + 8, z);
+        _f(p + 12, r);
+        _f(p + 16, g);
+        _f(p + 20, b);
+        _f(p + 24, F64_1);
+    }
+    return 0;
+}
+
+var _SCENE_WGSL = "struct V { @builtin(position) p: vec4<f32>, @location(0) c: vec4<f32> };
+@vertex fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec4<f32>) -> V {
+    var o: V;
+    o.p = vec4<f32>(pos, 1.0);
+    o.c = col;
+    return o;
+}
+@fragment fn fs_main(v: V) -> @location(0) vec4<f32> { return v.c; }
+struct Two { @location(0) a: vec4<f32>, @location(1) b: vec4<f32> };
+@fragment fn fs_two(v: V) -> Two {
+    var o: Two;
+    o.a = v.c;
+    o.b = vec4<f32>(1.0 - v.c.r, 1.0 - v.c.g, 1.0 - v.c.b, 1.0);
+    return o;
+}
+";
+
+var _SHADOW_WGSL = "struct O { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_full(@builtin(vertex_index) i: u32) -> O {
+    var o: O;
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    o.p = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    o.uv = vec2<f32>(x, y);
+    return o;
+}
+@group(0) @binding(0) var sd: texture_depth_2d;
+@group(0) @binding(1) var ss: sampler_comparison;
+@fragment fn fs_shadow(v: O) -> @location(0) vec4<f32> {
+    let lit = textureSampleCompare(sd, ss, v.uv, 0.4);
+    return vec4<f32>(lit, lit, lit, 1.0);
+}
+";
+
+var _scene = 0;      # shader module
+var _vbuf = 0;       # quads: N (0..5), F (6..11), M (12..17), FULL red (18..23), TRI (24..26)
+var _black = 0;
+var _rgba = 0;       # 64 x 64 x 4 readback scratch
+
+# RGBA8 pixel (x, y) of a 64-wide RGBA8 readback as 0xRRGGBBAA.
+fn _px(buf, x, y): i64 {
+    var p = buf + (y * W + x) * 4;
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+
+# f32 depth at (x, y) of a 64-wide Depth32F readback, as its bits.
+fn _dpx(buf, x, y): i64 { return load32(buf + (y * W + x) * 4); }
+
+# 1 when f32 bits `got` are within 64 ULP of f64 `want` (both positive).
+fn _near(got, want): i64 {
+    var w = f64_to_f32(want);
+    var d = got - w;
+    if (d < 0) { d = 0 - d; }
+    if (d <= 64) { return 1; }
+    return 0;
+}
+
+fn _read_rt(ctx, rt): i64 {
+    gpu_device_wait_idle(ctx);
+    return gpu_render_target_read(ctx, rt, _rgba, W * W * 4);
+}
+
+fn _scene_pipe(ctx, fs_entry, depth_write, compare, samples, two): i64 {
+    var d = gpu_pipeline_desc_new(_scene, "vs_main");
+    if (fs_entry != 0) { gpu_pipeline_desc_fragment(d, _scene, fs_entry); }
+    gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_LINE);
+    if (fs_entry != 0) { gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL); }
+    if (two == 1) { gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL); }
+    if (compare != 0) { gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, depth_write, compare); }
+    if (samples != 1) { gpu_pipeline_desc_multisample(d, samples, 0); }
+    return gpu_render_pipeline_create_desc(ctx, d);
+}
+
+fn _setup(ctx): i64 {
+    gpu_error_clear();
+    _scene = gpu_shader_module_create(ctx, _SCENE_WGSL, strlen(_SCENE_WGSL));
+    if (_scene == 0) { return _fail("setup: scene module"); }
+    var vb = alloc(27 * 28);
+    var m1 = f64_sub(F64_0, F64_1);
+    var mt = f64_sub(F64_0, _THIRD);
+    _quad(vb, 0, mt, m1, F64_1, _HALF, _Z_NEAR, F64_0, F64_1, F64_0);    # N: right 2/3, green
+    _quad(vb, 6, m1, m1, _THIRD, _HALF, _Z_FAR, F64_1, F64_0, F64_0);    # F: left 2/3, red
+    _quad(vb, 12, m1, m1, F64_1, F64_1, _Z_MID, F64_0, F64_0, F64_1);    # M: whole, blue
+    _quad(vb, 18, m1, m1, F64_1, F64_1, _Z_MID, F64_1, F64_0, F64_0);    # FULL: whole, red
+    # TRI: a white triangle with a long diagonal edge (MSAA).
+    var t = vb + 24 * 28;
+    _f(t, m1); _f(t + 4, m1); _f(t + 8, _Z_MID);
+    _f(t + 28, F64_1); _f(t + 32, m1); _f(t + 36, _Z_MID);
+    _f(t + 56, m1); _f(t + 60, F64_1); _f(t + 64, _Z_MID);
+    for (var k = 0; k < 3; k = k + 1) {
+        _f(t + k * 28 + 12, F64_1); _f(t + k * 28 + 16, F64_1); _f(t + k * 28 + 20, F64_1); _f(t + k * 28 + 24, F64_1);
+    }
+    _vbuf = gpu_buffer_create(ctx, 27 * 28, GPU_BUFFER_USAGE_VERTEX | GPU_BUFFER_USAGE_COPY_DST);
+    if (gpu_buffer_write(ctx, _vbuf, 0, vb, 27 * 28) != 0) { return _fail("setup: vertex buffer"); }
+    _black = color_new(F64_0, F64_0, F64_0, F64_1);
+    _rgba = alloc(W * W * 8);
+    return 0;
+}
+
+fn _draw(ctx, pass, pipe, first, count): i64 {
+    var rc = gpu_render_pass_set_pipeline(ctx, pass, pipe);
+    rc = rc + gpu_render_pass_set_vertex_buffer(ctx, pass, 0, _vbuf, 0, 0);
+    rc = rc + gpu_render_pass_draw_vertices(ctx, pass, count, 1, first, 0);
+    return rc;
+}
+
+# ---------------------------------------------------------------------------
+# A — depth and shadows (MB2)
+# ---------------------------------------------------------------------------
+fn _check_depth(ctx): i64 {
+    var color = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var depth = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_DEPTH32F, 1);
+    if (color == 0) { return _fail("A: RGBA8 target"); }
+    if (depth == 0) { return _fail("A: Depth32F target"); }
+    _pass("A: an RGBA8 and a Depth32F render target");
+    var pipe = _scene_pipe(ctx, "fs_main", 1, GPU_COMPARE_LESS, 1, 0);
+    if (pipe == 0) { return _fail("A: depth-tested pipeline"); }
+    var pd = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd, color, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_depth(pd, depth, GPU_LOAD_CLEAR, F64_1);
+    var pass = gpu_render_pass_begin_desc(ctx, pd);
+    if (pass == 0) { return _fail("A: descriptor pass with a depth attachment"); }
+    var rc = _draw(ctx, pass, pipe, 0, 6);         # N (near) first
+    rc = rc + _draw(ctx, pass, pipe, 6, 6);        # then F (far)
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return _fail("A: depth pass returned an error"); }
+    if (_read_rt(ctx, color) != 0) { return _fail("A: colour readback"); }
+    if (_px(_rgba, 8, 40) != 0xFF0000FF) { return _fail("A: the far quad's own region is not red"); }
+    if (_px(_rgba, 32, 40) != 0x00FF00FF) { return _fail("A: the overlap is not the near quad's green (depth test)"); }
+    if (_px(_rgba, 56, 40) != 0x00FF00FF) { return _fail("A: the near quad's own region is not green"); }
+    if (_px(_rgba, 32, 4) != 0x000000FF) { return _fail("A: the uncovered rows are not the clear"); }
+    _pass("A: depth test LESS: the far quad drawn second is hidden where the near one is");
+    if (_read_rt(ctx, depth) != 0) { return _fail("A: depth readback (gpu_render_target_read)"); }
+    if (_near(_dpx(_rgba, 8, 40), _Z_FAR) == 0) { return _fail("A: depth at the far quad is not 0.8"); }
+    if (_near(_dpx(_rgba, 32, 40), _Z_NEAR) == 0) { return _fail("A: depth in the overlap is not 0.2"); }
+    if (_near(_dpx(_rgba, 32, 4), F64_1) == 0) { return _fail("A: uncovered depth is not the 1.0 clear"); }
+    _pass("A: the depth target reads back 0.8 / 0.2 / the 1.0 clear");
+
+    # LOAD: keep colour and depth; a mid quad (0.5, blue) over everything passes
+    # only where the stored depth is farther.
+    var pd2 = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd2, color, GPU_LOAD_LOAD, 0);
+    gpu_pass_desc_depth(pd2, depth, GPU_LOAD_LOAD, F64_1);
+    pass = gpu_render_pass_begin_desc(ctx, pd2);
+    if (pass == 0) { return _fail("A: LOAD pass"); }
+    rc = _draw(ctx, pass, pipe, 12, 6);
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return _fail("A: LOAD pass returned an error"); }
+    if (_read_rt(ctx, color) != 0) { return _fail("A: colour readback 2"); }
+    if (_px(_rgba, 8, 40) != 0x0000FFFF) { return _fail("A: LOAD: blue did not pass over depth 0.8"); }
+    if (_px(_rgba, 32, 40) != 0x00FF00FF) { return _fail("A: LOAD: blue passed over depth 0.2 (depth not loaded)"); }
+    if (_px(_rgba, 32, 4) != 0x0000FFFF) { return _fail("A: LOAD: blue did not pass over the 1.0 clear"); }
+    _pass("A: GPU_LOAD_LOAD keeps colour and depth: the mid quad lands only behind-free pixels");
+
+    # The shadow lookup: the depth target as a texture_depth_2d + LessEqual
+    # comparison sampler, reference 0.4 (lit where 0.4 <= stored depth).
+    var sm = gpu_shader_module_create(ctx, _SHADOW_WGSL, strlen(_SHADOW_WGSL));
+    if (sm == 0) { return _fail("A: shadow module"); }
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_texture(l, 0, FRAG, GPU_SAMPLE_DEPTH, GPU_VIEW_2D, 0);
+    gpu_bgl_sampler(l, 1, FRAG, GPU_SAMPLER_COMPARISON);
+    var bgl = gpu_bind_group_layout_create(ctx, l);
+    if (bgl == 0) { return _fail("A: depth + comparison layout"); }
+    var cmp = gpu_sampler_object_create(ctx, GPU_FILTER_NEAREST, GPU_ADDRESS_CLAMP, GPU_COMPARE_LESS_EQUAL);
+    if (cmp == 0) { return _fail("A: comparison sampler"); }
+    var g = gpu_bind_group_new(bgl);
+    gpu_bg_texture(g, 0, depth);
+    gpu_bg_sampler(g, 1, cmp);
+    var bg = gpu_bind_group_create(ctx, g);
+    if (bg == 0) { return _fail("A: a group binding the depth target"); }
+    var d = gpu_pipeline_desc_new(sm, "vs_full");
+    gpu_pipeline_desc_fragment(d, sm, "fs_shadow");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    gpu_pipeline_desc_bind_group_layout(d, 0, bgl);
+    var spipe = gpu_render_pipeline_create_desc(ctx, d);
+    if (spipe == 0) { return _fail("A: shadow pipeline"); }
+    var lit = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var pass3 = gpu_render_pass_begin(ctx, lit, _black);
+    rc = gpu_render_pass_set_pipeline(ctx, pass3, spipe);
+    rc = rc + gpu_render_pass_set_bind_group(ctx, pass3, 0, bg, 0, 0);
+    rc = rc + gpu_render_pass_draw_vertices(ctx, pass3, 3, 1, 0, 0);
+    rc = rc + gpu_render_pass_end(ctx, pass3);
+    if (rc != 0) { return _fail("A: shadow lookup pass returned an error"); }
+    if (_read_rt(ctx, lit) != 0) { return _fail("A: shadow readback"); }
+    if (_px(_rgba, 8, 40) != 0xFFFFFFFF) { return _fail("A: compare: stored 0.5 >= 0.4 is not lit"); }
+    if (_px(_rgba, 32, 40) != 0x000000FF) { return _fail("A: compare: stored 0.2 < 0.4 is not shadowed"); }
+    _pass("A: the depth target sampled as texture_depth_2d with a LessEqual comparison sampler");
+
+    # Depth-only: no colour attachment, a pipeline without a fragment stage.
+    var dpipe = _scene_pipe(ctx, 0, 1, GPU_COMPARE_LESS, 1, 0);
+    if (dpipe == 0) { return _fail("A: depth-only pipeline (no fragment stage)"); }
+    var smap = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_DEPTH32F, 1);
+    var pd4 = gpu_pass_desc_new();
+    gpu_pass_desc_depth(pd4, smap, GPU_LOAD_CLEAR, F64_1);
+    var pass4 = gpu_render_pass_begin_desc(ctx, pd4);
+    if (pass4 == 0) { return _fail("A: depth-only pass (0 colour attachments)"); }
+    rc = _draw(ctx, pass4, dpipe, 0, 6);
+    rc = rc + gpu_render_pass_end(ctx, pass4);
+    if (rc != 0) { return _fail("A: depth-only pass returned an error"); }
+    if (_read_rt(ctx, smap) != 0) { return _fail("A: shadow map readback"); }
+    if (_near(_dpx(_rgba, 56, 40), _Z_NEAR) == 0) { return _fail("A: shadow map: the quad's depth is not 0.2"); }
+    if (_near(_dpx(_rgba, 8, 40), F64_1) == 0) { return _fail("A: shadow map: outside the quad is not 1.0"); }
+    _pass("A: a depth-only pass (no fragment stage, no colour attachment) writes a shadow map");
+
+    # Read-only depth: test against the shadow map without writing it.
+    var rpipe = _scene_pipe(ctx, "fs_main", 0, GPU_COMPARE_LESS, 1, 0);
+    if (rpipe == 0) { return _fail("A: depth-test-only pipeline"); }
+    var c5 = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var pd5 = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd5, c5, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_depth(pd5, smap, GPU_LOAD_LOAD, F64_1);
+    gpu_pass_desc_depth_read_only(pd5, 1);
+    var pass5 = gpu_render_pass_begin_desc(ctx, pd5);
+    if (pass5 == 0) { return _fail("A: read-only depth pass"); }
+    rc = _draw(ctx, pass5, rpipe, 12, 6);
+    rc = rc + gpu_render_pass_end(ctx, pass5);
+    if (rc != 0) { return _fail("A: read-only depth pass returned an error"); }
+    if (_read_rt(ctx, c5) != 0) { return _fail("A: read-only colour readback"); }
+    if (_px(_rgba, 8, 40) != 0x0000FFFF) { return _fail("A: read-only: blue did not pass over 1.0"); }
+    if (_px(_rgba, 56, 40) != 0x000000FF) { return _fail("A: read-only: blue passed over 0.2"); }
+    if (_read_rt(ctx, smap) != 0) { return _fail("A: shadow map readback 2"); }
+    if (_near(_dpx(_rgba, 8, 40), F64_1) == 0) { return _fail("A: read-only: the depth attachment was written"); }
+    _pass("A: a read-only depth attachment is tested against and left unwritten");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# B — formats, MSAA, several targets (MB3)
+# ---------------------------------------------------------------------------
+fn _check_formats(ctx): i64 {
+    var hdr = gpu_render_target_create(ctx, 4, 4, MABDA_TEXFMT_RGBA16F, 1);
+    if (hdr == 0) { return _fail("B: RGBA16F target"); }
+    var c = color_new(_HALF, f64_from(2), f64_sub(F64_0, F64_1), F64_1);
+    var pass = gpu_render_pass_begin(ctx, hdr, c);
+    if (gpu_render_pass_end(ctx, pass) != 0) { return _fail("B: RGBA16F clear pass"); }
+    gpu_device_wait_idle(ctx);
+    if (gpu_render_target_read(ctx, hdr, _rgba, 4 * 4 * 8) != 0) { return _fail("B: RGBA16F readback (8 B/texel)"); }
+    if (load16(_rgba) != 0x3800) { return _fail("B: RGBA16F red is not f16 0.5"); }
+    if (load16(_rgba + 2) != 0x4000) { return _fail("B: RGBA16F green is not f16 2.0 (HDR value clamped?)"); }
+    if (load16(_rgba + 4) != 0xBC00) { return _fail("B: RGBA16F blue is not f16 -1.0"); }
+    if (load16(_rgba + 6) != 0x3C00) { return _fail("B: RGBA16F alpha is not f16 1.0"); }
+    _pass("B: an RGBA16F target keeps 0.5 / 2.0 / -1.0 / 1.0 (HDR) and reads back 8 B per texel");
+    var srgb = gpu_render_target_create(ctx, 4, 4, MABDA_TEXFMT_RGBA8_SRGB, 1);
+    if (srgb == 0) { return _fail("B: RGBA8 sRGB target"); }
+    var g = color_new(_HALF, _HALF, _HALF, F64_1);
+    pass = gpu_render_pass_begin(ctx, srgb, g);
+    if (gpu_render_pass_end(ctx, pass) != 0) { return _fail("B: sRGB clear pass"); }
+    gpu_device_wait_idle(ctx);
+    if (gpu_render_target_read(ctx, srgb, _rgba, 64) != 0) { return _fail("B: sRGB readback"); }
+    var v = load8(_rgba);
+    if (v < 187) { return _fail("B: sRGB: linear 0.5 was not encoded (expected ~188)"); }
+    if (v > 189) { return _fail("B: sRGB: linear 0.5 was not encoded (expected ~188)"); }
+    if (load8(_rgba + 3) != 255) { return _fail("B: sRGB alpha is not 255"); }
+    _pass("B: an RGBA8 sRGB target stores linear 0.5 as ~188 (sRGB-encoded)");
+    var bgra = gpu_render_target_create(ctx, 4, 4, MABDA_TEXFMT_BGRA8, 1);
+    if (bgra == 0) { return _fail("B: BGRA8 target"); }
+    var red = color_new(F64_1, F64_0, F64_0, F64_1);
+    pass = gpu_render_pass_begin(ctx, bgra, red);
+    if (gpu_render_pass_end(ctx, pass) != 0) { return _fail("B: BGRA8 clear pass"); }
+    gpu_device_wait_idle(ctx);
+    if (gpu_render_target_read(ctx, bgra, _rgba, 64) != 0) { return _fail("B: BGRA8 readback"); }
+    if (_px(_rgba, 0, 0) != 0x0000FFFF) { return _fail("B: BGRA8 red is not stored B,G,R,A = 0,0,255,255"); }
+    _pass("B: a BGRA8 target stores red as bytes 0, 0, 255, 255");
+    var bgras = gpu_render_target_create(ctx, 4, 4, MABDA_TEXFMT_BGRA8_SRGB, 1);
+    if (bgras == 0) { return _fail("B: BGRA8 sRGB target"); }
+    gpu_render_target_release(ctx, bgras);
+    _pass("B: a BGRA8 sRGB target");
+    return 0;
+}
+
+fn _check_msaa(ctx): i64 {
+    var ms = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 4);
+    var msd = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_DEPTH32F, 4);
+    if (ms == 0) { return _fail("B: 4x MSAA RGBA8 target"); }
+    if (msd == 0) { return _fail("B: 4x MSAA Depth32F target"); }
+    var pipe = _scene_pipe(ctx, "fs_main", 1, GPU_COMPARE_LESS, 4, 0);
+    if (pipe == 0) { return _fail("B: 4x pipeline"); }
+    var pd = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd, ms, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_color_store(pd, 0, GPU_STORE_DISCARD);
+    gpu_pass_desc_depth(pd, msd, GPU_LOAD_CLEAR, F64_1);
+    gpu_pass_desc_depth_store(pd, GPU_STORE_DISCARD);
+    var pass = gpu_render_pass_begin_desc(ctx, pd);
+    if (pass == 0) { return _fail("B: MSAA pass"); }
+    var rc = _draw(ctx, pass, pipe, 24, 3);
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return _fail("B: MSAA pass returned an error"); }
+    if (_read_rt(ctx, ms) != 0) { return _fail("B: MSAA readback (the resolve)"); }
+    var partial = 0;
+    var full = 0;
+    for (var i = 0; i < W * W; i = i + 1) {
+        var r = load8(_rgba + i * 4);
+        if (r == 255) { full = full + 1; }
+        if (r > 0) { if (r < 255) { partial = partial + 1; } }
+    }
+    if (full < 1000) { return _fail("B: MSAA: the triangle's interior did not resolve white"); }
+    if (partial < 16) {
+        _info_int("    partial pixels: ", partial);
+        return _fail("B: MSAA: no antialiased edge pixels in the resolve");
+    }
+    _info_int("    edge pixels between 0 and 255: ", partial);
+    _pass("B: 4x MSAA colour + depth: the resolve has antialiased edge pixels (samples discarded)");
+    return 0;
+}
+
+fn _check_mrt(ctx): i64 {
+    var a = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var b = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var pipe = _scene_pipe(ctx, "fs_two", 0, 0, 1, 1);
+    if (pipe == 0) { return _fail("B: two-target pipeline"); }
+    var pd = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd, a, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_color(pd, b, GPU_LOAD_CLEAR, _black);
+    var pass = gpu_render_pass_begin_desc(ctx, pd);
+    var rc = _draw(ctx, pass, pipe, 18, 6);
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return _fail("B: two-target pass returned an error"); }
+    if (_read_rt(ctx, a) != 0) { return _fail("B: target 0 readback"); }
+    if (_px(_rgba, 30, 30) != 0xFF0000FF) { return _fail("B: @location(0) is not red"); }
+    if (_read_rt(ctx, b) != 0) { return _fail("B: target 1 readback"); }
+    if (_px(_rgba, 30, 30) != 0x00FFFFFF) { return _fail("B: @location(1) is not cyan"); }
+    _pass("B: two colour targets in one pass: @location(0) red, @location(1) cyan");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# B — views: render into a cube face and a mip level
+# ---------------------------------------------------------------------------
+fn _first_texel_of_view(ctx, tex, layer, level, w): i64 {
+    var v = gpu_texture_view_create(ctx, tex, GPU_VIEW_2D, level, 1, layer, 1);
+    if (v == 0) { return 0 - 1; }
+    gpu_device_wait_idle(ctx);
+    var rc = gpu_texture_read(ctx, v, _rgba, w * w * 4);
+    gpu_texture_view_release(ctx, v);
+    if (rc != 0) { return 0 - 1; }
+    return _px(_rgba, 0, 0);
+}
+
+fn _check_views(ctx): i64 {
+    var cube = gpu_texture_create_cube(ctx, 16, MABDA_TEXFMT_RGBA8, 2);
+    if (cube == 0) { return _fail("B: a 2-level RGBA8 cube (mipped cube create)"); }
+    for (var f = 0; f < 6; f = f + 1) {
+        var v = gpu_texture_view_attachment(ctx, cube, f, 0);
+        if (v == 0) { return _fail("B: a cube-face attachment view"); }
+        var cr = f64_div(f64_from(f * 40), f64_from(255));
+        var cg = f64_div(f64_from(255 - f * 40), f64_from(255));
+        var col = color_new(cr, cg, F64_0, F64_1);
+        var pass = gpu_render_pass_begin(ctx, v, col);
+        if (pass == 0) { return _fail("B: a pass into a cube face"); }
+        if (gpu_render_pass_end(ctx, pass) != 0) { return _fail("B: cube-face pass returned an error"); }
+        gpu_texture_view_release(ctx, v);
+    }
+    var lv = gpu_texture_view_attachment(ctx, cube, 3, 1);
+    if (lv == 0) { return _fail("B: a mip-level attachment view"); }
+    var n9 = f64_div(f64_from(9), f64_from(255));
+    var nine = color_new(n9, n9, n9, F64_1);
+    var lp = gpu_render_pass_begin(ctx, lv, nine);
+    if (gpu_render_pass_end(ctx, lp) != 0) { return _fail("B: mip-level pass returned an error"); }
+    gpu_texture_view_release(ctx, lv);
+    for (var f2 = 0; f2 < 6; f2 = f2 + 1) {
+        var want = ((f2 * 40) << 24) | ((255 - f2 * 40) << 16) | 0xFF;
+        if (_first_texel_of_view(ctx, cube, f2, 0, 16) != want) {
+            return _fail("B: a cube face does not hold its own clear");
+        }
+    }
+    _pass("B: rendering into each of the 6 cube faces through attachment views");
+    if (_first_texel_of_view(ctx, cube, 3, 1, 8) != 0x090909FF) {
+        return _fail("B: level 1 of face 3 does not hold its clear");
+    }
+    _pass("B: rendering into mip level 1 of one face; read back through a view");
+    if (gpu_texture_view_create(ctx, cube, GPU_VIEW_CUBE, 0, 0, 0, 0) == 0) { return _fail("B: a whole-cube view"); }
+    gpu_error_clear();
+    if (gpu_texture_view_create(ctx, cube, GPU_VIEW_2D, 2, 1, 0, 1) != 0) {
+        return _fail("B: a view past the levels was made");
+    }
+    if (gpu_texture_view_create(ctx, cube, GPU_VIEW_2D, 0, 1, 0, 2) != 0) {
+        return _fail("B: a 2D view of 2 layers was made");
+    }
+    if (gpu_texture_view_create(ctx, cube, GPU_VIEW_CUBE, 0, 1, 1, 6) != 0) {
+        return _fail("B: a cube view past the layers was made");
+    }
+    _pass("B: views past the levels / layers and a 2-layer 2D view are refused with a reason");
+    gpu_texture_release(ctx, cube);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# B — mip generation (wgpu: a render blit per level)
+# ---------------------------------------------------------------------------
+fn _check_mips(ctx): i64 {
+    var t = gpu_texture_create_2d_fmt_mipped(ctx, 8, 8, MABDA_TEXFMT_RGBA8, 0);
+    if (t == 0) { return _fail("B: an 8x8 RGBA8 full chain"); }
+    var px = alloc(256);
+    for (var i = 0; i < 64; i = i + 1) {
+        var r = 0;
+        if ((i & 1) == 1) { r = 200; }
+        store8(px + i * 4, r);
+        store8(px + i * 4 + 1, 100);
+        store8(px + i * 4 + 2, 0);
+        store8(px + i * 4 + 3, 255);
+    }
+    if (gpu_texture_write_level(ctx, t, 0, px, 256) != 0) { return _fail("B: level 0 upload"); }
+    if (gpu_texture_generate_mipmaps(ctx, t) != 0) { return _fail("B: gpu_texture_generate_mipmaps on wgpu"); }
+    var l1 = _first_texel_of_view(ctx, t, 0, 1, 4);
+    var l3 = _first_texel_of_view(ctx, t, 0, 3, 1);
+    var r1 = (l1 >> 24) & 0xFF;
+    var r3 = (l3 >> 24) & 0xFF;
+    if (r1 < 99) { return _fail("B: mips: level 1 is not the 0/200 average"); }
+    if (r1 > 101) { return _fail("B: mips: level 1 is not the 0/200 average"); }
+    if (r3 < 99) { return _fail("B: mips: level 3 is not the average"); }
+    if (r3 > 101) { return _fail("B: mips: level 3 is not the average"); }
+    if (((l3 >> 16) & 0xFF) != 100) { return _fail("B: mips: level 3 green is not 100"); }
+    _pass("B: RGBA8 mip chain generated on wgpu: alternating 0 / 200 averages to 100 at levels 1 and 3");
+    var s = gpu_texture_create_2d_fmt_mipped(ctx, 8, 8, MABDA_TEXFMT_RGBA8_SRGB, 0);
+    if (s == 0) { return _fail("B: an sRGB chain"); }
+    for (var j = 0; j < 64; j = j + 1) { store32(px + j * 4, 0xFF808080); }
+    gpu_texture_write_level(ctx, s, 0, px, 256);
+    if (gpu_texture_generate_mipmaps(ctx, s) != 0) { return _fail("B: sRGB mip generation"); }
+    var sl = _first_texel_of_view(ctx, s, 0, 3, 1);
+    if (((sl >> 24) & 0xFF) < 127) { return _fail("B: sRGB mips: a flat 128 did not stay 128"); }
+    if (((sl >> 24) & 0xFF) > 129) { return _fail("B: sRGB mips: a flat 128 did not stay 128"); }
+    _pass("B: sRGB mip chain generated (filtered in linear space)");
+    var h = gpu_texture_create_2d_fmt_mipped(ctx, 4, 4, MABDA_TEXFMT_RGBA16F, 0);
+    if (h == 0) { return _fail("B: an RGBA16F chain"); }
+    var hp = alloc(128);
+    for (var k = 0; k < 16; k = k + 1) {
+        var hv = 0;
+        if ((k & 1) == 1) { hv = 0x4000; }       # f16 2.0
+        store16(hp + k * 8, hv);
+        store16(hp + k * 8 + 2, hv);
+        store16(hp + k * 8 + 4, hv);
+        store16(hp + k * 8 + 6, 0x3C00);
+    }
+    gpu_texture_write_level(ctx, h, 0, hp, 128);
+    if (gpu_texture_generate_mipmaps(ctx, h) != 0) { return _fail("B: RGBA16F mip generation"); }
+    var hvw = gpu_texture_view_create(ctx, h, GPU_VIEW_2D, 2, 1, 0, 1);
+    gpu_device_wait_idle(ctx);
+    if (gpu_texture_read(ctx, hvw, _rgba, 8) != 0) { return _fail("B: RGBA16F level 2 readback"); }
+    if (load16(_rgba) != 0x3C00) { return _fail("B: RGBA16F mips: 0 / 2.0 did not average to 1.0"); }
+    _pass("B: RGBA16F mip chain generated: 0 / 2.0 averages to f16 1.0 exactly");
+    var cube = gpu_texture_create_cube(ctx, 8, MABDA_TEXFMT_RGBA8, 0);
+    if (cube == 0) { return _fail("B: a full-chain cube"); }
+    for (var f = 0; f < 6; f = f + 1) {
+        for (var q = 0; q < 64; q = q + 1) { store32(px + q * 4, 0xFF000000 | (f * 30)); }
+        gpu_texture_write_layer_level(ctx, cube, f, 0, px, 256);
+    }
+    if (gpu_texture_generate_mipmaps(ctx, cube) != 0) { return _fail("B: cube mip generation"); }
+    for (var f2 = 0; f2 < 6; f2 = f2 + 1) {
+        if (_first_texel_of_view(ctx, cube, f2, 3, 1) != (((f2 * 30) << 24) | 0xFF)) {
+            return _fail("B: cube mips: a face's last level lost its colour");
+        }
+    }
+    _pass("B: cube mip chain generated per face (6 faces x 3 levels)");
+    var dt = gpu_texture_create_2d(ctx, 4, 4, MABDA_TEXFMT_DEPTH32F);
+    if (dt == 0) { return _fail("B: a Depth32F texture"); }
+    if (gpu_texture_generate_mipmaps(ctx, dt) != GPU_ERR_FORMAT_UNSUPPORTED) {
+        return _fail("B: depth mip generation was not refused");
+    }
+    _pass("B: mip generation refuses a depth texture with GPU_ERR_FORMAT_UNSUPPORTED");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# B — copies and errors
+# ---------------------------------------------------------------------------
+fn _check_copies(ctx): i64 {
+    var src = gpu_texture_create_2d(ctx, 8, 8, MABDA_TEXFMT_RGBA8);
+    var px = alloc(256);
+    for (var i = 0; i < 64; i = i + 1) { store32(px + i * 4, 0xFF000000 | (i << 8) | i); }
+    if (gpu_texture_write(ctx, src, px, 256) != 0) { return _fail("B: copy source upload"); }
+    var dst = gpu_render_target_create(ctx, 8, 8, MABDA_TEXFMT_RGBA8, 1);
+    if (gpu_texture_copy(ctx, src, dst) != 0) { return _fail("B: whole-texture copy into a target"); }
+    gpu_device_wait_idle(ctx);
+    if (gpu_render_target_read(ctx, dst, _rgba, 256) != 0) { return _fail("B: copy readback"); }
+    if (memeq(_rgba, px, 256) != 1) { return _fail("B: the copied target differs from the source"); }
+    _pass("B: gpu_texture_copy: a texture into a render target, 256 bytes identical");
+    var dst2 = gpu_texture_create_2d(ctx, 4, 4, MABDA_TEXFMT_RGBA8_SRGB);
+    if (gpu_texture_copy_rect(ctx, src, 2, 3, dst2, 0, 0, 4, 4) != 0) {
+        return _fail("B: a rectangle into the sRGB twin");
+    }
+    gpu_device_wait_idle(ctx);
+    if (gpu_texture_read(ctx, dst2, _rgba, 64) != 0) { return _fail("B: rect copy readback"); }
+    if (load32(_rgba) != load32(px + (3 * 8 + 2) * 4)) {
+        return _fail("B: rect copy: (0,0) is not the source's (2,3)");
+    }
+    if (load32(_rgba + 60) != load32(px + (6 * 8 + 5) * 4)) {
+        return _fail("B: rect copy: (3,3) is not the source's (5,6)");
+    }
+    _pass("B: gpu_texture_copy_rect: (2,3)+4x4 of RGBA8 into an RGBA8 sRGB texture (copy-compatible)");
+    gpu_error_clear();
+    var hdr = gpu_texture_create_2d(ctx, 8, 8, MABDA_TEXFMT_RGBA16F);
+    if (gpu_texture_copy(ctx, src, hdr) == 0) { return _fail("B: an RGBA8 -> RGBA16F copy was taken"); }
+    if (gpu_texture_copy_rect(ctx, src, 6, 6, dst2, 0, 0, 4, 4) == 0) {
+        return _fail("B: a rectangle leaving the source was taken");
+    }
+    var dep = gpu_texture_create_2d(ctx, 4, 4, MABDA_TEXFMT_DEPTH32F);
+    if (gpu_texture_write(ctx, dep, px, 64) != GPU_ERR_TEXTURE) { return _fail("B: a depth upload was not refused"); }
+    _pass("B: copies across formats / out of range and a depth upload are refused with a reason");
+    var a = gpu_render_target_create(ctx, 8, 8, MABDA_TEXFMT_RGBA8, 1);
+    var b = gpu_render_target_create(ctx, 16, 16, MABDA_TEXFMT_DEPTH32F, 1);
+    var pd = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd, a, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_depth(pd, b, GPU_LOAD_CLEAR, F64_1);
+    gpu_error_clear();
+    if (gpu_render_pass_begin_desc(ctx, pd) != 0) { return _fail("B: attachments of two sizes were taken"); }
+    if (gpu_last_error() != GPU_ERR_TEXTURE) { return _fail("B: the size mismatch was not recorded"); }
+    _pass("B: a pass with attachments of two sizes is refused before wgpu (reason recorded)");
+    return 0;
+}
+
+# 1000 descriptor frames (colour + depth, clear, one draw) allocate nothing.
+fn _check_heap(ctx): i64 {
+    var color = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_RGBA8, 1);
+    var depth = gpu_render_target_create(ctx, W, W, MABDA_TEXFMT_DEPTH32F, 1);
+    var pipe = _scene_pipe(ctx, "fs_main", 1, GPU_COMPARE_LESS, 1, 0);
+    var pd = gpu_pass_desc_new();
+    gpu_pass_desc_color(pd, color, GPU_LOAD_CLEAR, _black);
+    gpu_pass_desc_depth(pd, depth, GPU_LOAD_CLEAR, F64_1);
+    var p0 = gpu_render_pass_begin_desc(ctx, pd);
+    _draw(ctx, p0, pipe, 0, 6);
+    gpu_render_pass_end(ctx, p0);
+    gpu_device_wait_idle(ctx);
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < 1000; i = i + 1) {
+        var p = gpu_render_pass_begin_desc(ctx, pd);
+        if (p == 0) { bad = bad + 1; }
+        var rc = _draw(ctx, p, pipe, 0, 6);
+        rc = rc + gpu_render_pass_end(ctx, p);
+        if (rc != 0) { bad = bad + 1; }
+        if ((i % 100) == 99) { gpu_device_wait_idle(ctx); }
+    }
+    var grown = alloc_used() - before;
+    if (bad != 0) { return _fail("B: a descriptor frame failed"); }
+    if (grown != 0) {
+        _info_int("    heap grown: ", grown);
+        return _fail("B: 1000 descriptor frames grew the Cyrius heap");
+    }
+    _pass("B: 1000 descriptor frames (colour + depth) allocated 0 bytes of Cyrius heap");
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    if (_setup(ctx) != 0) { return 1; }
+    if (_check_depth(ctx) != 0) { return 1; }
+    if (_check_formats(ctx) != 0) { return 1; }
+    if (_check_msaa(ctx) != 0) { return 1; }
+    if (_check_mrt(ctx) != 0) { return 1; }
+    if (_check_views(ctx) != 0) { return 1; }
+    if (_check_mips(ctx) != 0) { return 1; }
+    if (_check_copies(ctx) != 0) { return 1; }
+    if (_check_heap(ctx) != 0) { return 1; }
+    _e2e_summary();
+    return 0;
+}

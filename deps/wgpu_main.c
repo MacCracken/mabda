@@ -536,7 +536,11 @@ WGPUShaderModule wgpu_shim_create_shader_module_spirv(WGPUDevice device,
 // launcher tells mabda its slot count (mabda_wgpu_launcher_slots, below), and
 // mabda's wrappers for slots it does not have return an error instead of
 // calling through a pointer past the end of this table.
-#define FN_COUNT 81
+// v4.3.1: 81 -> 83. The 4.3.0 revision missed two entry points the compute tier
+// (MB4) needs: the compute pass encoder's release (without it every compute pass
+// leaked its encoder) and the compute pipeline's bind group layout (the auto
+// layout gpu_compute_dispatch binds through).
+#define FN_COUNT 83
 static void* fn_table[FN_COUNT];
 
 static void build_fn_table(void) {
@@ -642,6 +646,9 @@ static void build_fn_table(void) {
     fn_table[i++] = (void*)wgpu_shim_surface_get_capabilities;            // 79 (shim: FreeMembers by value)
     // v4.3.0 — debug groups / markers on every encoder kind (roadmap backlog).
     fn_table[i++] = (void*)wgpu_shim_debug_op;                            // 80 (shim: labels by value)
+    // v4.3.1 — MB4 compute tier.
+    fn_table[i++] = (void*)wgpuComputePassEncoderRelease;                 // 81
+    fn_table[i++] = (void*)wgpuComputePipelineGetBindGroupLayout;         // 82
     // A slot added above without bumping FN_COUNT (or the reverse) would hand
     // mabda a table whose tail is NULL or overruns: refuse to start instead.
     if (i != FN_COUNT) {

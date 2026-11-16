@@ -1,0 +1,217 @@
+# @internal — wgpu backend, Wayland window surfaces (v4.3.1, MB5)
+# backend_wgpu_surface.cyr — fills the surface block of Backend slots
+# (src/backend.cyr 592..632) for wgpu: a WGPUSurface from a Wayland
+# wl_display + wl_surface (launcher slot 78, the chained-descriptor shim), its
+# capabilities (slot 79), configuration in any format the surface lists with the
+# present mode resolved against it, the frame as a texture object, and resize.
+# The public side is src/surface_v3.cyr.
+#
+# Surface record (WGPU_SURFACE_STATE_SIZE = 80 bytes): a SurfaceState
+# (src/surface.cyr) for its first 48 bytes, so the older surface_state_* calls and
+# the gpu_surface_present / _release slots read it, then:
+#   +48: MABDA_TEXFMT_* format    +56: kind (1 = made by gpu_surface_configure;
+#                                       0 = surface_state_new's, which zeroes it)
+#   +64: the frame record (a WGPU_TEX_SIZE texture object of kind SURFACE, made
+#        once and refilled each frame)   +72: the configured WGPUTextureUsage
+var WGPU_SURFACE_STATE_SIZE = 80;
+
+fn _wgpu_surface_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+fn _backend_wgpu_surface_create_wayland(ctx, wl_display, wl_surface): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (_wgpu_has_slot(78) == 0) {
+        return _wgpu_surface_fail(GPU_ERR_FFI_SYMBOL,
+          "surface: the launcher predates 4.3.0 (no Wayland surface slot 78)");
+    }
+    if (gpu_ctx_wgpu_surface_handle(ctx) != 0) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG,
+          "surface: the context already has one (gpu_surface_release it first)");
+    }
+    var surf = wgpu_instance_create_surface_wayland(gpu_ctx_instance(ctx), wl_display, wl_surface);
+    if (surf == 0) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG,
+          "surface: wgpu made no surface from the wl_display / wl_surface");
+    }
+    gpu_ctx_set_wgpu_surface_handle(ctx, surf);
+    return 0;
+}
+
+# The launcher's WgpuSurfaceCapsOut (168 B) into `out`. 1 = WGPUStatus_Success.
+fn _wgpu_surface_caps(ctx, out): i64 {
+    var surf = gpu_ctx_wgpu_surface_handle(ctx);
+    if (surf == 0) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: none yet (gpu_surface_create_wayland first)");
+    }
+    if (_wgpu_has_slot(79) == 0) {
+        return _wgpu_surface_fail(GPU_ERR_FFI_SYMBOL, "surface: the launcher predates 4.3.0 (no capabilities slot 79)");
+    }
+    var st = wgpu_surface_get_capabilities(surf, gpu_ctx_adapter(ctx), out);
+    if (st != 1) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: wgpu could not read the surface's capabilities");
+    }
+    return 0;
+}
+
+fn _backend_wgpu_surface_capabilities(ctx, out): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (out == 0) { return GPU_ERR_OTHER; }
+    return _wgpu_surface_caps(ctx, out);
+}
+
+# wgpuSurfaceConfigure from the record. WGPUSurfaceConfiguration (64 B,
+# offsetof): device +8, format +16, usage +24 (u64), width +32, height +36,
+# viewFormatCount +40, viewFormats +48, alphaMode +56 (0 = Auto), presentMode +60.
+# Error-scoped: wgpu reports a refused configuration as a device error.
+fn _wgpu_surface_apply(ctx, ss): i64 {
+    var device = gpu_ctx_device(ctx);
+    var cfg[64];
+    memset(&cfg, 0, 64);
+    store64(&cfg + 8, device);
+    store32(&cfg + 16, load32(ss + 16));
+    store64(&cfg + 24, load64(ss + 72));
+    store32(&cfg + 32, load64(ss + 24));
+    store32(&cfg + 36, load64(ss + 32));
+    store32(&cfg + 60, load32(ss + 40));
+    var scoped = _wgpu_scope_open(device);
+    wgpu_surface_configure(load64(ss), &cfg);
+    if (scoped == 0) {
+        var rc = _wgpu_scope_close(ctx, device);
+        if (rc != 0) { return rc; }
+    }
+    return 0;
+}
+
+fn _backend_wgpu_surface_configure_ex(ctx, w, h, fmt, mode): i64 {
+    if (ctx == 0) { return 0; }
+    var surf = gpu_ctx_wgpu_surface_handle(ctx);
+    if (surf == 0) {
+        _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: none yet (gpu_surface_create_wayland first)");
+        return 0;
+    }
+    var caps[168];
+    memset(&caps, 0, 168);
+    if (_wgpu_surface_caps(ctx, &caps) != 0) { return 0; }
+    if (gpu_surface_caps_has_format(&caps, fmt) == 0) {
+        _wgpu_surface_fail(GPU_ERR_FORMAT_UNSUPPORTED,
+          "surface: the surface does not list this format (gpu_surface_capabilities)");
+        return 0;
+    }
+    var pm = gpu_surface_resolve_present_mode(&caps, mode);
+    if (pm < 0) {
+        _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: the surface does not offer this present mode");
+        return 0;
+    }
+    # RENDER_ATTACHMENT always; COPY_SRC too when the surface allows it, so a frame
+    # can be read back (screenshots, tests) before it is presented.
+    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    if ((load64(&caps + 8) & WGPU_TEXTURE_USAGE_COPY_SRC) != 0) { usage = usage | WGPU_TEXTURE_USAGE_COPY_SRC; }
+    var ss = alloc(WGPU_SURFACE_STATE_SIZE);
+    if (ss == 0) { return 0; }
+    memset(ss, 0, WGPU_SURFACE_STATE_SIZE);
+    var frame = _wgpu_tex_new(0, 0, fmt, w, h, 1, 1, 1, WGPU_TEX_KIND_SURFACE, usage,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D);
+    if (frame == 0) { return 0; }
+    store64(ss + 0, surf);
+    store64(ss + 8, gpu_ctx_device(ctx));
+    store32(ss + 16, mabda_texfmt_to_wgpu(fmt));
+    store64(ss + 24, w);
+    store64(ss + 32, h);
+    store32(ss + 40, pm);
+    store64(ss + 48, fmt);
+    store64(ss + 56, 1);
+    store64(ss + 64, frame);
+    store64(ss + 72, usage);
+    if (_wgpu_surface_apply(ctx, ss) != 0) { return 0; }
+    return ss;
+}
+
+# Release the acquired frame's view and texture reference (both returned to the
+# caller by wgpuSurfaceGetCurrentTexture / the view create).
+fn _wgpu_surface_drop_frame(ss): i64 {
+    var frame = load64(ss + 64);
+    if (frame == 0) { return 0; }
+    if (load64(frame + 8) != 0) { wgpu_texture_view_release(load64(frame + 8)); }
+    if (load64(frame) != 0) { wgpu_texture_release(load64(frame)); }
+    store64(frame, 0);
+    store64(frame + 8, 0);
+    return 0;
+}
+
+fn _wgpu_surface_status_err(status): i64 {
+    if (status == WGPU_SURFACE_STATUS_TIMEOUT) { return GPU_ERR_SURFACE_TIMEOUT; }
+    if (status == 4) { return GPU_ERR_SURFACE_OUTDATED; }   # WGPUSurfaceGetCurrentTextureStatus_Outdated
+    return GPU_ERR_SURFACE_LOST;                             # Lost (5), Error (6)
+}
+
+# WGPUSurfaceTexture (24 B, offsetof): texture +8, status +16.
+fn _backend_wgpu_surface_acquire_target(ctx, ss): i64 {
+    if (ctx == 0) { return 0; }
+    if (ss == 0) { return 0; }
+    if (load64(ss + 56) != 1) {
+        _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: acquire_target needs a gpu_surface_configure surface");
+        return 0;
+    }
+    var frame = load64(ss + 64);
+    if (load64(frame + 8) != 0) { return frame; }   # this frame, until presented
+    var st[24];
+    memset(&st, 0, 24);
+    wgpu_surface_get_current_texture(load64(ss), &st);
+    var status = load32(&st + 16);
+    var tex = load64(&st + 8);
+    if (status != WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL) {
+        if (status != WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL) {
+            if (tex != 0) { wgpu_texture_release(tex); }
+            _wgpu_surface_fail(_wgpu_surface_status_err(status),
+              "surface: no frame (timeout, outdated: resize, or lost)");
+            return 0;
+        }
+    }
+    if (tex == 0) { _wgpu_surface_fail(GPU_ERR_SURFACE_LOST, "surface: wgpu returned no frame texture"); return 0; }
+    var vd[64];
+    _wgpu_view_desc_fill(&vd, load32(ss + 16), WGPU_TEXTURE_VIEW_DIMENSION_2D, 0, 1, 0, 1);
+    var view = wgpu_texture_create_view(tex, &vd);
+    if (view == 0) {
+        wgpu_texture_release(tex);
+        _wgpu_surface_fail(GPU_ERR_SURFACE_LOST, "surface: no view of the frame texture");
+        return 0;
+    }
+    store64(frame, tex);
+    store64(frame + 8, view);
+    store32(frame + 24, load64(ss + 24));
+    store32(frame + 28, load64(ss + 32));
+    return frame;
+}
+
+fn _backend_wgpu_surface_resize(ctx, ss, w, h): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (ss == 0) { return GPU_ERR_OTHER; }
+    if (load64(ss + 56) != 1) { return surface_state_resize(ss, w, h); }
+    _wgpu_surface_drop_frame(ss);
+    store64(ss + 24, w);
+    store64(ss + 32, h);
+    return _wgpu_surface_apply(ctx, ss);
+}
+
+# Present the acquired frame and drop it (a gpu_surface_configure surface); the
+# older surface_state path presents as before.
+fn _wgpu_surface_present_ex(ctx, ss): i64 {
+    var frame = load64(ss + 64);
+    if (load64(frame + 8) == 0) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: present without an acquired frame");
+    }
+    wgpu_surface_present(load64(ss));
+    _wgpu_surface_drop_frame(ss);
+    return 0;
+}
+
+fn _backend_wgpu_fill_surface(b): i64 {
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_CREATE_WAYLAND, &_backend_wgpu_surface_create_wayland);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_CAPABILITIES,   &_backend_wgpu_surface_capabilities);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_CONFIGURE_EX,   &_backend_wgpu_surface_configure_ex);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_ACQUIRE_TARGET, &_backend_wgpu_surface_acquire_target);
+    backend_set_slot(b, BACKEND_SLOT_SURFACE_RESIZE,         &_backend_wgpu_surface_resize);
+    return 0;
+}

@@ -1,0 +1,176 @@
+# @public — compute on the render tier's terms (v4.3.1, MB4)
+# gpu_compute_tier.cyr — compute pipelines from a descriptor (an entry point and
+# explicit bind group layouts: storage read-write / read-only and uniform mixed,
+# built with src/gpu_bind.cyr) and compute passes that bind groups (with dynamic
+# offsets) and dispatch. A particle update:
+#
+#   var l = gpu_bind_group_layout_new();
+#   gpu_bgl_storage(l, 0, GPU_STAGE_COMPUTE, 0, 0, 0);      # particles, read-write
+#   gpu_bgl_uniform(l, 1, GPU_STAGE_COMPUTE, 0, 16);        # params
+#   var bgl = gpu_bind_group_layout_create(ctx, l);
+#   var cd = gpu_compute_desc_new(module, "cs_update");
+#   gpu_compute_desc_bind_group_layout(cd, 0, bgl);
+#   var pipe = gpu_compute_pipeline_create_desc(ctx, cd);
+#   ... per frame:
+#   var cp = gpu_compute_pass_begin(ctx);
+#   gpu_compute_pass_set_pipeline(ctx, cp, pipe);
+#   gpu_compute_pass_set_bind_group(ctx, cp, 0, bg, 0, 0);
+#   gpu_compute_pass_dispatch(ctx, cp, (count + 63) / 64, 1, 1);
+#   gpu_compute_pass_end(ctx, cp);                           # submits
+#   gpu_buffer_read(ctx, particles, 0, host, n);             # storage readback
+#
+# Errors follow the render tier: an argument mabda can check is checked here; a
+# pipeline wgpu refuses comes back 0 with the reason (gpu_last_error_message());
+# an encoding error (a dispatch without its groups) is GPU_ERR_VALIDATION from
+# gpu_compute_pass_end, and the pass is dropped rather than the process.
+#
+# Backends: wgpu (needs the 4.3.1 launcher, 83 slots: an older one returns
+# GPU_ERR_FFI_SYMBOL from gpu_compute_pass_begin rather than leak every pass's
+# encoder). Native AMD / NVIDIA dispatch through gpu_compute_dispatch
+# (src/compute.cyr) and leave these slots empty: GPU_ERR_NOT_IMPLEMENTED.  #skip-lint
+
+var GPU_COMPUTE_MAX_GROUPS = 4;
+
+# Compute pipeline descriptor (GPU_COMPUTE_DESC_SIZE = 64 bytes):
+#   +0:  shader module   +8:  entry point (cstr)   +16: label (cstr or 0)
+#   +24: group count     +32: 4 x bind group layout
+var GPU_COMPUTE_DESC_SIZE = 64;
+
+fn _gpu_ctier_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+# A descriptor for the compute stage `entry` (a NUL-terminated name such as
+# "cs_update") of `module`. 0 on allocation failure.
+fn gpu_compute_desc_new(module, entry): i64 {
+    var cd = alloc(GPU_COMPUTE_DESC_SIZE);
+    if (cd == 0) { return 0; }
+    memset(cd, 0, GPU_COMPUTE_DESC_SIZE);
+    store64(cd, module);
+    store64(cd + 8, entry);
+    return cd;
+}
+
+# The layout of @group(`group`). Groups 0 .. n-1 must all be set; a descriptor
+# with none gets the layout wgpu derives from the shader (usable for shaders that
+# bind nothing — a derived layout cannot be shared with bind groups made here).
+fn gpu_compute_desc_bind_group_layout(cd, group, bgl): i64 {
+    if (cd == 0) { return _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null"); }
+    if (group < 0) { return _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: negative group"); }
+    if (group >= GPU_COMPUTE_MAX_GROUPS) { return _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: group above 3"); }
+    if (bgl == 0) { return _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null bind group layout"); }
+    store64(cd + 32 + group * 8, bgl);
+    if (group + 1 > load64(cd + 24)) { store64(cd + 24, group + 1); }
+    return 0;
+}
+
+fn gpu_compute_desc_label(cd, label): i64 {
+    if (cd == 0) { return _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null"); }
+    store64(cd + 16, label);
+    return 0;
+}
+
+fn _gpu_ctier_slot(ctx, off): i64 {
+    if (ctx == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    return backend_get_slot(b, off);
+}
+
+fn _gpu_ctier_missing(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (gpu_ctx_backend(ctx) == 0) { return GPU_ERR_OTHER; }
+    return _gpu_ctier_fail(GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+      "compute tier: this backend has no compute passes (use gpu_compute_dispatch)");
+}
+
+# A compute pipeline from descriptor `cd`. Returns the pipeline, or 0 with the
+# reason recorded.
+fn gpu_compute_pipeline_create_desc(ctx, cd): i64 {
+    if (ctx == 0) { return 0; }
+    if (cd == 0) { _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null"); return 0; }
+    if (load64(cd) == 0) { _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null shader module"); return 0; }
+    if (load64(cd + 8) == 0) { _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: null entry point"); return 0; }
+    var n = load64(cd + 24);
+    if (n < 0) { _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: corrupt group count"); return 0; }
+    if (n > GPU_COMPUTE_MAX_GROUPS) {
+        _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: corrupt group count");
+        return 0;
+    }
+    for (var g = 0; g < n; g = g + 1) {
+        if (load64(cd + 32 + g * 8) == 0) {
+            _gpu_ctier_fail(GPU_ERR_PIPELINE, "compute desc: a group below the highest has no layout");
+            return 0;
+        }
+    }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PIPELINE_CREATE_DESC);
+    if (slot == 0) { _gpu_ctier_missing(ctx); return 0; }
+    return fncall2(slot, ctx, cd);
+}
+
+fn gpu_compute_pipeline_release(ctx, pipe): i64 {
+    if (ctx == 0) { return 0; }
+    if (pipe == 0) { return 0; }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PIPELINE_RELEASE);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, pipe);
+}
+
+# Begin a compute pass. Returns the pass, or 0 (reason recorded).
+fn gpu_compute_pass_begin(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PASS_BEGIN);
+    if (slot == 0) { _gpu_ctier_missing(ctx); return 0; }
+    return fncall1(slot, ctx);
+}
+
+fn gpu_compute_pass_set_pipeline(ctx, cpass, pipe): i64 {
+    if (cpass == 0) { return GPU_ERR_OTHER; }
+    if (pipe == 0) { return GPU_ERR_PIPELINE; }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PASS_SET_PIPELINE);
+    if (slot == 0) { return _gpu_ctier_missing(ctx); }
+    return fncall3(slot, ctx, cpass, pipe);
+}
+
+# Bind group `bg` at @group(`group`), with `count` u32 dynamic offsets at
+# `offsets` (each a multiple of GPU_DYNAMIC_OFFSET_ALIGN), as for a render pass.
+fn gpu_compute_pass_set_bind_group(ctx, cpass, group, bg, count, offsets): i64 {
+    if (cpass == 0) { return GPU_ERR_OTHER; }
+    if (bg == 0) { return GPU_ERR_PIPELINE; }
+    if (group < 0) { return GPU_ERR_PIPELINE; }
+    if (group >= GPU_COMPUTE_MAX_GROUPS) { return GPU_ERR_PIPELINE; }
+    if (count < 0) { return GPU_ERR_PIPELINE; }
+    if (count > GPU_MAX_DYNAMIC_OFFSETS) { return GPU_ERR_PIPELINE; }
+    if (count > 0) {
+        if (offsets == 0) { return GPU_ERR_PIPELINE; }
+        for (var i = 0; i < count; i = i + 1) {
+            if ((load32(offsets + i * 4) % GPU_DYNAMIC_OFFSET_ALIGN) != 0) { return GPU_ERR_BUFFER; }
+        }
+    }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PASS_SET_BIND_GROUP);
+    if (slot == 0) { return _gpu_ctier_missing(ctx); }
+    return fncall6(slot, ctx, cpass, group, bg, count, offsets);
+}
+
+# Dispatch x * y * z workgroups (each 1 .. MABDA_MAX_DISPATCH_DIM).
+fn gpu_compute_pass_dispatch(ctx, cpass, x, y, z): i64 {
+    if (cpass == 0) { return GPU_ERR_OTHER; }
+    if (x <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (y <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (z <= 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    if (validate_dispatch(x, y, z, MABDA_MAX_DISPATCH_DIM) != 0) { return GPU_ERR_WORKGROUP_LIMIT; }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PASS_DISPATCH);
+    if (slot == 0) { return _gpu_ctier_missing(ctx); }
+    return fncall5(slot, ctx, cpass, x, y, z);
+}
+
+# End the pass and submit it. 0, or GPU_ERR_VALIDATION (the reason recorded)
+# when wgpu refused what the pass encoded.
+fn gpu_compute_pass_end(ctx, cpass): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (cpass == 0) { return GPU_ERR_OTHER; }
+    var slot = _gpu_ctier_slot(ctx, BACKEND_SLOT_COMPUTE_PASS_END);
+    if (slot == 0) { return _gpu_ctier_missing(ctx); }
+    return fncall2(slot, ctx, cpass);
+}

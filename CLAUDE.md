@@ -159,7 +159,7 @@ issue ioctls directly, and samvada fills its fn-table in Cyrius.
    callback that RECORDS errors (slot 75 reads them) instead of
    wgpu-native's default panic.
 3. C builds the function-pointer table (wgpu functions +
-   struct-packing shims; 81 slots since 4.3.0 — `FN_COUNT` must match
+   struct-packing shims; 83 slots since 4.3.1 — `FN_COUNT` must match
    the entries or it aborts at start-up), then reports the count through
    the weak `mabda_wgpu_launcher_slots`. Without that report mabda
    assumes the old 67-slot table and every wrapper for slot 67+ returns
@@ -177,8 +177,10 @@ the reason (`gpu_last_error_message`). wgpu-native treats submitting an
 invalid command buffer as FATAL regardless of callbacks, so the finish
 shim (slot 29) scopes `finish` and returns NULL for an invalid buffer;
 the submit shim (slot 35) skips NULL and releases what it submits.
-**Adding a launcher slot forces every consumer to rebuild**: the 4.3.0
-revision already carries MB2–MB5's slots — don't add slots piecemeal.
+**Adding a launcher slot forces every consumer to rebuild**: the 4.3.1
+revision (83 slots) carries the whole render tier, MB1–MB5 — don't add
+slots piecemeal. (4.3.0's 81 missed the compute pass encoder's release and
+the compute pipeline's group layout; a new slot is the user's call.)
 
 ### Native AMD path (no C shim)
 

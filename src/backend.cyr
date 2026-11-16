@@ -334,7 +334,49 @@ var BACKEND_SLOT_PASS_SET_BLEND_CONSTANT     = 472;
 # 0 (not persistently mapped) and gpu_buffer_map records why.
 var BACKEND_SLOT_BUFFER_MAP                  = 480;
 
-var BACKEND_SIZE                         = 488;
+# v4.3.1 — the render tier's MB2-MB5, laid out together (the launcher already has
+# every wgpu slot they use). Signatures:
+# MB2 / MB3 targets and passes, 488..536 (public: src/gpu_target.cyr):
+#   render_target_create   (ctx, w, h, fmt, samples)  -> rt | 0
+#   render_pass_begin_desc (ctx, pass_desc)           -> pass | 0
+#   texture_view_create    (ctx, tex, view_desc)      -> view | 0   (MB3)
+#   texture_view_release   (ctx, view)                -> 0          (MB3)
+#   texture_copy           (ctx, copy_desc)           -> 0 | err    (MB3)
+#   render_target_read     (ctx, rt, dst, n)          -> 0 | err    (MB3)
+# MB4 compute, 536..592 (public: src/gpu_compute_tier.cyr):
+#   compute_pipeline_create_desc (ctx, desc)          -> pipe | 0
+#   compute_pipeline_release (ctx, pipe)              -> 0
+#   compute_pass_begin     (ctx)                      -> cpass | 0
+#   compute_pass_set_pipeline (ctx, cpass, pipe)      -> 0 | err
+#   compute_pass_set_bind_group (ctx, cpass, g, bg, n, offsets) -> 0 | err
+#   compute_pass_dispatch  (ctx, cpass, x, y, z)      -> 0 | err
+#   compute_pass_end       (ctx, cpass)               -> 0 | err (submits)
+# MB5 surfaces, 592..632 (public: src/surface_v3.cyr):
+#   surface_create_wayland (ctx, wl_display, wl_surface) -> 0 | err (stashes the surface)
+#   surface_capabilities   (ctx, out)                 -> 0 | err
+#   surface_configure_ex   (ctx, w, h, fmt, present_mode) -> surface | 0
+#   surface_acquire_target (ctx, surface)             -> frame | 0 (a texture object)
+#   surface_resize         (ctx, surface, w, h)       -> 0 | err
+var BACKEND_SLOT_RENDER_TARGET_CREATE        = 488;
+var BACKEND_SLOT_RENDER_PASS_BEGIN_DESC      = 496;
+var BACKEND_SLOT_TEXTURE_VIEW_CREATE         = 504;
+var BACKEND_SLOT_TEXTURE_VIEW_RELEASE        = 512;
+var BACKEND_SLOT_TEXTURE_COPY                = 520;
+var BACKEND_SLOT_RENDER_TARGET_READ          = 528;
+var BACKEND_SLOT_COMPUTE_PIPELINE_CREATE_DESC = 536;
+var BACKEND_SLOT_COMPUTE_PIPELINE_RELEASE    = 544;
+var BACKEND_SLOT_COMPUTE_PASS_BEGIN          = 552;
+var BACKEND_SLOT_COMPUTE_PASS_SET_PIPELINE   = 560;
+var BACKEND_SLOT_COMPUTE_PASS_SET_BIND_GROUP = 568;
+var BACKEND_SLOT_COMPUTE_PASS_DISPATCH       = 576;
+var BACKEND_SLOT_COMPUTE_PASS_END            = 584;
+var BACKEND_SLOT_SURFACE_CREATE_WAYLAND      = 592;
+var BACKEND_SLOT_SURFACE_CAPABILITIES        = 600;
+var BACKEND_SLOT_SURFACE_CONFIGURE_EX        = 608;
+var BACKEND_SLOT_SURFACE_ACQUIRE_TARGET      = 616;
+var BACKEND_SLOT_SURFACE_RESIZE              = 624;
+
+var BACKEND_SIZE                         = 632;
 
 # v0 fnptr block ends at +80 (the KIND value sits there). Layout
 # assertions and the v0 portion of backend_is_complete() iterate
@@ -424,6 +466,13 @@ var BACKEND_RTIER_SLOTS_BEGIN            = 352;
 var BACKEND_RTIER_SLOTS_END              = 480;
 var BACKEND_BUFMAP_SLOTS_BEGIN           = 480;
 var BACKEND_BUFMAP_SLOTS_END             = 488;
+# v4.3.1 render tier MB2-MB5 blocks (see the slot comments above).
+var BACKEND_TARGET_SLOTS_BEGIN           = 488;
+var BACKEND_TARGET_SLOTS_END             = 536;
+var BACKEND_CTIER_SLOTS_BEGIN            = 536;
+var BACKEND_CTIER_SLOTS_END              = 592;
+var BACKEND_SURFX_SLOTS_BEGIN            = 592;
+var BACKEND_SURFX_SLOTS_END              = 632;
 
 # ================================================================
 # Backend struct construction
@@ -450,7 +499,10 @@ fn backend_set_slot(b, off, fnptr): i64 {
     return 0;
 }
 
+# 0 for a null backend (a context that was never wired), so a dispatcher's
+# missing-slot path handles it instead of a load from address `off` (4.3.1).
 fn backend_get_slot(b, off): i64 {
+    if (b == 0) { return 0; }
     return load64(b + off);
 }
 
@@ -504,10 +556,8 @@ fn backend_is_complete(b): i64 {
         if (load64(b + off4) == 0) { return 0; }
         off4 = off4 + 8;
     }
-    # v3.1 mipmap slots (M.6b) — both backends now fill create_mipped +
-    # generate_mipmaps for real (native) or fail-loud
-    # (wgpu generate returns GPU_ERR_NOT_IMPLEMENTED until wgpu compute   #skip-lint
-    # lands; the slot fnptr is non-null, so completeness holds).
+    # v3.1 mipmap slots (M.6b) — both backends fill create_mipped +
+    # generate_mipmaps (native: compute; wgpu since 4.3.1: a render blit).
     var off5 = BACKEND_MIPMAP_SLOTS_BEGIN;
     while (off5 < BACKEND_MIPMAP_SLOTS_END) {
         if (load64(b + off5) == 0) { return 0; }

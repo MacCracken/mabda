@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.3.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.3.1 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -21,7 +21,10 @@ AMD-on-wgpu** (one-shot warning, still works; `-D MABDA_AMD_WGPU_STRICT` enforce
 native-only; retirement deferred). **v4.3.0 starts the render tier** a geometry
 renderer draws through (a pipeline descriptor, bind groups, vertex/index buffers,
 indexed draws with dynamic offsets, viewport and scissor), and a validation error
-returns a `GPU_ERR_*` with wgpu's reason instead of aborting the process. See
+returns a `GPU_ERR_*` with wgpu's reason instead of aborting the process. **v4.3.1
+completes it** (MB2–MB5): depth targets and shadow passes, sRGB / BGRA8 / RGBA16F textures, MSAA,
+texture views, mip generation and copies on wgpu, compute passes and `gpu_compute_dispatch` on
+wgpu, and a Wayland window surface. See
 [CHANGELOG.md](CHANGELOG.md) for the full release history and *Hardware support* below.
 
 ## Features
@@ -29,13 +32,14 @@ returns a `GPU_ERR_*` with wgpu's reason instead of aborting the process. See
 - **Three backends, one API** — wgpu-native (cross-vendor default), pure-Cyrius **native AMD** (amdgpu DRM / GFX9 / PM4), pure-Cyrius **native NVIDIA** (nouveau DRM / SM75). Backend chosen at build time via `MABDA_BACKEND_KIND`; the `@public` API is byte-identical across all three.
 - **Device lifecycle** — GpuContext creation with adapter/device/queue management
 - **Buffer management** — storage, uniform, vertex, index, staging, indirect buffers; synchronous readback; buffer-to-buffer copy; GrowableBuffer with generation tracking
-- **Compute pipelines** — shader compilation, bind group layout, dispatch, PingPongBuffer
+- **Compute pipelines** — shader compilation, bind group layout, dispatch, PingPongBuffer; on wgpu (4.3.1) `gpu_compute_desc_*` pipelines with explicit mixed layouts, compute passes with dynamic offsets, and `gpu_compute_dispatch`
 - **Render pipelines** — the `gpu_pipeline_desc_*` descriptor (named entry points, optional fragment stage, vertex layouts incl. the 2D / 3D / skinned / line presets, topology, culling, blending, depth state, explicit bind group layouts); `render_pipeline_create_simple` for full-screen effects, legacy `rpb_*` builder for back-compat
 - **Bind groups and draw-time calls** — `gpu_bind_group_layout_*` / `gpu_bind_group_*` (uniform, storage, texture, sampler and comparison-sampler entries), `gpu_sampler_object_create`; vertex and u16/u32 index buffers, `gpu_render_pass_draw_indexed`, dynamic offsets, viewport, scissor, blend constant (wgpu; the native backends serve the vertex-less subset)
 - **An error channel** — validation errors return a `GPU_ERR_*` with the API's reason (`gpu_last_error_message`); error scopes; nothing aborts the host process
 - **Textures** — RGBA + block-compressed (BC1/3/4/5/7) + array/cubemap; creation, TextureCache, mip levels, GPU sampling, dimension validation
 - **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
-- **Render targets** — offscreen framebuffers with optional MSAA and depth
+- **Render targets and passes** — `gpu_render_target_create` in RGBA8 / sRGB / BGRA8 / RGBA16F / Depth32F with 4x MSAA, the `gpu_pass_desc_*` pass descriptor (up to 8 colour targets, depth with load / clear / store / read-only, resolve), texture views (a cube face or mip level as an attachment), texture copies, mip generation and render-target readback (wgpu; the native backends serve one RGBA8 target)
+- **Window surfaces** — a wgpu surface from a Wayland `wl_display` / `wl_surface`, its capabilities, BGRA8 formats, AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture objects, resize; native KMS present on AMD and NVIDIA
 - **Asset loading** — KTX2 / DDS parsers in-tree + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
 - **Native SPIR-V → GFX9 compiler** — in-tree compute-shader lowering (structured control flow, int div/mod, vectors, f64), HW-verified on Cezanne
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
@@ -105,9 +109,10 @@ consumer needs none — the dist compiles those paths out without the flags.
 | **Buffers / compute** | buffer, typed_buffer, compute (workgroup math, dispatch, PingPongBuffer), gpu_timestamps |
 | **Graphics** | vertex, blend, sampler, depth, texture, texture_format, bind_group, instancing |
 | **Render** | render_target, render_pipeline, render_pass, render_graph, queue, surface, surface_v3 |
+| **Render tier** (4.3.x) | gpu_types, error_scope, gpu_bind, gpu_pipeline, gpu_draw, gpu_target, gpu_compute_tier |
 | **Assets** | asset_format, asset_load (KTX2 / DDS / PNG+JPEG-via-chitra) |
 | **Caching** | shader_cache, pipeline_cache, bind_group_cache |
-| **Backend abstraction** (`@internal`) | backend, backend_wgpu |
+| **Backend abstraction** (`@internal`) | backend, backend_wgpu, backend_wgpu_rtier, backend_wgpu_target, backend_wgpu_ctier, backend_wgpu_surface, backend_native_rtier |
 | **Native AMD** (`@internal`) | backend_native, backend_native_amdgpu, backend_native_pm4, backend_native_shaders, backend_native_kms |
 | **SPIR-V → GFX9 compiler** (`@internal`) | spirv_parse, spirv_lower, mir, gfx9_encode, gfx9_isel, gfx9_regalloc, gfx9_waitcnt, gfx9_abi, gfx9_compile |
 | **Native NVIDIA** (`@internal`) | backend_nvidia, backend_nvidia_nouveau, backend_nvidia_push, backend_nvidia_qmd, backend_nvidia_sass, backend_nvidia_tex |

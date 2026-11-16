@@ -1,0 +1,687 @@
+# @internal — wgpu backend, render targets and passes (v4.3.1, MB2 + MB3)
+# backend_wgpu_target.cyr — fills the target block of Backend slots
+# (src/backend.cyr 488..536) for wgpu: render targets of every render format and
+# sample count, the descriptor render pass (several colour attachments, depth,
+# load / clear / store, resolve), texture views, texture-to-texture copies,
+# render-target readback, and mip generation (a render blit per level). The
+# public side is src/gpu_target.cyr. Every object here is a WGPU_TEX_SIZE texture
+# record (src/backend_wgpu.cyr). Descriptors are built in the per-context render
+# state (src/backend_wgpu_rtier.cyr) or on the stack, never the bump heap.
+
+fn _wgpu_target_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+# ================================================================
+# Render targets
+# ================================================================
+# A colour target is RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC | COPY_DST:
+# drawn into, sampled, copied and read back. A depth target is the same without
+# COPY_DST (WebGPU forbids depth32float as a copy destination). A multisampled
+# colour target is two textures: the multisampled one (+48 / +56) that passes
+# render into, and a 1-sample resolve texture (+0 / +8) every pass resolves into
+# and everything else reads. A multisampled depth target is one multisampled
+# texture: WebGPU resolves no depth.
+fn _backend_wgpu_render_target_create(ctx, w, h, fmt, samples): i64 {
+    if (ctx == 0) { return 0; }
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    if (validate_dimensions(w, h, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return 0; }
+    if (samples != 1) {
+        if (samples != 4) { return 0; }
+    }
+    var depth = mabda_texfmt_is_depth(fmt);
+    if (depth == 0) {
+        if (mabda_texfmt_is_color_target(fmt) == 0) { return 0; }
+    }
+    var wfmt = mabda_texfmt_to_wgpu(fmt);
+    if (wfmt == 0) { return 0; }
+    var v2d = WGPU_TEXTURE_VIEW_DIMENSION_2D;
+    var usage = _wgpu_tex_usage(fmt);
+    var hv[16];
+    var mv[16];
+    store64(&mv, 0);
+    store64(&mv + 8, 0);
+    if (samples == 1) {
+        if (_wgpu_tex_make(ctx, &hv, usage, w, h, 1, wfmt, 1, 1, v2d) == 0) { return 0; }
+    } elif (depth == 1) {
+        usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+        if (_wgpu_tex_make(ctx, &hv, usage, w, h, 1, wfmt, 1, 4, v2d) == 0) { return 0; }
+    } else {
+        if (_wgpu_tex_make(ctx, &mv, WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT, w, h, 1, wfmt, 1, 4, v2d) == 0) {
+            return 0;
+        }
+        if (_wgpu_tex_make(ctx, &hv, usage, w, h, 1, wfmt, 1, 1, v2d) == 0) {
+            wgpu_texture_view_release(load64(&mv + 8));
+            wgpu_texture_release(load64(&mv));
+            return 0;
+        }
+    }
+    var t = _wgpu_tex_new(load64(&hv), load64(&hv + 8), fmt, w, h, 1, 1, samples,
+      WGPU_TEX_KIND_TARGET, usage, v2d);
+    if (t == 0) {
+        wgpu_texture_view_release(load64(&hv + 8));
+        wgpu_texture_release(load64(&hv));
+        if (load64(&mv) != 0) {
+            wgpu_texture_view_release(load64(&mv + 8));
+            wgpu_texture_release(load64(&mv));
+        }
+        return 0;
+    }
+    store64(t + 48, load64(&mv));
+    store64(t + 56, load64(&mv + 8));
+    return t;
+}
+
+# The 3.0 slot: a single-sample RGBA8 target.
+fn _backend_wgpu_render_target_create_2d_rgba8(ctx, width, height): i64 {
+    return _backend_wgpu_render_target_create(ctx, width, height, MABDA_TEXFMT_RGBA8, 1);
+}
+
+fn _backend_wgpu_render_target_release(ctx, rt): i64 {
+    if (ctx == 0) { return 0; }
+    return _wgpu_tex_release(rt);
+}
+
+fn _backend_wgpu_render_target_read(ctx, rt, dst, n): i64 {
+    return _wgpu_tex_read_sub(ctx, rt, 0, 0, dst, n);
+}
+
+# ================================================================
+# The descriptor render pass
+# ================================================================
+# WGPURenderPassColorAttachment (72 B, offsetof): view +8, depthSlice +16,
+# resolveTarget +24, loadOp +32, storeOp +36, clearValue +40 (WGPUColor: four
+# f64). WGPURenderPassDepthStencilAttachment (48 B): view +8, depthLoadOp +16,
+# depthStoreOp +20, depthClearValue +24 (f32), depthReadOnly +28, stencilLoadOp
+# +32, stencilStoreOp +36, stencilClearValue +40, stencilReadOnly +44. Depth32F
+# has no stencil, so the stencil ops stay Undefined (0), as WebGPU requires.
+
+# Why `t` cannot be attached, or 0. An attachment is one level and one layer of
+# a live texture object of a render format.
+fn _wgpu_att_unfit(t, want_depth): i64 {
+    if (load64(t) == 0) { return "render pass: an attachment was released"; }
+    if (load64(t + 8) == 0) { return "render pass: an attachment was released"; }
+    var fmt = _wgpu_tex_fmt(t);
+    if (want_depth == 1) {
+        if (mabda_texfmt_is_depth(fmt) == 0) { return "render pass: the depth attachment is not a depth format"; }
+    } else {
+        if (mabda_texfmt_is_color_target(fmt) == 0) {
+            return "render pass: a colour attachment is not a colour render format";
+        }
+    }
+    if ((_wgpu_tex_usage_of(t) & WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT) == 0) {
+        return "render pass: an attachment was not created to be rendered into";
+    }
+    if (_wgpu_tex_mips(t) != 1) {
+        return "render pass: an attachment view must span one level (gpu_texture_view_attachment)";
+    }
+    if (_wgpu_tex_layers(t) != 1) {
+        return "render pass: an attachment view must span one layer (gpu_texture_view_attachment)";
+    }
+    return 0;
+}
+
+# Open the pass: encoder, begin (the launcher's begin shim, slot 58), and the
+# pass record (48 B: encoder +0, pass encoder +8, back-reference +16, the
+# bind_for_sample texture +24 / sampler +32 / layer +40). The per-context record
+# is reused; while a pass begun earlier on the context is still open (its
+# encoder is set) a fresh record is allocated, so two open passes never share one.
+fn _wgpu_pass_open(ctx, atts, n, datt, label, back): i64 {
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var encoder = wgpu_device_create_command_encoder(gpu_ctx_device(ctx), 0);
+    if (encoder == 0) { return 0; }
+    # WgpuBeginPassArgs (40 B, deps/wgpu_main.c): colour attachments +0, count +8,
+    # depth attachment +16, timestamp writes +24, label (cstr) +32.
+    var args = rs + _WGPU_RS_BEGIN_ARGS;
+    memset(args, 0, 40);
+    store64(args, atts);
+    store64(args + 8, n);
+    store64(args + 16, datt);
+    store64(args + 32, label);
+    var pass = wgpu_command_encoder_begin_render_pass(encoder, args);
+    if (pass == 0) {
+        wgpu_command_encoder_release(encoder);
+        return 0;
+    }
+    var p = rs + _WGPU_RS_PASS;
+    if (load64(p) != 0) {
+        p = alloc(48);
+        if (p == 0) {
+            wgpu_render_pass_encoder_end(pass);
+            wgpu_render_pass_encoder_release(pass);
+            wgpu_command_encoder_release(encoder);
+            return 0;
+        }
+    }
+    memset(p, 0, 48);
+    store64(p +  0, encoder);
+    store64(p +  8, pass);
+    store64(p + 16, back);
+    store64(p + 40, 0 - 1);   # sample layer: none
+    return p;
+}
+
+fn _backend_wgpu_render_pass_begin_desc(ctx, pd): i64 {
+    if (ctx == 0) { return 0; }
+    if (pd == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var n = load64(pd);
+    if (n < 0) { return 0; }
+    if (n > GPU_PASS_MAX_COLORS) { return 0; }
+    var atts = rs + _WGPU_RS_COLOR_ATTS;
+    var w = 0 - 1;
+    var h = 0 - 1;
+    var back = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = pd + GPU_PASS_OFF_COLORS + i * GPU_PASS_COLOR_SIZE;
+        var t = load64(c);
+        if (t == 0) { _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: null colour attachment"); return 0; }
+        var why = _wgpu_att_unfit(t, 0);
+        if (why != 0) { _wgpu_target_fail(GPU_ERR_TEXTURE, why); return 0; }
+        if (w < 0) {
+            w = _wgpu_tex_width(t);
+            h = _wgpu_tex_height(t);
+            back = t;
+        }
+        if (_wgpu_tex_width(t) != w) {
+            _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: attachments differ in size");
+            return 0;
+        }
+        if (_wgpu_tex_height(t) != h) {
+            _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: attachments differ in size");
+            return 0;
+        }
+        var view = load64(t + 8);
+        var resolve = 0;
+        if (load64(t + 56) != 0) {
+            # A multisampled colour target: render into its samples, resolve into
+            # its own 1-sample texture (or the descriptor's resolve target).
+            view = load64(t + 56);
+            resolve = load64(t + 8);
+        }
+        var ro = load64(c + 24);
+        if (ro != 0) {
+            if (resolve == 0) {
+                _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: a resolve target needs a multisampled attachment");
+                return 0;
+            }
+            if (load64(ro + 8) == 0) {
+                _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: the resolve target was released");
+                return 0;
+            }
+            if (_wgpu_tex_samples(ro) > 1) {
+                if (load64(ro + 56) == 0) {
+                    _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: a resolve target must be single-sample");
+                    return 0;
+                }
+            }
+            resolve = load64(ro + 8);
+        }
+        var a = atts + i * 72;
+        memset(a, 0, 72);
+        store64(a + 8, view);
+        store32(a + 16, 0xFFFFFFFF);   # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED (2D)
+        store64(a + 24, resolve);
+        store32(a + 32, load64(c + 8));
+        store32(a + 36, load64(c + 16));
+        store64(a + 40, load64(c + 32));
+        store64(a + 48, load64(c + 40));
+        store64(a + 56, load64(c + 48));
+        store64(a + 64, load64(c + 56));
+    }
+    var datt = 0;
+    var dt = load64(pd + 8);
+    if (dt != 0) {
+        var dwhy = _wgpu_att_unfit(dt, 1);
+        if (dwhy != 0) { _wgpu_target_fail(GPU_ERR_TEXTURE, dwhy); return 0; }
+        if (w >= 0) {
+            if (_wgpu_tex_width(dt) != w) {
+                _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: attachments differ in size");
+                return 0;
+            }
+            if (_wgpu_tex_height(dt) != h) {
+                _wgpu_target_fail(GPU_ERR_TEXTURE, "render pass: attachments differ in size");
+                return 0;
+            }
+        }
+        if (back == 0) { back = dt; }
+        datt = rs + _WGPU_RS_DEPTH_ATT;
+        memset(datt, 0, 48);
+        store64(datt + 8, load64(dt + 8));
+        if (load64(pd + 40) == 1) {
+            store32(datt + 28, 1);     # depthReadOnly: load / store stay Undefined
+        } else {
+            store32(datt + 16, load64(pd + 16));
+            store32(datt + 20, load64(pd + 24));
+            store32(datt + 24, f64_to_f32(load64(pd + 32)));
+        }
+    }
+    return _wgpu_pass_open(ctx, atts, n, datt, load64(pd + 48), back);
+}
+
+# The 3.0 slot (gpu_render_pass_begin): one colour target, cleared to
+# `clear_color_ptr` — a one-attachment descriptor on the stack.
+fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
+    if (ctx == 0) { return 0; }
+    if (rt == 0) { return 0; }
+    if (clear_color_ptr == 0) { return 0; }
+    var pd[576];
+    gpu_pass_desc_reset(&pd);
+    if (gpu_pass_desc_color(&pd, rt, GPU_LOAD_CLEAR, clear_color_ptr) != 0) { return 0; }
+    return _backend_wgpu_render_pass_begin_desc(ctx, &pd);
+}
+
+# ================================================================
+# Texture views
+# ================================================================
+# `vr` is gpu_texture_view_create's request: dim +0, base_mip +8, mip_count +16,
+# base_layer +24, layer_count +32 (0 count = to the last), relative to `tex`
+# (itself possibly a view). The record's base level / layer are absolute.
+fn _backend_wgpu_texture_view_create(ctx, tex, vr): i64 {
+    if (ctx == 0) { return 0; }
+    if (tex == 0) { return 0; }
+    if (vr == 0) { return 0; }
+    var handle = load64(tex);
+    if (handle == 0) { _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: the texture was released"); return 0; }
+    var dim = load64(vr);
+    var bm = load64(vr + 8);
+    var mc = load64(vr + 16);
+    var bl = load64(vr + 24);
+    var lc = load64(vr + 32);
+    var tm = _wgpu_tex_mips(tex);
+    var tl = _wgpu_tex_layers(tex);
+    if (bm >= tm) {
+        _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: base level past the texture's levels");
+        return 0;
+    }
+    if (mc == 0) { mc = tm - bm; }
+    if (bm + mc > tm) {
+        _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: level range past the texture's levels");
+        return 0;
+    }
+    if (bl >= tl) {
+        _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: base layer past the texture's layers");
+        return 0;
+    }
+    if (lc == 0) { lc = tl - bl; }
+    if (bl + lc > tl) {
+        _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: layer range past the texture's layers");
+        return 0;
+    }
+    if (dim == GPU_VIEW_2D) {
+        if (lc != 1) { _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: a 2D view spans one layer"); return 0; }
+    }
+    if (dim == GPU_VIEW_CUBE) {
+        if (lc != 6) { _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: a cube view spans six layers"); return 0; }
+    }
+    if (dim == GPU_VIEW_CUBE_ARRAY) {
+        if ((lc % 6) != 0) {
+            _wgpu_target_fail(GPU_ERR_TEXTURE, "texture view: a cube array spans a multiple of six layers");
+            return 0;
+        }
+    }
+    var fmt = _wgpu_tex_fmt(tex);
+    var wfmt = mabda_texfmt_to_wgpu(fmt);
+    if (wfmt == 0) { return 0; }
+    var abm = _wgpu_tex_base_mip(tex) + bm;
+    var abl = _wgpu_tex_base_layer(tex) + bl;
+    # A view of a multisampled colour target sees its resolve texture (+0).
+    var samples = _wgpu_tex_samples(tex);
+    if (load64(tex + 48) != 0) { samples = 1; }
+    var device = gpu_ctx_device(ctx);
+    var vd[64];
+    _wgpu_view_desc_fill(&vd, wfmt, dim, abm, mc, abl, lc);
+    var scoped = _wgpu_scope_open(device);
+    var view = wgpu_texture_create_view(handle, &vd);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (view != 0) { wgpu_texture_view_release(view); }
+            return 0;
+        }
+    }
+    if (view == 0) { return 0; }
+    var t = _wgpu_tex_new(handle, view, fmt,
+      mip_level_dim(_wgpu_tex_width(tex), bm), mip_level_dim(_wgpu_tex_height(tex), bm),
+      mc, lc, samples, WGPU_TEX_KIND_VIEW, _wgpu_tex_usage_of(tex), dim);
+    if (t == 0) {
+        wgpu_texture_view_release(view);
+        return 0;
+    }
+    store32(t + 64, abm);
+    store32(t + 68, abl);
+    return t;
+}
+
+fn _backend_wgpu_texture_view_release(ctx, view): i64 {
+    if (ctx == 0) { return 0; }
+    if (view == 0) { return 0; }
+    if (_wgpu_tex_kind(view) != WGPU_TEX_KIND_VIEW) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE,
+          "texture view release: not a view (release a texture with gpu_texture_release)");
+    }
+    return _wgpu_tex_release(view);
+}
+
+# ================================================================
+# Texture-to-texture copies (launcher slot 77)
+# ================================================================
+# 1 when a copy may go from `a` to `b`: the same format, or a format and its
+# sRGB twin (WebGPU: copy-compatible).
+fn _wgpu_copy_fmt_ok(a, b): i64 {
+    if (a == b) { return 1; }
+    if (a == MABDA_TEXFMT_RGBA8) { if (b == MABDA_TEXFMT_RGBA8_SRGB) { return 1; } }
+    if (a == MABDA_TEXFMT_RGBA8_SRGB) { if (b == MABDA_TEXFMT_RGBA8) { return 1; } }
+    if (a == MABDA_TEXFMT_BGRA8) { if (b == MABDA_TEXFMT_BGRA8_SRGB) { return 1; } }
+    if (a == MABDA_TEXFMT_BGRA8_SRGB) { if (b == MABDA_TEXFMT_BGRA8) { return 1; } }
+    return 0;
+}
+
+fn _wgpu_copy_info(info, t, x, y): i64 {
+    memset(info, 0, 32);
+    store64(info, load64(t));
+    store32(info + 8, _wgpu_tex_base_mip(t));
+    store32(info + 12, x);
+    store32(info + 16, y);
+    store32(info + 20, _wgpu_tex_base_layer(t));
+    store32(info + 24, WGPU_TEXTURE_ASPECT_ALL);
+    return info;
+}
+
+# `cr` is gpu_texture_copy_rect's request: src +0, sx +8, sy +16, dst +24,
+# dx +32, dy +40, w +48, h +56 (w = h = 0: the source's size).
+fn _backend_wgpu_texture_copy(ctx, cr): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (cr == 0) { return GPU_ERR_OTHER; }
+    var src = load64(cr);
+    var dst = load64(cr + 24);
+    var sx = load64(cr + 8);
+    var sy = load64(cr + 16);
+    var dx = load64(cr + 32);
+    var dy = load64(cr + 40);
+    var w = load64(cr + 48);
+    var h = load64(cr + 56);
+    if (load64(src) == 0) { return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the source was released"); }
+    if (load64(dst) == 0) { return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the destination was released"); }
+    if (_wgpu_copy_fmt_ok(_wgpu_tex_fmt(src), _wgpu_tex_fmt(dst)) == 0) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the formats differ");
+    }
+    if (mabda_texfmt_is_compressed(_wgpu_tex_fmt(src)) == 1) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE,
+          "texture copy: block-compressed copies are not taken (copy the blocks' buffer)");
+    }
+    if (_wgpu_tex_samples(src) > 1) {
+        if (load64(src + 48) == 0) {
+            return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: a multisampled depth target is not copied");
+        }
+    }
+    if (_wgpu_tex_samples(dst) > 1) {
+        if (load64(dst + 48) == 0) {
+            return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: a multisampled depth target is not copied");
+        }
+    }
+    if ((_wgpu_tex_usage_of(src) & WGPU_TEXTURE_USAGE_COPY_SRC) == 0) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the source is not a copy source");
+    }
+    if ((_wgpu_tex_usage_of(dst) & WGPU_TEXTURE_USAGE_COPY_DST) == 0) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the destination is not a copy destination (depth?)");
+    }
+    if (w == 0) { if (h == 0) { w = _wgpu_tex_width(src); h = _wgpu_tex_height(src); } }
+    if (w == 0) { return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: zero width"); }
+    if (h == 0) { return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: zero height"); }
+    if (sx + w > _wgpu_tex_width(src)) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the rectangle leaves the source");
+    }
+    if (sy + h > _wgpu_tex_height(src)) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the rectangle leaves the source");
+    }
+    if (dx + w > _wgpu_tex_width(dst)) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the rectangle leaves the destination");
+    }
+    if (dy + h > _wgpu_tex_height(dst)) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "texture copy: the rectangle leaves the destination");
+    }
+    var si[32];
+    var di[32];
+    var ext[16];
+    _wgpu_copy_info(&si, src, sx, sy);
+    _wgpu_copy_info(&di, dst, dx, dy);
+    store32(&ext, w);
+    store32(&ext + 4, h);
+    store32(&ext + 8, 1);
+    var device = gpu_ctx_device(ctx);
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) { return GPU_ERR_OTHER; }
+    var rc = wgpu_command_encoder_copy_texture_to_texture(encoder, &si, &di, &ext);
+    if (rc != 0) {
+        wgpu_command_encoder_release(encoder);
+        return rc;
+    }
+    var cmd = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_command_encoder_release(encoder);
+    if (cmd == 0) {
+        rc = _backend_wgpu_error_take(ctx);
+        if (rc == 0) { rc = GPU_ERR_VALIDATION; }
+        _gpu_scope_note_pending(ctx, rc);
+        return rc;
+    }
+    wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+    return 0;
+}
+
+# ================================================================
+# Mip generation — a render blit per level (4.3.1; wgpu refused it before)
+# ================================================================
+# Level i of every layer is drawn from level i - 1 with a full-screen triangle
+# that samples it bilinearly at the centre of each 2 x 2 source block: a box
+# filter for even sizes. Rendering, not compute, so it covers every colour render
+# format (sRGB ones filter in linear space and re-encode; BGRA8 and sRGB cannot
+# be storage textures). One blit pipeline per format, created on first use and
+# kept in the render state with its shader module; one encoder and one submit
+# per call.
+var _WGPU_BLIT_WGSL = "struct O { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> O {
+    var o: O;
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    o.p = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    o.uv = vec2<f32>(x, y);
+    return o;
+}
+@group(0) @binding(0) var src_t: texture_2d<f32>;
+@group(0) @binding(1) var src_s: sampler;
+@fragment fn fs_main(v: O) -> @location(0) vec4<f32> {
+    return textureSample(src_t, src_s, v.uv);
+}
+";
+
+# The blit pipeline cache index of `fmt`, or -1 for a format the blit does not
+# take (compressed, depth).
+fn _wgpu_blit_index(fmt): i64 {
+    if (fmt == MABDA_TEXFMT_RGBA8) { return 0; }
+    if (fmt == MABDA_TEXFMT_RGBA8_SRGB) { return 1; }
+    if (fmt == MABDA_TEXFMT_BGRA8) { return 2; }
+    if (fmt == MABDA_TEXFMT_BGRA8_SRGB) { return 3; }
+    if (fmt == MABDA_TEXFMT_RGBA16F) { return 4; }
+    return 0 - 1;
+}
+
+# The blit pipeline for `fmt` (a pipeline record, handle at +0), creating it on
+# first use. 0 on failure (reason recorded).
+fn _wgpu_blit_pipeline(ctx, fmt): i64 {
+    var idx = _wgpu_blit_index(fmt);
+    if (idx < 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var cache = rs + _WGPU_RS_BLIT;
+    var pipe = load64(cache + 8 + idx * 8);
+    if (pipe != 0) { return pipe; }
+    var m = load64(cache);
+    if (m == 0) {
+        m = _backend_wgpu_shader_module_create(ctx, _WGPU_BLIT_WGSL, strlen(_WGPU_BLIT_WGSL), SHADER_SRC_WGSL);
+        if (m == 0) { return 0; }
+        store64(cache, m);
+    }
+    # A pipeline descriptor on the stack (GPU_PIPELINE_DESC_SIZE bytes): no vertex
+    # buffers, no explicit layout (wgpu derives group 0 from the shader).
+    var d[4112];
+    memset(&d, 0, GPU_PIPELINE_DESC_SIZE);
+    store64(&d, m);
+    store64(&d + 8, "vs_main");
+    store64(&d + 32, GPU_TOPOLOGY_TRIANGLE_LIST);
+    store64(&d + 40, GPU_CULL_NONE);
+    store64(&d + 48, GPU_FRONT_CCW);
+    store64(&d + 144, 1);
+    store64(&d + 56, "mabda-mip-blit");
+    if (gpu_pipeline_desc_fragment(&d, m, "fs_main") != 0) { return 0; }
+    if (gpu_pipeline_desc_target(&d, fmt, GPU_BLEND_NONE, GPU_WRITE_ALL) != 0) { return 0; }
+    pipe = _backend_wgpu_render_pipeline_create_desc(ctx, &d);
+    if (pipe == 0) { return 0; }
+    store64(cache + 8 + idx * 8, pipe);
+    return pipe;
+}
+
+# Release the blit cache (from _wgpu_render_state_release).
+fn _wgpu_blit_release(rs): i64 {
+    var cache = rs + _WGPU_RS_BLIT;
+    for (var i = 0; i < 5; i = i + 1) {
+        var p = load64(cache + 8 + i * 8);
+        if (p != 0) {
+            if (load64(p) != 0) { wgpu_render_pipeline_release(load64(p)); }
+            store64(p, 0);
+        }
+        store64(cache + 8 + i * 8, 0);
+    }
+    if (load64(cache) != 0) { wgpu_shader_module_release(load64(cache)); }
+    store64(cache, 0);
+    return 0;
+}
+
+# A single-level, single-layer 2D view of (layer, level) of the WGPUTexture `h`.
+fn _wgpu_level_view(h, wfmt, layer, level): i64 {
+    var vd[64];
+    _wgpu_view_desc_fill(&vd, wfmt, WGPU_TEXTURE_VIEW_DIMENSION_2D, level, 1, layer, 1);
+    return wgpu_texture_create_view(h, &vd);
+}
+
+fn _backend_wgpu_texture_generate_mipmaps(ctx, tex): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (tex == 0) { return GPU_ERR_OTHER; }
+    var handle = load64(tex);
+    if (handle == 0) { return _wgpu_target_fail(GPU_ERR_TEXTURE, "generate mipmaps: the texture was released"); }
+    var kind = _wgpu_tex_kind(tex);
+    if (kind == WGPU_TEX_KIND_VIEW) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "generate mipmaps: pass the texture, not a view");
+    }
+    if (kind == WGPU_TEX_KIND_SURFACE) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "generate mipmaps: a surface frame has one level");
+    }
+    var fmt = _wgpu_tex_fmt(tex);
+    if (_wgpu_blit_index(fmt) < 0) {
+        return _wgpu_target_fail(GPU_ERR_FORMAT_UNSUPPORTED,
+          "generate mipmaps: an uncompressed colour format is needed (compressed and depth chains are uploaded)");
+    }
+    var usage = _wgpu_tex_usage_of(tex);
+    if ((usage & WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT) == 0) {
+        return _wgpu_target_fail(GPU_ERR_TEXTURE, "generate mipmaps: the texture is not a render attachment");
+    }
+    var mips = _wgpu_tex_mips(tex);
+    if (mips <= 1) { return 0; }
+    var layers = _wgpu_tex_layers(tex);
+    var pipe = _wgpu_blit_pipeline(ctx, fmt);
+    if (pipe == 0) { return GPU_ERR_PIPELINE; }
+    var ph = load64(pipe);
+    var device = gpu_ctx_device(ctx);
+    var rs = _wgpu_render_state(ctx);
+    var bgl = wgpu_render_pipeline_get_bind_group_layout(ph, 0);
+    if (bgl == 0) { return GPU_ERR_PIPELINE; }
+    var sampler = _wgpu_cached_sampler(ctx, NATIVE_SAMP_FILTER_BILINEAR);   # bilinear, clamp
+    if (sampler == 0) { wgpu_bind_group_layout_release(bgl); return GPU_ERR_OTHER; }
+    var wfmt = mabda_texfmt_to_wgpu(fmt);
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) { wgpu_bind_group_layout_release(bgl); return GPU_ERR_OTHER; }
+    var rc = 0;
+    for (var layer = 0; layer < layers; layer = layer + 1) {
+        for (var level = 1; level < mips; level = level + 1) {
+            var sv = _wgpu_level_view(handle, wfmt, layer, level - 1);
+            var dv = _wgpu_level_view(handle, wfmt, layer, level);
+            if (sv == 0) { rc = GPU_ERR_TEXTURE; }
+            if (dv == 0) { rc = GPU_ERR_TEXTURE; }
+            var bg = 0;
+            if (rc == 0) {
+                var ents = rs + _WGPU_RS_BG_ENTRIES;
+                memset(ents, 0, 112);
+                store32(ents + 8, 0);
+                store64(ents + 48, sv);
+                store32(ents + 56 + 8, 1);
+                store64(ents + 56 + 40, sampler);
+                var bgd = rs + _WGPU_RS_DESC;
+                memset(bgd, 0, 48);
+                store64(bgd + 24, bgl);
+                store64(bgd + 32, 2);
+                store64(bgd + 40, ents);
+                bg = wgpu_device_create_bind_group(device, bgd);
+                if (bg == 0) { rc = GPU_ERR_OTHER; }
+            }
+            if (rc == 0) {
+                var a = rs + _WGPU_RS_COLOR_ATTS;
+                memset(a, 0, 72);
+                store64(a + 8, dv);
+                store32(a + 16, 0xFFFFFFFF);
+                store32(a + 32, WGPU_LOAD_OP_CLEAR);
+                store32(a + 36, WGPU_STORE_OP_STORE);
+                var args = rs + _WGPU_RS_BEGIN_ARGS;
+                memset(args, 0, 40);
+                store64(args, a);
+                store64(args + 8, 1);
+                var pe = wgpu_command_encoder_begin_render_pass(encoder, args);
+                if (pe == 0) {
+                    rc = GPU_ERR_OTHER;
+                } else {
+                    wgpu_render_pass_encoder_set_pipeline(pe, ph);
+                    wgpu_render_pass_encoder_set_bind_group(pe, 0, bg, 0, 0);
+                    wgpu_render_pass_encoder_draw(pe, 3, 1, 0, 0);
+                    wgpu_render_pass_encoder_end(pe);
+                    wgpu_render_pass_encoder_release(pe);
+                }
+            }
+            # wgpu keeps what the recorded passes use alive until they execute.
+            if (bg != 0) { wgpu_bind_group_release(bg); }
+            if (sv != 0) { wgpu_texture_view_release(sv); }
+            if (dv != 0) { wgpu_texture_view_release(dv); }
+            if (rc != 0) { break; }
+        }
+        if (rc != 0) { break; }
+    }
+    wgpu_bind_group_layout_release(bgl);
+    var cmd = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_command_encoder_release(encoder);
+    if (rc != 0) {
+        if (cmd != 0) { wgpu_command_buffer_release(cmd); }
+        return rc;
+    }
+    if (cmd == 0) {
+        rc = _backend_wgpu_error_take(ctx);
+        if (rc == 0) { rc = GPU_ERR_VALIDATION; }
+        _gpu_scope_note_pending(ctx, rc);
+        return rc;
+    }
+    wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+    return 0;
+}
+
+# ================================================================
+# Slot registration — called from backend_wgpu_new
+# ================================================================
+fn _backend_wgpu_fill_target(b): i64 {
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_CREATE,   &_backend_wgpu_render_target_create);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PASS_BEGIN_DESC, &_backend_wgpu_render_pass_begin_desc);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_VIEW_CREATE,    &_backend_wgpu_texture_view_create);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_VIEW_RELEASE,   &_backend_wgpu_texture_view_release);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_COPY,           &_backend_wgpu_texture_copy);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_TARGET_READ,     &_backend_wgpu_render_target_read);
+    return 0;
+}

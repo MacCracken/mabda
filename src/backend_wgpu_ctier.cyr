@@ -1,0 +1,382 @@
+# @internal — wgpu backend, the compute tier (v4.3.1, MB4)
+# backend_wgpu_ctier.cyr — fills the compute block of Backend slots
+# (src/backend.cyr 536..592) for wgpu: compute pipelines from a descriptor
+# (explicit layouts), compute passes, and gpu_compute_dispatch (it returned
+# GPU_ERR_OTHER on wgpu until 4.3.1). The public side is src/gpu_compute_tier.cyr
+# and src/compute.cyr. Needs the 4.3.1 launcher: slot 81 releases each compute
+# pass encoder (without it every pass leaked one), slot 82 gives an auto-layout
+# pipeline's group layout (gpu_compute_dispatch binds through it). On an older
+# launcher the passes refuse with GPU_ERR_FFI_SYMBOL.
+
+fn _wgpu_ctier_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+fn _wgpu_ctier_launcher_ok(): i64 {
+    if (_wgpu_has_slot(82) == 1) { return 1; }
+    _wgpu_ctier_fail(GPU_ERR_FFI_SYMBOL,
+      "compute tier: the launcher predates 4.3.1 (no slots 81-82) — copy the 4.3.1 deps/wgpu_main.c");
+    return 0;
+}
+
+# ================================================================
+# Compute pipelines
+# ================================================================
+# Pipeline record (16 B): WGPUComputePipeline +0, the WGPUPipelineLayout it was
+# made with +8 (0 for a derived layout).
+# WGPUComputePipelineDescriptor (80 B, offsetof): label +8, layout +24, compute
+# +32 (WGPUComputeState, 48 B: module +8, entryPoint +16, constantCount +32,
+# constants +40). WGPUPipelineLayoutDescriptor (48 B): bindGroupLayoutCount +24,
+# bindGroupLayouts +32.
+fn _wgpu_compute_pipeline_make(ctx, module, entry, label, layout): i64 {
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var d = rs + _WGPU_RS_CPIPE_DESC;
+    memset(d, 0, 80);
+    if (label != 0) { wgpu_string_view(d + 8, label); }
+    store64(d + 24, layout);
+    store64(d + 32 + 8, module);
+    if (entry != 0) {
+        wgpu_string_view(d + 32 + 16, entry);
+    } else {
+        # {NULL, WGPU_STRLEN}: no name given — the module's one compute entry point.
+        store64(d + 32 + 16, 0);
+        store64(d + 32 + 24, 0 - 1);
+    }
+    var scoped = _wgpu_scope_open(device);
+    var h = wgpu_device_create_compute_pipeline(device, d);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (h != 0) { wgpu_compute_pipeline_release(h); }
+            return 0;
+        }
+    }
+    return h;
+}
+
+fn _backend_wgpu_compute_pipeline_create_desc(ctx, cd): i64 {
+    if (ctx == 0) { return 0; }
+    if (cd == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+    var layout = 0;
+    var gc = load64(cd + 24);
+    if (gc > 0) {
+        var hs = rs + _WGPU_RS_BGL_HANDLES;
+        for (var g = 0; g < gc; g = g + 1) {
+            store64(hs + g * 8, load64(cd + 32 + g * 8));
+        }
+        var pl = rs + _WGPU_RS_PL_DESC;
+        memset(pl, 0, 48);
+        store64(pl + 24, gc);
+        store64(pl + 32, hs);
+        var scoped = _wgpu_scope_open(device);
+        layout = wgpu_device_create_pipeline_layout(device, pl);
+        if (scoped == 0) {
+            if (_wgpu_scope_close(ctx, device) != 0) {
+                if (layout != 0) { wgpu_pipeline_layout_release(layout); }
+                return 0;
+            }
+        }
+        if (layout == 0) { return 0; }
+    }
+    var h = _wgpu_compute_pipeline_make(ctx, load64(cd), load64(cd + 8), load64(cd + 16), layout);
+    if (h == 0) {
+        if (layout != 0) { wgpu_pipeline_layout_release(layout); }
+        return 0;
+    }
+    var p = alloc(16);
+    if (p == 0) {
+        wgpu_compute_pipeline_release(h);
+        if (layout != 0) { wgpu_pipeline_layout_release(layout); }
+        return 0;
+    }
+    store64(p, h);
+    store64(p + 8, layout);
+    return p;
+}
+
+fn _backend_wgpu_compute_pipeline_release(ctx, pipe): i64 {
+    if (pipe == 0) { return 0; }
+    if (load64(pipe) != 0) { wgpu_compute_pipeline_release(load64(pipe)); }
+    if (load64(pipe + 8) != 0) { wgpu_pipeline_layout_release(load64(pipe + 8)); }
+    store64(pipe, 0);
+    store64(pipe + 8, 0);
+    return 0;
+}
+
+# ================================================================
+# Compute passes
+# ================================================================
+# Pass record (32 B): WGPUCommandEncoder +0, WGPUComputePassEncoder +8. The
+# per-context record (render state) is reused; a second pass begun while one is
+# open gets a fresh record. WGPUComputePassDescriptor (32 B): label +8,
+# timestampWrites +24.
+fn _backend_wgpu_compute_pass_begin(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    if (_wgpu_ctier_launcher_ok() == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var encoder = wgpu_device_create_command_encoder(gpu_ctx_device(ctx), 0);
+    if (encoder == 0) { return 0; }
+    var cpd[32];
+    memset(&cpd, 0, 32);
+    var pe = wgpu_command_encoder_begin_compute_pass(encoder, &cpd);
+    if (pe == 0) {
+        wgpu_command_encoder_release(encoder);
+        return 0;
+    }
+    var p = rs + _WGPU_RS_CPASS;
+    if (load64(p) != 0) {
+        p = alloc(32);
+        if (p == 0) {
+            wgpu_compute_pass_end(pe);
+            wgpu_compute_pass_encoder_release(pe);
+            wgpu_command_encoder_release(encoder);
+            return 0;
+        }
+    }
+    memset(p, 0, 32);
+    store64(p, encoder);
+    store64(p + 8, pe);
+    return p;
+}
+
+fn _backend_wgpu_compute_pass_set_pipeline(ctx, cp, pipe): i64 {
+    var pe = load64(cp + 8);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    var h = load64(pipe);
+    if (h == 0) { return GPU_ERR_PIPELINE; }
+    wgpu_compute_pass_set_pipeline(pe, h);
+    return 0;
+}
+
+fn _backend_wgpu_compute_pass_set_bind_group(ctx, cp, group, bg, n, offsets): i64 {
+    var pe = load64(cp + 8);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    wgpu_compute_pass_set_bind_group(pe, group, bg, n, offsets);
+    return 0;
+}
+
+fn _backend_wgpu_compute_pass_dispatch(ctx, cp, x, y, z): i64 {
+    var pe = load64(cp + 8);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    wgpu_compute_pass_dispatch(pe, x, y, z);
+    return 0;
+}
+
+# End, release the pass encoder (slot 81), finish and submit. A command buffer the
+# launcher refused becomes GPU_ERR_VALIDATION with the reason recorded.
+fn _wgpu_compute_close(ctx, encoder, pe): i64 {
+    if (pe != 0) {
+        wgpu_compute_pass_end(pe);
+        wgpu_compute_pass_encoder_release(pe);
+    }
+    var rc = 0;
+    if (encoder != 0) {
+        var cmd = wgpu_command_encoder_finish(encoder, 0);
+        if (cmd != 0) {
+            wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+        } else {
+            rc = _backend_wgpu_error_take(ctx);
+            if (rc == 0) { rc = GPU_ERR_VALIDATION; }
+            _gpu_scope_note_pending(ctx, rc);
+        }
+        wgpu_command_encoder_release(encoder);
+    }
+    return rc;
+}
+
+fn _backend_wgpu_compute_pass_end(ctx, cp): i64 {
+    var rc = _wgpu_compute_close(ctx, load64(cp), load64(cp + 8));
+    store64(cp, 0);
+    store64(cp + 8, 0);
+    return rc;
+}
+
+# ================================================================
+# gpu_compute_dispatch on wgpu (4.3.1; was GPU_ERR_OTHER)
+# ================================================================
+# `shmod` is a WGPUShaderModule (gpu_shader_module_create / _spirv). The
+# pipeline takes the module's one compute entry point and the layout wgpu derives
+# from it, so read-write / read-only storage and uniform bindings mix freely.
+# `bp` is the count-prefixed binding array the native compiled path takes: bp+0 =
+# count, then count x 16-byte pairs whose first word is the buffer (the second,
+# the native GPU VA, is not read here); pair k binds @group(0) @binding(k), whole.
+# bp = 0 binds nothing. The pipeline and its group-0 layout are made on a
+# module's first dispatch and cached (the dispatch cache below) until the module
+# is released. Submitted in order with later work: gpu_buffer_read waits for it.
+var _WGPU_DISPATCH_CACHE_N = 32;   # modules cached; the oldest is evicted past it
+var _WGPU_DISPATCH_MAX_BINDINGS = 16;
+
+# The dispatch cache (allocated once per context, its pointer in the render
+# state): +0 next eviction index, then _WGPU_DISPATCH_CACHE_N x 24-byte entries
+# (module +0, pipeline +8, group-0 layout +16).
+fn _wgpu_dispatch_cache(ctx): i64 {
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var c = load64(rs + _WGPU_RS_MODULES);
+    if (c == 0) {
+        c = alloc(8 + _WGPU_DISPATCH_CACHE_N * 24);
+        if (c == 0) { return 0; }
+        memset(c, 0, 8 + _WGPU_DISPATCH_CACHE_N * 24);
+        store64(rs + _WGPU_RS_MODULES, c);
+    }
+    return c;
+}
+
+fn _wgpu_dispatch_entry_clear(e): i64 {
+    if (load64(e + 16) != 0) { wgpu_bind_group_layout_release(load64(e + 16)); }
+    if (load64(e + 8) != 0) { wgpu_compute_pipeline_release(load64(e + 8)); }
+    memset(e, 0, 24);
+    return 0;
+}
+
+# The cache entry for `shmod`, created (pipeline + group-0 layout when `need_bgl`)
+# on first use. 0 on failure (reason recorded).
+fn _wgpu_dispatch_entry(ctx, shmod, need_bgl): i64 {
+    var c = _wgpu_dispatch_cache(ctx);
+    if (c == 0) { return 0; }
+    var slot_e = 0;
+    for (var i = 0; i < _WGPU_DISPATCH_CACHE_N; i = i + 1) {
+        var e = c + 8 + i * 24;
+        if (load64(e) == shmod) {
+            if (need_bgl == 1) {
+                if (load64(e + 16) == 0) {
+                    store64(e + 16, wgpu_compute_pipeline_get_bind_group_layout(load64(e + 8), 0));
+                    if (load64(e + 16) == 0) { return 0; }
+                }
+            }
+            return e;
+        }
+        if (slot_e == 0) {
+            if (load64(e) == 0) { slot_e = e; }
+        }
+    }
+    if (slot_e == 0) {
+        var victim = load64(c) % _WGPU_DISPATCH_CACHE_N;
+        store64(c, victim + 1);
+        slot_e = c + 8 + victim * 24;
+        _wgpu_dispatch_entry_clear(slot_e);
+    }
+    var h = _wgpu_compute_pipeline_make(ctx, shmod, 0, "mabda-dispatch", 0);
+    if (h == 0) { return 0; }
+    store64(slot_e, shmod);
+    store64(slot_e + 8, h);
+    if (need_bgl == 1) {
+        var bgl = wgpu_compute_pipeline_get_bind_group_layout(h, 0);
+        if (bgl == 0) {
+            _wgpu_dispatch_entry_clear(slot_e);
+            return 0;
+        }
+        store64(slot_e + 16, bgl);
+    }
+    return slot_e;
+}
+
+# Forget `shmod` (from _backend_wgpu_shader_module_release): its cached pipeline
+# would otherwise outlive it and match a later module at the same address.
+fn _wgpu_dispatch_forget(ctx, shmod): i64 {
+    var rs = load64(ctx + CTX_OFF_RENDER_STATE);
+    if (rs == 0) { return 0; }
+    var c = load64(rs + _WGPU_RS_MODULES);
+    if (c == 0) { return 0; }
+    for (var i = 0; i < _WGPU_DISPATCH_CACHE_N; i = i + 1) {
+        var e = c + 8 + i * 24;
+        if (load64(e) == shmod) { _wgpu_dispatch_entry_clear(e); }
+    }
+    return 0;
+}
+
+# Release every cached dispatch pipeline (from _wgpu_render_state_release).
+fn _wgpu_dispatch_cache_release(rs): i64 {
+    var c = load64(rs + _WGPU_RS_MODULES);
+    if (c == 0) { return 0; }
+    for (var i = 0; i < _WGPU_DISPATCH_CACHE_N; i = i + 1) {
+        var e = c + 8 + i * 24;
+        if (load64(e) != 0) { _wgpu_dispatch_entry_clear(e); }
+    }
+    return 0;
+}
+
+fn _backend_wgpu_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (shmod == 0) { return _wgpu_ctier_fail(GPU_ERR_PIPELINE, "compute dispatch: null shader module"); }
+    if (_wgpu_ctier_launcher_ok() == 0) { return GPU_ERR_FFI_SYMBOL; }
+    var n = 0;
+    if (bp != 0) { n = load64(bp); }
+    if (n < 0) { return _wgpu_ctier_fail(GPU_ERR_BUFFER, "compute dispatch: negative binding count"); }
+    if (n > _WGPU_DISPATCH_MAX_BINDINGS) {
+        return _wgpu_ctier_fail(GPU_ERR_BUFFER, "compute dispatch: more than 16 bindings");
+    }
+    for (var k = 0; k < n; k = k + 1) {
+        if (load64(bp + 8 + k * 16) == 0) {
+            return _wgpu_ctier_fail(GPU_ERR_BUFFER, "compute dispatch: a null buffer in the binding array");
+        }
+    }
+    var need = 0;
+    if (n > 0) { need = 1; }
+    var e = _wgpu_dispatch_entry(ctx, shmod, need);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    var device = gpu_ctx_device(ctx);
+    var rs = _wgpu_render_state(ctx);
+    var bg = 0;
+    if (n > 0) {
+        # WGPUBindGroupEntry (56 B): binding +8, buffer +16, offset +24, size +32.
+        var ents = rs + _WGPU_RS_BG_ENTRIES;
+        memset(ents, 0, n * 56);
+        for (var b = 0; b < n; b = b + 1) {
+            var w = ents + b * 56;
+            store32(w + 8, b);
+            store64(w + 16, load64(bp + 8 + b * 16));
+            store64(w + 32, WGPU_WHOLE_SIZE);
+        }
+        var bgd = rs + _WGPU_RS_DESC;
+        memset(bgd, 0, 48);
+        store64(bgd + 24, load64(e + 16));
+        store64(bgd + 32, n);
+        store64(bgd + 40, ents);
+        var scoped = _wgpu_scope_open(device);
+        bg = wgpu_device_create_bind_group(device, bgd);
+        if (scoped == 0) {
+            if (_wgpu_scope_close(ctx, device) != 0) {
+                if (bg != 0) { wgpu_bind_group_release(bg); }
+                return GPU_ERR_VALIDATION;
+            }
+        }
+        if (bg == 0) { return GPU_ERR_OTHER; }
+    }
+    var encoder = wgpu_device_create_command_encoder(device, 0);
+    if (encoder == 0) {
+        if (bg != 0) { wgpu_bind_group_release(bg); }
+        return GPU_ERR_OTHER;
+    }
+    var cpd[32];
+    memset(&cpd, 0, 32);
+    var pe = wgpu_command_encoder_begin_compute_pass(encoder, &cpd);
+    if (pe != 0) {
+        wgpu_compute_pass_set_pipeline(pe, load64(e + 8));
+        if (bg != 0) { wgpu_compute_pass_set_bind_group(pe, 0, bg, 0, 0); }
+        wgpu_compute_pass_dispatch(pe, x, y, z);
+    }
+    var rc = _wgpu_compute_close(ctx, encoder, pe);
+    if (bg != 0) { wgpu_bind_group_release(bg); }
+    return rc;
+}
+
+# ================================================================
+# Slot registration — called from backend_wgpu_new
+# ================================================================
+fn _backend_wgpu_fill_ctier(b): i64 {
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PIPELINE_CREATE_DESC, &_backend_wgpu_compute_pipeline_create_desc);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PIPELINE_RELEASE,     &_backend_wgpu_compute_pipeline_release);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PASS_BEGIN,           &_backend_wgpu_compute_pass_begin);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PASS_SET_PIPELINE,    &_backend_wgpu_compute_pass_set_pipeline);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PASS_SET_BIND_GROUP,  &_backend_wgpu_compute_pass_set_bind_group);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PASS_DISPATCH,        &_backend_wgpu_compute_pass_dispatch);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_PASS_END,             &_backend_wgpu_compute_pass_end);
+    return 0;
+}

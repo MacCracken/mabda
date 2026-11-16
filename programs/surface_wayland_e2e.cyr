@@ -1,0 +1,516 @@
+# programs/surface_wayland_e2e.cyr — the render tier's MB5 (a Wayland window surface) on hardware (v4.3.1)
+#
+# A Wayland client in Cyrius, reached through the process's own libc dlopen / dlsym
+# (found by an ELF GNU-hash lookup in the loaded libc.so.6): libwayland-client opens
+# an xdg_toplevel window (the xdg-shell interface tables are built here, as
+# wayland-scanner would), then mabda:
+#   - makes a WGPUSurface from the wl_display + wl_surface (launcher slot 78);
+#   - reads its capabilities (slot 79): BGRA8 or BGRA8 sRGB listed, FIFO listed;
+#   - configures BGRA8 (sRGB when listed) with GPU_PRESENT_AUTO_NO_VSYNC;
+#   - renders 120 frames into the acquired frame through a descriptor pass, reads
+#     the first frame back (BGRA bytes) when the surface allows COPY_SRC;
+#   - resolves a 4x MSAA target into a frame (gpu_pass_desc_color_resolve);
+#   - resizes, acquires at the new size;
+#   - reconfigures GPU_PRESENT_AUTO_VSYNC and presents 5 frames;
+#   - releases the surface.
+# Needs a Wayland compositor (WAYLAND_DISPLAY): without one it prints SKIP and exits 0.
+# Linked with deps/wgpu_main.c via `make test-surface-wayland-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 {
+    _e2e_line(2, "FAIL: ", msg);
+    if (gpu_last_error() != 0) { _e2e_line(2, "      ", gpu_last_error_message()); }
+    return 1;
+}
+fn _info_int(label, v): i64 {
+    var nb[64];
+    memset(&nb, 0, 64);
+    fmt_int_buf(v, &nb);
+    _e2e_line(1, label, &nb);
+    return 0;
+}
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+fn _streq(a, b): i64 {
+    var i = 0;
+    while (1 == 1) {
+        var x = load8(a + i);
+        if (x != load8(b + i)) { return 0; }
+        if (x == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# dlopen / dlsym from the loaded libc (no new launcher slot)
+# ---------------------------------------------------------------------------
+
+fn _hexval(c): i64 {
+    if (c >= 48) { if (c <= 57) { return c - 48; } }
+    if (c >= 97) { if (c <= 102) { return c - 87; } }
+    return 0 - 1;
+}
+
+# The load base of the mapping of `suffix` at file offset 0, from /proc/self/maps.
+fn _lib_base(suffix): i64 {
+    var cap = 262144;
+    var buf = alloc(cap);
+    var fd = syscall(2, "/proc/self/maps", 0, 0);
+    if (fd < 0) { return 0; }
+    var n = 0;
+    while (n < cap - 1) {
+        var r = syscall(0, fd, buf + n, cap - 1 - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    syscall(3, fd);
+    store8(buf + n, 0);
+    var sl = strlen(suffix);
+    var ls = 0;
+    while (ls < n) {
+        var le = ls;
+        while (le < n) { if (load8(buf + le) == 10) { break; } le = le + 1; }
+        # start-end perms offset ...
+        var start = 0;
+        var i = ls;
+        while (_hexval(load8(buf + i)) >= 0) { start = start * 16 + _hexval(load8(buf + i)); i = i + 1; }
+        while (load8(buf + i) != 32) { i = i + 1; }   # skip -end
+        i = i + 1;
+        while (load8(buf + i) != 32) { i = i + 1; }   # skip perms
+        i = i + 1;
+        var off = 0;
+        while (_hexval(load8(buf + i)) >= 0) { off = off * 16 + _hexval(load8(buf + i)); i = i + 1; }
+        if (off == 0) {
+            if (le - ls > sl) {
+                if (memeq(buf + le - sl, suffix, sl) == 1) { return start; }
+            }
+        }
+        ls = le + 1;
+    }
+    return 0;
+}
+
+# The address of exported symbol `name` in the ELF image loaded at `base`
+# (DT_GNU_HASH lookup), or 0.
+fn _elf_sym(base, name): i64 {
+    if (load32(base) != 0x464C457F) { return 0; }
+    var phoff = load64(base + 32);
+    var phent = load16(base + 54);
+    var phnum = load16(base + 56);
+    var dyns = 0;
+    for (var p = 0; p < phnum; p = p + 1) {
+        var ph = base + phoff + p * phent;
+        if (load32(ph) == 2) { dyns = base + load64(ph + 16); }
+    }
+    if (dyns == 0) { return 0; }
+    var strtab = 0;
+    var symtab = 0;
+    var gnuh = 0;
+    var d = dyns;
+    while (load64(d) != 0) {
+        var tag = load64(d);
+        var v = load64(d + 8);
+        if (v < base) { v = v + base; }
+        if (tag == 5) { strtab = v; }
+        if (tag == 6) { symtab = v; }
+        if (tag == 0x6FFFFEF5) { gnuh = v; }
+        d = d + 16;
+    }
+    if (strtab == 0) { return 0; }
+    if (symtab == 0) { return 0; }
+    if (gnuh == 0) { return 0; }
+    var h = 5381;
+    var k = 0;
+    while (load8(name + k) != 0) { h = (h * 33 + load8(name + k)) & 0xFFFFFFFF; k = k + 1; }
+    var nb = load32(gnuh);
+    var symoff = load32(gnuh + 4);
+    var bloom = load32(gnuh + 8);
+    var buckets = gnuh + 16 + bloom * 8;
+    var chain = buckets + nb * 4;
+    var idx = load32(buckets + (h % nb) * 4);
+    if (idx == 0) { return 0; }
+    while (1 == 1) {
+        var ch = load32(chain + (idx - symoff) * 4);
+        if ((ch | 1) == (h | 1)) {
+            var sym = symtab + idx * 24;
+            if (_streq(strtab + load32(sym), name) == 1) {
+                if (load64(sym + 8) != 0) { return base + load64(sym + 8); }
+            }
+        }
+        if ((ch & 1) == 1) { break; }
+        idx = idx + 1;
+    }
+    return 0;
+}
+
+var _dlsym = 0;
+var _wl = 0;
+fn _wlsym(name): i64 { return fncall2(_dlsym, _wl, name); }
+
+# ---------------------------------------------------------------------------
+# libwayland-client + the xdg-shell interface tables
+# ---------------------------------------------------------------------------
+var _wl_display_connect = 0;
+var _wl_display_disconnect = 0;
+var _wl_display_roundtrip = 0;
+var _wl_display_dispatch_pending = 0;
+var _wl_display_flush = 0;
+var _wl_proxy_marshal_array_flags = 0;
+var _wl_proxy_add_listener = 0;
+var _wl_proxy_get_version = 0;
+var _wl_registry_interface = 0;
+var _wl_compositor_interface = 0;
+var _wl_surface_interface = 0;
+
+var _xdg_wm_base_iface = 0;
+var _xdg_surface_iface = 0;
+var _xdg_toplevel_iface = 0;
+
+# wl_message (24 B): name, signature, types. wl_interface (40 B): name, version
+# (i32), method_count (i32), methods, event_count (i32), events.
+fn _msg(arr, i, name, sig, types): i64 {
+    store64(arr + i * 24, name);
+    store64(arr + i * 24 + 8, sig);
+    store64(arr + i * 24 + 16, types);
+    return 0;
+}
+fn _types(n): i64 {
+    var t = alloc(n * 8 + 8);
+    memset(t, 0, n * 8 + 8);
+    return t;
+}
+fn _iface(iface, name, version, nm, methods, ne, events): i64 {
+    memset(iface, 0, 40);
+    store64(iface, name);
+    store32(iface + 8, version);
+    store32(iface + 12, nm);
+    store64(iface + 16, methods);
+    store32(iface + 24, ne);
+    store64(iface + 32, events);
+    return 0;
+}
+
+fn _build_xdg(): i64 {
+    _xdg_wm_base_iface = alloc(40);
+    _xdg_surface_iface = alloc(40);
+    _xdg_toplevel_iface = alloc(40);
+    var nul = _types(4);
+    # xdg_wm_base v1: destroy, create_positioner(n), get_xdg_surface(no), pong(u); ping(u)
+    var wmm = alloc(4 * 24);
+    var gx = _types(2);
+    store64(gx, _xdg_surface_iface);
+    store64(gx + 8, _wl_surface_interface);
+    _msg(wmm, 0, "destroy", "", nul);
+    _msg(wmm, 1, "create_positioner", "n", nul);
+    _msg(wmm, 2, "get_xdg_surface", "no", gx);
+    _msg(wmm, 3, "pong", "u", nul);
+    var wme = alloc(24);
+    _msg(wme, 0, "ping", "u", nul);
+    _iface(_xdg_wm_base_iface, "xdg_wm_base", 1, 4, wmm, 1, wme);
+    # xdg_surface v1: destroy, get_toplevel(n), get_popup(n?oo), set_window_geometry(iiii),
+    # ack_configure(u); configure(u)
+    var xsm = alloc(5 * 24);
+    var gt = _types(1);
+    store64(gt, _xdg_toplevel_iface);
+    _msg(xsm, 0, "destroy", "", nul);
+    _msg(xsm, 1, "get_toplevel", "n", gt);
+    _msg(xsm, 2, "get_popup", "n?oo", nul);
+    _msg(xsm, 3, "set_window_geometry", "iiii", nul);
+    _msg(xsm, 4, "ack_configure", "u", nul);
+    var xse = alloc(24);
+    _msg(xse, 0, "configure", "u", nul);
+    _iface(_xdg_surface_iface, "xdg_surface", 1, 5, xsm, 1, xse);
+    # xdg_toplevel v1: destroy, set_parent(?o), set_title(s), set_app_id(s); configure(iia), close
+    var tm = alloc(4 * 24);
+    var tp = _types(1);
+    store64(tp, _xdg_toplevel_iface);
+    _msg(tm, 0, "destroy", "", nul);
+    _msg(tm, 1, "set_parent", "?o", tp);
+    _msg(tm, 2, "set_title", "s", nul);
+    _msg(tm, 3, "set_app_id", "s", nul);
+    var te = alloc(2 * 24);
+    _msg(te, 0, "configure", "iia", nul);
+    _msg(te, 1, "close", "", nul);
+    _iface(_xdg_toplevel_iface, "xdg_toplevel", 1, 4, tm, 2, te);
+    return 0;
+}
+
+fn _marshal(proxy, opcode, iface, version, args): i64 {
+    return fncall6(_wl_proxy_marshal_array_flags, proxy, opcode, iface, version, 0, args);
+}
+
+# Listener callbacks (called by libwayland, C ABI). u32 arguments are masked.
+var _comp_name = 0;
+var _comp_ver = 0;
+var _wm_name = 0;
+var _wm = 0;
+var _xsurf = 0;
+var _configured = 0;
+var _top_w = 0;
+var _top_h = 0;
+var _closed = 0;
+
+fn _on_global(data, registry, name, iface, version): i64 {
+    if (_streq(iface, "wl_compositor") == 1) {
+        _comp_name = name & 0xFFFFFFFF;
+        _comp_ver = version & 0xFFFFFFFF;
+    }
+    if (_streq(iface, "xdg_wm_base") == 1) { _wm_name = name & 0xFFFFFFFF; }
+    return 0;
+}
+fn _on_global_remove(data, registry, name): i64 { return 0; }
+fn _on_ping(data, wm, serial): i64 {
+    var a[8];
+    store64(&a, serial & 0xFFFFFFFF);
+    _marshal(wm, 3, 0, 1, &a);     # xdg_wm_base.pong
+    return 0;
+}
+fn _on_xs_configure(data, xs, serial): i64 {
+    var a[8];
+    store64(&a, serial & 0xFFFFFFFF);
+    _marshal(xs, 4, 0, 1, &a);     # xdg_surface.ack_configure
+    _configured = 1;
+    return 0;
+}
+fn _on_top_configure(data, top, w, h, states): i64 {
+    _top_w = w & 0xFFFFFFFF;
+    _top_h = h & 0xFFFFFFFF;
+    return 0;
+}
+fn _on_top_close(data, top): i64 { _closed = 1; return 0; }
+
+var _display = 0;
+var _surface = 0;
+
+# Open the window. 1 on success; 0 = no compositor (SKIP); -1 = failure.
+fn _open_window(): i64 {
+    var base = _lib_base("/libc.so.6");
+    if (base == 0) { _fail("dl: libc.so.6 not found in /proc/self/maps"); return 0 - 1; }
+    var dlopen = _elf_sym(base, "dlopen");
+    _dlsym = _elf_sym(base, "dlsym");
+    if (dlopen == 0) { _fail("dl: no dlopen in the loaded libc"); return 0 - 1; }
+    if (_dlsym == 0) { _fail("dl: no dlsym in the loaded libc"); return 0 - 1; }
+    _wl = fncall2(dlopen, "libwayland-client.so.0", 2);
+    if (_wl == 0) { _e2e_line(1, "SKIP: ", "libwayland-client.so.0 not installed"); return 0; }
+    _pass("dl: libc's dlopen / dlsym found by GNU-hash lookup; libwayland-client loaded");
+    _wl_display_connect = _wlsym("wl_display_connect");
+    _wl_display_disconnect = _wlsym("wl_display_disconnect");
+    _wl_display_roundtrip = _wlsym("wl_display_roundtrip");
+    _wl_display_dispatch_pending = _wlsym("wl_display_dispatch_pending");
+    _wl_display_flush = _wlsym("wl_display_flush");
+    _wl_proxy_marshal_array_flags = _wlsym("wl_proxy_marshal_array_flags");
+    _wl_proxy_add_listener = _wlsym("wl_proxy_add_listener");
+    _wl_proxy_get_version = _wlsym("wl_proxy_get_version");
+    _wl_registry_interface = _wlsym("wl_registry_interface");
+    _wl_compositor_interface = _wlsym("wl_compositor_interface");
+    _wl_surface_interface = _wlsym("wl_surface_interface");
+    if (_wl_proxy_marshal_array_flags == 0) {
+        _fail("dl: libwayland-client lacks wl_proxy_marshal_array_flags (< 1.20)");
+        return 0 - 1;
+    }
+    _display = fncall1(_wl_display_connect, 0);
+    if (_display == 0) {
+        _e2e_line(1, "SKIP: ", "no Wayland compositor (WAYLAND_DISPLAY unset or unreachable)");
+        return 0;
+    }
+    _build_xdg();
+    var a[64];
+    memset(&a, 0, 64);
+    var registry = _marshal(_display, 1, _wl_registry_interface, fncall1(_wl_proxy_get_version, _display), &a);
+    var rl = alloc(16);
+    store64(rl, &_on_global);
+    store64(rl + 8, &_on_global_remove);
+    fncall3(_wl_proxy_add_listener, registry, rl, 0);
+    fncall1(_wl_display_roundtrip, _display);
+    if (_comp_name == 0) { _fail("wayland: no wl_compositor global"); return 0 - 1; }
+    if (_wm_name == 0) { _fail("wayland: no xdg_wm_base global"); return 0 - 1; }
+    var cv = _comp_ver;
+    if (cv > 4) { cv = 4; }
+    store64(&a, _comp_name);
+    store64(&a + 8, "wl_compositor");
+    store64(&a + 16, cv);
+    store64(&a + 24, 0);
+    var comp = _marshal(registry, 0, _wl_compositor_interface, cv, &a);
+    store64(&a, _wm_name);
+    store64(&a + 8, "xdg_wm_base");
+    store64(&a + 16, 1);
+    store64(&a + 24, 0);
+    _wm = _marshal(registry, 0, _xdg_wm_base_iface, 1, &a);
+    var wl = alloc(8);
+    store64(wl, &_on_ping);
+    fncall3(_wl_proxy_add_listener, _wm, wl, 0);
+    memset(&a, 0, 64);
+    _surface = _marshal(comp, 0, _wl_surface_interface, cv, &a);
+    store64(&a, 0);
+    store64(&a + 8, _surface);
+    _xsurf = _marshal(_wm, 2, _xdg_surface_iface, 1, &a);
+    var xl = alloc(8);
+    store64(xl, &_on_xs_configure);
+    fncall3(_wl_proxy_add_listener, _xsurf, xl, 0);
+    memset(&a, 0, 64);
+    var top = _marshal(_xsurf, 1, _xdg_toplevel_iface, 1, &a);
+    var tl = alloc(16);
+    store64(tl, &_on_top_configure);
+    store64(tl + 8, &_on_top_close);
+    fncall3(_wl_proxy_add_listener, top, tl, 0);
+    store64(&a, "mabda MB5");
+    _marshal(top, 2, 0, 1, &a);                  # set_title
+    memset(&a, 0, 64);
+    _marshal(_surface, 6, 0, cv, &a);            # wl_surface.commit
+    for (var r = 0; r < 10; r = r + 1) {
+        if (_configured == 1) { break; }
+        fncall1(_wl_display_roundtrip, _display);
+    }
+    if (_configured == 0) { _fail("wayland: the xdg_surface was never configured"); return 0 - 1; }
+    _pass("wayland: an xdg_toplevel window configured (registry, compositor, xdg_wm_base bound from Cyrius)");
+    return 1;
+}
+
+fn _pump(): i64 {
+    fncall1(_wl_display_dispatch_pending, _display);
+    fncall1(_wl_display_flush, _display);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# mabda's surface
+# ---------------------------------------------------------------------------
+fn _frame_pass(ctx, frame, r, g, b): i64 {
+    var pd[576];
+    gpu_pass_desc_reset(&pd);
+    var c[32];
+    store64(&c, r);
+    store64(&c + 8, g);
+    store64(&c + 16, b);
+    store64(&c + 24, F64_1);
+    if (gpu_pass_desc_color(&pd, frame, GPU_LOAD_CLEAR, &c) != 0) { return 1; }
+    var pass = gpu_render_pass_begin_desc(ctx, &pd);
+    if (pass == 0) { return 1; }
+    return gpu_render_pass_end(ctx, pass);
+}
+
+fn _check_surface(ctx): i64 {
+    gpu_error_clear();
+    if (gpu_surface_create_wayland(ctx, _display, _surface) != 0) { return _fail("gpu_surface_create_wayland"); }
+    _pass("gpu_surface_create_wayland: a WGPUSurface from the wl_display + wl_surface (slot 78)");
+    var caps = gpu_surface_caps_new();
+    if (gpu_surface_capabilities(ctx, caps) != 0) { return _fail("gpu_surface_capabilities (slot 79)"); }
+    _info_int("    formats: ", gpu_surface_caps_format_count(caps));
+    _info_int("    present modes: ", gpu_surface_caps_present_mode_count(caps));
+    var fmt = MABDA_TEXFMT_BGRA8;
+    if (gpu_surface_caps_has_format(caps, MABDA_TEXFMT_BGRA8_SRGB) == 1) { fmt = MABDA_TEXFMT_BGRA8_SRGB; }
+    if (gpu_surface_caps_has_format(caps, fmt) == 0) { return _fail("capabilities: no BGRA8 / BGRA8 sRGB format"); }
+    if (gpu_surface_caps_has_present_mode(caps, GPU_PRESENT_FIFO) == 0) {
+        return _fail("capabilities: FIFO is not listed");
+    }
+    _pass("gpu_surface_capabilities: a BGRA8 format and FIFO listed (slot 79)");
+    var w = 640;
+    var h = 480;
+    if (_top_w > 0) { w = _top_w; }
+    if (_top_h > 0) { h = _top_h; }
+    var s = gpu_surface_configure(ctx, w, h, fmt, GPU_PRESENT_AUTO_NO_VSYNC);
+    if (s == 0) { return _fail("gpu_surface_configure (BGRA8, AUTO_NO_VSYNC)"); }
+    _info_int("    AUTO_NO_VSYNC resolved to: ", gpu_surface_resolve_present_mode(caps, GPU_PRESENT_AUTO_NO_VSYNC));
+    _pass("gpu_surface_configure: BGRA8 at the window's size, AUTO_NO_VSYNC");
+    for (var i = 0; i < 120; i = i + 1) {
+        var frame = gpu_surface_acquire_target(ctx, s);
+        if (frame == 0) { return _fail("gpu_surface_acquire_target"); }
+        if (gpu_surface_acquire_target(ctx, s) != frame) {
+            return _fail("a second acquire before present is not the same frame");
+        }
+        var t = f64_div(f64_from(i), f64_from(120));
+        if (_frame_pass(ctx, frame, t, F64_0, f64_sub(F64_1, t)) != 0) { return _fail("a pass into the frame"); }
+        if (i == 0) {
+            var px = alloc(w * h * 4);
+            var rr = gpu_texture_read(ctx, frame, px, w * h * 4);
+            if (rr == 0) {
+                # Frame 0 is pure blue (r = 0, b = 1): BGRA bytes 255, 0, 0, 255.
+                if (load8(px) != 255) { return _fail("frame 0 readback: blue is not 255 (B of BGRA)"); }
+                if (load8(px + 2) != 0) { return _fail("frame 0 readback: red is not 0"); }
+                _pass("frame 0 read back from the surface texture: BGRA order");
+            } else {
+                _e2e_line(1, "INFO: ", "the surface does not allow COPY_SRC: frame readback skipped");
+            }
+        }
+        if (gpu_surface_present(ctx, s) != 0) { return _fail("gpu_surface_present"); }
+        _pump();
+    }
+    _pass("120 frames acquired, rendered through a descriptor pass and presented");
+    var ms = gpu_render_target_create(ctx, w, h, fmt, 4);
+    if (ms == 0) { return _fail("a 4x MSAA target in the surface format"); }
+    var frame2 = gpu_surface_acquire_target(ctx, s);
+    var pd[576];
+    gpu_pass_desc_reset(&pd);
+    var green = color_new(F64_0, F64_1, F64_0, F64_1);
+    gpu_pass_desc_color(&pd, ms, GPU_LOAD_CLEAR, green);
+    gpu_pass_desc_color_store(&pd, 0, GPU_STORE_DISCARD);
+    gpu_pass_desc_color_resolve(&pd, 0, frame2);
+    var mp = gpu_render_pass_begin_desc(ctx, &pd);
+    if (mp == 0) { return _fail("an MSAA pass resolving into the frame"); }
+    if (gpu_render_pass_end(ctx, mp) != 0) { return _fail("MSAA-resolve pass end"); }
+    if (gpu_surface_present(ctx, s) != 0) { return _fail("present after the resolve"); }
+    _pass("a 4x MSAA target resolved into the surface frame (gpu_pass_desc_color_resolve)");
+    _pump();
+    if (gpu_surface_resize(ctx, s, w / 2, h / 2) != 0) { return _fail("gpu_surface_resize"); }
+    var f3 = gpu_surface_acquire_target(ctx, s);
+    if (f3 == 0) { return _fail("acquire after resize"); }
+    if (_frame_pass(ctx, f3, F64_0, F64_1, F64_0) != 0) { return _fail("a pass at the new size"); }
+    if (gpu_surface_present(ctx, s) != 0) { return _fail("present after resize"); }
+    _pass("gpu_surface_resize to half size; a frame at the new size presented");
+    _pump();
+    var sv = gpu_surface_configure(ctx, w, h, fmt, GPU_PRESENT_AUTO_VSYNC);
+    if (sv == 0) { return _fail("reconfigure AUTO_VSYNC"); }
+    _info_int("    AUTO_VSYNC resolved to: ", gpu_surface_resolve_present_mode(caps, GPU_PRESENT_AUTO_VSYNC));
+    for (var j = 0; j < 5; j = j + 1) {
+        var f4 = gpu_surface_acquire_target(ctx, sv);
+        if (f4 == 0) { return _fail("acquire (vsync)"); }
+        _frame_pass(ctx, f4, F64_1, F64_1, F64_1);
+        if (gpu_surface_present(ctx, sv) != 0) { return _fail("present (vsync)"); }
+        _pump();
+    }
+    _pass("AUTO_VSYNC: 5 frames presented");
+    gpu_surface_release(ctx, sv);
+    _pass("gpu_surface_release");
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    var wr = _open_window();
+    if (wr < 0) { return 1; }
+    if (wr == 0) { return 0; }
+    if (_check_surface(ctx) != 0) { return 1; }
+    fncall1(_wl_display_disconnect, _display);
+    _e2e_summary();
+    return 0;
+}

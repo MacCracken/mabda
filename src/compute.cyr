@@ -113,16 +113,24 @@ fn compute_dispatch(device, queue, cp, bind_group, dims_xyz): i64 {
     if (validate_dispatch(x, y, z, MABDA_MAX_DISPATCH_DIM) != 0) { return 0; }
 
     var encoder = wgpu_device_create_command_encoder(device, "compute_enc");
+    if (encoder == 0) { return 0; }
 
-    var pass_desc = wgpu_compute_pass_descriptor("compute_pass");
-    var pass = wgpu_command_encoder_begin_compute_pass(encoder, pass_desc);
+    # 4.3.1: the pass descriptor is on the stack (it was bump-allocated per
+    # dispatch), and the pass encoder (launcher slot 81, when present) and the
+    # command encoder are released (both leaked on every dispatch before).
+    var pass_desc[32];
+    memset(&pass_desc, 0, 32);
+    wgpu_string_view(&pass_desc + 8, "compute_pass");
+    var pass = wgpu_command_encoder_begin_compute_pass(encoder, &pass_desc);
 
     wgpu_compute_pass_set_pipeline(pass, compute_pipeline_handle(cp));
     wgpu_compute_pass_set_bind_group(pass, 0, bind_group, 0, 0);
     wgpu_compute_pass_dispatch(pass, x, y, z);
     wgpu_compute_pass_end(pass);
+    wgpu_compute_pass_encoder_release(pass);   # GPU_ERR_FFI_SYMBOL (nothing called) on an 81-slot launcher
 
     var cmd_buf = wgpu_command_encoder_finish(encoder, "compute_cmd");
+    wgpu_command_encoder_release(encoder);
     wgpu_queue_submit_one(queue, cmd_buf);
     return 0;
 }
@@ -351,7 +359,10 @@ fn gpu_shader_module_release(ctx, shmod): i64 {
 # one (handle, va) pair for the v3.0 single-output shader, or, for a compiled SPIR-V shmod,
 # a count-prefixed array: bp+0 = count, then count x (handle, va) 16-byte pairs (N.6,
 # CHANGELOG [3.2.7]; _native_dispatch_compiled in src/backend_native.cyr). The wgpu slot
-# returns GPU_ERR_OTHER unconditionally: wgpu compute dispatch is unimplemented (roadmap.md).
+# (4.3.1, MB4; it returned GPU_ERR_OTHER before) reads the same array: pair k's first
+# word is the buffer bound at @group(0) @binding(k), in the layout wgpu derives from the
+# module's one compute entry point (storage and uniform mixed); the pipeline is cached
+# per module (src/backend_wgpu_ctier.cyr). It needs the 4.3.1 launcher (83 slots).
 
 fn gpu_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }

@@ -193,37 +193,61 @@ fn _backend_wgpu_buffer_write(ctx, buf, off, ptr, n): i64 {
 # default — anything larger requires a bespoke streaming path.
 var _BACKEND_WGPU_READ_CAP = 268435456;
 
+# 4.3.1 (MB4, storage readback): a buffer-to-buffer copy moves whole 4-byte
+# words (WebGPU's COPY_BUFFER_ALIGNMENT), so the copied window is [off, off + n)
+# widened to word bounds, and the requested bytes are taken from inside it.
+# Before 4.3.1 an unaligned offset or size went to the copy as is: wgpu refused
+# the command buffer, the launcher dropped it, and the read mapped a staging
+# buffer nothing was copied into — returning 0 with zeros. A refused copy now
+# returns its error, and the encoder (never released before) is released.
 fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n): i64 {
     if (n <= 0)                     { return GPU_ERR_BUFFER; }
     if (n > _BACKEND_WGPU_READ_CAP) { return GPU_ERR_BUFFER; }
+    if (buf == 0)                   { return GPU_ERR_BUFFER; }
+    if (ptr == 0)                   { return GPU_ERR_BUFFER; }
     var src_size = wgpu_buffer_get_size(buf);
     if (off < 0)                    { return GPU_ERR_BUFFER; }
     if (off + n > src_size)         { return GPU_ERR_BUFFER; }
+    var start = off & (0 - 4);
+    var end = (off + n + 3) & (0 - 4);
+    if (end > src_size) { return GPU_ERR_BUFFER; }   # a buffer whose size is not a word multiple
+    var span = end - start;
     var device = gpu_ctx_device(ctx);
     var queue  = gpu_ctx_queue(ctx);
 
     var staging_usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
-    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
-    var staging = wgpu_device_create_buffer(device, staging_desc);
+    var sd[48];
+    memset(&sd, 0, 48);
+    store64(&sd + 24, staging_usage);
+    store64(&sd + 32, span);
+    var staging = wgpu_device_create_buffer(device, &sd);
     if (staging == 0) { return GPU_ERR_BUFFER; }
 
     var encoder = wgpu_device_create_command_encoder(device, 0);
-    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buf, off, staging, 0, n);
+    if (encoder == 0) { wgpu_buffer_release(staging); return GPU_ERR_OTHER; }
+    wgpu_command_encoder_copy_buffer_to_buffer(encoder, buf, start, staging, 0, span);
     var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_command_encoder_release(encoder);
+    if (cmd_buf == 0) {
+        wgpu_buffer_release(staging);
+        var rc = _backend_wgpu_error_take(ctx);
+        if (rc == 0) { rc = GPU_ERR_READBACK_MAP; }
+        return rc;
+    }
     wgpu_queue_submit_one(queue, cmd_buf);
 
-    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, n);
+    var status = wgpu_buffer_map_sync(device, staging, WGPU_MAP_MODE_READ, 0, span);
     if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
         wgpu_buffer_release(staging);
         return GPU_ERR_READBACK_MAP;
     }
-    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, span);
     if (mapped == 0) {
         wgpu_buffer_unmap(staging);
         wgpu_buffer_release(staging);
         return GPU_ERR_READBACK_MAP;
     }
-    gpu_copy_bytes(ptr, mapped, n);   # 4.3.0: was the stdlib byte-loop memcpy (P7: 2.7 ms per 128 KB)
+    gpu_copy_bytes(ptr, mapped + (off - start), n);   # 4.3.0: was the stdlib byte-loop memcpy
     wgpu_buffer_unmap(staging);
     wgpu_buffer_release(staging);
     return 0;
@@ -356,161 +380,157 @@ fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
 
 fn _backend_wgpu_shader_module_release(ctx, shmod): i64 {
     if (ctx == 0) { return 0; }
+    _wgpu_dispatch_forget(ctx, shmod);   # 4.3.1: its cached dispatch pipeline
     wgpu_shader_module_release(shmod);
     return 0;
 }
 
 # ================================================================
-# Texture slots — wgpu wrappers (Step 5.5)
+# The wgpu texture record (v4.3.1 — one layout for every kind)
 # ================================================================
-# Returns a 32-byte struct in the same shape src/texture.cyr uses
-# elsewhere in the codebase, so the wgpu side stays consistent:
-#   +0:  handle   (WGPUTexture, u64)
-#   +8:  view     (WGPUTextureView, u64)
-#   +16: sampler  (WGPUSampler — unused for plain write/read; kept
-#                  for shape-compat with src/texture.cyr; zero here)
-#   +24: width    (u32)
-#   +28: height   (u32)
-#
-# Step 5.5 limit: width must be a multiple of 64 (so bytes_per_row =
-# width*4 satisfies wgpu's COPY_BUFFER_ALIGNMENT = 256 on the read
-# path). Real consumer flows already match this — render_e2e uses
-# 256x256. A row-padded staging buffer for sub-64 widths is deferred (see docs/development/roadmap.md).
+# Every texture-like object the wgpu backend hands out is one WGPU_TEX_SIZE
+# record: a texture (gpu_texture_create_*), a render target
+# (gpu_render_target_create*), a view (gpu_texture_view_create) and a surface
+# frame (gpu_surface_acquire_target). The bind group, pass, copy and readback
+# paths read any of them the same way:
+#   +0:  handle   WGPUTexture (owned by a TEXTURE / TARGET; a VIEW's and a
+#                 SURFACE frame's belongs to its parent / the surface)
+#   +8:  view     its default WGPUTextureView (owned): the one bound, attached,
+#                 sampled. A multisampled colour target's is its resolve view.
+#   +16: fmt      i64 MABDA_TEXFMT_*
+#   +24: width    u32 (of level base_mip)     +28: height u32
+#   +32: mips     u32 (levels it spans)       +36: layers u32 (array layers; 6 = cube)
+#   +40: samples  u32                         +44: kind   u32 (WGPU_TEX_KIND_*)
+#   +48: msaa     WGPUTexture: a multisampled colour target's (rendered into; +0
+#                 is then its 1-sample resolve texture)   +56: msaa view
+#   +64: base_mip u32 (a VIEW: its first level of +0)
+#   +68: base_layer u32 (a VIEW: its first layer of +0)
+#   +72: usage    u32 (WGPUTextureUsage)       +76: view dimension u32
+# Before 4.3.1 the backend had three 32-byte layouts (plain, mipped, array/cube)
+# that disagreed on where the width, height and format lived: a readback of a
+# mipped texture read its width as its format.
+var WGPU_TEX_SIZE          = 80;
+var WGPU_TEX_KIND_TEXTURE  = 0;
+var WGPU_TEX_KIND_TARGET   = 1;
+var WGPU_TEX_KIND_VIEW     = 2;
+var WGPU_TEX_KIND_SURFACE  = 3;
 
-fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height): i64 {
-    if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
-    | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
-    var desc = wgpu_texture_descriptor(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D,
-      width, height,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor(0,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
-      WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var t = alloc(32);
-    memset(t, 0, 32);
+fn _wgpu_tex_fmt(t): i64        { return load64(t + 16); }
+fn _wgpu_tex_width(t): i64      { return load32(t + 24); }
+fn _wgpu_tex_height(t): i64     { return load32(t + 28); }
+fn _wgpu_tex_mips(t): i64       { return load32(t + 32); }
+fn _wgpu_tex_layers(t): i64     { return load32(t + 36); }
+fn _wgpu_tex_samples(t): i64    { return load32(t + 40); }
+fn _wgpu_tex_kind(t): i64       { return load32(t + 44); }
+fn _wgpu_tex_base_mip(t): i64   { return load32(t + 64); }
+fn _wgpu_tex_base_layer(t): i64 { return load32(t + 68); }
+fn _wgpu_tex_usage_of(t): i64   { return load32(t + 72); }
+
+fn _wgpu_tex_new(handle, view, fmt, w, h, mips, layers, samples, kind, usage, vdim): i64 {
+    var t = alloc(WGPU_TEX_SIZE);
+    if (t == 0) { return 0; }
+    memset(t, 0, WGPU_TEX_SIZE);
     store64(t +  0, handle);
     store64(t +  8, view);
-    store64(t + 16, 0);
-    store32(t + 24, width);
-    store32(t + 28, height);
+    store64(t + 16, fmt);
+    store32(t + 24, w);
+    store32(t + 28, h);
+    store32(t + 32, mips);
+    store32(t + 36, layers);
+    store32(t + 40, samples);
+    store32(t + 44, kind);
+    store32(t + 72, usage);
+    store32(t + 76, vdim);
     return t;
 }
 
-# v3.1 [M.6]: create a mipped 2D RGBA8 texture (mipLevelCount = mip_count)
-# with STORAGE_BINDING so the downsample compute shader can write upper
-# levels. Returns a 32-byte WgpuMippedTexture: handle@0, level-0 view@8,
-# width@16(u32), height@20(u32), mip_count@24(u32). The per-level views
-# the generate path binds are built lazily in the generate slot (M.6b)
-# from `handle` via wgpu_texture_view_descriptor_level — no view table to
-# carry here. The consumer treats the returned ptr as opaque.
-fn _backend_wgpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
-    if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
-    if (mip_count < 1) { return 0; }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC
-    | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
-    | WGPU_TEXTURE_USAGE_STORAGE_BINDING;
-    var desc = wgpu_texture_descriptor_mipped(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D, width, height,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM, mip_count);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    # A full-chain view (all levels) for sampling/upload convenience.
-    var vd = wgpu_texture_view_descriptor(0,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
-      WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    store32(vd + 36, mip_count);   # mipLevelCount = full chain
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var t = alloc(32);
-    memset(t, 0, 32);
-    store64(t +  0, handle);
-    store64(t +  8, view);
-    store32(t + 16, width);
-    store32(t + 20, height);
-    store32(t + 24, mip_count);
-    return t;
+# The usage a texture of `fmt` is created with. Every uncompressed colour texture
+# can also be rendered into (an attachment view of one face or level, and the mip
+# blit); a depth texture is never a copy destination (WebGPU forbids depth32float
+# as one: depth is written by rendering); a compressed texture is sampled and
+# copied only.
+fn _wgpu_tex_usage(fmt): i64 {
+    var u = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return u | WGPU_TEXTURE_USAGE_COPY_DST; }
+    if (mabda_texfmt_is_depth(fmt) == 1) { return u | WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT; }
+    return u | WGPU_TEXTURE_USAGE_COPY_DST | WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
 }
 
-# v3.3 AL.2 — mipped create for ANY MABDA_TEXFMT_*. Same 32-byte WgpuMipped-
-# Texture layout as the RGBA8 path (handle@0, view@8, width@16, height@20,
-# mip_count@24) PLUS fmt@28 so write_level knows the format (the RGBA8 mipped
-# path leaves @28 == 0 == MABDA_TEXFMT_RGBA8, so it stays consistent). No
-# STORAGE_BINDING (compressed can't be storage-bound; mipmap-generate is the
-# RGBA8-only path). Caps-gated for compressed families like the fmt create.
-fn _backend_wgpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_count): i64 {
-    if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
-    if (mip_count < 1) { return 0; }
-    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
-        return 0;
-    }
-    var wfmt = mabda_texfmt_to_wgpu(fmt);
-    if (wfmt == 0) { return 0; }            # unknown / Undefined
-    var fam = mabda_texfmt_compression_family(fmt);
-    if (fam != 0) {
-        var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
-        if ((mask & fam) == 0) { return 0; }
-    }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
-    var desc = wgpu_texture_descriptor_mipped(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D, width, height, wfmt, mip_count);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor(0, wfmt, WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    store32(vd + 36, mip_count);   # mipLevelCount = full chain
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var t = alloc(32);
-    memset(t, 0, 32);
-    store64(t +  0, handle);
-    store64(t +  8, view);
-    store32(t + 16, width);
-    store32(t + 20, height);
-    store32(t + 24, mip_count);
-    store32(t + 28, fmt);          # AL.2: fmt for write_level (RGBA8 path = 0)
-    return t;
+# WGPUTextureDescriptor (80 B, offsetof): usage +24 (u64), dimension +32,
+# size +36 (w, h, depthOrArrayLayers), format +48, mipLevelCount +52,
+# sampleCount +56, viewFormatCount +64, viewFormats +72.
+fn _wgpu_tex_desc_fill(d, usage, w, h, layers, wfmt, mips, samples): i64 {
+    memset(d, 0, 80);
+    store64(d + 24, usage);
+    store32(d + 32, WGPU_TEXTURE_DIMENSION_2D);
+    store32(d + 36, w);
+    store32(d + 40, h);
+    store32(d + 44, layers);
+    store32(d + 48, wfmt);
+    store32(d + 52, mips);
+    store32(d + 56, samples);
+    return d;
 }
 
-# v3.4 AA.3b — create a wgpu 2D ARRAY texture. The texture dimension is 2D with
-# depthOrArrayLayers = layers; the VIEW is a 2DArray view spanning all layers (so
-# a texture_2d_array WGSL FS samples it). 32-byte wrapper, MIPPED-style layout:
-# handle@0, view@8, width@16, height@20, LAYERS@24, fmt@28 (single-level array —
-# mip_count is implicitly 1; mipped arrays widen the wrapper later). Caps-gated
-# for compressed families, mirroring create_2d_fmt.
-fn _backend_wgpu_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
+# WGPUTextureViewDescriptor (64 B, offsetof): format +24, dimension +28,
+# baseMipLevel +32, mipLevelCount +36, baseArrayLayer +40, arrayLayerCount +44,
+# aspect +48, usage +56 (0 = the texture's).
+fn _wgpu_view_desc_fill(d, wfmt, vdim, base_mip, mips, base_layer, layers): i64 {
+    memset(d, 0, 64);
+    store32(d + 24, wfmt);
+    store32(d + 28, vdim);
+    store32(d + 32, base_mip);
+    store32(d + 36, mips);
+    store32(d + 40, base_layer);
+    store32(d + 44, layers);
+    store32(d + 48, WGPU_TEXTURE_ASPECT_ALL);
+    return d;
+}
+
+# Create the WGPUTexture and its default view (all `mips` levels and `layers`
+# layers, dimension `vdim`). Error-scoped: a refusal returns 0 with wgpu's reason
+# in the GPU error record. On success stores the handle at out+0, the view at
+# out+8 and returns 1.
+fn _wgpu_tex_make(ctx, out, usage, w, h, layers, wfmt, mips, samples, vdim): i64 {
+    var device = gpu_ctx_device(ctx);
+    var td[80];
+    _wgpu_tex_desc_fill(&td, usage, w, h, layers, wfmt, mips, samples);
+    var scoped = _wgpu_scope_open(device);
+    var handle = wgpu_device_create_texture(device, &td);
+    var view = 0;
+    if (handle != 0) {
+        var vd[64];
+        _wgpu_view_desc_fill(&vd, wfmt, vdim, 0, mips, 0, layers);
+        view = wgpu_texture_create_view(handle, &vd);
+    }
+    var failed = 0;
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) { failed = 1; }
+    }
+    if (view == 0) { failed = 1; }
+    if (failed == 1) {
+        if (view != 0) { wgpu_texture_view_release(view); }
+        if (handle != 0) { wgpu_texture_release(handle); }
+        return 0;
+    }
+    store64(out, handle);
+    store64(out + 8, view);
+    return 1;
+}
+
+# A texture record of `fmt`: `mips` levels; `layers` > 1 is an array (vdim
+# 2D_ARRAY) or, with vdim CUBE, a cube. `extra_usage` adds usage bits (the RGBA8
+# mipped path keeps STORAGE_BINDING). Caps-gated for the compressed families: an
+# adapter without the family returns 0 before the FFI (wgpu would refuse it).
+fn _wgpu_tex_create(ctx, w, h, fmt, mips, layers, vdim, extra_usage): i64 {
     if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
+    if (w <= 0) { return 0; }
+    if (h <= 0) { return 0; }
+    if (mips < 1) { return 0; }
     if (layers < 1) { return 0; }
-    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
-        return 0;
-    }
+    if (layers > MABDA_MAX_TEXTURE_ARRAY_LAYERS) { return 0; }
+    if (validate_dimensions(w, h, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return 0; }
+    if (mips > mip_level_count(w, h)) { return 0; }
     var wfmt = mabda_texfmt_to_wgpu(fmt);
     if (wfmt == 0) { return 0; }
     var fam = mabda_texfmt_compression_family(fmt);
@@ -518,190 +538,69 @@ fn _backend_wgpu_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
         var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
         if ((mask & fam) == 0) { return 0; }
     }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
-    var desc = wgpu_texture_descriptor_layered(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D, width, height, wfmt, layers);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor_array(0, wfmt,
-      WGPU_TEXTURE_VIEW_DIMENSION_2D_ARRAY, layers);
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
+    var usage = _wgpu_tex_usage(fmt) | extra_usage;
+    var hv[16];
+    if (_wgpu_tex_make(ctx, &hv, usage, w, h, layers, wfmt, mips, 1, vdim) == 0) { return 0; }
+    var t = _wgpu_tex_new(load64(&hv), load64(&hv + 8), fmt, w, h, mips, layers, 1,
+      WGPU_TEX_KIND_TEXTURE, usage, vdim);
+    if (t == 0) {
+        wgpu_texture_view_release(load64(&hv + 8));
+        wgpu_texture_release(load64(&hv));
     }
-    var t = alloc(32);
-    memset(t, 0, 32);
-    store64(t +  0, handle);
-    store64(t +  8, view);
-    store32(t + 16, width);
-    store32(t + 20, height);
-    store32(t + 24, layers);       # LAYERS (not mip_count — single-level array)
-    store32(t + 28, fmt);
     return t;
 }
 
-# v3.4 AA.3b — upload one array layer / cube face at one mip level (wgpu): a
-# writeTexture with origin.z = layer (and mipLevel = level). Reads the array
-# wrapper (w@16, h@20, LAYERS@24, fmt@28). wgpu handles the mipLevel+origin.z
-# combo, so this is mipped-array-ready. Returns 0 | GPU_ERR_*.
-fn _backend_wgpu_texture_write_layer_level(ctx, tex, layer, level, src, n): i64 {
-    if (ctx == 0) { return GPU_ERR_OTHER; }
-    if (tex == 0) { return GPU_ERR_OTHER; }
-    if (src == 0) { return GPU_ERR_BUFFER; }
-    if (n <= 0)   { return GPU_ERR_BUFFER; }
-    if (layer < 0) { return GPU_ERR_TEXTURE; }
-    if (level < 0) { return GPU_ERR_TEXTURE; }
-    var handle = load64(tex +  0);
-    var width  = load32(tex + 16);
-    var height = load32(tex + 20);
-    var layers = load32(tex + 24);
-    var fmt    = load32(tex + 28);
-    if (layer >= layers) { return GPU_ERR_TEXTURE; }
-    var lw = mip_level_dim(width, level);
-    var lh = mip_level_dim(height, level);
-    var expected = mabda_texfmt_data_size(fmt, lw, lh);
-    if (expected == 0) { return GPU_ERR_TEXTURE; }
-    if (n != expected) { return GPU_ERR_BUFFER; }
-    var queue = gpu_ctx_queue(ctx);
-    var bpr = mabda_texfmt_blocks_for_dim(lw, mabda_texfmt_block_width(fmt))
-    * mabda_texfmt_block_bytes(fmt);
-    var rows = mabda_texfmt_blocks_for_dim(lh, mabda_texfmt_block_height(fmt));
-    var dst_info = wgpu_texel_copy_texture_info_layer(handle, level, layer);
-    var layout = wgpu_texel_copy_buffer_layout(0, bpr, rows);
-    var extent = wgpu_extent_3d(lw, lh, 1);
-    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
-    return 0;
+# ================================================================
+# Texture slots
+# ================================================================
+fn _backend_wgpu_texture_create_2d_rgba8(ctx, width, height): i64 {
+    return _wgpu_tex_create(ctx, width, height, MABDA_TEXFMT_RGBA8, 1, 1,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D, 0);
 }
 
-# v3.4 AA.5c — create a wgpu CUBEMAP: a 2D texture with depthOrArrayLayers = 6
-# and a CUBE view (the 6 faces are +X,-X,+Y,-Y,+Z,-Z = layers 0..5). Same 32-byte
-# wrapper as the array path (LAYERS@24 = 6), so write_layer_level uploads each
-# face via origin.z. Single-level (AA.5c); mipped cube is later (mip_count != 1
-# fails loud, matching native). Square only. A `texture_cube` WGSL FS samples it
-# with a direction (naga does the projection — unlike native's faceid).
+# v3.1 [M.6]: a mipped RGBA8 texture; STORAGE_BINDING kept from the compute
+# downsample design. The default view spans the whole chain.
+fn _backend_wgpu_texture_create_2d_rgba8_mipped(ctx, width, height, mip_count): i64 {
+    return _wgpu_tex_create(ctx, width, height, MABDA_TEXFMT_RGBA8, mip_count, 1,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D, WGPU_TEXTURE_USAGE_STORAGE_BINDING);
+}
+
+# v3.3 AL.2 — a mipped texture of any MABDA_TEXFMT_*.
+fn _backend_wgpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, mip_count): i64 {
+    return _wgpu_tex_create(ctx, width, height, fmt, mip_count, 1,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D, 0);
+}
+
+# v3.4 AA.3b — a 2D array: `layers` slices, one level, a 2DArray default view
+# (what a texture_2d_array WGSL declaration samples).
+fn _backend_wgpu_texture_create_2d_array(ctx, width, height, fmt, layers): i64 {
+    return _wgpu_tex_create(ctx, width, height, fmt, 1, layers,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D_ARRAY, 0);
+}
+
+# v3.4 AA.5c — a cube: six faces (+X,-X,+Y,-Y,+Z,-Z = layers 0..5) and a Cube
+# default view over every level. 4.3.1: `mip_count` levels (it was one level
+# only); an uncompressed cube is also a render attachment, so a consumer renders
+# into one face and level through gpu_texture_view_create (IBL prefiltering).
 fn _backend_wgpu_texture_create_cube(ctx, size, fmt, mip_count): i64 {
-    if (ctx == 0) { return 0; }
-    if (size <= 0) { return 0; }
-    if (mip_count != 1) { return 0; }   # single-level cube (mipped cube later)
-    if (validate_dimensions(size, size, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
-        return 0;
-    }
-    var wfmt = mabda_texfmt_to_wgpu(fmt);
-    if (wfmt == 0) { return 0; }
-    var fam = mabda_texfmt_compression_family(fmt);
-    if (fam != 0) {
-        var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
-        if ((mask & fam) == 0) { return 0; }
-    }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
-    var desc = wgpu_texture_descriptor_layered(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D, size, size, wfmt, 6);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor_array(0, wfmt,
-      WGPU_TEXTURE_VIEW_DIMENSION_CUBE, 6);
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var t = alloc(32);
-    memset(t, 0, 32);
-    store64(t +  0, handle);
-    store64(t +  8, view);
-    store32(t + 16, size);
-    store32(t + 20, size);
-    store32(t + 24, 6);            # 6 faces (LAYERS slot — write_layer_level face)
-    store32(t + 28, fmt);
-    return t;
+    return _wgpu_tex_create(ctx, size, size, fmt, mip_count, 6,
+      WGPU_TEXTURE_VIEW_DIMENSION_CUBE, 0);
 }
 
-# v3.1 [M.6b]: wgpu mipmap generation needs a real compute pipeline
-# (shader module + storage-texture bind groups + per-level dispatch), but
-# the wgpu COMPUTE path itself is still a v3.0 stub
-# (_backend_wgpu_compute_dispatch returns GPU_ERR_OTHER). Until wgpu
-# compute lands, this returns GPU_ERR_NOT_IMPLEMENTED (see docs/development/roadmap.md) —
-# fail-loud, not fail-silent (the 3.0.4 LOW-3 precedent).
-# The native backend is the
-# working mipmap-generation path today; wgpu `create_mipped` above DOES
-# work (texture allocation + STORAGE view), so a wgpu consumer can upload
-# all levels manually meanwhile. Wiring this is gated on real wgpu compute
-# (a v3.x item).
-fn _backend_wgpu_texture_generate_mipmaps(ctx, tex): i64 {
-    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
-}
-
-# v3.2 [T.6]: format-parameterized create. Same 32-byte tex struct as the
-# rgba8 path but the (previously-zero) +16 slot now stashes the MABDA_TEXFMT_*
-# id so the unified write slot can compute block-aware sizes. Usage is
-# TEXTURE_BINDING | COPY_DST (compressed textures cannot be COPY_SRC /
-# render attachments). An adapter that lacks the format's family makes
-# wgpu_device_create_texture return 0, so create fails gracefully — the
-# consumer's gpu_caps_supports_format pre-check is the friendly gate.
+# v3.2 [T.6]: a single-level texture of any MABDA_TEXFMT_*.
 fn _backend_wgpu_texture_create_2d_fmt(ctx, width, height, fmt): i64 {
-    if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
-    # Audit 2026-06-15 LOW: cap dims independently of the public dispatcher
-    # (mirrors the native sibling + the v2 audit MED-1 slot-independence rule).
-    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
-        return 0;
-    }
-    var wfmt = mabda_texfmt_to_wgpu(fmt);
-    if (wfmt == 0) { return 0; }            # unknown / Undefined
-    # Audit 2026-06-15 LOW: fail loud (graceful 0) if the adapter lacks this
-    # format's compression family — otherwise wgpuDeviceCreateTexture aborts
-    # the process (uncaptured wgpu error) on an unsupported format. (Consumers
-    # should pre-check gpu_caps_supports_format; this is the backend guard.)
-    var fam = mabda_texfmt_compression_family(fmt);
-    if (fam != 0) {
-        var mask = gpu_caps_detect_texture_compression(gpu_ctx_adapter(ctx));
-        if ((mask & fam) == 0) { return 0; }
-    }
-    var device = gpu_ctx_device(ctx);
-    # COPY_SRC lets a consumer (and the T.8 e2e) copy the compressed blocks
-    # back out for verification; COPY_DST for upload; TEXTURE_BINDING for
-    # sampling. (Compressed textures cannot be render attachments.)
-    var usage = WGPU_TEXTURE_USAGE_COPY_SRC | WGPU_TEXTURE_USAGE_COPY_DST
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
-    var desc = wgpu_texture_descriptor(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D, width, height, wfmt);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor(0, wfmt, WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var t = alloc(32);
-    memset(t, 0, 32);
-    store64(t +  0, handle);
-    store64(t +  8, view);
-    store64(t + 16, fmt);                   # MABDA_TEXFMT_* (0 = RGBA8)
-    store32(t + 24, width);
-    store32(t + 28, height);
-    return t;
+    return _wgpu_tex_create(ctx, width, height, fmt, 1, 1,
+      WGPU_TEXTURE_VIEW_DIMENSION_2D, 0);
 }
 
-# v3.2 TS.5 — sampleable 2D texture create (wgpu). The fmt-create above
-# already makes a TEXTURE_BINDING texture + a 2D view, which is exactly a
-# sampleable resource on wgpu, so this is a thin alias. (The native sibling
-# differs materially — it builds a tiled-or-linear BO + a T#/S# descriptor.)
+# v3.2 TS.5 — a sampleable texture is any wgpu texture (TEXTURE_BINDING + a view).
 fn _backend_wgpu_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     return _backend_wgpu_texture_create_2d_fmt(ctx, width, height, fmt);
 }
 
 # v3.2 TS.5 (minimal) — bind a sampleable texture into a render pass (wgpu).
 # Stashes the bound texture + sampler intent on the pass struct (bound_tex
-# @+24, bound_sampler @+32); the bind-group build + render_pass_encoder
-# set_bind_group + the textured pipeline are the wgpu sample render path
-# (next bite). Returns 0|GPU_ERR_*.
+# @+24, bound_sampler @+32); the draw builds and sets the bind group. 0|GPU_ERR_*.
 fn _backend_wgpu_texture_bind_for_sample(ctx, pass, tex, sampler): i64 {
     if (ctx == 0)  { return GPU_ERR_OTHER; }
     if (pass == 0) { return GPU_ERR_OTHER; }
@@ -728,117 +627,140 @@ fn _backend_wgpu_texture_bind_for_sample_layer(ctx, pass, tex, sampler, layer): 
     return 0;
 }
 
-# v3.2 [T.6]: block-aware write. Reads the format id at tex+16 (0 = RGBA8
-# for legacy textures created by the rgba8 path, whose +16 is zeroed), so
-# this one slot uploads RGBA8 and block-compressed data alike: expected
-# size + bytesPerRow + rowsPerImage come from the block geometry. For
-# RGBA8 the math reduces to the previous width*4 / height exactly.
-fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
-    if (ctx == 0) { return GPU_ERR_OTHER; }
-    if (tex == 0) { return GPU_ERR_OTHER; }
-    if (src == 0) { return GPU_ERR_BUFFER; }
-    if (n <= 0)   { return GPU_ERR_BUFFER; }
-    var handle = load64(tex +  0);
-    var fmt    = load64(tex + 16);
-    var width  = load32(tex + 24);
-    var height = load32(tex + 28);
-    var expected = mabda_texfmt_data_size(fmt, width, height);
-    if (expected == 0) { return GPU_ERR_BUFFER; }   # invalid fmt/dims on the tex
-    if (n != expected) { return GPU_ERR_BUFFER; }
-    var queue = gpu_ctx_queue(ctx);
-    var bpr = mabda_texfmt_blocks_for_dim(width, mabda_texfmt_block_width(fmt))
-    * mabda_texfmt_block_bytes(fmt);                # bytes per block-row
-    var rows = mabda_texfmt_blocks_for_dim(height, mabda_texfmt_block_height(fmt));
-    var dst_info = wgpu_texel_copy_texture_info(handle, 0);
-    var layout = wgpu_texel_copy_buffer_layout(0, bpr, rows);
-    var extent = wgpu_extent_3d(width, height, 1);  # extent stays in texels
-    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
-    return 0;
+fn _wgpu_tex_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
 }
 
-# v3.3 AL.1 — write `n` bytes into mip `level` of a wgpu texture via
-# wgpu_queue_write_texture with mipLevel = level. Reads the MIPPED-texture
-# layout (from _backend_wgpu_texture_create_2d_rgba8_mipped: handle@0,
-# width@16, height@20, mip_count@24, fmt@28). fmt@28 is the MABDA_TEXFMT_*
-# (the RGBA8 mipped-create path leaves it 0 == RGBA8, so both paths agree).
-# KNOWN LIMITATION (tracked, X2): wgpu requires bytesPerRow be a multiple of
-# 256 for multi-row copies; tightly-packed small-mip rows are not aligned, so
-# non-256-aligned widths need a staging re-pack — shared with the existing
-# whole-texture write; addressed when a non-aligned wgpu asset is loaded.
-fn _backend_wgpu_texture_write_level(ctx, tex, level, src, n): i64 {
+# Upload `n` bytes into (layer, level) of `tex`, relative to a view's base level
+# and layer. Block-aware: RGBA8, the render formats and the compressed formats
+# share it (bytesPerRow / rowsPerImage from the block geometry). WebGPU's
+# writeTexture has no 256-byte row alignment rule, so rows are tight.
+fn _wgpu_tex_write_sub(ctx, tex, layer, level, src, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
     if (src == 0) { return GPU_ERR_BUFFER; }
     if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
     if (level < 0) { return GPU_ERR_TEXTURE; }
-    var handle    = load64(tex +  0);
-    var width     = load32(tex + 16);
-    var height    = load32(tex + 20);
-    var mip_count = load32(tex + 24);
-    if (level >= mip_count) { return GPU_ERR_TEXTURE; }
-    var fmt = load32(tex + 28);   # AL.2: real fmt (RGBA8 mipped path stores 0)
-    var lw = mip_level_dim(width, level);
-    var lh = mip_level_dim(height, level);
+    var fmt = _wgpu_tex_fmt(tex);
+    if (mabda_texfmt_is_depth(fmt) == 1) {
+        return _wgpu_tex_fail(GPU_ERR_TEXTURE,
+          "texture write: depth is written by rendering (WebGPU has no depth32float upload)");
+    }
+    if ((_wgpu_tex_usage_of(tex) & WGPU_TEXTURE_USAGE_COPY_DST) == 0) {
+        return _wgpu_tex_fail(GPU_ERR_TEXTURE,
+          "texture write: this texture is not a copy destination (a surface frame?)");
+    }
+    if (level >= _wgpu_tex_mips(tex)) { return GPU_ERR_TEXTURE; }
+    if (layer >= _wgpu_tex_layers(tex)) { return GPU_ERR_TEXTURE; }
+    var lw = mip_level_dim(_wgpu_tex_width(tex), level);
+    var lh = mip_level_dim(_wgpu_tex_height(tex), level);
     var expected = mabda_texfmt_data_size(fmt, lw, lh);
     if (expected == 0) { return GPU_ERR_TEXTURE; }
     if (n != expected) { return GPU_ERR_BUFFER; }
-    var queue = gpu_ctx_queue(ctx);
     var bpr = mabda_texfmt_blocks_for_dim(lw, mabda_texfmt_block_width(fmt))
     * mabda_texfmt_block_bytes(fmt);
     var rows = mabda_texfmt_blocks_for_dim(lh, mabda_texfmt_block_height(fmt));
-    var dst_info = wgpu_texel_copy_texture_info(handle, level);   # mipLevel = level
-    var layout = wgpu_texel_copy_buffer_layout(0, bpr, rows);
-    var extent = wgpu_extent_3d(lw, lh, 1);
-    wgpu_queue_write_texture(queue, dst_info, src, n, layout, extent);
+    # WGPUTexelCopyTextureInfo (32 B): texture +0, mipLevel +8, origin +12
+    # (x, y, z = the array layer), aspect +24. WGPUTexelCopyBufferLayout (16 B):
+    # offset +0, bytesPerRow +8, rowsPerImage +12. WGPUExtent3D (12 B).
+    var info[32];
+    memset(&info, 0, 32);
+    store64(&info, load64(tex));
+    store32(&info + 8, _wgpu_tex_base_mip(tex) + level);
+    store32(&info + 20, _wgpu_tex_base_layer(tex) + layer);
+    store32(&info + 24, WGPU_TEXTURE_ASPECT_ALL);
+    var lay[16];
+    store64(&lay, 0);
+    store32(&lay + 8, bpr);
+    store32(&lay + 12, rows);
+    var ext[16];
+    store32(&ext, lw);
+    store32(&ext + 4, lh);
+    store32(&ext + 8, 1);
+    wgpu_queue_write_texture(gpu_ctx_queue(ctx), &info, src, n, &lay, &ext);
     return 0;
 }
 
-fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
+fn _backend_wgpu_texture_write(ctx, tex, src, n): i64 {
+    return _wgpu_tex_write_sub(ctx, tex, 0, 0, src, n);
+}
+
+# v3.3 AL.1 — one mip level.
+fn _backend_wgpu_texture_write_level(ctx, tex, level, src, n): i64 {
+    return _wgpu_tex_write_sub(ctx, tex, 0, level, src, n);
+}
+
+# v3.4 AA.3b — one array layer / cube face at one mip level.
+fn _backend_wgpu_texture_write_layer_level(ctx, tex, layer, level, src, n): i64 {
+    return _wgpu_tex_write_sub(ctx, tex, layer, level, src, n);
+}
+
+# Read (layer, level) of `tex` (relative to a view's base) into `dst`: `n` must be
+# the level's tight size (width x height x bytes per texel: 4, or 8 for RGBA16F).
+# A depth texture reads its depth aspect as f32. A multisampled colour target
+# reads its resolve texture; a multisampled depth target cannot be read (WebGPU
+# copies no multisampled texture to a buffer). Block-compressed readback is the
+# one format class this does not take (rows of blocks need their own un-pad).
+fn _wgpu_tex_read_sub(ctx, tex, layer, level, dst, n): i64 {
     if (ctx == 0) { return GPU_ERR_OTHER; }
     if (tex == 0) { return GPU_ERR_OTHER; }
     if (dst == 0) { return GPU_ERR_BUFFER; }
     if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (layer < 0) { return GPU_ERR_TEXTURE; }
+    if (level < 0) { return GPU_ERR_TEXTURE; }
+    var fmt = _wgpu_tex_fmt(tex);
+    # Audit 2026-06-15: block-compressed readback needs 256-padded block rows;
+    # a wgpu consumer copies blocks back itself (programs/compressed_texture_e2e.cyr).
+    if (mabda_texfmt_is_compressed(fmt) == 1) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    if (_wgpu_tex_samples(tex) > 1) {
+        if (load64(tex + 48) == 0) {
+            return _wgpu_tex_fail(GPU_ERR_TEXTURE, "texture read: a multisampled depth target cannot be read back");
+        }
+    }
+    if ((_wgpu_tex_usage_of(tex) & WGPU_TEXTURE_USAGE_COPY_SRC) == 0) {
+        return _wgpu_tex_fail(GPU_ERR_TEXTURE, "texture read: this texture is not a copy source (a surface frame?)");
+    }
+    if (level >= _wgpu_tex_mips(tex)) { return GPU_ERR_TEXTURE; }
+    if (layer >= _wgpu_tex_layers(tex)) { return GPU_ERR_TEXTURE; }
+    var bpp = mabda_texfmt_block_bytes(fmt);
+    if (bpp == 0) { return GPU_ERR_TEXTURE; }
+    var width  = mip_level_dim(_wgpu_tex_width(tex), level);
+    var height = mip_level_dim(_wgpu_tex_height(tex), level);
+    var row = width * bpp;
+    if (n != row * height) { return GPU_ERR_BUFFER; }
     var device = gpu_ctx_device(ctx);
     var queue  = gpu_ctx_queue(ctx);
-    var handle = load64(tex +  0);
-    var fmt    = load64(tex + 16);
-    var width  = load32(tex + 24);
-    var height = load32(tex + 28);
-    # Audit 2026-06-15: the write slot is block-aware, but block-compressed
-    # READBACK via copy_texture_to_buffer needs 256-byte-padded block rows +
-    # an un-pad copy (the path below assumes texel rows). Not implemented for
-    # wgpu this minor — fail loud rather than mis-validate / return wrong
-    # bytes. Native compressed read works (linear memcpy); a wgpu consumer
-    # reads blocks via a 256-padded copy-back, as
-    # programs/compressed_texture_e2e.cyr does.
-    if (mabda_texfmt_is_compressed(fmt) == 1) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
-    var expected = width * height * 4;
-    if (n != expected) { return GPU_ERR_BUFFER; }
+    var aspect = WGPU_TEXTURE_ASPECT_ALL;
+    if (mabda_texfmt_is_depth(fmt) == 1) { aspect = WGPU_TEXTURE_ASPECT_DEPTH_ONLY; }
 
-    # 4.3.0: a texture-to-buffer copy needs bytesPerRow to be a multiple of
-    # 256 (WGPU COPY_BYTES_PER_ROW_ALIGNMENT). Before, the copy used the tight
-    # width*4 pitch, which wgpu rejects for any width that is not a multiple of
-    # 64 texels (a 4x4 texture: 16-byte rows) — and wgpu-native made that
-    # submit-time error FATAL. Rows are now staged at the padded pitch and
-    # un-padded into `dst`. The staging buffer is padded_row * (height - 1) +
-    # the last tight row: the copy never writes past the last row's texels.
-    var row = width * 4;
+    # 4.3.0: a texture-to-buffer copy needs bytesPerRow to be a multiple of 256
+    # (COPY_BYTES_PER_ROW_ALIGNMENT); rows are staged at the padded pitch and
+    # un-padded into `dst`. The staging buffer is padded_row * (height - 1) + the
+    # last tight row: the copy never writes past the last row's texels. Width and
+    # height are <= 8192 and bpp <= 8, so padded_row <= 64 KiB and the staging
+    # size stays under 512 MiB.
     var padded_row = (row + 255) & (0 - 256);
     var staging_size = padded_row * (height - 1) + row;
-
-    # Stage the readback through a MAP_READ buffer.
-    var staging_usage = WGPU_BUFFER_USAGE_MAP_READ
-    | WGPU_BUFFER_USAGE_COPY_DST;
-    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, staging_size, 0);
-    var staging = wgpu_device_create_buffer(device, staging_desc);
+    # WGPUBufferDescriptor (48 B): usage +24, size +32 — on the stack (4.3.1: was
+    # bump-allocated per read).
+    var sd[48];
+    memset(&sd, 0, 48);
+    store64(&sd + 24, WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST);
+    store64(&sd + 32, staging_size);
+    var staging = wgpu_device_create_buffer(device, &sd);
     if (staging == 0) { return GPU_ERR_BUFFER; }
 
-    # copy_texture_to_buffer args (72-byte WgpuCopyTexToBufArgs — layout in
-    # deps/wgpu_main.c). Stack-local: 4.3.0 stopped bump-allocating it per read.
+    # WgpuCopyTexToBufArgs (72 B, deps/wgpu_main.c): texture +0, mip +8, origin
+    # +12/+16/+20, aspect +24, buffer +32, offset +40, bytesPerRow +48,
+    # rowsPerImage +52, copy w/h/depth +56/+60/+64.
     var cargs[72];
     memset(&cargs, 0, 72);
-    store64(&cargs +  0, handle);
-    store32(&cargs + 24, WGPU_TEXTURE_ASPECT_ALL);
+    store64(&cargs +  0, load64(tex));
+    store32(&cargs +  8, _wgpu_tex_base_mip(tex) + level);
+    store32(&cargs + 20, _wgpu_tex_base_layer(tex) + layer);
+    store32(&cargs + 24, aspect);
     store64(&cargs + 32, staging);
     store32(&cargs + 48, padded_row);
     store32(&cargs + 52, height);
@@ -855,7 +777,9 @@ fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
         # The launcher refused an invalid command buffer (its error is in the
         # uncaptured-error record); nothing was copied.
         wgpu_buffer_release(staging);
-        return GPU_ERR_READBACK_MAP;
+        var rc = _backend_wgpu_error_take(ctx);
+        if (rc == 0) { rc = GPU_ERR_READBACK_MAP; }
+        return rc;
     }
     wgpu_queue_submit_one(queue, cmd_buf);
 
@@ -883,36 +807,40 @@ fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
     return 0;
 }
 
-fn _backend_wgpu_texture_release(ctx, tex): i64 {
-    if (ctx == 0) { return 0; }
-    if (tex == 0) { return 0; }
-    var handle = load64(tex +  0);
-    var view   = load64(tex +  8);
-    if (view != 0)   { wgpu_texture_view_release(view); }
-    if (handle != 0) { wgpu_texture_release(handle); }
-    store64(tex +  0, 0);
-    store64(tex +  8, 0);
-    store32(tex + 24, 0);
-    store32(tex + 28, 0);
+fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
+    return _wgpu_tex_read_sub(ctx, tex, 0, 0, dst, n);
+}
+
+# Release any record: its views always; its textures when it owns them (a
+# TEXTURE or TARGET — a VIEW's texture is its parent's, a SURFACE frame's is
+# released by gpu_surface_present). Zeroes the handles, so a second release and a
+# use after release see 0.
+fn _wgpu_tex_release(t): i64 {
+    if (t == 0) { return 0; }
+    var kind = _wgpu_tex_kind(t);
+    var view  = load64(t +  8);
+    var mview = load64(t + 56);
+    if (view != 0)  { wgpu_texture_view_release(view); }
+    if (mview != 0) { wgpu_texture_view_release(mview); }
+    if (kind == WGPU_TEX_KIND_TEXTURE) {
+        if (load64(t) != 0) { wgpu_texture_release(load64(t)); }
+    }
+    if (kind == WGPU_TEX_KIND_TARGET) {
+        if (load64(t) != 0) { wgpu_texture_release(load64(t)); }
+        if (load64(t + 48) != 0) { wgpu_texture_release(load64(t + 48)); }
+    }
+    store64(t +  0, 0);
+    store64(t +  8, 0);
+    store64(t + 48, 0);
+    store64(t + 56, 0);
+    store32(t + 24, 0);
+    store32(t + 28, 0);
     return 0;
 }
 
-# ================================================================
-# Compute dispatch — STUB for Step 2
-# ================================================================
-# Full assembly (compute pipeline + bind group from bindings_ptr +
-# command encoder + compute pass + dispatch + submit) requires the
-# bindings_ptr format to be locked in and the public compute API in
-# src/compute.cyr to dispatch through this slot. Both are Step 3
-# work — see docs/development/3-0-punchlist.md.
-#
-# Step 2 returns GPU_ERR_OTHER unconditionally. The slot is filled
-# (backend_is_complete returns 1) but calling it through fncall
-# until Step 3 lands is a programming error. CPU tests do not call
-# this slot.
-
-fn _backend_wgpu_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
-    return GPU_ERR_OTHER;
+fn _backend_wgpu_texture_release(ctx, tex): i64 {
+    if (ctx == 0) { return 0; }
+    return _wgpu_tex_release(tex);
 }
 
 # ================================================================
@@ -945,60 +873,15 @@ fn _backend_wgpu_device_wait_idle(ctx): i64 {
 #   +0:  handle  (WGPURenderPipeline)
 #   +8:  reserved
 #
-# Pass struct (32 bytes) — opaque to slot caller:
+# Render targets are WGPU_TEX_SIZE texture records of kind TARGET (above); their
+# create / release slots, the render pass begin (a one-attachment descriptor) and
+# the descriptor pass live in src/backend_wgpu_target.cyr (4.3.1).
+#
+# Pass record (48 bytes) — opaque to slot caller:
 #   +0:  encoder (WGPUCommandEncoder)
 #   +8:  pass    (WGPURenderPassEncoder)
-#   +16: rt_ptr  (back-reference; the rt outlives the pass)
-#   +24: reserved
-
-fn _backend_wgpu_render_target_create_2d_rgba8(ctx, width, height): i64 {
-    if (ctx == 0) { return 0; }
-    if (width <= 0) { return 0; }
-    if (height <= 0) { return 0; }
-    # 4.1.4: the same dimension cap the native RT and texture create paths apply.
-    if (width > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }
-    if (height > MABDA_MAX_TEXTURE_DIM_2D) { return 0; }
-    var device = gpu_ctx_device(ctx);
-    var usage = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT
-    | WGPU_TEXTURE_USAGE_TEXTURE_BINDING
-    | WGPU_TEXTURE_USAGE_COPY_SRC;
-    var desc = wgpu_texture_descriptor(0, usage,
-      WGPU_TEXTURE_DIMENSION_2D,
-      width, height,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
-    var handle = wgpu_device_create_texture(device, desc);
-    if (handle == 0) { return 0; }
-    var vd = wgpu_texture_view_descriptor(0,
-      WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
-      WGPU_TEXTURE_VIEW_DIMENSION_2D);
-    var view = wgpu_texture_create_view(handle, vd);
-    if (view == 0) {
-        wgpu_texture_release(handle);
-        return 0;
-    }
-    var rt = alloc(32);
-    memset(rt, 0, 32);
-    store64(rt +  0, handle);
-    store64(rt +  8, view);
-    store64(rt + 16, 0);
-    store32(rt + 24, width);
-    store32(rt + 28, height);
-    return rt;
-}
-
-fn _backend_wgpu_render_target_release(ctx, rt): i64 {
-    if (ctx == 0) { return 0; }
-    if (rt == 0) { return 0; }
-    var handle = load64(rt +  0);
-    var view   = load64(rt +  8);
-    if (view != 0)   { wgpu_texture_view_release(view); }
-    if (handle != 0) { wgpu_texture_release(handle); }
-    store64(rt +  0, 0);
-    store64(rt +  8, 0);
-    store32(rt + 24, 0);
-    store32(rt + 28, 0);
-    return 0;
-}
+#   +16: back-reference (the first attachment; it outlives the pass)
+#   +24: bind_for_sample texture  +32: its sampler intent  +40: sample layer
 
 fn _backend_wgpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt): i64 {
     if (ctx == 0) { return 0; }
@@ -1046,68 +929,6 @@ fn _backend_wgpu_render_pipeline_release(ctx, pipe): i64 {
     if (handle != 0) { wgpu_render_pipeline_release(handle); }
     store64(pipe + 0, 0);
     return 0;
-}
-
-fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
-    if (ctx == 0) { return 0; }
-    if (rt == 0) { return 0; }
-    if (clear_color_ptr == 0) { return 0; }
-    var device = gpu_ctx_device(ctx);
-    var view = load64(rt + 8);
-    if (view == 0) { return 0; }
-
-    # 4.3.0 (L17): the colour attachment, the begin-pass args and the pass record
-    # live in the per-context render state (backend_wgpu_rtier.cyr) instead of the
-    # bump heap. Before, every begin allocated 432 B that were never freed (the
-    # rpb_pass_* builder, its vec, the attachment array, the args and the record):
-    # with the textured draw's 224 B, ~650 B per frame, forever.
-    var rs = _wgpu_render_state(ctx);
-    if (rs == 0) { return 0; }
-    var encoder = wgpu_device_create_command_encoder(device, 0);
-    if (encoder == 0) { return 0; }
-
-    # WGPURenderPassColorAttachment (72 B, render_pass.cyr): view +8, depthSlice
-    # +16, resolveTarget +24, loadOp +32, storeOp +36, clearValue +40.
-    var att = rs + _WGPU_RS_COLOR_ATT;
-    memset(att, 0, COLOR_ATTACHMENT_SIZE);
-    store64(att + 8, view);
-    store32(att + 16, 0xFFFFFFFF);   # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED
-    store32(att + 32, WGPU_LOAD_OP_CLEAR);
-    store32(att + 36, WGPU_STORE_OP_STORE);
-    color_write_f64(clear_color_ptr, att + 40);
-    # WgpuBeginPassArgs (40 B, deps/wgpu_main.c): attachments +0, count +8.
-    var args = rs + _WGPU_RS_BEGIN_ARGS;
-    memset(args, 0, 40);
-    store64(args, att);
-    store64(args + 8, 1);
-    var pass = wgpu_command_encoder_begin_render_pass(encoder, args);
-    if (pass == 0) {
-        wgpu_command_encoder_release(encoder);
-        return 0;
-    }
-
-    # 48 bytes (40 → 48 at v3.4.1 AA.3c): +24 bound_tex / +32 bound_sampler for
-    # bind_for_sample; +40 sample LAYER (-1 = none/2-entry group; >=0 = a draw-time
-    # array layer / cube face, 3-entry group with a layer uniform). Default -1.
-    # The per-context record is reused; when a pass begun earlier on this context
-    # is still open (its encoder is set), a fresh record is allocated so two open
-    # passes never share one.
-    var p = rs + _WGPU_RS_PASS;
-    if (load64(p) != 0) {
-        p = alloc(48);
-        if (p == 0) {
-            wgpu_render_pass_encoder_end(pass);
-            wgpu_render_pass_encoder_release(pass);
-            wgpu_command_encoder_release(encoder);
-            return 0;
-        }
-    }
-    memset(p, 0, 48);
-    store64(p +  0, encoder);
-    store64(p +  8, pass);
-    store64(p + 16, rt);
-    store64(p + 40, 0 - 1);   # sample layer: none
-    return p;
 }
 
 fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
@@ -1269,12 +1090,23 @@ fn _backend_wgpu_surface_acquire(ctx, surface): i64 {
 fn _backend_wgpu_surface_present(ctx, surface): i64 {
     if (ctx == 0)     { return GPU_ERR_OTHER; }
     if (surface == 0) { return GPU_ERR_OTHER; }
+    # 4.3.1: a gpu_surface_configure surface (MB5) presents its acquired frame and
+    # releases the frame's view and texture (backend_wgpu_surface.cyr).
+    if (load64(surface + 56) == 1) { return _wgpu_surface_present_ex(ctx, surface); }
     return surface_state_submit_present(surface);
 }
 
 fn _backend_wgpu_surface_release(ctx, surface): i64 {
     if (ctx == 0)     { return 0; }
     if (surface == 0) { return 0; }
+    if (load64(surface + 56) == 1) { _wgpu_surface_drop_frame(surface); }
+    # 4.3.1: two gpu_surface_configure records (a reconfigure) share one
+    # WGPUSurface; it is released once, while it is still the context's surface
+    # (gpu_surface_release clears that after the first).
+    if (load64(surface) != gpu_ctx_wgpu_surface_handle(ctx)) {
+        store64(surface, 0);
+        return 0;
+    }
     return surface_state_release(surface);
 }
 
@@ -1390,11 +1222,11 @@ fn gpu_wgpu_shader_f64_supported(device): i64 {
     return wgpu_device_has_feature(device, WGPU_NATIVE_FEATURE_SHADER_F64);
 }
 
-# v3.2 F.8b — wgpu compute dispatch is a v3.0 stub (`_backend_wgpu_compute_dispatch`
-# returns GPU_ERR_OTHER). f64 (like any compute) cannot run END-TO-END on wgpu until that
-# lands, so `gpu_caps_wgpu_shader_f64` reports 0 regardless of the (real, HW-proven) f64
-# module-create half. Flip to 1 only when wgpu compute dispatch is implemented.
-var MABDA_WGPU_COMPUTE = 0;
+# v3.2 F.8b — the gate for "wgpu compute runs end to end". It was 0 while wgpu compute
+# dispatch was a v3.0 stub. 4.3.1 (MB4) implements it (src/backend_wgpu_ctier.cyr) and
+# HW-proves an f64 SPIR-V kernel through gpu_compute_dispatch on the Cezanne
+# (programs/compute_tier_e2e.cyr, part C), so it is 1.
+var MABDA_WGPU_COMPUTE = 1;
 
 # v3.2 F.8b — a minimal f64 compute SPIR-V module (`OpCapability Float64` + `OpTypeFloat 64`
 # + an f64 `OpFMul`). programs/f64_compute_e2e.cyr feeds it to the ordinary
@@ -1469,13 +1301,14 @@ fn _wgpu_f64_probe_spirv(buf): i64 {
 # BOTH halves: (1) the device's f64 support — WGPUNativeFeature_ShaderF64 enabled, with which an
 # f64 SPIR-V module creates through the ordinary gpu_shader_module_create_spirv path; REAL and
 # HW-proven on Cezanne by programs/f64_compute_e2e.cyr. (2) wgpu compute *dispatch* to actually
-# run the kernel — a v3.0 stub (`_backend_wgpu_compute_dispatch` → GPU_ERR_OTHER). Per the
-# Phase F contract (never report 1 on a path that can't run f64 end-to-end — no silent f32
-# fallback; the M.6b mipmap-generate posture), this returns 0 while MABDA_WGPU_COMPUTE == 0.
-# Flipping MABDA_WGPU_COMPUTE when dispatch lands makes the gate the ShaderF64 device bit.
+# run the kernel — real since 4.3.1 (MB4), and it needs the 4.3.1 launcher (slots 81-82). Per
+# the Phase F contract (never report 1 on a path that can't run f64 end-to-end — no silent f32
+# fallback), this is the ShaderF64 device bit only when compute runs (MABDA_WGPU_COMPUTE) on a
+# launcher that has the compute slots; 0 otherwise.
 fn gpu_caps_wgpu_shader_f64(device): i64 {
     if (device == 0) { return 0; }
     if (MABDA_WGPU_COMPUTE == 0) { return 0; }
+    if (_wgpu_has_slot(82) == 0) { return 0; }   # a pre-4.3.1 launcher cannot dispatch
     return gpu_wgpu_shader_f64_supported(device);
 }
 
@@ -1606,6 +1439,12 @@ fn backend_wgpu_new(): i64 {
     backend_set_slot(b, BACKEND_SLOT_ERROR_TAKE,       &_backend_wgpu_error_take);
     # v4.3.0 — the render tier's descriptor / draw slots (src/backend_wgpu_rtier.cyr).
     _backend_wgpu_fill_rtier(b);
+    # v4.3.1 — MB2/MB3 targets, descriptor passes, views, copies (backend_wgpu_target.cyr).
+    _backend_wgpu_fill_target(b);
+    # v4.3.1 — MB4 compute tier + gpu_compute_dispatch (backend_wgpu_ctier.cyr).
+    _backend_wgpu_fill_ctier(b);
+    # v4.3.1 — MB5 Wayland surfaces (backend_wgpu_surface.cyr).
+    _backend_wgpu_fill_surface(b);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }

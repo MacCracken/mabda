@@ -1,0 +1,800 @@
+# programs/compute_tier_e2e.cyr — the render tier's MB4 (compute on wgpu) on real hardware (v4.3.1)
+#
+#   A — a compute pipeline from a descriptor with an explicit MIXED layout (soorat's
+#       particle shape: read-write storage + a dynamic-offset uniform + read-only
+#       storage) steps 100 particles in two passes (dynamic offsets 0 and 256,
+#       dt 0.5 then 0.25); storage readback (also an unaligned 5-byte window) checks
+#       every particle and that the ones past `count` are untouched.
+#   B — errors: a dispatch without its group is GPU_ERR_VALIDATION from the pass end
+#       and the next pass runs; a pipeline whose layout does not match the shader is
+#       0 + GPU_ERR_VALIDATION.
+#   C — gpu_compute_dispatch on wgpu (GPU_ERR_OTHER before 4.3.1): a WGSL kernel
+#       with a storage and a uniform binding through the binding array (auto layout,
+#       cached pipeline, repeated); the native suite's hand-authored SAXPY SPIR-V
+#       (ranga's call shape); its f64 arith SPIR-V against the same f64 ops on the
+#       CPU (within 1 ULP: RADV may contract a*b + c into an FMA).
+#   D — 160,000 compute passes: 0 bytes of Cyrius heap, and a flat RSS after the
+#       warm-up (slot 81 releases every pass encoder).
+#
+# Linked with deps/wgpu_main.c via `make test-compute-tier-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 {
+    _e2e_line(2, "FAIL: ", msg);
+    if (gpu_last_error() != 0) { _e2e_line(2, "      ", gpu_last_error_message()); }
+    return 1;
+}
+fn _info_int(label, v): i64 {
+    var nb[64];
+    memset(&nb, 0, 64);
+    fmt_int_buf(v, &nb);
+    _e2e_line(1, label, &nb);
+    return 0;
+}
+fn _info_hex(label, v): i64 {
+    var nb[64];
+    memset(&nb, 0, 64);
+    for (var i = 0; i < 16; i = i + 1) {
+        var d = (v >> ((15 - i) * 4)) & 15;
+        if (d < 10) { store8(&nb + i, 48 + d); } else { store8(&nb + i, 87 + d); }
+    }
+    _e2e_line(1, label, &nb);
+    return 0;
+}
+
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+var COMP = 4;
+var STORAGE = 0x80;
+var UNIFORM = 0x40;
+var COPY_SRC = 0x04;
+var COPY_DST = 0x08;
+
+const _DT1 = 0.5;
+const _DT2 = 0.25;
+
+fn _f(p, v): i64 { store32(p, f64_to_f32(v)); return 0; }
+
+var _PARTICLE_WGSL = "struct P { pos: vec4<f32>, vel: vec4<f32> };
+struct Params { dt: f32, count: u32, pad0: f32, pad1: f32 };
+@group(0) @binding(0) var<storage, read_write> ps: array<P>;
+@group(0) @binding(1) var<uniform> prm: Params;
+@group(0) @binding(2) var<storage, read> gravity: vec4<f32>;
+@compute @workgroup_size(64) fn cs_update(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= prm.count) { return; }
+    var p = ps[i];
+    p.vel = p.vel + gravity * prm.dt;
+    p.pos = p.pos + p.vel * prm.dt;
+    ps[i] = p;
+}
+";
+
+var _AUTO_WGSL = "@group(0) @binding(0) var<storage, read_write> d: array<u32>;
+@group(0) @binding(1) var<uniform> k: vec4<u32>;
+@compute @workgroup_size(8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    d[id.x] = d[id.x] * k.x + id.x;
+}
+";
+
+var N_LANES = 8;
+var _f64_contracted = 0;
+var _pbuf = 0;
+var _ubuf = 0;
+var _gbuf = 0;
+var _bgl = 0;
+var _bg = 0;
+var _pipe = 0;
+
+# 128 particles (32 B each): pos (i, 0, 0, 1), vel (0, 1, 0, 0).
+fn _seed(ctx): i64 {
+    var h = alloc(128 * 32);
+    memset(h, 0, 128 * 32);
+    for (var i = 0; i < 128; i = i + 1) {
+        _f(h + i * 32, f64_from(i));
+        _f(h + i * 32 + 12, F64_1);
+        _f(h + i * 32 + 20, F64_1);
+    }
+    return gpu_buffer_write(ctx, _pbuf, 0, h, 128 * 32);
+}
+
+fn _check_particles(ctx, want_pos_y, want_vel_y): i64 {
+    var h = alloc(128 * 32);
+    if (gpu_buffer_read(ctx, _pbuf, 0, h, 128 * 32) != 0) { return 1; }
+    for (var i = 0; i < 100; i = i + 1) {
+        if (load32(h + i * 32) != f64_to_f32(f64_from(i))) { return 2; }
+        if (load32(h + i * 32 + 4) != f64_to_f32(want_pos_y)) { return 3; }
+        if (load32(h + i * 32 + 20) != f64_to_f32(want_vel_y)) { return 4; }
+    }
+    # Particles past prm.count are untouched: pos.y 0, vel.y 1.
+    if (load32(h + 120 * 32 + 4) != 0) { return 5; }
+    if (load32(h + 120 * 32 + 20) != f64_to_f32(F64_1)) { return 6; }
+    return 0;
+}
+
+fn _step(ctx, offset): i64 {
+    var cp = gpu_compute_pass_begin(ctx);
+    if (cp == 0) { return 1; }
+    var offs[8];
+    store32(&offs, offset);
+    var rc = gpu_compute_pass_set_pipeline(ctx, cp, _pipe);
+    rc = rc + gpu_compute_pass_set_bind_group(ctx, cp, 0, _bg, 1, &offs);
+    rc = rc + gpu_compute_pass_dispatch(ctx, cp, 2, 1, 1);
+    rc = rc + gpu_compute_pass_end(ctx, cp);
+    return rc;
+}
+
+fn _check_particles_tier(ctx): i64 {
+    gpu_error_clear();
+    var m = gpu_shader_module_create(ctx, _PARTICLE_WGSL, strlen(_PARTICLE_WGSL));
+    if (m == 0) { return _fail("A: particle module"); }
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_storage(l, 0, COMP, 0, 0, 0);       # particles: read-write
+    gpu_bgl_uniform(l, 1, COMP, 1, 16);         # params: dynamic offset
+    gpu_bgl_storage(l, 2, COMP, 1, 0, 16);      # gravity: read-only
+    _bgl = gpu_bind_group_layout_create(ctx, l);
+    if (_bgl == 0) { return _fail("A: mixed storage + uniform + read-only layout"); }
+    _pbuf = gpu_buffer_create(ctx, 128 * 32, STORAGE | COPY_SRC | COPY_DST);
+    _ubuf = gpu_buffer_create(ctx, 512, UNIFORM | COPY_DST);
+    _gbuf = gpu_buffer_create(ctx, 16, STORAGE | COPY_DST);
+    var u = alloc(512);
+    memset(u, 0, 512);
+    _f(u, _DT1);
+    store32(u + 4, 100);
+    _f(u + 256, _DT2);
+    store32(u + 256 + 4, 100);
+    gpu_buffer_write(ctx, _ubuf, 0, u, 512);
+    var gv[16];
+    memset(&gv, 0, 16);
+    _f(&gv + 4, f64_from(2));
+    gpu_buffer_write(ctx, _gbuf, 0, &gv, 16);
+    if (_seed(ctx) != 0) { return _fail("A: particle upload"); }
+    var g = gpu_bind_group_new(_bgl);
+    gpu_bg_buffer(g, 0, _pbuf, 0, 0);
+    gpu_bg_buffer(g, 1, _ubuf, 0, 16);
+    gpu_bg_buffer(g, 2, _gbuf, 0, 16);
+    _bg = gpu_bind_group_create(ctx, g);
+    if (_bg == 0) { return _fail("A: particle group"); }
+    var cd = gpu_compute_desc_new(m, "cs_update");
+    gpu_compute_desc_bind_group_layout(cd, 0, _bgl);
+    gpu_compute_desc_label(cd, "particles");
+    _pipe = gpu_compute_pipeline_create_desc(ctx, cd);
+    if (_pipe == 0) { return _fail("A: compute pipeline from the descriptor (cs_update)"); }
+    _pass("A: compute pipeline from a descriptor: cs_update, explicit rw storage + dynamic uniform + ro storage");
+    if (_step(ctx, 0) != 0) { return _fail("A: pass 1 (dynamic offset 0) returned an error"); }
+    var bad = _check_particles(ctx, F64_1, f64_from(2));
+    if (bad != 0) { _info_int("    check: ", bad); return _fail("A: pass 1: particles are not pos.y 1, vel.y 2"); }
+    _pass("A: pass 1 (dt 0.5 at offset 0): 100 particles stepped, the 28 past `count` untouched");
+    if (_step(ctx, 256) != 0) { return _fail("A: pass 2 (dynamic offset 256) returned an error"); }
+    bad = _check_particles(ctx, f64_div(f64_from(13), f64_from(8)), f64_div(f64_from(5), f64_from(2)));
+    if (bad != 0) {
+        _info_int("    check: ", bad);
+        return _fail("A: pass 2: particles are not pos.y 1.625, vel.y 2.5");
+    }
+    _pass("A: pass 2 (dt 0.25 at dynamic offset 256): pos.y 1.625, vel.y 2.5 exactly");
+    var all = alloc(64);
+    var win = alloc(8);
+    gpu_buffer_read(ctx, _pbuf, 0, all, 64);
+    if (gpu_buffer_read(ctx, _pbuf, 2, win, 5) != 0) { return _fail("A: unaligned 5-byte storage readback"); }
+    if (memeq(win, all + 2, 5) != 1) { return _fail("A: the unaligned window differs from bytes 2..7"); }
+    _pass("A: storage readback of an unaligned window (offset 2, 5 bytes) matches");
+    return 0;
+}
+
+fn _check_errors(ctx): i64 {
+    gpu_error_clear();
+    var cp = gpu_compute_pass_begin(ctx);
+    gpu_compute_pass_set_pipeline(ctx, cp, _pipe);
+    gpu_compute_pass_dispatch(ctx, cp, 1, 1, 1);
+    var rc = gpu_compute_pass_end(ctx, cp);
+    if (rc != GPU_ERR_VALIDATION) {
+        _info_int("    rc: ", rc);
+        return _fail("B: a dispatch without its group did not end GPU_ERR_VALIDATION");
+    }
+    if (_seed(ctx) != 0) { return _fail("B: reseed"); }
+    if (_step(ctx, 0) != 0) { return _fail("B: the next pass after a refused one"); }
+    if (_check_particles(ctx, F64_1, f64_from(2)) != 0) { return _fail("B: the next pass did not compute"); }
+    _pass("B: a dispatch without its group ends GPU_ERR_VALIDATION; the next pass computes");
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(l, 0, COMP, 0, 16);         # the shader's binding 0 is storage
+    gpu_bgl_uniform(l, 1, COMP, 1, 16);
+    gpu_bgl_storage(l, 2, COMP, 1, 0, 16);
+    var wrong = gpu_bind_group_layout_create(ctx, l);
+    var m = gpu_shader_module_create(ctx, _PARTICLE_WGSL, strlen(_PARTICLE_WGSL));
+    var cd = gpu_compute_desc_new(m, "cs_update");
+    gpu_compute_desc_bind_group_layout(cd, 0, wrong);
+    gpu_error_clear();
+    if (gpu_compute_pipeline_create_desc(ctx, cd) != 0) { return _fail("B: a mismatched layout made a pipeline"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("B: the mismatch was not GPU_ERR_VALIDATION"); }
+    _pass("B: a layout that does not match the shader: 0 + GPU_ERR_VALIDATION with wgpu's reason");
+    var cd2 = gpu_compute_desc_new(m, "cs_nope");
+    gpu_compute_desc_bind_group_layout(cd2, 0, _bgl);
+    if (gpu_compute_pipeline_create_desc(ctx, cd2) != 0) { return _fail("B: a missing entry point made a pipeline"); }
+    _pass("B: a missing entry point: 0 + GPU_ERR_VALIDATION");
+    return 0;
+}
+
+fn _check_dispatch(ctx): i64 {
+    gpu_error_clear();
+    var m = gpu_shader_module_create(ctx, _AUTO_WGSL, strlen(_AUTO_WGSL));
+    if (m == 0) { return _fail("C: auto-layout module"); }
+    var d = gpu_buffer_create(ctx, 64, STORAGE | COPY_SRC | COPY_DST);
+    var k = gpu_buffer_create(ctx, 16, UNIFORM | COPY_DST);
+    var h[64];
+    for (var i = 0; i < 16; i = i + 1) { store32(&h + i * 4, 10); }
+    gpu_buffer_write(ctx, d, 0, &h, 64);
+    var kv[16];
+    memset(&kv, 0, 16);
+    store32(&kv, 3);
+    gpu_buffer_write(ctx, k, 0, &kv, 16);
+    var bp[40];
+    store64(&bp, 2);
+    store64(&bp + 8, d);
+    store64(&bp + 16, 0);
+    store64(&bp + 24, k);
+    store64(&bp + 32, 0);
+    if (gpu_compute_dispatch(ctx, m, 2, 1, 1, &bp) != 0) {
+        return _fail("C: gpu_compute_dispatch on wgpu (WGSL, storage + uniform)");
+    }
+    if (gpu_compute_dispatch(ctx, m, 2, 1, 1, &bp) != 0) { return _fail("C: a second dispatch (cached pipeline)"); }
+    var out[64];
+    gpu_buffer_read(ctx, d, 0, &out, 64);
+    for (var j = 0; j < 16; j = j + 1) {
+        # Two steps of d = d * 3 + j from 10: (10 * 3 + j) * 3 + j = 90 + 4j.
+        if (load32(&out + j * 4) != 90 + 4 * j) { return _fail("C: the WGSL dispatch results are wrong"); }
+    }
+    _pass("C: gpu_compute_dispatch on wgpu: WGSL storage + uniform through the binding array, twice (cached)");
+    gpu_shader_module_release(ctx, m);
+
+    var sbuf = alloc(1024);
+    var sn = build_saxpy_kernel(sbuf);
+    var sm = gpu_shader_module_create_spirv(ctx, sbuf, sn);
+    if (sm == 0) { return _fail("C: SAXPY SPIR-V module"); }
+    var x = gpu_buffer_create(ctx, 32, STORAGE | COPY_SRC | COPY_DST);
+    var y = gpu_buffer_create(ctx, 32, STORAGE | COPY_SRC | COPY_DST);
+    var xs[32];
+    var ys[32];
+    for (var a = 0; a < 8; a = a + 1) { store32(&xs + a * 4, a); store32(&ys + a * 4, 100); }
+    gpu_buffer_write(ctx, x, 0, &xs, 32);
+    gpu_buffer_write(ctx, y, 0, &ys, 32);
+    store64(&bp, 2);
+    store64(&bp + 8, x);
+    store64(&bp + 24, y);
+    if (gpu_compute_dispatch(ctx, sm, 1, 1, 1, &bp) != 0) { return _fail("C: SAXPY SPIR-V dispatch"); }
+    gpu_buffer_read(ctx, y, 0, &ys, 32);
+    for (var b = 0; b < 8; b = b + 1) {
+        if (load32(&ys + b * 4) != 3 * b + 100) { return _fail("C: SAXPY results are not 3i + 100"); }
+    }
+    _pass("C: gpu_compute_dispatch on wgpu: the native suite's SAXPY SPIR-V, y = 3x + y on 8 lanes");
+
+    if (gpu_wgpu_shader_f64_supported(gpu_ctx_device(ctx)) == 0) {
+        _e2e_line(1, "SKIP: ", "C: f64 (the device has no ShaderF64)");
+        return 0;
+    }
+    var fbuf = alloc(1024);
+    var fwords = build_f64_arith_kernel(fbuf);
+    var fm = gpu_shader_module_create_spirv(ctx, fbuf, fwords);
+    if (fm == 0) { return _fail("C: f64 arith SPIR-V module"); }
+    var ha = alloc(64);
+    var hb = alloc(64);
+    var hc = alloc(64);
+    fill_inputs(ha, hb, hc);
+    var ba = gpu_buffer_create(ctx, 64, STORAGE | COPY_SRC | COPY_DST);
+    var bb = gpu_buffer_create(ctx, 64, STORAGE | COPY_SRC | COPY_DST);
+    var bc = gpu_buffer_create(ctx, 64, STORAGE | COPY_SRC | COPY_DST);
+    var bo = gpu_buffer_create(ctx, 64, STORAGE | COPY_SRC | COPY_DST);
+    gpu_buffer_write(ctx, ba, 0, ha, 64);
+    gpu_buffer_write(ctx, bb, 0, hb, 64);
+    gpu_buffer_write(ctx, bc, 0, hc, 64);
+    var fbp[72];
+    store64(&fbp, 4);
+    store64(&fbp + 8, ba);
+    store64(&fbp + 24, bb);
+    store64(&fbp + 40, bc);
+    store64(&fbp + 56, bo);
+    store64(&fbp + 16, 0);
+    store64(&fbp + 32, 0);
+    store64(&fbp + 48, 0);
+    store64(&fbp + 64, 0);
+    if (gpu_compute_dispatch(ctx, fm, 1, 1, 1, &fbp) != 0) { return _fail("C: f64 arith dispatch"); }
+    var ho = alloc(64);
+    gpu_buffer_read(ctx, bo, 0, ho, 64);
+    for (var c = 0; c < 8; c = c + 1) {
+        var want = ref_arith(load64(ha + c * 8), load64(hb + c * 8), load64(hc + c * 8));
+        # RADV contracts the kernel's a*b + c into one FMA (Vulkan permits it: the
+        # SPIR-V has no NoContraction), so a lane may sit 1 ULP from the CPU's two
+        # roundings (lane 6 does on the Cezanne). The native compiler never fuses.
+        var got = load64(ho + c * 8);
+        var ulp = got - want;
+        if (ulp < 0) { ulp = 0 - ulp; }
+        if (ulp > 1) {
+            _info_hex("    got  ", got);
+            _info_hex("    want ", want);
+            return _fail("C: f64 arith is more than 1 ULP from the CPU's f64 ops");
+        }
+        if (ulp == 1) { _f64_contracted = _f64_contracted + 1; }
+    }
+    _info_int("    lanes 1 ULP off (FMA contraction): ", _f64_contracted);
+    _pass("C: f64 end to end on wgpu: the f64 arith SPIR-V matches the CPU's f64 ops on 8 lanes (within 1 ULP)");
+    return 0;
+}
+
+# Resident set (KiB) from /proc/self/statm (field 2, pages).
+fn _rss_kb(): i64 {
+    var fd = syscall(2, "/proc/self/statm", 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var b[128];
+    memset(&b, 0, 128);
+    syscall(0, fd, &b, 127);
+    syscall(3, fd);
+    var i = 0;
+    while (load8(&b + i) != 32) { i = i + 1; if (i > 120) { return 0 - 1; } }
+    i = i + 1;
+    var v = 0;
+    while (load8(&b + i) >= 48) {
+        if (load8(&b + i) > 57) { break; }
+        v = v * 10 + (load8(&b + i) - 48);
+        i = i + 1;
+    }
+    return v * 4;
+}
+
+# wgpu-core and the allocator grow to a high-water mark over the first ~100k
+# submissions of any kind (an empty encoder + submit does it too), then stay flat:
+# measured on the Cezanne, 50k-pass windows grew 11.5 MiB, 1.8 MiB, then 0, 0, 0, 0.
+# So the soak warms up for 120k passes, then requires a flat 40k-pass window.
+fn _check_soak(ctx): i64 {
+    for (var w = 0; w < 120000; w = w + 1) {
+        _step(ctx, 0);
+        if ((w % 500) == 499) { gpu_device_wait_idle(ctx); }
+    }
+    gpu_device_wait_idle(ctx);
+    var before = alloc_used();
+    var rss0 = _rss_kb();
+    var bad = 0;
+    for (var i = 0; i < 40000; i = i + 1) {
+        if (_step(ctx, 0) != 0) { bad = bad + 1; }
+        if ((i % 500) == 499) { gpu_device_wait_idle(ctx); }
+    }
+    gpu_device_wait_idle(ctx);
+    var grown = alloc_used() - before;
+    var rss1 = _rss_kb();
+    _info_int("    RSS growth, 40k warm passes (KiB): ", rss1 - rss0);
+    if (bad != 0) { return _fail("D: a pass in the soak returned an error"); }
+    if (grown != 0) {
+        _info_int("    heap grown: ", grown);
+        return _fail("D: 40000 compute passes grew the Cyrius heap");
+    }
+    _pass("D: 160000 compute passes allocated 0 bytes of Cyrius heap");
+    if (rss1 - rss0 > 512) { return _fail("D: RSS grew more than 512 KiB over 40000 warm passes (a leak per pass)"); }
+    _pass("D: RSS flat over 40000 warm passes (each pass encoder released, slot 81)");
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    if (_check_particles_tier(ctx) != 0) { return 1; }
+    if (_check_errors(ctx) != 0) { return 1; }
+    if (_check_dispatch(ctx) != 0) { return 1; }
+    if (_check_soak(ctx) != 0) { return 1; }
+    _e2e_summary();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# The native suite's hand-authored SPIR-V kernels (copied verbatim from
+# programs/native_spirv_saxpy_e2e.cyr and programs/native_spirv_f64_arith_e2e.cyr)
+# ---------------------------------------------------------------------------
+
+# SPIR-V (id-bound 25, 576 bytes): y[lid.x] = 3*x[lid.x] + y[lid.x], LocalSize 8.
+# Bindings: %13 x (binding 0), %14 y (binding 1).
+fn build_saxpy_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0);
+    store32(buf + 12, 25);
+    store32(buf + 16, 0);
+    store32(buf + 20, (2 << 16) | 17);   # OpCapability Shader
+    store32(buf + 24, 1);
+    store32(buf + 28, (3 << 16) | 14);   # OpMemoryModel Logical GLSL450
+    store32(buf + 32, 0);
+    store32(buf + 36, 1);
+    store32(buf + 40, (6 << 16) | 15);   # OpEntryPoint GLCompute %15 "main" %12
+    store32(buf + 44, 5);
+    store32(buf + 48, 15);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0);
+    store32(buf + 60, 12);
+    store32(buf + 64, (6 << 16) | 16);   # OpExecutionMode %15 LocalSize 8 1 1
+    store32(buf + 68, 15);
+    store32(buf + 72, 17);
+    store32(buf + 76, 8);
+    store32(buf + 80, 1);
+    store32(buf + 84, 1);
+    store32(buf + 88, (4 << 16) | 71);   # OpDecorate %12 BuiltIn LocalInvocationId
+    store32(buf + 92, 12);
+    store32(buf + 96, 11);
+    store32(buf + 100, 27);
+    store32(buf + 104, (4 << 16) | 71);  # OpDecorate %13 Binding 0
+    store32(buf + 108, 13);
+    store32(buf + 112, 33);
+    store32(buf + 116, 0);
+    store32(buf + 120, (4 << 16) | 71);  # OpDecorate %13 DescriptorSet 0
+    store32(buf + 124, 13);
+    store32(buf + 128, 34);
+    store32(buf + 132, 0);
+    store32(buf + 136, (4 << 16) | 71);  # OpDecorate %14 Binding 1
+    store32(buf + 140, 14);
+    store32(buf + 144, 33);
+    store32(buf + 148, 1);
+    store32(buf + 152, (4 << 16) | 71);  # OpDecorate %14 DescriptorSet 0
+    store32(buf + 156, 14);
+    store32(buf + 160, 34);
+    store32(buf + 164, 0);
+    store32(buf + 168, (2 << 16) | 19);  # OpTypeVoid %1
+    store32(buf + 172, 1);
+    store32(buf + 176, (3 << 16) | 33);  # OpTypeFunction %2 %1
+    store32(buf + 180, 2);
+    store32(buf + 184, 1);
+    store32(buf + 188, (4 << 16) | 21);  # OpTypeInt %3 32 0
+    store32(buf + 192, 3);
+    store32(buf + 196, 32);
+    store32(buf + 200, 0);
+    store32(buf + 204, (4 << 16) | 23);  # OpTypeVector %4 %3 3
+    store32(buf + 208, 4);
+    store32(buf + 212, 3);
+    store32(buf + 216, 3);
+    store32(buf + 220, (4 << 16) | 32);  # OpTypePointer %5 Input %4
+    store32(buf + 224, 5);
+    store32(buf + 228, 1);
+    store32(buf + 232, 4);
+    store32(buf + 236, (3 << 16) | 29);  # OpTypeRuntimeArray %6 %3
+    store32(buf + 240, 6);
+    store32(buf + 244, 3);
+    store32(buf + 248, (3 << 16) | 30);  # OpTypeStruct %7 %6
+    store32(buf + 252, 7);
+    store32(buf + 256, 6);
+    store32(buf + 260, (4 << 16) | 32);  # OpTypePointer %8 StorageBuffer %7
+    store32(buf + 264, 8);
+    store32(buf + 268, 12);
+    store32(buf + 272, 7);
+    store32(buf + 276, (4 << 16) | 32);  # OpTypePointer %9 StorageBuffer %3
+    store32(buf + 280, 9);
+    store32(buf + 284, 12);
+    store32(buf + 288, 3);
+    store32(buf + 292, (4 << 16) | 43);  # OpConstant %3 %10 3
+    store32(buf + 296, 3);
+    store32(buf + 300, 10);
+    store32(buf + 304, 3);
+    store32(buf + 308, (4 << 16) | 43);  # OpConstant %3 %11 0
+    store32(buf + 312, 3);
+    store32(buf + 316, 11);
+    store32(buf + 320, 0);
+    store32(buf + 324, (4 << 16) | 59);  # OpVariable %5 %12 Input
+    store32(buf + 328, 5);
+    store32(buf + 332, 12);
+    store32(buf + 336, 1);
+    store32(buf + 340, (4 << 16) | 59);  # OpVariable %8 %13 StorageBuffer
+    store32(buf + 344, 8);
+    store32(buf + 348, 13);
+    store32(buf + 352, 12);
+    store32(buf + 356, (4 << 16) | 59);  # OpVariable %8 %14 StorageBuffer
+    store32(buf + 360, 8);
+    store32(buf + 364, 14);
+    store32(buf + 368, 12);
+    store32(buf + 372, (5 << 16) | 54);  # OpFunction %1 %15 None %2
+    store32(buf + 376, 1);
+    store32(buf + 380, 15);
+    store32(buf + 384, 0);
+    store32(buf + 388, 2);
+    store32(buf + 392, (2 << 16) | 248); # OpLabel %16
+    store32(buf + 396, 16);
+    store32(buf + 400, (4 << 16) | 61);  # OpLoad %4 %17 %12
+    store32(buf + 404, 4);
+    store32(buf + 408, 17);
+    store32(buf + 412, 12);
+    store32(buf + 416, (5 << 16) | 81);  # OpCompositeExtract %3 %18 %17 0
+    store32(buf + 420, 3);
+    store32(buf + 424, 18);
+    store32(buf + 428, 17);
+    store32(buf + 432, 0);
+    store32(buf + 436, (6 << 16) | 65);  # OpAccessChain %9 %19 %13 %11 %18  (x[idx])
+    store32(buf + 440, 9);
+    store32(buf + 444, 19);
+    store32(buf + 448, 13);
+    store32(buf + 452, 11);
+    store32(buf + 456, 18);
+    store32(buf + 460, (4 << 16) | 61);  # OpLoad %3 %20 %19  (xv)
+    store32(buf + 464, 3);
+    store32(buf + 468, 20);
+    store32(buf + 472, 19);
+    store32(buf + 476, (6 << 16) | 65);  # OpAccessChain %9 %21 %14 %11 %18  (y[idx])
+    store32(buf + 480, 9);
+    store32(buf + 484, 21);
+    store32(buf + 488, 14);
+    store32(buf + 492, 11);
+    store32(buf + 496, 18);
+    store32(buf + 500, (4 << 16) | 61);  # OpLoad %3 %22 %21  (yv)
+    store32(buf + 504, 3);
+    store32(buf + 508, 22);
+    store32(buf + 512, 21);
+    store32(buf + 516, (5 << 16) | 132); # OpIMul %3 %23 %20 %10  (3*xv)
+    store32(buf + 520, 3);
+    store32(buf + 524, 23);
+    store32(buf + 528, 20);
+    store32(buf + 532, 10);
+    store32(buf + 536, (5 << 16) | 128); # OpIAdd %3 %24 %23 %22  (m + yv)
+    store32(buf + 540, 3);
+    store32(buf + 544, 24);
+    store32(buf + 548, 23);
+    store32(buf + 552, 22);
+    store32(buf + 556, (3 << 16) | 62);  # OpStore %21 %24
+    store32(buf + 560, 21);
+    store32(buf + 564, 24);
+    store32(buf + 568, (1 << 16) | 253); # OpReturn
+    store32(buf + 572, (1 << 16) | 56);  # OpFunctionEnd
+    return 576;
+}
+
+# 8 finite f64 triples (the F.6 inputs) as raw IEEE-754 bit patterns.
+fn fill_inputs(a, b, c): i64 {
+    store64(a + 0,    0x3FB999999999999A); store64(b + 0,    0x3FB999999999999A); store64(c + 0,    0x3FB999999999999A);
+    store64(a + 8,    0x3FB999999999999A); store64(b + 8,    0x3FD3333333333333); store64(c + 8,    0x3FD3333333333333);
+    store64(a + 16,   0x3FF000000006DF38); store64(b + 16,   0x4008000000000000); store64(c + 16,   0x3FB999999999999A);
+    store64(a + 24,   0xBFF000000006DF38); store64(b + 24,   0x4008000000000000); store64(c + 24,   0x3FB999999999999A);
+    store64(a + 32,   0x430C6BF526340000); store64(b + 32,   0x3CD203AF9EE75616); store64(c + 32,   0x3FF0000000000000);
+    store64(a + 40,   0x4000000000000000); store64(b + 40,   0x4008000000000000); store64(c + 40,   0x4010000000000000);
+    store64(a + 48,   0x3FB999999999999A); store64(b + 48,   0x3FE6666666666666); store64(c + 48,   0x3FB999999999999A);
+    store64(a + 56,   0xC00C000000000000); store64(b + 56,   0xC002000000000000); store64(c + 56,   0x401C800000000000);
+    return 0;
+}
+
+# The in-process reference: out = max(min(a*b + c, b), a), all f64, matching the kernel op-for-op.
+fn ref_arith(a, b, c): i64 {
+    var p = f64_add(f64_mul(a, b), c);   # unfused (two roundings) — separate OpFMul + OpFAdd
+    var mn = b;
+    if (f64_lt(p, b) == 1) { mn = p; }   # min(p, b)
+    var mx = a;
+    if (f64_gt(mn, a) == 1) { mx = mn; } # max(mn, a)
+    return mx;
+}
+
+# The f64 arith SPIR-V (spirv-as spv1.3, spirv-val-clean; 205 words / 820 bytes; id-bound 33).
+# out[lid.x] = max(min(a[lid.x]*b[lid.x] + c[lid.x], b[lid.x]), a[lid.x]); 4 StorageBuffer bindings.
+fn build_f64_arith_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x00000021);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x00020011);
+    store32(buf + 32, 0x0000000A);
+    store32(buf + 36, 0x0006000B);
+    store32(buf + 40, 0x00000001);
+    store32(buf + 44, 0x4C534C47);
+    store32(buf + 48, 0x6474732E);
+    store32(buf + 52, 0x3035342E);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x0003000E);
+    store32(buf + 64, 0x00000000);
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x0006000F);
+    store32(buf + 76, 0x00000005);
+    store32(buf + 80, 0x00000002);
+    store32(buf + 84, 0x6E69616D);
+    store32(buf + 88, 0x00000000);
+    store32(buf + 92, 0x00000003);
+    store32(buf + 96, 0x00060010);
+    store32(buf + 100, 0x00000002);
+    store32(buf + 104, 0x00000011);
+    store32(buf + 108, 0x00000008);
+    store32(buf + 112, 0x00000001);
+    store32(buf + 116, 0x00000001);
+    store32(buf + 120, 0x00040047);
+    store32(buf + 124, 0x00000003);
+    store32(buf + 128, 0x0000000B);
+    store32(buf + 132, 0x0000001B);
+    store32(buf + 136, 0x00040047);
+    store32(buf + 140, 0x00000004);
+    store32(buf + 144, 0x00000021);
+    store32(buf + 148, 0x00000000);
+    store32(buf + 152, 0x00040047);
+    store32(buf + 156, 0x00000004);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047);
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000001);
+    store32(buf + 184, 0x00040047);
+    store32(buf + 188, 0x00000005);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00040047);
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00000021);
+    store32(buf + 212, 0x00000002);
+    store32(buf + 216, 0x00040047);
+    store32(buf + 220, 0x00000006);
+    store32(buf + 224, 0x00000022);
+    store32(buf + 228, 0x00000000);
+    store32(buf + 232, 0x00040047);
+    store32(buf + 236, 0x00000007);
+    store32(buf + 240, 0x00000021);
+    store32(buf + 244, 0x00000003);
+    store32(buf + 248, 0x00040047);
+    store32(buf + 252, 0x00000007);
+    store32(buf + 256, 0x00000022);
+    store32(buf + 260, 0x00000000);
+    store32(buf + 264, 0x00020013);
+    store32(buf + 268, 0x00000008);
+    store32(buf + 272, 0x00030021);
+    store32(buf + 276, 0x00000009);
+    store32(buf + 280, 0x00000008);
+    store32(buf + 284, 0x00040015);
+    store32(buf + 288, 0x0000000A);
+    store32(buf + 292, 0x00000020);
+    store32(buf + 296, 0x00000000);
+    store32(buf + 300, 0x00040017);
+    store32(buf + 304, 0x0000000B);
+    store32(buf + 308, 0x0000000A);
+    store32(buf + 312, 0x00000003);
+    store32(buf + 316, 0x00040020);
+    store32(buf + 320, 0x0000000C);
+    store32(buf + 324, 0x00000001);
+    store32(buf + 328, 0x0000000B);
+    store32(buf + 332, 0x00030016);
+    store32(buf + 336, 0x0000000D);
+    store32(buf + 340, 0x00000040);
+    store32(buf + 344, 0x0003001D);
+    store32(buf + 348, 0x0000000E);
+    store32(buf + 352, 0x0000000D);
+    store32(buf + 356, 0x0003001E);
+    store32(buf + 360, 0x0000000F);
+    store32(buf + 364, 0x0000000E);
+    store32(buf + 368, 0x00040020);
+    store32(buf + 372, 0x00000010);
+    store32(buf + 376, 0x0000000C);
+    store32(buf + 380, 0x0000000F);
+    store32(buf + 384, 0x00040020);
+    store32(buf + 388, 0x00000011);
+    store32(buf + 392, 0x0000000C);
+    store32(buf + 396, 0x0000000D);
+    store32(buf + 400, 0x0004002B);
+    store32(buf + 404, 0x0000000A);
+    store32(buf + 408, 0x00000012);
+    store32(buf + 412, 0x00000000);
+    store32(buf + 416, 0x0004003B);
+    store32(buf + 420, 0x0000000C);
+    store32(buf + 424, 0x00000003);
+    store32(buf + 428, 0x00000001);
+    store32(buf + 432, 0x0004003B);
+    store32(buf + 436, 0x00000010);
+    store32(buf + 440, 0x00000004);
+    store32(buf + 444, 0x0000000C);
+    store32(buf + 448, 0x0004003B);
+    store32(buf + 452, 0x00000010);
+    store32(buf + 456, 0x00000005);
+    store32(buf + 460, 0x0000000C);
+    store32(buf + 464, 0x0004003B);
+    store32(buf + 468, 0x00000010);
+    store32(buf + 472, 0x00000006);
+    store32(buf + 476, 0x0000000C);
+    store32(buf + 480, 0x0004003B);
+    store32(buf + 484, 0x00000010);
+    store32(buf + 488, 0x00000007);
+    store32(buf + 492, 0x0000000C);
+    store32(buf + 496, 0x00050036);
+    store32(buf + 500, 0x00000008);
+    store32(buf + 504, 0x00000002);
+    store32(buf + 508, 0x00000000);
+    store32(buf + 512, 0x00000009);
+    store32(buf + 516, 0x000200F8);
+    store32(buf + 520, 0x00000013);
+    store32(buf + 524, 0x0004003D);
+    store32(buf + 528, 0x0000000B);
+    store32(buf + 532, 0x00000014);
+    store32(buf + 536, 0x00000003);
+    store32(buf + 540, 0x00050051);
+    store32(buf + 544, 0x0000000A);
+    store32(buf + 548, 0x00000015);
+    store32(buf + 552, 0x00000014);
+    store32(buf + 556, 0x00000000);
+    store32(buf + 560, 0x00060041);
+    store32(buf + 564, 0x00000011);
+    store32(buf + 568, 0x00000016);
+    store32(buf + 572, 0x00000004);
+    store32(buf + 576, 0x00000012);
+    store32(buf + 580, 0x00000015);
+    store32(buf + 584, 0x0004003D);
+    store32(buf + 588, 0x0000000D);
+    store32(buf + 592, 0x00000017);
+    store32(buf + 596, 0x00000016);
+    store32(buf + 600, 0x00060041);
+    store32(buf + 604, 0x00000011);
+    store32(buf + 608, 0x00000018);
+    store32(buf + 612, 0x00000005);
+    store32(buf + 616, 0x00000012);
+    store32(buf + 620, 0x00000015);
+    store32(buf + 624, 0x0004003D);
+    store32(buf + 628, 0x0000000D);
+    store32(buf + 632, 0x00000019);
+    store32(buf + 636, 0x00000018);
+    store32(buf + 640, 0x00060041);
+    store32(buf + 644, 0x00000011);
+    store32(buf + 648, 0x0000001A);
+    store32(buf + 652, 0x00000006);
+    store32(buf + 656, 0x00000012);
+    store32(buf + 660, 0x00000015);
+    store32(buf + 664, 0x0004003D);
+    store32(buf + 668, 0x0000000D);
+    store32(buf + 672, 0x0000001B);
+    store32(buf + 676, 0x0000001A);
+    store32(buf + 680, 0x00050085);
+    store32(buf + 684, 0x0000000D);
+    store32(buf + 688, 0x0000001C);
+    store32(buf + 692, 0x00000017);
+    store32(buf + 696, 0x00000019);
+    store32(buf + 700, 0x00050081);
+    store32(buf + 704, 0x0000000D);
+    store32(buf + 708, 0x0000001D);
+    store32(buf + 712, 0x0000001C);
+    store32(buf + 716, 0x0000001B);
+    store32(buf + 720, 0x0007000C);
+    store32(buf + 724, 0x0000000D);
+    store32(buf + 728, 0x0000001E);
+    store32(buf + 732, 0x00000001);
+    store32(buf + 736, 0x00000025);
+    store32(buf + 740, 0x0000001D);
+    store32(buf + 744, 0x00000019);
+    store32(buf + 748, 0x0007000C);
+    store32(buf + 752, 0x0000000D);
+    store32(buf + 756, 0x0000001F);
+    store32(buf + 760, 0x00000001);
+    store32(buf + 764, 0x00000028);
+    store32(buf + 768, 0x0000001E);
+    store32(buf + 772, 0x00000017);
+    store32(buf + 776, 0x00060041);
+    store32(buf + 780, 0x00000011);
+    store32(buf + 784, 0x00000020);
+    store32(buf + 788, 0x00000007);
+    store32(buf + 792, 0x00000012);
+    store32(buf + 796, 0x00000015);
+    store32(buf + 800, 0x0003003E);
+    store32(buf + 804, 0x00000020);
+    store32(buf + 808, 0x0000001F);
+    store32(buf + 812, 0x000100FD);
+    store32(buf + 816, 0x00010038);
+    return 820;
+}

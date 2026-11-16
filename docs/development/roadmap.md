@@ -44,10 +44,11 @@ renamed two names that collided with other cyrius folds; v4.1.7 (2026-10-06) mov
 6.6.18 and its compile-verified `dist/mabda.deps`; v4.2.0 (2026-10-08) moved to cyrius 6.7.5,
 made the eleven `F64_*` colour constants f64 `const`s, and closed the 6.6.5 / 6.6.6 pin-move
 lists below, which it pruned; v4.3.0 (2026-11-16) shipped the render tier's MB1 — the pipeline
-descriptor, bind groups, draw-time calls and the error channel, on an 81-slot launcher that
-already carries MB2–MB5's slots — and fixed the 2026-11 filings: the render-loop leak, the pin
-and optional deps, the profiler's pass timings, NVIDIA's shader-kind gate and binding array, and
-the byte-loop copies).
+descriptor, bind groups, draw-time calls and the error channel, on an 81-slot launcher — and
+fixed the 2026-11 filings: the render-loop leak, the pin and optional deps, the profiler's pass
+timings, NVIDIA's shader-kind gate and binding array, and the byte-loop copies; v4.3.1
+(2026-11-16) shipped MB2–MB5 — depth and shadows; render formats, MSAA, views, mip generation,
+copies and readback; compute on wgpu; a Wayland window surface — on an 83-slot launcher).
 
 ## The Long Arc
 
@@ -73,12 +74,12 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.3.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.3.1  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
-                        deprecation → render tier MB1)
-  v4.4 → v4.x      ─▶  the render tier MB2–MB5, N9 (SPIR-V → SASS), the
-                        texture encoder (below)
+                        deprecation → render tier MB1 → MB2–MB5)
+  v4.4 → v4.x      ─▶  N9 (SPIR-V → SASS), the texture encoder, the native
+                        render tier (below)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v5.0             ─▶  Intel native backend added (tentative); NVIDIA
                         wgpu path retires (NVIDIA → NVIDIA native only)
@@ -127,35 +128,41 @@ consumer accidentally couples to it.
 
 ---
 
-## The render tier — MB2 to MB5 (soorat's GPU half waits on it)
+## The render tier — MB1 to MB5 (shipped 4.3.0 / 4.3.1)
 
 Filed 2026-11-15 by soorat's Cyrius port (`issues/2026-11-15-render-tier-for-geometry-consumers.md`,
-its ledger L2–L6). **MB1 shipped in 4.3.0** (CHANGELOG [4.3.0]): the pipeline descriptor, bind group
-layouts / groups / sampler objects (comparison samplers included), the draw-time calls, public
-constant names, the error channel, and the pipeline-side depth state. The 4.3.0 launcher (81
-slots) already carries every slot below, so none of these needs another consumer rebuild. Each
-milestone is wgpu-first, gated by mabda's tests and soorat's probes (P6/MB1 extended per MB).
+its ledger L2–L6). **MB1 shipped in 4.3.0** (the pipeline descriptor, bind groups, draw-time calls,
+public constant names, the error channel); **MB2–MB5 shipped in 4.3.1** (CHANGELOG [4.3.1]) on an
+83-slot launcher — the 4.3.0 revision lacked the compute pass encoder's release and the compute
+pipeline's bind group layout, added as slots 81–82 (the one further consumer rebuild, approved
+2026-11-16):
 
-- **MB2 — depth and shadows** (soorat M6, M7). Depth32F render targets and textures
-  (`MABDA_TEXFMT_DEPTH32F` is named; `gpu_texture_create_*` refuses it until then), a depth
-  attachment in the render pass with load / clear, depth views (`WGPU_TEXTURE_ASPECT_DEPTH_ONLY`)
-  for binding a shadow map, and the render target builder's depth path.
-- **MB3 — formats, MSAA, mips, copies, readback** (M7, M8). Texture creation in RGBA16F, RGBA8
-  sRGB and BGRA8 (+ sRGB), with `asset_format.cyr` mapping sRGB containers to the sRGB ids
-  (punchlist AL.0); MSAA targets with resolve; several colour targets; rendering into a cube face
-  or mip level (a single-layer, single-level attachment view); mip generation on wgpu
-  (`gpu_texture_generate_mipmaps` returns NOT_IMPLEMENTED there); texture-to-texture copy on the  #skip-lint
-  public tier (slot 77 is in); render-target readback on the public tier.
-- **MB4 — compute on the public tier for wgpu** (M8). `gpu_compute_dispatch` on wgpu (it returns
-  `GPU_ERR_OTHER`), compute pipelines with explicit mixed layouts (storage + uniform — the MB1
-  layout builder already expresses them), storage-buffer readback.
-- **MB5 — a window surface** (M9). `WGPUSurface` from a Wayland `wl_display` / `wl_surface`
-  (slot 78), surface capabilities (slot 79), BGRA8 / BGRA8 sRGB swapchain formats, AutoVsync /
-  AutoNoVsync. Slots 78/79 are compile-checked only until this milestone brings a Wayland client
-  to prove them on hardware; a defect there would cost a second launcher revision.
+- **MB2 — depth and shadows.** Depth32F render targets and textures, the pass descriptor's depth
+  attachment (load / clear / store / read-only), depth-only passes, a depth target bound as a
+  `texture_depth_2d` for a comparison sampler (HW: `programs/target_tier_e2e.cyr` part A; soorat
+  P6/MB2-5 `shadow`).
+- **MB3 — formats, MSAA, views, mips, copies, readback.** Textures and targets in RGBA8 sRGB,
+  BGRA8 (+ sRGB), RGBA16F; KTX2 / DDS containers of those map to their own ids (punchlist AL.0 for
+  the uncompressed formats; the compressed sRGB variants still collapse, flagged by
+  `mabda_*_format_is_srgb`); 4x MSAA with automatic or explicit resolve; up to eight colour
+  targets; texture views (a cube face or mip level as an attachment; bindable; readable); mipped
+  cubes; mip generation on wgpu (a render blit per level, any uncompressed colour format, arrays
+  and cubes); texture-to-texture copies; render-target readback (part B; soorat `hdr`, `ibl`,
+  `copy`, `msaa`).
+- **MB4 — compute on wgpu.** Compute pipelines from a descriptor with explicit mixed layouts,
+  compute passes, `gpu_compute_dispatch` on wgpu, storage readback, f64 end to end
+  (`programs/compute_tier_e2e.cyr`; soorat `particles`).
+- **MB5 — a window surface.** A `WGPUSurface` from a Wayland `wl_display` / `wl_surface`,
+  capabilities, configure in any listed format with AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture
+  objects, resize. **HW proof open:** `programs/surface_wayland_e2e.cyr` (a Wayland client driven
+  from Cyrius) needs a running compositor; neither the Cezanne dev box (a tty session) nor `chew`
+  (an SDDM greeter) has one, and Hyprland will not start headless there without a seat. The
+  program loads libwayland-client through the process's libc and SKIPs at `wl_display_connect`;
+  run it from a Wayland session (`make test-surface-wayland-e2e`).
 - **The native render tier** (soorat's ledger L7, after its 2.0). On native AMD and NVIDIA the
-  4.3.0 tier serves the native render path's shape — a vertex-less, unbound, single-RGBA8 draw —
-  and names everything else `GPU_ERR_NOT_IMPLEMENTED` (`src/backend_native_rtier.cyr`). The rest  #skip-lint
+  tier serves the native render path's shape — a vertex-less, unbound draw into one single-sample
+  RGBA8 target, a cleared one-attachment descriptor pass, and its readback (4.3.1) — and names
+  everything else `GPU_ERR_NOT_IMPLEMENTED` (`src/backend_native_rtier.cyr`). The rest  #skip-lint
   (vertex fetch, bind groups, depth, blending) needs a render-capable native shader path: a WGSL
   front end, or SPIR-V render lowering beside the compute lowering. It bears on the v5.1 gate,
   which lists soorat among the consumers that must run native.

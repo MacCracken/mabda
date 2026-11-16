@@ -220,3 +220,189 @@ fn gpu_surface_release(ctx, surface): i64 {
     gpu_ctx_set_native_card_fd(ctx, 0);
     return rc;
 }
+
+# ================================================================
+# v4.3.1 — a window surface from Wayland on wgpu (the render tier's MB5)
+# ================================================================
+# The application owns the window (soorat 2.0 owns none): it connects to the
+# compositor and makes a wl_surface (an xdg_toplevel for a window), then hands
+# mabda the wl_display and wl_surface:
+#
+#   gpu_surface_create_wayland(ctx, wl_display, wl_surface);
+#   var caps = gpu_surface_caps_new();
+#   gpu_surface_capabilities(ctx, caps);            # formats, present modes
+#   var s = gpu_surface_configure(ctx, w, h, MABDA_TEXFMT_BGRA8_SRGB, GPU_PRESENT_AUTO_VSYNC);
+#   per frame:
+#     var frame = gpu_surface_acquire_target(ctx, s);   # a texture object
+#     ... gpu_pass_desc_color(pd, frame, ...) / a resolve target ...
+#     gpu_surface_present(ctx, s);                      # presents and drops the frame
+#   on a window resize (or GPU_ERR_SURFACE_OUTDATED): gpu_surface_resize(ctx, s, w, h);
+#   gpu_surface_release(ctx, s);
+#
+# Backends: wgpu (launcher slots 78-79). Native KMS surfaces keep
+# gpu_surface_configure_native_*; these calls are GPU_ERR_NOT_IMPLEMENTED there.  #skip-lint
+
+# Present modes (WebGPU's numbers) and mabda's two automatic choices.
+var GPU_PRESENT_FIFO          = 1;    # vsync: always available
+var GPU_PRESENT_FIFO_RELAXED  = 2;    # vsync, tears when late
+var GPU_PRESENT_IMMEDIATE     = 3;    # no vsync, tears
+var GPU_PRESENT_MAILBOX       = 4;    # no vsync, no tearing
+var GPU_PRESENT_AUTO_VSYNC    = 16;   # FifoRelaxed when the surface has it, else Fifo
+var GPU_PRESENT_AUTO_NO_VSYNC = 17;   # Immediate, else Mailbox, else Fifo
+
+# Surface capabilities (GPU_SURFACE_CAPS_SIZE = 168 bytes; the launcher's
+# WgpuSurfaceCapsOut, deps/wgpu_main.c): status +0, usages +8, format count +16,
+# 16 x u32 WGPUTextureFormat +24, present mode count +88, 8 x u32 present mode
+# +96, alpha mode count +128, 8 x u32 alpha mode +136. Counts are the surface's
+# true counts; at most 16 / 8 / 8 entries are kept.
+var GPU_SURFACE_CAPS_SIZE = 168;
+
+fn gpu_surface_caps_new(): i64 {
+    var c = alloc(GPU_SURFACE_CAPS_SIZE);
+    if (c == 0) { return 0; }
+    memset(c, 0, GPU_SURFACE_CAPS_SIZE);
+    return c;
+}
+
+fn _gpu_caps_count(c, off, cap): i64 {
+    if (c == 0) { return 0; }
+    var n = load64(c + off);
+    if (n < 0) { return 0; }
+    if (n > cap) { return cap; }
+    return n;
+}
+
+fn gpu_surface_caps_format_count(c): i64 { return _gpu_caps_count(c, 16, 16); }
+fn gpu_surface_caps_present_mode_count(c): i64 { return _gpu_caps_count(c, 88, 8); }
+
+# Format `i` as a MABDA_TEXFMT_* id, or -1 for a format mabda has no id for.
+fn gpu_surface_caps_format(c, i): i64 {
+    if (i < 0) { return 0 - 1; }
+    if (i >= gpu_surface_caps_format_count(c)) { return 0 - 1; }
+    return mabda_texfmt_from_wgpu(load32(c + 24 + i * 4));
+}
+
+# Present mode `i` (GPU_PRESENT_FIFO .. _MAILBOX), or -1.
+fn gpu_surface_caps_present_mode(c, i): i64 {
+    if (i < 0) { return 0 - 1; }
+    if (i >= gpu_surface_caps_present_mode_count(c)) { return 0 - 1; }
+    return load32(c + 96 + i * 4);
+}
+
+fn gpu_surface_caps_has_format(c, fmt): i64 {
+    var n = gpu_surface_caps_format_count(c);
+    for (var i = 0; i < n; i = i + 1) {
+        if (gpu_surface_caps_format(c, i) == fmt) { return 1; }
+    }
+    return 0;
+}
+
+fn gpu_surface_caps_has_present_mode(c, mode): i64 {
+    var n = gpu_surface_caps_present_mode_count(c);
+    for (var i = 0; i < n; i = i + 1) {
+        if (gpu_surface_caps_present_mode(c, i) == mode) { return 1; }
+    }
+    return 0;
+}
+
+# The present mode `mode` resolves to on a surface with capabilities `c`: an
+# explicit mode the surface has is itself; the AUTO modes pick as documented
+# above. -1 when the surface has none that fits (an explicit mode it lacks).
+fn gpu_surface_resolve_present_mode(c, mode): i64 {
+    if (mode == GPU_PRESENT_AUTO_VSYNC) {
+        if (gpu_surface_caps_has_present_mode(c, GPU_PRESENT_FIFO_RELAXED) == 1) { return GPU_PRESENT_FIFO_RELAXED; }
+        return GPU_PRESENT_FIFO;
+    }
+    if (mode == GPU_PRESENT_AUTO_NO_VSYNC) {
+        if (gpu_surface_caps_has_present_mode(c, GPU_PRESENT_IMMEDIATE) == 1) { return GPU_PRESENT_IMMEDIATE; }
+        if (gpu_surface_caps_has_present_mode(c, GPU_PRESENT_MAILBOX) == 1) { return GPU_PRESENT_MAILBOX; }
+        return GPU_PRESENT_FIFO;
+    }
+    if (mode < GPU_PRESENT_FIFO) { return 0 - 1; }
+    if (mode > GPU_PRESENT_MAILBOX) { return 0 - 1; }
+    if (gpu_surface_caps_has_present_mode(c, mode) == 1) { return mode; }
+    return 0 - 1;
+}
+
+fn _gpu_surfx_slot(ctx, off): i64 {
+    if (ctx == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    return backend_get_slot(b, off);
+}
+
+fn _gpu_surfx_missing(): i64 {
+    _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+      "surface: this backend has no Wayland surfaces (wgpu only)", 1);
+    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+}
+
+# Make the context's window surface from a Wayland client's wl_display* and
+# wl_surface* (they stay the caller's; the surface must outlive mabda's use).
+# Returns 0 or a GPU_ERR_* (the reason recorded).
+fn gpu_surface_create_wayland(ctx, wl_display, wl_surface): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (wl_display == 0) {
+        _gpu_err_record(GPU_ERR_SURFACE_CONFIG, "surface: null wl_display", 1);
+        return GPU_ERR_SURFACE_CONFIG;
+    }
+    if (wl_surface == 0) {
+        _gpu_err_record(GPU_ERR_SURFACE_CONFIG, "surface: null wl_surface", 1);
+        return GPU_ERR_SURFACE_CONFIG;
+    }
+    var slot = _gpu_surfx_slot(ctx, BACKEND_SLOT_SURFACE_CREATE_WAYLAND);
+    if (slot == 0) { return _gpu_surfx_missing(); }
+    return fncall3(slot, ctx, wl_display, wl_surface);
+}
+
+# Fill `caps` (from gpu_surface_caps_new) for the context's surface. 0 or a GPU_ERR_*.
+fn gpu_surface_capabilities(ctx, caps): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (caps == 0) { return GPU_ERR_OTHER; }
+    var slot = _gpu_surfx_slot(ctx, BACKEND_SLOT_SURFACE_CAPABILITIES);
+    if (slot == 0) { return _gpu_surfx_missing(); }
+    return fncall2(slot, ctx, caps);
+}
+
+# Configure the context's surface: `width` x `height`, `fmt` a MABDA_TEXFMT_* the
+# surface lists (BGRA8 / BGRA8_SRGB on most Wayland compositors), `present_mode`
+# a GPU_PRESENT_*. Returns the surface, or 0 (reason recorded).
+fn gpu_surface_configure(ctx, width, height, fmt, present_mode): i64 {
+    if (ctx == 0) { return 0; }
+    if (width <= 0) { _gpu_err_record(GPU_ERR_SURFACE_CONFIG, "surface: width must be positive", 1); return 0; }
+    if (height <= 0) { _gpu_err_record(GPU_ERR_SURFACE_CONFIG, "surface: height must be positive", 1); return 0; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) {
+        _gpu_err_record(GPU_ERR_SURFACE_CONFIG, "surface: a dimension is past 8192", 1);
+        return 0;
+    }
+    if (mabda_texfmt_is_color_target(fmt) == 0) {
+        _gpu_err_record(GPU_ERR_FORMAT_UNSUPPORTED, "surface: not a colour render format", 1);
+        return 0;
+    }
+    var slot = _gpu_surfx_slot(ctx, BACKEND_SLOT_SURFACE_CONFIGURE_EX);
+    if (slot == 0) { _gpu_surfx_missing(); return 0; }
+    return fncall5(slot, ctx, width, height, fmt, present_mode);
+}
+
+# This frame's surface texture as a texture object (attach it, or resolve into
+# it), or 0 with GPU_ERR_SURFACE_TIMEOUT / _OUTDATED (resize, then acquire again) /
+# _LOST recorded. Calling it again before gpu_surface_present returns the same frame.
+fn gpu_surface_acquire_target(ctx, surface): i64 {
+    if (ctx == 0) { return 0; }
+    if (surface == 0) { return 0; }
+    var slot = _gpu_surfx_slot(ctx, BACKEND_SLOT_SURFACE_ACQUIRE_TARGET);
+    if (slot == 0) { _gpu_surfx_missing(); return 0; }
+    return fncall2(slot, ctx, surface);
+}
+
+# Reconfigure `surface` at a new size (an unpresented frame is dropped first).
+fn gpu_surface_resize(ctx, surface, width, height): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (surface == 0) { return GPU_ERR_OTHER; }
+    if (width <= 0) { return GPU_ERR_SURFACE_CONFIG; }
+    if (height <= 0) { return GPU_ERR_SURFACE_CONFIG; }
+    if (validate_dimensions(width, height, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return GPU_ERR_SURFACE_CONFIG; }
+    var slot = _gpu_surfx_slot(ctx, BACKEND_SLOT_SURFACE_RESIZE);
+    if (slot == 0) { return _gpu_surfx_missing(); }
+    return fncall4(slot, ctx, surface, width, height);
+}

@@ -383,6 +383,18 @@ build/render_tier_e2e: build/render_tier_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/render_tier_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
+build/surface_wayland_e2e: build/surface_wayland_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/surface_wayland_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/compute_tier_e2e: build/compute_tier_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/compute_tier_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/target_tier_e2e: build/target_tier_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/target_tier_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
 build/error_channel_e2e: build/error_channel_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/error_channel_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
@@ -505,9 +517,35 @@ test-error-channel-e2e: build/error_channel_e2e
 
 # v4.3.0 render tier MB1 parts C-E: layouts, groups, samplers, the pipeline
 # descriptor and the draw-time calls, rendered and read back.
-.PHONY: test-render-tier-e2e
+.PHONY: test-render-tier-e2e test-target-tier-e2e
 test-render-tier-e2e: build/render_tier_e2e
 	./build/render_tier_e2e
+
+# v4.3.1 — the render tier's MB2 + MB3 on hardware: depth targets and passes, the
+# shadow comparison lookup, depth-only and read-only depth passes, RGBA16F / sRGB /
+# BGRA8 targets, 4x MSAA with resolve, two colour targets, cube-face and mip-level
+# attachment views, wgpu mip generation, texture copies, the refusals, and 1000
+# descriptor frames at 0 heap bytes.
+test-target-tier-e2e: build/target_tier_e2e
+	./build/target_tier_e2e
+
+# v4.3.1 — the render tier's MB4 on hardware: a descriptor compute pipeline with a
+# mixed explicit layout, compute passes with dynamic offsets, storage readback,
+# the refusals, gpu_compute_dispatch on wgpu (WGSL, SAXPY SPIR-V, f64 SPIR-V
+# within 1 ULP), and 160000 passes at 0 heap bytes and flat RSS. Needs the 83-slot
+# launcher.
+.PHONY: test-compute-tier-e2e
+test-compute-tier-e2e: build/compute_tier_e2e
+	./build/compute_tier_e2e
+
+# v4.3.1 — the render tier's MB5 on hardware: a Wayland window (libwayland-client
+# through the loaded libc's dlopen, xdg-shell tables built in Cyrius), a WGPUSurface
+# from it, capabilities, BGRA8 configure, 120 frames, an MSAA resolve into a frame,
+# resize, AUTO_VSYNC. Needs a running Wayland compositor (WAYLAND_DISPLAY); prints
+# SKIP without one. Not in test-gpu, whose gates run headless.
+.PHONY: test-surface-wayland-e2e
+test-surface-wayland-e2e: build/surface_wayland_e2e
+	./build/surface_wayland_e2e
 
 .PHONY: test-spirv-e2e
 test-spirv-e2e: build/spirv_e2e
@@ -1470,7 +1508,7 @@ bench-gpu: build/benchmarks
 
 # Developer gate: run every GPU integration program in sequence.
 .PHONY: test-gpu
-test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e test-launcher-slots-e2e test-error-channel-e2e test-render-tier-e2e
+test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e test-launcher-slots-e2e test-error-channel-e2e test-render-tier-e2e test-target-tier-e2e test-compute-tier-e2e
 
 # ---------------------------------------------------------------------------
 # test-native-all — run every `test-native-*` gate and report a TALLY.
