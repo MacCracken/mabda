@@ -35,9 +35,10 @@ The remaining 4.4.0 items are open and tracked in the roadmap. That includes "th
 SM75 path", which waits on N9.
 
 **N9 (SPIR-V → SASS for NVIDIA) has started.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1 (the encoder)
-and N9.2 (the instruction selector) have landed. N9.3–N9.6 are open (§7 of the note), and so is
-N9's done-when.
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1 (the encoder),
+N9.2 (the instruction selector) and N9.3 (register allocation, scheduling and the compile driver)
+have landed: straight-line SPIR-V now compiles to SASS that `nvdisasm` decodes. N9.4–N9.6 are
+open (§7 of the note): nothing runs on the TU116 yet, and N9's done-when is still ahead.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -191,6 +192,31 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   straight-line selects, and the integer-division macro. Hand-built MIR pins the operand and
   condition rules. `sm75_isel` joined the sizing gate's contract table.
 
+### Added — N9.3: SM75 register allocation, scheduling and the compile driver (`@internal`)
+- `src/sm75_regalloc.cyr`: a linear scan over one GPR file, R0–R254. It applies 4.4.0's
+  dead-load rule from the start. The QMD register count follows NAK:
+  `max(4, used + 2)`, because Volta and later reserve two GPRs per thread for the program
+  counter. That matches ptxas's 4 for the captured `store_deadbeef`.
+- `src/sm75_compile.cyr` encodes each record with physical registers and lays out the program the
+  way ptxas does: `EXIT`, a branch to itself, then `NOP`s to a 128-byte boundary. Scheduling is
+  the design note's deliberately conservative v1, because a wrong control word fails silently:
+  - every instruction stalls 15 cycles with yield clear;
+  - a variable-latency op (`S2R`, `LDG`, `MUFU`, `I2F`, `F2I`, `FRND`) writes scoreboard 0, and
+    the next instruction waits on it;
+  - `STG` sets read scoreboard 1, and the next instruction waits on it.
+- The driver is `sm75_compile(cc, spirv, n, sass, sass_len, desc)` (shared front end →
+  `sm75_isel` → `sm75_regalloc` → emit). It writes the SASS plus [length, register count,
+  binding count]. `sm75_compile_spirv(words, n, sass, sass_len, desc)` is the pure-CPU compile
+  frame, with all scratch on its own stack, for the CPU suite and for N9.4's backend.
+- Verified on `chew`: SAXPY by LocalInvocationId and by GlobalInvocationId, and the five
+  straight-line select kernels, compile to SASS that `nvdisasm -b SM75` decodes without error.
+  The round trip caught `STG`'s UR and data registers swapped, which is fixed and pinned.
+  `scripts/disasm-sass.sh` gained a file mode for this round trip.
+- `tests/tcyr/sm75_compile.tcyr` (36 assertions) covers the register-count rule, reuse and the
+  dead-load rule, the layout, every scheduling field of a whole kernel, and the
+  output-buffer bound. Error codes 135–137 are named. `sm75_regalloc`, `sm75_emit`,
+  `sm75_compile` and `sm75_compile_spirv` joined the sizing gate's contract table.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -252,8 +278,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 27 suites, **7181 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
-  contract; 7033 after the compiler limits; 7112 after N9.1). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+- CPU: 28 suites, **7217 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

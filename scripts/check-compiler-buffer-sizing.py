@@ -19,6 +19,9 @@ WITH ITS LENGTH IN BYTES, and derives its capacity from the length:
     gfx9_compile(cc, spirv, n, isa, isa_len, desc)
     gfx9_cc_buf(cc, CC_X, buf, len)                                src/gfx9_compile.cyr
     sm75_isel(m, out, out_len)                                     src/sm75_isel.cyr (N9)
+    sm75_regalloc(m, isel, n, alloc, alloc_len, hw)                src/sm75_regalloc.cyr
+    sm75_emit(isel, n, alloc, sass, sass_len), sm75_compile(cc, spirv, n, sass, sass_len, desc),
+    sm75_compile_spirv(words, n, sass, sass_len, desc)             src/sm75_compile.cyr
 
 So a callee can no longer write past a buffer whose length it was told. What it
 cannot check is whether the length is TRUE: a caller that declares `var vals[1024]`
@@ -73,6 +76,10 @@ CONTRACT = {
     "gfx9_compile": (6, [(3, 4)]),
     "gfx9_cc_buf": (4, [(2, 3)]),
     "sm75_isel": (3, [(1, 2)]),
+    "sm75_regalloc": (6, [(3, 4)]),
+    "sm75_emit": (5, [(3, 4)]),
+    "sm75_compile": (6, [(3, 4)]),
+    "sm75_compile_spirv": (5, [(2, 3)]),
 }
 
 DECL = re.compile(r"\bvar\s+(\w+)\s*\[\s*(\d+)\s*\]")

@@ -25926,6 +25926,319 @@ fn sm75_isel(m, out, out_len): i64 {
     return load64(&st);
 }
 
+# --- sm75_regalloc.cyr ---
+
+# @internal — N9.3: register allocation for the SPIR-V → SASS (SM75) compiler.
+# sm75_regalloc.cyr — maps the MIR <id>s in sm75_isel's records to physical GPRs. One file
+# (R0..R254; R255 is RZ, which operand <id> 0 already means), linear scan in record order.
+# docs/proposals/n9-spirv-to-sass.md §4.
+#
+# The rules gfx9_regalloc learned, applied here from the start:
+#   - an operand flagged MIR_FLAG_{A,B,C}_IMM is a value, not a register use;
+#   - a DEAD load keeps its register to the end of the program: a load writes its register
+#     whenever memory returns, so a register freed at the def could be claimed by the next
+#     value and then overwritten (the 4.4.0 phi-swap finding on GFX9).
+# Branches, and with them the loop-liveness extension and the allocate-once rule for phi
+# re-definitions, arrive with N9.5. The selector refuses branches until then
+# (SM75_ERR_CONTROL_FLOW), so straight-line liveness is exact here.
+#
+# The per-<id> table reuses gfx9_regalloc's record (RA_REC: +0 physical register, +8 last
+# use) and its _ra_claim free-at scan.
+
+var SM75_ERR_REG_OVERFLOW = 135;   # more simultaneously live values than R0..R254
+var SM75_ERR_ALLOC_SHORT  = 136;   # alloc[] shorter than the module's cap_ids records
+var SM75_GPR_CAP = 255;            # R0..R254 allocatable; R255 = RZ
+
+# Volta+ burns two GPRs per thread for the program counter (NAK sm70.rs hw_reserved_gprs,
+# citing the Volta whitepaper), and the QMD's REGISTER_COUNT must include them, with a floor
+# of 4: count = max(4, used + 2). Matches ptxas for the captured store_deadbeef (R0..R1 used,
+# REGISTER_COUNT 4).
+fn sm75_register_count(used): i64 {
+    var c = used + 2;
+    if (c < 4) { c = 4; }
+    return c;
+}
+
+# 1 if record op `op` writes a GPR result (its dst <id>).
+fn _s75_writes_gpr(op): i64 {
+    if (op == SM75I_ISETP) { return 0; }
+    if (op == SM75I_STG) { return 0; }
+    if (op == SM75I_ULDC) { return 0; }
+    if (op == SM75I_EXIT) { return 0; }
+    return 1;
+}
+
+fn _s75_use(m, alloc, id, i): i64 {
+    if (id <= 0) { return 0; }
+    if (id >= load64(m + 64)) { return 0; }
+    if (i > load64(alloc + id * RA_REC + 8)) { store64(alloc + id * RA_REC + 8, i); }
+    return 0;
+}
+
+# Allocate a GPR to every result in `isel` (n records). `alloc` (`alloc_len` bytes) must hold
+# the module's cap_ids RA_REC records; `hw` gets the GPR high-water at +0 (registers used).
+# Returns 0 or a NEGATIVE error.
+fn sm75_regalloc(m, isel, n, alloc, alloc_len, hw): i64 {
+    var cap_ids = load64(m + 64);
+    if (cap_ids <= 0) { return 0 - SM75_ERR_ALLOC_SHORT; }
+    if (cap_ids > alloc_len / RA_REC) { return 0 - SM75_ERR_ALLOC_SHORT; }
+    memset(alloc, 0xFF, cap_ids * RA_REC);
+    # Pass 1: intervals. A result is live from its record to its last use.
+    var i = 0;
+    while (i < n) {
+        var d = sm75i_dst(isel, i);
+        if (d > 0) {
+            if (d >= cap_ids) { return 0 - SM75_ERR_BAD_OPERAND; }
+            if (i > load64(alloc + d * RA_REC + 8)) { store64(alloc + d * RA_REC + 8, i); }
+        }
+        var fl = sm75i_flags(isel, i);
+        if ((fl & MIR_FLAG_A_IMM) == 0) { _s75_use(m, alloc, sm75i_a(isel, i), i); }
+        if ((fl & MIR_FLAG_B_IMM) == 0) { _s75_use(m, alloc, sm75i_b(isel, i), i); }
+        if ((fl & MIR_FLAG_C_IMM) == 0) { _s75_use(m, alloc, sm75i_c(isel, i), i); }
+        i = i + 1;
+    }
+    # Pass 1b: a dead load (no use after its def) keeps its register to the end.
+    i = 0;
+    while (i < n) {
+        if (sm75i_op(isel, i) == SM75I_LDG) {
+            var ld = sm75i_dst(isel, i);
+            if (ld > 0) { if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n); } }
+        }
+        i = i + 1;
+    }
+    # Pass 2: claim the lowest register free at each definition.
+    var freeat[2048];   # SM75_GPR_CAP (255) + 1 i64
+    memset(&freeat, 0, 2048);
+    var high = 0;
+    i = 0;
+    while (i < n) {
+        var op2 = sm75i_op(isel, i);
+        var d2 = sm75i_dst(isel, i);
+        if (d2 > 0) {
+            if (_s75_writes_gpr(op2) == 1) {
+                if (load64(alloc + d2 * RA_REC + 0) == 0 - 1) {
+                    var r = _ra_claim(&freeat, 0, SM75_GPR_CAP, i, load64(alloc + d2 * RA_REC + 8) + 1);
+                    if (r < 0) { return 0 - SM75_ERR_REG_OVERFLOW; }
+                    store64(alloc + d2 * RA_REC + 0, r);
+                    if (r + 1 > high) { high = r + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    store64(hw, high);
+    return 0;
+}
+
+# The physical register of operand `id` after sm75_regalloc: RZ for <id> 0.
+fn sm75_reg(alloc, id): i64 {
+    if (id <= 0) { return SM75_RZ; }
+    return load64(alloc + id * RA_REC + 0);
+}
+
+# --- sm75_compile.cyr ---
+
+# @internal — N9.3: SM75 emission, scheduling and the compile driver.
+# sm75_compile.cyr — the gfx9_compile.cyr analogue for NVIDIA: SPIR-V -> SASS through the
+# shared front end, sm75_isel, sm75_regalloc and the encoders in sm75_encode.cyr.
+# docs/proposals/n9-spirv-to-sass.md §2, §5.
+#
+# SCHEDULING (§5) is deliberately conservative in v1, because a wrong control word fails
+# silently (garbage or a hang) rather than with an error:
+#   - every instruction stalls 15 cycles, longer than any SM75 fixed latency (yield clear:
+#     stall 15 with yield set is not a valid encoding — nvdisasm rejects 0x1F);
+#   - a variable-latency op (NAK's "decoupled" class: S2R, LDG, MUFU, I2F, F2I, FRND) sets
+#     write scoreboard 0, and the NEXT instruction waits on it;
+#   - STG reads its sources late: it sets read scoreboard 1 and the next instruction waits.
+# That serializes the program. Tightening it from NAK's SM75 latency tables is named in §7.
+#
+# LAYOUT. One instruction per record, then — as ptxas lays out every kernel, and as the
+# captured ones in backend_nvidia_sass.cyr show — a BRA to itself after the last EXIT (a
+# trap for anything that falls through) and NOPs to a 128-byte boundary (the instruction
+# fetch reads ahead).
+
+var SM75_ERR_SASS_OVERFLOW = 137;  # the program would not fit the caller's sass_len
+
+# Compile output descriptor (caller buffer, SM75_DESC_SIZE bytes).
+var SM75_DESC_LEN   = 0;    # SASS byte length (a multiple of 128)
+var SM75_DESC_REGS  = 8;    # the QMD REGISTER_COUNT (sm75_register_count)
+var SM75_DESC_NBIND = 16;   # binding pointers the kernel reads (NV_SHMOD_NBIND)
+var SM75_DESC_SIZE  = 24;
+
+# 1 for a variable-latency ("decoupled") op: its result is tracked by a scoreboard.
+fn _s75_decoupled(op): i64 {
+    if (op == SM75I_S2R) { return 1; }
+    if (op == SM75I_LDG) { return 1; }
+    if (op == SM75I_MUFU) { return 1; }
+    if (op == SM75I_I2F) { return 1; }
+    if (op == SM75I_F2I) { return 1; }
+    if (op == SM75I_FRND) { return 1; }
+    return 0;
+}
+
+# The operand kind of record slot a / b / c: an immediate when its flag is set.
+fn _s75_k(fl, bit): i64 {
+    if ((fl & bit) != 0) { return SM75_K_IMM; }
+    return SM75_K_REG;
+}
+
+# A register-or-immediate operand's encoded value.
+fn _s75_v(alloc, fl, bit, field): i64 {
+    if ((fl & bit) != 0) { return field & 0xFFFFFFFF; }
+    return sm75_reg(alloc, field);
+}
+
+# Encode record i into `ins` with physical registers. Returns 0 or a negative error.
+fn _s75_encode(isel, i, alloc, ins): i64 {
+    var op = sm75i_op(isel, i);
+    var fl = sm75i_flags(isel, i);
+    var d = sm75_reg(alloc, sm75i_dst(isel, i));
+    var a = sm75_reg(alloc, sm75i_a(isel, i));
+    var bk = _s75_k(fl, MIR_FLAG_B_IMM);
+    var b = _s75_v(alloc, fl, MIR_FLAG_B_IMM, sm75i_b(isel, i));
+    var ck = _s75_k(fl, MIR_FLAG_C_IMM);
+    var c = _s75_v(alloc, fl, MIR_FLAG_C_IMM, sm75i_c(isel, i));
+    var mods = fl >> 8;
+    if (op == SM75I_IADD3) { return sm75_enc_iadd3(ins, d, a, b, bk, c, ck, mods & 1); }
+    if (op == SM75I_IMAD) { return sm75_enc_imad(ins, SM75_OP_IMAD, d, a, b, bk, c, ck, mods & 1); }
+    if (op == SM75I_IMAD_HI) { return sm75_enc_imad(ins, SM75_OP_IMADHI, d, a, b, bk, c, ck, 0); }
+    if (op == SM75I_LOP3) { return sm75_enc_lop3(ins, d, a, b, bk, c, ck, mods & 0xFF); }
+    if (op == SM75I_SHF) {
+        return sm75_enc_shf(ins, d, a, b, bk, c, mods & 3, (mods >> 2) & 1, (mods >> 3) & 1);
+    }
+    if (op == SM75I_ISETP) { return sm75_enc_isetp(ins, 0, a, b, bk, mods & 7, (mods >> 3) & 1); }
+    if (op == SM75I_SEL) { return sm75_enc_sel(ins, d, a, b, bk, 0, mods & 1); }
+    if (op == SM75I_MOV) { return sm75_enc_mov(ins, d, b, bk); }
+    if (op == SM75I_FADD) { return sm75_enc_fadd(ins, d, a, b, bk, mods & 1); }
+    if (op == SM75I_FMUL) { return sm75_enc_fmul(ins, d, a, b, bk); }
+    if (op == SM75I_FFMA) { return sm75_enc_ffma(ins, d, a, b, bk, c, ck); }
+    if (op == SM75I_FMNMX) { return sm75_enc_fmnmx(ins, d, a, b, bk, mods & 1); }
+    if (op == SM75I_FRND) { return sm75_enc_frnd(ins, d, b, bk, mods & 3); }
+    if (op == SM75I_F2I) { return sm75_enc_f2i(ins, d, b, bk, (mods >> 2) & 1, mods & 3); }
+    if (op == SM75I_I2F) { return sm75_enc_i2f(ins, d, b, bk, (mods >> 2) & 1); }
+    if (op == SM75I_MUFU) { return sm75_enc_mufu(ins, d, b, bk, mods & 0x3F); }
+    if (op == SM75I_S2R) { return sm75_enc_s2r(ins, d, mods & 0xFF); }
+    if (op == SM75I_ULDC) { return sm75_enc_uldc64(ins, sm75i_a(isel, i), 0, sm75i_b(isel, i)); }
+    if (op == SM75I_LDG) { return sm75_enc_ldg32(ins, d, a, mods & 0x3F, sm75i_b(isel, i)); }
+    if (op == SM75I_STG) {
+        # sm75_enc_stg32(ins, offset, UR, data, imm) — the nvdisasm round trip caught these
+        # two swapped (`[R1.U32+UR2], R6` for `[R1.U32+UR6], R2`)
+        return sm75_enc_stg32(ins, a, mods & 0x3F, sm75_reg(alloc, sm75i_b(isel, i)), sm75i_c(isel, i));
+    }
+    if (op == SM75I_EXIT) { return sm75_enc_exit(ins); }
+    return 0 - SM75_ERR_UNSUPPORTED_OP;
+}
+
+# Encode `n` records into `sass` (`sass_len` bytes) with the v1 schedule, then the tail.
+# Returns the byte length (a multiple of 128) or a negative error.
+fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
+    # n instructions + BRA + up to 7 NOPs of padding
+    var total = n + 1;
+    if ((total % 8) != 0) { total = total + (8 - total % 8); }
+    if (total * SM75_INS > sass_len) { return 0 - SM75_ERR_SASS_OVERFLOW; }
+    var wait = 0;
+    var i = 0;
+    while (i < n) {
+        var ins = sass + i * SM75_INS;
+        var rc = _s75_encode(isel, i, alloc, ins);
+        if (rc < 0) { return rc; }
+        var op = sm75i_op(isel, i);
+        var wr = 7;
+        var rd = 7;
+        var next = 0;
+        if (_s75_decoupled(op) == 1) { wr = 0; next = next | 1; }
+        if (op == SM75I_STG) { rd = 1; next = next | 2; }
+        sm75_set_ctrl(ins, 15, 0, wr, rd, wait, 0);
+        wait = next;
+        i = i + 1;
+    }
+    # BRA to itself (-4 words from the next instruction), then NOP padding.
+    var tb = sass + n * SM75_INS;
+    sm75_enc_bra(tb, 0 - 4);
+    sm75_set_ctrl(tb, 15, 0, 7, 7, wait, 0);
+    var j = n + 1;
+    while (j < total) {
+        var np = sass + j * SM75_INS;
+        sm75_enc_nop(np);
+        sm75_set_ctrl(np, 15, 0, 7, 7, 0, 0);
+        j = j + 1;
+    }
+    return total * SM75_INS;
+}
+
+# ================================================================
+# Driver: SPIR-V -> SASS + descriptor
+# ================================================================
+# Uses the gfx9_compile context (CC_*): the type / const / decoration tables, CC_OUTBI, an
+# initialized MirMod at CC_M, CC_ISEL for the SM75 records, CC_ALLOC for the register map and
+# CC_HW (>= 8 bytes) for the high-water. Every buffer carries its length (the scratch-buffer
+# contract). Writes the SASS into `sass` (`sass_len` bytes) and [length, register count,
+# binding count] into `desc` (SM75_DESC_SIZE bytes). Returns 0 or a NEGATIVE stage code.
+fn sm75_compile(ctx, spirv, n, sass, sass_len, desc): i64 {
+    if (spirv_validate_stream(spirv, n) != 0) { return 0 - CMP_ERR_VALIDATE; }
+    var types = load64(ctx + CC_TYPES);
+    var consts = load64(ctx + CC_CONSTS);
+    var deco = load64(ctx + CC_DECO);
+    if (spirv_build_type_table(spirv, n, types, load64(ctx + CC_TYPES_LEN)) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_const_table(spirv, n, consts, load64(ctx + CC_CONSTS_LEN)) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_decoration_table(spirv, n, deco, load64(ctx + CC_DECO_LEN)) < 0) { return 0 - CMP_ERR_TABLE; }
+    var m = load64(ctx + CC_M);
+    var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI),
+      load64(ctx + CC_OUTBI_LEN));
+    if (lr < 0) { return lr; }
+    var isel = load64(ctx + CC_ISEL);
+    var k = sm75_isel(m, isel, load64(ctx + CC_ISEL_LEN));
+    if (k < 0) { return k; }
+    var alloc = load64(ctx + CC_ALLOC);
+    var hw = load64(ctx + CC_HW);
+    var rr = sm75_regalloc(m, isel, k, alloc, load64(ctx + CC_ALLOC_LEN), hw);
+    if (rr < 0) { return rr; }
+    var len = sm75_emit(isel, k, alloc, sass, sass_len);
+    if (len < 0) { return len; }
+    store64(desc + SM75_DESC_LEN, len);
+    store64(desc + SM75_DESC_REGS, sm75_register_count(load64(hw)));
+    store64(desc + SM75_DESC_NBIND, sm75_binding_count(m));
+    return 0;
+}
+
+# The compile frame: SPIR-V -> SASS with all scratch on this stack, sized for 256 ids (the
+# NATIVE_SHADER_CAP_IDS ceiling the AMD path uses). Pure CPU — no context, no ioctl — so the
+# CPU suite drives it, and the NVIDIA backend's SPIR-V module create (N9.4) calls it. Like
+# _native_compile_spirv_isa, it screens the module first so a bad module reports
+# CMP_ERR_VALIDATE / CMP_ERR_TABLE rather than mir_mod_init's code. Every length is the literal
+# beside its `var` (scripts/check-compiler-buffer-sizing.py).
+fn sm75_compile_spirv(words, n, sass, sass_len, desc): i64 {
+    if (words == 0) { return 0 - CMP_ERR_VALIDATE; }
+    if (n < 20) { return 0 - CMP_ERR_VALIDATE; }
+    if (spirv_validate_stream(words, n) != 0) { return 0 - CMP_ERR_VALIDATE; }
+    var idb = spirv_hdr_id_bound(words);
+    if (idb > 256) { return 0 - CMP_ERR_TABLE; }
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
+    var m[80];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[4096];      # 128 * MIR_PTR_REC(32)
+    var blocks[32];
+    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
+    if (mr < 0) { return mr; }
+    var isel[24576];     # 512 * SM75I_REC(48)
+    var alloc[4096];     # 256 * RA_REC(16)
+    var hw[16];
+    var cc[136];         # CC_SIZE
+    gfx9_cc_buf(&cc, CC_TYPES, &types, 6144);
+    gfx9_cc_buf(&cc, CC_CONSTS, &consts, 4096);
+    gfx9_cc_buf(&cc, CC_DECO, &deco, 4096);
+    gfx9_cc_buf(&cc, CC_OUTBI, &outbi, 2048);
+    gfx9_cc_buf(&cc, CC_ISEL, &isel, 24576);
+    gfx9_cc_buf(&cc, CC_ALLOC, &alloc, 4096);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_HW, &hw);
+    return sm75_compile(&cc, words, n, sass, sass_len, desc);
+}
+
 # --- backend_nvidia_push.cyr ---
 
 # @internal — native NVIDIA backend, pushbuffer / method-stream builders
@@ -28902,7 +29215,7 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
 #   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
 #   70-88   encoding / validation / table build              (src/gfx9_compile.cyr)
 #   100-106 instruction selection                            (src/gfx9_isel.cyr)
-#   130-134 SM75 (NVIDIA) instruction selection              (src/sm75_isel.cyr)
+#   130-137 SM75 (NVIDIA) selection / regalloc / emit         (src/sm75_*.cyr)
 #   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
 fn gpu_shader_error_name(code): i64 {
     if (code == 0) { return "no error"; }
@@ -28979,6 +29292,9 @@ fn gpu_shader_error_name(code): i64 {
     if (c == SM75_ERR_CONTROL_FLOW) { return "sm75 isel: branches are not compiled for NVIDIA yet (N9.5)"; }
     if (c == SM75_ERR_BAD_OPERAND) { return "sm75 isel: an operand of a kind the instruction cannot take"; }
     if (c == SM75_ERR_TOO_MANY_BINDINGS) { return "sm75 isel: binding index at or past 16"; }
+    if (c == SM75_ERR_REG_OVERFLOW) { return "sm75 regalloc: more live values than R0..R254"; }
+    if (c == SM75_ERR_ALLOC_SHORT) { return "sm75 regalloc: alloc[] shorter than cap_ids records"; }
+    if (c == SM75_ERR_SASS_OVERFLOW) { return "sm75 emit: SASS would not fit the output buffer"; }
     if (c == GISEL_ERR_COND_NOT_COMPARE) {
         return "isel: branch / select condition is not an integer or OpFOrd compare result";
     }

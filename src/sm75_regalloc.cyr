@@ -1,0 +1,107 @@
+# @internal — N9.3: register allocation for the SPIR-V → SASS (SM75) compiler.
+# sm75_regalloc.cyr — maps the MIR <id>s in sm75_isel's records to physical GPRs. One file
+# (R0..R254; R255 is RZ, which operand <id> 0 already means), linear scan in record order.
+# docs/proposals/n9-spirv-to-sass.md §4.
+#
+# The rules gfx9_regalloc learned, applied here from the start:
+#   - an operand flagged MIR_FLAG_{A,B,C}_IMM is a value, not a register use;
+#   - a DEAD load keeps its register to the end of the program: a load writes its register
+#     whenever memory returns, so a register freed at the def could be claimed by the next
+#     value and then overwritten (the 4.4.0 phi-swap finding on GFX9).
+# Branches, and with them the loop-liveness extension and the allocate-once rule for phi
+# re-definitions, arrive with N9.5. The selector refuses branches until then
+# (SM75_ERR_CONTROL_FLOW), so straight-line liveness is exact here.
+#
+# The per-<id> table reuses gfx9_regalloc's record (RA_REC: +0 physical register, +8 last
+# use) and its _ra_claim free-at scan.
+
+var SM75_ERR_REG_OVERFLOW = 135;   # more simultaneously live values than R0..R254
+var SM75_ERR_ALLOC_SHORT  = 136;   # alloc[] shorter than the module's cap_ids records
+var SM75_GPR_CAP = 255;            # R0..R254 allocatable; R255 = RZ
+
+# Volta+ burns two GPRs per thread for the program counter (NAK sm70.rs hw_reserved_gprs,
+# citing the Volta whitepaper), and the QMD's REGISTER_COUNT must include them, with a floor
+# of 4: count = max(4, used + 2). Matches ptxas for the captured store_deadbeef (R0..R1 used,
+# REGISTER_COUNT 4).
+fn sm75_register_count(used): i64 {
+    var c = used + 2;
+    if (c < 4) { c = 4; }
+    return c;
+}
+
+# 1 if record op `op` writes a GPR result (its dst <id>).
+fn _s75_writes_gpr(op): i64 {
+    if (op == SM75I_ISETP) { return 0; }
+    if (op == SM75I_STG) { return 0; }
+    if (op == SM75I_ULDC) { return 0; }
+    if (op == SM75I_EXIT) { return 0; }
+    return 1;
+}
+
+fn _s75_use(m, alloc, id, i): i64 {
+    if (id <= 0) { return 0; }
+    if (id >= load64(m + 64)) { return 0; }
+    if (i > load64(alloc + id * RA_REC + 8)) { store64(alloc + id * RA_REC + 8, i); }
+    return 0;
+}
+
+# Allocate a GPR to every result in `isel` (n records). `alloc` (`alloc_len` bytes) must hold
+# the module's cap_ids RA_REC records; `hw` gets the GPR high-water at +0 (registers used).
+# Returns 0 or a NEGATIVE error.
+fn sm75_regalloc(m, isel, n, alloc, alloc_len, hw): i64 {
+    var cap_ids = load64(m + 64);
+    if (cap_ids <= 0) { return 0 - SM75_ERR_ALLOC_SHORT; }
+    if (cap_ids > alloc_len / RA_REC) { return 0 - SM75_ERR_ALLOC_SHORT; }
+    memset(alloc, 0xFF, cap_ids * RA_REC);
+    # Pass 1: intervals. A result is live from its record to its last use.
+    var i = 0;
+    while (i < n) {
+        var d = sm75i_dst(isel, i);
+        if (d > 0) {
+            if (d >= cap_ids) { return 0 - SM75_ERR_BAD_OPERAND; }
+            if (i > load64(alloc + d * RA_REC + 8)) { store64(alloc + d * RA_REC + 8, i); }
+        }
+        var fl = sm75i_flags(isel, i);
+        if ((fl & MIR_FLAG_A_IMM) == 0) { _s75_use(m, alloc, sm75i_a(isel, i), i); }
+        if ((fl & MIR_FLAG_B_IMM) == 0) { _s75_use(m, alloc, sm75i_b(isel, i), i); }
+        if ((fl & MIR_FLAG_C_IMM) == 0) { _s75_use(m, alloc, sm75i_c(isel, i), i); }
+        i = i + 1;
+    }
+    # Pass 1b: a dead load (no use after its def) keeps its register to the end.
+    i = 0;
+    while (i < n) {
+        if (sm75i_op(isel, i) == SM75I_LDG) {
+            var ld = sm75i_dst(isel, i);
+            if (ld > 0) { if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n); } }
+        }
+        i = i + 1;
+    }
+    # Pass 2: claim the lowest register free at each definition.
+    var freeat[2048];   # SM75_GPR_CAP (255) + 1 i64
+    memset(&freeat, 0, 2048);
+    var high = 0;
+    i = 0;
+    while (i < n) {
+        var op2 = sm75i_op(isel, i);
+        var d2 = sm75i_dst(isel, i);
+        if (d2 > 0) {
+            if (_s75_writes_gpr(op2) == 1) {
+                if (load64(alloc + d2 * RA_REC + 0) == 0 - 1) {
+                    var r = _ra_claim(&freeat, 0, SM75_GPR_CAP, i, load64(alloc + d2 * RA_REC + 8) + 1);
+                    if (r < 0) { return 0 - SM75_ERR_REG_OVERFLOW; }
+                    store64(alloc + d2 * RA_REC + 0, r);
+                    if (r + 1 > high) { high = r + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    store64(hw, high);
+    return 0;
+}
+
+# The physical register of operand `id` after sm75_regalloc: RZ for <id> 0.
+fn sm75_reg(alloc, id): i64 {
+    if (id <= 0) { return SM75_RZ; }
+    return load64(alloc + id * RA_REC + 0);
+}

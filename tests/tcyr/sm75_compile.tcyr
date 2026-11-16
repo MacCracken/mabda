@@ -1,0 +1,162 @@
+# tests/tcyr/sm75_compile.tcyr — N9.3: SM75 register allocation, scheduling, layout and the
+# compile driver (docs/proposals/n9-spirv-to-sass.md §4-5). The whole programs these build
+# were also round-tripped through `nvdisasm -b SM75` on chew (CUDA 13.4, 2026-11-16): every
+# kernel decoded without error, and the round trip caught STG's UR and data registers
+# swapped — pinned below.
+include "tests/tcyr/compiler_common.cyr"
+include "tests/tcyr/spirv_cf_kernels.cyr"
+
+fn _cfk2(name, spv): i64 {
+    var k = 0;
+    while (k < CFK_COUNT) {
+        if (streq(cfk_name(k), name) == 1) { return cfk_build(k, spv); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn test_sm75_register_count() {
+    assert_eq(sm75_register_count(0), 4, "floor of 4");
+    assert_eq(sm75_register_count(2), 4, "R0..R1 + 2 PC registers = 4 (ptxas store_deadbeef)");
+    assert_eq(sm75_register_count(3), 5, "3 used -> 5");
+    assert_eq(sm75_register_count(8), 10, "8 used -> 10");
+    return 0;
+}
+
+# Hand-built records: reuse after the last use, the dead-load rule, the alloc[] bound.
+fn test_sm75_regalloc_rules() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    var i = 3;
+    while (i < 12) { _mir_set_val(&m, i, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0); i = i + 1; }
+    var isel[960];
+    _gisel_emit(&isel, 0, SM75I_S2R, 3, 0, 0, 0, SM75_SR_TID_X << 8);         # v3 = tid
+    _gisel_emit(&isel, 1, SM75I_IADD3, 4, 3, 1, 0, MIR_FLAG_B_IMM);            # v4 = v3 + 1   (v3's last use)
+    _gisel_emit(&isel, 2, SM75I_IADD3, 5, 4, 1, 0, MIR_FLAG_B_IMM);            # v5 = v4 + 1   (v4's last use)
+    _gisel_emit(&isel, 3, SM75I_LDG, 6, 5, 0, 0, MIR_FLAG_B_IMM | (4 << 8));   # v6 = load      (dead)
+    _gisel_emit(&isel, 4, SM75I_MOV, 7, 0, 9, 0, MIR_FLAG_B_IMM);              # v7 = 9
+    _gisel_emit(&isel, 5, SM75I_STG, 0, 5, 7, 0, MIR_FLAG_C_IMM | (4 << 8));   # [v5] = v7
+    _gisel_emit(&isel, 6, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];      # cap_ids 32 (vals 1280 / 40) * RA_REC 16
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 7, &alloc, 512, &hw), 0, "regalloc ok");
+    assert_eq(sm75_reg(&alloc, 3), 0, "v3 in R0");
+    assert_eq(sm75_reg(&alloc, 4), 1, "v4 in R1 (R0 is busy until v3's last use has passed)");
+    assert_eq(sm75_reg(&alloc, 5), 0, "v5 reuses R0, free after v3's last use");
+    assert_eq(sm75_reg(&alloc, 6), 1, "v6 (the dead load) takes R1");
+    assert_neq(sm75_reg(&alloc, 7), 1, "v7 does NOT reuse the dead load's R1 (it could land late)");
+    assert_eq(sm75_reg(&alloc, 0), SM75_RZ, "<id> 0 is RZ");
+    assert_eq(load64(&hw) <= 3, 1, "at most R0..R2 used");
+    assert_eq(sm75_regalloc(&m, &isel, 7, &alloc, 511, &hw), 0 - SM75_ERR_ALLOC_SHORT,
+      "alloc[] one byte short of cap_ids records");
+    return 0;
+}
+
+# A whole kernel: layout, register count, binding count, and every control word.
+fn test_sm75_compile_saxpy() {
+    var spv[640];
+    var n = _spv_build_saxpy_gid(&spv);
+    var sass[4096];
+    var desc[24];
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0, "saxpy (GlobalInvocationId) compiles to SASS");
+    var len = load64(&desc + SM75_DESC_LEN);
+    assert_eq(len % 128, 0, "the program is a multiple of 128 bytes");
+    assert_eq(load64(&desc + SM75_DESC_NBIND), 2, "two binding pointers");
+    assert_eq(load64(&desc + SM75_DESC_REGS), 6, "R0..R3 + the two PC registers");
+    assert_eq(sm75_get(&sass, 0, 12), SM75_OP_ULDC, "starts with binding 0's ULDC.64");
+    assert_eq(sm75_get(&sass + 16, 0, 12), SM75_OP_ULDC, "then binding 1's");
+    # find EXIT; it is followed by BRA-to-self, then NOPs to the end
+    var nins = len / 16;
+    var ex = 0 - 1;
+    var i = 0;
+    while (i < nins) {
+        if (sm75_get(&sass + i * 16, 0, 12) == SM75_OP_EXIT) { ex = i; }
+        i = i + 1;
+    }
+    assert_eq(ex > 0, 1, "an EXIT");
+    assert_eq(sm75_get(&sass + (ex + 1) * 16, 0, 12), SM75_OP_BRA, "a BRA after the last EXIT");
+    assert_eq(sm75_get(&sass + (ex + 1) * 16, 34, 48), 0xFFFFFFFFFFFC, "to itself (-4 words)");
+    var pad_ok = 1;
+    i = ex + 2;
+    while (i < nins) {
+        if (sm75_get(&sass + i * 16, 0, 12) != SM75_OP_NOP) { pad_ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(pad_ok, 1, "NOPs to the 128-byte boundary");
+    # the v1 schedule: stall 15, yield clear; a decoupled op writes scoreboard 0 and the next
+    # instruction waits on it; STG sets read scoreboard 1 and the next instruction waits on it
+    var sched_ok = 1;
+    var want_wait = 0;
+    var saw_dec = 0;
+    var saw_stg = 0;
+    i = 0;
+    while (i < nins) {
+        var ins = &sass + i * 16;
+        var op = sm75_get(ins, 0, 12);
+        if (sm75_get(ins, 105, 4) != 15) { sched_ok = 0; }
+        if (sm75_get(ins, 109, 1) != 0) { sched_ok = 0; }
+        if (sm75_get(ins, 116, 6) != want_wait) { sched_ok = 0; }
+        want_wait = 0;
+        var dec = 0;
+        if (op == SM75_OP_S2R) { dec = 1; }
+        if (op == SM75_OP_LDG) { dec = 1; }
+        if (dec == 1) {
+            saw_dec = 1;
+            if (sm75_get(ins, 110, 3) != 0) { sched_ok = 0; }
+            want_wait = want_wait | 1;
+        } else {
+            if (sm75_get(ins, 110, 3) != 7) { sched_ok = 0; }
+        }
+        if (op == SM75_OP_STG) {
+            saw_stg = 1;
+            if (sm75_get(ins, 113, 3) != 1) { sched_ok = 0; }
+            want_wait = want_wait | 2;
+            # binding 1 (y) is UR6; the data is a register, not UR's number
+            assert_eq(sm75_get(ins, 64, 6), 6, "STG through UR6 (binding 1)");
+        }
+        i = i + 1;
+    }
+    assert_eq(saw_dec, 1, "S2R / LDG present");
+    assert_eq(saw_stg, 1, "STG present");
+    assert_eq(sched_ok, 1, "every control word follows the v1 schedule");
+    return 0;
+}
+
+fn test_sm75_compile_kernels_and_limits() {
+    var spv[1680];
+    var sass[4096];
+    var desc[24];
+    var n = _cfk2("sel_uniform_two_literals", &spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0, "sel_uniform_two_literals compiles");
+    n = _cfk2("sel_div_not_adjacent", &spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0, "sel_div_not_adjacent compiles");
+    n = _cfk2("sel_then_branch_same_cmp", &spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0 - SM75_ERR_CONTROL_FLOW,
+      "a kernel with a branch: N9.5");
+    # a 256-byte program does not fit 128 bytes, and nothing is written past them
+    n = _cfk2("sel_div_adjacent", &spv);
+    memset(&sass, 0xEE, 4096);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 128, &desc), 0 - SM75_ERR_SASS_OVERFLOW, "128 bytes: refused");
+    assert_eq(load8(&sass + 0), 0xEE, "and nothing written");
+    assert_eq(sm75_compile_spirv(0, 84, &sass, 4096, &desc), 0 - CMP_ERR_VALIDATE, "null words");
+    var unk = gpu_shader_error_name(0 - 9999);
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_REG_OVERFLOW), unk, "SM75_ERR_REG_OVERFLOW named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_ALLOC_SHORT), unk, "SM75_ERR_ALLOC_SHORT named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_SASS_OVERFLOW), unk, "SM75_ERR_SASS_OVERFLOW named");
+    return 0;
+}
+
+fn main(): i64 {
+    test_sm75_register_count();
+    test_sm75_regalloc_rules();
+    test_sm75_compile_saxpy();
+    test_sm75_compile_kernels_and_limits();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -19,6 +19,23 @@ if [ ! -x "$NVDISASM" ]; then
     echo "nvdisasm not found (install: sudo pacman -S cuda)"; exit 2
 fi
 
+# File mode (N9.3): `scripts/disasm-sass.sh <sass.bin>...` disassembles raw SM75 programs —
+# e.g. sm75_compile_spirv output written to disk — and fails if nvdisasm reports any error.
+# This is the whole-program round trip of docs/proposals/n9-spirv-to-sass.md §6.
+if [ "$#" -gt 0 ]; then
+    rc=0
+    for f in "$@"; do
+        echo "=== $f"
+        out="$("$NVDISASM" -b SM75 "$f" 2>&1)" || rc=1
+        printf '%s\n' "$out" | grep -E '/\*[0-9a-f]{4}\*/' | sed -E 's#/\* 0x[0-9a-f]+ \*/##g; s/ +/ /g'
+        if printf '%s\n' "$out" | grep -q 'error'; then
+            printf '%s\n' "$out" | grep 'error'
+            rc=1
+        fi
+    done
+    exit "$rc"
+fi
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/sass.bin"

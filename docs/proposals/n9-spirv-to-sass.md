@@ -45,8 +45,10 @@ with its byte length, capacities derived):
 - `src/sm75_encode.cyr` — the 128-bit instruction builder and one encoder per instruction form.
 - `src/sm75_isel.cyr` — MIR → SM75 instruction records (the 48-byte GISEL record shape, SM75 op tags).
 - `src/sm75_regalloc.cyr` — one GPR file (R0..R254, RZ = R255) plus predicates.
-- `src/sm75_sched.cyr` — control words (stall / yield / scoreboards / wait mask).
-- `src/sm75_compile.cyr` — the driver `sm75_compile(cc, spirv, n, sass, sass_len, desc)`.
+- `src/sm75_compile.cyr` — emission with the control words (stall / yield / scoreboards / wait
+  mask; the v1 schedule is small enough to live with the emitter rather than in a separate
+  `sm75_sched.cyr`), the driver `sm75_compile(cc, spirv, n, sass, sass_len, desc)`, and
+  `sm75_compile_spirv`, the CPU compile frame.
 - In `src/backend_nvidia.cyr`: `_nv_compile_spirv_sass` (the pure-CPU compile frame, the
   `_native_compile_spirv_isa` analogue), and `shader_module_create` accepting `SHADER_SRC_SPIRV`.
 
@@ -108,10 +110,10 @@ Linear scan over the selected list, one GPR file, with the 4.4.0 rules:
 - each value is allocated once (phi re-definitions share the register);
 - a dead load keeps its register to the end (a load lands whenever memory returns).
 
-R1 (the stack pointer in the CUDA ABI) is reserved, so N9 kernels have no local memory. The
-register count goes to the QMD's `REGISTER_COUNT_V`. Turing allocates registers per thread in
-granules, and NAK and ptxas round the count; the rounding rule is pinned against `cuobjdump
---dump-resource-usage` in N9.3.
+N9 kernels use no local memory, so R1 (the CUDA ABI's stack pointer) is not set up and is
+allocated like any other register. The QMD's `REGISTER_COUNT_V` is `max(4, used + 2)`: Volta
+and later burn two GPRs per thread for the program counter (NAK `hw_reserved_gprs`). That
+matches ptxas's 4 for the captured `store_deadbeef` (pinned in N9.3).
 
 ## 5. Scheduling (control words)
 
