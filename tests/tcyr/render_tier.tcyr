@@ -1,0 +1,906 @@
+# tests/tcyr/render_tier.tcyr — the render tier (v4.3.0, MB1 parts C-E)
+#
+# Public constants (src/gpu_types.cyr), the bind group layout / bind group /
+# sampler-object builders (src/gpu_bind.cyr), and the wgpu backend's descriptor
+# bytes (src/backend_wgpu_rtier.cyr), checked against webgpu.h v29 offsets taken
+# with offsetof. HW: programs/render_tier_e2e.cyr.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ---------------------------------------------------------------------------
+# mock wgpu
+# ---------------------------------------------------------------------------
+var _mr_wrong = 0;
+var _mr_create_calls = 0;
+var _mr_create_desc = 0;
+var _mr_create_ret = 0x4242;
+var _mr_release_calls = 0;
+var _mr_pop_ret = 1;
+
+fn _mr_trap(a, b, c, d, e, f): i64 { _mr_wrong = _mr_wrong + 1; return 0; }
+fn _mr_create(device, desc): i64 {
+    _mr_create_calls = _mr_create_calls + 1;
+    _mr_create_desc = desc;
+    return _mr_create_ret;
+}
+fn _mr_release(h): i64 { _mr_release_calls = _mr_release_calls + 1; return 0; }
+fn _mr_push(device, filter): i64 { return 0; }
+fn _mr_pop(device, buf, cap): i64 {
+    if (buf != 0) { store8(buf, 0); }
+    return _mr_pop_ret;
+}
+
+fn _mr_install(table): i64 {
+    for (var i = 0; i < WGPU_FN_COUNT; i = i + 1) { store64(table + i * 8, &_mr_trap); }
+    store64(table + 18 * 8, &_mr_create);   # create bind group layout
+    store64(table + 20 * 8, &_mr_create);   # create bind group
+    store64(table + 47 * 8, &_mr_create);   # create sampler
+    store64(table + 23 * 8, &_mr_release);  # bind group release
+    store64(table + 24 * 8, &_mr_release);  # bind group layout release
+    store64(table + 51 * 8, &_mr_release);  # sampler release
+    store64(table + 73 * 8, &_mr_push);
+    store64(table + 74 * 8, &_mr_pop);
+    _mr_wrong = 0;
+    _mr_create_calls = 0;
+    _mr_create_desc = 0;
+    _mr_create_ret = 0x4242;
+    _mr_release_calls = 0;
+    _mr_pop_ret = 1;
+    wgpu_ffi_init_table(table);
+    mabda_wgpu_launcher_slots(WGPU_FN_COUNT);
+    gpu_error_clear();
+    return 0;
+}
+
+fn _mr_uninstall(): i64 {
+    wgpu_ffi_init_table(0);
+    mabda_wgpu_launcher_slots(0);
+    gpu_error_clear();
+    return 0;
+}
+
+# A stack ctx whose backend holds the wgpu render-tier slots.
+fn _mr_ctx(ctx, be): i64 {
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 16, 0xD0);
+    store64(ctx + 24, 0xD1);
+    memset(be, 0, BACKEND_SIZE);
+    _backend_wgpu_fill_rtier(be);
+    backend_set_kind(be, BACKEND_KIND_WGPU);
+    store64(ctx + 32, be);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# public constants: webgpu.h v29 values
+# ---------------------------------------------------------------------------
+
+fn test_public_constants_pinned() {
+    assert_eq(GPU_BUFFER_USAGE_MAP_READ, 0x1, "usage MAP_READ");
+    assert_eq(GPU_BUFFER_USAGE_COPY_DST, 0x8, "usage COPY_DST");
+    assert_eq(GPU_BUFFER_USAGE_INDEX, 0x10, "usage INDEX");
+    assert_eq(GPU_BUFFER_USAGE_VERTEX, 0x20, "usage VERTEX");
+    assert_eq(GPU_BUFFER_USAGE_UNIFORM, 0x40, "usage UNIFORM");
+    assert_eq(GPU_BUFFER_USAGE_STORAGE, 0x80, "usage STORAGE");
+    assert_eq(GPU_BUFFER_USAGE_UNIFORM, WGPU_BUFFER_USAGE_UNIFORM, "public usage = wgpu usage");
+    assert_eq(GPU_STAGE_VERTEX | GPU_STAGE_FRAGMENT | GPU_STAGE_COMPUTE, 7, "stage bits");
+    assert_eq(GPU_INDEX_UINT16, 1, "index u16");
+    assert_eq(GPU_INDEX_UINT32, 2, "index u32");
+    assert_eq(GPU_VERTEX_FLOAT32, 0x1C, "Float32");
+    assert_eq(GPU_VERTEX_FLOAT32X2, 0x1D, "Float32x2");
+    assert_eq(GPU_VERTEX_FLOAT32X3, 0x1E, "Float32x3");
+    assert_eq(GPU_VERTEX_FLOAT32X4, 0x1F, "Float32x4");
+    assert_eq(GPU_VERTEX_UINT32X4, 0x23, "Uint32x4 (skinned joints)");
+    assert_eq(GPU_VERTEX_UNORM8X4, 0x09, "Unorm8x4");
+    assert_eq(GPU_STEP_VERTEX, 1, "step vertex");
+    assert_eq(GPU_STEP_INSTANCE, 2, "step instance");
+    assert_eq(GPU_TOPOLOGY_LINE_LIST, 2, "LineList");
+    assert_eq(GPU_TOPOLOGY_TRIANGLE_LIST, 4, "TriangleList");
+    assert_eq(GPU_CULL_NONE, 1, "cull none");
+    assert_eq(GPU_CULL_BACK, 3, "cull back");
+    assert_eq(GPU_FRONT_CCW, 1, "ccw");
+    assert_eq(GPU_BLEND_FACTOR_SRC_ALPHA, 5, "SrcAlpha");
+    assert_eq(GPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, 6, "OneMinusSrcAlpha");
+    assert_eq(GPU_BLEND_FACTOR_CONSTANT, 0x0C, "Constant");
+    assert_eq(GPU_BLEND_OP_ADD, 1, "op add");
+    assert_eq(GPU_BLEND_OP_MAX, 5, "op max");
+    assert_eq(GPU_WRITE_ALL, 0xF, "write all");
+    assert_eq(GPU_COMPARE_LESS, 2, "compare less");
+    assert_eq(GPU_COMPARE_LESS_EQUAL, 4, "compare less-equal");
+    assert_eq(GPU_COMPARE_ALWAYS, 8, "compare always");
+    assert_eq(GPU_FILTER_LINEAR, 2, "filter linear");
+    assert_eq(GPU_ADDRESS_CLAMP, 1, "address clamp");
+    assert_eq(GPU_ADDRESS_MIRROR, 3, "address mirror");
+    assert_eq(GPU_SAMPLE_FLOAT, 2, "sample Float");
+    assert_eq(GPU_SAMPLE_UNFILTERABLE_FLOAT, 3, "sample UnfilterableFloat");
+    assert_eq(GPU_SAMPLE_DEPTH, 4, "sample Depth");
+    assert_eq(GPU_VIEW_2D, 2, "view 2D");
+    assert_eq(GPU_VIEW_CUBE, 4, "view Cube");
+    assert_eq(GPU_SAMPLER_FILTERING, 2, "sampler Filtering");
+    assert_eq(GPU_SAMPLER_COMPARISON, 4, "sampler Comparison");
+    assert_eq(GPU_SAMPLER_FILTER_BILINEAR, NATIVE_SAMP_FILTER_BILINEAR, "gpu_sampler_create alias: bilinear");
+    assert_eq(GPU_SAMPLER_FILTER_POINT, NATIVE_SAMP_FILTER_POINT, "gpu_sampler_create alias: point");
+    assert_eq(GPU_SAMPLER_ADDR_WRAP, NATIVE_SAMP_ADDR_WRAP, "gpu_sampler_create alias: wrap");
+    assert_eq(GPU_SAMPLER_ADDR_CLAMP, NATIVE_SAMP_ADDR_CLAMP, "gpu_sampler_create alias: clamp");
+    return 0;
+}
+
+fn test_vertex_format_size() {
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_FLOAT32X2), 8, "Float32x2 = 8 B");
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_FLOAT32X3), 12, "Float32x3 = 12 B");
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_FLOAT32X4), 16, "Float32x4 = 16 B");
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_UINT32X4), 16, "Uint32x4 = 16 B");
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_UNORM8X4), 4, "Unorm8x4 = 4 B");
+    assert_eq(gpu_vertex_format_size(GPU_VERTEX_FLOAT16X2), 4, "Float16x2 = 4 B");
+    assert_eq(gpu_vertex_format_size(0), 0, "unknown = 0");
+    assert_eq(gpu_vertex_format_size(0x7F), 0, "out of range = 0");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# bind group layout builder
+# ---------------------------------------------------------------------------
+
+fn test_bgl_builder_records() {
+    var l = gpu_bind_group_layout_new();
+    assert_eq(gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX | GPU_STAGE_FRAGMENT, 1, 192), 0, "uniform");
+    assert_eq(gpu_bgl_storage(l, 1, GPU_STAGE_VERTEX, 1, 0, 8208), 0, "read-only storage");
+    assert_eq(gpu_bgl_texture(l, 2, GPU_STAGE_FRAGMENT, GPU_SAMPLE_DEPTH, GPU_VIEW_2D, 0), 0, "depth texture");
+    assert_eq(gpu_bgl_sampler(l, 3, GPU_STAGE_FRAGMENT, GPU_SAMPLER_COMPARISON), 0, "comparison sampler");
+    assert_eq(gpu_bgl_entry_count(l), 4, "4 entries");
+    var e0 = gpu_bgl_entry(l, 0);
+    assert_eq(load32(e0), 0, "e0 binding");
+    assert_eq(load32(e0 + 4), GPU_BINDING_UNIFORM, "e0 kind");
+    assert_eq(load64(e0 + 8), 3, "e0 visibility");
+    assert_eq(load64(e0 + 16), 1, "e0 dynamic offset");
+    assert_eq(load64(e0 + 24), 192, "e0 min size");
+    var e1 = gpu_bgl_entry(l, 1);
+    assert_eq(load32(e1 + 4), GPU_BINDING_STORAGE_READ_ONLY, "e1 read-only storage kind");
+    assert_eq(load64(e1 + 24), 8208, "e1 min size");
+    var e2 = gpu_bgl_entry(l, 2);
+    assert_eq(load64(e2 + 16), GPU_SAMPLE_DEPTH, "e2 sample type");
+    assert_eq(load64(e2 + 24), GPU_VIEW_2D, "e2 view dimension");
+    assert_eq(gpu_bgl_entry(l, 4), 0, "entry past the count = 0");
+    assert_eq(gpu_bgl_entry(l, 0 - 1), 0, "negative entry = 0");
+    return 0;
+}
+
+fn test_bgl_builder_rejects() {
+    gpu_error_clear();
+    var l = gpu_bind_group_layout_new();
+    assert_eq(gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX, 0, 0), 0, "first uniform");
+    assert_eq(gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX, 0, 0), GPU_ERR_PIPELINE, "binding used twice");
+    assert_neq(strlen(gpu_last_error_message()), 0, "duplicate binding: reason recorded");
+    assert_eq(gpu_bgl_uniform(l, 1, 0, 0, 0), GPU_ERR_PIPELINE, "no stage");
+    assert_eq(gpu_bgl_uniform(l, 1, 8, 0, 0), GPU_ERR_PIPELINE, "stage bits beyond GPU_STAGE_*");
+    assert_eq(gpu_bgl_uniform(l, 0 - 1, GPU_STAGE_VERTEX, 0, 0), GPU_ERR_PIPELINE, "negative binding");
+    assert_eq(gpu_bgl_uniform(l, 1000, GPU_STAGE_VERTEX, 0, 0), GPU_ERR_PIPELINE, "binding >= 1000");
+    assert_eq(gpu_bgl_uniform(l, 1, GPU_STAGE_VERTEX, 2, 0), GPU_ERR_PIPELINE, "dynamic_offset not 0/1");
+    assert_eq(gpu_bgl_uniform(l, 1, GPU_STAGE_VERTEX, 0, 0 - 1), GPU_ERR_PIPELINE, "negative min size");
+    assert_eq(gpu_bgl_texture(l, 1, GPU_STAGE_FRAGMENT, 1, GPU_VIEW_2D, 0), GPU_ERR_PIPELINE, "sample type 1");
+    assert_eq(gpu_bgl_texture(l, 1, GPU_STAGE_FRAGMENT, 7, GPU_VIEW_2D, 0), GPU_ERR_PIPELINE, "sample type 7");
+    assert_eq(gpu_bgl_texture(l, 1, GPU_STAGE_FRAGMENT, GPU_SAMPLE_FLOAT, 1, 0), GPU_ERR_PIPELINE, "1D view");
+    assert_eq(gpu_bgl_texture(l, 1, GPU_STAGE_FRAGMENT, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 2), GPU_ERR_PIPELINE,
+      "multisampled not 0/1");
+    assert_eq(gpu_bgl_sampler(l, 1, GPU_STAGE_FRAGMENT, 1), GPU_ERR_PIPELINE, "sampler type 1");
+    assert_eq(gpu_bgl_sampler(l, 1, GPU_STAGE_FRAGMENT, 5), GPU_ERR_PIPELINE, "sampler type 5");
+    assert_eq(gpu_bgl_storage(l, 1, GPU_STAGE_VERTEX, 2, 0, 0), GPU_ERR_PIPELINE, "read_only not 0/1");
+    assert_eq(gpu_bgl_entry_count(l), 1, "no rejected entry was added");
+    for (var i = 1; i < GPU_BGL_MAX_ENTRIES; i = i + 1) { gpu_bgl_uniform(l, i, GPU_STAGE_VERTEX, 0, 0); }
+    assert_eq(gpu_bgl_entry_count(l), 16, "16 entries");
+    assert_eq(gpu_bgl_uniform(l, 16, GPU_STAGE_VERTEX, 0, 0), GPU_ERR_PIPELINE, "a 17th entry is refused");
+    assert_eq(gpu_bgl_uniform(0, 0, GPU_STAGE_VERTEX, 0, 0), GPU_ERR_PIPELINE, "null builder");
+    gpu_error_clear();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# bind group builder
+# ---------------------------------------------------------------------------
+
+fn test_bg_builder() {
+    gpu_error_clear();
+    var g = gpu_bind_group_new(0x77);
+    assert_eq(gpu_bg_buffer(g, 0, 0x100, 256, 64), 0, "buffer entry");
+    assert_eq(gpu_bg_texture(g, 1, 0x200), 0, "texture entry");
+    assert_eq(gpu_bg_sampler(g, 2, 0x300), 0, "sampler entry");
+    assert_eq(gpu_bg_entry_count(g), 3, "3 entries");
+    assert_eq(load64(g), 0x77, "layout stored");
+    var e0 = gpu_bg_entry(g, 0);
+    assert_eq(load32(e0 + 4), GPU_BG_BUFFER, "e0 kind buffer");
+    assert_eq(load64(e0 + 8), 0x100, "e0 resource");
+    assert_eq(load64(e0 + 16), 256, "e0 offset");
+    assert_eq(load64(e0 + 24), 64, "e0 size");
+    assert_eq(gpu_bg_buffer(g, 0, 0x100, 0, 0), GPU_ERR_PIPELINE, "binding used twice");
+    assert_eq(gpu_bg_buffer(g, 3, 0, 0, 0), GPU_ERR_PIPELINE, "null resource");
+    assert_eq(gpu_bg_buffer(g, 3, 0x100, 0 - 1, 0), GPU_ERR_BUFFER, "negative offset");
+    assert_eq(gpu_bg_buffer(g, 3, 0x100, 0, 0 - 1), GPU_ERR_BUFFER, "negative size");
+    assert_eq(gpu_bg_texture(0, 0, 0x200), GPU_ERR_PIPELINE, "null builder");
+    assert_eq(gpu_bg_entry_count(g), 3, "no rejected entry added");
+    gpu_error_clear();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# wgpu backend: the v29 bytes
+# ---------------------------------------------------------------------------
+
+fn test_wgpu_bgl_bytes() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _mr_install(&table);
+    _mr_ctx(&ctx, &be);
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX, 1, 144);
+    gpu_bgl_storage(l, 1, GPU_STAGE_COMPUTE, 0, 0, 0);
+    gpu_bgl_texture(l, 2, GPU_STAGE_FRAGMENT, GPU_SAMPLE_FLOAT, GPU_VIEW_CUBE, 0);
+    gpu_bgl_sampler(l, 3, GPU_STAGE_FRAGMENT, GPU_SAMPLER_COMPARISON);
+    gpu_bgl_storage(l, 4, GPU_STAGE_VERTEX, 1, 0, 0);
+    var h = gpu_bind_group_layout_create(&ctx, l);
+    assert_eq(h, 0x4242, "BGL handle returned");
+    assert_eq(_mr_create_calls, 1, "one create");
+    var d = _mr_create_desc;
+    assert_eq(load64(d), 0, "desc nextInChain NULL");
+    assert_eq(load64(d + 24), 5, "desc entryCount @+24");
+    var e = load64(d + 32);
+    assert_neq(e, 0, "desc entries @+32");
+    # entry 0: uniform, dynamic, min 144
+    assert_eq(load32(e + 8), 0, "e0 binding @+8");
+    assert_eq(load64(e + 16), GPU_STAGE_VERTEX, "e0 visibility @+16");
+    assert_eq(load32(e + 24), 0, "e0 bindingArraySize @+24 = 0");
+    assert_eq(load32(e + 40), 2, "e0 buffer.type @+40 = Uniform (2)");
+    assert_eq(load32(e + 44), 1, "e0 buffer.hasDynamicOffset @+44");
+    assert_eq(load64(e + 48), 144, "e0 buffer.minBindingSize @+48");
+    # entry 1: read-write storage
+    assert_eq(load32(e + 120 + 40), 3, "e1 buffer.type = Storage (3)");
+    # entry 2: cube texture
+    assert_eq(load32(e + 240 + 40), 0, "e2 buffer.type BindingNotUsed (0)");
+    assert_eq(load32(e + 240 + 80), 2, "e2 texture.sampleType @+80 = Float (2)");
+    assert_eq(load32(e + 240 + 84), 4, "e2 texture.viewDimension @+84 = Cube (4)");
+    assert_eq(load32(e + 240 + 88), 0, "e2 texture.multisampled @+88");
+    # entry 3: comparison sampler
+    assert_eq(load32(e + 360 + 64), 4, "e3 sampler.type @+64 = Comparison (4)");
+    assert_eq(load32(e + 360 + 80), 0, "e3 texture.sampleType BindingNotUsed");
+    # entry 4: read-only storage
+    assert_eq(load32(e + 480 + 40), 4, "e4 buffer.type = ReadOnlyStorage (4)");
+    # Rejected by wgpu: 0, the invalid handle released.
+    _mr_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    assert_eq(gpu_bind_group_layout_create(&ctx, l), 0, "rejected BGL -> 0");
+    assert_eq(_mr_release_calls, 1, "rejected BGL released");
+    assert_eq(gpu_last_error(), GPU_ERR_VALIDATION, "rejection recorded");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+fn test_wgpu_bg_bytes() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    var tex[32];
+    _mr_install(&table);
+    _mr_ctx(&ctx, &be);
+    memset(&tex, 0, 32);
+    store64(&tex, 0xAA);         # handle
+    store64(&tex + 8, 0xBB);     # default view
+    var g = gpu_bind_group_new(0x99);
+    gpu_bg_buffer(g, 5, 0x100, 256, 0);
+    gpu_bg_texture(g, 6, &tex);
+    gpu_bg_sampler(g, 7, 0x300);
+    assert_eq(gpu_bind_group_create(&ctx, g), 0x4242, "BG handle returned");
+    var d = _mr_create_desc;
+    assert_eq(load64(d + 24), 0x99, "desc layout @+24");
+    assert_eq(load64(d + 32), 3, "desc entryCount @+32");
+    var e = load64(d + 40);
+    assert_eq(load32(e + 8), 5, "e0 binding @+8");
+    assert_eq(load64(e + 16), 0x100, "e0 buffer @+16");
+    assert_eq(load64(e + 24), 256, "e0 offset @+24");
+    assert_eq(load64(e + 32), WGPU_WHOLE_SIZE, "e0 size 0 -> WGPU_WHOLE_SIZE @+32");
+    assert_eq(load64(e + 56 + 48), 0xBB, "e1 textureView @+48 = the texture's view");
+    assert_eq(load64(e + 56 + 16), 0, "e1 buffer NULL");
+    assert_eq(load64(e + 112 + 40), 0x300, "e2 sampler @+40");
+    store64(&tex + 8, 0);
+    assert_eq(gpu_bind_group_create(&ctx, g), 0, "a texture without a view -> 0");
+    assert_eq(gpu_last_error(), GPU_ERR_TEXTURE, "no-view reason recorded");
+    var nolayout = gpu_bind_group_new(0);
+    gpu_bg_sampler(nolayout, 0, 0x300);
+    assert_eq(gpu_bind_group_create(&ctx, nolayout), 0, "a group without a layout -> 0");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+fn test_wgpu_sampler_object_bytes() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _mr_install(&table);
+    _mr_ctx(&ctx, &be);
+    assert_eq(gpu_sampler_object_create(&ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_REPEAT, GPU_COMPARE_LESS_EQUAL),
+      0x4242, "sampler handle");
+    var d = _mr_create_desc;
+    assert_eq(load32(d + 24), 2, "addressModeU @+24 = Repeat");
+    assert_eq(load32(d + 28), 2, "addressModeV @+28");
+    assert_eq(load32(d + 32), 2, "addressModeW @+32");
+    assert_eq(load32(d + 36), 2, "magFilter @+36 = Linear");
+    assert_eq(load32(d + 40), 2, "minFilter @+40");
+    assert_eq(load32(d + 44), 2, "mipmapFilter @+44 = Linear");
+    assert_eq(load32(d + 48), 0, "lodMinClamp @+48 = 0.0f");
+    assert_eq(load32(d + 52), 0x42000000, "lodMaxClamp @+52 = 32.0f");
+    assert_eq(load32(d + 56), 4, "compare @+56 = LessEqual");
+    assert_eq(load16(d + 60), 1, "maxAnisotropy @+60 = 1");
+    assert_eq(gpu_sampler_object_create(&ctx, 0, GPU_ADDRESS_CLAMP, 0), 0, "bad filter -> 0");
+    assert_eq(gpu_sampler_object_create(&ctx, GPU_FILTER_LINEAR, 4, 0), 0, "bad address -> 0");
+    assert_eq(gpu_sampler_object_create(&ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_CLAMP, 9), 0, "bad compare -> 0");
+    assert_eq(_mr_create_calls, 1, "rejected arguments never reach wgpu");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+# The render state is allocated once per context and reused.
+fn test_render_state_reused() {
+    var ctx[208];
+    memset(&ctx, 0, 208);
+    var a = _wgpu_render_state(&ctx);
+    assert_neq(a, 0, "render state allocated");
+    assert_eq(load64(&ctx + CTX_OFF_RENDER_STATE), a, "stored at ctx+200");
+    assert_eq(_wgpu_render_state(&ctx), a, "second call reuses it");
+    assert(_WGPU_RS_SAMPLERS + 32 <= _WGPU_RS_SIZE, "render state layout fits its size");
+    return 0;
+}
+
+# A backend without the render tier: 0, and the missing-slot reason recorded.
+fn test_rtier_missing_slot() {
+    var ctx[208];
+    var be[1024];
+    memset(&ctx, 0, 208);
+    memset(&be, 0, BACKEND_SIZE);
+    backend_set_kind(&be, BACKEND_KIND_AMD);
+    store64(&ctx + 32, &be);
+    gpu_error_clear();
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX, 0, 0);
+    assert_eq(gpu_bind_group_layout_create(&ctx, l), 0, "no slot -> 0");
+    assert_eq(gpu_last_error(), GPU_ERR_NOT_IMPLEMENTED, "no slot -> NOT_IMPLEMENTED recorded");  #skip-lint
+    assert_eq(gpu_sampler_object_create(&ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_CLAMP, 0), 0, "sampler: no slot -> 0");
+    assert_eq(gpu_bind_group_layout_release(&ctx, 0x5), 0, "release without a slot is a no-op");
+    assert_eq(gpu_bind_group_layout_create(0, l), 0, "null ctx -> 0");
+    gpu_error_clear();
+    return 0;
+}
+
+# The legacy bglb_* builders now write v29 offsets and values.
+fn test_legacy_bglb_v29() {
+    var b = bglb_new();
+    bglb_texture_2d(b, GPU_STAGE_FRAGMENT);
+    bglb_sampler(b, GPU_STAGE_FRAGMENT);
+    bglb_comparison_sampler(b, GPU_STAGE_FRAGMENT);
+    var arr = bglb_build_entries(b);
+    assert_eq(load64(arr + 72), 0, "texture sub-struct nextInChain stays NULL");
+    assert_eq(load32(arr + 80), 2, "texture sampleType @+80 = Float (2)");
+    assert_eq(load32(arr + 84), 2, "texture viewDimension @+84 = 2D (2)");
+    assert_eq(load64(arr + 120 + 56), 0, "sampler sub-struct nextInChain stays NULL");
+    assert_eq(load32(arr + 120 + 64), 2, "sampler type @+64 = Filtering (2)");
+    assert_eq(load32(arr + 240 + 64), 4, "comparison sampler type @+64 = Comparison (4)");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Part D — the pipeline descriptor
+# ---------------------------------------------------------------------------
+
+fn test_pipeline_desc_defaults_and_presets() {
+    var d = gpu_pipeline_desc_new(0x10, "vs_main");
+    assert_eq(load64(d), 0x10, "vs module");
+    assert_streq(load64(d + 8), "vs_main", "vs entry");
+    assert_eq(load64(d + 32), GPU_TOPOLOGY_TRIANGLE_LIST, "default TriangleList");
+    assert_eq(load64(d + 40), GPU_CULL_NONE, "default no culling");
+    assert_eq(load64(d + 48), GPU_FRONT_CCW, "default CCW");
+    assert_eq(load64(d + 144), 1, "default 1 sample");
+    assert_eq(GPU_PIPE_OFF_TARGETS, GPU_PIPE_OFF_VB + GPU_PIPE_MAX_VERTEX_BUFFERS * GPU_PIPE_VB_SIZE,
+      "targets follow the vertex buffers");
+    assert_eq(GPU_PIPE_OFF_GROUPS, GPU_PIPE_OFF_TARGETS + GPU_PIPE_MAX_TARGETS * GPU_PIPE_TARGET_SIZE,
+      "groups follow the targets");
+    assert_eq(GPU_PIPELINE_DESC_SIZE, GPU_PIPE_OFF_GROUPS + GPU_PIPE_MAX_GROUPS * 8, "desc size");
+    assert_eq(GPU_PIPE_VB_SIZE, 24 + GPU_PIPE_MAX_ATTRIBUTES * 24, "vertex buffer record size");
+    # The four presets, field for field Rust mabda 1.0 / soorat's LineVertex.
+    assert_eq(gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_SKINNED_3D), 0, "skinned preset");
+    var vb = d + GPU_PIPE_OFF_VB;
+    assert_eq(load64(vb), 96, "skinned stride 96");
+    assert_eq(load64(vb + 16), 7, "skinned: 7 attributes");
+    assert_eq(load64(vb + 24 + 5 * 24), GPU_VERTEX_UINT32X4, "skinned joints = Uint32x4");
+    assert_eq(load64(vb + 24 + 5 * 24 + 8), 64, "joints @64");
+    assert_eq(load64(vb + 24 + 5 * 24 + 16), 5, "joints @location(5)");
+    assert_eq(load64(vb + 24 + 6 * 24 + 8), 80, "weights @80");
+    var d2 = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_vertex_preset(d2, GPU_VERTEX_LAYOUT_2D);
+    assert_eq(load64(d2 + GPU_PIPE_OFF_VB), 32, "2D stride 32");
+    assert_eq(load64(d2 + GPU_PIPE_OFF_VB + 16), 3, "2D: 3 attributes");
+    var d3 = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_vertex_preset(d3, GPU_VERTEX_LAYOUT_3D);
+    assert_eq(load64(d3 + GPU_PIPE_OFF_VB), 48, "3D stride 48");
+    assert_eq(load64(d3 + GPU_PIPE_OFF_VB + 24 + 3 * 24 + 8), 32, "3D color @32");
+    var dl = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_vertex_preset(dl, GPU_VERTEX_LAYOUT_LINE);
+    assert_eq(load64(dl + GPU_PIPE_OFF_VB), 28, "line stride 28");
+    assert_eq(load64(dl + GPU_PIPE_OFF_VB + 24 + 24 + 8), 12, "line color @12");
+    assert_eq(gpu_pipeline_desc_vertex_preset(dl, 9), GPU_ERR_PIPELINE, "unknown preset");
+    return 0;
+}
+
+fn test_pipeline_desc_rejects() {
+    gpu_error_clear();
+    var d = gpu_pipeline_desc_new(0x10, "vs_main");
+    assert_eq(gpu_pipeline_desc_vertex_buffer(d, 30, GPU_STEP_VERTEX), GPU_ERR_PIPELINE, "stride not 4-aligned");
+    assert_eq(gpu_pipeline_desc_vertex_buffer(d, 4096, GPU_STEP_VERTEX), GPU_ERR_PIPELINE, "stride > 2048");
+    assert_eq(gpu_pipeline_desc_vertex_buffer(d, 16, 3), GPU_ERR_PIPELINE, "bad step mode");
+    assert_eq(gpu_pipeline_desc_vertex_buffer(d, 16, GPU_STEP_INSTANCE), 0, "instance buffer");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 1, GPU_VERTEX_FLOAT32, 0, 0), GPU_ERR_PIPELINE,
+      "attribute on a buffer not added");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, 0x7E, 0, 0), GPU_ERR_PIPELINE, "unknown format");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32X4, 4, 0), GPU_ERR_PIPELINE,
+      "attribute past the stride");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32, 2, 0), GPU_ERR_PIPELINE,
+      "offset not 4-aligned");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32, 0, 16), GPU_ERR_PIPELINE, "location 16");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32X4, 0, 3), 0, "ok attribute");
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32, 0, 3), GPU_ERR_PIPELINE,
+      "location used twice");
+    assert_eq(gpu_pipeline_desc_primitive(d, 6, GPU_CULL_NONE, GPU_FRONT_CCW), GPU_ERR_PIPELINE, "bad topology");
+    assert_eq(gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_LINE_LIST, 4, GPU_FRONT_CCW), GPU_ERR_PIPELINE, "bad cull");
+    assert_eq(gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_LINE_LIST, GPU_CULL_BACK, 3), GPU_ERR_PIPELINE, "bad face");
+    assert_eq(gpu_pipeline_desc_target(d, MABDA_TEXFMT_BC1, GPU_BLEND_NONE, GPU_WRITE_ALL),
+      GPU_ERR_FORMAT_UNSUPPORTED, "compressed colour target refused");
+    assert_eq(gpu_pipeline_desc_target(d, MABDA_TEXFMT_DEPTH32F, GPU_BLEND_NONE, GPU_WRITE_ALL),
+      GPU_ERR_FORMAT_UNSUPPORTED, "depth as a colour target refused");
+    assert_eq(gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, 7, GPU_WRITE_ALL), GPU_ERR_PIPELINE, "bad preset");
+    assert_eq(gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, 16), GPU_ERR_PIPELINE, "bad mask");
+    assert_eq(gpu_pipeline_desc_target_blend(d, 0, 1, 1, 1, 1, 1, 1), GPU_ERR_PIPELINE, "blend on no target");
+    assert_eq(gpu_pipeline_desc_depth(d, MABDA_TEXFMT_RGBA8, 1, GPU_COMPARE_LESS), GPU_ERR_FORMAT_UNSUPPORTED,
+      "colour as depth refused");
+    assert_eq(gpu_pipeline_desc_depth_bias(d, 2, F64_1, F64_0), GPU_ERR_PIPELINE, "bias before depth state");
+    assert_eq(gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, 1, 9), GPU_ERR_PIPELINE, "bad compare");
+    assert_eq(gpu_pipeline_desc_bind_group_layout(d, 4, 0x55), GPU_ERR_PIPELINE, "group 4");
+    assert_eq(gpu_pipeline_desc_bind_group_layout(d, 0, 0), GPU_ERR_PIPELINE, "null layout");
+    assert_eq(gpu_pipeline_desc_multisample(d, 2, 0), GPU_ERR_PIPELINE, "2 samples");
+    assert_eq(gpu_pipeline_desc_fragment(d, 0, "fs_main"), GPU_ERR_PIPELINE, "null fragment module");
+    # Whole-descriptor checks.
+    gpu_pipeline_desc_bind_group_layout(d, 2, 0x55);
+    assert_eq(gpu_pipeline_desc_validate(d), GPU_ERR_PIPELINE, "groups 0 and 1 missing below group 2");
+    var e = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_target(e, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    assert_eq(gpu_pipeline_desc_validate(e), GPU_ERR_PIPELINE, "targets without a fragment stage");
+    var f = gpu_pipeline_desc_new(0, "vs_main");
+    assert_eq(gpu_pipeline_desc_validate(f), GPU_ERR_PIPELINE, "null vertex module");
+    var g = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_vertex_buffer(g, 16, GPU_STEP_VERTEX);
+    assert_eq(gpu_pipeline_desc_validate(g), GPU_ERR_PIPELINE, "a vertex buffer without attributes");
+    gpu_error_clear();
+    return 0;
+}
+
+fn test_pipeline_desc_attribute_cap() {
+    var d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_vertex_buffer(d, 64, GPU_STEP_VERTEX);
+    gpu_pipeline_desc_vertex_buffer(d, 64, GPU_STEP_VERTEX);
+    for (var i = 0; i < 16; i = i + 1) {
+        gpu_pipeline_desc_vertex_attribute(d, i / 8, GPU_VERTEX_FLOAT32, (i % 8) * 4, i);
+    }
+    assert_eq(_gpu_pipe_attr_total(d), 16, "16 attributes across 2 buffers");
+    gpu_pipeline_desc_vertex_buffer(d, 64, GPU_STEP_VERTEX);
+    assert_eq(gpu_pipeline_desc_vertex_attribute(d, 2, GPU_VERTEX_FLOAT32, 0, 0), GPU_ERR_PIPELINE,
+      "a 17th attribute is refused");
+    gpu_error_clear();
+    return 0;
+}
+
+var _mp_pl_calls = 0;
+var _mp_pl_desc = 0;
+var _mp_pipe_desc = 0;
+var _mp_layout_release = 0;
+fn _mp_create_pl(device, desc): i64 { _mp_pl_calls = _mp_pl_calls + 1; _mp_pl_desc = desc; return 0x7070; }
+fn _mp_create_pipe(device, desc): i64 { _mp_pipe_desc = desc; return 0x9090; }
+fn _mp_release_pl(h): i64 { _mp_layout_release = _mp_layout_release + 1; return 0; }
+
+fn test_wgpu_pipeline_desc_bytes() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _mr_install(&table);
+    store64(&table + 19 * 8, &_mp_create_pl);
+    store64(&table + 25 * 8, &_mp_release_pl);
+    store64(&table + 52 * 8, &_mp_create_pipe);
+    store64(&table + 53 * 8, &_mr_release);
+    _mp_pl_calls = 0;
+    _mp_layout_release = 0;
+    _mr_ctx(&ctx, &be);
+    var d = gpu_pipeline_desc_new(0x11, "vs_main");
+    gpu_pipeline_desc_fragment(d, 0x22, "fs_threshold");
+    gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_3D);
+    gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_LINE_LIST, GPU_CULL_BACK, GPU_FRONT_CW);
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA16F, GPU_BLEND_ALPHA, GPU_WRITE_ALL);
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_RED);
+    gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, 1, GPU_COMPARE_LESS_EQUAL);
+    gpu_pipeline_desc_depth_bias(d, 2, f64_from(2), F64_0);
+    gpu_pipeline_desc_bind_group_layout(d, 0, 0xA0);
+    gpu_pipeline_desc_bind_group_layout(d, 1, 0xA1);
+    gpu_pipeline_desc_label(d, "mesh");
+    var p = gpu_render_pipeline_create_desc(&ctx, d);
+    assert_neq(p, 0, "pipeline struct returned");
+    assert_eq(load64(p), 0x9090, "pipeline handle");
+    # pipeline layout
+    assert_eq(_mp_pl_calls, 1, "one pipeline layout");
+    assert_eq(load64(_mp_pl_desc + 24), 2, "layout: 2 groups @+24");
+    var hs = load64(_mp_pl_desc + 32);
+    assert_eq(load64(hs), 0xA0, "layout: group 0");
+    assert_eq(load64(hs + 8), 0xA1, "layout: group 1");
+    assert_eq(load32(_mp_pl_desc + 40), 0, "layout: immediateSize 0");
+    assert_eq(_mp_layout_release, 1, "our pipeline-layout reference released after create");
+    var pd = _mp_pipe_desc;
+    assert_eq(load64(pd + 24), 0x7070, "desc layout @+24");
+    assert_eq(load64(pd + 16), 4, "desc label length @+16 (StringView)");
+    # vertex state @+32
+    assert_eq(load64(pd + 32 + 8), 0x11, "vertex.module");
+    assert_eq(load64(pd + 32 + 16 + 8), 7, "vertex.entryPoint length (vs_main)");
+    assert_eq(load64(pd + 32 + 48), 1, "vertex.bufferCount");
+    var vbl = load64(pd + 32 + 56);
+    assert_eq(load32(vbl + 8), 1, "buffer.stepMode = Vertex @+8");
+    assert_eq(load64(vbl + 16), 48, "buffer.arrayStride @+16");
+    assert_eq(load64(vbl + 24), 4, "buffer.attributeCount @+24");
+    var at = load64(vbl + 32);
+    assert_eq(load64(at), 0, "attr0 nextInChain");
+    assert_eq(load32(at + 8), GPU_VERTEX_FLOAT32X3, "attr0 format @+8");
+    assert_eq(load32(at + 96 + 8), GPU_VERTEX_FLOAT32X4, "attr3 format");
+    assert_eq(load64(at + 96 + 16), 32, "attr3 offset @+16");
+    assert_eq(load32(at + 96 + 24), 3, "attr3 location @+24");
+    # primitive @+96
+    assert_eq(load32(pd + 96 + 8), 2, "topology LineList");
+    assert_eq(load32(pd + 96 + 16), 2, "frontFace CW");
+    assert_eq(load32(pd + 96 + 20), 3, "cullMode Back");
+    # depth @+128
+    var ds = load64(pd + 128);
+    assert_neq(ds, 0, "depthStencil set");
+    assert_eq(load32(ds + 8), 0x30, "depth format Depth32Float");
+    assert_eq(load32(ds + 12), 1, "depthWriteEnabled = OptionalBool True");
+    assert_eq(load32(ds + 16), 4, "depthCompare LessEqual");
+    assert_eq(load32(ds + 20), 8, "stencilFront.compare Always");
+    assert_eq(load32(ds + 36 + 12), 1, "stencilBack.passOp Keep");
+    assert_eq(load32(ds + 52), 0xFFFFFFFF, "stencilReadMask");
+    assert_eq(load32(ds + 60), 2, "depthBias");
+    assert_eq(load32(ds + 64), 0x40000000, "depthBiasSlopeScale 2.0f");
+    # multisample @+136
+    assert_eq(load32(pd + 136 + 8), 1, "multisample count 1");
+    assert_eq(load32(pd + 136 + 12), 0xFFFFFFFF, "multisample mask");
+    # fragment @+160
+    var fr = load64(pd + 160);
+    assert_eq(load64(fr + 8), 0x22, "fragment.module");
+    assert_eq(load64(fr + 16 + 8), 12, "fragment.entryPoint length (fs_threshold)");
+    assert_eq(load64(fr + 48), 2, "fragment.targetCount");
+    var ct = load64(fr + 56);
+    assert_eq(load32(ct + 8), 0x28, "target0 format RGBA16Float");
+    var bl = load64(ct + 16);
+    assert_neq(bl, 0, "target0 blend set");
+    assert_eq(load32(bl), 1, "blend.color.operation Add");
+    assert_eq(load32(bl + 4), 5, "blend.color.srcFactor SrcAlpha");
+    assert_eq(load32(bl + 8), 6, "blend.color.dstFactor OneMinusSrcAlpha");
+    assert_eq(load32(bl + 16), 2, "blend.alpha.srcFactor One");
+    assert_eq(load64(ct + 24), GPU_WRITE_ALL, "target0 writeMask");
+    assert_eq(load32(ct + 32 + 8), 0x16, "target1 format RGBA8Unorm");
+    assert_eq(load64(ct + 32 + 16), 0, "target1 no blend");
+    assert_eq(load64(ct + 32 + 24), GPU_WRITE_RED, "target1 writeMask red");
+    # A depth-only pipeline: no fragment state, no layout (automatic).
+    _mp_pl_calls = 0;
+    var s = gpu_pipeline_desc_new(0x11, "vs_main");
+    gpu_pipeline_desc_vertex_preset(s, GPU_VERTEX_LAYOUT_3D);
+    gpu_pipeline_desc_depth(s, MABDA_TEXFMT_DEPTH32F, 1, GPU_COMPARE_LESS_EQUAL);
+    assert_neq(gpu_render_pipeline_create_desc(&ctx, s), 0, "depth-only pipeline");
+    assert_eq(load64(_mp_pipe_desc + 160), 0, "no fragment state");
+    assert_eq(load64(_mp_pipe_desc + 24), 0, "no groups -> automatic layout (NULL)");
+    assert_eq(_mp_pl_calls, 0, "no pipeline layout created");
+    # Rejected by wgpu.
+    _mr_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _mr_release_calls = 0;
+    assert_eq(gpu_render_pipeline_create_desc(&ctx, s), 0, "rejected pipeline -> 0");
+    assert_eq(_mr_release_calls, 1, "rejected pipeline released");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Part E — draw-time calls
+# ---------------------------------------------------------------------------
+var _md_slot = 0;      # which wgpu slot the last draw-time call reached
+var _md_a0 = 0;
+var _md_a1 = 0;
+var _md_a2 = 0;
+var _md_a3 = 0;
+var _md_a4 = 0;
+var _md_a5 = 0;
+fn _md_rec(slot, a, b, c, d, e, f): i64 {
+    _md_slot = slot;
+    _md_a0 = a;
+    _md_a1 = b;
+    _md_a2 = c;
+    _md_a3 = d;
+    _md_a4 = e;
+    _md_a5 = f;
+    return 0;
+}
+fn _md59(p, h): i64 { return _md_rec(59, p, h, 0, 0, 0, 0); }
+fn _md60(p, g, bg, n, o): i64 { return _md_rec(60, p, g, bg, n, o, 0); }
+fn _md61(p, vc, ic, fv, fi): i64 { return _md_rec(61, p, vc, ic, fv, fi, 0); }
+fn _md67(p, s, b, o, z): i64 { return _md_rec(67, p, s, b, o, z, 0); }
+fn _md68(p, b, f, o, z): i64 { return _md_rec(68, p, b, f, o, z, 0); }
+fn _md69(p, ic, n, fi, bv, f): i64 { return _md_rec(69, p, ic, n, fi, bv, f); }
+fn _md70(p, v): i64 { return _md_rec(70, p, v, 0, 0, 0, 0); }
+fn _md71(p, x, y, w, h): i64 { return _md_rec(71, p, x, y, w, h, 0); }
+fn _md72(p, c): i64 { return _md_rec(72, p, c, 0, 0, 0, 0); }
+
+fn _md_install(table): i64 {
+    _mr_install(table);
+    store64(table + 59 * 8, &_md59);
+    store64(table + 60 * 8, &_md60);
+    store64(table + 61 * 8, &_md61);
+    store64(table + 67 * 8, &_md67);
+    store64(table + 68 * 8, &_md68);
+    store64(table + 69 * 8, &_md69);
+    store64(table + 70 * 8, &_md70);
+    store64(table + 71 * 8, &_md71);
+    store64(table + 72 * 8, &_md72);
+    _md_slot = 0;
+    return 0;
+}
+
+fn test_draw_calls_reach_their_slots() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    var pass[48];
+    var pipe[16];
+    _md_install(&table);
+    _mr_ctx(&ctx, &be);
+    memset(&pass, 0, 48);
+    store64(&pass + 8, 0xE2);     # the pass encoder
+    store64(&pipe, 0x9A);
+    assert_eq(gpu_render_pass_set_pipeline(&ctx, &pass, &pipe), 0, "set_pipeline");
+    assert_eq(_md_slot, 59, "set_pipeline -> slot 59");
+    assert_eq(_md_a0, 0xE2, "the pass encoder");
+    assert_eq(_md_a1, 0x9A, "the pipeline handle");
+    assert_eq(gpu_render_pass_set_vertex_buffer(&ctx, &pass, 1, 0xB0, 64, 0), 0, "set_vertex_buffer");
+    assert_eq(_md_slot, 67, "-> slot 67");
+    assert_eq(_md_a1, 1, "vertex slot");
+    assert_eq(_md_a2, 0xB0, "buffer");
+    assert_eq(_md_a3, 64, "offset");
+    assert_eq(_md_a4, WGPU_WHOLE_SIZE, "size 0 -> WGPU_WHOLE_SIZE");
+    assert_eq(gpu_render_pass_set_index_buffer(&ctx, &pass, 0xB1, GPU_INDEX_UINT32, 8, 400), 0, "set_index_buffer");
+    assert_eq(_md_slot, 68, "-> slot 68");
+    assert_eq(_md_a2, 2, "Uint32");
+    assert_eq(_md_a4, 400, "size");
+    var offs[8];
+    store32(&offs, 512);
+    store32(&offs + 4, 256);
+    assert_eq(gpu_render_pass_set_bind_group(&ctx, &pass, 1, 0xB6, 2, &offs), 0, "set_bind_group");
+    assert_eq(_md_slot, 60, "-> slot 60");
+    assert_eq(_md_a1, 1, "group");
+    assert_eq(_md_a2, 0xB6, "bind group");
+    assert_eq(_md_a3, 2, "dynamic offset count");
+    assert_eq(_md_a4, &offs, "dynamic offsets");
+    assert_eq(gpu_render_pass_draw_vertices(&ctx, &pass, 6, 2, 3, 1), 0, "draw_vertices");
+    assert_eq(_md_slot, 61, "-> slot 61");
+    assert_eq(_md_a1, 6, "vertex count");
+    assert_eq(_md_a3, 3, "first vertex");
+    assert_eq(gpu_render_pass_draw_indexed(&ctx, &pass, 36, 1, 12, 0 - 2, 0), 0, "draw_indexed");
+    assert_eq(_md_slot, 69, "-> slot 69");
+    assert_eq(_md_a1, 36, "index count");
+    assert_eq(_md_a3, 12, "first index");
+    assert_eq(_md_a4 & 0xFFFFFFFF, 0xFFFFFFFE, "base vertex -2 (int32)");
+    assert_eq(gpu_render_pass_set_scissor(&ctx, &pass, 1, 2, 30, 40), 0, "set_scissor");
+    assert_eq(_md_slot, 71, "-> slot 71");
+    assert_eq(_md_a4, 40, "scissor height");
+    var c = color_new(F64_1, F64_0, F64_0, F64_1);
+    assert_eq(gpu_render_pass_set_blend_constant(&ctx, &pass, c), 0, "set_blend_constant");
+    assert_eq(_md_slot, 72, "-> slot 72");
+    assert_eq(_md_a1, c, "the Color is the WGPUColor");
+    assert_eq(gpu_render_pass_set_viewport(&ctx, &pass, F64_0, f64_from(8), f64_from(32), f64_from(16), F64_0, F64_1),
+      0, "set_viewport");
+    assert_eq(_md_slot, 70, "-> slot 70");
+    var vp = _md_a1;
+    assert_eq(load32(vp), 0, "viewport x = 0.0f");
+    assert_eq(load32(vp + 4), 0x41000000, "viewport y = 8.0f");
+    assert_eq(load32(vp + 8), 0x42000000, "viewport w = 32.0f");
+    assert_eq(load32(vp + 12), 0x41800000, "viewport h = 16.0f");
+    assert_eq(load32(vp + 20), 0x3F800000, "viewport max depth = 1.0f");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+fn test_draw_calls_reject() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    var pass[48];
+    _md_install(&table);
+    _mr_ctx(&ctx, &be);
+    memset(&pass, 0, 48);
+    store64(&pass + 8, 0xE2);
+    _md_slot = 0;
+    assert_eq(gpu_render_pass_set_pipeline(&ctx, &pass, 0), GPU_ERR_PIPELINE, "null pipeline");
+    assert_eq(gpu_render_pass_set_vertex_buffer(&ctx, &pass, 8, 0xB0, 0, 0), GPU_ERR_BUFFER, "vertex slot 8");
+    assert_eq(gpu_render_pass_set_vertex_buffer(&ctx, &pass, 0, 0xB0, 2, 0), GPU_ERR_BUFFER, "offset not 4-aligned");
+    assert_eq(gpu_render_pass_set_vertex_buffer(&ctx, &pass, 0, 0, 0, 0), GPU_ERR_BUFFER, "null vertex buffer");
+    assert_eq(gpu_render_pass_set_index_buffer(&ctx, &pass, 0xB1, 3, 0, 0), GPU_ERR_BUFFER, "bad index format");
+    assert_eq(gpu_render_pass_set_index_buffer(&ctx, &pass, 0xB1, GPU_INDEX_UINT32, 2, 0), GPU_ERR_BUFFER,
+      "u32 index offset not 4-aligned");
+    assert_eq(gpu_render_pass_set_index_buffer(&ctx, &pass, 0xB1, GPU_INDEX_UINT16, 2, 0), 0,
+      "u16 index offset 2 is fine");
+    _md_slot = 0;
+    var offs[8];
+    store32(&offs, 100);
+    assert_eq(gpu_render_pass_set_bind_group(&ctx, &pass, 0, 0xB6, 1, &offs), GPU_ERR_BUFFER,
+      "dynamic offset not 256-aligned");
+    assert_eq(gpu_render_pass_set_bind_group(&ctx, &pass, 4, 0xB6, 0, 0), GPU_ERR_PIPELINE, "group 4");
+    assert_eq(gpu_render_pass_set_bind_group(&ctx, &pass, 0, 0xB6, 1, 0), GPU_ERR_PIPELINE, "offsets missing");
+    assert_eq(gpu_render_pass_set_bind_group(&ctx, &pass, 0, 0xB6, 13, &offs), GPU_ERR_PIPELINE, "13 offsets");
+    assert_eq(gpu_render_pass_draw_indexed(&ctx, &pass, 0 - 1, 1, 0, 0, 0), GPU_ERR_OTHER, "negative index count");
+    assert_eq(gpu_render_pass_draw_vertices(&ctx, &pass, 3, 0 - 1, 0, 0), GPU_ERR_OTHER, "negative instances");
+    assert_eq(gpu_render_pass_set_viewport(&ctx, &pass, F64_0, F64_0, F64_0, F64_1, F64_0, F64_1), GPU_ERR_OTHER,
+      "zero-width viewport");
+    assert_eq(gpu_render_pass_set_viewport(&ctx, &pass, F64_0, F64_0, F64_1, F64_1, F64_1, F64_0), GPU_ERR_OTHER,
+      "min depth > max depth");
+    assert_eq(gpu_render_pass_set_scissor(&ctx, &pass, 0 - 1, 0, 4, 4), GPU_ERR_OTHER, "negative scissor x");
+    assert_eq(_md_slot, 0, "no rejected call reached wgpu");
+    # No pass / no backend slot.
+    assert_eq(gpu_render_pass_draw_vertices(&ctx, 0, 3, 1, 0, 0), GPU_ERR_OTHER, "null pass");
+    var be2[1024];
+    memset(&be2, 0, BACKEND_SIZE);
+    store64(&ctx + 32, &be2);
+    assert_eq(gpu_render_pass_draw_vertices(&ctx, &pass, 3, 1, 0, 0), GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+      "a backend without the slot -> NOT_IMPLEMENTED");  #skip-lint
+    _mr_uninstall();
+    return 0;
+}
+
+# L17: gpu_render_pass_begin reuses one pass record per context; a second pass
+# begun while the first is open gets its own.
+var _mb_enc_n = 0;
+fn _mb_create_encoder(device, label): i64 { _mb_enc_n = _mb_enc_n + 1; return 0xEC00 + _mb_enc_n; }
+fn _mb_begin(enc, args): i64 { return 0xBE00 + _mb_enc_n; }
+fn _mb_finish(enc, label): i64 { return 0xC0; }
+fn _mb_noop1(a): i64 { return 0; }
+fn _mb_noop2(a, b): i64 { return 0; }
+
+fn test_pass_record_reused() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    var rt[32];
+    _mr_install(&table);
+    store64(&table + 26 * 8, &_mb_create_encoder);
+    store64(&table + 58 * 8, &_mb_begin);
+    store64(&table + 29 * 8, &_mb_finish);
+    store64(&table + 34 * 8, &_mb_noop1);    # encoder release
+    store64(&table + 35 * 8, &_mb_noop2);    # submit
+    store64(&table + 62 * 8, &_mb_noop1);    # pass end
+    store64(&table + 63 * 8, &_mb_noop1);    # pass release
+    _mr_ctx(&ctx, &be);
+    memset(&rt, 0, 32);
+    store64(&rt + 8, 0x7E);                  # the target's view
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var p1 = _backend_wgpu_render_pass_begin(&ctx, &rt, clear);
+    assert_eq(p1, _wgpu_render_state(&ctx) + _WGPU_RS_PASS, "first pass uses the context's record");
+    var args = _wgpu_render_state(&ctx) + _WGPU_RS_BEGIN_ARGS;
+    var att = load64(args);
+    assert_eq(load64(args + 8), 1, "begin args: one colour attachment");
+    assert_eq(load64(att + 8), 0x7E, "attachment view");
+    assert_eq(load32(att + 32), WGPU_LOAD_OP_CLEAR, "attachment clears");
+    assert_eq(load64(att + 40 + 24), F64_1, "clear alpha 1.0");
+    var p2 = _backend_wgpu_render_pass_begin(&ctx, &rt, clear);
+    assert_neq(p2, p1, "a second open pass gets its own record");
+    assert_eq(load64(p1), 0xEC01, "the first record is untouched");
+    _backend_wgpu_render_pass_end(&ctx, p2);
+    _backend_wgpu_render_pass_end(&ctx, p1);
+    assert_eq(load64(p1), 0, "end frees the context's record");
+    var before = alloc_used();
+    for (var i = 0; i < 100; i = i + 1) {
+        var p = _backend_wgpu_render_pass_begin(&ctx, &rt, clear);
+        _backend_wgpu_render_pass_end(&ctx, p);
+    }
+    assert_eq(alloc_used() - before, 0, "100 begin/end pairs allocate 0 bytes (L17)");
+    assert_eq(_mr_wrong, 0, "no wrong slot");
+    _mr_uninstall();
+    return 0;
+}
+
+# Part G — the native backends' subset (src/backend_native_rtier.cyr).
+fn _nt_subset_desc(): i64 {
+    var d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_fragment(d, 0x20, "fs_main");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    return d;
+}
+
+fn test_native_rtier_subset_rules() {
+    assert_eq(_native_rtier_unsupported(_nt_subset_desc()), 0, "the subset descriptor is served");
+    var d = _nt_subset_desc();
+    gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_2D);
+    assert_neq(_native_rtier_unsupported(d), 0, "vertex buffers: not served");
+    d = _nt_subset_desc();
+    gpu_pipeline_desc_bind_group_layout(d, 0, 0x55);
+    assert_neq(_native_rtier_unsupported(d), 0, "bind groups: not served");
+    d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, 1, GPU_COMPARE_LESS);
+    assert_neq(_native_rtier_unsupported(d), 0, "depth-only: not served");
+    d = _nt_subset_desc();
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    assert_neq(_native_rtier_unsupported(d), 0, "two targets: not served");
+    d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_fragment(d, 0x20, "fs_main");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA16F, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    assert_neq(_native_rtier_unsupported(d), 0, "RGBA16F target: not served");
+    d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_fragment(d, 0x20, "fs_main");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_ALPHA, GPU_WRITE_ALL);
+    assert_neq(_native_rtier_unsupported(d), 0, "blending: not served");
+    d = gpu_pipeline_desc_new(0x10, "vs_main");
+    gpu_pipeline_desc_fragment(d, 0x20, "fs_main");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_RED);
+    assert_neq(_native_rtier_unsupported(d), 0, "partial write mask: not served");
+    d = _nt_subset_desc();
+    gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_LINE_LIST, GPU_CULL_NONE, GPU_FRONT_CCW);
+    assert_neq(_native_rtier_unsupported(d), 0, "LineList: not served");
+    d = _nt_subset_desc();
+    gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_TRIANGLE_LIST, GPU_CULL_BACK, GPU_FRONT_CCW);
+    assert_neq(_native_rtier_unsupported(d), 0, "culling: not served");
+    d = _nt_subset_desc();
+    gpu_pipeline_desc_multisample(d, 4, 0);
+    assert_neq(_native_rtier_unsupported(d), 0, "4 samples: not served");
+    # Slots wired on the native builders; the rest stay empty (NOT_IMPLEMENTED).  #skip-lint
+    var nb = backend_native_new();
+    var want_cd = &_backend_native_rtier_pipeline_create_desc;
+    assert_eq(backend_get_slot(nb, BACKEND_SLOT_RENDER_PIPELINE_CREATE_DESC), want_cd, "AMD: create_desc wired");
+    assert_eq(backend_get_slot(nb, BACKEND_SLOT_PASS_DRAW), &_backend_native_pass_draw, "AMD: draw wired");
+    assert_eq(backend_get_slot(nb, BACKEND_SLOT_PASS_DRAW_INDEXED), 0, "AMD: draw_indexed not wired");
+    assert_eq(backend_get_slot(nb, BACKEND_SLOT_BIND_GROUP_LAYOUT_CREATE), 0, "AMD: layouts not wired");
+    var vb = backend_nvidia_new();
+    assert_eq(backend_get_slot(vb, BACKEND_SLOT_PASS_SET_PIPELINE), &_backend_nvidia_pass_set_pipeline,
+      "NVIDIA: set_pipeline wired");
+    assert_eq(backend_get_slot(vb, BACKEND_SLOT_PASS_SET_VIEWPORT), 0, "NVIDIA: viewport not wired");
+    # The draw refuses offsets and a missing pipeline before touching hardware.
+    var pass[40];
+    memset(&pass, 0, 40);
+    gpu_error_clear();
+    assert_eq(_backend_native_pass_draw(0, &pass, 3, 1, 1, 0), GPU_ERR_NOT_IMPLEMENTED, "first_vertex refused");  #skip-lint
+    assert_eq(_backend_native_pass_draw(0, &pass, 3, 1, 0, 0), GPU_ERR_PIPELINE, "no pipeline bound");
+    _backend_native_pass_set_pipeline(0, &pass, 0x99);
+    assert_eq(load64(&pass + NATIVE_PASS_FIELD_PIPE), 0x99, "AMD pass: pipeline stored at +8");
+    gpu_error_clear();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_public_constants_pinned();
+    test_vertex_format_size();
+    test_bgl_builder_records();
+    test_bgl_builder_rejects();
+    test_bg_builder();
+    test_wgpu_bgl_bytes();
+    test_wgpu_bg_bytes();
+    test_wgpu_sampler_object_bytes();
+    test_render_state_reused();
+    test_rtier_missing_slot();
+    test_legacy_bglb_v29();
+    test_pipeline_desc_defaults_and_presets();
+    test_pipeline_desc_rejects();
+    test_pipeline_desc_attribute_cap();
+    test_wgpu_pipeline_desc_bytes();
+    test_draw_calls_reach_their_slots();
+    test_draw_calls_reject();
+    test_pass_record_reused();
+    test_native_rtier_subset_rules();
+    return assert_summary();
+}

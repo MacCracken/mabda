@@ -62,6 +62,11 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   `cyrius.cyml`; `asset_load.cyr` decodes through it to RGBA8. Its bundle excludes its own stdlib deps, so mabda provides
   `thread` + `sankoch`. **Consumers of mabda's dist must likewise add
   `[deps.chitra]` + `thread`/`sankoch`** (the samvada-style pattern).
+  Both `[deps.chitra]` and `[deps.samvada]` are `optional = true`: cyrius
+  reads `[features]` from the ROOT manifest only, so mabda's own
+  `default = ["png", "jpeg", "logind"]` resolves them here and a consumer
+  resolves them only if it names them. `src/lib.cyr` includes their bundles
+  only under `MABDA_PNG` / `MABDA_JPEG` / `MABDA_LOGIND`.
 - **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
   delegation. Pinned via `[deps.samvada]` in `cyrius.cyml`. Since
   samvada 1.0 it speaks dbus natively in Cyrius: the consumer calls
@@ -150,15 +155,30 @@ issue ioctls directly, and samvada fills its fn-table in Cyrius.
 1. C `main()` calls `_cyrius_init()` then `alloc_init()`
 2. C pre-initializes GPU (instance/adapter/device/queue — Vulkan-only
    via `WGPUInstanceExtras { backends = Vulkan }`; default `All` was a
-   problem on headless boxes)
+   problem on headless boxes). The device gets an uncaptured-error
+   callback that RECORDS errors (slot 75 reads them) instead of
+   wgpu-native's default panic.
 3. C builds the function-pointer table (wgpu functions +
-   struct-packing shims)
+   struct-packing shims; 81 slots since 4.3.0 — `FN_COUNT` must match
+   the entries or it aborts at start-up), then reports the count through
+   the weak `mabda_wgpu_launcher_slots`. Without that report mabda
+   assumes the old 67-slot table and every wrapper for slot 67+ returns
+   `GPU_ERR_FFI_SYMBOL` instead of calling.
 4. C calls `mabda_main(fn_table_ptr, preinit_ptr)` which the consumer
    defines
 5. Cyrius calls wgpu via `fncall1`..`fncall6` for scalar-arg entry
    points and struct-packing shims for struct-by-value descriptors —
    **never** `fncall6` with a struct-by-value / float arg (the shim
    marshals those)
+
+**Errors never abort (4.3.0).** mabda scopes its own creation calls
+(shader modules, pipelines, layouts, groups, samplers) and returns 0 +
+the reason (`gpu_last_error_message`). wgpu-native treats submitting an
+invalid command buffer as FATAL regardless of callbacks, so the finish
+shim (slot 29) scopes `finish` and returns NULL for an invalid buffer;
+the submit shim (slot 35) skips NULL and releases what it submits.
+**Adding a launcher slot forces every consumer to rebuild**: the 4.3.0
+revision already carries MB2–MB5's slots — don't add slots piecemeal.
 
 ### Native AMD path (no C shim)
 

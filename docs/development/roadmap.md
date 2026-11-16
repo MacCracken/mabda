@@ -3,7 +3,7 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.2.0** (2026-10-08). Module/assertion/bundle counts live in the
+> **v4.3.0** (2026-11-16). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**. For detail on every shipped
@@ -43,7 +43,11 @@ leak, shader-cache / depth-texture release, and the bench and launcher leftovers
 renamed two names that collided with other cyrius folds; v4.1.7 (2026-10-06) moved to cyrius
 6.6.18 and its compile-verified `dist/mabda.deps`; v4.2.0 (2026-10-08) moved to cyrius 6.7.5,
 made the eleven `F64_*` colour constants f64 `const`s, and closed the 6.6.5 / 6.6.6 pin-move
-lists below, which it pruned).
+lists below, which it pruned; v4.3.0 (2026-11-16) shipped the render tier's MB1 — the pipeline
+descriptor, bind groups, draw-time calls and the error channel, on an 81-slot launcher that
+already carries MB2–MB5's slots — and fixed the 2026-11 filings: the render-loop leak, the pin
+and optional deps, the profiler's pass timings, NVIDIA's shader-kind gate and binding array, and
+the byte-loop copies).
 
 ## The Long Arc
 
@@ -69,10 +73,12 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.2.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
+  v2.0.0 → v4.3.0  ─▶  shipped — see CHANGELOG.md (Cyrius port → dual
                         backend → texture/shader breadth → asset loading →
                         array/cube textures → NVIDIA native → AMD-wgpu
-                        deprecation)
+                        deprecation → render tier MB1)
+  v4.4 → v4.x      ─▶  the render tier MB2–MB5, N9 (SPIR-V → SASS), the
+                        texture encoder (below)
   v3.x+            ─▶  WebGPU / WASM (blocked on Cyrius WASM backend)
   v5.0             ─▶  Intel native backend added (tentative); NVIDIA
                         wgpu path retires (NVIDIA → NVIDIA native only)
@@ -118,6 +124,54 @@ texture, render_pipeline, render_pass, render_graph, etc.) is the
 load-bearing contract. The FFI layer underneath is explicitly marked
 internal (`@internal` header on line 1 of every FFI module) so no
 consumer accidentally couples to it.
+
+---
+
+## The render tier — MB2 to MB5 (soorat's GPU half waits on it)
+
+Filed 2026-11-15 by soorat's Cyrius port (`issues/2026-11-15-render-tier-for-geometry-consumers.md`,
+its ledger L2–L6). **MB1 shipped in 4.3.0** (CHANGELOG [4.3.0]): the pipeline descriptor, bind group
+layouts / groups / sampler objects (comparison samplers included), the draw-time calls, public
+constant names, the error channel, and the pipeline-side depth state. The 4.3.0 launcher (81
+slots) already carries every slot below, so none of these needs another consumer rebuild. Each
+milestone is wgpu-first, gated by mabda's tests and soorat's probes (P6/MB1 extended per MB).
+
+- **MB2 — depth and shadows** (soorat M6, M7). Depth32F render targets and textures
+  (`MABDA_TEXFMT_DEPTH32F` is named; `gpu_texture_create_*` refuses it until then), a depth
+  attachment in the render pass with load / clear, depth views (`WGPU_TEXTURE_ASPECT_DEPTH_ONLY`)
+  for binding a shadow map, and the render target builder's depth path.
+- **MB3 — formats, MSAA, mips, copies, readback** (M7, M8). Texture creation in RGBA16F, RGBA8
+  sRGB and BGRA8 (+ sRGB), with `asset_format.cyr` mapping sRGB containers to the sRGB ids
+  (punchlist AL.0); MSAA targets with resolve; several colour targets; rendering into a cube face
+  or mip level (a single-layer, single-level attachment view); mip generation on wgpu
+  (`gpu_texture_generate_mipmaps` returns NOT_IMPLEMENTED there); texture-to-texture copy on the  #skip-lint
+  public tier (slot 77 is in); render-target readback on the public tier.
+- **MB4 — compute on the public tier for wgpu** (M8). `gpu_compute_dispatch` on wgpu (it returns
+  `GPU_ERR_OTHER`), compute pipelines with explicit mixed layouts (storage + uniform — the MB1
+  layout builder already expresses them), storage-buffer readback.
+- **MB5 — a window surface** (M9). `WGPUSurface` from a Wayland `wl_display` / `wl_surface`
+  (slot 78), surface capabilities (slot 79), BGRA8 / BGRA8 sRGB swapchain formats, AutoVsync /
+  AutoNoVsync. Slots 78/79 are compile-checked only until this milestone brings a Wayland client
+  to prove them on hardware; a defect there would cost a second launcher revision.
+- **The native render tier** (soorat's ledger L7, after its 2.0). On native AMD and NVIDIA the
+  4.3.0 tier serves the native render path's shape — a vertex-less, unbound, single-RGBA8 draw —
+  and names everything else `GPU_ERR_NOT_IMPLEMENTED` (`src/backend_native_rtier.cyr`). The rest  #skip-lint
+  (vertex fetch, bind groups, depth, blending) needs a render-capable native shader path: a WGSL
+  front end, or SPIR-V render lowering beside the compute lowering. It bears on the v5.1 gate,
+  which lists soorat among the consumers that must run native.
+
+---
+
+## N9 — SPIR-V → SASS for the NVIDIA backend (ranga waits on it)
+
+Filed 2026-11-02 (`issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`); listed under "Next"
+since 4.0.0. The NVIDIA backend takes only pre-captured SASS, and a portable consumer ships
+SPIR-V. The compiler is the analogue of `spirv_lower` → `gfx9_*`: the SPIR-V parse and the MIR are
+reused; new for SM75 are instruction selection, register allocation, encoding and the control
+words (stall counts, barriers, yields) that ptxas computes and the captured kernels carry. Its
+modules set `NV_SHMOD_NBIND`, which 4.3.0's NVIDIA binding array already reads. Done when ranga's
+11 kernels compile through `gpu_shader_module_create_spirv` on an NVIDIA context and its four GPU
+suites pass on the TU116. A design note in `docs/proposals/` comes first.
 
 ---
 
@@ -204,7 +258,7 @@ native-Cyrius across every supported vendor.
   hardware. If v5.0 didn't actually ship Intel native, v5.1 doesn't
   ship either — the version is a placeholder for that completion.
 - **Remove `src/wgpu_*.cyr`, `src/backend_wgpu.cyr`,
-  `deps/wgpu_main.c`, `deps/wgpu-native/`.** The 67-slot wgpu fn
+  `deps/wgpu_main.c`, `deps/wgpu-native/`.** The 81-slot wgpu fn
   table and its struct-packing shims go away.
 - **Remove the `Backend` indirection**, optionally. If only one
   backend kind remains per vendor, the `ctx->backend` slot is
@@ -258,13 +312,9 @@ there's consumer demand plus a clear scope.
   `-D MABDA_LOGIND` today (off by default; the consumer, not mabda, initializes
   samvada). samvada's deletion of its `libsystemd` C shim at samvada 1.1.0 waits
   on that run.
-- **Encoder debug-group FFI.** The `debug_*` fns are no-op stubs until
-  `wgpuCommandEncoderPushDebugGroup` / `…Pop` land in the fn table — a
-  coordinated `deps/wgpu_main.c` launcher change (adding slots forces every
-  consumer to rebuild). The 3.4.3 per-node scope wrapping makes them visible in
-  profilers once wired.
 - **GPU texture compression — BC1–BC7 / ASTC encode** (filed 2026-10-13 from sankoch; the user placed
-  it in mabda, not sankoch). A CPU reference block encoder for the first format a consumer names,
+  it in mabda, not sankoch; scheduled after N9 in the 2026-11 plan, with KTX2 zstd / zlib
+  supercompression decode as its first, concrete half). A CPU reference block encoder for the first format a consumer names,
   validated against an independent decoder and mabda's own upload-and-sample path, with a PSNR bar.
   sankoch's zstd / zlib already unlock KTX2 supercompression schemes 2 and 3 in `_ktx2_parse`.
   Details: `docs/development/issues/2026-10-13-gpu-texture-compression-encoder.md`.

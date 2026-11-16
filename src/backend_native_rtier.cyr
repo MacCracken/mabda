@@ -1,0 +1,95 @@
+# @internal — the native backends' share of the render tier (v4.3.0, MB1)
+# backend_native_rtier.cyr — what the native AMD and NVIDIA backends serve of
+# the descriptor + draw-time API (src/gpu_pipeline.cyr, src/gpu_draw.cyr), so a
+# portable consumer's simplest frame runs unchanged on every backend.
+#
+# The native render path draws a vertex-less full-screen primitive from
+# pre-compiled shaders (GFX9 ISA / SM75 SASS), with fixed state. A descriptor is
+# served when it asks for exactly that:
+#   no vertex buffers, no bind groups, a fragment stage, one RGBA8 colour target
+#   without blending and with every channel written, no depth, one sample, a
+#   TriangleList with no culling and counter-clockwise front faces.
+# Entry-point names are not read: a pre-compiled module has one entry. Anything
+# else returns 0 / GPU_ERR_NOT_IMPLEMENTED with the reason recorded (gpu_error_  #skip-lint
+# message). gpu_render_pass_set_pipeline + gpu_render_pass_draw_vertices
+# (first_vertex 0, first_instance 0) map to the backend's existing draw. The rest
+# of the tier — layouts, groups, sampler objects, vertex / index buffers,
+# indexed draws, viewport, scissor, blend constant — needs a render-capable
+# native shader path (a WGSL front end or SPIR-V render lowering: soorat's
+# ledger L7, tracked in docs/development/roadmap.md) and returns
+# GPU_ERR_NOT_IMPLEMENTED through the public tier's missing-slot path.  #skip-lint
+
+# 0 when the native render path can serve descriptor `d`, else a reason cstr.
+fn _native_rtier_unsupported(d): i64 {
+    if (load64(d + 64) != 0) { return "native render tier: vertex buffers need a native vertex-fetch path (L7)"; }
+    if (load64(d + 80) != 0) { return "native render tier: explicit bind groups need a native binding model (L7)"; }
+    if (load64(d + 16) == 0) { return "native render tier: a depth-only pipeline (no fragment stage) is not served"; }
+    if (load64(d + 72) != 1) { return "native render tier: exactly one colour target is served"; }
+    var t = d + GPU_PIPE_OFF_TARGETS;
+    if (load64(t) != MABDA_TEXFMT_RGBA8) { return "native render tier: the target must be RGBA8"; }
+    if (load64(t + 16) != 0) { return "native render tier: blending is not served"; }
+    if (load64(t + 8) != GPU_WRITE_ALL) { return "native render tier: a partial write mask is not served"; }
+    if (load64(d + 88) != 0) { return "native render tier: depth state is not served"; }
+    if (load64(d + 144) != 1) { return "native render tier: multisampling is not served"; }
+    if (load64(d + 32) != GPU_TOPOLOGY_TRIANGLE_LIST) { return "native render tier: only TriangleList is served"; }
+    if (load64(d + 40) != GPU_CULL_NONE) { return "native render tier: culling is not served"; }
+    if (load64(d + 48) != GPU_FRONT_CCW) { return "native render tier: only CCW front faces are served"; }
+    return 0;
+}
+
+# BACKEND_SLOT_RENDER_PIPELINE_CREATE_DESC for both native backends: the subset
+# maps onto the backend's own render_pipeline_create (ctx, vs, fs, fmt).
+fn _backend_native_rtier_pipeline_create_desc(ctx, d): i64 {
+    if (ctx == 0) { return 0; }
+    if (d == 0) { return 0; }
+    var why = _native_rtier_unsupported(d);
+    if (why != 0) {
+        _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED, why, 1);   #skip-lint
+        return 0;
+    }
+    var slot = backend_get_slot(gpu_ctx_backend(ctx), BACKEND_SLOT_RENDER_PIPELINE_CREATE);
+    if (slot == 0) { return 0; }
+    return fncall4(slot, ctx, load64(d), load64(d + 16), 0);
+}
+
+fn _native_rtier_draw_unsupported(fv, fi): i64 {
+    if (fv != 0) {
+        _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED, "native render tier: first_vertex must be 0", 1);   #skip-lint
+        return 1;
+    }
+    if (fi != 0) {
+        _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED, "native render tier: first_instance must be 0", 1);   #skip-lint
+        return 1;
+    }
+    return 0;
+}
+
+# Native AMD: the bound pipeline lives in the pass record's +8 field.
+fn _backend_native_pass_set_pipeline(ctx, pass, pipe): i64 {
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    store64(pass + NATIVE_PASS_FIELD_PIPE, pipe);
+    return 0;
+}
+
+fn _backend_native_pass_draw(ctx, pass, vc, ic, fv, fi): i64 {
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (_native_rtier_draw_unsupported(fv, fi) == 1) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    var pipe = load64(pass + NATIVE_PASS_FIELD_PIPE);
+    if (pipe == 0) { return GPU_ERR_PIPELINE; }
+    return _backend_native_render_pass_draw(ctx, pass, pipe, vc, ic);
+}
+
+# NVIDIA: the bound pipeline lives at NV_PASS_PIPE.
+fn _backend_nvidia_pass_set_pipeline(ctx, pass, pipe): i64 {
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    store64(pass + NV_PASS_PIPE, pipe);
+    return 0;
+}
+
+fn _backend_nvidia_pass_draw(ctx, pass, vc, ic, fv, fi): i64 {
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (_native_rtier_draw_unsupported(fv, fi) == 1) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    var pipe = load64(pass + NV_PASS_PIPE);
+    if (pipe == 0) { return GPU_ERR_PIPELINE; }
+    return _backend_nvidia_render_pass_draw(ctx, pass, pipe, vc, ic);
+}

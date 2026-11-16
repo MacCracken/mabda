@@ -1,6 +1,6 @@
 # A render tier for consumers that draw geometry: what soorat's Cyrius port needs from the public `gpu_*` API
 
-**Status:** 🔴 **OPEN** — feature request, consumer-blocking.
+**Status:** 🟡 **IN PROGRESS** — **MB1 shipped in mabda 4.3.0** (2026-11-16); MB2–MB5 open. MB1: the pipeline descriptor (entry points, optional fragment, vertex layouts incl. `Uint32x4`, topology, culling, front face, blend, explicit layouts, depth state), bind group layouts / bind groups / sampler objects (comparison included), the draw-time calls (vertex + u16/u32 index buffers, `draw_indexed`, dynamic offsets, viewport, scissor), public constant names, and the error channel. The launcher revision (81 slots) already carries MB3's `CopyTextureToTexture` and MB5's surface slots, so MB2–MB5 need no further consumer rebuild. P6 against 4.3.0: all 11 soorat render pipelines build with their real layouts, the error cases return, and `sprite.wgsl` draws (`soorat/scripts/probes/gpu/src/p6_mb1.cyr`, `run_p6_mb1.sh`). The MB2–MB5 plan: `docs/development/roadmap.md`.
 **Filed:** 2026-11-15, from soorat's Cyrius port:
 - the plan: `soorat/docs/development/soorat-port-plan.md` §2.1, §8 (MB1–MB5) and ledger rows L2–L6;
 - the measurement: probe P6 (`soorat/scripts/probes/gpu/src/p6_wgsl.cyr`; logs in
@@ -100,7 +100,7 @@ The order follows soorat's milestones:
 - Texture-to-texture copy (soorat uses it 3 times).
 - Render-target readback on the public tier.
 - **Related:** `gpu_buffer_read` on wgpu ends in the stdlib's byte-loop `memcpy`, 2.7 ms per 128 KB in P7.
-  This is the same root cause as `2026-11-02-native-buffer-copies-are-byte-loops.md`, here on the wgpu
+  This is the same root cause as `archived/2026-11-02-native-buffer-copies-are-byte-loops.md` (fixed in 4.3.0 with `gpu_copy_bytes`), here on the wgpu
   backend; soorat's screenshots and tests read back through it.
 
 **MB4: compute on the public tier for wgpu**
@@ -120,7 +120,7 @@ client library is a separate, future project.
 
 **Launcher.** If the scope is known up front, land every new slot in **one** `deps/wgpu_main.c` revision,
 together with the command-buffer release from
-`2026-11-15-wgpu-render-loop-leaks-command-buffers-and-pass-records.md`, so every consumer rebuilds once. New
+`archived/2026-11-15-wgpu-render-loop-leaks-command-buffers-and-pass-records.md` (done in 4.3.0), so every consumer rebuilds once. New
 slots, roughly:
 
 | Area | Slots |

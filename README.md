@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.2.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.3.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -18,8 +18,11 @@ compiler, asset loading, and KMS present, all HW-verified on AMD Cezanne.
 compute, textures, render, and present, HW-proven on a GTX 1660 SUPER (TU116)
 and burned in ~30¾h of soak (RSS-flat, dmesg Δ=0). **v4.0.1 deprecates
 AMD-on-wgpu** (one-shot warning, still works; `-D MABDA_AMD_WGPU_STRICT` enforces
-native-only; retirement deferred). See [CHANGELOG.md](CHANGELOG.md) for the full
-release history and *Hardware support* below.
+native-only; retirement deferred). **v4.3.0 starts the render tier** a geometry
+renderer draws through (a pipeline descriptor, bind groups, vertex/index buffers,
+indexed draws with dynamic offsets, viewport and scissor), and a validation error
+returns a `GPU_ERR_*` with wgpu's reason instead of aborting the process. See
+[CHANGELOG.md](CHANGELOG.md) for the full release history and *Hardware support* below.
 
 ## Features
 
@@ -27,20 +30,22 @@ release history and *Hardware support* below.
 - **Device lifecycle** — GpuContext creation with adapter/device/queue management
 - **Buffer management** — storage, uniform, vertex, index, staging, indirect buffers; synchronous readback; buffer-to-buffer copy; GrowableBuffer with generation tracking
 - **Compute pipelines** — shader compilation, bind group layout, dispatch, PingPongBuffer
-- **Render pipelines** — `render_pipeline_create_simple` for full-screen effects, legacy `rpb_*` builder for back-compat
+- **Render pipelines** — the `gpu_pipeline_desc_*` descriptor (named entry points, optional fragment stage, vertex layouts incl. the 2D / 3D / skinned / line presets, topology, culling, blending, depth state, explicit bind group layouts); `render_pipeline_create_simple` for full-screen effects, legacy `rpb_*` builder for back-compat
+- **Bind groups and draw-time calls** — `gpu_bind_group_layout_*` / `gpu_bind_group_*` (uniform, storage, texture, sampler and comparison-sampler entries), `gpu_sampler_object_create`; vertex and u16/u32 index buffers, `gpu_render_pass_draw_indexed`, dynamic offsets, viewport, scissor, blend constant (wgpu; the native backends serve the vertex-less subset)
+- **An error channel** — validation errors return a `GPU_ERR_*` with the API's reason (`gpu_last_error_message`); error scopes; nothing aborts the host process
 - **Textures** — RGBA + block-compressed (BC1/3/4/5/7) + array/cubemap; creation, TextureCache, mip levels, GPU sampling, dimension validation
 - **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
 - **Render targets** — offscreen framebuffers with optional MSAA and depth
 - **Asset loading** — KTX2 / DDS parsers in-tree + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
 - **Native SPIR-V → GFX9 compiler** — in-tree compute-shader lowering (structured control flow, int div/mod, vectors, f64), HW-verified on Cezanne
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
-- **Profiling** — FrameProfiler with EMA smoothing, frame history, explicit scope timing
+- **Profiling** — FrameProfiler with EMA smoothing, frame history, pass timings, JSON / CSV export, explicit scope timing
 - **Caching** — ShaderCache, PipelineCache, BindGroupCache for GPU resource deduplication
 - **Capabilities** — GPU feature/limit detection, WebGPU compatibility constants
 
 ## Quick Start
 
-mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~1.2 MB it would
+mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~1.5 MB — 1,511,389 B at 4.3.0 — it would
 blow the stdlib preprocess cap). The base stdlib (`string`/`alloc`/`str`/`fmt`/
 `vec`/`io`/…) is auto-prepended by `cyrius`; a minimal consumer includes only
 these three manually, in this order, before `mabda`:
@@ -191,7 +196,7 @@ multi-backend rationale.
 
 ## Build
 
-Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.7.5+ and gcc
+Requires [Cyrius](https://github.com/MacCracken/cyrius) 6.7.18+ and gcc
 (for the GPU integration test only — CPU tests and benchmarks need
 only `cyrius`).
 
@@ -254,7 +259,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.2.0
+├── VERSION              4.3.0
 └── CHANGELOG.md
 ```
 

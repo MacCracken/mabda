@@ -5,21 +5,38 @@
 # FrameProfiler: EMA smoothing, frame timing, history ring buffer, pass timing
 # No RAII ProfileScope — use explicit profile_begin/profile_end instead
 #
-# FrameProfiler struct layout (72 bytes):
-#   +0:  frame_start_sec  (i64 — seconds from clock_gettime)
-#   +8:  frame_start_nsec (i64 — nanoseconds)
+# FrameProfiler struct layout (PROFILER_SIZE = 104 bytes):
+#   +0:  frame_start_ns   (i64 — monotonic nanoseconds; valid while +96 is 1)
+#   +8:  reserved         (was documented as frame_start_nsec; never used)
 #   +16: cpu_frame_ms     (f64)
 #   +24: avg_frame_ms     (f64)
 #   +32: fps              (f64)
 #   +40: frame_count      (i64)
 #   +48: alpha            (f64)
-#   +56: history          (vec ptr — vec of f64 frame times)
+#   +56: history          (vec ptr — vec of f64 frame times, oldest first)
 #   +64: history_cap      (i64)
+#   +72: passes           (ptr — pass_cap PassTiming records, reused frame to frame)
+#   +80: pass_count       (i64)
+#   +88: pass_cap         (i64)
+#   +96: frame_started    (i64 — 1 between begin_frame and end_frame)
 #
 # PassTiming (24 bytes):
-#   +0:  label       (str ptr)
+#   +0:  label       (str ptr — the caller's; not copied)
 #   +8:  label_len   (i64)
 #   +16: duration_ms (f64)
+#
+# 4.3.0 (issue 2026-11-15, soorat ledger L24) — parity with Rust mabda 1.0's
+# FrameProfiler, which soorat 1.2.0 re-exports:
+#   - pass timings: profiler_record_pass / _pass_count / _pass / _total_pass_time_ms,
+#     cleared by begin_frame and reset;
+#   - end_frame with no begin_frame times the frame as 0 ms (1.0's frame_start is
+#     an Option cleared at every end_frame); before 4.3.0 it timed from clock zero
+#     (the monotonic clock's whole uptime) or from a stale start;
+#   - best_frame_ms on an empty history is f64::MAX, as 1.0 folds from it;
+#   - profiler_frame_history and the two exports (export_json, export_history_csv).
+var PROFILER_SIZE = 104;
+var PROFILER_PASS_SIZE = 24;
+var _PROFILER_F64_MAX = 0x7FEFFFFFFFFFFFFF;
 
 # ================================================================
 # Time helpers — monotonic nanoseconds via lib/chrono.cyr
@@ -61,9 +78,11 @@ fn profiler_with_alpha(alpha): i64 {
 }
 
 fn profiler_with_alpha_and_history(alpha, history_cap): i64 {
-    var p = alloc(72);
-    store64(p, 0);           # frame_start_sec
-    store64(p + 8, 0);       # frame_start_nsec
+    var p = alloc(PROFILER_SIZE);
+    if (p == 0) { return 0; }
+    memset(p, 0, PROFILER_SIZE);
+    store64(p, 0);           # frame_start_ns
+    store64(p + 8, 0);       # reserved
     store64(p + 16, F64_0);  # cpu_frame_ms
     # avg_frame_ms = 16.67
     store64(p + 24, f64_div(f64_from(1667), f64_from(100)));
@@ -77,6 +96,10 @@ fn profiler_with_alpha_and_history(alpha, history_cap): i64 {
     store64(p + 48, alpha);
     store64(p + 56, vec_new());  # history vec
     store64(p + 64, history_cap);
+    store64(p + 72, 0);          # passes: allocated on the first record_pass
+    store64(p + 80, 0);
+    store64(p + 88, 0);
+    store64(p + 96, 0);          # no frame begun
     return p;
 }
 
@@ -96,14 +119,19 @@ fn profiler_begin_frame(p): i64 {
     if (_mabda_obs_enabled == 1) { sakshi_span_enter(_MABDA_FRAME_SPAN, 5); }
     var now = _time_now_ns();
     store64(p, now);
+    store64(p + 96, 1);
+    store64(p + 80, 0);          # a new frame's passes start empty (1.0: pass_times.clear())
     return 0;
 }
 
 fn profiler_end_frame(p): i64 {
-    var start = load64(p);
-    var now = _time_now_ns();
-    var elapsed_ns = now - start;
-    var elapsed_ms = _ns_to_ms(elapsed_ns);
+    # No begin_frame since the last end_frame: the frame is 0 ms (1.0's
+    # `frame_start.map(..).unwrap_or(0.0)`), still counted and recorded.
+    var elapsed_ms = F64_0;
+    if (load64(p + 96) == 1) {
+        elapsed_ms = _ns_to_ms(_time_now_ns() - load64(p));
+    }
+    store64(p + 96, 0);
 
     # cpu_frame_ms = elapsed
     store64(p + 16, elapsed_ms);
@@ -158,6 +186,7 @@ fn profiler_reset(p): i64 {
     store64(p + 24, f64_div(f64_from(1667), f64_from(100)));
     store64(p + 32, f64_from(60));
     store64(p + 40, 0);
+    store64(p + 80, 0);          # passes cleared (1.0: pass_times.clear())
     var history = load64(p + 56);
     # Clear history
     while (vec_len(history) > 0) { vec_pop(history); }
@@ -176,16 +205,160 @@ fn profiler_worst_frame_ms(p): i64 {
     return worst;
 }
 
+# Empty history: f64::MAX (1.0 folds from it). 4.3.0; this returned 0.0 before.
 fn profiler_best_frame_ms(p): i64 {
     var history = load64(p + 56);
     var len = vec_len(history);
-    if (len == 0) { return F64_0; }
+    if (len == 0) { return _PROFILER_F64_MAX; }
     var best = vec_get(history, 0);
     for (var i = 1; i < len; i = i + 1) {
         var v = vec_get(history, i);
         if (f64_lt(v, best) == 1) { best = v; }
     }
     return best;
+}
+
+# The frame-time history (a vec of f64 ms), oldest first.
+fn profiler_frame_history(p): i64 { return load64(p + 56); }
+
+# ================================================================
+# Pass timings (4.3.0, L24)
+# ================================================================
+# The pass records live in one buffer the profiler reuses from frame to frame
+# (it doubles when a frame records more passes than ever before), so recording
+# allocates nothing in steady state. The label pointer is the caller's: it must
+# stay valid while the profiler reports it (string literals do).
+
+fn profiler_record_pass(p, label, label_len, duration_ms): i64 {
+    if (p == 0) { return 0; }
+    var n = load64(p + 80);
+    var cap = load64(p + 88);
+    if (n >= cap) {
+        var ncap = cap * 2;
+        if (ncap < 8) { ncap = 8; }
+        var nb = alloc(ncap * PROFILER_PASS_SIZE);
+        if (nb == 0) { return 0; }
+        if (n > 0) { memcpy(nb, load64(p + 72), n * PROFILER_PASS_SIZE); }
+        store64(p + 72, nb);
+        store64(p + 88, ncap);
+    }
+    var r = load64(p + 72) + n * PROFILER_PASS_SIZE;
+    store64(r, label);
+    store64(r + 8, label_len);
+    store64(r + 16, duration_ms);
+    store64(p + 80, n + 1);
+    return 0;
+}
+
+fn profiler_pass_count(p): i64 { return load64(p + 80); }
+
+# The i-th PassTiming record of the current frame (24 bytes: label, label_len,
+# duration_ms), or 0 out of range.
+fn profiler_pass(p, i): i64 {
+    if (i < 0) { return 0; }
+    if (i >= load64(p + 80)) { return 0; }
+    return load64(p + 72) + i * PROFILER_PASS_SIZE;
+}
+
+fn pass_timing_label(t): i64 { return load64(t); }
+fn pass_timing_label_len(t): i64 { return load64(t + 8); }
+fn pass_timing_duration_ms(t): i64 { return load64(t + 16); }
+
+# Sum of the current frame's pass durations (f64 ms; 0.0 with none).
+fn profiler_total_pass_time_ms(p): i64 {
+    var sum = F64_0;
+    var n = load64(p + 80);
+    var base = load64(p + 72);
+    for (var i = 0; i < n; i = i + 1) {
+        sum = f64_add(sum, load64(base + i * PROFILER_PASS_SIZE + 16));
+    }
+    return sum;
+}
+
+# ================================================================
+# Exports (1.0's export_json / export_history_csv), as NUL-terminated strings
+# ================================================================
+
+# Append `n` bytes of `src` at buf+pos; returns the new pos.
+fn _prof_put(buf, pos, src, n): i64 {
+    memcpy(buf + pos, src, n);
+    return pos + n;
+}
+
+fn _prof_put_str(buf, pos, s): i64 { return _prof_put(buf, pos, s, strlen(s)); }
+
+fn _prof_put_f64(buf, pos, v, decimals): i64 { return pos + fmt_float_buf(v, buf + pos, decimals); }
+
+# {"cpu_frame_ms":d.ddd,"avg_frame_ms":d.ddd,"fps":d.d,"frame_count":N,
+#  "passes":[{"label":"...","duration_ms":d.ddd},...]} — labels JSON-escaped
+# (backslash, quote, LF, CR, TAB become \\ \" \n \r \t), as 1.0 does.
+# Capacity, from fmt_float_buf's documented bound (at most 43 bytes per float, at
+# any precision): the fixed part is at most 217 bytes (4 floats, an i64, the keys);
+# each pass at most 10 + 2*label_len (every byte escaped) + 16 + 43 + 2. Reserved
+# as 256 + 96 + 2*label_len per pass. (4.3.0 audit: the first cut reserved 64 per
+# pass and 48 per CSV line — enough at 3 decimals, whose floats print in at most
+# 24 bytes, but only by the precision's grace; the reservation now follows the
+# formatter's own bound.)
+var _PROF_JSON_FIXED    = 256;
+var _PROF_JSON_PER_PASS = 96;
+var _PROF_CSV_PER_LINE  = 72;    # i64 (20) + ',' + float (43) + '\n' = 65
+
+fn profiler_export_json(p): i64 {
+    var n = load64(p + 80);
+    var cap = _PROF_JSON_FIXED;
+    for (var i = 0; i < n; i = i + 1) {
+        cap = cap + _PROF_JSON_PER_PASS + 2 * pass_timing_label_len(profiler_pass(p, i));
+    }
+    var buf = alloc(cap);
+    if (buf == 0) { return 0; }
+    var pos = _prof_put_str(buf, 0, "{\"cpu_frame_ms\":");
+    pos = _prof_put_f64(buf, pos, load64(p + 16), 3);
+    pos = _prof_put_str(buf, pos, ",\"avg_frame_ms\":");
+    pos = _prof_put_f64(buf, pos, load64(p + 24), 3);
+    pos = _prof_put_str(buf, pos, ",\"fps\":");
+    pos = _prof_put_f64(buf, pos, load64(p + 32), 1);
+    pos = _prof_put_str(buf, pos, ",\"frame_count\":");
+    pos = pos + fmt_int_buf(load64(p + 40), buf + pos);
+    pos = _prof_put_str(buf, pos, ",\"passes\":[");
+    for (var k = 0; k < n; k = k + 1) {
+        var t = profiler_pass(p, k);
+        if (k > 0) { pos = _prof_put_str(buf, pos, ","); }
+        pos = _prof_put_str(buf, pos, "{\"label\":\"");
+        var lab = pass_timing_label(t);
+        var ll = pass_timing_label_len(t);
+        for (var c = 0; c < ll; c = c + 1) {
+            var ch = load8(lab + c);
+            if (ch == 92) { pos = _prof_put_str(buf, pos, "\\\\"); }
+            elif (ch == 34) { pos = _prof_put_str(buf, pos, "\\\""); }
+            elif (ch == 10) { pos = _prof_put_str(buf, pos, "\\n"); }
+            elif (ch == 13) { pos = _prof_put_str(buf, pos, "\\r"); }
+            elif (ch == 9) { pos = _prof_put_str(buf, pos, "\\t"); }
+            else { store8(buf + pos, ch); pos = pos + 1; }
+        }
+        pos = _prof_put_str(buf, pos, "\",\"duration_ms\":");
+        pos = _prof_put_f64(buf, pos, pass_timing_duration_ms(t), 3);
+        pos = _prof_put_str(buf, pos, "}");
+    }
+    pos = _prof_put_str(buf, pos, "]}");
+    store8(buf + pos, 0);
+    return buf;
+}
+
+# "frame,ms\n" then one "i,d.ddd\n" line per history entry, oldest first.
+fn profiler_export_history_csv(p): i64 {
+    var history = load64(p + 56);
+    var n = vec_len(history);
+    var buf = alloc(16 + n * _PROF_CSV_PER_LINE);
+    if (buf == 0) { return 0; }
+    var pos = _prof_put_str(buf, 0, "frame,ms\n");
+    for (var i = 0; i < n; i = i + 1) {
+        pos = pos + fmt_int_buf(i, buf + pos);
+        pos = _prof_put_str(buf, pos, ",");
+        pos = _prof_put_f64(buf, pos, vec_get(history, i), 3);
+        pos = _prof_put_str(buf, pos, "\n");
+    }
+    store8(buf + pos, 0);
+    return buf;
 }
 
 # ================================================================
@@ -201,4 +374,12 @@ fn profile_begin(): i64 {
 fn profile_end(start_ns): i64 {
     var now = _time_now_ns();
     return _ns_to_ms(now - start_ns);
+}
+
+# End timing a pass AND record it on `p` under `label` (1.0's ProfileScope, which
+# records on drop). Returns the duration in f64 ms.
+fn profile_end_record(p, start_ns, label, label_len): i64 {
+    var ms = profile_end(start_ns);
+    profiler_record_pass(p, label, label_len, ms);
+    return ms;
 }

@@ -2,8 +2,9 @@
 
 **Date filed:** 2026-04-30 (v3.0.0-rc.1 cut)
 **Toolchain at filing:** `cyrius 5.7.48` (mabda's pin at filing; bumped to `5.11.28` 2026-05-12 ahead of rc.3 soak)
-**Last re-checked against:** `cyrius 6.7.5` (mabda 4.2.0, 2026-10-08) — A3, A4, B3, D3 and E3 were fixed upstream in
-cyrius 6.6.5 and re-checked on 6.7.5; C4 is relaxed. (Before: `cyrius 6.5.29`, mabda 4.0.10 — Class A resolved upstream; see A1.)
+**Last re-checked against:** `cyrius 6.7.18` (mabda 4.3.0, 2026-11-16) — the full CI gate set passes on 6.7.18
+with no source change for the toolchain move; E4 is new. (Before: `cyrius 6.7.5`, mabda 4.2.0 — A3, A4, B3, D3 and E3
+fixed upstream in 6.6.5; C4 relaxed. Earlier: `cyrius 6.5.29`, mabda 4.0.10 — Class A resolved upstream; see A1.)
 **Audience:** mabda contributors + the cyrius toolchain team. Each
 entry is the smallest reproducible footprint we hit; cross-referenced
 to the deeper bug reports in `docs/development/issues/` and the
@@ -461,6 +462,26 @@ unconditionally, NOT silent on no-drift
   message suggests, needs the network.
 - **Upstream**: fixed in 6.6.5 (CHANGELOG entry "`cyrius deps` refused an untouched dep cache as
   "tampered"").
+
+### E4. `cycc` called directly ignores the manifest pin (found 4.3.0, on the NVIDIA test host) — ✅ **RESOLVED in-tree (4.3.0)**
+
+- **Resolved**: the Makefile derives `CYCC` from the pin (`~/.cyrius/versions/<pin>/bin/cycc` when
+  installed, else `cycc` from `PATH`), and the object rule writes through `$@.tmp`, so a failed
+  compile leaves no stale object. The history below is kept.
+
+- **Symptom**: the launcher-linked programs (`make test-gpu`, `build/%.o`) fail to compile with
+  errors inside `lib/*.cyr` (`undefined variable 'fd'` in `lib/io.cyr`), while `cyrius build` and
+  `cyrius test` on the same tree are clean.
+- **Why**: `cyrius` is a version manager — the `cyrius` wrapper reads `cyrius.cyml`'s pin and runs
+  `~/.cyrius/versions/<pin>/bin/...`. The Makefile's object rule pipes into `$(CYCC)` (default
+  `cycc` from `PATH`), and `~/.cyrius/bin` points at the **current** version, not the pin. On a box
+  whose `current` is older than the pin, the 6.7.18 `lib/` is compiled by an older `cycc`. A failed
+  compile also leaves a 0-byte `build/*.o` newer than its sources, so the next `make` "succeeds"
+  to a link error until the object is deleted.
+- **Workaround (before the fix)**: `make CYCC=$HOME/.cyrius/versions/<pin>/bin/cycc ...`, and
+  `rm -f build/*.o` after a failed object compile.
+- **Upstream**: nothing to file — the wrapper already follows the pin; only direct `cycc` callers
+  need to.
 
 ---
 

@@ -1,0 +1,534 @@
+# @internal — wgpu backend, render tier (v4.3.0, MB1)
+# backend_wgpu_rtier.cyr — fills the render-tier Backend slots (src/backend.cyr
+# 352..480) for wgpu: bind group layouts, bind groups, sampler objects, the
+# pipeline descriptor (render_pipeline_create_desc) and the draw-time calls.
+# The public side is src/gpu_bind.cyr, src/gpu_pipeline.cyr, src/gpu_draw.cyr.
+#
+# Every wgpu descriptor is built in a per-context scratch block (the "render
+# state", ctx+200, allocated once on first use) instead of the bump heap: wgpu
+# copies a descriptor during the create call, so the block is reused by every
+# call. Struct layouts are webgpu.h v29's, checked with offsetof (cited per
+# struct). Creates are error-scoped (_wgpu_scope_open/_close, backend_wgpu.cyr):
+# a rejected create returns 0 with wgpu's reason in the GPU error record.
+
+# ================================================================
+# Render state — per-context scratch (CTX_OFF_RENDER_STATE)
+# ================================================================
+var _WGPU_RS_BGL_ENTRIES  = 0;      # 16 x WGPUBindGroupLayoutEntry (120)  = 1920
+var _WGPU_RS_BG_ENTRIES   = 1920;   # 16 x WGPUBindGroupEntry (56)         =  896
+var _WGPU_RS_DESC         = 2816;   # one create descriptor (<= 64 bytes)
+var _WGPU_RS_PL_DESC      = 2880;   # WGPUPipelineLayoutDescriptor (48)
+var _WGPU_RS_BGL_HANDLES  = 2928;   # 8 x WGPUBindGroupLayout
+var _WGPU_RS_VB_LAYOUTS   = 2992;   # 8 x WGPUVertexBufferLayout (40)       =  320
+var _WGPU_RS_VB_ATTRS     = 3312;   # 8 x 16 x WGPUVertexAttribute (32)     = 4096
+var _WGPU_RS_TARGETS      = 7408;   # 8 x WGPUColorTargetState (32)         =  256
+var _WGPU_RS_BLENDS       = 7664;   # 8 x WGPUBlendState (24)               =  192
+var _WGPU_RS_FRAGMENT     = 7856;   # WGPUFragmentState (64)
+var _WGPU_RS_DEPTH        = 7920;   # WGPUDepthStencilState (72)
+var _WGPU_RS_PIPE_DESC    = 7992;   # WGPURenderPipelineDescriptor (168)
+var _WGPU_RS_PASS         = 8160;   # the reused pass record (64)
+var _WGPU_RS_COLOR_ATT    = 8224;   # WGPURenderPassColorAttachment (72)
+var _WGPU_RS_BEGIN_ARGS   = 8296;   # WgpuBeginPassArgs (40, deps/wgpu_main.c)
+var _WGPU_RS_VIEWPORT     = 8336;   # six f32 for the viewport shim (24)
+var _WGPU_RS_SAMPLERS     = 8360;   # the bind_for_sample sampler cache: 4 intents x 8
+var _WGPU_RS_SIZE         = 8448;
+
+fn _wgpu_render_state(ctx): i64 {
+    var rs = load64(ctx + CTX_OFF_RENDER_STATE);
+    if (rs == 0) {
+        rs = alloc(_WGPU_RS_SIZE);
+        if (rs == 0) { return 0; }
+        memset(rs, 0, _WGPU_RS_SIZE);
+        store64(ctx + CTX_OFF_RENDER_STATE, rs);
+    }
+    return rs;
+}
+
+# ================================================================
+# Bind group layouts
+# ================================================================
+# WGPUBindGroupLayoutEntry (120 B): binding +8, visibility +16 (u64),
+# bindingArraySize +24, buffer +32 {type +40, hasDynamicOffset +44,
+# minBindingSize +48}, sampler +56 {type +64}, texture +72 {sampleType +80,
+# viewDimension +84, multisampled +88}. WGPUBindGroupLayoutDescriptor (40 B):
+# label +8, entryCount +24, entries +32.
+fn _backend_wgpu_bind_group_layout_create(ctx, l): i64 {
+    if (ctx == 0) { return 0; }
+    if (l == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var n = gpu_bgl_entry_count(l);
+    if (n > GPU_BGL_MAX_ENTRIES) { return 0; }
+    var out = rs + _WGPU_RS_BGL_ENTRIES;
+    for (var i = 0; i < n; i = i + 1) {
+        var e = gpu_bgl_entry(l, i);
+        var w = out + i * 120;
+        var kind = load32(e + 4);
+        var binding = load32(e);
+        var vis = load64(e + 8);
+        if (kind == GPU_BINDING_UNIFORM) {
+            wgpu_bgl_entry_buffer(w, binding, vis, WGPU_BUFFER_BINDING_TYPE_UNIFORM, load64(e + 16), load64(e + 24));
+        } elif (kind == GPU_BINDING_STORAGE) {
+            wgpu_bgl_entry_buffer(w, binding, vis, WGPU_BUFFER_BINDING_TYPE_STORAGE, load64(e + 16), load64(e + 24));
+        } elif (kind == GPU_BINDING_STORAGE_READ_ONLY) {
+            wgpu_bgl_entry_buffer(w, binding, vis, WGPU_BUFFER_BINDING_TYPE_READ_ONLY_STORAGE,
+              load64(e + 16), load64(e + 24));
+        } elif (kind == GPU_BINDING_TEXTURE) {
+            wgpu_bgl_entry_texture(w, binding, vis, load64(e + 16), load64(e + 24), load64(e + 32));
+        } elif (kind == GPU_BINDING_SAMPLER) {
+            memset(w, 0, 120);
+            store32(w + 8, binding);
+            store64(w + 16, vis);
+            store32(w + 64, load64(e + 16));
+        } else {
+            _gpu_err_record(GPU_ERR_PIPELINE, "bind group layout: unknown entry kind", 1);
+            return 0;
+        }
+    }
+    var d = rs + _WGPU_RS_DESC;
+    memset(d, 0, 40);
+    store64(d + 24, n);
+    store64(d + 32, out);
+    var device = gpu_ctx_device(ctx);
+    var scoped = _wgpu_scope_open(device);
+    var h = wgpu_device_create_bind_group_layout(device, d);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (h != 0) { wgpu_bind_group_layout_release(h); }
+            return 0;
+        }
+    }
+    return h;
+}
+
+fn _backend_wgpu_bind_group_layout_release(ctx, bgl): i64 {
+    if (bgl == 0) { return 0; }
+    wgpu_bind_group_layout_release(bgl);
+    return 0;
+}
+
+# ================================================================
+# Bind groups
+# ================================================================
+# WGPUBindGroupEntry (56 B): binding +8, buffer +16, offset +24, size +32,
+# sampler +40, textureView +48. WGPUBindGroupDescriptor (48 B): label +8,
+# layout +24, entryCount +32, entries +40. A mabda wgpu texture / render target
+# keeps its default view at +8.
+fn _backend_wgpu_bind_group_create(ctx, g): i64 {
+    if (ctx == 0) { return 0; }
+    if (g == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var n = gpu_bg_entry_count(g);
+    if (n > GPU_BGL_MAX_ENTRIES) { return 0; }
+    var out = rs + _WGPU_RS_BG_ENTRIES;
+    for (var i = 0; i < n; i = i + 1) {
+        var e = gpu_bg_entry(g, i);
+        var w = out + i * 56;
+        memset(w, 0, 56);
+        store32(w + 8, load32(e));
+        var kind = load32(e + 4);
+        var res = load64(e + 8);
+        if (kind == GPU_BG_BUFFER) {
+            var size = load64(e + 24);
+            if (size == 0) { size = WGPU_WHOLE_SIZE; }
+            store64(w + 16, res);
+            store64(w + 24, load64(e + 16));
+            store64(w + 32, size);
+        } elif (kind == GPU_BG_TEXTURE) {
+            var view = load64(res + 8);
+            if (view == 0) {
+                _gpu_err_record(GPU_ERR_TEXTURE, "bind group: a texture entry has no view (released?)", 1);
+                return 0;
+            }
+            store64(w + 48, view);
+        } elif (kind == GPU_BG_SAMPLER) {
+            store64(w + 40, res);
+        } else {
+            _gpu_err_record(GPU_ERR_PIPELINE, "bind group: unknown entry kind", 1);
+            return 0;
+        }
+    }
+    var d = rs + _WGPU_RS_DESC;
+    memset(d, 0, 48);
+    store64(d + 24, load64(g));
+    store64(d + 32, n);
+    store64(d + 40, out);
+    var device = gpu_ctx_device(ctx);
+    var scoped = _wgpu_scope_open(device);
+    var h = wgpu_device_create_bind_group(device, d);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (h != 0) { wgpu_bind_group_release(h); }
+            return 0;
+        }
+    }
+    return h;
+}
+
+fn _backend_wgpu_bind_group_release(ctx, bg): i64 {
+    if (bg == 0) { return 0; }
+    wgpu_bind_group_release(bg);
+    return 0;
+}
+
+# ================================================================
+# Sampler objects
+# ================================================================
+# WGPUSamplerDescriptor (64 B): label +8, addressModeU/V/W +24/+28/+32,
+# magFilter +36, minFilter +40, mipmapFilter +44, lodMinClamp +48 (f32),
+# lodMaxClamp +52 (f32), compare +56, maxAnisotropy +60 (u16). GPU_FILTER_* and
+# GPU_ADDRESS_* / GPU_COMPARE_* carry the WGPU values (gpu_types.cyr), and
+# WGPUMipmapFilterMode numbers Nearest/Linear the same as WGPUFilterMode.
+fn _backend_wgpu_sampler_object_create(ctx, sd): i64 {
+    if (ctx == 0) { return 0; }
+    if (sd == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var filter = load64(sd);
+    var addr = load64(sd + 8);
+    var d = rs + _WGPU_RS_DESC;
+    memset(d, 0, 64);
+    store32(d + 24, addr);
+    store32(d + 28, addr);
+    store32(d + 32, addr);
+    store32(d + 36, filter);
+    store32(d + 40, filter);
+    store32(d + 44, filter);
+    store32(d + 52, 0x42000000);   # lodMaxClamp = 32.0f (WGPU_SAMPLER_DESCRIPTOR_INIT)
+    store32(d + 56, load64(sd + 16));
+    store16(d + 60, load64(sd + 24));
+    var device = gpu_ctx_device(ctx);
+    var scoped = _wgpu_scope_open(device);
+    var h = wgpu_device_create_sampler(device, d);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (h != 0) { wgpu_sampler_release(h); }
+            return 0;
+        }
+    }
+    return h;
+}
+
+fn _backend_wgpu_sampler_object_release(ctx, s): i64 {
+    if (s == 0) { return 0; }
+    wgpu_sampler_release(s);
+    return 0;
+}
+
+# ================================================================
+# Render pipelines from a descriptor (src/gpu_pipeline.cyr)
+# ================================================================
+# v29 layouts (offsetof): WGPURenderPipelineDescriptor (168 B) label +8,
+# layout +24, vertex +32 (WGPUVertexState, 64 B: module +8, entryPoint +16,
+# constantCount +32, constants +40, bufferCount +48, buffers +56), primitive +96
+# (32 B: topology +8, stripIndexFormat +12, frontFace +16, cullMode +20,
+# unclippedDepth +24), depthStencil +128 (ptr), multisample +136 (24 B: count
+# +8, mask +12, alphaToCoverageEnabled +16), fragment +160 (ptr).
+# WGPUVertexBufferLayout (40 B): stepMode +8, arrayStride +16, attributeCount
+# +24, attributes +32; WGPUVertexAttribute (32 B) via _vertex_attr (vertex.cyr).
+# WGPUFragmentState (64 B): module +8, entryPoint +16, targetCount +48,
+# targets +56. WGPUColorTargetState (32 B): format +8, blend +16 (ptr),
+# writeMask +24 (u64). WGPUBlendState (24 B): color {op +0, src +4, dst +8},
+# alpha {op +12, src +16, dst +20}. WGPUDepthStencilState (72 B): format +8,
+# depthWriteEnabled +12 (WGPUOptionalBool), depthCompare +16, stencilFront +20 /
+# stencilBack +36 (compare, failOp, depthFailOp, passOp), stencilReadMask +52,
+# stencilWriteMask +56, depthBias +60 (i32), depthBiasSlopeScale +64 (f32),
+# depthBiasClamp +68 (f32). WGPUPipelineLayoutDescriptor (48 B): label +8,
+# bindGroupLayoutCount +24, bindGroupLayouts +32, immediateSize +40.
+var _WGPU_STENCIL_OP_KEEP = 1;
+
+fn _wgpu_stencil_face_default(dst): i64 {
+    store32(dst, WGPU_COMPARE_ALWAYS);
+    store32(dst + 4, _WGPU_STENCIL_OP_KEEP);
+    store32(dst + 8, _WGPU_STENCIL_OP_KEEP);
+    store32(dst + 12, _WGPU_STENCIL_OP_KEEP);
+    return 0;
+}
+
+fn _backend_wgpu_render_pipeline_create_desc(ctx, d): i64 {
+    if (ctx == 0) { return 0; }
+    if (d == 0) { return 0; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var device = gpu_ctx_device(ctx);
+
+    # 1. An explicit pipeline layout when the descriptor names group layouts.
+    var layout = 0;
+    var gc = load64(d + 80);
+    if (gc > 0) {
+        var hs = rs + _WGPU_RS_BGL_HANDLES;
+        for (var g = 0; g < gc; g = g + 1) {
+            store64(hs + g * 8, load64(d + GPU_PIPE_OFF_GROUPS + g * 8));
+        }
+        var pl = rs + _WGPU_RS_PL_DESC;
+        memset(pl, 0, 48);
+        store64(pl + 24, gc);
+        store64(pl + 32, hs);
+        var scoped_pl = _wgpu_scope_open(device);
+        layout = wgpu_device_create_pipeline_layout(device, pl);
+        if (scoped_pl == 0) {
+            if (_wgpu_scope_close(ctx, device) != 0) {
+                if (layout != 0) { wgpu_pipeline_layout_release(layout); }
+                return 0;
+            }
+        }
+        if (layout == 0) { return 0; }
+    }
+
+    # 2. The pipeline descriptor.
+    var pd = rs + _WGPU_RS_PIPE_DESC;
+    memset(pd, 0, 168);
+    var label = load64(d + 56);
+    if (label != 0) { wgpu_string_view(pd + 8, label); }
+    store64(pd + 24, layout);
+
+    # Vertex state + buffers.
+    var vs = pd + 32;
+    store64(vs + 8, load64(d));
+    wgpu_string_view(vs + 16, load64(d + 8));
+    var nb = load64(d + 64);
+    store64(vs + 48, nb);
+    if (nb > 0) { store64(vs + 56, rs + _WGPU_RS_VB_LAYOUTS); }
+    for (var b = 0; b < nb; b = b + 1) {
+        var src = d + GPU_PIPE_OFF_VB + b * GPU_PIPE_VB_SIZE;
+        var vbl = rs + _WGPU_RS_VB_LAYOUTS + b * 40;
+        var attrs = rs + _WGPU_RS_VB_ATTRS + b * GPU_PIPE_MAX_ATTRIBUTES * 32;
+        var na = load64(src + 16);
+        memset(vbl, 0, 40);
+        store32(vbl + 8, load64(src + 8));
+        store64(vbl + 16, load64(src));
+        store64(vbl + 24, na);
+        store64(vbl + 32, attrs);
+        for (var a = 0; a < na; a = a + 1) {
+            var at = src + 24 + a * 24;
+            _vertex_attr(attrs + a * 32, load64(at), load64(at + 8), load64(at + 16));
+        }
+    }
+
+    # Primitive.
+    _primitive_state_init(pd + 96, load64(d + 32), load64(d + 48), load64(d + 40));
+    store32(pd + 96 + 12, load64(d + 160));
+
+    # Depth / stencil.
+    if (load64(d + 88) != 0) {
+        var ds = rs + _WGPU_RS_DEPTH;
+        memset(ds, 0, 72);
+        store32(ds + 8, mabda_texfmt_to_wgpu(load64(d + 96)));
+        store32(ds + 12, load64(d + 104));            # WGPUOptionalBool: 0 False, 1 True
+        store32(ds + 16, load64(d + 112));
+        _wgpu_stencil_face_default(ds + 20);
+        _wgpu_stencil_face_default(ds + 36);
+        store32(ds + 52, 0xFFFFFFFF);
+        store32(ds + 56, 0xFFFFFFFF);
+        store32(ds + 60, load64(d + 120));
+        store32(ds + 64, load64(d + 128));
+        store32(ds + 68, load64(d + 136));
+        store64(pd + 128, ds);
+    }
+
+    # Multisample.
+    _multisample_state_init(pd + 136, load64(d + 144));
+    store32(pd + 136 + 16, load64(d + 152));
+
+    # Fragment state + colour targets.
+    if (load64(d + 16) != 0) {
+        var fr = rs + _WGPU_RS_FRAGMENT;
+        memset(fr, 0, 64);
+        store64(fr + 8, load64(d + 16));
+        wgpu_string_view(fr + 16, load64(d + 24));
+        var nt = load64(d + 72);
+        store64(fr + 48, nt);
+        if (nt > 0) { store64(fr + 56, rs + _WGPU_RS_TARGETS); }
+        for (var t = 0; t < nt; t = t + 1) {
+            var tsrc = d + GPU_PIPE_OFF_TARGETS + t * GPU_PIPE_TARGET_SIZE;
+            var ct = rs + _WGPU_RS_TARGETS + t * 32;
+            memset(ct, 0, 32);
+            store32(ct + 8, mabda_texfmt_to_wgpu(load64(tsrc)));
+            if (load64(tsrc + 16) != 0) {
+                var bl = rs + _WGPU_RS_BLENDS + t * 24;
+                store32(bl, load64(tsrc + 24));
+                store32(bl + 4, load64(tsrc + 32));
+                store32(bl + 8, load64(tsrc + 40));
+                store32(bl + 12, load64(tsrc + 48));
+                store32(bl + 16, load64(tsrc + 56));
+                store32(bl + 20, load64(tsrc + 64));
+                store64(ct + 16, bl);
+            }
+            store64(ct + 24, load64(tsrc + 8));
+        }
+        store64(pd + 160, fr);
+    }
+
+    # 3. Create, scoped. The pipeline keeps its own reference to the layout.
+    var scoped = _wgpu_scope_open(device);
+    var h = wgpu_device_create_render_pipeline(device, pd);
+    var rejected = 0;
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) { rejected = 1; }
+    }
+    if (layout != 0) { wgpu_pipeline_layout_release(layout); }
+    if (rejected == 1) {
+        if (h != 0) { wgpu_render_pipeline_release(h); }
+        return 0;
+    }
+    if (h == 0) { return 0; }
+    var pipe = alloc(16);
+    if (pipe == 0) { wgpu_render_pipeline_release(h); return 0; }
+    store64(pipe, h);
+    store64(pipe + 8, 0);
+    return pipe;
+}
+
+# ================================================================
+# Draw-time calls (src/gpu_draw.cyr) — launcher slots 59-61, 67-72
+# ================================================================
+# `pass` is the record _backend_wgpu_render_pass_begin returns: the
+# WGPURenderPassEncoder is at +8. The public calls validated the arguments; the
+# rest is wgpu's (a refusal surfaces at gpu_render_pass_end). A pre-4.3.0
+# launcher has no slots 67-72: those wrappers return GPU_ERR_FFI_SYMBOL.
+
+fn _wgpu_pass_encoder(pass): i64 {
+    if (pass == 0) { return 0; }
+    return load64(pass + 8);
+}
+
+fn _backend_wgpu_pass_set_pipeline(ctx, pass, pipe): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    var h = load64(pipe);
+    if (h == 0) { return GPU_ERR_PIPELINE; }
+    wgpu_render_pass_encoder_set_pipeline(pe, h);
+    return 0;
+}
+
+fn _backend_wgpu_pass_set_vertex_buffer(ctx, pass, slot, buf, off, size): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    var sz = size;
+    if (sz == 0) { sz = WGPU_WHOLE_SIZE; }
+    return wgpu_render_pass_encoder_set_vertex_buffer(pe, slot, buf, off, sz);
+}
+
+fn _backend_wgpu_pass_set_index_buffer(ctx, pass, buf, fmt, off, size): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    var sz = size;
+    if (sz == 0) { sz = WGPU_WHOLE_SIZE; }
+    return wgpu_render_pass_encoder_set_index_buffer(pe, buf, fmt, off, sz);
+}
+
+fn _backend_wgpu_pass_set_bind_group(ctx, pass, group, bg, n, offsets): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    wgpu_render_pass_encoder_set_bind_group(pe, group, bg, n, offsets);
+    return 0;
+}
+
+fn _backend_wgpu_pass_draw(ctx, pass, vc, ic, fv, fi): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    wgpu_render_pass_encoder_draw(pe, vc, ic, fv, fi);
+    return 0;
+}
+
+fn _backend_wgpu_pass_draw_indexed(ctx, pass, ic, inst, first_index, base_vertex, first_inst): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    return wgpu_render_pass_encoder_draw_indexed(pe, ic, inst, first_index, base_vertex, first_inst);
+}
+
+# v64 = six f64 (x, y, w, h, min depth, max depth); the launcher's viewport shim
+# takes six f32 (f64 internally, f32 at the GPU boundary).
+fn _backend_wgpu_pass_set_viewport(ctx, pass, v64): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return GPU_ERR_OTHER; }
+    var vp = rs + _WGPU_RS_VIEWPORT;
+    for (var i = 0; i < 6; i = i + 1) {
+        store32(vp + i * 4, f64_to_f32(load64(v64 + i * 8)));
+    }
+    return wgpu_render_pass_encoder_set_viewport(pe, vp);
+}
+
+fn _backend_wgpu_pass_set_scissor(ctx, pass, x, y, w, h): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    return wgpu_render_pass_encoder_set_scissor_rect(pe, x, y, w, h);
+}
+
+# A mabda Color (four f64 r, g, b, a) is a WGPUColor.
+fn _backend_wgpu_pass_set_blend_constant(ctx, pass, color): i64 {
+    var pe = _wgpu_pass_encoder(pass);
+    if (pe == 0) { return GPU_ERR_OTHER; }
+    return wgpu_render_pass_encoder_set_blend_constant(pe, color);
+}
+
+# ================================================================
+# The textured-draw sampler cache (4.3.0, L17)
+# ================================================================
+# gpu_render_pass_bind_texture's sampler is an intent (sampler.cyr: filter and
+# address bits), and before 4.3.0 every textured draw created a WGPUSampler from
+# it and released it afterwards, bump-allocating its descriptor. There are four
+# intents (point / bilinear x clamp / wrap); each is created once per context and
+# kept in the render state until the context is released.
+fn _wgpu_cached_sampler(ctx, intent): i64 {
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
+    var f = gpu_sampler_filter(intent) & 1;
+    var a = gpu_sampler_addr(intent) & 1;
+    var slot = rs + _WGPU_RS_SAMPLERS + (f + a * 2) * 8;
+    var s = load64(slot);
+    if (s != 0) { return s; }
+    var d = rs + _WGPU_RS_DESC;
+    _sampler_desc_init(d, 0);
+    var amode = WGPU_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (a == NATIVE_SAMP_ADDR_WRAP) { amode = WGPU_ADDRESS_MODE_REPEAT; }
+    store32(d + 24, amode);
+    store32(d + 28, amode);
+    store32(d + 32, amode);
+    var fmode = WGPU_FILTER_MODE_NEAREST;
+    if (f == NATIVE_SAMP_FILTER_BILINEAR) { fmode = WGPU_FILTER_MODE_LINEAR; }
+    store32(d + 36, fmode);
+    store32(d + 40, fmode);
+    store32(d + 44, WGPU_MIPMAP_FILTER_NEAREST);
+    s = wgpu_device_create_sampler(gpu_ctx_device(ctx), d);
+    store64(slot, s);
+    return s;
+}
+
+# Release what the render state holds (called from the wgpu ctx release).
+fn _wgpu_render_state_release(ctx): i64 {
+    var rs = load64(ctx + CTX_OFF_RENDER_STATE);
+    if (rs == 0) { return 0; }
+    for (var i = 0; i < 4; i = i + 1) {
+        var s = load64(rs + _WGPU_RS_SAMPLERS + i * 8);
+        if (s != 0) { wgpu_sampler_release(s); }
+        store64(rs + _WGPU_RS_SAMPLERS + i * 8, 0);
+    }
+    return 0;
+}
+
+# ================================================================
+# Slot registration — called from backend_wgpu_new
+# ================================================================
+fn _backend_wgpu_fill_rtier(b): i64 {
+    backend_set_slot(b, BACKEND_SLOT_BIND_GROUP_LAYOUT_CREATE,  &_backend_wgpu_bind_group_layout_create);
+    backend_set_slot(b, BACKEND_SLOT_BIND_GROUP_LAYOUT_RELEASE, &_backend_wgpu_bind_group_layout_release);
+    backend_set_slot(b, BACKEND_SLOT_BIND_GROUP_CREATE,         &_backend_wgpu_bind_group_create);
+    backend_set_slot(b, BACKEND_SLOT_BIND_GROUP_RELEASE,        &_backend_wgpu_bind_group_release);
+    backend_set_slot(b, BACKEND_SLOT_SAMPLER_OBJECT_CREATE,     &_backend_wgpu_sampler_object_create);
+    backend_set_slot(b, BACKEND_SLOT_SAMPLER_OBJECT_RELEASE,    &_backend_wgpu_sampler_object_release);
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE_DESC, &_backend_wgpu_render_pipeline_create_desc);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_PIPELINE,         &_backend_wgpu_pass_set_pipeline);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_VERTEX_BUFFER,    &_backend_wgpu_pass_set_vertex_buffer);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_INDEX_BUFFER,     &_backend_wgpu_pass_set_index_buffer);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_BIND_GROUP,       &_backend_wgpu_pass_set_bind_group);
+    backend_set_slot(b, BACKEND_SLOT_PASS_DRAW,                 &_backend_wgpu_pass_draw);
+    backend_set_slot(b, BACKEND_SLOT_PASS_DRAW_INDEXED,         &_backend_wgpu_pass_draw_indexed);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_VIEWPORT,         &_backend_wgpu_pass_set_viewport);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_SCISSOR,          &_backend_wgpu_pass_set_scissor);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_BLEND_CONSTANT,   &_backend_wgpu_pass_set_blend_constant);
+    return 0;
+}

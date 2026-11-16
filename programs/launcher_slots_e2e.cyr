@@ -1,0 +1,347 @@
+# programs/launcher_slots_e2e.cyr — the v4.3.0 launcher revision on real hardware
+#
+# Drives every new deps/wgpu_main.c slot that can run without a window, against
+# wgpu-native through the C launcher, and checks what the GPU did:
+#   - the slot-count handshake (the launcher reports 81 before mabda_main);
+#   - [75] an invalid shader no longer aborts the process: the uncaptured error is
+#     recorded and taken, with its message;
+#   - [73]/[74] an error scope attributes a validation error to the call that
+#     raised it, and reports NoError for a valid call;
+#   - [68]/[69] an indexed draw of a vertex-less full-screen triangle (WGSL reads
+#     @builtin(vertex_index), which takes the INDEX values), restricted by
+#     [70] a viewport (left half) and [71] a scissor rect (top half), so only
+#     the top-left quadrant turns green — read back and checked per quadrant;
+#   - [72] the blend constant and [80] render-pass debug groups inside that pass,
+#     with the whole pass under an error scope that must report NoError;
+#   - [77] texture-to-texture copy, checked byte for byte;
+#   - [76] releasing a finished command buffer that is never submitted;
+#   - [35] the submit shim's release (L17) runs on every submit above;
+#   - [29]/[35] an encoding error is refused at finish instead of aborting at submit.
+# [67] (set vertex buffer) needs a pipeline with a vertex layout: it is proven
+# with the MB1 pipeline descriptor (programs/render_mesh_e2e.cyr). [78]/[79]
+# (Wayland surface, capabilities) need a wl_display: proven at MB5.
+#
+# Linked with deps/wgpu_main.c via the Makefile target `test-launcher-slots-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+fn _info(msg): i64 { _e2e_line(1, "  ", msg); return 0; }
+
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+# A vertex-less full-screen triangle: positions come from vertex_index.
+var _FULLSCREEN_GREEN = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
+";
+
+# Return type u32 for a vec4<f32> position: a WGSL validation error.
+var _BAD_WGSL = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return 1u; }";
+
+# A shader module straight through wgpu (slot 16), NOT gpu_shader_module_create:
+# since 4.3.0 that call scopes itself, and these checks drive the raw slots.
+fn _raw_module(ctx, src): i64 {
+    var desc = wgpu_shader_module_descriptor(0, wgpu_shader_source_wgsl_len(src, strlen(src)));
+    return wgpu_device_create_shader_module(gpu_ctx_device(ctx), desc);
+}
+
+# Read pixel (x, y) of a W-wide RGBA8 readback as 0xRRGGBBAA.
+fn _px(mapped, row_bytes, x, y): i64 {
+    var p = mapped + y * row_bytes + x * 4;
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+
+# Copy a W x H RGBA8 texture into a MAP_READ buffer and map it. Returns the
+# mapped pointer (0 on failure); the caller unmaps `buf_out`'s buffer.
+fn _readback(ctx, tex_handle, w, h, buf_out): i64 {
+    var device = gpu_ctx_device(ctx);
+    var row = w * 4;
+    var size = row * h;
+    var rdesc = wgpu_buffer_descriptor("slots-readback",
+      WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST, size, 0);
+    var buf = wgpu_device_create_buffer(device, rdesc);
+    if (buf == 0) { return 0; }
+    store64(buf_out, buf);
+    var cargs[72];
+    memset(&cargs, 0, 72);
+    store64(&cargs + 0, tex_handle);
+    store64(&cargs + 32, buf);
+    store32(&cargs + 48, row);
+    store32(&cargs + 52, h);
+    store32(&cargs + 56, w);
+    store32(&cargs + 60, h);
+    store32(&cargs + 64, 1);
+    var enc = wgpu_device_create_command_encoder(device, "slots-readback-enc");
+    if (enc == 0) { return 0; }
+    wgpu_command_encoder_copy_texture_to_buffer(enc, &cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "slots-readback-cmd");
+    wgpu_command_encoder_release(enc);
+    if (cmd == 0) { return 0; }
+    wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+    var st = wgpu_buffer_map_sync(device, buf, WGPU_MAP_MODE_READ, 0, size);
+    if (st != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) { return 0; }
+    return wgpu_buffer_get_const_mapped_range(buf, 0, size);
+}
+
+fn _check_handshake(): i64 {
+    if (wgpu_launcher_slot_count() != WGPU_FN_COUNT) {
+        return _fail("launcher handshake: slot count is not 81 (mabda_wgpu_launcher_slots never called?)");
+    }
+    _pass("launcher handshake: 81 slots reported before mabda_main");
+    return 0;
+}
+
+fn _check_uncaptured(ctx): i64 {
+    var msg[2048];
+    var cnt[8];
+    wgpu_take_uncaptured_error(&msg, 2048, &cnt);   # drain anything earlier
+    _raw_module(ctx, _BAD_WGSL);
+    # Reaching this line at all is the point: wgpu-native's default handler panicked here.
+    var t = wgpu_take_uncaptured_error(&msg, 2048, &cnt);
+    if (t != WGPU_ERROR_TYPE_VALIDATION) { return _fail("[75] invalid shader: uncaptured type is not Validation"); }
+    if (load64(&cnt) < 1) { return _fail("[75] uncaptured error count < 1"); }
+    if (strlen(&msg) == 0) { return _fail("[75] uncaptured error has no message"); }
+    _pass("[75] invalid shader recorded as an uncaptured Validation error, process alive");
+    _info(&msg);
+    if (wgpu_take_uncaptured_error(&msg, 2048, &cnt) != 0) { return _fail("[75] take did not clear"); }
+    _pass("[75] take clears the record");
+    return 0;
+}
+
+fn _check_scope(ctx): i64 {
+    var device = gpu_ctx_device(ctx);
+    var msg[2048];
+    var cnt[8];
+    if (wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION) != 0) { return _fail("[73] push"); }
+    _raw_module(ctx, _BAD_WGSL);
+    var t = wgpu_device_pop_error_scope(device, &msg, 2048);
+    if (t != WGPU_ERROR_TYPE_VALIDATION) { return _fail("[74] scope around an invalid shader is not Validation"); }
+    if (strlen(&msg) == 0) { return _fail("[74] scoped error has no message"); }
+    if (wgpu_take_uncaptured_error(&msg, 2048, &cnt) != 0) {
+        return _fail("[74] a scoped error also reached the uncaptured channel");
+    }
+    _pass("[73]/[74] error scope catches the invalid shader (not uncaptured)");
+    wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION);
+    var m = _raw_module(ctx, _FULLSCREEN_GREEN);
+    t = wgpu_device_pop_error_scope(device, &msg, 2048);
+    if (m == 0) { return _fail("[74] valid shader module failed"); }
+    if (t != WGPU_ERROR_TYPE_NO_ERROR) { return _fail("[74] scope around a valid shader is not NoError"); }
+    _pass("[73]/[74] error scope reports NoError for a valid shader");
+    return 0;
+}
+
+# The indexed, viewported, scissored draw. Quadrants of a 64x64 target cleared red:
+# the triangle covers the viewport (x < 32), the scissor keeps y < 32.
+fn _check_draw(ctx): i64 {
+    var device = gpu_ctx_device(ctx);
+    var msg[2048];
+    var m = gpu_shader_module_create(ctx, _FULLSCREEN_GREEN, strlen(_FULLSCREEN_GREEN));
+    if (m == 0) { return _fail("draw: shader module"); }
+    var pipe = gpu_render_pipeline_create(ctx, m, m, 0);
+    if (pipe == 0) { return _fail("draw: pipeline"); }
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt == 0) { return _fail("draw: render target"); }
+    # u16 indices 0,1,2 (+ one pad index: a buffer write must be a multiple of 4 bytes).
+    var idx[8];
+    store16(&idx, 0);
+    store16(&idx + 2, 1);
+    store16(&idx + 4, 2);
+    store16(&idx + 6, 0);
+    var ibuf = gpu_buffer_create(ctx, 8, WGPU_BUFFER_USAGE_INDEX | WGPU_BUFFER_USAGE_COPY_DST);
+    if (ibuf == 0) { return _fail("draw: index buffer"); }
+    gpu_buffer_write(ctx, ibuf, 0, &idx, 8);
+
+    wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION);
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    if (pass == 0) { return _fail("draw: pass begin"); }
+    var penc = load64(pass + 8);
+    if (debug_render_push(penc, "slots-e2e") != 0) { return _fail("[80] render-pass debug push"); }
+    wgpu_render_pass_encoder_set_pipeline(penc, load64(pipe));
+    var vp[24];
+    store32(&vp + 0,  f64_to_f32(F64_0));
+    store32(&vp + 4,  f64_to_f32(F64_0));
+    store32(&vp + 8,  f64_to_f32(f64_from(32)));
+    store32(&vp + 12, f64_to_f32(f64_from(64)));
+    store32(&vp + 16, f64_to_f32(F64_0));
+    store32(&vp + 20, f64_to_f32(F64_1));
+    if (wgpu_render_pass_encoder_set_viewport(penc, &vp) != 0) { return _fail("[70] viewport"); }
+    if (wgpu_render_pass_encoder_set_scissor_rect(penc, 0, 0, 64, 32) != 0) { return _fail("[71] scissor"); }
+    var bc = color_new(F64_0, F64_0, F64_0, F64_1);
+    if (wgpu_render_pass_encoder_set_blend_constant(penc, bc) != 0) { return _fail("[72] blend constant"); }
+    if (wgpu_render_pass_encoder_set_index_buffer(penc, ibuf, WGPU_INDEX_FORMAT_UINT16, 0, 8) != 0) {
+        return _fail("[68] index buffer");
+    }
+    debug_render_marker(penc, "draw");
+    if (wgpu_render_pass_encoder_draw_indexed(penc, 3, 1, 0, 0, 0) != 0) { return _fail("[69] draw indexed"); }
+    debug_render_pop(penc);
+    gpu_render_pass_end(ctx, pass);
+    var t = wgpu_device_pop_error_scope(device, &msg, 2048);
+    if (t != WGPU_ERROR_TYPE_NO_ERROR) {
+        _info(&msg);
+        return _fail("draw: the pass raised a validation error");
+    }
+    _pass("[68]/[69]/[70]/[71]/[72]/[80] indexed draw encoded and submitted, no validation error");
+
+    var rbuf[8];
+    store64(&rbuf, 0);
+    var mapped = _readback(ctx, load64(rt), 64, 64, &rbuf);
+    if (mapped == 0) { return _fail("draw: readback"); }
+    var tl = _px(mapped, 256, 8, 8);
+    var tr = _px(mapped, 256, 48, 8);
+    var bl = _px(mapped, 256, 8, 48);
+    var br = _px(mapped, 256, 48, 48);
+    wgpu_buffer_unmap(load64(&rbuf));
+    if (tl != 0x00FF00FF) { return _fail("draw: top-left (inside viewport and scissor) is not green"); }
+    _pass("[69] top-left quadrant green: the indexed draw rendered");
+    if (tr != 0xFF0000FF) { return _fail("draw: top-right is not the red clear (viewport ignored?)"); }
+    _pass("[70] top-right quadrant red: the viewport limited the draw to x < 32");
+    if (bl != 0xFF0000FF) { return _fail("draw: bottom-left is not the red clear (scissor ignored?)"); }
+    _pass("[71] bottom-left quadrant red: the scissor limited the draw to y < 32");
+    if (br != 0xFF0000FF) { return _fail("draw: bottom-right is not the red clear"); }
+    _pass("bottom-right quadrant red");
+    return 0;
+}
+
+fn _check_copy_t2t(ctx): i64 {
+    var device = gpu_ctx_device(ctx);
+    var msg[2048];
+    var a = gpu_texture_create_2d_rgba8(ctx, 4, 4);
+    var b = gpu_texture_create_2d_rgba8(ctx, 4, 4);
+    if (a == 0) { return _fail("[77] texture A"); }
+    if (b == 0) { return _fail("[77] texture B"); }
+    var src[64];
+    for (var i = 0; i < 64; i = i + 1) { store8(&src + i, (i * 7 + 3) & 0xFF); }
+    if (gpu_texture_write(ctx, a, &src, 64) != 0) { return _fail("[77] write A"); }
+    # WGPUTexelCopyTextureInfo (32 B): texture@0 mipLevel@8 origin x/y/z@12/16/20 aspect@24.
+    var si[32];
+    var di[32];
+    memset(&si, 0, 32);
+    memset(&di, 0, 32);
+    store64(&si, load64(a));
+    store32(&si + 24, WGPU_TEXTURE_ASPECT_ALL);
+    store64(&di, load64(b));
+    store32(&di + 24, WGPU_TEXTURE_ASPECT_ALL);
+    var ext[16];
+    memset(&ext, 0, 16);
+    store32(&ext, 4);
+    store32(&ext + 4, 4);
+    store32(&ext + 8, 1);
+    wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION);
+    var enc = wgpu_device_create_command_encoder(device, "t2t-enc");
+    if (wgpu_command_encoder_copy_texture_to_texture(enc, &si, &di, &ext) != 0) { return _fail("[77] call"); }
+    var cmd = wgpu_command_encoder_finish(enc, "t2t-cmd");
+    wgpu_command_encoder_release(enc);
+    wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+    var t = wgpu_device_pop_error_scope(device, &msg, 2048);
+    if (t != WGPU_ERROR_TYPE_NO_ERROR) { _info(&msg); return _fail("[77] copy raised a validation error"); }
+    var dst[64];
+    memset(&dst, 0, 64);
+    if (gpu_texture_read(ctx, b, &dst, 64) != 0) { return _fail("[77] read B"); }
+    if (memeq(&src, &dst, 64) != 1) { return _fail("[77] B differs from A after the copy"); }
+    _pass("[77] texture-to-texture copy: 64 bytes identical");
+    return 0;
+}
+
+fn _check_unsubmitted_release(ctx): i64 {
+    var device = gpu_ctx_device(ctx);
+    var msg[2048];
+    var cnt[8];
+    wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION);
+    var enc = wgpu_device_create_command_encoder(device, "unsubmitted-enc");
+    if (debug_push(enc, "unsubmitted") != 0) { return _fail("[80] encoder debug push"); }
+    debug_marker(enc, "marker");
+    debug_pop(enc);
+    var cmd = wgpu_command_encoder_finish(enc, "unsubmitted-cmd");
+    wgpu_command_encoder_release(enc);
+    if (cmd == 0) { return _fail("[76] finish"); }
+    if (wgpu_command_buffer_release(cmd) != 0) { return _fail("[76] release"); }
+    var t = wgpu_device_pop_error_scope(device, &msg, 2048);
+    if (t != WGPU_ERROR_TYPE_NO_ERROR) { _info(&msg); return _fail("[76]/[80] raised a validation error"); }
+    if (wgpu_take_uncaptured_error(&msg, 2048, &cnt) != 0) { return _fail("[76] uncaptured error after release"); }
+    _pass("[76] finished-but-unsubmitted command buffer released; [80] encoder debug group balanced");
+    return 0;
+}
+
+# [29]/[35] (4.3.0): an ENCODING error used to abort the process at submit
+# (wgpu-native's submit treats an invalid command buffer as fatal). The finish
+# shim now catches it under its own scope: finish returns 0, the error lands in
+# the uncaptured record, and submitting 0 is a no-op.
+fn _check_finish_refusal(ctx): i64 {
+    var device = gpu_ctx_device(ctx);
+    var msg[2048];
+    var cnt[8];
+    wgpu_take_uncaptured_error(&msg, 2048, &cnt);
+    var tex = gpu_texture_create_2d_rgba8(ctx, 4, 4);
+    if (tex == 0) { return _fail("refusal: texture"); }
+    var bdesc = wgpu_buffer_descriptor("refusal-buf",
+      WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST, 64, 0);
+    var buf = wgpu_device_create_buffer(device, bdesc);
+    var cargs[72];
+    memset(&cargs, 0, 72);
+    store64(&cargs + 0, load64(tex));
+    store64(&cargs + 32, buf);
+    store32(&cargs + 48, 16);    # bytesPerRow 16: not a multiple of 256 -> invalid
+    store32(&cargs + 52, 4);
+    store32(&cargs + 56, 4);
+    store32(&cargs + 60, 4);
+    store32(&cargs + 64, 1);
+    var enc = wgpu_device_create_command_encoder(device, "refusal-enc");
+    wgpu_command_encoder_copy_texture_to_buffer(enc, &cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "refusal-cmd");
+    wgpu_command_encoder_release(enc);
+    if (cmd != 0) { return _fail("[29] finish handed back an invalid command buffer"); }
+    wgpu_queue_submit_one(gpu_ctx_queue(ctx), cmd);
+    var t = wgpu_take_uncaptured_error(&msg, 2048, &cnt);
+    if (t != WGPU_ERROR_TYPE_VALIDATION) { return _fail("[29] the encoding error was not recorded"); }
+    _pass("[29]/[35] encoding error: finish returned 0, error recorded, submit of 0 skipped, process alive");
+    _info(&msg);
+    wgpu_buffer_release(buf);
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    if (_check_handshake() != 0) { return 1; }
+    if (_check_uncaptured(ctx) != 0) { return 1; }
+    if (_check_scope(ctx) != 0) { return 1; }
+    if (_check_draw(ctx) != 0) { return 1; }
+    if (_check_copy_t2t(ctx) != 0) { return 1; }
+    if (_check_unsubmitted_release(ctx) != 0) { return 1; }
+    if (_check_finish_refusal(ctx) != 0) { return 1; }
+    _info("[78]/[79] Wayland surface + capabilities: need a wl_display; proven at MB5");
+    _info("[67] set vertex buffer: needs a vertex layout; proven by render_mesh_e2e (MB1 part E)");
+    _e2e_summary();
+    return 0;
+}

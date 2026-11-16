@@ -413,6 +413,134 @@ fn test_caps_f64_detection() {
 # ================================================================
 # test_profiler.tcyr — tests for profiler.cyr
 
+# ---------------------------------------------------------------------------
+# 4.3.0 (L24): parity with Rust mabda 1.0's FrameProfiler. The first four are
+# soorat 1.2.0's own tests (src/profiler.rs), with their values.
+# ---------------------------------------------------------------------------
+fn _f64_close(a, b, tol): i64 {
+    var d = f64_sub(a, b);
+    if (f64_lt(d, F64_0) == 1) { d = f64_sub(F64_0, d); }
+    return f64_lt(d, tol);
+}
+
+fn test_profiler_l24_end_without_begin() {
+    var p = profiler_new();
+    var ms = profiler_end_frame(p);
+    assert_eq(ms, F64_0, "end_frame without begin_frame = exactly 0.0 (soorat profiler_end_without_begin)");
+    assert_eq(profiler_frame_count(p), 1, "the frame is still counted");
+    assert_eq(vec_len(profiler_frame_history(p)), 1, "and recorded");
+    assert_eq(vec_get(profiler_frame_history(p), 0), F64_0, "as 0.0");
+    profiler_begin_frame(p);
+    profiler_end_frame(p);
+    assert_eq(profiler_end_frame(p), F64_0, "a second end_frame (start cleared) is 0.0, not the stale start");
+    return 0;
+}
+
+fn test_profiler_l24_record_pass() {
+    var p = profiler_new();
+    profiler_begin_frame(p);
+    profiler_record_pass(p, "shadow", 6, f64_div(f64_from(5), f64_from(10)));
+    profiler_record_pass(p, "pbr", 3, f64_from(2));
+    profiler_record_pass(p, "post", 4, f64_div(f64_from(3), f64_from(10)));
+    assert_eq(profiler_pass_count(p), 3, "3 passes (soorat profiler_record_pass)");
+    var tol = f64_div(f64_from(1), f64_from(1000));
+    assert_eq(_f64_close(profiler_total_pass_time_ms(p), f64_div(f64_from(28), f64_from(10)), tol), 1,
+      "total 2.8 ms");
+    var t = profiler_pass(p, 1);
+    assert_streq(pass_timing_label(t), "pbr", "pass 1 label");
+    assert_eq(pass_timing_label_len(t), 3, "pass 1 label length");
+    assert_eq(pass_timing_duration_ms(t), f64_from(2), "pass 1 duration");
+    assert_eq(profiler_pass(p, 3), 0, "past the count = 0");
+    return 0;
+}
+
+fn test_profiler_l24_begin_clears_passes() {
+    var p = profiler_new();
+    profiler_record_pass(p, "test", 4, F64_1);
+    assert_eq(profiler_pass_count(p), 1, "one pass before begin");
+    profiler_begin_frame(p);
+    assert_eq(profiler_pass_count(p), 0, "begin_frame clears passes (soorat profiler_begin_clears_passes)");
+    profiler_record_pass(p, "x", 1, F64_1);
+    profiler_reset(p);
+    assert_eq(profiler_pass_count(p), 0, "reset clears passes");
+    return 0;
+}
+
+fn test_profiler_l24_pass_timing_fields() {
+    var p = profiler_new();
+    profiler_record_pass(p, "shadow", 6, f64_div(f64_from(15), f64_from(10)));
+    var t = profiler_pass(p, 0);
+    assert_streq(pass_timing_label(t), "shadow", "label (soorat pass_timing_fields)");
+    assert_eq(pass_timing_duration_ms(t), f64_div(f64_from(15), f64_from(10)), "duration 1.5");
+    assert_eq(PROFILER_PASS_SIZE, 24, "PassTiming is 24 bytes");
+    return 0;
+}
+
+fn test_profiler_l24_best_empty_is_f64_max() {
+    var p = profiler_new();
+    assert_eq(profiler_best_frame_ms(p), 0x7FEFFFFFFFFFFFFF, "empty history: best = f64::MAX");
+    assert_eq(profiler_worst_frame_ms(p), F64_0, "empty history: worst = 0.0 (as 1.0)");
+    return 0;
+}
+
+# Passes reuse one buffer: steady-state recording allocates nothing.
+fn test_profiler_l24_pass_buffer_reused() {
+    var p = profiler_with_alpha_and_history(F64_1, 4);   # a small history: it fills in 4 frames
+    for (var i = 0; i < 20; i = i + 1) { profiler_record_pass(p, "a", 1, F64_1); }
+    for (var w = 0; w < 8; w = w + 1) { profiler_begin_frame(p); profiler_end_frame(p); }
+    var before = alloc_used();
+    for (var f = 0; f < 50; f = f + 1) {
+        profiler_begin_frame(p);
+        for (var k = 0; k < 20; k = k + 1) { profiler_record_pass(p, "a", 1, F64_1); }
+        profiler_end_frame(p);
+    }
+    assert_eq(alloc_used() - before, 0, "50 frames x 20 passes allocate 0 bytes once the buffer grew");
+    return 0;
+}
+
+fn test_profiler_l24_exports() {
+    var p = profiler_with_alpha_and_history(F64_1, 4);
+    profiler_end_frame(p);    # a 0 ms frame, with alpha 1 -> avg 0, fps 0
+    profiler_record_pass(p, "sh\"a", 4, f64_div(f64_from(5), f64_from(10)));
+    var j = profiler_export_json(p);
+    var want = "{\"cpu_frame_ms\":0.000,\"avg_frame_ms\":0.000,\"fps\":0.0,\"frame_count\":1,";
+    var want2 = "\"passes\":[{\"label\":\"sh\\\"a\",\"duration_ms\":0.500}]}";
+    var wbuf = alloc(256);
+    memset(wbuf, 0, 256);
+    memcpy(wbuf, want, strlen(want));
+    memcpy(wbuf + strlen(want), want2, strlen(want2));
+    assert_streq(j, wbuf,
+      "export_json: 1.0's shape, label escaped");
+    var c = profiler_export_history_csv(p);
+    assert_streq(c, "frame,ms\n0,0.000\n", "export_history_csv");
+    return 0;
+}
+
+# 4.3.0 audit: the exports' buffers hold the worst case — full-width floats and
+# labels made only of escaped bytes — with the NUL inside the allocation.
+fn test_profiler_l24_export_worst_case_fits() {
+    var p = profiler_with_alpha_and_history(F64_1, 8);
+    var huge = f64_from(9000000000000000000);    # ~9e18: 19 integer digits
+    var lab = alloc(32);
+    memset(lab, 34, 31);                         # 31 '"' bytes: each escapes to 2
+    store8(lab + 31, 0);
+    for (var i = 0; i < 6; i = i + 1) { profiler_record_pass(p, lab, 31, huge); }
+    store64(p + 16, huge);
+    store64(p + 24, huge);
+    store64(p + 32, huge);
+    store64(p + 40, 9000000000000000000);
+    var before = alloc_used();
+    var j = profiler_export_json(p);
+    var used = alloc_used() - before;
+    assert(strlen(j) + 1 <= used, "export_json: the worst-case string and its NUL fit the allocation");
+    for (var f = 0; f < 8; f = f + 1) { vec_push(profiler_frame_history(p), huge); }
+    var before2 = alloc_used();
+    var c = profiler_export_history_csv(p);
+    var used2 = alloc_used() - before2;
+    assert(strlen(c) + 1 <= used2, "export_history_csv: the worst-case string and its NUL fit the allocation");
+    return 0;
+}
+
 fn test_profiler_new() {
     var p = profiler_new();
     assert(p != 0, "profiler allocated");
@@ -714,6 +842,14 @@ fn main() {
     test_profiler_new();
     test_profiler_frame();
     test_profiler_ema();
+    test_profiler_l24_end_without_begin();
+    test_profiler_l24_record_pass();
+    test_profiler_l24_begin_clears_passes();
+    test_profiler_l24_pass_timing_fields();
+    test_profiler_l24_best_empty_is_f64_max();
+    test_profiler_l24_pass_buffer_reused();
+    test_profiler_l24_exports();
+    test_profiler_l24_export_worst_case_fits();
     test_profiler_history();
     test_profiler_worst_best();
     test_profiler_reset();

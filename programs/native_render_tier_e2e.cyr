@@ -1,0 +1,106 @@
+# programs/native_render_tier_e2e.cyr — v4.3.0: the render tier's native AMD subset
+#
+# The same full-screen triangle native_render_e2e draws (GFX9 VS from VertexID +
+# solid-red FS), but through the 4.3.0 public calls a portable consumer writes:
+# gpu_pipeline_desc_* + gpu_render_pipeline_create_desc + gpu_render_pass_set_pipeline
+# + gpu_render_pass_draw_vertices. Then the rest of the tier answers named
+# GPU_ERR_NOT_IMPLEMENTED (a descriptor outside the native subset, an indexed draw)  #skip-lint
+# with the reason recorded, instead of misbehaving.
+#
+# Not in CI (hardware-dependent). Run via `make test-native-render-tier-e2e`.
+include "src/lib.cyr"
+
+var _passes = 0;
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn pass(s): i64 { out("PASS: "); out(s); out("\n"); _passes = _passes + 1; return 0; }
+fn fail(s): i64 { out("FAIL: "); out(s); out("\n"); return 1; }
+
+fn main(): i64 {
+    alloc_init();
+    var ctx_res_tag, ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res_tag) == 1) { out("SKIP: no native AMD context\n"); return 0; }
+    var ctx = ctx_res;
+    var fd = native_ctx_fd(ctx);
+    pass("native AMD context");
+
+    var vs_bo[16];
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { return fail("vs bo"); }
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { return fail("fs bo"); }
+    memset(load64(&vs_bo + 8), 0, 4096);
+    memset(load64(&fs_bo + 8), 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(load64(&vs_bo + 8), 0);
+    native_gfx9_shader_solid_red(load64(&fs_bo + 8), 0);
+    var vs_va = 0xFFFF800100000000;
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, load64(&vs_bo), vs_va, 4096, _NATIVE_PERM_SHADER) != 0) { return fail("vs va"); }
+    if (native_gem_va_map(fd, load64(&fs_bo), fs_va, 4096, _NATIVE_PERM_SHADER) != 0) { return fail("fs va"); }
+    var vs_mod[16];
+    var fs_mod[16];
+    native_buf_pair_write(&vs_mod, load64(&vs_bo), vs_va);
+    native_buf_pair_write(&fs_mod, load64(&fs_bo), fs_va);
+
+    var W = 256;
+    var H = 256;
+    var rt = gpu_render_target_create_2d_rgba8(ctx, W, H);
+    if (rt == 0) { return fail("render target"); }
+    var rt_addr = load64(rt + NATIVE_RT_FIELD_ADDR);
+    memset(rt_addr, 0x55, W * H * 4);
+
+    # The subset descriptor: no vertex buffers / groups, one RGBA8 target.
+    var d = gpu_pipeline_desc_new(&vs_mod, "vs_main");
+    gpu_pipeline_desc_fragment(d, &fs_mod, "fs_main");
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    var pipe = gpu_render_pipeline_create_desc(ctx, d);
+    if (pipe == 0) { out("  "); out(gpu_last_error_message()); out("\n"); return fail("subset pipeline"); }
+    pass("gpu_render_pipeline_create_desc: the native subset pipeline");
+
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    var p = gpu_render_pass_begin(ctx, rt, clear);
+    if (p == 0) { return fail("pass begin"); }
+    if (gpu_render_pass_set_pipeline(ctx, p, pipe) != 0) { return fail("set_pipeline"); }
+    gpu_error_clear();
+    if (gpu_render_pass_draw_vertices(ctx, p, 3, 1, 3, 0) != GPU_ERR_NOT_IMPLEMENTED) {   #skip-lint
+        return fail("first_vertex 3 was not refused");
+    }
+    var rc = gpu_render_pass_draw_vertices(ctx, p, 3, 1, 0, 0);
+    if (rc != 0) { return fail("draw_vertices"); }
+    gpu_render_pass_end(ctx, p);
+    var px = load32(rt_addr + ((H / 2) * W + (W / 2)) * 4);
+    if (px != 0xFF0000FF) { return fail("the centre pixel is not the solid-red FS (0xFF0000FF)"); }
+    pass("set_pipeline + draw_vertices(3, 1, 0, 0): the triangle renders solid red; first_vertex 3 refused");
+
+    # Outside the subset: named, not misbehaving.
+    gpu_error_clear();
+    var v = gpu_pipeline_desc_new(&vs_mod, "vs_main");
+    gpu_pipeline_desc_fragment(v, &fs_mod, "fs_main");
+    gpu_pipeline_desc_vertex_preset(v, GPU_VERTEX_LAYOUT_2D);
+    gpu_pipeline_desc_target(v, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    if (gpu_render_pipeline_create_desc(ctx, v) != 0) { return fail("a vertex-buffer pipeline was created"); }
+    if (gpu_last_error() != GPU_ERR_NOT_IMPLEMENTED) { return fail("not NOT_IMPLEMENTED"); }   #skip-lint
+    out("    ");
+    out(gpu_last_error_message());
+    out("\n");
+    var p2 = gpu_render_pass_begin(ctx, rt, clear);
+    if (gpu_render_pass_draw_indexed(ctx, p2, 3, 1, 0, 0, 0) != GPU_ERR_NOT_IMPLEMENTED) {   #skip-lint
+        return fail("an indexed draw was not refused");
+    }
+    gpu_render_pass_end(ctx, p2);
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(l, 0, GPU_STAGE_FRAGMENT, 0, 0);
+    if (gpu_bind_group_layout_create(ctx, l) != 0) { return fail("a native bind group layout was created"); }
+    pass("outside the subset: vertex buffers, indexed draws, layouts -> GPU_ERR_NOT_IMPLEMENTED + reason");  #skip-lint
+
+    gpu_render_pipeline_release(ctx, pipe);
+    gpu_render_target_release(ctx, rt);
+    gpu_context_release(ctx);
+    out("\n");
+    var nb[32];
+    memset(&nb, 0, 32);
+    syscall(1, 1, &nb, fmt_int_buf(_passes, &nb));
+    out(" passed, 0 failed\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

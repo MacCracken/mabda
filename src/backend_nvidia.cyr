@@ -63,15 +63,38 @@ var NV_BUF_ADDR   = 16;
 var NV_BUF_SIZE   = 24;
 var NV_BUF_STRUCT_SIZE = 32;
 
-# NVIDIA shader-module struct (40 bytes): handle, va (program GPU VA), addr
-# (CPU mmap, for release), regcount, size. The QMD's PROGRAM_ADDRESS = va;
-# REGISTER_COUNT_V = regcount.
+# NVIDIA shader-module struct (48 bytes): handle, va (program GPU VA), addr
+# (CPU mmap, for release), regcount, size, nbind. The QMD's PROGRAM_ADDRESS =
+# va; REGISTER_COUNT_V = regcount. nbind (4.3.0) is how many buffer pointers the
+# kernel takes: 0 = the v0 single-output kernel, whose dispatch `bp` is ONE
+# (handle, va) pair; N > 0 = the count-prefixed binding array AMD's compiled
+# kernels take (count, then count x (handle, va)), pointer i at
+# c[0x0][0x160 + 8*i]. Set by native_nv_shmod_set_bindings (and by the N9
+# compiler for the modules it builds).
 var NV_SHMOD_HANDLE   = 0;
 var NV_SHMOD_VA       = 8;
 var NV_SHMOD_ADDR     = 16;
 var NV_SHMOD_REGCOUNT = 24;
 var NV_SHMOD_SIZE     = 32;
-var NV_SHMOD_STRUCT_SIZE = 40;
+var NV_SHMOD_NBIND    = 40;
+var NV_SHMOD_STRUCT_SIZE = 48;
+
+# Kernel-param ABI (ptxas sm_70+): parameters start at c[0x0][0x160]; the param
+# bank the QMD points at is 0x200 bytes, so at most (0x200 - 0x160) / 8 = 20
+# pointers fit. mabda caps the binding array at 16.
+var NV_PARAM_BASE    = 0x160;
+var NV_PARAM_BANK    = 0x200;
+var NV_MAX_BINDINGS  = 16;
+
+# Declare that `shmod` takes an n-pointer binding array (1 .. NV_MAX_BINDINGS),
+# or 0 for the single-pair form. Returns 0 or GPU_ERR_OTHER.
+fn native_nv_shmod_set_bindings(shmod, n): i64 {
+    if (shmod == 0) { return GPU_ERR_OTHER; }
+    if (n < 0) { return GPU_ERR_OTHER; }
+    if (n > NV_MAX_BINDINGS) { return GPU_ERR_OTHER; }
+    store64(shmod + NV_SHMOD_NBIND, n);
+    return 0;
+}
 
 # NVIDIA texture struct (48 bytes, the NativeTexture shape): a v0 NVIDIA
 # texture is a host-visible LINEAR RGBA8 image — a 2D-shaped buffer. The BO
@@ -325,7 +348,7 @@ fn _backend_nvidia_buffer_write(ctx, buf, off, ptr, n): i64 {
     if (addr == 0) { return GPU_ERR_BUFFER; }
     if (off > size) { return GPU_ERR_BUFFER; }
     if (n > size - off) { return GPU_ERR_BUFFER; }
-    memcpy(addr + off, ptr, n);
+    gpu_copy_bytes(addr + off, ptr, n);   # 4.3.0: was the stdlib byte-loop memcpy
     return 0;
 }
 
@@ -341,8 +364,15 @@ fn _backend_nvidia_buffer_read(ctx, buf, off, ptr, n): i64 {
     if (addr == 0) { return GPU_ERR_BUFFER; }
     if (off > size) { return GPU_ERR_BUFFER; }
     if (n > size - off) { return GPU_ERR_BUFFER; }
-    memcpy(ptr, addr + off, n);
+    gpu_copy_bytes(ptr, addr + off, n);   # 4.3.0: was the stdlib byte-loop memcpy
     return 0;
+}
+
+# v4.3.0 — BACKEND_SLOT_BUFFER_MAP: the buffer's CPU mapping (gpu_buffer_map).
+fn _backend_nvidia_buffer_map(ctx, buf): i64 {
+    if (ctx == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    return load64(buf + NV_BUF_ADDR);
 }
 
 # Release a buffer: VM_UNBIND + BO release, then zero the struct. The fd
@@ -373,10 +403,20 @@ fn _backend_nvidia_buffer_release(ctx, buf): i64 {
 # real per-shader regcount metadata arrives with the N9 SPIR-V->SASS compiler.
 # Returns an NV_SHMOD struct ptr or 0 on failure.
 fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
-    if (ctx == 0) { return 0; }
-    if (bytes_ptr == 0) { return 0; }
-    if (n <= 0) { return 0; }
-    if (n > NV_BO_MAX_SIZE) { return 0; }
+    # 4.3.0 (issue 2026-11-02, High): only SASS. Before, the kind was never read:
+    # SPIR-V from gpu_shader_module_create_spirv was copied in as machine code,
+    # the module came back valid, and the first dispatch faulted the GPU (Xid 13,
+    # channel killed, GPU_ERR_DEVICE_LOST). Now a non-SASS module is 0 with
+    # SHMOD_ERR_SRC_KIND, like the native AMD backend. SPIR-V on NVIDIA is the N9
+    # compiler's.
+    if (kind != SHADER_SRC_SASS) {
+        _gpu_set_last_shader_err(0 - SHMOD_ERR_SRC_KIND);
+        return 0;
+    }
+    if (ctx == 0) { _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_CTX); return 0; }
+    if (bytes_ptr == 0) { _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_WORDS); return 0; }
+    if (n <= 0) { _gpu_set_last_shader_err(0 - SHMOD_ERR_TOO_SHORT); return 0; }
+    if (n > NV_BO_MAX_SIZE) { _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_TOO_BIG); return 0; }
     var bo[24];
     if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, n, &bo) != 0) { return 0; }
     var addr = load64(&bo + 16);
@@ -388,6 +428,8 @@ fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     store64(shmod + NV_SHMOD_ADDR,     addr);
     store64(shmod + NV_SHMOD_REGCOUNT, NV_SASS_STORE_DEADBEEF_REGCOUNT);
     store64(shmod + NV_SHMOD_SIZE,     n);
+    store64(shmod + NV_SHMOD_NBIND,    0);
+    _gpu_set_last_shader_err(0);
     return shmod;
 }
 
@@ -408,8 +450,28 @@ fn _backend_nvidia_shader_module_release(ctx, shmod): i64 {
     return 0;
 }
 
-# Dispatch a compute grid (x,y,z workgroups) of `shmod` with the buffer at
-# `bp` bound as c[0x0]+0x160 (the ptxas kernel-param output pointer). Builds
+# Write a dispatch's buffer pointers into the param bank at `param` (see
+# _backend_nvidia_compute_dispatch). nbind 0: the single pair's VA at +0x160.
+fn _nv_write_params(param, nbind, bp): i64 {
+    if (nbind == 0) {
+        store64(param + NV_PARAM_BASE, load64(bp + NV_BUF_VA));
+        return 0;
+    }
+    for (var i = 0; i < nbind; i = i + 1) {
+        store64(param + NV_PARAM_BASE + i * 8, load64(bp + 8 + i * 16 + 8));
+    }
+    return 0;
+}
+
+# Dispatch a compute grid (x,y,z workgroups) of `shmod`. `bp` binds the
+# kernel's buffer pointers into the param bank (the ptxas kernel-param ABI):
+#   - nbind 0 (the v0 kernels): `bp` is one NV_BUF / (handle, va) pair, its VA
+#     at c[0x0]+0x160;
+#   - nbind N (4.3.0, the AMD compiled-kernel shape): `bp` is a count-prefixed
+#     array, count at +0 then N x (handle, va); pointer i at c[0x0]+0x160+8*i. A
+#     count other than the module's N is refused (GPU_ERR_OTHER) before anything
+#     is written, as on AMD.
+# Builds
 # the QMD + dispatch pushbuffer into the persistent context BOs, EXECs on the
 # channel, and waits on an ABSOLUTE syncobj deadline (the N4 blocker fix).
 # Returns 0|GPU_ERR_*.
@@ -428,7 +490,16 @@ fn _backend_nvidia_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     var chid = nv_ctx_chid(ctx);
     var prog_va  = load64(shmod + NV_SHMOD_VA);
     var regcount = load64(shmod + NV_SHMOD_REGCOUNT);
-    var out_va   = load64(bp + NV_BUF_VA);
+    var nbind    = load64(shmod + NV_SHMOD_NBIND);
+    if (nbind < 0) { return GPU_ERR_OTHER; }
+    if (nbind > NV_MAX_BINDINGS) { return GPU_ERR_OTHER; }
+    if (nbind > 0) {
+        if (load64(bp) != nbind) {
+            _gpu_err_record(GPU_ERR_OTHER,
+              "nvidia dispatch: the binding array's count is not the module's binding count", 1);
+            return GPU_ERR_OTHER;
+        }
+    }
     var qmd_addr   = load64(ctx + NV_CTX_QMD_ADDR);
     var qmd_va     = load64(ctx + NV_CTX_QMD_VA);
     var push_addr  = load64(ctx + NV_CTX_PUSH_ADDR);
@@ -436,8 +507,8 @@ fn _backend_nvidia_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     var param_addr = load64(ctx + NV_CTX_PARAM_ADDR);
     var param_va   = load64(ctx + NV_CTX_PARAM_VA);
 
-    # Param bank: output pointer at c[0x0]+0x160 (ptxas sm_70+ kernel-param ABI).
-    store64(param_addr + 0x160, out_va);
+    # Param bank: pointer(s) from c[0x0]+0x160 (ptxas sm_70+ kernel-param ABI).
+    _nv_write_params(param_addr, nbind, bp);
     # QMD: program / regcount / const0 = the param bank (size 0x200).
     native_nv_qmd_build(qmd_addr, prog_va, regcount, param_va, 0x200);
     # Honor the requested grid (the builder defaults to 1,1,1):
@@ -632,7 +703,8 @@ var NV_PIPE_STRUCT_SIZE = 32;
 var NV_PASS_CTX         = 0;
 var NV_PASS_RT          = 8;
 var NV_PASS_CLEAR_COLOR = 16;
-var NV_PASS_STRUCT_SIZE = 24;
+var NV_PASS_PIPE        = 24;   # 4.3.0: the pipeline gpu_render_pass_set_pipeline bound
+var NV_PASS_STRUCT_SIZE = 32;
 
 # Create a render pipeline from a VS + FS shader module (the shmod convention:
 # program VA @ +8 points at the SPH, regcount @ +24). color_fmt is accepted for
@@ -1069,6 +1141,12 @@ fn backend_nvidia_new(): i64 {
       &_backend_nvidia_surface_present);
     backend_set_slot(b, BACKEND_SLOT_SURFACE_RELEASE,
       &_backend_nvidia_surface_release);
+    # v4.3.0 — zero-copy host access (gpu_buffer_map).
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_MAP, &_backend_nvidia_buffer_map);
+    # v4.3.0 — the render tier's native subset (src/backend_native_rtier.cyr).
+    backend_set_slot(b, BACKEND_SLOT_RENDER_PIPELINE_CREATE_DESC, &_backend_native_rtier_pipeline_create_desc);
+    backend_set_slot(b, BACKEND_SLOT_PASS_SET_PIPELINE, &_backend_nvidia_pass_set_pipeline);
+    backend_set_slot(b, BACKEND_SLOT_PASS_DRAW, &_backend_nvidia_pass_draw);
     backend_set_kind(b, BACKEND_KIND_NVIDIA);
     return b;
 }

@@ -31,7 +31,15 @@ CYRIUS     ?= cyrius
 # (6.0.x shipped cc5/cc5_aarch64/cc5_win; 6.1+ ship cycc/cycc_aarch64/
 # cycc_win). The wgpu integration programs link against deps/wgpu_main.c
 # and build via this object-mode path. Override with CYCC=... if needed.
-CYCC       ?= cycc
+#
+# 4.3.0: the PINNED toolchain's cycc when it is installed. `cyrius` is a version
+# manager — its wrapper runs the manifest pin — but a bare `cycc` from PATH is the
+# `current` version, which on a box whose current is older than the pin compiled
+# this tree's lib/ with the wrong compiler (docs/development/2026-04-30-toolchain-
+# issues.md E4, found on the NVIDIA test host). Falls back to `cycc` from PATH.
+CYRIUS_PIN := $(shell sed -n 's/^cyrius = "\(.*\)"/\1/p' cyrius.cyml | head -1)
+CYCC_PINNED := $(HOME)/.cyrius/versions/$(CYRIUS_PIN)/bin/cycc
+CYCC       ?= $(if $(wildcard $(CYCC_PINNED)),$(CYCC_PINNED),cycc)
 GCC        ?= gcc
 WGPU_DIR   ?= deps/wgpu-native
 
@@ -357,7 +365,10 @@ example-link: check-lib-wiring $(if $(wildcard $(WGPU_DIR)/lib/libwgpu_native.a)
 # Pattern rule for all programs/*.cyr GPU programs.
 build/%.o: programs/%.cyr src/*.cyr
 	@mkdir -p build
-	printf 'object;\n' | cat - $< | $(CYCC) > $@
+	# Through a temp file (4.3.0, E4): a failed compile must not leave a 0-byte .o
+	# newer than its sources, which the next make would take as up to date.
+	printf 'object;\n' | cat - $< | $(CYCC) > $@.tmp || { rm -f $@.tmp; exit 1; }
+	mv $@.tmp $@
 	objcopy $(LOCALIZE_FLAGS) -L print_num -L println $@
 
 build/phase0: build/phase0.o deps/wgpu_main.o
@@ -366,6 +377,18 @@ build/phase0: build/phase0.o deps/wgpu_main.o
 
 build/compute_e2e: build/compute_e2e.o deps/wgpu_main.o
 	$(GCC) deps/wgpu_main.o build/compute_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/render_tier_e2e: build/render_tier_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/render_tier_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/error_channel_e2e: build/error_channel_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/error_channel_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+build/launcher_slots_e2e: build/launcher_slots_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/launcher_slots_e2e.o \
 		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
 
 build/render_e2e: build/render_e2e.o deps/wgpu_main.o
@@ -468,6 +491,24 @@ test-compute-e2e: build/compute_e2e
 test-render-e2e: build/render_e2e
 	./build/render_e2e
 
+# v4.3.0 launcher revision: every new deps/wgpu_main.c slot that runs without a
+# window (67 is proven by render_mesh_e2e, 78/79 at MB5).
+.PHONY: test-launcher-slots-e2e
+test-launcher-slots-e2e: build/launcher_slots_e2e
+	./build/launcher_slots_e2e
+
+# v4.3.0 render tier MB1 part B: validation errors return GPU_ERR_* through the
+# public tier instead of aborting (soorat P6's fatal cases).
+.PHONY: test-error-channel-e2e
+test-error-channel-e2e: build/error_channel_e2e
+	./build/error_channel_e2e
+
+# v4.3.0 render tier MB1 parts C-E: layouts, groups, samplers, the pipeline
+# descriptor and the draw-time calls, rendered and read back.
+.PHONY: test-render-tier-e2e
+test-render-tier-e2e: build/render_tier_e2e
+	./build/render_tier_e2e
+
 .PHONY: test-spirv-e2e
 test-spirv-e2e: build/spirv_e2e
 	./build/spirv_e2e
@@ -552,6 +593,25 @@ build/nvidia_compute_api: programs/nvidia_compute_api.cyr src/*.cyr
 .PHONY: test-nvidia-compute-api
 test-nvidia-compute-api: build/nvidia_compute_api
 	./build/nvidia_compute_api
+
+# v4.3.0 — NVIDIA native repairs (issue 2026-11-02 pair): SPIR-V refused at
+# create, a two-binding dispatch (the count-prefixed binding array), gpu_buffer_map.
+build/nvidia_multibind_e2e: programs/nvidia_multibind_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_multibind_e2e.cyr $@
+
+.PHONY: test-nvidia-multibind-e2e
+test-nvidia-multibind-e2e: build/nvidia_multibind_e2e
+	./build/nvidia_multibind_e2e
+
+# v4.3.0 — the render tier's native NVIDIA subset (descriptor + set_pipeline + draw_vertices).
+build/nvidia_render_tier_e2e: programs/nvidia_render_tier_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_render_tier_e2e.cyr $@
+
+.PHONY: test-nvidia-render-tier-e2e
+test-nvidia-render-tier-e2e: build/nvidia_render_tier_e2e
+	./build/nvidia_render_tier_e2e
 
 # v4.0 Phase N6 — NVIDIA texture create/write/read roundtrip through the
 # PUBLIC mabda API (gpu_texture_*). Host-visible linear RGBA8; CPU roundtrip
@@ -1281,6 +1341,15 @@ build/native_render_e2e: programs/native_render_e2e.cyr src/*.cyr
 test-native-render-e2e: build/native_render_e2e
 	./build/native_render_e2e
 
+# v4.3.0 — the render tier's native AMD subset (descriptor + set_pipeline + draw_vertices).
+build/native_render_tier_e2e: programs/native_render_tier_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_render_tier_e2e.cyr $@
+
+.PHONY: test-native-render-tier-e2e
+test-native-render-tier-e2e: build/native_render_tier_e2e
+	./build/native_render_tier_e2e
+
 # v3.4.2 RT allocator regression — odd-window (1260x682) RT exercises the
 # 64 KiB va_map rounding, a 2nd live RT exercises the per-context VA bump.
 # HW-gated (needs the amdgpu render node; not master-gated).
@@ -1401,7 +1470,7 @@ bench-gpu: build/benchmarks
 
 # Developer gate: run every GPU integration program in sequence.
 .PHONY: test-gpu
-test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e
+test-gpu: test-phase0 test-compute-e2e test-render-e2e test-render-graph-e2e test-launcher-slots-e2e test-error-channel-e2e test-render-tier-e2e
 
 # ---------------------------------------------------------------------------
 # test-native-all — run every `test-native-*` gate and report a TALLY.

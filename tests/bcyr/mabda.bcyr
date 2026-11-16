@@ -334,6 +334,153 @@ fn bench_rg_plan_scaled() {
     return 0;
 }
 
+# ================================================================
+# v4.3.0 — the render tier + the repairs (no Rust baseline: new in 4.3.0)
+# Every buffer is allocated ONCE outside the timed loops (bump allocator).
+# ================================================================
+
+# gpu_copy_bytes vs the stdlib memcpy (issue 2026-11-02 byte-loop copies).
+var _bc_src = 0;
+var _bc_dst = 0;
+var _BC_FRAME = 8294400;    # 1920 x 1080 x 4
+
+fn _bench_copy(name, n, use_fast, rounds): i64 {
+    var b = bench_new(name);
+    var ri = 0;
+    while (ri < rounds) {
+        bench_batch_start(b);
+        if (use_fast == 1) { gpu_copy_bytes(_bc_dst, _bc_src, n); }
+        else { memcpy(_bc_dst, _bc_src, n); }
+        bench_batch_stop(b, 1);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
+fn bench_copies(): i64 {
+    _bc_src = alloc(_BC_FRAME);
+    _bc_dst = alloc(_BC_FRAME);
+    memset(_bc_src, 0x5A, _BC_FRAME);
+    _bench_copy("memcpy_128k (stdlib)", 131072, 0, 50);
+    _bench_copy("gpu_copy_bytes_128k", 131072, 1, 50);
+    _bench_copy("memcpy_1080p_frame (stdlib)", _BC_FRAME, 0, 5);
+    _bench_copy("gpu_copy_bytes_1080p_frame", _BC_FRAME, 1, 5);
+    return 0;
+}
+
+# Fill a pbr-style pipeline descriptor (Vertex3D preset, cull, target + blend,
+# depth, 4 groups). The descriptor is reused: zeroed and refilled per op.
+fn bench_pipeline_desc_fill(): i64 {
+    var d = gpu_pipeline_desc_new(0x10, "vs_main");
+    var b = bench_new("pipeline_desc_fill_3d");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 1000) {
+            memset(d, 0, GPU_PIPELINE_DESC_SIZE);
+            store64(d, 0x10);
+            store64(d + 8, "vs_main");
+            store64(d + 144, 1);
+            gpu_pipeline_desc_fragment(d, 0x10, "fs_main");
+            gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_3D);
+            gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_TRIANGLE_LIST, GPU_CULL_BACK, GPU_FRONT_CCW);
+            gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_ALPHA, GPU_WRITE_ALL);
+            gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, 1, GPU_COMPARE_LESS);
+            gpu_pipeline_desc_bind_group_layout(d, 0, 0xA0);
+            gpu_pipeline_desc_bind_group_layout(d, 1, 0xA1);
+            gpu_pipeline_desc_bind_group_layout(d, 2, 0xA2);
+            gpu_pipeline_desc_bind_group_layout(d, 3, 0xA3);
+            gpu_pipeline_desc_validate(d);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 1000);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
+# Fill pbr's IBL group layout (6 entries) in a reused builder.
+fn bench_bgl_fill(): i64 {
+    var l = gpu_bind_group_layout_new();
+    var b = bench_new("bgl_fill_pbr_ibl_6");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 1000) {
+            store64(l, 0);
+            gpu_bgl_texture(l, 0, 2, GPU_SAMPLE_FLOAT, GPU_VIEW_CUBE, 0);
+            gpu_bgl_sampler(l, 1, 2, GPU_SAMPLER_FILTERING);
+            gpu_bgl_texture(l, 2, 2, GPU_SAMPLE_FLOAT, GPU_VIEW_CUBE, 0);
+            gpu_bgl_sampler(l, 3, 2, GPU_SAMPLER_FILTERING);
+            gpu_bgl_texture(l, 4, 2, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 0);
+            gpu_bgl_sampler(l, 5, 2, GPU_SAMPLER_FILTERING);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 1000);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
+# One profiled frame with 8 passes (L24): steady state allocates nothing.
+fn bench_profiler_passes(): i64 {
+    var p = profiler_new();
+    var b = bench_new("profiler_frame_8_passes");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 1000) {
+            profiler_begin_frame(p);
+            var k = 0;
+            while (k < 8) { profiler_record_pass(p, "pass", 4, F64_1); k = k + 1; }
+            profiler_total_pass_time_ms(p);
+            profiler_end_frame(p);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 1000);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
+# The CPU cost of a public draw-time call: validation + backend dispatch into a
+# no-op slot (what mabda adds on top of the wgpu call itself).
+fn _bd_noop(ctx, pass, a, b, c, d, e): i64 { return 0; }
+
+fn bench_draw_dispatch(): i64 {
+    var ctx = alloc(GPU_CONTEXT_SIZE);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    var be = backend_new();
+    backend_set_slot(be, BACKEND_SLOT_PASS_DRAW_INDEXED, &_bd_noop);
+    backend_set_slot(be, BACKEND_SLOT_PASS_SET_BIND_GROUP, &_bd_noop);
+    store64(ctx + 32, be);
+    var pass = alloc(48);
+    var offs = alloc(8);
+    store32(offs, 256);
+    var b = bench_new("draw_indexed_plus_dynamic_group_dispatch");
+    var ri = 0;
+    while (ri < ROUNDS) {
+        bench_batch_start(b);
+        var bi = 0;
+        while (bi < 1000) {
+            gpu_render_pass_set_bind_group(ctx, pass, 1, 0x77, 1, offs);
+            gpu_render_pass_draw_indexed(ctx, pass, 36, 1, 0, 0, 0);
+            bi = bi + 1;
+        }
+        bench_batch_stop(b, 1000);
+        ri = ri + 1;
+    }
+    bench_report(b); _csv_row(b);
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -347,6 +494,11 @@ fn main() {
     bench_capabilities_report();
     bench_rg_plan_small();
     bench_rg_plan_scaled();
+    bench_copies();
+    bench_pipeline_desc_fill();
+    bench_bgl_fill();
+    bench_profiler_passes();
+    bench_draw_dispatch();
     return 0;
 }
 var exit_code = main();

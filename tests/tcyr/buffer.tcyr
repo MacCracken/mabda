@@ -299,6 +299,70 @@ fn test_frame_resources_release_buffers_no_ctx_is_noop() {
     return 0;
 }
 
+# v4.3.0 (issue 2026-11-02 byte-loop copies): gpu_copy_bytes equals memcpy for
+# every length 0..96 at every source/destination alignment 0..7, never writes past
+# n, and handles the head / 32-byte body / 8-byte / 4-byte / byte tails.
+fn test_gpu_copy_bytes_matches_memcpy() {
+    var src = alloc(256);
+    for (var i = 0; i < 256; i = i + 1) { store8(src + i, (i * 37 + 11) & 0xFF); }
+    var a = alloc(256);
+    var b = alloc(256);
+    var bad = 0;
+    for (var so = 0; so < 8; so = so + 1) {
+        for (var dof = 0; dof < 8; dof = dof + 1) {
+            for (var n = 0; n <= 96; n = n + 1) {
+                memset(a, 0xCC, 256);
+                memset(b, 0xCC, 256);
+                memcpy(a + dof, src + so, n);
+                var r = gpu_copy_bytes(b + dof, src + so, n);
+                if (r != b + dof) { bad = bad + 1; }
+                if (memeq(a, b, 256) != 1) { bad = bad + 1; }
+            }
+        }
+    }
+    assert_eq(bad, 0, "gpu_copy_bytes == memcpy for n 0..96 x src/dst alignment 0..7 (and nothing past n)");
+    assert_eq(gpu_copy_bytes(b, src, 0 - 4), b, "a negative length copies nothing");
+    return 0;
+}
+
+var _bm_calls = 0;
+fn _bm_map_slot(ctx, buf): i64 { _bm_calls = _bm_calls + 1; return load64(buf + 8); }
+
+fn test_gpu_buffer_map() {
+    var ctx[208];
+    var be[1024];
+    memset(&ctx, 0, 208);
+    memset(&be, 0, BACKEND_SIZE);
+    store64(&ctx + 32, &be);
+    var buf[32];
+    memset(&buf, 0, 32);
+    store64(&buf + 8, 0x7F0000);
+    gpu_error_clear();
+    assert_eq(gpu_buffer_map(&ctx, &buf), 0, "no slot (wgpu) -> 0");
+    assert_eq(gpu_last_error(), GPU_ERR_NOT_IMPLEMENTED, "no slot -> the reason recorded");   #skip-lint
+    backend_set_slot(&be, BACKEND_SLOT_BUFFER_MAP, &_bm_map_slot);
+    assert_eq(gpu_buffer_map(&ctx, &buf), 0x7F0000, "a slot's mapping is returned");
+    assert_eq(_bm_calls, 1, "slot called once");
+    assert_eq(gpu_buffer_map(&ctx, 0), 0, "null buffer -> 0");
+    assert_eq(gpu_buffer_map(0, &buf), 0, "null ctx -> 0");
+    # The native fillers return the BO's CPU mapping.
+    var nb[64];
+    memset(&nb, 0, 64);
+    store64(&nb + NATIVE_BUF_FIELD_ADDR, 0x123000);
+    assert_eq(_backend_native_buffer_map(&ctx, &nb), 0x123000, "native AMD: NATIVE_BUF_FIELD_ADDR");
+    var vb[32];
+    memset(&vb, 0, 32);
+    store64(&vb + NV_BUF_ADDR, 0x456000);
+    assert_eq(_backend_nvidia_buffer_map(&ctx, &vb), 0x456000, "NVIDIA: NV_BUF_ADDR");
+    assert_eq(backend_get_slot(backend_native_new(), BACKEND_SLOT_BUFFER_MAP), &_backend_native_buffer_map,
+      "backend_native_new fills buffer_map");
+    assert_eq(backend_get_slot(backend_nvidia_new(), BACKEND_SLOT_BUFFER_MAP), &_backend_nvidia_buffer_map,
+      "backend_nvidia_new fills buffer_map");
+    assert_eq(backend_get_slot(backend_wgpu_new(), BACKEND_SLOT_BUFFER_MAP), 0, "wgpu leaves buffer_map empty");
+    gpu_error_clear();
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
@@ -324,5 +388,7 @@ fn main() {
     test_audit_buffer_binding_type_values();
     test_gpu_buffer_read_null_ctx_returns_err();
     test_frame_resources_release_buffers_no_ctx_is_noop();
+    test_gpu_copy_bytes_matches_memcpy();
+    test_gpu_buffer_map();
     return assert_summary();
 }

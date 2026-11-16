@@ -73,6 +73,21 @@
 #   [64] wgpu_shim_command_encoder_copy_texture_to_buffer (struct-packed args)
 #   [65] wgpuRenderPipelineGetBindGroupLayout
 #   [66] wgpu_shim_create_shader_module_spirv (raw-SPIR-V passthrough escape hatch — F.8a)
+#   --- v4.3.0 launcher revision (render tier MB1-MB5 + L17), 67 -> 81 slots ---
+#   [67] wgpuRenderPassEncoderSetVertexBuffer
+#   [68] wgpuRenderPassEncoderSetIndexBuffer
+#   [69] wgpuRenderPassEncoderDrawIndexed
+#   [70] wgpu_shim_render_pass_set_viewport (six f32 by pointer)
+#   [71] wgpuRenderPassEncoderSetScissorRect
+#   [72] wgpuRenderPassEncoderSetBlendConstant
+#   [73] wgpuDevicePushErrorScope
+#   [74] wgpu_shim_pop_error_scope (callback info by value)
+#   [75] wgpu_shim_take_uncaptured_error (the launcher records uncaptured errors)
+#   [76] wgpuCommandBufferRelease
+#   [77] wgpuCommandEncoderCopyTextureToTexture
+#   [78] wgpu_shim_instance_create_surface_wayland (chained descriptor)
+#   [79] wgpu_shim_surface_get_capabilities (FreeMembers by value)
+#   [80] wgpu_shim_debug_op (every debug group / marker op)
 
 var _fn_table = 0;
 
@@ -80,6 +95,43 @@ fn _fp(idx): i64 { return load64(_fn_table + idx * 8); }
 
 fn wgpu_ffi_init_table(table_ptr): i64 {
     _fn_table = table_ptr;
+    return 0;
+}
+
+# ================================================================
+# Launcher slot-count handshake (v4.3.0)
+# ================================================================
+# Adding slots means every consumer rebuilds its copy of deps/wgpu_main.c. A
+# consumer still on the old copy hands mabda a 67-slot table, and calling slot
+# 67+ through it would jump through whatever follows the table in the launcher's
+# .bss. The 4.3.0+ launcher calls mabda_wgpu_launcher_slots(FN_COUNT) before
+# mabda_main (a weak symbol on the C side, so it also links against an older
+# mabda). Until that call, mabda assumes the pre-4.3.0 67-slot table, and every
+# wrapper for a newer slot checks _wgpu_has_slot first and fails with
+# GPU_ERR_FFI_SYMBOL (or its documented null result) instead of calling.
+var WGPU_FN_LEGACY_COUNT = 67;    # the pre-4.3.0 launcher table
+var WGPU_FN_COUNT        = 81;    # deps/wgpu_main.c FN_COUNT at 4.3.0
+var _wgpu_launcher_slots = 0;     # 0 = the launcher never said (a pre-4.3.0 launcher)
+
+# Called by deps/wgpu_main.c main() after _cyrius_init. Exported (a global T
+# symbol in the object) — the launcher's weak reference resolves to it.
+fn mabda_wgpu_launcher_slots(n): i64 {
+    if (n < 0) { n = 0; }
+    _wgpu_launcher_slots = n;
+    return 0;
+}
+
+# The slot count mabda assumes: what the launcher reported, or the legacy 67.
+fn wgpu_launcher_slot_count(): i64 {
+    if (_wgpu_launcher_slots > 0) { return _wgpu_launcher_slots; }
+    return WGPU_FN_LEGACY_COUNT;
+}
+
+# 1 when slot `idx` exists in the installed table (and a table is installed).
+fn _wgpu_has_slot(idx): i64 {
+    if (_fn_table == 0) { return 0; }
+    if (idx < 0) { return 0; }
+    if (idx < wgpu_launcher_slot_count()) { return 1; }
     return 0;
 }
 
@@ -335,4 +387,154 @@ fn wgpu_render_pass_encoder_release(pass): i64 { fncall1(_fp(63), pass); return 
 
 fn wgpu_command_encoder_copy_texture_to_buffer(enc, args): i64 {
     return fncall2(_fp(64), enc, args);
+}
+
+# ================================================================
+# v4.3.0 launcher revision — slots 67-80
+# ================================================================
+# Each wrapper checks _wgpu_has_slot first: against a pre-4.3.0 launcher it
+# returns GPU_ERR_FFI_SYMBOL (or the documented null result) without calling.
+# Void wgpu calls return 0 on success. All arguments are scalar or pointers
+# (direct fncallN); the float / by-value cases go through the launcher shims.
+
+# [67] (pass, slot u32, buffer, offset u64, size u64). size = WGPU_WHOLE_SIZE for
+# "to the end of the buffer".
+fn wgpu_render_pass_encoder_set_vertex_buffer(pass, slot, buf, offset, size): i64 {
+    if (_wgpu_has_slot(67) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall5(_fp(67), pass, slot, buf, offset, size);
+    return 0;
+}
+
+# [68] (pass, buffer, WGPUIndexFormat, offset u64, size u64).
+fn wgpu_render_pass_encoder_set_index_buffer(pass, buf, fmt, offset, size): i64 {
+    if (_wgpu_has_slot(68) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall5(_fp(68), pass, buf, fmt, offset, size);
+    return 0;
+}
+
+# [69] (pass, indexCount, instanceCount, firstIndex, baseVertex i32, firstInstance).
+# baseVertex may be negative: the callee reads the low 32 bits as int32.
+fn wgpu_render_pass_encoder_draw_indexed(pass, ic, inst, first_index, base_vertex, first_inst): i64 {
+    if (_wgpu_has_slot(69) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall6(_fp(69), pass, ic, inst, first_index, base_vertex, first_inst);
+    return 0;
+}
+
+# [70] f32x6 = 24 bytes: x, y, width, height, minDepth, maxDepth as f32.
+fn wgpu_render_pass_encoder_set_viewport(pass, f32x6): i64 {
+    if (_wgpu_has_slot(70) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall2(_fp(70), pass, f32x6);
+    return 0;
+}
+
+# [71] (pass, x, y, width, height), all u32.
+fn wgpu_render_pass_encoder_set_scissor_rect(pass, x, y, w, h): i64 {
+    if (_wgpu_has_slot(71) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall5(_fp(71), pass, x, y, w, h);
+    return 0;
+}
+
+# [72] color = a 32-byte WGPUColor (four f64: r, g, b, a) — mabda's Color shape.
+fn wgpu_render_pass_encoder_set_blend_constant(pass, color): i64 {
+    if (_wgpu_has_slot(72) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall2(_fp(72), pass, color);
+    return 0;
+}
+
+# WGPUErrorFilter / WGPUErrorType (webgpu.h v29).
+var WGPU_ERROR_FILTER_VALIDATION    = 1;
+var WGPU_ERROR_FILTER_OUT_OF_MEMORY = 2;
+var WGPU_ERROR_FILTER_INTERNAL      = 3;
+var WGPU_ERROR_TYPE_NO_ERROR        = 1;
+var WGPU_ERROR_TYPE_VALIDATION      = 2;
+var WGPU_ERROR_TYPE_OUT_OF_MEMORY   = 3;
+var WGPU_ERROR_TYPE_INTERNAL        = 4;
+var WGPU_ERROR_TYPE_UNKNOWN         = 5;
+# wgpu_device_pop_error_scope's result when the launcher has no slot 74.
+var WGPU_POP_SCOPE_NO_SLOT          = 0 - 200;
+
+# [73] push an error scope with a WGPUErrorFilter.
+fn wgpu_device_push_error_scope(device, filter): i64 {
+    if (_wgpu_has_slot(73) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall2(_fp(73), device, filter);
+    return 0;
+}
+
+# [74] pop the innermost scope. Returns a WGPUErrorType (1 = NoError) on a
+# successful pop; the negated WGPUPopErrorScopeStatus when the pop failed (-3: no
+# scope was pushed); -100 when the callback never fired; WGPU_POP_SCOPE_NO_SLOT
+# without the slot. The message (NUL-terminated, at most cap-1 bytes) lands in buf.
+fn wgpu_device_pop_error_scope(device, buf, cap): i64 {
+    if (_wgpu_has_slot(74) == 0) { return WGPU_POP_SCOPE_NO_SLOT; }
+    return fncall3(_fp(74), device, buf, cap);
+}
+
+# [75] take the launcher's latest uncaptured error and clear it. Returns its
+# WGPUErrorType, or 0 when none arrived since the last take (also 0 without the
+# slot). count_out (or 0) receives how many arrived; buf gets the latest message.
+fn wgpu_take_uncaptured_error(buf, cap, count_out): i64 {
+    if (_wgpu_has_slot(75) == 0) {
+        if (count_out != 0) { store64(count_out, 0); }
+        return 0;
+    }
+    return fncall3(_fp(75), buf, cap, count_out);
+}
+
+# [76] release a finished command buffer that was NOT submitted (slot 35 releases
+# the ones it submits).
+fn wgpu_command_buffer_release(cmd): i64 {
+    if (_wgpu_has_slot(76) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall1(_fp(76), cmd);
+    return 0;
+}
+
+# [77] (encoder, src WGPUTexelCopyTextureInfo*, dst WGPUTexelCopyTextureInfo*,
+# WGPUExtent3D*). See wgpu_texel_copy_texture_info for the 32-byte info layout.
+fn wgpu_command_encoder_copy_texture_to_texture(enc, src_info, dst_info, extent): i64 {
+    if (_wgpu_has_slot(77) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    fncall4(_fp(77), enc, src_info, dst_info, extent);
+    return 0;
+}
+
+# [78] a WGPUSurface from a Wayland wl_display* + wl_surface* (0 on failure or
+# without the slot).
+fn wgpu_instance_create_surface_wayland(instance, wl_display, wl_surface): i64 {
+    if (_wgpu_has_slot(78) == 0) { return 0; }
+    return fncall3(_fp(78), instance, wl_display, wl_surface);
+}
+
+# [79] fill a 168-byte WgpuSurfaceCapsOut block (layout in deps/wgpu_main.c and
+# WGPU_SURFACE_CAPS_* below). Returns the WGPUStatus (1 = Success); 0 without the
+# slot (out zeroed).
+var WGPU_SURFACE_CAPS_SIZE           = 168;
+var WGPU_SURFACE_CAPS_STATUS         = 0;
+var WGPU_SURFACE_CAPS_USAGES         = 8;
+var WGPU_SURFACE_CAPS_FORMAT_COUNT   = 16;
+var WGPU_SURFACE_CAPS_FORMATS        = 24;    # u32 x 16
+var WGPU_SURFACE_CAPS_FORMATS_MAX    = 16;
+var WGPU_SURFACE_CAPS_PRESENT_COUNT  = 88;
+var WGPU_SURFACE_CAPS_PRESENT_MODES  = 96;    # u32 x 8
+var WGPU_SURFACE_CAPS_PRESENT_MAX    = 8;
+var WGPU_SURFACE_CAPS_ALPHA_COUNT    = 128;
+var WGPU_SURFACE_CAPS_ALPHA_MODES    = 136;   # u32 x 8
+var WGPU_SURFACE_CAPS_ALPHA_MAX      = 8;
+fn wgpu_surface_get_capabilities(surface, adapter, out): i64 {
+    if (out != 0) { memset(out, 0, WGPU_SURFACE_CAPS_SIZE); }
+    if (_wgpu_has_slot(79) == 0) { return 0; }
+    if (out == 0) { return 0; }
+    return fncall3(_fp(79), surface, adapter, out);
+}
+
+# [80] debug groups / markers. target: 0 command encoder, 1 render pass,
+# 2 compute pass. op: 0 push (label), 1 pop, 2 insert marker (label).
+var WGPU_DEBUG_TARGET_ENCODER = 0;
+var WGPU_DEBUG_TARGET_RENDER  = 1;
+var WGPU_DEBUG_TARGET_COMPUTE = 2;
+var WGPU_DEBUG_OP_PUSH   = 0;
+var WGPU_DEBUG_OP_POP    = 1;
+var WGPU_DEBUG_OP_MARKER = 2;
+fn wgpu_debug_op(target, encoder, op, label): i64 {
+    if (_wgpu_has_slot(80) == 0) { return GPU_ERR_FFI_SYMBOL; }
+    if (encoder == 0) { return GPU_ERR_OTHER; }
+    return fncall4(_fp(80), target, encoder, op, label);
 }

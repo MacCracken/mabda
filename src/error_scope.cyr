@@ -1,0 +1,133 @@
+# @public — the render tier's error channel (v4.3.0, MB1)
+# error_scope.cyr — error scopes and uncaptured-error takes on the gpu_* tier
+#
+# Before 4.3.0 a wgpu validation error aborted the host process (wgpu-native's
+# default uncaptured-error handler panics; exit 134). Now:
+#
+#   - creation calls mabda can check itself (shader modules, render pipelines,
+#     bind group layouts, bind groups, sampler objects) return 0 when the API
+#     rejects them, and record why: gpu_last_error() / gpu_last_error_message()
+#     (src/error.cyr);
+#   - an encoding error (a draw missing its bind groups, a bad copy) is refused at
+#     finish, and gpu_render_pass_end returns its GPU_ERR_*;
+#   - gpu_error_scope_push / gpu_error_scope_pop bracket any other calls: the pop
+#     returns 0 or the first error raised inside the scope, including one mabda
+#     caught itself in a creation call while the scope was open;
+#   - gpu_error_take returns an error nothing scoped (the launcher recorded it
+#     instead of aborting), with the number of such errors since the last take.
+#
+# Scopes nest; an error belongs to the innermost scope open when it happens, as in
+# WebGPU. The scope catches Validation errors (WGPUErrorFilter_Validation); an
+# out-of-memory error goes to gpu_error_take.
+#
+# Native backends (AMD, NVIDIA): every call returns its error synchronously, so a
+# scope never catches anything and there is nothing to take. The calls still
+# balance (push/pop depth, pop-without-push is an error) so portable code runs
+# unchanged on every backend.
+#
+# Per-context state (src/context.cyr): +184 the open-scope depth; +192 a pointer
+# to GPU_ERROR_SCOPE_MAX_DEPTH slots, one pending GPU_ERR_* per open depth (an
+# error mabda caught itself while that scope was innermost), allocated on the
+# first push. A scope deeper than GPU_ERROR_SCOPE_MAX_DEPTH still balances and
+# still reports wgpu's own errors; only mabda-caught errors are not tracked there.
+
+var GPU_ERROR_SCOPE_MAX_DEPTH = 32;
+
+fn _gpu_scope_pending_table(ctx): i64 {
+    var t = load64(ctx + CTX_OFF_ERROR_SCOPE_PENDING);
+    if (t == 0) {
+        t = alloc(GPU_ERROR_SCOPE_MAX_DEPTH * 8);
+        if (t == 0) { return 0; }
+        memset(t, 0, GPU_ERROR_SCOPE_MAX_DEPTH * 8);
+        store64(ctx + CTX_OFF_ERROR_SCOPE_PENDING, t);
+    }
+    return t;
+}
+
+# Called where mabda catches an error itself (a refused creation call, a refused
+# frame): hands `code` to the innermost open scope on `ctx`, unless that scope
+# already holds an error (a scope reports its FIRST error). No-op with no scope.
+fn _gpu_scope_note_pending(ctx, code): i64 {
+    if (ctx == 0) { return 0; }
+    if (code == 0) { return 0; }
+    var depth = load64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH);
+    if (depth <= 0) { return 0; }
+    if (depth > GPU_ERROR_SCOPE_MAX_DEPTH) { return 0; }
+    var t = load64(ctx + CTX_OFF_ERROR_SCOPE_PENDING);
+    if (t == 0) { return 0; }
+    var slot = t + (depth - 1) * 8;
+    if (load64(slot) == 0) { store64(slot, code); }
+    return 0;
+}
+
+# @public — open an error scope on `ctx`. Returns 0, or a GPU_ERR_* when it could
+# not open one (GPU_ERR_FFI_SYMBOL: the launcher predates 4.3.0). Every successful
+# push needs one gpu_error_scope_pop.
+fn gpu_error_scope_push(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return GPU_ERR_OTHER; }
+    var depth = load64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH);
+    if (depth < GPU_ERROR_SCOPE_MAX_DEPTH) {
+        if (_gpu_scope_pending_table(ctx) == 0) { return GPU_ERR_OTHER; }
+    }
+    var slot = backend_get_slot(b, BACKEND_SLOT_ERROR_SCOPE_PUSH);
+    if (slot != 0) {
+        var rc = fncall1(slot, ctx);
+        if (rc != 0) { return rc; }
+    }
+    depth = depth + 1;
+    store64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH, depth);
+    if (depth <= GPU_ERROR_SCOPE_MAX_DEPTH) {
+        store64(load64(ctx + CTX_OFF_ERROR_SCOPE_PENDING) + (depth - 1) * 8, 0);
+    }
+    return 0;
+}
+
+# @public — close the innermost error scope. Returns 0 when nothing inside it
+# failed, else the first error's GPU_ERR_* (GPU_ERR_VALIDATION, ...); the message
+# is gpu_last_error_message(). Popping with no scope open returns GPU_ERR_OTHER and
+# records that, touching no backend.
+fn gpu_error_scope_pop(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return GPU_ERR_OTHER; }
+    var depth = load64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH);
+    if (depth <= 0) {
+        _gpu_err_record(GPU_ERR_OTHER, "gpu_error_scope_pop: no error scope is open", 1);
+        return GPU_ERR_OTHER;
+    }
+    var code = 0;
+    var slot = backend_get_slot(b, BACKEND_SLOT_ERROR_SCOPE_POP);
+    if (slot != 0) { code = fncall1(slot, ctx); }
+    var pending = 0;
+    if (depth <= GPU_ERROR_SCOPE_MAX_DEPTH) {
+        var t = load64(ctx + CTX_OFF_ERROR_SCOPE_PENDING);
+        if (t != 0) {
+            pending = load64(t + (depth - 1) * 8);
+            store64(t + (depth - 1) * 8, 0);
+        }
+    }
+    store64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH, depth - 1);
+    if (code == 0) { code = pending; }
+    return code;
+}
+
+# @public — how many error scopes are open on `ctx`.
+fn gpu_error_scope_depth(ctx): i64 {
+    if (ctx == 0) { return 0; }
+    return load64(ctx + CTX_OFF_ERROR_SCOPE_DEPTH);
+}
+
+# @public — take the errors nothing scoped (on wgpu, the launcher recorded them
+# instead of aborting). Returns 0 when none arrived since the last take, else the
+# latest one's GPU_ERR_*; gpu_last_error_message() has its message and
+# gpu_error_count() how many arrived. 0 on the native backends.
+fn gpu_error_take(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return GPU_ERR_OTHER; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_ERROR_TAKE);
+    if (slot == 0) { return 0; }
+    return fncall1(slot, ctx);
+}

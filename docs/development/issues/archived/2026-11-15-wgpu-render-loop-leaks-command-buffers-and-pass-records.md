@@ -1,6 +1,6 @@
-# wgpu backend: every frame leaks its command buffer and 656 B of pass records — about 1.6 KB a frame, ~350 MB an hour at 60 fps
+# wgpu backend: every frame leaks its command buffer and 656 B of pass records — about 1.6 KB a frame, ~350 MB an hour at 60 fps — RESOLVED
 
-**Status:** 🔴 **OPEN** — memory leak.
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16). Both causes fixed. (1) The launcher's submit shim releases each command buffer after `wgpuQueueSubmit` (`deps/wgpu_main.c`; one launcher revision with the render tier's slots, plus slot 76 `wgpuCommandBufferRelease` for a buffer finished but never submitted). (2) `gpu_render_pass_begin` keeps its pass record, colour attachment and begin args in a per-context scratch block (reused; a fresh record only if a pass is still open), and the textured draw takes its sampler from a per-context cache (one per sampler setting) and builds its descriptors in the scratch block. **Measured** with soorat's P8 against the 4.3.0 bundle: 100,000 frames, RSS flat at 96,600,064 B at every checkpoint, `alloc_used` growth 0 B/frame, every per-call delta 0 B, 27.2 s (4.2.0: 96.2 → 260.3 MB, 46.9 s). mabda's own `render_tier_e2e` checks 1000 frames of the new draw-time calls allocate 0 B. Was: open.
 **Filed:** 2026-11-15, from soorat's Cyrius-port probe P8 (`soorat/scripts/probes/gpu/src/p8_gpu_frame.cyr`; logs
 `soorat/scripts/probes/gpu/build/logs/p8-gpu-*.log`; write-up `soorat/docs/development/port-parity.md` §1.5).
 **Placement:**

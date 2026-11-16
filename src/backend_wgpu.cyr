@@ -66,10 +66,70 @@ fn _backend_wgpu_ctx_release(ctx): i64 {
     var device = load64(ctx + 16);
     var adapter = load64(ctx + 8);
     var instance = load64(ctx);
+    _wgpu_render_state_release(ctx);   # 4.3.0: the cached textured-draw samplers
     if (device != 0)   { wgpu_device_release(device); }
     if (adapter != 0)  { wgpu_adapter_release(adapter); }
     if (instance != 0) { wgpu_instance_release(instance); }
     return 0;
+}
+
+# ================================================================
+# v4.3.0 — error channel (render tier MB1)
+# ================================================================
+# wgpu reports a validation error asynchronously: a create call hands back a
+# handle either way, and the error goes to the innermost error scope or, with
+# none open, to the device's uncaptured-error callback (which, before 4.3.0,
+# panicked: exit 134). mabda now scopes its own creation calls: open a Validation
+# scope, create, close it; when the scope caught an error the handle is released,
+# the call returns 0, and the reason lands in the GPU error record (error.cyr).
+#
+# With a pre-4.3.0 launcher (no slots 73/74) open fails and close returns 0, so
+# the old behaviour applies unchanged.
+
+fn _wgpu_scope_open(device): i64 {
+    return wgpu_device_push_error_scope(device, WGPU_ERROR_FILTER_VALIDATION);
+}
+
+# Close the scope _wgpu_scope_open opened. Returns 0, or the GPU_ERR_* code the
+# scope caught (recorded, with the API's message). `ctx` (0 allowed) is told, so a
+# consumer scope open on it reports the error too (src/error_scope.cyr).
+fn _wgpu_scope_close(ctx, device): i64 {
+    var scratch = _gpu_err_scratch_buf();
+    var t = wgpu_device_pop_error_scope(device, scratch, GPU_ERROR_MESSAGE_CAP);
+    if (t == WGPU_POP_SCOPE_NO_SLOT) { return 0; }
+    var code = _gpu_err_from_wgpu_type(t);
+    if (code == 0) { return 0; }
+    _gpu_err_record(code, scratch, 1);
+    if (ctx != 0) { _gpu_scope_note_pending(ctx, code); }
+    return code;
+}
+
+# Backend slots (BACKEND_SLOT_ERROR_*). The public dispatchers in
+# src/error_scope.cyr keep the scope depth; these do the wgpu work.
+fn _backend_wgpu_error_scope_push(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    return wgpu_device_push_error_scope(gpu_ctx_device(ctx), WGPU_ERROR_FILTER_VALIDATION);
+}
+
+fn _backend_wgpu_error_scope_pop(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var scratch = _gpu_err_scratch_buf();
+    var t = wgpu_device_pop_error_scope(gpu_ctx_device(ctx), scratch, GPU_ERROR_MESSAGE_CAP);
+    if (t == WGPU_POP_SCOPE_NO_SLOT) { return GPU_ERR_FFI_SYMBOL; }
+    var code = _gpu_err_from_wgpu_type(t);
+    if (code != 0) { _gpu_err_record(code, scratch, 1); }
+    return code;
+}
+
+fn _backend_wgpu_error_take(ctx): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    var scratch = _gpu_err_scratch_buf();
+    var cnt[8];
+    store64(&cnt, 0);
+    var t = wgpu_take_uncaptured_error(scratch, GPU_ERROR_MESSAGE_CAP, &cnt);
+    var code = _gpu_err_from_wgpu_type(t);
+    if (code != 0) { _gpu_err_record(code, scratch, load64(&cnt)); }
+    return code;
 }
 
 # ================================================================
@@ -103,7 +163,23 @@ fn _backend_wgpu_buffer_create(ctx, size, usage): i64 {
     return wgpu_device_create_buffer(device, desc);
 }
 
+# 4.3.0 audit: validated before the call. Before, nothing was checked: a write
+# WebGPU rejects (an offset or size not a multiple of 4, past the buffer's end, a
+# null buffer or source) still returned 0, and the rejection surfaced only as an
+# uncaptured error (an abort before 4.3.0's error channel). The native backends
+# already bounds-check their writes and take any byte size; WebGPU's queue write
+# needs 4-byte alignment, which this path enforces.
 fn _backend_wgpu_buffer_write(ctx, buf, off, ptr, n): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (buf == 0) { return GPU_ERR_BUFFER; }
+    if (ptr == 0) { return GPU_ERR_BUFFER; }
+    if (n <= 0)   { return GPU_ERR_BUFFER; }
+    if (off < 0)  { return GPU_ERR_BUFFER; }
+    if ((off & 3) != 0) { return GPU_ERR_BUFFER; }
+    if ((n & 3) != 0)   { return GPU_ERR_BUFFER; }
+    var size = wgpu_buffer_get_size(buf);
+    if (off > size) { return GPU_ERR_BUFFER; }
+    if (n > size - off) { return GPU_ERR_BUFFER; }   # off + n > size, overflow-safe
     var queue = gpu_ctx_queue(ctx);
     wgpu_queue_write_buffer(queue, buf, off, ptr, n);
     return 0;
@@ -147,7 +223,7 @@ fn _backend_wgpu_buffer_read(ctx, buf, off, ptr, n): i64 {
         wgpu_buffer_release(staging);
         return GPU_ERR_READBACK_MAP;
     }
-    memcpy(ptr, mapped, n);
+    gpu_copy_bytes(ptr, mapped, n);   # 4.3.0: was the stdlib byte-loop memcpy (P7: 2.7 ms per 128 KB)
     wgpu_buffer_unmap(staging);
     wgpu_buffer_release(staging);
     return 0;
@@ -263,7 +339,19 @@ fn _backend_wgpu_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
         src = wgpu_shader_source_wgsl_len(bytes_ptr, n);
     }
     var desc = wgpu_shader_module_descriptor(0, src);
-    return wgpu_device_create_shader_module(device, desc);
+    # v4.3.0: scoped, so an invalid module returns 0 (and naga's reason, through
+    # gpu_last_error_message) instead of aborting the process.
+    var scoped = _wgpu_scope_open(device);
+    var m = wgpu_device_create_shader_module(device, desc);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (m != 0) { wgpu_shader_module_release(m); }
+            _gpu_set_last_shader_err(0 - SHMOD_ERR_VALIDATION);
+            return 0;
+        }
+    }
+    if (m != 0) { _gpu_set_last_shader_err(0); }
+    return m;
 }
 
 fn _backend_wgpu_shader_module_release(ctx, shmod): i64 {
@@ -727,50 +815,69 @@ fn _backend_wgpu_texture_read(ctx, tex, dst, n): i64 {
     var expected = width * height * 4;
     if (n != expected) { return GPU_ERR_BUFFER; }
 
+    # 4.3.0: a texture-to-buffer copy needs bytesPerRow to be a multiple of
+    # 256 (WGPU COPY_BYTES_PER_ROW_ALIGNMENT). Before, the copy used the tight
+    # width*4 pitch, which wgpu rejects for any width that is not a multiple of
+    # 64 texels (a 4x4 texture: 16-byte rows) — and wgpu-native made that
+    # submit-time error FATAL. Rows are now staged at the padded pitch and
+    # un-padded into `dst`. The staging buffer is padded_row * (height - 1) +
+    # the last tight row: the copy never writes past the last row's texels.
+    var row = width * 4;
+    var padded_row = (row + 255) & (0 - 256);
+    var staging_size = padded_row * (height - 1) + row;
+
     # Stage the readback through a MAP_READ buffer.
     var staging_usage = WGPU_BUFFER_USAGE_MAP_READ
     | WGPU_BUFFER_USAGE_COPY_DST;
-    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, n, 0);
+    var staging_desc = wgpu_buffer_descriptor(0, staging_usage, staging_size, 0);
     var staging = wgpu_device_create_buffer(device, staging_desc);
     if (staging == 0) { return GPU_ERR_BUFFER; }
 
-    # Build copy_texture_to_buffer args (72-byte struct layout —
-    # see src/wgpu_ffi.cyr / programs/render_e2e.cyr for the field
-    # offsets).
-    var cargs = alloc(72);
-    memset(cargs, 0, 72);
-    store64(cargs +  0, handle);
-    store32(cargs +  8, 0);   # src mip
-    store32(cargs + 12, 0);   # origin x
-    store32(cargs + 16, 0);   # origin y
-    store32(cargs + 20, 0);   # origin z
-    store32(cargs + 24, 0);   # aspect = All
-    store64(cargs + 32, staging);
-    store64(cargs + 40, 0);
-    store32(cargs + 48, width * 4);
-    store32(cargs + 52, height);
-    store32(cargs + 56, width);
-    store32(cargs + 60, height);
-    store32(cargs + 64, 1);
+    # copy_texture_to_buffer args (72-byte WgpuCopyTexToBufArgs — layout in
+    # deps/wgpu_main.c). Stack-local: 4.3.0 stopped bump-allocating it per read.
+    var cargs[72];
+    memset(&cargs, 0, 72);
+    store64(&cargs +  0, handle);
+    store32(&cargs + 24, WGPU_TEXTURE_ASPECT_ALL);
+    store64(&cargs + 32, staging);
+    store32(&cargs + 48, padded_row);
+    store32(&cargs + 52, height);
+    store32(&cargs + 56, width);
+    store32(&cargs + 60, height);
+    store32(&cargs + 64, 1);
 
     var encoder = wgpu_device_create_command_encoder(device, 0);
-    wgpu_command_encoder_copy_texture_to_buffer(encoder, cargs);
+    if (encoder == 0) { wgpu_buffer_release(staging); return GPU_ERR_OTHER; }
+    wgpu_command_encoder_copy_texture_to_buffer(encoder, &cargs);
     var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
+    wgpu_command_encoder_release(encoder);   # 4.3.0: was never released
+    if (cmd_buf == 0) {
+        # The launcher refused an invalid command buffer (its error is in the
+        # uncaptured-error record); nothing was copied.
+        wgpu_buffer_release(staging);
+        return GPU_ERR_READBACK_MAP;
+    }
     wgpu_queue_submit_one(queue, cmd_buf);
 
     var status = wgpu_buffer_map_sync(device, staging,
-      WGPU_MAP_MODE_READ, 0, n);
+      WGPU_MAP_MODE_READ, 0, staging_size);
     if (status != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
         wgpu_buffer_release(staging);
         return GPU_ERR_READBACK_MAP;
     }
-    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, n);
+    var mapped = wgpu_buffer_get_const_mapped_range(staging, 0, staging_size);
     if (mapped == 0) {
         wgpu_buffer_unmap(staging);
         wgpu_buffer_release(staging);
         return GPU_ERR_READBACK_MAP;
     }
-    memcpy(dst, mapped, n);
+    if (padded_row == row) {
+        gpu_copy_bytes(dst, mapped, n);
+    } else {
+        for (var y = 0; y < height; y = y + 1) {
+            gpu_copy_bytes(dst + y * row, mapped + y * padded_row, row);
+        }
+    }
     wgpu_buffer_unmap(staging);
     wgpu_buffer_release(staging);
     return 0;
@@ -915,7 +1022,16 @@ fn _backend_wgpu_render_pipeline_create(ctx, vs_mod, fs_mod, color_fmt): i64 {
     var fragment = _fragment_state_new(fs_mod, "fs_main", color_target);
     store64(desc + 160, fragment);
 
+    # v4.3.0: scoped — a pipeline whose WGSL doesn't match (a missing entry point,
+    # a vertex input no buffer provides) returns 0 with the reason recorded.
+    var scoped = _wgpu_scope_open(device);
     var handle = wgpu_device_create_render_pipeline(device, desc);
+    if (scoped == 0) {
+        if (_wgpu_scope_close(ctx, device) != 0) {
+            if (handle != 0) { wgpu_render_pipeline_release(handle); }
+            return 0;
+        }
+    }
     if (handle == 0) { return 0; }
     var pipe = alloc(16);
     memset(pipe, 0, 16);
@@ -940,12 +1056,31 @@ fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
     var view = load64(rt + 8);
     if (view == 0) { return 0; }
 
+    # 4.3.0 (L17): the colour attachment, the begin-pass args and the pass record
+    # live in the per-context render state (backend_wgpu_rtier.cyr) instead of the
+    # bump heap. Before, every begin allocated 432 B that were never freed (the
+    # rpb_pass_* builder, its vec, the attachment array, the args and the record):
+    # with the textured draw's 224 B, ~650 B per frame, forever.
+    var rs = _wgpu_render_state(ctx);
+    if (rs == 0) { return 0; }
     var encoder = wgpu_device_create_command_encoder(device, 0);
     if (encoder == 0) { return 0; }
 
-    var pb = rpb_pass_new();
-    rpb_pass_color(pb, view, clear_color_ptr);
-    var pass = rpb_pass_begin(encoder, pb);
+    # WGPURenderPassColorAttachment (72 B, render_pass.cyr): view +8, depthSlice
+    # +16, resolveTarget +24, loadOp +32, storeOp +36, clearValue +40.
+    var att = rs + _WGPU_RS_COLOR_ATT;
+    memset(att, 0, COLOR_ATTACHMENT_SIZE);
+    store64(att + 8, view);
+    store32(att + 16, 0xFFFFFFFF);   # depthSlice = WGPU_DEPTH_SLICE_UNDEFINED
+    store32(att + 32, WGPU_LOAD_OP_CLEAR);
+    store32(att + 36, WGPU_STORE_OP_STORE);
+    color_write_f64(clear_color_ptr, att + 40);
+    # WgpuBeginPassArgs (40 B, deps/wgpu_main.c): attachments +0, count +8.
+    var args = rs + _WGPU_RS_BEGIN_ARGS;
+    memset(args, 0, 40);
+    store64(args, att);
+    store64(args + 8, 1);
+    var pass = wgpu_command_encoder_begin_render_pass(encoder, args);
     if (pass == 0) {
         wgpu_command_encoder_release(encoder);
         return 0;
@@ -954,7 +1089,19 @@ fn _backend_wgpu_render_pass_begin(ctx, rt, clear_color_ptr): i64 {
     # 48 bytes (40 → 48 at v3.4.1 AA.3c): +24 bound_tex / +32 bound_sampler for
     # bind_for_sample; +40 sample LAYER (-1 = none/2-entry group; >=0 = a draw-time
     # array layer / cube face, 3-entry group with a layer uniform). Default -1.
-    var p = alloc(48);
+    # The per-context record is reused; when a pass begun earlier on this context
+    # is still open (its encoder is set), a fresh record is allocated so two open
+    # passes never share one.
+    var p = rs + _WGPU_RS_PASS;
+    if (load64(p) != 0) {
+        p = alloc(48);
+        if (p == 0) {
+            wgpu_render_pass_encoder_end(pass);
+            wgpu_render_pass_encoder_release(pass);
+            wgpu_command_encoder_release(encoder);
+            return 0;
+        }
+    }
     memset(p, 0, 48);
     store64(p +  0, encoder);
     store64(p +  8, pass);
@@ -981,41 +1128,63 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
         var view = load64(bound_tex + 8);   # wgpu tex struct: view @ +8
         if (view == 0) { return GPU_ERR_TEXTURE; }
         var device = gpu_ctx_device(ctx);
-        var intent = load64(pass + 32);
-        var sdesc = wgpu_sampler_descriptor_from_intent(
-          gpu_sampler_filter(intent), gpu_sampler_addr(intent));
-        var sampler = wgpu_device_create_sampler(device, sdesc);
+        var rs = _wgpu_render_state(ctx);
+        if (rs == 0) { return GPU_ERR_OTHER; }
+        # 4.3.0 (L17): the sampler comes from the per-context cache (one per
+        # intent, created once) and the descriptors are built in the render state;
+        # before, each textured draw bump-allocated 224 B and created + released a
+        # sampler.
+        var sampler = _wgpu_cached_sampler(ctx, load64(pass + 32));
         if (sampler == 0) { return GPU_ERR_OTHER; }
         var bgl = wgpu_render_pipeline_get_bind_group_layout(pipe_handle, 0);
-        if (bgl == 0) { wgpu_sampler_release(sampler); return GPU_ERR_OTHER; }
+        if (bgl == 0) { return GPU_ERR_OTHER; }
         # v3.4.1 AA.3c — if a draw-time layer was bound (+40 >= 0), stage a 16-byte
         # uniform buffer holding it + build a 3-entry group (tex@0,sampler@1,layer@2);
         # the consumer's array/cube WGSL reads the uniform as the sample array_index.
         var layer = load64(pass + 40);
         var ubuf = 0;
-        var bgdesc = 0;
+        var nent = 2;
         if (layer >= 0) {
-            var udesc = wgpu_buffer_descriptor("mabda-layer",
-              WGPU_BUFFER_USAGE_UNIFORM | WGPU_BUFFER_USAGE_COPY_DST, 16, 0);
+            # WGPUBufferDescriptor (48 B): label +8, usage +24, size +32, mapped +40.
+            var udesc = rs + _WGPU_RS_DESC;
+            memset(udesc, 0, 48);
+            wgpu_string_view(udesc + 8, "mabda-layer");
+            store64(udesc + 24, WGPU_BUFFER_USAGE_UNIFORM | WGPU_BUFFER_USAGE_COPY_DST);
+            store64(udesc + 32, 16);
             ubuf = wgpu_device_create_buffer(device, udesc);
             if (ubuf == 0) {
                 wgpu_bind_group_layout_release(bgl);
-                wgpu_sampler_release(sampler);
                 return GPU_ERR_OTHER;
             }
             var ldata[16];
             memset(&ldata, 0, 16);
             store32(&ldata, layer);
             wgpu_queue_write_buffer(gpu_ctx_queue(ctx), ubuf, 0, &ldata, 16);
-            bgdesc = wgpu_texture_layer_bind_group_descriptor(bgl, view, sampler, ubuf, 16);
-        } else {
-            bgdesc = wgpu_texture_bind_group_descriptor(bgl, view, sampler);
+            nent = 3;
         }
+        # WGPUBindGroupEntry (56 B): binding +8, buffer +16, offset +24, size +32,
+        # sampler +40, textureView +48. WGPUBindGroupDescriptor (48 B): layout +24,
+        # entryCount +32, entries +40.
+        var ents = rs + _WGPU_RS_BG_ENTRIES;
+        memset(ents, 0, 168);
+        store32(ents + 8, 0);
+        store64(ents + 48, view);
+        store32(ents + 56 + 8, 1);
+        store64(ents + 56 + 40, sampler);
+        if (nent == 3) {
+            store32(ents + 112 + 8, 2);
+            store64(ents + 112 + 16, ubuf);
+            store64(ents + 112 + 32, 16);
+        }
+        var bgdesc = rs + _WGPU_RS_DESC;
+        memset(bgdesc, 0, 48);
+        store64(bgdesc + 24, bgl);
+        store64(bgdesc + 32, nent);
+        store64(bgdesc + 40, ents);
         var bg = wgpu_device_create_bind_group(device, bgdesc);
         if (bg == 0) {
             if (ubuf != 0) { wgpu_buffer_release(ubuf); }
             wgpu_bind_group_layout_release(bgl);
-            wgpu_sampler_release(sampler);
             return GPU_ERR_OTHER;
         }
         wgpu_render_pass_encoder_set_bind_group(pass_enc, 0, bg, 0, 0);
@@ -1023,9 +1192,9 @@ fn _backend_wgpu_render_pass_draw(ctx, pass, pipe, vc, ic): i64 {
         # own refs to the recorded bind group (and the group AddRef'd the
         # view + sampler + uniform buffer), so dropping ours here avoids a per-draw
         # handle leak. The bind group keeps the layer buffer alive until submit.
+        # The cached sampler is NOT released here (the context owns it).
         wgpu_bind_group_release(bg);
         wgpu_bind_group_layout_release(bgl);
-        wgpu_sampler_release(sampler);
         if (ubuf != 0) { wgpu_buffer_release(ubuf); }
     }
     wgpu_render_pass_encoder_draw(pass_enc, vc, ic, 0, 0);
@@ -1038,17 +1207,28 @@ fn _backend_wgpu_render_pass_end(ctx, pass): i64 {
     var encoder  = load64(pass +  0);
     var pass_enc = load64(pass +  8);
     if (pass_enc != 0) { wgpu_render_pass_encoder_end(pass_enc); }
+    var rc = 0;
     if (encoder != 0) {
         var queue = gpu_ctx_queue(ctx);
         var cmd_buf = wgpu_command_encoder_finish(encoder, 0);
-        if (cmd_buf != 0) { wgpu_queue_submit_one(queue, cmd_buf); }
+        if (cmd_buf != 0) {
+            wgpu_queue_submit_one(queue, cmd_buf);
+        } else {
+            # v4.3.0: the launcher refused the frame's command buffer (an encoding
+            # error: a draw without its bind groups, a bad copy, ...) and recorded
+            # why. Take that into the GPU error record and report it, instead of
+            # the pre-4.3.0 abort at submit.
+            rc = _backend_wgpu_error_take(ctx);
+            if (rc == 0) { rc = GPU_ERR_VALIDATION; }
+            _gpu_scope_note_pending(ctx, rc);
+        }
         wgpu_command_encoder_release(encoder);
     }
     if (pass_enc != 0) { wgpu_render_pass_encoder_release(pass_enc); }
     store64(pass +  0, 0);
     store64(pass +  8, 0);
     store64(pass + 16, 0);
-    return 0;
+    return rc;
 }
 
 # ----------------------------------------------------------------
@@ -1420,6 +1600,12 @@ fn backend_wgpu_new(): i64 {
       &_backend_wgpu_texture_bind_for_sample);
     backend_set_slot(b, BACKEND_SLOT_TEXTURE_BIND_FOR_SAMPLE_LAYER,
       &_backend_wgpu_texture_bind_for_sample_layer);   # v3.4.1 AA.3c
+    # v4.3.0 — the render tier's error channel (src/error_scope.cyr).
+    backend_set_slot(b, BACKEND_SLOT_ERROR_SCOPE_PUSH, &_backend_wgpu_error_scope_push);
+    backend_set_slot(b, BACKEND_SLOT_ERROR_SCOPE_POP,  &_backend_wgpu_error_scope_pop);
+    backend_set_slot(b, BACKEND_SLOT_ERROR_TAKE,       &_backend_wgpu_error_take);
+    # v4.3.0 — the render tier's descriptor / draw slots (src/backend_wgpu_rtier.cyr).
+    _backend_wgpu_fill_rtier(b);
     backend_set_kind(b, BACKEND_KIND_WGPU);
     return b;
 }

@@ -39,6 +39,8 @@ enum GpuErrCode {
     GPU_ERR_CONTAINER_PARSE         = 21;   # v3.3 AL.3 — malformed/truncated/unsupported KTX2/DDS container
     GPU_ERR_AMD_WGPU_DEPRECATED     = 22;   # v4.0.1 — AMD on wgpu deprecated; MABDA_AMD_WGPU_STRICT reject
     GPU_ERR_DEVICE_LOST             = 23;   # v4.1.3 — a GPU reset hit the context; its work did not complete
+    GPU_ERR_VALIDATION              = 24;   # v4.3.0 — the GPU API rejected a call; gpu_last_error_message() says why
+    GPU_ERR_OUT_OF_MEMORY           = 25;   # v4.3.0 — the GPU API ran out of memory for a call
     GPU_ERR_OTHER                   = 99;
 }
 
@@ -221,6 +223,100 @@ var SHMOD_ERR_VA_MAP      = 117;   # GEM_VA map failed
 var SHMOD_ERR_OOM         = 118;   # shmod struct allocation failed
 var SHMOD_ERR_F64_GATE    = 119;   # module uses f64 and MABDA_NATIVE_F64 is off
 var SHMOD_ERR_SRC_KIND    = 120;   # source kind not accepted natively (WGSL / raw GFX9)
+var SHMOD_ERR_VALIDATION  = 121;   # v4.3.0 — wgpu rejected the module; gpu_last_error_message() has naga's reason
+
+# ================================================================
+# v4.3.0 — the GPU error record (the render tier's error channel)
+# ================================================================
+# Before 4.3.0 a wgpu validation error aborted the host process: wgpu-native's
+# default uncaptured-error handler panics, and nothing caught it. The launcher now
+# records uncaptured errors (deps/wgpu_main.c), mabda scopes its own creation
+# calls, and the result of every error mabda observes lands here: a GPU_ERR_*
+# code, the API's message, and how many errors a take covered.
+#
+# Who writes it:
+#   - a creation call mabda scoped itself (shader module, render pipeline, bind
+#     group layout / pipeline layout / bind group, sampler) that the API
+#     rejected: the call returns 0 and the reason is recorded here;
+#   - gpu_error_scope_pop, when its scope caught an error;
+#   - gpu_error_take, for errors nothing scoped (the launcher recorded them);
+#   - gpu_render_pass_end, when the frame's command buffer was refused.
+# Single-slot and not thread-safe, like the shader-error slot above: read it right
+# after the call that failed. gpu_error_clear() resets it.
+var GPU_ERROR_MESSAGE_CAP = 2048;
+var _gpu_err_msg = 0;         # GPU_ERROR_MESSAGE_CAP bytes, allocated on first use
+var _gpu_err_scratch = 0;     # same size: a pop that finds NO error must not clobber the record
+var _gpu_last_err = 0;
+var _gpu_err_count = 0;
+
+fn _gpu_err_msg_buf(): i64 {
+    if (_gpu_err_msg == 0) {
+        _gpu_err_msg = alloc(GPU_ERROR_MESSAGE_CAP);
+        memset(_gpu_err_msg, 0, GPU_ERROR_MESSAGE_CAP);
+    }
+    return _gpu_err_msg;
+}
+
+fn _gpu_err_scratch_buf(): i64 {
+    if (_gpu_err_scratch == 0) {
+        _gpu_err_scratch = alloc(GPU_ERROR_MESSAGE_CAP);
+        memset(_gpu_err_scratch, 0, GPU_ERROR_MESSAGE_CAP);
+    }
+    return _gpu_err_scratch;
+}
+
+# Record `code` with the NUL-terminated message at `msg` (0 = no message). The
+# message is copied, truncated to GPU_ERROR_MESSAGE_CAP - 1 bytes. count is how
+# many errors the record stands for (1 for a single call).
+fn _gpu_err_record(code, msg, count): i64 {
+    var buf = _gpu_err_msg_buf();
+    var n = 0;
+    if (msg != 0) {
+        if (msg != buf) {
+            while (n < GPU_ERROR_MESSAGE_CAP - 1) {
+                if (load8(msg + n) == 0) { break; }
+                n = n + 1;
+            }
+            memcpy(buf, msg, n);
+            store8(buf + n, 0);
+        }
+    } else {
+        store8(buf, 0);
+    }
+    _gpu_last_err = code;
+    _gpu_err_count = count;
+    return 0;
+}
+
+# Map a WGPUErrorType (1 NoError, 2 Validation, 3 OutOfMemory, 4 Internal,
+# 5 Unknown) or a failed pop's negative status to a GPU_ERR_* code (0 = no error).
+fn _gpu_err_from_wgpu_type(t): i64 {
+    if (t == 0) { return 0; }
+    if (t == 1) { return 0; }
+    if (t == 2) { return GPU_ERR_VALIDATION; }
+    if (t == 3) { return GPU_ERR_OUT_OF_MEMORY; }
+    return GPU_ERR_OTHER;
+}
+
+# @public — the GPU_ERR_* code of the most recent error mabda recorded from the
+# GPU API (see above), or 0 when none since the start or the last clear.
+fn gpu_last_error(): i64 { return _gpu_last_err; }
+
+# @public — the recorded error's message: the API's own text (naga's diagnostic
+# for a shader, wgpu's for a pipeline or a bind group). "" when none.
+fn gpu_last_error_message(): i64 { return _gpu_err_msg_buf(); }
+
+# @public — how many errors the record stands for: 1 for a refused call or a
+# scope, the number since the previous take for gpu_error_take.
+fn gpu_error_count(): i64 { return _gpu_err_count; }
+
+# @public — forget the recorded error.
+fn gpu_error_clear(): i64 {
+    store8(_gpu_err_msg_buf(), 0);
+    _gpu_last_err = 0;
+    _gpu_err_count = 0;
+    return 0;
+}
 
 # ================================================================
 # Error name lookup
@@ -251,6 +347,8 @@ fn gpu_err_name(code): i64 {
     if (code == GPU_ERR_CONTAINER_PARSE)    { return "malformed or unsupported texture container (KTX2/DDS)"; }
     if (code == GPU_ERR_AMD_WGPU_DEPRECATED) { return "AMD wgpu path deprecated (v4.0.1) - use native AMD"; }
     if (code == GPU_ERR_DEVICE_LOST)        { return "device lost (a GPU reset hit this context)"; }
+    if (code == GPU_ERR_VALIDATION)         { return "validation error (gpu_last_error_message() has the reason)"; }
+    if (code == GPU_ERR_OUT_OF_MEMORY)      { return "GPU out of memory"; }
     if (code == GPU_ERR_OTHER)              { return "other error"; }
     return "unknown error";
 }

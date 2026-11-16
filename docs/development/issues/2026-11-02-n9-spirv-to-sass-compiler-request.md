@@ -29,7 +29,7 @@ HW-verified on native GFX9 today:
 They use storage-buffer load and store, integer and f32 arithmetic, bounds guards written as structured
 selections, `OpFDiv`, `OpSelect` and GLSL.std.450 clamps. The same SPIR-V passes ranga's own structural
 checks. Each kernel binds two or three storage buffers, so N9 also needs multi-binding dispatch
-([`2026-11-02-compute-dispatch-bindings-differ-amd-nvidia.md`](./2026-11-02-compute-dispatch-bindings-differ-amd-nvidia.md)).
+([`2026-11-02-compute-dispatch-bindings-differ-amd-nvidia.md`](./archived/2026-11-02-compute-dispatch-bindings-differ-amd-nvidia.md)).
 
 ## Done when
 
@@ -39,5 +39,5 @@ pass on the TU116 host with an NVIDIA context.
 ## Until then
 
 Reject SPIR-V on NVIDIA loudly
-([`2026-11-02-nvidia-shader-module-create-ignores-source-kind.md`](./2026-11-02-nvidia-shader-module-create-ignores-source-kind.md)).
+([`2026-11-02-nvidia-shader-module-create-ignores-source-kind.md`](./archived/2026-11-02-nvidia-shader-module-create-ignores-source-kind.md)).
 ranga will also refuse compute on NVIDIA contexts on its own side.

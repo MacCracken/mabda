@@ -1,6 +1,6 @@
-# Native `gpu_buffer_write` / `gpu_buffer_read` copy one byte at a time: about 30 ms per 1080p frame round trip
+# Native `gpu_buffer_write` / `gpu_buffer_read` copy one byte at a time: about 30 ms per 1080p frame round trip — RESOLVED
 
-**Status:** 🔴 **OPEN** — performance.
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16), options 1 and 2. (1) `gpu_copy_bytes` (`src/buffer.cyr`): 32 bytes per iteration when the pointers share 8-byte alignment (4-byte or bytewise otherwise, safe on write-combined BO memory); native AMD and NVIDIA buffer write / read and the wgpu buffer and texture readbacks use it. `cyrius bench tests/bcyr/mabda.bcyr` on the Cezanne: 128 KB in 26 µs (stdlib `memcpy` 208 µs, 7.9x); a 1080p frame in 1.72 ms (12.9 ms, 7.5x) — ranga's 16.6 MB round trip from ~30 ms to ~4 ms of copying. (2) `gpu_buffer_map(ctx, buf)` returns a native buffer's CPU mapping for zero-copy writes and reads (0 on wgpu, with the reason); proven on the TU116 (`nvidia_multibind_e2e` case 5). Option 3, the stdlib `memcpy`, stays open in cyrius. Was: open.
 **Filed:** 2026-11-02, from ranga 2.3.1's GPU benchmarks (`tests/gpu.bcyr`).
 **Placement:** `src/backend_native.cyr` — `_backend_native_buffer_write` / `_read` (line ~910 / ~927);
 `src/backend_nvidia.cyr` — `_backend_nvidia_buffer_write` / `_read` (line ~317 / ~333). The root cause is

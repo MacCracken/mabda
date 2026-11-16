@@ -1,6 +1,6 @@
-# NVIDIA `shader_module_create` ignores the source kind, so SPIR-V is executed as SASS and the channel is killed
+# NVIDIA `shader_module_create` ignores the source kind, so SPIR-V is executed as SASS and the channel is killed — RESOLVED
 
-**Status:** 🔴 **OPEN** — bug.
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16). `_backend_nvidia_shader_module_create` accepts only `SHADER_SRC_SASS`; anything else returns 0 with `SHMOD_ERR_SRC_KIND` before any BO is allocated (and the other refusals now set their `SHMOD_ERR_*` too). CPU test `test_nv_shader_module_create_refuses_non_sass` (`tests/tcyr/nvidia.tcyr`, a hand-built ctx); on the TU116 (`chew`), `nvidia_multibind_e2e` case 1: SPIR-V through `gpu_shader_module_create_spirv` on an NVIDIA context returns 0 + `SHMOD_ERR_SRC_KIND`, no dispatch, no channel kill. SPIR-V on NVIDIA remains the N9 compiler's (`2026-11-02-n9-spirv-to-sass-compiler-request.md`, open). Was: open.
 **Filed:** 2026-11-02, from ranga 2.3.2 (first run of its GPU suites against `gpu_context_new_nvidia`).
 **Placement:** `src/backend_nvidia.cyr` — `_backend_nvidia_shader_module_create` (line ~375).
 **Severity:** **High.** A wrong-but-valid call does not fail. It faults the GPU, the channel is killed, and the
@@ -49,5 +49,5 @@ Do what `_backend_native_shader_module_create` does: accept only `SHADER_SRC_SAS
 on a hand-built NVIDIA ctx struct and expect 0 plus `SHMOD_ERR_SRC_KIND`.
 
 Related: the N9 request
-([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](./2026-11-02-n9-spirv-to-sass-compiler-request.md))
+([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](../2026-11-02-n9-spirv-to-sass-compiler-request.md))
 is the real fix for consumers. This issue is about failing loudly until then.

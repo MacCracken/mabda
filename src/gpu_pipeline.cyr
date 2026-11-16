@@ -1,0 +1,411 @@
+# @public — the render pipeline descriptor (v4.3.0, MB1)
+# gpu_pipeline.cyr — everything a geometry renderer's pipeline says: shader entry
+# points, an optional fragment stage, vertex buffer layouts, topology, culling,
+# front face, per-target formats and blending, explicit bind group layouts, and
+# depth state.
+#
+# Before 4.3.0 the public call was gpu_render_pipeline_create(ctx, vs, fs, fmt):
+# fixed vs_main / fs_main, no vertex buffers, no depth, no blending, an automatic
+# layout. soorat's probe P6 built 2 of its 9 shaders with it.
+#
+#   var d = gpu_pipeline_desc_new(module, "vs_main");
+#   gpu_pipeline_desc_fragment(d, module, "fs_main");      # omit for a depth-only pass
+#   gpu_pipeline_desc_vertex_preset(d, GPU_VERTEX_LAYOUT_3D);
+#   gpu_pipeline_desc_primitive(d, GPU_TOPOLOGY_TRIANGLE_LIST, GPU_CULL_BACK, GPU_FRONT_CCW);
+#   gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_ALPHA, GPU_WRITE_ALL);
+#   gpu_pipeline_desc_depth(d, MABDA_TEXFMT_DEPTH32F, 1, GPU_COMPARE_LESS);
+#   gpu_pipeline_desc_bind_group_layout(d, 0, frame_bgl);
+#   gpu_pipeline_desc_bind_group_layout(d, 1, material_bgl);
+#   var pipe = gpu_render_pipeline_create_desc(ctx, d);   # 0 on failure, reason recorded
+#
+# Defaults: TriangleList, no culling, counter-clockwise front faces, no vertex
+# buffers, no colour targets, no depth, 1 sample. With no
+# gpu_pipeline_desc_bind_group_layout call the layout is automatic (derived from
+# the WGSL); a pipeline that binds groups made by gpu_bind_group_create needs its
+# layouts given explicitly. Release with gpu_render_pipeline_release.
+#
+# Every setter validates and returns 0 or a GPU_ERR_* (reason in the GPU error
+# record). The descriptor is a backend-neutral record allocated once; it may be
+# changed and reused after a create.
+
+# ================================================================
+# Descriptor layout (GPU_PIPELINE_DESC_SIZE bytes)
+# ================================================================
+#   +0   vs module           +8   vs entry (cstr)
+#   +16  fs module (0 none)  +24  fs entry (cstr)
+#   +32  topology            +40  cull mode          +48  front face
+#   +56  label (cstr or 0)
+#   +64  vertex buffer count +72  colour target count +80 bind group count
+#   +88  depth enabled (0/1) +96  depth format (MABDA_TEXFMT_*)
+#   +104 depth write (0/1)   +112 depth compare (GPU_COMPARE_*)
+#   +120 depth bias (i32)    +128 bias slope scale (f32 bits) +136 bias clamp (f32 bits)
+#   +144 sample count        +152 alpha to coverage (0/1)
+#   +160 strip index format (0 = none)            +168 reserved
+#   +176 vertex buffers: GPU_PIPE_MAX_VERTEX_BUFFERS x GPU_PIPE_VB_SIZE (408):
+#        +0 stride  +8 step mode  +16 attribute count
+#        +24 attributes: GPU_PIPE_MAX_ATTRIBUTES x 24: +0 format +8 offset +16 location
+#   +3440 colour targets: GPU_PIPE_MAX_TARGETS x GPU_PIPE_TARGET_SIZE (80):
+#        +0 format (MABDA_TEXFMT_*)  +8 write mask  +16 blend enabled (0/1)
+#        +24 colour op  +32 colour src  +40 colour dst
+#        +48 alpha op   +56 alpha src   +64 alpha dst   +72 reserved
+#   +4080 bind group layouts: GPU_PIPE_MAX_GROUPS x 8 (group order)
+var GPU_PIPE_MAX_VERTEX_BUFFERS = 8;     # WebGPU maxVertexBuffers (minimum 8)
+var GPU_PIPE_MAX_ATTRIBUTES     = 16;    # WebGPU maxVertexAttributes, across all buffers
+var GPU_PIPE_MAX_TARGETS        = 8;     # WebGPU maxColorAttachments
+var GPU_PIPE_MAX_GROUPS         = 4;     # WebGPU maxBindGroups (default limit 4)
+var GPU_PIPE_MAX_LOCATION       = 16;    # shader locations 0 .. 15
+var GPU_PIPE_MAX_STRIDE         = 2048;  # WebGPU maxVertexBufferArrayStride
+var GPU_PIPE_VB_SIZE            = 408;   # 24 + 16 * 24
+var GPU_PIPE_TARGET_SIZE        = 80;
+var GPU_PIPE_OFF_VB             = 176;
+var GPU_PIPE_OFF_TARGETS        = 3440;  # 176 + 8 * 408
+var GPU_PIPE_OFF_GROUPS         = 4080;  # 3440 + 8 * 80
+var GPU_PIPELINE_DESC_SIZE      = 4112;  # 4080 + 4 * 8
+
+fn _gpu_pipe_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+# A descriptor for a pipeline whose vertex stage is `vs_entry` (a NUL-terminated
+# name such as "vs_main") in `vs_module`. 0 on allocation failure.
+fn gpu_pipeline_desc_new(vs_module, vs_entry): i64 {
+    var d = alloc(GPU_PIPELINE_DESC_SIZE);
+    if (d == 0) { return 0; }
+    memset(d, 0, GPU_PIPELINE_DESC_SIZE);
+    store64(d, vs_module);
+    store64(d + 8, vs_entry);
+    store64(d + 32, GPU_TOPOLOGY_TRIANGLE_LIST);
+    store64(d + 40, GPU_CULL_NONE);
+    store64(d + 48, GPU_FRONT_CCW);
+    store64(d + 144, 1);
+    return d;
+}
+
+# The fragment stage. Omit it for a depth-only pipeline (a shadow pass).
+fn gpu_pipeline_desc_fragment(d, fs_module, fs_entry): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (fs_module == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null fragment module"); }
+    if (fs_entry == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null fragment entry point"); }
+    store64(d + 16, fs_module);
+    store64(d + 24, fs_entry);
+    return 0;
+}
+
+fn gpu_pipeline_desc_label(d, label): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    store64(d + 56, label);
+    return 0;
+}
+
+# Add a vertex buffer layout. Buffers are numbered 0, 1, ... in the order added;
+# that number is the `slot` gpu_render_pass_set_vertex_buffer binds.
+fn gpu_pipeline_desc_vertex_buffer(d, stride, step_mode): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    var n = load64(d + 64);
+    if (n >= GPU_PIPE_MAX_VERTEX_BUFFERS) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: more than 8 vertex buffers");
+    }
+    if (stride < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: negative vertex stride"); }
+    if (stride > GPU_PIPE_MAX_STRIDE) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: vertex stride above 2048");
+    }
+    if ((stride & 3) != 0) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: vertex stride not a multiple of 4");
+    }
+    if (step_mode != GPU_STEP_VERTEX) {
+        if (step_mode != GPU_STEP_INSTANCE) {
+            return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad step mode");
+        }
+    }
+    var vb = d + GPU_PIPE_OFF_VB + n * GPU_PIPE_VB_SIZE;
+    memset(vb, 0, GPU_PIPE_VB_SIZE);
+    store64(vb, stride);
+    store64(vb + 8, step_mode);
+    store64(d + 64, n + 1);
+    return 0;
+}
+
+fn _gpu_pipe_attr_total(d): i64 {
+    var t = 0;
+    var n = load64(d + 64);
+    for (var i = 0; i < n; i = i + 1) {
+        t = t + load64(d + GPU_PIPE_OFF_VB + i * GPU_PIPE_VB_SIZE + 16);
+    }
+    return t;
+}
+
+# Add an attribute (GPU_VERTEX_* format, byte offset, shader @location) to vertex
+# buffer `buffer`.
+fn gpu_pipeline_desc_vertex_attribute(d, buffer, format, offset, location): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (buffer < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: no such vertex buffer"); }
+    if (buffer >= load64(d + 64)) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: no such vertex buffer"); }
+    var size = gpu_vertex_format_size(format);
+    if (size == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: unknown vertex format"); }
+    if (offset < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: negative attribute offset"); }
+    if ((offset & 3) != 0) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: attribute offset not a multiple of 4");
+    }
+    if (location < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: negative shader location"); }
+    if (location >= GPU_PIPE_MAX_LOCATION) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: shader location above 15");
+    }
+    if (_gpu_pipe_attr_total(d) >= GPU_PIPE_MAX_ATTRIBUTES) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: more than 16 vertex attributes");
+    }
+    var vb = d + GPU_PIPE_OFF_VB + buffer * GPU_PIPE_VB_SIZE;
+    var stride = load64(vb);
+    if (stride > 0) {
+        if (offset + size > stride) {
+            return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: attribute runs past the vertex stride");
+        }
+    }
+    var nb = load64(d + 64);
+    for (var b = 0; b < nb; b = b + 1) {
+        var vbb = d + GPU_PIPE_OFF_VB + b * GPU_PIPE_VB_SIZE;
+        var na = load64(vbb + 16);
+        for (var a = 0; a < na; a = a + 1) {
+            if (load64(vbb + 24 + a * 24 + 16) == location) {
+                return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: shader location used twice");
+            }
+        }
+    }
+    var n = load64(vb + 16);
+    var at = vb + 24 + n * 24;
+    store64(at, format);
+    store64(at + 8, offset);
+    store64(at + 16, location);
+    store64(vb + 16, n + 1);
+    return 0;
+}
+
+# Add one vertex buffer laid out as a fixed vertex type (GPU_VERTEX_LAYOUT_*,
+# src/gpu_types.cyr), stepping per vertex.
+fn gpu_pipeline_desc_vertex_preset(d, preset): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    var stride = 0;
+    if (preset == GPU_VERTEX_LAYOUT_2D) { stride = 32; }
+    if (preset == GPU_VERTEX_LAYOUT_3D) { stride = 48; }
+    if (preset == GPU_VERTEX_LAYOUT_SKINNED_3D) { stride = 96; }
+    if (preset == GPU_VERTEX_LAYOUT_LINE) { stride = 28; }
+    if (stride == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: unknown vertex layout preset"); }
+    var b = load64(d + 64);
+    var rc = gpu_pipeline_desc_vertex_buffer(d, stride, GPU_STEP_VERTEX);
+    if (rc != 0) { return rc; }
+    if (preset == GPU_VERTEX_LAYOUT_2D) {
+        gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X2, 0, 0);
+        gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X2, 8, 1);
+        return gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X4, 16, 2);
+    }
+    if (preset == GPU_VERTEX_LAYOUT_LINE) {
+        gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X3, 0, 0);
+        return gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X4, 12, 1);
+    }
+    gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X3, 0, 0);
+    gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X3, 12, 1);
+    gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X2, 24, 2);
+    rc = gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X4, 32, 3);
+    if (preset == GPU_VERTEX_LAYOUT_3D) { return rc; }
+    gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X4, 48, 4);
+    gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_UINT32X4, 64, 5);
+    return gpu_pipeline_desc_vertex_attribute(d, b, GPU_VERTEX_FLOAT32X4, 80, 6);
+}
+
+# Topology (GPU_TOPOLOGY_*), cull mode (GPU_CULL_*), front face (GPU_FRONT_*).
+fn gpu_pipeline_desc_primitive(d, topology, cull, front_face): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (topology < GPU_TOPOLOGY_POINT_LIST) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad topology"); }
+    if (topology > GPU_TOPOLOGY_TRIANGLE_STRIP) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad topology");
+    }
+    if (cull < GPU_CULL_NONE) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad cull mode"); }
+    if (cull > GPU_CULL_BACK) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad cull mode"); }
+    if (front_face < GPU_FRONT_CCW) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad front face"); }
+    if (front_face > GPU_FRONT_CW) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad front face"); }
+    store64(d + 32, topology);
+    store64(d + 40, cull);
+    store64(d + 48, front_face);
+    return 0;
+}
+
+# Write a blend preset's factors into target record `t`. Returns 0 or err.
+fn _gpu_pipe_blend_preset(t, preset): i64 {
+    if (preset == GPU_BLEND_NONE) { store64(t + 16, 0); return 0; }
+    var csrc = 0;
+    var cdst = GPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    var asrc = GPU_BLEND_FACTOR_ONE;
+    var adst = GPU_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    if (preset == GPU_BLEND_ALPHA) { csrc = GPU_BLEND_FACTOR_SRC_ALPHA; }
+    if (preset == GPU_BLEND_PREMULTIPLIED) { csrc = GPU_BLEND_FACTOR_ONE; }
+    if (preset == GPU_BLEND_ADDITIVE) {
+        csrc = GPU_BLEND_FACTOR_ONE;
+        cdst = GPU_BLEND_FACTOR_ONE;
+        adst = GPU_BLEND_FACTOR_ONE;
+    }
+    if (csrc == 0) { return GPU_ERR_PIPELINE; }
+    store64(t + 16, 1);
+    store64(t + 24, GPU_BLEND_OP_ADD);
+    store64(t + 32, csrc);
+    store64(t + 40, cdst);
+    store64(t + 48, GPU_BLEND_OP_ADD);
+    store64(t + 56, asrc);
+    store64(t + 64, adst);
+    return 0;
+}
+
+# Add a colour target: a MABDA_TEXFMT_* colour format, a GPU_BLEND_* preset and
+# a GPU_WRITE_* mask. Targets are numbered 0, 1, ... (the shader's
+# @location(n) outputs) in the order added.
+fn gpu_pipeline_desc_target(d, format, blend_preset, write_mask): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    var n = load64(d + 72);
+    if (n >= GPU_PIPE_MAX_TARGETS) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: more than 8 colour targets");
+    }
+    if (mabda_texfmt_is_color_target(format) == 0) {
+        return _gpu_pipe_fail(GPU_ERR_FORMAT_UNSUPPORTED, "pipeline desc: not a colour target format");
+    }
+    if (write_mask < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad write mask"); }
+    if (write_mask > GPU_WRITE_ALL) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad write mask"); }
+    var t = d + GPU_PIPE_OFF_TARGETS + n * GPU_PIPE_TARGET_SIZE;
+    memset(t, 0, GPU_PIPE_TARGET_SIZE);
+    store64(t, format);
+    store64(t + 8, write_mask);
+    if (_gpu_pipe_blend_preset(t, blend_preset) != 0) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: unknown blend preset");
+    }
+    store64(d + 72, n + 1);
+    return 0;
+}
+
+fn _gpu_pipe_blend_factor_ok(f): i64 {
+    if (f < GPU_BLEND_FACTOR_ZERO) { return 0; }
+    if (f > GPU_BLEND_FACTOR_ONE_MINUS_CONSTANT) { return 0; }
+    return 1;
+}
+
+fn _gpu_pipe_blend_op_ok(op): i64 {
+    if (op < GPU_BLEND_OP_ADD) { return 0; }
+    if (op > GPU_BLEND_OP_MAX) { return 0; }
+    return 1;
+}
+
+# A custom blend for target `target` (already added): colour and alpha
+# components as (GPU_BLEND_OP_*, src GPU_BLEND_FACTOR_*, dst GPU_BLEND_FACTOR_*).
+fn gpu_pipeline_desc_target_blend(d, target, cop, csrc, cdst, aop, asrc, adst): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (target < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: no such colour target"); }
+    if (target >= load64(d + 72)) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: no such colour target"); }
+    if (_gpu_pipe_blend_op_ok(cop) == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad blend op"); }
+    if (_gpu_pipe_blend_op_ok(aop) == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad blend op"); }
+    var ok = _gpu_pipe_blend_factor_ok(csrc) & _gpu_pipe_blend_factor_ok(cdst);
+    ok = ok & _gpu_pipe_blend_factor_ok(asrc) & _gpu_pipe_blend_factor_ok(adst);
+    if (ok == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad blend factor"); }
+    var t = d + GPU_PIPE_OFF_TARGETS + target * GPU_PIPE_TARGET_SIZE;
+    store64(t + 16, 1);
+    store64(t + 24, cop);
+    store64(t + 32, csrc);
+    store64(t + 40, cdst);
+    store64(t + 48, aop);
+    store64(t + 56, asrc);
+    store64(t + 64, adst);
+    return 0;
+}
+
+# The bind group layout (gpu_bind_group_layout_create) for @group(`group`).
+# Groups 0 .. n-1 must all be given; with none the layout is automatic.
+fn gpu_pipeline_desc_bind_group_layout(d, group, bgl): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (group < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: negative group"); }
+    if (group >= GPU_PIPE_MAX_GROUPS) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: group above 3"); }
+    if (bgl == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null bind group layout"); }
+    store64(d + GPU_PIPE_OFF_GROUPS + group * 8, bgl);
+    if (group + 1 > load64(d + 80)) { store64(d + 80, group + 1); }
+    return 0;
+}
+
+# Depth state: a depth format (MABDA_TEXFMT_DEPTH32F), whether the pass writes
+# depth, and the GPU_COMPARE_* test (soorat: LESS for meshes, LESS_EQUAL for
+# lines and the shadow pass).
+fn gpu_pipeline_desc_depth(d, format, write_enabled, compare): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (mabda_texfmt_is_depth(format) == 0) {
+        return _gpu_pipe_fail(GPU_ERR_FORMAT_UNSUPPORTED, "pipeline desc: not a depth format");
+    }
+    if (write_enabled < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: depth write is 0 or 1"); }
+    if (write_enabled > 1) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: depth write is 0 or 1"); }
+    if (compare < GPU_COMPARE_NEVER) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad depth compare"); }
+    if (compare > GPU_COMPARE_ALWAYS) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: bad depth compare"); }
+    store64(d + 88, 1);
+    store64(d + 96, format);
+    store64(d + 104, write_enabled);
+    store64(d + 112, compare);
+    return 0;
+}
+
+# Depth bias: a constant (integer, in the depth format's units) plus a slope
+# scale and a clamp, both f64 (mabda's internal precision; stored as f32, the
+# GPU's). Needs gpu_pipeline_desc_depth first.
+fn gpu_pipeline_desc_depth_bias(d, constant, slope_scale, clamp): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (load64(d + 88) == 0) {
+        return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: depth bias without depth state");
+    }
+    if (constant < 0 - 2147483648) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: depth bias out of i32"); }
+    if (constant > 2147483647) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: depth bias out of i32"); }
+    store64(d + 120, constant);
+    store64(d + 128, f64_to_f32(slope_scale));
+    store64(d + 136, f64_to_f32(clamp));
+    return 0;
+}
+
+# Multisampling: 1 or 4 samples (WebGPU's guaranteed counts), and whether alpha
+# writes coverage. Rendering into a multisampled target is MB3's.
+fn gpu_pipeline_desc_multisample(d, count, alpha_to_coverage): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (count != 1) {
+        if (count != 4) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: sample count is 1 or 4"); }
+    }
+    if (alpha_to_coverage < 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: alpha to coverage is 0/1"); }
+    if (alpha_to_coverage > 1) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: alpha to coverage is 0/1"); }
+    store64(d + 144, count);
+    store64(d + 152, alpha_to_coverage);
+    return 0;
+}
+
+# Checks that need the whole descriptor. 0 or the GPU_ERR_* (reason recorded).
+fn gpu_pipeline_desc_validate(d): i64 {
+    if (d == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null"); }
+    if (load64(d) == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null vertex module"); }
+    if (load64(d + 8) == 0) { return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: null vertex entry point"); }
+    var gc = load64(d + 80);
+    for (var g = 0; g < gc; g = g + 1) {
+        if (load64(d + GPU_PIPE_OFF_GROUPS + g * 8) == 0) {
+            return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: a bind group below the highest has no layout");
+        }
+    }
+    var nb = load64(d + 64);
+    for (var b = 0; b < nb; b = b + 1) {
+        if (load64(d + GPU_PIPE_OFF_VB + b * GPU_PIPE_VB_SIZE + 16) == 0) {
+            return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: a vertex buffer has no attributes");
+        }
+    }
+    if (load64(d + 16) == 0) {
+        if (load64(d + 72) != 0) {
+            return _gpu_pipe_fail(GPU_ERR_PIPELINE, "pipeline desc: colour targets without a fragment stage");
+        }
+    }
+    return 0;
+}
+
+# Create the pipeline. Returns an opaque pipeline (release with
+# gpu_render_pipeline_release), or 0 with the reason recorded: a descriptor
+# check, wgpu's own validation (an entry point the module lacks, a vertex input no
+# buffer provides, a layout the WGSL does not match), or GPU_ERR_NOT_IMPLEMENTED  #skip-lint
+# on a backend without this tier.
+fn gpu_render_pipeline_create_desc(ctx, d): i64 {
+    if (ctx == 0) { _gpu_pipe_fail(GPU_ERR_OTHER, "pipeline: null ctx"); return 0; }
+    if (gpu_pipeline_desc_validate(d) != 0) { return 0; }
+    return _gpu_rtier_create(ctx, BACKEND_SLOT_RENDER_PIPELINE_CREATE_DESC, d, "pipeline desc: null");
+}

@@ -1,0 +1,230 @@
+# programs/error_channel_e2e.cyr — the render tier's error channel (v4.3.0, MB1 part B)
+#
+# Every case below aborted the process before 4.3.0 (wgpu-native's default
+# uncaptured-error handler panics, exit 134); soorat's probe P6 hit each of them.
+# Now each returns a GPU_ERR_* through the public tier, the reason is readable,
+# and the process goes on to render a correct frame afterwards:
+#   1. an invalid WGSL module            -> 0, SHMOD_ERR_VALIDATION, naga's reason
+#   2. a pipeline whose WGSL takes vertex inputs no buffer provides (P6: sprite)
+#   3. a pipeline whose entry point is not fs_main (P6: bloom)
+#   4. a draw missing its bind group (P6: postprocess) -> gpu_render_pass_end
+#      returns GPU_ERR_VALIDATION; the next frame renders and reads back right
+#   5. gpu_error_scope_push/pop around a refused call, nested scopes, and a pop
+#      with no scope open
+#   6. gpu_error_take for an error nothing scoped
+#
+# Linked with deps/wgpu_main.c via `make test-error-channel-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+fn _info(msg): i64 { _e2e_line(1, "    ", msg); return 0; }
+
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+# 1 when `needle` occurs in the NUL-terminated `hay`.
+fn _contains(hay, needle): i64 {
+    var hl = strlen(hay);
+    var nl = strlen(needle);
+    for (var i = 0; i + nl <= hl; i = i + 1) {
+        if (memeq(hay + i, needle, nl) == 1) { return 1; }
+    }
+    return 0;
+}
+
+var _BAD_WGSL = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return 1u; }";
+
+# P6's sprite case: a vertex input at location 0, and gpu_render_pipeline_create
+# provides no vertex buffers.
+var _NEEDS_VERTEX_INPUT = "struct V { @location(0) pos: vec2<f32> };
+@vertex fn vs_main(v: V) -> @builtin(position) vec4<f32> { return vec4<f32>(v.pos, 0.0, 1.0); }
+@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+";
+
+# P6's bloom case: no fs_main entry point.
+var _NO_FS_MAIN = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs_threshold() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+";
+
+# P6's postprocess case: the fragment stage reads a uniform at group 0.
+var _NEEDS_BIND_GROUP = "@group(0) @binding(0) var<uniform> tint: vec4<f32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> { return tint; }
+";
+
+var _GREEN = "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
+";
+
+fn _module(ctx, src): i64 { return gpu_shader_module_create(ctx, src, strlen(src)); }
+
+fn _check_bad_module(ctx): i64 {
+    gpu_error_clear();
+    var m = _module(ctx, _BAD_WGSL);
+    if (m != 0) { return _fail("1: an invalid module was returned"); }
+    if (gpu_last_shader_error() != 0 - SHMOD_ERR_VALIDATION) { return _fail("1: last shader error"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("1: last error is not VALIDATION"); }
+    if (_contains(gpu_last_error_message(), "vs_main") == 0) { return _fail("1: the reason does not name vs_main"); }
+    _pass("1: invalid WGSL -> 0 + SHMOD_ERR_VALIDATION + naga's reason, process alive");
+    return 0;
+}
+
+fn _check_pipeline_refusals(ctx): i64 {
+    gpu_error_clear();
+    var m = _module(ctx, _NEEDS_VERTEX_INPUT);
+    if (m == 0) { return _fail("2: module"); }
+    if (gpu_render_pipeline_create(ctx, m, m, 0) != 0) { return _fail("2: pipeline without vertex buffers built"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("2: last error is not VALIDATION"); }
+    _pass("2: vertex inputs without vertex buffers -> 0 + GPU_ERR_VALIDATION (P6 sprite case)");
+    _info(gpu_last_error_message());
+    gpu_error_clear();
+    m = _module(ctx, _NO_FS_MAIN);
+    if (m == 0) { return _fail("3: module"); }
+    if (gpu_render_pipeline_create(ctx, m, m, 0) != 0) { return _fail("3: pipeline without fs_main built"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("3: last error is not VALIDATION"); }
+    if (_contains(gpu_last_error_message(), "fs_main") == 0) { return _fail("3: the reason does not name fs_main"); }
+    _pass("3: no fs_main entry point -> 0 + GPU_ERR_VALIDATION naming fs_main (P6 bloom case)");
+    return 0;
+}
+
+fn _px00(ctx, rt): i64 {
+    var px[16384];
+    memset(&px, 0, 16384);
+    # 64x64 RGBA8 render target: read through a copy (render-target readback is MB3's
+    # public call; the backend's texture read handles the RT struct's handle@0).
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex, load64(rt));
+    store32(&tex + 24, 64);
+    store32(&tex + 28, 64);
+    if (_backend_wgpu_texture_read(ctx, &tex, &px, 16384) != 0) { return 0 - 1; }
+    return (load8(&px) << 24) | (load8(&px + 1) << 16) | (load8(&px + 2) << 8) | load8(&px + 3);
+}
+
+fn _check_refused_frame_then_good_frame(ctx): i64 {
+    gpu_error_clear();
+    var rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (rt == 0) { return _fail("4: render target"); }
+    var m = _module(ctx, _NEEDS_BIND_GROUP);
+    var p = gpu_render_pipeline_create(ctx, m, m, 0);
+    if (p == 0) { return _fail("4: pipeline (its layout is fine; only the draw lacks the group)"); }
+    var clear = color_new(F64_1, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, rt, clear);
+    gpu_render_pass_draw(ctx, pass, p, 3, 1);
+    var rc = gpu_render_pass_end(ctx, pass);
+    if (rc != GPU_ERR_VALIDATION) { return _fail("4: render_pass_end did not report the missing bind group"); }
+    if (_contains(gpu_last_error_message(), "ind") == 0) { return _fail("4: the reason lacks the bind group"); }
+    _pass("4: draw without its bind group -> render_pass_end = GPU_ERR_VALIDATION (P6 postprocess case)");
+    _info(gpu_last_error_message());
+    var g = _module(ctx, _GREEN);
+    var gp = gpu_render_pipeline_create(ctx, g, g, 0);
+    if (gp == 0) { return _fail("4: green pipeline"); }
+    pass = gpu_render_pass_begin(ctx, rt, clear);
+    gpu_render_pass_draw(ctx, pass, gp, 3, 1);
+    if (gpu_render_pass_end(ctx, pass) != 0) { return _fail("4: the next frame was refused too"); }
+    gpu_device_wait_idle(ctx);
+    if (_px00(ctx, rt) != 0x00FF00FF) { return _fail("4: the next frame did not render green"); }
+    _pass("4: the next frame renders and reads back green: the error cost one frame, not the process");
+    return 0;
+}
+
+fn _check_scopes(ctx): i64 {
+    gpu_error_clear();
+    if (gpu_error_scope_push(ctx) != 0) { return _fail("5: push"); }
+    _module(ctx, _BAD_WGSL);                       # refused by mabda inside the scope
+    if (gpu_error_scope_pop(ctx) != GPU_ERR_VALIDATION) { return _fail("5: the scope missed the refused module"); }
+    _pass("5: a scope reports the module mabda refused inside it");
+    gpu_error_scope_push(ctx);
+    gpu_error_scope_push(ctx);
+    _module(ctx, _BAD_WGSL);                       # inner scope's error
+    if (gpu_error_scope_pop(ctx) != GPU_ERR_VALIDATION) { return _fail("5: inner scope"); }
+    if (gpu_error_scope_pop(ctx) != 0) { return _fail("5: the outer scope saw the inner scope's error"); }
+    _pass("5: nested scopes: the error belongs to the inner scope only");
+    gpu_error_scope_push(ctx);
+    if (_module(ctx, _GREEN) == 0) { return _fail("5: valid module"); }
+    if (gpu_error_scope_pop(ctx) != 0) { return _fail("5: a clean scope reported an error"); }
+    if (gpu_error_scope_pop(ctx) != GPU_ERR_OTHER) { return _fail("5: pop with no scope open"); }
+    if (gpu_error_scope_depth(ctx) != 0) { return _fail("5: depth not balanced"); }
+    _pass("5: a clean scope reports 0; a pop with none open reports GPU_ERR_OTHER");
+    return 0;
+}
+
+fn _check_take(ctx): i64 {
+    gpu_error_take(ctx);   # drain
+    gpu_error_clear();
+    # Straight through wgpu, unscoped: only the launcher's uncaptured record sees it.
+    var desc = wgpu_shader_module_descriptor(0, wgpu_shader_source_wgsl_len(_BAD_WGSL, strlen(_BAD_WGSL)));
+    wgpu_device_create_shader_module(gpu_ctx_device(ctx), desc);
+    if (gpu_error_take(ctx) != GPU_ERR_VALIDATION) { return _fail("6: take missed the unscoped error"); }
+    if (gpu_error_count() != 1) { return _fail("6: take count"); }
+    if (gpu_error_take(ctx) != 0) { return _fail("6: take did not clear"); }
+    _pass("6: gpu_error_take returns the unscoped error (count 1), then 0");
+    return 0;
+}
+
+# 7 (4.3.0 audit): gpu_buffer_write on wgpu returned 0 for writes WebGPU rejects
+# (the rejection went to the uncaptured-error channel). It now checks what WebGPU
+# requires before the call: 4-byte-aligned offset and size, inside the buffer,
+# non-null; and returns GPU_ERR_BUFFER.
+fn _check_buffer_write_guards(ctx): i64 {
+    var buf = gpu_buffer_create(ctx, 64, GPU_BUFFER_USAGE_COPY_DST | GPU_BUFFER_USAGE_VERTEX);
+    var data[64];
+    memset(&data, 7, 64);
+    if (gpu_buffer_write(ctx, buf, 0, &data, 6) != GPU_ERR_BUFFER) { return _fail("7: a 6-byte write"); }
+    if (gpu_buffer_write(ctx, buf, 2, &data, 8) != GPU_ERR_BUFFER) { return _fail("7: offset 2 was not refused"); }
+    if (gpu_buffer_write(ctx, buf, 32, &data, 64) != GPU_ERR_BUFFER) { return _fail("7: a write past the end"); }
+    if (gpu_buffer_write(ctx, 0, 0, &data, 8) != GPU_ERR_BUFFER) { return _fail("7: a null buffer"); }
+    if (gpu_buffer_write(ctx, buf, 0, 0, 8) != GPU_ERR_BUFFER) { return _fail("7: a null source"); }
+    if (gpu_buffer_write(ctx, buf, 60, &data, 4) != 0) { return _fail("7: the last 4 bytes were refused"); }
+    _pass("7: gpu_buffer_write refuses misaligned / out-of-range / null writes (it used to return 0 for them)");
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    if (_check_bad_module(ctx) != 0) { return 1; }
+    if (_check_pipeline_refusals(ctx) != 0) { return 1; }
+    if (_check_refused_frame_then_good_frame(ctx) != 0) { return 1; }
+    if (_check_scopes(ctx) != 0) { return 1; }
+    if (_check_take(ctx) != 0) { return 1; }
+    if (_check_buffer_write_guards(ctx) != 0) { return 1; }
+    _e2e_summary();
+    return 0;
+}

@@ -1,6 +1,6 @@
-# The profiler has no pass timings, and `profiler_end_frame` without a `profiler_begin_frame` times from clock zero
+# The profiler has no pass timings, and `profiler_end_frame` without a `profiler_begin_frame` times from clock zero — RESOLVED
 
-**Status:** 🟡 **OPEN** — needed by soorat's M6 (not blocking before then).
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16). Every item, against Rust mabda 1.0's `FrameProfiler` source: `profiler_record_pass` / `_pass_count` / `_pass` / `_total_pass_time_ms` and `pass_timing_*` (cleared by `begin_frame` and `reset`; one reused buffer, so steady-state recording allocates nothing); `profiler_end_frame` with no frame begun returns 0.0 (the frame still counted and recorded; the start is cleared at every end); `profiler_best_frame_ms` on an empty history returns `f64::MAX`'s bits; `profiler_frame_history`, `profiler_export_json`, `profiler_export_history_csv` (1.0's formats), and `profile_end_record` (1.0's `ProfileScope`). soorat's four tests (`profiler_record_pass`, `profiler_begin_clears_passes`, `pass_timing_fields`, `profiler_end_without_begin`) are ported verbatim into `tests/tcyr/core.tcyr`. Was: open.
 **Filed:** 2026-11-15, from soorat's Cyrius port, M4 part d (`soorat/docs/development/port-parity.md` §5.5;
 ledger row L24).
 **Placement:** `src/profiler.cyr` (`profiler_with_alpha_and_history`, `profiler_begin_frame`, `profiler_end_frame`,

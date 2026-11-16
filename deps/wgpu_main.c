@@ -32,6 +32,106 @@ static void c_on_buffer_mapped(WGPUMapAsyncStatus status,
     if (ud1) *(long*)ud1 = (long)status;
 }
 
+// === v4.3.0 error channel ===
+//
+// wgpu-native's default uncaptured-error handler PANICS ("Handling wgpu
+// uncaptured errors as fatal by default"), so before 4.3.0 any validation error
+// (a bad shader, a pipeline whose layout does not match its WGSL, a bind group
+// with the wrong entry count) aborted the host process with exit 134. The device
+// is now created with an uncaptured-error callback that RECORDS the error here
+// instead; Cyrius reads and clears it through slot 75. Error scopes (slots 73/74)
+// attribute an error to the exact call that raised it.
+
+// Copy a WGPUStringView into a NUL-terminated buffer of `cap` bytes (cap >= 1).
+// A view whose length is WGPU_STRLEN is itself NUL-terminated.
+static void copy_string_view(char* dst, long cap, WGPUStringView sv) {
+    if (!dst || cap <= 0) return;
+    dst[0] = 0;
+    if (!sv.data) return;
+    size_t n = sv.length;
+    if (n == WGPU_STRLEN) n = strlen(sv.data);
+    if (n > (size_t)(cap - 1)) n = (size_t)(cap - 1);
+    memcpy(dst, sv.data, n);
+    dst[n] = 0;
+}
+
+#define MABDA_ERR_MSG_CAP 2048
+static long g_uncaptured_type = 0;    // latest WGPUErrorType since the last take; 0 = none
+static long g_uncaptured_count = 0;   // errors since the last take
+static char g_uncaptured_msg[MABDA_ERR_MSG_CAP];
+
+static void c_on_uncaptured_error(WGPUDevice const* device, WGPUErrorType type,
+    WGPUStringView message, void* ud1, void* ud2) {
+    (void)device;
+    (void)ud1;
+    (void)ud2;
+    g_uncaptured_type = (long)type;
+    g_uncaptured_count++;
+    copy_string_view(g_uncaptured_msg, MABDA_ERR_MSG_CAP, message);
+}
+
+// Slot 75: return the latest uncaptured error's WGPUErrorType (0 when none
+// arrived since the last call), copy its message into buf (cap bytes, NUL-
+// terminated; buf may be NULL), store the number of errors since the last call
+// in *count_out (may be NULL), and clear all three.
+long wgpu_shim_take_uncaptured_error(char* buf, long cap, long* count_out) {
+    long type = g_uncaptured_type;
+    if (buf && cap > 0) {
+        long n = (long)strlen(g_uncaptured_msg);
+        if (n > cap - 1) n = cap - 1;
+        memcpy(buf, g_uncaptured_msg, (size_t)n);
+        buf[n] = 0;
+    }
+    if (count_out) *count_out = g_uncaptured_count;
+    g_uncaptured_type = 0;
+    g_uncaptured_count = 0;
+    g_uncaptured_msg[0] = 0;
+    return type;
+}
+
+typedef struct {
+    long done;
+    long status;    // WGPUPopErrorScopeStatus
+    long type;      // WGPUErrorType
+    char* buf;
+    long cap;
+} PopScopeResult;
+
+static void c_on_pop_error_scope(WGPUPopErrorScopeStatus status, WGPUErrorType type,
+    WGPUStringView message, void* ud1, void* ud2) {
+    (void)ud2;
+    PopScopeResult* r = (PopScopeResult*)ud1;
+    if (!r) return;
+    r->status = (long)status;
+    r->type = (long)type;
+    copy_string_view(r->buf, r->cap, message);
+    r->done = 1;
+}
+
+// Slot 74: pop the device's innermost error scope (pushed with slot 73,
+// wgpuDevicePushErrorScope) and wait for its result. Returns the WGPUErrorType
+// (1 = NoError, 2 = Validation, 3 = OutOfMemory, 4 = Internal, 5 = Unknown) when
+// the pop succeeded; the negated WGPUPopErrorScopeStatus when it did not (e.g.
+// -3 = Error: the scope stack was empty); -100 if the callback never fired. The
+// message (if any) lands in buf. The callback info is passed BY VALUE, hence the
+// shim.
+long wgpu_shim_pop_error_scope(WGPUDevice device, char* buf, long cap) {
+    PopScopeResult r = {0};
+    r.buf = buf;
+    r.cap = cap;
+    if (buf && cap > 0) buf[0] = 0;
+    WGPUPopErrorScopeCallbackInfo cb = {
+        .mode = WGPUCallbackMode_AllowSpontaneous,
+        .callback = c_on_pop_error_scope,
+        .userdata1 = &r,
+    };
+    wgpuDevicePopErrorScope(device, cb);
+    for (int i = 0; i < 64 && !r.done; i++) wgpuDevicePoll(device, false, NULL);
+    if (!r.done) return -100;
+    if (r.status != WGPUPopErrorScopeStatus_Success) return -r.status;
+    return r.type;
+}
+
 // === Simplified shims — Cyrius calls these, C handles callback structs ===
 
 // Request adapter: (instance, power_pref, result_ptr) → adapter handle in *result_ptr
@@ -95,6 +195,9 @@ long wgpu_shim_request_device(WGPUAdapter adapter, long* result_ptr) {
     // Re-add a request here if upstream un-comments PassthroughShaders.
     desc.requiredFeatures = feats;
     desc.requiredFeatureCount = nfeat;
+    // v4.3.0: record uncaptured errors instead of wgpu-native's default panic
+    // (see the error channel above).
+    desc.uncapturedErrorCallbackInfo.callback = c_on_uncaptured_error;
     WGPURequestDeviceCallbackInfo cb = {
         .mode = WGPUCallbackMode_AllowSpontaneous,
         .callback = c_on_device,
@@ -137,20 +240,153 @@ WGPUCommandEncoder wgpu_shim_create_command_encoder(WGPUDevice device, const cha
     return wgpuDeviceCreateCommandEncoder(device, &desc);
 }
 
+// The device error scopes are pushed on (set by preinit_gpu). NULL until then.
+static WGPUDevice g_scope_device = NULL;
+
 // Finish the command encoder with a zero-inited descriptor.
+//
+// v4.3.0: an encoding error (a copy with a bad row pitch, a draw with a missing
+// bind group, ...) is reported at finish, and the command buffer finish returns
+// is then INVALID. wgpu-native treats submitting an invalid command buffer as
+// FATAL (handle_error_fatal in wgpuQueueSubmit: it aborts even with an
+// uncaptured-error callback installed). So finish runs under its own Validation
+// error scope: on an error the message goes to the uncaptured-error record (slot
+// 75 reads it), the invalid buffer is released, and NULL is returned. The submit
+// shim (slot 35) skips NULL, so an encoding error costs the frame, not the process.
 WGPUCommandBuffer wgpu_shim_command_encoder_finish(WGPUCommandEncoder encoder, const char* label) {
     WGPUCommandBufferDescriptor desc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
     if (label) {
         desc.label.data = label;
         desc.label.length = strlen(label);
     }
-    return wgpuCommandEncoderFinish(encoder, &desc);
+    if (!g_scope_device) return wgpuCommandEncoderFinish(encoder, &desc);
+    wgpuDevicePushErrorScope(g_scope_device, WGPUErrorFilter_Validation);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, &desc);
+    char msg[MABDA_ERR_MSG_CAP];
+    long t = wgpu_shim_pop_error_scope(g_scope_device, msg, MABDA_ERR_MSG_CAP);
+    if (t > WGPUErrorType_NoError) {
+        g_uncaptured_type = t;
+        g_uncaptured_count++;
+        memcpy(g_uncaptured_msg, msg, MABDA_ERR_MSG_CAP);
+        if (cmd) wgpuCommandBufferRelease(cmd);
+        return NULL;
+    }
+    return cmd;
 }
 
 // Submit a single command buffer. Simpler than passing an array handle from
 // Cyrius when the count is always small.
+//
+// v4.3.0 (L17): the shim now RELEASES the command buffer after submitting it.
+// Before, nothing released a submitted WGPUCommandBuffer (no slot could), so
+// every submit leaked ~1 KB of native heap: a 60 fps render loop grew ~200 MB an
+// hour from this alone. wgpu keeps its own reference until the GPU is done with
+// the work, and a WebGPU command buffer cannot be submitted twice, so the
+// caller's handle is dead after this call. Every submit site in mabda goes
+// through this slot; slot 76 (wgpuCommandBufferRelease) is for a buffer that is
+// finished but never submitted (an error path).
+//
+// A NULL cmd (the finish shim refused an invalid buffer) submits nothing.
 void wgpu_shim_queue_submit_one(WGPUQueue queue, WGPUCommandBuffer cmd) {
+    if (!cmd) return;
     wgpuQueueSubmit(queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+}
+
+// === v4.3.0 render-tier shims ===
+
+// Slot 70: wgpuRenderPassEncoderSetViewport takes six `float`s, which fncallN
+// cannot pass (they go in xmm registers). Cyrius writes them as f32 into a
+// 24-byte block: x, y, width, height, minDepth, maxDepth.
+void wgpu_shim_render_pass_set_viewport(WGPURenderPassEncoder pass, const float* v) {
+    wgpuRenderPassEncoderSetViewport(pass, v[0], v[1], v[2], v[3], v[4], v[5]);
+}
+
+// Slot 78 (MB5): create a WGPUSurface from a Wayland wl_display / wl_surface
+// pair. The application owns the window and passes the two raw pointers; mabda
+// does not link libwayland. The descriptor is a chained struct, hence the shim.
+WGPUSurface wgpu_shim_instance_create_surface_wayland(WGPUInstance instance,
+                                                      void* wl_display, void* wl_surface) {
+    WGPUSurfaceSourceWaylandSurface src = {0};
+    src.chain.sType = WGPUSType_SurfaceSourceWaylandSurface;
+    src.display = wl_display;
+    src.surface = wl_surface;
+    WGPUSurfaceDescriptor desc = {0};
+    desc.nextInChain = &src.chain;
+    return wgpuInstanceCreateSurface(instance, &desc);
+}
+
+// Slot 79 (MB5): wgpuSurfaceGetCapabilities fills arrays wgpu owns, and freeing
+// them (wgpuSurfaceCapabilitiesFreeMembers) takes the struct BY VALUE, hence the
+// shim. It copies the result into a flat block the caller owns and frees wgpu's.
+// Each count is the TRUE count; at most the array's capacity is copied.
+//
+// WgpuSurfaceCapsOut layout (168 bytes, Cyrius-side matches):
+//   +0:   status              (i64: WGPUStatus, 1 = Success)
+//   +8:   usages              (u64: WGPUTextureUsage bits)
+//   +16:  format_count        (u64)
+//   +24:  formats[16]         (u32 each: WGPUTextureFormat)
+//   +88:  present_mode_count  (u64)
+//   +96:  present_modes[8]    (u32 each: WGPUPresentMode)
+//   +128: alpha_mode_count    (u64)
+//   +136: alpha_modes[8]      (u32 each: WGPUCompositeAlphaMode)
+typedef struct {
+    int64_t  status;
+    uint64_t usages;
+    uint64_t format_count;
+    uint32_t formats[16];
+    uint64_t present_mode_count;
+    uint32_t present_modes[8];
+    uint64_t alpha_mode_count;
+    uint32_t alpha_modes[8];
+} WgpuSurfaceCapsOut;
+
+long wgpu_shim_surface_get_capabilities(WGPUSurface surface, WGPUAdapter adapter,
+                                        WgpuSurfaceCapsOut* out) {
+    memset(out, 0, sizeof(*out));
+    WGPUSurfaceCapabilities caps = {0};
+    WGPUStatus st = wgpuSurfaceGetCapabilities(surface, adapter, &caps);
+    out->status = (int64_t)st;
+    if (st != WGPUStatus_Success) return (long)st;
+    out->usages = (uint64_t)caps.usages;
+    out->format_count = caps.formatCount;
+    for (size_t i = 0; i < caps.formatCount && i < 16; i++)
+        out->formats[i] = (uint32_t)caps.formats[i];
+    out->present_mode_count = caps.presentModeCount;
+    for (size_t i = 0; i < caps.presentModeCount && i < 8; i++)
+        out->present_modes[i] = (uint32_t)caps.presentModes[i];
+    out->alpha_mode_count = caps.alphaModeCount;
+    for (size_t i = 0; i < caps.alphaModeCount && i < 8; i++)
+        out->alpha_modes[i] = (uint32_t)caps.alphaModes[i];
+    wgpuSurfaceCapabilitiesFreeMembers(caps);
+    return (long)st;
+}
+
+// Slot 80: every debug-group operation through one slot. Labels are
+// WGPUStringView BY VALUE, hence the shim; one shim instead of nine slots.
+//   target: 0 = WGPUCommandEncoder, 1 = WGPURenderPassEncoder, 2 = WGPUComputePassEncoder
+//   op:     0 = push group (label), 1 = pop group, 2 = insert marker (label)
+// Returns 0, or -1 for an unknown target/op (nothing is called).
+long wgpu_shim_debug_op(long target, void* encoder, long op, const char* label) {
+    WGPUStringView sv = { label, label ? strlen(label) : 0 };
+    if (!encoder) return -1;
+    if (target == 0) {
+        WGPUCommandEncoder e = (WGPUCommandEncoder)encoder;
+        if (op == 0) { wgpuCommandEncoderPushDebugGroup(e, sv); return 0; }
+        if (op == 1) { wgpuCommandEncoderPopDebugGroup(e); return 0; }
+        if (op == 2) { wgpuCommandEncoderInsertDebugMarker(e, sv); return 0; }
+    } else if (target == 1) {
+        WGPURenderPassEncoder p = (WGPURenderPassEncoder)encoder;
+        if (op == 0) { wgpuRenderPassEncoderPushDebugGroup(p, sv); return 0; }
+        if (op == 1) { wgpuRenderPassEncoderPopDebugGroup(p); return 0; }
+        if (op == 2) { wgpuRenderPassEncoderInsertDebugMarker(p, sv); return 0; }
+    } else if (target == 2) {
+        WGPUComputePassEncoder p = (WGPUComputePassEncoder)encoder;
+        if (op == 0) { wgpuComputePassEncoderPushDebugGroup(p, sv); return 0; }
+        if (op == 1) { wgpuComputePassEncoderPopDebugGroup(p); return 0; }
+        if (op == 2) { wgpuComputePassEncoderInsertDebugMarker(p, sv); return 0; }
+    }
+    return -1;
 }
 
 // wgpuCommandEncoderCopyBufferToBuffer, wgpuQueueWriteTexture, and
@@ -294,7 +530,13 @@ WGPUShaderModule wgpu_shim_create_shader_module_spirv(WGPUDevice device,
 }
 
 // === Function table ===
-#define FN_COUNT 67
+// v4.3.0: 67 -> 81 slots, in ONE revision covering mabda's whole render tier
+// (MB1-MB5) plus the L17 command-buffer release, so consumers rebuild their
+// launcher copy once. A consumer that keeps an older launcher still runs: the
+// launcher tells mabda its slot count (mabda_wgpu_launcher_slots, below), and
+// mabda's wrappers for slots it does not have return an error instead of
+// calling through a pointer past the end of this table.
+#define FN_COUNT 81
 static void* fn_table[FN_COUNT];
 
 static void build_fn_table(void) {
@@ -339,7 +581,7 @@ static void build_fn_table(void) {
     fn_table[i++] = (void*)wgpuComputePassEncoderEnd;                 // 33
     fn_table[i++] = (void*)wgpuCommandEncoderRelease;                 // 34
     // Queue (35)
-    fn_table[i++] = (void*)wgpu_shim_queue_submit_one;                // 35 (shim: takes queue, single cmd buffer)
+    fn_table[i++] = (void*)wgpu_shim_queue_submit_one;                // 35 (shim: single cmd buffer; releases it after submit, 4.3.0)
     // Adapter (36-38)
     fn_table[i++] = (void*)wgpuAdapterGetInfo;                        // 36
     fn_table[i++] = (void*)wgpuAdapterGetLimits;                      // 37
@@ -380,6 +622,32 @@ static void build_fn_table(void) {
     // pipeline's auto-generated BGL to build the (texture, sampler) bind group.
     fn_table[i++] = (void*)wgpuRenderPipelineGetBindGroupLayout;          // 65
     fn_table[i++] = (void*)wgpu_shim_create_shader_module_spirv;          // 66 (shim: raw-SPIR-V passthrough)
+    // v4.3.0 — MB1 draw-time calls (67-72). Direct: scalar / pointer arguments.
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetVertexBuffer;          // 67
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetIndexBuffer;           // 68
+    fn_table[i++] = (void*)wgpuRenderPassEncoderDrawIndexed;              // 69
+    fn_table[i++] = (void*)wgpu_shim_render_pass_set_viewport;            // 70 (shim: six floats)
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetScissorRect;           // 71
+    fn_table[i++] = (void*)wgpuRenderPassEncoderSetBlendConstant;         // 72 (WGPUColor by pointer)
+    // v4.3.0 — error channel (73-75).
+    fn_table[i++] = (void*)wgpuDevicePushErrorScope;                      // 73
+    fn_table[i++] = (void*)wgpu_shim_pop_error_scope;                     // 74 (shim: callback info by value)
+    fn_table[i++] = (void*)wgpu_shim_take_uncaptured_error;               // 75 (shim: launcher-recorded error)
+    // v4.3.0 — L17: release a finished command buffer that was never submitted.
+    fn_table[i++] = (void*)wgpuCommandBufferRelease;                      // 76
+    // v4.3.0 — MB3: texture-to-texture copy (all arguments by pointer).
+    fn_table[i++] = (void*)wgpuCommandEncoderCopyTextureToTexture;        // 77
+    // v4.3.0 — MB5: Wayland surface + capabilities.
+    fn_table[i++] = (void*)wgpu_shim_instance_create_surface_wayland;     // 78 (shim: chained descriptor)
+    fn_table[i++] = (void*)wgpu_shim_surface_get_capabilities;            // 79 (shim: FreeMembers by value)
+    // v4.3.0 — debug groups / markers on every encoder kind (roadmap backlog).
+    fn_table[i++] = (void*)wgpu_shim_debug_op;                            // 80 (shim: labels by value)
+    // A slot added above without bumping FN_COUNT (or the reverse) would hand
+    // mabda a table whose tail is NULL or overruns: refuse to start instead.
+    if (i != FN_COUNT) {
+        fprintf(stderr, "wgpu_main.c: fn_table has %d entries, FN_COUNT is %d\n", i, FN_COUNT);
+        abort();
+    }
 }
 
 // Pre-initialize GPU context in C (before Cyrius code runs)
@@ -438,6 +706,7 @@ static int preinit_gpu(void) {
     if (!preinit.device) return 0;
 
     preinit.queue = wgpuDeviceGetQueue(preinit.device);
+    g_scope_device = preinit.device;
     return 1;
 }
 
@@ -445,6 +714,11 @@ extern long mabda_main(long fn_table_ptr, long preinit_ptr);
 extern void _cyrius_init(void);
 extern void alloc_init(void);
 extern long thread_local_use_foreign_tls(void);
+// v4.3.0: tells mabda how many fn_table slots this launcher has. WEAK, so this
+// launcher still links against a mabda older than 4.3.0 (which lacks the
+// symbol); a mabda that never hears from it treats the launcher as the 67-slot
+// pre-4.3.0 table and refuses the newer calls with an error.
+extern long mabda_wgpu_launcher_slots(long slot_count) __attribute__((weak));
 
 int main(void) {
     // Initialize Cyrius globals (enums, global vars), then heap
@@ -466,6 +740,8 @@ int main(void) {
     int gpu_ok = preinit_gpu();
 
     build_fn_table();
+    // After _cyrius_init (it resets cyrius globals, including the slot count).
+    if (mabda_wgpu_launcher_slots) mabda_wgpu_launcher_slots(FN_COUNT);
     long result = mabda_main((long)(void*)fn_table, gpu_ok ? (long)(void*)&preinit : 0);
     return (int)result;
 }

@@ -1,0 +1,331 @@
+# @public — bind group layouts, bind groups and sampler objects (v4.3.0, MB1)
+# gpu_bind.cyr — what a geometry renderer binds: uniform / storage buffers,
+# textures and samplers, in explicit layouts, several groups per pipeline.
+#
+# Before 4.3.0 the public tier could bind exactly one thing: a (texture, sampler)
+# pair through gpu_render_pass_bind_texture, as a 2-entry group built from the
+# pipeline's automatic layout. soorat's shaders bind up to four groups of mixed
+# entries (P6: postprocess's layout has a uniform the old call could not bind).
+#
+#   var l = gpu_bind_group_layout_new();
+#   gpu_bgl_uniform(l, 0, GPU_STAGE_VERTEX | GPU_STAGE_FRAGMENT, 1, 0);   # dynamic offset
+#   gpu_bgl_texture(l, 1, GPU_STAGE_FRAGMENT, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 0);
+#   gpu_bgl_sampler(l, 2, GPU_STAGE_FRAGMENT, GPU_SAMPLER_FILTERING);
+#   var bgl = gpu_bind_group_layout_create(ctx, l);      # 0 on failure (reason recorded)
+#
+#   var g = gpu_bind_group_new(bgl);
+#   gpu_bg_buffer(g, 0, ubuf, 0, 256);                   # the dynamically-offset window
+#   gpu_bg_texture(g, 1, tex);
+#   gpu_bg_sampler(g, 2, gpu_sampler_object_create(ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_CLAMP, GPU_COMPARE_NONE));
+#   var bg = gpu_bind_group_create(ctx, g);
+#
+# The builders (gpu_bind_group_layout_new / gpu_bind_group_new) are plain
+# backend-neutral records, allocated once at setup; a backend turns one into its
+# own object when it is created. The created layout, group and sampler are opaque
+# handles. A builder may be reused after its create call.
+#
+# Every builder call validates its arguments and returns 0 or a GPU_ERR_* with the
+# reason in the GPU error record (gpu_last_error_message). A create returns 0 when the
+# backend rejects the record (the reason recorded), or GPU_ERR_NOT_IMPLEMENTED's  #skip-lint
+# reason on a backend without this tier (the native backends at 4.3.0).
+
+# ================================================================
+# Bind group layout builder
+# ================================================================
+# Layout (GPU_BGL_DESC_SIZE bytes):
+#   +0:  entry count (u64)
+#   +8:  GPU_BGL_MAX_ENTRIES entries x GPU_BGL_ENTRY_SIZE (48):
+#        +0  binding (u32)    +4 kind (u32: GPU_BINDING_*)
+#        +8  visibility (u64: GPU_STAGE_* bits)
+#        +16 a: buffer -> has_dynamic_offset (0/1); texture -> sample type;
+#               sampler -> sampler binding type
+#        +24 b: buffer -> min binding size (bytes, 0 = any); texture -> view dimension
+#        +32 c: texture -> multisampled (0/1)
+#        +40 reserved
+var GPU_BGL_MAX_ENTRIES = 16;
+var GPU_BGL_ENTRY_SIZE  = 48;
+var GPU_BGL_DESC_SIZE   = 776;    # 8 + 16 * 48
+# Bindings are numbered 0 .. GPU_BINDING_INDEX_MAX - 1 (WebGPU's
+# maxBindingsPerBindGroup minimum is 1000).
+var GPU_BINDING_INDEX_MAX = 1000;
+
+fn gpu_bind_group_layout_new(): i64 {
+    var l = alloc(GPU_BGL_DESC_SIZE);
+    if (l == 0) { return 0; }
+    memset(l, 0, GPU_BGL_DESC_SIZE);
+    return l;
+}
+
+fn gpu_bgl_entry_count(l): i64 {
+    if (l == 0) { return 0; }
+    return load64(l);
+}
+
+# Entry i of a layout builder (0 when out of range). For backends and tests.
+fn gpu_bgl_entry(l, i): i64 {
+    if (l == 0) { return 0; }
+    if (i < 0) { return 0; }
+    if (i >= load64(l)) { return 0; }
+    return l + 8 + i * GPU_BGL_ENTRY_SIZE;
+}
+
+fn _gpu_bind_fail(code, msg): i64 {
+    _gpu_err_record(code, msg, 1);
+    return code;
+}
+
+# Append an entry after the checks every kind shares. Returns the entry or 0 (the
+# reason recorded).
+fn _gpu_bgl_add(l, binding, kind, visibility): i64 {
+    if (l == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: null builder"); return 0; }
+    var n = load64(l);
+    if (n >= GPU_BGL_MAX_ENTRIES) {
+        _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: more than 16 entries");
+        return 0;
+    }
+    if (binding < 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: negative binding"); return 0; }
+    if (binding >= GPU_BINDING_INDEX_MAX) {
+        _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: binding >= 1000");
+        return 0;
+    }
+    if (visibility == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: no shader stage"); return 0; }
+    if ((visibility & (0 - 8)) != 0) {
+        _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: visibility has bits beyond GPU_STAGE_*");
+        return 0;
+    }
+    for (var i = 0; i < n; i = i + 1) {
+        if (load32(l + 8 + i * GPU_BGL_ENTRY_SIZE) == binding) {
+            _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group layout: binding used twice");
+            return 0;
+        }
+    }
+    var e = l + 8 + n * GPU_BGL_ENTRY_SIZE;
+    memset(e, 0, GPU_BGL_ENTRY_SIZE);
+    store32(e, binding);
+    store32(e + 4, kind);
+    store64(e + 8, visibility);
+    store64(l, n + 1);
+    return e;
+}
+
+# A uniform buffer (`var<uniform>`). dynamic_offset = 1 lets
+# gpu_render_pass_set_bind_group pick the window per draw; min_size = 0 accepts
+# any bound size the shader can use.
+fn gpu_bgl_uniform(l, binding, visibility, dynamic_offset, min_size): i64 {
+    if (dynamic_offset < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_uniform: dynamic_offset is 0 or 1"); }
+    if (dynamic_offset > 1) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_uniform: dynamic_offset is 0 or 1"); }
+    if (min_size < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_uniform: negative min_size"); }
+    var e = _gpu_bgl_add(l, binding, GPU_BINDING_UNIFORM, visibility);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    store64(e + 16, dynamic_offset);
+    store64(e + 24, min_size);
+    return 0;
+}
+
+# A storage buffer (`var<storage, read_write>`, or `var<storage, read>` with
+# read_only = 1).
+fn gpu_bgl_storage(l, binding, visibility, read_only, dynamic_offset, min_size): i64 {
+    if (read_only < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_storage: read_only is 0 or 1"); }
+    if (read_only > 1) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_storage: read_only is 0 or 1"); }
+    if (dynamic_offset < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_storage: dynamic_offset is 0 or 1"); }
+    if (dynamic_offset > 1) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_storage: dynamic_offset is 0 or 1"); }
+    if (min_size < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_storage: negative min_size"); }
+    var kind = GPU_BINDING_STORAGE;
+    if (read_only == 1) { kind = GPU_BINDING_STORAGE_READ_ONLY; }
+    var e = _gpu_bgl_add(l, binding, kind, visibility);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    store64(e + 16, dynamic_offset);
+    store64(e + 24, min_size);
+    return 0;
+}
+
+# A sampled texture: sample_type GPU_SAMPLE_*, view_dim GPU_VIEW_*,
+# multisampled 0/1. A texture_depth_2d is GPU_SAMPLE_DEPTH + GPU_VIEW_2D; a
+# texture_cube<f32> is GPU_SAMPLE_FLOAT + GPU_VIEW_CUBE.
+fn gpu_bgl_texture(l, binding, visibility, sample_type, view_dim, multisampled): i64 {
+    if (sample_type < GPU_SAMPLE_FLOAT) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: bad sample type"); }
+    if (sample_type > GPU_SAMPLE_UINT) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: bad sample type"); }
+    if (view_dim < GPU_VIEW_2D) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: bad view dimension"); }
+    if (view_dim > GPU_VIEW_3D) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: bad view dimension"); }
+    if (multisampled < 0) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: multisampled is 0 or 1"); }
+    if (multisampled > 1) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_texture: multisampled is 0 or 1"); }
+    var e = _gpu_bgl_add(l, binding, GPU_BINDING_TEXTURE, visibility);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    store64(e + 16, sample_type);
+    store64(e + 24, view_dim);
+    store64(e + 32, multisampled);
+    return 0;
+}
+
+# A sampler: GPU_SAMPLER_FILTERING / NON_FILTERING / COMPARISON
+# (sampler_comparison).
+fn gpu_bgl_sampler(l, binding, visibility, sampler_type): i64 {
+    if (sampler_type < GPU_SAMPLER_FILTERING) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_sampler: bad type"); }
+    if (sampler_type > GPU_SAMPLER_COMPARISON) { return _gpu_bind_fail(GPU_ERR_PIPELINE, "bgl_sampler: bad type"); }
+    var e = _gpu_bgl_add(l, binding, GPU_BINDING_SAMPLER, visibility);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    store64(e + 16, sampler_type);
+    return 0;
+}
+
+# ================================================================
+# Bind group builder
+# ================================================================
+# Layout (GPU_BG_DESC_SIZE bytes):
+#   +0:  layout handle (from gpu_bind_group_layout_create)
+#   +8:  entry count (u64)
+#   +16: GPU_BGL_MAX_ENTRIES entries x GPU_BG_ENTRY_SIZE (40):
+#        +0  binding (u32)   +4 kind (u32: GPU_BG_BUFFER / TEXTURE / SAMPLER)
+#        +8  resource: a gpu_buffer_create buffer, a mabda texture (any
+#            gpu_texture_create_* or gpu_render_target_create_* result: its
+#            default view is bound), or a gpu_sampler_object_create sampler
+#        +16 offset (buffer)   +24 size (buffer; 0 = to the end)   +32 reserved
+var GPU_BG_ENTRY_SIZE = 40;
+var GPU_BG_DESC_SIZE  = 656;    # 16 + 16 * 40
+var GPU_BG_BUFFER  = 1;
+var GPU_BG_TEXTURE = 2;
+var GPU_BG_SAMPLER = 3;
+
+fn gpu_bind_group_new(layout): i64 {
+    var g = alloc(GPU_BG_DESC_SIZE);
+    if (g == 0) { return 0; }
+    memset(g, 0, GPU_BG_DESC_SIZE);
+    store64(g, layout);
+    return g;
+}
+
+fn gpu_bg_entry_count(g): i64 {
+    if (g == 0) { return 0; }
+    return load64(g + 8);
+}
+
+fn gpu_bg_entry(g, i): i64 {
+    if (g == 0) { return 0; }
+    if (i < 0) { return 0; }
+    if (i >= load64(g + 8)) { return 0; }
+    return g + 16 + i * GPU_BG_ENTRY_SIZE;
+}
+
+fn _gpu_bg_add(g, binding, kind, resource): i64 {
+    if (g == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: null builder"); return 0; }
+    var n = load64(g + 8);
+    if (n >= GPU_BGL_MAX_ENTRIES) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: more than 16 entries"); return 0; }
+    if (binding < 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: negative binding"); return 0; }
+    if (binding >= GPU_BINDING_INDEX_MAX) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: binding >= 1000"); return 0; }
+    if (resource == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: null resource"); return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (load32(g + 16 + i * GPU_BG_ENTRY_SIZE) == binding) {
+            _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: binding used twice");
+            return 0;
+        }
+    }
+    var e = g + 16 + n * GPU_BG_ENTRY_SIZE;
+    memset(e, 0, GPU_BG_ENTRY_SIZE);
+    store32(e, binding);
+    store32(e + 4, kind);
+    store64(e + 8, resource);
+    store64(g + 8, n + 1);
+    return e;
+}
+
+# A buffer range: [offset, offset + size); size 0 binds to the end of the buffer.
+# With a dynamic-offset layout entry this is the window each draw offsets.
+fn gpu_bg_buffer(g, binding, buf, offset, size): i64 {
+    if (offset < 0) { return _gpu_bind_fail(GPU_ERR_BUFFER, "bg_buffer: negative offset"); }
+    if (size < 0) { return _gpu_bind_fail(GPU_ERR_BUFFER, "bg_buffer: negative size"); }
+    var e = _gpu_bg_add(g, binding, GPU_BG_BUFFER, buf);
+    if (e == 0) { return GPU_ERR_PIPELINE; }
+    store64(e + 16, offset);
+    store64(e + 24, size);
+    return 0;
+}
+
+fn gpu_bg_texture(g, binding, tex): i64 {
+    if (_gpu_bg_add(g, binding, GPU_BG_TEXTURE, tex) == 0) { return GPU_ERR_PIPELINE; }
+    return 0;
+}
+
+fn gpu_bg_sampler(g, binding, sampler): i64 {
+    if (_gpu_bg_add(g, binding, GPU_BG_SAMPLER, sampler) == 0) { return GPU_ERR_PIPELINE; }
+    return 0;
+}
+
+# ================================================================
+# Create / release — backend dispatch
+# ================================================================
+
+# Dispatch a handle-returning render-tier slot: returns the handle, or 0 with the
+# reason recorded (a missing slot is GPU_ERR_NOT_IMPLEMENTED on this backend).  #skip-lint
+fn _gpu_rtier_create(ctx, slot_off, desc, what): i64 {
+    if (ctx == 0) { _gpu_bind_fail(GPU_ERR_OTHER, "render tier: null ctx"); return 0; }
+    if (desc == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, what); return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { _gpu_bind_fail(GPU_ERR_OTHER, "render tier: ctx has no backend"); return 0; }
+    var slot = backend_get_slot(b, slot_off);
+    if (slot == 0) {
+        _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+          "render tier: this call is not implemented on this backend (wgpu only at 4.3.0)", 1);
+        return 0;
+    }
+    return fncall2(slot, ctx, desc);
+}
+
+fn _gpu_rtier_release(ctx, slot_off, h): i64 {
+    if (ctx == 0) { return 0; }
+    if (h == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, slot_off);
+    if (slot == 0) { return 0; }
+    return fncall2(slot, ctx, h);
+}
+
+fn gpu_bind_group_layout_create(ctx, l): i64 {
+    return _gpu_rtier_create(ctx, BACKEND_SLOT_BIND_GROUP_LAYOUT_CREATE, l, "bind group layout: null builder");
+}
+
+fn gpu_bind_group_layout_release(ctx, bgl): i64 {
+    return _gpu_rtier_release(ctx, BACKEND_SLOT_BIND_GROUP_LAYOUT_RELEASE, bgl);
+}
+
+fn gpu_bind_group_create(ctx, g): i64 {
+    if (g != 0) {
+        if (load64(g) == 0) { _gpu_bind_fail(GPU_ERR_PIPELINE, "bind group: no layout"); return 0; }
+    }
+    return _gpu_rtier_create(ctx, BACKEND_SLOT_BIND_GROUP_CREATE, g, "bind group: null builder");
+}
+
+fn gpu_bind_group_release(ctx, bg): i64 {
+    return _gpu_rtier_release(ctx, BACKEND_SLOT_BIND_GROUP_RELEASE, bg);
+}
+
+# ================================================================
+# Sampler objects
+# ================================================================
+# A sampler handle for gpu_bg_sampler. `filter` (GPU_FILTER_*) applies to
+# magnification, minification and mip selection; `address` (GPU_ADDRESS_*) to
+# u, v and w; `compare` GPU_COMPARE_NONE for an ordinary sampler, or a
+# GPU_COMPARE_* for a comparison sampler (shadow maps: GPU_COMPARE_LESS_EQUAL).
+#
+# Descriptor handed to the backend (GPU_SAMPLER_DESC_SIZE bytes):
+#   +0 filter  +8 address  +16 compare  +24 max anisotropy (1)
+var GPU_SAMPLER_DESC_SIZE = 32;
+
+fn gpu_sampler_object_create(ctx, filter, address, compare): i64 {
+    if (filter < GPU_FILTER_NEAREST) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad filter"); return 0; }
+    if (filter > GPU_FILTER_LINEAR) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad filter"); return 0; }
+    if (address < GPU_ADDRESS_CLAMP) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad address mode"); return 0; }
+    if (address > GPU_ADDRESS_MIRROR) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad address mode"); return 0; }
+    if (compare < GPU_COMPARE_NONE) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad compare function"); return 0; }
+    if (compare > GPU_COMPARE_ALWAYS) { _gpu_bind_fail(GPU_ERR_OTHER, "sampler: bad compare function"); return 0; }
+    var d[32];
+    store64(&d, filter);
+    store64(&d + 8, address);
+    store64(&d + 16, compare);
+    store64(&d + 24, 1);
+    return _gpu_rtier_create(ctx, BACKEND_SLOT_SAMPLER_OBJECT_CREATE, &d, "sampler: null descriptor");
+}
+
+fn gpu_sampler_object_release(ctx, sampler): i64 {
+    return _gpu_rtier_release(ctx, BACKEND_SLOT_SAMPLER_OBJECT_RELEASE, sampler);
+}

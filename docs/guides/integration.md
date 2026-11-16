@@ -1,6 +1,6 @@
 # Consumer Integration Guide
 
-> Written against mabda 4.2.0 / Cyrius 6.7.5. Full launcher-wiring
+> Written against mabda 4.3.0 / Cyrius 6.7.18. Full launcher-wiring
 > walk-through in [`docs/stdlib-integration.md`](../stdlib-integration.md).
 >
 > mabda ships **three backends** behind one public API: wgpu-native
@@ -17,7 +17,7 @@ Declare mabda in your `cyrius.cyml`:
 ```cyml
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.2.0"
+tag = "4.3.0"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -44,7 +44,21 @@ backend. Your project needs:
 2. wgpu-native library (`libwgpu_native.a`, v29) — downloaded via
    `sh deps/fetch-wgpu.sh`
 3. Compilation: `cycc` (object mode, prepend `object;`) + `gcc`
-   (linking)
+   (linking). Use the `cycc` of the version your `cyrius.cyml` pins
+   (`~/.cyrius/versions/<pin>/bin/cycc`): a bare `cycc` from `PATH` is the
+   `current` toolchain, which may be older than the pin.
+
+**Since 4.3.0, take the 81-slot launcher.** If your project keeps a copy of
+`deps/wgpu_main.c`, replace it with 4.3.0's and rebuild its object. The new
+copy adds the render tier's slots (vertex / index buffers, indexed draws,
+viewport, scissor, error scopes, texture-to-texture copy, the Wayland surface
+and debug groups), creates the device with an error callback so a validation
+error is reported instead of aborting your process, and releases every command
+buffer it submits. It reports its slot count to mabda (`mabda_wgpu_launcher_slots`,
+a weak symbol, so it also links against older mabda). An old copy keeps working
+for everything it already did; the 4.3.0 calls that need a new slot return
+`GPU_ERR_FFI_SYMBOL` with it. The render tier's later milestones (MB2–MB5) need
+no further launcher change.
 
 The two **native** backends (AMD amdgpu/GFX9, NVIDIA nouveau/SM75)
 do **not** use the C launcher or wgpu-native at all — they drive DRM

@@ -209,6 +209,80 @@ fn gpu_buffer_copy(ctx, src_buf, dst_buf, bytes): i64 {
 }
 
 # ================================================================
+# v4.3.0 — fast host copies + zero-copy native buffers
+# (issue 2026-11-02-native-buffer-copies-are-byte-loops.md; soorat L13 / P7)
+# ================================================================
+# The stdlib memcpy is a byte loop at cyrius 6.7.x (the x86 `rep movsb` path was
+# removed for aarch64), ~530 MB/s on the Cezanne: a 1080p frame's upload +
+# readback cost ~30 ms on the native backends, ten times the kernel. Every mabda
+# bulk copy (native AMD / NVIDIA buffer write + read, wgpu buffer and texture
+# readback) now goes through gpu_copy_bytes. The stdlib fix is upstream
+# (cyrius/docs/development/issues/2026-11-02-memcpy-memset-byte-loops-dominate-
+# frame-copies.md); this helper stops mabda waiting on it.
+
+# Copy `n` bytes from `src` to `dst` (non-overlapping). When both pointers share
+# their alignment mod 8, the head is copied bytewise up to an 8-byte boundary and
+# the body 32 bytes per iteration as four 8-byte moves; otherwise 4-byte moves
+# when both are 4-aligned, else bytes. Aligned-only wide moves keep it correct on
+# strict-alignment targets and on write-combined (BO-mapped) memory. Returns dst.
+fn gpu_copy_bytes(dst, src, n): i64 {
+    if (n <= 0) { return dst; }
+    var i = 0;
+    if (((dst ^ src) & 7) == 0) {
+        while (((dst + i) & 7) != 0) {
+            if (i >= n) { return dst; }
+            store8(dst + i, load8(src + i));
+            i = i + 1;
+        }
+        var end32 = n - 32;
+        while (i <= end32) {
+            store64(dst + i, load64(src + i));
+            store64(dst + i + 8, load64(src + i + 8));
+            store64(dst + i + 16, load64(src + i + 16));
+            store64(dst + i + 24, load64(src + i + 24));
+            i = i + 32;
+        }
+        var end8 = n - 8;
+        while (i <= end8) {
+            store64(dst + i, load64(src + i));
+            i = i + 8;
+        }
+    } elif (((dst | src) & 3) == 0) {
+        var end4 = n - 4;
+        while (i <= end4) {
+            store32(dst + i, load32(src + i));
+            i = i + 4;
+        }
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    return dst;
+}
+
+# @public — the CPU address of a host-visible GPU buffer, for writing or reading
+# it in place with no copy: the native AMD and NVIDIA buffers are GTT BOs mapped
+# at creation. Returns 0 on wgpu (its buffers are not persistently mapped: use
+# gpu_buffer_write / gpu_buffer_read) or a backend without the slot, with the
+# reason recorded. The pointer is valid until gpu_buffer_release. The GPU may
+# read or write the memory while a dispatch / submit that uses the buffer runs:
+# wait for it (gpu_device_wait_idle) before reading results.
+fn gpu_buffer_map(ctx, buf): i64 {
+    if (ctx == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    var slot = backend_get_slot(b, BACKEND_SLOT_BUFFER_MAP);
+    if (slot == 0) {
+        _gpu_err_record(GPU_ERR_NOT_IMPLEMENTED,   #skip-lint
+          "gpu_buffer_map: this backend has no host-visible buffers; use gpu_buffer_write / gpu_buffer_read", 1);
+        return 0;
+    }
+    return fncall2(slot, ctx, buf);
+}
+
+# ================================================================
 # GrowableBuffer — dynamic GPU buffer with generation tracking
 # ================================================================
 #

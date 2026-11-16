@@ -1,0 +1,372 @@
+# programs/render_tier_e2e.cyr — the render tier on real hardware (v4.3.0, MB1)
+#
+# Grows with MB1's parts:
+#   C — bind group layouts, bind groups and sampler objects through the public
+#       tier: soorat's pbr layouts (4 uniforms; texture + sampler; a depth texture
+#       + a comparison sampler; 2 cube textures + samplers + a 2D texture) and
+#       pbr_skinned's read-only storage palette are created with no validation
+#       error; groups bind real buffers, textures and samplers; layouts and
+#       groups wgpu rejects come back 0 with wgpu's reason.
+#   D+E — a pipeline from the descriptor (an explicit layout with a dynamic-offset
+#       uniform, a vertex buffer layout, a named fragment entry point) drives a
+#       frame through the draw-time calls: vertex + u16 index buffers, three
+#       indexed draws with base_vertex, a different dynamic offset per draw (red,
+#       green, blue tints out of one buffer), viewport and scissor; then a
+#       non-indexed draw from first_vertex. Every quadrant is read back. Then 1000
+#       frames of the same loop must allocate 0 bytes of Cyrius heap (L17).
+#
+# Linked with deps/wgpu_main.c via `make test-render-tier-e2e`.
+include "src/lib.cyr"
+
+var _e2e_passes = 0;
+
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[512];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 511) { ml = 511 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 {
+    _e2e_line(2, "FAIL: ", msg);
+    if (gpu_last_error() != 0) { _e2e_line(2, "      ", gpu_last_error_message()); }
+    return 1;
+}
+fn _info(msg): i64 { _e2e_line(1, "    ", msg); return 0; }
+
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+var FRAG = 2;
+var VERT = 1;
+
+# ---------------------------------------------------------------------------
+# Part C — layouts, groups, samplers
+# ---------------------------------------------------------------------------
+
+# pbr.wgsl's group layouts (soorat 1.2.0): g0 4 uniforms (192, 544, 32, 80 B);
+# g1 texture_2d + sampler; g2 texture_depth_2d + sampler_comparison; g3 2 x
+# texture_cube + 2 samplers + texture_2d + sampler.
+var _pbr_bgl = 0;    # 4 handles
+
+fn _check_pbr_layouts(ctx): i64 {
+    _pbr_bgl = alloc(32);
+    var g0 = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(g0, 0, VERT | FRAG, 0, 192);
+    gpu_bgl_uniform(g0, 1, VERT | FRAG, 0, 544);
+    gpu_bgl_uniform(g0, 2, VERT | FRAG, 0, 32);
+    gpu_bgl_uniform(g0, 3, VERT | FRAG, 0, 80);
+    var g1 = gpu_bind_group_layout_new();
+    gpu_bgl_texture(g1, 0, FRAG, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 0);
+    gpu_bgl_sampler(g1, 1, FRAG, GPU_SAMPLER_FILTERING);
+    var g2 = gpu_bind_group_layout_new();
+    gpu_bgl_texture(g2, 0, FRAG, GPU_SAMPLE_DEPTH, GPU_VIEW_2D, 0);
+    gpu_bgl_sampler(g2, 1, FRAG, GPU_SAMPLER_COMPARISON);
+    var g3 = gpu_bind_group_layout_new();
+    gpu_bgl_texture(g3, 0, FRAG, GPU_SAMPLE_FLOAT, GPU_VIEW_CUBE, 0);
+    gpu_bgl_sampler(g3, 1, FRAG, GPU_SAMPLER_FILTERING);
+    gpu_bgl_texture(g3, 2, FRAG, GPU_SAMPLE_FLOAT, GPU_VIEW_CUBE, 0);
+    gpu_bgl_sampler(g3, 3, FRAG, GPU_SAMPLER_FILTERING);
+    gpu_bgl_texture(g3, 4, FRAG, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 0);
+    gpu_bgl_sampler(g3, 5, FRAG, GPU_SAMPLER_FILTERING);
+    if (gpu_bind_group_layout_entry_total(g0, g1, g2, g3) != 14) { return _fail("C: pbr layout builders"); }
+    gpu_error_clear();
+    store64(_pbr_bgl, gpu_bind_group_layout_create(ctx, g0));
+    store64(_pbr_bgl + 8, gpu_bind_group_layout_create(ctx, g1));
+    store64(_pbr_bgl + 16, gpu_bind_group_layout_create(ctx, g2));
+    store64(_pbr_bgl + 24, gpu_bind_group_layout_create(ctx, g3));
+    for (var i = 0; i < 4; i = i + 1) {
+        if (load64(_pbr_bgl + i * 8) == 0) { return _fail("C: a pbr bind group layout was rejected"); }
+    }
+    if (gpu_last_error() != 0) { return _fail("C: creating the pbr layouts recorded an error"); }
+    _pass("C: pbr's 4 group layouts (uniforms, texture, depth + comparison, 2 cubes) created");
+    var sk = gpu_bind_group_layout_new();
+    gpu_bgl_storage(sk, 0, VERT, 1, 0, 8208);
+    var skh = gpu_bind_group_layout_create(ctx, sk);
+    if (skh == 0) { return _fail("C: pbr_skinned's read-only storage layout"); }
+    _pass("C: pbr_skinned's read-only storage (8208 B palette) layout created");
+    gpu_bind_group_layout_release(ctx, skh);
+    return 0;
+}
+
+fn gpu_bind_group_layout_entry_total(a, b, c, d): i64 {
+    return gpu_bgl_entry_count(a) + gpu_bgl_entry_count(b) + gpu_bgl_entry_count(c) + gpu_bgl_entry_count(d);
+}
+
+fn _check_groups(ctx): i64 {
+    var ubuf = gpu_buffer_create(ctx, 1024, GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST);
+    if (ubuf == 0) { return _fail("C: uniform buffer"); }
+    var g = gpu_bind_group_new(load64(_pbr_bgl));
+    gpu_bg_buffer(g, 0, ubuf, 0, 192);
+    gpu_bg_buffer(g, 1, ubuf, 256, 544);
+    gpu_bg_buffer(g, 2, ubuf, 0, 32);
+    gpu_bg_buffer(g, 3, ubuf, 0, 80);
+    gpu_error_clear();
+    var bg0 = gpu_bind_group_create(ctx, g);
+    if (bg0 == 0) { return _fail("C: the uniform group was rejected"); }
+    _pass("C: a 4-uniform group over one buffer (offsets 0 / 256) created");
+    var tex = gpu_texture_create_2d_rgba8(ctx, 8, 8);
+    var lin = gpu_sampler_object_create(ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_CLAMP, GPU_COMPARE_NONE);
+    if (lin == 0) { return _fail("C: linear sampler object"); }
+    var g1 = gpu_bind_group_new(load64(_pbr_bgl + 8));
+    gpu_bg_texture(g1, 0, tex);
+    gpu_bg_sampler(g1, 1, lin);
+    var bg1 = gpu_bind_group_create(ctx, g1);
+    if (bg1 == 0) { return _fail("C: the texture + sampler group was rejected"); }
+    _pass("C: a texture + sampler-object group created");
+    var cube = gpu_texture_create_cube(ctx, 16, MABDA_TEXFMT_RGBA8, 1);
+    if (cube == 0) { return _fail("C: cube texture"); }
+    var g3 = gpu_bind_group_new(load64(_pbr_bgl + 24));
+    gpu_bg_texture(g3, 0, cube);
+    gpu_bg_sampler(g3, 1, lin);
+    gpu_bg_texture(g3, 2, cube);
+    gpu_bg_sampler(g3, 3, lin);
+    gpu_bg_texture(g3, 4, tex);
+    gpu_bg_sampler(g3, 5, lin);
+    var bg3 = gpu_bind_group_create(ctx, g3);
+    if (bg3 == 0) { return _fail("C: the IBL group (2 cubes) was rejected"); }
+    _pass("C: pbr's IBL group (2 cube views + a 2D texture + 3 samplers) created");
+    var cmp = gpu_sampler_object_create(ctx, GPU_FILTER_LINEAR, GPU_ADDRESS_CLAMP, GPU_COMPARE_LESS_EQUAL);
+    if (cmp == 0) { return _fail("C: comparison sampler object (LessEqual)"); }
+    _pass("C: comparison sampler object (LessEqual) created");
+    gpu_bind_group_release(ctx, bg0);
+    gpu_bind_group_release(ctx, bg1);
+    gpu_bind_group_release(ctx, bg3);
+    gpu_sampler_object_release(ctx, cmp);
+    return 0;
+}
+
+# Layouts and groups wgpu (not mabda's builder) rejects: 0, with wgpu's reason.
+fn _check_rejections(ctx): i64 {
+    gpu_error_clear();
+    # A multisampled texture binding cannot be filterable float (WebGPU rule).
+    var bad = gpu_bind_group_layout_new();
+    gpu_bgl_texture(bad, 0, FRAG, GPU_SAMPLE_FLOAT, GPU_VIEW_2D, 1);
+    if (gpu_bind_group_layout_create(ctx, bad) != 0) { return _fail("C: a multisampled Float layout was created"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("C: the layout rejection is not VALIDATION"); }
+    _pass("C: wgpu-rejected layout (multisampled filterable float) -> 0 + GPU_ERR_VALIDATION");
+    _info(gpu_last_error_message());
+    gpu_error_clear();
+    # A texture where the layout wants a uniform buffer.
+    var tex = gpu_texture_create_2d_rgba8(ctx, 4, 4);
+    var g = gpu_bind_group_new(load64(_pbr_bgl));
+    gpu_bg_texture(g, 0, tex);
+    if (gpu_bind_group_create(ctx, g) != 0) { return _fail("C: a group with the wrong resource kind was created"); }
+    if (gpu_last_error() != GPU_ERR_VALIDATION) { return _fail("C: the group rejection is not VALIDATION"); }
+    _pass("C: wgpu-rejected group (texture in a uniform slot, missing entries) -> 0 + GPU_ERR_VALIDATION");
+    _info(gpu_last_error_message());
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Parts D + E — a pipeline from the descriptor, drawn through the draw-time calls
+# ---------------------------------------------------------------------------
+
+var _TINT_WGSL = "struct Tint { color: vec4<f32> };
+@group(0) @binding(0) var<uniform> tint: Tint;
+@vertex fn vs_main(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(pos, 0.0, 1.0);
+}
+@fragment fn fs_paint() -> @location(0) vec4<f32> { return tint.color; }
+";
+
+var _d_pipe = 0;
+var _d_bg = 0;
+var _d_vbuf = 0;
+var _d_ibuf = 0;
+var _d_rt = 0;
+
+fn _store_f32(p, v): i64 { store32(p, f64_to_f32(f64_from(v))); return 0; }
+
+# Quad corners (clip space; row 0 of the target is y = +1) at vertex `base`.
+fn _quad(vb, base, x0, y0, x1, y1): i64 {
+    var p = vb + base * 8;
+    _store_f32(p, x0);
+    _store_f32(p + 4, y0);
+    _store_f32(p + 8, x1);
+    _store_f32(p + 12, y0);
+    _store_f32(p + 16, x1);
+    _store_f32(p + 20, y1);
+    _store_f32(p + 24, x0);
+    _store_f32(p + 28, y1);
+    return 0;
+}
+
+fn _setup_draw(ctx): i64 {
+    gpu_error_clear();
+    var m = gpu_shader_module_create(ctx, _TINT_WGSL, strlen(_TINT_WGSL));
+    if (m == 0) { return _fail("D: tint module"); }
+    var l = gpu_bind_group_layout_new();
+    gpu_bgl_uniform(l, 0, FRAG, 1, 16);          # dynamic offset, 16-byte window
+    var bgl = gpu_bind_group_layout_create(ctx, l);
+    if (bgl == 0) { return _fail("D: dynamic-uniform layout"); }
+    var d = gpu_pipeline_desc_new(m, "vs_main");
+    gpu_pipeline_desc_fragment(d, m, "fs_paint");
+    gpu_pipeline_desc_vertex_buffer(d, 8, GPU_STEP_VERTEX);
+    gpu_pipeline_desc_vertex_attribute(d, 0, GPU_VERTEX_FLOAT32X2, 0, 0);
+    gpu_pipeline_desc_target(d, MABDA_TEXFMT_RGBA8, GPU_BLEND_NONE, GPU_WRITE_ALL);
+    gpu_pipeline_desc_bind_group_layout(d, 0, bgl);
+    _d_pipe = gpu_render_pipeline_create_desc(ctx, d);
+    if (_d_pipe == 0) { return _fail("D: pipeline from the descriptor"); }
+    _pass("D: pipeline from the descriptor (vertex layout, fs_paint, explicit dynamic-uniform layout)");
+    # Tints: red @0, green @256, blue @512 (dynamic offsets are 256-aligned).
+    var ubuf = gpu_buffer_create(ctx, 768, GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST);
+    var tints = alloc(768);
+    memset(tints, 0, 768);
+    _store_f32(tints, 1);
+    _store_f32(tints + 12, 1);
+    _store_f32(tints + 256 + 4, 1);
+    _store_f32(tints + 256 + 12, 1);
+    _store_f32(tints + 512 + 8, 1);
+    _store_f32(tints + 512 + 12, 1);
+    gpu_buffer_write(ctx, ubuf, 0, tints, 768);
+    var g = gpu_bind_group_new(bgl);
+    gpu_bg_buffer(g, 0, ubuf, 0, 16);
+    _d_bg = gpu_bind_group_create(ctx, g);
+    if (_d_bg == 0) { return _fail("D: dynamic-uniform group"); }
+    # Vertices: quad A = left half (0..3), B = right half (4..7), C = whole (8..11).
+    var vb = alloc(96);
+    _quad(vb, 0, 0 - 1, 0 - 1, 0, 1);
+    _quad(vb, 4, 0, 0 - 1, 1, 1);
+    _quad(vb, 8, 0 - 1, 0 - 1, 1, 1);
+    _d_vbuf = gpu_buffer_create(ctx, 96, GPU_BUFFER_USAGE_VERTEX | GPU_BUFFER_USAGE_COPY_DST);
+    gpu_buffer_write(ctx, _d_vbuf, 0, vb, 96);
+    var ib[12];
+    store16(&ib, 0);
+    store16(&ib + 2, 1);
+    store16(&ib + 4, 2);
+    store16(&ib + 6, 0);
+    store16(&ib + 8, 2);
+    store16(&ib + 10, 3);
+    _d_ibuf = gpu_buffer_create(ctx, 12, GPU_BUFFER_USAGE_INDEX | GPU_BUFFER_USAGE_COPY_DST);
+    gpu_buffer_write(ctx, _d_ibuf, 0, &ib, 12);
+    _d_rt = gpu_render_target_create_2d_rgba8(ctx, 64, 64);
+    if (_d_rt == 0) { return _fail("E: render target"); }
+    return 0;
+}
+
+# One frame: A red, B green (dynamic offsets 0 / 256, base_vertex 0 / 4), then C
+# blue over the top 8 rows (scissor). Returns the summed return codes.
+var _d_black = 0;
+fn _draw_frame(ctx): i64 {
+    # Allocated once: the test itself allocates nothing per frame.
+    if (_d_black == 0) { _d_black = color_new(F64_0, F64_0, F64_0, F64_1); }
+    var pass = gpu_render_pass_begin(ctx, _d_rt, _d_black);
+    if (pass == 0) { return 1; }
+    var offs[8];
+    var rc = gpu_render_pass_set_pipeline(ctx, pass, _d_pipe);
+    rc = rc + gpu_render_pass_set_vertex_buffer(ctx, pass, 0, _d_vbuf, 0, 0);
+    rc = rc + gpu_render_pass_set_index_buffer(ctx, pass, _d_ibuf, GPU_INDEX_UINT16, 0, 0);
+    rc = rc + gpu_render_pass_set_viewport(ctx, pass, F64_0, F64_0, f64_from(64), f64_from(64), F64_0, F64_1);
+    rc = rc + gpu_render_pass_set_scissor(ctx, pass, 0, 0, 64, 64);
+    store32(&offs, 0);
+    rc = rc + gpu_render_pass_set_bind_group(ctx, pass, 0, _d_bg, 1, &offs);
+    rc = rc + gpu_render_pass_draw_indexed(ctx, pass, 6, 1, 0, 0, 0);
+    store32(&offs, 256);
+    rc = rc + gpu_render_pass_set_bind_group(ctx, pass, 0, _d_bg, 1, &offs);
+    rc = rc + gpu_render_pass_draw_indexed(ctx, pass, 6, 1, 0, 4, 0);
+    rc = rc + gpu_render_pass_set_scissor(ctx, pass, 0, 0, 64, 8);
+    store32(&offs, 512);
+    rc = rc + gpu_render_pass_set_bind_group(ctx, pass, 0, _d_bg, 1, &offs);
+    rc = rc + gpu_render_pass_draw_indexed(ctx, pass, 6, 1, 0, 8, 0);
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    return rc;
+}
+
+fn _px(ctx, x, y): i64 {
+    var px = alloc(16384);
+    var tex[32];
+    memset(&tex, 0, 32);
+    store64(&tex, load64(_d_rt));
+    store32(&tex + 24, 64);
+    store32(&tex + 28, 64);
+    if (_backend_wgpu_texture_read(ctx, &tex, px, 16384) != 0) { return 0 - 1; }
+    var p = px + y * 256 + x * 4;
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+
+fn _check_draw(ctx): i64 {
+    if (_setup_draw(ctx) != 0) { return 1; }
+    var rc = _draw_frame(ctx);
+    if (rc != 0) { return _fail("E: a draw-time call or the pass end returned an error"); }
+    _pass("E: pipeline, vertex + u16 index buffers, viewport, scissor, 3 dynamic offsets, 3 indexed draws: rc 0");
+    gpu_device_wait_idle(ctx);
+    if (_px(ctx, 8, 32) != 0xFF0000FF) { return _fail("E: left half is not red (offset 0, base_vertex 0)"); }
+    _pass("E: left half red: dynamic offset 0, draw_indexed base_vertex 0");
+    if (_px(ctx, 48, 32) != 0x00FF00FF) { return _fail("E: right half is not green (offset 256, base_vertex 4)"); }
+    _pass("E: right half green: dynamic offset 256, base_vertex 4");
+    if (_px(ctx, 8, 2) != 0x0000FFFF) { return _fail("E: top rows are not blue (offset 512, base_vertex 8)"); }
+    if (_px(ctx, 48, 2) != 0x0000FFFF) { return _fail("E: top-right rows are not blue"); }
+    _pass("E: top 8 rows blue: dynamic offset 512, base_vertex 8, inside the scissor");
+    if (_px(ctx, 8, 9) != 0xFF0000FF) { return _fail("E: row 9 is not red (the scissor leaked)"); }
+    _pass("E: row 9 still red: the blue draw stayed inside its 8-row scissor");
+    # A non-indexed draw: the lower-right triangle of quad C (vertices 8, 9, 10).
+    var black = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(ctx, _d_rt, black);
+    var offs[8];
+    store32(&offs, 256);
+    gpu_render_pass_set_pipeline(ctx, pass, _d_pipe);
+    gpu_render_pass_set_vertex_buffer(ctx, pass, 0, _d_vbuf, 0, 0);
+    gpu_render_pass_set_bind_group(ctx, pass, 0, _d_bg, 1, &offs);
+    rc = gpu_render_pass_draw_vertices(ctx, pass, 3, 1, 8, 0);
+    rc = rc + gpu_render_pass_end(ctx, pass);
+    if (rc != 0) { return _fail("E: draw_vertices frame"); }
+    gpu_device_wait_idle(ctx);
+    if (_px(ctx, 56, 56) != 0x00FF00FF) { return _fail("E: the lower-right triangle is not green"); }
+    if (_px(ctx, 4, 4) != 0x000000FF) { return _fail("E: the upper-left corner is not the black clear"); }
+    _pass("E: draw_vertices(3, first_vertex 8): lower-right triangle green, upper-left clear");
+    return 0;
+}
+
+# L17: the render loop allocates nothing from the Cyrius heap.
+fn _check_frame_heap(ctx): i64 {
+    _draw_frame(ctx);    # warm: the render state and the sampler cache exist
+    gpu_device_wait_idle(ctx);
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < 1000; i = i + 1) {
+        if (_draw_frame(ctx) != 0) { bad = bad + 1; }
+        if ((i % 100) == 99) { gpu_device_wait_idle(ctx); }
+    }
+    var grown = alloc_used() - before;
+    if (bad != 0) { return _fail("E: a frame in the 1000-frame loop returned an error"); }
+    if (grown != 0) {
+        var nb[32];
+        memset(&nb, 0, 32);
+        fmt_int_buf(grown, &nb);
+        _info(&nb);
+        return _fail("E: 1000 frames grew the Cyrius heap (bytes above)");
+    }
+    _pass("E: 1000 frames (begin, 13 draw-time calls, end) allocated 0 bytes of Cyrius heap (L17)");
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    wgpu_ffi_init_table(fn_table_ptr);
+    var res_tag, res = gpu_context_from_preinit(preinit_ptr);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    var ctx = res;
+    _pass("GPU context created");
+    if (_check_pbr_layouts(ctx) != 0) { return 1; }
+    if (_check_groups(ctx) != 0) { return 1; }
+    if (_check_rejections(ctx) != 0) { return 1; }
+    if (_check_draw(ctx) != 0) { return 1; }
+    if (_check_frame_heap(ctx) != 0) { return 1; }
+    _e2e_summary();
+    return 0;
+}

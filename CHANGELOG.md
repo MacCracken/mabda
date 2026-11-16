@@ -13,6 +13,225 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.3.0] — 2026-11-16
+
+**The render tier's first milestone (MB1), and the repairs filed against 4.2.0.** A geometry
+renderer can now draw through the public `gpu_*` tier alone: a pipeline descriptor (named entry
+points, an optional fragment stage, vertex layouts, topology, culling, blending, depth state,
+explicit bind group layouts), bind groups of buffers, textures and sampler objects, and the
+draw-time calls (vertex and index buffers, indexed draws, dynamic offsets, viewport, scissor). A
+validation error no longer aborts the host process: it returns a `GPU_ERR_*` with wgpu's reason.
+The C launcher grew from 67 to 81 slots in **one** revision that already carries every slot
+MB2–MB5 needs, so consumers rebuild their launcher copy once for the whole render tier.
+Requested by soorat's Cyrius port (`docs/development/issues/2026-11-15-render-tier-for-geometry-consumers.md`,
+its ledger L2–L6); the other 2026-11 filings are fixed here too (L17, L12, L24, and the three
+from ranga's NVIDIA run). Audit: [`docs/audit/2026-11-16-audit.md`](docs/audit/2026-11-16-audit.md).
+
+**Verified.**
+- CPU: 24 suites, **6474 assertions**, 0 failed (cyrius 6.7.18); every CI gate run locally
+  (per-file lint, `--strict-deferrals`, `fmt --check`, vet, the sizing / write-length / fuzz
+  checks, distlib idempotency, `example-link`, the raw-include test, the security scan).
+- AMD Cezanne (RADV, wgpu-native v29.0.1.1): `make test-gpu` 72 PASS / 0 FAIL (incl. the new
+  `launcher_slots_e2e` 14, `error_channel_e2e` 11, `render_tier_e2e` 17), the eight other wgpu gates,
+  `test-native-all` (71 passed, 0 failed, 2 skipped for DRM master, 0 known-fail) and
+  `native_render_tier_e2e`.
+- NVIDIA TU116 (`chew`, NVK + nouveau): `make test-gpu` on NVK 72 PASS / 0 FAIL, the eight other
+  wgpu gates, the 11 masterless NVIDIA gates, `nvidia_multibind_e2e` 6/6, `nvidia_render_tier_e2e` 4/4.
+- ranga's six GPU suites (319 assertions) pass against the 4.3.0 bundle (the consumer check; rasa,
+  kiran and aethersafta are not checked out on the dev box, bijli does not use mabda).
+- soorat's probes against this checkout's bundle (`soorat/scripts/probes/gpu/`, built with
+  `MABDA_DIST`): **P6/MB1** builds all 11 of soorat's render pipelines from its own WGSL with its
+  real layouts in one process (sprite, line, pbr, pbr_skinned, the depth-only shadow pass, ssao,
+  bloom's `fs_threshold` / `fs_blur_h` / `fs_blur_v`, postprocess's `fs_main` / `fs_no_bloom`);
+  its error cases return instead of aborting; and soorat's `sprite.wgsl` draws a frame that reads
+  back exactly. **P8** runs 100,000 frames with RSS flat at 96.6 MB (4.2.0: 96.2 → 260.3 MB) and
+  0 B of heap growth per frame, in 27.2 s (4.2.0: 46.9 s).
+- Not run: the 2 KMS gates that need DRM master (as at every release); the Wayland surface shims
+  (slots 78/79) are compile-checked only until MB5 brings a Wayland client.
+
+### Added — the render tier (MB1)
+
+- **An error channel** (`src/error_scope.cyr`, `src/error.cyr`). `gpu_error_scope_push` /
+  `gpu_error_scope_pop` (nested; the pop returns the first error raised inside, including one
+  mabda caught itself in a creation call), `gpu_error_take` (errors nothing scoped, with a
+  count), `gpu_last_error` / `gpu_last_error_message` / `gpu_error_count` / `gpu_error_clear` (the
+  message accessor is not `gpu_error_message`: ranga defines a one-argument function of that name,
+  and the consumer check caught the fold collision; `fold_namespace.tcyr` pins it), and
+  `GPU_ERR_VALIDATION` (24) / `GPU_ERR_OUT_OF_MEMORY` (25). Shader modules, render pipelines,
+  bind group layouts, pipeline layouts, bind groups and sampler objects are created inside their
+  own Validation scope: a rejected one returns 0 and records wgpu's reason (a shader also sets
+  `gpu_last_shader_error()` to `SHMOD_ERR_VALIDATION`, 121). An encoding error (a draw missing
+  its bind group, a bad copy) is caught at `finish`: `gpu_render_pass_end` returns
+  `GPU_ERR_VALIDATION` and drops that frame, not the process. On the native backends every call
+  already returns its error, so scopes balance and catch nothing.
+- **Public names for the constants public calls take** (`src/gpu_types.cyr`):
+  `GPU_BUFFER_USAGE_*`, `GPU_STAGE_*`, `GPU_INDEX_UINT16/32`, `GPU_VERTEX_*` (30 formats incl.
+  `UINT32X4`) with `gpu_vertex_format_size`, `GPU_STEP_*`, `GPU_TOPOLOGY_*`, `GPU_CULL_*`,
+  `GPU_FRONT_*`, `GPU_BLEND_FACTOR_*` / `GPU_BLEND_OP_*` / `GPU_BLEND_NONE|ALPHA|PREMULTIPLIED|ADDITIVE`,
+  `GPU_WRITE_*`, `GPU_COMPARE_*`, `GPU_FILTER_*`, `GPU_ADDRESS_*`, the `GPU_SAMPLER_FILTER_*` /
+  `GPU_SAMPLER_ADDR_*` names for `gpu_sampler_create`, and the binding kinds, sample types, view
+  dimensions and sampler binding types. Values are webgpu.h v29's, pinned by test.
+- **Render formats** (`src/texture_format.cyr`): `MABDA_TEXFMT_RGBA8_SRGB`, `BGRA8`,
+  `BGRA8_SRGB`, `RGBA16F`, `DEPTH32F` (ids 12–16), for pipeline colour targets and depth state,
+  with `mabda_texfmt_is_depth` / `_is_color_target` / `_is_render_format` /
+  `_texture_ready`. Creating a **texture** in them is MB2 (Depth32F) and MB3 (the rest):
+  `gpu_texture_create_*` refuses them until then.
+- **Bind group layouts, bind groups, sampler objects** (`src/gpu_bind.cyr`):
+  `gpu_bind_group_layout_new` + `gpu_bgl_uniform` (with dynamic offsets) / `gpu_bgl_storage`
+  (read-only or read-write) / `gpu_bgl_texture` (float, unfilterable, depth, sint, uint x 2D,
+  2D-array, cube, cube-array, 3D, multisampled) / `gpu_bgl_sampler` (filtering, non-filtering,
+  comparison), `gpu_bind_group_layout_create`; `gpu_bind_group_new` + `gpu_bg_buffer` /
+  `gpu_bg_texture` / `gpu_bg_sampler`, `gpu_bind_group_create`; `gpu_sampler_object_create(ctx,
+  filter, address, compare)` — comparison samplers included (`GPU_COMPARE_LESS_EQUAL` for shadow
+  maps).
+- **The render pipeline descriptor** (`src/gpu_pipeline.cyr`): `gpu_pipeline_desc_new(vs,
+  "vs_main")`, `_fragment` (optional: a depth-only pass omits it), `_vertex_buffer` +
+  `_vertex_attribute`, `_vertex_preset` (`GPU_VERTEX_LAYOUT_2D` / `3D` / `SKINNED_3D` / `LINE`,
+  field for field Rust mabda 1.0 and soorat's `LineVertex`), `_primitive`, `_target` (+
+  `_target_blend` for a custom blend), `_bind_group_layout` (up to 4 groups; none = automatic
+  layout), `_depth` + `_depth_bias`, `_multisample`, `_label`; `gpu_render_pipeline_create_desc`.
+- **Draw-time calls** (`src/gpu_draw.cyr`): `gpu_render_pass_set_pipeline`,
+  `_set_vertex_buffer`, `_set_index_buffer` (u16 / u32), `_set_bind_group` (dynamic offsets,
+  256-aligned), `_draw_vertices`, `_draw_indexed` (incl. negative `base_vertex`),
+  `_set_viewport` (f64 in, f32 at the GPU), `_set_scissor`, `_set_blend_constant`. They allocate
+  nothing.
+- **The native backends' share** (`src/backend_native_rtier.cyr`): on native AMD and NVIDIA the
+  descriptor serves the native render path's shape (no vertex buffers or groups, one RGBA8 target
+  without blending, no depth), and `set_pipeline` + `draw_vertices` map to the existing draw.
+  Everything else returns `GPU_ERR_NOT_IMPLEMENTED` with the reason recorded (it needs a  #skip-lint
+  render-capable native shader path: soorat's ledger L7, `docs/development/roadmap.md`).
+- **The launcher revision** (`deps/wgpu_main.c`, 67 → 81 slots), wrapped in `src/wgpu_ffi.cyr`:
+  `SetVertexBuffer` (67), `SetIndexBuffer` (68), `DrawIndexed` (69), `SetViewport` (70, a shim:
+  six floats), `SetScissorRect` (71), `SetBlendConstant` (72), `PushErrorScope` (73),
+  `PopErrorScope` (74, a shim), the launcher's uncaptured-error record (75), `CommandBufferRelease`
+  (76), `CopyTextureToTexture` (77, for MB3), `InstanceCreateSurface` from a Wayland
+  `wl_display` / `wl_surface` (78, a shim, for MB5), `SurfaceGetCapabilities` (79, a shim, for
+  MB5), and every debug group / marker operation (80, a shim — `src/debug.cyr`'s nine functions
+  were no-op stubs and now work; `rg_execute`'s per-node groups show in GPU profilers). The device
+  is created with an uncaptured-error callback that records instead of aborting. The launcher
+  reports its slot count through `mabda_wgpu_launcher_slots` (a weak symbol, so it links against
+  older mabda); against a launcher that never reports, mabda assumes the old 67 slots and every
+  newer call returns `GPU_ERR_FFI_SYMBOL` instead of jumping through memory past the table. The
+  table aborts at start-up if `FN_COUNT` and its entries disagree.
+
+### Added — repairs and the rest
+
+- **`gpu_copy_bytes(dst, src, n)`** (`src/buffer.cyr`): 32 bytes per iteration when the pointers
+  share alignment, 7.9x the stdlib byte-loop `memcpy` on 128 KB (26 µs vs 208 µs) and 7.5x on a
+  1080p frame (1.72 ms vs 12.9 ms). Every mabda bulk copy uses it.
+- **`gpu_buffer_map(ctx, buf)`**: the CPU address of a native AMD / NVIDIA buffer (mapped GTT
+  BOs) to write or read in place, with no copy; 0 on wgpu, with the reason. Backend slot 480.
+- **NVIDIA multi-binding dispatch**: `native_nv_shmod_set_bindings(shmod, n)`; a module declaring
+  N bindings takes AMD's count-prefixed binding array, pointer i at `c[0x0][0x160 + 8i]`, and a
+  count other than N is refused. The single-pair form is unchanged. Proven on the TU116 with
+  `add_one2`, a new two-pointer SM75 kernel captured with `nvcc` (`src/backend_nvidia_sass.cyr`).
+- **Profiler pass timings** (`src/profiler.cyr`, soorat's L24, parity with Rust mabda 1.0's
+  `FrameProfiler`): `profiler_record_pass`, `_pass_count`, `_pass`, `_total_pass_time_ms`,
+  `pass_timing_*`, cleared by `begin_frame` and `reset`; `profile_end_record` (1.0's
+  `ProfileScope`); `profiler_frame_history`, `profiler_export_json`,
+  `profiler_export_history_csv`. Recording reuses one buffer: steady state allocates nothing.
+- **Tests and benches.** New suites `launcher.tcyr`, `errors.tcyr`, `render_tier.tcyr`; new HW
+  programs `launcher_slots_e2e`, `error_channel_e2e`, `render_tier_e2e`, `native_render_tier_e2e`,
+  `nvidia_render_tier_e2e`, `nvidia_multibind_e2e` (each with a `make test-*` target; the first
+  three are in `test-gpu`). New CPU benches: the copies, a pipeline-descriptor fill (6.4 µs), a
+  6-entry layout fill (0.5 µs), a profiled frame with 8 passes, and a public `set_bind_group` +
+  `draw_indexed` dispatch (49 ns of mabda on top of the wgpu call).
+
+### Fixed
+
+- **The render loop leaked ~1.6 KB a frame** (L17, `docs/development/issues/archived/2026-11-15-wgpu-render-loop-leaks-command-buffers-and-pass-records.md`).
+  Submitted command buffers were never released: the submit shim now releases them. And
+  `gpu_render_pass_begin` bump-allocated 432 B per call and a textured draw 224 B: the pass record,
+  attachment and descriptors now live in a per-context scratch block, and the textured draw's
+  sampler is created once per sampler setting and cached. soorat's P8: flat RSS over 100,000 frames.
+- **Submitting an invalid command buffer aborted the process** even with an error callback
+  (wgpu-native treats it as fatal). The finish shim scopes its own call and returns NULL for an
+  invalid buffer; the submit shim skips NULL.
+- **NVIDIA ran SPIR-V as machine code** (`docs/development/issues/archived/2026-11-02-nvidia-shader-module-create-ignores-source-kind.md`,
+  High): the source kind was never read, and the first dispatch faulted the GPU and killed the
+  channel. Non-SASS modules are now refused with `SHMOD_ERR_SRC_KIND`, as on AMD.
+- **NVIDIA read `gpu_compute_dispatch`'s binding array as a single buffer**
+  (`…/archived/2026-11-02-compute-dispatch-bindings-differ-amd-nvidia.md`): see the binding array
+  above.
+- **The native buffer copies were byte loops**, ~30 ms of a 1080p round trip
+  (`…/archived/2026-11-02-native-buffer-copies-are-byte-loops.md`): `gpu_copy_bytes` and
+  `gpu_buffer_map`, above. The stdlib `memcpy` itself is cyrius's to fix (its issue stays open).
+- **`profiler_end_frame` without `profiler_begin_frame` timed from clock zero** (or from a stale
+  start) and **`profiler_best_frame_ms` returned 0 on an empty history** (L24): now 0.0 ms (the frame
+  still counted) and `f64::MAX`, as Rust mabda 1.0.
+- **Legacy descriptor builders used pre-v29 layouts** (audit MED-1, MED-2): `WGPUVertexAttribute`
+  is 32 bytes in v29 with the format at +8, and `WGPU_VERTEX_FORMAT_FLOAT32X2/X3/X4` are
+  0x1D–0x1F (they were 21–23, which v29 numbers as other formats); `bglb_texture_2d` /
+  `bglb_sampler` / `bglb_comparison_sampler` wrote their sample and sampler types into the
+  sub-structs' `nextInChain` pointers with pre-v29 values.
+- **`gpu_texture_read` on wgpu** copied with a tight row pitch, which wgpu rejects for any width
+  that is not a multiple of 64 texels (a 4x4 texture aborted the process); rows are now staged at
+  256-byte pitch and un-padded. The read also leaked its command encoder and bump-allocated its
+  copy arguments.
+- **`gpu_buffer_write` on wgpu returned 0 for writes WebGPU rejects** (audit LOW-1): misaligned,
+  out-of-range or null writes now return `GPU_ERR_BUFFER`.
+- **`WGPU_TEXTURE_ASPECT_ALL` was 0**, which is `Undefined` in v29 (wgpu resolved it to All). It
+  is now 1, beside `_UNDEFINED`, `_STENCIL_ONLY`, `_DEPTH_ONLY` (MB2's depth views).
+- **The launcher-linked programs compiled with the `current` toolchain, not the pin** (toolchain
+  cheat sheet E4, found on the NVIDIA test host): the Makefile now derives `CYCC` from the
+  `cyrius.cyml` pin, and the object rule writes through a temp file so a failed compile leaves no
+  0-byte object for the next `make` to trust.
+
+### Changed
+
+- **cyrius 6.7.5 → 6.7.18** (`cyrius.cyml`), the version soorat and mabda's other consumers
+  pin (L12). 0 warnings on the move.
+- **`[deps.chitra]` and `[deps.samvada]` are `optional = true`** (L12,
+  `docs/development/issues/archived/2026-11-15-cyrius-pin-and-production-only-deps.md`). cyrius
+  reads `[features]` from the root manifest only, so a consumer resolves them only when it names
+  them (`cyrius deps --features chitra`); mabda's own `default = ["png", "jpeg", "logind"]` keeps
+  its tree resolving both. `src/lib.cyr` includes them only under the defines that call them, so
+  `cyrius deps --no-default-features` builds.
+- **`GPU_CONTEXT_SIZE` 184 → 208** (+184 error-scope depth, +192 the per-depth pending table,
+  +200 the render-state scratch); **`BACKEND_SIZE` 328 → 488** (the error block 328–352, the
+  render-tier block 352–480, `buffer_map` 480).
+- **`MABDA_TEXFMT_COUNT` 12 → 17**, and `mabda_texfmt_is_compressed` is an explicit BC1..ASTC_8X8
+  range (it was "any id above RGBA8").
+- **`gpu_render_pass_end` returns a `GPU_ERR_*`** when the frame's command buffer was refused (it
+  returned 0 always).
+- **NVIDIA:** `NV_SHMOD_STRUCT_SIZE` 40 → 48 (+40 `nbind`), `NV_PASS_STRUCT_SIZE` 24 → 32 (+24 the
+  bound pipeline). Native AMD's pass record keeps the bound pipeline in its reserved +8 field.
+- **The profiler struct** is 104 bytes (`PROFILER_SIZE`).
+
+### Breaking
+
+- **Consumers rebuild their copy of `deps/wgpu_main.c`.** The render-tier calls need the 81-slot
+  launcher. **Migration:** replace the copy with this release's file and rebuild the object; a
+  consumer that keeps the old one still runs, and every 4.3.0 call that needs a new slot returns
+  `GPU_ERR_FFI_SYMBOL` (or 0 for a handle) instead of misbehaving. The new launcher also links
+  against older mabda (the handshake is a weak symbol). This is the only launcher change the
+  render tier needs: MB2–MB5's slots are already in it.
+- **A validation error no longer aborts** the process. **Migration:** check return values — a
+  shader module, pipeline, layout or group the API rejects is now 0, and `gpu_render_pass_end` can
+  return `GPU_ERR_VALIDATION`; `gpu_last_error_message()` says why.
+- **`vertex2d_attributes` / `vertex3d_attributes` / `instance_data_attributes`** return the v29
+  layout (32 bytes per attribute: 96 / 128 / 160 bytes), and `WGPU_VERTEX_FORMAT_FLOAT32X2/X3/X4`
+  changed value. **Migration:** read attributes at the v29 offsets, or build layouts with the
+  pipeline descriptor (`gpu_pipeline_desc_vertex_preset`).
+- **Stack buffers sized by literal** for a `GpuContext` or a `Backend` must grow (208 / 488). The
+  in-tree tests moved to `ctx[208]` and `be[1024]`.
+- **`profiler_best_frame_ms`** on an empty history is `f64::MAX`'s bits, and **`profiler_end_frame`**
+  without a begun frame returns 0.0.
+
+### Metrics
+
+- 24 CPU suites (21 at 4.2.0), **6474** assertions (5726). 64 `src/` modules (57): `gpu_types`,
+  `error_scope`, `backend_wgpu_rtier`, `gpu_bind`, `gpu_pipeline`, `gpu_draw`,
+  `backend_native_rtier`. `dist/mabda.cyr` 1,511,389 B (1,370,812). Launcher: 81 slots (67).
+
+### Next
+
+- **MB2** (depth): Depth32F render targets and textures, depth attachments with load / clear,
+  depth views (`WGPU_TEXTURE_ASPECT_DEPTH_ONLY`) — the pipeline-side depth state and comparison
+  samplers are already here. Then MB3 (formats, MSAA, mips, copies, readback), MB4 (wgpu compute
+  on the public tier), MB5 (Wayland surfaces), N9 (SPIR-V → SASS), and the texture encoder:
+  `docs/development/roadmap.md`.
+
 ## [4.2.0] — 2026-10-08
 
 **cyrius 6.7.5, and the eleven `F64_*` colour constants are f64 `const`s.** Until now they

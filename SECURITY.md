@@ -24,9 +24,9 @@ harden the wrapper, document the workaround, or both.
 
 | Version | Supported                                                |
 |---------|----------------------------------------------------------|
-| 4.1.x   | **Yes** — current release, receives security fixes       |
-| 4.0.x   | Yes — receives security fixes via back-ports on request  |
-| < 4.0   | No                                                       |
+| 4.3.x   | **Yes** — current release, receives security fixes       |
+| 4.2.x   | Yes — receives security fixes via back-ports on request  |
+| < 4.2   | No                                                       |
 
 ## Response Timeline
 
@@ -66,6 +66,7 @@ adjacent GPU / wgpu surfaces. Findings are filed as
 | 2026-07-01 | 4.0.0   | 0 CRITICAL / 0 HIGH — NVIDIA native backend | [`2026-07-01-audit.md`](docs/audit/2026-07-01-audit.md) |
 | 2026-07-02 | 4.0.1   | 0 CRITICAL / 0 HIGH / 0 MED — AMD-wgpu deprecation diff | [`2026-07-02-audit.md`](docs/audit/2026-07-02-audit.md) |
 | 2026-09-16 | 4.1.3   | 0 CRITICAL / 0 HIGH / 1 MED + 2 LOW → fixed in 4.1.4 — full P(-1): SPIR-V compiler, chitra/samvada moves | [`2026-09-16-audit.md`](docs/audit/2026-09-16-audit.md) |
+| 2026-11-16 | 4.3.0   | 0 CRITICAL / 0 HIGH / 2 MED + 2 LOW → fixed — render tier MB1, the 81-slot launcher, the 2026-11 repairs | [`2026-11-16-audit.md`](docs/audit/2026-11-16-audit.md) |
 
 2.3.0 was the last audit-gated *stdlib-candidate* release; from 2.4.0
 onward the `CLAUDE.md` Security Hardening checklist is the rolling

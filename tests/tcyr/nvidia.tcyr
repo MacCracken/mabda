@@ -449,7 +449,8 @@ fn test_nv_backend_v2_render_slots() {
     assert_eq(NV_PASS_CTX, 0, "nvidia pass ctx at +0");
     assert_eq(NV_PASS_RT, 8, "nvidia pass RT at +8");
     assert_eq(NV_PASS_CLEAR_COLOR, 16, "nvidia pass clear color at +16");
-    assert_eq(NV_PASS_STRUCT_SIZE, 24, "nvidia pass struct = 24 bytes");
+    assert_eq(NV_PASS_STRUCT_SIZE, 32, "nvidia pass struct = 32 bytes (4.3.0: +24 bound pipeline)");
+    assert_eq(NV_PASS_PIPE, 24, "nvidia pass: bound pipeline at +24");
     return 0;
 }
 
@@ -768,7 +769,7 @@ fn test_nv_bigbo_allocator() {
     # VA bump allocator on a stack ctx blob: distinct 64 KiB-aligned VAs,
     # cursor advances by the aligned span, exhaustion returns 0 and does
     # NOT advance the cursor.
-    var ctx[184];
+    var ctx[208];
     memset(&ctx, 0, GPU_CONTEXT_SIZE);
     store64(&ctx + NV_CTX_VA_CURSOR, NV_VA_BASE);
     assert_eq(_nv_ctx_alloc_va(&ctx, 1), NV_VA_BASE, "first VA = base");
@@ -851,8 +852,85 @@ fn test_nv_fence_status_check() {
     return 0;
 }
 
+# 4.3.0 (issue 2026-11-02, High): NVIDIA accepts only SASS. A SPIR-V / WGSL / GFX9
+# module is refused with SHMOD_ERR_SRC_KIND before any BO is allocated (it used to
+# be copied in as machine code and fault the GPU at the first dispatch).
+fn test_nv_shader_module_create_refuses_non_sass() {
+    var ctx[208];
+    memset(&ctx, 0, 208);
+    var words[32];
+    memset(&words, 0, 32);
+    store32(&words, 0x07230203);   # a SPIR-V magic
+    _gpu_set_last_shader_err(0);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &words, 32, SHADER_SRC_SPIRV), 0, "SPIR-V refused");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_SRC_KIND, "SPIR-V -> SHMOD_ERR_SRC_KIND");
+    _gpu_set_last_shader_err(0);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &words, 32, SHADER_SRC_WGSL), 0, "WGSL refused");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_SRC_KIND, "WGSL -> SHMOD_ERR_SRC_KIND");
+    _gpu_set_last_shader_err(0);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &words, 32, SHADER_SRC_GFX9), 0, "GFX9 refused");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_SRC_KIND, "GFX9 -> SHMOD_ERR_SRC_KIND");
+    assert(streq(gpu_shader_error_name(gpu_last_shader_error()), gpu_shader_error_name(0 - 9999)) == 0,
+      "SRC_KIND has a name");
+    _gpu_set_last_shader_err(0);
+    assert_eq(_backend_nvidia_shader_module_create(0, &words, 32, SHADER_SRC_SASS), 0, "SASS, null ctx refused");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_NULL_CTX, "null ctx -> SHMOD_ERR_NULL_CTX");
+    _gpu_set_last_shader_err(0);
+    return 0;
+}
+
+# 4.3.0 (issue 2026-11-02): the binding array, AMD's compiled-kernel shape.
+fn test_nv_binding_array_params() {
+    assert_eq(NV_SHMOD_NBIND, 40, "shmod nbind at +40");
+    assert_eq(NV_SHMOD_STRUCT_SIZE, 48, "shmod struct = 48 bytes");
+    assert(NV_PARAM_BASE + NV_MAX_BINDINGS * 8 <= NV_PARAM_BANK, "16 pointers fit the 0x200 param bank");
+    var shmod[48];
+    memset(&shmod, 0, 48);
+    assert_eq(native_nv_shmod_set_bindings(&shmod, 3), 0, "declare 3 bindings");
+    assert_eq(load64(&shmod + NV_SHMOD_NBIND), 3, "nbind stored");
+    assert_eq(native_nv_shmod_set_bindings(&shmod, 17), GPU_ERR_OTHER, "17 refused");
+    assert_eq(native_nv_shmod_set_bindings(&shmod, 0 - 1), GPU_ERR_OTHER, "negative refused");
+    assert_eq(native_nv_shmod_set_bindings(0, 1), GPU_ERR_OTHER, "null shmod refused");
+    # Param writes: the array form puts pointer i at +0x160 + 8*i.
+    var param[512];
+    memset(&param, 0, 512);
+    var bp[56];
+    store64(&bp, 3);
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(&bp + 8 + i * 16, 100 + i);          # handle
+        store64(&bp + 8 + i * 16 + 8, 0x1000 * (i + 1));   # va
+    }
+    _nv_write_params(&param, 3, &bp);
+    assert_eq(load64(&param + 0x160), 0x1000, "pointer 0 at +0x160");
+    assert_eq(load64(&param + 0x168), 0x2000, "pointer 1 at +0x168");
+    assert_eq(load64(&param + 0x170), 0x3000, "pointer 2 at +0x170");
+    assert_eq(load64(&param + 0x178), 0, "nothing past the array");
+    # The single-pair form (nbind 0) is unchanged: NV_BUF's VA at +0x160.
+    var nvbuf[32];
+    memset(&nvbuf, 0, 32);
+    store64(&nvbuf + NV_BUF_HANDLE, 7);
+    store64(&nvbuf + NV_BUF_VA, 0xABC000);
+    memset(&param, 0, 512);
+    _nv_write_params(&param, 0, &nvbuf);
+    assert_eq(load64(&param + 0x160), 0xABC000, "single pair: VA at +0x160");
+    assert_eq(load64(&param + 0x168), 0, "single pair writes one pointer");
+    # A count that is not the module's is refused before any ioctl (the stack ctx
+    # has no fd: reaching an ioctl would fail differently).
+    var ctx[208];
+    memset(&ctx, 0, 208);
+    gpu_error_clear();
+    store64(&bp, 2);
+    assert_eq(_backend_nvidia_compute_dispatch(&ctx, &shmod, 1, 1, 1, &bp), GPU_ERR_OTHER,
+      "array count 2 for a 3-binding module refused");
+    assert_neq(strlen(gpu_last_error_message()), 0, "the refusal says why");
+    gpu_error_clear();
+    return 0;
+}
+
 fn main() {
     alloc_init();
+    test_nv_shader_module_create_refuses_non_sass();
+    test_nv_binding_array_params();
     test_nv_getparam_ioctl_encoding();
     test_nv_vm_init_ioctl_encoding();
     test_nv_getparam_param_ids();

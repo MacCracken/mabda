@@ -1,6 +1,6 @@
 # Render Graph Guide
 
-> Written against mabda 4.2.0 / Cyrius 6.7.5. See
+> Written against mabda 4.3.0 / Cyrius 6.7.18. See
 > [`usage.md`](usage.md) and
 > [`../stdlib-integration.md`](../stdlib-integration.md) for the
 > consumer-project setup. This guide covers

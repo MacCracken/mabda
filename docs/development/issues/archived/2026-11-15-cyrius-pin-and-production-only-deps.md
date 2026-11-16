@@ -1,6 +1,6 @@
-# Tidy-up: the cyrius 6.7.5 pin is behind its consumers, and `[deps.chitra]`/`[deps.samvada]` reach every consumer though both features are opt-in
+# Tidy-up: the cyrius 6.7.5 pin is behind its consumers, and `[deps.chitra]`/`[deps.samvada]` reach every consumer though both features are opt-in — RESOLVED
 
-**Status:** 🟡 **OPEN** — tidy-up (not blocking).
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16). The pin is 6.7.18. `[deps.chitra]` and `[deps.samvada]` are `optional = true` with `[features] png / jpeg = ["chitra"]`, `logind = ["samvada"]`, `default = [png, jpeg, logind]`. cyrius reads `[features]` from the ROOT manifest only (cbt/deps/resolve.cyr), so mabda's defaults keep its own tree resolving both while a consumer resolves neither unless it names them (`cyrius deps --features chitra`). Checked with a scratch consumer on a `path =` dep: `cyrius deps -v` prints `skip optional dep (no active feature): samvada` / `chitra`, and `--features chitra` brings chitra back. `src/lib.cyr` includes the two bundles only under `MABDA_LOGIND` / `MABDA_PNG` / `MABDA_JPEG`, so mabda's own `cyrius deps --no-default-features` builds. README size corrected. Was: open.
 **Filed:** 2026-11-15, from soorat's Cyrius-port probe P5 (`soorat/scripts/probes/bundle/p5_fold/`, `p5_dep/`;
 `bundle/run.sh p5`; `soorat/docs/development/port-parity.md` §1.4; ledger row L12).
 **Placement:** `cyrius.cyml` — `[package] cyrius = "6.7.5"`, `[deps.samvada]` (line ~102), `[deps.chitra]`

@@ -1,0 +1,104 @@
+# programs/nvidia_multibind_e2e.cyr — v4.3.0 NVIDIA native repairs, on the TU116
+#
+# Issue 2026-11-02 (ranga 2.3.2) pair, through the PUBLIC mabda API:
+#   1. a SPIR-V module on an NVIDIA context is refused at create (0 +
+#      SHMOD_ERR_SRC_KIND) instead of being run as SASS and killing the channel;
+#   2. a compute dispatch binds TWO buffers with the count-prefixed binding array
+#      (AMD's compiled-kernel shape): add_one2 reads src (binding 0, c[0x0]+0x160)
+#      and writes dst (binding 1, c[0x0]+0x168); dst == src + 1;
+#   3. a binding array whose count is not the module's is refused before submit;
+#   4. the v0 single-pair form (store_deadbeef) still works unchanged;
+#   5. gpu_buffer_map returns the buffers' CPU mappings: src is written in place,
+#      dst read in place (the zero-copy path of issue 2026-11-02 byte-loop copies).
+#
+# Not in CI (hardware-dependent). Run via `make test-nvidia-multibind-e2e`.
+include "src/lib.cyr"
+
+var _passes = 0;
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn outn(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    syscall(1, 1, &buf, fmt_int_buf(n, &buf));
+    return 0;
+}
+fn pass(s): i64 { out("PASS: "); out(s); out("\n"); _passes = _passes + 1; return 0; }
+fn fail(s): i64 { out("FAIL: "); out(s); out("\n"); return 1; }
+
+fn main(): i64 {
+    alloc_init();
+    var res_tag, res = gpu_context_new_native_nvidia();
+    if (is_err_result(res_tag) == 1) { out("SKIP: no NVIDIA context\n"); return 0; }
+    var ctx = res;
+    pass("NVIDIA native context");
+
+    # 1. SPIR-V refused at create.
+    var words[32];
+    memset(&words, 0, 32);
+    store32(&words, 0x07230203);
+    store32(&words + 4, 0x00010000);
+    _gpu_set_last_shader_err(0);
+    if (gpu_shader_module_create_spirv(ctx, &words, 32) != 0) { return fail("1: a SPIR-V module was created"); }
+    if (gpu_last_shader_error() != 0 - SHMOD_ERR_SRC_KIND) { return fail("1: not SHMOD_ERR_SRC_KIND"); }
+    pass("1: SPIR-V on NVIDIA -> 0 + SHMOD_ERR_SRC_KIND (no SASS run, no channel kill)");
+
+    # 2. Two bindings.
+    var src = gpu_buffer_create(ctx, 4, 0);
+    var dst = gpu_buffer_create(ctx, 4, 0);
+    if (src == 0) { return fail("2: src buffer"); }
+    if (dst == 0) { return fail("2: dst buffer"); }
+    var sp = gpu_buffer_map(ctx, src);
+    var dp = gpu_buffer_map(ctx, dst);
+    if (sp == 0) { return fail("5: gpu_buffer_map(src)"); }
+    if (dp == 0) { return fail("5: gpu_buffer_map(dst)"); }
+    store32(sp, 41);         # written in place: no copy
+    store32(dp, 0);
+    var sass[128];
+    native_nv_sass_add_one2(&sass);
+    var m = gpu_shader_module_create(ctx, &sass, NV_SASS_ADD_ONE2_BYTES);
+    if (m == 0) { return fail("2: add_one2 module"); }
+    store64(m + NV_SHMOD_REGCOUNT, NV_SASS_ADD_ONE2_REGCOUNT);
+    native_nv_shmod_set_bindings(m, NV_SASS_ADD_ONE2_BINDINGS);
+    var bp[40];
+    store64(&bp, 2);
+    store64(&bp + 8, load64(src + NV_BUF_HANDLE));
+    store64(&bp + 16, load64(src + NV_BUF_VA));
+    store64(&bp + 24, load64(dst + NV_BUF_HANDLE));
+    store64(&bp + 32, load64(dst + NV_BUF_VA));
+    var rc = gpu_compute_dispatch(ctx, m, 1, 1, 1, &bp);
+    if (rc != 0) { out("  rc="); outn(rc); out("\n"); return fail("2: two-binding dispatch"); }
+    var got = load32(dp);    # read in place
+    if (got != 42) { out("  dst="); outn(got); out("\n"); return fail("2: dst != src + 1"); }
+    pass("2: binding array (count 2): add_one2 read src (c[0x0]+0x160), wrote dst (+0x168): 41 + 1 = 42");
+    pass("5: gpu_buffer_map: src written and dst read in place");
+
+    # 3. A count that is not the module's: refused before submit.
+    store64(&bp, 1);
+    if (gpu_compute_dispatch(ctx, m, 1, 1, 1, &bp) != GPU_ERR_OTHER) { return fail("3: count 1 for 2 bindings"); }
+    pass("3: a binding array whose count is not the module's -> GPU_ERR_OTHER, nothing submitted");
+
+    # 4. The v0 single-pair form, unchanged.
+    var d2 = gpu_buffer_create(ctx, 4, 0);
+    var sass2[128];
+    native_nv_sass_store_deadbeef(&sass2);
+    var m2 = gpu_shader_module_create(ctx, &sass2, NV_SASS_STORE_DEADBEEF_BYTES);
+    if (gpu_compute_dispatch(ctx, m2, 1, 1, 1, d2) != 0) { return fail("4: deadbeef dispatch"); }
+    var out2 = 0;
+    gpu_buffer_read(ctx, d2, 0, &out2, 4);
+    if (load32(&out2) != 0xDEADBEEF) { return fail("4: deadbeef readback"); }
+    pass("4: the single-pair (v0) kernel still writes 0xDEADBEEF");
+
+    gpu_shader_module_release(ctx, m);
+    gpu_shader_module_release(ctx, m2);
+    gpu_buffer_release(ctx, src);
+    gpu_buffer_release(ctx, dst);
+    gpu_buffer_release(ctx, d2);
+    gpu_context_release(ctx);
+    out("\n");
+    outn(_passes);
+    out(" passed, 0 failed\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

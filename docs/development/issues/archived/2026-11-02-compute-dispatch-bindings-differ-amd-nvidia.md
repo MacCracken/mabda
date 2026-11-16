@@ -1,6 +1,6 @@
-# `gpu_compute_dispatch`'s `bp` means different things on native AMD and native NVIDIA, and NVIDIA binds only one buffer
+# `gpu_compute_dispatch`'s `bp` means different things on native AMD and native NVIDIA, and NVIDIA binds only one buffer — RESOLVED
 
-**Status:** 🔴 **OPEN** — API defect.
+**Status:** ✅ **RESOLVED in mabda 4.3.0** (2026-11-16). NVIDIA reads `bp` the way AMD does. A module declaring N bindings (`NV_SHMOD_NBIND`, set by `native_nv_shmod_set_bindings`, and by the N9 compiler for the modules it builds) takes the count-prefixed array: count at +0, then N x (handle, VA); pointer i goes to `c[0x0][0x160 + 8*i]` (up to 16). An array whose count is not N is refused before anything is written or submitted. A module declaring 0 keeps the v0 single-pair form, which is AMD's precompiled-kernel form too. `gpu_compute_dispatch`'s comment documents both. Proven on the TU116 with `add_one2`, a two-pointer SM75 kernel captured with `nvcc` (reads binding 0, writes binding 1: 41 → 42), plus the count-mismatch refusal and the unchanged single-pair kernel (`nvidia_multibind_e2e`). Was: open.
 **Filed:** 2026-11-02, from ranga 2.3.2 (NVIDIA hardware run).
 **Placement:** `src/backend_nvidia.cyr` — `_backend_nvidia_compute_dispatch` (line ~416); `src/compute.cyr` —
 `gpu_compute_dispatch` (line ~355) and its doc comment.
@@ -33,4 +33,4 @@ so even with a SPIR-V compiler they can't run on a one-binding dispatch.
 - Until then, document the NVIDIA meaning of `bp` in `gpu_compute_dispatch`'s comment, and have NVIDIA
   reject a `bp` whose first word looks like a small binding count.
 - Pair with N9: the SPIR-V→SASS compiler is where the binding count would come from
-  ([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](./2026-11-02-n9-spirv-to-sass-compiler-request.md)).
+  ([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](../2026-11-02-n9-spirv-to-sass-compiler-request.md)).

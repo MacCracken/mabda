@@ -1,0 +1,443 @@
+# tests/tcyr/errors.tcyr — the render tier's error channel (v4.3.0, MB1 part B)
+#
+# The GPU error record (src/error.cyr), the public scope API (src/error_scope.cyr)
+# and the wgpu backend's scoped creation paths (src/backend_wgpu.cyr), driven
+# through mock fn tables. HW: programs/error_channel_e2e.cyr.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# ---------------------------------------------------------------------------
+# mock wgpu: a WGPU_FN_COUNT table of traps plus the entries a test installs
+# ---------------------------------------------------------------------------
+var _me_wrong = 0;
+var _me_push_calls = 0;
+var _me_push_filter = 0;
+var _me_pop_calls = 0;
+var _me_pop_ret = 1;          # WGPUErrorType the mock pop reports (1 = NoError)
+var _me_pop_msg = "";
+var _me_take_ret = 0;
+var _me_take_count = 0;
+var _me_take_msg = "";
+var _me_create_ret = 0;       # handle the mock create returns
+var _me_create_calls = 0;
+var _me_release_calls = 0;
+var _me_release_arg = 0;
+var _me_finish_ret = 0;
+var _me_submit_calls = 0;
+var _me_enc_release = 0;
+
+fn _me_trap(a, b, c, d, e, f): i64 { _me_wrong = _me_wrong + 1; return 0; }
+fn _me_push(device, filter): i64 {
+    _me_push_calls = _me_push_calls + 1;
+    _me_push_filter = filter;
+    return 0;
+}
+fn _me_copy(dst, src, cap): i64 {
+    var n = strlen(src);
+    if (n > cap - 1) { n = cap - 1; }
+    memcpy(dst, src, n);
+    store8(dst + n, 0);
+    return 0;
+}
+fn _me_pop(device, buf, cap): i64 {
+    _me_pop_calls = _me_pop_calls + 1;
+    if (buf != 0) { _me_copy(buf, _me_pop_msg, cap); }
+    return _me_pop_ret;
+}
+fn _me_take(buf, cap, count_out): i64 {
+    if (buf != 0) { _me_copy(buf, _me_take_msg, cap); }
+    if (count_out != 0) { store64(count_out, _me_take_count); }
+    return _me_take_ret;
+}
+fn _me_create(device, desc): i64 {
+    _me_create_calls = _me_create_calls + 1;
+    return _me_create_ret;
+}
+fn _me_release(h): i64 {
+    _me_release_calls = _me_release_calls + 1;
+    _me_release_arg = h;
+    return 0;
+}
+fn _me_finish(enc, label): i64 { return _me_finish_ret; }
+fn _me_submit(queue, cmd): i64 { _me_submit_calls = _me_submit_calls + 1; return 0; }
+fn _me_enc_rel(enc): i64 { _me_enc_release = _me_enc_release + 1; return 0; }
+fn _me_noop(a): i64 { return 0; }
+
+fn _me_install(table): i64 {
+    for (var i = 0; i < WGPU_FN_COUNT; i = i + 1) { store64(table + i * 8, &_me_trap); }
+    store64(table + 16 * 8, &_me_create);    # create shader module
+    store64(table + 21 * 8, &_me_release);   # shader module release
+    store64(table + 52 * 8, &_me_create);    # create render pipeline
+    store64(table + 53 * 8, &_me_release);   # render pipeline release
+    store64(table + 29 * 8, &_me_finish);
+    store64(table + 34 * 8, &_me_enc_rel);
+    store64(table + 35 * 8, &_me_submit);
+    store64(table + 62 * 8, &_me_noop);      # render pass end
+    store64(table + 63 * 8, &_me_noop);      # render pass release
+    store64(table + 73 * 8, &_me_push);
+    store64(table + 74 * 8, &_me_pop);
+    store64(table + 75 * 8, &_me_take);
+    _me_wrong = 0;
+    _me_push_calls = 0;
+    _me_pop_calls = 0;
+    _me_pop_ret = 1;
+    _me_pop_msg = "";
+    _me_take_ret = 0;
+    _me_take_count = 0;
+    _me_take_msg = "";
+    _me_create_ret = 0;
+    _me_create_calls = 0;
+    _me_release_calls = 0;
+    _me_release_arg = 0;
+    _me_finish_ret = 0;
+    _me_submit_calls = 0;
+    _me_enc_release = 0;
+    wgpu_ffi_init_table(table);
+    mabda_wgpu_launcher_slots(WGPU_FN_COUNT);
+    gpu_error_clear();
+    _gpu_set_last_shader_err(0);
+    return 0;
+}
+
+fn _me_uninstall(): i64 {
+    wgpu_ffi_init_table(0);
+    mabda_wgpu_launcher_slots(0);
+    gpu_error_clear();
+    return 0;
+}
+
+# A stack ctx with device 0xD0 / queue 0xD1 and the given backend.
+fn _me_ctx(ctx, be): i64 {
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 16, 0xD0);
+    store64(ctx + 24, 0xD1);
+    store64(ctx + 32, be);
+    return 0;
+}
+
+# A backend with the wgpu error slots only (the rest 0).
+fn _me_wgpu_error_backend(be): i64 {
+    memset(be, 0, BACKEND_SIZE);
+    backend_set_slot(be, BACKEND_SLOT_ERROR_SCOPE_PUSH, &_backend_wgpu_error_scope_push);
+    backend_set_slot(be, BACKEND_SLOT_ERROR_SCOPE_POP,  &_backend_wgpu_error_scope_pop);
+    backend_set_slot(be, BACKEND_SLOT_ERROR_TAKE,       &_backend_wgpu_error_take);
+    backend_set_kind(be, BACKEND_KIND_WGPU);
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# the record
+# ---------------------------------------------------------------------------
+
+fn test_error_codes_and_names() {
+    assert_eq(GPU_ERR_VALIDATION, 24, "GPU_ERR_VALIDATION = 24 (appended)");
+    assert_eq(GPU_ERR_OUT_OF_MEMORY, 25, "GPU_ERR_OUT_OF_MEMORY = 25");
+    assert_neq(strlen(gpu_err_name(GPU_ERR_VALIDATION)), 0, "validation has a name");
+    assert(streq(gpu_err_name(GPU_ERR_VALIDATION), gpu_err_name(0 - 1)) == 0, "validation has its own name");
+    assert(streq(gpu_err_name(GPU_ERR_OUT_OF_MEMORY), gpu_err_name(0 - 1)) == 0, "OOM has its own name");
+    assert_eq(SHMOD_ERR_VALIDATION, 121, "SHMOD_ERR_VALIDATION = 121");
+    assert(streq(gpu_shader_error_name(0 - SHMOD_ERR_VALIDATION), gpu_shader_error_name(0 - 9999)) == 0,
+      "SHMOD_ERR_VALIDATION has its own shader-error name (not the unknown-code fallback)");
+    return 0;
+}
+
+fn test_error_type_mapping() {
+    assert_eq(_gpu_err_from_wgpu_type(0), 0, "0 (none) -> 0");
+    assert_eq(_gpu_err_from_wgpu_type(1), 0, "NoError -> 0");
+    assert_eq(_gpu_err_from_wgpu_type(2), GPU_ERR_VALIDATION, "Validation -> GPU_ERR_VALIDATION");
+    assert_eq(_gpu_err_from_wgpu_type(3), GPU_ERR_OUT_OF_MEMORY, "OutOfMemory -> GPU_ERR_OUT_OF_MEMORY");
+    assert_eq(_gpu_err_from_wgpu_type(4), GPU_ERR_OTHER, "Internal -> GPU_ERR_OTHER");
+    assert_eq(_gpu_err_from_wgpu_type(5), GPU_ERR_OTHER, "Unknown -> GPU_ERR_OTHER");
+    assert_eq(_gpu_err_from_wgpu_type(0 - 3), GPU_ERR_OTHER, "a failed pop's -status -> GPU_ERR_OTHER");
+    return 0;
+}
+
+fn test_error_record_round_trip() {
+    gpu_error_clear();
+    assert_eq(gpu_last_error(), 0, "cleared: no error");
+    assert_eq(strlen(gpu_last_error_message()), 0, "cleared: empty message");
+    _gpu_err_record(GPU_ERR_VALIDATION, "bad pipeline", 3);
+    assert_eq(gpu_last_error(), GPU_ERR_VALIDATION, "record: code");
+    assert_streq(gpu_last_error_message(), "bad pipeline", "record: message copied");
+    assert_eq(gpu_error_count(), 3, "record: count");
+    _gpu_err_record(GPU_ERR_OTHER, 0, 1);
+    assert_eq(strlen(gpu_last_error_message()), 0, "a null message clears the text");
+    gpu_error_clear();
+    assert_eq(gpu_error_count(), 0, "clear: count");
+    return 0;
+}
+
+fn test_error_record_truncates() {
+    var big = alloc(GPU_ERROR_MESSAGE_CAP + 100);
+    memset(big, 65, GPU_ERROR_MESSAGE_CAP + 99);
+    store8(big + GPU_ERROR_MESSAGE_CAP + 99, 0);
+    _gpu_err_record(GPU_ERR_VALIDATION, big, 1);
+    assert_eq(strlen(gpu_last_error_message()), GPU_ERROR_MESSAGE_CAP - 1, "message truncated to cap - 1");
+    gpu_error_clear();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# public scopes over a backend with NO error slots (the native shape)
+# ---------------------------------------------------------------------------
+
+fn test_scope_balance_without_slots() {
+    var ctx[208];
+    var be[1024];
+    memset(&be, 0, BACKEND_SIZE);
+    backend_set_kind(&be, BACKEND_KIND_AMD);
+    _me_ctx(&ctx, &be);
+    gpu_error_clear();
+    assert_eq(gpu_error_scope_depth(&ctx), 0, "fresh ctx: depth 0");
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_OTHER, "pop with no scope -> GPU_ERR_OTHER");
+    assert_eq(gpu_last_error(), GPU_ERR_OTHER, "pop with no scope is recorded");
+    assert_neq(strlen(gpu_last_error_message()), 0, "pop with no scope says why");
+    assert_eq(gpu_error_scope_push(&ctx), 0, "native-shaped push -> 0");
+    assert_eq(gpu_error_scope_push(&ctx), 0, "nested push -> 0");
+    assert_eq(gpu_error_scope_depth(&ctx), 2, "depth 2");
+    assert_eq(gpu_error_scope_pop(&ctx), 0, "inner pop -> 0 (nothing caught)");
+    assert_eq(gpu_error_scope_pop(&ctx), 0, "outer pop -> 0");
+    assert_eq(gpu_error_scope_depth(&ctx), 0, "balanced back to 0");
+    assert_eq(gpu_error_take(&ctx), 0, "native-shaped take -> 0");
+    assert_eq(gpu_error_scope_push(0), GPU_ERR_OTHER, "null ctx push");
+    assert_eq(gpu_error_scope_pop(0), GPU_ERR_OTHER, "null ctx pop");
+    assert_eq(gpu_error_take(0), GPU_ERR_OTHER, "null ctx take");
+    gpu_error_clear();
+    return 0;
+}
+
+# An error mabda caught itself goes to the innermost open scope only, once.
+fn test_scope_pending_goes_to_innermost() {
+    var ctx[208];
+    var be[1024];
+    memset(&be, 0, BACKEND_SIZE);
+    _me_ctx(&ctx, &be);
+    _gpu_scope_note_pending(&ctx, GPU_ERR_VALIDATION);   # no scope open: dropped
+    gpu_error_scope_push(&ctx);                          # A
+    _gpu_scope_note_pending(&ctx, GPU_ERR_OUT_OF_MEMORY); # belongs to A
+    gpu_error_scope_push(&ctx);                          # B
+    _gpu_scope_note_pending(&ctx, GPU_ERR_VALIDATION);   # belongs to B
+    _gpu_scope_note_pending(&ctx, GPU_ERR_OTHER);        # B already holds its first error
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_VALIDATION, "B reports its first error");
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_OUT_OF_MEMORY, "A reports its own, not B's");
+    gpu_error_scope_push(&ctx);
+    assert_eq(gpu_error_scope_pop(&ctx), 0, "a fresh scope at a reused depth starts clean");
+    gpu_error_clear();
+    return 0;
+}
+
+# Past GPU_ERROR_SCOPE_MAX_DEPTH scopes still balance.
+fn test_scope_past_max_depth_balances() {
+    var ctx[208];
+    var be[1024];
+    memset(&be, 0, BACKEND_SIZE);
+    _me_ctx(&ctx, &be);
+    var n = GPU_ERROR_SCOPE_MAX_DEPTH + 3;
+    for (var i = 0; i < n; i = i + 1) { gpu_error_scope_push(&ctx); }
+    assert_eq(gpu_error_scope_depth(&ctx), n, "depth past the table");
+    _gpu_scope_note_pending(&ctx, GPU_ERR_VALIDATION);   # untracked at this depth
+    var bad = 0;
+    for (var j = 0; j < n; j = j + 1) {
+        if (gpu_error_scope_pop(&ctx) != 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every pop past the table reports 0");
+    assert_eq(gpu_error_scope_depth(&ctx), 0, "balanced");
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# the wgpu backend's error slots
+# ---------------------------------------------------------------------------
+
+fn test_wgpu_scope_slots() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _me_install(&table);
+    _me_wgpu_error_backend(&be);
+    _me_ctx(&ctx, &be);
+    assert_eq(gpu_error_scope_push(&ctx), 0, "wgpu push -> 0");
+    assert_eq(_me_push_calls, 1, "wgpu push reached slot 73");
+    assert_eq(_me_push_filter, WGPU_ERROR_FILTER_VALIDATION, "push filter = Validation");
+    _me_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_pop_msg = "Location[0] is not provided";
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_VALIDATION, "wgpu pop -> GPU_ERR_VALIDATION");
+    assert_streq(gpu_last_error_message(), "Location[0] is not provided", "pop recorded wgpu's message");
+    gpu_error_scope_push(&ctx);
+    _me_pop_ret = WGPU_ERROR_TYPE_NO_ERROR;
+    _me_pop_msg = "";
+    assert_eq(gpu_error_scope_pop(&ctx), 0, "NoError pop -> 0");
+    assert_streq(gpu_last_error_message(), "Location[0] is not provided", "a clean pop leaves the record alone");
+    _me_take_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_take_count = 4;
+    _me_take_msg = "uncaptured!";
+    assert_eq(gpu_error_take(&ctx), GPU_ERR_VALIDATION, "take -> GPU_ERR_VALIDATION");
+    assert_eq(gpu_error_count(), 4, "take records the count");
+    assert_streq(gpu_last_error_message(), "uncaptured!", "take records the message");
+    _me_take_ret = 0;
+    assert_eq(gpu_error_take(&ctx), 0, "take with none -> 0");
+    assert_eq(_me_wrong, 0, "no wrong slot");
+    # A pre-4.3.0 launcher: push refuses, nothing is opened.
+    mabda_wgpu_launcher_slots(0);
+    assert_eq(gpu_error_scope_push(&ctx), GPU_ERR_FFI_SYMBOL, "legacy launcher push -> FFI_SYMBOL");
+    assert_eq(gpu_error_scope_depth(&ctx), 0, "a refused push opens nothing");
+    _me_uninstall();
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# scoped creation paths
+# ---------------------------------------------------------------------------
+
+fn test_wgpu_shader_create_refused() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _me_install(&table);
+    _me_wgpu_error_backend(&be);
+    _me_ctx(&ctx, &be);
+    _me_create_ret = 0x5EAD;
+    _me_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_pop_msg = "Entry point vs_main at Vertex is invalid";
+    var src = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return 1u; }";
+    var m = _backend_wgpu_shader_module_create(&ctx, src, strlen(src), SHADER_SRC_WGSL);
+    assert_eq(m, 0, "rejected module -> 0");
+    assert_eq(_me_push_calls, 1, "module create was scoped (push)");
+    assert_eq(_me_pop_calls, 1, "module create was scoped (pop)");
+    assert_eq(_me_release_calls, 1, "the invalid module was released");
+    assert_eq(_me_release_arg, 0x5EAD, "released the handle wgpu returned");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_VALIDATION, "last shader error = -SHMOD_ERR_VALIDATION");
+    assert_eq(gpu_last_error(), GPU_ERR_VALIDATION, "GPU error record = VALIDATION");
+    assert_streq(gpu_last_error_message(), "Entry point vs_main at Vertex is invalid", "naga's reason recorded");
+    # A valid module: returned, and the shader-error slot is cleared.
+    _me_pop_ret = WGPU_ERROR_TYPE_NO_ERROR;
+    _me_release_calls = 0;
+    m = _backend_wgpu_shader_module_create(&ctx, src, strlen(src), SHADER_SRC_WGSL);
+    assert_eq(m, 0x5EAD, "valid module returned");
+    assert_eq(_me_release_calls, 0, "valid module not released");
+    assert_eq(gpu_last_shader_error(), 0, "success clears the shader-error slot");
+    # Inside a consumer scope, the refusal is handed to that scope too.
+    gpu_error_scope_push(&ctx);
+    _me_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _backend_wgpu_shader_module_create(&ctx, src, strlen(src), SHADER_SRC_WGSL);
+    _me_pop_ret = WGPU_ERROR_TYPE_NO_ERROR;   # the consumer's own wgpu scope saw nothing
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_VALIDATION,
+      "the consumer scope reports the refusal mabda caught inside it");
+    assert_eq(_me_wrong, 0, "no wrong slot");
+    _me_uninstall();
+    return 0;
+}
+
+fn test_wgpu_pipeline_create_refused() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _me_install(&table);
+    _me_wgpu_error_backend(&be);
+    _me_ctx(&ctx, &be);
+    _me_create_ret = 0x9199;
+    _me_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_pop_msg = "Unable to find entry point 'fs_main'";
+    var p = _backend_wgpu_render_pipeline_create(&ctx, 0x11, 0x22, 0);
+    assert_eq(p, 0, "rejected pipeline -> 0");
+    assert_eq(_me_release_calls, 1, "invalid pipeline released");
+    assert_eq(_me_release_arg, 0x9199, "released wgpu's handle");
+    assert_streq(gpu_last_error_message(), "Unable to find entry point 'fs_main'", "reason recorded");
+    _me_pop_ret = WGPU_ERROR_TYPE_NO_ERROR;
+    p = _backend_wgpu_render_pipeline_create(&ctx, 0x11, 0x22, 0);
+    assert_neq(p, 0, "valid pipeline returned");
+    assert_eq(load64(p), 0x9199, "pipeline struct holds the handle");
+    # The legacy builder path (no ctx) is scoped too.
+    _me_pop_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_release_calls = 0;
+    assert_eq(render_pipeline_create_simple(0xD0, 0x11, WGPU_TEXTURE_FORMAT_RGBA8_UNORM), 0,
+      "legacy create_simple refused -> 0");
+    assert_eq(_me_release_calls, 1, "legacy path released the invalid pipeline");
+    assert_eq(_me_wrong, 0, "no wrong slot");
+    _me_uninstall();
+    return 0;
+}
+
+# The launcher refused the frame's command buffer: render_pass_end reports it.
+fn test_wgpu_pass_end_refused_frame() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    var pass[48];
+    _me_install(&table);
+    _me_wgpu_error_backend(&be);
+    _me_ctx(&ctx, &be);
+    memset(&pass, 0, 48);
+    store64(&pass + 0, 0xE1);   # encoder
+    store64(&pass + 8, 0xE2);   # pass encoder
+    _me_finish_ret = 0;          # refused
+    _me_take_ret = WGPU_ERROR_TYPE_VALIDATION;
+    _me_take_count = 1;
+    _me_take_msg = "expects a BindGroup to be set at index 0";
+    gpu_error_scope_push(&ctx);
+    _me_pop_ret = WGPU_ERROR_TYPE_NO_ERROR;
+    assert_eq(_backend_wgpu_render_pass_end(&ctx, &pass), GPU_ERR_VALIDATION, "refused frame -> VALIDATION");
+    assert_eq(_me_submit_calls, 0, "nothing submitted");
+    assert_eq(_me_enc_release, 1, "encoder still released");
+    assert_streq(gpu_last_error_message(), "expects a BindGroup to be set at index 0", "the refusal's reason recorded");
+    assert_eq(gpu_error_scope_pop(&ctx), GPU_ERR_VALIDATION, "an open consumer scope reports the refused frame");
+    # A good frame submits and returns 0.
+    memset(&pass, 0, 48);
+    store64(&pass + 0, 0xE1);
+    store64(&pass + 8, 0xE2);
+    _me_finish_ret = 0xC0;
+    assert_eq(_backend_wgpu_render_pass_end(&ctx, &pass), 0, "good frame -> 0");
+    assert_eq(_me_submit_calls, 1, "good frame submitted");
+    assert_eq(_me_wrong, 0, "no wrong slot");
+    _me_uninstall();
+    return 0;
+}
+
+# 4.3.0 audit: the wgpu buffer write validates before the queue write.
+var _mw_writes = 0;
+fn _mw_size(buf): i64 { return 64; }
+fn _mw_write(queue, buf, off, data, n): i64 { _mw_writes = _mw_writes + 1; return 0; }
+
+fn test_wgpu_buffer_write_guards() {
+    var table[648];
+    var ctx[208];
+    var be[1024];
+    _me_install(&table);
+    store64(&table + 13 * 8, &_mw_size);
+    store64(&table + 9 * 8, &_mw_write);
+    _mw_writes = 0;
+    _me_wgpu_error_backend(&be);
+    _me_ctx(&ctx, &be);
+    var data[64];
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 0, &data, 6), GPU_ERR_BUFFER, "size 6 refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 2, &data, 8), GPU_ERR_BUFFER, "offset 2 refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 32, &data, 36), GPU_ERR_BUFFER, "past the 64-byte end refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 68, &data, 4), GPU_ERR_BUFFER, "offset past the end refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0, 0, &data, 8), GPU_ERR_BUFFER, "null buffer refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 0, 0, 8), GPU_ERR_BUFFER, "null source refused");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 0 - 4, &data, 8), GPU_ERR_BUFFER, "negative offset refused");
+    assert_eq(_mw_writes, 0, "no refused write reached wgpu");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 60, &data, 4), 0, "the last 4 bytes accepted");
+    assert_eq(_backend_wgpu_buffer_write(&ctx, 0xB0, 0, &data, 64), 0, "the whole buffer accepted");
+    assert_eq(_mw_writes, 2, "accepted writes reach wgpu");
+    assert_eq(_me_wrong, 0, "no wrong slot");
+    _me_uninstall();
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_error_codes_and_names();
+    test_error_type_mapping();
+    test_error_record_round_trip();
+    test_error_record_truncates();
+    test_scope_balance_without_slots();
+    test_scope_pending_goes_to_innermost();
+    test_scope_past_max_depth_balances();
+    test_wgpu_scope_slots();
+    test_wgpu_shader_create_refused();
+    test_wgpu_pipeline_create_refused();
+    test_wgpu_pass_end_refused_frame();
+    test_wgpu_buffer_write_guards();
+    return assert_summary();
+}

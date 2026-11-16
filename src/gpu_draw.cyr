@@ -1,0 +1,183 @@
+# @public — draw-time calls (v4.3.0, MB1)
+# gpu_draw.cyr — what a geometry renderer does inside a render pass: set the
+# pipeline, vertex and index buffers, bind groups (with dynamic offsets), the
+# viewport, the scissor and the blend constant, then draw — indexed or not,
+# instanced or not.
+#
+# Before 4.3.0 the only draw was gpu_render_pass_draw(ctx, pass, pipe, vc, ic):
+# vertex-less, one optional (texture, sampler) group. These calls work on the pass
+# gpu_render_pass_begin returns, with a pipeline from
+# gpu_render_pipeline_create_desc (src/gpu_pipeline.cyr) and groups from
+# gpu_bind_group_create (src/gpu_bind.cyr):
+#
+#   var pass = gpu_render_pass_begin(ctx, rt, clear);
+#   gpu_render_pass_set_pipeline(ctx, pass, pipe);
+#   gpu_render_pass_set_bind_group(ctx, pass, 0, frame_bg, 0, 0);
+#   gpu_render_pass_set_vertex_buffer(ctx, pass, 0, vbuf, 0, 0);
+#   gpu_render_pass_set_index_buffer(ctx, pass, ibuf, GPU_INDEX_UINT16, 0, 0);
+#   for each mesh:
+#       store32(&offs, mesh_index * 256);                      # per-draw uniform window
+#       gpu_render_pass_set_bind_group(ctx, pass, 1, model_bg, 1, &offs);
+#       gpu_render_pass_draw_indexed(ctx, pass, index_count, 1, first_index, 0, 0);
+#   gpu_render_pass_end(ctx, pass);
+#
+# Each call returns 0 or a GPU_ERR_*. An argument mabda can check is checked here
+# (null handles, alignment, ranges); what only the GPU API can check (a buffer
+# without VERTEX usage, a draw past the bound vertices, a group the pipeline's
+# layout does not take) is refused when the pass ends: gpu_render_pass_end
+# returns GPU_ERR_VALIDATION with the reason in gpu_last_error_message(), and the frame
+# is dropped rather than the process. These calls allocate nothing.
+#
+# Backends: wgpu at 4.3.0. A backend without the slot returns
+# GPU_ERR_NOT_IMPLEMENTED (the native backends; docs/development/roadmap.md).  #skip-lint
+
+# Dynamic offsets per set_bind_group call (WebGPU: maxDynamicUniformBuffersPerPipelineLayout
+# 8 + maxDynamicStorageBuffersPerPipelineLayout 4).
+var GPU_MAX_DYNAMIC_OFFSETS = 12;
+# Dynamic offsets must be multiples of this (WebGPU's minUniformBufferOffsetAlignment
+# and minStorageBufferOffsetAlignment defaults).
+var GPU_DYNAMIC_OFFSET_ALIGN = 256;
+
+fn _gpu_draw_slot(ctx, pass, off): i64 {
+    if (ctx == 0) { return 0; }
+    if (pass == 0) { return 0; }
+    var b = gpu_ctx_backend(ctx);
+    if (b == 0) { return 0; }
+    return backend_get_slot(b, off);
+}
+
+fn _gpu_draw_missing(ctx, pass): i64 {
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (pass == 0) { return GPU_ERR_OTHER; }
+    if (gpu_ctx_backend(ctx) == 0) { return GPU_ERR_OTHER; }
+    return GPU_ERR_NOT_IMPLEMENTED;   #skip-lint
+}
+
+fn gpu_render_pass_set_pipeline(ctx, pass, pipe): i64 {
+    if (pipe == 0) { return GPU_ERR_PIPELINE; }
+    var slot = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_PIPELINE);
+    if (slot == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall3(slot, ctx, pass, pipe);
+}
+
+# Bind `buf` (GPU_BUFFER_USAGE_VERTEX) at vertex buffer `slot` (the pipeline
+# descriptor's buffer number), from byte `offset`; size 0 = to the end.
+fn gpu_render_pass_set_vertex_buffer(ctx, pass, slot, buf, offset, size): i64 {
+    if (buf == 0) { return GPU_ERR_BUFFER; }
+    if (slot < 0) { return GPU_ERR_BUFFER; }
+    if (slot >= GPU_PIPE_MAX_VERTEX_BUFFERS) { return GPU_ERR_BUFFER; }
+    if (offset < 0) { return GPU_ERR_BUFFER; }
+    if ((offset & 3) != 0) { return GPU_ERR_BUFFER; }
+    if (size < 0) { return GPU_ERR_BUFFER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_VERTEX_BUFFER);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall6(s, ctx, pass, slot, buf, offset, size);
+}
+
+# Bind `buf` (GPU_BUFFER_USAGE_INDEX) as the index buffer: GPU_INDEX_UINT16 or
+# GPU_INDEX_UINT32, from byte `offset` (a multiple of the index size); size 0 =
+# to the end.
+fn gpu_render_pass_set_index_buffer(ctx, pass, buf, index_format, offset, size): i64 {
+    if (buf == 0) { return GPU_ERR_BUFFER; }
+    if (index_format != GPU_INDEX_UINT16) {
+        if (index_format != GPU_INDEX_UINT32) { return GPU_ERR_BUFFER; }
+    }
+    if (offset < 0) { return GPU_ERR_BUFFER; }
+    if (size < 0) { return GPU_ERR_BUFFER; }
+    var isz = 2;
+    if (index_format == GPU_INDEX_UINT32) { isz = 4; }
+    if ((offset % isz) != 0) { return GPU_ERR_BUFFER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_INDEX_BUFFER);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall6(s, ctx, pass, buf, index_format, offset, size);
+}
+
+# Bind group `bg` at @group(`group`). `offsets` points to `count` u32 dynamic
+# offsets, one per dynamic-offset entry of the group's layout in binding order,
+# each a multiple of GPU_DYNAMIC_OFFSET_ALIGN (256). count 0 = none (offsets may be 0).
+fn gpu_render_pass_set_bind_group(ctx, pass, group, bg, count, offsets): i64 {
+    if (bg == 0) { return GPU_ERR_PIPELINE; }
+    if (group < 0) { return GPU_ERR_PIPELINE; }
+    if (group >= GPU_PIPE_MAX_GROUPS) { return GPU_ERR_PIPELINE; }
+    if (count < 0) { return GPU_ERR_PIPELINE; }
+    if (count > GPU_MAX_DYNAMIC_OFFSETS) { return GPU_ERR_PIPELINE; }
+    if (count > 0) {
+        if (offsets == 0) { return GPU_ERR_PIPELINE; }
+        for (var i = 0; i < count; i = i + 1) {
+            if ((load32(offsets + i * 4) % GPU_DYNAMIC_OFFSET_ALIGN) != 0) { return GPU_ERR_BUFFER; }
+        }
+    }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_BIND_GROUP);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall6(s, ctx, pass, group, bg, count, offsets);
+}
+
+# Draw `vertex_count` vertices x `instance_count` instances from the bound vertex
+# buffers, starting at `first_vertex` / `first_instance`.
+fn gpu_render_pass_draw_vertices(ctx, pass, vertex_count, instance_count, first_vertex, first_instance): i64 {
+    if (vertex_count < 0) { return GPU_ERR_OTHER; }
+    if (instance_count < 0) { return GPU_ERR_OTHER; }
+    if (first_vertex < 0) { return GPU_ERR_OTHER; }
+    if (first_instance < 0) { return GPU_ERR_OTHER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_DRAW);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall6(s, ctx, pass, vertex_count, instance_count, first_vertex, first_instance);
+}
+
+# Draw `index_count` indices x `instance_count` instances from the bound index
+# buffer, starting at index `first_index`; `base_vertex` (may be negative) is
+# added to each index.
+fn gpu_render_pass_draw_indexed(ctx, pass, index_count, instance_count, first_index, base_vertex, first_instance): i64 {
+    if (index_count < 0) { return GPU_ERR_OTHER; }
+    if (instance_count < 0) { return GPU_ERR_OTHER; }
+    if (first_index < 0) { return GPU_ERR_OTHER; }
+    if (first_instance < 0) { return GPU_ERR_OTHER; }
+    if (base_vertex < 0 - 2147483648) { return GPU_ERR_OTHER; }
+    if (base_vertex > 2147483647) { return GPU_ERR_OTHER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_DRAW_INDEXED);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall7(s, ctx, pass, index_count, instance_count, first_index, base_vertex, first_instance);
+}
+
+# The viewport, in target pixels, and its depth range: six f64 (mabda's
+# precision; the GPU takes f32). width and height must be positive; depth in [0, 1].
+fn gpu_render_pass_set_viewport(ctx, pass, x, y, w, h, min_depth, max_depth): i64 {
+    if (f64_gt(w, F64_0) == 0) { return GPU_ERR_OTHER; }
+    if (f64_gt(h, F64_0) == 0) { return GPU_ERR_OTHER; }
+    if (f64_lt(min_depth, F64_0) == 1) { return GPU_ERR_OTHER; }
+    if (f64_gt(max_depth, F64_1) == 1) { return GPU_ERR_OTHER; }
+    if (f64_gt(min_depth, max_depth) == 1) { return GPU_ERR_OTHER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_VIEWPORT);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    var v[48];
+    store64(&v, x);
+    store64(&v + 8, y);
+    store64(&v + 16, w);
+    store64(&v + 24, h);
+    store64(&v + 32, min_depth);
+    store64(&v + 40, max_depth);
+    return fncall3(s, ctx, pass, &v);
+}
+
+# The scissor rectangle, in target pixels (non-negative integers).
+fn gpu_render_pass_set_scissor(ctx, pass, x, y, w, h): i64 {
+    if (x < 0) { return GPU_ERR_OTHER; }
+    if (y < 0) { return GPU_ERR_OTHER; }
+    if (w < 0) { return GPU_ERR_OTHER; }
+    if (h < 0) { return GPU_ERR_OTHER; }
+    if (x > 0xFFFFFFFF) { return GPU_ERR_OTHER; }
+    if (y > 0xFFFFFFFF) { return GPU_ERR_OTHER; }
+    if (w > 0xFFFFFFFF) { return GPU_ERR_OTHER; }
+    if (h > 0xFFFFFFFF) { return GPU_ERR_OTHER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_SCISSOR);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall6(s, ctx, pass, x, y, w, h);
+}
+
+# The colour GPU_BLEND_FACTOR_CONSTANT refers to: a mabda Color (four f64).
+fn gpu_render_pass_set_blend_constant(ctx, pass, color): i64 {
+    if (color == 0) { return GPU_ERR_OTHER; }
+    var s = _gpu_draw_slot(ctx, pass, BACKEND_SLOT_PASS_SET_BLEND_CONSTANT);
+    if (s == 0) { return _gpu_draw_missing(ctx, pass); }
+    return fncall3(s, ctx, pass, color);
+}
