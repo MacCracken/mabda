@@ -25052,6 +25052,10 @@ var SM75_OP_ULDC   = 0xAB9;
 var SM75_OP_BRA    = 0x947;
 var SM75_OP_EXIT   = 0x94D;
 var SM75_OP_NOP    = 0x918;
+var SM75_OP_BCLEAR = 0x355;   # BMOV.32.CLEAR RZ, Bx (NAK OpBClear)
+var SM75_OP_BSSY   = 0x945;
+var SM75_OP_BSYNC  = 0x941;
+var SM75_NBAR      = 16;      # convergence barrier registers B0..B15
 
 # ISETP / FSETP compare codes (bits 76-78).
 var SM75_CMP_LT = 1;
@@ -25439,6 +25443,39 @@ fn sm75_enc_bra(ins, rel): i64 {
     return 0;
 }
 
+# ================================================================
+# Convergence barriers (4.4.0: BSSY / BSYNC reconvergence)
+# ================================================================
+# Pinned against ptxas (CUDA 13.4, sm_75) on chew: BMOV.32.CLEAR RZ, B0 / B1; BSSY B0 / B1 with
+# their reconvergence offsets; BSYNC B1 (tests/tcyr/sm75_encode.tcyr).
+
+# BMOV.32.CLEAR RZ, B<bar> — clears the barrier before a BSSY sets it (BSSY accumulates).
+fn sm75_enc_bclear(ins, bar): i64 {
+    _sm75_begin(ins, SM75_OP_BCLEAR);
+    sm75_set(ins, 16, 8, SM75_RZ);
+    sm75_set(ins, 24, 4, bar);
+    sm75_set(ins, 84, 1, 1);          # .CLEAR
+    return 0;
+}
+
+# BSSY B<bar>, <reconvergence point> — `rel` in 32-bit words from the next instruction (as BRA),
+# 30-bit field. The reconvergence point is the instruction after the matching BSYNC.
+fn sm75_enc_bssy(ins, bar, rel): i64 {
+    _sm75_begin(ins, SM75_OP_BSSY);
+    sm75_set(ins, 16, 4, bar);
+    sm75_set(ins, 34, 30, rel & 0x3FFFFFFF);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# BSYNC B<bar> — waits until every thread BSSY recorded in B<bar> arrives here or exits.
+fn sm75_enc_bsync(ins, bar): i64 {
+    _sm75_begin(ins, SM75_OP_BSYNC);
+    sm75_set(ins, 16, 4, bar);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
 # EXIT
 fn sm75_enc_exit(ins): i64 {
     _sm75_begin(ins, SM75_OP_EXIT);
@@ -25487,9 +25524,24 @@ fn sm75_enc_nop(ins): i64 {
 # Back-edge phi copies (MIR_CB_MOVES_*) go between the two branches, so only the edge that takes
 # them runs them (FALSE-edge copies flip it: `@Pk BRA <true>`, copies, `BRA <false>`). OpReturn
 # is EXIT anywhere — it retires only the threads that execute it, so an early return inside a
-# divergent if or loop is legal here, unlike on AMD. Reconvergence (BSSY / BSYNC) is not
-# emitted: these kernels have no warp-synchronous operations, so threads that never reconverge
-# still compute correctly (design note §3; named in §7).
+# divergent if or loop is legal here, unlike on AMD.
+#
+# RECONVERGENCE (4.4.0). Diverged threads run each path separately and, without help, may stay
+# apart for the rest of the program, each group running the shared code after the merge on its
+# own. A closed divergent region gets `BMOV.32.CLEAR RZ, Bd; BSSY Bd, <after its BSYNC>` at its
+# head and `BSYNC Bd` at its merge, which waits for every thread the BSSY recorded to arrive or
+# exit (NAK nak_nir_lower_cf.c: "exited lanes never block a bsync"; the clear first, as NAK and
+# ptxas do, because BSSY accumulates into the barrier). The regions:
+#   - a divergent if (forward COND_BRANCH, THEN next): head = the branch, merge = the FALSE label,
+#     or for an if/else the label the THEN block's last branch jumps over the ELSE to;
+#   - a loop (a label some later branch jumps back to) with a divergent condition inside and ONE
+#     exit label after it: head = just before the header label (so the back-edges skip it),
+#     merge = the exit.
+# A BSYNC hangs if a thread the BSSY recorded never reaches it, so a region gets one only when it
+# is CLOSED: no branch inside it targets a label outside it but its merge, and no branch outside
+# it targets a label inside it or its merge. Anything else (a break out of an if inside a loop,
+# say) runs without reconvergence there, as v1 did everywhere — correct, just not reconverged.
+# Regions nest: barrier d = nesting depth (B0..B15); one deeper gets none.
 #
 # NOT YET (docs/proposals/n9-spirv-to-sass.md §7): f64; the GFX9-shaped division macros
 # (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT). Each fails with
@@ -25518,6 +25570,9 @@ var SM75I_STG     = 20;   # [a.U32 + UR + c] = b   bits 8-13: UR, c immediate   
 var SM75I_EXIT    = 21;
 var SM75I_LABEL   = 22;   # a = label <id> (immediate); 0 bytes — the emitter records its offset
 var SM75I_BRA     = 23;   # a = target label (immediate); bit 8: guarded, bit 9: @!Pk, bits 10-12: k
+var SM75I_BCLEAR  = 24;   # BMOV.32.CLEAR RZ, B<a>                            a immediate
+var SM75I_BSSY    = 25;   # BSSY B<a> -> after the c-th BSYNC at label b     a, b, c immediate
+var SM75I_BSYNC   = 26;   # BSYNC B<a>                                        a immediate
 
 var SM75I_REC = 48;   # the GISEL record shape (gfx9_isel.cyr)
 
@@ -25546,9 +25601,13 @@ fn sm75i_flags(out, i): i64 { return load64(out + i * SM75I_REC + 40); }
 
 # Selection state (SM75_ST_SIZE bytes): st+0 = k (records so far), st+8 = cap, st+16 = the
 # predicate holding the last MIR compare (-1: none since the last label), st+24 = a use clock,
-# then SM75_NPRED (7) pairs from st+32: [compare <id> held (0: none), last use].
+# then SM75_NPRED (7) pairs from st+32: [compare <id> held (0: none), last use]; st+144 = the
+# open reconvergence regions, st+152 = the label-position table (`lpos`, cap_ids i64: the MIR
+# index of each LABEL, -1 none), st+160 = its entries; from st+168, SM75_NBAR (16) regions of
+# [merge label, barrier, the BSSY record's index, BSYNCs already emitted at the merge].
 var SM75_NPRED = 7;            # P0..P6; P7 is PT
-var SM75_ST_SIZE = 144;        # 32 + 7 * 16
+var SM75_ST_SIZE = 680;        # 168 + 16 * 32
+var _S75_RREC = 32;
 
 fn _s75_put(out, st, op, dst, a, b, c, flags): i64 {
     var k = load64(st);
@@ -25844,8 +25903,26 @@ fn _s75_one(m, out, st, i): i64 {
     var f = MIR_T_F32;
     if (op == MIR_OP_RET) { return _s75_put(out, st, SM75I_EXIT, 0, 0, 0, 0, 0); }
     if (op == MIR_OP_LABEL) {
+        # A loop header: open its region first, so the back-edges skip the BSSY. Not when an
+        # open region merges here too (its BSYNC must come after the label).
+        var n1 = mir_n_instrs(m);
+        var lx = _s75_loop_region(m, st, n1, a, i);
+        if (lx > 0) {
+            var clash = 0;
+            var d1 = 0;
+            while (d1 < _s75_rdepth(st)) {
+                if (_s75_rmerge(st, d1) == a) { clash = 1; }
+                d1 = d1 + 1;
+            }
+            if (clash == 0) {
+                var ro = _s75_ropen(out, st, lx, _s75_lpos(st, lx));
+                if (ro < 0) { return ro; }
+            }
+        }
         _s75_preset(st);   # predicates depend on the path in
-        return _s75_put(out, st, SM75I_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+        var pl = _s75_put(out, st, SM75I_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+        if (pl < 0) { return pl; }
+        return _s75_rclose(out, st, a);
     }
     if (op == MIR_OP_BRANCH) {
         # a branch to the label right after it falls through: nothing to emit
@@ -25984,6 +26061,186 @@ fn _s75_is_label(m, n, i, l): i64 {
     return 1;
 }
 
+# ---- reconvergence regions (see the header) ----
+fn _s75_lpos(st, l): i64 {
+    if (l <= 0) { return 0 - 1; }
+    if (l >= load64(st + 160)) { return 0 - 1; }
+    return load64(load64(st + 152) + l * 8);
+}
+
+fn _s75_rdepth(st): i64 { return load64(st + 144); }
+fn _s75_rmerge(st, d): i64 { return load64(st + 168 + d * _S75_RREC); }
+
+# The targets of MIR branch j into t2 (2 i64); returns how many (0 if j is not a branch).
+fn _s75_targets(m, j, t2): i64 {
+    var op = mir_instr_op(m, j);
+    if (op == MIR_OP_BRANCH) { store64(t2, mir_instr_a(m, j)); return 1; }
+    if (op == MIR_OP_COND_BRANCH) {
+        store64(t2, mir_instr_b(m, j));
+        store64(t2 + 8, mir_instr_c(m, j));
+        return 2;
+    }
+    return 0;
+}
+
+# Is the region of MIR indices (lo, hi] closed? Every branch strictly inside (lo, hi) targets a
+# label at a position in (lo, hi]; no branch at j < lo or j > hi targets one. The branch AT lo
+# (an if's head, a loop's preheader) is the caller's to check.
+fn _s75_closed(m, st, n, lo, hi): i64 {
+    var t2[16];
+    var j = 0;
+    while (j < n) {
+        if (j != lo) {
+            var nt = _s75_targets(m, j, &t2);
+            var q = 0;
+            while (q < nt) {
+                var tp = _s75_lpos(st, load64(&t2 + q * 8));
+                if (tp < 0) { return 0; }
+                var in_t = 0;
+                if (tp > lo) { if (tp <= hi) { in_t = 1; } }
+                var in_j = 0;
+                if (j > lo) { if (j < hi) { in_j = 1; } }
+                if (in_j != in_t) { return 0; }
+                q = q + 1;
+            }
+        }
+        j = j + 1;
+    }
+    return 1;
+}
+
+# Open a region ending at label `merge` (at MIR position mpos): BCLEAR + BSSY on the next
+# barrier, unless it would not nest inside the innermost open one or all 16 are open.
+# Returns 1 if opened, 0 if not, or a negative error.
+fn _s75_ropen(out, st, merge, mpos): i64 {
+    var d = _s75_rdepth(st);
+    if (d >= SM75_NBAR) { return 0; }
+    if (d > 0) { if (mpos > _s75_lpos(st, _s75_rmerge(st, d - 1))) { return 0; } }
+    var r1 = _s75_put(out, st, SM75I_BCLEAR, 0, d, 0, 0, MIR_FLAG_A_IMM);
+    if (r1 < 0) { return r1; }
+    var bi = load64(st);
+    var r2 = _s75_put(out, st, SM75I_BSSY, 0, d, merge, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    if (r2 < 0) { return r2; }
+    var r = st + 168 + d * _S75_RREC;
+    store64(r, merge);
+    store64(r + 8, d);
+    store64(r + 16, bi);
+    store64(st + 144, d + 1);
+    return 1;
+}
+
+# At label l: close every innermost region that merges there, innermost first — BSYNC each, and
+# point its BSSY after that BSYNC (the c-th at l).
+fn _s75_rclose(out, st, l): i64 {
+    var c = 0;
+    while (_s75_rdepth(st) > 0) {
+        var d = _s75_rdepth(st) - 1;
+        if (_s75_rmerge(st, d) != l) { return 0; }
+        var r = st + 168 + d * _S75_RREC;
+        var pr = _s75_put(out, st, SM75I_BSYNC, 0, load64(r + 8), 0, 0, MIR_FLAG_A_IMM);
+        if (pr < 0) { return pr; }
+        store64(out + load64(r + 16) * SM75I_REC + 32, c);    # the BSSY record's c
+        c = c + 1;
+        store64(st + 144, d);
+    }
+    return 0;
+}
+
+# Would a BSYNC at merge position mpos be wasted? Yes when, from the merge on, only labels,
+# moves and branches onward come before the program's end or an open region's merge (that
+# region syncs anyway) — NAK's parent_scope_will_sync. ranga's bounds guard is the common case:
+# its merge is the RET.
+fn _s75_merge_trivial(m, st, n, mpos): i64 {
+    var j = mpos + 1;
+    var steps = 0;
+    while (j < n) {
+        if (steps > n) { return 0; }
+        steps = steps + 1;
+        var op = mir_instr_op(m, j);
+        if (op == MIR_OP_RET) { return 1; }
+        if (op == MIR_OP_LABEL) {
+            var l = mir_instr_a(m, j);
+            var d = 0;
+            while (d < _s75_rdepth(st)) {
+                if (_s75_rmerge(st, d) == l) { return 1; }
+                d = d + 1;
+            }
+            j = j + 1;
+            continue;
+        }
+        if (op == MIR_OP_VMOV) { j = j + 1; continue; }
+        if (op == MIR_OP_BRANCH) {
+            var tp = _s75_lpos(st, mir_instr_a(m, j));
+            if (tp <= j) { return 0; }
+            j = tp;
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+fn _s75_divergent(m, v): i64 {
+    if (v <= 0) { return 0; }
+    if (v >= load64(m + 64)) { return 0; }
+    if (mir_val_unif(m, v) == MIR_DIVERGENT) { return 1; }
+    return 0;
+}
+
+# The loop whose header is label L at MIR position p: its exit label if it is a closed loop with
+# a divergent condition and a plain way in (fall-through, or BRANCH L just before), else 0.
+fn _s75_loop_region(m, st, n, l, p): i64 {
+    var t2[16];
+    var e = 0 - 1;
+    var j = p + 1;
+    while (j < n) {
+        var nt = _s75_targets(m, j, &t2);
+        var q = 0;
+        while (q < nt) {
+            if (load64(&t2 + q * 8) == l) { e = j; }
+            q = q + 1;
+        }
+        j = j + 1;
+    }
+    if (e < 0) { return 0; }
+    # the one exit: every target of a branch in [p, e] outside [p, e] is the same label, after e
+    var x = 0;
+    j = p;
+    while (j <= e) {
+        var nt2 = _s75_targets(m, j, &t2);
+        var q2 = 0;
+        while (q2 < nt2) {
+            var tl = load64(&t2 + q2 * 8);
+            var tp = _s75_lpos(st, tl);
+            if (tp < 0) { return 0; }
+            if (tp < p) { return 0; }
+            if (tp > e) {
+                if (x == 0) { x = tl; }
+                if (tl != x) { return 0; }
+            }
+            q2 = q2 + 1;
+        }
+        j = j + 1;
+    }
+    if (x == 0) { return 0; }
+    var xp = _s75_lpos(st, x);
+    if (p > 0) {
+        var pop = mir_instr_op(m, p - 1);
+        if (pop == MIR_OP_COND_BRANCH) { return 0; }
+        if (pop == MIR_OP_BRANCH) { if (mir_instr_a(m, p - 1) != l) { return 0; } }
+    }
+    if (_s75_closed(m, st, n, p - 1, xp) == 0) { return 0; }
+    var div = 0;
+    j = p;
+    while (j < xp) {
+        if (mir_instr_op(m, j) == MIR_OP_COND_BRANCH) { div = div | _s75_divergent(m, mir_instr_a(m, j)); }
+        j = j + 1;
+    }
+    if (div == 0) { return 0; }
+    if (_s75_merge_trivial(m, st, n, xp) == 1) { return 0; }
+    return x;
+}
+
 # COND_BRANCH at MIR index i (a = cond, b = TRUE label, c = FALSE label), with the back-edge
 # phi copies that follow it. Returns how many MIR instructions it consumed (1 + copies).
 fn _s75_cond_branch(m, out, st, i, n): i64 {
@@ -26016,6 +26273,28 @@ fn _s75_cond_branch(m, out, st, i, n): i64 {
     }
     var cr = _s75_cond(m, out, st, cond);
     if (cr < 0) { return cr; }
+    # A divergent if (no copies, THEN next): open its reconvergence region at the merge.
+    if (nmv == 0) {
+        if (_s75_is_label(m, n, i + 1, bt) == 1) {
+            if (_s75_divergent(m, cond) == 1) {
+                var mg = ct;
+                var cp = _s75_lpos(st, ct);
+                if (cp > i + 1) {
+                    if (mir_instr_op(m, cp - 1) == MIR_OP_BRANCH) {
+                        var bx = mir_instr_a(m, cp - 1);
+                        if (_s75_lpos(st, bx) > cp) { mg = bx; }
+                    }
+                    var mp = _s75_lpos(st, mg);
+                    if (_s75_closed(m, st, n, i, mp) == 1) {
+                        if (_s75_merge_trivial(m, st, n, mp) == 0) {
+                            var ro2 = _s75_ropen(out, st, mg, mp);
+                            if (ro2 < 0) { return ro2; }
+                        }
+                    }
+                }
+            }
+        }
+    }
     # the guarded branch skips the edge that takes the copies
     var first = ct;
     var other = bt;
@@ -26088,11 +26367,27 @@ fn _s75_binding_read(m, b): i64 {
 # declared binding nothing reads is counted but not loaded.
 # Returns the record count or a NEGATIVE error.
 fn sm75_isel(m, out, out_len): i64 {
-    var st[144];         # SM75_ST_SIZE
+    var st[680];         # SM75_ST_SIZE
     store64(&st, 0);
     store64(&st + 8, out_len / SM75I_REC);
     store64(&st + 24, 0);
     _s75_preset(&st);
+    # label positions, for the reconvergence regions
+    var lpos[2048];      # 256 label <id>s (cap_ids <= 256)
+    var cap_ids = load64(m + 64);
+    if (cap_ids > 256) { cap_ids = 256; }
+    memset(&lpos, 0xFF, 2048);
+    var li = 0;
+    while (li < mir_n_instrs(m)) {
+        if (mir_instr_op(m, li) == MIR_OP_LABEL) {
+            var lid = mir_instr_a(m, li);
+            if (lid > 0) { if (lid < cap_ids) { store64(&lpos + lid * 8, li); } }
+        }
+        li = li + 1;
+    }
+    store64(&st + 144, 0);
+    store64(&st + 152, &lpos);
+    store64(&st + 160, cap_ids);
     var nb = sm75_binding_count(m);
     if (nb > SM75_MAX_BIND) { return 0 - SM75_ERR_TOO_MANY_BINDINGS; }
     var b = 0;
@@ -26163,6 +26458,9 @@ fn _s75_writes_gpr(op): i64 {
     if (op == SM75I_STG) { return 0; }
     if (op == SM75I_ULDC) { return 0; }
     if (op == SM75I_EXIT) { return 0; }
+    if (op == SM75I_BCLEAR) { return 0; }
+    if (op == SM75I_BSSY) { return 0; }
+    if (op == SM75I_BSYNC) { return 0; }
     return 1;
 }
 
@@ -26364,6 +26662,8 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
         return sm75_enc_stg32(ins, a, mods & 0x3F, sm75_reg(alloc, sm75i_b(isel, i)), sm75i_c(isel, i));
     }
     if (op == SM75I_EXIT) { return sm75_enc_exit(ins); }
+    if (op == SM75I_BCLEAR) { return sm75_enc_bclear(ins, sm75i_a(isel, i) & 15); }
+    if (op == SM75I_BSYNC) { return sm75_enc_bsync(ins, sm75i_a(isel, i) & 15); }
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
@@ -26384,7 +26684,8 @@ var _S75_C_ALU  = 1;   # CoupledAlu: IADD3 LOP3 SHF ISETP SEL MOV FMNMX
 var _S75_C_FMA  = 2;   # CoupledFMA and IMADLo (identical rows): FADD FMUL FFMA IMAD IMAD.HI
 var _S75_C_DEC  = 3;   # Decoupled, scoreboarded: S2R LDG STG MUFU I2F F2I FRND
 var _S75_C_UNI  = 4;   # ULDC (the uniform datapath's Uldc)
-var _S75_C_CTL  = 5;   # BRA, EXIT
+var _S75_C_CTL  = 5;   # BRA, EXIT, BSYNC
+var _S75_C_BAR  = 6;   # BMOV.32.CLEAR, BSSY: no register operands; barriers interlock in HW
 
 var SM75_LAT_GUARD   = 12;   # ISETP -> a branch guarded by its predicate (GuardPredicate)
 var SM75_LAT_SEL     = 4;    # ISETP -> SEL reading the predicate (CoupledAlu)
@@ -26393,12 +26694,16 @@ var SM75_LAT_WAW_DEC = 6;    # a coupled write, then a decoupled write of the sa
 var SM75_LAT_DRAIN   = 6;    # the worst coupled GPR read-after-write: what a target may read
 var SM75_SB_SET_WAIT = 2;    # a scoreboard is waited on no sooner than 2 cycles after its set
 var SM75_EXIT_STALL  = 5;    # what ptxas gives EXIT
+var SM75_BSYNC_STALL = 5;    # and BSYNC
 var _S75_NEVER = 0 - 1000000;
 
 fn _s75_class(op): i64 {
     if (op == SM75I_LABEL) { return _S75_C_NONE; }
     if (op == SM75I_BRA) { return _S75_C_CTL; }
     if (op == SM75I_EXIT) { return _S75_C_CTL; }
+    if (op == SM75I_BSYNC) { return _S75_C_CTL; }
+    if (op == SM75I_BCLEAR) { return _S75_C_BAR; }
+    if (op == SM75I_BSSY) { return _S75_C_BAR; }
     if (op == SM75I_ULDC) { return _S75_C_UNI; }
     if (op == SM75I_STG) { return _S75_C_DEC; }
     if (_s75_decoupled(op) == 1) { return _S75_C_DEC; }
@@ -26495,7 +26800,10 @@ fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
     var j = i + 1;
     while (j < n) {
         var opj = sm75i_op(isel, j);
-        if (opj == SM75I_BRA) {
+        var waits_all = 0;
+        if (opj == SM75I_BRA) { waits_all = 1; }
+        if (opj == SM75I_BSYNC) { waits_all = 1; }
+        if (waits_all == 1) {
             if (d < 0) { return 1; }
             return 0;
         }
@@ -26701,6 +27009,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
                 if (dr > minnext) { minnext = dr; }
                 r = r + 1;
             }
+            if (op == SM75I_BSYNC) { if (minnext < t + SM75_BSYNC_STALL) { minnext = t + SM75_BSYNC_STALL; } }
         }
         tprev = t;
         iprev = i;
@@ -26751,19 +27060,28 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
         if (_s75_zero_size(op) == 1) { i = i + 1; continue; }
         var ins = sass + pc;
         var rc = 0;
-        if (op == SM75I_BRA) {
-            var t = sm75i_a(isel, i);
-            if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            var toff = load64(&laboff + t * 8);
-            if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            # offset in 32-bit words from the NEXT instruction
-            rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
-            var bfl = sm75i_flags(isel, i) >> 8;
-            if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
-        } else {
-            rc = _s75_encode(isel, i, alloc, ins);
-        }
+        if (op == SM75I_BSSY) {
+            # the reconvergence point: just after the c-th BSYNC at merge label b
+            var bl = sm75i_b(isel, i);
+            if (bl <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (bl >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            var boff = load64(&laboff + bl * 8);
+            if (boff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            boff = boff + (sm75i_c(isel, i) + 1) * SM75_INS;
+            rc = sm75_enc_bssy(ins, sm75i_a(isel, i) & 15, (boff - (pc + SM75_INS)) / 4);
+        } else { if (op == SM75I_BRA) {
+                var t = sm75i_a(isel, i);
+                if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                var toff = load64(&laboff + t * 8);
+                if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                # offset in 32-bit words from the NEXT instruction
+                rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
+                var bfl = sm75i_flags(isel, i) >> 8;
+                if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
+            } else {
+                rc = _s75_encode(isel, i, alloc, ins);
+            } }
         if (rc < 0) { return rc; }
         var c = load64(&ctl + i * 8);
         sm75_set_ctrl(ins, c & 15, 0, (c >> 4) & 7, (c >> 8) & 7, (c >> 12) & 0x3F, 0);

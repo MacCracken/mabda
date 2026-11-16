@@ -3,7 +3,9 @@
 #   - ranga's six whole-image kernels (the five one-buffer kernels and dissolve,
 #     tests/tcyr/spirv_ranga_kernels.cyr) over a 1024 x 1024 image: memory-bound;
 #   - loop_lcg (tests/spirv/control_flow/loop_lcg.body) on 4096 workgroups of 64 lanes, each
-#     lane 16384 dependent integer multiply-adds: arithmetic-bound, where the schedule shows.
+#     lane 16384 dependent integer multiply-adds: arithmetic-bound, where the schedule shows;
+#   - if_then_lcg: the same loop after a divergent if/else, where reconvergence (BSSY / BSYNC)
+#     decides whether each warp runs the loop once or once per half.
 #
 # It measures the SM75 compiler's output, not the driver: each kernel is compiled once, then
 # dispatched BENCH_WARM times untimed and BENCH_REPS times timed; gpu_compute_dispatch returns
@@ -95,16 +97,17 @@ fn bench_one(ctx, k, src, dst, prm, sp, dp, pp): i64 {
     return 0;
 }
 
-# loop_lcg: a = src (binding 0), o = dst (binding 1); every workgroup works on lanes 0..63.
-fn bench_lcg(ctx, src, dst): i64 {
+# A control-flow kernel by name: a = src (binding 0), o = dst (binding 1); every workgroup works
+# on lanes 0..63.
+fn bench_lcg(ctx, src, dst, name): i64 {
     var spv[1680];
     var k = 0;
     var n = 0;
     while (k < CFK_COUNT) {
-        if (streq(cfk_name(k), "loop_lcg") == 1) { n = cfk_build(k, &spv); }
+        if (streq(cfk_name(k), name) == 1) { n = cfk_build(k, &spv); }
         k = k + 1;
     }
-    if (n == 0) { out("FAIL — no loop_lcg fixture\n"); return 7; }
+    if (n == 0) { out("FAIL — no such fixture\n"); return 7; }
     var m = gpu_shader_module_create_spirv(ctx, &spv, n);
     if (m == 0) { out("FAIL — create_spirv\n"); return 7; }
     var bp[40];
@@ -130,7 +133,7 @@ fn bench_lcg(ctx, src, dst): i64 {
         r = r + 1;
     }
     # 262144 lanes x 4096 iterations x 4 multiply-adds
-    out("  loop_lcg: best "); outn(best / 1000); out(" us, mean "); outn(sum / BENCH_REPS / 1000);
+    out("  "); out(name); out(": best "); outn(best / 1000); out(" us, mean "); outn(sum / BENCH_REPS / 1000);
     out(" us, "); outn(262144 * 16384 / best); out(" G multiply-adds/s\n");
     gpu_shader_module_release(ctx, m);
     return 0;
@@ -166,7 +169,9 @@ fn main(): i64 {
         k = k + 1;
     }
     _fill(sp, 64, 0x2545F491);
-    var lr = bench_lcg(ctx, src, dst);
+    var lr = bench_lcg(ctx, src, dst, "loop_lcg");
+    if (lr != 0) { return lr; }
+    lr = bench_lcg(ctx, src, dst, "if_then_lcg");
     if (lr != 0) { return lr; }
     gpu_buffer_release(ctx, prm);
     gpu_buffer_release(ctx, dst);

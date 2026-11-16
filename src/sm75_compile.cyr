@@ -94,6 +94,8 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
         return sm75_enc_stg32(ins, a, mods & 0x3F, sm75_reg(alloc, sm75i_b(isel, i)), sm75i_c(isel, i));
     }
     if (op == SM75I_EXIT) { return sm75_enc_exit(ins); }
+    if (op == SM75I_BCLEAR) { return sm75_enc_bclear(ins, sm75i_a(isel, i) & 15); }
+    if (op == SM75I_BSYNC) { return sm75_enc_bsync(ins, sm75i_a(isel, i) & 15); }
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
@@ -114,7 +116,8 @@ var _S75_C_ALU  = 1;   # CoupledAlu: IADD3 LOP3 SHF ISETP SEL MOV FMNMX
 var _S75_C_FMA  = 2;   # CoupledFMA and IMADLo (identical rows): FADD FMUL FFMA IMAD IMAD.HI
 var _S75_C_DEC  = 3;   # Decoupled, scoreboarded: S2R LDG STG MUFU I2F F2I FRND
 var _S75_C_UNI  = 4;   # ULDC (the uniform datapath's Uldc)
-var _S75_C_CTL  = 5;   # BRA, EXIT
+var _S75_C_CTL  = 5;   # BRA, EXIT, BSYNC
+var _S75_C_BAR  = 6;   # BMOV.32.CLEAR, BSSY: no register operands; barriers interlock in HW
 
 var SM75_LAT_GUARD   = 12;   # ISETP -> a branch guarded by its predicate (GuardPredicate)
 var SM75_LAT_SEL     = 4;    # ISETP -> SEL reading the predicate (CoupledAlu)
@@ -123,12 +126,16 @@ var SM75_LAT_WAW_DEC = 6;    # a coupled write, then a decoupled write of the sa
 var SM75_LAT_DRAIN   = 6;    # the worst coupled GPR read-after-write: what a target may read
 var SM75_SB_SET_WAIT = 2;    # a scoreboard is waited on no sooner than 2 cycles after its set
 var SM75_EXIT_STALL  = 5;    # what ptxas gives EXIT
+var SM75_BSYNC_STALL = 5;    # and BSYNC
 var _S75_NEVER = 0 - 1000000;
 
 fn _s75_class(op): i64 {
     if (op == SM75I_LABEL) { return _S75_C_NONE; }
     if (op == SM75I_BRA) { return _S75_C_CTL; }
     if (op == SM75I_EXIT) { return _S75_C_CTL; }
+    if (op == SM75I_BSYNC) { return _S75_C_CTL; }
+    if (op == SM75I_BCLEAR) { return _S75_C_BAR; }
+    if (op == SM75I_BSSY) { return _S75_C_BAR; }
     if (op == SM75I_ULDC) { return _S75_C_UNI; }
     if (op == SM75I_STG) { return _S75_C_DEC; }
     if (_s75_decoupled(op) == 1) { return _S75_C_DEC; }
@@ -225,7 +232,10 @@ fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
     var j = i + 1;
     while (j < n) {
         var opj = sm75i_op(isel, j);
-        if (opj == SM75I_BRA) {
+        var waits_all = 0;
+        if (opj == SM75I_BRA) { waits_all = 1; }
+        if (opj == SM75I_BSYNC) { waits_all = 1; }
+        if (waits_all == 1) {
             if (d < 0) { return 1; }
             return 0;
         }
@@ -431,6 +441,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
                 if (dr > minnext) { minnext = dr; }
                 r = r + 1;
             }
+            if (op == SM75I_BSYNC) { if (minnext < t + SM75_BSYNC_STALL) { minnext = t + SM75_BSYNC_STALL; } }
         }
         tprev = t;
         iprev = i;
@@ -481,19 +492,28 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
         if (_s75_zero_size(op) == 1) { i = i + 1; continue; }
         var ins = sass + pc;
         var rc = 0;
-        if (op == SM75I_BRA) {
-            var t = sm75i_a(isel, i);
-            if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            var toff = load64(&laboff + t * 8);
-            if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
-            # offset in 32-bit words from the NEXT instruction
-            rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
-            var bfl = sm75i_flags(isel, i) >> 8;
-            if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
-        } else {
-            rc = _s75_encode(isel, i, alloc, ins);
-        }
+        if (op == SM75I_BSSY) {
+            # the reconvergence point: just after the c-th BSYNC at merge label b
+            var bl = sm75i_b(isel, i);
+            if (bl <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (bl >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            var boff = load64(&laboff + bl * 8);
+            if (boff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            boff = boff + (sm75i_c(isel, i) + 1) * SM75_INS;
+            rc = sm75_enc_bssy(ins, sm75i_a(isel, i) & 15, (boff - (pc + SM75_INS)) / 4);
+        } else { if (op == SM75I_BRA) {
+                var t = sm75i_a(isel, i);
+                if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                var toff = load64(&laboff + t * 8);
+                if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+                # offset in 32-bit words from the NEXT instruction
+                rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
+                var bfl = sm75i_flags(isel, i) >> 8;
+                if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
+            } else {
+                rc = _s75_encode(isel, i, alloc, ins);
+            } }
         if (rc < 0) { return rc; }
         var c = load64(&ctl + i * 8);
         sm75_set_ctrl(ins, c & 15, 0, (c >> 4) & 7, (c >> 8) & 7, (c >> 12) & 0x3F, 0);

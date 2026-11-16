@@ -26,10 +26,11 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   `test-native-ranga-kernels-e2e` checks the same goldens on AMD. The open 4.4.0 items are:
   - N9's follow-ons. Latency-table scheduling is done: `sm75_schedule` is checked by
     `_ck_sched` in `tests/tcyr/sm75_compile.tcyr`, and `make bench-nvidia-compute` measures
-    it. Predicate allocation is done too (P0–P6, `_s75_palloc` in `sm75_isel.cyr`). Next is
-    `BSSY` / `BSYNC`, then SM75 `OpFDiv` / f64. Each
-    needs a hardware check on chew, where `~/mabda-bench-v1` holds the v1-schedule tree for
-    before/after benches.
+    it. Predicate allocation is done too (P0–P6, `_s75_palloc` in `sm75_isel.cyr`), and so is
+    `BSSY` / `BSYNC` reconvergence (`_s75_ropen` / `_s75_rclose`, checked by `_ck_barriers`).
+    Next is SM75 `OpFDiv` / f64. Each
+    needs a hardware check on chew, where `~/mabda-bench-v1` holds a git-archived "before"
+    tree for before/after benches (refresh it from the commit you compare against).
   - NVIDIA block-linear scanout.
   - The surface-acquire leak.
   - The seat-only closeout.

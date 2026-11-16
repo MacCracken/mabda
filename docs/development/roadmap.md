@@ -127,8 +127,11 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     another (CHANGELOG [4.4.0]). There is a per-block table with least-recently-used eviction,
     and the last compare, which CNDMASK reads, is protected. No compare is re-emitted across the
     34 compiled kernels. HW-verified: the 15 gates, ranga's goldens and ranga's four suites.
-  - `BSSY` / `BSYNC` reconvergence hints. v1 omits them, which is correct but lets diverged
-    threads reconverge later than ptxas code would.
+  - ✅ **`BSSY` / `BSYNC` reconvergence** (CHANGELOG [4.4.0]). Closed divergent ifs and loops get
+    a cleared barrier, a BSSY at their head and a BSYNC at their merge. A merge that leads only to
+    the end gets none, which leaves ranga's kernels unchanged. HW-verified on the TU116 with the
+    15 gates, the 27-kernel lane checks, ranga's goldens and suites, and no hangs. A divergent
+    if/else before a long loop runs 1.92× faster: 7144 → 3722 µs.
   - A target-aware lowering for f32 `OpFDiv` (`MUFU.RCP` plus a Newton step) and for f64. Today
     `sm75_isel` refuses both with `SM75_ERR_UNSUPPORTED_OP`, and so does the control-flow suite's
     `loop_phi_f64`.

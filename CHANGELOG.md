@@ -45,9 +45,9 @@ NVIDIA context now compiles SPIR-V in-tree. On the TU116:
 - ranga's 11 kernels match an independent oracle;
 - ranga's four GPU suites pass with an NVIDIA context.
 
-The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. Two have
-landed (below): latency-table scheduling and predicate allocation. `BSSY` / `BSYNC` and SM75
-`OpFDiv` / f64 are open.
+The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. Three have
+landed (below): latency-table scheduling, predicate allocation and `BSSY` / `BSYNC`
+reconvergence. SM75 `OpFDiv` / f64 is open.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -440,6 +440,62 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - `sm75_compile.tcyr` (263 assertions): `test_sm75_schedule_per_predicate`, plus the new
     `if_vcc_clobbered` branch shape.
 
+### Changed — SM75 reconvergence: BSSY / BSYNC (the third N9 follow-on)
+- **What it fixes.** Diverged threads on Turing run each path separately, and without help they
+  stay apart: each group runs the code after the merge on its own. `sm75_isel` now brackets a
+  closed divergent region with `BMOV.32.CLEAR RZ, Bd; BSSY Bd, <after its BSYNC>` at the head and
+  `BSYNC Bd` at the merge. `BSYNC` waits for every thread the BSSY recorded to arrive or exit.
+  The barrier is cleared first because BSSY accumulates into it, as both NAK
+  (`nak_nir_lower_cf.c`) and ptxas do.
+- **Which regions** (`_s75_ropen` / `_s75_rclose`):
+  - **A divergent if.** The merge is its FALSE label, or for an if/else the label the THEN block
+    jumps over the ELSE to.
+  - **A loop with a divergent condition and one exit label.** The BSSY goes just before the
+    header label, so the back-edges skip it.
+  - **Only closed regions.** No branch inside may target a label outside except the merge, and
+    no branch outside may target a label inside or the merge. A thread that left would hang the
+    BSYNC. Anything else, such as a `break` out of an if inside a loop, runs unreconverged there,
+    as before.
+  - **No wasted syncs.** A merge followed only by labels, moves and branches up to the program's
+    end or an enclosing region's merge gets no region (NAK's `parent_scope_will_sync`). ranga's
+    bounds guards are the common case, so ranga's kernels are unchanged.
+  - **Nesting.** The barrier is the nesting depth (B0..B15). Several regions ending at one label
+    each get a BSYNC there, innermost first, and each BSSY targets the instruction after its
+    own.
+- **Encoding.** `sm75_enc_bclear` / `sm75_enc_bssy` / `sm75_enc_bsync` (0x355 / 0x945 / 0x941,
+  barrier at bits 16–19 and 24–27, the BSSY's word offset at 34–63) are pinned against ptxas bytes
+  from a divergent loop compiled on chew (`test_sm75_ptxas_golden_barriers`). The same test adds
+  `ISETP … P1`, which pins predicate allocation's destination field.
+- **Scheduling.** The clear and the BSSY carry no scoreboards, because barriers interlock in
+  hardware (ptxas sets none). BSYNC is scheduled like a branch: it waits on every scoreboard,
+  drains, and stalls at least 5, as ptxas does. A STG before a BSYNC takes a read scoreboard, as
+  before a branch.
+- **Checked.** `_ck_barriers` decodes the SASS and checks that every BSSY directly follows its
+  barrier's clear and targets the instruction right after a later BSYNC on the same barrier. It
+  runs on every control-flow and ranga kernel, and `_ck_sched` treats BSYNC like a branch.
+- **New kernels.**
+  - `if_then_lcg`: a divergent if/else, then the shared 4096-iteration LCG loop.
+  - `if_nest_shared`: nested divergent if/elses with shared code after both merges, so B0 and B1
+    are live together.
+
+  Both are lane-checked on both GPUs. On Cezanne the control-flow gate passes 27 of 27.
+- **Tests.**
+  - `sm75_encode.tcyr` (91 assertions): the barrier goldens.
+  - `sm75_isel.tcyr` (114): which kernels get regions, including the escaping if in
+    `loop_break`, which gets none.
+  - `sm75_compile.tcyr` (314): `test_sm75_bssy_shared_merge` (two regions at one label) and the
+    barrier check on every kernel.
+- **On the TU116** (`build/logs/nvidia-bssy-20261116-152801.log`):
+  - nvdisasm decodes all 36 kernels, and every BSSY targets the instruction after its BSYNC;
+  - all 15 masterless gates pass;
+  - 25 of the 27 control-flow kernels match every lane, with the 2 refusals as expected;
+  - ranga's goldens and four suites pass;
+  - the kernel log shows no hang.
+- **The win** (`make bench-nvidia-compute`). Measured against `516580c` (no BSSY) with the same
+  bench, two alternating passes: `if_then_lcg` takes **3722 µs against 7144 µs, 1.92× faster**.
+  Without reconvergence each half-warp ran the loop on its own; with it, the run matches
+  `loop_lcg`, which has no divergence. Turing does not reconverge a split warp by itself.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -501,9 +557,10 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7472 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7557 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
-  7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
+  predicate allocation). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

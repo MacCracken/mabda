@@ -336,6 +336,61 @@ fn test_sm75_isel_limits() {
     return 0;
 }
 
+# Reconvergence regions (4.4.0, BSSY / BSYNC): which kernels get them.
+#   if_nest_shared — two closed divergent ifs with shared code after each merge: BSSY B0 (outer)
+#     and B1 (inner), each cleared first; BSYNC B1 then B0 later, each right after its merge label.
+#   if_div — its merge leads straight to EXIT: no region (NAK's parent_scope_will_sync).
+#   loop_break — the if inside the loop breaks out (an escape): no region for it; the loop's
+#     own region (one exit label) remains, opened just before its header label.
+#   sel_div_adjacent — no branch at all: none.
+fn test_sm75_isel_reconvergence() {
+    var spv[1680];
+    var out[24576];
+    var hist[256];
+    var n = _cfk("if_nest_shared", &spv);
+    var k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "if_nest_shared selects");
+    assert_eq(_h(&hist, SM75I_BSSY), 2, "two regions");
+    assert_eq(_h(&hist, SM75I_BCLEAR), 2, "each barrier cleared first");
+    assert_eq(_h(&hist, SM75I_BSYNC), 2, "two BSYNCs");
+    var nb = 0;
+    var ns = 0;
+    var i = 0;
+    while (i < k) {
+        var op = sm75i_op(&out, i);
+        if (op == SM75I_BSSY) {
+            assert_eq(sm75i_a(&out, i), nb, "BSSY on the next barrier (outer B0, inner B1)");
+            assert_eq(sm75i_op(&out, i - 1), SM75I_BCLEAR, "its clear right before");
+            assert_eq(sm75i_a(&out, i - 1), nb, "of the same barrier");
+            assert_eq(sm75i_c(&out, i), 0, "the first BSYNC at its merge");
+            nb = nb + 1;
+        }
+        if (op == SM75I_BSYNC) {
+            assert_eq(sm75i_a(&out, i), 1 - ns, "inner B1 syncs first, then outer B0");
+            assert_eq(sm75i_op(&out, i - 1), SM75I_LABEL, "right after a label");
+            ns = ns + 1;
+        }
+        i = i + 1;
+    }
+    n = _cfk("if_div", &spv);
+    k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(_h(&hist, SM75I_BSSY), 0, "if_div: the merge is the end — no region");
+    n = _cfk("loop_break", &spv);
+    k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(_h(&hist, SM75I_BSSY), 1, "loop_break: one region (the loop), not the escaping if");
+    i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_BSSY) {
+            assert_eq(sm75i_op(&out, i + 1), SM75I_LABEL, "opened just before the loop header label");
+        }
+        i = i + 1;
+    }
+    n = _cfk("sel_div_adjacent", &spv);
+    k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(_h(&hist, SM75I_BSSY), 0, "no branch, no region");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_isel_saxpy();
     test_sm75_isel_gid();
@@ -344,6 +399,7 @@ fn main(): i64 {
     test_sm75_isel_operand_rules();
     test_sm75_isel_conditions();
     test_sm75_isel_predicate_eviction();
+    test_sm75_isel_reconvergence();
     test_sm75_isel_udiv_macro();
     test_sm75_isel_limits();
     return assert_summary();

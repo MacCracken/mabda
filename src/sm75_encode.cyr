@@ -58,6 +58,10 @@ var SM75_OP_ULDC   = 0xAB9;
 var SM75_OP_BRA    = 0x947;
 var SM75_OP_EXIT   = 0x94D;
 var SM75_OP_NOP    = 0x918;
+var SM75_OP_BCLEAR = 0x355;   # BMOV.32.CLEAR RZ, Bx (NAK OpBClear)
+var SM75_OP_BSSY   = 0x945;
+var SM75_OP_BSYNC  = 0x941;
+var SM75_NBAR      = 16;      # convergence barrier registers B0..B15
 
 # ISETP / FSETP compare codes (bits 76-78).
 var SM75_CMP_LT = 1;
@@ -441,6 +445,39 @@ fn sm75_enc_stg32(ins, roff, ur, data, imm): i64 {
 fn sm75_enc_bra(ins, rel): i64 {
     _sm75_begin(ins, SM75_OP_BRA);
     sm75_set(ins, 34, 48, rel & 0xFFFFFFFFFFFF);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# ================================================================
+# Convergence barriers (4.4.0: BSSY / BSYNC reconvergence)
+# ================================================================
+# Pinned against ptxas (CUDA 13.4, sm_75) on chew: BMOV.32.CLEAR RZ, B0 / B1; BSSY B0 / B1 with
+# their reconvergence offsets; BSYNC B1 (tests/tcyr/sm75_encode.tcyr).
+
+# BMOV.32.CLEAR RZ, B<bar> — clears the barrier before a BSSY sets it (BSSY accumulates).
+fn sm75_enc_bclear(ins, bar): i64 {
+    _sm75_begin(ins, SM75_OP_BCLEAR);
+    sm75_set(ins, 16, 8, SM75_RZ);
+    sm75_set(ins, 24, 4, bar);
+    sm75_set(ins, 84, 1, 1);          # .CLEAR
+    return 0;
+}
+
+# BSSY B<bar>, <reconvergence point> — `rel` in 32-bit words from the next instruction (as BRA),
+# 30-bit field. The reconvergence point is the instruction after the matching BSYNC.
+fn sm75_enc_bssy(ins, bar, rel): i64 {
+    _sm75_begin(ins, SM75_OP_BSSY);
+    sm75_set(ins, 16, 4, bar);
+    sm75_set(ins, 34, 30, rel & 0x3FFFFFFF);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# BSYNC B<bar> — waits until every thread BSSY recorded in B<bar> arrives here or exits.
+fn sm75_enc_bsync(ins, bar): i64 {
+    _sm75_begin(ins, SM75_OP_BSYNC);
+    sm75_set(ins, 16, 4, bar);
     _sm75_psrc(ins, 87, 90, SM75_PT, 0);
     return 0;
 }

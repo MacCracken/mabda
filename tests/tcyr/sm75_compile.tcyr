@@ -457,6 +457,9 @@ fn _ck_cls(op12): i64 {
     if (op12 == SM75_OP_BRA) { return 0; }
     if (op12 == SM75_OP_EXIT) { return 0; }
     if (op12 == SM75_OP_NOP) { return 0; }
+    if (op12 == SM75_OP_BCLEAR) { return 0; }
+    if (op12 == SM75_OP_BSSY) { return 0; }
+    if (op12 == SM75_OP_BSYNC) { return 0; }
     var base = op12 & 0x1FF;
     if (base == SM75_OP_MUFU) { return 3; }
     if (base == SM75_OP_I2F) { return 3; }
@@ -644,8 +647,11 @@ fn _ck_sched(sass, len): i64 {
                 o2 = o2 + 1;
             }
         }
-        # 6. branches and EXIT
-        if (op12 == SM75_OP_BRA) {
+        # 6. branches (and BSYNC, a reconvergence point) and EXIT
+        var waits_all = 0;
+        if (op12 == SM75_OP_BRA) { waits_all = 1; }
+        if (op12 == SM75_OP_BSYNC) { waits_all = 1; }
+        if (waits_all == 1) {
             var o3 = 0;
             while (o3 < j) {
                 if (load64(&odc + o3 * 8) == 1) {
@@ -717,6 +723,46 @@ fn _ck_sched(sass, len): i64 {
     return bad;
 }
 
+# The reconvergence structure, decoded from the SASS: every BSSY Bx is right after a
+# BMOV.32.CLEAR RZ, Bx, and its target is the instruction right after a BSYNC Bx that comes later
+# in the program. Returns the violations.
+fn _ck_barriers(sass, len): i64 {
+    var bad = 0;
+    var nins = len / 16;
+    var j = 0;
+    while (j < nins) {
+        var ins = sass + j * 16;
+        if (sm75_get(ins, 0, 12) == SM75_OP_BSSY) {
+            var bar = sm75_get(ins, 16, 4);
+            if (j == 0) { bad = bad + _ck_bad(j, "BSSY first"); }
+            if (j > 0) {
+                var pv = sass + (j - 1) * 16;
+                var clr = 0;
+                if (sm75_get(pv, 0, 12) == SM75_OP_BCLEAR) { if (sm75_get(pv, 24, 4) == bar) { clr = 1; } }
+                bad = bad + _ck_need(clr, j, "BSSY without its barrier cleared just before");
+            }
+            var rel = sm75_get(ins, 34, 30);
+            var tgt = (j + 1) * 16 + rel * 4;          # bytes
+            var ok = 0;
+            if (rel > 0) {
+                if (tgt % 16 == 0) {
+                    var ti = tgt / 16 - 1;             # the BSYNC: just before the target
+                    if (ti > j) {
+                        if (ti < nins) {
+                            if (sm75_get(sass + ti * 16, 0, 12) == SM75_OP_BSYNC) {
+                                if (sm75_get(sass + ti * 16, 16, 4) == bar) { ok = 1; }
+                            }
+                        }
+                    }
+                }
+            }
+            bad = bad + _ck_need(ok, j, "BSSY target is not just after a later BSYNC on its barrier");
+        }
+        j = j + 1;
+    }
+    return bad;
+}
+
 # Every control-flow and ranga kernel's schedule passes the independent check, and the check
 # is not vacuous: a shortened stall, a dropped wait and a dropped read scoreboard each fail it.
 fn test_sm75_schedule_checked() {
@@ -728,6 +774,7 @@ fn test_sm75_schedule_checked() {
         var n = cfk_build(k, &spv);
         if (sm75_compile_spirv(&spv, n, &sass, 16384, &desc) == 0) {
             assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, cfk_name(k));
+            assert_eq(_ck_barriers(&sass, load64(&desc + SM75_DESC_LEN)), 0, "its barriers");
         }
         k = k + 1;
     }
@@ -736,6 +783,7 @@ fn test_sm75_schedule_checked() {
         var nr = rk_build(k, &spv);
         assert_eq(sm75_compile_spirv(&spv, nr, &sass, 16384, &desc), 0, "ranga kernel compiles");
         assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, rk_name(k));
+        assert_eq(_ck_barriers(&sass, load64(&desc + SM75_DESC_LEN)), 0, "its barriers");
         k = k + 1;
     }
     # Fault injection on loop_do_while: find its guarded BRA, its ISETP, the first wait.
@@ -901,6 +949,47 @@ fn test_sm75_schedule_per_predicate() {
     return 0;
 }
 
+# Two regions merging at one label (the mechanism _s75_rclose supports): BSYNC the inner one
+# first, then the outer, and point each BSSY just after its own BSYNC — the record's c is its
+# index among the BSYNCs at the label. Checked by decoding the emitted targets.
+fn test_sm75_bssy_shared_merge() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    var isel[960];
+    var fi = MIR_FLAG_A_IMM | MIR_FLAG_B_IMM | MIR_FLAG_C_IMM;
+    _gisel_emit(&isel, 0, SM75I_BCLEAR, 0, 0, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 1, SM75I_BSSY, 0, 0, 9, 1, fi);      # outer: B0, the 2nd BSYNC at L9
+    _gisel_emit(&isel, 2, SM75I_BCLEAR, 0, 1, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 3, SM75I_BSSY, 0, 1, 9, 0, fi);      # inner: B1, the 1st BSYNC at L9
+    _gisel_emit(&isel, 4, SM75I_LABEL, 0, 9, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 5, SM75I_BSYNC, 0, 1, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 6, SM75I_BSYNC, 0, 0, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 7, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 8, &alloc, 512, &hw), 0, "regalloc");
+    var sass[256];
+    assert_eq(sm75_emit(&isel, 8, &alloc, &sass, 256), 128, "emits");
+    # instructions: BCLEAR 0x00, BSSY B0 0x10, BCLEAR 0x20, BSSY B1 0x30, BSYNC B1 0x40,
+    # BSYNC B0 0x50, EXIT 0x60
+    assert_eq(sm75_get(&sass + 16, 0, 12), SM75_OP_BSSY, "BSSY B0 at 0x10");
+    assert_eq(sm75_get(&sass + 16, 34, 30), (0x60 - 0x20) / 4, "targets 0x60, after BSYNC B0");
+    assert_eq(sm75_get(&sass + 48, 34, 30), (0x50 - 0x40) / 4, "BSSY B1 targets 0x50, after BSYNC B1");
+    assert_eq(sm75_get(&sass + 64, 16, 4), 1, "BSYNC B1 first");
+    assert_eq(sm75_get(&sass + 80, 16, 4), 0, "then BSYNC B0");
+    assert_eq(_ck_barriers(&sass, 128), 0, "the independent barrier check agrees");
+    assert_eq(_ck_sched(&sass, 128), 0, "and so does the schedule check");
+    assert_eq(sm75_get(&sass + 64, 105, 4), 5, "BSYNC stalls 5 (as ptxas)");
+    # a BSSY whose merge label is missing is refused like a BRA
+    _gisel_emit(&isel, 1, SM75I_BSSY, 0, 0, 12, 1, fi);
+    assert_eq(sm75_emit(&isel, 8, &alloc, &sass, 256), 0 - SM75_ERR_UNRESOLVED_LABEL, "BSSY to a missing label");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -918,6 +1007,7 @@ fn main(): i64 {
     test_sm75_schedule_numbers();
     test_sm75_schedule_stg_before_branch();
     test_sm75_schedule_per_predicate();
+    test_sm75_bssy_shared_merge();
     return assert_summary();
 }
 

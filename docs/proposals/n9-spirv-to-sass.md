@@ -113,6 +113,25 @@ Reconvergence (`BSSY` / `BSYNC` around divergent regions, as ptxas emits) is not
 correctness of these kernels: there are no warp-synchronous operations, and threads that never
 reconverge still finish. v1 omits it, and each divergent region runs serialized. §7 lists it.
 
+**Reconvergence (4.4.0, the third N9 follow-on): landed.** A closed divergent region gets
+`BMOV.32.CLEAR RZ, Bd; BSSY Bd, <after its BSYNC>` at its head and `BSYNC Bd` at its merge, as
+NAK (`nak_nir_lower_cf.c`) and ptxas emit them.
+- **Regions:** a divergent if, whose merge is its FALSE label or the label the THEN block jumps
+  over the ELSE to; and a loop with a divergent condition and one exit label, opened just before
+  its header so the back-edges skip the BSSY.
+- **Closed:** no branch inside escapes to a label outside except the merge, and no branch
+  outside enters it or targets its merge. A BSYNC waits for every thread its BSSY recorded,
+  arrived or exited ("exited lanes never block a bsync"), so an escaping thread would hang it.
+  Open regions get none, as v1.
+- **Skipped:** a merge followed only by labels, moves and branches up to the end or an enclosing
+  region's merge (NAK's `parent_scope_will_sync`). This is why ranga's bounds guards cost
+  nothing.
+- **Nesting:** barrier = depth, B0..B15.
+
+Measured on the TU116 with `if_then_lcg` (a divergent if/else before a 4096-iteration loop):
+without it each half-warp runs the loop on its own, at 7144 µs, about twice `loop_lcg`; with
+it, 3722 µs. Turing does not reconverge a split warp by itself.
+
 ## 4. Registers
 
 Linear scan over the selected list, one GPR file, with the 4.4.0 rules:
@@ -225,8 +244,8 @@ N9.6 found one bug: SM75 counted only the bindings a kernel reads, where GFX9 co
 bindings it declares. It now counts declared bindings too (CHANGELOG [4.4.0]).
 
 Named for after the done-when. Since N9 closed they are tracked in the roadmap's 4.4.0 section,
-"N9 follow-ons". Two are done: the latency-table scheduling (§5 v2) and predicate allocation (§3,
-"Conditions"). Two are open: `BSSY`/`BSYNC` reconvergence, and a target-aware lowering for
+"N9 follow-ons". Three are done: the latency-table scheduling (§5 v2), predicate allocation (§3,
+"Conditions") and `BSSY`/`BSYNC` reconvergence (§3). One is open: a target-aware lowering for
 `OpFDiv` (`MUFU.RCP` + Newton on SM75) and f64.
 
 ## 8. Risks
