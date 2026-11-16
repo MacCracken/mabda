@@ -1,7 +1,8 @@
 # N9 — SPIR-V→SASS compiler for the NVIDIA backend: a consumer is waiting on it
 
-**Status:** 📋 **OPEN — roadmap request.** N9 has been listed under "Next" since the 4.0.0 CHANGELOG
-("deferrable to v4.1"), but it is not in `docs/development/roadmap.md`.
+**Status:** 📌 **SCHEDULED — mabda v4.4.0** (Phase 3 of the 2026-11 plan; `docs/development/roadmap.md`).
+N9 was listed under "Next" from the 4.0.0 CHANGELOG ("deferrable to v4.1") without a roadmap entry
+until 2026-11-16.
 **Filed:** 2026-11-02, from ranga 2.3.2.
 **Placement:** a new compiler module, the NVIDIA analogue of `src/spirv_lower.cyr` → `src/gfx9_*.cyr`.
 **Severity:** none (feature). It blocks every NVIDIA compute consumer.

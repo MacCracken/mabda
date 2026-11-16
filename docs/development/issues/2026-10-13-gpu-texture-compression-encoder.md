@@ -1,7 +1,8 @@
-# GPU texture compression (BC1–BC7 / ASTC encode) belongs in mabda — roadmap request, not yet scheduled
+# GPU texture compression (BC1–BC7 / ASTC encode) belongs in mabda — scheduled for v4.5.0
 
-**Status:** 📋 **OPEN — roadmap request** (backlog; to be scheduled when a consumer names the formats it
-needs).
+**Status:** 📌 **SCHEDULED — mabda v4.5.0** (Phase 4 of the 2026-11 plan; `docs/development/roadmap.md`):
+KTX2 zstd / zlib supercompression decode first, then a CPU block encoder for the first format a
+consumer names (the user is asked if none has by then).
 **Filed:** 2026-10-13, from sankoch, at the user's decision on sankoch's 2.8.6 roadmap item.
 **Placement:** a new mabda module (texture encode), next to `src/texture_format.cyr`,
 `src/asset_format.cyr` and `src/asset_load.cyr`.
