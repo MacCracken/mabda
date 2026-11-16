@@ -1,0 +1,150 @@
+# tests/tcyr/sm75_encode.tcyr — N9.1: the Turing (SM75) encoder, word for word.
+#
+# Every row is one instruction: the low u64 must match exactly, the high u64 below bit 105
+# (everything except the scheduling word, which the scheduler owns) likewise. Provenance:
+#   ptxas    — CUDA 13.4 `nvcc -arch=sm_75 -cubin`, `cuobjdump -sass`, on chew (TU116),
+#              from a kernel doing exactly that operation (2026-11-16); or the captured
+#              kernels in src/backend_nvidia_sass.cyr (CUDA 13.3).
+#   nvdisasm — ptxas emitted no instruction in that form; mabda's encoding, decoded by
+#              `nvdisasm -b SM75` (CUDA 13.4, chew) to exactly the instruction named.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+var _NC = 0x1FFFFFFFFFF;   # high-word bits 64-104
+
+fn _w(ins, lo, hi, what): i64 {
+    assert_eq(load64(ins), lo, what);
+    assert_eq(load64(ins + 8) & _NC, hi & _NC, what);
+    return 0;
+}
+
+fn test_sm75_field_core() {
+    var ins[16];
+    store64(&ins, 0);
+    store64(&ins + 8, 0);
+    sm75_set(&ins, 60, 8, 0xA5);   # straddles the two u64 halves
+    assert_eq(load64(&ins) >> 60, 0x5, "low nibble lands in bits 60-63");
+    assert_eq(load64(&ins + 8) & 0xF, 0xA, "high nibble lands in bits 64-67");
+    assert_eq(sm75_get(&ins, 60, 8), 0xA5, "sm75_get reads it back across the halves");
+    sm75_set(&ins, 62, 2, 0);
+    assert_eq(sm75_get(&ins, 60, 8), 0xA1, "a narrower set clears only its own bits");
+    sm75_set_ctrl(&ins, 15, 0, 1, 7, 0x3, 0);
+    assert_eq(sm75_get(&ins, 105, 4), 15, "stall at bits 105-108");
+    assert_eq(sm75_get(&ins, 110, 3), 1, "write scoreboard at 110-112");
+    assert_eq(sm75_get(&ins, 116, 6), 3, "wait mask at 116-121");
+    return 0;
+}
+
+fn test_sm75_captured_kernels() {
+    var ins[16];
+    # ptxas (CUDA 13.3), backend_nvidia_sass.cyr store_deadbeef / sample_tex
+    sm75_enc_uldc64(&ins, 4, 0, 0x160);
+    _w(&ins, 0x0000580000047ab9, 0x000fce0000000a00, "ULDC.64 UR4, c[0x0][0x160]");
+    sm75_enc_exit(&ins);
+    _w(&ins, 0x000000000000794d, 0x000fea0003800000, "EXIT");
+    sm75_enc_bra(&ins, 0 - 4);
+    _w(&ins, 0xfffffff000007947, 0x000fc0000383ffff, "BRA to itself (-4 words from the next)");
+    sm75_enc_mov(&ins, 0, 0xdeadbeef, SM75_K_IMM);
+    _w(&ins, 0xdeadbeef00007802, 0x000fe20000000f00, "MOV R0, 0xdeadbeef");
+    sm75_enc_nop(&ins);
+    _w(&ins, 0x0000000000007918, 0x000fc00000000000, "NOP");
+    sm75_enc_imad(&ins, SM75_OP_IMAD, 1, SM75_RZ, SM75_RZ, SM75_K_REG, 0x28, SM75_K_CB, 0);
+    _w(&ins, 0x00000a00ff017624, 0x000fe400078e00ff, "IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28]");
+    sm75_enc_imad(&ins, SM75_OP_IMAD, 2, SM75_RZ, SM75_RZ, SM75_K_REG, 0xc2000000, SM75_K_IMM, 0);
+    _w(&ins, 0xc2000000ff027424, 0x000fe200078e00ff, "IMAD.MOV.U32 R2, RZ, RZ, -0x3e000000");
+    # The captured STG addresses through a 64-bit RZ (bit 90 set); mabda's form uses a 32-bit
+    # offset register, so set the bit to compare against the capture.
+    sm75_enc_stg32(&ins, SM75_RZ, 4, 0, 0);
+    sm75_set(&ins, 90, 1, 1);
+    _w(&ins, 0x00000000ff007986, 0x000fe2000c114904, "STG.E.STRONG.GPU [UR4], R0");
+    return 0;
+}
+
+fn test_sm75_ptxas_golden() {
+    var ins[16];
+    # ptxas (CUDA 13.4, chew): tests/../docs/proposals/n9-spirv-to-sass.md §6 gold.cu
+    sm75_enc_s2r(&ins, 6, SM75_SR_CTAID_X);
+    _w(&ins, 0x0000000000067919, 0x000e220000002500, "S2R R6, SR_CTAID.X");
+    sm75_enc_s2r(&ins, 3, SM75_SR_TID_X);
+    _w(&ins, 0x0000000000037919, 0x000e240000002100, "S2R R3, SR_TID.X");
+    sm75_enc_imad(&ins, SM75_OP_IMAD, 6, 6, 0x100, SM75_K_IMM, 3, SM75_K_REG, 1);
+    _w(&ins, 0x0000010006067824, 0x001fc800078e0203, "IMAD R6, R6, 0x100, R3");
+    sm75_enc_f2i(&ins, 13, 0, SM75_K_REG, 1, SM75_RND_RZ);
+    _w(&ins, 0x00000000000d7305, 0x004e22000020f100, "F2I.TRUNC.NTZ R13, R0");
+    sm75_enc_i2f(&ins, 17, 10, SM75_K_REG, 0);
+    _w(&ins, 0x0000000a00117306, 0x000ea20000201000, "I2F.U32 R17, R10");
+    sm75_enc_isetp(&ins, 0, 10, 9, SM75_K_REG, SM75_CMP_GT, 0);
+    _w(&ins, 0x000000090a00720c, 0x090fe40003f04070, "ISETP.GT.U32.AND P0, PT, R10, R9, PT");
+    sm75_enc_shf(&ins, 12, SM75_RZ, 9, SM75_K_REG, 10, 3, 1, 1);
+    _w(&ins, 0x00000009ff0c7219, 0x000fca0000011e0a, "SHF.R.W.U32.HI R12, RZ, R9, R10");
+    sm75_enc_frnd(&ins, 19, 0, SM75_K_REG, SM75_RND_RM);
+    _w(&ins, 0x0000000000137307, 0x000ee20000205000, "FRND.FLOOR R19, R0");
+    sm75_enc_sel(&ins, 5, 10, 0x6f, SM75_K_IMM, 0, 0);
+    _w(&ins, 0x0000006f0a057807, 0x002fe40000000000, "SEL R5, R10, 0x6f, P0");
+    sm75_enc_lop3(&ins, 15, 12, 15, SM75_K_REG, SM75_RZ, SM75_K_REG, 0xfc);
+    _w(&ins, 0x0000000f0c0f7212, 0x000fe400078efcff, "LOP3.LUT R15, R12, R15, RZ, 0xfc, !PT");
+    sm75_enc_lop3(&ins, 4, 4, 0x7f800000, SM75_K_IMM, SM75_RZ, SM75_K_REG, 0xc0);
+    _w(&ins, 0x7f80000004047812, 0x000fc600078ec0ff, "LOP3.LUT R4, R4, 0x7f800000, RZ, 0xc0, !PT");
+    sm75_enc_fmnmx(&ins, 21, 0, 11, SM75_K_REG, 0);
+    _w(&ins, 0x0000000b00157209, 0x020fe20003800000, "FMNMX R21, R0, R11, PT");
+    sm75_enc_mufu(&ins, 4, 11, SM75_K_REG, SM75_MUFU_RCP);
+    _w(&ins, 0x0000000b00047308, 0x001e240000001000, "MUFU.RCP R4, R11");
+    sm75_enc_ffma(&ins, 5, 11, 4, SM75_K_REG, 0xbf800000, SM75_K_IMM);
+    _w(&ins, 0xbf8000000b057423, 0x001fc80000000004, "FFMA R5, R11, R4, -1");
+    sm75_enc_ffma(&ins, 5, 4, 5, SM75_K_REG, 4, SM75_K_REG);
+    _w(&ins, 0x0000000504057223, 0x000fc60000000004, "FFMA R5, R4, R5, R4");
+    sm75_enc_fmul(&ins, 5, 0, 5, SM75_K_REG);
+    _w(&ins, 0x0000000500057220, 0x000fd00000400000, "FMUL R5, R0, R5");
+    sm75_enc_iadd3(&ins, 4, 11, 0x1800000, SM75_K_IMM, SM75_RZ, SM75_K_REG, 0);
+    _w(&ins, 0x018000000b047810, 0x000fc60007ffe0ff, "IADD3 R4, R11, 0x1800000, RZ");
+    sm75_enc_isetp(&ins, 0, 4, 0x1ffffff, SM75_K_IMM, SM75_CMP_GT, 0);
+    _w(&ins, 0x01ffffff0400780c, 0x000fd80003f04070, "ISETP.GT.U32.AND P0, PT, R4, 0x1ffffff, PT");
+    sm75_enc_bra(&ins, 16);
+    sm75_set_guard(&ins, 0, 0);
+    _w(&ins, 0x0000004000000947, 0x000fea0003800000, "@P0 BRA +0x40 bytes");
+    return 0;
+}
+
+# Forms ptxas did not emit for gold.cu; nvdisasm decodes each to the instruction named.
+fn test_sm75_nvdisasm_confirmed() {
+    var ins[16];
+    sm75_enc_iadd3(&ins, 2, 0, 3, SM75_K_REG, SM75_RZ, SM75_K_REG, 1);
+    assert_eq(load64(&ins), 0x8000000300027210, "IADD3 R2, R0, -R3, RZ (low; bit 63 = -src1)");
+    assert_eq(sm75_get(&ins, 63, 1), 1, "IADD3 SUB: src1 negate bit 63");
+    sm75_enc_imad(&ins, SM75_OP_IMADHI, 2, 3, 5, SM75_K_REG, SM75_RZ, SM75_K_REG, 0);
+    assert_eq(sm75_get(&ins, 0, 9), 0x027, "IMAD.HI.U32 opcode 0x027");
+    assert_eq(sm75_get(&ins, 73, 1), 0, "IMAD.HI.U32 unsigned");
+    sm75_enc_shf(&ins, 2, 0, 8, SM75_K_IMM, SM75_RZ, 3, 0, 0);
+    assert_eq(sm75_get(&ins, 75, 1), 0, "SHF.L.U32 R2, R0, 0x8, RZ: an immediate shift has no .W");
+    assert_eq(sm75_get(&ins, 76, 1), 0, "SHF.L: left");
+    sm75_enc_ldg32(&ins, 2, 0, 4, 0);
+    assert_eq(sm75_get(&ins, 0, 12), SM75_OP_LDG, "LDG.E.STRONG.GPU R2, [R0.U32+UR4]");
+    assert_eq(sm75_get(&ins, 64, 3), 0, "LDG's reversed predicate: PT encodes as 0");
+    assert_eq(sm75_get(&ins, 90, 1), 0, "a 32-bit offset register (.U32)");
+    assert_eq(sm75_get(&ins, 91, 1), 1, "uniform-register addressing");
+    assert_eq(sm75_get(&ins, 77, 4), 0xA, "scope GPU (2) + order STRONG (2): never .SYS");
+    sm75_enc_stg32(&ins, 0, 6, 2, 0);
+    assert_eq(sm75_get(&ins, 64, 6), 6, "STG.E.STRONG.GPU [R0.U32+UR6], R2: UR6");
+    assert_eq(sm75_get(&ins, 32, 8), 2, "STG data R2");
+    sm75_enc_fadd(&ins, 2, 0, 0x3f800000, SM75_K_IMM, 0);
+    assert_eq(sm75_get(&ins, 9, 3), 2, "FADD R2, R0, 1: an immediate sits in src2 (form 2)");
+    assert_eq(sm75_get(&ins, 64, 8), SM75_RZ, "with RZ in the src2 register slot");
+    sm75_enc_fmnmx(&ins, 2, 0, 0x437f0000, SM75_K_IMM, 1);
+    assert_eq(sm75_get(&ins, 90, 1), 1, "FMNMX R2, R0, 255, !PT: max");
+    sm75_enc_bra(&ins, 8);
+    sm75_set_guard(&ins, 0, 1);
+    assert_eq(sm75_get(&ins, 12, 4), 8, "@!P0: guard P0 (bits 12-14) negated (bit 15)");
+    assert_eq(sm75_get(&ins, 34, 48), 8, "BRA +8 words");
+    return 0;
+}
+
+fn main(): i64 {
+    test_sm75_field_core();
+    test_sm75_captured_kernels();
+    test_sm75_ptxas_golden();
+    test_sm75_nvdisasm_confirmed();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);

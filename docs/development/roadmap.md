@@ -95,7 +95,11 @@ accidentally couples to it.
 
 Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the roadmap.
 
-- **N9: SPIR-V → SASS for the NVIDIA backend** (`issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`;
+- 🔨 **N9: SPIR-V → SASS for the NVIDIA backend**, in progress. The design note is
+  [`../proposals/n9-spirv-to-sass.md`](../proposals/n9-spirv-to-sass.md), whose §7 lists the bites.
+  **N9.1 (the encoder) has landed**, pinned against ptxas and `nvdisasm` on `chew`. N9.2–N9.6 are
+  open. ranga's 11 kernels at HEAD need less than the issue lists: no `OpFDiv`, `OpSelect` or
+  `FClamp`. (`issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`;
   ranga's NVIDIA compute waits on it). The NVIDIA backend takes only pre-captured SASS; a portable
   consumer ships SPIR-V. The compiler is the analogue of `spirv_lower` → `gfx9_*`: the SPIR-V
   parse and the MIR are reused; new for SM75 are instruction selection, register allocation,

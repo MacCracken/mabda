@@ -24989,6 +24989,468 @@ fn native_nv_sass_add_one2(dst): i64 {
     return NV_SASS_ADD_ONE2_BYTES;
 }
 
+# --- sm75_encode.cyr ---
+
+# @internal — N9: Turing (SM75) instruction encoder for the SPIR-V → SASS compiler.
+# sm75_encode.cyr — the gfx9_encode.cyr analogue for NVIDIA. Builds one 128-bit
+# instruction at a time into a caller buffer (16 bytes, little-endian, two u64 in
+# memory order [low, high] — the layout the captured kernels in
+# backend_nvidia_sass.cyr use). Pure bit math; no syscalls.
+#
+# PROVENANCE. NVIDIA publishes no ISA document. Field positions come from Mesa's NAK
+# encoder (src/nouveau/compiler/nak/sm70_encode.rs, Mesa 6aa7eaf09fc1, MIT) — used as a
+# reference for facts, not copied. Every encoder here is pinned dword-for-dword in
+# tests/tcyr/sm75_encode.tcyr against bytes `nvdisasm -b SM75` (CUDA 13.4, on chew)
+# decodes to the intended instruction; docs/proposals/n9-spirv-to-sass.md §6.
+#
+# THE WORD (bit ranges, low inclusive):
+#   0-8 opcode, 9-11 operand form, 12-14 guard predicate, 15 guard negate,
+#   16-23 dst GPR, 24-31 src0 GPR, 32-39 src1 GPR | 32-63 imm32 | 32-58 c[bank][off]
+#   (offset 38-53, bank 54-58), 64-71 src2 GPR, 72+ per-op modifiers,
+#   105-108 stall, 109 yield, 110-112 write scoreboard, 113-115 read scoreboard
+#   (7 = none), 116-121 scoreboard wait mask, 122-125 operand reuse.
+# Operand forms (bits 9-11): 1 src1 reg / 4 src1 imm32 / 5 src1 c[] (src2 a reg or
+# absent); 2 src2 imm32 / 3 src2 c[] (src1 then moves to the src2 register slot).
+#
+# Registers: GPR 0..254, SM75_RZ = 255. Predicates 0..6, SM75_PT = 7. Uniform GPRs
+# 0..62, SM75_URZ = 63.
+
+var SM75_INS   = 16;    # bytes per instruction
+var SM75_RZ    = 255;
+var SM75_PT    = 7;
+var SM75_URZ   = 63;
+
+# Operand kinds for the ALU form selection.
+var SM75_K_REG = 0;
+var SM75_K_IMM = 1;
+var SM75_K_CB  = 2;     # value = (bank << 16) | byte offset
+var SM75_K_NONE = 3;    # an absent src2: its field stays 0 (NAK leaves it unset)
+
+# Opcodes (bits 0-8 for ALU ops; 0-11 for the fixed-form ones).
+var SM75_OP_FMUL   = 0x020;
+var SM75_OP_FADD   = 0x021;
+var SM75_OP_FFMA   = 0x023;
+var SM75_OP_FMNMX  = 0x009;
+var SM75_OP_IADD3  = 0x010;
+var SM75_OP_LOP3   = 0x012;
+var SM75_OP_SHF    = 0x019;
+var SM75_OP_IMAD   = 0x024;
+var SM75_OP_IMADW  = 0x025;   # IMAD.WIDE
+var SM75_OP_IMADHI = 0x027;   # IMAD.HI (ptxas mul.hi.u32; not in NAK — pinned by nvdisasm)
+var SM75_OP_ISETP  = 0x00C;
+var SM75_OP_SEL    = 0x007;
+var SM75_OP_MOV    = 0x002;
+var SM75_OP_F2I    = 0x105;
+var SM75_OP_I2F    = 0x106;
+var SM75_OP_FRND   = 0x107;
+var SM75_OP_MUFU   = 0x108;
+var SM75_OP_S2R    = 0x919;
+var SM75_OP_LDG    = 0x981;
+var SM75_OP_STG    = 0x986;
+var SM75_OP_ULDC   = 0xAB9;
+var SM75_OP_BRA    = 0x947;
+var SM75_OP_EXIT   = 0x94D;
+var SM75_OP_NOP    = 0x918;
+
+# ISETP / FSETP compare codes (bits 76-78).
+var SM75_CMP_LT = 1;
+var SM75_CMP_EQ = 2;
+var SM75_CMP_LE = 3;
+var SM75_CMP_GT = 4;
+var SM75_CMP_NE = 5;
+var SM75_CMP_GE = 6;
+
+# Rounding modes (FRND / F2I / I2F bits 78-79).
+var SM75_RND_RN = 0;
+var SM75_RND_RM = 1;   # toward -inf (FLOOR)
+var SM75_RND_RP = 2;
+var SM75_RND_RZ = 3;   # toward zero (TRUNC)
+
+# MUFU functions (bits 74-79).
+var SM75_MUFU_RCP = 4;
+
+# Special registers for S2R (bits 72-79).
+var SM75_SR_TID_X   = 0x21;
+var SM75_SR_TID_Y   = 0x22;
+var SM75_SR_TID_Z   = 0x23;
+var SM75_SR_CTAID_X = 0x25;
+var SM75_SR_CTAID_Y = 0x26;
+var SM75_SR_CTAID_Z = 0x27;
+
+# ================================================================
+# Bit-field core
+# ================================================================
+# Set bits [lo, lo + width) of the 128-bit word at `ins` to the low `width` bits of
+# `val`. Bit-at-a-time: compile-time only, and it crosses the 64-bit halves (the BRA
+# offset spans bits 34-81) without a special case. Cyrius `>>` is logical.
+fn sm75_set(ins, lo, width, val): i64 {
+    var i = 0;
+    while (i < width) {
+        var bit = lo + i;
+        var w = ins + (bit / 64) * 8;
+        var b = bit % 64;
+        var m = 1 << b;
+        var cur = load64(w);
+        if (((val >> i) & 1) == 1) { cur = cur | m; } else { cur = cur & ((0 - 1) ^ m); }
+        store64(w, cur);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn sm75_get(ins, lo, width): i64 {
+    var v = 0;
+    var i = 0;
+    while (i < width) {
+        var bit = lo + i;
+        var b = bit % 64;
+        if (((load64(ins + (bit / 64) * 8) >> b) & 1) == 1) { v = v | (1 << i); }
+        i = i + 1;
+    }
+    return v;
+}
+
+# Start an instruction: zero it, set the opcode (12 bits), guard @PT, and the
+# no-scoreboard control defaults (write / read scoreboard 7). An operand an op does not
+# have stays 0 — NAK leaves it unset, and the captured EXIT / STG words agree. Stall /
+# yield / wait are the scheduler's (sm75_set_ctrl).
+fn _sm75_begin(ins, opcode): i64 {
+    store64(ins, 0);
+    store64(ins + 8, 0);
+    sm75_set(ins, 0, 12, opcode);
+    sm75_set(ins, 12, 3, SM75_PT);
+    sm75_set(ins, 110, 3, 7);
+    sm75_set(ins, 113, 3, 7);
+    return 0;
+}
+
+# Guard predicate: @P / @!P.
+fn sm75_set_guard(ins, p, neg): i64 {
+    sm75_set(ins, 12, 3, p);
+    sm75_set(ins, 15, 1, neg);
+    return 0;
+}
+
+# The scheduling word: stall cycles (0-15), yield, write / read scoreboard (0-5, 7 =
+# none), wait mask (bit i = wait on scoreboard i), operand reuse.
+fn sm75_set_ctrl(ins, stall, yld, wrbar, rdbar, wait, reuse): i64 {
+    sm75_set(ins, 105, 4, stall);
+    sm75_set(ins, 109, 1, yld);
+    sm75_set(ins, 110, 3, wrbar);
+    sm75_set(ins, 113, 3, rdbar);
+    sm75_set(ins, 116, 6, wait);
+    sm75_set(ins, 122, 4, reuse);
+    return 0;
+}
+
+# A predicate source field (3-bit register + a NOT bit).
+fn _sm75_psrc(ins, lo, notbit, p, neg): i64 {
+    sm75_set(ins, lo, 3, p);
+    sm75_set(ins, notbit, 1, neg);
+    return 0;
+}
+
+# The src1 / src2 operand of an ALU op in one of the three kinds, at the slot NAK's
+# encode_alu_base picks, plus the form bits. `b` is the second source, `c` the third
+# (SM75_RZ + SM75_K_REG when absent). Returns 0, or -1 for a combination the
+# hardware has no form for (two non-register sources).
+fn _sm75_alu_srcs(ins, b, bk, c, ck): i64 {
+    var form = 1;
+    var c_slot = 0;
+    if (ck == SM75_K_REG) { c_slot = 1; }
+    if (ck == SM75_K_NONE) { c_slot = 1; }
+    if (c_slot == 1) {
+        if (ck == SM75_K_REG) { sm75_set(ins, 64, 8, c); }
+        if (bk == SM75_K_REG) { sm75_set(ins, 32, 8, b); form = 1; }
+        if (bk == SM75_K_IMM) { sm75_set(ins, 32, 32, b); form = 4; }
+        if (bk == SM75_K_CB) {
+            sm75_set(ins, 38, 16, b & 0xFFFF);
+            sm75_set(ins, 54, 5, (b >> 16) & 0x1F);
+            form = 5;
+        }
+    } else {
+        if (bk != SM75_K_REG) { return 0 - 1; }
+        sm75_set(ins, 64, 8, b);
+        if (ck == SM75_K_IMM) { sm75_set(ins, 32, 32, c); form = 2; }
+        if (ck == SM75_K_CB) {
+            sm75_set(ins, 38, 16, c & 0xFFFF);
+            sm75_set(ins, 54, 5, (c >> 16) & 0x1F);
+            form = 3;
+        }
+    }
+    sm75_set(ins, 9, 3, form);
+    return 0;
+}
+
+# An ALU instruction: dst, src0 (register), src1 / src2 of any kind.
+fn _sm75_alu(ins, opcode, d, a, b, bk, c, ck): i64 {
+    _sm75_begin(ins, opcode);
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 24, 8, a);
+    return _sm75_alu_srcs(ins, b, bk, c, ck);
+}
+
+# ================================================================
+# Integer
+# ================================================================
+# IADD3 d, a, b, c — d = a + b + c. `negb` / `negc` negate b / c (registers only), which
+# is how SUB is spelled. Carry-out predicates are PT (none); carry-in !PT (none).
+fn sm75_enc_iadd3(ins, d, a, b, bk, c, ck, negb): i64 {
+    var r = _sm75_alu(ins, SM75_OP_IADD3, d, a, b, bk, c, ck);
+    if (r < 0) { return r; }
+    if (negb == 1) { sm75_set(ins, 63, 1, 1); }
+    _sm75_psrc(ins, 87, 90, SM75_PT, 1);
+    _sm75_psrc(ins, 77, 80, SM75_PT, 1);
+    sm75_set(ins, 81, 3, SM75_PT);
+    sm75_set(ins, 84, 3, SM75_PT);
+    return 0;
+}
+
+# IMAD d, a, b, c — d = a * b + c (low 32). IMAD.HI / IMAD.WIDE pick the op with `op`.
+# `signed` = 1 is the plain `IMAD` ptxas emits for a u32 multiply (the low 32 bits do not
+# depend on it); 0 prints `.U32`, which IMAD.HI.U32 needs.
+fn sm75_enc_imad(ins, op, d, a, b, bk, c, ck, signed): i64 {
+    var r = _sm75_alu(ins, op, d, a, b, bk, c, ck);
+    if (r < 0) { return r; }
+    sm75_set(ins, 81, 3, SM75_PT);
+    sm75_set(ins, 73, 1, signed);
+    # carry-in predicate !PT (none) — absent from NAK's encoder, present in every ptxas IMAD
+    # (sample_tex's IMAD.MOV.U32 words in backend_nvidia_sass.cyr)
+    _sm75_psrc(ins, 87, 90, SM75_PT, 1);
+    return 0;
+}
+
+# LOP3.LUT d, a, b, c, lut — the bitwise op given as a 3-input truth table
+# (a = 0xF0, b = 0xCC, c = 0xAA: AND 0xC0, OR 0xFC, XOR 0x3C with c = RZ).
+fn sm75_enc_lop3(ins, d, a, b, bk, c, ck, lut): i64 {
+    var r = _sm75_alu(ins, SM75_OP_LOP3, d, a, b, bk, c, ck);
+    if (r < 0) { return r; }
+    sm75_set(ins, 72, 8, lut);
+    sm75_set(ins, 81, 3, SM75_PT);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 1);
+    return 0;
+}
+
+# SHF d, lo, shift, hi — funnel shift of {hi:lo}. `type`: 2 = S32, 3 = U32.
+# SHL = SHF.L.U32 d, a, s, RZ. SHR = SHF.R.U32.HI d, RZ, s, a. ASHR = SHF.R.S32.HI.
+#
+# A REGISTER shift amount gets .W (wrap: shift mod 32), as ptxas emits for `x >> (y & 31)`
+# and as GFX9's v_lshrrev masks, so an out-of-range SPIR-V shift agrees across vendors.
+fn sm75_enc_shf(ins, d, lo, s, sk, hi, type, right, dhigh): i64 {
+    var r = _sm75_alu(ins, SM75_OP_SHF, d, lo, s, sk, hi, SM75_K_REG);
+    if (r < 0) { return r; }
+    if (sk == SM75_K_REG) { sm75_set(ins, 75, 1, 1); }
+    sm75_set(ins, 73, 2, type);
+    sm75_set(ins, 76, 1, right);
+    sm75_set(ins, 80, 1, dhigh);
+    return 0;
+}
+
+# ISETP.<cmp>.<U32|I32>.AND pd, PT, a, b, PT
+fn sm75_enc_isetp(ins, pd, a, b, bk, cmp, signed): i64 {
+    _sm75_begin(ins, SM75_OP_ISETP);
+    sm75_set(ins, 24, 8, a);
+    var r = _sm75_alu_srcs(ins, b, bk, 0, SM75_K_NONE);
+    if (r < 0) { return r; }
+    _sm75_psrc(ins, 68, 71, SM75_PT, 0);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    sm75_set(ins, 73, 1, signed);
+    sm75_set(ins, 74, 2, 0);          # .AND
+    sm75_set(ins, 76, 3, cmp);
+    sm75_set(ins, 81, 3, pd);
+    sm75_set(ins, 84, 3, SM75_PT);
+    return 0;
+}
+
+# SEL d, a, b, [!]p — d = p ? a : b.
+fn sm75_enc_sel(ins, d, a, b, bk, p, pneg): i64 {
+    var r = _sm75_alu(ins, SM75_OP_SEL, d, a, b, bk, 0, SM75_K_NONE);
+    if (r < 0) { return r; }
+    _sm75_psrc(ins, 87, 90, p, pneg);
+    return 0;
+}
+
+# MOV d, src (register, imm32 or c[]). Quad-lane mask 0xF.
+fn sm75_enc_mov(ins, d, s, sk): i64 {
+    var r = _sm75_alu(ins, SM75_OP_MOV, d, 0, s, sk, 0, SM75_K_NONE);
+    if (r < 0) { return r; }
+    sm75_set(ins, 72, 4, 0xF);
+    return 0;
+}
+
+# ================================================================
+# Float
+# ================================================================
+# FADD d, a, b — b of any kind; a register / c[] b sits in src1, an immediate in src2
+# (NAK's rule). `negb` negates a register b (SUB); negate an immediate in its bits.
+fn sm75_enc_fadd(ins, d, a, b, bk, negb): i64 {
+    var r = 0;
+    if (bk == SM75_K_REG) {
+        r = _sm75_alu(ins, SM75_OP_FADD, d, a, b, bk, 0, SM75_K_NONE);
+        if (negb == 1) { sm75_set(ins, 63, 1, 1); }
+    } else {
+        r = _sm75_alu(ins, SM75_OP_FADD, d, a, SM75_RZ, SM75_K_REG, b, bk);
+    }
+    return r;
+}
+
+# FMUL d, a, b (PDIV field 84-86 = 4, none). src2 stays 0: ptxas leaves it unset (NAK
+# writes RZ there; the golden FMUL R5, R0, R5 in tests/tcyr/sm75_encode.tcyr has 0).
+fn sm75_enc_fmul(ins, d, a, b, bk): i64 {
+    var r = _sm75_alu(ins, SM75_OP_FMUL, d, a, b, bk, 0, SM75_K_NONE);
+    if (r < 0) { return r; }
+    sm75_set(ins, 84, 3, 4);
+    return 0;
+}
+
+# FFMA d, a, b, c
+fn sm75_enc_ffma(ins, d, a, b, bk, c, ck): i64 {
+    return _sm75_alu(ins, SM75_OP_FFMA, d, a, b, bk, c, ck);
+}
+
+# FMNMX d, a, b, [!]PT — min with PT, max with !PT.
+fn sm75_enc_fmnmx(ins, d, a, b, bk, is_max): i64 {
+    var r = _sm75_alu(ins, SM75_OP_FMNMX, d, a, b, bk, 0, SM75_K_NONE);
+    if (r < 0) { return r; }
+    _sm75_psrc(ins, 87, 90, SM75_PT, is_max);
+    return 0;
+}
+
+# The single-source conversions read their operand from the src1 slot (src0 = 0).
+fn _sm75_unary(ins, opcode, d, s, sk): i64 {
+    _sm75_begin(ins, opcode);
+    sm75_set(ins, 16, 8, d);
+    return _sm75_alu_srcs(ins, s, sk, 0, SM75_K_NONE);
+}
+
+# FRND.<rnd> d, s (32-bit).
+fn sm75_enc_frnd(ins, d, s, sk, rnd): i64 {
+    var r = _sm75_unary(ins, SM75_OP_FRND, d, s, sk);
+    if (r < 0) { return r; }
+    sm75_set(ins, 75, 2, 2);          # dst 32-bit
+    sm75_set(ins, 78, 2, rnd);
+    sm75_set(ins, 84, 2, 2);          # src 32-bit
+    return 0;
+}
+
+# F2I.<rnd> d, s — f32 -> 32-bit integer, signed or unsigned.
+fn sm75_enc_f2i(ins, d, s, sk, signed, rnd): i64 {
+    var r = _sm75_unary(ins, SM75_OP_F2I, d, s, sk);
+    if (r < 0) { return r; }
+    sm75_set(ins, 72, 1, signed);
+    sm75_set(ins, 75, 2, 2);
+    sm75_set(ins, 77, 1, 1);          # .NTZ, as ptxas emits for cvt.rzi (NAK leaves it clear)
+    sm75_set(ins, 78, 2, rnd);
+    sm75_set(ins, 84, 2, 2);
+    return 0;
+}
+
+# I2F d, s — 32-bit integer (signed or unsigned) -> f32, round to nearest even.
+fn sm75_enc_i2f(ins, d, s, sk, signed): i64 {
+    var r = _sm75_unary(ins, SM75_OP_I2F, d, s, sk);
+    if (r < 0) { return r; }
+    sm75_set(ins, 74, 1, signed);
+    sm75_set(ins, 75, 2, 2);
+    sm75_set(ins, 78, 2, SM75_RND_RN);
+    sm75_set(ins, 84, 2, 2);
+    return 0;
+}
+
+# MUFU.<fn> d, s (f32).
+fn sm75_enc_mufu(ins, d, s, sk, fnc): i64 {
+    var r = _sm75_unary(ins, SM75_OP_MUFU, d, s, sk);
+    if (r < 0) { return r; }
+    sm75_set(ins, 74, 6, fnc);
+    return 0;
+}
+
+# ================================================================
+# Special registers, constants, memory
+# ================================================================
+# S2R d, SR_<sr>
+fn sm75_enc_s2r(ins, d, sr): i64 {
+    _sm75_begin(ins, SM75_OP_S2R);
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 72, 8, sr);
+    return 0;
+}
+
+# ULDC.64 UR<ur>, c[bank][off] — a 64-bit binding pointer into a uniform pair. Pinned
+# against the captured `ULDC.64 UR4, c[0x0][0x160]` (backend_nvidia_sass.cyr).
+fn sm75_enc_uldc64(ins, ur, bank, off): i64 {
+    _sm75_begin(ins, SM75_OP_ULDC);
+    sm75_set(ins, 16, 6, ur);
+    sm75_set(ins, 38, 16, off);
+    sm75_set(ins, 54, 5, bank);
+    sm75_set(ins, 73, 3, 5);          # .64
+    return 0;
+}
+
+# The global-memory access fields: 32-bit data, .STRONG.GPU (never .SYS: a system-scope
+# access to a GART buffer hangs — backend_nvidia_sass.cyr), normal eviction, a 64-bit
+# uniform base, and the 32-bit register offset (bit 90 clear: [R.U32 + UR]).
+fn _sm75_mem32(ins): i64 {
+    sm75_set(ins, 73, 3, 4);          # B32
+    sm75_set(ins, 77, 2, 2);          # scope GPU
+    sm75_set(ins, 79, 2, 2);          # order STRONG
+    sm75_set(ins, 84, 3, 1);          # eviction normal
+    sm75_set(ins, 72, 1, 1);          # uniform base is 64-bit
+    sm75_set(ins, 90, 1, 0);          # register offset is 32-bit
+    sm75_set(ins, 91, 1, 1);          # uniform-register addressing
+    return 0;
+}
+
+# LDG.E.STRONG.GPU d, [roff.U32 + UR<ur> + imm24]
+fn sm75_enc_ldg32(ins, d, roff, ur, imm): i64 {
+    _sm75_begin(ins, SM75_OP_LDG);
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 24, 8, roff);
+    sm75_set(ins, 32, 6, ur);
+    sm75_set(ins, 40, 24, imm);
+    sm75_set(ins, 81, 3, SM75_PT);
+    # the load's predicate is encoded REVERSED (field = 7 - P; NAK set_rev_pred_src), so PT
+    # is 0 here — a 7 decodes as P0 (nvdisasm showed `[R0.U32+UR4], P0`)
+    _sm75_psrc(ins, 64, 67, 0, 0);
+    return _sm75_mem32(ins);
+}
+
+# STG.E.STRONG.GPU [roff.U32 + UR<ur> + imm24], data
+fn sm75_enc_stg32(ins, roff, ur, data, imm): i64 {
+    _sm75_begin(ins, SM75_OP_STG);
+    sm75_set(ins, 24, 8, roff);
+    sm75_set(ins, 32, 8, data);
+    sm75_set(ins, 40, 24, imm);
+    sm75_set(ins, 64, 6, ur);
+    return _sm75_mem32(ins);
+}
+
+# ================================================================
+# Control
+# ================================================================
+# BRA <rel> — `rel` in 32-bit words from the NEXT instruction (NAK get_rel_offset:
+# target - ip - 4 words), 48-bit signed field at bits 34-81. The branch condition field
+# is PT; predicate a branch with sm75_set_guard. Pinned by the captured `BRA 0x50`
+# self-loop (rel = -4) in backend_nvidia_sass.cyr.
+fn sm75_enc_bra(ins, rel): i64 {
+    _sm75_begin(ins, SM75_OP_BRA);
+    sm75_set(ins, 34, 48, rel & 0xFFFFFFFFFFFF);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# EXIT
+fn sm75_enc_exit(ins): i64 {
+    _sm75_begin(ins, SM75_OP_EXIT);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# NOP
+fn sm75_enc_nop(ins): i64 {
+    _sm75_begin(ins, SM75_OP_NOP);
+    return 0;
+}
+
 # --- backend_nvidia_push.cyr ---
 
 # @internal — native NVIDIA backend, pushbuffer / method-stream builders

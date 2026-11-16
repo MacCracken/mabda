@@ -34,6 +34,10 @@ so far, both in the native AMD SPIR-V compiler:
 The remaining 4.4.0 items are open and tracked in the roadmap. That includes "the same in N9's
 SM75 path", which waits on N9.
 
+**N9 (SPIR-V → SASS for NVIDIA) has started.** The design note is
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md), and its first bite,
+N9.1 (the encoder), has landed. N9.2–N9.6 are open (§7 of the note), and so is N9's done-when.
+
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
   (`src/backend_native.cyr`) declared `ptrs[2048]`, 64 MIR pointer records, but told
@@ -140,6 +144,26 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   also tests for the region stack (nesting, the depth limit, two ifs closing at one label, the
   inverted uniform back-edge) and the new encodings, dword-exact against llvm-mc.
 
+### Added — N9.1: the Turing (SM75) instruction encoder (`@internal`)
+- `src/sm75_encode.cyr` builds 128-bit SM75 instructions: a bit-field core, the scheduling word,
+  and encoders for every instruction the design note's §3 selects. That covers `IADD3`, `IMAD`
+  (and `.HI` / `.WIDE`), `LOP3`, `SHF`, `ISETP`, `SEL`, `MOV`, `FADD`, `FMUL`, `FFMA`, `FMNMX`,
+  `FRND`, `F2I`, `I2F`, `MUFU`, `S2R`, `ULDC.64`, `LDG` / `STG` (`.STRONG.GPU`,
+  `[R.U32 + UR]`), `BRA`, `EXIT` and `NOP`. Field positions come from Mesa's NAK encoder
+  (`6aa7eaf09fc1`, MIT), used as a reference, not copied. Nothing calls it yet; the selector is
+  N9.2.
+- `tests/tcyr/sm75_encode.tcyr` (79 assertions) pins each encoder word for word. 27 rows are
+  ptxas output: CUDA 13.4 on `chew` for a kernel doing that operation, or the captured kernels.
+  The rest are forms ptxas didn't emit, which `nvdisasm -b SM75` decodes to exactly the intended
+  instruction. Where NAK's encoder and ptxas disagreed, ptxas won:
+  - `IMAD` carries a `!PT` carry-in at bits 87–90;
+  - `F2I` sets `.NTZ`;
+  - `FMUL` leaves src2 at 0;
+  - `LDG`'s predicate is encoded reversed (PT = 0).
+- Facts this pinned: a `BRA` offset is in 32-bit words from the next instruction; stall 15 with
+  yield set is not a valid scheduling value (`nvdisasm` rejects `0x1F`); a register shift gets
+  `.W` (shift mod 32), which matches GFX9's masked shifts.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -201,8 +225,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 25 suites, **7033 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
-  contract alone). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+- CPU: 26 suites, **7112 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract; 7033 after the compiler limits). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.
