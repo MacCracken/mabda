@@ -111,13 +111,21 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   The same 24 control-flow kernels run on both backends. On NVIDIA 22 match every lane and 2 are
   refused by name (f64; an out-of-range label). The request is archived:
   `issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md`.
-- **N9 follow-ons, from the design note's §7** (named there "for after the done-when"; now
-  scheduled here). Each needs a hardware check on chew:
+- 🔨 **N9 follow-ons, from the design note's §7** (named there "for after the done-when"; now
+  scheduled here). Each needs a hardware check on chew. They are taken in this order:
+  scheduling first, because it changes every kernel and the existing gates check it; then the two
+  that build on it; then the largest.
+  - ✅ **Scheduling from the SM75 latency tables** (`sm75_schedule`; CHANGELOG [4.4.0]) in place of
+    v1's stall-15-everywhere control words.
+    - Every control word is checked by an independent CPU checker.
+    - On the TU116 all 15 masterless gates pass, ranga's goldens hold, and ranga's four suites
+      pass.
+    - 4.5× fewer issue cycles per warp. Wall-clock is 1.48× faster for the arithmetic-bound
+      `loop_lcg`; ranga's GART-memory-bound kernels are unchanged
+      (`make bench-nvidia-compute`).
+  - Predicate allocation (P0–P6) in place of re-emitting the compare whenever P0 holds another.
   - `BSSY` / `BSYNC` reconvergence hints. v1 omits them, which is correct but lets diverged
     threads reconverge later than ptxas code would.
-  - Scheduling from the SM75 latency tables (NAK `sm75_instr_latencies.rs`) in place of v1's
-    stall-15-everywhere control words.
-  - Predicate allocation (P0–P6) in place of re-emitting the compare whenever P0 holds another.
   - A target-aware lowering for f32 `OpFDiv` (`MUFU.RCP` plus a Newton step) and for f64. Today
     `sm75_isel` refuses both with `SM75_ERR_UNSUPPORTED_OP`, and so does the control-flow suite's
     `loop_phi_f64`.
@@ -179,7 +187,8 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - logs in `build/logs/ranga-gpu-suites-{amd,nvidia}-n9.6-*.log`.
 
   Still to do: rerun against the final 4.4.0 bundle at the cut. ranga needs four changes in its
-  own repo, all ranga's call:
+  own repo, all ranga's call. They are filed there as
+  `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`:
   - `tests/gpu_spirv.tcyr`'s 4-argument table-builder call (needed for 4.4.0 on any backend);
   - `BACKEND_KIND_NVIDIA` added to `gpu_context_supports_compute` (ADR 005's allowlist);
   - `tests/gpu_nvidia.tcyr`'s refused rows flipped to the AMD suites' expected values;

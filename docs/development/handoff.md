@@ -24,13 +24,16 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   ranga's kernels are vendored in `tests/spirv/ranga/`. Their goldens come from the SPIR-V
   interpreter in `scripts/gen-spirv-ranga-fixtures.py` (`make check-ranga-fixtures`).
   `test-native-ranga-kernels-e2e` checks the same goldens on AMD. The open 4.4.0 items are:
-  - N9's follow-ons: `BSSY` / `BSYNC`, latency-table scheduling, predicate allocation, and SM75
-    `OpFDiv` / f64. Each needs a hardware check on chew.
+  - N9's follow-ons. Latency-table scheduling is done: `sm75_schedule` is checked by
+    `_ck_sched` in `tests/tcyr/sm75_compile.tcyr`, and `make bench-nvidia-compute` measures
+    it. Next is predicate allocation, then `BSSY` / `BSYNC`, then SM75 `OpFDiv` / f64. Each
+    needs a hardware check on chew, where `~/mabda-bench-v1` holds the v1-schedule tree for
+    before/after benches.
   - NVIDIA block-linear scanout.
   - The surface-acquire leak.
   - The seat-only closeout.
-  - The consumer check. ranga needs four changes in its own repo, all its call; the roadmap
-    lists them.
+  - The consumer check. ranga needs four changes in its own repo, all its call. They are
+    filed as `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`.
   On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
   Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
   deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in

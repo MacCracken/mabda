@@ -45,8 +45,9 @@ NVIDIA context now compiles SPIR-V in-tree. On the TU116:
 - ranga's 11 kernels match an independent oracle;
 - ranga's four GPU suites pass with an NVIDIA context.
 
-The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section: `BSSY` /
-`BSYNC`, latency-table scheduling, predicate allocation, and SM75 `OpFDiv` / f64.
+The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. The first one,
+latency-table scheduling, has landed (below). Predicate allocation, `BSSY` / `BSYNC` and SM75
+`OpFDiv` / f64 are open.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -347,6 +348,65 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 - The N9 request is archived as resolved
   (`docs/development/issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md`).
 
+### Changed — SM75 scheduling from the Turing latency tables (the first N9 follow-on)
+- **The control words.** `sm75_schedule` (`src/sm75_compile.cyr`) now sets every instruction's
+  stall, scoreboards and wait mask from NVIDIA's Turing latency tables, as NAK carries them
+  (`sm75_instr_latencies.rs`). It replaces v1, which stalled 15 cycles after every instruction
+  and waited on every scoreboard at the next one.
+  - **Fixed-latency ("coupled") results.** These are covered by stall counts. ALU → ALU waits 4,
+    ALU ↔ FMA/IMAD 5, FMA → FMA 4, and a coupled result read by a decoupled op 6. A predicate
+    takes 4 from ISETP to SEL and 12 from ISETP to a guarded BRA. A uniform register takes 2 from
+    ULDC to LDG or STG.
+  - **Variable-latency ("decoupled") results.** Each takes one of the 6 scoreboards, and the
+    first instruction that reads or overwrites the result waits on it. A forward look gives an op
+    a read scoreboard when one of its sources is overwritten before its result is waited on, and
+    gives a STG one when a branch follows it. A scoreboard is waited on no sooner than 2 cycles
+    after it is set.
+  - **Branches and EXIT.** Each waits on every scoreboard, and its stall drains coupled writes
+    (6 cycles), so no hazard crosses a block boundary. EXIT stalls 5, as in ptxas.
+  - Yield stays clear, NAK's default.
+  - The emitter takes at most 1024 records (`SM75_EMIT_MAX_RECS`). A hazard needing more than 15
+    stall cycles, or a short control buffer, is the new `SM75_ERR_SCHEDULE` (139), named in
+    `gpu_shader_error_name`. `sm75_schedule(isel, n, alloc, ctl, ctl_len)` follows the
+    scratch-buffer contract and is in the sizing gate's table.
+- **Fixed before it shipped.** The first draft gave a STG no read scoreboard when a branch
+  followed it. A branch waits on scoreboards only, so it could not have waited for the STG to read
+  its data register before the branch target overwrote it. Designing the independent checker
+  found this, and `test_sm75_schedule_stg_before_branch` pins it.
+- **Checked independently.** `_ck_sched` (`tests/tcyr/sm75_compile.tcyr`) decodes the emitted SASS
+  rather than reusing the scheduler's operand table. It walks the program with the cycle counts
+  the stall fields give and checks every hazard against its own copy of the latencies.
+  - Every control-flow and ranga kernel passes it.
+  - It is not vacuous: a shortened ISETP → BRA stall, a dropped scoreboard wait and a dropped read
+    scoreboard are each caught.
+  - `test_sm75_schedule_numbers` pins each table value on a hand-built program.
+  - `sm75_compile.tcyr` is now 249 assertions.
+- **On the TU116** (`build/logs/nvidia-sched-v2-20261116-145859.log`):
+  - all 15 masterless NVIDIA gates pass;
+  - 22 of the 24 control-flow kernels match every lane;
+  - ranga's 11 kernels match their goldens;
+  - ranga's four GPU suites pass with an NVIDIA context;
+  - all 33 compiled kernels round-trip through `nvdisasm`;
+  - the kernel log is clean.
+
+  The minimum gaps are what is being tested. Across those kernels, 157 ALU → ALU, 135 ALU →
+  decoupled, 86 FMA → FMA and 49 ISETP → guarded-BRA pairs sit at exactly their minimum. In the
+  one captured ptxas kernel, ptxas agreed with the table except for ALU → STG data, where it used
+  8 against 6. 42 such pairs sit at exactly 6 and pass.
+- **New kernel `loop_lcg`** (`tests/spirv/control_flow/loop_lcg.body`): 4096 iterations of four
+  dependent `acc * 5 + 7` steps, with two phis. It is checked lane by lane on both GPUs: on
+  Cezanne the control-flow gate passes 25 of 25, and on the TU116 23 kernels run exactly and 2
+  are refused as expected. The fixture generator gained an `lcg(x, steps)` helper for its
+  expectation.
+- **The win** (`make bench-nvidia-compute`, `programs/nvidia_compute_bench.cyr`). On the 33
+  kernels, issue cycles per warp drop 4.5×, from 19065 to 4203.
+  - On the TU116, the arithmetic-bound `loop_lcg` (4096 workgroups) takes **3731 µs against
+    5527 µs, 1.48× faster**.
+  - ranga's whole-image kernels at 1024 x 1024 are unchanged within ±3%. They are bound by PCIe:
+    NVIDIA buffers are GART, and resident warps hide stall cycles.
+  - Measured against `720eaf2` (the v1 schedule) on the same box, two alternating passes; log
+    `build/logs/bench-nvidia-compute-v1-v2-20261116-150245.log`.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -408,9 +468,9 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7356 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7435 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
-  7232 after N9.4; 7289 after N9.5). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  7232 after N9.4; 7289 after N9.5; 7356 after N9.6). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

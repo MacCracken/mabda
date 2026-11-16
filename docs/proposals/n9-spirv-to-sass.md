@@ -133,6 +133,39 @@ That serializes everything. These kernels are short, and the gate is correctness
 SM75 latency tables (`sm75_instr_latencies.rs`) to tighten the stalls is a later bite (§7), and
 each tightening has to keep the hardware gates green.
 
+**v2 (4.4.0, the first N9 follow-on): landed.** `sm75_schedule` (`src/sm75_compile.cyr`) sets
+every control word from the Turing tables NAK carries, for the subset `sm75_isel` emits:
+- coupled read-after-write latencies:
+  - ALU → ALU 4;
+  - ALU ↔ FMA/IMAD 5;
+  - FMA → FMA 4;
+  - any coupled op → a decoupled reader 6;
+- predicates: ISETP → SEL 4, and ISETP → a guarded BRA 12;
+- uniform registers: ULDC → LDG/STG 2;
+- write-after-write: a coupled write followed by a decoupled write of the same register, 6.
+
+Decoupled results take a scoreboard, which is waited on at the first reader or overwriter. A
+forward look gives an op a read scoreboard when a source is overwritten before its result is
+waited on, and gives a STG one when a branch follows it. A scoreboard is waited on no sooner
+than 2 cycles after it is set. Every branch and EXIT waits on all scoreboards, and its stall
+drains coupled writes (6), so no hazard crosses a block boundary. Yield stays clear (NAK's
+default).
+
+How it is checked:
+- **Independent checker:** the CPU suite decodes the emitted SASS and re-derives every hazard
+  with its own latency table (`_ck_sched` in `tests/tcyr/sm75_compile.tcyr`). Every
+  control-flow and ranga kernel passes, and three injected faults are caught.
+- **Pinned values:** a hand-built program pins each table value.
+- **Hardware:** on the TU116 every lane check and golden still matches. The minimum gaps are
+  exercised: of the 33 compiled kernels, 157 ALU→ALU pairs, 135 ALU→decoupled, 86 FMA→FMA and
+  49 ISETP→guard sit at exactly their minimum.
+- **ptxas comparison:** in the one captured kernel, ptxas agreed except for ALU → STG data,
+  where it used 8 against the table's 6. 42 pairs sit at exactly 6 and pass on hardware.
+
+Result: 4.5× fewer issue cycles per warp across the 33 kernels. On the TU116 that is 1.48×
+faster for the arithmetic-bound `loop_lcg` and unchanged for ranga's memory-bound kernels
+(`make bench-nvidia-compute`).
+
 ## 6. Encoding and the oracle
 
 NVIDIA publishes no ISA document. The field layout comes from Mesa's NAK encoder
@@ -181,7 +214,7 @@ N9.6 found one bug: SM75 counted only the bindings a kernel reads, where GFX9 co
 bindings it declares. It now counts declared bindings too (CHANGELOG [4.4.0]).
 
 Named for after the done-when. Since N9 closed they are tracked in the roadmap's 4.4.0 section,
-"N9 follow-ons":
+"N9 follow-ons". The latency-table scheduling is done (§5 v2); the rest are open:
 `BSSY`/`BSYNC` reconvergence; tightened scheduling from the SM75 latency tables; predicate
 allocation in place of P0 re-emission; a target-aware lowering for `OpFDiv` (`MUFU.RCP` + Newton
 on SM75) and f64.

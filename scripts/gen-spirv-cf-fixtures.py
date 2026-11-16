@@ -9,7 +9,8 @@ and the hardware gate (programs/native_spirv_control_flow_e2e.cyr) include.
 
 Each kernel is head.spvasm + <name>.body (or head_<h>.spvasm with a `; head: <h>` line). A
 body's first lines say what it must do:
-    ; want: <python expression over lane i>   (D = 0xDEADBEEF, the untouched seed)
+    ; want: <python expression over lane i>   (D = 0xDEADBEEF, the untouched seed; max, min
+                                              and lcg(x, steps) are available)
     ; refuse: <mabda error constant>          (the compile must fail with exactly that code)
 and may override either for the NVIDIA (SM75) compiler, where the hardware differs:
     ; nv-want: <python expression over lane i>
@@ -54,6 +55,13 @@ def nest_body(depth):
         lines += [f"               OpBranch %m{k}", f"        %m{k} = OpLabel"]
     lines += ["               OpReturn", "               OpFunctionEnd"]
     return "\n".join(lines) + "\n"
+
+
+def lcg(x, steps):
+    """`steps` of x = x * 5 + 7 mod 2^32 (loop_lcg's chain)."""
+    for _ in range(steps):
+        x = (x * 5 + 7) & 0xFFFFFFFF
+    return x
 
 
 def assemble(text):
@@ -238,7 +246,8 @@ def build():
             kind, val = pick(name, meta)
             if kind != "want":
                 continue
-            vals = [eval(val, {"D": D, "max": max, "min": min}, {"i": i}) & 0xFFFFFFFF for i in range(LANES)]
+            vals = [eval(val, {"D": D, "max": max, "min": min, "lcg": lcg}, {"i": i}) & 0xFFFFFFFF
+                    for i in range(LANES)]
             o.append(f"    if (k == {idx}) {{")
             o.extend(["    " + line for line in w4_lines("out", vals, 0)])
             o.append("        return 1;")

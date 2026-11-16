@@ -20,6 +20,7 @@ WITH ITS LENGTH IN BYTES, and derives its capacity from the length:
     gfx9_cc_buf(cc, CC_X, buf, len)                                src/gfx9_compile.cyr
     sm75_isel(m, out, out_len)                                     src/sm75_isel.cyr (N9)
     sm75_regalloc(m, isel, n, alloc, alloc_len, hw)                src/sm75_regalloc.cyr
+    sm75_schedule(isel, n, alloc, ctl, ctl_len),
     sm75_emit(isel, n, alloc, sass, sass_len), sm75_compile(cc, spirv, n, sass, sass_len, desc),
     sm75_compile_spirv(words, n, sass, sass_len, desc)             src/sm75_compile.cyr
 
@@ -77,6 +78,7 @@ CONTRACT = {
     "gfx9_cc_buf": (4, [(2, 3)]),
     "sm75_isel": (3, [(1, 2)]),
     "sm75_regalloc": (6, [(3, 4)]),
+    "sm75_schedule": (5, [(3, 4)]),
     "sm75_emit": (5, [(3, 4)]),
     "sm75_compile": (6, [(3, 4)]),
     "sm75_compile_spirv": (5, [(2, 3)]),

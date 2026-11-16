@@ -88,42 +88,19 @@ fn test_sm75_compile_saxpy() {
         i = i + 1;
     }
     assert_eq(pad_ok, 1, "NOPs to the 128-byte boundary");
-    # the v1 schedule: stall 15, yield clear; a decoupled op writes scoreboard 0 and the next
-    # instruction waits on it; STG sets read scoreboard 1 and the next instruction waits on it
-    var sched_ok = 1;
-    var want_wait = 0;
-    var saw_dec = 0;
-    var saw_stg = 0;
+    # binding 1 (y) is UR6 in the STG; the data is a register, not UR's number
     i = 0;
+    var saw_stg = 0;
     while (i < nins) {
-        var ins = &sass + i * 16;
-        var op = sm75_get(ins, 0, 12);
-        if (sm75_get(ins, 105, 4) != 15) { sched_ok = 0; }
-        if (sm75_get(ins, 109, 1) != 0) { sched_ok = 0; }
-        if (sm75_get(ins, 116, 6) != want_wait) { sched_ok = 0; }
-        want_wait = 0;
-        var dec = 0;
-        if (op == SM75_OP_S2R) { dec = 1; }
-        if (op == SM75_OP_LDG) { dec = 1; }
-        if (dec == 1) {
-            saw_dec = 1;
-            if (sm75_get(ins, 110, 3) != 0) { sched_ok = 0; }
-            want_wait = want_wait | 1;
-        } else {
-            if (sm75_get(ins, 110, 3) != 7) { sched_ok = 0; }
-        }
-        if (op == SM75_OP_STG) {
+        if (sm75_get(&sass + i * 16, 0, 12) == SM75_OP_STG) {
             saw_stg = 1;
-            if (sm75_get(ins, 113, 3) != 1) { sched_ok = 0; }
-            want_wait = want_wait | 2;
-            # binding 1 (y) is UR6; the data is a register, not UR's number
-            assert_eq(sm75_get(ins, 64, 6), 6, "STG through UR6 (binding 1)");
+            assert_eq(sm75_get(&sass + i * 16, 64, 6), 6, "STG through UR6 (binding 1)");
         }
         i = i + 1;
     }
-    assert_eq(saw_dec, 1, "S2R / LDG present");
     assert_eq(saw_stg, 1, "STG present");
-    assert_eq(sched_ok, 1, "every control word follows the v1 schedule");
+    # the v2 schedule: every hazard covered (the independent check below)
+    assert_eq(_ck_sched(&sass, len), 0, "every control word covers its hazards");
     return 0;
 }
 
@@ -425,6 +402,450 @@ fn test_sm75_unread_binding_not_loaded() {
     return 0;
 }
 
+# ================================================================
+# An independent check of the v2 schedule (sm75_schedule)
+# ================================================================
+# It DECODES the emitted SASS — opcode, operand form, register fields, control word — instead
+# of reusing sm75_schedule's operand table, walks the program in order with the cycle counts
+# the stall fields give, and checks every hazard against its own copy of the Turing latencies
+# (NAK sm75_instr_latencies.rs): coupled read-after-write, a decoupled result read or
+# overwritten only after its scoreboard was waited on, a register a decoupled op still reads
+# overwritten only after its read (or write) scoreboard was waited on, a scoreboard waited no
+# sooner than 2 cycles after its set, ISETP -> SEL 4 / -> guarded BRA 12, ULDC -> LDG/STG 2,
+# coupled -> decoupled write of one register 6, every branch waiting on all outstanding
+# scoreboards and draining coupled writes (6) before its target, every result-producing
+# decoupled op owning a write scoreboard, stall 1..15, yield clear. Returns the violations.
+var _ck_first = 0;
+fn _ck_bad(j, why): i64 {
+    if (_ck_first < 4) {
+        syscall(1, 1, "    sched check: ins ", 21);
+        var b[32];
+        memset(&b, 0, 32);
+        syscall(1, 1, &b, fmt_int_buf(j, &b));
+        syscall(1, 1, ": ", 2);
+        syscall(1, 1, why, strlen(why));
+        syscall(1, 1, "\n", 1);
+    }
+    _ck_first = _ck_first + 1;
+    return 1;
+}
+
+# 1 coupled ALU, 2 coupled FMA / IMAD, 3 decoupled, 0 anything else; by 12-bit opcode.
+# 0 when `ok`, else one reported violation.
+fn _ck_need(ok, j, why): i64 {
+    if (ok == 1) { return 0; }
+    return _ck_bad(j, why);
+}
+
+fn _ck_cls(op12): i64 {
+    if (op12 == SM75_OP_S2R) { return 3; }
+    if (op12 == SM75_OP_LDG) { return 3; }
+    if (op12 == SM75_OP_STG) { return 3; }
+    if (op12 == SM75_OP_ULDC) { return 0; }
+    if (op12 == SM75_OP_BRA) { return 0; }
+    if (op12 == SM75_OP_EXIT) { return 0; }
+    if (op12 == SM75_OP_NOP) { return 0; }
+    var base = op12 & 0x1FF;
+    if (base == SM75_OP_MUFU) { return 3; }
+    if (base == SM75_OP_I2F) { return 3; }
+    if (base == SM75_OP_F2I) { return 3; }
+    if (base == SM75_OP_FRND) { return 3; }
+    if (base == SM75_OP_FADD) { return 2; }
+    if (base == SM75_OP_FMUL) { return 2; }
+    if (base == SM75_OP_FFMA) { return 2; }
+    if (base == SM75_OP_IMAD) { return 2; }
+    if (base == SM75_OP_IMADHI) { return 2; }
+    return 1;
+}
+
+fn _ck_raw(wc, rc): i64 {
+    if (rc == 3) { return 6; }
+    if (wc == rc) { return 4; }
+    return 5;
+}
+
+fn _ck_is3(base): i64 {
+    if (base == SM75_OP_IADD3) { return 1; }
+    if (base == SM75_OP_IMAD) { return 1; }
+    if (base == SM75_OP_IMADHI) { return 1; }
+    if (base == SM75_OP_LOP3) { return 1; }
+    if (base == SM75_OP_SHF) { return 1; }
+    if (base == SM75_OP_FFMA) { return 1; }
+    return 0;
+}
+
+fn _ck_add(out, k, r): i64 {
+    if (r == SM75_RZ) { return k; }
+    store64(out + k * 8, r);
+    return k + 1;
+}
+
+# The GPRs instruction `ins` reads, decoded from its fields (at most 3).
+fn _ck_srcs(ins, out): i64 {
+    var op12 = sm75_get(ins, 0, 12);
+    if (op12 == SM75_OP_LDG) { return _ck_add(out, 0, sm75_get(ins, 24, 8)); }
+    if (op12 == SM75_OP_STG) { return _ck_add(out, _ck_add(out, 0, sm75_get(ins, 24, 8)), sm75_get(ins, 32, 8)); }
+    if (_ck_cls(op12) == 0) { return 0; }
+    if (op12 == SM75_OP_S2R) { return 0; }
+    var base = op12 & 0x1FF;
+    var form = op12 >> 9;
+    var unary = 0;
+    if (_ck_cls(op12) == 3) { unary = 1; }
+    if (base == SM75_OP_MOV) { unary = 1; }
+    var k = 0;
+    if (unary == 0) { k = _ck_add(out, k, sm75_get(ins, 24, 8)); }
+    if (form == 1) {
+        k = _ck_add(out, k, sm75_get(ins, 32, 8));
+        if (_ck_is3(base) == 1) { k = _ck_add(out, k, sm75_get(ins, 64, 8)); }
+    }
+    if (form == 4) { if (_ck_is3(base) == 1) { k = _ck_add(out, k, sm75_get(ins, 64, 8)); } }
+    if (form == 5) { if (_ck_is3(base) == 1) { k = _ck_add(out, k, sm75_get(ins, 64, 8)); } }
+    if (form == 2) { k = _ck_add(out, k, sm75_get(ins, 64, 8)); }
+    if (form == 3) { k = _ck_add(out, k, sm75_get(ins, 64, 8)); }
+    return k;
+}
+
+# The GPR instruction `ins` writes, or -1.
+fn _ck_dst(ins): i64 {
+    var op12 = sm75_get(ins, 0, 12);
+    var c = _ck_cls(op12);
+    if (c == 0) { return 0 - 1; }
+    if (op12 == SM75_OP_STG) { return 0 - 1; }
+    if ((op12 & 0x1FF) == SM75_OP_ISETP) { return 0 - 1; }
+    var d = sm75_get(ins, 16, 8);
+    if (d == SM75_RZ) { return 0 - 1; }
+    return d;
+}
+
+fn _ck_sched(sass, len): i64 {
+    var lwk[2048];      # per GPR: last writer 0 none / 1 coupled / 2 decoupled
+    var lwt[2048];      #   its issue cycle
+    var lwc[2048];      #   its class
+    var lwo[2048];      #   its instruction (decoupled)
+    var ow[2048];       # per instruction (<= 256): write SB
+    var orr[2048];      #   read SB
+    var ot[2048];       #   issue cycle
+    var odw[2048];      #   result waited
+    var odr[2048];      #   reads waited
+    var odc[2048];      #   decoupled?
+    var od[2048];       #   its result register (-1)
+    var osr[6144];      #   its sources (3 each)
+    var ons[2048];      #   source count
+    var urt[512];
+    var srcs[24];
+    memset(&lwk, 0, 2048);
+    memset(&odc, 0, 2048);
+    var r = 0;
+    while (r < 64) { store64(&urt + r * 8, 0 - 1000); r = r + 1; }
+    var p0t = 0 - 1000;
+    var t = 0;
+    var bad = 0;
+    var nins = len / 16;
+    if (nins > 256) { return _ck_bad(0, "program longer than the checker's 256"); }
+    var j = 0;
+    while (j < nins) {
+        var ins = sass + j * 16;
+        var op12 = sm75_get(ins, 0, 12);
+        if (op12 == SM75_OP_BRA) { if (sm75_get(ins, 34, 48) == 0xFFFFFFFFFFFC) { j = nins; continue; } }
+        var st = sm75_get(ins, 105, 4);
+        var wr = sm75_get(ins, 110, 3);
+        var rd = sm75_get(ins, 113, 3);
+        var wt = sm75_get(ins, 116, 6);
+        if (st < 1) { bad = bad + _ck_bad(j, "stall 0"); }
+        if (sm75_get(ins, 109, 1) != 0) { bad = bad + _ck_bad(j, "yield set"); }
+        if (wr == 6) { bad = bad + _ck_bad(j, "write SB 6"); }
+        if (rd == 6) { bad = bad + _ck_bad(j, "read SB 6"); }
+        # 1. this instruction's waits complete the ops on those scoreboards
+        var k = 0;
+        while (k < 6) {
+            if (((wt >> k) & 1) == 1) {
+                var o = 0;
+                while (o < j) {
+                    if (load64(&odc + o * 8) == 1) {
+                        var hit = 0;
+                        if (load64(&ow + o * 8) == k) { if (load64(&odw + o * 8) == 0) { hit = 1; } }
+                        if (load64(&orr + o * 8) == k) { if (load64(&odr + o * 8) == 0) { hit = 2; } }
+                        if (hit > 0) {
+                            bad = bad + _ck_need(t >= load64(&ot + o * 8) + 2, j, "SB waited < 2 cycles after its set");
+                            store64(&odr + o * 8, 1);
+                            if (hit == 1) { store64(&odw + o * 8, 1); }
+                        }
+                    }
+                    o = o + 1;
+                }
+            }
+            k = k + 1;
+        }
+        var cls = _ck_cls(op12);
+        var ns = _ck_srcs(ins, &srcs);
+        var d = _ck_dst(ins);
+        # 2. sources
+        k = 0;
+        while (k < ns) {
+            var s = load64(&srcs + k * 8);
+            if (load64(&lwk + s * 8) == 1) {
+                var need = _ck_raw(load64(&lwc + s * 8), cls);
+                bad = bad + _ck_need(t - load64(&lwt + s * 8) >= need, j, "coupled RAW too soon");
+            }
+            if (load64(&lwk + s * 8) == 2) {
+                var ws = load64(&odw + load64(&lwo + s * 8) * 8);
+                bad = bad + _ck_need(ws == 1, j, "reads a decoupled result unwaited");
+            }
+            k = k + 1;
+        }
+        # 3. the predicate, 4. the uniform registers
+        if ((op12 & 0x1FF) == SM75_OP_SEL) { if (t - p0t < 4) { bad = bad + _ck_bad(j, "SEL < 4 after ISETP"); } }
+        if (op12 == SM75_OP_BRA) {
+            if (sm75_get(ins, 12, 3) != SM75_PT) {
+                bad = bad + _ck_need(t - p0t >= 12, j, "guarded BRA < 12 after ISETP");
+            }
+        }
+        var ur = 0 - 1;
+        if (op12 == SM75_OP_LDG) { ur = sm75_get(ins, 32, 6); }
+        if (op12 == SM75_OP_STG) { ur = sm75_get(ins, 64, 6); }
+        if (ur >= 0) { if (t - load64(&urt + ur * 8) < 2) { bad = bad + _ck_bad(j, "LDG/STG < 2 after its ULDC"); } }
+        # 5. the result register
+        if (d >= 0) {
+            if (load64(&lwk + d * 8) == 2) {
+                var wd = load64(&odw + load64(&lwo + d * 8) * 8);
+                bad = bad + _ck_need(wd == 1, j, "overwrites a decoupled result unwaited");
+            }
+            if (load64(&lwk + d * 8) == 1) {
+                if (cls == 3) {
+                    bad = bad + _ck_need(t - load64(&lwt + d * 8) >= 6, j, "decoupled write < 6 after a coupled one");
+                }
+            }
+            var o2 = 0;
+            while (o2 < j) {
+                if (load64(&odc + o2 * 8) == 1) {
+                    if (load64(&odr + o2 * 8) == 0) {
+                        var rdg = _s75_in(&osr + o2 * 24, load64(&ons + o2 * 8), d);
+                        bad = bad + _ck_need(rdg == 0, j, "overwrites a register a decoupled op still reads");
+                    }
+                }
+                o2 = o2 + 1;
+            }
+        }
+        # 6. branches and EXIT
+        if (op12 == SM75_OP_BRA) {
+            var o3 = 0;
+            while (o3 < j) {
+                if (load64(&odc + o3 * 8) == 1) {
+                    bad = bad + _ck_need(load64(&odr + o3 * 8) == 1, j, "branch, a read outstanding");
+                    if (load64(&od + o3 * 8) >= 0) {
+                        bad = bad + _ck_need(load64(&odw + o3 * 8) == 1, j, "branch, a result outstanding");
+                    }
+                }
+                o3 = o3 + 1;
+            }
+            r = 0;
+            while (r < 256) {
+                if (load64(&lwk + r * 8) == 1) {
+                    bad = bad + _ck_need(t + st - load64(&lwt + r * 8) >= 6, j, "target < 6 after a write");
+                }
+                r = r + 1;
+            }
+        }
+        if (op12 == SM75_OP_EXIT) {
+            var o4 = 0;
+            while (o4 < j) {
+                if (load64(&odc + o4 * 8) == 1) {
+                    if (load64(&ow + o4 * 8) != 7) {
+                        bad = bad + _ck_need(load64(&odw + o4 * 8) == 1, j, "EXIT with a write SB outstanding");
+                    }
+                    if (load64(&orr + o4 * 8) != 7) {
+                        bad = bad + _ck_need(load64(&odr + o4 * 8) == 1, j, "EXIT with a read SB outstanding");
+                    }
+                }
+                o4 = o4 + 1;
+            }
+        }
+        # 7. record this instruction
+        store64(&ow + j * 8, wr);
+        store64(&orr + j * 8, rd);
+        store64(&ot + j * 8, t);
+        store64(&odw + j * 8, 0);
+        store64(&odr + j * 8, 0);
+        store64(&od + j * 8, d);
+        store64(&ons + j * 8, ns);
+        k = 0;
+        while (k < ns) { store64(&osr + j * 24 + k * 8, load64(&srcs + k * 8)); k = k + 1; }
+        if (cls == 3) {
+            store64(&odc + j * 8, 1);
+            if (d >= 0) { if (wr == 7) { bad = bad + _ck_bad(j, "a decoupled result with no write SB"); } }
+        } else {
+            store64(&odc + j * 8, 0);
+            if (wr != 7) { bad = bad + _ck_bad(j, "a coupled op sets a write SB"); }
+        }
+        if (d >= 0) {
+            if (cls == 3) {
+                store64(&lwk + d * 8, 2);
+                store64(&lwo + d * 8, j);
+            } else {
+                store64(&lwk + d * 8, 1);
+                store64(&lwt + d * 8, t);
+                store64(&lwc + d * 8, cls);
+            }
+        }
+        if ((op12 & 0x1FF) == SM75_OP_ISETP) { p0t = t; }
+        if (op12 == SM75_OP_ULDC) {
+            var u = sm75_get(ins, 16, 6);
+            store64(&urt + u * 8, t);
+            store64(&urt + (u + 1) * 8, t);
+        }
+        t = t + st;
+        j = j + 1;
+    }
+    return bad;
+}
+
+# Every control-flow and ranga kernel's schedule passes the independent check, and the check
+# is not vacuous: a shortened stall, a dropped wait and a dropped read scoreboard each fail it.
+fn test_sm75_schedule_checked() {
+    var spv[2688];
+    var sass[16384];
+    var desc[24];
+    var k = 0;
+    while (k < CFK_COUNT) {
+        var n = cfk_build(k, &spv);
+        if (sm75_compile_spirv(&spv, n, &sass, 16384, &desc) == 0) {
+            assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, cfk_name(k));
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < RK_COUNT) {
+        var nr = rk_build(k, &spv);
+        assert_eq(sm75_compile_spirv(&spv, nr, &sass, 16384, &desc), 0, "ranga kernel compiles");
+        assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, rk_name(k));
+        k = k + 1;
+    }
+    # Fault injection on loop_do_while: find its guarded BRA, its ISETP, the first wait.
+    var n2 = _cfk2("loop_do_while", &spv);
+    assert_eq(sm75_compile_spirv(&spv, n2, &sass, 16384, &desc), 0, "loop_do_while");
+    var len = load64(&desc + SM75_DESC_LEN);
+    var gi = 0 - 1;
+    var wi = 0 - 1;
+    var ri = 0 - 1;
+    var i = 0;
+    while (i < len / 16) {
+        var op12 = sm75_get(&sass + i * 16, 0, 12);
+        if (op12 == SM75_OP_BRA) { if (sm75_get(&sass + i * 16, 12, 3) != SM75_PT) { if (gi < 0) { gi = i; } } }
+        if (wi < 0) { if (sm75_get(&sass + i * 16, 116, 6) != 0) { wi = i; } }
+        if (ri < 0) { if (sm75_get(&sass + i * 16, 113, 3) != 7) { ri = i; } }
+        i = i + 1;
+    }
+    assert_eq(gi > 0, 1, "a guarded BRA");
+    assert_eq(wi > 0, 1, "a scoreboard wait");
+    assert_eq(ri > 0, 1, "a read scoreboard (the LDG's address register is reused at once)");
+    var save = 0;
+    _ck_first = 4;     # quiet: these are meant to fail
+    save = sm75_get(&sass + (gi - 1) * 16, 105, 4);
+    sm75_set(&sass + (gi - 1) * 16, 105, 4, 1);
+    assert_eq(_ck_sched(&sass, len) > 0, 1, "ISETP -> guarded BRA in 1 cycle is caught");
+    sm75_set(&sass + (gi - 1) * 16, 105, 4, save);
+    save = sm75_get(&sass + wi * 16, 116, 6);
+    sm75_set(&sass + wi * 16, 116, 6, 0);
+    assert_eq(_ck_sched(&sass, len) > 0, 1, "a dropped scoreboard wait is caught");
+    sm75_set(&sass + wi * 16, 116, 6, save);
+    save = sm75_get(&sass + ri * 16, 113, 3);
+    sm75_set(&sass + ri * 16, 113, 3, 7);
+    assert_eq(_ck_sched(&sass, len) > 0, 1, "a dropped read scoreboard is caught");
+    sm75_set(&sass + ri * 16, 113, 3, save);
+    _ck_first = 0;
+    assert_eq(_ck_sched(&sass, len), 0, "and restored, it passes again");
+    return 0;
+}
+
+# The NVIDIA table's numbers, pinned on a hand-built program (one value per rule):
+#   ULDC -> LDG reading the UR: 2;  S2R (decoupled) -> its reader waits on its SB >= 2 later;
+#   IADD3 (ALU) -> FMUL (FMA): 5;  FMUL -> FADD (FMA): 4;  FADD -> LDG address (decoupled): 6;
+#   ISETP -> SEL: 4;  ISETP -> guarded BRA: 12;  a branch's stall drains the coupled writes
+#   (the target issues >= 6 after the last one);  EXIT: 5.
+fn test_sm75_schedule_numbers() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    var i = 3;
+    while (i < 16) { _mir_set_val(&m, i, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0); i = i + 1; }
+    var isel[960];
+    var g = (1 << 8) | (1 << 9);
+    _gisel_emit(&isel, 0, SM75I_ULDC, 0, 4, 0x160, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);   # UR4
+    _gisel_emit(&isel, 1, SM75I_S2R, 3, 0, 0, 0, SM75_SR_TID_X << 8);                     # v3 = tid
+    _gisel_emit(&isel, 2, SM75I_IADD3, 4, 3, 1, 0, MIR_FLAG_B_IMM);                       # v4 = v3 + 1
+    _gisel_emit(&isel, 3, SM75I_FMUL, 5, 4, 4, 0, 0);                                     # v5 = v4 * v4
+    _gisel_emit(&isel, 4, SM75I_FADD, 6, 5, 5, 0, 0);                                     # v6 = v5 + v5
+    _gisel_emit(&isel, 5, SM75I_LDG, 7, 6, 0, 0, MIR_FLAG_B_IMM | (4 << 8));              # v7 = [v6]
+    _gisel_emit(&isel, 6, SM75I_ISETP, 0, 4, 7, 0, (SM75_CMP_LT << 8));                   # P0 = v4 < v7
+    _gisel_emit(&isel, 7, SM75I_SEL, 8, 4, 6, 0, 0);                                      # v8 = P0 ? v4 : v6
+    _gisel_emit(&isel, 8, SM75I_BRA, 0, 10, 0, 0, MIR_FLAG_A_IMM | g);                    # @!P0 BRA L10
+    _gisel_emit(&isel, 9, SM75I_LABEL, 0, 10, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 10, SM75I_MOV, 9, 0, 8, 0, 0);                                     # v9 = v8
+    _gisel_emit(&isel, 11, SM75I_BRA, 0, 11, 0, 0, MIR_FLAG_A_IMM);                       # BRA L11
+    _gisel_emit(&isel, 12, SM75I_LABEL, 0, 11, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 13, SM75I_STG, 0, 6, 9, 0, MIR_FLAG_C_IMM | (4 << 8));             # [v6] = v9
+    _gisel_emit(&isel, 14, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 15, &alloc, 512, &hw), 0, "regalloc");
+    var ctl[120];
+    assert_eq(sm75_schedule(&isel, 15, &alloc, &ctl, 120), 0, "schedule");
+    # issue cycles: ULDC 0, S2R 1, IADD3 3 (waits S2R's SB, set at 1), FMUL 8, FADD 12,
+    # LDG 18, ISETP 20 (waits the LDG's SB), SEL 24, @!P0 BRA 32, MOV 33, BRA 34, STG 39, EXIT 40
+    assert_eq(load64(&ctl + 0) & 15, 1, "ULDC -> S2R: 1");
+    assert_eq(load64(&ctl + 8) & 15, 2, "S2R -> IADD3: the SB wait comes 2 after the set");
+    assert_eq((load64(&ctl + 8) >> 4) & 7, 0, "S2R sets write SB 0");
+    assert_eq((load64(&ctl + 16) >> 12) & 0x3F, 1, "IADD3 waits on SB 0");
+    assert_eq(load64(&ctl + 16) & 15, 5, "IADD3 (ALU) -> FMUL (FMA): 5");
+    assert_eq(load64(&ctl + 24) & 15, 4, "FMUL -> FADD (FMA -> FMA): 4");
+    assert_eq(load64(&ctl + 32) & 15, 6, "FADD -> LDG reading it as the address: 6");
+    assert_eq(load64(&ctl + 40) & 15, 2, "LDG -> ISETP waiting on the LDG's SB: 2");
+    assert_eq(load64(&ctl + 48) & 15, 4, "ISETP -> SEL: 4");
+    assert_eq(load64(&ctl + 56) & 15, 8, "SEL at +4, the guarded BRA at ISETP + 12: 8 more");
+    assert_eq(load64(&ctl + 64) & 15, 1, "the guarded BRA's drain is covered (SEL + 6 = 30 < 33)");
+    assert_eq((load64(&ctl + 64) >> 12) & 0x3F, 0, "nothing outstanding to wait on");
+    assert_eq(load64(&ctl + 72), 0, "a LABEL has no control word");
+    assert_eq(load64(&ctl + 80) & 15, 1, "MOV -> BRA: 1");
+    assert_eq(load64(&ctl + 88) & 15, 5, "the BRA drains: its target issues MOV + 6");
+    assert_eq(load64(&ctl + 104) & 15, 1, "STG -> EXIT: 1");
+    assert_eq((load64(&ctl + 104) >> 8) & 7, 7, "a STG before EXIT takes no read SB (as ptxas)");
+    assert_eq(load64(&ctl + 112) & 15, 5, "EXIT: 5");
+    assert_eq(sm75_schedule(&isel, 15, &alloc, &ctl, 119), 0 - SM75_ERR_SCHEDULE, "ctl[] one byte short");
+    return 0;
+}
+
+# A STG has no result scoreboard, so a branch after it can only wait on a READ scoreboard: the
+# STG takes one and the branch waits on it (the target may overwrite the data register).
+fn test_sm75_schedule_stg_before_branch() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    var i = 3;
+    while (i < 8) { _mir_set_val(&m, i, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0); i = i + 1; }
+    var isel[480];
+    _gisel_emit(&isel, 0, SM75I_ULDC, 0, 4, 0x160, 0, MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+    _gisel_emit(&isel, 1, SM75I_MOV, 3, 0, 5, 0, MIR_FLAG_B_IMM);                         # v3 = 5
+    _gisel_emit(&isel, 2, SM75I_STG, 0, 3, 3, 0, MIR_FLAG_C_IMM | (4 << 8));              # [v3] = v3
+    _gisel_emit(&isel, 3, SM75I_BRA, 0, 9, 0, 0, MIR_FLAG_A_IMM);                         # BRA L9
+    _gisel_emit(&isel, 4, SM75I_LABEL, 0, 9, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 5, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 6, &alloc, 512, &hw), 0, "regalloc");
+    var ctl[48];
+    assert_eq(sm75_schedule(&isel, 6, &alloc, &ctl, 48), 0, "schedule");
+    var rdsb = (load64(&ctl + 16) >> 8) & 7;
+    assert_neq(rdsb, 7, "the STG takes a read scoreboard");
+    assert_eq(((load64(&ctl + 24) >> 12) >> rdsb) & 1, 1, "and the branch waits on it");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -438,6 +859,9 @@ fn main(): i64 {
     test_sm75_binding_count_declared();
     test_sm75_ranga_kernels_compile();
     test_sm75_unread_binding_not_loaded();
+    test_sm75_schedule_checked();
+    test_sm75_schedule_numbers();
+    test_sm75_schedule_stg_before_branch();
     return assert_summary();
 }
 

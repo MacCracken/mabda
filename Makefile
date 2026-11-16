@@ -921,6 +921,17 @@ test-native-ranga-kernels-e2e: build/ranga_kernels_e2e
 test-nvidia-ranga-kernels-e2e: build/ranga_kernels_e2e
 	./build/ranga_kernels_e2e nvidia
 
+# Wall-clock time of ranga's whole-image kernels compiled for SM75, 1024x1024 on the TU116
+# (the v2 scheduling measurement; run on the tree before and after a compiler change). Not a
+# gate. Masterless; runs over ssh on chew.
+build/nvidia_compute_bench: programs/nvidia_compute_bench.cyr src/*.cyr tests/tcyr/spirv_ranga_kernels.cyr tests/tcyr/spirv_cf_kernels.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_compute_bench.cyr $@
+
+.PHONY: bench-nvidia-compute
+bench-nvidia-compute: build/nvidia_compute_bench
+	./build/nvidia_compute_bench
+
 # v3.2 F.7e — the first COMPILED f64 on silicon: an f64 FMA SPIR-V kernel compiled in-tree
 # (gfx9_compile) + dispatched on Cezanne, bit-exact vs the fused-FMA reference.
 build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr

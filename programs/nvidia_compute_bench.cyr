@@ -1,0 +1,179 @@
+# programs/nvidia_compute_bench.cyr — wall-clock time of compiled SPIR-V on the native NVIDIA
+# backend (TU116), through the public API:
+#   - ranga's six whole-image kernels (the five one-buffer kernels and dissolve,
+#     tests/tcyr/spirv_ranga_kernels.cyr) over a 1024 x 1024 image: memory-bound;
+#   - loop_lcg (tests/spirv/control_flow/loop_lcg.body) on 4096 workgroups of 64 lanes, each
+#     lane 16384 dependent integer multiply-adds: arithmetic-bound, where the schedule shows.
+#
+# It measures the SM75 compiler's output, not the driver: each kernel is compiled once, then
+# dispatched BENCH_WARM times untimed and BENCH_REPS times timed; gpu_compute_dispatch returns
+# when the work is done. Reported per kernel: the fastest and the mean dispatch, and Mpx/s at
+# the fastest. The buffers are GART (system memory), as every native NVIDIA buffer is, so a
+# kernel with little arithmetic per pixel is bound by PCIe, not by its schedule.
+#
+# Written for the v2 scheduling change (CHANGELOG [4.4.0], N9 follow-ons): run it on the tree
+# before and after a compiler change. Not a gate: it prints numbers and exits 0 unless a
+# context, buffer, module or dispatch fails (3 / 5 / 7 / 9).
+
+include "src/lib.cyr"
+include "tests/tcyr/spirv_ranga_kernels.cyr"
+include "tests/tcyr/spirv_cf_kernels.cyr"
+
+var BENCH_NPX = 1048576;    # 1024 x 1024
+var BENCH_WARM = 3;
+var BENCH_REPS = 20;
+
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn outn(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    syscall(1, 1, &buf, fmt_int_buf(n, &buf));
+    return 0;
+}
+
+fn _pair(dst, buf): i64 {
+    store64(dst, load64(buf + NATIVE_BUF_FIELD_HANDLE));
+    store64(dst + 8, load64(buf + NATIVE_BUF_FIELD_VA));
+    return 0;
+}
+
+fn _fill(p, n, seed): i64 {
+    var s = seed;
+    var i = 0;
+    while (i < n) {
+        s = s ^ ((s << 13) & 0xFFFFFFFF);
+        s = s ^ (s >> 17);
+        s = s ^ ((s << 5) & 0xFFFFFFFF);
+        store32(p + i * 4, s);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn bench_one(ctx, k, src, dst, prm, sp, dp, pp): i64 {
+    var spv[2688];
+    var n = rk_build(k, &spv);
+    var m = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (m == 0) { out("FAIL — create_spirv\n"); return 7; }
+    rk_params(k, pp);
+    store32(pp, BENCH_NPX);
+    var bp[72];
+    var nb = 3;
+    _pair(&bp + 8, src);
+    if (rk_shape(k) == RK_SHAPE_1BUF) {
+        _pair(&bp + 24, prm);
+        _pair(&bp + 40, prm);
+    } else {
+        nb = 4;
+        _pair(&bp + 24, dst);
+        _pair(&bp + 40, prm);
+        _pair(&bp + 56, prm);
+    }
+    store64(&bp, nb);
+    var groups = BENCH_NPX / 256;
+    var r = 0;
+    while (r < BENCH_WARM) {
+        if (gpu_compute_dispatch(ctx, m, groups, 1, 1, &bp) != 0) { out("FAIL — dispatch\n"); return 9; }
+        r = r + 1;
+    }
+    var best = 0x7FFFFFFFFFFFFFFF;
+    var sum = 0;
+    r = 0;
+    while (r < BENCH_REPS) {
+        _fill(sp, 64, 0x2545F491 + r);      # touch the input so no run is a pure repeat
+        var t0 = clock_now_ns();
+        var rc = gpu_compute_dispatch(ctx, m, groups, 1, 1, &bp);
+        var dt = clock_now_ns() - t0;
+        if (rc != 0) { out("FAIL — dispatch\n"); return 9; }
+        if (dt < best) { best = dt; }
+        sum = sum + dt;
+        r = r + 1;
+    }
+    out("  "); out(rk_name(k)); out(": best "); outn(best / 1000); out(" us, mean ");
+    outn(sum / BENCH_REPS / 1000); out(" us, "); outn(BENCH_NPX * 1000 / best); out(" Mpx/s\n");
+    gpu_shader_module_release(ctx, m);
+    return 0;
+}
+
+# loop_lcg: a = src (binding 0), o = dst (binding 1); every workgroup works on lanes 0..63.
+fn bench_lcg(ctx, src, dst): i64 {
+    var spv[1680];
+    var k = 0;
+    var n = 0;
+    while (k < CFK_COUNT) {
+        if (streq(cfk_name(k), "loop_lcg") == 1) { n = cfk_build(k, &spv); }
+        k = k + 1;
+    }
+    if (n == 0) { out("FAIL — no loop_lcg fixture\n"); return 7; }
+    var m = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (m == 0) { out("FAIL — create_spirv\n"); return 7; }
+    var bp[40];
+    store64(&bp, 2);
+    _pair(&bp + 8, src);
+    _pair(&bp + 24, dst);
+    var groups = 4096;
+    var r = 0;
+    while (r < BENCH_WARM) {
+        if (gpu_compute_dispatch(ctx, m, groups, 1, 1, &bp) != 0) { out("FAIL — dispatch\n"); return 9; }
+        r = r + 1;
+    }
+    var best = 0x7FFFFFFFFFFFFFFF;
+    var sum = 0;
+    r = 0;
+    while (r < BENCH_REPS) {
+        var t0 = clock_now_ns();
+        var rc = gpu_compute_dispatch(ctx, m, groups, 1, 1, &bp);
+        var dt = clock_now_ns() - t0;
+        if (rc != 0) { out("FAIL — dispatch\n"); return 9; }
+        if (dt < best) { best = dt; }
+        sum = sum + dt;
+        r = r + 1;
+    }
+    # 262144 lanes x 4096 iterations x 4 multiply-adds
+    out("  loop_lcg: best "); outn(best / 1000); out(" us, mean "); outn(sum / BENCH_REPS / 1000);
+    out(" us, "); outn(262144 * 16384 / best); out(" G multiply-adds/s\n");
+    gpu_shader_module_release(ctx, m);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    out("mabda NVIDIA compute bench — ranga's whole-image kernels (1024x1024) and loop_lcg, on the TU116\n");
+    var t, v = gpu_context_new_native_nvidia();
+    if (is_err_result(t) == 1) { out("FAIL: no NVIDIA context\n"); return 3; }
+    var ctx = v;
+    var src = gpu_buffer_create(ctx, BENCH_NPX * 4, 0x008C);
+    var dst = gpu_buffer_create(ctx, BENCH_NPX * 4, 0x008C);
+    var prm = gpu_buffer_create(ctx, 32, 0x008C);
+    if (src == 0) { return 5; }
+    if (dst == 0) { return 5; }
+    if (prm == 0) { return 5; }
+    var sp = gpu_buffer_map(ctx, src);
+    var dp = gpu_buffer_map(ctx, dst);
+    var pp = gpu_buffer_map(ctx, prm);
+    _fill(sp, BENCH_NPX, 0x2545F491);
+    _fill(dp, BENCH_NPX, 0x9E3779B9);
+    var k = 0;
+    while (k < RK_COUNT) {
+        var shape = rk_shape(k);
+        var run = 0;
+        if (shape == RK_SHAPE_1BUF) { run = 1; }
+        if (streq(rk_name(k), "dissolve") == 1) { run = 1; }
+        if (run == 1) {
+            var rc = bench_one(ctx, k, src, dst, prm, sp, dp, pp);
+            if (rc != 0) { return rc; }
+        }
+        k = k + 1;
+    }
+    _fill(sp, 64, 0x2545F491);
+    var lr = bench_lcg(ctx, src, dst);
+    if (lr != 0) { return lr; }
+    gpu_buffer_release(ctx, prm);
+    gpu_buffer_release(ctx, dst);
+    gpu_buffer_release(ctx, src);
+    gpu_context_release(ctx);
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

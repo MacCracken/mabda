@@ -13,7 +13,9 @@ on an NVIDIA context compiles SPIR-V to SM75 SASS in-tree (`src/sm75_*.cyr`; des
 
 One mabda bug was found and fixed on the way: SM75 counted only the bindings a kernel reads,
 while GFX9 counts every binding it declares, so ranga's 3-entry binding array was refused on
-NVIDIA alone. Lifting the guard is ranga's call (mabda roadmap, "The consumer check").
+NVIDIA alone. Lifting the guard is ranga's call (mabda roadmap, "The consumer check"). The
+changes ranga needs are filed there as
+`ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`.
 Was: 📌 SCHEDULED — mabda v4.4.0 (Phase 3 of the 2026-11 plan; `docs/development/roadmap.md`).
 N9 was listed under "Next" from the 4.0.0 CHANGELOG ("deferrable to v4.1") without a roadmap entry
 until 2026-11-16.

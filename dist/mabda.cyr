@@ -26201,14 +26201,21 @@ fn sm75_reg(alloc, id): i64 {
 # shared front end, sm75_isel, sm75_regalloc and the encoders in sm75_encode.cyr.
 # docs/proposals/n9-spirv-to-sass.md §2, §5.
 #
-# SCHEDULING (§5) is deliberately conservative in v1, because a wrong control word fails
-# silently (garbage or a hang) rather than with an error:
-#   - every instruction stalls 15 cycles, longer than any SM75 fixed latency (yield clear:
-#     stall 15 with yield set is not a valid encoding — nvdisasm rejects 0x1F);
-#   - a variable-latency op (NAK's "decoupled" class: S2R, LDG, MUFU, I2F, F2I, FRND) sets
-#     write scoreboard 0, and the NEXT instruction waits on it;
-#   - STG reads its sources late: it sets read scoreboard 1 and the next instruction waits.
-# That serializes the program. Tightening it from NAK's SM75 latency tables is named in §7.
+# SCHEDULING (v2, 4.4.0; §5). sm75_schedule fills every instruction's control word from
+# NVIDIA's Turing latency tables as NAK carries them (src/nouveau/compiler/nak/
+# sm75_instr_latencies.rs, "register scheduling information provided by NVIDIA"), for the
+# subset sm75_isel emits:
+#   - a fixed-latency ("coupled") result is covered by the stall counts: an instruction issues
+#     no sooner than its producer's issue + the read-after-write latency for the pair;
+#   - a variable-latency ("decoupled") op sets a scoreboard, and the first instruction that
+#     reads or overwrites its result waits on it; one that overwrites a register it still reads
+#     gets a read scoreboard (a forward look decides whether one is needed);
+#   - every branch and EXIT waits on all scoreboards and is followed by the worst coupled
+#     latency, so a branch target never inherits a hazard.
+# v1 (N9.3–N9.6) stalled 15 cycles after every instruction and waited on every scoreboard at
+# the next one. Wrong control bits fail silently, so the schedule is checked independently in
+# the CPU suite and every NVIDIA gate runs on it. Yield stays clear, NAK's default (stall 15
+# with yield set is not a valid encoding — nvdisasm rejects 0x1F).
 #
 # LAYOUT. One instruction per record, then — as ptxas lays out every kernel, and as the
 # captured ones in backend_nvidia_sass.cyr show — a BRA to itself after the last EXIT (a
@@ -26294,8 +26301,344 @@ fn _s75_zero_size(op): i64 {
     return 0;
 }
 
-# Encode `n` records into `sass` (`sass_len` bytes) with the v1 schedule, then the tail.
-# Returns the byte length (a multiple of 128) or a negative error.
+# ================================================================
+# Scheduling (v2): control words from the Turing latency tables
+# ================================================================
+var SM75_ERR_SCHEDULE = 139;   # a hazard needs more than 15 stall cycles, or ctl[] is short
+
+# Latency classes: NAK's RegLatencySM75, the subset sm75_isel emits.
+var _S75_C_NONE = 0;   # LABEL (no instruction)
+var _S75_C_ALU  = 1;   # CoupledAlu: IADD3 LOP3 SHF ISETP SEL MOV FMNMX
+var _S75_C_FMA  = 2;   # CoupledFMA and IMADLo (identical rows): FADD FMUL FFMA IMAD IMAD.HI
+var _S75_C_DEC  = 3;   # Decoupled, scoreboarded: S2R LDG STG MUFU I2F F2I FRND
+var _S75_C_UNI  = 4;   # ULDC (the uniform datapath's Uldc)
+var _S75_C_CTL  = 5;   # BRA, EXIT
+
+var SM75_LAT_GUARD   = 12;   # ISETP -> a branch guarded by its predicate (GuardPredicate)
+var SM75_LAT_SEL     = 4;    # ISETP -> SEL reading the predicate (CoupledAlu)
+var SM75_LAT_UR      = 2;    # ULDC -> LDG / STG reading the UR (VectorDecoupled)
+var SM75_LAT_WAW_DEC = 6;    # a coupled write, then a decoupled write of the same register
+var SM75_LAT_DRAIN   = 6;    # the worst coupled GPR read-after-write: what a target may read
+var SM75_SB_SET_WAIT = 2;    # a scoreboard is waited on no sooner than 2 cycles after its set
+var SM75_EXIT_STALL  = 5;    # what ptxas gives EXIT
+var _S75_NEVER = 0 - 1000000;
+
+fn _s75_class(op): i64 {
+    if (op == SM75I_LABEL) { return _S75_C_NONE; }
+    if (op == SM75I_BRA) { return _S75_C_CTL; }
+    if (op == SM75I_EXIT) { return _S75_C_CTL; }
+    if (op == SM75I_ULDC) { return _S75_C_UNI; }
+    if (op == SM75I_STG) { return _S75_C_DEC; }
+    if (_s75_decoupled(op) == 1) { return _S75_C_DEC; }
+    if (op == SM75I_FADD) { return _S75_C_FMA; }
+    if (op == SM75I_FMUL) { return _S75_C_FMA; }
+    if (op == SM75I_FFMA) { return _S75_C_FMA; }
+    if (op == SM75I_IMAD) { return _S75_C_FMA; }
+    if (op == SM75I_IMAD_HI) { return _S75_C_FMA; }
+    return _S75_C_ALU;
+}
+
+# Read-after-write latency, coupled writer class `wc` -> reader class `rc` (NAK
+# RegLatencySM75::read_after_write). A decoupled reader takes 6 from any coupled writer.
+fn _s75_raw(wc, rc): i64 {
+    if (rc == _S75_C_DEC) { return 6; }
+    if (rc == _S75_C_ALU) {
+        if (wc == _S75_C_ALU) { return 4; }
+        return 5;
+    }
+    if (rc == _S75_C_FMA) {
+        if (wc == _S75_C_FMA) { return 4; }
+        return 5;
+    }
+    return 1;
+}
+
+fn _s75_src_add(out, k, r): i64 {
+    if (r < 0) { return k; }
+    if (r >= SM75_RZ) { return k; }
+    store64(out + k * 8, r);
+    return k + 1;
+}
+
+# The physical GPRs record i reads (at most 3, into `out`; RZ and immediates are not reads).
+fn _s75_srcs(isel, i, alloc, out): i64 {
+    var op = sm75i_op(isel, i);
+    var fl = sm75i_flags(isel, i);
+    var ua = 0;
+    var ub = 0;
+    var uc = 0;
+    if (op == SM75I_IADD3) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_IMAD) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_IMAD_HI) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_LOP3) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_SHF) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_FFMA) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_ISETP) { ua = 1; ub = 1; }
+    if (op == SM75I_SEL) { ua = 1; ub = 1; }
+    if (op == SM75I_FADD) { ua = 1; ub = 1; }
+    if (op == SM75I_FMUL) { ua = 1; ub = 1; }
+    if (op == SM75I_FMNMX) { ua = 1; ub = 1; }
+    if (op == SM75I_MOV) { ub = 1; }
+    if (op == SM75I_FRND) { ub = 1; }
+    if (op == SM75I_F2I) { ub = 1; }
+    if (op == SM75I_I2F) { ub = 1; }
+    if (op == SM75I_MUFU) { ub = 1; }
+    if (op == SM75I_LDG) { ua = 1; }
+    if (op == SM75I_STG) { ua = 1; ub = 1; }
+    var k = 0;
+    if (ua == 1) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_a(isel, i))); }
+    if (ub == 1) { if ((fl & MIR_FLAG_B_IMM) == 0) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_b(isel, i))); } }
+    if (uc == 1) { if ((fl & MIR_FLAG_C_IMM) == 0) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_c(isel, i))); } }
+    return k;
+}
+
+# The physical GPR record i writes, or -1.
+fn _s75_dst(isel, i, alloc): i64 {
+    if (_s75_writes_gpr(sm75i_op(isel, i)) == 0) { return 0 - 1; }
+    if (sm75i_dst(isel, i) <= 0) { return 0 - 1; }
+    var r = sm75_reg(alloc, sm75i_dst(isel, i));
+    if (r < 0) { return 0 - 1; }
+    if (r >= SM75_RZ) { return 0 - 1; }
+    return r;
+}
+
+fn _s75_in(regs, n, r): i64 {
+    var k = 0;
+    while (k < n) {
+        if (load64(regs + k * 8) == r) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Does decoupled record i need a READ scoreboard? When a later instruction overwrites one of
+# its sources before anything waits on its result (a wait on the result covers the reads,
+# which finish first). A branch waits on every scoreboard, so it covers an op with a result;
+# a STG has none, and without a read scoreboard the branch would have nothing to wait on
+# while the target overwrites the data register — so a STG before a branch takes one. After
+# EXIT nothing runs: no read scoreboard (ptxas does the same).
+fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
+    if (ns == 0) { return 0; }
+    var js[24];
+    var j = i + 1;
+    while (j < n) {
+        var opj = sm75i_op(isel, j);
+        if (opj == SM75I_BRA) {
+            if (d < 0) { return 1; }
+            return 0;
+        }
+        if (opj == SM75I_EXIT) { return 0; }
+        if (opj != SM75I_LABEL) {
+            var nj = _s75_srcs(isel, j, alloc, &js);
+            var dj = _s75_dst(isel, j, alloc);
+            if (d >= 0) {
+                if (dj == d) { return 0; }
+                if (_s75_in(&js, nj, d) == 1) { return 0; }
+            }
+            if (dj >= 0) { if (_s75_in(srcs, ns, dj) == 1) { return 1; } }
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# Scoreboard k is free again: no register waits on it any more.
+fn _s75_sb_clear(sbw, sbr, k): i64 {
+    var m = 0 - 1 - (1 << k);    # ~(1 << k)
+    var r = 0;
+    while (r < 256) {
+        store64(sbw + r * 8, load64(sbw + r * 8) & m);
+        store64(sbr + r * 8, load64(sbr + r * 8) & m);
+        r = r + 1;
+    }
+    return 0;
+}
+
+# A scoreboard to set: the lowest free one, else the one set longest ago (the caller waits on it).
+fn _s75_sb_pick(busy, sseq): i64 {
+    var k = 0;
+    while (k < 6) {
+        if (((busy >> k) & 1) == 0) { return k; }
+        k = k + 1;
+    }
+    var best = 0;
+    k = 1;
+    while (k < 6) {
+        if (load64(sseq + k * 8) < load64(sseq + best * 8)) { best = k; }
+        k = k + 1;
+    }
+    return best;
+}
+
+# Compute every record's control word into ctl (`ctl_len` bytes, 8 per record):
+# stall | write SB << 4 | read SB << 8 | wait mask << 12 (SB 7 = none). Records are processed
+# in program order, which is also the fall-through order: a label inherits its fall-through
+# predecessor's state, and anything reaching it by a branch arrives with nothing outstanding.
+# Returns 0 or a negative error.
+fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
+    if (n > ctl_len / 8) { return 0 - SM75_ERR_SCHEDULE; }
+    var wcyc[2048];     # 256 GPRs: issue cycle of the last coupled write (_S75_NEVER: none)
+    var wcls[2048];     # its latency class
+    var sbw[2048];      # scoreboards to wait on before reading or writing (a pending result)
+    var sbr[2048];      # scoreboards to wait on before writing (a pending decoupled read)
+    var urc[512];       # 64 uniform registers: issue cycle of the ULDC that wrote them
+    var sset[48];       # 6 scoreboards: the cycle each was last set
+    var sseq[48];       # 6 scoreboards: allocation order
+    var srcs[24];
+    memset(&wcls, 0, 2048);
+    memset(&sbw, 0, 2048);
+    memset(&sbr, 0, 2048);
+    memset(&sset, 0, 48);
+    memset(&sseq, 0, 48);
+    var r = 0;
+    while (r < 256) { store64(&wcyc + r * 8, _S75_NEVER); r = r + 1; }
+    r = 0;
+    while (r < 64) { store64(&urc + r * 8, _S75_NEVER); r = r + 1; }
+    var busy = 0;
+    var seq = 1;
+    var p0c = _S75_NEVER;
+    var tprev = 0 - 1;
+    var iprev = 0 - 1;
+    var minnext = 0;
+    var i = 0;
+    while (i < n) {
+        var op = sm75i_op(isel, i);
+        var cls = _s75_class(op);
+        store64(ctl + i * 8, 0);
+        if (cls == _S75_C_NONE) { i = i + 1; continue; }
+        var ns = _s75_srcs(isel, i, alloc, &srcs);
+        var d = _s75_dst(isel, i, alloc);
+        var fl = sm75i_flags(isel, i);
+        var t = tprev + 1;
+        if (t < minnext) { t = minnext; }
+        var wait = 0;
+        var k = 0;
+        while (k < ns) {
+            var s = load64(&srcs + k * 8);
+            var lr = load64(&wcyc + s * 8) + _s75_raw(load64(&wcls + s * 8), cls);
+            if (t < lr) { t = lr; }
+            wait = wait | load64(&sbw + s * 8);
+            k = k + 1;
+        }
+        if (op == SM75I_SEL) { if (t < p0c + SM75_LAT_SEL) { t = p0c + SM75_LAT_SEL; } }
+        if (op == SM75I_BRA) {
+            if (((fl >> 8) & 1) == 1) { if (t < p0c + SM75_LAT_GUARD) { t = p0c + SM75_LAT_GUARD; } }
+        }
+        var ur = 0 - 1;
+        if (op == SM75I_LDG) { ur = (fl >> 8) & 0x3F; }
+        if (op == SM75I_STG) { ur = (fl >> 8) & 0x3F; }
+        if (ur >= 0) { if (t < load64(&urc + ur * 8) + SM75_LAT_UR) { t = load64(&urc + ur * 8) + SM75_LAT_UR; } }
+        if (d >= 0) {
+            wait = wait | load64(&sbw + d * 8) | load64(&sbr + d * 8);
+            if (cls == _S75_C_DEC) {
+                var lw = load64(&wcyc + d * 8) + SM75_LAT_WAW_DEC;
+                if (t < lw) { t = lw; }
+            }
+        }
+        if (cls == _S75_C_CTL) { wait = wait | busy; }
+        wait = wait & busy;
+        # The waits free their scoreboards; a wait comes >= 2 cycles after the set.
+        k = 0;
+        while (k < 6) {
+            if (((wait >> k) & 1) == 1) {
+                if (t < load64(&sset + k * 8) + SM75_SB_SET_WAIT) { t = load64(&sset + k * 8) + SM75_SB_SET_WAIT; }
+                busy = busy & (0 - 1 - (1 << k));
+                _s75_sb_clear(&sbw, &sbr, k);
+            }
+            k = k + 1;
+        }
+        var kw = 7;
+        var kr = 7;
+        if (cls == _S75_C_DEC) {
+            if (d >= 0) {
+                kw = _s75_sb_pick(busy, &sseq);
+                if (((busy >> kw) & 1) == 1) {
+                    wait = wait | (1 << kw);
+                    var ekw = load64(&sset + kw * 8) + SM75_SB_SET_WAIT;
+                    if (t < ekw) { t = ekw; }
+                    _s75_sb_clear(&sbw, &sbr, kw);
+                }
+                busy = busy | (1 << kw);
+                store64(&sseq + kw * 8, seq);    # now the newest: the read pick cannot evict it
+                seq = seq + 1;
+            }
+            if (_s75_need_rd(isel, n, alloc, i, &srcs, ns, d) == 1) {
+                kr = _s75_sb_pick(busy, &sseq);
+                if (((busy >> kr) & 1) == 1) {
+                    wait = wait | (1 << kr);
+                    var ekr = load64(&sset + kr * 8) + SM75_SB_SET_WAIT;
+                    if (t < ekr) { t = ekr; }
+                    _s75_sb_clear(&sbw, &sbr, kr);
+                }
+                busy = busy | (1 << kr);
+                store64(&sseq + kr * 8, seq);
+                seq = seq + 1;
+            }
+        }
+        # The previous instruction's stall is the gap to this one.
+        if (iprev >= 0) {
+            var st = t - tprev;
+            if (st > 15) { return 0 - SM75_ERR_SCHEDULE; }
+            store64(ctl + iprev * 8, load64(ctl + iprev * 8) | st);
+        }
+        store64(ctl + i * 8, (kw << 4) | (kr << 8) | (wait << 12));
+        # State after issue: scoreboards set now, then sources' read SB, then the result.
+        if (kw != 7) { store64(&sset + kw * 8, t); }
+        if (kr != 7) {
+            store64(&sset + kr * 8, t);
+            k = 0;
+            while (k < ns) {
+                var sr = load64(&srcs + k * 8);
+                store64(&sbr + sr * 8, load64(&sbr + sr * 8) | (1 << kr));
+                k = k + 1;
+            }
+        }
+        if (d >= 0) {
+            if (cls == _S75_C_DEC) {
+                store64(&wcyc + d * 8, _S75_NEVER);
+                store64(&sbw + d * 8, 1 << kw);
+            } else {
+                store64(&wcyc + d * 8, t);
+                store64(&wcls + d * 8, cls);
+                store64(&sbw + d * 8, 0);
+            }
+            store64(&sbr + d * 8, 0);
+        }
+        if (op == SM75I_ISETP) { p0c = t; }
+        if (op == SM75I_ULDC) {
+            var u = sm75i_a(isel, i);
+            if (u >= 0) {
+                if (u < 63) { store64(&urc + u * 8, t); store64(&urc + (u + 1) * 8, t); }
+            }
+        }
+        minnext = 0;
+        if (cls == _S75_C_CTL) {
+            # Whatever runs next (the fall-through or the target) may read any register: it
+            # issues after the worst coupled latency of everything still in flight.
+            r = 0;
+            while (r < 256) {
+                var dr = load64(&wcyc + r * 8) + SM75_LAT_DRAIN;
+                if (dr > minnext) { minnext = dr; }
+                r = r + 1;
+            }
+        }
+        tprev = t;
+        iprev = i;
+        i = i + 1;
+    }
+    if (iprev >= 0) {
+        var sl = SM75_EXIT_STALL;
+        if (minnext - tprev > sl) { sl = minnext - tprev; }
+        if (sl > 15) { return 0 - SM75_ERR_SCHEDULE; }
+        store64(ctl + iprev * 8, load64(ctl + iprev * 8) | sl);
+    }
+    return 0;
+}
+
+# Encode `n` records into `sass` (`sass_len` bytes) with sm75_schedule's control words, then
+# the tail. At most SM75_EMIT_MAX_RECS records. Returns the byte length (a multiple of 128) or
+# a negative error.
+var SM75_EMIT_MAX_RECS = 1024;
 fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
     # Pass 1: instruction count, and each label's byte offset (labels emit nothing).
     var laboff[2048];   # 256 label <id>s (ids < cap_ids <= 256)
@@ -26317,7 +26660,10 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
     var total = nins + 1;
     if ((total % 8) != 0) { total = total + (8 - total % 8); }
     if (total * SM75_INS > sass_len) { return 0 - SM75_ERR_SASS_OVERFLOW; }
-    var wait = 0;
+    if (n > SM75_EMIT_MAX_RECS) { return 0 - SM75_ERR_CAP_EXCEEDED; }
+    var ctl[8192];      # SM75_EMIT_MAX_RECS * 8
+    var sr = sm75_schedule(isel, n, alloc, &ctl, 8192);
+    if (sr < 0) { return sr; }
     var pc = 0;
     i = 0;
     while (i < n) {
@@ -26339,20 +26685,16 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
             rc = _s75_encode(isel, i, alloc, ins);
         }
         if (rc < 0) { return rc; }
-        var wr = 7;
-        var rd = 7;
-        var next = 0;
-        if (_s75_decoupled(op) == 1) { wr = 0; next = next | 1; }
-        if (op == SM75I_STG) { rd = 1; next = next | 2; }
-        sm75_set_ctrl(ins, 15, 0, wr, rd, wait, 0);
-        wait = next;
+        var c = load64(&ctl + i * 8);
+        sm75_set_ctrl(ins, c & 15, 0, (c >> 4) & 7, (c >> 8) & 7, (c >> 12) & 0x3F, 0);
         pc = pc + SM75_INS;
         i = i + 1;
     }
-    # BRA to itself (-4 words from the next instruction), then NOP padding.
+    # BRA to itself (-4 words from the next instruction), then NOP padding. Never reached: the
+    # program ends in EXIT, which waited on every scoreboard.
     var tb = sass + nins * SM75_INS;
     sm75_enc_bra(tb, 0 - 4);
-    sm75_set_ctrl(tb, 15, 0, 7, 7, wait, 0);
+    sm75_set_ctrl(tb, 15, 0, 7, 7, 0, 0);
     var j = nins + 1;
     while (j < total) {
         var np = sass + j * SM75_INS;
@@ -29504,7 +29846,7 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
 #   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
 #   70-88   encoding / validation / table build              (src/gfx9_compile.cyr)
 #   100-106 instruction selection                            (src/gfx9_isel.cyr)
-#   130-138 SM75 (NVIDIA) selection / regalloc / emit         (src/sm75_*.cyr)
+#   130-139 SM75 (NVIDIA) selection / regalloc / schedule / emit (src/sm75_*.cyr)
 #   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
 fn gpu_shader_error_name(code): i64 {
     if (code == 0) { return "no error"; }
@@ -29585,6 +29927,7 @@ fn gpu_shader_error_name(code): i64 {
     if (c == SM75_ERR_ALLOC_SHORT) { return "sm75 regalloc: alloc[] shorter than cap_ids records"; }
     if (c == SM75_ERR_SASS_OVERFLOW) { return "sm75 emit: SASS would not fit the output buffer"; }
     if (c == SM75_ERR_UNRESOLVED_LABEL) { return "sm75 emit: a branch to a label not in the program"; }
+    if (c == SM75_ERR_SCHEDULE) { return "sm75 schedule: a hazard needs more than 15 stall cycles, or ctl[] is short"; }
     if (c == GISEL_ERR_COND_NOT_COMPARE) {
         return "isel: branch / select condition is not an integer or OpFOrd compare result";
     }
