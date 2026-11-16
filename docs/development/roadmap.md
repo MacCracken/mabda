@@ -95,24 +95,32 @@ accidentally couples to it.
 
 Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the roadmap.
 
-- 🔨 **N9: SPIR-V → SASS for the NVIDIA backend**, in progress. The design note is
-  [`../proposals/n9-spirv-to-sass.md`](../proposals/n9-spirv-to-sass.md), whose §7 lists the bites.
-  **N9.1–N9.5 have landed**: compiled SPIR-V runs on the TU116 through the public API, with
-  branches, loops and phis. 22 of the 24 control-flow kernels match on every lane
-  (`test-nvidia-spirv-compute-e2e`); the other two are refused by name (f64; an out-of-range
-  label). N9.6 (ranga's kernels and suites, the done-when) is open. ranga's 11 kernels at HEAD
-  need less than the issue lists: no `OpFDiv`, `OpSelect` or
-  `FClamp`. (`issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`;
-  ranga's NVIDIA compute waits on it). The NVIDIA backend takes only pre-captured SASS; a portable
-  consumer ships SPIR-V. The compiler is the analogue of `spirv_lower` → `gfx9_*`: the SPIR-V
-  parse and the MIR are reused; new for SM75 are instruction selection, register allocation,
-  encoding and the control words (stall counts, barriers, yields). Its modules set
-  `NV_SHMOD_NBIND`, which 4.3.0's binding array reads. A design note in `docs/proposals/` first.
-  Oracle: `nvcc -arch=sm_75 -cubin` on `chew` (`/opt/cuda/bin`) with an `nvdisasm -b SM75`
-  round-trip. **Done when** ranga's 11 kernels (`ranga/src/gpu_kernels.cyr`: storage load /
-  store, integer and f32 arithmetic, structured selections, `OpFDiv`, `OpSelect`, GLSL.std.450
-  clamps, 2–3 bindings) compile through `gpu_shader_module_create_spirv` on an NVIDIA context and
-  ranga's four GPU suites pass on the TU116.
+- ✅ **N9: SPIR-V → SASS for the NVIDIA backend** — done (uncommitted; CHANGELOG [4.4.0]
+  N9.1–N9.6). The design note is [`../proposals/n9-spirv-to-sass.md`](../proposals/n9-spirv-to-sass.md).
+  `gpu_shader_module_create_spirv` on an NVIDIA context compiles SPIR-V to SM75 SASS in-tree,
+  reusing the SPIR-V front end and MIR, with its own instruction selection, register allocation,
+  encoder and control words (`src/sm75_*.cyr`).
+  **Done-when met, 2026-11-16:**
+  - ranga's 11 kernels compile through the public API on the TU116, and
+    `test-nvidia-ranga-kernels-e2e` matches all 11 to goldens computed independently by the
+    fixture generator's SPIR-V interpreter.
+  - ranga's four GPU suites pass on the TU116 with an NVIDIA context: `gpu` 48, `gpu_kernels` 53,
+    `gpu_pipeline` 102 and `gpu_spirv` 54, the same counts as on AMD. They ran in a scratch clone
+    of ranga with the guard lifted (see the consumer check below).
+
+  The same 24 control-flow kernels run on both backends. On NVIDIA 22 match every lane and 2 are
+  refused by name (f64; an out-of-range label). The request is archived:
+  `issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md`.
+- **N9 follow-ons, from the design note's §7** (named there "for after the done-when"; now
+  scheduled here). Each needs a hardware check on chew:
+  - `BSSY` / `BSYNC` reconvergence hints. v1 omits them, which is correct but lets diverged
+    threads reconverge later than ptxas code would.
+  - Scheduling from the SM75 latency tables (NAK `sm75_instr_latencies.rs`) in place of v1's
+    stall-15-everywhere control words.
+  - Predicate allocation (P0–P6) in place of re-emitting the compare whenever P0 holds another.
+  - A target-aware lowering for f32 `OpFDiv` (`MUFU.RCP` plus a Newton step) and for f64. Today
+    `sm75_isel` refuses both with `SM75_ERR_UNSUPPORTED_OP`, and so does the control-flow suite's
+    `loop_phi_f64`.
 - ✅ **The scratch-buffer contract** — landed (uncommitted; CHANGELOG [4.4.0]). Every compiler
   buffer now carries its byte length and each stage derives its capacity from it: `mir_mod_init`,
   the table builders, `_spirv_resolve_builtins` / `spirv_lower_module`, `gfx9_isel`,
@@ -123,7 +131,8 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   are fixed. HW-verified on the Cezanne (`test-native-all` 72 / 0 / 2 skipped,
   `build/logs/test-native-all-20261116-123553.log`). **Open:** ranga's `tests/gpu_spirv.tcyr`
   calls the table builders with the old 5-argument form and now fails to compile; it needs the
-  4-argument call. That is ranga's repo, and it rides with the ranga consumer run below.
+  4-argument call. That is ranga's repo, and it rides with the consumer check below (the call
+  was verified in N9.6's scratch run).
 - ✅ **The compiler limits v4.1.0 left named**, AMD half. It landed uncommitted (CHANGELOG
   [4.4.0]). Nested divergent ifs use a region stack in `gfx9_isel` with one saved-EXEC pair per
   level, up to 8. Int-compare `OpSelect` uses `s_cselect_b32` for a uniform condition and
@@ -139,7 +148,7 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   inside a divergent region, and nesting deeper than 8. **SM75 half: done in N9.5.** The same 24
   kernels run on the TU116. 22 match every lane, including the return inside a loop and the
   9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `loop_phi_f64` is
-  refused because f64 is not selected for NVIDIA yet (the design note's §7 f64 item);
+  refused because f64 is not selected for NVIDIA yet (the N9 follow-ons' f64 item above);
   `oob_label` is refused as on AMD.
 - **NVIDIA block-linear scanout + ADDFB2 format modifiers.** The nouveau present slots
   (`_nv_surface_alloc_fb`) scan out a LINEAR VRAM BO with modifier 0 (ADR 007 Fork 4);
@@ -162,7 +171,22 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   returns the frame's `WGPUTexture` and nothing releases it; noted in CHANGELOG [4.3.1]): release
   it at `gpu_surface_present`, with a CPU test and an RSS check.
 - **The consumer check** — ranga's GPU suites against the bundle (4.3.1 ran only the fold
-  name-collision scan: 0 shared function names with ranga or soorat).
+  name-collision scan: 0 shared function names with ranga or soorat). Partly run during N9.6
+  against the in-progress bundle, in a scratch clone of ranga@de54123:
+  - native AMD on the Cezanne: `gpu` 48, `gpu_kernels` 53, `gpu_pipeline` 102 and `gpu_spirv`
+    54, all passing;
+  - NVIDIA on the TU116: the same four suites and counts;
+  - logs in `build/logs/ranga-gpu-suites-{amd,nvidia}-n9.6-*.log`.
+
+  Still to do: rerun against the final 4.4.0 bundle at the cut. ranga needs four changes in its
+  own repo, all ranga's call:
+  - `tests/gpu_spirv.tcyr`'s 4-argument table-builder call (needed for 4.4.0 on any backend);
+  - `BACKEND_KIND_NVIDIA` added to `gpu_context_supports_compute` (ADR 005's allowlist);
+  - `tests/gpu_nvidia.tcyr`'s refused rows flipped to the AMD suites' expected values;
+  - a way to open an NVIDIA context in the four suites, which hard-code `gpu_context_new_amd`.
+
+  Also for ranga, low priority: its SPIR-V is version 1.3 but lists storage buffers in
+  `OpEntryPoint`, a 1.4 rule. mabda accepts it; `spirv-val` and naga would not.
 
 ---
 

@@ -1,7 +1,7 @@
 # N9 — SPIR-V → SASS (SM75) for the native NVIDIA backend
 
-**Status:** design, 2026-11-16. Roadmap: v4.4.0. Issue:
-[`2026-11-02-n9-spirv-to-sass-compiler-request.md`](../development/issues/2026-11-02-n9-spirv-to-sass-compiler-request.md).
+**Status:** done, 2026-11-16 (N9.1–N9.6; the done-when is met, see §7). Roadmap: v4.4.0. Issue:
+[`2026-11-02-n9-spirv-to-sass-compiler-request.md`](../development/issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md).
 
 **Done when:** `gpu_shader_module_create_spirv` on an NVIDIA context compiles ranga's 11 kernels,
 and ranga's four GPU suites pass on the TU116 (`chew`) with an NVIDIA context.
@@ -168,13 +168,20 @@ on it.
 | N9.3 | `sm75_regalloc` + conservative `sm75_sched` + `sm75_compile` driver; register-count rounding | CPU; whole-kernel `nvdisasm` round trip |
 | N9.4 | backend wiring: SPIR-V `shader_module_create` on NVIDIA, QMD LocalSize + register count + binding count; first compiled kernel (SAXPY) on the TU116 | `test-nvidia-spirv-*` program on chew |
 | N9.5 | branches, loops, phis, int-compare select, the udiv macro; the 24 control-flow kernels on the TU116 | `test-nvidia-spirv-compute-e2e` (N9.4's gate, now checking every kernel), every lane |
-| N9.6 | ranga's 11 kernels through the public API on the TU116; then ranga's four GPU suites with an NVIDIA context | the done-when |
+| N9.6 | ranga's 11 kernels through the public API on the TU116; then ranga's four GPU suites with an NVIDIA context | the done-when: `test-nvidia-ranga-kernels-e2e` (goldens from an independent SPIR-V interpreter) and ranga's suites in a scratch clone |
 
-Status (2026-11-16): N9.1–N9.5 have landed. On the TU116, 22 of the 24 control-flow kernels
-match every lane. `loop_phi_f64` is refused as `SM75_ERR_UNSUPPORTED_OP` (the f64 item below),
-and `oob_label` as `MIR_ERR_ID_OOR`. N9.6 is next.
+Status (2026-11-16): N9.1–N9.6 have landed and the done-when is met. On the TU116:
+- 22 of the 24 control-flow kernels match every lane. `loop_phi_f64` is refused as
+  `SM75_ERR_UNSUPPORTED_OP` (the f64 item below), and `oob_label` as `MIR_ERR_ID_OOR`.
+- ranga's 11 kernels match the generator's oracle (`tests/spirv/ranga/`).
+- ranga's four GPU suites pass with an NVIDIA context: `gpu` 48, `gpu_kernels` 53,
+  `gpu_pipeline` 102, `gpu_spirv` 54.
 
-Named for after the done-when, tracked here and to be carried into the roadmap when N9 closes:
+N9.6 found one bug: SM75 counted only the bindings a kernel reads, where GFX9 counts the
+bindings it declares. It now counts declared bindings too (CHANGELOG [4.4.0]).
+
+Named for after the done-when. Since N9 closed they are tracked in the roadmap's 4.4.0 section,
+"N9 follow-ons":
 `BSSY`/`BSYNC` reconvergence; tightened scheduling from the SM75 latency tables; predicate
 allocation in place of P0 re-emission; a target-aware lowering for `OpFDiv` (`MUFU.RCP` + Newton
 on SM75) and f64.
@@ -188,7 +195,8 @@ on SM75) and f64.
   round trip: three independent checks.
 - **ranga's own NVIDIA guard** (ranga ADR 005) refuses compute on NVIDIA contexts. Running ranga's
   suites (N9.6) needs that guard lifted in ranga's repository. That is the maintainer's call and
-  outside mabda.
+  outside mabda. N9.6 ran the suites in a scratch clone with the guard lifted; ranga's
+  repository is unchanged, and the changes it needs are listed in the roadmap's consumer check.
 
 ## 9. Not changing
 

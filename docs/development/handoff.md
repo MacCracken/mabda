@@ -14,22 +14,28 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   Two items have landed: **the scratch-buffer contract** and **the compiler limits v4.1.0 left
   named**, together with the control-flow miscompiles found next to them (see "The compiler's
   control flow" below). **N9 is in progress**: the design is `docs/proposals/n9-spirv-to-sass.md`
-  and N9.1–N9.5 have landed. N9.1–N9.3 are `src/sm75_encode.cyr`, `sm75_isel.cyr`,
-  `sm75_regalloc.cyr` and `sm75_compile.cyr`; `sm75_compile_spirv` is the CPU compile frame.
-  N9.4 wired it into the NVIDIA backend. N9.5 added branches, loops and phis. On the TU116,
-  `make test-nvidia-spirv-compute-e2e` gets 22 of the 24 control-flow kernels right on every
-  lane; the other two are refused by name (f64; an out-of-range label). Where NVIDIA's
-  expectation differs from AMD's, it comes from `; nv-want:` / `; nv-refuse:` lines in
-  `tests/spirv/control_flow/*.body`, via `cfk_nv_refuse` / `cfk_nv_want`. **Next is N9.6**:
-  compile ranga's 11 kernels (`ranga/src/gpu_kernels.cyr`) through
-  `gpu_shader_module_create_spirv` on the TU116, then run ranga's four GPU suites with an NVIDIA
-  context. That needs two changes in ranga's repo: its NVIDIA compute guard (ADR 005) lifted, and
-  `tests/gpu_spirv.tcyr`'s 4-argument table-builder call. Both are the user's call.
+  and **N9 is done** (N9.1–N9.6). The modules are `src/sm75_encode.cyr`, `sm75_isel.cyr`,
+  `sm75_regalloc.cyr` and `sm75_compile.cyr`; `sm75_compile_spirv` is the CPU compile frame, and
+  `backend_nvidia.cyr` wires it into `gpu_shader_module_create_spirv`. On the TU116:
+  - `test-nvidia-spirv-compute-e2e`: 22 of the 24 control-flow kernels match every lane;
+  - `test-nvidia-ranga-kernels-e2e`: ranga's 11 kernels match;
+  - ranga's four GPU suites pass with an NVIDIA context (in a scratch clone).
+
+  ranga's kernels are vendored in `tests/spirv/ranga/`. Their goldens come from the SPIR-V
+  interpreter in `scripts/gen-spirv-ranga-fixtures.py` (`make check-ranga-fixtures`).
+  `test-native-ranga-kernels-e2e` checks the same goldens on AMD. The open 4.4.0 items are:
+  - N9's follow-ons: `BSSY` / `BSYNC`, latency-table scheduling, predicate allocation, and SM75
+    `OpFDiv` / f64. Each needs a hardware check on chew.
+  - NVIDIA block-linear scanout.
+  - The surface-acquire leak.
+  - The seat-only closeout.
+  - The consumer check. ranga needs four changes in its own repo, all its call; the roadmap
+    lists them.
   On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
   Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
   deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
-  `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. After N9 come NVIDIA block-linear
-  scanout, the surface-acquire leak, the seat-only closeout and ranga's run. ranga's
+  `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. ranga's suites ran from static binaries built
+  here against a scratch clone (`~/ranga-n96` on chew holds them). ranga's
   `tests/gpu_spirv.tcyr` needs the 4-argument table-builder call (CHANGELOG, Breaking).
 - **This boot took a compute-ring reset** (12:59:20, 2026-11-16: a probe hung the GPU before its
   fix). Render gates run since are on a post-reset GPU. The clean-boot `test-native-all` in the

@@ -900,6 +900,27 @@ test-native-spirv-control-flow-e2e: build/native_spirv_control_flow_e2e
 check-cf-fixtures:
 	@./scripts/gen-spirv-cf-fixtures.py --check
 
+# The generated ranga-kernel fixture must match tests/spirv/ranga/*.spv (python3 only).
+.PHONY: check-ranga-fixtures
+check-ranga-fixtures:
+	@./scripts/gen-spirv-ranga-fixtures.py --check
+
+# v4.4.0 (N9.6) — ranga's eleven SPIR-V kernels through the public API, bound and
+# parameterised as ranga binds them, on 61x67 seeded pixels. One program for both native
+# backends: every output must hash to the same golden on AMD (gfx9_compile) and NVIDIA
+# (sm75_compile). Masterless (render node only); the NVIDIA one runs over ssh on chew.
+build/ranga_kernels_e2e: programs/ranga_kernels_e2e.cyr src/*.cyr tests/tcyr/spirv_ranga_kernels.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/ranga_kernels_e2e.cyr $@
+
+.PHONY: test-native-ranga-kernels-e2e
+test-native-ranga-kernels-e2e: build/ranga_kernels_e2e
+	./build/ranga_kernels_e2e amd
+
+.PHONY: test-nvidia-ranga-kernels-e2e
+test-nvidia-ranga-kernels-e2e: build/ranga_kernels_e2e
+	./build/ranga_kernels_e2e nvidia
+
 # v3.2 F.7e — the first COMPILED f64 on silicon: an f64 FMA SPIR-V kernel compiled in-tree
 # (gfx9_compile) + dispatched on Cezanne, bit-exact vs the fused-FMA reference.
 build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr

@@ -35,13 +35,18 @@ The remaining 4.4.0 items are open and tracked in the roadmap. "The same in N9's
 done in N9.5, below. f64 is the exception: it is not selected for NVIDIA yet and stays a named
 N9 item.
 
-**N9 (SPIR-V → SASS for NVIDIA) is in progress.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.5 have
-landed: the encoder, instruction selection, register allocation, scheduling, the compile driver,
-the backend wiring, and branches, loops and phis. **SPIR-V compiled in-tree now runs on the
-TU116**: 22 of the 24 control-flow kernels match on every lane. The other two are refused by
-name: one is f64, the other has an out-of-range label. N9.6 (ranga's kernels and suites, the
-done-when) is open.
+**N9 (SPIR-V → SASS for NVIDIA) is done.** The design note is
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.6 cover the
+encoder, instruction selection, register allocation, scheduling, the compile driver, the
+backend wiring, branches, loops and phis, and ranga. `gpu_shader_module_create_spirv` on an
+NVIDIA context now compiles SPIR-V in-tree. On the TU116:
+- 22 of the 24 control-flow kernels match on every lane; the other two are refused by name
+  (f64; an out-of-range label);
+- ranga's 11 kernels match an independent oracle;
+- ranga's four GPU suites pass with an NVIDIA context.
+
+The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section: `BSSY` /
+`BSYNC`, latency-table scheduling, predicate allocation, and SM75 `OpFDiv` / f64.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -285,6 +290,63 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   directions, the `@!P0` guard, and the unresolved-label refusals. In `sm75_isel.tcyr`
   (71 assertions), `if_div` now selects.
 
+### Added — N9.6: ranga's kernels on NVIDIA (N9's done-when)
+- **Fixed: a module's binding count differed between the backends.** `sm75_binding_count` counted
+  only the bindings a kernel reads, while `gfx9_abi_assign` counts every binding it declares. ranga's
+  one-buffer kernels declare three bindings: pixels, then the params block twice, as its u32 and
+  f32 views. Invert and grayscale never read the f32 view, so their NVIDIA module wanted 2
+  bindings where AMD's wants 3. ranga's 3-entry binding array was then refused by NVIDIA's
+  dispatch alone (`GPU_ERR_OTHER`), and so were the flips' 4-entry arrays.
+  - SM75 now counts declared bindings, like GFX9, so the same SPIR-V needs the same binding array
+    on both backends.
+  - The prologue still loads only the pointers the kernel reads.
+  - The bug was found by running ranga's own suites on the TU116; the first, failing run is
+    `build/logs/ranga-gpu-suites-nvidia-n9.6-20261116-142345.log`.
+- **ranga's kernels are vendored**: `tests/spirv/ranga/*.spv`, ranga's bytes from ranga@de54123
+  (`PROVENANCE`). `scripts/gen-spirv-ranga-fixtures.py` turns them into
+  `tests/tcyr/spirv_ranga_kernels.cyr`, and `--from-ranga DIR` re-dumps them from a ranga
+  checkout.
+  - **The oracle.** The generator also *runs* each module in a small SPIR-V interpreter of its
+    own, rounding every f32 operation to f32, on the gate's seeded input. It writes the output's
+    FNV-1a 64 into the fixture as that kernel's golden. The interpreter shares nothing with
+    mabda's compiler, so a bug in the shared front end (`spirv_lower`, MIR) cannot hide behind
+    two back ends agreeing.
+  - The gate's inputs are defined in the generator and emitted into the fixture, so the program
+    and the oracle cannot drift: a 61 x 67 image (4087 pixels, the last workgroup partial),
+    xorshift32 seeds, ranga's params blocks, and the output rasters.
+  - `make check-ranga-fixtures` (python3 only) regenerates the fixture and requires an exact
+    match. It runs in CI.
+- **`programs/ranga_kernels_e2e.cyr`**: `make test-native-ranga-kernels-e2e` (AMD) and
+  `make test-nvidia-ranga-kernels-e2e` (NVIDIA). Each kernel compiles through
+  `gpu_shader_module_create_spirv` and is bound and parameterised as ranga's `gpu_pipeline.cyr`
+  does it. Its output must hash to the golden, the 16 sentinel words past every buffer must stay
+  untouched, and a source buffer must come back unchanged.
+  - **All 11 match on both backends.** The interpreter, the Cezanne (GFX9) and the TU116 (SM75)
+    agree on every output byte of every kernel.
+  - The AMD gate joins `test-native-all`, which now gives 74 passed, 0 failed, 2 skipped of 76
+    (`build/logs/test-native-all-20261116-143426.log`).
+  - The NVIDIA gate joins the masterless set on chew, which is now 15 gates, all passing
+    (`build/logs/nvidia-gates-n9.6-20261116-143258.log`). All 11 compiled kernels round-trip
+    through `nvdisasm -b SM75` with no error.
+- **ranga's four GPU suites** were built against this tree's `dist/mabda.cyr` in a scratch clone
+  of ranga@de54123; ranga's repository is untouched. Two edits were needed in the clone: the
+  4-argument table-builder call in `tests/gpu_spirv.tcyr`, and, for the NVIDIA run,
+  `BACKEND_KIND_NVIDIA` in `gpu_context_supports_compute` with the suites opening
+  `gpu_context_new_nvidia`.
+  - On the Cezanne: `gpu` 48, `gpu_kernels` 53, `gpu_pipeline` 102 and `gpu_spirv` 54, all
+    passing (`build/logs/ranga-gpu-suites-amd-n9.6-20261116-142307.log`).
+  - **On the TU116, the same four suites and the same counts, all passing**, with a clean kernel
+    log (`build/logs/ranga-gpu-suites-nvidia-n9.6-20261116-142509.log`).
+  - ranga's `gpu_nvidia.tcyr` now fails 31 of 54 rows. That is by design: it pins ADR 005's
+    refusals, and its header says to flip them when the guard lifts. ranga's side is listed in
+    the roadmap's consumer check.
+- Tests: `sm75_compile.tcyr` (171 assertions) adds three tests. All 11 ranga kernels compile
+  for SM75 and for GFX9 with equal binding counts (3 or 4) and LocalSize 256. A hand-built
+  module declaring bindings 0 and 2 counts 3 on both backends. Invert loads exactly two binding
+  pointers, never the unread f32 view.
+- The N9 request is archived as resolved
+  (`docs/development/issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md`).
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -346,11 +408,11 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7289 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7356 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
-  7232 after N9.4). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  7232 after N9.4; 7289 after N9.5). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
-  make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
+  make-dry-run / cf-fixtures / ranga-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.
 - AMD Cezanne, scratch-buffer contract: `make test-native-all` gave 72 passed, 0 failed,
   2 skipped (DRM master), the same as 4.3.1 (`build/logs/test-native-all-20261116-123553.log`).

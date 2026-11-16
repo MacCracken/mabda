@@ -5,6 +5,7 @@
 # swapped — pinned below.
 include "tests/tcyr/compiler_common.cyr"
 include "tests/tcyr/spirv_cf_kernels.cyr"
+include "tests/tcyr/spirv_ranga_kernels.cyr"
 
 fn _cfk2(name, spv): i64 {
     var k = 0;
@@ -339,6 +340,91 @@ fn test_sm75_loop_liveness_and_branches() {
     return 0;
 }
 
+# N9.6: a module's binding count is the bindings it DECLARES (gfx9_abi_assign's rule), so the
+# same SPIR-V asks for the same binding array on both backends. Bindings 0 and 2 declared,
+# nothing read: both count 3. (Counting only the bindings read gave ranga's invert 2 on NVIDIA
+# where AMD said 3, and ranga's 3-entry array was refused on NVIDIA alone.)
+fn test_sm75_binding_count_declared() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    _mir_set_val(&m, 3, MIR_VK_BUFVAR, MIR_T_U32, MIR_UNIFORM, 0 - 1, 0);
+    _mir_set_val(&m, 4, MIR_VK_BUFVAR, MIR_T_U32, MIR_UNIFORM, 0 - 1, 2);
+    assert_eq(sm75_binding_count(&m), 3, "SM75: bindings 0 and 2 declared -> 3");
+    var abi[64];
+    assert_eq(gfx9_abi_assign(&m, &abi), 0, "gfx9 abi");
+    assert_eq(gfx9_abi_num_bindings(&abi), 3, "GFX9 says the same");
+    return 0;
+}
+
+# N9.6, the done-when corpus: ranga's eleven kernels (tests/spirv/ranga/, ranga's bytes) compile
+# for SM75 and for GFX9, with the same binding count and LocalSize 256. The hardware gates
+# (test-{native,nvidia}-ranga-kernels-e2e) check their output against the generator's oracle.
+fn test_sm75_ranga_kernels_compile() {
+    var spv[2688];
+    var sass[16384];
+    var desc[24];
+    var isa[16384];
+    var gd[48];
+    var lsz[24];
+    assert_eq(RK_MAX_BYTES <= 2688, 1, "the fixture fits spv[]");
+    var k = 0;
+    while (k < RK_COUNT) {
+        var n = rk_build(k, &spv);
+        assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), 0, rk_name(k));
+        assert_eq(_native_compile_spirv_isa(&spv, n, &isa, 16384, &gd), 0, "and for GFX9");
+        assert_eq(load64(&desc + SM75_DESC_NBIND), load64(&gd + DESC_NUM_BINDINGS), "same binding count");
+        var want = 3;
+        if (rk_shape(k) != RK_SHAPE_1BUF) { want = 4; }
+        assert_eq(load64(&desc + SM75_DESC_NBIND), want, "ranga's binding array length");
+        spirv_find_local_size(&spv, n, spirv_find_entry_point(&spv, n), &lsz);
+        assert_eq(load64(&lsz), 256, "LocalSize 256");
+        k = k + 1;
+    }
+    return 0;
+}
+
+# N9.6: a declared binding nothing reads is counted but its pointer is not loaded. ranga's
+# invert reads pixels (0) and the params' u32 view (1), never the f32 view (2).
+fn test_sm75_unread_binding_not_loaded() {
+    var spv[2688];
+    var out[24576];
+    var types[6144];
+    var consts[4096];
+    var deco[4096];
+    var outbi[2048];
+    var m[80];
+    var vals[10240];
+    var instrs[16384];
+    var ptrs[4096];
+    var blocks[32];
+    var n = rk_build(0, &spv);
+    assert_eq(streq(rk_name(0), "invert"), 1, "kernel 0 is invert");
+    assert_eq(mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32,
+        spirv_hdr_id_bound(&spv)), 0, "init");
+    spirv_build_type_table(&spv, n, &types, 6144);
+    spirv_build_const_table(&spv, n, &consts, 4096);
+    spirv_build_decoration_table(&spv, n, &deco, 4096);
+    assert_eq(spirv_lower_module(&spv, n, &types, &consts, &deco, &m, &outbi, 2048), 0, "lowers");
+    assert_eq(sm75_binding_count(&m), 3, "three declared");
+    var k = sm75_isel(&m, &out, 24576);
+    assert_eq(k > 0, 1, "selects");
+    var nu = 0;
+    var i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_ULDC) {
+            nu = nu + 1;
+            assert_neq(sm75i_a(&out, i), SM75_UR_BASE + 4, "no ULDC for binding 2");
+        }
+        i = i + 1;
+    }
+    assert_eq(nu, 2, "two pointers loaded");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -349,6 +435,9 @@ fn main(): i64 {
     test_sm75_cf_kernels_compile();
     test_sm75_branch_shapes();
     test_sm75_loop_liveness_and_branches();
+    test_sm75_binding_count_declared();
+    test_sm75_ranga_kernels_compile();
+    test_sm75_unread_binding_not_loaded();
     return assert_summary();
 }
 

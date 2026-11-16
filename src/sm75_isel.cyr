@@ -519,10 +519,24 @@ fn _s75_cond_branch(m, out, st, i, n): i64 {
 # ================================================================
 # Driver
 # ================================================================
-# The number of binding pointers the kernel reads: one past the highest binding any
-# LOAD / STORE names (the NVIDIA shader module's NV_SHMOD_NBIND). 0 when it touches none.
+# The module's binding count (NV_SHMOD_NBIND, which the dispatch's binding array must
+# match): one past the highest binding the kernel DECLARES, whether or not it reads it,
+# the rule gfx9_abi_assign uses. The same SPIR-V must ask for the same binding array on
+# every backend: ranga's 1-buffer kernels declare three bindings and invert reads two.
+# Counting only the bindings read made its NVIDIA module want 2 where AMD's wants 3, so
+# ranga's 3-entry array was refused on NVIDIA alone. Also covers a binding read through an
+# access chain whose variable is not a BUFVAR value. 0 when it declares none.
 fn sm75_binding_count(m): i64 {
     var nb = 0;
+    var cap_ids = load64(m + 64);
+    var v = 1;
+    while (v < cap_ids) {
+        if (mir_val_kind(m, v) == MIR_VK_BUFVAR) {
+            var vb = mir_val_payload(m, v);
+            if (vb + 1 > nb) { nb = vb + 1; }
+        }
+        v = v + 1;
+    }
     var i = 0;
     while (i < mir_n_ptrs(m)) {
         var bnd = mir_ptr_binding(m, i);
@@ -532,8 +546,19 @@ fn sm75_binding_count(m): i64 {
     return nb;
 }
 
+# 1 if a LOAD / STORE reaches binding `b` (its pointer needs loading into a UR).
+fn _s75_binding_read(m, b): i64 {
+    var i = 0;
+    while (i < mir_n_ptrs(m)) {
+        if (mir_ptr_binding(m, i) == b) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Select the whole MIR list into `out` (`out_len` BYTES — the scratch-buffer contract).
-# A prologue loads each binding's pointer once (ULDC.64 UR(4+2b), c[0x0][0x160+8b]).
+# A prologue loads each binding's pointer once (ULDC.64 UR(4+2b), c[0x0][0x160+8b]); a
+# declared binding nothing reads is counted but not loaded.
 # Returns the record count or a NEGATIVE error.
 fn sm75_isel(m, out, out_len): i64 {
     var st[24];
@@ -544,9 +569,11 @@ fn sm75_isel(m, out, out_len): i64 {
     if (nb > SM75_MAX_BIND) { return 0 - SM75_ERR_TOO_MANY_BINDINGS; }
     var b = 0;
     while (b < nb) {
-        var pr = _s75_put(out, &st, SM75I_ULDC, 0, SM75_UR_BASE + 2 * b, SM75_CB_PARAMS + 8 * b, 0,
-          MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
-        if (pr < 0) { return pr; }
+        if (_s75_binding_read(m, b) == 1) {
+            var pr = _s75_put(out, &st, SM75I_ULDC, 0, SM75_UR_BASE + 2 * b, SM75_CB_PARAMS + 8 * b, 0,
+              MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+            if (pr < 0) { return pr; }
+        }
         b = b + 1;
     }
     var n = mir_n_instrs(m);

@@ -33,4 +33,4 @@ so even with a SPIR-V compiler they can't run on a one-binding dispatch.
 - Until then, document the NVIDIA meaning of `bp` in `gpu_compute_dispatch`'s comment, and have NVIDIA
   reject a `bp` whose first word looks like a small binding count.
 - Pair with N9: the SPIR-V→SASS compiler is where the binding count would come from
-  ([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](../2026-11-02-n9-spirv-to-sass-compiler-request.md)).
+  ([`2026-11-02-n9-spirv-to-sass-compiler-request.md`](./2026-11-02-n9-spirv-to-sass-compiler-request.md)).

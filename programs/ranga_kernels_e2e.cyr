@@ -1,0 +1,201 @@
+# programs/ranga_kernels_e2e.cyr — N9.6: ranga's eleven compute kernels through the PUBLIC
+# gpu_* API, on either native backend, checked against one set of golden outputs.
+#
+# The kernels are ranga's SPIR-V byte for byte, and everything about the run comes from the
+# same generated fixture (tests/tcyr/spirv_ranga_kernels.cyr, from tests/spirv/ranga/ by
+# scripts/gen-spirv-ranga-fixtures.py; provenance there). Each kernel is bound and
+# parameterised the way ranga's src/gpu_pipeline.cyr does it: a params block
+# [count, a, b, c, d, e] bound twice (its u32 and f32 views), after the pixel buffer(s).
+#
+# The image is RK_W x RK_H = 61 x 67 = 4087 pixels: 16 workgroups of 256, the last one
+# partial, so the kernels' bounds guards matter. Pixels and the 2-buffer kernels' destinations
+# are seeded from xorshift32. RK_SENT sentinel words follow every buffer's pixels; none may
+# change, and a kernel's source (2-buffer and geometry kernels) must come back unchanged.
+#
+# THE ORACLE. Each kernel's output must hash (FNV-1a 64) to rk_golden(k), which the generator
+# computes by RUNNING the same SPIR-V in its own interpreter with exact f32 rounding. That
+# interpreter shares nothing with mabda's compiler, so the gate checks the shared front end
+# (spirv_lower, MIR) as well as the GFX9 and SM75 back ends. First recorded 2026-11-16: the
+# interpreter, the Cezanne and the TU116 agree on all eleven (CHANGELOG [4.4.0] N9.6).
+#
+# Usage: ranga_kernels_e2e amd|nvidia   (make test-native-ranga-kernels-e2e /
+#                                        make test-nvidia-ranga-kernels-e2e)
+# Exit: 0 = all eleven match; 2 = usage; 3 = context; 11 = any kernel wrong.
+
+include "src/lib.cyr"
+include "tests/tcyr/spirv_ranga_kernels.cyr"
+
+var RK_USAGE = 0x008C;         # STORAGE | COPY_DST | COPY_SRC, as ranga creates them
+
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn outn(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn _xs(s): i64 {
+    var x = s & 0xFFFFFFFF;
+    x = x ^ ((x << 13) & 0xFFFFFFFF);
+    x = x ^ (x >> 17);
+    x = x ^ ((x << 5) & 0xFFFFFFFF);
+    return x & 0xFFFFFFFF;
+}
+
+fn _fill(p, n, seed): i64 {
+    var s = seed;
+    var i = 0;
+    while (i < n) {
+        s = _xs(s);
+        store32(p + i * 4, s);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < RK_SENT) { store32(p + (n + i) * 4, RK_SENT_V); i = i + 1; }
+    return 0;
+}
+
+fn _fnv(p, nbytes): i64 {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (i < nbytes) {
+        h = h ^ load8(p + i);
+        h = h * 0x100000001B3;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _sent_ok(p, n): i64 {
+    var i = 0;
+    while (i < RK_SENT) {
+        if (load32(p + (n + i) * 4) != RK_SENT_V) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _pair(dst, buf): i64 {
+    store64(dst, load64(buf + NATIVE_BUF_FIELD_HANDLE));
+    store64(dst + 8, load64(buf + NATIVE_BUF_FIELD_VA));
+    return 0;
+}
+
+# Run kernel k. Returns 1 when its output matches the golden, its sentinels are intact and
+# its source is unchanged; 0 otherwise. Prints the hash either way.
+fn run_one(ctx, k): i64 {
+    var spv[2688];      # >= RK_MAX_BYTES
+    var n = rk_build(k, &spv);
+    if (n > 2688) { out("FAIL — fixture larger than the buffer\n"); return 0; }
+    _gpu_set_last_shader_err(0);
+    var m = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (m == 0) {
+        out("FAIL — create_spirv: "); out(gpu_shader_error_name(gpu_last_shader_error())); out("\n");
+        return 0;
+    }
+    var shape = rk_shape(k);
+    var nin = RK_W * RK_H;
+    var nout = rk_out_w(k) * rk_out_h(k);
+    var src = gpu_buffer_create(ctx, (nin + RK_SENT) * 4, RK_USAGE);
+    var dst = 0;
+    if (shape != RK_SHAPE_1BUF) { dst = gpu_buffer_create(ctx, (nout + RK_SENT) * 4, RK_USAGE); }
+    var prm = gpu_buffer_create(ctx, 32, RK_USAGE);
+    var ok = 1;
+    if (src == 0) { ok = 0; }
+    if (prm == 0) { ok = 0; }
+    if (shape != RK_SHAPE_1BUF) { if (dst == 0) { ok = 0; } }
+    if (ok == 0) { out("FAIL — buffer create\n"); return 0; }
+    var sp = gpu_buffer_map(ctx, src);
+    var pp = gpu_buffer_map(ctx, prm);
+    var dp = 0;
+    if (shape != RK_SHAPE_1BUF) { dp = gpu_buffer_map(ctx, dst); }
+    _fill(sp, nin, RK_SEED_SRC);
+    if (shape == RK_SHAPE_2BUF) { _fill(dp, nout, RK_SEED_DST); }
+    if (shape == RK_SHAPE_GEOM) {
+        memset(dp, 0, nout * 4);          # ranga hands geometry kernels a zeroed raster
+        _fill(dp + nout * 4, 0, 1);       # sentinels only
+    }
+    rk_params(k, pp);
+    var src_hash = _fnv(sp, (nin + RK_SENT) * 4);
+    var bp[72];
+    var nb = 3;
+    if (shape == RK_SHAPE_1BUF) {
+        _pair(&bp + 8, src);
+        _pair(&bp + 24, prm);
+        _pair(&bp + 40, prm);
+    } else {
+        nb = 4;
+        _pair(&bp + 8, src);
+        _pair(&bp + 24, dst);
+        _pair(&bp + 40, prm);
+        _pair(&bp + 56, prm);
+    }
+    store64(&bp, nb);
+    var groups = (nout + 255) / 256;
+    var rc = gpu_compute_dispatch(ctx, m, groups, 1, 1, &bp);
+    var res = 0;
+    if (rc != 0) {
+        out("FAIL — dispatch rc="); outn(rc); out("\n");
+    } else {
+        var op = sp;
+        if (shape != RK_SHAPE_1BUF) { op = dp; }
+        var h = _fnv(op, nout * 4);
+        out("fnv "); fmt_hex0x(h);
+        out("  px0 "); fmt_hex0x(load32(op)); out(" ");
+        var good = 1;
+        if (_sent_ok(op, nout) == 0) { out("[sentinel past count overwritten] "); good = 0; }
+        if (shape != RK_SHAPE_1BUF) {
+            if (_fnv(sp, (nin + RK_SENT) * 4) != src_hash) { out("[source changed] "); good = 0; }
+        }
+        if (h != rk_golden(k)) { out("MISMATCH, golden "); fmt_hex0x(rk_golden(k)); good = 0; }
+        if (good == 1) { out("= golden"); }
+        res = good;
+        out("\n");
+    }
+    gpu_shader_module_release(ctx, m);
+    gpu_buffer_release(ctx, prm);
+    if (dst != 0) { gpu_buffer_release(ctx, dst); }
+    gpu_buffer_release(ctx, src);
+    return res;
+}
+
+fn main(): i64 {
+    alloc_init();
+    args_init();
+    var which = 0;
+    if (argc() >= 2) {
+        if (streq(argv(1), "amd") == 1) { which = 1; }
+        if (streq(argv(1), "nvidia") == 1) { which = 2; }
+    }
+    if (which == 0) { out("usage: ranga_kernels_e2e amd|nvidia\n"); return 2; }
+    out("mabda ranga kernels e2e (N9.6) — ranga's 11 SPIR-V kernels on seeded pixels, on ");
+    if (which == 1) { out("native AMD (GFX9)\n"); } else { out("native NVIDIA (SM75)\n"); }
+    out("--------------------------------------------------------------------------------------\n");
+    var ctx = 0;
+    if (which == 1) {
+        var at, av = gpu_context_new_native();
+        if (is_err_result(at) == 1) { out("FAIL: no native AMD context\n"); return 3; }
+        ctx = av;
+    } else {
+        var nt, nv = gpu_context_new_native_nvidia();
+        if (is_err_result(nt) == 1) { out("FAIL: no native NVIDIA context\n"); return 3; }
+        ctx = nv;
+    }
+    var pass = 0;
+    var k = 0;
+    while (k < RK_COUNT) {
+        out("  "); out(rk_name(k)); out(": ");
+        pass = pass + run_one(ctx, k);
+        k = k + 1;
+    }
+    gpu_context_release(ctx);
+    out("ranga kernels: "); outn(pass); out(" of "); outn(RK_COUNT); out(" match\n");
+    if (pass != RK_COUNT) { return 11; }
+    out("OK — all eleven of ranga's kernels match the goldens\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
