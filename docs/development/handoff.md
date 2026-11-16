@@ -15,11 +15,14 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   named**, together with the control-flow miscompiles found next to them (see "The compiler's
   control flow" below). **N9 is in progress**: the design is `docs/proposals/n9-spirv-to-sass.md`
   and N9.1–N9.3 have landed: `src/sm75_encode.cyr`, `sm75_isel.cyr`, `sm75_regalloc.cyr` and
-  `sm75_compile.cyr` (`sm75_compile_spirv` is the CPU compile frame). Next is N9.4: accept
-  SPIR-V in `_backend_nvidia_shader_module_create`; put the register count, binding count and
-  LocalSize into the module and the QMD (`CTA_THREAD_DIM`); run the first compiled kernel on
-  the TU116. To round-trip compiled SASS, copy it to chew and run
-  `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
+  `sm75_compile.cyr` (`sm75_compile_spirv` is the CPU compile frame), and N9.4 wired it into the
+  NVIDIA backend: compiled SPIR-V runs on the TU116 (`make test-nvidia-spirv-compute-e2e`). Next
+  is N9.5: labels, branches, loops and phi copies in `sm75_isel` / `sm75_regalloc`. Turn the
+  gate's refused kernels into lane checks, with the NVIDIA-specific expectations: an `OpReturn`
+  inside a divergent region is legal there, and nesting has no 8-level limit. Then N9.6.
+  On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
+  Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
+  deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
   `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. After N9 come NVIDIA block-linear
   scanout, the surface-acquire leak, the seat-only closeout and ranga's run. ranga's
   `tests/gpu_spirv.tcyr` needs the 4-argument table-builder call (CHANGELOG, Breaking).

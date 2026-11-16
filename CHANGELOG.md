@@ -35,10 +35,11 @@ The remaining 4.4.0 items are open and tracked in the roadmap. That includes "th
 SM75 path", which waits on N9.
 
 **N9 (SPIR-V → SASS for NVIDIA) has started.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1 (the encoder),
-N9.2 (the instruction selector) and N9.3 (register allocation, scheduling and the compile driver)
-have landed: straight-line SPIR-V now compiles to SASS that `nvdisasm` decodes. N9.4–N9.6 are
-open (§7 of the note): nothing runs on the TU116 yet, and N9's done-when is still ahead.
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.4 have
+landed: the encoder, instruction selection, register allocation, scheduling, the compile driver,
+and the backend wiring. **SPIR-V compiled in-tree now runs on the TU116**: the straight-line
+control-flow kernels match on every lane. N9.5 (branches) and N9.6 (ranga, the done-when) are
+open.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -192,6 +193,28 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   straight-line selects, and the integer-division macro. Hand-built MIR pins the operand and
   condition rules. `sm75_isel` joined the sizing gate's contract table.
 
+### Added — N9.4: SPIR-V on the native NVIDIA backend
+- `gpu_shader_module_create_spirv` on an NVIDIA context now compiles the SPIR-V to SM75 SASS with
+  `sm75_compile_spirv` and stages it in a program BO (`_nv_shader_compile_spirv`). Before, it
+  was refused with `SHMOD_ERR_SRC_KIND`. The module carries the compiled register count,
+  binding count and LocalSize. The NVIDIA shader-module struct grows from 48 to 72 bytes
+  (`NV_SHMOD_LOCALX/Y/Z`; pre-captured SASS gets 1, 1, 1). The dispatch writes LocalSize into the
+  QMD's `CTA_THREAD_DIMENSION0..2` (`_nv_qmd_set_block`); before, every block was 1, 1, 1.
+  WGSL and GFX9 modules are still refused with `SHMOD_ERR_SRC_KIND`.
+- A failed compile reports its own stage code through `gpu_last_shader_error`. A LocalSize past
+  Turing's block limits (1024 threads; z at most 64) is the new `SHMOD_ERR_LOCAL_SIZE` (122).
+- **On the TU116** (`chew`, nouveau): `programs/nvidia_spirv_compute_e2e.cyr` /
+  `make test-nvidia-spirv-compute-e2e` runs the control-flow suite's kernels through the public
+  API. The five straight-line kernels match all 64 lanes; they cover WorkgroupId, two bindings,
+  int-compare selects with uniform and divergent conditions, and both two-literal forms. Every
+  kernel with a branch is refused with exactly `SM75_ERR_CONTROL_FLOW` (N9.5), each named in the
+  program. The f64 kernel is refused as `SM75_ERR_UNSUPPORTED_OP`. The 13 existing masterless
+  NVIDIA gates still pass (`build/logs/nvidia-gates-n9.4-20261116-140142.log`).
+- `programs/nvidia_multibind_e2e.cyr` step 1 now expects the compiler's `CMP_ERR_VALIDATE` for
+  its junk SPIR-V words instead of `SHMOD_ERR_SRC_KIND`. The invariant it guards is unchanged:
+  SPIR-V is never run raw as SASS. CPU tests cover the compile-then-stage path on a fake
+  context, the LocalSize limit, and the QMD block words.
+
 ### Added — N9.3: SM75 register allocation, scheduling and the compile driver (`@internal`)
 - `src/sm75_regalloc.cyr`: a linear scan over one GPR file, R0–R254. It applies 4.4.0's
   dead-load rule from the start. The QMD register count follows NAK:
@@ -278,8 +301,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7217 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
-  contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+- CPU: 28 suites, **7232 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.
@@ -291,8 +314,10 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   12:59:20, when the `loop_do_while` probe hung the GPU before its fix. That was a per-queue
   reset, not MODE2, but render gates on this boot ran after it. The clean-boot rerun is already
   a 4.4.0 closeout item.
-- Not yet run for 4.4.0: the NVIDIA box `chew` (this change touches no NVIDIA code), and
-  ranga's suites, which need the table-builder fix described above.
+- NVIDIA TU116 (`chew`): the new `test-nvidia-spirv-compute-e2e` and the 13 existing masterless
+  NVIDIA gates pass (`build/logs/nvidia-gates-n9.4-20261116-140142.log`). The 5 card-node gates
+  need a seat, as at every release. Not yet run for 4.4.0: ranga's suites, which need the
+  table-builder fix described above.
 
 ## [4.3.1] — 2026-11-16
 

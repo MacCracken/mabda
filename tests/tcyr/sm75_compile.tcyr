@@ -150,11 +150,59 @@ fn test_sm75_compile_kernels_and_limits() {
     return 0;
 }
 
+# N9.4: SPIR-V through the NVIDIA backend's module create. The context is fake (fd -1, so the
+# program-BO ioctl fails with EBADF), which proves the compile ran to completion: the failure is
+# at staging, after it. Refusals keep the compile stage's own code.
+fn test_nv_spirv_module_create_path() {
+    var ctx[208];
+    memset(&ctx, 0, 208);
+    store64(&ctx + NV_CTX_FD, 0 - 1);
+    var spv[2048];
+    var n = _spv_build_saxpy_lid(&spv);
+    _gpu_set_last_shader_err(0);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "no module on a fake context");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_BO_CREATE, "compiled; staging the program BO failed");
+    n = _spv_build_f64_fma(&spv);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "f64 refused");
+    assert_eq(gpu_last_shader_error(), 0 - SM75_ERR_UNSUPPORTED_OP, "with the selector's own code");
+    n = _spv_build_saxpy_lid(&spv);
+    store32(&spv + 76, 2048);   # OpExecutionMode LocalSize 2048 1 1
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "LocalSize 2048 refused");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_LOCAL_SIZE, "past 1024 threads per block");
+    assert_neq(gpu_shader_error_name(0 - SHMOD_ERR_LOCAL_SIZE), gpu_shader_error_name(0 - 9999),
+      "SHMOD_ERR_LOCAL_SIZE named");
+    assert_eq(_backend_nvidia_shader_module_create(0, &spv, n, SHADER_SRC_SPIRV), 0, "null ctx");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_NULL_CTX, "SHMOD_ERR_NULL_CTX");
+    _gpu_set_last_shader_err(0);
+    return 0;
+}
+
+# N9.4: the QMD's block dimensions come from the module's LocalSize (1 where unset).
+fn test_nv_qmd_block_dims() {
+    var qmd[256];
+    native_nv_qmd_build(&qmd, 0x100000, 6, 0x200000, 0x200);
+    var sm[72];
+    memset(&sm, 0, 72);
+    store64(&sm + NV_SHMOD_LOCALX, 256);
+    store64(&sm + NV_SHMOD_LOCALY, 2);
+    store64(&sm + NV_SHMOD_LOCALZ, 3);
+    _nv_qmd_set_block(&qmd, &sm);
+    assert_eq(load32(&qmd + 0x48), 0x01000022, "CTA_THREAD_DIMENSION0 = 256 over the 0x22 version stamp");
+    assert_eq(load32(&qmd + 0x4C), 0x00030002, "DIMENSION1 = 2, DIMENSION2 = 3");
+    memset(&sm, 0, 72);
+    _nv_qmd_set_block(&qmd, &sm);
+    assert_eq(load32(&qmd + 0x48), 0x00010022, "unset: 1 (the builder's proof-of-life block)");
+    assert_eq(load32(&qmd + 0x4C), 0x00010001, "1, 1");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
     test_sm75_compile_saxpy();
     test_sm75_compile_kernels_and_limits();
+    test_nv_spirv_module_create_path();
+    test_nv_qmd_block_dims();
     return assert_summary();
 }
 

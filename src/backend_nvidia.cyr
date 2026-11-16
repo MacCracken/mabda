@@ -63,9 +63,11 @@ var NV_BUF_ADDR   = 16;
 var NV_BUF_SIZE   = 24;
 var NV_BUF_STRUCT_SIZE = 32;
 
-# NVIDIA shader-module struct (48 bytes): handle, va (program GPU VA), addr
-# (CPU mmap, for release), regcount, size, nbind. The QMD's PROGRAM_ADDRESS =
-# va; REGISTER_COUNT_V = regcount. nbind (4.3.0) is how many buffer pointers the
+# NVIDIA shader-module struct (72 bytes since 4.4.0; 48 before): handle, va (program GPU VA),
+# addr (CPU mmap, for release), regcount, size, nbind, and the LocalSize x / y / z the QMD's
+# CTA_THREAD_DIMENSION takes (N9: a compiled kernel's OpExecutionMode LocalSize; 1, 1, 1 for
+# pre-captured SASS, the proof-of-life block). The QMD's PROGRAM_ADDRESS = va;
+# REGISTER_COUNT_V = regcount. nbind (4.3.0) is how many buffer pointers the
 # kernel takes: 0 = the v0 single-output kernel, whose dispatch `bp` is ONE
 # (handle, va) pair; N > 0 = the count-prefixed binding array AMD's compiled
 # kernels take (count, then count x (handle, va)), pointer i at
@@ -77,7 +79,18 @@ var NV_SHMOD_ADDR     = 16;
 var NV_SHMOD_REGCOUNT = 24;
 var NV_SHMOD_SIZE     = 32;
 var NV_SHMOD_NBIND    = 40;
-var NV_SHMOD_STRUCT_SIZE = 48;
+var NV_SHMOD_LOCALX   = 48;
+var NV_SHMOD_LOCALY   = 56;
+var NV_SHMOD_LOCALZ   = 64;
+var NV_SHMOD_STRUCT_SIZE = 72;
+
+# Turing compute block limits (CUDA compute capability 7.5): 1024 threads per block,
+# x / y <= 1024, z <= 64.
+var NV_MAX_BLOCK_THREADS = 1024;
+var NV_MAX_BLOCK_Z       = 64;
+# The SASS staging buffer a compiled module is built in: room for the selector's 512 records
+# plus the tail (sm75_compile_spirv's CC_ISEL holds 512).
+var NV_SASS_MAX_BYTES = 16384;
 
 # Kernel-param ABI (ptxas sm_70+): parameters start at c[0x0][0x160]; the param
 # bank the QMD points at is 0x200 bytes, so at most (0x200 - 0x160) / 8 = 20
@@ -403,12 +416,13 @@ fn _backend_nvidia_buffer_release(ctx, buf): i64 {
 # real per-shader regcount metadata arrives with the N9 SPIR-V->SASS compiler.
 # Returns an NV_SHMOD struct ptr or 0 on failure.
 fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
-    # 4.3.0 (issue 2026-11-02, High): only SASS. Before, the kind was never read:
-    # SPIR-V from gpu_shader_module_create_spirv was copied in as machine code,
+    # 4.4.0 (N9.4): SPIR-V is compiled to SM75 SASS (src/sm75_*.cyr).
+    if (kind == SHADER_SRC_SPIRV) { return _nv_shader_compile_spirv(ctx, bytes_ptr, n); }
+    # 4.3.0 (issue 2026-11-02, High): otherwise only SASS. Before, the kind was never
+    # read: SPIR-V from gpu_shader_module_create_spirv was copied in as machine code,
     # the module came back valid, and the first dispatch faulted the GPU (Xid 13,
-    # channel killed, GPU_ERR_DEVICE_LOST). Now a non-SASS module is 0 with
-    # SHMOD_ERR_SRC_KIND, like the native AMD backend. SPIR-V on NVIDIA is the N9
-    # compiler's.
+    # channel killed, GPU_ERR_DEVICE_LOST). A WGSL / GFX9 module is 0 with
+    # SHMOD_ERR_SRC_KIND, like the native AMD backend.
     if (kind != SHADER_SRC_SASS) {
         _gpu_set_last_shader_err(0 - SHMOD_ERR_SRC_KIND);
         return 0;
@@ -429,8 +443,85 @@ fn _backend_nvidia_shader_module_create(ctx, bytes_ptr, n, kind): i64 {
     store64(shmod + NV_SHMOD_REGCOUNT, NV_SASS_STORE_DEADBEEF_REGCOUNT);
     store64(shmod + NV_SHMOD_SIZE,     n);
     store64(shmod + NV_SHMOD_NBIND,    0);
+    store64(shmod + NV_SHMOD_LOCALX,   1);
+    store64(shmod + NV_SHMOD_LOCALY,   1);
+    store64(shmod + NV_SHMOD_LOCALZ,   1);
     _gpu_set_last_shader_err(0);
     return shmod;
+}
+
+# N9.4: compile SPIR-V to SM75 SASS (sm75_compile_spirv, pure CPU), stage it in a program BO,
+# and return a module carrying the compiled register count, binding count and LocalSize.
+# Returns 0 on any failure with the reason in gpu_last_shader_error: the compile stage's own
+# code (CMP_ERR_* / LOWER_ERR_* / SM75_ERR_* ...), or a SHMOD_ERR_* for staging.
+fn _nv_shader_compile_spirv(ctx, words, n): i64 {
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_CTX);
+    if (ctx == 0) { return 0; }
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_NULL_WORDS);
+    if (words == 0) { return 0; }
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_TOO_SHORT);
+    if (n < 20) { return 0; }
+    var sass[16384];     # NV_SASS_MAX_BYTES
+    var desc[24];        # SM75_DESC_SIZE
+    var crc = sm75_compile_spirv(words, n, &sass, 16384, &desc);
+    if (crc != 0) { _gpu_set_last_shader_err(crc); return 0; }
+    var len = load64(&desc + SM75_DESC_LEN);
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_EMPTY);
+    if (len <= 0) { return 0; }
+    # LocalSize (default 1, 1, 1): the QMD's block dimensions; the kernel was compiled for it.
+    var lsz[24];
+    store64(&lsz + 0, 1);
+    store64(&lsz + 8, 1);
+    store64(&lsz + 16, 1);
+    spirv_find_local_size(words, n, spirv_find_entry_point(words, n), &lsz);
+    var lx = load64(&lsz + 0);
+    var ly = load64(&lsz + 8);
+    var lz = load64(&lsz + 16);
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_LOCAL_SIZE);
+    if (lx <= 0) { return 0; }
+    if (ly <= 0) { return 0; }
+    if (lz <= 0) { return 0; }
+    if (lx > NV_MAX_BLOCK_THREADS) { return 0; }
+    if (ly > NV_MAX_BLOCK_THREADS) { return 0; }
+    if (lz > NV_MAX_BLOCK_Z) { return 0; }
+    if (lx * ly * lz > NV_MAX_BLOCK_THREADS) { return 0; }
+    var bo[24];
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_BO_CREATE);
+    if (_nv_ctx_bo_alloc_bind(ctx, NOUVEAU_GEM_DOMAIN_HOST, len, &bo) != 0) { return 0; }
+    var addr = load64(&bo + 16);
+    memcpy(addr, &sass, len);
+    _gpu_set_last_shader_err(0 - SHMOD_ERR_OOM);
+    var shmod = alloc(NV_SHMOD_STRUCT_SIZE);
+    if (shmod == 0) { return 0; }
+    memset(shmod, 0, NV_SHMOD_STRUCT_SIZE);
+    store64(shmod + NV_SHMOD_HANDLE,   load64(&bo + 0));
+    store64(shmod + NV_SHMOD_VA,       load64(&bo + 8));
+    store64(shmod + NV_SHMOD_ADDR,     addr);
+    store64(shmod + NV_SHMOD_REGCOUNT, load64(&desc + SM75_DESC_REGS));
+    store64(shmod + NV_SHMOD_SIZE,     len);
+    store64(shmod + NV_SHMOD_NBIND,    load64(&desc + SM75_DESC_NBIND));
+    store64(shmod + NV_SHMOD_LOCALX,   lx);
+    store64(shmod + NV_SHMOD_LOCALY,   ly);
+    store64(shmod + NV_SHMOD_LOCALZ,   lz);
+    _gpu_set_last_shader_err(0);
+    return shmod;
+}
+
+# 4.4.0 (N9.4): the QMD's block — CTA_THREAD_DIMENSION0 in the high half of dw18 (+0x48, whose
+# low byte is the QMD version stamp 0x22), DIMENSION1 / 2 in the halves of dw19 (+0x4C). The
+# builder's 1, 1, 1 suits pre-captured SASS; a compiled kernel runs its LocalSize.
+fn _nv_qmd_set_block(qmd, shmod): i64 {
+    store32(qmd + 0x48, 0x22 | ((_nv_shmod_dim(shmod, NV_SHMOD_LOCALX) & 0xFFFF) * 0x10000));
+    store32(qmd + 0x4C, (_nv_shmod_dim(shmod, NV_SHMOD_LOCALY) & 0xFFFF)
+      | ((_nv_shmod_dim(shmod, NV_SHMOD_LOCALZ) & 0xFFFF) * 0x10000));
+    return 0;
+}
+
+# The block dimensions a module dispatches with: its LocalSize, or 1 where unset.
+fn _nv_shmod_dim(shmod, off): i64 {
+    var v = load64(shmod + off);
+    if (v <= 0) { return 1; }
+    return v;
 }
 
 # Release a shader module: VM_UNBIND + BO release, zero the struct. Null-safe.
@@ -516,6 +607,7 @@ fn _backend_nvidia_compute_dispatch(ctx, shmod, x, y, z, bp): i64 {
     store32(qmd_addr + 0x30, x);
     store32(qmd_addr + 0x34, y);
     store32(qmd_addr + 0x38, z);
+    _nv_qmd_set_block(qmd_addr, shmod);
     # Dispatch pushbuffer: SET_OBJECT + memory windows + SEND_PCAS.
     var push_len = native_nv_push_dispatch(push_addr, qmd_va);
 
