@@ -1,0 +1,472 @@
+# @internal — N9.2: instruction selection for the SPIR-V → SASS (SM75) compiler.
+# sm75_isel.cyr — MIR → SM75 instruction records; the gfx9_isel.cyr analogue for NVIDIA
+# (docs/proposals/n9-spirv-to-sass.md §3). Reads the same MIR the AMD path does (lowering
+# and the uniformity sweep are shared) and writes 48-byte records in the GISEL layout
+# [op, dst, a, b, c, flags] with SM75I_* op tags. Registers are still MIR <id>s here
+# (sm75_regalloc maps them to R0..R254); id 0 in an operand slot is RZ.
+#
+# OPERANDS. A slot holds a register <id>, or — when its MIR_FLAG_{A,B,C}_IMM bit is set — a
+# raw 32-bit immediate (an int, or f32 bits). A MIR constant becomes an immediate here, so
+# nothing downstream reads MIR value kinds. SM75 takes any 32-bit immediate in the src1
+# slot (b) and, when src1 is a register, in src2 (c); src0 (a) is always a register. A
+# constant that lands in src0 is swapped out (commutative ops), flips its compare, or is
+# copied into a fresh synth register with MOV.
+#
+# FLAGS, bits 8+: the per-op modifiers the encoder needs (see each SM75I_* below).
+#
+# CONDITIONS. ISETP writes predicate P0 and nothing else does, so P0 always holds the last
+# compare emitted. CNDMASK (lowering's udiv macro) means exactly that — AMD's "VCC from the
+# last compare" — and becomes SEL ... P0. ISELECT names its condition, and re-emits the
+# compare when P0 holds a different one (the 4.4.0 freshness rule, simpler here because no
+# other instruction writes P0).
+#
+# NOT YET (docs/proposals/n9-spirv-to-sass.md §7): labels and branches (N9.5); f64; the
+# GFX9-shaped division macros (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT).
+# Each fails with SM75_ERR_UNSUPPORTED_OP or SM75_ERR_CONTROL_FLOW rather than compiling.
+
+var SM75I_IADD3   = 1;    # d = a + b + c          bit 8: negate b
+var SM75I_IMAD    = 2;    # d = a * b + c (low)    bit 8: signed
+var SM75I_IMAD_HI = 3;    # d = hi(a * b) + c      unsigned
+var SM75I_LOP3    = 4;    # d = lut(a, b, c)       bits 8-15: lut
+var SM75I_SHF     = 5;    # funnel shift           bits 8-9: type (2 S32, 3 U32), bit 10 right, bit 11 high
+var SM75I_ISETP   = 6;    # P0 = a <cmp> b         bits 8-10: cmp, bit 11: signed   (dst 0)
+var SM75I_SEL     = 7;    # d = P0 ? a : b         bit 8: P0 negated
+var SM75I_MOV     = 8;    # d = b
+var SM75I_FADD    = 9;    # d = a + b              bit 8: negate b
+var SM75I_FMUL    = 10;   # d = a * b
+var SM75I_FFMA    = 11;   # d = a * b + c
+var SM75I_FMNMX   = 12;   # d = min / max(a, b)    bit 8: max
+var SM75I_FRND    = 13;   # d = round(b)           bits 8-9: rounding
+var SM75I_F2I     = 14;   # d = (int)b             bits 8-9: rounding, bit 10: signed
+var SM75I_I2F     = 15;   # d = (float)b           bit 10: signed
+var SM75I_MUFU    = 16;   # d = fn(b)              bits 8-13: function
+var SM75I_S2R     = 17;   # d = special reg        bits 8-15: SR index
+var SM75I_ULDC    = 18;   # UR<a> = c[0][b] (64)   a, b immediate               (dst 0)
+var SM75I_LDG     = 19;   # d = [a.U32 + UR + b]   bits 8-13: UR, b immediate
+var SM75I_STG     = 20;   # [a.U32 + UR + c] = b   bits 8-13: UR, c immediate    (dst 0)
+var SM75I_EXIT    = 21;
+
+var SM75I_REC = 48;   # the GISEL record shape (gfx9_isel.cyr)
+
+# Error codes — the SM75 band, 130-139 (gpu_shader_error_name in compute.cyr).
+var SM75_ERR_UNSUPPORTED_OP   = 130;  # a MIR op / type SM75 selection does not handle yet
+var SM75_ERR_CAP_EXCEEDED     = 131;  # the selected list outgrew its buffer
+var SM75_ERR_CONTROL_FLOW     = 132;  # labels / branches: N9.5
+var SM75_ERR_BAD_OPERAND      = 133;  # an operand of a kind the op cannot take (a pointer, a builtin)
+var SM75_ERR_TOO_MANY_BINDINGS = 134; # a binding index at or past NV_MAX_BINDINGS (16)
+
+# The uniform registers the binding pointers live in: binding b -> UR(4 + 2b), loaded once
+# from c[0x0][0x160 + 8b] (the NVIDIA dispatch's binding array; backend_nvidia.cyr).
+var SM75_UR_BASE   = 4;
+var SM75_CB_PARAMS = 0x160;
+var SM75_MAX_BIND  = 16;
+
+# ================================================================
+# Records
+# ================================================================
+fn sm75i_op(out, i): i64 { return load64(out + i * SM75I_REC + 0); }
+fn sm75i_dst(out, i): i64 { return load64(out + i * SM75I_REC + 8); }
+fn sm75i_a(out, i): i64 { return load64(out + i * SM75I_REC + 16); }
+fn sm75i_b(out, i): i64 { return load64(out + i * SM75I_REC + 24); }
+fn sm75i_c(out, i): i64 { return load64(out + i * SM75I_REC + 32); }
+fn sm75i_flags(out, i): i64 { return load64(out + i * SM75I_REC + 40); }
+
+# Selection state: st+0 = k (records so far), st+8 = cap, st+16 = the condition <id> P0
+# holds (0 = unknown).
+fn _s75_put(out, st, op, dst, a, b, c, flags): i64 {
+    var k = load64(st);
+    if (k >= load64(st + 8)) { return 0 - SM75_ERR_CAP_EXCEEDED; }
+    _gisel_emit(out, k, op, dst, a, b, c, flags);
+    store64(st, k + 1);
+    return 0;
+}
+
+# The immediate value of an operand, or -1 when it is a register (or absent: RZ). A raw
+# immediate (flagged) or a MIR constant is an immediate; the constant's 32 payload bits are
+# its value whatever its type (SM75 immediates are raw bits).
+fn _s75_imm(m, field, is_imm): i64 {
+    if (is_imm != 0) { return field & 0xFFFFFFFF; }
+    if (field == 0) { return 0 - 1; }
+    if (field >= load64(m + 64)) { return 0 - 1; }
+    if (mir_val_kind(m, field) == MIR_VK_CONST) { return mir_val_payload(m, field) & 0xFFFFFFFF; }
+    return 0 - 1;
+}
+
+# A register operand for `field`: its <id>, RZ (0) for an absent operand or the constant 0,
+# or a fresh synth register MOV'd from the immediate. Returns the <id> (>= 0) or an error.
+fn _s75_reg(m, out, st, field, is_imm, type): i64 {
+    var v = _s75_imm(m, field, is_imm);
+    if (v < 0) {
+        if (field == 0) { return 0; }
+        if (field >= load64(m + 64)) { return 0 - SM75_ERR_BAD_OPERAND; }
+        var kind = mir_val_kind(m, field);
+        if (kind != MIR_VK_SSA) { return 0 - SM75_ERR_BAD_OPERAND; }
+        return field;
+    }
+    if (v == 0) { return 0; }
+    var sid = mir_alloc_synth_id(m);
+    if (sid < 0) { return 0 - MIR_ERR_ID_OOR; }
+    var sr = _mir_set_val(m, sid, MIR_VK_SSA, type, MIR_DIVERGENT, 0 - 1, 0);
+    if (sr < 0) { return sr; }
+    var pr = _s75_put(out, st, SM75I_MOV, sid, 0, v, 0, MIR_FLAG_B_IMM);
+    if (pr < 0) { return pr; }
+    return sid;
+}
+
+# A src1 / src2 operand: an immediate (value, flag set) or a register <id>. Writes the value
+# to `slot` and returns the IMM flag bit to OR in (0 for a register), or an error.
+fn _s75_src(m, field, is_imm, slot, imm_bit): i64 {
+    var v = _s75_imm(m, field, is_imm);
+    if (v >= 0) {
+        store64(slot, v);
+        return imm_bit;
+    }
+    if (field != 0) {
+        if (field >= load64(m + 64)) { return 0 - SM75_ERR_BAD_OPERAND; }
+        if (mir_val_kind(m, field) != MIR_VK_SSA) { return 0 - SM75_ERR_BAD_OPERAND; }
+    }
+    store64(slot, field);
+    return 0;
+}
+
+# ================================================================
+# Per-op selection
+# ================================================================
+# A two-source op d = a OP b. `comm` = 1 for a commutative op: a constant `a` swaps into src1.
+fn _s75_bin(m, out, st, op, dst, a, b, fl, mods, comm, type): i64 {
+    var aimm = fl & MIR_FLAG_A_IMM;
+    var bimm = fl & MIR_FLAG_B_IMM;
+    if (comm == 1) {
+        if (_s75_imm(m, a, aimm) >= 0) {
+            if (_s75_imm(m, b, bimm) < 0) {
+                var t = a;  a = b;  b = t;
+                var ti = aimm;  aimm = bimm;  bimm = ti;
+            }
+        }
+    }
+    var ra = _s75_reg(m, out, st, a, aimm, type);
+    if (ra < 0) { return ra; }
+    var slot[8];
+    var bf = _s75_src(m, b, bimm, &slot, MIR_FLAG_B_IMM);
+    if (bf < 0) { return bf; }
+    return _s75_put(out, st, op, dst, ra, load64(&slot), 0, bf | mods);
+}
+
+# ICMP_* -> ISETP P0. A constant in src0 swaps sides and flips the predicate.
+fn _s75_cmp_code(op): i64 {
+    if (op == MIR_OP_ICMP_EQ) { return SM75_CMP_EQ; }
+    if (op == MIR_OP_ICMP_NE) { return SM75_CMP_NE; }
+    if (op == MIR_OP_ICMP_ULT) { return SM75_CMP_LT; }
+    if (op == MIR_OP_ICMP_SLT) { return SM75_CMP_LT; }
+    if (op == MIR_OP_ICMP_UGT) { return SM75_CMP_GT; }
+    if (op == MIR_OP_ICMP_SGT) { return SM75_CMP_GT; }
+    if (op == MIR_OP_ICMP_ULE) { return SM75_CMP_LE; }
+    if (op == MIR_OP_ICMP_SLE) { return SM75_CMP_LE; }
+    if (op == MIR_OP_ICMP_UGE) { return SM75_CMP_GE; }
+    if (op == MIR_OP_ICMP_SGE) { return SM75_CMP_GE; }
+    return 0 - 1;
+}
+
+fn _s75_cmp_flip(cmp): i64 {
+    if (cmp == SM75_CMP_LT) { return SM75_CMP_GT; }
+    if (cmp == SM75_CMP_GT) { return SM75_CMP_LT; }
+    if (cmp == SM75_CMP_LE) { return SM75_CMP_GE; }
+    if (cmp == SM75_CMP_GE) { return SM75_CMP_LE; }
+    return cmp;
+}
+
+fn _s75_icmp(m, out, st, op, res, a, b, fl): i64 {
+    var cmp = _s75_cmp_code(op);
+    if (cmp < 0) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    var signed = 0;
+    if (op >= MIR_OP_ICMP_SLT) { if (op <= MIR_OP_ICMP_SGE) { signed = 1; } }
+    var aimm = fl & MIR_FLAG_A_IMM;
+    var bimm = fl & MIR_FLAG_B_IMM;
+    if (_s75_imm(m, a, aimm) >= 0) {
+        if (_s75_imm(m, b, bimm) < 0) {
+            var t = a;  a = b;  b = t;
+            var ti = aimm;  aimm = bimm;  bimm = ti;
+            cmp = _s75_cmp_flip(cmp);
+        }
+    }
+    var ra = _s75_reg(m, out, st, a, aimm, MIR_T_U32);
+    if (ra < 0) { return ra; }
+    var slot[8];
+    var bf = _s75_src(m, b, bimm, &slot, MIR_FLAG_B_IMM);
+    if (bf < 0) { return bf; }
+    var pr = _s75_put(out, st, SM75I_ISETP, 0, ra, load64(&slot), 0, bf | (cmp << 8) | (signed << 11));
+    if (pr < 0) { return pr; }
+    store64(st + 16, res);
+    return 0;
+}
+
+# Put condition `cond` in P0, unless it is already there: re-select its compare.
+fn _s75_cond(m, out, st, cond): i64 {
+    if (load64(st + 16) == cond) { if (cond != 0) { return 0; } }
+    if (cond <= 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (cond >= load64(m + 64)) { return 0 - SM75_ERR_BAD_OPERAND; }
+    var cdef = mir_val_def(m, cond);
+    if (cdef < 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (cdef >= mir_n_instrs(m)) { return 0 - SM75_ERR_BAD_OPERAND; }
+    var op = mir_instr_op(m, cdef);
+    if (mir_op_is_icmp(op) == 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    return _s75_icmp(m, out, st, op, cond, mir_instr_a(m, cdef), mir_instr_b(m, cdef),
+      mir_instr_flags(m, cdef));
+}
+
+# SEL d, t, f, P0 (t / f = the TRUE / FALSE values). A constant TRUE value with a register
+# FALSE one swaps them and negates P0; src0 is otherwise materialized.
+fn _s75_sel(m, out, st, dst, t, tflag, f, fflag, type): i64 {
+    var neg = 0;
+    if (_s75_imm(m, t, tflag) >= 0) {
+        if (_s75_imm(m, f, fflag) < 0) {
+            var tt = t;  t = f;  f = tt;
+            var tf = tflag;  tflag = fflag;  fflag = tf;
+            neg = 1;
+        }
+    }
+    var ra = _s75_reg(m, out, st, t, tflag, type);
+    if (ra < 0) { return ra; }
+    var slot[8];
+    var bf = _s75_src(m, f, fflag, &slot, MIR_FLAG_B_IMM);
+    if (bf < 0) { return bf; }
+    return _s75_put(out, st, SM75I_SEL, dst, ra, load64(&slot), 0, bf | (neg << 8));
+}
+
+# A single-source op (conversions, MUFU, MOV): the source rides in the src1 slot (b).
+fn _s75_un(m, out, st, op, dst, a, fl, mods): i64 {
+    var slot[8];
+    var bf = _s75_src(m, a, fl & MIR_FLAG_A_IMM, &slot, MIR_FLAG_B_IMM);
+    if (bf < 0) { return bf; }
+    return _s75_put(out, st, op, dst, 0, load64(&slot), 0, bf | mods);
+}
+
+# The UR a binding's pointer lives in.
+fn _s75_ur(m, pidx): i64 {
+    var bnd = mir_ptr_binding(m, pidx);
+    if (bnd < 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (bnd >= SM75_MAX_BIND) { return 0 - SM75_ERR_TOO_MANY_BINDINGS; }
+    return SM75_UR_BASE + 2 * bnd;
+}
+
+# LOAD d, [off] / STORE [off], v. The byte offset is a register, or a constant that fits
+# the 24-bit immediate field (then RZ + imm); the value stored is a register.
+fn _s75_mem(m, out, st, op, dst, a, b, c, fl): i64 {
+    if (mir_type_base(mir_val_type(m, dst)) == MIR_T_F64) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    var ur = _s75_ur(m, b);
+    if (ur < 0) { return ur; }
+    var aimm = fl & MIR_FLAG_A_IMM;
+    var roff = a;
+    var imm = 0;
+    var cv = _s75_imm(m, a, aimm);
+    if (cv >= 0) {
+        if (cv < 0x800000) { roff = 0; imm = cv; }
+        else {
+            roff = _s75_reg(m, out, st, a, aimm, MIR_T_U32);
+            if (roff < 0) { return roff; }
+        }
+    } else {
+        roff = _s75_reg(m, out, st, a, aimm, MIR_T_U32);
+        if (roff < 0) { return roff; }
+    }
+    if (op == MIR_OP_LOAD) {
+        return _s75_put(out, st, SM75I_LDG, dst, roff, imm, 0, MIR_FLAG_B_IMM | (ur << 8));
+    }
+    if (mir_type_base(mir_val_type(m, c)) == MIR_T_F64) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    var data = _s75_reg(m, out, st, c, fl & MIR_FLAG_C_IMM, MIR_T_U32);
+    if (data < 0) { return data; }
+    return _s75_put(out, st, SM75I_STG, 0, roff, data, imm, MIR_FLAG_C_IMM | (ur << 8));
+}
+
+# EXTRACT of a builtin component -> S2R. GlobalInvocationId never reaches here: lowering
+# expands it to WorkgroupId * LocalSize + LocalInvocationId (_spirv_expand_gid).
+fn _s75_extract(m, out, st, dst, a, c): i64 {
+    if (a <= 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (a >= load64(m + 64)) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (mir_val_kind(m, a) != MIR_VK_BUILTIN) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    if (c < 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+    if (c > 2) { return 0 - SM75_ERR_BAD_OPERAND; }
+    var bi = mir_val_payload(m, a);
+    var sr = 0;
+    if (bi == MIR_BI_LOCAL_INVOC_ID) { sr = SM75_SR_TID_X + c; }
+    if (bi == MIR_BI_WORKGROUP_ID) { sr = SM75_SR_CTAID_X + c; }
+    if (sr == 0) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    return _s75_put(out, st, SM75I_S2R, dst, 0, 0, 0, sr << 8);
+}
+
+# One MIR instruction.
+fn _s75_one(m, out, st, i): i64 {
+    var op = mir_instr_op(m, i);
+    var dst = mir_instr_result(m, i);
+    var a = mir_instr_a(m, i);
+    var b = mir_instr_b(m, i);
+    var c = mir_instr_c(m, i);
+    var fl = mir_instr_flags(m, i);
+    if (dst != 0) {
+        if (mir_type_base(mir_val_type(m, dst)) == MIR_T_F64) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+    }
+    var u = MIR_T_U32;
+    var f = MIR_T_F32;
+    if (op == MIR_OP_RET) { return _s75_put(out, st, SM75I_EXIT, 0, 0, 0, 0, 0); }
+    if (op == MIR_OP_LABEL) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    if (op == MIR_OP_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    if (op == MIR_OP_COND_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    if (op == MIR_OP_IADD) { return _s75_bin(m, out, st, SM75I_IADD3, dst, a, b, fl, 0, 1, u); }
+    if (op == MIR_OP_ISUB) {
+        # a - b: a constant b folds into the immediate (two's complement); a register b
+        # takes IADD3's negate bit.
+        var bv = _s75_imm(m, b, fl & MIR_FLAG_B_IMM);
+        if (bv >= 0) {
+            var ra = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, u);
+            if (ra < 0) { return ra; }
+            return _s75_put(out, st, SM75I_IADD3, dst, ra, (0 - bv) & 0xFFFFFFFF, 0, MIR_FLAG_B_IMM);
+        }
+        return _s75_bin(m, out, st, SM75I_IADD3, dst, a, b, fl, 1 << 8, 0, u);
+    }
+    if (op == MIR_OP_IMUL) { return _s75_bin(m, out, st, SM75I_IMAD, dst, a, b, fl, 1 << 8, 1, u); }
+    if (op == MIR_OP_MUL_HI) { return _s75_bin(m, out, st, SM75I_IMAD_HI, dst, a, b, fl, 0, 1, u); }
+    if (op == MIR_OP_AND) { return _s75_bin(m, out, st, SM75I_LOP3, dst, a, b, fl, 0xC0 << 8, 1, u); }
+    if (op == MIR_OP_OR) { return _s75_bin(m, out, st, SM75I_LOP3, dst, a, b, fl, 0xFC << 8, 1, u); }
+    if (op == MIR_OP_XOR) { return _s75_bin(m, out, st, SM75I_LOP3, dst, a, b, fl, 0x3C << 8, 1, u); }
+    if (op == MIR_OP_SHL) {
+        # SHF.L.U32 d, a, s, RZ
+        return _s75_bin(m, out, st, SM75I_SHF, dst, a, b, fl, 3 << 8, 0, u);
+    }
+    if (op == MIR_OP_SHR) {
+        # SHF.R.U32.HI d, RZ, s, a — the value rides in src2 (c), so it must be a register.
+        var vr = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, u);
+        if (vr < 0) { return vr; }
+        var ss[8];
+        var sf = _s75_src(m, b, fl & MIR_FLAG_B_IMM, &ss, MIR_FLAG_B_IMM);
+        if (sf < 0) { return sf; }
+        return _s75_put(out, st, SM75I_SHF, dst, 0, load64(&ss), vr, sf | (3 << 8) | (1 << 10) | (1 << 11));
+    }
+    if (op == MIR_OP_ASHR) {
+        var vs = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, u);
+        if (vs < 0) { return vs; }
+        var s2[8];
+        var sf2 = _s75_src(m, b, fl & MIR_FLAG_B_IMM, &s2, MIR_FLAG_B_IMM);
+        if (sf2 < 0) { return sf2; }
+        return _s75_put(out, st, SM75I_SHF, dst, 0, load64(&s2), vs, sf2 | (2 << 8) | (1 << 10) | (1 << 11));
+    }
+    if (mir_op_is_icmp(op) == 1) { return _s75_icmp(m, out, st, op, dst, a, b, fl); }
+    if (op == MIR_OP_FADD) { return _s75_bin(m, out, st, SM75I_FADD, dst, a, b, fl, 0, 1, f); }
+    if (op == MIR_OP_FSUB) {
+        var fv = _s75_imm(m, b, fl & MIR_FLAG_B_IMM);
+        if (fv >= 0) {
+            var fa = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, f);
+            if (fa < 0) { return fa; }
+            return _s75_put(out, st, SM75I_FADD, dst, fa, fv ^ 0x80000000, 0, MIR_FLAG_B_IMM);
+        }
+        return _s75_bin(m, out, st, SM75I_FADD, dst, a, b, fl, 1 << 8, 0, f);
+    }
+    if (op == MIR_OP_FMUL) { return _s75_bin(m, out, st, SM75I_FMUL, dst, a, b, fl, 0, 1, f); }
+    if (op == MIR_OP_FMIN) { return _s75_bin(m, out, st, SM75I_FMNMX, dst, a, b, fl, 0, 1, f); }
+    if (op == MIR_OP_FMAX) { return _s75_bin(m, out, st, SM75I_FMNMX, dst, a, b, fl, 1 << 8, 1, f); }
+    if (op == MIR_OP_FMA) {
+        # a * b + c: src0 a register, at most one of b / c an immediate.
+        var ma = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, f);
+        if (ma < 0) { return ma; }
+        var mb[8];
+        var mbf = _s75_src(m, b, fl & MIR_FLAG_B_IMM, &mb, MIR_FLAG_B_IMM);
+        if (mbf < 0) { return mbf; }
+        var mc = 0;
+        var mcf = 0;
+        if (mbf != 0) {
+            mc = _s75_reg(m, out, st, c, fl & MIR_FLAG_C_IMM, f);
+            if (mc < 0) { return mc; }
+        } else {
+            var mcs[8];
+            mcf = _s75_src(m, c, fl & MIR_FLAG_C_IMM, &mcs, MIR_FLAG_C_IMM);
+            if (mcf < 0) { return mcf; }
+            mc = load64(&mcs);
+        }
+        return _s75_put(out, st, SM75I_FFMA, dst, ma, load64(&mb), mc, mbf | mcf);
+    }
+    if (op == MIR_OP_FABS) {
+        # |x| = x & 0x7FFFFFFF (as the GFX9 path does)
+        var xa = _s75_reg(m, out, st, a, fl & MIR_FLAG_A_IMM, f);
+        if (xa < 0) { return xa; }
+        return _s75_put(out, st, SM75I_LOP3, dst, xa, 0x7FFFFFFF, 0, MIR_FLAG_B_IMM | (0xC0 << 8));
+    }
+    if (op == MIR_OP_FCLAMP) {
+        # clamp(x, lo, hi) = min(max(x, lo), hi): the max into a synth, then the min.
+        var tmp = mir_alloc_synth_id(m);
+        if (tmp < 0) { return 0 - MIR_ERR_ID_OOR; }
+        var tr = _mir_set_val(m, tmp, MIR_VK_SSA, f, MIR_DIVERGENT, 0 - 1, 0);
+        if (tr < 0) { return tr; }
+        var r1 = _s75_bin(m, out, st, SM75I_FMNMX, tmp, a, b, fl & (MIR_FLAG_A_IMM | MIR_FLAG_B_IMM), 1 << 8, 1, f);
+        if (r1 < 0) { return r1; }
+        var cfl = 0;
+        if ((fl & MIR_FLAG_C_IMM) != 0) { cfl = MIR_FLAG_B_IMM; }
+        return _s75_bin(m, out, st, SM75I_FMNMX, dst, tmp, c, cfl, 0, 1, f);
+    }
+    if (op == MIR_OP_FFLOOR) { return _s75_un(m, out, st, SM75I_FRND, dst, a, fl, SM75_RND_RM << 8); }
+    if (op == MIR_OP_FSQRT) { return _s75_un(m, out, st, SM75I_MUFU, dst, a, fl, 8 << 8); }
+    if (op == MIR_OP_RCP_IFLAG) { return _s75_un(m, out, st, SM75I_MUFU, dst, a, fl, SM75_MUFU_RCP << 8); }
+    if (op == MIR_OP_CVT_F32) { return _s75_un(m, out, st, SM75I_I2F, dst, a, fl, 1 << 10); }
+    if (op == MIR_OP_CVT_F32_U) { return _s75_un(m, out, st, SM75I_I2F, dst, a, fl, 0); }
+    if (op == MIR_OP_CVT_I32) {
+        return _s75_un(m, out, st, SM75I_F2I, dst, a, fl, (SM75_RND_RZ << 8) | (1 << 10));
+    }
+    if (op == MIR_OP_CVT_U_F32) { return _s75_un(m, out, st, SM75I_F2I, dst, a, fl, SM75_RND_RZ << 8); }
+    if (op == MIR_OP_VMOV) { return _s75_un(m, out, st, SM75I_MOV, dst, a, fl, 0); }
+    if (op == MIR_OP_CNDMASK) {
+        # dst = <last compare> ? b : a — P0 holds the last compare (see the header).
+        if (load64(st + 16) == 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, a, fl & MIR_FLAG_A_IMM, u);
+    }
+    if (op == MIR_OP_ISELECT) {
+        var cr = _s75_cond(m, out, st, a);
+        if (cr < 0) { return cr; }
+        var ty = mir_type_base(mir_val_type(m, dst));
+        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, c, fl & MIR_FLAG_C_IMM, ty);
+    }
+    if (op == MIR_OP_EXTRACT) { return _s75_extract(m, out, st, dst, a, c); }
+    if (op == MIR_OP_LOAD) { return _s75_mem(m, out, st, op, dst, a, b, c, fl); }
+    if (op == MIR_OP_STORE) { return _s75_mem(m, out, st, op, dst, a, b, c, fl); }
+    return 0 - SM75_ERR_UNSUPPORTED_OP;
+}
+
+# ================================================================
+# Driver
+# ================================================================
+# The number of binding pointers the kernel reads: one past the highest binding any
+# LOAD / STORE names (the NVIDIA shader module's NV_SHMOD_NBIND). 0 when it touches none.
+fn sm75_binding_count(m): i64 {
+    var nb = 0;
+    var i = 0;
+    while (i < mir_n_ptrs(m)) {
+        var bnd = mir_ptr_binding(m, i);
+        if (bnd + 1 > nb) { nb = bnd + 1; }
+        i = i + 1;
+    }
+    return nb;
+}
+
+# Select the whole MIR list into `out` (`out_len` BYTES — the scratch-buffer contract).
+# A prologue loads each binding's pointer once (ULDC.64 UR(4+2b), c[0x0][0x160+8b]).
+# Returns the record count or a NEGATIVE error.
+fn sm75_isel(m, out, out_len): i64 {
+    var st[24];
+    store64(&st, 0);
+    store64(&st + 8, out_len / SM75I_REC);
+    store64(&st + 16, 0);
+    var nb = sm75_binding_count(m);
+    if (nb > SM75_MAX_BIND) { return 0 - SM75_ERR_TOO_MANY_BINDINGS; }
+    var b = 0;
+    while (b < nb) {
+        var pr = _s75_put(out, &st, SM75I_ULDC, 0, SM75_UR_BASE + 2 * b, SM75_CB_PARAMS + 8 * b, 0,
+          MIR_FLAG_A_IMM | MIR_FLAG_B_IMM);
+        if (pr < 0) { return pr; }
+        b = b + 1;
+    }
+    var n = mir_n_instrs(m);
+    var i = 0;
+    while (i < n) {
+        var rc = _s75_one(m, out, &st, i);
+        if (rc < 0) { return rc; }
+        i = i + 1;
+    }
+    return load64(&st);
+}

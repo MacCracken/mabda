@@ -1,0 +1,297 @@
+# tests/tcyr/sm75_isel.tcyr — N9.2: MIR -> SM75 instruction records.
+# Real kernels go through the shared front end (tables, lowering, uniformity) and then
+# sm75_isel; hand-built MIR pins the operand rules (constants in src0, flipped compares,
+# the P0 condition). docs/proposals/n9-spirv-to-sass.md §3.
+include "tests/tcyr/compiler_common.cyr"
+include "tests/tcyr/spirv_cf_kernels.cyr"
+
+# Lower SPIR-V and select it. Fills hist[op] (32 slots) with how many records of each SM75I_*
+# op came out and returns the record count, or the negative stage code. The records land in
+# `out` (12288 bytes) for tests that look closer.
+fn _s75_run(spv, n, out, hist): i64 {
+    memset(hist, 0, 256);
+    var types[6144];
+    var consts[4096];
+    var deco[4096];
+    var outbi[2048];
+    var m[80];
+    var vals[10240];
+    var instrs[16384];
+    var ptrs[4096];
+    var blocks[32];
+    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, spirv_hdr_id_bound(spv));
+    if (mr < 0) { return mr; }
+    if (spirv_build_type_table(spv, n, &types, 6144) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_const_table(spv, n, &consts, 4096) < 0) { return 0 - CMP_ERR_TABLE; }
+    if (spirv_build_decoration_table(spv, n, &deco, 4096) < 0) { return 0 - CMP_ERR_TABLE; }
+    var lr = spirv_lower_module(spv, n, &types, &consts, &deco, &m, &outbi, 2048);
+    if (lr < 0) { return lr; }
+    var k = sm75_isel(&m, out, 12288);
+    if (k < 0) { return k; }
+    var i = 0;
+    while (i < k) {
+        var op = sm75i_op(out, i);
+        if (op < 32) { store64(hist + op * 8, load64(hist + op * 8) + 1); }
+        i = i + 1;
+    }
+    return k;
+}
+
+fn _h(hist, op): i64 { return load64(hist + op * 8); }
+
+fn _cfk(name, spv): i64 {
+    var k = 0;
+    while (k < CFK_COUNT) {
+        if (streq(cfk_name(k), name) == 1) { return cfk_build(k, spv); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# SAXPY indexed by LocalInvocationId: y[i] = 2.0 * x[i] + y[i], two bindings.
+fn test_sm75_isel_saxpy() {
+    var spv[640];
+    var out[12288];
+    var hist[256];
+    var n = _spv_build_saxpy_lid(&spv);
+    var k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "saxpy selects");
+    assert_eq(sm75i_op(&out, 0), SM75I_ULDC, "prologue: binding 0's pointer");
+    assert_eq(sm75i_a(&out, 0), 4, "into UR4");
+    assert_eq(sm75i_b(&out, 0), 0x160, "from c[0x0][0x160]");
+    assert_eq(sm75i_op(&out, 1), SM75I_ULDC, "binding 1's pointer");
+    assert_eq(sm75i_a(&out, 1), 6, "into UR6");
+    assert_eq(sm75i_b(&out, 1), 0x168, "from c[0x0][0x168]");
+    assert_eq(_h(&hist, SM75I_S2R), 1, "LocalInvocationId.x: one S2R");
+    assert_eq(_h(&hist, SM75I_LDG), 2, "x[i] and y[i]");
+    assert_eq(_h(&hist, SM75I_STG), 1, "y[i] =");
+    assert_eq(_h(&hist, SM75I_EXIT), 1, "OpReturn -> EXIT");
+    assert_eq(sm75i_op(&out, k - 1), SM75I_EXIT, "EXIT last");
+    # every LDG / STG names its binding's UR in flags bits 8-13
+    var i = 0;
+    var urs_ok = 1;
+    while (i < k) {
+        var op = sm75i_op(&out, i);
+        var isldst = 0;
+        if (op == SM75I_LDG) { isldst = 1; }
+        if (op == SM75I_STG) { isldst = 1; }
+        if (isldst == 1) {
+            var ur = (sm75i_flags(&out, i) >> 8) & 0x3F;
+            if (ur != 4) { if (ur != 6) { urs_ok = 0; } }
+        }
+        i = i + 1;
+    }
+    assert_eq(urs_ok, 1, "each access uses UR4 or UR6");
+    return 0;
+}
+
+# GlobalInvocationId = WorkgroupId * 64 + LocalInvocationId: S2R CTAID + S2R TID + IMAD.
+fn test_sm75_isel_gid() {
+    var spv[640];
+    var out[12288];
+    var hist[256];
+    var n = _spv_build_saxpy_gid(&spv);
+    var k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "gid saxpy selects");
+    assert_eq(_h(&hist, SM75I_S2R), 2, "SR_CTAID.X and SR_TID.X");
+    var sawc = 0;
+    var sawt = 0;
+    var i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_S2R) {
+            var sr = (sm75i_flags(&out, i) >> 8) & 0xFF;
+            if (sr == SM75_SR_CTAID_X) { sawc = 1; }
+            if (sr == SM75_SR_TID_X) { sawt = 1; }
+        }
+        i = i + 1;
+    }
+    assert_eq(sawc, 1, "S2R SR_CTAID.X");
+    assert_eq(sawt, 1, "S2R SR_TID.X");
+    assert_eq(_h(&hist, SM75I_IMAD) >= 1, 1, "WorkgroupId * LocalSize is an IMAD");
+    return 0;
+}
+
+# Int-compare OpSelect, straight-line, from the control-flow suite.
+fn test_sm75_isel_selects() {
+    var spv[1680];
+    var out[12288];
+    var hist[256];
+    var n = _cfk("sel_div_adjacent", &spv);
+    var k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "sel_div_adjacent selects");
+    assert_eq(_h(&hist, SM75I_ISETP), 1, "one compare: P0 is fresh at the select");
+    assert_eq(_h(&hist, SM75I_SEL), 1, "SEL ... P0");
+    n = _cfk("sel_div_not_adjacent", &spv);
+    k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "sel_div_not_adjacent selects");
+    assert_eq(_h(&hist, SM75I_ISETP), 1, "an IADD3 between does not write P0: still one compare");
+    n = _cfk("sel_uniform_two_literals", &spv);
+    k = _s75_run(&spv, n, &out, &hist);
+    assert_eq(k > 0, 1, "sel_uniform_two_literals selects");
+    # SEL needs a register TRUE value: one literal is MOV'd into a synth register first
+    assert_eq(_h(&hist, SM75I_MOV) >= 1, 1, "the TRUE literal is materialized");
+    n = _cfk("sel_uniform_scalar", &spv);
+    assert_eq(_s75_run(&spv, n, &out, &hist) > 0, 1, "sel_uniform_scalar selects");
+    n = _cfk("sel_uniform_cond_lane_vals", &spv);
+    assert_eq(_s75_run(&spv, n, &out, &hist) > 0, 1, "sel_uniform_cond_lane_vals selects");
+    # a branch is N9.5
+    n = _cfk("if_div", &spv);
+    assert_eq(_s75_run(&spv, n, &out, &hist), 0 - SM75_ERR_CONTROL_FLOW, "if_div: branches are N9.5");
+    return 0;
+}
+
+# What SM75 selection refuses today, by name.
+fn test_sm75_isel_refusals() {
+    var spv[2048];
+    var out[12288];
+    var hist[256];
+    var n = _spv_build_f64_fma(&spv);
+    assert_eq(_s75_run(&spv, n, &out, &hist), 0 - SM75_ERR_UNSUPPORTED_OP, "f64 is not selected for NVIDIA yet");
+    n = _spv_build_f32_div(&spv);
+    assert_eq(_s75_run(&spv, n, &out, &hist), 0 - SM75_ERR_UNSUPPORTED_OP,
+      "OpFDiv's GFX9-shaped macro has no SM75 form yet");
+    var unk = gpu_shader_error_name(0 - 9999);
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_UNSUPPORTED_OP), unk, "SM75_ERR_UNSUPPORTED_OP named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_CAP_EXCEEDED), unk, "SM75_ERR_CAP_EXCEEDED named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_CONTROL_FLOW), unk, "SM75_ERR_CONTROL_FLOW named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_BAD_OPERAND), unk, "SM75_ERR_BAD_OPERAND named");
+    assert_neq(gpu_shader_error_name(0 - SM75_ERR_TOO_MANY_BINDINGS), unk, "SM75_ERR_TOO_MANY_BINDINGS named");
+    return 0;
+}
+
+# Hand-built MIR: the operand rules.
+fn test_sm75_isel_operand_rules() {
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 1024, &ptrs, 64, &blocks, 32, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 5);
+    mir_set_const(&m, 2, MIR_T_U32, 0);
+    _mir_set_val(&m, 3, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);   # x (a register)
+    mir_emit(&m, MIR_OP_IADD, 4, MIR_T_U32, 1, 3, 0, 0);         # 5 + x: constant in src0 -> swap
+    mir_emit(&m, MIR_OP_ICMP_ULT, 5, MIR_T_U32, 1, 3, 0, 0);     # 5 < x  ->  x > 5
+    mir_emit(&m, MIR_OP_ISUB, 6, MIR_T_U32, 3, 1, 0, 0);         # x - 5  ->  x + (-5)
+    mir_emit(&m, MIR_OP_ISUB, 7, MIR_T_U32, 2, 3, 0, 0);         # 0 - x  ->  RZ + -x
+    mir_emit(&m, MIR_OP_SHR, 8, MIR_T_U32, 1, 3, 0, 0);          # 5 >> x: the value must be a register
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var out[2400];
+    var k = sm75_isel(&m, &out, 2400);
+    assert_eq(k, 7, "7 records (one MOV for the shifted constant)");
+    assert_eq(sm75i_op(&out, 0), SM75I_IADD3, "IADD3");
+    assert_eq(sm75i_a(&out, 0), 3, "x in src0 (swapped)");
+    assert_eq(sm75i_b(&out, 0), 5, "5 as an immediate in src1");
+    assert_eq(sm75i_flags(&out, 0) & MIR_FLAG_B_IMM, MIR_FLAG_B_IMM, "flagged immediate");
+    assert_eq(sm75i_op(&out, 1), SM75I_ISETP, "ISETP");
+    assert_eq((sm75i_flags(&out, 1) >> 8) & 7, SM75_CMP_GT, "5 < x became x > 5");
+    assert_eq(sm75i_a(&out, 1), 3, "x in src0");
+    assert_eq(sm75i_b(&out, 2), 0xFFFFFFFB, "x - 5 adds the two's complement -5");
+    assert_eq(sm75i_a(&out, 3), 0, "0 - x: RZ in src0");
+    assert_eq((sm75i_flags(&out, 3) >> 8) & 1, 1, "and the negate bit on x");
+    assert_eq(sm75i_op(&out, 4), SM75I_MOV, "5 >> x: 5 MOV'd into a register");
+    assert_eq(sm75i_op(&out, 5), SM75I_SHF, "SHF");
+    assert_eq(sm75i_c(&out, 5), sm75i_dst(&out, 4), "the MOV'd 5 is SHF's high source");
+    assert_eq((sm75i_flags(&out, 5) >> 10) & 3, 3, ".R.HI");
+    return 0;
+}
+
+# CNDMASK reads the LAST compare (AMD's VCC); ISELECT names its compare and re-emits it.
+fn test_sm75_isel_conditions() {
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 1024, &ptrs, 64, &blocks, 32, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 5);
+    _mir_set_val(&m, 3, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);
+    _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 4, MIR_T_U32, 3, 1, 0, 0);     # c4: x < 5
+    mir_emit(&m, MIR_OP_ICMP_EQ, 6, MIR_T_U32, 3, 9, 0, 0);      # c6: x == y   (P0 now c6)
+    mir_emit(&m, MIR_OP_CNDMASK, 7, MIR_T_U32, 3, 9, 0, 0);      # c6 ? y : x
+    mir_emit(&m, MIR_OP_ISELECT, 8, MIR_T_U32, 4, 3, 9, 0);      # c4 ? x : y   -> re-emit c4
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var out[2400];
+    var k = sm75_isel(&m, &out, 2400);
+    assert_eq(k, 6, "6 records: two compares, SEL, the re-emitted compare, SEL, EXIT");
+    assert_eq(sm75i_op(&out, 2), SM75I_SEL, "CNDMASK -> SEL");
+    assert_eq(sm75i_a(&out, 2), 9, "TRUE = b (y)");
+    assert_eq(sm75i_b(&out, 2), 3, "FALSE = a (x)");
+    assert_eq(sm75i_op(&out, 3), SM75I_ISETP, "ISELECT on c4 re-emits its compare (P0 held c6)");
+    assert_eq((sm75i_flags(&out, 3) >> 8) & 7, SM75_CMP_LT, "the x < 5 compare");
+    assert_eq(sm75i_op(&out, 4), SM75I_SEL, "then SEL");
+    assert_eq(sm75i_a(&out, 4), 3, "TRUE = x");
+    return 0;
+}
+
+# The udiv macro (lowering's, written in target-neutral MIR) maps one primitive at a time.
+fn test_sm75_isel_udiv_macro() {
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 64, &blocks, 32, 16);
+    _mir_set_val(&m, 3, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);   # n
+    _mir_set_val(&m, 4, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);   # d
+    var buf[64];
+    store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
+    store32(&buf + 20, (5 << 16) | 134);   # OpUDiv %2 %5 %3 %4
+    store32(&buf + 24, 2); store32(&buf + 28, 5); store32(&buf + 32, 3); store32(&buf + 36, 4);
+    assert_eq(_spirv_lower_udiv(&buf, 5, 5, &m), 0, "OpUDiv lowers to the macro");
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var out[4800];
+    var k = sm75_isel(&m, &out, 4800);
+    assert_eq(k > 0, 1, "the udiv macro selects for SM75");
+    var hist[256];
+    memset(&hist, 0, 256);
+    var i = 0;
+    while (i < k) { var op = sm75i_op(&out, i); store64(&hist + op * 8, load64(&hist + op * 8) + 1); i = i + 1; }
+    assert_eq(_h(&hist, SM75I_MUFU), 1, "RCP_IFLAG -> MUFU.RCP");
+    assert_eq(_h(&hist, SM75I_I2F), 1, "CVT_F32_U -> I2F.U32");
+    assert_eq(_h(&hist, SM75I_F2I), 1, "CVT_U_F32 -> F2I.U32");
+    assert_eq(_h(&hist, SM75I_IMAD_HI), 2, "two MUL_HI -> IMAD.HI.U32");
+    assert_eq(_h(&hist, SM75I_ISETP), 3, "three compares (two corrections + the divide-by-zero)");
+    assert_eq(_h(&hist, SM75I_SEL), 4, "four CNDMASK -> SEL");
+    return 0;
+}
+
+fn test_sm75_isel_limits() {
+    var m[80];
+    var vals[1280];
+    var instrs[1024];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 1024, &ptrs, 64, &blocks, 32, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 5);
+    _mir_set_val(&m, 3, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);
+    mir_emit(&m, MIR_OP_IADD, 4, MIR_T_U32, 3, 1, 0, 0);
+    mir_emit(&m, MIR_OP_IADD, 5, MIR_T_U32, 4, 1, 0, 0);
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var out[2400];
+    assert_eq(sm75_isel(&m, &out, 96), 0 - SM75_ERR_CAP_EXCEEDED, "a 2-record buffer is too short for 3");
+    assert_eq(sm75_isel(&m, &out, 144), 3, "3 records fit 144 bytes");
+    mir_add_ptr(&m, 10, 16, MIR_T_U32, 3, 0, 1);    # binding 16
+    assert_eq(sm75_isel(&m, &out, 2400), 0 - SM75_ERR_TOO_MANY_BINDINGS, "binding 16 is past the 16-pointer bank");
+    return 0;
+}
+
+fn main(): i64 {
+    test_sm75_isel_saxpy();
+    test_sm75_isel_gid();
+    test_sm75_isel_selects();
+    test_sm75_isel_refusals();
+    test_sm75_isel_operand_rules();
+    test_sm75_isel_conditions();
+    test_sm75_isel_udiv_macro();
+    test_sm75_isel_limits();
+    return assert_summary();
+}
+
+var exit_code = main();
+syscall(60, exit_code);

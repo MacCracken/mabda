@@ -35,8 +35,9 @@ The remaining 4.4.0 items are open and tracked in the roadmap. That includes "th
 SM75 path", which waits on N9.
 
 **N9 (SPIR-V → SASS for NVIDIA) has started.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md), and its first bite,
-N9.1 (the encoder), has landed. N9.2–N9.6 are open (§7 of the note), and so is N9's done-when.
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1 (the encoder)
+and N9.2 (the instruction selector) have landed. N9.3–N9.6 are open (§7 of the note), and so is
+N9's done-when.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -164,6 +165,32 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   yield set is not a valid scheduling value (`nvdisasm` rejects `0x1F`); a register shift gets
   `.W` (shift mod 32), which matches GFX9's masked shifts.
 
+### Added — N9.2: SM75 instruction selection (`@internal`)
+- `src/sm75_isel.cyr`: `sm75_isel(m, out, out_len)` turns the MIR the AMD path uses (shared
+  lowering and uniformity) into SM75 records, in the GISEL record shape with `SM75I_*` tags. It
+  covers the straight-line part of the design note's §3:
+  - integer `IADD3` / `IMAD` / `IMAD.HI` / `LOP3` / `SHF` / `ISETP`;
+  - float `FADD` / `FMUL` / `FFMA` / `FMNMX` / `FRND`, plus `FABS` as an AND and `FCLAMP` as two
+    `FMNMX`;
+  - conversions, `MUFU` (`RCP`, `SQRT`), `MOV`, and `SEL` for both `CNDMASK` and `ISELECT`;
+  - `S2R` for the builtins;
+  - global `LDG` / `STG`, whose binding pointers are loaded once in a prologue
+    (`ULDC.64 UR(4+2b), c[0x0][0x160+8b]`);
+  - `EXIT`.
+- Operand rules: a constant becomes a 32-bit immediate. src0 is always a register: a constant
+  there swaps into src1 (commutative ops), flips its compare, or is copied into a temporary
+  register with `MOV`. A constant subtrahend folds into a negated immediate.
+- Conditions: on SM75 only `ISETP` writes P0, so `CNDMASK` (AMD's "the last compare") reads P0
+  directly. An `ISELECT` re-emits its compare when P0 holds another.
+- Refused by name, codes 130–134, all named in `gpu_shader_error_name`:
+  - branches (`SM75_ERR_CONTROL_FLOW`, N9.5);
+  - f64, the GFX9-shaped `OpFDiv` macro, and the bfi select (`SM75_ERR_UNSUPPORTED_OP`);
+  - a binding past 16.
+- `tests/tcyr/sm75_isel.tcyr` (69 assertions) runs real kernels through the shared front end:
+  SAXPY by LocalInvocationId and by GlobalInvocationId, the control-flow suite's five
+  straight-line selects, and the integer-division macro. Hand-built MIR pins the operand and
+  condition rules. `sm75_isel` joined the sizing gate's contract table.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -225,8 +252,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 26 suites, **7112 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
-  contract; 7033 after the compiler limits). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+- CPU: 27 suites, **7181 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract; 7033 after the compiler limits; 7112 after N9.1). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

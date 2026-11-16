@@ -14,8 +14,9 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   Two items have landed: **the scratch-buffer contract** and **the compiler limits v4.1.0 left
   named**, together with the control-flow miscompiles found next to them (see "The compiler's
   control flow" below). **N9 is in progress**: the design is `docs/proposals/n9-spirv-to-sass.md`
-  and N9.1 (`src/sm75_encode.cyr`, pinned by `tests/tcyr/sm75_encode.tcyr`) has landed. Next is
-  N9.2, the selector. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
+  and N9.1 (`src/sm75_encode.cyr`, the encoder) and N9.2 (`src/sm75_isel.cyr`, the selector)
+  have landed. Next is N9.3: register allocation, the conservative scheduler, and the
+  `sm75_compile` driver that turns selector records into encoded SASS. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
   `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. After N9 come NVIDIA block-linear
   scanout, the surface-acquire leak, the seat-only closeout and ranga's run. ranga's
   `tests/gpu_spirv.tcyr` needs the 4-argument table-builder call (CHANGELOG, Breaking).
