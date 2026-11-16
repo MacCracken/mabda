@@ -47,15 +47,15 @@ fn test_gfx9_isel_f64() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # divergent u32
     mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 mul
     mir_emit(&m, MIR_OP_FMA, 8, MIR_T_F64, 7, 7, 7, 0);                    # f64 fma
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     # isel order: 0=EXTRACT, 1=FMUL(f64), 2=FMA(f64), 3=ENDPGM
     assert_eq(gisel_op(&isel, 1), GISEL_V_MUL_F64, "f64 FMUL -> GISEL_V_MUL_F64");
     assert_eq(gisel_op(&isel, 2), GISEL_V_FMA_F64, "f64 FMA -> GISEL_V_FMA_F64");
@@ -72,14 +72,14 @@ fn test_gfx9_isel_fconvert_rejects_same_width() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     mir_emit(&m, MIR_OP_FMUL, 6, MIR_T_F64, 5, 5, 0, 0);                                  # an f64 value
     mir_emit(&m, MIR_OP_FCONVERT, 7, MIR_T_F64, 6, 0, 0, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM); # f64->f64 (invalid)
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     assert_eq(ic, 0 - GISEL_ERR_UNSUPPORTED_OP, "f64->f64 FCONVERT fails loud (operand width mismatch)");
     return 0;
 }
@@ -94,7 +94,7 @@ fn test_gfx9_isel_saxpy() {
     var n = _spv_build_saxpy(&buf);
     assert_eq(_spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks), 0, "saxpy lower ok");
     var isel[480];
-    var ic = gfx9_isel(&m, &isel, 10);
+    var ic = gfx9_isel(&m, &isel, 480);
     assert_eq(ic, 9, "9 selected instrs");
     assert_eq(gisel_op(&isel, 0), GISEL_EXTRACT, "0 extract gid.x");
     assert_eq(gisel_op(&isel, 1), GISEL_V_MUL_LO_U32, "1 offset = i*4 (divergent -> VALU)");
@@ -125,13 +125,13 @@ fn test_gfx9_isel_gid_salu_valu() {
     var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "gid lower ok");
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128), 0, "gid lower ok");
     var isel[256];
-    var ic = gfx9_isel(&m, &isel, 5);
+    var ic = gfx9_isel(&m, &isel, 240);
     # The 1<<2 SHL const-folds away (N.8b-8), so only the divergent ops + endpgm remain.
     assert_eq(ic, 4, "4 selected instrs (shl folded)");
     assert_eq(gisel_op(&isel, 0), GISEL_EXTRACT, "0 extract gid.x");
@@ -147,25 +147,25 @@ fn test_gfx9_isel_errors() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    var isel[256];
+    var isel[384];
     # cap exceeded: a non-empty MIR with cap 0
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     assert_eq(gfx9_isel(&m, &isel, 0), 0 - GISEL_ERR_CAP_EXCEEDED, "cap exceeded");
     # unsupported MIR op (a fabricated op code) -> fail loud
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_emit(&m, 99, 1, MIR_T_I32, 0, 0, 0, 0);
-    assert_eq(gfx9_isel(&m, &isel, 8), 0 - GISEL_ERR_UNSUPPORTED_OP, "unsupported op");
+    assert_eq(gfx9_isel(&m, &isel, 384), 0 - GISEL_ERR_UNSUPPORTED_OP, "unsupported op");
     # review N.3 #1: a result-less integer ALU op (dst 0) must fail loud, not
     # read the vals[0] sentinel and silently pick SALU.
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_emit(&m, MIR_OP_IADD, 0, MIR_T_I32, 0, 0, 0, 0);
-    assert_eq(gfx9_isel(&m, &isel, 8), 0 - GISEL_ERR_UNSUPPORTED_OP, "result-less int op");
+    assert_eq(gfx9_isel(&m, &isel, 384), 0 - GISEL_ERR_UNSUPPORTED_OP, "result-less int op");
     # review N.3 #2: an UNKNOWN-uniformity result (no mir_run_uniformity) must
     # fail loud, not silently pick SALU for a possibly-divergent value.
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_emit(&m, MIR_OP_IADD, 5, MIR_T_I32, 1, 2, 0, 0);
-    assert_eq(gfx9_isel(&m, &isel, 8), 0 - GISEL_ERR_UNSUPPORTED_OP, "UNKNOWN unif");
+    assert_eq(gfx9_isel(&m, &isel, 384), 0 - GISEL_ERR_UNSUPPORTED_OP, "UNKNOWN unif");
     return 0;
 }
 
@@ -187,16 +187,16 @@ fn test_gfx9_regalloc_gid() {
     var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     var alloc[256];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "gid regalloc ok");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, 256, &hw), 0, "gid regalloc ok");
     assert_eq(gfx9_reg(&alloc, 12), 1, "gid.x -> v1");
     assert_eq(gfx9_reg(&alloc, 13), 2, "x+1 -> v2");
     assert_eq(gfx9_reg(&alloc, 14), 1, "*2 -> v1 (reuses freed v1)");
@@ -216,19 +216,19 @@ fn test_gfx9_regalloc_uniform_salu() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_WORKGROUP_ID);   # uniform
     mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);  # wgid.x (uniform)
     mir_emit(&m, MIR_OP_SHL, 7, MIR_T_U32, 6, 2, 0, MIR_FLAG_B_IMM);      # wgid.x << 2 (uniform)
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     assert_eq(mir_val_unif(&m, 7), MIR_UNIFORM, "wgid<<2 uniform");
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     assert_eq(gisel_op(&isel, 1), GISEL_S_LSHL_B32, "uniform shl -> SALU");
     var alloc[256];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "uniform-salu regalloc ok");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, 256, &hw), 0, "uniform-salu regalloc ok");
     # %6 (wgid.x extract) and %7 (shl) are both uniform → SGPRs at/above the base (8);
     # assert SGPR-range + a non-trivial SGPR high-water rather than pinning exact regs.
     assert_eq(gfx9_reg(&alloc, 7) >= 8, 1, "wgid<<2 allocated to an SGPR (>= base)");
@@ -246,10 +246,10 @@ fn test_gfx9_regalloc_saxpy() {
     var n = _spv_build_saxpy(&buf);
     _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
     var isel[480];
-    var ic = gfx9_isel(&m, &isel, 10);
+    var ic = gfx9_isel(&m, &isel, 480);
     var alloc[512];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "saxpy regalloc ok");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, 512, &hw), 0, "saxpy regalloc ok");
     # all 7 SSA values are divergent -> VGPRs; none uniform -> sgpr hw stays at base
     assert_eq(gfx9_hw_sgpr(&hw), 8, "no uniform results -> sgpr hw = base");
     assert_eq(gfx9_hw_vgpr(&hw), 5, "7 divergent values reuse into v1-v4");
@@ -272,20 +272,21 @@ fn test_gfx9_regalloc_errors() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    var isel[256];
+    var isel[384];
     var alloc[256];
     var hw[16];
     var n = _spv_build_gid_kernel(&buf);
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
-    var ic = gfx9_isel(&m, &isel, 8);
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128);
+    var ic = gfx9_isel(&m, &isel, 384);
     # vgpr_cap 2 leaves only v1 allocatable (base 1) -> the 2nd VGPR overflows
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 2, &alloc, &hw), 0 - RA_ERR_VGPR_OVERFLOW, "vgpr overflow");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 2, &alloc, 256, &hw), 0 - RA_ERR_VGPR_OVERFLOW, "vgpr overflow");
     # a cap beyond the free-at scratch limit (256) fails loud
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 300, &alloc, &hw), 0 - RA_ERR_CAP_TOO_LARGE, "cap too large");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 300, &alloc, 256, &hw), 0 - RA_ERR_CAP_TOO_LARGE,
+      "cap too large");
     return 0;
 }
 
@@ -318,18 +319,18 @@ fn test_gfx9_regalloc_f64_pairs() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);   # lid.x (divergent u32)
     mir_emit(&m, MIR_OP_FMUL, 7, MIR_T_F64, 6, 6, 0, 0);                   # f64 #1 (divergent)
     mir_emit(&m, MIR_OP_FADD, 8, MIR_T_F64, 7, 6, 0, 0);                   # f64 #2 (uses %7, %6)
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     var alloc[256];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "f64 regalloc ok");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, 256, &hw), 0, "f64 regalloc ok");
     assert_eq(gfx9_reg(&alloc, 6), 1, "u32 single -> v1 (coexists with the f64 pairs)");
     var r7 = gfx9_reg(&alloc, 7);
     var r8 = gfx9_reg(&alloc, 8);
@@ -351,18 +352,18 @@ fn test_gfx9_regalloc_valu_uniform() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_I32, 5);
     mir_emit(&m, MIR_OP_CVT_F32, 2, MIR_T_F32, 1, 0, 0, 0);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     assert_eq(mir_val_unif(&m, 2), MIR_UNIFORM, "cvt of a const is uniform");
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
     assert_eq(gisel_op(&isel, 0), GISEL_V_CVT_F32_I32, "cvt -> VALU op");
     var alloc[256];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, &hw), 0, "regalloc ok");
+    assert_eq(gfx9_regalloc(&m, &isel, ic, 8, 1, 104, 256, &alloc, 256, &hw), 0, "regalloc ok");
     assert_eq(gfx9_reg(&alloc, 2), 1, "uniform VALU result -> VGPR v1 (not s8)");
     assert_eq(gfx9_hw_vgpr(&hw), 2, "one VGPR used");
     assert_eq(gfx9_hw_sgpr(&hw), 8, "no SGPR used (VALU result lives in a VGPR)");
@@ -380,7 +381,7 @@ fn test_mir_unif_f64_div_ops_forced_divergent() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_F64, 0);
     mir_set_const(&m, 2, MIR_T_F64, 0);
     mir_emit(&m, MIR_OP_F64_RCP, 3, MIR_T_F64, 1, 0, 0, 0);
@@ -414,9 +415,9 @@ fn test_gfx9_waitcnt_saxpy() {
     var n = _spv_build_saxpy(&buf);
     _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
     var isel[480];
-    var ic = gfx9_isel(&m, &isel, 10);
+    var ic = gfx9_isel(&m, &isel, 480);
     var out[640];
-    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 13);
+    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 624);
     assert_eq(wc, 11, "9 isel + 2 waits = 11");
     # the vmcnt(0) lands right before the first use of a load (the f32 multiply)
     assert_eq(gisel_op(&out, 5), GISEL_S_WAITCNT, "5 is a waitcnt");
@@ -447,15 +448,15 @@ fn test_gfx9_waitcnt_none() {
     var ptrs[128];
     var blocks[32];
     var n = _spv_build_gid_kernel(&buf);
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
-    var isel[256];
-    var ic = gfx9_isel(&m, &isel, 8);
-    var out[256];
-    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 8);
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128);
+    var isel[384];
+    var ic = gfx9_isel(&m, &isel, 384);
+    var out[384];
+    var wc = gfx9_waitcnt(&m, &isel, ic, &out, 384);
     # 4 selected instrs (the 1<<2 SHL const-folds away, N.8b-8); no memory -> no waits.
     assert_eq(wc, 4, "no memory -> no waits, count unchanged");
     assert_eq(gisel_op(&out, 3), GISEL_S_ENDPGM, "endpgm not preceded by a wait");
@@ -481,15 +482,15 @@ fn test_gfx9_waitcnt_errors() {
     var n = _spv_build_saxpy(&buf);
     _spv_saxpy_lower(&buf, n, &m, &vals, &instrs, &ptrs, &blocks);
     var isel[480];
-    var ic = gfx9_isel(&m, &isel, 10);
+    var ic = gfx9_isel(&m, &isel, 480);
     var out[640];
     # an output cap too small to hold the spliced list fails loud
-    assert_eq(gfx9_waitcnt(&m, &isel, ic, &out, 3), 0 - WC_ERR_CAP, "output cap exceeded");
+    assert_eq(gfx9_waitcnt(&m, &isel, ic, &out, 144), 0 - WC_ERR_CAP, "output cap exceeded");
     # cap_ids beyond the outstanding-tracker scratch fails loud
     var fake[80];
     memset(&fake, 0, 80);
     store64(&fake + 64, 300);
-    assert_eq(gfx9_waitcnt(&fake, &isel, 0, &out, 8), 0 - WC_ERR_TOO_MANY_IDS, "cap_ids too large");
+    assert_eq(gfx9_waitcnt(&fake, &isel, 0, &out, 384), 0 - WC_ERR_TOO_MANY_IDS, "cap_ids too large");
     return 0;
 }
 
@@ -514,7 +515,7 @@ fn test_gfx9_emit_alu_program() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     # SSA results (file comes from the defining op, not these unif values)
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
     _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_I32, MIR_UNIFORM, 0, 0);
@@ -550,7 +551,7 @@ fn test_gfx9_emit_alu_program() {
     memset(&built, 0, 256);
     var abi[64];
     memset(&abi, 0, 64);
-    var endp = gfx9_emit_program(&m, &isel, 9, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 9, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 40, "emit_program end at 40 bytes (10 dwords)");
     # llvm-mc gfx900 ground-truth
     var truth[256];
@@ -577,7 +578,7 @@ fn test_gfx9_emit_errors() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     _mir_set_val(&m, 20, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
     _mir_set_val(&m, 21, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -592,18 +593,19 @@ fn test_gfx9_emit_errors() {
     var isel[120];
     # 200 is not a defined GISEL op → _cmp_emit_one falls through to fail loud.
     _gisel_emit(&isel, 0, 200, 20, 0, 0, 0, 0);
-    assert_eq(gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0), 0 - CMP_ERR_UNSUPPORTED_OP, "unsupported op");
+    assert_eq(gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0, 128), 0 - CMP_ERR_UNSUPPORTED_OP,
+      "unsupported op");
     # a builtin operand (ABI resolution is N.5c): bootstrap %20 as a VGPR in-list,
     # then add a builtin — the resolve of %5 fails loud.
     _gisel_emit(&isel, 0, GISEL_V_CVT_F32_I32, 20, 5, 0, 0, MIR_FLAG_A_IMM);
     _gisel_emit(&isel, 1, GISEL_V_ADD_U32, 21, 20, 5, 0, 0);
-    var rcb = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    var rcb = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0, 128);
     assert_eq(rcb, 0 - CMP_ERR_UNSUPPORTED_OPERAND, "builtin operand");
     # cap_ids beyond the scratch
     var fake[80];
     memset(&fake, 0, 80);
     store64(&fake + 64, 300);
-    var rcc = gfx9_emit_program(&fake, &isel, 0, &alloc, &abi, &built, 0);
+    var rcc = gfx9_emit_program(&fake, &isel, 0, &alloc, &abi, &built, 0, 128);
     assert_eq(rcc, 0 - CMP_ERR_TOO_MANY_IDS, "cap_ids too large");
     return 0;
 }
@@ -619,7 +621,7 @@ fn test_gfx9_emit_sub_noncommutative() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 32, 32);
+    mir_mod_init(&m, &vals, 1280, &instrs, 128, &ptrs, 128, &blocks, 32, 32);
     _mir_set_val(&m, 20, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
     _mir_set_val(&m, 21, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
     _mir_set_val(&m, 22, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
@@ -654,7 +656,7 @@ fn test_gfx9_emit_sub_noncommutative() {
     memset(&built, 0, 256);
     var abi[64];
     memset(&abi, 0, 64);
-    var endp = gfx9_emit_program(&m, &isel, 7, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 7, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 32, "sub program end at 32 bytes");
     assert_eq(load32(&built + 0), 0x7E080A89, "cvt_f32_i32 v4,9");
     assert_eq(load32(&built + 4), 0x7E0A1104, "cvt_i32_f32 v5,v4");
@@ -684,7 +686,7 @@ fn test_gfx9_emit_flat_vop3() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
     _mir_set_val(&m, 11, MIR_VK_SSA, MIR_T_I32, MIR_DIVERGENT, 0, 0);
@@ -710,7 +712,7 @@ fn test_gfx9_emit_flat_vop3() {
     store64(&alloc + 12 * 16, 2);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 36, "flat/vop3 program end at 36 bytes");
     assert_eq(load32(&built + 0), 0x7E080A89, "cvt_f32_i32 v4,9");
     assert_eq(load32(&built + 4), 0x7E061104, "cvt_i32_f32 v3,v4");
@@ -733,7 +735,7 @@ fn test_gfx9_emit_store_const() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 9, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # offset → v3
     mir_set_const(&m, 11, MIR_T_U32, 0xCAFE);                           # the stored constant
@@ -749,7 +751,7 @@ fn test_gfx9_emit_store_const() {
     store64(&alloc + 10 * 16, 3);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 24, "store-const: extract(1) + v_mov(2) + store(2) + endpgm(1) = 24 bytes");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (offset)");
     assert_eq(load32(&built + 4), 0x7E0802FF, "v_mov v4, literal (materialize)");
@@ -770,7 +772,7 @@ fn test_gfx9_emit_vop2_const() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # x → v3
     mir_set_const(&m, 10, MIR_T_F32, 0x40000000);                       # 2.0
@@ -791,7 +793,7 @@ fn test_gfx9_emit_vop2_const() {
     store64(&alloc + 13 * 16, 6);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 4, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 4, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 16, "vop2-const program end at 16 bytes (no literal dword — inline floats)");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
     assert_eq(load32(&built + 4), 0x0A0A06F4, "v_mul_f32 v5, 2.0, v3 (const swapped to src0)");
@@ -808,7 +810,7 @@ fn test_gfx9_emit_fabs() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # x → v3
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # abs → v5
@@ -824,7 +826,7 @@ fn test_gfx9_emit_fabs() {
     store64(&alloc + 10 * 16, 5);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 16, "fabs: extract(1) + v_and(2) + endpgm(1) = 16 bytes");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
     assert_eq(load32(&built + 4), 0x260A06FF, "v_and_b32 v5, 0x7FFFFFFF, v3");
@@ -842,7 +844,7 @@ fn test_gfx9_emit_div_primitives() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);    # x → v3
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v4
@@ -873,7 +875,7 @@ fn test_gfx9_emit_div_primitives() {
     store64(&alloc + 15 * 16, 9);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 8, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 8, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 36, "div-primitives program end at 36 bytes");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (extract)");
     assert_eq(load32(&built + 4), 0x7E080D03, "v_cvt_f32_u32 v4, v3");
@@ -897,7 +899,7 @@ fn test_gfx9_emit_vop3_literal_materialize() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 9, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);   # gid.x → v3 (extract)
     mir_set_const(&m, 11, MIR_T_U32, 100);                              # the literal 100
@@ -914,7 +916,7 @@ fn test_gfx9_emit_vop3_literal_materialize() {
     store64(&alloc + 12 * 16, 5);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 24, "materialize: extract(1) + v_mov(2) + v_mul(2) + endpgm(1) = 24 bytes");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (gid.x extract)");
     assert_eq(load32(&built + 4), 0x7E0C02FF, "v_mov_b32 v6, literal");
@@ -934,7 +936,7 @@ fn test_gfx9_emit_glsl_math() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # operand a → v3
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # operand b → v4
@@ -959,7 +961,7 @@ fn test_gfx9_emit_glsl_math() {
     store64(&alloc + 13 * 16, 7);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 24, "glsl-math program end at 24 bytes");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
     assert_eq(load32(&built + 4), 0x7E080300, "v_mov v4, v0");
@@ -978,7 +980,7 @@ fn test_gfx9_emit_glsl_fma_floor() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # → v1
     _mir_set_val(&m, 10, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);   # → v2
@@ -1003,7 +1005,7 @@ fn test_gfx9_emit_glsl_fma_floor() {
     store64(&alloc + 13 * 16, 6);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 6, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 28, "fma/floor program end at 28 bytes");
     assert_eq(load32(&built + 0), 0x7E020300, "v_mov v1, v0");
     assert_eq(load32(&built + 4), 0x7E040300, "v_mov v2, v0");
@@ -1024,7 +1026,7 @@ fn test_gfx9_emit_fma_inline_float() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 8, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     _mir_set_val(&m, 9, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);    # gid → v3
     mir_set_const(&m, 10, MIR_T_F32, 0x40000000);                       # 2.0
@@ -1042,7 +1044,7 @@ fn test_gfx9_emit_fma_inline_float() {
     store64(&alloc + 12 * 16, 5);
     var built[256];
     memset(&built, 0, 256);
-    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0);
+    var endp = gfx9_emit_program(&m, &isel, 3, &alloc, &abi, &built, 0, 256);
     assert_eq(endp, 16, "fma-inline-float program end at 16 bytes (no literal dword)");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0");
     assert_eq(load32(&built + 4), 0xD1CB0005, "v_fma_f32 v5,v3,2.0,1.0 lo");
@@ -1060,7 +1062,7 @@ fn test_gfx9_flat_review_guards() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_bufvar(&m, 13, 0);
     _mir_set_val(&m, 5, MIR_VK_SSA, MIR_T_U32, MIR_UNIFORM, 0, 0);
     _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_F32, MIR_DIVERGENT, 0, 0);
@@ -1075,18 +1077,18 @@ fn test_gfx9_flat_review_guards() {
     var isel[120];
     # (a) const-offset access chain (offset operand id 0) -> fail loud, not v255
     _gisel_emit(&isel, 0, GISEL_GLOBAL_LOAD, 6, 0, 0, 0, 0);
-    var ra = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    var ra = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0, 128);
     assert_eq(ra, 0 - CMP_ERR_FLAT_CONST_OFFSET, "const-offset load fails loud");
     # (b) uniform (SGPR-file) offset -> fail loud, not an SGPR index in vaddr.
     # %5 is defined by an S_* op so the file-map marks it SGPR.
     _gisel_emit(&isel, 0, GISEL_S_ADD_I32, 5, 7, 7, 0, 0);
     _gisel_emit(&isel, 1, GISEL_GLOBAL_LOAD, 6, 5, 0, 0, 0);
-    var rb = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    var rb = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0, 128);
     assert_eq(rb, 0 - CMP_ERR_FLAT_NONVGPR, "uniform offset fails loud");
     # (c) a binding past the loaded USER_DATA region -> fail loud
     _gisel_emit(&isel, 0, GISEL_V_CVT_F32_I32, 6, 6, 0, 0, MIR_FLAG_A_IMM);
     _gisel_emit(&isel, 1, GISEL_GLOBAL_LOAD, 6, 6, 0, 0, 3 << 8);
-    var rc = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    var rc = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0, 128);
     assert_eq(rc, 0 - CMP_ERR_BINDING_RANGE, "out-of-range binding fails loud");
     return 0;
 }
@@ -1099,7 +1101,7 @@ fn test_gfx9_emit_extract_lid() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     mir_set_builtin(&m, 6, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     _mir_set_val(&m, 7, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
@@ -1115,12 +1117,12 @@ fn test_gfx9_emit_extract_lid() {
     memset(&built, 0, 64);
     # EXTRACT(LID, comp 0) -> %7 (v3): v_mov v3, v0
     _gisel_emit(&isel, 0, GISEL_EXTRACT, 7, 5, 0, 0, MIR_FLAG_C_IMM);
-    var e = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    var e = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0, 64);
     assert_eq(e, 4, "extract -> one v_mov dword");
     assert_eq(load32(&built + 0), 0x7E060300, "v_mov v3, v0 (LID.x)");
     # EXTRACT(GID) fails loud (needs wgid*size+lid expansion, N.5c-2)
     _gisel_emit(&isel, 0, GISEL_EXTRACT, 8, 6, 0, 0, MIR_FLAG_C_IMM);
-    var e2 = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0);
+    var e2 = gfx9_emit_program(&m, &isel, 1, &alloc, &abi, &built, 0, 64);
     assert_eq(e2, 0 - CMP_ERR_UNSUPPORTED_BUILTIN, "extract GID fails loud");
     return 0;
 }
@@ -1134,12 +1136,12 @@ fn test_gfx9_isel_extract_unknown_unif() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
     mir_emit(&m, MIR_OP_EXTRACT, 6, MIR_T_U32, 5, 0, 0, MIR_FLAG_C_IMM);
-    var isel[256];
+    var isel[384];
     # deliberately NO mir_run_uniformity → %6 stays MIR_UNKNOWN
-    assert_eq(gfx9_isel(&m, &isel, 8), 0 - GISEL_ERR_UNSUPPORTED_OP, "EXTRACT with UNKNOWN unif fails loud");
+    assert_eq(gfx9_isel(&m, &isel, 384), 0 - GISEL_ERR_UNSUPPORTED_OP, "EXTRACT with UNKNOWN unif fails loud");
     return 0;
 }
 
@@ -1152,7 +1154,7 @@ fn test_gfx9_emit_extract_wgid() {
     var instrs[512];
     var ptrs[512];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 4, 4, 30, 30);
+    mir_mod_init(&m, &vals, 1200, &instrs, 128, &ptrs, 128, &blocks, 32, 30);
     mir_set_bufvar(&m, 13, 0);   # 1 binding → user_sgpr=2, TGID at s2
     mir_set_builtin(&m, 5, MIR_T_U32, MIR_BI_WORKGROUP_ID);
     mir_set_builtin(&m, 6, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
@@ -1171,13 +1173,14 @@ fn test_gfx9_emit_extract_wgid() {
     _gisel_emit(&isel, 1, GISEL_EXTRACT, 11, 6, 0, 0, MIR_FLAG_C_IMM);
     var alloc[512];
     var hw[16];
-    var rr = gfx9_regalloc(&m, &isel, 2, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, &hw);
+    var rr = gfx9_regalloc(&m, &isel, 2, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, 512,
+      &hw);
     assert_eq(rr, 0, "regalloc ok");
     assert_eq(gfx9_reg(&alloc, 10), 3, "uniform WGID extract -> s3 (SGPR file)");
     assert_eq(gfx9_reg(&alloc, 11), 1, "divergent LID extract -> v1 (VGPR file)");
     var built[64];
     memset(&built, 0, 64);
-    var e = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0);
+    var e = gfx9_emit_program(&m, &isel, 2, &alloc, &abi, &built, 0, 64);
     assert_eq(e, 8, "two moves = 8 bytes");
     assert_eq(load32(&built + 0), 0xBE830002, "EXTRACT(WGID.x) -> s_mov s3, s2");
     assert_eq(load32(&built + 4), 0x7E020300, "EXTRACT(LID.x) -> v_mov v1, v0");
@@ -1199,13 +1202,13 @@ fn test_gfx9_isel_uniform_if() {
     var instrs[1024];
     var ptrs[256];
     var blocks[32];
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 960, &instrs, 1024, &ptrs, 256, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 256), 0, "lower ok");
     var isel[1536];
-    var ni = gfx9_isel(&m, &isel, 32);
+    var ni = gfx9_isel(&m, &isel, 1536);
     assert_eq(ni, 7, "7 selected instrs");
     assert_eq(gisel_op(&isel, 0), GISEL_EXTRACT, "0: extract wgid.x");
     assert_eq(gisel_op(&isel, 1), GISEL_S_CMP, "1: s_cmp");
@@ -1223,10 +1226,11 @@ fn test_gfx9_isel_uniform_if() {
     gfx9_abi_assign(&m, &abi);
     var alloc[512];
     var hw[16];
-    var rr = gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, &hw);
+    var rr = gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, 512,
+      &hw);
     assert_eq(rr, 0, "regalloc over control flow ok");
     var isel2[1536];
-    var ni2 = gfx9_waitcnt(&m, &isel, ni, &isel2, 32);
+    var ni2 = gfx9_waitcnt(&m, &isel, ni, &isel2, 1536);
     assert_eq(ni2 >= ni, 1, "waitcnt passes control flow through");
     return 0;
 }
@@ -1240,7 +1244,7 @@ fn test_gfx9_isel_divergent_compare() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);                          # bound (constant)
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);  # divergent
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);   # divergent
@@ -1249,8 +1253,8 @@ fn test_gfx9_isel_divergent_compare() {
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     assert_eq(mir_val_unif(&m, 4), MIR_DIVERGENT, "gid<8 divergent");
-    var isel[512];
-    var ni = gfx9_isel(&m, &isel, 16);
+    var isel[768];
+    var ni = gfx9_isel(&m, &isel, 768);
     assert_eq(ni, 3, "3 selected (2 v_cmp + endpgm)");
     # gid < 8: b is the constant → moved to src0, predicate flipped lt → gt.
     assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp (divergent compare)");
@@ -1275,7 +1279,7 @@ fn test_gfx9_isel_signed_compare() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);  # divergent
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_WORKGROUP_ID);     # uniform
@@ -1283,8 +1287,8 @@ fn test_gfx9_isel_signed_compare() {
     mir_emit(&m, MIR_OP_ICMP_SLT, 5, MIR_T_U32, 3, 1, 0, 0);    # (wgid < 8) signed uniform
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[512];
-    var ni = gfx9_isel(&m, &isel, 16);
+    var isel[768];
+    var ni = gfx9_isel(&m, &isel, 768);
     assert_eq(ni, 3, "3 selected (v_cmp + s_cmp + endpgm)");
     assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp (divergent signed)");
     assert_eq(gisel_flags(&isel, 0) >> 8, GFX9_VOPC_V_CMP_GT_I32, "v_cmp op = gt_i32 (flipped)");
@@ -1370,7 +1374,7 @@ fn test_gfx9_regalloc_loop_liveness() {
     var instrs[1024];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 24, 32);
+    mir_mod_init(&m, &vals, 1280, &instrs, 1024, &ptrs, 128, &blocks, 32, 24);
     mir_set_builtin(&m, 1, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_set_const(&m, 2, MIR_T_U32, 7);
     mir_emit(&m, MIR_OP_IADD, 3, MIR_T_U32, 1, 2, 0, 0);    # v3 defined BEFORE the loop
@@ -1382,14 +1386,14 @@ fn test_gfx9_regalloc_loop_liveness() {
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     var isel[2048];
-    var ni = gfx9_isel(&m, &isel, 32);
+    var ni = gfx9_isel(&m, &isel, 1536);
     assert_eq(ni > 0, 1, "loop MIR selects");
     var abi[64];
     gfx9_abi_assign(&m, &abi);
     var alloc[512];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi),
-        104, 256, &alloc, &hw), 0, "regalloc over a back-edge succeeds");
+    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, 512,
+        &hw), 0, "regalloc over a back-edge succeeds");
     var r3 = load64(&alloc + 3 * RA_REC + 0);
     var r5 = load64(&alloc + 5 * RA_REC + 0);
     var r6 = load64(&alloc + 6 * RA_REC + 0);
@@ -1414,7 +1418,7 @@ fn test_gfx9_regalloc_allocates_each_value_once() {
     var instrs[1024];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 24, 32);
+    mir_mod_init(&m, &vals, 1280, &instrs, 1024, &ptrs, 128, &blocks, 32, 24);
     mir_set_builtin(&m, 1, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_set_const(&m, 2, MIR_T_U32, 7);
     mir_emit(&m, MIR_OP_IADD, 3, MIR_T_U32, 1, 2, 0, 0);    # first def of v3
@@ -1430,13 +1434,13 @@ fn test_gfx9_regalloc_allocates_each_value_once() {
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     var isel[2048];
-    var ni = gfx9_isel(&m, &isel, 32);
+    var ni = gfx9_isel(&m, &isel, 1536);
     var abi[64];
     gfx9_abi_assign(&m, &abi);
     var alloc[512];
     var hw[16];
-    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi),
-        104, 256, &alloc, &hw), 0, "regalloc with a redefined value succeeds");
+    assert_eq(gfx9_regalloc(&m, &isel, ni, gfx9_abi_sgpr_base(&abi), gfx9_abi_vgpr_base(&abi), 104, 256, &alloc, 512,
+        &hw), 0, "regalloc with a redefined value succeeds");
     var r3 = load64(&alloc + 3 * RA_REC + 0);
     var r4 = load64(&alloc + 4 * RA_REC + 0);
     var r5 = load64(&alloc + 5 * RA_REC + 0);
@@ -1459,7 +1463,7 @@ fn test_gfx9_isel_rejects_return_in_selection() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);     # divergent cond
@@ -1469,8 +1473,8 @@ fn test_gfx9_isel_rejects_return_in_selection() {
     mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, 0);       # merge
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[512];
-    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_RETURN_IN_SELECTION,
+    var isel[768];
+    assert_eq(gfx9_isel(&m, &isel, 768), 0 - GISEL_ERR_RETURN_IN_SELECTION,
       "OpReturn inside a divergent if is rejected, not miscompiled");
     return 0;
 }
@@ -1484,7 +1488,7 @@ fn test_gfx9_isel_rejects_nested_selection() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
@@ -1495,8 +1499,8 @@ fn test_gfx9_isel_rejects_nested_selection() {
     mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, 0);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[512];
-    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_NESTED_SELECTION,
+    var isel[768];
+    assert_eq(gfx9_isel(&m, &isel, 768), 0 - GISEL_ERR_NESTED_SELECTION,
       "a nested divergent if names itself");
     return 0;
 }
@@ -1508,15 +1512,15 @@ fn test_gfx9_isel_rejects_unclosed_selection() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
     mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 5, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
     mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);       # then, no merge %5 ever
     mir_run_uniformity(&m);
-    var isel[512];
-    assert_eq(gfx9_isel(&m, &isel, 16), 0 - GISEL_ERR_UNCLOSED_SELECTION,
+    var isel[768];
+    assert_eq(gfx9_isel(&m, &isel, 768), 0 - GISEL_ERR_UNCLOSED_SELECTION,
       "an unclosed divergent if names itself");
     return 0;
 }
@@ -1527,7 +1531,7 @@ fn test_gfx9_isel_divergent_if() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);     # divergent cond (gid < 8)
@@ -1537,8 +1541,8 @@ fn test_gfx9_isel_divergent_if() {
     mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, 0);       # merge
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[512];
-    var ni = gfx9_isel(&m, &isel, 16);
+    var isel[768];
+    var ni = gfx9_isel(&m, &isel, 768);
     assert_eq(ni, 8, "8 selected (v_cmp + saveexec + execz + then-label + s_branch + merge-label + or + endpgm)");
     assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp");
     assert_eq(gisel_op(&isel, 1), GISEL_S_SAVEEXEC, "1: s_and_saveexec_b64");
@@ -1563,7 +1567,7 @@ fn test_gfx9_isel_divergent_if_nesting_rejected() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
@@ -1574,8 +1578,8 @@ fn test_gfx9_isel_divergent_if_nesting_rejected() {
     mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, 0);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
-    var isel[512];
-    assert_eq(gfx9_isel(&m, &isel, 16) < 0, 1, "nested divergent if fails loud (single EXEC pair)");
+    var isel[768];
+    assert_eq(gfx9_isel(&m, &isel, 768) < 0, 1, "nested divergent if fails loud (single EXEC pair)");
     return 0;
 }
 

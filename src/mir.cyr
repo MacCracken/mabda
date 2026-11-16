@@ -202,12 +202,13 @@ var MIR_ERR_ID_OOR           = 25;
 # (`native_spirv_saxpy_e2e`, red 4.0.5 -> 4.0.10) in the wrong direction.
 var MIR_ERR_MOD_UNINIT       = 30;   # MirMod header reads uninitialized/corrupt (cap_ids <= 0)
 var MIR_ERR_VALS_OVERRUN     = 31;   # mir_mod_init's vals[] memset overran and clobbered the header
-var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null buf / bad cap / id_bound)
+var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null / short buf, id_bound)
 
 # Ceiling on cap_ids. Mirrors gfx9_regalloc's RA_MAX_REGS: the regalloc free-at
 # scratch and the gfx9_compile/gfx9_waitcnt per-id file-maps are all sized for
-# 256 ids, so a larger cap is rejected downstream regardless. Named here so
-# mir_mod_init can reject it at the stage that was actually handed the number.
+# 256 ids. mir_mod_init clamps the cap it derives from vals_len to this (since
+# 4.4.0; before, a cap_ids above it was rejected), so a larger vals[] is legal
+# and its excess is never touched.
 var MIR_MAX_CAP_IDS          = 256;
 
 # Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
@@ -231,22 +232,45 @@ var MIR_FLAG_C_IMM = 8;
 #   +32 n_instrs  +40 cap_instrs  +48 n_ptrs  +56 cap_ptrs
 #   +64 cap_ids  +72 next_synth
 # ================================================================
+# THE SCRATCH-BUFFER CONTRACT (v4.4.0). Every buffer arrives with its length in
+# BYTES, and every capacity is DERIVED from that length; none is a separate
+# number. Before 4.4.0 the caller passed `cap_ids` / `cap_instrs` / `cap_ptrs`
+# beside bare pointers, and nothing tied a capacity to its buffer: the vals[]
+# memset below overran its caller's stack for four releases
+# (`native_spirv_saxpy_e2e`, 4.0.5 -> 4.0.10), and the production compile path
+# declared ptrs[2048] (64 records) while claiming 128 (fixed in 4.4.0). A
+# length can still be wrong, but it now sits beside its own `var buf[N]`, where
+# `scripts/check-compiler-buffer-sizing.py` checks every literal one.
+#   cap_ids    = vals_len   / MIR_VAL_REC   (clamped to MIR_MAX_CAP_IDS)
+#   cap_instrs = instrs_len / MIR_INSTR_REC
+#   cap_ptrs   = ptrs_len   / MIR_PTR_REC
+#   blocks_len >= MIR_BLOCK_REC (one block record; this fn writes block 0)
+# A buffer longer than the cap needs is fine; the excess is never touched.
+#
 # `cap_ids` is the value-id CEILING = the vals[] backing-store capacity in
 # records (>= id_bound + synth headroom). It is the bound every value write is
 # checked against — DISTINCT from the SPIR-V id_bound, because mir_alloc_synth_id
 # hands out fresh ids >= id_bound for synthesized terms (e.g. the
-# GlobalInvocationId expansion). Caller MUST size vals[] as cap_ids * MIR_VAL_REC.
-# `next_synth` starts at id_bound so synth ids occupy [id_bound, cap_ids).
+# GlobalInvocationId expansion). `next_synth` starts at id_bound so synth ids
+# occupy [id_bound, cap_ids).
 # Returns 0, or a NEGATIVE error. ⚠ The return was ignorable before v4.0.11 (this
 # fn could not fail); it can now, and callers SHOULD check it — a rejected init
 # leaves the module unusable and every later stage reports a downstream symptom
 # instead of this cause.
-fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, cap_ids): i64 {
+fn mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
     if (m == 0)      { return 0 - MIR_ERR_BAD_INIT; }
     if (vals == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (instrs == 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (ptrs == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (blocks == 0) { return 0 - MIR_ERR_BAD_INIT; }
+    if (blocks_len < MIR_BLOCK_REC) { return 0 - MIR_ERR_BAD_INIT; }
+    # A buffer longer than the ceiling every later stage is sized for (the
+    # regalloc and file-map scratch hold RA_MAX_REGS = 256 ids) keeps its excess
+    # unused; it is not an error.
+    var cap_ids = vals_len / MIR_VAL_REC;
+    if (cap_ids > MIR_MAX_CAP_IDS) { cap_ids = MIR_MAX_CAP_IDS; }
+    var cap_instrs = instrs_len / MIR_INSTR_REC;
+    var cap_ptrs = ptrs_len / MIR_PTR_REC;
     if (cap_ids <= 0)    { return 0 - MIR_ERR_BAD_INIT; }
     if (cap_instrs <= 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (cap_ptrs <= 0)   { return 0 - MIR_ERR_BAD_INIT; }
@@ -261,9 +285,6 @@ fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, c
     # that DOES synth gets is MIR_ERR_ID_OOR from mir_alloc_synth_id, at the point
     # of the actual request.
     if (id_bound > cap_ids) { return 0 - MIR_ERR_BAD_INIT; }
-    # cap_ids above RA_MAX_REGS is rejected by gfx9_emit_program anyway
-    # (CMP_ERR_TOO_MANY_IDS); saying so at init names the stage that set it.
-    if (cap_ids > MIR_MAX_CAP_IDS) { return 0 - MIR_ERR_BAD_INIT; }
     store64(m + 0, vals);
     store64(m + 8, instrs);
     store64(m + 16, ptrs);
@@ -279,17 +300,16 @@ fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, c
     store64(blocks + 8, 0);
     store64(blocks + 16, 0);
     store64(blocks + 24, MIR_TERM_RETURN);
-    # ⭐ SELF-CHECK — cheap, and it catches the exact defect that hid for four
-    # releases. The memset above writes cap_ids * MIR_VAL_REC bytes into a buffer
-    # whose size this fn CANNOT know (it gets a bare pointer). When a caller
-    # undersizes vals[] and the MirMod header happens to sit just past its end —
-    # the ordinary stack layout, since both are locals declared adjacently — that
+    # ⭐ SELF-CHECK — the backstop for a caller whose vals_len is larger than the
+    # buffer it actually declared. The memset above writes cap_ids * MIR_VAL_REC
+    # bytes, which is within vals_len by construction; it overruns only if the
+    # length lies. When it does and the MirMod header sits just past vals[] — the
+    # ordinary stack layout, since both are locals declared adjacently — the
     # memset has just zeroed the header written above. Reading it back costs two
-    # loads and turns silent corruption into a named error.
-    # ⚠ NOT a complete bound: if the overrun lands on something OTHER than the
-    # header this check passes and the corruption is still silent. The static gate
-    # `scripts/check-compiler-buffer-sizing.py` is what covers the general case;
-    # this is the runtime backstop for the layout that actually bit us.
+    # loads and turns that into a named error.
+    # ⚠ NOT a complete bound: an overrun that lands on something OTHER than the
+    # header passes this check. `scripts/check-compiler-buffer-sizing.py` checks
+    # every literal length against its `var buf[N]`.
     if (load64(m + 64) != cap_ids)  { return 0 - MIR_ERR_VALS_OVERRUN; }
     if (load64(m + 72) != id_bound) { return 0 - MIR_ERR_VALS_OVERRUN; }
     return 0;

@@ -13,6 +13,97 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.4.0] — in progress (VERSION still reads 4.3.1)
+
+**Compilers + NVIDIA** ([roadmap](docs/development/roadmap.md#v440--compilers--nvidia)). Landed
+so far: **the scratch-buffer contract**. Every compiler buffer now arrives with its length in
+bytes, and each stage derives its capacity from that length. While moving the call sites over,
+three real overruns turned up (Security, Fixed), one in the path that compiles consumer SPIR-V.
+The remaining 4.4.0 items are open and tracked in the roadmap.
+
+### Security
+- **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
+  (`src/backend_native.cyr`) declared `ptrs[2048]`, 64 MIR pointer records, but told
+  `mir_mod_init` it held 128. The SPIR-V a consumer hands to `gpu_shader_module_create_spirv` on
+  a native AMD context therefore wrote one 32-byte record past the buffer per `OpAccessChain`
+  beyond 64. The 256-id budget caps a kernel at about 118 chains, so the overrun reached about
+  1.7 KiB of the compile frame. `scripts/check-compiler-buffer-sizing.py` never saw it: it parsed
+  only call sites whose arguments were all integer literals, and this one passed named values.
+  Fixed: `ptrs[4096]`, and the gate (below) now fails a local buffer whose length is not
+  checkable. Regression: `test_contract_many_access_chains` compiles 100 chains through the
+  production path. Shrinking `ptrs[]` back to 2048 bytes fails it with `MIR_ERR_CAP_EXCEEDED`.
+
+### Changed — the scratch-buffer contract (`@internal`; no public API changes)
+- `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
+  id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
+  buffer's length divided by its record size. A `vals[]` longer than 256 records is clamped to
+  the 256-id ceiling; it was rejected before. A length shorter than one record is rejected.
+- `spirv_build_{type,const,decoration}_table(p, n, out, out_len)`: both `cap` and `id_bound`
+  are gone. Each builder reads `id_bound` from the module header, as `gfx9_compile` always did,
+  and returns -1 for a module shorter than a header. Dropping the argument is deliberate: with
+  `(.., out, out_len)` in place of `(.., cap, out)`, a stale caller would still compile and then
+  write through `cap` as a pointer. Now it fails to compile.
+- `_spirv_resolve_builtins(.., out_bi, out_bi_len)`, `spirv_lower_module(.., out_bi,
+  out_bi_len)`, `gfx9_isel(m, out, out_len)`, `gfx9_waitcnt(.., out, out_len)`,
+  `gfx9_regalloc(.., alloc, alloc_len, hw)`, `gfx9_emit_program(.., buf, pos, buf_len)` and
+  `gfx9_compile(cc, spirv, n, isa, isa_len, desc)` all take byte lengths. Each one checks its
+  length before it writes anything.
+- The compile context is 136 bytes (`CC_SIZE`). Each capacity-scaled buffer is bound with its
+  length by `gfx9_cc_buf(cc, CC_X, buf, len)`. `CC_CAP_IDS`, the single record count that four
+  buffers with three different record sizes had to honour, is removed.
+- `gfx9_emit_program` checks for `CMP_RECORD_MAX_BYTES` (32) of room before encoding each
+  record, and `gfx9_compile` checks for room for the prefetch pad. Before this the ISA output
+  buffer had no bound at all. The production path checked `isa_len > 8192` only after emitting.
+- The pure-CPU half of `_native_shader_compile_spirv` is now `_native_compile_spirv_isa`, so the
+  CPU suite can drive the production compile frame. That function still screens the module the
+  way `gfx9_compile` does (`CMP_ERR_VALIDATE`, then `CMP_ERR_TABLE` for an `id_bound` above 256),
+  so a consumer sees the same codes as before.
+- `scripts/check-compiler-buffer-sizing.py` is rewritten as a generic check. At every
+  contract call, each `&buf, LEN` pair must satisfy `LEN <=` the enclosing function's
+  `var buf[N]`. A local buffer passed with a non-literal length fails, unless the same function
+  bounds that name first with `if (len > M)`, `M <= N`. A zero length outside an assertion fails
+  as probable swapped arguments. 1000 pairs are checked; the old gate checked 124 call sites.
+
+### Breaking — for a consumer that calls the `@internal` compiler directly
+- **ranga** (`ranga/tests/gpu_spirv.tcyr:189-195`) calls the three table builders with the old
+  5-argument form, `spirv_build_type_table(p, n, idb, idb, types)`. Against this bundle that
+  is a compile error, *expects 4 arguments*. The fix is
+  `spirv_build_type_table(p, n, types, <bytes of types>)`, likewise for the const (16-byte
+  records) and decoration (16-byte records) tables. ranga's repo is not edited here.
+  soorat, bijli and aethersafta do not reference the changed functions. rasa and kiran have no
+  checkout on the dev box and were not checked.
+
+### Fixed
+- Four HW programs (`native_spirv_f64_{const,ldexp,select,i32_cvt}_e2e`) declared `isel[1024]`
+  (21 records) while `gfx9_compile` always told `gfx9_isel` it had 256. The old gate missed it
+  because it read only the first `store64(&cc + CC_*, ..)` on a line, and those programs packed
+  three per line. The buffers are now 12288 bytes.
+- In `tests/tcyr/compiler_backend.tcyr`, 18 `isel` / `out` buffers held fewer records than the
+  call claimed (`isel[256]` passed a cap of 8). They are now sized to match.
+- `spirv_lower_module` discarded `_spirv_resolve_builtins`'s return value. That was harmless
+  only while the function could not fail.
+
+### Added
+- Error codes `LOWER_ERR_OUTBI_SHORT` (35), `RA_ERR_ALLOC_SHORT` (53) and
+  `CMP_ERR_ISA_OVERFLOW` (88). `gpu_shader_error_name` names all three, and the
+  `MIR_ERR_BAD_INIT` / `MIR_ERR_VALS_OVERRUN` / `CMP_ERR_TABLE` reasons now describe lengths.
+- Tests: `test_contract_many_access_chains`, `test_contract_short_buffers_fail_before_writing`
+  (each buffer shortened alone fails with its own stage's code and writes nothing past its
+  length), `test_contract_short_tables`, `test_gfx9_cc_buf_layout`, and
+  `test_mir_mod_init_oversized_vals_clamps`. `test_mir_mod_init_contract` is rewritten for
+  derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
+
+### Verified (so far)
+- CPU: 25 suites, **6929 assertions**, 0 failed (4.3.1: 6880). Per-file lint,
+  `--strict-deferrals` and `fmt --check` are clean on every changed file. `cyrius vet`, the
+  sizing / stack-array / write-length / count-script / make-dry-run gates, `fuzz`,
+  `example-link` and `test-raw-include` pass. `cyrius distlib` is idempotent.
+- AMD Cezanne: `make test-native-all` gives 72 passed, 0 failed, 2 skipped (DRM master), the
+  same as 4.3.1. Every edited `native_spirv_*_e2e` program passes
+  (`build/logs/test-native-all-20261116-123553.log`).
+- Not yet run for 4.4.0: the NVIDIA box `chew` (this change touches no NVIDIA code), and
+  ranga's suites, which need the table-builder fix described above.
+
 ## [4.3.1] — 2026-11-16
 
 **The render tier's MB2–MB5: depth and shadows; render formats, MSAA, views, mip generation,

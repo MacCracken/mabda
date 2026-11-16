@@ -436,11 +436,11 @@ fn _spv_saxpy_lower(buf, n, m, vals, instrs, ptrs, blocks): i64 {
     var consts[448];
     var deco[448];
     var outbi[256];
-    spirv_build_type_table(buf, n, 26, 26, &types);
-    spirv_build_const_table(buf, n, 26, 26, &consts);
-    spirv_build_decoration_table(buf, n, 26, 26, &deco);
-    mir_mod_init(m, vals, instrs, ptrs, blocks, 32, 8, 26, 30);
-    return spirv_lower_module(buf, n, &types, &consts, &deco, m, &outbi);
+    spirv_build_type_table(buf, n, &types, 624);
+    spirv_build_const_table(buf, n, &consts, 416);
+    spirv_build_decoration_table(buf, n, &deco, 416);
+    mir_mod_init(m, vals, 1200, instrs, 1024, ptrs, 256, blocks, 32, 26);
+    return spirv_lower_module(buf, n, &types, &consts, &deco, m, &outbi, 256);
 }
 
 # ================================================================
@@ -471,6 +471,31 @@ fn _spv_build_saxpy_lid(buf): i64 {
     var n = _spv_build_saxpy(buf);
     store32(buf + 100, 27);   # OpDecorate %12 BuiltIn LocalInvocationId (the base is already LID)
     return n;
+}
+
+# v4.4.0 — the SAXPY-LID header and prologue (through `%19 = LID.x`) followed by
+# `nchain` OpAccessChain %10 %(20+k) %13 %16 %19, each one MIR pointer record and one
+# synth offset id, then OpReturn / OpFunctionEnd. id_bound = 20 + nchain. Sized for
+# `buf` of 448 + nchain * 24 + 8 bytes. Drives the scratch-buffer contract's ptrs[]
+# tests: the production compile path declared 64 records while claiming 128.
+fn _spv_build_many_chains(buf, nchain): i64 {
+    _spv_build_saxpy_lid(buf);
+    store32(buf + 12, 20 + nchain);   # id_bound
+    var p = 448;                       # first byte after `OpCompositeExtract %19`
+    var k = 0;
+    while (k < nchain) {
+        store32(buf + p, (6 << 16) | 65);   # OpAccessChain %10 %(20+k) %13 %16 %19
+        store32(buf + p + 4, 10);
+        store32(buf + p + 8, 20 + k);
+        store32(buf + p + 12, 13);
+        store32(buf + p + 16, 16);
+        store32(buf + p + 20, 19);
+        p = p + 24;
+        k = k + 1;
+    }
+    store32(buf + p, (1 << 16) | 253);   # OpReturn
+    store32(buf + p + 4, (1 << 16) | 56);   # OpFunctionEnd
+    return p + 8;
 }
 
 # The SAXPY fixture re-indexed by GlobalInvocationId (BuiltIn 28) — the index then

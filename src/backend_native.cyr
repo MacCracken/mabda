@@ -996,13 +996,66 @@ var NATIVE_SHMOD_LOCALY  = 72;
 var NATIVE_SHMOD_LOCALZ  = 80;
 var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the compile
-# scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
-# → CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
+# Compile cap for shader-module-create: the id_bound / cap_ids ceiling the scratch in
+# _native_compile_spirv_isa is sized for. SPIR-V whose header id_bound exceeds it
+# fails loud (CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
 # free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
 # RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
 # further needs growing those internal scratch buffers (a deeper N.8 change).
 var NATIVE_SHADER_CAP_IDS = 256;
+
+# The compile half of _native_shader_compile_spirv: SPIR-V -> GFX9 ISA into `isa`
+# (`isa_len` bytes) + the DESC_* descriptor into `desc`, all scratch on this frame.
+# Pure CPU (no ctx, no ioctl), so tests/tcyr/native.tcyr drives it directly.
+# Returns 0 or gfx9_compile's negative stage code.
+#
+# THE SCRATCH-BUFFER CONTRACT (4.4.0): each buffer's length is the literal beside
+# its `var`, and every stage derives its capacity from it. Until 4.4.0 the
+# capacities were separate numbers: ptrs[] was declared 2048 bytes (64 records)
+# while mir_mod_init was told 128, so SPIR-V with 65-128 access chains wrote past
+# ptrs[] on this stack. The sizing gate skipped this call because its arguments
+# were not literals.
+fn _native_compile_spirv_isa(words_ptr, byte_len, isa, isa_len, desc): i64 {
+    # --- scratch sized for NATIVE_SHADER_CAP_IDS = 256 ids ---
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
+    var m[80];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[4096];      # 128 * MIR_PTR_REC(32)
+    var blocks[32];      # one MIR_BLOCK_REC
+    # mir_mod_init runs before gfx9_compile, so screen the module here the way
+    # gfx9_compile would. A consumer then sees the same codes as before 4.4.0
+    # (CMP_ERR_VALIDATE for bad bytes, CMP_ERR_TABLE for an id_bound past the cap)
+    # rather than mir_mod_init's MIR_ERR_BAD_INIT, which names the wrong layer.
+    if (spirv_validate_stream(words_ptr, byte_len) != 0) { return 0 - CMP_ERR_VALIDATE; }
+    var idb = spirv_hdr_id_bound(words_ptr);
+    if (idb > NATIVE_SHADER_CAP_IDS) { return 0 - CMP_ERR_TABLE; }
+    # The MIR synth-id counter starts right after the SPIR-V ids (the header's
+    # id_bound), so synthesized values (access-chain offsets, GID expansion) get
+    # fresh ids in [id_bound, 256).
+    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
+    if (mr < 0) { return mr; }
+    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
+    var isel2[12288];
+    var alloc[4096];     # 256 * RA_REC(16)
+    var hw[16];
+    var abi[64];
+    var cc[136];         # CC_SIZE
+    gfx9_cc_buf(&cc, CC_TYPES, &types, 6144);
+    gfx9_cc_buf(&cc, CC_CONSTS, &consts, 4096);
+    gfx9_cc_buf(&cc, CC_DECO, &deco, 4096);
+    gfx9_cc_buf(&cc, CC_OUTBI, &outbi, 2048);
+    gfx9_cc_buf(&cc, CC_ISEL, &isel, 12288);
+    gfx9_cc_buf(&cc, CC_ISEL2, &isel2, 12288);
+    gfx9_cc_buf(&cc, CC_ALLOC, &alloc, 4096);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    return gfx9_compile(&cc, words_ptr, byte_len, isa, isa_len, desc);
+}
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
 # at a context-allocated VA, and return a magic-tagged shmod struct the compute
@@ -1025,41 +1078,6 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     _gpu_set_last_shader_err(0 - SHMOD_ERR_TOO_SHORT);
     if (byte_len < 20) { return 0; }
 
-    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
-    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
-    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
-    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
-    var outbi[2048];     # 256 * 8
-    var m[80];
-    var vals[10240];     # 256 * MIR_VAL_REC(40)
-    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
-    var ptrs[2048];      # 128 * MIR_PTR_REC(16)
-    var blocks[32];
-    # The MIR synth-id counter starts right after the SPIR-V ids (the header's
-    # id_bound), so synthesized values (access-chain offsets, GID expansion) get
-    # fresh ids in [id_bound, NATIVE_SHADER_CAP_IDS). Passing the cap as the start
-    # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
-    # table-build gate (CMP_ERR_TABLE).
-    var idb = spirv_hdr_id_bound(words_ptr);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 512, 128, idb,
-      NATIVE_SHADER_CAP_IDS);
-    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
-    var isel2[12288];
-    var alloc[4096];     # 256 * RA_REC(16)
-    var hw[16];
-    var abi[64];
-    var cc[88];
-    store64(&cc + CC_TYPES, &types);
-    store64(&cc + CC_CONSTS, &consts);
-    store64(&cc + CC_DECO, &deco);
-    store64(&cc + CC_M, &m);
-    store64(&cc + CC_OUTBI, &outbi);
-    store64(&cc + CC_ISEL, &isel);
-    store64(&cc + CC_ISEL2, &isel2);
-    store64(&cc + CC_ALLOC, &alloc);
-    store64(&cc + CC_HW, &hw);
-    store64(&cc + CC_ABI, &abi);
-    store64(&cc + CC_CAP_IDS, NATIVE_SHADER_CAP_IDS);
     var isa[8192];
     memset(&isa, 0, 8192);
     var desc[72];
@@ -1067,7 +1085,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # specific stage code (mir / lower / regalloc / waitcnt / isel / emit) and was
     # previously discarded here. Every case in the ranga M6 filing arrived as a
     # bare 0 because of this one comparison.
-    var crc = gfx9_compile(&cc, words_ptr, byte_len, &isa, &desc);
+    var crc = _native_compile_spirv_isa(words_ptr, byte_len, &isa, 8192, &desc);
     if (crc != 0) { _gpu_set_last_shader_err(crc); return 0; }
     var isa_len = load64(&desc + DESC_ISA_LEN);
     _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_EMPTY);

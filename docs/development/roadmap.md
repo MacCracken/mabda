@@ -106,11 +106,17 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   store, integer and f32 arithmetic, structured selections, `OpFDiv`, `OpSelect`, GLSL.std.450
   clamps, 2–3 bindings) compile through `gpu_shader_module_create_spirv` on an NVIDIA context and
   ranga's four GPU suites pass on the TU116.
-- ⭐ **The scratch-buffer contract.** `mir_mod_init`, `gfx9_regalloc`, `_spirv_resolve_builtins`
-  and the three `spirv_build_*_table` builders memset a caller-supplied extent into a buffer whose
-  size they cannot see (a runtime self-check and `scripts/check-compiler-buffer-sizing.py` guard
-  it today). Passing explicit lengths makes the invalid state unrepresentable — before N9 adds a
-  second backend's callers. `@internal`, no public break.
+- ✅ **The scratch-buffer contract** — landed (uncommitted; CHANGELOG [4.4.0]). Every compiler
+  buffer now carries its byte length and each stage derives its capacity from it: `mir_mod_init`,
+  the table builders, `_spirv_resolve_builtins` / `spirv_lower_module`, `gfx9_isel`,
+  `gfx9_regalloc`, `gfx9_waitcnt`, `gfx9_emit_program`, `gfx9_compile` and the 136-byte compile
+  context (`gfx9_cc_buf`). `check-compiler-buffer-sizing.py` checks every literal length against
+  its `var buf[N]`. The move turned up a HIGH stack overrun in the native SPIR-V compile path
+  (`ptrs[2048]` claimed as 128 records) and undersized `isel` buffers in four HW programs; both
+  are fixed. HW-verified on the Cezanne (`test-native-all` 72 / 0 / 2 skipped,
+  `build/logs/test-native-all-20261116-123553.log`). **Open:** ranga's `tests/gpu_spirv.tcyr`
+  calls the table builders with the old 5-argument form and now fails to compile; it needs the
+  4-argument call. That is ranga's repo, and it rides with the ranga consumer run below.
 - **The compiler limits v4.1.0 left named** (each refused with a code today, never miscompiled):
   nested divergent ifs (`GISEL_ERR_NESTED_SELECTION`: a region stack in `gfx9_isel` and a second
   saved-EXEC pair, against the SGPR budget); `OpSelect` with a non-adjacent integer compare

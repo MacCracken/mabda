@@ -9667,12 +9667,18 @@ var SPIRV_TYK_STRUCT        = 8;   # p0 = member count, p1 = first member type <
 var SPIRV_TYK_POINTER       = 9;   # p0 = storage class, p1 = pointee type <id>
 var SPIRV_TYK_FUNCTION      = 10;  # p0 = return type <id>
 
-# Record sizes (bytes). Caller sizes each table buffer to >= `cap` records and
-# passes `cap` so the builder can reject a SPIR-V `id_bound` (UNTRUSTED, from the
-# header) that would write past it. The validate gate only caps `id_bound` at a
-# loose 0x40000000, unrelated to the caller's fixed buffer — without `cap` a
-# crafted oversized `id_bound` silently corrupts memory (the `memset` below and
-# every per-id write index by `id`). N-HARDEN.1 (found via N.5g adversarial review).
+# Record sizes (bytes). Each builder takes its table buffer WITH ITS LENGTH IN
+# BYTES (`out`, `out_len`; the scratch-buffer contract, 4.4.0) and derives its
+# record capacity `cap = out_len / REC`, so it can reject a SPIR-V `id_bound`
+# (UNTRUSTED, from the header) that would write past the buffer. The validate gate
+# only caps `id_bound` at a loose 0x40000000, unrelated to the caller's fixed
+# buffer — without the bound a crafted oversized `id_bound` silently corrupts
+# memory (the `memset` below and every per-id write index by `id`). N-HARDEN.1
+# (found via N.5g adversarial review). Before 4.4.0 the caller passed `cap` as a
+# separate number that nothing tied to the buffer, and `id_bound` as another: the
+# builders now read id_bound from the module header, as every production caller
+# already did, so a stale 5-argument call fails to compile instead of being
+# reinterpreted (ranga's tests/gpu_spirv.tcyr calls these directly).
 var SPIRV_TYPE_REC  = 24;   # [kind, p0, p1]
 var SPIRV_CONST_REC = 16;   # [result-type <id>, value]
 var SPIRV_DECO_REC  = 16;   # [binding, descriptor-set]  (-1 = absent)
@@ -9698,10 +9704,13 @@ fn _spirv_set_type(out, id, kind, p0, p1, cap): i64 {
 
 # Build the type table: out[id] = (kind, p0, p1) for every OpType* in the
 # stream. Returns 0, -1 on a malformed (zero-wc) instruction, or
-# -SPIRV_ERR_ID_CAP if id_bound exceeds the caller's `cap`-record table. Per-op
+# -SPIRV_ERR_ID_CAP if id_bound exceeds the records `out_len` holds. Per-op
 # `wc` guards keep operand reads inside the instruction (a compiler ingests
 # untrusted input). `a` = word 2, `b` = word 3 (read only when wc allows).
-fn spirv_build_type_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_type_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_TYPE_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_TYPE_REC);
     var total = byte_len / 4;
@@ -9756,7 +9765,10 @@ fn spirv_type_p1(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 16); 
 # ---- constant table ----
 # out[result-id] = (result-type <id>, value). Scalar OpConstant only (the 32-bit
 # value is word 3); composite/64-bit constants land when the lowering needs them.
-fn spirv_build_const_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_const_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_CONST_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_CONST_REC);
     var total = byte_len / 4;
@@ -9791,7 +9803,10 @@ fn spirv_const_value(out, id): i64 { return load64(out + id * SPIRV_CONST_REC + 
 # ---- decoration table ----
 # out[target-id] = (Binding, DescriptorSet); both default to -1 (absent). Only
 # the two binding decorations N.2 needs to resolve buffer slots are recorded.
-fn spirv_build_decoration_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_decoration_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_DECO_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0xFF, id_bound * SPIRV_DECO_REC);
     var total = byte_len / 4;
@@ -10025,12 +10040,13 @@ var MIR_ERR_ID_OOR           = 25;
 # (`native_spirv_saxpy_e2e`, red 4.0.5 -> 4.0.10) in the wrong direction.
 var MIR_ERR_MOD_UNINIT       = 30;   # MirMod header reads uninitialized/corrupt (cap_ids <= 0)
 var MIR_ERR_VALS_OVERRUN     = 31;   # mir_mod_init's vals[] memset overran and clobbered the header
-var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null buf / bad cap / id_bound)
+var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null / short buf, id_bound)
 
 # Ceiling on cap_ids. Mirrors gfx9_regalloc's RA_MAX_REGS: the regalloc free-at
 # scratch and the gfx9_compile/gfx9_waitcnt per-id file-maps are all sized for
-# 256 ids, so a larger cap is rejected downstream regardless. Named here so
-# mir_mod_init can reject it at the stage that was actually handed the number.
+# 256 ids. mir_mod_init clamps the cap it derives from vals_len to this (since
+# 4.4.0; before, a cap_ids above it was rejected), so a larger vals[] is legal
+# and its excess is never touched.
 var MIR_MAX_CAP_IDS          = 256;
 
 # Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
@@ -10054,22 +10070,45 @@ var MIR_FLAG_C_IMM = 8;
 #   +32 n_instrs  +40 cap_instrs  +48 n_ptrs  +56 cap_ptrs
 #   +64 cap_ids  +72 next_synth
 # ================================================================
+# THE SCRATCH-BUFFER CONTRACT (v4.4.0). Every buffer arrives with its length in
+# BYTES, and every capacity is DERIVED from that length; none is a separate
+# number. Before 4.4.0 the caller passed `cap_ids` / `cap_instrs` / `cap_ptrs`
+# beside bare pointers, and nothing tied a capacity to its buffer: the vals[]
+# memset below overran its caller's stack for four releases
+# (`native_spirv_saxpy_e2e`, 4.0.5 -> 4.0.10), and the production compile path
+# declared ptrs[2048] (64 records) while claiming 128 (fixed in 4.4.0). A
+# length can still be wrong, but it now sits beside its own `var buf[N]`, where
+# `scripts/check-compiler-buffer-sizing.py` checks every literal one.
+#   cap_ids    = vals_len   / MIR_VAL_REC   (clamped to MIR_MAX_CAP_IDS)
+#   cap_instrs = instrs_len / MIR_INSTR_REC
+#   cap_ptrs   = ptrs_len   / MIR_PTR_REC
+#   blocks_len >= MIR_BLOCK_REC (one block record; this fn writes block 0)
+# A buffer longer than the cap needs is fine; the excess is never touched.
+#
 # `cap_ids` is the value-id CEILING = the vals[] backing-store capacity in
 # records (>= id_bound + synth headroom). It is the bound every value write is
 # checked against — DISTINCT from the SPIR-V id_bound, because mir_alloc_synth_id
 # hands out fresh ids >= id_bound for synthesized terms (e.g. the
-# GlobalInvocationId expansion). Caller MUST size vals[] as cap_ids * MIR_VAL_REC.
-# `next_synth` starts at id_bound so synth ids occupy [id_bound, cap_ids).
+# GlobalInvocationId expansion). `next_synth` starts at id_bound so synth ids
+# occupy [id_bound, cap_ids).
 # Returns 0, or a NEGATIVE error. ⚠ The return was ignorable before v4.0.11 (this
 # fn could not fail); it can now, and callers SHOULD check it — a rejected init
 # leaves the module unusable and every later stage reports a downstream symptom
 # instead of this cause.
-fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, cap_ids): i64 {
+fn mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
     if (m == 0)      { return 0 - MIR_ERR_BAD_INIT; }
     if (vals == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (instrs == 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (ptrs == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (blocks == 0) { return 0 - MIR_ERR_BAD_INIT; }
+    if (blocks_len < MIR_BLOCK_REC) { return 0 - MIR_ERR_BAD_INIT; }
+    # A buffer longer than the ceiling every later stage is sized for (the
+    # regalloc and file-map scratch hold RA_MAX_REGS = 256 ids) keeps its excess
+    # unused; it is not an error.
+    var cap_ids = vals_len / MIR_VAL_REC;
+    if (cap_ids > MIR_MAX_CAP_IDS) { cap_ids = MIR_MAX_CAP_IDS; }
+    var cap_instrs = instrs_len / MIR_INSTR_REC;
+    var cap_ptrs = ptrs_len / MIR_PTR_REC;
     if (cap_ids <= 0)    { return 0 - MIR_ERR_BAD_INIT; }
     if (cap_instrs <= 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (cap_ptrs <= 0)   { return 0 - MIR_ERR_BAD_INIT; }
@@ -10084,9 +10123,6 @@ fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, c
     # that DOES synth gets is MIR_ERR_ID_OOR from mir_alloc_synth_id, at the point
     # of the actual request.
     if (id_bound > cap_ids) { return 0 - MIR_ERR_BAD_INIT; }
-    # cap_ids above RA_MAX_REGS is rejected by gfx9_emit_program anyway
-    # (CMP_ERR_TOO_MANY_IDS); saying so at init names the stage that set it.
-    if (cap_ids > MIR_MAX_CAP_IDS) { return 0 - MIR_ERR_BAD_INIT; }
     store64(m + 0, vals);
     store64(m + 8, instrs);
     store64(m + 16, ptrs);
@@ -10102,17 +10138,16 @@ fn mir_mod_init(m, vals, instrs, ptrs, blocks, cap_instrs, cap_ptrs, id_bound, c
     store64(blocks + 8, 0);
     store64(blocks + 16, 0);
     store64(blocks + 24, MIR_TERM_RETURN);
-    # ⭐ SELF-CHECK — cheap, and it catches the exact defect that hid for four
-    # releases. The memset above writes cap_ids * MIR_VAL_REC bytes into a buffer
-    # whose size this fn CANNOT know (it gets a bare pointer). When a caller
-    # undersizes vals[] and the MirMod header happens to sit just past its end —
-    # the ordinary stack layout, since both are locals declared adjacently — that
+    # ⭐ SELF-CHECK — the backstop for a caller whose vals_len is larger than the
+    # buffer it actually declared. The memset above writes cap_ids * MIR_VAL_REC
+    # bytes, which is within vals_len by construction; it overruns only if the
+    # length lies. When it does and the MirMod header sits just past vals[] — the
+    # ordinary stack layout, since both are locals declared adjacently — the
     # memset has just zeroed the header written above. Reading it back costs two
-    # loads and turns silent corruption into a named error.
-    # ⚠ NOT a complete bound: if the overrun lands on something OTHER than the
-    # header this check passes and the corruption is still silent. The static gate
-    # `scripts/check-compiler-buffer-sizing.py` is what covers the general case;
-    # this is the runtime backstop for the layout that actually bit us.
+    # loads and turns that into a named error.
+    # ⚠ NOT a complete bound: an overrun that lands on something OTHER than the
+    # header passes this check. `scripts/check-compiler-buffer-sizing.py` checks
+    # every literal length against its `var buf[N]`.
     if (load64(m + 64) != cap_ids)  { return 0 - MIR_ERR_VALS_OVERRUN; }
     if (load64(m + 72) != id_bound) { return 0 - MIR_ERR_VALS_OVERRUN; }
     return 0;
@@ -10562,6 +10597,9 @@ var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450
 # rejected are distinguishable by a consumer reading gpu_shader_error_name.
 var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # int-compare cond, but VCC no longer live at the select
 var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # int-compare cond is UNIFORM (SCC, not VCC)
+# v4.4.0 — the scratch-buffer contract: out_bi[] (out_bi_len bytes) holds fewer
+# than id_bound i64 records, so the builtin side-table would be written past it.
+var LOWER_ERR_OUTBI_SHORT = 35;
 
 var SPIRV_DECO_ARRAY_STRIDE = 6;    # OpDecorate %arrayType ArrayStride <n>
 
@@ -10579,14 +10617,16 @@ fn _spirv_builtin_to_mir(k): i64 {
 
 # Build out_bi[<id>] = MIR_BI_* for every `OpDecorate %v BuiltIn k` (the N.1b
 # decoration table records Binding/DescriptorSet but NOT BuiltIn). `out_bi` is a
-# caller-provided array of `id_bound` i64s; -1 = not a (recognized) builtin.
-fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi): i64 {
-    # PRECONDITION (untrusted id_bound): out_bi must hold >= id_bound i64s. On the
-    # public path this is guaranteed — gfx9_compile gates id_bound <= CC_CAP_IDS via
-    # the table builders before reaching here, and CC_CAP_IDS's contract sizes OUTBI
-    # for >= CC_CAP_IDS records (see CC_CAP_IDS in gfx9_compile.cyr). The per-id
-    # store below is independently bounded (`tid < id_bound`, N.2b-1); this memset
-    # trusts that contract. A direct caller bypassing gfx9_compile owns the sizing.
+# caller-provided array of `out_bi_len` BYTES that must hold >= id_bound i64s;
+# -1 = not a (recognized) builtin. Returns 0, or -LOWER_ERR_OUTBI_SHORT before
+# any write when it does not (the scratch-buffer contract, 4.4.0: until then this
+# memset trusted a sizing rule written in a comment in gfx9_compile.cyr).
+fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi, out_bi_len): i64 {
+    # id_bound is UNTRUSTED (the SPIR-V header). Bound the memset by the buffer the
+    # caller actually handed over; the per-id store below is independently bounded
+    # (`tid < id_bound`, N.2b-1).
+    if (id_bound < 0) { return 0 - LOWER_ERR_OUTBI_SHORT; }
+    if (id_bound > out_bi_len / 8) { return 0 - LOWER_ERR_OUTBI_SHORT; }
     memset(out_bi, 0xFF, id_bound * 8);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -12003,9 +12043,10 @@ fn _spirv_check_ext_sets(ptr, byte_len): i64 {
 # Top-level driver
 # ================================================================
 # Lower a validated SPIR-V compute module into MIR. `m` is an initialized MirMod;
-# `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided
-# id_bound-sized builtin side-table. Returns SPIRV_LOWER_OK or a negative error.
-fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
+# `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided builtin
+# side-table of `out_bi_len` bytes (>= id_bound i64s, else -LOWER_ERR_OUTBI_SHORT).
+# Returns SPIRV_LOWER_OK or a negative error.
+fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi, out_bi_len): i64 {
     var entry = spirv_find_entry_point(ptr, byte_len);
     if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
     var as_chk = _spirv_check_array_strides(ptr, byte_len, types, spirv_hdr_id_bound(ptr));
@@ -12016,7 +12057,10 @@ fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
     # block label or length from a previous compile cannot leak into this one.
     _lower_cur_label = 0;
     _lower_byte_len = byte_len;
-    _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
+    # ⚠ The return was discarded before 4.4.0, which was safe only while it could not
+    # fail. It can now (a short out_bi), and continuing would read an unset table.
+    var rb = _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi, out_bi_len);
+    if (rb < 0) { return rb; }
     var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
     if (sr < 0) { return sr; }
     # LocalSize dims (default 1,1,1 if absent) — the GlobalInvocationId expansion
@@ -12490,9 +12534,11 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
 # Driver: MIR instruction list → selected GFX9 instruction list
 # ================================================================
 # Selects one GFX9 instruction per MIR instruction, in program order, into
-# `out` (caller-provided, sized cap * GISEL_REC). Returns the count, or a
-# NEGATIVE error (cap exceeded / unsupported op).
-fn gfx9_isel(m, out, cap): i64 {
+# `out` (caller-provided, `out_len` BYTES; it holds out_len / GISEL_REC records —
+# the scratch-buffer contract, 4.4.0, replacing a record count passed beside the
+# buffer). Returns the count, or a NEGATIVE error (cap exceeded / unsupported op).
+fn gfx9_isel(m, out, out_len): i64 {
+    var cap = out_len / GISEL_REC;
     var n = mir_n_instrs(m);
     var i = 0;
     var k = 0;
@@ -12595,6 +12641,7 @@ fn gfx9_isel(m, out, cap): i64 {
 var RA_REC     = 16;    # per-id record: +0 phys_reg, +8 last_use
 var RA_HW_SGPR = 0;     # hw[] offsets
 var RA_HW_VGPR = 8;
+var RA_HW_SIZE = 16;    # hw[] is a fixed two-field record, not a capacity
 var RA_MAX_REGS = 256;  # free-at scratch size (the full GFX9 VGPR file)
 
 var RA_ERR_SGPR_OVERFLOW = 50;
@@ -12644,6 +12691,9 @@ var RA_ERR_VGPR_OVERFLOW = 51;
 # now names which file overflowed — that is the signal to restructure, not to
 # raise a cap.
 var RA_ERR_CAP_TOO_LARGE = 52;
+# v4.4.0 — the scratch-buffer contract: alloc[] (alloc_len bytes) holds fewer than
+# the module's cap_ids RA_REC records, so the init memset would run past it.
+var RA_ERR_ALLOC_SHORT = 53;
 
 # ================================================================
 # Accessors
@@ -12708,11 +12758,17 @@ fn _ra_claim_pair(freeat, base, cap, step, freeat_new): i64 {
 # list `isel` (n_isel instrs), over the MIR `m`. sgpr_base/vgpr_base = first
 # allocatable register in each file (above the ABI-reserved region);
 # sgpr_cap/vgpr_cap = file ceilings (<= RA_MAX_REGS). Writes the per-id reg into
-# `alloc` and the high-water marks into `hw`. Returns 0 or a negative error.
-fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, alloc, hw): i64 {
+# `alloc` (`alloc_len` bytes, >= the module's cap_ids * RA_REC) and the high-water
+# marks into `hw` (RA_HW_SIZE bytes). Returns 0 or a negative error.
+fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, alloc, alloc_len, hw): i64 {
     if (sgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
     if (vgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
     var cap_ids = load64(m + 64);
+    # The scratch-buffer contract (4.4.0): cap_ids comes from the MIR header, sized
+    # by the MIR's vals[], NOT by this buffer. Until 4.4.0 nothing tied the two and
+    # the memset below trusted the caller.
+    if (cap_ids < 0) { return 0 - RA_ERR_ALLOC_SHORT; }
+    if (cap_ids > alloc_len / RA_REC) { return 0 - RA_ERR_ALLOC_SHORT; }
     memset(alloc, 0xFF, cap_ids * RA_REC);   # reg = -1, last_use = -1
     var sfreeat[2048];
     var vfreeat[2048];
@@ -12931,9 +12987,10 @@ fn _wc_emit_wait(dst, k, s): i64 {
 # Driver
 # ================================================================
 # Splice s_waitcnt into the selected-instruction list `in_buf` (n_in instrs) into
-# the caller buffer `out` (sized cap_out * GISEL_REC). Returns the new count or a
-# negative error.
-fn gfx9_waitcnt(m, in_buf, n_in, out, cap_out): i64 {
+# the caller buffer `out` (`out_len` BYTES = out_len / GISEL_REC records; the
+# scratch-buffer contract, 4.4.0). Returns the new count or a negative error.
+fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
+    var cap_out = out_len / GISEL_REC;
     var cap_ids = load64(m + 64);
     if (cap_ids > RA_MAX_REGS) { return 0 - WC_ERR_TOO_MANY_IDS; }
     var outstanding[2048];   # RA_MAX_REGS (256) i64; 1 = id is an un-waited load
@@ -13269,30 +13326,65 @@ var CMP_ERR_BINDING_RANGE       = 79;   # a binding outside the loaded USER_DATA
 var CMP_ERR_UNSUPPORTED_BUILTIN = 83;   # an EXTRACT of a builtin N.5c does not resolve yet (WGID/GID)
 var CMP_ERR_VALIDATE            = 84;   # spirv_validate_stream rejected the input
 var CMP_ERR_TABLE               = 85;   # a type/const/deco table builder rejected the
-# input (malformed, or id_bound > CC_CAP_IDS) (N-HARDEN.1)
+# input (malformed, or id_bound past a table's length) (N-HARDEN.1)
 var CMP_ERR_UNRESOLVED_LABEL    = 86;   # a branch targets a label not in the program (N.7)
 var CMP_ERR_TOO_MANY_BRANCHES   = 87;   # branch count exceeds the patch-list scratch (N.7)
+var CMP_ERR_ISA_OVERFLOW        = 88;   # the ISA would not fit the caller's isa_len (4.4.0)
 
-# Top-level compile context (caller buffer, 80 B): pointers to the stage scratch.
-# `m` is an initialized MirMod (it holds vals/instrs/ptrs/blocks); the rest are
-# the per-stage tables/lists the driver fills.
-var CC_TYPES  = 0;
-var CC_CONSTS = 8;
-var CC_DECO   = 16;
-var CC_M      = 24;
-var CC_OUTBI  = 32;
-var CC_ISEL   = 40;   # selected-instruction list (>= CMP_ISEL_CAP * GISEL_REC)
-var CC_ISEL2  = 48;   # waitcnt-spliced list (same size)
-var CC_ALLOC  = 56;
-var CC_HW     = 64;
-var CC_ABI    = 72;
-var CC_CAP_IDS = 80;  # capacity (in records) of the <id>-indexed scratch tables.
-# The caller MUST size ALL of types (CC_CAP_IDS*24 B), consts
-# (*16), deco (*16) AND the OUTBI builtin table (*8) for at
-# least CC_CAP_IDS records, and set this field. The table
-# builders reject id_bound > CC_CAP_IDS (N-HARDEN.1) before any
-# write, which — because OUTBI is in this same contract — also
-# bounds the OUTBI memset in _spirv_resolve_builtins downstream.
+# Top-level compile context (caller buffer, CC_SIZE = 136 B): the stage scratch.
+# THE SCRATCH-BUFFER CONTRACT (4.4.0): every capacity-scaled buffer sits beside its
+# length in BYTES, and each stage derives its capacity from that length — set both
+# with gfx9_cc_buf(cc, CC_X, &buf, N). Before 4.4.0 the context held bare pointers
+# plus one CC_CAP_IDS count that four buffers of three record sizes had to honour,
+# and nothing checked them against it.
+#   +0   CC_TYPES  / +8   CC_TYPES_LEN    type table   (>= id_bound * SPIRV_TYPE_REC)
+#   +16  CC_CONSTS / +24  CC_CONSTS_LEN   const table  (>= id_bound * SPIRV_CONST_REC)
+#   +32  CC_DECO   / +40  CC_DECO_LEN     deco table   (>= id_bound * SPIRV_DECO_REC)
+#   +48  CC_OUTBI  / +56  CC_OUTBI_LEN    builtin side-table (>= id_bound * 8)
+#   +64  CC_ISEL   / +72  CC_ISEL_LEN     selected list; cap = min(len / GISEL_REC, CMP_ISEL_CAP)
+#   +80  CC_ISEL2  / +88  CC_ISEL2_LEN    waitcnt-spliced list (same rule)
+#   +96  CC_ALLOC  / +104 CC_ALLOC_LEN    regalloc map (>= the MIR's cap_ids * RA_REC)
+#   +112 CC_M      an initialized MirMod (mir_mod_init took its buffers' lengths)
+#   +120 CC_HW     RA_HW_SIZE (16) bytes — a fixed record, not a capacity
+#   +128 CC_ABI    64 bytes — a fixed record, not a capacity
+# A too-short buffer fails with that stage's code before anything is written.
+var CC_TYPES      = 0;
+var CC_TYPES_LEN  = 8;
+var CC_CONSTS     = 16;
+var CC_CONSTS_LEN = 24;
+var CC_DECO       = 32;
+var CC_DECO_LEN   = 40;
+var CC_OUTBI      = 48;
+var CC_OUTBI_LEN  = 56;
+var CC_ISEL       = 64;
+var CC_ISEL_LEN   = 72;
+var CC_ISEL2      = 80;
+var CC_ISEL2_LEN  = 88;
+var CC_ALLOC      = 96;
+var CC_ALLOC_LEN  = 104;
+var CC_M          = 112;
+var CC_HW         = 120;
+var CC_ABI        = 128;
+var CC_SIZE       = 136;
+
+# Bind a capacity-scaled scratch buffer and its byte length into a compile context.
+# `slot` is one of the pointer offsets above (CC_TYPES .. CC_ALLOC); the length
+# lands in the word after it.
+fn gfx9_cc_buf(cc, slot, buf, len): i64 {
+    store64(cc + slot, buf);
+    store64(cc + slot + 8, len);
+    return 0;
+}
+
+# The most bytes one GISEL record may encode to. gfx9_emit_program checks for this
+# much room before each record, so it never writes past the caller's buffer, and
+# fails loud if a record ever emits more (an encoder grew past the reserve). The
+# largest encoders today emit a VOP3-literal materialization (v_mov_b32 + literal,
+# then the 8-byte VOP3): 16 bytes, the maximum measured over every compiler suite
+# when this landed (4.4.0). 32 is twice that. It is also the slack a caller's
+# buffer needs past the program's real end, so keep it tight.
+var CMP_RECORD_MAX_BYTES = 32;
+var CMP_PREFETCH_PAD_BYTES = 64;   # gfx9_emit_prefetch_pad: 16 x s_nop
 
 # Compile output descriptor (caller buffer, 40 B).
 var DESC_ISA_LEN      = 0;    # ISA byte length (incl. the prefetch pad)
@@ -13301,7 +13393,7 @@ var DESC_RSRC2        = 16;
 var DESC_USER_SGPR    = 24;
 var DESC_NUM_BINDINGS = 32;
 
-var CMP_ISEL_CAP  = 256;   # max selected instrs (caller sizes isel/isel2 to match) —
+var CMP_ISEL_CAP  = 256;   # max selected instrs (the cap derived from CC_ISEL_LEN is clamped to it) —
 # matched to the RA_MAX_REGS=256 id ceiling so a kernel at
 # the cap can still select an instr per value.
 # ⛔ WAS 104, WHICH CONTRADICTED THE TWO COMMENTS DIRECTLY BELOW AND THE ONE AT :89.
@@ -14065,10 +14157,15 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
 # ================================================================
 # Encode the selected-instruction list `isel` (n_isel instrs) over the MIR `m`,
 # the regalloc map `alloc`, and the ABI descriptor `abi` (for binding→SGPR on FLAT
-# ops), writing the ISA byte stream into `buf` starting at `pos`. Returns the end
-# byte position or a negative error. The caller appends gfx9_emit_prefetch_pad to
-# the returned position.
-fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
+# ops), writing the ISA byte stream into `buf` (`buf_len` bytes) starting at `pos`.
+# Returns the end byte position or a negative error. The caller appends
+# gfx9_emit_prefetch_pad to the returned position (and must check it has
+# CMP_PREFETCH_PAD_BYTES of room). Every record is checked for
+# CMP_RECORD_MAX_BYTES of room before it is encoded, so a list that would not fit
+# fails with -CMP_ERR_ISA_OVERFLOW instead of writing past `buf` (4.4.0; the
+# caller's buffer size was invisible here before).
+fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
+    if (pos < 0) { return 0 - CMP_ERR_ISA_OVERFLOW; }
     var cap_ids = load64(m + 64);
     if (cap_ids > RA_MAX_REGS) { return 0 - CMP_ERR_TOO_MANY_IDS; }
     var isvgpr[2048];   # per-id file-map: 1 = the value lives in a VGPR
@@ -14107,6 +14204,7 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
     var p = pos;
     i = 0;
     while (i < n_isel) {
+        if (p + CMP_RECORD_MAX_BYTES > buf_len) { return 0 - CMP_ERR_ISA_OVERFLOW; }
         var op = gisel_op(isel, i);
         if (op == GISEL_LABEL) {
             store64(&laboff + gisel_a(isel, i) * 8, p);
@@ -14134,6 +14232,9 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
                     } else {
                         var rc = _cmp_emit_one(m, isel, i, alloc, abi, &isvgpr, buf, p, scratch_vgpr);
                         if (rc < 0) { return rc; }
+                        # The room check above reserved CMP_RECORD_MAX_BYTES. An encoder
+                        # that emitted more broke that reserve; say so rather than go on.
+                        if (rc - p > CMP_RECORD_MAX_BYTES) { return 0 - CMP_ERR_ISA_OVERFLOW; }
                         p = rc;
                     }
                 }
@@ -14156,6 +14257,16 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos): i64 {
     return p;
 }
 
+# The usable length of a selected-instruction list `len` bytes long: all of it, up
+# to CMP_ISEL_CAP records (the id ceiling the later stages are sized for). A short
+# list makes gfx9_isel / gfx9_waitcnt report their capacity error instead of
+# writing past it.
+fn _cmp_isel_len(len): i64 {
+    if (len <= 0) { return 0; }
+    if (len > CMP_ISEL_CAP * GISEL_REC) { return CMP_ISEL_CAP * GISEL_REC; }
+    return len;
+}
+
 # 1 if the selected list uses the divergent-if EXEC mask (an s_and_saveexec) — the
 # driver then reserves the saved-EXEC SGPR pair and bumps the rsrc1 SGPR count.
 fn _cmp_has_exec_save(isel, ni): i64 {
@@ -14173,31 +14284,37 @@ fn _cmp_has_exec_save(isel, ni): i64 {
 # Chains the whole compiler over the caller-provided context `ctx` (stage scratch
 # pointers; `m` pre-initialized): validate -> type/const/decoration tables ->
 # lower (+ uniformity) -> isel -> ABI assign -> regalloc (ABI-reserved bases) ->
-# s_waitcnt -> encode -> prefetch pad. Writes the ISA byte stream into `isa` and
-# the [isa_len, rsrc1, rsrc2, user_sgpr, num_bindings] descriptor into `desc`.
+# s_waitcnt -> encode -> prefetch pad. Writes the ISA byte stream into `isa`
+# (`isa_len` bytes; -CMP_ERR_ISA_OVERFLOW if it would not fit) and the
+# [isa_len, rsrc1, rsrc2, user_sgpr, num_bindings] descriptor into `desc`.
 # Returns 0 or a NEGATIVE error from whichever stage rejected the input.
-fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
+fn gfx9_compile(ctx, spirv, n, isa, isa_len, desc): i64 {
     # spirv_validate_stream returns 0 (OK) or a POSITIVE error code — the untrusted-
     # input gate must reject any non-zero, NOT `< 0` (which never fires and would let
     # malformed SPIR-V reach the table builders → OOB reads). (N.5c review, CRITICAL.)
     if (spirv_validate_stream(spirv, n) != 0) { return 0 - CMP_ERR_VALIDATE; }
-    var idb = spirv_hdr_id_bound(spirv);
     var types = load64(ctx + CC_TYPES);
     var consts = load64(ctx + CC_CONSTS);
     var deco = load64(ctx + CC_DECO);
-    # The SPIR-V id_bound is untrusted (header field); the table builders reject any
-    # id_bound that would overflow the caller's CC_CAP_IDS-record tables, and guard
-    # every per-id write, so a crafted module fails loud instead of corrupting
-    # memory (N-HARDEN.1, found via the N.5g adversarial review).
-    var cap = load64(ctx + CC_CAP_IDS);
-    if (spirv_build_type_table(spirv, n, idb, cap, types) < 0) { return 0 - CMP_ERR_TABLE; }
-    if (spirv_build_const_table(spirv, n, idb, cap, consts) < 0) { return 0 - CMP_ERR_TABLE; }
-    if (spirv_build_decoration_table(spirv, n, idb, cap, deco) < 0) { return 0 - CMP_ERR_TABLE; }
+    # The SPIR-V id_bound is untrusted (header field); each table builder rejects an
+    # id_bound that would overflow the buffer length it is handed, and guards every
+    # per-id write, so a crafted module fails loud instead of corrupting memory
+    # (N-HARDEN.1, found via the N.5g adversarial review; lengths since 4.4.0).
+    if (spirv_build_type_table(spirv, n, types, load64(ctx + CC_TYPES_LEN)) < 0) {
+        return 0 - CMP_ERR_TABLE;
+    }
+    if (spirv_build_const_table(spirv, n, consts, load64(ctx + CC_CONSTS_LEN)) < 0) {
+        return 0 - CMP_ERR_TABLE;
+    }
+    if (spirv_build_decoration_table(spirv, n, deco, load64(ctx + CC_DECO_LEN)) < 0) {
+        return 0 - CMP_ERR_TABLE;
+    }
     var m = load64(ctx + CC_M);
-    var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI));
+    var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI),
+      load64(ctx + CC_OUTBI_LEN));
     if (lr < 0) { return lr; }
     var isel = load64(ctx + CC_ISEL);
-    var ni = gfx9_isel(m, isel, CMP_ISEL_CAP);
+    var ni = gfx9_isel(m, isel, _cmp_isel_len(load64(ctx + CC_ISEL_LEN)));
     if (ni < 0) { return ni; }
     var abi = load64(ctx + CC_ABI);
     var ar = gfx9_abi_assign(m, abi);
@@ -14210,13 +14327,14 @@ fn gfx9_compile(ctx, spirv, n, isa, desc): i64 {
     var scap = GFX9_SGPR_CAP;
     if (div_cf == 1) { scap = GFX9_EXEC_SAVE_SGPR; }
     var rr = gfx9_regalloc(m, isel, ni, gfx9_abi_sgpr_base(abi), gfx9_abi_vgpr_base(abi),
-      scap, GFX9_VGPR_CAP, alloc, hw);
+      scap, GFX9_VGPR_CAP, alloc, load64(ctx + CC_ALLOC_LEN), hw);
     if (rr < 0) { return rr; }
     var isel2 = load64(ctx + CC_ISEL2);
-    var ni2 = gfx9_waitcnt(m, isel, ni, isel2, CMP_ISEL_CAP);
+    var ni2 = gfx9_waitcnt(m, isel, ni, isel2, _cmp_isel_len(load64(ctx + CC_ISEL2_LEN)));
     if (ni2 < 0) { return ni2; }
-    var ep = gfx9_emit_program(m, isel2, ni2, alloc, abi, isa, 0);
+    var ep = gfx9_emit_program(m, isel2, ni2, alloc, abi, isa, 0, isa_len);
     if (ep < 0) { return ep; }
+    if (ep + CMP_PREFETCH_PAD_BYTES > isa_len) { return 0 - CMP_ERR_ISA_OVERFLOW; }
     ep = gfx9_emit_prefetch_pad(isa, ep);
     # The saved-EXEC pair lives at s[100:101], so the grant must cover s101 even though
     # the regalloc high-water (allocated GPRs only) is lower.
@@ -18608,13 +18726,66 @@ var NATIVE_SHMOD_LOCALY  = 72;
 var NATIVE_SHMOD_LOCALZ  = 80;
 var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: id_bound / cap_ids ceiling for the compile
-# scratch below. SPIR-V whose header id_bound exceeds this fails loud (gfx9_compile
-# → CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
+# Compile cap for shader-module-create: the id_bound / cap_ids ceiling the scratch in
+# _native_compile_spirv_isa is sized for. SPIR-V whose header id_bound exceeds it
+# fails loud (CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
 # free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
 # RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
 # further needs growing those internal scratch buffers (a deeper N.8 change).
 var NATIVE_SHADER_CAP_IDS = 256;
+
+# The compile half of _native_shader_compile_spirv: SPIR-V -> GFX9 ISA into `isa`
+# (`isa_len` bytes) + the DESC_* descriptor into `desc`, all scratch on this frame.
+# Pure CPU (no ctx, no ioctl), so tests/tcyr/native.tcyr drives it directly.
+# Returns 0 or gfx9_compile's negative stage code.
+#
+# THE SCRATCH-BUFFER CONTRACT (4.4.0): each buffer's length is the literal beside
+# its `var`, and every stage derives its capacity from it. Until 4.4.0 the
+# capacities were separate numbers: ptrs[] was declared 2048 bytes (64 records)
+# while mir_mod_init was told 128, so SPIR-V with 65-128 access chains wrote past
+# ptrs[] on this stack. The sizing gate skipped this call because its arguments
+# were not literals.
+fn _native_compile_spirv_isa(words_ptr, byte_len, isa, isa_len, desc): i64 {
+    # --- scratch sized for NATIVE_SHADER_CAP_IDS = 256 ids ---
+    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
+    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
+    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
+    var outbi[2048];     # 256 * 8
+    var m[80];
+    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var ptrs[4096];      # 128 * MIR_PTR_REC(32)
+    var blocks[32];      # one MIR_BLOCK_REC
+    # mir_mod_init runs before gfx9_compile, so screen the module here the way
+    # gfx9_compile would. A consumer then sees the same codes as before 4.4.0
+    # (CMP_ERR_VALIDATE for bad bytes, CMP_ERR_TABLE for an id_bound past the cap)
+    # rather than mir_mod_init's MIR_ERR_BAD_INIT, which names the wrong layer.
+    if (spirv_validate_stream(words_ptr, byte_len) != 0) { return 0 - CMP_ERR_VALIDATE; }
+    var idb = spirv_hdr_id_bound(words_ptr);
+    if (idb > NATIVE_SHADER_CAP_IDS) { return 0 - CMP_ERR_TABLE; }
+    # The MIR synth-id counter starts right after the SPIR-V ids (the header's
+    # id_bound), so synthesized values (access-chain offsets, GID expansion) get
+    # fresh ids in [id_bound, 256).
+    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
+    if (mr < 0) { return mr; }
+    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
+    var isel2[12288];
+    var alloc[4096];     # 256 * RA_REC(16)
+    var hw[16];
+    var abi[64];
+    var cc[136];         # CC_SIZE
+    gfx9_cc_buf(&cc, CC_TYPES, &types, 6144);
+    gfx9_cc_buf(&cc, CC_CONSTS, &consts, 4096);
+    gfx9_cc_buf(&cc, CC_DECO, &deco, 4096);
+    gfx9_cc_buf(&cc, CC_OUTBI, &outbi, 2048);
+    gfx9_cc_buf(&cc, CC_ISEL, &isel, 12288);
+    gfx9_cc_buf(&cc, CC_ISEL2, &isel2, 12288);
+    gfx9_cc_buf(&cc, CC_ALLOC, &alloc, 4096);
+    store64(&cc + CC_M, &m);
+    store64(&cc + CC_HW, &hw);
+    store64(&cc + CC_ABI, &abi);
+    return gfx9_compile(&cc, words_ptr, byte_len, isa, isa_len, desc);
+}
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped
 # at a context-allocated VA, and return a magic-tagged shmod struct the compute
@@ -18637,41 +18808,6 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     _gpu_set_last_shader_err(0 - SHMOD_ERR_TOO_SHORT);
     if (byte_len < 20) { return 0; }
 
-    # --- compile (pure CPU); scratch sized for NATIVE_SHADER_CAP_IDS=256 ids ---
-    var types[6144];     # 256 * SPIRV_TYPE_REC(24)
-    var consts[4096];    # 256 * SPIRV_CONST_REC(16)
-    var deco[4096];      # 256 * SPIRV_DECO_REC(16)
-    var outbi[2048];     # 256 * 8
-    var m[80];
-    var vals[10240];     # 256 * MIR_VAL_REC(40)
-    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
-    var ptrs[2048];      # 128 * MIR_PTR_REC(16)
-    var blocks[32];
-    # The MIR synth-id counter starts right after the SPIR-V ids (the header's
-    # id_bound), so synthesized values (access-chain offsets, GID expansion) get
-    # fresh ids in [id_bound, NATIVE_SHADER_CAP_IDS). Passing the cap as the start
-    # would leave zero synth room. id_bound > the cap fails loud in gfx9_compile's
-    # table-build gate (CMP_ERR_TABLE).
-    var idb = spirv_hdr_id_bound(words_ptr);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 512, 128, idb,
-      NATIVE_SHADER_CAP_IDS);
-    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
-    var isel2[12288];
-    var alloc[4096];     # 256 * RA_REC(16)
-    var hw[16];
-    var abi[64];
-    var cc[88];
-    store64(&cc + CC_TYPES, &types);
-    store64(&cc + CC_CONSTS, &consts);
-    store64(&cc + CC_DECO, &deco);
-    store64(&cc + CC_M, &m);
-    store64(&cc + CC_OUTBI, &outbi);
-    store64(&cc + CC_ISEL, &isel);
-    store64(&cc + CC_ISEL2, &isel2);
-    store64(&cc + CC_ALLOC, &alloc);
-    store64(&cc + CC_HW, &hw);
-    store64(&cc + CC_ABI, &abi);
-    store64(&cc + CC_CAP_IDS, NATIVE_SHADER_CAP_IDS);
     var isa[8192];
     memset(&isa, 0, 8192);
     var desc[72];
@@ -18679,7 +18815,7 @@ fn _native_shader_compile_spirv(ctx, words_ptr, byte_len): i64 {
     # specific stage code (mir / lower / regalloc / waitcnt / isel / emit) and was
     # previously discarded here. Every case in the ranga M6 filing arrived as a
     # bare 0 because of this one comparison.
-    var crc = gfx9_compile(&cc, words_ptr, byte_len, &isa, &desc);
+    var crc = _native_compile_spirv_isa(words_ptr, byte_len, &isa, 8192, &desc);
     if (crc != 0) { _gpu_set_last_shader_err(crc); return 0; }
     var isa_len = load64(&desc + DESC_ISA_LEN);
     _gpu_set_last_shader_err(0 - SHMOD_ERR_ISA_EMPTY);
@@ -26943,11 +27079,11 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
 # The codes are the compiler's own, stored NEGATED. The band tells you the stage,
 # which is usually enough to know where to look:
 #   20-32   MIR construction / the scratch-buffer contract   (src/mir.cyr)
-#   26-29   SPIR-V -> MIR lowering                           (src/spirv_lower.cyr)
-#   50-52   register allocation                              (src/gfx9_regalloc.cyr)
+#   26-29, 33-35  SPIR-V -> MIR lowering                     (src/spirv_lower.cyr)
+#   50-53   register allocation                              (src/gfx9_regalloc.cyr)
 #   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
-#   70-87   encoding / validation / table build              (src/gfx9_compile.cyr)
-#   100-101 instruction selection                            (src/gfx9_isel.cyr)
+#   70-88   encoding / validation / table build              (src/gfx9_compile.cyr)
+#   100-104 instruction selection                            (src/gfx9_isel.cyr)
 #   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
 fn gpu_shader_error_name(code): i64 {
     if (code == 0) { return "no error"; }
@@ -26961,12 +27097,14 @@ fn gpu_shader_error_name(code): i64 {
     if (c == MIR_ERR_OVERFLOW)         { return "MIR: integer overflow in index math"; }
     if (c == MIR_ERR_ID_OOR)           { return "MIR: value id outside cap_ids"; }
     if (c == MIR_ERR_MOD_UNINIT) {
-        return "MIR: module header uninitialized or overwritten - check vals[] is cap_ids*40 bytes";
+        return "MIR: module header uninitialized or overwritten - was mir_mod_init's result checked?";
     }
     if (c == MIR_ERR_VALS_OVERRUN) {
-        return "MIR: vals[] too small - its memset overran and clobbered the module header";
+        return "MIR: vals_len exceeds the vals[] buffer - its memset clobbered the module header";
     }
-    if (c == MIR_ERR_BAD_INIT)         { return "MIR: mir_mod_init rejected its arguments"; }
+    if (c == MIR_ERR_BAD_INIT) {
+        return "MIR: mir_mod_init rejected its arguments (null or short buffer, or id_bound past vals_len)";
+    }
     # --- SPIR-V -> MIR lowering ---
     if (c == LOWER_ERR_CONTROL_FLOW)   { return "lower: unsupported control flow"; }
     if (c == LOWER_ERR_NO_ENTRY)       { return "lower: no OpEntryPoint found"; }
@@ -26978,10 +27116,12 @@ fn gpu_shader_error_name(code): i64 {
     if (c == LOWER_ERR_SELECT_UNIFORM_COND) {
         return "lower: OpSelect's integer compare is uniform (SCC) - needs a divergent condition";
     }
+    if (c == LOWER_ERR_OUTBI_SHORT)    { return "lower: builtin table out_bi[] shorter than id_bound records"; }
     # --- register allocation ---
     if (c == RA_ERR_SGPR_OVERFLOW)     { return "regalloc: out of SGPRs (too many live scalar values)"; }
     if (c == RA_ERR_VGPR_OVERFLOW)     { return "regalloc: out of VGPRs (too many live vector values)"; }
     if (c == RA_ERR_CAP_TOO_LARGE)     { return "regalloc: register cap above RA_MAX_REGS"; }
+    if (c == RA_ERR_ALLOC_SHORT)       { return "regalloc: alloc[] shorter than the module's cap_ids records"; }
     # --- waitcnt ---
     if (c == WC_ERR_CAP)               { return "waitcnt: output capacity exceeded"; }
     if (c == WC_ERR_TOO_MANY_IDS)      { return "waitcnt: cap_ids above the file-map bound"; }
@@ -26998,9 +27138,10 @@ fn gpu_shader_error_name(code): i64 {
     if (c == CMP_ERR_BINDING_RANGE)        { return "encode: binding outside the loaded USER_DATA region"; }
     if (c == CMP_ERR_UNSUPPORTED_BUILTIN)  { return "encode: unresolved builtin in an OpCompositeExtract"; }
     if (c == CMP_ERR_VALIDATE)             { return "validate: spirv_validate_stream rejected the module"; }
-    if (c == CMP_ERR_TABLE)                { return "tables: malformed module, or id_bound above cap_ids"; }
+    if (c == CMP_ERR_TABLE)                { return "tables: malformed module, or id_bound past a table's length"; }
     if (c == CMP_ERR_UNRESOLVED_LABEL)     { return "encode: branch to a label not in the program"; }
     if (c == CMP_ERR_TOO_MANY_BRANCHES)    { return "encode: branch count exceeds the patch list"; }
+    if (c == CMP_ERR_ISA_OVERFLOW)         { return "encode: ISA would not fit the output buffer"; }
     # --- instruction selection ---
     if (c == GISEL_ERR_UNSUPPORTED_OP)     { return "isel: MIR op not selectable on GFX9"; }
     if (c == GISEL_ERR_CAP_EXCEEDED)       { return "isel: selected-instruction capacity exceeded"; }

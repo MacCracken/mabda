@@ -116,6 +116,9 @@ var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450
 # rejected are distinguishable by a consumer reading gpu_shader_error_name.
 var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # int-compare cond, but VCC no longer live at the select
 var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # int-compare cond is UNIFORM (SCC, not VCC)
+# v4.4.0 — the scratch-buffer contract: out_bi[] (out_bi_len bytes) holds fewer
+# than id_bound i64 records, so the builtin side-table would be written past it.
+var LOWER_ERR_OUTBI_SHORT = 35;
 
 var SPIRV_DECO_ARRAY_STRIDE = 6;    # OpDecorate %arrayType ArrayStride <n>
 
@@ -133,14 +136,16 @@ fn _spirv_builtin_to_mir(k): i64 {
 
 # Build out_bi[<id>] = MIR_BI_* for every `OpDecorate %v BuiltIn k` (the N.1b
 # decoration table records Binding/DescriptorSet but NOT BuiltIn). `out_bi` is a
-# caller-provided array of `id_bound` i64s; -1 = not a (recognized) builtin.
-fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi): i64 {
-    # PRECONDITION (untrusted id_bound): out_bi must hold >= id_bound i64s. On the
-    # public path this is guaranteed — gfx9_compile gates id_bound <= CC_CAP_IDS via
-    # the table builders before reaching here, and CC_CAP_IDS's contract sizes OUTBI
-    # for >= CC_CAP_IDS records (see CC_CAP_IDS in gfx9_compile.cyr). The per-id
-    # store below is independently bounded (`tid < id_bound`, N.2b-1); this memset
-    # trusts that contract. A direct caller bypassing gfx9_compile owns the sizing.
+# caller-provided array of `out_bi_len` BYTES that must hold >= id_bound i64s;
+# -1 = not a (recognized) builtin. Returns 0, or -LOWER_ERR_OUTBI_SHORT before
+# any write when it does not (the scratch-buffer contract, 4.4.0: until then this
+# memset trusted a sizing rule written in a comment in gfx9_compile.cyr).
+fn _spirv_resolve_builtins(ptr, byte_len, id_bound, out_bi, out_bi_len): i64 {
+    # id_bound is UNTRUSTED (the SPIR-V header). Bound the memset by the buffer the
+    # caller actually handed over; the per-id store below is independently bounded
+    # (`tid < id_bound`, N.2b-1).
+    if (id_bound < 0) { return 0 - LOWER_ERR_OUTBI_SHORT; }
+    if (id_bound > out_bi_len / 8) { return 0 - LOWER_ERR_OUTBI_SHORT; }
     memset(out_bi, 0xFF, id_bound * 8);
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
@@ -1557,9 +1562,10 @@ fn _spirv_check_ext_sets(ptr, byte_len): i64 {
 # Top-level driver
 # ================================================================
 # Lower a validated SPIR-V compute module into MIR. `m` is an initialized MirMod;
-# `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided
-# id_bound-sized builtin side-table. Returns SPIRV_LOWER_OK or a negative error.
-fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
+# `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided builtin
+# side-table of `out_bi_len` bytes (>= id_bound i64s, else -LOWER_ERR_OUTBI_SHORT).
+# Returns SPIRV_LOWER_OK or a negative error.
+fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi, out_bi_len): i64 {
     var entry = spirv_find_entry_point(ptr, byte_len);
     if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
     var as_chk = _spirv_check_array_strides(ptr, byte_len, types, spirv_hdr_id_bound(ptr));
@@ -1570,7 +1576,10 @@ fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi): i64 {
     # block label or length from a previous compile cannot leak into this one.
     _lower_cur_label = 0;
     _lower_byte_len = byte_len;
-    _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi);
+    # ⚠ The return was discarded before 4.4.0, which was safe only while it could not
+    # fail. It can now (a short out_bi), and continuing would read an unset table.
+    var rb = _spirv_resolve_builtins(ptr, byte_len, spirv_hdr_id_bound(ptr), out_bi, out_bi_len);
+    if (rb < 0) { return rb; }
     var sr = _spirv_lower_seed_globals(ptr, byte_len, types, deco, m, out_bi);
     if (sr < 0) { return sr; }
     # LocalSize dims (default 1,1,1 if absent) — the GlobalInvocationId expansion

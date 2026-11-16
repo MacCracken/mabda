@@ -26,6 +26,7 @@
 var RA_REC     = 16;    # per-id record: +0 phys_reg, +8 last_use
 var RA_HW_SGPR = 0;     # hw[] offsets
 var RA_HW_VGPR = 8;
+var RA_HW_SIZE = 16;    # hw[] is a fixed two-field record, not a capacity
 var RA_MAX_REGS = 256;  # free-at scratch size (the full GFX9 VGPR file)
 
 var RA_ERR_SGPR_OVERFLOW = 50;
@@ -75,6 +76,9 @@ var RA_ERR_VGPR_OVERFLOW = 51;
 # now names which file overflowed — that is the signal to restructure, not to
 # raise a cap.
 var RA_ERR_CAP_TOO_LARGE = 52;
+# v4.4.0 — the scratch-buffer contract: alloc[] (alloc_len bytes) holds fewer than
+# the module's cap_ids RA_REC records, so the init memset would run past it.
+var RA_ERR_ALLOC_SHORT = 53;
 
 # ================================================================
 # Accessors
@@ -139,11 +143,17 @@ fn _ra_claim_pair(freeat, base, cap, step, freeat_new): i64 {
 # list `isel` (n_isel instrs), over the MIR `m`. sgpr_base/vgpr_base = first
 # allocatable register in each file (above the ABI-reserved region);
 # sgpr_cap/vgpr_cap = file ceilings (<= RA_MAX_REGS). Writes the per-id reg into
-# `alloc` and the high-water marks into `hw`. Returns 0 or a negative error.
-fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, alloc, hw): i64 {
+# `alloc` (`alloc_len` bytes, >= the module's cap_ids * RA_REC) and the high-water
+# marks into `hw` (RA_HW_SIZE bytes). Returns 0 or a negative error.
+fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, alloc, alloc_len, hw): i64 {
     if (sgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
     if (vgpr_cap > RA_MAX_REGS) { return 0 - RA_ERR_CAP_TOO_LARGE; }
     var cap_ids = load64(m + 64);
+    # The scratch-buffer contract (4.4.0): cap_ids comes from the MIR header, sized
+    # by the MIR's vals[], NOT by this buffer. Until 4.4.0 nothing tied the two and
+    # the memset below trusted the caller.
+    if (cap_ids < 0) { return 0 - RA_ERR_ALLOC_SHORT; }
+    if (cap_ids > alloc_len / RA_REC) { return 0 - RA_ERR_ALLOC_SHORT; }
     memset(alloc, 0xFF, cap_ids * RA_REC);   # reg = -1, last_use = -1
     var sfreeat[2048];
     var vfreeat[2048];

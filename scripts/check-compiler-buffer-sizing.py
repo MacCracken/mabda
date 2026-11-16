@@ -1,78 +1,83 @@
 #!/usr/bin/env python3
-"""check-compiler-buffer-sizing.py — static gate for the SPIR-V→GFX9 compiler's
-caller-provided scratch buffers.
+"""check-compiler-buffer-sizing.py — static gate for the compiler's scratch-buffer contract.
 
-WHY THIS EXISTS
----------------
-The compiler pipeline takes every scratch buffer from its caller and is told the
-CAPACITY separately, as a plain integer. Several stages then `memset` the full
-capacity before use:
+THE CONTRACT (mabda 4.4.0)
+--------------------------
+Every SPIR-V->GFX9 compiler stage that writes a caller buffer takes that buffer
+WITH ITS LENGTH IN BYTES, and derives its capacity from the length:
 
-    mir_mod_init         memset(vals,  0,    cap_ids  * MIR_VAL_REC)     src/mir.cyr
-    gfx9_regalloc        memset(alloc, 0xFF, cap_ids  * RA_REC)          src/gfx9_regalloc.cyr
-    _spirv_resolve_...   memset(outbi, 0xFF, id_bound * 8)               src/spirv_lower.cyr
-    spirv_build_*_table  memset(out,   0,    id_bound * SPIRV_*_REC)     src/spirv_parse.cyr
+    mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len,
+                 blocks, blocks_len, id_bound)                     src/mir.cyr
+    spirv_build_{type,const,decoration}_table(p, n, out, out_len)  src/spirv_parse.cyr
+    _spirv_resolve_builtins(p, n, idb, out_bi, out_bi_len)
+    spirv_lower_module(p, n, types, consts, deco, m, out_bi, out_bi_len)
+                                                                   src/spirv_lower.cyr
+    gfx9_isel(m, out, out_len)                                     src/gfx9_isel.cyr
+    gfx9_regalloc(m, isel, n, sb, vb, sc, vc, alloc, alloc_len, hw) src/gfx9_regalloc.cyr
+    gfx9_waitcnt(m, in, n, out, out_len)                           src/gfx9_waitcnt.cyr
+    gfx9_emit_program(m, isel, n, alloc, abi, buf, pos, buf_len)
+    gfx9_compile(cc, spirv, n, isa, isa_len, desc)
+    gfx9_cc_buf(cc, CC_X, buf, len)                                src/gfx9_compile.cyr
 
-A callee cannot bounds-check a raw pointer, so if the declared buffer is smaller
-than capacity * record-size the memset runs off the end of the caller's STACK and
-silently corrupts whatever follows.
+So a callee can no longer write past a buffer whose length it was told. What it
+cannot check is whether the length is TRUE: a caller that declares `var vals[1024]`
+and passes 2048 still overruns. That mismatch is two integer literals a few lines
+apart, so this gate checks it: for every (&buf, LEN) pair at a contract call, the
+enclosing function's `var buf[N]` must satisfy LEN <= N.
 
-⛔ This is not hypothetical. `programs/native_spirv_saxpy_e2e.cyr` declared
-`vals[1440]` while passing `cap_ids = 40` (needing 40 * 40 = 1600). The 160-byte
-overrun landed on the adjacent MirMod header and zeroed `m + 64` — the cap_ids
-field itself. Every subsequent id then failed `id >= cap_ids` (0) and the compile
-returned `MIR_ERR_ID_OOR`, pointing at "your ids are out of range" when the real
-fault was "your vals buffer is too small". That gate was red for four releases
-(4.0.5 -> 4.0.10) and the misleading error is exactly why.
+⛔ WHY IT IS STRICT ABOUT LITERALS. The 4.0.x gate this replaces parsed only call
+sites whose arguments were all integer literals, and skipped the rest without a
+word. The one call site that compiles untrusted SPIR-V (`_native_shader_compile_spirv`,
+src/backend_native.cyr) passed named values, so it was skipped — and it declared
+`ptrs[2048]` (64 records) while telling mir_mod_init it held 128. The old gate also
+read only the FIRST store on each line, so programs that packed three
+`store64(&cc + CC_*, ..)` per line had `isel[1024]` (21 records) checked against
+nothing while gfx9_compile assumed 256. Both fixed in 4.4.0. Hence:
+  * a LOCAL array (`&name` with a `var name[N]` in the same fn) passed with a
+    non-literal length is a FAILURE — write the literal so it can be checked —
+    unless the length is a plain name the same function bounds first with
+    `if (name > M)`, M <= N (that guard is the proof);
+  * a buffer that is not a local array (a parameter, a computed pointer) is the
+    caller's business and is skipped; that caller's own call is checked.
 
-⭐ The bug is invisible at runtime and trivial at compile time: both the buffer
-size and the capacity are integer literals sitting a few lines apart. Hence a
-static gate rather than a runtime check.
+Also checked: mir_mod_init's id_bound must fit vals_len / MIR_VAL_REC when both are
+literals (the init rejects it at runtime; this names the site).
 
 USAGE
     scripts/check-compiler-buffer-sizing.py [--verbose]
-Exit 0 = every call site adequately sized. Exit 1 = at least one deficit.
+Exit 0 = every pair adequately sized. Exit 1 = at least one problem.
 """
 import glob
 import os
 import re
 import sys
 
-# Record sizes, mirrored from src/. Kept here as literals ON PURPOSE: if someone
-# changes a REC in src/ without updating this gate, the gate's numbers stop
-# matching and the mismatch is caught by test_compiler_buffer_sizing_recs in
-# tests/tcyr/compiler_compile.tcyr, which asserts these exact values.
+# Mirrored from src/mir.cyr; test_compiler_buffer_sizing_recs in
+# tests/tcyr/compiler_lower.tcyr asserts it so the two cannot drift.
 MIR_VAL_REC = 40
-MIR_INSTR_REC = 32
-MIR_PTR_REC = 32
-RA_REC = 16
-SPIRV_TYPE_REC = 24
-SPIRV_CONST_REC = 16
-SPIRV_DECO_REC = 16
-OUTBI_REC = 8
-GISEL_REC = 48
-CMP_ISEL_CAP = 256
+MIR_MAX_CAP_IDS = 256
+
+# fn name -> (arg count, [(buf arg index, len arg index), ...])
+CONTRACT = {
+    "mir_mod_init": (10, [(1, 2), (3, 4), (5, 6), (7, 8)]),
+    "spirv_build_type_table": (4, [(2, 3)]),
+    "spirv_build_const_table": (4, [(2, 3)]),
+    "spirv_build_decoration_table": (4, [(2, 3)]),
+    "_spirv_resolve_builtins": (5, [(3, 4)]),
+    "spirv_lower_module": (8, [(6, 7)]),
+    "gfx9_isel": (3, [(1, 2)]),
+    "gfx9_regalloc": (10, [(7, 8)]),
+    "gfx9_waitcnt": (5, [(3, 4)]),
+    "gfx9_emit_program": (8, [(5, 7)]),
+    "gfx9_compile": (6, [(3, 4)]),
+    "gfx9_cc_buf": (4, [(2, 3)]),
+}
 
 DECL = re.compile(r"\bvar\s+(\w+)\s*\[\s*(\d+)\s*\]")
-CALL = re.compile(
-    r"mir_mod_init\(\s*&?(\w+)\s*,\s*&?(\w+)\s*,\s*&?(\w+)\s*,\s*&?(\w+)\s*,"
-    r"\s*&?(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"
-)
-# `store64(&cc + CC_ALLOC, &alloc);` — the cc-struct wiring for the buffers that
-# reach the later stages.
-CC_STORE = re.compile(r"store64\(\s*&(\w+)\s*\+\s*(CC_\w+)\s*,\s*&(\w+)\s*\)")
-CC_CAP = re.compile(r"store64\(\s*&(\w+)\s*\+\s*CC_CAP_IDS\s*,\s*(\w+)\s*\)")
-
-# cc slot -> (record size, "sized by cap_ids", human name)
-CC_SLOTS = {
-    "CC_TYPES": (SPIRV_TYPE_REC, "types"),
-    "CC_CONSTS": (SPIRV_CONST_REC, "consts"),
-    "CC_DECO": (SPIRV_DECO_REC, "deco"),
-    "CC_OUTBI": (OUTBI_REC, "outbi"),
-    "CC_ALLOC": (RA_REC, "alloc"),
-    "CC_ISEL": (GISEL_REC, "isel"),
-    "CC_ISEL2": (GISEL_REC, "isel2"),
-}
+FN_START = re.compile(r"^fn\s+\w+\s*\(", re.M)
+CALL = re.compile(r"\b(" + "|".join(re.escape(k) for k in CONTRACT) + r")\s*\(")
+LOCAL_REF = re.compile(r"&\s*(\w+)")
+INT = re.compile(r"\d+")
 
 
 def sources():
@@ -83,165 +88,169 @@ def sources():
     return sorted(set(out))
 
 
-FN_START = re.compile(r"^fn\s+\w+\s*\(")
+def strip_comments(text):
+    """Blank `#` comments (outside strings) so a call quoted in a comment is not a call.
+    Keeps offsets and newlines intact."""
+    out = []
+    in_str = False
+    in_cmt = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_cmt:
+            if c == "\n":
+                in_cmt = False
+                out.append(c)
+            else:
+                out.append(" ")
+        elif in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "#":
+            in_cmt = True
+            out.append(" ")
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
 
 
-def enclosing_fn(lines, idx):
-    """[start, end) line range of the function containing `idx`.
+def split_args(text, open_paren):
+    """Top-level comma split of the call whose '(' is at open_paren. Returns
+    (args, index of the matching ')') or (None, None) if unbalanced."""
+    depth = 0
+    args = []
+    cur = open_paren + 1
+    in_str = False
+    i = open_paren
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                args.append(text[cur:i].strip())
+                return args, i
+        elif c == "," and depth == 1:
+            args.append(text[cur:i].strip())
+            cur = i + 1
+        i += 1
+    return None, None
 
-    ⚠ Scanning merely BACKWARDS from the call is wrong twice over: it walks past
-    the function header into a previous function (reporting a stale buffer of the
-    same name — an earlier draft of this gate blamed `alloc[256]` from one test
-    for a call in the next, which declares `alloc[768]`), and it misses buffers
-    declared AFTER mir_mod_init, which is where several call sites put them.
-    """
-    start = 0
-    for j in range(idx, -1, -1):
-        if FN_START.match(lines[j]):
-            start = j
+
+def fn_bounds(starts, pos, end_of_text):
+    lo, hi = 0, end_of_text
+    for s in starts:
+        if s <= pos:
+            lo = s
+        else:
+            hi = s
             break
-    end = len(lines)
-    for j in range(idx + 1, len(lines)):
-        if FN_START.match(lines[j]):
-            end = j
-            break
-    return start, end
-
-
-def decls_in_fn(lines, idx):
-    """Every `var NAME[N]` in the function containing `idx`.
-
-    A name declared twice in one function keeps the LARGER size: the gate must not
-    fire on a redeclaration that is adequately sized.
-    """
-    start, end = enclosing_fn(lines, idx)
-    seen = {}
-    for j in range(start, end):
-        for d in DECL.finditer(lines[j]):
-            nm, sz = d.group(1), int(d.group(2))
-            if nm not in seen or sz > seen[nm]:
-                seen[nm] = sz
-    return seen
+    return lo, hi
 
 
 def main():
     verbose = "--verbose" in sys.argv
     problems = []
-    sites = 0
-
+    pairs = 0
     for path in sources():
         try:
-            lines = open(path).read().split("\n")
+            raw = open(path).read()
         except (OSError, UnicodeDecodeError):
             continue
-        joined = "\n".join(lines)
-        if "mir_mod_init" not in joined:
+        text = strip_comments(raw)
+        if not CALL.search(text):
             continue
-
-        consumed = set()
-        for i, line in enumerate(lines):
-            if i in consumed:
+        starts = [m.start() for m in FN_START.finditer(text)]
+        for m in CALL.finditer(text):
+            name = m.group(1)
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            if text[line_start:m.start()].lstrip().startswith("fn "):
+                continue  # the definition
+            nargs, plist = CONTRACT[name]
+            args, _close = split_args(text, m.end() - 1)
+            line = text.count("\n", 0, m.start()) + 1
+            where = f"{path}:{line}: {name}"
+            if args is None:
+                problems.append(f"{where}: could not parse the call")
                 continue
-            # A call may wrap onto the next line. Mark the continuation consumed so
-            # one physical call is never counted twice (which would double every
-            # deficit and make the totals meaningless).
-            probe = line
-            if CALL.search(line):
-                mm = CALL.search(line)
-            else:
-                nxt = lines[i + 1] if i + 1 < len(lines) else ""
-                probe = line + " " + nxt
-                mm = CALL.search(probe)
-                if mm:
-                    consumed.add(i + 1)
-            if not mm:
+            if len(args) != nargs:
+                problems.append(f"{where}: {len(args)} args, the contract signature takes {nargs}")
                 continue
-            # ⚠ Skip call sites that are ARGUMENTS to an assertion. Those are
-            # negative tests deliberately passing a rejected configuration to
-            # prove mir_mod_init rejects it (see
-            # test_mir_mod_init_contract in tests/tcyr/compiler_lower.tcyr).
-            # Flagging them would make the gate fire on the very tests that
-            # defend it, and the only way to quiet it would be deleting them.
-            # ⚠ Test `probe`, not `line`. When the call wraps, the match is
-            # attributed to the PRECEDING line — often a comment — and testing
-            # that line alone finds no "assert" and skips nothing.
-            if "assert" in probe:
-                continue
-            sites += 1
-            (_m, vals, instrs, ptrs, _blocks,
-             cap_instrs, cap_ptrs, id_bound, cap_ids) = mm.groups()
-            cap_instrs, cap_ptrs = int(cap_instrs), int(cap_ptrs)
-            id_bound, cap_ids = int(id_bound), int(cap_ids)
-            sizes = decls_in_fn(lines, i)
-
-            def check(name, need, why):
-                have = sizes.get(name)
-                if have is None:
-                    return  # declared elsewhere (a param, or a helper's buffer)
-                if have < need:
+            lo, hi = fn_bounds(starts, m.start(), len(text))
+            decls = {}
+            for d in DECL.finditer(text, lo, hi):
+                decls[d.group(1)] = max(int(d.group(2)), decls.get(d.group(1), 0))
+            # A call that is itself an ASSERTION ARGUMENT may pass an incoherent id_bound
+            # or a zero length on purpose — test_mir_mod_init_contract proves the init
+            # rejects them. That exemption never covers a length past its buffer: that is
+            # a real overrun whether or not an assertion wraps the call.
+            stmt = text[max(text.rfind(";", 0, m.start()), text.rfind("{", 0, m.start()),
+                            text.rfind("}", 0, m.start())) + 1:m.start()]
+            in_assert = "assert" in stmt
+            for bi, li in plist:
+                buf, ln = args[bi], args[li]
+                ref = re.fullmatch(r"&\s*(\w+)", buf)
+                if not ref or ref.group(1) not in decls:
+                    continue  # not a local array: the caller that owns it is checked
+                have = decls[ref.group(1)]
+                pairs += 1
+                if not INT.fullmatch(ln) and re.fullmatch(r"\w+", ln):
+                    # A named length is accepted when the SAME function bounds it first:
+                    # an `if (NAME > N)` at or below the declared size, before the call
+                    # (a test helper that shortens one buffer at a time does this).
+                    guard = re.compile(r"\bif\s*\(\s*" + re.escape(ln) + r"\s*>\s*(\d+)\s*\)")
+                    bound = [int(g.group(1)) for g in guard.finditer(text, lo, m.start())]
+                    if bound and min(bound) <= have:
+                        if verbose:
+                            print(f"  ok {where} {ref.group(1)}[{have}] >= {ln} (guarded <= {min(bound)})")
+                        continue
+                if not INT.fullmatch(ln):
                     problems.append(
-                        f"{path}:{i + 1}: {name}[{have}] needs {need} B ({why}) "
-                        f"— DEFICIT {need - have} B"
-                    )
+                        f"{where}: local {ref.group(1)}[{have}] passed with non-literal length "
+                        f"'{ln}' — write the byte count so this gate can check it")
+                    continue
+                need = int(ln)
+                # ⚠ A zero length on a call that is meant to work is almost always two
+                # arguments swapped — gfx9_emit_program's (pos, buf_len) is the trap: the
+                # 4.4.0 conversion first wrote `&built, 128, 0` (pos 128, length 0), which
+                # this gate's `<=` passed.
+                if need == 0 and not in_assert:
+                    problems.append(
+                        f"{where}: {ref.group(1)}[{have}] passed with length 0 — swapped arguments?")
+                    continue
+                if need > have:
+                    problems.append(
+                        f"{where}: {ref.group(1)}[{have}] passed as {need} bytes — "
+                        f"OVERRUN {need - have} B")
                 elif verbose:
-                    print(f"  ok {path}:{i + 1} {name}[{have}] >= {need} ({why})")
-
-            # Eagerly memset by mir_mod_init itself — an undersized vals corrupts
-            # unconditionally, at init, before any lowering runs.
-            check(vals, cap_ids * MIR_VAL_REC, f"EAGER memset: {cap_ids} ids x {MIR_VAL_REC}")
-            # Written on demand, bounded by the cap — a deficit here is LATENT and
-            # only fires once a program emits that many records.
-            check(instrs, cap_instrs * MIR_INSTR_REC, f"{cap_instrs} x {MIR_INSTR_REC}")
-            check(ptrs, cap_ptrs * MIR_PTR_REC, f"{cap_ptrs} x {MIR_PTR_REC}")
-
-            if id_bound > cap_ids:
-                problems.append(
-                    f"{path}:{i + 1}: id_bound {id_bound} > cap_ids {cap_ids} "
-                    f"— the SPIR-V ids alone do not fit vals[] "
-                    f"(id_bound == cap_ids is legal: no synth headroom)"
-                )
-
-            # The cc-wired buffers, if this call site also builds a cc struct.
-            # Scan forward for the stores; they follow mir_mod_init in every
-            # existing site but tolerate either order.
-            fn_start, fn_end = enclosing_fn(lines, i)
-            window = lines[fn_start:fn_end]
-            declared_cap = None
-            for w in window:
-                cm = CC_CAP.search(w)
-                if cm and cm.group(2).isdigit():
-                    declared_cap = int(cm.group(2))
-            for w in window:
-                sm = CC_STORE.search(w)
-                if not sm:
-                    continue
-                slot, buf = sm.group(2), sm.group(3)
-                if slot not in CC_SLOTS:
-                    continue
-                rec, label = CC_SLOTS[slot]
-                if slot in ("CC_ISEL", "CC_ISEL2"):
-                    # gfx9_compile always passes CMP_ISEL_CAP to gfx9_isel, which
-                    # bounds its writes on that value — so any caller of
-                    # gfx9_compile must size isel/isel2 for the full cap.
-                    need, why = CMP_ISEL_CAP * rec, f"CMP_ISEL_CAP {CMP_ISEL_CAP} x {rec}"
-                elif slot == "CC_ALLOC":
-                    # ⚠ gfx9_regalloc reads cap_ids from the MIR header
-                    # (`load64(m + 64)`), NOT from CC_CAP_IDS. The two can and do
-                    # differ at the same call site, so using CC_CAP_IDS here would
-                    # under-require the buffer.
-                    need = cap_ids * rec
-                    why = f"{label}: EAGER memset: mir cap_ids {cap_ids} x {rec}"
-                else:
-                    c = declared_cap if declared_cap is not None else cap_ids
-                    eager = " EAGER memset:" if slot in ("CC_OUTBI", "CC_TYPES",
-                                                         "CC_CONSTS", "CC_DECO") else ""
-                    need, why = c * rec, f"{label}:{eager} CC_CAP_IDS {c} x {rec}"
-                check(buf, need, why)
-
-    for p in sorted(set(problems)):
+                    print(f"  ok {where} {ref.group(1)}[{have}] >= {need}")
+            if (name == "mir_mod_init" and not in_assert
+                    and INT.fullmatch(args[2]) and INT.fullmatch(args[9])):
+                cap = min(int(args[2]) // MIR_VAL_REC, MIR_MAX_CAP_IDS)
+                if int(args[9]) > cap:
+                    problems.append(
+                        f"{where}: id_bound {args[9]} > cap_ids {cap} (vals_len {args[2]} / "
+                        f"{MIR_VAL_REC}) — mir_mod_init rejects it")
+    for p in problems:
         print(p)
-    print(f"\n{sites} mir_mod_init call site(s) checked, "
-          f"{len(set(problems))} problem(s)")
+    print(f"\n{pairs} (buffer, length) pair(s) checked, {len(problems)} problem(s)")
     return 1 if problems else 0
 
 

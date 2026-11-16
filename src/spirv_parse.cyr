@@ -251,12 +251,18 @@ var SPIRV_TYK_STRUCT        = 8;   # p0 = member count, p1 = first member type <
 var SPIRV_TYK_POINTER       = 9;   # p0 = storage class, p1 = pointee type <id>
 var SPIRV_TYK_FUNCTION      = 10;  # p0 = return type <id>
 
-# Record sizes (bytes). Caller sizes each table buffer to >= `cap` records and
-# passes `cap` so the builder can reject a SPIR-V `id_bound` (UNTRUSTED, from the
-# header) that would write past it. The validate gate only caps `id_bound` at a
-# loose 0x40000000, unrelated to the caller's fixed buffer — without `cap` a
-# crafted oversized `id_bound` silently corrupts memory (the `memset` below and
-# every per-id write index by `id`). N-HARDEN.1 (found via N.5g adversarial review).
+# Record sizes (bytes). Each builder takes its table buffer WITH ITS LENGTH IN
+# BYTES (`out`, `out_len`; the scratch-buffer contract, 4.4.0) and derives its
+# record capacity `cap = out_len / REC`, so it can reject a SPIR-V `id_bound`
+# (UNTRUSTED, from the header) that would write past the buffer. The validate gate
+# only caps `id_bound` at a loose 0x40000000, unrelated to the caller's fixed
+# buffer — without the bound a crafted oversized `id_bound` silently corrupts
+# memory (the `memset` below and every per-id write index by `id`). N-HARDEN.1
+# (found via N.5g adversarial review). Before 4.4.0 the caller passed `cap` as a
+# separate number that nothing tied to the buffer, and `id_bound` as another: the
+# builders now read id_bound from the module header, as every production caller
+# already did, so a stale 5-argument call fails to compile instead of being
+# reinterpreted (ranga's tests/gpu_spirv.tcyr calls these directly).
 var SPIRV_TYPE_REC  = 24;   # [kind, p0, p1]
 var SPIRV_CONST_REC = 16;   # [result-type <id>, value]
 var SPIRV_DECO_REC  = 16;   # [binding, descriptor-set]  (-1 = absent)
@@ -282,10 +288,13 @@ fn _spirv_set_type(out, id, kind, p0, p1, cap): i64 {
 
 # Build the type table: out[id] = (kind, p0, p1) for every OpType* in the
 # stream. Returns 0, -1 on a malformed (zero-wc) instruction, or
-# -SPIRV_ERR_ID_CAP if id_bound exceeds the caller's `cap`-record table. Per-op
+# -SPIRV_ERR_ID_CAP if id_bound exceeds the records `out_len` holds. Per-op
 # `wc` guards keep operand reads inside the instruction (a compiler ingests
 # untrusted input). `a` = word 2, `b` = word 3 (read only when wc allows).
-fn spirv_build_type_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_type_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_TYPE_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_TYPE_REC);
     var total = byte_len / 4;
@@ -340,7 +349,10 @@ fn spirv_type_p1(out, id): i64 { return load64(out + id * SPIRV_TYPE_REC + 16); 
 # ---- constant table ----
 # out[result-id] = (result-type <id>, value). Scalar OpConstant only (the 32-bit
 # value is word 3); composite/64-bit constants land when the lowering needs them.
-fn spirv_build_const_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_const_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_CONST_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0, id_bound * SPIRV_CONST_REC);
     var total = byte_len / 4;
@@ -375,7 +387,10 @@ fn spirv_const_value(out, id): i64 { return load64(out + id * SPIRV_CONST_REC + 
 # ---- decoration table ----
 # out[target-id] = (Binding, DescriptorSet); both default to -1 (absent). Only
 # the two binding decorations N.2 needs to resolve buffer slots are recorded.
-fn spirv_build_decoration_table(ptr, byte_len, id_bound, cap, out): i64 {
+fn spirv_build_decoration_table(ptr, byte_len, out, out_len): i64 {
+    if (byte_len < SPIRV_HEADER_WORDS * 4) { return 0 - 1; }
+    var id_bound = spirv_hdr_id_bound(ptr);
+    var cap = out_len / SPIRV_DECO_REC;
     if (id_bound > cap) { return 0 - SPIRV_ERR_ID_CAP; }
     memset(out, 0xFF, id_bound * SPIRV_DECO_REC);
     var total = byte_len / 4;

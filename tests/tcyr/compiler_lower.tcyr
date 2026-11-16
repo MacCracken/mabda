@@ -7,7 +7,7 @@ fn test_mir_type_distill() {
     var buf[128];
     var n = _spv_build_distill_types(&buf);
     var types[384];
-    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_type_table(&buf, n, &types, 384);
     assert_eq(_mir_lower_type(&types, 2, 16), MIR_T_I32, "signed int32 -> I32");
     assert_eq(_mir_lower_type(&types, 3, 16), MIR_T_U32, "unsigned int32 -> U32");
     assert_eq(_mir_lower_type(&types, 4, 16), MIR_T_F32, "float32 -> F32");
@@ -48,7 +48,7 @@ fn test_mir_value_builders() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 42);
     assert_eq(mir_val_kind(&m, 1), MIR_VK_CONST, "const kind");
     assert_eq(mir_val_type(&m, 1), MIR_T_U32, "const type");
@@ -81,43 +81,86 @@ fn test_mir_mod_init_contract() {
     var blocks[32];
 
     # A well-formed init still succeeds, and reports so.
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16), 0,
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16), 0,
       "well-formed mir_mod_init returns 0");
 
     # id_bound == cap_ids is LEGAL — it means "no synth headroom", which is what
     # every hand-built-MIR test in this suite uses. Asserted explicitly because a
     # first cut of the v4.0.11 guard rejected it and broke three suites.
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16), 0,
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16), 0,
       "id_bound == cap_ids is accepted");
     # ... while id_bound > cap_ids is incoherent and rejected.
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 17, 16),
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 17),
       0 - MIR_ERR_BAD_INIT, "id_bound > cap_ids rejected");
 
     # Null buffers.
-    assert_eq(mir_mod_init(0, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16),
+    assert_eq(mir_mod_init(0, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16),
       0 - MIR_ERR_BAD_INIT, "null m rejected");
-    assert_eq(mir_mod_init(&m, 0, &instrs, &ptrs, &blocks, 16, 4, 16, 16),
+    assert_eq(mir_mod_init(&m, 0, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16),
       0 - MIR_ERR_BAD_INIT, "null vals rejected");
-    assert_eq(mir_mod_init(&m, &vals, 0, &ptrs, &blocks, 16, 4, 16, 16),
+    assert_eq(mir_mod_init(&m, &vals, 640, 0, 512, &ptrs, 128, &blocks, 32, 16),
       0 - MIR_ERR_BAD_INIT, "null instrs rejected");
-    assert_eq(mir_mod_init(&m, &vals, &instrs, 0, &blocks, 16, 4, 16, 16),
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, 0, 128, &blocks, 32, 16),
       0 - MIR_ERR_BAD_INIT, "null ptrs rejected");
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, 0, 16, 4, 16, 16),
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, 0, 32, 16),
       0 - MIR_ERR_BAD_INIT, "null blocks rejected");
 
-    # Non-positive capacities.
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 0),
-      0 - MIR_ERR_BAD_INIT, "cap_ids 0 rejected");
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 0, 4, 16, 16),
-      0 - MIR_ERR_BAD_INIT, "cap_instrs 0 rejected");
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 0, 16, 16),
-      0 - MIR_ERR_BAD_INIT, "cap_ptrs 0 rejected");
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 0 - 1, 16),
+    # 4.4.0 — capacities are DERIVED from byte lengths. A length under one record
+    # leaves a zero capacity, which is rejected.
+    assert_eq(mir_mod_init(&m, &vals, 0, &instrs, 512, &ptrs, 128, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "vals_len 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, 39, &instrs, 512, &ptrs, 128, &blocks, 32, 0),
+      0 - MIR_ERR_BAD_INIT, "vals_len under one MIR_VAL_REC rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 0, &ptrs, 128, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "instrs_len 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 31, &ptrs, 128, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "instrs_len under one MIR_INSTR_REC rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 0, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "ptrs_len 0 rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 31, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "ptrs_len under one MIR_PTR_REC rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 31, 16),
+      0 - MIR_ERR_BAD_INIT, "blocks_len under one MIR_BLOCK_REC rejected");
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 0 - 1),
       0 - MIR_ERR_BAD_INIT, "negative id_bound rejected");
 
-    # cap_ids past the architectural ceiling every later stage is sized for.
-    assert_eq(mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16,
-        MIR_MAX_CAP_IDS + 1), 0 - MIR_ERR_BAD_INIT, "cap_ids > MIR_MAX_CAP_IDS rejected");
+    # The derived capacities, and floor division: a partial record is not a record.
+    assert_eq(mir_mod_init(&m, &vals, 639, &instrs, 511, &ptrs, 127, &blocks, 32, 15), 0,
+      "partial-record lengths accepted");
+    assert_eq(load64(&m + 64), 15, "cap_ids = 639 / 40 = 15");
+    assert_eq(load64(&m + 40), 15, "cap_instrs = 511 / 32 = 15");
+    assert_eq(load64(&m + 56), 3, "cap_ptrs = 127 / 32 = 3");
+    assert_eq(mir_mod_init(&m, &vals, 639, &instrs, 511, &ptrs, 127, &blocks, 32, 16),
+      0 - MIR_ERR_BAD_INIT, "id_bound 16 does not fit 639 bytes of vals");
+
+    # A rejected init writes nothing: the length is checked before the memset.
+    memset(&vals, 0xAB, 640);
+    assert_eq(mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 17),
+      0 - MIR_ERR_BAD_INIT, "id_bound past vals_len rejected");
+    assert_eq(load8(&vals + 0), 0xAB, "rejected init left vals[0] untouched");
+    assert_eq(load8(&vals + 639), 0xAB, "rejected init left vals[639] untouched");
+    # ... and an accepted one clears exactly cap_ids records, not the whole length.
+    assert_eq(mir_mod_init(&m, &vals, 600, &instrs, 512, &ptrs, 128, &blocks, 32, 15), 0,
+      "init over 600 of vals[640]");
+    assert_eq(load8(&vals + 599), 0, "the 15 records are cleared");
+    assert_eq(load8(&vals + 600), 0xAB, "the byte past vals_len is untouched");
+    return 0;
+}
+
+# 4.4.0 — the clamp that replaced "cap_ids > MIR_MAX_CAP_IDS is rejected". A vals[]
+# longer than the 256-id ceiling is legal; the excess is never written.
+fn test_mir_mod_init_oversized_vals_clamps() {
+    var m[80];
+    var big[10280];      # 257 records
+    var instrs[512];
+    var ptrs[128];
+    var blocks[32];
+    memset(&big, 0xCD, 10280);
+    assert_eq(mir_mod_init(&m, &big, 10280, &instrs, 512, &ptrs, 128, &blocks, 32, 16), 0,
+      "257-record vals accepted");
+    assert_eq(load64(&m + 64), MIR_MAX_CAP_IDS, "cap_ids clamped to MIR_MAX_CAP_IDS");
+    assert_eq(load8(&big + 10239), 0, "the 256 records are cleared");
+    assert_eq(load8(&big + 10240), 0xCD, "the 257th record is untouched");
     assert_eq(MIR_MAX_CAP_IDS, 256, "MIR_MAX_CAP_IDS mirrors RA_MAX_REGS");
     return 0;
 }
@@ -144,7 +187,7 @@ fn test_mir_uninit_module_is_distinguishable() {
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     assert_eq(mir_set_const(&m, 99, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR,
       "id past cap on a live module is still ID_OOR");
     assert_eq(mir_set_const(&m, 0, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR,
@@ -178,7 +221,7 @@ fn test_mir_emit_and_accessors() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     var idx = mir_emit(&m, MIR_OP_IADD, 5, MIR_T_I32, 2, 3, 0, 0);
     assert_eq(idx, 0, "first instr index 0");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_IADD, "op IADD");
@@ -208,7 +251,7 @@ fn test_mir_add_ptr() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     var p = mir_add_ptr(&m, 5, 0, MIR_T_F32, 7, 0, 1);
     assert_eq(p, 0, "first ptr index 0");
     assert_eq(mir_ptr_binding(&m, 0), 0, "binding 0");
@@ -235,7 +278,7 @@ fn test_mir_uniformity() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 4);                             # stride
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);     # divergent
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_WORKGROUP_ID);        # uniform
@@ -267,7 +310,7 @@ fn test_mir_blocks_and_synth() {
     var ptrs[64];
     var blocks[32];
     # id_bound 16, cap_ids 20 -> synth ids 16..19 have backing storage (vals 20*40)
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 20);
+    mir_mod_init(&m, &vals, 800, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_finalize_block0(&m);
@@ -291,7 +334,7 @@ fn test_mir_review_n2a() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     # #5: mir_set_* bound-check the value-id ceiling + the id-0 sentinel
     assert_eq(mir_set_const(&m, 5, MIR_T_U32, 1), 0, "set_const valid id ok");
     assert_eq(mir_set_const(&m, 16, MIR_T_U32, 1), 0 - MIR_ERR_ID_OOR, "set_const id == cap -> OOR");
@@ -306,7 +349,7 @@ fn test_mir_review_n2a() {
     var buf[128];
     var n = _spv_build_bad_vectors(&buf);
     var types[384];
-    spirv_build_type_table(&buf, n, 16, 16, &types);
+    spirv_build_type_table(&buf, n, &types, 384);
     assert_eq(_mir_lower_type(&types, 6, 16), MIR_T_F32 | (4 << 8), "valid vec4 f32 ok");
     assert_eq(_mir_lower_type(&types, 7, 16), MIR_T_UNSUPPORTED, "vector-of-vector -> UNSUPPORTED");
     assert_eq(_mir_lower_type(&types, 8, 16), MIR_T_UNSUPPORTED, "self-ref vector -> UNSUPPORTED (no crash)");
@@ -320,11 +363,11 @@ fn test_mir_emit_errors() {
     var ptrs[64];
     var blocks[32];
     # cap_instrs = 1: the second emit overflows
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 1, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 32, &ptrs, 64, &blocks, 32, 16);
     assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0, "first emit ok");
     assert_eq(mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0), 0 - MIR_ERR_CAP_EXCEEDED, "cap exceeded");
     # result id >= id_bound -> ID_OOR
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     assert_eq(mir_emit(&m, MIR_OP_IADD, 16, MIR_T_I32, 1, 1, 0, 0), 0 - MIR_ERR_ID_OOR, "result id OOR");
     return 0;
 }
@@ -337,16 +380,16 @@ fn test_spirv_lower_gid_kernel() {
     var consts[256];
     var deco[256];
     var outbi[128];
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
     var m[80];
     var vals[640];
     var instrs[512];
     var ptrs[128];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "lower ok");
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128), 0, "lower ok");
     # builtin resolution (the gap the N.1b parser does not fill)
     assert_eq(_spirv_builtin_for_var(&outbi, 7), MIR_BI_LOCAL_INVOC_ID, "lid var resolved");
     # seed
@@ -389,7 +432,7 @@ fn test_spirv_const_fold() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 16, 16);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_U32, 6);
     mir_set_const(&m, 2, MIR_T_U32, 7);
     mir_set_const(&m, 3, MIR_T_U32, 0xF0);
@@ -436,7 +479,7 @@ fn test_spirv_lower_smod() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 8);
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);    # a — divergent
     mir_set_builtin(&m, 4, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # b — divergent
     assert_eq(_spirv_lower_smod(&w, 0, 5, &m), 0, "smod lowers");
@@ -476,7 +519,7 @@ fn test_spirv_lower_fdiv() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m), 0, "fdiv f64 lowers");
     assert_eq(mir_n_instrs(&m), 11, "fdiv = 11 MIR instrs");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_DIV_SCALE, "0: div_scale(D,D,N)");
@@ -520,7 +563,7 @@ fn test_spirv_lower_fdiv_f32() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     assert_eq(_spirv_lower_fdiv(&buf, 5, 5, &types, &m), 0, "fdiv f32 lowers");
     assert_eq(mir_n_instrs(&m), 11, "f32 fdiv = 11 MIR instrs (same shape as f64)");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_F32_DIV_SCALE, "0: div_scale(D,D,N)");
@@ -554,7 +597,7 @@ fn test_mir_f32_div_ops_force_divergent() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     mir_set_const(&m, 1, MIR_T_F32, 0);     # UNIFORM operands throughout
     mir_set_const(&m, 2, MIR_T_F32, 0);
     mir_emit(&m, MIR_OP_F32_DIV_SCALE, 3, MIR_T_F32, 1, 2, 1, 0);
@@ -584,7 +627,7 @@ fn test_spirv_lower_fsqrt() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 8, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 8);
     assert_eq(_spirv_lower_fsqrt_f64(&m, 3, 5), 0, "fsqrt f64 lowers");   # x=id 3, result=id 5
     assert_eq(mir_n_instrs(&m), 22, "fsqrt = 22 MIR instrs (full range)");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_F64_CONST, "0: threshold f64-const");
@@ -631,7 +674,7 @@ fn test_spirv_lower_select_int_cond() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);   # divergent
     mir_set_const(&m, 4, MIR_T_U32, 8);
     mir_set_const(&m, 7, MIR_T_U32, 111);
@@ -674,7 +717,7 @@ fn test_spirv_lower_select_int_cond_not_adjacent() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     mir_set_builtin(&m, 3, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_set_const(&m, 4, MIR_T_U32, 8);
     mir_set_const(&m, 7, MIR_T_U32, 111);
@@ -707,7 +750,7 @@ fn test_spirv_lower_select_int_cond_uniform() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     mir_set_const(&m, 3, MIR_T_U32, 4);      # both operands uniform
     mir_set_const(&m, 4, MIR_T_U32, 8);
     mir_set_const(&m, 7, MIR_T_U32, 111);
@@ -736,7 +779,7 @@ fn test_spirv_lower_select_rejects_nonmask() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     # cond = a U32 SSA (an integer-compare bool, NOT a 0/-1 mask) -> reject
     _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
     # v4.1.0: a U32 SSA is no longer rejected outright — it is accepted when it is
@@ -761,7 +804,7 @@ fn test_spirv_f64_arg() {
     var instrs[2048];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 64, 8, 16, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 256, &blocks, 32, 16);
     mir_set_const(&m, 5, MIR_T_F64, 0x400921FB54442D18);   # pi as an f64 const
     var r = _spirv_f64_arg(&m, 5);
     assert_eq(mir_n_instrs(&m), 1, "f64 const → 1 F64_CONST materialized");
@@ -791,7 +834,7 @@ fn test_spirv_lower_vec_construct_extract() {
     var instrs[512];
     var ptrs[128];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_mod_init(&m, &vals, 1600, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_const(&m, 10, MIR_T_F32, 0x3F800000);   # 1.0
     mir_set_const(&m, 11, MIR_T_F32, 0x40000000);   # 2.0
     mir_set_const(&m, 12, MIR_T_F32, 0x40400000);   # 3.0
@@ -837,7 +880,7 @@ fn test_spirv_lower_vec_construct_guards() {
     var instrs[512];
     var ptrs[128];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_mod_init(&m, &vals, 1600, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     mir_set_const(&m, 10, MIR_T_F32, 0);
     mir_set_const(&m, 11, MIR_T_F32, 0);
     # vec3 with only 2 operands (wc 5 → wc-3 = 2 != 3) → fail
@@ -870,7 +913,7 @@ fn test_spirv_vec_robustness() {
     var instrs[512];
     var ptrs[128];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_mod_init(&m, &vals, 1600, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     var lsz[24];
     store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
     # (1) mir_emit rejects a vector operand in either source position
@@ -914,7 +957,7 @@ fn test_spirv_lower_vec_binop() {
     var instrs[1024];
     var ptrs[128];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 1024, &ptrs, 128, &blocks, 32, 40);
     var lsz[24];
     store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
     # %30's components are non-const (builtins) so the component-wise op stays a RUNTIME FADD
@@ -964,7 +1007,7 @@ fn test_spirv_lower_vec_binop_fold() {
     var instrs[1024];
     var ptrs[128];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 4, 40, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 1024, &ptrs, 128, &blocks, 32, 40);
     mir_set_const(&m, 10, MIR_T_F32, 0x3F800000);   # 1.0
     mir_set_const(&m, 11, MIR_T_F32, 0x40000000);   # 2.0
     mir_set_const(&m, 12, MIR_T_F32, 0x40400000);   # 3.0
@@ -991,7 +1034,7 @@ fn test_spirv_lower_vec_load_store() {
     var instrs[1024];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 1024, &ptrs, 256, &blocks, 32, 40);
     mir_set_const(&m, 5, MIR_T_U32, 64);   # stand-in off_id (a non-vector value id)
     var pr = mir_add_ptr(&m, 10, 0, MIR_T_F32 | (4 << 8), 5, 0, 1);   # PTR: elem vec4<f32>, off_id 5
     assert_eq(pr, 0, "ptr added");
@@ -1062,7 +1105,7 @@ fn test_spirv_lower_vec_access_chain() {
     var instrs[1024];
     var ptrs[256];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 40, 64);
+    mir_mod_init(&m, &vals, 2560, &instrs, 1024, &ptrs, 256, &blocks, 32, 40);
     mir_set_bufvar(&m, 30, 0);
     var lsz[24];
     store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
@@ -1120,7 +1163,7 @@ fn test_spirv_lower_constant_composite() {
     var instrs[512];
     var ptrs[64];
     var blocks[64];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 32, 40);
+    mir_mod_init(&m, &vals, 1600, &instrs, 512, &ptrs, 64, &blocks, 32, 32);
     var deco[640];
     memset(&deco, 0xFF, 640);
     var outbi[320];
@@ -1210,15 +1253,15 @@ fn test_spirv_lower_seed_bufvar() {
     var types[480];
     var deco[320];
     var outbi[160];
-    spirv_build_type_table(&buf, n, 20, 20, &types);
-    spirv_build_decoration_table(&buf, n, 20, 20, &deco);
-    _spirv_resolve_builtins(&buf, n, 20, &outbi);
+    spirv_build_type_table(&buf, n, &types, 480);
+    spirv_build_decoration_table(&buf, n, &deco, 320);
+    _spirv_resolve_builtins(&buf, n, 20, &outbi, 160);
     var m[80];
     var vals[800];
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    mir_mod_init(&m, &vals, 800, &instrs, 512, &ptrs, 64, &blocks, 32, 20);
     assert_eq(_spirv_lower_seed_globals(&buf, n, &types, &deco, &m, &outbi), 0, "seed ok");
     assert_eq(mir_val_kind(&m, 12), MIR_VK_BUFVAR, "var %12 is a buffer var");
     assert_eq(mir_val_payload(&m, 12), 0, "var %12 binding 0");
@@ -1243,11 +1286,11 @@ fn test_spirv_lower_negatives() {
     # no GLCompute entry point -> LOWER_ERR_NO_ENTRY
     var n = _spv_build_gid_kernel(&buf);
     store32(&buf + 44, 0);   # OpEntryPoint execution model GLCompute(5) -> Vertex(0)
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - LOWER_ERR_NO_ENTRY, "no entry rejected");
     # v4.1.0: BRANCH/SELECTION_MERGE lower, and LOOP_MERGE + PHI now lower too.
     # This assertion previously read "PHI still rejected" — loops were blocked on
@@ -1257,21 +1300,21 @@ fn test_spirv_lower_negatives() {
     # its own; the copies live on the predecessors' branches.
     _spv_build_gid_kernel(&buf);
     store32(&buf + 324, (5 << 16) | 245);   # OpShiftLeftLogical -> OpPhi
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       SPIRV_LOWER_OK, "OpPhi now lowers (v4.1.0)");
     # an unmapped executable op -> MIR_ERR_UNSUPPORTED_OP (OpFDiv (136) is now lowered as the
     # F.7f.6b macro, so use OpFRem (140) — still unmapped — for the generic-unsupported path).
     _spv_build_gid_kernel(&buf);
     store32(&buf + 324, (5 << 16) | 140);   # OpShiftLeftLogical -> OpFRem (unmapped)
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - MIR_ERR_UNSUPPORTED_OP, "unmapped op err");
     return 0;
 }
@@ -1295,49 +1338,49 @@ fn test_spirv_lower_n2b1_review() {
     # uniformity sweep). IADD operand a is at buf+296.
     var n = _spv_build_gid_kernel(&buf);
     store32(&buf + 296, 0x3FFFFFFF);
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - MIR_ERR_ID_OOR, "operand OOB rejected");
     # #2 untrusted result-type id -> bounded in _mir_lower_type (was OOB type read).
     _spv_build_gid_kernel(&buf);
     store32(&buf + 288, 0x3FFFFFFF);   # IADD result-type word
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - MIR_ERR_UNSUPPORTED_TYPE, "type OOB");
     # #3 untrusted OpLoad source id -> bounded in _spirv_lower_load (was OOB read).
     _spv_build_gid_kernel(&buf);
     store32(&buf + 260, 0x3FFFFFFF);   # OpLoad source word
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - MIR_ERR_ID_OOR, "load src OOB rejected");
     # #4 untrusted OpDecorate BuiltIn target id -> bounded in _spirv_resolve_builtins
     # (was a controlled-offset OOB WRITE). The store is skipped; the now-unresolved
     # gid var makes the body OpLoad fail loud (no crash, no corruption).
     _spv_build_gid_kernel(&buf);
     store32(&buf + 92, 0x3FFFFFFF);   # OpDecorate target word
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - MIR_ERR_UNSUPPORTED_OP, "deco OOB safe");
     # #5 entry id with no matching OpFunction -> fail loud (was silent empty body).
     _spv_build_gid_kernel(&buf);
     store32(&buf + 228, 99);   # OpFunction result id 6 -> 99 (entry point still names 6)
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 16);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi),
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 128),
       0 - LOWER_ERR_NO_ENTRY, "empty body fail-loud");
     return 0;
 }
@@ -1467,7 +1510,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs[512];
     var ptrs[64];
     var blocks[32];
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 2, 20, 20);
+    mir_mod_init(&m, &vals, 800, &instrs, 512, &ptrs, 64, &blocks, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m, &lsz), 0,
       "FMax extinst lowers");
     assert_eq(mir_n_instrs(&m), 1, "one MIR instr");
@@ -1483,7 +1526,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs2[512];
     var ptrs2[64];
     var blocks2[32];
-    mir_mod_init(&m2, &vals2, &instrs2, &ptrs2, &blocks2, 16, 2, 20, 20);
+    mir_mod_init(&m2, &vals2, 800, &instrs2, 512, &ptrs2, 64, &blocks2, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m2, &lsz), 0,
       "Sqrt extinst lowers");
     assert_eq(mir_instr_op(&m2, 0), MIR_OP_FSQRT, "op = FSQRT");
@@ -1496,7 +1539,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs3[512];
     var ptrs3[64];
     var blocks3[32];
-    mir_mod_init(&m3, &vals3, &instrs3, &ptrs3, &blocks3, 16, 2, 20, 20);
+    mir_mod_init(&m3, &vals3, 800, &instrs3, 512, &ptrs3, 64, &blocks3, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 7, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m3, &lsz) < 0, 1,
       "unsupported ext instruction fails loud");
     # Floor is unary (wc 6).
@@ -1507,7 +1550,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs4[512];
     var ptrs4[64];
     var blocks4[32];
-    mir_mod_init(&m4, &vals4, &instrs4, &ptrs4, &blocks4, 16, 2, 20, 20);
+    mir_mod_init(&m4, &vals4, 800, &instrs4, 512, &ptrs4, 64, &blocks4, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m4, &lsz), 0,
       "Floor extinst lowers");
     assert_eq(mir_instr_op(&m4, 0), MIR_OP_FFLOOR, "op = FFLOOR");
@@ -1518,7 +1561,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrsab[512];
     var ptrsab[64];
     var blocksab[32];
-    mir_mod_init(&mab, &valsab, &instrsab, &ptrsab, &blocksab, 16, 2, 20, 20);
+    mir_mod_init(&mab, &valsab, 800, &instrsab, 512, &ptrsab, 64, &blocksab, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 6, SPIRV_OP_EXT_INST, &types, &consts, &deco, &mab, &lsz), 0,
       "FAbs extinst lowers");
     assert_eq(mir_instr_op(&mab, 0), MIR_OP_FABS, "op = FABS");
@@ -1532,7 +1575,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs5[512];
     var ptrs5[64];
     var blocks5[32];
-    mir_mod_init(&m5, &vals5, &instrs5, &ptrs5, &blocks5, 16, 2, 20, 20);
+    mir_mod_init(&m5, &vals5, 800, &instrs5, 512, &ptrs5, 64, &blocks5, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m5, &lsz), 0,
       "Fma extinst lowers");
     assert_eq(mir_instr_op(&m5, 0), MIR_OP_FMA, "op = FMA");
@@ -1546,7 +1589,7 @@ fn test_spirv_lower_glsl_extinst() {
     var instrs6[512];
     var ptrs6[64];
     var blocks6[32];
-    mir_mod_init(&m6, &vals6, &instrs6, &ptrs6, &blocks6, 16, 2, 20, 20);
+    mir_mod_init(&m6, &vals6, 800, &instrs6, 512, &ptrs6, 64, &blocks6, 32, 20);
     assert_eq(_spirv_lower_one_instr(&buf, 5, 8, SPIRV_OP_EXT_INST, &types, &consts, &deco, &m6, &lsz), 0,
       "FClamp extinst lowers");
     assert_eq(mir_instr_op(&m6, 0), MIR_OP_FCLAMP, "op = FCLAMP");
@@ -1569,11 +1612,11 @@ fn test_spirv_lower_gid_expansion() {
     var instrs[1024];
     var ptrs[256];
     var blocks[32];
-    spirv_build_type_table(&buf, n, 26, 26, &types);
-    spirv_build_const_table(&buf, n, 26, 26, &consts);
-    spirv_build_decoration_table(&buf, n, 26, 26, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 48);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "gid saxpy lowers");
+    spirv_build_type_table(&buf, n, &types, 624);
+    spirv_build_const_table(&buf, n, &consts, 416);
+    spirv_build_decoration_table(&buf, n, &deco, 416);
+    mir_mod_init(&m, &vals, 1920, &instrs, 1024, &ptrs, 256, &blocks, 32, 26);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 256), 0, "gid saxpy lowers");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
     assert_eq(mir_instr_op(&m, 1), MIR_OP_EXTRACT, "1: extract lid.x");
     assert_eq(mir_instr_op(&m, 2), MIR_OP_IMUL, "2: wgid * local_size");
@@ -1603,12 +1646,12 @@ fn test_spirv_lower_synth_exhaustion() {
     var instrs[1024];
     var ptrs[256];
     var blocks[32];
-    spirv_build_type_table(&buf, n, 26, 26, &types);
-    spirv_build_const_table(&buf, n, 26, 26, &consts);
-    spirv_build_decoration_table(&buf, n, 26, 26, &deco);
+    spirv_build_type_table(&buf, n, &types, 624);
+    spirv_build_const_table(&buf, n, &consts, 416);
+    spirv_build_decoration_table(&buf, n, &deco, 416);
     # cap_ids = id_bound(26) + 2 → only 2 synth slots, but the GID expansion needs 5
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 26, 28);
-    var lr = spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi);
+    mir_mod_init(&m, &vals, 1120, &instrs, 1024, &ptrs, 256, &blocks, 32, 26);
+    var lr = spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 256);
     assert_eq(lr, 0 - MIR_ERR_ID_OOR, "synth exhaustion fails loud");
     return 0;
 }
@@ -1626,11 +1669,11 @@ fn test_spirv_lower_uniform_if() {
     var instrs[1024];
     var ptrs[256];
     var blocks[32];
-    spirv_build_type_table(&buf, n, 16, 16, &types);
-    spirv_build_const_table(&buf, n, 16, 16, &consts);
-    spirv_build_decoration_table(&buf, n, 16, 16, &deco);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 32, 8, 16, 24);
-    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi), 0, "uniform-if lowers");
+    spirv_build_type_table(&buf, n, &types, 384);
+    spirv_build_const_table(&buf, n, &consts, 256);
+    spirv_build_decoration_table(&buf, n, &deco, 256);
+    mir_mod_init(&m, &vals, 960, &instrs, 1024, &ptrs, 256, &blocks, 32, 16);
+    assert_eq(spirv_lower_module(&buf, n, &types, &consts, &deco, &m, &outbi, 256), 0, "uniform-if lowers");
     # The entry label is skipped (laid out at 0); then/merge get LABEL markers.
     assert_eq(mir_n_instrs(&m), 7, "7 MIR instrs");
     assert_eq(mir_instr_op(&m, 0), MIR_OP_EXTRACT, "0: extract wgid.x");
@@ -1662,7 +1705,7 @@ fn test_spirv_lower_untrusted_ids_bounded() {
     var blocks[64];
     var types[960];
     memset(&types, 0, 960);
-    mir_mod_init(&m, &vals, &instrs, &ptrs, &blocks, 16, 4, 16, 40);
+    mir_mod_init(&m, &vals, 1600, &instrs, 512, &ptrs, 128, &blocks, 32, 16);
     var lsz[24];
     store64(&lsz + 0, 1); store64(&lsz + 8, 1); store64(&lsz + 16, 1);
     var buf[64];
@@ -1708,6 +1751,7 @@ fn main(): i64 {
     test_mir_blocks_and_synth();
     test_mir_review_n2a();
     test_mir_mod_init_contract();
+    test_mir_mod_init_oversized_vals_clamps();
     test_mir_uninit_module_is_distinguishable();
     test_compiler_buffer_sizing_recs();
     test_mir_emit_errors();

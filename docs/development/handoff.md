@@ -10,9 +10,10 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   tier's MB2–MB5 on top of 4.3.0's MB1: everything soorat's GPU half asked for
   (`issues/archived/2026-11-15-render-tier-for-geometry-consumers.md`), every milestone HW-verified.
   Audit: `docs/audit/2026-11-16-4.3.1-audit.md`.
-- **Uncommitted after the tag** (docs only): this file, the roadmap reorganized (all remaining
-  work pinned into two minors, v5.0, v5.1, or blocked-upstream), the N9 and texture-encoder issues
-  marked scheduled, the `CLAUDE.md` pointer here. They ride with the next release's commit.
+- **v4.4.0 in progress, uncommitted** (VERSION still 4.3.1; CHANGELOG `[4.4.0] — in progress`):
+  **the scratch-buffer contract** has landed. Every compiler buffer travels with its byte length
+  (see "The compiler's scratch-buffer contract" below). The rest of v4.4.0 is open; the next
+  roadmap item is the compiler limits v4.1.0 left named, then N9.
 - **Pins:** cyrius **6.7.18** (`cyrius.cyml`; track the latest upstream `VERSION` when you bump),
   wgpu-native **v29.0.1.1**, launcher **83 slots**, deps samvada 1.0.1 / chitra 1.0.3.
 - **Next release: v4.4.0 — compilers + NVIDIA**: N9 (SPIR-V → SASS; ranga is waiting), the
@@ -109,6 +110,21 @@ Consumers:
 - HW: `programs/render_tier_e2e.cyr`, `target_tier_e2e.cyr`, `compute_tier_e2e.cyr`,
   `error_channel_e2e.cyr`, `launcher_slots_e2e.cyr`, `surface_wayland_e2e.cyr`,
   `native_render_tier_e2e.cyr`, `nvidia_render_tier_e2e.cyr`.
+
+## The compiler's scratch-buffer contract (4.4.0)
+
+- Every SPIR-V → GFX9 stage that writes a caller buffer takes `(buf, len_in_bytes)` and derives its
+  capacity as `len / RECORD`. No stage takes a record count beside a bare pointer any more:
+  `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound)`;
+  the table builders `(p, n, out, out_len)` read `id_bound` from the header; the compile context is
+  136 bytes, filled by `gfx9_cc_buf(&cc, CC_X, &buf, N)`; `gfx9_compile(cc, spirv, n, isa, isa_len, desc)`.
+- Write each length as the literal beside its `var buf[N]`. `scripts/check-compiler-buffer-sizing.py`
+  checks every one, and it fails a local buffer passed with a non-literal length. The exception is a
+  plain name that the same function bounds first with `if (name > M)`, where `M <= N`.
+- **N9 must follow it.** The SM75 path will reuse the SPIR-V parse and the MIR. Give its isel /
+  regalloc / encoder the same `(buf, len)` shape and add them to the gate's `CONTRACT` table.
+- `_native_compile_spirv_isa` is the pure-CPU production compile frame, and the CPU suite drives it.
+  An NVIDIA counterpart should be split the same way.
 
 ## Gotchas this arc found
 
