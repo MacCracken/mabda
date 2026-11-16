@@ -218,16 +218,49 @@ fn _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos): i64 {
 }
 
 # v_cndmask_b32 dst, src0(=a, false value), vsrc1(=b, true value), VCC (implicit). NON-
-# commutative + VCC-dependent: both operands MUST be VGPRs (the udiv macro guarantees it),
-# and it must immediately follow its v_cmp with no VCC-writer between (true by construction
-# in the macro). a → the 9-bit src0 code, b → the raw vsrc1 index. (N.9 udiv.)
+# commutative + VCC-dependent. vsrc1 must be a VGPR. src0 may be a VGPR or an INLINE constant
+# (v4.4.0, for int-compare selects): on GFX9 the implicit VCC read takes the one constant-bus
+# slot, so an SGPR or a literal there is illegal (llvm-mc: "violates constant bus
+# restrictions") — gfx9_isel copies those into a VGPR first, and this refuses them.
 fn _emit_cndmask(m, isel, i, alloc, isvgpr, buf, pos): i64 {
-    var fa = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
-    if (fa < 0) { return fa; }
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }
+    if (src0 < 128) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }   # an SGPR (or VCC/EXEC) source
     var tb = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
     if (tb < 0) { return tb; }
     var dst = gfx9_reg(alloc, gisel_dst(isel, i));
-    return gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, gfx9_vgpr(fa), tb));
+    return gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, src0, tb));
+}
+
+# v4.4.0 — s_cselect_b32 dst, a(true), b(false): dst = SCC ? a : b, for a select whose
+# condition, result and both values are uniform. SGPR / inline / literal sources; a SOP2 takes
+# one literal dword, so two DIFFERENT literals load the false one first:
+#   s_mov_b32 dst, <false>; s_cselect_b32 dst, <true>, dst      (s_mov leaves SCC alone)
+fn _emit_scselect(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var s0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (s0 < 0) { return s0; }
+    var s1 = _cmp_resolve(m, alloc, isvgpr, b, fl & MIR_FLAG_B_IMM);
+    if (s1 < 0) { return s1; }
+    if (s0 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (s1 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = pos;
+    if (s0 == GFX9_SRC_LITERAL) {
+        if (s1 == GFX9_SRC_LITERAL) {
+            p = gfx9_emit32(buf, p, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B32, dst, GFX9_SRC_LITERAL));
+            p = gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM));
+            s1 = gfx9_sgpr(dst);
+        }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B32, dst, s0, s1));
+    if (s0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    if (s1 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM)); }
+    return p;
 }
 
 # VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
@@ -742,7 +775,19 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     # N.9 integer-division primitives. The unary forms reuse _emit_vop1; MUL_HI reuses the
     # VOP3 2-src emit (operands are always VGPRs in the macro); CNDMASK is dedicated.
-    if (op == GISEL_V_MOV) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_MOV_B32); }
+    if (op == GISEL_V_MOV) {
+        # v4.4.0 — an f64 value is a VGPR PAIR, so its copy (an f64 phi's) is two v_mov_b32. Until
+        # 4.4.0 this emitted one and an f64 loop phi kept a stale high half. The source must
+        # already be a pair: lowering materializes an f64 constant first (_spirv_f64_arg).
+        if (mir_type_base(mir_val_type(m, gisel_dst(isel, i))) == MIR_T_F64) {
+            var fs = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+            if (fs < 0) { return fs; }
+            var fd = gfx9_reg(alloc, gisel_dst(isel, i));
+            var pm0 = gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, fd, gfx9_vgpr(fs)));
+            return gfx9_emit32(buf, pm0, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, fd + 1, gfx9_vgpr(fs + 1)));
+        }
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_MOV_B32);
+    }
     if (op == GISEL_V_CVT_F32_U32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_U32); }
     if (op == GISEL_V_CVT_U32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_U32_F32); }
     if (op == GISEL_V_RCP_IFLAG_F32) {
@@ -850,14 +895,40 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_SELECT) { return _emit_select(m, isel, i, alloc, isvgpr, buf, pos); }
-    # Divergent-if EXEC mask: save+AND EXEC with VCC into the reserved pair; restore it.
+    if (op == GISEL_S_CSELECT) { return _emit_scselect(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_S_CSELECT_VCC) {
+        # s_cselect_b64 vcc, -1, 0 — inline -1 = 193, inline 0 = 128.
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B64, GFX9_REG_VCC_LO, 193, 128));
+    }
+    # Structured divergent control flow (v4.4.0). Every op names its saved-EXEC pair's base SGPR
+    # in `a` (gfx9_isel's region stack; s[100:101] at depth 0).
+    var pr = gisel_a(isel, i);
     if (op == GISEL_S_SAVEEXEC) {
-        return gfx9_emit32(buf, pos,
-          gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, GFX9_EXEC_SAVE_SGPR, GFX9_REG_VCC_LO));
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, pr, GFX9_REG_VCC_LO));
+    }
+    if (op == GISEL_S_EXEC_XOR_SAVE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, pr, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_ELSE) {
+        var pe = gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_OR_SAVEEXEC_B64, pr, pr));
+        return gfx9_emit32(buf, pe, gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, pr));
     }
     if (op == GISEL_S_OR_EXEC) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_LOOP_SAVE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, pr, GFX9_REG_EXEC_LO));
+    }
+    if (op == GISEL_S_LOOP_RESTORE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_EXEC_AND_VCC) {
         return gfx9_emit32(buf, pos,
-          gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_EXEC_SAVE_SGPR));
+          gfx9_enc_sop2(GFX9_SOP2_S_AND_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO));
+    }
+    if (op == GISEL_S_EXEC_ANDN2_VCC) {
+        return gfx9_emit32(buf, pos,
+          gfx9_enc_sop2(GFX9_SOP2_S_ANDN2_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO));
     }
     # LABEL / S_BRANCH / S_CBRANCH are handled in gfx9_emit_program's layout loop (they
     # need the label-offset map + branch patch list), never here.
@@ -919,7 +990,13 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
         if (p + CMP_RECORD_MAX_BYTES > buf_len) { return 0 - CMP_ERR_ISA_OVERFLOW; }
         var op = gisel_op(isel, i);
         if (op == GISEL_LABEL) {
-            store64(&laboff + gisel_a(isel, i) * 8, p);
+            # ⛔ laboff holds cap_ids entries, indexed by label <id>. Until 4.4.0 nothing bounded
+            # the id, and a crafted module's out-of-range label wrote `p` off this frame's stack
+            # (lowering now rejects it, _spirv_check_label; this is the backstop).
+            var lid = gisel_a(isel, i);
+            if (lid <= 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+            if (lid >= cap_ids) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+            store64(&laboff + lid * 8, p);
         } else {
             if (op == GISEL_S_BRANCH) {
                 if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
@@ -928,12 +1005,15 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
                 npatch = npatch + 1;
                 p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_BRANCH, 0));
             } else {
-                if (op == GISEL_S_CBRANCH) {
+                var sccop = 0 - 1;
+                if (op == GISEL_S_CBRANCH) { sccop = GFX9_SOPP_S_CBRANCH_SCC0; }
+                if (op == GISEL_S_CBRANCH_SCC1) { sccop = GFX9_SOPP_S_CBRANCH_SCC1; }
+                if (sccop >= 0) {
                     if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
                     store64(&patch_off + npatch * 8, p);
                     store64(&patch_tgt + npatch * 8, gisel_c(isel, i));
                     npatch = npatch + 1;
-                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_SCC0, 0));
+                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(sccop, 0));
                 } else {
                     if (op == GISEL_S_CBRANCH_EXECZ) {
                         if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
@@ -959,7 +1039,10 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
     var j = 0;
     while (j < npatch) {
         var boff = load64(&patch_off + j * 8);
-        var toff = load64(&laboff + load64(&patch_tgt + j * 8) * 8);
+        var tgt_id = load64(&patch_tgt + j * 8);
+        if (tgt_id <= 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        if (tgt_id >= cap_ids) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        var toff = load64(&laboff + tgt_id * 8);
         if (toff < 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
         var simm = (toff - (boff + 4)) / 4;
         var dw = load32(buf + boff);
@@ -979,15 +1062,26 @@ fn _cmp_isel_len(len): i64 {
     return len;
 }
 
-# 1 if the selected list uses the divergent-if EXEC mask (an s_and_saveexec) — the
-# driver then reserves the saved-EXEC SGPR pair and bumps the rsrc1 SGPR count.
-fn _cmp_has_exec_save(isel, ni): i64 {
+# The lowest saved-EXEC pair base the selected list uses (gfx9_isel's region stack: s[100:101]
+# at depth 0, s[98:99] at depth 1, ...), or 0 if it has no divergent control flow. The driver
+# caps regalloc below it and makes the rsrc1 SGPR count cover s101. (4.3.1 had one pair and
+# answered 1 / 0 here.)
+fn _cmp_exec_save_base(isel, ni): i64 {
+    var lo = 0;
     var i = 0;
     while (i < ni) {
-        if (gisel_op(isel, i) == GISEL_S_SAVEEXEC) { return 1; }
+        var op = gisel_op(isel, i);
+        var pair = 0;
+        if (op == GISEL_S_SAVEEXEC) { pair = 1; }
+        if (op == GISEL_S_LOOP_SAVE) { pair = 1; }
+        if (pair == 1) {
+            var base = gisel_a(isel, i);
+            if (lo == 0) { lo = base; }
+            if (base < lo) { lo = base; }
+        }
         i = i + 1;
     }
-    return 0;
+    return lo;
 }
 
 # ================================================================
@@ -1033,11 +1127,13 @@ fn gfx9_compile(ctx, spirv, n, isa, isa_len, desc): i64 {
     if (ar < 0) { return ar; }
     var alloc = load64(ctx + CC_ALLOC);
     var hw = load64(ctx + CC_HW);
-    # A divergent if reserves s[100:101] for the saved EXEC, so the regalloc must not
-    # allocate that high (cap drops to GFX9_EXEC_SAVE_SGPR).
-    var div_cf = _cmp_has_exec_save(isel, ni);
+    # Divergent ifs and loops reserve saved-EXEC pairs downward from s[100:101], one per nesting
+    # level, so the regalloc must stop below the deepest one.
+    var save_base = _cmp_exec_save_base(isel, ni);
+    var div_cf = 0;
+    if (save_base > 0) { div_cf = 1; }
     var scap = GFX9_SGPR_CAP;
-    if (div_cf == 1) { scap = GFX9_EXEC_SAVE_SGPR; }
+    if (div_cf == 1) { scap = save_base; }
     var rr = gfx9_regalloc(m, isel, ni, gfx9_abi_sgpr_base(abi), gfx9_abi_vgpr_base(abi),
       scap, GFX9_VGPR_CAP, alloc, load64(ctx + CC_ALLOC_LEN), hw);
     if (rr < 0) { return rr; }

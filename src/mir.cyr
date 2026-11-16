@@ -177,6 +177,13 @@ var MIR_OP_F32_DIV_FMAS   = 66;   # v_div_fmas_f32 (3-src; reads VCC for the pos
 var MIR_OP_F32_DIV_FIXUP  = 67;   # v_div_fixup_f32 (3-src; correctly-rounding fixup)
 var MIR_OP_F32_FMA_N0     = 68;   # v_fma_f32(-a, b, c) - NEGATE src0
 var MIR_OP_F32_FMA_N0_ONE = 69;   # v_fma_f32(-a, b, 1.0) - NEGATE src0 + inline-1.0 src2
+# v4.4.0 — OpSelect on an INTEGER-compare condition: a = cond (an ICMP result), b = true value,
+# c = false value. The compare leaves its result in SCC (uniform) or VCC (divergent), not in a
+# register, so the instruction that reads it is chosen in gfx9_isel, after the uniformity sweep:
+# v_cndmask_b32, s_cselect_b32, or s_cselect_b64 vcc + v_cndmask_b32. isel also re-emits the
+# compare when the flag may have been overwritten since. Not vector-only: uniformity is the
+# ordinary meet over cond and both values (outside every forced-DIVERGENT range).
+var MIR_OP_ISELECT        = 70;
 
 # Is `op` an integer compare? The ICMP opcodes are split across two ranges
 # (22-27 unsigned/equality, 32-35 signed), so a single range test would silently
@@ -225,6 +232,13 @@ var MIR_BLOCK_REC = 32;   # [first_instr, instr_count, label_id, terminator]
 var MIR_FLAG_A_IMM = 2;
 var MIR_FLAG_B_IMM = 4;
 var MIR_FLAG_C_IMM = 8;
+# v4.4.0 — a COND_BRANCH whose BACKWARD target (a loop header) needs phi copies has them as the
+# next N instructions, N in bits 8-15. Bit 16 / 17 says which target takes them. See
+# _spirv_lower_cond_branch; gfx9_isel places them on that edge.
+var MIR_CB_MOVES_SHIFT    = 8;
+var MIR_CB_MOVES_MAX      = 255;
+var MIR_CB_MOVES_ON_TRUE  = 0x10000;
+var MIR_CB_MOVES_ON_FALSE = 0x20000;
 
 # ================================================================
 # MirMod header (80 bytes; caller stack `var m[80]`)
@@ -447,6 +461,16 @@ fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
 }
 
 fn mir_n_instrs(m): i64 { return load64(m + 32); }
+
+# Rewrite instruction i's flags (the high half of its +24 slot). Used to annotate a branch
+# after the instructions that follow it are emitted (MIR_CB_MOVES_*). i must be < n_instrs.
+fn mir_set_instr_flags(m, i, flags): i64 {
+    if (i < 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (i >= load64(m + 32)) { return 0 - MIR_ERR_ID_OOR; }
+    var slot = load64(m + 8) + i * MIR_INSTR_REC + 24;
+    store64(slot, (load64(slot) & 0xFFFFFFFF) | ((flags & 0xFFFFFFFF) << 32));
+    return 0;
+}
 fn mir_instr_op(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 0); }
 fn mir_instr_result(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 8) & 0xFFFFFFFF; }
 fn mir_instr_type(m, i): i64 { return (load64(load64(m + 8) + i * MIR_INSTR_REC + 8) >> 32) & 0xFFFFFFFF; }

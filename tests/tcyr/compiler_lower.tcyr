@@ -687,19 +687,22 @@ fn test_spirv_lower_select_int_cond() {
     # f64 bfi path uses; callers test `< 0` for errors.
     assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m) >= 0, 1,
       "OpSelect with an adjacent divergent int compare lowers");
-    assert_eq(mir_n_instrs(&m), before + 1, "int-cond select is ONE instruction (no mask needed)");
-    assert_eq(mir_instr_op(&m, before), MIR_OP_CNDMASK, "lowers to CNDMASK (reads VCC)");
-    # ⚠ operand order: CNDMASK is `dst = VCC ? b : a`, so the FALSE value (obj2=8)
-    # must be in `a` and the TRUE value (obj1=7) in `b`. Reversing these inverts
-    # every select in the program and still compiles, so it is asserted directly.
-    assert_eq(mir_instr_a(&m, before), 8, "a = obj2 (the FALSE value)");
+    assert_eq(mir_n_instrs(&m), before + 1, "int-cond select is ONE MIR instruction");
+    # v4.4.0: lowering emits MIR_OP_ISELECT and gfx9_isel picks v_cndmask / s_cselect after the
+    # uniformity sweep (4.1.0 decided here, from a uniformity the sweep had not computed yet).
+    assert_eq(mir_instr_op(&m, before), MIR_OP_ISELECT, "lowers to ISELECT");
+    # ⚠ operand order: ISELECT is `cond ? b : c`. Reversing b and c inverts every select
+    # in the program and still compiles, so it is asserted directly.
+    assert_eq(mir_instr_a(&m, before), 6, "a = cond");
     assert_eq(mir_instr_b(&m, before), 7, "b = obj1 (the TRUE value)");
+    assert_eq(mir_instr_c(&m, before), 8, "c = obj2 (the FALSE value)");
     return 0;
 }
 
-# ⚠ VCC is one physical register. If anything is emitted between the compare and
-# the select, VCC may already have been overwritten and the select would read a
-# stale flag — silently choosing the wrong operand. That case must fail loud.
+# ⚠ VCC is one physical register. If anything is emitted between the compare and the select,
+# VCC may already have been overwritten. 4.1.0 refused this (LOWER_ERR_SELECT_NOT_ADJACENT);
+# since 4.4.0 it lowers to ISELECT and gfx9_isel re-emits the compare right before the select
+# (tests/tcyr/compiler_compile.tcyr checks the two v_cmps in the ISA).
 fn test_spirv_lower_select_int_cond_not_adjacent() {
     var buf[64];
     store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
@@ -725,14 +728,14 @@ fn test_spirv_lower_select_int_cond_not_adjacent() {
     mir_emit(&m, MIR_OP_ICMP_ULT, 6, MIR_T_U32, 3, 4, 0, 0);
     mir_emit(&m, MIR_OP_IADD, 10, MIR_T_U32, 3, 4, 0, 0);   # <- intervening instruction
     mir_run_uniformity(&m);
-    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
-      0 - LOWER_ERR_SELECT_NOT_ADJACENT, "non-adjacent int compare fails loud");
+    var at = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m) >= 0, 1, "a non-adjacent int compare lowers");
+    assert_eq(mir_instr_op(&m, at), MIR_OP_ISELECT, "to ISELECT (isel re-emits the compare)");
     return 0;
 }
 
-# A UNIFORM integer compare writes SCC, not VCC — v_cndmask_b32 would read a VCC
-# nobody wrote. Named separately from the adjacency case because the consumer fix
-# is different (restructure vs. make the condition per-lane).
+# A UNIFORM integer compare writes SCC, not VCC. 4.1.0 refused it (LOWER_ERR_SELECT_UNIFORM_COND);
+# since 4.4.0 gfx9_isel selects s_cselect_b32 (uniform result) or s_cselect_b64 vcc + v_cndmask.
 fn test_spirv_lower_select_int_cond_uniform() {
     var buf[64];
     store32(&buf + 0, 0x07230203); store32(&buf + 12, 16);
@@ -757,8 +760,9 @@ fn test_spirv_lower_select_int_cond_uniform() {
     mir_set_const(&m, 8, MIR_T_U32, 222);
     mir_emit(&m, MIR_OP_ICMP_ULT, 6, MIR_T_U32, 3, 4, 0, 0);
     mir_run_uniformity(&m);
-    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m),
-      0 - LOWER_ERR_SELECT_UNIFORM_COND, "uniform int compare fails loud (SCC, not VCC)");
+    var at = mir_n_instrs(&m);
+    assert_eq(_spirv_lower_select(&buf, 5, 6, &types, &m) >= 0, 1, "a uniform int compare lowers");
+    assert_eq(mir_instr_op(&m, at), MIR_OP_ISELECT, "to ISELECT (isel picks s_cselect)");
     return 0;
 }
 
@@ -1730,7 +1734,7 @@ fn test_spirv_lower_untrusted_ids_bounded() {
     store32(&ph + 28, (5 << 16) | SPIRV_OP_PHI);
     store32(&ph + 32, 3); store32(&ph + 36, 0x7FFFFFF0);
     store32(&ph + 40, 1); store32(&ph + 44, 7);
-    assert_eq(_spirv_emit_phi_moves(&ph, 48, 7, 9, &m), 0 - MIR_ERR_ID_OOR,
+    assert_eq(_spirv_emit_phi_moves(&ph, 48, 7, 9, &m, &types), 0 - MIR_ERR_ID_OOR,
       "phi move into a forward block with an out-of-range result fails loud");
     assert_eq(_spirv_val_type(&m, 0), MIR_T_VOID, "id 0 -> VOID");
     assert_eq(_spirv_val_type(&m, 40), MIR_T_VOID, "id == cap_ids -> VOID");

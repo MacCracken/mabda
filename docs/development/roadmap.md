@@ -117,11 +117,19 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   `build/logs/test-native-all-20261116-123553.log`). **Open:** ranga's `tests/gpu_spirv.tcyr`
   calls the table builders with the old 5-argument form and now fails to compile; it needs the
   4-argument call. That is ranga's repo, and it rides with the ranga consumer run below.
-- **The compiler limits v4.1.0 left named** (each refused with a code today, never miscompiled):
-  nested divergent ifs (`GISEL_ERR_NESTED_SELECTION`: a region stack in `gfx9_isel` and a second
-  saved-EXEC pair, against the SGPR budget); `OpSelect` with a non-adjacent integer compare
-  (`LOWER_ERR_SELECT_NOT_ADJACENT`: materialize the 0/-1 mask at the compare) and with a uniform
-  condition (`LOWER_ERR_SELECT_UNIFORM_COND`: `s_cselect_b32`); the same in N9's SM75 path.
+- ✅ **The compiler limits v4.1.0 left named**, AMD half. It landed uncommitted (CHANGELOG
+  [4.4.0]). Nested divergent ifs use a region stack in `gfx9_isel` with one saved-EXEC pair per
+  level, up to 8. Int-compare `OpSelect` uses `s_cselect_b32` for a uniform condition and
+  re-emits a non-adjacent compare. The "never miscompiled" premise was false next door, and the
+  same work fixed those miscompiles: divergent if/else dropped its else block; a branch read a
+  stale SCC/VCC; divergent loops lost early-exiting lanes; phi copies were missing on conditional
+  edges (a do-while hung the GPU); swapped phis lost a value; f64 phis copied one dword; a dead
+  load's register was reused while the load was in flight; the v4.1.0 int-compare select never
+  worked; and a label id past `id_bound` wrote off the stack (HIGH). 24 generated kernels
+  (`tests/spirv/control_flow/`) are checked lane by lane by `test-native-spirv-control-flow-e2e`.
+  **Open:** the same in N9's SM75 path (rides with N9 above). Still refused with a named code:
+  a `break` out of a divergent if nested inside a divergent loop (a `continue` there compiles, as
+  an if/else merging at the latch), a return inside a divergent region, and nesting deeper than 8.
 - **NVIDIA block-linear scanout + ADDFB2 format modifiers.** The nouveau present slots
   (`_nv_surface_alloc_fb`) scan out a LINEAR VRAM BO with modifier 0 (ADR 007 Fork 4);
   block-linear needs ADDFB2 with `DRM_MODE_FB_MODIFIERS` and an NVIDIA block-linear

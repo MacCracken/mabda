@@ -114,8 +114,11 @@ var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450
 # v4.1.0 — OpSelect on an integer-compare condition (ranga M6). Split out of the
 # generic MIR_ERR_UNSUPPORTED_OP so the two distinct reasons a select can be
 # rejected are distinguishable by a consumer reading gpu_shader_error_name.
-var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # int-compare cond, but VCC no longer live at the select
-var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # int-compare cond is UNIFORM (SCC, not VCC)
+# ⚠ Neither is returned since v4.4.0: int-compare selects lower to MIR_OP_ISELECT and gfx9_isel
+# handles both cases (it re-emits a stale compare; a uniform condition uses s_cselect). The codes
+# and their gpu_shader_error_name strings stay so a consumer comparing against them still builds.
+var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # (retired 4.4.0) int-compare cond, VCC no longer live
+var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # (retired 4.4.0) int-compare cond is UNIFORM (SCC)
 # v4.4.0 — the scratch-buffer contract: out_bi[] (out_bi_len bytes) holds fewer
 # than id_bound i64 records, so the builtin side-table would be written past it.
 var LOWER_ERR_OUTBI_SHORT = 35;
@@ -377,10 +380,10 @@ fn _spirv_lower_fcmp(m, vopc, a, b, result): i64 {
     return 0;
 }
 
-# OpSelect(result, cond, obj1, obj2) → obj1 if cond true else obj2, via v_bfi_b32 (MIR_OP_SELECT).
-# `cond` must be a 0/-1 MASK — i.e. the result of an OpFOrd* compare (F.7f.8). f64-const obj1/obj2
-# are materialized to VGPR pairs first. (A non-mask cond — e.g. from an integer compare, which lowers
-# to VCC/SCC not a mask value — is not supported here; that needs a unified bool representation.)
+# OpSelect(result, cond, obj1, obj2) → obj1 if cond true else obj2. Two condition kinds:
+#   - a 0/-1 MASK from an OpFOrd* compare (F.7f.8) → MIR_OP_SELECT, a v_bfi_b32 blend;
+#   - an integer compare (v4.4.0) → MIR_OP_ISELECT, whose instruction gfx9_isel picks.
+# f64-const obj1/obj2 are materialized to VGPR pairs first. Anything else fails loud.
 fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
     if (wc < 6) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
@@ -394,41 +397,39 @@ fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
     if (cond == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     if (cond >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
     if (mir_val_kind(m, cond) != MIR_VK_SSA) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-    # v4.1.0 — INTEGER-compare condition (ranga M6). An OpFOrd* compare leaves a
-    # 0/-1 MASK (MIR_T_BOOL) that v_bfi_b32 blends; an INTEGER compare leaves its
-    # result in VCC with no mask register, which is why this was rejected outright
-    # and why ranga hand-rolls `d = (b1-1-v1) | (b2-1-v2); d < 0x80000000` instead.
+    # INTEGER-compare condition (ranga M6, v4.1.0; reworked v4.4.0). An OpFOrd* compare
+    # leaves a 0/-1 MASK (MIR_T_BOOL) that v_bfi_b32 blends; an INTEGER compare leaves its
+    # result in a FLAG — SCC when uniform, VCC when divergent — with no register at all.
     #
-    # ⭐ But VCC is exactly what v_cndmask_b32 reads, so when the compare is still
-    # the most recent instruction the select is ONE instruction — no mask needed at
-    # all: `result = VCC ? obj1 : obj2`.
+    # ⛔ v4.1.0 decided the flag here, from mir_val_unif(cond) and from whether the compare
+    # was the last instruction emitted. Both are wrong at this point: the uniformity sweep
+    # runs AFTER lowering (spirv_lower_module), so every compare still read MIR_UNKNOWN and
+    # every int-compare select failed as LOWER_ERR_SELECT_UNIFORM_COND — the adjacent
+    # divergent case v4.1.0 shipped as supported included. Its unit tests passed only
+    # because they ran mir_run_uniformity by hand before calling this.
     #
-    # ⚠ ADJACENCY IS THE WHOLE CORRECTNESS ARGUMENT. VCC is a single physical
-    # register; anything emitted between the compare and the select may overwrite
-    # it, and a stale VCC selects silently and wrongly. So this path is taken ONLY
-    # when the compare is literally the last MIR instruction emitted, and any other
-    # arrangement fails loud with a named reason rather than guessing.
+    # So lowering only checks the SHAPE (cond is an integer compare) and emits
+    # MIR_OP_ISELECT; gfx9_isel picks the instruction once uniformity and the final order
+    # are known, re-emitting the compare when its flag may be stale. LOWER_ERR_SELECT_*
+    # are no longer returned.
     if (mir_type_base(mir_val_type(m, cond)) != MIR_T_BOOL) {
         var cdef = mir_val_def(m, cond);
         if (cdef < 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         # ⚠ Bound `cdef` before dereferencing it. A value can carry a def index that
         # is not (yet) a live instruction — a hand-built module, or an id seeded
         # without emitting — and mir_mod_init memsets only vals[], NOT instrs[], so
-        # reading past n_instrs returns STACK GARBAGE. That garbage landed inside the
-        # ICMP opcode range during this test's first run and took the adjacent-compare
-        # path on a module with zero instructions.
+        # reading past n_instrs returns STACK GARBAGE.
         if (cdef >= mir_n_instrs(m)) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         if (mir_op_is_icmp(mir_instr_op(m, cdef)) == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        # A UNIFORM compare writes SCC, not VCC; v_cndmask_b32 would read a VCC
-        # nobody wrote. Uniform selects need s_cselect_b32, which is separate work.
-        if (mir_val_unif(m, cond) != MIR_DIVERGENT) { return 0 - LOWER_ERR_SELECT_UNIFORM_COND; }
-        if (cdef != mir_n_instrs(m) - 1) { return 0 - LOWER_ERR_SELECT_NOT_ADJACENT; }
+        if (mir_instr_result(m, cdef) != cond) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var tx = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (tx < 0) { return tx; }
         var ty = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (ty < 0) { return ty; }
-        # MIR_OP_CNDMASK is `dst = VCC ? b : a` — a is the FALSE value, b the TRUE
-        # one, so obj2 goes in `a` and obj1 in `b`. Getting this backwards inverts
-        # every select and still compiles.
-        return mir_emit(m, MIR_OP_CNDMASK, result, rty, ty, tx, 0, 0);
+        if (tx == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (ty == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (tx >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        if (ty >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        # a = cond, b = obj1 (TRUE), c = obj2 (FALSE).
+        return mir_emit(m, MIR_OP_ISELECT, result, rty, cond, tx, ty, 0);
     }
     var x = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (x < 0) { return x; }   # obj1 (true)
     var y = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (y < 0) { return y; }   # obj2 (false)
@@ -1140,16 +1141,26 @@ fn _spirv_find_label(ptr, byte_len, label_id): i64 {
 #
 # SPIR-V guarantees OpPhi instructions come FIRST in their block, so the scan stops
 # at the first non-phi.
-fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
+fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m, types): i64 {
     var lb = _spirv_find_label(ptr, byte_len, to_label);
     if (lb < 0) { return 0; }
+    # v4.4.0 — the copies are a PARALLEL copy: every phi reads its source as it was BEFORE any
+    # of them is written. Emitted one after another, a phi whose source is another phi of the
+    # same block (a swap: a = phi(.., b), b = phi(.., a)) read the value just written — the
+    # probe's swapped pair came back (2, 2) instead of (2, 1). So: collect the pairs, and if any
+    # source is one of the results being written, copy every source to a temporary first.
+    var res[512];    # up to 64 phis per edge (result, source, MIR type)
+    var srcs[512];
+    var tys[512];
+    var np = 0;
+    var idb = spirv_hdr_id_bound(ptr);
     var total = byte_len / 4;
     var off = lb + spirv_op_wordcount(spirv_word(ptr, lb));
     while (off < total) {
         var w0 = spirv_word(ptr, off);
         var wc = spirv_op_wordcount(w0);
         if (wc == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        if (spirv_op(w0) != SPIRV_OP_PHI) { return 0; }
+        if (spirv_op(w0) != SPIRV_OP_PHI) { off = total; continue; }
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var result = spirv_word(ptr, off + 2);
         # The target block's OpPhi may not be lowered yet (a forward branch), so its result
@@ -1160,15 +1171,140 @@ fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
         var k = 3;
         while (k + 1 < wc) {
             if (spirv_word(ptr, off + k + 1) == from_label) {
-                var src = spirv_word(ptr, off + k);
-                var e = mir_emit(m, MIR_OP_VMOV, result, mir_val_type(m, result), src, 0, 0, 0);
-                if (e < 0) { return e; }
+                if (np >= 64) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+                store64(&res + np * 8, result);
+                store64(&srcs + np * 8, spirv_word(ptr, off + k));
+                # The phi's own result type (word 1): it may not be lowered yet on a forward edge.
+                var pty = _mir_lower_type(types, spirv_word(ptr, off + 1), idb);
+                if (pty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                if (mir_type_count(pty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                store64(&tys + np * 8, pty);
+                np = np + 1;
                 k = wc;
             }
             k = k + 2;
         }
         off = off + wc;
     }
+    # Does any copy read a value another copy of this edge writes?
+    var clash = 0;
+    var i = 0;
+    while (i < np) {
+        var j = 0;
+        while (j < np) {
+            if (load64(&srcs + i * 8) == load64(&res + j * 8)) { clash = 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < np) {
+        var r = load64(&res + i * 8);
+        var sv = load64(&srcs + i * 8);
+        # The phi's type is its own: an f64 phi copies a register PAIR (the encoder moves both
+        # halves for an f64 VMOV), and an f64 constant source is materialized into one first.
+        var ty = load64(&tys + i * 8);
+        if (mir_type_base(ty) == MIR_T_F64) {
+            sv = _spirv_f64_arg(m, sv);
+            if (sv < 0) { return sv; }
+        }
+        if (clash == 1) {
+            var tmp = mir_alloc_synth_id(m);
+            if (tmp < 0) { return 0 - MIR_ERR_ID_OOR; }
+            var et = mir_emit(m, MIR_OP_VMOV, tmp, ty, sv, 0, 0, 0);
+            if (et < 0) { return et; }
+            sv = tmp;
+        }
+        store64(&srcs + i * 8, sv);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < np) {
+        var r2 = load64(&res + i * 8);
+        var e = mir_emit(m, MIR_OP_VMOV, r2, load64(&tys + i * 8), load64(&srcs + i * 8), 0, 0, 0);
+        if (e < 0) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1 if label `l`'s OpLabel comes before stream word `off` — a branch at `off` to it is a
+# back-edge (the stream is lowered in order, so that block was already lowered).
+fn _spirv_label_before(ptr, off, l): i64 {
+    var lb = _spirv_find_label(ptr, off * 4, l);
+    if (lb < 0) { return 0; }
+    return 1;
+}
+
+# OpBranchConditional %cond %true %false (v4.4.0: with its phi copies). The copies a target's
+# OpPhi needs on THIS edge were never emitted before 4.4.0 — only OpBranch emitted them — so a
+# phi fed by a conditional edge kept a stale value: a do-while counter whose latch is a
+# conditional back-edge never advanced (the probe kernel hung the GPU), and an if-merge phi
+# read garbage on the path that skipped the then-block. Where each edge's copies go:
+#   - a FORWARD target's copies run BEFORE the branch, so on both paths. That is safe: the phi
+#     result is defined at that block and dominated by it, and every other path into the block
+#     copies again on its own edge before anything reads it;
+#   - the BACKWARD target's (a loop header, via its latch) must run on the continuing path only,
+#     or they would clobber the loop variable the exit path still reads. They are emitted AFTER
+#     the branch, and the branch's flags carry their count (MIR_CB_MOVES_SHIFT) and which target
+#     takes them; gfx9_isel places them after the exit test, before the back-edge s_branch.
+# Two backward targets that both need copies cannot be split this way and fail loud.
+fn _spirv_lower_cond_branch(ptr, off, cond, tb, tc, m, types): i64 {
+    var bb = _spirv_label_before(ptr, off, tb);
+    var bc = _spirv_label_before(ptr, off, tc);
+    if (bb == 0) {
+        var pb = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tb, m, types);
+        if (pb < 0) { return pb; }
+    }
+    if (bc == 0) {
+        if (tc != tb) {
+            var pc = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tc, m, types);
+            if (pc < 0) { return pc; }
+        }
+    }
+    var fl = MIR_FLAG_B_IMM | MIR_FLAG_C_IMM;
+    var bi = mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, cond, tb, tc, fl);
+    if (bi < 0) { return bi; }
+    var back = 0;
+    var which = 0;
+    if (bb == 1) { back = tb; which = MIR_CB_MOVES_ON_TRUE; }
+    if (bc == 1) {
+        if (back != 0) {
+            if (tc != tb) {
+                # Both targets backward: only fine if neither needs a copy.
+                var n0 = mir_n_instrs(m);
+                var pt = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tb, m, types);
+                if (pt < 0) { return pt; }
+                var pf = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tc, m, types);
+                if (pf < 0) { return pf; }
+                if (mir_n_instrs(m) != n0) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+                return bi;
+            }
+        }
+        back = tc;
+        which = MIR_CB_MOVES_ON_FALSE;
+    }
+    if (back == 0) { return bi; }
+    var before = mir_n_instrs(m);
+    var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, back, m, types);
+    if (pm < 0) { return pm; }
+    var nm = mir_n_instrs(m) - before;
+    if (nm == 0) { return bi; }
+    if (nm > MIR_CB_MOVES_MAX) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    mir_set_instr_flags(m, bi, fl | which | (nm << MIR_CB_MOVES_SHIFT));
+    return bi;
+}
+
+# A label <id> (OpLabel, or a branch target) must be a real id: non-zero and below the header's
+# id_bound, as the SPIR-V spec requires of every id. ⛔ Nothing checked this before v4.4.0, and
+# gfx9_emit_program indexes its 256-entry label-offset table by it: a crafted module with a label
+# id past id_bound (which spirv_validate_stream, a structural check only, lets through) wrote the
+# ISA position to `&laboff + id * 8`, off the compile frame's stack. Reachable from
+# gpu_shader_module_create_spirv; a 5000 crashed the probe. id_bound <= cap_ids <= 256 by the
+# time lowering runs, so this bound also keeps every label inside isel's and the emitter's tables.
+fn _spirv_check_label(ptr, id): i64 {
+    if (id <= 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (id >= spirv_hdr_id_bound(ptr)) { return 0 - MIR_ERR_ID_OOR; }
     return 0;
 }
 
@@ -1204,6 +1340,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # forward if, so emitting it would shift every straight-line kernel's MIR.
     if (op == SPIRV_OP_LABEL) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var lr = _spirv_check_label(ptr, spirv_word(ptr, off + 1));  if (lr < 0) { return lr; }
         _lower_cur_label = spirv_word(ptr, off + 1);
         if (mir_n_instrs(m) == 0) { return 0; }
         return mir_emit(m, MIR_OP_LABEL, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
@@ -1215,7 +1352,8 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_BRANCH) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var tgt = spirv_word(ptr, off + 1);
-        var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tgt, m);
+        var tr = _spirv_check_label(ptr, tgt);  if (tr < 0) { return tr; }
+        var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tgt, m, types);
         if (pm < 0) { return pm; }
         return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, tgt, 0, 0, MIR_FLAG_A_IMM);
     }
@@ -1223,8 +1361,11 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # fall-through then), c = false (the merge); b/c are labels (immediate tags).
     if (op == SPIRV_OP_BRANCH_CONDITIONAL) {
         if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        return mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1),
-          spirv_word(ptr, off + 2), spirv_word(ptr, off + 3), MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+        var tb = spirv_word(ptr, off + 2);
+        var tc = spirv_word(ptr, off + 3);
+        var t1 = _spirv_check_label(ptr, tb);  if (t1 < 0) { return t1; }
+        var t2 = _spirv_check_label(ptr, tc);  if (t2 < 0) { return t2; }
+        return _spirv_lower_cond_branch(ptr, off, spirv_word(ptr, off + 1), tb, tc, m, types);
     }
     if (op == SPIRV_OP_RETURN) {
         var er = mir_emit(m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);

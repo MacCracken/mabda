@@ -873,6 +873,22 @@ build/native_spirv_saxpy_e2e: programs/native_spirv_saxpy_e2e.cyr src/*.cyr
 test-native-spirv-saxpy-e2e: build/native_spirv_saxpy_e2e
 	./build/native_spirv_saxpy_e2e
 
+# v4.4.0 — structured control flow + int-compare OpSelect on silicon: divergent if / else,
+# nesting, divergent loops, stale-flag conditions, and the shapes that must be refused. The
+# kernels are generated (scripts/gen-spirv-cf-fixtures.py); every lane is checked.
+build/native_spirv_control_flow_e2e: programs/native_spirv_control_flow_e2e.cyr src/*.cyr tests/tcyr/spirv_cf_kernels.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_spirv_control_flow_e2e.cyr $@
+
+.PHONY: test-native-spirv-control-flow-e2e
+test-native-spirv-control-flow-e2e: build/native_spirv_control_flow_e2e
+	./build/native_spirv_control_flow_e2e
+
+# The generated control-flow fixture must match its SPIR-V sources (needs spirv-as / spirv-val).
+.PHONY: check-cf-fixtures
+check-cf-fixtures:
+	@./scripts/gen-spirv-cf-fixtures.py --check
+
 # v3.2 F.7e — the first COMPILED f64 on silicon: an f64 FMA SPIR-V kernel compiled in-tree
 # (gfx9_compile) + dispatched on Cezanne, bit-exact vs the fused-FMA reference.
 build/native_spirv_f64_fma_e2e: programs/native_spirv_f64_fma_e2e.cyr src/*.cyr

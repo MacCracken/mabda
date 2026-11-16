@@ -1,0 +1,149 @@
+# programs/native_spirv_control_flow_e2e.cyr — v4.4.0: structured control flow and int-compare
+# OpSelect, compiled in-tree and run on the native AMD backend through the PUBLIC gpu_* API.
+#
+# Every kernel in tests/tcyr/spirv_cf_kernels.cyr (generated from tests/spirv/control_flow/ by
+# scripts/gen-spirv-cf-fixtures.py) goes through gpu_shader_module_create_spirv +
+# gpu_compute_dispatch: binding 0 = a[64] seeded a[i] = i, binding 1 = o[64] seeded 0xDEADBEEF,
+# one 64-lane workgroup. A "want" kernel must produce its 64 expected values exactly; a "refuse"
+# kernel must be rejected at module create with exactly its code (gpu_last_shader_error).
+#
+# Four of these compiled on 4.3.1 and produced WRONG results with no error — if_else_div (the
+# else block never ran), if_vcc_clobbered / if_scc_clobbered_taken (the branch read a stale
+# flag), loop_div (lanes that left a divergent loop early lost the code after it) — and
+# loop_do_while hung the GPU. oob_label crashed the compile frame.
+#
+# Exit: 0 = every kernel right; 3 = context; 5 / 6 = buffer setup; 11 = any kernel wrong.
+
+include "src/lib.cyr"
+include "tests/tcyr/spirv_cf_kernels.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# Seed both buffers, run kernel `shmod`, compare o[] to want[]. Returns the number of wrong lanes
+# (printing the first few), or -1 if the dispatch failed.
+fn run_one(ctx, shmod, a_map, o_map, bp, want): i64 {
+    var i = 0;
+    while (i < 64) {
+        store32(a_map + i * 4, i);
+        store32(o_map + i * 4, 0xDEADBEEF);
+        i = i + 1;
+    }
+    var rc = gpu_compute_dispatch(ctx, shmod, 1, 1, 1, bp);
+    if (rc != 0) { print_cstr("dispatch rc="); print_i64(rc); print_cstr(" "); return 0 - 1; }
+    var bad = 0;
+    i = 0;
+    while (i < 64) {
+        var got = load32(o_map + i * 4);
+        var exp = load32(want + i * 4);
+        if (got != exp) {
+            if (bad < 3) {
+                print_cstr("o["); print_i64(i); print_cstr("]="); print_i64(got);
+                print_cstr(" want "); print_i64(exp); print_cstr(" ");
+            }
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native SPIR-V control flow e2e (v4.4.0) — ifs, if/else, nesting, loops, selects\n");
+    print_cstr("------------------------------------------------------------------------------------\n");
+    var ctx_res_tag, ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_res_tag) == 1) { return 3; }
+    var ctx = ctx_res;
+    var fd = native_ctx_fd(ctx);
+
+    var ab[16];
+    if (native_bo_create_gtt(fd, 4096, &ab) != 0) { return 5; }
+    var a_handle = load64(&ab + 0);
+    var a_map = load64(&ab + 8);
+    var a_va = 0xFFFF800100400000;
+    if (native_gem_va_map(fd, a_handle, a_va, 4096, _NATIVE_PERM_DATA) != 0) { return 5; }
+    var ob[16];
+    if (native_bo_create_gtt(fd, 4096, &ob) != 0) { return 6; }
+    var o_handle = load64(&ob + 0);
+    var o_map = load64(&ob + 8);
+    var o_va = 0xFFFF800100800000;
+    if (native_gem_va_map(fd, o_handle, o_va, 4096, _NATIVE_PERM_DATA) != 0) { return 6; }
+    var bp[40];
+    store64(&bp + 0, 2);
+    store64(&bp + 8, a_handle);
+    store64(&bp + 16, a_va);
+    store64(&bp + 24, o_handle);
+    store64(&bp + 32, o_va);
+
+    var spv[1680];       # CFK_MAX_BYTES
+    var want[256];       # 64 u32
+    var pass = 0;
+    var fail = 0;
+    var k = 0;
+    while (k < CFK_COUNT) {
+        var n = cfk_build(k, &spv);
+        print_cstr("  ");
+        print_cstr(cfk_name(k));
+        print_cstr(": ");
+        var refuse = cfk_refuse(k);
+        var shmod = gpu_shader_module_create_spirv(ctx, &spv, n);
+        if (refuse != 0) {
+            if (shmod != 0) {
+                print_cstr("FAIL — compiled, must be refused with ");
+                print_cstr(gpu_shader_error_name(refuse)); print_cstr("\n");
+                gpu_shader_module_release(ctx, shmod);
+                fail = fail + 1;
+            } else {
+                var got = gpu_last_shader_error();
+                if (got == refuse) {
+                    print_cstr("refused — "); print_cstr(gpu_shader_error_name(got)); print_cstr("\n");
+                    pass = pass + 1;
+                } else {
+                    print_cstr("FAIL — refused with "); print_cstr(gpu_shader_error_name(got));
+                    print_cstr(", want "); print_cstr(gpu_shader_error_name(refuse)); print_cstr("\n");
+                    fail = fail + 1;
+                }
+            }
+        } else {
+            if (shmod == 0) {
+                print_cstr("FAIL — create_spirv returned 0: ");
+                print_cstr(gpu_shader_error_name(gpu_last_shader_error())); print_cstr("\n");
+                fail = fail + 1;
+            } else {
+                cfk_want(k, &want);
+                var bad = run_one(ctx, shmod, a_map, o_map, &bp, &want);
+                if (bad == 0) {
+                    print_cstr("64/64 lanes\n");
+                    pass = pass + 1;
+                } else {
+                    print_cstr("FAIL — "); print_i64(bad); print_cstr(" lanes wrong\n");
+                    fail = fail + 1;
+                }
+                gpu_shader_module_release(ctx, shmod);
+            }
+        }
+        k = k + 1;
+    }
+
+    native_gem_va_unmap(fd, o_handle, o_va, 4096);
+    native_bo_release_gtt(fd, o_handle, o_map, 4096);
+    native_gem_va_unmap(fd, a_handle, a_va, 4096);
+    native_bo_release_gtt(fd, a_handle, a_map, 4096);
+    gpu_context_release(ctx);
+
+    print_cstr("control flow: "); print_i64(pass); print_cstr(" passed, "); print_i64(fail);
+    print_cstr(" failed (of "); print_i64(CFK_COUNT); print_cstr(")\n");
+    if (fail != 0) { return 11; }
+    print_cstr("OK — every control-flow kernel ran right on Cezanne\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

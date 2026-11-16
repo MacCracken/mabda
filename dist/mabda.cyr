@@ -9219,11 +9219,18 @@ var GFX9_SOP2_S_MUL_I32     = 0x24;
 # 64-bit EXEC-mask ops for divergent control flow (N.7). llvm-mc gfx900-verified.
 var GFX9_SOP2_S_OR_B64      = 0x0F;
 var GFX9_SOP2_S_ANDN2_B64   = 0x13;
+# v4.4.0 — structured control flow + scalar select. llvm-mc gfx90c-verified (the encodings are
+# asserted dword-for-dword in tests/tcyr/compiler_backend.tcyr).
+var GFX9_SOP2_S_CSELECT_B32 = 0x0A;   # sdst = SCC ? ssrc0 : ssrc1
+var GFX9_SOP2_S_CSELECT_B64 = 0x0B;   # `s_cselect_b64 vcc, -1, 0`: SCC -> a full VCC lane mask
+var GFX9_SOP2_S_AND_B64     = 0x0D;   # loop exit: EXEC &= VCC (lanes that stay)
+var GFX9_SOP2_S_XOR_B64     = 0x11;   # if / else: saved ^= EXEC; EXEC ^= saved
 
 # SOP1 (single-dword) — bits 15-8 opcode.
 var GFX9_SOP1_S_MOV_B32           = 0x00;
 var GFX9_SOP1_S_MOV_B64           = 0x01;   # N.7: save/restore EXEC (64-bit)
 var GFX9_SOP1_S_AND_SAVEEXEC_B64  = 0x20;   # N.7: divergent if — mask EXEC, save old
+var GFX9_SOP1_S_OR_SAVEEXEC_B64   = 0x21;   # v4.4.0: else — sdst = EXEC; EXEC |= ssrc0
 
 # SOPP (single-dword) — bits 22-16 opcode.
 var GFX9_SOPP_S_NOP             = 0x00;
@@ -10015,6 +10022,13 @@ var MIR_OP_F32_DIV_FMAS   = 66;   # v_div_fmas_f32 (3-src; reads VCC for the pos
 var MIR_OP_F32_DIV_FIXUP  = 67;   # v_div_fixup_f32 (3-src; correctly-rounding fixup)
 var MIR_OP_F32_FMA_N0     = 68;   # v_fma_f32(-a, b, c) - NEGATE src0
 var MIR_OP_F32_FMA_N0_ONE = 69;   # v_fma_f32(-a, b, 1.0) - NEGATE src0 + inline-1.0 src2
+# v4.4.0 — OpSelect on an INTEGER-compare condition: a = cond (an ICMP result), b = true value,
+# c = false value. The compare leaves its result in SCC (uniform) or VCC (divergent), not in a
+# register, so the instruction that reads it is chosen in gfx9_isel, after the uniformity sweep:
+# v_cndmask_b32, s_cselect_b32, or s_cselect_b64 vcc + v_cndmask_b32. isel also re-emits the
+# compare when the flag may have been overwritten since. Not vector-only: uniformity is the
+# ordinary meet over cond and both values (outside every forced-DIVERGENT range).
+var MIR_OP_ISELECT        = 70;
 
 # Is `op` an integer compare? The ICMP opcodes are split across two ranges
 # (22-27 unsigned/equality, 32-35 signed), so a single range test would silently
@@ -10063,6 +10077,13 @@ var MIR_BLOCK_REC = 32;   # [first_instr, instr_count, label_id, terminator]
 var MIR_FLAG_A_IMM = 2;
 var MIR_FLAG_B_IMM = 4;
 var MIR_FLAG_C_IMM = 8;
+# v4.4.0 — a COND_BRANCH whose BACKWARD target (a loop header) needs phi copies has them as the
+# next N instructions, N in bits 8-15. Bit 16 / 17 says which target takes them. See
+# _spirv_lower_cond_branch; gfx9_isel places them on that edge.
+var MIR_CB_MOVES_SHIFT    = 8;
+var MIR_CB_MOVES_MAX      = 255;
+var MIR_CB_MOVES_ON_TRUE  = 0x10000;
+var MIR_CB_MOVES_ON_FALSE = 0x20000;
 
 # ================================================================
 # MirMod header (80 bytes; caller stack `var m[80]`)
@@ -10285,6 +10306,16 @@ fn mir_emit(m, op, result, type, a, b, c, flags): i64 {
 }
 
 fn mir_n_instrs(m): i64 { return load64(m + 32); }
+
+# Rewrite instruction i's flags (the high half of its +24 slot). Used to annotate a branch
+# after the instructions that follow it are emitted (MIR_CB_MOVES_*). i must be < n_instrs.
+fn mir_set_instr_flags(m, i, flags): i64 {
+    if (i < 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (i >= load64(m + 32)) { return 0 - MIR_ERR_ID_OOR; }
+    var slot = load64(m + 8) + i * MIR_INSTR_REC + 24;
+    store64(slot, (load64(slot) & 0xFFFFFFFF) | ((flags & 0xFFFFFFFF) << 32));
+    return 0;
+}
 fn mir_instr_op(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 0); }
 fn mir_instr_result(m, i): i64 { return load64(load64(m + 8) + i * MIR_INSTR_REC + 8) & 0xFFFFFFFF; }
 fn mir_instr_type(m, i): i64 { return (load64(load64(m + 8) + i * MIR_INSTR_REC + 8) >> 32) & 0xFFFFFFFF; }
@@ -10595,8 +10626,11 @@ var LOWER_ERR_EXT_SET       = 29;   # an OpExtInst references a non-GLSL.std.450
 # v4.1.0 — OpSelect on an integer-compare condition (ranga M6). Split out of the
 # generic MIR_ERR_UNSUPPORTED_OP so the two distinct reasons a select can be
 # rejected are distinguishable by a consumer reading gpu_shader_error_name.
-var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # int-compare cond, but VCC no longer live at the select
-var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # int-compare cond is UNIFORM (SCC, not VCC)
+# ⚠ Neither is returned since v4.4.0: int-compare selects lower to MIR_OP_ISELECT and gfx9_isel
+# handles both cases (it re-emits a stale compare; a uniform condition uses s_cselect). The codes
+# and their gpu_shader_error_name strings stay so a consumer comparing against them still builds.
+var LOWER_ERR_SELECT_NOT_ADJACENT = 33;  # (retired 4.4.0) int-compare cond, VCC no longer live
+var LOWER_ERR_SELECT_UNIFORM_COND = 34;  # (retired 4.4.0) int-compare cond is UNIFORM (SCC)
 # v4.4.0 — the scratch-buffer contract: out_bi[] (out_bi_len bytes) holds fewer
 # than id_bound i64 records, so the builtin side-table would be written past it.
 var LOWER_ERR_OUTBI_SHORT = 35;
@@ -10858,10 +10892,10 @@ fn _spirv_lower_fcmp(m, vopc, a, b, result): i64 {
     return 0;
 }
 
-# OpSelect(result, cond, obj1, obj2) → obj1 if cond true else obj2, via v_bfi_b32 (MIR_OP_SELECT).
-# `cond` must be a 0/-1 MASK — i.e. the result of an OpFOrd* compare (F.7f.8). f64-const obj1/obj2
-# are materialized to VGPR pairs first. (A non-mask cond — e.g. from an integer compare, which lowers
-# to VCC/SCC not a mask value — is not supported here; that needs a unified bool representation.)
+# OpSelect(result, cond, obj1, obj2) → obj1 if cond true else obj2. Two condition kinds:
+#   - a 0/-1 MASK from an OpFOrd* compare (F.7f.8) → MIR_OP_SELECT, a v_bfi_b32 blend;
+#   - an integer compare (v4.4.0) → MIR_OP_ISELECT, whose instruction gfx9_isel picks.
+# f64-const obj1/obj2 are materialized to VGPR pairs first. Anything else fails loud.
 fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
     if (wc < 6) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     var rty = _mir_lower_type(types, spirv_word(ptr, off + 1), spirv_hdr_id_bound(ptr));
@@ -10875,41 +10909,39 @@ fn _spirv_lower_select(ptr, off, wc, types, m): i64 {
     if (cond == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
     if (cond >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
     if (mir_val_kind(m, cond) != MIR_VK_SSA) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-    # v4.1.0 — INTEGER-compare condition (ranga M6). An OpFOrd* compare leaves a
-    # 0/-1 MASK (MIR_T_BOOL) that v_bfi_b32 blends; an INTEGER compare leaves its
-    # result in VCC with no mask register, which is why this was rejected outright
-    # and why ranga hand-rolls `d = (b1-1-v1) | (b2-1-v2); d < 0x80000000` instead.
+    # INTEGER-compare condition (ranga M6, v4.1.0; reworked v4.4.0). An OpFOrd* compare
+    # leaves a 0/-1 MASK (MIR_T_BOOL) that v_bfi_b32 blends; an INTEGER compare leaves its
+    # result in a FLAG — SCC when uniform, VCC when divergent — with no register at all.
     #
-    # ⭐ But VCC is exactly what v_cndmask_b32 reads, so when the compare is still
-    # the most recent instruction the select is ONE instruction — no mask needed at
-    # all: `result = VCC ? obj1 : obj2`.
+    # ⛔ v4.1.0 decided the flag here, from mir_val_unif(cond) and from whether the compare
+    # was the last instruction emitted. Both are wrong at this point: the uniformity sweep
+    # runs AFTER lowering (spirv_lower_module), so every compare still read MIR_UNKNOWN and
+    # every int-compare select failed as LOWER_ERR_SELECT_UNIFORM_COND — the adjacent
+    # divergent case v4.1.0 shipped as supported included. Its unit tests passed only
+    # because they ran mir_run_uniformity by hand before calling this.
     #
-    # ⚠ ADJACENCY IS THE WHOLE CORRECTNESS ARGUMENT. VCC is a single physical
-    # register; anything emitted between the compare and the select may overwrite
-    # it, and a stale VCC selects silently and wrongly. So this path is taken ONLY
-    # when the compare is literally the last MIR instruction emitted, and any other
-    # arrangement fails loud with a named reason rather than guessing.
+    # So lowering only checks the SHAPE (cond is an integer compare) and emits
+    # MIR_OP_ISELECT; gfx9_isel picks the instruction once uniformity and the final order
+    # are known, re-emitting the compare when its flag may be stale. LOWER_ERR_SELECT_*
+    # are no longer returned.
     if (mir_type_base(mir_val_type(m, cond)) != MIR_T_BOOL) {
         var cdef = mir_val_def(m, cond);
         if (cdef < 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         # ⚠ Bound `cdef` before dereferencing it. A value can carry a def index that
         # is not (yet) a live instruction — a hand-built module, or an id seeded
         # without emitting — and mir_mod_init memsets only vals[], NOT instrs[], so
-        # reading past n_instrs returns STACK GARBAGE. That garbage landed inside the
-        # ICMP opcode range during this test's first run and took the adjacent-compare
-        # path on a module with zero instructions.
+        # reading past n_instrs returns STACK GARBAGE.
         if (cdef >= mir_n_instrs(m)) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         if (mir_op_is_icmp(mir_instr_op(m, cdef)) == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        # A UNIFORM compare writes SCC, not VCC; v_cndmask_b32 would read a VCC
-        # nobody wrote. Uniform selects need s_cselect_b32, which is separate work.
-        if (mir_val_unif(m, cond) != MIR_DIVERGENT) { return 0 - LOWER_ERR_SELECT_UNIFORM_COND; }
-        if (cdef != mir_n_instrs(m) - 1) { return 0 - LOWER_ERR_SELECT_NOT_ADJACENT; }
+        if (mir_instr_result(m, cdef) != cond) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var tx = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (tx < 0) { return tx; }
         var ty = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (ty < 0) { return ty; }
-        # MIR_OP_CNDMASK is `dst = VCC ? b : a` — a is the FALSE value, b the TRUE
-        # one, so obj2 goes in `a` and obj1 in `b`. Getting this backwards inverts
-        # every select and still compiles.
-        return mir_emit(m, MIR_OP_CNDMASK, result, rty, ty, tx, 0, 0);
+        if (tx == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (ty == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        if (tx >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        if (ty >= load64(m + 64)) { return 0 - MIR_ERR_ID_OOR; }
+        # a = cond, b = obj1 (TRUE), c = obj2 (FALSE).
+        return mir_emit(m, MIR_OP_ISELECT, result, rty, cond, tx, ty, 0);
     }
     var x = _spirv_f64_arg(m, spirv_word(ptr, off + 4));  if (x < 0) { return x; }   # obj1 (true)
     var y = _spirv_f64_arg(m, spirv_word(ptr, off + 5));  if (y < 0) { return y; }   # obj2 (false)
@@ -11621,16 +11653,26 @@ fn _spirv_find_label(ptr, byte_len, label_id): i64 {
 #
 # SPIR-V guarantees OpPhi instructions come FIRST in their block, so the scan stops
 # at the first non-phi.
-fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
+fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m, types): i64 {
     var lb = _spirv_find_label(ptr, byte_len, to_label);
     if (lb < 0) { return 0; }
+    # v4.4.0 — the copies are a PARALLEL copy: every phi reads its source as it was BEFORE any
+    # of them is written. Emitted one after another, a phi whose source is another phi of the
+    # same block (a swap: a = phi(.., b), b = phi(.., a)) read the value just written — the
+    # probe's swapped pair came back (2, 2) instead of (2, 1). So: collect the pairs, and if any
+    # source is one of the results being written, copy every source to a temporary first.
+    var res[512];    # up to 64 phis per edge (result, source, MIR type)
+    var srcs[512];
+    var tys[512];
+    var np = 0;
+    var idb = spirv_hdr_id_bound(ptr);
     var total = byte_len / 4;
     var off = lb + spirv_op_wordcount(spirv_word(ptr, lb));
     while (off < total) {
         var w0 = spirv_word(ptr, off);
         var wc = spirv_op_wordcount(w0);
         if (wc == 0) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        if (spirv_op(w0) != SPIRV_OP_PHI) { return 0; }
+        if (spirv_op(w0) != SPIRV_OP_PHI) { off = total; continue; }
         if (wc < 5) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var result = spirv_word(ptr, off + 2);
         # The target block's OpPhi may not be lowered yet (a forward branch), so its result
@@ -11641,15 +11683,140 @@ fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m): i64 {
         var k = 3;
         while (k + 1 < wc) {
             if (spirv_word(ptr, off + k + 1) == from_label) {
-                var src = spirv_word(ptr, off + k);
-                var e = mir_emit(m, MIR_OP_VMOV, result, mir_val_type(m, result), src, 0, 0, 0);
-                if (e < 0) { return e; }
+                if (np >= 64) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+                store64(&res + np * 8, result);
+                store64(&srcs + np * 8, spirv_word(ptr, off + k));
+                # The phi's own result type (word 1): it may not be lowered yet on a forward edge.
+                var pty = _mir_lower_type(types, spirv_word(ptr, off + 1), idb);
+                if (pty == MIR_T_UNSUPPORTED) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                if (mir_type_count(pty) != 1) { return 0 - MIR_ERR_UNSUPPORTED_TYPE; }
+                store64(&tys + np * 8, pty);
+                np = np + 1;
                 k = wc;
             }
             k = k + 2;
         }
         off = off + wc;
     }
+    # Does any copy read a value another copy of this edge writes?
+    var clash = 0;
+    var i = 0;
+    while (i < np) {
+        var j = 0;
+        while (j < np) {
+            if (load64(&srcs + i * 8) == load64(&res + j * 8)) { clash = 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < np) {
+        var r = load64(&res + i * 8);
+        var sv = load64(&srcs + i * 8);
+        # The phi's type is its own: an f64 phi copies a register PAIR (the encoder moves both
+        # halves for an f64 VMOV), and an f64 constant source is materialized into one first.
+        var ty = load64(&tys + i * 8);
+        if (mir_type_base(ty) == MIR_T_F64) {
+            sv = _spirv_f64_arg(m, sv);
+            if (sv < 0) { return sv; }
+        }
+        if (clash == 1) {
+            var tmp = mir_alloc_synth_id(m);
+            if (tmp < 0) { return 0 - MIR_ERR_ID_OOR; }
+            var et = mir_emit(m, MIR_OP_VMOV, tmp, ty, sv, 0, 0, 0);
+            if (et < 0) { return et; }
+            sv = tmp;
+        }
+        store64(&srcs + i * 8, sv);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < np) {
+        var r2 = load64(&res + i * 8);
+        var e = mir_emit(m, MIR_OP_VMOV, r2, load64(&tys + i * 8), load64(&srcs + i * 8), 0, 0, 0);
+        if (e < 0) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1 if label `l`'s OpLabel comes before stream word `off` — a branch at `off` to it is a
+# back-edge (the stream is lowered in order, so that block was already lowered).
+fn _spirv_label_before(ptr, off, l): i64 {
+    var lb = _spirv_find_label(ptr, off * 4, l);
+    if (lb < 0) { return 0; }
+    return 1;
+}
+
+# OpBranchConditional %cond %true %false (v4.4.0: with its phi copies). The copies a target's
+# OpPhi needs on THIS edge were never emitted before 4.4.0 — only OpBranch emitted them — so a
+# phi fed by a conditional edge kept a stale value: a do-while counter whose latch is a
+# conditional back-edge never advanced (the probe kernel hung the GPU), and an if-merge phi
+# read garbage on the path that skipped the then-block. Where each edge's copies go:
+#   - a FORWARD target's copies run BEFORE the branch, so on both paths. That is safe: the phi
+#     result is defined at that block and dominated by it, and every other path into the block
+#     copies again on its own edge before anything reads it;
+#   - the BACKWARD target's (a loop header, via its latch) must run on the continuing path only,
+#     or they would clobber the loop variable the exit path still reads. They are emitted AFTER
+#     the branch, and the branch's flags carry their count (MIR_CB_MOVES_SHIFT) and which target
+#     takes them; gfx9_isel places them after the exit test, before the back-edge s_branch.
+# Two backward targets that both need copies cannot be split this way and fail loud.
+fn _spirv_lower_cond_branch(ptr, off, cond, tb, tc, m, types): i64 {
+    var bb = _spirv_label_before(ptr, off, tb);
+    var bc = _spirv_label_before(ptr, off, tc);
+    if (bb == 0) {
+        var pb = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tb, m, types);
+        if (pb < 0) { return pb; }
+    }
+    if (bc == 0) {
+        if (tc != tb) {
+            var pc = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tc, m, types);
+            if (pc < 0) { return pc; }
+        }
+    }
+    var fl = MIR_FLAG_B_IMM | MIR_FLAG_C_IMM;
+    var bi = mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, cond, tb, tc, fl);
+    if (bi < 0) { return bi; }
+    var back = 0;
+    var which = 0;
+    if (bb == 1) { back = tb; which = MIR_CB_MOVES_ON_TRUE; }
+    if (bc == 1) {
+        if (back != 0) {
+            if (tc != tb) {
+                # Both targets backward: only fine if neither needs a copy.
+                var n0 = mir_n_instrs(m);
+                var pt = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tb, m, types);
+                if (pt < 0) { return pt; }
+                var pf = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tc, m, types);
+                if (pf < 0) { return pf; }
+                if (mir_n_instrs(m) != n0) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+                return bi;
+            }
+        }
+        back = tc;
+        which = MIR_CB_MOVES_ON_FALSE;
+    }
+    if (back == 0) { return bi; }
+    var before = mir_n_instrs(m);
+    var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, back, m, types);
+    if (pm < 0) { return pm; }
+    var nm = mir_n_instrs(m) - before;
+    if (nm == 0) { return bi; }
+    if (nm > MIR_CB_MOVES_MAX) { return 0 - LOWER_ERR_CONTROL_FLOW; }
+    mir_set_instr_flags(m, bi, fl | which | (nm << MIR_CB_MOVES_SHIFT));
+    return bi;
+}
+
+# A label <id> (OpLabel, or a branch target) must be a real id: non-zero and below the header's
+# id_bound, as the SPIR-V spec requires of every id. ⛔ Nothing checked this before v4.4.0, and
+# gfx9_emit_program indexes its 256-entry label-offset table by it: a crafted module with a label
+# id past id_bound (which spirv_validate_stream, a structural check only, lets through) wrote the
+# ISA position to `&laboff + id * 8`, off the compile frame's stack. Reachable from
+# gpu_shader_module_create_spirv; a 5000 crashed the probe. id_bound <= cap_ids <= 256 by the
+# time lowering runs, so this bound also keeps every label inside isel's and the emitter's tables.
+fn _spirv_check_label(ptr, id): i64 {
+    if (id <= 0) { return 0 - MIR_ERR_ID_OOR; }
+    if (id >= spirv_hdr_id_bound(ptr)) { return 0 - MIR_ERR_ID_OOR; }
     return 0;
 }
 
@@ -11685,6 +11852,7 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # forward if, so emitting it would shift every straight-line kernel's MIR.
     if (op == SPIRV_OP_LABEL) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
+        var lr = _spirv_check_label(ptr, spirv_word(ptr, off + 1));  if (lr < 0) { return lr; }
         _lower_cur_label = spirv_word(ptr, off + 1);
         if (mir_n_instrs(m) == 0) { return 0; }
         return mir_emit(m, MIR_OP_LABEL, 0, MIR_T_VOID, spirv_word(ptr, off + 1), 0, 0, MIR_FLAG_A_IMM);
@@ -11696,7 +11864,8 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     if (op == SPIRV_OP_BRANCH) {
         if (wc < 2) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
         var tgt = spirv_word(ptr, off + 1);
-        var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tgt, m);
+        var tr = _spirv_check_label(ptr, tgt);  if (tr < 0) { return tr; }
+        var pm = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tgt, m, types);
         if (pm < 0) { return pm; }
         return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, tgt, 0, 0, MIR_FLAG_A_IMM);
     }
@@ -11704,8 +11873,11 @@ fn _spirv_lower_one_instr(ptr, off, wc, op, types, consts, deco, m, lsz): i64 {
     # fall-through then), c = false (the merge); b/c are labels (immediate tags).
     if (op == SPIRV_OP_BRANCH_CONDITIONAL) {
         if (wc < 4) { return 0 - MIR_ERR_UNSUPPORTED_OP; }
-        return mir_emit(m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, spirv_word(ptr, off + 1),
-          spirv_word(ptr, off + 2), spirv_word(ptr, off + 3), MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+        var tb = spirv_word(ptr, off + 2);
+        var tc = spirv_word(ptr, off + 3);
+        var t1 = _spirv_check_label(ptr, tb);  if (t1 < 0) { return t1; }
+        var t2 = _spirv_check_label(ptr, tc);  if (t2 < 0) { return t2; }
+        return _spirv_lower_cond_branch(ptr, off, spirv_word(ptr, off + 1), tb, tc, m, types);
     }
     if (op == SPIRV_OP_RETURN) {
         var er = mir_emit(m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
@@ -12222,6 +12394,22 @@ var GISEL_V_CVT_I32_F64       = 75;   # (i32)f64 round-nearest
 var GISEL_V_CVT_F64_I32       = 76;   # (f64)i32
 # v3.2 F.7f.8 — OpSelect blend (v_bfi_b32: mask ? b : c). 1 lane for i32/f32, 2 for an f64 pair.
 var GISEL_V_SELECT            = 77;
+# v4.4.0 — structured divergent control flow over a STACK of saved-EXEC SGPR pairs. Every op
+# below that names a pair carries its base SGPR in `a`, flagged MIR_FLAG_A_IMM so regalloc and
+# waitcnt never read it as a value. Depth d (0 = outermost) uses s[100-2d : 101-2d]; the driver
+# lowers the regalloc SGPR ceiling to the deepest pair's base. (GISEL_S_SAVEEXEC = s_and_saveexec
+# into s[a:a+1] and GISEL_S_OR_EXEC = the restore from it are the N.7c ops above, now per depth.)
+var GISEL_S_EXEC_XOR_SAVE     = 111;  # s_xor_b64 s[a], exec, s[a]  -> s[a] = lanes NOT taking then
+var GISEL_S_ELSE              = 112;  # s_or_saveexec_b64 s[a], s[a]; s_xor_b64 exec, exec, s[a]
+var GISEL_S_LOOP_SAVE         = 113;  # s_mov_b64 s[a], exec    (loop entry)
+var GISEL_S_LOOP_RESTORE      = 114;  # s_mov_b64 exec, s[a]    (loop exit label)
+var GISEL_S_EXEC_AND_VCC      = 115;  # s_and_b64 exec, exec, vcc    (loop exit when cond false)
+var GISEL_S_EXEC_ANDN2_VCC    = 116;  # s_andn2_b64 exec, exec, vcc  (loop exit when cond true)
+# v4.4.0 — int-compare OpSelect, decided after uniformity (MIR_OP_ISELECT).
+var GISEL_S_CSELECT           = 117;  # s_cselect_b32 dst, a(true), b(false) — reads SCC; SGPR dst
+var GISEL_S_CSELECT_VCC       = 118;  # s_cselect_b64 vcc, -1, 0 — SCC -> a VCC lane mask (dst 0)
+# A uniform branch whose FALSE target is a loop header taking back-edge phi copies inverts.
+var GISEL_S_CBRANCH_SCC1      = 119;  # c = target: branch if SCC == 1
 
 var GISEL_REC = 48;   # [op, dst, a, b, c, flags]
 
@@ -12234,9 +12422,16 @@ var GISEL_ERR_CAP_EXCEEDED   = 101;
 # All three were ALREADY rejected (or, for RETURN_IN_SELECTION, silently miscompiled);
 # what was missing is a code that says which. See the ranga M6 filing
 # `docs/development/issues/archived/2026-08-19-native-spirv-compile-limits.md`.
-var GISEL_ERR_NESTED_SELECTION    = 102;  # a divergent if opened inside another
+var GISEL_ERR_NESTED_SELECTION    = 102;  # divergent ifs / loops nested past GISEL_CF_MAX_DEPTH (4.3.1: any nesting)
 var GISEL_ERR_RETURN_IN_SELECTION = 103;  # OpReturn inside a divergent if -> would end the WAVE
 var GISEL_ERR_UNCLOSED_SELECTION  = 104;  # a divergent if whose merge label never arrived
+# v4.4.0 — the divergent-CF rework. 105/106 reuse numbers that are also GISEL op tags; the two
+# never meet (errors are returned negated), and the 100s are the isel band consumers know.
+var GISEL_ERR_UNSTRUCTURED_CF     = 105;  # a branch leaves a divergent region, or a layout isel can't mask
+var GISEL_ERR_COND_NOT_COMPARE    = 106;  # a branch / select condition isel cannot put in SCC / VCC
+# How deep divergent ifs and loops may nest: one saved-EXEC pair per level, s[86:101] at 8.
+var GISEL_CF_MAX_DEPTH            = 8;
+var GISEL_CF_TOP_PAIR             = 100;  # depth 0's pair base (s[100:101]); s102+ are reserved
 
 # ================================================================
 # Selected-instruction emit + accessors
@@ -12259,6 +12454,7 @@ fn _gisel_emit(out, k, op, dst, a, b, c, flags): i64 {
 # result (GFX9 has no scalar f32 ALU), so a "uniform" float value lives in a
 # VGPR. (STORE / S_ENDPGM have no result and never reach this.)
 fn gisel_writes_vgpr(op): i64 {
+    if (op == GISEL_S_CSELECT) { return 0; }
     if (op == GISEL_S_ADD_I32) { return 0; }
     if (op == GISEL_S_SUB_I32) { return 0; }
     if (op == GISEL_S_MUL_I32) { return 0; }
@@ -12397,14 +12593,11 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
     if (op == MIR_OP_RET) { return _gisel_emit(out, k, GISEL_S_ENDPGM, 0, 0, 0, 0, 0); }
     # N.7 control flow. LABEL/BRANCH carry the label <id> in `a`; COND_BRANCH skips to
     # its FALSE/merge target (c) when SCC==0 (the preceding S_CMP set SCC = condition).
-    if (op == MIR_OP_LABEL) { return _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0); }
+    if (op == MIR_OP_LABEL) { return _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM); }
     if (op == MIR_OP_BRANCH) { return _gisel_emit(out, k, GISEL_S_BRANCH, 0, a, 0, 0, 0); }
-    # A UNIFORM cond branches on SCC (s_cbranch_scc0 → merge). A DIVERGENT cond needs
-    # the EXEC-mask sequence (s_and_saveexec_b64 + s_cbranch_execz + restore) — N.7c-2b.
-    if (op == MIR_OP_COND_BRANCH) {
-        if (mir_val_unif(m, a) == MIR_DIVERGENT) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
-        return _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, 0);
-    }
+    # A conditional branch needs its condition's flag made fresh and, when divergent, the EXEC
+    # region stack — both live in the gfx9_isel driver (v4.4.0), which never routes one here.
+    if (op == MIR_OP_COND_BRANCH) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
     var sop = _gisel_cmp_sopc(op);
     if (sop >= 0) {
         if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
@@ -12531,83 +12724,651 @@ fn _gisel_one(m, out, k, op, dst, a, b, c, flags): i64 {
 }
 
 # ================================================================
-# Driver: MIR instruction list → selected GFX9 instruction list
+# v4.4.0 — conditions, selects and structured divergent control flow
 # ================================================================
-# Selects one GFX9 instruction per MIR instruction, in program order, into
-# `out` (caller-provided, `out_len` BYTES; it holds out_len / GISEL_REC records —
-# the scratch-buffer contract, 4.4.0, replacing a record count passed beside the
-# buffer). Returns the count, or a NEGATIVE error (cap exceeded / unsupported op).
-fn gfx9_isel(m, out, out_len): i64 {
-    var cap = out_len / GISEL_REC;
-    var n = mir_n_instrs(m);
-    var i = 0;
-    var k = 0;
-    var pending_merge = 0;   # merge label of an open divergent if (0 = none; MVP = no nesting)
-    while (i < n) {
-        if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
-        var op = mir_instr_op(m, i);
-        var a = mir_instr_a(m, i);
-        var c = mir_instr_c(m, i);
-        var handled = 0;
-        # A DIVERGENT cond branch opens the EXEC-mask region: save+mask EXEC, then skip
-        # the then-block entirely when no lane is active. The restore is emitted at merge.
-        if (op == MIR_OP_COND_BRANCH) {
-            if (mir_val_unif(m, a) == MIR_DIVERGENT) {
-                if (pending_merge != 0) { return 0 - GISEL_ERR_NESTED_SELECTION; }
-                if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
-                _gisel_emit(out, k, GISEL_S_SAVEEXEC, 0, 0, 0, 0, 0);
-                _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, c, 0);
-                k = k + 2;
-                pending_merge = c;
-                handled = 1;
-            }
-        }
-        # Its merge label closes the region: the label points at the EXEC restore, so a
-        # skip OR a fall-through both land on it. Label first (records the offset), then
-        # the s_or_b64 restore as the first real instruction there.
-        if (handled == 0) {
-            if (op == MIR_OP_LABEL) {
-                if (pending_merge != 0) {
-                    if (a == pending_merge) {
-                        if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
-                        _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, 0);
-                        _gisel_emit(out, k + 1, GISEL_S_OR_EXEC, 0, 0, 0, 0, 0);
-                        k = k + 2;
-                        pending_merge = 0;
-                        handled = 1;
+# An integer compare's result lives in a FLAG, not a register: SCC (s_cmp, uniform) or VCC
+# (v_cmp, divergent). Every reader — a branch, an int-compare select — needs that flag to be the
+# compare's, and almost everything clobbers SCC (any SALU op) or VCC (the division macros, other
+# compares). ⛔ Before 4.4.0 a branch read whatever the flag held: the probes found a divergent
+# if taking the wrong lanes after an OpUDiv, and a uniform if skipped after an s_add.
+#
+# So a reader checks the record just before it: if that is the compare of its condition the flag
+# is FRESH; otherwise the compare is selected again right there (compares are pure — re-running
+# one costs an instruction and extends its operands' live ranges, which regalloc sees as uses).
+
+# Put `cond` in its flag as the last selected record, unless `fresh` says it already is. A
+# 0/-1 MASK (MIR_T_BOOL, an OpFOrd* result) becomes VCC = (mask != 0). Returns the new k.
+fn _gisel_cond_flag(m, out, k, cap, cond, fresh): i64 {
+    if (fresh == 1) { return k; }
+    if (cond <= 0) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (cond >= load64(m + 64)) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (mir_val_kind(m, cond) != MIR_VK_SSA) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+    if (mir_type_base(mir_val_type(m, cond)) == MIR_T_BOOL) {
+        _gisel_emit(out, k, GISEL_V_CMP, 0, 0, cond, 0, MIR_FLAG_A_IMM | (GFX9_VOPC_V_CMP_NE_U32 << 8));
+        return k + 1;
+    }
+    var cdef = mir_val_def(m, cond);
+    if (cdef < 0) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (cdef >= mir_n_instrs(m)) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    var op = mir_instr_op(m, cdef);
+    if (mir_op_is_icmp(op) == 0) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (mir_instr_result(m, cdef) != cond) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    var rc = _gisel_one(m, out, k, op, cond, mir_instr_a(m, cdef), mir_instr_b(m, cdef), 0,
+      mir_instr_flags(m, cdef));
+    if (rc < 0) { return rc; }
+    return k + 1;
+}
+
+# 1 if value `id` will sit in a VGPR. The file follows the record that DEFINES it (the
+# gisel_result_is_vgpr rule regalloc and the encoder share), found by scanning back from k.
+# A constant is never in one; a value with no defining record yet (a phi's seed) follows its
+# uniformity.
+fn _gisel_in_vgpr(m, out, k, id): i64 {
+    var kind = mir_val_kind(m, id);
+    if (kind == MIR_VK_CONST) { return 0; }
+    var j = k - 1;
+    while (j >= 0) {
+        if (gisel_dst(out, j) == id) { return gisel_result_is_vgpr(m, out, j); }
+        j = j - 1;
+    }
+    if (mir_val_unif(m, id) == MIR_DIVERGENT) { return 1; }
+    return 0;
+}
+
+# 1 if constant `id` encodes as an inline operand (no literal dword, no constant bus).
+fn _gisel_is_inline_const(m, id): i64 {
+    if (mir_val_kind(m, id) != MIR_VK_CONST) { return 0; }
+    var v = mir_val_payload(m, id);
+    if (mir_val_type(m, id) == MIR_T_F32) {
+        if (gfx9_inline_float(v) == GFX9_SRC_LITERAL) { return 0; }
+        return 1;
+    }
+    if (gfx9_inline_int(v) == GFX9_SRC_LITERAL) { return 0; }
+    return 1;
+}
+
+# Copy `id` into a fresh synth VGPR (v_mov_b32) at record k. Returns the synth id (> 0) or a
+# negative error; the caller advances k by one.
+fn _gisel_to_vgpr(m, out, k, cap, id): i64 {
+    if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+    var sid = mir_alloc_synth_id(m);
+    if (sid < 0) { return 0 - MIR_ERR_ID_OOR; }
+    var sr = _mir_set_val(m, sid, MIR_VK_SSA, mir_val_type(m, id), MIR_DIVERGENT, 0 - 1, 0);
+    if (sr < 0) { return sr; }
+    _gisel_emit(out, k, GISEL_V_MOV, sid, id, 0, 0, 0);
+    return sid;
+}
+
+# MIR_OP_ISELECT: dst = cond ? tv : fv, cond an integer compare. Returns the new k.
+#   uniform cond, uniform 32-bit integer result, both values outside VGPRs
+#       -> s_cmp (if stale); s_cselect_b32 dst, tv, fv
+#   uniform cond, per-lane (or float) result
+#       -> s_cmp (if stale); s_cselect_b64 vcc, -1, 0; v_cndmask_b32 dst, fv, tv
+#   divergent cond
+#       -> v_cmp (if stale); v_cndmask_b32 dst, fv, tv
+# ⚠ GFX9 v_cndmask_b32 reads VCC through the single constant-bus slot, so src0 (the FALSE value)
+# must be a VGPR or an inline constant and vsrc1 (the TRUE value) a VGPR (llvm-mc: "violates
+# constant bus restrictions"). Anything else is copied into a synth VGPR first.
+fn _gisel_iselect(m, out, k, cap, dst, cond, tv, fv, fresh): i64 {
+    if (dst == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    if (cond <= 0) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    if (cond >= load64(m + 64)) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+    var cu = mir_val_unif(m, cond);
+    var ru = mir_val_unif(m, dst);
+    if (cu == MIR_UNKNOWN) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    if (ru == MIR_UNKNOWN) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    var tb = mir_type_base(mir_val_type(m, dst));
+    var isint = 0;
+    if (tb == MIR_T_I32) { isint = 1; }
+    if (tb == MIR_T_U32) { isint = 1; }
+    if (cu == MIR_UNIFORM) {
+        if (ru == MIR_UNIFORM) {
+            if (isint == 1) {
+                if (_gisel_in_vgpr(m, out, k, tv) == 0) {
+                    if (_gisel_in_vgpr(m, out, k, fv) == 0) {
+                        var ks = _gisel_cond_flag(m, out, k, cap, cond, fresh);
+                        if (ks < 0) { return ks; }
+                        if (ks >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                        _gisel_emit(out, ks, GISEL_S_CSELECT, dst, tv, fv, 0, 0);
+                        return ks + 1;
                     }
                 }
             }
         }
-        # ⛔ OpReturn inside an open divergent if. This is the ranga M6 filing's worst
-        # case, and the only one that was not already a rejection: it COMPILED, then
-        # did nothing. A divergent if runs its then-block under a masked EXEC, so a
-        # RET there lowers to s_endpgm and ends the ENTIRE WAVE — every lane, active
-        # or not — before the code after the merge ever runs. The kernel dispatches
-        # with rc=0 and writes nothing, which a consumer can only discover by noticing
-        # an unchanged output buffer.
-        #
-        # The idiomatic WGSL guard `if idx >= count { return; }` lowers to exactly
-        # this shape. The form that works puts the body in the then-block and leaves
-        # the function's only OpReturn in the merge block (see
-        # programs/native_spirv_divergent_if_e2e.cyr), or inverts the guard:
-        # `if (count > idx) { body } return`.
-        #
-        # A loud failure is strictly better than a shader that runs and does nothing.
-        if (handled == 0) {
-            if (op == MIR_OP_RET) {
-                if (pending_merge != 0) { return 0 - GISEL_ERR_RETURN_IN_SELECTION; }
+    }
+    var kk = k;
+    if (tb == MIR_T_F64) {
+        # f64 values reach here as VGPR pairs (lowering materializes f64 constants).
+        if (_gisel_in_vgpr(m, out, kk, tv) == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+        if (_gisel_in_vgpr(m, out, kk, fv) == 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    } else {
+        if (_gisel_in_vgpr(m, out, kk, fv) == 0) {
+            if (_gisel_is_inline_const(m, fv) == 0) {
+                var sf = _gisel_to_vgpr(m, out, kk, cap, fv);
+                if (sf < 0) { return sf; }
+                fv = sf;
+                kk = kk + 1;
             }
         }
-        if (handled == 0) {
-            var rc = _gisel_one(m, out, k, op, mir_instr_result(m, i),
-              a, mir_instr_b(m, i), c, mir_instr_flags(m, i));
-            if (rc < 0) { return rc; }
-            k = k + 1;
+        if (_gisel_in_vgpr(m, out, kk, tv) == 0) {
+            var st = _gisel_to_vgpr(m, out, kk, cap, tv);
+            if (st < 0) { return st; }
+            tv = st;
+            kk = kk + 1;
+        }
+    }
+    # A copy above sits between the compare and here, so the flag is no longer known fresh.
+    var fr = fresh;
+    if (kk != k) { fr = 0; }
+    kk = _gisel_cond_flag(m, out, kk, cap, cond, fr);
+    if (kk < 0) { return kk; }
+    if (cu == MIR_UNIFORM) {
+        if (kk >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+        _gisel_emit(out, kk, GISEL_S_CSELECT_VCC, 0, 0, 0, 0, 0);
+        kk = kk + 1;
+    }
+    if (kk >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+    if (tb == MIR_T_F64) {
+        _gisel_emit(out, kk, GISEL_V_CNDMASK_F64, dst, fv, tv, 0, 0);
+    } else {
+        _gisel_emit(out, kk, GISEL_V_CNDMASK, dst, fv, tv, 0, 0);
+    }
+    return kk + 1;
+}
+
+# ---- structured divergent control flow -------------------------------------------------
+# A UNIFORM branch is a scalar branch: the whole wave goes one way, EXEC is untouched, and any
+# structure works. A DIVERGENT one splits the wave, so EXEC must narrow to the lanes that take
+# each path and be restored where the paths join. isel keeps a stack of open divergent regions,
+# one saved-EXEC SGPR pair each (depth d -> s[100-2d : 101-2d]):
+#
+#   if (no else)  s_and_saveexec s[p], vcc; s_xor s[p], exec, s[p]; s_cbranch_execz MERGE
+#                 THEN ...
+#       MERGE:    s_or_b64 exec, exec, s[p]
+#   if / else     the same header, then at the ELSE label (the then-block's own s_branch MERGE
+#                 is dropped so it falls through):
+#       ELSE:     s_or_saveexec s[p], s[p]; s_xor exec, exec, s[p]; s_cbranch_execz MERGE
+#                 ELSE ...
+#       MERGE:    s_or_b64 exec, exec, s[p]
+#   loop          s_mov_b64 s[p], exec            (before HEADER: the back-edge skips it)
+#       HEADER:   ...  at a divergent exit:  s_and_b64 / s_andn2_b64 exec, exec, vcc
+#                                            s_cbranch_execz EXIT
+#                 ...  s_branch HEADER
+#       EXIT:     s_mov_b64 exec, s[p]        (every lane that entered, whenever it left)
+# ⛔ What this replaces: one region, no nesting (GISEL_ERR_NESTED_SELECTION), and the FALSE target
+# taken to be the merge. That made an if/else silently skip its else block (the then-block's
+# s_branch MERGE carried the whole wave over it), and a loop with a divergent exit restored only
+# the lanes still running on the final iteration, so lanes that left early never ran the code
+# after the loop. Both compiled and ran without an error; the 4.4.0 probes caught them on HW.
+#
+# Shapes isel cannot mask — a branch out of the middle of a divergent region, a then-block that
+# does not follow its header, a divergent loop with more than one exit target — fail with
+# GISEL_ERR_UNSTRUCTURED_CF rather than compile.
+
+var _CF_IF   = 1;    # in the THEN part of a divergent if
+var _CF_ELSE = 2;    # in the ELSE part
+var _CF_LOOP = 3;    # inside a loop with a divergent exit
+var _CF_REC  = 48;   # [kind, pair, end_label, aux_label, lo, hi]; inside = lo < pos < hi
+
+fn _cf_kind(stk, d): i64 { return load64(stk + d * _CF_REC + 0); }
+fn _cf_pair(stk, d): i64 { return load64(stk + d * _CF_REC + 8); }
+fn _cf_end(stk, d): i64 { return load64(stk + d * _CF_REC + 16); }
+fn _cf_aux(stk, d): i64 { return load64(stk + d * _CF_REC + 24); }
+fn _cf_set(stk, d, kind, pair, endl, aux, lo, hi): i64 {
+    var r = stk + d * _CF_REC;
+    store64(r + 0, kind);
+    store64(r + 8, pair);
+    store64(r + 16, endl);
+    store64(r + 24, aux);
+    store64(r + 32, lo);
+    store64(r + 40, hi);
+    return 0;
+}
+
+# 1 if MIR instruction i is LABEL `l`.
+fn _cf_is_label(m, n, i, l): i64 {
+    if (i >= n) { return 0; }
+    if (mir_instr_op(m, i) != MIR_OP_LABEL) { return 0; }
+    if (mir_instr_a(m, i) != l) { return 0; }
+    return 1;
+}
+
+# Position of label l (its LABEL's MIR index), or -1. Bounds l against the table first.
+fn _cf_pos(lpos, cap_ids, l): i64 {
+    if (l <= 0) { return 0 - 1; }
+    if (l >= cap_ids) { return 0 - 1; }
+    return load64(lpos + l * 8);
+}
+
+# May a branch inside the TOP divergent region target label t? Inside the region, or one of its
+# own exits: a plain if's merge, an else's merge, a loop's exit or header (the back-edge).
+fn _cf_target_ok(stk, depth, lpos, cap_ids, t): i64 {
+    if (depth == 0) { return 1; }
+    var d = depth - 1;
+    var kind = _cf_kind(stk, d);
+    var endl = _cf_end(stk, d);
+    if (kind == _CF_IF) { if (_cf_aux(stk, d) == 0) { if (t == endl) { return 1; } } }
+    if (kind == _CF_ELSE) { if (t == endl) { return 1; } }
+    if (kind == _CF_LOOP) {
+        if (t == endl) { return 1; }
+        if (t == _cf_aux(stk, d)) { return 1; }
+    }
+    var p = _cf_pos(lpos, cap_ids, t);
+    if (p < 0) { return 0; }
+    if (p <= load64(stk + d * _CF_REC + 32)) { return 0; }
+    if (p >= load64(stk + d * _CF_REC + 40)) { return 0; }
+    return 1;
+}
+
+# Pre-pass: where every label is, which labels are loop headers (a later branch jumps back to
+# them) and where each loop's last back-edge sits, each loop's exit label (the one target outside
+# it; -1 if there are several), and whether any exit is divergent.
+fn _gisel_cf_prepass(m, n, cap_ids, lpos, lend, lexit, ldiv): i64 {
+    memset(lpos, 0xFF, cap_ids * 8);
+    memset(lend, 0xFF, cap_ids * 8);
+    memset(lexit, 0, cap_ids * 8);
+    memset(ldiv, 0, cap_ids * 8);
+    var i = 0;
+    while (i < n) {
+        if (mir_instr_op(m, i) == MIR_OP_LABEL) {
+            var l = mir_instr_a(m, i);
+            if (l <= 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            if (l >= cap_ids) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            if (load64(lpos + l * 8) >= 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            store64(lpos + l * 8, i);
         }
         i = i + 1;
     }
-    if (pending_merge != 0) { return 0 - GISEL_ERR_UNCLOSED_SELECTION; }
+    # back-edges: a branch to a label at or before it
+    i = 0;
+    while (i < n) {
+        var op = mir_instr_op(m, i);
+        var nt = 0;
+        var t0 = 0;
+        var t1 = 0;
+        if (op == MIR_OP_BRANCH) { nt = 1; t0 = mir_instr_a(m, i); }
+        if (op == MIR_OP_COND_BRANCH) { nt = 2; t0 = mir_instr_b(m, i); t1 = mir_instr_c(m, i); }
+        var j = 0;
+        while (j < nt) {
+            var t = t0;
+            if (j == 1) { t = t1; }
+            var p = _cf_pos(lpos, cap_ids, t);
+            if (p >= 0) {
+                if (p <= i) {
+                    if (load64(lend + t * 8) < i) { store64(lend + t * 8, i); }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    # exits: a branch inside loop H to a label outside [pos(H), lend(H)]
+    i = 0;
+    while (i < n) {
+        var op2 = mir_instr_op(m, i);
+        var nt2 = 0;
+        var u0 = 0;
+        var u1 = 0;
+        var div = 0;
+        if (op2 == MIR_OP_BRANCH) { nt2 = 1; u0 = mir_instr_a(m, i); }
+        if (op2 == MIR_OP_COND_BRANCH) {
+            nt2 = 2;
+            u0 = mir_instr_b(m, i);
+            u1 = mir_instr_c(m, i);
+            if (mir_val_unif(m, mir_instr_a(m, i)) == MIR_DIVERGENT) { div = 1; }
+        }
+        if (nt2 > 0) {
+            var h = 1;
+            while (h < cap_ids) {
+                var he = load64(lend + h * 8);
+                if (he >= 0) {
+                    var hp = load64(lpos + h * 8);
+                    if (i >= hp) {
+                        if (i <= he) {
+                            var jj = 0;
+                            while (jj < nt2) {
+                                var tt = u0;
+                                if (jj == 1) { tt = u1; }
+                                var tp = _cf_pos(lpos, cap_ids, tt);
+                                var outside = 0;
+                                if (tp < hp) { outside = 1; }
+                                if (tp > he) { outside = 1; }
+                                if (outside == 1) {
+                                    var ex = load64(lexit + h * 8);
+                                    if (ex == 0) { store64(lexit + h * 8, tt); }
+                                    if (ex > 0) { if (ex != tt) { store64(lexit + h * 8, 0 - 1); } }
+                                    if (div == 1) { store64(ldiv + h * 8, 1); }
+                                }
+                                jj = jj + 1;
+                            }
+                        }
+                    }
+                }
+                h = h + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Select the `nmv` phi copies that follow the COND_BRANCH at MIR index i (each a VMOV). They go
+# on one edge only; see _spirv_lower_cond_branch. Returns the new k.
+fn _gisel_edge_moves(m, out, k, cap, i, nmv): i64 {
+    var j = 1;
+    var kk = k;
+    while (j <= nmv) {
+        if (kk >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+        var mi = i + j;
+        # A copy (VMOV), or the F64_CONST that materializes an f64 constant source for one.
+        var mop = mir_instr_op(m, mi);
+        var okop = 0;
+        if (mop == MIR_OP_VMOV) { okop = 1; }
+        if (mop == MIR_OP_F64_CONST) { okop = 1; }
+        if (okop == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+        var rc = _gisel_one(m, out, kk, mop, mir_instr_result(m, mi), mir_instr_a(m, mi),
+          mir_instr_b(m, mi), mir_instr_c(m, mi), mir_instr_flags(m, mi));
+        if (rc < 0) { return rc; }
+        kk = kk + 1;
+        j = j + 1;
+    }
+    return kk;
+}
+
+# 1 if label t is the header of a loop with a divergent exit that starts AFTER instruction i
+# (so a branch at i to it is the loop's entry, not its back-edge).
+fn _cf_is_div_loop_entry(lpos, lend, ldiv, cap_ids, t, i): i64 {
+    var p = _cf_pos(lpos, cap_ids, t);
+    if (p <= i) { return 0; }
+    if (load64(lend + t * 8) < 0) { return 0; }
+    if (load64(ldiv + t * 8) == 0) { return 0; }
+    return 1;
+}
+
+# ================================================================
+# Driver: MIR instruction list → selected GFX9 instruction list
+# ================================================================
+# Selects GFX9 instructions for the MIR list, in program order, into `out` (caller-provided,
+# `out_len` BYTES; it holds out_len / GISEL_REC records — the scratch-buffer contract, 4.4.0).
+# Most MIR instructions select one record; control flow and int-compare selects may emit
+# several (see above). Returns the count, or a NEGATIVE error.
+fn gfx9_isel(m, out, out_len): i64 {
+    var cap = out_len / GISEL_REC;
+    var n = mir_n_instrs(m);
+    var cap_ids = load64(m + 64);
+    if (cap_ids <= 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    if (cap_ids > RA_MAX_REGS) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+    var lpos[2048];    # RA_MAX_REGS (256) i64 each, indexed by label <id>
+    var lend[2048];
+    var lexit[2048];
+    var ldiv[2048];
+    var pr = _gisel_cf_prepass(m, n, cap_ids, &lpos, &lend, &lexit, &ldiv);
+    if (pr < 0) { return pr; }
+    var stk[384];      # GISEL_CF_MAX_DEPTH (8) * _CF_REC (48)
+    var depth = 0;
+    var fl_id = 0;     # the condition whose flag the record at fl_k set
+    var fl_k = 0 - 1;
+    var i = 0;
+    var k = 0;
+    while (i < n) {
+        if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+        var op = mir_instr_op(m, i);
+        var a = mir_instr_a(m, i);
+        var b = mir_instr_b(m, i);
+        var c = mir_instr_c(m, i);
+        var fresh = 0;
+        if (fl_k == k - 1) { if (fl_id == a) { fresh = 1; } }
+        # OpBranchConditional with both targets the same is an unconditional branch.
+        if (op == MIR_OP_COND_BRANCH) { if (b == c) { op = MIR_OP_BRANCH; a = b; } }
+
+        if (op == MIR_OP_LABEL) {
+            # Entering a loop with a divergent exit: save EXEC first. The back-edge targets the
+            # LABEL, after the save, so the save runs once per entry.
+            if (_cf_is_div_loop_entry(&lpos, &lend, &ldiv, cap_ids, a, i - 1) == 1) {
+                if (depth >= GISEL_CF_MAX_DEPTH) { return 0 - GISEL_ERR_NESTED_SELECTION; }
+                var ex = load64(&lexit + a * 8);
+                if (ex <= 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                if (_cf_pos(&lpos, cap_ids, ex) <= load64(&lend + a * 8)) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                var lp = GISEL_CF_TOP_PAIR - 2 * depth;
+                _gisel_emit(out, k, GISEL_S_LOOP_SAVE, 0, lp, 0, 0, MIR_FLAG_A_IMM);
+                _gisel_emit(out, k + 1, GISEL_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+                _cf_set(&stk, depth, _CF_LOOP, lp, ex, a, i - 1, load64(&lend + a * 8) + 1);
+                depth = depth + 1;
+                k = k + 2;
+                i = i + 1;
+                continue;
+            }
+            if (depth > 0) {
+                if (a == _cf_end(&stk, depth - 1)) {
+                    # One label can end several regions (a then-block that branches to an
+                    # enclosing region's end makes that the if's merge too): emit the label once,
+                    # then each region's restore, innermost first.
+                    if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                    _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+                    k = k + 1;
+                    while (depth > 0) {
+                        var td = depth - 1;
+                        if (a != _cf_end(&stk, td)) { break; }
+                        var tk = _cf_kind(&stk, td);
+                        var tp2 = _cf_pair(&stk, td);
+                        if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                        if (tk == _CF_IF) {
+                            var mrg = _cf_aux(&stk, td);
+                            if (mrg != 0) {
+                                # The else block starts here: flip EXEC to the lanes that skipped then.
+                                _gisel_emit(out, k, GISEL_S_ELSE, 0, tp2, 0, 0, MIR_FLAG_A_IMM);
+                                _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, mrg, MIR_FLAG_C_IMM);
+                                _cf_set(&stk, td, _CF_ELSE, tp2, mrg, 0, i, _cf_pos(&lpos, cap_ids, mrg));
+                                k = k + 2;
+                                break;
+                            }
+                        }
+                        if (tk == _CF_LOOP) {
+                            _gisel_emit(out, k, GISEL_S_LOOP_RESTORE, 0, tp2, 0, 0, MIR_FLAG_A_IMM);
+                        } else {
+                            _gisel_emit(out, k, GISEL_S_OR_EXEC, 0, tp2, 0, 0, MIR_FLAG_A_IMM);
+                        }
+                        depth = depth - 1;
+                        k = k + 1;
+                    }
+                    var cd = 0;
+                    while (cd < depth) {
+                        if (a == _cf_end(&stk, cd)) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                        cd = cd + 1;
+                    }
+                    i = i + 1;
+                    continue;
+                }
+                # Any OTHER open region's boundary arriving now means the regions do not nest.
+                var od = 0;
+                while (od < depth) {
+                    if (a == _cf_end(&stk, od)) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                    if (_cf_kind(&stk, od) == _CF_IF) {
+                        if (_cf_aux(&stk, od) == a) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                    }
+                    od = od + 1;
+                }
+            }
+            _gisel_emit(out, k, GISEL_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+            k = k + 1;
+            i = i + 1;
+            continue;
+        }
+
+        if (op == MIR_OP_BRANCH) {
+            # The entry into a divergent loop must fall through into its EXEC save.
+            if (_cf_is_div_loop_entry(&lpos, &lend, &ldiv, cap_ids, a, i) == 1) {
+                if (_cf_is_label(m, n, i + 1, a) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                i = i + 1;
+                continue;
+            }
+            if (depth > 0) {
+                var bd = depth - 1;
+                var bk = _cf_kind(&stk, bd);
+                var be = _cf_end(&stk, bd);
+                if (bk == _CF_IF) {
+                    if (_cf_is_label(m, n, i + 1, be) == 1) {
+                        # The then-block's last branch: to the merge (no else), or over the else
+                        # block to the merge — that one is dropped so then falls into the ELSE flip.
+                        if (a == be) { i = i + 1; continue; }
+                        if (a == _cf_aux(&stk, bd)) { i = i + 1; continue; }
+                        return 0 - GISEL_ERR_UNSTRUCTURED_CF;
+                    }
+                }
+                if (_cf_target_ok(&stk, depth, &lpos, cap_ids, a) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            }
+            _gisel_emit(out, k, GISEL_S_BRANCH, 0, a, 0, 0, MIR_FLAG_A_IMM);
+            k = k + 1;
+            i = i + 1;
+            continue;
+        }
+
+        if (op == MIR_OP_COND_BRANCH) {
+            if (_cf_is_div_loop_entry(&lpos, &lend, &ldiv, cap_ids, b, i) == 1) {
+                if (_cf_is_label(m, n, i + 1, b) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            }
+            if (_cf_is_div_loop_entry(&lpos, &lend, &ldiv, cap_ids, c, i) == 1) {
+                return 0 - GISEL_ERR_UNSTRUCTURED_CF;   # jumps past the loop's EXEC save
+            }
+            if (_cf_target_ok(&stk, depth, &lpos, cap_ids, b) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            if (_cf_target_ok(&stk, depth, &lpos, cap_ids, c) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            if (a <= 0) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+            if (a >= cap_ids) { return 0 - GISEL_ERR_COND_NOT_COMPARE; }
+            var cu = mir_val_unif(m, a);
+            if (cu == MIR_UNKNOWN) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+            # Back-edge phi copies (_spirv_lower_cond_branch) follow the branch in the MIR.
+            var mfl = mir_instr_flags(m, i);
+            var nmv = (mfl >> MIR_CB_MOVES_SHIFT) & 0xFF;
+            var mv_t = 0;
+            if (nmv > 0) {
+                if ((mfl & MIR_CB_MOVES_ON_TRUE) != 0) { mv_t = b; }
+                if ((mfl & MIR_CB_MOVES_ON_FALSE) != 0) { mv_t = c; }
+                if (mv_t == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                if (i + nmv >= n) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            }
+            if (cu == MIR_UNIFORM) {
+                # Scalar: s_cbranch_scc0 FALSE, then fall into TRUE (or jump to it). When the
+                # FALSE target takes the copies, invert: s_cbranch_scc1 TRUE, copies, s_branch FALSE.
+                k = _gisel_cond_flag(m, out, k, cap, a, fresh);
+                if (k < 0) { return k; }
+                if (k + 2 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                var other = b;
+                if (mv_t == c) {
+                    if (nmv > 0) {
+                        _gisel_emit(out, k, GISEL_S_CBRANCH_SCC1, 0, 0, 0, b, MIR_FLAG_C_IMM);
+                        other = c;
+                    }
+                }
+                if (other == b) { _gisel_emit(out, k, GISEL_S_CBRANCH, 0, 0, 0, c, MIR_FLAG_C_IMM); }
+                k = k + 1;
+                k = _gisel_edge_moves(m, out, k, cap, i, nmv);
+                if (k < 0) { return k; }
+                if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                if (_cf_is_label(m, n, i + 1 + nmv, other) == 0) {
+                    _gisel_emit(out, k, GISEL_S_BRANCH, 0, other, 0, 0, MIR_FLAG_A_IMM);
+                    k = k + 1;
+                }
+                i = i + 1 + nmv;
+                continue;
+            }
+            # Divergent: a loop exit, or an if.
+            var lx = 0;
+            if (depth > 0) {
+                if (_cf_kind(&stk, depth - 1) == _CF_LOOP) {
+                    var le = _cf_end(&stk, depth - 1);
+                    if (b == le) { lx = 1; }
+                    if (c == le) { lx = 1; }
+                }
+            }
+            if (lx == 1) {
+                var exit_l = _cf_end(&stk, depth - 1);
+                var stay = b;
+                var keep = GISEL_S_EXEC_AND_VCC;        # exit when FALSE: keep the lanes where cond holds
+                if (b == exit_l) { stay = c; keep = GISEL_S_EXEC_ANDN2_VCC; }
+                # Copies, if any, belong to the edge that stays in the loop: after the exit test,
+                # where only continuing lanes are active.
+                if (nmv > 0) { if (mv_t != stay) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; } }
+                k = _gisel_cond_flag(m, out, k, cap, a, fresh);
+                if (k < 0) { return k; }
+                if (k + 3 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                _gisel_emit(out, k, keep, 0, 0, 0, 0, 0);
+                _gisel_emit(out, k + 1, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, exit_l, MIR_FLAG_C_IMM);
+                k = k + 2;
+                k = _gisel_edge_moves(m, out, k, cap, i, nmv);
+                if (k < 0) { return k; }
+                if (k >= cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+                if (_cf_is_label(m, n, i + 1 + nmv, stay) == 0) {
+                    _gisel_emit(out, k, GISEL_S_BRANCH, 0, stay, 0, 0, MIR_FLAG_A_IMM);
+                    k = k + 1;
+                }
+                i = i + 1 + nmv;
+                continue;
+            }
+            # A divergent if takes no back-edge copies (both of its targets are forward).
+            if (nmv > 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            # A divergent if: the THEN block must come next, the FALSE target after it.
+            if (_cf_is_label(m, n, i + 1, b) == 0) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            var cpos = _cf_pos(&lpos, cap_ids, c);
+            if (cpos < 0) { return 0 - GISEL_ERR_UNCLOSED_SELECTION; }   # its merge never arrives
+            if (cpos <= i + 1) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+            if (depth >= GISEL_CF_MAX_DEPTH) { return 0 - GISEL_ERR_NESTED_SELECTION; }
+            # An ELSE block: the instruction before the FALSE label is the then-block's branch
+            # to a merge that lies beyond it.
+            var mg = 0;
+            if (mir_instr_op(m, cpos - 1) == MIR_OP_BRANCH) {
+                var bx = mir_instr_a(m, cpos - 1);
+                if (bx != c) {
+                    if (_cf_pos(&lpos, cap_ids, bx) <= cpos) { return 0 - GISEL_ERR_UNSTRUCTURED_CF; }
+                    mg = bx;
+                }
+            }
+            k = _gisel_cond_flag(m, out, k, cap, a, fresh);
+            if (k < 0) { return k; }
+            if (k + 3 > cap) { return 0 - GISEL_ERR_CAP_EXCEEDED; }
+            var ip = GISEL_CF_TOP_PAIR - 2 * depth;
+            _gisel_emit(out, k, GISEL_S_SAVEEXEC, 0, ip, 0, 0, MIR_FLAG_A_IMM);
+            _gisel_emit(out, k + 1, GISEL_S_EXEC_XOR_SAVE, 0, ip, 0, 0, MIR_FLAG_A_IMM);
+            _gisel_emit(out, k + 2, GISEL_S_CBRANCH_EXECZ, 0, 0, 0, c, MIR_FLAG_C_IMM);
+            _cf_set(&stk, depth, _CF_IF, ip, c, mg, i, cpos);
+            depth = depth + 1;
+            k = k + 3;
+            i = i + 1;
+            continue;
+        }
+
+        # ⛔ OpReturn inside an open divergent region. This is the ranga M6 filing's worst
+        # case, and the only one that was not already a rejection: it COMPILED, then did
+        # nothing. A divergent region runs under a masked EXEC, so a RET there lowers to
+        # s_endpgm and ends the ENTIRE WAVE — every lane, active or not — before the code
+        # after the merge ever runs. The idiomatic WGSL guard `if idx >= count { return; }`
+        # lowers to exactly this shape. The form that works puts the body in the then-block
+        # and leaves the function's only OpReturn in the merge block (see
+        # programs/native_spirv_divergent_if_e2e.cyr), or inverts the guard.
+        if (op == MIR_OP_RET) {
+            if (depth > 0) { return 0 - GISEL_ERR_RETURN_IN_SELECTION; }
+        }
+
+        if (op == MIR_OP_ISELECT) {
+            if (b <= 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+            if (c <= 0) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+            if (b >= cap_ids) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+            if (c >= cap_ids) { return 0 - GISEL_ERR_UNSUPPORTED_OP; }
+            k = _gisel_iselect(m, out, k, cap, mir_instr_result(m, i), a, b, c, fresh);
+            if (k < 0) { return k; }
+            i = i + 1;
+            continue;
+        }
+
+        var res = mir_instr_result(m, i);
+        var rc = _gisel_one(m, out, k, op, res, a, b, c, mir_instr_flags(m, i));
+        if (rc < 0) { return rc; }
+        if (mir_op_is_icmp(op) == 1) { fl_id = res; fl_k = k; }
+        k = k + 1;
+        i = i + 1;
+    }
+    if (depth != 0) { return 0 - GISEL_ERR_UNCLOSED_SELECTION; }
     return k;
 }
 
@@ -12791,6 +13552,28 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
         if ((fl & MIR_FLAG_C_IMM) == 0) { _ra_use(m, alloc, gisel_c(isel, i), i); }
         i = i + 1;
     }
+    # v4.4.0 — a DEAD load keeps its register to the end. A VMEM load writes its VGPR whenever the
+    # memory returns, and gfx9_waitcnt waits only before a USE of the result; a load nobody reads
+    # gets no wait, so freeing its register at the def let a later value claim it and then be
+    # overwritten by the load landing late. Found by the phi-swap probe (4.4.0): the kernel never
+    # read its a[x] load, regalloc gave that VGPR to a loop phi, and the phi read back lane-varying
+    # garbage. A used load is safe: its first use waits (vmcnt 0) before the register can recycle.
+    i = 0;
+    while (i < n_isel) {
+        var lop = gisel_op(isel, i);
+        var is_ld = 0;
+        if (lop == GISEL_GLOBAL_LOAD) { is_ld = 1; }
+        if (lop == GISEL_GLOBAL_LOAD_DWORDX2) { is_ld = 1; }
+        if (is_ld == 1) {
+            var ld = gisel_dst(isel, i);
+            if (ld > 0) {
+                if (ld < cap_ids) {
+                    if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n_isel); }
+                }
+            }
+        }
+        i = i + 1;
+    }
     # v4.1.0 — LOOP LIVENESS EXTENSION. This is the blocker the lowerer's
     # "loops remain unsupported" comment names: "a back-edge breaks the forward
     # linear-scan liveness".
@@ -12825,11 +13608,13 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
             var is_br = 0;
             if (bop == GISEL_S_BRANCH) { is_br = 1; }
             if (bop == GISEL_S_CBRANCH) { is_br = 1; }
+            if (bop == GISEL_S_CBRANCH_SCC1) { is_br = 1; }
             if (is_br == 1) {
                 # Resolve the branch target to its LABEL index. A target earlier in
                 # the list is a back-edge, and [tgt, bi] is the loop body.
                 var tgt = gisel_a(isel, bi);
                 if (bop == GISEL_S_CBRANCH) { tgt = gisel_c(isel, bi); }
+                if (bop == GISEL_S_CBRANCH_SCC1) { tgt = gisel_c(isel, bi); }
                 var li = 0;
                 var tgt_idx = 0 - 1;
                 while (li < n_isel) {
@@ -13506,16 +14291,49 @@ fn _emit_fabs(m, isel, i, alloc, isvgpr, buf, pos): i64 {
 }
 
 # v_cndmask_b32 dst, src0(=a, false value), vsrc1(=b, true value), VCC (implicit). NON-
-# commutative + VCC-dependent: both operands MUST be VGPRs (the udiv macro guarantees it),
-# and it must immediately follow its v_cmp with no VCC-writer between (true by construction
-# in the macro). a → the 9-bit src0 code, b → the raw vsrc1 index. (N.9 udiv.)
+# commutative + VCC-dependent. vsrc1 must be a VGPR. src0 may be a VGPR or an INLINE constant
+# (v4.4.0, for int-compare selects): on GFX9 the implicit VCC read takes the one constant-bus
+# slot, so an SGPR or a literal there is illegal (llvm-mc: "violates constant bus
+# restrictions") — gfx9_isel copies those into a VGPR first, and this refuses them.
 fn _emit_cndmask(m, isel, i, alloc, isvgpr, buf, pos): i64 {
-    var fa = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
-    if (fa < 0) { return fa; }
+    var fl = gisel_flags(isel, i);
+    var src0 = _cmp_resolve(m, alloc, isvgpr, gisel_a(isel, i), fl & MIR_FLAG_A_IMM);
+    if (src0 < 0) { return src0; }
+    if (src0 == GFX9_SRC_LITERAL) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }
+    if (src0 < 128) { return 0 - CMP_ERR_NO_VGPR_OPERAND; }   # an SGPR (or VCC/EXEC) source
     var tb = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_b(isel, i));
     if (tb < 0) { return tb; }
     var dst = gfx9_reg(alloc, gisel_dst(isel, i));
-    return gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, gfx9_vgpr(fa), tb));
+    return gfx9_emit32(buf, pos, gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, dst, src0, tb));
+}
+
+# v4.4.0 — s_cselect_b32 dst, a(true), b(false): dst = SCC ? a : b, for a select whose
+# condition, result and both values are uniform. SGPR / inline / literal sources; a SOP2 takes
+# one literal dword, so two DIFFERENT literals load the false one first:
+#   s_mov_b32 dst, <false>; s_cselect_b32 dst, <true>, dst      (s_mov leaves SCC alone)
+fn _emit_scselect(m, isel, i, alloc, isvgpr, buf, pos): i64 {
+    var fl = gisel_flags(isel, i);
+    var a = gisel_a(isel, i);
+    var b = gisel_b(isel, i);
+    var s0 = _cmp_resolve(m, alloc, isvgpr, a, fl & MIR_FLAG_A_IMM);
+    if (s0 < 0) { return s0; }
+    var s1 = _cmp_resolve(m, alloc, isvgpr, b, fl & MIR_FLAG_B_IMM);
+    if (s1 < 0) { return s1; }
+    if (s0 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    if (s1 >= 256) { return 0 - CMP_ERR_BAD_SALU_OPERAND; }
+    var dst = gfx9_reg(alloc, gisel_dst(isel, i));
+    var p = pos;
+    if (s0 == GFX9_SRC_LITERAL) {
+        if (s1 == GFX9_SRC_LITERAL) {
+            p = gfx9_emit32(buf, p, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B32, dst, GFX9_SRC_LITERAL));
+            p = gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM));
+            s1 = gfx9_sgpr(dst);
+        }
+    }
+    p = gfx9_emit32(buf, p, gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B32, dst, s0, s1));
+    if (s0 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, a, fl & MIR_FLAG_A_IMM)); }
+    if (s1 == GFX9_SRC_LITERAL) { return gfx9_emit32(buf, p, _cmp_lit(m, b, fl & MIR_FLAG_B_IMM)); }
+    return p;
 }
 
 # VOP2: vector ALU, two sources. Encoding is src0 (9-bit, flexible) + vsrc1
@@ -14030,7 +14848,19 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     }
     # N.9 integer-division primitives. The unary forms reuse _emit_vop1; MUL_HI reuses the
     # VOP3 2-src emit (operands are always VGPRs in the macro); CNDMASK is dedicated.
-    if (op == GISEL_V_MOV) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_MOV_B32); }
+    if (op == GISEL_V_MOV) {
+        # v4.4.0 — an f64 value is a VGPR PAIR, so its copy (an f64 phi's) is two v_mov_b32. Until
+        # 4.4.0 this emitted one and an f64 loop phi kept a stale high half. The source must
+        # already be a pair: lowering materializes an f64 constant first (_spirv_f64_arg).
+        if (mir_type_base(mir_val_type(m, gisel_dst(isel, i))) == MIR_T_F64) {
+            var fs = _cmp_vgpr_operand(m, alloc, isvgpr, gisel_a(isel, i));
+            if (fs < 0) { return fs; }
+            var fd = gfx9_reg(alloc, gisel_dst(isel, i));
+            var pm0 = gfx9_emit32(buf, pos, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, fd, gfx9_vgpr(fs)));
+            return gfx9_emit32(buf, pm0, gfx9_enc_vop1(GFX9_VOP1_V_MOV_B32, fd + 1, gfx9_vgpr(fs + 1)));
+        }
+        return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_MOV_B32);
+    }
     if (op == GISEL_V_CVT_F32_U32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_F32_U32); }
     if (op == GISEL_V_CVT_U32_F32) { return _emit_vop1(m, isel, i, alloc, isvgpr, buf, pos, GFX9_VOP1_V_CVT_U32_F32); }
     if (op == GISEL_V_RCP_IFLAG_F32) {
@@ -14138,14 +14968,40 @@ fn _cmp_emit_one(m, isel, i, alloc, abi, isvgpr, buf, pos, scratch_vgpr): i64 {
     if (op == GISEL_S_CMP) { return _emit_sopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_CMP) { return _emit_vopc(m, isel, i, alloc, isvgpr, buf, pos); }
     if (op == GISEL_V_SELECT) { return _emit_select(m, isel, i, alloc, isvgpr, buf, pos); }
-    # Divergent-if EXEC mask: save+AND EXEC with VCC into the reserved pair; restore it.
+    if (op == GISEL_S_CSELECT) { return _emit_scselect(m, isel, i, alloc, isvgpr, buf, pos); }
+    if (op == GISEL_S_CSELECT_VCC) {
+        # s_cselect_b64 vcc, -1, 0 — inline -1 = 193, inline 0 = 128.
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B64, GFX9_REG_VCC_LO, 193, 128));
+    }
+    # Structured divergent control flow (v4.4.0). Every op names its saved-EXEC pair's base SGPR
+    # in `a` (gfx9_isel's region stack; s[100:101] at depth 0).
+    var pr = gisel_a(isel, i);
     if (op == GISEL_S_SAVEEXEC) {
-        return gfx9_emit32(buf, pos,
-          gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, GFX9_EXEC_SAVE_SGPR, GFX9_REG_VCC_LO));
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, pr, GFX9_REG_VCC_LO));
+    }
+    if (op == GISEL_S_EXEC_XOR_SAVE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, pr, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_ELSE) {
+        var pe = gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_OR_SAVEEXEC_B64, pr, pr));
+        return gfx9_emit32(buf, pe, gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, pr));
     }
     if (op == GISEL_S_OR_EXEC) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_LOOP_SAVE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, pr, GFX9_REG_EXEC_LO));
+    }
+    if (op == GISEL_S_LOOP_RESTORE) {
+        return gfx9_emit32(buf, pos, gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, GFX9_REG_EXEC_LO, pr));
+    }
+    if (op == GISEL_S_EXEC_AND_VCC) {
         return gfx9_emit32(buf, pos,
-          gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_EXEC_SAVE_SGPR));
+          gfx9_enc_sop2(GFX9_SOP2_S_AND_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO));
+    }
+    if (op == GISEL_S_EXEC_ANDN2_VCC) {
+        return gfx9_emit32(buf, pos,
+          gfx9_enc_sop2(GFX9_SOP2_S_ANDN2_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO));
     }
     # LABEL / S_BRANCH / S_CBRANCH are handled in gfx9_emit_program's layout loop (they
     # need the label-offset map + branch patch list), never here.
@@ -14207,7 +15063,13 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
         if (p + CMP_RECORD_MAX_BYTES > buf_len) { return 0 - CMP_ERR_ISA_OVERFLOW; }
         var op = gisel_op(isel, i);
         if (op == GISEL_LABEL) {
-            store64(&laboff + gisel_a(isel, i) * 8, p);
+            # ⛔ laboff holds cap_ids entries, indexed by label <id>. Until 4.4.0 nothing bounded
+            # the id, and a crafted module's out-of-range label wrote `p` off this frame's stack
+            # (lowering now rejects it, _spirv_check_label; this is the backstop).
+            var lid = gisel_a(isel, i);
+            if (lid <= 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+            if (lid >= cap_ids) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+            store64(&laboff + lid * 8, p);
         } else {
             if (op == GISEL_S_BRANCH) {
                 if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
@@ -14216,12 +15078,15 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
                 npatch = npatch + 1;
                 p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_BRANCH, 0));
             } else {
-                if (op == GISEL_S_CBRANCH) {
+                var sccop = 0 - 1;
+                if (op == GISEL_S_CBRANCH) { sccop = GFX9_SOPP_S_CBRANCH_SCC0; }
+                if (op == GISEL_S_CBRANCH_SCC1) { sccop = GFX9_SOPP_S_CBRANCH_SCC1; }
+                if (sccop >= 0) {
                     if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
                     store64(&patch_off + npatch * 8, p);
                     store64(&patch_tgt + npatch * 8, gisel_c(isel, i));
                     npatch = npatch + 1;
-                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_SCC0, 0));
+                    p = gfx9_emit32(buf, p, gfx9_enc_sopp(sccop, 0));
                 } else {
                     if (op == GISEL_S_CBRANCH_EXECZ) {
                         if (npatch >= 256) { return 0 - CMP_ERR_TOO_MANY_BRANCHES; }
@@ -14247,7 +15112,10 @@ fn gfx9_emit_program(m, isel, n_isel, alloc, abi, buf, pos, buf_len): i64 {
     var j = 0;
     while (j < npatch) {
         var boff = load64(&patch_off + j * 8);
-        var toff = load64(&laboff + load64(&patch_tgt + j * 8) * 8);
+        var tgt_id = load64(&patch_tgt + j * 8);
+        if (tgt_id <= 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        if (tgt_id >= cap_ids) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
+        var toff = load64(&laboff + tgt_id * 8);
         if (toff < 0) { return 0 - CMP_ERR_UNRESOLVED_LABEL; }
         var simm = (toff - (boff + 4)) / 4;
         var dw = load32(buf + boff);
@@ -14267,15 +15135,26 @@ fn _cmp_isel_len(len): i64 {
     return len;
 }
 
-# 1 if the selected list uses the divergent-if EXEC mask (an s_and_saveexec) — the
-# driver then reserves the saved-EXEC SGPR pair and bumps the rsrc1 SGPR count.
-fn _cmp_has_exec_save(isel, ni): i64 {
+# The lowest saved-EXEC pair base the selected list uses (gfx9_isel's region stack: s[100:101]
+# at depth 0, s[98:99] at depth 1, ...), or 0 if it has no divergent control flow. The driver
+# caps regalloc below it and makes the rsrc1 SGPR count cover s101. (4.3.1 had one pair and
+# answered 1 / 0 here.)
+fn _cmp_exec_save_base(isel, ni): i64 {
+    var lo = 0;
     var i = 0;
     while (i < ni) {
-        if (gisel_op(isel, i) == GISEL_S_SAVEEXEC) { return 1; }
+        var op = gisel_op(isel, i);
+        var pair = 0;
+        if (op == GISEL_S_SAVEEXEC) { pair = 1; }
+        if (op == GISEL_S_LOOP_SAVE) { pair = 1; }
+        if (pair == 1) {
+            var base = gisel_a(isel, i);
+            if (lo == 0) { lo = base; }
+            if (base < lo) { lo = base; }
+        }
         i = i + 1;
     }
-    return 0;
+    return lo;
 }
 
 # ================================================================
@@ -14321,11 +15200,13 @@ fn gfx9_compile(ctx, spirv, n, isa, isa_len, desc): i64 {
     if (ar < 0) { return ar; }
     var alloc = load64(ctx + CC_ALLOC);
     var hw = load64(ctx + CC_HW);
-    # A divergent if reserves s[100:101] for the saved EXEC, so the regalloc must not
-    # allocate that high (cap drops to GFX9_EXEC_SAVE_SGPR).
-    var div_cf = _cmp_has_exec_save(isel, ni);
+    # Divergent ifs and loops reserve saved-EXEC pairs downward from s[100:101], one per nesting
+    # level, so the regalloc must stop below the deepest one.
+    var save_base = _cmp_exec_save_base(isel, ni);
+    var div_cf = 0;
+    if (save_base > 0) { div_cf = 1; }
     var scap = GFX9_SGPR_CAP;
-    if (div_cf == 1) { scap = GFX9_EXEC_SAVE_SGPR; }
+    if (div_cf == 1) { scap = save_base; }
     var rr = gfx9_regalloc(m, isel, ni, gfx9_abi_sgpr_base(abi), gfx9_abi_vgpr_base(abi),
       scap, GFX9_VGPR_CAP, alloc, load64(ctx + CC_ALLOC_LEN), hw);
     if (rr < 0) { return rr; }
@@ -27083,7 +27964,7 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
 #   50-53   register allocation                              (src/gfx9_regalloc.cyr)
 #   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
 #   70-88   encoding / validation / table build              (src/gfx9_compile.cyr)
-#   100-104 instruction selection                            (src/gfx9_isel.cyr)
+#   100-106 instruction selection                            (src/gfx9_isel.cyr)
 #   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
 fn gpu_shader_error_name(code): i64 {
     if (code == 0) { return "no error"; }
@@ -27111,10 +27992,10 @@ fn gpu_shader_error_name(code): i64 {
     if (c == LOWER_ERR_ARRAY_STRIDE)   { return "lower: ArrayStride disagrees with std430"; }
     if (c == LOWER_ERR_EXT_SET)        { return "lower: non-GLSL.std.450 extended instruction set"; }
     if (c == LOWER_ERR_SELECT_NOT_ADJACENT) {
-        return "lower: OpSelect's integer compare is not adjacent - VCC no longer live";
+        return "lower: (not returned since 4.4.0) OpSelect's integer compare was not adjacent";
     }
     if (c == LOWER_ERR_SELECT_UNIFORM_COND) {
-        return "lower: OpSelect's integer compare is uniform (SCC) - needs a divergent condition";
+        return "lower: (not returned since 4.4.0) OpSelect's integer compare was uniform";
     }
     if (c == LOWER_ERR_OUTBI_SHORT)    { return "lower: builtin table out_bi[] shorter than id_bound records"; }
     # --- register allocation ---
@@ -27146,10 +28027,16 @@ fn gpu_shader_error_name(code): i64 {
     if (c == GISEL_ERR_UNSUPPORTED_OP)     { return "isel: MIR op not selectable on GFX9"; }
     if (c == GISEL_ERR_CAP_EXCEEDED)       { return "isel: selected-instruction capacity exceeded"; }
     if (c == GISEL_ERR_NESTED_SELECTION) {
-        return "isel: a divergent if inside another - flatten to two sequential ifs";
+        return "isel: divergent ifs / loops nested deeper than 8 - flatten one level";
     }
     if (c == GISEL_ERR_RETURN_IN_SELECTION) {
-        return "isel: OpReturn inside a divergent if would end the whole wave - invert the guard";
+        return "isel: OpReturn inside a divergent if or loop would end the whole wave - invert the guard";
+    }
+    if (c == GISEL_ERR_UNSTRUCTURED_CF) {
+        return "isel: a branch leaves a divergent if or loop mid-way, or a layout EXEC masking cannot follow";
+    }
+    if (c == GISEL_ERR_COND_NOT_COMPARE) {
+        return "isel: branch / select condition is not an integer or OpFOrd compare result";
     }
     if (c == GISEL_ERR_UNCLOSED_SELECTION) { return "isel: divergent if never reached its merge label"; }
     # --- module staging ---

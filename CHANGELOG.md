@@ -16,10 +16,23 @@ for the immediate forward pointer.
 ## [4.4.0] — in progress (VERSION still reads 4.3.1)
 
 **Compilers + NVIDIA** ([roadmap](docs/development/roadmap.md#v440--compilers--nvidia)). Landed
-so far: **the scratch-buffer contract**. Every compiler buffer now arrives with its length in
-bytes, and each stage derives its capacity from that length. While moving the call sites over,
-three real overruns turned up (Security, Fixed), one in the path that compiles consumer SPIR-V.
-The remaining 4.4.0 items are open and tracked in the roadmap.
+so far, both in the native AMD SPIR-V compiler:
+- **The scratch-buffer contract.** Every compiler buffer now arrives with its length in bytes, and
+  each stage derives its capacity from that length. Moving the call sites over turned up three
+  real overruns, one in the path that compiles consumer SPIR-V.
+- **The compiler limits v4.1.0 left named.** Divergent ifs now nest (up to 8 levels), and
+  int-compare `OpSelect` works with a uniform condition and with a compare that isn't adjacent.
+  The roadmap described these as "each refused with a code today, never miscompiled". That turned
+  out to be wrong for the shapes next to them. All of these compiled and ran with **wrong
+  results and no error**: divergent if/else; divergent loops; a branch whose compare was followed
+  by an instruction that overwrites SCC/VCC; loop phis (missing copies on conditional edges,
+  swapped phis, f64 phis); and a dead load whose register was reused. The v4.1.0 int-compare
+  select never worked through the real pipeline, and a crafted label id crashed the compile frame.
+  All of these are fixed, and each is pinned by a kernel the new hardware gate checks lane by
+  lane.
+
+The remaining 4.4.0 items are open and tracked in the roadmap. That includes "the same in N9's
+SM75 path", which waits on N9.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -32,6 +45,100 @@ The remaining 4.4.0 items are open and tracked in the roadmap.
   Fixed: `ptrs[4096]`, and the gate (below) now fails a local buffer whose length is not
   checkable. Regression: `test_contract_many_access_chains` compiles 100 chains through the
   production path. Shrinking `ptrs[]` back to 2048 bytes fails it with `MIR_ERR_CAP_EXCEEDED`.
+
+- **(HIGH) Stack write at an attacker-chosen offset in the native SPIR-V compile path.**
+  `spirv_validate_stream` checks structure only (word counts), and nothing bounded a label `<id>`
+  by `id_bound`. `gfx9_emit_program` indexes its 256-entry label-offset table by that id, so a
+  module with `OpLabel %5000` and a small header `id_bound` stored the ISA position at
+  `&laboff + 5000 * 8`, off the stack. Through `gpu_shader_module_create_spirv` this crashed the
+  probe (exit 139). Fixed twice: lowering rejects any label or branch target that is 0 or
+  `>= id_bound` (`_spirv_check_label`, `MIR_ERR_ID_OOR`), and the emitter bounds the id again
+  before it indexes the table. Regression: the `oob_label` kernel (`tests/spirv/control_flow/`,
+  generated) must be refused with `MIR_ERR_ID_OOR`, on the CPU and on hardware.
+
+### Fixed — native compiler control flow (these compiled and ran wrong, with no error)
+All found by probe kernels on the Cezanne while doing the named limits. Each is now a kernel in
+`tests/spirv/control_flow/`, checked on all 64 lanes by `test-native-spirv-control-flow-e2e`.
+- **Divergent if/else dropped the else block.** Isel took the false target to be the merge. The
+  then-block's `s_branch MERGE` then carried the whole wave over the else block, and lanes 32–63
+  of `if_else_div` kept their seed. Now the header saves the not-taken lanes
+  (`s_and_saveexec` + `s_xor`). At the else label `s_or_saveexec` + `s_xor exec` flips EXEC to
+  them, and the merge restores.
+- **A branch read a stale condition flag.** An integer compare leaves its result in SCC (uniform)
+  or VCC (divergent), and the branch read whatever the flag held when it executed. With an
+  `OpUDiv` in between (it writes VCC), `if_vcc_clobbered` ran the then-block for lane 0 only.
+  With an `s_add` in between (it writes SCC), `if_scc_clobbered_taken` skipped a taken branch.
+  Now every branch and select checks whether the record just before it is its own compare, and
+  re-emits the compare if not. Compares are pure, so this costs one instruction.
+- **Divergent loops lost lanes.** The exit restored EXEC from a pair saved on the last iteration,
+  so lanes that left the loop early never ran the code after it (`loop_div`: every lane with a
+  zero trip count kept its seed). Now EXEC is saved once before the header and narrowed at each
+  divergent exit (`s_and_b64` / `s_andn2_b64 exec, exec, vcc` + `s_cbranch_execz`). The exit
+  label restores every lane that entered.
+- **Phi copies were missing on conditional edges.** Only `OpBranch` emitted the copies an `OpPhi`
+  needs on its edge, so a phi fed through `OpBranchConditional` kept a stale value. A do-while,
+  whose latch is a conditional back-edge, never advanced its counter and **hung the GPU**
+  (`loop_do_while`; the hang caused a compute-ring reset at 12:59:20 on this boot). Copies on a
+  forward edge are now emitted before the branch, which is safe because every other path into
+  that block copies again. Copies on a backward edge (to the loop header) are emitted after the
+  exit test, so they run on the continuing path only.
+- **The v4.1.0 int-compare `OpSelect` never worked.** Lowering decided it from the condition's
+  uniformity, but the uniformity sweep runs after lowering, so every condition read
+  `MIR_UNKNOWN`. Every int-compare select, the adjacent divergent case v4.1.0 shipped included,
+  failed as `LOWER_ERR_SELECT_UNIFORM_COND`. The unit tests passed only because they ran the
+  sweep by hand first.
+- **Swapped loop phis lost a value.** Phi copies on an edge ran one after another, so a phi whose
+  source is another phi of the same block read the value just written: a pair swapped every
+  iteration came back (2, 2) instead of (2, 1). The copies are now a parallel copy: if any source
+  on an edge is also written on that edge, every source goes through a temporary first
+  (`loop_phi_swap`).
+- **An f64 phi copied only its low dword.** The copy was one `v_mov_b32`, so an f64 loop
+  accumulator kept a stale high half (`loop_phi_f64` got 0 where 12 is right). An f64 copy is now
+  a `v_mov_b32` pair, and an f64 constant source is materialized into a pair first.
+- **A dead load's VGPR was reused while the load was in flight.** waitcnt waits only before a use
+  of a loaded value. Regalloc freed the register of a load nobody reads at its definition, gave
+  it to the next value, and the load then landed on that value. Now a dead VMEM load keeps its
+  register to the end of the program (`test_gfx9_regalloc_dead_load_keeps_register`). The
+  phi-swap kernel loads `a[x]` without reading it, which is how this showed up.
+- Regalloc and waitcnt read label ids on `LABEL` / `S_BRANCH` / `S_CBRANCH` records as value uses
+  (the label field wasn't flagged as an immediate). That could extend the live range of an
+  unrelated value with the same number, or put a wait before a branch for nothing. The fields
+  are flagged now.
+
+### Added — the compiler limits v4.1.0 left named
+- **Nested divergent control flow.** `gfx9_isel` keeps a stack of open divergent regions, one
+  saved-EXEC SGPR pair each: s[100:101] at depth 0, down to s[86:87] at depth 8
+  (`GISEL_CF_MAX_DEPTH`). The regalloc ceiling drops to the deepest pair in use. If, if/else,
+  loops with a divergent trip count, a divergent `break` from the loop body, do-while, loops
+  inside ifs and ifs inside loops all compile. `GISEL_ERR_NESTED_SELECTION` now means "deeper
+  than 8".
+- **Int-compare `OpSelect`, all forms.** Lowering emits `MIR_OP_ISELECT`, and isel chooses once
+  uniformity and order are known:
+  - divergent condition: `v_cndmask_b32`;
+  - uniform condition with a uniform integer result: `s_cselect_b32` (two different literals:
+    `s_mov_b32` + `s_cselect_b32`);
+  - uniform condition with per-lane values: `s_cselect_b64 vcc, -1, 0` + `v_cndmask_b32`.
+
+  A compare that isn't adjacent is re-emitted. `v_cndmask_b32`'s `src0` may now be an inline
+  constant; an SGPR or literal is copied to a VGPR first, because GFX9's constant bus forbids
+  them next to VCC (llvm-mc confirmed).
+- Error codes `GISEL_ERR_UNSTRUCTURED_CF` (105: a branch leaves a divergent region mid-way, or a
+  layout EXEC masking can't follow) and `GISEL_ERR_COND_NOT_COMPARE` (106). Both are named by
+  `gpu_shader_error_name`. `LOWER_ERR_SELECT_NOT_ADJACENT` / `_UNIFORM_COND` are no longer
+  returned; the codes and names stay.
+- `tests/spirv/control_flow/`: 21 SPIR-V assembly kernels (`head.spvasm`, plus `head_f64.spvasm`
+  for f64), each with its expected lane values or refusal code.
+  `scripts/gen-spirv-cf-fixtures.py` assembles and validates them, generates three more
+  (`if_nest8`, `if_nest9`, `oob_label`), and writes `tests/tcyr/spirv_cf_kernels.cyr`.
+  `make check-cf-fixtures` fails if that file is stale.
+- `programs/native_spirv_control_flow_e2e.cyr` / `make test-native-spirv-control-flow-e2e` runs
+  all 24 kernels through the public API on hardware and checks every lane. It is part of
+  `test-native-all`.
+- CPU tests: every kernel compiles or is refused with exactly its code. The ISA of each fixed
+  bug is checked for the instruction that fixes it; for example, the dword before `s_and_saveexec`
+  must be a `v_cmp`. Disabling the re-emission fails exactly those two assertions. There are
+  also tests for the region stack (nesting, the depth limit, two ifs closing at one label, the
+  inverted uniform back-edge) and the new encodings, dword-exact against llvm-mc.
 
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
@@ -94,13 +201,19 @@ The remaining 4.4.0 items are open and tracked in the roadmap.
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 25 suites, **6929 assertions**, 0 failed (4.3.1: 6880). Per-file lint,
-  `--strict-deferrals` and `fmt --check` are clean on every changed file. `cyrius vet`, the
-  sizing / stack-array / write-length / count-script / make-dry-run gates, `fuzz`,
-  `example-link` and `test-raw-include` pass. `cyrius distlib` is idempotent.
-- AMD Cezanne: `make test-native-all` gives 72 passed, 0 failed, 2 skipped (DRM master), the
-  same as 4.3.1. Every edited `native_spirv_*_e2e` program passes
-  (`build/logs/test-native-all-20261116-123553.log`).
+- CPU: 25 suites, **7033 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract alone). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
+  make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
+  `cyrius distlib` is idempotent.
+- AMD Cezanne, scratch-buffer contract: `make test-native-all` gave 72 passed, 0 failed,
+  2 skipped (DRM master), the same as 4.3.1 (`build/logs/test-native-all-20261116-123553.log`).
+- AMD Cezanne, control flow: `test-native-spirv-control-flow-e2e` passes 24 / 24, and
+  `make test-native-all` gives 73 passed, 0 failed, 2 skipped, of 75
+  (`build/logs/test-native-all-20261116-131938.log`). ⚠ This boot took a compute-ring reset at
+  12:59:20, when the `loop_do_while` probe hung the GPU before its fix. That was a per-queue
+  reset, not MODE2, but render gates on this boot ran after it. The clean-boot rerun is already
+  a 4.4.0 closeout item.
 - Not yet run for 4.4.0: the NVIDIA box `chew` (this change touches no NVIDIA code), and
   ranga's suites, which need the table-builder fix described above.
 

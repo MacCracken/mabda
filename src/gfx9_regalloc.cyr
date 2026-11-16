@@ -176,6 +176,28 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
         if ((fl & MIR_FLAG_C_IMM) == 0) { _ra_use(m, alloc, gisel_c(isel, i), i); }
         i = i + 1;
     }
+    # v4.4.0 — a DEAD load keeps its register to the end. A VMEM load writes its VGPR whenever the
+    # memory returns, and gfx9_waitcnt waits only before a USE of the result; a load nobody reads
+    # gets no wait, so freeing its register at the def let a later value claim it and then be
+    # overwritten by the load landing late. Found by the phi-swap probe (4.4.0): the kernel never
+    # read its a[x] load, regalloc gave that VGPR to a loop phi, and the phi read back lane-varying
+    # garbage. A used load is safe: its first use waits (vmcnt 0) before the register can recycle.
+    i = 0;
+    while (i < n_isel) {
+        var lop = gisel_op(isel, i);
+        var is_ld = 0;
+        if (lop == GISEL_GLOBAL_LOAD) { is_ld = 1; }
+        if (lop == GISEL_GLOBAL_LOAD_DWORDX2) { is_ld = 1; }
+        if (is_ld == 1) {
+            var ld = gisel_dst(isel, i);
+            if (ld > 0) {
+                if (ld < cap_ids) {
+                    if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n_isel); }
+                }
+            }
+        }
+        i = i + 1;
+    }
     # v4.1.0 — LOOP LIVENESS EXTENSION. This is the blocker the lowerer's
     # "loops remain unsupported" comment names: "a back-edge breaks the forward
     # linear-scan liveness".
@@ -210,11 +232,13 @@ fn gfx9_regalloc(m, isel, n_isel, sgpr_base, vgpr_base, sgpr_cap, vgpr_cap, allo
             var is_br = 0;
             if (bop == GISEL_S_BRANCH) { is_br = 1; }
             if (bop == GISEL_S_CBRANCH) { is_br = 1; }
+            if (bop == GISEL_S_CBRANCH_SCC1) { is_br = 1; }
             if (is_br == 1) {
                 # Resolve the branch target to its LABEL index. A target earlier in
                 # the list is a back-edge, and [tgt, bi] is the loop body.
                 var tgt = gisel_a(isel, bi);
                 if (bop == GISEL_S_CBRANCH) { tgt = gisel_c(isel, bi); }
+                if (bop == GISEL_S_CBRANCH_SCC1) { tgt = gisel_c(isel, bi); }
                 var li = 0;
                 var tgt_idx = 0 - 1;
                 while (li < n_isel) {

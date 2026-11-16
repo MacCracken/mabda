@@ -1479,10 +1479,9 @@ fn test_gfx9_isel_rejects_return_in_selection() {
     return 0;
 }
 
-# A divergent if opened inside another. Already rejected before v4.0.11 — but as
-# the generic GISEL_ERR_UNSUPPORTED_OP, which told a consumer nothing about which
-# construct to change. Now it names itself.
-fn test_gfx9_isel_rejects_nested_selection() {
+# v4.4.0 — nested divergent ifs COMPILE. Before, any nesting was GISEL_ERR_NESTED_SELECTION
+# (one saved-EXEC pair); now each level takes the next pair down: s[100:101], then s[98:99].
+fn test_gfx9_isel_nested_selection_compiles() {
     var m[80];
     var vals[640];
     var instrs[512];
@@ -1492,16 +1491,137 @@ fn test_gfx9_isel_rejects_nested_selection() {
     mir_set_const(&m, 1, MIR_T_U32, 8);
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
-    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
-    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);
-    # second divergent if, opened before the first reached its merge
+    mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 7, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, MIR_FLAG_A_IMM);    # outer then
     mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 5, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
-    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, 0);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, MIR_FLAG_A_IMM);    # inner then
+    mir_emit(&m, MIR_OP_BRANCH, 0, MIR_T_VOID, 6, 0, 0, MIR_FLAG_A_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, MIR_FLAG_A_IMM);    # inner merge
+    mir_emit(&m, MIR_OP_BRANCH, 0, MIR_T_VOID, 7, 0, 0, MIR_FLAG_A_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 7, 0, 0, MIR_FLAG_A_IMM);    # outer merge
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     var isel[768];
-    assert_eq(gfx9_isel(&m, &isel, 768), 0 - GISEL_ERR_NESTED_SELECTION,
-      "a nested divergent if names itself");
+    var ni = gfx9_isel(&m, &isel, 768);
+    assert_eq(ni > 0, 1, "a divergent if inside another compiles");
+    # [0] v_cmp [1] saveexec s100 [2] xor s100 [3] execz %7 [4] label %4
+    # [5] v_cmp (re-emitted: the label sits between) [6] saveexec s98 [7] xor s98 [8] execz %6
+    # [9] label %5 [10] label %6 [11] or_exec s98 [12] label %7 [13] or_exec s100 [14] endpgm
+    assert_eq(ni, 15, "15 records");
+    assert_eq(gisel_op(&isel, 1), GISEL_S_SAVEEXEC, "outer saveexec");
+    assert_eq(gisel_a(&isel, 1), 100, "outer level saves into s[100:101]");
+    assert_eq(gisel_op(&isel, 5), GISEL_V_CMP, "the inner branch re-emits its compare");
+    assert_eq(gisel_op(&isel, 6), GISEL_S_SAVEEXEC, "inner saveexec");
+    assert_eq(gisel_a(&isel, 6), 98, "inner level saves into s[98:99]");
+    assert_eq(gisel_op(&isel, 11), GISEL_S_OR_EXEC, "inner restore first");
+    assert_eq(gisel_a(&isel, 11), 98, "inner restore from s[98:99]");
+    assert_eq(gisel_op(&isel, 13), GISEL_S_OR_EXEC, "then the outer restore");
+    assert_eq(gisel_a(&isel, 13), 100, "outer restore from s[100:101]");
+    return 0;
+}
+
+# Nesting is bounded by the saved-EXEC pairs: GISEL_CF_MAX_DEPTH (8) levels, s[86:101].
+fn _isel_nest(depth, isel): i64 {
+    var m[80];
+    var vals[2560];
+    var instrs[2048];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 2560, &instrs, 2048, &ptrs, 64, &blocks, 32, 64);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
+    var d = 0;
+    while (d < depth) {
+        # then label 10+d, merge label 40+d
+        mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 10 + d, 40 + d, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+        mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 10 + d, 0, 0, MIR_FLAG_A_IMM);
+        d = d + 1;
+    }
+    while (d > 0) {
+        d = d - 1;
+        mir_emit(&m, MIR_OP_BRANCH, 0, MIR_T_VOID, 40 + d, 0, 0, MIR_FLAG_A_IMM);
+        mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 40 + d, 0, 0, MIR_FLAG_A_IMM);
+    }
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    return gfx9_isel(&m, isel, 4800);
+}
+
+fn test_gfx9_isel_nesting_depth_limit() {
+    var isel[4800];
+    var ni = _isel_nest(8, &isel);
+    assert_eq(ni > 0, 1, "8 nested divergent ifs compile (GISEL_CF_MAX_DEPTH)");
+    var lo = 1000;
+    var i = 0;
+    while (i < ni) {
+        if (gisel_op(&isel, i) == GISEL_S_SAVEEXEC) { if (gisel_a(&isel, i) < lo) { lo = gisel_a(&isel, i); } }
+        i = i + 1;
+    }
+    assert_eq(lo, 86, "the 8th level saves into s[86:87]");
+    assert_eq(_isel_nest(9, &isel), 0 - GISEL_ERR_NESTED_SELECTION, "a 9th level names itself");
+    assert_eq(GISEL_CF_MAX_DEPTH, 8, "GISEL_CF_MAX_DEPTH is 8");
+    return 0;
+}
+
+# v4.4.0 — a UNIFORM branch whose FALSE target is a loop header taking a back-edge phi copy:
+# s_cbranch_scc1 to the TRUE target, the copy, then s_branch to the header — the copy runs on
+# the back-edge only (_spirv_lower_cond_branch, MIR_CB_MOVES_ON_FALSE).
+fn test_gfx9_isel_uniform_back_edge_copies_invert() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    mir_set_const(&m, 1, MIR_T_U32, 8);
+    mir_set_const(&m, 9, MIR_T_U32, 0);
+    mir_emit(&m, MIR_OP_BRANCH, 0, MIR_T_VOID, 10, 0, 0, MIR_FLAG_A_IMM);    # entry -> header
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 10, 0, 0, MIR_FLAG_A_IMM);     # header
+    mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 1, 1, 0, 0);                # uniform cond
+    var cb = mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 11, 10, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
+    mir_emit(&m, MIR_OP_VMOV, 12, MIR_T_U32, 9, 0, 0, 0);                   # the back-edge copy
+    mir_set_instr_flags(&m, cb, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM | MIR_CB_MOVES_ON_FALSE | (1 << MIR_CB_MOVES_SHIFT));
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 11, 0, 0, MIR_FLAG_A_IMM);     # exit
+    mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
+    mir_run_uniformity(&m);
+    var isel[768];
+    var ni = gfx9_isel(&m, &isel, 768);
+    assert_eq(ni, 8, "8 records");
+    assert_eq(gisel_op(&isel, 2), GISEL_S_CMP, "s_cmp (fresh: the branch follows it)");
+    assert_eq(gisel_op(&isel, 3), GISEL_S_CBRANCH_SCC1, "inverted: s_cbranch_scc1");
+    assert_eq(gisel_c(&isel, 3), 11, "to the TRUE target (the exit)");
+    assert_eq(gisel_op(&isel, 4), GISEL_V_MOV, "the copy, on the back-edge only");
+    assert_eq(gisel_dst(&isel, 4), 12, "copy dst");
+    assert_eq(gisel_op(&isel, 5), GISEL_S_BRANCH, "then the back-edge");
+    assert_eq(gisel_a(&isel, 5), 10, "to the header");
+    return 0;
+}
+
+# v4.4.0 — every new encoding, dword-exact against llvm-mc 22 (gfx90c).
+fn test_gfx9_cf_encodings_llvm_mc() {
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B32, 0, 1, 255), 0x8500FF01, "s_cselect_b32 s0, s1, lit");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_CSELECT_B64, GFX9_REG_VCC_LO, 193, 128), 0x85EA80C1,
+      "s_cselect_b64 vcc, -1, 0");
+    assert_eq(gfx9_enc_sop1(GFX9_SOP1_S_AND_SAVEEXEC_B64, 98, GFX9_REG_VCC_LO), 0xBEE2206A,
+      "s_and_saveexec_b64 s[98:99], vcc");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, 100, GFX9_REG_EXEC_LO, 100), 0x88E4647E,
+      "s_xor_b64 s[100:101], exec, s[100:101]");
+    assert_eq(gfx9_enc_sop1(GFX9_SOP1_S_OR_SAVEEXEC_B64, 100, 100), 0xBEE42164,
+      "s_or_saveexec_b64 s[100:101], s[100:101]");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_XOR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, 100), 0x88FE647E,
+      "s_xor_b64 exec, exec, s[100:101]");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_OR_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, 98), 0x87FE627E,
+      "s_or_b64 exec, exec, s[98:99]");
+    assert_eq(gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, 98, GFX9_REG_EXEC_LO), 0xBEE2017E, "s_mov_b64 s[98:99], exec");
+    assert_eq(gfx9_enc_sop1(GFX9_SOP1_S_MOV_B64, GFX9_REG_EXEC_LO, 98), 0xBEFE0162, "s_mov_b64 exec, s[98:99]");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_AND_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO), 0x86FE6A7E,
+      "s_and_b64 exec, exec, vcc");
+    assert_eq(gfx9_enc_sop2(GFX9_SOP2_S_ANDN2_B64, GFX9_REG_EXEC_LO, GFX9_REG_EXEC_LO, GFX9_REG_VCC_LO), 0x89FE6A7E,
+      "s_andn2_b64 exec, exec, vcc");
+    assert_eq(gfx9_enc_vop2(GFX9_VOP2_V_CNDMASK_B32, 0, 193, 1), 0x000002C1, "v_cndmask_b32 v0, -1, v1, vcc");
+    assert_eq(gfx9_enc_vopc(GFX9_VOPC_V_CMP_NE_U32, 128, 3), 0x7D9A0680, "v_cmp_ne_u32 vcc, 0, v3");
+    assert_eq(gfx9_enc_sopp(GFX9_SOPP_S_CBRANCH_SCC1, 0), 0xBF850000, "s_cbranch_scc1 0");
     return 0;
 }
 
@@ -1543,25 +1663,28 @@ fn test_gfx9_isel_divergent_if() {
     mir_run_uniformity(&m);
     var isel[768];
     var ni = gfx9_isel(&m, &isel, 768);
-    assert_eq(ni, 8, "8 selected (v_cmp + saveexec + execz + then-label + s_branch + merge-label + or + endpgm)");
+    # v4.4.0: the header gains s_xor (saved = lanes NOT taking then, which the else flip needs),
+    # and the then-block's branch to the merge right after it is dropped (a fall-through).
+    assert_eq(ni, 8, "8 selected (v_cmp, saveexec, xor, execz, then-label, merge-label, or, endpgm)");
     assert_eq(gisel_op(&isel, 0), GISEL_V_CMP, "0: v_cmp");
     assert_eq(gisel_op(&isel, 1), GISEL_S_SAVEEXEC, "1: s_and_saveexec_b64");
-    assert_eq(gisel_op(&isel, 2), GISEL_S_CBRANCH_EXECZ, "2: s_cbranch_execz");
-    assert_eq(gisel_c(&isel, 2), 5, "execz skip-target = merge %5");
-    assert_eq(gisel_op(&isel, 3), GISEL_LABEL, "3: then label");
-    assert_eq(gisel_a(&isel, 3), 4, "then label = %4");
-    assert_eq(gisel_op(&isel, 4), GISEL_S_BRANCH, "4: s_branch");
-    assert_eq(gisel_a(&isel, 4), 5, "branch target = merge %5");
+    assert_eq(gisel_a(&isel, 1), 100, "depth 0 saves into s[100:101]");
+    assert_eq(gisel_op(&isel, 2), GISEL_S_EXEC_XOR_SAVE, "2: s_xor_b64 s[100:101], exec, s[100:101]");
+    assert_eq(gisel_op(&isel, 3), GISEL_S_CBRANCH_EXECZ, "3: s_cbranch_execz");
+    assert_eq(gisel_c(&isel, 3), 5, "execz skip-target = merge %5");
+    assert_eq(gisel_op(&isel, 4), GISEL_LABEL, "4: then label");
+    assert_eq(gisel_a(&isel, 4), 4, "then label = %4");
     assert_eq(gisel_op(&isel, 5), GISEL_LABEL, "5: merge label (before restore)");
     assert_eq(gisel_a(&isel, 5), 5, "merge label = %5");
     assert_eq(gisel_op(&isel, 6), GISEL_S_OR_EXEC, "6: s_or_b64 exec restore");
+    assert_eq(gisel_a(&isel, 6), 100, "restore from s[100:101]");
     assert_eq(gisel_op(&isel, 7), GISEL_S_ENDPGM, "7: s_endpgm");
     return 0;
 }
 
-# N.7c-2b — nested divergent ifs are not supported in the MVP; isel fails loud rather
-# than corrupting the single saved-EXEC pair (see docs/archive/punchlists/3-2-punchlist.md N.8).
-fn test_gfx9_isel_divergent_if_nesting_rejected() {
+# v4.4.0 — two divergent ifs that end at the SAME label (N.7c-2b rejected any nesting): the
+# label is emitted once, then both restores, innermost first.
+fn test_gfx9_isel_two_ifs_closing_at_one_label() {
     var m[80];
     var vals[640];
     var instrs[512];
@@ -1572,14 +1695,49 @@ fn test_gfx9_isel_divergent_if_nesting_rejected() {
     mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_GLOBAL_INVOC_ID);
     mir_emit(&m, MIR_OP_ICMP_ULT, 3, MIR_T_U32, 2, 1, 0, 0);
     mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 4, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
-    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, 0);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 4, 0, 0, MIR_FLAG_A_IMM);
     mir_emit(&m, MIR_OP_COND_BRANCH, 0, MIR_T_VOID, 3, 5, 6, MIR_FLAG_B_IMM | MIR_FLAG_C_IMM);
-    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, 0);
-    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, 0);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 5, 0, 0, MIR_FLAG_A_IMM);
+    mir_emit(&m, MIR_OP_LABEL, 0, MIR_T_VOID, 6, 0, 0, MIR_FLAG_A_IMM);
     mir_emit(&m, MIR_OP_RET, 0, MIR_T_VOID, 0, 0, 0, 0);
     mir_run_uniformity(&m);
     var isel[768];
-    assert_eq(gfx9_isel(&m, &isel, 768) < 0, 1, "nested divergent if fails loud (single EXEC pair)");
+    var ni = gfx9_isel(&m, &isel, 768);
+    assert_eq(ni > 0, 1, "two ifs sharing a merge label compile");
+    var at = 0;
+    var i = 0;
+    while (i < ni) {
+        if (gisel_op(&isel, i) == GISEL_LABEL) { if (gisel_a(&isel, i) == 6) { at = i; } }
+        i = i + 1;
+    }
+    assert_eq(gisel_op(&isel, at + 1), GISEL_S_OR_EXEC, "first restore after the shared label");
+    assert_eq(gisel_a(&isel, at + 1), 98, "inner first (s[98:99])");
+    assert_eq(gisel_op(&isel, at + 2), GISEL_S_OR_EXEC, "second restore");
+    assert_eq(gisel_a(&isel, at + 2), 100, "then outer (s[100:101])");
+    return 0;
+}
+
+# v4.4.0 — a load nobody reads keeps its VGPR. waitcnt only waits before a USE of a loaded value,
+# so a dead load's register, freed at its def, could be handed to the next value and then
+# overwritten when the load landed (the phi-swap probe read lane-varying garbage).
+fn test_gfx9_regalloc_dead_load_keeps_register() {
+    var m[80];
+    var vals[640];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 640, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    _mir_set_val(&m, 5, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0, 0);
+    _mir_set_val(&m, 6, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 1, 0);
+    mir_set_builtin(&m, 2, MIR_T_U32, MIR_BI_LOCAL_INVOC_ID);
+    var isel[480];
+    _gisel_emit(&isel, 0, GISEL_GLOBAL_LOAD, 5, 2, 0, 0, MIR_FLAG_B_IMM);   # dead: 5 is never read
+    _gisel_emit(&isel, 1, GISEL_V_MOV, 6, 2, 0, 0, 0);                      # the next VGPR value
+    _gisel_emit(&isel, 2, GISEL_S_ENDPGM, 0, 0, 0, 0, 0);
+    var alloc[256];
+    var hw[16];
+    assert_eq(gfx9_regalloc(&m, &isel, 3, 8, 1, 104, 256, &alloc, 256, &hw), 0, "regalloc ok");
+    assert_neq(gfx9_reg(&alloc, 6), gfx9_reg(&alloc, 5), "the value after a dead load gets a different VGPR");
     return 0;
 }
 
@@ -1624,9 +1782,13 @@ fn main(): i64 {
     test_gfx9_regalloc_loop_liveness();
     test_gfx9_regalloc_allocates_each_value_once();
     test_gfx9_isel_rejects_return_in_selection();
-    test_gfx9_isel_rejects_nested_selection();
+    test_gfx9_isel_nested_selection_compiles();
+    test_gfx9_isel_nesting_depth_limit();
+    test_gfx9_isel_uniform_back_edge_copies_invert();
+    test_gfx9_cf_encodings_llvm_mc();
+    test_gfx9_regalloc_dead_load_keeps_register();
     test_gfx9_isel_rejects_unclosed_selection();
     test_gfx9_isel_divergent_if();
-    test_gfx9_isel_divergent_if_nesting_rejected();
+    test_gfx9_isel_two_ifs_closing_at_one_label();
     return assert_summary();
 }
