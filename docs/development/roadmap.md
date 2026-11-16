@@ -130,7 +130,7 @@ consumer accidentally couples to it.
 
 ## The render tier — MB1 to MB5 (shipped 4.3.0 / 4.3.1)
 
-Filed 2026-11-15 by soorat's Cyrius port (`issues/2026-11-15-render-tier-for-geometry-consumers.md`,
+Filed 2026-11-15 by soorat's Cyrius port (`issues/archived/2026-11-15-render-tier-for-geometry-consumers.md`,
 its ledger L2–L6). **MB1 shipped in 4.3.0** (the pipeline descriptor, bind groups, draw-time calls,
 public constant names, the error channel); **MB2–MB5 shipped in 4.3.1** (CHANGELOG [4.3.1]) on an
 83-slot launcher — the 4.3.0 revision lacked the compute pass encoder's release and the compute
@@ -154,11 +154,11 @@ pipeline's bind group layout, added as slots 81–82 (the one further consumer r
   (`programs/compute_tier_e2e.cyr`; soorat `particles`).
 - **MB5 — a window surface.** A `WGPUSurface` from a Wayland `wl_display` / `wl_surface`,
   capabilities, configure in any listed format with AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture
-  objects, resize. **HW proof open:** `programs/surface_wayland_e2e.cyr` (a Wayland client driven
-  from Cyrius) needs a running compositor; neither the Cezanne dev box (a tty session) nor `chew`
-  (an SDDM greeter) has one, and Hyprland will not start headless there without a seat. The
-  program loads libwayland-client through the process's libc and SKIPs at `wl_display_connect`;
-  run it from a Wayland session (`make test-surface-wayland-e2e`).
+  objects, resize. HW: `programs/surface_wayland_e2e.cyr` (a Wayland client driven from Cyrius),
+  12 / 12 in a Hyprland session on the Cezanne (2026-11-16). It needs a running compositor, which the
+  boxes only have inside a desktop session (a tty; an SDDM greeter), so it is run there by hand
+  (`make test-surface-wayland-e2e`, logged to `build/logs/`); it SKIPs at `wl_display_connect`
+  anywhere else.
 - **The native render tier** (soorat's ledger L7, after its 2.0). On native AMD and NVIDIA the
   tier serves the native render path's shape — a vertex-less, unbound draw into one single-sample
   RGBA8 target, a cleared one-attachment descriptor pass, and its readback (4.3.1) — and names

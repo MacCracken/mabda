@@ -543,9 +543,20 @@ test-compute-tier-e2e: build/compute_tier_e2e
 # from it, capabilities, BGRA8 configure, 120 frames, an MSAA resolve into a frame,
 # resize, AUTO_VSYNC. Needs a running Wayland compositor (WAYLAND_DISPLAY); prints
 # SKIP without one. Not in test-gpu, whose gates run headless.
+# It runs from a desktop session, where nobody else sees the terminal, so every
+# run writes its whole output — with the date, host, kernel, commit and session —
+# to build/logs/surface_wayland_e2e-<timestamp>.log; build/logs/surface_wayland_e2e.log
+# is a copy of the latest. The recipe exits with the program's status.
 .PHONY: test-surface-wayland-e2e
 test-surface-wayland-e2e: build/surface_wayland_e2e
-	./build/surface_wayland_e2e
+	@mkdir -p build/logs; \
+	log=build/logs/surface_wayland_e2e-$$(date +%Y%m%d-%H%M%S).log; \
+	{ echo "# surface_wayland_e2e $$(date -Is) host=$$(uname -n) kernel=$$(uname -r)"; \
+	  echo "# commit=$$(git rev-parse --short HEAD 2>/dev/null)$$(git diff --quiet 2>/dev/null || echo +dirty)"; \
+	  echo "# WAYLAND_DISPLAY=$${WAYLAND_DISPLAY:-unset} desktop=$${XDG_CURRENT_DESKTOP:-unset} session=$${XDG_SESSION_TYPE:-unset}"; } > $$log; \
+	./build/surface_wayland_e2e >> $$log 2>&1; rc=$$?; \
+	cat $$log; cp $$log build/logs/surface_wayland_e2e.log; \
+	echo "log: $$log (exit $$rc)"; exit $$rc
 
 .PHONY: test-spirv-e2e
 test-spirv-e2e: build/spirv_e2e

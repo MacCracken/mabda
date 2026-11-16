@@ -17,7 +17,7 @@ for the immediate forward pointer.
 
 **The render tier's MB2–MB5: depth and shadows; render formats, MSAA, views, mip generation,
 copies and readback; compute on wgpu; a Wayland window surface.** What soorat's GPU milestones
-M6–M9 asked of mabda (`docs/development/issues/2026-11-15-render-tier-for-geometry-consumers.md`)
+M6–M9 asked of mabda (`docs/development/issues/archived/2026-11-15-render-tier-for-geometry-consumers.md`)
 is on the public tier. The launcher goes from 81 to **83 slots**: 4.3.0's revision lacked the
 compute pass encoder's release and the compute pipeline's bind group layout (the user approved the
 one extra rebuild). Audit: [`docs/audit/2026-11-16-4.3.1-audit.md`](docs/audit/2026-11-16-4.3.1-audit.md).
@@ -39,10 +39,15 @@ one extra rebuild). Audit: [`docs/audit/2026-11-16-4.3.1-audit.md`](docs/audit/2
   antialiased edges; `gpu_particles.wgsl` steps 200 particles exactly. **P6/MB1** still builds all
   11 pipelines, returns its error cases and draws its sprite. **P8**: 100,000 frames, RSS flat at
   43.0 MB, 0 B of heap per frame, 21.3 s.
-- **Not run:** `surface_wayland_e2e` past `wl_display_connect` — neither box has a Wayland
-  compositor (a tty session; an SDDM greeter), and Hyprland will not start headless without a seat.
-  The program loads libwayland-client from Cyrius and SKIPs there; MB5's hardware proof is open
-  (roadmap, MB5).
+- **MB5 on hardware:** `make test-surface-wayland-e2e` — **12 passed, 0 failed** in a Hyprland
+  session on the Cezanne (`WAYLAND_DISPLAY=wayland-1`, kernel 7.2.14, log
+  `build/logs/surface_wayland_e2e-20261116-092215.log`): an xdg_toplevel window opened from Cyrius,
+  the `WGPUSurface` from it, capabilities (7 formats, 3 present modes, BGRA8 and FIFO listed), BGRA8
+  configure with AUTO_NO_VSYNC (resolved to Immediate), frame 0 read back in BGRA order, 120 presented
+  frames, a 4x MSAA target resolved into a frame, resize to half size, AUTO_VSYNC (resolved to Fifo:
+  Hyprland lists no FifoRelaxed) for 5 frames, release. Neither box has a compositor outside a
+  desktop session (a tty; an SDDM greeter), so this gate runs there by hand; every run writes
+  `build/logs/surface_wayland_e2e-<timestamp>.log` (date, host, kernel, commit, session, output).
 
 ### Added — MB2: depth and shadows
 
@@ -119,7 +124,8 @@ one extra rebuild). Audit: [`docs/audit/2026-11-16-4.3.1-audit.md`](docs/audit/2
 - `programs/surface_wayland_e2e.cyr` — a Wayland client in Cyrius (libwayland-client through the
   process's own libc `dlopen`, found by a GNU-hash lookup; the xdg-shell tables built in Cyrius):
   window, surface, capabilities, 120 frames, an MSAA resolve into a frame, resize, AUTO_VSYNC.
-  `make test-surface-wayland-e2e`; it needs a compositor (not in `test-gpu`).
+  `make test-surface-wayland-e2e`, from a Wayland session (not in `test-gpu`); every run writes
+  its output, with the date, host, kernel, commit and session, to `build/logs/`.
 
 ### Added — the native subset
 
@@ -168,8 +174,7 @@ one extra rebuild). Audit: [`docs/audit/2026-11-16-4.3.1-audit.md`](docs/audit/2
 ### Next
 
 Phase 3 of the 2026-11 plan: N9, SPIR-V → SASS for the NVIDIA backend
-(`docs/development/issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`). Open from this release:
-MB5's hardware proof on a running Wayland compositor.
+(`docs/development/issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`).
 
 ## [4.3.0] — 2026-11-16
 
@@ -181,7 +186,7 @@ draw-time calls (vertex and index buffers, indexed draws, dynamic offsets, viewp
 validation error no longer aborts the host process: it returns a `GPU_ERR_*` with wgpu's reason.
 The C launcher grew from 67 to 81 slots in **one** revision that already carries every slot
 MB2–MB5 needs, so consumers rebuild their launcher copy once for the whole render tier.
-Requested by soorat's Cyrius port (`docs/development/issues/2026-11-15-render-tier-for-geometry-consumers.md`,
+Requested by soorat's Cyrius port (`docs/development/issues/archived/2026-11-15-render-tier-for-geometry-consumers.md`,
 its ledger L2–L6); the other 2026-11 filings are fixed here too (L17, L12, L24, and the three
 from ranga's NVIDIA run). Audit: [`docs/audit/2026-11-16-audit.md`](docs/audit/2026-11-16-audit.md).
 
