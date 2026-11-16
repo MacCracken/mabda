@@ -31,15 +31,17 @@ so far, both in the native AMD SPIR-V compiler:
   All of these are fixed, and each is pinned by a kernel the new hardware gate checks lane by
   lane.
 
-The remaining 4.4.0 items are open and tracked in the roadmap. That includes "the same in N9's
-SM75 path", which waits on N9.
+The remaining 4.4.0 items are open and tracked in the roadmap. "The same in N9's SM75 path" is
+done in N9.5, below. f64 is the exception: it is not selected for NVIDIA yet and stays a named
+N9 item.
 
-**N9 (SPIR-V → SASS for NVIDIA) has started.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.4 have
+**N9 (SPIR-V → SASS for NVIDIA) is in progress.** The design note is
+[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.5 have
 landed: the encoder, instruction selection, register allocation, scheduling, the compile driver,
-and the backend wiring. **SPIR-V compiled in-tree now runs on the TU116**: the straight-line
-control-flow kernels match on every lane. N9.5 (branches) and N9.6 (ranga, the done-when) are
-open.
+the backend wiring, and branches, loops and phis. **SPIR-V compiled in-tree now runs on the
+TU116**: 22 of the 24 control-flow kernels match on every lane. The other two are refused by
+name: one is f64, the other has an out-of-range label. N9.6 (ranga's kernels and suites, the
+done-when) is open.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -185,35 +187,13 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 - Conditions: on SM75 only `ISETP` writes P0, so `CNDMASK` (AMD's "the last compare") reads P0
   directly. An `ISELECT` re-emits its compare when P0 holds another.
 - Refused by name, codes 130–134, all named in `gpu_shader_error_name`:
-  - branches (`SM75_ERR_CONTROL_FLOW`, N9.5);
+  - branches (`SM75_ERR_CONTROL_FLOW`; selected since N9.5);
   - f64, the GFX9-shaped `OpFDiv` macro, and the bfi select (`SM75_ERR_UNSUPPORTED_OP`);
   - a binding past 16.
 - `tests/tcyr/sm75_isel.tcyr` (69 assertions) runs real kernels through the shared front end:
   SAXPY by LocalInvocationId and by GlobalInvocationId, the control-flow suite's five
   straight-line selects, and the integer-division macro. Hand-built MIR pins the operand and
   condition rules. `sm75_isel` joined the sizing gate's contract table.
-
-### Added — N9.4: SPIR-V on the native NVIDIA backend
-- `gpu_shader_module_create_spirv` on an NVIDIA context now compiles the SPIR-V to SM75 SASS with
-  `sm75_compile_spirv` and stages it in a program BO (`_nv_shader_compile_spirv`). Before, it
-  was refused with `SHMOD_ERR_SRC_KIND`. The module carries the compiled register count,
-  binding count and LocalSize. The NVIDIA shader-module struct grows from 48 to 72 bytes
-  (`NV_SHMOD_LOCALX/Y/Z`; pre-captured SASS gets 1, 1, 1). The dispatch writes LocalSize into the
-  QMD's `CTA_THREAD_DIMENSION0..2` (`_nv_qmd_set_block`); before, every block was 1, 1, 1.
-  WGSL and GFX9 modules are still refused with `SHMOD_ERR_SRC_KIND`.
-- A failed compile reports its own stage code through `gpu_last_shader_error`. A LocalSize past
-  Turing's block limits (1024 threads; z at most 64) is the new `SHMOD_ERR_LOCAL_SIZE` (122).
-- **On the TU116** (`chew`, nouveau): `programs/nvidia_spirv_compute_e2e.cyr` /
-  `make test-nvidia-spirv-compute-e2e` runs the control-flow suite's kernels through the public
-  API. The five straight-line kernels match all 64 lanes; they cover WorkgroupId, two bindings,
-  int-compare selects with uniform and divergent conditions, and both two-literal forms. Every
-  kernel with a branch is refused with exactly `SM75_ERR_CONTROL_FLOW` (N9.5), each named in the
-  program. The f64 kernel is refused as `SM75_ERR_UNSUPPORTED_OP`. The 13 existing masterless
-  NVIDIA gates still pass (`build/logs/nvidia-gates-n9.4-20261116-140142.log`).
-- `programs/nvidia_multibind_e2e.cyr` step 1 now expects the compiler's `CMP_ERR_VALIDATE` for
-  its junk SPIR-V words instead of `SHMOD_ERR_SRC_KIND`. The invariant it guards is unchanged:
-  SPIR-V is never run raw as SASS. CPU tests cover the compile-then-stage path on a fake
-  context, the LocalSize limit, and the QMD block words.
 
 ### Added — N9.3: SM75 register allocation, scheduling and the compile driver (`@internal`)
 - `src/sm75_regalloc.cyr`: a linear scan over one GPR file, R0–R254. It applies 4.4.0's
@@ -239,6 +219,71 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   dead-load rule, the layout, every scheduling field of a whole kernel, and the
   output-buffer bound. Error codes 135–137 are named. `sm75_regalloc`, `sm75_emit`,
   `sm75_compile` and `sm75_compile_spirv` joined the sizing gate's contract table.
+
+### Added — N9.4: SPIR-V on the native NVIDIA backend
+- `gpu_shader_module_create_spirv` on an NVIDIA context now compiles the SPIR-V to SM75 SASS with
+  `sm75_compile_spirv` and stages it in a program BO (`_nv_shader_compile_spirv`). Before, it
+  was refused with `SHMOD_ERR_SRC_KIND`. The module carries the compiled register count,
+  binding count and LocalSize. The NVIDIA shader-module struct grows from 48 to 72 bytes
+  (`NV_SHMOD_LOCALX/Y/Z`; pre-captured SASS gets 1, 1, 1). The dispatch writes LocalSize into the
+  QMD's `CTA_THREAD_DIMENSION0..2` (`_nv_qmd_set_block`); before, every block was 1, 1, 1.
+  WGSL and GFX9 modules are still refused with `SHMOD_ERR_SRC_KIND`.
+- A failed compile reports its own stage code through `gpu_last_shader_error`. A LocalSize past
+  Turing's block limits (1024 threads; z at most 64) is the new `SHMOD_ERR_LOCAL_SIZE` (122).
+- **On the TU116** (`chew`, nouveau): `programs/nvidia_spirv_compute_e2e.cyr` /
+  `make test-nvidia-spirv-compute-e2e` runs the control-flow suite's kernels through the public
+  API. The five straight-line kernels match all 64 lanes; they cover WorkgroupId, two bindings,
+  int-compare selects with uniform and divergent conditions, and both two-literal forms. Every
+  kernel with a branch is refused with exactly `SM75_ERR_CONTROL_FLOW`, each named in the
+  program (N9.5 turned these into lane checks). The f64 kernel is refused as `SM75_ERR_UNSUPPORTED_OP`. The 13 existing masterless
+  NVIDIA gates still pass (`build/logs/nvidia-gates-n9.4-20261116-140142.log`).
+- `programs/nvidia_multibind_e2e.cyr` step 1 now expects the compiler's `CMP_ERR_VALIDATE` for
+  its junk SPIR-V words instead of `SHMOD_ERR_SRC_KIND`. The invariant it guards is unchanged:
+  SPIR-V is never run raw as SASS. CPU tests cover the compile-then-stage path on a fake
+  context, the LocalSize limit, and the QMD block words.
+
+### Added — N9.5: branches, loops and phis on NVIDIA
+- `sm75_isel` selects `LABEL`, `BRANCH` and `COND_BRANCH`. A conditional branch re-emits its
+  compare when P0 holds another (a label forgets P0, because the path in decides it), then
+  branches with `@!P0 BRA <false>`. A loop's back-edge phi copies go on the edge that takes
+  them: the guarded branch skips that edge, then the copies, then an unguarded `BRA` to their
+  target. A branch to the label right after it is a fall-through and emits nothing.
+  `SM75_ERR_CONTROL_FLOW` (132) now means only "copies on both edges of one branch", which the
+  lowering never produces.
+- There is no EXEC bookkeeping. Volta and later keep a program counter per thread, so a divergent
+  branch is a predicated `BRA`. Two things GFX9 refuses therefore compile on NVIDIA: `OpReturn`
+  inside a loop (`EXIT` retires only the threads that run it) and ifs nested deeper than 8.
+  v1 emits no `BSSY` / `BSYNC` reconvergence hints. Threads that diverge still compute the
+  right values, but they may not reconverge as early as ptxas code would. That is tracked in
+  the design note's §7.
+- `sm75_regalloc`: a value whose last read falls inside a loop stays live to the back-edge,
+  because the next iteration reads it again. The rule iterates to a fixed point over nested
+  loops. Every value is allocated once, so all of a phi's incoming copies land in one register.
+- `sm75_emit` resolves labels in a first pass. A branch offset is in words from the next
+  instruction. A branch to a label the program does not contain is
+  `SM75_ERR_UNRESOLVED_LABEL` (138), named in `gpu_shader_error_name`.
+- Fixtures: a `; nv-want:` / `; nv-refuse:` line in `tests/spirv/control_flow/*.body` gives the
+  NVIDIA expectation where the hardware differs. The generator emits `cfk_nv_refuse` /
+  `cfk_nv_want` alongside the AMD ones.
+  - `refuse_return_in_loop` runs on NVIDIA (`i` for i ≤ 2, else untouched).
+  - `if_nest9` runs.
+  - `loop_phi_f64` is refused with `SM75_ERR_UNSUPPORTED_OP`, because f64 is not selected for
+    NVIDIA yet.
+- **On the TU116** (`chew`): `make test-nvidia-spirv-compute-e2e` now checks every kernel against
+  its NVIDIA expectation. 22 of the 24 kernels compile, run, and match all 64 lanes. That covers
+  every if, loop, break, continue, phi swap and nesting shape in the suite. The other two are
+  refused with their codes: `loop_phi_f64` (f64) and `oob_label` (`MIR_ERR_ID_OOR`). All 22
+  compiled kernels round-trip through `nvdisasm -b SM75` with no error. The 13 other masterless
+  NVIDIA gates still pass (`build/logs/nvidia-gates-n9.5-20261116-141200.log`; the fall-through
+  rerun is `build/logs/nvidia-spirv-n9.5-fallthrough-20261116-141300.log`). On Cezanne,
+  `test-native-spirv-control-flow-e2e` is still 24 of 24 after the fixture change
+  (`build/logs/test-native-spirv-control-flow-e2e-20261116-141228.log`).
+- Tests: `sm75_compile.tcyr` (104 assertions) checks that every control-flow kernel compiles or
+  is refused with exactly its NVIDIA code. It also checks the branch shapes: the re-emitted
+  compare in `if_vcc_clobbered`, the latch's copy between its two branches, and no branch to
+  the next label. A hand-built loop pins loop liveness, the phi's single register, both branch
+  directions, the `@!P0` guard, and the unresolved-label refusals. In `sm75_isel.tcyr`
+  (71 assertions), `if_div` now selects.
 
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
@@ -301,8 +346,9 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7232 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
-  contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+- CPU: 28 suites, **7289 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+  contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
+  7232 after N9.4). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

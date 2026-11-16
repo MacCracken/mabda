@@ -25476,9 +25476,21 @@ fn sm75_enc_nop(ins): i64 {
 # compare when P0 holds a different one (the 4.4.0 freshness rule, simpler here because no
 # other instruction writes P0).
 #
-# NOT YET (docs/proposals/n9-spirv-to-sass.md §7): labels and branches (N9.5); f64; the
-# GFX9-shaped division macros (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT).
-# Each fails with SM75_ERR_UNSUPPORTED_OP or SM75_ERR_CONTROL_FLOW rather than compiling.
+# CONTROL FLOW (N9.5). An SM75 thread keeps its own program counter (Volta independent thread
+# scheduling), so a divergent branch is just a predicated BRA: no EXEC mask to save, narrow or
+# restore, and none of gfx9_isel's region stack. A conditional branch is the compare (in P0,
+# re-emitted when stale) + `@!P0 BRA <false>` + `BRA <true>` unless the true block comes next.
+# Back-edge phi copies (MIR_CB_MOVES_*) go between the two branches, so only the edge that takes
+# them runs them (FALSE-edge copies flip it: `@P0 BRA <true>`, copies, `BRA <false>`). OpReturn
+# is EXIT anywhere — it retires only the threads that execute it, so an early return inside a
+# divergent if or loop is legal here, unlike on AMD. P0's contents depend on the path into a
+# label, so a label resets what P0 is known to hold. Reconvergence (BSSY / BSYNC) is not
+# emitted: these kernels have no warp-synchronous operations, so threads that never reconverge
+# still compute correctly (design note §3; named in §7).
+#
+# NOT YET (docs/proposals/n9-spirv-to-sass.md §7): f64; the GFX9-shaped division macros
+# (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT). Each fails with
+# SM75_ERR_UNSUPPORTED_OP rather than compiling.
 
 var SM75I_IADD3   = 1;    # d = a + b + c          bit 8: negate b
 var SM75I_IMAD    = 2;    # d = a * b + c (low)    bit 8: signed
@@ -25501,13 +25513,15 @@ var SM75I_ULDC    = 18;   # UR<a> = c[0][b] (64)   a, b immediate               
 var SM75I_LDG     = 19;   # d = [a.U32 + UR + b]   bits 8-13: UR, b immediate
 var SM75I_STG     = 20;   # [a.U32 + UR + c] = b   bits 8-13: UR, c immediate    (dst 0)
 var SM75I_EXIT    = 21;
+var SM75I_LABEL   = 22;   # a = label <id> (immediate); 0 bytes — the emitter records its offset
+var SM75I_BRA     = 23;   # a = target label (immediate); bit 8: guarded by P0, bit 9: @!P0
 
 var SM75I_REC = 48;   # the GISEL record shape (gfx9_isel.cyr)
 
 # Error codes — the SM75 band, 130-139 (gpu_shader_error_name in compute.cyr).
 var SM75_ERR_UNSUPPORTED_OP   = 130;  # a MIR op / type SM75 selection does not handle yet
 var SM75_ERR_CAP_EXCEEDED     = 131;  # the selected list outgrew its buffer
-var SM75_ERR_CONTROL_FLOW     = 132;  # labels / branches: N9.5
+var SM75_ERR_CONTROL_FLOW     = 132;  # a branch shape SM75 selection cannot place (copies on both edges)
 var SM75_ERR_BAD_OPERAND      = 133;  # an operand of a kind the op cannot take (a pointer, a builtin)
 var SM75_ERR_TOO_MANY_BINDINGS = 134; # a binding index at or past NV_MAX_BINDINGS (16)
 
@@ -25764,9 +25778,16 @@ fn _s75_one(m, out, st, i): i64 {
     var u = MIR_T_U32;
     var f = MIR_T_F32;
     if (op == MIR_OP_RET) { return _s75_put(out, st, SM75I_EXIT, 0, 0, 0, 0, 0); }
-    if (op == MIR_OP_LABEL) { return 0 - SM75_ERR_CONTROL_FLOW; }
-    if (op == MIR_OP_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
-    if (op == MIR_OP_COND_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    if (op == MIR_OP_LABEL) {
+        store64(st + 16, 0);   # P0 depends on the path in
+        return _s75_put(out, st, SM75I_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+    }
+    if (op == MIR_OP_BRANCH) {
+        # a branch to the label right after it falls through: nothing to emit
+        if (_s75_is_label(m, mir_n_instrs(m), i + 1, a) == 1) { return 0; }
+        return _s75_put(out, st, SM75I_BRA, 0, a, 0, 0, MIR_FLAG_A_IMM);
+    }
+    # COND_BRANCH needs the copies that follow it: the driver selects it (_s75_cond_branch).
     if (op == MIR_OP_IADD) { return _s75_bin(m, out, st, SM75I_IADD3, dst, a, b, fl, 0, 1, u); }
     if (op == MIR_OP_ISUB) {
         # a - b: a constant b folds into the immediate (two's complement); a register b
@@ -25884,6 +25905,73 @@ fn _s75_one(m, out, st, i): i64 {
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
+# 1 if MIR instruction i is LABEL `l`.
+fn _s75_is_label(m, n, i, l): i64 {
+    if (i >= n) { return 0; }
+    if (mir_instr_op(m, i) != MIR_OP_LABEL) { return 0; }
+    if (mir_instr_a(m, i) != l) { return 0; }
+    return 1;
+}
+
+# COND_BRANCH at MIR index i (a = cond, b = TRUE label, c = FALSE label), with the back-edge
+# phi copies that follow it. Returns how many MIR instructions it consumed (1 + copies).
+fn _s75_cond_branch(m, out, st, i, n): i64 {
+    var cond = mir_instr_a(m, i);
+    var bt = mir_instr_b(m, i);
+    var ct = mir_instr_c(m, i);
+    var fl = mir_instr_flags(m, i);
+    var nmv = (fl >> MIR_CB_MOVES_SHIFT) & 0xFF;
+    var mv_c = 0;
+    if (nmv > 0) {
+        if ((fl & MIR_CB_MOVES_ON_TRUE) != 0) { if ((fl & MIR_CB_MOVES_ON_FALSE) != 0) {
+                return 0 - SM75_ERR_CONTROL_FLOW;
+            } }
+        if ((fl & MIR_CB_MOVES_ON_FALSE) != 0) { mv_c = 1; }
+        if (i + nmv >= n) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    }
+    if (bt == ct) {
+        # both targets the same: an unconditional branch (its copies, if any, first)
+        var j0 = 1;
+        while (j0 <= nmv) {
+            var r0 = _s75_one(m, out, st, i + j0);
+            if (r0 < 0) { return r0; }
+            j0 = j0 + 1;
+        }
+        if (_s75_is_label(m, n, i + 1 + nmv, bt) == 0) {
+            var pb = _s75_put(out, st, SM75I_BRA, 0, bt, 0, 0, MIR_FLAG_A_IMM);
+            if (pb < 0) { return pb; }
+        }
+        return 1 + nmv;
+    }
+    var cr = _s75_cond(m, out, st, cond);
+    if (cr < 0) { return cr; }
+    # the guarded branch skips the edge that takes the copies
+    var first = ct;
+    var other = bt;
+    var guard = (1 << 8) | (1 << 9);       # @!P0 BRA <false>
+    if (mv_c == 1) { first = bt; other = ct; guard = 1 << 8; }   # @P0 BRA <true>
+    var p1 = _s75_put(out, st, SM75I_BRA, 0, first, 0, 0, MIR_FLAG_A_IMM | guard);
+    if (p1 < 0) { return p1; }
+    var j = 1;
+    while (j <= nmv) {
+        var mop = mir_instr_op(m, i + j);
+        if (mop != MIR_OP_VMOV) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+        var rj = _s75_one(m, out, st, i + j);
+        if (rj < 0) { return rj; }
+        j = j + 1;
+    }
+    if (nmv > 0) {
+        var p2 = _s75_put(out, st, SM75I_BRA, 0, other, 0, 0, MIR_FLAG_A_IMM);
+        if (p2 < 0) { return p2; }
+    } else {
+        if (_s75_is_label(m, n, i + 1, other) == 0) {
+            var p3 = _s75_put(out, st, SM75I_BRA, 0, other, 0, 0, MIR_FLAG_A_IMM);
+            if (p3 < 0) { return p3; }
+        }
+    }
+    return 1 + nmv;
+}
+
 # ================================================================
 # Driver
 # ================================================================
@@ -25920,6 +26008,12 @@ fn sm75_isel(m, out, out_len): i64 {
     var n = mir_n_instrs(m);
     var i = 0;
     while (i < n) {
+        if (mir_instr_op(m, i) == MIR_OP_COND_BRANCH) {
+            var used = _s75_cond_branch(m, out, &st, i, n);
+            if (used < 0) { return used; }
+            i = i + used;
+            continue;
+        }
         var rc = _s75_one(m, out, &st, i);
         if (rc < 0) { return rc; }
         i = i + 1;
@@ -25939,9 +26033,11 @@ fn sm75_isel(m, out, out_len): i64 {
 #   - a DEAD load keeps its register to the end of the program: a load writes its register
 #     whenever memory returns, so a register freed at the def could be claimed by the next
 #     value and then overwritten (the 4.4.0 phi-swap finding on GFX9).
-# Branches, and with them the loop-liveness extension and the allocate-once rule for phi
-# re-definitions, arrive with N9.5. The selector refuses branches until then
-# (SM75_ERR_CONTROL_FLOW), so straight-line liveness is exact here.
+#   - (N9.5) a value whose last use falls INSIDE a loop stays live to the loop's back-edge,
+#     because the next iteration reads it again (the v4.1.0 GFX9 rule, to a fixed point over
+#     nested loops);
+#   - (N9.5) each value is allocated ONCE: a phi is defined by a copy on every incoming edge,
+#     and all of them must land in the same register.
 #
 # The per-<id> table reuses gfx9_regalloc's record (RA_REC: +0 physical register, +8 last
 # use) and its _ra_claim free-at scan.
@@ -25962,6 +26058,8 @@ fn sm75_register_count(used): i64 {
 
 # 1 if record op `op` writes a GPR result (its dst <id>).
 fn _s75_writes_gpr(op): i64 {
+    if (op == SM75I_LABEL) { return 0; }
+    if (op == SM75I_BRA) { return 0; }
     if (op == SM75I_ISETP) { return 0; }
     if (op == SM75I_STG) { return 0; }
     if (op == SM75I_ULDC) { return 0; }
@@ -26006,6 +26104,38 @@ fn sm75_regalloc(m, isel, n, alloc, alloc_len, hw): i64 {
             if (ld > 0) { if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n); } }
         }
         i = i + 1;
+    }
+    # Pass 1c: loops. A BRA to a label earlier in the list is a back-edge; a value whose last
+    # use lies in [label, back-edge) is read again on the next iteration, so it stays live to
+    # the back-edge. Repeat until nothing moves (an extension can land inside an outer loop).
+    var rounds = 0;
+    while (rounds <= n) {
+        var changed = 0;
+        var bi = 0;
+        while (bi < n) {
+            if (sm75i_op(isel, bi) == SM75I_BRA) {
+                var tgt = sm75i_a(isel, bi);
+                var ti = 0 - 1;
+                var li = 0;
+                while (li < bi) {
+                    if (sm75i_op(isel, li) == SM75I_LABEL) { if (sm75i_a(isel, li) == tgt) { ti = li; } }
+                    li = li + 1;
+                }
+                if (ti >= 0) {
+                    var vi = 1;
+                    while (vi < cap_ids) {
+                        var lu = load64(alloc + vi * RA_REC + 8);
+                        if (lu >= ti) {
+                            if (lu < bi) { store64(alloc + vi * RA_REC + 8, bi); changed = 1; }
+                        }
+                        vi = vi + 1;
+                    }
+                }
+            }
+            bi = bi + 1;
+        }
+        if (changed == 0) { rounds = n + 1; }
+        rounds = rounds + 1;
     }
     # Pass 2: claim the lowest register free at each definition.
     var freeat[2048];   # SM75_GPR_CAP (255) + 1 i64
@@ -26059,6 +26189,7 @@ fn sm75_reg(alloc, id): i64 {
 # fetch reads ahead).
 
 var SM75_ERR_SASS_OVERFLOW = 137;  # the program would not fit the caller's sass_len
+var SM75_ERR_UNRESOLVED_LABEL = 138; # a branch to a label the program does not contain
 
 # Compile output descriptor (caller buffer, SM75_DESC_SIZE bytes).
 var SM75_DESC_LEN   = 0;    # SASS byte length (a multiple of 128)
@@ -26130,20 +26261,57 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
+# 1 if record op `op` emits no instruction (a label is a position, not an instruction).
+fn _s75_zero_size(op): i64 {
+    if (op == SM75I_LABEL) { return 1; }
+    return 0;
+}
+
 # Encode `n` records into `sass` (`sass_len` bytes) with the v1 schedule, then the tail.
 # Returns the byte length (a multiple of 128) or a negative error.
 fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
-    # n instructions + BRA + up to 7 NOPs of padding
-    var total = n + 1;
+    # Pass 1: instruction count, and each label's byte offset (labels emit nothing).
+    var laboff[2048];   # 256 label <id>s (ids < cap_ids <= 256)
+    memset(&laboff, 0xFF, 2048);
+    var nins = 0;
+    var i = 0;
+    while (i < n) {
+        if (_s75_zero_size(sm75i_op(isel, i)) == 1) {
+            var lid = sm75i_a(isel, i);
+            if (lid <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (lid >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            store64(&laboff + lid * 8, nins * SM75_INS);
+        } else {
+            nins = nins + 1;
+        }
+        i = i + 1;
+    }
+    # the instructions + BRA + up to 7 NOPs of padding
+    var total = nins + 1;
     if ((total % 8) != 0) { total = total + (8 - total % 8); }
     if (total * SM75_INS > sass_len) { return 0 - SM75_ERR_SASS_OVERFLOW; }
     var wait = 0;
-    var i = 0;
+    var pc = 0;
+    i = 0;
     while (i < n) {
-        var ins = sass + i * SM75_INS;
-        var rc = _s75_encode(isel, i, alloc, ins);
-        if (rc < 0) { return rc; }
         var op = sm75i_op(isel, i);
+        if (_s75_zero_size(op) == 1) { i = i + 1; continue; }
+        var ins = sass + pc;
+        var rc = 0;
+        if (op == SM75I_BRA) {
+            var t = sm75i_a(isel, i);
+            if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            var toff = load64(&laboff + t * 8);
+            if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            # offset in 32-bit words from the NEXT instruction
+            rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
+            var bfl = sm75i_flags(isel, i) >> 8;
+            if ((bfl & 1) != 0) { sm75_set_guard(ins, 0, (bfl >> 1) & 1); }
+        } else {
+            rc = _s75_encode(isel, i, alloc, ins);
+        }
+        if (rc < 0) { return rc; }
         var wr = 7;
         var rd = 7;
         var next = 0;
@@ -26151,13 +26319,14 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
         if (op == SM75I_STG) { rd = 1; next = next | 2; }
         sm75_set_ctrl(ins, 15, 0, wr, rd, wait, 0);
         wait = next;
+        pc = pc + SM75_INS;
         i = i + 1;
     }
     # BRA to itself (-4 words from the next instruction), then NOP padding.
-    var tb = sass + n * SM75_INS;
+    var tb = sass + nins * SM75_INS;
     sm75_enc_bra(tb, 0 - 4);
     sm75_set_ctrl(tb, 15, 0, 7, 7, wait, 0);
-    var j = n + 1;
+    var j = nins + 1;
     while (j < total) {
         var np = sass + j * SM75_INS;
         sm75_enc_nop(np);
@@ -29308,7 +29477,7 @@ fn gpu_shader_module_create_spirv(ctx, words_ptr, byte_len): i64 {
 #   60-61   waitcnt insertion                                (src/gfx9_waitcnt.cyr)
 #   70-88   encoding / validation / table build              (src/gfx9_compile.cyr)
 #   100-106 instruction selection                            (src/gfx9_isel.cyr)
-#   130-137 SM75 (NVIDIA) selection / regalloc / emit         (src/sm75_*.cyr)
+#   130-138 SM75 (NVIDIA) selection / regalloc / emit         (src/sm75_*.cyr)
 #   110-120 module staging (BO / VA / gates)                 (src/error.cyr)
 fn gpu_shader_error_name(code): i64 {
     if (code == 0) { return "no error"; }
@@ -29382,12 +29551,13 @@ fn gpu_shader_error_name(code): i64 {
     # --- SM75 (NVIDIA) instruction selection, N9 ---
     if (c == SM75_ERR_UNSUPPORTED_OP) { return "sm75 isel: MIR op or type not selectable for NVIDIA yet"; }
     if (c == SM75_ERR_CAP_EXCEEDED) { return "sm75 isel: selected-instruction capacity exceeded"; }
-    if (c == SM75_ERR_CONTROL_FLOW) { return "sm75 isel: branches are not compiled for NVIDIA yet (N9.5)"; }
+    if (c == SM75_ERR_CONTROL_FLOW) { return "sm75 isel: a branch with back-edge phi copies on both of its edges"; }
     if (c == SM75_ERR_BAD_OPERAND) { return "sm75 isel: an operand of a kind the instruction cannot take"; }
     if (c == SM75_ERR_TOO_MANY_BINDINGS) { return "sm75 isel: binding index at or past 16"; }
     if (c == SM75_ERR_REG_OVERFLOW) { return "sm75 regalloc: more live values than R0..R254"; }
     if (c == SM75_ERR_ALLOC_SHORT) { return "sm75 regalloc: alloc[] shorter than cap_ids records"; }
     if (c == SM75_ERR_SASS_OVERFLOW) { return "sm75 emit: SASS would not fit the output buffer"; }
+    if (c == SM75_ERR_UNRESOLVED_LABEL) { return "sm75 emit: a branch to a label not in the program"; }
     if (c == GISEL_ERR_COND_NOT_COMPARE) {
         return "isel: branch / select condition is not an integer or OpFOrd compare result";
     }

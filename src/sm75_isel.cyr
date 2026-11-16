@@ -20,9 +20,21 @@
 # compare when P0 holds a different one (the 4.4.0 freshness rule, simpler here because no
 # other instruction writes P0).
 #
-# NOT YET (docs/proposals/n9-spirv-to-sass.md §7): labels and branches (N9.5); f64; the
-# GFX9-shaped division macros (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT).
-# Each fails with SM75_ERR_UNSUPPORTED_OP or SM75_ERR_CONTROL_FLOW rather than compiling.
+# CONTROL FLOW (N9.5). An SM75 thread keeps its own program counter (Volta independent thread
+# scheduling), so a divergent branch is just a predicated BRA: no EXEC mask to save, narrow or
+# restore, and none of gfx9_isel's region stack. A conditional branch is the compare (in P0,
+# re-emitted when stale) + `@!P0 BRA <false>` + `BRA <true>` unless the true block comes next.
+# Back-edge phi copies (MIR_CB_MOVES_*) go between the two branches, so only the edge that takes
+# them runs them (FALSE-edge copies flip it: `@P0 BRA <true>`, copies, `BRA <false>`). OpReturn
+# is EXIT anywhere — it retires only the threads that execute it, so an early return inside a
+# divergent if or loop is legal here, unlike on AMD. P0's contents depend on the path into a
+# label, so a label resets what P0 is known to hold. Reconvergence (BSSY / BSYNC) is not
+# emitted: these kernels have no warp-synchronous operations, so threads that never reconverge
+# still compute correctly (design note §3; named in §7).
+#
+# NOT YET (docs/proposals/n9-spirv-to-sass.md §7): f64; the GFX9-shaped division macros
+# (F32_DIV_*, F64_*); the bfi OpSelect mask (MIR_OP_SELECT). Each fails with
+# SM75_ERR_UNSUPPORTED_OP rather than compiling.
 
 var SM75I_IADD3   = 1;    # d = a + b + c          bit 8: negate b
 var SM75I_IMAD    = 2;    # d = a * b + c (low)    bit 8: signed
@@ -45,13 +57,15 @@ var SM75I_ULDC    = 18;   # UR<a> = c[0][b] (64)   a, b immediate               
 var SM75I_LDG     = 19;   # d = [a.U32 + UR + b]   bits 8-13: UR, b immediate
 var SM75I_STG     = 20;   # [a.U32 + UR + c] = b   bits 8-13: UR, c immediate    (dst 0)
 var SM75I_EXIT    = 21;
+var SM75I_LABEL   = 22;   # a = label <id> (immediate); 0 bytes — the emitter records its offset
+var SM75I_BRA     = 23;   # a = target label (immediate); bit 8: guarded by P0, bit 9: @!P0
 
 var SM75I_REC = 48;   # the GISEL record shape (gfx9_isel.cyr)
 
 # Error codes — the SM75 band, 130-139 (gpu_shader_error_name in compute.cyr).
 var SM75_ERR_UNSUPPORTED_OP   = 130;  # a MIR op / type SM75 selection does not handle yet
 var SM75_ERR_CAP_EXCEEDED     = 131;  # the selected list outgrew its buffer
-var SM75_ERR_CONTROL_FLOW     = 132;  # labels / branches: N9.5
+var SM75_ERR_CONTROL_FLOW     = 132;  # a branch shape SM75 selection cannot place (copies on both edges)
 var SM75_ERR_BAD_OPERAND      = 133;  # an operand of a kind the op cannot take (a pointer, a builtin)
 var SM75_ERR_TOO_MANY_BINDINGS = 134; # a binding index at or past NV_MAX_BINDINGS (16)
 
@@ -308,9 +322,16 @@ fn _s75_one(m, out, st, i): i64 {
     var u = MIR_T_U32;
     var f = MIR_T_F32;
     if (op == MIR_OP_RET) { return _s75_put(out, st, SM75I_EXIT, 0, 0, 0, 0, 0); }
-    if (op == MIR_OP_LABEL) { return 0 - SM75_ERR_CONTROL_FLOW; }
-    if (op == MIR_OP_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
-    if (op == MIR_OP_COND_BRANCH) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    if (op == MIR_OP_LABEL) {
+        store64(st + 16, 0);   # P0 depends on the path in
+        return _s75_put(out, st, SM75I_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
+    }
+    if (op == MIR_OP_BRANCH) {
+        # a branch to the label right after it falls through: nothing to emit
+        if (_s75_is_label(m, mir_n_instrs(m), i + 1, a) == 1) { return 0; }
+        return _s75_put(out, st, SM75I_BRA, 0, a, 0, 0, MIR_FLAG_A_IMM);
+    }
+    # COND_BRANCH needs the copies that follow it: the driver selects it (_s75_cond_branch).
     if (op == MIR_OP_IADD) { return _s75_bin(m, out, st, SM75I_IADD3, dst, a, b, fl, 0, 1, u); }
     if (op == MIR_OP_ISUB) {
         # a - b: a constant b folds into the immediate (two's complement); a register b
@@ -428,6 +449,73 @@ fn _s75_one(m, out, st, i): i64 {
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
+# 1 if MIR instruction i is LABEL `l`.
+fn _s75_is_label(m, n, i, l): i64 {
+    if (i >= n) { return 0; }
+    if (mir_instr_op(m, i) != MIR_OP_LABEL) { return 0; }
+    if (mir_instr_a(m, i) != l) { return 0; }
+    return 1;
+}
+
+# COND_BRANCH at MIR index i (a = cond, b = TRUE label, c = FALSE label), with the back-edge
+# phi copies that follow it. Returns how many MIR instructions it consumed (1 + copies).
+fn _s75_cond_branch(m, out, st, i, n): i64 {
+    var cond = mir_instr_a(m, i);
+    var bt = mir_instr_b(m, i);
+    var ct = mir_instr_c(m, i);
+    var fl = mir_instr_flags(m, i);
+    var nmv = (fl >> MIR_CB_MOVES_SHIFT) & 0xFF;
+    var mv_c = 0;
+    if (nmv > 0) {
+        if ((fl & MIR_CB_MOVES_ON_TRUE) != 0) { if ((fl & MIR_CB_MOVES_ON_FALSE) != 0) {
+                return 0 - SM75_ERR_CONTROL_FLOW;
+            } }
+        if ((fl & MIR_CB_MOVES_ON_FALSE) != 0) { mv_c = 1; }
+        if (i + nmv >= n) { return 0 - SM75_ERR_CONTROL_FLOW; }
+    }
+    if (bt == ct) {
+        # both targets the same: an unconditional branch (its copies, if any, first)
+        var j0 = 1;
+        while (j0 <= nmv) {
+            var r0 = _s75_one(m, out, st, i + j0);
+            if (r0 < 0) { return r0; }
+            j0 = j0 + 1;
+        }
+        if (_s75_is_label(m, n, i + 1 + nmv, bt) == 0) {
+            var pb = _s75_put(out, st, SM75I_BRA, 0, bt, 0, 0, MIR_FLAG_A_IMM);
+            if (pb < 0) { return pb; }
+        }
+        return 1 + nmv;
+    }
+    var cr = _s75_cond(m, out, st, cond);
+    if (cr < 0) { return cr; }
+    # the guarded branch skips the edge that takes the copies
+    var first = ct;
+    var other = bt;
+    var guard = (1 << 8) | (1 << 9);       # @!P0 BRA <false>
+    if (mv_c == 1) { first = bt; other = ct; guard = 1 << 8; }   # @P0 BRA <true>
+    var p1 = _s75_put(out, st, SM75I_BRA, 0, first, 0, 0, MIR_FLAG_A_IMM | guard);
+    if (p1 < 0) { return p1; }
+    var j = 1;
+    while (j <= nmv) {
+        var mop = mir_instr_op(m, i + j);
+        if (mop != MIR_OP_VMOV) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
+        var rj = _s75_one(m, out, st, i + j);
+        if (rj < 0) { return rj; }
+        j = j + 1;
+    }
+    if (nmv > 0) {
+        var p2 = _s75_put(out, st, SM75I_BRA, 0, other, 0, 0, MIR_FLAG_A_IMM);
+        if (p2 < 0) { return p2; }
+    } else {
+        if (_s75_is_label(m, n, i + 1, other) == 0) {
+            var p3 = _s75_put(out, st, SM75I_BRA, 0, other, 0, 0, MIR_FLAG_A_IMM);
+            if (p3 < 0) { return p3; }
+        }
+    }
+    return 1 + nmv;
+}
+
 # ================================================================
 # Driver
 # ================================================================
@@ -464,6 +552,12 @@ fn sm75_isel(m, out, out_len): i64 {
     var n = mir_n_instrs(m);
     var i = 0;
     while (i < n) {
+        if (mir_instr_op(m, i) == MIR_OP_COND_BRANCH) {
+            var used = _s75_cond_branch(m, out, &st, i, n);
+            if (used < 0) { return used; }
+            i = i + used;
+            continue;
+        }
         var rc = _s75_one(m, out, &st, i);
         if (rc < 0) { return rc; }
         i = i + 1;

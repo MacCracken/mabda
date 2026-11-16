@@ -18,6 +18,7 @@
 # fetch reads ahead).
 
 var SM75_ERR_SASS_OVERFLOW = 137;  # the program would not fit the caller's sass_len
+var SM75_ERR_UNRESOLVED_LABEL = 138; # a branch to a label the program does not contain
 
 # Compile output descriptor (caller buffer, SM75_DESC_SIZE bytes).
 var SM75_DESC_LEN   = 0;    # SASS byte length (a multiple of 128)
@@ -89,20 +90,57 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
     return 0 - SM75_ERR_UNSUPPORTED_OP;
 }
 
+# 1 if record op `op` emits no instruction (a label is a position, not an instruction).
+fn _s75_zero_size(op): i64 {
+    if (op == SM75I_LABEL) { return 1; }
+    return 0;
+}
+
 # Encode `n` records into `sass` (`sass_len` bytes) with the v1 schedule, then the tail.
 # Returns the byte length (a multiple of 128) or a negative error.
 fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
-    # n instructions + BRA + up to 7 NOPs of padding
-    var total = n + 1;
+    # Pass 1: instruction count, and each label's byte offset (labels emit nothing).
+    var laboff[2048];   # 256 label <id>s (ids < cap_ids <= 256)
+    memset(&laboff, 0xFF, 2048);
+    var nins = 0;
+    var i = 0;
+    while (i < n) {
+        if (_s75_zero_size(sm75i_op(isel, i)) == 1) {
+            var lid = sm75i_a(isel, i);
+            if (lid <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (lid >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            store64(&laboff + lid * 8, nins * SM75_INS);
+        } else {
+            nins = nins + 1;
+        }
+        i = i + 1;
+    }
+    # the instructions + BRA + up to 7 NOPs of padding
+    var total = nins + 1;
     if ((total % 8) != 0) { total = total + (8 - total % 8); }
     if (total * SM75_INS > sass_len) { return 0 - SM75_ERR_SASS_OVERFLOW; }
     var wait = 0;
-    var i = 0;
+    var pc = 0;
+    i = 0;
     while (i < n) {
-        var ins = sass + i * SM75_INS;
-        var rc = _s75_encode(isel, i, alloc, ins);
-        if (rc < 0) { return rc; }
         var op = sm75i_op(isel, i);
+        if (_s75_zero_size(op) == 1) { i = i + 1; continue; }
+        var ins = sass + pc;
+        var rc = 0;
+        if (op == SM75I_BRA) {
+            var t = sm75i_a(isel, i);
+            if (t <= 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            if (t >= 256) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            var toff = load64(&laboff + t * 8);
+            if (toff < 0) { return 0 - SM75_ERR_UNRESOLVED_LABEL; }
+            # offset in 32-bit words from the NEXT instruction
+            rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
+            var bfl = sm75i_flags(isel, i) >> 8;
+            if ((bfl & 1) != 0) { sm75_set_guard(ins, 0, (bfl >> 1) & 1); }
+        } else {
+            rc = _s75_encode(isel, i, alloc, ins);
+        }
+        if (rc < 0) { return rc; }
         var wr = 7;
         var rd = 7;
         var next = 0;
@@ -110,13 +148,14 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
         if (op == SM75I_STG) { rd = 1; next = next | 2; }
         sm75_set_ctrl(ins, 15, 0, wr, rd, wait, 0);
         wait = next;
+        pc = pc + SM75_INS;
         i = i + 1;
     }
     # BRA to itself (-4 words from the next instruction), then NOP padding.
-    var tb = sass + n * SM75_INS;
+    var tb = sass + nins * SM75_INS;
     sm75_enc_bra(tb, 0 - 4);
     sm75_set_ctrl(tb, 15, 0, 7, 7, wait, 0);
-    var j = n + 1;
+    var j = nins + 1;
     while (j < total) {
         var np = sass + j * SM75_INS;
         sm75_enc_nop(np);

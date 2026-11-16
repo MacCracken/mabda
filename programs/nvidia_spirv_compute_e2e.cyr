@@ -1,17 +1,17 @@
-# programs/nvidia_spirv_compute_e2e.cyr — N9.4: SPIR-V compiled to SM75 SASS in-tree and run on
+# programs/nvidia_spirv_compute_e2e.cyr — N9.4/N9.5: SPIR-V compiled to SM75 SASS in-tree and run on
 # the native NVIDIA backend through the PUBLIC gpu_* API (TU116 / nouveau). The N9 hardware gate
 # (docs/proposals/n9-spirv-to-sass.md §7).
 #
 # Kernels: tests/tcyr/spirv_cf_kernels.cyr — the same ones the AMD control-flow gate runs
 # (binding 0 = a[64] seeded a[i] = i, binding 1 = o[64] seeded 0xDEADBEEF, one 64-lane block).
-# What N9.4 must do, kernel by kernel:
-#   - the straight-line kernels (no branches): compile, run, and produce all 64 lanes exactly;
+# Each kernel's NVIDIA expectation is generated (cfk_nv_refuse / cfk_nv_want, from the
+# `; nv-want:` / `; nv-refuse:` lines in tests/spirv/control_flow/): every kernel compiles and
+# produces all 64 lanes exactly, except
 #   - oob_label: refused by lowering with MIR_ERR_ID_OOR, as on AMD;
-#   - loop_phi_f64: refused with SM75_ERR_UNSUPPORTED_OP — f64 is not selected for NVIDIA (named
-#     in the design note's §7), and its first f64 instruction comes before its first branch;
-#   - every kernel with a branch: refused with exactly SM75_ERR_CONTROL_FLOW. Branches are N9.5,
-#     which turns these into lane checks too. They are named below, so a straight-line kernel
-#     that started being refused would fail here rather than hide among them.
+#   - loop_phi_f64: refused with SM75_ERR_UNSUPPORTED_OP (f64 is not selected for NVIDIA yet,
+#     the design note's §7).
+# Where NVIDIA differs from AMD it runs instead of refusing: refuse_return_in_loop (EXIT retires
+# only the threads that run it) and if_nest9 (no saved-EXEC pairs, so no nesting limit).
 #
 # Exit: 0 = every expectation met; 3 = context; 5 = buffers; 11 = any kernel wrong.
 
@@ -27,19 +27,9 @@ fn outn(n): i64 {
     return 0;
 }
 
-# The kernels with no branch — N9.4's subset.
-fn straight_line(name): i64 {
-    if (streq(name, "sel_div_adjacent") == 1) { return 1; }
-    if (streq(name, "sel_div_not_adjacent") == 1) { return 1; }
-    if (streq(name, "sel_uniform_cond_lane_vals") == 1) { return 1; }
-    if (streq(name, "sel_uniform_scalar") == 1) { return 1; }
-    if (streq(name, "sel_uniform_two_literals") == 1) { return 1; }
-    return 0;
-}
-
 fn main(): i64 {
     alloc_init();
-    out("mabda NVIDIA SPIR-V e2e (N9.4) — SPIR-V -> SM75 SASS in-tree, run on the TU116\n");
+    out("mabda NVIDIA SPIR-V e2e (N9) — SPIR-V -> SM75 SASS in-tree, run on the TU116\n");
     out("------------------------------------------------------------------------------\n");
     var res_tag, res = gpu_context_new_native_nvidia();
     if (is_err_result(res_tag) == 1) { out("FAIL: no NVIDIA context\n"); return 3; }
@@ -69,10 +59,7 @@ fn main(): i64 {
         var name = cfk_name(k);
         var n = cfk_build(k, &spv);
         out("  "); out(name); out(": ");
-        var expect = 0 - SM75_ERR_CONTROL_FLOW;
-        if (straight_line(name) == 1) { expect = 0; }
-        if (cfk_refuse(k) == 0 - MIR_ERR_ID_OOR) { expect = 0 - MIR_ERR_ID_OOR; }
-        if (streq(name, "loop_phi_f64") == 1) { expect = 0 - SM75_ERR_UNSUPPORTED_OP; }
+        var expect = cfk_nv_refuse(k);
         _gpu_set_last_shader_err(0);
         var m = gpu_shader_module_create_spirv(ctx, &spv, n);
         var got = gpu_last_shader_error();
@@ -107,7 +94,7 @@ fn main(): i64 {
                     out("FAIL — dispatch rc="); outn(rc); out("\n");
                     fail = fail + 1;
                 } else {
-                    cfk_want(k, &want);
+                    cfk_nv_want(k, &want);
                     var bad = 0;
                     i = 0;
                     while (i < 64) {
@@ -139,7 +126,7 @@ fn main(): i64 {
     out("NVIDIA SPIR-V: "); outn(ran); out(" ran exactly, "); outn(refused); out(" refused as expected, ");
     outn(fail); out(" failed (of "); outn(CFK_COUNT); out(")\n");
     if (fail != 0) { return 11; }
-    out("OK — compiled SPIR-V ran on the TU116; branches are N9.5\n");
+    out("OK — every control-flow kernel ran right on the TU116\n");
     return 0;
 }
 

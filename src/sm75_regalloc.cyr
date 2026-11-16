@@ -8,9 +8,11 @@
 #   - a DEAD load keeps its register to the end of the program: a load writes its register
 #     whenever memory returns, so a register freed at the def could be claimed by the next
 #     value and then overwritten (the 4.4.0 phi-swap finding on GFX9).
-# Branches, and with them the loop-liveness extension and the allocate-once rule for phi
-# re-definitions, arrive with N9.5. The selector refuses branches until then
-# (SM75_ERR_CONTROL_FLOW), so straight-line liveness is exact here.
+#   - (N9.5) a value whose last use falls INSIDE a loop stays live to the loop's back-edge,
+#     because the next iteration reads it again (the v4.1.0 GFX9 rule, to a fixed point over
+#     nested loops);
+#   - (N9.5) each value is allocated ONCE: a phi is defined by a copy on every incoming edge,
+#     and all of them must land in the same register.
 #
 # The per-<id> table reuses gfx9_regalloc's record (RA_REC: +0 physical register, +8 last
 # use) and its _ra_claim free-at scan.
@@ -31,6 +33,8 @@ fn sm75_register_count(used): i64 {
 
 # 1 if record op `op` writes a GPR result (its dst <id>).
 fn _s75_writes_gpr(op): i64 {
+    if (op == SM75I_LABEL) { return 0; }
+    if (op == SM75I_BRA) { return 0; }
     if (op == SM75I_ISETP) { return 0; }
     if (op == SM75I_STG) { return 0; }
     if (op == SM75I_ULDC) { return 0; }
@@ -75,6 +79,38 @@ fn sm75_regalloc(m, isel, n, alloc, alloc_len, hw): i64 {
             if (ld > 0) { if (load64(alloc + ld * RA_REC + 8) <= i) { store64(alloc + ld * RA_REC + 8, n); } }
         }
         i = i + 1;
+    }
+    # Pass 1c: loops. A BRA to a label earlier in the list is a back-edge; a value whose last
+    # use lies in [label, back-edge) is read again on the next iteration, so it stays live to
+    # the back-edge. Repeat until nothing moves (an extension can land inside an outer loop).
+    var rounds = 0;
+    while (rounds <= n) {
+        var changed = 0;
+        var bi = 0;
+        while (bi < n) {
+            if (sm75i_op(isel, bi) == SM75I_BRA) {
+                var tgt = sm75i_a(isel, bi);
+                var ti = 0 - 1;
+                var li = 0;
+                while (li < bi) {
+                    if (sm75i_op(isel, li) == SM75I_LABEL) { if (sm75i_a(isel, li) == tgt) { ti = li; } }
+                    li = li + 1;
+                }
+                if (ti >= 0) {
+                    var vi = 1;
+                    while (vi < cap_ids) {
+                        var lu = load64(alloc + vi * RA_REC + 8);
+                        if (lu >= ti) {
+                            if (lu < bi) { store64(alloc + vi * RA_REC + 8, bi); changed = 1; }
+                        }
+                        vi = vi + 1;
+                    }
+                }
+            }
+            bi = bi + 1;
+        }
+        if (changed == 0) { rounds = n + 1; }
+        rounds = rounds + 1;
     }
     # Pass 2: claim the lowest register free at each definition.
     var freeat[2048];   # SM75_GPR_CAP (255) + 1 i64

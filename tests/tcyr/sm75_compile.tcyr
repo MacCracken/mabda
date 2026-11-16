@@ -135,8 +135,7 @@ fn test_sm75_compile_kernels_and_limits() {
     n = _cfk2("sel_div_not_adjacent", &spv);
     assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0, "sel_div_not_adjacent compiles");
     n = _cfk2("sel_then_branch_same_cmp", &spv);
-    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0 - SM75_ERR_CONTROL_FLOW,
-      "a kernel with a branch: N9.5");
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 4096, &desc), 0, "a kernel with a branch compiles (N9.5)");
     # a 256-byte program does not fit 128 bytes, and nothing is written past them
     n = _cfk2("sel_div_adjacent", &spv);
     memset(&sass, 0xEE, 4096);
@@ -196,6 +195,150 @@ fn test_nv_qmd_block_dims() {
     return 0;
 }
 
+# N9.5: every control-flow kernel compiles for SM75 or is refused with exactly its NVIDIA code
+# (cfk_nv_refuse); the hardware gate test-nvidia-spirv-compute-e2e checks the lanes.
+fn test_sm75_cf_kernels_compile() {
+    var spv[1680];
+    var sass[16384];
+    var desc[24];
+    var k = 0;
+    while (k < CFK_COUNT) {
+        var n = cfk_build(k, &spv);
+        assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), cfk_nv_refuse(k), cfk_name(k));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# N9.5: a branch's shape. if_vcc_clobbered: the udiv's compares overwrite P0, so the branch
+# re-emits its own compare right before `@!P0 BRA`; loop_do_while: the back-edge copy sits
+# between `@!P0 BRA <exit>` and `BRA <header>`.
+fn test_sm75_branch_shapes() {
+    var spv[1680];
+    var out[24576];
+    var hist[256];
+    var types[6144];
+    var consts[4096];
+    var deco[4096];
+    var outbi[2048];
+    var m[80];
+    var vals[10240];
+    var instrs[16384];
+    var ptrs[4096];
+    var blocks[32];
+    var n = _cfk2("if_vcc_clobbered", &spv);
+    assert_eq(mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32,
+        spirv_hdr_id_bound(&spv)), 0, "init");
+    spirv_build_type_table(&spv, n, &types, 6144);
+    spirv_build_const_table(&spv, n, &consts, 4096);
+    spirv_build_decoration_table(&spv, n, &deco, 4096);
+    assert_eq(spirv_lower_module(&spv, n, &types, &consts, &deco, &m, &outbi, 2048), 0, "lowers");
+    var k = sm75_isel(&m, &out, 24576);
+    assert_eq(k > 0, 1, "selects");
+    var bi = 0 - 1;
+    var i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_BRA) { if (((sm75i_flags(&out, i) >> 8) & 1) == 1) { if (bi < 0) { bi = i; } } }
+        i = i + 1;
+    }
+    assert_eq(bi > 0, 1, "a guarded BRA");
+    assert_eq(sm75i_op(&out, bi - 1), SM75I_ISETP, "its compare right before it (P0 was overwritten by the udiv)");
+    assert_eq((sm75i_flags(&out, bi) >> 9) & 1, 1, "@!P0 BRA <merge>");
+    n = _cfk2("loop_do_while", &spv);
+    assert_eq(mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32,
+        spirv_hdr_id_bound(&spv)), 0, "init 2");
+    spirv_build_type_table(&spv, n, &types, 6144);
+    spirv_build_const_table(&spv, n, &consts, 4096);
+    spirv_build_decoration_table(&spv, n, &deco, 4096);
+    assert_eq(spirv_lower_module(&spv, n, &types, &consts, &deco, &m, &outbi, 2048), 0, "lowers 2");
+    k = sm75_isel(&m, &out, 24576);
+    var gi = 0 - 1;
+    i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_BRA) { if (((sm75i_flags(&out, i) >> 8) & 1) == 1) { gi = i; } }
+        i = i + 1;
+    }
+    assert_eq(gi > 0, 1, "the latch's guarded BRA");
+    assert_eq(sm75i_op(&out, gi + 1), SM75I_MOV, "the back-edge copy after it");
+    assert_eq(sm75i_op(&out, gi + 2), SM75I_BRA, "then the unguarded back-edge");
+    assert_eq((sm75i_flags(&out, gi + 2) >> 8) & 1, 0, "unguarded");
+    # a branch to the label right after it is a fall-through, not a BRA: the latch's two only
+    var nb = 0;
+    var ft = 0;
+    i = 0;
+    while (i < k) {
+        if (sm75i_op(&out, i) == SM75I_BRA) {
+            nb = nb + 1;
+            if (i + 1 < k) { if (sm75i_op(&out, i + 1) == SM75I_LABEL) { if (sm75i_a(&out, i + 1) == sm75i_a(&out, i)) {
+                        ft = ft + 1;
+                    } } }
+        }
+        i = i + 1;
+    }
+    assert_eq(ft, 0, "no BRA to the next label");
+    assert_eq(nb, 2, "loop_do_while: @!P0 BRA <exit> and BRA <header>, nothing else");
+    return 0;
+}
+
+# N9.5: a loop by hand. v3 is last read INSIDE the loop, so it stays live to the back-edge:
+# v6, defined after that read, must not take v3's register (the next iteration reads v3
+# again). v4 is a phi, written before the loop and by the back-edge copy, in ONE register.
+# Then the emit: label offsets, a forward and a backward BRA, the @!P0 guard, and a branch
+# to a label the program does not contain.
+fn test_sm75_loop_liveness_and_branches() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    var i = 3;
+    while (i < 12) { _mir_set_val(&m, i, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0); i = i + 1; }
+    var isel[960];
+    var g = (1 << 8) | (1 << 9);
+    _gisel_emit(&isel, 0, SM75I_S2R, 3, 0, 0, 0, SM75_SR_TID_X << 8);     # v3 = tid
+    _gisel_emit(&isel, 1, SM75I_MOV, 4, 0, 0, 0, MIR_FLAG_B_IMM);          # v4 = 0      (phi in)
+    _gisel_emit(&isel, 2, SM75I_LABEL, 0, 10, 0, 0, MIR_FLAG_A_IMM);       # L10:
+    _gisel_emit(&isel, 3, SM75I_IADD3, 5, 4, 3, 0, 0);                     # v5 = v4 + v3 (v3's last read)
+    _gisel_emit(&isel, 4, SM75I_MOV, 6, 0, 7, 0, MIR_FLAG_B_IMM);          # v6 = 7
+    _gisel_emit(&isel, 5, SM75I_ISETP, 0, 5, 6, 0, (SM75_CMP_LT << 8));    # P0 = v5 < v6
+    _gisel_emit(&isel, 6, SM75I_BRA, 0, 11, 0, 0, MIR_FLAG_A_IMM | g);     # @!P0 BRA L11
+    _gisel_emit(&isel, 7, SM75I_MOV, 4, 0, 5, 0, 0);                       # v4 = v5     (phi copy)
+    _gisel_emit(&isel, 8, SM75I_BRA, 0, 10, 0, 0, MIR_FLAG_A_IMM);         # BRA L10     (back-edge)
+    _gisel_emit(&isel, 9, SM75I_LABEL, 0, 11, 0, 0, MIR_FLAG_A_IMM);       # L11:
+    _gisel_emit(&isel, 10, SM75I_IADD3, 7, 5, 1, 0, MIR_FLAG_B_IMM);       # v7 = v5 + 1
+    _gisel_emit(&isel, 11, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 12, &alloc, 512, &hw), 0, "loop regalloc ok");
+    assert_neq(sm75_reg(&alloc, 6), sm75_reg(&alloc, 3), "v6 does not take v3's register: v3 is read next iteration");
+    assert_neq(sm75_reg(&alloc, 6), sm75_reg(&alloc, 4), "nor the phi's: v4 is read next iteration");
+    assert_neq(sm75_reg(&alloc, 5), sm75_reg(&alloc, 4), "v5 (read by the copy into v4) apart from v4");
+    assert_eq(load64(&alloc + 3 * RA_REC + 8), 8, "v3 live to the back-edge (record 8)");
+    assert_eq(load64(&alloc + 4 * RA_REC + 8), 8, "v4 (the phi) live to the back-edge");
+    var sass[512];
+    var len = sm75_emit(&isel, 12, &alloc, &sass, 512);
+    assert_eq(len, 256, "10 instructions + BRA-self, padded to 256 bytes");
+    # instructions: S2R 0, MOV 16, [L10 = 32] IADD3 32, MOV 48, ISETP 64, BRA 80, MOV 96,
+    # BRA 112, [L11 = 128] IADD3 128, EXIT 144
+    assert_eq(sm75_get(&sass + 80, 0, 12), SM75_OP_BRA, "a BRA at 0x50");
+    assert_eq(sm75_get(&sass + 80, 34, 48), 8, "forward to 0x80: (0x80 - 0x60) / 4 = 8 words");
+    assert_eq(sm75_get(&sass + 80, 12, 3), 0, "guarded by P0");
+    assert_eq(sm75_get(&sass + 80, 15, 1), 1, "negated: @!P0");
+    assert_eq(sm75_get(&sass + 112, 34, 48), (1 << 48) - 24, "back to 0x20: (0x20 - 0x80) / 4 = -24 words");
+    assert_eq(sm75_get(&sass + 112, 12, 3), SM75_PT, "the back-edge is unguarded (PT)");
+    assert_eq(sm75_get(&sass + 112, 15, 1), 0, "not negated");
+    # a branch to a label that is not in the program
+    _gisel_emit(&isel, 8, SM75I_BRA, 0, 12, 0, 0, MIR_FLAG_A_IMM);
+    assert_eq(sm75_emit(&isel, 12, &alloc, &sass, 512), 0 - SM75_ERR_UNRESOLVED_LABEL, "BRA to a missing label");
+    _gisel_emit(&isel, 8, SM75I_BRA, 0, 300, 0, 0, MIR_FLAG_A_IMM);
+    assert_eq(sm75_emit(&isel, 12, &alloc, &sass, 512), 0 - SM75_ERR_UNRESOLVED_LABEL, "BRA to label id 300");
+    _gisel_emit(&isel, 8, SM75I_BRA, 0, 10, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 9, SM75I_LABEL, 0, 0, 0, 0, MIR_FLAG_A_IMM);
+    assert_eq(sm75_emit(&isel, 12, &alloc, &sass, 512), 0 - SM75_ERR_UNRESOLVED_LABEL, "a LABEL with id 0");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -203,6 +346,9 @@ fn main(): i64 {
     test_sm75_compile_kernels_and_limits();
     test_nv_spirv_module_create_path();
     test_nv_qmd_block_dims();
+    test_sm75_cf_kernels_compile();
+    test_sm75_branch_shapes();
+    test_sm75_loop_liveness_and_branches();
     return assert_summary();
 }
 

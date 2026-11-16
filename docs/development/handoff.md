@@ -14,12 +14,17 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   Two items have landed: **the scratch-buffer contract** and **the compiler limits v4.1.0 left
   named**, together with the control-flow miscompiles found next to them (see "The compiler's
   control flow" below). **N9 is in progress**: the design is `docs/proposals/n9-spirv-to-sass.md`
-  and N9.1–N9.3 have landed: `src/sm75_encode.cyr`, `sm75_isel.cyr`, `sm75_regalloc.cyr` and
-  `sm75_compile.cyr` (`sm75_compile_spirv` is the CPU compile frame), and N9.4 wired it into the
-  NVIDIA backend: compiled SPIR-V runs on the TU116 (`make test-nvidia-spirv-compute-e2e`). Next
-  is N9.5: labels, branches, loops and phi copies in `sm75_isel` / `sm75_regalloc`. Turn the
-  gate's refused kernels into lane checks, with the NVIDIA-specific expectations: an `OpReturn`
-  inside a divergent region is legal there, and nesting has no 8-level limit. Then N9.6.
+  and N9.1–N9.5 have landed. N9.1–N9.3 are `src/sm75_encode.cyr`, `sm75_isel.cyr`,
+  `sm75_regalloc.cyr` and `sm75_compile.cyr`; `sm75_compile_spirv` is the CPU compile frame.
+  N9.4 wired it into the NVIDIA backend. N9.5 added branches, loops and phis. On the TU116,
+  `make test-nvidia-spirv-compute-e2e` gets 22 of the 24 control-flow kernels right on every
+  lane; the other two are refused by name (f64; an out-of-range label). Where NVIDIA's
+  expectation differs from AMD's, it comes from `; nv-want:` / `; nv-refuse:` lines in
+  `tests/spirv/control_flow/*.body`, via `cfk_nv_refuse` / `cfk_nv_want`. **Next is N9.6**:
+  compile ranga's 11 kernels (`ranga/src/gpu_kernels.cyr`) through
+  `gpu_shader_module_create_spirv` on the TU116, then run ranga's four GPU suites with an NVIDIA
+  context. That needs two changes in ranga's repo: its NVIDIA compute guard (ADR 005) lifted, and
+  `tests/gpu_spirv.tcyr`'s 4-argument table-builder call. Both are the user's call.
   On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
   Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
   deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in

@@ -167,8 +167,12 @@ on it.
 | N9.2 | `sm75_isel.cyr`: MIR → records for the §1 op set, builtins, global memory | CPU unit tests on hand-built MIR |
 | N9.3 | `sm75_regalloc` + conservative `sm75_sched` + `sm75_compile` driver; register-count rounding | CPU; whole-kernel `nvdisasm` round trip |
 | N9.4 | backend wiring: SPIR-V `shader_module_create` on NVIDIA, QMD LocalSize + register count + binding count; first compiled kernel (SAXPY) on the TU116 | `test-nvidia-spirv-*` program on chew |
-| N9.5 | branches, loops, phis, int-compare select, the udiv macro; the 24 control-flow kernels on the TU116 | a `test-nvidia-spirv-control-flow-e2e` gate, every lane |
+| N9.5 | branches, loops, phis, int-compare select, the udiv macro; the 24 control-flow kernels on the TU116 | `test-nvidia-spirv-compute-e2e` (N9.4's gate, now checking every kernel), every lane |
 | N9.6 | ranga's 11 kernels through the public API on the TU116; then ranga's four GPU suites with an NVIDIA context | the done-when |
+
+Status (2026-11-16): N9.1–N9.5 have landed. On the TU116, 22 of the 24 control-flow kernels
+match every lane. `loop_phi_f64` is refused as `SM75_ERR_UNSUPPORTED_OP` (the f64 item below),
+and `oob_label` as `MIR_ERR_ID_OOR`. N9.6 is next.
 
 Named for after the done-when, tracked here and to be carried into the roadmap when N9 closes:
 `BSSY`/`BSYNC` reconvergence; tightened scheduling from the SM75 latency tables; predicate

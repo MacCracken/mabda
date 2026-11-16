@@ -645,9 +645,9 @@ test-nvidia-compute-api: build/nvidia_compute_api
 
 # v4.3.0 — NVIDIA native repairs (issue 2026-11-02 pair): SPIR-V refused at
 # create, a two-binding dispatch (the count-prefixed binding array), gpu_buffer_map.
-# v4.4.0 (N9.4) — SPIR-V compiled to SM75 SASS in-tree and run through the public API on the
-# TU116: the straight-line control-flow kernels lane by lane, the branchy ones refused with
-# SM75_ERR_CONTROL_FLOW until N9.5. Masterless (render node only), runs over ssh on chew.
+# v4.4.0 (N9) — SPIR-V compiled to SM75 SASS in-tree and run through the public API on the
+# TU116: the control-flow kernels lane by lane, with NVIDIA's own expectations where the
+# hardware differs. Masterless (render node only), runs over ssh on chew.
 build/nvidia_spirv_compute_e2e: programs/nvidia_spirv_compute_e2e.cyr src/*.cyr tests/tcyr/spirv_cf_kernels.cyr
 	@mkdir -p build
 	$(CYRIUS) build programs/nvidia_spirv_compute_e2e.cyr $@

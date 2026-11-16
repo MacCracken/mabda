@@ -11,6 +11,10 @@ Each kernel is head.spvasm + <name>.body (or head_<h>.spvasm with a `; head: <h>
 body's first lines say what it must do:
     ; want: <python expression over lane i>   (D = 0xDEADBEEF, the untouched seed)
     ; refuse: <mabda error constant>          (the compile must fail with exactly that code)
+and may override either for the NVIDIA (SM75) compiler, where the hardware differs:
+    ; nv-want: <python expression over lane i>
+    ; nv-refuse: <mabda error constant>
+(e.g. an OpReturn inside a divergent loop is refused on AMD and legal on NVIDIA).
 Three kernels are generated here rather than written: if_nest8 (eight nested divergent ifs,
 the GISEL_CF_MAX_DEPTH limit), if_nest9 (one past it), and oob_label (if_div with its merge
 label renumbered past id_bound — the crafted module that crashed the compile frame before 4.4.0).
@@ -84,6 +88,16 @@ def meta_of(body):
     return kind, val
 
 
+def nv_meta_of(body):
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("; nv-want:"):
+            return "want", s[len("; nv-want:"):].strip()
+        if s.startswith("; nv-refuse:"):
+            return "refuse", s[len("; nv-refuse:"):].strip()
+    return None
+
+
 def renumber_label(words, old, new):
     """Rewrite label <id> `old` to `new` wherever OpLabel / OpBranch / OpBranchConditional /
     OpSelectionMerge name it (the header's id_bound is left alone)."""
@@ -125,13 +139,17 @@ def head_text(h):
 
 def build():
     kernels = []   # (name, head group, assembled text, meta)
+    nv = {}        # name -> NVIDIA override (kind, val) or None
     for fn in sorted(os.listdir(SRC)):
         if fn.endswith(".body"):
             body = open(os.path.join(SRC, fn)).read()
             h = head_of(body)
             kernels.append((fn[:-5], h, head_text(h) + body, meta_of(body)))
+            nv[fn[:-5]] = nv_meta_of(body)
     kernels.append(("if_nest8", "", head_text("") + nest_body(8), ("want", "D if i == 0 else min(i, 8)")))
     kernels.append(("if_nest9", "", head_text("") + nest_body(9), ("refuse", "GISEL_ERR_NESTED_SELECTION")))
+    # NVIDIA keeps a PC per thread: no saved-EXEC pairs, so no nesting limit.
+    nv["if_nest9"] = ("want", "D if i == 0 else min(i, 9)")
     words = {}
     for name, _, text, _ in kernels:
         words[name] = assemble(text)
@@ -214,17 +232,36 @@ def build():
     o.append("    return 0;")
     o.append("}")
     o.append("")
-    o.append("fn cfk_want(k, out): i64 {")
+    def want_fn(fname, pick):
+        o.append(f"fn {fname}(k, out): i64 {{")
+        for idx, (name, _, _, meta) in enumerate(kernels):
+            kind, val = pick(name, meta)
+            if kind != "want":
+                continue
+            vals = [eval(val, {"D": D, "max": max, "min": min}, {"i": i}) & 0xFFFFFFFF for i in range(LANES)]
+            o.append(f"    if (k == {idx}) {{")
+            o.extend(["    " + line for line in w4_lines("out", vals, 0)])
+            o.append("        return 1;")
+            o.append("    }")
+        o.append("    return 0;")
+        o.append("}")
+
+    want_fn("cfk_want", lambda name, meta: meta)
+    o.append("")
+    o.append("# The NVIDIA (SM75) expectations: the shared ones, except where a body says `; nv-want:` /")
+    o.append("# `; nv-refuse:` (an OpReturn in a divergent region and deep nesting are legal there; f64 is")
+    o.append("# not selected for NVIDIA yet).")
+    o.append("fn cfk_nv_refuse(k): i64 {")
     for idx, (name, _, _, (kind, val)) in enumerate(kernels):
-        if kind != "want":
-            continue
-        vals = [eval(val, {"D": D, "max": max, "min": min}, {"i": i}) & 0xFFFFFFFF for i in range(LANES)]
-        o.append(f"    if (k == {idx}) {{")
-        o += ["    " + line for line in w4_lines("out", vals, 0)]
-        o.append("        return 1;")
-        o.append("    }")
+        ov = nv.get(name)
+        if ov is not None:
+            kind, val = ov
+        if kind == "refuse":
+            o.append(f"    if (k == {idx}) {{ return 0 - {val}; }}")
     o.append("    return 0;")
     o.append("}")
+    o.append("")
+    want_fn("cfk_nv_want", lambda name, meta: nv.get(name) or meta)
     return "\n".join(o) + "\n"
 
 

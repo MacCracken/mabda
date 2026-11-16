@@ -97,9 +97,11 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
 
 - 🔨 **N9: SPIR-V → SASS for the NVIDIA backend**, in progress. The design note is
   [`../proposals/n9-spirv-to-sass.md`](../proposals/n9-spirv-to-sass.md), whose §7 lists the bites.
-  **N9.1–N9.4 have landed**: compiled SPIR-V runs on the TU116 through the public API, and the
-  straight-line kernels match on every lane (`test-nvidia-spirv-compute-e2e`). N9.5 (branches,
-  loops, phis; the control-flow suite on NVIDIA) and N9.6 (ranga's kernels and suites) are open. ranga's 11 kernels at HEAD need less than the issue lists: no `OpFDiv`, `OpSelect` or
+  **N9.1–N9.5 have landed**: compiled SPIR-V runs on the TU116 through the public API, with
+  branches, loops and phis. 22 of the 24 control-flow kernels match on every lane
+  (`test-nvidia-spirv-compute-e2e`); the other two are refused by name (f64; an out-of-range
+  label). N9.6 (ranga's kernels and suites, the done-when) is open. ranga's 11 kernels at HEAD
+  need less than the issue lists: no `OpFDiv`, `OpSelect` or
   `FClamp`. (`issues/2026-11-02-n9-spirv-to-sass-compiler-request.md`;
   ranga's NVIDIA compute waits on it). The NVIDIA backend takes only pre-captured SASS; a portable
   consumer ships SPIR-V. The compiler is the analogue of `spirv_lower` → `gfx9_*`: the SPIR-V
@@ -132,9 +134,13 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   load's register was reused while the load was in flight; the v4.1.0 int-compare select never
   worked; and a label id past `id_bound` wrote off the stack (HIGH). 24 generated kernels
   (`tests/spirv/control_flow/`) are checked lane by lane by `test-native-spirv-control-flow-e2e`.
-  **Open:** the same in N9's SM75 path (rides with N9 above). Still refused with a named code:
-  a `break` out of a divergent if nested inside a divergent loop (a `continue` there compiles, as
-  an if/else merging at the latch), a return inside a divergent region, and nesting deeper than 8.
+  Still refused on GFX9 with a named code: a `break` out of a divergent if nested inside a
+  divergent loop (a `continue` there compiles, as an if/else merging at the latch), a return
+  inside a divergent region, and nesting deeper than 8. **SM75 half: done in N9.5.** The same 24
+  kernels run on the TU116. 22 match every lane, including the return inside a loop and the
+  9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `loop_phi_f64` is
+  refused because f64 is not selected for NVIDIA yet (the design note's §7 f64 item);
+  `oob_label` is refused as on AMD.
 - **NVIDIA block-linear scanout + ADDFB2 format modifiers.** The nouveau present slots
   (`_nv_surface_alloc_fb`) scan out a LINEAR VRAM BO with modifier 0 (ADR 007 Fork 4);
   block-linear needs ADDFB2 with `DRM_MODE_FB_MODIFIERS` and an NVIDIA block-linear
