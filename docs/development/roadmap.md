@@ -123,7 +123,10 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     - 4.5× fewer issue cycles per warp. Wall-clock is 1.48× faster for the arithmetic-bound
       `loop_lcg`; ranga's GART-memory-bound kernels are unchanged
       (`make bench-nvidia-compute`).
-  - Predicate allocation (P0–P6) in place of re-emitting the compare whenever P0 holds another.
+  - ✅ **Predicate allocation (P0–P6)** in place of re-emitting the compare whenever P0 holds
+    another (CHANGELOG [4.4.0]). There is a per-block table with least-recently-used eviction,
+    and the last compare, which CNDMASK reads, is protected. No compare is re-emitted across the
+    34 compiled kernels. HW-verified: the 15 gates, ranga's goldens and ranga's four suites.
   - `BSSY` / `BSYNC` reconvergence hints. v1 omits them, which is correct but lets diverged
     threads reconverge later than ptxas code would.
   - A target-aware lowering for f32 `OpFDiv` (`MUFU.RCP` plus a Newton step) and for f64. Today

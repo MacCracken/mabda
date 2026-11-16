@@ -45,8 +45,8 @@ NVIDIA context now compiles SPIR-V in-tree. On the TU116:
 - ranga's 11 kernels match an independent oracle;
 - ranga's four GPU suites pass with an NVIDIA context.
 
-The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. The first one,
-latency-table scheduling, has landed (below). Predicate allocation, `BSSY` / `BSYNC` and SM75
+The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. Two have
+landed (below): latency-table scheduling and predicate allocation. `BSSY` / `BSYNC` and SM75
 `OpFDiv` / f64 are open.
 
 ### Security
@@ -407,6 +407,39 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - Measured against `720eaf2` (the v1 schedule) on the same box, two alternating passes; log
     `build/logs/bench-nvidia-compute-v1-v2-20261116-150245.log`.
 
+### Changed — SM75 predicate allocation (the second N9 follow-on)
+- **Allocation.** `sm75_isel` now gives each MIR compare's `ISETP` one of P0–P6 (`_s75_palloc`)
+  instead of always P0. Selection keeps a per-block table of the compare each predicate holds.
+  - A `SEL` or a guarded `BRA` on a compare still held reads its predicate. Only a compare no
+    longer held is re-selected, into a free predicate or else the least recently used one.
+  - The last MIR compare's predicate is never evicted, because `CNDMASK` (the udiv macro's "VCC
+    from the last compare") reads it.
+  - A label empties the table, because predicate contents depend on the path in.
+- **Record layout.** `ISETP`, `SEL` and `BRA` records carry their predicate in flags bits 12–14,
+  9–11 and 10–12. The encoder writes it to `ISETP`'s destination (81–83), `SEL`'s predicate source
+  (87–89) and the guard (12–14).
+- **Scheduler and checker.** `sm75_schedule` and the independent checker `_ck_sched` track all
+  seven predicates. A guarded branch's 12 cycles and a `SEL`'s 4 now count from that predicate's
+  own `ISETP`.
+- **Effect.** Across the 34 compiled kernels, no compare is re-emitted any more. Before, one was:
+  in `if_vcc_clobbered` the udiv macro's compares overwrote P0, so the branch re-selected its
+  compare. Now the branch reads P0 past the macro's P1–P3, which saves one `ISETP` and 8 issue
+  cycles there. Real kernels rarely read a compare after another one, so the wider gain is
+  small; the rule now holds for every block.
+- **On the TU116** (`build/logs/nvidia-predicates-20261116-151429.log`):
+  - nvdisasm decodes all 34 kernels and shows P0–P3 where expected;
+  - the 15 masterless gates pass;
+  - 23 of the 25 control-flow kernels match every lane, with the 2 refusals as expected;
+  - ranga's 11 kernels match their goldens;
+  - ranga's four GPU suites pass with an NVIDIA context;
+  - the kernel log is clean.
+- **Tests.**
+  - `sm75_isel.tcyr` (94 assertions): `test_sm75_isel_conditions` now pins no re-emission, and
+    `test_sm75_isel_predicate_eviction` covers least-recently-used eviction that spares the last
+    compare and the table reset at a label.
+  - `sm75_compile.tcyr` (263 assertions): `test_sm75_schedule_per_predicate`, plus the new
+    `if_vcc_clobbered` branch shape.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -468,9 +501,9 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7435 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7472 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
-  7232 after N9.4; 7289 after N9.5; 7356 after N9.6). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
   `cyrius distlib` is idempotent.

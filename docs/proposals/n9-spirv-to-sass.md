@@ -90,6 +90,17 @@ a reader re-emits its compare unless the record just before it is that compare. 
 predicates, so allocating them would avoid re-emission; v1 uses P0 alone because the rule is
 proven and simple.
 
+**Predicate allocation (4.4.0, the second N9 follow-on): landed.** Each MIR compare's `ISETP`
+gets one of P0–P6, and selection keeps a table of the compare each predicate holds. A `SEL` or a
+guarded branch on a compare still held reads its predicate directly. A compare that is no longer
+held is re-selected into a free predicate, or else the least recently used one. The last MIR
+compare's predicate is never evicted, because `CNDMASK` (the udiv macro's "VCC from the last
+compare") reads it. A label empties the table, since contents depend on the path in.
+
+The scheduler and the independent checker track all seven predicates. Across the 34 compiled
+kernels no compare is re-emitted any more; the only one before was in `if_vcc_clobbered`, whose
+branch now reads P0 past the udiv macro's P1–P3.
+
 **Control flow.** NVIDIA's SIMT keeps a program counter per thread (Volta independent thread
 scheduling), so a divergent branch is just a predicated `BRA`. There is no EXEC mask to save,
 narrow or restore. A divergent if becomes `@!P0 BRA merge`. A loop exit becomes `@!P0 BRA exit`,
@@ -214,10 +225,9 @@ N9.6 found one bug: SM75 counted only the bindings a kernel reads, where GFX9 co
 bindings it declares. It now counts declared bindings too (CHANGELOG [4.4.0]).
 
 Named for after the done-when. Since N9 closed they are tracked in the roadmap's 4.4.0 section,
-"N9 follow-ons". The latency-table scheduling is done (§5 v2); the rest are open:
-`BSSY`/`BSYNC` reconvergence; tightened scheduling from the SM75 latency tables; predicate
-allocation in place of P0 re-emission; a target-aware lowering for `OpFDiv` (`MUFU.RCP` + Newton
-on SM75) and f64.
+"N9 follow-ons". Two are done: the latency-table scheduling (§5 v2) and predicate allocation (§3,
+"Conditions"). Two are open: `BSSY`/`BSYNC` reconvergence, and a target-aware lowering for
+`OpFDiv` (`MUFU.RCP` + Newton on SM75) and f64.
 
 ## 8. Risks
 

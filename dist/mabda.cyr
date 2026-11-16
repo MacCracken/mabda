@@ -25470,21 +25470,24 @@ fn sm75_enc_nop(ins): i64 {
 #
 # FLAGS, bits 8+: the per-op modifiers the encoder needs (see each SM75I_* below).
 #
-# CONDITIONS. ISETP writes predicate P0 and nothing else does, so P0 always holds the last
-# compare emitted. CNDMASK (lowering's udiv macro) means exactly that — AMD's "VCC from the
-# last compare" — and becomes SEL ... P0. ISELECT names its condition, and re-emits the
-# compare when P0 holds a different one (the 4.4.0 freshness rule, simpler here because no
-# other instruction writes P0).
+# CONDITIONS (predicate allocation, 4.4.0). Only ISETP writes a predicate. Each MIR compare's
+# ISETP gets one of P0..P6 (PT, 7, is the constant true), and selection keeps a table of which
+# compare each predicate holds: a SEL or a branch on a compare still held reads its predicate
+# directly; only a compare no longer held is re-selected (the 4.4.0 freshness rule), into a free
+# predicate or the least recently used one. CNDMASK (lowering's udiv macro) means AMD's "VCC
+# from the last compare": it reads the predicate of the last MIR compare selected, which is
+# never evicted. A predicate's contents depend on the path into a label, so a label empties
+# the table (and forgets the last compare). v1 (N9.2–N9.6) used P0 alone and re-selected a
+# compare whenever another had overwritten it.
 #
 # CONTROL FLOW (N9.5). An SM75 thread keeps its own program counter (Volta independent thread
 # scheduling), so a divergent branch is just a predicated BRA: no EXEC mask to save, narrow or
-# restore, and none of gfx9_isel's region stack. A conditional branch is the compare (in P0,
-# re-emitted when stale) + `@!P0 BRA <false>` + `BRA <true>` unless the true block comes next.
+# restore, and none of gfx9_isel's region stack. A conditional branch is its compare's predicate
+# (re-selected when not held) + `@!Pk BRA <false>` + `BRA <true>` unless the true block comes next.
 # Back-edge phi copies (MIR_CB_MOVES_*) go between the two branches, so only the edge that takes
-# them runs them (FALSE-edge copies flip it: `@P0 BRA <true>`, copies, `BRA <false>`). OpReturn
+# them runs them (FALSE-edge copies flip it: `@Pk BRA <true>`, copies, `BRA <false>`). OpReturn
 # is EXIT anywhere — it retires only the threads that execute it, so an early return inside a
-# divergent if or loop is legal here, unlike on AMD. P0's contents depend on the path into a
-# label, so a label resets what P0 is known to hold. Reconvergence (BSSY / BSYNC) is not
+# divergent if or loop is legal here, unlike on AMD. Reconvergence (BSSY / BSYNC) is not
 # emitted: these kernels have no warp-synchronous operations, so threads that never reconverge
 # still compute correctly (design note §3; named in §7).
 #
@@ -25497,8 +25500,8 @@ var SM75I_IMAD    = 2;    # d = a * b + c (low)    bit 8: signed
 var SM75I_IMAD_HI = 3;    # d = hi(a * b) + c      unsigned
 var SM75I_LOP3    = 4;    # d = lut(a, b, c)       bits 8-15: lut
 var SM75I_SHF     = 5;    # funnel shift           bits 8-9: type (2 S32, 3 U32), bit 10 right, bit 11 high
-var SM75I_ISETP   = 6;    # P0 = a <cmp> b         bits 8-10: cmp, bit 11: signed   (dst 0)
-var SM75I_SEL     = 7;    # d = P0 ? a : b         bit 8: P0 negated
+var SM75I_ISETP   = 6;    # Pk = a <cmp> b         bits 8-10: cmp, bit 11: signed, bits 12-14: k (dst 0)
+var SM75I_SEL     = 7;    # d = Pk ? a : b         bit 8: Pk negated, bits 9-11: k
 var SM75I_MOV     = 8;    # d = b
 var SM75I_FADD    = 9;    # d = a + b              bit 8: negate b
 var SM75I_FMUL    = 10;   # d = a * b
@@ -25514,7 +25517,7 @@ var SM75I_LDG     = 19;   # d = [a.U32 + UR + b]   bits 8-13: UR, b immediate
 var SM75I_STG     = 20;   # [a.U32 + UR + c] = b   bits 8-13: UR, c immediate    (dst 0)
 var SM75I_EXIT    = 21;
 var SM75I_LABEL   = 22;   # a = label <id> (immediate); 0 bytes — the emitter records its offset
-var SM75I_BRA     = 23;   # a = target label (immediate); bit 8: guarded by P0, bit 9: @!P0
+var SM75I_BRA     = 23;   # a = target label (immediate); bit 8: guarded, bit 9: @!Pk, bits 10-12: k
 
 var SM75I_REC = 48;   # the GISEL record shape (gfx9_isel.cyr)
 
@@ -25541,8 +25544,12 @@ fn sm75i_b(out, i): i64 { return load64(out + i * SM75I_REC + 24); }
 fn sm75i_c(out, i): i64 { return load64(out + i * SM75I_REC + 32); }
 fn sm75i_flags(out, i): i64 { return load64(out + i * SM75I_REC + 40); }
 
-# Selection state: st+0 = k (records so far), st+8 = cap, st+16 = the condition <id> P0
-# holds (0 = unknown).
+# Selection state (SM75_ST_SIZE bytes): st+0 = k (records so far), st+8 = cap, st+16 = the
+# predicate holding the last MIR compare (-1: none since the last label), st+24 = a use clock,
+# then SM75_NPRED (7) pairs from st+32: [compare <id> held (0: none), last use].
+var SM75_NPRED = 7;            # P0..P6; P7 is PT
+var SM75_ST_SIZE = 144;        # 32 + 7 * 16
+
 fn _s75_put(out, st, op, dst, a, b, c, flags): i64 {
     var k = load64(st);
     if (k >= load64(st + 8)) { return 0 - SM75_ERR_CAP_EXCEEDED; }
@@ -25645,7 +25652,59 @@ fn _s75_cmp_flip(cmp): i64 {
     return cmp;
 }
 
-fn _s75_icmp(m, out, st, op, res, a, b, fl): i64 {
+fn _s75_pheld(st, k): i64 { return load64(st + 32 + k * 16); }
+
+# Forget every predicate (a label: the contents depend on the path in).
+fn _s75_preset(st): i64 {
+    store64(st + 16, 0 - 1);
+    var k = 0;
+    while (k < SM75_NPRED) { store64(st + 32 + k * 16, 0); store64(st + 40 + k * 16, 0); k = k + 1; }
+    return 0;
+}
+
+fn _s75_ptouch(st, k): i64 {
+    var c = load64(st + 24) + 1;
+    store64(st + 24, c);
+    store64(st + 40 + k * 16, c);
+    return 0;
+}
+
+# The predicate holding compare `cond`, or -1.
+fn _s75_pfind(st, cond): i64 {
+    if (cond <= 0) { return 0 - 1; }
+    var k = 0;
+    while (k < SM75_NPRED) {
+        if (_s75_pheld(st, k) == cond) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+# A predicate for compare `cond`: the one already holding it, else a free one, else the least
+# recently used — never the last MIR compare's, which a CNDMASK may still read.
+fn _s75_palloc(st, cond): i64 {
+    var k = _s75_pfind(st, cond);
+    if (k >= 0) { return k; }
+    k = 0;
+    while (k < SM75_NPRED) {
+        if (_s75_pheld(st, k) == 0) { return k; }
+        k = k + 1;
+    }
+    var best = 0 - 1;
+    k = 0;
+    while (k < SM75_NPRED) {
+        if (k != load64(st + 16)) {
+            if (best < 0) { best = k; }
+            if (load64(st + 40 + k * 16) < load64(st + 40 + best * 16)) { best = k; }
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+# Select compare `res` (MIR op `op`, operands a / b) into a predicate. `last` = 1 for the MIR
+# compare itself (it becomes the last compare), 0 for a re-selection. Returns the predicate.
+fn _s75_icmp(m, out, st, op, res, a, b, fl, last): i64 {
     var cmp = _s75_cmp_code(op);
     if (cmp < 0) { return 0 - SM75_ERR_UNSUPPORTED_OP; }
     var signed = 0;
@@ -25664,15 +25723,21 @@ fn _s75_icmp(m, out, st, op, res, a, b, fl): i64 {
     var slot[8];
     var bf = _s75_src(m, b, bimm, &slot, MIR_FLAG_B_IMM);
     if (bf < 0) { return bf; }
-    var pr = _s75_put(out, st, SM75I_ISETP, 0, ra, load64(&slot), 0, bf | (cmp << 8) | (signed << 11));
+    var pk = _s75_palloc(st, res);
+    var pr = _s75_put(out, st, SM75I_ISETP, 0, ra, load64(&slot), 0,
+      bf | (cmp << 8) | (signed << 11) | (pk << 12));
     if (pr < 0) { return pr; }
-    store64(st + 16, res);
-    return 0;
+    store64(st + 32 + pk * 16, res);
+    _s75_ptouch(st, pk);
+    if (last == 1) { store64(st + 16, pk); }
+    return pk;
 }
 
-# Put condition `cond` in P0, unless it is already there: re-select its compare.
+# The predicate holding condition `cond`: the one it is in, else its compare re-selected.
+# Returns the predicate (0..6) or a negative error.
 fn _s75_cond(m, out, st, cond): i64 {
-    if (load64(st + 16) == cond) { if (cond != 0) { return 0; } }
+    var held = _s75_pfind(st, cond);
+    if (held >= 0) { _s75_ptouch(st, held); return held; }
     if (cond <= 0) { return 0 - SM75_ERR_BAD_OPERAND; }
     if (cond >= load64(m + 64)) { return 0 - SM75_ERR_BAD_OPERAND; }
     var cdef = mir_val_def(m, cond);
@@ -25681,12 +25746,12 @@ fn _s75_cond(m, out, st, cond): i64 {
     var op = mir_instr_op(m, cdef);
     if (mir_op_is_icmp(op) == 0) { return 0 - SM75_ERR_BAD_OPERAND; }
     return _s75_icmp(m, out, st, op, cond, mir_instr_a(m, cdef), mir_instr_b(m, cdef),
-      mir_instr_flags(m, cdef));
+      mir_instr_flags(m, cdef), 0);
 }
 
-# SEL d, t, f, P0 (t / f = the TRUE / FALSE values). A constant TRUE value with a register
-# FALSE one swaps them and negates P0; src0 is otherwise materialized.
-fn _s75_sel(m, out, st, dst, t, tflag, f, fflag, type): i64 {
+# SEL d, t, f, Pp (t / f = the TRUE / FALSE values). A constant TRUE value with a register
+# FALSE one swaps them and negates Pp; src0 is otherwise materialized.
+fn _s75_sel(m, out, st, dst, t, tflag, f, fflag, type, p): i64 {
     var neg = 0;
     if (_s75_imm(m, t, tflag) >= 0) {
         if (_s75_imm(m, f, fflag) < 0) {
@@ -25700,7 +25765,7 @@ fn _s75_sel(m, out, st, dst, t, tflag, f, fflag, type): i64 {
     var slot[8];
     var bf = _s75_src(m, f, fflag, &slot, MIR_FLAG_B_IMM);
     if (bf < 0) { return bf; }
-    return _s75_put(out, st, SM75I_SEL, dst, ra, load64(&slot), 0, bf | (neg << 8));
+    return _s75_put(out, st, SM75I_SEL, dst, ra, load64(&slot), 0, bf | (neg << 8) | (p << 9));
 }
 
 # A single-source op (conversions, MUFU, MOV): the source rides in the src1 slot (b).
@@ -25779,7 +25844,7 @@ fn _s75_one(m, out, st, i): i64 {
     var f = MIR_T_F32;
     if (op == MIR_OP_RET) { return _s75_put(out, st, SM75I_EXIT, 0, 0, 0, 0, 0); }
     if (op == MIR_OP_LABEL) {
-        store64(st + 16, 0);   # P0 depends on the path in
+        _s75_preset(st);   # predicates depend on the path in
         return _s75_put(out, st, SM75I_LABEL, 0, a, 0, 0, MIR_FLAG_A_IMM);
     }
     if (op == MIR_OP_BRANCH) {
@@ -25826,7 +25891,11 @@ fn _s75_one(m, out, st, i): i64 {
         if (sf2 < 0) { return sf2; }
         return _s75_put(out, st, SM75I_SHF, dst, 0, load64(&s2), vs, sf2 | (2 << 8) | (1 << 10) | (1 << 11));
     }
-    if (mir_op_is_icmp(op) == 1) { return _s75_icmp(m, out, st, op, dst, a, b, fl); }
+    if (mir_op_is_icmp(op) == 1) {
+        var ir = _s75_icmp(m, out, st, op, dst, a, b, fl, 1);
+        if (ir < 0) { return ir; }
+        return 0;
+    }
     if (op == MIR_OP_FADD) { return _s75_bin(m, out, st, SM75I_FADD, dst, a, b, fl, 0, 1, f); }
     if (op == MIR_OP_FSUB) {
         var fv = _s75_imm(m, b, fl & MIR_FLAG_B_IMM);
@@ -25889,15 +25958,17 @@ fn _s75_one(m, out, st, i): i64 {
     if (op == MIR_OP_CVT_U_F32) { return _s75_un(m, out, st, SM75I_F2I, dst, a, fl, SM75_RND_RZ << 8); }
     if (op == MIR_OP_VMOV) { return _s75_un(m, out, st, SM75I_MOV, dst, a, fl, 0); }
     if (op == MIR_OP_CNDMASK) {
-        # dst = <last compare> ? b : a — P0 holds the last compare (see the header).
-        if (load64(st + 16) == 0) { return 0 - SM75_ERR_BAD_OPERAND; }
-        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, a, fl & MIR_FLAG_A_IMM, u);
+        # dst = <last compare> ? b : a — the last MIR compare's predicate (see the header).
+        var lp = load64(st + 16);
+        if (lp < 0) { return 0 - SM75_ERR_BAD_OPERAND; }
+        _s75_ptouch(st, lp);
+        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, a, fl & MIR_FLAG_A_IMM, u, lp);
     }
     if (op == MIR_OP_ISELECT) {
         var cr = _s75_cond(m, out, st, a);
         if (cr < 0) { return cr; }
         var ty = mir_type_base(mir_val_type(m, dst));
-        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, c, fl & MIR_FLAG_C_IMM, ty);
+        return _s75_sel(m, out, st, dst, b, fl & MIR_FLAG_B_IMM, c, fl & MIR_FLAG_C_IMM, ty, cr);
     }
     if (op == MIR_OP_EXTRACT) { return _s75_extract(m, out, st, dst, a, c); }
     if (op == MIR_OP_LOAD) { return _s75_mem(m, out, st, op, dst, a, b, c, fl); }
@@ -25948,8 +26019,8 @@ fn _s75_cond_branch(m, out, st, i, n): i64 {
     # the guarded branch skips the edge that takes the copies
     var first = ct;
     var other = bt;
-    var guard = (1 << 8) | (1 << 9);       # @!P0 BRA <false>
-    if (mv_c == 1) { first = bt; other = ct; guard = 1 << 8; }   # @P0 BRA <true>
+    var guard = (1 << 8) | (1 << 9) | (cr << 10);       # @!Pk BRA <false>
+    if (mv_c == 1) { first = bt; other = ct; guard = (1 << 8) | (cr << 10); }   # @Pk BRA <true>
     var p1 = _s75_put(out, st, SM75I_BRA, 0, first, 0, 0, MIR_FLAG_A_IMM | guard);
     if (p1 < 0) { return p1; }
     var j = 1;
@@ -26017,10 +26088,11 @@ fn _s75_binding_read(m, b): i64 {
 # declared binding nothing reads is counted but not loaded.
 # Returns the record count or a NEGATIVE error.
 fn sm75_isel(m, out, out_len): i64 {
-    var st[24];
+    var st[144];         # SM75_ST_SIZE
     store64(&st, 0);
     store64(&st + 8, out_len / SM75I_REC);
-    store64(&st + 16, 0);
+    store64(&st + 24, 0);
+    _s75_preset(&st);
     var nb = sm75_binding_count(m);
     if (nb > SM75_MAX_BIND) { return 0 - SM75_ERR_TOO_MANY_BINDINGS; }
     var b = 0;
@@ -26272,8 +26344,8 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
     if (op == SM75I_SHF) {
         return sm75_enc_shf(ins, d, a, b, bk, c, mods & 3, (mods >> 2) & 1, (mods >> 3) & 1);
     }
-    if (op == SM75I_ISETP) { return sm75_enc_isetp(ins, 0, a, b, bk, mods & 7, (mods >> 3) & 1); }
-    if (op == SM75I_SEL) { return sm75_enc_sel(ins, d, a, b, bk, 0, mods & 1); }
+    if (op == SM75I_ISETP) { return sm75_enc_isetp(ins, (mods >> 4) & 7, a, b, bk, mods & 7, (mods >> 3) & 1); }
+    if (op == SM75I_SEL) { return sm75_enc_sel(ins, d, a, b, bk, (mods >> 1) & 7, mods & 1); }
     if (op == SM75I_MOV) { return sm75_enc_mov(ins, d, b, bk); }
     if (op == SM75I_FADD) { return sm75_enc_fadd(ins, d, a, b, bk, mods & 1); }
     if (op == SM75I_FMUL) { return sm75_enc_fmul(ins, d, a, b, bk); }
@@ -26484,6 +26556,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
     var urc[512];       # 64 uniform registers: issue cycle of the ULDC that wrote them
     var sset[48];       # 6 scoreboards: the cycle each was last set
     var sseq[48];       # 6 scoreboards: allocation order
+    var pcyc[56];       # P0..P6: issue cycle of the ISETP that wrote each
     var srcs[24];
     memset(&wcls, 0, 2048);
     memset(&sbw, 0, 2048);
@@ -26494,9 +26567,10 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
     while (r < 256) { store64(&wcyc + r * 8, _S75_NEVER); r = r + 1; }
     r = 0;
     while (r < 64) { store64(&urc + r * 8, _S75_NEVER); r = r + 1; }
+    r = 0;
+    while (r < 7) { store64(&pcyc + r * 8, _S75_NEVER); r = r + 1; }
     var busy = 0;
     var seq = 1;
-    var p0c = _S75_NEVER;
     var tprev = 0 - 1;
     var iprev = 0 - 1;
     var minnext = 0;
@@ -26520,9 +26594,15 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
             wait = wait | load64(&sbw + s * 8);
             k = k + 1;
         }
-        if (op == SM75I_SEL) { if (t < p0c + SM75_LAT_SEL) { t = p0c + SM75_LAT_SEL; } }
+        if (op == SM75I_SEL) {
+            var ps = load64(&pcyc + ((fl >> 9) & 7) * 8) + SM75_LAT_SEL;
+            if (t < ps) { t = ps; }
+        }
         if (op == SM75I_BRA) {
-            if (((fl >> 8) & 1) == 1) { if (t < p0c + SM75_LAT_GUARD) { t = p0c + SM75_LAT_GUARD; } }
+            if (((fl >> 8) & 1) == 1) {
+                var pg = load64(&pcyc + ((fl >> 10) & 7) * 8) + SM75_LAT_GUARD;
+                if (t < pg) { t = pg; }
+            }
         }
         var ur = 0 - 1;
         if (op == SM75I_LDG) { ur = (fl >> 8) & 0x3F; }
@@ -26604,7 +26684,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
             }
             store64(&sbr + d * 8, 0);
         }
-        if (op == SM75I_ISETP) { p0c = t; }
+        if (op == SM75I_ISETP) { store64(&pcyc + ((fl >> 12) & 7) * 8, t); }
         if (op == SM75I_ULDC) {
             var u = sm75i_a(isel, i);
             if (u >= 0) {
@@ -26680,7 +26760,7 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
             # offset in 32-bit words from the NEXT instruction
             rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
             var bfl = sm75i_flags(isel, i) >> 8;
-            if ((bfl & 1) != 0) { sm75_set_guard(ins, 0, (bfl >> 1) & 1); }
+            if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
         } else {
             rc = _s75_encode(isel, i, alloc, ins);
         }

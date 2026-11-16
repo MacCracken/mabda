@@ -188,9 +188,11 @@ fn test_sm75_cf_kernels_compile() {
     return 0;
 }
 
-# N9.5: a branch's shape. if_vcc_clobbered: the udiv's compares overwrite P0, so the branch
-# re-emits its own compare right before `@!P0 BRA`; loop_do_while: the back-edge copy sits
-# between `@!P0 BRA <exit>` and `BRA <header>`.
+# A branch's shape. if_vcc_clobbered: the branch's compare comes first, then the udiv macro's
+# three compares. With predicate allocation (4.4.0) they take other predicates, so the branch
+# reads the first compare's predicate with nothing re-emitted (N9.5, with P0 alone, re-emitted
+# it right before `@!P0 BRA`). loop_do_while: the back-edge copy sits between `@!Pk BRA <exit>`
+# and `BRA <header>`.
 fn test_sm75_branch_shapes() {
     var spv[1680];
     var out[24576];
@@ -220,8 +222,18 @@ fn test_sm75_branch_shapes() {
         i = i + 1;
     }
     assert_eq(bi > 0, 1, "a guarded BRA");
-    assert_eq(sm75i_op(&out, bi - 1), SM75I_ISETP, "its compare right before it (P0 was overwritten by the udiv)");
-    assert_eq((sm75i_flags(&out, bi) >> 9) & 1, 1, "@!P0 BRA <merge>");
+    var ni = 0;
+    var fi = 0 - 1;
+    i = 0;
+    while (i < bi) {
+        if (sm75i_op(&out, i) == SM75I_ISETP) { ni = ni + 1; if (fi < 0) { fi = i; } }
+        i = i + 1;
+    }
+    assert_eq(ni, 4, "four compares: the branch's and the udiv's three — none re-emitted");
+    assert_neq(sm75i_op(&out, bi - 1), SM75I_ISETP, "no compare right before the branch");
+    assert_eq((sm75i_flags(&out, bi) >> 10) & 7, (sm75i_flags(&out, fi) >> 12) & 7,
+      "the branch reads the first compare's predicate");
+    assert_eq((sm75i_flags(&out, bi) >> 9) & 1, 1, "@!Pk BRA <merge>");
     n = _cfk2("loop_do_while", &spv);
     assert_eq(mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32,
         spirv_hdr_id_bound(&spv)), 0, "init 2");
@@ -532,12 +544,14 @@ fn _ck_sched(sass, len): i64 {
     var osr[6144];      #   its sources (3 each)
     var ons[2048];      #   source count
     var urt[512];
+    var prt[64];        # P0..P6 (and PT): issue cycle of the ISETP that wrote each
     var srcs[24];
     memset(&lwk, 0, 2048);
     memset(&odc, 0, 2048);
     var r = 0;
     while (r < 64) { store64(&urt + r * 8, 0 - 1000); r = r + 1; }
-    var p0t = 0 - 1000;
+    r = 0;
+    while (r < 8) { store64(&prt + r * 8, 0 - 1000); r = r + 1; }
     var t = 0;
     var bad = 0;
     var nins = len / 16;
@@ -594,10 +608,14 @@ fn _ck_sched(sass, len): i64 {
             k = k + 1;
         }
         # 3. the predicate, 4. the uniform registers
-        if ((op12 & 0x1FF) == SM75_OP_SEL) { if (t - p0t < 4) { bad = bad + _ck_bad(j, "SEL < 4 after ISETP"); } }
+        if ((op12 & 0x1FF) == SM75_OP_SEL) {
+            var sp = load64(&prt + sm75_get(ins, 87, 3) * 8);
+            bad = bad + _ck_need(t - sp >= 4, j, "SEL < 4 after its ISETP");
+        }
         if (op12 == SM75_OP_BRA) {
             if (sm75_get(ins, 12, 3) != SM75_PT) {
-                bad = bad + _ck_need(t - p0t >= 12, j, "guarded BRA < 12 after ISETP");
+                var gp = load64(&prt + sm75_get(ins, 12, 3) * 8);
+                bad = bad + _ck_need(t - gp >= 12, j, "guarded BRA < 12 after its ISETP");
             }
         }
         var ur = 0 - 1;
@@ -687,7 +705,7 @@ fn _ck_sched(sass, len): i64 {
                 store64(&lwc + d * 8, cls);
             }
         }
-        if ((op12 & 0x1FF) == SM75_OP_ISETP) { p0t = t; }
+        if ((op12 & 0x1FF) == SM75_OP_ISETP) { store64(&prt + sm75_get(ins, 81, 3) * 8, t); }
         if (op12 == SM75_OP_ULDC) {
             var u = sm75_get(ins, 16, 6);
             store64(&urt + u * 8, t);
@@ -846,6 +864,43 @@ fn test_sm75_schedule_stg_before_branch() {
     return 0;
 }
 
+# Predicate allocation (4.4.0): a guarded branch's 12 cycles count from ITS predicate's ISETP,
+# not the latest one. ISETP P0, ISETP P1, then @!P0 BRA: 12 after the first (11 after the second).
+fn test_sm75_schedule_per_predicate() {
+    var m[80];
+    var vals[1280];
+    var instrs[512];
+    var ptrs[64];
+    var blocks[32];
+    mir_mod_init(&m, &vals, 1280, &instrs, 512, &ptrs, 64, &blocks, 32, 16);
+    _mir_set_val(&m, 3, MIR_VK_SSA, MIR_T_U32, MIR_DIVERGENT, 0 - 1, 0);
+    var isel[480];
+    _gisel_emit(&isel, 0, SM75I_S2R, 3, 0, 0, 0, SM75_SR_TID_X << 8);
+    _gisel_emit(&isel, 1, SM75I_ISETP, 0, 3, 5, 0, MIR_FLAG_B_IMM | (SM75_CMP_LT << 8));              # P0
+    _gisel_emit(&isel, 2, SM75I_ISETP, 0, 3, 9, 0, MIR_FLAG_B_IMM | (SM75_CMP_LT << 8) | (1 << 12));  # P1
+    _gisel_emit(&isel, 3, SM75I_BRA, 0, 7, 0, 0, MIR_FLAG_A_IMM | (1 << 8) | (1 << 9));               # @!P0
+    _gisel_emit(&isel, 4, SM75I_LABEL, 0, 7, 0, 0, MIR_FLAG_A_IMM);
+    _gisel_emit(&isel, 5, SM75I_EXIT, 0, 0, 0, 0, 0);
+    var alloc[512];
+    var hw[16];
+    assert_eq(sm75_regalloc(&m, &isel, 6, &alloc, 512, &hw), 0, "regalloc");
+    var ctl[48];
+    assert_eq(sm75_schedule(&isel, 6, &alloc, &ctl, 48), 0, "schedule");
+    assert_eq(load64(&ctl + 8) & 15, 1, "ISETP P0 -> ISETP P1: 1");
+    assert_eq(load64(&ctl + 16) & 15, 11, "ISETP P1 -> @!P0 BRA: 11 (12 after P0's ISETP)");
+    _gisel_emit(&isel, 3, SM75I_BRA, 0, 7, 0, 0, MIR_FLAG_A_IMM | (1 << 8) | (1 << 9) | (1 << 10));  # @!P1
+    assert_eq(sm75_schedule(&isel, 6, &alloc, &ctl, 48), 0, "schedule 2");
+    assert_eq(load64(&ctl + 16) & 15, 12, "guarded on P1 instead: 12 after P1's ISETP");
+    var sass[256];
+    assert_eq(sm75_emit(&isel, 6, &alloc, &sass, 256), 128, "emits");
+    assert_eq(sm75_get(&sass + 16, 81, 3), 0, "the first ISETP writes P0");
+    assert_eq(sm75_get(&sass + 32, 81, 3), 1, "the second writes P1");
+    assert_eq(sm75_get(&sass + 48, 12, 3), 1, "the BRA is guarded by P1");
+    assert_eq(sm75_get(&sass + 48, 15, 1), 1, "negated");
+    assert_eq(_ck_sched(&sass, 128), 0, "and the independent check agrees");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -862,6 +917,7 @@ fn main(): i64 {
     test_sm75_schedule_checked();
     test_sm75_schedule_numbers();
     test_sm75_schedule_stg_before_branch();
+    test_sm75_schedule_per_predicate();
     return assert_summary();
 }
 

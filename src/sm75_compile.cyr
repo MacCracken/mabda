@@ -74,8 +74,8 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
     if (op == SM75I_SHF) {
         return sm75_enc_shf(ins, d, a, b, bk, c, mods & 3, (mods >> 2) & 1, (mods >> 3) & 1);
     }
-    if (op == SM75I_ISETP) { return sm75_enc_isetp(ins, 0, a, b, bk, mods & 7, (mods >> 3) & 1); }
-    if (op == SM75I_SEL) { return sm75_enc_sel(ins, d, a, b, bk, 0, mods & 1); }
+    if (op == SM75I_ISETP) { return sm75_enc_isetp(ins, (mods >> 4) & 7, a, b, bk, mods & 7, (mods >> 3) & 1); }
+    if (op == SM75I_SEL) { return sm75_enc_sel(ins, d, a, b, bk, (mods >> 1) & 7, mods & 1); }
     if (op == SM75I_MOV) { return sm75_enc_mov(ins, d, b, bk); }
     if (op == SM75I_FADD) { return sm75_enc_fadd(ins, d, a, b, bk, mods & 1); }
     if (op == SM75I_FMUL) { return sm75_enc_fmul(ins, d, a, b, bk); }
@@ -286,6 +286,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
     var urc[512];       # 64 uniform registers: issue cycle of the ULDC that wrote them
     var sset[48];       # 6 scoreboards: the cycle each was last set
     var sseq[48];       # 6 scoreboards: allocation order
+    var pcyc[56];       # P0..P6: issue cycle of the ISETP that wrote each
     var srcs[24];
     memset(&wcls, 0, 2048);
     memset(&sbw, 0, 2048);
@@ -296,9 +297,10 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
     while (r < 256) { store64(&wcyc + r * 8, _S75_NEVER); r = r + 1; }
     r = 0;
     while (r < 64) { store64(&urc + r * 8, _S75_NEVER); r = r + 1; }
+    r = 0;
+    while (r < 7) { store64(&pcyc + r * 8, _S75_NEVER); r = r + 1; }
     var busy = 0;
     var seq = 1;
-    var p0c = _S75_NEVER;
     var tprev = 0 - 1;
     var iprev = 0 - 1;
     var minnext = 0;
@@ -322,9 +324,15 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
             wait = wait | load64(&sbw + s * 8);
             k = k + 1;
         }
-        if (op == SM75I_SEL) { if (t < p0c + SM75_LAT_SEL) { t = p0c + SM75_LAT_SEL; } }
+        if (op == SM75I_SEL) {
+            var ps = load64(&pcyc + ((fl >> 9) & 7) * 8) + SM75_LAT_SEL;
+            if (t < ps) { t = ps; }
+        }
         if (op == SM75I_BRA) {
-            if (((fl >> 8) & 1) == 1) { if (t < p0c + SM75_LAT_GUARD) { t = p0c + SM75_LAT_GUARD; } }
+            if (((fl >> 8) & 1) == 1) {
+                var pg = load64(&pcyc + ((fl >> 10) & 7) * 8) + SM75_LAT_GUARD;
+                if (t < pg) { t = pg; }
+            }
         }
         var ur = 0 - 1;
         if (op == SM75I_LDG) { ur = (fl >> 8) & 0x3F; }
@@ -406,7 +414,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
             }
             store64(&sbr + d * 8, 0);
         }
-        if (op == SM75I_ISETP) { p0c = t; }
+        if (op == SM75I_ISETP) { store64(&pcyc + ((fl >> 12) & 7) * 8, t); }
         if (op == SM75I_ULDC) {
             var u = sm75i_a(isel, i);
             if (u >= 0) {
@@ -482,7 +490,7 @@ fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
             # offset in 32-bit words from the NEXT instruction
             rc = sm75_enc_bra(ins, (toff - (pc + SM75_INS)) / 4);
             var bfl = sm75i_flags(isel, i) >> 8;
-            if ((bfl & 1) != 0) { sm75_set_guard(ins, 0, (bfl >> 1) & 1); }
+            if ((bfl & 1) != 0) { sm75_set_guard(ins, (bfl >> 2) & 7, (bfl >> 1) & 1); }
         } else {
             rc = _s75_encode(isel, i, alloc, ins);
         }
