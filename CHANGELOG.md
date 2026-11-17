@@ -32,8 +32,7 @@ so far, both in the native AMD SPIR-V compiler:
   lane.
 
 The remaining 4.4.0 items are open and tracked in the roadmap. "The same in N9's SM75 path" is
-done in N9.5, below. f64 is the exception: it is not selected for NVIDIA yet and stays a named
-N9 item.
+done in N9.5, below, and f64 (refused on NVIDIA at N9.5) landed with the fourth N9 follow-on.
 
 **N9 (SPIR-V → SASS for NVIDIA) is done.** The design note is
 [`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.6 cover the
@@ -45,9 +44,9 @@ NVIDIA context now compiles SPIR-V in-tree. On the TU116:
 - ranga's 11 kernels match an independent oracle;
 - ranga's four GPU suites pass with an NVIDIA context.
 
-The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. Three have
-landed (below): latency-table scheduling, predicate allocation and `BSSY` / `BSYNC`
-reconvergence. SM75 `OpFDiv` / f64 is open.
+The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. All four have
+landed (below): latency-table scheduling, predicate allocation, `BSSY` / `BSYNC` reconvergence,
+and `OpFDiv` / f64 on SM75.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -496,6 +495,96 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   Without reconvergence each half-warp ran the loop on its own; with it, the run matches
   `loop_lcg`, which has no divergence. Turing does not reconverge a split warp by itself.
 
+### Changed — SM75 `OpFDiv` and f64 (the fourth N9 follow-on)
+- **What it adds.** f64 on NVIDIA (F.a), then `OpFDiv` for f32 (F.b) and f64 (F.c). Every kernel
+  in the f64 corpus now compiles for SM75, and so do 26 of the 27 control-flow kernels
+  (`loop_phi_f64` loses its `nv-refuse`; `oob_label` is still refused, as on AMD).
+- **f64 (F.a).**
+  - f64 values live in even-aligned register pairs: `sm75_regalloc` claims a pair for every
+    F64-typed id, and hazard tracking counts both halves.
+  - The encoder gains DADD (b negated at bit 75), DMUL, DFMA (a negated at bit 72), DSETP,
+    F2F.F64.F32 / F2F.F32.F64, I2F.F64, F2I.F64.TRUNC, FRND.F64 and LDG.E.64 / STG.E.64. All 15
+    forms are pinned against ptxas bytes (`test_sm75_ptxas_golden_f64`).
+  - Selection covers the MIR f64 ops the AMD corpus uses:
+    - arithmetic and the FMA forms;
+    - IEEE minNum / maxNum (a NaN yields the other operand) and clamp;
+    - compares (DSETP), and the sqrt macro's class test (mask 0x260 only);
+    - ldexp (musl's scalbn, with a fast path when the exponent is provably small);
+    - conversions, selects, loads and stores.
+  - Scheduling follows NAK's RedirectedFP64. On SM75 an f64 op takes a scoreboard AND the
+    read-after-write delay: 9 to a reader, 8 to another f64 op. DSETP → SEL waits 9, and DSETP →
+    a guarded branch waits 15. The independent checker decodes the f64 forms and tracks each
+    predicate's DSETP wait.
+- **f32 `OpFDiv` (F.b).**
+  - The lowering is target-aware. `spirv_lower_set_target(SPIRV_TARGET_SM75)` makes `OpFDiv` one
+    portable `MIR_OP_FDIV` (71) instead of GFX9's `v_div_scale` / `v_div_fmas` / `v_div_fixup`
+    macro. `sm75_compile` sets the target around the lowering and restores GFX9 afterwards,
+    after a refusal too.
+  - Selection widens both operands and runs NVIDIA's f64 reciprocal fast path (a `MUFU.RCP64H`
+    seed and DFMA refinement), then narrows. The double rounding is innocuous because
+    53 ≥ 2·24 + 2. Zero, infinity and NaN operands are decided on the f32 bits.
+- **f64 `OpFDiv` (F.c).** Full range and branch-free:
+  - classify the operands and normalize both to [1, 2);
+  - run the fast path and form the exact residual with DFMA;
+  - rebuild the exponent, overflowing to infinity, with subnormal quotients rounded to
+    nearest-even and the residual's sign breaking ties.
+  Every IEEE special pair is in the oracle.
+- **The wide id space.** One f64 division expands to about 140 MIR ids, so a kernel with two of
+  them overflowed the 256-id space (`MIR_ERR_ID_OOR`).
+  - SM75 now uses `mir_mod_init_wide` (1024 ids, `MIR_MAX_CAP_IDS_WIDE`). Its stages are sized
+    from their own buffers.
+  - GFX9 keeps 256, because its register allocator and file maps are sized for 256.
+  - `sm75_compile_spirv`'s frame is split in two: `_sm75_compile_back` holds the selection
+    records and the register map. Each half stays under Cyrius's per-fn frame budget (about
+    120 KB; past it a local array silently becomes static storage, with a warning).
+  - The label tables stay keyed by SPIR-V `OpLabel` ids, which are below the id bound (≤ 256).
+  - `check-compiler-buffer-sizing.py` checks `mir_mod_init_wide` calls too, against the wider
+    ceiling.
+- **ranga's bilinear resize runs on NVIDIA.** `gk_resize_bilinear` was refused on both backends:
+  its 201 ids plus temporaries pass 256. It now compiles for SM75 and is the twelfth ranga kernel
+  (`tests/spirv/ranga/resize_bilinear.spv`: ranga de54123's bytes; the other eleven re-dumped
+  byte-identical), with a golden from the generator's interpreter. GFX9 still refuses it, by name
+  (`rk_gfx9_refuse`: `MIR_ERR_ID_OOR`), and the AMD gate and the CPU suite expect exactly that
+  code. Widening GFX9's id space is a new 4.4.0 roadmap item.
+- **The IEEE oracle.** `scripts/gen-f64-fixtures.py` writes `tests/tcyr/f64_cases.cyr`:
+  - 15 kernels: fma, arith, cvt, subabs, vec, sqrt, i32_cvt, const, ldexp, select, f32_div,
+    div, div_b, div2 (two chained divisions) and store_const;
+  - for each, four sets of eight lanes, special and seeded random inputs, and expected outputs
+    from Python's binary64 (an exact rational fma where Python < 3.13 lacks `math.fma`);
+  - inputs kept out of what SPIR-V leaves undefined. f32 subnormals are out of f32_div, because
+    Vulkan allows flushing them and GFX9 does.
+
+  `programs/f64_kernels_e2e.cyr amd|nvidia` (`make test-{native,nvidia}-f64-kernels-e2e`) runs
+  them through the public API and must match bit for bit; a NaN matches by class.
+  `make check-f64-fixtures` is now a CI step.
+- **Found on the way.**
+  - The schedule checker refused programs longer than 256 instructions, with its message hidden
+    by the print limit. It holds 1024 now, which is `SM75_EMIT_MAX_RECS`; div2 is 376.
+  - The stack-array gate flagged `_s75_sb_clear`. One loop wrote both scoreboard arrays, guarded
+    by `r < 256`, which the gate can't see. It is now two loops, one per array bound, with the
+    same behaviour.
+- **Tests.**
+  - `sm75_encode.tcyr` (121 assertions): the f64 goldens.
+  - `sm75_isel.tcyr` (138): `test_sm75_isel_fdiv` (one `MIR_OP_FDIV` under the SM75 target,
+    none under GFX9, the expansions' shape, div2 failing in 256 ids and selecting in 1024) and
+    `test_mir_mod_init_wide`.
+  - `sm75_compile.tcyr` (359): the f64 corpus and div2 under the schedule checker, bilinear's
+    GFX9 refusal code, and the target restored after a lowering refusal. The backend's
+    "refusals keep the selector's code" case moved to a binding past the 16-pointer bank.
+- **On the TU116** (`build/logs/chew-nv-gates-fdiv-20261116-162117.log`,
+  `chew-nv-ranga-bilinear-20261116-162635.log`, `nvidia-ranga-fdiv-20261116-162252.log`):
+  - all 16 masterless gates pass, including the new f64 gate;
+  - f64: 15 of 15 kernels, 512 lanes bit-exact, division included;
+  - control flow: 26 kernels exact, `oob_label` refused as expected;
+  - ranga: 12 of 12, bilinear included;
+  - ranga's suites: `gpu` 48, `gpu_pipeline` 102 and `gpu_spirv` 54 pass. `gpu_kernels` passes
+    52 of 53: the one failure is ranga's own "flip this when it can" assertion on bilinear, which
+    now compiles. That is a ranga-side change for the consumer check.
+- **On the Cezanne** (`build/logs/amd-gates-fdiv-20261116-162053.log`,
+  `amd-ranga-bilinear-20261116-162635.log`): f64 15 of 15 (512 lanes), control flow 27 of 27,
+  ranga 12 of 12 (bilinear refused as expected), and the f64 division, f32 division, layernorm,
+  compute-store and SAXPY gates.
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -557,12 +646,13 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7557 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7658 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
-  predicate allocation). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  predicate allocation; 7557 after BSSY / BSYNC). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
-  make-dry-run / cf-fixtures / ranga-fixtures gates, `fuzz`, `example-link` and `test-raw-include` pass.
+  make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
+  `test-raw-include` pass.
   `cyrius distlib` is idempotent.
 - AMD Cezanne, scratch-buffer contract: `make test-native-all` gave 72 passed, 0 failed,
   2 skipped (DRM master), the same as 4.3.1 (`build/logs/test-native-all-20261116-123553.log`).

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """gen-spirv-ranga-fixtures.py — build tests/tcyr/spirv_ranga_kernels.cyr from tests/spirv/ranga/.
 
-ranga (the AGNOS image-processing library) emits its eleven per-pixel compute kernels as SPIR-V
+ranga (the AGNOS image-processing library) emits its twelve per-pixel compute kernels as SPIR-V
 (`ranga/src/gpu_kernels.cyr` through `ranga/src/gpu_spirv.cyr`) and hands them to
-`gpu_shader_module_create_spirv`. They are N9's done-when corpus. Their exact bytes are vendored
+`gpu_shader_module_create_spirv`. The first eleven are N9's done-when corpus; resize_bilinear
+joined with the SM75 wide id space (4.4.0, the fourth N9 follow-on). GFX9 still refuses it by name
+(GFX9_REFUSE below: MIR_ERR_ID_OOR, the 256-id cap; tracked in the roadmap's 4.4.0 section). Their exact bytes are vendored
 in tests/spirv/ranga/<name>.spv, with tests/spirv/ranga/PROVENANCE naming the ranga commit they
 came from, so mabda's CPU suite and hardware gates run them without a ranga checkout.
 
@@ -75,8 +77,13 @@ KERNELS = [
     ("flip_horizontal", "gk_flip_horizontal", "geom", [W, H], (W, H)),
     ("flip_vertical", "gk_flip_vertical", "geom", [W, H], (W, H)),
     ("resize_nearest", "gk_resize_nearest", "geom", [W, H, 97, 53], (97, 53)),
+    # bilinear: params[5..6]: the host's reciprocals 1/max(dst_w-1,1), 1/max(dst_h-1,1) (ranga's layout)
+    ("resize_bilinear", "gk_resize_bilinear", "geom", [W, H, 97, 53, f32bits(1.0 / 96), f32bits(1.0 / 52)],
+     (97, 53)),
 ]
 SHAPE = {"1buf": 1, "2buf": 2, "geom": 3}
+# Kernels the GFX9 back end refuses, with the MIR code (the AMD gate and the CPU suite expect it).
+GFX9_REFUSE = {"resize_bilinear": 25}     # MIR_ERR_ID_OOR: past the 256-id cap
 
 
 # ---------------------------------------------------------------- ranga → .spv
@@ -351,7 +358,8 @@ def build():
     o.append("# Regenerate after refreshing the .spv files; `--check` (in `make check-ranga-fixtures`)")
     o.append("# catches drift.")
     o.append("#")
-    o.append("# ranga's eleven per-pixel compute kernels, byte for byte (N9's done-when corpus):")
+    o.append("# ranga's twelve per-pixel compute kernels, byte for byte (N9's done-when corpus and")
+    o.append("# resize_bilinear):")
     for line in prov:
         o.append(f"#   {line}")
     o.append("# rk_build(k, buf) writes kernel k's SPIR-V into buf (>= RK_MAX_BYTES) and returns its byte")
@@ -360,6 +368,7 @@ def build():
     o.append("# RK_SENT sentinel words of RK_SENT_V after every buffer's pixels, rk_params(k, p) (32 bytes,")
     o.append("# ranga's [count, a, b, c, d, e] block) and an rk_out_w(k) x rk_out_h(k) output.")
     o.append("# rk_golden(k) is the FNV-1a 64 of that output as the generator's SPIR-V interpreter computes it.")
+    o.append("# rk_gfx9_refuse(k): the MIR code GFX9 refuses kernel k with (0: it compiles).")
     o.append("")
     o.append(f"var RK_COUNT = {len(mods)};")
     o.append(f"var RK_MAX_BYTES = {maxb};")
@@ -405,6 +414,7 @@ def build():
     table("rk_shape", "k", [SHAPE[m[1]] for m in mods], "0")
     table("rk_out_w", "k", [m[3][0] for m in mods], "0")
     table("rk_out_h", "k", [m[3][1] for m in mods], "0")
+    table("rk_gfx9_refuse", "k", [GFX9_REFUSE.get(m[0], 0) for m in mods], "0")
     o.append("# ranga's params block for kernel k: [count, a, b, c, d, e] into p (32 bytes, zeroed).")
     o.append("fn rk_params(k, p): i64 {")
     o.append("    memset(p, 0, 32);")

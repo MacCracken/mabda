@@ -1,5 +1,7 @@
-# programs/ranga_kernels_e2e.cyr — N9.6: ranga's eleven compute kernels through the PUBLIC
-# gpu_* API, on either native backend, checked against one set of golden outputs.
+# programs/ranga_kernels_e2e.cyr — N9.6: ranga's compute kernels through the PUBLIC gpu_* API,
+# on either native backend, checked against one set of golden outputs. Twelve since the fourth
+# N9 follow-on: resize_bilinear runs on NVIDIA, and AMD must refuse it with rk_gfx9_refuse(k)
+# (MIR_ERR_ID_OOR, GFX9's 256-id cap: a tracked 4.4.0 item), which counts as a pass there.
 #
 # The kernels are ranga's SPIR-V byte for byte, and everything about the run comes from the
 # same generated fixture (tests/tcyr/spirv_ranga_kernels.cyr, from tests/spirv/ranga/ by
@@ -16,11 +18,12 @@
 # computes by RUNNING the same SPIR-V in its own interpreter with exact f32 rounding. That
 # interpreter shares nothing with mabda's compiler, so the gate checks the shared front end
 # (spirv_lower, MIR) as well as the GFX9 and SM75 back ends. First recorded 2026-11-16: the
-# interpreter, the Cezanne and the TU116 agree on all eleven (CHANGELOG [4.4.0] N9.6).
+# interpreter, the Cezanne and the TU116 agree on all eleven (CHANGELOG [4.4.0] N9.6), and the
+# TU116 on resize_bilinear (the FDiv / f64 follow-on).
 #
 # Usage: ranga_kernels_e2e amd|nvidia   (make test-native-ranga-kernels-e2e /
 #                                        make test-nvidia-ranga-kernels-e2e)
-# Exit: 0 = all eleven match; 2 = usage; 3 = context; 11 = any kernel wrong.
+# Exit: 0 = every kernel matches (or is refused as expected); 2 = usage; 3 = context; 11 = any wrong.
 
 include "src/lib.cyr"
 include "tests/tcyr/spirv_ranga_kernels.cyr"
@@ -85,12 +88,27 @@ fn _pair(dst, buf): i64 {
 
 # Run kernel k. Returns 1 when its output matches the golden, its sentinels are intact and
 # its source is unchanged; 0 otherwise. Prints the hash either way.
-fn run_one(ctx, k): i64 {
-    var spv[2688];      # >= RK_MAX_BYTES
+fn run_one(ctx, k, which): i64 {
+    var spv[4352];      # >= RK_MAX_BYTES
     var n = rk_build(k, &spv);
-    if (n > 2688) { out("FAIL — fixture larger than the buffer\n"); return 0; }
+    if (n > 4352) { out("FAIL — fixture larger than the buffer\n"); return 0; }
     _gpu_set_last_shader_err(0);
     var m = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (which == 1) {
+        if (rk_gfx9_refuse(k) != 0) {
+            if (m != 0) {
+                out("FAIL — GFX9 compiled it; flip rk_gfx9_refuse\n");
+                gpu_shader_module_release(ctx, m);
+                return 0;
+            }
+            if (gpu_last_shader_error() != 0 - rk_gfx9_refuse(k)) {
+                out("FAIL — refused, but: "); out(gpu_shader_error_name(gpu_last_shader_error())); out("\n");
+                return 0;
+            }
+            out("refused as expected — "); out(gpu_shader_error_name(gpu_last_shader_error())); out("\n");
+            return 1;
+        }
+    }
     if (m == 0) {
         out("FAIL — create_spirv: "); out(gpu_shader_error_name(gpu_last_shader_error())); out("\n");
         return 0;
@@ -170,7 +188,7 @@ fn main(): i64 {
         if (streq(argv(1), "nvidia") == 1) { which = 2; }
     }
     if (which == 0) { out("usage: ranga_kernels_e2e amd|nvidia\n"); return 2; }
-    out("mabda ranga kernels e2e (N9.6) — ranga's 11 SPIR-V kernels on seeded pixels, on ");
+    out("mabda ranga kernels e2e (N9.6) — ranga's SPIR-V kernels on seeded pixels, on ");
     if (which == 1) { out("native AMD (GFX9)\n"); } else { out("native NVIDIA (SM75)\n"); }
     out("--------------------------------------------------------------------------------------\n");
     var ctx = 0;
@@ -187,13 +205,13 @@ fn main(): i64 {
     var k = 0;
     while (k < RK_COUNT) {
         out("  "); out(rk_name(k)); out(": ");
-        pass = pass + run_one(ctx, k);
+        pass = pass + run_one(ctx, k, which);
         k = k + 1;
     }
     gpu_context_release(ctx);
     out("ranga kernels: "); outn(pass); out(" of "); outn(RK_COUNT); out(" match\n");
     if (pass != RK_COUNT) { return 11; }
-    out("OK — all eleven of ranga's kernels match the goldens\n");
+    out("OK — every one of ranga's kernels matches the goldens (or is refused as expected)\n");
     return 0;
 }
 

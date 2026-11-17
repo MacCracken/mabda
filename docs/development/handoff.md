@@ -17,20 +17,28 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   and **N9 is done** (N9.1–N9.6). The modules are `src/sm75_encode.cyr`, `sm75_isel.cyr`,
   `sm75_regalloc.cyr` and `sm75_compile.cyr`; `sm75_compile_spirv` is the CPU compile frame, and
   `backend_nvidia.cyr` wires it into `gpu_shader_module_create_spirv`. On the TU116:
-  - `test-nvidia-spirv-compute-e2e`: 22 of the 24 control-flow kernels match every lane;
-  - `test-nvidia-ranga-kernels-e2e`: ranga's 11 kernels match;
-  - ranga's four GPU suites pass with an NVIDIA context (in a scratch clone).
+  - `test-nvidia-spirv-compute-e2e`: 26 of the 27 control-flow kernels match every lane
+    (`oob_label` is refused by name);
+  - `test-nvidia-ranga-kernels-e2e`: ranga's 12 kernels match (bilinear since the f64 work;
+    AMD refuses bilinear by name, the GFX9 256-id item);
+  - `test-nvidia-f64-kernels-e2e`: the f64 corpus, 512 lanes bit-exact against the IEEE oracle;
+  - ranga's four GPU suites pass with an NVIDIA context (in a scratch clone), except
+    `gpu_kernels`' "flip this when it can" bilinear row, which is ranga's to flip.
 
   ranga's kernels are vendored in `tests/spirv/ranga/`. Their goldens come from the SPIR-V
   interpreter in `scripts/gen-spirv-ranga-fixtures.py` (`make check-ranga-fixtures`).
   `test-native-ranga-kernels-e2e` checks the same goldens on AMD. The open 4.4.0 items are:
-  - N9's follow-ons. Latency-table scheduling is done: `sm75_schedule` is checked by
-    `_ck_sched` in `tests/tcyr/sm75_compile.tcyr`, and `make bench-nvidia-compute` measures
-    it. Predicate allocation is done too (P0–P6, `_s75_palloc` in `sm75_isel.cyr`), and so is
-    `BSSY` / `BSYNC` reconvergence (`_s75_ropen` / `_s75_rclose`, checked by `_ck_barriers`).
-    Next is SM75 `OpFDiv` / f64. Each
-    needs a hardware check on chew, where `~/mabda-bench-v1` holds a git-archived "before"
-    tree for before/after benches (refresh it from the commit you compare against).
+  - N9's follow-ons are all done:
+    - latency-table scheduling: `sm75_schedule` is checked by `_ck_sched` in
+      `tests/tcyr/sm75_compile.tcyr`, and `make bench-nvidia-compute` measures it;
+    - predicate allocation (P0–P6, `_s75_palloc` in `sm75_isel.cyr`);
+    - `BSSY` / `BSYNC` reconvergence (`_s75_ropen` / `_s75_rclose`, checked by `_ck_barriers`);
+    - `OpFDiv` / f64 (`_s75_f64`, `_s75_fdiv32` / `_s75_fdiv64`; the lowering emits
+      `MIR_OP_FDIV` under `spirv_lower_set_target(SPIRV_TARGET_SM75)`).
+
+    `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
+    (refresh it from the commit you compare against).
+  - GFX9's 256-id cap: ranga's bilinear is refused on AMD (new, from the f64 work).
   - NVIDIA block-linear scanout.
   - The surface-acquire leak.
   - The seat-only closeout.
@@ -197,6 +205,11 @@ Consumers:
 - RADV contracts f64 `a*b + c` into an FMA (allowed without `NoContraction`), so expect 1 ULP. The
   native GFX9 compiler never fuses.
 - Cyrius reserves `mod` and `dyn` as identifiers.
+- A fn's local arrays share a frame budget of about 120 KB (15360 slots of 8 bytes). Past it, a
+  local array silently gets STATIC storage, with only a build warning (shared and not re-entrant).
+  Split a big frame across two fns, as `sm75_compile_spirv` / `_sm75_compile_back` do.
+- SM75 compiles in a 1024-id MIR space (`mir_mod_init_wide`); GFX9 must stay on `mir_mod_init`
+  (256) until its regalloc scratch and file maps are sized from their buffers.
 - Test fake function tables must be `WGPU_FN_COUNT x 8` bytes (664 at 83 slots).
 - A new `src/` module goes in **both** `src/lib.cyr` and `cyrius.cyml`'s `[lib].modules`, or distlib
   silently leaves it out.

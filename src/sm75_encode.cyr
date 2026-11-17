@@ -59,6 +59,20 @@ var SM75_OP_BRA    = 0x947;
 var SM75_OP_EXIT   = 0x94D;
 var SM75_OP_NOP    = 0x918;
 var SM75_OP_BCLEAR = 0x355;   # BMOV.32.CLEAR RZ, Bx (NAK OpBClear)
+var SM75_OP_DMUL   = 0x028;   # f64 (4.4.0, the fourth N9 follow-on)
+var SM75_OP_DADD   = 0x029;
+var SM75_OP_DSETP  = 0x02A;
+var SM75_OP_DFMA   = 0x02B;
+var SM75_OP_F2F    = 0x110;   # F2F with a 64-bit side (0x104 is the 16/32-bit form)
+var SM75_OP_F2I64  = 0x111;   # F2I from f64
+var SM75_OP_I2F64  = 0x112;   # I2F to f64
+var SM75_OP_FRND64 = 0x113;   # FRND.F64
+var SM75_MUFU_RCP64H = 6;
+var SM75_MUFU_RSQ64H = 7;
+# DSETP's float compare (bits 76-79): ordered LT..GE as ISETP's codes, plus these
+var SM75_FCMP_NUM = 7;
+var SM75_FCMP_NAN = 8;
+var SM75_FCMP_NEU = 13;
 var SM75_OP_BSSY   = 0x945;
 var SM75_OP_BSYNC  = 0x941;
 var SM75_NBAR      = 16;      # convergence barrier registers B0..B15
@@ -447,6 +461,100 @@ fn sm75_enc_bra(ins, rel): i64 {
     sm75_set(ins, 34, 48, rel & 0xFFFFFFFFFFFF);
     _sm75_psrc(ins, 87, 90, SM75_PT, 0);
     return 0;
+}
+
+# ================================================================
+# f64 (4.4.0, the fourth N9 follow-on). A register operand is the LOW register of an
+# even-aligned pair. Pinned against ptxas (CUDA 13.4, sm_75) on chew:
+# ~/mabda-n9-oracle/f64/g64.cu (tests/tcyr/sm75_encode.tcyr test_sm75_ptxas_golden_f64).
+# ================================================================
+# DADD d, a, [-]b — b rides in the src2 slot (64-71); negate b at bit 75.
+fn sm75_enc_dadd(ins, d, a, b, negb): i64 {
+    _sm75_begin(ins, SM75_OP_DADD | (1 << 9));
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 24, 8, a);
+    sm75_set(ins, 64, 8, b);
+    sm75_set(ins, 75, 1, negb);
+    return 0;
+}
+
+# DMUL d, a, b
+fn sm75_enc_dmul(ins, d, a, b): i64 {
+    _sm75_begin(ins, SM75_OP_DMUL | (1 << 9));
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 24, 8, a);
+    sm75_set(ins, 32, 8, b);
+    return 0;
+}
+
+# DFMA d, [-]a, b, c — negate a at bit 72.
+fn sm75_enc_dfma(ins, d, a, b, c, nega): i64 {
+    _sm75_begin(ins, SM75_OP_DFMA | (1 << 9));
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 24, 8, a);
+    sm75_set(ins, 32, 8, b);
+    sm75_set(ins, 64, 8, c);
+    sm75_set(ins, 72, 1, nega);
+    return 0;
+}
+
+# DSETP.<fcmp>.AND pd, PT, a, b, PT — `fcmp` is the float compare (SM75_CMP_* ordered codes,
+# SM75_FCMP_* for the rest).
+fn sm75_enc_dsetp(ins, pd, a, b, fcmp): i64 {
+    _sm75_begin(ins, SM75_OP_DSETP | (1 << 9));
+    sm75_set(ins, 24, 8, a);
+    sm75_set(ins, 32, 8, b);
+    sm75_set(ins, 74, 2, 0);          # .AND
+    sm75_set(ins, 76, 4, fcmp);
+    sm75_set(ins, 81, 3, pd);
+    sm75_set(ins, 84, 3, SM75_PT);
+    _sm75_psrc(ins, 87, 90, SM75_PT, 0);
+    return 0;
+}
+
+# The 64-bit conversions: register source in src1 (32-39); size fields log2(bytes):
+# dst at 75-76, src at 84-85; rounding at 78-79.
+fn _sm75_cvt64(ins, opcode, d, s, dsz, ssz, rnd): i64 {
+    _sm75_begin(ins, opcode | (1 << 9));
+    sm75_set(ins, 16, 8, d);
+    sm75_set(ins, 32, 8, s);
+    sm75_set(ins, 75, 2, dsz);
+    sm75_set(ins, 78, 2, rnd);
+    sm75_set(ins, 84, 2, ssz);
+    return 0;
+}
+
+# F2F.F64.F32 d, s (widen, exact) / F2F.F32.F64 d, s (narrow, round to nearest even).
+fn sm75_enc_f2f_widen(ins, d, s): i64 { return _sm75_cvt64(ins, SM75_OP_F2F, d, s, 3, 2, SM75_RND_RN); }
+fn sm75_enc_f2f_narrow(ins, d, s): i64 { return _sm75_cvt64(ins, SM75_OP_F2F, d, s, 2, 3, SM75_RND_RN); }
+
+# F2I.<S32|U32>.F64.<rnd> d, s
+fn sm75_enc_f2i64(ins, d, s, signed, rnd): i64 {
+    var r = _sm75_cvt64(ins, SM75_OP_F2I64, d, s, 2, 3, rnd);
+    sm75_set(ins, 72, 1, signed);
+    return r;
+}
+
+# I2F.F64.<S32|U32> d, s (exact)
+fn sm75_enc_i2f64(ins, d, s, signed): i64 {
+    var r = _sm75_cvt64(ins, SM75_OP_I2F64, d, s, 3, 2, SM75_RND_RN);
+    sm75_set(ins, 74, 1, signed);
+    return r;
+}
+
+# FRND.F64.<rnd> d, s
+fn sm75_enc_frnd64(ins, d, s, rnd): i64 { return _sm75_cvt64(ins, SM75_OP_FRND64, d, s, 3, 3, rnd); }
+
+# LDG.E.64 / STG.E.64: the 32-bit forms with the size field (73-75) at 5 (B64).
+fn sm75_enc_ldg64(ins, d, roff, ur, imm): i64 {
+    var r = sm75_enc_ldg32(ins, d, roff, ur, imm);
+    sm75_set(ins, 73, 3, 5);
+    return r;
+}
+fn sm75_enc_stg64(ins, roff, ur, data, imm): i64 {
+    var r = sm75_enc_stg32(ins, roff, ur, data, imm);
+    sm75_set(ins, 73, 3, 5);
+    return r;
 }
 
 # ================================================================

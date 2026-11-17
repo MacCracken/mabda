@@ -36,6 +36,16 @@ var SM75_DESC_SIZE  = 24;
 # 1 for a variable-latency ("decoupled") op: its result is tracked by a scoreboard.
 fn _s75_decoupled(op): i64 {
     if (op == SM75I_S2R) { return 1; }
+    if (op == SM75I_DADD) { return 1; }
+    if (op == SM75I_DMUL) { return 1; }
+    if (op == SM75I_DFMA) { return 1; }
+    if (op == SM75I_DSETP) { return 1; }
+    if (op == SM75I_F2F64) { return 1; }
+    if (op == SM75I_F2F32) { return 1; }
+    if (op == SM75I_I2F64) { return 1; }
+    if (op == SM75I_F2I64) { return 1; }
+    if (op == SM75I_FRND64) { return 1; }
+    if (op == SM75I_LDG64) { return 1; }
     if (op == SM75I_LDG) { return 1; }
     if (op == SM75I_MUFU) { return 1; }
     if (op == SM75I_I2F) { return 1; }
@@ -67,6 +77,24 @@ fn _s75_encode(isel, i, alloc, ins): i64 {
     var ck = _s75_k(fl, MIR_FLAG_C_IMM);
     var c = _s75_v(alloc, fl, MIR_FLAG_C_IMM, sm75i_c(isel, i));
     var mods = fl >> 8;
+    # a 32-bit op on the high half of an f64 pair (SM75I_HI_*)
+    if ((fl & SM75I_HI_D) != 0) { if (sm75i_dst(isel, i) > 0) { d = d + 1; } }
+    if ((fl & SM75I_HI_A) != 0) { if (sm75i_a(isel, i) > 0) { a = a + 1; } }
+    if ((fl & SM75I_HI_B) != 0) { if (bk == SM75_K_REG) { if (sm75i_b(isel, i) > 0) { b = b + 1; } } }
+    if ((fl & SM75I_HI_C) != 0) { if (ck == SM75_K_REG) { if (sm75i_c(isel, i) > 0) { c = c + 1; } } }
+    if (op == SM75I_DADD) { return sm75_enc_dadd(ins, d, a, b, mods & 1); }
+    if (op == SM75I_DMUL) { return sm75_enc_dmul(ins, d, a, b); }
+    if (op == SM75I_DFMA) { return sm75_enc_dfma(ins, d, a, b, c, mods & 1); }
+    if (op == SM75I_DSETP) { return sm75_enc_dsetp(ins, (mods >> 4) & 7, a, b, mods & 0xF); }
+    if (op == SM75I_F2F64) { return sm75_enc_f2f_widen(ins, d, b); }
+    if (op == SM75I_F2F32) { return sm75_enc_f2f_narrow(ins, d, b); }
+    if (op == SM75I_I2F64) { return sm75_enc_i2f64(ins, d, b, (mods >> 2) & 1); }
+    if (op == SM75I_F2I64) { return sm75_enc_f2i64(ins, d, b, (mods >> 2) & 1, mods & 3); }
+    if (op == SM75I_FRND64) { return sm75_enc_frnd64(ins, d, b, mods & 3); }
+    if (op == SM75I_LDG64) { return sm75_enc_ldg64(ins, d, a, mods & 0x3F, sm75i_b(isel, i)); }
+    if (op == SM75I_STG64) {
+        return sm75_enc_stg64(ins, a, mods & 0x3F, sm75_reg(alloc, sm75i_b(isel, i)), sm75i_c(isel, i));
+    }
     if (op == SM75I_IADD3) { return sm75_enc_iadd3(ins, d, a, b, bk, c, ck, mods & 1); }
     if (op == SM75I_IMAD) { return sm75_enc_imad(ins, SM75_OP_IMAD, d, a, b, bk, c, ck, mods & 1); }
     if (op == SM75I_IMAD_HI) { return sm75_enc_imad(ins, SM75_OP_IMADHI, d, a, b, bk, c, ck, 0); }
@@ -118,9 +146,13 @@ var _S75_C_DEC  = 3;   # Decoupled, scoreboarded: S2R LDG STG MUFU I2F F2I FRND
 var _S75_C_UNI  = 4;   # ULDC (the uniform datapath's Uldc)
 var _S75_C_CTL  = 5;   # BRA, EXIT, BSYNC
 var _S75_C_BAR  = 6;   # BMOV.32.CLEAR, BSSY: no register operands; barriers interlock in HW
+var _S75_C_F64  = 7;   # DADD DMUL DFMA DSETP: NAK's RedirectedFP64 — on SM75 BOTH a scoreboard
+# and the read-after-write delay (9 to a coupled or decoupled reader)
 
 var SM75_LAT_GUARD   = 12;   # ISETP -> a branch guarded by its predicate (GuardPredicate)
 var SM75_LAT_SEL     = 4;    # ISETP -> SEL reading the predicate (CoupledAlu)
+var SM75_LAT_SEL_F64   = 9;  # DSETP -> SEL (pred RAW from RedirectedFP64), with its scoreboard
+var SM75_LAT_GUARD_F64 = 15; # DSETP -> a guarded branch
 var SM75_LAT_UR      = 2;    # ULDC -> LDG / STG reading the UR (VectorDecoupled)
 var SM75_LAT_WAW_DEC = 6;    # a coupled write, then a decoupled write of the same register
 var SM75_LAT_DRAIN   = 6;    # the worst coupled GPR read-after-write: what a target may read
@@ -138,6 +170,11 @@ fn _s75_class(op): i64 {
     if (op == SM75I_BSSY) { return _S75_C_BAR; }
     if (op == SM75I_ULDC) { return _S75_C_UNI; }
     if (op == SM75I_STG) { return _S75_C_DEC; }
+    if (op == SM75I_STG64) { return _S75_C_DEC; }
+    if (op == SM75I_DADD) { return _S75_C_F64; }
+    if (op == SM75I_DMUL) { return _S75_C_F64; }
+    if (op == SM75I_DFMA) { return _S75_C_F64; }
+    if (op == SM75I_DSETP) { return _S75_C_F64; }
     if (_s75_decoupled(op) == 1) { return _S75_C_DEC; }
     if (op == SM75I_FADD) { return _S75_C_FMA; }
     if (op == SM75I_FMUL) { return _S75_C_FMA; }
@@ -150,6 +187,11 @@ fn _s75_class(op): i64 {
 # Read-after-write latency, coupled writer class `wc` -> reader class `rc` (NAK
 # RegLatencySM75::read_after_write). A decoupled reader takes 6 from any coupled writer.
 fn _s75_raw(wc, rc): i64 {
+    if (wc == _S75_C_F64) {
+        if (rc == _S75_C_F64) { return 8; }
+        return 9;
+    }
+    if (rc == _S75_C_F64) { return 6; }
     if (rc == _S75_C_DEC) { return 6; }
     if (rc == _S75_C_ALU) {
         if (wc == _S75_C_ALU) { return 4; }
@@ -169,7 +211,46 @@ fn _s75_src_add(out, k, r): i64 {
     return k + 1;
 }
 
-# The physical GPRs record i reads (at most 3, into `out`; RZ and immediates are not reads).
+# Add operand <id> `id` (a register, not an immediate) of width w — 1, or 2 for an f64 pair — on
+# the pair's high register when `hi`.
+fn _s75_opnd_add(alloc, out, k, id, w, hi): i64 {
+    if (id <= 0) { return k; }
+    var r = sm75_reg(alloc, id);
+    if (r < 0) { return k; }
+    if (r >= SM75_RZ) { return k; }
+    if (w == 2) {
+        var k2 = _s75_src_add(out, k, r);
+        return _s75_src_add(out, k2, r + 1);
+    }
+    return _s75_src_add(out, k, r + hi);
+}
+
+# The width of record op `op`'s operand slot s (0 = a, 1 = b, 2 = c, 3 = dst): 2 for an f64 pair.
+fn _s75_width(op, s): i64 {
+    if (op == SM75I_DADD) { if (s != 2) { return 2; } }
+    if (op == SM75I_DMUL) { if (s != 2) { return 2; } }
+    if (op == SM75I_DFMA) { return 2; }
+    if (op == SM75I_DSETP) { if (s < 2) { return 2; } }
+    if (op == SM75I_F2F64) { if (s == 3) { return 2; } }
+    if (op == SM75I_F2F32) { if (s == 1) { return 2; } }
+    if (op == SM75I_I2F64) { if (s == 3) { return 2; } }
+    if (op == SM75I_F2I64) { if (s == 1) { return 2; } }
+    if (op == SM75I_FRND64) {
+        if (s == 1) { return 2; }
+        if (s == 3) { return 2; }
+    }
+    if (op == SM75I_LDG64) { if (s == 3) { return 2; } }
+    if (op == SM75I_STG64) { if (s == 1) { return 2; } }
+    return 1;
+}
+
+fn _s75_hi(fl, bit): i64 {
+    if ((fl & bit) != 0) { return 1; }
+    return 0;
+}
+
+# The physical GPRs record i reads (at most 6, into `out`, 48 bytes; RZ and immediates are not
+# reads; an f64 pair is both of its registers).
 fn _s75_srcs(isel, i, alloc, out): i64 {
     var op = sm75i_op(isel, i);
     var fl = sm75i_flags(isel, i);
@@ -182,33 +263,50 @@ fn _s75_srcs(isel, i, alloc, out): i64 {
     if (op == SM75I_LOP3) { ua = 1; ub = 1; uc = 1; }
     if (op == SM75I_SHF) { ua = 1; ub = 1; uc = 1; }
     if (op == SM75I_FFMA) { ua = 1; ub = 1; uc = 1; }
+    if (op == SM75I_DFMA) { ua = 1; ub = 1; uc = 1; }
     if (op == SM75I_ISETP) { ua = 1; ub = 1; }
     if (op == SM75I_SEL) { ua = 1; ub = 1; }
     if (op == SM75I_FADD) { ua = 1; ub = 1; }
     if (op == SM75I_FMUL) { ua = 1; ub = 1; }
     if (op == SM75I_FMNMX) { ua = 1; ub = 1; }
+    if (op == SM75I_DADD) { ua = 1; ub = 1; }
+    if (op == SM75I_DMUL) { ua = 1; ub = 1; }
+    if (op == SM75I_DSETP) { ua = 1; ub = 1; }
     if (op == SM75I_MOV) { ub = 1; }
     if (op == SM75I_FRND) { ub = 1; }
     if (op == SM75I_F2I) { ub = 1; }
     if (op == SM75I_I2F) { ub = 1; }
     if (op == SM75I_MUFU) { ub = 1; }
+    if (op == SM75I_F2F64) { ub = 1; }
+    if (op == SM75I_F2F32) { ub = 1; }
+    if (op == SM75I_I2F64) { ub = 1; }
+    if (op == SM75I_F2I64) { ub = 1; }
+    if (op == SM75I_FRND64) { ub = 1; }
     if (op == SM75I_LDG) { ua = 1; }
+    if (op == SM75I_LDG64) { ua = 1; }
     if (op == SM75I_STG) { ua = 1; ub = 1; }
+    if (op == SM75I_STG64) { ua = 1; ub = 1; }
     var k = 0;
-    if (ua == 1) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_a(isel, i))); }
-    if (ub == 1) { if ((fl & MIR_FLAG_B_IMM) == 0) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_b(isel, i))); } }
-    if (uc == 1) { if ((fl & MIR_FLAG_C_IMM) == 0) { k = _s75_src_add(out, k, sm75_reg(alloc, sm75i_c(isel, i))); } }
+    if (ua == 1) { k = _s75_opnd_add(alloc, out, k, sm75i_a(isel, i), _s75_width(op, 0), _s75_hi(fl, SM75I_HI_A)); }
+    if (ub == 1) {
+        if ((fl & MIR_FLAG_B_IMM) == 0) {
+            k = _s75_opnd_add(alloc, out, k, sm75i_b(isel, i), _s75_width(op, 1), _s75_hi(fl, SM75I_HI_B));
+        }
+    }
+    if (uc == 1) {
+        if ((fl & MIR_FLAG_C_IMM) == 0) {
+            k = _s75_opnd_add(alloc, out, k, sm75i_c(isel, i), _s75_width(op, 2), _s75_hi(fl, SM75I_HI_C));
+        }
+    }
     return k;
 }
 
-# The physical GPR record i writes, or -1.
-fn _s75_dst(isel, i, alloc): i64 {
-    if (_s75_writes_gpr(sm75i_op(isel, i)) == 0) { return 0 - 1; }
-    if (sm75i_dst(isel, i) <= 0) { return 0 - 1; }
-    var r = sm75_reg(alloc, sm75i_dst(isel, i));
-    if (r < 0) { return 0 - 1; }
-    if (r >= SM75_RZ) { return 0 - 1; }
-    return r;
+# The physical GPRs record i writes — 0, 1, or 2 for an f64 pair — into `out` (16 bytes).
+fn _s75_dsts(isel, i, alloc, out): i64 {
+    var op = sm75i_op(isel, i);
+    if (_s75_writes_gpr(op) == 0) { return 0; }
+    var hd = _s75_hi(sm75i_flags(isel, i), SM75I_HI_D);
+    return _s75_opnd_add(alloc, out, 0, sm75i_dst(isel, i), _s75_width(op, 3), hd);
 }
 
 fn _s75_in(regs, n, r): i64 {
@@ -226,9 +324,10 @@ fn _s75_in(regs, n, r): i64 {
 # a STG has none, and without a read scoreboard the branch would have nothing to wait on
 # while the target overwrites the data register — so a STG before a branch takes one. After
 # EXIT nothing runs: no read scoreboard (ptxas does the same).
-fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
+fn _s75_need_rd(isel, n, alloc, i, srcs, ns, ds, nd): i64 {
     if (ns == 0) { return 0; }
-    var js[24];
+    var js[48];
+    var jd[16];
     var j = i + 1;
     while (j < n) {
         var opj = sm75i_op(isel, j);
@@ -236,18 +335,25 @@ fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
         if (opj == SM75I_BRA) { waits_all = 1; }
         if (opj == SM75I_BSYNC) { waits_all = 1; }
         if (waits_all == 1) {
-            if (d < 0) { return 1; }
+            if (nd == 0) { return 1; }
             return 0;
         }
         if (opj == SM75I_EXIT) { return 0; }
         if (opj != SM75I_LABEL) {
             var nj = _s75_srcs(isel, j, alloc, &js);
-            var dj = _s75_dst(isel, j, alloc);
-            if (d >= 0) {
-                if (dj == d) { return 0; }
-                if (_s75_in(&js, nj, d) == 1) { return 0; }
+            var ndj = _s75_dsts(isel, j, alloc, &jd);
+            var q = 0;
+            while (q < nd) {
+                var dq = load64(ds + q * 8);
+                if (_s75_in(&jd, ndj, dq) == 1) { return 0; }
+                if (_s75_in(&js, nj, dq) == 1) { return 0; }
+                q = q + 1;
             }
-            if (dj >= 0) { if (_s75_in(srcs, ns, dj) == 1) { return 1; } }
+            q = 0;
+            while (q < ndj) {
+                if (_s75_in(srcs, ns, load64(&jd + q * 8)) == 1) { return 1; }
+                q = q + 1;
+            }
         }
         j = j + 1;
     }
@@ -258,8 +364,12 @@ fn _s75_need_rd(isel, n, alloc, i, srcs, ns, d): i64 {
 fn _s75_sb_clear(sbw, sbr, k): i64 {
     var m = 0 - 1 - (1 << k);    # ~(1 << k)
     var r = 0;
-    while (r < 256) {
+    while (r < 263) {            # sbw: 256 GPRs, then P0..P6 (a DSETP's pending write)
         store64(sbw + r * 8, load64(sbw + r * 8) & m);
+        r = r + 1;
+    }
+    r = 0;
+    while (r < 256) {            # sbr: the 256 GPRs
         store64(sbr + r * 8, load64(sbr + r * 8) & m);
         r = r + 1;
     }
@@ -291,15 +401,19 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
     if (n > ctl_len / 8) { return 0 - SM75_ERR_SCHEDULE; }
     var wcyc[2048];     # 256 GPRs: issue cycle of the last coupled write (_S75_NEVER: none)
     var wcls[2048];     # its latency class
-    var sbw[2048];      # scoreboards to wait on before reading or writing (a pending result)
+    var sbw[2104];      # scoreboards to wait on before reading or writing (a pending result):
+    # 256 GPRs, then P0..P6 at 256 + k (a DSETP's)
     var sbr[2048];      # scoreboards to wait on before writing (a pending decoupled read)
     var urc[512];       # 64 uniform registers: issue cycle of the ULDC that wrote them
     var sset[48];       # 6 scoreboards: the cycle each was last set
     var sseq[48];       # 6 scoreboards: allocation order
-    var pcyc[56];       # P0..P6: issue cycle of the ISETP that wrote each
-    var srcs[24];
+    var pcyc[56];       # P0..P6: issue cycle of the ISETP / DSETP that wrote each
+    var pcls[56];       # its class
+    var srcs[48];
+    var dsts[16];
     memset(&wcls, 0, 2048);
-    memset(&sbw, 0, 2048);
+    memset(&sbw, 0, 2104);
+    memset(&pcls, 0, 56);
     memset(&sbr, 0, 2048);
     memset(&sset, 0, 48);
     memset(&sseq, 0, 48);
@@ -321,7 +435,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
         store64(ctl + i * 8, 0);
         if (cls == _S75_C_NONE) { i = i + 1; continue; }
         var ns = _s75_srcs(isel, i, alloc, &srcs);
-        var d = _s75_dst(isel, i, alloc);
+        var nd = _s75_dsts(isel, i, alloc, &dsts);
         var fl = sm75i_flags(isel, i);
         var t = tprev + 1;
         if (t < minnext) { t = minnext; }
@@ -335,25 +449,42 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
             k = k + 1;
         }
         if (op == SM75I_SEL) {
-            var ps = load64(&pcyc + ((fl >> 9) & 7) * 8) + SM75_LAT_SEL;
+            var sp = (fl >> 9) & 7;
+            var ps = load64(&pcyc + sp * 8) + SM75_LAT_SEL;
+            if (load64(&pcls + sp * 8) == _S75_C_F64) { ps = load64(&pcyc + sp * 8) + SM75_LAT_SEL_F64; }
             if (t < ps) { t = ps; }
+            wait = wait | load64(&sbw + (256 + sp) * 8);
         }
         if (op == SM75I_BRA) {
             if (((fl >> 8) & 1) == 1) {
-                var pg = load64(&pcyc + ((fl >> 10) & 7) * 8) + SM75_LAT_GUARD;
+                var gp = (fl >> 10) & 7;
+                var pg = load64(&pcyc + gp * 8) + SM75_LAT_GUARD;
+                if (load64(&pcls + gp * 8) == _S75_C_F64) { pg = load64(&pcyc + gp * 8) + SM75_LAT_GUARD_F64; }
                 if (t < pg) { t = pg; }
+                wait = wait | load64(&sbw + (256 + gp) * 8);
             }
         }
+        # a write of a predicate a DSETP still owes waits for it (WAW)
+        var pw = 0 - 1;
+        if (op == SM75I_ISETP) { pw = (fl >> 12) & 7; }
+        if (op == SM75I_DSETP) { pw = (fl >> 12) & 7; }
+        if (pw >= 0) { wait = wait | load64(&sbw + (256 + pw) * 8); }
         var ur = 0 - 1;
         if (op == SM75I_LDG) { ur = (fl >> 8) & 0x3F; }
         if (op == SM75I_STG) { ur = (fl >> 8) & 0x3F; }
         if (ur >= 0) { if (t < load64(&urc + ur * 8) + SM75_LAT_UR) { t = load64(&urc + ur * 8) + SM75_LAT_UR; } }
-        if (d >= 0) {
+        k = 0;
+        while (k < nd) {
+            var d = load64(&dsts + k * 8);
             wait = wait | load64(&sbw + d * 8) | load64(&sbr + d * 8);
-            if (cls == _S75_C_DEC) {
+            var dec_w = 0;
+            if (cls == _S75_C_DEC) { dec_w = 1; }
+            if (cls == _S75_C_F64) { dec_w = 1; }
+            if (dec_w == 1) {
                 var lw = load64(&wcyc + d * 8) + SM75_LAT_WAW_DEC;
                 if (t < lw) { t = lw; }
             }
+            k = k + 1;
         }
         if (cls == _S75_C_CTL) { wait = wait | busy; }
         wait = wait & busy;
@@ -369,8 +500,14 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
         }
         var kw = 7;
         var kr = 7;
-        if (cls == _S75_C_DEC) {
-            if (d >= 0) {
+        var sbd = 0;
+        if (cls == _S75_C_DEC) { sbd = 1; }
+        if (cls == _S75_C_F64) { sbd = 1; }
+        if (sbd == 1) {
+            var wants_w = 0;
+            if (nd > 0) { wants_w = 1; }
+            if (op == SM75I_DSETP) { wants_w = 1; }
+            if (wants_w == 1) {
                 kw = _s75_sb_pick(busy, &sseq);
                 if (((busy >> kw) & 1) == 1) {
                     wait = wait | (1 << kw);
@@ -382,7 +519,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
                 store64(&sseq + kw * 8, seq);    # now the newest: the read pick cannot evict it
                 seq = seq + 1;
             }
-            if (_s75_need_rd(isel, n, alloc, i, &srcs, ns, d) == 1) {
+            if (_s75_need_rd(isel, n, alloc, i, &srcs, ns, &dsts, nd) == 1) {
                 kr = _s75_sb_pick(busy, &sseq);
                 if (((busy >> kr) & 1) == 1) {
                     wait = wait | (1 << kr);
@@ -413,18 +550,36 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
                 k = k + 1;
             }
         }
-        if (d >= 0) {
+        k = 0;
+        while (k < nd) {
+            var dd = load64(&dsts + k * 8);
             if (cls == _S75_C_DEC) {
-                store64(&wcyc + d * 8, _S75_NEVER);
-                store64(&sbw + d * 8, 1 << kw);
+                store64(&wcyc + dd * 8, _S75_NEVER);
+                store64(&sbw + dd * 8, 1 << kw);
             } else {
-                store64(&wcyc + d * 8, t);
-                store64(&wcls + d * 8, cls);
-                store64(&sbw + d * 8, 0);
+                if (cls == _S75_C_F64) {
+                    store64(&wcyc + dd * 8, t);         # both: the delay and the scoreboard
+                    store64(&wcls + dd * 8, cls);
+                    store64(&sbw + dd * 8, 1 << kw);
+                } else {
+                    store64(&wcyc + dd * 8, t);
+                    store64(&wcls + dd * 8, cls);
+                    store64(&sbw + dd * 8, 0);
+                }
             }
-            store64(&sbr + d * 8, 0);
+            store64(&sbr + dd * 8, 0);
+            k = k + 1;
         }
-        if (op == SM75I_ISETP) { store64(&pcyc + ((fl >> 12) & 7) * 8, t); }
+        if (op == SM75I_ISETP) {
+            store64(&pcyc + ((fl >> 12) & 7) * 8, t);
+            store64(&pcls + ((fl >> 12) & 7) * 8, _S75_C_ALU);
+            store64(&sbw + (256 + ((fl >> 12) & 7)) * 8, 0);
+        }
+        if (op == SM75I_DSETP) {
+            store64(&pcyc + ((fl >> 12) & 7) * 8, t);
+            store64(&pcls + ((fl >> 12) & 7) * 8, _S75_C_F64);
+            store64(&sbw + (256 + ((fl >> 12) & 7)) * 8, 1 << kw);
+        }
         if (op == SM75I_ULDC) {
             var u = sm75i_a(isel, i);
             if (u >= 0) {
@@ -462,7 +617,7 @@ fn sm75_schedule(isel, n, alloc, ctl, ctl_len): i64 {
 var SM75_EMIT_MAX_RECS = 1024;
 fn sm75_emit(isel, n, alloc, sass, sass_len): i64 {
     # Pass 1: instruction count, and each label's byte offset (labels emit nothing).
-    var laboff[2048];   # 256 label <id>s (ids < cap_ids <= 256)
+    var laboff[2048];   # 256 label <id>s (SPIR-V OpLabel ids: under the id bound, <= 256)
     memset(&laboff, 0xFF, 2048);
     var nins = 0;
     var i = 0;
@@ -552,8 +707,10 @@ fn sm75_compile(ctx, spirv, n, sass, sass_len, desc): i64 {
     if (spirv_build_const_table(spirv, n, consts, load64(ctx + CC_CONSTS_LEN)) < 0) { return 0 - CMP_ERR_TABLE; }
     if (spirv_build_decoration_table(spirv, n, deco, load64(ctx + CC_DECO_LEN)) < 0) { return 0 - CMP_ERR_TABLE; }
     var m = load64(ctx + CC_M);
+    spirv_lower_set_target(SPIRV_TARGET_SM75);    # OpFDiv -> the portable MIR_OP_FDIV
     var lr = spirv_lower_module(spirv, n, types, consts, deco, m, load64(ctx + CC_OUTBI),
       load64(ctx + CC_OUTBI_LEN));
+    spirv_lower_set_target(SPIRV_TARGET_GFX9);
     if (lr < 0) { return lr; }
     var isel = load64(ctx + CC_ISEL);
     var k = sm75_isel(m, isel, load64(ctx + CC_ISEL_LEN));
@@ -587,23 +744,30 @@ fn sm75_compile_spirv(words, n, sass, sass_len, desc): i64 {
     var deco[4096];      # 256 * SPIRV_DECO_REC(16)
     var outbi[2048];     # 256 * 8
     var m[80];
-    var vals[10240];     # 256 * MIR_VAL_REC(40)
+    var vals[40960];     # 1024 * MIR_VAL_REC(40): MIR_MAX_CAP_IDS_WIDE, room for the expansions' temporaries
     var instrs[16384];   # 512 * MIR_INSTR_REC(32)
     var ptrs[4096];      # 128 * MIR_PTR_REC(32)
     var blocks[32];
-    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
+    var mr = mir_mod_init_wide(&m, &vals, 40960, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
     if (mr < 0) { return mr; }
-    var isel[24576];     # 512 * SM75I_REC(48)
-    var alloc[4096];     # 256 * RA_REC(16)
-    var hw[16];
     var cc[136];         # CC_SIZE
     gfx9_cc_buf(&cc, CC_TYPES, &types, 6144);
     gfx9_cc_buf(&cc, CC_CONSTS, &consts, 4096);
     gfx9_cc_buf(&cc, CC_DECO, &deco, 4096);
     gfx9_cc_buf(&cc, CC_OUTBI, &outbi, 2048);
-    gfx9_cc_buf(&cc, CC_ISEL, &isel, 24576);
-    gfx9_cc_buf(&cc, CC_ALLOC, &alloc, 4096);
     store64(&cc + CC_M, &m);
-    store64(&cc + CC_HW, &hw);
-    return sm75_compile(&cc, words, n, sass, sass_len, desc);
+    return _sm75_compile_back(&cc, words, n, sass, sass_len, desc);
+}
+
+# The back half of the compile frame: the selection records and the register map, in a frame of
+# their own (one fn's arrays must stay under Cyrius's per-fn frame budget, ~120 KB, to stay on the
+# stack rather than in shared static storage).
+fn _sm75_compile_back(cc, words, n, sass, sass_len, desc): i64 {
+    var isel[49152];     # 1024 * SM75I_REC(48) = SM75_EMIT_MAX_RECS
+    var alloc[16384];    # 1024 * RA_REC(16)
+    var hw[16];
+    gfx9_cc_buf(cc, CC_ISEL, &isel, 49152);
+    gfx9_cc_buf(cc, CC_ALLOC, &alloc, 16384);
+    store64(cc + CC_HW, &hw);
+    return sm75_compile(cc, words, n, sass, sass_len, desc);
 }

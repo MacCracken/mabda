@@ -379,6 +379,18 @@ unconditionally, NOT silent on no-drift
   preventive.
 - **Upstream**: speculative / hard to repro. No issue file yet.
 
+### D2b. A fn's local arrays past ~120 KB become STATIC storage (found 4.4.0, cyrius 6.7.18)
+
+- **Symptom**: `warning: array local over the per-fn frame budget gets STATIC storage` at the
+  array's declaration. The build still succeeds, but that array is now one shared copy: a
+  recursive or re-entrant call aliases it. CI fails on the warning.
+- **The rule** (cyrius `src/frontend/parse/decl/array.cyr`: `GFLC(S) + sa_need + 1 >= 15360`):
+  the frame holds 15360 slots of 8 bytes, roughly 120 KB, summed over the fn's locals.
+- **Workaround**: split the frame across two fns, the outer holding some arrays and passing
+  pointers to an inner that declares the rest. `sm75_compile_spirv` / `_sm75_compile_back` is the
+  example (the SM75 compile frame grew to about 143 KB with the 1024-id space).
+- **Upstream**: working as designed, and it warns. Nothing to file.
+
 ### D3. `lib/bench.cyr` minima read low or 0; the floor is calibrated once (6.6.4) — ✅ **RESOLVED upstream (6.6.5)**
 
 - **Resolved**: cyrius 6.6.5 rewrote the floor handling (CHANGELOG entry "`lib/bench.cyr` subtracted

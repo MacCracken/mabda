@@ -35,9 +35,11 @@ SPIR-V ─ validate ─ tables ─ spirv_lower ─ uniformity ─┬─ gfx9_ise
 The whole front end is reused as is: validation, the type/const/decoration tables, lowering to MIR
 and the uniformity sweep. Lowering's integer-division macro is already written in target-neutral
 MIR primitives (`VMOV`, `CVT_F32_U`, `RCP_IFLAG`, `MUL_HI`, `ICMP` + `CNDMASK`), so it maps onto SM75
-one primitive at a time (§3). The GFX9-specific macros (f32 / f64 `OpFDiv` via `DIV_SCALE` /
-`DIV_FMAS`, f64 sqrt) have no SM75 form and fail loud in `sm75_isel` until a target-aware lowering
-lands (§7). ranga does not need them.
+one primitive at a time (§3). The GFX9-specific `OpFDiv` macros (f32 / f64 via `DIV_SCALE` /
+`DIV_FMAS` / `DIV_FIXUP`) have no SM75 form. Since the fourth follow-on (§7) the lowering is
+target-aware: for `SPIRV_TARGET_SM75` it emits one portable `MIR_OP_FDIV`, which `sm75_isel`
+expands, and the GFX9 macros stay GFX9-only. The f64 sqrt macro is built from target-neutral
+primitives and selects one at a time.
 
 New modules, all `@internal`, all under the 4.4.0 scratch-buffer contract (every buffer passed
 with its byte length, capacities derived):
@@ -244,9 +246,19 @@ N9.6 found one bug: SM75 counted only the bindings a kernel reads, where GFX9 co
 bindings it declares. It now counts declared bindings too (CHANGELOG [4.4.0]).
 
 Named for after the done-when. Since N9 closed they are tracked in the roadmap's 4.4.0 section,
-"N9 follow-ons". Three are done: the latency-table scheduling (§5 v2), predicate allocation (§3,
-"Conditions") and `BSSY`/`BSYNC` reconvergence (§3). One is open: a target-aware lowering for
-`OpFDiv` (`MUFU.RCP` + Newton on SM75) and f64.
+"N9 follow-ons". All four are done: the latency-table scheduling (§5 v2), predicate allocation (§3,
+"Conditions"), `BSSY`/`BSYNC` reconvergence (§3), and `OpFDiv` / f64. The last one differs from
+the plan written here.
+- **The design.** "`MUFU.RCP` + Newton" became NVIDIA's f64 reciprocal path. That is a
+  `MUFU.RCP64H` seed with DFMA refinement, which ptxas emits for a correctly rounded division.
+  f32 widens, divides there and narrows. The double rounding is innocuous since 53 ≥ 2·24 + 2.
+- **f64.** Its own full-range, branch-free sequence, which normalizes the operands, forms the
+  exact residual and rounds subnormal quotients with the residual's sign breaking ties.
+- **The id space.** One f64 division is about 140 MIR ids, so SM75 compiles in a 1024-id space
+  (`mir_mod_init_wide`). That also lets ranga's bilinear resize compile for NVIDIA. GFX9 refuses
+  it at 256 ids, which is now a 4.4.0 roadmap item.
+- **The status line above** is N9's own. Since the follow-on, `loop_phi_f64` runs on the TU116
+  (26 of 27 control-flow kernels exact), and ranga's corpus is 12 of 12.
 
 ## 8. Risks
 

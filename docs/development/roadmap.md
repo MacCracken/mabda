@@ -132,9 +132,26 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     the end gets none, which leaves ranga's kernels unchanged. HW-verified on the TU116 with the
     15 gates, the 27-kernel lane checks, ranga's goldens and suites, and no hangs. A divergent
     if/else before a long loop runs 1.92× faster: 7144 → 3722 µs.
-  - A target-aware lowering for f32 `OpFDiv` (`MUFU.RCP` plus a Newton step) and for f64. Today
-    `sm75_isel` refuses both with `SM75_ERR_UNSUPPORTED_OP`, and so does the control-flow suite's
-    `loop_phi_f64`.
+  - ✅ **`OpFDiv` and f64 on SM75** (CHANGELOG [4.4.0]).
+    - f64 in register pairs, with 15 encodings pinned to ptxas, and scheduling per NAK's
+      RedirectedFP64 (a scoreboard and the delay).
+    - A target-aware lowering: `OpFDiv` is one `MIR_OP_FDIV` for SM75. f32 divides on NVIDIA's
+      f64 reciprocal fast path. f64 is full range and branch-free, subnormals and specials
+      included.
+    - A 1024-id MIR space for SM75 (`mir_mod_init_wide`).
+    - A cross-vendor IEEE oracle: `make test-{native,nvidia}-f64-kernels-e2e`, 15 kernels and
+      512 lanes, bit-exact on both GPUs.
+
+    `loop_phi_f64` runs on the TU116, and so does ranga's bilinear resize (the twelfth ranga
+    kernel). HW-verified: the 16 masterless gates, control flow 26 + 1 refusal, ranga 12 of 12.
+- **GFX9's 256-id cap** (found by the item above, 2026-11-16). ranga's `gk_resize_bilinear`
+  (201 SPIR-V ids plus the lowering's temporaries) is refused on AMD with `MIR_ERR_ID_OOR`, as
+  ranga's `gpu_pipeline.cyr` notes ("reason -25"). It runs on NVIDIA since SM75 got a 1024-id
+  space. GFX9 is held at `MIR_MAX_CAP_IDS = 256` by `gfx9_regalloc`'s `RA_MAX_REGS` scratch and
+  the per-id file maps in `gfx9_compile` / `gfx9_waitcnt`. **Done when** those are sized from
+  their buffers like SM75's, `gfx9_compile` uses `mir_mod_init_wide`, and bilinear matches its
+  golden on the Cezanne (flip `GFX9_REFUSE` in `scripts/gen-spirv-ranga-fixtures.py`; the AMD
+  gate fails loudly once GFX9 compiles it).
 - ✅ **The scratch-buffer contract** — landed (uncommitted; CHANGELOG [4.4.0]). Every compiler
   buffer now carries its byte length and each stage derives its capacity from it: `mir_mod_init`,
   the table builders, `_spirv_resolve_builtins` / `spirv_lower_module`, `gfx9_isel`,
@@ -161,9 +178,8 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   divergent loop (a `continue` there compiles, as an if/else merging at the latch), a return
   inside a divergent region, and nesting deeper than 8. **SM75 half: done in N9.5.** The same 24
   kernels run on the TU116. 22 match every lane, including the return inside a loop and the
-  9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `loop_phi_f64` is
-  refused because f64 is not selected for NVIDIA yet (the N9 follow-ons' f64 item above);
-  `oob_label` is refused as on AMD.
+  9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `oob_label` is
+  refused as on AMD. `loop_phi_f64`, refused at N9.5, runs since the N9 follow-ons' f64 item.
 - **NVIDIA block-linear scanout + ADDFB2 format modifiers.** The nouveau present slots
   (`_nv_surface_alloc_fb`) scan out a LINEAR VRAM BO with modifier 0 (ADR 007 Fork 4);
   block-linear needs ADDFB2 with `DRM_MODE_FB_MODIFIERS` and an NVIDIA block-linear
@@ -199,6 +215,12 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - `BACKEND_KIND_NVIDIA` added to `gpu_context_supports_compute` (ADR 005's allowlist);
   - `tests/gpu_nvidia.tcyr`'s refused rows flipped to the AMD suites' expected values;
   - a way to open an NVIDIA context in the four suites, which hard-code `gpu_context_new_amd`.
+
+  Found since the filing (the FDiv / f64 follow-on, 2026-11-16), not yet in that issue: on
+  NVIDIA, ranga's bilinear resize now compiles. So `tests/gpu_kernels.tcyr`'s pinned "cannot yet
+  lower it … flip this when it can" assertion fails there (52 of 53;
+  `build/logs/nvidia-ranga-fdiv-20261116-162252.log`), and `gpu_resize` could take
+  `SF_BILINEAR` on an NVIDIA context. AMD still refuses it (the GFX9 256-id item above).
 
   Also for ranga, low priority: its SPIR-V is version 1.3 but lists storage buffers in
   `OpEntryPoint`, a 1.4 rule. mabda accepts it; `spirv-val` and naga would not.

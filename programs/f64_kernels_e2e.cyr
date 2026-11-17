@@ -1,0 +1,175 @@
+# programs/f64_kernels_e2e.cyr — the f64 compiler corpus through the PUBLIC gpu_* API on either
+# native backend, against one IEEE-exact oracle (4.4.0, the fourth N9 follow-on: f64 on SM75).
+#
+# The kernels are the CPU suite's own builders (tests/tcyr/compiler_common.cyr: fma, arith, cvt,
+# subabs, vec, sqrt, i32_cvt, const, ldexp, select, f32_div, store_const). Inputs and expected outputs come
+# from tests/tcyr/f64_cases.cyr, which scripts/gen-f64-fixtures.py computes in Python binary64
+# (correctly rounded + - * / sqrt, fused fma): four sets of eight lanes per kernel, special values
+# (signed zeros, subnormals, the largest finite, infinities, NaN) and seeded random ones. Every
+# lane must match bit for bit; an expected NaN matches any NaN (payloads differ by vendor).
+#
+# Bindings: the kernel's inputs in order, then its output. One workgroup (LocalSize 8) per set.
+#
+# Usage: f64_kernels_e2e amd|nvidia   (make test-native-f64-kernels-e2e / test-nvidia-f64-kernels-e2e)
+# Exit: 0 = every lane of every kernel matches; 2 = usage; 3 = context; 5 = buffers; 11 = any wrong.
+
+include "tests/tcyr/compiler_common.cyr"
+include "tests/tcyr/f64_cases.cyr"
+
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn outn(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    syscall(1, 1, &buf, fmt_int_buf(n, &buf));
+    return 0;
+}
+
+fn _pair(dst, buf): i64 {
+    store64(dst, load64(buf + NATIVE_BUF_FIELD_HANDLE));
+    store64(dst + 8, load64(buf + NATIVE_BUF_FIELD_VA));
+    return 0;
+}
+
+fn _is_nan(v): i64 {
+    if (((v >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((v & 0xFFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+fn _is_nan32(v): i64 {
+    if (((v >> 23) & 0xFF) != 0xFF) { return 0; }
+    if ((v & 0x7FFFFF) == 0) { return 0; }
+    return 1;
+}
+
+# Kernel k over all its sets; returns the number of lanes wrong (or -1: no module).
+fn run_kernel(ctx, k, bufs, maps): i64 {
+    var spv[4096];
+    var n = f64k_build(k, &spv);
+    _gpu_set_last_shader_err(0);
+    var m = gpu_shader_module_create_spirv(ctx, &spv, n);
+    if (m == 0) {
+        out("FAIL — create_spirv: "); out(gpu_shader_error_name(gpu_last_shader_error())); out("\n");
+        return 0 - 1;
+    }
+    var nin = f64k_nin(k);
+    var w = f64k_width(k);
+    var es = f64k_esize(k);
+    var lanes = F64K_LANES * w;
+    var want[256];
+    var bp[72];
+    store64(&bp, nin + 1);
+    var b = 0;
+    while (b <= nin) { _pair(&bp + 8 + b * 16, load64(bufs + b * 8)); b = b + 1; }
+    var bad = 0;
+    var s = 0;
+    while (s < F64K_SETS) {
+        var om = load64(maps + nin * 8);
+        var i = 0;
+        while (i < lanes) { store64(om + i * 8, 0xBAADF00DBAADF00D); i = i + 1; }
+        if (es == 4) { i = 0; while (i < lanes) { store32(om + i * 4, 0xBAADF00D); i = i + 1; } }
+        f64k_fill(k, s, load64(maps + 0), load64(maps + 8), load64(maps + 16), &want);
+        var rc = gpu_compute_dispatch(ctx, m, 1, 1, 1, &bp);
+        if (rc != 0) { out("dispatch rc="); outn(rc); out(" "); bad = bad + lanes; }
+        if (rc == 0) {
+            i = 0;
+            while (i < lanes) {
+                var g = 0;
+                var e = load64(&want + i * 8);
+                var ok = 0;
+                if (es == 8) {
+                    g = load64(om + i * 8);
+                    if (g == e) { ok = 1; }
+                    if (_is_nan(e) == 1) { ok = _is_nan(g); }
+                } else {
+                    g = load32(om + i * 4);
+                    e = e & 0xFFFFFFFF;
+                    if (g == e) { ok = 1; }
+                    if (_is_nan32(e) == 1) { ok = _is_nan32(g); }
+                }
+                if (ok == 0) {
+                    if (bad < 4) {
+                        out("\n      set "); outn(s); out(" lane "); outn(i / w);
+                        if (w == 2) { out("."); outn(i % w); }
+                        out(": in ");
+                        var q = 0;
+                        while (q < nin) {
+                            if (es == 8) { fmt_hex0x(load64(load64(maps + q * 8) + i * 8)); }
+                            if (es == 4) { fmt_hex0x(load32(load64(maps + q * 8) + i * 4)); }
+                            out(" ");
+                            q = q + 1;
+                        }
+                        out("got "); fmt_hex0x(g); out(" want "); fmt_hex0x(e);
+                    }
+                    bad = bad + 1;
+                }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    gpu_shader_module_release(ctx, m);
+    return bad;
+}
+
+fn main(): i64 {
+    alloc_init();
+    args_init();
+    var which = 0;
+    if (argc() >= 2) {
+        if (streq(argv(1), "amd") == 1) { which = 1; }
+        if (streq(argv(1), "nvidia") == 1) { which = 2; }
+    }
+    if (which == 0) { out("usage: f64_kernels_e2e amd|nvidia\n"); return 2; }
+    out("mabda f64 kernels e2e (4.4.0) — the f64 corpus vs the IEEE oracle, on ");
+    if (which == 1) { out("native AMD (GFX9)\n"); } else { out("native NVIDIA (SM75)\n"); }
+    out("--------------------------------------------------------------------------\n");
+    var ctx = 0;
+    if (which == 1) {
+        var at, av = gpu_context_new_native();
+        if (is_err_result(at) == 1) { out("FAIL: no native AMD context\n"); return 3; }
+        ctx = av;
+    } else {
+        var nt, nv = gpu_context_new_native_nvidia();
+        if (is_err_result(nt) == 1) { out("FAIL: no native NVIDIA context\n"); return 3; }
+        ctx = nv;
+    }
+    var bufs[32];
+    var maps[32];
+    var b = 0;
+    while (b < 4) {
+        var bo = gpu_buffer_create(ctx, 4096, 0x008C);
+        if (bo == 0) { return 5; }
+        var mp = gpu_buffer_map(ctx, bo);
+        if (mp == 0) { return 5; }
+        store64(&bufs + b * 8, bo);
+        store64(&maps + b * 8, mp);
+        b = b + 1;
+    }
+    var pass = 0;
+    var total = 0;
+    var k = 0;
+    while (k < F64K_COUNT) {
+        out("  "); out(f64k_name(k)); out(": ");
+        var bad = run_kernel(ctx, k, &bufs, &maps);
+        var lanes = F64K_SETS * F64K_LANES * f64k_width(k);
+        total = total + lanes;
+        if (bad == 0) {
+            outn(lanes); out("/"); outn(lanes); out(" lanes\n");
+            pass = pass + 1;
+        } else {
+            if (bad > 0) { out("\n    "); outn(bad); out(" lanes wrong\n"); }
+        }
+        k = k + 1;
+    }
+    b = 0;
+    while (b < 4) { gpu_buffer_release(ctx, load64(&bufs + b * 8)); b = b + 1; }
+    gpu_context_release(ctx);
+    out("f64 kernels: "); outn(pass); out(" of "); outn(F64K_COUNT); out(" exact ("); outn(total); out(" lanes)\n");
+    if (pass != F64K_COUNT) { return 11; }
+    out("OK — every f64 kernel matches the IEEE oracle\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

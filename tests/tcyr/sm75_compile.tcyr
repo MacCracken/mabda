@@ -127,6 +127,22 @@ fn test_sm75_compile_kernels_and_limits() {
     return 0;
 }
 
+# Every OpDecorate <id> Binding <k> in the module set to Binding v (byte_len n).
+fn _spv_set_bindings(spv, n, v): i64 {
+    var w = 5;
+    var hit = 0;
+    while (w < n / 4) {
+        var hd = load32(spv + w * 4);
+        if (hd == 0x00040047) {
+            if (load32(spv + w * 4 + 8) == 33) { store32(spv + w * 4 + 12, v); hit = hit + 1; }
+        }
+        var wc = (hd >> 16) & 0xFFFF;
+        if (wc == 0) { return hit; }
+        w = w + wc;
+    }
+    return hit;
+}
+
 # N9.4: SPIR-V through the NVIDIA backend's module create. The context is fake (fd -1, so the
 # program-BO ioctl fails with EBADF), which proves the compile ran to completion: the failure is
 # at staging, after it. Refusals keep the compile stage's own code.
@@ -139,9 +155,16 @@ fn test_nv_spirv_module_create_path() {
     _gpu_set_last_shader_err(0);
     assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "no module on a fake context");
     assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_BO_CREATE, "compiled; staging the program BO failed");
+    n = _spv_build_f64_div(&spv);
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "f64 division: no module");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_BO_CREATE, "compiled (4.4.0 F.c); staging failed");
+    n = _spv_build_saxpy_lid(&spv);
+    assert_eq(_spv_set_bindings(&spv, n, 16) > 0, 1, "bindings moved to 16");
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "binding 16 refused");
+    assert_eq(gpu_last_shader_error(), 0 - SM75_ERR_TOO_MANY_BINDINGS, "with the selector's own code");
     n = _spv_build_f64_fma(&spv);
-    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "f64 refused");
-    assert_eq(gpu_last_shader_error(), 0 - SM75_ERR_UNSUPPORTED_OP, "with the selector's own code");
+    assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "f64 fma: no module");
+    assert_eq(gpu_last_shader_error(), 0 - SHMOD_ERR_BO_CREATE, "compiled (4.4.0 f64); staging failed");
     n = _spv_build_saxpy_lid(&spv);
     store32(&spv + 76, 2048);   # OpExecutionMode LocalSize 2048 1 1
     assert_eq(_backend_nvidia_shader_module_create(&ctx, &spv, n, SHADER_SRC_SPIRV), 0, "LocalSize 2048 refused");
@@ -349,23 +372,30 @@ fn test_sm75_binding_count_declared() {
     return 0;
 }
 
-# N9.6, the done-when corpus: ranga's eleven kernels (tests/spirv/ranga/, ranga's bytes) compile
-# for SM75 and for GFX9, with the same binding count and LocalSize 256. The hardware gates
+# N9.6, the done-when corpus: ranga's kernels (tests/spirv/ranga/, ranga's bytes) compile for
+# SM75 and for GFX9, with the same binding count and LocalSize 256. The hardware gates
 # (test-{native,nvidia}-ranga-kernels-e2e) check their output against the generator's oracle.
+# resize_bilinear (the twelfth) compiles for SM75 in its wide id space; GFX9 refuses it by name
+# (rk_gfx9_refuse: MIR_ERR_ID_OOR, the 256-id cap, a tracked 4.4.0 item).
 fn test_sm75_ranga_kernels_compile() {
-    var spv[2688];
+    var spv[4352];
     var sass[16384];
     var desc[24];
     var isa[16384];
     var gd[48];
     var lsz[24];
-    assert_eq(RK_MAX_BYTES <= 2688, 1, "the fixture fits spv[]");
+    assert_eq(RK_MAX_BYTES <= 4352, 1, "the fixture fits spv[]");
     var k = 0;
     while (k < RK_COUNT) {
         var n = rk_build(k, &spv);
         assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), 0, rk_name(k));
-        assert_eq(_native_compile_spirv_isa(&spv, n, &isa, 16384, &gd), 0, "and for GFX9");
-        assert_eq(load64(&desc + SM75_DESC_NBIND), load64(&gd + DESC_NUM_BINDINGS), "same binding count");
+        var gr = _native_compile_spirv_isa(&spv, n, &isa, 16384, &gd);
+        if (rk_gfx9_refuse(k) == 0) {
+            assert_eq(gr, 0, "and for GFX9");
+            assert_eq(load64(&desc + SM75_DESC_NBIND), load64(&gd + DESC_NUM_BINDINGS), "same binding count");
+        } else {
+            assert_eq(gr, 0 - rk_gfx9_refuse(k), "GFX9 refuses it by name");
+        }
         var want = 3;
         if (rk_shape(k) != RK_SHAPE_1BUF) { want = 4; }
         assert_eq(load64(&desc + SM75_DESC_NBIND), want, "ranga's binding array length");
@@ -461,6 +491,14 @@ fn _ck_cls(op12): i64 {
     if (op12 == SM75_OP_BSSY) { return 0; }
     if (op12 == SM75_OP_BSYNC) { return 0; }
     var base = op12 & 0x1FF;
+    if (base == SM75_OP_DMUL) { return 3; }   # f64: scoreboarded (NAK RedirectedFP64)
+    if (base == SM75_OP_DADD) { return 3; }
+    if (base == SM75_OP_DSETP) { return 3; }
+    if (base == SM75_OP_DFMA) { return 3; }
+    if (base == SM75_OP_F2F) { return 3; }
+    if (base == SM75_OP_F2I64) { return 3; }
+    if (base == SM75_OP_I2F64) { return 3; }
+    if (base == SM75_OP_FRND64) { return 3; }
     if (base == SM75_OP_MUFU) { return 3; }
     if (base == SM75_OP_I2F) { return 3; }
     if (base == SM75_OP_F2I) { return 3; }
@@ -495,11 +533,76 @@ fn _ck_add(out, k, r): i64 {
     return k + 1;
 }
 
-# The GPRs instruction `ins` reads, decoded from its fields (at most 3).
+# An operand field of width w registers (2: an f64 pair).
+fn _ck_addw(out, k, r, w): i64 {
+    if (r == SM75_RZ) { return k; }
+    var k2 = _ck_add(out, k, r);
+    if (w == 2) { k2 = _ck_add(out, k2, r + 1); }
+    return k2;
+}
+
+# The f64 forms (decoded by field): their sources into out, or -1 when op12 is not one.
+fn _ck_srcs64(ins, op12, out): i64 {
+    var base = op12 & 0x1FF;
+    if (base == SM75_OP_DADD) {
+        return _ck_addw(out, _ck_addw(out, 0, sm75_get(ins, 24, 8), 2), sm75_get(ins, 64, 8), 2);
+    }
+    if (base == SM75_OP_DMUL) {
+        return _ck_addw(out, _ck_addw(out, 0, sm75_get(ins, 24, 8), 2), sm75_get(ins, 32, 8), 2);
+    }
+    if (base == SM75_OP_DSETP) {
+        return _ck_addw(out, _ck_addw(out, 0, sm75_get(ins, 24, 8), 2), sm75_get(ins, 32, 8), 2);
+    }
+    if (base == SM75_OP_DFMA) {
+        var k = _ck_addw(out, _ck_addw(out, 0, sm75_get(ins, 24, 8), 2), sm75_get(ins, 32, 8), 2);
+        return _ck_addw(out, k, sm75_get(ins, 64, 8), 2);
+    }
+    var cv = 0;
+    if (base == SM75_OP_F2F) { cv = 1; }
+    if (base == SM75_OP_F2I64) { cv = 1; }
+    if (base == SM75_OP_I2F64) { cv = 1; }
+    if (base == SM75_OP_FRND64) { cv = 1; }
+    if (cv == 1) {
+        var sw = 1;
+        if (sm75_get(ins, 84, 2) == 3) { sw = 2; }     # the source size field
+        return _ck_addw(out, 0, sm75_get(ins, 32, 8), sw);
+    }
+    return 0 - 1;
+}
+
+# The registers an instruction writes (0..2) into out (16 bytes).
+fn _ck_dsts(ins, out): i64 {
+    var op12 = sm75_get(ins, 0, 12);
+    var c = _ck_cls(op12);
+    if (c == 0) { return 0; }
+    if (op12 == SM75_OP_STG) { return 0; }
+    var base = op12 & 0x1FF;
+    if (base == SM75_OP_ISETP) { return 0; }
+    if (base == SM75_OP_DSETP) { return 0; }
+    var d = sm75_get(ins, 16, 8);
+    if (d == SM75_RZ) { return 0; }
+    var w = 1;
+    if (base == SM75_OP_DADD) { w = 2; }
+    if (base == SM75_OP_DMUL) { w = 2; }
+    if (base == SM75_OP_DFMA) { w = 2; }
+    if (base == SM75_OP_F2F) { if (sm75_get(ins, 75, 2) == 3) { w = 2; } }
+    if (base == SM75_OP_I2F64) { w = 2; }
+    if (base == SM75_OP_FRND64) { w = 2; }
+    if (op12 == SM75_OP_LDG) { if (sm75_get(ins, 73, 3) == 5) { w = 2; } }
+    return _ck_addw(out, 0, d, w);
+}
+
+# The GPRs instruction `ins` reads, decoded from its fields (at most 6: f64 pairs).
 fn _ck_srcs(ins, out): i64 {
     var op12 = sm75_get(ins, 0, 12);
     if (op12 == SM75_OP_LDG) { return _ck_add(out, 0, sm75_get(ins, 24, 8)); }
-    if (op12 == SM75_OP_STG) { return _ck_add(out, _ck_add(out, 0, sm75_get(ins, 24, 8)), sm75_get(ins, 32, 8)); }
+    if (op12 == SM75_OP_STG) {
+        var dw = 1;
+        if (sm75_get(ins, 73, 3) == 5) { dw = 2; }
+        return _ck_addw(out, _ck_add(out, 0, sm75_get(ins, 24, 8)), sm75_get(ins, 32, 8), dw);
+    }
+    var f64s = _ck_srcs64(ins, op12, out);
+    if (f64s >= 0) { return f64s; }
     if (_ck_cls(op12) == 0) { return 0; }
     if (op12 == SM75_OP_S2R) { return 0; }
     var base = op12 & 0x1FF;
@@ -520,16 +623,14 @@ fn _ck_srcs(ins, out): i64 {
     return k;
 }
 
-# The GPR instruction `ins` writes, or -1.
-fn _ck_dst(ins): i64 {
-    var op12 = sm75_get(ins, 0, 12);
-    var c = _ck_cls(op12);
-    if (c == 0) { return 0 - 1; }
-    if (op12 == SM75_OP_STG) { return 0 - 1; }
-    if ((op12 & 0x1FF) == SM75_OP_ISETP) { return 0 - 1; }
-    var d = sm75_get(ins, 16, 8);
-    if (d == SM75_RZ) { return 0 - 1; }
-    return d;
+# 1 when register r is among the n u32 entries at arr.
+fn _ck_in32(arr, n, r): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load32(arr + i * 4) == r) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn _ck_sched(sass, len): i64 {
@@ -537,20 +638,24 @@ fn _ck_sched(sass, len): i64 {
     var lwt[2048];      #   its issue cycle
     var lwc[2048];      #   its class
     var lwo[2048];      #   its instruction (decoupled)
-    var ow[2048];       # per instruction (<= 256): write SB
-    var orr[2048];      #   read SB
-    var ot[2048];       #   issue cycle
-    var odw[2048];      #   result waited
-    var odr[2048];      #   reads waited
-    var odc[2048];      #   decoupled?
-    var od[2048];       #   its result register (-1)
-    var osr[6144];      #   its sources (3 each)
-    var ons[2048];      #   source count
+    var ow[8192];       # per instruction (<= 1024, SM75_EMIT_MAX_RECS): write SB
+    var orr[8192];      #   read SB
+    var ot[8192];       #   issue cycle
+    var odw[8192];      #   result waited
+    var odr[8192];      #   reads waited
+    var odc[8192];      #   decoupled?
+    var od[8192];       #   its result register count
+    var osr[24576];     #   its sources (6 each, u32: the frame stays under Cyrius's per-fn budget)
+    var ons[8192];      #   source count
     var urt[512];
-    var prt[64];        # P0..P6 (and PT): issue cycle of the ISETP that wrote each
-    var srcs[24];
+    var prt[64];        # P0..P6 (and PT): issue cycle of the ISETP / DSETP that wrote each
+    var prk[64];        #   0 none / 1 ISETP (coupled) / 2 DSETP (scoreboarded)
+    var pro[64];        #   the DSETP's instruction
+    var srcs[48];
+    var dsts[16];
+    memset(&prk, 0, 64);
     memset(&lwk, 0, 2048);
-    memset(&odc, 0, 2048);
+    memset(&odc, 0, 8192);
     var r = 0;
     while (r < 64) { store64(&urt + r * 8, 0 - 1000); r = r + 1; }
     r = 0;
@@ -558,7 +663,7 @@ fn _ck_sched(sass, len): i64 {
     var t = 0;
     var bad = 0;
     var nins = len / 16;
-    if (nins > 256) { return _ck_bad(0, "program longer than the checker's 256"); }
+    if (nins > 1024) { return _ck_bad(0, "program longer than the checker's 1024"); }
     var j = 0;
     while (j < nins) {
         var ins = sass + j * 16;
@@ -595,7 +700,7 @@ fn _ck_sched(sass, len): i64 {
         }
         var cls = _ck_cls(op12);
         var ns = _ck_srcs(ins, &srcs);
-        var d = _ck_dst(ins);
+        var nd = _ck_dsts(ins, &dsts);
         # 2. sources
         k = 0;
         while (k < ns) {
@@ -612,21 +717,46 @@ fn _ck_sched(sass, len): i64 {
         }
         # 3. the predicate, 4. the uniform registers
         if ((op12 & 0x1FF) == SM75_OP_SEL) {
-            var sp = load64(&prt + sm75_get(ins, 87, 3) * 8);
-            bad = bad + _ck_need(t - sp >= 4, j, "SEL < 4 after its ISETP");
+            var spk = sm75_get(ins, 87, 3);
+            var sp = load64(&prt + spk * 8);
+            if (load64(&prk + spk * 8) == 2) {
+                bad = bad + _ck_need(t - sp >= 9, j, "SEL < 9 after its DSETP");
+                bad = bad + _ck_need(load64(&odw + load64(&pro + spk * 8) * 8) == 1, j, "SEL on a DSETP unwaited");
+            } else {
+                bad = bad + _ck_need(t - sp >= 4, j, "SEL < 4 after its ISETP");
+            }
         }
         if (op12 == SM75_OP_BRA) {
             if (sm75_get(ins, 12, 3) != SM75_PT) {
-                var gp = load64(&prt + sm75_get(ins, 12, 3) * 8);
-                bad = bad + _ck_need(t - gp >= 12, j, "guarded BRA < 12 after its ISETP");
+                var gpk = sm75_get(ins, 12, 3);
+                var gp = load64(&prt + gpk * 8);
+                if (load64(&prk + gpk * 8) == 2) {
+                    bad = bad + _ck_need(t - gp >= 15, j, "guarded BRA < 15 after its DSETP");
+                    bad = bad + _ck_need(load64(&odw + load64(&pro + gpk * 8) * 8) == 1, j, "BRA on a DSETP unwaited");
+                } else {
+                    bad = bad + _ck_need(t - gp >= 12, j, "guarded BRA < 12 after its ISETP");
+                }
+            }
+        }
+        # a predicate a DSETP still owes is not overwritten
+        var pwk = 0 - 1;
+        if ((op12 & 0x1FF) == SM75_OP_ISETP) { pwk = sm75_get(ins, 81, 3); }
+        if ((op12 & 0x1FF) == SM75_OP_DSETP) { pwk = sm75_get(ins, 81, 3); }
+        if (pwk >= 0) {
+            if (load64(&prk + pwk * 8) == 2) {
+                var pwo = load64(&pro + pwk * 8);
+                bad = bad + _ck_need(load64(&odw + pwo * 8) == 1, j, "overwrites a DSETP's predicate unwaited");
             }
         }
         var ur = 0 - 1;
         if (op12 == SM75_OP_LDG) { ur = sm75_get(ins, 32, 6); }
         if (op12 == SM75_OP_STG) { ur = sm75_get(ins, 64, 6); }
         if (ur >= 0) { if (t - load64(&urt + ur * 8) < 2) { bad = bad + _ck_bad(j, "LDG/STG < 2 after its ULDC"); } }
-        # 5. the result register
-        if (d >= 0) {
+        # 5. the result registers
+        var dk = 0;
+        while (dk < nd) {
+            var d = load64(&dsts + dk * 8);
+            dk = dk + 1;
             if (load64(&lwk + d * 8) == 2) {
                 var wd = load64(&odw + load64(&lwo + d * 8) * 8);
                 bad = bad + _ck_need(wd == 1, j, "overwrites a decoupled result unwaited");
@@ -640,7 +770,7 @@ fn _ck_sched(sass, len): i64 {
             while (o2 < j) {
                 if (load64(&odc + o2 * 8) == 1) {
                     if (load64(&odr + o2 * 8) == 0) {
-                        var rdg = _s75_in(&osr + o2 * 24, load64(&ons + o2 * 8), d);
+                        var rdg = _ck_in32(&osr + o2 * 24, load64(&ons + o2 * 8), d);
                         bad = bad + _ck_need(rdg == 0, j, "overwrites a register a decoupled op still reads");
                     }
                 }
@@ -656,7 +786,7 @@ fn _ck_sched(sass, len): i64 {
             while (o3 < j) {
                 if (load64(&odc + o3 * 8) == 1) {
                     bad = bad + _ck_need(load64(&odr + o3 * 8) == 1, j, "branch, a read outstanding");
-                    if (load64(&od + o3 * 8) >= 0) {
+                    if (load64(&od + o3 * 8) > 0) {
                         bad = bad + _ck_need(load64(&odw + o3 * 8) == 1, j, "branch, a result outstanding");
                     }
                 }
@@ -690,28 +820,42 @@ fn _ck_sched(sass, len): i64 {
         store64(&ot + j * 8, t);
         store64(&odw + j * 8, 0);
         store64(&odr + j * 8, 0);
-        store64(&od + j * 8, d);
+        store64(&od + j * 8, nd);
+        if ((op12 & 0x1FF) == SM75_OP_DSETP) { store64(&od + j * 8, 1); }   # its predicate is a result
         store64(&ons + j * 8, ns);
         k = 0;
-        while (k < ns) { store64(&osr + j * 24 + k * 8, load64(&srcs + k * 8)); k = k + 1; }
+        while (k < ns) { store32(&osr + j * 24 + k * 4, load64(&srcs + k * 8)); k = k + 1; }
         if (cls == 3) {
             store64(&odc + j * 8, 1);
-            if (d >= 0) { if (wr == 7) { bad = bad + _ck_bad(j, "a decoupled result with no write SB"); } }
+            if (load64(&od + j * 8) > 0) {
+                if (wr == 7) { bad = bad + _ck_bad(j, "a decoupled result with no write SB"); }
+            }
         } else {
             store64(&odc + j * 8, 0);
             if (wr != 7) { bad = bad + _ck_bad(j, "a coupled op sets a write SB"); }
         }
-        if (d >= 0) {
+        dk = 0;
+        while (dk < nd) {
+            var dr = load64(&dsts + dk * 8);
             if (cls == 3) {
-                store64(&lwk + d * 8, 2);
-                store64(&lwo + d * 8, j);
+                store64(&lwk + dr * 8, 2);
+                store64(&lwo + dr * 8, j);
             } else {
-                store64(&lwk + d * 8, 1);
-                store64(&lwt + d * 8, t);
-                store64(&lwc + d * 8, cls);
+                store64(&lwk + dr * 8, 1);
+                store64(&lwt + dr * 8, t);
+                store64(&lwc + dr * 8, cls);
             }
+            dk = dk + 1;
         }
-        if ((op12 & 0x1FF) == SM75_OP_ISETP) { store64(&prt + sm75_get(ins, 81, 3) * 8, t); }
+        if ((op12 & 0x1FF) == SM75_OP_ISETP) {
+            store64(&prt + sm75_get(ins, 81, 3) * 8, t);
+            store64(&prk + sm75_get(ins, 81, 3) * 8, 1);
+        }
+        if ((op12 & 0x1FF) == SM75_OP_DSETP) {
+            store64(&prt + sm75_get(ins, 81, 3) * 8, t);
+            store64(&prk + sm75_get(ins, 81, 3) * 8, 2);
+            store64(&pro + sm75_get(ins, 81, 3) * 8, j);
+        }
         if (op12 == SM75_OP_ULDC) {
             var u = sm75_get(ins, 16, 6);
             store64(&urt + u * 8, t);
@@ -766,7 +910,7 @@ fn _ck_barriers(sass, len): i64 {
 # Every control-flow and ranga kernel's schedule passes the independent check, and the check
 # is not vacuous: a shortened stall, a dropped wait and a dropped read scoreboard each fail it.
 fn test_sm75_schedule_checked() {
-    var spv[2688];
+    var spv[4352];
     var sass[16384];
     var desc[24];
     var k = 0;
@@ -990,6 +1134,49 @@ fn test_sm75_bssy_shared_merge() {
     return 0;
 }
 
+# f64 on SM75 (4.4.0, the fourth N9 follow-on): the AMD f64 corpus compiles for NVIDIA and every
+# program passes the independent schedule check (F.a), OpFDiv included: f32 (F.b), f64 (F.c).
+fn _ck_f64_one(name, spv, n): i64 {
+    var sass[16384];
+    var desc[24];
+    var rc = sm75_compile_spirv(spv, n, &sass, 16384, &desc);
+    assert_eq(rc, 0, name);
+    if (rc == 0) { assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, "and its schedule checks"); }
+    return 0;
+}
+
+fn test_sm75_f64_corpus() {
+    var spv[4096];
+    _ck_f64_one("f64_fma", &spv, _spv_build_f64_fma(&spv));
+    _ck_f64_one("f64_arith", &spv, _spv_build_f64_arith(&spv));
+    _ck_f64_one("f64_cvt", &spv, _spv_build_f64_cvt(&spv));
+    _ck_f64_one("f64_subabs", &spv, _spv_build_f64_subabs(&spv));
+    _ck_f64_one("f64_vec", &spv, _spv_build_f64_vec(&spv));
+    _ck_f64_one("f64_sqrt", &spv, _spv_build_f64_sqrt(&spv));
+    _ck_f64_one("f64_i32_cvt", &spv, _spv_build_f64_i32_cvt(&spv));
+    _ck_f64_one("f64_const", &spv, _spv_build_f64_const(&spv));
+    _ck_f64_one("f64_store_const", &spv, _spv_build_f64_store_const(&spv));
+    _ck_f64_one("f64_ldexp", &spv, _spv_build_f64_ldexp(&spv));
+    _ck_f64_one("f64_select", &spv, _spv_build_f64_select(&spv));
+    var sass[16384];
+    var desc[24];
+    var n = _spv_build_f64_div(&spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), 0, "f64 OpFDiv compiles (F.c)");
+    assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, "and its schedule checks");
+    n = _spv_build_f32_div(&spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), 0, "f32 OpFDiv compiles (F.b)");
+    assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, "and its schedule checks");
+    n = _spv_build_f64_div2(&spv);
+    assert_eq(sm75_compile_spirv(&spv, n, &sass, 16384, &desc), 0, "two f64 divisions compile (wide ids)");
+    assert_eq(_ck_sched(&sass, load64(&desc + SM75_DESC_LEN)), 0, "and their schedule checks");
+    assert_eq(_spirv_lower_target, SPIRV_TARGET_GFX9, "the lowering target is back to GFX9");
+    var cl[2048];
+    n = cfk_build(26, &cl);     # oob_label: refused by the lowering itself
+    assert_eq(sm75_compile_spirv(&cl, n, &sass, 16384, &desc) < 0, 1, "a lowering refusal");
+    assert_eq(_spirv_lower_target, SPIRV_TARGET_GFX9, "still restores the GFX9 target");
+    return 0;
+}
+
 fn main(): i64 {
     test_sm75_register_count();
     test_sm75_regalloc_rules();
@@ -1008,6 +1195,7 @@ fn main(): i64 {
     test_sm75_schedule_stg_before_branch();
     test_sm75_schedule_per_predicate();
     test_sm75_bssy_shared_merge();
+    test_sm75_f64_corpus();
     return assert_summary();
 }
 

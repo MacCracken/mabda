@@ -184,6 +184,11 @@ var MIR_OP_F32_FMA_N0_ONE = 69;   # v_fma_f32(-a, b, 1.0) - NEGATE src0 + inline
 # compare when the flag may have been overwritten since. Not vector-only: uniformity is the
 # ordinary meet over cond and both values (outside every forced-DIVERGENT range).
 var MIR_OP_ISELECT        = 70;
+# v4.4.0 (the fourth N9 follow-on) — dst = a / b (f32 or f64), IEEE-correctly rounded: the
+# PORTABLE division. Only the SM75 target's lowering emits it (spirv_lower_set_target); sm75_isel
+# expands it. The GFX9 target keeps its 11-op DIV_SCALE / DIV_FMAS / DIV_FIXUP macro, which has
+# no SM75 counterpart. Uniformity is the ordinary meet.
+var MIR_OP_FDIV           = 71;
 
 # Is `op` an integer compare? The ICMP opcodes are split across two ranges
 # (22-27 unsigned/equality, 32-35 signed), so a single range test would silently
@@ -217,6 +222,10 @@ var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null
 # 4.4.0; before, a cap_ids above it was rejected), so a larger vals[] is legal
 # and its excess is never touched.
 var MIR_MAX_CAP_IDS          = 256;
+# The wider ceiling for a back end whose every id-indexed table is sized from its own buffers
+# (SM75: sm75_regalloc's alloc[], keyed by <id>; its label tables stay keyed by SPIR-V ids, which
+# are < 256): synthesized temporaries need the room (one f64 OpFDiv expands to ~140). 4.4.0.
+var MIR_MAX_CAP_IDS_WIDE     = 1024;
 
 # Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
 # fields (uniformity especially). The instr/ptr records pack two <id>/flag
@@ -272,6 +281,17 @@ var MIR_CB_MOVES_ON_FALSE = 0x20000;
 # leaves the module unusable and every later stage reports a downstream symptom
 # instead of this cause.
 fn mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
+    return _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
+      id_bound, MIR_MAX_CAP_IDS);
+}
+
+# mir_mod_init with MIR_MAX_CAP_IDS_WIDE (1024) in place of 256 (see that constant): for SM75.
+fn mir_mod_init_wide(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
+    return _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
+      id_bound, MIR_MAX_CAP_IDS_WIDE);
+}
+
+fn _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound, maxcap): i64 {
     if (m == 0)      { return 0 - MIR_ERR_BAD_INIT; }
     if (vals == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (instrs == 0) { return 0 - MIR_ERR_BAD_INIT; }
@@ -282,7 +302,7 @@ fn mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, b
     # regalloc and file-map scratch hold RA_MAX_REGS = 256 ids) keeps its excess
     # unused; it is not an error.
     var cap_ids = vals_len / MIR_VAL_REC;
-    if (cap_ids > MIR_MAX_CAP_IDS) { cap_ids = MIR_MAX_CAP_IDS; }
+    if (cap_ids > maxcap) { cap_ids = maxcap; }
     var cap_instrs = instrs_len / MIR_INSTR_REC;
     var cap_ptrs = ptrs_len / MIR_PTR_REC;
     if (cap_ids <= 0)    { return 0 - MIR_ERR_BAD_INIT; }

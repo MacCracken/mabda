@@ -8,6 +8,7 @@ WITH ITS LENGTH IN BYTES, and derives its capacity from the length:
 
     mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len,
                  blocks, blocks_len, id_bound)                     src/mir.cyr
+    mir_mod_init_wide(... same ...)   (1024 ids, not 256: SM75)    src/mir.cyr
     spirv_build_{type,const,decoration}_table(p, n, out, out_len)  src/spirv_parse.cyr
     _spirv_resolve_builtins(p, n, idb, out_bi, out_bi_len)
     spirv_lower_module(p, n, types, consts, deco, m, out_bi, out_bi_len)
@@ -61,10 +62,12 @@ import sys
 # tests/tcyr/compiler_lower.tcyr asserts it so the two cannot drift.
 MIR_VAL_REC = 40
 MIR_MAX_CAP_IDS = 256
+MIR_MAX_CAP_IDS_WIDE = 1024
 
 # fn name -> (arg count, [(buf arg index, len arg index), ...])
 CONTRACT = {
     "mir_mod_init": (10, [(1, 2), (3, 4), (5, 6), (7, 8)]),
+    "mir_mod_init_wide": (10, [(1, 2), (3, 4), (5, 6), (7, 8)]),
     "spirv_build_type_table": (4, [(2, 3)]),
     "spirv_build_const_table": (4, [(2, 3)]),
     "spirv_build_decoration_table": (4, [(2, 3)]),
@@ -252,13 +255,14 @@ def main():
                         f"OVERRUN {need - have} B")
                 elif verbose:
                     print(f"  ok {where} {ref.group(1)}[{have}] >= {need}")
-            if (name == "mir_mod_init" and not in_assert
+            if (name in ("mir_mod_init", "mir_mod_init_wide") and not in_assert
                     and INT.fullmatch(args[2]) and INT.fullmatch(args[9])):
-                cap = min(int(args[2]) // MIR_VAL_REC, MIR_MAX_CAP_IDS)
+                ceil = MIR_MAX_CAP_IDS_WIDE if name == "mir_mod_init_wide" else MIR_MAX_CAP_IDS
+                cap = min(int(args[2]) // MIR_VAL_REC, ceil)
                 if int(args[9]) > cap:
                     problems.append(
                         f"{where}: id_bound {args[9]} > cap_ids {cap} (vals_len {args[2]} / "
-                        f"{MIR_VAL_REC}) — mir_mod_init rejects it")
+                        f"{MIR_VAL_REC}) — {name} rejects it")
     for p in problems:
         print(p)
     print(f"\n{pairs} (buffer, length) pair(s) checked, {len(problems)} problem(s)")

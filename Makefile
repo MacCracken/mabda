@@ -900,6 +900,25 @@ test-native-spirv-control-flow-e2e: build/native_spirv_control_flow_e2e
 check-cf-fixtures:
 	@./scripts/gen-spirv-cf-fixtures.py --check
 
+# The generated f64 oracle fixture must match its generator (python3 only).
+.PHONY: check-f64-fixtures
+check-f64-fixtures:
+	@./scripts/gen-f64-fixtures.py --check
+
+# v4.4.0 (the fourth N9 follow-on) — the f64 compiler corpus through the public API on either
+# native backend, bit-exact against the IEEE oracle in tests/tcyr/f64_cases.cyr. Masterless.
+build/f64_kernels_e2e: programs/f64_kernels_e2e.cyr src/*.cyr tests/tcyr/f64_cases.cyr tests/tcyr/compiler_common.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/f64_kernels_e2e.cyr $@
+
+.PHONY: test-native-f64-kernels-e2e
+test-native-f64-kernels-e2e: build/f64_kernels_e2e
+	./build/f64_kernels_e2e amd
+
+.PHONY: test-nvidia-f64-kernels-e2e
+test-nvidia-f64-kernels-e2e: build/f64_kernels_e2e
+	./build/f64_kernels_e2e nvidia
+
 # The generated ranga-kernel fixture must match tests/spirv/ranga/*.spv (python3 only).
 .PHONY: check-ranga-fixtures
 check-ranga-fixtures:

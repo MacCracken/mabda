@@ -12,7 +12,9 @@
 #     because the next iteration reads it again (the v4.1.0 GFX9 rule, to a fixed point over
 #     nested loops);
 #   - (N9.5) each value is allocated ONCE: a phi is defined by a copy on every incoming edge,
-#     and all of them must land in the same register.
+#     and all of them must land in the same register;
+#   - (4.4.0) an f64 value takes an even-aligned PAIR (Rn, Rn+1, n even), as SM75's 64-bit
+#     operands require; a 32-bit op on one half names the pair and a half flag (SM75I_HI_*).
 #
 # The per-<id> table reuses gfx9_regalloc's record (RA_REC: +0 physical register, +8 last
 # use) and its _ra_claim free-at scan.
@@ -42,6 +44,8 @@ fn _s75_writes_gpr(op): i64 {
     if (op == SM75I_BCLEAR) { return 0; }
     if (op == SM75I_BSSY) { return 0; }
     if (op == SM75I_BSYNC) { return 0; }
+    if (op == SM75I_DSETP) { return 0; }
+    if (op == SM75I_STG64) { return 0; }
     return 1;
 }
 
@@ -126,10 +130,18 @@ fn sm75_regalloc(m, isel, n, alloc, alloc_len, hw): i64 {
         if (d2 > 0) {
             if (_s75_writes_gpr(op2) == 1) {
                 if (load64(alloc + d2 * RA_REC + 0) == 0 - 1) {
-                    var r = _ra_claim(&freeat, 0, SM75_GPR_CAP, i, load64(alloc + d2 * RA_REC + 8) + 1);
+                    # an f64 value takes an even-aligned pair (4.4.0)
+                    var w = 1;
+                    if (mir_type_base(mir_val_type(m, d2)) == MIR_T_F64) { w = 2; }
+                    var r = 0 - 1;
+                    if (w == 2) {
+                        r = _ra_claim_pair(&freeat, 0, SM75_GPR_CAP, i, load64(alloc + d2 * RA_REC + 8) + 1);
+                    } else {
+                        r = _ra_claim(&freeat, 0, SM75_GPR_CAP, i, load64(alloc + d2 * RA_REC + 8) + 1);
+                    }
                     if (r < 0) { return 0 - SM75_ERR_REG_OVERFLOW; }
                     store64(alloc + d2 * RA_REC + 0, r);
-                    if (r + 1 > high) { high = r + 1; }
+                    if (r + w > high) { high = r + w; }
                 }
             }
         }
