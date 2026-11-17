@@ -216,12 +216,44 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     2026-11-16** (`build/logs/chew-nvidia_surface_present_e2e-20261116-183837.log`): block-linear
     accepted, both phases identical on screen, exit 0. The first attempt ran from a terminal
     inside chew's Wayland desktop and was refused master (exit 2). The run needs a text
-    console with sddm stopped. chew's other four card-node gates are still to run. Only this run proves
+    console with sddm stopped. chew's other four card-node gates passed with it in
+    `make seat-closeout-nvidia` (below). Only this run proves
     the scanout and the ADDFB2 struct fix on NVIDIA; the AMD master gates above prove the fix
     on AMD;
   - the samvada live-bus run: `gpu_surface_configure_native_logind` with `samvada_native_init()`,
     built `-D MABDA_LOGIND`, from a seated session (samvada 1.1.0's `libsystemd` shim deletion
-    waits on it).
+    waits on it). Since 2026-11-16 this is `make test-native-logind-present-e2e`
+    (`programs/native_present_logind_e2e.cyr`). It takes the card from logind, presents 120
+    frames, releases, then takes the card again for 30 more, which proves the release returned
+    it.
+
+  **How to run it (2026-11-16).** Every seat gate logs through `scripts/seat-gate.sh`. One logged
+  run per box (`scripts/seat-closeout.sh`) is run from a TEXT CONSOLE (Ctrl-Alt-F3) with
+  `sudo systemctl stop sddm` (both boxes use sddm):
+  - **Cezanne:** `make seat-closeout-amd` after a REBOOT. It runs `test-native-all` with the
+    master and logind gates included, then the linked example consumer. Any GPU reset in the
+    boot's kernel log fails it.
+  - **chew:** `make seat-closeout-nvidia` in `~/mabda-verify-n9`. It runs the five card-node
+    gates.
+  - **The logs:** each closeout writes `build/logs/seat-closeout-<box>-<timestamp>.log`, which
+    can be read over ssh.
+
+  **Status.**
+  - **chew: done, 2026-11-16** (`build/logs/chew-seat-closeout-nvidia-20261116-191558.log`).
+    All five card-node gates passed from tty3 with sddm stopped: the topology probe, ADDFB2
+    with the corrected 104-byte struct, the red modeset, 120 page-flipped frames, and the test
+    card block-linear then linear.
+  - **Cezanne: waiting on a reboot the maintainer can't take soon** (said 2026-11-16).
+    `make seat-closeout-amd` still has to run after a clean boot: `test-native-all` with the
+    master and logind gates, and the example consumer. Until then, the AMD DRM-master gates,
+    the samvada live-bus run and the clean-boot rerun stay unverified for 4.4.0.
+- **Found 2026-11-16: the logind path never hands the device back on NVIDIA.**
+  `gpu_surface_configure_native_logind` marks a surface as owning its logind fd only for AMD
+  (`native_surface_mark_master_owned`; `NativeSurface +108`). `NvSurface` has no such field, so
+  on NVIDIA `gpu_surface_release` neither releases the device to logind nor closes the fd. Both
+  stay held until the process exits. The fd-ownership marking in surface_v3.cyr, NvSurface and
+  the NVIDIA release need extending. **Done when** the logind gate also runs on chew
+  (`test-nvidia-logind-present-e2e`) and its second phase takes the card again.
 - ✅ **Fix: the older wgpu `gpu_surface_acquire` path leaked one texture reference per frame**
   (CHANGELOG [4.4.0]). It now releases the texture at `gpu_surface_present`, and resize and
   release drop an unpresented one. CPU test: one release per frame over 1,000 frames, no heap

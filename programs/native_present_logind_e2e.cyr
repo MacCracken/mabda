@@ -1,0 +1,128 @@
+# programs/native_present_logind_e2e.cyr — 4.4.0 seat closeout: the samvada live-bus run.
+#
+# The in-session present path end to end on hardware: DRM master delegated by systemd-logind
+# over the system dbus, through samvada's pure-Cyrius client, instead of the kiosk path's
+# SET_MASTER on a self-opened card fd.
+#   1. samvada_native_init() connects to the system bus and finds this process's session;
+#   2. gpu_surface_configure_native_logind takes /dev/dri/card0 (or card1) from logind with
+#      TakeDevice (samvada takes session control first, lazily), and modesets;
+#   3. 120 presented frames of the scrolling gradient;
+#   4. gpu_surface_release hands the device back to logind (ReleaseDevice) and closes the fd;
+#   5. a second configure + 30 frames: it can only take the device if step 4 returned it.
+# samvada 1.1.0 deletes its libsystemd shim once this run has passed (its roadmap).
+#
+# **Run from a text-console login** (Ctrl-Alt-F3), with the display manager stopped: the
+# session must be the active one and logind must not have handed the card to another session's
+# compositor. While it runs, logind mutes this VT's keyboard (session control); it is restored
+# when the program exits. Built with -D MABDA_LOGIND (`make test-native-logind-present-e2e`).
+#
+# Exit codes:
+#   0 both phases presented, the device returned between them
+#   2 samvada_native_init failed (no system bus / no logind session for this process)
+#   4 gpu_context_new_native failed
+#   5 phase 1: logind would not hand over the card (not the active session? another controller?)
+#   6 acquire returned 0     7 present failed
+#   8 phase 2: the device did not come back after release
+
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
+    var y = 0;
+    while (y < h) {
+        var virt_y = (y + frame_offset) % h;
+        var r = (virt_y * 255) / h;
+        var pixel = (r << 16) | (255 - r);
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            store32(row + x * 4, pixel);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Configure through logind, present `frames` frames, release. Returns 0 or an exit code
+# (`fail_configure` when logind would not hand the card over).
+fn run_phase(ctx, label, frames, fail_configure): i64 {
+    var surface = gpu_surface_configure_native_logind(ctx, 1920, 1080);
+    if (surface == 0) {
+        print_cstr("FAIL: "); print_cstr(label);
+        print_cstr(": gpu_surface_configure_native_logind returned 0 (logind refused TakeDevice, or no\n");
+        print_cstr("      connected connector). Run from a text-console login with the display manager stopped.\n");
+        return fail_configure;
+    }
+    var w = load32(surface + NATIVE_SURFACE_WIDTH);
+    var h = load32(surface + NATIVE_SURFACE_HEIGHT);
+    var pitch = load32(surface + NATIVE_SURFACE_PITCH);
+    print_cstr(label); print_cstr(": logind handed over the card; ");
+    print_i64(w); print_cstr("x"); print_i64(h); print_cstr(", master owned by mabda: ");
+    print_i64(load32(surface + NATIVE_SURFACE_MASTER_OWNED)); print_cstr("\n");
+    var frame = 0;
+    while (frame < frames) {
+        var fb = gpu_surface_acquire(ctx, surface);
+        if (fb == 0) {
+            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame); print_cstr("\n");
+            gpu_surface_release(ctx, surface);
+            return 6;
+        }
+        var addr = 0;
+        if (fb == surface + NATIVE_SURFACE_FB_B) { addr = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR); }
+        if (fb == surface + NATIVE_SURFACE_SCANOUT) { addr = load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR); }
+        _fill_gradient(addr, w, h, pitch, frame * 4);
+        var rc = gpu_surface_present(ctx, surface);
+        if (rc != 0) {
+            print_cstr("FAIL: present returned "); print_i64(rc);
+            print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+            gpu_surface_release(ctx, surface);
+            return 7;
+        }
+        frame = frame + 1;
+    }
+    gpu_surface_release(ctx, surface);
+    print_cstr("  "); print_i64(frames); print_cstr(" frames presented; released (device back to logind)\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native present via logind (4.4.0 seat closeout: samvada live bus)\n");
+    print_cstr("-----------------------------------------------------------------------\n");
+    print_cstr("expect: ~2 s of a scrolling blue-red gradient, a blink, ~0.5 s more, then the console\n\n");
+    var sr = samvada_native_init();
+    if (sr != 0) {
+        print_cstr("FAIL: samvada_native_init rc="); print_i64(sr);
+        print_cstr(" (no system bus, or no logind session for this process)\n");
+        return 2;
+    }
+    print_cstr("samvada: connected to the system bus, session found\n");
+    var ctx_tag, ctx_res = gpu_context_new_native();
+    if (is_err_result(ctx_tag) == 1) {
+        print_cstr("FAIL: gpu_context_new_native\n");
+        samvada_release();
+        return 4;
+    }
+    var ctx = ctx_res;
+    var rc = run_phase(ctx, "phase 1", 120, 5);
+    if (rc == 0) { rc = run_phase(ctx, "phase 2 (the device came back)", 30, 8); }
+    gpu_context_release(ctx);
+    samvada_release();
+    if (rc == 0) {
+        print_cstr("OK: DRM master delegated by logind over the live system bus, presented, returned,\n");
+        print_cstr("    and taken again\n");
+    }
+    return rc;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -39,6 +39,11 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
+  - The seat-only closeout. chew's half passed on 2026-11-16 (`make seat-closeout-nvidia`, all five
+    card-node gates). The Cezanne half, `make seat-closeout-amd`, is still open: it needs a reboot
+    the maintainer can't take soon. Run it from a text console with `sudo systemctl stop sddm`,
+    then read `build/logs/seat-closeout-amd-*.log`.
+  - The logind path on NVIDIA never returns the device (a roadmap item, found 2026-11-16).
   - NVIDIA block-linear scanout: done. The layout is checked against the copy engine
     (`test-nvidia-blocklinear-e2e`), and the scanout passed its seat run on chew (2026-11-16).
     A seat run on chew needs a text console (Ctrl-Alt-F3) with `sudo systemctl stop sddm`; a

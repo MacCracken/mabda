@@ -712,6 +712,37 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 - **On the TU116**, all 17 masterless gates pass with the new one
   (`build/logs/chew-nv-gates-blocklinear-20261116-180402.log`).
 
+### Added — the seat-closeout gates
+- **Every seat gate writes a log.** That covers the AMD and NVIDIA KMS, modeset and present
+  gates, the NVIDIA surface present gate, and the new logind gate. Each goes through
+  `scripts/seat-gate.sh`, which writes `build/logs/<gate>-<timestamp>.log`. Its header records
+  the tty, the session type and the boot time, which decide whether a seat gate can pass at all.
+  The person at the console often cannot copy anything back, so the log is the result.
+- **One logged run per box** (`scripts/seat-closeout.sh`), from a text console with the display
+  manager stopped:
+  - `make seat-closeout-amd` runs `test-native-all` with `NATIVE_NEEDS_MASTER` emptied, so the
+    DRM-master and logind gates run with the rest, then the linked example consumer. It lists
+    the boot's GPU resets and fails on any, since a clean boot is required.
+  - `make seat-closeout-nvidia` runs chew's five card-node gates.
+- **The samvada live-bus gate** (`make test-native-logind-present-e2e`, built
+  `-D MABDA_LOGIND`):
+  - `samvada_native_init()`, then `gpu_surface_configure_native_logind` takes the card from
+    systemd-logind over the system dbus, with no `SET_MASTER` and no root;
+  - 120 frames are presented, then `gpu_surface_release` hands the device back;
+  - a second configure and 30 frames show the device really returned.
+
+  `test-native-all` skips it like the other master gates.
+- **Found while writing it:** the logind path never returns the device on NVIDIA (`NvSurface` has
+  no "mabda owns this fd" field). It is a roadmap item.
+- **chew's closeout passed** (`make seat-closeout-nvidia`, 2026-11-16,
+  `build/logs/chew-seat-closeout-nvidia-20261116-191558.log`), from a text console with sddm
+  stopped. All five card-node gates passed: `kms-summary`, `kms-scanout` (ADDFB2 with the corrected
+  struct), `kms-modeset`, `present-e2e` (120 page-flipped frames) and `surface-present-e2e`
+  (block-linear, then linear).
+- **The Cezanne closeout has not run.** It needs a clean boot, and the box can't be rebooted for
+  now. So for 4.4.0, the AMD DRM-master gates, the samvada live-bus gate and the clean-boot
+  `test-native-all` remain unverified.
+
 ### Fixed — the older wgpu surface path leaked a frame texture every frame
 - **What leaked.** `gpu_surface_configure_wgpu` → `gpu_surface_acquire` → `gpu_surface_present`
   (`surface_state_*` underneath) never released the texture reference wgpu hands out per frame.

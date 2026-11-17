@@ -769,7 +769,7 @@ build/nvidia_kms_summary: programs/nvidia_kms_summary.cyr src/*.cyr
 
 .PHONY: test-nvidia-kms-summary
 test-nvidia-kms-summary: build/nvidia_kms_summary
-	./build/nvidia_kms_summary
+	@./scripts/seat-gate.sh nvidia_kms_summary ./build/nvidia_kms_summary
 
 # v4.0 Phase N8.2 — nouveau scanout FB. Allocates a linear VRAM BO on the
 # render node, PRIME-bridges it onto the KMS card fd, and ADDFB2's an XRGB8888
@@ -781,7 +781,7 @@ build/nvidia_kms_scanout: programs/nvidia_kms_scanout.cyr src/*.cyr
 
 .PHONY: test-nvidia-kms-scanout
 test-nvidia-kms-scanout: build/nvidia_kms_scanout
-	./build/nvidia_kms_scanout
+	@./scripts/seat-gate.sh nvidia_kms_scanout ./build/nvidia_kms_scanout
 
 # v4.0 Phase N8.3 — nouveau LIVE MODESET. SETCRTC a red scanout FB onto the
 # first connected connector — the screen turns red for 3s, then restores.
@@ -793,7 +793,7 @@ build/nvidia_kms_modeset: programs/nvidia_kms_modeset.cyr src/*.cyr
 
 .PHONY: test-nvidia-kms-modeset
 test-nvidia-kms-modeset: build/nvidia_kms_modeset
-	./build/nvidia_kms_modeset
+	@./scripts/seat-gate.sh nvidia_kms_modeset ./build/nvidia_kms_modeset
 
 # v4.0 Phase N8.4 — nouveau ANIMATED PRESENT. Double-buffered, vsync'd
 # PAGE_FLIP loop: the screen shows ~2s of a scrolling blue->red gradient, then
@@ -805,7 +805,7 @@ build/nvidia_present_e2e: programs/nvidia_present_e2e.cyr src/*.cyr
 
 .PHONY: test-nvidia-present-e2e
 test-nvidia-present-e2e: build/nvidia_present_e2e
-	./build/nvidia_present_e2e
+	@./scripts/seat-gate.sh nvidia_present_e2e ./build/nvidia_present_e2e
 
 # v4.0 Phase N8.5 — nouveau ANIMATED PRESENT through the PUBLIC surface API.
 # Same on-screen result as N8.4 (scrolling blue->red gradient, ~2s, console
@@ -818,14 +818,7 @@ build/nvidia_surface_present_e2e: programs/nvidia_surface_present_e2e.cyr src/*.
 
 .PHONY: test-nvidia-surface-present-e2e
 test-nvidia-surface-present-e2e: build/nvidia_surface_present_e2e
-	@mkdir -p build/logs; \
-	log=build/logs/nvidia_surface_present_e2e-$$(date +%Y%m%d-%H%M%S).log; \
-	{ echo "# nvidia_surface_present_e2e $$(date -Is) host=$$(uname -n) kernel=$$(uname -r)"; \
-	  echo "# commit=$$(git rev-parse --short HEAD 2>/dev/null)$$(git diff --quiet 2>/dev/null || echo +dirty)"; \
-	  echo "# tty=$$(tty 2>/dev/null) session=$${XDG_SESSION_TYPE:-unset}"; } > $$log; \
-	./build/nvidia_surface_present_e2e >> $$log 2>&1; rc=$$?; \
-	cat $$log; cp $$log build/logs/nvidia_surface_present_e2e.log; \
-	echo "log: $$log (exit $$rc)"; exit $$rc
+	@./scripts/seat-gate.sh nvidia_surface_present_e2e ./build/nvidia_surface_present_e2e
 
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,
@@ -1547,7 +1540,7 @@ build/native_kms_modeset_smoke: programs/native_kms_modeset_smoke.cyr src/*.cyr
 
 .PHONY: test-native-kms-modeset
 test-native-kms-modeset: build/native_kms_modeset_smoke
-	./build/native_kms_modeset_smoke
+	@./scripts/seat-gate.sh native_kms_modeset ./build/native_kms_modeset_smoke
 
 # v3 Step 7.7 — Phase D end-to-end. 120-frame double-buffered
 # animated present using the v3 public surface API. Requires DRM
@@ -1560,7 +1553,29 @@ build/native_present_e2e: programs/native_present_e2e.cyr src/*.cyr
 
 .PHONY: test-native-present-e2e
 test-native-present-e2e: build/native_present_e2e
-	./build/native_present_e2e
+	@./scripts/seat-gate.sh native_present_e2e ./build/native_present_e2e
+
+# v4.4.0 — the seat closeout's samvada live-bus run: DRM master delegated by systemd-logind over
+# the system dbus (samvada's pure-Cyrius client), 120 frames, release, take again + 30 frames.
+# Built -D MABDA_LOGIND. **Run from a text-console login with the display manager stopped**;
+# test-native-all skips it (NATIVE_NEEDS_MASTER) unless seat-closeout-amd empties that list.
+build/native_present_logind_e2e: programs/native_present_logind_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build -D MABDA_LOGIND programs/native_present_logind_e2e.cyr $@
+
+.PHONY: test-native-logind-present-e2e
+test-native-logind-present-e2e: build/native_present_logind_e2e
+	@./scripts/seat-gate.sh native_present_logind_e2e ./build/native_present_logind_e2e
+
+# v4.4.0 — the seat-only closeout, one logged run per box (scripts/seat-closeout.sh says what
+# each runs). From a TEXT CONSOLE with the display manager stopped. seat-closeout-amd also
+# needs a CLEAN BOOT (reboot first): any GPU reset in this boot's kernel log fails it.
+.PHONY: seat-closeout-amd seat-closeout-nvidia
+seat-closeout-amd: build/native_present_logind_e2e
+	@./scripts/seat-closeout.sh amd
+
+seat-closeout-nvidia:
+	@./scripts/seat-closeout.sh nvidia
 
 # v3 Phase B (Sessions 11–12) — libdrm_amdgpu reference programs.
 # Used to differentiate "is this bug in our direct ioctls?" (spike =
@@ -1667,7 +1682,7 @@ $$(echo $$skipped | wc -w) skipped, $$(echo $$known | wc -w) known-fail  (of $$t
 # Gates that cannot pass in an ordinary desktop session because the compositor
 # holds DRM master. NOT hidden — the roll-up prints them as SKIP with the reason,
 # because a test you deleted is worse than a skip you can read.
-NATIVE_NEEDS_MASTER = test-native-kms-modeset test-native-present-e2e
+NATIVE_NEEDS_MASTER = test-native-kms-modeset test-native-present-e2e test-native-logind-present-e2e
 
 # Gates failing for a filed, understood reason. Every entry MUST have an issue
 # file; this list is not a place to park inconvenient red. It is empty when no
