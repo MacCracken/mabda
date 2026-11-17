@@ -39,10 +39,10 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
-  - NVIDIA block-linear scanout: landed, with the layout checked against the copy engine
-    (`test-nvidia-blocklinear-e2e`). The scanout itself waits for the seat run of
-    `test-nvidia-surface-present-e2e`, whose two phases must look identical.
-  - The surface-acquire leak.
+  - NVIDIA block-linear scanout: done. The layout is checked against the copy engine
+    (`test-nvidia-blocklinear-e2e`), and the scanout passed its seat run on chew (2026-11-16).
+    A seat run on chew needs a text console (Ctrl-Alt-F3) with `sudo systemctl stop sddm`; a
+    terminal in the desktop cannot take DRM master.
   - The seat-only closeout.
   - The consumer check. ranga needs five changes in its own repo, all its call. They are
     filed as `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`

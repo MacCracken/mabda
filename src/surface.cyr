@@ -14,6 +14,9 @@
 #   +24: width            (i64)
 #   +32: height           (i64)
 #   +40: present_mode     (u32)
+# The record surface_state_new allocates is the full WGPU_SURFACE_STATE_SIZE
+# (src/backend_wgpu_surface.cyr); its +80 holds the texture surface_state_acquire handed
+# out (4.4.0), which surface_state_submit_present releases.
 
 # ================================================================
 # Present mode preferences (wgpu-native v29 values)
@@ -97,6 +100,7 @@ fn _surface_state_configure(ss): i64 {
 fn surface_state_resize(ss, width, height): i64 {
     if (width <= 0) { return 0; }    # Audit [LOW-3]: was == 0; negatives
     if (height <= 0) { return 0; }   # truncated to a huge u32 extent.
+    _surface_state_drop_frame(ss);   # a reconfigure invalidates an unpresented frame
     store64(ss + 24, width);
     store64(ss + 32, height);
     _surface_state_configure(ss);
@@ -112,14 +116,33 @@ fn surface_state_resize(ss, width, height): i64 {
 #
 # wgpuSurfaceGetCurrentTexture writes into a WGPUSurfaceTexture struct
 # (24 bytes): +0 nextInChain, +8 texture, +16 status.
+#
+# 4.4.0: the texture is a reference wgpu hands out per frame, and this path never released
+# it (one leaked reference a frame; the 4.3.1 CHANGELOG named it). It is kept at ss+80 until
+# surface_state_submit_present releases it after the present (or resize / release drops an
+# unpresented one). A second acquire before the present returns the SAME texture rather than
+# asking wgpu again, which refuses a second acquire. The struct it reads is on the stack
+# (it was a 24-byte bump allocation a frame).
 fn surface_state_acquire(ss): i64 {
-    var out = alloc(24);
-    memset(out, 0, 24);
-    wgpu_surface_get_current_texture(surface_state_handle(ss), out);
-    var status = load32(out + 16);
-    var texture = load64(out + 8);
-    if (status == WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL) { return gpu_ok(texture); }
-    if (status == WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL) { return gpu_ok(texture); }
+    var held = load64(ss + 80);
+    if (held != 0) { return gpu_ok(held); }
+    var out[24];
+    memset(&out, 0, 24);
+    wgpu_surface_get_current_texture(surface_state_handle(ss), &out);
+    var status = load32(&out + 16);
+    var texture = load64(&out + 8);
+    var good = 0;
+    if (status == WGPU_SURFACE_STATUS_SUCCESS_OPTIMAL) { good = 1; }
+    if (status == WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL) { good = 1; }
+    if (good == 1) {
+        if (texture == 0) {
+            return gpu_err_result_msg(GPU_ERR_SURFACE_LOST, "surface: wgpu returned no frame texture");
+        }
+        store64(ss + 80, texture);
+        return gpu_ok(texture);
+    }
+    # a failed acquire can still carry a texture reference: release it
+    if (texture != 0) { wgpu_texture_release(texture); }
     if (status == WGPU_SURFACE_STATUS_TIMEOUT) {
         return gpu_err_result_msg(GPU_ERR_SURFACE_TIMEOUT, "surface texture acquire timed out");
     }
@@ -135,10 +158,20 @@ fn surface_state_acquire(ss): i64 {
 # See docs/audit/2026-04-19-audit.md HIGH-1.
 fn surface_state_submit_present(ss): i64 {
     wgpu_surface_present(surface_state_handle(ss));
+    _surface_state_drop_frame(ss);
+    return 0;
+}
+
+# Release the texture surface_state_acquire handed out, if one is held (4.4.0).
+fn _surface_state_drop_frame(ss): i64 {
+    var t = load64(ss + 80);
+    if (t != 0) { wgpu_texture_release(t); }
+    store64(ss + 80, 0);
     return 0;
 }
 
 fn surface_state_release(ss): i64 {
+    _surface_state_drop_frame(ss);
     var h = load64(ss + 0);
     if (h != 0) { wgpu_surface_release(h); }
     store64(ss + 0, 0);

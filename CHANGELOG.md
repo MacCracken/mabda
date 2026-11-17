@@ -50,8 +50,8 @@ The follow-ons the design note named are scheduled in the roadmap's 4.4.0 sectio
 landed (below): latency-table scheduling, predicate allocation, `BSSY` / `BSYNC` reconvergence,
 and `OpFDiv` / f64 on SM75.
 
-**NVIDIA block-linear scanout** has landed too (below). Its layout is checked on the TU116 against
-the copy engine; the scanout itself still needs the seat run.
+**NVIDIA block-linear scanout** has landed too (below), verified on the TU116 against the copy
+engine and on screen from chew's console.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -674,15 +674,29 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - a control that swizzles at the wrong block height mismatches (3,200 of 51,200 words right);
   - the 1080p swizzle costs 5.9 ms a frame into VRAM through BAR1 (5.2 ms into host memory),
     inside a 60 Hz frame.
-- **Not yet verified: the scanout itself.** The display can only be checked from a seat. The seat
-  gate `make test-nvidia-surface-present-e2e` now runs two phases of 180 frames each, the
-  default (block-linear) and then forced linear. Each phase prints its layout and frame time.
+- **The scanout, from a seat.** The seat gate `make test-nvidia-surface-present-e2e` now runs two
+  phases of 180 frames each, the default (block-linear) and then forced linear, and prints each
+  phase's layout and frame time.
   - It shows a test card a wrong layout can't hide: a 32-px checkerboard, a green border, a 1-px
     diagonal and a moving bar. The old vertical gradient was constant along each row, so a
     swizzle error inside a row would not have shown.
   - It exits 7 if the kernel refuses block-linear, and it writes
     `build/logs/nvidia_surface_present_e2e-<timestamp>.log`.
-  - It is in the seat-only closeout, with chew's other card-node gates.
+
+  **Passed on chew, 2026-11-16, run from a text console with sddm stopped**
+  (`build/logs/chew-nvidia_surface_present_e2e-20261116-183837.log`):
+  - the kernel accepted the block-linear FBs at chew's 2560×1440 mode
+    (`BLOCK-LINEAR scanout: h=4`, modifier `0x300000000606014`);
+  - both phases presented 180 frames and the console was restored, with exit 0 and a clean
+    kernel log;
+  - the maintainer saw the two phases render identically.
+
+  The first attempt ran from a terminal inside the Wayland desktop and was refused DRM master
+  (exit 2, before configure). The failure message now says how to run it.
+- **Cost at 1440p.** The phases took about 165 and 150 ms a frame. Most of that is the gate's
+  per-pixel test-card fill in Cyrius; the roughly 15 ms difference is the swizzle into VRAM
+  (5.9 ms at 1080p in the masterless gate). A copy-engine present would take that off the CPU;
+  it is not in this item's scope.
 - **New helpers:**
   - `native_kms_add_fb_xrgb8888_mod` and `native_kms_fb_cmd2_pack`;
   - `native_nv_gem_new_tiled` / `native_nv_gem_new_pack` and `native_nv_bo_create_kind`;
@@ -698,6 +712,35 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 - **On the TU116**, all 17 masterless gates pass with the new one
   (`build/logs/chew-nv-gates-blocklinear-20261116-180402.log`).
 
+### Fixed — the older wgpu surface path leaked a frame texture every frame
+- **What leaked.** `gpu_surface_configure_wgpu` → `gpu_surface_acquire` → `gpu_surface_present`
+  (`surface_state_*` underneath) never released the texture reference wgpu hands out per frame.
+  The 4.3.1 CHANGELOG named it. Its acquire also bump-allocated 24 bytes a frame.
+  - Measured on chew (NVK, Hyprland), the old behaviour grows the resident set by about 2 MiB per
+    1,800 frames, about 1.15 KB a frame: roughly 250 MB an hour at 60 Hz.
+- **The fix** (`src/surface.cyr`):
+  - the record keeps the texture it handed out (`+80`; `WGPU_SURFACE_STATE_SIZE` is 88), and
+    `surface_state_submit_present` releases it after `wgpuSurfacePresent`;
+  - `surface_state_resize` and `surface_state_release` drop an unpresented one;
+  - a failed acquire releases whatever texture wgpu returned with it;
+  - the status struct is on the stack.
+- **Behaviour change.** A second acquire before the present returns the same texture. Before,
+  it asked wgpu again, which wgpu refuses. The newer path already worked this way.
+- **The same leak, mixed.** `gpu_surface_acquire` on a `gpu_surface_configure` surface used to
+  acquire a second reference that nothing released. It now returns the surface's own frame
+  texture, which its present releases.
+- **Tests** (`target_tier.tcyr`, 370, against the fake wgpu table):
+  - one release per frame over 1,000 frames, with no heap growth;
+  - the second acquire, a failed acquire, and resize and release with an unpresented frame;
+  - `gpu_surface_acquire` on a configured surface.
+- **The RSS check** (`make test-surface-wayland-e2e`, from a Wayland session). A new phase
+  presents 1,800 frames through the older path after 300 warm-up frames, then 1,800 frames that
+  release nothing, as a control. On chew, twice
+  (`build/logs/chew-surface_wayland_e2e-20261116-185{344,458}.log`): 0 KiB of growth with the fix
+  against 2,040–2,060 KiB for the control, and 14 of 14 checks passed. Those frames are never drawn
+  into, so the window shows undefined contents; the gate now says so before the phase.
+  `make test-gpu` passes on the Cezanne.
+
 ### Fixed — ADDFB2's request struct
 - `drm_mode_fb_cmd2` is 104 bytes on x86_64, with `modifier[]` u64-aligned at +72. mabda laid it
   out as 100 bytes with `modifier` at +68, using ioctl `0xC06464B8` rather than the header's
@@ -707,8 +750,9 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   misaligned.
 - `kms.tcyr` had pinned the wrong layout, and now pins the `sizeof` / `offsetof` the uapi header
   gives.
-- The AMD and NVIDIA present paths share it, so it is hardware-checked at their seat gates
-  (AMD `test-native-kms-modeset` / `test-native-present-e2e`, NVIDIA's present gates). The
+- The AMD and NVIDIA present paths share it. On NVIDIA it is hardware-checked by the block-linear
+  seat run above, the first ADDFB2 with a modifier. On AMD it waits for the seat gates
+  `test-native-kms-modeset` / `test-native-present-e2e`, which use the linear form. The
   masterless AMD suite is unchanged by it: `make test-native-all` 75 passed, 0 failed, 2 skipped
   (DRM master), of 77 (`build/logs/test-native-all-blocklinear-20261116-180401.log`).
 
@@ -774,11 +818,11 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 29 suites, **7770 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 29 suites, **7803 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
   predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9
-  1024-id space). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  1024-id space; 7770 after block-linear scanout). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
   `test-raw-include` pass.

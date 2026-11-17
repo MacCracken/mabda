@@ -185,8 +185,9 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   kernels run on the TU116. 22 match every lane, including the return inside a loop and the
   9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `oob_label` is
   refused as on AMD. `loop_phi_f64`, refused at N9.5, runs since the N9 follow-ons' f64 item.
-- 🔨 **NVIDIA block-linear scanout + ADDFB2 format modifiers** (CHANGELOG [4.4.0]). It landed
-  with the layout verified on hardware; **the scanout itself awaits the seat run** (below).
+- ✅ **NVIDIA block-linear scanout + ADDFB2 format modifiers** (CHANGELOG [4.4.0]). Verified on
+  the TU116: the layout against the copy engine (masterless), and the scanout from chew's console
+  on 2026-11-16 (2560×1440, h=4; both phases rendered identically to the maintainer).
   - **Scope, chosen 2026-11-16: swizzle at present.** configure takes two block-linear VRAM FBs:
     kind 0x06, ADDFB2 with `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)` and
     NVK's block height.
@@ -199,7 +200,7 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - Found on the way and fixed: ADDFB2's `drm_mode_fb_cmd2` was 4 bytes short, with `modifier`
     unaligned.
   - Not in this scope: block-linear render targets and textures (a zero-copy present), and a
-    copy-engine present to take the swizzle off the CPU.
+    copy-engine present to take the swizzle off the CPU (about 15 ms a frame at 1440p).
 - **The seat-only HW closeout** — gates skipped at every release because they need a person at a
   seat (a VT with no compositor, `chew`'s console). Each target first writes its whole output to
   `build/logs/<gate>-<timestamp>.log` (the `test-surface-wayland-e2e` recipe is the template); the
@@ -211,18 +212,21 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - `chew`'s five card-node gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
     surface-present-e2e). Since the block-linear item, `surface-present-e2e` runs block-linear
     then forced linear on a test card. **The two phases must look identical, and the log must
-    say phase 1 was BLOCK-LINEAR** (exit 7 means the kernel refused it). The first attempt
-    (2026-11-16 18:32, `build/logs/nvidia_surface_present_e2e-20261116-183245.log` on chew)
-    ran from a terminal inside chew's Wayland desktop, so `SET_MASTER` was refused (-13, exit
-    2) before anything was configured. The run needs a text console with sddm stopped. Only this run proves
+    say phase 1 was BLOCK-LINEAR** (exit 7 means the kernel refused it). **Done for 4.4.0,
+    2026-11-16** (`build/logs/chew-nvidia_surface_present_e2e-20261116-183837.log`): block-linear
+    accepted, both phases identical on screen, exit 0. The first attempt ran from a terminal
+    inside chew's Wayland desktop and was refused master (exit 2). The run needs a text
+    console with sddm stopped. chew's other four card-node gates are still to run. Only this run proves
     the scanout and the ADDFB2 struct fix on NVIDIA; the AMD master gates above prove the fix
     on AMD;
   - the samvada live-bus run: `gpu_surface_configure_native_logind` with `samvada_native_init()`,
     built `-D MABDA_LOGIND`, from a seated session (samvada 1.1.0's `libsystemd` shim deletion
     waits on it).
-- **Fix: the older wgpu `gpu_surface_acquire` path leaks one texture reference per frame** (it
-  returns the frame's `WGPUTexture` and nothing releases it; noted in CHANGELOG [4.3.1]): release
-  it at `gpu_surface_present`, with a CPU test and an RSS check.
+- ✅ **Fix: the older wgpu `gpu_surface_acquire` path leaked one texture reference per frame**
+  (CHANGELOG [4.4.0]). It now releases the texture at `gpu_surface_present`, and resize and
+  release drop an unpresented one. CPU test: one release per frame over 1,000 frames, no heap
+  growth. RSS check on chew (NVK, Hyprland, `make test-surface-wayland-e2e`): 0 KiB over 1,800
+  frames, against about 2 MiB for a no-release control (about 1.15 KB a frame).
 - **The consumer check** — ranga's GPU suites against the bundle (4.3.1 ran only the fold
   name-collision scan: 0 shared function names with ranga or soorat). Partly run during N9.6
   against the in-progress bundle, in a scratch clone of ranga@de54123:

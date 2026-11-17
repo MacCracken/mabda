@@ -12,7 +12,15 @@
 #   - resolves a 4x MSAA target into a frame (gpu_pass_desc_color_resolve);
 #   - resizes, acquires at the new size;
 #   - reconfigures GPU_PRESENT_AUTO_VSYNC and presents 5 frames;
-#   - releases the surface.
+#   - releases the surface;
+#   - (4.4.0) the OLDER path's leak check: a new WGPUSurface through
+#     gpu_surface_configure_wgpu (RGBA8, FIFO), 300 warm-up frames, then the resident set
+#     across 1800 gpu_surface_acquire + gpu_surface_present frames (which now release the frame
+#     texture), then across 1800 raw get_current_texture + present frames that release
+#     nothing (the control: what the old leak looks like here). Skipped, by name, when the
+#     surface does not list RGBA8. These ~65 s of frames are never drawn into, so the window
+#     shows UNDEFINED contents (stale memory: flicker, garbage, leftover colour) by design; the
+#     check is the resident set, not the picture.
 # Needs a Wayland compositor (WAYLAND_DISPLAY): without one it prints SKIP and exits 0.
 # Linked with deps/wgpu_main.c via `make test-surface-wayland-e2e`.
 include "src/lib.cyr"
@@ -506,6 +514,94 @@ fn _check_surface(ctx): i64 {
     return 0;
 }
 
+# Resident set (KiB) from /proc/self/statm (field 2, pages).
+fn _rss_kb(): i64 {
+    var fd = syscall(2, "/proc/self/statm", 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var b[128];
+    memset(&b, 0, 128);
+    syscall(0, fd, &b, 127);
+    syscall(3, fd);
+    var i = 0;
+    while (load8(&b + i) != 32) { i = i + 1; if (i > 120) { return 0 - 1; } }
+    i = i + 1;
+    var v = 0;
+    while (load8(&b + i) >= 48) {
+        if (load8(&b + i) > 57) { break; }
+        v = v * 10 + (load8(&b + i) - 48);
+        i = i + 1;
+    }
+    return v * 4;
+}
+
+var LEGACY_WARM = 300;
+var LEGACY_FRAMES = 1800;
+var LEGACY_MAX_GROWTH_KB = 256;   # ~145 bytes a frame of noise allowed over 1800 frames
+
+# 4.4.0 — the older gpu_surface_acquire path released nothing: one texture reference a frame.
+fn _check_legacy_rss(ctx): i64 {
+    gpu_error_clear();
+    if (gpu_surface_create_wayland(ctx, _display, _surface) != 0) { return _fail("older path: a second WGPUSurface"); }
+    var handle = gpu_ctx_wgpu_surface_handle(ctx);
+    var caps = gpu_surface_caps_new();
+    if (gpu_surface_capabilities(ctx, caps) != 0) { return _fail("older path: capabilities"); }
+    if (gpu_surface_caps_has_format(caps, MABDA_TEXFMT_RGBA8) == 0) {
+        _e2e_line(1, "SKIP: ", "older path's leak check: the surface does not list RGBA8 (that path's fixed format)");
+        wgpu_surface_release(handle);
+        gpu_ctx_set_wgpu_surface_handle(ctx, 0);
+        return 0;
+    }
+    var w = 640;
+    var h = 480;
+    if (_top_w > 0) { w = _top_w; }
+    if (_top_h > 0) { h = _top_h; }
+    var ls = gpu_surface_configure_wgpu(ctx, handle, w, h);
+    if (ls == 0) { return _fail("gpu_surface_configure_wgpu (RGBA8, FIFO)"); }
+    _e2e_line(1, "INFO: ", "older path's leak check: ~65 s of frames that are never drawn into, so the window");
+    _e2e_line(1, "      ", "shows undefined contents (flicker / garbage / leftover colour) until it closes");
+    var i = 0;
+    while (i < LEGACY_WARM) {
+        if (gpu_surface_acquire(ctx, ls) == 0) { return _fail("older path: acquire (warm-up)"); }
+        if (gpu_surface_present(ctx, ls) != 0) { return _fail("older path: present (warm-up)"); }
+        _pump();
+        i = i + 1;
+    }
+    var r0 = _rss_kb();
+    i = 0;
+    while (i < LEGACY_FRAMES) {
+        if (gpu_surface_acquire(ctx, ls) == 0) { return _fail("older path: acquire"); }
+        if (gpu_surface_present(ctx, ls) != 0) { return _fail("older path: present"); }
+        _pump();
+        i = i + 1;
+    }
+    var r1 = _rss_kb();
+    # the control: what the pre-4.4.0 path did, a texture reference a frame never released
+    var st[24];
+    i = 0;
+    while (i < LEGACY_FRAMES) {
+        memset(&st, 0, 24);
+        wgpu_surface_get_current_texture(handle, &st);
+        wgpu_surface_present(handle);
+        _pump();
+        i = i + 1;
+    }
+    var r2 = _rss_kb();
+    _info_int("    older path, RSS before (KiB): ", r0);
+    _info_int("    RSS growth over the frames, releasing (KiB): ", r1 - r0);
+    _info_int("    RSS growth over the control frames, not releasing (KiB): ", r2 - r1);
+    gpu_surface_release(ctx, ls);
+    if (r1 - r0 > LEGACY_MAX_GROWTH_KB) {
+        return _fail("older path: the resident set grew past 256 KiB over 1800 acquire + present frames");
+    }
+    _pass("older path: 1800 gpu_surface_acquire + gpu_surface_present frames, flat resident set");
+    if (r2 - r1 > r1 - r0) {
+        _pass("the control (no release) grew more: the check sees the leak the fix removed");
+    } else {
+        _e2e_line(1, "INFO: ", "the control did not grow more: RSS does not resolve one reference a frame here");
+    }
+    return 0;
+}
+
 fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     wgpu_ffi_init_table(fn_table_ptr);
     var res_tag, res = gpu_context_from_preinit(preinit_ptr);
@@ -519,6 +615,7 @@ fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
     if (wr < 0) { return 1; }
     if (wr == 0) { return 0; }
     if (_check_surface(ctx) != 0) { return 1; }
+    if (_check_legacy_rss(ctx) != 0) { return 1; }
     fncall1(_wl_display_disconnect, _display);
     _e2e_summary();
     return 0;

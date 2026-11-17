@@ -154,8 +154,9 @@ block-linear one:
 
 Linear stays as the fallback whenever the kernel refuses any part of the
 block-linear path. The layout is checked against the copy engine
-(`test-nvidia-blocklinear-e2e`); the scanout's proof is the seat run of
-`test-nvidia-surface-present-e2e`. See CHANGELOG [4.4.0].
+(`test-nvidia-blocklinear-e2e`). The scanout passed its seat run of
+`test-nvidia-surface-present-e2e` on the TU116 (2026-11-16, 2560×1440). See
+CHANGELOG [4.4.0].
 
 ### GSP firmware policy — accept as the amdgpu-microcode class (consumer-provided runtime dependency)
 

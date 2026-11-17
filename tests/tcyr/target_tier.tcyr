@@ -107,7 +107,9 @@ fn _mt_get_bgl(p, i): i64 { _mt_bgl_get = _mt_bgl_get + 1; return 0xB6; }
 fn _mt_create_bg(device, desc): i64 { _mt_bg_n = _mt_bg_n + 1; return 0xBB; }
 fn _mt_set_bg(p, g, bg, n, o): i64 { return 0; }
 fn _mt_configure(surface, cfg): i64 { memcpy(_mt_cfg, cfg, 64); _mt_cfg_n = _mt_cfg_n + 1; return 0; }
+var _mt_cur_n = 0;
 fn _mt_current(surface, out): i64 {
+    _mt_cur_n = _mt_cur_n + 1;
     store64(out + 8, 0x5A);
     store32(out + 16, _mt_cur_status);
     return 0;
@@ -253,7 +255,7 @@ fn test_constants() {
     assert_eq(GPU_PASS_DESC_SIZE, GPU_PASS_OFF_COLORS + GPU_PASS_MAX_COLORS * GPU_PASS_COLOR_SIZE,
       "pass desc size covers 8 attachments");
     assert_eq(WGPU_TEX_SIZE, 80, "texture record 80 B");
-    assert_eq(WGPU_SURFACE_STATE_SIZE, 80, "surface record 80 B");
+    assert_eq(WGPU_SURFACE_STATE_SIZE, 88, "surface record 88 B (+80: the older path's frame, 4.4.0)");
     assert(_WGPU_RS_MODULES + 8 <= _WGPU_RS_SIZE, "render state holds the dispatch cache pointer");
     assert(_WGPU_RS_COLOR_ATTS + 8 * 72 <= _WGPU_RS_BEGIN_ARGS, "8 colour attachments fit before the begin args");
     assert(_WGPU_RS_DEPTH_ATT + 48 <= _WGPU_RS_BLIT, "depth attachment fits");
@@ -978,6 +980,95 @@ fn test_wgpu_surface_bytes() {
     return 0;
 }
 
+# 4.4.0 — the older gpu_surface_configure_wgpu / gpu_surface_acquire path: the texture it
+# hands out each frame is released at present (it leaked one reference a frame since v3).
+fn test_wgpu_legacy_surface_frames() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    backend_set_slot(&be, BACKEND_SLOT_SURFACE_CONFIGURE, &_backend_wgpu_surface_configure);
+    backend_set_slot(&be, BACKEND_SLOT_SURFACE_ACQUIRE, &_backend_wgpu_surface_acquire);
+    _mt_cur_status = 1;
+    var s = gpu_surface_configure_wgpu(&ctx, 0x5F, 64, 32);
+    assert_nonnull(s, "an older-path surface");
+    assert_eq(load64(s + 56), 0, "kind 0 (surface_state_new)");
+    _mt_cur_n = 0;
+    _mt_tex_release = 0;
+    _mt_present = 0;
+    assert_eq(gpu_surface_acquire(&ctx, s), 0x5A, "the frame texture");
+    assert_eq(load64(s + 80), 0x5A, "held until present");
+    assert_eq(gpu_surface_acquire(&ctx, s), 0x5A, "a second acquire: the same texture");
+    assert_eq(_mt_cur_n, 1, "and wgpu was asked once");
+    assert_eq(gpu_surface_present(&ctx, s), 0, "presented");
+    assert_eq(_mt_present, 1, "wgpuSurfacePresent");
+    assert_eq(_mt_tex_release, 1, "the frame texture released after the present");
+    assert_eq(load64(s + 80), 0, "nothing held");
+    # 1000 frames: one release a frame, no heap growth (the acquire's 24-byte bump allocation is gone)
+    var before = alloc_used();
+    var i = 0;
+    while (i < 1000) {
+        gpu_surface_acquire(&ctx, s);
+        gpu_surface_present(&ctx, s);
+        i = i + 1;
+    }
+    assert_eq(_mt_tex_release, 1001, "1000 frames, 1000 more releases");
+    assert_eq(alloc_used() - before, 0, "1000 frames allocate 0 bytes");
+    assert_eq(gpu_surface_present(&ctx, s), 0, "a present with no frame acquired");
+    assert_eq(_mt_tex_release, 1001, "releases nothing");
+    # a failed acquire holds nothing and releases what wgpu returned with it
+    _mt_cur_status = 4;
+    _mt_tex_release = 0;
+    assert_eq(gpu_surface_acquire(&ctx, s), 0, "outdated: no frame");
+    assert_eq(load64(s + 80), 0, "nothing held");
+    assert_eq(_mt_tex_release, 1, "the failed acquire's texture released");
+    _mt_cur_status = 1;
+    # resize and release drop an unpresented frame
+    _mt_tex_release = 0;
+    gpu_surface_acquire(&ctx, s);
+    assert_eq(surface_state_resize(s, 32, 16), 0, "resized");
+    assert_eq(_mt_tex_release, 1, "resize released the unpresented frame");
+    assert_eq(load64(s + 80), 0, "and holds nothing");
+    gpu_surface_acquire(&ctx, s);
+    gpu_surface_release(&ctx, s);
+    assert_eq(_mt_tex_release, 2, "release dropped the unpresented frame");
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
+# gpu_surface_acquire on a gpu_surface_configure surface takes the frame record's texture,
+# which its present releases once (4.4.0: it used to acquire a second reference nothing freed).
+fn test_wgpu_surface_acquire_on_configured_surface() {
+    var table[664];
+    var ctx[208];
+    var be[1024];
+    _mt_install(&table);
+    _mt_ctx(&ctx, &be);
+    backend_set_slot(&be, BACKEND_SLOT_SURFACE_ACQUIRE, &_backend_wgpu_surface_acquire);
+    _caps_fill(_mt_caps, 1, 0x1B, 0, 1, GPU_PRESENT_FIFO, 0, 0, 0x10);
+    _mt_cur_status = 1;
+    assert_eq(gpu_surface_create_wayland(&ctx, 0x1, 0x2), 0, "wayland surface");
+    var s = gpu_surface_configure(&ctx, 64, 32, MABDA_TEXFMT_BGRA8, GPU_PRESENT_FIFO);
+    assert_nonnull(s, "configured");
+    _mt_cur_n = 0;
+    _mt_tex_release = 0;
+    _mt_view_release = 0;
+    assert_eq(gpu_surface_acquire(&ctx, s), 0x5A, "gpu_surface_acquire: the frame record's texture");
+    assert_eq(load64(load64(s + 64)), 0x5A, "the frame record holds it");
+    assert_eq(load64(s + 80), 0, "not the older path's field");
+    assert_eq(gpu_surface_acquire(&ctx, s), 0x5A, "again: the same frame");
+    assert_eq(_mt_cur_n, 1, "one wgpu acquire");
+    assert_eq(gpu_surface_present(&ctx, s), 0, "presented");
+    assert_eq(_mt_tex_release, 1, "the texture released once");
+    assert_eq(_mt_view_release, 1, "and its view");
+    gpu_surface_release(&ctx, s);
+    assert_eq(_mt_wrong, 0, "no wrong slot");
+    _mt_uninstall();
+    return 0;
+}
+
 # ---------------------------------------------------------------------------
 # native subset fillers
 # ---------------------------------------------------------------------------
@@ -1032,6 +1123,8 @@ fn main() {
     test_wgpu_compute_bytes();
     test_surface_caps();
     test_wgpu_surface_bytes();
+    test_wgpu_legacy_surface_frames();
+    test_wgpu_surface_acquire_on_configured_surface();
     test_native_target_subset();
     return assert_summary();
 }
