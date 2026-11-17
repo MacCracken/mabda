@@ -138,20 +138,25 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     - A target-aware lowering: `OpFDiv` is one `MIR_OP_FDIV` for SM75. f32 divides on NVIDIA's
       f64 reciprocal fast path. f64 is full range and branch-free, subnormals and specials
       included.
-    - A 1024-id MIR space for SM75 (`mir_mod_init_wide`).
+    - A 1024-id MIR space for SM75 (GFX9 took the same space next: the item below).
     - A cross-vendor IEEE oracle: `make test-{native,nvidia}-f64-kernels-e2e`, 15 kernels and
       512 lanes, bit-exact on both GPUs.
 
     `loop_phi_f64` runs on the TU116, and so does ranga's bilinear resize (the twelfth ranga
     kernel). HW-verified: the 16 masterless gates, control flow 26 + 1 refusal, ranga 12 of 12.
-- **GFX9's 256-id cap** (found by the item above, 2026-11-16). ranga's `gk_resize_bilinear`
-  (201 SPIR-V ids plus the lowering's temporaries) is refused on AMD with `MIR_ERR_ID_OOR`, as
-  ranga's `gpu_pipeline.cyr` notes ("reason -25"). It runs on NVIDIA since SM75 got a 1024-id
-  space. GFX9 is held at `MIR_MAX_CAP_IDS = 256` by `gfx9_regalloc`'s `RA_MAX_REGS` scratch and
-  the per-id file maps in `gfx9_compile` / `gfx9_waitcnt`. **Done when** those are sized from
-  their buffers like SM75's, `gfx9_compile` uses `mir_mod_init_wide`, and bilinear matches its
-  golden on the Cezanne (flip `GFX9_REFUSE` in `scripts/gen-spirv-ranga-fixtures.py`; the AMD
-  gate fails loudly once GFX9 compiles it).
+- ✅ **GFX9's 256-id cap** (found by the item above, 2026-11-16; CHANGELOG [4.4.0]). ranga's
+  `gk_resize_bilinear` (201 SPIR-V ids plus the lowering's temporaries) was refused on AMD with
+  `MIR_ERR_ID_OOR`, which is ranga's "reason -25". It was never register pressure: it compiles in
+  16 VGPRs.
+  - There is one ceiling now, `MIR_MAX_CAP_IDS` = 1024, for both back ends. The SPIR-V id bound
+    stays at 256.
+  - `gfx9_isel`, `gfx9_waitcnt` and `gfx9_emit_program` size their per-id tables for 1024, and
+    `CMP_ISEL_CAP` is 1024.
+  - The AMD compile frame is split in two to fit Cyrius's frame budget.
+  - Every other kernel compiles byte-identical.
+
+  HW-verified: on the Cezanne, `test-native-all` 75 / 0 / 2 skipped and bilinear at its golden
+  (the same hash as the TU116's); on the TU116, the 16 gates.
 - ✅ **The scratch-buffer contract** — landed (uncommitted; CHANGELOG [4.4.0]). Every compiler
   buffer now carries its byte length and each stage derives its capacity from it: `mir_mod_init`,
   the table builders, `_spirv_resolve_builtins` / `spirv_lower_module`, `gfx9_isel`,
@@ -220,7 +225,9 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   NVIDIA, ranga's bilinear resize now compiles. So `tests/gpu_kernels.tcyr`'s pinned "cannot yet
   lower it … flip this when it can" assertion fails there (52 of 53;
   `build/logs/nvidia-ranga-fdiv-20261116-162252.log`), and `gpu_resize` could take
-  `SF_BILINEAR` on an NVIDIA context. AMD still refuses it (the GFX9 256-id item above).
+  `SF_BILINEAR` on an NVIDIA context. Since the GFX9 256-id item above, the same holds on AMD:
+  the row fails there too (52 of 53, `build/logs/ranga-gpu-suites-amd-gfx9ids-20261116-173352.log`)
+  and bilinear matches its golden on both backends.
 
   Also for ranga, low priority: its SPIR-V is version 1.3 but lists storage buffers in
   `OpEntryPoint`, a 1.4 rule. mabda accepts it; `spirv-val` and naga would not.

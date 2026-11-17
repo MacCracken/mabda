@@ -19,11 +19,12 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   `backend_nvidia.cyr` wires it into `gpu_shader_module_create_spirv`. On the TU116:
   - `test-nvidia-spirv-compute-e2e`: 26 of the 27 control-flow kernels match every lane
     (`oob_label` is refused by name);
-  - `test-nvidia-ranga-kernels-e2e`: ranga's 12 kernels match (bilinear since the f64 work;
-    AMD refuses bilinear by name, the GFX9 256-id item);
+  - `test-nvidia-ranga-kernels-e2e`: ranga's 12 kernels match (bilinear since the f64 work, and
+    on AMD since the 1024-id MIR space);
   - `test-nvidia-f64-kernels-e2e`: the f64 corpus, 512 lanes bit-exact against the IEEE oracle;
   - ranga's four GPU suites pass with an NVIDIA context (in a scratch clone), except
-    `gpu_kernels`' "flip this when it can" bilinear row, which is ranga's to flip.
+    `gpu_kernels`' "flip this when it can" bilinear row, which is ranga's to flip (it fails on
+    AMD too now that GFX9 compiles bilinear).
 
   ranga's kernels are vendored in `tests/spirv/ranga/`. Their goldens come from the SPIR-V
   interpreter in `scripts/gen-spirv-ranga-fixtures.py` (`make check-ranga-fixtures`).
@@ -38,7 +39,6 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
-  - GFX9's 256-id cap: ranga's bilinear is refused on AMD (new, from the f64 work).
   - NVIDIA block-linear scanout.
   - The surface-acquire leak.
   - The seat-only closeout.
@@ -208,8 +208,10 @@ Consumers:
 - A fn's local arrays share a frame budget of about 120 KB (15360 slots of 8 bytes). Past it, a
   local array silently gets STATIC storage, with only a build warning (shared and not re-entrant).
   Split a big frame across two fns, as `sm75_compile_spirv` / `_sm75_compile_back` do.
-- SM75 compiles in a 1024-id MIR space (`mir_mod_init_wide`); GFX9 must stay on `mir_mod_init`
-  (256) until its regalloc scratch and file maps are sized from their buffers.
+- The MIR id space is `MIR_MAX_CAP_IDS` (1024) on both back ends; the SPIR-V id bound is 256
+  (`NATIVE_SHADER_CAP_IDS`); `RA_MAX_REGS` (256) is the register file. A refusal names which
+  limit it hit: `MIR_ERR_ID_OOR` is ids, `RA_ERR_{V,S}GPR_OVERFLOW` is registers. Measure before
+  restructuring a kernel: bilinear was misread as register pressure for two releases.
 - Test fake function tables must be `WGPU_FN_COUNT x 8` bytes (664 at 83 slots).
 - A new `src/` module goes in **both** `src/lib.cyr` and `cyrius.cyml`'s `[lib].modules`, or distlib
   silently leaves it out.

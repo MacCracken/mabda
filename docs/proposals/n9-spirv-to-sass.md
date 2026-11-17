@@ -255,8 +255,8 @@ the plan written here.
 - **f64.** Its own full-range, branch-free sequence, which normalizes the operands, forms the
   exact residual and rounds subnormal quotients with the residual's sign breaking ties.
 - **The id space.** One f64 division is about 140 MIR ids, so SM75 compiles in a 1024-id space
-  (`mir_mod_init_wide`). That also lets ranga's bilinear resize compile for NVIDIA. GFX9 refuses
-  it at 256 ids, which is now a 4.4.0 roadmap item.
+  (`MIR_MAX_CAP_IDS`, which GFX9 then took too). That also lets ranga's bilinear resize compile,
+  first for NVIDIA, then for GFX9.
 - **The status line above** is N9's own. Since the follow-on, `loop_phi_f64` runs on the TU116
   (26 of 27 control-flow kernels exact), and ranga's corpus is 12 of 12.
 

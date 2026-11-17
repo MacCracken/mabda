@@ -216,16 +216,17 @@ var MIR_ERR_MOD_UNINIT       = 30;   # MirMod header reads uninitialized/corrupt
 var MIR_ERR_VALS_OVERRUN     = 31;   # mir_mod_init's vals[] memset overran and clobbered the header
 var MIR_ERR_BAD_INIT         = 32;   # mir_mod_init rejected its arguments (null / short buf, id_bound)
 
-# Ceiling on cap_ids. Mirrors gfx9_regalloc's RA_MAX_REGS: the regalloc free-at
-# scratch and the gfx9_compile/gfx9_waitcnt per-id file-maps are all sized for
-# 256 ids. mir_mod_init clamps the cap it derives from vals_len to this (since
-# 4.4.0; before, a cap_ids above it was rejected), so a larger vals[] is legal
-# and its excess is never touched.
-var MIR_MAX_CAP_IDS          = 256;
-# The wider ceiling for a back end whose every id-indexed table is sized from its own buffers
-# (SM75: sm75_regalloc's alloc[], keyed by <id>; its label tables stay keyed by SPIR-V ids, which
-# are < 256): synthesized temporaries need the room (one f64 OpFDiv expands to ~140). 4.4.0.
-var MIR_MAX_CAP_IDS_WIDE     = 1024;
+# Ceiling on cap_ids: the per-id tables inside the back ends are sized for it (gfx9_isel's label
+# tables, gfx9_waitcnt's outstanding-load map, gfx9_emit_program's file map and label offsets;
+# SM75's stages size theirs from the caller's buffers). mir_mod_init clamps the cap it derives
+# from vals_len to this (since 4.4.0; before, a cap_ids above it was rejected), so a larger vals[]
+# is legal and its excess is never touched.
+# 1024 since 4.4.0 (was 256). The SPIR-V ids themselves stay under 256 (the type / const /
+# decoration tables, NATIVE_SHADER_CAP_IDS); the room above them is for the lowering's
+# synthesized temporaries: one f64 OpFDiv on SM75 is about 140, and ranga's bilinear resize
+# (201 SPIR-V ids) needed more than 256 on GFX9. It is NOT the register file: RA_MAX_REGS (256)
+# is gfx9_regalloc's per-register scratch, an independent limit.
+var MIR_MAX_CAP_IDS          = 1024;
 
 # Record sizes (bytes). One i64 per field — no bit-packing of load-bearing
 # fields (uniformity especially). The instr/ptr records pack two <id>/flag
@@ -281,28 +282,16 @@ var MIR_CB_MOVES_ON_FALSE = 0x20000;
 # leaves the module unusable and every later stage reports a downstream symptom
 # instead of this cause.
 fn mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
-    return _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
-      id_bound, MIR_MAX_CAP_IDS);
-}
-
-# mir_mod_init with MIR_MAX_CAP_IDS_WIDE (1024) in place of 256 (see that constant): for SM75.
-fn mir_mod_init_wide(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound): i64 {
-    return _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
-      id_bound, MIR_MAX_CAP_IDS_WIDE);
-}
-
-fn _mir_mod_init_cap(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len, id_bound, maxcap): i64 {
     if (m == 0)      { return 0 - MIR_ERR_BAD_INIT; }
     if (vals == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (instrs == 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (ptrs == 0)   { return 0 - MIR_ERR_BAD_INIT; }
     if (blocks == 0) { return 0 - MIR_ERR_BAD_INIT; }
     if (blocks_len < MIR_BLOCK_REC) { return 0 - MIR_ERR_BAD_INIT; }
-    # A buffer longer than the ceiling every later stage is sized for (the
-    # regalloc and file-map scratch hold RA_MAX_REGS = 256 ids) keeps its excess
-    # unused; it is not an error.
+    # A buffer longer than the ceiling every later stage is sized for
+    # (MIR_MAX_CAP_IDS) keeps its excess unused; it is not an error.
     var cap_ids = vals_len / MIR_VAL_REC;
-    if (cap_ids > maxcap) { cap_ids = maxcap; }
+    if (cap_ids > MIR_MAX_CAP_IDS) { cap_ids = MIR_MAX_CAP_IDS; }
     var cap_instrs = instrs_len / MIR_INSTR_REC;
     var cap_ptrs = ptrs_len / MIR_PTR_REC;
     if (cap_ids <= 0)    { return 0 - MIR_ERR_BAD_INIT; }

@@ -16,7 +16,7 @@ for the immediate forward pointer.
 ## [4.4.0] — in progress (VERSION still reads 4.3.1)
 
 **Compilers + NVIDIA** ([roadmap](docs/development/roadmap.md#v440--compilers--nvidia)). Landed
-so far, both in the native AMD SPIR-V compiler:
+so far in the native AMD SPIR-V compiler:
 - **The scratch-buffer contract.** Every compiler buffer now arrives with its length in bytes, and
   each stage derives its capacity from that length. Moving the call sites over turned up three
   real overruns, one in the path that compiles consumer SPIR-V.
@@ -30,6 +30,8 @@ so far, both in the native AMD SPIR-V compiler:
   select never worked through the real pipeline, and a crafted label id crashed the compile frame.
   All of these are fixed, and each is pinned by a kernel the new hardware gate checks lane by
   lane.
+- **A 1024-id MIR space** (was 256), shared with NVIDIA. ranga's bilinear resize, refused with
+  `MIR_ERR_ID_OOR` until now, compiles and matches its golden.
 
 The remaining 4.4.0 items are open and tracked in the roadmap. "The same in N9's SM75 path" is
 done in N9.5, below, and f64 (refused on NVIDIA at N9.5) landed with the fourth N9 follow-on.
@@ -531,21 +533,20 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   Every IEEE special pair is in the oracle.
 - **The wide id space.** One f64 division expands to about 140 MIR ids, so a kernel with two of
   them overflowed the 256-id space (`MIR_ERR_ID_OOR`).
-  - SM75 now uses `mir_mod_init_wide` (1024 ids, `MIR_MAX_CAP_IDS_WIDE`). Its stages are sized
+  - SM75 got a 1024-id space first, through a separate `mir_mod_init_wide`. Its stages are sized
     from their own buffers.
-  - GFX9 keeps 256, because its register allocator and file maps are sized for 256.
+  - GFX9 kept 256 at first, because its selection, waitcnt and encoder tables were sized for 256
+    ids. The next section widens those and folds both inits into one 1024-id `MIR_MAX_CAP_IDS`.
   - `sm75_compile_spirv`'s frame is split in two: `_sm75_compile_back` holds the selection
     records and the register map. Each half stays under Cyrius's per-fn frame budget (about
     120 KB; past it a local array silently becomes static storage, with a warning).
   - The label tables stay keyed by SPIR-V `OpLabel` ids, which are below the id bound (≤ 256).
-  - `check-compiler-buffer-sizing.py` checks `mir_mod_init_wide` calls too, against the wider
-    ceiling.
 - **ranga's bilinear resize runs on NVIDIA.** `gk_resize_bilinear` was refused on both backends:
   its 201 ids plus temporaries pass 256. It now compiles for SM75 and is the twelfth ranga kernel
   (`tests/spirv/ranga/resize_bilinear.spv`: ranga de54123's bytes; the other eleven re-dumped
-  byte-identical), with a golden from the generator's interpreter. GFX9 still refuses it, by name
-  (`rk_gfx9_refuse`: `MIR_ERR_ID_OOR`), and the AMD gate and the CPU suite expect exactly that
-  code. Widening GFX9's id space is a new 4.4.0 roadmap item.
+  byte-identical), with a golden from the generator's interpreter. GFX9 refused it by name
+  (`rk_gfx9_refuse`: `MIR_ERR_ID_OOR`) until the next section, and the AMD gate and the CPU
+  suite expected exactly that code.
 - **The IEEE oracle.** `scripts/gen-f64-fixtures.py` writes `tests/tcyr/f64_cases.cyr`:
   - 15 kernels: fma, arith, cvt, subabs, vec, sqrt, i32_cvt, const, ldexp, select, f32_div,
     div, div_b, div2 (two chained divisions) and store_const;
@@ -567,7 +568,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - `sm75_encode.tcyr` (121 assertions): the f64 goldens.
   - `sm75_isel.tcyr` (138): `test_sm75_isel_fdiv` (one `MIR_OP_FDIV` under the SM75 target,
     none under GFX9, the expansions' shape, div2 failing in 256 ids and selecting in 1024) and
-    `test_mir_mod_init_wide`.
+    `test_mir_mod_init_wide` (folded into `compiler_lower.tcyr`'s clamp test in the next
+    section).
   - `sm75_compile.tcyr` (359): the f64 corpus and div2 under the schedule checker, bilinear's
     GFX9 refusal code, and the target restored after a lowering refusal. The backend's
     "refusals keep the selector's code" case moved to a binding past the 16-pointer bank.
@@ -585,11 +587,61 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   ranga 12 of 12 (bilinear refused as expected), and the f64 division, f32 division, layernorm,
   compute-store and SAXPY gates.
 
+### Changed — one 1024-id MIR space, GFX9 included (found by the fourth follow-on)
+- **What it fixes.** GFX9 refused ranga's bilinear resize with `MIR_ERR_ID_OOR`: its 201
+  SPIR-V ids plus the lowering's temporaries passed the 256-id MIR space. It now compiles in
+  16 VGPRs and matches its golden on the Cezanne, with the same output hash as the TU116 and the
+  interpreter (`0x784d2538b784a2e0`). ranga's notes recorded the refusal as "reason -25", but
+  `gfx9_regalloc`'s header (4.0.11) blamed it on register liveness. The measurement says ids,
+  and the header is corrected.
+- **One ceiling.**
+  - `MIR_MAX_CAP_IDS` is 1024 (was 256), and `mir_mod_init` clamps to it.
+  - `mir_mod_init_wide` and `MIR_MAX_CAP_IDS_WIDE`, added for SM75 in the previous section, are
+    gone, because both back ends now take the same space.
+  - The SPIR-V id bound stays at 256 (`NATIVE_SHADER_CAP_IDS`): the type, constant, decoration
+    and builtin tables are keyed by SPIR-V ids.
+  - `RA_MAX_REGS` (256) is the register file, a separate limit, and is unchanged.
+- **The GFX9 tables**, now `MIR_MAX_CAP_IDS` entries each:
+  - `gfx9_isel`'s four label tables;
+  - `gfx9_waitcnt`'s outstanding-load map;
+  - `gfx9_emit_program`'s VGPR file map and label offsets.
+
+  Each stage refuses a module above the ceiling with its existing code. `CMP_ISEL_CAP` is 1024
+  (was 256). `gfx9_waitcnt` now bounds its operand lookups by `cap_ids` (`_wc_out` /
+  `_wc_mark`) instead of trusting every operand to be an id.
+- **The compile frames.**
+  - `_native_compile_spirv_isa` holds 1024 MIR values and 1024 MIR instructions (was 256 and
+    512).
+  - It splits the way SM75's frame does: `_native_compile_back` holds the two selected lists
+    and the register map, so each half stays under Cyrius's per-fn frame budget.
+  - `sm75_compile_spirv` gets 1024 MIR instructions too.
+- **Nothing else moved.** Against `0854346`, every other kernel in the corpus compiles to
+  byte-identical GFX9 ISA and RSRC words and identical SM75 SASS: ranga's 11, the 27
+  control-flow kernels, the 15 f64 kernels, SAXPY and 100 access chains.
+- **Tests.**
+  - `test_gfx9_wide_id_space` (`compiler_compile.tcyr`): a 256-id frame refuses bilinear with
+    `MIR_ERR_ID_OOR`, and the production frame compiles it in 16 VGPRs or fewer.
+  - The ranga corpus test expects GFX9 to compile all twelve, and `GFX9_REFUSE` in the ranga
+    generator is empty.
+  - The cap tests use `MIR_MAX_CAP_IDS + 1`.
+  - The clamp test uses a 1025-record buffer and takes over `test_mir_mod_init_wide`'s asserts.
+- **On the Cezanne.** Same boot as the 12:59 compute-ring reset below; these runs caused no new
+  reset.
+  - `make test-native-all`: 75 passed, 0 failed, 2 skipped (DRM master), of 77
+    (`build/logs/test-native-all-gfx9ids-20261116-173208.log`).
+  - ranga: 12 of 12, bilinear at its golden (`amd-ranga-gfx9ids-20261116-173352.log`).
+  - ranga's suites (`ranga-gpu-suites-amd-gfx9ids-20261116-173352.log`): `gpu` 48,
+    `gpu_pipeline` 102 and `gpu_spirv` 54. `gpu_kernels` passes 52 of 53. The one failure is
+    ranga's "flip this when it can" bilinear row, now due on both backends.
+- **On the TU116**: all 16 masterless gates pass
+  (`build/logs/chew-nv-gates-gfx9ids-20261116-173218.log`).
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
-  buffer's length divided by its record size. A `vals[]` longer than 256 records is clamped to
-  the 256-id ceiling; it was rejected before. A length shorter than one record is rejected.
+  buffer's length divided by its record size. A `vals[]` longer than the id ceiling (256 then;
+  `MIR_MAX_CAP_IDS` = 1024 since the GFX9 id-space change above) is clamped to it; it was
+  rejected before. A length shorter than one record is rejected.
 - `spirv_build_{type,const,decoration}_table(p, n, out, out_len)`: both `cap` and `id_bound`
   are gone. Each builder reads `id_bound` from the module header, as `gfx9_compile` always did,
   and returns -1 for a module shorter than a header. Dropping the argument is deliberate: with
@@ -646,10 +698,10 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7658 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 28 suites, **7661 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
-  predicate allocation; 7557 after BSSY / BSYNC). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
   `test-raw-include` pass.

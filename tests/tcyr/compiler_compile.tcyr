@@ -3,6 +3,7 @@
 # Fixtures + include chain live in compiler_common.cyr (shared across the compiler_*.tcyr).
 include "tests/tcyr/compiler_common.cyr"
 include "tests/tcyr/spirv_cf_kernels.cyr"
+include "tests/tcyr/spirv_ranga_kernels.cyr"
 
 # ================================================================
 # Phase N.5b-1 — compute ABI + RSRC wiring (gfx9_abi.cyr)
@@ -1156,6 +1157,32 @@ fn test_contract_many_access_chains() {
     return 0;
 }
 
+# 4.4.0 — GFX9 in the 1024-id MIR space. ranga's bilinear resize is 201 SPIR-V ids, and its
+# lowering's temporaries take the module past 256: the old ceiling refused it with
+# MIR_ERR_ID_OOR, which ranga's notes recorded as "reason -25". The production compile frame
+# now holds MIR_MAX_CAP_IDS, and the kernel needs only 16 VGPRs: it was never the register file.
+fn test_gfx9_wide_id_space() {
+    var spv[4352];      # >= RK_MAX_BYTES
+    var k = 0;
+    var bl = 0 - 1;
+    while (k < RK_COUNT) {
+        if (streq(rk_name(k), "resize_bilinear") == 1) { bl = k; }
+        k = k + 1;
+    }
+    assert_eq(bl >= 0, 1, "the fixture has resize_bilinear");
+    assert_eq(RK_MAX_BYTES <= 4352, 1, "it fits spv[]");
+    var n = rk_build(bl, &spv);
+    assert_eq(spirv_hdr_id_bound(&spv) <= NATIVE_SHADER_CAP_IDS, 1, "its SPIR-V ids fit 256");
+    var isa[16384];
+    assert_eq(_cc_compile_saxpy(&spv, n, 4096, 2048, 12288, 4096, &isa, 16384), 0 - MIR_ERR_ID_OOR,
+      "a 256-id frame refuses it (the old ceiling)");
+    var gd[48];
+    assert_eq(_native_compile_spirv_isa(&spv, n, &isa, 16384, &gd), 0, "the production frame compiles it");
+    assert_eq((load64(&gd + DESC_RSRC1) & 0x3F) <= 3, 1, "in 16 VGPRs or fewer");
+    assert_eq(load64(&gd + DESC_NUM_BINDINGS), 4, "ranga's four bindings");
+    return 0;
+}
+
 # Each remaining buffer, shortened alone, fails with its own stage's code.
 fn test_contract_short_buffers_fail_before_writing() {
     var spv[640];
@@ -1422,6 +1449,7 @@ fn main(): i64 {
     test_gfx9_abi_assign_2d();
     test_gfx9_cc_buf_layout();
     test_contract_many_access_chains();
+    test_gfx9_wide_id_space();
     test_contract_short_buffers_fail_before_writing();
     test_contract_short_tables();
     test_cf_kernels_compile_or_refuse();

@@ -996,16 +996,17 @@ var NATIVE_SHMOD_LOCALY  = 72;
 var NATIVE_SHMOD_LOCALZ  = 80;
 var NATIVE_SHMOD_SIZE    = 88;
 
-# Compile cap for shader-module-create: the id_bound / cap_ids ceiling the scratch in
-# _native_compile_spirv_isa is sized for. SPIR-V whose header id_bound exceeds it
-# fails loud (CMP_ERR_TABLE → this returns 0). 256 is the ARCHITECTURAL ceiling: the regalloc
-# free-at scratch + the gfx9_compile/gfx9_waitcnt per-id file-maps are sized for
-# RA_MAX_REGS=256, so cap_ids > 256 is rejected by those stages anyway. Raising it
-# further needs growing those internal scratch buffers (a deeper N.8 change).
+# Compile cap for shader-module-create: the SPIR-V id_bound ceiling the per-SPIR-V-id tables in
+# _native_compile_spirv_isa (types / consts / decorations / builtins) are sized for. SPIR-V
+# whose header id_bound exceeds it fails loud (CMP_ERR_TABLE → this returns 0). The MIR id
+# space above the SPIR-V ids, for the lowering's synthesized temporaries, is wider:
+# MIR_MAX_CAP_IDS (1024) since 4.4.0 (was 256, which refused ranga's bilinear resize: 201
+# SPIR-V ids plus temporaries).
 var NATIVE_SHADER_CAP_IDS = 256;
 
 # The compile half of _native_shader_compile_spirv: SPIR-V -> GFX9 ISA into `isa`
-# (`isa_len` bytes) + the DESC_* descriptor into `desc`, all scratch on this frame.
+# (`isa_len` bytes) + the DESC_* descriptor into `desc`, all scratch on this frame and
+# _native_compile_back's.
 # Pure CPU (no ctx, no ioctl), so tests/tcyr/native.tcyr drives it directly.
 # Returns 0 or gfx9_compile's negative stage code.
 #
@@ -1016,14 +1017,15 @@ var NATIVE_SHADER_CAP_IDS = 256;
 # ptrs[] on this stack. The sizing gate skipped this call because its arguments
 # were not literals.
 fn _native_compile_spirv_isa(words_ptr, byte_len, isa, isa_len, desc): i64 {
-    # --- scratch sized for NATIVE_SHADER_CAP_IDS = 256 ids ---
+    # --- the SPIR-V tables: NATIVE_SHADER_CAP_IDS = 256 SPIR-V ids ---
     var types[6144];     # 256 * SPIRV_TYPE_REC(24)
     var consts[4096];    # 256 * SPIRV_CONST_REC(16)
     var deco[4096];      # 256 * SPIRV_DECO_REC(16)
     var outbi[2048];     # 256 * 8
+    # --- the MIR: MIR_MAX_CAP_IDS = 1024 ids (the SPIR-V ids + the lowering's temporaries) ---
     var m[80];
-    var vals[10240];     # 256 * MIR_VAL_REC(40)
-    var instrs[16384];   # 512 * MIR_INSTR_REC(32)
+    var vals[40960];     # 1024 * MIR_VAL_REC(40)
+    var instrs[32768];   # 1024 * MIR_INSTR_REC(32)
     var ptrs[4096];      # 128 * MIR_PTR_REC(32)
     var blocks[32];      # one MIR_BLOCK_REC
     # mir_mod_init runs before gfx9_compile, so screen the module here the way
@@ -1035,26 +1037,33 @@ fn _native_compile_spirv_isa(words_ptr, byte_len, isa, isa_len, desc): i64 {
     if (idb > NATIVE_SHADER_CAP_IDS) { return 0 - CMP_ERR_TABLE; }
     # The MIR synth-id counter starts right after the SPIR-V ids (the header's
     # id_bound), so synthesized values (access-chain offsets, GID expansion) get
-    # fresh ids in [id_bound, 256).
-    var mr = mir_mod_init(&m, &vals, 10240, &instrs, 16384, &ptrs, 4096, &blocks, 32, idb);
+    # fresh ids in [id_bound, 1024).
+    var mr = mir_mod_init(&m, &vals, 40960, &instrs, 32768, &ptrs, 4096, &blocks, 32, idb);
     if (mr < 0) { return mr; }
-    var isel[12288];     # CMP_ISEL_CAP(256) * GISEL_REC(48)
-    var isel2[12288];
-    var alloc[4096];     # 256 * RA_REC(16)
-    var hw[16];
-    var abi[64];
     var cc[136];         # CC_SIZE
     gfx9_cc_buf(&cc, CC_TYPES, &types, 6144);
     gfx9_cc_buf(&cc, CC_CONSTS, &consts, 4096);
     gfx9_cc_buf(&cc, CC_DECO, &deco, 4096);
     gfx9_cc_buf(&cc, CC_OUTBI, &outbi, 2048);
-    gfx9_cc_buf(&cc, CC_ISEL, &isel, 12288);
-    gfx9_cc_buf(&cc, CC_ISEL2, &isel2, 12288);
-    gfx9_cc_buf(&cc, CC_ALLOC, &alloc, 4096);
     store64(&cc + CC_M, &m);
-    store64(&cc + CC_HW, &hw);
-    store64(&cc + CC_ABI, &abi);
-    return gfx9_compile(&cc, words_ptr, byte_len, isa, isa_len, desc);
+    return _native_compile_back(&cc, words_ptr, byte_len, isa, isa_len, desc);
+}
+
+# The back half of the compile frame: the selected lists and the register map, in a frame of
+# their own (one fn's arrays must stay under Cyrius's per-fn frame budget, ~120 KB, to stay on
+# the stack rather than in shared static storage; see the toolchain notes, D2b).
+fn _native_compile_back(cc, words_ptr, byte_len, isa, isa_len, desc): i64 {
+    var isel[49152];     # CMP_ISEL_CAP(1024) * GISEL_REC(48)
+    var isel2[49152];
+    var alloc[16384];    # 1024 * RA_REC(16)
+    var hw[16];
+    var abi[64];
+    gfx9_cc_buf(cc, CC_ISEL, &isel, 49152);
+    gfx9_cc_buf(cc, CC_ISEL2, &isel2, 49152);
+    gfx9_cc_buf(cc, CC_ALLOC, &alloc, 16384);
+    store64(cc + CC_HW, &hw);
+    store64(cc + CC_ABI, &abi);
+    return gfx9_compile(cc, words_ptr, byte_len, isa, isa_len, desc);
 }
 
 # Compile a SPIR-V compute kernel to GFX9 ISA, stage it in a fresh GTT BO mapped

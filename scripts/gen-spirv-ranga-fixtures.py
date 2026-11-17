@@ -3,9 +3,9 @@
 
 ranga (the AGNOS image-processing library) emits its twelve per-pixel compute kernels as SPIR-V
 (`ranga/src/gpu_kernels.cyr` through `ranga/src/gpu_spirv.cyr`) and hands them to
-`gpu_shader_module_create_spirv`. The first eleven are N9's done-when corpus; resize_bilinear
-joined with the SM75 wide id space (4.4.0, the fourth N9 follow-on). GFX9 still refuses it by name
-(GFX9_REFUSE below: MIR_ERR_ID_OOR, the 256-id cap; tracked in the roadmap's 4.4.0 section). Their exact bytes are vendored
+`gpu_shader_module_create_spirv`. The first eleven are N9's done-when corpus. resize_bilinear
+joined when SM75 got a 1024-id MIR space (4.4.0, the fourth N9 follow-on), and GFX9 has run it
+since its 256-id cap went the same way (4.4.0). Their exact bytes are vendored
 in tests/spirv/ranga/<name>.spv, with tests/spirv/ranga/PROVENANCE naming the ranga commit they
 came from, so mabda's CPU suite and hardware gates run them without a ranga checkout.
 
@@ -82,8 +82,10 @@ KERNELS = [
      (97, 53)),
 ]
 SHAPE = {"1buf": 1, "2buf": 2, "geom": 3}
-# Kernels the GFX9 back end refuses, with the MIR code (the AMD gate and the CPU suite expect it).
-GFX9_REFUSE = {"resize_bilinear": 25}     # MIR_ERR_ID_OOR: past the 256-id cap
+# Kernels the GFX9 back end refuses, with the stage's code (the AMD gate and the CPU suite
+# expect exactly that code). Empty since 4.4.0: resize_bilinear was MIR_ERR_ID_OOR (25) at the
+# old 256-id cap.
+GFX9_REFUSE = {}
 
 
 # ---------------------------------------------------------------- ranga → .spv

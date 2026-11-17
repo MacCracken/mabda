@@ -46,14 +46,27 @@ fn _wc_copy(src, i, dst, k): i64 {
 # 1 if instruction `i` reads a register operand that is an outstanding (un-waited)
 # load result; 0 otherwise. Immediate operands (flagged) and the load/store ptr
 # index are not register reads, so they never trigger a wait.
-fn _wc_uses_outstanding(src, i, outstanding): i64 {
+fn _wc_uses_outstanding(src, i, outstanding, cap_ids): i64 {
     var fl = gisel_flags(src, i);
-    var a = gisel_a(src, i);
-    var b = gisel_b(src, i);
-    var c = gisel_c(src, i);
-    if (a != 0) { if ((fl & MIR_FLAG_A_IMM) == 0) { if (load64(outstanding + a * 8) == 1) { return 1; } } }
-    if (b != 0) { if ((fl & MIR_FLAG_B_IMM) == 0) { if (load64(outstanding + b * 8) == 1) { return 1; } } }
-    if (c != 0) { if ((fl & MIR_FLAG_C_IMM) == 0) { if (load64(outstanding + c * 8) == 1) { return 1; } } }
+    if ((fl & MIR_FLAG_A_IMM) == 0) { if (_wc_out(outstanding, cap_ids, gisel_a(src, i)) == 1) { return 1; } }
+    if ((fl & MIR_FLAG_B_IMM) == 0) { if (_wc_out(outstanding, cap_ids, gisel_b(src, i)) == 1) { return 1; } }
+    if ((fl & MIR_FLAG_C_IMM) == 0) { if (_wc_out(outstanding, cap_ids, gisel_c(src, i)) == 1) { return 1; } }
+    return 0;
+}
+
+# outstanding[id], bounded: an operand outside (0, cap_ids) is never an outstanding load.
+fn _wc_out(outstanding, cap_ids, id): i64 {
+    if (id <= 0) { return 0; }
+    if (id >= cap_ids) { return 0; }
+    return load64(outstanding + id * 8);
+}
+
+# Mark a load's result outstanding (a result outside (0, cap_ids) is not tracked: it has no
+# register to wait on).
+fn _wc_mark(outstanding, cap_ids, id): i64 {
+    if (id <= 0) { return 0; }
+    if (id >= cap_ids) { return 0; }
+    store64(outstanding + id * 8, 1);
     return 0;
 }
 
@@ -72,8 +85,8 @@ fn _wc_emit_wait(dst, k, s): i64 {
 fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
     var cap_out = out_len / GISEL_REC;
     var cap_ids = load64(m + 64);
-    if (cap_ids > RA_MAX_REGS) { return 0 - WC_ERR_TOO_MANY_IDS; }
-    var outstanding[2048];   # RA_MAX_REGS (256) i64; 1 = id is an un-waited load
+    if (cap_ids > MIR_MAX_CAP_IDS) { return 0 - WC_ERR_TOO_MANY_IDS; }
+    var outstanding[8192];   # MIR_MAX_CAP_IDS (1024) i64; 1 = id is an un-waited load
     memset(&outstanding, 0, cap_ids * 8);
     var any_vmem = 0;
     var k = 0;
@@ -93,7 +106,7 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
         } else {
             # Wait before consuming an outstanding load result. vmcnt(0) clears
             # ALL outstanding loads, so one wait covers every prior load.
-            if (_wc_uses_outstanding(in_buf, i, &outstanding) == 1) {
+            if (_wc_uses_outstanding(in_buf, i, &outstanding, cap_ids) == 1) {
                 if (k >= cap_out) { return 0 - WC_ERR_CAP; }
                 _wc_emit_wait(out, k, GFX9_WAITCNT_VM);
                 k = k + 1;
@@ -103,13 +116,13 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
             _wc_copy(in_buf, i, out, k);
             k = k + 1;
             if (op == GISEL_GLOBAL_LOAD) {
-                store64(&outstanding + gisel_dst(in_buf, i) * 8, 1);
+                _wc_mark(&outstanding, cap_ids, gisel_dst(in_buf, i));
                 any_vmem = 1;
             }
             # v3.2 F.7d — a DWORDX2 (f64) load is one result <id> spanning a VGPR pair; track it
             # exactly like a 32-bit load (the conservative vmcnt(0) waits for it before any use).
             if (op == GISEL_GLOBAL_LOAD_DWORDX2) {
-                store64(&outstanding + gisel_dst(in_buf, i) * 8, 1);
+                _wc_mark(&outstanding, cap_ids, gisel_dst(in_buf, i));
                 any_vmem = 1;
             }
             if (op == GISEL_GLOBAL_STORE) { any_vmem = 1; }
