@@ -92,7 +92,8 @@ src/   (68 domain modules + lib.cyr — annotated below; the filesystem is autho
 ├── texture.cyr, texture_format.cyr, render_target.cyr, render_pipeline.cyr
 ├── asset_format.cyr     — container format ids (VkFormat / DXGI) → MABDA_TEXFMT_*
 ├── asset_load.cyr       — DDS / KTX2 container loaders; PNG / JPEG via chitra
-│                          (`-D MABDA_PNG` / `-D MABDA_JPEG`; untrusted input)
+│                          (`-D MABDA_PNG` / `-D MABDA_JPEG`; untrusted input); KTX2
+│                          zstd / zlib levels via decoders the consumer registers
 ├── render_pass.cyr, render_graph.cyr, queue.cyr, surface.cyr, surface_v3.cyr, instancing.cyr
 ├── @internal wgpu FFI:  wgpu_types.cyr, wgpu_descriptors.cyr, wgpu_ffi.cyr
 ├── @internal backend:   backend.cyr, backend_wgpu.cyr, backend_native.cyr,

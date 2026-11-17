@@ -43,7 +43,7 @@ block-linear scanout, and passes the seat-only display gates on both GPUs. See
 - **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
 - **Render targets and passes** — `gpu_render_target_create` in RGBA8 / sRGB / BGRA8 / RGBA16F / Depth32F with 4x MSAA, the `gpu_pass_desc_*` pass descriptor (up to 8 colour targets, depth with load / clear / store / read-only, resolve), texture views (a cube face or mip level as an attachment), texture copies, mip generation and render-target readback (wgpu; the native backends serve one RGBA8 target)
 - **Window surfaces** — a wgpu surface from a Wayland `wl_display` / `wl_surface`, its capabilities, BGRA8 formats, AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture objects, resize; native KMS present on AMD and NVIDIA
-- **Asset loading** — KTX2 / DDS parsers in-tree + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
+- **Asset loading** — KTX2 / DDS parsers in-tree (KTX2 Zstandard / ZLIB supercompression since 4.5.0, through decoders the consumer registers) + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
 - **Native SPIR-V compilers** — in-tree compute-shader lowering to GFX9 (AMD) and, since 4.4.0, to SM75 SASS (NVIDIA): structured control flow, int div/mod, vectors, f64; HW-verified on Cezanne and TU116
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
 - **Profiling** — FrameProfiler with EMA smoothing, frame history, pass timings, JSON / CSV export, explicit scope timing
@@ -101,8 +101,10 @@ Extra deps opt in via compile flags: **PNG / JPEG asset loading**
 (`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 1.4.1) + stdlib
 `thread`/`sankoch` (include their `lib/*.cyr` before `mabda`); **logind master
 delegation** (`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 1.1.2; the consumer
-calls `samvada_native_init()` first — pure-Cyrius dbus, no C shim). A minimal
-consumer needs none — the dist compiles those paths out without the flags.
+calls `samvada_native_init()` first — pure-Cyrius dbus, no C shim). **KTX2 zstd / zlib
+supercompression** (4.5.0) needs no flag: the consumer includes sankoch and registers its
+decoders (`gpu_ktx2_set_zstd_decoder(&zstd_decompress)`, `gpu_ktx2_set_zlib_decoder(...)`).
+A minimal consumer needs none of these — the dist compiles the flagged paths out.
 
 ## Modules
 

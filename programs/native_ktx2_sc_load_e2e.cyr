@@ -1,0 +1,116 @@
+# programs/native_ktx2_sc_load_e2e.cyr — 4.5.0: supercompressed KTX2 through the public API on
+# the native AMD backend.
+#
+# Loads four KTX2 files whose levels are Zstandard or ZLIB supercompressed
+# (tests/assets/sc_*.ktx2, from scripts/gen-ktx2-sc-fixtures.py: the zstd CLI and Python's zlib
+# made them, not sankoch). Then it reads every byte of every level and slice back from the
+# GPU-resident BO and compares it with the formula the files were made from
+# (ktx2sc_payload_byte):
+#   - a 3-level RGBA8 64x64 mip chain, zstd; the same, zlib (the mipped 2D path);
+#   - a 4-layer RGBA8 32x32 array, zstd; a 6-face RGBA8 16x16 cube, zlib (the layered path).
+# Like a consumer, it includes sankoch itself and registers its decoders
+# (`make test-native-ktx2-sc-load-e2e`).
+#
+# Exit codes: 0 pass; 1 ctx; 2 read the file; 3 load; 4 a byte differs.
+include "src/lib.cyr"
+include "lib/sankoch.cyr"
+include "tests/tcyr/ktx2_sc_fixtures.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+fn _seed_of(name): i64 {
+    var k = 0;
+    while (k < KTX2SC_COUNT) {
+        if (streq(ktx2sc_name(k), name) == 1) { return ktx2sc_seed(k); }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+# Bytes [start, start + n) of level `level` that differ from the formula.
+fn _diff(addr, seed, level, start, n): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        if ((load8(addr + i) & 0xFF) != ktx2sc_payload_byte(seed, level, start + i)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# Load assets/sc_<name>.ktx2 and check it: `levels` mip levels of one image, or `slices`
+# images of one level. Returns 0, or an exit code.
+fn _check(ctx, name, path, levels, slices): i64 {
+    var buf = alloc(8192);
+    var n = file_read_all(path, buf, 8192);
+    if (n <= 0) { print_cstr("FAIL: read "); print_cstr(path); print_cstr("\n"); return 2; }
+    var r_tag, r = gpu_texture_load_ktx2_result(ctx, buf, n);
+    if (is_err_result(r_tag) == 1) {
+        print_cstr("FAIL: load "); print_cstr(path); print_cstr(" err "); print_i64(load64(r));
+        print_cstr("\n");
+        return 3;
+    }
+    var tex = r;
+    var seed = _seed_of(name);
+    var addr = load64(tex + NATIVE_TEX_FIELD_ADDR);
+    var fmt = load32(tex + NATIVE_TEX_FIELD_FMT);
+    var w = load32(tex + NATIVE_TEX_FIELD_WIDTH);
+    var h = load32(tex + NATIVE_TEX_FIELD_HEIGHT);
+    var bad = 0;
+    var bytes = 0;
+    if (slices > 1) {
+        var per = load64(tex + NATIVE_TEX_FIELD_SIZE);
+        var img = mabda_texfmt_data_size(fmt, w, h);
+        var k = 0;
+        while (k < slices) {
+            bad = bad + _diff(addr + k * per, seed, 0, k * img, img);
+            bytes = bytes + img;
+            k = k + 1;
+        }
+    } else {
+        var lv = 0;
+        while (lv < levels) {
+            var sz = mabda_texfmt_data_size(fmt, mip_level_dim(w, lv), mip_level_dim(h, lv));
+            bad = bad + _diff(addr + native_tex_level_offset(fmt, w, h, lv), seed, lv, 0, sz);
+            bytes = bytes + sz;
+            lv = lv + 1;
+        }
+    }
+    gpu_texture_release(ctx, tex);
+    if (bad != 0) {
+        print_cstr("FAIL: "); print_cstr(name); print_cstr(": "); print_i64(bad);
+        print_cstr(" of "); print_i64(bytes); print_cstr(" bytes differ\n");
+        return 4;
+    }
+    print_cstr("PASS: "); print_cstr(name); print_cstr(": "); print_i64(bytes);
+    print_cstr(" bytes, decoded from "); print_i64(n); print_cstr(", exact in the GPU BO\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    print_cstr("mabda native KTX2 zstd / zlib supercompression load (4.5.0)\n");
+    print_cstr("-----------------------------------------------------------\n");
+    var ct, cv = gpu_context_new_native();
+    if (is_err_result(ct) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = cv;
+    gpu_ktx2_set_zstd_decoder(&zstd_decompress);
+    gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);
+    var rc = _check(ctx, "zstd_rgba8_mips", "tests/assets/sc_zstd_rgba8_mips.ktx2", 3, 1);
+    if (rc == 0) { rc = _check(ctx, "zlib_rgba8_mips", "tests/assets/sc_zlib_rgba8_mips.ktx2", 3, 1); }
+    if (rc == 0) { rc = _check(ctx, "zstd_array4", "tests/assets/sc_zstd_array4.ktx2", 1, 4); }
+    if (rc == 0) { rc = _check(ctx, "zlib_cube", "tests/assets/sc_zlib_cube.ktx2", 1, 6); }
+    gpu_context_release(ctx);
+    if (rc == 0) { print_cstr("OK — supercompressed KTX2 levels and slices land exactly in the GPU BO\n"); }
+    return rc;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

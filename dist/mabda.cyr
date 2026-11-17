@@ -34133,6 +34133,46 @@ var _KTX2_LEVELIDX_SZ  = 24;  # bytes per level-index entry
 # Parse a KTX2 header. Returns 0 on success, or GPU_ERR_CONTAINER_PARSE
 # (bad identifier / truncated / 1D) / GPU_ERR_FORMAT_UNSUPPORTED (super-
 # compression, array/cubemap, or an unmapped vkFormat).
+# 4.5.0 — KTX2 supercompression (supercompressionScheme, header +44). 0 none, 1 BasisLZ (a
+# transcoder, not a codec: refused), 2 Zstandard, 3 ZLIB. Schemes 2 and 3 supercompress each mip
+# level on its own; the level index's byteLength is then the compressed size and
+# uncompressedByteLength the level's real size.
+#
+# The decoders are the CONSUMER's, registered by function pointer (sankoch's, normally):
+#     gpu_ktx2_set_zstd_decoder(&zstd_decompress);         # (src, src_len, dst, dst_cap)
+#     gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);  # (src, src_len, dst, dst_cap, max_out)
+# Each returns the bytes written or a negative code, and must not write past dst_cap. Nothing
+# in mabda names sankoch, so a consumer that never loads a supercompressed KTX2 compiles none of
+# it. (A -D define around direct calls was tried first: cyrius distlib's Requires block counts
+# names inside an #ifdef whose define is off, so it put sankoch in every consumer's bundle,
+# +0.8 MB of object. docs/development/2026-04-30-toolchain-issues.md.) An unregistered scheme is
+# refused by name.
+var KTX2_SC_NONE    = 0;
+var KTX2_SC_BASISLZ = 1;
+var KTX2_SC_ZSTD    = 2;
+var KTX2_SC_ZLIB    = 3;
+var _ktx2_zstd_fn = 0;    # the registered Zstandard decoder (0: none)
+var _ktx2_zlib_fn = 0;    # the registered ZLIB decoder (0: none)
+
+# Register the Zstandard decoder KTX2 scheme 2 levels go through: fn(src, src_len, dst, dst_cap)
+# returning the bytes written or a negative code (sankoch's zstd_decompress). 0 unregisters.
+# Returns 0. # @public
+fn gpu_ktx2_set_zstd_decoder(fp): i64 {
+    _ktx2_zstd_fn = fp;
+    return 0;
+}
+
+# Register the ZLIB decoder KTX2 scheme 3 levels go through: fn(src, src_len, dst, dst_cap,
+# max_output) returning the bytes written or a negative code (sankoch's zlib_decompress_capped;
+# mabda passes the level's size as both dst_cap and max_output). 0 unregisters. Returns 0.
+# @public
+fn gpu_ktx2_set_zlib_decoder(fp): i64 {
+    _ktx2_zlib_fn = fp;
+    return 0;
+}
+
+# Parse a KTX2 header into `out` (64 bytes): +0 MABDA_TEXFMT_*, +8 width, +16 height, +24 levels,
+# +32 layers, +40 faces, +48 sRGB, +56 supercompressionScheme (4.5.0). Returns 0 or a GPU_ERR_*.
 fn _ktx2_parse(bytes, len, out): i64 {
     if (bytes == 0) { return GPU_ERR_CONTAINER_PARSE; }
     if (len < 80)   { return GPU_ERR_CONTAINER_PARSE; }   # identifier + header + index
@@ -34145,9 +34185,14 @@ fn _ktx2_parse(bytes, len, out): i64 {
     if (width <= 0)  { return GPU_ERR_CONTAINER_PARSE; }
     if (height <= 0) { return GPU_ERR_CONTAINER_PARSE; }   # pixelHeight 0 = 1D (unsupported)
 
-    # supercompressionScheme != 0 (BasisLZ/Zstd/ZLIB) needs a decompressor mabda
-    # does not have - the decoder gate, fail loud (tracked, post-v3.3).
-    if (load32(bytes + 44) != 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+    # supercompressionScheme: none, Zstandard or ZLIB (4.5.0). BasisLZ and anything else is
+    # refused; whether 2 / 3 can be decoded in this build is the loader's check.
+    var scheme = load32(bytes + 44);
+    var sc_ok = 0;
+    if (scheme == KTX2_SC_NONE) { sc_ok = 1; }
+    if (scheme == KTX2_SC_ZSTD) { sc_ok = 1; }
+    if (scheme == KTX2_SC_ZLIB) { sc_ok = 1; }
+    if (sc_ok == 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
     # v3.4 AA.6b — faceCount 1 (2D/array) or 6 (cube); layerCount (0 = 1).
     var faces = load32(bytes + 36);
     if (faces != 1) { if (faces != 6) { return GPU_ERR_FORMAT_UNSUPPORTED; } }
@@ -34175,6 +34220,62 @@ fn _ktx2_parse(bytes, len, out): i64 {
     store64(out + 32, layers);     # v3.4 AA.6b — array layers
     store64(out + 40, faces);      # v3.4 AA.6b — cube faces (1 or 6)
     store64(out + 48, mabda_vk_format_is_srgb(vk));   # out widened to 56 B
+    store64(out + 56, scheme);                         # 4.5.0: 64 B
+    return 0;
+}
+
+# 1 when a level of KTX2 supercompression scheme `scheme` can be decoded now: always for none,
+# and for Zstandard / ZLIB once a decoder is registered.
+fn _ktx2_scheme_ready(scheme): i64 {
+    if (scheme == KTX2_SC_NONE) { return 1; }
+    if (scheme == KTX2_SC_ZSTD) { if (_ktx2_zstd_fn != 0) { return 1; } }
+    if (scheme == KTX2_SC_ZLIB) { if (_ktx2_zlib_fn != 0) { return 1; } }
+    return 0;
+}
+
+# One KTX2 level's bytes, uncompressed: the address of `expected` bytes, or a NEGATED GPU_ERR_*.
+# `idx` is the level's index entry (byteOffset, byteLength, uncompressedByteLength); `min_off`
+# the end of the level index. Every span is checked against `len` without computing
+# boff + blen (a huge byteOffset would wrap; the 2026-06-19 CRITICAL).
+#   scheme 0: the level as stored; byteLength == uncompressedByteLength == expected.
+#   schemes 2 / 3 (4.5.0): uncompressedByteLength must be `expected`, and the level must decode
+#     to exactly that many bytes, through the registered decoder, given `expected` as its buffer
+#     size (sankoch's stop at the buffer, so a bomb cannot grow past it). It is decoded into an
+#     anonymous mapping, freed by _ktx2_level_done: a long-running consumer loading many
+#     textures must not grow the bump heap.
+# *mapped_out is set to 1 when the caller must call _ktx2_level_done(addr, expected, 1).
+fn _ktx2_level_data(bytes, len, idx, scheme, expected, min_off, mapped_out): i64 {
+    store64(mapped_out, 0);
+    if (expected <= 0) { return 0 - GPU_ERR_CONTAINER_PARSE; }
+    var boff = load64(bytes + idx + 0);
+    var blen = load64(bytes + idx + 8);
+    var ulen = load64(bytes + idx + 16);
+    if (ulen != expected) { return 0 - GPU_ERR_CONTAINER_PARSE; }   # the level's real size
+    if (scheme == KTX2_SC_NONE) {
+        if (blen != expected) { return 0 - GPU_ERR_CONTAINER_PARSE; } # wrong level size
+    }
+    if (blen <= 0) { return 0 - GPU_ERR_CONTAINER_PARSE; }
+    if (boff < min_off) { return 0 - GPU_ERR_CONTAINER_PARSE; }       # overlaps index/header (or < 0)
+    # blen > 0: `len - blen` cannot overflow; a blen past len makes it negative and rejects.
+    if (boff > len - blen) { return 0 - GPU_ERR_CONTAINER_PARSE; }   # truncated / OOB
+    if (scheme == KTX2_SC_NONE) { return bytes + boff; }
+    if (_ktx2_scheme_ready(scheme) == 0) { return 0 - GPU_ERR_FORMAT_UNSUPPORTED; }
+    var dst = mmap_anon(expected);
+    if (dst == 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
+    var got = 0 - 1;
+    if (scheme == KTX2_SC_ZSTD) { got = fncall4(_ktx2_zstd_fn, bytes + boff, blen, dst, expected); }
+    if (scheme == KTX2_SC_ZLIB) { got = fncall5(_ktx2_zlib_fn, bytes + boff, blen, dst, expected, expected); }
+    if (got != expected) {
+        cyr_munmap(dst, expected);
+        return 0 - GPU_ERR_CONTAINER_PARSE;                           # corrupt, short or long
+    }
+    store64(mapped_out, 1);
+    return dst;
+}
+
+# Release what _ktx2_level_data mapped (nothing for a stored level).
+fn _ktx2_level_done(addr, expected, mapped): i64 {
+    if (mapped == 1) { cyr_munmap(addr, expected); }
     return 0;
 }
 
@@ -34182,35 +34283,32 @@ fn _ktx2_parse(bytes, len, out): i64 {
 # = layers*faces equal images; image_idx (0..total-1) is the slice the
 # write_layer_level targets (KTX2 within-level order layer->face matches the
 # backend slice index for a pure array or a pure cube). Returns Ok(tex) | Err.
-fn _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces): i64 {
+fn _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces, scheme): i64 {
     var total = layers * faces;
     var tex = 0;
     if (faces == 6) { tex = gpu_texture_create_cube(ctx, width, fmt, 1); }
     if (faces != 6) { tex = gpu_texture_create_2d_array(ctx, width, height, fmt, layers); }
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
-    var boff = load64(bytes + _KTX2_LEVELIDX_OFF + 0);
-    var blen = load64(bytes + _KTX2_LEVELIDX_OFF + 8);
-    var ulen = load64(bytes + _KTX2_LEVELIDX_OFF + 16);
     var per_image = mabda_texfmt_data_size(fmt, width, height);
     if (per_image <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
-    # blen != total*per_image (div-by-0 / non-divisible / wrong size)
-    if (_asset_per_image_size(blen, total) != per_image) {
-        return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
-    }
-    if (ulen != blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
-    # whole level span past the 1-entry index (ends at +104) + fits, overflow-safe.
-    if (boff < _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ) {
-        return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
-    }
-    if (boff > len - blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
+    # The level holds `total` equal images (per_image is dimension-bounded, total <= 6 * the
+    # layer limit, so the product cannot overflow). Its span is checked past the 1-entry index
+    # (which ends at +104), overflow-safe, and decoded if supercompressed (4.5.0).
+    var mapped[8];
+    var data = _ktx2_level_data(bytes, len, _KTX2_LEVELIDX_OFF, scheme, per_image * total,
+      _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ, &mapped);
+    if (data < 0) { return _asset_release_fail(ctx, tex, 0 - data); }
     var img = 0;
     while (img < total) {
-        # in bounds: img < total, per_image*total == blen, boff+blen <= len.
-        var sub = boff + img * per_image;
-        var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, bytes + sub, per_image);
-        if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
+        # in bounds: img < total and the level is exactly per_image * total bytes.
+        var wrc = gpu_texture_write_layer_level(ctx, tex, img, 0, data + img * per_image, per_image);
+        if (wrc != 0) {
+            _ktx2_level_done(data, per_image * total, load64(&mapped));
+            return _asset_release_fail(ctx, tex, wrc);
+        }
         img = img + 1;
     }
+    _ktx2_level_done(data, per_image * total, load64(&mapped));
     return gpu_ok(tex);
 }
 
@@ -34221,9 +34319,19 @@ fn _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces): i64 {
 # image) route to _ktx2_load_layered (single-level); single 2D is mipped here.
 fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
     if (ctx == 0) { return gpu_err_result(GPU_ERR_OTHER); }
-    var out[56];
+    var out[64];
     var prc = _ktx2_parse(bytes, len, &out);
     if (prc != 0) { return gpu_err_result(prc); }
+    var scheme = load64(&out + 56);
+    if (_ktx2_scheme_ready(scheme) == 0) {
+        # On the error channel too: gpu_texture_load_ktx2 (handle | 0) drops the Result's detail.
+        var why = "KTX2: a zstd level needs gpu_ktx2_set_zstd_decoder(&zstd_decompress) first";
+        if (scheme == KTX2_SC_ZLIB) {
+            why = "KTX2: a zlib level needs gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped) first";
+        }
+        _gpu_err_record(GPU_ERR_FORMAT_UNSUPPORTED, why, 1);
+        return gpu_err_result_msg(GPU_ERR_FORMAT_UNSUPPORTED, why);
+    }
     var fmt    = load64(&out + 0);
     var width  = load64(&out + 8);
     var height = load64(&out + 16);
@@ -34235,32 +34343,24 @@ fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
     # level's blen covers all `total` images (KTX2 is mip-outer, image-inner).
     var total = layers * faces;
     if (total > 1) {
-        return _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces);
+        return _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces, scheme);
     }
     if (levels > mip_level_count(width, height)) { return gpu_err_result(GPU_ERR_CONTAINER_PARSE); }
     var tex = gpu_texture_create_2d_fmt_mipped(ctx, width, height, fmt, levels);
     if (tex == 0) { return gpu_err_result(GPU_ERR_TEXTURE); }
     var level = 0;
+    var mapped[8];
     while (level < levels) {
         var idx = _KTX2_LEVELIDX_OFF + level * _KTX2_LEVELIDX_SZ;
-        var boff = load64(bytes + idx + 0);
-        var blen = load64(bytes + idx + 8);
-        var ulen = load64(bytes + idx + 16);
         var expected = mabda_texfmt_data_size(fmt, mip_level_dim(width, level), mip_level_dim(height, level));
-        if (expected <= 0) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }
-        if (blen != expected) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # wrong level size
-        if (ulen != blen)     { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }   # scheme 0 invariant
-        # overlaps index/header (also rejects boff < 0)
-        if (boff < _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ) {
-            return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE);
-        }
-        # SECURITY: boff is an untrusted i64 - check WITHOUT computing boff+blen.
-        # `boff + blen > len` overflows for boff near i64_max (wraps negative, the
-        # comparison silently passes) -> OOB read. blen here is already == expected
-        # (> 0, dim-bounded), so `len - blen` is a safe subtraction; if blen > len
-        # it goes negative and any in-range boff (>= 104 above) is rejected.
-        if (boff > len - blen) { return _asset_release_fail(ctx, tex, GPU_ERR_CONTAINER_PARSE); }  # truncated / OOB
-        var wrc = gpu_texture_write_level(ctx, tex, level, bytes + boff, blen);
+        # SECURITY: byteOffset is an untrusted i64; _ktx2_level_data checks every span without
+        # computing boff + blen (a boff near i64_max wrapped that sum negative and passed: the
+        # 2026-06-19 CRITICAL), and decodes a supercompressed level (4.5.0).
+        var data = _ktx2_level_data(bytes, len, idx, scheme, expected,
+          _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ, &mapped);
+        if (data < 0) { return _asset_release_fail(ctx, tex, 0 - data); }
+        var wrc = gpu_texture_write_level(ctx, tex, level, data, expected);
+        _ktx2_level_done(data, expected, load64(&mapped));
         if (wrc != 0) { return _asset_release_fail(ctx, tex, wrc); }
         level = level + 1;
     }

@@ -495,6 +495,27 @@ unconditionally, NOT silent on no-drift
 - **Upstream**: nothing to file — the wrapper already follows the pin; only direct `cycc` callers
   need to.
 
+### E5. distlib's Requires block counts names inside an `#ifdef` that is off (found 4.5.0, cyrius 6.7.18) — worked around in-tree
+
+- **Symptom**: a stdlib call that only an `#ifdef`'d block makes still puts that leaf in the
+  bundle's `# Requires` include block (and `dist/mabda.deps`), unconditionally, for every
+  consumer. Found with KTX2 supercompression: direct `zstd_decompress` /
+  `zlib_decompress_capped` calls under `#ifdef MABDA_KTX2_SUPERCOMPRESSION` put
+  `include "lib/sankoch.cyr"` at the top of `dist/mabda.cyr`. The example consumer's object grew
+  from 1.40 to 2.20 MB, and every consumer compiled 20.7k more lines.
+- **Why**: deriving the sidecar does not honour the preprocessor. The same calls under a define
+  nothing ever sets still pulled sankoch in; with the calls commented out it dropped out
+  (scratch-tree experiment, 4.5.0). Names a **named dep** provides (chitra under `MABDA_PNG`,
+  samvada under `MABDA_LOGIND`) are credited to that dep, so only stdlib leaves are affected.
+- **Workaround (in-tree, 4.5.0)**: don't name an optional stdlib leaf's functions in `src/`. The
+  KTX2 decoders are the consumer's, registered by function pointer
+  (`gpu_ktx2_set_zstd_decoder(&zstd_decompress)`, `gpu_ktx2_set_zlib_decoder(...)`), so the
+  bundle never names sankoch, and its Requires block is the 4.4.0 list.
+- **Check**: after a `cyrius distlib`, read `git diff dist/mabda.deps`. A leaf appearing there
+  is a new include for every consumer.
+- **Upstream**: not filed. This is cyrius distlib's behaviour (sankoch is only the leaf it pulled
+  in); whether to raise it there is the maintainer's call.
+
 ---
 
 ## How to file a new toolchain issue

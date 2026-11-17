@@ -548,9 +548,46 @@ fn test_gpu_texture_create_2d_guards() {
     return 0;
 }
 
+# 4.5.0 — with no decoder registered (this suite has no sankoch at all), a zstd / zlib KTX2 is
+# refused by name before any texture is created; the reason names the call that registers one.
+fn test_ktx2_supercompression_needs_a_decoder() {
+    var b = backend_new();
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    var ctx[208];
+    memset(&ctx, 0, GPU_CONTEXT_SIZE);
+    store64(&ctx + 32, b);
+    var buf[128];
+    memset(&buf, 0, 128);
+    store32(&buf + 0, _KTX2_ID0);
+    store32(&buf + 4, _KTX2_ID1);
+    store32(&buf + 8, _KTX2_ID2);
+    store32(&buf + 12, 37);          # RGBA8
+    store32(&buf + 20, 4);
+    store32(&buf + 24, 4);
+    store32(&buf + 36, 1);
+    store32(&buf + 40, 1);
+    var s = 2;
+    while (s <= 3) {
+        store32(&buf + 44, s);       # Zstandard, then ZLIB
+        assert_eq(_ktx2_scheme_ready(s), 0, "no decoder registered");
+        var r_tag, r = gpu_texture_load_ktx2_result(&ctx, &buf, 128);
+        assert_eq(is_err_result(r_tag), 1, "a supercompressed KTX2 is refused");
+        assert_eq(load64(r), GPU_ERR_FORMAT_UNSUPPORTED, "as an unsupported format");
+        var setter = "gpu_ktx2_set_zstd_decoder";
+        if (s == 3) { setter = "gpu_ktx2_set_zlib_decoder"; }
+        assert_eq(strstr(load64(r + 8), setter) >= 0, 1, "the Err names the call that registers one");
+        assert_eq(gpu_last_error(), GPU_ERR_FORMAT_UNSUPPORTED, "and so does the error channel");
+        assert_eq(strstr(gpu_last_error_message(), setter) >= 0, 1, "  with the same reason");
+        s = s + 1;
+    }
+    assert_eq(_ktx2_scheme_ready(0), 1, "scheme 0 always decodes");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_ktx2_supercompression_needs_a_decoder();
     test_texfmt_ids_distinct_and_bounded();
     test_texfmt_render_formats();
     test_texfmt_block_geometry();

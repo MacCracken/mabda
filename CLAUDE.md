@@ -68,7 +68,10 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   reads `[features]` from the ROOT manifest only, so mabda's own
   `default = ["png", "jpeg", "logind"]` resolves them here and a consumer
   resolves them only if it names them. `src/lib.cyr` includes their bundles
-  only under `MABDA_PNG` / `MABDA_JPEG` / `MABDA_LOGIND`.
+  only under `MABDA_PNG` / `MABDA_JPEG` / `MABDA_LOGIND`. KTX2 zstd / zlib levels (4.5.0) go
+  through decoders the consumer registers (`gpu_ktx2_set_zstd_decoder` / `_zlib_decoder`):
+  `src/` never names an optional stdlib leaf's functions, because distlib's Requires block
+  counts names inside an `#ifdef` that is off (toolchain-issues E5).
 - **`samvada` (AGNOS dep)** — Cyrius dbus client for logind master
   delegation. Pinned via `[deps.samvada]` in `cyrius.cyml`. Since
   samvada 1.0 it speaks dbus natively in Cyrius: the consumer calls

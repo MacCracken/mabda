@@ -109,6 +109,10 @@ its version explicitly:
 - **`-D MABDA_PNG`** / **`-D MABDA_JPEG`** (PNG / baseline-JPEG decode) →
   `[deps.chitra]` (tag `1.4.1`), plus `thread` + `sankoch` in `[deps].stdlib`
   (one chitra dep serves both formats).
+- **KTX2 Zstandard / ZLIB supercompression** (4.5.0, no flag) → `sankoch` in `[deps].stdlib`
+  and `include "lib/sankoch.cyr"`, then register its decoders:
+  `gpu_ktx2_set_zstd_decoder(&zstd_decompress)` and
+  `gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped)`.
 - **`-D MABDA_LOGIND`** (logind master delegation) →
   `[deps.samvada]` (tag `1.1.2`). Either way, call `samvada_native_init()`
   before configuring the surface (samvada 1.0 is a pure-Cyrius dbus client:

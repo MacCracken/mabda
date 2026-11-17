@@ -24,7 +24,9 @@ modules = ["dist/mabda.cyr"]
 `chitra` (PNG + baseline JPEG decode, opt-in under `-D MABDA_PNG` /
 `-D MABDA_JPEG`) and `samvada` (logind master delegation, opt-in under
 `-D MABDA_LOGIND`) are **not** unconditional deps — add them only when
-you enable the corresponding flag. [`docs/stdlib-integration.md`](../stdlib-integration.md)
+you enable the corresponding flag. KTX2 Zstandard / ZLIB levels (4.5.0) need no flag: include
+the stdlib `sankoch` leaf yourself and register its decoders with `gpu_ktx2_set_zstd_decoder` /
+`gpu_ktx2_set_zlib_decoder`. [`docs/stdlib-integration.md`](../stdlib-integration.md)
 is the authoritative manifest for the full `cyrius.cyml` block
 (stdlib modules, pinned tags, and per-flag opt-ins).
 

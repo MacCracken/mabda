@@ -1376,6 +1376,18 @@ build/native_array_cube_load_e2e: programs/native_array_cube_load_e2e.cyr src/*.
 test-native-array-cube-load-e2e: build/native_array_cube_load_e2e
 	./build/native_array_cube_load_e2e
 
+# 4.5.0 — KTX2 zstd / zlib supercompression: four files (tests/assets/sc_*.ktx2, made by
+# scripts/gen-ktx2-sc-fixtures.py with the zstd CLI and Python's zlib) load through the public
+# API, and every byte of every level and slice in the GPU BO matches the formula they were made
+# from. Like a consumer, the program includes sankoch and registers its decoders.
+build/native_ktx2_sc_load_e2e: programs/native_ktx2_sc_load_e2e.cyr src/*.cyr tests/tcyr/ktx2_sc_fixtures.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_ktx2_sc_load_e2e.cyr $@
+
+.PHONY: test-native-ktx2-sc-load-e2e
+test-native-ktx2-sc-load-e2e: build/native_ktx2_sc_load_e2e
+	./build/native_ktx2_sc_load_e2e
+
 # v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
 build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr
 	@mkdir -p build

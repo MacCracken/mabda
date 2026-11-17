@@ -86,6 +86,19 @@ you don't need the dep:
   modules = ["dist/samvada.cyr"]
   ```
 
+- **KTX2 Zstandard / ZLIB supercompression** (4.5.0; `gpu_texture_load_ktx2` on a file with
+  `supercompressionScheme` 2 or 3). There is no define, and mabda never names sankoch: you bring
+  the decoders. Add `sankoch` to the `stdlib` list above (a stdlib leaf; a PNG / JPEG build
+  already has it), `include "lib/sankoch.cyr"`, and register its decoders once before loading:
+
+  ```cyrius
+  gpu_ktx2_set_zstd_decoder(&zstd_decompress);          # scheme 2
+  gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);   # scheme 3
+  ```
+
+  A scheme with no decoder registered is refused with `GPU_ERR_FORMAT_UNSUPPORTED`, and the
+  reason names the call. BasisLZ (scheme 1) is refused either way.
+
 Then `cyrius deps` fetches the tag into the dep cache under
 `~/.cyrius/deps/mabda/<tag>/` and copies the bundle into `lib/mabda.cyr`.
 

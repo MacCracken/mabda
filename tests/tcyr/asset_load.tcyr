@@ -6,6 +6,7 @@
 #define MABDA_JPEG  # v4.0.4: AL.7 decodes a real baseline JPEG through the same chitra dep
 include "src/lib.cyr"
 include "lib/assert.cyr"
+include "tests/tcyr/ktx2_sc_fixtures.cyr"
 
 # --- AL.0: VkFormat -> MABDA_TEXFMT (numbers pinned to vulkan_core.h) ---
 fn test_vk_format_mapping() {
@@ -343,8 +344,18 @@ fn test_ktx2_parse_rejects() {
     assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_CONTAINER_PARSE, "bad identifier");
     _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 0, 1);
     assert_eq(_ktx2_parse(&buf, 40, &out), GPU_ERR_CONTAINER_PARSE, "truncated (<80)");
-    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 2, 0, 1);    # scheme 2 = Zstd
-    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "supercompression gated");
+    # 4.5.0: schemes 2 (Zstd) and 3 (ZLIB) parse and are recorded; 1 (BasisLZ) and the
+    # undefined ones are refused.
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 2, 0, 1);
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "scheme 2 (Zstd) parses");
+    assert_eq(load64(&out + 56), KTX2_SC_ZSTD, "and is recorded");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 3, 0, 1);
+    assert_eq(_ktx2_parse(&buf, 148, &out), 0, "scheme 3 (ZLIB) parses");
+    assert_eq(load64(&out + 56), KTX2_SC_ZLIB, "and is recorded");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 1, 0, 1);
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "scheme 1 (BasisLZ) refused");
+    _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 4, 0, 1);
+    assert_eq(_ktx2_parse(&buf, 148, &out), GPU_ERR_FORMAT_UNSUPPORTED, "an undefined scheme refused");
     # v3.4 AA.6b — genuine array/cube rejects (single cubes/arrays now LOAD; see
     # test_ktx2_parse_array_cube). Cube-array (layers>1 AND faces==6) gated.
     _mk_ktx2_hdr(&buf, 145, 64, 64, 1, 0, 2, 6);    # layers 2 + faces 6 = cube-array
@@ -405,6 +416,201 @@ fn test_ktx2_load_orchestration() {
     assert_eq(gpu_texture_load_ktx2(&ctx, &buf3, 168), 0, "huge byteOffset rejected (no overflow OOB)");
     assert_eq(_dds_wl_count, 0, "write_level never reached for OOB byteOffset");
     assert_eq(_al_rel_count, 1, "the rejected load releases its texture (the ETC2 load never created one)");
+    return 0;
+}
+
+# --- 4.5.0: KTX2 Zstandard / ZLIB supercompression ---
+# The backend mocks record what each write received: its level or slice, its length and an
+# FNV-1a hash of its bytes, compared with the hash of the formula's payload.
+var _sc_cr = 0;
+var _sc_writes = 0;
+var _sc_rel = 0;
+var _sc_bad = 0;      # a write whose length or bytes were not the expected ones
+var _sc_seed = 0;
+var _sc_per = 0;      # the layered path: bytes per image
+fn _sc_fnv(src, n): i64 {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (i < n) {
+        h = ((h ^ (load8(src + i) & 0xFF)) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+fn _sc_fnv_payload(seed, level, start, n): i64 {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (i < n) {
+        h = ((h ^ ktx2sc_payload_byte(seed, level, start + i)) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+fn _sc_create_mipped(ctx, w, h, fmt, mc) { _sc_cr = _sc_cr + 1; return 0x7E; }
+fn _sc_create_array(ctx, w, h, fmt, layers) { _sc_cr = _sc_cr + 1; return 0x7E; }
+fn _sc_create_cube(ctx, w, fmt, mc) { _sc_cr = _sc_cr + 1; return 0x7E; }
+fn _sc_write_level(ctx, tex, level, src, n) {
+    _sc_writes = _sc_writes + 1;
+    if (_sc_fnv(src, n) != _sc_fnv_payload(_sc_seed, level, 0, n)) { _sc_bad = _sc_bad + 1; }
+    return 0;
+}
+fn _sc_write_layer_level(ctx, tex, layer, level, src, n) {
+    _sc_writes = _sc_writes + 1;
+    if (n != _sc_per) { _sc_bad = _sc_bad + 1; }
+    if (_sc_fnv(src, n) != _sc_fnv_payload(_sc_seed, 0, layer * n, n)) { _sc_bad = _sc_bad + 1; }
+    return 0;
+}
+fn _sc_release(ctx, tex) { _sc_rel = _sc_rel + 1; return 0; }
+
+fn _sc_ctx(ctx, b): i64 {
+    backend_set_kind(b, BACKEND_KIND_AMD);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_FMT_MIPPED, &_sc_create_mipped);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_2D_ARRAY, &_sc_create_array);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_CREATE_CUBE, &_sc_create_cube);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LEVEL, &_sc_write_level);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_WRITE_LAYER_LEVEL, &_sc_write_layer_level);
+    backend_set_slot(b, BACKEND_SLOT_TEXTURE_RELEASE, &_sc_release);
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    store64(ctx + 32, b);
+    return 0;
+}
+
+# Every fixture: the good ones load, and every level / slice written holds exactly the formula's
+# bytes; the bad ones fail with their code, write nothing, and release what they created.
+fn test_ktx2_supercompressed_loads() {
+    var b = backend_new();
+    var ctx[208];
+    _sc_ctx(&ctx, b);
+    # sankoch's decoders, as a consumer registers them (this suite has sankoch: MABDA_PNG).
+    gpu_ktx2_set_zstd_decoder(&zstd_decompress);
+    gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);
+    var buf[3600];
+    assert_eq(KTX2SC_MAX_BYTES <= 3600, 1, "buf holds the largest fixture");
+    var k = 0;
+    while (k < KTX2SC_COUNT) {
+        var n = ktx2sc_build(k, &buf);
+        _sc_seed = ktx2sc_seed(k);
+        _sc_cr = 0;
+        _sc_writes = 0;
+        _sc_rel = 0;
+        _sc_bad = 0;
+        var w = load32(&buf + 20);
+        var hh = load32(&buf + 24);
+        _sc_per = mabda_texfmt_data_size(mabda_texfmt_from_vk_format(load32(&buf + 12)), w, hh);
+        var levels = load32(&buf + 40);
+        var images = load32(&buf + 32);
+        if (images < 1) { images = 1; }
+        images = images * load32(&buf + 36);
+        var r_tag, r = gpu_texture_load_ktx2_result(&ctx, &buf, n);
+        var want = ktx2sc_expect(k);
+        if (want == 0) {
+            assert_eq(is_err_result(r_tag), 0, ktx2sc_name(k));
+            var nw = levels;
+            if (images > 1) { nw = images; }
+            assert_eq(_sc_writes, nw, "  one write per level or slice");
+            assert_eq(_sc_bad, 0, "  each the formula's exact bytes");
+        } else {
+            assert_eq(is_err_result(r_tag), 1, ktx2sc_name(k));
+            var code = 0;
+            if (is_err_result(r_tag) == 1) { code = load64(r); }
+            assert_eq(code, want, "  with its code");
+            assert_eq(_sc_writes, 0, "  and nothing written");
+            assert_eq(_sc_rel, _sc_cr, "  and anything created released");
+        }
+        k = k + 1;
+    }
+    gpu_ktx2_set_zstd_decoder(0);
+    gpu_ktx2_set_zlib_decoder(0);
+    return 0;
+}
+
+# A registered decoder is held to the level's size: one that returns a byte short, or a byte
+# long, fails the load, nothing is written, and the texture is released. Unregistering refuses
+# the scheme again, before anything is created.
+var _sc_fake_delta = 0;
+fn _sc_fake_zstd(src, src_len, dst, dst_cap) { return dst_cap + _sc_fake_delta; }
+fn _sc_fake_zlib(src, src_len, dst, dst_cap, max_out) { return max_out + _sc_fake_delta; }
+fn test_ktx2_decoder_registration() {
+    var b = backend_new();
+    var ctx[208];
+    _sc_ctx(&ctx, b);
+    var buf[3600];
+    var kz = 0;
+    var kl = 0;
+    var k = 0;
+    while (k < KTX2SC_COUNT) {
+        if (streq(ktx2sc_name(k), "zstd_bc7") == 1) { kz = k; }
+        if (streq(ktx2sc_name(k), "zlib_cube") == 1) { kl = k; }
+        k = k + 1;
+    }
+    gpu_ktx2_set_zstd_decoder(&_sc_fake_zstd);
+    gpu_ktx2_set_zlib_decoder(&_sc_fake_zlib);
+    var d = 0 - 1;
+    while (d <= 1) {
+        _sc_fake_delta = d;
+        _sc_writes = 0;
+        _sc_cr = 0;
+        _sc_rel = 0;
+        var n = ktx2sc_build(kz, &buf);
+        var t1, r1 = gpu_texture_load_ktx2_result(&ctx, &buf, n);
+        assert_eq(is_err_result(t1), 1, "a zstd decoder off by one byte fails the load");
+        assert_eq(load64(r1), GPU_ERR_CONTAINER_PARSE, "  as a container error");
+        n = ktx2sc_build(kl, &buf);
+        var t2, r2 = gpu_texture_load_ktx2_result(&ctx, &buf, n);
+        assert_eq(is_err_result(t2), 1, "a zlib decoder off by one byte fails the load");
+        assert_eq(_sc_writes, 0, "  nothing written");
+        assert_eq(_sc_rel, _sc_cr, "  and both textures released");
+        d = d + 2;
+    }
+    gpu_ktx2_set_zstd_decoder(0);
+    gpu_ktx2_set_zlib_decoder(0);
+    _sc_cr = 0;
+    var n2 = ktx2sc_build(kz, &buf);
+    var t3, r3 = gpu_texture_load_ktx2_result(&ctx, &buf, n2);
+    assert_eq(load64(r3), GPU_ERR_FORMAT_UNSUPPORTED, "unregistered again: zstd refused");
+    assert_eq(_sc_cr, 0, "  before any texture is created");
+    return 0;
+}
+
+# Loading allocates no bump memory: the decoded levels live in anonymous mappings, unmapped
+# after the upload, so a consumer that loads textures for hours does not grow its heap.
+fn test_ktx2_supercompressed_no_heap_growth() {
+    var b = backend_new();
+    var ctx[208];
+    _sc_ctx(&ctx, b);
+    var buf[3600];
+    var k0 = 0;
+    var k1 = 0;
+    var k = 0;
+    while (k < KTX2SC_COUNT) {
+        if (streq(ktx2sc_name(k), "zstd_rgba8_mips") == 1) { k0 = k; }
+        if (streq(ktx2sc_name(k), "zlib_rgba8_mips") == 1) { k1 = k; }
+        k = k + 1;
+    }
+    gpu_ktx2_set_zstd_decoder(&zstd_decompress);
+    gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);
+    var n0 = ktx2sc_build(k0, &buf);
+    _sc_seed = ktx2sc_seed(k0);
+    gpu_texture_load_ktx2(&ctx, &buf, n0);      # the first load may set up decoder state
+    var before = alloc_used();
+    var i = 0;
+    while (i < 20) {
+        gpu_texture_load_ktx2(&ctx, &buf, n0);
+        i = i + 1;
+    }
+    assert_eq(alloc_used() - before, 0, "20 zstd loads: 0 bytes of bump heap");
+    var n1 = ktx2sc_build(k1, &buf);
+    _sc_seed = ktx2sc_seed(k1);
+    gpu_texture_load_ktx2(&ctx, &buf, n1);
+    before = alloc_used();
+    i = 0;
+    while (i < 20) {
+        gpu_texture_load_ktx2(&ctx, &buf, n1);
+        i = i + 1;
+    }
+    assert_eq(alloc_used() - before, 0, "20 zlib loads: 0 bytes of bump heap");
+    gpu_ktx2_set_zstd_decoder(0);
+    gpu_ktx2_set_zlib_decoder(0);
     return 0;
 }
 
@@ -744,6 +950,9 @@ fn main() {
     test_ktx2_parse();
     test_ktx2_parse_rejects();
     test_ktx2_load_orchestration();
+    test_ktx2_supercompressed_loads();
+    test_ktx2_supercompressed_no_heap_growth();
+    test_ktx2_decoder_registration();
     test_gpu_texture_load_png_orchestration();
     test_gpu_texture_load_jpeg_orchestration();
     test_gpu_texture_load_sniffer();

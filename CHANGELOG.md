@@ -13,6 +13,65 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
+## [4.5.0] — in progress (VERSION still reads 4.4.0)
+
+**Textures + language** ([roadmap](docs/development/roadmap.md#v450--textures--language)), phase 4
+of the 2026-11 plan. Landed so far: KTX2 Zstandard / ZLIB supercompression decode, the first half
+of texture encoding (below). The other items are open and tracked in the roadmap.
+
+### Added — KTX2 supercompression: Zstandard and ZLIB
+- **`gpu_texture_load_ktx2` loads KTX2 files whose levels are supercompressed** with
+  supercompressionScheme 2 (Zstandard) or 3 (ZLIB). It covers the mipped 2D path and the
+  array / cube path. BasisLZ (scheme 1) is a transcoder, not a codec, and stays refused, as
+  does any undefined scheme.
+- **Each level decodes through a decoder the consumer registers**, normally sankoch's:
+  `gpu_ktx2_set_zstd_decoder(&zstd_decompress)` for scheme 2, and
+  `gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped)` for scheme 3. Both are new `@public`
+  calls; 0 unregisters. mabda passes the level's size as the buffer, and as zlib's ceiling.
+  - The level must decode to exactly its `uncompressedByteLength`, which must be the level's
+    real size. A short, long, truncated or corrupt level is `GPU_ERR_CONTAINER_PARSE`.
+  - The decoders stop at the buffer, so a decompression bomb cannot grow past the level.
+  - The decoded level goes into an anonymous mapping that is unmapped after the upload, not
+    the bump heap: loading 20 textures adds 0 bytes.
+  - Spans are checked as for stored levels, without computing `byteOffset + byteLength`.
+- **No define, and mabda never names sankoch.** A consumer that wants supercompressed KTX2
+  includes sankoch and registers its decoders; one that does not compiles none of it.
+  - With no decoder registered, a supercompressed file is refused with
+    `GPU_ERR_FORMAT_UNSUPPORTED` before anything is created. The reason names the call, both in
+    the `Err` and on the error channel.
+  - A `-D` define around direct calls was built first and dropped. cyrius distlib's Requires
+    block counts names inside an `#ifdef` whose define is off, so it put sankoch in every
+    consumer's bundle: the example consumer's object grew from 1.40 to 2.20 MB
+    (`docs/development/2026-04-30-toolchain-issues.md` E5).
+  - The bundle's Requires block is unchanged from 4.4.0, and the example consumer's object grows
+    by 2.5 KB.
+- **The stored-level path now uses the same span checks** (`_ktx2_level_data`). The layered
+  path checks `uncompressedByteLength`, which it did not before.
+- **Tests:**
+  - **The fixtures are independent of sankoch.** `scripts/gen-ktx2-sc-fixtures.py` builds 11
+    KTX2 files with the `zstd` CLI and Python's zlib, writing `tests/tcyr/ktx2_sc_fixtures.cyr`
+    and four `tests/assets/sc_*.ktx2`. Each level's bytes come from a formula the tests
+    recompute, so a decoder that returned the right length with the wrong bytes fails.
+  - `asset_load.tcyr` (266): every good file loads, and every level and slice written holds
+    the formula's exact bytes. The short, long, truncated, wrong-length and BasisLZ files are
+    refused with their codes, write nothing, and release what they created. There is no heap
+    growth.
+  - `test_ktx2_decoder_registration`: a registered decoder that returns a byte short or a byte
+    long fails the load, writes nothing, and releases the texture. Unregistering refuses the
+    scheme again before anything is created.
+  - `texture.tcyr`, which has no sankoch at all: with no decoder registered, each scheme is
+    refused, and the reason names its call.
+- **Hardware:** the new `make test-native-ktx2-sc-load-e2e` loads the four assets on the
+  Cezanne and compares every byte of every level and slice in the GPU BO with the formula
+  (`build/logs/ktx2-sc-load-e2e-*.log`). It covers 21,504-byte mip chains from zstd and from
+  zlib, a 4-layer array and a 6-face cube, all exact.
+
+### Verified (so far)
+- CPU: 29 suites, **8004 assertions**, 0 failed (4.4.0: 7932). Every CI gate passes locally
+  (`build/logs/ktx2-sc-ci-gates-*.log`), and `cyrius distlib` is idempotent.
+- Cezanne: `make test-native-all` gives 76 passed, 0 failed, 3 skipped for DRM master, of 79,
+  the new KTX2 gate included, with no GPU reset (`build/logs/ktx2-sc-native-all-*.log`).
+
 ## [4.4.0] — 2026-11-17
 
 **Compilers + NVIDIA.** Phase 3 of the 2026-11 plan. Every item the roadmap pinned to 4.4.0

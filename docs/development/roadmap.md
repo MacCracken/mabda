@@ -95,8 +95,11 @@ Phase 4 of the 2026-11 plan with the texture, render-graph and language items al
 roadmap.
 
 - **Texture encoding** (`issues/2026-10-13-gpu-texture-compression-encoder.md`; filed from sankoch,
-  placed in mabda by the user). First **KTX2 supercompression decode** — schemes 2 (zstd) and 3
-  (zlib) in `_ktx2_parse`, through sankoch's codecs. Then **a CPU reference block encoder** for the
+  placed in mabda by the user). ✅ First **KTX2 supercompression decode** — schemes 2 (zstd) and
+  3 (zlib), through sankoch's codecs: done (CHANGELOG [4.5.0]). The consumer registers the
+  decoders, so mabda's bundle never names sankoch; the result is byte-exact in the GPU BO on the
+  Cezanne. Then **a CPU
+  reference block encoder** for the
   first format a consumer names (BC1 / BC3 / BC4 / BC5 / BC7, or ASTC 4×4 / 6×6 / 8×8), validated
   against an independent decoder and mabda's upload-and-sample path, with a PSNR bar; if no
   consumer has named one by then, ask the user.
