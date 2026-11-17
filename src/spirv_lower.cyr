@@ -1131,7 +1131,66 @@ var _lower_cur_label = 0;
 var _lower_byte_len = 0;
 
 # Byte offset of the OpLabel whose result is `label_id`, or -1.
+# 4.4.0 audit LOW-2: every branch looked its targets up with a scan of the whole stream (up to
+# five per OpBranchConditional), so compile time grew with branches × stream length (minutes for
+# a crafted module near MABDA_MAX_SPIRV_WORDS). spirv_lower_module now builds a label -> offset
+# table once (the first OpLabel of each id, the scan's own answer) and drops it when it returns;
+# outside a lowering, or for a module past MIR_MAX_CAP_IDS ids, the scan runs as before.
+var _lower_lab = 0;       # MIR_MAX_CAP_IDS i64: label <id> -> word offset of its OpLabel, or -1
+var _lower_lab_ptr = 0;   # the module the table describes (0: no table)
+var _lower_lab_len = 0;   # its byte length
+var _lower_lab_n = 0;     # its id_bound (entries filled)
+
+fn _spirv_build_label_table(ptr, byte_len): i64 {
+    _lower_lab_ptr = 0;
+    var idb = spirv_hdr_id_bound(ptr);
+    if (idb <= 0) { return 0; }
+    if (idb > MIR_MAX_CAP_IDS) { return 0; }
+    if (_lower_lab == 0) { _lower_lab = alloc(MIR_MAX_CAP_IDS * 8); }
+    if (_lower_lab == 0) { return 0; }
+    var j = 0;
+    while (j < idb) {
+        store64(_lower_lab + j * 8, 0 - 1);
+        j = j + 1;
+    }
+    var total = byte_len / 4;
+    var off = SPIRV_HEADER_WORDS;
+    while (off < total) {
+        var w0 = spirv_word(ptr, off);
+        var wc = spirv_op_wordcount(w0);
+        if (wc == 0) { off = total; } else {
+            if (spirv_op(w0) == SPIRV_OP_LABEL) {
+                if (wc >= 2) {
+                    var id = spirv_word(ptr, off + 1);
+                    if (id > 0) { if (id < idb) {
+                            if (load64(_lower_lab + id * 8) < 0) { store64(_lower_lab + id * 8, off); }
+                        } }
+                }
+            }
+            off = off + wc;
+        }
+    }
+    _lower_lab_ptr = ptr;
+    _lower_lab_len = byte_len;
+    _lower_lab_n = idb;
+    return 0;
+}
+
+# The table's answer for `label_id` in the module at `ptr`: its word offset or -1; -2 when no
+# table describes this module (scan instead).
+fn _spirv_label_lookup(ptr, label_id): i64 {
+    if (_lower_lab_ptr == 0) { return 0 - 2; }
+    if (ptr != _lower_lab_ptr) { return 0 - 2; }
+    if (label_id <= 0) { return 0 - 1; }
+    if (label_id >= _lower_lab_n) { return 0 - 1; }
+    return load64(_lower_lab + label_id * 8);
+}
+
 fn _spirv_find_label(ptr, byte_len, label_id): i64 {
+    if (byte_len == _lower_lab_len) {
+        var t = _spirv_label_lookup(ptr, label_id);
+        if (t != 0 - 2) { return t; }
+    }
     var total = byte_len / 4;
     var off = SPIRV_HEADER_WORDS;
     while (off < total) {
@@ -1253,6 +1312,12 @@ fn _spirv_emit_phi_moves(ptr, byte_len, from_label, to_label, m, types): i64 {
 # 1 if label `l`'s OpLabel comes before stream word `off` — a branch at `off` to it is a
 # back-edge (the stream is lowered in order, so that block was already lowered).
 fn _spirv_label_before(ptr, off, l): i64 {
+    var t = _spirv_label_lookup(ptr, l);
+    if (t != 0 - 2) {
+        if (t < 0) { return 0; }
+        if (t < off) { return 1; }
+        return 0;
+    }
     var lb = _spirv_find_label(ptr, off * 4, l);
     if (lb < 0) { return 0; }
     return 1;
@@ -1272,6 +1337,16 @@ fn _spirv_label_before(ptr, off, l): i64 {
 #     takes them; gfx9_isel places them after the exit test, before the back-edge s_branch.
 # Two backward targets that both need copies cannot be split this way and fail loud.
 fn _spirv_lower_cond_branch(ptr, off, cond, tb, tc, m, types): i64 {
+    # Both targets the same: an unconditional branch, lowered as OpBranch is (its copies first)
+    # (4.4.0 audit MEDIUM-1). A both-backward latch `OpBranchConditional %c %H %H` used to get
+    # its back-edge phi copies AFTER the COND_BRANCH, and GFX9 isel, which turns an equal-target
+    # COND_BRANCH into s_branch, selected them after it: they never ran, and the loop's phi never
+    # advanced. Lowering it here covers both back ends.
+    if (tb == tc) {
+        var pe = _spirv_emit_phi_moves(ptr, _lower_byte_len, _lower_cur_label, tb, m, types);
+        if (pe < 0) { return pe; }
+        return mir_emit(m, MIR_OP_BRANCH, 0, MIR_T_VOID, tb, 0, 0, MIR_FLAG_A_IMM);
+    }
     var bb = _spirv_label_before(ptr, off, tb);
     var bc = _spirv_label_before(ptr, off, tc);
     if (bb == 0) {
@@ -1729,7 +1804,15 @@ fn _spirv_check_ext_sets(ptr, byte_len): i64 {
 # `types`/`consts`/`deco` are N.1b tables; `out_bi` is a caller-provided builtin
 # side-table of `out_bi_len` bytes (>= id_bound i64s, else -LOWER_ERR_OUTBI_SHORT).
 # Returns SPIRV_LOWER_OK or a negative error.
+# The label table (LOW-2 above) lives for exactly this call.
 fn spirv_lower_module(ptr, byte_len, types, consts, deco, m, out_bi, out_bi_len): i64 {
+    _spirv_build_label_table(ptr, byte_len);
+    var r = _spirv_lower_module_run(ptr, byte_len, types, consts, deco, m, out_bi, out_bi_len);
+    _lower_lab_ptr = 0;
+    return r;
+}
+
+fn _spirv_lower_module_run(ptr, byte_len, types, consts, deco, m, out_bi, out_bi_len): i64 {
     var entry = spirv_find_entry_point(ptr, byte_len);
     if (entry == 0 - 1) { return 0 - LOWER_ERR_NO_ENTRY; }
     var as_chk = _spirv_check_array_strides(ptr, byte_len, types, spirv_hdr_id_bound(ptr));

@@ -364,7 +364,14 @@ fn _rss_kb(): i64 {
 # wgpu-core and the allocator grow to a high-water mark over the first ~100k
 # submissions of any kind (an empty encoder + submit does it too), then stay flat:
 # measured on the Cezanne, 50k-pass windows grew 11.5 MiB, 1.8 MiB, then 0, 0, 0, 0.
-# So the soak warms up for 120k passes, then requires a flat 40k-pass window.
+# So the soak warms up for 120k passes, then measures 40k-pass windows.
+#
+# 4.4.0 (Mesa 26.2.7): where that mark is reached varies run to run. The first window
+# after the warm-up grew 0 to 2,216 KiB, in ~444 KiB steps, while eight windows after
+# it grew 0 each (build/logs/cut-440-compute-tier-soak-windows-*.log). A single window
+# was a flaky gate. Now up to four consecutive windows run, and one must stay within
+# 512 KiB. A per-pass leak of 13 bytes or more (512 KiB / 40k) grows every window, so
+# it still fails. The heap check covers every pass.
 fn _check_soak(ctx): i64 {
     for (var w = 0; w < 120000; w = w + 1) {
         _step(ctx, 0);
@@ -372,24 +379,30 @@ fn _check_soak(ctx): i64 {
     }
     gpu_device_wait_idle(ctx);
     var before = alloc_used();
-    var rss0 = _rss_kb();
     var bad = 0;
-    for (var i = 0; i < 40000; i = i + 1) {
-        if (_step(ctx, 0) != 0) { bad = bad + 1; }
-        if ((i % 500) == 499) { gpu_device_wait_idle(ctx); }
+    var flat = 0;
+    var win = 0;
+    while (win < 4) {
+        var rss0 = _rss_kb();
+        for (var i = 0; i < 40000; i = i + 1) {
+            if (_step(ctx, 0) != 0) { bad = bad + 1; }
+            if ((i % 500) == 499) { gpu_device_wait_idle(ctx); }
+        }
+        gpu_device_wait_idle(ctx);
+        var d = _rss_kb() - rss0;
+        _info_int("    RSS growth, a 40k-pass window (KiB): ", d);
+        win = win + 1;
+        if (d <= 512) { flat = 1; break; }
     }
-    gpu_device_wait_idle(ctx);
     var grown = alloc_used() - before;
-    var rss1 = _rss_kb();
-    _info_int("    RSS growth, 40k warm passes (KiB): ", rss1 - rss0);
     if (bad != 0) { return _fail("D: a pass in the soak returned an error"); }
     if (grown != 0) {
         _info_int("    heap grown: ", grown);
-        return _fail("D: 40000 compute passes grew the Cyrius heap");
+        return _fail("D: the soak's compute passes grew the Cyrius heap");
     }
-    _pass("D: 160000 compute passes allocated 0 bytes of Cyrius heap");
-    if (rss1 - rss0 > 512) { return _fail("D: RSS grew more than 512 KiB over 40000 warm passes (a leak per pass)"); }
-    _pass("D: RSS flat over 40000 warm passes (each pass encoder released, slot 81)");
+    _pass("D: every soak compute pass allocated 0 bytes of Cyrius heap");
+    if (flat == 0) { return _fail("D: RSS grew > 512 KiB in each of 4 warm 40k-pass windows (a leak per pass)"); }
+    _pass("D: RSS flat over a 40000-pass warm window (each pass encoder released, slot 81)");
     return 0;
 }
 

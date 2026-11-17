@@ -854,7 +854,7 @@ var DRM_MODE_FB_MODIFIERS = 2;
 # here for clarity at call sites.
 var DRM_FORMAT_MOD_LINEAR = 0;
 
-# Low-level AddFB2 ioctl. Caller owns `req` (100 bytes), MUST fill
+# Low-level AddFB2 ioctl. Caller owns `req` (104 bytes), MUST fill
 # width/height/format/handles/pitches/offsets/modifiers/flags
 # before calling. fb_id at +0 is OUT (overwritten on success).
 # Returns 0 on success (req+0 holds the new FB ID), negative errno
@@ -1139,6 +1139,28 @@ fn native_kms_lowest_set_bit(mask): i64 {
     return -1;
 }
 
+# The CRTC to drive a connector through `enc`, a filled DRM_MODE_GETENCODER request: the CRTC
+# already driving it when the card lists that one, so the console config saved before the
+# modeset is this connector's own and the restore puts back what was there. Otherwise the
+# lowest CRTC the encoder can use. With two heads, possible_crtcs' lowest bit can name the
+# CRTC driving the OTHER monitor (4.4.0 audit L3). Returns the CRTC id, or 0.
+fn native_kms_pick_crtc(enc, crtc_ids, crtc_count): i64 {
+    if (enc == 0)      { return 0; }
+    if (crtc_ids == 0) { return 0; }
+    var cur = load32(enc + DRM_MODE_GET_ENCODER_CRTC_ID);
+    if (cur != 0) {
+        var k = 0;
+        while (k < crtc_count) {
+            if (load32(crtc_ids + k * 4) == cur) { return cur; }
+            k = k + 1;
+        }
+    }
+    var idx = native_kms_lowest_set_bit(load32(enc + DRM_MODE_GET_ENCODER_POSS_CRTCS));
+    if (idx < 0)           { return 0; }
+    if (idx >= crtc_count) { return 0; }
+    return load32(crtc_ids + idx * 4);
+}
+
 # High-level: bridge a BO from `render_fd`'s handle namespace into
 # `card_fd`'s. Returns the new card-fd handle on success, or 0 on
 # failure. The transient dmabuf fd is closed before return — the
@@ -1326,11 +1348,8 @@ fn native_kms_modeset_first_connected_save(card_fd, render_fd, state, out, saved
     memset(&enc_req, 0, DRM_MODE_GET_ENCODER_SIZE);
     store32(&enc_req + DRM_MODE_GET_ENCODER_ID, encoder_id);
     if (native_drm_mode_get_encoder(card_fd, &enc_req) != 0) { return -4; }
-    var possible_crtcs = load32(&enc_req + DRM_MODE_GET_ENCODER_POSS_CRTCS);
-    var crtc_idx = native_kms_lowest_set_bit(possible_crtcs);
-    if (crtc_idx < 0)            { return -5; }
-    if (crtc_idx >= crtc_count)  { return -5; }
-    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+    var crtc_id = native_kms_pick_crtc(&enc_req, crtc_ids, crtc_count);
+    if (crtc_id == 0) { return -5; }
 
     # ---- Step C: get connector modes, pick preferred ----
     var modes_count[4];
@@ -1597,25 +1616,36 @@ fn native_drm_read_event(fd, buf, n): i64 {
 # present failed at frame 0, and NVIDIA's present, which ignored the read's result, never waited
 # for its flips). poll(2) first, then read. Returns the bytes read, -ETIME (-62) when nothing
 # arrived in time, or a negative errno.
+# `timeout_ms` is a deadline for the whole call (4.4.0 audit L1): a poll interrupted by a signal
+# (-EINTR) polls again for the time that is left, and does not count as one of the 4 spurious
+# wakeups allowed. Each retry used to restart the full timeout, so four EINTRs made it 4 s.
 var NATIVE_DRM_EVENT_TIMEOUT_MS = 1000;
 fn native_drm_wait_event(fd, buf, n, timeout_ms): i64 {
     if (fd <= 0)  { return -1; }
     if (buf == 0) { return -1; }
     if (n <= 0)   { return -1; }
+    if (timeout_ms < 0) { return -1; }
+    var deadline = _native_mono_ns() + timeout_ms * 1000000;
     var pfd[8];
-    var tries = 0;
-    while (tries < 4) {
+    var spurious = 0;
+    var loops = 0;
+    while (loops < 1024) {
+        loops = loops + 1;
+        var left_ns = deadline - _native_mono_ns();
+        if (left_ns <= 0) { return 0 - 62; }
+        var left_ms = (left_ns + 999999) / 1000000;
         memset(&pfd, 0, 8);
         store32(&pfd, fd);
         store16(&pfd + 4, 1);                     # events = POLLIN
-        var r = syscall(7, &pfd, 1, timeout_ms);  # poll(2)
+        var r = syscall(7, &pfd, 1, left_ms);     # poll(2)
         if (r == 0) { return 0 - 62; }           # timed out: -ETIME
         if (r > 0) {
             var got = syscall(0, fd, buf, n);
-            if (got != 0 - 11) { return got; }    # a spurious wakeup reads -EAGAIN: poll again
+            if (got != 0 - 11) { return got; }
+            spurious = spurious + 1;              # a spurious wakeup reads -EAGAIN: poll again
+            if (spurious >= 4) { return 0 - 62; }
         }
-        if (r < 0) { if (r != 0 - 4) { return r; } }   # -EINTR: poll again
-        tries = tries + 1;
+        if (r < 0) { if (r != 0 - 4) { return r; } }   # -EINTR: poll again for what is left
     }
     return 0 - 62;
 }
@@ -1623,9 +1653,31 @@ fn native_drm_wait_event(fd, buf, n, timeout_ms): i64 {
 # Drain events from `card_fd` until a DRM_EVENT_FLIP_COMPLETE arrives (the kernel may queue a
 # VBLANK first). Writes its vblank sequence to `seq_out` when non-zero. Returns 0, or a negative
 # code: -2 no flip-complete within 16 reads or a short read, -3 a malformed event, -62 nothing
-# arrived in time, or a negative errno. Shared by the AMD and NVIDIA presents (4.4.0; the loop
-# was native_kms_present's).
+# arrived in time, or a negative errno. Takes the first FLIP_COMPLETE of any flip; the presents
+# use native_kms_wait_flip_for (4.4.0; the loop was native_kms_present's).
 fn native_kms_wait_flip_complete(card_fd, seq_out): i64 {
+    return _native_kms_wait_flip(card_fd, 0, 0, 0, seq_out);
+}
+
+# The same drain, waiting for ONE flip's FLIP_COMPLETE: the one whose user_data is `user_data`
+# (what native_kms_page_flip was given) and, when the event carries a CRTC id, whose CRTC is
+# `crtc_id`. Any other FLIP_COMPLETE is skipped (4.4.0 audit L1). One is still queued after a
+# wait that timed out on a flip the kernel went on to complete, or comes from another CRTC on
+# the same fd; taking it left every later present returning one flip early, before its own flip
+# landed.
+fn native_kms_wait_flip_for(card_fd, crtc_id, user_data, seq_out): i64 {
+    return _native_kms_wait_flip(card_fd, 1, crtc_id, user_data, seq_out);
+}
+
+fn _native_kms_flip_matches(ev, want, crtc_id, user_data): i64 {
+    if (want == 0) { return 1; }
+    if (drm_event_vblank_user_data(ev) != user_data) { return 0; }
+    var ec = drm_event_vblank_crtc_id(ev);
+    if (crtc_id != 0) { if (ec != 0) { if (ec != crtc_id) { return 0; } } }
+    return 1;
+}
+
+fn _native_kms_wait_flip(card_fd, want, crtc_id, user_data, seq_out): i64 {
     var buf[256];
     var attempts = 0;
     while (attempts < 16) {
@@ -1640,13 +1692,26 @@ fn native_kms_wait_flip_complete(card_fd, seq_out): i64 {
             if (ev_len <= 0) { return 0 - 3; }          # malformed header, can't advance
             if (off + ev_len > n) { return 0 - 3; }     # length past read end
             if (drm_event_type(&buf + off) == DRM_EVENT_FLIP_COMPLETE) {
-                if (seq_out != 0) { store32(seq_out, drm_event_vblank_sequence(&buf + off)); }
-                return 0;
+                if (_native_kms_flip_matches(&buf + off, want, crtc_id, user_data) == 1) {
+                    if (seq_out != 0) { store32(seq_out, drm_event_vblank_sequence(&buf + off)); }
+                    return 0;
+                }
             }
             off = off + ev_len;
         }
     }
     return 0 - 2;                                       # too many events drained, bail
+}
+
+# A present's negative result as a GPU_ERR_*: the flip drain's own -2 (no flip-complete, or a
+# short read) and -3 (a malformed event) are a lost surface; anything else is a kernel errno.
+# Shared by the AMD and NVIDIA presents (4.4.0 audit L2: NVIDIA read -2 as ENOENT, "no
+# adapter"). 0 stays 0.
+fn _native_present_rc_to_gpu_err(rc): i64 {
+    if (rc == 0)     { return 0; }
+    if (rc == 0 - 2) { return GPU_ERR_SURFACE_LOST; }
+    if (rc == 0 - 3) { return GPU_ERR_SURFACE_LOST; }
+    return _native_neg_rc_to_gpu_err(rc);
 }
 
 # Convenience accessors for a freshly-read drm_event_vblank.
@@ -1862,11 +1927,11 @@ fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out): i64 {
     # easily holds 8+ events. Cap the outer reads at 16 to prevent
     # any pathological event-spew from spinning the present loop
     # forever (16 * 8 events = 128 events drained before bail-out).
-    # 4.4.0: the drain moved to native_kms_wait_flip_complete, which polls first (a logind fd
-    # is non-blocking).
+    # 4.4.0: the drain moved to native_kms_wait_flip_for, which polls first (a logind fd is
+    # non-blocking) and takes only this flip's event (its user_data, new_fb_id, and CRTC).
     var seq[4];
     store32(&seq, 0);
-    var wr = native_kms_wait_flip_complete(card_fd, &seq);
+    var wr = native_kms_wait_flip_for(card_fd, crtc_id, new_fb_id, &seq);
     if (wr != 0) { return wr; }
 
     # Update scanout's bound FB so subsequent operations have the

@@ -38,7 +38,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.3.0"
+tag = "4.4.0"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -69,7 +69,7 @@ you don't need the dep:
   ```cyml
   [deps.chitra]
   git = "https://github.com/MacCracken/chitra.git"
-  tag = "1.0.3"
+  tag = "1.4.1"
   modules = ["dist/chitra.cyr"]
   ```
 
@@ -82,7 +82,7 @@ you don't need the dep:
   ```cyml
   [deps.samvada]
   git = "https://github.com/MacCracken/samvada.git"
-  tag = "1.0.1"
+  tag = "1.1.2"
   modules = ["dist/samvada.cyr"]
   ```
 
@@ -252,7 +252,7 @@ project. mabda's `make example-link` compiles and links it this way
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.3.0 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.4.0 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

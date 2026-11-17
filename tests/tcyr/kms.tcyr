@@ -466,6 +466,97 @@ fn test_kms_wait_event_nonblocking() {
     return 0;
 }
 
+# 4.4.0 audit L1 — the present waits for ITS flip's event. A FLIP_COMPLETE left queued by a
+# wait that timed out (or another CRTC's) is skipped, so a later present doesn't return one
+# flip early. And the timeout is a deadline for the whole wait.
+fn _fake_flip(buf, seq, user_data, crtc): i64 {
+    _fake_event(buf, DRM_EVENT_FLIP_COMPLETE, seq);
+    store64(buf + DRM_EVENT_VBLANK_USER_DATA, user_data);
+    store32(buf + DRM_EVENT_VBLANK_CRTC_ID, crtc);
+    return 0;
+}
+
+fn test_kms_wait_flip_for_skips_stale_events() {
+    var p[8];
+    assert_eq(syscall(293, &p, 0x800, 0), 0, "pipe2(O_NONBLOCK)");
+    var rfd = load32(&p);
+    var wfd = load32(&p + 4);
+    var ev[128];
+    var seq[4];
+    # a stale flip (FB 40) and then this one (FB 41), in one read
+    _fake_flip(&ev, 10, 40, 7);
+    _fake_flip(&ev + 32, 11, 41, 7);
+    syscall(1, wfd, &ev, 64);
+    store32(&seq, 0);
+    assert_eq(native_kms_wait_flip_for(rfd, 7, 41, &seq), 0, "this flip's event found past a stale one");
+    assert_eq(load32(&seq), 11, "its sequence, not the stale event's");
+    # another CRTC's flip with the same user_data is skipped; an event with no CRTC id matches
+    _fake_flip(&ev, 20, 41, 9);
+    _fake_flip(&ev + 32, 21, 41, 0);
+    syscall(1, wfd, &ev, 64);
+    assert_eq(native_kms_wait_flip_for(rfd, 7, 41, &seq), 0, "the other CRTC's skipped");
+    assert_eq(load32(&seq), 21, "an event without a CRTC id is taken");
+    # the any-flip drain still takes the first FLIP_COMPLETE
+    _fake_flip(&ev, 30, 99, 3);
+    syscall(1, wfd, &ev, 32);
+    assert_eq(native_kms_wait_flip_complete(rfd, &seq), 0, "the any-flip drain");
+    assert_eq(load32(&seq), 30, "takes the first");
+    # only stale events: the wait gives up when nothing more arrives (-ETIME)
+    _fake_flip(&ev, 40, 40, 7);
+    syscall(1, wfd, &ev, 32);
+    var t0 = _native_mono_ns();
+    var r = native_kms_wait_flip_for(rfd, 7, 41, &seq);
+    var dt_ms = (_native_mono_ns() - t0) / 1000000;
+    assert_eq(r, 0 - 62, "no matching flip: -ETIME");
+    assert_eq(dt_ms < 2500, 1, "within the 1 s wait (and a margin)");
+    # the wait's timeout is one deadline
+    t0 = _native_mono_ns();
+    assert_eq(native_drm_wait_event(rfd, &ev, 128, 30), 0 - 62, "a 30 ms wait times out");
+    dt_ms = (_native_mono_ns() - t0) / 1000000;
+    assert_eq(dt_ms >= 29, 1, "after about 30 ms");
+    assert_eq(dt_ms < 500, 1, "not much more");
+    assert_eq(native_drm_wait_event(rfd, &ev, 128, 0 - 1), 0 - 1, "a negative timeout is refused");
+    syscall(3, rfd);
+    syscall(3, wfd);
+    return 0;
+}
+
+# 4.4.0 audit L3 — the CRTC already driving the connector is kept, so the console config saved
+# before the modeset is this connector's own.
+fn test_kms_pick_crtc() {
+    var crtcs[16];
+    store32(&crtcs, 31);
+    store32(&crtcs + 4, 32);
+    store32(&crtcs + 8, 33);
+    var enc[20];
+    memset(&enc, 0, 20);
+    store32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS, 7);
+    store32(&enc + DRM_MODE_GET_ENCODER_CRTC_ID, 32);
+    assert_eq(native_kms_pick_crtc(&enc, &crtcs, 3), 32, "the CRTC driving it, not the lowest bit's");
+    store32(&enc + DRM_MODE_GET_ENCODER_CRTC_ID, 0);
+    assert_eq(native_kms_pick_crtc(&enc, &crtcs, 3), 31, "unbound: the lowest CRTC it can use");
+    store32(&enc + DRM_MODE_GET_ENCODER_CRTC_ID, 77);
+    store32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS, 4);
+    assert_eq(native_kms_pick_crtc(&enc, &crtcs, 3), 33, "a CRTC the card doesn't list: the mask's");
+    store32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS, 8);
+    assert_eq(native_kms_pick_crtc(&enc, &crtcs, 3), 0, "a mask bit past the CRTC count: 0");
+    store32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS, 0);
+    assert_eq(native_kms_pick_crtc(&enc, &crtcs, 3), 0, "an empty mask: 0");
+    assert_eq(native_kms_pick_crtc(0, &crtcs, 3), 0, "no encoder: 0");
+    assert_eq(native_kms_pick_crtc(&enc, 0, 3), 0, "no CRTC list: 0");
+    return 0;
+}
+
+# 4.4.0 audit L2 — one mapping for both presents: the drain's -2 / -3 are a lost surface.
+fn test_kms_present_rc_mapping() {
+    assert_eq(_native_present_rc_to_gpu_err(0), 0, "0 stays 0");
+    assert_eq(_native_present_rc_to_gpu_err(0 - 2), GPU_ERR_SURFACE_LOST, "-2: no flip-complete");
+    assert_eq(_native_present_rc_to_gpu_err(0 - 3), GPU_ERR_SURFACE_LOST, "-3: a malformed event");
+    assert_eq(_native_present_rc_to_gpu_err(0 - 62), _native_neg_rc_to_gpu_err(0 - 62), "-ETIME: the errno map");
+    assert_eq(_native_present_rc_to_gpu_err(0 - 16), _native_neg_rc_to_gpu_err(0 - 16), "-EBUSY: the errno map");
+    return 0;
+}
+
 # v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB)
 
 fn test_drm_mode_fb_ioctl_numbers() {
@@ -931,6 +1022,9 @@ fn main() {
     test_drm_mode_fb_cmd2_field_offsets();
     test_kms_first_connected_mode_and_size_msg();
     test_kms_wait_event_nonblocking();
+    test_kms_wait_flip_for_skips_stale_events();
+    test_kms_pick_crtc();
+    test_kms_present_rc_mapping();
     test_drm_format_fourcc_constants();
     test_native_kms_add_fb_xrgb8888_null_safe();
     test_native_kms_rm_fb_null_safe();

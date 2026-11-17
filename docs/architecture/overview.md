@@ -104,10 +104,15 @@ src/   (68 domain modules + lib.cyr — annotated below; the filesystem is autho
 │                        backend_nvidia_push.cyr    — pushbuffer / method-stream builders
 │                        backend_nvidia_qmd.cyr     — Turing compute QMD builder
 │                        backend_nvidia_sass.cyr    — pre-compiled SM75 SASS programs
-│                        backend_nvidia_tex.cyr     — Turing TIC/TSC descriptor builders
-└── @internal SPIR-V→GFX9 compiler (v3.2.x): gfx9_encode.cyr, spirv_parse.cyr,
-                         mir.cyr, spirv_lower.cyr, gfx9_isel.cyr,
-                         gfx9_regalloc.cyr, gfx9_waitcnt.cyr, gfx9_abi.cyr, gfx9_compile.cyr
+│                        backend_nvidia_tex.cyr     — Turing TIC/TSC descriptor builders,
+│                                                     block-linear scanout layout (4.4.0)
+├── @internal SPIR-V→GFX9 compiler (v3.2.x): gfx9_encode.cyr, spirv_parse.cyr,
+│                        mir.cyr, spirv_lower.cyr, gfx9_isel.cyr,
+│                        gfx9_regalloc.cyr, gfx9_waitcnt.cyr, gfx9_abi.cyr, gfx9_compile.cyr
+└── @internal SPIR-V→SM75 compiler (v4.4.0, N9): the same front end and MIR, then
+                         sm75_encode.cyr (instruction encoder + control words),
+                         sm75_isel.cyr (selection, predicates, BSSY/BSYNC, f64),
+                         sm75_regalloc.cyr, sm75_compile.cyr (scheduling + driver)
 ```
 
 Stdlib includes live **only** in `src/lib.cyr`. Domain modules are

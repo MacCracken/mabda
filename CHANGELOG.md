@@ -13,46 +13,132 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [4.4.0] — in progress (VERSION still reads 4.3.1)
+## [4.4.0] — 2026-11-17
 
-**Compilers + NVIDIA** ([roadmap](docs/development/roadmap.md#v440--compilers--nvidia)). Landed
-so far in the native AMD SPIR-V compiler:
-- **The scratch-buffer contract.** Every compiler buffer now arrives with its length in bytes, and
-  each stage derives its capacity from that length. Moving the call sites over turned up three
-  real overruns, one in the path that compiles consumer SPIR-V.
-- **The compiler limits v4.1.0 left named.** Divergent ifs now nest (up to 8 levels), and
-  int-compare `OpSelect` works with a uniform condition and with a compare that isn't adjacent.
-  The roadmap described these as "each refused with a code today, never miscompiled". That turned
-  out to be wrong for the shapes next to them. All of these compiled and ran with **wrong
-  results and no error**: divergent if/else; divergent loops; a branch whose compare was followed
-  by an instruction that overwrites SCC/VCC; loop phis (missing copies on conditional edges,
-  swapped phis, f64 phis); and a dead load whose register was reused. The v4.1.0 int-compare
-  select never worked through the real pipeline, and a crafted label id crashed the compile frame.
-  All of these are fixed, and each is pinned by a kernel the new hardware gate checks lane by
-  lane.
-- **A 1024-id MIR space** (was 256), shared with NVIDIA. ranga's bilinear resize, refused with
-  `MIR_ERR_ID_OOR` until now, compiles and matches its golden.
+**Compilers + NVIDIA.** Phase 3 of the 2026-11 plan. Every item the roadmap pinned to 4.4.0
+shipped, the seat-only closeout and the consumer check included.
+- **N9: SPIR-V → SASS for NVIDIA.** `gpu_shader_module_create_spirv` on an NVIDIA context now
+  compiles SPIR-V in-tree to Turing (SM75) SASS. It reuses the SPIR-V front end and MIR, and has
+  its own instruction selection, register allocation, scheduling, encoder and control words
+  (`src/sm75_*.cyr`; design note
+  [`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md)). It covers
+  branches, loops and phis, then the design note's four follow-ons: latency-table scheduling,
+  predicate allocation, `BSSY` / `BSYNC` reconvergence, and `OpFDiv` / f64. On the TU116:
+  - 26 of 27 control-flow kernels match every lane, and the 27th is refused by name;
+  - ranga's 12 kernels match independent goldens;
+  - 15 f64 kernels are bit-exact against an IEEE oracle;
+  - ranga's GPU suites pass with an NVIDIA context.
+- **The GFX9 compiler's control flow.** The shapes next to the limits v4.1.0 left named compiled
+  and ran with **wrong results and no error**: divergent if/else, divergent loops, stale
+  SCC/VCC, loop phis, and a reused in-flight load register. All of these are fixed, and each is
+  pinned by a kernel the hardware gate checks lane by lane. The named limits themselves landed:
+  nested divergent ifs (8 deep) and int-compare `OpSelect`.
+- **One 1024-id MIR space** for both back ends (was 256). It is why ranga's bilinear resize
+  compiles on AMD and NVIDIA.
+- **The scratch-buffer contract.** Every compiler buffer now arrives with its byte length, and
+  each stage derives its capacity from it. Moving the call sites over found three real overruns,
+  one of them a HIGH in the path that compiles consumer SPIR-V.
+- **NVIDIA block-linear scanout.** It has ADDFB2 format modifiers, and the layout is checked
+  against the copy engine. Fixed on the way: ADDFB2's request struct.
+- **The seat-only closeout**, logged, on both boxes. The display gates found and fixed four
+  present bugs:
+  - AMD refused the monitor's mode silently;
+  - the flip wait was a bare `read()` on logind's non-blocking fd;
+  - AMD's double buffer showed every other frame, torn;
+  - AMD's teardown left the display off instead of restoring the console, as NVIDIA's does.
 
-Every 4.4.0 roadmap item is now done, the seat-only closeout and the consumer check included
-(below). "The same in N9's SM75 path" is done in N9.5, below, and f64 (refused on NVIDIA at N9.5)
-landed with the fourth N9 follow-on.
+  The logind path now returns the device on NVIDIA.
+- **The older wgpu `gpu_surface_acquire` path no longer leaks** a texture reference per frame.
+- **Dependencies:** samvada 1.0.1 → **1.1.2**, which fixes a HIGH in the `TakeDevice` path
+  mabda's logind present uses, and chitra 1.0.3 → **1.4.1** (below).
 
-**N9 (SPIR-V → SASS for NVIDIA) is done.** The design note is
-[`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.6 cover the
-encoder, instruction selection, register allocation, scheduling, the compile driver, the
-backend wiring, branches, loops and phis, and ranga. `gpu_shader_module_create_spirv` on an
-NVIDIA context now compiles SPIR-V in-tree. On the TU116:
-- 22 of the 24 control-flow kernels match on every lane; the other two are refused by name
-  (f64; an out-of-range label);
-- ranga's 11 kernels match an independent oracle;
-- ranga's four GPU suites pass with an NVIDIA context.
+**The audit** ([`docs/audit/2026-11-17-4.4.0-audit.md`](docs/audit/2026-11-17-4.4.0-audit.md))
+found 1 HIGH, 2 MEDIUM and 9 LOW in mabda, all fixed (below). The HIGH: GFX9's waits ignored
+branches, so valid kernels with a load in flight across a skippable block read stale data. It
+was shown failing on the Cezanne, and is exact with the fix.
 
-The follow-ons the design note named are scheduled in the roadmap's 4.4.0 section. All four have
-landed (below): latency-table scheduling, predicate allocation, `BSSY` / `BSYNC` reconvergence,
-and `OpFDiv` / f64 on SM75.
+### Changed — dependencies
+- **samvada 1.0.1 → 1.1.2.** Through 1.1.1, a descriptor on a dbus message samvada could not
+  parse stayed queued and was returned by the next `TakeDevice`. So any local user could choose
+  the fd that `gpu_surface_configure_native_logind` modesets onto (samvada 1.1.2 P1-1, HIGH, the
+  class of CVE-2022-42012). samvada's public surface is unchanged: mabda calls
+  `samvada_native_init`, `samvada_session_take_device`, `samvada_session_release_device` and
+  `samvada_release`, all in 1.1.2's frozen eight. Its stricter `samvada_native_init` errors are
+  all negative, and mabda branches on non-zero. 1.1.2 needs cyrius ≥ 6.6.13; mabda pins 6.7.18.
+  Checked against the live system bus from this box: `samvada_native_init()` returns 0 and
+  `samvada_version()` reports 1.1.2.
+- **chitra 1.0.3 → 1.4.1.** Nothing frozen was renamed, and `chitra_png_decode_rgba8` /
+  `chitra_jpeg_decode_rgba8` keep their signatures. chitra now also decodes progressive JPEG,
+  and its subsampled-JPEG output moved toward `djpeg`. mabda documents PNG and baseline JPEG as
+  before; `asset_load.tcyr` passes unchanged. chitra 1.4 no longer needs the stdlib `thread`
+  leaf. It stays in mabda's `[deps].stdlib`, so consumer recipes that copy the list keep
+  building.
+- `cyrius.lock` is re-pinned for both: samvada c81fe21, chitra 0320010, plus chitra's
+  transitive sankoch 2.8.9. mabda's stdlib `sankoch` leaf still provides it, and its bytes are
+  unchanged.
+- **The bundle's Requires block** (`dist/mabda.deps`, and the `include` lines that open
+  `dist/mabda.cyr`) lists 9 leaves, down from 12. `alloc`, `string` and `fnptr` dropped out
+  because samvada 1.1.2's bundle includes them, and distlib credits a dep's includes. They were
+  redundant anyway: `vec`, `hashmap`, `chrono`, `sakshi` and `syscalls`, all still listed,
+  include them. The bundle still compiles from a bare include (`make test-raw-include`), and a
+  build with the old deps gives the old 12-leaf list, so it is the deps, not mabda.
 
-**NVIDIA block-linear scanout** has landed too (below), verified on the TU116 against the copy
-engine and on screen from chew's console.
+### Security — the 4.4.0 audit
+[`docs/audit/2026-11-17-4.4.0-audit.md`](docs/audit/2026-11-17-4.4.0-audit.md). Three reviewers
+were split by trust boundary (the compilers, the kernel boundary, wgpu), followed by a
+regression check of both 2026-11-16 audits (all 10 findings still fixed) and a CVE sweep.
+**0 CRITICAL / 1 HIGH / 2 MEDIUM / 9 LOW in mabda, all fixed**, plus samvada's HIGH (above).
+- **HIGH-1, GFX9 waits ignored branches** (`src/gfx9_waitcnt.cyr`). A wait inside a block a
+  branch can skip cleared the tracker for the code after the merge. On the path that skipped
+  it, a later load was read before it arrived, or a load landing late overwrote a register
+  regalloc had recycled. Valid kernels silently got wrong data. Now nothing is in flight across
+  a branch: every branch waits first, as SM75 already did. The new hardware kernel
+  `wait_skipped_only_use` was wrong on 63 of 64 lanes on the Cezanne without the fix, and is
+  exact with it.
+- **MED-1, an equal-target loop latch hung GFX9.** On `OpBranchConditional %c %H %H` its
+  back-edge phi copies were selected after the branch, where they never ran. It is now lowered
+  as an OpBranch, byte-identical to that form.
+- **MED-2, SM75 compiled exhausted ids as RZ.** An f64 divide near the 1024-id limit returned
+  0.0 instead of failing. `_s75_put` now refuses any negative operand id with that operand's
+  own code.
+- **LOW:**
+  - the flip wait takes only its own flip's event, with a real deadline (below);
+  - NVIDIA's present maps a lost surface as AMD's does;
+  - the modeset keeps the CRTC already driving the connector;
+  - three wgpu surface edge cases (in "the older wgpu surface path leaked", below);
+  - a uniform branch on a 0/-1 mask is refused;
+  - branch targets come from a once-per-module label table instead of a stream scan per branch;
+  - four size comments are fixed.
+
+  Each code finding lands with a test; the HIGH and MED-1 tests are mutation-checked.
+- **Four new control-flow kernels** (31 in the corpus): `wait_skipped_uniform_use`,
+  `wait_skipped_only_use`, `loop_latch_same_targets` and its twin `loop_latch_branch`. They are
+  lane-checked on the Cezanne and the TU116.
+
+### Fixed — the flip wait (audit LOW-1–3)
+- `native_kms_wait_flip_for(card_fd, crtc_id, user_data, seq_out)` takes only the
+  FLIP_COMPLETE of the flip it waits for: its `user_data` (the FB id; NVIDIA now passes one too)
+  and its CRTC. A wait that timed out on a flip the kernel went on to complete used to leave
+  that event queued, and every later present returned one flip early.
+- `native_drm_wait_event`'s timeout is one deadline. An EINTR no longer restarts the full second
+  or counts as a retry.
+- Both presents map the drain's -2 / -3 to `GPU_ERR_SURFACE_LOST`
+  (`_native_present_rc_to_gpu_err`).
+- `native_kms_pick_crtc` keeps the CRTC already driving the connector, so on two heads the
+  console save and restore are this connector's own.
+
+  Tests in `kms.tcyr` (383).
+
+### Fixed — the compute-tier soak gate was flaky
+`test-compute-tier-e2e` part D required one 40k-pass window after a 120k-pass warm-up to grow
+RSS by at most 512 KiB.
+- On Mesa 26.2.7 that window grew 0 to 2,216 KiB, in ~444 KiB steps, under both 4.3.1's build
+  and 4.4.0's (`build/logs/cut-440-compute-tier-rss-ab-*.log`).
+- Eight consecutive windows after it grew 0 each, and the Cyrius heap grew 0 B throughout
+  (`build/logs/cut-440-compute-tier-soak-windows-*.log`). That is wgpu and the driver reaching
+  their high-water mark later, not a leak.
+- The gate now runs up to four windows and needs one within 512 KiB. A per-pass leak of 13 bytes
+  or more grows every window, so it still fails.
 
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
@@ -344,8 +430,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - **On the TU116, the same four suites and the same counts, all passing**, with a clean kernel
     log (`build/logs/ranga-gpu-suites-nvidia-n9.6-20261116-142509.log`).
   - ranga's `gpu_nvidia.tcyr` now fails 31 of 54 rows. That is by design: it pins ADR 005's
-    refusals, and its header says to flip them when the guard lifts. ranga's side is listed in
-    the roadmap's consumer check.
+    refusals, and its header says to flip them when the guard lifts. ranga's side is filed in
+    ranga (`docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`).
 - Tests: `sm75_compile.tcyr` (171 assertions) adds three tests. All 11 ranga kernels compile
   for SM75 and for GFX9 with equal binding counts (3 or 4) and LocalSize 256. A hand-built
   module declaring bindings 0 and 2 counts 3 on both backends. Invert loads exactly two binding
@@ -734,7 +820,7 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 
   `test-native-all` skips it like the other master gates.
 - **Found while writing it:** the logind path never returns the device on NVIDIA (`NvSurface` has
-  no "mabda owns this fd" field). It is a roadmap item.
+  no "mabda owns this fd" field). Fixed below.
 - **chew's closeout passed** (`make seat-closeout-nvidia`, 2026-11-16,
   `build/logs/chew-seat-closeout-nvidia-20261116-191558.log`), from a text console with sddm
   stopped. All five card-node gates passed: `kms-summary`, `kms-scanout` (ADDFB2 with the corrected
@@ -768,7 +854,13 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 
 ### Verified — the consumer check (2026-11-17)
 Run against this tree's `dist/mabda.cyr` (6514b46 plus the uncommitted 4.4.0 work), in scratch
-clones; no consumer repository was touched. If `src/` changes before the cut, rerun it.
+clones; no consumer repository was touched. **Rerun on the final cut tree** (after the samvada
+and chitra moves and the audit fixes), with the same results everywhere:
+- the name scan: 4,051 names, 0 shared;
+- ranga on both GPUs (`build/logs/consumer-ranga-{amd,nvidia}-final-*.log`);
+- soorat's probes (`build/logs/consumer-soorat-final-*.log`).
+
+The first run:
 - **Name scan:** none of the dist's 4,037 top-level names is defined by ranga's `src/`,
   soorat's dist or bijli.
 - **ranga** (scratch clone of cca5976): its `lib/mabda.cyr` was replaced with this dist, and two
@@ -915,7 +1007,17 @@ AMD's looked broken. The AMD gates passed every check, but two bugs sat behind t
   - a failed acquire releases whatever texture wgpu returned with it;
   - the status struct is on the stack.
 - **Behaviour change.** A second acquire before the present returns the same texture. Before,
-  it asked wgpu again, which wgpu refuses. The newer path already worked this way.
+  it asked wgpu again, which wgpu refuses. The newer path already worked this way. The texture
+  `gpu_surface_acquire` returns belongs to the surface, which frees it at present, resize or
+  release: don't release it yourself, and don't use it after the present. No consumer in the
+  tree releases it (checked: soorat, rasa, ranga, bijli, aethersafta, kiran).
+- **Hardened by the 4.4.0 audit** (LOW-1–3, `docs/audit/2026-11-17-4.4.0-audit.md`):
+  - releasing an older-path record that is no longer the context's current surface now drops
+    its unpresented frame too;
+  - a present with no frame acquired returns `GPU_ERR_SURFACE_CONFIG` instead of calling
+    `wgpuSurfacePresent`, as the newer path does;
+  - a failed acquire allocates nothing: the reason goes to the error channel
+    (`_surface_state_acquire_raw`), so retrying it every frame doesn't grow the heap.
 - **The same leak, mixed.** `gpu_surface_acquire` on a `gpu_surface_configure` surface used to
   acquire a second reference that nothing released. It now returns the surface's own frame
   texture, which its present releases.
@@ -1007,8 +1109,34 @@ AMD's looked broken. The AMD gates passed every check, but two bugs sat behind t
   `test_mir_mod_init_oversized_vals_clamps`. `test_mir_mod_init_contract` is rewritten for
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
-### Verified (so far)
-- CPU: 29 suites, **7847 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+### Verified — the cut (2026-11-17, the final tree)
+- **CPU:** 29 suites, **7932 assertions**, 0 failed
+  (`build/logs/cut-440-final-cpu-suite-*.log`).
+  - Every CI gate passes locally (`build/logs/cut-440-ci-gates-*.log`): per-file lint,
+    `--strict-deferrals` and `fmt --check` over every file, `cyrius vet`, buffer sizing, the
+    ranga / f64 / control-flow fixtures, stack-array sizing, program write lengths, the count
+    script, fuzz logs, the make dry-run, `fuzz`, the smoke build with DCE, `example-link`,
+    `test-raw-include`, version-check, and the security scan.
+  - `cyrius distlib` is idempotent: 1,861,396 B. Its one warning is the tracked M10.
+- **Cezanne** (Mesa 26.2.7, Linux 7.3.4, no GPU reset this boot;
+  `build/logs/cut-440-final-cezanne-hw-*.log`):
+  - `make test-native-all`: 75 passed, 0 failed, 3 skipped for DRM master;
+  - `make test-gpu`: passed;
+  - `test-native-spirv-control-flow-e2e`: 31 of 31 kernels, the audit's four new ones
+    included.
+- **TU116** (`chew`; `build/logs/chew-cut-440-final-nvidia-masterless-*.log`): all 17
+  masterless gates, the new kernels lane-exact, and `make test-gpu` on NVK, with no nouveau
+  errors.
+- **Benches:** `cyrius bench` matches 4.3.1 within noise, run in the same hour on the same box
+  (`build/logs/cut-440-bench-ab-*.log`). The new baseline is
+  `docs/audit/baselines/2026-11-17-cpu-bench-baseline.csv`.
+- **The consumer check:** rerun on this tree, the same results as above.
+- **Still to run: the seat closeout on both boxes**, after the audit's flip-wait and CRTC-pick
+  fixes and the samvada move: `make seat-closeout-amd` on the Cezanne and
+  `make seat-closeout-nvidia` on chew, from a text console with sddm stopped.
+
+### Verified — during development
+- CPU: 29 suites, **7847 assertions** before the cut, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
   predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9

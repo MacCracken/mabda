@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.3.1 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.4.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -24,7 +24,10 @@ indexed draws with dynamic offsets, viewport and scissor), and a validation erro
 returns a `GPU_ERR_*` with wgpu's reason instead of aborting the process. **v4.3.1
 completes it** (MB2–MB5): depth targets and shadow passes, sRGB / BGRA8 / RGBA16F textures, MSAA,
 texture views, mip generation and copies on wgpu, compute passes and `gpu_compute_dispatch` on
-wgpu, and a Wayland window surface. See
+wgpu, and a Wayland window surface. **v4.4.0 compiles SPIR-V for NVIDIA in-tree**
+(SPIR-V → SM75 SASS, with control flow, f64 and ranga's kernels), fixes control-flow shapes the
+GFX9 compiler ran wrong without an error, widens both compilers to one 1024-id space, adds NVIDIA
+block-linear scanout, and passes the seat-only display gates on both GPUs. See
 [CHANGELOG.md](CHANGELOG.md) for the full release history and *Hardware support* below.
 
 ## Features
@@ -41,7 +44,7 @@ wgpu, and a Wayland window surface. See
 - **Render targets and passes** — `gpu_render_target_create` in RGBA8 / sRGB / BGRA8 / RGBA16F / Depth32F with 4x MSAA, the `gpu_pass_desc_*` pass descriptor (up to 8 colour targets, depth with load / clear / store / read-only, resolve), texture views (a cube face or mip level as an attachment), texture copies, mip generation and render-target readback (wgpu; the native backends serve one RGBA8 target)
 - **Window surfaces** — a wgpu surface from a Wayland `wl_display` / `wl_surface`, its capabilities, BGRA8 formats, AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture objects, resize; native KMS present on AMD and NVIDIA
 - **Asset loading** — KTX2 / DDS parsers in-tree + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
-- **Native SPIR-V → GFX9 compiler** — in-tree compute-shader lowering (structured control flow, int div/mod, vectors, f64), HW-verified on Cezanne
+- **Native SPIR-V compilers** — in-tree compute-shader lowering to GFX9 (AMD) and, since 4.4.0, to SM75 SASS (NVIDIA): structured control flow, int div/mod, vectors, f64; HW-verified on Cezanne and TU116
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)
 - **Profiling** — FrameProfiler with EMA smoothing, frame history, pass timings, JSON / CSV export, explicit scope timing
 - **Caching** — ShaderCache, PipelineCache, BindGroupCache for GPU resource deduplication
@@ -49,7 +52,7 @@ wgpu, and a Wayland window surface. See
 
 ## Quick Start
 
-mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~1.5 MB — 1,511,389 B at 4.3.0 — it would
+mabda is an **opt-in** distlib — it is *not* auto-prepended (at ~1.9 MB — 1,861,396 B at 4.4.0 — it would
 blow the stdlib preprocess cap). The base stdlib (`string`/`alloc`/`str`/`fmt`/
 `vec`/`io`/…) is auto-prepended by `cyrius`; a minimal consumer includes only
 these three manually, in this order, before `mabda`:
@@ -95,9 +98,9 @@ for the full wiring. (The C launcher + `wgpu_ffi_init_table` shown above are the
 launcher.)
 
 Extra deps opt in via compile flags: **PNG / JPEG asset loading**
-(`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 1.0.3) + stdlib
+(`-D MABDA_PNG` / `-D MABDA_JPEG`) both pull `[deps.chitra]` (tag 1.4.1) + stdlib
 `thread`/`sankoch` (include their `lib/*.cyr` before `mabda`); **logind master
-delegation** (`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 1.0.1; the consumer
+delegation** (`-D MABDA_LOGIND`) pulls `[deps.samvada]` (tag 1.1.2; the consumer
 calls `samvada_native_init()` first — pure-Cyrius dbus, no C shim). A minimal
 consumer needs none — the dist compiles those paths out without the flags.
 
@@ -116,6 +119,7 @@ consumer needs none — the dist compiles those paths out without the flags.
 | **Native AMD** (`@internal`) | backend_native, backend_native_amdgpu, backend_native_pm4, backend_native_shaders, backend_native_kms |
 | **SPIR-V → GFX9 compiler** (`@internal`) | spirv_parse, spirv_lower, mir, gfx9_encode, gfx9_isel, gfx9_regalloc, gfx9_waitcnt, gfx9_abi, gfx9_compile |
 | **Native NVIDIA** (`@internal`) | backend_nvidia, backend_nvidia_nouveau, backend_nvidia_push, backend_nvidia_qmd, backend_nvidia_sass, backend_nvidia_tex |
+| **SPIR-V → SM75 compiler** (`@internal`, 4.4.0) | sm75_encode, sm75_isel, sm75_regalloc, sm75_compile (front end and MIR shared with GFX9) |
 | **wgpu FFI** (`@internal`) | wgpu_types, wgpu_descriptors, wgpu_ffi |
 
 ## Consumers
@@ -168,7 +172,7 @@ roadmap is in [docs/development/roadmap.md](docs/development/roadmap.md).
 |-------------------|--------------------------|------------------------------------|
 | `wgpu`            | NVIDIA, Intel (+ AMD, **deprecated** at v4.0.1)                        | **Cross-vendor default. Shipping.** AMD-on-wgpu is deprecated at v4.0.1 (warn+allow; `-D MABDA_AMD_WGPU_STRICT` enforces native-only). Retires per-chipset as each vendor's native path matures. |
 | `native` (AMD)    | AMD                      | **Shipping (v3.0 GA + the v3.1–v3.4 arcs).** Compute, textures (incl. BC-compressed + arrays/cubes), render, multi-queue, a SPIR-V→GFX9 f64 compiler, and KMS present all verified end-to-end on AMD Cezanne (gfx90c, GFX9). Other GFX families (GFX10/11/12, RDNA*) not yet exercised — same amdgpu / PM4 / DRM ioctl path, but each generation needs its own bring-up. |
-| `native` (NVIDIA) | NVIDIA                   | **Shipping (v4.0).** Compute, textures (incl. GPU sampling), render, and KMS present HW-verified on Turing / SM75 (GTX 1660 SUPER / TU116); ~30¾h soak (RSS-flat, dmesg Δ=0). nouveau DRM + clc597 push + SM75 SASS, no PM4. Other SM families not yet exercised — each needs its own bring-up. |
+| `native` (NVIDIA) | NVIDIA                   | **Shipping (v4.0).** Compute (pre-compiled SASS, and SPIR-V compiled in-tree since 4.4.0), textures (incl. GPU sampling), render, and KMS present (block-linear scanout since 4.4.0) HW-verified on Turing / SM75 (GTX 1660 SUPER / TU116); ~30¾h soak (RSS-flat, dmesg Δ=0). nouveau DRM + clc597 push + SM75 SASS, no PM4. Other SM families not yet exercised — each needs its own bring-up. |
 | `native` (Intel)  | Intel                    | **Tentative for v5.0.** Different submission path (i915 / Xe, no PM4, Gen ISA). Intel consumers stay on `wgpu` until v5.0 ships. |
 
 **Per-chipset retirement.** When a vendor's native backend has been
@@ -264,7 +268,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.3.0
+├── VERSION              4.4.0
 └── CHANGELOG.md
 ```
 

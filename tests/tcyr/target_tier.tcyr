@@ -1015,7 +1015,9 @@ fn test_wgpu_legacy_surface_frames() {
     }
     assert_eq(_mt_tex_release, 1001, "1000 frames, 1000 more releases");
     assert_eq(alloc_used() - before, 0, "1000 frames allocate 0 bytes");
-    assert_eq(gpu_surface_present(&ctx, s), 0, "a present with no frame acquired");
+    var presents = _mt_present;
+    assert_eq(gpu_surface_present(&ctx, s), GPU_ERR_SURFACE_CONFIG, "a present with no frame acquired is refused");
+    assert_eq(_mt_present, presents, "and wgpuSurfacePresent is not called");
     assert_eq(_mt_tex_release, 1001, "releases nothing");
     # a failed acquire holds nothing and releases what wgpu returned with it
     _mt_cur_status = 4;
@@ -1023,6 +1025,16 @@ fn test_wgpu_legacy_surface_frames() {
     assert_eq(gpu_surface_acquire(&ctx, s), 0, "outdated: no frame");
     assert_eq(load64(s + 80), 0, "nothing held");
     assert_eq(_mt_tex_release, 1, "the failed acquire's texture released");
+    assert_eq(gpu_last_error(), GPU_ERR_SURFACE_LOST, "the reason is on the error channel");
+    assert_eq(gpu_surface_present(&ctx, s), GPU_ERR_SURFACE_CONFIG, "a present after a failed acquire is refused");
+    # a failing acquire retried every frame allocates nothing (4.4.0 audit LOW-3)
+    var fail_before = alloc_used();
+    var k = 0;
+    while (k < 1000) {
+        gpu_surface_acquire(&ctx, s);
+        k = k + 1;
+    }
+    assert_eq(alloc_used() - fail_before, 0, "1000 failed acquires allocate 0 bytes");
     _mt_cur_status = 1;
     # resize and release drop an unpresented frame
     _mt_tex_release = 0;
@@ -1033,6 +1045,17 @@ fn test_wgpu_legacy_surface_frames() {
     gpu_surface_acquire(&ctx, s);
     gpu_surface_release(&ctx, s);
     assert_eq(_mt_tex_release, 2, "release dropped the unpresented frame");
+    # a record that is no longer the context's current surface drops its frame on release too
+    # (4.4.0 audit LOW-1: that release returns early, before surface_state_release)
+    var s1 = gpu_surface_configure_wgpu(&ctx, 0x5F, 64, 32);
+    var s2 = gpu_surface_configure_wgpu(&ctx, 0x6F, 64, 32);
+    assert_nonnull(s2, "a second older-path surface");
+    _mt_tex_release = 0;
+    assert_eq(gpu_surface_acquire(&ctx, s1), 0x5A, "a frame on the first record");
+    gpu_surface_release(&ctx, s1);
+    assert_eq(_mt_tex_release, 1, "a non-current record's unpresented frame is released");
+    assert_eq(load64(s1 + 80), 0, "and it holds nothing");
+    gpu_surface_release(&ctx, s2);
     assert_eq(_mt_wrong, 0, "no wrong slot");
     _mt_uninstall();
     return 0;

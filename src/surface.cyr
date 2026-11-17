@@ -123,9 +123,17 @@ fn surface_state_resize(ss, width, height): i64 {
 # unpresented one). A second acquire before the present returns the SAME texture rather than
 # asking wgpu again, which refuses a second acquire. The struct it reads is on the stack
 # (it was a 24-byte bump allocation a frame).
-fn surface_state_acquire(ss): i64 {
+#
+# _surface_state_acquire_raw allocates nothing on any path: it returns the texture, or 0 with
+# the GPU_ERR_* code at err_out+0 and a static reason string at err_out+8 (err_out is 16
+# bytes). gpu_surface_acquire's slot uses it, so a consumer that retries a failing acquire
+# every frame (an occluded window) no longer allocates a 16-byte error each time (the 4.4.0
+# audit, LOW-3). surface_state_acquire keeps its Result form for direct callers.
+fn _surface_state_acquire_raw(ss, err_out): i64 {
+    store64(err_out, 0);
+    store64(err_out + 8, 0);
     var held = load64(ss + 80);
-    if (held != 0) { return gpu_ok(held); }
+    if (held != 0) { return held; }
     var out[24];
     memset(&out, 0, 24);
     wgpu_surface_get_current_texture(surface_state_handle(ss), &out);
@@ -136,17 +144,30 @@ fn surface_state_acquire(ss): i64 {
     if (status == WGPU_SURFACE_STATUS_SUCCESS_SUBOPTIMAL) { good = 1; }
     if (good == 1) {
         if (texture == 0) {
-            return gpu_err_result_msg(GPU_ERR_SURFACE_LOST, "surface: wgpu returned no frame texture");
+            store64(err_out, GPU_ERR_SURFACE_LOST);
+            store64(err_out + 8, "surface: wgpu returned no frame texture");
+            return 0;
         }
         store64(ss + 80, texture);
-        return gpu_ok(texture);
+        return texture;
     }
     # a failed acquire can still carry a texture reference: release it
     if (texture != 0) { wgpu_texture_release(texture); }
     if (status == WGPU_SURFACE_STATUS_TIMEOUT) {
-        return gpu_err_result_msg(GPU_ERR_SURFACE_TIMEOUT, "surface texture acquire timed out");
+        store64(err_out, GPU_ERR_SURFACE_TIMEOUT);
+        store64(err_out + 8, "surface texture acquire timed out");
+        return 0;
     }
-    return gpu_err_result_msg(GPU_ERR_SURFACE_LOST, "surface texture acquire failed");
+    store64(err_out, GPU_ERR_SURFACE_LOST);
+    store64(err_out + 8, "surface texture acquire failed");
+    return 0;
+}
+
+fn surface_state_acquire(ss): i64 {
+    var e[16];
+    var texture = _surface_state_acquire_raw(ss, &e);
+    if (texture != 0) { return gpu_ok(texture); }
+    return gpu_err_result_msg(load64(&e), load64(&e + 8));
 }
 
 # ================================================================

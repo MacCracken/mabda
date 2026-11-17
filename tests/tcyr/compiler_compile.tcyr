@@ -1328,6 +1328,75 @@ fn test_cf_isa_shapes() {
     return 0;
 }
 
+# 4.4.0 audit HIGH-1 / MEDIUM-1, in the compiled code. The wait kernels branch on a uniform
+# compare with loads in flight: s_waitcnt vmcnt(0) must come right before the s_cbranch_scc0.
+# The equal-target latch must compile to exactly its OpBranch twin's code: that twin's shape is
+# what every loop gate runs, so this is checked before the kernel runs on hardware (a wrong
+# lowering there hangs the GPU).
+fn test_cf_audit_fixes_isa() {
+    var isa[8192];
+    var isa2[8192];
+    var len = _cfk_compile("wait_skipped_uniform_use", &isa);
+    assert_eq(len > 0, 1, "wait_skipped_uniform_use compiles");
+    var cb = _isa_find(&isa, len, 0xFFFF0000, 0xBF840000);
+    assert_eq(cb > 0, 1, "it has an s_cbranch_scc0");
+    assert_eq(load32(&isa + cb - 4), 0xBF8C0F70, "s_waitcnt vmcnt(0) right before it");
+    len = _cfk_compile("wait_skipped_only_use", &isa);
+    cb = _isa_find(&isa, len, 0xFFFF0000, 0xBF840000);
+    assert_eq(cb > 0, 1, "wait_skipped_only_use: s_cbranch_scc0");
+    assert_eq(load32(&isa + cb - 4), 0xBF8C0F70, "s_waitcnt vmcnt(0) right before it");
+    len = _cfk_compile("loop_latch_same_targets", &isa);
+    var len2 = _cfk_compile("loop_latch_branch", &isa2);
+    assert_eq(len > 0, 1, "loop_latch_same_targets compiles");
+    assert_eq(len, len2, "the equal-target latch: the OpBranch twin's length");
+    var same = 1;
+    var p = 0;
+    while (p < len) {
+        if (load32(&isa + p) != load32(&isa2 + p)) { same = 0; }
+        p = p + 4;
+    }
+    assert_eq(same, 1, "and its exact bytes");
+    return 0;
+}
+
+# 4.4.0 audit LOW-2 — the label table answers exactly what the stream scan does, for every label
+# id of every control-flow kernel, and spirv_lower_module drops it when it returns.
+fn test_cf_label_table_matches_scan() {
+    var spv[1680];
+    var k = 0;
+    var bad = 0;
+    var checked = 0;
+    while (k < CFK_COUNT) {
+        var n = cfk_build(k, &spv);
+        var idb = spirv_hdr_id_bound(&spv);
+        var scans[2048];
+        var befores[2048];
+        _lower_lab_ptr = 0;
+        var id = 1;
+        while (id < idb) {
+            store64(&scans + id * 8, _spirv_find_label(&spv, n, id));
+            store64(&befores + id * 8, _spirv_label_before(&spv, 40, id));
+            id = id + 1;
+        }
+        _spirv_build_label_table(&spv, n);
+        id = 1;
+        while (id < idb) {
+            if (_spirv_find_label(&spv, n, id) != load64(&scans + id * 8)) { bad = bad + 1; }
+            if (_spirv_label_before(&spv, 40, id) != load64(&befores + id * 8)) { bad = bad + 1; }
+            checked = checked + 1;
+            id = id + 1;
+        }
+        _lower_lab_ptr = 0;
+        k = k + 1;
+    }
+    assert_eq(bad, 0, "the table and the scan agree on every label");
+    assert_eq(checked > 1000, 1, "over every id of every kernel");
+    var isa[8192];
+    assert_eq(_cfk_compile("loop_lcg", &isa) > 0, 1, "a compile");
+    assert_eq(_lower_lab_ptr, 0, "leaves no table behind");
+    return 0;
+}
+
 # The do-while's latch is a CONDITIONAL back-edge carrying a phi copy: lowering puts the copy after
 # the branch and records it in the branch's flags (4.3.1 emitted no copy at all and the GPU hung).
 fn test_cf_lower_back_edge_copy() {
@@ -1454,6 +1523,8 @@ fn main(): i64 {
     test_contract_short_tables();
     test_cf_kernels_compile_or_refuse();
     test_cf_isa_shapes();
+    test_cf_audit_fixes_isa();
+    test_cf_label_table_matches_scan();
     test_cf_lower_back_edge_copy();
     test_cf_phi_copies();
     return assert_summary();

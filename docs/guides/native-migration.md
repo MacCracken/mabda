@@ -1,6 +1,6 @@
 # Migrating to the native AMD backend (v3.0)
 
-> Written against mabda 3.0.0; still applicable through 4.3.0 (see the
+> Written against mabda 3.0.0; still applicable through 4.4.0 (see the
 > v4.0.1 update below for what changed). Pairs with
 > [`integration.md`](integration.md) (which covers the wgpu path).
 > Closes the gap from "I have a wgpu-on-mabda consumer" to "I have a
@@ -130,11 +130,11 @@ dbus client, a sister AGNOS package, to your `cyrius.cyml`:
 ```cyml
 [deps.samvada]
 git = "https://github.com/MacCracken/samvada.git"
-tag = "1.0.1"
+tag = "1.1.2"
 modules = ["dist/samvada.cyr"]
 ```
 
-samvada 1.0.1's native backend (`samvada_native_init()`) is pure-Cyrius
+samvada 1.1.2's native backend (`samvada_native_init()`) is pure-Cyrius
 dbus — no C shim, no libsystemd. Your consumer initializes it once,
 before configuring the surface; mabda never initializes samvada itself:
 
@@ -152,13 +152,13 @@ mabda then routes through samvada (`samvada_session_take_device`) to ask
 logind for the master fd. If samvada was never initialized, take_device
 returns `-EINVAL` and `gpu_surface_configure_native_logind` returns 0, so
 the consumer can fall back to `_native_kiosk`. Don't pin samvada below
-1.0.1 (earlier versions could return the wrong fd or fail `TakeDevice`).
+1.1.2. Earlier versions could return the wrong fd or fail `TakeDevice`. Through 1.1.1 a
+local user could choose the descriptor `TakeDevice` returned (samvada 1.1.2, P1-1, HIGH).
 
-samvada labels its native backend not yet consumer-validated. Its
-libsystemd C shim still exists as an opt-in fallback (C entry
-`samvada_shim_init()`), and samvada plans to remove it at 1.1.0 — a
-removal waiting on a mabda live-bus end-to-end run of the logind path
-from a seated session, which has not been done yet. **v4.0.1 deprecates the
+samvada's libsystemd C shim still exists as an opt-in fallback (C entry
+`samvada_shim_init()`). samvada's roadmap retires it at 1.2.0. mabda's
+live-bus end-to-end run of the logind path from a seated session, which that
+retirement waited on, passed on AMD and NVIDIA in mabda 4.4.0. **v4.0.1 deprecates the
 AMD wgpu route** (AMD-on-wgpu still works with a one-shot warning;
 `-D MABDA_AMD_WGPU_STRICT` enforces native-only). (v4.0 itself shipped
 NVIDIA native.)

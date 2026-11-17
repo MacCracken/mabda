@@ -88,8 +88,9 @@ var NV_SHMOD_STRUCT_SIZE = 72;
 # x / y <= 1024, z <= 64.
 var NV_MAX_BLOCK_THREADS = 1024;
 var NV_MAX_BLOCK_Z       = 64;
-# The SASS staging buffer a compiled module is built in: room for the selector's 512 records
-# plus the tail (sm75_compile_spirv's CC_ISEL holds 512).
+# The SASS staging buffer a compiled module is built in: 1024 16-byte instructions. The selector
+# holds 1024 records (SM75_EMIT_MAX_RECS); a program that would not fit is refused before any
+# write (SM75_ERR_SASS_OVERFLOW).
 var NV_SASS_MAX_BYTES = 16384;
 
 # Kernel-param ABI (ptxas sm_70+): parameters start at c[0x0][0x160]; the param
@@ -923,7 +924,7 @@ fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
 # falls back to the linear FBs. NV_SURFACE_LAYOUT says which one is live;
 # native_nv_surface_force_linear(1) skips the attempt (gates compare both).
 #
-# NvSurface (288 bytes; 232 before 4.4.0):
+# NvSurface (296 bytes; 232 before 4.4.0):
 #   +0   card_fd      i32   consumer-owned DRM master card node (kiosk)
 #   +4   render_fd    i32   render node (copied from nv_ctx_fd at configure)
 #   +8   state        u64   KmsState* (native_kms_init)
@@ -1156,7 +1157,8 @@ fn _backend_nvidia_surface_configure(ctx, width, height): i64 {
     # teardown disabled the CRTC with no compositor to re-bind). Default to the
     # first CRTC: SETCRTC re-binds an encoder, and every encoder on this GPU
     # accepts any CRTC (possible_crtcs = 0x0F). Mirrors the N8.3 modeset fallback.
-    var crtc_idx = 0;
+    var crtc_id = 0;
+    if (crtc_count > 0) { crtc_id = load32(crtc_ids); }
     if (encoder_id != 0) {
         var enc[20];
         memset(&enc, 0, DRM_MODE_GET_ENCODER_SIZE);
@@ -1164,11 +1166,10 @@ fn _backend_nvidia_surface_configure(ctx, width, height): i64 {
         if (native_drm_mode_get_encoder(card_fd, &enc) != 0) {
             native_kms_release(state); return 0;
         }
-        crtc_idx = native_kms_lowest_set_bit(load32(&enc + DRM_MODE_GET_ENCODER_POSS_CRTCS));
+        # the CRTC already driving the connector, else the lowest it can use (4.4.0 audit L3)
+        crtc_id = native_kms_pick_crtc(&enc, crtc_ids, crtc_count);
     }
-    if (crtc_idx < 0) { native_kms_release(state); return 0; }
-    if (crtc_idx >= crtc_count) { native_kms_release(state); return 0; }
-    var crtc_id = load32(crtc_ids + crtc_idx * 4);
+    if (crtc_id == 0) { native_kms_release(state); return 0; }
 
     var mc[4];
     store32(&mc, 0);
@@ -1268,13 +1269,15 @@ fn _backend_nvidia_surface_present(ctx, surface): i64 {
           load32(surface + NV_SURFACE_HEIGHT), load32(surface + NV_SURFACE_BL_H));
         if (sr != 0) { return GPU_ERR_OTHER; }
     }
-    var rc = native_kms_page_flip(card_fd, crtc_id, back_fb, DRM_MODE_PAGE_FLIP_EVENT, 0);
+    # user_data = the FB id, as on AMD, so the wait takes only this flip's event (4.4.0 audit L1)
+    var rc = native_kms_page_flip(card_fd, crtc_id, back_fb, DRM_MODE_PAGE_FLIP_EVENT, back_fb);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
     # 4.4.0: wait for the flip to complete (poll, then read). The bare read this replaced
     # ignored its result, so on a non-blocking logind fd it returned at once and the next
     # frame was written into a buffer still scanning out.
-    var wr = native_kms_wait_flip_complete(card_fd, 0);
-    if (wr != 0) { return _native_neg_rc_to_gpu_err(wr); }
+    var wr = native_kms_wait_flip_for(card_fd, crtc_id, back_fb, 0);
+    # the drain's own -2 / -3 are a lost surface, as on AMD, not errnos (4.4.0 audit L2)
+    if (wr != 0) { return _native_present_rc_to_gpu_err(wr); }
     store32(surface + NV_SURFACE_FRONT, 1 - front);
     return 0;
 }

@@ -1,4 +1,4 @@
-# Agent hand-over — mabda (2026-11-16)
+# Agent hand-over — mabda (2026-11-17)
 
 For the next agent picking this repo up. Read this, then `CLAUDE.md`, then the
 [roadmap](roadmap.md) (every planned release, pinned and in order). Keep this file current
@@ -6,12 +6,16 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
 ## Where things stand
 
-- **Released: v4.3.1** (tag `4.3.1` at `979222d`, pushed by the maintainer). It shipped the render
-  tier's MB2–MB5 on top of 4.3.0's MB1: everything soorat's GPU half asked for
-  (`issues/archived/2026-11-15-render-tier-for-geometry-consumers.md`), every milestone HW-verified.
-  Audit: `docs/audit/2026-11-16-4.3.1-audit.md`.
-- **v4.4.0 in progress, uncommitted** (VERSION still 4.3.1; CHANGELOG `[4.4.0] — in progress`).
-  Two items have landed: **the scratch-buffer contract** and **the compiler limits v4.1.0 left
+- **v4.4.0 is cut, uncommitted** (2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
+  are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
+  - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits
+    ignoring branches; the corpus kernel `wait_skipped_only_use` shows it on the Cezanne.
+  - The last step is the maintainer's seat closeout on both boxes, needed because the audit
+    fixes touched the flip wait and the CRTC pick, and samvada moved. Then the maintainer
+    commits and tags.
+  - The previous release was v4.3.1 (tag `4.3.1` at `979222d`; the render tier's MB2–MB5;
+    audit `docs/audit/2026-11-16-4.3.1-audit.md`).
+- **What 4.4.0 holds.** Two items landed first: **the scratch-buffer contract** and **the compiler limits v4.1.0 left
   named**, together with the control-flow miscompiles found next to them (see "The compiler's
   control flow" below). **N9 is in progress**: the design is `docs/proposals/n9-spirv-to-sass.md`
   and **N9 is done** (N9.1–N9.6). The modules are `src/sm75_encode.cyr`, `sm75_isel.cyr`,
@@ -58,8 +62,8 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     - item 3, `gpu_nvidia`'s 31 refusal rows.
 
     soorat's P6/MB1, MB2–5, P7 and P8 probes are identical to the 4.3.1 dist. The logs are
-    `build/logs/consumer-{ranga,soorat}-*-20261117-113114.log`. **Rerun it at the cut only if
-    `src/` changed after that.** ranga's five changes are its own call: they are filed as
+    `build/logs/consumer-{ranga,soorat}-*-20261117-113114.log`. It was rerun on the final cut
+    tree with the same results (`build/logs/consumer-*-final-*.log`). ranga's five changes are its own call: they are filed as
     `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`
     (item 5, the bilinear row and `gpu_resize`, was appended after the 1024-id work). For the
     soorat probes, keep the `scripts/probes/gpu/` layout and the `rust-old/src/` shaders the
@@ -75,14 +79,13 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   boot ("GPU resets this boot: none", `build/logs/seat-closeout-amd-20261117-111849.log`).
   Never run hang-inducing controls on the local Cezanne.
 - **Pins:** cyrius **6.7.18** (`cyrius.cyml`; track the latest upstream `VERSION` when you bump),
-  wgpu-native **v29.0.1.1**, launcher **83 slots**, deps samvada 1.0.1 / chitra 1.0.3.
-- **Next release: v4.4.0 — compilers + NVIDIA**: N9 (SPIR-V → SASS; ranga is waiting), the
-  scratch-buffer contract, the compiler limits v4.1.0 left named, NVIDIA block-linear scanout, the
-  seat-only HW closeout, the legacy surface-acquire leak, ranga's consumer run (all done; the cut
-  is next). Then **v4.5.0 —
-  textures + language**: texture encoding, compressed sRGB ids, render-graph aliasing, the cyrius
-  6.7 language minors (S2 / S3 / S4 / M6). Then v5.0 (native rendering beyond the vertex-less
-  subset; Intel; NVIDIA wgpu retires) and v5.1. Don't split these into more minors without asking.
+  wgpu-native **v29.0.1.1**, launcher **83 slots**, deps samvada 1.1.2 / chitra 1.4.1 (since
+  4.4.0; samvada 1.1.2 fixed a HIGH in `TakeDevice`).
+- **Next release: v4.5.0 — textures + language**: texture encoding, compressed sRGB ids,
+  render-graph aliasing, the cyrius 6.7 language minors (S2 / S3 / S4 / M6). Then v5.0 (native
+  rendering beyond the vertex-less subset; the NVIDIA scanout follow-ons, which are block-linear
+  render targets and a copy-engine present; Intel; NVIDIA wgpu retires) and v5.1. Don't split
+  these into more minors without asking.
 
 ## The maintainer's standing rules
 
@@ -112,7 +115,7 @@ These come from `CLAUDE.md` and corrections the maintainer has made. Break none 
 rm -rf lib && mkdir lib && cyrius deps        # lib/ is a real directory, never a symlink
 cyrius build programs/smoke.cyr build/mabda_smoke
 make test                                     # every tests/tcyr/*.tcyr; gate on exit codes
-./scripts/count-test-assertions.sh            # the honest count (25 suites, 6880 at 4.3.1)
+./scripts/count-test-assertions.sh            # the honest count (29 suites, 7932 at 4.4.0)
 cyrius vet programs/smoke.cyr
 cyrius distlib                                # run twice: dist/mabda.cyr must not change
 ./scripts/version-check.sh

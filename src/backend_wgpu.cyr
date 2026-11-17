@@ -1090,9 +1090,11 @@ fn _backend_wgpu_surface_acquire(ctx, surface): i64 {
         if (f == 0) { return 0; }
         return load64(f);
     }
-    var res_tag, res = surface_state_acquire(surface);
-    if (is_err_result(res_tag) == 1) { return 0; }
-    return res;
+    # allocation-free on failure too: the reason goes to the error channel (4.4.0 audit LOW-3)
+    var e[16];
+    var texture = _surface_state_acquire_raw(surface, &e);
+    if (texture == 0) { _gpu_err_record(load64(&e), load64(&e + 8), 1); }
+    return texture;
 }
 
 fn _backend_wgpu_surface_present(ctx, surface): i64 {
@@ -1101,13 +1103,26 @@ fn _backend_wgpu_surface_present(ctx, surface): i64 {
     # 4.3.1: a gpu_surface_configure surface (MB5) presents its acquired frame and
     # releases the frame's view and texture (backend_wgpu_surface.cyr).
     if (load64(surface + 56) == 1) { return _wgpu_surface_present_ex(ctx, surface); }
+    # 4.4.0 audit LOW-2: with no frame acquired (no acquire, a failed one, or a resize since),
+    # wgpuSurfacePresent has nothing to present and wgpu-native treats its error as fatal.
+    # Refuse it, as the MB5 path does.
+    if (load64(surface + 80) == 0) {
+        return _wgpu_surface_fail(GPU_ERR_SURFACE_CONFIG, "surface: present without an acquired frame");
+    }
     return surface_state_submit_present(surface);
 }
 
 fn _backend_wgpu_surface_release(ctx, surface): i64 {
     if (ctx == 0)     { return 0; }
     if (surface == 0) { return 0; }
-    if (load64(surface + 56) == 1) { _wgpu_surface_drop_frame(surface); }
+    # Drop an unpresented frame first, on either kind: the early return below skips
+    # surface_state_release, which is where an older-path record drops its frame
+    # (4.4.0 audit LOW-1).
+    if (load64(surface + 56) == 1) {
+        _wgpu_surface_drop_frame(surface);
+    } else {
+        _surface_state_drop_frame(surface);
+    }
     # 4.3.1: two gpu_surface_configure records (a reconfigure) share one
     # WGPUSurface; it is released once, while it is still the context's surface
     # (gpu_surface_release clears that after the first).

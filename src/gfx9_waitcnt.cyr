@@ -20,6 +20,15 @@
 # regalloc reg-map is id-keyed so it is unaffected by the index shift). N.5 walks
 # this output and resolves regs via the regalloc map.
 #
+# ⛔ 4.4.0 audit HIGH-1: the walk is LINEAR, but the program is not. A wait inside a block a
+# branch can skip at run time (a uniform s_cbranch_scc0, a divergent if's s_cbranch_execz, a
+# loop exit) cleared the tracker for everything after the merge. On the path that skipped it,
+# a load used only after the merge was read before it arrived. Regalloc also recycled the
+# register of a load whose only use was in the skipped block while the load was in flight.
+# So before EVERY branch record, anything outstanding is waited for (vmcnt(0)), and every branch
+# target is reached with nothing in flight. That is SM75's rule (its scheduler waits on every
+# scoreboard at a BRA). A fall-through keeps the linear state, which is exact for it.
+#
 # Output: a NEW caller-provided buffer of 48-byte GISEL records (the input copied
 # with s_waitcnt records spliced in). gfx9_waitcnt returns the new instruction
 # count (>= 0) or a NEGATIVE error. Included after gfx9_regalloc.cyr. Pure byte
@@ -70,6 +79,15 @@ fn _wc_mark(outstanding, cap_ids, id): i64 {
     return 0;
 }
 
+# 1 for a branch record: its target can be reached with whatever is in flight at the branch.
+fn _wc_is_branch(op): i64 {
+    if (op == GISEL_S_BRANCH)         { return 1; }
+    if (op == GISEL_S_CBRANCH)        { return 1; }
+    if (op == GISEL_S_CBRANCH_SCC1)   { return 1; }
+    if (op == GISEL_S_CBRANCH_EXECZ)  { return 1; }
+    return 0;
+}
+
 # Emit an s_waitcnt with simm `s` into `dst` slot `k` (a = simm, flagged
 # immediate so no later pass treats it as a register).
 fn _wc_emit_wait(dst, k, s): i64 {
@@ -89,10 +107,21 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
     var outstanding[8192];   # MIR_MAX_CAP_IDS (1024) i64; 1 = id is an un-waited load
     memset(&outstanding, 0, cap_ids * 8);
     var any_vmem = 0;
+    var n_out = 0;           # loads marked outstanding since the last wait
     var k = 0;
     var i = 0;
     while (i < n_in) {
         var op = gisel_op(in_buf, i);
+        # Nothing may be in flight across a branch (HIGH-1 above).
+        if (_wc_is_branch(op) == 1) {
+            if (n_out > 0) {
+                if (k >= cap_out) { return 0 - WC_ERR_CAP; }
+                _wc_emit_wait(out, k, GFX9_WAITCNT_VM);
+                k = k + 1;
+                memset(&outstanding, 0, cap_ids * 8);
+                n_out = 0;
+            }
+        }
         if (op == GISEL_S_ENDPGM) {
             # Drain all memory before the wave retires (stores must land).
             if (any_vmem == 1) {
@@ -111,18 +140,21 @@ fn gfx9_waitcnt(m, in_buf, n_in, out, out_len): i64 {
                 _wc_emit_wait(out, k, GFX9_WAITCNT_VM);
                 k = k + 1;
                 memset(&outstanding, 0, cap_ids * 8);
+                n_out = 0;
             }
             if (k >= cap_out) { return 0 - WC_ERR_CAP; }
             _wc_copy(in_buf, i, out, k);
             k = k + 1;
             if (op == GISEL_GLOBAL_LOAD) {
                 _wc_mark(&outstanding, cap_ids, gisel_dst(in_buf, i));
+                n_out = n_out + 1;
                 any_vmem = 1;
             }
             # v3.2 F.7d — a DWORDX2 (f64) load is one result <id> spanning a VGPR pair; track it
             # exactly like a 32-bit load (the conservative vmcnt(0) waits for it before any use).
             if (op == GISEL_GLOBAL_LOAD_DWORDX2) {
                 _wc_mark(&outstanding, cap_ids, gisel_dst(in_buf, i));
+                n_out = n_out + 1;
                 any_vmem = 1;
             }
             if (op == GISEL_GLOBAL_STORE) { any_vmem = 1; }

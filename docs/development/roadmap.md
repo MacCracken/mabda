@@ -3,14 +3,14 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.3.1** (2026-11-16). Module/assertion/bundle counts live in the
+> **v4.4.0** (2026-11-17). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**: every planned release is pinned below, in order.
 [`CHANGELOG.md`](../../CHANGELOG.md) is the source of truth for shipped work, and shipped
 sections are pruned from this file when their arc closes (v2.x pruned 2026-04-21; v3.0–v3.4
 2026-06-19; v4.0–v4.0.2 2026-07-02; v4.0.3–v4.2.0 and the render tier MB1–MB5, v4.3.0–v4.3.1,
-2026-11-16).
+2026-11-16; v4.4.0, compilers + NVIDIA, 2026-11-17).
 
 The current agent hand-over — repo state, how to verify, the boxes, the gotchas — is
 [`handoff.md`](handoff.md).
@@ -38,9 +38,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.3.1  ─▶  shipped — see CHANGELOG.md
-  v4.4.0           ─▶  compilers + NVIDIA: N9 (SPIR-V → SASS), the compiler items v4.1.0
-                        left open, NVIDIA tiled scanout, the seat-only HW closeout
+  v2.0.0 → v4.4.0  ─▶  shipped — see CHANGELOG.md
   v4.5.0           ─▶  textures + language: texture encoding, compressed sRGB ids,
                         render-graph aliasing, the cyrius 6.7 language minors
   v5.0             ─▶  native rendering beyond the vertex-less subset; Intel native
@@ -91,240 +89,6 @@ accidentally couples to it.
 
 ---
 
-## v4.4.0 — compilers + NVIDIA
-
-Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the roadmap.
-
-- ✅ **N9: SPIR-V → SASS for the NVIDIA backend** — done (uncommitted; CHANGELOG [4.4.0]
-  N9.1–N9.6). The design note is [`../proposals/n9-spirv-to-sass.md`](../proposals/n9-spirv-to-sass.md).
-  `gpu_shader_module_create_spirv` on an NVIDIA context compiles SPIR-V to SM75 SASS in-tree,
-  reusing the SPIR-V front end and MIR, with its own instruction selection, register allocation,
-  encoder and control words (`src/sm75_*.cyr`).
-  **Done-when met, 2026-11-16:**
-  - ranga's 11 kernels compile through the public API on the TU116, and
-    `test-nvidia-ranga-kernels-e2e` matches all 11 to goldens computed independently by the
-    fixture generator's SPIR-V interpreter.
-  - ranga's four GPU suites pass on the TU116 with an NVIDIA context: `gpu` 48, `gpu_kernels` 53,
-    `gpu_pipeline` 102 and `gpu_spirv` 54, the same counts as on AMD. They ran in a scratch clone
-    of ranga with the guard lifted (see the consumer check below).
-
-  The same 24 control-flow kernels run on both backends. On NVIDIA 22 match every lane and 2 are
-  refused by name (f64; an out-of-range label). The request is archived:
-  `issues/archived/2026-11-02-n9-spirv-to-sass-compiler-request.md`.
-- 🔨 **N9 follow-ons, from the design note's §7** (named there "for after the done-when"; now
-  scheduled here). Each needs a hardware check on chew. They are taken in this order:
-  scheduling first, because it changes every kernel and the existing gates check it; then the two
-  that build on it; then the largest.
-  - ✅ **Scheduling from the SM75 latency tables** (`sm75_schedule`; CHANGELOG [4.4.0]) in place of
-    v1's stall-15-everywhere control words.
-    - Every control word is checked by an independent CPU checker.
-    - On the TU116 all 15 masterless gates pass, ranga's goldens hold, and ranga's four suites
-      pass.
-    - 4.5× fewer issue cycles per warp. Wall-clock is 1.48× faster for the arithmetic-bound
-      `loop_lcg`; ranga's GART-memory-bound kernels are unchanged
-      (`make bench-nvidia-compute`).
-  - ✅ **Predicate allocation (P0–P6)** in place of re-emitting the compare whenever P0 holds
-    another (CHANGELOG [4.4.0]). There is a per-block table with least-recently-used eviction,
-    and the last compare, which CNDMASK reads, is protected. No compare is re-emitted across the
-    34 compiled kernels. HW-verified: the 15 gates, ranga's goldens and ranga's four suites.
-  - ✅ **`BSSY` / `BSYNC` reconvergence** (CHANGELOG [4.4.0]). Closed divergent ifs and loops get
-    a cleared barrier, a BSSY at their head and a BSYNC at their merge. A merge that leads only to
-    the end gets none, which leaves ranga's kernels unchanged. HW-verified on the TU116 with the
-    15 gates, the 27-kernel lane checks, ranga's goldens and suites, and no hangs. A divergent
-    if/else before a long loop runs 1.92× faster: 7144 → 3722 µs.
-  - ✅ **`OpFDiv` and f64 on SM75** (CHANGELOG [4.4.0]).
-    - f64 in register pairs, with 15 encodings pinned to ptxas, and scheduling per NAK's
-      RedirectedFP64 (a scoreboard and the delay).
-    - A target-aware lowering: `OpFDiv` is one `MIR_OP_FDIV` for SM75. f32 divides on NVIDIA's
-      f64 reciprocal fast path. f64 is full range and branch-free, subnormals and specials
-      included.
-    - A 1024-id MIR space for SM75 (GFX9 took the same space next: the item below).
-    - A cross-vendor IEEE oracle: `make test-{native,nvidia}-f64-kernels-e2e`, 15 kernels and
-      512 lanes, bit-exact on both GPUs.
-
-    `loop_phi_f64` runs on the TU116, and so does ranga's bilinear resize (the twelfth ranga
-    kernel). HW-verified: the 16 masterless gates, control flow 26 + 1 refusal, ranga 12 of 12.
-- ✅ **GFX9's 256-id cap** (found by the item above, 2026-11-16; CHANGELOG [4.4.0]). ranga's
-  `gk_resize_bilinear` (201 SPIR-V ids plus the lowering's temporaries) was refused on AMD with
-  `MIR_ERR_ID_OOR`, which is ranga's "reason -25". It was never register pressure: it compiles in
-  16 VGPRs.
-  - There is one ceiling now, `MIR_MAX_CAP_IDS` = 1024, for both back ends. The SPIR-V id bound
-    stays at 256.
-  - `gfx9_isel`, `gfx9_waitcnt` and `gfx9_emit_program` size their per-id tables for 1024, and
-    `CMP_ISEL_CAP` is 1024.
-  - The AMD compile frame is split in two to fit Cyrius's frame budget.
-  - Every other kernel compiles byte-identical.
-
-  HW-verified: on the Cezanne, `test-native-all` 75 / 0 / 2 skipped and bilinear at its golden
-  (the same hash as the TU116's); on the TU116, the 16 gates.
-- ✅ **The scratch-buffer contract** — landed (uncommitted; CHANGELOG [4.4.0]). Every compiler
-  buffer now carries its byte length and each stage derives its capacity from it: `mir_mod_init`,
-  the table builders, `_spirv_resolve_builtins` / `spirv_lower_module`, `gfx9_isel`,
-  `gfx9_regalloc`, `gfx9_waitcnt`, `gfx9_emit_program`, `gfx9_compile` and the 136-byte compile
-  context (`gfx9_cc_buf`). `check-compiler-buffer-sizing.py` checks every literal length against
-  its `var buf[N]`. The move turned up a HIGH stack overrun in the native SPIR-V compile path
-  (`ptrs[2048]` claimed as 128 records) and undersized `isel` buffers in four HW programs; both
-  are fixed. HW-verified on the Cezanne (`test-native-all` 72 / 0 / 2 skipped,
-  `build/logs/test-native-all-20261116-123553.log`). **Open:** ranga's `tests/gpu_spirv.tcyr`
-  calls the table builders with the old 5-argument form and now fails to compile; it needs the
-  4-argument call. That is ranga's repo, and it rides with the consumer check below (the call
-  was verified in N9.6's scratch run).
-- ✅ **The compiler limits v4.1.0 left named**, AMD half. It landed uncommitted (CHANGELOG
-  [4.4.0]). Nested divergent ifs use a region stack in `gfx9_isel` with one saved-EXEC pair per
-  level, up to 8. Int-compare `OpSelect` uses `s_cselect_b32` for a uniform condition and
-  re-emits a non-adjacent compare. The "never miscompiled" premise was false next door, and the
-  same work fixed those miscompiles: divergent if/else dropped its else block; a branch read a
-  stale SCC/VCC; divergent loops lost early-exiting lanes; phi copies were missing on conditional
-  edges (a do-while hung the GPU); swapped phis lost a value; f64 phis copied one dword; a dead
-  load's register was reused while the load was in flight; the v4.1.0 int-compare select never
-  worked; and a label id past `id_bound` wrote off the stack (HIGH). 24 generated kernels
-  (`tests/spirv/control_flow/`) are checked lane by lane by `test-native-spirv-control-flow-e2e`.
-  Still refused on GFX9 with a named code: a `break` out of a divergent if nested inside a
-  divergent loop (a `continue` there compiles, as an if/else merging at the latch), a return
-  inside a divergent region, and nesting deeper than 8. **SM75 half: done in N9.5.** The same 24
-  kernels run on the TU116. 22 match every lane, including the return inside a loop and the
-  9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `oob_label` is
-  refused as on AMD. `loop_phi_f64`, refused at N9.5, runs since the N9 follow-ons' f64 item.
-- ✅ **NVIDIA block-linear scanout + ADDFB2 format modifiers** (CHANGELOG [4.4.0]). Verified on
-  the TU116: the layout against the copy engine (masterless), and the scanout from chew's console
-  on 2026-11-16 (2560×1440, h=4; both phases rendered identically to the maintainer).
-  - **Scope, chosen 2026-11-16: swizzle at present.** configure takes two block-linear VRAM FBs:
-    kind 0x06, ADDFB2 with `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)` and
-    NVK's block height.
-  - `acquire` still hands the consumer a pitch-linear buffer, and `present` CPU-swizzles it into
-    the back FB: 5.9 ms a frame at 1080p.
-  - Anything refused falls back to the linear FBs (ADR 007 Fork 4's path).
-  - The layout (TuringColor2D GOBs) matches both the kernel's and NVK's definitions on the CPU.
-    On the TU116 it matches the copy engine in both directions for every case and block height
-    (`test-nvidia-blocklinear-e2e`, masterless).
-  - Found on the way and fixed: ADDFB2's `drm_mode_fb_cmd2` was 4 bytes short, with `modifier`
-    unaligned.
-  - Not in this scope: block-linear render targets and textures (a zero-copy present), and a
-    copy-engine present to take the swizzle off the CPU (about 15 ms a frame at 1440p).
-- ✅ **The seat-only HW closeout** (done 2026-11-17; the status notes below) — gates skipped at every release because they need a person at a
-  seat (a VT with no compositor, `chew`'s console). Each target first writes its whole output to
-  `build/logs/<gate>-<timestamp>.log` (the `test-surface-wayland-e2e` recipe is the template); the
-  maintainer runs it; the CHANGELOG cites the log:
-  - clean-boot `make test-native-all` with `NATIVE_KNOWN_FAIL` empty, plus the linked example
-    consumer (several fixes were HW-proven only on a Cezanne that had taken MODE2 resets; see
-    `issues/archived/2026-08-19-native-compute-spike-stale.md`);
-  - the DRM-master AMD gates `test-native-kms-modeset` and `test-native-present-e2e`;
-  - `chew`'s five card-node gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
-    surface-present-e2e). Since the block-linear item, `surface-present-e2e` runs block-linear
-    then forced linear on a test card. **The two phases must look identical, and the log must
-    say phase 1 was BLOCK-LINEAR** (exit 7 means the kernel refused it). **Done for 4.4.0,
-    2026-11-16** (`build/logs/chew-nvidia_surface_present_e2e-20261116-183837.log`): block-linear
-    accepted, both phases identical on screen, exit 0. The first attempt ran from a terminal
-    inside chew's Wayland desktop and was refused master (exit 2). The run needs a text
-    console with sddm stopped. chew's other four card-node gates passed with it in
-    `make seat-closeout-nvidia` (below). Only this run proves
-    the scanout and the ADDFB2 struct fix on NVIDIA; the AMD master gates above prove the fix
-    on AMD;
-  - the samvada live-bus run: `gpu_surface_configure_native_logind` with `samvada_native_init()`,
-    built `-D MABDA_LOGIND`, from a seated session (samvada 1.1.0's `libsystemd` shim deletion
-    waits on it). **Passed on NVIDIA (chew), 2026-11-16**
-    (`build/logs/chew-nvidia_present_logind_e2e-20261116-192609.log`); the AMD run is in
-    `seat-closeout-amd`. Since 2026-11-16 this is `make test-native-logind-present-e2e`
-    (`programs/native_present_logind_e2e.cyr`). It takes the card from logind, presents 120
-    frames, releases, then takes the card again for 30 more, which proves the release returned
-    it.
-
-  **How to run it (2026-11-16).** Every seat gate logs through `scripts/seat-gate.sh`. One logged
-  run per box (`scripts/seat-closeout.sh`) is run from a TEXT CONSOLE (Ctrl-Alt-F3) with
-  `sudo systemctl stop sddm` (both boxes use sddm):
-  - **Cezanne:** `make seat-closeout-amd` after a REBOOT. It runs `test-native-all` with the
-    master and logind gates included, then the linked example consumer. Any GPU reset in the
-    boot's kernel log fails it.
-  - **chew:** `make seat-closeout-nvidia` in `~/mabda-verify-n9`. It runs the five card-node
-    gates.
-  - **The logs:** each closeout writes `build/logs/seat-closeout-<box>-<timestamp>.log`, which
-    can be read over ssh.
-
-  **Status.**
-  - **chew: done, 2026-11-16** (`build/logs/chew-seat-closeout-nvidia-20261116-191558.log`).
-    All five card-node gates passed from tty3 with sddm stopped: the topology probe, ADDFB2
-    with the corrected 104-byte struct, the red modeset, 120 page-flipped frames, and the test
-    card block-linear then linear.
-  - **Cezanne: first run 2026-11-17 on a clean boot**
-    (`build/logs/seat-closeout-amd-20261117-103518.log`). 76 of 78 gates passed, including
-    `test-native-kms-modeset`, and the example consumer ran.
-    - `test-native-present-e2e` and `test-native-logind-present-e2e` failed at configure:
-      they asked for 1920×1080 on a 2560×1440 monitor, which the AMD configure refuses (and
-      used to refuse silently). Fixed: the refusal is recorded, and the gates ask for the
-      connector's mode.
-    - Rerun the same boot: 77 of 78. The kiosk present passed at 2560×1440. The logind gate
-      configured and failed its first present: logind's fd is non-blocking, and the
-      flip-complete wait was a bare `read()`. Fixed, for AMD and NVIDIA: poll, then read.
-    - **Third run: passed** (`build/logs/seat-closeout-amd-20261117-105059.log`). 78 of 78 on
-      the clean boot, the master gates and the logind live-bus run included. The example
-      consumer ran too.
-    - What it showed on screen exposed two AMD present bugs that every check had missed: a
-      broken double buffer (half the frames, drawn into the on-screen FB) and a display left
-      off at teardown. Both are fixed, and the gate now shows NVIDIA's test card.
-    - **Fourth run, after those fixes: passed and looked right**
-      (`build/logs/seat-closeout-amd-20261117-111849.log`). The console came back after every
-      display gate, the gradient ran at exactly 60 Hz, and the maintainer confirmed the test
-      card rendered correctly. **The Cezanne half is done for 4.4.0.**
-  - **chew rerun: passed** (2026-11-17, `build/logs/chew-seat-closeout-nvidia-20261117-112453.log`).
-    All six gates passed with the poll-then-read present, and the kernel log stayed clean. Both
-    halves are done.
-- ✅ **Found 2026-11-16: the logind path never hands the device back on NVIDIA.** Fixed
-  (CHANGELOG [4.4.0]): `NvSurface` +288 / +292 is marked like AMD's and released. A CPU test
-  covers it, and the seat run on chew passed: logind delegated the card over the live bus,
-  release returned it, and a second phase took it again.
-  `gpu_surface_configure_native_logind` marks a surface as owning its logind fd only for AMD
-  (`native_surface_mark_master_owned`; `NativeSurface +108`). `NvSurface` has no such field, so
-  on NVIDIA `gpu_surface_release` neither releases the device to logind nor closes the fd. Both
-  stay held until the process exits. The fd-ownership marking in surface_v3.cyr, NvSurface and
-  the NVIDIA release need extending. **Done when** the logind gate also runs on chew
-  (`test-nvidia-logind-present-e2e`) and its second phase takes the card again.
-- ✅ **Fix: the older wgpu `gpu_surface_acquire` path leaked one texture reference per frame**
-  (CHANGELOG [4.4.0]). It now releases the texture at `gpu_surface_present`, and resize and
-  release drop an unpresented one. CPU test: one release per frame over 1,000 frames, no heap
-  growth. RSS check on chew (NVK, Hyprland, `make test-surface-wayland-e2e`): 0 KiB over 1,800
-  frames, against about 2 MiB for a no-release control (about 1.15 KB a frame).
-- ✅ **The consumer check** (done 2026-11-17; CHANGELOG [4.4.0] "Verified — the consumer
-  check"). It ran against the working-tree dist, in scratch clones.
-  - The name scan found 0 collisions with ranga, soorat or bijli.
-  - ranga's suites gave the same counts on the Cezanne and the TU116. The only failing rows are
-    the two ranga has filed to flip: item 5 on both GPUs, and item 3 in `gpu_nvidia`
-    (`build/logs/consumer-ranga-{amd,nvidia}-20261117-113114.log`).
-  - soorat's P6/MB1, P6/MB2–5, P7 and P8 probes gave results identical to the 4.3.1 dist
-    (`build/logs/consumer-soorat-{old,new}-20261117-113114.log`).
-  - aethersafta is still Rust, bijli has no mabda dependency, and rasa and kiran are not checked
-    out.
-  - **Rerun at the cut only if `src/` changes before it.**
-
-  The history:
-  ranga's GPU suites against the bundle (4.3.1 ran only the fold
-  name-collision scan: 0 shared function names with ranga or soorat). Partly run during N9.6
-  against the in-progress bundle, in a scratch clone of ranga@de54123:
-  - native AMD on the Cezanne: `gpu` 48, `gpu_kernels` 53, `gpu_pipeline` 102 and `gpu_spirv`
-    54, all passing;
-  - NVIDIA on the TU116: the same four suites and counts;
-  - logs in `build/logs/ranga-gpu-suites-{amd,nvidia}-n9.6-*.log`.
-
-  Still to do: rerun against the final 4.4.0 bundle at the cut. ranga needs five changes in its
-  own repo, all ranga's call. They are filed there as
-  `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`:
-  - `tests/gpu_spirv.tcyr`'s 4-argument table-builder call (needed for 4.4.0 on any backend);
-  - `BACKEND_KIND_NVIDIA` added to `gpu_context_supports_compute` (ADR 005's allowlist);
-  - `tests/gpu_nvidia.tcyr`'s refused rows flipped to the AMD suites' expected values;
-  - a way to open an NVIDIA context in the four suites, which hard-code `gpu_context_new_amd`.
-
-  Found since the filing (the FDiv / f64 follow-on, 2026-11-16), and appended to that issue as
-  its item 5: on NVIDIA, ranga's bilinear resize now compiles. So `tests/gpu_kernels.tcyr`'s pinned "cannot yet
-  lower it … flip this when it can" assertion fails there (52 of 53;
-  `build/logs/nvidia-ranga-fdiv-20261116-162252.log`), and `gpu_resize` could take
-  `SF_BILINEAR` on an NVIDIA context. Since the GFX9 256-id item above, the same holds on AMD:
-  the row fails there too (52 of 53, `build/logs/ranga-gpu-suites-amd-gfx9ids-20261116-173352.log`)
-  and bilinear matches its golden on both backends.
-
-  Also for ranga, low priority: its SPIR-V is version 1.3 but lists storage buffers in
-  `OpEntryPoint`, a 1.4 rule. mabda accepts it; `spirv-val` and naga would not.
-
----
-
 ## v4.5.0 — textures + language
 
 Phase 4 of the 2026-11 plan with the texture, render-graph and language items already on the
@@ -371,6 +135,14 @@ draws geometry (soorat, and kiran through it) cannot leave wgpu on NVIDIA until 
 bind groups, depth, blending, MSAA, the render formats, views and copies run natively. That
 needs a render-capable native shader path (a WGSL front end, or SPIR-V render lowering beside
 the compute lowering), plus native BGRA8 / RGBA16F sampling and the sRGB decode.
+
+**NVIDIA scanout follow-ons** (left out of 4.4.0's block-linear scope, "swizzle at present",
+2026-11-16; scheduled here at the 4.4.0 cut because they need native render targets):
+- **Block-linear render targets and textures**, so a frame rendered on the GPU scans out with no
+  copy (zero-copy present).
+- **A copy-engine present** (`native_nv_push_ce_copy_bl`, already HW-checked in
+  `test-nvidia-blocklinear-e2e`) in place of the CPU swizzle, which costs about 15 ms a frame
+  at 1440p (5.9 ms at 1080p).
 
 **Intel — likely scope.** Same shape as v4.0 NVIDIA, retargeted:
 

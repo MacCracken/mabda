@@ -81,12 +81,12 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   vendorID guard warns but still allows AMD-on-wgpu; `-D MABDA_AMD_WGPU_STRICT`
   hard-rejects). The binding stays for NVIDIA + Intel until the wgpu+C
   path leaves the tree at v5.1; full AMD retirement is deferred.
-- **libsystemd** — no longer required. samvada 1.0.x keeps its
-  libsystemd C shim only as an opt-in fallback and plans to delete it at
-  samvada 1.1.0. That deletion waited on a mabda live-bus end-to-end run
-  of the logind path from a seated session: it passed on NVIDIA (chew)
-  on 2026-11-16 (`make test-nvidia-logind-present-e2e`); the AMD run is
-  part of `make seat-closeout-amd`.
+- **libsystemd** — no longer required. samvada (1.1.2 pinned since mabda
+  4.4.0) keeps its libsystemd C shim only as an opt-in fallback; its
+  roadmap retires it at samvada 1.2.0. mabda's side of that, a live-bus
+  end-to-end run of the logind path from a seated session, passed on both
+  boxes in the 4.4.0 seat closeout (`make test-nvidia-logind-present-e2e`
+  on chew, `make test-native-logind-present-e2e` on the Cezanne).
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.
