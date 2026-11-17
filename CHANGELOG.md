@@ -50,6 +50,9 @@ The follow-ons the design note named are scheduled in the roadmap's 4.4.0 sectio
 landed (below): latency-table scheduling, predicate allocation, `BSSY` / `BSYNC` reconvergence,
 and `OpFDiv` / f64 on SM75.
 
+**NVIDIA block-linear scanout** has landed too (below). Its layout is checked on the TU116 against
+the copy engine; the scanout itself still needs the seat run.
+
 ### Security
 - **(HIGH) Stack overrun in the native SPIR-V compile path.** `_native_shader_compile_spirv`
   (`src/backend_native.cyr`) declared `ptrs[2048]`, 64 MIR pointer records, but told
@@ -636,6 +639,79 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
 - **On the TU116**: all 16 masterless gates pass
   (`build/logs/chew-nv-gates-gfx9ids-20261116-173218.log`).
 
+### Added — NVIDIA block-linear scanout
+- **What it adds.** On nouveau, `gpu_surface_configure_native_kiosk` now scans out block-linear
+  VRAM framebuffers:
+  - ADDFB2 with `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)`, the modifiers the
+    Turing windows list (the kernel's `wndwc57e_modifiers`);
+  - BOs of PTE kind 0x06 (Turing "generic memory"), set through GEM_NEW's `tile_flags`, with
+    the block height in `tile_mode`;
+  - the block height from NVK's heuristic: 16 GOBs (h=4) for anything 86 rows or taller.
+- **The consumer contract is unchanged.** `acquire` returns a pitch-linear staging buffer (the
+  same `NV_SFB_*` shape, `NV_SURFACE_PITCH` bytes per row), and `present` swizzles it into the
+  back FB before the flip.
+- **Linear fallback.** If anything on that path is refused, configure unwinds it and falls back
+  to the linear FBs, as before. That covers the BO, the PRIME import, the kernel's modifier and
+  size checks, and the staging BO. `NV_SURFACE_LAYOUT` records which layout is live, and
+  `native_nv_surface_force_linear(1)` skips the attempt so a gate can compare the two.
+- **The layout** (`native_nv_bl_*` in `backend_nvidia_tex.cyr`):
+  - The GOB is TuringColor2D: 64 bytes × 8 rows. Its byte-address bits are x%16, then y%4,
+    x/16, y/4 and x/32.
+  - Blocks are one GOB wide and 2^h GOBs tall, laid out row-major.
+  - Two independent references agree on every bit, and the CPU suite checks both: the kernel's
+    Turing drm_panic writer (`nv50_set_pixel_swizzle`) and NVK's `CopyGOBTuring2D` line table.
+  - The older Tegra / Fermi GOB formula is a different layout.
+  - Sizes follow `nouveau_check_bl_size`.
+- **The hardware check, masterless** (`make test-nvidia-blocklinear-e2e`). The copy engine
+  (`TURING_DMA_COPY_A`, 0xC5B5, on the GR channel's subchannel 4 as NVK binds it) converts
+  block-linear to pitch in hardware. For each case, two directions:
+  - mabda's CPU swizzle into a kind-0x06 VRAM BO, then the copy engine back to pitch;
+  - the copy engine into the BO, then mabda's CPU unswizzle.
+
+  Results on the TU116 (`build/logs/chew-nv-blocklinear-20261116-175833.log`):
+  - every pixel matches in both directions: 1920×1080 at h=4; 100×70, 52×50, 16×8 and 300×20,
+    which have partial GOB columns and block rows; and 256×200 at each of h=0..5;
+  - a control that swizzles at the wrong block height mismatches (3,200 of 51,200 words right);
+  - the 1080p swizzle costs 5.9 ms a frame into VRAM through BAR1 (5.2 ms into host memory),
+    inside a 60 Hz frame.
+- **Not yet verified: the scanout itself.** The display can only be checked from a seat. The seat
+  gate `make test-nvidia-surface-present-e2e` now runs two phases of 180 frames each, the
+  default (block-linear) and then forced linear. Each phase prints its layout and frame time.
+  - It shows a test card a wrong layout can't hide: a 32-px checkerboard, a green border, a 1-px
+    diagonal and a moving bar. The old vertical gradient was constant along each row, so a
+    swizzle error inside a row would not have shown.
+  - It exits 7 if the kernel refuses block-linear, and it writes
+    `build/logs/nvidia_surface_present_e2e-<timestamp>.log`.
+  - It is in the seat-only closeout, with chew's other card-node gates.
+- **New helpers:**
+  - `native_kms_add_fb_xrgb8888_mod` and `native_kms_fb_cmd2_pack`;
+  - `native_nv_gem_new_tiled` / `native_nv_gem_new_pack` and `native_nv_bo_create_kind`;
+  - `native_nv_vm_bind_map_kind` / `native_nv_vm_bind_op_pack` (the kernel reads the PTE kind
+    from the bind op's `flags` bits 7:0);
+  - `native_nv_push_ce_copy_bl`.
+- **Tests.**
+  - `nvidia_blocklinear.tcyr` (new, 107 assertions): the layout against both references, every
+    pixel of a 48×70 surface at h=0..5, a block's bijection, a swizzle round trip with partial
+    columns and rows, the BO and bind packing, the ADDFB2 modifier packing, the copy-engine
+    pushbuffer and the surface's block-linear fields.
+  - `nvidia.tcyr` (386) and `kms.tcyr` (336).
+- **On the TU116**, all 17 masterless gates pass with the new one
+  (`build/logs/chew-nv-gates-blocklinear-20261116-180402.log`).
+
+### Fixed — ADDFB2's request struct
+- `drm_mode_fb_cmd2` is 104 bytes on x86_64, with `modifier[]` u64-aligned at +72. mabda laid it
+  out as 100 bytes with `modifier` at +68, using ioctl `0xC06464B8` rather than the header's
+  `0xC06864B8`.
+- Linear scanout never noticed, because without `DRM_MODE_FB_MODIFIERS` the modifier is unused
+  and the kernel zero-fills a short copy. Block-linear's modifier would have been read
+  misaligned.
+- `kms.tcyr` had pinned the wrong layout, and now pins the `sizeof` / `offsetof` the uapi header
+  gives.
+- The AMD and NVIDIA present paths share it, so it is hardware-checked at their seat gates
+  (AMD `test-native-kms-modeset` / `test-native-present-e2e`, NVIDIA's present gates). The
+  masterless AMD suite is unchanged by it: `make test-native-all` 75 passed, 0 failed, 2 skipped
+  (DRM master), of 77 (`build/logs/test-native-all-blocklinear-20261116-180401.log`).
+
 ### Changed — the scratch-buffer contract (`@internal`; no public API changes)
 - `mir_mod_init(m, vals, vals_len, instrs, instrs_len, ptrs, ptrs_len, blocks, blocks_len,
   id_bound)`: the `cap_ids` / `cap_instrs` / `cap_ptrs` arguments are gone. Each is now the
@@ -698,10 +774,11 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 28 suites, **7661 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 29 suites, **7770 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
-  predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9
+  1024-id space). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
   `test-raw-include` pass.

@@ -146,6 +146,17 @@ scanout BO. Do **not** attempt a GPU-buffer present on nvidia-drm
 (foreign-buffer scanout blocked) — another reason present steers to
 nouveau.
 
+**4.4.0 note.** Present first shipped the forced-linear BO. 4.4.0 adds the
+block-linear one:
+- kind-0x06 VRAM FBs;
+- ADDFB2 with `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)`;
+- a pitch-linear staging buffer that present swizzles into the FB.
+
+Linear stays as the fallback whenever the kernel refuses any part of the
+block-linear path. The layout is checked against the copy engine
+(`test-nvidia-blocklinear-e2e`); the scanout's proof is the seat run of
+`test-nvidia-surface-present-e2e`. See CHANGELOG [4.4.0].
+
 ### GSP firmware policy — accept as the amdgpu-microcode class (consumer-provided runtime dependency)
 
 GSP is the **same category** as the amdgpu microcode mabda's AMD path

@@ -185,10 +185,21 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   kernels run on the TU116. 22 match every lane, including the return inside a loop and the
   9-deep nest: NVIDIA keeps a per-thread PC, so neither needs refusing there. `oob_label` is
   refused as on AMD. `loop_phi_f64`, refused at N9.5, runs since the N9 follow-ons' f64 item.
-- **NVIDIA block-linear scanout + ADDFB2 format modifiers.** The nouveau present slots
-  (`_nv_surface_alloc_fb`) scan out a LINEAR VRAM BO with modifier 0 (ADR 007 Fork 4);
-  block-linear needs ADDFB2 with `DRM_MODE_FB_MODIFIERS` and an NVIDIA block-linear
-  `DRM_FORMAT_MOD`.
+- 🔨 **NVIDIA block-linear scanout + ADDFB2 format modifiers** (CHANGELOG [4.4.0]). It landed
+  with the layout verified on hardware; **the scanout itself awaits the seat run** (below).
+  - **Scope, chosen 2026-11-16: swizzle at present.** configure takes two block-linear VRAM FBs:
+    kind 0x06, ADDFB2 with `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h)` and
+    NVK's block height.
+  - `acquire` still hands the consumer a pitch-linear buffer, and `present` CPU-swizzles it into
+    the back FB: 5.9 ms a frame at 1080p.
+  - Anything refused falls back to the linear FBs (ADR 007 Fork 4's path).
+  - The layout (TuringColor2D GOBs) matches both the kernel's and NVK's definitions on the CPU.
+    On the TU116 it matches the copy engine in both directions for every case and block height
+    (`test-nvidia-blocklinear-e2e`, masterless).
+  - Found on the way and fixed: ADDFB2's `drm_mode_fb_cmd2` was 4 bytes short, with `modifier`
+    unaligned.
+  - Not in this scope: block-linear render targets and textures (a zero-copy present), and a
+    copy-engine present to take the swizzle off the CPU.
 - **The seat-only HW closeout** — gates skipped at every release because they need a person at a
   seat (a VT with no compositor, `chew`'s console). Each target first writes its whole output to
   `build/logs/<gate>-<timestamp>.log` (the `test-surface-wayland-e2e` recipe is the template); the
@@ -198,7 +209,14 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     `issues/archived/2026-08-19-native-compute-spike-stale.md`);
   - the DRM-master AMD gates `test-native-kms-modeset` and `test-native-present-e2e`;
   - `chew`'s five card-node gates (kms-summary, kms-scanout, kms-modeset, present-e2e,
-    surface-present-e2e);
+    surface-present-e2e). Since the block-linear item, `surface-present-e2e` runs block-linear
+    then forced linear on a test card. **The two phases must look identical, and the log must
+    say phase 1 was BLOCK-LINEAR** (exit 7 means the kernel refused it). The first attempt
+    (2026-11-16 18:32, `build/logs/nvidia_surface_present_e2e-20261116-183245.log` on chew)
+    ran from a terminal inside chew's Wayland desktop, so `SET_MASTER` was refused (-13, exit
+    2) before anything was configured. The run needs a text console with sddm stopped. Only this run proves
+    the scanout and the ADDFB2 struct fix on NVIDIA; the AMD master gates above prove the fix
+    on AMD;
   - the samvada live-bus run: `gpu_surface_configure_native_logind` with `samvada_native_init()`,
     built `-D MABDA_LOGIND`, from a seated session (samvada 1.1.0's `libsystemd` shim deletion
     waits on it).
@@ -213,7 +231,7 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - NVIDIA on the TU116: the same four suites and counts;
   - logs in `build/logs/ranga-gpu-suites-{amd,nvidia}-n9.6-*.log`.
 
-  Still to do: rerun against the final 4.4.0 bundle at the cut. ranga needs four changes in its
+  Still to do: rerun against the final 4.4.0 bundle at the cut. ranga needs five changes in its
   own repo, all ranga's call. They are filed there as
   `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`:
   - `tests/gpu_spirv.tcyr`'s 4-argument table-builder call (needed for 4.4.0 on any backend);
@@ -221,8 +239,8 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   - `tests/gpu_nvidia.tcyr`'s refused rows flipped to the AMD suites' expected values;
   - a way to open an NVIDIA context in the four suites, which hard-code `gpu_context_new_amd`.
 
-  Found since the filing (the FDiv / f64 follow-on, 2026-11-16), not yet in that issue: on
-  NVIDIA, ranga's bilinear resize now compiles. So `tests/gpu_kernels.tcyr`'s pinned "cannot yet
+  Found since the filing (the FDiv / f64 follow-on, 2026-11-16), and appended to that issue as
+  its item 5: on NVIDIA, ranga's bilinear resize now compiles. So `tests/gpu_kernels.tcyr`'s pinned "cannot yet
   lower it … flip this when it can" assertion fails there (52 of 53;
   `build/logs/nvidia-ranga-fdiv-20261116-162252.log`), and `gpu_resize` could take
   `SF_BILINEAR` on an NVIDIA context. Since the GFX9 256-id item above, the same holds on AMD:

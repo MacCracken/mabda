@@ -104,3 +104,152 @@ fn native_nv_tsc_build_nearest_clamp(dst): i64 {
     store32(dst + 4, NV_TSC_NEAREST_CLAMP_DW1);
     return 32;
 }
+
+# ================================================================
+# Turing block-linear layout (4.4.0, NVIDIA block-linear scanout)
+# ================================================================
+# The layout the Turing display engine, copy engine and TEX unit read for an uncompressed
+# color surface of PTE kind 0x06 ("generic memory"; DRM modifier generation g=2). Two
+# independent references agree on every bit, and the CPU tests check both:
+#   - the kernel's drm_panic writer for Turing+ (drivers/gpu/drm/nouveau/dispnv50/wndw.c,
+#     nv50_set_pixel_swizzle: "bit order is yn..y3 x3 y2 x2 y1 y0 x1 x0", in 4-byte pixels);
+#   - Mesa NVK's CPU tiling copy (src/nouveau/nil/copy.rs, CopyGOBTuring2D's line table).
+#
+# GOB: 64 bytes wide x 8 rows = 512 bytes. Within it, the byte address is
+#   bits 3:0 = x % 16 (bytes)   bits 5:4 = y % 4   bit 6 = (x / 16) % 2
+#   bit 7    = (y / 4) % 2      bit 8    = (x / 32) % 2
+# (the older Fermi / Tegra GOBs order these differently: do not reuse their formulas).
+# Block: one GOB wide, 2^h GOBs tall (h = log2 GOBs per block, 0..5). Blocks are row-major:
+# ceil(width_bytes / 64) per row, each (512 << h) bytes. The row pitch the display and
+# ADDFB2 take is the width rounded up to the 64-byte GOB width.
+# Sizes mirror the kernel's nouveau_check_bl_size (dispnv50/tile.h).
+var NV_BL_GOB_W_BYTES       = 64;
+var NV_BL_GOB_ROWS          = 8;
+var NV_BL_GOB_BYTES         = 512;
+var NV_BL_MAX_BLOCK_H_LOG2  = 5;
+var NV_TU_PTE_KIND_GENERIC  = 0x06;    # Turing uncompressed color (wndwc57e_modifiers' kind)
+var DRM_FORMAT_MOD_VENDOR_NVIDIA = 0x03;
+
+# The block height (log2 GOBs) for a `height`-row surface: NVK's heuristic (nil tiling.rs,
+# "aims to match what the proprietary driver picks"), 0 for a non-positive height.
+fn native_nv_bl_block_h_log2(height): i64 {
+    if (height >= 86) { return 4; }
+    if (height >= 43) { return 3; }
+    if (height >= 22) { return 2; }
+    if (height >= 11) { return 1; }
+    return 0;
+}
+
+# The block-linear row pitch for `width_bytes`: rounded up to the GOB width (0 if <= 0).
+fn native_nv_bl_pitch(width_bytes): i64 {
+    if (width_bytes <= 0) { return 0; }
+    return (width_bytes + 63) / 64 * 64;
+}
+
+# Bytes a block-linear surface occupies (0 for a bad argument): blocks per row x block rows x
+# block bytes, as nouveau_check_bl_size requires of the BO.
+fn native_nv_bl_size(width_bytes, height, h): i64 {
+    if (width_bytes <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    if (h < 0) { return 0; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0; }
+    var cols = (width_bytes + 63) / 64;
+    var brows = NV_BL_GOB_ROWS << h;
+    var rows = (height + brows - 1) / brows;
+    return cols * rows * (NV_BL_GOB_BYTES << h);
+}
+
+# Byte offset of linear byte (x_bytes, y) in a block-linear surface of row pitch `bl_pitch`
+# (a multiple of 64) and block height h.
+fn native_nv_bl_offset(x_bytes, y, bl_pitch, h): i64 {
+    var brows = NV_BL_GOB_ROWS << h;
+    var blk = (y / brows) * (bl_pitch / 64) + x_bytes / 64;
+    var yb = y % brows;
+    var xg = x_bytes % 64;
+    var yg = yb % 8;
+    var within = (xg % 16) | ((yg % 4) << 4) | (((xg / 16) % 2) << 6) | ((yg / 4) << 7) | ((xg / 32) << 8);
+    return blk * (NV_BL_GOB_BYTES << h) + (yb / 8) * NV_BL_GOB_BYTES + within;
+}
+
+# The DRM format modifier for a Turing block-linear surface of block height h:
+# DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h), the values the Turing
+# windows (wndwc57e) list. -1 for h outside 0..5.
+fn native_nv_bl_modifier(h): i64 {
+    if (h < 0) { return 0 - 1; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0 - 1; }
+    var v = 0x10 | h | (NV_TU_PTE_KIND_GENERIC << 12) | (2 << 20) | (1 << 22);
+    return (DRM_FORMAT_MOD_VENDOR_NVIDIA << 56) | v;
+}
+
+# Copy (to_bl = 1) a pitch-linear image into a block-linear surface, or (to_bl = 0) back.
+# `lin` is height rows of `lin_pitch` bytes, `bl` the surface; every byte at x < bl_pitch,
+# y < height moves (the GOB padding past the image width included, so `lin_pitch` must be at
+# least `bl_pitch`). Walks the surface in memory order, 16-byte line by line, so the
+# block-linear side (write-combined VRAM at present) is written sequentially. Rows past
+# `height` in the last block row are not touched. Returns 0, or -1 for bad arguments.
+fn _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, to_bl): i64 {
+    if (bl == 0) { return 0 - 1; }
+    if (lin == 0) { return 0 - 1; }
+    if (h < 0) { return 0 - 1; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0 - 1; }
+    if (bl_pitch <= 0) { return 0 - 1; }
+    if ((bl_pitch % 64) != 0) { return 0 - 1; }
+    if (lin_pitch < bl_pitch) { return 0 - 1; }
+    if (height <= 0) { return 0 - 1; }
+    var cols = bl_pitch / 64;
+    var gobs = 1 << h;
+    var brows = NV_BL_GOB_ROWS << h;
+    var nbr = (height + brows - 1) / brows;
+    var d = bl;
+    var br = 0;
+    while (br < nbr) {
+        var bc = 0;
+        while (bc < cols) {
+            var g = 0;
+            while (g < gobs) {
+                var y0 = br * brows + g * 8;
+                var row0 = lin + y0 * lin_pitch + bc * 64;
+                var half = 0;
+                while (half < 2) {
+                    var yq = 0;
+                    while (yq < 2) {
+                        var xs = 0;
+                        while (xs < 2) {
+                            var yy = 0;
+                            while (yy < 4) {
+                                var yr = yq * 4 + yy;
+                                if (y0 + yr < height) {
+                                    var s = row0 + yr * lin_pitch + half * 32 + xs * 16;
+                                    if (to_bl == 1) {
+                                        store64(d, load64(s));
+                                        store64(d + 8, load64(s + 8));
+                                    } else {
+                                        store64(s, load64(d));
+                                        store64(s + 8, load64(d + 8));
+                                    }
+                                }
+                                d = d + 16;
+                                yy = yy + 1;
+                            }
+                            xs = xs + 1;
+                        }
+                        yq = yq + 1;
+                    }
+                    half = half + 1;
+                }
+                g = g + 1;
+            }
+            bc = bc + 1;
+        }
+        br = br + 1;
+    }
+    return 0;
+}
+
+fn native_nv_bl_swizzle(bl, lin, lin_pitch, bl_pitch, height, h): i64 {
+    return _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, 1);
+}
+
+fn native_nv_bl_unswizzle(lin, bl, lin_pitch, bl_pitch, height, h): i64 {
+    return _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, 0);
+}

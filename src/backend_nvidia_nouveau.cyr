@@ -237,11 +237,27 @@ var NOUVEAU_GEM_DOMAIN_NO_SHARE = 0x20;  # 1<<5
 # alignment (page-multiple). On success the kernel fills the embedded
 # info — read it back via the accessors below. Returns 0 or -errno.
 fn native_nv_gem_new(fd, size, align, domains, req): i64 {
-    memset(req, 0, DRM_NOUVEAU_GEM_NEW_SIZE);
-    store32(req + 4, domains);   # info.domain
-    store64(req + 8, size);      # info.size
-    store32(req + 44, align);    # align
+    return native_nv_gem_new_tiled(fd, size, align, domains, 0, 0, req);
+}
+
+# GEM_NEW with tiling (4.4.0, block-linear scanout). On Fermi+ the kernel takes the BO's PTE
+# kind from tile_flags bits 15:8 (nouveau_bo_alloc: nvif_mmu_kind_valid-checked, EINVAL
+# otherwise) and its block height from tile_mode bits 7:4 (log2 GOBs; nouveau_get_gobs_in_block).
+# The kind is what the BAR1 CPU mapping uses; VM_BIND takes its own (native_nv_vm_bind_map_kind).
+fn native_nv_gem_new_tiled(fd, size, align, domains, tile_mode, tile_flags, req): i64 {
+    native_nv_gem_new_pack(req, size, align, domains, tile_mode, tile_flags);
     return _mabda_ioctl(fd, DRM_IOCTL_NOUVEAU_GEM_NEW, req);
+}
+
+# Fill drm_nouveau_gem_new (`req`, 48 bytes). Returns 0.
+fn native_nv_gem_new_pack(req, size, align, domains, tile_mode, tile_flags): i64 {
+    memset(req, 0, DRM_NOUVEAU_GEM_NEW_SIZE);
+    store32(req + 4, domains);     # info.domain
+    store64(req + 8, size);        # info.size
+    store32(req + 32, tile_mode);  # info.tile_mode
+    store32(req + 36, tile_flags); # info.tile_flags
+    store32(req + 44, align);      # align
+    return 0;
 }
 
 fn native_nv_gem_new_handle(req): i64 { return load32(req + 0); }
@@ -268,11 +284,22 @@ var NOUVEAU_GEM_DOMAIN_HOST = 0x1C;  # GART | MAPPABLE | COHERENT
 # failure the handle is closed and out+0 cleared so a non-zero return
 # leaks nothing (mirrors native_bo_create_gtt).
 fn native_nv_bo_create_dom(fd, size, domains, out): i64 {
+    return native_nv_bo_create_kind(fd, size, domains, 0, 0, out);
+}
+
+# native_nv_bo_create_dom for a tiled BO: PTE `kind` (0 = pitch) and block height
+# `block_h_log2` (log2 GOBs), packed into GEM_NEW's tile_flags / tile_mode as nouveau's
+# Fermi+ path reads them. 4.4.0, block-linear scanout.
+fn native_nv_bo_create_kind(fd, size, domains, kind, block_h_log2, out): i64 {
     store64(out + 0, 0);
     store64(out + 8, 0);
+    if (kind < 0) { return 0 - 22; }
+    if (kind > 0xFF) { return 0 - 22; }
+    if (block_h_log2 < 0) { return 0 - 22; }
+    if (block_h_log2 > 5) { return 0 - 22; }
 
     var req[48];
-    var rc = native_nv_gem_new(fd, size, 4096, domains, &req);
+    var rc = native_nv_gem_new_tiled(fd, size, 4096, domains, block_h_log2 * 16, kind * 256, &req);
     if (rc != 0) { return rc; }
     var handle = native_nv_gem_new_handle(&req);
     store64(out + 0, handle);
@@ -376,12 +403,26 @@ fn native_nv_channel_free(fd, chid): i64 {
 # 0 (the kernel EINVALs a non-zero sync count when flags=0). Returns 0 or
 # -errno. The op struct is stack-local; op_ptr references it for the call.
 fn native_nv_vm_bind_map(fd, handle, addr, range): i64 {
+    return native_nv_vm_bind_map_kind(fd, handle, addr, range, 0);
+}
+
+# Fill one drm_nouveau_vm_bind_op (`op`, 40 bytes) for a MAP. The kernel takes the mapping's
+# PTE kind from the op's flags bits 7:0 (nouveau_uvmm: `op->flags & 0xff`). Returns 0.
+fn native_nv_vm_bind_op_pack(op, handle, addr, range, kind): i64 {
+    memset(op, 0, 40);
+    store32(op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);   # op = MAP
+    store32(op + 4, kind & 0xFF);                   # flags: PTE kind
+    store32(op + 8, handle);                        # handle
+    store64(op + 16, addr);                         # addr
+    store64(op + 32, range);                        # range
+    return 0;
+}
+
+# native_nv_vm_bind_map with the mapping's PTE kind (4.4.0: a block-linear BO is mapped with
+# kind 0x06, the same kind its CPU mapping and the display use).
+fn native_nv_vm_bind_map_kind(fd, handle, addr, range, kind): i64 {
     var op[40];
-    memset(&op, 0, 40);
-    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);  # op = MAP
-    store32(&op + 8, handle);                      # handle
-    store64(&op + 16, addr);                       # addr
-    store64(&op + 32, range);                      # range
+    native_nv_vm_bind_op_pack(&op, handle, addr, range, kind);
 
     var bind[40];
     memset(&bind, 0, 40);

@@ -39,11 +39,14 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
-  - NVIDIA block-linear scanout.
+  - NVIDIA block-linear scanout: landed, with the layout checked against the copy engine
+    (`test-nvidia-blocklinear-e2e`). The scanout itself waits for the seat run of
+    `test-nvidia-surface-present-e2e`, whose two phases must look identical.
   - The surface-acquire leak.
   - The seat-only closeout.
-  - The consumer check. ranga needs four changes in its own repo, all its call. They are
-    filed as `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`.
+  - The consumer check. ranga needs five changes in its own repo, all its call. They are
+    filed as `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`
+    (item 5, the bilinear row and `gpu_resize`, was appended after the 1024-id work).
   On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
   Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
   deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
@@ -205,6 +208,12 @@ Consumers:
 - RADV contracts f64 `a*b + c` into an FMA (allowed without `NoContraction`), so expect 1 ULP. The
   native GFX9 compiler never fuses.
 - Cyrius reserves `mod` and `dyn` as identifiers.
+- Turing's block-linear GOB is NOT the Tegra / Fermi one that most write-ups give. Bits 4..8 of
+  the in-GOB address are y0 y1 x(16) y2 x(32): see `native_nv_bl_offset`, checked against the
+  kernel's `nv50_set_pixel_swizzle` and NVK's `CopyGOBTuring2D`.
+- Check every uapi struct against `sizeof` / `offsetof` from the header (compile a 3-line C
+  probe). `drm_mode_fb_cmd2` sat 4 bytes short for years, because linear scanout never reads
+  its `modifier`.
 - A fn's local arrays share a frame budget of about 120 KB (15360 slots of 8 bytes). Past it, a
   local array silently gets STATIC storage, with only a build warning (shared and not re-entrant).
   Split a big frame across two fns, as `sm75_compile_spirv` / `_sm75_compile_back` do.

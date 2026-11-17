@@ -1,0 +1,252 @@
+# programs/nvidia_blocklinear_e2e.cyr — 4.4.0 NVIDIA block-linear scanout: the hardware
+# oracle for mabda's block-linear swizzle (masterless, renderD128 only).
+#
+# Block-linear present (backend_nvidia.cyr) CPU-swizzles the consumer's pitch-linear frame
+# into a VRAM FB of PTE kind 0x06 that the display reads with
+# DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, h). The display itself can only be
+# checked from a seat, so this gate checks the layout against another engine that reads the
+# same layout: the copy engine (TURING_DMA_COPY_A, 0xC5B5), which converts block-linear to
+# pitch in hardware. For each image size and block height:
+#   1. mabda's CPU swizzle writes the source image into a kind-0x06 VRAM BO (through its BAR1
+#      mapping, as present does); the copy engine copies it back to pitch-linear; every pixel
+#      must match the source;
+#   2. the copy engine swizzles the source into the BO; mabda's CPU unswizzle reads it back;
+#      every pixel must match.
+# A control case swizzles with the WRONG block height and must mismatch, so the check is not
+# vacuous. It also times the 1920x1080 swizzle into VRAM (the per-frame cost present pays).
+#
+# Usage: nvidia_blocklinear_e2e   (make test-nvidia-blocklinear-e2e)
+# Exit: 0 = every case exact; 3 = context; 4 = no copy-engine object; 5 = BO / bind;
+#       7 = submit / wait; 11 = a case mismatched; 12 = the control did not mismatch.
+
+include "src/lib.cyr"
+
+fn out(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn outn(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    syscall(1, 1, &buf, fmt_int_buf(n, &buf));
+    return 0;
+}
+
+var g_ctx = 0;
+var g_fd = 0;
+var g_chid = 0;
+var g_push = 0;
+var g_push_va = 0;
+
+# A VA-bound BO: `size` bytes (rounded to 64 KiB), domain `dom`, PTE kind `kind`, block
+# height `h`. out[24]: +0 handle, +8 GPU VA, +16 CPU address. Returns 0 or a negative errno.
+fn mk_bo(dom, size, kind, h, o): i64 {
+    var span = _nv_align64k(size);
+    var bo[16];
+    var rc = native_nv_bo_create_kind(g_fd, span, dom, kind, h, &bo);
+    if (rc != 0) { return rc; }
+    var va = _nv_ctx_alloc_va(g_ctx, span);
+    if (va == 0) { native_nv_bo_release_host(g_fd, load64(&bo), load64(&bo + 8), span); return 0 - 12; }
+    rc = native_nv_vm_bind_map_kind(g_fd, load64(&bo), va, span, kind);
+    if (rc != 0) { native_nv_bo_release_host(g_fd, load64(&bo), load64(&bo + 8), span); return rc; }
+    store64(o, load64(&bo));
+    store64(o + 8, va);
+    store64(o + 16, load64(&bo + 8));
+    return 0;
+}
+
+fn rel_bo(o, size): i64 {
+    var span = _nv_align64k(size);
+    native_nv_vm_unbind(g_fd, load64(o + 8), span);
+    native_nv_bo_release_host(g_fd, load64(o), load64(o + 16), span);
+    return 0;
+}
+
+# Run `len` bytes of pushbuffer and wait (2 s). Returns 0 or non-zero.
+fn submit(len): i64 {
+    var so[8];
+    memset(&so, 0, 8);
+    if (native_syncobj_create(g_fd, &so) != 0) { return 0 - 1; }
+    var sh = load32(&so);
+    var deadline = _time_now_ns() + 2000000000;
+    var rc = native_nv_exec_submit(g_fd, g_chid, g_push_va, len, sh);
+    if (rc == 0) { rc = native_syncobj_wait_fence_checked(g_fd, sh, deadline); }
+    native_syncobj_destroy(g_fd, sh);
+    return rc;
+}
+
+fn pattern(x, y, seed): i64 {
+    var v = (x * 0x85EBCA6B + y * 0xC2B2AE35 + seed * 0x27D4EB2F) & 0xFFFFFFFF;
+    v = (v ^ (v >> 15)) & 0xFFFFFFFF;
+    return v | 0x01000000;
+}
+
+# Words that differ between `a` and `b` over an image of w x hgt pixels at pitch lp.
+fn diff_words(a, b, w, hgt, lp): i64 {
+    var bad = 0;
+    var y = 0;
+    while (y < hgt) {
+        var x = 0;
+        while (x < w) {
+            if (load32(a + y * lp + x * 4) != load32(b + y * lp + x * 4)) { bad = bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+# One case: a w x hgt image, the copy engine at block height h, mabda's CPU at cpu_h (== h
+# except in the control). Returns the mismatching words in both directions, or -1 on a setup
+# failure (g_err says which).
+var g_err = 0;
+fn run_case(w, hgt, h, cpu_h, seed): i64 {
+    var wb = w * 4;
+    var lp = (wb + 255) / 256 * 256;
+    var blp = native_nv_bl_pitch(wb);
+    var bls = native_nv_bl_size(wb, hgt, h);
+    var cbls = native_nv_bl_size(wb, hgt, cpu_h);
+    if (cbls > bls) { bls = cbls; }
+    var src[24];
+    var dst[24];
+    var bl[24];
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_HOST, lp * hgt, 0, 0, &src) != 0) { g_err = 5; return 0 - 1; }
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_HOST, lp * hgt, 0, 0, &dst) != 0) { g_err = 5; return 0 - 1; }
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_VRAM, bls, NV_TU_PTE_KIND_GENERIC, h, &bl) != 0) { g_err = 5; return 0 - 1; }
+    var sp = load64(&src + 16);
+    var dp = load64(&dst + 16);
+    var bp = load64(&bl + 16);
+    var y = 0;
+    while (y < hgt) {
+        var x = 0;
+        while (x < lp / 4) { store32(sp + y * lp + x * 4, pattern(x, y, seed)); x = x + 1; }
+        y = y + 1;
+    }
+    # 1. CPU swizzle -> copy engine block-linear -> pitch
+    native_nv_bl_swizzle(bp, sp, lp, blp, hgt, cpu_h);
+    memset(dp, 0, lp * hgt);
+    var n = native_nv_push_ce_copy_bl(g_push, load64(&bl + 8), load64(&dst + 8), lp, wb, hgt, h, 0);
+    if (submit(n) != 0) { g_err = 7; return 0 - 1; }
+    var bad1 = diff_words(dp, sp, w, hgt, lp);
+    # 2. copy engine pitch -> block-linear -> CPU unswizzle
+    memset(bp, 0, _nv_align64k(bls));
+    n = native_nv_push_ce_copy_bl(g_push, load64(&bl + 8), load64(&src + 8), lp, wb, hgt, h, 1);
+    if (submit(n) != 0) { g_err = 7; return 0 - 1; }
+    memset(dp, 0, lp * hgt);
+    native_nv_bl_unswizzle(dp, bp, lp, blp, hgt, cpu_h);
+    var bad2 = diff_words(dp, sp, w, hgt, lp);
+    out("  "); outn(w); out("x"); outn(hgt); out(" h="); outn(h);
+    if (cpu_h != h) { out(" (cpu h="); outn(cpu_h); out(")"); }
+    out(": cpu->ce "); outn(w * hgt - bad1); out("/"); outn(w * hgt);
+    out(", ce->cpu "); outn(w * hgt - bad2); out("/"); outn(w * hgt); out("\n");
+    rel_bo(&bl, bls);
+    rel_bo(&dst, lp * hgt);
+    rel_bo(&src, lp * hgt);
+    return bad1 + bad2;
+}
+
+# The per-frame swizzle cost: a 1920x1080 frame into a VRAM BO (BAR1) and into host memory.
+fn time_swizzle(): i64 {
+    var lp = 7680;
+    var hgt = 1080;
+    var h = native_nv_bl_block_h_log2(hgt);
+    var bls = native_nv_bl_size(lp, hgt, h);
+    var src[24];
+    var vr[24];
+    var hs[24];
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_HOST, lp * hgt, 0, 0, &src) != 0) { return 0 - 1; }
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_VRAM, bls, NV_TU_PTE_KIND_GENERIC, h, &vr) != 0) { return 0 - 1; }
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_HOST, bls, 0, 0, &hs) != 0) { return 0 - 1; }
+    memset(load64(&src + 16), 0x5A, lp * hgt);
+    var reps = 5;
+    var t0 = _time_now_ns();
+    var r = 0;
+    while (r < reps) { native_nv_bl_swizzle(load64(&vr + 16), load64(&src + 16), lp, lp, hgt, h); r = r + 1; }
+    var t1 = _time_now_ns();
+    r = 0;
+    while (r < reps) { native_nv_bl_swizzle(load64(&hs + 16), load64(&src + 16), lp, lp, hgt, h); r = r + 1; }
+    var t2 = _time_now_ns();
+    out("  swizzle 1920x1080 (h="); outn(h); out("): into VRAM "); outn((t1 - t0) / reps / 1000);
+    out(" us/frame, into host memory "); outn((t2 - t1) / reps / 1000); out(" us/frame\n");
+    rel_bo(&hs, bls);
+    rel_bo(&vr, bls);
+    rel_bo(&src, lp * hgt);
+    return 0;
+}
+
+# A copy-engine channel (the fallback when the GR channel has no copy class). Returns the
+# chid or a negative errno.
+fn ce_channel(): i64 {
+    var req[88];
+    memset(&req, 0, DRM_NOUVEAU_CHANNEL_ALLOC_SIZE);
+    store32(&req + 0, 0xFFFFFFFF);
+    store32(&req + 4, NOUVEAU_FIFO_ENGINE_CE);
+    var rc = _mabda_ioctl(g_fd, DRM_IOCTL_NOUVEAU_CHANNEL_ALLOC, &req);
+    if (rc != 0) { return rc; }
+    return native_nv_channel_id(&req);
+}
+
+fn main(): i64 {
+    alloc_init();
+    out("mabda NVIDIA block-linear e2e (4.4.0) — CPU swizzle vs the copy engine, TU116\n");
+    out("--------------------------------------------------------------------------\n");
+    var ct, cv = gpu_context_new_native_nvidia();
+    if (is_err_result(ct) == 1) { out("FAIL: no native NVIDIA context\n"); return 3; }
+    g_ctx = cv;
+    g_fd = nv_ctx_fd(g_ctx);
+    g_chid = nv_ctx_chid(g_ctx);
+    var rc = native_nv_object_new(g_fd, g_chid, native_nv_object_handle(g_chid, TURING_DMA_COPY_A), TURING_DMA_COPY_A);
+    if (rc == 0) {
+        out("copy class 0xC5B5 on the GR channel "); outn(g_chid); out("\n");
+    } else {
+        out("copy class on the GR channel: rc "); outn(rc); out("; trying a copy-engine channel\n");
+        var cc = ce_channel();
+        if (cc < 0) { out("FAIL: CE channel rc "); outn(cc); out("\n"); return 4; }
+        g_chid = cc;
+        rc = native_nv_object_new(g_fd, g_chid, native_nv_object_handle(g_chid, TURING_DMA_COPY_A), TURING_DMA_COPY_A);
+        if (rc != 0) { out("FAIL: copy class rc "); outn(rc); out("\n"); return 4; }
+        out("copy class 0xC5B5 on CE channel "); outn(g_chid); out("\n");
+    }
+    var pb[24];
+    if (mk_bo(NOUVEAU_GEM_DOMAIN_HOST, 4096, 0, 0, &pb) != 0) { out("FAIL: push BO\n"); return 5; }
+    g_push = load64(&pb + 16);
+    g_push_va = load64(&pb + 8);
+
+    var bad = 0;
+    var r = 0;
+    # the scanout case, odd sizes (partial GOB columns and block rows), the heuristic's heights
+    r = run_case(1920, 1080, native_nv_bl_block_h_log2(1080), native_nv_bl_block_h_log2(1080), 1);
+    if (r < 0) { return g_err; }
+    bad = bad + r;
+    r = run_case(100, 70, native_nv_bl_block_h_log2(70), native_nv_bl_block_h_log2(70), 2);
+    if (r < 0) { return g_err; }
+    bad = bad + r;
+    r = run_case(52, 50, 3, 3, 3);
+    if (r < 0) { return g_err; }
+    bad = bad + r;
+    r = run_case(16, 8, 0, 0, 4);
+    if (r < 0) { return g_err; }
+    bad = bad + r;
+    r = run_case(300, 20, 1, 1, 5);
+    if (r < 0) { return g_err; }
+    bad = bad + r;
+    # every block height on one size
+    var h = 0;
+    while (h <= 5) {
+        r = run_case(256, 200, h, h, 10 + h);
+        if (r < 0) { return g_err; }
+        bad = bad + r;
+        h = h + 1;
+    }
+    # the control: the CPU at the wrong block height must not match
+    out("control (must mismatch):\n");
+    var ctl = run_case(256, 200, 3, 2, 20);
+    if (ctl < 0) { return g_err; }
+    time_swizzle();
+    rel_bo(&pb, 4096);
+    gpu_context_release(g_ctx);
+    if (bad != 0) { out("FAIL: "); outn(bad); out(" words mismatched\n"); return 11; }
+    if (ctl == 0) { out("FAIL: the wrong-height control matched (the check is vacuous)\n"); return 12; }
+    out("OK — the copy engine agrees with mabda's block-linear swizzle, both ways, every case\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

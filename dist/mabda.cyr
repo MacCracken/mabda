@@ -23354,9 +23354,13 @@ fn native_kms_mode_refresh_hz(modes_ptr, idx): i64 {
 # (tiling). Single-plane RGB scanout uses planes[0] only and
 # modifier=0 (linear).
 
-# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 100
-#   0xC0000000 | (100 << 16) | (0x64 << 8) | 0xB8 == 0xC06464B8
-var DRM_IOCTL_MODE_ADDFB2 = 0xC06464B8;
+# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 104
+#   0xC0000000 | (104 << 16) | (0x64 << 8) | 0xB8 == 0xC06864B8
+# ⛔ 100 / 0xC06464B8 until 4.4.0: the struct was laid out without the u64 alignment of
+# modifier[] (+72, not +68). Linear scanout never noticed (no DRM_MODE_FB_MODIFIERS flag, and
+# the kernel zero-fills a short copy), but a modifier written at +68 would have reached the
+# kernel misaligned. Checked against sizeof / offsetof from the uapi header.
+var DRM_IOCTL_MODE_ADDFB2 = 0xC06864B8;
 
 # DRM_IOCTL_MODE_RMFB — nr 0xAF, RW, sizeof(u32) = 4
 #   0xC0000000 | (4 << 16) | (0x64 << 8) | 0xAF == 0xC00464AF
@@ -23383,7 +23387,7 @@ var DRM_FORMAT_ARGB8888 = 0x34325241;   # 'A' 'R' '2' '4'
 var DRM_FORMAT_XBGR8888 = 0x34324258;   # 'X' 'B' '2' '4'
 var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
 
-# drm_mode_fb_cmd2 layout (100 bytes, x86_64):
+# drm_mode_fb_cmd2 layout (104 bytes, x86_64):
 #   +0:  fb_id          (u32) — OUT (kernel returns FB ID)
 #   +4:  width          (u32) — IN
 #   +8:  height         (u32) — IN
@@ -23392,8 +23396,10 @@ var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
 #   +20: handles[4]     (u32 × 4 = 16 B) — IN, plane GEM handles
 #   +36: pitches[4]     (u32 × 4 = 16 B) — IN, bytes per row per plane
 #   +52: offsets[4]     (u32 × 4 = 16 B) — IN, BO byte offset per plane
-#   +68: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane
-var DRM_MODE_FB_CMD2_SIZE      = 100;
+#   +68: (pad)          (4 B) — the u64 alignment of modifier[]
+#   +72: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane (read only when
+#                       flags has DRM_MODE_FB_MODIFIERS)
+var DRM_MODE_FB_CMD2_SIZE      = 104;
 var DRM_MODE_FB_CMD2_FB_ID     = 0;
 var DRM_MODE_FB_CMD2_WIDTH     = 4;
 var DRM_MODE_FB_CMD2_HEIGHT    = 8;
@@ -23402,7 +23408,10 @@ var DRM_MODE_FB_CMD2_FLAGS     = 16;
 var DRM_MODE_FB_CMD2_HANDLES   = 20;
 var DRM_MODE_FB_CMD2_PITCHES   = 36;
 var DRM_MODE_FB_CMD2_OFFSETS   = 52;
-var DRM_MODE_FB_CMD2_MODIFIERS = 68;
+var DRM_MODE_FB_CMD2_MODIFIERS = 72;
+
+# drm_mode_fb_cmd2.flags: DRM_MODE_FB_MODIFIERS makes the kernel read modifier[].
+var DRM_MODE_FB_MODIFIERS = 2;
 
 # Linear (untiled) tiling modifier — value 0 in uapi/drm/drm_fourcc.h.
 # Pre-2018 kernels infer linear from "no MODIFIERS flag set"; modern
@@ -23444,16 +23453,42 @@ fn native_kms_add_fb_xrgb8888(fd, bo_handle, width, height, pitch): i64 {
     if (height <= 0)    { return 0; }
     if (pitch <= 0)     { return 0; }
 
-    var req[100];
-    memset(&req, 0, DRM_MODE_FB_CMD2_SIZE);
-    store32(&req + DRM_MODE_FB_CMD2_WIDTH,           width);
-    store32(&req + DRM_MODE_FB_CMD2_HEIGHT,          height);
-    store32(&req + DRM_MODE_FB_CMD2_FORMAT,          DRM_FORMAT_XRGB8888);
-    store32(&req + DRM_MODE_FB_CMD2_FLAGS,           0);
-    store32(&req + DRM_MODE_FB_CMD2_HANDLES + 0,     bo_handle);
-    store32(&req + DRM_MODE_FB_CMD2_PITCHES + 0,     pitch);
-    store32(&req + DRM_MODE_FB_CMD2_OFFSETS + 0,     0);
-    store64(&req + DRM_MODE_FB_CMD2_MODIFIERS + 0,   DRM_FORMAT_MOD_LINEAR);
+    var req[104];
+    native_kms_fb_cmd2_pack(&req, bo_handle, width, height, pitch, 0, DRM_FORMAT_MOD_LINEAR);
+    var rc = native_drm_mode_add_fb2(fd, &req);
+    if (rc != 0) { return 0; }
+    return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
+}
+
+# Fill `req` (DRM_MODE_FB_CMD2_SIZE bytes) for a single-plane XRGB8888 framebuffer: plane 0's
+# handle / pitch / offset 0 / `modifier`, and `flags` (0, or DRM_MODE_FB_MODIFIERS for the
+# kernel to read the modifier). Returns 0.
+fn native_kms_fb_cmd2_pack(req, bo_handle, width, height, pitch, flags, modifier): i64 {
+    memset(req, 0, DRM_MODE_FB_CMD2_SIZE);
+    store32(req + DRM_MODE_FB_CMD2_WIDTH,         width);
+    store32(req + DRM_MODE_FB_CMD2_HEIGHT,        height);
+    store32(req + DRM_MODE_FB_CMD2_FORMAT,        DRM_FORMAT_XRGB8888);
+    store32(req + DRM_MODE_FB_CMD2_FLAGS,         flags);
+    store32(req + DRM_MODE_FB_CMD2_HANDLES + 0,   bo_handle);
+    store32(req + DRM_MODE_FB_CMD2_PITCHES + 0,   pitch);
+    store32(req + DRM_MODE_FB_CMD2_OFFSETS + 0,   0);
+    store64(req + DRM_MODE_FB_CMD2_MODIFIERS + 0, modifier);
+    return 0;
+}
+
+# native_kms_add_fb_xrgb8888 with an explicit format modifier (DRM_MODE_FB_MODIFIERS set):
+# a tiled scanout such as NVIDIA block-linear (native_nv_bl_modifier). The kernel checks the
+# modifier against the plane's list and the BO's size against the tiled layout; either
+# refusal returns 0, which the caller treats as "fall back to linear". 4.4.0.
+fn native_kms_add_fb_xrgb8888_mod(fd, bo_handle, width, height, pitch, modifier): i64 {
+    if (fd <= 0)        { return 0; }
+    if (bo_handle == 0) { return 0; }
+    if (width <= 0)     { return 0; }
+    if (height <= 0)    { return 0; }
+    if (pitch <= 0)     { return 0; }
+
+    var req[104];
+    native_kms_fb_cmd2_pack(&req, bo_handle, width, height, pitch, DRM_MODE_FB_MODIFIERS, modifier);
     var rc = native_drm_mode_add_fb2(fd, &req);
     if (rc != 0) { return 0; }
     return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
@@ -24529,11 +24564,27 @@ var NOUVEAU_GEM_DOMAIN_NO_SHARE = 0x20;  # 1<<5
 # alignment (page-multiple). On success the kernel fills the embedded
 # info — read it back via the accessors below. Returns 0 or -errno.
 fn native_nv_gem_new(fd, size, align, domains, req): i64 {
-    memset(req, 0, DRM_NOUVEAU_GEM_NEW_SIZE);
-    store32(req + 4, domains);   # info.domain
-    store64(req + 8, size);      # info.size
-    store32(req + 44, align);    # align
+    return native_nv_gem_new_tiled(fd, size, align, domains, 0, 0, req);
+}
+
+# GEM_NEW with tiling (4.4.0, block-linear scanout). On Fermi+ the kernel takes the BO's PTE
+# kind from tile_flags bits 15:8 (nouveau_bo_alloc: nvif_mmu_kind_valid-checked, EINVAL
+# otherwise) and its block height from tile_mode bits 7:4 (log2 GOBs; nouveau_get_gobs_in_block).
+# The kind is what the BAR1 CPU mapping uses; VM_BIND takes its own (native_nv_vm_bind_map_kind).
+fn native_nv_gem_new_tiled(fd, size, align, domains, tile_mode, tile_flags, req): i64 {
+    native_nv_gem_new_pack(req, size, align, domains, tile_mode, tile_flags);
     return _mabda_ioctl(fd, DRM_IOCTL_NOUVEAU_GEM_NEW, req);
+}
+
+# Fill drm_nouveau_gem_new (`req`, 48 bytes). Returns 0.
+fn native_nv_gem_new_pack(req, size, align, domains, tile_mode, tile_flags): i64 {
+    memset(req, 0, DRM_NOUVEAU_GEM_NEW_SIZE);
+    store32(req + 4, domains);     # info.domain
+    store64(req + 8, size);        # info.size
+    store32(req + 32, tile_mode);  # info.tile_mode
+    store32(req + 36, tile_flags); # info.tile_flags
+    store32(req + 44, align);      # align
+    return 0;
 }
 
 fn native_nv_gem_new_handle(req): i64 { return load32(req + 0); }
@@ -24560,11 +24611,22 @@ var NOUVEAU_GEM_DOMAIN_HOST = 0x1C;  # GART | MAPPABLE | COHERENT
 # failure the handle is closed and out+0 cleared so a non-zero return
 # leaks nothing (mirrors native_bo_create_gtt).
 fn native_nv_bo_create_dom(fd, size, domains, out): i64 {
+    return native_nv_bo_create_kind(fd, size, domains, 0, 0, out);
+}
+
+# native_nv_bo_create_dom for a tiled BO: PTE `kind` (0 = pitch) and block height
+# `block_h_log2` (log2 GOBs), packed into GEM_NEW's tile_flags / tile_mode as nouveau's
+# Fermi+ path reads them. 4.4.0, block-linear scanout.
+fn native_nv_bo_create_kind(fd, size, domains, kind, block_h_log2, out): i64 {
     store64(out + 0, 0);
     store64(out + 8, 0);
+    if (kind < 0) { return 0 - 22; }
+    if (kind > 0xFF) { return 0 - 22; }
+    if (block_h_log2 < 0) { return 0 - 22; }
+    if (block_h_log2 > 5) { return 0 - 22; }
 
     var req[48];
-    var rc = native_nv_gem_new(fd, size, 4096, domains, &req);
+    var rc = native_nv_gem_new_tiled(fd, size, 4096, domains, block_h_log2 * 16, kind * 256, &req);
     if (rc != 0) { return rc; }
     var handle = native_nv_gem_new_handle(&req);
     store64(out + 0, handle);
@@ -24668,12 +24730,26 @@ fn native_nv_channel_free(fd, chid): i64 {
 # 0 (the kernel EINVALs a non-zero sync count when flags=0). Returns 0 or
 # -errno. The op struct is stack-local; op_ptr references it for the call.
 fn native_nv_vm_bind_map(fd, handle, addr, range): i64 {
+    return native_nv_vm_bind_map_kind(fd, handle, addr, range, 0);
+}
+
+# Fill one drm_nouveau_vm_bind_op (`op`, 40 bytes) for a MAP. The kernel takes the mapping's
+# PTE kind from the op's flags bits 7:0 (nouveau_uvmm: `op->flags & 0xff`). Returns 0.
+fn native_nv_vm_bind_op_pack(op, handle, addr, range, kind): i64 {
+    memset(op, 0, 40);
+    store32(op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);   # op = MAP
+    store32(op + 4, kind & 0xFF);                   # flags: PTE kind
+    store32(op + 8, handle);                        # handle
+    store64(op + 16, addr);                         # addr
+    store64(op + 32, range);                        # range
+    return 0;
+}
+
+# native_nv_vm_bind_map with the mapping's PTE kind (4.4.0: a block-linear BO is mapped with
+# kind 0x06, the same kind its CPU mapping and the display use).
+fn native_nv_vm_bind_map_kind(fd, handle, addr, range, kind): i64 {
     var op[40];
-    memset(&op, 0, 40);
-    store32(&op + 0, DRM_NOUVEAU_VM_BIND_OP_MAP);  # op = MAP
-    store32(&op + 8, handle);                      # handle
-    store64(&op + 16, addr);                       # addr
-    store64(&op + 32, range);                      # range
+    native_nv_vm_bind_op_pack(&op, handle, addr, range, kind);
 
     var bind[40];
     memset(&bind, 0, 40);
@@ -28830,6 +28906,84 @@ fn native_nv_push_draw(dst, dp, vertex_count): i64 {
     return n;
 }
 
+# ================================================================
+# TURING_DMA_COPY_A (0xC5B5) — a block-linear <-> pitch copy (4.4.0)
+# ================================================================
+# The copy engine converts between the block-linear layout (backend_nvidia_tex.cyr,
+# NV_BL_*) and pitch-linear in hardware. mabda uses it as the hardware oracle for its CPU
+# swizzle (programs/nvidia_blocklinear_e2e.cyr); the NVK method sequence, field values from
+# NVIDIA's clc5b5.h (Mesa src/nouveau/headers/nvidia/classes). NVK binds copy on subc 4.
+var TURING_DMA_COPY_A           = 0xC5B5;
+var NV_COPY_SUBC                = 4;
+var NVC5B5_SET_OBJECT           = 0x0000;
+var NVC5B5_LAUNCH_DMA           = 0x0300;
+# OFFSET_IN_UPPER is followed by IN_LOWER, OUT_UPPER, OUT_LOWER, PITCH_IN, PITCH_OUT,
+# LINE_LENGTH_IN and LINE_COUNT (one 8-dword INCR run).
+var NVC5B5_OFFSET_IN_UPPER      = 0x0400;
+var NVC5B5_SET_DST_BLOCK_SIZE   = 0x070C;   # + DST_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+var NVC5B5_SET_SRC_BLOCK_SIZE   = 0x0728;   # + SRC_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+# SET_*_BLOCK_SIZE: WIDTH 3:0 = ONE_GOB (0), HEIGHT 7:4 = log2 GOBs, DEPTH 11:8 = ONE_GOB,
+# GOB_HEIGHT 15:12 = GOB_HEIGHT_FERMI_8 (1).
+var NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8 = 0x1000;
+# LAUNCH_DMA: DATA_TRANSFER_TYPE 1:0 = NON_PIPELINED (2), FLUSH_ENABLE 2:2,
+# SRC_MEMORY_LAYOUT 7:7 / DST_MEMORY_LAYOUT 8:8 (0 = BLOCKLINEAR, 1 = PITCH),
+# MULTI_LINE_ENABLE 9:9; SRC_TYPE / DST_TYPE 12 / 13 = VIRTUAL (0).
+var NVC5B5_LAUNCH_NON_PIPELINED = 0x2;
+var NVC5B5_LAUNCH_FLUSH         = 0x4;
+var NVC5B5_LAUNCH_SRC_PITCH     = 0x80;
+var NVC5B5_LAUNCH_DST_PITCH     = 0x100;
+var NVC5B5_LAUNCH_MULTI_LINE    = 0x200;
+
+fn _nv_push_put(dst, n, v): i64 {
+    store32(dst + n, v);
+    return n + 4;
+}
+
+# Stage a copy-engine pushbuffer into `dst` (>= NV_PUSH_CE_COPY_BYTES): copy a `width_bytes`
+# x `height` image between the block-linear surface at GPU VA `bl_va` (block height h) and
+# the pitch-linear one at `lin_va` (`lin_pitch` bytes per row). to_bl = 1 copies pitch ->
+# block-linear, 0 block-linear -> pitch. Returns the byte length (the EXEC push va_len).
+var NV_PUSH_CE_COPY_BYTES = 80;
+fn native_nv_push_ce_copy_bl(dst, bl_va, lin_va, lin_pitch, width_bytes, height, h, to_bl): i64 {
+    var n = 0;
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_SET_OBJECT, 1));
+    n = _nv_push_put(dst, n, TURING_DMA_COPY_A);
+    # the block-linear side's surface: block size, width (bytes), height, depth 1, layer 0, origin 0
+    var surf = NVC5B5_SET_SRC_BLOCK_SIZE;
+    if (to_bl == 1) { surf = NVC5B5_SET_DST_BLOCK_SIZE; }
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, surf, 6));
+    n = _nv_push_put(dst, n, (h * 16) | NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8);
+    n = _nv_push_put(dst, n, width_bytes);
+    n = _nv_push_put(dst, n, height);
+    n = _nv_push_put(dst, n, 1);
+    n = _nv_push_put(dst, n, 0);
+    n = _nv_push_put(dst, n, 0);
+    var src = bl_va;
+    var dva = lin_va;
+    var pin = 0;
+    var pout = lin_pitch;
+    var lay = NVC5B5_LAUNCH_DST_PITCH;
+    if (to_bl == 1) {
+        src = lin_va;
+        dva = bl_va;
+        pin = lin_pitch;
+        pout = 0;
+        lay = NVC5B5_LAUNCH_SRC_PITCH;
+    }
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_OFFSET_IN_UPPER, 8));
+    n = _nv_push_put(dst, n, (src / 0x100000000) & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, src & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, (dva / 0x100000000) & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, dva & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, pin);
+    n = _nv_push_put(dst, n, pout);
+    n = _nv_push_put(dst, n, width_bytes);
+    n = _nv_push_put(dst, n, height);
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_LAUNCH_DMA, 1));
+    n = _nv_push_put(dst, n, NVC5B5_LAUNCH_NON_PIPELINED | NVC5B5_LAUNCH_FLUSH | lay | NVC5B5_LAUNCH_MULTI_LINE);
+    return n;
+}
+
 # --- backend_nvidia_qmd.cyr ---
 
 # @internal — native NVIDIA backend, Turing compute QMD builder
@@ -29002,6 +29156,155 @@ fn native_nv_tsc_build_nearest_clamp(dst): i64 {
     store32(dst + 0, NV_TSC_NEAREST_CLAMP_DW0);
     store32(dst + 4, NV_TSC_NEAREST_CLAMP_DW1);
     return 32;
+}
+
+# ================================================================
+# Turing block-linear layout (4.4.0, NVIDIA block-linear scanout)
+# ================================================================
+# The layout the Turing display engine, copy engine and TEX unit read for an uncompressed
+# color surface of PTE kind 0x06 ("generic memory"; DRM modifier generation g=2). Two
+# independent references agree on every bit, and the CPU tests check both:
+#   - the kernel's drm_panic writer for Turing+ (drivers/gpu/drm/nouveau/dispnv50/wndw.c,
+#     nv50_set_pixel_swizzle: "bit order is yn..y3 x3 y2 x2 y1 y0 x1 x0", in 4-byte pixels);
+#   - Mesa NVK's CPU tiling copy (src/nouveau/nil/copy.rs, CopyGOBTuring2D's line table).
+#
+# GOB: 64 bytes wide x 8 rows = 512 bytes. Within it, the byte address is
+#   bits 3:0 = x % 16 (bytes)   bits 5:4 = y % 4   bit 6 = (x / 16) % 2
+#   bit 7    = (y / 4) % 2      bit 8    = (x / 32) % 2
+# (the older Fermi / Tegra GOBs order these differently: do not reuse their formulas).
+# Block: one GOB wide, 2^h GOBs tall (h = log2 GOBs per block, 0..5). Blocks are row-major:
+# ceil(width_bytes / 64) per row, each (512 << h) bytes. The row pitch the display and
+# ADDFB2 take is the width rounded up to the 64-byte GOB width.
+# Sizes mirror the kernel's nouveau_check_bl_size (dispnv50/tile.h).
+var NV_BL_GOB_W_BYTES       = 64;
+var NV_BL_GOB_ROWS          = 8;
+var NV_BL_GOB_BYTES         = 512;
+var NV_BL_MAX_BLOCK_H_LOG2  = 5;
+var NV_TU_PTE_KIND_GENERIC  = 0x06;    # Turing uncompressed color (wndwc57e_modifiers' kind)
+var DRM_FORMAT_MOD_VENDOR_NVIDIA = 0x03;
+
+# The block height (log2 GOBs) for a `height`-row surface: NVK's heuristic (nil tiling.rs,
+# "aims to match what the proprietary driver picks"), 0 for a non-positive height.
+fn native_nv_bl_block_h_log2(height): i64 {
+    if (height >= 86) { return 4; }
+    if (height >= 43) { return 3; }
+    if (height >= 22) { return 2; }
+    if (height >= 11) { return 1; }
+    return 0;
+}
+
+# The block-linear row pitch for `width_bytes`: rounded up to the GOB width (0 if <= 0).
+fn native_nv_bl_pitch(width_bytes): i64 {
+    if (width_bytes <= 0) { return 0; }
+    return (width_bytes + 63) / 64 * 64;
+}
+
+# Bytes a block-linear surface occupies (0 for a bad argument): blocks per row x block rows x
+# block bytes, as nouveau_check_bl_size requires of the BO.
+fn native_nv_bl_size(width_bytes, height, h): i64 {
+    if (width_bytes <= 0) { return 0; }
+    if (height <= 0) { return 0; }
+    if (h < 0) { return 0; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0; }
+    var cols = (width_bytes + 63) / 64;
+    var brows = NV_BL_GOB_ROWS << h;
+    var rows = (height + brows - 1) / brows;
+    return cols * rows * (NV_BL_GOB_BYTES << h);
+}
+
+# Byte offset of linear byte (x_bytes, y) in a block-linear surface of row pitch `bl_pitch`
+# (a multiple of 64) and block height h.
+fn native_nv_bl_offset(x_bytes, y, bl_pitch, h): i64 {
+    var brows = NV_BL_GOB_ROWS << h;
+    var blk = (y / brows) * (bl_pitch / 64) + x_bytes / 64;
+    var yb = y % brows;
+    var xg = x_bytes % 64;
+    var yg = yb % 8;
+    var within = (xg % 16) | ((yg % 4) << 4) | (((xg / 16) % 2) << 6) | ((yg / 4) << 7) | ((xg / 32) << 8);
+    return blk * (NV_BL_GOB_BYTES << h) + (yb / 8) * NV_BL_GOB_BYTES + within;
+}
+
+# The DRM format modifier for a Turing block-linear surface of block height h:
+# DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c=0, s=1, g=2, k=0x06, h), the values the Turing
+# windows (wndwc57e) list. -1 for h outside 0..5.
+fn native_nv_bl_modifier(h): i64 {
+    if (h < 0) { return 0 - 1; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0 - 1; }
+    var v = 0x10 | h | (NV_TU_PTE_KIND_GENERIC << 12) | (2 << 20) | (1 << 22);
+    return (DRM_FORMAT_MOD_VENDOR_NVIDIA << 56) | v;
+}
+
+# Copy (to_bl = 1) a pitch-linear image into a block-linear surface, or (to_bl = 0) back.
+# `lin` is height rows of `lin_pitch` bytes, `bl` the surface; every byte at x < bl_pitch,
+# y < height moves (the GOB padding past the image width included, so `lin_pitch` must be at
+# least `bl_pitch`). Walks the surface in memory order, 16-byte line by line, so the
+# block-linear side (write-combined VRAM at present) is written sequentially. Rows past
+# `height` in the last block row are not touched. Returns 0, or -1 for bad arguments.
+fn _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, to_bl): i64 {
+    if (bl == 0) { return 0 - 1; }
+    if (lin == 0) { return 0 - 1; }
+    if (h < 0) { return 0 - 1; }
+    if (h > NV_BL_MAX_BLOCK_H_LOG2) { return 0 - 1; }
+    if (bl_pitch <= 0) { return 0 - 1; }
+    if ((bl_pitch % 64) != 0) { return 0 - 1; }
+    if (lin_pitch < bl_pitch) { return 0 - 1; }
+    if (height <= 0) { return 0 - 1; }
+    var cols = bl_pitch / 64;
+    var gobs = 1 << h;
+    var brows = NV_BL_GOB_ROWS << h;
+    var nbr = (height + brows - 1) / brows;
+    var d = bl;
+    var br = 0;
+    while (br < nbr) {
+        var bc = 0;
+        while (bc < cols) {
+            var g = 0;
+            while (g < gobs) {
+                var y0 = br * brows + g * 8;
+                var row0 = lin + y0 * lin_pitch + bc * 64;
+                var half = 0;
+                while (half < 2) {
+                    var yq = 0;
+                    while (yq < 2) {
+                        var xs = 0;
+                        while (xs < 2) {
+                            var yy = 0;
+                            while (yy < 4) {
+                                var yr = yq * 4 + yy;
+                                if (y0 + yr < height) {
+                                    var s = row0 + yr * lin_pitch + half * 32 + xs * 16;
+                                    if (to_bl == 1) {
+                                        store64(d, load64(s));
+                                        store64(d + 8, load64(s + 8));
+                                    } else {
+                                        store64(s, load64(d));
+                                        store64(s + 8, load64(d + 8));
+                                    }
+                                }
+                                d = d + 16;
+                                yy = yy + 1;
+                            }
+                            xs = xs + 1;
+                        }
+                        yq = yq + 1;
+                    }
+                    half = half + 1;
+                }
+                g = g + 1;
+            }
+            bc = bc + 1;
+        }
+        br = br + 1;
+    }
+    return 0;
+}
+
+fn native_nv_bl_swizzle(bl, lin, lin_pitch, bl_pitch, height, h): i64 {
+    return _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, 1);
+}
+
+fn native_nv_bl_unswizzle(lin, bl, lin_pitch, bl_pitch, height, h): i64 {
+    return _native_nv_bl_copy(bl, lin, lin_pitch, bl_pitch, height, h, 0);
 }
 
 # --- backend_nvidia.cyr ---
@@ -29922,7 +30225,16 @@ fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
 # reuse native_kms_modeset_first_connected / native_kms_alloc_fb — those bake
 # in the AMDGPU native_bo_create_gtt allocator).
 #
-# NvSurface (232 bytes):
+# BLOCK-LINEAR SCANOUT (4.4.0). configure first tries two block-linear VRAM FBs (PTE kind
+# 0x06, ADDFB2 with the Turing block-linear modifier; backend_nvidia_tex.cyr NV_BL_*). The
+# consumer's contract does not change: acquire then returns a pitch-linear STAGING buffer
+# (NV_SURFACE_STAGE, the same NV_SFB_* shape, NV_SURFACE_PITCH bytes per row), and present
+# swizzles it into the back FB before the flip. If anything in that path is refused (the BO,
+# the PRIME import, the kernel's modifier check, the staging BO), configure unwinds it and
+# falls back to the linear FBs. NV_SURFACE_LAYOUT says which one is live;
+# native_nv_surface_force_linear(1) skips the attempt (gates compare both).
+#
+# NvSurface (288 bytes; 232 before 4.4.0):
 #   +0   card_fd      i32   consumer-owned DRM master card node (kiosk)
 #   +4   render_fd    i32   render node (copied from nv_ctx_fd at configure)
 #   +8   state        u64   KmsState* (native_kms_init)
@@ -29937,6 +30249,12 @@ fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
 #   +48  fb0          40B   scanout FB 0 (NV_SFB_* shape)
 #   +88  fb1          40B   scanout FB 1
 #   +128 saved        104B  DRM_MODE_CRTC blob (GETCRTC) -> restore on release
+#   +232 layout       u32   NV_SCANOUT_LINEAR / NV_SCANOUT_BLOCKLINEAR (4.4.0)
+#   +236 bl_h         u32   block height (log2 GOBs) when block-linear
+#   +240 bl_pitch     u32   the FBs' block-linear row pitch (64-byte multiple)
+#   +244 (pad)        u32
+#   +248 stage        40B   the pitch-linear staging buffer acquire hands out (NV_SFB_*
+#                           shape; render handle + mapping + size, no FB id) when block-linear
 var NV_SURFACE_CARD_FD     = 0;
 var NV_SURFACE_RENDER_FD   = 4;
 var NV_SURFACE_STATE       = 8;
@@ -29950,7 +30268,22 @@ var NV_SURFACE_PITCH       = 40;
 var NV_SURFACE_FB0         = 48;
 var NV_SURFACE_FB1         = 88;
 var NV_SURFACE_SAVED       = 128;
-var NV_SURFACE_STRUCT_SIZE = 232;
+var NV_SURFACE_LAYOUT      = 232;
+var NV_SURFACE_BL_H        = 236;
+var NV_SURFACE_BL_PITCH    = 240;
+var NV_SURFACE_STAGE       = 248;
+var NV_SURFACE_STRUCT_SIZE = 288;
+
+var NV_SCANOUT_LINEAR      = 0;
+var NV_SCANOUT_BLOCKLINEAR = 1;
+
+# 1: configure skips the block-linear attempt (the linear FBs, as before 4.4.0).
+var _nv_scanout_force_linear = 0;
+fn native_nv_surface_force_linear(on): i64 {
+    _nv_scanout_force_linear = 0;
+    if (on != 0) { _nv_scanout_force_linear = 1; }
+    return 0;
+}
 
 # FB sub-struct (40 bytes), one per scanout buffer. acquire hands the consumer
 # a pointer to one of these; the CPU write target is NV_SFB_MAPPED.
@@ -29990,6 +30323,75 @@ fn _nv_surface_alloc_fb(card_fd, render_fd, bo_size, width, height, pitch, out):
     store64(out + NV_SFB_MAPPED,        mapped);
     store64(out + NV_SFB_BO_SIZE,       bo_size);
     return 0;
+}
+
+# The block-linear variant: a VRAM BO of PTE kind 0x06 and block height `h` (GEM_NEW
+# tile_flags / tile_mode) -> PRIME -> ADDFB2 with native_nv_bl_modifier(h) at `bl_pitch`.
+# Same stage codes and unwinding as _nv_surface_alloc_fb (-3 includes the kernel refusing
+# the modifier or the size).
+fn _nv_surface_alloc_fb_bl(card_fd, render_fd, bo_size, width, height, bl_pitch, h, out): i64 {
+    memset(out, 0, NV_SFB_STRUCT_SIZE);
+    var bo[24];
+    if (native_nv_bo_create_kind(render_fd, bo_size, NOUVEAU_GEM_DOMAIN_VRAM, NV_TU_PTE_KIND_GENERIC, h, &bo) != 0) {
+        return 0 - 1;
+    }
+    var render_handle = load64(&bo + 0);
+    var mapped        = load64(&bo + 8);
+    var card_handle = native_kms_import_bo(card_fd, render_fd, render_handle);
+    if (card_handle == 0) {
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        return 0 - 2;
+    }
+    var fb_id = native_kms_add_fb_xrgb8888_mod(card_fd, card_handle, width, height, bl_pitch,
+      native_nv_bl_modifier(h));
+    if (fb_id == 0) {
+        native_gem_close(card_fd, card_handle);
+        native_nv_bo_release_host(render_fd, render_handle, mapped, bo_size);
+        return 0 - 3;
+    }
+    store64(out + NV_SFB_RENDER_HANDLE, render_handle);
+    store64(out + NV_SFB_CARD_HANDLE,   card_handle);
+    store64(out + NV_SFB_FB_ID,         fb_id);
+    store64(out + NV_SFB_MAPPED,        mapped);
+    store64(out + NV_SFB_BO_SIZE,       bo_size);
+    return 0;
+}
+
+# The block-linear scanout for `ns` (fb_w x fb_h, staging pitch `pitch`): two block-linear FBs
+# and the staging buffer. Returns 1 when all three are built (ns's layout fields set), else 0
+# with nothing left allocated.
+fn _nv_surface_try_bl(card_fd, render_fd, fb_w, fb_h, pitch, ns): i64 {
+    var h = native_nv_bl_block_h_log2(fb_h);
+    var blp = native_nv_bl_pitch(fb_w * 4);
+    var size = native_nv_bl_size(fb_w * 4, fb_h, h);
+    if (size <= 0) { return 0; }
+    if (pitch < blp) { return 0; }
+    size = (size + 0xFFFF) / 0x10000 * 0x10000;
+    if (_nv_surface_alloc_fb_bl(card_fd, render_fd, size, fb_w, fb_h, blp, h, ns + NV_SURFACE_FB0) != 0) {
+        return 0;
+    }
+    if (_nv_surface_alloc_fb_bl(card_fd, render_fd, size, fb_w, fb_h, blp, h, ns + NV_SURFACE_FB1) != 0) {
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+        memset(ns + NV_SURFACE_FB0, 0, NV_SFB_STRUCT_SIZE);
+        return 0;
+    }
+    var ssize = (pitch * fb_h + 0xFFF) / 0x1000 * 0x1000;
+    var sbo[24];
+    if (native_nv_bo_create_host(render_fd, ssize, &sbo) != 0) {
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB1);
+        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+        memset(ns + NV_SURFACE_FB0, 0, NV_SFB_STRUCT_SIZE);
+        memset(ns + NV_SURFACE_FB1, 0, NV_SFB_STRUCT_SIZE);
+        return 0;
+    }
+    memset(ns + NV_SURFACE_STAGE, 0, NV_SFB_STRUCT_SIZE);
+    store64(ns + NV_SURFACE_STAGE + NV_SFB_RENDER_HANDLE, load64(&sbo + 0));
+    store64(ns + NV_SURFACE_STAGE + NV_SFB_MAPPED,        load64(&sbo + 8));
+    store64(ns + NV_SURFACE_STAGE + NV_SFB_BO_SIZE,       ssize);
+    store32(ns + NV_SURFACE_LAYOUT,   NV_SCANOUT_BLOCKLINEAR);
+    store32(ns + NV_SURFACE_BL_H,     h);
+    store32(ns + NV_SURFACE_BL_PITCH, blp);
+    return 1;
 }
 
 # Tear down one scanout FB: RMFB -> GEM close (card handle) -> BO release (render
@@ -30093,13 +30495,19 @@ fn _backend_nvidia_surface_configure(ctx, width, height): i64 {
         }
     }
 
-    # two VRAM scanout FBs (front + back); on failure unwind everything built
-    if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB0) != 0) {
-        native_kms_release(state); return 0;
-    }
-    if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB1) != 0) {
-        _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
-        native_kms_release(state); return 0;
+    # two VRAM scanout FBs (front + back): block-linear when the kernel takes it, else
+    # linear; on failure unwind everything built
+    var bl = 0;
+    if (_nv_scanout_force_linear == 0) { bl = _nv_surface_try_bl(card_fd, render_fd, fb_w, fb_h, pitch, ns); }
+    if (bl == 0) {
+        store32(ns + NV_SURFACE_LAYOUT, NV_SCANOUT_LINEAR);
+        if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB0) != 0) {
+            native_kms_release(state); return 0;
+        }
+        if (_nv_surface_alloc_fb(card_fd, render_fd, bo_size, fb_w, fb_h, pitch, ns + NV_SURFACE_FB1) != 0) {
+            _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+            native_kms_release(state); return 0;
+        }
     }
 
     # initial modeset on FB0 (needs DRM master)
@@ -30110,15 +30518,29 @@ fn _backend_nvidia_surface_configure(ctx, width, height): i64 {
     if (native_kms_set_crtc(card_fd, crtc_id, fb0_id, &conn_list, 1, mode_ptr) != 0) {
         _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB1);
         _nv_surface_free_fb(card_fd, render_fd, ns + NV_SURFACE_FB0);
+        _nv_surface_free_stage(render_fd, ns);
         native_kms_release(state); return 0;
     }
     return ns;
+}
+
+# Release the block-linear staging buffer (a no-op for a linear surface).
+fn _nv_surface_free_stage(render_fd, ns): i64 {
+    var h = load64(ns + NV_SURFACE_STAGE + NV_SFB_RENDER_HANDLE);
+    if (h != 0) {
+        native_nv_bo_release_host(render_fd, h, load64(ns + NV_SURFACE_STAGE + NV_SFB_MAPPED),
+          load64(ns + NV_SURFACE_STAGE + NV_SFB_BO_SIZE));
+    }
+    memset(ns + NV_SURFACE_STAGE, 0, NV_SFB_STRUCT_SIZE);
+    return 0;
 }
 
 # BACKEND_SLOT_SURFACE_ACQUIRE (184): (ctx, surface) -> back-FB ptr | 0. The
 # consumer reads NV_SFB_MAPPED off the returned FB and CPU-fills the pixels.
 fn _backend_nvidia_surface_acquire(ctx, surface): i64 {
     if (surface == 0) { return 0; }
+    # block-linear: the consumer fills the pitch-linear staging buffer; present swizzles it
+    if (load32(surface + NV_SURFACE_LAYOUT) == NV_SCANOUT_BLOCKLINEAR) { return surface + NV_SURFACE_STAGE; }
     # return the FB that is NOT currently scanning out
     if (load32(surface + NV_SURFACE_FRONT) == 0) { return surface + NV_SURFACE_FB1; }
     return surface + NV_SURFACE_FB0;
@@ -30131,9 +30553,15 @@ fn _backend_nvidia_surface_present(ctx, surface): i64 {
     var card_fd = load32(surface + NV_SURFACE_CARD_FD);
     var crtc_id = load32(surface + NV_SURFACE_CRTC_ID);
     var front   = load32(surface + NV_SURFACE_FRONT);
-    var back_fb = 0;
-    if (front == 0) { back_fb = load64(surface + NV_SURFACE_FB1 + NV_SFB_FB_ID); }
-    if (front == 1) { back_fb = load64(surface + NV_SURFACE_FB0 + NV_SFB_FB_ID); }
+    var back = surface + NV_SURFACE_FB0;
+    if (front == 0) { back = surface + NV_SURFACE_FB1; }
+    var back_fb = load64(back + NV_SFB_FB_ID);
+    if (load32(surface + NV_SURFACE_LAYOUT) == NV_SCANOUT_BLOCKLINEAR) {
+        var sr = native_nv_bl_swizzle(load64(back + NV_SFB_MAPPED), load64(surface + NV_SURFACE_STAGE + NV_SFB_MAPPED),
+          load32(surface + NV_SURFACE_PITCH), load32(surface + NV_SURFACE_BL_PITCH),
+          load32(surface + NV_SURFACE_HEIGHT), load32(surface + NV_SURFACE_BL_H));
+        if (sr != 0) { return GPU_ERR_OTHER; }
+    }
     var rc = native_kms_page_flip(card_fd, crtc_id, back_fb, DRM_MODE_PAGE_FLIP_EVENT, 0);
     if (rc != 0) { return _native_neg_rc_to_gpu_err(rc); }
     var ev[64];
@@ -30164,6 +30592,7 @@ fn _backend_nvidia_surface_release(ctx, surface): i64 {
     }
     _nv_surface_free_fb(card_fd, render_fd, surface + NV_SURFACE_FB1);
     _nv_surface_free_fb(card_fd, render_fd, surface + NV_SURFACE_FB0);
+    _nv_surface_free_stage(render_fd, surface);
     if (state != 0) { native_kms_release(state); }
     memset(surface, 0, NV_SURFACE_STRUCT_SIZE);
     return 0;

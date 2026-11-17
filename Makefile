@@ -697,6 +697,18 @@ build/nvidia_texture_sample_e2e: programs/nvidia_texture_sample_e2e.cyr src/*.cy
 test-nvidia-texture-sample-e2e: build/nvidia_texture_sample_e2e
 	./build/nvidia_texture_sample_e2e
 
+# v4.4.0 — NVIDIA block-linear scanout: the copy engine (TURING_DMA_COPY_A) checks mabda's CPU
+# block-linear swizzle both ways on kind-0x06 VRAM BOs, plus a wrong-height control, and times
+# the 1080p present swizzle. Masterless (renderD128); the scanout itself is a seat gate
+# (test-nvidia-surface-present-e2e).
+build/nvidia_blocklinear_e2e: programs/nvidia_blocklinear_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/nvidia_blocklinear_e2e.cyr $@
+
+.PHONY: test-nvidia-blocklinear-e2e
+test-nvidia-blocklinear-e2e: build/nvidia_blocklinear_e2e
+	./build/nvidia_blocklinear_e2e
+
 # v4.0 Phase N7.1 — NVIDIA native render-target create/release through the
 # PUBLIC mabda API (v2 render slots 120/128). Allocates two live RTs (distinct
 # VAs), checks geometry, proves the BO mapping backs memory. The GPU
@@ -806,7 +818,14 @@ build/nvidia_surface_present_e2e: programs/nvidia_surface_present_e2e.cyr src/*.
 
 .PHONY: test-nvidia-surface-present-e2e
 test-nvidia-surface-present-e2e: build/nvidia_surface_present_e2e
-	./build/nvidia_surface_present_e2e
+	@mkdir -p build/logs; \
+	log=build/logs/nvidia_surface_present_e2e-$$(date +%Y%m%d-%H%M%S).log; \
+	{ echo "# nvidia_surface_present_e2e $$(date -Is) host=$$(uname -n) kernel=$$(uname -r)"; \
+	  echo "# commit=$$(git rev-parse --short HEAD 2>/dev/null)$$(git diff --quiet 2>/dev/null || echo +dirty)"; \
+	  echo "# tty=$$(tty 2>/dev/null) session=$${XDG_SESSION_TYPE:-unset}"; } > $$log; \
+	./build/nvidia_surface_present_e2e >> $$log 2>&1; rc=$$?; \
+	cat $$log; cp $$log build/logs/nvidia_surface_present_e2e.log; \
+	echo "log: $$log (exit $$rc)"; exit $$rc
 
 # v3 Phase B.2 — GEM BO round-trip. Creates a 4 KiB GTT buffer object,
 # mmaps it, writes a deterministic pattern, reads it back byte-identical,

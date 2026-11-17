@@ -449,3 +449,81 @@ fn native_nv_push_draw(dst, dp, vertex_count): i64 {
     n = _nv_g_arg(dst, n, vertex_count);                    # BEGIN_END_B = vertex_count -> fires the draw
     return n;
 }
+
+# ================================================================
+# TURING_DMA_COPY_A (0xC5B5) — a block-linear <-> pitch copy (4.4.0)
+# ================================================================
+# The copy engine converts between the block-linear layout (backend_nvidia_tex.cyr,
+# NV_BL_*) and pitch-linear in hardware. mabda uses it as the hardware oracle for its CPU
+# swizzle (programs/nvidia_blocklinear_e2e.cyr); the NVK method sequence, field values from
+# NVIDIA's clc5b5.h (Mesa src/nouveau/headers/nvidia/classes). NVK binds copy on subc 4.
+var TURING_DMA_COPY_A           = 0xC5B5;
+var NV_COPY_SUBC                = 4;
+var NVC5B5_SET_OBJECT           = 0x0000;
+var NVC5B5_LAUNCH_DMA           = 0x0300;
+# OFFSET_IN_UPPER is followed by IN_LOWER, OUT_UPPER, OUT_LOWER, PITCH_IN, PITCH_OUT,
+# LINE_LENGTH_IN and LINE_COUNT (one 8-dword INCR run).
+var NVC5B5_OFFSET_IN_UPPER      = 0x0400;
+var NVC5B5_SET_DST_BLOCK_SIZE   = 0x070C;   # + DST_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+var NVC5B5_SET_SRC_BLOCK_SIZE   = 0x0728;   # + SRC_WIDTH, HEIGHT, DEPTH, LAYER, ORIGIN
+# SET_*_BLOCK_SIZE: WIDTH 3:0 = ONE_GOB (0), HEIGHT 7:4 = log2 GOBs, DEPTH 11:8 = ONE_GOB,
+# GOB_HEIGHT 15:12 = GOB_HEIGHT_FERMI_8 (1).
+var NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8 = 0x1000;
+# LAUNCH_DMA: DATA_TRANSFER_TYPE 1:0 = NON_PIPELINED (2), FLUSH_ENABLE 2:2,
+# SRC_MEMORY_LAYOUT 7:7 / DST_MEMORY_LAYOUT 8:8 (0 = BLOCKLINEAR, 1 = PITCH),
+# MULTI_LINE_ENABLE 9:9; SRC_TYPE / DST_TYPE 12 / 13 = VIRTUAL (0).
+var NVC5B5_LAUNCH_NON_PIPELINED = 0x2;
+var NVC5B5_LAUNCH_FLUSH         = 0x4;
+var NVC5B5_LAUNCH_SRC_PITCH     = 0x80;
+var NVC5B5_LAUNCH_DST_PITCH     = 0x100;
+var NVC5B5_LAUNCH_MULTI_LINE    = 0x200;
+
+fn _nv_push_put(dst, n, v): i64 {
+    store32(dst + n, v);
+    return n + 4;
+}
+
+# Stage a copy-engine pushbuffer into `dst` (>= NV_PUSH_CE_COPY_BYTES): copy a `width_bytes`
+# x `height` image between the block-linear surface at GPU VA `bl_va` (block height h) and
+# the pitch-linear one at `lin_va` (`lin_pitch` bytes per row). to_bl = 1 copies pitch ->
+# block-linear, 0 block-linear -> pitch. Returns the byte length (the EXEC push va_len).
+var NV_PUSH_CE_COPY_BYTES = 80;
+fn native_nv_push_ce_copy_bl(dst, bl_va, lin_va, lin_pitch, width_bytes, height, h, to_bl): i64 {
+    var n = 0;
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_SET_OBJECT, 1));
+    n = _nv_push_put(dst, n, TURING_DMA_COPY_A);
+    # the block-linear side's surface: block size, width (bytes), height, depth 1, layer 0, origin 0
+    var surf = NVC5B5_SET_SRC_BLOCK_SIZE;
+    if (to_bl == 1) { surf = NVC5B5_SET_DST_BLOCK_SIZE; }
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, surf, 6));
+    n = _nv_push_put(dst, n, (h * 16) | NVC5B5_BLOCK_GOB_HEIGHT_FERMI_8);
+    n = _nv_push_put(dst, n, width_bytes);
+    n = _nv_push_put(dst, n, height);
+    n = _nv_push_put(dst, n, 1);
+    n = _nv_push_put(dst, n, 0);
+    n = _nv_push_put(dst, n, 0);
+    var src = bl_va;
+    var dva = lin_va;
+    var pin = 0;
+    var pout = lin_pitch;
+    var lay = NVC5B5_LAUNCH_DST_PITCH;
+    if (to_bl == 1) {
+        src = lin_va;
+        dva = bl_va;
+        pin = lin_pitch;
+        pout = 0;
+        lay = NVC5B5_LAUNCH_SRC_PITCH;
+    }
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_OFFSET_IN_UPPER, 8));
+    n = _nv_push_put(dst, n, (src / 0x100000000) & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, src & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, (dva / 0x100000000) & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, dva & 0xFFFFFFFF);
+    n = _nv_push_put(dst, n, pin);
+    n = _nv_push_put(dst, n, pout);
+    n = _nv_push_put(dst, n, width_bytes);
+    n = _nv_push_put(dst, n, height);
+    n = _nv_push_put(dst, n, native_nv_method_header(NV_OP_INCR, NV_COPY_SUBC, NVC5B5_LAUNCH_DMA, 1));
+    n = _nv_push_put(dst, n, NVC5B5_LAUNCH_NON_PIPELINED | NVC5B5_LAUNCH_FLUSH | lay | NVC5B5_LAUNCH_MULTI_LINE);
+    return n;
+}

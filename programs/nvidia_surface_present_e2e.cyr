@@ -1,32 +1,37 @@
 # programs/nvidia_surface_present_e2e.cyr — v4.0 Phase N8.5 — NVIDIA native
 # animated present through the PUBLIC mabda surface API.
 #
-# The public-API counterpart to the raw N8.4 present gate
-# (nvidia_present_e2e.cyr, which drove the native_kms_* helpers directly): the
-# SAME double-buffered vsync-locked scrolling gradient, but driven entirely
-# through the backend-agnostic v3 surface slots — gpu_surface_configure_native_kiosk
-# / gpu_surface_acquire / gpu_surface_present / gpu_surface_release — exactly the
-# surface a compositor (aethersafta) consumes. The nouveau backend fills those
-# slots (backend_nvidia.cyr, N8.5); the only nouveau-specific call here is
-# native_nv_open_card_node, to find the card node + take DRM master (the kiosk
-# precondition the public configure fn assumes the consumer has satisfied). This
-# is the NVIDIA analogue of the AMD native_present_e2e.cyr flow.
+# The public-API counterpart to the raw N8.4 present gate (nvidia_present_e2e.cyr, which drove
+# the native_kms_* helpers directly), driven entirely through the backend-agnostic v3 surface
+# slots — gpu_surface_configure_native_kiosk / gpu_surface_acquire / gpu_surface_present /
+# gpu_surface_release — exactly the surface a compositor (aethersafta) consumes. The only
+# nouveau-specific calls are native_nv_open_card_node (find the card node + take DRM master,
+# the kiosk precondition) and native_nv_surface_force_linear (the A/B below).
 #
-# At 60 Hz the screen shows ~2 seconds of a vertically-scrolling blue->red
-# gradient, then the console is restored (the surface_release slot re-binds the
-# saved CRTC via the N8.3 GETCRTC save/restore).
+# 4.4.0, block-linear scanout: TWO phases of 180 frames (3 s at 60 Hz) each.
+#   1. the default: configure takes block-linear VRAM FBs (DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D,
+#      PTE kind 0x06) and present swizzles the consumer's frame into them;
+#   2. native_nv_surface_force_linear(1): the linear FBs, as before 4.4.0.
+# Both show the same TEST CARD, chosen so a wrong layout cannot hide: a grey 32-px
+# checkerboard, a 4-px green border, a 1-px white diagonal and a red bar sweeping right. (The
+# old vertical gradient was constant along each row, so a swizzle error inside a row was
+# invisible.) The two phases must look identical; jagged checker edges, a broken diagonal or
+# noise in phase 1 mean the layout is wrong. Each phase prints its layout and the mean
+# acquire + fill + present time.
 #
 # **RUN FROM A TTY.** SETCRTC + PAGE_FLIP need DRM master — switch to an unused
 # vt (Ctrl-Alt-F2) so logind hands master to this session. From inside a desktop
 # session SET_MASTER fails and the program stops at exit code 2.
 #
-# Not in CI (hardware-dependent). Run via `make test-nvidia-surface-present-e2e`.
+# Not in CI (hardware-dependent). Run via `make test-nvidia-surface-present-e2e`, which writes
+# build/logs/nvidia_surface_present_e2e-<timestamp>.log.
 #
 # Exit codes:
-#   0 success (120 frames presented, console restored)
+#   0 success (both phases presented, console restored)
 #   1 no nouveau card / permission   2 SET_MASTER (a compositor holds master)
 #   3 gpu_context_new_native_nvidia   4 gpu_surface_configure_native_kiosk
 #   5 gpu_surface_acquire returned 0   6 gpu_surface_present returned non-zero
+#   7 phase 1 fell back to linear (the kernel refused block-linear; phase 2 still runs)
 
 include "src/lib.cyr"
 
@@ -39,21 +44,25 @@ fn print_i64(n): i64 {
     return 0;
 }
 
-# Fill XRGB8888 with a vertically-scrolling blue->red gradient. Row color =
-# (virt_y * 255 / h) where virt_y = (y + frame_offset) wrapped; pixel = R<<16 | B,
-# G = 0. Copied verbatim from nvidia_present_e2e.cyr so the on-screen result
-# matches the N8.4 gate exactly — only the present PATH changed (public surface
-# API vs the raw native_kms_* helpers).
-fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
+# The test card into an XRGB8888 buffer (`pitch` bytes per row): a 32-px checkerboard (0x303030
+# / 0x606060), a 4-px green border, a 1-px white diagonal (moving 4 px a frame) and a 16-px red
+# bar sweeping right 8 px a frame.
+fn _fill_card(addr, w, h, pitch, frame): i64 {
+    var bar = (frame * 8) % w;
     var y = 0;
     while (y < h) {
-        var virt_y = (y + frame_offset) % h;
-        var r = virt_y * 255 / h;
-        var pixel = (r * 0x10000) | (255 - r);   # R<<16 | B; G=0
         var row = addr + y * pitch;
         var x = 0;
         while (x < w) {
-            store32(row + x * 4, pixel);
+            var px = 0x303030;
+            if ((((x / 32) + (y / 32)) % 2) == 1) { px = 0x606060; }
+            if (x >= bar) { if (x < bar + 16) { px = 0xFF0000; } }
+            if (((x + 4096 - y - frame * 4) % 256) == 0) { px = 0xFFFFFF; }
+            if (x < 4) { px = 0x00FF00; }
+            if (y < 4) { px = 0x00FF00; }
+            if (x >= w - 4) { px = 0x00FF00; }
+            if (y >= h - 4) { px = 0x00FF00; }
+            store32(row + x * 4, px);
             x = x + 1;
         }
         y = y + 1;
@@ -61,11 +70,70 @@ fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
     return 0;
 }
 
+# One phase: configure (force_linear 0 / 1), print the layout, present 180 frames, release.
+# Returns 0, or the exit code for the step that failed; *layout_out gets NV_SURFACE_LAYOUT.
+fn run_phase(ctx, card_fd, force_linear, label, layout_out): i64 {
+    native_nv_surface_force_linear(force_linear);
+    var surface = gpu_surface_configure_native_kiosk(ctx, card_fd, 1920, 1080);
+    native_nv_surface_force_linear(0);
+    if (surface == 0) {
+        print_cstr("FAIL: surface configure (no connected connector / not master?)\n");
+        return 4;
+    }
+    var w = load32(surface + NV_SURFACE_WIDTH);
+    var h = load32(surface + NV_SURFACE_HEIGHT);
+    var pitch = load32(surface + NV_SURFACE_PITCH);
+    var layout = load32(surface + NV_SURFACE_LAYOUT);
+    store64(layout_out, layout);
+    print_cstr(label); print_cstr(": "); print_i64(w); print_cstr("x"); print_i64(h);
+    print_cstr(", frame pitch "); print_i64(pitch);
+    if (layout == NV_SCANOUT_BLOCKLINEAR) {
+        var bh = load32(surface + NV_SURFACE_BL_H);
+        print_cstr(", BLOCK-LINEAR scanout: h="); print_i64(bh);
+        print_cstr(" ("); print_i64(1 << bh); print_cstr(" GOBs), FB pitch ");
+        print_i64(load32(surface + NV_SURFACE_BL_PITCH));
+        print_cstr(", modifier "); fmt_hex0x(native_nv_bl_modifier(bh));
+    } else {
+        print_cstr(", LINEAR scanout");
+    }
+    print_cstr("\n");
+    var frame = 0;
+    var rc = 0;
+    var t0 = _time_now_ns();
+    while (frame < 180) {
+        var fb = gpu_surface_acquire(ctx, surface);
+        if (fb == 0) {
+            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame); print_cstr("\n");
+            rc = 5;
+            frame = 180;
+        }
+        if (fb != 0) {
+            _fill_card(load64(fb + NV_SFB_MAPPED), w, h, pitch, frame);
+            var pr = gpu_surface_present(ctx, surface);
+            if (pr != 0) {
+                print_cstr("FAIL: present rc="); print_i64(pr);
+                print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+                rc = 6;
+                frame = 180;
+            }
+            frame = frame + 1;
+        }
+    }
+    var t1 = _time_now_ns();
+    gpu_surface_release(ctx, surface);
+    if (rc == 0) {
+        print_cstr("  180 frames, "); print_i64((t1 - t0) / 180 / 1000);
+        print_cstr(" us per frame (acquire + fill + present)\n");
+    }
+    return rc;
+}
+
 fn main(): i64 {
     alloc_init();
-    print_cstr("mabda NVIDIA animated present via PUBLIC surface API (v4.0 N8.5)\n");
+    print_cstr("mabda NVIDIA animated present via PUBLIC surface API (v4.0 N8.5; 4.4.0 block-linear)\n");
     print_cstr("---------------------------------------------------------------\n");
-    print_cstr("expect: ~2s of a scrolling blue->red gradient, then console restore\n\n");
+    print_cstr("expect: 3 s of the test card twice (block-linear, then linear), identical\n");
+    print_cstr("        both times; then console restore\n\n");
 
     # nouveau-specific: find the card node + take DRM master (the kiosk
     # precondition). Everything below SET_MASTER is the backend-agnostic API.
@@ -92,7 +160,11 @@ fn main(): i64 {
     var master_rc = native_drm_set_master(card_fd);
     if (master_rc != 0) {
         print_cstr("FAIL: SET_MASTER rc="); print_i64(master_rc);
-        print_cstr(" — a compositor holds master. Run from an unused tty (Ctrl-Alt-F2).\n");
+        print_cstr(" — another DRM client holds master (a desktop's compositor, or the display\n");
+        print_cstr("      manager's greeter). A terminal inside a desktop session (a pts) cannot take it,\n");
+        print_cstr("      and on chew the sddm greeter keeps it after logout. To run: switch to a text\n");
+        print_cstr("      console (Ctrl-Alt-F3), log in, `sudo systemctl stop sddm` (ends the desktop\n");
+        print_cstr("      session), rerun, then `sudo systemctl start sddm`.\n");
         sys_close(card_fd);
         return 2;
     }
@@ -107,51 +179,26 @@ fn main(): i64 {
     }
     print_cstr("context created (native nvidia)\n");
 
-    var surface = gpu_surface_configure_native_kiosk(ctx, card_fd, 1920, 1080);
-    if (surface == 0) {
-        print_cstr("FAIL: surface configure (no connected connector / not master?)\n");
-        gpu_context_release(ctx);
-        native_drm_drop_master(card_fd); sys_close(card_fd); return 4;
-    }
-    var w = load32(surface + NV_SURFACE_WIDTH);
-    var h = load32(surface + NV_SURFACE_HEIGHT);
-    var pitch = load32(surface + NV_SURFACE_PITCH);
-    print_cstr("surface configured: "); print_i64(w); print_cstr("x"); print_i64(h);
-    print_cstr(" pitch "); print_i64(pitch); print_cstr("\n");
-
-    print_cstr("presenting 120 frames ...\n");
-    var frame = 0;
-    var rc = 0;
-    while (frame < 120) {
-        var fb = gpu_surface_acquire(ctx, surface);
-        if (fb == 0) {
-            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame); print_cstr("\n");
-            rc = 5;
-            frame = 120;
-        }
-        if (fb != 0) {
-            # the consumer CPU-fills the back FB's mapped bytes, then presents
-            _fill_gradient(load64(fb + NV_SFB_MAPPED), w, h, pitch, frame * 4);
-            var pr = gpu_surface_present(ctx, surface);
-            if (pr != 0) {
-                print_cstr("FAIL: present rc="); print_i64(pr);
-                print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
-                rc = 6;
-                frame = 120;
-            }
-            frame = frame + 1;
-        }
+    var lay[8];
+    store64(&lay, 0);
+    var rc = run_phase(ctx, card_fd, 0, "phase 1 (default)", &lay);
+    var bl_ok = 0;
+    if (load64(&lay) == NV_SCANOUT_BLOCKLINEAR) { bl_ok = 1; }
+    if (rc == 0) {
+        if (bl_ok == 0) { print_cstr("NOTE: phase 1 fell back to linear: the kernel refused block-linear\n"); }
+        rc = run_phase(ctx, card_fd, 1, "phase 2 (forced linear)", &lay);
     }
 
-    # teardown: release the surface (restores the console CRTC), then the
+    # teardown: each phase released its surface (restoring the console CRTC); now the
     # context, then drop master + close the card fd (kiosk: the consumer owns it).
-    gpu_surface_release(ctx, surface);
     gpu_context_release(ctx);
     native_drm_drop_master(card_fd);
     sys_close(card_fd);
 
     if (rc == 0) {
-        print_cstr("OK: 120 frames presented via the public surface API; console restored\n");
+        if (bl_ok == 0) { return 7; }
+        print_cstr("OK: block-linear then linear, 180 frames each, via the public surface API;\n");
+        print_cstr("    console restored. The two phases should have looked identical.\n");
     }
     return rc;
 }

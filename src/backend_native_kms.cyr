@@ -789,9 +789,13 @@ fn native_kms_mode_refresh_hz(modes_ptr, idx): i64 {
 # (tiling). Single-plane RGB scanout uses planes[0] only and
 # modifier=0 (linear).
 
-# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 100
-#   0xC0000000 | (100 << 16) | (0x64 << 8) | 0xB8 == 0xC06464B8
-var DRM_IOCTL_MODE_ADDFB2 = 0xC06464B8;
+# DRM_IOCTL_MODE_ADDFB2 — nr 0xB8, RW, sizeof(drm_mode_fb_cmd2) = 104
+#   0xC0000000 | (104 << 16) | (0x64 << 8) | 0xB8 == 0xC06864B8
+# ⛔ 100 / 0xC06464B8 until 4.4.0: the struct was laid out without the u64 alignment of
+# modifier[] (+72, not +68). Linear scanout never noticed (no DRM_MODE_FB_MODIFIERS flag, and
+# the kernel zero-fills a short copy), but a modifier written at +68 would have reached the
+# kernel misaligned. Checked against sizeof / offsetof from the uapi header.
+var DRM_IOCTL_MODE_ADDFB2 = 0xC06864B8;
 
 # DRM_IOCTL_MODE_RMFB — nr 0xAF, RW, sizeof(u32) = 4
 #   0xC0000000 | (4 << 16) | (0x64 << 8) | 0xAF == 0xC00464AF
@@ -818,7 +822,7 @@ var DRM_FORMAT_ARGB8888 = 0x34325241;   # 'A' 'R' '2' '4'
 var DRM_FORMAT_XBGR8888 = 0x34324258;   # 'X' 'B' '2' '4'
 var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
 
-# drm_mode_fb_cmd2 layout (100 bytes, x86_64):
+# drm_mode_fb_cmd2 layout (104 bytes, x86_64):
 #   +0:  fb_id          (u32) — OUT (kernel returns FB ID)
 #   +4:  width          (u32) — IN
 #   +8:  height         (u32) — IN
@@ -827,8 +831,10 @@ var DRM_FORMAT_ABGR8888 = 0x34324241;   # 'A' 'B' '2' '4'
 #   +20: handles[4]     (u32 × 4 = 16 B) — IN, plane GEM handles
 #   +36: pitches[4]     (u32 × 4 = 16 B) — IN, bytes per row per plane
 #   +52: offsets[4]     (u32 × 4 = 16 B) — IN, BO byte offset per plane
-#   +68: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane
-var DRM_MODE_FB_CMD2_SIZE      = 100;
+#   +68: (pad)          (4 B) — the u64 alignment of modifier[]
+#   +72: modifier[4]    (u64 × 4 = 32 B) — IN, tiling modifier per plane (read only when
+#                       flags has DRM_MODE_FB_MODIFIERS)
+var DRM_MODE_FB_CMD2_SIZE      = 104;
 var DRM_MODE_FB_CMD2_FB_ID     = 0;
 var DRM_MODE_FB_CMD2_WIDTH     = 4;
 var DRM_MODE_FB_CMD2_HEIGHT    = 8;
@@ -837,7 +843,10 @@ var DRM_MODE_FB_CMD2_FLAGS     = 16;
 var DRM_MODE_FB_CMD2_HANDLES   = 20;
 var DRM_MODE_FB_CMD2_PITCHES   = 36;
 var DRM_MODE_FB_CMD2_OFFSETS   = 52;
-var DRM_MODE_FB_CMD2_MODIFIERS = 68;
+var DRM_MODE_FB_CMD2_MODIFIERS = 72;
+
+# drm_mode_fb_cmd2.flags: DRM_MODE_FB_MODIFIERS makes the kernel read modifier[].
+var DRM_MODE_FB_MODIFIERS = 2;
 
 # Linear (untiled) tiling modifier — value 0 in uapi/drm/drm_fourcc.h.
 # Pre-2018 kernels infer linear from "no MODIFIERS flag set"; modern
@@ -879,16 +888,42 @@ fn native_kms_add_fb_xrgb8888(fd, bo_handle, width, height, pitch): i64 {
     if (height <= 0)    { return 0; }
     if (pitch <= 0)     { return 0; }
 
-    var req[100];
-    memset(&req, 0, DRM_MODE_FB_CMD2_SIZE);
-    store32(&req + DRM_MODE_FB_CMD2_WIDTH,           width);
-    store32(&req + DRM_MODE_FB_CMD2_HEIGHT,          height);
-    store32(&req + DRM_MODE_FB_CMD2_FORMAT,          DRM_FORMAT_XRGB8888);
-    store32(&req + DRM_MODE_FB_CMD2_FLAGS,           0);
-    store32(&req + DRM_MODE_FB_CMD2_HANDLES + 0,     bo_handle);
-    store32(&req + DRM_MODE_FB_CMD2_PITCHES + 0,     pitch);
-    store32(&req + DRM_MODE_FB_CMD2_OFFSETS + 0,     0);
-    store64(&req + DRM_MODE_FB_CMD2_MODIFIERS + 0,   DRM_FORMAT_MOD_LINEAR);
+    var req[104];
+    native_kms_fb_cmd2_pack(&req, bo_handle, width, height, pitch, 0, DRM_FORMAT_MOD_LINEAR);
+    var rc = native_drm_mode_add_fb2(fd, &req);
+    if (rc != 0) { return 0; }
+    return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
+}
+
+# Fill `req` (DRM_MODE_FB_CMD2_SIZE bytes) for a single-plane XRGB8888 framebuffer: plane 0's
+# handle / pitch / offset 0 / `modifier`, and `flags` (0, or DRM_MODE_FB_MODIFIERS for the
+# kernel to read the modifier). Returns 0.
+fn native_kms_fb_cmd2_pack(req, bo_handle, width, height, pitch, flags, modifier): i64 {
+    memset(req, 0, DRM_MODE_FB_CMD2_SIZE);
+    store32(req + DRM_MODE_FB_CMD2_WIDTH,         width);
+    store32(req + DRM_MODE_FB_CMD2_HEIGHT,        height);
+    store32(req + DRM_MODE_FB_CMD2_FORMAT,        DRM_FORMAT_XRGB8888);
+    store32(req + DRM_MODE_FB_CMD2_FLAGS,         flags);
+    store32(req + DRM_MODE_FB_CMD2_HANDLES + 0,   bo_handle);
+    store32(req + DRM_MODE_FB_CMD2_PITCHES + 0,   pitch);
+    store32(req + DRM_MODE_FB_CMD2_OFFSETS + 0,   0);
+    store64(req + DRM_MODE_FB_CMD2_MODIFIERS + 0, modifier);
+    return 0;
+}
+
+# native_kms_add_fb_xrgb8888 with an explicit format modifier (DRM_MODE_FB_MODIFIERS set):
+# a tiled scanout such as NVIDIA block-linear (native_nv_bl_modifier). The kernel checks the
+# modifier against the plane's list and the BO's size against the tiled layout; either
+# refusal returns 0, which the caller treats as "fall back to linear". 4.4.0.
+fn native_kms_add_fb_xrgb8888_mod(fd, bo_handle, width, height, pitch, modifier): i64 {
+    if (fd <= 0)        { return 0; }
+    if (bo_handle == 0) { return 0; }
+    if (width <= 0)     { return 0; }
+    if (height <= 0)    { return 0; }
+    if (pitch <= 0)     { return 0; }
+
+    var req[104];
+    native_kms_fb_cmd2_pack(&req, bo_handle, width, height, pitch, DRM_MODE_FB_MODIFIERS, modifier);
     var rc = native_drm_mode_add_fb2(fd, &req);
     if (rc != 0) { return 0; }
     return load32(&req + DRM_MODE_FB_CMD2_FB_ID);
