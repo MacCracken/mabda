@@ -43,7 +43,8 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     card-node gates). The Cezanne half, `make seat-closeout-amd`, is still open: it needs a reboot
     the maintainer can't take soon. Run it from a text console with `sudo systemctl stop sddm`,
     then read `build/logs/seat-closeout-amd-*.log`.
-  - The logind path on NVIDIA never returns the device (a roadmap item, found 2026-11-16).
+  - The logind path on NVIDIA returning the device: fixed and verified on chew (2026-11-16,
+    `make test-nvidia-logind-present-e2e`, the first live-bus run of mabda's logind path).
   - NVIDIA block-linear scanout: done. The layout is checked against the copy engine
     (`test-nvidia-blocklinear-e2e`), and the scanout passed its seat run on chew (2026-11-16).
     A seat run on chew needs a text console (Ctrl-Alt-F3) with `sudo systemctl stop sddm`; a

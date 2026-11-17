@@ -743,6 +743,29 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   now. So for 4.4.0, the AMD DRM-master gates, the samvada live-bus gate and the clean-boot
   `test-native-all` remain unverified.
 
+### Fixed — the logind present path kept the device on NVIDIA
+- **What was wrong.** `gpu_surface_configure_native_logind` marked a surface as owning the fd it
+  took from logind only on AMD (`NativeSurface +108`). An NVIDIA surface had no such field, so
+  `gpu_surface_release` neither handed the device back to logind nor closed the fd. Both stayed
+  taken until the process exited, and a second configure in the same process could not take
+  the card.
+- **The fix.**
+  - `NvSurface` gains `master_owned` / `master_minor` at +288 / +292, making it 296 bytes.
+  - `native_nv_surface_mark_master_owned` sets them, and the dispatcher now marks NVIDIA
+    surfaces too.
+  - The NVIDIA release calls `samvada_session_release_device` (under `-D MABDA_LOGIND`) and
+    closes the fd, after the KMS teardown that still needs it. A kiosk fd stays the consumer's.
+- **Tests.** In `nvidia.tcyr` (397), a release closes an owned fd on a real `/dev/null` fd,
+  checked with `F_GETFD`, and leaves a kiosk fd open.
+- **On hardware.** The live-bus gate now takes `amd|nvidia`; `make test-nvidia-logind-present-e2e`
+  is in `seat-closeout-nvidia`. It fails with exit 9 if a surface isn't marked, and its second
+  phase can only take the card again if the release returned it.
+  **Passed on chew, 2026-11-16** (`build/logs/chew-nvidia_present_logind_e2e-20261116-192609.log`),
+  from tty3 with sddm stopped. samvada reached the system bus and found the session. Logind
+  handed over the card, and mabda owned it: 120 frames, then the device returned on release.
+  The second phase took the card again and presented 30 frames. This is the first live-bus run
+  of mabda's logind path, the run samvada 1.1.0's `libsystemd` shim deletion was waiting for.
+
 ### Fixed — the older wgpu surface path leaked a frame texture every frame
 - **What leaked.** `gpu_surface_configure_wgpu` → `gpu_surface_acquire` → `gpu_surface_present`
   (`surface_state_*` underneath) never released the texture reference wgpu hands out per frame.
@@ -849,11 +872,11 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 29 suites, **7803 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 29 suites, **7814 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
   predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9
-  1024-id space; 7770 after block-linear scanout). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  1024-id space; 7770 after block-linear scanout; 7803 after the wgpu surface leak). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
   `test-raw-include` pass.

@@ -83,9 +83,10 @@ soorat). Six-consumer regression sweep is Tier 2 ship work.
   path leaves the tree at v5.1; full AMD retirement is deferred.
 - **libsystemd** — no longer required. samvada 1.0.x keeps its
   libsystemd C shim only as an opt-in fallback and plans to delete it at
-  samvada 1.1.0. That deletion waits on a mabda live-bus end-to-end run
-  of the logind path from a seated session, which has not been done
-  (roadmap backlog).
+  samvada 1.1.0. That deletion waited on a mabda live-bus end-to-end run
+  of the logind path from a seated session: it passed on NVIDIA (chew)
+  on 2026-11-16 (`make test-nvidia-logind-present-e2e`); the AMD run is
+  part of `make seat-closeout-amd`.
 
 All Cyrius deps are pinned in `cyrius.cyml`. `cyrius deps` resolves
 them against the installed toolchain.

@@ -222,7 +222,9 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     on AMD;
   - the samvada live-bus run: `gpu_surface_configure_native_logind` with `samvada_native_init()`,
     built `-D MABDA_LOGIND`, from a seated session (samvada 1.1.0's `libsystemd` shim deletion
-    waits on it). Since 2026-11-16 this is `make test-native-logind-present-e2e`
+    waits on it). **Passed on NVIDIA (chew), 2026-11-16**
+    (`build/logs/chew-nvidia_present_logind_e2e-20261116-192609.log`); the AMD run is in
+    `seat-closeout-amd`. Since 2026-11-16 this is `make test-native-logind-present-e2e`
     (`programs/native_present_logind_e2e.cyr`). It takes the card from logind, presents 120
     frames, releases, then takes the card again for 30 more, which proves the release returned
     it.
@@ -247,7 +249,10 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     `make seat-closeout-amd` still has to run after a clean boot: `test-native-all` with the
     master and logind gates, and the example consumer. Until then, the AMD DRM-master gates,
     the samvada live-bus run and the clean-boot rerun stay unverified for 4.4.0.
-- **Found 2026-11-16: the logind path never hands the device back on NVIDIA.**
+- ✅ **Found 2026-11-16: the logind path never hands the device back on NVIDIA.** Fixed
+  (CHANGELOG [4.4.0]): `NvSurface` +288 / +292 is marked like AMD's and released. A CPU test
+  covers it, and the seat run on chew passed: logind delegated the card over the live bus,
+  release returned it, and a second phase took it again.
   `gpu_surface_configure_native_logind` marks a surface as owning its logind fd only for AMD
   (`native_surface_mark_master_owned`; `NativeSurface +108`). `NvSurface` has no such field, so
   on NVIDIA `gpu_surface_release` neither releases the device to logind nor closes the fd. Both

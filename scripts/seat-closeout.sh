@@ -10,7 +10,8 @@
 #           BOOT: the log lists every GPU reset in this boot's kernel log, and any reset fails
 #           the closeout (fixes proven on a GPU that has reset do not count).
 #   nvidia  (chew): the five card-node gates — test-nvidia-kms-summary, -kms-scanout,
-#           -kms-modeset, -present-e2e and -surface-present-e2e.
+#           -kms-modeset, -present-e2e and -surface-present-e2e — and the logind live-bus run
+#           on nouveau (test-nvidia-logind-present-e2e, 4.4.0).
 #
 # Run from a TEXT CONSOLE login (Ctrl-Alt-F3) with the display manager stopped
 # (e.g. `sudo systemctl stop sddm`): a terminal inside a desktop session cannot take DRM master.
@@ -49,7 +50,7 @@ amd)
     ;;
 nvidia)
     for g in test-nvidia-kms-summary test-nvidia-kms-scanout test-nvidia-kms-modeset \
-             test-nvidia-present-e2e test-nvidia-surface-present-e2e; do
+             test-nvidia-present-e2e test-nvidia-surface-present-e2e test-nvidia-logind-present-e2e; do
         echo "=== $g" >> "$log"
         make --no-print-directory "$g" >> "$log" 2>&1
         r=$?

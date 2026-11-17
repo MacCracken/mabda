@@ -11,18 +11,25 @@
 #   5. a second configure + 30 frames: it can only take the device if step 4 returned it.
 # samvada 1.1.0 deletes its libsystemd shim once this run has passed (its roadmap).
 #
+# `amd` (the native AMD backend) or `nvidia` (nouveau). The NVIDIA run is the check for the
+# 4.4.0 fix: until then an NVIDIA surface was never marked as owning its logind fd, so release
+# kept the device and phase 2 could not take it again.
+#
 # **Run from a text-console login** (Ctrl-Alt-F3), with the display manager stopped: the
 # session must be the active one and logind must not have handed the card to another session's
 # compositor. While it runs, logind mutes this VT's keyboard (session control); it is restored
-# when the program exits. Built with -D MABDA_LOGIND (`make test-native-logind-present-e2e`).
+# when the program exits. Built with -D MABDA_LOGIND (`make test-native-logind-present-e2e` /
+# `make test-nvidia-logind-present-e2e`).
 #
 # Exit codes:
 #   0 both phases presented, the device returned between them
+#   1 usage (amd|nvidia)
 #   2 samvada_native_init failed (no system bus / no logind session for this process)
 #   4 gpu_context_new_native failed
 #   5 phase 1: logind would not hand over the card (not the active session? another controller?)
 #   6 acquire returned 0     7 present failed
 #   8 phase 2: the device did not come back after release
+#   9 the configured surface was not marked as owning its logind fd
 
 include "src/lib.cyr"
 
@@ -52,6 +59,24 @@ fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
     return 0;
 }
 
+var g_nv = 0;   # 1: the NVIDIA backend's NvSurface, else AMD's NativeSurface
+
+fn s_w(s): i64 { if (g_nv == 1) { return load32(s + NV_SURFACE_WIDTH); } return load32(s + NATIVE_SURFACE_WIDTH); }
+fn s_h(s): i64 { if (g_nv == 1) { return load32(s + NV_SURFACE_HEIGHT); } return load32(s + NATIVE_SURFACE_HEIGHT); }
+fn s_pitch(s): i64 { if (g_nv == 1) { return load32(s + NV_SURFACE_PITCH); } return load32(s + NATIVE_SURFACE_PITCH); }
+fn s_owned(s): i64 {
+    if (g_nv == 1) { return load32(s + NV_SURFACE_MASTER_OWNED); }
+    return load32(s + NATIVE_SURFACE_MASTER_OWNED);
+}
+
+# The CPU address of the frame acquire returned.
+fn frame_addr(s, fb): i64 {
+    if (g_nv == 1) { return load64(fb + NV_SFB_MAPPED); }
+    if (fb == s + NATIVE_SURFACE_FB_B) { return load64(fb + NATIVE_KMS_FB_MAPPED_ADDR); }
+    if (fb == s + NATIVE_SURFACE_SCANOUT) { return load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR); }
+    return 0;
+}
+
 # Configure through logind, present `frames` frames, release. Returns 0 or an exit code
 # (`fail_configure` when logind would not hand the card over).
 fn run_phase(ctx, label, frames, fail_configure): i64 {
@@ -62,12 +87,17 @@ fn run_phase(ctx, label, frames, fail_configure): i64 {
         print_cstr("      connected connector). Run from a text-console login with the display manager stopped.\n");
         return fail_configure;
     }
-    var w = load32(surface + NATIVE_SURFACE_WIDTH);
-    var h = load32(surface + NATIVE_SURFACE_HEIGHT);
-    var pitch = load32(surface + NATIVE_SURFACE_PITCH);
+    var w = s_w(surface);
+    var h = s_h(surface);
+    var pitch = s_pitch(surface);
     print_cstr(label); print_cstr(": logind handed over the card; ");
     print_i64(w); print_cstr("x"); print_i64(h); print_cstr(", master owned by mabda: ");
-    print_i64(load32(surface + NATIVE_SURFACE_MASTER_OWNED)); print_cstr("\n");
+    print_i64(s_owned(surface)); print_cstr("\n");
+    if (s_owned(surface) != 1) {
+        print_cstr("FAIL: the surface is not marked as owning its logind fd: release would keep the device\n");
+        gpu_surface_release(ctx, surface);
+        return 9;
+    }
     var frame = 0;
     while (frame < frames) {
         var fb = gpu_surface_acquire(ctx, surface);
@@ -76,10 +106,7 @@ fn run_phase(ctx, label, frames, fail_configure): i64 {
             gpu_surface_release(ctx, surface);
             return 6;
         }
-        var addr = 0;
-        if (fb == surface + NATIVE_SURFACE_FB_B) { addr = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR); }
-        if (fb == surface + NATIVE_SURFACE_SCANOUT) { addr = load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR); }
-        _fill_gradient(addr, w, h, pitch, frame * 4);
+        _fill_gradient(frame_addr(surface, fb), w, h, pitch, frame * 4);
         var rc = gpu_surface_present(ctx, surface);
         if (rc != 0) {
             print_cstr("FAIL: present returned "); print_i64(rc);
@@ -96,7 +123,14 @@ fn run_phase(ctx, label, frames, fail_configure): i64 {
 
 fn main(): i64 {
     alloc_init();
-    print_cstr("mabda native present via logind (4.4.0 seat closeout: samvada live bus)\n");
+    args_init();
+    if (argc() < 2) { print_cstr("usage: native_present_logind_e2e amd|nvidia\n"); return 1; }
+    var which = 0;
+    if (streq(argv(1), "amd") == 1) { which = 1; }
+    if (streq(argv(1), "nvidia") == 1) { which = 2; g_nv = 1; }
+    if (which == 0) { print_cstr("usage: native_present_logind_e2e amd|nvidia\n"); return 1; }
+    print_cstr("mabda native present via logind (4.4.0 seat closeout: samvada live bus), on ");
+    if (g_nv == 1) { print_cstr("NVIDIA (nouveau)\n"); } else { print_cstr("AMD\n"); }
     print_cstr("-----------------------------------------------------------------------\n");
     print_cstr("expect: ~2 s of a scrolling blue-red gradient, a blink, ~0.5 s more, then the console\n\n");
     var sr = samvada_native_init();
@@ -106,13 +140,20 @@ fn main(): i64 {
         return 2;
     }
     print_cstr("samvada: connected to the system bus, session found\n");
-    var ctx_tag, ctx_res = gpu_context_new_native();
-    if (is_err_result(ctx_tag) == 1) {
-        print_cstr("FAIL: gpu_context_new_native\n");
-        samvada_release();
-        return 4;
+    var ctx = 0;
+    if (g_nv == 1) {
+        var nt, nv = gpu_context_new_native_nvidia();
+        if (is_err_result(nt) == 1) {
+            print_cstr("FAIL: gpu_context_new_native_nvidia\n");
+            samvada_release();
+            return 4;
+        }
+        ctx = nv;
+    } else {
+        var at, av = gpu_context_new_native();
+        if (is_err_result(at) == 1) { print_cstr("FAIL: gpu_context_new_native\n"); samvada_release(); return 4; }
+        ctx = av;
     }
-    var ctx = ctx_res;
     var rc = run_phase(ctx, "phase 1", 120, 5);
     if (rc == 0) { rc = run_phase(ctx, "phase 2 (the device came back)", 30, 8); }
     gpu_context_release(ctx);

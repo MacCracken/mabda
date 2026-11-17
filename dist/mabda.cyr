@@ -30265,6 +30265,10 @@ fn _backend_nvidia_render_pass_end(ctx, pass): i64 {
 #   +244 (pad)        u32
 #   +248 stage        40B   the pitch-linear staging buffer acquire hands out (NV_SFB_*
 #                           shape; render handle + mapping + size, no FB id) when block-linear
+#   +288 master_owned u32   1 = mabda owns card_fd (taken from logind through samvada):
+#                           release gives the device back and closes it. 0 = the kiosk
+#                           consumer's fd, left alone (4.4.0; the NativeSurface +108 analogue)
+#   +292 master_minor u32   the DRM minor samvada_session_release_device gets
 var NV_SURFACE_CARD_FD     = 0;
 var NV_SURFACE_RENDER_FD   = 4;
 var NV_SURFACE_STATE       = 8;
@@ -30282,7 +30286,20 @@ var NV_SURFACE_LAYOUT      = 232;
 var NV_SURFACE_BL_H        = 236;
 var NV_SURFACE_BL_PITCH    = 240;
 var NV_SURFACE_STAGE       = 248;
-var NV_SURFACE_STRUCT_SIZE = 288;
+var NV_SURFACE_MASTER_OWNED = 288;
+var NV_SURFACE_MASTER_MINOR = 292;
+var NV_SURFACE_STRUCT_SIZE = 296;
+
+# Record that mabda, not the consumer, owns this surface's DRM master fd (the logind path's
+# success case in gpu_surface_configure_native_logind), so release returns the device to
+# logind and closes the fd. Until 4.4.0 only AMD surfaces were marked: on NVIDIA the device
+# and the fd stayed taken until the process exited.
+fn native_nv_surface_mark_master_owned(surface, minor): i64 {
+    if (surface == 0) { return 0 - 1; }
+    store32(surface + NV_SURFACE_MASTER_OWNED, 1);
+    store32(surface + NV_SURFACE_MASTER_MINOR, minor);
+    return 0;
+}
 
 var NV_SCANOUT_LINEAR      = 0;
 var NV_SCANOUT_BLOCKLINEAR = 1;
@@ -30604,6 +30621,14 @@ fn _backend_nvidia_surface_release(ctx, surface): i64 {
     _nv_surface_free_fb(card_fd, render_fd, surface + NV_SURFACE_FB0);
     _nv_surface_free_stage(render_fd, surface);
     if (state != 0) { native_kms_release(state); }
+    # 4.4.0: a logind-delegated fd goes back to logind and is closed, AFTER the KMS teardown
+    # above (which still needs it). A kiosk fd (master_owned 0) is the consumer's.
+    if (load32(surface + NV_SURFACE_MASTER_OWNED) != 0) {
+        #ifdef MABDA_LOGIND
+        samvada_session_release_device(_DRM_MAJOR, load32(surface + NV_SURFACE_MASTER_MINOR));
+        #endif
+        sys_close(card_fd);
+    }
     memset(surface, 0, NV_SURFACE_STRUCT_SIZE);
     return 0;
 }
@@ -38388,6 +38413,10 @@ fn gpu_surface_configure_native_logind(ctx, width, height): i64 {
     if (surf != 0) {
         if (backend_kind(b) == BACKEND_KIND_AMD) {
             native_surface_mark_master_owned(surf, minor);
+        }
+        # 4.4.0: NVIDIA too (NvSurface +288); before, its release kept the device and the fd.
+        if (backend_kind(b) == BACKEND_KIND_NVIDIA) {
+            native_nv_surface_mark_master_owned(surf, minor);
         }
     }
     return surf;

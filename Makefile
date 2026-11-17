@@ -1565,7 +1565,13 @@ build/native_present_logind_e2e: programs/native_present_logind_e2e.cyr src/*.cy
 
 .PHONY: test-native-logind-present-e2e
 test-native-logind-present-e2e: build/native_present_logind_e2e
-	@./scripts/seat-gate.sh native_present_logind_e2e ./build/native_present_logind_e2e
+	@./scripts/seat-gate.sh native_present_logind_e2e ./build/native_present_logind_e2e amd
+
+# The same run on nouveau (4.4.0: the fix that makes an NVIDIA surface give its logind fd back;
+# phase 2 can only take the card again if it did). In seat-closeout-nvidia.
+.PHONY: test-nvidia-logind-present-e2e
+test-nvidia-logind-present-e2e: build/native_present_logind_e2e
+	@./scripts/seat-gate.sh nvidia_present_logind_e2e ./build/native_present_logind_e2e nvidia
 
 # v4.4.0 — the seat-only closeout, one logged run per box (scripts/seat-closeout.sh says what
 # each runs). From a TEXT CONSOLE with the display manager stopped. seat-closeout-amd also

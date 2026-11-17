@@ -733,7 +733,7 @@ fn test_nv_backend_v3_surface_slots() {
     assert_eq(NV_SURFACE_FB1, 88, "NvSurface fb1 at +88 (fb0 + 40)");
     assert_eq(NV_SURFACE_SAVED, 128, "NvSurface saved CRTC at +128 (fb1 + 40)");
     assert_eq(NV_SURFACE_LAYOUT, 232, "NvSurface layout at +232 (saved + 104)");
-    assert_eq(NV_SURFACE_STRUCT_SIZE, 288, "NvSurface = 288 bytes (stage at +248 + 40)");
+    assert_eq(NV_SURFACE_STRUCT_SIZE, 296, "NvSurface = 296 bytes (master_owned / minor after the stage)");
     # FB sub-struct (40 bytes): mapped addr is the consumer's CPU write target.
     assert_eq(NV_SFB_FB_ID, 16, "NV_SFB fb_id at +16");
     assert_eq(NV_SFB_MAPPED, 24, "NV_SFB mapped at +24 (acquire hands this to the consumer)");
@@ -747,6 +747,39 @@ fn test_nv_backend_v3_surface_slots() {
     assert_eq(NV_CTX_PARAM_VA, 112, "NV_CTX_PARAM_VA relocated to +112");
     assert_eq(NV_CTX_PARAM_ADDR, 120, "NV_CTX_PARAM_ADDR relocated to +120");
     assert_eq(NV_CTX_PARAM_ADDR < GPU_CONTEXT_SIZE, 1, "param block still fits GpuContext");
+    return 0;
+}
+
+# 4.4.0 — a logind-delegated master fd on NVIDIA: gpu_surface_configure_native_logind marks the
+# surface (as on AMD), and release gives the device back and closes the fd. A kiosk surface's fd
+# is the consumer's and stays open. Uses a real fd (/dev/null) so "closed" is observable.
+fn test_nv_surface_logind_ownership() {
+    assert_eq(NV_SURFACE_MASTER_OWNED, 288, "master_owned after the stage");
+    assert_eq(NV_SURFACE_MASTER_MINOR, 292, "master_minor");
+    var s[296];
+    memset(&s, 0, 296);
+    assert_eq(native_nv_surface_mark_master_owned(0, 0), 0 - 1, "null surface");
+    assert_eq(native_nv_surface_mark_master_owned(&s, 1), 0, "marked");
+    assert_eq(load32(&s + NV_SURFACE_MASTER_OWNED), 1, "owned");
+    assert_eq(load32(&s + NV_SURFACE_MASTER_MINOR), 1, "minor 1");
+    # owned: release closes the fd (the KMS teardown ioctls on /dev/null fail harmlessly)
+    var fd = syscall(2, "/dev/null", 0, 0);
+    assert_eq(fd >= 0, 1, "opened /dev/null");
+    memset(&s, 0, 296);
+    store32(&s + NV_SURFACE_CARD_FD, fd);
+    store32(&s + NV_SURFACE_RENDER_FD, 0 - 1);
+    native_nv_surface_mark_master_owned(&s, 0);
+    assert_eq(_backend_nvidia_surface_release(0, &s), 0, "released");
+    assert_eq(syscall(72, fd, 1, 0), 0 - 9, "the owned fd is closed (F_GETFD: EBADF)");
+    assert_eq(load32(&s + NV_SURFACE_MASTER_OWNED), 0, "and the record cleared");
+    # kiosk: release leaves the consumer's fd open
+    var kfd = syscall(2, "/dev/null", 0, 0);
+    memset(&s, 0, 296);
+    store32(&s + NV_SURFACE_CARD_FD, kfd);
+    store32(&s + NV_SURFACE_RENDER_FD, 0 - 1);
+    _backend_nvidia_surface_release(0, &s);
+    assert_eq(syscall(72, kfd, 1, 0) >= 0, 1, "a kiosk fd stays open");
+    syscall(3, kfd);
     return 0;
 }
 
@@ -973,6 +1006,7 @@ fn main() {
     test_nv_sass_render();
     test_nv_kms_topology_constants();
     test_nv_backend_v3_surface_slots();
+    test_nv_surface_logind_ownership();
     test_nv_bigbo_allocator();
     test_nv_fence_status_check();
     return assert_summary();
