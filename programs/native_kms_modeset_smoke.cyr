@@ -88,7 +88,7 @@ fn main(): i64 {
 
     print_cstr("mabda native modeset smoke (v3 Step 7.2(d))\n");
     print_cstr("-------------------------------------------\n");
-    print_cstr("expect: screen turns solid red for 3 seconds, then restores\n\n");
+    print_cstr("expect: screen turns solid red for 3 seconds, then the console comes back\n\n");
 
     # Open card master fd.
     var path[16];
@@ -174,8 +174,10 @@ fn main(): i64 {
     # The big one.
     var scanout[40];
     memset(&scanout, 0, 40);
-    var rc = native_kms_modeset_first_connected(card_fd, render_fd,
-      state, &scanout);
+    var saved[104];      # DRM_MODE_CRTC: the console's config, read just before the modeset (4.4.0)
+    memset(&saved, 0, 104);
+    var rc = native_kms_modeset_first_connected_save(card_fd, render_fd,
+      state, &scanout, &saved);
     if (rc != 0) {
         print_cstr("FAIL: modeset rc=");
         print_i64(rc);
@@ -212,9 +214,14 @@ fn main(): i64 {
     print_cstr("filled BO with solid red, sleeping 3s ...\n");
     _sleep_seconds(3);
 
-    # Teardown — release_scanout disables CRTC, removes FB, closes
-    # both handles, unmaps the BO.
-    native_kms_release_scanout(card_fd, render_fd, &scanout);
+    # Teardown (4.4.0): give the display back to the console when its config was saved (NVIDIA's
+    # N8.3 does the same), else switch the CRTC off as before; then remove the FB, close both
+    # handles, unmap the BO.
+    if (native_kms_release_scanout_restore(card_fd, render_fd, &scanout, &saved) == 1) {
+        print_cstr("restored the original CRTC config (console back)\n");
+    } else {
+        print_cstr("no console config to restore: CRTC disabled\n");
+    }
     print_cstr("teardown complete\n");
 
     # Drop master so the next compositor / smoke run can acquire.

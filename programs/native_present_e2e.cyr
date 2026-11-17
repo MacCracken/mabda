@@ -21,10 +21,14 @@
 # gpu_surface_configure_native_logind (`-D MABDA_LOGIND` plus an
 # initialized samvada).
 #
-# At 60 Hz the screen shows ~2 seconds of a vertically-scrolling
-# blue-to-red gradient — visual confirmation the page-flip path
-# works. Each frame's gradient offset is `frame * 4` rows, so
-# the pattern wraps every (h/4) frames.
+# Two phases (4.4.0; the same picture NVIDIA's surface present gate shows):
+#   1. 120 frames of a vertically-scrolling blue-to-red gradient (~2 s at 60 Hz). Each frame's
+#      offset is `frame * 4` rows, so the pattern wraps every (h/4) frames.
+#   2. 180 frames of the TEST CARD: a 32-px grey checkerboard, a 4-px green border, a 1-px white
+#      diagonal and a red bar sweeping right. A broken flip shows here: jagged or torn edges, a
+#      bar that jumps back, or a frozen picture.
+# Then gpu_surface_release puts the console back (4.4.0: it used to switch the display off).
+# Each phase prints its frame time.
 #
 # Exit codes:
 #   0   — 120 frames presented, clean teardown
@@ -83,12 +87,74 @@ fn _fill_gradient(addr, w, h, pitch, frame_offset): i64 {
     return 0;
 }
 
+# The test card into an XRGB8888 buffer (`pitch` bytes per row): a 32-px checkerboard, a 4-px
+# green border, a 1-px white diagonal (moving 4 px a frame) and a 16-px red bar sweeping right
+# 8 px a frame. The same card as programs/nvidia_surface_present_e2e.cyr.
+fn _fill_card(addr, w, h, pitch, frame): i64 {
+    var bar = (frame * 8) % w;
+    var y = 0;
+    while (y < h) {
+        var row = addr + y * pitch;
+        var x = 0;
+        while (x < w) {
+            var px = 0x303030;
+            if ((((x / 32) + (y / 32)) % 2) == 1) { px = 0x606060; }
+            if (x >= bar) { if (x < bar + 16) { px = 0xFF0000; } }
+            if (((x + 4096 - y - frame * 4) % 256) == 0) { px = 0xFFFFFF; }
+            if (x < 4) { px = 0x00FF00; }
+            if (y < 4) { px = 0x00FF00; }
+            if (x >= w - 4) { px = 0x00FF00; }
+            if (y >= h - 4) { px = 0x00FF00; }
+            store32(row + x * 4, px);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Present `frames` frames: the gradient (card 0) or the test card (card 1). Returns 0, or 6
+# (acquire returned 0) / 7 (present failed).
+fn present_frames(ctx, surface, w, h, pitch, frames, card, label): i64 {
+    var t0 = _time_now_ns();
+    var frame = 0;
+    while (frame < frames) {
+        var fb = gpu_surface_acquire(ctx, surface);
+        if (fb == 0) {
+            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame); print_cstr("\n");
+            return 6;
+        }
+        # fb is a NativeKmsFb-shaped pointer (fb_b) or the NativeKmsScanout (fb_a): the mapped
+        # address sits at a different offset in each.
+        var addr = 0;
+        if (fb == surface + NATIVE_SURFACE_FB_B) {
+            addr = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR);
+        }
+        if (fb == surface + NATIVE_SURFACE_SCANOUT) {
+            addr = load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
+        }
+        if (card == 1) { _fill_card(addr, w, h, pitch, frame); } else { _fill_gradient(addr, w, h, pitch, frame * 4); }
+        var rc = gpu_surface_present(ctx, surface);
+        if (rc != 0) {
+            print_cstr("FAIL: present returned "); print_i64(rc);
+            print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
+            return 7;
+        }
+        frame = frame + 1;
+    }
+    var t1 = _time_now_ns();
+    print_cstr("PASS: "); print_cstr(label); print_cstr(": "); print_i64(frames);
+    print_cstr(" frames, "); print_i64((t1 - t0) / frames / 1000); print_cstr(" us per frame\n");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
 
     print_cstr("mabda native present e2e (v3 Step 7.7)\n");
     print_cstr("--------------------------------------\n");
-    print_cstr("expect: vertically-scrolling blue-red gradient for ~2s\n\n");
+    print_cstr("expect: ~2 s of a scrolling blue-red gradient, then the test card (checkerboard, green\n");
+    print_cstr("        border, white diagonal, red bar sweeping right), then the console comes back\n\n");
 
     # Open card master fd.
     var path[16];
@@ -155,54 +221,21 @@ fn main(): i64 {
     print_cstr("x"); print_i64(actual_h); print_cstr(" pitch=");
     print_i64(pitch); print_cstr("\n");
 
-    # Animation loop — 120 frames at vsync = ~2s @60Hz.
-    var frame = 0;
-    while (frame < 120) {
-        var fb = gpu_surface_acquire(ctx, surface);
-        if (fb == 0) {
-            print_cstr("FAIL: acquire returned 0 at frame "); print_i64(frame);
-            print_cstr("\n");
-            gpu_surface_release(ctx, surface);
-            gpu_context_release(ctx);
-            native_drm_drop_master(card_fd);
-            sys_close(card_fd);
-            return 6;
-        }
-        # fb is a NativeKmsFb-shaped pointer (or NativeKmsScanout-
-        # shaped for the front-is-fb_b case — same layout up through
-        # mapped_addr / width / height fields). Read mapped_addr.
-        # NativeKmsFb.MAPPED_ADDR offset = 16; NativeKmsScanout's
-        # mapped_addr is at +24. We pick based on which side the
-        # acquire returned. The cleanest path: use the surface's
-        # cached width/pitch (they match both FBs since both were
-        # alloc'd at modeset dimensions).
-        var addr = 0;
-        if (fb == surface + NATIVE_SURFACE_FB_B) {
-            addr = load64(fb + NATIVE_KMS_FB_MAPPED_ADDR);
-        }
-        if (fb == surface + NATIVE_SURFACE_SCANOUT) {
-            addr = load64(fb + NATIVE_KMS_SCANOUT_MAPPED_ADDR);
-        }
-        _fill_gradient(addr, actual_w, actual_h, pitch, frame * 4);
-        rc = gpu_surface_present(ctx, surface);
-        if (rc != 0) {
-            print_cstr("FAIL: present returned "); print_i64(rc);
-            print_cstr(" at frame "); print_i64(frame); print_cstr("\n");
-            gpu_surface_release(ctx, surface);
-            gpu_context_release(ctx);
-            native_drm_drop_master(card_fd);
-            sys_close(card_fd);
-            return 7;
-        }
-        frame = frame + 1;
+    rc = present_frames(ctx, surface, actual_w, actual_h, pitch, 120, 0, "the gradient");
+    if (rc == 0) { rc = present_frames(ctx, surface, actual_w, actual_h, pitch, 180, 1, "the test card"); }
+    if (rc != 0) {
+        gpu_surface_release(ctx, surface);
+        gpu_context_release(ctx);
+        native_drm_drop_master(card_fd);
+        sys_close(card_fd);
+        return rc;
     }
-    print_cstr("PASS: 120 frames presented\n");
 
     gpu_surface_release(ctx, surface);
     gpu_context_release(ctx);
     native_drm_drop_master(card_fd);
     sys_close(card_fd);
-    print_cstr("teardown complete\n");
+    print_cstr("teardown complete (the console should be back)\n");
     return 0;
 }
 

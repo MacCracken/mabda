@@ -1275,6 +1275,15 @@ fn native_kms_first_connected_mode(fd, out): i64 {
 # negative and `out` is not guaranteed valid (caller should not
 # release).
 fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
+    return native_kms_modeset_first_connected_save(card_fd, render_fd, state, out, 0);
+}
+
+# native_kms_modeset_first_connected that first saves the CRTC's current config (GETCRTC into
+# `saved`, DRM_MODE_CRTC_SIZE bytes; 0 = don't) right before replacing it, so teardown can put
+# the console back with native_kms_release_scanout_restore instead of leaving the display off.
+# `saved` is zeroed when the read fails or `saved` is 0-sized garbage. NVIDIA's surface has
+# done this since N8.3; AMD's left a black screen until the kernel's console took it back. 4.4.0.
+fn native_kms_modeset_first_connected_save(card_fd, render_fd, state, out, saved): i64 {
     if (card_fd <= 0)   { return -1; }
     if (render_fd <= 0) { return -1; }
     if (state == 0)     { return -1; }
@@ -1379,9 +1388,13 @@ fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
     var conn_list[4];
     store32(&conn_list, conn_id);
     var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    if (saved != 0) {
+        if (native_kms_get_crtc(card_fd, crtc_id, saved) != 0) { memset(saved, 0, DRM_MODE_CRTC_SIZE); }
+    }
     var rc = native_kms_set_crtc(card_fd, crtc_id, fb_id,
       &conn_list, 1, mode_ptr);
     if (rc != 0) {
+        if (saved != 0) { memset(saved, 0, DRM_MODE_CRTC_SIZE); }
         native_kms_rm_fb(card_fd, fb_id);
         native_gem_close(card_fd, card_handle);
         native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
@@ -1399,6 +1412,35 @@ fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
     store32(out + NATIVE_KMS_SCANOUT_BO_SIZE,       bo_size);
     store64(out + NATIVE_KMS_SCANOUT_MAPPED_ADDR,   mapped_addr);
     return 0;
+}
+
+# native_kms_release_scanout that first gives the display back: when `saved` (a GETCRTC config
+# from native_kms_modeset_first_connected_save) has a framebuffer, SETCRTC the CRTC back to it and
+# its mode (the console), then release the scanout WITHOUT disabling the CRTC. With nothing
+# saved, or if the restore is refused, it falls back to the plain release (CRTC off). Release any
+# second FB after this call, so nothing of ours is on screen when it goes. Returns 1 when the
+# console was restored, 0 when the CRTC was disabled instead. 4.4.0.
+fn native_kms_release_scanout_restore(card_fd, render_fd, scanout, saved): i64 {
+    if (scanout == 0) { return 0; }
+    var restored = 0;
+    if (saved != 0) {
+        if (card_fd > 0) {
+            var sfb = load32(saved + DRM_MODE_CRTC_FB_ID);
+            var crtc_id = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+            if (sfb != 0) {
+                if (crtc_id != 0) {
+                    var conn_list[4];
+                    store32(&conn_list, load32(scanout + NATIVE_KMS_SCANOUT_CONN_ID));
+                    if (native_kms_set_crtc(card_fd, crtc_id, sfb, &conn_list, 1, saved + DRM_MODE_CRTC_MODE) == 0) {
+                        restored = 1;
+                        store32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID, 0);   # release: don't disable
+                    }
+                }
+            }
+        }
+    }
+    native_kms_release_scanout(card_fd, render_fd, scanout);
+    return restored;
 }
 
 # Tear down a successful scanout. Disables the CRTC, removes the

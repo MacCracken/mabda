@@ -33,8 +33,9 @@ so far in the native AMD SPIR-V compiler:
 - **A 1024-id MIR space** (was 256), shared with NVIDIA. ranga's bilinear resize, refused with
   `MIR_ERR_ID_OOR` until now, compiles and matches its golden.
 
-The remaining 4.4.0 items are open and tracked in the roadmap. "The same in N9's SM75 path" is
-done in N9.5, below, and f64 (refused on NVIDIA at N9.5) landed with the fourth N9 follow-on.
+Every 4.4.0 roadmap item is now done, the seat-only closeout and the consumer check included
+(below). "The same in N9's SM75 path" is done in N9.5, below, and f64 (refused on NVIDIA at N9.5)
+landed with the fourth N9 follow-on.
 
 **N9 (SPIR-V → SASS for NVIDIA) is done.** The design note is
 [`docs/proposals/n9-spirv-to-sass.md`](docs/proposals/n9-spirv-to-sass.md). N9.1–N9.6 cover the
@@ -739,8 +740,16 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   stopped. All five card-node gates passed: `kms-summary`, `kms-scanout` (ADDFB2 with the corrected
   struct), `kms-modeset`, `present-e2e` (120 page-flipped frames) and `surface-present-e2e`
   (block-linear, then linear).
-- **The Cezanne closeout passed** (`make seat-closeout-amd`, 2026-11-17, a clean boot after
-  package updates, from tty3 with sddm stopped; `build/logs/seat-closeout-amd-20261117-105059.log`).
+- **The Cezanne closeout passed, and looked right**: `make seat-closeout-amd`, 2026-11-17,
+  `build/logs/seat-closeout-amd-20261117-111849.log`, the run after the double-buffer and
+  console-restore fixes below. The maintainer confirmed the test card rendered correctly.
+  - The red-screen gate and every surface teardown restored the console.
+  - The gradient presented at 16,677 µs a frame, exactly 60 Hz. The test card ran 180 frames at
+    33.7 ms each.
+  - 78 of 78 native gates, the logind live-bus run and the example consumer passed again.
+
+  The checks had already passed on the earlier run (a clean boot after package updates, from
+  tty3 with sddm stopped; `build/logs/seat-closeout-amd-20261117-105059.log`):
   - 78 of 78 native gates passed, the DRM-master ones included: `test-native-kms-modeset`
     and `test-native-present-e2e` at 2560×1440.
   - The samvada live-bus run on AMD passed (`test-native-logind-present-e2e`). Logind handed
@@ -749,8 +758,51 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - The example consumer ran cleanly.
   - It took three runs. The first two found the two present bugs fixed below: the size
     refusal, then the non-blocking flip wait.
-  - chew reruns its present and logind gates next, since NVIDIA's present changed with that
-    fix.
+- **chew's closeout, rerun after the flip-wait fix, passed** (`make seat-closeout-nvidia`,
+  2026-11-17, `build/logs/chew-seat-closeout-nvidia-20261117-112453.log`, kernel 7.3.4).
+  - All six gates passed: the topology probe, ADDFB2, the red modeset (console restored),
+    120 page-flipped frames that now really wait for each flip, the test card block-linear then
+    linear, and the logind run.
+  - The logind run confirms logind's fd is `O_NONBLOCK` on nouveau too.
+  - The kernel log stayed clean. **The seat-only closeout is done for 4.4.0.**
+
+### Verified — the consumer check (2026-11-17)
+Run against this tree's `dist/mabda.cyr` (6514b46 plus the uncommitted 4.4.0 work), in scratch
+clones; no consumer repository was touched. If `src/` changes before the cut, rerun it.
+- **Name scan:** none of the dist's 4,037 top-level names is defined by ranga's `src/`,
+  soorat's dist or bijli.
+- **ranga** (scratch clone of cca5976): its `lib/mabda.cyr` was replaced with this dist, and two
+  of the five filed changes were applied: the 4-argument table builders in `tests/gpu_spirv.tcyr`,
+  and `BACKEND_KIND_NVIDIA` in `gpu_context_supports_compute`. The suites open an NVIDIA context
+  for the TU116 run. Both GPUs gave the same counts:
+  - `gpu` 48/48, `gpu_pipeline` 102/102 and `gpu_spirv` 54/54 pass.
+  - `gpu_kernels` passes 52 of 53. The one failure is ranga's "cannot yet lower it … flip this
+    when it can" row: bilinear now compiles. That is the filed issue's item 5.
+  - On the TU116, `gpu_nvidia` passes 23 of 54. The 31 failures are its pinned ADR 005 refusals,
+    which now succeed (item 3). The kernel log stayed clean.
+  - Logs: `build/logs/consumer-ranga-{amd,nvidia}-20261117-113114.log`.
+
+  Every failing row is one ranga already has filed to flip
+  (`ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`).
+- **soorat** (`scripts/probes/gpu/`, built with `MABDA_DIST`, on the Cezanne through wgpu): an
+  A/B run, the 4.3.1 dist against this one, gave **identical results** apart from handles and
+  timings.
+  - **P6/MB1:** all 11 render pipelines build; the three error cases return a validation error
+    and the process carries on; `sprite.wgsl` draws a frame that reads back exactly.
+  - **P6/MB2–5:** 8 of 8 (shadow map, HDR bloom, IBL cube mips, sRGB copy, 4× MSAA,
+    `gpu_particles` compute).
+  - **P7:** upload `bytes_match=1` with 0 B of heap growth.
+  - **P8:** 20,000 frames at 0 B of heap growth a frame, RSS flat (109.4 MB; 114.6 MB under
+    4.3.1).
+  - The legacy P6 probe (`p6_wgsl.cyr`, written against 4.2.0) builds 9 of 9 modules and 2 of 9
+    pipelines under both dists. Those calls use the auto-layout, no-vertex-buffer form, matching
+    soorat's own P6 record. MB1 is the probe that tests that path.
+  - Logs: `build/logs/consumer-soorat-{old,new}-20261117-113114.log`, with each case's own log
+    in the matching directory.
+- **Not checked:**
+  - **aethersafta** is still the Rust crate (0.50.0), with no Cyrius build to link.
+  - **bijli** has no mabda dependency yet.
+  - **rasa** and **kiran** are not checked out on the dev box.
 
 ### Fixed — the AMD native surface refused the monitor's mode silently
 - **What happened.** The Cezanne seat closeout's first run (2026-11-17,
@@ -770,6 +822,39 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   - The no-substitution rule stands.
 - **Tests.** In `kms.tcyr` (347): the query's bad arguments, the message's content and
   truncation, and both errors recorded with their messages.
+
+### Fixed — AMD's native present showed every other frame, torn, and left the screen black
+Found by comparing what the two seat runs showed on screen: NVIDIA's gates read as proofs and
+AMD's looked broken. The AMD gates passed every check, but two bugs sat behind them.
+- **The double buffer was broken since v3 Step 7.7.**
+  - `native_kms_present` writes the FB it flipped to into the scanout record's `fb_id`.
+    `_backend_native_surface_present` read FB A's id from that same field.
+  - After the first flip it held B, so every later present targeted B. FB A's frames were
+    never shown, and every other frame was drawn into B while B was on screen: half rate, torn.
+  - The release then removed B twice and leaked A's FB until the fd closed.
+  - The fix: NativeSurface keeps A's id at +124 (`NATIVE_SURFACE_FB_A_ID`).
+    `_native_surface_back_fb_id` picks the back buffer from the two stable ids, and
+    `_native_surface_after_flip` puts the scanout record back to A.
+- **AMD switched the display off instead of giving it back.** Its teardown disabled the CRTC, so
+  the screen stayed black until the kernel's console took it back after the program exited.
+  NVIDIA's surface has restored the console since N8.3.
+  - `native_kms_modeset_first_connected_save` reads the CRTC's config just before replacing it.
+  - `native_kms_release_scanout_restore` sets it back, then frees without switching off. It
+    falls back to switching off when nothing was saved or the restore is refused.
+  - NativeSurface keeps the saved config (+120 `have_saved`, +128 the 104-byte config; 232
+    bytes), and every teardown restores it: release, the size refusal, and a failed second-FB
+    allocation.
+  - The red-screen gate restores too, and says so.
+- **AMD's present gate shows NVIDIA's test card.** `test-native-present-e2e` now runs the
+  gradient (120 frames), then 180 frames of the checkerboard, border, diagonal and sweeping bar,
+  with each phase's frame time. A broken flip shows there as torn edges, a bar that jumps back,
+  or a frozen picture.
+- **Tests.** In `surface.tcyr` (84):
+  - eight frames of flips alternating B, A, B, A, with the acquired FB always the one flipped
+    to and the scanout record back to A after each;
+  - the restoring release's fallbacks;
+  - the save variant's argument checks;
+  - the new layout.
 
 ### Fixed — present on a logind fd: the flip-complete wait was a bare read()
 - **What happened.** In the Cezanne closeout's rerun (2026-11-17,
@@ -923,7 +1008,7 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 29 suites, **7836 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 29 suites, **7847 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
   predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9
@@ -943,8 +1028,8 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   a 4.4.0 closeout item.
 - NVIDIA TU116 (`chew`): the new `test-nvidia-spirv-compute-e2e` and the 13 existing masterless
   NVIDIA gates pass (`build/logs/nvidia-gates-n9.4-20261116-140142.log`). The 5 card-node gates
-  need a seat, as at every release. Not yet run for 4.4.0: ranga's suites, which need the
-  table-builder fix described above.
+  need a seat, as at every release. ranga's suites ran later (N9.6, and the consumer check
+  above).
 
 ## [4.3.1] — 2026-11-16
 

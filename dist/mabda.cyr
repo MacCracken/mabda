@@ -21218,7 +21218,7 @@ fn _backend_native_render_pass_end(ctx, pass): i64 {
 # via gpu_ctx_set_native_card_fd and dispatches this slot exactly as
 # the kiosk entry does.
 
-# NativeSurface layout (120 bytes):
+# NativeSurface layout (232 bytes; 120 before 4.4.0):
 #   +0:   card_fd        (i32)
 #   +4:   render_fd      (i32)
 #   +8:   state          (u64) — KmsState ptr (96 B elsewhere)
@@ -21234,7 +21234,13 @@ fn _backend_native_render_pass_end(ctx, pass): i64 {
 #                                close. 0 = kiosk consumer-owned fd. [HIGH-2]
 #   +112: master_minor   (u32) — DRM minor passed to samvada_session_release
 #   +116: pad            (u32)
-var NATIVE_SURFACE_SIZE         = 120;
+#   +120: have_saved     (u32) — 1 = saved[] holds the console's CRTC config (4.4.0)
+#   +124: fb_a_id        (u32) — the scanout FB's id. native_kms_present overwrites the
+#                                scanout record's fb_id with the FB it flipped to, so present
+#                                takes A's id from here (4.4.0; see _native_surface_back_fb_id)
+#   +128: saved          (104 B DRM_MODE_CRTC, GETCRTC'd just before the modeset) — release puts
+#                                the console back with it instead of switching the display off
+var NATIVE_SURFACE_SIZE         = 232;
 var NATIVE_SURFACE_CARD_FD      = 0;
 var NATIVE_SURFACE_RENDER_FD    = 4;
 var NATIVE_SURFACE_STATE        = 8;
@@ -21246,6 +21252,9 @@ var NATIVE_SURFACE_HEIGHT       = 100;
 var NATIVE_SURFACE_PITCH        = 104;
 var NATIVE_SURFACE_MASTER_OWNED = 108;
 var NATIVE_SURFACE_MASTER_MINOR = 112;
+var NATIVE_SURFACE_HAVE_SAVED   = 120;
+var NATIVE_SURFACE_FB_A_ID      = 124;
+var NATIVE_SURFACE_SAVED        = 128;
 
 # Audit 2026-06-14 [HIGH-2 NEW]: record that mabda (not the consumer)
 # owns this surface's DRM master fd, so gpu_surface_release gives it back
@@ -21282,9 +21291,16 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     store64(ns + NATIVE_SURFACE_STATE, state);
 
     # ---- modeset on first CONNECTED connector ----
-    var rc = native_kms_modeset_first_connected(card_fd, render_fd,
+    # 4.4.0: save the console's CRTC config just before the modeset replaces it, so every
+    # teardown below gives the display back (NVIDIA's surface has since N8.3).
+    var rc = native_kms_modeset_first_connected_save(card_fd, render_fd,
       state,
-      ns + NATIVE_SURFACE_SCANOUT);
+      ns + NATIVE_SURFACE_SCANOUT, ns + NATIVE_SURFACE_SAVED);
+    if (rc == 0) {
+        if (load32(ns + NATIVE_SURFACE_SAVED + DRM_MODE_CRTC_FB_ID) != 0) {
+            store32(ns + NATIVE_SURFACE_HAVE_SAVED, 1);
+        }
+    }
     if (rc != 0) {
         native_kms_release(state);
         # 4.4.0: say why (it returned a bare 0): native_kms_modeset_first_connected's stage code
@@ -21306,8 +21322,8 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     if (fb_w != width)  { mismatch = 1; }
     if (fb_h != height) { mismatch = 1; }
     if (mismatch == 1) {
-        native_kms_release_scanout(card_fd, render_fd,
-          ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release_scanout_restore(card_fd, render_fd,
+          ns + NATIVE_SURFACE_SCANOUT, ns + NATIVE_SURFACE_SAVED);
         native_kms_release(state);
         _native_surface_fail_size(fb_w, fb_h, width, height);
         return 0;
@@ -21317,8 +21333,8 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     rc = native_kms_alloc_fb(card_fd, render_fd, fb_w, fb_h,
       ns + NATIVE_SURFACE_FB_B);
     if (rc != 0) {
-        native_kms_release_scanout(card_fd, render_fd,
-          ns + NATIVE_SURFACE_SCANOUT);
+        native_kms_release_scanout_restore(card_fd, render_fd,
+          ns + NATIVE_SURFACE_SCANOUT, ns + NATIVE_SURFACE_SAVED);
         native_kms_release(state);
         return 0;
     }
@@ -21329,6 +21345,8 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     store32(ns + NATIVE_SURFACE_HEIGHT,     fb_h);
     store32(ns + NATIVE_SURFACE_PITCH,      pitch);
     store32(ns + NATIVE_SURFACE_FRONT_IS_B, 0);  # scanout's FB is front
+    store32(ns + NATIVE_SURFACE_FB_A_ID,
+      load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_FB_ID));
     return ns;
 }
 
@@ -21402,22 +21420,32 @@ fn _backend_native_surface_acquire(ctx, surface): i64 {
 # then toggles which is "front." After return, the buffer that
 # was just presented is on screen, and the next acquire returns
 # the OTHER one.
+# The FB id present flips to: the one that is NOT front (FB A, the scanout's, when fb_b is front;
+# else fb_b). A's id comes from NATIVE_SURFACE_FB_A_ID, never the scanout record.
+#
+# 4.4.0, a double-buffering bug: native_kms_present writes the FB it flipped to into the scanout
+# record's fb_id, and this read A's id from there. After the first flip that field held B, so
+# every later present flipped to B: A's frames were never shown, and every other frame was drawn
+# into B while it was on screen. The release then removed B twice and leaked A's FB.
+fn _native_surface_back_fb_id(surface): i64 {
+    if (load32(surface + NATIVE_SURFACE_FRONT_IS_B) != 0) { return load32(surface + NATIVE_SURFACE_FB_A_ID); }
+    return load32(surface + NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_FB_ID);
+}
+
+# After a completed flip: the back FB is now front, and the scanout record describes FB A again
+# (its handles, mapping and id), whatever native_kms_present wrote.
+fn _native_surface_after_flip(surface): i64 {
+    store32(surface + NATIVE_SURFACE_FRONT_IS_B, 1 - load32(surface + NATIVE_SURFACE_FRONT_IS_B));
+    store32(surface + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_FB_ID,
+      load32(surface + NATIVE_SURFACE_FB_A_ID));
+    return 0;
+}
+
 fn _backend_native_surface_present(ctx, surface): i64 {
     if (ctx == 0)     { return GPU_ERR_OTHER; }
     if (surface == 0) { return GPU_ERR_OTHER; }
     var card_fd = load32(surface + NATIVE_SURFACE_CARD_FD);
-    var front_is_b = load32(surface + NATIVE_SURFACE_FRONT_IS_B);
-    var back_fb_id = 0;
-    if (front_is_b != 0) {
-        # back is scanout's FB
-        back_fb_id = load32(surface + NATIVE_SURFACE_SCANOUT
-          + NATIVE_KMS_SCANOUT_FB_ID);
-    }
-    if (front_is_b == 0) {
-        # back is fb_b
-        back_fb_id = load32(surface + NATIVE_SURFACE_FB_B
-          + NATIVE_KMS_FB_FB_ID);
-    }
+    var back_fb_id = _native_surface_back_fb_id(surface);
     var rc = native_kms_present(card_fd,
       surface + NATIVE_SURFACE_SCANOUT,
       back_fb_id, 0);
@@ -21429,8 +21457,7 @@ fn _backend_native_surface_present(ctx, surface): i64 {
     if (rc != 0)     { return _native_neg_rc_to_gpu_err(rc); }
     # Toggle which is front. (The flip-completed event drained inside
     # native_kms_present already ran; back is now scanning.)
-    if (front_is_b == 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 1); }
-    if (front_is_b != 0) { store32(surface + NATIVE_SURFACE_FRONT_IS_B, 0); }
+    _native_surface_after_flip(surface);
     return 0;
 }
 
@@ -21442,10 +21469,15 @@ fn _backend_native_surface_release(ctx, surface): i64 {
     var state        = load64(surface + NATIVE_SURFACE_STATE);
     var master_owned = load32(surface + NATIVE_SURFACE_MASTER_OWNED);
     var master_minor = load32(surface + NATIVE_SURFACE_MASTER_MINOR);
+    # 4.4.0: put the console back first (when its config was saved), so neither of our FBs is on
+    # screen when it goes, then free fb_b; with nothing saved the scanout release switches the
+    # CRTC off, as before.
+    var saved = 0;
+    if (load32(surface + NATIVE_SURFACE_HAVE_SAVED) == 1) { saved = surface + NATIVE_SURFACE_SAVED; }
+    native_kms_release_scanout_restore(card_fd, render_fd,
+      surface + NATIVE_SURFACE_SCANOUT, saved);
     native_kms_release_fb(card_fd, render_fd,
       surface + NATIVE_SURFACE_FB_B);
-    native_kms_release_scanout(card_fd, render_fd,
-      surface + NATIVE_SURFACE_SCANOUT);
     if (state != 0) { native_kms_release(state); }
     # Audit 2026-06-14 [HIGH-2 NEW]: if mabda acquired this master fd via
     # logind/samvada, give master back to logind and close the fd — AFTER
@@ -23904,6 +23936,15 @@ fn native_kms_first_connected_mode(fd, out): i64 {
 # negative and `out` is not guaranteed valid (caller should not
 # release).
 fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
+    return native_kms_modeset_first_connected_save(card_fd, render_fd, state, out, 0);
+}
+
+# native_kms_modeset_first_connected that first saves the CRTC's current config (GETCRTC into
+# `saved`, DRM_MODE_CRTC_SIZE bytes; 0 = don't) right before replacing it, so teardown can put
+# the console back with native_kms_release_scanout_restore instead of leaving the display off.
+# `saved` is zeroed when the read fails or `saved` is 0-sized garbage. NVIDIA's surface has
+# done this since N8.3; AMD's left a black screen until the kernel's console took it back. 4.4.0.
+fn native_kms_modeset_first_connected_save(card_fd, render_fd, state, out, saved): i64 {
     if (card_fd <= 0)   { return -1; }
     if (render_fd <= 0) { return -1; }
     if (state == 0)     { return -1; }
@@ -24008,9 +24049,13 @@ fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
     var conn_list[4];
     store32(&conn_list, conn_id);
     var mode_ptr = modes + mode_idx * DRM_MODE_MODEINFO_SIZE;
+    if (saved != 0) {
+        if (native_kms_get_crtc(card_fd, crtc_id, saved) != 0) { memset(saved, 0, DRM_MODE_CRTC_SIZE); }
+    }
     var rc = native_kms_set_crtc(card_fd, crtc_id, fb_id,
       &conn_list, 1, mode_ptr);
     if (rc != 0) {
+        if (saved != 0) { memset(saved, 0, DRM_MODE_CRTC_SIZE); }
         native_kms_rm_fb(card_fd, fb_id);
         native_gem_close(card_fd, card_handle);
         native_bo_release_gtt(render_fd, render_handle, mapped_addr, bo_size);
@@ -24028,6 +24073,35 @@ fn native_kms_modeset_first_connected(card_fd, render_fd, state, out): i64 {
     store32(out + NATIVE_KMS_SCANOUT_BO_SIZE,       bo_size);
     store64(out + NATIVE_KMS_SCANOUT_MAPPED_ADDR,   mapped_addr);
     return 0;
+}
+
+# native_kms_release_scanout that first gives the display back: when `saved` (a GETCRTC config
+# from native_kms_modeset_first_connected_save) has a framebuffer, SETCRTC the CRTC back to it and
+# its mode (the console), then release the scanout WITHOUT disabling the CRTC. With nothing
+# saved, or if the restore is refused, it falls back to the plain release (CRTC off). Release any
+# second FB after this call, so nothing of ours is on screen when it goes. Returns 1 when the
+# console was restored, 0 when the CRTC was disabled instead. 4.4.0.
+fn native_kms_release_scanout_restore(card_fd, render_fd, scanout, saved): i64 {
+    if (scanout == 0) { return 0; }
+    var restored = 0;
+    if (saved != 0) {
+        if (card_fd > 0) {
+            var sfb = load32(saved + DRM_MODE_CRTC_FB_ID);
+            var crtc_id = load32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID);
+            if (sfb != 0) {
+                if (crtc_id != 0) {
+                    var conn_list[4];
+                    store32(&conn_list, load32(scanout + NATIVE_KMS_SCANOUT_CONN_ID));
+                    if (native_kms_set_crtc(card_fd, crtc_id, sfb, &conn_list, 1, saved + DRM_MODE_CRTC_MODE) == 0) {
+                        restored = 1;
+                        store32(scanout + NATIVE_KMS_SCANOUT_CRTC_ID, 0);   # release: don't disable
+                    }
+                }
+            }
+        }
+    }
+    native_kms_release_scanout(card_fd, render_fd, scanout);
+    return restored;
 }
 
 # Tear down a successful scanout. Disables the CRTC, removes the

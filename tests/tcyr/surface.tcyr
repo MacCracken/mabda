@@ -159,7 +159,11 @@ fn test_native_surface_struct_field_offsets() {
     # the free tail of the 120-byte struct (master_minor ends at +116).
     assert_eq(NATIVE_SURFACE_MASTER_OWNED, 108, "master_owned");
     assert_eq(NATIVE_SURFACE_MASTER_MINOR, 112, "master_minor");
-    assert_eq(NATIVE_SURFACE_SIZE,         120, "size");
+    assert_eq(NATIVE_SURFACE_HAVE_SAVED,   120, "have_saved (4.4.0)");
+    assert_eq(NATIVE_SURFACE_FB_A_ID,      124, "fb_a_id (4.4.0)");
+    assert_eq(NATIVE_SURFACE_SAVED,        128, "saved CRTC, 8-aligned");
+    assert_eq(NATIVE_SURFACE_SAVED + DRM_MODE_CRTC_SIZE, NATIVE_SURFACE_SIZE, "saved ends the struct");
+    assert_eq(NATIVE_SURFACE_SIZE,         232, "size (120 before 4.4.0)");
     assert(NATIVE_SURFACE_MASTER_MINOR + 4 <= NATIVE_SURFACE_SIZE,
       "provenance fields fit within the struct");
     # Sanity: scanout + 40-byte size = fb_b offset; fb_b + 32 = front_is_b.
@@ -246,9 +250,66 @@ fn test_gpu_surface_per_frame_ops_null_safe() {
     return 0;
 }
 
+# 4.4.0 — the AMD double buffer. native_kms_present writes the FB it flipped to into the scanout
+# record; present used to read FB A's id from there, so after one flip every present targeted B
+# (A's frames never shown, every other frame drawn into the on-screen B). Now the back FB comes
+# from the two stable ids and the scanout record is put back to A after each flip.
+fn test_native_surface_flip_alternates() {
+    var s[232];
+    memset(&s, 0, 232);
+    store32(&s + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_FB_ID, 11);   # FB A
+    store32(&s + NATIVE_SURFACE_FB_A_ID, 11);
+    store32(&s + NATIVE_SURFACE_FB_B + NATIVE_KMS_FB_FB_ID, 22);         # FB B
+    var want = 22;
+    var bad = 0;
+    var f = 0;
+    while (f < 8) {
+        var back = _native_surface_back_fb_id(&s);
+        if (back != want) { bad = bad + 1; }
+        # acquire hands out the FB that is not front, and it is the one present flips to
+        var acq = _backend_native_surface_acquire(1, &s);
+        var acq_id = load32(&s + NATIVE_SURFACE_FB_A_ID);
+        if (acq == &s + NATIVE_SURFACE_FB_B) { acq_id = 22; }
+        if (acq_id != back) { bad = bad + 1; }
+        # what native_kms_present does to the record, then the bookkeeping after the flip
+        store32(&s + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_FB_ID, back);
+        _native_surface_after_flip(&s);
+        if (load32(&s + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_FB_ID) != 11) { bad = bad + 1; }
+        want = 33 - want;
+        f = f + 1;
+    }
+    assert_eq(bad, 0, "8 frames: the flips alternate B, A, B, A, the acquired FB is the one flipped to");
+    return 0;
+}
+
+# 4.4.0 — the restoring release gives the console back when its config was saved, and falls back
+# to switching the CRTC off when it wasn't or the restore is refused.
+fn test_native_release_scanout_restore() {
+    var scan[40];
+    memset(&scan, 0, 40);
+    var saved[104];
+    memset(&saved, 0, 104);
+    assert_eq(native_kms_release_scanout_restore(0 - 1, 0 - 1, 0, &saved), 0, "null scanout");
+    assert_eq(native_kms_release_scanout_restore(0 - 1, 0 - 1, &scan, 0), 0, "nothing saved: no restore");
+    assert_eq(native_kms_release_scanout_restore(0 - 1, 0 - 1, &scan, &saved), 0, "a saved config with no FB");
+    var fd = syscall(2, "/dev/null", 2, 0);
+    store32(&scan + NATIVE_KMS_SCANOUT_CRTC_ID, 5);
+    store32(&saved + DRM_MODE_CRTC_FB_ID, 9);
+    assert_eq(native_kms_release_scanout_restore(fd, 0 - 1, &scan, &saved), 0,
+      "a refused SETCRTC (not a card): falls back to the plain release");
+    syscall(3, fd);
+    var dummy[64];
+    memset(&dummy, 0, 64);
+    assert_eq(native_kms_modeset_first_connected_save(0, 7, &dummy, &scan, &saved), 0 - 1, "card_fd=0");
+    assert_eq(native_kms_modeset_first_connected_save(7, 7, &dummy, 0, &saved), 0 - 1, "out=0");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     color_init();
+    test_native_surface_flip_alternates();
+    test_native_release_scanout_restore();
     test_recoverable_surface_timeout();
     test_recoverable_surface_outdated();
     test_recoverable_surface_config();

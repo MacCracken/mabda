@@ -28,7 +28,8 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
   ranga's kernels are vendored in `tests/spirv/ranga/`. Their goldens come from the SPIR-V
   interpreter in `scripts/gen-spirv-ranga-fixtures.py` (`make check-ranga-fixtures`).
-  `test-native-ranga-kernels-e2e` checks the same goldens on AMD. The open 4.4.0 items are:
+  `test-native-ranga-kernels-e2e` checks the same goldens on AMD. **Every 4.4.0 item is done**
+  (2026-11-17); what is left is the cut itself, which is the maintainer's call:
   - N9's follow-ons are all done:
     - latency-table scheduling: `sm75_schedule` is checked by `_ck_sched` in
       `tests/tcyr/sm75_compile.tcyr`, and `make bench-nvidia-compute` measures it;
@@ -40,9 +41,9 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
   - The seat-only closeout. chew's half passed on 2026-11-16 (`make seat-closeout-nvidia`, all five
-    card-node gates). The Cezanne half passed on 2026-11-17 (78 of 78 plus the example consumer,
-    on its third run; the first two found the size refusal and the non-blocking flip wait).
-    Left: rerun `make seat-closeout-nvidia` on chew, because NVIDIA's present changed. Run it from a text console with `sudo systemctl stop sddm`,
+    card-node gates). Done on both boxes (2026-11-17). The Cezanne's fourth run passed and
+    looked right, after fixes to the size refusal, the non-blocking flip wait, the AMD double
+    buffer and the console restore. chew's rerun passed all six gates. Run it from a text console with `sudo systemctl stop sddm`,
     then read `build/logs/seat-closeout-amd-*.log`.
   - The logind path on NVIDIA returning the device: fixed and verified on chew (2026-11-16,
     `make test-nvidia-logind-present-e2e`, the first live-bus run of mabda's logind path).
@@ -50,24 +51,35 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     (`test-nvidia-blocklinear-e2e`), and the scanout passed its seat run on chew (2026-11-16).
     A seat run on chew needs a text console (Ctrl-Alt-F3) with `sudo systemctl stop sddm`; a
     terminal in the desktop cannot take DRM master.
-  - The seat-only closeout.
-  - The consumer check. ranga needs five changes in its own repo, all its call. They are
-    filed as `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`
-    (item 5, the bilinear row and `gpu_resize`, was appended after the 1024-id work).
+  - The consumer check: done (2026-11-17) against the working-tree dist, in scratch clones.
+    ranga's suites give the same counts on both GPUs. The only failing rows are the ones ranga
+    has filed to flip:
+    - item 5, the bilinear "flip this when it can" row, on both GPUs;
+    - item 3, `gpu_nvidia`'s 31 refusal rows.
+
+    soorat's P6/MB1, MB2–5, P7 and P8 probes are identical to the 4.3.1 dist. The logs are
+    `build/logs/consumer-{ranga,soorat}-*-20261117-113114.log`. **Rerun it at the cut only if
+    `src/` changed after that.** ranga's five changes are its own call: they are filed as
+    `ranga/docs/development/issues/2026-11-16-mabda-n9-nvidia-compute-lift-the-guard.md`
+    (item 5, the bilinear row and `gpu_resize`, was appended after the 1024-id work). For the
+    soorat probes, keep the `scripts/probes/gpu/` layout and the `rust-old/src/` shaders the
+    probes read through `../../../`. A flat copy fails every shader read.
   On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
   Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
   deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
   `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. ranga's suites ran from static binaries built
   here against a scratch clone (`~/ranga-n96` on chew holds them). ranga's
   `tests/gpu_spirv.tcyr` needs the 4-argument table-builder call (CHANGELOG, Breaking).
-- **This boot took a compute-ring reset** (12:59:20, 2026-11-16: a probe hung the GPU before its
-  fix). Render gates run since are on a post-reset GPU. The clean-boot `test-native-all` in the
-  seat-only closeout settles it.
+- **The 2026-11-16 compute-ring reset is settled.** A probe hung the GPU at 12:59:20, before its
+  fix. The Cezanne has rebooted since, and the seat closeout's `test-native-all` ran on a clean
+  boot ("GPU resets this boot: none", `build/logs/seat-closeout-amd-20261117-111849.log`).
+  Never run hang-inducing controls on the local Cezanne.
 - **Pins:** cyrius **6.7.18** (`cyrius.cyml`; track the latest upstream `VERSION` when you bump),
   wgpu-native **v29.0.1.1**, launcher **83 slots**, deps samvada 1.0.1 / chitra 1.0.3.
 - **Next release: v4.4.0 — compilers + NVIDIA**: N9 (SPIR-V → SASS; ranga is waiting), the
   scratch-buffer contract, the compiler limits v4.1.0 left named, NVIDIA block-linear scanout, the
-  seat-only HW closeout, the legacy surface-acquire leak, ranga's consumer run. Then **v4.5.0 —
+  seat-only HW closeout, the legacy surface-acquire leak, ranga's consumer run (all done; the cut
+  is next). Then **v4.5.0 —
   textures + language**: texture encoding, compressed sRGB ids, render-graph aliasing, the cyrius
   6.7 language minors (S2 / S3 / S4 / M6). Then v5.0 (native rendering beyond the vertex-less
   subset; Intel; NVIDIA wgpu retires) and v5.1. Don't split these into more minors without asking.
@@ -215,6 +227,10 @@ Consumers:
 - RADV contracts f64 `a*b + c` into an FMA (allowed without `NoContraction`), so expect 1 ULP. The
   native GFX9 compiler never fuses.
 - Cyrius reserves `mod` and `dyn` as identifiers.
+- `native_kms_present` overwrites the scanout record's `fb_id` with the FB it flipped to. Never
+  read a double buffer's FB ids back from it; NativeSurface keeps A's id at +124.
+- A gate that passes its checks can still look broken on screen, and that is a finding. The AMD
+  double-buffer bug passed every present gate for months.
 - systemd-logind hands out device fds with O_NONBLOCK. Never `read()` a DRM event bare: use
   `native_drm_wait_event` / `native_kms_wait_flip_complete` (poll, then read).
 - An AMD native surface must be configured with the connector's exact mode (no scaling; audit

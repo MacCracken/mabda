@@ -201,7 +201,7 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     unaligned.
   - Not in this scope: block-linear render targets and textures (a zero-copy present), and a
     copy-engine present to take the swizzle off the CPU (about 15 ms a frame at 1440p).
-- **The seat-only HW closeout** — gates skipped at every release because they need a person at a
+- ✅ **The seat-only HW closeout** (done 2026-11-17; the status notes below) — gates skipped at every release because they need a person at a
   seat (a VT with no compositor, `chew`'s console). Each target first writes its whole output to
   `build/logs/<gate>-<timestamp>.log` (the `test-surface-wayland-e2e` recipe is the template); the
   maintainer runs it; the CHANGELOG cites the log:
@@ -257,10 +257,17 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
       flip-complete wait was a bare `read()`. Fixed, for AMD and NVIDIA: poll, then read.
     - **Third run: passed** (`build/logs/seat-closeout-amd-20261117-105059.log`). 78 of 78 on
       the clean boot, the master gates and the logind live-bus run included. The example
-      consumer ran too. **The Cezanne half is done for 4.4.0.**
-  - **Left:** rerun `make seat-closeout-nvidia` on chew. NVIDIA's present now really waits for
-    its flips (the poll-then-read fix), so its present and logind gates need their pass
-    repeated.
+      consumer ran too.
+    - What it showed on screen exposed two AMD present bugs that every check had missed: a
+      broken double buffer (half the frames, drawn into the on-screen FB) and a display left
+      off at teardown. Both are fixed, and the gate now shows NVIDIA's test card.
+    - **Fourth run, after those fixes: passed and looked right**
+      (`build/logs/seat-closeout-amd-20261117-111849.log`). The console came back after every
+      display gate, the gradient ran at exactly 60 Hz, and the maintainer confirmed the test
+      card rendered correctly. **The Cezanne half is done for 4.4.0.**
+  - **chew rerun: passed** (2026-11-17, `build/logs/chew-seat-closeout-nvidia-20261117-112453.log`).
+    All six gates passed with the poll-then-read present, and the kernel log stayed clean. Both
+    halves are done.
 - ✅ **Found 2026-11-16: the logind path never hands the device back on NVIDIA.** Fixed
   (CHANGELOG [4.4.0]): `NvSurface` +288 / +292 is marked like AMD's and released. A CPU test
   covers it, and the seat run on chew passed: logind delegated the card over the live bus,
@@ -276,7 +283,20 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
   release drop an unpresented one. CPU test: one release per frame over 1,000 frames, no heap
   growth. RSS check on chew (NVK, Hyprland, `make test-surface-wayland-e2e`): 0 KiB over 1,800
   frames, against about 2 MiB for a no-release control (about 1.15 KB a frame).
-- **The consumer check** — ranga's GPU suites against the bundle (4.3.1 ran only the fold
+- ✅ **The consumer check** (done 2026-11-17; CHANGELOG [4.4.0] "Verified — the consumer
+  check"). It ran against the working-tree dist, in scratch clones.
+  - The name scan found 0 collisions with ranga, soorat or bijli.
+  - ranga's suites gave the same counts on the Cezanne and the TU116. The only failing rows are
+    the two ranga has filed to flip: item 5 on both GPUs, and item 3 in `gpu_nvidia`
+    (`build/logs/consumer-ranga-{amd,nvidia}-20261117-113114.log`).
+  - soorat's P6/MB1, P6/MB2–5, P7 and P8 probes gave results identical to the 4.3.1 dist
+    (`build/logs/consumer-soorat-{old,new}-20261117-113114.log`).
+  - aethersafta is still Rust, bijli has no mabda dependency, and rasa and kiran are not checked
+    out.
+  - **Rerun at the cut only if `src/` changes before it.**
+
+  The history:
+  ranga's GPU suites against the bundle (4.3.1 ran only the fold
   name-collision scan: 0 shared function names with ranga or soorat). Partly run during N9.6
   against the in-progress bundle, in a scratch clone of ranga@de54123:
   - native AMD on the Cezanne: `gpu` 48, `gpu_kernels` 53, `gpu_pipeline` 102 and `gpu_spirv`
