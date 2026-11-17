@@ -10,9 +10,10 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits
     ignoring branches; the corpus kernel `wait_skipped_only_use` shows it on the Cezanne.
-  - The last step is the maintainer's seat closeout on both boxes, needed because the audit
-    fixes touched the flip wait and the CRTC pick, and samvada moved. Then the maintainer
-    commits and tags.
+  - The seat closeout passed on both boxes after the audit fixes and the samvada move
+    (`build/logs/seat-closeout-amd-20261117-122835.log`,
+    `build/logs/chew-seat-closeout-nvidia-20261117-123117.log`). What is left is the tag, which
+    is the maintainer's.
   - The previous release was v4.3.1 (tag `4.3.1` at `979222d`; the render tier's MB2–MB5;
     audit `docs/audit/2026-11-16-4.3.1-audit.md`).
 - **What 4.4.0 holds.** Two items landed first: **the scratch-buffer contract** and **the compiler limits v4.1.0 left

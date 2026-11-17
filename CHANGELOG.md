@@ -1131,9 +1131,24 @@ AMD's looked broken. The AMD gates passed every check, but two bugs sat behind t
   (`build/logs/cut-440-bench-ab-*.log`). The new baseline is
   `docs/audit/baselines/2026-11-17-cpu-bench-baseline.csv`.
 - **The consumer check:** rerun on this tree, the same results as above.
-- **Still to run: the seat closeout on both boxes**, after the audit's flip-wait and CRTC-pick
-  fixes and the samvada move: `make seat-closeout-amd` on the Cezanne and
-  `make seat-closeout-nvidia` on chew, from a text console with sddm stopped.
+- **The seat closeout passed on both boxes**, on the committed tree (`7a5df78`), after the
+  audit's flip-wait and CRTC-pick fixes and the samvada move. Both ran from tty3 with sddm
+  stopped.
+  - **Cezanne** (`build/logs/seat-closeout-amd-20261117-122835.log`, a clean boot):
+    - 78 of 78 native gates, the three master gates included;
+    - the modeset on CRTC 108, with the console restored;
+    - the gradient at 16,678 µs a frame, and the test card at 33.5 ms;
+    - the logind live-bus run on samvada 1.1.2: the card handed over, 120 frames, returned,
+      and taken again for 30;
+    - the example consumer.
+  - **chew** (`build/logs/chew-seat-closeout-nvidia-20261117-123117.log`; the same sources as
+    `7a5df78`, by digest):
+    - all six gates: the topology probe, ADDFB2, the red modeset (console restored), 120
+      page-flipped frames, and the test card block-linear (h=4) then linear;
+    - the logind run on samvada 1.1.2: handed over, 120 frames, returned, and 30 more.
+
+    The surface gate's 150 ms a frame is unchanged from every earlier run; it is the gate's own
+    CPU fill.
 
 ### Verified — during development
 - CPU: 29 suites, **7847 assertions** before the cut, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
