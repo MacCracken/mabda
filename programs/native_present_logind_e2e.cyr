@@ -77,14 +77,42 @@ fn frame_addr(s, fb): i64 {
     return 0;
 }
 
+var g_mode_w = 0;
+var g_mode_h = 0;
+
+# The connector's preferred mode, read without master from the card logind will hand over: an
+# AMD surface must be configured with exactly that size (NVIDIA takes it as a hint). Returns 0
+# when found. AMD: card0 then card1 (gpu_surface_configure_native_logind's minors); NVIDIA: the
+# nouveau card.
+fn query_mode(): i64 {
+    var fd = 0 - 1;
+    if (g_nv == 1) {
+        var which[4];
+        fd = native_nv_open_card_node(&which);
+    } else {
+        fd = syscall(2, "/dev/dri/card0", 2, 0);
+        if (fd < 0) { fd = syscall(2, "/dev/dri/card1", 2, 0); }
+    }
+    if (fd < 0) { return 0 - 1; }
+    var wh[16];
+    var r = native_kms_first_connected_mode(fd, &wh);
+    sys_close(fd);
+    if (r != 0) { return 0 - 1; }
+    g_mode_w = load64(&wh);
+    g_mode_h = load64(&wh + 8);
+    return 0;
+}
+
 # Configure through logind, present `frames` frames, release. Returns 0 or an exit code
 # (`fail_configure` when logind would not hand the card over).
 fn run_phase(ctx, label, frames, fail_configure): i64 {
-    var surface = gpu_surface_configure_native_logind(ctx, 1920, 1080);
+    gpu_error_clear();
+    var surface = gpu_surface_configure_native_logind(ctx, g_mode_w, g_mode_h);
     if (surface == 0) {
         print_cstr("FAIL: "); print_cstr(label);
-        print_cstr(": gpu_surface_configure_native_logind returned 0 (logind refused TakeDevice, or no\n");
-        print_cstr("      connected connector). Run from a text-console login with the display manager stopped.\n");
+        print_cstr(": gpu_surface_configure_native_logind returned 0 (logind refused TakeDevice, or the\n");
+        print_cstr("      configure failed). Run from a text-console login with the display manager stopped.\n");
+        if (gpu_last_error() != 0) { print_cstr("      "); print_cstr(gpu_last_error_message()); print_cstr("\n"); }
         return fail_configure;
     }
     var w = s_w(surface);
@@ -93,6 +121,13 @@ fn run_phase(ctx, label, frames, fail_configure): i64 {
     print_cstr(label); print_cstr(": logind handed over the card; ");
     print_i64(w); print_cstr("x"); print_i64(h); print_cstr(", master owned by mabda: ");
     print_i64(s_owned(surface)); print_cstr("\n");
+    # the fd logind handed over: O_NONBLOCK (04000) is why a bare read() of the flip event failed
+    var cfd = load32(surface + NATIVE_SURFACE_CARD_FD);
+    if (g_nv == 1) { cfd = load32(surface + NV_SURFACE_CARD_FD); }
+    var fl = syscall(72, cfd, 3, 0);
+    print_cstr("  the card fd's O_NONBLOCK: ");
+    if (fl < 0) { print_cstr("unknown"); } else { print_i64((fl / 0x800) % 2); }
+    print_cstr(" (the present polls before reading the flip event, so either works)\n");
     if (s_owned(surface) != 1) {
         print_cstr("FAIL: the surface is not marked as owning its logind fd: release would keep the device\n");
         gpu_surface_release(ctx, surface);
@@ -140,6 +175,12 @@ fn main(): i64 {
         return 2;
     }
     print_cstr("samvada: connected to the system bus, session found\n");
+    if (query_mode() != 0) {
+        print_cstr("FAIL: no card node with a connected connector to read the mode from\n");
+        samvada_release();
+        return 5;
+    }
+    print_cstr("connector mode "); print_i64(g_mode_w); print_cstr("x"); print_i64(g_mode_h); print_cstr("\n");
     var ctx = 0;
     if (g_nv == 1) {
         var nt, nv = gpu_context_new_native_nvidia();

@@ -739,9 +739,60 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   stopped. All five card-node gates passed: `kms-summary`, `kms-scanout` (ADDFB2 with the corrected
   struct), `kms-modeset`, `present-e2e` (120 page-flipped frames) and `surface-present-e2e`
   (block-linear, then linear).
-- **The Cezanne closeout has not run.** It needs a clean boot, and the box can't be rebooted for
-  now. So for 4.4.0, the AMD DRM-master gates, the samvada live-bus gate and the clean-boot
-  `test-native-all` remain unverified.
+- **The Cezanne closeout passed** (`make seat-closeout-amd`, 2026-11-17, a clean boot after
+  package updates, from tty3 with sddm stopped; `build/logs/seat-closeout-amd-20261117-105059.log`).
+  - 78 of 78 native gates passed, the DRM-master ones included: `test-native-kms-modeset`
+    and `test-native-present-e2e` at 2560×1440.
+  - The samvada live-bus run on AMD passed (`test-native-logind-present-e2e`). Logind handed
+    over the card; the log confirms its fd is `O_NONBLOCK`. 120 frames were presented, the
+    device returned, and the card was taken again for 30 more.
+  - The example consumer ran cleanly.
+  - It took three runs. The first two found the two present bugs fixed below: the size
+    refusal, then the non-blocking flip wait.
+  - chew reruns its present and logind gates next, since NVIDIA's present changed with that
+    fix.
+
+### Fixed — the AMD native surface refused the monitor's mode silently
+- **What happened.** The Cezanne seat closeout's first run (2026-11-17,
+  `build/logs/seat-closeout-amd-20261117-103518.log`, a clean boot) passed 76 of 78 gates.
+  `test-native-present-e2e` and `test-native-logind-present-e2e` failed at configure.
+- **Why.** `_backend_native_surface_configure` refuses any size but the connector's preferred
+  mode (audit HIGH-1: no silent substitution). Both gates asked for a fixed 1920×1080, and the
+  box's monitor now runs 2560×1440. The refusal returned a bare 0, which the gate reported as "no
+  connected connector?". NVIDIA's configure takes the size as a hint, which is why chew passed.
+- **The fix.**
+  - The refusal is now loud: `GPU_ERR_SURFACE_CONFIG`, with "the connector's mode is
+    2560x1440, not the 1920x1080 asked for". A modeset failure records its stage code too.
+  - `native_kms_first_connected_mode(fd, out)` reads the size to ask for without DRM master.
+    It picks the same connector and mode as the modeset, and read 2560×1440 from this box's
+    connector.
+  - Both gates now configure with it and print the recorded reason if configure fails.
+  - The no-substitution rule stands.
+- **Tests.** In `kms.tcyr` (347): the query's bad arguments, the message's content and
+  truncation, and both errors recorded with their messages.
+
+### Fixed — present on a logind fd: the flip-complete wait was a bare read()
+- **What happened.** In the Cezanne closeout's rerun (2026-11-17,
+  `build/logs/seat-closeout-amd-20261117-104420.log`), 77 of 78 gates passed and the kiosk
+  present showed its gradient. The logind gate got its card, configured, and failed its first
+  present with 99 (`GPU_ERR_OTHER`).
+- **Why.** Both presents waited for the flip-complete event with a plain `read()` on the card
+  fd. A kiosk fd blocks. systemd-logind opens the devices it hands out with `O_NONBLOCK`, so the
+  read returned -EAGAIN before the flip completed.
+  - The AMD present returned that as an error.
+  - The NVIDIA present ignored the read's result, so on a logind fd it never waited for its
+    flips. chew's logind run passed only because the frame fill is slower than a vblank.
+- **The fix.**
+  - `native_drm_wait_event` polls for the event, then reads it. It returns -ETIME after
+    `NATIVE_DRM_EVENT_TIMEOUT_MS` (1 s) and retries on EINTR or a spurious wakeup.
+  - `native_kms_wait_flip_complete` holds the old drain loop (VBLANK events skipped until the
+    FLIP_COMPLETE), now shared.
+  - `native_kms_present` and the NVIDIA present both use it, and NVIDIA's now fails when no
+    flip completes.
+  - The logind gate prints the fd's `O_NONBLOCK` flag, so the hardware log records the cause.
+- **Tests.** In `kms.tcyr` (358), a non-blocking pipe stands in for the card fd. A bare read
+  returns -EAGAIN and the wait times out, then an event is read once written. A VBLANK followed
+  by a FLIP_COMPLETE is drained in one read and across two, and a malformed event fails with -3.
 
 ### Fixed — the logind present path kept the device on NVIDIA
 - **What was wrong.** `gpu_surface_configure_native_logind` marked a surface as owning the fd it
@@ -872,11 +923,12 @@ All found by probe kernels on the Cezanne while doing the named limits. Each is 
   derived capacities, and the `_spv_build_many_chains(buf, n)` fixture is added.
 
 ### Verified (so far)
-- CPU: 29 suites, **7814 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
+- CPU: 29 suites, **7836 assertions**, 0 failed (4.3.1: 6880; 6929 after the scratch-buffer
   contract; 7033 after the compiler limits; 7112 after N9.1; 7181 after N9.2; 7217 after N9.3;
   7232 after N9.4; 7289 after N9.5; 7356 after N9.6; 7435 after the v2 scheduling; 7472 after
   predicate allocation; 7557 after BSSY / BSYNC; 7658 after `OpFDiv` / f64; 7661 after the GFX9
-  1024-id space; 7770 after block-linear scanout; 7803 after the wgpu surface leak). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
+  1024-id space; 7770 after block-linear scanout; 7803 after the wgpu surface leak; 7814 after
+  the NVIDIA logind fix). Per-file lint, `--strict-deferrals` and `fmt --check` are clean on every
   changed file. `cyrius vet`, the sizing / stack-array / write-length / count-script /
   make-dry-run / cf-fixtures / ranga-fixtures / f64-fixtures gates, `fuzz`, `example-link` and
   `test-raw-include` pass.

@@ -245,10 +245,22 @@ Phase 3 of the 2026-11 plan with the compiler and NVIDIA items already on the ro
     All five card-node gates passed from tty3 with sddm stopped: the topology probe, ADDFB2
     with the corrected 104-byte struct, the red modeset, 120 page-flipped frames, and the test
     card block-linear then linear.
-  - **Cezanne: waiting on a reboot the maintainer can't take soon** (said 2026-11-16).
-    `make seat-closeout-amd` still has to run after a clean boot: `test-native-all` with the
-    master and logind gates, and the example consumer. Until then, the AMD DRM-master gates,
-    the samvada live-bus run and the clean-boot rerun stay unverified for 4.4.0.
+  - **Cezanne: first run 2026-11-17 on a clean boot**
+    (`build/logs/seat-closeout-amd-20261117-103518.log`). 76 of 78 gates passed, including
+    `test-native-kms-modeset`, and the example consumer ran.
+    - `test-native-present-e2e` and `test-native-logind-present-e2e` failed at configure:
+      they asked for 1920×1080 on a 2560×1440 monitor, which the AMD configure refuses (and
+      used to refuse silently). Fixed: the refusal is recorded, and the gates ask for the
+      connector's mode.
+    - Rerun the same boot: 77 of 78. The kiosk present passed at 2560×1440. The logind gate
+      configured and failed its first present: logind's fd is non-blocking, and the
+      flip-complete wait was a bare `read()`. Fixed, for AMD and NVIDIA: poll, then read.
+    - **Third run: passed** (`build/logs/seat-closeout-amd-20261117-105059.log`). 78 of 78 on
+      the clean boot, the master gates and the logind live-bus run included. The example
+      consumer ran too. **The Cezanne half is done for 4.4.0.**
+  - **Left:** rerun `make seat-closeout-nvidia` on chew. NVIDIA's present now really waits for
+    its flips (the poll-then-read fix), so its present and logind gates need their pass
+    repeated.
 - ✅ **Found 2026-11-16: the logind path never hands the device back on NVIDIA.** Fixed
   (CHANGELOG [4.4.0]): `NvSurface` +288 / +292 is marked like AMD's and released. A CPU test
   covers it, and the seat run on chew passed: logind delegated the card over the live bus,

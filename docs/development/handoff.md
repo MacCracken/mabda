@@ -40,8 +40,9 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     `~/mabda-bench-v1` on chew holds a git-archived "before" tree for before/after benches
     (refresh it from the commit you compare against).
   - The seat-only closeout. chew's half passed on 2026-11-16 (`make seat-closeout-nvidia`, all five
-    card-node gates). The Cezanne half, `make seat-closeout-amd`, is still open: it needs a reboot
-    the maintainer can't take soon. Run it from a text console with `sudo systemctl stop sddm`,
+    card-node gates). The Cezanne half passed on 2026-11-17 (78 of 78 plus the example consumer,
+    on its third run; the first two found the size refusal and the non-blocking flip wait).
+    Left: rerun `make seat-closeout-nvidia` on chew, because NVIDIA's present changed. Run it from a text console with `sudo systemctl stop sddm`,
     then read `build/logs/seat-closeout-amd-*.log`.
   - The logind path on NVIDIA returning the device: fixed and verified on chew (2026-11-16,
     `make test-nvidia-logind-present-e2e`, the first live-bus run of mabda's logind path).
@@ -214,6 +215,11 @@ Consumers:
 - RADV contracts f64 `a*b + c` into an FMA (allowed without `NoContraction`), so expect 1 ULP. The
   native GFX9 compiler never fuses.
 - Cyrius reserves `mod` and `dyn` as identifiers.
+- systemd-logind hands out device fds with O_NONBLOCK. Never `read()` a DRM event bare: use
+  `native_drm_wait_event` / `native_kms_wait_flip_complete` (poll, then read).
+- An AMD native surface must be configured with the connector's exact mode (no scaling; audit
+  HIGH-1). Read it first with `native_kms_first_connected_mode` (no master needed). The monitor
+  both boxes share runs 2560×1440, and the AMD GPU is `card1` on the Cezanne.
 - Turing's block-linear GOB is NOT the Tegra / Fermi one that most write-ups give. Bits 4..8 of
   the in-GOB address are y0 y1 x(16) y2 x(32): see `native_nv_bl_offset`, checked against the
   kernel's `nv50_set_pixel_swizzle` and NVK's `CopyGOBTuring2D`.

@@ -387,6 +387,85 @@ fn test_native_kms_mode_dim_accessors() {
     return 0;
 }
 
+# 4.4.0 — the size a native surface must be configured with, read without master, and the
+# AMD configure's refusal message when it is asked for another (it used to return a bare 0).
+fn test_kms_first_connected_mode_and_size_msg() {
+    var wh[16];
+    store64(&wh, 7);
+    store64(&wh + 8, 7);
+    assert_eq(native_kms_first_connected_mode(0 - 1, &wh), 0 - 1, "bad fd refused");
+    assert_eq(load64(&wh) | load64(&wh + 8), 0, "and the size zeroed");
+    assert_eq(native_kms_first_connected_mode(3, 0), 0 - 1, "null out refused");
+    var m[192];
+    var n = _native_surface_size_msg(&m, 2560, 1440, 1920, 1080, 192);
+    assert_eq(memeq(&m, "native surface: the connector's mode is 2560x1440, ", 51), 1, "names the mode");
+    assert_eq(memeq(&m + 51, "not the 1920x1080 asked for (AMD does not scale", 47), 1, "and the size asked for");
+    assert_eq(n, strlen(&m), "returns its length");
+    var t[24];
+    n = _native_surface_size_msg(&t, 2560, 1440, 1920, 1080, 24);
+    assert_eq(n, 23, "truncated to the buffer");
+    assert_eq(load8(&t + 23), 0, "and terminated");
+    gpu_error_clear();
+    _native_surface_fail_size(2560, 1440, 1920, 1080);
+    assert_eq(gpu_last_error(), GPU_ERR_SURFACE_CONFIG, "recorded as GPU_ERR_SURFACE_CONFIG");
+    assert_eq(streq(gpu_last_error_message(), &m), 1, "with the message");
+    _native_surface_fail_rc("native surface: the modeset failed, stage ", 0 - 2);
+    assert_eq(streq(gpu_last_error_message(), "native surface: the modeset failed, stage -2"), 1, "the stage code");
+    gpu_error_clear();
+    return 0;
+}
+
+# A fake drm_event_vblank (32 bytes) of `type` with `seq` into `buf`.
+fn _fake_event(buf, type, seq): i64 {
+    memset(buf, 0, 32);
+    store32(buf + DRM_EVENT_HEADER_TYPE, type);
+    store32(buf + DRM_EVENT_HEADER_LENGTH, 32);
+    store32(buf + DRM_EVENT_VBLANK_SEQUENCE, seq);
+    return 0;
+}
+
+# 4.4.0 — the flip-event wait on a NON-BLOCKING fd (systemd-logind hands out its devices with
+# O_NONBLOCK; a bare read() returned -EAGAIN before the flip completed and failed the AMD present
+# at frame 0). A non-blocking pipe stands in for the card fd.
+fn test_kms_wait_event_nonblocking() {
+    var p[8];
+    assert_eq(syscall(293, &p, 0x800, 0), 0, "pipe2(O_NONBLOCK)");
+    var rfd = load32(&p);
+    var wfd = load32(&p + 4);
+    var buf[256];
+    assert_eq(syscall(0, rfd, &buf, 256), 0 - 11, "a bare read on the empty fd: -EAGAIN");
+    assert_eq(native_drm_wait_event(rfd, &buf, 256, 20), 0 - 62, "the wait times out: -ETIME");
+    var ev[64];
+    _fake_event(&ev, DRM_EVENT_FLIP_COMPLETE, 77);
+    syscall(1, wfd, &ev, 32);
+    assert_eq(native_drm_wait_event(rfd, &buf, 256, 20), 32, "an event: read once it is there");
+    assert_eq(native_drm_wait_event(0 - 1, &buf, 256, 20), 0 - 1, "bad fd");
+    assert_eq(native_drm_wait_event(rfd, 0, 256, 20), 0 - 1, "null buffer");
+    # the drain: a VBLANK then the FLIP_COMPLETE, in one read
+    _fake_event(&ev, DRM_EVENT_VBLANK, 5);
+    _fake_event(&ev + 32, DRM_EVENT_FLIP_COMPLETE, 6);
+    syscall(1, wfd, &ev, 64);
+    var seq[4];
+    store32(&seq, 0);
+    assert_eq(native_kms_wait_flip_complete(rfd, &seq), 0, "the flip-complete found past a vblank");
+    assert_eq(load32(&seq), 6, "its sequence");
+    # in two reads: a lone VBLANK, then the FLIP_COMPLETE
+    _fake_event(&ev, DRM_EVENT_VBLANK, 8);
+    syscall(1, wfd, &ev, 32);
+    _fake_event(&ev, DRM_EVENT_FLIP_COMPLETE, 9);
+    syscall(1, wfd, &ev, 32);
+    assert_eq(native_kms_wait_flip_complete(rfd, &seq), 0, "across reads");
+    assert_eq(load32(&seq), 9, "the flip's sequence");
+    # a malformed header, and nothing at all
+    _fake_event(&ev, DRM_EVENT_FLIP_COMPLETE, 1);
+    store32(&ev + DRM_EVENT_HEADER_LENGTH, 0);
+    syscall(1, wfd, &ev, 32);
+    assert_eq(native_kms_wait_flip_complete(rfd, 0), 0 - 3, "a zero-length event: -3");
+    syscall(3, rfd);
+    syscall(3, wfd);
+    return 0;
+}
+
 # v3 Step 7.3 — KMS framebuffer (ADDFB2 + RMFB)
 
 fn test_drm_mode_fb_ioctl_numbers() {
@@ -850,6 +929,8 @@ fn main() {
     test_native_kms_mode_dim_accessors();
     test_drm_mode_fb_ioctl_numbers();
     test_drm_mode_fb_cmd2_field_offsets();
+    test_kms_first_connected_mode_and_size_msg();
+    test_kms_wait_event_nonblocking();
     test_drm_format_fourcc_constants();
     test_native_kms_add_fb_xrgb8888_null_safe();
     test_native_kms_rm_fb_null_safe();

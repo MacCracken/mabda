@@ -2619,6 +2619,8 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
       ns + NATIVE_SURFACE_SCANOUT);
     if (rc != 0) {
         native_kms_release(state);
+        # 4.4.0: say why (it returned a bare 0): native_kms_modeset_first_connected's stage code
+        _native_surface_fail_rc("native surface: the modeset failed, stage ", rc);
         return 0;
     }
     var fb_w = load32(ns + NATIVE_SURFACE_SCANOUT + NATIVE_KMS_SCANOUT_WIDTH);
@@ -2629,16 +2631,17 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     # picks the EDID-preferred mode. If they don't match, fail loudly
     # rather than silently substituting — consumer back-buffer math
     # downstream assumes the dimensions it asked for.
-    if (fb_w != width)  {
+    # 4.4.0: the refusal now records both sizes (GPU_ERR_SURFACE_CONFIG): it used to return a
+    # bare 0, which read as "no connected connector". native_kms_first_connected_mode gives the
+    # size to ask for without taking master.
+    var mismatch = 0;
+    if (fb_w != width)  { mismatch = 1; }
+    if (fb_h != height) { mismatch = 1; }
+    if (mismatch == 1) {
         native_kms_release_scanout(card_fd, render_fd,
           ns + NATIVE_SURFACE_SCANOUT);
         native_kms_release(state);
-        return 0;
-    }
-    if (fb_h != height) {
-        native_kms_release_scanout(card_fd, render_fd,
-          ns + NATIVE_SURFACE_SCANOUT);
-        native_kms_release(state);
+        _native_surface_fail_size(fb_w, fb_h, width, height);
         return 0;
     }
 
@@ -2659,6 +2662,57 @@ fn _backend_native_surface_configure(ctx, width, height): i64 {
     store32(ns + NATIVE_SURFACE_PITCH,      pitch);
     store32(ns + NATIVE_SURFACE_FRONT_IS_B, 0);  # scanout's FB is front
     return ns;
+}
+
+# Append the NUL-terminated `s` to the message at `buf` (`len` bytes written so far, `cap` total).
+fn _ns_msg_put(buf, len, cap, s): i64 {
+    var n = len;
+    var i = 0;
+    while (load8(s + i) != 0) {
+        if (n >= cap - 1) { break; }
+        store8(buf + n, load8(s + i));
+        n = n + 1;
+        i = i + 1;
+    }
+    store8(buf + n, 0);
+    return n;
+}
+
+fn _ns_msg_int(buf, len, cap, v): i64 {
+    var d[32];
+    memset(&d, 0, 32);
+    fmt_int_buf(v, &d);
+    return _ns_msg_put(buf, len, cap, &d);
+}
+
+# Build "native surface: the connector's mode is MWxMH, not the AWxAH asked for (...)" into
+# `buf` (`cap` bytes). Returns its length.
+fn _native_surface_size_msg(buf, mw, mh, aw, ah, cap): i64 {
+    var n = _ns_msg_put(buf, 0, cap, "native surface: the connector's mode is ");
+    n = _ns_msg_int(buf, n, cap, mw);
+    n = _ns_msg_put(buf, n, cap, "x");
+    n = _ns_msg_int(buf, n, cap, mh);
+    n = _ns_msg_put(buf, n, cap, ", not the ");
+    n = _ns_msg_int(buf, n, cap, aw);
+    n = _ns_msg_put(buf, n, cap, "x");
+    n = _ns_msg_int(buf, n, cap, ah);
+    n = _ns_msg_put(buf, n, cap, " asked for (AMD does not scale: configure with the mode's size)");
+    return n;
+}
+
+fn _native_surface_fail_size(mw, mh, aw, ah): i64 {
+    var m[192];
+    _native_surface_size_msg(&m, mw, mh, aw, ah, 192);
+    _gpu_err_record(GPU_ERR_SURFACE_CONFIG, &m, 1);
+    return 0;
+}
+
+fn _native_surface_fail_rc(prefix, rc): i64 {
+    var m[128];
+    var n = _ns_msg_put(&m, 0, 128, prefix);
+    _ns_msg_int(&m, n, 128, rc);
+    _gpu_err_record(GPU_ERR_SURFACE_CONFIG, &m, 1);
+    return 0;
 }
 
 # Acquire returns the back-buffer's NativeKmsFb pointer (the FB

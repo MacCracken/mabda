@@ -1224,6 +1224,47 @@ var NATIVE_KMS_SCANOUT_MAPPED_ADDR  = 24;
 var NATIVE_KMS_SCANOUT_HEIGHT       = 32;
 var NATIVE_KMS_SCANOUT_BO_SIZE      = 36;
 
+# The mode native_kms_modeset_first_connected would set, without setting it: the preferred mode of
+# the first CONNECTED connector on card node `fd` (a query: no DRM master needed). Writes the width
+# at out+0 and the height at out+8 (i64 each). Returns 0, or -1 (bad argument, no connected
+# connector, no modes). An AMD native surface must be configured with exactly this size
+# (_backend_native_surface_configure refuses any other); NVIDIA's takes the size as a hint. 4.4.0.
+fn native_kms_first_connected_mode(fd, out): i64 {
+    if (out == 0) { return 0 - 1; }
+    store64(out, 0);
+    store64(out + 8, 0);
+    if (fd <= 0) { return 0 - 1; }
+    var state = native_kms_init(fd);
+    if (state == 0) { return 0 - 1; }
+    var conn_count = kms_state_count_conn(state);
+    var conn_ids = kms_state_conn_ids(state);
+    var meta[80];
+    var i = 0;
+    while (i < conn_count) {
+        var cid = load32(conn_ids + i * 4);
+        memset(&meta, 0, DRM_MODE_GET_CONNECTOR_SIZE);
+        store32(&meta + DRM_MODE_GET_CONNECTOR_CONN_ID, cid);
+        if (native_drm_mode_get_connector(fd, &meta) == 0) {
+            if (load32(&meta + DRM_MODE_GET_CONNECTOR_CONNECTION) == DRM_MODE_CONNECTED) {
+                var mc[4];
+                store32(&mc, 0);
+                var modes = native_kms_get_connector_modes(fd, cid, &mc);
+                var n = load32(&mc);
+                if (modes == 0) { native_kms_release(state); return 0 - 1; }
+                if (n == 0) { native_kms_release(state); return 0 - 1; }
+                var idx = native_kms_pick_preferred_mode(modes, n);
+                store64(out, native_kms_mode_hdisplay(modes, idx));
+                store64(out + 8, native_kms_mode_vdisplay(modes, idx));
+                native_kms_release(state);
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    native_kms_release(state);
+    return 0 - 1;
+}
+
 # Drive the full modeset on the first connected connector found.
 # Caller provides:
 #   card_fd    — master fd opened on /dev/dri/cardN
@@ -1508,6 +1549,64 @@ fn native_drm_read_event(fd, buf, n): i64 {
     return syscall(0, fd, buf, n);
 }
 
+# Wait up to `timeout_ms` for an event on card fd `fd`, then read it: native_drm_read_event that
+# also works on a NON-BLOCKING fd. systemd-logind opens the devices it hands out with O_NONBLOCK,
+# so on the logind path a bare read() returned -EAGAIN before the flip completed (4.4.0: the AMD
+# present failed at frame 0, and NVIDIA's present, which ignored the read's result, never waited
+# for its flips). poll(2) first, then read. Returns the bytes read, -ETIME (-62) when nothing
+# arrived in time, or a negative errno.
+var NATIVE_DRM_EVENT_TIMEOUT_MS = 1000;
+fn native_drm_wait_event(fd, buf, n, timeout_ms): i64 {
+    if (fd <= 0)  { return -1; }
+    if (buf == 0) { return -1; }
+    if (n <= 0)   { return -1; }
+    var pfd[8];
+    var tries = 0;
+    while (tries < 4) {
+        memset(&pfd, 0, 8);
+        store32(&pfd, fd);
+        store16(&pfd + 4, 1);                     # events = POLLIN
+        var r = syscall(7, &pfd, 1, timeout_ms);  # poll(2)
+        if (r == 0) { return 0 - 62; }           # timed out: -ETIME
+        if (r > 0) {
+            var got = syscall(0, fd, buf, n);
+            if (got != 0 - 11) { return got; }    # a spurious wakeup reads -EAGAIN: poll again
+        }
+        if (r < 0) { if (r != 0 - 4) { return r; } }   # -EINTR: poll again
+        tries = tries + 1;
+    }
+    return 0 - 62;
+}
+
+# Drain events from `card_fd` until a DRM_EVENT_FLIP_COMPLETE arrives (the kernel may queue a
+# VBLANK first). Writes its vblank sequence to `seq_out` when non-zero. Returns 0, or a negative
+# code: -2 no flip-complete within 16 reads or a short read, -3 a malformed event, -62 nothing
+# arrived in time, or a negative errno. Shared by the AMD and NVIDIA presents (4.4.0; the loop
+# was native_kms_present's).
+fn native_kms_wait_flip_complete(card_fd, seq_out): i64 {
+    var buf[256];
+    var attempts = 0;
+    while (attempts < 16) {
+        attempts = attempts + 1;
+        memset(&buf, 0, 256);
+        var n = native_drm_wait_event(card_fd, &buf, 256, NATIVE_DRM_EVENT_TIMEOUT_MS);
+        if (n < 0) { return n; }
+        if (n < DRM_EVENT_VBLANK_SIZE) { return 0 - 2; }
+        var off = 0;
+        while (off < n) {
+            var ev_len = drm_event_length(&buf + off);
+            if (ev_len <= 0) { return 0 - 3; }          # malformed header, can't advance
+            if (off + ev_len > n) { return 0 - 3; }     # length past read end
+            if (drm_event_type(&buf + off) == DRM_EVENT_FLIP_COMPLETE) {
+                if (seq_out != 0) { store32(seq_out, drm_event_vblank_sequence(&buf + off)); }
+                return 0;
+            }
+            off = off + ev_len;
+        }
+    }
+    return 0 - 2;                                       # too many events drained, bail
+}
+
 # Convenience accessors for a freshly-read drm_event_vblank.
 fn drm_event_type(buf): i64 { return load32(buf + DRM_EVENT_HEADER_TYPE); }
 fn drm_event_length(buf): i64 { return load32(buf + DRM_EVENT_HEADER_LENGTH); }
@@ -1721,39 +1820,19 @@ fn native_kms_present(card_fd, scanout, new_fb_id, sequence_out): i64 {
     # easily holds 8+ events. Cap the outer reads at 16 to prevent
     # any pathological event-spew from spinning the present loop
     # forever (16 * 8 events = 128 events drained before bail-out).
-    var buf[256];
-    var found = 0;
-    var seq = 0;
-    var attempts = 0;
-    while (found == 0) {
-        if (attempts >= 16) { return 0 - 2; }   # too many events drained, bail
-        attempts = attempts + 1;
-        memset(&buf, 0, 256);
-        var n = native_drm_read_event(card_fd, &buf, 256);
-        if (n < 0) { return n; }
-        if (n < DRM_EVENT_VBLANK_SIZE) { return 0 - 2; }
-        # walk events in this read
-        var off = 0;
-        while (off < n) {
-            var ev_len = drm_event_length(&buf + off);
-            if (ev_len <= 0) { return 0 - 3; }   # malformed header, can't advance
-            if (off + ev_len > n) { return 0 - 3; }   # length past read end
-            var ev_type = drm_event_type(&buf + off);
-            if (ev_type == DRM_EVENT_FLIP_COMPLETE) {
-                seq = drm_event_vblank_sequence(&buf + off);
-                found = 1;
-                off = n;   # exit inner loop
-            }
-            if (found == 0) { off = off + ev_len; }
-        }
-    }
+    # 4.4.0: the drain moved to native_kms_wait_flip_complete, which polls first (a logind fd
+    # is non-blocking).
+    var seq[4];
+    store32(&seq, 0);
+    var wr = native_kms_wait_flip_complete(card_fd, &seq);
+    if (wr != 0) { return wr; }
 
     # Update scanout's bound FB so subsequent operations have the
     # right state.
     store32(scanout + NATIVE_KMS_SCANOUT_FB_ID, new_fb_id);
 
     if (sequence_out != 0) {
-        store32(sequence_out, seq);
+        store32(sequence_out, load32(&seq));
     }
     return 0;
 }
