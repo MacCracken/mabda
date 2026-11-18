@@ -43,6 +43,7 @@ block-linear scanout, and passes the seat-only display gates on both GPUs. See
 - **Render graph** — DAG pass orchestration with multi-queue scheduling (native runs nodes on distinct HW rings)
 - **Render targets and passes** — `gpu_render_target_create` in RGBA8 / sRGB / BGRA8 / RGBA16F / Depth32F with 4x MSAA, the `gpu_pass_desc_*` pass descriptor (up to 8 colour targets, depth with load / clear / store / read-only, resolve), texture views (a cube face or mip level as an attachment), texture copies, mip generation and render-target readback (wgpu; the native backends serve one RGBA8 target)
 - **Window surfaces** — a wgpu surface from a Wayland `wl_display` / `wl_surface`, its capabilities, BGRA8 formats, AUTO_VSYNC / AUTO_NO_VSYNC, frames as texture objects, resize; native KMS present on AMD and NVIDIA
+- **Texture encoding** — a deterministic CPU BC7 encoder and decoder (`mabda_bc7_encode` / `mabda_bc7_decode`, 4.5.0), checked against the GPU's own BC7 decode
 - **Asset loading** — KTX2 / DDS parsers in-tree (KTX2 Zstandard / ZLIB supercompression since 4.5.0, through decoders the consumer registers) + PNG / baseline-JPEG via the `chitra` package (opt-in, `-D MABDA_PNG` / `-D MABDA_JPEG`)
 - **Native SPIR-V compilers** — in-tree compute-shader lowering to GFX9 (AMD) and, since 4.4.0, to SM75 SASS (NVIDIA): structured control flow, int div/mod, vectors, f64; HW-verified on Cezanne and TU116
 - **KMS present** — pure-Cyrius modeset + double-buffered vsync page-flip (native path)

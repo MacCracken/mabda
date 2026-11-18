@@ -1388,6 +1388,16 @@ build/native_ktx2_sc_load_e2e: programs/native_ktx2_sc_load_e2e.cyr src/*.cyr te
 test-native-ktx2-sc-load-e2e: build/native_ktx2_sc_load_e2e
 	./build/native_ktx2_sc_load_e2e
 
+# 4.5.0 — BC7 against the Cezanne's texture unit: random blocks of every mode, and the CPU
+# encoder's output, sampled and compared texel by texel with mabda's CPU decode.
+build/native_bc7_e2e: programs/native_bc7_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_bc7_e2e.cyr $@
+
+.PHONY: test-native-bc7-e2e
+test-native-bc7-e2e: build/native_bc7_e2e
+	./build/native_bc7_e2e
+
 # v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
 build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr
 	@mkdir -p build

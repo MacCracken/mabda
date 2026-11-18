@@ -7,11 +7,15 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 ## Where things stand
 
 - **v4.5.0 is in progress, uncommitted** (VERSION still 4.4.0; CHANGELOG `[4.5.0] — in progress`).
-  Landed: KTX2 zstd / zlib supercompression decode, the first half of texture encoding. The
-  consumer registers sankoch's decoders (`gpu_ktx2_set_zstd_decoder` / `_zlib_decoder`): mabda's
-  `src/` must not name an optional stdlib leaf's functions, even under an `#ifdef`
-  (toolchain-issues E5). Next: the CPU block encoder; ask the maintainer which format if no
-  consumer has named one. Then compressed sRGB ids, render-graph aliasing and the language minors.
+  Landed, texture encoding (both halves):
+  - KTX2 zstd / zlib supercompression decode. The consumer registers sankoch's decoders
+    (`gpu_ktx2_set_zstd_decoder` / `_zlib_decoder`); mabda's `src/` must not name an optional
+    stdlib leaf's functions, even under an `#ifdef` (toolchain-issues E5).
+  - The BC7 CPU reference encoder and decoder (`src/texture_bc7.cyr`; the maintainer chose BC7).
+    `make test-native-bc7-e2e` compares it texel by texel with the Cezanne's texture unit, which
+    decodes BC7 exactly. `tests/tcyr/texture_bc7.tcyr` holds the PSNR bar. About 0.8 ms a block.
+
+  Next: compressed sRGB ids, then render-graph aliasing, then the language minors.
 - **v4.4.0 is released** (tag `4.4.0`; the cut was 2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits

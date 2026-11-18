@@ -1,0 +1,419 @@
+# tests/tcyr/texture_bc7.tcyr — 4.5.0: BC7 decode and the CPU reference encoder
+# (src/texture_bc7.cyr). The decoder's independent check is the hardware
+# (programs/native_bc7_e2e.cyr: every texel of every mode equals the Cezanne's texture unit);
+# this suite pins that verified output for CI, and holds the encoder to its quality bar.
+#define MABDA_PNG   # the bar's last image is tests/assets/load_test_64.png (decoded by chitra)
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn _fnv_bytes(h, p, n): i64 {
+    var i = 0;
+    while (i < n) {
+        h = ((h ^ (load8(p + i) & 0xFF)) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+var g_rng = 0;
+fn _rng_byte(): i64 {
+    g_rng = (g_rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF;
+    return (g_rng >> 33) & 0xFF;
+}
+
+# The hardware gate's 256 random blocks (the same generator, seed and mode order), decoded: the
+# hash is the output the Cezanne's texture unit agreed with on every texel (4.5.0). A change
+# to the decoder or its tables changes it.
+fn test_bc7_decode_matches_the_hardware_verified_output() {
+    _bc7_init();
+    g_rng = 0x9E3779B97F4A7C15;
+    var blk[16];
+    var dec[64];
+    var h = 0xCBF29CE484222325;
+    var modes[64];
+    memset(&modes, 0, 64);
+    var k = 0;
+    while (k < 256) {
+        var i = 0;
+        while (i < 16) { store8(&blk + i, _rng_byte()); i = i + 1; }
+        var m = k % 8;
+        var keep = 0xFF - ((1 << (m + 1)) - 1);
+        store8(&blk, ((load8(&blk) & 0xFF) & keep) | (1 << m));
+        var got = _bc7_decode_block(&blk, &dec);
+        store64(&modes + got * 8, load64(&modes + got * 8) + 1);
+        h = _fnv_bytes(h, &dec, 64);
+        k = k + 1;
+    }
+    assert_eq(h, 0 - 1328472187708894022, "256 random blocks decode to the hardware-verified texels");
+    var m2 = 0;
+    while (m2 < 8) {
+        assert_eq(load64(&modes + m2 * 8), 32, "  32 of each mode");
+        m2 = m2 + 1;
+    }
+    # the reserved mode 8 (byte 0 == 0) decodes to all zeros
+    memset(&blk, 0, 16);
+    store8(&blk + 5, 0xFF);
+    memset(&dec, 0x77, 64);
+    assert_eq(_bc7_decode_block(&blk, &dec), 8, "byte 0 == 0: the reserved mode");
+    assert_eq(load64(&dec) + load64(&dec + 56), 0, "  decodes to zeros");
+    return 0;
+}
+
+# A hand-checkable block: mode 6, endpoint 0 = (R,G,B,A) codes (10, 20, 30, 40) with p-bit 1,
+# endpoint 1 = all 127 codes with p-bit 1, every index 0 except texel 5 = 15. Texel 0 is
+# (21, 41, 61, 81): (code << 1) | p; texel 5 is endpoint 1, (255, 255, 255, 255).
+fn test_bc7_decode_mode6_by_hand() {
+    _bc7_init();
+    var blk[16];
+    memset(&blk, 0, 16);
+    var pos[8];
+    store64(&pos, 0);
+    _bc7_put(&blk, &pos, 0x40, 7);
+    _bc7_put(&blk, &pos, 10, 7);
+    _bc7_put(&blk, &pos, 127, 7);
+    _bc7_put(&blk, &pos, 20, 7);
+    _bc7_put(&blk, &pos, 127, 7);
+    _bc7_put(&blk, &pos, 30, 7);
+    _bc7_put(&blk, &pos, 127, 7);
+    _bc7_put(&blk, &pos, 40, 7);
+    _bc7_put(&blk, &pos, 127, 7);
+    _bc7_put(&blk, &pos, 1, 1);
+    _bc7_put(&blk, &pos, 1, 1);
+    var t = 0;
+    while (t < 16) {
+        var nb = 4;
+        if (t == 0) { nb = 3; }
+        var v = 0;
+        if (t == 5) { v = 15; }
+        _bc7_put(&blk, &pos, v, nb);
+        t = t + 1;
+    }
+    assert_eq(load64(&pos), 128, "the block is 128 bits");
+    var dec[64];
+    assert_eq(_bc7_decode_block(&blk, &dec), 6, "mode 6");
+    assert_eq(load32(&dec), 21 | (41 << 8) | (61 << 16) | (81 << 24), "texel 0 = endpoint 0");
+    assert_eq(load32(&dec + 20), 0xFFFFFFFF, "texel 5 = endpoint 1");
+    assert_eq(_bc7_get(&blk, &pos, 0), 0, "a 0-bit read reads nothing");
+    return 0;
+}
+
+# A solid block, opaque or not, encodes exactly (mode 6: any 8-bit value is an endpoint).
+fn test_bc7_encode_solid_blocks_exact() {
+    _bc7_init();
+    var px[512];
+    var out[16];
+    var cols[48];
+    store64(&cols, 0xFF000000);
+    store64(&cols + 8, 0xFFFFFFFF);
+    store64(&cols + 16, 0x80402010);
+    store64(&cols + 24, 0x00000000);
+    store64(&cols + 32, 0x7F3C9AE1);
+    store64(&cols + 40, 0xFF8C3D11);
+    var k = 0;
+    while (k < 6) {
+        var c = load64(&cols + k * 8);
+        var t = 0;
+        while (t < 16) {
+            var ch = 0;
+            while (ch < 4) {
+                store64(&px + (t * 4 + ch) * 8, (c >> (ch * 8)) & 0xFF);
+                ch = ch + 1;
+            }
+            t = t + 1;
+        }
+        assert_eq(_bc7_encode_block(&px, &out), 0, "a solid block encodes exactly");
+        k = k + 1;
+    }
+    return 0;
+}
+
+# Every mode, partition, rotation and index selection packs to exactly 128 bits (a packing
+# that did not would score 1 << 61), and every block it packs decodes in that mode.
+fn test_bc7_every_mode_packs_128_bits() {
+    _bc7_init();
+    g_rng = 41;
+    var px[512];
+    var out[16];
+    var dec[64];
+    var bad = 0;
+    var wrong_mode = 0;
+    var n = 0;
+    var m = 0;
+    while (m < 8) {
+        var part = 0;
+        var nparts = 64;
+        if (_bc7_m_partbits(m) == 0) { nparts = 1; }
+        if (m == 0) { nparts = 16; }
+        while (part < nparts) {
+            var rot = 0;
+            var nrot = 1;
+            if (m == 4) { nrot = 4; }
+            if (m == 5) { nrot = 4; }
+            while (rot < nrot) {
+                var isel = 0;
+                var nisel = 1;
+                if (m == 4) { nisel = 2; }
+                while (isel < nisel) {
+                    var t = 0;
+                    while (t < 64) { store64(&px + t * 8, _rng_byte()); t = t + 1; }
+                    if (m < 4) {
+                        var a = 0;
+                        while (a < 16) { store64(&px + (a * 4 + 3) * 8, 255); a = a + 1; }
+                    }
+                    var e = _bc7_encode_mode(&px, m, part, rot, isel, &out);
+                    if (e >= (1 << 61)) { bad = bad + 1; }
+                    if (_bc7_decode_block(&out, &dec) != m) { wrong_mode = wrong_mode + 1; }
+                    n = n + 1;
+                    isel = isel + 1;
+                }
+                rot = rot + 1;
+            }
+            part = part + 16;
+            if (m == 0) { part = part - 12; }
+        }
+        m = m + 1;
+    }
+    assert_eq(bad, 0, "every configuration packs 128 bits");
+    assert_eq(wrong_mode, 0, "  and decodes in its own mode");
+    # modes 0 / 1 / 2 / 3 / 7: 4 partitions each; mode 4: 4 rotations x 2 index selections;
+    # mode 5: 4 rotations; mode 6: one
+    assert_eq(n, 33, "  over all 33 configurations tried");
+    return 0;
+}
+
+# Every configuration also fits a smooth block well: a ramp in R and G with a ramp in alpha
+# (opaque for modes 0..3). A mis-packed field decodes to unrelated texels, far past this bound
+# (16 texels x 4 channels x an error of 30 each); modes 4, 6 and 7 are covered here even where
+# an image never picks them.
+fn test_bc7_every_mode_fits_a_smooth_block() {
+    _bc7_init();
+    var px[512];
+    var out[16];
+    var worst = 0;
+    var m = 0;
+    while (m < 8) {
+        var t = 0;
+        while (t < 16) {
+            store64(&px + (t * 4) * 8, 40 + (t % 4) * 20);
+            store64(&px + (t * 4 + 1) * 8, 60 + (t / 4) * 20);
+            store64(&px + (t * 4 + 2) * 8, 128);
+            var a = 255;
+            if (m >= 4) { a = 100 + t * 6; }
+            store64(&px + (t * 4 + 3) * 8, a);
+            t = t + 1;
+        }
+        var nrot = 1;
+        if (m == 4) { nrot = 4; }
+        if (m == 5) { nrot = 4; }
+        var rot = 0;
+        while (rot < nrot) {
+            var nisel = 1;
+            if (m == 4) { nisel = 2; }
+            var isel = 0;
+            while (isel < nisel) {
+                var e = _bc7_encode_mode(&px, m, 0, rot, isel, &out);
+                if (e > worst) { worst = e; }
+                isel = isel + 1;
+            }
+            rot = rot + 1;
+        }
+        m = m + 1;
+    }
+    assert_eq(worst <= 16 * 4 * 900, 1, "every mode and rotation fits a smooth block (error <= 57600)");
+    return 0;
+}
+
+# The quality bar's images (64 x 64 RGBA8), made here so the bar does not depend on files.
+fn _img_put(img, w, x, y, r, g, b, a): i64 {
+    store32(img + (y * w + x) * 4, r | (g << 8) | (b << 16) | (a << 24));
+    return 0;
+}
+fn _img_make(kind, img, w, h): i64 {
+    g_rng = 12345 + kind;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            if (kind == 0) { _img_put(img, w, x, y, (x * 4) & 0xFF, (y * 4) & 0xFF, ((x + y) * 2) & 0xFF, 255); }
+            if (kind == 1) { _img_put(img, w, x, y, _rng_byte(), _rng_byte(), _rng_byte(), 255); }
+            if (kind == 2) {
+                var cell = (x / 3) * 7 + (y / 3) * 13;
+                _img_put(img, w, x, y, (cell * 37) & 0xFF, (cell * 91) & 0xFF, (cell * 53 + 40) & 0xFF, 255);
+            }
+            if (kind == 3) { _img_put(img, w, x, y, (x * 4) & 0xFF, 128, (y * 4) & 0xFF, ((x + y) * 2) & 0xFF); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (kind == 4) {
+        # a 5 x 5 box blur of RGB noise: smooth, uncorrelated detail, like a photograph's
+        var nz = alloc(w * h * 4);
+        var i = 0;
+        while (i < w * h * 4) { store8(nz + i, _rng_byte()); i = i + 1; }
+        var y2 = 0;
+        while (y2 < h) {
+            var x2 = 0;
+            while (x2 < w) {
+                var c = 0;
+                while (c < 3) {
+                    var s = 0;
+                    var dy = 0 - 2;
+                    while (dy <= 2) {
+                        var dx = 0 - 2;
+                        while (dx <= 2) {
+                            s = s + (load8(nz + (((y2 + dy + h) % h) * w + ((x2 + dx + w) % w)) * 4 + c) & 0xFF);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    store8(img + (y2 * w + x2) * 4 + c, s / 25);
+                    c = c + 1;
+                }
+                store8(img + (y2 * w + x2) * 4 + 3, 255);
+                x2 = x2 + 1;
+            }
+            y2 = y2 + 1;
+        }
+    }
+    return 0;
+}
+
+# Squared RGBA error of encode -> decode, or -1 when either fails.
+fn _bc7_round_trip_se(img, w, h): i64 {
+    var size = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
+    var blocks = alloc(size);
+    if (mabda_bc7_encode(img, w, h, w * 4, blocks, size) != size) { return 0 - 1; }
+    var dec = alloc(w * h * 4);
+    if (mabda_bc7_decode(blocks, size, w, h, dec, w * 4) != 0) { return 0 - 1; }
+    var se = 0;
+    var i = 0;
+    while (i < w * h * 4) {
+        var d = (load8(img + i) & 0xFF) - (load8(dec + i) & 0xFF);
+        se = se + d * d;
+        i = i + 1;
+    }
+    return se;
+}
+
+# The quality bar (4.5.0): each image's total squared RGBA error after encode -> decode, at
+# most 1% above the encoder's first measured value, so later speed work cannot trade quality
+# away silently. PSNR at the measurement (64 x 64; RGB, the alpha gradient RGBA): gradient
+# 45.49 dB, noise 17.95 dB, cells exact, alpha gradient 45.89 dB, blurred noise 37.08 dB,
+# load_test_64.png 54.15 dB.
+fn test_bc7_quality_bar() {
+    var w = 64;
+    var h = 64;
+    var img = alloc(w * h * 4);
+    _img_make(0, img, w, h);
+    assert_eq(_bc7_round_trip_se(img, w, h) <= 22810, 1, "gradient: squared error <= 22810 (22584 measured)");
+    _img_make(1, img, w, h);
+    assert_eq(_bc7_round_trip_se(img, w, h) <= 12926000, 1, "noise: <= 12926000 (12798079)");
+    _img_make(2, img, w, h);
+    assert_eq(_bc7_round_trip_se(img, w, h), 0, "3-pixel cells: exact");
+    _img_make(3, img, w, h);
+    assert_eq(_bc7_round_trip_se(img, w, h) <= 27740, 1, "alpha gradient: <= 27740 (27462)");
+    _img_make(4, img, w, h);
+    assert_eq(_bc7_round_trip_se(img, w, h) <= 157990, 1, "blurred noise: <= 157990 (156420)");
+    var png = alloc(16384);
+    var n = file_read_all("tests/assets/load_test_64.png", png, 16384);
+    assert_eq(n > 0, 1, "load_test_64.png read");
+    var pw = 0;
+    var ph = 0;
+    var pix = chitra_png_decode_rgba8(png, n, &pw, &ph);
+    assert_nonnull(pix, "  and decoded");
+    assert_eq(_bc7_round_trip_se(pix, pw, ph) <= 3103, 1, "load_test_64.png: <= 3103 (3072)");
+    return 0;
+}
+
+# The encoder is deterministic: the same image encodes to the same bytes.
+fn test_bc7_encode_deterministic() {
+    var w = 32;
+    var h = 32;
+    var img = alloc(w * h * 4);
+    _img_make(4, img, w, h);
+    var size = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
+    var a = alloc(size);
+    var b = alloc(size);
+    mabda_bc7_encode(img, w, h, w * 4, a, size);
+    mabda_bc7_encode(img, w, h, w * 4, b, size);
+    assert_eq(_fnv_bytes(0xCBF29CE484222325, a, size), _fnv_bytes(0xCBF29CE484222325, b, size),
+      "two encodes of one image are byte-identical");
+    return 0;
+}
+
+# The arguments, and images whose size is not a multiple of 4 (the edge texels repeat into the
+# partial blocks, and only the image's own texels are written back).
+fn test_bc7_api() {
+    var img = alloc(64 * 64 * 4);
+    var dst = alloc(4096);
+    _img_make(0, img, 64, 64);
+    assert_eq(mabda_bc7_encode(img, 0, 4, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION, "width 0");
+    assert_eq(mabda_bc7_encode(img, 4, 8193, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION, "height past 8192");
+    assert_eq(mabda_bc7_encode(0, 4, 4, 16, dst, 4096), 0 - GPU_ERR_BUFFER, "no src");
+    assert_eq(mabda_bc7_encode(img, 4, 4, 16, 0, 4096), 0 - GPU_ERR_BUFFER, "no dst");
+    assert_eq(mabda_bc7_encode(img, 8, 4, 31, dst, 4096), 0 - GPU_ERR_BUFFER, "a pitch short of width * 4");
+    assert_eq(mabda_bc7_encode(img, 8, 8, 32, dst, 63), 0 - GPU_ERR_BUFFER, "a dst short of 4 blocks");
+    assert_eq(mabda_bc7_encode(img, 8, 8, 32, dst, 64), 64, "8 x 8: 4 blocks, 64 bytes");
+    assert_eq(mabda_bc7_decode(dst, 63, 8, 8, img, 32), 0 - GPU_ERR_BUFFER, "decode: a short src");
+    assert_eq(mabda_bc7_decode(dst, 64, 8, 8, img, 31), 0 - GPU_ERR_BUFFER, "decode: a short pitch");
+    # odd sizes, from a pitch wider than the image
+    var sizes[48];
+    store64(&sizes, 1);
+    store64(&sizes + 8, 1);
+    store64(&sizes + 16, 5);
+    store64(&sizes + 24, 3);
+    store64(&sizes + 32, 7);
+    store64(&sizes + 40, 9);
+    var src = alloc(64 * 64 * 4);
+    _img_make(2, src, 64, 64);
+    var k = 0;
+    while (k < 3) {
+        var w = load64(&sizes + k * 16);
+        var h = load64(&sizes + k * 16 + 8);
+        var need = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
+        assert_eq(mabda_bc7_encode(src, w, h, 256, dst, 4096), need, "an odd size encodes its blocks");
+        var out = alloc(64 * 64 * 4);
+        memset(out, 0xEE, 64 * 64 * 4);
+        assert_eq(mabda_bc7_decode(dst, need, w, h, out, 256), 0, "  and decodes");
+        var se = 0;
+        var outside = 0;
+        var y = 0;
+        while (y < 12) {
+            var x = 0;
+            while (x < 12) {
+                var o = load32(out + y * 256 + x * 4);
+                if (x < w) {
+                    if (y < h) {
+                        var c = 0;
+                        while (c < 4) {
+                            var d = ((o >> (c * 8)) & 0xFF) - (load8(src + y * 256 + x * 4 + c) & 0xFF);
+                            se = se + d * d;
+                            c = c + 1;
+                        }
+                    }
+                }
+                if (x >= w) { if (o != 0xEEEEEEEE) { outside = outside + 1; } }
+                if (y >= h) { if (o != 0xEEEEEEEE) { outside = outside + 1; } }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        assert_eq(se, 0, "  exactly (3-pixel cells)");
+        assert_eq(outside, 0, "  writing nothing outside the image");
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    test_bc7_decode_matches_the_hardware_verified_output();
+    test_bc7_decode_mode6_by_hand();
+    test_bc7_encode_solid_blocks_exact();
+    test_bc7_every_mode_packs_128_bits();
+    test_bc7_every_mode_fits_a_smooth_block();
+    test_bc7_quality_bar();
+    test_bc7_encode_deterministic();
+    test_bc7_api();
+    return assert_summary();
+}

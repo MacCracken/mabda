@@ -16,8 +16,9 @@ for the immediate forward pointer.
 ## [4.5.0] — in progress (VERSION still reads 4.4.0)
 
 **Textures + language** ([roadmap](docs/development/roadmap.md#v450--textures--language)), phase 4
-of the 2026-11 plan. Landed so far: KTX2 Zstandard / ZLIB supercompression decode, the first half
-of texture encoding (below). The other items are open and tracked in the roadmap.
+of the 2026-11 plan. Landed so far: texture encoding, both halves. KTX2 Zstandard / ZLIB
+supercompression decodes, and there is a BC7 CPU reference encoder (and decoder), both below. The
+other items are open and tracked in the roadmap.
 
 ### Added — KTX2 supercompression: Zstandard and ZLIB
 - **`gpu_texture_load_ktx2` loads KTX2 files whose levels are supercompressed** with
@@ -66,11 +67,62 @@ of texture encoding (below). The other items are open and tracked in the roadmap
   (`build/logs/ktx2-sc-load-e2e-*.log`). It covers 21,504-byte mip chains from zstd and from
   zlib, a 4-layer array and a 6-face cube, all exact.
 
+### Added — BC7: a CPU reference encoder, and its decoder
+The format was chosen by the maintainer (2026-11-17), since no consumer had named one. The new
+module is `src/texture_bc7.cyr`.
+- **`mabda_bc7_encode(src, width, height, src_pitch, dst, dst_len)`** (`@public`, CPU only)
+  encodes RGBA8 to BC7. It writes `mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h)` bytes,
+  blocks in row-major order, and a partial edge block repeats the edge texels. It returns the
+  bytes written, or a negative error: `GPU_ERR_TEXTURE_DIMENSION` for a size outside 1..8192, and
+  `GPU_ERR_BUFFER` for a null buffer, a short pitch or a short `dst`.
+- **`mabda_bc7_decode(src, src_len, width, height, dst, dst_pitch)`** (`@public`) is the
+  inverse. It writes only the image's own texels.
+- **The encoder** is deterministic and integer-only.
+  - Per block it keeps the lowest squared RGBA error among: mode 6 always; for opaque blocks,
+    modes 5 and 4 and the best-ranked partitions of modes 1, 3, 0 and 2; for blocks with alpha,
+    modes 4 and 5 under every rotation and mode 7's best partitions.
+  - A subset is fitted along its principal axis, then: quantized under every p-bit choice;
+    refitted twice by least squares; and, for the winning candidate, given a ±1 local search on
+    each endpoint code.
+  - Every candidate is packed and decoded, so it is scored on its real error.
+  - Speed: about 0.8 ms a block, so 0.2 s for 64×64 and roughly 50 s a megapixel. It is a
+    reference, and the issue's GPU encoder is the speed path.
+- **The tables** (partitions, anchors) are the D3D11 BC7 tables, taken as data from Microsoft's
+  DirectXTex (MIT). Nothing of it was run.
+- **Verified against hardware** (`make test-native-bc7-e2e`, `build/logs/bc7-e2e-*.log`). BC7
+  decoding is exact integer math, so the Cezanne's texture unit is an independent decoder:
+  - A: 256 random blocks, 32 of each mode with every field random, sampled with point filtering
+    — all 4,096 texels equal the CPU decode. Mutation-checked: one wrong 3-bit weight gives
+    about 55 mismatches in each of modes 0, 1 and 4, and none elsewhere.
+  - B: the encoder's output for a 64×64 image of four quadrants (gradient, noise, alpha
+    gradient, colour cells) decodes on the hardware exactly as on the CPU.
+- **The quality bar** (`tests/tcyr/texture_bc7.tcyr`). Each image's squared error after encode →
+  decode may be at most 1% above the first measurement, so later speed work cannot trade quality
+  away unnoticed:
+
+  | 64×64 image | PSNR |
+  |---|---|
+  | RGB gradient | 45.49 dB |
+  | RGB noise | 17.95 dB |
+  | 3-pixel colour cells | exact |
+  | alpha gradient (RGBA) | 45.89 dB |
+  | blurred noise | 37.08 dB |
+  | `tests/assets/load_test_64.png` | 54.15 dB |
+- **Tests** (`texture_bc7.tcyr`, 56 assertions, a new suite):
+  - the decoder is pinned to the hardware-verified output of the gate's 256 random blocks, plus
+    a hand-checked mode 6 block and the reserved mode 8;
+  - solid blocks encode exactly;
+  - all 33 mode / partition / rotation / index-selection configurations tried pack 128 bits and
+    decode in their own mode, and each fits a smooth block well;
+  - the encoder is deterministic;
+  - the argument checks hold, and odd image sizes round-trip without writing outside the image.
+- The bundle's Requires block is unchanged, and the example consumer's object grows by 43 KB.
+
 ### Verified (so far)
-- CPU: 29 suites, **8004 assertions**, 0 failed (4.4.0: 7932). Every CI gate passes locally
-  (`build/logs/ktx2-sc-ci-gates-*.log`), and `cyrius distlib` is idempotent.
-- Cezanne: `make test-native-all` gives 76 passed, 0 failed, 3 skipped for DRM master, of 79,
-  the new KTX2 gate included, with no GPU reset (`build/logs/ktx2-sc-native-all-*.log`).
+- CPU: 30 suites, **8060 assertions**, 0 failed (4.4.0: 7932). Every CI gate passes locally
+  (`build/logs/bc7-ci-gates-*.log`), and `cyrius distlib` is idempotent.
+- Cezanne: `make test-native-all` gives 77 passed, 0 failed, 3 skipped for DRM master, of 80,
+  both new gates included, with no GPU reset (`build/logs/bc7-native-all-*.log`).
 
 ## [4.4.0] — 2026-11-17
 

@@ -98,8 +98,10 @@ roadmap.
   placed in mabda by the user). ✅ First **KTX2 supercompression decode** — schemes 2 (zstd) and
   3 (zlib), through sankoch's codecs: done (CHANGELOG [4.5.0]). The consumer registers the
   decoders, so mabda's bundle never names sankoch; the result is byte-exact in the GPU BO on the
-  Cezanne. Then **a CPU
-  reference block encoder** for the
+  Cezanne. ✅ Then **a CPU
+  reference block encoder**: BC7, chosen by the maintainer (2026-11-17), done (CHANGELOG
+  [4.5.0]). It is checked against the Cezanne's texture unit on every mode, with a PSNR bar
+  recorded in `tests/tcyr/texture_bc7.tcyr`. The item as filed was for the
   first format a consumer names (BC1 / BC3 / BC4 / BC5 / BC7, or ASTC 4×4 / 6×6 / 8×8), validated
   against an independent decoder and mabda's upload-and-sample path, with a PSNR bar; if no
   consumer has named one by then, ask the user.

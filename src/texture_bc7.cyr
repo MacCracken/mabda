@@ -1,0 +1,1203 @@
+# @internal — BC7 (BPTC UNORM): block decode and a CPU reference encoder (4.5.0)
+# src/texture_bc7.cyr
+#
+# BC7 packs a 4x4 RGBA8 block into 128 bits, read LSB first (bit 0 is byte 0's bit 0). A block
+# opens with its mode: m zero bits, then a one (byte 0 == 0 is the reserved mode 8, which
+# decodes to all zeros). Then, in order: the partition, the rotation and the index selector
+# where the mode has them, every endpoint's R, then G, then B, then A, the p-bits, and the
+# indices. A subset's anchor texel stores its index one bit short (its top bit is 0).
+#
+#   mode  subsets  partition  rot/isel  colour  alpha  p-bits           indices
+#     0      3       4 bits      -        4       -    6 (per endpoint)  3
+#     1      2       6 bits      -        6       -    2 (per subset)    3
+#     2      3       6 bits      -        5       -    -                 2
+#     3      2       6 bits      -        7       -    4 (per endpoint)  2
+#     4      1        -        2 / 1      5       6    -                 2 and 3 (isel swaps)
+#     5      1        -        2 / -      7       8    -                 2 colour, 2 alpha
+#     6      1        -          -        7       7    2 (per endpoint)  4
+#     7      2       6 bits      -        5       5    4 (per endpoint)  2
+#
+# An n-bit endpoint (p-bit included) widens to 8 bits by bit replication; a texel is
+# ((64 - w) * e0 + w * e1 + 32) >> 6 per channel, w from the index's weight table. A rotation
+# swaps alpha with R (1), G (2) or B (3) after decoding.
+#
+# The partition and anchor tables are the D3D11 BC7 tables, taken as data from Microsoft's
+# DirectXTex (BC6HBC7.cpp, g_aPartitionTable / g_aFixUp; MIT). Every entry is checked by
+# programs/native_bc7_e2e.cyr, which compares this decoder with the Cezanne's hardware sampler
+# on random blocks of every mode.
+
+# The tables, built at first use (_bc7_init): u64 entries, at entry index
+#   0..63 P2 (a 2-subset partition's 16 subset bits)    64..127 P3 (16 x 2 bits)
+#   128..191 the 2-subset anchors   192..255 / 256..319 the 3-subset anchors of subsets 1 / 2
+#   320..323 / 324..331 / 332..347 the 2- / 3- / 4-bit index weights
+var _bc7_tab = 0;
+var _BC7_TAB_ENTRIES = 348;
+
+fn _bc7_set8(t, i, a, b, c, d, e, f, g, h): i64 {
+    store64(t + i * 8, a);
+    store64(t + i * 8 + 8, b);
+    store64(t + i * 8 + 16, c);
+    store64(t + i * 8 + 24, d);
+    store64(t + i * 8 + 32, e);
+    store64(t + i * 8 + 40, f);
+    store64(t + i * 8 + 48, g);
+    store64(t + i * 8 + 56, h);
+    return 0;
+}
+
+fn _bc7_init(): i64 {
+    if (_bc7_tab != 0) { return 0; }
+    var t = alloc(_BC7_TAB_ENTRIES * 8);
+    if (t == 0) { return 0 - 1; }
+    _bc7_set8(t, 0, 0xCCCC, 0x8888, 0xEEEE, 0xECC8, 0xC880, 0xFEEC, 0xFEC8, 0xEC80);
+    _bc7_set8(t, 8, 0xC800, 0xFFEC, 0xFE80, 0xE800, 0xFFE8, 0xFF00, 0xFFF0, 0xF000);
+    _bc7_set8(t, 16, 0xF710, 0x008E, 0x7100, 0x08CE, 0x008C, 0x7310, 0x3100, 0x8CCE);
+    _bc7_set8(t, 24, 0x088C, 0x3110, 0x6666, 0x366C, 0x17E8, 0x0FF0, 0x718E, 0x399C);
+    _bc7_set8(t, 32, 0xAAAA, 0xF0F0, 0x5A5A, 0x33CC, 0x3C3C, 0x55AA, 0x9696, 0xA55A);
+    _bc7_set8(t, 40, 0x73CE, 0x13C8, 0x324C, 0x3BDC, 0x6996, 0xC33C, 0x9966, 0x0660);
+    _bc7_set8(t, 48, 0x0272, 0x04E4, 0x4E40, 0x2720, 0xC936, 0x936C, 0x39C6, 0x639C);
+    _bc7_set8(t, 56, 0x9336, 0x9CC6, 0x817E, 0xE718, 0xCCF0, 0x0FCC, 0x7744, 0xEE22);
+    _bc7_set8(t, 64, 0xAA685050, 0x6A5A5040, 0x5A5A4200, 0x5450A0A8, 0xA5A50000, 0xA0A05050, 0x5555A0A0, 0x5A5A5050);
+    _bc7_set8(t, 72, 0xAA550000, 0xAA555500, 0xAAAA5500, 0x90909090, 0x94949494, 0xA4A4A4A4, 0xA9A59450, 0x2A0A4250);
+    _bc7_set8(t, 80, 0xA5945040, 0x0A425054, 0xA5A5A500, 0x55A0A0A0, 0xA8A85454, 0x6A6A4040, 0xA4A45000, 0x1A1A0500);
+    _bc7_set8(t, 88, 0x0050A4A4, 0xAAA59090, 0x14696914, 0x69691400, 0xA08585A0, 0xAA821414, 0x50A4A450, 0x6A5A0200);
+    _bc7_set8(t, 96, 0xA9A58000, 0x5090A0A8, 0xA8A09050, 0x24242424, 0x00AA5500, 0x24924924, 0x24499224, 0x50A50A50);
+    _bc7_set8(t, 104, 0x500AA550, 0xAAAA4444, 0x66660000, 0xA5A0A5A0, 0x50A050A0, 0x69286928, 0x44AAAA44, 0x66666600);
+    _bc7_set8(t, 112, 0xAA444444, 0x54A854A8, 0x95809580, 0x96969600, 0xA85454A8, 0x80959580, 0xAA141414, 0x96960000);
+    _bc7_set8(t, 120, 0xAAAA1414, 0xA05050A0, 0xA0A5A5A0, 0x96000000, 0x40804080, 0xA9A8A9A8, 0xAAAAAA44, 0x2A4A5254);
+    _bc7_set8(t, 128, 15, 15, 15, 15, 15, 15, 15, 15);
+    _bc7_set8(t, 136, 15, 15, 15, 15, 15, 15, 15, 15);
+    _bc7_set8(t, 144, 15, 2, 8, 2, 2, 8, 8, 15);
+    _bc7_set8(t, 152, 2, 8, 2, 2, 8, 8, 2, 2);
+    _bc7_set8(t, 160, 15, 15, 6, 8, 2, 8, 15, 15);
+    _bc7_set8(t, 168, 2, 8, 2, 2, 2, 15, 15, 6);
+    _bc7_set8(t, 176, 6, 2, 6, 8, 15, 15, 2, 2);
+    _bc7_set8(t, 184, 15, 15, 15, 15, 15, 2, 2, 15);
+    _bc7_set8(t, 192, 3, 3, 15, 15, 8, 3, 15, 15);
+    _bc7_set8(t, 200, 8, 8, 6, 6, 6, 5, 3, 3);
+    _bc7_set8(t, 208, 3, 3, 8, 15, 3, 3, 6, 10);
+    _bc7_set8(t, 216, 5, 8, 8, 6, 8, 5, 15, 15);
+    _bc7_set8(t, 224, 8, 15, 3, 5, 6, 10, 8, 15);
+    _bc7_set8(t, 232, 15, 3, 15, 5, 15, 15, 15, 15);
+    _bc7_set8(t, 240, 3, 15, 5, 5, 5, 8, 5, 10);
+    _bc7_set8(t, 248, 5, 10, 8, 13, 15, 12, 3, 3);
+    _bc7_set8(t, 256, 15, 8, 8, 3, 15, 15, 3, 8);
+    _bc7_set8(t, 264, 15, 15, 15, 15, 15, 15, 15, 8);
+    _bc7_set8(t, 272, 15, 8, 15, 3, 15, 8, 15, 8);
+    _bc7_set8(t, 280, 3, 15, 6, 10, 15, 15, 10, 8);
+    _bc7_set8(t, 288, 15, 3, 15, 10, 10, 8, 9, 10);
+    _bc7_set8(t, 296, 6, 15, 8, 15, 3, 6, 6, 8);
+    _bc7_set8(t, 304, 15, 3, 15, 15, 15, 15, 15, 15);
+    _bc7_set8(t, 312, 15, 15, 15, 15, 3, 15, 15, 8);
+    _bc7_set8(t, 320, 0, 21, 43, 64, 0, 9, 18, 27);
+    _bc7_set8(t, 328, 37, 46, 55, 64, 0, 4, 9, 13);
+    _bc7_set8(t, 336, 17, 21, 26, 30, 34, 38, 43, 47);
+    store64(t + 344 * 8, 51);
+    store64(t + 345 * 8, 55);
+    store64(t + 346 * 8, 60);
+    store64(t + 347 * 8, 64);
+    _bc7_tab = t;
+    return 0;
+}
+
+# The subset of texel i (0..15) in partition `part` of a `nsub`-subset mode.
+fn _bc7_subset(nsub, part, i): i64 {
+    if (nsub == 2) { return (load64(_bc7_tab + part * 8) >> i) & 1; }
+    if (nsub == 3) { return (load64(_bc7_tab + (64 + part) * 8) >> (i * 2)) & 3; }
+    return 0;
+}
+
+# The anchor texel of subset `sub` (subset 0's is texel 0).
+fn _bc7_anchor(nsub, part, sub): i64 {
+    if (sub == 0) { return 0; }
+    if (nsub == 2) { return load64(_bc7_tab + (128 + part) * 8); }
+    if (sub == 1) { return load64(_bc7_tab + (192 + part) * 8); }
+    return load64(_bc7_tab + (256 + part) * 8);
+}
+
+# The weight (0..64) of index `idx` in a `bits`-bit index.
+fn _bc7_weight(bits, idx): i64 {
+    if (bits == 2) { return load64(_bc7_tab + (320 + idx) * 8); }
+    if (bits == 3) { return load64(_bc7_tab + (324 + idx) * 8); }
+    return load64(_bc7_tab + (332 + idx) * 8);
+}
+
+fn _bc7_interp(e0, e1, w): i64 { return ((64 - w) * e0 + w * e1 + 32) >> 6; }
+
+# An n-bit endpoint value (4 <= n <= 8) widened to 8 bits by bit replication.
+fn _bc7_unq(v, n): i64 {
+    if (n >= 8) { return v & 0xFF; }
+    return ((v << (8 - n)) | (v >> (n + n - 8))) & 0xFF;
+}
+
+# The mode table (see the header).
+fn _bc7_m_nsub(m): i64 {
+    if (m == 0) { return 3; }
+    if (m == 2) { return 3; }
+    if (m == 1) { return 2; }
+    if (m == 3) { return 2; }
+    if (m == 7) { return 2; }
+    return 1;
+}
+fn _bc7_m_partbits(m): i64 {
+    if (m == 0) { return 4; }
+    if (m == 4) { return 0; }
+    if (m == 5) { return 0; }
+    if (m == 6) { return 0; }
+    return 6;
+}
+fn _bc7_m_cbits(m): i64 {
+    if (m == 0) { return 4; }
+    if (m == 1) { return 6; }
+    if (m == 2) { return 5; }
+    if (m == 4) { return 5; }
+    if (m == 7) { return 5; }
+    return 7;
+}
+fn _bc7_m_abits(m): i64 {
+    if (m == 4) { return 6; }
+    if (m == 5) { return 8; }
+    if (m == 6) { return 7; }
+    if (m == 7) { return 5; }
+    return 0;
+}
+# p-bits: 0 none, 1 one per endpoint, 2 one per subset (shared by its two endpoints).
+fn _bc7_m_pkind(m): i64 {
+    if (m == 1) { return 2; }
+    if (m == 2) { return 0; }
+    if (m == 4) { return 0; }
+    if (m == 5) { return 0; }
+    return 1;
+}
+fn _bc7_m_ibits(m): i64 {
+    if (m == 0) { return 3; }
+    if (m == 1) { return 3; }
+    if (m == 6) { return 4; }
+    return 2;
+}
+fn _bc7_m_ibits2(m): i64 {
+    if (m == 4) { return 3; }
+    if (m == 5) { return 2; }
+    return 0;
+}
+
+# Bit I/O over a 16-byte block, LSB first. `pos` is a cursor cell (an i64 the caller owns).
+fn _bc7_get(blk, pos, n): i64 {
+    var v = 0;
+    var p = load64(pos);
+    var k = 0;
+    while (k < n) {
+        v = v | (((load8(blk + ((p + k) >> 3)) >> ((p + k) & 7)) & 1) << k);
+        k = k + 1;
+    }
+    store64(pos, p + n);
+    return v;
+}
+fn _bc7_put(blk, pos, v, n): i64 {
+    var p = load64(pos);
+    var k = 0;
+    while (k < n) {
+        var byte = blk + ((p + k) >> 3);
+        var bit = (p + k) & 7;
+        var cur = load8(byte) & 0xFF;
+        if (((v >> k) & 1) == 1) { cur = cur | (1 << bit); } else { cur = cur & (0xFF - (1 << bit)); }
+        store8(byte, cur);
+        k = k + 1;
+    }
+    store64(pos, p + n);
+    return 0;
+}
+
+# Decode one BC7 block into 16 texels at `out`, each a u32 R | G << 8 | B << 16 | A << 24, in
+# row-major order (texel i is x = i % 4, y = i / 4). Returns the mode (8: the reserved mode,
+# all zeros). Needs _bc7_init.
+fn _bc7_decode_block(blk, out): i64 {
+    var m = 0;
+    while (m < 8) {
+        if (((load8(blk + (m >> 3)) >> (m & 7)) & 1) == 1) { break; }
+        m = m + 1;
+    }
+    if (m == 8) {
+        memset(out, 0, 64);
+        return 8;
+    }
+    var pos[8];
+    store64(&pos, m + 1);
+    var nsub = _bc7_m_nsub(m);
+    var part = _bc7_get(blk, &pos, _bc7_m_partbits(m));
+    var rot = 0;
+    var isel = 0;
+    if (m == 4) { rot = _bc7_get(blk, &pos, 2); isel = _bc7_get(blk, &pos, 1); }
+    if (m == 5) { rot = _bc7_get(blk, &pos, 2); }
+    var cb = _bc7_m_cbits(m);
+    var ab = _bc7_m_abits(m);
+    var ne = nsub * 2;
+    var ep[192];                       # 6 endpoints x 4 channels x i64
+    var c = 0;
+    while (c < 3) {
+        var e = 0;
+        while (e < ne) {
+            store64(&ep + (e * 4 + c) * 8, _bc7_get(blk, &pos, cb));
+            e = e + 1;
+        }
+        c = c + 1;
+    }
+    var ea = 0;
+    while (ea < ne) {
+        var av = 255;
+        if (ab > 0) { av = _bc7_get(blk, &pos, ab); }
+        store64(&ep + (ea * 4 + 3) * 8, av);
+        ea = ea + 1;
+    }
+    # p-bits widen every channel the mode stores by one bit
+    var pk = _bc7_m_pkind(m);
+    var pb[48];
+    memset(&pb, 0, 48);
+    if (pk == 1) {
+        var i1 = 0;
+        while (i1 < ne) { store64(&pb + i1 * 8, _bc7_get(blk, &pos, 1)); i1 = i1 + 1; }
+    }
+    if (pk == 2) {
+        var s2 = 0;
+        while (s2 < nsub) {
+            var sp = _bc7_get(blk, &pos, 1);
+            store64(&pb + (s2 * 2) * 8, sp);
+            store64(&pb + (s2 * 2 + 1) * 8, sp);
+            s2 = s2 + 1;
+        }
+    }
+    var e2 = 0;
+    while (e2 < ne) {
+        var c2 = 0;
+        while (c2 < 4) {
+            var bits = cb;
+            if (c2 == 3) { bits = ab; }
+            var v = load64(&ep + (e2 * 4 + c2) * 8);
+            if (bits > 0) {
+                if (pk != 0) {
+                    v = (v << 1) | load64(&pb + e2 * 8);
+                    bits = bits + 1;
+                }
+                v = _bc7_unq(v, bits);
+            }
+            store64(&ep + (e2 * 4 + c2) * 8, v);
+            c2 = c2 + 1;
+        }
+        e2 = e2 + 1;
+    }
+    # indices: the primary set, then (modes 4 / 5) the secondary
+    var ib = _bc7_m_ibits(m);
+    var ib2 = _bc7_m_ibits2(m);
+    var idx[128];
+    var idx2[128];
+    var t = 0;
+    while (t < 16) {
+        var sub = _bc7_subset(nsub, part, t);
+        var nb = ib;
+        if (t == _bc7_anchor(nsub, part, sub)) { nb = nb - 1; }
+        store64(&idx + t * 8, _bc7_get(blk, &pos, nb));
+        t = t + 1;
+    }
+    if (ib2 > 0) {
+        var t2 = 0;
+        while (t2 < 16) {
+            var nb2 = ib2;
+            if (t2 == 0) { nb2 = nb2 - 1; }
+            store64(&idx2 + t2 * 8, _bc7_get(blk, &pos, nb2));
+            t2 = t2 + 1;
+        }
+    }
+    var x = 0;
+    while (x < 16) {
+        var s = _bc7_subset(nsub, part, x);
+        var e0 = &ep + (s * 2) * 32;
+        var e1 = &ep + (s * 2 + 1) * 32;
+        var cw = _bc7_weight(ib, load64(&idx + x * 8));
+        var aw = cw;
+        if (m == 4) {
+            if (isel == 0) { aw = _bc7_weight(3, load64(&idx2 + x * 8)); }
+            if (isel == 1) {
+                aw = cw;
+                cw = _bc7_weight(3, load64(&idx2 + x * 8));
+            }
+        }
+        if (m == 5) { aw = _bc7_weight(2, load64(&idx2 + x * 8)); }
+        var r = _bc7_interp(load64(e0), load64(e1), cw);
+        var g = _bc7_interp(load64(e0 + 8), load64(e1 + 8), cw);
+        var b = _bc7_interp(load64(e0 + 16), load64(e1 + 16), cw);
+        var a = _bc7_interp(load64(e0 + 24), load64(e1 + 24), aw);
+        var tmp = a;
+        if (rot == 1) { a = r; r = tmp; }
+        if (rot == 2) { a = g; g = tmp; }
+        if (rot == 3) { a = b; b = tmp; }
+        store32(out + x * 4, r | (g << 8) | (b << 16) | (a << 24));
+        x = x + 1;
+    }
+    return m;
+}
+
+# ================================================================
+# The CPU reference encoder (4.5.0)
+# ================================================================
+# Deterministic and integer-only. Per block it tries, and keeps the lowest squared RGBA error:
+#   every block:    mode 6 (one subset, RGBA, 4-bit indices);
+#   opaque blocks:  modes 5 and 4 (rotation 0; mode 4 with both index selections), the 4 best
+#                   partitions of modes 1 and 3, and the 2 best of modes 0 and 2;
+#   alpha blocks:   modes 5 and 4 under every rotation, and the 4 best partitions of mode 7.
+# A partition's rank is its line-fit residual (each subset's variance off its principal axis).
+# A subset is fitted along its principal axis (power iteration on the covariance), quantized
+# under every p-bit choice, given each texel's nearest palette index, then refitted twice by
+# least squares. Every candidate is packed and decoded with _bc7_decode_block, and the error is
+# measured on what the decoder returns, so it is the real one.
+
+var _bc7_best = 0;        # the block search's running best error
+var _bc7_best_cfg = 0;    # and its configuration: m | part << 8 | rot << 16 | isel << 24
+var _bc7_polishing = 0;   # 1 while the winner is re-fitted with _bc7_polish (_bc7_fit)
+
+# a / b rounded half away from zero (b > 0).
+fn _bc7_rdiv(a, b): i64 {
+    if (a >= 0) { return (a + b / 2) / b; }
+    return 0 - ((0 - a + b / 2) / b);
+}
+
+fn _bc7_clamp8(v): i64 {
+    if (v < 0) { return 0; }
+    if (v > 255) { return 255; }
+    return v;
+}
+
+# The code (0 .. 2^bits - 1) whose decoded value is nearest `v` (0..255). With a p-bit (has_p)
+# the endpoint is (code << 1) | p over bits + 1 bits.
+fn _bc7_quant(v, bits, p, has_p): i64 {
+    var nb = bits;
+    if (has_p == 1) { nb = bits + 1; }
+    var top = (1 << bits) - 1;
+    var est = (v * ((1 << nb) - 1) + 127) / 255;
+    if (has_p == 1) { est = (est - p) / 2; }
+    var best = 0;
+    var berr = 1 << 30;
+    var q = est - 1;
+    while (q <= est + 1) {
+        if (q >= 0) {
+            if (q <= top) {
+                var t = q;
+                if (has_p == 1) { t = (q << 1) | p; }
+                var d = _bc7_unq(t, nb) - v;
+                if (d < 0) { d = 0 - d; }
+                if (d < berr) { berr = d; best = q; }
+            }
+        }
+        q = q + 1;
+    }
+    return best;
+}
+
+# The decoded 8-bit value of an endpoint code.
+fn _bc7_dq(code, bits, p, has_p): i64 {
+    if (has_p == 1) { return _bc7_unq((code << 1) | p, bits + 1); }
+    return _bc7_unq(code, bits);
+}
+
+# Mean (x16) and covariance (of the x16 deviations) of the texels of `mask`, over the `nch`
+# channels chs[] picks from px (16 texels x 4 channels, i64). Returns the texel count.
+fn _bc7_stats(px, mask, chs, nch, mean, cov): i64 {
+    var sum[32];
+    memset(&sum, 0, 32);
+    memset(cov, 0, 128);
+    var n = 0;
+    var t = 0;
+    while (t < 16) {
+        if (((mask >> t) & 1) == 1) {
+            n = n + 1;
+            var c = 0;
+            while (c < nch) {
+                store64(&sum + c * 8, load64(&sum + c * 8) + load64(px + (t * 4 + load64(chs + c * 8)) * 8));
+                c = c + 1;
+            }
+        }
+        t = t + 1;
+    }
+    if (n == 0) { return 0; }
+    var c1 = 0;
+    while (c1 < nch) {
+        store64(mean + c1 * 8, _bc7_rdiv(load64(&sum + c1 * 8) * 16, n));
+        c1 = c1 + 1;
+    }
+    var t2 = 0;
+    while (t2 < 16) {
+        if (((mask >> t2) & 1) == 1) {
+            var a = 0;
+            while (a < nch) {
+                var da = load64(px + (t2 * 4 + load64(chs + a * 8)) * 8) * 16 - load64(mean + a * 8);
+                var b = 0;
+                while (b < nch) {
+                    var db = load64(px + (t2 * 4 + load64(chs + b * 8)) * 8) * 16 - load64(mean + b * 8);
+                    store64(cov + (a * 4 + b) * 8, load64(cov + (a * 4 + b) * 8) + da * db);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+        }
+        t2 = t2 + 1;
+    }
+    return n;
+}
+
+# The principal axis of `cov` (nch x nch, rows of 4) by power iteration, into v (nch i64,
+# largest component scaled to 1024). Starts from the column of the largest variance, which is
+# never orthogonal to the axis. Returns 0, or -1 when every variance is 0 (v is then the unit
+# x-axis).
+fn _bc7_axis(cov, nch, v, iters): i64 {
+    var j = 0;
+    var big = 0;
+    var c = 0;
+    while (c < nch) {
+        if (load64(cov + (c * 4 + c) * 8) > big) { big = load64(cov + (c * 4 + c) * 8); j = c; }
+        c = c + 1;
+    }
+    var c0 = 0;
+    while (c0 < nch) {
+        store64(v + c0 * 8, 0);
+        c0 = c0 + 1;
+    }
+    if (big == 0) { store64(v, 1024); return 0 - 1; }
+    var w[32];
+    var c1 = 0;
+    while (c1 < nch) {
+        store64(&w + c1 * 8, load64(cov + (c1 * 4 + j) * 8));
+        c1 = c1 + 1;
+    }
+    var it = 0;
+    while (it <= iters) {
+        var m = 0;
+        var c2 = 0;
+        while (c2 < nch) {
+            var a = load64(&w + c2 * 8);
+            if (a < 0) { a = 0 - a; }
+            if (a > m) { m = a; }
+            c2 = c2 + 1;
+        }
+        if (m == 0) { break; }
+        var c3 = 0;
+        while (c3 < nch) {
+            store64(v + c3 * 8, _bc7_rdiv(load64(&w + c3 * 8) * 1024, m));
+            c3 = c3 + 1;
+        }
+        if (it == iters) { break; }
+        var r = 0;
+        while (r < nch) {
+            var s = 0;
+            var k = 0;
+            while (k < nch) {
+                s = s + load64(cov + (r * 4 + k) * 8) * load64(v + k * 8);
+                k = k + 1;
+            }
+            store64(&w + r * 8, s);
+            r = r + 1;
+        }
+        it = it + 1;
+    }
+    return 0;
+}
+
+# Give each texel of `mask` its nearest index for decoded endpoints d0 / d1 (nch values each)
+# with `ib`-bit indices, into idx[t]. Returns the squared error over those channels.
+fn _bc7_assign(px, mask, chs, nch, d0, d1, ib, idx): i64 {
+    var n = 1 << ib;
+    var pal[512];
+    var k = 0;
+    while (k < n) {
+        var w = _bc7_weight(ib, k);
+        var c = 0;
+        while (c < nch) {
+            store64(&pal + (k * 4 + c) * 8, _bc7_interp(load64(d0 + c * 8), load64(d1 + c * 8), w));
+            c = c + 1;
+        }
+        k = k + 1;
+    }
+    # the texel's channels are read once, not once per palette entry (the encoder's hot loop)
+    var c0 = load64(chs);
+    var c1 = 0;
+    var c2 = 0;
+    var c3 = 0;
+    if (nch > 1) { c1 = load64(chs + 8); }
+    if (nch > 2) { c2 = load64(chs + 16); }
+    if (nch > 3) { c3 = load64(chs + 24); }
+    var err = 0;
+    var t = 0;
+    while (t < 16) {
+        if (((mask >> t) & 1) == 1) {
+            var tp = px + t * 32;
+            var v0 = load64(tp + c0 * 8);
+            var v1 = load64(tp + c1 * 8);
+            var v2 = load64(tp + c2 * 8);
+            var v3 = load64(tp + c3 * 8);
+            var best = 0;
+            var be = 1 << 40;
+            var k2 = 0;
+            while (k2 < n) {
+                var pp = &pal + k2 * 32;
+                var d = load64(pp) - v0;
+                var e = d * d;
+                if (nch > 1) { d = load64(pp + 8) - v1; e = e + d * d; }
+                if (nch > 2) { d = load64(pp + 16) - v2; e = e + d * d; }
+                if (nch > 3) { d = load64(pp + 24) - v3; e = e + d * d; }
+                if (e < be) { be = e; best = k2; }
+                k2 = k2 + 1;
+            }
+            store64(idx + t * 8, best);
+            err = err + be;
+        }
+        t = t + 1;
+    }
+    return err;
+}
+
+# A fitted subset, `res` (88 bytes): +0 e0 codes[4]  +32 e1 codes[4]  +64 p0  +72 p1  +80 error.
+var _BC7_RES = 88;
+
+# Quantize float-free endpoint targets e0f / e1f (0..255 each) under every p-bit choice of
+# p-bit kind `pk`, assign indices, and keep the best into res / idx if it beats res's error.
+fn _bc7_try_endpoints(px, mask, chs, nch, bits, pk, ib, e0f, e1f, res, idx): i64 {
+    var hp = 0;
+    var ncombo = 1;
+    if (pk == 1) { hp = 1; ncombo = 4; }
+    if (pk == 2) { hp = 1; ncombo = 2; }
+    var q0[32];
+    var q1[32];
+    var d0[32];
+    var d1[32];
+    var tidx[128];
+    var cb = 0;
+    while (cb < ncombo) {
+        var p0 = cb & 1;
+        var p1 = (cb >> 1) & 1;
+        if (pk == 2) { p1 = p0; }
+        var c = 0;
+        while (c < nch) {
+            var a0 = _bc7_quant(load64(e0f + c * 8), bits, p0, hp);
+            var a1 = _bc7_quant(load64(e1f + c * 8), bits, p1, hp);
+            store64(&q0 + c * 8, a0);
+            store64(&q1 + c * 8, a1);
+            store64(&d0 + c * 8, _bc7_dq(a0, bits, p0, hp));
+            store64(&d1 + c * 8, _bc7_dq(a1, bits, p1, hp));
+            c = c + 1;
+        }
+        var err = _bc7_assign(px, mask, chs, nch, &d0, &d1, ib, &tidx);
+        if (err < load64(res + 80)) {
+            memcpy(res, &q0, 32);
+            memcpy(res + 32, &q1, 32);
+            store64(res + 64, p0);
+            store64(res + 72, p1);
+            store64(res + 80, err);
+            var t = 0;
+            while (t < 16) {
+                if (((mask >> t) & 1) == 1) { store64(idx + t * 8, load64(&tidx + t * 8)); }
+                t = t + 1;
+            }
+        }
+        cb = cb + 1;
+    }
+    return 0;
+}
+
+# Fit one subset (`mask`) for `nch` channels chs[] with `bits`-bit endpoints, p-bit kind `pk`
+# and `ib`-bit indices: res (the codes, p-bits and error) and idx[t] for the texels of mask.
+fn _bc7_fit(px, mask, chs, nch, bits, pk, ib, res, idx): i64 {
+    memset(res, 0, _BC7_RES);
+    store64(res + 80, 1 << 60);
+    var mean[32];
+    var cov[128];
+    var n = _bc7_stats(px, mask, chs, nch, &mean, &cov);
+    if (n == 0) { store64(res + 80, 0); return 0; }
+    var v[32];
+    _bc7_axis(&cov, nch, &v, 8);
+    var vv = 0;
+    var c = 0;
+    while (c < nch) {
+        vv = vv + load64(&v + c * 8) * load64(&v + c * 8);
+        c = c + 1;
+    }
+    var tmin = 1 << 60;
+    var tmax = 0 - (1 << 60);
+    var t = 0;
+    while (t < 16) {
+        if (((mask >> t) & 1) == 1) {
+            var p = 0;
+            var c1 = 0;
+            while (c1 < nch) {
+                var d = load64(px + (t * 4 + load64(chs + c1 * 8)) * 8) * 16 - load64(&mean + c1 * 8);
+                p = p + d * load64(&v + c1 * 8);
+                c1 = c1 + 1;
+            }
+            if (p < tmin) { tmin = p; }
+            if (p > tmax) { tmax = p; }
+        }
+        t = t + 1;
+    }
+    var e0f[32];
+    var e1f[32];
+    var c2 = 0;
+    while (c2 < nch) {
+        var mc = load64(&mean + c2 * 8);
+        var vc = load64(&v + c2 * 8);
+        store64(&e0f + c2 * 8, _bc7_clamp8(_bc7_rdiv(mc + _bc7_rdiv(tmin * vc, vv), 16)));
+        store64(&e1f + c2 * 8, _bc7_clamp8(_bc7_rdiv(mc + _bc7_rdiv(tmax * vc, vv), 16)));
+        c2 = c2 + 1;
+    }
+    _bc7_try_endpoints(px, mask, chs, nch, bits, pk, ib, &e0f, &e1f, res, idx);
+    # least-squares refits from the current indices
+    var it = 0;
+    while (it < 2) {
+        var moved = 0;
+        var c3 = 0;
+        while (c3 < nch) {
+            var sa = 0;
+            var sb = 0;
+            var sc = 0;
+            var x0 = 0;
+            var x1 = 0;
+            var t3 = 0;
+            while (t3 < 16) {
+                if (((mask >> t3) & 1) == 1) {
+                    var w = _bc7_weight(ib, load64(idx + t3 * 8));
+                    var a = 64 - w;
+                    var val = load64(px + (t3 * 4 + load64(chs + c3 * 8)) * 8);
+                    sa = sa + a * a;
+                    sb = sb + a * w;
+                    sc = sc + w * w;
+                    x0 = x0 + a * val;
+                    x1 = x1 + w * val;
+                }
+                t3 = t3 + 1;
+            }
+            var det = sa * sc - sb * sb;
+            if (det > 0) {
+                store64(&e0f + c3 * 8, _bc7_clamp8(_bc7_rdiv(64 * (sc * x0 - sb * x1), det)));
+                store64(&e1f + c3 * 8, _bc7_clamp8(_bc7_rdiv(64 * (sa * x1 - sb * x0), det)));
+                moved = 1;
+            }
+            c3 = c3 + 1;
+        }
+        if (moved == 0) { break; }
+        _bc7_try_endpoints(px, mask, chs, nch, bits, pk, ib, &e0f, &e1f, res, idx);
+        it = it + 1;
+    }
+    if (_bc7_polishing == 1) { _bc7_polish(px, mask, chs, nch, bits, pk, ib, res, idx); }
+    return 0;
+}
+
+# A local search on a fitted subset: every endpoint code of every channel is moved by -1 and +1
+# (p-bits kept), and a move is kept when the re-assigned error drops. Two passes.
+fn _bc7_polish(px, mask, chs, nch, bits, pk, ib, res, idx): i64 {
+    var hp = 0;
+    if (pk != 0) { hp = 1; }
+    var top = (1 << bits) - 1;
+    var d0[32];
+    var d1[32];
+    var tidx[128];
+    var pass = 0;
+    while (pass < 2) {
+        var improved = 0;
+        var e = 0;
+        while (e < 2) {
+            var c = 0;
+            while (c < nch) {
+                var dir = 0 - 1;
+                while (dir <= 1) {
+                    var slot = res + e * 32 + c * 8;
+                    var old = load64(slot);
+                    var nv = old + dir;
+                    if (nv >= 0) {
+                        if (nv <= top) {
+                            store64(slot, nv);
+                            var k = 0;
+                            while (k < nch) {
+                                store64(&d0 + k * 8, _bc7_dq(load64(res + k * 8), bits, load64(res + 64), hp));
+                                store64(&d1 + k * 8, _bc7_dq(load64(res + 32 + k * 8), bits, load64(res + 72), hp));
+                                k = k + 1;
+                            }
+                            var err = _bc7_assign(px, mask, chs, nch, &d0, &d1, ib, &tidx);
+                            if (err < load64(res + 80)) {
+                                store64(res + 80, err);
+                                var t = 0;
+                                while (t < 16) {
+                                    if (((mask >> t) & 1) == 1) { store64(idx + t * 8, load64(&tidx + t * 8)); }
+                                    t = t + 1;
+                                }
+                                improved = 1;
+                            } else {
+                                store64(slot, old);
+                            }
+                        }
+                    }
+                    dir = dir + 2;
+                }
+                c = c + 1;
+            }
+            e = e + 1;
+        }
+        if (improved == 0) { break; }
+        pass = pass + 1;
+    }
+    return 0;
+}
+
+# Swap a fitted subset's endpoints (codes for nch channels, and p-bits) and invert its indices
+# over `mask`: the decode is unchanged, because the weights are symmetric (w[k] = 64 - w[max-k]).
+fn _bc7_flip(res, nch, mask, ib, idx): i64 {
+    var c = 0;
+    while (c < nch) {
+        var a = load64(res + c * 8);
+        store64(res + c * 8, load64(res + 32 + c * 8));
+        store64(res + 32 + c * 8, a);
+        c = c + 1;
+    }
+    var p = load64(res + 64);
+    store64(res + 64, load64(res + 72));
+    store64(res + 72, p);
+    var top = (1 << ib) - 1;
+    var t = 0;
+    while (t < 16) {
+        if (((mask >> t) & 1) == 1) { store64(idx + t * 8, top - load64(idx + t * 8)); }
+        t = t + 1;
+    }
+    return 0;
+}
+
+# The 16-bit texel mask of subset `sub` of a partition.
+fn _bc7_mask(nsub, part, sub): i64 {
+    var m = 0;
+    var t = 0;
+    while (t < 16) {
+        if (_bc7_subset(nsub, part, t) == sub) { m = m | (1 << t); }
+        t = t + 1;
+    }
+    return m;
+}
+
+# Squared RGBA error between a decoded block (16 u32) and px.
+fn _bc7_block_err(dec, px): i64 {
+    var err = 0;
+    var t = 0;
+    while (t < 16) {
+        var v = load32(dec + t * 4);
+        var c = 0;
+        while (c < 4) {
+            var d = ((v >> (c * 8)) & 0xFF) - load64(px + (t * 4 + c) * 8);
+            err = err + d * d;
+            c = c + 1;
+        }
+        t = t + 1;
+    }
+    return err;
+}
+
+# Encode px (16 texels x 4 channels, i64) in mode m with partition `part`, rotation `rot` and
+# index selection `isel` into the 16-byte `out`. Returns the decoded block's squared error.
+fn _bc7_encode_mode(px, m, part, rot, isel, out): i64 {
+    var rp[512];
+    memcpy(&rp, px, 512);
+    if (rot > 0) {
+        var t0 = 0;
+        while (t0 < 16) {
+            var a = load64(&rp + (t0 * 4 + 3) * 8);
+            store64(&rp + (t0 * 4 + 3) * 8, load64(&rp + (t0 * 4 + rot - 1) * 8));
+            store64(&rp + (t0 * 4 + rot - 1) * 8, a);
+            t0 = t0 + 1;
+        }
+    }
+    var nsub = _bc7_m_nsub(m);
+    var cb = _bc7_m_cbits(m);
+    var ab = _bc7_m_abits(m);
+    var pk = _bc7_m_pkind(m);
+    var ib = _bc7_m_ibits(m);
+    var res[264];
+    var resa[88];
+    var idx[128];
+    var idxa[128];
+    var chs[32];
+    store64(&chs, 0);
+    store64(&chs + 8, 1);
+    store64(&chs + 16, 2);
+    store64(&chs + 24, 3);
+    var cib = ib;
+    var aib = 0;
+    var sep = 0;
+    if (m == 4) { sep = 1; cib = 2; aib = 3; if (isel == 1) { cib = 3; aib = 2; } }
+    if (m == 5) { sep = 1; cib = 2; aib = 2; }
+    if (sep == 1) {
+        _bc7_fit(&rp, 0xFFFF, &chs, 3, cb, 0, cib, &res, &idx);
+        var cha[8];
+        store64(&cha, 3);
+        _bc7_fit(&rp, 0xFFFF, &cha, 1, ab, 0, aib, &resa, &idxa);
+        if (load64(&idx) >= (1 << (cib - 1))) { _bc7_flip(&res, 3, 0xFFFF, cib, &idx); }
+        if (load64(&idxa) >= (1 << (aib - 1))) { _bc7_flip(&resa, 1, 0xFFFF, aib, &idxa); }
+    } else {
+        var nch = 3;
+        if (ab > 0) { nch = 4; }
+        var s = 0;
+        while (s < nsub) {
+            var mask = _bc7_mask(nsub, part, s);
+            _bc7_fit(&rp, mask, &chs, nch, cb, pk, ib, &res + s * _BC7_RES, &idx);
+            if (load64(&idx + _bc7_anchor(nsub, part, s) * 8) >= (1 << (ib - 1))) {
+                _bc7_flip(&res + s * _BC7_RES, nch, mask, ib, &idx);
+            }
+            s = s + 1;
+        }
+    }
+    # pack
+    memset(out, 0, 16);
+    var pos[8];
+    store64(&pos, 0);
+    _bc7_put(out, &pos, 1 << m, m + 1);
+    _bc7_put(out, &pos, part, _bc7_m_partbits(m));
+    if (m == 4) { _bc7_put(out, &pos, rot, 2); _bc7_put(out, &pos, isel, 1); }
+    if (m == 5) { _bc7_put(out, &pos, rot, 2); }
+    var ne = nsub * 2;
+    var c = 0;
+    while (c < 3) {
+        var e = 0;
+        while (e < ne) {
+            var r = &res + (e / 2) * _BC7_RES;
+            _bc7_put(out, &pos, load64(r + (e % 2) * 32 + c * 8), cb);
+            e = e + 1;
+        }
+        c = c + 1;
+    }
+    if (ab > 0) {
+        var e2 = 0;
+        while (e2 < ne) {
+            var av = 0;
+            if (sep == 1) { av = load64(&resa + (e2 % 2) * 32); }
+            if (sep == 0) { av = load64(&res + (e2 / 2) * _BC7_RES + (e2 % 2) * 32 + 24); }
+            _bc7_put(out, &pos, av, ab);
+            e2 = e2 + 1;
+        }
+    }
+    if (pk == 1) {
+        var e3 = 0;
+        while (e3 < ne) {
+            _bc7_put(out, &pos, load64(&res + (e3 / 2) * _BC7_RES + 64 + (e3 % 2) * 8), 1);
+            e3 = e3 + 1;
+        }
+    }
+    if (pk == 2) {
+        var s2 = 0;
+        while (s2 < nsub) {
+            _bc7_put(out, &pos, load64(&res + s2 * _BC7_RES + 64), 1);
+            s2 = s2 + 1;
+        }
+    }
+    var prim = &idx;
+    var sec = &idxa;
+    var pib = ib;
+    var sib = aib;
+    if (m == 4) {
+        pib = 2;
+        sib = 3;
+        if (isel == 1) { prim = &idxa; sec = &idx; }
+    }
+    var t = 0;
+    while (t < 16) {
+        var nb = pib;
+        if (t == _bc7_anchor(nsub, part, _bc7_subset(nsub, part, t))) { nb = nb - 1; }
+        _bc7_put(out, &pos, load64(prim + t * 8), nb);
+        t = t + 1;
+    }
+    if (sep == 1) {
+        var t2 = 0;
+        while (t2 < 16) {
+            var nb2 = sib;
+            if (t2 == 0) { nb2 = nb2 - 1; }
+            _bc7_put(out, &pos, load64(sec + t2 * 8), nb2);
+            t2 = t2 + 1;
+        }
+    }
+    # every mode's fields come to exactly 128 bits; a packing that did not is never chosen
+    if (load64(&pos) != 128) { return 1 << 61; }
+    var dec[64];
+    _bc7_decode_block(out, &dec);
+    return _bc7_block_err(&dec, px);
+}
+
+# Every partition's rank for `nsub` subsets, into errs[64]: the sum over its subsets of the
+# squared error left off each subset's principal axis (trace - largest eigenvalue of the
+# subset's covariance), over `nch` channels. Each texel's values and pairwise products are
+# formed once, so a partition costs one pass of adds (the encoder's hot spot before 4.5.0's
+# first measurement: ~0.4 ms a block).
+fn _bc7_part_errs(px, nsub, nch, errs): i64 {
+    # the covariance is symmetric: only the a <= b products (6 for RGB, 10 for RGBA), listed
+    # in pairs[] as a * 4 + b
+    var pairs[80];
+    var np = 0;
+    var a0 = 0;
+    while (a0 < nch) {
+        var b0 = a0;
+        while (b0 < nch) {
+            store64(&pairs + np * 8, a0 * 4 + b0);
+            np = np + 1;
+            b0 = b0 + 1;
+        }
+        a0 = a0 + 1;
+    }
+    var prod[1280];                    # 16 texels x 10 products
+    var t = 0;
+    while (t < 16) {
+        var q = 0;
+        while (q < np) {
+            var ab = load64(&pairs + q * 8);
+            store64(&prod + (t * 10 + q) * 8, load64(px + (t * 4 + ab / 4) * 8) * load64(px + (t * 4 + ab % 4) * 8));
+            q = q + 1;
+        }
+        t = t + 1;
+    }
+    var acc[504];                      # 3 subsets x (n, S[4], Sab[16])
+    var cov[128];
+    var v[32];
+    var p = 0;
+    while (p < 64) {
+        memset(&acc, 0, 504);
+        var t1 = 0;
+        while (t1 < 16) {
+            var sb = &acc + _bc7_subset(nsub, p, t1) * 168;
+            store64(sb, load64(sb) + 1);
+            var c = 0;
+            while (c < nch) {
+                store64(sb + 8 + c * 8, load64(sb + 8 + c * 8) + load64(px + (t1 * 4 + c) * 8));
+                c = c + 1;
+            }
+            var k = 0;
+            while (k < np) {
+                store64(sb + 40 + k * 8, load64(sb + 40 + k * 8) + load64(&prod + (t1 * 10 + k) * 8));
+                k = k + 1;
+            }
+            t1 = t1 + 1;
+        }
+        var total = 0;
+        var s = 0;
+        while (s < nsub) {
+            var sb2 = &acc + s * 168;
+            var n = load64(sb2);
+            if (n > 1) {
+                var q2 = 0;
+                while (q2 < np) {
+                    var ab2 = load64(&pairs + q2 * 8);
+                    var ra = ab2 / 4;
+                    var rb = ab2 % 4;
+                    var cv = n * load64(sb2 + 40 + q2 * 8) - load64(sb2 + 8 + ra * 8) * load64(sb2 + 8 + rb * 8);
+                    store64(&cov + (ra * 4 + rb) * 8, cv);
+                    store64(&cov + (rb * 4 + ra) * 8, cv);
+                    q2 = q2 + 1;
+                }
+                _bc7_axis(&cov, nch, &v, 4);
+                var vv = 0;
+                var vcv = 0;
+                var tr = 0;
+                var r = 0;
+                while (r < nch) {
+                    tr = tr + load64(&cov + (r * 4 + r) * 8);
+                    vv = vv + load64(&v + r * 8) * load64(&v + r * 8);
+                    var row = 0;
+                    var k2 = 0;
+                    while (k2 < nch) {
+                        row = row + load64(&cov + (r * 4 + k2) * 8) * load64(&v + k2 * 8);
+                        k2 = k2 + 1;
+                    }
+                    vcv = vcv + load64(&v + r * 8) * row;
+                    r = r + 1;
+                }
+                var lam = 0;
+                if (vv > 0) { lam = vcv / vv; }
+                total = total + (tr - lam) / n;
+            }
+            s = s + 1;
+        }
+        store64(errs + p * 8, total);
+        p = p + 1;
+    }
+    return 0;
+}
+
+# The `k` lowest of errs[0 .. nparts) into out[] (partition numbers, i64), best first; ties go
+# to the lower partition.
+fn _bc7_top_parts(errs, nparts, k, out): i64 {
+    var best[64];
+    var i = 0;
+    while (i < k) {
+        store64(out + i * 8, 0);
+        store64(&best + i * 8, 1 << 62);
+        i = i + 1;
+    }
+    var p = 0;
+    while (p < nparts) {
+        var e = load64(errs + p * 8);
+        var j = k - 1;
+        if (e < load64(&best + j * 8)) {
+            while (j > 0) {
+                if (load64(&best + (j - 1) * 8) <= e) { break; }
+                store64(&best + j * 8, load64(&best + (j - 1) * 8));
+                store64(out + j * 8, load64(out + (j - 1) * 8));
+                j = j - 1;
+            }
+            store64(&best + j * 8, e);
+            store64(out + j * 8, p);
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+fn _bc7_cand(px, m, part, rot, isel, out): i64 {
+    var tmp[16];
+    var e = _bc7_encode_mode(px, m, part, rot, isel, &tmp);
+    if (e < _bc7_best) {
+        _bc7_best = e;
+        _bc7_best_cfg = m | (part << 8) | (rot << 16) | (isel << 24);
+        memcpy(out, &tmp, 16);
+    }
+    return 0;
+}
+
+# Encode one block (px: 16 texels x 4 channels, i64) into the 16 bytes at `out`. Returns its
+# squared error.
+fn _bc7_encode_block(px, out): i64 {
+    _bc7_best = 1 << 62;
+    var opaque = 1;
+    var t = 0;
+    while (t < 16) {
+        if (load64(px + (t * 4 + 3) * 8) != 255) { opaque = 0; }
+        t = t + 1;
+    }
+    _bc7_cand(px, 6, 0, 0, 0, out);
+    if (_bc7_best == 0) { return 0; }
+    var parts[32];
+    var errs[512];
+    if (opaque == 1) {
+        _bc7_cand(px, 5, 0, 0, 0, out);
+        _bc7_cand(px, 4, 0, 0, 0, out);
+        _bc7_cand(px, 4, 0, 0, 1, out);
+        _bc7_part_errs(px, 2, 3, &errs);
+        _bc7_top_parts(&errs, 64, 4, &parts);
+        var i = 0;
+        while (i < 4) {
+            _bc7_cand(px, 1, load64(&parts + i * 8), 0, 0, out);
+            _bc7_cand(px, 3, load64(&parts + i * 8), 0, 0, out);
+            i = i + 1;
+        }
+        _bc7_part_errs(px, 3, 3, &errs);
+        _bc7_top_parts(&errs, 16, 2, &parts);       # mode 0 has the first 16 partitions
+        _bc7_cand(px, 0, load64(&parts), 0, 0, out);
+        _bc7_cand(px, 0, load64(&parts + 8), 0, 0, out);
+        _bc7_top_parts(&errs, 64, 2, &parts);
+        _bc7_cand(px, 2, load64(&parts), 0, 0, out);
+        _bc7_cand(px, 2, load64(&parts + 8), 0, 0, out);
+    } else {
+        var rot = 0;
+        while (rot < 4) {
+            _bc7_cand(px, 5, 0, rot, 0, out);
+            _bc7_cand(px, 4, 0, rot, 0, out);
+            _bc7_cand(px, 4, 0, rot, 1, out);
+            rot = rot + 1;
+        }
+        _bc7_part_errs(px, 2, 4, &errs);
+        _bc7_top_parts(&errs, 64, 4, &parts);
+        var i2 = 0;
+        while (i2 < 4) {
+            _bc7_cand(px, 7, load64(&parts + i2 * 8), 0, 0, out);
+            i2 = i2 + 1;
+        }
+    }
+    # the winner, re-fitted with the endpoint local search (kept only if it improves)
+    if (_bc7_best > 0) {
+        var cfg = _bc7_best_cfg;
+        _bc7_polishing = 1;
+        _bc7_cand(px, cfg & 0xFF, (cfg >> 8) & 0xFF, (cfg >> 16) & 0xFF, (cfg >> 24) & 0xFF, out);
+        _bc7_polishing = 0;
+    }
+    return _bc7_best;
+}
+
+# Encode an RGBA8 image to BC7: `width` x `height` texels at `src`, `src_pitch` bytes a row
+# (each texel R, G, B, A bytes), into `dst` (`dst_len` bytes; it needs
+# mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height)). Blocks run row-major; a partial
+# block at the right or bottom edge repeats the edge texels. Returns the bytes written, or a
+# negative GPU_ERR_*: -GPU_ERR_TEXTURE_DIMENSION for a size outside 1..MABDA_MAX_TEXTURE_DIM_2D,
+# -GPU_ERR_BUFFER for a null buffer, a short pitch or a short dst. CPU only; deterministic.
+# @public
+fn mabda_bc7_encode(src, width, height, src_pitch, dst, dst_len): i64 {
+    if (width < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (height < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (width > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (height > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (src == 0) { return 0 - GPU_ERR_BUFFER; }
+    if (dst == 0) { return 0 - GPU_ERR_BUFFER; }
+    if (src_pitch < width * 4) { return 0 - GPU_ERR_BUFFER; }
+    var need = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height);
+    if (dst_len < need) { return 0 - GPU_ERR_BUFFER; }
+    if (_bc7_init() != 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
+    var bxn = (width + 3) / 4;
+    var byn = (height + 3) / 4;
+    var px[512];
+    var by = 0;
+    while (by < byn) {
+        var bx = 0;
+        while (bx < bxn) {
+            var t = 0;
+            while (t < 16) {
+                var x = bx * 4 + (t % 4);
+                var y = by * 4 + (t / 4);
+                if (x >= width) { x = width - 1; }
+                if (y >= height) { y = height - 1; }
+                var p = src + y * src_pitch + x * 4;
+                var c = 0;
+                while (c < 4) {
+                    store64(&px + (t * 4 + c) * 8, load8(p + c) & 0xFF);
+                    c = c + 1;
+                }
+                t = t + 1;
+            }
+            _bc7_encode_block(&px, dst + (by * bxn + bx) * 16);
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return need;
+}
+
+# Decode a BC7 image (`width` x `height`, the blocks mabda_bc7_encode writes) to RGBA8 at
+# `dst` (`dst_pitch` bytes a row). Returns 0, or a negative GPU_ERR_* as mabda_bc7_encode.
+# CPU only. @public
+fn mabda_bc7_decode(src, src_len, width, height, dst, dst_pitch): i64 {
+    if (width < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (height < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (width > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (height > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
+    if (src == 0) { return 0 - GPU_ERR_BUFFER; }
+    if (dst == 0) { return 0 - GPU_ERR_BUFFER; }
+    if (dst_pitch < width * 4) { return 0 - GPU_ERR_BUFFER; }
+    if (src_len < mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height)) { return 0 - GPU_ERR_BUFFER; }
+    if (_bc7_init() != 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
+    var bxn = (width + 3) / 4;
+    var byn = (height + 3) / 4;
+    var dec[64];
+    var by = 0;
+    while (by < byn) {
+        var bx = 0;
+        while (bx < bxn) {
+            _bc7_decode_block(src + (by * bxn + bx) * 16, &dec);
+            var t = 0;
+            while (t < 16) {
+                var tx = bx * 4 + (t % 4);
+                var ty = by * 4 + (t / 4);
+                if (tx < width) {
+                    if (ty < height) { store32(dst + ty * dst_pitch + tx * 4, load32(&dec + t * 4)); }
+                }
+                t = t + 1;
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return 0;
+}

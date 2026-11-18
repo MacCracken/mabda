@@ -1,9 +1,15 @@
-# GPU texture compression (BC1–BC7 / ASTC encode) belongs in mabda — scheduled for v4.5.0
+# GPU texture compression (BC1–BC7 / ASTC encode) belongs in mabda — BC7 done in v4.5.0
 
-**Status:** 📌 **SCHEDULED — mabda v4.5.0** (Phase 4 of the 2026-11 plan; `docs/development/roadmap.md`):
-KTX2 zstd / zlib supercompression decode first (✅ done in 4.5.0, CHANGELOG [4.5.0]: the consumer
-registers sankoch's decoders with `gpu_ktx2_set_zstd_decoder` / `gpu_ktx2_set_zlib_decoder`), then a CPU block encoder for the first format a consumer names (the user is
-asked if none has by then).
+**Status:** ✅ **the v4.5.0 scope is done** (CHANGELOG [4.5.0]):
+- KTX2 zstd / zlib supercompression decode: the consumer registers sankoch's decoders with
+  `gpu_ktx2_set_zstd_decoder` / `gpu_ktx2_set_zlib_decoder`.
+- A CPU reference block encoder for **BC7**, which the maintainer chose (2026-11-17) since no
+  consumer had named a format: `mabda_bc7_encode` / `mabda_bc7_decode` in
+  `src/texture_bc7.cyr`. It is checked against the Cezanne's texture unit and has a PSNR bar.
+
+**Not scheduled in any release:** the other formats (BC1 / BC3 / BC4 / BC5, ASTC), the GPU
+compute encoder ("later, if it pays", below), and supercompression *encode*. They wait for a
+consumer's request or the maintainer's call; this file stays open for them.
 **Filed:** 2026-10-13, from sankoch, at the user's decision on sankoch's 2.8.6 roadmap item.
 **Placement:** a new mabda module (texture encode), next to `src/texture_format.cyr`,
 `src/asset_format.cyr` and `src/asset_load.cyr`.

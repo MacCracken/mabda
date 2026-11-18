@@ -91,6 +91,7 @@ src/   (68 domain modules + lib.cyr — annotated below; the filesystem is autho
 ├── vertex.cyr, blend.cyr, sampler.cyr, depth.cyr, bind_group.cyr
 ├── texture.cyr, texture_format.cyr, render_target.cyr, render_pipeline.cyr
 ├── asset_format.cyr     — container format ids (VkFormat / DXGI) → MABDA_TEXFMT_*
+├── texture_bc7.cyr      — BC7 block decode + the CPU reference encoder (4.5.0)
 ├── asset_load.cyr       — DDS / KTX2 container loaders; PNG / JPEG via chitra
 │                          (`-D MABDA_PNG` / `-D MABDA_JPEG`; untrusted input); KTX2
 │                          zstd / zlib levels via decoders the consumer registers
