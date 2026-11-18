@@ -9884,6 +9884,26 @@ fn native_build_cs_chunk_syncobj(buf, handle, flags, point): i64 {
     return 0;
 }
 
+# 4.5.0 — the TIMELINE_WAIT chunk payload for `n` (syncobj u64, point u64) pairs at
+# `waits`: n drm_amdgpu_cs_chunk_syncobj entries (16 B each) into `buf` (n * 16
+# bytes). Each entry carries WAIT_FLAGS_WAIT_FOR_SUBMIT (0x2): the amdgpu CS parser
+# routes flags through drm_syncobj_find_fence, and the flag (the Mesa / RADV
+# choice) lets a wait name a point whose submit has not landed yet instead of
+# failing -ENOENT. Returns 0, or -1 for n outside 1..QUEUE_PEND_SLOTS or a pair
+# with a zero syncobj or point (point 0 is never signalled: a dead dependency).
+fn native_build_cs_wait_chunk(buf, waits, n): i64 {
+    if (n < 1) { return 0 - 1; }
+    if (n > QUEUE_PEND_SLOTS) { return 0 - 1; }
+    for (var i = 0; i < n; i = i + 1) {
+        var so = load64(waits + i * 16);
+        var pt = load64(waits + i * 16 + 8);
+        if (so == 0) { return 0 - 1; }
+        if (pt == 0) { return 0 - 1; }
+        native_build_cs_chunk_syncobj(buf + i * 16, so, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, pt);
+    }
+    return 0;
+}
+
 # Wait until `handle` reaches timeline `point`. `timeout_ns` is
 # absolute CLOCK_MONOTONIC ns. WAIT_FOR_SUBMIT covers the case where
 # the signalling submit hasn't landed yet. Returns 0 on reached,
@@ -10197,12 +10217,13 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 # barriers (Q.4). Chunk order:
 #   BO_HANDLES, [TIMELINE_WAIT], TIMELINE_SIGNAL, FENCE, IB
 # The GPU signals `signal_syncobj` at `signal_point` on completion;
-# when `wait_syncobj != 0` the submission first waits for that syncobj
-# to reach `wait_point`. Returns 0 on accepted, negative errno on
-# failure. (HW-gated; chunk byte layout is CPU-tested via the pure
-# native_build_cs_chunk_syncobj helper.)
+# with `n_waits` > 0 the submission first waits for each (syncobj, point)
+# pair at `waits` (u64 syncobj, u64 point; at most QUEUE_PEND_SLOTS, 4.5.0:
+# it took one pair). Returns 0 on accepted, negative errno on failure.
+# (HW-gated; the wait chunk's bytes are CPU-tested via
+# native_build_cs_wait_chunk.)
 fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
-  signal_syncobj, signal_point, wait_syncobj, wait_point, fence_kh, fence_offset, ib_flags): i64 {
+  signal_syncobj, signal_point, waits, n_waits, fence_kh, fence_offset, ib_flags): i64 {
     if ((fence_offset & 3) != 0) { return 0 - 22; }   # -EINVAL: DWORD-align guard
     # Timeline points are strictly monotonic from an initial 0, so the
     # kernel rejects a SIGNAL of point 0 (drm_syncobj_add_point requires
@@ -10227,23 +10248,11 @@ fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_typ
     var signal_chunk[16];
     native_build_cs_chunk_syncobj(&signal_chunk, signal_syncobj, 0, signal_point);
 
-    var wait_chunk[16];
+    var wait_chunk[64];   # QUEUE_PEND_SLOTS x 16 B
     var include_wait = 1;
-    if (wait_syncobj == 0) { include_wait = 0; }
+    if (n_waits == 0) { include_wait = 0; }
     if (include_wait == 1) {
-        # Waiting on timeline point 0 is meaningless (nothing is signalled
-        # at 0); reject rather than submit a dead dependency.
-        if (wait_point == 0) { return 0 - 22; }
-        # WAIT chunk: the amdgpu CS parser routes flags through
-        # drm_syncobj_find_fence, which reads WAIT_FLAGS_WAIT_FOR_SUBMIT
-        # (0x2). Setting it (the Mesa/RADV choice) makes the in-CS wait
-        # tolerate a consumer submit that races ahead of the producer —
-        # the dependency resolves once the producer's fence installs,
-        # instead of failing -ENOENT. Harmless for our barrier path
-        # (which waits on already-signalled points), robust against
-        # future render-graph cross-queue scheduling (3.1.2).
-        native_build_cs_chunk_syncobj(&wait_chunk, wait_syncobj,
-          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, wait_point);
+        if (native_build_cs_wait_chunk(&wait_chunk, waits, n_waits) != 0) { return 0 - 22; }
     }
 
     var fence_chunk[8];
@@ -10268,7 +10277,7 @@ fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_typ
 
     if (include_wait == 1) {
         store32(&chunks + co + 0, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT);
-        store32(&chunks + co + 4, 4);               # chunk_syncobj = 16 B = 4 dw
+        store32(&chunks + co + 4, 4 * n_waits);     # n x chunk_syncobj (16 B = 4 dw)
         store64(&chunks + co + 8, &wait_chunk);
         store64(&chunk_ptrs + po, &chunks + co);
         co = co + 16;
@@ -20351,16 +20360,15 @@ fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
     # GPU resolves the dependency without a CPU stall. Read + clear
     # before submit so the queue state is clean regardless of outcome
     # (a single barrier applies to the next submit only).
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this dispatch's timeline point and submit signalling it on
     # completion. ib_flags=0x08 (TC_WB_NOT_INVALIDATE) as on the compute
     # path. wait_so==0 omits the wait chunk (the common no-barrier case).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+      ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -20417,12 +20425,11 @@ fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
     store32(&bo_list_in + 8, ne);
     store32(&bo_list_in + 12, 8);
     store64(&bo_list_in + 16, &entries);
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+      ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -20489,15 +20496,14 @@ fn native_transfer_copy_timeline(ctx, src_handle, src_va,
 
     # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
     # TIMELINE_WAIT; read + clear before submit so queue state is clean.
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this copy's timeline point and submit signalling it on
     # completion. ib_flags = 0 (SDMA needs no TC writeback hook).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, sdma_bytes,
-      AMDGPU_HW_IP_DMA, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+      AMDGPU_HW_IP_DMA, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -20760,15 +20766,14 @@ fn native_render_dispatch_timeline(ctx, pm4, pm4_bytes,
 
     # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
     # TIMELINE_WAIT; read + clear before submit so queue state is clean.
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this dispatch's timeline point and submit signalling it on
     # completion. ib_flags=0 (GFX ACQUIRE_MEM handles cache invalidation).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      AMDGPU_HW_IP_GFX, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+      AMDGPU_HW_IP_GFX, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -21548,7 +21553,9 @@ fn _backend_native_queue_wait_idle(ctx, queue): i64 {
 
 # Order work on dst_queue after work submitted on src_queue (Q.4).
 # Records the producer's (syncobj, current point) as a PENDING WAIT on
-# the consumer queue — no CPU block. The consumer's next queue-targeted
+# the consumer queue — no CPU block. src == dst is allowed (4.5.0): the
+# kernel makes a same-ring wait a pipeline sync, so dst's next submit starts
+# after everything submitted on it so far has finished. The consumer's next queue-targeted
 # submit (native_compute_dispatch_cached_timeline) turns it into an
 # in-CS TIMELINE_WAIT chunk so the dependency resolves GPU-side, leaving
 # the two rings free to overlap. If src has submitted nothing yet
@@ -21559,7 +21566,10 @@ fn _backend_native_queue_barrier(ctx, src_queue, dst_queue): i64 {
     if (dst_queue == 0)  { return GPU_ERR_OTHER; }
     var src_point = queue_point(src_queue);
     if (src_point == 0) { return 0; }
-    queue_set_pending_wait(dst_queue, queue_syncobj(src_queue), src_point);
+    # 4.5.0: merged with the queue's other pending waits (it overwrote them).
+    if (queue_set_pending_wait(dst_queue, queue_syncobj(src_queue), src_point) != 0) {
+        return GPU_ERR_OTHER;
+    }
     return 0;
 }
 
@@ -21798,6 +21808,34 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     native_tex_set_sw_mode(tex, sw_mode);
     native_tex_set_t_va(tex, va + desc_off);
     return tex;
+}
+
+# 4.5.0 — fill `tex` (NATIVE_TEX_STRUCT_SIZE bytes) as a VIEW: a LINEAR sampleable
+# `fmt` texture whose surface is at (`va`, CPU `addr`) inside an existing BO
+# `handle`, with its T# + S# (64 bytes) at (`desc_va`, CPU `desc_addr`) in the same
+# BO, built exactly as _backend_native_texture_create_2d_sampleable builds them.
+# Nothing is allocated or mapped: the owner of the BO releases it, never the view
+# (render-graph transients, rg_build_ctx). Returns 0, or -1 for a format with no T#.
+fn native_tex_view_init(tex, handle, va, addr, width, height, fmt, desc_addr, desc_va): i64 {
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0 - 1; }
+    memset(desc_addr, 0, 64);
+    native_gfx9_image_descriptor(desc_addr, 0, va, width, height, fmt, GFX9_SW_MODE_LINEAR, 1, width - 1);
+    native_gfx9_sampler_descriptor(desc_addr, 32,
+      NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);   # unnormalized (image_sample FS)
+    store32(desc_addr + 48, 0x3F800000);   # scale_x = 1.0f (the draw overwrites it)
+    store32(desc_addr + 52, 0x3F800000);   # scale_y = 1.0f
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(tex + NATIVE_TEX_FIELD_VA,     va);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   mabda_texfmt_data_size(fmt, width, height));
+    store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
+    native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
+    native_tex_set_t_va(tex, desc_va);
+    return 0;
 }
 
 # v3.4 AA.1b — create a sampleable 2D ARRAY texture (LINEAR / uncompressed).
@@ -38246,20 +38284,28 @@ var QUEUE_KIND_COUNT    = 3;
 #   +24: timeline_point   monotonic u64 — last point signalled on this
 #                         queue's timeline. Bumped per queue-targeted
 #                         submit (Q.3); read by gpu_queue_barrier (Q.4).
-#   +32: pending_wait_syncobj  Q.4 — a cross-ring dependency recorded by
+#   +32: pending_wait_syncobj  Q.4 — a dependency recorded by
 #                         gpu_queue_barrier on the CONSUMER queue. The
 #                         consumer's NEXT queue-targeted submit adds an
 #                         in-CS TIMELINE_WAIT on (this syncobj, point),
-#                         then clears both. 0 = no pending dependency.
+#                         then clears it. 0 = no pending dependency.
 #   +40: pending_wait_point    Q.4 — the producer timeline point this
 #                         queue's next submit must wait for.
+#   +48..+95: pending waits 1..3, the same (syncobj, point) pair shape (4.5.0).
+#                         Before 4.5.0 a queue held ONE pending wait, so a
+#                         second barrier into the same submit overwrote the
+#                         first. Now a barrier merges into the slot of its
+#                         syncobj (the later point wins) or takes a free one;
+#                         a context has one timeline per queue kind, so 3
+#                         slots cover every source and the 4th is headroom.
 var QUEUE_OFF_KIND         = 0;
 var QUEUE_OFF_RING         = 8;
 var QUEUE_OFF_SYNCOBJ      = 16;
 var QUEUE_OFF_POINT        = 24;
 var QUEUE_OFF_PEND_SYNCOBJ = 32;
 var QUEUE_OFF_PEND_POINT   = 40;
-var QUEUE_STRUCT_SIZE      = 48;
+var QUEUE_PEND_SLOTS       = 4;
+var QUEUE_STRUCT_SIZE      = 96;
 
 # Allocate a zero-initialized Queue of the given kind. ring_handle,
 # timeline_syncobj, and timeline_point stay zero until the backend
@@ -38312,10 +38358,16 @@ fn queue_bump_point(q): i64 {
     return p;
 }
 
-# Pending cross-ring wait dependency (Q.4). gpu_queue_barrier records
-# (producer syncobj, producer point) on the CONSUMER queue; the
-# consumer's next queue-targeted submit reads these, adds an in-CS
-# TIMELINE_WAIT, and clears them. syncobj == 0 means "no pending wait".
+# Pending wait dependencies (Q.4; several since 4.5.0). gpu_queue_barrier
+# records (producer syncobj, producer point) on the CONSUMER queue; the
+# consumer's next queue-targeted submit takes them all, adds one in-CS
+# TIMELINE_WAIT entry per syncobj, and clears them. syncobj == 0 marks a
+# free slot. A barrier from a queue onto itself is allowed: the kernel turns
+# a same-ring dependency into a pipeline sync, so the submit starts only after
+# the earlier work has finished.
+fn _queue_pend_off(i): i64 { return QUEUE_OFF_PEND_SYNCOBJ + i * 16; }
+
+# Slot 0's syncobj / point (the pre-4.5.0 single-wait accessors).
 fn queue_pending_wait_syncobj(q): i64 {
     if (q == 0) { return 0; }
     return load64(q + QUEUE_OFF_PEND_SYNCOBJ);
@@ -38324,17 +38376,64 @@ fn queue_pending_wait_point(q): i64 {
     if (q == 0) { return 0; }
     return load64(q + QUEUE_OFF_PEND_POINT);
 }
+
+# The number of pending waits (occupied slots).
+fn queue_pending_wait_count(q): i64 {
+    if (q == 0) { return 0; }
+    var n = 0;
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        if (load64(q + _queue_pend_off(i)) != 0) { n = n + 1; }
+    }
+    return n;
+}
+
+# Add a pending wait for `syncobj` at `point`: merged into that syncobj's slot
+# (the later point wins), else into a free slot. Returns 0, or -1 for a null
+# queue, a zero syncobj or point, or no free slot (never silently dropped).
 fn queue_set_pending_wait(q, syncobj, point): i64 {
     if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, syncobj);
-    store64(q + QUEUE_OFF_PEND_POINT, point);
-    return 0;
+    if (syncobj == 0) { return -1; }
+    if (point == 0) { return -1; }
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        var off = _queue_pend_off(i);
+        if (load64(q + off) == syncobj) {
+            if (point > load64(q + off + 8)) { store64(q + off + 8, point); }
+            return 0;
+        }
+    }
+    for (var j = 0; j < QUEUE_PEND_SLOTS; j = j + 1) {
+        var off2 = _queue_pend_off(j);
+        if (load64(q + off2) == 0) {
+            store64(q + off2, syncobj);
+            store64(q + off2 + 8, point);
+            return 0;
+        }
+    }
+    return -1;
 }
+
 fn queue_clear_pending_wait(q): i64 {
     if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, 0);
-    store64(q + QUEUE_OFF_PEND_POINT, 0);
+    memset(q + QUEUE_OFF_PEND_SYNCOBJ, 0, QUEUE_PEND_SLOTS * 16);
     return 0;
+}
+
+# Move every pending wait into `out` as (syncobj u64, point u64) pairs
+# (QUEUE_PEND_SLOTS * 16 bytes) and clear them. Returns the pair count.
+fn queue_take_pending_waits(q, out): i64 {
+    if (q == 0) { return 0; }
+    var n = 0;
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        var off = _queue_pend_off(i);
+        var so = load64(q + off);
+        if (so != 0) {
+            store64(out + n * 16, so);
+            store64(out + n * 16 + 8, load64(q + off + 8));
+            n = n + 1;
+        }
+    }
+    queue_clear_pending_wait(q);
+    return n;
 }
 
 # ================================================================
@@ -38468,14 +38567,17 @@ fn gpu_queue_transfer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
 #   reads/writes declarations on each node: if node A writes resource
 #   R and node B reads R, B depends on A.
 # - Transient resources (buffers / textures the graph owns for one
-#   submission) are allocated at `rg_build` time and freed at
-#   `rg_release`. Alias pass is scaffolded but OFF by default — alias
-#   mode shares backing storage between transients with disjoint
-#   lifetimes (follow-up work when a consumer asks; see docs/development/roadmap.md).
+#   submission) are allocated at build time and freed at `rg_release`.
+#   On wgpu each transient is its own resource; the aliasing planner
+#   (OFF by default, `rg_aliasing`) only computes a reuse plan there.
+#   On native AMD (4.5.0, `rg_build_ctx`) every transient is a view into
+#   ONE backing allocation, and with aliasing on, transients with disjoint
+#   lifetimes share bytes: the executor makes each reusing node wait for
+#   the slot's previous occupant to finish.
 #
 # Struct layouts:
 #
-# RenderGraph (48 bytes — grew 40→48 at v3.2.13 R.3, append-only):
+# RenderGraph (72 bytes — grew 40→48 at v3.2.13 R.3, 48→72 at v4.5.0, append-only):
 #   +0:  nodes         (vec ptr, 8)   — vec of Node*
 #   +8:  transients    (vec ptr, 8)   — vec of TransientResource*
 #   +16: built_flag    (i64)          — 0 before rg_build, 1 after
@@ -38484,6 +38586,11 @@ fn gpu_queue_transfer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
 #   +40: schedule      (ptr, 8)       — Schedule* (per-queue batches +
 #                                       cross-queue fence edges), 0 before
 #                                       rg_schedule. See the scheduler block.
+#   +48: ctx           (ptr, 8)       — the context rg_build_ctx built on
+#                                       (0 after a plain rg_build). 4.5.0.
+#   +56: backing       (ptr, 8)       — native: the NativeBuf every transient
+#                                       is a view into (0 = none). 4.5.0.
+#   +64: backing_bytes (i64)          — that allocation's byte size. 4.5.0.
 #
 # Node (80 bytes — grew 72→80 at v3.2.13 R.1, append-only):
 #   +0:  kind            (i64 — NODE_* enum)
@@ -38540,16 +38647,25 @@ fn gpu_queue_transfer_copy(ctx, queue, src_buf, dst_buf, bytes): i64 {
 #   +64: copy_depth         (u32)
 #   +68: pad (4)
 #
-# TransientResource (72 bytes, grew from 56 at v3 for aliasing planner):
+# TransientResource (112 bytes; 56 → 72 at v3 for the aliasing planner, 72 → 112 at v4.5.0):
 #   +0:  kind         (i64 — RES_BUFFER or RES_TEXTURE)
-#   +8:  handle       (WGPUBuffer or WGPUTexture — populated by rg_build)
+#   +8:  handle       (wgpu: WGPUBuffer / WGPUTexture; native AMD: a NativeBuf /
+#                      NativeTexture view into the backing — set at build, 0 before.
+#                      Until 4.5.0 it held the label until a wgpu device replaced it.)
 #   +16: view         (WGPUTextureView for textures, 0 for buffers — populated by rg_build)
 #   +24: size_w       (u64 — buffer size, or texture width)
 #   +32: height       (u64 — 0 for buffer, texture height)
-#   +40: format_usage (u64 — format << 32 | usage_flags)
+#   +40: format_usage (u64 — WGPUTextureFormat << 32 | usage_flags)
 #   +48: first_use    (i64 — node sort_idx of first user, -1 before scan)
 #   +56: last_use     (i64 — node sort_idx of last user, -1 before scan)
-#   +64: offset       (i64 — byte offset into the aliased block, set by planner)
+#   +64: offset       (i64 — byte offset into the backing block, set by planner)
+#   +72: alias_of     (i64 — the res_id whose slot this transient took over, -1 = none) 4.5.0
+#   +80: plan_bytes   (i64 — the planned (aligned) size, 0 before the planner) 4.5.0
+#   +88: target       (native AMD: a NativeRT view over a RENDER_ATTACHMENT texture, else 0) 4.5.0
+#   +96: user_queues  (i64 — bitmask of 1 << QUEUE_KIND_* over the nodes using it) 4.5.0
+#   +104: label       (cstr) 4.5.0
+var RG_STRUCT_SIZE  = 72;
+var RG_RES_SIZE     = 112;
 
 var NODE_COMPUTE       = 1;
 var NODE_RENDER        = 2;
@@ -38564,8 +38680,8 @@ var RES_TEXTURE = 2;
 # ================================================================
 
 fn rg_new(): i64 {
-    var g = alloc(48);
-    memset(g, 0, 48);
+    var g = alloc(RG_STRUCT_SIZE);
+    memset(g, 0, RG_STRUCT_SIZE);
     store64(g + 0,  vec_new());
     store64(g + 8,  vec_new());
     return g;
@@ -38681,32 +38797,32 @@ fn rg_node_queue_get(g, node_id): i64 {
 # rg_release. Size/format/usage are recorded here; actual GPU
 # creation happens inside rg_build.
 
-fn rg_add_transient_buffer(g, size, usage, label): i64 {
-    var r = alloc(72);
-    memset(r, 0, 72);
-    store64(r + 0,  RES_BUFFER);
-    store64(r + 24, size);
-    store64(r + 40, usage);
+fn _rg_res_new(kind, label): i64 {
+    var r = alloc(RG_RES_SIZE);
+    memset(r, 0, RG_RES_SIZE);
+    store64(r + 0,  kind);
     store64(r + 48, 0 - 1);
     store64(r + 56, 0 - 1);
-    # label stashed in handle slot until rg_build replaces it
-    store64(r + 8,  label);
+    store64(r + 72, 0 - 1);
+    store64(r + 104, label);
+    return r;
+}
+
+fn rg_add_transient_buffer(g, size, usage, label): i64 {
+    var r = _rg_res_new(RES_BUFFER, label);
+    store64(r + 24, size);
+    store64(r + 40, usage);
     var res_id = vec_len(load64(g + 8));
     vec_push(load64(g + 8), r);
     return res_id;
 }
 
 fn rg_add_transient_texture(g, width, height, format, usage, label): i64 {
-    var r = alloc(72);
-    memset(r, 0, 72);
-    store64(r + 0,  RES_TEXTURE);
+    var r = _rg_res_new(RES_TEXTURE, label);
     store64(r + 24, width);
     store64(r + 32, height);
     # Pack (format << 32) | usage so both fit in one field.
     store64(r + 40, (format * 0x100000000) | usage);
-    store64(r + 48, 0 - 1);
-    store64(r + 56, 0 - 1);
-    store64(r + 8,  label);
     var res_id = vec_len(load64(g + 8));
     vec_push(load64(g + 8), r);
     return res_id;
@@ -38725,6 +38841,44 @@ fn rg_transient_view(g, res_id): i64 {
     if (res_id < 0) { return 0; }
     if (res_id >= rg_transient_count(g)) { return 0; }
     return load64(vec_get(load64(g + 8), res_id) + 16);
+}
+
+# Accessor (4.5.0): after rg_build_ctx on native AMD, the NativeRT over a
+# transient texture created with WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT — pass it to
+# gpu_render_pass_begin. 0 for buffers, other textures, wgpu and an unbuilt graph.
+fn rg_transient_target(g, res_id): i64 {
+    if (res_id < 0) { return 0; }
+    if (res_id >= rg_transient_count(g)) { return 0; }
+    return load64(vec_get(load64(g + 8), res_id) + 88);
+}
+
+# Accessor (4.5.0): the res_id whose bytes this transient reuses under the aliasing
+# plan (it takes over that transient's slot once its last user is done), or -1.
+fn rg_transient_alias_of(g, res_id): i64 {
+    if (res_id < 0) { return 0 - 1; }
+    if (res_id >= rg_transient_count(g)) { return 0 - 1; }
+    return load64(vec_get(load64(g + 8), res_id) + 72);
+}
+
+# Accessor (4.5.0): the byte size of the native backing allocation every transient
+# lives in after rg_build_ctx on native AMD (0 on wgpu or with nothing to back).
+fn rg_backing_bytes(g): i64 {
+    if (g == 0) { return 0; }
+    return load64(g + 64);
+}
+
+# Set (or replace) a render node's pass after the build (4.5.0). On native a pass
+# is created from a render target (gpu_render_pass_begin), and a transient's target
+# exists only once rg_build_ctx has backed it, so its node is added with pass 0 and
+# given the pass here. Returns 0, or 1 for a bad node id or a node that is not a
+# render node.
+fn rg_node_set_pass(g, node_id, pass): i64 {
+    if (node_id < 0) { return 1; }
+    if (node_id >= rg_node_count(g)) { return 1; }
+    var node = vec_get(load64(g + 0), node_id);
+    if (load64(node + 0) != NODE_RENDER) { return 1; }
+    store64(load64(node + 8) + 0, pass);
+    return 0;
 }
 
 # ================================================================
@@ -38884,6 +39038,10 @@ fn rg_build(g, device): i64 {
     while (ni < n) {
         var node = vec_get(nodes, ni);
         var sort_idx = load64(node + 48);
+        # 4.5.0: the queue bit of this node, OR-ed into every transient it uses.
+        var qbit = 0;
+        var nqk = load64(node + 56);
+        if (nqk >= 0) { if (nqk < QUEUE_KIND_COUNT) { qbit = 1 << nqk; } }
         # Reads
         var reads_vec = load64(node + 16);
         var rcount = vec_len(reads_vec);
@@ -38899,6 +39057,7 @@ fn rg_build(g, device): i64 {
                     var lu = load64(r + 56);
                     if (lu == 0 - 1) { store64(r + 56, sort_idx); }
                     if (lu != 0 - 1) { if (sort_idx > lu) { store64(r + 56, sort_idx); } }
+                    store64(r + 96, load64(r + 96) | qbit);
                 }
             }
             ri = ri + 1;
@@ -38918,6 +39077,7 @@ fn rg_build(g, device): i64 {
                     var lu = load64(r + 56);
                     if (lu == 0 - 1) { store64(r + 56, sort_idx); }
                     if (lu != 0 - 1) { if (sort_idx > lu) { store64(r + 56, sort_idx); } }
+                    store64(r + 96, load64(r + 96) | qbit);
                 }
             }
             wi = wi + 1;
@@ -38949,7 +39109,159 @@ fn rg_build(g, device): i64 {
     # offset. Safe (pure CPU planning; allocation above is unchanged).
     if (load64(g + 24) == 1) {
         var alias_stats[24];
-        rg_plan_aliasing_stats(g, &alias_stats);
+        _rg_plan(g, &alias_stats, 1, 1);
+    }
+    return 0;
+}
+
+# ================================================================
+# rg_build_ctx — build on a context; native AMD backs the transients (4.5.0)
+# ================================================================
+# rg_build_ctx(g, ctx) does what rg_build does, against `ctx`'s backend:
+#   - wgpu: exactly rg_build(g, gpu_ctx_device(ctx)) — one resource per transient;
+#     with aliasing on, the plan stays the consumer's to apply (wgpu's safe API has
+#     no placed or aliased resources).
+#   - native AMD: the transients get ONE backing allocation (a GTT BO), laid out as
+#     [buffers | textures | a 64-byte T#/S# per texture]. With aliasing off each
+#     transient has its own bytes; with aliasing on the planner's offsets are used,
+#     so disjoint-lifetime transients of a kind share bytes. rg_transient_handle
+#     gives a NativeBuf view (buffers) or a NativeTexture view (textures: write,
+#     read and bind it); rg_transient_target gives a NativeRT view of a
+#     RENDER_ATTACHMENT texture. The graph owns them all: release the graph, never
+#     a view. A transient no node uses gets no backing (handle 0). Native textures
+#     are RGBA8 (render target and/or sampled) or RGBA8 sRGB (sampled only).
+#     rg_execute_mq waits, before a reusing node, for every queue that ran the
+#     slot's previous occupant.
+#   - native NVIDIA / Intel: GPU_ERR_NOT_IMPLEMENTED (no native render-graph   #skip-lint
+#     executor there; see docs/development/roadmap.md).
+# Returns 0; 1 for a dependency cycle (as rg_build); else a GPU_ERR_*: _OTHER for a
+# null g / ctx, _FORMAT_UNSUPPORTED, _TEXTURE_DIMENSION or _BUFFER for a transient
+# the native backing cannot hold, _OUT_OF_MEMORY when the allocation fails. On a
+# failure the graph is left unbuilt. A built graph returns 0 at once.
+fn rg_build_ctx(g, ctx): i64 {
+    if (g == 0) { return GPU_ERR_OTHER; }
+    if (ctx == 0) { return GPU_ERR_OTHER; }
+    if (rg_is_built(g) == 1) { return 0; }
+    var kind = BACKEND_KIND_WGPU;
+    var b = gpu_ctx_backend(ctx);
+    if (b != 0) { kind = backend_kind(b); }
+    if (kind == BACKEND_KIND_NVIDIA) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+    if (kind == BACKEND_KIND_INTEL) { return GPU_ERR_NOT_IMPLEMENTED; }    #skip-lint
+    if (kind != BACKEND_KIND_AMD) {
+        var rc = rg_build(g, gpu_ctx_device(ctx));
+        if (rc == 0) { store64(g + 48, ctx); }
+        return rc;
+    }
+    var vr = _rg_native_validate(g);
+    if (vr != 0) { return vr; }
+    var brc = rg_build(g, 0);
+    if (brc != 0) { return brc; }
+    store64(g + 48, ctx);
+    var nr = _rg_native_back(g, ctx);
+    if (nr != 0) {
+        store64(g + 16, 0);
+        store64(g + 48, 0);
+    }
+    return nr;
+}
+
+# The native backing's limits on each transient (checked before anything is built
+# or allocated). Returns 0 or a GPU_ERR_*.
+fn _rg_native_validate(g): i64 {
+    var transients = load64(g + 8);
+    var t = vec_len(transients);
+    for (var i = 0; i < t; i = i + 1) {
+        var r = vec_get(transients, i);
+        if (load64(r + 0) == RES_BUFFER) {
+            var size = load64(r + 24);
+            if (size <= 0) { return GPU_ERR_BUFFER; }
+            if (size > _NATIVE_TEXTURE_VA_REGION) { return GPU_ERR_BUFFER; }
+        }
+        if (load64(r + 0) == RES_TEXTURE) {
+            var w = load64(r + 24);
+            var h = load64(r + 32);
+            if (w < 1) { return GPU_ERR_TEXTURE_DIMENSION; }
+            if (h < 1) { return GPU_ERR_TEXTURE_DIMENSION; }
+            if (validate_dimensions(w, h, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return GPU_ERR_TEXTURE_DIMENSION; }
+            var packed = load64(r + 40);
+            var fmt = mabda_texfmt_from_wgpu(packed / 0x100000000);
+            var usage = packed & 0xFFFFFFFF;
+            var ok = 0;
+            if (fmt == MABDA_TEXFMT_RGBA8) { ok = 1; }
+            if (fmt == MABDA_TEXFMT_RGBA8_SRGB) { ok = 1; }
+            if (ok == 0) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+            if ((usage & WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT) != 0) {
+                # The native target is RGBA8 UNORM with even sides (native_rt_create_2d_rgba8).
+                if (fmt != MABDA_TEXFMT_RGBA8) { return GPU_ERR_FORMAT_UNSUPPORTED; }
+                if ((w & 1) != 0) { return GPU_ERR_TEXTURE_DIMENSION; }
+                if ((h & 1) != 0) { return GPU_ERR_TEXTURE_DIMENSION; }
+            }
+        }
+    }
+    return 0;
+}
+
+# Allocate the native backing and point every used transient into it. The layout is
+# the planner's (aliasing on: shared slots; off: every transient its own bytes),
+# then one 64-byte descriptor per texture past it. Returns 0 or a GPU_ERR_*.
+fn _rg_native_back(g, ctx): i64 {
+    var stats[24];
+    _rg_plan(g, &stats, load64(g + 24), 1);
+    var end = load64(&stats + 16);
+    var transients = load64(g + 8);
+    var t = vec_len(transients);
+    var n_tex = 0;
+    for (var i = 0; i < t; i = i + 1) {
+        var r = vec_get(transients, i);
+        if (load64(r + 0) == RES_TEXTURE) { if (load64(r + 48) != 0 - 1) { n_tex = n_tex + 1; } }
+    }
+    var desc_base = _rg_plan_align_up(end, _RG_PLAN_ALIGN);
+    var total = desc_base + n_tex * 64;
+    if (total == 0) { return 0; }
+    if (total > _NATIVE_TEXTURE_VA_REGION) { return GPU_ERR_OUT_OF_MEMORY; }
+    var block = gpu_buffer_create(ctx, total, 0);
+    if (block == 0) { return GPU_ERR_OUT_OF_MEMORY; }
+    store64(g + 56, block);
+    store64(g + 64, total);
+    var bh = load64(block + NATIVE_BUF_FIELD_HANDLE);
+    var bva = load64(block + NATIVE_BUF_FIELD_VA);
+    var baddr = load64(block + NATIVE_BUF_FIELD_ADDR);
+    var di = 0;
+    for (var k = 0; k < t; k = k + 1) {
+        var rr = vec_get(transients, k);
+        if (load64(rr + 48) != 0 - 1) {
+            var off = load64(rr + 64);
+            if (load64(rr + 0) == RES_BUFFER) {
+                var v = alloc(NATIVE_BUF_STRUCT_SIZE);
+                store64(v + NATIVE_BUF_FIELD_HANDLE, bh);
+                store64(v + NATIVE_BUF_FIELD_VA, bva + off);
+                store64(v + NATIVE_BUF_FIELD_ADDR, baddr + off);
+                store64(v + NATIVE_BUF_FIELD_SIZE, load64(rr + 24));
+                store64(rr + 8, v);
+            }
+            if (load64(rr + 0) == RES_TEXTURE) {
+                var w = load64(rr + 24);
+                var h = load64(rr + 32);
+                var packed = load64(rr + 40);
+                var fmt = mabda_texfmt_from_wgpu(packed / 0x100000000);
+                var doff = desc_base + di * 64;
+                var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
+                native_tex_view_init(tex, bh, bva + off, baddr + off, w, h, fmt, baddr + doff, bva + doff);
+                store64(rr + 8, tex);
+                if (((packed & 0xFFFFFFFF) & WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT) != 0) {
+                    var rt = alloc(NATIVE_RT_STRUCT_SIZE);
+                    memset(rt, 0, NATIVE_RT_STRUCT_SIZE);
+                    store64(rt + NATIVE_RT_FIELD_HANDLE, bh);
+                    store64(rt + NATIVE_RT_FIELD_VA, bva + off);
+                    store64(rt + NATIVE_RT_FIELD_ADDR, baddr + off);
+                    store64(rt + NATIVE_RT_FIELD_SIZE, w * h * 4);
+                    store32(rt + NATIVE_RT_FIELD_WIDTH, w);
+                    store32(rt + NATIVE_RT_FIELD_HEIGHT, h);
+                    store64(rr + 88, rt);
+                }
+                di = di + 1;
+            }
+        }
     }
     return 0;
 }
@@ -38978,9 +39290,12 @@ fn rg_build(g, device): i64 {
 # Transients with first_use == -1 (never used) are skipped.
 # Returns 0 on success.
 #
-# Byte size per kind: buffers use size_w directly; textures use
-# width * height * 4 as a portable RGBA8 proxy. Format-aware sizing
-# lands with Phase B's texture-format byte-width table.
+# Byte size per kind: buffers use size_w directly. Textures (4.5.0) take
+# their format's size (mabda_texfmt_data_size of the mabda id for the
+# WGPUTextureFormat); a format mabda has no id for is sized at 16 bytes a
+# texel, the largest uncompressed WebGPU colour format (RGBA32 float), so
+# the plan never undersizes it. Until 4.5.0 every texture was sized as
+# RGBA8 (width * height * 4), which undersized RGBA16F by half.
 #
 # Alignment: 256 bytes, matches typical GPU storage-buffer binding
 # alignment. Both naive and aliased totals respect it, so the reclaim
@@ -38990,13 +39305,23 @@ var _RG_PLAN_ALIGN = 256;
 fn _rg_plan_transient_bytes(r): i64 {
     var kind = load64(r + 0);
     if (kind == RES_BUFFER) {
-        return load64(r + 24);
+        var size = load64(r + 24);
+        if (size < 0) { return 0; }
+        if (size > _NATIVE_TEXTURE_VA_REGION) { return 0; }   # unplannable (rg_build_ctx refuses it)
+        return size;
     }
-    # Texture: width * height * 4 (RGBA8 proxy).
     var w = load64(r + 24);
     var h = load64(r + 32);
     if (h == 0) { h = 1; }
-    return w * h * 4;
+    if (w < 1) { return 0; }
+    if (h < 1) { return 0; }
+    if (validate_dimensions(w, h, MABDA_MAX_TEXTURE_DIM_2D) != 0) { return 0; }   # dims capped: no overflow
+    var fmt = mabda_texfmt_from_wgpu(load64(r + 40) / 0x100000000);
+    if (fmt >= 0) {
+        var sz = mabda_texfmt_data_size(fmt, w, h);
+        if (sz > 0) { return sz; }
+    }
+    return w * h * 16;
 }
 
 fn _rg_plan_align_up(n, align): i64 {
@@ -39006,23 +39331,26 @@ fn _rg_plan_align_up(n, align): i64 {
 }
 
 # Per-kind planner. Call once with kind=RES_BUFFER then once with
-# kind=RES_TEXTURE, summing results. Slots are tracked in two
-# parallel vecs:
+# kind=RES_TEXTURE, summing results. Slots are tracked in parallel vecs:
 #   slot_offset (i64)
 #   slot_size   (i64)
 #   slot_until  (i64 — last_use of the current occupant; -1 = free)
-fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
+#   slot_owner  (i64 — res_id of the current occupant; 4.5.0)
+# `reuse` 0 gives every transient its own slot (the native layout with
+# aliasing off); `apply` 0 computes the totals without writing the
+# transients' offset / alias_of / plan_bytes (4.5.0).
+fn _rg_plan_kind(g, kind, start_offset, out_slot_count, reuse, apply): i64 {
     var transients = load64(g + 8);
     var t = vec_len(transients);
     if (t == 0) { store64(out_slot_count, 0); return start_offset; }
 
-    # Collect live transients of this kind (first_use != -1).
+    # Collect live transients of this kind (first_use != -1), by res_id.
     var live = vec_new();
     var ti = 0;
     while (ti < t) {
         var r = vec_get(transients, ti);
         if (load64(r + 0) == kind) {
-            if (load64(r + 48) != 0 - 1) { vec_push(live, r); }
+            if (load64(r + 48) != 0 - 1) { vec_push(live, ti); }
         }
         ti = ti + 1;
     }
@@ -39035,7 +39363,9 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
         var min_j = i;
         var j = i + 1;
         while (j < n_live) {
-            if (load64(vec_get(live, j) + 48) < load64(vec_get(live, min_j) + 48)) {
+            var rj = vec_get(transients, vec_get(live, j));
+            var rm = vec_get(transients, vec_get(live, min_j));
+            if (load64(rj + 48) < load64(rm + 48)) {
                 min_j = j;
             }
             j = j + 1;
@@ -39054,11 +39384,13 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
     var slot_offsets = vec_new();
     var slot_sizes   = vec_new();
     var slot_until   = vec_new();
+    var slot_owner   = vec_new();
     var cursor = start_offset;
 
     var si = 0;
     while (si < n_live) {
-        var r2 = vec_get(live, si);
+        var id2 = vec_get(live, si);
+        var r2 = vec_get(transients, id2);
         var fu2 = load64(r2 + 48);
         var lu2 = load64(r2 + 56);
         var sz2 = _rg_plan_align_up(_rg_plan_transient_bytes(r2), _RG_PLAN_ALIGN);
@@ -39066,7 +39398,9 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
         var best = 0 - 1;
         var best_size = 0 - 1;
         var k = 0;
-        while (k < vec_len(slot_offsets)) {
+        var n_slots = vec_len(slot_offsets);
+        if (reuse == 0) { n_slots = 0; }
+        while (k < n_slots) {
             var u = vec_get(slot_until, k);
             if (u < fu2) {
                 var slot_sz = vec_get(slot_sizes, k);
@@ -39080,15 +39414,24 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
             k = k + 1;
         }
 
+        var place = cursor;
+        var prev = 0 - 1;
         if (best == 0 - 1) {
-            store64(r2 + 64, cursor);
             vec_push(slot_offsets, cursor);
             vec_push(slot_sizes, sz2);
             vec_push(slot_until, lu2);
+            vec_push(slot_owner, id2);
             cursor = cursor + sz2;
         } else {
-            store64(r2 + 64, vec_get(slot_offsets, best));
+            place = vec_get(slot_offsets, best);
+            prev = vec_get(slot_owner, best);
             vec_set(slot_until, best, lu2);
+            vec_set(slot_owner, best, id2);
+        }
+        if (apply == 1) {
+            store64(r2 + 64, place);
+            store64(r2 + 72, prev);
+            store64(r2 + 80, sz2);
         }
         si = si + 1;
     }
@@ -39101,10 +39444,19 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count): i64 {
 #   +0:  slot_count    (i64)
 #   +8:  naive_bytes   (i64) — sum of all live transient sizes, aligned
 #   +16: aliased_bytes (i64) — total block size under aliasing
-# Sets each live transient's offset field as a side effect.
+# Sets each live transient's offset field as a side effect — except on a
+# graph with a native backing (rg_build_ctx, 4.5.0), whose offsets are
+# the layout the backing was built with and stay as they are.
 # Returns 0 on success, 1 if the graph is not yet built.   #skip-lint
 fn rg_plan_aliasing_stats(g, out): i64 {
     if (rg_is_built(g) == 0) { return 1; }
+    var apply = 1;
+    if (load64(g + 56) != 0) { apply = 0; }
+    return _rg_plan(g, out, 1, apply);
+}
+
+# The planner over both kinds (`reuse` / `apply` as in _rg_plan_kind). Returns 0.
+fn _rg_plan(g, out, reuse, apply): i64 {
     store64(out + 0, 0);
     store64(out + 8, 0);
     store64(out + 16, 0);
@@ -39126,15 +39478,15 @@ fn rg_plan_aliasing_stats(g, out): i64 {
     # get [0, buf_end); textures start at buf_end). This is conservative
     # — real hardware might allow mixed allocations but requires
     # bufferImageGranularity handling that lives in Phase B.
-    var buf_slots = alloc(8);
-    store64(buf_slots, 0);
-    var buf_end = _rg_plan_kind(g, RES_BUFFER, 0, buf_slots);
+    var buf_slots[8];
+    store64(&buf_slots, 0);
+    var buf_end = _rg_plan_kind(g, RES_BUFFER, 0, &buf_slots, reuse, apply);
 
-    var tex_slots = alloc(8);
-    store64(tex_slots, 0);
-    var tex_end = _rg_plan_kind(g, RES_TEXTURE, buf_end, tex_slots);
+    var tex_slots[8];
+    store64(&tex_slots, 0);
+    var tex_end = _rg_plan_kind(g, RES_TEXTURE, buf_end, &tex_slots, reuse, apply);
 
-    store64(out + 0, load64(buf_slots) + load64(tex_slots));
+    store64(out + 0, load64(&buf_slots) + load64(&tex_slots));
     store64(out + 8, naive);
     store64(out + 16, tex_end);
     return 0;
@@ -39656,6 +40008,50 @@ fn _rg_native_dispatch_node(ctx, node): i64 {
 # advances the IB staging slice per node (R.5; no shared-IB clobber), and
 # finally gpu_queue_wait_idle's every used queue so results are readable on
 # return (the v2.5 completion contract). Returns 0|GPU_ERR_*.
+# The waits node `i` needs before it is dispatched on `q` (4.5.0), recorded with
+# gpu_queue_barrier, which waits for everything the source queue has submitted:
+#   - every earlier node that writes a resource node i reads, on ANY queue. A
+#     same-queue edge used to rely on submit order, but successive submits on one
+#     ring may overlap; a same-ring wait makes the kernel insert a pipeline sync.
+#   - for every transient whose first user is node i and which takes over another
+#     transient's slot (alias_of), every queue that ran a user of that transient, so
+#     nothing still reads or writes the bytes when they are reused.
+# Returns 0 or the first GPU_ERR_* a barrier gave.
+fn _rg_native_waits(g, ctx, i, q): i64 {
+    var nodes = load64(g + 0);
+    var node = vec_get(nodes, i);
+    var reads = load64(node + 16);
+    for (var j = 0; j < i; j = j + 1) {
+        var pj = vec_get(nodes, j);
+        if (_rg_nodes_share_dep(load64(pj + 24), reads) == 1) {
+            # A dispatcher call is never a later argument: it would run with rsp 8 bytes
+            # off alignment (docs/development/issues/archived/2026-09-16-cycc-nested-call-stack-alignment.md).
+            var pq = gpu_queue_get(ctx, load64(pj + 56));
+            var br = gpu_queue_barrier(ctx, pq, q);
+            if (br != 0) { return br; }
+        }
+    }
+    var transients = load64(g + 8);
+    var t = vec_len(transients);
+    for (var k = 0; k < t; k = k + 1) {
+        var r = vec_get(transients, k);
+        if (load64(r + 48) == i) {
+            var prev = load64(r + 72);
+            if (prev >= 0) {
+                var mask = load64(vec_get(transients, prev) + 96);
+                for (var qk = 0; qk < QUEUE_KIND_COUNT; qk = qk + 1) {
+                    if ((mask & (1 << qk)) != 0) {
+                        var aq = gpu_queue_get(ctx, qk);
+                        var ar = gpu_queue_barrier(ctx, aq, q);
+                        if (ar != 0) { return ar; }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 fn _rg_execute_native_mq(g, ctx): i64 {
     var nodes = load64(g + 0);
     var n = vec_len(nodes);
@@ -39666,8 +40062,6 @@ fn _rg_execute_native_mq(g, ctx): i64 {
     var sched = _rg_sched(g);
     var batches = load64(sched + SCHED_OFF_BATCHES);
     var nb = vec_len(batches);
-    var fences = load64(sched + SCHED_OFF_FENCES);
-    var nf = vec_len(fences);
 
     # Acquire (idempotently) the logical queue for every batch's kind.
     var bi = 0;
@@ -39684,18 +40078,11 @@ fn _rg_execute_native_mq(g, ctx): i64 {
         var node = vec_get(nodes, i);   # vec is in sort_idx order, so i == sort_idx
         var q = gpu_queue_get(ctx, load64(node + 56));
 
-        # Cross-queue barriers for every fence edge feeding this consumer node.
-        var fi = 0;
-        while (fi < nf) {
-            var fe = vec_get(fences, fi);
-            if (load64(fe + FENCE_OFF_CN) == i) {
-                # A dispatcher call is never a later argument: it would run with rsp 8 bytes
-                # off alignment (docs/development/issues/archived/2026-09-16-cycc-nested-call-stack-alignment.md).
-                var pq = gpu_queue_get(ctx, load64(fe + FENCE_OFF_PQ));
-                gpu_queue_barrier(ctx, pq, q);
-            }
-            fi = fi + 1;
-        }
+        # Waits before this node (4.5.0): every producer it reads, on whatever queue,
+        # and every queue that used a slot it now reuses. Before 4.5.0 only the
+        # cross-queue edges (`fences`, nf) waited, and on one pending slot.
+        var wr0 = _rg_native_waits(g, ctx, i, q);
+        if (wr0 != 0) { rc = wr0; }
 
         gpu_ctx_set_current_queue(ctx, q);
         var dr = _rg_native_dispatch_node(ctx, node);
@@ -39733,6 +40120,10 @@ fn rg_execute_mq(g, ctx): i64 {
         if (backend_kind(b) == BACKEND_KIND_AMD) {
             return _rg_execute_native_mq(g, ctx);
         }
+        # 4.5.0: a native NVIDIA / Intel context has no graph executor; it used to
+        # fall into the wgpu path and call wgpu with native handles.
+        if (backend_kind(b) == BACKEND_KIND_NVIDIA) { return GPU_ERR_NOT_IMPLEMENTED; }   #skip-lint
+        if (backend_kind(b) == BACKEND_KIND_INTEL) { return GPU_ERR_NOT_IMPLEMENTED; }    #skip-lint
     }
     return rg_execute(g, gpu_ctx_device(ctx), gpu_ctx_queue(ctx));
 }
@@ -39745,6 +40136,27 @@ fn rg_release(g): i64 {
     if (g == 0) { return 0; }
     var transients = load64(g + 8);
     var t = vec_len(transients);
+    # 4.5.0: a native AMD graph frees its one backing allocation; its transients are
+    # views into it (never wgpu objects), so only their fields are cleared.
+    var ctx = load64(g + 48);
+    var native = 0;
+    if (ctx != 0) {
+        var cb = gpu_ctx_backend(ctx);
+        if (cb != 0) { if (backend_kind(cb) == BACKEND_KIND_AMD) { native = 1; } }
+    }
+    if (native == 1) {
+        var backing = load64(g + 56);
+        if (backing != 0) { gpu_buffer_release(ctx, backing); }
+        store64(g + 56, 0);
+        store64(g + 64, 0);
+        for (var vi = 0; vi < t; vi = vi + 1) {
+            var vr = vec_get(transients, vi);
+            store64(vr + 8, 0);
+            store64(vr + 16, 0);
+            store64(vr + 88, 0);
+        }
+        return 0;
+    }
     var ti = 0;
     while (ti < t) {
         var r = vec_get(transients, ti);
@@ -39797,7 +40209,7 @@ fn _rg_alloc_transient(r, device): i64 {
     # the GPU side. Real executions pass a live device.
     if (device == 0) { return 0; }
     var kind = load64(r + 0);
-    var label = load64(r + 8);
+    var label = load64(r + 104);
     if (kind == RES_BUFFER) {
         var size = load64(r + 24);
         var usage = load64(r + 40) & 0xFFFFFFFF;

@@ -56,20 +56,28 @@ var QUEUE_KIND_COUNT    = 3;
 #   +24: timeline_point   monotonic u64 — last point signalled on this
 #                         queue's timeline. Bumped per queue-targeted
 #                         submit (Q.3); read by gpu_queue_barrier (Q.4).
-#   +32: pending_wait_syncobj  Q.4 — a cross-ring dependency recorded by
+#   +32: pending_wait_syncobj  Q.4 — a dependency recorded by
 #                         gpu_queue_barrier on the CONSUMER queue. The
 #                         consumer's NEXT queue-targeted submit adds an
 #                         in-CS TIMELINE_WAIT on (this syncobj, point),
-#                         then clears both. 0 = no pending dependency.
+#                         then clears it. 0 = no pending dependency.
 #   +40: pending_wait_point    Q.4 — the producer timeline point this
 #                         queue's next submit must wait for.
+#   +48..+95: pending waits 1..3, the same (syncobj, point) pair shape (4.5.0).
+#                         Before 4.5.0 a queue held ONE pending wait, so a
+#                         second barrier into the same submit overwrote the
+#                         first. Now a barrier merges into the slot of its
+#                         syncobj (the later point wins) or takes a free one;
+#                         a context has one timeline per queue kind, so 3
+#                         slots cover every source and the 4th is headroom.
 var QUEUE_OFF_KIND         = 0;
 var QUEUE_OFF_RING         = 8;
 var QUEUE_OFF_SYNCOBJ      = 16;
 var QUEUE_OFF_POINT        = 24;
 var QUEUE_OFF_PEND_SYNCOBJ = 32;
 var QUEUE_OFF_PEND_POINT   = 40;
-var QUEUE_STRUCT_SIZE      = 48;
+var QUEUE_PEND_SLOTS       = 4;
+var QUEUE_STRUCT_SIZE      = 96;
 
 # Allocate a zero-initialized Queue of the given kind. ring_handle,
 # timeline_syncobj, and timeline_point stay zero until the backend
@@ -122,10 +130,16 @@ fn queue_bump_point(q): i64 {
     return p;
 }
 
-# Pending cross-ring wait dependency (Q.4). gpu_queue_barrier records
-# (producer syncobj, producer point) on the CONSUMER queue; the
-# consumer's next queue-targeted submit reads these, adds an in-CS
-# TIMELINE_WAIT, and clears them. syncobj == 0 means "no pending wait".
+# Pending wait dependencies (Q.4; several since 4.5.0). gpu_queue_barrier
+# records (producer syncobj, producer point) on the CONSUMER queue; the
+# consumer's next queue-targeted submit takes them all, adds one in-CS
+# TIMELINE_WAIT entry per syncobj, and clears them. syncobj == 0 marks a
+# free slot. A barrier from a queue onto itself is allowed: the kernel turns
+# a same-ring dependency into a pipeline sync, so the submit starts only after
+# the earlier work has finished.
+fn _queue_pend_off(i): i64 { return QUEUE_OFF_PEND_SYNCOBJ + i * 16; }
+
+# Slot 0's syncobj / point (the pre-4.5.0 single-wait accessors).
 fn queue_pending_wait_syncobj(q): i64 {
     if (q == 0) { return 0; }
     return load64(q + QUEUE_OFF_PEND_SYNCOBJ);
@@ -134,17 +148,64 @@ fn queue_pending_wait_point(q): i64 {
     if (q == 0) { return 0; }
     return load64(q + QUEUE_OFF_PEND_POINT);
 }
+
+# The number of pending waits (occupied slots).
+fn queue_pending_wait_count(q): i64 {
+    if (q == 0) { return 0; }
+    var n = 0;
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        if (load64(q + _queue_pend_off(i)) != 0) { n = n + 1; }
+    }
+    return n;
+}
+
+# Add a pending wait for `syncobj` at `point`: merged into that syncobj's slot
+# (the later point wins), else into a free slot. Returns 0, or -1 for a null
+# queue, a zero syncobj or point, or no free slot (never silently dropped).
 fn queue_set_pending_wait(q, syncobj, point): i64 {
     if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, syncobj);
-    store64(q + QUEUE_OFF_PEND_POINT, point);
-    return 0;
+    if (syncobj == 0) { return -1; }
+    if (point == 0) { return -1; }
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        var off = _queue_pend_off(i);
+        if (load64(q + off) == syncobj) {
+            if (point > load64(q + off + 8)) { store64(q + off + 8, point); }
+            return 0;
+        }
+    }
+    for (var j = 0; j < QUEUE_PEND_SLOTS; j = j + 1) {
+        var off2 = _queue_pend_off(j);
+        if (load64(q + off2) == 0) {
+            store64(q + off2, syncobj);
+            store64(q + off2 + 8, point);
+            return 0;
+        }
+    }
+    return -1;
 }
+
 fn queue_clear_pending_wait(q): i64 {
     if (q == 0) { return -1; }
-    store64(q + QUEUE_OFF_PEND_SYNCOBJ, 0);
-    store64(q + QUEUE_OFF_PEND_POINT, 0);
+    memset(q + QUEUE_OFF_PEND_SYNCOBJ, 0, QUEUE_PEND_SLOTS * 16);
     return 0;
+}
+
+# Move every pending wait into `out` as (syncobj u64, point u64) pairs
+# (QUEUE_PEND_SLOTS * 16 bytes) and clear them. Returns the pair count.
+fn queue_take_pending_waits(q, out): i64 {
+    if (q == 0) { return 0; }
+    var n = 0;
+    for (var i = 0; i < QUEUE_PEND_SLOTS; i = i + 1) {
+        var off = _queue_pend_off(i);
+        var so = load64(q + off);
+        if (so != 0) {
+            store64(out + n * 16, so);
+            store64(out + n * 16 + 8, load64(q + off + 8));
+            n = n + 1;
+        }
+    }
+    queue_clear_pending_wait(q);
+    return n;
 }
 
 # ================================================================

@@ -1,0 +1,684 @@
+# programs/native_rg_alias_e2e.cyr — 4.5.0: render-graph transients sharing one backing
+# allocation on native AMD, checked on the Cezanne.
+#
+# rg_build_ctx gives a native graph's transients one GTT BO; with rg_aliasing(g, 1),
+# transients with disjoint lifetimes share bytes, and rg_execute_mq makes each node that
+# reuses a slot wait for every queue that used the slot's previous occupant.
+#   A. A compute chain across rings: n0 (COMPUTE) b1 = b0 + 1, n1 (GRAPHICS) b2 = b1 + 1,
+#      n2 (COMPUTE) b3 = b2 + 1. b2 reuses b0's bytes and b3 reuses b1's, so 4 buffers fit
+#      in 2 slots. Every b3[i] must be b0[i] + 3.
+#   B. The case only the reuse wait covers: two INDEPENDENT nodes on different rings. n0
+#      (GRAPHICS) runs a 32768-step loop, then reads X into a buffer it owns; n1 (COMPUTE)
+#      writes Y, which reuses X's bytes. With no data edge between them, only the wait keeps
+#      n1 from overwriting X before n0 reads it. Every R[i] must be X[i] + 1.
+#   C. Textures on the GRAPHICS ring: n0 samples t0 into t1 (a render target), n1 samples
+#      t1 into t2, which reuses t0's bytes. t2 must equal t0's uploaded pattern exactly.
+#
+# Exit codes: 0 pass; 1 ctx; 2 kernel; 3 build; 4 layout; 5 execute; 6 A wrong; 7 B wrong;
+#   8 render setup; 9 C wrong; 10 consumer buffers.
+include "src/lib.cyr"
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# SPIR-V (644 bytes; tests/spirv/rg_alias/*.spvasm): o[gid] = a[gid] + 1. LocalSize 64;
+# binding 0 = a, binding 1 = o. Returns the byte length.
+fn build_add_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x0000001B);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x0003000E);
+    store32(buf + 32, 0x00000000);
+    store32(buf + 36, 0x00000001);
+    store32(buf + 40, 0x0006000F);
+    store32(buf + 44, 0x00000005);
+    store32(buf + 48, 0x00000001);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x00000002);
+    store32(buf + 64, 0x00060010);
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x00000011);
+    store32(buf + 76, 0x00000040);
+    store32(buf + 80, 0x00000001);
+    store32(buf + 84, 0x00000001);
+    store32(buf + 88, 0x00040047);
+    store32(buf + 92, 0x00000002);
+    store32(buf + 96, 0x0000000B);
+    store32(buf + 100, 0x0000001C);
+    store32(buf + 104, 0x00040047);
+    store32(buf + 108, 0x00000003);
+    store32(buf + 112, 0x00000006);
+    store32(buf + 116, 0x00000004);
+    store32(buf + 120, 0x00050048);
+    store32(buf + 124, 0x00000004);
+    store32(buf + 128, 0x00000000);
+    store32(buf + 132, 0x00000023);
+    store32(buf + 136, 0x00000000);
+    store32(buf + 140, 0x00030047);
+    store32(buf + 144, 0x00000004);
+    store32(buf + 148, 0x00000002);
+    store32(buf + 152, 0x00040047);
+    store32(buf + 156, 0x00000005);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047);
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000000);
+    store32(buf + 184, 0x00040047);
+    store32(buf + 188, 0x00000006);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00040047);
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00000021);
+    store32(buf + 212, 0x00000001);
+    store32(buf + 216, 0x00020013);
+    store32(buf + 220, 0x00000007);
+    store32(buf + 224, 0x00030021);
+    store32(buf + 228, 0x00000008);
+    store32(buf + 232, 0x00000007);
+    store32(buf + 236, 0x00040015);
+    store32(buf + 240, 0x00000009);
+    store32(buf + 244, 0x00000020);
+    store32(buf + 248, 0x00000000);
+    store32(buf + 252, 0x00040017);
+    store32(buf + 256, 0x0000000A);
+    store32(buf + 260, 0x00000009);
+    store32(buf + 264, 0x00000003);
+    store32(buf + 268, 0x00040020);
+    store32(buf + 272, 0x0000000B);
+    store32(buf + 276, 0x00000001);
+    store32(buf + 280, 0x0000000A);
+    store32(buf + 284, 0x00020014);
+    store32(buf + 288, 0x0000000C);
+    store32(buf + 292, 0x0003001D);
+    store32(buf + 296, 0x00000003);
+    store32(buf + 300, 0x00000009);
+    store32(buf + 304, 0x0003001E);
+    store32(buf + 308, 0x00000004);
+    store32(buf + 312, 0x00000003);
+    store32(buf + 316, 0x00040020);
+    store32(buf + 320, 0x0000000D);
+    store32(buf + 324, 0x0000000C);
+    store32(buf + 328, 0x00000004);
+    store32(buf + 332, 0x00040020);
+    store32(buf + 336, 0x0000000E);
+    store32(buf + 340, 0x0000000C);
+    store32(buf + 344, 0x00000009);
+    store32(buf + 348, 0x0004002B);
+    store32(buf + 352, 0x00000009);
+    store32(buf + 356, 0x0000000F);
+    store32(buf + 360, 0x00000000);
+    store32(buf + 364, 0x0004002B);
+    store32(buf + 368, 0x00000009);
+    store32(buf + 372, 0x00000010);
+    store32(buf + 376, 0x00000001);
+    store32(buf + 380, 0x0004002B);
+    store32(buf + 384, 0x00000009);
+    store32(buf + 388, 0x00000011);
+    store32(buf + 392, 0x00000005);
+    store32(buf + 396, 0x0004002B);
+    store32(buf + 400, 0x00000009);
+    store32(buf + 404, 0x00000012);
+    store32(buf + 408, 0x00000007);
+    store32(buf + 412, 0x0004002B);
+    store32(buf + 416, 0x00000009);
+    store32(buf + 420, 0x00000013);
+    store32(buf + 424, 0x00008000);
+    store32(buf + 428, 0x0004003B);
+    store32(buf + 432, 0x0000000B);
+    store32(buf + 436, 0x00000002);
+    store32(buf + 440, 0x00000001);
+    store32(buf + 444, 0x0004003B);
+    store32(buf + 448, 0x0000000D);
+    store32(buf + 452, 0x00000005);
+    store32(buf + 456, 0x0000000C);
+    store32(buf + 460, 0x0004003B);
+    store32(buf + 464, 0x0000000D);
+    store32(buf + 468, 0x00000006);
+    store32(buf + 472, 0x0000000C);
+    store32(buf + 476, 0x00050036);
+    store32(buf + 480, 0x00000007);
+    store32(buf + 484, 0x00000001);
+    store32(buf + 488, 0x00000000);
+    store32(buf + 492, 0x00000008);
+    store32(buf + 496, 0x000200F8);
+    store32(buf + 500, 0x00000014);
+    store32(buf + 504, 0x0004003D);
+    store32(buf + 508, 0x0000000A);
+    store32(buf + 512, 0x00000015);
+    store32(buf + 516, 0x00000002);
+    store32(buf + 520, 0x00050051);
+    store32(buf + 524, 0x00000009);
+    store32(buf + 528, 0x00000016);
+    store32(buf + 532, 0x00000015);
+    store32(buf + 536, 0x00000000);
+    store32(buf + 540, 0x00060041);
+    store32(buf + 544, 0x0000000E);
+    store32(buf + 548, 0x00000017);
+    store32(buf + 552, 0x00000005);
+    store32(buf + 556, 0x0000000F);
+    store32(buf + 560, 0x00000016);
+    store32(buf + 564, 0x0004003D);
+    store32(buf + 568, 0x00000009);
+    store32(buf + 572, 0x00000018);
+    store32(buf + 576, 0x00000017);
+    store32(buf + 580, 0x00050080);
+    store32(buf + 584, 0x00000009);
+    store32(buf + 588, 0x00000019);
+    store32(buf + 592, 0x00000018);
+    store32(buf + 596, 0x00000010);
+    store32(buf + 600, 0x00060041);
+    store32(buf + 604, 0x0000000E);
+    store32(buf + 608, 0x0000001A);
+    store32(buf + 612, 0x00000006);
+    store32(buf + 616, 0x0000000F);
+    store32(buf + 620, 0x00000016);
+    store32(buf + 624, 0x0003003E);
+    store32(buf + 628, 0x0000001A);
+    store32(buf + 632, 0x00000019);
+    store32(buf + 636, 0x000100FD);
+    store32(buf + 640, 0x00010038);
+    return 644;
+}
+
+# SPIR-V (932 bytes; tests/spirv/rg_alias/*.spvasm): o[gid] = a[gid] + 1, a[gid] loaded after a
+# 32768-step loop. LocalSize 64;
+# binding 0 = a, binding 1 = o. Returns the byte length.
+fn build_slow_kernel(buf): i64 {
+    store32(buf + 0, 0x07230203);
+    store32(buf + 4, 0x00010300);
+    store32(buf + 8, 0x00070000);
+    store32(buf + 12, 0x00000028);
+    store32(buf + 16, 0x00000000);
+    store32(buf + 20, 0x00020011);
+    store32(buf + 24, 0x00000001);
+    store32(buf + 28, 0x0003000E);
+    store32(buf + 32, 0x00000000);
+    store32(buf + 36, 0x00000001);
+    store32(buf + 40, 0x0006000F);
+    store32(buf + 44, 0x00000005);
+    store32(buf + 48, 0x00000001);
+    store32(buf + 52, 0x6E69616D);
+    store32(buf + 56, 0x00000000);
+    store32(buf + 60, 0x00000002);
+    store32(buf + 64, 0x00060010);
+    store32(buf + 68, 0x00000001);
+    store32(buf + 72, 0x00000011);
+    store32(buf + 76, 0x00000040);
+    store32(buf + 80, 0x00000001);
+    store32(buf + 84, 0x00000001);
+    store32(buf + 88, 0x00040047);
+    store32(buf + 92, 0x00000002);
+    store32(buf + 96, 0x0000000B);
+    store32(buf + 100, 0x0000001C);
+    store32(buf + 104, 0x00040047);
+    store32(buf + 108, 0x00000003);
+    store32(buf + 112, 0x00000006);
+    store32(buf + 116, 0x00000004);
+    store32(buf + 120, 0x00050048);
+    store32(buf + 124, 0x00000004);
+    store32(buf + 128, 0x00000000);
+    store32(buf + 132, 0x00000023);
+    store32(buf + 136, 0x00000000);
+    store32(buf + 140, 0x00030047);
+    store32(buf + 144, 0x00000004);
+    store32(buf + 148, 0x00000002);
+    store32(buf + 152, 0x00040047);
+    store32(buf + 156, 0x00000005);
+    store32(buf + 160, 0x00000022);
+    store32(buf + 164, 0x00000000);
+    store32(buf + 168, 0x00040047);
+    store32(buf + 172, 0x00000005);
+    store32(buf + 176, 0x00000021);
+    store32(buf + 180, 0x00000000);
+    store32(buf + 184, 0x00040047);
+    store32(buf + 188, 0x00000006);
+    store32(buf + 192, 0x00000022);
+    store32(buf + 196, 0x00000000);
+    store32(buf + 200, 0x00040047);
+    store32(buf + 204, 0x00000006);
+    store32(buf + 208, 0x00000021);
+    store32(buf + 212, 0x00000001);
+    store32(buf + 216, 0x00020013);
+    store32(buf + 220, 0x00000007);
+    store32(buf + 224, 0x00030021);
+    store32(buf + 228, 0x00000008);
+    store32(buf + 232, 0x00000007);
+    store32(buf + 236, 0x00040015);
+    store32(buf + 240, 0x00000009);
+    store32(buf + 244, 0x00000020);
+    store32(buf + 248, 0x00000000);
+    store32(buf + 252, 0x00040017);
+    store32(buf + 256, 0x0000000A);
+    store32(buf + 260, 0x00000009);
+    store32(buf + 264, 0x00000003);
+    store32(buf + 268, 0x00040020);
+    store32(buf + 272, 0x0000000B);
+    store32(buf + 276, 0x00000001);
+    store32(buf + 280, 0x0000000A);
+    store32(buf + 284, 0x00020014);
+    store32(buf + 288, 0x0000000C);
+    store32(buf + 292, 0x0003001D);
+    store32(buf + 296, 0x00000003);
+    store32(buf + 300, 0x00000009);
+    store32(buf + 304, 0x0003001E);
+    store32(buf + 308, 0x00000004);
+    store32(buf + 312, 0x00000003);
+    store32(buf + 316, 0x00040020);
+    store32(buf + 320, 0x0000000D);
+    store32(buf + 324, 0x0000000C);
+    store32(buf + 328, 0x00000004);
+    store32(buf + 332, 0x00040020);
+    store32(buf + 336, 0x0000000E);
+    store32(buf + 340, 0x0000000C);
+    store32(buf + 344, 0x00000009);
+    store32(buf + 348, 0x0004002B);
+    store32(buf + 352, 0x00000009);
+    store32(buf + 356, 0x0000000F);
+    store32(buf + 360, 0x00000000);
+    store32(buf + 364, 0x0004002B);
+    store32(buf + 368, 0x00000009);
+    store32(buf + 372, 0x00000010);
+    store32(buf + 376, 0x00000001);
+    store32(buf + 380, 0x0004002B);
+    store32(buf + 384, 0x00000009);
+    store32(buf + 388, 0x00000011);
+    store32(buf + 392, 0x00000005);
+    store32(buf + 396, 0x0004002B);
+    store32(buf + 400, 0x00000009);
+    store32(buf + 404, 0x00000012);
+    store32(buf + 408, 0x00000007);
+    store32(buf + 412, 0x0004002B);
+    store32(buf + 416, 0x00000009);
+    store32(buf + 420, 0x00000013);
+    store32(buf + 424, 0x00008000);
+    store32(buf + 428, 0x0004003B);
+    store32(buf + 432, 0x0000000B);
+    store32(buf + 436, 0x00000002);
+    store32(buf + 440, 0x00000001);
+    store32(buf + 444, 0x0004003B);
+    store32(buf + 448, 0x0000000D);
+    store32(buf + 452, 0x00000005);
+    store32(buf + 456, 0x0000000C);
+    store32(buf + 460, 0x0004003B);
+    store32(buf + 464, 0x0000000D);
+    store32(buf + 468, 0x00000006);
+    store32(buf + 472, 0x0000000C);
+    store32(buf + 476, 0x00050036);
+    store32(buf + 480, 0x00000007);
+    store32(buf + 484, 0x00000001);
+    store32(buf + 488, 0x00000000);
+    store32(buf + 492, 0x00000008);
+    store32(buf + 496, 0x000200F8);
+    store32(buf + 500, 0x00000014);
+    store32(buf + 504, 0x0004003D);
+    store32(buf + 508, 0x0000000A);
+    store32(buf + 512, 0x00000015);
+    store32(buf + 516, 0x00000002);
+    store32(buf + 520, 0x00050051);
+    store32(buf + 524, 0x00000009);
+    store32(buf + 528, 0x00000016);
+    store32(buf + 532, 0x00000015);
+    store32(buf + 536, 0x00000000);
+    store32(buf + 540, 0x000200F9);
+    store32(buf + 544, 0x00000017);
+    store32(buf + 548, 0x000200F8);
+    store32(buf + 552, 0x00000017);
+    store32(buf + 556, 0x000700F5);
+    store32(buf + 560, 0x00000009);
+    store32(buf + 564, 0x00000018);
+    store32(buf + 568, 0x0000000F);
+    store32(buf + 572, 0x00000014);
+    store32(buf + 576, 0x00000019);
+    store32(buf + 580, 0x0000001A);
+    store32(buf + 584, 0x000700F5);
+    store32(buf + 588, 0x00000009);
+    store32(buf + 592, 0x0000001B);
+    store32(buf + 596, 0x00000016);
+    store32(buf + 600, 0x00000014);
+    store32(buf + 604, 0x0000001C);
+    store32(buf + 608, 0x0000001A);
+    store32(buf + 612, 0x000500B0);
+    store32(buf + 616, 0x0000000C);
+    store32(buf + 620, 0x0000001D);
+    store32(buf + 624, 0x00000018);
+    store32(buf + 628, 0x00000013);
+    store32(buf + 632, 0x000400F6);
+    store32(buf + 636, 0x0000001E);
+    store32(buf + 640, 0x0000001A);
+    store32(buf + 644, 0x00000000);
+    store32(buf + 648, 0x000400FA);
+    store32(buf + 652, 0x0000001D);
+    store32(buf + 656, 0x0000001A);
+    store32(buf + 660, 0x0000001E);
+    store32(buf + 664, 0x000200F8);
+    store32(buf + 668, 0x0000001A);
+    store32(buf + 672, 0x00050084);
+    store32(buf + 676, 0x00000009);
+    store32(buf + 680, 0x0000001F);
+    store32(buf + 684, 0x0000001B);
+    store32(buf + 688, 0x00000011);
+    store32(buf + 692, 0x00050080);
+    store32(buf + 696, 0x00000009);
+    store32(buf + 700, 0x00000020);
+    store32(buf + 704, 0x0000001F);
+    store32(buf + 708, 0x00000012);
+    store32(buf + 712, 0x00050084);
+    store32(buf + 716, 0x00000009);
+    store32(buf + 720, 0x00000021);
+    store32(buf + 724, 0x00000020);
+    store32(buf + 728, 0x00000011);
+    store32(buf + 732, 0x00050080);
+    store32(buf + 736, 0x00000009);
+    store32(buf + 740, 0x0000001C);
+    store32(buf + 744, 0x00000021);
+    store32(buf + 748, 0x00000012);
+    store32(buf + 752, 0x00050080);
+    store32(buf + 756, 0x00000009);
+    store32(buf + 760, 0x00000019);
+    store32(buf + 764, 0x00000018);
+    store32(buf + 768, 0x00000010);
+    store32(buf + 772, 0x000200F9);
+    store32(buf + 776, 0x00000017);
+    store32(buf + 780, 0x000200F8);
+    store32(buf + 784, 0x0000001E);
+    store32(buf + 788, 0x00060041);
+    store32(buf + 792, 0x0000000E);
+    store32(buf + 796, 0x00000022);
+    store32(buf + 800, 0x00000005);
+    store32(buf + 804, 0x0000000F);
+    store32(buf + 808, 0x00000016);
+    store32(buf + 812, 0x0004003D);
+    store32(buf + 816, 0x00000009);
+    store32(buf + 820, 0x00000023);
+    store32(buf + 824, 0x00000022);
+    store32(buf + 828, 0x00050082);
+    store32(buf + 832, 0x00000009);
+    store32(buf + 836, 0x00000024);
+    store32(buf + 840, 0x0000001B);
+    store32(buf + 844, 0x0000001B);
+    store32(buf + 848, 0x00050080);
+    store32(buf + 852, 0x00000009);
+    store32(buf + 856, 0x00000025);
+    store32(buf + 860, 0x00000023);
+    store32(buf + 864, 0x00000010);
+    store32(buf + 868, 0x00050080);
+    store32(buf + 872, 0x00000009);
+    store32(buf + 876, 0x00000026);
+    store32(buf + 880, 0x00000025);
+    store32(buf + 884, 0x00000024);
+    store32(buf + 888, 0x00060041);
+    store32(buf + 892, 0x0000000E);
+    store32(buf + 896, 0x00000027);
+    store32(buf + 900, 0x00000006);
+    store32(buf + 904, 0x0000000F);
+    store32(buf + 908, 0x00000016);
+    store32(buf + 912, 0x0003003E);
+    store32(buf + 916, 0x00000027);
+    store32(buf + 920, 0x00000026);
+    store32(buf + 924, 0x000100FD);
+    store32(buf + 928, 0x00010038);
+    return 932;
+}
+
+var N = 4096;      # elements per buffer: 64 workgroups of 64
+var NB = 16384;    # bytes per buffer
+
+# A count-prefixed 2-binding array (a = binding 0, o = binding 1) from two NativeBufs.
+fn bind2(bp, a, o): i64 {
+    store64(bp + 0, 2);
+    store64(bp + 8, load64(a + NATIVE_BUF_FIELD_HANDLE));
+    store64(bp + 16, load64(a + NATIVE_BUF_FIELD_VA));
+    store64(bp + 24, load64(o + NATIVE_BUF_FIELD_HANDLE));
+    store64(bp + 32, load64(o + NATIVE_BUF_FIELD_VA));
+    return 0;
+}
+
+fn view_addr(g, id): i64 { return load64(rg_transient_handle(g, id) + NATIVE_BUF_FIELD_ADDR); }
+fn view_va(g, id): i64 { return load64(rg_transient_handle(g, id) + NATIVE_BUF_FIELD_VA); }
+
+# The words of `p` (n of them) that differ from base + i * step + add. Prints the first few.
+fn count_bad(p, n, step, add, label): i64 {
+    var bad = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var want = (i * step + add) & 0xFFFFFFFF;
+        var got = load32(p + i * 4);
+        if (got != want) {
+            if (bad < 4) {
+                print_cstr("  "); print_cstr(label); print_cstr("["); print_i64(i);
+                print_cstr("] = "); print_i64(got); print_cstr(", want "); print_i64(want); print_cstr("\n");
+            }
+            bad = bad + 1;
+        }
+    }
+    return bad;
+}
+
+fn phase_a(ctx, add): i64 {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var b0 = rg_add_transient_buffer(g, NB, 0, "b0");
+    var b1 = rg_add_transient_buffer(g, NB, 0, "b1");
+    var b2 = rg_add_transient_buffer(g, NB, 0, "b2");
+    var b3 = rg_add_transient_buffer(g, NB, 0, "b3");
+    var dims[12];
+    store32(&dims, 64); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var bp0[40];
+    var bp1[40];
+    var bp2[40];
+    var n0 = rg_add_compute(g, add, &bp0, &dims, "n0");
+    rg_node_reads(g, n0, b0);
+    rg_node_writes(g, n0, b1);
+    var n1 = rg_add_compute(g, add, &bp1, &dims, "n1");
+    rg_node_queue(g, n1, QUEUE_KIND_GRAPHICS);
+    rg_node_reads(g, n1, b1);
+    rg_node_writes(g, n1, b2);
+    var n2 = rg_add_compute(g, add, &bp2, &dims, "n2");
+    rg_node_reads(g, n2, b2);
+    rg_node_writes(g, n2, b3);
+    var rc = rg_build_ctx(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: A build rc="); print_i64(rc); print_cstr("\n"); return 3; }
+    var stats[24];
+    rg_plan_aliasing_stats(g, &stats);
+    print_cstr("A. chain COMPUTE -> GRAPHICS -> COMPUTE: backing "); print_i64(rg_backing_bytes(g));
+    print_cstr(" bytes for "); print_i64(load64(&stats + 8)); print_cstr(" of transients\n");
+    if (rg_transient_alias_of(g, b2) != b0) { print_cstr("FAIL: A: b2 does not reuse b0\n"); return 4; }
+    if (rg_transient_alias_of(g, b3) != b1) { print_cstr("FAIL: A: b3 does not reuse b1\n"); return 4; }
+    if (view_va(g, b2) != view_va(g, b0)) { print_cstr("FAIL: A: b2 and b0 differ in VA\n"); return 4; }
+    if (rg_backing_bytes(g) != 2 * NB) { print_cstr("FAIL: A: backing is not 2 buffers\n"); return 4; }
+    var v0 = rg_transient_handle(g, b0);
+    var v1 = rg_transient_handle(g, b1);
+    var v2 = rg_transient_handle(g, b2);
+    var v3 = rg_transient_handle(g, b3);
+    bind2(&bp0, v0, v1);
+    bind2(&bp1, v1, v2);
+    bind2(&bp2, v2, v3);
+    var inp = view_addr(g, b0);
+    for (var i = 0; i < N; i = i + 1) { store32(inp + i * 4, i * 7); }
+    rc = rg_execute_mq(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: A execute rc="); print_i64(rc); print_cstr("\n"); return 5; }
+    var bad = count_bad(view_addr(g, b3), N, 7, 3, "b3");
+    print_cstr("  b3 = b0 + 3: "); print_i64(N - bad); print_cstr(" of "); print_i64(N); print_cstr(" right\n");
+    rg_release(g);
+    if (bad != 0) { print_cstr("FAIL: A\n"); return 6; }
+    print_cstr("PASS: A\n");
+    return 0;
+}
+
+fn phase_b(ctx, add, slow): i64 {
+    var r = gpu_buffer_create(ctx, NB, 0);
+    var in2 = gpu_buffer_create(ctx, NB, 0);
+    if (r == 0) { print_cstr("FAIL: B buffers\n"); return 10; }
+    if (in2 == 0) { print_cstr("FAIL: B buffers\n"); return 10; }
+    var ra = load64(r + NATIVE_BUF_FIELD_ADDR);
+    var ia = load64(in2 + NATIVE_BUF_FIELD_ADDR);
+    for (var i = 0; i < N; i = i + 1) {
+        store32(ra + i * 4, 0x55555555);
+        store32(ia + i * 4, 1000000 + i);
+    }
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var x = rg_add_transient_buffer(g, NB, 0, "x");
+    var y = rg_add_transient_buffer(g, NB, 0, "y");
+    var dims[12];
+    store32(&dims, 64); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var bp0[40];
+    var bp1[40];
+    var n0 = rg_add_compute(g, slow, &bp0, &dims, "slow reader");
+    rg_node_queue(g, n0, QUEUE_KIND_GRAPHICS);
+    rg_node_reads(g, n0, x);
+    var n1 = rg_add_compute(g, add, &bp1, &dims, "writer");
+    rg_node_writes(g, n1, y);
+    var rc = rg_build_ctx(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: B build rc="); print_i64(rc); print_cstr("\n"); return 3; }
+    print_cstr("B. independent GRAPHICS reader / COMPUTE writer sharing bytes: backing ");
+    print_i64(rg_backing_bytes(g)); print_cstr(" bytes\n");
+    if (rg_transient_alias_of(g, y) != x) { print_cstr("FAIL: B: y does not reuse x\n"); return 4; }
+    if (view_va(g, y) != view_va(g, x)) { print_cstr("FAIL: B: x and y differ in VA\n"); return 4; }
+    var vx = rg_transient_handle(g, x);
+    var vy = rg_transient_handle(g, y);
+    bind2(&bp0, vx, r);
+    bind2(&bp1, in2, vy);
+    var xa = view_addr(g, x);
+    for (var j = 0; j < N; j = j + 1) { store32(xa + j * 4, j * 5); }
+    rc = rg_execute_mq(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: B execute rc="); print_i64(rc); print_cstr("\n"); return 5; }
+    var bad_r = count_bad(ra, N, 5, 1, "R");
+    var bad_y = count_bad(view_addr(g, y), N, 1, 1000001, "y");
+    print_cstr("  R = x + 1 (read before y overwrote it): "); print_i64(N - bad_r); print_cstr(" of ");
+    print_i64(N); print_cstr(" right; y: "); print_i64(N - bad_y); print_cstr(" right\n");
+    rg_release(g);
+    gpu_buffer_release(ctx, r);
+    gpu_buffer_release(ctx, in2);
+    if (bad_r != 0) { print_cstr("FAIL: B: the writer overwrote x before the reader read it\n"); return 7; }
+    if (bad_y != 0) { print_cstr("FAIL: B: y is wrong\n"); return 7; }
+    print_cstr("PASS: B\n");
+    return 0;
+}
+
+fn phase_c(ctx): i64 {
+    var fd = native_ctx_fd(ctx);
+    var vs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &vs_bo) != 0) { print_cstr("FAIL: vs bo\n"); return 8; }
+    var vs_handle = load64(&vs_bo + 0);
+    var vs_addr = load64(&vs_bo + 8);
+    memset(vs_addr, 0, 4096);
+    native_gfx9_shader_fullscreen_triangle_vs(vs_addr, 0);
+    var vs_va = 0xFFFF800100000000;
+    if (native_gem_va_map(fd, vs_handle, vs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: vs va\n");
+        return 8;
+    }
+    var vs_mod[16];
+    native_buf_pair_write(&vs_mod, vs_handle, vs_va);
+    var fs_bo[16];
+    if (native_bo_create_gtt(fd, 4096, &fs_bo) != 0) { print_cstr("FAIL: fs bo\n"); return 8; }
+    var fs_handle = load64(&fs_bo + 0);
+    var fs_addr = load64(&fs_bo + 8);
+    memset(fs_addr, 0, 4096);
+    native_gfx9_shader_textured_sample_fs(fs_addr, 0);
+    var fs_va = 0xFFFF800100001000;
+    if (native_gem_va_map(fd, fs_handle, fs_va, 4096, _NATIVE_PERM_SHADER) != 0) {
+        print_cstr("FAIL: fs va\n");
+        return 8;
+    }
+    var fs_mod[16];
+    native_buf_pair_write(&fs_mod, fs_handle, fs_va);
+    var samp = gpu_sampler_create(ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    var pipe = gpu_render_pipeline_create(ctx, &vs_mod, &fs_mod, 0);
+    if (samp == 0) { print_cstr("FAIL: sampler\n"); return 8; }
+    if (pipe == 0) { print_cstr("FAIL: pipeline\n"); return 8; }
+    var both = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var t0 = rg_add_transient_texture(g, 64, 64, WGPU_TEXTURE_FORMAT_RGBA8_UNORM,
+      WGPU_TEXTURE_USAGE_TEXTURE_BINDING, "t0");
+    var t1 = rg_add_transient_texture(g, 64, 64, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, both, "t1");
+    var t2 = rg_add_transient_texture(g, 64, 64, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, both, "t2");
+    var n0 = rg_add_render(g, 0, pipe, 3, "t0 -> t1");
+    rg_node_reads(g, n0, t0);
+    rg_node_writes(g, n0, t1);
+    var n1 = rg_add_render(g, 0, pipe, 3, "t1 -> t2");
+    rg_node_reads(g, n1, t1);
+    rg_node_writes(g, n1, t2);
+    var rc = rg_build_ctx(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: C build rc="); print_i64(rc); print_cstr("\n"); return 3; }
+    print_cstr("C. render-to-texture chain on GRAPHICS: backing "); print_i64(rg_backing_bytes(g));
+    print_cstr(" bytes for 3 textures of 16384\n");
+    if (rg_transient_alias_of(g, t2) != t0) { print_cstr("FAIL: C: t2 does not reuse t0\n"); return 4; }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var rt1 = rg_transient_target(g, t1);
+    var rt2 = rg_transient_target(g, t2);
+    var tex0 = rg_transient_handle(g, t0);
+    var tex1 = rg_transient_handle(g, t1);
+    var p0 = gpu_render_pass_begin(ctx, rt1, clear);
+    var p1 = gpu_render_pass_begin(ctx, rt2, clear);
+    if (p0 == 0) { print_cstr("FAIL: C pass\n"); return 8; }
+    if (p1 == 0) { print_cstr("FAIL: C pass\n"); return 8; }
+    if (gpu_render_pass_bind_texture(ctx, p0, tex0, samp) != 0) { print_cstr("FAIL: bind\n"); return 8; }
+    if (gpu_render_pass_bind_texture(ctx, p1, tex1, samp) != 0) { print_cstr("FAIL: bind\n"); return 8; }
+    rg_node_set_pass(g, n0, p0);
+    rg_node_set_pass(g, n1, p1);
+    var pat = alloc(16384);
+    for (var i = 0; i < 4096; i = i + 1) {
+        var px = (i * 2654435761) & 0xFFFFFFFF;
+        store32(pat + i * 4, px);
+    }
+    if (gpu_texture_write(ctx, tex0, pat, 16384) != 0) { print_cstr("FAIL: C upload\n"); return 8; }
+    rc = rg_execute_mq(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: C execute rc="); print_i64(rc); print_cstr("\n"); return 5; }
+    var out = load64(rt2 + NATIVE_RT_FIELD_ADDR);
+    var bad = 0;
+    for (var k = 0; k < 4096; k = k + 1) {
+        if (load32(out + k * 4) != load32(pat + k * 4)) { bad = bad + 1; }
+    }
+    print_cstr("  t2 = t0's pattern: "); print_i64(4096 - bad); print_cstr(" of 4096 texels\n");
+    rg_release(g);
+    gpu_render_pipeline_release(ctx, pipe);
+    native_gem_va_unmap(fd, fs_handle, fs_va, 4096);
+    native_bo_release_gtt(fd, fs_handle, fs_addr, 4096);
+    native_gem_va_unmap(fd, vs_handle, vs_va, 4096);
+    native_bo_release_gtt(fd, vs_handle, vs_addr, 4096);
+    if (bad != 0) { print_cstr("FAIL: C\n"); return 9; }
+    print_cstr("PASS: C\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    color_init();
+    print_cstr("mabda render-graph backing reuse on the Cezanne (4.5.0)\n");
+    print_cstr("-------------------------------------------------------\n");
+    var ct, cv = gpu_context_new_native();
+    if (is_err_result(ct) == 1) { print_cstr("FAIL: ctx\n"); return 1; }
+    var ctx = cv;
+    var spv = alloc(4096);
+    var n = build_add_kernel(spv);
+    var add = gpu_shader_module_create_spirv(ctx, spv, n);
+    var n2 = build_slow_kernel(spv);
+    var slow = gpu_shader_module_create_spirv(ctx, spv, n2);
+    if (add == 0) { print_cstr("FAIL: add kernel\n"); return 2; }
+    if (slow == 0) { print_cstr("FAIL: slow kernel\n"); return 2; }
+    var rc = phase_a(ctx, add);
+    if (rc == 0) { rc = phase_b(ctx, add, slow); }
+    if (rc == 0) { rc = phase_c(ctx); }
+    gpu_context_release(ctx);
+    if (rc == 0) { print_cstr("OK — transients share one backing; every reuse waited\n"); }
+    return rc;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

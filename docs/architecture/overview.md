@@ -280,6 +280,11 @@ render graph collapses everything into a single command encoder:
 9. rg_release(g)              → release transient handles
 ```
 
+On native AMD (4.5.0), step 7 is `rg_build_ctx(g, ctx)` and step 8 `rg_execute_mq(g, ctx)`:
+the transients become views into one GTT allocation (shared bytes with `rg_aliasing(g, 1)`),
+and each node is submitted on its queue's ring after waits for its producers and for every
+queue that used a slot it reuses.
+
 See [`../guides/render-graph.md`](../guides/render-graph.md) for the
 full authoring guide.
 

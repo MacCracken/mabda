@@ -19,7 +19,8 @@ for the immediate forward pointer.
 of the 2026-11 plan. Landed so far:
 - texture encoding, both halves: KTX2 Zstandard / ZLIB supercompression decode, and a BC7 CPU
   reference encoder (and decoder);
-- compressed sRGB ids, with the sRGB decode on native AMD.
+- compressed sRGB ids, with the sRGB decode on native AMD;
+- render-graph backing reuse on native AMD.
 
 The other items are open and tracked in the roadmap.
 
@@ -197,16 +198,105 @@ module is `src/texture_bc7.cyr`.
   - `native.tcyr`: the T# number format for every sRGB id, ETC2 RGB sRGB keeping its no-alpha
     swizzle, the tiled layout equal to the twin's, and `native_texfmt_sampleable`.
 
+### Added — render-graph transients share one backing allocation on native AMD
+- **`rg_build_ctx(g, ctx)`** (new, `src/render_graph.cyr`) builds a graph against a context.
+  - On wgpu it is `rg_build(g, gpu_ctx_device(ctx))`, unchanged: one resource per transient.
+    wgpu's safe API has no placed or aliased resources, so the aliasing plan stays the
+    consumer's to apply there.
+  - On native AMD the graph now allocates its transients itself, in ONE GTT allocation laid out
+    as [buffers | textures | a 64-byte T#/S# per texture]. Before, a native graph allocated
+    nothing; `rg_build` takes a wgpu device, so native callers built their own buffers and got
+    only the planner's offsets.
+  - With `rg_aliasing(g, 1)`, transients whose lifetimes do not overlap share bytes at the
+    planner's offsets. With it off, each transient has its own bytes in the same allocation.
+- **What each transient becomes** (all views into the allocation; the graph owns them, so
+  release the graph, never a view):
+  - `rg_transient_handle` gives a NativeBuf for a buffer, or a NativeTexture for a texture
+    (write, read and bind it).
+  - The new `rg_transient_target` gives a NativeRT over a texture created with
+    `WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT`, the same surface the NativeTexture samples. A
+    native graph can render into a transient and sample it in a later node.
+  - Native transient textures are RGBA8 (target and / or sampled) or RGBA8 sRGB (sampled). A
+    transient that no node uses gets no backing.
+- **New accessors and setter:**
+  - `rg_transient_alias_of(g, id)`: the transient whose slot this one took over, or -1;
+  - `rg_backing_bytes(g)`: the size of the native allocation;
+  - `rg_node_set_pass(g, node, pass)`: gives a render node its pass after the build. A native
+    pass is made from a target, and a transient's target exists only once the graph is built.
+- **The executor waits before reuse.** Before a node whose transient takes over a slot,
+  `rg_execute_mq` waits for every queue that used the slot's previous occupant. Without the
+  wait, two independent nodes on different rings race for the bytes. On the Cezanne, with the
+  wait disabled, the reader got the writer's values in 4,096 of 4,096 elements, three runs out
+  of three.
+- **Refused before anything is built or allocated**, leaving the graph unbuilt:
+  - formats other than RGBA8 / RGBA8 sRGB (`GPU_ERR_FORMAT_UNSUPPORTED`);
+  - an sRGB render target (`GPU_ERR_FORMAT_UNSUPPORTED`; native renders RGBA8 UNORM);
+  - a target with an odd side, a texture side outside 1..8192 (`GPU_ERR_TEXTURE_DIMENSION`);
+  - a buffer of size 0 or past the VA region (`GPU_ERR_BUFFER`);
+  - a failed allocation (`GPU_ERR_OUT_OF_MEMORY`).
+
+  On native NVIDIA and Intel, which have no graph executor, `rg_build_ctx` returns
+  `GPU_ERR_NOT_IMPLEMENTED`.
+
+### Changed — the render-graph planner and native graph ordering
+- **The planner sizes textures by their format** (`mabda_texfmt_data_size`). Every texture was
+  planned as RGBA8 (`width × height × 4`), which undersized RGBA16F by half. A format mabda has
+  no id for is planned at 16 bytes a texel, the largest uncompressed WebGPU colour format, so
+  the plan never undersizes it. An out-of-range size plans as 0 bytes instead of overflowing.
+- **A native graph's same-queue edges now wait too.** A node reading what an earlier node on
+  the same queue wrote relied on submit order, but successive submits on one ring may overlap.
+  The executor now records a same-queue barrier, which the kernel turns into a pipeline sync.
+- **A queue holds up to 4 pending waits** (`src/queue.cyr`; `QUEUE_STRUCT_SIZE` 48 → 96), and a
+  submit sends them as one multi-entry TIMELINE_WAIT chunk. A queue held one, so a second
+  barrier into the same submit silently replaced the first: a node reading from two other
+  queues waited for only one. Barriers now merge per syncobj, keeping the later point, and a
+  fifth distinct source is refused. `native_cs_submit_timeline` takes `(waits, n_waits)` pairs
+  in place of one `(wait_syncobj, wait_point)`.
+- **`rg_plan_aliasing_stats` leaves a native-backed graph's offsets alone.** They are the layout
+  the allocation was built with. It still reports the aliased plan.
+- **TransientResource grew 72 → 112 bytes and RenderGraph 48 → 72** (append-only), for the
+  reuse record, the planned size, the target, the queues used and the label.
+
+### Fixed — render graph
+- **A transient's handle is 0 until something is allocated.** The label sat in the handle slot
+  until a wgpu device replaced it. So after `rg_build(g, 0)`, `rg_transient_handle` returned
+  the label, and `rg_release` passed it to the wgpu release calls. The label has its own field
+  now.
+- **`rg_execute_mq` on a native NVIDIA or Intel context returns `GPU_ERR_NOT_IMPLEMENTED`**. It
+  fell into the wgpu path and called wgpu with the native context's fields.
+
+### Verified — render-graph backing reuse
+- **Cezanne** (`make test-native-rg-alias-e2e`, new; `build/logs/rg-alias-e2e-*.log`):
+  - A: a compute chain COMPUTE → GRAPHICS → COMPUTE over four 16 KiB buffers in 32 KiB (two
+    slots). Every b3[i] = b0[i] + 3, 4,096 of 4,096.
+  - B: two independent nodes, a slow reader on GRAPHICS and a writer on COMPUTE, whose buffers
+    share bytes. The reader read its data before the writer overwrote it in 4,096 of 4,096;
+    without the reuse wait, 0 of 4,096 (`build/logs/rg-alias-mutation-*.log`).
+  - C: a render-to-texture chain on GRAPHICS (t0 → t1 → t2, t2 reusing t0's bytes) in 32,960
+    bytes for 49,152 of textures. t2 equals t0's uploaded pattern in 4,096 of 4,096 texels.
+  - Every existing native queue and graph gate still passes with the multi-entry wait chunk:
+    queue barrier, multiqueue, queue compute, render-graph MQ, SPIR-V queue dispatch and
+    transfer copy.
+- **Tests:**
+  - `render.tcyr` covers, with a mock AMD backend that allocates in CPU memory:
+    - the layout: offsets, view VAs and CPU addresses, T# bytes, the target and the
+      descriptor tail;
+    - release and every refusal;
+    - the waits the executor records (the cross-queue reuse case, the same-queue edge, and
+      none with aliasing off);
+    - format-aware sizes and `rg_node_set_pass`.
+  - `queue.tcyr` covers merging, the slot limit, take-and-clear and the wait-chunk bytes.
+
 ### Verified (so far)
-- CPU: 30 suites, **8377 assertions**, 0 failed (4.4.0: 7932; 8060 after BC7). Every CI gate
-  passes locally, the bench included, and `cyrius distlib` is idempotent
-  (`build/logs/srgb-ci-gates-*.log`).
-- Cezanne, native: `make test-native-all` gives 78 passed, 0 failed, 3 skipped for DRM master,
-  of 81. All three 4.5.0 gates are included, with no GPU reset
-  (`build/logs/srgb-native-all-*.log`).
+- CPU: 30 suites, **8522 assertions**, 0 failed (4.4.0: 7932; 8060 after BC7, 8377 after the
+  sRGB ids). Every CI gate passes locally, the bench included, and `cyrius distlib` is
+  idempotent (`build/logs/alias-ci-gates-*.log`).
+- Cezanne, native: `make test-native-all` gives 79 passed, 0 failed, 3 skipped for DRM master,
+  of 82. All four 4.5.0 gates are included, with no GPU reset
+  (`build/logs/alias-native-all-*.log`).
 - Cezanne, wgpu: `make test-gpu` passes all nine programs, 112 checks, including the target
-  tier's sRGB copies (`build/logs/srgb-test-gpu-*.log`). `make test-wgpu-srgb-sample-e2e` passes
-  separately.
+  tier's sRGB copies and the wgpu render graph (`build/logs/alias-test-gpu-*.log`).
+  `make test-wgpu-srgb-sample-e2e` passes separately.
 
 ## [4.4.0] — 2026-11-17
 

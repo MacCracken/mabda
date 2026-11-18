@@ -943,16 +943,364 @@ fn test_rg_native_dispatch_copy_offset_fails_loud() {
     return 0;
 }
 
-fn test_rg_transient_handle_before_build_is_label_ptr() {
-    # Before rg_build, the handle slot holds the label pointer (the
-    # struct layout doubles the slot up as a staging area). This is
-    # a load-bearing implementation detail documented in the module
-    # header — the assertion guards against accidental refactors.
+fn test_rg_transient_handle_before_build_is_zero() {
+    # 4.5.0: the label has its own field (+104). Until then it sat in the handle
+    # slot until a wgpu device replaced it, so after rg_build(g, 0) the "handle"
+    # was the label and rg_release would hand it to wgpu's release calls.
     var g = rg_new();
-    var r = rg_add_transient_buffer(g, 64, 0x08, "label-str");
-    # Before build, handle field holds the label pointer.
-    assert_neq(rg_transient_handle(g, r), 0,
-      "pre-build handle slot holds label ptr, not 0");
+    var label = "label-str";
+    var r = rg_add_transient_buffer(g, 64, 0x08, label);
+    assert_eq(rg_transient_handle(g, r), 0, "pre-build handle is 0");
+    assert_eq(load64(vec_get(load64(g + 8), r) + 104), label, "the label has its own field");
+    rg_build(g, 0);
+    assert_eq(rg_transient_handle(g, r), 0, "no device, no handle: still 0 after rg_build(g, 0)");
+    return 0;
+}
+
+# ================================================================
+# 4.5.0 — native transient backing (rg_build_ctx) + aliasing waits
+# ================================================================
+# A mock AMD backend: buffer create hands out CPU memory as a NativeBuf
+# (handle 0x77, va 0x10000000), so the layout, the views, the T# bytes and
+# release are all checkable without a GPU. Barriers are logged as (src, dst).
+var _al_creates = 0;
+var _al_releases = 0;
+var _al_fail = 0;
+var _al_last_size = 0;
+var _al_bars = 0;
+fn _al_bcreate(ctx, size, usage): i64 {
+    if (_al_fail == 1) { return 0; }
+    _al_creates = _al_creates + 1;
+    _al_last_size = size;
+    var b = alloc(NATIVE_BUF_STRUCT_SIZE);
+    store64(b + NATIVE_BUF_FIELD_HANDLE, 0x77);
+    store64(b + NATIVE_BUF_FIELD_VA, 0x10000000);
+    store64(b + NATIVE_BUF_FIELD_ADDR, alloc(size));
+    store64(b + NATIVE_BUF_FIELD_SIZE, size);
+    return b;
+}
+fn _al_brelease(ctx, buf): i64 { _al_releases = _al_releases + 1; return 0; }
+fn _al_barrier(ctx, src, dst): i64 {
+    vec_push(_mq_log, 3);
+    vec_push(_al_bars, src);
+    vec_push(_al_bars, dst);
+    return 0;
+}
+
+fn _al_ctx(ctx, kind): i64 {
+    memset(ctx, 0, GPU_CONTEXT_SIZE);
+    var b = _mq_make_backend();
+    backend_set_kind(b, kind);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_CREATE, &_al_bcreate);
+    backend_set_slot(b, BACKEND_SLOT_BUFFER_RELEASE, &_al_brelease);
+    backend_set_slot(b, BACKEND_SLOT_QUEUE_BARRIER, &_al_barrier);
+    store64(ctx + 32, b);
+    _al_creates = 0;
+    _al_releases = 0;
+    _al_fail = 0;
+    _al_bars = vec_new();
+    _mq_log = vec_new();
+    return 0;
+}
+
+fn _al_dims(d): i64 { store32(d, 1); store32(d + 4, 1); store32(d + 8, 1); return 0; }
+
+# The planner sizes a texture by its format (it sized every texture as RGBA8).
+fn test_rg_plan_texture_sizes_format_aware() {
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var a = rg_add_transient_texture(g, 16, 16, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 0, "rgba8");
+    var b = rg_add_transient_texture(g, 16, 16, WGPU_TEXTURE_FORMAT_RGBA16_FLOAT, 0, "rgba16f");
+    var c = rg_add_transient_texture(g, 16, 16, 0x12, 0, "rg16snorm");   # no mabda id
+    var d = rg_add_transient_texture(g, 16, 16, WGPU_TEXTURE_FORMAT_BC7_RGBA_UNORM, 0, "bc7");
+    var n = rg_add_compute(g, 0, 0, &dims, "N");
+    rg_node_reads(g, n, a);
+    rg_node_reads(g, n, b);
+    rg_node_reads(g, n, c);
+    rg_node_reads(g, n, d);
+    rg_build(g, 0);
+    var stats[24];
+    rg_plan_aliasing_stats(g, &stats);
+    var ts = load64(g + 8);
+    assert_eq(load64(vec_get(ts, a) + 80), 1024, "16x16 RGBA8 = 1024 B");
+    assert_eq(load64(vec_get(ts, b) + 80), 2048, "16x16 RGBA16F = 2048 B (was planned as 1024)");
+    assert_eq(load64(vec_get(ts, c) + 80), 4096, "a format with no mabda id: 16 B a texel");
+    assert_eq(load64(vec_get(ts, d) + 80), 256, "16x16 BC7 = 16 blocks = 256 B");
+    assert_eq(load64(&stats + 8), 1024 + 2048 + 4096 + 256, "naive total from the real sizes");
+    # Unplannable sizes plan as 0 bytes instead of overflowing.
+    var g2 = rg_new();
+    var big = rg_add_transient_texture(g2, 0x100000000, 4, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 0, "huge");
+    var neg = rg_add_transient_buffer(g2, 0 - 5, 0, "neg");
+    var negw = rg_add_transient_texture(g2, 0 - 4, 4, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 0, "negw");
+    var n3 = rg_add_compute(g2, 0, 0, &dims, "N3");
+    rg_node_reads(g2, n3, negw);
+    var n2 = rg_add_compute(g2, 0, 0, &dims, "N2");
+    rg_node_reads(g2, n2, big);
+    rg_node_reads(g2, n2, neg);
+    rg_build(g2, 0);
+    rg_plan_aliasing_stats(g2, &stats);
+    assert_eq(load64(&stats + 8), 0, "out-of-range sizes plan as 0, no overflow");
+    return 0;
+}
+
+# Each reused slot records whose bytes it took over; the queues that used a
+# transient are recorded as a mask.
+fn test_rg_plan_alias_of_and_queue_mask() {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12];
+    _al_dims(&dims);
+    var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
+    var b1 = rg_add_transient_buffer(g, 256, 0, "b1");
+    var b2 = rg_add_transient_buffer(g, 200, 0, "b2");
+    var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_node_writes(g, n0, b0);
+    var n1 = rg_add_render(g, 0, 0, 3, "n1");   # GRAPHICS
+    rg_node_writes(g, n1, b1);
+    var n2 = rg_add_compute(g, 0, 0, &dims, "n2");
+    rg_node_writes(g, n2, b2);
+    rg_node_reads(g, n2, b1);   # n1 -> n2: b1 lives [1, 2]
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    assert_eq(rg_transient_alias_of(g, b0), 0 - 1, "b0 opened its slot");
+    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 takes over b0's slot");
+    assert_eq(rg_transient_offset(g, b1), rg_transient_offset(g, b0), "same offset as b0");
+    assert_eq(rg_transient_alias_of(g, b2), 0 - 1, "b2 overlaps b1: a slot of its own");
+    var ts = load64(g + 8);
+    assert_eq(load64(vec_get(ts, b0) + 96), 1 << QUEUE_KIND_COMPUTE, "b0 used on COMPUTE only");
+    assert_eq(load64(vec_get(ts, b1) + 96), (1 << QUEUE_KIND_GRAPHICS) | (1 << QUEUE_KIND_COMPUTE),
+      "b1 used on GRAPHICS and COMPUTE");
+    assert_eq(rg_transient_alias_of(g, 99), 0 - 1, "alias_of(out of range) = -1");
+    assert_eq(rg_transient_alias_of(g, 0 - 1), 0 - 1, "alias_of(-1) = -1");
+    return 0;
+}
+
+# rg_build_ctx on native AMD with aliasing on: one backing allocation, views at the
+# planner's offsets, the texture descriptors after the shared region.
+fn test_rg_build_ctx_native_layout() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12];
+    _al_dims(&dims);
+    var ra = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT | WGPU_TEXTURE_USAGE_TEXTURE_BINDING;
+    var b0 = rg_add_transient_buffer(g, 1000, 0, "b0");
+    var b1 = rg_add_transient_buffer(g, 600, 0, "b1");
+    var t0 = rg_add_transient_texture(g, 16, 8, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, ra, "t0");
+    var t1 = rg_add_transient_texture(g, 8, 8, WGPU_TEXTURE_FORMAT_RGBA8_UNORM_SRGB,
+      WGPU_TEXTURE_USAGE_TEXTURE_BINDING, "t1");
+    var dead = rg_add_transient_buffer(g, 64, 0, "unused");
+    var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_node_writes(g, n0, b0);
+    rg_node_writes(g, n0, t0);
+    var n1 = rg_add_compute(g, 0, 0, &dims, "n1");
+    rg_node_writes(g, n1, b1);
+    rg_node_writes(g, n1, t1);
+    assert_eq(rg_build_ctx(g, &ctx), 0, "native build ok");
+    assert_eq(rg_is_built(g), 1, "built");
+    assert_eq(_al_creates, 1, "ONE backing allocation");
+    # b1 (600 -> 768) reuses b0's 1024-byte slot; t1 (256) reuses t0's 512-byte slot.
+    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 reuses b0");
+    assert_eq(rg_transient_alias_of(g, t1), t0, "t1 reuses t0");
+    assert_eq(rg_transient_offset(g, b0), 0, "buffers from 0");
+    assert_eq(rg_transient_offset(g, t0), 1024, "textures after the buffer region");
+    var desc = 1024 + 512;
+    assert_eq(rg_backing_bytes(g), desc + 2 * 64, "backing = shared regions + 2 descriptors");
+    assert_eq(_al_last_size, rg_backing_bytes(g), "allocated exactly that");
+    var block = load64(g + 56);
+    var baddr = load64(block + NATIVE_BUF_FIELD_ADDR);
+    var v0 = rg_transient_handle(g, b0);
+    var v1 = rg_transient_handle(g, b1);
+    assert_eq(load64(v0 + NATIVE_BUF_FIELD_HANDLE), 0x77, "buffer view: the backing BO");
+    assert_eq(load64(v0 + NATIVE_BUF_FIELD_VA), 0x10000000, "b0 view at the block VA");
+    assert_eq(load64(v1 + NATIVE_BUF_FIELD_VA), 0x10000000, "b1 view at the same VA (aliased)");
+    assert_eq(load64(v1 + NATIVE_BUF_FIELD_ADDR), baddr, "b1 view at the same CPU address");
+    assert_eq(load64(v1 + NATIVE_BUF_FIELD_SIZE), 600, "a view keeps its logical size");
+    var x0 = rg_transient_handle(g, t0);
+    assert_eq(load64(x0 + NATIVE_TEX_FIELD_VA), 0x10000000 + 1024, "t0 view at its offset");
+    assert_eq(load64(x0 + NATIVE_TEX_FIELD_ADDR), baddr + 1024, "t0 CPU address at its offset");
+    assert_eq(load64(x0 + NATIVE_TEX_FIELD_SIZE), 16 * 8 * 4, "t0 logical size");
+    assert_eq(load32(x0 + NATIVE_TEX_FIELD_WIDTH), 16, "t0 width");
+    assert_eq(load64(x0 + NATIVE_TEX_FIELD_T_VA), 0x10000000 + desc, "t0 T# after the shared region");
+    assert_eq(native_tex_desc_cpu_addr(x0), baddr + desc, "the draw finds t0's T# in the block");
+    assert_eq(load32(baddr + desc), (0x10000000 + 1024) / 256, "t0 T# W0 = its surface VA >> 8");
+    assert_eq((load32(baddr + desc + 4) >> 20) & 0x3F, 10, "t0 T#: 8_8_8_8");
+    assert_eq(load32(baddr + desc + 48), 0x3F800000, "t0 scale_x = 1.0");
+    var x1 = rg_transient_handle(g, t1);
+    assert_eq(load64(x1 + NATIVE_TEX_FIELD_T_VA), 0x10000000 + desc + 64, "t1 T# in the next 64 B");
+    assert_eq(load32(x1 + NATIVE_TEX_FIELD_FMT), MABDA_TEXFMT_RGBA8_SRGB, "t1 keeps its sRGB id");
+    assert_eq((load32(baddr + desc + 64 + 4) >> 26) & 0xF, GFX9_IMG_NUM_FORMAT_SRGB, "t1 T# decodes sRGB");
+    assert_eq(load32(baddr + desc + 64), (0x10000000 + 1024) / 256, "t1 T# at t0's bytes (aliased)");
+    var rt = rg_transient_target(g, t0);
+    assert(rt != 0, "t0 (RENDER_ATTACHMENT) has a target view");
+    assert_eq(load64(rt + NATIVE_RT_FIELD_VA), 0x10000000 + 1024, "the target shares t0's surface");
+    assert_eq(load32(rt + NATIVE_RT_FIELD_WIDTH), 16, "target width");
+    assert_eq(load32(rt + NATIVE_RT_FIELD_HEIGHT), 8, "target height");
+    assert_eq(rg_transient_target(g, t1), 0, "t1 (sampled only) has no target");
+    assert_eq(rg_transient_target(g, b0), 0, "a buffer has no target");
+    assert_eq(rg_transient_handle(g, dead), 0, "an unused transient gets no backing");
+    # The stats query must not move a backed graph's offsets.
+    var stats[24];
+    rg_plan_aliasing_stats(g, &stats);
+    assert_eq(rg_transient_offset(g, t0), 1024, "offsets unchanged by a stats query");
+    # Release frees the one allocation and clears the views.
+    assert_eq(rg_release(g), 0, "release ok");
+    assert_eq(_al_releases, 1, "the backing released once");
+    assert_eq(rg_transient_handle(g, b0), 0, "views cleared");
+    assert_eq(rg_transient_target(g, t0), 0, "target cleared");
+    assert_eq(rg_backing_bytes(g), 0, "no backing after release");
+    return 0;
+}
+
+# Aliasing off on native: every transient has its own bytes in the one allocation, and
+# the stats query still reports the aliased plan without moving them.
+fn test_rg_build_ctx_native_no_aliasing() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
+    var b1 = rg_add_transient_buffer(g, 256, 0, "b1");
+    var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_node_writes(g, n0, b0);
+    var n1 = rg_add_compute(g, 0, 0, &dims, "n1");
+    rg_node_writes(g, n1, b1);
+    assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
+    assert_eq(rg_transient_offset(g, b0), 0, "b0 at 0");
+    assert_eq(rg_transient_offset(g, b1), 256, "b1 has its own bytes");
+    assert_eq(rg_transient_alias_of(g, b1), 0 - 1, "no reuse with aliasing off");
+    assert_eq(rg_backing_bytes(g), 512, "backing = the naive total");
+    var stats[24];
+    rg_plan_aliasing_stats(g, &stats);
+    assert_eq(load64(&stats + 16), 256, "the stats still describe the aliased plan");
+    assert_eq(rg_transient_offset(g, b1), 256, "but the backed layout is untouched");
+    assert_eq(rg_transient_alias_of(g, b1), 0 - 1, "and so is alias_of");
+    return 0;
+}
+
+# What the native backing refuses, before anything is allocated; the graph is left unbuilt.
+fn _al_refuse(fmt, w, h, usage, want, name): i64 {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var t = rg_add_transient_texture(g, w, h, fmt, usage, "t");
+    var n = rg_add_compute(g, 0, 0, &dims, "n");
+    rg_node_writes(g, n, t);
+    assert_eq(rg_build_ctx(g, &ctx), want, name);
+    assert_eq(rg_is_built(g), 0, "left unbuilt");
+    assert_eq(_al_creates, 0, "nothing allocated");
+    return 0;
+}
+
+fn test_rg_build_ctx_refusals() {
+    var ra = WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    _al_refuse(WGPU_TEXTURE_FORMAT_BGRA8_UNORM, 8, 8, 0, GPU_ERR_FORMAT_UNSUPPORTED, "BGRA8: no native T#");
+    _al_refuse(WGPU_TEXTURE_FORMAT_RGBA16_FLOAT, 8, 8, 0, GPU_ERR_FORMAT_UNSUPPORTED, "RGBA16F refused");
+    _al_refuse(WGPU_TEXTURE_FORMAT_RGBA8_UNORM_SRGB, 8, 8, ra, GPU_ERR_FORMAT_UNSUPPORTED,
+      "sRGB target refused (native renders RGBA8 UNORM)");
+    _al_refuse(WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 9, 8, ra, GPU_ERR_TEXTURE_DIMENSION, "odd target width");
+    _al_refuse(WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 8, 0, 0, GPU_ERR_TEXTURE_DIMENSION, "zero height");
+    _al_refuse(WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 9000, 8, 0, GPU_ERR_TEXTURE_DIMENSION, "past 8192");
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var b = rg_add_transient_buffer(g, 0, 0, "empty");
+    var n = rg_add_compute(g, 0, 0, &dims, "n");
+    rg_node_writes(g, n, b);
+    assert_eq(rg_build_ctx(g, &ctx), GPU_ERR_BUFFER, "a zero-size buffer refused");
+    # A failed allocation leaves the graph unbuilt.
+    var g2 = rg_new();
+    var b2 = rg_add_transient_buffer(g2, 64, 0, "b2");
+    var n2 = rg_add_compute(g2, 0, 0, &dims, "n2");
+    rg_node_writes(g2, n2, b2);
+    _al_fail = 1;
+    assert_eq(rg_build_ctx(g2, &ctx), GPU_ERR_OUT_OF_MEMORY, "allocation failure -> OUT_OF_MEMORY");
+    assert_eq(rg_is_built(g2), 0, "left unbuilt (rg_execute_mq refuses it)");
+    assert_eq(rg_execute_mq(g2, &ctx), 1, "execute refuses the unbuilt graph");
+    _al_fail = 0;
+    assert_eq(rg_build_ctx(g2, &ctx), 0, "a retry after the failure builds");
+    # Null arguments; native NVIDIA has no graph executor.
+    assert_eq(rg_build_ctx(0, &ctx), GPU_ERR_OTHER, "null graph");
+    assert_eq(rg_build_ctx(g, 0), GPU_ERR_OTHER, "null ctx");
+    var nctx[208];
+    _al_ctx(&nctx, BACKEND_KIND_NVIDIA);
+    var g3 = rg_new();
+    rg_add_compute(g3, 0, 0, &dims, "n3");
+    assert_eq(rg_build_ctx(g3, &nctx), GPU_ERR_NOT_IMPLEMENTED, "native NVIDIA: refused");   #skip-lint
+    rg_build(g3, 0);
+    assert_eq(rg_execute_mq(g3, &nctx), GPU_ERR_NOT_IMPLEMENTED,                              #skip-lint
+      "native NVIDIA execute refused (it called wgpu with native handles)");
+    return 0;
+}
+
+# The waits the native executor records. The dangerous case: two nodes with no
+# dependency, on different queues, whose transients share bytes.
+fn test_rg_native_waits_alias_and_same_queue() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12];
+    _al_dims(&dims);
+    var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
+    var b1 = rg_add_transient_buffer(g, 256, 0, "b1");
+    var n0 = rg_add_render(g, 0x333, 0x444, 3, "n0");   # GRAPHICS writes b0
+    rg_node_writes(g, n0, b0);
+    var n1 = rg_add_compute(g, 0x111, 0x222, &dims, "n1");   # COMPUTE writes b1: no edge
+    rg_node_writes(g, n1, b1);
+    assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
+    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 shares b0's bytes");
+    assert_eq(_rg_execute_native_mq(g, &ctx), 0, "execute ok");
+    assert_eq(vec_len(_al_bars), 2, "one barrier");
+    assert_eq(vec_get(_al_bars, 0), 0x6000, "from GRAPHICS (b0's queue)");
+    assert_eq(vec_get(_al_bars, 1), 0x6001, "into COMPUTE, before n1");
+    # A same-queue producer -> consumer edge waits too (it relied on submit order).
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var h = rg_new();
+    var p = rg_add_compute(h, 0x111, 0x222, &dims, "p");
+    rg_node_writes(h, p, 70);
+    var c = rg_add_compute(h, 0x111, 0x222, &dims, "c");
+    rg_node_reads(h, c, 70);
+    assert_eq(rg_build_ctx(h, &ctx), 0, "build ok");
+    assert_eq(_rg_execute_native_mq(h, &ctx), 0, "execute ok");
+    assert_eq(vec_len(_al_bars), 2, "one barrier");
+    assert_eq(vec_get(_al_bars, 0), 0x6001, "from COMPUTE");
+    assert_eq(vec_get(_al_bars, 1), 0x6001, "into COMPUTE (a same-ring wait)");
+    assert_eq(vec_get(_mq_log, 0), 1, "producer dispatched");
+    assert_eq(vec_get(_mq_log, 1), 3, "then the barrier");
+    assert_eq(vec_get(_mq_log, 2), 1, "then the consumer");
+    # No aliasing: no reuse, so no alias wait.
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var k = rg_new();
+    var c0 = rg_add_transient_buffer(k, 256, 0, "c0");
+    var c1 = rg_add_transient_buffer(k, 256, 0, "c1");
+    var m0 = rg_add_render(k, 0x333, 0x444, 3, "m0");
+    rg_node_writes(k, m0, c0);
+    var m1 = rg_add_compute(k, 0x111, 0x222, &dims, "m1");
+    rg_node_writes(k, m1, c1);
+    rg_build_ctx(k, &ctx);
+    _rg_execute_native_mq(k, &ctx);
+    assert_eq(vec_len(_al_bars), 0, "aliasing off: independent nodes do not wait");
+    return 0;
+}
+
+fn test_rg_node_set_pass() {
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var r = rg_add_render(g, 0, 0x444, 3, "r");
+    var c = rg_add_compute(g, 0, 0, &dims, "c");
+    assert_eq(rg_node_set_pass(g, r, 0x5150), 0, "set a render node's pass");
+    assert_eq(load64(load64(vec_get(load64(g + 0), r) + 8) + 0), 0x5150, "payload +0 = the pass");
+    assert_eq(rg_node_set_pass(g, c, 0x5150), 1, "a compute node has no pass");
+    assert_eq(rg_node_set_pass(g, 9, 0x5150), 1, "bad node id");
+    assert_eq(rg_node_set_pass(g, 0 - 1, 0x5150), 1, "negative node id");
     return 0;
 }
 
@@ -1152,8 +1500,9 @@ fn test_rg_plan_buffers_and_textures_separate() {
     var g = rg_new();
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
     var buf = rg_add_transient_buffer(g, 256, 0, "buf");
-    # 4x4 RGBA8 texture = 64 bytes → aligns up to 256.
-    var tex = rg_add_transient_texture(g, 4, 4, 18, 0, "tex");
+    # 4x4 RGBA8 texture = 64 bytes → aligns up to 256. (4.5.0: the format is the v29
+    # value; it was 18, which v29 numbers RG16Snorm.)
+    var tex = rg_add_transient_texture(g, 4, 4, WGPU_TEXTURE_FORMAT_RGBA8_UNORM, 0, "tex");
     var n = rg_add_compute(g, 0, 0, &dims, "N");
     rg_node_reads(g, n, buf);
     rg_node_reads(g, n, tex);
@@ -1453,7 +1802,14 @@ fn main() {
     test_rg_execute_native_mq_orders_and_barriers();
     test_rg_execute_mq_routes_native_backend();
     test_rg_native_dispatch_copy_offset_fails_loud();
-    test_rg_transient_handle_before_build_is_label_ptr();
+    test_rg_transient_handle_before_build_is_zero();
+    test_rg_plan_texture_sizes_format_aware();
+    test_rg_plan_alias_of_and_queue_mask();
+    test_rg_build_ctx_native_layout();
+    test_rg_build_ctx_native_no_aliasing();
+    test_rg_build_ctx_refusals();
+    test_rg_native_waits_alias_and_same_queue();
+    test_rg_node_set_pass();
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();
     test_rg_aliasing_flag_round_trip();

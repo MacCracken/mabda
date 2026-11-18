@@ -758,6 +758,26 @@ fn native_build_cs_chunk_syncobj(buf, handle, flags, point): i64 {
     return 0;
 }
 
+# 4.5.0 — the TIMELINE_WAIT chunk payload for `n` (syncobj u64, point u64) pairs at
+# `waits`: n drm_amdgpu_cs_chunk_syncobj entries (16 B each) into `buf` (n * 16
+# bytes). Each entry carries WAIT_FLAGS_WAIT_FOR_SUBMIT (0x2): the amdgpu CS parser
+# routes flags through drm_syncobj_find_fence, and the flag (the Mesa / RADV
+# choice) lets a wait name a point whose submit has not landed yet instead of
+# failing -ENOENT. Returns 0, or -1 for n outside 1..QUEUE_PEND_SLOTS or a pair
+# with a zero syncobj or point (point 0 is never signalled: a dead dependency).
+fn native_build_cs_wait_chunk(buf, waits, n): i64 {
+    if (n < 1) { return 0 - 1; }
+    if (n > QUEUE_PEND_SLOTS) { return 0 - 1; }
+    for (var i = 0; i < n; i = i + 1) {
+        var so = load64(waits + i * 16);
+        var pt = load64(waits + i * 16 + 8);
+        if (so == 0) { return 0 - 1; }
+        if (pt == 0) { return 0 - 1; }
+        native_build_cs_chunk_syncobj(buf + i * 16, so, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, pt);
+    }
+    return 0;
+}
+
 # Wait until `handle` reaches timeline `point`. `timeout_ns` is
 # absolute CLOCK_MONOTONIC ns. WAIT_FOR_SUBMIT covers the case where
 # the signalling submit hasn't landed yet. Returns 0 on reached,
@@ -1071,12 +1091,13 @@ fn native_cs_submit_4chunk(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
 # barriers (Q.4). Chunk order:
 #   BO_HANDLES, [TIMELINE_WAIT], TIMELINE_SIGNAL, FENCE, IB
 # The GPU signals `signal_syncobj` at `signal_point` on completion;
-# when `wait_syncobj != 0` the submission first waits for that syncobj
-# to reach `wait_point`. Returns 0 on accepted, negative errno on
-# failure. (HW-gated; chunk byte layout is CPU-tested via the pure
-# native_build_cs_chunk_syncobj helper.)
+# with `n_waits` > 0 the submission first waits for each (syncobj, point)
+# pair at `waits` (u64 syncobj, u64 point; at most QUEUE_PEND_SLOTS, 4.5.0:
+# it took one pair). Returns 0 on accepted, negative errno on failure.
+# (HW-gated; the wait chunk's bytes are CPU-tested via
+# native_build_cs_wait_chunk.)
 fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_type,
-  signal_syncobj, signal_point, wait_syncobj, wait_point, fence_kh, fence_offset, ib_flags): i64 {
+  signal_syncobj, signal_point, waits, n_waits, fence_kh, fence_offset, ib_flags): i64 {
     if ((fence_offset & 3) != 0) { return 0 - 22; }   # -EINVAL: DWORD-align guard
     # Timeline points are strictly monotonic from an initial 0, so the
     # kernel rejects a SIGNAL of point 0 (drm_syncobj_add_point requires
@@ -1101,23 +1122,11 @@ fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_typ
     var signal_chunk[16];
     native_build_cs_chunk_syncobj(&signal_chunk, signal_syncobj, 0, signal_point);
 
-    var wait_chunk[16];
+    var wait_chunk[64];   # QUEUE_PEND_SLOTS x 16 B
     var include_wait = 1;
-    if (wait_syncobj == 0) { include_wait = 0; }
+    if (n_waits == 0) { include_wait = 0; }
     if (include_wait == 1) {
-        # Waiting on timeline point 0 is meaningless (nothing is signalled
-        # at 0); reject rather than submit a dead dependency.
-        if (wait_point == 0) { return 0 - 22; }
-        # WAIT chunk: the amdgpu CS parser routes flags through
-        # drm_syncobj_find_fence, which reads WAIT_FLAGS_WAIT_FOR_SUBMIT
-        # (0x2). Setting it (the Mesa/RADV choice) makes the in-CS wait
-        # tolerate a consumer submit that races ahead of the producer —
-        # the dependency resolves once the producer's fence installs,
-        # instead of failing -ENOENT. Harmless for our barrier path
-        # (which waits on already-signalled points), robust against
-        # future render-graph cross-queue scheduling (3.1.2).
-        native_build_cs_chunk_syncobj(&wait_chunk, wait_syncobj,
-          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, wait_point);
+        if (native_build_cs_wait_chunk(&wait_chunk, waits, n_waits) != 0) { return 0 - 22; }
     }
 
     var fence_chunk[8];
@@ -1142,7 +1151,7 @@ fn native_cs_submit_timeline(fd, ctx_id, bo_list_in_ptr, ib_va, ib_bytes, ip_typ
 
     if (include_wait == 1) {
         store32(&chunks + co + 0, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT);
-        store32(&chunks + co + 4, 4);               # chunk_syncobj = 16 B = 4 dw
+        store32(&chunks + co + 4, 4 * n_waits);     # n x chunk_syncobj (16 B = 4 dw)
         store64(&chunks + co + 8, &wait_chunk);
         store64(&chunk_ptrs + po, &chunks + co);
         co = co + 16;

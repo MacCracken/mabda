@@ -21,7 +21,17 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   maintainer's call. The gates are `make test-native-srgb-e2e` and its wgpu twin
   `make test-wgpu-srgb-sample-e2e`, which check every texel against the sRGB table, ±1.
 
-  Next: render-graph aliasing, then the language minors.
+  Landed, render-graph backing reuse on native AMD (`rg_build_ctx` in `src/render_graph.cyr`):
+  one GTT allocation holds every transient as a view, and with `rg_aliasing` on,
+  disjoint-lifetime transients share bytes. `rg_execute_mq` waits for every queue that used a
+  slot before a node reuses it. `make test-native-rg-alias-e2e` checks it on the Cezanne, and
+  its phase B fails without that wait. Fixed on the way:
+  - queues hold 4 merged pending waits (one used to be overwritten);
+  - same-queue graph edges wait (a pipeline sync);
+  - the planner sizes textures by format;
+  - a transient's handle is 0 until it is allocated.
+
+  Next: the language minors (S2 / S3 / S4 / M6).
 - **v4.4.0 is released** (tag `4.4.0`; the cut was 2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits

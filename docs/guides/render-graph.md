@@ -100,16 +100,43 @@ them.
 
 The aliasing planner (shipped v3.4.3) is **OFF by default**
 (`aliasing_flag` defaults to 0). When you enable it with
-`rg_aliasing(g, 1)`, `rg_build` runs a greedy interval-coloring pass
+`rg_aliasing(g, 1)`, the build runs a greedy interval-coloring pass
 that assigns disjoint-lifetime transients of the same kind a shared
-byte offset into one backing block; the chosen offset is queryable via
-`rg_transient_offset(g, res_id)` and the block totals via
-`rg_plan_aliasing_stats(g, out)`. This is a reuse **plan** only — the
-graph still allocates one GPU handle per transient (the render graph
-doesn't own bind-group creation, so it can't transparently share a
-backing allocation), and a consumer applies the offsets to its own
-sub-allocated backing store. Leave aliasing off unless a consumer
-explicitly asks for memory-tight frames.
+byte offset into one backing block. The chosen offset is queryable via
+`rg_transient_offset(g, res_id)`, the transient whose slot it took over
+via `rg_transient_alias_of(g, res_id)`, and the block totals via
+`rg_plan_aliasing_stats(g, out)`. Textures are sized by their format
+(4.5.0; they were all sized as RGBA8).
+
+What happens with the plan depends on the backend you build on with
+`rg_build_ctx(g, ctx)` (4.5.0):
+
+- **Native AMD:** the graph allocates its transients itself, in one GTT
+  allocation (`rg_backing_bytes(g)`), and each transient is a view into
+  it. `rg_transient_handle` gives a NativeBuf (buffers) or a
+  NativeTexture (textures), and `rg_transient_target` gives a NativeRT
+  for a texture with `WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT`, so a node
+  can render into a transient that a later node samples. With aliasing
+  on, transients share bytes at the planner's offsets, and
+  `rg_execute_mq` waits, before a node that reuses a slot, for every
+  queue that used it. With aliasing off, every transient has its own
+  bytes. Native transient textures are RGBA8, or RGBA8 sRGB if only
+  sampled. The graph owns the views: release the graph, never a view.
+- **wgpu:** one resource per transient, as with `rg_build`. wgpu's safe
+  API has no placed or aliased resources, so the plan is advisory there:
+  a consumer applies the offsets to its own sub-allocated store.
+
+With aliasing on, a transient's contents before its first user are
+undefined: another transient may own those bytes until then. Fill an
+input transient after the build and before `rg_execute_mq`, as the
+first user expects. Read a result from a transient whose slot nothing
+reuses afterwards (`rg_transient_alias_of` tells you which reuse which).
+
+On native, build the graph's nodes before its transients have views:
+add render nodes with pass 0, call `rg_build_ctx`, create each pass from
+`rg_transient_target`, and give it to the node with
+`rg_node_set_pass(g, node, pass)`. Compute bindings are your own arrays,
+so fill them from `rg_transient_handle` after the build.
 
 ## Reads and writes
 
@@ -197,11 +224,10 @@ Omitting affinity reproduces the single-queue ordering. The plain
 
 Roadmap material, not current behavior:
 
-- Transparent transient backing reuse. The aliasing planner computes
-  the shared-offset *plan* (shipped v3.4.3), but the graph still
-  allocates one GPU handle per transient; having the graph itself
-  sub-allocate a single backing BO and bind transients into it needs
-  a native transient subsystem (tracked future arc).
+- Backing reuse on wgpu. Native AMD shares one allocation since 4.5.0
+  (above); wgpu's safe API has no placed or aliased resources, so wgpu
+  keeps one resource per transient. Native NVIDIA has no render-graph
+  executor yet (scheduled in v5.0, see the roadmap).
 - Render-pass-across-nodes. Every render node opens and ends its
   own pass; there is no graph-level "shared render pass with N draws
   across N nodes" construct. That belongs in a higher-level

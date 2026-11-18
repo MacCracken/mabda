@@ -1418,6 +1418,18 @@ build/native_srgb_e2e: programs/native_srgb_e2e.cyr src/*.cyr
 test-native-srgb-e2e: build/native_srgb_e2e
 	./build/native_srgb_e2e
 
+# 4.5.0 — render-graph transients sharing one backing allocation on native AMD
+# (rg_build_ctx + rg_aliasing): a cross-ring compute chain, two independent nodes on
+# different rings whose buffers share bytes (only the reuse wait keeps the reader right),
+# and a render-to-texture chain whose third texture reuses the first's bytes.
+build/native_rg_alias_e2e: programs/native_rg_alias_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_rg_alias_e2e.cyr $@
+
+.PHONY: test-native-rg-alias-e2e
+test-native-rg-alias-e2e: build/native_rg_alias_e2e
+	./build/native_rg_alias_e2e
+
 # v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
 build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr
 	@mkdir -p build

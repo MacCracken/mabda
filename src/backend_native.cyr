@@ -251,16 +251,15 @@ fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
     # GPU resolves the dependency without a CPU stall. Read + clear
     # before submit so the queue state is clean regardless of outcome
     # (a single barrier applies to the next submit only).
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this dispatch's timeline point and submit signalling it on
     # completion. ib_flags=0x08 (TC_WB_NOT_INVALIDATE) as on the compute
     # path. wait_so==0 omits the wait chunk (the common no-barrier case).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+      ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -317,12 +316,11 @@ fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
     store32(&bo_list_in + 8, ne);
     store32(&bo_list_in + 12, 8);
     store64(&bo_list_in + 16, &entries);
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      ip_type, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0x08);
+      ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -389,15 +387,14 @@ fn native_transfer_copy_timeline(ctx, src_handle, src_va,
 
     # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
     # TIMELINE_WAIT; read + clear before submit so queue state is clean.
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this copy's timeline point and submit signalling it on
     # completion. ib_flags = 0 (SDMA needs no TC writeback hook).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, sdma_bytes,
-      AMDGPU_HW_IP_DMA, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+      AMDGPU_HW_IP_DMA, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -660,15 +657,14 @@ fn native_render_dispatch_timeline(ctx, pm4, pm4_bytes,
 
     # Consume any pending cross-ring wait (gpu_queue_barrier) as an in-CS
     # TIMELINE_WAIT; read + clear before submit so queue state is clean.
-    var wait_so = queue_pending_wait_syncobj(queue);
-    var wait_pt = queue_pending_wait_point(queue);
-    queue_clear_pending_wait(queue);
+    var waits[64];   # QUEUE_PEND_SLOTS (syncobj, point) pairs
+    var n_waits = queue_take_pending_waits(queue, &waits);
 
     # Reserve this dispatch's timeline point and submit signalling it on
     # completion. ib_flags=0 (GFX ACQUIRE_MEM handles cache invalidation).
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
-      AMDGPU_HW_IP_GFX, syncobj, point, wait_so, wait_pt, fence_handle, 32, 0);
+      AMDGPU_HW_IP_GFX, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -1448,7 +1444,9 @@ fn _backend_native_queue_wait_idle(ctx, queue): i64 {
 
 # Order work on dst_queue after work submitted on src_queue (Q.4).
 # Records the producer's (syncobj, current point) as a PENDING WAIT on
-# the consumer queue — no CPU block. The consumer's next queue-targeted
+# the consumer queue — no CPU block. src == dst is allowed (4.5.0): the
+# kernel makes a same-ring wait a pipeline sync, so dst's next submit starts
+# after everything submitted on it so far has finished. The consumer's next queue-targeted
 # submit (native_compute_dispatch_cached_timeline) turns it into an
 # in-CS TIMELINE_WAIT chunk so the dependency resolves GPU-side, leaving
 # the two rings free to overlap. If src has submitted nothing yet
@@ -1459,7 +1457,10 @@ fn _backend_native_queue_barrier(ctx, src_queue, dst_queue): i64 {
     if (dst_queue == 0)  { return GPU_ERR_OTHER; }
     var src_point = queue_point(src_queue);
     if (src_point == 0) { return 0; }
-    queue_set_pending_wait(dst_queue, queue_syncobj(src_queue), src_point);
+    # 4.5.0: merged with the queue's other pending waits (it overwrote them).
+    if (queue_set_pending_wait(dst_queue, queue_syncobj(src_queue), src_point) != 0) {
+        return GPU_ERR_OTHER;
+    }
     return 0;
 }
 
@@ -1698,6 +1699,34 @@ fn _backend_native_texture_create_2d_sampleable(ctx, width, height, fmt): i64 {
     native_tex_set_sw_mode(tex, sw_mode);
     native_tex_set_t_va(tex, va + desc_off);
     return tex;
+}
+
+# 4.5.0 — fill `tex` (NATIVE_TEX_STRUCT_SIZE bytes) as a VIEW: a LINEAR sampleable
+# `fmt` texture whose surface is at (`va`, CPU `addr`) inside an existing BO
+# `handle`, with its T# + S# (64 bytes) at (`desc_va`, CPU `desc_addr`) in the same
+# BO, built exactly as _backend_native_texture_create_2d_sampleable builds them.
+# Nothing is allocated or mapped: the owner of the BO releases it, never the view
+# (render-graph transients, rg_build_ctx). Returns 0, or -1 for a format with no T#.
+fn native_tex_view_init(tex, handle, va, addr, width, height, fmt, desc_addr, desc_va): i64 {
+    if (native_gfx9_texfmt_to_img_format(fmt) < 0) { return 0 - 1; }
+    memset(desc_addr, 0, 64);
+    native_gfx9_image_descriptor(desc_addr, 0, va, width, height, fmt, GFX9_SW_MODE_LINEAR, 1, width - 1);
+    native_gfx9_sampler_descriptor(desc_addr, 32,
+      NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP, 1);   # unnormalized (image_sample FS)
+    store32(desc_addr + 48, 0x3F800000);   # scale_x = 1.0f (the draw overwrites it)
+    store32(desc_addr + 52, 0x3F800000);   # scale_y = 1.0f
+    memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+    store64(tex + NATIVE_TEX_FIELD_HANDLE, handle);
+    store64(tex + NATIVE_TEX_FIELD_VA,     va);
+    store64(tex + NATIVE_TEX_FIELD_ADDR,   addr);
+    store64(tex + NATIVE_TEX_FIELD_SIZE,   mabda_texfmt_data_size(fmt, width, height));
+    store32(tex + NATIVE_TEX_FIELD_WIDTH,     width);
+    store32(tex + NATIVE_TEX_FIELD_HEIGHT,    height);
+    store32(tex + NATIVE_TEX_FIELD_MIP_COUNT, 1);
+    store32(tex + NATIVE_TEX_FIELD_FMT,       fmt);
+    native_tex_set_sw_mode(tex, GFX9_SW_MODE_LINEAR);
+    native_tex_set_t_va(tex, desc_va);
+    return 0;
 }
 
 # v3.4 AA.1b — create a sampleable 2D ARRAY texture (LINEAR / uncompressed).

@@ -112,10 +112,17 @@ roadmap.
   BC3, BC7 sRGB) takes NUM_FORMAT_SRGB, checked on the Cezanne by `test-native-srgb-e2e` and
   matched by wgpu's `test-wgpu-srgb-sample-e2e`. That is the sampling half of v5.0's native sRGB
   decode, pulled forward.
-- **Render-graph aliasing backing reuse.** Actually sharing one GPU allocation across
-  disjoint-lifetime render-graph transients (today the consumer applies the planner's offsets)
-  needs a native transient-allocation subsystem; wgpu's safe API has no placed / aliased
-  resources, so wgpu keeps today's behaviour.
+- ✅ **Render-graph aliasing backing reuse** — done (CHANGELOG [4.5.0]). `rg_build_ctx` gives a
+  native AMD graph's transients one GTT allocation (buffers, and RGBA8 textures usable as targets
+  and sampled), and with aliasing on, disjoint-lifetime transients share bytes. The executor
+  waits, before a reusing node, for every queue that used the slot. Checked on the Cezanne by
+  `test-native-rg-alias-e2e`, whose independent-nodes phase fails without the wait. Found and
+  fixed on the way: a queue held one pending wait (a second barrier replaced the first);
+  same-queue edges relied on submit order; the planner sized every texture as RGBA8. wgpu
+  keeps today's behaviour (its safe API has no placed or aliased resources). Native NVIDIA
+  has no render-graph executor (`rg_build_ctx` / `rg_execute_mq` return
+  GPU_ERR_NOT_IMPLEMENTED); the executor is scheduled in v5.0 below, with the NVIDIA wgpu
+  retirement it blocks.
 - **The cyrius 6.7 language minors** (recorded by the W2 stdlib wave, 4.2.0; each changes a public
   name's kind or type, which is why they ride a minor):
   - S2: about 1,570 top-level integer `var NAME = <literal>` constants become `const`, after a
@@ -145,6 +152,13 @@ bind groups, depth, blending, MSAA, the render formats, views and copies run nat
 needs a render-capable native shader path (a WGSL front end, or SPIR-V render lowering beside
 the compute lowering), plus native BGRA8 / RGBA16F sampling and sRGB render targets (the
 sRGB decode on sampling landed in 4.5.0).
+
+**A native NVIDIA render-graph executor** (found in 4.5.0; placed here because a graph
+consumer cannot leave wgpu on NVIDIA without it). `rg_execute_mq` runs native graphs on AMD only,
+and `rg_build_ctx` backs transients on AMD only; on an NVIDIA context both return
+`GPU_ERR_NOT_IMPLEMENTED` (until 4.5.0, `rg_execute_mq` fell into the wgpu path there). It  #skip-lint
+needs NVIDIA's queue timelines and barriers under the same per-node waits, and the transient
+views over one NVIDIA allocation.
 
 **NVIDIA scanout follow-ons** (left out of 4.4.0's block-linear scope, "swizzle at present",
 2026-11-16; scheduled here at the 4.4.0 cut because they need native render targets):
