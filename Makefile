@@ -461,6 +461,16 @@ build/wgpu_texture_sample_e2e: build/wgpu_texture_sample_e2e.o deps/wgpu_main.o
 test-wgpu-texture-sample-e2e: build/wgpu_texture_sample_e2e
 	./build/wgpu_texture_sample_e2e
 
+# 4.5.0 — the sRGB decode on wgpu: RGBA8 / BC1 / BC3 / BC7 sRGB sampled against their UNORM
+# twins and the sRGB table; the twin of test-native-srgb-e2e.
+build/wgpu_srgb_sample_e2e: build/wgpu_srgb_sample_e2e.o deps/wgpu_main.o
+	$(GCC) deps/wgpu_main.o build/wgpu_srgb_sample_e2e.o \
+		$(WGPU_DIR)/lib/libwgpu_native.a -lpthread -ldl -lm -o $@
+
+.PHONY: test-wgpu-srgb-sample-e2e
+test-wgpu-srgb-sample-e2e: build/wgpu_srgb_sample_e2e
+	./build/wgpu_srgb_sample_e2e
+
 # v3.4 AA.3b — wgpu 2D-array sample: create an array, upload distinct layers,
 # sample a chosen layer via a texture_2d_array WGSL FS, verify the RT.
 build/wgpu_array_sample_e2e: build/wgpu_array_sample_e2e.o deps/wgpu_main.o
@@ -1397,6 +1407,16 @@ build/native_bc7_e2e: programs/native_bc7_e2e.cyr src/*.cyr
 .PHONY: test-native-bc7-e2e
 test-native-bc7-e2e: build/native_bc7_e2e
 	./build/native_bc7_e2e
+
+# 4.5.0 — the native sRGB decode: RGBA8 / BC1 / BC3 / BC7 sRGB sampled on the Cezanne against
+# their UNORM twins and the sRGB table (NUM_FORMAT_SRGB in the T#).
+build/native_srgb_e2e: programs/native_srgb_e2e.cyr src/*.cyr
+	@mkdir -p build
+	$(CYRIUS) build programs/native_srgb_e2e.cyr $@
+
+.PHONY: test-native-srgb-e2e
+test-native-srgb-e2e: build/native_srgb_e2e
+	./build/native_srgb_e2e
 
 # v3.4.1 AA.4 — native BC1 compressed/tiled array: per-slice L2T + array image_sample.
 build/native_bc_array_e2e: programs/native_bc_array_e2e.cyr src/*.cyr

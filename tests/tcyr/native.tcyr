@@ -654,6 +654,20 @@ fn test_native_gfx9_image_descriptor() {
     assert_eq((w3etc >> 6) & 0x7, 6, "ETC2_RGB DST_SEL_Z = Z(6)");
     assert_eq((w3etc >> 9) & 0x7, 1, "ETC2_RGB DST_SEL_W = 1 (no alpha)");
     assert_eq((load32(&buf + 4) >> 20) & 0x3F, 24, "ETC2_RGB DATA_FORMAT = 24");
+    # 4.5.0: ETC2_RGB's sRGB twin keeps the no-alpha W override, and takes
+    # NUM_FORMAT_SRGB(9) on the same DATA_FORMAT.
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+      64, 64, MABDA_TEXFMT_ETC2_RGB8_SRGB, GFX9_SW_MODE_64KB_S, 1, 15);
+    assert_eq((load32(&buf + 12) >> 9) & 0x7, 1, "ETC2_RGB sRGB DST_SEL_W = 1 (no alpha)");
+    assert_eq((load32(&buf + 4) >> 20) & 0x3F, 24, "ETC2_RGB sRGB DATA_FORMAT = 24");
+    assert_eq((load32(&buf + 4) >> 26) & 0xF, 9, "ETC2_RGB sRGB NUM_FORMAT = SRGB(9)");
+    memset(&buf, 0, 32);
+    native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
+      64, 64, MABDA_TEXFMT_BC7_SRGB, GFX9_SW_MODE_64KB_S, 1, 15);
+    assert_eq((load32(&buf + 4) >> 20) & 0x3F, 41, "BC7 sRGB DATA_FORMAT = BC7(41)");
+    assert_eq((load32(&buf + 4) >> 26) & 0xF, 9, "BC7 sRGB NUM_FORMAT = SRGB(9)");
+    assert_eq((load32(&buf + 12) >> 9) & 0x7, 7, "BC7 sRGB DST_SEL_W = W(7)");
     # 4-level mip: LAST_LEVEL + MAX_MIP both = 3.
     memset(&buf, 0, 32);
     native_gfx9_image_descriptor(&buf, 0, 0xFFFF800180000000,
@@ -1283,6 +1297,45 @@ fn test_native_texfmt_sampleable() {
     assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ETC2_RGB8), 0, "ETC2 NOT (gated, TS.8)");
     assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ASTC_4X4),  0, "ASTC NOT (gated, TS.8)");
     assert_eq(native_texfmt_sampleable(99), 0, "unknown fmt NOT");
+    # 4.5.0: RGBA8 sRGB (created and sampled since 4.3.1; this said 0 until 4.5.0)
+    # and the compressed sRGB ids, as their UNORM twins.
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_RGBA8_SRGB), 1, "RGBA8 sRGB sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC1_SRGB), 1, "BC1 sRGB sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC3_SRGB), 1, "BC3 sRGB sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BC7_SRGB), 1, "BC7 sRGB sampleable");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ETC2_RGBA8_SRGB), 0, "ETC2 sRGB NOT (Cezanne)");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_ASTC_8X8_SRGB), 0, "ASTC sRGB NOT (Cezanne)");
+    assert_eq(native_texfmt_sampleable(MABDA_TEXFMT_BGRA8_SRGB), 0, "BGRA8 sRGB NOT (no BGRA T#)");
+    # The T# format: the twin's DATA_FORMAT with NUM_FORMAT_SRGB, for every sRGB id
+    # whose twin has a T#; none for BGRA8 sRGB (BGRA8 has none).
+    var ids[64];
+    store64(&ids + 0, MABDA_TEXFMT_RGBA8_SRGB);
+    store64(&ids + 8, MABDA_TEXFMT_BC1_SRGB);
+    store64(&ids + 16, MABDA_TEXFMT_BC3_SRGB);
+    store64(&ids + 24, MABDA_TEXFMT_BC7_SRGB);
+    store64(&ids + 32, MABDA_TEXFMT_ETC2_RGB8_SRGB);
+    store64(&ids + 40, MABDA_TEXFMT_ETC2_RGBA8_SRGB);
+    store64(&ids + 48, MABDA_TEXFMT_ASTC_4X4_SRGB);
+    store64(&ids + 56, MABDA_TEXFMT_ASTC_8X8_SRGB);
+    for (var i = 0; i < 8; i = i + 1) {
+        var f = load64(&ids + i * 8);
+        var p = native_gfx9_texfmt_to_img_format(f);
+        var q = native_gfx9_texfmt_to_img_format(mabda_texfmt_unorm_of(f));
+        assert(p >= 0, "sRGB id has a T# format");
+        assert_eq(native_img_data_format(p), native_img_data_format(q), "sRGB T#: the twin's DATA_FORMAT");
+        assert_eq(native_img_num_format(p), GFX9_IMG_NUM_FORMAT_SRGB, "sRGB T#: NUM_FORMAT_SRGB");
+        assert_eq(native_img_num_format(q), GFX9_IMG_NUM_FORMAT_UNORM, "the twin's T#: UNORM");
+    }
+    assert(native_gfx9_texfmt_to_img_format(MABDA_TEXFMT_BGRA8_SRGB) < 0, "BGRA8 sRGB: no T#");
+    # The tiled layout of a compressed sRGB id is its twin's.
+    var tp[56];
+    var tq[56];
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC7_SRGB, 100, 60, &tp), 0, "BC7 sRGB tiled params");
+    native_tex_tiled_params(MABDA_TEXFMT_BC7, 100, 60, &tq);
+    assert_eq(memeq(&tp, &tq, 56), 1, "BC7 sRGB tiles exactly like BC7");
+    assert_eq(native_tex_tiled_params(MABDA_TEXFMT_BC1_SRGB, 100, 60, &tp), 0, "BC1 sRGB tiled params");
+    native_tex_tiled_params(MABDA_TEXFMT_BC1, 100, 60, &tq);
+    assert_eq(memeq(&tp, &tq, 56), 1, "BC1 sRGB tiles exactly like BC1");
     # Family-granular advisory + the populate-then-query flow (wgpu parity).
     assert_eq(gpu_caps_native_texture_compression(), MABDA_TEXCOMP_BC,
       "native advertises the BC family");

@@ -18,20 +18,23 @@ fn test_vk_format_mapping() {
     assert_eq(mabda_texfmt_from_vk_format(126), 0 - 1, "VK 126 D32_SFLOAT: not a container format here");
     assert_eq(mabda_vk_format_is_srgb(50), 1, "VK 50 BGRA8 sRGB is sRGB");
     assert_eq(mabda_vk_format_is_srgb(44), 0, "VK 44 BGRA8 UNORM is not");
+    # 4.5.0: native decodes RGBA8 sRGB (it sampled it raw, as RGBA8, from 4.3.1 to 4.4.x).
     var t_srgb = native_gfx9_texfmt_to_img_format(MABDA_TEXFMT_RGBA8_SRGB);
-    assert_eq(t_srgb, native_gfx9_texfmt_to_img_format(MABDA_TEXFMT_RGBA8),
-      "native samples RGBA8 sRGB as RGBA8 (as before 4.3.1)");
+    var t_unorm = native_gfx9_texfmt_to_img_format(MABDA_TEXFMT_RGBA8);
+    assert_eq(native_img_data_format(t_srgb), native_img_data_format(t_unorm),
+      "native RGBA8 sRGB: RGBA8's data format");
+    assert_eq(native_img_num_format(t_srgb), GFX9_IMG_NUM_FORMAT_SRGB, "native RGBA8 sRGB: decoded (NUM_FORMAT_SRGB)");
     assert(native_gfx9_texfmt_to_img_format(MABDA_TEXFMT_BGRA8) < 0, "native has no BGRA8 T# yet");
     assert_eq(mabda_texfmt_from_vk_format(131), MABDA_TEXFMT_BC1, "VK 131 BC1_RGB_UNORM");
     assert_eq(mabda_texfmt_from_vk_format(133), MABDA_TEXFMT_BC1, "VK 133 BC1_RGBA_UNORM");
-    assert_eq(mabda_texfmt_from_vk_format(134), MABDA_TEXFMT_BC1, "VK 134 BC1_RGBA_SRGB -> BC1");
+    assert_eq(mabda_texfmt_from_vk_format(134), MABDA_TEXFMT_BC1_SRGB, "VK 134 BC1_RGBA_SRGB -> BC1_SRGB (4.5.0)");
     assert_eq(mabda_texfmt_from_vk_format(137), MABDA_TEXFMT_BC3, "VK 137 BC3_UNORM");
-    assert_eq(mabda_texfmt_from_vk_format(138), MABDA_TEXFMT_BC3, "VK 138 BC3_SRGB -> BC3");
+    assert_eq(mabda_texfmt_from_vk_format(138), MABDA_TEXFMT_BC3_SRGB, "VK 138 BC3_SRGB -> BC3_SRGB");
     assert_eq(mabda_texfmt_from_vk_format(139), MABDA_TEXFMT_BC4, "VK 139 BC4_UNORM");
     assert_eq(mabda_texfmt_from_vk_format(141), MABDA_TEXFMT_BC5, "VK 141 BC5_UNORM");
     assert_eq(mabda_texfmt_from_vk_format(143), MABDA_TEXFMT_BC6H, "VK 143 BC6H_UFLOAT");
     assert_eq(mabda_texfmt_from_vk_format(145), MABDA_TEXFMT_BC7, "VK 145 BC7_UNORM");
-    assert_eq(mabda_texfmt_from_vk_format(146), MABDA_TEXFMT_BC7, "VK 146 BC7_SRGB -> BC7");
+    assert_eq(mabda_texfmt_from_vk_format(146), MABDA_TEXFMT_BC7_SRGB, "VK 146 BC7_SRGB -> BC7_SRGB");
     assert_eq(mabda_texfmt_from_vk_format(147), MABDA_TEXFMT_ETC2_RGB8, "VK 147 ETC2_RGB8");
     assert_eq(mabda_texfmt_from_vk_format(151), MABDA_TEXFMT_ETC2_RGBA8, "VK 151 ETC2_RGBA8");
     assert_eq(mabda_texfmt_from_vk_format(157), MABDA_TEXFMT_ASTC_4X4, "VK 157 ASTC_4x4");
@@ -51,6 +54,48 @@ fn test_vk_format_unmapped() {
     assert_eq(mabda_texfmt_from_vk_format(9999), 0 - 1, "VK 9999 unknown -> -1");
     # RGBA8 (id 0) is a VALID result, distinct from unmapped (-1).
     assert_eq(mabda_texfmt_from_vk_format(37), MABDA_TEXFMT_RGBA8, "VK 37 -> RGBA8 (0), not unmapped");
+    return 0;
+}
+
+# 4.5.0: every sRGB container number maps to an sRGB mabda id whose UNORM twin is
+# what the UNORM number maps to, and the container's sRGB flag matches the id's.
+fn _assert_srgb_pair(srgb_n, unorm_n, want, is_vk) {
+    var got = mabda_texfmt_from_dxgi_format(srgb_n);
+    var base = mabda_texfmt_from_dxgi_format(unorm_n);
+    var flag = mabda_dxgi_format_is_srgb(srgb_n);
+    if (is_vk == 1) {
+        got = mabda_texfmt_from_vk_format(srgb_n);
+        base = mabda_texfmt_from_vk_format(unorm_n);
+        flag = mabda_vk_format_is_srgb(srgb_n);
+    }
+    assert_eq(got, want, "sRGB container -> its own sRGB id");
+    assert_eq(mabda_texfmt_is_srgb(got), 1, "the mapped id is sRGB");
+    assert_eq(flag, 1, "the container number reports sRGB");
+    assert_eq(mabda_texfmt_unorm_of(got), base, "the id's UNORM twin = the UNORM container's id");
+    assert_eq(mabda_texfmt_srgb_of(base), got, "the UNORM id's sRGB twin = the sRGB id");
+    return 0;
+}
+
+fn test_compressed_srgb_container_ids() {
+    _assert_srgb_pair(132, 131, MABDA_TEXFMT_BC1_SRGB, 1);          # BC1 RGB
+    _assert_srgb_pair(134, 133, MABDA_TEXFMT_BC1_SRGB, 1);          # BC1 RGBA
+    _assert_srgb_pair(138, 137, MABDA_TEXFMT_BC3_SRGB, 1);
+    _assert_srgb_pair(146, 145, MABDA_TEXFMT_BC7_SRGB, 1);
+    _assert_srgb_pair(148, 147, MABDA_TEXFMT_ETC2_RGB8_SRGB, 1);
+    _assert_srgb_pair(152, 151, MABDA_TEXFMT_ETC2_RGBA8_SRGB, 1);
+    _assert_srgb_pair(158, 157, MABDA_TEXFMT_ASTC_4X4_SRGB, 1);
+    _assert_srgb_pair(166, 165, MABDA_TEXFMT_ASTC_6X6_SRGB, 1);
+    _assert_srgb_pair(172, 171, MABDA_TEXFMT_ASTC_8X8_SRGB, 1);
+    _assert_srgb_pair(43, 37, MABDA_TEXFMT_RGBA8_SRGB, 1);
+    _assert_srgb_pair(50, 44, MABDA_TEXFMT_BGRA8_SRGB, 1);
+    _assert_srgb_pair(72, 71, MABDA_TEXFMT_BC1_SRGB, 0);
+    _assert_srgb_pair(78, 77, MABDA_TEXFMT_BC3_SRGB, 0);
+    _assert_srgb_pair(99, 98, MABDA_TEXFMT_BC7_SRGB, 0);
+    _assert_srgb_pair(29, 28, MABDA_TEXFMT_RGBA8_SRGB, 0);
+    _assert_srgb_pair(91, 87, MABDA_TEXFMT_BGRA8_SRGB, 0);
+    # A UNORM container number never maps to an sRGB id.
+    assert_eq(mabda_texfmt_is_srgb(mabda_texfmt_from_vk_format(145)), 0, "VK 145 BC7 UNORM -> a UNORM id");
+    assert_eq(mabda_texfmt_is_srgb(mabda_texfmt_from_dxgi_format(98)), 0, "DXGI 98 BC7 UNORM -> a UNORM id");
     return 0;
 }
 
@@ -74,14 +119,14 @@ fn test_dxgi_format_mapping() {
     assert_eq(mabda_texfmt_from_dxgi_format(10), MABDA_TEXFMT_RGBA16F, "DXGI 10 R16G16B16A16_FLOAT -> RGBA16F");
     assert_eq(mabda_dxgi_format_is_srgb(91), 1, "DXGI 91 is sRGB");
     assert_eq(mabda_texfmt_from_dxgi_format(71), MABDA_TEXFMT_BC1, "DXGI 71 BC1_UNORM");
-    assert_eq(mabda_texfmt_from_dxgi_format(72), MABDA_TEXFMT_BC1, "DXGI 72 BC1_SRGB -> BC1");
+    assert_eq(mabda_texfmt_from_dxgi_format(72), MABDA_TEXFMT_BC1_SRGB, "DXGI 72 BC1_SRGB -> BC1_SRGB (4.5.0)");
     assert_eq(mabda_texfmt_from_dxgi_format(77), MABDA_TEXFMT_BC3, "DXGI 77 BC3_UNORM");
-    assert_eq(mabda_texfmt_from_dxgi_format(78), MABDA_TEXFMT_BC3, "DXGI 78 BC3_SRGB -> BC3");
+    assert_eq(mabda_texfmt_from_dxgi_format(78), MABDA_TEXFMT_BC3_SRGB, "DXGI 78 BC3_SRGB -> BC3_SRGB");
     assert_eq(mabda_texfmt_from_dxgi_format(80), MABDA_TEXFMT_BC4, "DXGI 80 BC4_UNORM");
     assert_eq(mabda_texfmt_from_dxgi_format(83), MABDA_TEXFMT_BC5, "DXGI 83 BC5_UNORM");
     assert_eq(mabda_texfmt_from_dxgi_format(95), MABDA_TEXFMT_BC6H, "DXGI 95 BC6H_UF16");
     assert_eq(mabda_texfmt_from_dxgi_format(98), MABDA_TEXFMT_BC7, "DXGI 98 BC7_UNORM");
-    assert_eq(mabda_texfmt_from_dxgi_format(99), MABDA_TEXFMT_BC7, "DXGI 99 BC7_SRGB -> BC7");
+    assert_eq(mabda_texfmt_from_dxgi_format(99), MABDA_TEXFMT_BC7_SRGB, "DXGI 99 BC7_SRGB -> BC7_SRGB");
     return 0;
 }
 
@@ -178,7 +223,7 @@ fn test_dds_parse_dx10() {
     assert_eq(load64(&out + 40), 0, "BC7 UNORM not sRGB");
     _mk_dds_dx10(&buf, 8, 8, 1, 99, 0, 1);   # DXGI 99 = BC7 sRGB
     _dds_parse(&buf, 148, &out);
-    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7, "DXGI 99 -> BC7");
+    assert_eq(load64(&out + 0), MABDA_TEXFMT_BC7_SRGB, "DXGI 99 -> BC7_SRGB (4.5.0)");
     assert_eq(load64(&out + 40), 1, "DXGI 99 srgb flag set");
     # RGBA8 via DX10 (DXGI 28 -> id 0): MUST parse, not be mistaken for unmapped.
     _mk_dds_dx10(&buf, 4, 4, 1, 28, 0, 1);
@@ -232,7 +277,13 @@ fn test_gpu_ctx_supports_format_native() {
     assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_ETC2_RGB8), 0, "native ETC2 unsupported (Cezanne)");
     assert_eq(gpu_ctx_supports_format(&ctx, 99), 0, "invalid fmt -> 0");
     # 4.3.1: the uncompressed render ids a container maps to.
-    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_RGBA8_SRGB), 1, "native: RGBA8 sRGB (sampled as RGBA8)");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_RGBA8_SRGB), 1, "native: RGBA8 sRGB (decoded since 4.5.0)");
+    # 4.5.0: a compressed sRGB id answers as its family, like its UNORM twin.
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_BC1_SRGB), 1, "native: BC1 sRGB");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_BC3_SRGB), 1, "native: BC3 sRGB");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_BC7_SRGB), 1, "native: BC7 sRGB");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_ETC2_RGB8_SRGB), 0, "native: no ETC2 sRGB (Cezanne)");
+    assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_ASTC_4X4_SRGB), 0, "native: no ASTC sRGB (Cezanne)");
     assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_BGRA8), 0, "native: no BGRA8 sampler yet");
     assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_RGBA16F), 0, "native: no half-float sampler yet");
     assert_eq(gpu_ctx_supports_format(&ctx, MABDA_TEXFMT_DEPTH32F), 0, "depth is never a container format");
@@ -938,6 +989,7 @@ fn main() {
     test_vk_format_mapping();
     test_vk_format_unmapped();
     test_vk_format_srgb_flag();
+    test_compressed_srgb_container_ids();
     test_dxgi_format_mapping();
     test_dxgi_format_unmapped();
     test_dxgi_format_srgb_flag();

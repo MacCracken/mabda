@@ -15,7 +15,13 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     `make test-native-bc7-e2e` compares it texel by texel with the Cezanne's texture unit, which
     decodes BC7 exactly. `tests/tcyr/texture_bc7.tcyr` holds the PSNR bar. About 0.8 ms a block.
 
-  Next: compressed sRGB ids, then render-graph aliasing, then the language minors.
+  Landed, compressed sRGB ids (17–24, `src/texture_format.cyr`, with `mabda_texfmt_is_srgb` /
+  `_unorm_of` / `_srgb_of`). KTX2 / DDS sRGB containers load as them. Native AMD decodes every
+  sRGB id it samples (NUM_FORMAT_SRGB in the T#; RGBA8 sRGB sampled raw before), the
+  maintainer's call. The gates are `make test-native-srgb-e2e` and its wgpu twin
+  `make test-wgpu-srgb-sample-e2e`, which check every texel against the sRGB table, ±1.
+
+  Next: render-graph aliasing, then the language minors.
 - **v4.4.0 is released** (tag `4.4.0`; the cut was 2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits

@@ -105,9 +105,13 @@ roadmap.
   first format a consumer names (BC1 / BC3 / BC4 / BC5 / BC7, or ASTC 4×4 / 6×6 / 8×8), validated
   against an independent decoder and mabda's upload-and-sample path, with a PSNR bar; if no
   consumer has named one by then, ask the user.
-- **Compressed sRGB ids.** The BC1/3/7, ETC2 and ASTC sRGB container variants still collapse to
-  the UNORM id (`mabda_*_format_is_srgb` reports it); they get their own ids, as the uncompressed
-  ones did in 4.3.1.
+- ✅ **Compressed sRGB ids** — done (CHANGELOG [4.5.0]). The BC1/3/7, ETC2 and ASTC sRGB
+  container variants collapsed to the UNORM id; they have their own ids (17–24) now, as the
+  uncompressed ones got in 4.3.1, and wgpu samples them with the sRGB decode. At the
+  maintainer's call (2026-11-17) native AMD decodes too: every sRGB id it samples (RGBA8, BC1,
+  BC3, BC7 sRGB) takes NUM_FORMAT_SRGB, checked on the Cezanne by `test-native-srgb-e2e` and
+  matched by wgpu's `test-wgpu-srgb-sample-e2e`. That is the sampling half of v5.0's native sRGB
+  decode, pulled forward.
 - **Render-graph aliasing backing reuse.** Actually sharing one GPU allocation across
   disjoint-lifetime render-graph transients (today the consumer applies the planner's offsets)
   needs a native transient-allocation subsystem; wgpu's safe API has no placed / aliased
@@ -139,7 +143,8 @@ everything else is `GPU_ERR_NOT_IMPLEMENTED` (`src/backend_native_rtier.cyr`). A
 draws geometry (soorat, and kiran through it) cannot leave wgpu on NVIDIA until vertex fetch,
 bind groups, depth, blending, MSAA, the render formats, views and copies run natively. That
 needs a render-capable native shader path (a WGSL front end, or SPIR-V render lowering beside
-the compute lowering), plus native BGRA8 / RGBA16F sampling and the sRGB decode.
+the compute lowering), plus native BGRA8 / RGBA16F sampling and sRGB render targets (the
+sRGB decode on sampling landed in 4.5.0).
 
 **NVIDIA scanout follow-ons** (left out of 4.4.0's block-linear scope, "swizzle at present",
 2026-11-16; scheduled here at the 4.4.0 cut because they need native render targets):

@@ -16,9 +16,12 @@ for the immediate forward pointer.
 ## [4.5.0] — in progress (VERSION still reads 4.4.0)
 
 **Textures + language** ([roadmap](docs/development/roadmap.md#v450--textures--language)), phase 4
-of the 2026-11 plan. Landed so far: texture encoding, both halves. KTX2 Zstandard / ZLIB
-supercompression decodes, and there is a BC7 CPU reference encoder (and decoder), both below. The
-other items are open and tracked in the roadmap.
+of the 2026-11 plan. Landed so far:
+- texture encoding, both halves: KTX2 Zstandard / ZLIB supercompression decode, and a BC7 CPU
+  reference encoder (and decoder);
+- compressed sRGB ids, with the sRGB decode on native AMD.
+
+The other items are open and tracked in the roadmap.
 
 ### Added — KTX2 supercompression: Zstandard and ZLIB
 - **`gpu_texture_load_ktx2` loads KTX2 files whose levels are supercompressed** with
@@ -118,11 +121,92 @@ module is `src/texture_bc7.cyr`.
   - the argument checks hold, and odd image sizes round-trip without writing outside the image.
 - The bundle's Requires block is unchanged, and the example consumer's object grows by 43 KB.
 
+### Added — compressed sRGB ids
+- **Eight new format ids**, appended after `MABDA_TEXFMT_DEPTH32F` (no id was renumbered):
+  - `MABDA_TEXFMT_BC1_SRGB` (17), `_BC3_SRGB` (18), `_BC7_SRGB` (19);
+  - `_ETC2_RGB8_SRGB` (20), `_ETC2_RGBA8_SRGB` (21);
+  - `_ASTC_4X4_SRGB` (22), `_ASTC_6X6_SRGB` (23), `_ASTC_8X8_SRGB` (24).
+
+  `MABDA_TEXFMT_COUNT` is now 25.
+- **Each holds its UNORM twin's blocks.** Sampling one decodes R, G and B from sRGB to linear and
+  leaves alpha alone.
+  - Block geometry, data size, compression family and the native tiled layout are the twin's.
+  - Each id is creatable, uploadable and sampleable wherever its twin is, and is never a colour
+    target.
+  - On wgpu each maps to its webgpu.h v29 value, the one after the twin's (`BC1RGBAUnormSrgb`
+    0x33 … `ASTC8x8UnormSrgb` 0x59).
+- **KTX2 and DDS sRGB containers load as these ids.** VkFormat 132 / 134, 138, 146, 148, 152,
+  158, 166, 172 and DXGI 72, 78, 99 collapsed to the UNORM id before.
+  `mabda_vk_format_is_srgb` / `mabda_dxgi_format_is_srgb` still answer for the container
+  number.
+- **New `@public` helpers** (`src/texture_format.cyr`):
+  - `mabda_texfmt_is_srgb(fmt)`: 1 for RGBA8 / BGRA8 sRGB and the eight new ids;
+  - `mabda_texfmt_unorm_of(fmt)`: the UNORM twin (an id that is not sRGB is its own twin, and an
+    invalid one gives -1);
+  - `mabda_texfmt_srgb_of(fmt)`: the sRGB twin, or -1 for BC4 / BC5 / BC6H, RGBA16F, Depth32F.
+- **wgpu copies** (`gpu_texture_copy_rect`): a format and its sRGB twin are copy-compatible
+  through `mabda_texfmt_unorm_of`. Block-compressed copies are still refused, as before.
+
+### Changed — native AMD decodes sRGB when it samples
+- **Every sRGB id native AMD samples now decodes**: RGBA8 sRGB and BC1 / BC3 / BC7 sRGB. The T#
+  takes the twin's DATA_FORMAT with NUM_FORMAT_SRGB (9), the choice RADV makes for every sRGB
+  VkFormat. ETC2 and ASTC stay unsampleable on the Cezanne, as their UNORM twins are.
+  - Until now native sampled RGBA8 sRGB raw, as RGBA8, from 4.3.1 to 4.4.x. An sRGB id now
+    samples the same on both backends.
+  - This pulls the sampling half of v5.0's "native sRGB decode" forward, at the maintainer's
+    call (2026-11-17). Writing sRGB render targets natively stays with v5.0's render formats.
+- **`native_texfmt_sampleable(MABDA_TEXFMT_RGBA8_SRGB)` returns 1.** It returned 0, although
+  native has created and sampled RGBA8 sRGB textures since 4.3.1.
+- **`mabda_texfmt_is_render_format` is now bounded by `DEPTH32F`** instead of `COUNT`, so the
+  new ids are not render formats.
+
+### Breaking — sRGB assets now sample as linear
+- A KTX2 or DDS texture in a compressed sRGB format now samples as linear, on wgpu and on native
+  AMD. So does an RGBA8 sRGB texture on native.
+- **Migration:** if a shader converted those samples from sRGB to linear itself, because
+  `mabda_*_format_is_srgb` flagged the container, remove the conversion; it would now apply
+  twice. To sample the raw bytes, create the texture with `mabda_texfmt_unorm_of(fmt)` and
+  upload the levels yourself. The loaders always use the container's encoding.
+- No consumer in the sweep calls the sRGB queries, iterates `MABDA_TEXFMT_COUNT` or loads KTX2
+  / DDS. That sweep covered soorat, ranga, bijli and aethersafta; rasa and kiran are not checked
+  out on the dev box. soorat's RGBA8 / BGRA8 sRGB targets and copies are wgpu and unchanged.
+
+### Verified — compressed sRGB ids
+- **Native, on the Cezanne** (`make test-native-srgb-e2e`, new; `build/logs/srgb-e2e-*.log`).
+  The same 64×64 bytes are sampled with point filtering as the UNORM id and as the sRGB id.
+  Every texel must satisfy sRGB.rgb = LUT[UNORM.rgb] within 1 and sRGB.a = UNORM.a, where LUT is
+  the exact IEC 61966-2-1 table:
+  - A, RGBA8 (each byte value 16 times per channel): 3,072 of 4,096 texels exact, 1,024 within 1.
+  - B, BC1 (random blocks): 3,184 exact, the rest within 1.
+  - C, BC3 (random blocks): 3,196 exact, the rest within 1.
+  - D, BC7 (32 random blocks per mode, whose UNORM result equals mabda's CPU decode): 3,181
+    exact, the rest within 1.
+
+  The Cezanne's conversion is a little coarser than exact: 23 byte values round the other way,
+  up to 0.35 from a tie. Mutation-checked: with the T# left at UNORM, every phase fails (exit 12;
+  nothing decoded).
+- **wgpu, on the same chip** (`make test-wgpu-srgb-sample-e2e`, new; WGSL
+  `textureSampleLevel` at texel centres; `build/logs/wgpu-srgb-e2e-*.log`). It runs the same four
+  phases on the same bytes and passes all four. Its exact-texel counts equal native's
+  (3,072 / 3,184 / 3,196 / 3,181), and BC7 UNORM equals the CPU decode there too.
+- **Tests:**
+  - `texture.tcyr`: every new id against its twin, the helpers, their invalid ids, caps by
+    family, and copy compatibility;
+  - `asset_load.tcyr`: every sRGB container number maps to the id whose twin is its UNORM
+    number's id, and the native context's format answers;
+  - `native.tcyr`: the T# number format for every sRGB id, ETC2 RGB sRGB keeping its no-alpha
+    swizzle, the tiled layout equal to the twin's, and `native_texfmt_sampleable`.
+
 ### Verified (so far)
-- CPU: 30 suites, **8060 assertions**, 0 failed (4.4.0: 7932). Every CI gate passes locally
-  (`build/logs/bc7-ci-gates-*.log`), and `cyrius distlib` is idempotent.
-- Cezanne: `make test-native-all` gives 77 passed, 0 failed, 3 skipped for DRM master, of 80,
-  both new gates included, with no GPU reset (`build/logs/bc7-native-all-*.log`).
+- CPU: 30 suites, **8377 assertions**, 0 failed (4.4.0: 7932; 8060 after BC7). Every CI gate
+  passes locally, the bench included, and `cyrius distlib` is idempotent
+  (`build/logs/srgb-ci-gates-*.log`).
+- Cezanne, native: `make test-native-all` gives 78 passed, 0 failed, 3 skipped for DRM master,
+  of 81. All three 4.5.0 gates are included, with no GPU reset
+  (`build/logs/srgb-native-all-*.log`).
+- Cezanne, wgpu: `make test-gpu` passes all nine programs, 112 checks, including the target
+  tier's sRGB copies (`build/logs/srgb-test-gpu-*.log`). `make test-wgpu-srgb-sample-e2e` passes
+  separately.
 
 ## [4.4.0] — 2026-11-17
 

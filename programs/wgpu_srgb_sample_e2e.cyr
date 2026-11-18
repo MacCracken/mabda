@@ -1,0 +1,301 @@
+# programs/wgpu_srgb_sample_e2e.cyr — 4.5.0: the sRGB decode of the sRGB ids on wgpu, the twin
+# of programs/native_srgb_e2e.cyr (same bytes, same checks, so the two backends compare).
+#
+# Each phase uploads one 64x64 texture's bytes twice, as the UNORM id and as its sRGB twin,
+# samples both at texel centres (point filter, WGSL textureSampleLevel at @builtin(position))
+# into an RGBA8 target, reads it back, and checks every texel: sRGB.rgb = LUT[UNORM.rgb]
+# within 1 and sRGB.a = UNORM.a, LUT[v] = round(255 * linear(v / 255)).
+#   A. RGBA8 sRGB (the UNORM result must equal the uploaded bytes)
+#   B. BC1 sRGB, C. BC3 sRGB: random blocks
+#   D. BC7 sRGB: 32 random blocks per mode; the UNORM result must equal mabda's CPU decode
+# Linked with deps/wgpu_main.c. Skips cleanly with no GPU or no BC on the adapter.
+
+include "src/lib.cyr"
+
+var _gpu_preinit = 0;
+var _gpu_ctx = 0;
+
+# Output helpers. Every line's byte count comes from strlen, never a hand-counted literal:
+# miscounts wrote the NUL terminator into the log or dropped the newline and glued two PASS
+# lines (4.1.3 verification). The summary counts the PASS lines actually printed, so it cannot
+# disagree with them; every FAIL returns non-zero at once, so "0 failed" holds by construction.
+var _e2e_passes = 0;
+
+# Write tag + msg + "\n" to fd as ONE write (a line never interleaves with wgpu's own stderr).
+fn _e2e_line(fd, tag, msg): i64 {
+    var line[256];
+    var tl = strlen(tag);
+    var ml = strlen(msg);
+    if (tl > 64) { tl = 64; }
+    if (tl + ml > 255) { ml = 255 - tl; }
+    memcpy(&line, tag, tl);
+    memcpy(&line + tl, msg, ml);
+    store8(&line + tl + ml, 10);
+    syscall(1, fd, &line, tl + ml + 1);
+    return 0;
+}
+fn _pass(msg): i64 { _e2e_line(1, "PASS: ", msg); _e2e_passes = _e2e_passes + 1; return 0; }
+fn _fail(msg): i64 { _e2e_line(2, "FAIL: ", msg); return 1; }
+
+# "\n<N> passed, 0 failed\n" with N = the PASS lines printed above.
+fn _e2e_summary(): i64 {
+    var nb[32];
+    memset(&nb, 0, 32);
+    store8(&nb, 10);
+    fmt_int_buf(_e2e_passes, &nb + 1);
+    _e2e_line(1, &nb, " passed, 0 failed");
+    return 0;
+}
+
+fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn print_i64(n): i64 {
+    var buf[32];
+    memset(&buf, 0, 32);
+    var len = fmt_int_buf(n, &buf);
+    syscall(1, 1, &buf, len);
+    return 0;
+}
+
+# LUT[v] = round(255 * linear(v / 255)), IEC 61966-2-1 in f64 (the native twin's table).
+# 8 rows of 32 bytes.
+var _SRGB_LUT_0 = "0000000000000001010101010101010101010202020202020202030303030303";
+var _SRGB_LUT_1 = "04040404040505050506060606070707080808080909090a0a0a0b0b0c0c0c0d";
+var _SRGB_LUT_2 = "0d0d0e0e0f0f10101111111212131314141516161717181819191a1b1b1c1d1d";
+var _SRGB_LUT_3 = "1e1e1f20202122232324252526272829292a2b2c2d2d2e2f3031323333343536";
+var _SRGB_LUT_4 = "3738393a3b3c3d3e3f404142434445464748494a4c4d4e4f5051525455565758";
+var _SRGB_LUT_5 = "5a5b5c5d5f60616364656768696b6c6d6f707273747677797a7c7d7f80828385";
+var _SRGB_LUT_6 = "86888a8b8d8e9092939597989a9c9d9fa1a3a4a6a8aaabadafb1b3b5b7b8babc";
+var _SRGB_LUT_7 = "bec0c2c4c6c8caccced0d2d4d6d8dadcdee0e2e5e7e9ebedeff2f4f6f8fafdff";
+var g_lut = 0;
+fn _hexval(c): i64 {
+    if (c >= 97) { return c - 87; }
+    return c - 48;
+}
+fn _lut_row(i): i64 {
+    if (i == 0) { return _SRGB_LUT_0; }
+    if (i == 1) { return _SRGB_LUT_1; }
+    if (i == 2) { return _SRGB_LUT_2; }
+    if (i == 3) { return _SRGB_LUT_3; }
+    if (i == 4) { return _SRGB_LUT_4; }
+    if (i == 5) { return _SRGB_LUT_5; }
+    if (i == 6) { return _SRGB_LUT_6; }
+    return _SRGB_LUT_7;
+}
+fn lut_init(): i64 {
+    g_lut = alloc(256);
+    var i = 0;
+    while (i < 256) {
+        var row = _lut_row(i / 32);
+        var j = (i % 32) * 2;
+        var hi = _hexval(load8(row + j));
+        var lo = _hexval(load8(row + j + 1));
+        store8(g_lut + i, hi * 16 + lo);
+        i = i + 1;
+    }
+    return 0;
+}
+
+var g_rng = 0x9E3779B97F4A7C15;
+fn rng_byte(): i64 {
+    g_rng = (g_rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF;
+    return (g_rng >> 33) & 0xFF;
+}
+
+fn _sample_wgsl(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "@group(0) @binding(0) var t: texture_2d<f32>; ");
+    str_builder_add_cstr(sb, "@group(0) @binding(1) var s: sampler; ");
+    str_builder_add_cstr(sb, "@vertex fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> { ");
+    str_builder_add_cstr(sb, "var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), ");
+    str_builder_add_cstr(sb, "vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)); ");
+    str_builder_add_cstr(sb, "return vec4<f32>(p[vid], 0.0, 1.0); } ");
+    str_builder_add_cstr(sb, "@fragment fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> { ");
+    str_builder_add_cstr(sb, "return textureSampleLevel(t, s, pos.xy / vec2<f32>(64.0, 64.0), 0.0); }");
+    return str_cstr(str_builder_build(sb));
+}
+
+var g_rt = 0;
+var g_samp = 0;
+var g_pipe = 0;
+
+# Sample a 64x64 texture of `fmt` holding `data` (`n` bytes) and read the target back into
+# `out` (64*64*4 bytes). Returns 0, or 1 after printing the failure.
+fn render(fmt, data, n, out): i64 {
+    var tex = gpu_texture_create_2d_sampleable(_gpu_ctx, 64, 64, fmt);
+    if (tex == 0) { return _fail("texture create"); }
+    if (gpu_texture_write(_gpu_ctx, tex, data, n) != 0) { return _fail("texture upload"); }
+    var clear = color_new(F64_0, F64_0, F64_0, F64_1);
+    var pass = gpu_render_pass_begin(_gpu_ctx, g_rt, clear);
+    if (pass == 0) { return _fail("pass begin"); }
+    if (gpu_render_pass_bind_texture(_gpu_ctx, pass, tex, g_samp) != 0) { return _fail("bind"); }
+    if (gpu_render_pass_draw(_gpu_ctx, pass, g_pipe, 3, 1) != 0) { return _fail("draw"); }
+    gpu_render_pass_end(_gpu_ctx, pass);
+    gpu_texture_release(_gpu_ctx, tex);
+    var device = gpu_ctx_device(_gpu_ctx);
+    var queue = gpu_ctx_queue(_gpu_ctx);
+    var usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+    var desc = wgpu_buffer_descriptor("srgb-readback", usage, 16384, 0);
+    var buf = wgpu_device_create_buffer(device, desc);
+    if (buf == 0) { return _fail("readback buffer"); }
+    var enc = wgpu_device_create_command_encoder(device, "srgb-readback-enc");
+    var cargs[72];
+    memset(&cargs, 0, 72);
+    store64(&cargs + 0, load64(g_rt + 0));
+    store64(&cargs + 32, buf);
+    store32(&cargs + 48, 256);   # bytesPerRow = 64 * 4
+    store32(&cargs + 52, 64);
+    store32(&cargs + 56, 64);
+    store32(&cargs + 60, 64);
+    store32(&cargs + 64, 1);
+    wgpu_command_encoder_copy_texture_to_buffer(enc, &cargs);
+    var cmd = wgpu_command_encoder_finish(enc, "srgb-readback-cmd");
+    wgpu_queue_submit_one(queue, cmd);
+    if (wgpu_buffer_map_sync(device, buf, WGPU_MAP_MODE_READ, 0, 16384) != WGPU_BUFFER_MAP_ASYNC_STATUS_SUCCESS) {
+        return _fail("map readback");
+    }
+    var mapped = wgpu_buffer_get_const_mapped_range(buf, 0, 16384);
+    if (mapped == 0) { return _fail("mapped range"); }
+    memcpy(out, mapped, 16384);
+    wgpu_buffer_unmap(buf);
+    wgpu_buffer_release(buf);
+    return 0;
+}
+
+# Every texel of `srgb` against LUT applied to `ref` (RGB within 1, A exact). Returns the
+# number of failing texels (4096 when nothing was decoded at all).
+fn check_decode(ref, srgb, label): i64 {
+    var exact = 0;
+    var bad = 0;
+    var decoded = 0;
+    var i = 0;
+    while (i < 4096) {
+        var r = load32(ref + i * 4);
+        var s = load32(srgb + i * 4);
+        var worst = 0;
+        var c = 0;
+        while (c < 3) {
+            var v = (r >> (c * 8)) & 0xFF;
+            var d = ((s >> (c * 8)) & 0xFF) - (load8(g_lut + v) & 0xFF);
+            if (d < 0) { d = 0 - d; }
+            if (d > worst) { worst = d; }
+            if (((s >> (c * 8)) & 0xFF) != v) { decoded = decoded + 1; }
+            c = c + 1;
+        }
+        var fail = 0;
+        if (worst > 1) { fail = 1; }
+        if (((r >> 24) & 0xFF) != ((s >> 24) & 0xFF)) { fail = 1; }
+        if (fail == 1) { bad = bad + 1; }
+        if (fail == 0) { if (worst == 0) { exact = exact + 1; } }
+        i = i + 1;
+    }
+    print_cstr("  "); print_cstr(label); print_cstr(": 4096 texels, "); print_i64(exact);
+    print_cstr(" exact, "); print_i64(bad); print_cstr(" failing; "); print_i64(decoded);
+    print_cstr(" of 12288 colour channels changed by the decode\n");
+    if (decoded == 0) { return 4096; }
+    return bad;
+}
+
+# Phase: `n` bytes of `data` as `unorm` and as `srgb`. `cpu` (or 0) is the expected UNORM
+# result. Returns 0 or 1.
+fn phase(unorm, srgb, data, n, cpu, raw, dec, label, pass_msg): i64 {
+    if (render(unorm, data, n, raw) != 0) { return 1; }
+    if (cpu != 0) {
+        if (memeq(raw, cpu, 16384) == 0) { return _fail("the UNORM twin does not sample as expected"); }
+    }
+    if (render(srgb, data, n, dec) != 0) { return 1; }
+    if (check_decode(raw, dec, label) != 0) { return _fail("the sRGB decode differs from the table"); }
+    _pass(pass_msg);
+    return 0;
+}
+
+fn mabda_main(fn_table_ptr, preinit_ptr): i64 {
+    color_init();
+    wgpu_ffi_init_table(fn_table_ptr);
+    _gpu_preinit = preinit_ptr;
+    _bc7_init();
+    lut_init();
+    var res_tag, res = gpu_context_from_preinit(_gpu_preinit);
+    if (is_err_result(res_tag) == 1) {
+        _e2e_line(2, "SKIP: ", "no GPU available");
+        return 0;
+    }
+    _gpu_ctx = res;
+    if (gpu_ctx_supports_format(_gpu_ctx, MABDA_TEXFMT_BC7_SRGB) == 0) {
+        _e2e_line(2, "SKIP: ", "the adapter has no BC compression");
+        return 0;
+    }
+    _pass("GPU context created, BC supported");
+    g_samp = gpu_sampler_create(_gpu_ctx, NATIVE_SAMP_FILTER_POINT, NATIVE_SAMP_ADDR_CLAMP);
+    if (g_samp == 0) { return _fail("sampler create"); }
+    var wgsl = _sample_wgsl();
+    var shmod = gpu_shader_module_create(_gpu_ctx, wgsl, strlen(wgsl));
+    if (shmod == 0) { return _fail("shader module"); }
+    g_pipe = gpu_render_pipeline_create(_gpu_ctx, shmod, shmod, WGPU_TEXTURE_FORMAT_RGBA8_UNORM);
+    if (g_pipe == 0) { return _fail("render pipeline"); }
+    g_rt = gpu_render_target_create_2d_rgba8(_gpu_ctx, 64, 64);
+    if (g_rt == 0) { return _fail("render target"); }
+
+    var data = alloc(16384);
+    var raw = alloc(16384);
+    var dec = alloc(16384);
+
+    # A. RGBA8 sRGB: every byte value 16 times per channel
+    var i = 0;
+    while (i < 4096) {
+        var r = i & 0xFF;
+        var g = (i * 37 + 11) & 0xFF;
+        var b = (i * 101 + 200) & 0xFF;
+        var a = (i * 13 + 5) & 0xFF;
+        store32(data + i * 4, r | (g << 8) | (b << 16) | (a << 24));
+        i = i + 1;
+    }
+    print_cstr("A. RGBA8 sRGB\n");
+    if (phase(MABDA_TEXFMT_RGBA8, MABDA_TEXFMT_RGBA8_SRGB, data, 16384, data, raw, dec, "A",
+        "A: RGBA8 sRGB decodes within 1 of the table, alpha untouched") != 0) { return 1; }
+
+    # B. BC1 sRGB
+    i = 0;
+    while (i < 2048) { store8(data + i, rng_byte()); i = i + 1; }
+    print_cstr("B. BC1 sRGB\n");
+    if (phase(MABDA_TEXFMT_BC1, MABDA_TEXFMT_BC1_SRGB, data, 2048, 0, raw, dec, "B",
+        "B: BC1 sRGB decodes within 1 of the table") != 0) { return 1; }
+
+    # C. BC3 sRGB
+    i = 0;
+    while (i < 4096) { store8(data + i, rng_byte()); i = i + 1; }
+    print_cstr("C. BC3 sRGB\n");
+    if (phase(MABDA_TEXFMT_BC3, MABDA_TEXFMT_BC3_SRGB, data, 4096, 0, raw, dec, "C",
+        "C: BC3 sRGB decodes within 1 of the table") != 0) { return 1; }
+
+    # D. BC7 sRGB: block k is mode k % 8
+    var k = 0;
+    while (k < 256) {
+        var blk = data + k * 16;
+        var j = 0;
+        while (j < 16) { store8(blk + j, rng_byte()); j = j + 1; }
+        var m = k % 8;
+        var keep = 0xFF - ((1 << (m + 1)) - 1);
+        store8(blk, (load8(blk) & keep) | (1 << m));
+        k = k + 1;
+    }
+    var cpu = alloc(16384);
+    var blkdec[64];
+    k = 0;
+    while (k < 256) {
+        _bc7_decode_block(data + k * 16, &blkdec);
+        var t = 0;
+        while (t < 16) {
+            var x = (k % 16) * 4 + (t % 4);
+            var y = (k / 16) * 4 + (t / 4);
+            store32(cpu + (y * 64 + x) * 4, load32(&blkdec + t * 4));
+            t = t + 1;
+        }
+        k = k + 1;
+    }
+    print_cstr("D. BC7 sRGB\n");
+    if (phase(MABDA_TEXFMT_BC7, MABDA_TEXFMT_BC7_SRGB, data, 4096, cpu, raw, dec, "D",
+        "D: BC7 equals the CPU decode; BC7 sRGB decodes within 1 of the table") != 0) { return 1; }
+
+    _e2e_summary();
+    return 0;
+}
