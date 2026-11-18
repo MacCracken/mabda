@@ -6,13 +6,14 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
 ## Where things stand
 
-- **The v4.5.0 cut is prepared, uncommitted** (VERSION 4.5.0; CHANGELOG `[4.5.0] — 2026-11-17`).
-  The audit is `docs/audit/2026-11-17-4.5.0-audit.md`: 1 HIGH / 4 MEDIUM / 11 LOW, all fixed.
-  Every pin is current (cyrius 6.7.18, samvada 1.1.2, chitra 1.4.1). The CPU suite, the CI
-  gates, `test-native-all` (79/0/3), `test-gpu`, chew's 17 masterless gates and NVK `test-gpu`,
-  and the consumer check (ranga on both GPUs, soorat) all pass. Left: the seat closeout on both
-  boxes (`make seat-closeout-amd` here, `make seat-closeout-nvidia` in chew's
-  `~/mabda-verify-450`), then the commit and tag, which are the maintainer's.
+- **The v4.5.0 cut is committed (`306c95b`) and closed out** (VERSION 4.5.0; CHANGELOG
+  `[4.5.0] — 2026-11-17`). The audit is `docs/audit/2026-11-17-4.5.0-audit.md`: 1 HIGH /
+  4 MEDIUM / 11 LOW, all fixed. Every pin is current (cyrius 6.7.18, samvada 1.1.2, chitra
+  1.4.1). The CPU suite, the CI gates, `test-native-all`, `test-gpu`, chew's 17 masterless
+  gates and NVK `test-gpu`, and the consumer check (ranga on both GPUs, soorat) all pass. The
+  seat closeout passed on both boxes (`build/logs/seat-closeout-amd-20261117-205653.log`, 82 of
+  82; `build/logs/chew-seat-closeout-nvidia-20261117-204347.log`, all six steps). What is left
+  is the tag, which is the maintainer's.
   Landed, texture encoding (both halves):
   - KTX2 zstd / zlib supercompression decode. The consumer registers sankoch's decoders
     (`gpu_ktx2_set_zstd_decoder` / `_zlib_decoder`); mabda's `src/` must not name an optional
@@ -109,9 +110,10 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
     (item 5, the bilinear row and `gpu_resize`, was appended after the 1024-id work). For the
     soorat probes, keep the `scripts/probes/gpu/` layout and the `rust-old/src/` shaders the
     probes read through `../../../`. A flat copy fails every shader read.
-  On chew, test the working tree in `~/mabda-verify-n9` (tar `src tests programs scripts
-  Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf lib && mkdir lib && cyrius
-  deps`). To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
+  On chew, test the working tree in a verify tree (`~/mabda-verify-450` for 4.5.0): tar `src
+  tests programs scripts dist Makefile cyrius.cyml cyrius.lock VERSION` over it, then `rm -rf
+  lib && mkdir lib && cyrius deps`. Include `dist`: `tests/tcyr/mabda_raw_include.tcyr` and the
+  example-link step read `dist/mabda.cyr`, and 4.5.0's tree had a stale one until it was copied. To round-trip compiled SASS, copy it there and run `scripts/disasm-sass.sh <file>...`. The oracle lives on `chew`: `nvcc` / `nvdisasm` / `cuobjdump` in
   `/opt/cuda/bin`, scratch in `~/mabda-n9-oracle`. ranga's suites ran from static binaries built
   here against a scratch clone (`~/ranga-n96` on chew holds them). ranga's
   `tests/gpu_spirv.tcyr` needs the 4-argument table-builder call (CHANGELOG, Breaking).
@@ -122,11 +124,10 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 - **Pins:** cyrius **6.7.18** (`cyrius.cyml`; track the latest upstream `VERSION` when you bump),
   wgpu-native **v29.0.1.1**, launcher **83 slots**, deps samvada 1.1.2 / chitra 1.4.1 (since
   4.4.0; samvada 1.1.2 fixed a HIGH in `TakeDevice`).
-- **Next release: v4.5.0 — textures + language**: texture encoding, compressed sRGB ids,
-  render-graph aliasing, the cyrius 6.7 language minors (S2 / S3 / S4 / M6). Then v5.0 (native
-  rendering beyond the vertex-less subset; the NVIDIA scanout follow-ons, which are block-linear
-  render targets and a copy-engine present; Intel; NVIDIA wgpu retires) and v5.1. Don't split
-  these into more minors without asking.
+- **Next release: v5.0**, after the 4.5.0 tag: native rendering beyond the vertex-less subset;
+  the NVIDIA scanout follow-ons, which are block-linear render targets and a copy-engine
+  present; Intel; NVIDIA wgpu retires, which now also needs a native NVIDIA render-graph
+  executor. Then v5.1. Don't split these into more minors without asking.
 
 ## The maintainer's standing rules
 
@@ -301,6 +302,6 @@ Consumers:
 
 ## Open, and where it is tracked
 
-Everything is in [the roadmap](roadmap.md): v4.4.0 (compilers + NVIDIA + the seat-only closeout),
-v4.5.0 (textures + language), v5.0 (native rendering, Intel, NVIDIA wgpu retirement), v5.1, and
+Everything is in [the roadmap](roadmap.md): v5.0 (native rendering, Intel, NVIDIA wgpu
+retirement), v5.1, the texture-encoder follow-ons that no release holds yet, and
 "blocked upstream" (WASM, `trait Backend`, samvada's Windows `sys_recvmsg`, cyrfmt's file cap).

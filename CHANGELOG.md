@@ -495,8 +495,8 @@ module is `src/texture_bc7.cyr`.
   112 checks. `make test-wgpu-srgb-sample-e2e` passes too.
 - **chew, NVIDIA TU116** (`build/logs/chew-nv-gates-450-*.log`): all 17 masterless
   `test-nvidia-*` gates pass, and so does `test-gpu` on NVK, with no nouveau faults. The tree is
-  `~/mabda-verify-450`, this working tree on a fresh clone. The five card-node gates are the
-  seat closeout.
+  `~/mabda-verify-450`, a clone whose files match the cut commit's (checked by checksum). The
+  card-node gates are the seat closeout.
 - **Consumers, against the final dist** (scratch copies; neither repo was touched). All give
   exactly their 4.4.0 results:
   - ranga on the Cezanne (`build/logs/consumer-ranga-amd-450final-*.log`): gpu 48/0,
@@ -506,11 +506,18 @@ module is `src/texture_bc7.cyr`.
     four, plus gpu_nvidia 23/31. Those 31 are ranga's stale "NVIDIA refuses compute" rows.
   - soorat's probes (`build/logs/consumer-soorat-450final-*.log`): MB1 builds 11 of 11
     pipelines, and its error cases fail as designed; MB2–MB5 pass 8 of 8.
-- **The seat closeout** (the DRM-master gates, from a text console on each box) is run by the
-  maintainer before the tag.
+- **The seat closeout** (the DRM-master gates) passed on both boxes. The maintainer ran it from a
+  text console on each, on the committed cut (`306c95b`):
+  - Cezanne (`build/logs/seat-closeout-amd-20261117-205653.log`): `test-native-all` with nothing
+    skipped gives **82 passed, 0 failed, of 82**, on a boot with no GPU reset. The example
+    consumer (`examples/stdlib-consumer`'s `hello_gpu`) links and runs.
+  - chew (`build/logs/chew-seat-closeout-nvidia-20261117-204347.log`): all six steps pass. They
+    are the KMS probe, the scanout framebuffer, the live modeset, the 120-frame present, the
+    public surface API in block-linear then linear (180 frames each, at 4.4.0's frame time), and
+    logind handing over the card on the live system bus, twice.
 
 ### Next
-- The seat closeout on both boxes, then the tag. v5.0 (native rendering; the NVIDIA wgpu
+- The tag. v5.0 (native rendering; the NVIDIA wgpu
   retirement, which now also needs a native NVIDIA render-graph executor) follows:
   `docs/development/roadmap.md`.
 
