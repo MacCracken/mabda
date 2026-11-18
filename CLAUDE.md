@@ -268,6 +268,11 @@ struct-shape tests at the Cyrius layer. HW gates live in the
 - **`var X = expr;` initialization required.** Cyrius rejects bare
   `var X;` declarations — every var needs an initializer. Use
   `var X = 0;` for "to-be-set-later" pattern.
+- **A top-level constant is `const`, not `var`** (4.5.0, S2). Only state that something
+  assigns stays a `var`. A `const` beside a same-name top-level `var` anywhere in the same
+  compile is an error, so check a new name against cyrius's `lib/` and the consumers.
+- **`*_is_*` / `*_has_*` predicates return `: bool`** (4.5.0, S3): `true` / `false` or a
+  comparison, never `return 1;`. `tests/tcyr/predicates.tcyr` pins them, so add a new one there.
 - **`gpu_shader_module_create` is byte-polymorphic.** wgpu reads as
   WGSL, native reads as pre-compiled GFX9 ISA. v3.0 ships consumer
   two-form bundles; in-mabda WGSL → GFX9 lowering is v3.x scope.

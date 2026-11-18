@@ -116,16 +116,16 @@
 #   +88: target       (native AMD: a NativeRT view over a RENDER_ATTACHMENT texture, else 0) 4.5.0
 #   +96: user_queues  (i64 — bitmask of 1 << QUEUE_KIND_* over the nodes using it) 4.5.0
 #   +104: label       (cstr) 4.5.0
-var RG_STRUCT_SIZE  = 72;
-var RG_RES_SIZE     = 112;
+const RG_STRUCT_SIZE  = 72;
+const RG_RES_SIZE   = 112;
 
-var NODE_COMPUTE       = 1;
-var NODE_RENDER        = 2;
-var NODE_COPY_BUF_BUF  = 3;
-var NODE_COPY_TEX_BUF  = 4;
+const NODE_COMPUTE     = 1;
+const NODE_RENDER      = 2;
+const NODE_COPY_BUF_BUF  = 3;
+const NODE_COPY_TEX_BUF  = 4;
 
-var RES_BUFFER  = 1;
-var RES_TEXTURE = 2;
+const RES_BUFFER  = 1;
+const RES_TEXTURE = 2;
 
 # ================================================================
 # Graph construction
@@ -144,7 +144,7 @@ fn rg_aliasing(g, on): i64 { store64(g + 24, on); return g; }
 
 fn rg_node_count(g): i64 { return vec_len(load64(g + 0)); }
 fn rg_transient_count(g): i64 { return vec_len(load64(g + 8)); }
-fn rg_is_built(g): i64 { return load64(g + 16); }
+fn rg_is_built(g): bool { return load64(g + 16) != 0; }
 
 # Add a compute node. `dims_xyz` is a 12-byte packed (x, y, z) u32 triple.
 # Returns the node_id (0-indexed); callers pass this to rg_node_reads /
@@ -752,7 +752,7 @@ fn _rg_native_back(g, ctx): i64 {
 # Alignment: 256 bytes, matches typical GPU storage-buffer binding
 # alignment. Both naive and aliased totals respect it, so the reclaim
 # ratio is apples-to-apples.
-var _RG_PLAN_ALIGN = 256;
+const _RG_PLAN_ALIGN = 256;
 
 fn _rg_plan_transient_bytes(r): i64 {
     var kind = load64(r + 0);
@@ -902,8 +902,7 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count, reuse, apply): i64 {
 # Returns 0 on success, 1 if the graph is not yet built.   #skip-lint
 fn rg_plan_aliasing_stats(g, out): i64 {
     if (rg_is_built(g) == 0) { return 1; }
-    var apply = 1;
-    if (load64(g + 56) != 0) { apply = 0; }
+    var apply = if (load64(g + 56) != 0) { 0 } else { 1 };
     return _rg_plan(g, out, 1, apply);
 }
 
@@ -994,19 +993,19 @@ fn rg_transient_last_use(g, res_id): i64 {
 #                               walked in sort_idx order).
 #   +8:  fences     (vec ptr) — vec of FenceEdge* (cross-queue edges).
 #   +16: node_count (i64)     — total nodes scheduled (sanity / tests).
-var SCHED_OFF_BATCHES   = 0;
-var SCHED_OFF_FENCES    = 8;
-var SCHED_OFF_NODECOUNT = 16;
-var SCHED_SIZE          = 24;
+const SCHED_OFF_BATCHES = 0;
+const SCHED_OFF_FENCES  = 8;
+const SCHED_OFF_NODECOUNT = 16;
+const SCHED_SIZE        = 24;
 
 # Batch (24 bytes):
 #   +0:  queue_kind (i64 — QUEUE_KIND_*)
 #   +8:  nodes      (vec ptr — Node*, in sort_idx order within the queue)
 #   +16: min_sort   (i64 — smallest sort_idx in the batch; submit-order key)
-var BATCH_OFF_QUEUE   = 0;
-var BATCH_OFF_NODES   = 8;
-var BATCH_OFF_MINSORT = 16;
-var BATCH_SIZE        = 24;
+const BATCH_OFF_QUEUE = 0;
+const BATCH_OFF_NODES = 8;
+const BATCH_OFF_MINSORT = 16;
+const BATCH_SIZE      = 24;
 
 # FenceEdge (32 bytes) — a writer→reader dependency whose endpoints sit
 # on different queues. The R.4 executor turns each into a
@@ -1016,13 +1015,13 @@ var BATCH_SIZE        = 24;
 #   +8:  producer_node  (i64 — producer sort_idx)
 #   +16: consumer_queue (i64 — QUEUE_KIND_*)
 #   +24: consumer_node  (i64 — consumer sort_idx)
-var FENCE_OFF_PQ = 0;
-var FENCE_OFF_PN = 8;
-var FENCE_OFF_CQ = 16;
-var FENCE_OFF_CN = 24;
-var FENCE_SIZE   = 32;
+const FENCE_OFF_PQ = 0;
+const FENCE_OFF_PN = 8;
+const FENCE_OFF_CQ = 16;
+const FENCE_OFF_CN = 24;
+const FENCE_SIZE = 32;
 
-var RG_OFF_SCHEDULE = 40;
+const RG_OFF_SCHEDULE = 40;
 
 # Find the index of the batch for `qk` in `batches`, or -1 if none.
 fn _rg_batch_index_for(batches, qk): i64 {
@@ -1143,9 +1142,9 @@ fn rg_schedule(g): i64 {
 }
 
 # 1 if rg_schedule has run on this graph, else 0.
-fn rg_is_scheduled(g): i64 {
-    if (load64(g + RG_OFF_SCHEDULE) == 0) { return 0; }
-    return 1;
+fn rg_is_scheduled(g): bool {
+    if (load64(g + RG_OFF_SCHEDULE) == 0) { return false; }
+    return true;
 }
 
 # --- Schedule accessors (post-rg_schedule). All return 0 / -1 on a bad
@@ -1359,8 +1358,7 @@ fn rg_execute(g, device, queue): i64 {
     if (n == 0) { return 0; }
 
     var label = load64(g + 32);
-    var enc_label = label;
-    if (enc_label == 0) { enc_label = "render_graph_enc"; }
+    var enc_label = if (label == 0) { "render_graph_enc" } else { label };
     var encoder = wgpu_device_create_command_encoder(device, enc_label);
     if (encoder == 0) { return 1; }
 
@@ -1394,8 +1392,7 @@ fn rg_execute(g, device, queue): i64 {
         i = i + 1;
     }
 
-    var cmd_label = label;
-    if (cmd_label == 0) { cmd_label = "render_graph_cmd"; }
+    var cmd_label = if (label == 0) { "render_graph_cmd" } else { label };
     var cmd = wgpu_command_encoder_finish(encoder, cmd_label);
     if (cmd == 0) { return 1; }
     wgpu_queue_submit_one(queue, cmd);
@@ -1641,8 +1638,7 @@ fn _rg_node_new(kind, label): i64 {
     store64(node + 48, 0 - 1);
     # Default queue affinity per node kind (R.1): compute runs on the
     # COMPUTE ring, render/copy on GRAPHICS. rg_node_queue overrides this.
-    var qk = QUEUE_KIND_GRAPHICS;
-    if (kind == NODE_COMPUTE) { qk = QUEUE_KIND_COMPUTE; }
+    var qk = if (kind == NODE_COMPUTE) { QUEUE_KIND_COMPUTE } else { QUEUE_KIND_GRAPHICS };
     store64(node + 56, qk);
     store64(node + 64, 0 - 1);
     return node;

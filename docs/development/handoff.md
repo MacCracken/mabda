@@ -31,7 +31,15 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   - the planner sizes textures by format;
   - a transient's handle is 0 until it is allocated.
 
-  Next: the language minors (S2 / S3 / S4 / M6).
+  Landed, the cyrius 6.7 language minors:
+  - S2: 2,126 integer constants are `const`. A new top-level constant should be `const` too;
+    anything assigned stays `var`.
+  - S3: the `*_is_*` / `*_has_*` predicates are `: bool`. Return `true` / `false` or a
+    comparison; `tests/tcyr/predicates.tcyr` stops compiling if one goes back to `i64`.
+  - S4: if-expressions.
+  - M6: the GPU benchmarks report what lib/bench.cyr resolves.
+
+  Every 4.5.0 item has landed. Next: the 4.5.0 cut (audit, closeout, consumer check, tag).
 - **v4.4.0 is released** (tag `4.4.0`; the cut was 2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits

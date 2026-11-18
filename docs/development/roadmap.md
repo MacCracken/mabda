@@ -123,15 +123,17 @@ roadmap.
   has no render-graph executor (`rg_build_ctx` / `rg_execute_mq` return
   GPU_ERR_NOT_IMPLEMENTED); the executor is scheduled in v5.0 below, with the NVIDIA wgpu
   retirement it blocks.
-- **The cyrius 6.7 language minors** (recorded by the W2 stdlib wave, 4.2.0; each changes a public
-  name's kind or type, which is why they ride a minor):
-  - S2: about 1,570 top-level integer `var NAME = <literal>` constants become `const`, after a
-    per-name collision survey (a `const` beside a same-name `var` is a compile error, and cyrius
-    folds mabda next to other stdlibs);
-  - S3: the `*_is_*` / `*_has_*` predicates return `: bool` (cyrius 6.7.3);
-  - S4: if-expressions at the ~77 assignment sites where they read better (cyrius 6.7.4);
-  - M6: retire the measured-clock windowing in `programs/benchmarks.cyr` (`_clock_jitter_ns`),
-    with a `make bench-gpu` run before and after.
+- ✅ **The cyrius 6.7 language minors** — done (CHANGELOG [4.5.0]; recorded by the W2 stdlib
+  wave, 4.2.0; each changes a public name's kind or type, which is why they ride a minor):
+  - S2: 2,126 top-level integer constants are `const` (1,570 when counted at 4.2.0), after a
+    survey of mabda, its consumers and cyrius's `lib/`. 31 stay `var`: 30 are mutable state,
+    and `DRM_IOCTL_VERSION` is also declared by agnodrm;
+  - S3: the 34 `*_is_*` / `*_has_*` predicates return `: bool`, pinned by
+    `tests/tcyr/predicates.tcyr`;
+  - S4: if-expressions at 66 assignment sites (12 more stay two lines; one line would pass 120
+    bytes);
+  - M6: `programs/benchmarks.cyr` uses lib/bench.cyr's resolution, its `_clock_jitter_ns`
+    windowing retired, with a `make bench-gpu` run before and after.
 
 ---
 

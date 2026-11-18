@@ -20,9 +20,11 @@ of the 2026-11 plan. Landed so far:
 - texture encoding, both halves: KTX2 Zstandard / ZLIB supercompression decode, and a BC7 CPU
   reference encoder (and decoder);
 - compressed sRGB ids, with the sRGB decode on native AMD;
-- render-graph backing reuse on native AMD.
+- render-graph backing reuse on native AMD;
+- the cyrius 6.7 language minors: S2 (`const`), S3 (`bool` predicates), S4 (if-expressions)
+  and M6 (the GPU benchmarks on lib/bench.cyr's own resolution).
 
-The other items are open and tracked in the roadmap.
+Every 4.5.0 item has landed; what is left is the cut.
 
 ### Added — KTX2 supercompression: Zstandard and ZLIB
 - **`gpu_texture_load_ktx2` loads KTX2 files whose levels are supercompressed** with
@@ -287,16 +289,130 @@ module is `src/texture_bc7.cyr`.
     - format-aware sizes and `rg_node_set_pass`.
   - `queue.tcyr` covers merging, the slot limit, take-and-clear and the wait-chunk bytes.
 
+### Breaking — 2,126 integer constants are `const` (S2)
+- **Every top-level `var NAME = <integer constant>;` in `src/` that nothing assigns or takes
+  the address of is now `const NAME = …;`.** That is 2,126 names in 62 files: the wgpu, DRM,
+  amdgpu, nouveau, GFX9, SM75, MIR, KMS and PM4 numbers, the struct offsets and sizes, the error
+  codes. A `const` has no storage: every use is its value, and it has no init order.
+  - The smoke binary shrank from 1,936,048 to 1,873,968 bytes.
+  - With the 11 f64 colour constants of 4.2.0, `src/` holds 2,137 consts.
+- **31 stay `var`:**
+  - 30 hold mutable state that merely starts at a literal: the error channel, the BC7 search,
+    the SPIR-V lowering scratch, the launcher slot count, the observability switch.
+  - `DRM_IOCTL_VERSION`, which agnodrm also declares. A const beside its var would not compile
+    in a program that includes both.
+- **The survey behind the list** checked:
+  - mabda's `src/`, `programs/`, `tests/`, `fuzz/` and `examples/`;
+  - the consumers: ranga, rosnet, anukulana, tarka, attn11, soorat, cyrius-bb, bijli,
+    aethersafta and agnodrm (rasa and kiran are not checked out here);
+  - cyrius's `lib/` (105 files besides the mabda fold, 10,821 top-level declarations).
+
+  It looked for assignments (`=`, `OP=`), address-taking (`&NAME`) and same-name top-level
+  declarations. None of those consumers assigns, takes the address of, or declares any of the
+  2,126.
+- **Migration:** a consumer that assigns one, takes `&NAME`, or declares a top-level `var` /
+  `const` / `fn` of one of these names must stop; each is now a compile error naming it. A
+  local variable or parameter of the same name is fine, since it shadows the const.
+- **Found by it:**
+  - `WGPU_BUFFER_USAGE_QUERY_RESOLVE` was declared twice: in `wgpu_types.cyr`'s enum, and as a
+    same-value `var` in `gpu_timestamps.cyr`. The `var` is gone.
+  - `tests/bcyr/mabda.bcyr` declared its own top-level `BATCH_SIZE` (10000) beside the render
+    graph's (24, the Batch struct's size). As two `var`s that compiled, and one value silently
+    won for both. The bench's is `BENCH_BATCH` now.
+
+### Changed — the 34 `*_is_*` / `*_has_*` predicates return `: bool` (S3)
+- **Every predicate named `*_is_*` / `*_has_*` in `src/` is a `: bool` fn** (cyrius 6.7.3),
+  returning `true` / `false` or a comparison. Examples: `mabda_texfmt_is_compressed`,
+  `rg_is_built`, `gpu_err_is_recoverable`, `wgpu_device_has_feature`.
+  - A bool reads as the integer 0 or 1, so callers comparing with 1, adding the result or
+    storing it in an i64 behave as before.
+  - What is new: `var b: bool = mabda_texfmt_is_srgb(f);` compiles, and a `: bool` fn may
+    return one.
+- **Seven returned an integer rather than a literal.** Each now compares it with 0:
+  - a `memeq` result, a flag word and a load (all 0 or 1, so the same answers);
+  - two internal helpers;
+  - `wgpu_adapter_has_feature` / `wgpu_device_has_feature`, which now use only the low 32 bits
+    of the call's result. A C `WGPUBool` is a u32, and the upper half of rax is not part of it.
+- **`tests/tcyr/predicates.tcyr` (new, 15 assertions)** assigns all 34 results to `bool`
+  variables in a fn that is never called. cycc checks every fn, so if a predicate goes back to
+  `: i64` the suite stops compiling. Its runtime rows check the 0 / 1 reads.
+
+### Changed — if-expressions at 66 assignment sites (S4)
+- **66 sites in 24 files** use the cyrius 6.7.4 if-expression:
+  - `var x = a; if (c) { x = b; }` becomes `var x = if (c) { b } else { a };`;
+  - an `if (c) { x = a; } else { x = b; }` assignment becomes `x = if (c) { a } else { b };`;
+  - where the two values were 1 and 0, it is the comparison itself (`var include_wait = n_waits
+    != 0;`), the same value.
+- **Converted only where it is the same program.** An if-expression evaluates the default only
+  on the false branch, after the condition, so a default had to be a literal, a constant or a
+  local. Where the condition or the new value named the variable itself, it names the default,
+  which is equal there. A call in the taken branch still runs only when the condition holds.
+- **12 sites stay two lines**, because as one line they would pass the 120-byte limit and read
+  worse.
+- Behaviour is unchanged. Among the checks that pass unchanged are the BC7 golden decode hash
+  and the compilers' byte-exact ISA tests.
+
+### Changed — the GPU benchmarks use lib/bench.cyr's own resolution (M6)
+- **`programs/benchmarks.cyr` no longer sizes its windows from a measured clock jitter.** The
+  removed pieces are `_clock_jitter_ns` (16,384 empty windows before every row),
+  `_ops_per_window`, the pilot and the clock warm-up.
+  - lib/bench.cyr (cyrius 6.6.9) reports a row's min only when its smallest window, at the
+    row's mean cost, is at least 100 times the clock's worst-case error. Otherwise it reports
+    the mean and says `min UNRESOLVED`.
+  - It re-measures the floor at the first report and nets every row at read time, which is
+    what the warm-up was for.
+- **mabda's own lines contradicted the stdlib's.** In the run before the change, 11 of the 13
+  rows printed the mean (UNRESOLVED), while mabda's line beside each gave a "min may under-read
+  by ≤ N ns" bound for a min that was never printed. Each row now says whether its min resolved
+  and which value its CSV carries.
+- **`uniform_buffer_write` takes 512 writes per window.** The jitter sizing chose 44 on this run.
+  At 512 its min resolves on the Cezanne's hpet clock: 665 ns, mean 805 ns, against the 1,780 ns
+  mean before. 256 writes did not resolve (199 µs against a 225 µs bar).
+- **Every other row times one op per window, as before**, so it reports the mean, as it did. A
+  row that is entirely under one clock read (`bench_sub_floor`) now fails the run, like one that
+  reads 0.
+- **`make bench-gpu` on the Cezanne** (`build/logs/m6-bench-gpu-{before,after}-*.log`; ns per
+  op):
+
+  | row | before | after |
+  |---|---|---|
+  | create_storage_buffer_4k | 3,058 | 2,930 |
+  | create_uniform_buffer_64 | 2,434 | 2,211 |
+  | uniform_buffer_write | 1,780 (mean, 44 per window) | **665 (resolved min, 512)** |
+  | shader_cache_hit | 178 | 185 |
+  | shader_cache_miss | 13,042 | 12,061 |
+  | bind_group_cache_hit | 25 | 25 |
+  | texture_1x1_solid | 7,921 | 7,311 |
+  | texture_256x256_rgba | 45,593 | 43,841 |
+  | depth_texture_1080p | 2,760 | 2,532 |
+  | render_target_1080p | 4,502 | 4,271 |
+  | render_target_msaa4_1080p | 11,511 | 10,723 |
+  | render_pipeline_build | 61,194 | 59,284 |
+  | compute_dispatch_1024 | 62,736 | 52,851 |
+
+  Apart from `uniform_buffer_write`, the after column is the same estimator on the same code, so
+  its differences are run-to-run variation. Two after runs disagree by as much:
+  `compute_dispatch_1024` measured 60,643 and then 52,851.
+
 ### Verified (so far)
-- CPU: 30 suites, **8522 assertions**, 0 failed (4.4.0: 7932; 8060 after BC7, 8377 after the
-  sRGB ids). Every CI gate passes locally, the bench included, and `cyrius distlib` is
-  idempotent (`build/logs/alias-ci-gates-*.log`).
+- CPU: 31 suites, **8537 assertions**, 0 failed. For comparison: 7932 at 4.4.0, 8060 after BC7,
+  8377 after the sRGB ids, 8522 after backing reuse. Every CI gate passes locally, the bench
+  included, and `cyrius distlib` is idempotent (`build/logs/minors-ci-gates-*.log`).
 - Cezanne, native: `make test-native-all` gives 79 passed, 0 failed, 3 skipped for DRM master,
-  of 82. All four 4.5.0 gates are included, with no GPU reset
-  (`build/logs/alias-native-all-*.log`).
+  of 82. All four new 4.5.0 gates are included, with no GPU reset
+  (`build/logs/minors-native-all-*.log`).
 - Cezanne, wgpu: `make test-gpu` passes all nine programs, 112 checks, including the target
-  tier's sRGB copies and the wgpu render graph (`build/logs/alias-test-gpu-*.log`).
+  tier's sRGB copies and the wgpu render graph (`build/logs/minors-test-gpu-*.log`).
   `make test-wgpu-srgb-sample-e2e` passes separately.
+- **Consumers, against this dist** (scratch copies; neither repo was touched). Both give exactly
+  their 4.4.0 results:
+  - ranga's four GPU suites on the Cezanne (`build/logs/consumer-ranga-amd-450-*.log`): gpu
+    48/0, gpu_kernels 52/1, gpu_pipeline 102/0, gpu_spirv 54/0. The one failure is the "flip
+    this when it can" row already in ranga's filed issue.
+  - soorat's probes (`build/logs/consumer-soorat-450-*.log`): MB1 builds 11 of 11 pipelines,
+    and its error cases fail as designed; MB2–MB5 pass 8 of 8.
+
+  So the `const` and `bool` changes compile in both.
 
 ## [4.4.0] — 2026-11-17
 
