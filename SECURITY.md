@@ -24,9 +24,9 @@ harden the wrapper, document the workaround, or both.
 
 | Version | Supported                                                |
 |---------|----------------------------------------------------------|
-| 4.4.x   | **Yes** — current release, receives security fixes       |
-| 4.3.x   | Yes — receives security fixes via back-ports on request  |
-| < 4.3   | No                                                       |
+| 4.5.x   | **Yes** — current release, receives security fixes       |
+| 4.4.x   | Yes — receives security fixes via back-ports on request  |
+| < 4.4   | No                                                       |
 
 ## Response Timeline
 

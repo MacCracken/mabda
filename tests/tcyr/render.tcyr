@@ -424,14 +424,16 @@ fn test_rg_node_reads_writes_guards_out_of_range() {
     var g = rg_new();
     var dims[12]; store32(&dims, 1); store32(&dims + 4, 1); store32(&dims + 8, 1);
     rg_add_compute(g, 0, 0, &dims, "n0");
-    assert_eq(rg_node_reads(g, 0 - 1, 0), 0,
-      "reads(-1, _) short-circuits");
-    assert_eq(rg_node_reads(g, 99, 0), 0,
-      "reads(out-of-range, _) short-circuits");
-    assert_eq(rg_node_writes(g, 0 - 1, 0), 0,
-      "writes(-1, _) short-circuits");
-    assert_eq(rg_node_writes(g, 99, 0), 0,
-      "writes(out-of-range, _) short-circuits");
+    # 4.5.0: a refused call returns 1 (it returned 0, as for a recorded one).
+    assert_eq(rg_node_reads(g, 0 - 1, 0), 1,
+      "reads(-1, _) refused");
+    assert_eq(rg_node_reads(g, 99, 0), 1,
+      "reads(out-of-range, _) refused");
+    assert_eq(rg_node_writes(g, 0 - 1, 0), 1,
+      "writes(-1, _) refused");
+    assert_eq(rg_node_writes(g, 99, 0), 1,
+      "writes(out-of-range, _) refused");
+    assert_eq(rg_node_reads(g, 0, 5), 0, "a good id is recorded");
     return 0;
 }
 
@@ -1054,22 +1056,26 @@ fn test_rg_plan_alias_of_and_queue_mask() {
     var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
     var b1 = rg_add_transient_buffer(g, 256, 0, "b1");
     var b2 = rg_add_transient_buffer(g, 200, 0, "b2");
+    # Scratch only: each is written, then read. n0 -> n1 (b0), n1 -> n2 (b1), n2 -> n3 (b2).
     var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
     rg_node_writes(g, n0, b0);
     var n1 = rg_add_render(g, 0, 0, 3, "n1");   # GRAPHICS
+    rg_node_reads(g, n1, b0);
     rg_node_writes(g, n1, b1);
     var n2 = rg_add_compute(g, 0, 0, &dims, "n2");
+    rg_node_reads(g, n2, b1);
     rg_node_writes(g, n2, b2);
-    rg_node_reads(g, n2, b1);   # n1 -> n2: b1 lives [1, 2]
+    var n3 = rg_add_compute(g, 0, 0, &dims, "n3");
+    rg_node_reads(g, n3, b2);
     assert_eq(rg_build(g, 0), 0, "build ok");
-    assert_eq(rg_transient_alias_of(g, b0), 0 - 1, "b0 opened its slot");
-    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 takes over b0's slot");
-    assert_eq(rg_transient_offset(g, b1), rg_transient_offset(g, b0), "same offset as b0");
-    assert_eq(rg_transient_alias_of(g, b2), 0 - 1, "b2 overlaps b1: a slot of its own");
+    assert_eq(rg_transient_alias_of(g, b0), 0 - 1, "b0 [0,1] opened its slot");
+    assert_eq(rg_transient_alias_of(g, b1), 0 - 1, "b1 [1,2] overlaps b0 at n1: its own slot");
+    assert_eq(rg_transient_alias_of(g, b2), b0, "b2 [2,3] takes over b0's slot");
+    assert_eq(rg_transient_offset(g, b2), rg_transient_offset(g, b0), "same offset as b0");
     var ts = load64(g + 8);
-    assert_eq(load64(vec_get(ts, b0) + 96), 1 << QUEUE_KIND_COMPUTE, "b0 used on COMPUTE only");
-    assert_eq(load64(vec_get(ts, b1) + 96), (1 << QUEUE_KIND_GRAPHICS) | (1 << QUEUE_KIND_COMPUTE),
-      "b1 used on GRAPHICS and COMPUTE");
+    assert_eq(load64(vec_get(ts, b2) + 96), 1 << QUEUE_KIND_COMPUTE, "b2 used on COMPUTE only");
+    assert_eq(load64(vec_get(ts, b0) + 96), (1 << QUEUE_KIND_GRAPHICS) | (1 << QUEUE_KIND_COMPUTE),
+      "b0 used on COMPUTE and GRAPHICS");
     assert_eq(rg_transient_alias_of(g, 99), 0 - 1, "alias_of(out of range) = -1");
     assert_eq(rg_transient_alias_of(g, 0 - 1), 0 - 1, "alias_of(-1) = -1");
     return 0;
@@ -1091,12 +1097,22 @@ fn test_rg_build_ctx_native_layout() {
     var t1 = rg_add_transient_texture(g, 8, 8, WGPU_TEXTURE_FORMAT_RGBA8_UNORM_SRGB,
       WGPU_TEXTURE_USAGE_TEXTURE_BINDING, "t1");
     var dead = rg_add_transient_buffer(g, 64, 0, "unused");
+    # n0 writes b0 / t0, n1 reads them; then n2 writes b1 / t1 (after n1: a token edge) and n3
+    # reads them. b0 / t0 live [0,1] and b1 / t1 [2,3], so the second pair reuses the first.
     var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
     rg_node_writes(g, n0, b0);
     rg_node_writes(g, n0, t0);
     var n1 = rg_add_compute(g, 0, 0, &dims, "n1");
-    rg_node_writes(g, n1, b1);
-    rg_node_writes(g, n1, t1);
+    rg_node_reads(g, n1, b0);
+    rg_node_reads(g, n1, t0);
+    rg_node_writes(g, n1, 90);
+    var n2 = rg_add_compute(g, 0, 0, &dims, "n2");
+    rg_node_reads(g, n2, 90);
+    rg_node_writes(g, n2, b1);
+    rg_node_writes(g, n2, t1);
+    var n3 = rg_add_compute(g, 0, 0, &dims, "n3");
+    rg_node_reads(g, n3, b1);
+    rg_node_reads(g, n3, t1);
     assert_eq(rg_build_ctx(g, &ctx), 0, "native build ok");
     assert_eq(rg_is_built(g), 1, "built");
     assert_eq(_al_creates, 1, "ONE backing allocation");
@@ -1166,7 +1182,13 @@ fn test_rg_build_ctx_native_no_aliasing() {
     var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
     rg_node_writes(g, n0, b0);
     var n1 = rg_add_compute(g, 0, 0, &dims, "n1");
-    rg_node_writes(g, n1, b1);
+    rg_node_reads(g, n1, b0);
+    rg_node_writes(g, n1, 90);
+    var n2 = rg_add_compute(g, 0, 0, &dims, "n2");
+    rg_node_reads(g, n2, 90);
+    rg_node_writes(g, n2, b1);
+    var n3 = rg_add_compute(g, 0, 0, &dims, "n3");
+    rg_node_reads(g, n3, b1);
     assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
     assert_eq(rg_transient_offset(g, b0), 0, "b0 at 0");
     assert_eq(rg_transient_offset(g, b1), 256, "b1 has its own bytes");
@@ -1250,12 +1272,12 @@ fn test_rg_native_waits_alias_and_same_queue() {
     _al_dims(&dims);
     var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
     var b1 = rg_add_transient_buffer(g, 256, 0, "b1");
-    var n0 = rg_add_render(g, 0x333, 0x444, 3, "n0");   # GRAPHICS writes b0
-    rg_node_writes(g, n0, b0);
-    var n1 = rg_add_compute(g, 0x111, 0x222, &dims, "n1");   # COMPUTE writes b1: no edge
+    var n0 = rg_add_render(g, 0x333, 0x444, 3, "n0");   # GRAPHICS reads the input b0
+    rg_node_reads(g, n0, b0);
+    var n1 = rg_add_compute(g, 0x111, 0x222, &dims, "n1");   # COMPUTE writes the output b1: no edge
     rg_node_writes(g, n1, b1);
     assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
-    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 shares b0's bytes");
+    assert_eq(rg_transient_alias_of(g, b1), b0, "b1 [1,1] shares the input b0's [0,0] bytes");
     assert_eq(_rg_execute_native_mq(g, &ctx), 0, "execute ok");
     assert_eq(vec_len(_al_bars), 2, "one barrier");
     assert_eq(vec_get(_al_bars, 0), 0x6000, "from GRAPHICS (b0's queue)");
@@ -1287,6 +1309,178 @@ fn test_rg_native_waits_alias_and_same_queue() {
     rg_build_ctx(k, &ctx);
     _rg_execute_native_mq(k, &ctx);
     assert_eq(vec_len(_al_bars), 0, "aliasing off: independent nodes do not wait");
+    return 0;
+}
+
+# ================================================================
+# 4.5.0 audit — the render-graph findings, each with the case that shows it
+# ================================================================
+var _al_fail_compute = 0;
+fn _al_compute(ctx, shmod, x, y, z, bp): i64 {
+    vec_push(_mq_log, 1);
+    if (_al_fail_compute == 1) { return GPU_ERR_OTHER; }
+    return 0;
+}
+
+# HIGH-1: rg_build sorts the nodes in place, so after the build a node id indexed the SORTED
+# order. A writes X, B reads X, C is independent: Kahn's order is A, C, B, and
+# rg_node_set_pass(g, B, ..) set C's pass.
+fn test_rg_audit_node_ids_after_build() {
+    var g = rg_new();
+    var a = rg_add_render(g, 0, 0x444, 3, "A");
+    rg_node_writes(g, a, 7);
+    var b = rg_add_render(g, 0, 0x444, 3, "B");
+    rg_node_reads(g, b, 7);
+    var c = rg_add_render(g, 0, 0x444, 3, "C");
+    rg_node_queue(g, c, QUEUE_KIND_COMPUTE);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    assert_eq(load64(vec_get(load64(g + 0), 1) + 72), c, "the sorted order is A, C, B");
+    rg_node_set_pass(g, b, 0xB0B);
+    rg_node_set_pass(g, c, 0xC0C);
+    assert_eq(load64(load64(_rg_node_by_id(g, b) + 8)), 0xB0B, "B got B's pass");
+    assert_eq(load64(load64(_rg_node_by_id(g, c) + 8)), 0xC0C, "C got C's pass");
+    assert_eq(rg_node_queue_get(g, c), QUEUE_KIND_COMPUTE, "queue_get(C) reads C after the build");
+    assert_eq(rg_node_queue_get(g, b), QUEUE_KIND_GRAPHICS, "queue_get(B) reads B");
+    rg_schedule(g);
+    assert(rg_node_batch_idx(g, c) != rg_node_batch_idx(g, b), "batch_idx is per id: C and B differ");
+    # LOW-7: no edits after the build (lifetimes, masks and waits would go stale).
+    assert_eq(rg_node_reads(g, a, 8), 1, "reads after the build refused");
+    assert_eq(rg_node_writes(g, a, 8), 1, "writes after the build refused");
+    assert_eq(rg_node_queue(g, a, QUEUE_KIND_COMPUTE), 1, "queue after the build refused");
+    assert_eq(rg_node_queue_get(g, a), QUEUE_KIND_GRAPHICS, "and nothing changed");
+    return 0;
+}
+
+# MED-3: lifetimes from first to last user let an INPUT (filled by the CPU before the graph
+# runs) share bytes with a transient an earlier node writes, and an OUTPUT (read after it)
+# with one a later node writes. Inputs are live from node 0, outputs to the last node.
+fn test_rg_audit_inputs_and_outputs() {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12];
+    _al_dims(&dims);
+    var s0 = rg_add_transient_buffer(g, 256, 0, "s0");
+    var inp = rg_add_transient_buffer(g, 256, 0, "input");
+    var out = rg_add_transient_buffer(g, 256, 0, "output");
+    var s1 = rg_add_transient_buffer(g, 256, 0, "s1");
+    var s2 = rg_add_transient_buffer(g, 256, 0, "s2");
+    var n0 = rg_add_compute(g, 0, 0, &dims, "n0");
+    rg_node_writes(g, n0, s0);
+    rg_node_writes(g, n0, out);
+    var n1 = rg_add_compute(g, 0, 0, &dims, "n1");
+    rg_node_reads(g, n1, s0);
+    rg_node_writes(g, n1, s1);
+    var n2 = rg_add_compute(g, 0, 0, &dims, "n2");
+    rg_node_reads(g, n2, s1);
+    rg_node_reads(g, n2, inp);
+    rg_node_writes(g, n2, s2);
+    var n3 = rg_add_compute(g, 0, 0, &dims, "n3");
+    rg_node_reads(g, n3, s2);
+    assert_eq(rg_build(g, 0), 0, "build ok");
+    var ts = load64(g + 8);
+    assert_eq(load64(vec_get(ts, inp) + 112), 0, "the input is planned from node 0");
+    assert_eq(load64(vec_get(ts, out) + 120), 3, "the output is planned to the last node");
+    assert_eq(rg_transient_alias_of(g, inp), 0 - 1, "the input never takes s0's bytes (s0 is written at n0)");
+    assert_eq(rg_transient_alias_of(g, s1), 0 - 1, "s1 never takes the output's bytes");
+    assert_eq(rg_transient_alias_of(g, s2), s0, "scratch still reuses scratch: s2 [2,3] takes s0 [0,1]");
+    return 0;
+}
+
+# MED-2: only the FIRST user of a reused slot waited. n0 (GRAPHICS) reads the input x; n1
+# (COMPUTE) and n2 (GRAPHICS) both write y, which takes x's bytes, with no edge between them:
+# n2 waited for nothing and could overlap n0 still reading x.
+fn test_rg_audit_every_user_waits() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var dims[12];
+    _al_dims(&dims);
+    var x = rg_add_transient_buffer(g, 256, 0, "x");
+    var y = rg_add_transient_buffer(g, 256, 0, "y");
+    var n0 = rg_add_render(g, 0x333, 0x444, 3, "n0");
+    rg_node_reads(g, n0, x);
+    var n1 = rg_add_compute(g, 0x111, 0x222, &dims, "n1");
+    rg_node_writes(g, n1, y);
+    var n2 = rg_add_render(g, 0x333, 0x444, 3, "n2");
+    rg_node_writes(g, n2, y);
+    assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
+    assert_eq(rg_transient_alias_of(g, y), x, "y takes x's bytes");
+    assert_eq(_rg_execute_native_mq(g, &ctx), 0, "execute ok");
+    assert_eq(vec_len(_al_bars), 4, "two barriers");
+    assert_eq(vec_get(_al_bars, 0), 0x6000, "n1 waits for GRAPHICS (x's queue)");
+    assert_eq(vec_get(_al_bars, 1), 0x6001, "into COMPUTE");
+    assert_eq(vec_get(_al_bars, 2), 0x6000, "n2 waits for GRAPHICS too");
+    assert_eq(vec_get(_al_bars, 3), 0x6000, "into GRAPHICS (a same-ring wait)");
+    return 0;
+}
+
+# MED-4: the 16 IB slices wrapped with no wait, so node k+16 rewrote node k's IB while it might
+# still be pending. 17 nodes on one queue: one drain when the slices wrap, one at the end.
+fn test_rg_audit_ib_wrap_drains() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    for (var i = 0; i < 17; i = i + 1) { rg_add_compute(g, 0x111, 0x222, &dims, "n"); }
+    assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
+    assert_eq(_rg_execute_native_mq(g, &ctx), 0, "execute ok");
+    var waits = 0;
+    var first_wait = 0 - 1;
+    for (var k = 0; k < vec_len(_mq_log); k = k + 1) {
+        if (vec_get(_mq_log, k) == 4) {
+            waits = waits + 1;
+            if (first_wait < 0) { first_wait = k; }
+        }
+    }
+    assert_eq(waits, 2, "a drain when the 16 slices wrap, and the final one");
+    assert_eq(first_wait, 16, "the first drain comes after 16 dispatches, before the 17th");
+    return 0;
+}
+
+# LOW-5 / LOW-6 / LOW-7: release, a released or foreign graph, and a failed node.
+fn test_rg_audit_release_and_refusals() {
+    var ctx[208];
+    _al_ctx(&ctx, BACKEND_KIND_AMD);
+    var g = rg_new();
+    var dims[12];
+    _al_dims(&dims);
+    var b0 = rg_add_transient_buffer(g, 256, 0, "b0");
+    var n0 = rg_add_compute(g, 0x111, 0x222, &dims, "n0");
+    rg_node_writes(g, n0, b0);
+    var n1 = rg_add_compute(g, 0x111, 0x222, &dims, "n1");
+    rg_node_reads(g, n1, b0);
+    assert_eq(rg_build_ctx(g, &ctx), 0, "build ok");
+    var v = rg_transient_handle(g, b0);
+    assert(native_is_view(v), "the transient's NativeBuf is a registered view");
+    assert_eq(_backend_native_buffer_release(&ctx, v), GPU_ERR_OTHER, "releasing a view is refused");
+    assert_eq(load64(v + NATIVE_BUF_FIELD_HANDLE), 0x77, "and leaves it alone");
+    # A graph built on one context is not run on another.
+    var other[208];
+    _al_ctx(&other, BACKEND_KIND_AMD);
+    assert_eq(rg_execute_mq(g, &other), GPU_ERR_OTHER, "another context refused");
+    assert_eq(rg_execute_mq(0, &ctx), 1, "a null graph refused (it read address 16)");
+    # The first failed dispatch stops the graph.
+    _mq_log = vec_new();
+    _al_fail_compute = 1;
+    var b = gpu_ctx_backend(&ctx);
+    backend_set_slot(b, BACKEND_SLOT_COMPUTE_DISPATCH, &_al_compute);
+    assert_eq(_rg_execute_native_mq(g, &ctx), GPU_ERR_OTHER, "the failure is returned");
+    var dispatched = 0;
+    for (var k = 0; k < vec_len(_mq_log); k = k + 1) { if (vec_get(_mq_log, k) == 1) { dispatched = dispatched + 1; } }
+    assert_eq(dispatched, 1, "n1 is not dispatched after n0 failed");
+    _al_fail_compute = 0;
+    # Release: the view is zeroed and unregistered, and the graph is unbuilt.
+    assert_eq(rg_release(g), 0, "release ok");
+    assert_eq(load64(v + NATIVE_BUF_FIELD_HANDLE), 0, "the view a payload may still hold is zeroed");
+    assert(!native_is_view(v), "and no longer a registered view");
+    assert(!rg_is_built(g), "the graph is unbuilt");
+    assert_eq(rg_execute_mq(g, &ctx), 1, "so execute refuses it");
+    assert_eq(rg_release(g), 0, "a second release is harmless");
+    assert_eq(_al_releases, 1, "the backing was released once");
+    assert_eq(rg_build_ctx(g, &ctx), 0, "a released graph can be built again");
+    assert(rg_backing_bytes(g) > 0, "with a new backing");
     return 0;
 }
 
@@ -1810,6 +2004,11 @@ fn main() {
     test_rg_build_ctx_refusals();
     test_rg_native_waits_alias_and_same_queue();
     test_rg_node_set_pass();
+    test_rg_audit_node_ids_after_build();
+    test_rg_audit_inputs_and_outputs();
+    test_rg_audit_every_user_waits();
+    test_rg_audit_ib_wrap_drains();
+    test_rg_audit_release_and_refusals();
     test_rg_transient_handle_out_of_range();
     test_rg_release_null_is_safe();
     test_rg_aliasing_flag_round_trip();

@@ -13,18 +13,66 @@ toolchain-side items that became viable mid-cycle, **Metrics** for
 numeric deltas (module count, assertions, bundle size), and **Next**
 for the immediate forward pointer.
 
-## [4.5.0] — in progress (VERSION still reads 4.4.0)
+## [4.5.0] — 2026-11-17
 
-**Textures + language** ([roadmap](docs/development/roadmap.md#v450--textures--language)), phase 4
-of the 2026-11 plan. Landed so far:
-- texture encoding, both halves: KTX2 Zstandard / ZLIB supercompression decode, and a BC7 CPU
-  reference encoder (and decoder);
-- compressed sRGB ids, with the sRGB decode on native AMD;
-- render-graph backing reuse on native AMD;
-- the cyrius 6.7 language minors: S2 (`const`), S3 (`bool` predicates), S4 (if-expressions)
-  and M6 (the GPU benchmarks on lib/bench.cyr's own resolution).
+**Textures + language.** Phase 4 of the 2026-11 plan. Every item the roadmap pinned to 4.5.0
+shipped:
+- **Texture encoding**, both halves:
+  - KTX2 Zstandard / ZLIB supercompression decodes through decoders the consumer registers;
+  - a BC7 CPU reference encoder and decoder, bit-exact against the Cezanne's own BC7 decode.
+- **Compressed sRGB ids.** The BC1 / BC3 / BC7, ETC2 and ASTC sRGB formats have their own ids,
+  and sampling decodes them to linear on wgpu and, new, on native AMD.
+- **Render-graph backing reuse.** On native AMD a graph's transients live in one allocation,
+  and with aliasing on, disjoint-lifetime ones share bytes. The executor waits for every queue
+  that used a slot before it is reused.
+- **The cyrius 6.7 language minors:**
+  - S2: 2,126 constants are `const`;
+  - S3: the predicates return `bool`;
+  - S4: if-expressions at 66 sites;
+  - M6: the GPU benchmarks use lib/bench.cyr's own resolution.
 
-Every 4.5.0 item has landed; what is left is the cut.
+**The audit** ([`docs/audit/2026-11-17-4.5.0-audit.md`](docs/audit/2026-11-17-4.5.0-audit.md))
+found 1 HIGH, 4 MEDIUM and 11 LOW, all fixed (below). The HIGH and three MEDIUMs are in the new
+render-graph backing reuse. The fourth MEDIUM was a decompression bomb: a supercompressed KTX2
+of a few hundred KiB loaded as a texture of any size the limits allow. Supercompressed loads
+now have a decoded-bytes budget. Every pin is current (cyrius 6.7.18, samvada 1.1.2, chitra
+1.4.1), so there is no dependency move.
+
+### Security — the 4.5.0 audit
+[`docs/audit/2026-11-17-4.5.0-audit.md`](docs/audit/2026-11-17-4.5.0-audit.md). Three reviewers
+were split by trust boundary: asset input, native GPU memory and the kernel, and the language
+sweep. A regression check of the 4.4.0 audit followed (its eleven tests still pass), then a CVE
+sweep. **0 CRITICAL / 1 HIGH / 4 MEDIUM / 11 LOW, all fixed.**
+- **HIGH-1, render-graph node ids after the build** (`src/render_graph.cyr`).
+  - `rg_build` sorts its node list in place, and every id-taking accessor indexed it. So after
+    the build an id named whichever node sat at that sorted position.
+  - With A writing X, B reading X and an independent C, `rg_node_set_pass(g, B, ..)` set C's
+    pass. C drew into B's target without B's waits.
+  - Fixed: the graph keeps an insertion-order list (`_rg_node_by_id`). Test: that graph.
+- **MED-1, a KTX2 decompression bomb** (`src/asset_load.cyr`).
+  - A few hundred KiB of zstd could declare an 8192² RGBA16F array and load as an 8 GiB
+    texture.
+  - Fixed: a decoded-bytes budget, 1 GiB by default and checked before anything is created.
+    Tests: the exact boundary, and a stored file under a 1-byte budget.
+- **MED-2, reuse waited only at the first user.** A later user of the transient, with no edge to
+  the first, could touch the bytes while the previous occupant's users still ran. Fixed: every
+  user waits. Test: two writers, two barriers.
+- **MED-3, inputs and outputs could share bytes.** An input the CPU fills before the graph runs
+  could take the slot of a transient an earlier node writes. Fixed: inputs are planned from the
+  first node, outputs to the last. Test.
+- **MED-4, IB slices reused while pending** (since 3.2.14). Past 16 nodes, node k + 16 rewrote
+  node k's command stream while it could still be pending. Fixed: the queues drain when the
+  slices wrap. Tests: the CPU test, and the hardware gate's phase D (20 nodes).
+- **LOW-1 to LOW-11**, in the audit:
+  - the BC7 API's buffer lengths;
+  - the KTX2 pre-pass, guard page and checked unmaps;
+  - views zeroed and unbuilt at release, and refused by the release slots;
+  - a null or foreign graph refused;
+  - the executor stopping at the first failure, and edits refused after the build;
+  - a refused timeline submit giving back its point and waits;
+  - the view-init check;
+  - the BC7 thread-safety note;
+  - three stale comments, and a dead helper.
 
 ### Added — KTX2 supercompression: Zstandard and ZLIB
 - **`gpu_texture_load_ktx2` loads KTX2 files whose levels are supercompressed** with
@@ -38,6 +86,14 @@ Every 4.5.0 item has landed; what is left is the cut.
   - The level must decode to exactly its `uncompressedByteLength`, which must be the level's
     real size. A short, long, truncated or corrupt level is `GPU_ERR_CONTAINER_PARSE`.
   - The decoders stop at the buffer, so a decompression bomb cannot grow past the level.
+  - A supercompressed file whose levels decode past a budget is refused before anything is
+    created (`GPU_ERR_OUT_OF_MEMORY`; audit MED-1). The default is 1 GiB
+    (`KTX2_MAX_DECODED_DEFAULT`); set it with `gpu_ktx2_set_max_decoded_bytes(n)` (`n <= 0`
+    restores the default) and read it with `gpu_ktx2_max_decoded_bytes()`. A stored file is not
+    limited: its levels must be in the file.
+  - Every level-index entry is checked before the texture is created (audit LOW-2).
+  - Each decoded level ends at a `PROT_NONE` guard page, so a decoder that writes past its
+    buffer faults instead of silently corrupting memory (audit LOW-3).
   - The decoded level goes into an anonymous mapping that is unmapped after the upload, not
     the bump heap: loading 20 textures adds 0 bytes.
   - Spans are checked as for stored levels, without computing `byteOffset + byteLength`.
@@ -76,13 +132,19 @@ Every 4.5.0 item has landed; what is left is the cut.
 ### Added — BC7: a CPU reference encoder, and its decoder
 The format was chosen by the maintainer (2026-11-17), since no consumer had named one. The new
 module is `src/texture_bc7.cyr`.
-- **`mabda_bc7_encode(src, width, height, src_pitch, dst, dst_len)`** (`@public`, CPU only)
-  encodes RGBA8 to BC7. It writes `mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h)` bytes,
-  blocks in row-major order, and a partial edge block repeats the edge texels. It returns the
-  bytes written, or a negative error: `GPU_ERR_TEXTURE_DIMENSION` for a size outside 1..8192, and
-  `GPU_ERR_BUFFER` for a null buffer, a short pitch or a short `dst`.
-- **`mabda_bc7_decode(src, src_len, width, height, dst, dst_pitch)`** (`@public`) is the
+- **`mabda_bc7_encode(src, src_len, width, height, src_pitch, dst, dst_len)`** (`@public`, CPU
+  only) encodes RGBA8 to BC7.
+  - It writes `mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h)` bytes, blocks in row-major
+    order, and a partial edge block repeats the edge texels.
+  - It returns the bytes written, or a negative error: `GPU_ERR_TEXTURE_DIMENSION` for a size
+    outside 1..8192, and `GPU_ERR_BUFFER` for a null buffer, a short pitch, a `src` shorter than
+    its rows, or a short `dst`.
+  - It is not thread-safe: the block search keeps its state in module globals, like mabda's
+    other CPU state.
+- **`mabda_bc7_decode(src, src_len, width, height, dst, dst_len, dst_pitch)`** (`@public`) is the
   inverse. It writes only the image's own texels.
+- Each strided buffer carries its length (audit LOW-1), checked divide-first so a huge pitch
+  cannot overflow.
 - **The encoder** is deterministic and integer-only.
   - Per block it keeps the lowest squared RGBA error among: mode 6 always; for opaque blocks,
     modes 5 and 4 and the best-ranked partitions of modes 1, 3, 0 and 2; for blocks with alpha,
@@ -225,11 +287,22 @@ module is `src/texture_bc7.cyr`.
   - `rg_backing_bytes(g)`: the size of the native allocation;
   - `rg_node_set_pass(g, node, pass)`: gives a render node its pass after the build. A native
     pass is made from a target, and a transient's target exists only once the graph is built.
-- **The executor waits before reuse.** Before a node whose transient takes over a slot,
-  `rg_execute_mq` waits for every queue that used the slot's previous occupant. Without the
-  wait, two independent nodes on different rings race for the bytes. On the Cezanne, with the
-  wait disabled, the reader got the writer's values in 4,096 of 4,096 elements, three runs out
-  of three.
+- **The executor waits before reuse.** Before EVERY node that uses a transient which took over
+  a slot, `rg_execute_mq` waits for every queue that used the slot's previous occupant (audit
+  MED-2: at first only the first user waited).
+  - Without the wait, two independent nodes on different rings race for the bytes. On the
+    Cezanne, with the wait disabled, the reader got the writer's values in 4,096 of 4,096
+    elements, three runs out of three.
+  - Past 16 nodes the executor also drains its queues before the IB slices are reused (audit
+    MED-4).
+- **Inputs and outputs keep their bytes** (audit MED-3):
+  - a transient whose first user reads it is an input, filled before the graph runs, and is
+    planned from the first node;
+  - one whose last user writes it is an output, read after the graph, and is planned to the last
+    node;
+  - scratch, written and then read, still reuses.
+- **Node ids after the build** name the node `rg_add_*` returned them for (audit HIGH-1). The
+  build sorts its node list, and an id used to index the sorted order.
 - **Refused before anything is built or allocated**, leaving the graph unbuilt:
   - formats other than RGBA8 / RGBA8 sRGB (`GPU_ERR_FORMAT_UNSUPPORTED`);
   - an sRGB render target (`GPU_ERR_FORMAT_UNSUPPORTED`; native renders RGBA8 UNORM);
@@ -256,8 +329,9 @@ module is `src/texture_bc7.cyr`.
   in place of one `(wait_syncobj, wait_point)`.
 - **`rg_plan_aliasing_stats` leaves a native-backed graph's offsets alone.** They are the layout
   the allocation was built with. It still reports the aliased plan.
-- **TransientResource grew 72 → 112 bytes and RenderGraph 48 → 72** (append-only), for the
-  reuse record, the planned size, the target, the queues used and the label.
+- **TransientResource grew 72 → 128 bytes and RenderGraph 48 → 80** (append-only), for the
+  reuse record, the planned size and interval, the target, the queues used, the label and the
+  insertion-order node list.
 
 ### Fixed — render graph
 - **A transient's handle is 0 until something is allocated.** The label sat in the handle slot
@@ -266,6 +340,19 @@ module is `src/texture_bc7.cyr`.
   now.
 - **`rg_execute_mq` on a native NVIDIA or Intel context returns `GPU_ERR_NOT_IMPLEMENTED`**. It
   fell into the wgpu path and called wgpu with the native context's fields.
+- **A wgpu graph's `rg_release` clears what it released**, so a second release no longer
+  releases its handles again. `rg_release` also unbuilds the graph, on both backends.
+- **From the audit** (`docs/audit/2026-11-17-4.5.0-audit.md`):
+  - `rg_node_reads` / `rg_node_writes` / `rg_node_queue` return 1 and change nothing after the
+    build or for a bad id. The first two returned 0 for both.
+  - `rg_execute_mq` refuses a null graph (it read address 16), and refuses with `GPU_ERR_OTHER`
+    a graph `rg_build_ctx` built on another context.
+  - The native executor stops at the first failed wait or dispatch, and still drains its
+    queues.
+  - `rg_release` zeroes a native graph's views. A native buffer, texture or target release
+    refuses a render-graph view.
+  - A native timeline submit the kernel refuses gives back the point it reserved and the waits
+    it took. Every later wait on that queue used to time out on a point that never signals.
 
 ### Verified — render-graph backing reuse
 - **Cezanne** (`make test-native-rg-alias-e2e`, new; `build/logs/rg-alias-e2e-*.log`):
@@ -394,25 +481,38 @@ module is `src/texture_bc7.cyr`.
   its differences are run-to-run variation. Two after runs disagree by as much:
   `compute_dispatch_1024` measured 60,643 and then 52,851.
 
-### Verified (so far)
-- CPU: 31 suites, **8537 assertions**, 0 failed. For comparison: 7932 at 4.4.0, 8060 after BC7,
-  8377 after the sRGB ids, 8522 after backing reuse. Every CI gate passes locally, the bench
-  included, and `cyrius distlib` is idempotent (`build/logs/minors-ci-gates-*.log`).
-- Cezanne, native: `make test-native-all` gives 79 passed, 0 failed, 3 skipped for DRM master,
-  of 82. All four new 4.5.0 gates are included, with no GPU reset
-  (`build/logs/minors-native-all-*.log`).
-- Cezanne, wgpu: `make test-gpu` passes all nine programs, 112 checks, including the target
-  tier's sRGB copies and the wgpu render graph (`build/logs/minors-test-gpu-*.log`).
-  `make test-wgpu-srgb-sample-e2e` passes separately.
-- **Consumers, against this dist** (scratch copies; neither repo was touched). Both give exactly
-  their 4.4.0 results:
-  - ranga's four GPU suites on the Cezanne (`build/logs/consumer-ranga-amd-450-*.log`): gpu
-    48/0, gpu_kernels 52/1, gpu_pipeline 102/0, gpu_spirv 54/0. The one failure is the "flip
-    this when it can" row already in ranga's filed issue.
-  - soorat's probes (`build/logs/consumer-soorat-450-*.log`): MB1 builds 11 of 11 pipelines,
-    and its error cases fail as designed; MB2–MB5 pass 8 of 8.
+### Verified
+- **CPU:** 31 suites, **8604 assertions**, 0 failed (4.4.0: 7932). Every CI gate passes locally,
+  and `cyrius distlib` is idempotent (`build/logs/cut450-ci-gates-*.log`).
+- **The CPU bench** (`docs/audit/baselines/2026-11-17-4.5.0-cpu-bench-baseline.csv`) is within a
+  few percent of 4.4.0's on every row but the planner's. `rg_plan_aliasing_stats` costs 911 →
+  1,205 ns for 5 transients and 7,030 → 11,380 ns for 30. That is the audit's input / output
+  intervals, plus the planner keeping res ids (MED-3), run once per build.
+- **Cezanne, native** (`build/logs/cut450-native-all-*.log`): `make test-native-all` gives 79
+  passed, 0 failed, 3 skipped for DRM master, of 82. All four new 4.5.0 gates are included, and
+  there was no GPU reset this boot. The three DRM-master gates are the seat closeout (below).
+- **Cezanne, wgpu** (`build/logs/cut450-test-gpu-*.log`): `make test-gpu` passes all nine programs,
+  112 checks. `make test-wgpu-srgb-sample-e2e` passes too.
+- **chew, NVIDIA TU116** (`build/logs/chew-nv-gates-450-*.log`): all 17 masterless
+  `test-nvidia-*` gates pass, and so does `test-gpu` on NVK, with no nouveau faults. The tree is
+  `~/mabda-verify-450`, this working tree on a fresh clone. The five card-node gates are the
+  seat closeout.
+- **Consumers, against the final dist** (scratch copies; neither repo was touched). All give
+  exactly their 4.4.0 results:
+  - ranga on the Cezanne (`build/logs/consumer-ranga-amd-450final-*.log`): gpu 48/0,
+    gpu_kernels 52/1, gpu_pipeline 102/0, gpu_spirv 54/0. The one failure is the "flip this
+    when it can" row in ranga's filed issue.
+  - ranga on chew's NVIDIA context (`build/logs/consumer-ranga-nvidia-450final-*.log`): the same
+    four, plus gpu_nvidia 23/31. Those 31 are ranga's stale "NVIDIA refuses compute" rows.
+  - soorat's probes (`build/logs/consumer-soorat-450final-*.log`): MB1 builds 11 of 11
+    pipelines, and its error cases fail as designed; MB2–MB5 pass 8 of 8.
+- **The seat closeout** (the DRM-master gates, from a text console on each box) is run by the
+  maintainer before the tag.
 
-  So the `const` and `bool` changes compile in both.
+### Next
+- The seat closeout on both boxes, then the tag. v5.0 (native rendering; the NVIDIA wgpu
+  retirement, which now also needs a native NVIDIA render-graph executor) follows:
+  `docs/development/roadmap.md`.
 
 ## [4.4.0] — 2026-11-17
 

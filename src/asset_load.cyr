@@ -45,25 +45,6 @@ fn gpu_ctx_supports_format(ctx, fmt): i64 {
 }
 
 # ----------------------------------------------------------------
-# Per-image (array layer / cube face) sizing (AA.6a)
-# ----------------------------------------------------------------
-# A multi-image level (array/cube) stores `total_images` equal sub-images packed
-# in `blen` bytes. Returns the per-image byte size, or -1 if the split is unsafe:
-# total_images <= 0 (div-by-zero), or blen not evenly divisible by it (a
-# malformed/hostile header). Carries the 3.3.0 KTX2-byteOffset audit forward —
-# now BOTH the divisor (total_images) and the image count come from untrusted
-# header fields, so the division is guarded. The caller still bounds the LEVEL
-# span (boff + blen <= len) overflow-safely; given that, each image's offset
-# boff + idx*per_image (idx < total_images) lies within [boff, boff+blen) <= len,
-# so no per-image add can overflow or read OOB.
-fn _asset_per_image_size(blen, total_images): i64 {
-    if (total_images <= 0) { return 0 - 1; }       # div-by-zero guard
-    if (blen < 0) { return 0 - 1; }
-    if (blen % total_images != 0) { return 0 - 1; } # not evenly divisible -> reject
-    return blen / total_images;
-}
-
-# ----------------------------------------------------------------
 # DDS (AL.3)
 # ----------------------------------------------------------------
 # DDS layout: u32 magic 'DDS ' + 124-byte DDS_HEADER + optional 20-byte
@@ -84,7 +65,7 @@ const _DDSCAPS2_CUBEMAP = 0x200;
 const _DDSCAPS2_CUBE_ALLFACES = 0xFC00;
 const _DDS_MISC_CUBE    = 0x4;          # DXT10 miscFlag DDS_RESOURCE_MISC_TEXTURECUBE
 
-# DdsParse `out` (48 bytes): fmt@0, width@8, height@16, mip_count@24,
+# DdsParse `out` (64 bytes): fmt@0, width@8, height@16, mip_count@24,
 # data_offset@32, srgb@40 (1 if the source is sRGB-encoded; since 4.5.0 every
 # such source maps to an sRGB mabda id, see asset_format.cyr's sRGB policy).
 const _DDS_OUT_FMT      = 0;
@@ -96,7 +77,7 @@ const _DDS_OUT_SRGB     = 40;
 const _DDS_OUT_FACES    = 48;   # v3.4 AA.6c — cube faces (1 or 6)
 const _DDS_OUT_LAYERS   = 56;   # v3.4 AA.6c — array layers (out widened to 64 B)
 
-# Parse a DDS header into `out` (48 B). Returns 0 on success, or a GPU_ERR_*:
+# Parse a DDS header into `out` (64 B). Returns 0 on success, or a GPU_ERR_*:
 # GPU_ERR_CONTAINER_PARSE (bad magic / truncated / unsupported FourCC or layout)
 # or GPU_ERR_FORMAT_UNSUPPORTED (no mabda id, or array/cubemap which are v3.4).
 fn _dds_parse(bytes, len, out): i64 {
@@ -267,7 +248,7 @@ const _KTX2_ID2 = 0x0A1A0A0D;   # 0x0D 0x0A 0x1A 0x0A
 const _KTX2_LEVELIDX_OFF = 80;  # first level-index entry
 const _KTX2_LEVELIDX_SZ  = 24;  # bytes per level-index entry
 
-# Ktx2Parse `out` (48 bytes): fmt@0, width@8, height@16, level_count@24, srgb@40.
+# Ktx2Parse `out` (64 bytes): see _ktx2_parse below.
 # Parse a KTX2 header. Returns 0 on success, or GPU_ERR_CONTAINER_PARSE
 # (bad identifier / truncated / 1D) / GPU_ERR_FORMAT_UNSUPPORTED (super-
 # compression, array/cubemap, or an unmapped vkFormat).
@@ -291,6 +272,28 @@ const KTX2_SC_ZSTD  = 2;
 const KTX2_SC_ZLIB  = 3;
 var _ktx2_zstd_fn = 0;    # the registered Zstandard decoder (0: none)
 var _ktx2_zlib_fn = 0;    # the registered ZLIB decoder (0: none)
+
+# 4.5.0 audit MED-1 — the decoded-bytes budget. A supercompressed level's size comes only from
+# the header (its uncompressedByteLength), so without a limit a few hundred KiB of zstd could
+# decode, and load, as a texture of any size the dimension limits allow (8192 x 8192 RGBA16F,
+# 256 layers: 128 GiB of host mapping and GPU memory). A supercompressed file whose levels
+# decode past the budget is refused before anything is created. 1 GiB holds every 2D texture
+# of up to 8192 x 8192 in any mabda format with a full mip chain (RGBA16F's is about 683 MiB).
+# A stored (scheme 0) file is not limited: its levels must be in the file, so the file's size
+# bounds them.
+const KTX2_MAX_DECODED_DEFAULT = 1073741824;
+var _ktx2_max_decoded = 1073741824;
+
+# Set the decoded-bytes budget for supercompressed KTX2 loads; `n` <= 0 restores
+# KTX2_MAX_DECODED_DEFAULT (1 GiB). Returns 0. # @public
+fn gpu_ktx2_set_max_decoded_bytes(n): i64 {
+    _ktx2_max_decoded = n;
+    if (n <= 0) { _ktx2_max_decoded = KTX2_MAX_DECODED_DEFAULT; }
+    return 0;
+}
+
+# The current decoded-bytes budget (gpu_ktx2_set_max_decoded_bytes). # @public
+fn gpu_ktx2_max_decoded_bytes(): i64 { return _ktx2_max_decoded; }
 
 # Register the Zstandard decoder KTX2 scheme 2 levels go through: fn(src, src_len, dst, dst_cap)
 # returning the bytes written or a negative code (sankoch's zstd_decompress). 0 unregisters.
@@ -382,38 +385,108 @@ fn _ktx2_scheme_ready(scheme): i64 {
 #     anonymous mapping, freed by _ktx2_level_done: a long-running consumer loading many
 #     textures must not grow the bump heap.
 # *mapped_out is set to 1 when the caller must call _ktx2_level_done(addr, expected, 1).
-fn _ktx2_level_data(bytes, len, idx, scheme, expected, min_off, mapped_out): i64 {
-    store64(mapped_out, 0);
-    if (expected <= 0) { return 0 - GPU_ERR_CONTAINER_PARSE; }
+# The span checks of level-index entry `idx` (0 or a GPU_ERR_*), shared by the pre-pass that
+# runs before the texture is created and by the load (4.5.0 audit).
+fn _ktx2_level_span(bytes, len, idx, scheme, expected, min_off): i64 {
+    if (expected <= 0) { return GPU_ERR_CONTAINER_PARSE; }
     var boff = load64(bytes + idx + 0);
     var blen = load64(bytes + idx + 8);
     var ulen = load64(bytes + idx + 16);
-    if (ulen != expected) { return 0 - GPU_ERR_CONTAINER_PARSE; }   # the level's real size
+    if (ulen != expected) { return GPU_ERR_CONTAINER_PARSE; }   # the level's real size
     if (scheme == KTX2_SC_NONE) {
-        if (blen != expected) { return 0 - GPU_ERR_CONTAINER_PARSE; } # wrong level size
+        if (blen != expected) { return GPU_ERR_CONTAINER_PARSE; } # wrong level size
     }
-    if (blen <= 0) { return 0 - GPU_ERR_CONTAINER_PARSE; }
-    if (boff < min_off) { return 0 - GPU_ERR_CONTAINER_PARSE; }       # overlaps index/header (or < 0)
+    if (blen <= 0) { return GPU_ERR_CONTAINER_PARSE; }
+    if (boff < min_off) { return GPU_ERR_CONTAINER_PARSE; }       # overlaps index/header (or < 0)
     # blen > 0: `len - blen` cannot overflow; a blen past len makes it negative and rejects.
-    if (boff > len - blen) { return 0 - GPU_ERR_CONTAINER_PARSE; }   # truncated / OOB
+    if (boff > len - blen) { return GPU_ERR_CONTAINER_PARSE; }   # truncated / OOB
+    return 0;
+}
+
+fn _ktx2_page_up(n): i64 { return ((n + 4095) / 4096) * 4096; }
+
+# Unmap a decoded level's mapping, recording a failure on the error channel (it cannot fail
+# for the exact range mmap returned, but its return is checked: checklist item 5).
+fn _ktx2_unmap(base, map_len): i64 {
+    if (cyr_munmap(base, map_len) != 0) {
+        _gpu_err_record(GPU_ERR_OTHER, "KTX2: unmapping a decoded level failed", 1);
+    }
+    return 0;
+}
+
+fn _ktx2_level_data(bytes, len, idx, scheme, expected, min_off, mapped_out): i64 {
+    store64(mapped_out, 0);
+    var sr = _ktx2_level_span(bytes, len, idx, scheme, expected, min_off);
+    if (sr != 0) { return 0 - sr; }
+    var boff = load64(bytes + idx + 0);
+    var blen = load64(bytes + idx + 8);
     if (scheme == KTX2_SC_NONE) { return bytes + boff; }
-    if (_ktx2_scheme_ready(scheme) == 0) { return 0 - GPU_ERR_FORMAT_UNSUPPORTED; }
-    var dst = mmap_anon(expected);
-    if (dst == 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
+    # 4.5.0 audit: read the decoder once (it was checked, then read again for the call).
+    var fp = _ktx2_zstd_fn;
+    if (scheme == KTX2_SC_ZLIB) { fp = _ktx2_zlib_fn; }
+    if (fp == 0) { return 0 - GPU_ERR_FORMAT_UNSUPPORTED; }
+    # The level ends exactly where a PROT_NONE page begins, so a decoder that writes past its
+    # buffer faults instead of overwriting whatever was mapped next (4.5.0 audit).
+    var body = _ktx2_page_up(expected);
+    var base = mmap_anon(body + 4096);
+    if (base == 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
+    if (cyr_mprotect(base + body, 4096, 0) != 0) {
+        _ktx2_unmap(base, body + 4096);
+        return 0 - GPU_ERR_OUT_OF_MEMORY;
+    }
+    var dst = base + body - expected;
     var got = 0 - 1;
-    if (scheme == KTX2_SC_ZSTD) { got = fncall4(_ktx2_zstd_fn, bytes + boff, blen, dst, expected); }
-    if (scheme == KTX2_SC_ZLIB) { got = fncall5(_ktx2_zlib_fn, bytes + boff, blen, dst, expected, expected); }
+    if (scheme == KTX2_SC_ZSTD) { got = fncall4(fp, bytes + boff, blen, dst, expected); }
+    if (scheme == KTX2_SC_ZLIB) { got = fncall5(fp, bytes + boff, blen, dst, expected, expected); }
     if (got != expected) {
-        cyr_munmap(dst, expected);
+        _ktx2_unmap(base, body + 4096);
         return 0 - GPU_ERR_CONTAINER_PARSE;                           # corrupt, short or long
     }
     store64(mapped_out, 1);
     return dst;
 }
 
-# Release what _ktx2_level_data mapped (nothing for a stored level).
+# Release what _ktx2_level_data mapped (nothing for a stored level): the page-rounded body
+# that ends at `addr + expected`, and the guard page after it.
 fn _ktx2_level_done(addr, expected, mapped): i64 {
-    if (mapped == 1) { cyr_munmap(addr, expected); }
+    if (mapped == 1) {
+        var body = _ktx2_page_up(expected);
+        _ktx2_unmap(addr + expected - body, body + 4096);
+    }
+    return 0;
+}
+
+# 4.5.0 audit — every level-index entry is checked, and a supercompressed file's decoded size
+# is held to the budget, BEFORE the texture is created. Until then a 104-byte header made a
+# full-size GPU allocation before its first bad entry was found. Returns 0 or a GPU_ERR_*.
+fn _ktx2_check_levels(bytes, len, scheme, fmt, width, height, levels, total): i64 {
+    var decoded = 0;
+    if (total > 1) {
+        var per_image = mabda_texfmt_data_size(fmt, width, height);
+        if (per_image <= 0) { return GPU_ERR_CONTAINER_PARSE; }
+        var lvl = per_image * total;   # per_image <= 512 MiB and total <= 6 * the layer limit
+        var r0 = _ktx2_level_span(bytes, len, _KTX2_LEVELIDX_OFF, scheme, lvl,
+          _KTX2_LEVELIDX_OFF + _KTX2_LEVELIDX_SZ);
+        if (r0 != 0) { return r0; }
+        decoded = lvl;
+    } else {
+        if (levels > mip_level_count(width, height)) { return GPU_ERR_CONTAINER_PARSE; }
+        for (var level = 0; level < levels; level = level + 1) {
+            var idx = _KTX2_LEVELIDX_OFF + level * _KTX2_LEVELIDX_SZ;
+            var expected = mabda_texfmt_data_size(fmt, mip_level_dim(width, level), mip_level_dim(height, level));
+            var r1 = _ktx2_level_span(bytes, len, idx, scheme, expected,
+              _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ);
+            if (r1 != 0) { return r1; }
+            decoded = decoded + expected;
+        }
+    }
+    if (scheme != KTX2_SC_NONE) {
+        if (decoded > _ktx2_max_decoded) {
+            _gpu_err_record(GPU_ERR_OUT_OF_MEMORY,
+              "KTX2: the levels decode past the budget (gpu_ktx2_set_max_decoded_bytes)", 1);
+            return GPU_ERR_OUT_OF_MEMORY;
+        }
+    }
     return 0;
 }
 
@@ -480,6 +553,8 @@ fn gpu_texture_load_ktx2_result(ctx, bytes, len): i64 {
     # v3.4 AA.6b — array / cube: single-level (parse enforced levels==1), one
     # level's blen covers all `total` images (KTX2 is mip-outer, image-inner).
     var total = layers * faces;
+    var cr = _ktx2_check_levels(bytes, len, scheme, fmt, width, height, levels, total);
+    if (cr != 0) { return gpu_err_result(cr); }
     if (total > 1) {
         return _ktx2_load_layered(ctx, bytes, len, fmt, width, height, layers, faces, scheme);
     }

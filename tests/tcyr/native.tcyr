@@ -1083,8 +1083,9 @@ fn test_native_transfer_copy_timeline_driver() {
     assert_eq(native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, qns),
       GPU_ERR_OTHER, "DMA queue, syncobj 0 -> GPU_ERR_OTHER");
     # Full path: DMA queue + syncobj + ib backing + fake fd. The submit
-    # fails (no HW) but the queue bookkeeping must still run: timeline
-    # point bumped 0->1, the recorded barrier wait consumed.
+    # fails (no HW). 4.5.0: a refused submit gives its timeline point back
+    # and puts the barrier wait it took back on the queue (both used to be
+    # lost: the point never signalled, and the next submit lost the wait).
     queue_set_pending_wait(qt, 0x55, 3);
     store64((&ctx) + 0, 0 - 1);          # fd = -1
     var ib_scratch[4096];
@@ -1092,21 +1093,24 @@ fn test_native_transfer_copy_timeline_driver() {
     assert_eq(queue_point(qt), 0, "point starts 0");
     var rc = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200, 64, qt);
     assert(rc != 0, "fake-fd submit fails gracefully");
-    assert_eq(queue_point(qt), 1, "timeline point bumped 0->1");
-    assert_eq(queue_pending_wait_syncobj(qt), 0, "pending wait consumed");
+    assert(rc != GPU_ERR_BUFFER, "it reached the submit (a kernel errno, not a pre-submit refusal)");
+    assert_eq(queue_point(qt), 0, "the refused submit gave its point back (4.5.0)");
+    assert_eq(queue_pending_wait_syncobj(qt), 0x55, "and put its wait back (4.5.0)");
+    assert_eq(queue_pending_wait_point(qt), 3, "at the same point");
     # X.8: a > 4 MiB copy is no longer rejected — it chunks into multiple
-    # COPY_LINEAR packets and proceeds to submit (fails on the fake fd, but
-    # the point bumps, proving it reached submit rather than early-rejecting).
+    # COPY_LINEAR packets and proceeds to submit (fails on the fake fd: a
+    # kernel errno, not the pre-submit GPU_ERR_BUFFER below).
     var rc2 = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200,
       _NATIVE_SDMA_COPY_MAX_BYTES + 4, qt);
     assert(rc2 != 0, "4MiB+4 chunks + submits (fake-fd fail), not rejected");
-    assert_eq(queue_point(qt), 2, "point bumped 1->2 (reached submit)");
+    assert(rc2 != GPU_ERR_BUFFER, "4MiB+4 reached the submit");
+    assert_eq(queue_point(qt), 0, "point given back again");
     # X.8: a copy too large for the IB packet chain (>146 packets) is
     # rejected pre-submit with GPU_ERR_BUFFER (point NOT bumped).
     var rc3 = native_transfer_copy_timeline(&ctx, 1, 0x100, 2, 0x200,
       _NATIVE_SDMA_COPY_MAX_BYTES * 147, qt);
     assert_eq(rc3, GPU_ERR_BUFFER, "oversize chain -> GPU_ERR_BUFFER");
-    assert_eq(queue_point(qt), 2, "oversize rejected pre-submit (point unchanged)");
+    assert_eq(queue_point(qt), 0, "oversize rejected pre-submit (point unchanged)");
     return 0;
 }
 
@@ -1216,8 +1220,9 @@ fn test_native_compute_dispatch_queue_targeted_branch() {
     assert_eq(queue_point(q), 0, "point starts 0");
     var rc = _backend_native_compute_dispatch(&ctx, &shmod, 1, 1, 1, &bp);
     assert(rc != 0, "fake-fd submit fails gracefully (no crash)");
-    assert_eq(queue_point(q), 1, "timeline path taken: queue point bumped 0->1");
-    assert_eq(queue_pending_wait_syncobj(q), 0, "pending wait consumed + cleared");
+    # 4.5.0: the refused submit gives its point back and restores its wait.
+    assert_eq(queue_point(q), 0, "refused timeline submit: point given back");
+    assert_eq(queue_pending_wait_syncobj(q), 0x77, "refused timeline submit: wait restored");
     return 0;
 }
 
@@ -3673,8 +3678,8 @@ fn test_native_render_dispatch_timeline_driver() {
       GPU_ERR_OTHER, "GFX queue, syncobj 0 -> GPU_ERR_OTHER");
 
     # Full path: GFX queue + syncobj + ib/fence backing + fake fd. The
-    # submit fails (no HW) but the queue bookkeeping must still run:
-    # timeline point bumped 0->1, the recorded cross-ring barrier consumed.
+    # submit fails (no HW); 4.5.0: it gives its point back and restores the
+    # recorded cross-ring barrier.
     queue_set_pending_wait(qg, 0x55, 3);
     store64((&ctx) + 0, 0 - 1);             # fd = -1
     var ib_scratch[4096];
@@ -3684,8 +3689,8 @@ fn test_native_render_dispatch_timeline_driver() {
     assert_eq(queue_point(qg), 0, "point starts 0");
     var rc = native_render_dispatch_timeline(&ctx, &pm4, 32, &triple, qg);
     assert(rc != 0, "fake-fd submit fails gracefully");
-    assert_eq(queue_point(qg), 1, "timeline point bumped 0->1");
-    assert_eq(queue_pending_wait_syncobj(qg), 0, "pending wait consumed");
+    assert_eq(queue_point(qg), 0, "refused render submit: point given back (4.5.0)");
+    assert_eq(queue_pending_wait_syncobj(qg), 0x55, "refused render submit: wait restored");
     return 0;
 }
 

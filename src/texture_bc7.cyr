@@ -1107,23 +1107,37 @@ fn _bc7_encode_block(px, out): i64 {
     return _bc7_best;
 }
 
-# Encode an RGBA8 image to BC7: `width` x `height` texels at `src`, `src_pitch` bytes a row
-# (each texel R, G, B, A bytes), into `dst` (`dst_len` bytes; it needs
+# 1 when a `width` x `height` RGBA8 image with `pitch` bytes a row fits in `len` bytes: the
+# last row ends at (height - 1) * pitch + width * 4. Divide-first, so a huge pitch or height
+# cannot overflow the product (4.5.0 audit). Dimensions are already 1..8192 here.
+fn _bc7_rows_fit(len, width, height, pitch): i64 {
+    if (pitch < width * 4) { return 0; }
+    if (len < width * 4) { return 0; }
+    if (height == 1) { return 1; }
+    if (pitch > (len - width * 4) / (height - 1)) { return 0; }
+    return 1;
+}
+
+# Encode an RGBA8 image to BC7: `width` x `height` texels at `src` (`src_len` bytes,
+# `src_pitch` bytes a row, each texel R, G, B, A bytes), into `dst` (`dst_len` bytes; it needs
 # mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height)). Blocks run row-major; a partial
 # block at the right or bottom edge repeats the edge texels. Returns the bytes written, or a
 # negative GPU_ERR_*: -GPU_ERR_TEXTURE_DIMENSION for a size outside 1..MABDA_MAX_TEXTURE_DIM_2D,
-# -GPU_ERR_BUFFER for a null buffer, a short pitch or a short dst. CPU only; deterministic.
+# -GPU_ERR_BUFFER for a null buffer, a short pitch, a src too short for its rows or a short
+# dst. CPU only; deterministic; not thread-safe: the block search keeps its state in module
+# globals, like mabda's other CPU state, so call it from one thread at a time.
 # The blocks are the same for MABDA_TEXFMT_BC7_SRGB (4.5.0): encode the sRGB-encoded bytes
 # and create the texture in that id, and sampling decodes them to linear.
+# 4.5.0 audit: `src_len` is new. Without it the strided read could not be bounded.
 # @public
-fn mabda_bc7_encode(src, width, height, src_pitch, dst, dst_len): i64 {
+fn mabda_bc7_encode(src, src_len, width, height, src_pitch, dst, dst_len): i64 {
     if (width < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (height < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (width > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (height > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (src == 0) { return 0 - GPU_ERR_BUFFER; }
     if (dst == 0) { return 0 - GPU_ERR_BUFFER; }
-    if (src_pitch < width * 4) { return 0 - GPU_ERR_BUFFER; }
+    if (_bc7_rows_fit(src_len, width, height, src_pitch) == 0) { return 0 - GPU_ERR_BUFFER; }
     var need = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height);
     if (dst_len < need) { return 0 - GPU_ERR_BUFFER; }
     if (_bc7_init() != 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
@@ -1156,17 +1170,19 @@ fn mabda_bc7_encode(src, width, height, src_pitch, dst, dst_len): i64 {
     return need;
 }
 
-# Decode a BC7 image (`width` x `height`, the blocks mabda_bc7_encode writes) to RGBA8 at
-# `dst` (`dst_pitch` bytes a row). Returns 0, or a negative GPU_ERR_* as mabda_bc7_encode.
-# CPU only. @public
-fn mabda_bc7_decode(src, src_len, width, height, dst, dst_pitch): i64 {
+# Decode a BC7 image (`width` x `height`, the blocks mabda_bc7_encode writes; `src_len` bytes)
+# to RGBA8 at `dst` (`dst_len` bytes, `dst_pitch` bytes a row). Returns 0, or a negative
+# GPU_ERR_* as mabda_bc7_encode (a dst too short for its rows is -GPU_ERR_BUFFER). CPU only.
+# 4.5.0 audit: `dst_len` is new. Without it the strided write could not be bounded.
+# @public
+fn mabda_bc7_decode(src, src_len, width, height, dst, dst_len, dst_pitch): i64 {
     if (width < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (height < 1) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (width > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (height > MABDA_MAX_TEXTURE_DIM_2D) { return 0 - GPU_ERR_TEXTURE_DIMENSION; }
     if (src == 0) { return 0 - GPU_ERR_BUFFER; }
     if (dst == 0) { return 0 - GPU_ERR_BUFFER; }
-    if (dst_pitch < width * 4) { return 0 - GPU_ERR_BUFFER; }
+    if (_bc7_rows_fit(dst_len, width, height, dst_pitch) == 0) { return 0 - GPU_ERR_BUFFER; }
     if (src_len < mabda_texfmt_data_size(MABDA_TEXFMT_BC7, width, height)) { return 0 - GPU_ERR_BUFFER; }
     if (_bc7_init() != 0) { return 0 - GPU_ERR_OUT_OF_MEMORY; }
     var bxn = (width + 3) / 4;

@@ -29,7 +29,7 @@
 #
 # Struct layouts:
 #
-# RenderGraph (72 bytes — grew 40→48 at v3.2.13 R.3, 48→72 at v4.5.0, append-only):
+# RenderGraph (80 bytes — grew 40→48 at v3.2.13 R.3, 48→80 at v4.5.0, append-only):
 #   +0:  nodes         (vec ptr, 8)   — vec of Node*
 #   +8:  transients    (vec ptr, 8)   — vec of TransientResource*
 #   +16: built_flag    (i64)          — 0 before rg_build, 1 after
@@ -43,6 +43,10 @@
 #   +56: backing       (ptr, 8)       — native: the NativeBuf every transient
 #                                       is a view into (0 = none). 4.5.0.
 #   +64: backing_bytes (i64)          — that allocation's byte size. 4.5.0.
+#   +72: by_id         (vec ptr, 8)   — Node* in INSERTION order (4.5.0). rg_build sorts
+#                                       `nodes` in place, so a node id only indexes this
+#                                       one after the build: every id-taking accessor
+#                                       resolves through it (_rg_node_by_id).
 #
 # Node (80 bytes — grew 72→80 at v3.2.13 R.1, append-only):
 #   +0:  kind            (i64 — NODE_* enum)
@@ -59,6 +63,7 @@
 #                         per op kind" rule. rg_node_queue overrides it.)
 #   +64: batch_idx       (i64 — scheduler scratch: which per-queue batch
 #                         this node lands in; -1 before rg_schedule. R.3.)
+#   +72: node_id         (i64 — the id rg_add_* returned, its insertion index; 4.5.0)
 #
 # ComputePayload (32 bytes):
 #   +0:  pipeline    (WGPUComputePipeline struct ptr from compute.cyr)
@@ -116,8 +121,12 @@
 #   +88: target       (native AMD: a NativeRT view over a RENDER_ATTACHMENT texture, else 0) 4.5.0
 #   +96: user_queues  (i64 — bitmask of 1 << QUEUE_KIND_* over the nodes using it) 4.5.0
 #   +104: label       (cstr) 4.5.0
-const RG_STRUCT_SIZE  = 72;
-const RG_RES_SIZE   = 112;
+#   +112: plan_first  (i64 — the planner's start: 0 for an INPUT, whose first user reads it,
+#                      so its contents come from before the graph; else first_use) 4.5.0
+#   +120: plan_last   (i64 — the planner's end: the last node for an OUTPUT, whose last user
+#                      writes it, so its contents are read after the graph; else last_use) 4.5.0
+const RG_STRUCT_SIZE  = 80;
+const RG_RES_SIZE     = 128;
 
 const NODE_COMPUTE     = 1;
 const NODE_RENDER      = 2;
@@ -136,15 +145,44 @@ fn rg_new(): i64 {
     memset(g, 0, RG_STRUCT_SIZE);
     store64(g + 0,  vec_new());
     store64(g + 8,  vec_new());
+    store64(g + 72, vec_new());
     return g;
 }
 
 fn rg_label(g, label): i64 { store64(g + 32, label); return g; }
 fn rg_aliasing(g, on): i64 { store64(g + 24, on); return g; }
 
-fn rg_node_count(g): i64 { return vec_len(load64(g + 0)); }
-fn rg_transient_count(g): i64 { return vec_len(load64(g + 8)); }
-fn rg_is_built(g): bool { return load64(g + 16) != 0; }
+fn rg_node_count(g): i64 {
+    if (g == 0) { return 0; }
+    return vec_len(load64(g + 0));
+}
+fn rg_transient_count(g): i64 {
+    if (g == 0) { return 0; }
+    return vec_len(load64(g + 8));
+}
+fn rg_is_built(g): bool {
+    if (g == 0) { return false; }
+    return load64(g + 16) != 0;
+}
+
+# 1 if vec `v` holds `x`.
+fn _rg_vec_has(v, x): i64 {
+    var n = vec_len(v);
+    for (var i = 0; i < n; i = i + 1) {
+        if (vec_get(v, i) == x) { return 1; }
+    }
+    return 0;
+}
+
+# The node rg_add_* returned `node_id` for, or 0 for a bad id (4.5.0). rg_build sorts the
+# `nodes` vec in place, so after the build a node id must be looked up here, never in it.
+fn _rg_node_by_id(g, node_id): i64 {
+    if (g == 0) { return 0; }
+    if (node_id < 0) { return 0; }
+    var by_id = load64(g + 72);
+    if (node_id >= vec_len(by_id)) { return 0; }
+    return vec_get(by_id, node_id);
+}
 
 # Add a compute node. `dims_xyz` is a 12-byte packed (x, y, z) u32 triple.
 # Returns the node_id (0-indexed); callers pass this to rg_node_reads /
@@ -204,18 +242,20 @@ fn rg_add_copy_tex_buf(g, args): i64 {
 # Declare that `node_id` reads `res_id` during execution. Used for
 # toposort edge inference (if any earlier node WROTE this resource,
 # the current node depends on it).
+# 4.5.0: returns 1, changing nothing, for a bad id or a built graph (a dependency added after
+# the build would leave its lifetimes, queue masks and waits stale); it returned 0 for both.
 fn rg_node_reads(g, node_id, res_id): i64 {
-    if (node_id < 0) { return 0; }
-    if (node_id >= rg_node_count(g)) { return 0; }
-    var node = vec_get(load64(g + 0), node_id);
+    if (rg_is_built(g)) { return 1; }
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 1; }
     vec_push(load64(node + 16), res_id);
     return 0;
 }
 
 fn rg_node_writes(g, node_id, res_id): i64 {
-    if (node_id < 0) { return 0; }
-    if (node_id >= rg_node_count(g)) { return 0; }
-    var node = vec_get(load64(g + 0), node_id);
+    if (rg_is_built(g)) { return 1; }
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 1; }
     vec_push(load64(node + 24), res_id);
     return 0;
 }
@@ -226,13 +266,13 @@ fn rg_node_writes(g, node_id, res_id): i64 {
 # which reproduces v2.5 ordering. Must be called before rg_build. On the
 # wgpu backend affinity is informational (one device queue); on native
 # it routes the node to the matching HW ring (consumed by the R.2/R.3
-# scheduler). Returns 0 on success, 1 on a bad node_id or kind.
+# scheduler). Returns 0 on success, 1 on a bad node_id or kind, or (4.5.0) a built graph.
 fn rg_node_queue(g, node_id, kind): i64 {
-    if (node_id < 0) { return 1; }
-    if (node_id >= rg_node_count(g)) { return 1; }
+    if (rg_is_built(g)) { return 1; }
     if (kind < 0) { return 1; }
     if (kind >= QUEUE_KIND_COUNT) { return 1; }
-    var node = vec_get(load64(g + 0), node_id);
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 1; }
     store64(node + 56, kind);
     return 0;
 }
@@ -240,9 +280,9 @@ fn rg_node_queue(g, node_id, kind): i64 {
 # Accessor: the queue affinity assigned to a node (QUEUE_KIND_*).
 # Returns -1 on a bad node_id.
 fn rg_node_queue_get(g, node_id): i64 {
-    if (node_id < 0) { return 0 - 1; }
-    if (node_id >= rg_node_count(g)) { return 0 - 1; }
-    return load64(vec_get(load64(g + 0), node_id) + 56);
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 0 - 1; }
+    return load64(node + 56);
 }
 
 # Transient resources — the graph owns them between rg_build and
@@ -325,9 +365,8 @@ fn rg_backing_bytes(g): i64 {
 # given the pass here. Returns 0, or 1 for a bad node id or a node that is not a
 # render node.
 fn rg_node_set_pass(g, node_id, pass): i64 {
-    if (node_id < 0) { return 1; }
-    if (node_id >= rg_node_count(g)) { return 1; }
-    var node = vec_get(load64(g + 0), node_id);
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 1; }
     if (load64(node + 0) != NODE_RENDER) { return 1; }
     store64(load64(node + 8) + 0, pass);
     return 0;
@@ -486,6 +525,14 @@ fn rg_build(g, device): i64 {
     #     and the planner treats them as dead.
     var transients = load64(g + 8);
     var t = vec_len(transients);
+    # 4.5.0: start every lifetime fresh, so a rebuild after rg_release (which may sort the
+    # nodes differently) does not mix in the previous build's indices.
+    for (var tr = 0; tr < t; tr = tr + 1) {
+        var r0 = vec_get(transients, tr);
+        store64(r0 + 48, 0 - 1);
+        store64(r0 + 56, 0 - 1);
+        store64(r0 + 96, 0);
+    }
     var ni = 0;
     while (ni < n) {
         var node = vec_get(nodes, ni);
@@ -535,6 +582,24 @@ fn rg_build(g, device): i64 {
             wi = wi + 1;
         }
         ni = ni + 1;
+    }
+
+    # 4.5.0 — the planner's interval for each transient. An INPUT (its first user reads it:
+    # its contents come from before the graph, e.g. a CPU fill after the build) is live from
+    # node 0; an OUTPUT (its last user writes it: its contents are read after the graph) is
+    # live to the last node. Planned from its first to its last user only, an aliased input
+    # could share bytes with a transient an earlier node writes over the fill, and an output
+    # with one a later node writes before the consumer reads it.
+    for (var tp = 0; tp < t; tp = tp + 1) {
+        var rp = vec_get(transients, tp);
+        var fu3 = load64(rp + 48);
+        var lu3 = load64(rp + 56);
+        store64(rp + 112, fu3);
+        store64(rp + 120, lu3);
+        if (fu3 != 0 - 1) {
+            if (_rg_vec_has(load64(vec_get(nodes, fu3) + 16), tp) == 1) { store64(rp + 112, 0); }
+            if (_rg_vec_has(load64(vec_get(nodes, lu3) + 24), tp) == 1) { store64(rp + 120, n - 1); }
+        }
     }
 
     # --- Allocate GPU resources per transient. Each transient gets its own
@@ -690,6 +755,7 @@ fn _rg_native_back(g, ctx): i64 {
                 store64(v + NATIVE_BUF_FIELD_ADDR, baddr + off);
                 store64(v + NATIVE_BUF_FIELD_SIZE, load64(rr + 24));
                 store64(rr + 8, v);
+                native_view_register(v);
             }
             if (load64(rr + 0) == RES_TEXTURE) {
                 var w = load64(rr + 24);
@@ -698,8 +764,13 @@ fn _rg_native_back(g, ctx): i64 {
                 var fmt = mabda_texfmt_from_wgpu(packed / 0x100000000);
                 var doff = desc_base + di * 64;
                 var tex = alloc(NATIVE_TEX_STRUCT_SIZE);
-                native_tex_view_init(tex, bh, bva + off, baddr + off, w, h, fmt, baddr + doff, bva + doff);
+                memset(tex, 0, NATIVE_TEX_STRUCT_SIZE);
+                if (native_tex_view_init(tex, bh, bva + off, baddr + off, w, h, fmt, baddr + doff, bva + doff) != 0) {
+                    rg_release(g);   # validation makes this unreachable; never leave a half-built backing
+                    return GPU_ERR_FORMAT_UNSUPPORTED;
+                }
                 store64(rr + 8, tex);
+                native_view_register(tex);
                 if (((packed & 0xFFFFFFFF) & WGPU_TEXTURE_USAGE_RENDER_ATTACHMENT) != 0) {
                     var rt = alloc(NATIVE_RT_STRUCT_SIZE);
                     memset(rt, 0, NATIVE_RT_STRUCT_SIZE);
@@ -710,6 +781,7 @@ fn _rg_native_back(g, ctx): i64 {
                     store32(rt + NATIVE_RT_FIELD_WIDTH, w);
                     store32(rt + NATIVE_RT_FIELD_HEIGHT, h);
                     store64(rr + 88, rt);
+                    native_view_register(rt);
                 }
                 di = di + 1;
             }
@@ -817,7 +889,7 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count, reuse, apply): i64 {
         while (j < n_live) {
             var rj = vec_get(transients, vec_get(live, j));
             var rm = vec_get(transients, vec_get(live, min_j));
-            if (load64(rj + 48) < load64(rm + 48)) {
+            if (load64(rj + 112) < load64(rm + 112)) {
                 min_j = j;
             }
             j = j + 1;
@@ -843,8 +915,8 @@ fn _rg_plan_kind(g, kind, start_offset, out_slot_count, reuse, apply): i64 {
     while (si < n_live) {
         var id2 = vec_get(live, si);
         var r2 = vec_get(transients, id2);
-        var fu2 = load64(r2 + 48);
-        var lu2 = load64(r2 + 56);
+        var fu2 = load64(r2 + 112);   # the planner's interval (inputs from 0, outputs to the end)
+        var lu2 = load64(r2 + 120);
         var sz2 = _rg_plan_align_up(_rg_plan_transient_bytes(r2), _RG_PLAN_ALIGN);
 
         var best = 0 - 1;
@@ -1228,9 +1300,9 @@ fn rg_schedule_fence_consumer_node(g, fi): i64 {
 
 # The batch index a node landed in (-1 before rg_schedule or bad id).
 fn rg_node_batch_idx(g, node_id): i64 {
-    if (node_id < 0) { return 0 - 1; }
-    if (node_id >= rg_node_count(g)) { return 0 - 1; }
-    return load64(vec_get(load64(g + 0), node_id) + 64);
+    var node = _rg_node_by_id(g, node_id);
+    if (node == 0) { return 0 - 1; }
+    return load64(node + 64);
 }
 
 # ================================================================
@@ -1462,9 +1534,9 @@ fn _rg_native_dispatch_node(ctx, node): i64 {
 #   - every earlier node that writes a resource node i reads, on ANY queue. A
 #     same-queue edge used to rely on submit order, but successive submits on one
 #     ring may overlap; a same-ring wait makes the kernel insert a pipeline sync.
-#   - for every transient whose first user is node i and which takes over another
-#     transient's slot (alias_of), every queue that ran a user of that transient, so
-#     nothing still reads or writes the bytes when they are reused.
+#   - for every transient node i uses that takes over another transient's slot (alias_of),
+#     every queue that ran a user of that transient, so nothing still reads or writes the
+#     bytes when they are reused.
 # Returns 0 or the first GPU_ERR_* a barrier gave.
 fn _rg_native_waits(g, ctx, i, q): i64 {
     var nodes = load64(g + 0);
@@ -1480,19 +1552,32 @@ fn _rg_native_waits(g, ctx, i, q): i64 {
             if (br != 0) { return br; }
         }
     }
+    var ar = _rg_alias_waits(g, ctx, reads, q);
+    if (ar != 0) { return ar; }
+    return _rg_alias_waits(g, ctx, load64(node + 24), q);
+}
+
+# For each transient in `ids` that took over another's slot, a barrier from every queue that
+# used the previous occupant. Every USER of the transient waits, not only its first: a later
+# user with no edge to the first one (another queue, or the same ring, whose submits may
+# overlap) could otherwise touch the bytes while the previous occupant's users still run.
+fn _rg_alias_waits(g, ctx, ids, q): i64 {
     var transients = load64(g + 8);
     var t = vec_len(transients);
-    for (var k = 0; k < t; k = k + 1) {
-        var r = vec_get(transients, k);
-        if (load64(r + 48) == i) {
-            var prev = load64(r + 72);
-            if (prev >= 0) {
-                var mask = load64(vec_get(transients, prev) + 96);
-                for (var qk = 0; qk < QUEUE_KIND_COUNT; qk = qk + 1) {
-                    if ((mask & (1 << qk)) != 0) {
-                        var aq = gpu_queue_get(ctx, qk);
-                        var ar = gpu_queue_barrier(ctx, aq, q);
-                        if (ar != 0) { return ar; }
+    var n = vec_len(ids);
+    for (var k = 0; k < n; k = k + 1) {
+        var id = vec_get(ids, k);
+        if (id >= 0) {
+            if (id < t) {
+                var prev = load64(vec_get(transients, id) + 72);
+                if (prev >= 0) {
+                    var mask = load64(vec_get(transients, prev) + 96);
+                    for (var qk = 0; qk < QUEUE_KIND_COUNT; qk = qk + 1) {
+                        if ((mask & (1 << qk)) != 0) {
+                            var aq = gpu_queue_get(ctx, qk);
+                            var ar = gpu_queue_barrier(ctx, aq, q);
+                            if (ar != 0) { return ar; }
+                        }
                     }
                 }
             }
@@ -1530,31 +1615,49 @@ fn _rg_execute_native_mq(g, ctx): i64 {
         # Waits before this node (4.5.0): every producer it reads, on whatever queue,
         # and every queue that used a slot it now reuses. Before 4.5.0 only the
         # cross-queue edges (`fences`, nf) waited, and on one pending slot.
+        # 4.5.0: a node whose waits fail is not dispatched, and the graph stops at the first
+        # failure (later nodes read what it would have written); until 4.5.0 both ran on.
         var wr0 = _rg_native_waits(g, ctx, i, q);
-        if (wr0 != 0) { rc = wr0; }
+        if (wr0 != 0) { rc = wr0; break; }
 
         gpu_ctx_set_current_queue(ctx, q);
         var dr = _rg_native_dispatch_node(ctx, node);
-        if (dr != 0) { rc = dr; }
-        native_ctx_ib_advance(ctx);     # next node stages into a fresh IB slice
+        if (dr != 0) { rc = dr; break; }
+        # Next node stages into a fresh IB slice. 4.5.0: when the cursor wraps to slice 0, the
+        # slices are about to be reused, so every queue drains first (a pending submit still
+        # reads its slice; reusing it would hand the GPU a half-overwritten stream).
+        if (native_ctx_ib_advance(ctx) == 0) {
+            var dw = _rg_wait_queues(ctx, batches, nb);
+            if (dw != 0) { rc = dw; break; }
+        }
         i = i + 1;
     }
 
     # Clear the stash and retire every used queue before returning.
     gpu_ctx_set_current_queue(ctx, 0);
-    bi = 0;
-    while (bi < nb) {
+    var wr = _rg_wait_queues(ctx, batches, nb);
+    if (rc == 0) { rc = wr; }
+    return rc;
+}
+
+# gpu_queue_wait_idle on the queue of every batch. Returns 0 or the last GPU_ERR_*.
+fn _rg_wait_queues(ctx, batches, nb): i64 {
+    var rc = 0;
+    for (var bi = 0; bi < nb; bi = bi + 1) {
         var wq = gpu_queue_get(ctx, load64(vec_get(batches, bi) + BATCH_OFF_QUEUE));
         var wr = gpu_queue_wait_idle(ctx, wq);
         if (wr != 0) { rc = wr; }
-        bi = bi + 1;
     }
     return rc;
 }
 
 fn rg_execute_mq(g, ctx): i64 {
     if (ctx == 0) { return 1; }
-    if (rg_is_built(g) == 0) { return 1; }
+    if (rg_is_built(g) == 0) { return 1; }   # also a null g (4.5.0: it read address 16)
+    # 4.5.0: a graph rg_build_ctx built is bound to that context. Its views are another
+    # context's handles and VAs; run elsewhere, they name that context's memory.
+    var built_on = load64(g + 48);
+    if (built_on != 0) { if (built_on != ctx) { return GPU_ERR_OTHER; } }
     # Run the scheduler pass (R.2/R.3) — idempotent; produces the per-queue
     # batches + cross-queue fence edges both executors read.
     rg_schedule(g);
@@ -1594,16 +1697,20 @@ fn rg_release(g): i64 {
         if (cb != 0) { if (backend_kind(cb) == BACKEND_KIND_AMD) { native = 1; } }
     }
     if (native == 1) {
+        # 4.5.0 (audit): the views are zeroed as well as dropped. A consumer payload still
+        # pointing at one then names handle 0 / VA 0, which every native path refuses, not a
+        # freed BO whose VA a later allocation may own.
+        for (var vi = 0; vi < t; vi = vi + 1) {
+            var vr = vec_get(transients, vi);
+            _rg_drop_view(vr + 8, NATIVE_BUF_STRUCT_SIZE, NATIVE_TEX_STRUCT_SIZE, load64(vr + 0));
+            _rg_drop_view(vr + 88, NATIVE_RT_STRUCT_SIZE, NATIVE_RT_STRUCT_SIZE, RES_TEXTURE);
+            store64(vr + 16, 0);
+        }
         var backing = load64(g + 56);
         if (backing != 0) { gpu_buffer_release(ctx, backing); }
         store64(g + 56, 0);
         store64(g + 64, 0);
-        for (var vi = 0; vi < t; vi = vi + 1) {
-            var vr = vec_get(transients, vi);
-            store64(vr + 8, 0);
-            store64(vr + 16, 0);
-            store64(vr + 88, 0);
-        }
+        _rg_unbuild(g);
         return 0;
     }
     var ti = 0;
@@ -1617,10 +1724,35 @@ fn rg_release(g): i64 {
             if (kind == RES_BUFFER)  { wgpu_buffer_release(handle); }
             if (kind == RES_TEXTURE) { wgpu_texture_release(handle); }
         }
+        # 4.5.0: cleared, so a second rg_release does not release them again.
+        store64(r + 8, 0);
+        store64(r + 16, 0);
         ti = ti + 1;
     }
+    _rg_unbuild(g);
     # Node payloads and vecs are bump-allocated; the arena reset
     # reclaims them en masse. Nothing else to free per-node.
+    return 0;
+}
+
+# 4.5.0: a released graph is unbuilt (rg_execute / rg_execute_mq refuse it; rg_build may
+# build it again) and no longer bound to a context or schedule.
+fn _rg_unbuild(g): i64 {
+    store64(g + 16, 0);
+    store64(g + 40, 0);
+    store64(g + 48, 0);
+    return 0;
+}
+
+# Unregister, zero and clear the native view at *slot (a NativeBuf for a buffer transient,
+# else a NativeTexture or NativeRT of the given sizes).
+fn _rg_drop_view(slot, buf_size, tex_size, kind): i64 {
+    var v = load64(slot);
+    if (v == 0) { return 0; }
+    native_view_forget(v);
+    if (kind == RES_BUFFER) { memset(v, 0, buf_size); }
+    if (kind == RES_TEXTURE) { memset(v, 0, tex_size); }
+    store64(slot, 0);
     return 0;
 }
 
@@ -1648,6 +1780,8 @@ fn _rg_append_node(g, node): i64 {
     var nodes = load64(g + 0);
     var id = vec_len(nodes);
     vec_push(nodes, node);
+    vec_push(load64(g + 72), node);
+    store64(node + 72, id);
     return id;
 }
 

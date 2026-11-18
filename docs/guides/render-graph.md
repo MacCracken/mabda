@@ -1,6 +1,6 @@
 # Render Graph Guide
 
-> Written against mabda 4.4.0 / Cyrius 6.7.18. See
+> Written against mabda 4.5.0 / Cyrius 6.7.18. See
 > [`usage.md`](usage.md) and
 > [`../stdlib-integration.md`](../stdlib-integration.md) for the
 > consumer-project setup. This guide covers
@@ -126,11 +126,26 @@ What happens with the plan depends on the backend you build on with
   API has no placed or aliased resources, so the plan is advisory there:
   a consumer applies the offsets to its own sub-allocated store.
 
-With aliasing on, a transient's contents before its first user are
-undefined: another transient may own those bytes until then. Fill an
-input transient after the build and before `rg_execute_mq`, as the
-first user expects. Read a result from a transient whose slot nothing
-reuses afterwards (`rg_transient_alias_of` tells you which reuse which).
+With aliasing on, the planner keeps two kinds of transient out of
+shared bytes for the whole graph:
+- an **input**, whose first user reads it, is planned from the first
+  node, so fill it after the build and before `rg_execute_mq`;
+- an **output**, whose last user writes it, is planned to the last node,
+  so read it after `rg_execute_mq` returns.
+
+Scratch that one node writes and a later one reads still shares bytes
+with other scratch. `rg_transient_alias_of` tells you which transient
+reuses which. Before every node that uses a reused transient,
+`rg_execute_mq` waits for every queue that used its slot. Past 16 nodes
+the executor also drains its queues before reusing its command-stream
+slices.
+
+Node ids stay valid after the build: `rg_node_set_pass`,
+`rg_node_queue_get` and `rg_node_batch_idx` take the id `rg_add_*`
+returned. `rg_node_reads` / `rg_node_writes` / `rg_node_queue` return 1
+after the build, because the dependencies are fixed then.
+`rg_release` frees the backing, zeroes the views and unbuilds the graph.
+A graph is bound to the context `rg_build_ctx` built it on.
 
 On native, build the graph's nodes before its transients have views:
 add render nodes with pass 0, call `rg_build_ctx`, create each pass from

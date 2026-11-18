@@ -282,9 +282,9 @@ fn _img_make(kind, img, w, h): i64 {
 fn _bc7_round_trip_se(img, w, h): i64 {
     var size = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
     var blocks = alloc(size);
-    if (mabda_bc7_encode(img, w, h, w * 4, blocks, size) != size) { return 0 - 1; }
+    if (mabda_bc7_encode(img, w * h * 4, w, h, w * 4, blocks, size) != size) { return 0 - 1; }
     var dec = alloc(w * h * 4);
-    if (mabda_bc7_decode(blocks, size, w, h, dec, w * 4) != 0) { return 0 - 1; }
+    if (mabda_bc7_decode(blocks, size, w, h, dec, w * h * 4, w * 4) != 0) { return 0 - 1; }
     var se = 0;
     var i = 0;
     while (i < w * h * 4) {
@@ -334,8 +334,8 @@ fn test_bc7_encode_deterministic() {
     var size = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
     var a = alloc(size);
     var b = alloc(size);
-    mabda_bc7_encode(img, w, h, w * 4, a, size);
-    mabda_bc7_encode(img, w, h, w * 4, b, size);
+    mabda_bc7_encode(img, w * h * 4, w, h, w * 4, a, size);
+    mabda_bc7_encode(img, w * h * 4, w, h, w * 4, b, size);
     assert_eq(_fnv_bytes(0xCBF29CE484222325, a, size), _fnv_bytes(0xCBF29CE484222325, b, size),
       "two encodes of one image are byte-identical");
     return 0;
@@ -347,15 +347,27 @@ fn test_bc7_api() {
     var img = alloc(64 * 64 * 4);
     var dst = alloc(4096);
     _img_make(0, img, 64, 64);
-    assert_eq(mabda_bc7_encode(img, 0, 4, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION, "width 0");
-    assert_eq(mabda_bc7_encode(img, 4, 8193, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION, "height past 8192");
-    assert_eq(mabda_bc7_encode(0, 4, 4, 16, dst, 4096), 0 - GPU_ERR_BUFFER, "no src");
-    assert_eq(mabda_bc7_encode(img, 4, 4, 16, 0, 4096), 0 - GPU_ERR_BUFFER, "no dst");
-    assert_eq(mabda_bc7_encode(img, 8, 4, 31, dst, 4096), 0 - GPU_ERR_BUFFER, "a pitch short of width * 4");
-    assert_eq(mabda_bc7_encode(img, 8, 8, 32, dst, 63), 0 - GPU_ERR_BUFFER, "a dst short of 4 blocks");
-    assert_eq(mabda_bc7_encode(img, 8, 8, 32, dst, 64), 64, "8 x 8: 4 blocks, 64 bytes");
-    assert_eq(mabda_bc7_decode(dst, 63, 8, 8, img, 32), 0 - GPU_ERR_BUFFER, "decode: a short src");
-    assert_eq(mabda_bc7_decode(dst, 64, 8, 8, img, 31), 0 - GPU_ERR_BUFFER, "decode: a short pitch");
+    var isz = 64 * 64 * 4;
+    assert_eq(mabda_bc7_encode(img, isz, 0, 4, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION, "width 0");
+    assert_eq(mabda_bc7_encode(img, isz, 4, 8193, 256, dst, 4096), 0 - GPU_ERR_TEXTURE_DIMENSION,
+      "height past 8192");
+    assert_eq(mabda_bc7_encode(0, isz, 4, 4, 16, dst, 4096), 0 - GPU_ERR_BUFFER, "no src");
+    assert_eq(mabda_bc7_encode(img, isz, 4, 4, 16, 0, 4096), 0 - GPU_ERR_BUFFER, "no dst");
+    assert_eq(mabda_bc7_encode(img, isz, 8, 4, 31, dst, 4096), 0 - GPU_ERR_BUFFER, "a pitch short of width * 4");
+    assert_eq(mabda_bc7_encode(img, isz, 8, 8, 32, dst, 63), 0 - GPU_ERR_BUFFER, "a dst short of 4 blocks");
+    assert_eq(mabda_bc7_encode(img, isz, 8, 8, 32, dst, 64), 64, "8 x 8: 4 blocks, 64 bytes");
+    assert_eq(mabda_bc7_decode(dst, 63, 8, 8, img, isz, 32), 0 - GPU_ERR_BUFFER, "decode: a short src");
+    assert_eq(mabda_bc7_decode(dst, 64, 8, 8, img, isz, 31), 0 - GPU_ERR_BUFFER, "decode: a short pitch");
+    # 4.5.0 audit: the strided buffer's length bounds its rows. 8 rows of 32 bytes at a pitch
+    # of 32 end at 7 * 32 + 32 = 256 bytes.
+    assert_eq(mabda_bc7_encode(img, 255, 8, 8, 32, dst, 64), 0 - GPU_ERR_BUFFER, "a src one byte short");
+    assert_eq(mabda_bc7_encode(img, 256, 8, 8, 32, dst, 64), 64, "a src exactly long enough");
+    assert_eq(mabda_bc7_decode(dst, 64, 8, 8, img, 255, 32), 0 - GPU_ERR_BUFFER, "decode: a dst one byte short");
+    assert_eq(mabda_bc7_decode(dst, 64, 8, 8, img, 256, 32), 0, "decode: a dst exactly long enough");
+    assert_eq(mabda_bc7_encode(img, isz, 8, 8, 0x4000000000000000, dst, 64), 0 - GPU_ERR_BUFFER,
+      "a pitch whose (h - 1) * pitch would overflow is refused");
+    assert_eq(mabda_bc7_encode(img, isz, 8, 1, 0x4000000000000000, dst, 64), 32,
+      "one row reads only width * 4, whatever its pitch");
     # odd sizes, from a pitch wider than the image
     var sizes[48];
     store64(&sizes, 1);
@@ -371,10 +383,10 @@ fn test_bc7_api() {
         var w = load64(&sizes + k * 16);
         var h = load64(&sizes + k * 16 + 8);
         var need = mabda_texfmt_data_size(MABDA_TEXFMT_BC7, w, h);
-        assert_eq(mabda_bc7_encode(src, w, h, 256, dst, 4096), need, "an odd size encodes its blocks");
+        assert_eq(mabda_bc7_encode(src, 64 * 64 * 4, w, h, 256, dst, 4096), need, "an odd size encodes its blocks");
         var out = alloc(64 * 64 * 4);
         memset(out, 0xEE, 64 * 64 * 4);
-        assert_eq(mabda_bc7_decode(dst, need, w, h, out, 256), 0, "  and decodes");
+        assert_eq(mabda_bc7_decode(dst, need, w, h, out, 64 * 64 * 4, 256), 0, "  and decodes");
         var se = 0;
         var outside = 0;
         var y = 0;

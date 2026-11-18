@@ -466,7 +466,10 @@ fn test_ktx2_load_orchestration() {
     store64(&buf3 + 96, 64);                         # ulen = blen
     assert_eq(gpu_texture_load_ktx2(&ctx, &buf3, 168), 0, "huge byteOffset rejected (no overflow OOB)");
     assert_eq(_dds_wl_count, 0, "write_level never reached for OOB byteOffset");
-    assert_eq(_al_rel_count, 1, "the rejected load releases its texture (the ETC2 load never created one)");
+    # 4.5.0 audit: every level-index entry is checked before the texture is created, so the bad
+    # byteOffset is refused with nothing created (it was created, then released).
+    assert_eq(_al_rel_count, 0, "the rejected load created nothing to release");
+    assert_eq(_dds_cr_count, 1, "no second create: the level index is checked first");
     return 0;
 }
 
@@ -623,6 +626,95 @@ fn test_ktx2_decoder_registration() {
     return 0;
 }
 
+# 4.5.0 audit (MED-1, LOW-2, LOW-5): the decoded-bytes budget, the level-index pre-pass and
+# the guard page after a decoded level.
+fn _sc_find(name): i64 {
+    for (var k = 0; k < KTX2SC_COUNT; k = k + 1) {
+        if (streq(ktx2sc_name(k), name) == 1) { return k; }
+    }
+    return 0 - 1;
+}
+fn _sc_decoded_total(buf): i64 {
+    var fmt = mabda_texfmt_from_vk_format(load32(buf + 12));
+    var w = load32(buf + 20);
+    var h = load32(buf + 24);
+    var total = 0;
+    for (var l = 0; l < load32(buf + 40); l = l + 1) {
+        total = total + mabda_texfmt_data_size(fmt, mip_level_dim(w, l), mip_level_dim(h, l));
+    }
+    return total;
+}
+fn _sc_load(ctx, k, buf): i64 {
+    var n = ktx2sc_build(k, buf);
+    _sc_seed = ktx2sc_seed(k);
+    _sc_cr = 0;
+    _sc_writes = 0;
+    _sc_rel = 0;
+    _sc_bad = 0;
+    var t, r = gpu_texture_load_ktx2_result(ctx, buf, n);
+    if (is_err_result(t) == 1) { return load64(r); }
+    return 0;
+}
+fn test_ktx2_audit_budget_and_prepass() {
+    var b = backend_new();
+    var ctx[208];
+    _sc_ctx(&ctx, b);
+    gpu_ktx2_set_zstd_decoder(&zstd_decompress);
+    gpu_ktx2_set_zlib_decoder(&zlib_decompress_capped);
+    var buf[3600];
+    assert_eq(KTX2_MAX_DECODED_DEFAULT, 1073741824, "the default budget is 1 GiB");
+    assert_eq(gpu_ktx2_max_decoded_bytes(), KTX2_MAX_DECODED_DEFAULT, "and in force");
+    var kz = _sc_find("zstd_rgba8_mips");
+    ktx2sc_build(kz, &buf);
+    var total = _sc_decoded_total(&buf);
+    assert(total > 0, "the mip chain decodes to some bytes");
+    gpu_ktx2_set_max_decoded_bytes(total - 1);
+    assert_eq(_sc_load(&ctx, kz, &buf), GPU_ERR_OUT_OF_MEMORY, "one byte past the budget is refused");
+    assert_eq(_sc_cr, 0, "  before any texture is created");
+    gpu_ktx2_set_max_decoded_bytes(total);
+    assert_eq(_sc_load(&ctx, kz, &buf), 0, "exactly the budget loads");
+    assert_eq(_sc_bad, 0, "  with the formula's bytes");
+    # A stored level must be in the file, so the file's size bounds it: no budget applies.
+    gpu_ktx2_set_max_decoded_bytes(1);
+    var sbuf[168];
+    _mk_ktx2_hdr(&sbuf, 145, 8, 8, 1, 0, 0, 1);   # BC7 8x8, stored
+    store64(&sbuf + 80, 104);
+    store64(&sbuf + 88, 64);
+    store64(&sbuf + 96, 64);
+    var ts, rs = gpu_texture_load_ktx2_result(&ctx, &sbuf, 168);
+    assert_eq(is_err_result(ts), 0, "a stored file is not held to the budget");
+    gpu_ktx2_set_max_decoded_bytes(0);
+    assert_eq(gpu_ktx2_max_decoded_bytes(), KTX2_MAX_DECODED_DEFAULT, "0 restores the default");
+    # The pre-pass: a level-index entry the span checks refuse is refused before the texture
+    # is created (it was created, then released).
+    assert_eq(_sc_load(&ctx, _sc_find("zstd_ulen"), &buf), GPU_ERR_CONTAINER_PARSE, "a wrong ulen");
+    assert_eq(_sc_cr, 0, "  refused before any texture is created");
+    # A file cut short: its last level's span runs past the end. (The zstd_truncated fixture
+    # cuts the compressed stream instead, which only decoding can find: created, then released.)
+    var nf = ktx2sc_build(kz, &buf);
+    _sc_cr = 0;
+    var tc, rc2 = gpu_texture_load_ktx2_result(&ctx, &buf, nf - 1);
+    assert_eq(load64(rc2), GPU_ERR_CONTAINER_PARSE, "a file one byte short");
+    assert_eq(_sc_cr, 0, "  refused before any texture is created");
+    assert_eq(_sc_load(&ctx, _sc_find("zstd_truncated"), &buf), GPU_ERR_CONTAINER_PARSE, "a cut stream");
+    assert_eq(_sc_rel, _sc_cr, "  found by the decode: what was created is released");
+    # A decoded level ends exactly where the PROT_NONE guard page begins.
+    var n = ktx2sc_build(kz, &buf);
+    var fmt = mabda_texfmt_from_vk_format(load32(&buf + 12));
+    var expected = mabda_texfmt_data_size(fmt, load32(&buf + 20), load32(&buf + 24));
+    var levels = load32(&buf + 40);
+    var mapped[8];
+    var d = _ktx2_level_data(&buf, n, _KTX2_LEVELIDX_OFF, KTX2_SC_ZSTD, expected,
+      _KTX2_LEVELIDX_OFF + levels * _KTX2_LEVELIDX_SZ, &mapped);
+    assert(d > 0, "level 0 decodes");
+    assert_eq(load64(&mapped), 1, "  into a mapping");
+    assert_eq((d + expected) % 4096, 0, "  that ends at a page boundary, where the guard page begins");
+    _ktx2_level_done(d, expected, load64(&mapped));
+    gpu_ktx2_set_zstd_decoder(0);
+    gpu_ktx2_set_zlib_decoder(0);
+    return 0;
+}
+
 # Loading allocates no bump memory: the decoded levels live in anonymous mappings, unmapped
 # after the upload, so a consumer that loads textures for hours does not grow its heap.
 fn test_ktx2_supercompressed_no_heap_growth() {
@@ -666,19 +758,6 @@ fn test_ktx2_supercompressed_no_heap_growth() {
 }
 
 # --- AA.6a: per-image (array layer / cube face) sizing + overflow-safety ---
-fn test_asset_per_image_size() {
-    # Valid even splits.
-    assert_eq(_asset_per_image_size(64, 1), 64, "1 image -> blen");
-    assert_eq(_asset_per_image_size(384, 6), 64, "6 faces of 64 -> 64");
-    assert_eq(_asset_per_image_size(2048, 8), 256, "8 layers of 256 -> 256");
-    # Unsafe / hostile.
-    assert_eq(_asset_per_image_size(64, 0), 0 - 1, "div-by-zero (0 images) -> -1");
-    assert_eq(_asset_per_image_size(64, 0 - 3), 0 - 1, "negative image count -> -1");
-    assert_eq(_asset_per_image_size(100, 6), 0 - 1, "not evenly divisible -> -1");
-    assert_eq(_asset_per_image_size(0 - 8, 4), 0 - 1, "negative blen -> -1");
-    assert_eq(_asset_per_image_size(0, 6), 0, "0 bytes / 6 -> 0 (degenerate but even)");
-    return 0;
-}
 
 # --- AL.5: PNG load via the chitra dep (real decode + upload routing) ---
 
@@ -1004,11 +1083,11 @@ fn main() {
     test_ktx2_load_orchestration();
     test_ktx2_supercompressed_loads();
     test_ktx2_supercompressed_no_heap_growth();
+    test_ktx2_audit_budget_and_prepass();
     test_ktx2_decoder_registration();
     test_gpu_texture_load_png_orchestration();
     test_gpu_texture_load_jpeg_orchestration();
     test_gpu_texture_load_sniffer();
-    test_asset_per_image_size();
     test_dds_parse_array_cube();
     test_ktx2_parse_array_cube();
     test_dds_load_array_orchestration();

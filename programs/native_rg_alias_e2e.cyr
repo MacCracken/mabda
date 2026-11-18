@@ -13,9 +13,12 @@
 #      n1 from overwriting X before n0 reads it. Every R[i] must be X[i] + 1.
 #   C. Textures on the GRAPHICS ring: n0 samples t0 into t1 (a render target), n1 samples
 #      t1 into t2, which reuses t0's bytes. t2 must equal t0's uploaded pattern exactly.
+#   D. (4.5.0 audit) A 20-node chain on one ring over 21 buffers that aliasing packs into 2
+#      slots, so nearly every node reuses bytes, and the 16 IB slices wrap once mid-graph (the
+#      executor drains its queues before reusing them). Every b20[i] must be b0[i] + 20.
 #
 # Exit codes: 0 pass; 1 ctx; 2 kernel; 3 build; 4 layout; 5 execute; 6 A wrong; 7 B wrong;
-#   8 render setup; 9 C wrong; 10 consumer buffers.
+#   8 render setup; 9 C wrong; 10 consumer buffers; 11 D wrong.
 include "src/lib.cyr"
 
 fn print_cstr(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
@@ -657,6 +660,41 @@ fn phase_c(ctx): i64 {
     return 0;
 }
 
+fn phase_d(ctx, add): i64 {
+    var g = rg_new();
+    rg_aliasing(g, 1);
+    var ids = alloc(21 * 8);
+    for (var i = 0; i < 21; i = i + 1) { store64(ids + i * 8, rg_add_transient_buffer(g, NB, 0, "b")); }
+    var dims[12];
+    store32(&dims, 64); store32(&dims + 4, 1); store32(&dims + 8, 1);
+    var bps = alloc(20 * 40);
+    for (var j = 0; j < 20; j = j + 1) {
+        var n = rg_add_compute(g, add, bps + j * 40, &dims, "step");
+        rg_node_reads(g, n, load64(ids + j * 8));
+        rg_node_writes(g, n, load64(ids + j * 8 + 8));
+    }
+    var rc = rg_build_ctx(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: D build rc="); print_i64(rc); print_cstr("\n"); return 3; }
+    print_cstr("D. a 20-node chain on COMPUTE over 21 buffers: backing "); print_i64(rg_backing_bytes(g));
+    print_cstr(" bytes (21 would be "); print_i64(21 * NB); print_cstr(")\n");
+    if (rg_backing_bytes(g) >= 21 * NB) { print_cstr("FAIL: D: no reuse\n"); return 4; }
+    for (var k = 0; k < 20; k = k + 1) {
+        var va = rg_transient_handle(g, load64(ids + k * 8));
+        var vb = rg_transient_handle(g, load64(ids + k * 8 + 8));
+        bind2(bps + k * 40, va, vb);
+    }
+    var inp = view_addr(g, load64(ids + 0));
+    for (var e = 0; e < N; e = e + 1) { store32(inp + e * 4, e * 11); }
+    rc = rg_execute_mq(g, ctx);
+    if (rc != 0) { print_cstr("FAIL: D execute rc="); print_i64(rc); print_cstr("\n"); return 5; }
+    var bad = count_bad(view_addr(g, load64(ids + 160)), N, 11, 20, "b20");
+    print_cstr("  b20 = b0 + 20: "); print_i64(N - bad); print_cstr(" of "); print_i64(N); print_cstr(" right\n");
+    rg_release(g);
+    if (bad != 0) { print_cstr("FAIL: D\n"); return 11; }
+    print_cstr("PASS: D\n");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     color_init();
@@ -675,6 +713,7 @@ fn main(): i64 {
     var rc = phase_a(ctx, add);
     if (rc == 0) { rc = phase_b(ctx, add, slow); }
     if (rc == 0) { rc = phase_c(ctx); }
+    if (rc == 0) { rc = phase_d(ctx, add); }
     gpu_context_release(ctx);
     if (rc == 0) { print_cstr("OK — transients share one backing; every reuse waited\n"); }
     return rc;

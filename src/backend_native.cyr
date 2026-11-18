@@ -260,6 +260,7 @@ fn native_compute_dispatch_cached_timeline(ctx, pm4, pm4_bytes,
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
       ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
+    if (rc != 0) { _native_submit_undo(queue, point, &waits, n_waits); }
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -321,6 +322,7 @@ fn native_compute_dispatch_cached_n_timeline(ctx, pm4, pm4_bytes, shader_handle,
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
       ip_type, syncobj, point, &waits, n_waits, fence_handle, 32, 0x08);
+    if (rc != 0) { _native_submit_undo(queue, point, &waits, n_waits); }
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -395,6 +397,7 @@ fn native_transfer_copy_timeline(ctx, src_handle, src_va,
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, sdma_bytes,
       AMDGPU_HW_IP_DMA, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
+    if (rc != 0) { _native_submit_undo(queue, point, &waits, n_waits); }
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -665,6 +668,7 @@ fn native_render_dispatch_timeline(ctx, pm4, pm4_bytes,
     var point = queue_bump_point(queue);
     var rc = native_cs_submit_timeline(fd, cid, &bo_list_in, ib_va, pm4_bytes,
       AMDGPU_HW_IP_GFX, syncobj, point, &waits, n_waits, fence_handle, 32, 0);
+    if (rc != 0) { _native_submit_undo(queue, point, &waits, n_waits); }
     return _native_neg_rc_to_gpu_err(rc);
 }
 
@@ -833,6 +837,56 @@ fn _backend_native_ctx_release(ctx): i64 {
     return 0;
 }
 
+# 4.5.0 (audit) — a timeline submit the kernel refused never signals its point, so the point
+# is given back and the waits it took are put back on the queue. Until 4.5.0 the point stayed
+# bumped: every later wait on it (a barrier, gpu_queue_wait_idle) waited for a signal that
+# would never come and timed out, and the next submit lost the dependency.
+fn _native_submit_undo(queue, point, waits, n_waits): i64 {
+    queue_set_point(queue, point - 1);
+    for (var i = 0; i < n_waits; i = i + 1) {
+        queue_set_pending_wait(queue, load64(waits + i * 16), load64(waits + i * 16 + 8));
+    }
+    return 0;
+}
+
+# 4.5.0 — render-graph transient views (rg_build_ctx). A view is a NativeBuf / NativeTexture /
+# NativeRT that points into a graph's one backing BO and owns nothing; the graph frees the BO.
+# The release slots check this set and refuse a view: releasing one would GEM_CLOSE the
+# shared handle and unmap part of the backing, and rg_release would then close the handle
+# again, by then perhaps another BO's. A linear scan: a context has few live views.
+var _native_views = 0;
+fn native_view_register(p): i64 {
+    if (_native_views == 0) { _native_views = vec_new(); }
+    vec_push(_native_views, p);
+    return 0;
+}
+fn native_view_forget(p): i64 {
+    if (_native_views == 0) { return 0; }
+    var n = vec_len(_native_views);
+    for (var i = 0; i < n; i = i + 1) {
+        if (vec_get(_native_views, i) == p) {
+            vec_set(_native_views, i, vec_get(_native_views, n - 1));
+            vec_pop(_native_views);
+            return 0;
+        }
+    }
+    return 0;
+}
+fn native_is_view(p): bool {
+    if (_native_views == 0) { return false; }
+    if (p == 0) { return false; }
+    var n = vec_len(_native_views);
+    for (var i = 0; i < n; i = i + 1) {
+        if (vec_get(_native_views, i) == p) { return true; }
+    }
+    return false;
+}
+fn _native_refuse_view_release(): i64 {
+    _gpu_err_record(GPU_ERR_OTHER,
+      "native: that object is a render-graph transient view; release the graph (rg_release)", 1);
+    return GPU_ERR_OTHER;
+}
+
 # Buffer slots — diagnostic stubs (audit LOW-3).
 #
 # Public gpu_buffer_* on native AMD — REAL as of v3.2 (Phase X). A native
@@ -947,6 +1001,7 @@ fn _backend_native_buffer_map(ctx, buf): i64 {
 fn _backend_native_buffer_release(ctx, buf): i64 {
     if (ctx == 0) { return 0; }
     if (buf == 0) { return 0; }
+    if (native_is_view(buf)) { return _native_refuse_view_release(); }   # 4.5.0
     var fd = native_ctx_fd(ctx);
     var handle = load64(buf + NATIVE_BUF_FIELD_HANDLE);
     var va     = load64(buf + NATIVE_BUF_FIELD_VA);
@@ -2147,6 +2202,7 @@ fn _backend_native_texture_read(ctx, tex, dst, n): i64 {
 fn _backend_native_texture_release(ctx, tex): i64 {
     if (ctx == 0) { return 0; }
     if (tex == 0) { return 0; }
+    if (native_is_view(tex)) { return _native_refuse_view_release(); }   # 4.5.0
     var fd = native_ctx_fd(ctx);
     var handle = load64(tex + NATIVE_TEX_FIELD_HANDLE);
     var va = load64(tex + NATIVE_TEX_FIELD_VA);
@@ -2271,6 +2327,7 @@ fn _backend_native_render_target_create_2d_rgba8(ctx, width, height): i64 {
 fn _backend_native_render_target_release(ctx, rt): i64 {
     if (ctx == 0) { return 0; }
     if (rt == 0)  { return 0; }
+    if (native_is_view(rt)) { return _native_refuse_view_release(); }   # 4.5.0
     var fd = native_ctx_fd(ctx);
     var handle = load64(rt + NATIVE_RT_FIELD_HANDLE);
     var va = load64(rt + NATIVE_RT_FIELD_VA);

@@ -3,14 +3,14 @@
 > GPU foundation layer for AGNOS. Written in Cyrius. **Three backends behind one
 > public API**: wgpu-native (cross-vendor default), native AMD (amdgpu DRM /
 > GFX9 / PM4), and native NVIDIA (nouveau DRM, Turing/SM75). Baseline:
-> **v4.4.0** (2026-11-17). Module/assertion/bundle counts live in the
+> **v4.5.0** (2026-11-17). Module/assertion/bundle counts live in the
 > filesystem + `CHANGELOG.md`, not here — they go stale on every cut.
 
 This document is **forward-looking**: every planned release is pinned below, in order.
 [`CHANGELOG.md`](../../CHANGELOG.md) is the source of truth for shipped work, and shipped
 sections are pruned from this file when their arc closes (v2.x pruned 2026-04-21; v3.0–v3.4
 2026-06-19; v4.0–v4.0.2 2026-07-02; v4.0.3–v4.2.0 and the render tier MB1–MB5, v4.3.0–v4.3.1,
-2026-11-16; v4.4.0, compilers + NVIDIA, 2026-11-17).
+2026-11-16; v4.4.0, compilers + NVIDIA, 2026-11-17; v4.5.0, textures + language, 2026-11-17).
 
 The current agent hand-over — repo state, how to verify, the boxes, the gotchas — is
 [`handoff.md`](handoff.md).
@@ -38,9 +38,7 @@ AMD-on-wgpu is **deprecated** as of v4.0.1 (see the retirement policy
 below).
 
 ```
-  v2.0.0 → v4.4.0  ─▶  shipped — see CHANGELOG.md
-  v4.5.0           ─▶  textures + language: texture encoding, compressed sRGB ids,
-                        render-graph aliasing, the cyrius 6.7 language minors
+  v2.0.0 → v4.5.0  ─▶  shipped — see CHANGELOG.md
   v5.0             ─▶  native rendering beyond the vertex-less subset; Intel native
                         (tentative); NVIDIA wgpu path retires
   v5.1             ─▶  full wgpu retirement — wgpu-native + C launcher + the FFI
@@ -52,6 +50,11 @@ below).
 Every item the roadmap carries is in one of these. Version numbers are the order of work,
 not dates. A release that finds it needs a new launcher slot asks first: every slot forces
 every consumer to rebuild its launcher copy (83 slots since 4.3.1).
+
+Open but in no release: the texture-encoder follow-ons that 4.5.0 left out of its scope
+(the BC1 / BC3 / BC4 / BC5 and ASTC encoders, a GPU compute encoder, KTX2 supercompression
+*encode*), tracked in `issues/2026-10-13-gpu-texture-compression-encoder.md`. They wait for
+a consumer's request or the maintainer's call.
 
 ### wgpu retirement policy
 
@@ -86,54 +89,6 @@ Everything in this roadmap prioritizes **API stability** over
 contract. The FFI layer underneath is explicitly marked internal
 (`@internal` header on line 1 of every FFI module) so no consumer
 accidentally couples to it.
-
----
-
-## v4.5.0 — textures + language
-
-Phase 4 of the 2026-11 plan with the texture, render-graph and language items already on the
-roadmap.
-
-- **Texture encoding** (`issues/2026-10-13-gpu-texture-compression-encoder.md`; filed from sankoch,
-  placed in mabda by the user). ✅ First **KTX2 supercompression decode** — schemes 2 (zstd) and
-  3 (zlib), through sankoch's codecs: done (CHANGELOG [4.5.0]). The consumer registers the
-  decoders, so mabda's bundle never names sankoch; the result is byte-exact in the GPU BO on the
-  Cezanne. ✅ Then **a CPU
-  reference block encoder**: BC7, chosen by the maintainer (2026-11-17), done (CHANGELOG
-  [4.5.0]). It is checked against the Cezanne's texture unit on every mode, with a PSNR bar
-  recorded in `tests/tcyr/texture_bc7.tcyr`. The item as filed was for the
-  first format a consumer names (BC1 / BC3 / BC4 / BC5 / BC7, or ASTC 4×4 / 6×6 / 8×8), validated
-  against an independent decoder and mabda's upload-and-sample path, with a PSNR bar; if no
-  consumer has named one by then, ask the user.
-- ✅ **Compressed sRGB ids** — done (CHANGELOG [4.5.0]). The BC1/3/7, ETC2 and ASTC sRGB
-  container variants collapsed to the UNORM id; they have their own ids (17–24) now, as the
-  uncompressed ones got in 4.3.1, and wgpu samples them with the sRGB decode. At the
-  maintainer's call (2026-11-17) native AMD decodes too: every sRGB id it samples (RGBA8, BC1,
-  BC3, BC7 sRGB) takes NUM_FORMAT_SRGB, checked on the Cezanne by `test-native-srgb-e2e` and
-  matched by wgpu's `test-wgpu-srgb-sample-e2e`. That is the sampling half of v5.0's native sRGB
-  decode, pulled forward.
-- ✅ **Render-graph aliasing backing reuse** — done (CHANGELOG [4.5.0]). `rg_build_ctx` gives a
-  native AMD graph's transients one GTT allocation (buffers, and RGBA8 textures usable as targets
-  and sampled), and with aliasing on, disjoint-lifetime transients share bytes. The executor
-  waits, before a reusing node, for every queue that used the slot. Checked on the Cezanne by
-  `test-native-rg-alias-e2e`, whose independent-nodes phase fails without the wait. Found and
-  fixed on the way: a queue held one pending wait (a second barrier replaced the first);
-  same-queue edges relied on submit order; the planner sized every texture as RGBA8. wgpu
-  keeps today's behaviour (its safe API has no placed or aliased resources). Native NVIDIA
-  has no render-graph executor (`rg_build_ctx` / `rg_execute_mq` return
-  GPU_ERR_NOT_IMPLEMENTED); the executor is scheduled in v5.0 below, with the NVIDIA wgpu
-  retirement it blocks.
-- ✅ **The cyrius 6.7 language minors** — done (CHANGELOG [4.5.0]; recorded by the W2 stdlib
-  wave, 4.2.0; each changes a public name's kind or type, which is why they ride a minor):
-  - S2: 2,126 top-level integer constants are `const` (1,570 when counted at 4.2.0), after a
-    survey of mabda, its consumers and cyrius's `lib/`. 31 stay `var`: 30 are mutable state,
-    and `DRM_IOCTL_VERSION` is also declared by agnodrm;
-  - S3: the 34 `*_is_*` / `*_has_*` predicates return `: bool`, pinned by
-    `tests/tcyr/predicates.tcyr`;
-  - S4: if-expressions at 66 assignment sites (12 more stay two lines; one line would pass 120
-    bytes);
-  - M6: `programs/benchmarks.cyr` uses lib/bench.cyr's resolution, its `_clock_jitter_ns`
-    windowing retired, with a `make bench-gpu` run before and after.
 
 ---
 

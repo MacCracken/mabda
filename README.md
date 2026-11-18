@@ -9,7 +9,7 @@ all AGNOS GPU consumers build upon.
 Written in [Cyrius](https://github.com/MacCracken/cyrius), the AGNOS
 systems language.
 
-Version: 4.4.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
+Version: 4.5.0 — **triple backend** (wgpu-native + native AMD + native NVIDIA)
 behind one stable public API. GA (3.0.0, 2026-06-02) added the pure-Cyrius
 **native AMD** path (amdgpu DRM / GFX9 / PM4); v3.1–v3.4 grew it — multi-queue,
 block-compressed + array/cube textures, an in-tree SPIR-V→GFX9 f64 compute
@@ -27,7 +27,11 @@ texture views, mip generation and copies on wgpu, compute passes and `gpu_comput
 wgpu, and a Wayland window surface. **v4.4.0 compiles SPIR-V for NVIDIA in-tree**
 (SPIR-V → SM75 SASS, with control flow, f64 and ranga's kernels), fixes control-flow shapes the
 GFX9 compiler ran wrong without an error, widens both compilers to one 1024-id space, adds NVIDIA
-block-linear scanout, and passes the seat-only display gates on both GPUs. See
+block-linear scanout, and passes the seat-only display gates on both GPUs. **v4.5.0** decodes
+zstd / zlib-supercompressed KTX2, adds a BC7 CPU encoder checked against the GPU's own decode,
+gives the compressed sRGB formats their own ids (decoded on sampling on wgpu and native AMD),
+backs a native render graph's transients with one shared allocation, and moves to cyrius 6.7's
+`const`, `bool` and if-expressions. See
 [CHANGELOG.md](CHANGELOG.md) for the full release history and *Hardware support* below.
 
 ## Features
@@ -271,7 +275,7 @@ mabda/
 ├── scripts/             version-check.sh, version-bump.sh
 ├── cyrius.cyml          Package manifest (toolchain pin, [lib], [deps])
 ├── Makefile             Thin wrapper over `cyrius` CLI + GPU path
-├── VERSION              4.4.0
+├── VERSION              4.5.0
 └── CHANGELOG.md
 ```
 

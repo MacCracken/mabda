@@ -38,7 +38,7 @@ stdlib = [
 
 [deps.mabda]
 git = "https://github.com/MacCracken/mabda.git"
-tag = "4.4.0"
+tag = "4.5.0"
 modules = ["dist/mabda.cyr"]
 ```
 
@@ -97,7 +97,10 @@ you don't need the dep:
   ```
 
   A scheme with no decoder registered is refused with `GPU_ERR_FORMAT_UNSUPPORTED`, and the
-  reason names the call. BasisLZ (scheme 1) is refused either way.
+  reason names the call. BasisLZ (scheme 1) is refused either way. A supercompressed file whose
+  levels decode past 1 GiB is refused with `GPU_ERR_OUT_OF_MEMORY` before anything is created
+  (a decompression-bomb guard). Raise the limit with `gpu_ktx2_set_max_decoded_bytes(n)` if
+  you load larger textures.
 
 Then `cyrius deps` fetches the tag into the dep cache under
 `~/.cyrius/deps/mabda/<tag>/` and copies the bundle into `lib/mabda.cyr`.
@@ -265,7 +268,7 @@ project. mabda's `make example-link` compiles and links it this way
 
 The native Cyrius backends did **not** replace the wgpu path — v3.0
 added native AMD *alongside* wgpu, v4.0 added native NVIDIA. As of the
-v4.4.0 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
+v4.5.0 baseline the wgpu launcher (`deps/wgpu_main.c`), wgpu-native,
 the `wgpu_ffi_init_table` bootstrap, and your libC link are all still
 in the tree and still the cross-vendor default. Retirement happens
 **per vendor**, and only once that vendor's native backend is in

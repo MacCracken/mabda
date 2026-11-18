@@ -6,7 +6,13 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
 
 ## Where things stand
 
-- **v4.5.0 is in progress, uncommitted** (VERSION still 4.4.0; CHANGELOG `[4.5.0] — in progress`).
+- **The v4.5.0 cut is prepared, uncommitted** (VERSION 4.5.0; CHANGELOG `[4.5.0] — 2026-11-17`).
+  The audit is `docs/audit/2026-11-17-4.5.0-audit.md`: 1 HIGH / 4 MEDIUM / 11 LOW, all fixed.
+  Every pin is current (cyrius 6.7.18, samvada 1.1.2, chitra 1.4.1). The CPU suite, the CI
+  gates, `test-native-all` (79/0/3), `test-gpu`, chew's 17 masterless gates and NVK `test-gpu`,
+  and the consumer check (ranga on both GPUs, soorat) all pass. Left: the seat closeout on both
+  boxes (`make seat-closeout-amd` here, `make seat-closeout-nvidia` in chew's
+  `~/mabda-verify-450`), then the commit and tag, which are the maintainer's.
   Landed, texture encoding (both halves):
   - KTX2 zstd / zlib supercompression decode. The consumer registers sankoch's decoders
     (`gpu_ktx2_set_zstd_decoder` / `_zlib_decoder`); mabda's `src/` must not name an optional
@@ -39,7 +45,7 @@ when you hand over again; `CHANGELOG.md` stays the record of what shipped.
   - S4: if-expressions.
   - M6: the GPU benchmarks report what lib/bench.cyr resolves.
 
-  Every 4.5.0 item has landed. Next: the 4.5.0 cut (audit, closeout, consumer check, tag).
+  Every 4.5.0 item has landed.
 - **v4.4.0 is released** (tag `4.4.0`; the cut was 2026-11-17). VERSION and the CHANGELOG say 4.4.0. The pins
   are samvada 1.1.2 and chitra 1.4.1, and the audit is `docs/audit/2026-11-17-4.4.0-audit.md`.
   - The audit's 1 HIGH, 2 MEDIUM and 9 LOW are all fixed and tested. The HIGH was GFX9's waits
