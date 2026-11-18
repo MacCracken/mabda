@@ -73,19 +73,14 @@ Cross-reference the `CHANGELOG.md` entries for the release each item
 shipped in; this directory is just the original analysis / scoping
 document, preserved for context.
 
-### Session handoffs & bring-up notes
+### Soak runs & bring-up notes
 
-Per-session debugging handoffs and vendor bring-up capture-notes from
-completed arcs, kept for post-mortem value. `CHANGELOG.md` and the ADRs are
-the authoritative record.
+Soak logs and vendor bring-up capture-notes from completed arcs, kept for
+post-mortem value. `CHANGELOG.md` and the ADRs are the authoritative record.
 
-- `handoff/2026-04-*.md` — the v3.0 native-AMD GFX9 bring-up saga
-  (session9 → session26: the GEM/PM4/CS/CPC-fault investigation ending in the
-  B.4 compute-store proof and 3.0.0 GA).
 - `handoff/soak-2026-05*/`, `handoff/soak-2026-06-0[13]*/` — the v3.x AMD
-  soak-burn-in runs (compute/render/wgpu). The v4.0 NVIDIA soaks live in the
-  live `docs/handoff/` alongside the current GA evidence.
-- `handoff/2026-06-19-handoff.md` — stale v3.4-era "start here" pointer.
+  soak-burn-in runs (compute/render/wgpu). The v4.0 NVIDIA soaks are in
+  `docs/handoff/soak-*/`, where `scripts/soak.sh` writes new runs.
 - `development/nvidia-n4/n6/n7-capture-notes.md` — decoded NVK Vulkan captures
   (compute / texture-sampling / triangle-draw) that seeded the v4.0 NVIDIA
   backend; `development/nvidia-bringup-hardware.md` — the TU116 HW ladder.

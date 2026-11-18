@@ -26,8 +26,6 @@ paths.
 
 ## Pointers (where things live)
 
-- **Agent hand-over (current state, how to verify, the boxes, gotchas)** —
-  `docs/development/handoff.md`; read it first when picking the repo up
 - **Version history / what shipped when** — `CHANGELOG.md`
 - **Architecture overview + file layout** — `docs/architecture/overview.md`
 - **Roadmap** — `docs/development/roadmap.md`

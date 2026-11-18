@@ -12,9 +12,6 @@ sections are pruned from this file when their arc closes (v2.x pruned 2026-04-21
 2026-06-19; v4.0–v4.0.2 2026-07-02; v4.0.3–v4.2.0 and the render tier MB1–MB5, v4.3.0–v4.3.1,
 2026-11-16; v4.4.0, compilers + NVIDIA, 2026-11-17; v4.5.0, textures + language, 2026-11-17).
 
-The current agent hand-over — repo state, how to verify, the boxes, the gotchas — is
-[`handoff.md`](handoff.md).
-
 ## The Long Arc
 
 Mabda is the **public GPU API** for the Cyrius ecosystem. It shipped
